@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, Mask, MaskBackground, PathShape};
-use texturecraft_geom::OrbitCamera;
 use texturecraft_geom::glam::{Vec2, Vec3};
+use texturecraft_geom::{OrbitCamera, surface_at};
 use texturecraft_paint::{BrushSettings, Lasso, fill_coverage, spline};
 
 use crate::commands::{CommandSpec, always, bad, boolp, has_layer, u64p};
@@ -25,6 +25,8 @@ pub const MAX_PATH_POINTS: usize = 4096;
 /// Curve sampling step in viewport pixels (3D view) and texture units (2D view).
 const STEP_PX: f32 = 2.0;
 const STEP_UV: f32 = 0.001;
+/// The viewport (pixels) a 3D path is painted through, whatever the size of the view.
+const PATH_VIEWPORT: Vec2 = Vec2::splat(1024.0);
 
 /// The curve being edited with the Path tool.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -422,9 +424,46 @@ impl Session {
         self.tool.values = paint.values;
         self.tool.enabled = paint.enabled;
         self.tool.mask_value = paint.mask_value;
-        self.camera = paint.camera;
         self.tool.path = state_of(shape);
-        self.paint_path(Vec2::from_array(shape.viewport).max(Vec2::splat(16.0)).min(Vec2::splat(16384.0)))
+        // The view camera is only borrowed for painting: the user's viewport never moves.
+        let view = self.camera;
+        let result = if shape.uv {
+            self.camera = paint.camera;
+            self.paint_path(Vec2::from_array(shape.viewport).max(Vec2::splat(16.0)).min(Vec2::splat(16384.0)))
+        } else {
+            // Every path (committed new, edited live or repainted) is painted here: a 3D one paints
+            // the same pixels whatever the view was when it was drawn or edited.
+            self.camera = self.path_camera();
+            self.paint_path(PATH_VIEWPORT)
+        };
+        self.camera = view;
+        result
+    }
+
+    /// The camera a 3D path is painted from, set by its points, the brush and the mesh only:
+    /// facing the surface along the points' mean normal, framing the points and the brush.
+    fn path_camera(&self) -> OrbitCamera {
+        let (points, brush) = (&self.tool.path.points, &self.tool.brush);
+        if points.is_empty() {
+            return OrbitCamera::default();
+        }
+        let (lo, hi) = points.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
+        let (mlo, mhi) = self.mesh.bounds();
+        // The farthest a stamp reaches from the curve (brush radius with jitter), with a margin.
+        let reach = brush.size * (mhi - mlo).length().max(1e-4) * (1.0 + brush.jitter_size) * (1.0 + 2.0 * brush.jitter_position) * 1.5;
+        let normal = points
+            .iter()
+            .filter_map(|p| self.bvh.nearest(*p, f32::INFINITY, &|_| true))
+            .filter_map(|h| surface_at(&self.mesh, h.tri, h.u, h.v))
+            .map(|s| s.nrm)
+            .sum::<Vec3>()
+            .try_normalize()
+            .unwrap_or(Vec3::Y);
+        let max_pitch = 89f32.to_radians();
+        let mut camera =
+            OrbitCamera { yaw: normal.x.atan2(normal.z), pitch: normal.y.clamp(-1.0, 1.0).asin().clamp(-max_pitch, max_pitch), ..OrbitCamera::default() };
+        camera.frame(lo - Vec3::splat(reach), hi + Vec3::splat(reach));
+        camera
     }
 
     /// Paint the Path tool's curve with the current brush (or fill it when closed and filled)
@@ -528,5 +567,72 @@ mod tests {
         s.render_paths(eid, 0).unwrap();
         assert_eq!(cached, pixels(&s, eid), "same pixels as painting every path");
         assert!(!cached.is_empty());
+    }
+
+    /// The same 3D path baked from different view cameras (one with a box between the eye and
+    /// the path) paints the same pixels, both as a new path and when a stored path is edited.
+    #[test]
+    fn baking_a_3d_path_ignores_the_camera() {
+        use texturecraft_geom::glam::{Vec2, Vec3};
+        use texturecraft_geom::{OrbitCamera, primitives};
+
+        let mut mesh = primitives::plane(2.0, 16);
+        let mut cube = primitives::cube(0.4);
+        for p in &mut cube.positions {
+            *p += Vec3::new(0.0, 0.25, 0.6);
+        }
+        mesh.append(&cube);
+        let cams = [
+            OrbitCamera { yaw: std::f32::consts::PI, pitch: 1.0, distance: 4.0, ..OrbitCamera::default() },
+            OrbitCamera { yaw: 0.0, pitch: 0.35, distance: 4.0, ..OrbitCamera::default() },
+            OrbitCamera { yaw: 0.7, pitch: 0.8, distance: 2.5, ..OrbitCamera::default() },
+        ];
+        let stroke = vec![Vec3::new(-0.8, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.8, 0.0, 0.0)];
+        let quad = vec![Vec3::new(-0.6, 0.0, -0.2), Vec3::new(0.6, 0.0, -0.2), Vec3::new(0.6, 0.0, 0.2), Vec3::new(-0.6, 0.0, 0.2)];
+        let vp = Vec2::new(512.0, 512.0);
+        let session = |fill: bool| {
+            let mut s = Session::new_project("t", mesh.clone(), "builtin:test", None, 256).unwrap();
+            s.update();
+            execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [1.0, 0.0, 0.0]})).unwrap();
+            execute(&mut s, "tool.brush", &json!({"size": 4, "hardness": 90})).unwrap();
+            execute(&mut s, "tool.path", &json!({"closed": fill, "fill": fill})).unwrap();
+            s
+        };
+        let view = |cam: &OrbitCamera| OrbitCamera { scene_radius: 1.5, ..*cam };
+        for (points, fill) in [(stroke, false), (quad, true)] {
+            // A new path, committed from each view.
+            let new: Vec<Vec<String>> = cams
+                .iter()
+                .map(|cam| {
+                    let mut s = session(fill);
+                    s.camera = view(cam);
+                    s.tool.path.points = points.clone();
+                    let r = s.commit_path(vp).unwrap();
+                    assert_eq!(s.camera, view(cam), "fill {fill}: baking moved the view");
+                    pixels(&s, texturecraft_core::LayerId(r["effect"].as_u64().unwrap()))
+                })
+                .collect();
+            assert!(!new[0].is_empty(), "fill {fill}: the path painted nothing");
+            for b in &new[1..] {
+                assert!(*b == new[0], "fill {fill}: a new path's pixels depend on the camera");
+            }
+            // A stored path (drawn from the first view) moved to `points` while seen from each view.
+            for cam in &cams {
+                let mut s = session(fill);
+                s.camera = view(&cams[0]);
+                s.tool.path.points = points.iter().map(|p| *p + Vec3::new(0.0, 0.0, 0.3)).collect();
+                let eid = s.commit_path(vp).unwrap()["effect"].as_u64().unwrap();
+                execute(&mut s, "path.edit", &json!({"effect": eid, "index": 0})).unwrap();
+                s.camera = view(cam);
+                s.tool.path.points = points.clone();
+                assert!(s.path_live().unwrap(), "fill {fill}: the edit repainted");
+                assert_eq!(s.camera, view(cam), "fill {fill}: a live edit moved the view");
+                let live = pixels(&s, texturecraft_core::LayerId(eid));
+                assert!(live == new[0], "fill {fill}: an edited path's live pixels depend on the camera");
+                s.commit_path(vp).unwrap();
+                assert_eq!(s.camera, view(cam), "fill {fill}: committing an edit moved the view");
+                assert!(pixels(&s, texturecraft_core::LayerId(eid)) == new[0], "fill {fill}: an edited path's pixels depend on the camera");
+            }
+        }
     }
 }
