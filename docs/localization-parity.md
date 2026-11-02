@@ -29,6 +29,7 @@ generator, filter and brush alpha names (**KEYS** strings, counted by the
 | Indonesian | `id` | 0 | no | Latin | no | none | 3 h |
 | Japanese | `ja` | KEYS (100%) | yes | CJK glyphs: craft-fonts (BIZ UDPGothic) or system fonts on desktop | no | full | 2 h (review) |
 | German | `de` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
+| Czech | `cs` | KEYS (100%) | yes | Latin | yes | full | 0 h |
 | Korean | `ko` | KEYS (100%) | yes | Hangul glyphs: system fonts on desktop (craft-fonts has no Korean face yet) | no | full | 2 h (review) |
 | Vietnamese | `vi` | 0 | no | Latin with diacritics | no | none | 3 h |
 | Italian | `it` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
