@@ -724,7 +724,7 @@ fn bake_panel(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
     // Pressing a map's checkbox and dragging down the list sets every row the pointer passes to
     // the state the first one got, as in Substance Painter.
-    let drag_id = ui.id().with("bake_map_drag");
+    let drag_id = ui.scope_id().with("bake_map_drag");
     let mut drag: Option<(bool, f32)> = ui.data(|d| d.get_temp(drag_id));
     let (pointer, pressed, down, released) =
         ui.input(|i| (i.pointer.interact_pos(), i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.any_released()));
