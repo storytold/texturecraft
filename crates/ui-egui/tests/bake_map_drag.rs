@@ -35,14 +35,14 @@ fn press(h: &mut Harness<'_, TextureCraftApp>, at: Pos2, pressed: bool) {
     h.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
 }
 
-fn drag(h: &mut Harness<'_, TextureCraftApp>, from: &str, to: &str) {
+fn drag(h: &mut Harness<'_, TextureCraftApp>, from: &str, to: &str, steps: u32) {
     let (a, b) = (checkbox(h, from), checkbox(h, to));
     h.hover_at(a);
     h.run_steps(1);
     press(h, a, true);
     h.run_steps(2);
-    for k in 1..=6 {
-        h.hover_at(a + (b - a) * (k as f32 / 6.0));
+    for k in 1..=steps {
+        h.hover_at(a + (b - a) * (k as f32 / steps as f32));
         h.run_steps(1);
     }
     press(h, b, false);
@@ -58,7 +58,7 @@ fn dragging_down_the_list_sets_every_row_to_the_state_of_the_first() {
     let between: Vec<BakedMap> = BakedMap::ALL[1..=4].to_vec();
     let on = before.contains(&first);
     // The first row's state flips and the others follow it, whatever they were.
-    drag(&mut h, from, to);
+    drag(&mut h, from, to, 6);
     let after = maps(&h);
     for m in &between {
         assert_eq!(after.contains(m), !on, "{m:?} follows the first row");
@@ -67,7 +67,7 @@ fn dragging_down_the_list_sets_every_row_to_the_state_of_the_first() {
         assert_eq!(after.contains(m), before.contains(m), "{m:?} is not passed over");
     }
     // Dragging back up over the same rows with the opposite state restores them.
-    drag(&mut h, to, from);
+    drag(&mut h, to, from, 6);
     let again = maps(&h);
     for m in &between {
         assert_eq!(again.contains(m), on, "{m:?} follows the last row");
@@ -89,4 +89,17 @@ fn a_plain_click_still_toggles_one_map() {
     let after = maps(&h);
     assert_ne!(after.contains(&m), before.contains(&m));
     assert_eq!(after.len() as i32 - before.len() as i32, if before.contains(&m) { -1 } else { 1 });
+}
+
+#[test]
+fn a_fast_swipe_skips_no_row() {
+    let mut h = harness();
+    let (from, to) = (BakedMap::ALL[0], BakedMap::ALL[5]);
+    let on = maps(&h).contains(&from);
+    // One pointer move across six rows between two frames.
+    drag(&mut h, from.label(), to.label(), 1);
+    let after = maps(&h);
+    for m in &BakedMap::ALL[0..=5] {
+        assert_eq!(after.contains(m), !on, "{m:?}");
+    }
 }

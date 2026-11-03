@@ -725,7 +725,7 @@ fn bake_panel(app: &mut TextureCraftApp, ui: &mut Ui) {
     // Pressing a map's checkbox and dragging down the list sets every row the pointer passes to
     // the state the first one got, as in Substance Painter.
     let drag_id = ui.id().with("bake_map_drag");
-    let mut drag: Option<bool> = ui.data(|d| d.get_temp(drag_id));
+    let mut drag: Option<(bool, f32)> = ui.data(|d| d.get_temp(drag_id));
     let (pointer, pressed, down, released) =
         ui.input(|i| (i.pointer.interact_pos(), i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.any_released()));
     for m in BakedMap::ALL {
@@ -737,16 +737,19 @@ fn bake_panel(app: &mut TextureCraftApp, ui: &mut Ui) {
             if check.changed() && !released && !pressed {
                 want = !want;
             }
-            if pressed && drag.is_none() && pointer.is_some_and(|p| check.rect.contains(p)) {
+            if pressed && drag.is_none() && pointer.is_some_and(|p| check.rect.contains(p) && ui.ctx().layer_id_at(p) == Some(ui.layer_id())) {
                 want = !want;
-                drag = Some(want);
+                drag = Some((want, pointer.map_or(check.rect.center().y, |p| p.y)));
             }
-            if let (Some(target), Some(p)) = (drag, pointer)
+            // Every row between the last pointer position and this one, so a fast swipe skips none.
+            if let (Some((target, last_y)), Some(p)) = (drag, pointer)
                 && down
-                && check.rect.expand2(egui::vec2(0.0, ui.spacing().item_spacing.y / 2.0)).y_range().contains(p.y)
                 && ui.clip_rect().contains(p)
             {
-                want = target;
+                let band = check.rect.expand2(egui::vec2(0.0, ui.spacing().item_spacing.y / 2.0)).y_range();
+                if band.min <= p.y.max(last_y) && band.max >= p.y.min(last_y) {
+                    want = target;
+                }
             }
             if want {
                 b.maps.insert(m);
@@ -759,11 +762,11 @@ fn bake_panel(app: &mut TextureCraftApp, ui: &mut Ui) {
         });
     }
     ui.data_mut(|d| match drag.filter(|_| down) {
-        Some(t) => {
-            d.insert_temp(drag_id, t);
+        Some((t, _)) => {
+            d.insert_temp(drag_id, (t, pointer.map_or(0.0, |p| p.y)));
         }
         None => {
-            d.remove_temp::<bool>(drag_id);
+            d.remove_temp::<(bool, f32)>(drag_id);
         }
     });
     app.ui.bake_baker = selected;
