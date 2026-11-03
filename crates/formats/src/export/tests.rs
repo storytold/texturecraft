@@ -344,6 +344,10 @@ fn list_outputs_matches_render_and_presets_round_trip() {
         files,
         [("$mesh_$textureSet_BaseColor", 4), ("$mesh_$textureSet_Roughness", 1), ("$mesh_$textureSet_Metallic", 1), ("$mesh_$textureSet_Normal", 3)]
     );
+    let src = |m: usize, i: usize| roblox.maps[m].channels[i].1.clone();
+    assert_eq!(src(0, 3), SourceRef::Channel { channel: Channel::Opacity, component: 0 });
+    assert_eq!(src(1, 0), SourceRef::Channel { channel: Channel::Roughness, component: 0 });
+    assert_eq!(src(2, 0), SourceRef::Channel { channel: Channel::Metallic, component: 0 });
     assert!(roblox.maps[3].channels.iter().all(|(_, s)| matches!(s, SourceRef::Virtual { map: VirtualMap::NormalDirectX, .. })));
     assert!(preset_from_json("{").is_err());
     let dup = r#"{"name":"x","maps":[{"file":"a","format":"Png","bit_depth":8,"channels":[["R",{"Constant":1.0}],["R",{"Constant":0.0}]]}]}"#;

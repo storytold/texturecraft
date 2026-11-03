@@ -154,7 +154,7 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 map("emission", 8, rgb(|k| ch(Channel::Emissive, k))),
             ],
         ),
-        // Roblox SurfaceAppearance: Roblox reads DirectX normals and takes the colour map's alpha as transparency.
+        // Roblox SurfaceAppearance, laid out like Substance Painter's Roblox preset (DirectX normals); the colour map's alpha is opacity.
         preset(
             "Roblox SurfaceAppearance",
             vec![
