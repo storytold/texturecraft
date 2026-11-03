@@ -104,7 +104,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   the slot's menu. A UV-tiled set takes one image per tile, named with its tile number
   (`ao.1001.png`, `ao.1002.png`…): drop or pick any one of them.
 - **Export presets** for glTF PBR Metal Roughness, Unreal Engine (packed), Unity HDRP (mask map),
-  Unity Standard, Blender (Principled BSDF), Godot 4 (ORM), OpenPBR (with the coat, fuzz,
+  Unity Standard, Blender (Principled BSDF), Godot 4 (ORM), Roblox SurfaceAppearance, OpenPBR (with the coat, fuzz,
   anisotropy, transmission and subsurface maps), separate maps, mesh maps and document channels, in
   PNG, JPEG, TGA, TIFF, BMP, WEBP, EXR or HDR at 8, 16 or 32 bits, with UV padding, size
   override and OpenGL or DirectX normals.
