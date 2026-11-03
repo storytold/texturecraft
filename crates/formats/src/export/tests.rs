@@ -337,7 +337,7 @@ fn list_outputs_matches_render_and_presets_round_trip() {
     let coated = names(&Fx::new(&lobes));
     assert!(coated.iter().any(|n| n.ends_with("_coat_weight.png")) && coated.iter().any(|n| n.ends_with("_fuzz_weight.png")), "{coated:?}");
     assert!(builtin_preset("godot 4 (orm)").is_some());
-    // Roblox SurfaceAppearance: separate Metallic and Roughness maps, DirectX normals, opacity in the colour alpha.
+    // Roblox SurfaceAppearance: separate Metallic and Roughness maps, OpenGL normals, opacity in the colour alpha.
     let roblox = builtin_preset("roblox surfaceappearance").unwrap();
     let files: Vec<(&str, usize)> = roblox.maps.iter().map(|m| (m.file.as_str(), m.channels.len())).collect();
     assert_eq!(
@@ -348,7 +348,7 @@ fn list_outputs_matches_render_and_presets_round_trip() {
     assert_eq!(src(0, 3), SourceRef::Channel { channel: Channel::Opacity, component: 0 });
     assert_eq!(src(1, 0), SourceRef::Channel { channel: Channel::Roughness, component: 0 });
     assert_eq!(src(2, 0), SourceRef::Channel { channel: Channel::Metallic, component: 0 });
-    assert!(roblox.maps[3].channels.iter().all(|(_, s)| matches!(s, SourceRef::Virtual { map: VirtualMap::NormalDirectX, .. })));
+    assert!(roblox.maps[3].channels.iter().all(|(_, s)| matches!(s, SourceRef::Virtual { map: VirtualMap::NormalOpenGl, .. })));
     assert!(preset_from_json("{").is_err());
     let dup = r#"{"name":"x","maps":[{"file":"a","format":"Png","bit_depth":8,"channels":[["R",{"Constant":1.0}],["R",{"Constant":0.0}]]}]}"#;
     assert!(preset_from_json(dup).is_err());

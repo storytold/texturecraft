@@ -154,14 +154,14 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 map("emission", 8, rgb(|k| ch(Channel::Emissive, k))),
             ],
         ),
-        // Roblox SurfaceAppearance, laid out like Substance Painter's Roblox preset (DirectX normals); the colour map's alpha is opacity.
+        // Roblox SurfaceAppearance, laid out like Substance Painter's Roblox preset but with OpenGL normals, the only tangent-space format Roblox reads; the colour map's alpha is opacity.
         preset(
             "Roblox SurfaceAppearance",
             vec![
                 map("BaseColor", 8, base_with_alpha()),
                 map("Roughness", 8, gray(ch(Channel::Roughness, 0))),
                 map("Metallic", 8, gray(ch(Channel::Metallic, 0))),
-                map("Normal", 8, normal(VirtualMap::NormalDirectX)),
+                map("Normal", 8, normal(VirtualMap::NormalOpenGl)),
             ],
         ),
         // OpenPBR Surface inputs, one map each (maps of channels a set lacks are skipped).
