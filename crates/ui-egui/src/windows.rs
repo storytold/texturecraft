@@ -722,21 +722,50 @@ fn bake_panel(app: &mut TextureCraftApp, ui: &mut Ui) {
     if ui.selectable_label(selected.is_none(), format!("{}  {}", ic::GEAR, tr("Common parameters"))).clicked() {
         selected = None;
     }
+    // Pressing a map's checkbox and dragging down the list sets every row the pointer passes to
+    // the state the first one got, as in Substance Painter.
+    let drag_id = ui.id().with("bake_map_drag");
+    let mut drag: Option<bool> = ui.data(|d| d.get_temp(drag_id));
+    let (pointer, pressed, down, released) =
+        ui.input(|i| (i.pointer.interact_pos(), i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.any_released()));
     for m in BakedMap::ALL {
         ui.horizontal(|ui| {
             let mut on = b.maps.contains(&m);
-            if ui.checkbox(&mut on, "").changed() {
-                if on {
-                    b.maps.insert(m);
-                } else {
-                    b.maps.remove(&m);
-                }
+            let check = ui.checkbox(&mut on, "");
+            // A click is handled below as a press; only a key press toggles through the widget.
+            let mut want = b.maps.contains(&m);
+            if check.changed() && !released && !pressed {
+                want = !want;
+            }
+            if pressed && drag.is_none() && pointer.is_some_and(|p| check.rect.contains(p)) {
+                want = !want;
+                drag = Some(want);
+            }
+            if let (Some(target), Some(p)) = (drag, pointer)
+                && down
+                && check.rect.expand2(egui::vec2(0.0, ui.spacing().item_spacing.y / 2.0)).y_range().contains(p.y)
+                && ui.clip_rect().contains(p)
+            {
+                want = target;
+            }
+            if want {
+                b.maps.insert(m);
+            } else {
+                b.maps.remove(&m);
             }
             if ui.selectable_label(selected == Some(m), tr(m.label())).clicked() {
                 selected = Some(m);
             }
         });
     }
+    ui.data_mut(|d| match drag.filter(|_| down) {
+        Some(t) => {
+            d.insert_temp(drag_id, t);
+        }
+        None => {
+            d.remove_temp::<bool>(drag_id);
+        }
+    });
     app.ui.bake_baker = selected;
     ui.separator();
     match selected {
