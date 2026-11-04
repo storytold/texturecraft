@@ -177,10 +177,11 @@ impl Session {
         check_materials(&pf.project, &mesh)?;
         let source = pf.mesh.clone();
         let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
-        let mut s = Session::new(Document { project: pf.project, pixels: pf.pixels, baked: pf.baked, resources }, mesh, source)?;
+        let mut s =
+            Session::new(Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources }, mesh, source)?;
         s.sync_images();
         s.load_bake_meshes(pf.high_poly, pf.cage);
-        s.load_skew(pf.skew);
+        s.load_bake_paint(pf.bake_paint);
         Ok(s)
     }
 
@@ -208,7 +209,7 @@ impl Session {
             mesh: self.mesh_source.clone(),
             high_poly,
             cage,
-            skew: self.saved_skew(),
+            bake_paint: self.saved_bake_paint(),
             thumbnail: None,
             resources: self.doc.resources.iter().map(|(k, v)| (k.clone(), v.as_ref().clone())).collect(),
         }

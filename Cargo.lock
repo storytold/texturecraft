@@ -3854,6 +3854,7 @@ dependencies = [
 name = "texturecraft-bake"
 version = "0.3.0"
 dependencies = [
+ "bytemuck",
  "rayon",
  "texturecraft-core",
  "texturecraft-geom",
