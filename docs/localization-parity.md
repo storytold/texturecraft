@@ -21,6 +21,7 @@ generator, filter and brush alpha names (**KEYS** strings, counted by the
 |---|---|---|---|---|---|---|---|
 | English | `en` | KEYS (100%) | yes | Latin | yes | full | 0 h |
 | Simplified Chinese | `zh-Hans` | KEYS (100%) | yes | CJK glyphs: craft-fonts (Noto Sans CJK SC) or system fonts on desktop; see below | no | full | 2 h (review) |
+| Traditional Chinese (Taiwan) | `zh-Hant` | KEYS (100%) | yes | CJK glyphs: system fonts on desktop (Noto Sans CJK TC, Microsoft JhengHei, PingFang TC); craft-fonts has no Traditional face yet, and the web build shows its English name in the picker without one | no | full | 2 h (review) |
 | Spanish | `es` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
 | Hindi | `hi` | 0 | no | Devanagari shaping: not yet (egui has no complex shaping) | no | none | 12 h |
 | Arabic | `ar` | KEYS (100%) | yes | Arabic glyphs: craft-fonts (Noto Sans Arabic) or system fonts on desktop; egui shapes the text and orders it right to left (panels keep the left-to-right layout) | yes | full | 0 h |
@@ -50,10 +51,11 @@ UI language needs them or the language picker shows every language's own name:
    Desktop builds embed BIZ UDPGothic Regular (Japanese), Noto Sans CJK SC Regular (Simplified
    Chinese) and Noto Sans Arabic Regular; the web build embeds BIZ UDPGothic (about 4.5 MB of the
    download) and Noto Sans Arabic (0.8 MB).
-2. **System fonts** on desktop: Yu Gothic / Meiryo, Microsoft YaHei / SimSun and Malgun Gothic on
-   Windows; Hiragino, PingFang / STHeiti and Apple SD Gothic Neo on macOS; Noto Sans CJK, WenQuanYi,
-   Droid Sans Fallback and Nanum Gothic on Linux and FreeBSD. Arabic: Segoe UI / Tahoma / Arial on
-   Windows, SF Arabic / Geeza Pro on macOS, Noto Sans Arabic or DejaVu Sans on Linux and FreeBSD.
+2. **System fonts** on desktop: Yu Gothic / Meiryo, Microsoft YaHei / SimSun, Microsoft JhengHei /
+   MingLiU and Malgun Gothic on Windows; Hiragino, PingFang / STHeiti, PingFang TC / Songti and
+   Apple SD Gothic Neo on macOS; Noto Sans CJK (SC or TC face), WenQuanYi, Droid Sans Fallback and
+   Nanum Gothic on Linux and FreeBSD. Arabic: Segoe UI / Tahoma / Arial on Windows, SF Arabic /
+   Geeza Pro on macOS, Noto Sans Arabic or DejaVu Sans on Linux and FreeBSD.
 
 **Web limitation:** a browser page can't read system fonts, so the web build shows CJK text only
 with the fonts it embeds: Japanese (and most shared Han characters) and Arabic when built with

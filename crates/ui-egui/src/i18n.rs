@@ -17,9 +17,10 @@ mod ja;
 mod ko;
 mod pt_br;
 mod zh_hans;
+mod zh_hant;
 
 pub struct Language {
-    /// BCP 47 code ("en", "pt-BR", "zh-Hans").
+    /// BCP 47 code ("en", "pt-BR", "zh-Hans", "zh-Hant").
     pub code: &'static str,
     /// The language's own name, for the picker.
     pub name: &'static str,
@@ -29,7 +30,7 @@ pub struct Language {
     pub table: &'static [(&'static str, &'static str)],
 }
 
-const COUNT: usize = 10;
+const COUNT: usize = 11;
 
 pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "en", name: "English", english: "English", table: &[] },
@@ -40,6 +41,7 @@ pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "it", name: "Italiano", english: "Italian", table: it::TABLE },
     Language { code: "ja", name: "日本語", english: "Japanese", table: ja::TABLE },
     Language { code: "zh-Hans", name: "简体中文", english: "Chinese (Simplified)", table: zh_hans::TABLE },
+    Language { code: "zh-Hant", name: "繁體中文（台灣）", english: "Chinese (Traditional, Taiwan)", table: zh_hant::TABLE },
     Language { code: "ko", name: "한국어", english: "Korean", table: ko::TABLE },
     Language { code: "ar", name: "العربية", english: "Arabic", table: ar::TABLE },
 ];
@@ -47,9 +49,14 @@ pub static LANGUAGES: [Language; COUNT] = [
 static MAPS: [OnceLock<HashMap<&'static str, &'static str>>; COUNT] = [const { OnceLock::new() }; COUNT];
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 
-/// Switch the UI language (unknown codes fall back to English).
+/// Switch the UI language (a locale such as "zh-TW" picks its language; unknown codes fall back
+/// to English).
 pub fn set_language(code: &str) {
-    CURRENT.store(LANGUAGES.iter().position(|l| l.code == code).unwrap_or(0), Ordering::Relaxed);
+    let index = LANGUAGES.iter().position(|l| l.code == code).or_else(|| {
+        let code = language_for_locale(code);
+        LANGUAGES.iter().position(|l| l.code == code)
+    });
+    CURRENT.store(index.unwrap_or(0), Ordering::Relaxed);
 }
 
 /// The current UI language.
@@ -97,14 +104,36 @@ pub fn trf(template: &str, args: &[(&str, &dyn Display)]) -> String {
 }
 
 /// The supported language for a locale such as "de-AT", "pt_BR.UTF-8" or "zh-Hant-TW" ("en" when
-/// none matches). Chinese locales get Simplified Chinese; Portuguese ones get Brazilian Portuguese.
+/// none matches). Chinese locales get Simplified Chinese unless the script says `Hant` or the
+/// region is Taiwan, Hong Kong or Macao; an explicit `Hans` always gets Simplified. Portuguese
+/// locales get Brazilian Portuguese.
 pub fn language_for_locale(locale: &str) -> &'static str {
-    let lang = locale.split(['-', '_', '.', '@']).next().unwrap_or("").to_ascii_lowercase();
-    match lang.as_str() {
+    let mut parts = locale.split(['-', '_', '.', '@']);
+    let lang = parts.next().unwrap_or("").to_ascii_lowercase();
+    let code = match lang.as_str() {
         "pt" => "pt-BR",
-        "zh" => "zh-Hans",
+        "zh" => {
+            let rest: Vec<String> = parts.map(|p| p.to_ascii_lowercase()).collect();
+            let has = |tag: &str| rest.iter().any(|p| p == tag);
+            // A script subtag is the strongest signal, then the region (TW, HK, MO).
+            if has("hans") {
+                "zh-Hans"
+            } else if has("hant") || ["tw", "hk", "mo"].iter().any(|r| has(r)) {
+                "zh-Hant"
+            } else {
+                "zh-Hans"
+            }
+        }
         l => LANGUAGES.iter().find(|x| x.code == l).map_or("en", |x| x.code),
-    }
+    };
+    drawable(code, cfg!(target_arch = "wasm32"))
+}
+
+/// The web build embeds no Traditional Chinese face, so an automatic `zh-Hant` choice would draw
+/// missing-glyph boxes on a first visit. Keep the choice on a drawable language there; the native
+/// build keeps Traditional Chinese.
+fn drawable(code: &'static str, web: bool) -> &'static str {
+    if web && code == "zh-Hant" { "en" } else { code }
 }
 
 /// The operating system's (or browser's) UI language, for the first run.
@@ -274,14 +303,74 @@ mod tests",
         assert_eq!(trf("Saved {path}", &[("path", &"a.tcraft")]), "Saved a.tcraft");
         assert_eq!(trf("{a} of {b} {c}", &[("a", &1), ("b", &2)]), "1 of 2 {c}");
         assert_eq!(trf("{unclosed", &[]), "{unclosed");
-        for (locale, code) in
-            [("de-AT", "de"), ("pt_PT.UTF-8", "pt-BR"), ("zh-Hant-TW", "zh-Hans"), ("ja", "ja"), ("ko_KR", "ko"), ("ar-EG", "ar"), ("nl-NL", "en"), ("", "en")]
-        {
+        for (locale, code) in [("de-AT", "de"), ("pt_PT.UTF-8", "pt-BR"), ("ja", "ja"), ("ko_KR", "ko"), ("ar-EG", "ar"), ("nl-NL", "en"), ("", "en")] {
             assert_eq!(language_for_locale(locale), code, "{locale}");
         }
         set_language("de");
         assert_eq!(current().code, "de");
         assert_eq!(tr("not a key"), "not a key");
+        set_language("en");
+    }
+
+    /// Taiwan, Hong Kong, Macao and `Hant` select Traditional Chinese; `Hans` and the mainland
+    /// regions keep Simplified.
+    #[test]
+    fn chinese_locales_pick_their_script_and_region() {
+        for (locale, code) in [
+            ("zh", "zh-Hans"),
+            ("zh-CN", "zh-Hans"),
+            ("zh-SG", "zh-Hans"),
+            ("zh-Hans", "zh-Hans"),
+            ("zh-Hans-CN", "zh-Hans"),
+            ("zh-Hans-TW", "zh-Hans"),
+            ("zh-hans", "zh-Hans"),
+            ("zh-TW", "zh-Hant"),
+            ("zh_HK", "zh-Hant"),
+            ("zh-MO", "zh-Hant"),
+            ("zh-Hant", "zh-Hant"),
+            ("zh-Hant-TW", "zh-Hant"),
+            ("zh-Hant-HK", "zh-Hant"),
+            ("zh_TW.UTF-8", "zh-Hant"),
+            ("zh-Hant-CN", "zh-Hant"),
+            ("zh-HK-Hant", "zh-Hant"),
+            ("ZH-tw", "zh-Hant"),
+        ] {
+            assert_eq!(language_for_locale(locale), code, "{locale}");
+        }
+    }
+
+    /// The web build has no Traditional Chinese face, so automatic selection stays drawable; the
+    /// native build keeps the language.
+    #[test]
+    fn the_web_falls_back_from_traditional_to_english() {
+        assert_eq!(drawable("zh-Hant", true), "en");
+        assert_eq!(drawable("zh-Hant", false), "zh-Hant");
+        assert_eq!(drawable("zh-Hans", true), "zh-Hans");
+    }
+
+    #[test]
+    fn switching_to_traditional_chinese_translates_and_survives_a_restart() {
+        let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A locale is enough: the switcher resolves it to a catalog code.
+        set_language("zh-TW");
+        assert_eq!(current().code, "zh-Hant");
+        assert_eq!(tr("Layers"), "圖層");
+        assert_eq!(tr("Brushes"), "筆刷");
+        assert_eq!(tr("Roughness"), "粗糙度");
+        assert_eq!(trf("Saved {path}", &[("path", &"a.tcraft")]), "已儲存 a.tcraft");
+        // An explicit Hans still gets Simplified Chinese, live.
+        set_language("zh-Hans");
+        assert_eq!(current().code, "zh-Hans");
+        assert_eq!(tr("Layers"), "图层");
+        // The saved UI state carries the code, so a restart comes back in the same language.
+        set_language("zh-TW");
+        let mut ui = crate::state::UiState::default();
+        ui.prefs.language = current().code.into();
+        let saved = serde_json::to_string(&ui).expect("UI state serializes");
+        let reloaded: crate::state::UiState = serde_json::from_str(&saved).expect("UI state loads");
+        assert_eq!(reloaded.prefs.language, "zh-Hant");
+        set_language(&reloaded.prefs.language);
+        assert_eq!(current().code, "zh-Hant");
         set_language("en");
     }
 

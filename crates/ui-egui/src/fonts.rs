@@ -36,18 +36,20 @@ const MAX_FONT_BYTES: u64 = 128 << 20;
 pub enum Script {
     Japanese,
     Chinese,
+    ChineseTraditional,
     Korean,
     Arabic,
 }
 
 impl Script {
-    pub const ALL: [Script; 4] = [Script::Japanese, Script::Chinese, Script::Korean, Script::Arabic];
+    pub const ALL: [Script; 5] = [Script::Japanese, Script::Chinese, Script::ChineseTraditional, Script::Korean, Script::Arabic];
 
     /// The script a UI language needs beyond Latin.
     pub fn of_language(code: &str) -> Option<Script> {
         match code {
             "ja" => Some(Script::Japanese),
             "zh-Hans" => Some(Script::Chinese),
+            "zh-Hant" => Some(Script::ChineseTraditional),
             "ko" => Some(Script::Korean),
             "ar" => Some(Script::Arabic),
             _ => None,
@@ -59,6 +61,7 @@ impl Script {
         match self {
             Script::Japanese => "Jpan",
             Script::Chinese => "Hans",
+            Script::ChineseTraditional => "Hant",
             Script::Korean => "Kore",
             Script::Arabic => "Arab",
         }
@@ -74,20 +77,31 @@ impl Script {
             let files: &[&str] = match self {
                 Script::Japanese => &["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"],
                 Script::Chinese => &["msyh.ttc", "simsun.ttc", "simhei.ttf"],
+                // Microsoft JhengHei, then PMingLiU (MingLiU) and DFKai-SB.
+                Script::ChineseTraditional => &["msjh.ttc", "mingliu.ttc", "kaiu.ttf"],
                 Script::Korean => &["malgun.ttf", "gulim.ttc"],
                 Script::Arabic => &["segoeui.ttf", "tahoma.ttf", "arial.ttf"],
             };
             v.extend(files.iter().map(|f| (fonts.join(f), 0)));
         } else if cfg!(target_os = "macos") {
-            let files: &[&str] = match self {
-                Script::Japanese => &["/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", "/System/Library/Fonts/Hiragino Sans GB.ttc"],
-                Script::Chinese => {
-                    &["/System/Library/Fonts/Hiragino Sans GB.ttc", "/System/Library/Fonts/STHeiti Light.ttc", "/System/Library/Fonts/PingFang.ttc"]
-                }
-                Script::Korean => &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
-                Script::Arabic => &["/System/Library/Fonts/SFArabic.ttf", "/System/Library/Fonts/Supplemental/GeezaPro.ttc"],
+            // PingFang.ttc and STHeiti Light.ttc hold the Simplified face first and the
+            // Traditional one second, so index 1 is the Taiwan face.
+            let files: &[(&str, u32)] = match self {
+                Script::Japanese => &[("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", 0), ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0)],
+                Script::Chinese => &[
+                    ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+                    ("/System/Library/Fonts/STHeiti Light.ttc", 0),
+                    ("/System/Library/Fonts/PingFang.ttc", 0),
+                ],
+                Script::ChineseTraditional => &[
+                    ("/System/Library/Fonts/PingFang.ttc", 1),
+                    ("/System/Library/Fonts/STHeiti Light.ttc", 1),
+                    ("/System/Library/Fonts/Supplemental/Songti.ttc", 0),
+                ],
+                Script::Korean => &[("/System/Library/Fonts/AppleSDGothicNeo.ttc", 0)],
+                Script::Arabic => &[("/System/Library/Fonts/SFArabic.ttf", 0), ("/System/Library/Fonts/Supplemental/GeezaPro.ttc", 0)],
             };
-            v.extend(files.iter().map(|f| (PathBuf::from(f), 0)));
+            v.extend(files.iter().map(|(f, i)| (PathBuf::from(f), *i)));
             v.push((PathBuf::from("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"), 0));
         } else if self == Script::Arabic {
             for f in [
@@ -101,12 +115,30 @@ impl Script {
             ] {
                 v.push((PathBuf::from(f), 0));
             }
+        } else if self == Script::ChineseTraditional {
+            // Noto's Traditional faces first: the standalone TC OTF, then the CJK collection's
+            // TC face, then the standalone Noto Sans TC family.
+            for dir in ["/usr/share/fonts/opentype/noto", "/usr/share/fonts/noto-cjk", "/usr/share/fonts/google-noto-cjk", "/usr/local/share/fonts/noto"] {
+                v.push((PathBuf::from(dir).join("NotoSansCJKtc-Regular.otf"), 0));
+                v.push((PathBuf::from(dir).join("NotoSansCJK-Regular.ttc"), 3));
+            }
+            for dir in ["/usr/share/fonts/truetype/noto", "/usr/share/fonts/noto", "/usr/local/share/fonts/noto"] {
+                v.push((PathBuf::from(dir).join("NotoSansTC-Regular.ttf"), 0));
+            }
+            for f in [
+                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+                "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+                "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            ] {
+                v.push((PathBuf::from(f), 0));
+            }
         } else {
             // Noto Sans CJK collections hold JP, KR, SC, TC and HK faces, in that order.
             let face = match self {
                 Script::Japanese | Script::Arabic => 0,
                 Script::Korean => 1,
                 Script::Chinese => 2,
+                Script::ChineseTraditional => 3,
             };
             for dir in ["/usr/share/fonts/opentype/noto", "/usr/share/fonts/noto-cjk", "/usr/share/fonts/google-noto-cjk", "/usr/local/share/fonts/noto"] {
                 v.push((PathBuf::from(dir).join("NotoSansCJK-Regular.ttc"), face));
@@ -275,6 +307,7 @@ mod tests {
     fn languages_map_to_scripts() {
         assert_eq!(Script::of_language("ja"), Some(Script::Japanese));
         assert_eq!(Script::of_language("zh-Hans"), Some(Script::Chinese));
+        assert_eq!(Script::of_language("zh-Hant"), Some(Script::ChineseTraditional));
         assert_eq!(Script::of_language("ko"), Some(Script::Korean));
         assert_eq!(Script::of_language("ar"), Some(Script::Arabic));
         assert_eq!(Script::of_language("de"), None);
@@ -283,6 +316,44 @@ mod tests {
             let other_script = l.name.chars().any(|c| c > '\u{036F}');
             assert_eq!(other_script, Script::of_language(l.code).is_some(), "{}", l.code);
         }
+    }
+
+    /// Traditional Chinese is its own script, drawn by Taiwan's faces: a different file on
+    /// Windows and a different face index in the shared collections than Simplified Chinese.
+    #[test]
+    fn traditional_chinese_prefers_taiwan_faces() {
+        assert_eq!(Script::of_language("zh-Hant"), Some(Script::ChineseTraditional));
+        assert_eq!(Script::ChineseTraditional.iso(), "Hant");
+        assert!(Script::ALL.contains(&Script::ChineseTraditional));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let files = Script::ChineseTraditional.system_files();
+            assert!(!files.is_empty(), "Traditional Chinese has system font candidates");
+            if cfg!(windows) {
+                let first = files.first().and_then(|(p, _)| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+                assert_eq!(first.as_deref(), Some("msjh.ttc"), "Microsoft JhengHei comes first");
+            }
+            if cfg!(target_os = "macos") {
+                assert_eq!(files.first().map(|(_, i)| *i), Some(1), "PingFang TC is the second face");
+            }
+            if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") {
+                // Noto Sans CJK TC is face 3 of the collection, beside the Simplified face 2.
+                assert!(files.iter().any(|(p, i)| p.ends_with("NotoSansCJK-Regular.ttc") && *i == 3));
+                assert!(Script::Chinese.system_files().iter().any(|(p, i)| p.ends_with("NotoSansCJK-Regular.ttc") && *i == 2));
+            }
+        }
+    }
+
+    #[test]
+    fn a_traditional_chinese_ui_loads_the_traditional_script_first() {
+        let ctx = egui::Context::default();
+        let mut f = UiFonts::default();
+        f.update(&ctx, "zh-Hant", false);
+        assert_eq!(f.installed, [Script::ChineseTraditional]);
+        // Switching between the Chinese scripts swaps the first fallback, so shared Han
+        // characters take that language's glyph forms.
+        f.update(&ctx, "zh-Hans", false);
+        assert_eq!(f.installed.first(), Some(&Script::Chinese));
     }
 
     #[test]
