@@ -50,12 +50,12 @@ static MAPS: [OnceLock<HashMap<&'static str, &'static str>>; COUNT] = [const { O
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 
 /// Switch the UI language (a locale such as "zh-TW" picks its language; unknown codes fall back
-/// to English).
+/// to English). On the web build an exact `zh-Hant` code is undrawable, so it falls back to
+/// English here too; explicit native choices keep Traditional Chinese.
 pub fn set_language(code: &str) {
-    let index = LANGUAGES.iter().position(|l| l.code == code).or_else(|| {
-        let code = language_for_locale(code);
-        LANGUAGES.iter().position(|l| l.code == code)
-    });
+    let resolved =
+        LANGUAGES.iter().find(|l| l.code == code).map(|l| drawable(l.code, cfg!(target_arch = "wasm32"))).unwrap_or_else(|| language_for_locale(code));
+    let index = LANGUAGES.iter().position(|l| l.code == resolved);
     CURRENT.store(index.unwrap_or(0), Ordering::Relaxed);
 }
 
@@ -346,6 +346,16 @@ mod tests",
         assert_eq!(drawable("zh-Hant", true), "en");
         assert_eq!(drawable("zh-Hant", false), "zh-Hant");
         assert_eq!(drawable("zh-Hans", true), "zh-Hans");
+    }
+
+    /// An exact `zh-Hant` code (e.g. restored from saved prefs) takes the same web fallback
+    /// as a locale; the native build keeps Traditional Chinese.
+    #[test]
+    fn set_language_applies_the_web_fallback_to_exact_codes() {
+        let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_language("zh-Hant");
+        assert_eq!(current().code, drawable("zh-Hant", cfg!(target_arch = "wasm32")));
+        set_language("en");
     }
 
     #[test]
