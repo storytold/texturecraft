@@ -68,6 +68,7 @@ pub const CATALOG: &[Item] = &[
     sub("Window", "Views", "Layers", "ui.view.layers", None),
     sub("Window", "Views", "Log", "ui.view.log", None),
     sub("Window", "Views", "Properties", "ui.view.properties", None),
+    sub("Window", "Views", "Reference", "ui.view.reference", None),
     sub("Window", "Views", "Shader Settings", "ui.view.shader", None),
     sub("Window", "Views", "Texture Sets", "ui.view.textureSetList", None),
     sub("Window", "Views", "Texture Set Settings", "ui.view.textureSetSettings", None),

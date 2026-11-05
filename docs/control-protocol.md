@@ -65,7 +65,7 @@ keeps its state in a throwaway file.
 | `ui.inspect` | | UI state, viewport rect, fps, bake progress, toasts, `titleBar` (who draws the title bar this run: `app`, `integrated` on macOS, or `system`) |
 | `ui.menu.list` | | the menu catalog: `{menu, submenu, label, id, shortcut, implemented, enabled}` |
 | `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window) |
-| `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History` and `Log`; `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds) | `null` |
+| `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History`, `Log` and `Reference`; `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds) | `null` |
 | `viewport.screenshot` | `{view?: "3d" \| "2d"}` | `{width, height, png}` (PNG, base64) |
 | `ui.screenshot` | | `{width, height, png}` of the whole window, after the next frame |
 | `ui.resize` | `{width, height}` | Sets the window's inner size in points (640–7680), leaving maximized state; for recordings and screenshots at a fixed size |
@@ -222,6 +222,33 @@ File access follows `--read-root` / `--write-root` as for MCP.
 printf '%s\n' '{"id":1,"method":"command.run","params":{"id":"project.new","params":{"mesh":"torus"}}}' \
               '{"id":2,"method":"render","params":{"width":512,"height":512}}' | texturecraft-cli serve
 ```
+
+## Reference images
+
+Pictures to paint from. They are kept with the project, shown in the **Reference** panel (Window ▸
+Views ▸ Reference, `ui.view.reference`) and can be pinned over the 3D view. The pinned overlay is
+drawn by the interface over the 3D view only: it is never part of a render, a path-traced image or
+an export. Projects saved before references existed load unchanged.
+
+Storage is the user's choice per image: `embedded` (default) keeps a copy in the project file;
+`linked` keeps a path, written relative to the project file's folder once the project is saved
+(`../refs/wood.png`), absolute before that. A linked file that is gone, or an image that does not
+decode, only marks its reference (`status: missing` / `invalid` with an `error`); the project still
+opens and saves. `reference.reload` reads linked files again. A project file never makes a headless
+or MCP session read files: linked references stay `missing` there.
+
+| Command | Params → result |
+|---|---|
+| `reference.add` | `{path \| resource, name?, storage?: embedded\|linked}` → `{id, name, storage, status, width, height, …}`. `path` is refused through `command.run` like every path (use `resource.import`, then `resource`). |
+| `reference.remove` | `{id}` (also unpins it) |
+| `reference.list` | `{}` → `{references: [{id, name, storage, path?, status, error?, width, height, flipH, flipV, grayscale}], overlay}` |
+| `reference.set` | `{id, name?, flipH?, flipV?, grayscale?}` |
+| `reference.overlay` | `{reference?: id \| null (off), opacity?, x?, y?, scale?}` → the overlay (`x`, `y`: image centre as a fraction of the 3D view; `scale`: image height as a fraction of the view height) |
+| `reference.pick` | `{id, u, v, radius?, apply?: true}` → `{linear: [r,g,b], srgb: "#rrggbb", applied}`: the colour at (`u`, `v`) of the image as shown (flips and grayscale applied), averaged over `radius` source pixels in linear light, set as the brush's Base color when `apply` |
+| `reference.reload` | `{id?}` |
+
+`session.inspect` lists the references under `references`. Images over 32 megapixels or 256 MB are
+refused; a project holds at most 64 references.
 
 ## MaterialCraft materials
 

@@ -28,6 +28,8 @@ zip = { workspace = true }
 # The OS UI language for the first run (MIT OR Apache-2.0; the browser asks `navigator.language`).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 sys-locale = "0.3"
+# Reference panel › Paste: an image from the clipboard (MIT OR Apache-2.0; already in the tree through egui-winit).
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
 # Floating panels open as OS windows.
 craft-ui = { workspace = true, features = ["native-windows"] }
 

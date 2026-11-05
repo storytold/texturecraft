@@ -341,6 +341,11 @@ pub struct Session {
     pub clipboard: Option<(Document, LayerId)>,
     /// Decoded image resources (rebuilt from `doc.resources` by `Session::sync_images`).
     pub images: texturecraft_compose::ImageStore,
+    /// Decoded reference images (rebuilt from the project by `Session::sync_references`).
+    pub references: crate::reference_cmds::RefCache,
+    /// Linked reference images are read from disk. Off until the app opens a project file from
+    /// the user's own disk (a headless or MCP session never follows links a project file names).
+    pub read_linked_files: bool,
     /// Temporary texel mask limiting paint strokes (not saved, not in the history).
     pub quick_mask: crate::quick_mask::QuickMask,
     /// A path sublayer is being repainted from its paths (the only way to paint into one).
@@ -397,6 +402,8 @@ impl Session {
             stroke: None,
             clipboard: None,
             images: Default::default(),
+            references: Default::default(),
+            read_linked_files: false,
             quick_mask: Default::default(),
             painting_paths: false,
             path_cache: None,

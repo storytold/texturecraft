@@ -863,7 +863,7 @@ fn image_menu(app: &mut TextureCraftApp, ui: &mut Ui) -> Option<String> {
     let mut picked = None;
     // Bounded, so Import... and the items after it stay on screen with many images.
     egui::ScrollArea::vertical().id_salt("image_menu").max_height(240.0).show(ui, |ui| {
-        for name in app.session.doc.resources.keys() {
+        for name in app.session.doc.resources.keys().filter(|n| !texturecraft_engine::reference_cmds::is_embedded_copy(n)) {
             if ui.button(name.as_str()).clicked() {
                 picked = Some(name.clone());
             }
@@ -1050,7 +1050,7 @@ fn tool_properties(app: &mut TextureCraftApp, ui: &mut Ui) {
 fn stencil_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     let tk = Tokens::get(ui.ctx());
     ui.label(caption(tr("Stencil")));
-    let names: Vec<String> = app.session.doc.resources.keys().cloned().collect();
+    let names: Vec<String> = app.session.doc.resources.keys().filter(|n| !texturecraft_engine::reference_cmds::is_embedded_copy(n)).cloned().collect();
     let current = app.session.tool.stencil.as_ref().map(|s| s.image.clone()).unwrap_or_else(|| tr("None").into());
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt("stencil_img").width(170.0).selected_text(current.clone()).show_ui(ui, |ui| {
@@ -1281,7 +1281,7 @@ fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
             });
         }
         // Imported images, sampled as grayscale.
-        for name in app.session.doc.resources.keys() {
+        for name in app.session.doc.resources.keys().filter(|n| !texturecraft_engine::reference_cmds::is_embedded_copy(n)) {
             let Some(img) = app.session.images.get(name) else { continue };
             let tex = app.thumbs.image(ui.ctx(), name, img);
             let on = image.as_deref() == Some(name.as_str());

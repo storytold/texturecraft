@@ -439,6 +439,8 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // Shelf drops: a material goes above the selection, an alpha on the brush.
     crate::shelf::drop_target(app, ui, &resp, crate::shelf::DropZone::View3d);
 
+    // The pinned reference image (a screen overlay: never in a render or export).
+    crate::reference::overlay(app, ui, rect);
     // Brush cursor.
     if app.ui.mode == crate::state::Mode::Painting
         && !navigating

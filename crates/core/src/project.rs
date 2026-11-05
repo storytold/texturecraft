@@ -414,6 +414,65 @@ pub struct Project {
     /// Saved and imported cameras (the viewport's default camera is not in the list).
     #[serde(default)]
     pub cameras: Vec<Camera>,
+    /// Reference images to paint from (never part of an export or render). Old projects have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<Reference>,
+    /// The reference pinned over the 3D view.
+    #[serde(default, skip_serializing_if = "ReferenceOverlay::is_default")]
+    pub reference_overlay: ReferenceOverlay,
+}
+
+/// Most references a project holds.
+pub const MAX_REFERENCES: usize = 64;
+
+/// Where a reference image's bytes live.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceSource {
+    /// A copy stored in the project file, as the resource `resource`.
+    Embedded { resource: String },
+    /// A file outside the project: relative to the project file's folder, or absolute.
+    Linked { path: String },
+}
+
+/// A reference image: shown in the Reference panel and, optionally, over the 3D view.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Reference {
+    pub id: u64,
+    pub name: String,
+    pub source: ReferenceSource,
+    #[serde(default)]
+    pub flip_h: bool,
+    #[serde(default)]
+    pub flip_v: bool,
+    /// Shown (and picked from) as luminance only.
+    #[serde(default)]
+    pub grayscale: bool,
+}
+
+/// The reference pinned over the 3D view: a screen-space overlay the renderer and exports never see.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReferenceOverlay {
+    /// The pinned reference (`None`: the overlay is off).
+    pub reference: Option<u64>,
+    /// 0..1.
+    pub opacity: f32,
+    /// Image centre, as a fraction of the 3D view (0.5, 0.5 is the middle).
+    pub center: [f32; 2],
+    /// Image height as a fraction of the 3D view height.
+    pub scale: f32,
+}
+
+impl Default for ReferenceOverlay {
+    fn default() -> Self {
+        ReferenceOverlay { reference: None, opacity: 0.5, center: [0.5, 0.5], scale: 0.5 }
+    }
+}
+
+impl ReferenceOverlay {
+    pub fn is_default(&self) -> bool {
+        *self == ReferenceOverlay::default()
+    }
 }
 
 impl Project {
@@ -429,6 +488,8 @@ impl Project {
             next_id: 1,
             display: DisplaySettings::default(),
             cameras: Vec::new(),
+            references: Vec::new(),
+            reference_overlay: ReferenceOverlay::default(),
         }
     }
 
@@ -646,6 +707,13 @@ impl Project {
                     return Err(CoreError::Invalid(format!("layer {} appears twice", id.0)));
                 }
             }
+        }
+        if self.references.len() > MAX_REFERENCES {
+            return Err(CoreError::Invalid(format!("{} reference images (limit {MAX_REFERENCES})", self.references.len())));
+        }
+        let mut ids = BTreeSet::new();
+        if let Some(r) = self.references.iter().find(|r| !ids.insert(r.id)) {
+            return Err(CoreError::Invalid(format!("reference {} appears twice", r.id)));
         }
         match self.instance_cycle() {
             Some(id) => Err(CoreError::Invalid(format!("instance layer {} draws itself", id.0))),

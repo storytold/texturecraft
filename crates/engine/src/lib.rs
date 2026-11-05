@@ -38,6 +38,7 @@ pub mod preset_cmds;
 pub mod preview;
 pub mod project_cmds;
 pub mod quick_mask;
+pub mod reference_cmds;
 pub mod resource_cmds;
 pub mod session;
 pub mod set_cmds;

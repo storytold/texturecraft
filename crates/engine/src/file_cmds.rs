@@ -345,6 +345,10 @@ mod native {
             let mut s = Session::from_project_file(pf)?;
             s.path = Some(path.to_string());
             s.modified = false;
+            // Linked references resolve against the project file's folder.
+            s.read_linked_files = true;
+            s.references.clear();
+            s.sync_references();
             Ok(s)
         } else {
             let f = read_mesh("file.open", path)?;
@@ -356,10 +360,19 @@ mod native {
 
     pub fn save_to(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
         let path = if ext_of(path) == PROJECT_EXT { path.to_string() } else { format!("{path}.{PROJECT_EXT}") };
-        texturecraft_formats::save_project(Path::new(&path), &s.project_file()).map_err(fe)?;
+        let mut pf = s.project_file();
+        // Linked references are written to find their files from where the project file lands.
+        let refs = std::path::absolute(&path).ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf)).map(|dir| s.references_for_dir(&dir));
+        if let Some(refs) = &refs {
+            pf.project.references = refs.clone();
+        }
+        texturecraft_formats::save_project(Path::new(&path), &pf).map_err(fe)?;
         if adopt {
             s.path = Some(path.clone());
             s.modified = false;
+            if let Some(refs) = &refs {
+                s.adopt_reference_paths(refs);
+            }
         }
         s.log.push(format!("Saved {path}"));
         Ok(json!({ "path": path }))
@@ -448,6 +461,9 @@ impl Session {
         let mut next = Session::new(doc, mesh, source)?;
         next.log.extend(warnings);
         next.path = self.path.clone();
+        next.read_linked_files = self.read_linked_files;
+        next.references.clear();
+        next.sync_references();
         let preserved = preserve_strokes.then(|| crate::preserve::preserve_strokes(self, &mut next));
         self.switch_to(next);
         Ok(preserved.map_or(Value::Null, |n| json!({ "preserved": n })))

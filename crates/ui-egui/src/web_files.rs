@@ -46,6 +46,8 @@ enum Pick {
     Cage,
     /// Export dialog › Output templates: an export template (`.json`).
     ExportPreset,
+    /// Reference panel: an image to paint from.
+    Reference,
 }
 
 /// Files picked in the browser, waiting for the next frame: (file name, bytes, purpose).
@@ -60,6 +62,7 @@ pub fn poll(app: &mut TextureCraftApp) {
                 load(app, &name, bytes);
                 continue;
             }
+            Pick::Reference => app.session.add_reference_bytes(&name, bytes).map(crate::reference::select),
             Pick::Environment => app.session.import_resource_bytes(&name, bytes).map(|res| use_environment(app, &res)),
             Pick::HighPoly => app.session.add_high_poly_bytes(&name, bytes).map(|n| app.toast(trf("High poly: {name}", &[("name", &n)]), false)),
             Pick::Cage => app.session.set_cage_bytes(&name, bytes).map(|n| app.toast(trf("Cage: {name}", &[("name", &n)]), false)),
@@ -200,8 +203,8 @@ fn zip_files(files: &[ExportedFile]) -> Result<Vec<u8>, String> {
 
 #[cfg(target_arch = "wasm32")]
 pub use web::{
-    download, export_mesh, export_textures, import_bake_mesh, import_environment, import_images, import_material, import_preset, open, save_project,
-    sync_unsaved, unsaved,
+    download, drop_reference, export_mesh, export_textures, import_bake_mesh, import_environment, import_images, import_material, import_preset, open,
+    pick_reference, save_project, sync_unsaved, unsaved,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -236,6 +239,24 @@ mod web {
     /// File › Import resources: pick images; they import on a later frame.
     pub fn import_images(ctx: &egui::Context) {
         pick(ctx, tr("Images"), IMAGE_EXTS, true, Pick::Open);
+    }
+
+    /// Reference panel › Add: pick images; they become references on a later frame.
+    pub fn pick_reference(ctx: &egui::Context) {
+        pick(ctx, tr("Images"), IMAGE_EXTS, true, Pick::Reference);
+    }
+
+    /// An image dropped on the Reference panel: it becomes a reference on a later frame.
+    pub fn drop_reference(ctx: &egui::Context, file: &egui::DroppedFileHandle) {
+        let (file, ctx) = (file.clone(), ctx.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let name = file.path().display().to_string();
+            match file.bytes_async().await {
+                Ok(bytes) => INBOX.lock().unwrap_or_else(PoisonError::into_inner).push((name, bytes, Pick::Reference)),
+                Err(e) => log::warn!("couldn't read dropped file {name}: {e}"),
+            }
+            ctx.request_repaint();
+        });
     }
 
     /// Display settings › Import HDR: pick an equirect image; it becomes the environment on a
