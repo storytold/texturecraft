@@ -233,6 +233,51 @@ pub struct RenderParams {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct TurntableToolParams {
+    /// Animated GIF to write (workspace-relative path ending in .gif).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gif: Option<String>,
+    /// Directory for the PNG frame sequence (`<stem>_0000.png`, …; full alpha). Give `gif`, `dir` or both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// File name stem of the PNG frames (default `turntable`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stem: Option<String>,
+    /// Frames for the full 360 degrees, 2..720 (default 36).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<u32>,
+    /// Frames per second, 1..60 (default 24); GIF delays are whole hundredths of a second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    /// `camera` (default: the camera orbits the model) or `environment` (only the environment, its key light and shadows turn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spin: Option<String>,
+    /// With `camera`: turn the environment light with the camera, so the lighting stays fixed to the view and the model seems to spin in place.
+    #[serde(default, rename = "rotateEnv", skip_serializing_if = "Option::is_none")]
+    pub rotate_env: Option<bool>,
+    /// `viewport` (default: the environment as shown) or `transparent` (needs `samples`; the CPU path tracer; GIF has 1-bit transparency, PNG frames full alpha).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    /// Pixels, 16..2048 (default: the session viewport).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Camera pitch in degrees (-89..89); default the session camera's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch: Option<f32>,
+    /// Path trace every frame with this many samples (1..4096) instead of the real-time viewport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub samples: Option<u32>,
+    /// Light bounces when path tracing (default 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounces: Option<u32>,
+    /// Path trace on the CPU even when a GPU is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ScreenshotParams {
     /// `3d` (default) or `2d`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -333,7 +378,7 @@ impl TexturecraftMcp {
                     b.call("command.run", json!({"id": "file.reimportMesh", "params": {"preserveStrokes": p.get("preserveStrokes")}})).await
                 }
                 "project.save" | "project.open" | "mesh.import" | "mesh.reimport" | "mesh.export" | "bake.mesh.add" | "resource.import" | "material.save"
-                | "material.load" | "textures.export" | "command.batch" | "render" => {
+                | "material.load" | "textures.export" | "command.batch" | "render" | "turntable" => {
                     Err(bad(format!("`{method}` with paths works in headless mode only: the running app reads and writes its own files (use ui_menu_invoke)")))
                 }
                 _ => b.call(method, p).await,
@@ -506,6 +551,13 @@ impl TexturecraftMcp {
     async fn viewport_render(&self, Parameters(p): Parameters<RenderParams>) -> Result<CallToolResult, McpError> {
         let note = format!("render {}", params(&p));
         image_result(self.call("render", params(&p)).await, &note, false)
+    }
+
+    #[tool(description = "Headless: render a 360-degree turntable (the camera, or only the environment, spins around the up axis \
+        over `frames` frames) and write it as an animated GIF (`gif`) and/or a PNG frame sequence (`dir`). The session is not \
+        changed. MP4/WebM are not produced (no pure-Rust encoder): turn the PNG frames into video with any video tool.")]
+    async fn viewport_turntable(&self, Parameters(p): Parameters<TurntableToolParams>) -> Result<CallToolResult, McpError> {
+        to_result(self.call("turntable", params(&p)).await)
     }
 
     #[tool(description = "Bridge mode: PNG of the live app's 3D or 2D viewport.")]

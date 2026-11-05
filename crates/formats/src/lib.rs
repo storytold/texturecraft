@@ -37,6 +37,7 @@ pub mod mesh_export;
 pub mod mesh_import;
 pub mod presets;
 pub mod project_file;
+pub mod turntable;
 
 pub use export::{
     Dest, ExportInput, ExportOptions, ExportPreset, ExportedFile, FileFormat, MapSpec, Padding, PlannedFile, SourceRef, VirtualMap, list_outputs, render_maps,

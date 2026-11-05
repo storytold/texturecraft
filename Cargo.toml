@@ -40,6 +40,8 @@ epaint_default_fonts = "0.37"
 log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "tiff", "exr", "hdr", "bmp", "webp"] }
 half = "2"
+# Animated GIF encoding for turntable exports (pure Rust, MIT OR Apache-2.0; pulls in color_quant, MIT).
+gif = "0.14"
 exr = { version = "1.73", default-features = false }
 eframe = { version = "0.37", default-features = false }
 egui = "0.37"

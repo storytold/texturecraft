@@ -372,6 +372,31 @@ impl Tracer {
 }
 
 impl Tracer {
+    /// Like [`Tracer::rgba8`] but with the background left out: the color is the tone-mapped
+    /// mesh radiance (not blended with the backdrop) and alpha is the share of samples that hit
+    /// the mesh, so anti-aliased edges keep a partial alpha. Straight (not premultiplied) alpha.
+    pub fn rgba8_transparent(&self, d: &TraceDisplay) -> Vec<u8> {
+        let n = self.samples.max(1) as f32;
+        let denoised = if d.denoise { self.denoise() } else { Vec::new() };
+        let mut out = vec![0u8; self.acc.len() * 4];
+        out.par_chunks_mut(4).zip(self.acc.par_iter()).enumerate().for_each(|(i, (o, px))| {
+            let a = (px.hits / n).clamp(0.0, 1.0);
+            let mean = denoised.get(i).copied().unwrap_or(px.hit / px.hits.max(1.0));
+            let c = if px.hits > 0.0 { tonemap(mean, d) } else { Vec3::ZERO };
+            for (k, v) in c.to_array().into_iter().enumerate() {
+                if let Some(o) = o.get_mut(k) {
+                    *o = (texturecraft_texel::linear_to_srgb(v.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+                }
+            }
+            if let Some(o) = o.get_mut(3) {
+                *o = (a * 255.0 + 0.5) as u8;
+            }
+        });
+        out
+    }
+}
+
+impl Tracer {
     /// Edge-avoiding à-trous filtering of the mesh radiance: lighting is divided by the first-hit
     /// reflectance (so texture detail stays sharp), filtered five times with growing steps, its
     /// weights falling off across normal, depth and luminance edges (scaled by the estimated
@@ -1078,6 +1103,28 @@ mod tests {
         let corner: u32 = px(0, 0).iter().map(|v| *v as u32).sum();
         assert!(center > corner + 60, "center {center} corner {corner}");
         assert!(tr.acc.iter().all(|p| p.hit.is_finite() && p.env.is_finite()));
+    }
+
+    #[test]
+    fn transparent_output_has_coverage_alpha_and_no_backdrop() {
+        let s = scene("Studio Soft");
+        let mut tr = Tracer::new(48, 32);
+        for _ in 0..2 {
+            tr.pass(&s, &camera(), &TraceSettings::default());
+        }
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 1.0, denoise: false };
+        let img = tr.rgba8_transparent(&d);
+        assert_eq!(img.len(), 48 * 32 * 4);
+        let px = |x: usize, y: usize| &img[(y * 48 + x) * 4..(y * 48 + x) * 4 + 4];
+        assert_eq!(px(24, 16)[3], 255, "the sphere covers the center");
+        assert_eq!(px(0, 0), [0, 0, 0, 0], "nothing behind the corner, not even the backdrop");
+        // The opaque output is the same image over a backdrop: same mesh color where fully covered.
+        let opaque = tr.rgba8(&d);
+        for (a, b) in opaque[(16 * 48 + 24) * 4..(16 * 48 + 24) * 4 + 3].iter().zip(&px(24, 16)[..3]) {
+            assert!(a.abs_diff(*b) <= 1, "{a} vs {b}");
+        }
+        // The rim pixels are partly covered (anti-aliasing): some alpha strictly between 0 and 255.
+        assert!(img.chunks(4).any(|p| p[3] > 0 && p[3] < 255), "edges keep a partial alpha");
     }
 
     #[test]

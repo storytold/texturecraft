@@ -9,7 +9,8 @@
 //! `resource.import {path}`, `material.save {path, layer?, name?}`, `material.load {path}`
 //! (workspace-scoped versions of the engine commands),
 //! `textures.export {dir, …}`, `render {view?, width?, height?, yaw?, pitch?}` (PNG base64, the
-//! shape of the app's `viewport.screenshot`) and `methods`.
+//! shape of the app's `viewport.screenshot`), `turntable {gif?, dir?, frames?, fps?, …}` (a 360-degree
+//! spin written as a GIF and/or PNG frames) and `methods`.
 
 use std::io::{BufRead, Write};
 use std::net::TcpListener;
@@ -43,6 +44,7 @@ pub const METHODS: &[&str] = &[
     "material.load",
     "textures.export",
     "render",
+    "turntable",
 ];
 
 fn str_of<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
@@ -72,6 +74,31 @@ fn bool_of(p: &Value, k: &str) -> Result<bool, AutomationError> {
 
 fn required<'a>(p: &'a Value, k: &str) -> Result<&'a str, AutomationError> {
     str_of(p, k).ok_or_else(|| bad(format!("`{k}` is required")))
+}
+
+/// The `turntable` params: `frames` (36), `fps` (24), `spin` (`camera` | `environment`),
+/// `rotateEnv`, `background` (`viewport` | `transparent`), `width`, `height`, `pitch`, `samples`,
+/// `bounces`, `cpu`, `gif` (file path), `dir` (PNG frames directory), `stem`.
+fn turntable_params(p: &Value) -> Result<crate::TurntableParams, AutomationError> {
+    use texturecraft_engine::formats::turntable::{Background, Spin, Turntable};
+    let d = Turntable::default();
+    let te = |e: texturecraft_engine::formats::turntable::TurntableError| bad(e.to_string());
+    let spin = str_of(p, "spin").map(Spin::parse).transpose().map_err(te)?.unwrap_or_default();
+    let turntable = Turntable::new(u32_of(p, "frames")?.unwrap_or(d.frames), u32_of(p, "fps")?.unwrap_or(d.fps), spin, bool_of(p, "rotateEnv")?).map_err(te)?;
+    let background = str_of(p, "background").map(Background::parse).transpose().map_err(te)?.unwrap_or_default();
+    Ok(crate::TurntableParams {
+        turntable,
+        background,
+        width: u32_of(p, "width")?,
+        height: u32_of(p, "height")?,
+        pitch: f32_of(p, "pitch")?,
+        samples: u32_of(p, "samples")?,
+        bounces: u32_of(p, "bounces")?,
+        cpu: bool_of(p, "cpu")?,
+        gif: str_of(p, "gif").map(str::to_string),
+        frames_dir: str_of(p, "dir").map(str::to_string),
+        stem: str_of(p, "stem").unwrap_or("turntable").to_string(),
+    })
 }
 
 impl Headless {
@@ -113,6 +140,12 @@ impl Headless {
                 };
                 let r = self.render_png(&o)?;
                 Ok(json!({ "width": r.width, "height": r.height, "by": r.by, "png": base64::engine::general_purpose::STANDARD.encode(r.png) }))
+            }
+            "turntable" => {
+                let tp = turntable_params(p)?;
+                let never = std::sync::atomic::AtomicBool::new(false);
+                let r = self.turntable(&tp, &never, &mut |_, _| {})?;
+                Ok(json!({ "frames": r.frames, "width": r.width, "height": r.height, "by": r.by, "gif": r.gif, "gifBytes": r.gif_bytes, "files": r.files }))
             }
             m if m.starts_with("ui.") || m == "viewport.screenshot" => {
                 Err(bad(format!("`{m}` needs the running app (texturecraft --control <port>); headless renders use `render`")))

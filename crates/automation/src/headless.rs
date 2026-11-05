@@ -81,7 +81,7 @@ impl Headless {
         Ok(Session::new_project("Untitled", primitives::material_ball(), "builtin:material_ball", None, 1024)?)
     }
 
-    fn trusted(&self) -> bool {
+    pub(crate) fn trusted(&self) -> bool {
         matches!(self.fs, Filesystem::TrustedLocal)
     }
 
@@ -99,7 +99,7 @@ impl Headless {
         }
     }
 
-    fn write(&self, path: &str, bytes: &[u8]) -> Result<(), AutomationError> {
+    pub(crate) fn write(&self, path: &str, bytes: &[u8]) -> Result<(), AutomationError> {
         match &self.fs {
             Filesystem::Denied => Err(bad("file access is not granted: start the server with --write-root <dir>")),
             Filesystem::TrustedLocal => {
@@ -115,12 +115,24 @@ impl Headless {
         }
     }
 
-    fn create_dir_all(&self, dir: &str) -> Result<(), AutomationError> {
+    pub(crate) fn create_dir_all(&self, dir: &str) -> Result<(), AutomationError> {
         match &self.fs {
             _ if dir == "." => Ok(()),
             Filesystem::Denied => Err(bad("file access is not granted: start the server with --write-root <dir>")),
             Filesystem::TrustedLocal => std::fs::create_dir_all(dir).map_err(|e| AutomationError::Io(format!("cannot create {dir}: {e}"))),
             Filesystem::Workspace(w) => w.create_dir_all(dir),
+        }
+    }
+
+    /// Remove a file this process wrote (a missing file is fine).
+    pub(crate) fn remove_file(&self, path: &str) -> Result<(), AutomationError> {
+        match &self.fs {
+            Filesystem::Denied => Err(bad("file access is not granted")),
+            Filesystem::TrustedLocal => match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(AutomationError::Io(format!("cannot remove {path}: {e}"))),
+                _ => Ok(()),
+            },
+            Filesystem::Workspace(w) => w.remove_file(path),
         }
     }
 

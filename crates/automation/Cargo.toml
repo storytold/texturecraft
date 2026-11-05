@@ -28,4 +28,5 @@ getrandom = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+gif = { workspace = true }
 rmcp = { workspace = true, features = ["client"] }

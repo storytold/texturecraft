@@ -21,11 +21,13 @@ pub mod render;
 pub mod rpc;
 pub mod security;
 pub mod server;
+pub mod turntable;
 pub mod workspace;
 
 pub use bridge::BridgeClient;
 pub use headless::{Filesystem, Headless, RenderOptions};
 pub use server::{Backend, TexturecraftMcp};
+pub use turntable::{TurntableParams, TurntableReport};
 pub use workspace::AuthorizedWorkspace;
 
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +44,8 @@ pub enum AutomationError {
     App(String),
     #[error("{0}")]
     Other(String),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub(crate) fn bad(msg: impl Into<String>) -> AutomationError {

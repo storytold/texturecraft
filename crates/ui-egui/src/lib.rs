@@ -26,6 +26,8 @@ pub mod theme;
 pub mod thumbs;
 pub mod titlebar;
 pub mod toolbar;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod turntable;
 pub mod viewport;
 pub mod web_files;
 pub mod widgets;
@@ -96,6 +98,9 @@ pub struct TextureCraftApp {
     pub brushes: Option<Vec<std::path::PathBuf>>,
     /// Rendering mode's path tracer.
     pub render: render_mode::RenderView,
+    /// The Display panel's turntable settings and the running turntable export.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub turntable: turntable::State,
     /// Smoothed CPU time spent building the UI per frame (ms).
     pub ui_ms: f32,
     /// Frame timing and the scripted paint test (`debug.*` control methods).
@@ -155,6 +160,8 @@ impl TextureCraftApp {
             library: None,
             brushes: None,
             render: render_mode::RenderView::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            turntable: turntable::State::default(),
             last_paint_point: None,
             placing_decal: None,
             render_state: cc.wgpu_render_state.clone(),
@@ -496,6 +503,8 @@ impl eframe::App for TextureCraftApp {
         }
         self.poll_bake(ctx);
         self.poll_resize(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        turntable::poll(self, ctx);
         self.poll_link_cooks(ctx);
         // The library shelf rescans when the window comes back (MaterialCraft may have sent a material).
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);

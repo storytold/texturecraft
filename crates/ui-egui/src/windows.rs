@@ -179,6 +179,8 @@ pub(crate) fn display(app: &mut TextureCraftApp, ui: &mut Ui) {
     if import_hdr {
         crate::web_files::import_environment(app, &ctx);
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::turntable::section(app, ui);
 }
 
 /// The camera list: rename (edit the name), view or delete saved and imported cameras, save the

@@ -11,6 +11,8 @@
 //! - `ui.set {...}`: merge fields into the UI state (e.g. `{"layout":"Only3D"}`).
 //! - `viewport.screenshot {view?: "3d"|"2d"}`: PNG of a viewport, base64.
 //! - `ui.screenshot`: PNG of the whole window (replies after the next frame).
+//! - `viewport.turntable {frames?, fps?, spin?, rotateEnv?, background?, samples?, width?, height?, gif?, dir?, stem?}`:
+//!   start a 360-degree turntable export (desktop; progress in `ui.inspect`); `viewport.turntable.cancel` stops it.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -110,6 +112,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
                 "uiMs": app.ui_ms,
                 "titleBar": app.title_bar.name(),
                 "baking": app.bake_progress(),
+                "turntable": turntable_progress(app),
                 "toasts": app.toasts.iter().map(|t| json!({"text": t.text, "error": t.error})).collect::<Vec<_>>(),
             }))
         }
@@ -153,15 +156,35 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
                 None => err("no rendered view to capture yet"),
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        m @ ("viewport.turntable" | "viewport.turntable.cancel") => match crate::turntable::control(app, ctx, m, p) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
         other => err(format!("unknown method `{other}`")),
     }
 }
 
-/// Encode a rendered view as PNG.
-pub fn screenshot(app: &TextureCraftApp, view: u64) -> Option<(u32, u32, Vec<u8>)> {
+#[cfg(not(target_arch = "wasm32"))]
+fn turntable_progress(app: &TextureCraftApp) -> Value {
+    app.turntable.progress().map_or(Value::Null, |(done, total)| json!({"done": done, "total": total}))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn turntable_progress(_: &TextureCraftApp) -> Value {
+    Value::Null
+}
+
+/// The pixels (RGBA8, sRGB) of a rendered view.
+pub(crate) fn capture_rgba(app: &TextureCraftApp, view: u64) -> Option<(u32, u32, Vec<u8>)> {
     let rs = app.render_state.as_ref()?;
     let renderer = rs.renderer.read();
     let gpu = renderer.callback_resources.get::<crate::gpu::GpuState>()?;
-    let (w, h, rgba) = gpu.renderer.read_view(&rs.device, &rs.queue, view)?;
+    gpu.renderer.read_view(&rs.device, &rs.queue, view)
+}
+
+/// Encode a rendered view as PNG.
+pub fn screenshot(app: &TextureCraftApp, view: u64) -> Option<(u32, u32, Vec<u8>)> {
+    let (w, h, rgba) = capture_rgba(app, view)?;
     encode_png(w, h, rgba)
 }

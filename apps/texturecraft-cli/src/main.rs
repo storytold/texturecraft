@@ -34,6 +34,17 @@ USAGE:
       Render the viewport to PNG (needs a GPU or software adapter); --camera looks through a
       camera saved in the project (camera.add); --samples path traces it instead (Rendering
       mode), on the GPU when it has compute shaders, else (or with --cpu) on the CPU.
+  texturecraft-cli turntable <input> <out.gif | frames-dir> [--frames-dir <dir>] [--frames <n>] [--fps <n>]
+                   [--size <W>x<H>] [--spin camera|environment] [--rotate-env]
+                   [--background viewport|transparent] [--camera <name>] [--pitch <deg>]
+                   [--samples <n>] [--bounces <n>] [--cpu] [--stem <name>]
+      Render a 360-degree turntable (default 36 frames at 24 fps). The output is an animated
+      GIF when it ends in .gif, else a directory of numbered PNG frames (--frames-dir adds the
+      PNG frames next to a GIF). --spin camera orbits the camera around the up axis (with
+      --rotate-env the environment light turns with it, so the model seems to spin in fixed
+      light); --spin environment turns only the environment. --background transparent needs
+      --samples and path traces on the CPU. No MP4/WebM: feed the PNG frames to any video tool.
+      The project is not changed.
   texturecraft-cli new <mesh file | builtin:<id>> <out.tcraft> [--resolution <px>] [--sample]
       New project; --sample bakes and applies a smart material to every texture set. The
       sample's mesh maps are baked at the resolution up to 1024 px (most of the file's size),
@@ -59,6 +70,11 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("bake", &["-o", "--resolution", "--maps"], &[]),
     ("export", &["--preset", "--format", "--padding", "--size"], &[]),
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
+    (
+        "turntable",
+        &["--frames-dir", "--frames", "--fps", "--size", "--spin", "--background", "--camera", "--pitch", "--samples", "--bounces", "--stem"],
+        &["--rotate-env", "--cpu"],
+    ),
     ("new", &["--resolution"], &["--sample"]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
     ("serve", &["--port", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
@@ -173,6 +189,7 @@ fn dispatch(name: &str, a: &Args) -> R {
         "bake" => bake(a),
         "export" => export(a),
         "render" => render(a),
+        "turntable" => turntable(a),
         "new" => new(a),
         "mcp" => mcp(a),
         "serve" => serve(a),
@@ -355,6 +372,59 @@ fn render(a: &Args) -> R {
     let secs = t0.elapsed().as_secs_f64();
     std::fs::write(out, &r.png).map_err(|e| format!("cannot write {out}: {e}"))?;
     eprintln!("wrote {out} ({}x{}, {}, {secs:.2} s)", r.width, r.height, r.by);
+    Ok(())
+}
+
+fn turntable(a: &Args) -> R {
+    use texturecraft_automation::TurntableParams;
+    use texturecraft_engine::formats::turntable::{Background, Spin, Turntable};
+    let (input, out) = (a.pos(0, "<input>")?, a.pos(1, "<out.gif | frames-dir>")?);
+    let (width, height) = match a.get("--size") {
+        Some(sz) => {
+            let (w, h) = sz.split_once(['x', 'X']).ok_or("--size must be <W>x<H>, e.g. 1280x800")?;
+            (Some(w.parse().map_err(|_| "bad --size width")?), Some(h.parse().map_err(|_| "bad --size height")?))
+        }
+        None => (None, None),
+    };
+    let d = Turntable::default();
+    let spin = a.get("--spin").map(Spin::parse).transpose().map_err(s)?.unwrap_or_default();
+    let turntable = Turntable::new(a.num("--frames")?.unwrap_or(d.frames), a.num("--fps")?.unwrap_or(d.fps), spin, a.has("--rotate-env")).map_err(s)?;
+    let (gif, mut frames_dir) = if out.to_ascii_lowercase().ends_with(".gif") { (Some(out.to_string()), None) } else { (None, Some(out.to_string())) };
+    if let Some(dir) = a.get("--frames-dir") {
+        frames_dir = Some(dir.to_string());
+    }
+    let p = TurntableParams {
+        turntable,
+        background: a.get("--background").map(Background::parse).transpose().map_err(s)?.unwrap_or_default(),
+        width,
+        height,
+        pitch: a.num("--pitch")?,
+        samples: a.num("--samples")?,
+        bounces: a.num("--bounces")?,
+        cpu: a.has("--cpu"),
+        gif,
+        frames_dir,
+        stem: a.get("--stem").unwrap_or("turntable").to_string(),
+    };
+    let mut h = open(input, None)?;
+    if let Some(name) = a.get("--camera") {
+        h.command_run("camera.select", json!({ "name": name })).map_err(s)?;
+    }
+    let t0 = std::time::Instant::now();
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let r = h
+        .turntable(&p, &never, &mut |done, total| {
+            eprint!("\rframe {done}/{total}");
+        })
+        .map_err(s)?;
+    eprintln!();
+    if let Some(g) = &r.gif {
+        println!("{g}");
+    }
+    for f in &r.files {
+        println!("{f}");
+    }
+    eprintln!("{} frames, {}x{}, {}, {:.2} s", r.frames, r.width, r.height, r.by, t0.elapsed().as_secs_f64());
     Ok(())
 }
 

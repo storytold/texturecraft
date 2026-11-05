@@ -171,7 +171,7 @@ fn render_size(rect: Rect) -> (u32, u32) {
     ((rect.width() * scale).max(16.0) as u32, (rect.height() * scale).max(16.0) as u32)
 }
 
-fn trace_scene(app: &TextureCraftApp) -> TraceScene {
+pub(crate) fn trace_scene(app: &TextureCraftApp) -> TraceScene {
     let s = &app.session;
     let d = &s.doc.project.display;
     let sets: Vec<TraceSet> = s
@@ -198,11 +198,11 @@ fn trace_scene(app: &TextureCraftApp) -> TraceScene {
     TraceScene::for_display(mesh, bvh, sets, d, env_image.map(|i| i.as_ref()))
 }
 
-fn settings(app: &TextureCraftApp) -> TraceSettings {
+pub(crate) fn settings(app: &TextureCraftApp) -> TraceSettings {
     TraceSettings { bounces: app.ui.render.bounces }
 }
 
-fn display(app: &TextureCraftApp) -> TraceDisplay {
+pub(crate) fn display(app: &TextureCraftApp) -> TraceDisplay {
     TraceDisplay { denoise: app.ui.render.denoise, ..TraceDisplay::from_display(&app.session.doc.project.display) }
 }
 

@@ -69,6 +69,16 @@ impl AuthorizedWorkspace {
         Ok(())
     }
 
+    /// Remove one file below the write root (a missing file is fine).
+    pub fn remove_file(&self, path: &str) -> Result<(), AutomationError> {
+        let rel = relative_path(path)?;
+        let root = self.write.as_ref().ok_or_else(|| denied("write"))?;
+        match root.remove_file(&rel) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(file_error("remove", path, e)),
+            _ => Ok(()),
+        }
+    }
+
     /// Create a directory (and its parents) below the write root.
     pub fn create_dir_all(&self, path: &str) -> Result<(), AutomationError> {
         let rel = relative_path(path)?;

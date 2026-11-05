@@ -8,7 +8,7 @@ Everything TextureCraft does is an engine command with a stable id (`layer.add.f
 | Control channel | `texturecraft --control <port>` | Drive the running desktop app: commands, inspect, menus, screenshots |
 | MCP server | `texturecraft-cli mcp` | AI agents (Claude Code, Claude Desktop, any MCP client), headless or bridged to the app |
 | JSON-lines server | `texturecraft-cli serve [--port <port>]` | Scripts that keep one headless session open |
-| CLI subcommands | `texturecraft-cli info/run/batch/bake/export/render/new` | One-shot jobs in shells and pipelines |
+| CLI subcommands | `texturecraft-cli info/run/batch/bake/export/render/turntable/new` | One-shot jobs in shells and pipelines |
 
 Programmatic calls never open dialogs: a command runs with its defaults. Only `ui.menu.invoke`
 behaves like a menu click. `session.inspect` shows every layer, mask, effect, fill source and
@@ -67,6 +67,8 @@ keeps its state in a throwaway file.
 | `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window) |
 | `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History` and `Log`; `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds) | `null` |
 | `viewport.screenshot` | `{view?: "3d" \| "2d"}` | `{width, height, png}` (PNG, base64) |
+| `viewport.turntable` | `{frames?: 36, fps?: 24, spin?: "camera" \| "environment", rotateEnv?, background?: "viewport" \| "transparent", samples?, width?, height?, gif?, dir?, stem?}` | Desktop app: starts a 360° [turntable export](#turntable-export) and returns `{started: true, frames}` at once; progress is `turntable: {done, total}` (else `null`) in `ui.inspect`, errors are replies (`ok: false`), the result is a toast. Needs `gif` and/or `dir` (absolute paths on the machine the app runs on). `samples: 0` (default) captures the live 3D view (its on-screen size); `samples > 0` path traces on a worker thread at `width`×`height` (0 = the 3D view's size) |
+| `viewport.turntable.cancel` | | Stops the running turntable: frames already written are removed and the camera and environment rotation are restored |
 | `ui.screenshot` | | `{width, height, png}` of the whole window, after the next frame |
 | `ui.resize` | `{width, height}` | Sets the window's inner size in points (640–7680), leaving maximized state; for recordings and screenshots at a fixed size |
 | `debug.paintTest` | `{from: [x, y], to: [x, y], frames?: 120}` | Paints a straight stroke through the real frame loop (viewport pixels, one point per frame) for performance work |
@@ -144,6 +146,7 @@ takes a font family, not a path: it reads only the system's font folders.
 | `bake` | `{ts?, resolution?, maps?, cpu?}` | Mesh maps for generators and smart materials; rays on the GPU when there is one (`cpu: true`: on the CPU). Per-map ray settings (`ao`, `thickness`, `bentNormal`: rays, maxDistance, spread, distribution; AO ignoreBackface, selfOcclusion) are `bake.settings` parameters |
 | `paint_stroke` | `{points, viewport?, color?, roughness?, metallic?, height?, size?, hardness?}` | Paint tool + brush material + `tool.stroke`; points in viewport pixels |
 | `viewport_render` | `{view?: "3d" \| "2d", width?, height?, yaw?, pitch?, samples?, bounces?, cpu?}` | Headless: PNG image (≤ 2048 px a side); yaw/pitch in degrees for this render only; `samples` (1–4096) path traces the 3D view instead, on the GPU when it has compute shaders, else (or with `cpu: true`) on the CPU (no GPU needed) |
+| `viewport_turntable` | `{gif?, dir?, stem?, frames?, fps?, spin?, rotateEnv?, background?, width?, height?, pitch?, samples?, bounces?, cpu?}` | Headless: a 360° turntable as an animated GIF and/or PNG frames below the write root, see [Turntable export](#turntable-export) |
 | `viewport_screenshot` | `{view?}` | Bridge: the app's 3D or 2D view |
 | `ui_screenshot` | | Bridge: the whole window (downscaled to 2048 px) |
 | `ui_inspect` | | Bridge: UI state |
@@ -217,6 +220,7 @@ File access follows `--read-root` / `--write-root` as for MCP.
 | `material.load` | `{path}` |
 | `textures.export` | `{dir, preset?, ts?, format?, padding?, size?, bitDepth?, dilation?, normalFormat?}` |
 | `render` | `{view?, width?, height?, yaw?, pitch?}` → `{width, height, png}` |
+| `turntable` | `{gif?, dir?, stem?, frames?, fps?, spin?, rotateEnv?, background?, width?, height?, pitch?, samples?, bounces?, cpu?}` → `{frames, width, height, by, gif, gifBytes, files}`, see [Turntable export](#turntable-export) |
 
 ```sh
 printf '%s\n' '{"id":1,"method":"command.run","params":{"id":"project.new","params":{"mesh":"torus"}}}' \
@@ -272,6 +276,8 @@ texturecraft-cli bake model.tcraft --resolution 2048 --maps ambientOcclusion,cur
 texturecraft-cli export model.tcraft out/ --preset "Unreal Engine (Packed)" --format png --size 2048
 texturecraft-cli render ball.tcraft ball.png --size 1280x800 --view 3d --yaw 30 --pitch 15
 texturecraft-cli render scene.tcraft hero.png --size 1200x900 --camera Hero --samples 2048   # a saved camera (camera.add), path traced
+texturecraft-cli turntable ball.tcraft spin.gif --frames 48 --fps 24 --size 640x480           # looping GIF of the viewport
+texturecraft-cli turntable ball.tcraft frames/ --samples 128 --background transparent --rotate-env   # path traced PNG frames with alpha
 ```
 
 `<input>` is a `.tcraft` project, a mesh file or `builtin:<id>`. A batch script is a list of
@@ -291,3 +297,35 @@ steps or an object with an optional input and output (paths relative to the curr
 
 Errors print `texturecraft-cli <command>: error: …` and exit 1; usage errors exit 2. The CLI is a
 console program and never opens a window; `render` needs a GPU or software adapter.
+
+## Turntable export
+
+A turntable spins the view 360° around the up axis over `frames` frames (2–720, default 36;
+frame *i* is `360·i/frames` degrees from the session camera, so the loop closes without a repeated
+frame). It never changes the project: camera angle and environment rotation are per-frame
+overrides, restored afterwards.
+
+| Option | Meaning |
+|---|---|
+| `gif` / `dir` | The output: an animated GIF (looping; path must end in `.gif`) and/or a directory of numbered PNG frames `<stem>_0000.png` (`stem` defaults to `turntable`). At least one |
+| `frames`, `fps` | Frame count and rate (1–60; GIF delays are whole hundredths of a second, so 24 fps plays at 25) |
+| `spin` | `camera` (default): the camera orbits the model. `environment`: the camera stays and only the environment, with its key light and shadows, turns |
+| `rotateEnv` | With `spin: camera`: the environment turns with the camera, so the lighting stays fixed relative to the view and the model seems to spin in place |
+| `background` | `viewport` (default, the environment or backdrop as shown) or `transparent` (needs `samples`; drawn by the CPU path tracer; the GIF has 1-bit transparency, PNG frames keep full alpha) |
+| `width`, `height` | Pixels (16–2048 through MCP and `serve`, 4096 in the CLI; default the session viewport) |
+| `samples`, `bounces`, `cpu` | As for `viewport_render`: `samples` path traces every frame (Rendering mode's renderer); without it the real-time viewport is drawn (needs a GPU adapter) |
+| `pitch` | Camera pitch override in degrees |
+
+The headless run is all or nothing: the GIF is written (atomically) after every frame is encoded,
+and a cancelled or failed run removes the PNG frames it already wrote. The pixel budget is
+`frames × width × height ≤ 2³¹` and a GIF is built in memory (≤ 256 MiB).
+
+**Formats.** Animated GIF and PNG sequence. MP4 and WebM are not produced: no encoder is both
+pure Rust and practical here (H.264/H.265 encoders are C/C++ or patent-encumbered; the pure-Rust
+AV1 encoder `rav1e` is a heavy build needing an assembler on x86, and WebM/MP4 muxing would be
+another dependency). Turn the PNG frames into video with any video tool, e.g.
+`ffmpeg -framerate 24 -i frames/turntable_%04d.png -pix_fmt yuv420p spin.mp4`.
+
+In the app, **Display settings › Turntable** sets the same options, shows a progress bar and has a
+Cancel button; `viewport.turntable` / `viewport.turntable.cancel` do the same over the control
+channel. The GIF encoder is the `gif` crate (MIT OR Apache-2.0, with `color_quant`, MIT).

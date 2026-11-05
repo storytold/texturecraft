@@ -145,6 +145,28 @@ pub fn path_trace(
     (tracer.width, tracer.height, tracer.rgba8(&display))
 }
 
+/// [`path_trace`] with a transparent background: straight-alpha RGBA8 where alpha is how much of
+/// the pixel the mesh covers. CPU only (the GPU tracer returns no coverage). `None` when `cancel`
+/// is set (checked between passes).
+pub fn path_trace_transparent(
+    s: &mut Session,
+    size: [u32; 2],
+    camera: texturecraft_engine::geom::OrbitCamera,
+    samples: u32,
+    settings: &TraceSettings,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let (scene, display) = trace_inputs(s);
+    let mut tracer = Tracer::new(size[0], size[1]);
+    for _ in 0..samples {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        tracer.pass(&scene, &camera, settings);
+    }
+    Some((tracer.width, tracer.height, tracer.rgba8_transparent(&display)))
+}
+
 /// How the viewport shades the session (the app's `viewport::shade`).
 pub fn shade(s: &Session) -> Shade {
     let (view_mode, channel) = match s.view {
