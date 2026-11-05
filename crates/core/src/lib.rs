@@ -12,6 +12,7 @@ pub mod blend;
 pub mod channel;
 pub mod layer;
 pub mod project;
+pub mod swatch;
 
 pub use bake::{
     AmbientOcclusionAttenuation, AmbientOcclusionSettings, BackfaceMode, BakeAntialiasing, BakePaintTarget, BakeResolution, BakeSettings, BakedMap,
@@ -30,6 +31,7 @@ pub use project::{
     AoMixing, BlockScales, Camera, DepthOfField, DisplaySettings, FORMAT_VERSION, MAX_RESOLUTION, MIN_RESOLUTION, NormalFormat, NormalMixing, Project,
     TextureSet, TileGrid, ToneMapping, UDIM_RANGE, udim_at,
 };
+pub use swatch::Swatch;
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum CoreError {

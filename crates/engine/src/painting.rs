@@ -276,18 +276,34 @@ impl Session {
         Some(texturecraft_compose::Stencil { image, view_proj: self.camera.view_proj(aspect), center, half, rotation, tile: st.tile })
     }
 
+    /// A stroke is starting: the brush's base colour joins the recent colours when the stroke
+    /// paints it (a content stroke with the channel on, not an eraser or a mask stroke).
+    fn note_colour_used(&mut self) {
+        let paints_colour = matches!(self.tool.tool, Tool::Paint | Tool::Projection | Tool::PolygonFill)
+            && self.target == StackTarget::Content
+            && self.tool.enabled.contains(&Channel::BaseColor);
+        if paints_colour {
+            let c = crate::swatch_cmds::current_colour(self);
+            crate::swatch_cmds::note_used(self, c);
+        }
+    }
+
     /// Start a stroke at `screen` (viewport pixels). Returns false when the cursor misses the
     /// mesh (the stroke starts anyway and resumes when the cursor enters the mesh).
     pub fn begin_stroke(&mut self, screen: Vec2, viewport: Vec2, pressure: f32) -> Result<bool> {
         self.cancel_stroke();
         match self.tool.tool {
-            Tool::PolygonFill => return self.polygon_fill(screen, viewport).map(|_| true),
+            Tool::PolygonFill => {
+                self.note_colour_used();
+                return self.polygon_fill(screen, viewport).map(|_| true);
+            }
             Tool::ColorPicker => return self.color_pick(screen, viewport).map(|_| true),
             Tool::GeometryMask => return crate::instance_cmds::toggle_part_at(self, screen, viewport).map(|_| true),
             _ => {}
         }
         let first_uv = if self.tool.tool == Tool::Clone { self.pick(screen, viewport).map(|h| h.uv) } else { None };
         self.start_stroke(viewport, false, first_uv)?;
+        self.note_colour_used();
         Ok(self.continue_stroke(screen, pressure))
     }
 
@@ -298,6 +314,7 @@ impl Session {
             return Err(EngineError::Other("use this tool in the 3D view".into()));
         }
         self.start_stroke(self.viewport, true, Some(uv))?;
+        self.note_colour_used();
         self.continue_stroke_uv(uv, pressure);
         Ok(())
     }

@@ -1395,6 +1395,9 @@ fn material_section(app: &mut TextureCraftApp, ui: &mut Ui) {
                         app.session.tool.values.insert(c, v);
                     }
                 });
+                if c == Channel::BaseColor {
+                    crate::swatches::strip(app, ui, v, crate::swatches::Target::Brush, "tool");
+                }
             }
             texturecraft_engine::core::ChannelKind::NormalMap => {
                 ui.label(RichText::new(tr("Normal: painting uses the flat normal")).color(tk.text_dim));
@@ -1778,6 +1781,9 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                     if c.kind() == ChannelKind::Color {
                         if color_swatch(ui, &format!("fill_{salt}_{}", c.id()), &mut v, ui.available_width() - 4.0) {
                             app.run("layer.fill.set", set(json!({"color": v})));
+                        }
+                        if c == Channel::BaseColor {
+                            crate::swatches::strip(app, ui, v, crate::swatches::Target::Fill(base), &format!("fill_{salt}"));
                         }
                     } else {
                         let range = if c.kind() == ChannelKind::Signed { -1.0..=1.0 } else { 0.0..=1.0 };

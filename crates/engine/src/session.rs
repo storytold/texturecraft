@@ -360,6 +360,8 @@ pub struct Session {
     pub export_presets: crate::preset_cmds::UserPresets,
     /// The user's project templates (kept when another project opens).
     pub templates: crate::template_cmds::UserTemplates,
+    /// The user's global colour swatches and the recent colours (kept when another project opens).
+    pub swatches: crate::swatch_cmds::SwatchBook,
 }
 
 impl Session {
@@ -407,6 +409,7 @@ impl Session {
             depth_cache: None,
             export_presets: Default::default(),
             templates: Default::default(),
+            swatches: Default::default(),
         })
     }
 
@@ -416,6 +419,7 @@ impl Session {
         next.viewport = self.viewport;
         next.export_presets = std::mem::take(&mut self.export_presets);
         next.templates = std::mem::take(&mut self.templates);
+        next.swatches = std::mem::take(&mut self.swatches);
         *self = next;
     }
 

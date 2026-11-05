@@ -59,6 +59,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::effect_clipboard::specs());
         v.extend(crate::tool_cmds::specs());
         v.extend(crate::brush_preset_cmds::specs());
+        v.extend(crate::swatch_cmds::specs());
         v.extend(crate::path_tool::specs());
         v.extend(crate::view_cmds::specs());
         v.extend(crate::camera_cmds::specs());

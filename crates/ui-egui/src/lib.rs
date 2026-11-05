@@ -22,6 +22,7 @@ pub mod profile;
 pub mod render_mode;
 pub mod shelf;
 pub mod state;
+pub mod swatches;
 pub mod theme;
 pub mod thumbs;
 pub mod titlebar;
@@ -170,6 +171,7 @@ impl TextureCraftApp {
         app.ui.windows.new_project = false;
         i18n::set_language(&app.ui.prefs.language);
         export_templates::load_library(&mut app, cc.storage);
+        swatches::load(&mut app);
         #[cfg(not(target_arch = "wasm32"))]
         {
             // The first window of the process fixes it; a new folder applies on restart.
@@ -470,6 +472,7 @@ impl eframe::App for TextureCraftApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        swatches::sync(self);
         eframe::set_value(storage, "ui", &self.ui);
         export_templates::save_library(self, storage);
     }
@@ -497,6 +500,7 @@ impl eframe::App for TextureCraftApp {
         self.poll_bake(ctx);
         self.poll_resize(ctx);
         self.poll_link_cooks(ctx);
+        swatches::sync(self);
         // The library shelf rescans when the window comes back (MaterialCraft may have sent a material).
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if focused && !self.focused {

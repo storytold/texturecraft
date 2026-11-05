@@ -414,6 +414,9 @@ pub struct Project {
     /// Saved and imported cameras (the viewport's default camera is not in the list).
     #[serde(default)]
     pub cameras: Vec<Camera>,
+    /// The project's colour swatches (linear colours; older projects have none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub swatches: Vec<crate::swatch::Swatch>,
 }
 
 impl Project {
@@ -429,6 +432,7 @@ impl Project {
             next_id: 1,
             display: DisplaySettings::default(),
             cameras: Vec::new(),
+            swatches: Vec::new(),
         }
     }
 

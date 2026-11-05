@@ -257,6 +257,31 @@ case and underscores ignored). Usages map to channels of the same id (`baseColor
 OpenGL convention, `roughness`, `metallic`, `height`, `ambientOcclusion`, `emissive`, `opacity`,
 `specular`); missing channels join the texture set.
 
+## Colour swatches
+
+Swatches live in two lists: `project` (saved in the `.tcraft`; older projects load with none) and
+`global` (the user's own, kept in the app's preferences and in every project). The last 8 colours
+painted with (a paint, projection or polygon-fill stroke on the base color) form the recent row.
+Colours are **linear** in params and results (`color: [r, g, b]`, or `"#rrggbb"` read as sRGB);
+`hex` is the sRGB form shown in the UI. `scope` is `project` (default) or `global`; a swatch is
+found by `index` or by `name` (case-insensitive). A project change is one undo step.
+
+| Command | Params |
+|---|---|
+| `swatch.list` | `{}` → `{project: [{index, name, hex, color}], global: [...], recent: [{index, hex, color}]}` |
+| `swatch.add` | `{scope?, color?: default the brush's base color, name?}` → `{index, hex}` (at most 512 per list) |
+| `swatch.apply` | `{scope?, index?\|name?}` or `{recent: index}`, `target?: brush` (default) or `layer` (the base color of fill `layer`, default the selected one, or of a content fill `effect`) |
+| `swatch.rename` | `{scope?, index, newName}` |
+| `swatch.replace` | `{scope?, index?\|name?, color?: default the brush's base color}`, keeps the name |
+| `swatch.remove` | `{scope?, index?\|name?}` |
+| `swatch.move` | `{scope?, from, to}` |
+| `swatch.import` | `{path (desktop) \| text, scope?, mode?: append (default) \| replace}` → `{added, skipped, count}`: a GIMP palette (`.gpl`) or a hex list |
+| `swatch.export` | `{scope?, format?: gpl \| hex (default: hex for a .txt or .hex path, else gpl), path? (desktop)}` → `{text, count, path}` |
+
+A hex list has one `#rrggbb` (or `rrggbb`, `#rgb`) per line, optionally followed by a name; lines
+starting with `//` or `;` are comments. Palette files over 1 MiB are refused, unreadable lines are
+skipped and counted, and names lose control characters and are cut to 64 characters.
+
 ## CLI
 
 ```sh

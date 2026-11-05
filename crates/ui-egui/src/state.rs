@@ -118,6 +118,10 @@ pub struct Prefs {
     /// Where autosaves, smart materials, presets, templates and layouts go (desktop; read at
     /// startup). Empty or relative: `Documents/TextureCraft`.
     pub data_folder: String,
+    /// The user's global colour swatches (linear colours).
+    pub swatches: Vec<texturecraft_engine::core::Swatch>,
+    /// The last colours painted with (linear, newest first).
+    pub recent_colors: Vec<[f32; 3]>,
 }
 
 impl Default for Prefs {
@@ -132,6 +136,8 @@ impl Default for Prefs {
             system_title_bar: false,
             start_window: true,
             data_folder: String::new(),
+            swatches: Vec::new(),
+            recent_colors: Vec::new(),
         }
     }
 }
