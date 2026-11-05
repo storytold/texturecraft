@@ -10,8 +10,9 @@ pub const TILE_AREA: usize = (TILE * TILE) as usize;
 /// A tile's texel data: `TILE_AREA × comps` interleaved components.
 pub type TileData = Arc<Vec<u16>>;
 
-/// An image split into 64×64 tiles; unallocated tiles read as zero. Cloning shares every tile,
-/// so snapshots for undo cost one `Arc` clone per allocated tile.
+/// An image split into 64×64 tiles; unallocated tiles read as zero. Cloning shares the tile table
+/// and every tile, so a snapshot costs one reference-count bump; the first write after a clone
+/// copies the table (one pointer per tile slot) once.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TileImage {
     width: u32,
@@ -19,7 +20,7 @@ pub struct TileImage {
     comps: usize,
     tiles_x: u32,
     tiles_y: u32,
-    tiles: Vec<Option<TileData>>,
+    tiles: Arc<Vec<Option<TileData>>>,
 }
 
 impl TileImage {
@@ -28,7 +29,7 @@ impl TileImage {
         let (width, height) = (width.max(1), height.max(1));
         let tiles_x = width.div_ceil(TILE);
         let tiles_y = height.div_ceil(TILE);
-        TileImage { width, height, comps: comps.clamp(1, 4), tiles_x, tiles_y, tiles: vec![None; (tiles_x * tiles_y) as usize] }
+        TileImage { width, height, comps: comps.clamp(1, 4), tiles_x, tiles_y, tiles: Arc::new(vec![None; (tiles_x * tiles_y) as usize]) }
     }
 
     pub fn width(&self) -> u32 {
@@ -65,7 +66,7 @@ impl TileImage {
         let len = TILE_AREA * self.comps;
         let data = data.filter(|d| d.len() == len);
         if let Some(i) = self.tile_index(tx, ty)
-            && let Some(slot) = self.tiles.get_mut(i)
+            && let Some(slot) = Arc::make_mut(&mut self.tiles).get_mut(i)
         {
             *slot = data;
         }
@@ -76,7 +77,7 @@ impl TileImage {
     pub fn tile_mut(&mut self, tx: u32, ty: u32, fill: &[u16]) -> Option<&mut [u16]> {
         let comps = self.comps;
         let i = self.tile_index(tx, ty)?;
-        let slot = self.tiles.get_mut(i)?;
+        let slot = Arc::make_mut(&mut self.tiles).get_mut(i)?;
         let tile = slot.get_or_insert_with(|| {
             let mut v = vec![0u16; TILE_AREA * comps];
             if fill.iter().any(|f| *f != 0) {
@@ -140,9 +141,19 @@ impl TileImage {
         self.allocated_count() * TILE_AREA * self.comps * 2
     }
 
+    /// Whether `self` and `other` share their tile table: no tile of either changed since one
+    /// was cloned from the other.
+    pub fn same_tiles(&self, other: &TileImage) -> bool {
+        Arc::ptr_eq(&self.tiles, &other.tiles)
+    }
+
     /// Drop tiles whose every texel is zero.
     pub fn prune_empty(&mut self) {
-        for t in &mut self.tiles {
+        let is_empty = |t: &Option<TileData>| t.as_ref().is_some_and(|d| d.iter().all(|v| *v == 0));
+        if !self.tiles.iter().any(is_empty) {
+            return;
+        }
+        for t in Arc::make_mut(&mut self.tiles) {
             if t.as_ref().is_some_and(|d| d.iter().all(|v| *v == 0)) {
                 *t = None;
             }
@@ -203,6 +214,39 @@ mod tests {
         assert!(!Arc::ptr_eq(a.tile_handle(0, 0).unwrap(), b.tile_handle(0, 0).unwrap()));
         assert_eq!(b.get(1, 0)[0], 0);
         assert_eq!(a.get(1, 0)[0], 6);
+    }
+
+    #[test]
+    fn clone_shares_the_table_until_written() {
+        let mut a = TileImage::new(512, 512, 2);
+        a.set(0, 0, &[1, 2]);
+        let mut b = a.clone();
+        assert!(a.same_tiles(&b));
+        b.set(70, 0, &[3, 4]);
+        assert!(!a.same_tiles(&b));
+        assert_eq!(a.get(70, 0)[..2], [0, 0]);
+        assert_eq!(b.get(70, 0)[..2], [3, 4]);
+        assert_eq!(a.get(0, 0)[..2], [1, 2]);
+        assert_eq!(b.get(0, 0)[..2], [1, 2]);
+    }
+
+    #[test]
+    fn out_of_range_writes_do_not_unshare() {
+        let mut a = TileImage::new(512, 512, 2);
+        a.set(0, 0, &[1, 2]);
+        let mut b = a.clone();
+        b.set_tile(999, 999, None);
+        assert!(b.tile_mut(999, 999, &[0, 0]).is_none());
+        assert!(a.same_tiles(&b));
+    }
+
+    #[test]
+    fn noop_prune_does_not_unshare() {
+        let mut a = TileImage::new(512, 512, 2);
+        a.set(0, 0, &[1, 2]);
+        let mut b = a.clone();
+        b.prune_empty();
+        assert!(a.same_tiles(&b));
     }
 
     #[test]

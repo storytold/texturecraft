@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use texturecraft_compose::{BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles, pad_tiles};
+use texturecraft_compose::{
+    BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles, pad_tiles, stack_reads_neighbours,
+};
 use texturecraft_core::{Channel, Layer, LayerId, LayerKind, Project, TextureSet};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, UvGBuffer};
@@ -541,10 +543,27 @@ impl Session {
             StackKey::new(&d.project, &d.pixels, d.baked.get(&ts).unwrap_or(&empty), &images, ts, stack)
         };
         for ts in 0..self.caches.len() {
-            if (all || key(other, ts) != key(&self.doc, ts))
-                && let Some(c) = self.caches.get_mut(ts)
-            {
+            let Some(c) = self.caches.get_mut(ts) else { continue };
+            if all {
                 c.invalidate_all();
+                continue;
+            }
+            let (before, after) = (key(other, ts), key(&self.doc, ts));
+            if before == after {
+                continue;
+            }
+            // Only painted pixels changed and nothing reads across tiles: the tiles whose pixels
+            // differ are the tiles to recomposite. Anything else recomposites the whole set.
+            let tiles = match (&before, &after) {
+                (Some(a), Some(b)) if !stack_reads_neighbours(&self.doc.project, ts) && !stack_reads_neighbours(&other.project, ts) => a.changed_tiles(b),
+                _ => None,
+            };
+            match tiles {
+                Some(tiles) => {
+                    let covered: BTreeSet<(u32, u32)> = c.covered_tiles.iter().copied().collect();
+                    c.dirty.extend(tiles.into_iter().filter(|t| covered.contains(t)));
+                }
+                None => c.invalidate_all(),
             }
         }
     }

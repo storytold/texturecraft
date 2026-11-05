@@ -380,3 +380,95 @@ fn background_resizes_match_the_command_and_keep_later_edits() {
     b.update();
     assert_eq!(b.caches[0].size, (512, 512));
 }
+
+/// A 2048 sphere set with a fill layer and an empty paint layer, a small brush, and the
+/// oracle: the composite after recompositing every covered tile from scratch.
+fn painted_set() -> Session {
+    use texturecraft_engine::geom::glam::Vec2;
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 2048).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    execute(&mut s, "layer.add.fill", &json!({"color": [0.2, 0.5, 0.3], "roughness": 0.7})).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 12, "hardness": 70, "opacity": 0.8})).unwrap();
+    // A stroke creates the layer's images; later edits only rewrite tiles of images that exist
+    // (the first stroke of a channel adds an image, which recomposites the whole set).
+    execute(&mut s, "tool.stroke", &json!({"points": [[150, 160], [170, 170]]})).unwrap();
+    s.update();
+    s
+}
+
+fn full(s: &mut Session) -> texturecraft_engine::compose::Composite {
+    s.caches[0].invalidate_all();
+    s.update();
+    s.caches[0].composite.clone()
+}
+
+/// Undo and redo of `change` queue the right tiles: `Some(max)` fewer than `max` of them, matching
+/// a full recomposite once updated; `None` every covered tile.
+fn check_undo_redo(s: &mut Session, change: impl FnOnce(&mut Session), limit: Option<usize>) {
+    change(s);
+    s.update();
+    for cmd in ["edit.undo", "edit.redo"] {
+        execute(s, cmd, &Value::Null).unwrap();
+        let (dirty, covered) = (s.caches[0].dirty.len(), s.caches[0].covered_tiles.len());
+        match limit {
+            Some(max) => assert!(0 < dirty && dirty < max, "{cmd}: {dirty} of {covered} tiles dirty"),
+            None => assert_eq!(dirty, covered, "{cmd}"),
+        }
+        s.update();
+        let settled = s.caches[0].composite.clone();
+        assert_eq!(settled, full(s), "{cmd}: matches a full recomposite");
+    }
+}
+
+#[test]
+fn undo_recomposites_only_changed_tiles() {
+    let mut s = painted_set();
+    let stroke = |s: &mut Session| drop(execute(s, "tool.stroke", &json!({"points": [[150, 200], [190, 210]]})).unwrap());
+    // The stroke covers a handful of the set's 1024 tiles.
+    check_undo_redo(&mut s, stroke, Some(64));
+}
+
+#[test]
+fn undo_with_a_blur_above_recomposites_everything() {
+    use texturecraft_engine::geom::glam::Vec2;
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 2048).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    execute(&mut s, "layer.add.fill", &json!({"color": [0.2, 0.5, 0.3], "roughness": 0.7})).unwrap();
+    execute(&mut s, "mask.add.white", &Value::Null).unwrap();
+    execute(&mut s, "effect.add.filter", &json!({"filter": "blur", "radius": 8})).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 12, "hardness": 70, "opacity": 0.8})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[150, 160], [170, 170]]})).unwrap();
+    s.update();
+    let stroke = |s: &mut Session| drop(execute(s, "tool.stroke", &json!({"points": [[150, 200], [190, 210]]})).unwrap());
+    check_undo_redo(&mut s, stroke, None);
+}
+
+#[test]
+fn polygon_fill_recomposites_only_changed_tiles() {
+    let mut s = painted_set();
+    execute(&mut s, "tool.material", &json!({"channel": "roughness", "value": 0.1})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[150, 240], [170, 250]]})).unwrap();
+    execute(&mut s, "tool.polygonFill", &Value::Null).unwrap();
+    s.update();
+    let tris = s.polygon_fill(texturecraft_engine::geom::glam::Vec2::new(200.0, 200.0), s.viewport).unwrap();
+    assert!(tris > 0);
+    let (dirty, covered) = (s.caches[0].dirty.len(), s.caches[0].covered_tiles.len());
+    assert!(0 < dirty && dirty < covered / 4, "{dirty} of {covered} tiles dirty after one triangle");
+    s.update();
+    let settled = s.caches[0].composite.clone();
+    assert_eq!(settled, full(&mut s));
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert!(s.caches[0].dirty.len() < covered / 4);
+    s.update();
+    let settled = s.caches[0].composite.clone();
+    assert_eq!(settled, full(&mut s));
+}
+
+#[test]
+fn undo_of_a_layer_change_recomposites_everything() {
+    let mut s = painted_set();
+    let change = |s: &mut Session| drop(execute(s, "layer.blend", &json!({"channel": "all", "opacity": 0.5})).unwrap());
+    check_undo_redo(&mut s, change, None);
+}

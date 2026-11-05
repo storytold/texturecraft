@@ -124,6 +124,46 @@ impl StackKey {
     }
 }
 
+impl StackKey {
+    /// The tiles whose pixels differ between `self` and `other` when nothing but painted pixels
+    /// changed (same set, roots, layers, baked maps and images; the same images by id, channel
+    /// and size). None when anything else differs: the caller recomposites everything.
+    pub fn changed_tiles(&self, other: &StackKey) -> Option<BTreeSet<(u32, u32)>> {
+        if self.set != other.set || self.roots != other.roots || self.layers != other.layers || self.baked != other.baked || self.images != other.images {
+            return None;
+        }
+        if self.pixels.len() != other.pixels.len() {
+            return None;
+        }
+        let size = self.set.size();
+        let mut changed = BTreeSet::new();
+        for ((id_a, ch_a, a), (id_b, ch_b, b)) in self.pixels.iter().zip(&other.pixels) {
+            let (a, b) = (&a.0, &b.0);
+            let same_shape = id_a == id_b && ch_a == ch_b && a.width() == b.width() && a.height() == b.height() && a.comps() == b.comps();
+            // Image tiles are composite tiles only when the grids coincide.
+            if !same_shape || (a.width(), a.height()) != size {
+                return None;
+            }
+            if a.same_tiles(b) {
+                continue;
+            }
+            for ty in 0..a.tiles_y() {
+                for tx in 0..a.tiles_x() {
+                    let equal = match (a.tile_handle(tx, ty), b.tile_handle(tx, ty)) {
+                        (None, None) => true,
+                        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+                        _ => false,
+                    };
+                    if !equal {
+                        changed.insert((tx, ty));
+                    }
+                }
+            }
+        }
+        Some(changed)
+    }
+}
+
 /// An image compared by tile identity: holding the clone keeps its tiles alive, and a tile
 /// rewritten since is a different allocation (copy-on-write), so pointer equality means the
 /// same pixels without reading them.
@@ -344,5 +384,49 @@ mod tests {
         assert!(c.tile((9, 9)).is_none(), "bigger than the whole budget");
         c.set_hot(Some(LayerId(3)));
         assert!(c.is_empty() && c.bytes() == 0);
+    }
+
+    /// A project with one paint layer in a 128 px set, its pixels and a key builder.
+    fn painted() -> (Project, PixelStore, LayerId) {
+        let mut project = Project::new("t", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, 128));
+        let id = project.alloc_id();
+        let layer = Layer::new(id, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+        project.insert_layer(0, layer, None, false).unwrap();
+        (project, PixelStore::default(), id)
+    }
+
+    fn key(project: &Project, pixels: &PixelStore) -> StackKey {
+        let stack = project.texture_sets[0].stack.clone();
+        StackKey::new(project, pixels, &BakedMaps::default(), &ImageStore::default(), 0, &stack).unwrap()
+    }
+
+    #[test]
+    fn changed_tiles_lists_only_rewritten_tiles() {
+        let (project, mut pixels, id) = painted();
+        pixels.layer_mut(id, Channel::BaseColor, (128, 128)).set(70, 5, &[9, 9, 9, 9]);
+        let before = key(&project, &pixels);
+        pixels.layer_mut(id, Channel::BaseColor, (128, 128)).set(70, 6, &[1, 1, 1, 1]);
+        let after = key(&project, &pixels);
+        assert_eq!(before.changed_tiles(&after), Some(BTreeSet::from([(1, 0)])));
+    }
+
+    #[test]
+    fn changed_tiles_is_none_when_a_layer_changes() {
+        let (mut project, pixels, id) = painted();
+        let before = key(&project, &pixels);
+        project
+            .layer_mut(id)
+            .unwrap()
+            .channels
+            .insert(Channel::BaseColor, texturecraft_core::ChannelBlend { mode: texturecraft_core::BlendMode::Multiply, opacity: 0.5 });
+        assert_eq!(before.changed_tiles(&key(&project, &pixels)), None);
+    }
+
+    #[test]
+    fn changed_tiles_is_empty_for_identical_documents() {
+        let (project, mut pixels, id) = painted();
+        pixels.layer_mut(id, Channel::BaseColor, (128, 128)).set(3, 3, &[5, 5, 5, 5]);
+        assert_eq!(key(&project, &pixels).changed_tiles(&key(&project, &pixels)), Some(BTreeSet::new()));
     }
 }
