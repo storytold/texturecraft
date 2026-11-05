@@ -73,6 +73,9 @@ pub struct Windows {
     /// Browser File › Export Mesh: the download format choice.
     #[serde(default)]
     pub export_mesh: bool,
+    /// Export image: scene image resolution (the viewport top bar's camera button).
+    #[serde(default)]
+    pub image_export: bool,
     /// The start window: new, open, recent projects (the app opens it at launch).
     #[serde(skip)]
     pub start: bool,
@@ -118,6 +121,32 @@ pub struct Prefs {
     /// Where autosaves, smart materials, presets, templates and layouts go (desktop; read at
     /// startup). Empty or relative: `Documents/TextureCraft`.
     pub data_folder: String,
+    /// Scene image export and Rendering mode resolution (the Export image window).
+    pub image_export: ImageExport,
+    /// Viewport anti-aliasing (the top-bar AA toggle): new and opened projects take it as their
+    /// `display.msaa` and `display.taa`, so the choice carries across projects and restarts.
+    pub viewport_aa: bool,
+}
+
+/// Output resolution of scene images: Export image (real-time view) and Rendering mode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageExport {
+    /// A `texturecraft_render::output::PRESETS` id, or empty for the viewport's size.
+    pub preset: String,
+    /// Pixels; 0 = auto (from the preset or the viewport, keeping its aspect ratio).
+    pub width: u32,
+    pub height: u32,
+    /// Render multiplier per side: 1, 2 or 4.
+    pub scale: u32,
+    /// Transparent background (path-traced renders on the CPU only).
+    pub transparent: bool,
+}
+
+impl Default for ImageExport {
+    fn default() -> Self {
+        ImageExport { preset: String::new(), width: 0, height: 0, scale: 1, transparent: false }
+    }
 }
 
 impl Default for Prefs {
@@ -132,6 +161,8 @@ impl Default for Prefs {
             system_title_bar: false,
             start_window: true,
             data_folder: String::new(),
+            image_export: ImageExport::default(),
+            viewport_aa: true,
         }
     }
 }

@@ -41,11 +41,14 @@ struct Work {
     display: TraceDisplay,
     max_samples: u32,
     tracer: Tracer,
+    /// Leave the backdrop out (Export image's transparent background).
+    transparent: bool,
 }
 
 impl Work {
     fn frame(&self) -> Frame {
-        Frame { width: self.tracer.width, height: self.tracer.height, rgba: self.tracer.rgba8(&self.display), samples: self.tracer.samples }
+        let rgba = if self.transparent { self.tracer.rgba8_transparent(&self.display) } else { self.tracer.rgba8(&self.display) };
+        Frame { width: self.tracer.width, height: self.tracer.height, rgba, samples: self.tracer.samples }
     }
 
     /// One more sample per pixel, or None when done.
@@ -171,6 +174,16 @@ fn render_size(rect: Rect) -> (u32, u32) {
     ((rect.width() * scale).max(16.0) as u32, (rect.height() * scale).max(16.0) as u32)
 }
 
+/// The render's resolution: the Export image settings (size, preset, render scale) applied to
+/// the view's `base` size, within `max_side`. A request that cannot be met (shown as an error
+/// in the Export image window) renders at the base size instead.
+fn output_size(app: &TextureCraftApp, base: (u32, u32), max_side: u32) -> (u32, u32) {
+    match crate::image_export::resolve(&app.ui.prefs.image_export, [base.0, base.1], max_side.min(crate::image_export::MAX_SIDE), "export limit") {
+        Ok([w, h]) => (w, h),
+        Err(_) => base,
+    }
+}
+
 fn trace_scene(app: &TextureCraftApp) -> TraceScene {
     let s = &app.session;
     let d = &s.doc.project.display;
@@ -214,6 +227,7 @@ fn work(app: &TextureCraftApp, size: (u32, u32)) -> Work {
         display: display(app),
         max_samples: app.ui.render.max_samples.max(1),
         tracer: Tracer::new(size.0, size.1),
+        transparent: app.ui.prefs.image_export.transparent,
     }
 }
 
@@ -226,7 +240,7 @@ fn scene_key(app: &TextureCraftApp) -> String {
 
 /// What the render depends on; a change restarts it.
 fn key(app: &TextureCraftApp, size: (u32, u32)) -> String {
-    format!("{}|{:?}|{size:?}|{:?}", scene_key(app), app.session.camera, app.ui.render)
+    format!("{}|{:?}|{size:?}|{:?}|{}", scene_key(app), app.session.camera, app.ui.render, app.ui.prefs.image_export.transparent)
 }
 
 fn start(app: &TextureCraftApp, ctx: &egui::Context, key: String, size: (u32, u32)) -> Job {
@@ -261,7 +275,8 @@ fn start(app: &TextureCraftApp, ctx: &egui::Context, key: String, size: (u32, u3
 
 /// Draw Rendering mode over the 3D view in `rect` (navigation is handled by the 3D view).
 pub fn show(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) {
-    let on_gpu = !app.ui.render.cpu && show_gpu(app, ui, rect);
+    // The GPU tracer always resolves over the backdrop: transparent renders trace on the CPU.
+    let on_gpu = !app.ui.render.cpu && !app.ui.prefs.image_export.transparent && show_gpu(app, ui, rect);
     if !on_gpu {
         drop_gpu(app);
         show_cpu(app, ui, rect);
@@ -271,7 +286,7 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) {
 
 fn show_cpu(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) {
     let ctx = ui.ctx().clone();
-    let size = render_size(rect);
+    let size = output_size(app, render_size(rect), crate::image_export::MAX_SIDE);
     let k = key(app, size);
     if app.render.job.as_ref().is_none_or(|j| j.key != k) {
         app.render.job = Some(start(app, &ctx, k, size));
@@ -300,16 +315,20 @@ fn show_cpu(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) {
         }
     }
     let shown = app.render.texture.as_ref().filter(|_| app.render.samples > 0).map(TextureHandle::id);
-    paint(ui, rect, shown);
+    paint(ui, rect, shown, size);
 }
 
-/// The render, or a placeholder until its first samples.
-fn paint(ui: &Ui, rect: Rect, texture: Option<egui::TextureId>) {
+/// The render (fitted into `rect` at its own aspect ratio), or a placeholder until its first
+/// samples.
+fn paint(ui: &Ui, rect: Rect, texture: Option<egui::TextureId>, size: (u32, u32)) {
     let tk = Tokens::get(ui.ctx());
     let p = ui.painter_at(rect);
     match texture {
         Some(t) => {
-            p.image(t, rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            p.rect_filled(rect, 0.0, tk.viewport);
+            let fit = (rect.width() / size.0.max(1) as f32).min(rect.height() / size.1.max(1) as f32);
+            let shown = Rect::from_center_size(rect.center(), vec2(size.0 as f32 * fit, size.1 as f32 * fit));
+            p.image(t, shown, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         }
         None => {
             p.rect_filled(rect, 0.0, tk.viewport);
@@ -332,7 +351,7 @@ fn show_gpu(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) -> bool {
     }
     let ctx = ui.ctx().clone();
     let now = ctx.input(|i| i.time);
-    let size = (rect.width().max(16.0) as u32, rect.height().max(16.0) as u32);
+    let size = output_size(app, (rect.width().max(16.0) as u32, rect.height().max(16.0) as u32), rs.device.limits().max_texture_dimension_2d);
     let key = key(app, size);
     let mut g = match app.render.gpu.take() {
         Some(g) if g.size == size => g,
@@ -408,7 +427,7 @@ fn show_gpu(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) -> bool {
         read: g.read.clone(),
     };
     ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, cb));
-    paint(ui, rect, (samples > 0).then_some(g.texture));
+    paint(ui, rect, (samples > 0).then_some(g.texture), size);
     app.render.gpu = Some(g);
     true
 }
@@ -553,7 +572,7 @@ fn drop_gpu(app: &mut TextureCraftApp) {
 /// The render status and settings card in the top-left corner.
 fn overlay(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, on_gpu: bool) {
     let tk = Tokens::get(ui.ctx());
-    let card = Rect::from_min_size(rect.min + vec2(12.0, 12.0), vec2(250.0, 200.0));
+    let card = Rect::from_min_size(rect.min + vec2(12.0, 12.0), vec2(250.0, 236.0));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(card).layout(egui::Layout::top_down(egui::Align::Min)));
     egui::Frame::popup(child.style()).show(&mut child, |ui| {
         ui.set_width(226.0);
@@ -581,6 +600,15 @@ fn overlay(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, on_gpu: bool) {
             ui.label(tr("Bounces"));
             ui.add(egui::DragValue::new(&mut app.ui.render.bounces).range(1..=32));
         });
+        ui.horizontal(|ui| {
+            let size = app.render.shown.as_ref().map(|(w, h, _)| (*w, *h)).or(app.render.gpu.as_ref().map(|g| g.size));
+            if let Some((w, h)) = size {
+                ui.label(RichText::new(trf("Output: {w} × {h} px", &[("w", &w), ("h", &h)])).size(11.0).color(tk.text_dim));
+            }
+            if ui.small_button(tr("Image size...")).on_hover_text(tr("Export image (resolution, render scale, transparency)")).clicked() {
+                app.ui.windows.image_export = true;
+            }
+        });
         ui.checkbox(&mut app.ui.render.denoise, tr("Denoise")).on_hover_text(tr("Filter the remaining noise while keeping edges and texture detail"));
         if app.render_state.as_ref().is_some_and(|rs| GpuTracer::supported(&rs.device)) {
             ui.checkbox(&mut app.ui.render.cpu, tr("Render on the CPU")).on_hover_text(tr("Path trace on the processor instead of the graphics card (slower)"));
@@ -604,24 +632,8 @@ fn overlay(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, on_gpu: bool) {
 /// Save the shown render as PNG.
 fn save(app: &mut TextureCraftApp) {
     let Some((w, h, rgba)) = app.render.shown.clone() else { return };
-    let Some(png) = crate::control::encode_png(w, h, rgba).map(|(_, _, png)| png) else {
-        app.toast(tr("Couldn't encode the render"), true);
-        return;
-    };
     let name = format!("{}_render.png", texturecraft_engine::formats::export::sanitize_file_stem(&app.session.doc.project.name));
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let Some(path) = rfd::FileDialog::new().add_filter(tr("PNG image"), &["png"]).set_file_name(name).save_file() else { return };
-        match std::fs::write(&path, png) {
-            Ok(()) => app.toast(trf("Saved {path}", &[("path", &path.display())]), false),
-            Err(e) => app.toast(trf("Couldn't save the render: {error}", &[("error", &e)]), true),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    match crate::web_files::download(&name, &png) {
-        Ok(()) => app.toast(trf("Downloaded {name}", &[("name", &name)]), false),
-        Err(e) => app.toast(trf("Couldn't save the render: {error}", &[("error", &e)]), true),
-    }
+    crate::image_export::save_png(app, name, w, h, rgba);
 }
 
 impl RenderView {

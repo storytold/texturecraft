@@ -346,6 +346,17 @@ impl Tracer {
 
     /// Tone-mapped sRGB pixels, row-major from the top.
     pub fn rgba8(&self, d: &TraceDisplay) -> Vec<u8> {
+        self.rgba8_with(d, false)
+    }
+
+    /// [`Tracer::rgba8`] with a transparent background: only the mesh is drawn, with straight
+    /// (not premultiplied) alpha equal to its coverage of the pixel; where nothing was hit the
+    /// pixel is fully transparent black. The studio backdrop and the environment are left out.
+    pub fn rgba8_transparent(&self, d: &TraceDisplay) -> Vec<u8> {
+        self.rgba8_with(d, true)
+    }
+
+    fn rgba8_with(&self, d: &TraceDisplay, transparent: bool) -> Vec<u8> {
         let n = self.samples.max(1) as f32;
         let (w, h) = (self.width as f32, self.height as f32);
         let denoised = if d.denoise { self.denoise() } else { Vec::new() };
@@ -357,14 +368,14 @@ impl Tracer {
             let back = if misses > 0.0 { backdrop(uv).lerp(tonemap(px.env / misses, d), d.env_opacity.clamp(0.0, 1.0)) } else { backdrop(uv) };
             let mean = denoised.get(i).copied().unwrap_or(px.hit / px.hits.max(1.0));
             let scene = if px.hits > 0.0 { tonemap(mean, d) } else { Vec3::ZERO };
-            let c = back.lerp(scene, a);
+            let c = if transparent { scene } else { back.lerp(scene, a) };
             for (k, v) in c.to_array().into_iter().enumerate() {
                 if let Some(o) = o.get_mut(k) {
                     *o = (texturecraft_texel::linear_to_srgb(v.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
                 }
             }
             if let Some(o) = o.get_mut(3) {
-                *o = 255;
+                *o = if transparent { (a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8 } else { 255 };
             }
         });
         out
@@ -1078,6 +1089,24 @@ mod tests {
         let corner: u32 = px(0, 0).iter().map(|v| *v as u32).sum();
         assert!(center > corner + 60, "center {center} corner {corner}");
         assert!(tr.acc.iter().all(|p| p.hit.is_finite() && p.env.is_finite()));
+    }
+
+    #[test]
+    fn transparent_output_keeps_the_mesh_and_drops_the_backdrop() {
+        let s = scene("Studio Soft");
+        let mut tr = Tracer::new(48, 32);
+        for _ in 0..4 {
+            tr.pass(&s, &camera(), &TraceSettings::default());
+        }
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 1.0, denoise: false };
+        let (solid, clear) = (tr.rgba8(&d), tr.rgba8_transparent(&d));
+        assert_eq!(solid.len(), clear.len());
+        let at = |img: &[u8], x: usize, y: usize| img[(y * 48 + x) * 4..(y * 48 + x) * 4 + 4].to_vec();
+        assert_eq!(at(&clear, 0, 0), vec![0, 0, 0, 0], "nothing was hit in the corner: fully transparent");
+        assert_eq!(at(&solid, 0, 0)[3], 255, "the normal output stays opaque");
+        assert_eq!(at(&clear, 24, 16)[3], 255, "the sphere's middle is fully covered");
+        assert_eq!(at(&clear, 24, 16), at(&solid, 24, 16), "fully covered pixels match the normal output");
+        assert!(clear.chunks(4).any(|p| p[3] > 0 && p[3] < 255), "antialiased edges get partial alpha");
     }
 
     #[test]

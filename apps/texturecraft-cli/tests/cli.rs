@@ -166,3 +166,34 @@ fn path_traced_render_needs_no_gpu() {
     assert_eq!(cli(&["render", "builtin:cube", p(&out), "--samples", "4", "--view", "2d"]).status.code(), Some(1));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn render_resolution_scale_and_transparency() {
+    let d = tmp("resolution");
+    let out = d.join("ball.png");
+    // --scale multiplies the chosen size; one edge keeps the 1280x800 viewport's aspect ratio.
+    ok(&["render", "builtin:material_ball", p(&out), "--size", "40x24", "--scale", "2x", "--samples", "1", "--cpu"]);
+    assert_eq!(image::open(&out).unwrap().to_rgba8().dimensions(), (80, 48));
+    ok(&["render", "builtin:material_ball", p(&out), "--width", "64", "--samples", "1", "--cpu"]);
+    assert_eq!(image::open(&out).unwrap().to_rgba8().dimensions(), (64, 40));
+    // A transparent background: clear corners, an opaque ball.
+    ok(&["render", "builtin:material_ball", p(&out), "--size", "96x64", "--samples", "4", "--transparent"]);
+    let img = image::open(&out).unwrap().to_rgba8();
+    assert_eq!(img.get_pixel(0, 0).0[3], 0, "the backdrop is gone");
+    assert_eq!(img.get_pixel(48, 28).0[3], 255, "the ball stays opaque");
+    // Clear errors: a bad scale, a size over the limit, an unknown preset, transparency without path tracing.
+    for bad in [
+        vec!["--scale", "3", "--samples", "1"],
+        vec!["--size", "2048x2048", "--scale", "4", "--samples", "1"],
+        vec!["--preset", "huge", "--samples", "1"],
+        vec!["--transparent"],
+    ] {
+        let mut args = vec!["render", "builtin:cube", p(&out)];
+        args.extend(bad.iter().copied());
+        let o = cli(&args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(["render scale", "limit", "preset", "transparent"].iter().any(|k| err.contains(k)), "{args:?}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

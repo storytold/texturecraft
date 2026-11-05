@@ -15,6 +15,7 @@ pub mod export_templates;
 pub mod fonts;
 pub mod gpu;
 pub mod i18n;
+pub mod image_export;
 pub mod keymap;
 pub mod menus;
 pub mod parity;
@@ -118,9 +119,39 @@ pub struct TextureCraftApp {
     styled: Option<(theme::Brightness, theme::Accent)>,
     /// Whether the window had focus last frame.
     focused: bool,
+    /// The mesh (project) the viewport anti-aliasing preference was last applied to.
+    aa_mesh_id: u64,
 }
 
 impl TextureCraftApp {
+    /// A new or opened project (a new mesh) takes the viewport anti-aliasing preference.
+    pub fn apply_viewport_aa(&mut self) {
+        if self.aa_mesh_id != self.session.mesh_id {
+            self.aa_mesh_id = self.session.mesh_id;
+            self.set_viewport_aa(self.ui.prefs.viewport_aa);
+        }
+    }
+
+    /// Whether the viewport anti-aliases its edges (4× MSAA, what the top-bar AA toggle shows).
+    pub fn viewport_aa(&self) -> bool {
+        self.session.doc.project.display.msaa
+    }
+
+    /// The top-bar AA toggle (`ui.viewportAa`, Alt+A): switch the views' anti-aliasing (4× MSAA
+    /// and the idle temporal refinement together) and remember the choice in the preferences.
+    /// Off renders one sample per pixel: hard edges and crisp texels.
+    pub fn toggle_viewport_aa(&mut self) {
+        let on = !self.viewport_aa();
+        self.set_viewport_aa(on);
+        self.ui.prefs.viewport_aa = on;
+    }
+
+    fn set_viewport_aa(&mut self, on: bool) {
+        let d = &mut self.session.doc.project.display;
+        d.msaa = on;
+        d.taa = on;
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, session: Session) -> TextureCraftApp {
         theme::install(&cc.egui_ctx);
         // Bakes cast their rays on a GPU device of their own (created on the first bake).
@@ -162,6 +193,7 @@ impl TextureCraftApp {
             next_autosave,
             styled: None,
             focused: true,
+            aa_mesh_id: 0,
         };
         app.ui.rename = None;
         app.ui.windows.new_project = false;
@@ -442,6 +474,7 @@ impl eframe::App for TextureCraftApp {
             theme::apply(ctx, style.0, style.1);
             self.styled = Some(style);
         }
+        self.apply_viewport_aa();
         control::poll(self, ctx);
         web_files::poll(self);
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());

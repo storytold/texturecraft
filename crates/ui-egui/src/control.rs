@@ -9,7 +9,8 @@
 //! - `ui.menu.list`: the menu catalog with ids, shortcuts and whether each is live.
 //! - `ui.menu.invoke {id}`: behave like a menu click (may open a window).
 //! - `ui.set {...}`: merge fields into the UI state (e.g. `{"layout":"Only3D"}`).
-//! - `viewport.screenshot {view?: "3d"|"2d"}`: PNG of a viewport, base64.
+//! - `viewport.screenshot {view?: "3d"|"2d", width?, height?, preset?, scale?}`: PNG of a viewport,
+//!   base64; with a size, preset or scale the view is rendered again at that resolution.
 //! - `ui.screenshot`: PNG of the whole window (replies after the next frame).
 
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -148,6 +149,18 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
         }
         "viewport.screenshot" => {
             let view = if p.get("view").and_then(Value::as_str) == Some("2d") { crate::viewport::VIEW_2D } else { crate::viewport::VIEW_3D };
+            let req = match size_request(p) {
+                Ok(r) => r,
+                Err(e) => return err(e),
+            };
+            if req != texturecraft_render::output::SizeRequest::default() {
+                // A size, preset or scale: render the view again at that resolution.
+                return match crate::image_export::render_view(app, view, &req).map(|(w, h, rgba)| encode_png(w, h, rgba)) {
+                    Ok(Some((w, h, png))) => ok(json!({ "width": w, "height": h, "png": base64::engine::general_purpose::STANDARD.encode(png) })),
+                    Ok(None) => err("could not encode the screenshot"),
+                    Err(e) => err(e),
+                };
+            }
             match screenshot(app, view) {
                 Some((w, h, png)) => ok(json!({ "width": w, "height": h, "png": base64::engine::general_purpose::STANDARD.encode(png) })),
                 None => err("no rendered view to capture yet"),
@@ -155,6 +168,22 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
         }
         other => err(format!("unknown method `{other}`")),
     }
+}
+
+/// `{width?, height?, preset?, scale?}` of `viewport.screenshot`.
+fn size_request(p: &Value) -> Result<texturecraft_render::output::SizeRequest, String> {
+    let num = |k: &str| match p.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_u64().and_then(|v| u32::try_from(v).ok()).map(Some).ok_or_else(|| format!("`{k}` must be a whole number")),
+    };
+    let preset = match p.get("preset") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_str().ok_or("`preset` must be a string")?.to_string()),
+    };
+    if p.get("transparent").and_then(Value::as_bool) == Some(true) {
+        return Err("a transparent background needs a path-traced render (Rendering mode, or `render` with `samples`)".into());
+    }
+    Ok(texturecraft_render::output::SizeRequest { width: num("width")?, height: num("height")?, preset, scale: num("scale")? })
 }
 
 /// Encode a rendered view as PNG.

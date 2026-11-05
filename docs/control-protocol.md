@@ -66,7 +66,7 @@ keeps its state in a throwaway file.
 | `ui.menu.list` | | the menu catalog: `{menu, submenu, label, id, shortcut, implemented, enabled}` |
 | `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window) |
 | `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History` and `Log`; `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds) | `null` |
-| `viewport.screenshot` | `{view?: "3d" \| "2d"}` | `{width, height, png}` (PNG, base64) |
+| `viewport.screenshot` | `{view?: "3d" \| "2d", width?, height?, preset?, scale?}` | `{width, height, png}` (PNG, base64); without a size it reads the view as shown, otherwise it renders the view again at the [resolution](#scene-image-resolution) asked (up to 4096 px a side and the GPU limit) |
 | `ui.screenshot` | | `{width, height, png}` of the whole window, after the next frame |
 | `ui.resize` | `{width, height}` | Sets the window's inner size in points (640–7680), leaving maximized state; for recordings and screenshots at a fixed size |
 | `debug.paintTest` | `{from: [x, y], to: [x, y], frames?: 120}` | Paints a straight stroke through the real frame loop (viewport pixels, one point per frame) for performance work |
@@ -143,8 +143,8 @@ takes a font family, not a path: it reads only the system's font folders.
 | `textures_export` | `{dir, preset?, ts?, format?, padding?, size?}` | Writes files below the write root |
 | `bake` | `{ts?, resolution?, maps?, cpu?}` | Mesh maps for generators and smart materials; rays on the GPU when there is one (`cpu: true`: on the CPU). Per-map ray settings (`ao`, `thickness`, `bentNormal`: rays, maxDistance, spread, distribution; AO ignoreBackface, selfOcclusion) are `bake.settings` parameters |
 | `paint_stroke` | `{points, viewport?, color?, roughness?, metallic?, height?, size?, hardness?}` | Paint tool + brush material + `tool.stroke`; points in viewport pixels |
-| `viewport_render` | `{view?: "3d" \| "2d", width?, height?, yaw?, pitch?, samples?, bounces?, cpu?}` | Headless: PNG image (≤ 2048 px a side); yaw/pitch in degrees for this render only; `samples` (1–4096) path traces the 3D view instead, on the GPU when it has compute shaders, else (or with `cpu: true`) on the CPU (no GPU needed) |
-| `viewport_screenshot` | `{view?}` | Bridge: the app's 3D or 2D view |
+| `viewport_render` | `{view?: "3d" \| "2d", width?, height?, preset?, scale?, transparent?, yaw?, pitch?, samples?, bounces?, cpu?}` | Headless: PNG image (≤ 2048 px a side); size, preset, scale and transparency as in [Scene image resolution](#scene-image-resolution); yaw/pitch in degrees for this render only; `samples` (1–4096) path traces the 3D view instead, on the GPU when it has compute shaders, else (or with `cpu: true`) on the CPU (no GPU needed) |
+| `viewport_screenshot` | `{view?, width?, height?, preset?, scale?}` | Bridge: the app's 3D or 2D view; with a size, preset or scale it renders the view again at that resolution |
 | `ui_screenshot` | | Bridge: the whole window (downscaled to 2048 px) |
 | `ui_inspect` | | Bridge: UI state |
 | `ui_menu_invoke` | `{id}` | Bridge: a menu click |
@@ -216,12 +216,60 @@ File access follows `--read-root` / `--write-root` as for MCP.
 | `material.save` | `{path, layer?, name?}` |
 | `material.load` | `{path}` |
 | `textures.export` | `{dir, preset?, ts?, format?, padding?, size?, bitDepth?, dilation?, normalFormat?}` |
-| `render` | `{view?, width?, height?, yaw?, pitch?}` → `{width, height, png}` |
+| `render` | `{view?, width?, height?, preset?, scale?, transparent?, yaw?, pitch?, samples?, bounces?, cpu?}` → `{width, height, by, png}` |
 
 ```sh
 printf '%s\n' '{"id":1,"method":"command.run","params":{"id":"project.new","params":{"mesh":"torus"}}}' \
               '{"id":2,"method":"render","params":{"width":512,"height":512}}' | texturecraft-cli serve
 ```
+
+## Scene image resolution
+
+Every scene image export (`render`, `viewport_render`, `viewport.screenshot` with a size,
+`texturecraft-cli render`, and the app's **Export image** window) resolves its output size the same
+way (`texturecraft_render::output`):
+
+| Param | Meaning |
+|---|---|
+| `width`, `height` | Pixels. Both: that size. One: the other edge follows the aspect ratio of the preset, else of the viewport. Neither: the preset, else the session viewport (1280×800 headless; the 3D view's size in the app) |
+| `preset` | `hd` 1920×1080, `qhd` 2560×1440, `4k` 3840×2160, `square-1k` 1024×1024, `square-2k` 2048×2048 |
+| `scale` | Render multiplier per side, `1` (default), `2` or `4`, applied last |
+| `transparent` | `true`: no backdrop; only the mesh, with straight (not premultiplied) alpha from its pixel coverage |
+
+The final size must be at least 16 px a side and at most the limit: 4096 px for local CLI renders
+and the app, 2048 px for remote and agent callers (`render` over `serve`, MCP), and never more than
+the GPU's largest texture (`max_texture_dimension_2d`) for real-time renders. Over the limit is an
+error that names the size and the limit (`render size 5120x3200 is over the export limit of 4096
+pixels a side; lower the size or the render scale`), never a silent downscale.
+
+**Transparent backgrounds** are supported by the CPU path tracer only: `transparent` needs
+`samples`, and forces the CPU tracer even where the GPU tracer runs (its output is always over the
+backdrop). The real-time viewport (rasterized, no `samples`) refuses `transparent` with an error,
+because its post pass always composites over the studio backdrop.
+
+```sh
+texturecraft-cli render ball.tcraft ball@2x.png --scale 2                          # 2560x1600 from the 1280x800 viewport
+texturecraft-cli render ball.tcraft ball-hd.png --preset hd
+texturecraft-cli render ball.tcraft ball-wide.png --width 1600                     # 1600x1000, the viewport's aspect
+texturecraft-cli render ball.tcraft cutout.png --size 1024x1024 --samples 256 --transparent
+```
+
+## Viewport anti-aliasing
+
+Two display settings, both shown by `session.inspect` under `display` and set with `display.set`:
+
+| Setting | On (default) | Off |
+|---|---|---|
+| `msaa` | The scene pass renders 4× multisampled and resolves: smooth mesh edges and wireframe | One sample per pixel, straight into the view's target: hard, aliased edges and crisp texels; less GPU memory and fill |
+| `taa` | While the view is still, jittered frames are averaged (up to 16) for smoother edges and texture detail | Every frame is a single frame; no repaint while idle |
+
+The top-bar **AA** toggle (Viewport › Anti-aliasing, Alt+A) switches both together and is
+remembered as a preference: new and opened projects take it. The Display panel has a checkbox for
+each. `display.set {"msaa": false, "taa": false}` gives the same pixel-exact view to agents.
+
+Renders and screenshots taken through automation and Export image are single frames (no `taa`
+accumulation) and follow `msaa`. Path-traced Rendering mode antialiases by its own sample jitter
+and ignores both settings.
 
 ## MaterialCraft materials
 

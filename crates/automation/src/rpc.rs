@@ -8,7 +8,8 @@
 //! preserveStrokes?}`, `mesh.export {path, format?}`, `bake.mesh.add {path, cage?}`,
 //! `resource.import {path}`, `material.save {path, layer?, name?}`, `material.load {path}`
 //! (workspace-scoped versions of the engine commands),
-//! `textures.export {dir, …}`, `render {view?, width?, height?, yaw?, pitch?}` (PNG base64, the
+//! `textures.export {dir, …}`, `render {view?, width?, height?, preset?, scale?, transparent?, yaw?,
+//! pitch?, samples?, bounces?, cpu?}` (PNG base64, the
 //! shape of the app's `viewport.screenshot`) and `methods`.
 
 use std::io::{BufRead, Write};
@@ -110,6 +111,9 @@ impl Headless {
                     samples: u32_of(p, "samples")?,
                     bounces: u32_of(p, "bounces")?,
                     cpu: bool_of(p, "cpu")?,
+                    preset: str_of(p, "preset").map(str::to_string),
+                    scale: u32_of(p, "scale")?,
+                    transparent: bool_of(p, "transparent")?,
                 };
                 let r = self.render_png(&o)?;
                 Ok(json!({ "width": r.width, "height": r.height, "by": r.by, "png": base64::engine::general_purpose::STANDARD.encode(r.png) }))
