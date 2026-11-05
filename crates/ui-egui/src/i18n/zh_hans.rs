@@ -1014,4 +1014,9 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "值上限"),
     ("Value Bounds Min", "值下限"),
     ("Vertex Color", "顶点颜色"),
+    ("Brush presets", "笔刷预设"),
+    ("Use this brush (with its size)", "使用此笔刷（含大小）"),
+    ("Rename this brush", "重命名此笔刷"),
+    ("Replace with the current brush", "用当前笔刷替换"),
+    ("Delete this brush", "删除此笔刷"),
 ];

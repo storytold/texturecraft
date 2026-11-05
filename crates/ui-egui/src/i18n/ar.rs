@@ -1055,4 +1055,9 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "الحد الأقصى للقيمة"),
     ("Value Bounds Min", "الحد الأدنى للقيمة"),
     ("Vertex Color", "لون الرأس"),
+    ("Brush presets", "إعدادات الفرشاة المسبقة"),
+    ("Use this brush (with its size)", "استخدام هذه الفرشاة (مع حجمها)"),
+    ("Rename this brush", "إعادة تسمية هذه الفرشاة"),
+    ("Replace with the current brush", "استبدال بالفرشاة الحالية"),
+    ("Delete this brush", "حذف هذه الفرشاة"),
 ];

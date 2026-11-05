@@ -215,6 +215,12 @@ File access follows `--read-root` / `--write-root` as for MCP.
 | `resource.import` | `{path}` |
 | `material.save` | `{path, layer?, name?}` |
 | `material.load` | `{path}` |
+| `brush.preset.list` | `{}` → `[{id, label, category, builtin}]`: the built-in brush presets, then the user's |
+| `brush.preset.apply` | `{preset}`: a built-in sets the stroke and keeps the size; a user preset sets the whole brush (size too) and the painted channels |
+| `brush.preset.store` | `{name, overwrite?}`: saves the current brush and painted channels as a user preset (a `.tcbrush` file in the data folder's `brushes` folder); an existing name needs `overwrite: true`, built-in names are read-only |
+| `brush.preset.rename` | `{name, to}` |
+| `brush.preset.delete` | `{name}` |
+| `brush.preset.save` / `brush.preset.load` | `{path}`: the brush as a loose `.tcbrush` file, and back (the stroke only, size kept) |
 | `textures.export` | `{dir, preset?, ts?, format?, padding?, size?, bitDepth?, dilation?, normalFormat?}` |
 | `render` | `{view?, width?, height?, yaw?, pitch?}` → `{width, height, png}` |
 

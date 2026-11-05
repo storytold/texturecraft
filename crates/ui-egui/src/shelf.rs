@@ -393,63 +393,76 @@ fn brushes(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: 
             });
         }
     }
-    my_brushes(app, ui, filter);
+    user_brushes(app, ui, filter);
 }
 
-/// The user's saved brush presets (desktop brushes folder) and saving the current brush there.
-#[cfg(not(target_arch = "wasm32"))]
-fn my_brushes(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str) {
-    use texturecraft_engine::brush_preset_cmds::BRUSH_EXT;
-    let dir = crate::user_dir("brushes");
-    if app.brushes.is_none() {
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == BRUSH_EXT)).collect())
-            .unwrap_or_default();
-        files.sort();
-        app.brushes = Some(files);
-    }
-    let files = app.brushes.clone().unwrap_or_default();
-    let name = |f: &std::path::PathBuf| f.file_stem().and_then(|s| s.to_str()).unwrap_or("brush").to_string();
-    let shown: Vec<_> = files.iter().filter(|f| matches(filter, &[&name(f)])).collect();
-    if !filter.is_empty() && shown.is_empty() {
+/// The user's brush presets: click to use one, and rename, replace it with the current brush or
+/// delete it; below, a field saves the current brush under a new name.
+pub(crate) fn user_brushes(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str) {
+    let names: Vec<String> = app.session.brush_presets.list.iter().map(|p| p.name.clone()).filter(|n| matches(filter, &[n])).collect();
+    if !filter.is_empty() && names.is_empty() {
         return;
     }
-    ui.horizontal(|ui| {
-        header(ui, tr("My brushes"));
-        if ui.small_button(ic::ARROW_CLOCKWISE).on_hover_text(tr("Rescan the library folder")).clicked() {
-            app.brushes = None;
+    header(ui, tr("My brushes"));
+    let rename_id = ui.make_persistent_id("brush_preset_rename");
+    let mut renaming: Option<(String, String)> = ui.data_mut(|d| d.get_temp(rename_id));
+    for name in names {
+        ui.horizontal(|ui| {
+            if renaming.as_ref().is_some_and(|(old, _)| *old == name) {
+                let Some((old, buf)) = renaming.as_mut() else { return };
+                let edit = ui.add(egui::TextEdit::singleline(buf).desired_width(120.0));
+                let (done, cancel) = (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)), ui.input(|i| i.key_pressed(egui::Key::Escape)));
+                if !edit.has_focus() && !done && !cancel {
+                    edit.request_focus();
+                }
+                if done {
+                    // A failed rename is reported by the command; the row goes back to its name either way
+                    app.run("brush.preset.rename", json!({"name": old, "to": buf}));
+                }
+                if done || cancel {
+                    renaming = None;
+                }
+                return;
+            }
+            let use_it =
+                ui.add(egui::Button::selectable(false, format!("{}  {name}", ic::PAINT_BRUSH_BROAD))).on_hover_text(tr("Use this brush (with its size)"));
+            if use_it.clicked() {
+                app.run("brush.preset.apply", json!({"preset": name}));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(ic::TRASH).on_hover_text(tr("Delete this brush")).clicked() {
+                    app.run("brush.preset.delete", json!({"name": name}));
+                }
+                if ui.small_button(ic::ARROWS_CLOCKWISE).on_hover_text(tr("Replace with the current brush")).clicked() {
+                    app.run("brush.preset.store", json!({"name": name, "overwrite": true}));
+                }
+                if ui.small_button(ic::PENCIL_SIMPLE).on_hover_text(tr("Rename this brush")).clicked() {
+                    renaming = Some((name.clone(), name.clone()));
+                }
+            });
+        });
+    }
+    ui.data_mut(|d| match renaming {
+        Some(r) => {
+            d.insert_temp(rename_id, r);
+        }
+        None => {
+            d.remove_temp::<(String, String)>(rename_id);
         }
     });
-    for f in shown {
-        if ui
-            .add(egui::Button::selectable(false, format!("{}  {}", ic::PAINT_BRUSH_BROAD, name(f))))
-            .on_hover_text(tr("Use this brush (keeps its size)"))
-            .clicked()
-        {
-            app.run("brush.preset.load", json!({"path": f.display().to_string()}));
-        }
-    }
     ui.horizontal(|ui| {
         let id = ui.make_persistent_id("brush_preset_name");
         let mut new_name: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
         ui.add(egui::TextEdit::singleline(&mut new_name).hint_text(tr("Brush name")).desired_width(110.0));
-        let file = texturecraft_engine::formats::export::sanitize_file_stem(new_name.trim());
-        if ui.add_enabled(!new_name.trim().is_empty(), egui::Button::new(tr("Save current brush"))).clicked() {
-            let path = dir.join(format!("{file}.{BRUSH_EXT}"));
-            // A folder that can't be made fails the save, which reports it.
-            let _ = std::fs::create_dir_all(&dir);
-            if app.run("brush.preset.save", json!({"path": path.display().to_string()})).is_some() {
-                new_name.clear();
-                app.brushes = None;
-            }
+        if ui.add_enabled(!new_name.trim().is_empty(), egui::Button::new(tr("Save current brush"))).clicked()
+            && app.run("brush.preset.store", json!({"name": new_name})).is_some()
+        {
+            new_name.clear();
         }
         ui.data_mut(|d| d.insert_temp(id, new_name));
     });
     ui.add_space(6.0);
 }
-
-#[cfg(target_arch = "wasm32")]
-fn my_brushes(_: &mut TextureCraftApp, _: &mut Ui, _: &str) {}
 
 /// The built-in alpha library, grouped by category; the brush's alpha is outlined.
 fn alpha_library(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: &str, name: &str) {

@@ -1139,9 +1139,38 @@ fn path_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.label(RichText::new(hint).size(10.5).color(tk.text_dim));
 }
 
+/// The "Brush presets" button: a popover with the built-in presets and the user's own.
+fn brush_presets_popover(app: &mut TextureCraftApp, ui: &mut Ui) {
+    let resp = ui.button(format!("{}  {}", ic::PAINT_BRUSH_BROAD, tr("Brush presets")));
+    let popup = ui.make_persistent_id("brush_presets_popup");
+    if resp.clicked() {
+        egui::Popup::toggle_id(ui.ctx(), popup);
+    }
+    egui::Popup::from_response(&resp).id(popup).open_memory(None).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        ui.set_min_width(230.0);
+        egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+            let mut category = "";
+            for p in texturecraft_engine::paint::presets::PRESETS.iter() {
+                if p.category != category {
+                    category = p.category;
+                    ui.label(caption(category));
+                }
+                if ui.selectable_label(false, p.label).on_hover_text(tr("Use this brush (keeps its size)")).clicked() {
+                    app.run("brush.preset.apply", json!({"preset": p.id}));
+                }
+            }
+            ui.separator();
+            crate::shelf::user_brushes(app, ui, "");
+        });
+    });
+}
+
 fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        ui.label(caption(tr("Brush")));
+        brush_presets_popover(app, ui);
+    });
     let b = &mut app.session.tool.brush;
-    ui.label(caption(tr("Brush")));
     let hint = tr("Ctrl+right-drag in a view sets the size and hardness, Ctrl+left-drag the flow and angle.");
     ui.label(RichText::new(hint).size(10.5).color(Tokens::get(ui.ctx()).text_dim));
     section(ui, "sec_size", tr("Size"), true, |ui| {

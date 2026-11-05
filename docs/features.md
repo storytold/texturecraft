@@ -13,7 +13,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   and angle.
   **67 procedural brush alphas** in their own shelf tab, or any imported image as the alpha.
   **18 brush presets** (basic, wear and grunge, details) in the shelf's Brushes tab set the
-  stroke and keep the size; save your own brushes there too.
+  stroke and keep the size. The Brush section's **Brush presets** popover (and the shelf) also keeps
+  your own: save the current brush, click to use it, rename, replace or delete it.
 - **Tools:** paint, eraser, **projection** with image stencils (hold S to move, turn and scale the
   stencil), polygon fill (triangle, UV island or the whole mesh), **path** and **lasso fill**, a
   **particle brush**, **smudge**, **clone** (V + click sets the source), color picker, Shift+click

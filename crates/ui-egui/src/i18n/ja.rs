@@ -1083,4 +1083,9 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "値の上限"),
     ("Value Bounds Min", "値の下限"),
     ("Vertex Color", "頂点カラー"),
+    ("Brush presets", "ブラシプリセット"),
+    ("Use this brush (with its size)", "このブラシを使う（サイズも）"),
+    ("Rename this brush", "このブラシの名前を変更"),
+    ("Replace with the current brush", "現在のブラシで置き換え"),
+    ("Delete this brush", "このブラシを削除"),
 ];

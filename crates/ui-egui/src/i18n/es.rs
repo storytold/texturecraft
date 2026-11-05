@@ -1089,4 +1089,9 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "Límite máximo"),
     ("Value Bounds Min", "Límite mínimo"),
     ("Vertex Color", "Color de vértice"),
+    ("Brush presets", "Ajustes de pincel"),
+    ("Use this brush (with its size)", "Usar este pincel (con su tamaño)"),
+    ("Rename this brush", "Renombrar este pincel"),
+    ("Replace with the current brush", "Reemplazar con el pincel actual"),
+    ("Delete this brush", "Eliminar este pincel"),
 ];
