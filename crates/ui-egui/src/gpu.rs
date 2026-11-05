@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use rayon::prelude::*;
 use texturecraft_engine::Session;
-use texturecraft_engine::compose::{DisplayKind, ImageRes, tile_bytes};
+use texturecraft_engine::compose::{DisplayKind, ImageRes, display_view, tile_bytes};
 use texturecraft_engine::core::BakedMap;
 use texturecraft_engine::geom::Mesh;
 use texturecraft_render::{Frame, Renderer, wgpu};
@@ -187,14 +187,14 @@ impl GpuLink {
             let mut done = 0;
             if let Some(cache) = s.caches.get(ts) {
                 let empty = Default::default();
-                let baked = s.doc.baked.get(&ts).unwrap_or(&empty);
                 let comp = &cache.composite;
+                let baked = display_view(s.doc.baked.get(&ts).unwrap_or(&empty), comp);
                 // In chunks while the frame has time (at least one chunk); the rest waits.
                 for chunk in tiles.chunks(UPLOAD_CHUNK) {
                     let bytes: Vec<_> = chunk
                         .par_iter()
                         .flat_map_iter(|&(tx, ty)| DisplayKind::ALL.into_iter().map(move |k| (k, tx, ty)))
-                        .map(|(k, tx, ty)| (ts, k, tx, ty, tile_bytes(comp, baked, k, tx, ty)))
+                        .map(|(k, tx, ty)| (ts, k, tx, ty, tile_bytes(comp, &baked, k, tx, ty)))
                         .collect();
                     queued += bytes.len();
                     out.tiles.extend(bytes);
