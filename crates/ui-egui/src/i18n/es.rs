@@ -1089,4 +1089,12 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "Límite máximo"),
     ("Value Bounds Min", "Límite mínimo"),
     ("Vertex Color", "Color de vértice"),
+    ("Select the layer content", "Seleccionar el contenido de la capa"),
+    ("Paint layer", "Capa de pintura"),
+    ("Fill layer", "Capa de relleno"),
+    ("1 effect", "1 efecto"),
+    ("{count} effects", "{count} efectos"),
+    ("Mask effects", "Efectos de la máscara"),
+    ("Content effects", "Efectos del contenido"),
+    ("Fold or unfold these effects", "Plegar o desplegar estos efectos"),
 ];

@@ -69,6 +69,26 @@ The CPU compositor is the reference for everything users see and export. Export
 (`formats::export`) reads the same composite, adds height-to-normal (Sobel) combined with the
 normal channel and baked normals by reoriented normal mapping, and packs channels per preset.
 
+### Layer-panel thumbnails
+
+The Layers panel shows each layer's content (in the displayed channel), its mask and every effect
+stage as small pictures. `compose::thumb::render` runs the same compositor on a *cut* copy of the
+project: the set's stack becomes the one layer, forced visible at Normal / 100 %, without its mask
+for the content, and with its effect list truncated after the previewed effect (a hidden effect
+shows the result it bypasses). Paint and fill layers are flattened to (value, coverage), so empty
+texels are transparent; folders composite their children. Colors are encoded linear to sRGB, data
+channels raw. Everything is evaluated on a 64 px G-buffer of the mesh (painted tiles are
+resampled), never at the set's resolution, and the main composite is never touched.
+
+`engine::thumbs::ThumbService` runs it off the UI thread: an immutable `ThumbSnapshot` (the
+project, copy-on-write pixel tiles, baked maps, images and the cached 64 px G-buffer) is rebuilt
+only when the document really differs (compared at most every 120 ms while it keeps changing), a
+worker thread renders one job at a time (inline, one per frame, on wasm32), results of an older
+snapshot are dropped, and an LRU of 96 pictures keeps the out-of-date picture on screen until its
+replacement arrives. Only rows on screen ask for pictures; queued rows that scrolled away are
+dropped. On a 4096 set (`perf::bench_layer_thumbs_4k`) a snapshot costs 0.02 ms, a content picture
+about 2.5 ms and a whole ten-layer panel (20 pictures) about 42 ms of worker time.
+
 ## Undo
 
 `Session::edit` snapshots the `Document` (project + pixels + baked maps + resources) before a

@@ -129,7 +129,40 @@ fn window_snapshots() {
         texturecraft_engine::execute(session, id, &params).unwrap();
     }
     save(&mut harness, &output_dir, "properties-levels");
-
+    // Show the Layers panel thumbnails with a hidden content effect, a folder and a mask
+    let session = &mut harness.state_mut().session;
+    for (id, params) in [
+        ("effect.add.filter", serde_json::json!({"target": "content", "filter": "hsl"})),
+        ("effect.add.filter", serde_json::json!({"target": "content", "filter": "invert"})),
+        ("layer.add.paint", serde_json::Value::Null),
+        ("layer.group", serde_json::Value::Null),
+    ] {
+        texturecraft_engine::execute(session, id, &params).unwrap();
+    }
+    let hidden = harness
+        .state()
+        .session
+        .doc
+        .project
+        .layers
+        .values()
+        .flat_map(|layer| layer.content_effects.iter())
+        .find(|effect| effect.name == "Invert")
+        .map(|effect| effect.id.0);
+    if let Some(effect) = hidden {
+        texturecraft_engine::execute(&mut harness.state_mut().session, "effect.set", &serde_json::json!({"effect": effect, "visible": false})).unwrap();
+    }
+    harness.state_mut().ui.dock.focus(Panel::Layers);
+    harness.set_size(egui::vec2(1600.0, 1400.0));
+    for _ in 0..400 {
+        harness.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if !harness.state().layer_panel.service().busy() {
+            break;
+        }
+    }
+    save(&mut harness, &output_dir, "panel-layers");
+    harness.set_size(egui::vec2(1600.0, 960.0));
     // Show the second path selected in Properties
     let session = &mut harness.state_mut().session;
     for (id, params) in [

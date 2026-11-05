@@ -1068,4 +1068,12 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "값 상한"),
     ("Value Bounds Min", "값 하한"),
     ("Vertex Color", "정점 색상"),
+    ("Select the layer content", "레이어 내용 선택"),
+    ("Paint layer", "페인트 레이어"),
+    ("Fill layer", "채우기 레이어"),
+    ("1 effect", "효과 1개"),
+    ("{count} effects", "효과 {count}개"),
+    ("Mask effects", "마스크 효과"),
+    ("Content effects", "콘텐츠 효과"),
+    ("Fold or unfold these effects", "이 효과들 접기/펼치기"),
 ];
