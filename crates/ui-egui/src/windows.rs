@@ -24,6 +24,7 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     crate::windows::export(app, ctx);
     #[cfg(target_arch = "wasm32")]
     export_mesh(app, ctx);
+    crate::pbr_import::window(app, ctx);
     unsaved(app, ctx);
 }
 
@@ -101,7 +102,7 @@ pub(crate) fn window<'a>(id: &str, title: &str, open: &'a mut bool) -> egui::Win
 }
 
 /// A centered dialog; `id` keeps its place across UI languages.
-fn dialog<'a>(id: &str, title: &str, open: &'a mut bool) -> egui::Window<'a> {
+pub(crate) fn dialog<'a>(id: &str, title: &str, open: &'a mut bool) -> egui::Window<'a> {
     egui::Window::new(title.to_owned())
         .id(egui::Id::unique(id))
         .open(open)
@@ -792,6 +793,10 @@ pub fn file_action(app: &mut TextureCraftApp, _ctx: &egui::Context, id: &str) ->
                 app.toast(trf("Imported {name}", &[("name", &name)]), false);
                 app.ui.dock.focus(crate::docking::Panel::Layers);
             }
+            true
+        }
+        "file.importPbrFolder" => {
+            crate::pbr_import::pick(app);
             true
         }
         "file.exportMesh" => {

@@ -223,6 +223,57 @@ printf '%s\n' '{"id":1,"method":"command.run","params":{"id":"project.new","para
               '{"id":2,"method":"render","params":{"width":512,"height":512}}' | texturecraft-cli serve
 ```
 
+## PBR texture folders
+
+`file.importPbrFolder` turns a folder, a `.zip` or a list of image files of PBR maps into one fill layer
+(one undo step), the way `file.importMaterialX` does for a `.mtlx`. `file.scanPbrFolder` takes the same
+`path` / `files` and reports what would be used without changing anything. Both are `file.*` commands, so
+they run over the control channel and the CLI, not through MCP `command_run` (which refuses `file.*`
+commands and host paths).
+
+| Command | Params |
+|---|---|
+| `file.importPbrFolder` | `{path \| files, name?, normalFormat?: auto\|openGl\|directX, projection?: uv\|triplanar\|planar..., scale?, choose?: {map: file}}` → `{layer, name, maps, candidates, normalFormat, channels, resources, ignored, warnings}` |
+| `file.scanPbrFolder` | `{path \| files, normalFormat?, choose?}` → `{name, maps, candidates, normalFormat, ignored, channelsAvailable}` |
+
+Maps are found by file name, case-insensitively, from the last known word in the name; resolution
+(`2k`, `4096`), bit depth and other tokens are skipped:
+
+| Map (`maps` key) | Words |
+|---|---|
+| `baseColor` | `basecolor`, `base_color`, `albedo`, `diffuse`, `diff`, `col`, `color`, `bc`, `basemap`, `maintex` |
+| `roughness` | `roughness`, `rough`, `rgh` |
+| `glossiness` (inverted into roughness; a roughness file wins) | `gloss`, `glossiness`, `smoothness` |
+| `metallic` | `metallic`, `metalness`, `metal`, `mtl` |
+| `normal` | `normal`, `nrm`, `nor`, `norm`, `normalmap`, `bumpmap`, a trailing `n` |
+| `height` | `height`, `disp`, `displacement`, `hgt`, `bump` (weakest) |
+| `ambientOcclusion` | `ao`, `ambientocclusion`, `ambient_occlusion`, `occlusion`, `occ` |
+| `emissive` | `emissive`, `emission`, `emit`, `glow` |
+| `opacity` | `opacity`, `alpha`, `transparency` |
+| `orm` (split: R occlusion, G roughness, B metallic; separate files win) | `orm`, `arm`, `ao_rough_metal` |
+
+- **Normal convention.** `gl` / `opengl` in the name is OpenGL, `dx` / `directx` is DirectX (the layer's
+  normal source is flagged DirectX, so its green is flipped where it is sampled). With neither the map is
+  OpenGL. `normalFormat: openGl|directX` forces every normal map; `auto` (the default) reads the name.
+- **Ignored**: other files, dot files and `__MACOSX`, preview images (`preview`, `thumb`, `thumbnail`,
+  `sphere`, `render`, `swatch`, `icon`), and maps with no channel here (cavity, curvature, specular...).
+  Each is listed in `ignored` with the reason.
+- **Several files for one map** (resolutions, formats, GL and DX): the OpenGL normal, then the highest
+  resolution token, then the largest file wins. A programmatic call never asks; `candidates` lists the
+  alternatives and `choose: {"baseColor": "file.png"}` picks one (the app's dialog shows a drop-down).
+- **Where.** A folder's own files if they hold maps; otherwise the one sub-folder that does (several are
+  an error that names them). The layer is named after the folder, archive or shared file-name prefix.
+- **Channels** the texture set doesn't have are skipped with a warning. Projection defaults to UV
+  (`scale` 1); `projection: triplanar` is the option for models without good UVs.
+- **Hostile input.** Links, pipes and devices are not followed, at most 4096 files are listed, a file is
+  at most 256 MB, an image 64 M texels (320 M per import), a zip entry is read through the same limit.
+  An image that doesn't decode is skipped with a warning; if none decodes the import is an error that
+  changes nothing.
+
+In the app: File › Import PBR texture folder... or drop a folder, a `.zip` or several map files on the
+window. The dialog shows the maps found, lets you pick between candidates, set the normal convention and
+projection, and keep the material in the library (shelf › Materials).
+
 ## MaterialCraft materials
 
 A `.mcmat` portable material (MaterialCraft's format, read here by `formats::mcmat`; the manifest is

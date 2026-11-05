@@ -49,6 +49,17 @@ pub fn coverage_png(width: u32, height: u32, coverage: &[u8], rgb: [u8; 3]) -> R
     Ok(png)
 }
 
+/// 16-bit single-channel PNG bytes of `values` (0..1, `width × height`, top row first): one map
+/// split out of a packed image, or an inverted one.
+pub fn gray16_png(width: u32, height: u32, values: impl Iterator<Item = f32>) -> Result<Vec<u8>> {
+    let data: Vec<u16> = values.map(|v| if v.is_finite() { (v.clamp(0.0, 1.0) * 65535.0).round() as u16 } else { 0 }).collect();
+    let img = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(width, height, data)
+        .ok_or_else(|| FormatError::Invalid(format!("pixel count does not match {width}x{height}")))?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| FormatError::Invalid(e.to_string()))?;
+    Ok(png)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +78,18 @@ mod tests {
         let text = decode_image(&coverage_png(2, 1, &[0, 255], [255; 3]).unwrap()).unwrap();
         assert_eq!(text.rgba, vec![[1.0, 1.0, 1.0, 0.0], [1.0; 4]]);
         assert!(coverage_png(2, 2, &[0], [255; 3]).is_err());
+    }
+
+    #[test]
+    fn gray16_round_trips_and_rejects_a_wrong_count() {
+        let png = gray16_png(2, 1, [0.0, 1.0].into_iter()).unwrap();
+        let d = decode_image(&png).unwrap();
+        assert_eq!((d.width, d.height), (2, 1));
+        assert_eq!((d.rgba[0][0], d.rgba[1][0]), (0.0, 1.0));
+        assert!(gray16_png(2, 2, [0.5].into_iter()).is_err());
+        // NaN becomes 0, out-of-range values clamp.
+        let d = decode_image(&gray16_png(3, 1, [f32::NAN, 9.0, -9.0].into_iter()).unwrap()).unwrap();
+        assert_eq!((d.rgba[0][0], d.rgba[1][0], d.rgba[2][0]), (0.0, 1.0, 0.0));
     }
 
     #[test]

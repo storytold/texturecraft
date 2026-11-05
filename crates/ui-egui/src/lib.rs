@@ -18,6 +18,7 @@ pub mod i18n;
 pub mod keymap;
 pub mod menus;
 pub mod parity;
+pub mod pbr_import;
 pub mod profile;
 pub mod render_mode;
 pub mod shelf;
@@ -82,6 +83,8 @@ pub struct TextureCraftApp {
     /// Texture sets the GPU could not hold, and the text of the one sticky toast naming them.
     pub(crate) gpu_memory: (Vec<String>, Option<String>),
     pub bake: Option<BakeJob>,
+    /// The Import PBR textures dialog while it is open.
+    pub pbr_import: Option<pbr_import::PbrDialog>,
     pub resize: Option<ResizeJob>,
     pub link_cooks: Vec<LinkCook>,
     pub thumbs: thumbs::Thumbs,
@@ -142,6 +145,7 @@ impl TextureCraftApp {
             toasts: Vec::new(),
             gpu_memory: (Vec::new(), None),
             bake: None,
+            pbr_import: None,
             resize: None,
             link_cooks: Vec::new(),
             thumbs: thumbs::Thumbs::default(),
@@ -445,7 +449,15 @@ impl eframe::App for TextureCraftApp {
         control::poll(self, ctx);
         web_files::poll(self);
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        for f in &dropped {
+        // A folder, a zip or several PBR maps dropped together open the PBR import dialog.
+        #[cfg(not(target_arch = "wasm32"))]
+        let taken = !dropped.is_empty() && {
+            let paths: Vec<std::path::PathBuf> = dropped.iter().map(|f| f.path().to_path_buf()).collect();
+            pbr_import::dropped(self, &paths)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let taken = false;
+        for f in dropped.iter().filter(|_| !taken) {
             web_files::dropped(self, ctx, f);
         }
         self.poll_bake(ctx);
