@@ -304,8 +304,15 @@ fn effect_command<'a>(app: &TextureCraftApp, id: &'a str) -> &'a str {
     }
 }
 
+/// Factor of one `[` or `]` press on the brush size
+const BRUSH_SIZE_STEP: f32 = 1.15;
+/// Brush radius limits for `[` and `]`, as a fraction of the mesh diagonal
+const MIN_BRUSH_SIZE: f32 = 0.0005;
+const MAX_BRUSH_SIZE: f32 = 0.25;
+
+/// Runs the commands bound to the keys pressed this frame, outside text fields and key capture
 pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
-    if crate::keymap::capturing(ctx) || (ctx.memory(|m| m.focused().is_some()) && ctx.egui_wants_keyboard_input()) {
+    if crate::keymap::capturing(ctx) || (ctx.memory(|memory| memory.focused().is_some()) && ctx.egui_wants_keyboard_input()) {
         return;
     }
 
@@ -317,6 +324,9 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if !ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))) {
         return;
     }
+
+    // Escape closes an open popup instead of cancelling the stroke
+    let popup_open = egui::Popup::is_any_open(ctx);
 
     let active_shortcuts = crate::keymap::active(&app.ui.keymap);
     let mut commands_to_invoke: Vec<&str> = Vec::new();
@@ -330,11 +340,11 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         let size_down = input.consume_key(Modifiers::NONE, Key::OpenBracket);
         let size_up = input.consume_key(Modifiers::NONE, Key::CloseBracket);
         if app.ui.mode == Mode::Painting && (size_down || size_up) {
-            let scale = if size_up { 1.15 } else { 1.0 / 1.15 };
-            app.session.tool.brush.size = (app.session.tool.brush.size * scale).clamp(0.0005, 0.25);
+            let scale = if size_up { BRUSH_SIZE_STEP } else { 1.0 / BRUSH_SIZE_STEP };
+            app.session.tool.brush.size = (app.session.tool.brush.size * scale).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
         }
 
-        if app.ui.mode == Mode::Painting && input.consume_key(Modifiers::NONE, Key::Escape) {
+        if app.ui.mode == Mode::Painting && !popup_open && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.session.cancel_stroke();
             app.session.tool.path.points.clear();
             app.session.tool.path.editing = None;

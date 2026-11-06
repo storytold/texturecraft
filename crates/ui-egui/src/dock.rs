@@ -8,7 +8,7 @@ use texturecraft_engine::core::{
     BakedMap, BlendMode, Channel, Decal, Effect, EffectKind, Fill, Filter, GeneratorKind, Layer, LayerId, LayerKind, LinkParam, MaterialLink, ProceduralKind,
     Source,
 };
-use texturecraft_engine::filter_lib::{FILTERS, scalar_params};
+use texturecraft_engine::filter_lib::scalar_params;
 use texturecraft_engine::paint::{BrushAlpha, alphas};
 use texturecraft_engine::{CloneFrom, StackTarget, Tool};
 
@@ -18,6 +18,13 @@ use crate::shelf::{Asset, ShelfDrag};
 use crate::state::PropsTab;
 use crate::theme::{Tokens, caption};
 use crate::widgets::{chip, color_swatch, combo, dnd_release, elided, histogram, icon_button, section, slider, slider_edit};
+
+/// The filter Add filter adds: at its defaults it changes nothing until the slot swaps it
+const NEW_FILTER: &str = "hsl";
+const FILTER_SWATCH_WIDTH: f32 = 36.0;
+const FILTER_HINT_SIZE: f32 = 10.5;
+/// The most colors `effect.set {colors}` takes for a gradient map
+const MAX_GRADIENT_STOPS: usize = 16;
 
 const TAG_COLORS: [Color32; 8] = [
     Color32::from_rgb(0xc0, 0x40, 0x40),
@@ -208,48 +215,34 @@ pub(crate) fn targets_content(app: &TextureCraftApp) -> bool {
     }
 }
 
-/// "Add effect" items for `layer` (toolbar and context menu). Effects that fit both stacks go
-/// to the content when it is the selected target; generators and compare always go to the
-/// mask, anchor points to the content.
+/// "Add effect" items for `layer`: content when it is the selected target, else the mask
 fn effect_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     let content = !layer.is_group() && app.session.selected_layer() == Some(layer.id) && targets_content(app);
-    let t = if content { "content" } else { "mask" };
+    let target = if content { "content" } else { "mask" };
     ui.label(caption(if content { tr("Add to the layer content") } else { tr("Add to the mask") }));
+
+    // Generators and compare masks always go to the mask, anchor points to the content
     let items = [
         (tr("Add generator"), "effect.add.generator", json!({})),
-        (tr("Add paint"), "effect.add.paint", json!({"target": t})),
-        (tr("Add fill"), "effect.add.fill", json!({"target": t})),
-        (tr("Add levels"), "effect.add.levels", json!({"target": t})),
+        (tr("Add paint"), "effect.add.paint", json!({"target": target})),
+        (tr("Add fill"), "effect.add.fill", json!({"target": target})),
+        (tr("Add levels"), "effect.add.levels", json!({"target": target})),
         (tr("Add compare mask"), "effect.add.compare", json!({})),
+        (tr("Add filter"), "effect.add.filter", json!({"target": target, "filter": NEW_FILTER})),
         (tr("Add anchor point"), "effect.add.anchor", json!({})),
     ];
-    let run = |app: &mut TextureCraftApp, id: &str, p: &Value| {
+    for (label, command, params) in items {
+        let enabled = command != "effect.add.anchor" || !layer.is_group();
+        if !ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            continue;
+        }
+
         if app.session.selected_layer() != Some(layer.id) {
             app.run("layer.select", json!({"layer": layer.id.0}));
         }
-        app.run(id, with(p, json!({"layer": layer.id.0})));
-    };
-    for (label, id, p) in items {
-        let enabled = id != "effect.add.anchor" || !layer.is_group();
-        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-            run(app, id, &p);
-            ui.close();
-        }
+        app.run(command, with(&params, json!({"layer": layer.id.0})));
+        ui.close();
     }
-    // The filter library (material finishes only fill content).
-    ui.menu_button(tr("Add filter"), |ui| {
-        let mut group = "";
-        for f in FILTERS.iter().filter(|f| content || f.mask) {
-            if f.group != group {
-                ui.label(caption(tr(f.group)));
-                group = f.group;
-            }
-            if ui.button(tr(f.label)).clicked() {
-                run(app, "effect.add.filter", &json!({"target": t, "filter": f.id}));
-                ui.close();
-            }
-        }
-    });
 }
 
 fn layer_tree(app: &mut TextureCraftApp, ui: &mut Ui, id: LayerId, depth: usize) {
@@ -2035,82 +2028,85 @@ fn levels_histogram(app: &TextureCraftApp, ui: &mut Ui, layer: &Layer, eid: Laye
     }
 }
 
-/// The parameters of filter effect `id`.
-fn filter_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, f: &Filter) {
+/// The filter slot and the parameters of filter effect `id`
+fn filter_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, filter: &Filter) {
     let tk = Tokens::get(ui.ctx());
-    let set = |app: &mut TextureCraftApp, key: &str, v: Value, merge: bool| {
-        let mut p = json!({ "effect": id, "merge": merge });
-        p[key] = v;
-        app.run("effect.set", p);
+    let set = |app: &mut TextureCraftApp, key: &str, value: Value, merge: bool| {
+        let mut params = json!({ "effect": id, "merge": merge });
+        params[key] = value;
+        app.run("effect.set", params);
     };
-    ui.label(caption(tr(f.label())));
-    if let Filter::Hsl { hue, .. } = f {
-        let mut h = hue * 360.0;
-        if let Some(merge) = slider_edit(ui, tr("Hue shift (degrees)"), &mut h, -180.0..=180.0, 0) {
-            set(app, "hue", json!(h / 360.0), merge);
+    crate::filter_slot::show(app, ui, id, filter);
+
+    if let Filter::Hsl { hue, .. } = filter {
+        let mut degrees = hue * 360.0;
+        if let Some(merge) = slider_edit(ui, tr("Hue shift (degrees)"), &mut degrees, -180.0..=180.0, 0) {
+            set(app, "hue", json!(degrees / 360.0), merge);
         }
     }
-    for (key, label, mut v, lo, hi) in scalar_params(f) {
+
+    for (key, label, mut value, min, max) in scalar_params(filter) {
         let decimals = if matches!(key, "seed" | "levels") {
             0
-        } else if hi - lo > 10.0 {
+        } else if max - min > 10.0 {
             1
         } else {
             2
         };
-        if let Some(merge) = slider_edit(ui, tr(label), &mut v, lo..=hi, decimals) {
-            set(app, key, json!(v), merge);
+        if let Some(merge) = slider_edit(ui, tr(label), &mut value, min..=max, decimals) {
+            set(app, key, json!(value), merge);
         }
     }
-    match f {
+
+    match filter {
         Filter::ColorBalance { shadows, midtones, highlights } => {
             for (key, label, rgb) in [("shadows", tr("Shadows"), shadows), ("midtones", tr("Midtones"), midtones), ("highlights", tr("Highlights"), highlights)]
             {
                 ui.label(RichText::new(label).strong());
-                let mut v = *rgb;
+                let mut balance = *rgb;
                 let mut edit = None;
-                for (x, name) in v.iter_mut().zip([tr("Cyan / red"), tr("Magenta / green"), tr("Yellow / blue")]) {
-                    edit = edit.or(slider_edit(ui, name, x, -1.0..=1.0, 2));
+                for (component, name) in balance.iter_mut().zip([tr("Cyan / red"), tr("Magenta / green"), tr("Yellow / blue")]) {
+                    edit = edit.or(slider_edit(ui, name, component, -1.0..=1.0, 2));
                 }
                 if let Some(merge) = edit {
-                    set(app, key, json!(v), merge);
+                    set(app, key, json!(balance), merge);
                 }
             }
         }
         Filter::ReplaceColor { from, to, .. } => {
             for (key, label, rgb) in [("from", tr("Color to replace"), from), ("to", tr("Replacement color"), to)] {
-                let mut v = *rgb;
+                let mut color = *rgb;
                 ui.horizontal(|ui| {
-                    if color_swatch(ui, &format!("replace_{key}_{id}"), &mut v, 36.0) {
-                        set(app, key, json!(v), false);
+                    if color_swatch(ui, &format!("replace_{key}_{id}"), &mut color, FILTER_SWATCH_WIDTH) {
+                        set(app, key, json!(color), false);
                     }
                     ui.label(label);
                 });
             }
-            ui.label(RichText::new(tr("Colors near the first shift towards the second, keeping their shading.")).size(10.5).color(tk.text_dim));
+            ui.label(RichText::new(tr("Colors near the first shift towards the second, keeping their shading.")).size(FILTER_HINT_SIZE).color(tk.text_dim));
         }
         Filter::GradientMap { colors } => {
-            let mut c = colors.clone();
+            let mut stops = colors.clone();
             let mut changed = false;
             ui.horizontal_wrapped(|ui| {
-                for (i, col) in c.iter_mut().enumerate() {
-                    changed |= color_swatch(ui, &format!("gradient_{id}_{i}"), col, 36.0);
+                for (i, stop) in stops.iter_mut().enumerate() {
+                    changed |= color_swatch(ui, &format!("gradient_{id}_{i}"), stop, FILTER_SWATCH_WIDTH);
                 }
             });
             ui.horizontal(|ui| {
-                if ui.add_enabled(c.len() < 16, egui::Button::new(format!("{} {}", ic::PLUS, tr("Add color")))).clicked() {
-                    c.push(c.last().copied().unwrap_or([1.0; 3]));
+                if ui.add_enabled(stops.len() < MAX_GRADIENT_STOPS, egui::Button::new(format!("{} {}", ic::PLUS, tr("Add color")))).clicked() {
+                    stops.push(stops.last().copied().unwrap_or([1.0; 3]));
                     changed = true;
                 }
-                if ui.add_enabled(c.len() > 1, egui::Button::new(format!("{} {}", ic::MINUS, tr("Remove last")))).clicked() {
-                    c.pop();
+                if ui.add_enabled(stops.len() > 1, egui::Button::new(format!("{} {}", ic::MINUS, tr("Remove last")))).clicked() {
+                    stops.pop();
                     changed = true;
                 }
             });
             if changed {
-                set(app, "colors", json!(c), false);
+                set(app, "colors", json!(stops), false);
             }
-            ui.label(RichText::new(tr("Dark to light: the content's luminance picks a color along these stops.")).size(10.5).color(tk.text_dim));
+            ui.label(RichText::new(tr("Dark to light: the content's luminance picks a color along these stops.")).size(FILTER_HINT_SIZE).color(tk.text_dim));
         }
         Filter::Warp { .. }
         | Filter::DirectionalBlur { .. }
@@ -2121,7 +2117,7 @@ fn filter_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, f: &Filter
         | Filter::Bevel { .. }
         | Filter::Mosaic { .. }
         | Filter::Glow { .. } => {
-            ui.label(RichText::new(tr("Works in texture space, like the blur: it does not cross UV seams.")).size(10.5).color(tk.text_dim));
+            ui.label(RichText::new(tr("Works in texture space, like the blur: it does not cross UV seams.")).size(FILTER_HINT_SIZE).color(tk.text_dim));
         }
         _ => {}
     }

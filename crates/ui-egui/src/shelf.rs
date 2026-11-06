@@ -266,7 +266,7 @@ fn drag_preview(ctx: &egui::Context) {
     p.galley(rect.min + vec2(6.0, 3.0), galley, tk.text_strong);
 }
 
-fn matches(filter: &str, texts: &[&str]) -> bool {
+pub(crate) fn matches(filter: &str, texts: &[&str]) -> bool {
     filter.is_empty() || texts.iter().any(|t| t.to_lowercase().contains(filter))
 }
 
@@ -275,13 +275,13 @@ fn title(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).strong().color(tk.text_strong));
 }
 
-fn header(ui: &mut Ui, text: &str) {
+pub(crate) fn header(ui: &mut Ui, text: &str) {
     let tk = Tokens::get(ui.ctx());
     ui.add_space(2.0);
     ui.label(RichText::new(text).size(11.0).color(tk.text_dim));
 }
 
-fn tiles(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
+pub(crate) fn tiles(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
         body(ui);
@@ -290,7 +290,7 @@ fn tiles(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
 }
 
 /// The distinct categories of `items`, in order of first appearance.
-fn categories<T>(items: &[T], category: impl Fn(&T) -> &'static str) -> Vec<&'static str> {
+pub(crate) fn categories<T>(items: &[T], category: impl Fn(&T) -> &'static str) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     for c in items.iter().map(category) {
         if !out.contains(&c) {
@@ -586,7 +586,7 @@ fn textures(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter:
 }
 
 /// Asset tile with optional dragging and a larger hover preview
-fn tile(
+pub(crate) fn tile(
     ui: &mut Ui,
     thumbs: &mut Thumbs,
     tex: Option<&egui::TextureHandle>,
