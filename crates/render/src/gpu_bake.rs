@@ -325,15 +325,18 @@ impl RayScene for GpuScene<'_> {
             .par_iter()
             .map(|q| {
                 let root = roots.get(q.mesh as usize).copied().ok_or_else(|| err(format!("no scene mesh {}", q.mesh)))?;
-                Ok([row(q.pos, q.rot[0].to_bits()), row(q.nrm, q.rot[1].to_bits()), row(q.geo, q.key), [root, 0, 0, 0]])
+                Ok([row(q.pos, q.rot[0].to_bits()), row(q.nrm, q.rot[1].to_bits()), row(q.geo, q.key), [root, q.subset, q.subsets.max(1), 0]])
             })
             .collect::<Result<Vec<_>, BakeError>>()?
             .concat();
+        // Antialiased texels split their rays between subsamples: size the lanes for a full texel's share.
+        let subsets = queries.par_iter().map(|q| q.subsets).max().unwrap_or(1).max(1);
         let passes: Vec<Pass> = passes
             .iter()
             .map(|h| {
-                // A sample's rays spread over `lanes` threads of a workgroup (a power of two).
-                let lanes = h.rays.clamp(1, WORKGROUP).next_power_of_two();
+                // A query's rays spread over `lanes` threads of a workgroup (a power of two).
+                let rays = h.rays.div_ceil(subsets);
+                let lanes = rays.clamp(1, WORKGROUP).next_power_of_two();
                 let flags =
                     [(h.uniform, UNIFORM), (h.ground_height.is_some(), 8), (h.same_key, SAME_KEY)].iter().filter(|(on, _)| *on).fold(0, |f, (_, b)| f | b);
                 let params = Params {
@@ -359,7 +362,7 @@ impl RayScene for GpuScene<'_> {
                     lanes,
                     ..Params::default()
                 };
-                Pass { params, per_dispatch: RAYS_PER_DISPATCH / h.rays.max(1) as usize, per_group: (WORKGROUP / lanes) as usize }
+                Pass { params, per_dispatch: RAYS_PER_DISPATCH / rays.max(1) as usize, per_group: (WORKGROUP / lanes) as usize }
             })
             .collect();
         let gpu = self.gpu;

@@ -650,8 +650,8 @@ fn curvature_from_the_normal_map_sees_the_bump() {
     assert!((c[quad_texel(64, 0.9, 0.9)] - 0.5).abs() < 0.02, "flat corner {}", c[quad_texel(64, 0.9, 0.9)]);
 }
 
-#[test]
-fn bent_normals_point_away_from_occluders() {
+/// The unit quad (material 0) against a wall at x = 1 (material 1)
+fn quad_beside_a_wall() -> Mesh {
     let mut m = quad();
     let wall = Mesh::from_parts(
         vec![Vec3::new(1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0), Vec3::new(1.0, 2.0, 1.0), Vec3::new(1.0, 2.0, -1.0)],
@@ -662,6 +662,12 @@ fn bent_normals_point_away_from_occluders() {
     )
     .unwrap();
     m.append(&wall);
+    m
+}
+
+#[test]
+fn bent_normals_point_away_from_occluders() {
+    let m = quad_beside_a_wall();
     let s = with_rays(settings(32, &[BakedMap::BentNormal, BakedMap::AmbientOcclusion]), 64, 2.0);
     let out = run(&m, &s).unwrap();
     let bent = &out.maps[&BakedMap::BentNormal];
@@ -1174,4 +1180,197 @@ fn skew_correction_preserves_uniform_mesh_normals_and_rejects_invalid_values() {
         tiles: (1, 1),
     };
     assert!(matches!(bake(&req, &Progress::new()), Err(BakeError::Invalid(_))));
+}
+
+/// The CPU tracer, counting the hemisphere rays its queries cast.
+#[derive(Default)]
+struct Counting {
+    rays: std::sync::atomic::AtomicU64,
+    split_queries: std::sync::atomic::AtomicU64,
+}
+
+struct CountingScene<'a> {
+    inner: Box<dyn RayScene + 'a>,
+    counts: &'a Counting,
+}
+
+impl Tracer for Counting {
+    fn name(&self) -> String {
+        "Counting".into()
+    }
+
+    fn scene<'a>(&'a self, meshes: &[tracing::TraceMesh<'a>]) -> Result<Box<dyn RayScene + 'a>, BakeError> {
+        Ok(Box::new(CountingScene { inner: CpuTracer.scene(meshes)?, counts: self }))
+    }
+}
+
+impl RayScene for CountingScene<'_> {
+    fn closest(&mut self, mesh: usize, rays: &[tracing::Ray], ignore_backface: bool) -> Result<Vec<Option<texturecraft_geom::Hit>>, BakeError> {
+        self.inner.closest(mesh, rays, ignore_backface)
+    }
+
+    fn hemispheres(&mut self, passes: &[tracing::Hemisphere], queries: &[tracing::Query]) -> Result<Vec<Vec<[f32; 4]>>, BakeError> {
+        let cast = |pass: &tracing::Hemisphere, query: &tracing::Query| (query.subset..pass.rays).step_by(query.subsets.max(1) as usize).count() as u64;
+        let rays = passes.iter().flat_map(|pass| queries.iter().map(move |query| cast(pass, query))).sum();
+        self.counts.rays.fetch_add(rays, Relaxed);
+        self.counts.split_queries.fetch_add(queries.iter().filter(|query| query.subsets != 1).count() as u64, Relaxed);
+        self.inner.hemispheres(passes, queries)
+    }
+}
+
+/// The bake and the hemisphere rays it cast.
+fn counted(mesh: &Mesh, s: &BakeSettings) -> (BakeOutput, Counting) {
+    let bvh = Bvh::new(mesh);
+    let counting = Counting::default();
+    let req =
+        BakeRequest { low_base_color: &[], mesh, bvh: &bvh, material: 0, settings: s, high: None, cage: None, skew: None, cage_paint: None, tiles: (1, 1) };
+    let out = bake_on(&req, &Progress::new(), &counting).unwrap();
+    assert_eq!(out.tracer, "Counting");
+    (out, counting)
+}
+
+fn antialiased(mut s: BakeSettings, antialiasing: BakeAntialiasing) -> BakeSettings {
+    s.common.antialiasing = antialiasing;
+    s
+}
+
+#[test]
+fn antialiasing_splits_each_texels_rays_between_its_subsamples() {
+    // The quad covers every subsample of every texel
+    let m = quad();
+    for (antialiasing, rays) in [
+        (BakeAntialiasing::None, 16),
+        (BakeAntialiasing::Subsampling2x2, 7),
+        (BakeAntialiasing::Subsampling4x4, 16),
+        (BakeAntialiasing::Subsampling4x4, 40),
+        (BakeAntialiasing::Subsampling8x8, 16),
+    ] {
+        let s = antialiased(with_rays(settings(16, &[BakedMap::AmbientOcclusion]), rays, 0.25), antialiasing);
+        let (_, counts) = counted(&m, &s);
+        let per_texel = rays.max(antialiasing.samples_per_axis().pow(2));
+        assert_eq!(counts.rays.load(Relaxed), 16 * 16 * u64::from(per_texel), "{antialiasing:?} at {rays} rays");
+    }
+}
+
+#[test]
+fn without_antialiasing_a_texel_is_one_query_casting_every_ray() {
+    let m = primitives::material_ball();
+    let s = with_rays(settings(32, &[BakedMap::AmbientOcclusion, BakedMap::Thickness]), 12, 0.25);
+    let (out, counts) = counted(&m, &s);
+    assert_eq!(counts.split_queries.load(Relaxed), 0);
+    let texels = covered_values(&m, &out, BakedMap::AmbientOcclusion).len() as u64;
+    assert_eq!(counts.rays.load(Relaxed), 2 * 12 * texels);
+    assert_eq!(out.maps, run(&m, &s).unwrap().maps, "the counting tracer is the CPU tracer");
+}
+
+/// Box filters a `factor`× larger square map down, over texels whose sources are all covered, and
+/// tells whether those sources span an edge (values `edge` or more apart).
+fn box_down(fine: &[f32], covered: &[bool], size: usize, factor: usize, edge: f32) -> Vec<Option<(f32, bool)>> {
+    let fine_size = size * factor;
+    (0..size * size)
+        .map(|texel| {
+            let (x, y) = (texel % size, texel / size);
+            let sources: Vec<usize> = (0..factor * factor).map(|i| (y * factor + i / factor) * fine_size + x * factor + i % factor).collect();
+            let values: Vec<f32> = sources.iter().filter(|&&i| covered[i]).map(|&i| fine[i]).collect();
+            let (low, high) = values.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), v| (low.min(*v), high.max(*v)));
+            (values.len() == sources.len()).then(|| (values.iter().sum::<f32>() / values.len() as f32, high - low >= edge))
+        })
+        .collect()
+}
+
+/// A floor (material 0) through a turned cube: the cube's slanted outline is a hard occlusion edge
+/// above the floor and a hard thickness edge below it.
+fn floor_through_a_turned_cube() -> Mesh {
+    let mut m = quad();
+    let mut cube = primitives::cube(1.0);
+    let turn = texturecraft_geom::glam::Quat::from_rotation_y(0.5);
+    for p in &mut cube.positions {
+        *p = turn * *p;
+    }
+    for n in &mut cube.normals {
+        *n = turn * *n;
+    }
+    m.append(&cube);
+    m
+}
+
+#[test]
+fn antialiasing_keeps_the_mean_and_cost_of_traced_maps_and_still_smooths_them() {
+    let m = floor_through_a_turned_cube();
+    let (size, factor) = (64usize, 4usize);
+    for map in [BakedMap::AmbientOcclusion, BakedMap::Thickness] {
+        let base = {
+            let mut base = with_rays(settings(size as u32, &[map]), 64, 1.0);
+            base.maps.ao.parameters.attenuation = texturecraft_core::AmbientOcclusionAttenuation::None;
+            base
+        };
+        let (plain, plain_counts) = counted(&m, &base);
+        let (smooth, smooth_counts) = counted(&m, &antialiased(base.clone(), BakeAntialiasing::Subsampling4x4));
+
+        // The reference: four times the resolution, box filtered down to `size`
+        let (fine, _) = counted(
+            &m,
+            &BakeSettings {
+                common: CommonBakeSettings { resolution: BakeResolution::from_pixels((size * factor) as u32).unwrap(), ..base.common },
+                ..base.clone()
+            },
+        );
+        let fine_covered: Vec<bool> = {
+            let g = UvGBuffer::new(&m, 0, (size * factor) as u32, (size * factor) as u32);
+            g.tri.iter().map(|t| *t != NO_TRI).collect()
+        };
+        let reference = box_down(&fine.maps[&map], &fine_covered, size, factor, 0.25);
+        let error = |out: &BakeOutput| {
+            let pairs: Vec<(f32, bool, f32)> = reference.iter().zip(&out.maps[&map]).filter_map(|(r, v)| r.map(|(r, edge)| (r, edge, *v))).collect();
+            let edges = pairs.iter().filter(|(_, edge, _)| *edge);
+            (mean(pairs.iter().map(|(r, _, v)| v - r)), mean(edges.map(|(r, _, v)| (v - r).abs())))
+        };
+        let ((plain_bias, plain_error), (smooth_bias, smooth_error)) = (error(&plain), error(&smooth));
+        let (plain_rays, smooth_rays) = (plain_counts.rays.load(Relaxed), smooth_counts.rays.load(Relaxed));
+        eprintln!("{map:?}: bias {plain_bias:+.5} / {smooth_bias:+.5}, edge error {plain_error:.5} / {smooth_error:.5}, rays {plain_rays} / {smooth_rays}");
+        assert!(smooth_bias.abs() < 0.003, "{map:?}: antialiased bias {smooth_bias}");
+        assert!(smooth_error < plain_error * 0.8, "{map:?}: antialiased edge error {smooth_error}, plain {plain_error}");
+        // Edge texels that only some subsamples cover add a few percent
+        assert!(smooth_rays < plain_rays + plain_rays / 10, "{map:?}: {smooth_rays} rays antialiased, {plain_rays} plain");
+    }
+}
+
+#[test]
+fn antialiasing_skips_ray_subsets_that_fall_entirely_below_the_surface() {
+    // Shading normals leaning far from the faces send many rays below the surface; a texel skips
+    // those, and so must a subsample whose whole share of the rays is below it
+    let mut m = plane(0.0, 1.0, Vec3::new(0.8, 0.6, 0.0));
+    m.append(&plane(0.2, 4.0, Vec3::NEG_Y));
+    m.append(&plane(-0.2, 4.0, Vec3::Y));
+    for map in [BakedMap::AmbientOcclusion, BakedMap::Thickness] {
+        let base = with_rays(settings(16, &[map]), 64, 1.0);
+        let plain = mean(covered_values(&m, &counted(&m, &base).0, map).into_iter().map(|v| v.1));
+        let smooth = mean(covered_values(&m, &counted(&m, &antialiased(base, BakeAntialiasing::Subsampling8x8)).0, map).into_iter().map(|v| v.1));
+        assert!((plain - smooth).abs() < 0.01, "{map:?}: {plain} plain, {smooth} antialiased");
+    }
+}
+
+#[test]
+fn antialiasing_keeps_bent_normals_unbiased() {
+    // Subsamples that split a texel's rays each see a slice of its pattern (a band of elevations).
+    // Normalizing each slice's bent normal before averaging put them 0.7-10.8 degrees off the 1x1
+    // bake's; summing the slices and normalizing once keeps them within 0.1 degrees.
+    let m = quad_beside_a_wall();
+    let s = with_rays(settings(32, &[BakedMap::BentNormal]), 64, 2.0);
+    let g = UvGBuffer::new(&m, 0, 32, 32);
+    let mean_bent = |out: &BakeOutput, band: f32| -> Vec3 {
+        let bent = &out.maps[&BakedMap::BentNormal];
+        (0..32 * 32)
+            .filter(|&i| g.surface(&m, i).is_some_and(|s| (s.pos.x - band).abs() < 0.25))
+            .map(|i| Vec3::from_slice(&bent[i * 3..i * 3 + 3]) * 2.0 - Vec3::ONE)
+            .sum()
+    };
+    let plain = run(&m, &s).unwrap();
+    for antialiasing in [BakeAntialiasing::Subsampling2x2, BakeAntialiasing::Subsampling4x4, BakeAntialiasing::Subsampling8x8] {
+        let smooth = run(&m, &antialiased(s.clone(), antialiasing)).unwrap();
+        for band in [-0.75, -0.25, 0.25, 0.75] {
+            let degrees = mean_bent(&plain, band).angle_between(mean_bent(&smooth, band)).to_degrees();
+            assert!(degrees < 0.5, "{antialiasing:?} at x = {band}: the bent normal is {degrees} degrees off the 1x1 bake's");
+        }
+    }
 }
