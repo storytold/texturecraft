@@ -21,6 +21,8 @@ const WORKGROUP: u32 = 64;
 /// Rays per dispatch: short dispatches keep slow GPUs clear of driver watchdogs.
 const RAYS_PER_DISPATCH: usize = 1 << 24;
 const NONE: u32 = u32::MAX;
+/// Fewest items per parallel write when uploading a batch.
+const FILL_CHUNK: usize = 1 << 12;
 const UNIFORM: u32 = 1;
 const IGNORE_BACKFACE: u32 = 2;
 const SAME_KEY: u32 = 4;
@@ -170,17 +172,23 @@ impl Tracer for GpuBaker {
             (buffer(&gpu.device, "tc_bake_nodes", bytemuck::cast_slice(&nodes)), buffer(&gpu.device, "tc_bake_tris", bytemuck::cast_slice(&tris)))
         })
         .map_err(BakeError::Tracer)?;
-        Ok(Box::new(GpuScene { gpu, nodes, tris, roots, io: None }))
+        Ok(Box::new(GpuScene { gpu, roots, batches: Batches { gpu, nodes, tris, io: None } }))
     }
 }
 
-/// The meshes of one bake on the GPU: every BVH in one node and one triangle buffer.
+/// The meshes of one bake on the GPU.
 struct GpuScene<'g> {
+    gpu: &'g Gpu,
+    /// Root node of each mesh.
+    roots: Vec<u32>,
+    batches: Batches<'g>,
+}
+
+/// Every BVH in one node and one triangle buffer, and the batch buffers that run passes over them.
+struct Batches<'g> {
     gpu: &'g Gpu,
     nodes: wgpu::Buffer,
     tris: wgpu::Buffer,
-    /// Root node of each mesh.
-    roots: Vec<u32>,
     /// Batch buffers, grown as needed and reused across batches.
     io: Option<Io>,
 }
@@ -205,7 +213,9 @@ impl GpuScene<'_> {
     fn root(&self, mesh: usize) -> Result<u32, BakeError> {
         self.roots.get(mesh).copied().ok_or_else(|| err(format!("no scene mesh {mesh}")))
     }
+}
 
+impl Batches<'_> {
     /// Batch buffers of at least these sizes (bytes).
     fn io(&mut self, items: u64, results: u64, params: u64) -> Result<&Io, BakeError> {
         let fits = |io: &Io| io.items.size() >= items && io.results.size() >= results && io.params.size() >= params;
@@ -238,13 +248,13 @@ impl GpuScene<'_> {
         self.io.as_ref().ok_or_else(|| err("no batch buffers"))
     }
 
-    /// Run `pipeline` over `n` items (`items`: their rows) once per pass in one submission, and
-    /// hand `read` one result row per item and pass (pass after pass).
-    fn run<R: Default>(
+    /// Run `pipeline` over `n` items (item `i`: the `N` bytes of `item(i)`) once per pass in one
+    /// submission, and hand `read` one result row per item and pass (pass after pass).
+    fn run<R: Default, const N: usize>(
         &mut self,
         pipeline: &wgpu::ComputePipeline,
-        items: &[u8],
         n: usize,
+        item: impl Fn(usize) -> Result<[u8; N], BakeError> + Sync,
         passes: &[Pass],
         read: impl FnOnce(&[[u32; 4]]) -> R,
     ) -> Result<R, BakeError> {
@@ -264,14 +274,14 @@ impl GpuScene<'_> {
                 blocks.resize(blocks.len().next_multiple_of(g.stride), 0);
             }
         }
-        let (in_bytes, out_bytes) = (items.len() as u64, (n * passes.len()) as u64 * 16);
+        let (in_bytes, out_bytes) = ((n as u64).saturating_mul(N as u64), (n * passes.len()) as u64 * 16);
         if in_bytes.max(out_bytes) > g.max_buffer() {
             return Err(err("a batch exceeds this GPU's buffer limit"));
         }
         let io = self.io(in_bytes, out_bytes, blocks.len() as u64)?;
         let dev = &g.device;
         scoped(dev, "GPU baking: dispatch", || {
-            g.queue.write_buffer(&io.items, 0, items);
+            upload(&g.queue, &io.items, n, item)?;
             g.queue.write_buffer(&io.params, 0, &blocks);
             let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_bake") });
             {
@@ -284,8 +294,9 @@ impl GpuScene<'_> {
             }
             enc.copy_buffer_to_buffer(&io.results, 0, &io.staging, 0, out_bytes);
             g.queue.submit([enc.finish()]);
+            Ok(())
         })
-        .map_err(BakeError::Tracer)?;
+        .map_err(BakeError::Tracer)??;
         let slice = io.staging.slice(..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -301,6 +312,26 @@ impl GpuScene<'_> {
     }
 }
 
+/// Upload `item(i)` as the `i`-th `N`-byte row of `buffer`: built and written in parallel, each
+/// thread a contiguous range of rows.
+fn upload<const N: usize>(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    n: usize,
+    item: impl Fn(usize) -> Result<[u8; N], BakeError> + Sync,
+) -> Result<(), BakeError> {
+    let chunk = n.div_ceil(rayon::current_num_threads().max(1)).max(FILL_CHUNK);
+    (0..n.div_ceil(chunk)).into_par_iter().try_for_each_init(Vec::new, |bytes: &mut Vec<u8>, k| {
+        let start = k.saturating_mul(chunk);
+        bytes.clear();
+        for i in start..start.saturating_add(chunk).min(n) {
+            bytes.extend_from_slice(&item(i)?);
+        }
+        queue.write_buffer(buffer, start.saturating_mul(N) as u64, bytes);
+        Ok(())
+    })
+}
+
 /// A row of `v` (as bits) and `w`.
 fn row(v: Vec3, w: u32) -> [u32; 4] {
     [v.x.to_bits(), v.y.to_bits(), v.z.to_bits(), w]
@@ -314,26 +345,28 @@ impl RayScene for GpuScene<'_> {
             per_group: WORKGROUP as usize,
         };
         let gpu = self.gpu;
-        self.run(&gpu.transfer, bytemuck::cast_slice(rays), rays.len(), &[pass], |out| {
+        let ray = |i: usize| rays.get(i).map(|&ray| bytemuck::cast::<Ray, [u8; 32]>(ray)).ok_or_else(|| err("ray out of range"));
+        self.batches.run(&gpu.transfer, rays.len(), ray, &[pass], |out| {
             out.par_iter().map(|&[t, u, v, tri]| (tri != NONE).then(|| Hit { t: f32::from_bits(t), tri, u: f32::from_bits(u), v: f32::from_bits(v) })).collect()
         })
     }
 
     fn hemispheres(&mut self, passes: &[Hemisphere], queries: &[Query]) -> Result<Vec<Vec<[f32; 4]>>, BakeError> {
         let roots = &self.roots;
-        let items = queries
-            .par_iter()
-            .map(|q| {
-                let root = roots.get(q.mesh as usize).copied().ok_or_else(|| err(format!("no scene mesh {}", q.mesh)))?;
-                Ok([row(q.pos, q.rot[0].to_bits()), row(q.nrm, q.rot[1].to_bits()), row(q.geo, q.key), [root, 0, 0, 0]])
-            })
-            .collect::<Result<Vec<_>, BakeError>>()?
-            .concat();
+        let item = |i: usize| {
+            let q = queries.get(i).ok_or_else(|| err("query out of range"))?;
+            let root = roots.get(q.mesh as usize).copied().ok_or_else(|| err(format!("no scene mesh {}", q.mesh)))?;
+            let rows = [row(q.pos, q.rot[0].to_bits()), row(q.nrm, q.rot[1].to_bits()), row(q.geo, q.key), [root, q.subset, q.subsets.max(1), 0]];
+            Ok(bytemuck::cast::<[[u32; 4]; 4], [u8; 64]>(rows))
+        };
+        // Antialiased texels split their rays between subsamples: size the lanes for a full texel's share.
+        let subsets = queries.par_iter().map(|q| q.subsets).max().unwrap_or(1).max(1);
         let passes: Vec<Pass> = passes
             .iter()
             .map(|h| {
-                // A sample's rays spread over `lanes` threads of a workgroup (a power of two).
-                let lanes = h.rays.clamp(1, WORKGROUP).next_power_of_two();
+                // A query's rays spread over `lanes` threads of a workgroup (a power of two).
+                let rays = h.rays.div_ceil(subsets);
+                let lanes = rays.clamp(1, WORKGROUP).next_power_of_two();
                 let flags =
                     [(h.uniform, UNIFORM), (h.ground_height.is_some(), 8), (h.same_key, SAME_KEY)].iter().filter(|(on, _)| *on).fold(0, |f, (_, b)| f | b);
                 let params = Params {
@@ -359,12 +392,12 @@ impl RayScene for GpuScene<'_> {
                     lanes,
                     ..Params::default()
                 };
-                Pass { params, per_dispatch: RAYS_PER_DISPATCH / h.rays.max(1) as usize, per_group: (WORKGROUP / lanes) as usize }
+                Pass { params, per_dispatch: RAYS_PER_DISPATCH / rays.max(1) as usize, per_group: (WORKGROUP / lanes) as usize }
             })
             .collect();
         let gpu = self.gpu;
-        self.run(&gpu.hemisphere, bytemuck::cast_slice(&items), queries.len(), &passes, |out| {
-            out.chunks(queries.len().max(1)).map(|c| c.iter().map(|v| v.map(f32::from_bits)).collect()).collect()
+        self.batches.run(&gpu.hemisphere, queries.len(), item, &passes, |out| {
+            out.chunks(queries.len().max(1)).map(|c| c.par_iter().map(|v| v.map(f32::from_bits)).collect()).collect()
         })
     }
 }
