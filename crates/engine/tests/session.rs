@@ -128,6 +128,28 @@ fn panic_hunt() {
     }
 }
 
+/// A colour param is `[r, g, b]` in linear 0..1 or `"#rrggbb"` in sRGB, and the same digits differ
+/// between the two, so every command that takes a colour says which form is which.
+#[test]
+fn colour_params_name_their_colour_space() {
+    for spec in command_specs() {
+        if ["color?", "colors?", "Color?"].iter().any(|k| spec.params.contains(k)) {
+            assert!(spec.params.contains("linear"), "{}: {}", spec.id, spec.params);
+        }
+    }
+    let base_color = |color: Value| {
+        let mut s = session();
+        execute(&mut s, "layer.add.fill", &json!({ "color": color })).unwrap();
+        s.update();
+        s.caches[0].composite.value(Channel::BaseColor, 128, 128)
+    };
+    let hex = base_color(json!("#c8102e"));
+    let linear = base_color(json!([0.5776, 0.0052, 0.0273]));
+    assert!(hex.iter().zip(&linear).all(|(a, b)| (a - b).abs() < 2e-3), "{hex:?} {linear:?}");
+    let digits = base_color(json!([0.7843, 0.0627, 0.1804]));
+    assert!(digits[0] - hex[0] > 0.1, "{digits:?} {hex:?}");
+}
+
 #[test]
 fn copy_paste_flatten_and_resize_keep_the_look() {
     let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 256).unwrap();

@@ -47,7 +47,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Tool material",
             [],
             None,
-            "{channel, color?|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1}",
+            "{channel, color?: [r,g,b] linear or \"#rrggbb\"|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1}",
             always,
             material
         ),

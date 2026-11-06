@@ -12,7 +12,7 @@ use crate::{EngineError, Result, Session, cmd, session::StackTarget};
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("layer.add.paint", "Add paint layer", ["Layers"], None, "{name?}", always, add_paint),
-        cmd!("layer.add.fill", "Add fill layer", ["Layers"], None, "{name?, color?, roughness?, metallic?}", always, add_fill),
+        cmd!("layer.add.fill", "Add fill layer", ["Layers"], None, "{name?, color?: [r,g,b] linear or \"#rrggbb\", roughness?, metallic?}", always, add_fill),
         cmd!("layer.add.group", "Add folder", ["Layers"], None, "{name?}", always, add_group),
         cmd!("layer.remove", "Remove layer(s)", ["Layers"], Some("Delete"), "{layer?}", has_layer, remove),
         cmd!("layer.duplicate", "Duplicate layer(s)", ["Layers"], Some("Ctrl+D"), "{layer?}", has_layer, duplicate),
@@ -27,7 +27,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set fill source",
             [],
             None,
-            "{layer? | effect?: content fill effect id, channel, color?|value?|procedural?: kind, scale?, seed?, contrast?, balance?, invert?, low?, high?|image?, normalFormat?: openGl|directX (the image's normal map convention; alone, it changes the channel's image)|anchor?: anchor effect id, anchorChannel?, enabled?, solo?: true (this channel on, every other one off)}",
+            "{layer? | effect?: content fill effect id, channel, color?: [r,g,b] linear or \"#rrggbb\"|value?|procedural?: kind, scale?, seed?, contrast?, balance?, invert?, low?, high? (colors)|image?, normalFormat?: openGl|directX (the image's normal map convention; alone, it changes the channel's image)|anchor?: anchor effect id, anchorChannel?, enabled?, solo?: true (this channel on, every other one off)}",
             has_layer,
             fill_set
         ),

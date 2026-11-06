@@ -24,6 +24,11 @@ as the history reaches); `edit.history` lists the steps done and the undone ones
 Any command takes `merge: true` to fold its edit into the previous undo step when that step has
 the same label: a drag that applies a value on every frame stays one step.
 
+A colour param is `[r, g, b]` in linear 0..1, or `"#rrggbb"` in sRGB, which is converted to
+linear. The same digits are two different colours: `"#c8102e"` is `[0.578, 0.005, 0.027]`, while
+`[0.784, 0.063, 0.180]` (its hex digits over 255) paints the lighter `#e54776`. Pass a colour from
+a design tool or a brand guide as hex.
+
 ## Control channel (desktop app)
 
 ```sh
