@@ -1,6 +1,17 @@
 //! Spanish UI text: (English key, translation). Keys are the English strings passed to `tr`.
 
 pub const TABLE: &[(&str, &str)] = &[
+    ("Baking {map} ({n}/{total})", "Horneando {map} ({n}/{total})"),
+    ("Baking {map} ({n}/{total}), texture set {set} of {sets}", "Horneando {map} ({n}/{total}), conjunto de texturas {set} de {sets}"),
+    ("Follow Newest Map", "Seguir el mapa más reciente"),
+    (
+        "Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.",
+        "La pintura está en pausa mientras se muestra un horneado. Cancela el horneado o espera a que termine.",
+    ),
+    (
+        "What the 3D view shows while the bake runs: the newest finished map, one finished map, or the material. Maps not baked yet show a neutral value.",
+        "Lo que muestra la vista 3D mientras se hornea: el último mapa terminado, un mapa terminado a elección o el material. Los mapas aún sin hornear muestran un valor neutro.",
+    ),
     ("\"{layer}\" has no paint yet: the filter changes what you paint on it.", "\"{layer}\" aún no tiene pintura: el filtro cambia lo que pintes en ella."),
     ("0 turns autosave off. Copies go to {folder}", "0 desactiva el autoguardado. Las copias se guardan en {folder}"),
     ("2D view only", "Solo vista 2D"),

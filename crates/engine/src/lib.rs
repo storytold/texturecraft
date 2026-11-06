@@ -12,6 +12,7 @@ pub mod bake_cmds;
 #[path = "bake/mod.rs"]
 mod bake_data;
 mod bake_paint_cmds;
+pub mod bake_preview;
 pub mod brush_preset_cmds;
 pub mod camera_cmds;
 pub mod commands;
@@ -50,7 +51,8 @@ pub mod tool_cmds;
 pub mod uv_tile_cmds;
 pub mod view_cmds;
 
-pub use bake_data::{BakeMesh, BakeMeshes, BakeTask};
+pub use bake_data::{BakeMesh, BakeMeshes, BakeTask, StreamedMap};
+pub use bake_preview::{BakePreview, PreviewShow};
 pub use commands::{CommandSpec, command_specs, execute, find};
 pub use path_tool::PathState;
 pub use project_cmds::sample_session;

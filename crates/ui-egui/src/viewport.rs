@@ -538,7 +538,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
                         }
                         app.last_paint_point = Some(local(p));
                     }
-                    Err(e) => app.toast(e.to_string(), true),
+                    Err(e) => app.toast(tr(&e.to_string()).to_string(), true),
                 }
             }
             if resp.clicked_by(PointerButton::Primary)
@@ -1150,7 +1150,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             if let Some(p) = resp.interact_pointer_pos()
                 && let Err(e) = app.session.begin_stroke_uv(to_uv(p), pressure)
             {
-                app.toast(e.to_string(), true);
+                app.toast(tr(&e.to_string()).to_string(), true);
             }
             if resp.clicked_by(PointerButton::Primary)
                 && let Err(e) = app.session.end_stroke()

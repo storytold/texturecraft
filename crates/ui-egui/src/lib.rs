@@ -48,10 +48,22 @@ pub struct ResizeJob {
     pub rx: std::sync::mpsc::Receiver<texturecraft_engine::Result<texturecraft_engine::ResizeOutput>>,
 }
 
+/// The texture set baking on a worker thread: its progress, its result and the maps it finishes
+/// on the way (the 3D view shows one per UI poll).
+pub struct RunningBake {
+    pub set_index: usize,
+    pub progress: Arc<Progress>,
+    pub receiver: std::sync::mpsc::Receiver<texturecraft_engine::Result<texturecraft_engine::bake::BakeOutput>>,
+    pub maps: std::sync::mpsc::Receiver<texturecraft_engine::StreamedMap>,
+    /// Maps finished so far, and how many the set makes.
+    pub maps_done: Arc<std::sync::atomic::AtomicUsize>,
+    pub maps_total: usize,
+}
+
 /// A background bake of one or more texture sets.
 pub struct BakeJob {
     pub queue: Vec<usize>,
-    pub current: Option<(usize, Arc<Progress>, std::sync::mpsc::Receiver<texturecraft_engine::Result<texturecraft_engine::bake::BakeOutput>>)>,
+    pub current: Option<RunningBake>,
     pub total: usize,
 }
 
@@ -62,6 +74,9 @@ pub struct LinkCook {
     pub values: serde_json::Map<String, Value>,
     pub rx: std::sync::mpsc::Receiver<texturecraft_engine::Result<Vec<u8>>>,
 }
+
+/// The engine's refusal to paint while a bake shows (translated where it is toasted).
+pub const PAINTING_PAUSED: &str = i18n::n_("Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.");
 
 /// The browser build's notice when WebGPU is unavailable and wgpu fell back to WebGL2.
 pub const WEBGL_NOTICE: &str = i18n::n_(
@@ -220,6 +235,16 @@ impl TextureCraftApp {
             return;
         }
         let total = sets.len();
+        // The 3D view shows the maps landing on the model while they bake
+        let orders = sets
+            .iter()
+            .map(|&set_index| {
+                let maps =
+                    self.session.doc.project.texture_sets.get(set_index).map(|texture_set| texture_set.bake.maps.enabled().collect()).unwrap_or_default();
+                (set_index, maps)
+            })
+            .collect();
+        self.session.bake_preview_begin(orders);
         self.bake = Some(BakeJob { queue: sets, current: None, total });
     }
 
@@ -273,13 +298,27 @@ impl TextureCraftApp {
     }
 
     fn poll_bake(&mut self, ctx: &egui::Context) {
-        let Some(job) = self.bake.as_mut() else { return };
+        // Leaving Bake mode puts the view mode back; the bake goes on
+        if self.session.bake_preview_active() && self.ui.mode != state::Mode::Baking {
+            self.session.bake_preview_end();
+        }
+        let Some(job) = self.bake.as_mut() else {
+            // A preview whose bake is gone must not keep the view
+            self.session.bake_preview_end();
+            return;
+        };
 
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        if let Some((set_index, _, receiver)) = &job.current {
-            match receiver.try_recv() {
+        if let Some(running) = &job.current {
+            let set_index = running.set_index;
+            // One streamed map per poll, so each lands on the model in its own frame. The worker
+            // sends every map before its result, so the last map shows before the bake is applied
+            if let Ok(map) = running.maps.try_recv() {
+                self.session.bake_preview_map(set_index, map);
+                return;
+            }
+            match running.receiver.try_recv() {
                 Ok(Ok(output)) => {
-                    let set_index = *set_index;
                     job.current = None;
                     if let Err(error) = self.session.apply_bake(set_index, output) {
                         self.toast(error.to_string(), true);
@@ -302,17 +341,28 @@ impl TextureCraftApp {
 
         if job.queue.is_empty() {
             self.bake = None;
+            self.session.bake_preview_end();
             self.toast(i18n::tr("Mesh maps baked"), false);
             return;
         }
         let set_index = job.queue.remove(0);
+        self.session.bake_preview_set_current(set_index);
         match self.session.bake_task(set_index) {
             Ok(task) => {
                 let progress = Arc::new(Progress::new());
                 let worker_progress = progress.clone();
-                let receiver = spawn_worker("texturecraft-bake", move || task.run(&worker_progress));
+                let maps_total = task.maps().len();
+                let maps_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let worker_done = maps_done.clone();
+                let (sender, maps) = std::sync::mpsc::channel();
+                let receiver = spawn_worker("texturecraft-bake", move || {
+                    task.run_streaming(&worker_progress, &mut |map| {
+                        worker_done.fetch_add(1, Ordering::Relaxed);
+                        let _ = sender.send(map);
+                    })
+                });
                 if let Some(job) = self.bake.as_mut() {
-                    job.current = Some((set_index, progress, receiver));
+                    job.current = Some(RunningBake { set_index, progress, receiver, maps, maps_done, maps_total });
                 }
             }
             Err(error) => self.toast(error.to_string(), true),
@@ -323,9 +373,11 @@ impl TextureCraftApp {
     pub fn cancel_bake(&mut self) {
         let Some(job) = self.bake.take() else { return };
 
-        if let Some((_, progress, _)) = job.current {
-            progress.cancel.store(true, Ordering::Relaxed);
+        if let Some(running) = job.current {
+            running.progress.cancel.store(true, Ordering::Relaxed);
         }
+        // The streamed maps were only shown: the document keeps the maps it had
+        self.session.bake_preview_end();
     }
 
     /// Resize texture set `ts` to `resolution` on a worker thread (the document changes when
@@ -363,10 +415,30 @@ impl TextureCraftApp {
     }
 
     /// Bake progress 0..1 across all queued sets.
+    pub fn bake_status(&self) -> Option<String> {
+        let job = self.bake.as_ref()?;
+        let stage = self.session.bake_preview.as_ref()?.stage()?;
+        let map = i18n::tr(i18n::baked_map_label(stage.map));
+        let (n, total) = (stage.position, stage.total);
+        if job.total > 1 {
+            let set = job.total - job.queue.len();
+            return Some(i18n::trf(
+                "Baking {map} ({n}/{total}), texture set {set} of {sets}",
+                &[("map", &map), ("n", &n), ("total", &total), ("set", &set.max(1)), ("sets", &job.total)],
+            ));
+        }
+        Some(i18n::trf("Baking {map} ({n}/{total})", &[("map", &map), ("n", &n), ("total", &total)]))
+    }
+
     pub fn bake_progress(&self) -> Option<f32> {
         let job = self.bake.as_ref()?;
         let done = job.total - job.queue.len() - usize::from(job.current.is_some());
-        let cur = job.current.as_ref().map(|(_, p, _)| p.fraction()).unwrap_or(0.0);
+        // Each map is a bake of its own: its progress runs from 0 to 1 within the set's share
+        let cur = job
+            .current
+            .as_ref()
+            .map(|running| (running.maps_done.load(Ordering::Relaxed) as f32 + running.progress.fraction()) / running.maps_total.max(1) as f32)
+            .unwrap_or(0.0);
         Some(((done as f32 + cur) / job.total.max(1) as f32).clamp(0.0, 1.0))
     }
 }

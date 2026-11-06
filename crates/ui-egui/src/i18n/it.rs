@@ -1,6 +1,17 @@
 //! Italian UI text: (English key, translation). Keys are the English strings passed to `tr`.
 
 pub const TABLE: &[(&str, &str)] = &[
+    ("Baking {map} ({n}/{total})", "Bake di {map} in corso ({n}/{total})"),
+    ("Baking {map} ({n}/{total}), texture set {set} of {sets}", "Bake di {map} in corso ({n}/{total}), set di texture {set} di {sets}"),
+    ("Follow Newest Map", "Segui la mappa più recente"),
+    (
+        "Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.",
+        "La pittura è in pausa finché viene mostrato un bake. Annulla il bake o attendi che finisca.",
+    ),
+    (
+        "What the 3D view shows while the bake runs: the newest finished map, one finished map, or the material. Maps not baked yet show a neutral value.",
+        "Cosa mostra la vista 3D durante il bake: l'ultima mappa completata, una mappa completata a scelta o il materiale. Le mappe non ancora create mostrano un valore neutro.",
+    ),
     ("\"{layer}\" has no paint yet: the filter changes what you paint on it.", "\"{layer}\" non è ancora dipinto: il filtro modifica ciò che vi dipingi."),
     ("0 turns autosave off. Copies go to {folder}", "0 disattiva il salvataggio automatico. Le copie vengono salvate in {folder}"),
     ("2D view only", "Solo vista 2D"),

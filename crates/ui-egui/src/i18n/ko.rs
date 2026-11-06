@@ -1,6 +1,17 @@
 //! Korean UI text: (English key, translation). Keys are the English strings passed to `tr`.
 
 pub const TABLE: &[(&str, &str)] = &[
+    ("Baking {map} ({n}/{total})", "{map} 베이크 중 ({n}/{total})"),
+    ("Baking {map} ({n}/{total}), texture set {set} of {sets}", "{map} 베이크 중 ({n}/{total}), 텍스처 세트 {set}/{sets}"),
+    ("Follow Newest Map", "최신 맵 따라가기"),
+    (
+        "Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.",
+        "베이크를 표시하는 동안에는 페인팅이 일시 중지됩니다. 베이크를 취소하거나 끝날 때까지 기다리세요.",
+    ),
+    (
+        "What the 3D view shows while the bake runs: the newest finished map, one finished map, or the material. Maps not baked yet show a neutral value.",
+        "베이크하는 동안 3D 뷰가 보여 주는 것: 가장 최근에 완료된 맵, 완료된 맵 중 선택한 하나, 또는 머티리얼. 아직 베이크되지 않은 맵은 중립 값으로 표시됩니다.",
+    ),
     (
         "\"{layer}\" has no paint yet: the filter changes what you paint on it.",
         "\"{layer}\"에 아직 페인트가 없습니다: 필터는 이 레이어에 칠하는 내용을 바꿉니다.",

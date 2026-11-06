@@ -211,13 +211,22 @@ impl GpuLink {
         match aux_map {
             Some(AuxView::MeshMap(m)) => {
                 for ts in 0..s.caches.len() {
-                    let rev = s.doc.baked.get(&ts).and_then(|b| b.maps.get(&m)).map(|d| Arc::as_ptr(d) as u64).unwrap_or(0);
-                    let key = (format!("{m:?}"), rev);
+                    // While a bake shows, its streamed maps (neutral where not baked yet) replace the document's
+                    let preview = s.bake_preview_baked(ts);
+                    let baked = preview.or_else(|| s.doc.baked.get(&ts));
+                    let have = baked.and_then(|b| b.maps.get(&m));
+                    let rev = have.map(|d| Arc::as_ptr(d) as u64).unwrap_or(0);
+                    let key = (format!("{m:?}{}", if preview.is_some() { "~" } else { "" }), rev);
                     if self.aux.get(&ts) == Some(&key) {
                         continue;
                     }
                     let res = s.caches.get(ts).map_or(1024, |c| texturecraft_render::aux_size(c.size));
-                    out.aux.push((ts, res, texturecraft_render::mesh_maps::mesh_map_rgba(s.doc.baked.get(&ts), m, res)));
+                    let rgba = if preview.is_some() && have.is_none() {
+                        texturecraft_render::mesh_maps::neutral_rgba(m, res)
+                    } else {
+                        texturecraft_render::mesh_maps::mesh_map_rgba(baked, m, res)
+                    };
+                    out.aux.push((ts, res, rgba));
                     self.aux.insert(ts, key);
                 }
             }
