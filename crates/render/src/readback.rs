@@ -17,7 +17,12 @@ pub struct Readback {
 impl Readback {
     /// Encode the copy of mip 0 of `texture` (an RGBA8 format) into a mappable buffer.
     pub fn new(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) -> Readback {
-        let (width, height) = (texture.width(), texture.height());
+        Readback::new_level(device, encoder, texture, 0)
+    }
+
+    /// [`Readback::new`] for mip `level` of `texture`.
+    pub fn new_level(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture, level: u32) -> Readback {
+        let (width, height) = ((texture.width() >> level).max(1), (texture.height() >> level).max(1));
         let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tc_read"),
@@ -26,7 +31,7 @@ impl Readback {
             mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture, mip_level: level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyBufferInfo {
                 buffer: &buf,
                 layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(height) },
@@ -61,8 +66,13 @@ impl Readback {
 
     /// Copy, submit and wait (the web cannot block: there it returns None).
     pub fn blocking(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Option<(u32, u32, Vec<u8>)> {
+        Readback::blocking_level(device, queue, texture, 0)
+    }
+
+    /// [`Readback::blocking`] for mip `level`.
+    pub fn blocking_level(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, level: u32) -> Option<(u32, u32, Vec<u8>)> {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_read") });
-        let r = Readback::new(device, &mut enc, texture);
+        let r = Readback::new_level(device, &mut enc, texture, level);
         queue.submit([enc.finish()]);
         r.map();
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });

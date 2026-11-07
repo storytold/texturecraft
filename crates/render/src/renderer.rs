@@ -348,13 +348,38 @@ struct SetGpu {
     /// until its sets are painted.
     tex: Vec<Tex>,
     bind_group: wgpu::BindGroup,
-    mips_dirty: Vec<bool>,
+    mips_dirty: Vec<MipsDirty>,
     /// Textures whose full-size allocation failed (out of GPU memory): they keep their
     /// placeholder until the set is re-created, instead of retrying on every tile.
     failed: Vec<bool>,
     /// Full-size textures the browser's WebGPU has not yet confirmed: tiles go into them while
     /// the placeholder stays bound (see [`Renderer::resolve_pending`]).
     pending: Vec<Option<PendingTex>>,
+}
+
+/// What of a texture's mip chain is stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MipsDirty {
+    Clean,
+    /// Level-0 texel rectangle [x0, x1) × [y0, y1) whose mips are stale.
+    Region {
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+    },
+    All,
+}
+
+impl MipsDirty {
+    /// Mark the level-0 rectangle [x0, x1) × [y0, y1) stale (unioned with what already is).
+    fn add(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) {
+        *self = match *self {
+            MipsDirty::Clean => MipsDirty::Region { x0, y0, x1, y1 },
+            MipsDirty::Region { x0: a, y0: b, x1: c, y1: d } => MipsDirty::Region { x0: x0.min(a), y0: y0.min(b), x1: x1.max(c), y1: y1.max(d) },
+            MipsDirty::All => MipsDirty::All,
+        };
+    }
 }
 
 /// A full-size texture waiting for WebGPU's verdict on its allocation.
@@ -372,7 +397,7 @@ fn install(set: &mut SetGpu, slot: usize, tex: Tex, device: &wgpu::Device, layou
     }
     set.bind_group = set_bind_group(device, layout, sampler, &set.tex);
     if let Some(d) = set.mips_dirty.get_mut(slot) {
-        *d = true;
+        *d = MipsDirty::All;
     }
 }
 
@@ -795,6 +820,38 @@ fn fullscreen_blend(
     pass.draw(0..3, 0..1);
 }
 
+/// [`fullscreen`] over the `(x, y, w, h)` scissor rectangle only, keeping the rest of `target`
+/// (with `None`: the whole target, cleared, as [`fullscreen`]).
+fn mip_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    pipe: &wgpu::RenderPipeline,
+    bg: &wgpu::BindGroup,
+    scissor: Option<(u32, u32, u32, u32)>,
+) {
+    let Some((x, y, w, h)) = scissor else {
+        return fullscreen(encoder, label, target, CLEAR, pipe, bg);
+    };
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, bg, &[]);
+    pass.set_scissor_rect(x, y, w, h);
+    pass.draw(0..3, 0..1);
+}
+
 /// Halton low-discrepancy value of `i` in `base` (0..1).
 fn halton(mut i: u32, base: u32) -> f32 {
     let (mut f, mut r) = (1.0, 0.0);
@@ -1161,7 +1218,8 @@ impl Renderer {
             tex.push(neutral_tex(device, queue, (1, 1), wgpu::TextureFormat::Rgba8Unorm, 1, &AUX_NEUTRAL));
             let bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &tex);
             let n = tex.len();
-            let gpu = SetGpu { size, shift, tex, bind_group, mips_dirty: vec![true; n], failed: vec![false; n], pending: (0..n).map(|_| None).collect() };
+            let gpu =
+                SetGpu { size, shift, tex, bind_group, mips_dirty: vec![MipsDirty::All; n], failed: vec![false; n], pending: (0..n).map(|_| None).collect() };
             if i < self.sets.len() {
                 self.sets[i] = gpu;
             } else {
@@ -1234,7 +1292,7 @@ impl Renderer {
         drop(oom);
         self.content_rev += 1;
         if let Some(d) = set.mips_dirty.get_mut(ki) {
-            *d = true;
+            d.add(ox, oy, ox + w, oy + h);
         }
     }
 
@@ -1274,7 +1332,7 @@ impl Renderer {
         drop(oom);
         self.content_rev += 1;
         if let Some(d) = set.mips_dirty.last_mut() {
-            *d = true;
+            *d = MipsDirty::All;
         }
     }
 
@@ -1326,14 +1384,31 @@ impl Renderer {
     fn generate_mips(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
         for si in 0..self.sets.len() {
             for ti in 0..self.sets[si].tex.len() {
-                if !self.sets[si].mips_dirty.get(ti).copied().unwrap_or(false) {
+                let dirty = self.sets[si].mips_dirty.get(ti).copied().unwrap_or(MipsDirty::Clean);
+                if dirty == MipsDirty::Clean {
                     continue;
                 }
                 let format = self.sets[si].tex[ti].format;
                 self.ensure_mip_pipeline(device, format);
                 let Some(pipe) = self.mip_pipelines.get(&format) else { continue };
                 let t = &self.sets[si].tex[ti];
+                // The stale rectangle of the level below, in that level's texels.
+                let mut rect = match dirty {
+                    MipsDirty::Region { x0, y0, x1, y1 } => Some((x0, y0, x1, y1)),
+                    _ => None,
+                };
                 for level in 1..t.mips {
+                    // The parent rectangle plus one texel on every side: for even sizes the
+                    // 2×2 parents are exact, but at odd sizes (UV-tiled atlases, or `>> level`
+                    // of them) the bilinear footprint is wider, so a changed texel can reach a
+                    // destination texel just outside it.
+                    let scissor = rect.map(|(px0, py0, px1, py1)| {
+                        let (w, h) = ((t.texture.width() >> level).max(1), (t.texture.height() >> level).max(1));
+                        let (x0, y0) = ((px0 / 2).saturating_sub(1).min(w - 1), (py0 / 2).saturating_sub(1).min(h - 1));
+                        let (x1, y1) = ((px1.div_ceil(2) + 1).clamp(x0 + 1, w), (py1.div_ceil(2) + 1).clamp(y0 + 1, h));
+                        (x0, y0, x1, y1)
+                    });
+                    rect = scissor;
                     let src = t.texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level - 1, mip_level_count: Some(1), ..Default::default() });
                     let dst = t.texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level, mip_level_count: Some(1), ..Default::default() });
                     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1344,10 +1419,10 @@ impl Renderer {
                             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                         ],
                     });
-                    fullscreen(encoder, "tc_mip", &dst, CLEAR, pipe, &bg);
+                    mip_pass(encoder, "tc_mip", &dst, pipe, &bg, scissor.map(|(x0, y0, x1, y1)| (x0, y0, x1 - x0, y1 - y0)));
                 }
                 if let Some(d) = self.sets[si].mips_dirty.get_mut(ti) {
-                    *d = false;
+                    *d = MipsDirty::Clean;
                 }
             }
         }
@@ -2109,5 +2184,83 @@ mod tests {
         prepare(&mut h);
         assert_eq!(base_width(&h), 1);
         assert_eq!(h.renderer.take_memory_failures(), vec![0]);
+    }
+
+    /// Time of one frame's mip work after a single tile upload on an 8K set.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_mips() {
+        let Ok(mut h) = Headless::new() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((8192, 8192), 0)], 1);
+        let tile = [200, 30, 30, 255].repeat(64 * 64);
+        h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, 0, 0, &tile);
+        prepare(&mut h);
+        let _ = h.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let mut times = Vec::new();
+        for i in 0..20 {
+            h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, 10 + i, 10, &tile);
+            let t0 = std::time::Instant::now();
+            prepare(&mut h);
+            let _ = h.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            times.push(t0.elapsed());
+        }
+        let avg = times.iter().sum::<std::time::Duration>() / 20;
+        let worst = times.iter().max().copied().unwrap_or_default();
+        eprintln!("bench_mips [{}] 8192^2, one tile per frame: avg {avg:?}, worst {worst:?}", h.adapter_name);
+    }
+
+    /// Every mip level below 0 of the base color texture of set 0.
+    fn mip_levels(h: &Headless) -> Vec<Vec<u8>> {
+        let tex = h.renderer.display_textures()[0][0];
+        let last = mip_count(tex.width().max(tex.height())) - 1;
+        (1..=last).map(|l| crate::readback::Readback::blocking_level(&h.device, &h.queue, tex, l).unwrap().2).collect()
+    }
+
+    /// Paint `first` tiles, settle, then add each of `later` regionally and compare every level
+    /// against a forced full regeneration.
+    fn assert_regional_equals_full(size: (u32, u32), first: &[(u32, u32)], later: &[(u32, u32)]) {
+        let Ok(mut h) = Headless::new() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[(size, 0)], 1);
+        let colour = |i: u32| [(37 * i % 200 + 40) as u8, (91 * i % 200 + 40) as u8, (151 * i % 200 + 40) as u8, 255];
+        let up = |h: &mut Headless, i: u32, (tx, ty): (u32, u32)| {
+            h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, tx, ty, &colour(i).repeat(64 * 64));
+        };
+        for (i, t) in (0..).zip(first) {
+            up(&mut h, i, *t);
+        }
+        prepare(&mut h);
+        for (i, t) in (10..).zip(later) {
+            up(&mut h, i, *t);
+            assert!(matches!(h.renderer.sets[0].mips_dirty[0], MipsDirty::Region { .. }));
+            prepare(&mut h);
+            assert_eq!(h.renderer.sets[0].mips_dirty[0], MipsDirty::Clean);
+            let regional = mip_levels(&h);
+            h.renderer.sets[0].mips_dirty[0] = MipsDirty::All;
+            prepare(&mut h);
+            let full = mip_levels(&h);
+            for (level, (a, b)) in regional.iter().zip(&full).enumerate() {
+                assert_eq!(a, b, "{size:?}, tile {t:?}: regional and full mips differ at level {}", level + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn regional_mips_match_full() {
+        // The last column and row included (edge clamping).
+        assert_regional_equals_full((512, 512), &[(0, 0), (4, 4), (7, 2)], &[(3, 5), (7, 7)]);
+    }
+
+    #[test]
+    fn regional_mips_match_full_on_non_power_of_two_sets() {
+        // 3×1 tiles: odd widths further down the chain.
+        assert_regional_equals_full((192, 64), &[(0, 0)], &[(1, 0), (2, 0)]);
+        // Odd in both directions.
+        assert_regional_equals_full((192, 192), &[(0, 0)], &[(1, 1), (2, 2), (0, 2)]);
     }
 }
