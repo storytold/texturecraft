@@ -291,8 +291,8 @@ pub(crate) struct ActiveStroke {
     pub canvas: StrokeCanvas,
     /// Camera visibility for 3D strokes (None for strokes in the 2D view).
     pub depth: Option<Arc<EyeDepth>>,
-    /// 2D view strokes: last UV point and the distance carried to the next stamp.
-    pub uv: Option<(Option<Vec2>, f32)>,
+    /// 2D view strokes: where the stroke is between samples.
+    pub uv: Option<crate::uv_stroke_state::UvStrokeState>,
     pub camera: OrbitCamera,
     pub viewport: Vec2,
     pub values: BTreeMap<Channel, [f32; 3]>,

@@ -165,6 +165,18 @@ const UV_VIEW_MAX_ZOOM: f32 = 40.0;
 /// UV zoom change per point of mouse wheel, as a fraction of the zoom
 const UV_WHEEL_ZOOM_PER_POINT: f32 = 0.002;
 
+/// Dash length of the straight-line preview, in points
+const RUBBER_BAND_DASH: f32 = 6.0;
+
+/// Gap between the straight-line preview's dashes, in points
+const RUBBER_BAND_GAP: f32 = 4.0;
+
+/// Opacity of the UV tile outlines in the 2D view
+const UV_TILE_OUTLINE_ALPHA: u8 = 40;
+
+/// Smallest skew brush circle in the 2D view, in points, so a tiny brush stays visible
+const BAKE_PAINT_CURSOR_MIN_RADIUS: f32 = 2.0;
+
 /// The 2D view's width when the split divider is at `divider_x`
 fn uv_view_width(full: Rect, divider_x: f32) -> f32 {
     (full.right() - divider_x - SPLIT_LINE_HALF_WIDTH).max(1.0)
@@ -996,11 +1008,43 @@ fn path_overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, resp: &egui::Respons
     }
 }
 
-/// Dashed preview of a straight segment.
+/// Dashed preview of a straight segment, clipped to `rect` so an end far off screen adds no dashes.
 fn rubber_band(ui: &Ui, rect: Rect, from: Pos2, to: Pos2) {
-    let p = ui.painter_at(rect);
-    p.add(egui::Shape::dashed_line(&[from, to], Stroke::new(2.5, Color32::from_black_alpha(120)), 6.0, 4.0));
-    p.add(egui::Shape::dashed_line(&[from, to], Stroke::new(1.0, Color32::from_white_alpha(200)), 6.0, 4.0));
+    let Some(visible) = visible_dashes(rect, from, to) else { return };
+    let painter = ui.painter_at(rect);
+    for stroke in [Stroke::new(2.5, Color32::from_black_alpha(120)), Stroke::new(1.0, Color32::from_white_alpha(200))] {
+        painter.add(egui::Shape::dashed_line(&visible, stroke, RUBBER_BAND_DASH, RUBBER_BAND_GAP));
+    }
+}
+
+/// The part of `from`→`to` inside `rect`, its start moved back to a whole dash period so the dashes keep their place.
+fn visible_dashes(rect: Rect, from: Pos2, to: Pos2) -> Option<[Pos2; 2]> {
+    let direction = to - from;
+    let length = direction.length();
+    if length == 0.0 {
+        return rect.contains(from).then_some([from, to]);
+    }
+
+    // Clip the segment's parameter range against each axis's slab
+    let (mut enter, mut exit) = (0.0_f32, 1.0_f32);
+    for (delta, origin, low, high) in [(direction.x, from.x, rect.left(), rect.right()), (direction.y, from.y, rect.top(), rect.bottom())] {
+        if delta == 0.0 {
+            if origin < low || origin > high {
+                return None;
+            }
+            continue;
+        }
+        let (at_low, at_high) = ((low - origin) / delta, (high - origin) / delta);
+        enter = enter.max(at_low.min(at_high));
+        exit = exit.min(at_low.max(at_high));
+    }
+    if enter > exit {
+        return None;
+    }
+
+    let period = RUBBER_BAND_DASH + RUBBER_BAND_GAP;
+    let start = (enter * length / period).floor() * period / length;
+    Some([from + direction * start, from + direction * exit])
 }
 
 /// V held with the Clone tool in painting mode: clicks set the clone source.
@@ -1148,11 +1192,12 @@ fn pen_pressure(ui: &Ui) -> f32 {
     }
 }
 
+/// The 2D (UV) view: navigation, painting in texture coordinates and the overlays drawn over the texture.
 fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut PendingSync) {
     let tokens = Tokens::get(ui.ctx());
     let response = ui.interact(rect, ui.scope_id().with("view2d"), Sense::click_and_drag());
     let size = rect.size();
-    let alt = ui.input(|input| input.modifiers.alt);
+    let (alt, shift) = ui.input(|input| (input.modifiers.alt, input.modifiers.shift));
     let adjusting = brush_drag(app, ui, &response);
 
     // Pan with a middle drag or Alt+left drag, zoom with the wheel about the cursor
@@ -1216,29 +1261,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     if painting && path_tool {
         path_input(app, ui, &response, true, |_, pointer| Some(to_uv(pointer).extend(0.0)), show);
     } else if painting {
-        let pressure = pen_pressure(ui);
-        if response.drag_started_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary) {
-            if let Some(pointer) = response.interact_pointer_pos()
-                && let Err(error) = app.session.begin_stroke_uv(to_uv(pointer), pressure)
-            {
-                app.toast(error.to_string(), true);
-            }
-            if response.clicked_by(PointerButton::Primary)
-                && let Err(error) = app.session.end_stroke()
-            {
-                app.toast(error.to_string(), true);
-            }
-        } else if response.dragged_by(PointerButton::Primary)
-            && app.session.stroke_active()
-            && let Some(pointer) = response.interact_pointer_pos()
-        {
-            app.session.continue_stroke_uv(to_uv(pointer), pressure);
-        }
-        if response.drag_stopped_by(PointerButton::Primary)
-            && let Err(error) = app.session.end_stroke()
-        {
-            app.toast(error.to_string(), true);
-        }
+        paint_2d_input(app, ui, &response, shift, &to_uv);
     }
     if response.double_clicked() && !(painting && path_tool) {
         app.ui.uv_zoom = 1.0;
@@ -1259,7 +1282,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // The UV tile outlines (numbered for UDIM sets) and the path being edited
     let painter = ui.painter_at(rect);
     let set = app.session.doc.project.texture_sets.get(ts);
-    let outline = |tile: Rect| painter.rect_stroke(tile, 0.0, Stroke::new(1.0, Color32::from_white_alpha(40)), egui::StrokeKind::Outside);
+    let outline = |tile: Rect| painter.rect_stroke(tile, 0.0, Stroke::new(1.0, Color32::from_white_alpha(UV_TILE_OUTLINE_ALPHA)), egui::StrokeKind::Outside);
     match set.and_then(|texture_set| Some((texture_set, texture_set.tile_grid()?))) {
         Some((texture_set, grid)) => {
             for (udim, (block_x, block_y)) in texture_set.uv_tiles.iter().filter_map(|udim| Some((*udim, grid.block(*udim)?))) {
@@ -1285,10 +1308,22 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         path_overlay(app, ui, rect, &response, true, show);
     }
 
+    // Shift: preview the straight line Shift+click paints from the last stroke
+    if painting
+        && shift
+        && !path_tool
+        && brush_tool(app.session.tool.tool)
+        && let Some((last_set, from)) = app.last_paint_uv
+        && last_set == ts
+        && let Some(hover) = response.hover_pos()
+    {
+        rubber_band(ui, rect, to_screen(from.x, from.y), hover);
+    }
+
     if app.ui.mode == crate::state::Mode::Baking {
         bake_paint_overlay(app, ui, &painter, to_screen(0.0, 1.0), to_screen(1.0, 0.0));
         if bake_paint_on && let Some(hover) = response.hover_pos() {
-            let radius = (to_screen(app.ui.bake_paint_brush.radius, 0.0).x - to_screen(0.0, 0.0).x).abs().max(2.0);
+            let radius = (to_screen(app.ui.bake_paint_brush.radius, 0.0).x - to_screen(0.0, 0.0).x).abs().max(BAKE_PAINT_CURSOR_MIN_RADIUS);
             painter.circle_stroke(hover, radius, Stroke::new(1.0, Color32::from_white_alpha(200)));
         }
     }
@@ -1298,6 +1333,51 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     axis_gizmo(ui, rect, app, true);
     let name = app.session.doc.project.texture_sets.get(ts).map(|texture_set| texture_set.name.clone()).unwrap_or_default();
     ui.painter().text(rect.right_bottom() + vec2(-10.0, -10.0), egui::Align2::RIGHT_BOTTOM, name, egui::FontId::proportional(11.0), tokens.viewport_text);
+}
+
+/// Paint in the 2D view: a press starts a stroke, a drag continues it, Shift+click draws a line from the last stroke.
+fn paint_2d_input(app: &mut TextureCraftApp, ui: &Ui, resp: &egui::Response, shift: bool, to_uv: &dyn Fn(egui::Pos2) -> Vec2) {
+    let pressure = pen_pressure(ui);
+    let set = app.session.ts();
+    // Where the stroke under way is; it becomes the line start only when the stroke finishes
+    let stroke_end = ui.scope_id().with("paint_2d_stroke_end");
+
+    if resp.drag_started_by(PointerButton::Primary) || resp.clicked_by(PointerButton::Primary) {
+        // A line starts only from a point on the same texture set
+        let line_start = match app.last_paint_uv {
+            Some((last_set, last_uv)) if shift && last_set == set => Some(last_uv),
+            _ => None,
+        };
+        if let Some(pointer) = resp.interact_pointer_pos() {
+            let uv = to_uv(pointer);
+            match app.session.begin_stroke_uv(line_start.unwrap_or(uv), pressure) {
+                Ok(()) => {
+                    if line_start.is_some() {
+                        app.session.continue_stroke_uv(uv, pressure);
+                    }
+                    ui.data_mut(|data| data.insert_temp(stroke_end, (set, uv)));
+                }
+                Err(error) => app.toast(error.to_string(), true),
+            }
+        }
+    } else if resp.dragged_by(PointerButton::Primary)
+        && app.session.stroke_active()
+        && let Some(pointer) = resp.interact_pointer_pos()
+    {
+        let uv = to_uv(pointer);
+        app.session.continue_stroke_uv(uv, pressure);
+        ui.data_mut(|data| data.insert_temp(stroke_end, (set, uv)));
+    }
+
+    // Escape cancels the stroke and ends the drag without a primary release, so a cancelled stroke never gets here
+    if resp.clicked_by(PointerButton::Primary) || resp.drag_stopped_by(PointerButton::Primary) {
+        let finishing = app.session.stroke_active();
+        match app.session.end_stroke() {
+            Ok(()) if finishing => app.last_paint_uv = ui.data(|data| data.get_temp(stroke_end)),
+            Ok(()) => {}
+            Err(error) => app.toast(error.to_string(), true),
+        }
+    }
 }
 
 /// Paint the skew map under the pointer in the 2D view (a click is one dab, a drag a stroke).
@@ -1350,4 +1430,35 @@ fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, t
         }
     };
     painter.image(tex.id(), Rect::from_two_pos(top_left, bottom_right), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VIEW: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0));
+    const DASH_PERIOD: f32 = RUBBER_BAND_DASH + RUBBER_BAND_GAP;
+
+    #[test]
+    fn a_far_start_is_clipped_to_the_view_on_a_whole_dash_period() {
+        let far_start = pos2(-10_003.0, 50.0);
+
+        let [start, end] = visible_dashes(VIEW, far_start, pos2(50.0, 50.0)).unwrap();
+
+        assert!(start.x <= VIEW.left() && start.x > VIEW.left() - DASH_PERIOD, "starts at the view's edge: {start:?}");
+        let periods = (start.x - far_start.x) / DASH_PERIOD;
+        assert!((periods - periods.round()).abs() < 1e-3, "a whole number of dash periods from the real start: {periods}");
+        assert_eq!(end, pos2(50.0, 50.0));
+    }
+
+    #[test]
+    fn a_segment_inside_the_view_is_kept_whole() {
+        assert_eq!(visible_dashes(VIEW, pos2(10.0, 20.0), pos2(90.0, 80.0)), Some([pos2(10.0, 20.0), pos2(90.0, 80.0)]));
+    }
+
+    #[test]
+    fn a_segment_outside_the_view_draws_nothing() {
+        assert_eq!(visible_dashes(VIEW, pos2(-50.0, -10.0), pos2(150.0, -10.0)), None);
+        assert_eq!(visible_dashes(VIEW, pos2(-50.0, 120.0), pos2(120.0, 300.0)), None);
+    }
 }
