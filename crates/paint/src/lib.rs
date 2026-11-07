@@ -27,6 +27,6 @@ pub use brush::{Alignment, BrushAlpha, BrushSettings, Particles, Shape, Symmetry
 pub use commit::{CommitSource, Staging, TexelFn, commit_coverage, commit_layer, commit_mask};
 pub use path::{Lasso, spline};
 pub use pickup::{Pickup, PickupMode};
-pub use raster::{RasterCtx, StrokeCanvas, UvStamp, fill_coverage, fill_triangles, rasterize, rasterize_uv};
+pub use raster::{ProjectCtx, RasterCtx, StrokeCanvas, UvStamp, fill_coverage, fill_triangles, project_coverage, rasterize, rasterize_uv, view_weight};
 pub use stroke::{PickCtx, Stamp, Stroke, SurfaceHit, pick};
 pub use visibility::EyeDepth;

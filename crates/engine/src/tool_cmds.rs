@@ -56,7 +56,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Projection stencil",
             [],
             None,
-            "{image?: resource name, center?: [x,y] NDC, scale?: 0.01..10, rotation?: degrees, tile?, opacity?, clear?: bool}",
+            "{image?: resource name, center?: [x,y] NDC, scale?: 0.01..10, rotation?: degrees, tile?, opacity?, baseColorOnly?: bool (paint the image's color alone), clear?: bool}",
             always,
             stencil
         ),
@@ -283,6 +283,9 @@ fn stencil(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(v) = f32p(p, "opacity") {
         st.opacity = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = boolp(p, "baseColorOnly") {
+        st.base_color_only = v;
     }
     s.revision = s.revision.wrapping_add(1);
     Ok(serde_json::to_value(&s.tool.stencil).unwrap_or(Value::Null))

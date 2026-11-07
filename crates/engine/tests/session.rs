@@ -265,6 +265,52 @@ fn projection_tool_paints_the_stencil_colors() {
 }
 
 #[test]
+fn project_whole_image_bakes_the_stencil_from_the_camera() {
+    let mut s = session();
+    let split = |s: &mut Session, file: &str| {
+        let mut png = Vec::new();
+        let img = image::RgbaImage::from_fn(16, 16, |x, _| if x < 8 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 255, 0, 255]) });
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        s.import_resource_bytes(file, png).unwrap()
+    };
+    // No stencil, or one whose image is gone: an error, never a panic.
+    assert!(execute(&mut s, "tool.stencil.project", &Value::Null).is_err());
+    let gone = split(&mut s, "gone.png");
+    execute(&mut s, "tool.stencil", &json!({"image": gone})).unwrap();
+    s.images.remove(&gone);
+    assert!(execute(&mut s, "tool.stencil.project", &Value::Null).is_err());
+    // Hostile params fall back to the defaults.
+    let name = split(&mut s, "split.png");
+    execute(&mut s, "tool.stencil", &json!({"image": name, "scale": 1.0, "baseColorOnly": true})).unwrap();
+    execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [0.0, 0.0, 1.0]})).unwrap();
+    execute(&mut s, "tool.material", &json!({"channel": "roughness", "value": 0.9, "enabled": true})).unwrap();
+    s.update();
+    let vp = s.viewport;
+    let at = |s: &Session, x: f32, c: Channel| {
+        let hit = s.pick(texturecraft_engine::geom::glam::Vec2::new(x, 200.0), vp).unwrap();
+        s.caches[0].composite.value(c, (hit.uv.x * 256.0) as u32, (hit.uv.y * 256.0) as u32)
+    };
+    let rough = at(&s, 150.0, Channel::Roughness)[0];
+    let r = execute(&mut s, "tool.stencil.project", &json!({"viewport": [0, 0], "angleFade": ["x", null]})).unwrap();
+    assert!(r["tiles"].as_u64().unwrap() > 0);
+    s.update();
+    let (left, right) = (at(&s, 150.0, Channel::BaseColor), at(&s, 250.0, Channel::BaseColor));
+    assert!(left[0] > 0.8 && left[1] < 0.2, "left {left:?}");
+    assert!(right[1] > 0.8 && right[0] < 0.2, "right {right:?}");
+    // Base color only: the roughness enabled in the tool stays as it was.
+    assert_eq!(at(&s, 150.0, Channel::Roughness)[0], rough, "roughness untouched");
+    // One undo step takes it back.
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    s.update();
+    assert!(at(&s, 150.0, Channel::BaseColor)[0] < 0.8, "undo restores");
+    // All channels: the stencil alpha now carries the tool's roughness too.
+    execute(&mut s, "tool.stencil", &json!({"baseColorOnly": false})).unwrap();
+    execute(&mut s, "tool.stencil.project", &Value::Null).unwrap();
+    s.update();
+    assert!((at(&s, 150.0, Channel::Roughness)[0] - 0.9).abs() < 0.05);
+}
+
+#[test]
 fn smart_materials_save_and_load_with_pixels() {
     let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 256).unwrap();
     s.viewport = texturecraft_engine::geom::glam::Vec2::new(400.0, 400.0);

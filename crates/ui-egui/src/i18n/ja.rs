@@ -568,6 +568,12 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Output template", "出力テンプレート"),
     ("Output templates", "出力テンプレート"),
     ("Overlay", "オーバーレイ"),
+    ("Base color only", "ベースカラーのみ"),
+    ("Project whole image", "画像全体を投影"),
+    (
+        "Bake the image from the current camera onto the visible surface; grazing angles fade out.",
+        "現在のカメラから見える面に画像をベイクします。浅い角度の面はフェードアウトします。",
+    ),
     ("Overlay opacity", "オーバーレイの不透明度"),
     ("PBR - Metallic Roughness (TextureCraft)", "PBR - メタリック/ラフネス (TextureCraft)"),
     ("PNG image", "PNG画像"),

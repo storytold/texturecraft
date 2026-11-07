@@ -102,6 +102,20 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// How much a surface seen at `facing` (cosine between its normal and the direction to the eye)
+/// is painted: 0 for back faces when `culling`, and a smooth fade between the angle-fade start
+/// and end (degrees from the view direction) so grazing surfaces do not stretch the paint.
+/// Without culling every surface counts in full.
+pub fn view_weight(facing: f32, culling: bool, angle_fade: (f32, f32)) -> f32 {
+    if !culling {
+        return 1.0;
+    }
+    if facing.is_nan() || facing <= 0.0 {
+        return 0.0;
+    }
+    smoothstep(angle_fade.1.to_radians().cos(), angle_fade.0.to_radians().cos(), facing)
+}
+
 /// Accumulate `stamps` into `canvas` ("over": `m = a + m·(1 − a)`).
 pub fn rasterize(canvas: &mut StrokeCanvas, ctx: &RasterCtx, stamps: &[Stamp]) {
     let (w, h) = (ctx.gbuf.width, ctx.gbuf.height);
@@ -225,6 +239,33 @@ pub fn fill_coverage(canvas: &mut StrokeCanvas, gbuf: &UvGBuffer, coverage: impl
     canvas.add_stamp([0.0; 2]);
 }
 
+/// What [`project_coverage`] reads: the surface, the camera's view of it and the fade settings.
+pub struct ProjectCtx<'a> {
+    pub mesh: &'a Mesh,
+    pub gbuf: &'a UvGBuffer,
+    /// Camera visibility (None projects onto hidden surfaces too).
+    pub depth: Option<&'a EyeDepth>,
+    pub eye: Vec3,
+    pub backface_culling: bool,
+    /// Angle fade from/to in degrees.
+    pub angle_fade: (f32, f32),
+}
+
+/// One-shot "project the whole image": every texel the camera sees through the stencil gets the
+/// alpha of its [`view_weight`] (back faces, hidden surfaces and texels outside the image get 0).
+/// The stencil's own color and alpha are applied when the canvas is committed with
+/// `per_texel`, so this is only the surface part of the weight.
+pub fn project_coverage(canvas: &mut StrokeCanvas, ctx: &ProjectCtx, stencil: &texturecraft_compose::Stencil) {
+    fill_coverage(canvas, ctx.gbuf, |i, _| {
+        let Some(s) = ctx.gbuf.surface(ctx.mesh, i) else { return 0.0 };
+        if stencil.sample_world(s.pos).is_none() || ctx.depth.is_some_and(|d| !d.visible(s.pos)) {
+            return 0.0;
+        }
+        let to_eye = (ctx.eye - s.pos).try_normalize().unwrap_or(s.nrm);
+        view_weight(s.nrm.dot(to_eye), ctx.backface_culling, ctx.angle_fade)
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +313,57 @@ mod tests {
         let below = RasterCtx { eye: Vec3::new(0.0, -5.0, 0.0), ..ctx };
         rasterize(&mut c2, &below, &[st]);
         assert!(c2.dirty.is_empty());
+    }
+
+    #[test]
+    fn view_weight_fades_towards_grazing_angles() {
+        let fade = (70.0, 85.0);
+        let w = |deg: f32| view_weight(deg.to_radians().cos(), true, fade);
+        assert_eq!(w(0.0), 1.0);
+        assert_eq!(w(70.0), 1.0, "full strength up to the fade start");
+        assert!(w(78.0) > 0.05 && w(78.0) < 0.95, "partway: {}", w(78.0));
+        assert!(w(60.0) > w(78.0) && w(78.0) > w(84.0), "monotonic");
+        assert!(w(89.9) < 0.01, "grazing paints nothing");
+        // Back faces and NaN never paint with culling; without culling everything counts.
+        assert_eq!(view_weight(-0.5, true, fade), 0.0);
+        assert_eq!(view_weight(f32::NAN, true, fade), 0.0);
+        assert_eq!(view_weight(-0.5, false, fade), 1.0);
+    }
+
+    fn projected_plane(eye: Vec3, culling: bool, depth: Option<&EyeDepth>) -> StrokeCanvas {
+        use texturecraft_compose::{Stencil, store::ImageRes};
+        let m = primitives::plane(2.0, 4);
+        let g = UvGBuffer::new(&m, 0, 64, 64);
+        let image = std::sync::Arc::new(ImageRes { width: 1, height: 1, rgba: vec![[1.0; 4]], srgb: false });
+        let view_proj =
+            texturecraft_geom::glam::Mat4::perspective_rh(1.0, 1.0, 0.1, 50.0) * texturecraft_geom::glam::Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Z);
+        // The image covers the left half of the screen only (x from -1 to 0).
+        let stencil = Stencil { image, view_proj, center: [-0.5, 0.0], half: [0.5, 1.0], rotation: 0.0, tile: false };
+        let mut canvas = StrokeCanvas::new(64, 64);
+        let ctx = ProjectCtx { mesh: &m, gbuf: &g, depth, eye, backface_culling: culling, angle_fade: (70.0, 85.0) };
+        project_coverage(&mut canvas, &ctx, &stencil);
+        canvas
+    }
+
+    #[test]
+    fn projection_maps_camera_left_to_texels_and_culls_backfaces() {
+        let canvas = projected_plane(Vec3::new(0.0, 4.0, 0.0), true, None);
+        let at = |x: u32, y: u32| from_u16(canvas.alpha.get(x, y)[0]);
+        // Exactly one side of the middle row is under the image (the other half of the screen is empty).
+        let (a, b) = (at(8, 32), at(56, 32));
+        assert!((a > 0.99) != (b > 0.99), "only one half is projected: {a} {b}");
+        assert!(a.max(b) > 0.99 && a.min(b) < 0.01);
+        // From below the plane is a back face: nothing is painted; without culling it is.
+        assert!(projected_plane(Vec3::new(0.0, -4.0, 0.0), true, None).dirty.is_empty());
+        assert!(!projected_plane(Vec3::new(0.0, -4.0, 0.0), false, None).dirty.is_empty());
+    }
+
+    #[test]
+    fn projection_fades_surfaces_seen_at_a_grazing_angle() {
+        // Eye almost level with the plane (about 87 degrees off its normal): faded out.
+        let canvas = projected_plane(Vec3::new(0.0, 0.15, 4.0), true, None);
+        let max = (0..64).flat_map(|y| (0..64).map(move |x| (x, y))).map(|(x, y)| from_u16(canvas.alpha.get(x, y)[0])).fold(0.0f32, f32::max);
+        assert!(max < 0.5, "grazing view stays faint: {max}");
     }
 }
 

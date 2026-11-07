@@ -184,11 +184,14 @@ pub struct StencilState {
     pub tile: bool,
     /// Overlay opacity in the viewport (display only).
     pub opacity: f32,
+    /// Paint only the base color from the image; the tool's other enabled channels stay untouched.
+    #[serde(default)]
+    pub base_color_only: bool,
 }
 
 impl StencilState {
     pub fn new(image: &str) -> StencilState {
-        StencilState { image: image.to_string(), center: [0.0, 0.0], scale: 0.8, rotation: 0.0, tile: false, opacity: 0.5 }
+        StencilState { image: image.to_string(), center: [0.0, 0.0], scale: 0.8, rotation: 0.0, tile: false, opacity: 0.5, base_color_only: false }
     }
 
     /// Placement for a viewport aspect (width / height): center, half extents in NDC, radians.
