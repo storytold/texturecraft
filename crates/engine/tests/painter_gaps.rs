@@ -411,6 +411,30 @@ fn images_fill_mesh_map_slots() {
 }
 
 #[test]
+fn normal_format_change_rereads_an_imported_normal_map() {
+    use texturecraft_engine::core::BakedMap;
+    let mut s = session();
+    let n = s.import_resource_bytes("n.png", png(2, 2, |_, _| [128, 64, 255, 255])).unwrap();
+    execute(&mut s, "textureSet.meshMap.set", &json!({"map": "normal", "image": n})).unwrap();
+    let green = |s: &Session| s.baked(0).unwrap().sample(BakedMap::Normal, 50, 50, (100, 100)).unwrap()[1];
+    assert!((green(&s) - 64.0 / 255.0).abs() < 1e-3, "read as OpenGL: {}", green(&s));
+    // Switching the project to DirectX after the import reads the same file with green flipped.
+    execute(&mut s, "textureSet.settings", &json!({"normalFormat": "directX"})).unwrap();
+    assert!((green(&s) - (1.0 - 64.0 / 255.0)).abs() < 1e-3, "green not flipped after format change: {}", green(&s));
+    // Setting the same format again changes nothing.
+    execute(&mut s, "textureSet.settings", &json!({"normalFormat": "directX"})).unwrap();
+    assert!((green(&s) - (1.0 - 64.0 / 255.0)).abs() < 1e-3, "{}", green(&s));
+    execute(&mut s, "textureSet.settings", &json!({"normalFormat": "openGl"})).unwrap();
+    assert!((green(&s) - 64.0 / 255.0).abs() < 1e-3, "{}", green(&s));
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert!((green(&s) - (1.0 - 64.0 / 255.0)).abs() < 1e-3, "undo restores the DirectX reading: {}", green(&s));
+    // It survives a save: the reopened project still knows the map came from an image.
+    let mut back = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
+    execute(&mut back, "textureSet.settings", &json!({"normalFormat": "openGl"})).unwrap();
+    assert!((green(&back) - 64.0 / 255.0).abs() < 1e-3, "{}", green(&back));
+}
+
+#[test]
 fn fill_projection_edits_keep_what_they_do_not_change() {
     let mut s = session();
     let layer = id(execute(&mut s, "layer.add.fill", &json!({"color": [0.5, 0.2, 0.1]})).unwrap(), "layer");

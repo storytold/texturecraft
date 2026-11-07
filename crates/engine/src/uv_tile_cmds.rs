@@ -154,7 +154,9 @@ pub(crate) fn relayout(doc: &mut Document, ts: usize, old: &TextureSet, log: &mu
             }
             None => {
                 doc.baked.remove(&ts);
-                doc.project.texture_set_mut(ts)?.baked.clear();
+                let set = doc.project.texture_set_mut(ts)?;
+                set.baked.clear();
+                set.imported_maps.clear();
                 log.push(format!("Texture set \"{}\": the baked mesh maps no longer fit; bake them again", new.name));
             }
         }

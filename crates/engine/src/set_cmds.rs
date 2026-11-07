@@ -1,7 +1,7 @@
 //! Texture set commands (Texture Set List / Texture Set Settings).
 
 use serde_json::{Value, json};
-use texturecraft_core::{Channel, ChannelBlend, ChannelFormat};
+use texturecraft_core::{BakedMap, Channel, ChannelBlend, ChannelFormat};
 
 use std::sync::Arc;
 
@@ -260,8 +260,22 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
     let ts = ts_param(s, p, "textureSet.settings")?;
     let nf = normal_format_param("textureSet.settings", p)?;
     s.edit("Texture set settings", |s| {
-        if let Some(n) = nf {
+        if let Some(n) = nf.filter(|n| *n != s.doc.project.normal_format) {
             s.doc.project.normal_format = n;
+            // An imported normal map was read in the old format: read it in the new one
+            // (the two differ only in the sign of green). Baked normal maps are left alone.
+            for (i, set) in s.doc.project.texture_sets.iter().enumerate() {
+                if let (true, Some(map)) =
+                    (set.imported_maps.contains(&BakedMap::Normal), s.doc.baked.get_mut(&i).and_then(|b| b.maps.get_mut(&BakedMap::Normal)))
+                {
+                    let comps = BakedMap::Normal.components();
+                    for texel in Arc::make_mut(map).chunks_exact_mut(comps) {
+                        if let Some(g) = texel.get_mut(1) {
+                            *g = 1.0 - *g;
+                        }
+                    }
+                }
+            }
         }
         let set = s.doc.project.texture_set_mut(ts)?;
         if let Some(d) = strp(p, "description") {
