@@ -2,8 +2,8 @@
 
 use serde_json::{Value, json};
 use texturecraft_core::{
-    BlendMode, Channel, CompareOp, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, Levels, Mask, MaskBackground, Procedural, ProceduralKind,
-    Project, Source,
+    BlendMode, Channel, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, Levels, Mask, MaskBackground,
+    Procedural, ProceduralKind, Project, Source,
 };
 
 use crate::commands::{CommandSpec, always, bad, blend_param, boolp, channel_param, color_param, f32p, has_layer, layer_param, strp, u64p};
@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add generator",
             ["Layers", "Effects"],
             None,
-            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, level?, softness?, noise?, invert?}",
+            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, level?, softness?, noise?, invert?, mode?: edges|cavities|both|raw, sizes?: [7 weights 0..1, finest first] (curvature and edgeWear)}",
             has_layer,
             add_generator
         ),
@@ -94,7 +94,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit effect",
             [],
             None,
-            "{effect, visible?, blend?, opacity?, name?, level?, softness?, noise?, noiseScale?, invert?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, filter parameters (see effect.add.filter)}",
+            "{effect, visible?, blend?, opacity?, name?, level?, softness?, noise?, noiseScale?, invert?, mode?, sizes?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, filter parameters (see effect.add.filter)}",
             has_layer,
             set
         ),
@@ -314,39 +314,67 @@ fn add_fill(s: &mut Session, p: &Value) -> Result<Value> {
     push_effect(s, p, EffectKind::Fill { source, projection }, blend)
 }
 
-fn generator_from(p: &Value, g: &mut Generator) {
-    if let Some(v) = f32p(p, "level") {
-        g.level = v.clamp(0.0, 1.0);
+/// Apply the generator parameters in `params` to `generator` (`command` names it in errors).
+fn generator_from(command: &str, params: &Value, generator: &mut Generator) -> Result<()> {
+    if let Some(level) = f32p(params, "level") {
+        generator.level = level.clamp(0.0, 1.0);
     }
-    if let Some(v) = f32p(p, "softness") {
-        g.softness = v.clamp(0.0, 1.0);
+    if let Some(softness) = f32p(params, "softness") {
+        generator.softness = softness.clamp(0.0, 1.0);
     }
-    if let Some(v) = f32p(p, "noise") {
-        g.noise_amount = v.clamp(0.0, 2.0);
+    if let Some(noise) = f32p(params, "noise") {
+        generator.noise_amount = noise.clamp(0.0, 2.0);
     }
-    if let Some(v) = f32p(p, "noiseScale") {
-        g.noise_scale = v.clamp(0.01, 1000.0);
+    if let Some(noise_scale) = f32p(params, "noiseScale") {
+        generator.noise_scale = noise_scale.clamp(0.01, 1000.0);
     }
-    if let Some(v) = u64p(p, "seed") {
-        g.seed = v as u32;
+    if let Some(seed) = u64p(params, "seed") {
+        generator.seed = seed as u32;
     }
-    if let Some(v) = boolp(p, "invert") {
-        g.invert = v;
+    if let Some(invert) = boolp(params, "invert") {
+        generator.invert = invert;
     }
-    if let Some(d) = color_param(p, "direction") {
-        g.direction = d;
+    if let Some(direction) = color_param(params, "direction") {
+        generator.direction = direction;
     }
+
+    // A mode or sizes also give a curvature generator saved before detail sizes its detail
+    let mode =
+        strp(params, "mode").map(|name| CurvatureMode::parse(name).ok_or_else(|| bad(command, format!("unknown curvature mode `{name}`")))).transpose()?;
+    let weights = params.get("sizes").map(|value| size_weights(command, value)).transpose()?;
+    if mode.is_none() && weights.is_none() {
+        return Ok(());
+    }
+    if !matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear) {
+        return Err(bad(command, "only curvature and edge wear generators have a mode and detail sizes"));
+    }
+
+    let detail = generator.detail.get_or_insert_with(CurvatureDetail::default);
+    if let Some(mode) = mode {
+        detail.mode = mode;
+    }
+    if let Some(weights) = weights {
+        detail.weights = weights;
+    }
+    Ok(())
 }
 
-fn add_generator(s: &mut Session, p: &Value) -> Result<Value> {
-    let kind = match strp(p, "generator") {
-        Some(k) => GeneratorKind::parse(k).ok_or_else(|| bad("effect.add.generator", format!("unknown generator `{k}`")))?,
+/// The detail size weights in `value`: one number (0..1) per size of [`CurvatureDetail::SIZES`], finest first.
+fn size_weights(command: &str, value: &Value) -> Result<[f32; CurvatureDetail::SIZES.len()]> {
+    let weights: Vec<f32> =
+        value.as_array().map(|items| items.iter().filter_map(Value::as_f64).map(|weight| (weight as f32).clamp(0.0, 1.0)).collect()).unwrap_or_default();
+    weights.try_into().map_err(|_| bad(command, format!("`sizes` takes {} numbers, finest first", CurvatureDetail::SIZES.len())))
+}
+
+fn add_generator(session: &mut Session, params: &Value) -> Result<Value> {
+    let kind = match strp(params, "generator") {
+        Some(name) => GeneratorKind::parse(name).ok_or_else(|| bad("effect.add.generator", format!("unknown generator `{name}`")))?,
         None => GeneratorKind::EdgeWear,
     };
-    let mut g = Generator::new(kind);
-    generator_from(p, &mut g);
-    let blend = blend_param("effect.add.generator", p, "blend")?.unwrap_or(BlendMode::Normal);
-    push_effect(s, p, EffectKind::Generator(g), blend)
+    let mut generator = Generator::new(kind);
+    generator_from("effect.add.generator", params, &mut generator)?;
+    let blend = blend_param("effect.add.generator", params, "blend")?.unwrap_or(BlendMode::Normal);
+    push_effect(session, params, EffectKind::Generator(generator), blend)
 }
 
 pub(crate) fn levels_from(p: &Value, l: &mut Levels) {
@@ -413,55 +441,57 @@ fn histogram(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(if content { json!({"target": "content", "channel": channel.id(), "bins": counts}) } else { json!({"target": "mask", "bins": counts}) })
 }
 
-fn set(s: &mut Session, p: &Value) -> Result<Value> {
-    let eid = effect_id(s, p, "effect.set")?;
-    let blend = blend_param("effect.set", p, "blend")?;
-    // A fill reading an anchor: `anchor` picks the anchor point, `anchorChannel` alone
-    // re-targets the current one.
-    let anchor = match s.doc.project.effect(eid) {
+fn set(session: &mut Session, params: &Value) -> Result<Value> {
+    let target = effect_id(session, params, "effect.set")?;
+    let blend = blend_param("effect.set", params, "blend")?;
+
+    // A fill reading an anchor: `anchor` picks the anchor point, `anchorChannel` alone re-targets the current one
+    let anchor = match session.doc.project.effect(target) {
         Some((owner, Effect { kind: EffectKind::Fill { source, .. }, .. })) => {
             let (current, channel) = match source {
                 Source::Anchor { anchor, channel } => (Some(*anchor), *channel),
                 _ => (None, Channel::Height),
             };
-            let channel_param = channel_param("effect.set", p, "anchorChannel")?;
-            match u64p(p, "anchor").map(LayerId).or(current.filter(|_| channel_param.is_some())) {
-                Some(a) => Some(anchor_source(s, "effect.set", owner, a, channel_param.unwrap_or(channel))?),
+            let channel_param = channel_param("effect.set", params, "anchorChannel")?;
+            match u64p(params, "anchor").map(LayerId).or(current.filter(|_| channel_param.is_some())) {
+                Some(anchor) => Some(anchor_source(session, "effect.set", owner, anchor, channel_param.unwrap_or(channel))?),
                 None => None,
             }
         }
         _ => None,
     };
-    s.edit("Edit effect", |s| {
-        let e = s.doc.project.effect_mut(eid).ok_or_else(|| bad("effect.set", format!("no effect {}", eid.0)))?;
-        if let Some(v) = boolp(p, "visible") {
-            e.visible = v;
+
+    session.edit("Edit effect", |session| {
+        let effect = session.doc.project.effect_mut(target).ok_or_else(|| bad("effect.set", format!("no effect {}", target.0)))?;
+        if let Some(visible) = boolp(params, "visible") {
+            effect.visible = visible;
         }
-        if let Some(b) = blend {
-            e.blend = b;
+        if let Some(blend) = blend {
+            effect.blend = blend;
         }
-        if let Some(o) = f32p(p, "opacity") {
-            e.opacity = o.clamp(0.0, 1.0);
+        if let Some(opacity) = f32p(params, "opacity") {
+            effect.opacity = opacity.clamp(0.0, 1.0);
         }
-        if let Some(n) = name_param(p) {
-            e.name = n.to_string();
+        if let Some(name) = name_param(params) {
+            effect.name = name.to_string();
         }
-        match &mut e.kind {
-            EffectKind::Generator(g) => generator_from(p, g),
-            EffectKind::Levels(l) => levels_from(p, l),
-            EffectKind::Filter(f) => crate::filter_lib::apply(p, f, "effect.set")?,
+
+        match &mut effect.kind {
+            EffectKind::Generator(generator) => generator_from("effect.set", params, generator)?,
+            EffectKind::Levels(levels) => levels_from(params, levels),
+            EffectKind::Filter(filter) => crate::filter_lib::apply(params, filter, "effect.set")?,
             EffectKind::Fill { source, .. } => {
-                if let Some(a) = anchor {
-                    *source = a;
-                } else if let Some(x) = f32p(p, "value")
+                if let Some(anchor) = anchor {
+                    *source = anchor;
+                } else if let Some(value) = f32p(params, "value")
                     && matches!(source, Source::Uniform(_) | Source::Anchor { .. })
                 {
-                    *source = Source::Uniform([x.clamp(0.0, 1.0); 3]);
+                    *source = Source::Uniform([value.clamp(0.0, 1.0); 3]);
                 }
             }
             EffectKind::ColorSelection { tolerance, .. } | EffectKind::Compare { tolerance, .. } => {
-                if let Some(x) = f32p(p, "tolerance") {
-                    *tolerance = x.clamp(0.0, 1.0);
+                if let Some(value) = f32p(params, "tolerance") {
+                    *tolerance = value.clamp(0.0, 1.0);
                 }
             }
             _ => {}

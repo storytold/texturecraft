@@ -1072,4 +1072,13 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Remove resolution override", "Rimuovi risoluzione personalizzata"),
     ("Texture set resolution", "Risoluzione del set di texture"),
     ("UV tile {tile} resolution", "Risoluzione del tile UV {tile}"),
+    ("Edges", "Bordi"),
+    ("Cavities", "Cavità"),
+    ("Edges and cavities", "Bordi e cavità"),
+    ("Raw curvature", "Curvatura grezza"),
+    ("Detail sizes", "Dimensioni del dettaglio"),
+    (
+        "Reads the curvature map as baked: changing the mode or a size turns detail sizes on.",
+        "Legge la mappa di curvatura così come è stata calcolata: cambiare la modalità o una dimensione attiva le dimensioni del dettaglio.",
+    ),
 ];

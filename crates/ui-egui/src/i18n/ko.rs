@@ -1045,4 +1045,13 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Remove resolution override", "해상도 재정의 제거"),
     ("Texture set resolution", "텍스처 세트 해상도"),
     ("UV tile {tile} resolution", "UV 타일 {tile} 해상도"),
+    ("Edges", "가장자리"),
+    ("Cavities", "오목한 부분"),
+    ("Edges and cavities", "가장자리와 오목한 부분"),
+    ("Raw curvature", "원시 곡률"),
+    ("Detail sizes", "디테일 크기"),
+    (
+        "Reads the curvature map as baked: changing the mode or a size turns detail sizes on.",
+        "곡률 맵을 베이크된 그대로 읽습니다. 모드나 크기를 바꾸면 디테일 크기가 켜집니다.",
+    ),
 ];

@@ -5,8 +5,8 @@ use egui::{Color32, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use egui_phosphor::regular as ic;
 use serde_json::{Value, json};
 use texturecraft_engine::core::{
-    BakedMap, BlendMode, Channel, Decal, Effect, EffectKind, Fill, Filter, GeneratorKind, Layer, LayerId, LayerKind, LinkParam, MaterialLink, ProceduralKind,
-    Source,
+    BakedMap, BlendMode, Channel, CurvatureDetail, CurvatureMode, Decal, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, Layer, LayerId, LayerKind,
+    LinkParam, MaterialLink, ProceduralKind, Source,
 };
 use texturecraft_engine::filter_lib::{FILTERS, scalar_params};
 use texturecraft_engine::paint::{BrushAlpha, alphas};
@@ -1850,63 +1850,42 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
 
 fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid: LayerId) {
     let tk = Tokens::get(ui.ctx());
-    let Some((_, e)) = app.session.doc.project.effect(eid).map(|(l, e)| (l, e.clone())) else { return };
+    let Some((_, effect)) = app.session.doc.project.effect(eid).map(|(owner, effect)| (owner, effect.clone())) else { return };
+
     let id = eid.0;
     ui.horizontal(|ui| {
         ui.label(tr("Blending"));
-        egui::ComboBox::from_id_salt("eff_blend").selected_text(tr(e.blend.label())).show_ui(ui, |ui| {
-            for m in BlendMode::all() {
-                if ui.selectable_label(m == e.blend, tr(m.label())).clicked() {
-                    app.run("effect.set", json!({"effect": id, "blend": format!("{m:?}")}));
+        egui::ComboBox::from_id_salt("eff_blend").selected_text(tr(effect.blend.label())).show_ui(ui, |ui| {
+            for mode in BlendMode::all() {
+                if ui.selectable_label(mode == effect.blend, tr(mode.label())).clicked() {
+                    app.run("effect.set", json!({"effect": id, "blend": format!("{mode:?}")}));
                 }
             }
         });
     });
-    let mut op = e.opacity;
-    if let Some(merge) = slider_edit(ui, tr("Opacity"), &mut op, 0.0..=1.0, 2) {
-        app.run("effect.set", json!({"effect": id, "opacity": op, "merge": merge}));
+    let mut opacity = effect.opacity;
+    if let Some(merge) = slider_edit(ui, tr("Opacity"), &mut opacity, 0.0..=1.0, 2) {
+        app.run("effect.set", json!({"effect": id, "opacity": opacity, "merge": merge}));
     }
     ui.separator();
-    match &e.kind {
-        EffectKind::Generator(g) => {
-            ui.label(caption(tr("Generator")));
-            egui::ComboBox::from_id_salt("gen_kind").selected_text(tr(g.kind.label())).show_ui(ui, |ui| {
-                for k in GeneratorKind::ALL {
-                    if ui.selectable_label(k == g.kind, tr(k.label())).clicked() {
-                        // Replace the generator kind: remove and add keeps ordering simple.
-                        app.run("effect.remove", json!({"effect": id}));
-                        app.run("effect.add.generator", json!({"generator": format!("{k:?}")}));
-                    }
-                }
-            });
-            let (mut level, mut soft, mut noise, mut ns) = (g.level, g.softness, g.noise_amount, g.noise_scale);
-            let r1 = slider_edit(ui, tr("Level"), &mut level, 0.0..=1.0, 2);
-            let r2 = slider_edit(ui, tr("Softness"), &mut soft, 0.0..=1.0, 2);
-            let r3 = slider_edit(ui, tr("Noise amount"), &mut noise, 0.0..=2.0, 2);
-            let r4 = slider_edit(ui, tr("Noise scale"), &mut ns, 0.1..=64.0, 1);
-            let mut inv = g.invert;
-            let r5 = ui.checkbox(&mut inv, tr("Invert"));
-            if let Some(merge) = r1.or(r2).or(r3).or(r4).or(r5.changed().then_some(false)) {
-                app.run("effect.set", json!({"effect": id, "level": level, "softness": soft, "noise": noise, "noiseScale": ns, "invert": inv, "merge": merge}));
-            }
-            if !app.session.doc.baked.contains_key(&app.session.ts()) {
-                ui.label(
-                    RichText::new(format!("{} {}", ic::WARNING, tr("Bake mesh maps (F8) for curvature, AO and thickness based generators."))).color(tk.warning),
-                );
-            }
-        }
-        EffectKind::Levels(l) => {
+
+    match &effect.kind {
+        EffectKind::Generator(generator) => generator_properties(app, ui, id, generator),
+        EffectKind::Levels(levels) => {
             ui.label(caption(tr("Levels")));
-            levels_histogram(app, ui, layer, eid, (l.in_low, l.in_high));
-            let mut v = [l.in_low, l.in_high, l.gamma, l.out_low, l.out_high];
+            levels_histogram(app, ui, layer, eid, (levels.in_low, levels.in_high));
+            let mut values = [levels.in_low, levels.in_high, levels.gamma, levels.out_low, levels.out_high];
             let labels = [tr("Input low"), tr("Input high"), tr("Gamma"), tr("Output low"), tr("Output high")];
             let mut edit = None;
-            for (i, label) in labels.iter().enumerate() {
-                let range = if i == 2 { 0.1..=5.0 } else { 0.0..=1.0 };
-                edit = edit.or(slider_edit(ui, label, &mut v[i], range, 2));
+            for (index, label) in labels.iter().enumerate() {
+                let range = if index == 2 { 0.1..=5.0 } else { 0.0..=1.0 };
+                edit = edit.or(slider_edit(ui, label, &mut values[index], range, 2));
             }
             if let Some(merge) = edit {
-                app.run("effect.set", json!({"effect": id, "inLow": v[0], "inHigh": v[1], "gamma": v[2], "outLow": v[3], "outHigh": v[4], "merge": merge}));
+                app.run(
+                    "effect.set",
+                    json!({"effect": id, "inLow": values[0], "inHigh": values[1], "gamma": values[2], "outLow": values[3], "outHigh": values[4], "merge": merge}),
+                );
             }
         }
         EffectKind::Fill { source, .. } => {
@@ -1922,25 +1901,25 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
                 if ui.selectable_label(matches!(source, Source::Uniform(_)), tr("Uniform value")).clicked() {
                     app.run("effect.set", json!({"effect": id, "value": 1.0}));
                 }
-                for (a, label) in &anchors {
-                    if ui.selectable_label(source.anchor() == Some(*a), trf("Anchor: {name}", &[("name", label)])).clicked() {
-                        app.run("effect.set", json!({"effect": id, "anchor": a.0}));
+                for (anchor, label) in &anchors {
+                    if ui.selectable_label(source.anchor() == Some(*anchor), trf("Anchor: {name}", &[("name", label)])).clicked() {
+                        app.run("effect.set", json!({"effect": id, "anchor": anchor.0}));
                     }
                 }
             });
             match source {
-                Source::Uniform(v) => {
-                    let mut x = v[0];
-                    if let Some(merge) = slider_edit(ui, tr("Value"), &mut x, 0.0..=1.0, 2) {
-                        app.run("effect.set", json!({"effect": id, "value": x, "merge": merge}));
+                Source::Uniform(color) => {
+                    let mut value = color[0];
+                    if let Some(merge) = slider_edit(ui, tr("Value"), &mut value, 0.0..=1.0, 2) {
+                        app.run("effect.set", json!({"effect": id, "value": value, "merge": merge}));
                     }
                 }
                 Source::Anchor { channel, .. } => {
-                    let chans = app.session.doc.project.texture_set(app.session.ts()).map(|t| t.channel_list()).unwrap_or_default();
+                    let channels = app.session.doc.project.texture_set(app.session.ts()).map(|set| set.channel_list()).unwrap_or_default();
                     combo(ui, tr("Channel"), tr(channel.label()), |ui| {
-                        for c in chans {
-                            if ui.selectable_label(c == *channel, tr(c.label())).clicked() {
-                                app.run("effect.set", json!({"effect": id, "anchorChannel": c.id()}));
+                        for option in channels {
+                            if ui.selectable_label(option == *channel, tr(option.label())).clicked() {
+                                app.run("effect.set", json!({"effect": id, "anchorChannel": option.id()}));
                             }
                         }
                     });
@@ -1952,10 +1931,10 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
                 ui.label(RichText::new(tr("Add an anchor point to a layer below to use its stack as a mask.")).color(tk.text_dim));
             }
         }
-        EffectKind::Material(f) => {
+        EffectKind::Material(fill) => {
             ui.label(caption(tr("Fill")));
-            let on: Vec<Channel> = f.sources.keys().copied().collect();
-            fill_editor(app, ui, f, &json!({"effect": id}), &on, layer.id);
+            let enabled: Vec<Channel> = fill.sources.keys().copied().collect();
+            fill_editor(app, ui, fill, &json!({"effect": id}), &enabled, layer.id);
         }
         EffectKind::Anchor => {
             ui.label(caption(tr("Anchor point")));
@@ -1965,7 +1944,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
             );
         }
         EffectKind::Paint => {
-            let hint = if layer.content_effects.iter().any(|x| x.id == eid) {
+            let hint = if layer.content_effects.iter().any(|content| content.id == eid) {
                 tr("Paint on the mesh to edit the layer content.")
             } else {
                 tr("Paint on the mesh to edit this mask. Use the Material tab's mask value for gray.")
@@ -1979,27 +1958,99 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
                     .color(tk.text_dim),
             );
             let editing = app.session.tool.path.editing;
-            for i in 0..paths.len() {
+            for index in 0..paths.len() {
                 ui.horizontal(|ui| {
-                    let on = editing == Some((eid, i));
-                    if ui.selectable_label(on, format!("{} {}", tr("Path"), i + 1)).on_hover_text(tr("Edit")).clicked() {
-                        if on {
+                    let selected = editing == Some((eid, index));
+                    if ui.selectable_label(selected, format!("{} {}", tr("Path"), index + 1)).on_hover_text(tr("Edit")).clicked() {
+                        if selected {
                             app.run("tool.path", json!({"clear": true}));
                         } else {
-                            app.run("path.edit", json!({"effect": id, "index": i}));
+                            app.run("path.edit", json!({"effect": id, "index": index}));
                         }
                     }
                     if icon_button(ui, ic::TRASH, tr("Remove"), false, 22.0).clicked() {
-                        app.run("path.remove", json!({"effect": id, "index": i}));
+                        app.run("path.remove", json!({"effect": id, "index": index}));
                     }
                 });
             }
             tool_properties(app, ui);
         }
-        EffectKind::Filter(f) => filter_properties(app, ui, id, f),
+        EffectKind::Filter(filter) => filter_properties(app, ui, id, filter),
         other => {
             ui.label(RichText::new(tr(other.name())).color(tk.text_dim));
         }
+    }
+}
+
+/// The settings of generator effect `id`.
+fn generator_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, generator: &Generator) {
+    let tk = Tokens::get(ui.ctx());
+    ui.label(caption(tr("Generator")));
+    egui::ComboBox::from_id_salt("gen_kind").selected_text(tr(generator.kind.label())).show_ui(ui, |ui| {
+        for kind in GeneratorKind::ALL {
+            if ui.selectable_label(kind == generator.kind, tr(kind.label())).clicked() {
+                // Replace the generator kind: remove and add keeps ordering simple
+                app.run("effect.remove", json!({"effect": id}));
+                app.run("effect.add.generator", json!({"generator": format!("{kind:?}")}));
+            }
+        }
+    });
+
+    let (mut level, mut softness, mut noise, mut noise_scale, mut invert) =
+        (generator.level, generator.softness, generator.noise_amount, generator.noise_scale, generator.invert);
+    let level_edit = slider_edit(ui, tr("Level"), &mut level, 0.0..=1.0, 2);
+    let softness_edit = slider_edit(ui, tr("Softness"), &mut softness, 0.0..=1.0, 2);
+    let noise_edit = slider_edit(ui, tr("Noise amount"), &mut noise, 0.0..=2.0, 2);
+    let noise_scale_edit = slider_edit(ui, tr("Noise scale"), &mut noise_scale, 0.1..=64.0, 1);
+    let invert_edit = ui.checkbox(&mut invert, tr("Invert")).changed().then_some(false);
+    if let Some(merge) = level_edit.or(softness_edit).or(noise_edit).or(noise_scale_edit).or(invert_edit) {
+        app.run(
+            "effect.set",
+            json!({"effect": id, "level": level, "softness": softness, "noise": noise, "noiseScale": noise_scale, "invert": invert, "merge": merge}),
+        );
+    }
+
+    if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear) {
+        curvature_detail_properties(app, ui, id, generator.detail.as_ref());
+    }
+    if !app.session.doc.baked.contains_key(&app.session.ts()) {
+        ui.label(RichText::new(format!("{} {}", ic::WARNING, tr("Bake mesh maps (F8) for curvature, AO and thickness based generators."))).color(tk.warning));
+    }
+}
+
+/// The curvature mode and detail size weights of generator effect `id` (`detail` None: saved before detail sizes).
+fn curvature_detail_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, detail: Option<&CurvatureDetail>) {
+    let tk = Tokens::get(ui.ctx());
+    let shown = detail.cloned().unwrap_or_default();
+    combo(ui, tr("Mode"), curvature_mode_label(shown.mode), |ui| {
+        for mode in CurvatureMode::ALL {
+            if ui.selectable_label(mode == shown.mode, curvature_mode_label(mode)).clicked() {
+                app.run("effect.set", json!({"effect": id, "mode": format!("{mode:?}")}));
+            }
+        }
+    });
+
+    ui.label(caption(tr("Detail sizes")));
+    let mut weights = shown.weights;
+    let mut edit = None;
+    for (weight, size) in weights.iter_mut().zip(CurvatureDetail::SIZES) {
+        edit = edit.or(slider_edit(ui, &format!("{size} px"), weight, 0.0..=1.0, 2));
+    }
+    if let Some(merge) = edit {
+        app.run("effect.set", json!({"effect": id, "sizes": weights, "merge": merge}));
+    }
+    if detail.is_none() {
+        ui.label(RichText::new(tr("Reads the curvature map as baked: changing the mode or a size turns detail sizes on.")).color(tk.text_dim));
+    }
+}
+
+/// The translated name of curvature mode `mode`.
+fn curvature_mode_label(mode: CurvatureMode) -> &'static str {
+    match mode {
+        CurvatureMode::Edges => tr("Edges"),
+        CurvatureMode::Cavities => tr("Cavities"),
+        CurvatureMode::Both => tr("Edges and cavities"),
+        CurvatureMode::Raw => tr("Raw curvature"),
     }
 }
 

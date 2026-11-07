@@ -1003,4 +1003,10 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Remove resolution override", "移除分辨率覆盖"),
     ("Texture set resolution", "纹理集分辨率"),
     ("UV tile {tile} resolution", "UV 图块 {tile} 的分辨率"),
+    ("Edges", "边缘"),
+    ("Cavities", "凹陷"),
+    ("Edges and cavities", "边缘和凹陷"),
+    ("Raw curvature", "原始曲率"),
+    ("Detail sizes", "细节尺寸"),
+    ("Reads the curvature map as baked: changing the mode or a size turns detail sizes on.", "按烘焙原样读取曲率贴图：更改模式或尺寸会启用细节尺寸。"),
 ];
