@@ -128,6 +128,50 @@ fn panic_hunt() {
     }
 }
 
+/// A command that panics halfway through an edit leaves the document and history as they were.
+#[test]
+fn a_panic_inside_an_edit_restores_the_document() {
+    let mut s = session();
+    let project = s.doc.project.clone();
+    let history = s.history_labels();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = s.edit("Half done", |s| -> texturecraft_engine::Result<()> {
+            s.doc.project.name = "changed".into();
+            panic!("boom");
+        });
+    }));
+    assert!(r.is_err(), "the panic still reaches the caller");
+    assert_eq!(s.doc.project, project, "the half-made change was rolled back");
+    assert_eq!(s.history_labels(), history, "no undo step was recorded");
+}
+
+/// A command that fails leaves the project as it was (AGENTS rule 5: commands are atomic).
+#[test]
+fn failed_commands_leave_the_project_unchanged() {
+    let hostile = [
+        Value::Null,
+        json!({}),
+        json!({"layer": u64::MAX, "ts": 99, "channel": "nope", "mode": "???", "opacity": f64::MAX}),
+        json!({"layer": 1, "index": -5, "delta": i64::MIN, "above": "x", "points": [[f64::MAX, -1e300]], "size": -1e30}),
+        json!({"resolution": 0, "maps": ["x"], "rays": u64::MAX, "antialiasing": 3, "color": [1], "value": "nan"}),
+        json!({"effect": 0, "x": 1e30, "y": -1e30, "viewport": [0, 0], "mesh": "../../etc", "material": ""}),
+    ];
+    let mut offenders = Vec::new();
+    for spec in command_specs() {
+        if spec.id == "project.sample" {
+            continue; // slow (bakes); covered elsewhere
+        }
+        for p in &hostile {
+            let mut s = session();
+            let before = s.doc.project.clone();
+            if execute(&mut s, spec.id, p).is_err() && s.doc.project != before {
+                offenders.push(format!("{} {p}", spec.id));
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "failed commands changed the project:\n{}", offenders.join("\n"));
+}
+
 #[test]
 fn copy_paste_flatten_and_resize_keep_the_look() {
     let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 256).unwrap();
