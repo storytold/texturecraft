@@ -118,7 +118,7 @@ impl Panel {
 }
 
 /// The window width the default workspace's ratios are drawn for.
-const DEFAULT_WINDOW_WIDTH: f32 = 1600.0;
+pub(crate) const DEFAULT_WINDOW_WIDTH: f32 = 1600.0;
 
 /// The saved panel arrangement: craft-ui's workspace over TextureCraft's panels.
 pub type Workspace = craft_ui::docking::Workspace<Panel>;
