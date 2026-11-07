@@ -145,7 +145,7 @@ fn scrolling_with_a_stationary_pointer_defers_the_big_preview() {
 
 #[test]
 fn high_dpi_smart_mask_hover_stays_within_the_renderer_limit() {
-    use texturecraft_engine::mask_preview::MAX_PREVIEW_SIZE_PX;
+    use texturecraft_engine::orb_preview::MAX_PREVIEW_SIZE_PX;
     use texturecraft_engine::smart_masks::SMART_MASKS;
 
     let (mut harness, _) = materials_shelf(1.0 / 4.0, 3.0);

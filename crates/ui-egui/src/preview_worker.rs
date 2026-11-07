@@ -2,7 +2,7 @@
 //! Web requests render synchronously on the UI thread
 
 #[cfg(target_arch = "wasm32")]
-use crate::mask_shape::MaskShape;
+use crate::orb_shape::OrbShape;
 use crate::preview_request::PreviewRequest;
 
 /// Request key and rendered image; None on failure
@@ -18,7 +18,7 @@ pub enum PreviewWorker {
     Running { requests: std::sync::mpsc::Sender<PreviewRequest>, results: std::sync::mpsc::Receiver<PreviewResult> },
     /// The web: requests render as they are made
     #[cfg(target_arch = "wasm32")]
-    Inline { shape: MaskShape, results: Vec<PreviewResult> },
+    Inline { shape: OrbShape, results: Vec<PreviewResult> },
     /// The worker could not start or stopped; requests are refused
     // The web has no thread to stop
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -89,7 +89,7 @@ impl PreviewWorker {
         use std::collections::VecDeque;
         use std::sync::mpsc::channel;
 
-        use crate::mask_shape::MaskShape;
+        use crate::orb_shape::OrbShape;
 
         let (requests, request_rx) = channel::<PreviewRequest>();
         let (result_tx, results) = channel();
@@ -101,7 +101,7 @@ impl PreviewWorker {
             if let Err(e) = &pool {
                 log::warn!("shelf previews share the global thread pool: {e}");
             }
-            let mut shape = MaskShape::default();
+            let mut shape = OrbShape::default();
             let mut queue = VecDeque::new();
             loop {
                 if queue.is_empty() {
@@ -136,7 +136,7 @@ impl PreviewWorker {
     /// Render inline (no threads on the web)
     #[cfg(target_arch = "wasm32")]
     fn start(_ctx: &egui::Context) -> PreviewWorker {
-        PreviewWorker::Inline { shape: MaskShape::default(), results: Vec::new() }
+        PreviewWorker::Inline { shape: OrbShape::default(), results: Vec::new() }
     }
 }
 
@@ -170,23 +170,26 @@ mod tests {
             ("unknown material", ShelfPreview::Material("nope")),
             ("mask", ShelfPreview::SmartMask(SMART_MASKS[0].id)),
             ("unknown mask", ShelfPreview::SmartMask("nope")),
+            ("smart material", ShelfPreview::SmartMaterial("steel_painted_worn")),
+            ("unknown smart material", ShelfPreview::SmartMaterial("nope")),
         ];
+        let requests_sent = requests.len();
         for (key, preview) in requests {
             assert!(worker.request(&ctx, PreviewRequest { key: key.into(), preview, size_px, hover: false }), "{key}");
         }
 
         let mut answers = HashMap::new();
         let start = Instant::now();
-        while answers.len() < 4 && start.elapsed() < Duration::from_secs(120) {
+        while answers.len() < requests_sent && start.elapsed() < Duration::from_secs(120) {
             answers.extend(worker.poll());
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        for key in ["material", "mask"] {
+        for key in ["material", "mask", "smart material"] {
             let image = answers.get(key).and_then(Option::as_ref).unwrap_or_else(|| panic!("{key}: {answers:?}"));
             assert_eq!(image.size, [size_px, size_px], "{key}");
         }
-        for key in ["unknown material", "unknown mask"] {
+        for key in ["unknown material", "unknown mask", "unknown smart material"] {
             assert!(matches!(answers.get(key), Some(None)), "{key}: {answers:?}");
         }
         assert!(!worker.is_stopped());
