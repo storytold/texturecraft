@@ -86,10 +86,10 @@ impl Session {
     }
 
     /// What limits a paint stroke on `ts`: the mask and whether it is inverted (None when the
-    /// quick mask is off or being edited).
+    /// quick mask is off or being edited, and for paths, which repaint from what they store).
     pub(crate) fn stroke_limit(&self, ts: usize, size: (u32, u32)) -> Option<(TileImage, bool)> {
         let q = &self.quick_mask;
-        (q.enabled && !q.editing).then(|| (self.quick_mask_image(ts, size), q.inverted))
+        (q.enabled && !q.editing && !self.painting_paths).then(|| (self.quick_mask_image(ts, size), q.inverted))
     }
 
     /// Commit a stroke into the quick mask of `ts`.

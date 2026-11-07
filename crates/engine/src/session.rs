@@ -345,8 +345,10 @@ pub struct Session {
     pub quick_mask: crate::quick_mask::QuickMask,
     /// A path sublayer is being repainted from its paths (the only way to paint into one).
     pub(crate) painting_paths: bool,
-    /// Pixels of the paths below the one being edited, so live edits skip repainting them.
+    /// A path sublayer as last painted, so a repaint skips the paths an edit didn't reach.
     pub(crate) path_cache: Option<crate::path_tool::PathCache>,
+    /// Tiles painted since `render_paths` cleared it (the footprint of one path).
+    pub(crate) path_tiles: std::collections::BTreeSet<(u32, u32)>,
     pub path: Option<String>,
     pub modified: bool,
     /// Bumps on every document change.
@@ -400,6 +402,7 @@ impl Session {
             quick_mask: Default::default(),
             painting_paths: false,
             path_cache: None,
+            path_tiles: Default::default(),
             path: None,
             modified: false,
             revision: 1,

@@ -151,6 +151,8 @@ impl Session {
         let ts = self.ts();
         let size = self.caches.get(ts).map(|c| c.size).unwrap_or((1024, 1024));
         let pickup = if quick_mask { None } else { self.pickup_mode(first_uv)? };
+        // PathCache reuses a path's tiles only if painting one tile reads no other.
+        debug_assert!(!(self.painting_paths && pickup.is_some()), "path repaints never pick up");
         if pickup.is_some() {
             // Clone and smudge read the composite: bring it up to date first.
             self.update();
@@ -412,6 +414,9 @@ impl Session {
             self.doc = st.before;
             return Ok(());
         }
+        if self.painting_paths {
+            self.path_tiles.extend(st.canvas.dirty.iter().copied());
+        }
         let gbuf = self.caches.get(st.ts).map(|c| c.gbuf.clone());
         let mesh = self.mesh.clone();
         let mut staging = std::mem::take(&mut st.staging);
@@ -512,6 +517,9 @@ impl Session {
     pub(crate) fn commit_fill(&mut self, label: &str, ts: usize, canvas: &StrokeCanvas) -> Result<()> {
         let size = (canvas.alpha.width(), canvas.alpha.height());
         let src = |opacity| CommitSource { alpha: &canvas.alpha, tiles: &canvas.dirty, opacity, erase: false, per_texel: None, carried: None };
+        if self.painting_paths {
+            self.path_tiles.extend(canvas.dirty.iter().copied());
+        }
         if self.quick_mask.editing {
             self.commit_quick_mask(ts, size, src(self.tool.brush.opacity));
             return Ok(());
