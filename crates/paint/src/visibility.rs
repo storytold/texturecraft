@@ -2,10 +2,25 @@
 //! rendered once at the start of a stroke.
 
 use rayon::prelude::*;
-use texturecraft_geom::glam::{Mat4, Vec3, Vec4};
-use texturecraft_geom::{Mesh, OrbitCamera};
+use texturecraft_geom::glam::{Mat4, Vec2, Vec3};
+use texturecraft_geom::{Mesh, NO_TRI, OrbitCamera};
 
 const BAND: usize = 16;
+
+/// Largest buffer side in pixels.
+const MAX_SIZE: u32 = 4096;
+
+/// Clip-space w below which a vertex counts as behind the camera.
+pub const MIN_CLIP_W: f32 = 1e-5;
+
+/// Screen area (pixels squared) below which a triangle is skipped as degenerate.
+const MIN_SCREEN_AREA: f32 = 1e-9;
+
+/// How far outside a triangle (in barycentric weight) a pixel center may lie and still count, closing seams between neighbours.
+const EDGE_TOLERANCE: f32 = 1e-4;
+
+/// [`EyeDepth::bias`] as a fraction of the scene radius.
+const BIAS_PER_RADIUS: f32 = 0.004;
 
 /// Distance from the eye to the nearest surface per screen pixel (f32::MAX where empty).
 #[derive(Clone, Debug)]
@@ -15,73 +30,109 @@ pub struct EyeDepth {
     pub view_proj: Mat4,
     pub eye: Vec3,
     pub dist: Vec<f32>,
+    /// The nearest triangle per screen pixel ([`NO_TRI`] where empty); empty unless rendered with [`EyeDepth::render_with_triangles`].
+    pub triangle: Vec<u32>,
     /// Tolerance in world units (≈ 0.4% of the scene radius).
     pub bias: f32,
 }
 
+/// Where `position` lands in a `size` pixel view through `view_proj` (origin top-left), or None behind the camera.
+pub fn screen_point(view_proj: Mat4, position: Vec3, size: Vec2) -> Option<Vec2> {
+    let clip = view_proj * position.extend(1.0);
+    (clip.w > MIN_CLIP_W).then(|| Vec2::new(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5) * size)
+}
+
 impl EyeDepth {
-    /// Rasterize `mesh` seen by `camera` into a `width × height` buffer (sizes capped at 4096).
+    /// Rasterize `mesh` seen by `camera` into a `width × height` buffer (sizes capped at [`MAX_SIZE`]), without [`EyeDepth::triangle`].
     pub fn render(mesh: &Mesh, camera: &OrbitCamera, width: u32, height: u32) -> EyeDepth {
-        let (w, h) = (width.clamp(1, 4096), height.clamp(1, 4096));
-        let aspect = w as f32 / h as f32;
-        let vp = camera.view_proj(aspect);
+        Self::rasterize(mesh, camera, width, height, false)
+    }
+
+    /// [`EyeDepth::render`] that also records the nearest triangle per pixel in [`EyeDepth::triangle`].
+    pub fn render_with_triangles(mesh: &Mesh, camera: &OrbitCamera, width: u32, height: u32) -> EyeDepth {
+        Self::rasterize(mesh, camera, width, height, true)
+    }
+
+    /// The eye-distance buffer, plus the nearest triangle per pixel when `record_triangles` is set.
+    fn rasterize(mesh: &Mesh, camera: &OrbitCamera, width: u32, height: u32, record_triangles: bool) -> EyeDepth {
+        let (width, height) = (width.clamp(1, MAX_SIZE), height.clamp(1, MAX_SIZE));
+        let size = Vec2::new(width as f32, height as f32);
+        let view_proj = camera.view_proj(size.x / size.y);
         let eye = camera.eye();
-        // Project every vertex once.
-        let clip: Vec<Vec4> = mesh.positions.iter().map(|p| vp * p.extend(1.0)).collect();
-        let screen: Vec<Option<(f32, f32)>> =
-            clip.iter().map(|c| (c.w > 1e-5).then(|| ((c.x / c.w * 0.5 + 0.5) * w as f32, (0.5 - c.y / c.w * 0.5) * h as f32))).collect();
-        let dist_v: Vec<f32> = mesh.positions.iter().map(|p| p.distance(eye)).collect();
-        let bands = (h as usize).div_ceil(BAND);
-        let mut bins: Vec<Vec<u32>> = vec![Vec::new(); bands];
-        for t in 0..mesh.triangle_count() {
-            let Some([a, b, c]) = mesh.tri(t) else { continue };
-            let (Some(Some(pa)), Some(Some(pb)), Some(Some(pc))) = (screen.get(a), screen.get(b), screen.get(c)) else { continue };
-            let y0 = pa.1.min(pb.1).min(pc.1).floor().max(0.0);
-            let y1 = pa.1.max(pb.1).max(pc.1).ceil().min(h as f32);
-            if y1 <= y0 || !y0.is_finite() || !y1.is_finite() {
+
+        // Project every vertex once
+        let screen: Vec<Option<Vec2>> = mesh.positions.iter().map(|position| screen_point(view_proj, *position, size)).collect();
+        let vertex_distance: Vec<f32> = mesh.positions.iter().map(|position| position.distance(eye)).collect();
+
+        // Bin each triangle into the bands of rows it covers
+        let mut bands: Vec<Vec<u32>> = vec![Vec::new(); (height as usize).div_ceil(BAND)];
+        for triangle in 0..mesh.triangle_count() {
+            let Some([first, second, third]) = mesh.tri(triangle) else { continue };
+            let (Some(Some(first)), Some(Some(second)), Some(Some(third))) = (screen.get(first), screen.get(second), screen.get(third)) else { continue };
+
+            let top = first.y.min(second.y).min(third.y).floor().max(0.0);
+            let bottom = first.y.max(second.y).max(third.y).ceil().min(size.y);
+            if bottom <= top || !top.is_finite() || !bottom.is_finite() {
                 continue;
             }
-            let (b0, b1) = (y0 as usize / BAND, ((y1 as usize).saturating_sub(1)) / BAND);
-            for bin in bins.iter_mut().take(b1 + 1).skip(b0) {
-                bin.push(t as u32);
+            let (first_band, last_band) = (top as usize / BAND, (bottom as usize).saturating_sub(1) / BAND);
+            for band in bands.iter_mut().take(last_band + 1).skip(first_band) {
+                band.push(triangle as u32);
             }
         }
-        let mut dist = vec![f32::MAX; (w * h) as usize];
-        dist.par_chunks_mut(BAND * w as usize).enumerate().for_each(|(bi, rows)| {
-            let row0 = bi * BAND;
-            let nrows = rows.len() / w as usize;
-            for &t in bins.get(bi).map(Vec::as_slice).unwrap_or(&[]) {
-                let Some([a, b, c]) = mesh.tri(t as usize) else { continue };
-                let (Some(Some(pa)), Some(Some(pb)), Some(Some(pc))) = (screen.get(a), screen.get(b), screen.get(c)) else { continue };
-                let (da, db, dc) = (dist_v[a], dist_v[b], dist_v[c]);
-                let area = (pb.0 - pa.0) * (pc.1 - pa.1) - (pb.1 - pa.1) * (pc.0 - pa.0);
-                if area.abs() < 1e-9 {
+
+        let mut dist = vec![f32::MAX; (width * height) as usize];
+        let mut triangle = if record_triangles { vec![NO_TRI; (width * height) as usize] } else { Vec::new() };
+        let band_len = BAND * width as usize;
+        let mut triangle_bands: Vec<Option<&mut [u32]>> = triangle.chunks_mut(band_len).map(Some).collect();
+        triangle_bands.resize_with(dist.len().div_ceil(band_len), || None);
+        dist.par_chunks_mut(band_len).zip(triangle_bands.into_par_iter()).enumerate().for_each(|(band, (band_dist, mut band_triangles))| {
+            let first_row = band * BAND;
+            let row_count = band_dist.len() / width as usize;
+            for &candidate in bands.get(band).map(Vec::as_slice).unwrap_or(&[]) {
+                let Some(corners) = mesh.tri(candidate as usize) else { continue };
+                let [first, second, third] = corners;
+                let (Some(Some(first_point)), Some(Some(second_point)), Some(Some(third_point))) = (screen.get(first), screen.get(second), screen.get(third))
+                else {
+                    continue;
+                };
+
+                let corner_distance = corners.map(|vertex| vertex_distance.get(vertex).copied().unwrap_or(f32::MAX));
+                let area = (*second_point - *first_point).perp_dot(*third_point - *first_point);
+                if area.abs() < MIN_SCREEN_AREA {
                     continue;
                 }
-                let x0 = pa.0.min(pb.0).min(pc.0).floor().max(0.0) as usize;
-                let x1 = (pa.0.max(pb.0).max(pc.0).ceil().min(w as f32)) as usize;
-                let y0 = (pa.1.min(pb.1).min(pc.1).floor().max(row0 as f32)) as usize;
-                let y1 = (pa.1.max(pb.1).max(pc.1).ceil().min((row0 + nrows) as f32)) as usize;
-                for y in y0.max(row0)..y1 {
-                    for x in x0..x1.min(w as usize) {
-                        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                        let w0 = ((pb.0 - px) * (pc.1 - py) - (pb.1 - py) * (pc.0 - px)) / area;
-                        let w1 = ((pc.0 - px) * (pa.1 - py) - (pc.1 - py) * (pa.0 - px)) / area;
-                        let w2 = 1.0 - w0 - w1;
-                        if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
+
+                let low = first_point.min(*second_point).min(*third_point).floor();
+                let high = first_point.max(*second_point).max(*third_point).ceil();
+                let (left, right) = (low.x.max(0.0) as usize, (high.x.min(size.x) as usize).min(width as usize));
+                let (top, bottom) = (low.y.max(first_row as f32) as usize, high.y.min((first_row + row_count) as f32) as usize);
+                for row in top.max(first_row)..bottom {
+                    for column in left..right {
+                        let sample = Vec2::new(column as f32 + 0.5, row as f32 + 0.5);
+                        let first_weight = (*third_point - *second_point).perp_dot(sample - *second_point) / area;
+                        let second_weight = (*first_point - *third_point).perp_dot(sample - *third_point) / area;
+                        let third_weight = 1.0 - first_weight - second_weight;
+                        if first_weight < -EDGE_TOLERANCE || second_weight < -EDGE_TOLERANCE || third_weight < -EDGE_TOLERANCE {
                             continue;
                         }
-                        let d = w0 * da + w1 * db + w2 * dc;
-                        if let Some(slot) = rows.get_mut((y - row0) * w as usize + x)
-                            && d < *slot
+
+                        let distance = first_weight * corner_distance[0] + second_weight * corner_distance[1] + third_weight * corner_distance[2];
+                        let at = (row - first_row) * width as usize + column;
+                        if let Some(slot) = band_dist.get_mut(at)
+                            && distance < *slot
                         {
-                            *slot = d;
+                            *slot = distance;
+                            if let Some(nearest) = band_triangles.as_deref_mut().and_then(|triangles| triangles.get_mut(at)) {
+                                *nearest = candidate;
+                            }
                         }
                     }
                 }
             }
         });
-        EyeDepth { width: w, height: h, view_proj: vp, eye, dist, bias: mesh.radius() * 0.004 }
+
+        EyeDepth { width, height, view_proj, eye, dist, triangle, bias: mesh.radius() * BIAS_PER_RADIUS }
     }
 
     /// Whether world point `p` is visible (not hidden behind other geometry, inside the view).

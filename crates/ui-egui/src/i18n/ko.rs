@@ -1045,4 +1045,27 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Remove resolution override", "해상도 재정의 제거"),
     ("Texture set resolution", "텍스처 세트 해상도"),
     ("UV tile {tile} resolution", "UV 타일 {tile} 해상도"),
+    (
+        "A click fills what is under it; a dragged rectangle fills what it selects as it grows",
+        "클릭하면 아래에 있는 것을 채우고, 드래그한 사각형은 커지면서 선택한 것을 채웁니다",
+    ),
+    ("Contained center: fill polygons whose center is in the rectangle", "중심 포함: 중심이 사각형 안에 있는 폴리곤을 채웁니다"),
+    (
+        "Editing the quick mask: fills paint where painting is allowed. Press U to finish.",
+        "퀵 마스크 편집 중: 채우기로 페인팅을 허용할 영역을 칠합니다. U를 눌러 완료하세요.",
+    ),
+    ("Fill mode", "채우기 모드"),
+    ("Fill only polygons the camera sees (3D view)", "카메라에 보이는 폴리곤만 채웁니다 (3D 뷰)"),
+    ("Hit-test", "히트 테스트"),
+    ("How a rectangle selects polygons", "사각형이 폴리곤을 선택하는 방식"),
+    ("Intersection: fill polygons the rectangle touches", "교차: 사각형에 닿는 폴리곤을 채웁니다"),
+    ("Rectangle fill", "사각형 채우기"),
+    ("Select a paint layer or a layer's mask to fill", "채울 페인트 레이어나 레이어 마스크를 선택하세요"),
+    ("Selection mode", "선택 모드"),
+    (
+        "Triangle fills single triangles, Polygon whole quads and n-gons, Mesh the connected geometry, UV island the UV islands",
+        "삼각형은 개별 삼각형, 폴리곤은 사각형과 N각형 전체, 메시는 연결된 지오메트리, UV 아일랜드는 UV 아일랜드를 채웁니다",
+    ),
+    ("Visible polygons only", "보이는 폴리곤만"),
+    ("\"{layer}\" can't be filled: select a paint layer or a layer's mask", "\"{layer}\"은(는) 채울 수 없습니다: 페인트 레이어나 레이어 마스크를 선택하세요"),
 ];

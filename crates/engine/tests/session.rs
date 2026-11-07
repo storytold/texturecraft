@@ -105,6 +105,29 @@ fn polygon_fill_and_color_picker() {
     assert!((r["roughness"][0].as_f64().unwrap() - 0.9).abs() < 0.01, "{r}");
 }
 
+#[test]
+fn polygon_fill_boxes_survive_hostile_params() {
+    let hostile = [
+        json!({"x0": 1e30, "y0": -1e30, "x1": f64::MAX, "y1": 0, "viewport": [1e9, 1e9]}),
+        json!({"x0": 0, "y0": 0, "x1": 0, "y1": 0, "viewport": [16, 16]}),
+        json!({"uv0": [1e30, -1e30], "uv1": [0, 0]}),
+        json!({"uv0": [0.5], "uv1": "x", "uv": [f64::MIN, 2]}),
+        json!({"hitTest": "nope", "visibleOnly": "yes", "mode": 7}),
+    ];
+    for visible_only in [true, false] {
+        for hit_test in ["intersection", "containedCenter"] {
+            let mut session = session();
+            execute(&mut session, "tool.polygonFill", &Value::Null).unwrap();
+            execute(&mut session, "tool.fillSelection", &json!({"hitTest": hit_test, "visibleOnly": visible_only})).unwrap();
+            for params in &hostile {
+                let _ = execute(&mut session, "tool.click", params);
+                let _ = execute(&mut session, "tool.fillSelection", params);
+                session.update();
+            }
+        }
+    }
+}
+
 /// Every command must return Ok or Err — never panic — for hostile params.
 #[test]
 fn panic_hunt() {
