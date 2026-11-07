@@ -58,6 +58,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         _ => None,
     };
     let mut sync = PendingSync(Some(aux));
+    crate::id_color_pick::IdColorPick::end_when_stale(app);
     let full = ui.available_rect_before_wrap();
     path_keys(app, ui);
 
@@ -516,8 +517,20 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             app.placing_decal = None;
         }
     }
+    let picking_id_color = app.picking_id_color.is_some();
+    if picking_id_color {
+        crate::id_color_pick::IdColorPick::draw_cursor(ui, rect);
+        if !alt
+            && resp.clicked_by(PointerButton::Primary)
+            && let Some(position) = resp.interact_pointer_pos()
+        {
+            let (pixel, viewport) = (local(position), app.session.viewport);
+            crate::id_color_pick::IdColorPick::pick_at(app, json!({"x": pixel.x, "y": pixel.y, "viewport": [viewport.x, viewport.y]}));
+        }
+    }
     // The selected decal's frame and handles: drag to move, scale or turn it.
-    let decal_drag = !alt && !s_held && !v_held && !focus_pick && placing.is_none() && touch.is_none() && decal_input(app, ui, &resp, rect);
+    let decal_drag =
+        !alt && !s_held && !v_held && !focus_pick && placing.is_none() && !picking_id_color && touch.is_none() && decal_input(app, ui, &resp, rect);
     // Painting.
     let painting = app.ui.mode == crate::state::Mode::Painting
         && !alt
@@ -526,6 +539,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !v_held
         && !focus_pick
         && placing.is_none()
+        && !picking_id_color
         && touch.is_none()
         && !decal_drag;
     let path_tool = app.session.tool.tool == Tool::Path;
@@ -585,6 +599,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !navigating
         && resp.hovered()
         && brush_tool(app.session.tool.tool)
+        && app.picking_id_color.is_none()
         // While a Ctrl+drag changes the brush, its cursor stays where the drag began.
         && let Some(hp) = if adjusting { ui.input(|i| i.pointer.press_origin()) } else { resp.hover_pos() }
         && let Some(hit) = app.session.pick(local(hp), app.session.viewport)
@@ -1149,7 +1164,18 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     if bake_paint_on {
         bake_paint_input(app, ui, &resp, &to_uv);
     }
-    let painting = app.ui.mode == crate::state::Mode::Painting && !alt && !adjusting && !v_held;
+    let picking_id_color = app.picking_id_color.is_some();
+    if picking_id_color {
+        crate::id_color_pick::IdColorPick::draw_cursor(ui, rect);
+        if !alt
+            && resp.clicked_by(PointerButton::Primary)
+            && let Some(position) = resp.interact_pointer_pos()
+        {
+            let uv = to_uv(position);
+            crate::id_color_pick::IdColorPick::pick_at(app, json!({"uv": [uv.x, uv.y]}));
+        }
+    }
+    let painting = app.ui.mode == crate::state::Mode::Painting && !alt && !adjusting && !v_held && !picking_id_color;
     if painting && path_tool {
         path_input(app, ui, &resp, true, |_, p| Some(to_uv(p).extend(0.0)), show);
     } else if painting {

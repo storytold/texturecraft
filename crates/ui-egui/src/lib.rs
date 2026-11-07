@@ -8,6 +8,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod bake_mode;
+mod color_selection_editor;
 pub mod control;
 pub mod dock;
 pub mod docking;
@@ -15,6 +16,7 @@ pub mod export_templates;
 pub mod fonts;
 pub mod gpu;
 pub mod i18n;
+pub mod id_color_pick;
 pub mod keymap;
 mod mask_preview_image;
 mod mask_shape;
@@ -111,6 +113,8 @@ pub struct TextureCraftApp {
     pub last_paint_point: Option<texturecraft_engine::geom::glam::Vec2>,
     /// The decal layer the next click in the 3D view places.
     pub placing_decal: Option<texturecraft_engine::core::LayerId>,
+    /// The color selection the next click in the 3D or 2D view picks an ID color for.
+    pub picking_id_color: Option<id_color_pick::IdColorPick>,
     /// The wgpu state (screenshots read the renderer's targets).
     pub render_state: Option<eframe::egui_wgpu::RenderState>,
     /// CJK fallback fonts for the UI language.
@@ -164,6 +168,7 @@ impl TextureCraftApp {
             render: render_mode::RenderView::default(),
             last_paint_point: None,
             placing_decal: None,
+            picking_id_color: None,
             render_state: cc.wgpu_render_state.clone(),
             fonts: fonts::UiFonts::default(),
             banner: None,
