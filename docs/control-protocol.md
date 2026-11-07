@@ -170,7 +170,7 @@ takes a font family, not a path: it reads only the system's font folders.
 | `mesh_reimport` | `{path?, preserveStrokes?}` | Reimport the mesh from a file, or (no path) from the project's own copy; bridge mode supports only the latter |
 | `mesh_export` | `{path, format?}` | The mesh as obj, glb, usda, usdc or usdz below the write root (obj: its .mtl and textures, usda / usdc: textures next to it) → `{path, textures?}` |
 | `bake_mesh_add` | `{path, cage?}` | Add a high-definition mesh for baking, or set the cage → `{name, meshes}` |
-| `resource_import` | `{path}` | Image resource (png, jpg, tga, tif, bmp, webp, exr, hdr) → its name, for `layer.add.image` / `tool.stencil`, or as a mesh map instead of baking it: `textureSet.meshMap.set {ts?, map, image}` (`textureSet.meshMap.clear {ts?, map}` empties the slot) |
+| `resource_import` | `{path}` | Image resource (png, jpg, tga, tif, bmp, webp, exr, hdr) → its name, for `layer.add.image` / `tool.stencil`, or as a mesh map instead of baking it: `textureSet.meshMap.set {ts?, map, image}` (`textureSet.meshMap.clear {ts?, map}` empties the slot); many baked map files at once, matched to sets and maps by file name: `textureSet.meshMap.import {files: [{path, map?}]}` |
 | `material_save` | `{path, layer?, name?}` | A layer or folder as a `.tcmat` smart material below the write root |
 | `material_load` | `{path}` | Add a `.tcmat` smart material, a MaterialCraft `.mcmat` material or a `.mcraft` package above the selection |
 | `textures_export` | `{dir, preset?, ts?, format?, padding?, size?}` | Writes files below the write root |
