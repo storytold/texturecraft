@@ -338,14 +338,28 @@ pub struct UiState {
 }
 
 impl UiState {
-    /// Replace an outdated or unreadable saved bake dock by the bake layout, then give the mode its dock
+    /// Replace an outdated or unreadable saved dock by its default layout, then give the mode its dock
     pub(crate) fn sync_mode_dock(&mut self) {
         self.reset_outdated_bake_dock();
+        self.reset_unreadable_painting_dock();
 
         let baking = self.mode == Mode::Baking;
         if baking != self.dock_is_baking {
             std::mem::swap(&mut self.dock, &mut self.inactive_mode_dock);
             self.dock_is_baking = baking;
+        }
+    }
+
+    /// Replace an unreadable saved painting dock by the painting default, mirrored if in right-to-left
+    fn reset_unreadable_painting_dock(&mut self) {
+        let painting_dock = if self.dock_is_baking { &mut self.inactive_mode_dock } else { &mut self.dock };
+        if !painting_dock.replaced_unreadable() {
+            return;
+        }
+
+        *painting_dock = Dock::default();
+        if self.docks_rtl {
+            painting_dock.mirror(crate::docking::DEFAULT_WINDOW_WIDTH);
         }
     }
 
@@ -357,11 +371,17 @@ impl UiState {
         }
 
         *bake_dock = Dock::for_baking();
+        // The default is drawn for a left-to-right interface; keep it in step with the other dock.
+        if self.docks_rtl {
+            bake_dock.mirror(crate::docking::DEFAULT_WINDOW_WIDTH);
+        }
         self.bake_layout_version = BAKE_LAYOUT_VERSION;
     }
 
     /// Mirror the active and inactive docks when the language reading direction changes.
     pub fn sync_dock_direction(&mut self, rtl: bool, width: f32) {
+        self.reset_outdated_bake_dock();
+        self.reset_unreadable_painting_dock();
         if self.docks_rtl != rtl {
             self.dock.mirror(width);
             self.inactive_mode_dock.mirror(width);
@@ -506,6 +526,63 @@ mod tests {
         assert_eq!(ui.dock, Dock::default());
     }
 
+    #[test]
+    fn an_outdated_bake_dock_is_replaced_by_the_default_for_the_interface_direction() {
+        let mut ui = UiState::default();
+        ui.sync_dock_direction(true, 1600.0);
+        // A bake layout saved before the current version, in a right-to-left session
+        ui.bake_layout_version = 0;
+        ui.sync_mode_dock();
+        let mut want = Dock::for_baking();
+        want.mirror(crate::docking::DEFAULT_WINDOW_WIDTH);
+        assert_ne!(want, Dock::for_baking(), "the bake default is not symmetric");
+        assert_eq!(ui.inactive_mode_dock, want, "the replacement is mirrored like the painting dock");
+        assert_eq!(ui.bake_layout_version, BAKE_LAYOUT_VERSION);
+    }
+
+    #[test]
+    fn an_unreadable_painting_dock_is_replaced_by_the_default_for_the_interface_direction() {
+        let mut v = serde_json::to_value(UiState::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.insert("dock".into(), serde_json::json!({"version": 9999, "layout": {}}));
+        obj.insert("docks_rtl".into(), serde_json::json!(true));
+        let mut ui: UiState = serde_json::from_value(v).unwrap();
+        assert!(ui.docks_rtl);
+        assert!(ui.dock.replaced_unreadable());
+
+        ui.sync_mode_dock();
+        assert!(!ui.dock.replaced_unreadable());
+
+        let mut want = Dock::default();
+        want.mirror(crate::docking::DEFAULT_WINDOW_WIDTH);
+        assert_ne!(want, Dock::default());
+        assert_eq!(ui.dock, want, "the replacement painting dock is mirrored for right-to-left");
+
+        ui.sync_mode_dock();
+        assert_eq!(ui.dock, want, "the dock is not repeatedly mirrored on subsequent frames");
+        ui.sync_dock_direction(true, 1600.0);
+        assert_eq!(ui.dock, want, "sync_dock_direction with true does not re-mirror");
+    }
+
+    #[test]
+    fn an_unreadable_painting_dock_saved_while_baking_is_replaced_and_mirrored() {
+        let mut v = serde_json::to_value(UiState::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.insert("dock_is_baking".into(), serde_json::json!(true));
+        obj.insert("mode".into(), serde_json::json!("Baking"));
+        obj.insert("inactive_mode_dock".into(), serde_json::json!({"version": 9999, "layout": {}}));
+        obj.insert("docks_rtl".into(), serde_json::json!(true));
+        let mut ui: UiState = serde_json::from_value(v).unwrap();
+        assert!(ui.docks_rtl);
+        assert!(ui.inactive_mode_dock.replaced_unreadable());
+
+        ui.sync_mode_dock();
+        assert!(!ui.inactive_mode_dock.replaced_unreadable());
+
+        let mut want = Dock::default();
+        want.mirror(crate::docking::DEFAULT_WINDOW_WIDTH);
+        assert_eq!(ui.inactive_mode_dock, want);
+    }
 
     #[test]
     fn docks_follow_the_interface_direction() {
