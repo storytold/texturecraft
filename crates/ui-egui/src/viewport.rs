@@ -1292,12 +1292,41 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             painter.circle_stroke(hover, radius, Stroke::new(1.0, Color32::from_white_alpha(200)));
         }
     }
-
+    // Brush cursor: the stamp's size and hardness at the pointer, as in the 3D view.
+    let cursor_mode = app.ui.mode == crate::state::Mode::Painting && !alt && !v_held;
+    if cursor_mode
+        && !path_tool
+        && brush_tool(app.session.tool.tool)
+        && !response.dragged_by(PointerButton::Middle)
+        // While a Ctrl+drag changes the brush, its cursor stays where the drag began.
+        && let Some(hp) = if adjusting { ui.input(|i| i.pointer.press_origin()) } else { response.hover_pos().or_else(|| response.interact_pointer_pos()) }
+    {
+        // A UV brush stamp has a radius of twice the brush size, as in `continue_stroke_uv`.
+        let r = (to_screen(app.session.tool.brush.size * 2.0, 0.0).x - to_screen(0.0, 0.0).x).abs().max(1.5);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+        brush_cursor_2d(&painter, hp, r, app.session.tool.brush.hardness);
+    }
     brush_readout(app, ui, &response, adjusting);
     view_header(app, ui, rect, "v2d");
     axis_gizmo(ui, rect, app, true);
     let name = app.session.doc.project.texture_sets.get(ts).map(|texture_set| texture_set.name.clone()).unwrap_or_default();
     ui.painter().text(rect.right_bottom() + vec2(-10.0, -10.0), egui::Align2::RIGHT_BOTTOM, name, egui::FontId::proportional(11.0), tokens.viewport_text);
+}
+
+/// The brush outline (and its hardness ring) as screen circles around `c`, radius `r` in points.
+fn brush_cursor_2d(p: &egui::Painter, c: egui::Pos2, r: f32, hardness: f32) {
+    p.circle_stroke(c, r, Stroke::new(2.5, Color32::from_black_alpha(140)));
+    p.circle_stroke(c, r, Stroke::new(1.2, Color32::from_white_alpha(230)));
+    if hardness > 0.05 {
+        let inner: Vec<egui::Pos2> = (0..=48)
+            .map(|k| {
+                let a = k as f32 / 48.0 * std::f32::consts::TAU;
+                c + vec2(a.cos(), a.sin()) * r * hardness
+            })
+            .collect();
+        p.add(egui::Shape::dashed_line(&inner, Stroke::new(1.0, Color32::from_white_alpha(120)), 3.0, 3.0));
+    }
+    p.circle_filled(c, 1.5, Color32::WHITE);
 }
 
 /// Paint the skew map under the pointer in the 2D view (a click is one dab, a drag a stroke).
