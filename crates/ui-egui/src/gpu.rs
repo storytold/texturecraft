@@ -1,15 +1,15 @@
 //! Bridge between the session and the wgpu renderer: per-frame scene sync (mesh, texture set
 //! layout, dirty tiles, environment) and the egui paint callback that renders and blits a view.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use rayon::prelude::*;
 use texturecraft_engine::Session;
-use texturecraft_engine::compose::{DisplayKind, ImageRes, tile_bytes};
-use texturecraft_engine::core::BakedMap;
+use texturecraft_engine::compose::{DisplayKind, ImageRes, kinds_for, tile_bytes};
+use texturecraft_engine::core::{BakedMap, Channel};
 use texturecraft_engine::geom::Mesh;
 use texturecraft_render::{Frame, Renderer, wgpu};
 
@@ -43,6 +43,9 @@ pub struct GpuState {
     pub renderer: Renderer,
     /// Raised when texture-set textures were recreated: the UI must upload every tile again.
     pub reset: Arc<AtomicBool>,
+    /// The texture sets whose textures were recreated (all neutral again), for [`GpuLink`]'s
+    /// record of the display kinds each set holds.
+    pub recreated: Arc<Mutex<BTreeSet<usize>>>,
     pub reports: Arc<Mutex<GpuReports>>,
     /// Wakes the UI when the GPU side has something to report.
     pub ctx: egui::Context,
@@ -63,6 +66,8 @@ const MAX_GPU_ERRORS: usize = 8;
 /// UI-side bookkeeping of what the GPU already has.
 pub struct GpuLink {
     pub reset: Arc<AtomicBool>,
+    /// [`GpuState::recreated`].
+    recreated: Arc<Mutex<BTreeSet<usize>>>,
     pub reports: Arc<Mutex<GpuReports>>,
     /// Raised when a view callback was dropped before the GPU applied its scene sync (the
     /// frame was never painted, e.g. a WebGPU surface not ready yet): send everything again.
@@ -75,6 +80,11 @@ pub struct GpuLink {
     env: (String, usize),
     /// What each set's aux texture holds: (mesh map or mask key, revision).
     aux: BTreeMap<usize, (String, u64)>,
+    /// The display kinds sent to the GPU per set: kinds the set has no channels for are not
+    /// converted, unless an earlier upload gave them content that must be overwritten. Only the
+    /// renderer recreating a set's textures ([`GpuState::recreated`]) clears its entry: a set
+    /// that keeps its size keeps its textures through mesh, layout and project changes.
+    sent: HashMap<usize, BTreeSet<DisplayKind>>,
     pub adapter: String,
     /// Most tiles waiting to be composited since compositing last caught up (progress).
     composite_total: usize,
@@ -96,6 +106,7 @@ const UPLOAD_MS_PER_TILE: f64 = 0.006;
 
 pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
     let reset = Arc::new(AtomicBool::new(false));
+    let recreated = Arc::new(Mutex::new(BTreeSet::new()));
     let reports = Arc::new(Mutex::new(GpuReports::default()));
     // wgpu's default handler panics on any error no scope caught (an out-of-memory texture, a
     // driver hiccup): report it instead, so the user keeps the session.
@@ -111,10 +122,17 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         wake.request_repaint();
     }));
     let renderer = Renderer::new(&rs.device, &rs.queue, rs.target_format);
-    rs.renderer.write().callback_resources.insert(GpuState { renderer, reset: reset.clone(), reports: reports.clone(), ctx: ctx.clone() });
+    rs.renderer.write().callback_resources.insert(GpuState {
+        renderer,
+        reset: reset.clone(),
+        recreated: recreated.clone(),
+        reports: reports.clone(),
+        ctx: ctx.clone(),
+    });
     let info = rs.adapter.get_info();
     GpuLink {
         reset,
+        recreated,
         reports,
         lost: Arc::new(AtomicBool::new(false)),
         mesh_id: 0,
@@ -122,6 +140,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         shift: 0,
         env: Default::default(),
         aux: BTreeMap::new(),
+        sent: HashMap::new(),
         adapter: format!("{} ({:?})", info.name, info.backend),
         composite_total: 0,
     }
@@ -179,6 +198,9 @@ impl GpuLink {
             }
             self.aux.clear();
         }
+        for ts in std::mem::take(&mut *self.recreated.lock().unwrap_or_else(PoisonError::into_inner)) {
+            self.sent.remove(&ts);
+        }
         for ts in 0..s.caches.len() {
             let tiles = s.take_uploads(ts);
             if tiles.is_empty() {
@@ -189,11 +211,15 @@ impl GpuLink {
                 let empty = Default::default();
                 let baked = s.doc.baked.get(&ts).unwrap_or(&empty);
                 let comp = &cache.composite;
+                let channels: Vec<Channel> = comp.channels.keys().copied().collect();
+                let sent = self.sent.entry(ts).or_default();
+                let kinds: Vec<DisplayKind> = DisplayKind::ALL.into_iter().filter(|k| sent.contains(k) || kinds_for(&channels).any(|n| n == *k)).collect();
+                sent.extend(kinds.iter().copied());
                 // In chunks while the frame has time (at least one chunk); the rest waits.
                 for chunk in tiles.chunks(UPLOAD_CHUNK) {
                     let bytes: Vec<_> = chunk
                         .par_iter()
-                        .flat_map_iter(|&(tx, ty)| DisplayKind::ALL.into_iter().map(move |k| (k, tx, ty)))
+                        .flat_map_iter(|&(tx, ty)| kinds.iter().map(move |&k| (k, tx, ty)))
                         .map(|(k, tx, ty)| (ts, k, tx, ty, tile_bytes(comp, baked, k, tx, ty)))
                         .collect();
                     queued += bytes.len();
@@ -299,6 +325,7 @@ impl CallbackTrait for ViewCallback {
                 gpu.renderer.set_display_shift(*shift);
                 let reset = gpu.renderer.set_texture_sets(device, queue, sets, *mats);
                 if !reset.is_empty() {
+                    gpu.recreated.lock().unwrap_or_else(PoisonError::into_inner).extend(reset);
                     gpu.reset.store(true, Ordering::Release);
                 }
             }
@@ -341,5 +368,70 @@ impl CallbackTrait for ViewCallback {
         pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
         pass.set_scissor_rect(clip.left_px.max(0) as u32, clip.top_px.max(0) as u32, clip.width_px as u32, clip.height_px as u32);
         gpu.renderer.blit_prepared(pass, self.frame.view_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use texturecraft_engine::execute;
+    use texturecraft_engine::geom::primitives;
+
+    fn link() -> GpuLink {
+        GpuLink {
+            reset: Arc::default(),
+            recreated: Arc::default(),
+            reports: Arc::default(),
+            lost: Arc::default(),
+            mesh_id: 0,
+            sets: Vec::new(),
+            shift: 0,
+            env: Default::default(),
+            aux: BTreeMap::new(),
+            sent: HashMap::new(),
+            adapter: String::new(),
+            composite_total: 0,
+        }
+    }
+
+    fn session(emissive: bool) -> Session {
+        let mut s = Session::new_project("t", primitives::sphere(1.0, 16, 8), "builtin:sphere", None, 128).unwrap();
+        if emissive {
+            execute(&mut s, "textureSet.channel.add", &json!({"channel": "emissive"})).unwrap();
+            execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+            execute(&mut s, "layer.fill.set", &json!({"channel": "emissive", "color": [1.0, 0.5, 0.0]})).unwrap();
+        }
+        s
+    }
+
+    fn kinds(out: &SceneSync) -> BTreeSet<DisplayKind> {
+        out.tiles.iter().filter(|t| t.0 == 0).map(|t| t.1).collect()
+    }
+
+    #[test]
+    fn a_kind_sent_before_a_project_change_is_overwritten_while_its_textures_survive() {
+        let mut gpu = link();
+        let out = gpu.sync(&mut session(true), None, 0, 0.0);
+        assert!(kinds(&out).contains(&DisplayKind::Emissive));
+        // A same-size project without emissive: a new mesh and the same set layout, so the
+        // renderer keeps the set's textures, emissive content included. It must be overwritten.
+        let out = gpu.sync(&mut session(false), None, 0, 0.0);
+        assert!(out.mesh.is_some() && out.sets.is_some());
+        assert!(kinds(&out).contains(&DisplayKind::Emissive), "the stale emissive texture is overwritten");
+    }
+
+    #[test]
+    fn a_recreated_set_converts_only_the_kinds_it_has_channels_for() {
+        let mut gpu = link();
+        gpu.sync(&mut session(true), None, 0, 0.0);
+        let mut plain = session(false);
+        gpu.sync(&mut plain, None, 0, 0.0);
+        // The renderer recreated set 0 (all neutral) and asked for every tile again.
+        gpu.recreated.lock().unwrap().insert(0);
+        gpu.reset.store(true, Ordering::Release);
+        let out = gpu.sync(&mut plain, None, 0, 0.0);
+        assert!(!out.tiles.is_empty());
+        assert!(!kinds(&out).contains(&DisplayKind::Emissive), "nothing to overwrite in a neutral texture");
     }
 }
