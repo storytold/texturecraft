@@ -550,6 +550,12 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Output template", "قالب الإخراج"),
     ("Output templates", "قوالب الإخراج"),
     ("Overlay", "تراكب (Overlay)"),
+    ("Base color only", "اللون الأساسي فقط"),
+    ("Project whole image", "إسقاط الصورة كاملة"),
+    (
+        "Bake the image from the current camera onto the visible surface; grazing angles fade out.",
+        "يخبز الصورة من الكاميرا الحالية على السطح المرئي؛ تتلاشى الزوايا المائلة.",
+    ),
     ("Overlay opacity", "عتامة التراكب"),
     ("PBR - Metallic Roughness (TextureCraft)", "PBR - خشونة ومعدنية (TextureCraft)"),
     ("PNG image", "صورة PNG"),

@@ -571,6 +571,12 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Output template", "Modelo de saída"),
     ("Output templates", "Modelos de saída"),
     ("Overlay", "Sobrepor"),
+    ("Base color only", "Somente cor base"),
+    ("Project whole image", "Projetar a imagem inteira"),
+    (
+        "Bake the image from the current camera onto the visible surface; grazing angles fade out.",
+        "Grava a imagem da câmera atual na superfície visível; ângulos rasantes esmaecem.",
+    ),
     ("Overlay opacity", "Opacidade da sobreposição"),
     ("PBR - Metallic Roughness (TextureCraft)", "PBR - Metálico Rugosidade (TextureCraft)"),
     ("PNG image", "Imagem PNG"),

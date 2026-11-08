@@ -15,7 +15,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   **18 brush presets** (basic, wear and grunge, details) in the shelf's Brushes tab set the
   stroke and keep the size; save your own brushes there too.
 - **Tools:** paint, eraser, **projection** with image stencils (hold S to move, turn and scale the
-  stencil), polygon fill (triangle, UV island or the whole mesh), **path** and **lasso fill**, a
+  stencil; **Project whole image** bakes it from the camera, see [photo-projection.md](photo-projection.md)), polygon fill (triangle, UV island or the whole mesh), **path** and **lasso fill**, a
   **particle brush**, **smudge**, **clone** (V + click sets the source), color picker, Shift+click
   straight lines, and painting directly in the **2D UV view**.
 - **Geometry decals:** drop an image on the surface, then move, scale and turn its frame; it stays

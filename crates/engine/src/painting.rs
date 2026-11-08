@@ -16,7 +16,7 @@ use crate::{EngineError, Result};
 
 impl Session {
     /// Camera visibility for a stroke at `viewport` (cached until the camera, size or mesh change).
-    fn eye_depth(&mut self, viewport: Vec2) -> std::sync::Arc<EyeDepth> {
+    pub(crate) fn eye_depth(&mut self, viewport: Vec2) -> std::sync::Arc<EyeDepth> {
         let size = ((viewport.x / 2.0).max(64.0) as u32, (viewport.y / 2.0).max(64.0) as u32);
         if let Some((cam, sz, mesh, depth)) = &self.depth_cache
             && *cam == self.camera
@@ -47,7 +47,7 @@ impl Session {
 
     /// Resolve what a stroke on the selected layer paints into, creating the mask paint effect
     /// when painting a mask. Must run inside the stroke's history snapshot.
-    fn paint_target(&mut self) -> Result<PaintTarget> {
+    pub(crate) fn paint_target(&mut self) -> Result<PaintTarget> {
         let id = self.selected_layer().ok_or_else(|| EngineError::Other("select a layer to paint on".into()))?;
         // Painting an instance paints its source (its own mask when it overrides the mask).
         let p = &self.doc.project;
@@ -123,7 +123,7 @@ impl Session {
         Ok(PaintTarget::Mask(eid))
     }
 
-    fn stroke_values(&self, target: PaintTarget) -> BTreeMap<Channel, [f32; 3]> {
+    pub(crate) fn stroke_values(&self, target: PaintTarget) -> BTreeMap<Channel, [f32; 3]> {
         let ts = self.ts();
         let Ok(set) = self.doc.project.texture_set(ts) else { return BTreeMap::new() };
         let layer_channels = match target {
@@ -134,9 +134,12 @@ impl Session {
             }
             PaintTarget::Mask(_) => BTreeSet::new(),
         };
+        // The Projection tool can paint the image's base color alone.
+        let only_color = self.tool.tool == Tool::Projection && self.tool.stencil.as_ref().is_some_and(|st| st.base_color_only);
         self.tool
             .values
             .iter()
+            .filter(|(c, _)| !only_color || **c == Channel::BaseColor)
             .filter(|(c, _)| self.tool.enabled.contains(c) && set.has_channel(**c) && layer_channels.contains(c))
             .map(|(c, v)| (*c, *v))
             .collect()
@@ -278,7 +281,7 @@ impl Session {
     }
 
     /// The stencil placed for the current camera and viewport.
-    fn capture_stencil(&self, viewport: Vec2) -> Option<texturecraft_compose::Stencil> {
+    pub(crate) fn capture_stencil(&self, viewport: Vec2) -> Option<texturecraft_compose::Stencil> {
         let st = self.tool.stencil.as_ref()?;
         let image = self.images.get(&st.image)?.clone();
         let aspect = viewport.x.max(1.0) / viewport.y.max(1.0);

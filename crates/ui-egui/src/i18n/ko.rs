@@ -559,6 +559,12 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Output template", "출력 템플릿"),
     ("Output templates", "출력 템플릿"),
     ("Overlay", "오버레이"),
+    ("Base color only", "베이스 컬러만"),
+    ("Project whole image", "이미지 전체 투영"),
+    (
+        "Bake the image from the current camera onto the visible surface; grazing angles fade out.",
+        "현재 카메라에서 보이는 표면에 이미지를 베이크합니다. 비스듬한 각도는 페이드 아웃됩니다.",
+    ),
     ("Overlay opacity", "오버레이 불투명도"),
     ("PBR - Metallic Roughness (TextureCraft)", "PBR - 메탈릭 러프니스 (TextureCraft)"),
     ("PNG image", "PNG 이미지"),

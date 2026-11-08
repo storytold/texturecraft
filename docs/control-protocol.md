@@ -136,6 +136,15 @@ call("auth", {"token": token})
 print(call("command.run", {"id": "layer.add.fill", "params": {"color": [0.8, 0.1, 0.1]}}))
 ```
 
+## Photo projection commands
+
+Details of the audit and the workflow: [photo-projection.md](photo-projection.md).
+
+| Command | Params | Notes |
+|---|---|---|
+| `tool.stencil` | `{image?, center?, scale?, rotation?, tile?, opacity?, baseColorOnly?, clear?}` | Place an imported image (`resource.import`) as a screen-space stencil; with the Projection tool (`tool.projection`) the brush paints it (`tool.stroke`) |
+| `tool.stencil.project` | `{viewport?, backfaceCulling?, angleFade?: [from, to], occlusion?}` | Bake the whole stencil from the current camera onto the visible surface of the selected layer or mask, one undo step; back faces and hidden surfaces stay clean, surfaces seen at a grazing angle fade out (defaults: the brush's culling and angle fade) |
+
 ## MCP server
 
 `texturecraft-cli mcp` speaks MCP on stdin/stdout (stdout carries only protocol messages).

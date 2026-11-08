@@ -1079,7 +1079,15 @@ fn stencil_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         slider(ui, tr("Rotation"), &mut st.rotation, 0.0..=360.0, 0);
         slider(ui, tr("Overlay opacity"), &mut st.opacity, 0.0..=1.0, 2);
         ui.checkbox(&mut st.tile, tr("Tile"));
+        ui.checkbox(&mut st.base_color_only, tr("Base color only"));
         ui.label(RichText::new(tr("Hold S: left-drag rotates, right-drag scales, middle-drag moves the stencil.")).size(10.5).color(tk.text_dim));
+        if ui
+            .button(tr("Project whole image"))
+            .on_hover_text(tr("Bake the image from the current camera onto the visible surface; grazing angles fade out."))
+            .clicked()
+        {
+            app.run("tool.stencil.project", json!({}));
+        }
     }
 }
 
