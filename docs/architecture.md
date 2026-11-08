@@ -72,9 +72,10 @@ normal channel and baked normals by reoriented normal mapping, and packs channel
 ## Undo
 
 `Session::edit` snapshots the `Document` (project + pixels + baked maps + resources) before a
-change and restores it if the change fails. Pixel data is copy-on-write (`Arc` tiles), so a
-snapshot costs one reference-count bump per allocated tile, and an undo step only keeps the tiles
-that actually changed.
+change and restores it if the change fails. Pixel images are copy-on-write at two levels: an
+image's tile table and each 64×64 tile are `Arc`-shared, so a snapshot costs one
+reference-count bump per image, and an undo step keeps only the tables and tiles the change
+wrote.
 
 ## Rendering
 
