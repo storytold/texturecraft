@@ -165,10 +165,14 @@ impl Session {
             entry.maps.clear();
         }
         entry.resolution = output.resolution;
+        let output_maps: Vec<BakedMap> = output.maps.keys().copied().collect();
         for (map, pixels) in output.maps {
             entry.maps.insert(map, Arc::new(pixels));
         }
-        self.doc.project.texture_set_mut(texture_set)?.baked = entry.maps.keys().copied().collect();
+        let set = self.doc.project.texture_set_mut(texture_set)?;
+        set.baked = entry.maps.keys().copied().collect();
+        // Baked maps replace imported ones; a cleared entry drops them all.
+        set.imported_maps.retain(|map| entry.maps.contains_key(map) && !output_maps.contains(map));
         Ok(())
     }
 

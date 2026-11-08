@@ -67,7 +67,9 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         let entry = s.doc.baked.entry(ts).or_default();
         entry.resolution = res;
         entry.maps.insert(map, Arc::new(data));
-        s.doc.project.texture_set_mut(ts)?.baked.insert(map);
+        let set = s.doc.project.texture_set_mut(ts)?;
+        set.baked.insert(map);
+        set.imported_maps.insert(map);
         Ok(())
     })?;
     Ok(json!({ "map": map.id(), "resolution": res }))
@@ -127,7 +129,9 @@ fn clear(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(b) = s.doc.baked.get_mut(&ts) {
             b.maps.remove(&map);
         }
-        s.doc.project.texture_set_mut(ts)?.baked.remove(&map);
+        let set = s.doc.project.texture_set_mut(ts)?;
+        set.baked.remove(&map);
+        set.imported_maps.remove(&map);
         Ok(())
     })?;
     Ok(Value::Null)
