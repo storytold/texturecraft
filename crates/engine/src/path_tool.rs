@@ -7,13 +7,16 @@
 //! (`path.edit`, live while the points, brush or material change) or removed (`path.remove`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use texturecraft_compose::ImageRes;
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, Mask, MaskBackground, PathShape};
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{OrbitCamera, surface_at};
 use texturecraft_paint::{BrushSettings, Lasso, fill_coverage, spline};
+use texturecraft_texel::{TILE_AREA, TileImage};
 
 use crate::commands::{CommandSpec, always, bad, boolp, has_layer, u64p};
 use crate::session::{StackTarget, Tool};
@@ -22,6 +25,9 @@ use crate::{EngineError, Result, Session, cmd};
 
 /// Control points kept at most.
 pub const MAX_PATH_POINTS: usize = 4096;
+/// Bytes of tiles the path cache's snapshots may hold (plus the edited path's); the oldest go
+/// first.
+const CACHE_BYTES: usize = 256 << 20;
 /// Curve sampling step in viewport pixels (3D view) and texture units (2D view).
 const STEP_PX: f32 = 2.0;
 const STEP_UV: f32 = 0.001;
@@ -61,17 +67,74 @@ impl PathState {
     }
 }
 
-/// A path sublayer's pixels after painting its first paths (`below`), with the mesh and
-/// texture size they were painted for.
+/// Mesh id, texture size, owner layer channels, texture set channels.
+type CacheKey = (u64, Option<(u32, u32)>, Vec<Channel>, Vec<Channel>);
+/// A path sublayer's images: its mask (`None`) and each channel.
+type Snap = BTreeMap<Option<Channel>, TileImage>;
+/// A stored path and the brush alpha image it was painted with.
+type Painted = (PathShape, Option<Arc<ImageRes>>);
+
+/// A path sublayer as last painted for `key`: its paths, its images after each path
+/// (`snaps[k]` after the first k; tiles are shared, so a snapshot costs only the tiles that
+/// path changed; None once [`evict`]ed) and the tiles each path painted.
 #[derive(Clone)]
-// shortcut: the key doesn't cover image resources a path's brush alpha reads; replacing one
-// leaves cached paths with the old alpha until a path below the edited one changes.
 pub(crate) struct PathCache {
     eid: LayerId,
-    key: (u64, Option<(u32, u32)>),
-    below: Vec<PathShape>,
-    mask: Option<texturecraft_texel::TileImage>,
-    layers: Vec<((LayerId, Channel), texturecraft_texel::TileImage)>,
+    key: CacheKey,
+    shapes: Vec<Painted>,
+    snaps: Vec<Option<Snap>>,
+    tiles: Vec<BTreeSet<(u32, u32)>>,
+}
+
+/// Drop the snapshots past `budget` bytes, oldest first, so adding a path and editing recent
+/// ones stay cheap, but keep snapshot `edited` (below the path being edited, so its next live
+/// repaint starts there). Snapshot k holds at most path k-1's tiles in each image; the first
+/// (empty) and the last (the live pixels) cost nothing.
+fn evict(snaps: &mut [Option<Snap>], tiles: &[BTreeSet<(u32, u32)>], budget: usize, edited: usize) {
+    let mut bytes = 0;
+    for k in (1..snaps.len().saturating_sub(1)).rev().filter(|&k| k != edited) {
+        if let Some(snap) = &snaps[k] {
+            bytes += tiles[k - 1].len() * snap.values().map(|i| TILE_AREA * i.comps() * 2).sum::<usize>();
+            if bytes > budget {
+                snaps[k] = None;
+            }
+        }
+    }
+}
+
+fn same_handle<T>(a: Option<&Arc<T>>, b: Option<&Arc<T>>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+        (x, y) => x.is_none() && y.is_none(),
+    }
+}
+
+fn same_path(a: &Painted, b: &Painted) -> bool {
+    a.0 == b.0 && same_handle(a.1.as_ref(), b.1.as_ref())
+}
+
+/// Whether `a` and `b` hold the same tiles at `tiles`, by shared handle (painting a tile always
+/// gives it a new one); a missing image reads as empty.
+fn same_tiles(a: &Snap, b: &Snap, tiles: &BTreeSet<(u32, u32)>) -> bool {
+    a.keys().chain(b.keys()).all(|k| {
+        let (x, y) = (a.get(k), b.get(k));
+        let dims = |i: &TileImage| (i.width(), i.height(), i.comps());
+        x.zip(y).is_none_or(|(x, y)| dims(x) == dims(y))
+            && tiles.iter().all(|&(tx, ty)| same_handle(x.and_then(|i| i.tile_handle(tx, ty)), y.and_then(|i| i.tile_handle(tx, ty))))
+    })
+}
+
+/// Copy `from`'s tiles at `tiles` into `to`.
+fn copy_tiles(to: &mut Snap, from: &Snap, tiles: &BTreeSet<(u32, u32)>) {
+    for (k, src) in from {
+        to.entry(*k).or_insert_with(|| TileImage::new(src.width(), src.height(), src.comps()));
+    }
+    for (k, dst) in to.iter_mut() {
+        let src = from.get(k);
+        for &(x, y) in tiles {
+            dst.set_tile(x, y, src.and_then(|i| i.tile_handle(x, y)).cloned());
+        }
+    }
 }
 
 /// What a stored path is painted with ([`PathShape::paint`]).
@@ -200,7 +263,7 @@ fn remove_path(s: &mut Session, p: &Value) -> Result<Value> {
         {
             shapes.remove(index);
         }
-        s.render_paths(eid, index)
+        s.render_paths(eid)
     })?;
     if s.tool.path.editing.is_some_and(|(e, _)| e == eid) {
         s.stop_path_edit();
@@ -362,32 +425,43 @@ impl Session {
             },
             _ => return Err(EngineError::Other(format!("{} is not a path sublayer", eid.0))),
         };
-        let mut out = self.render_paths(eid, index)?.get(index).cloned().unwrap_or_else(|| json!({}));
+        let mut out = self.render_paths(eid)?.get(index).cloned().unwrap_or_else(|| json!({}));
         out["effect"] = json!(eid.0);
         out["index"] = json!(index);
         Ok(out)
     }
 
-    /// Repaint path sublayer `eid` from its stored paths, bottom to top, where paths before
-    /// `from` are unchanged: their pixels come from [`PathCache`] when it holds them, and are
-    /// cached for the next repaint otherwise, so editing a path repaints it and the paths above
-    /// only. Runs inside the caller's undo step. Returns each painted path's report (null for
-    /// the cached ones).
-    fn render_paths(&mut self, eid: LayerId, from: usize) -> Result<Vec<Value>> {
+    /// Repaint path sublayer `eid` from its stored paths, bottom to top. From [`PathCache`]: the
+    /// paths before the first changed one keep their pixels, and an unchanged path above it
+    /// whose tiles the change didn't reach keeps its painted tiles; the rest repaint. Runs
+    /// inside the caller's undo step. Returns each painted path's report (null for the cached
+    /// ones).
+    fn render_paths(&mut self, eid: LayerId) -> Result<Vec<Value>> {
         let shapes = self.paths(eid).ok_or_else(|| EngineError::Other(format!("{} is not a path sublayer", eid.0)))?.to_vec();
-        let key = (self.mesh_id, self.caches.get(self.ts()).map(|c| c.size));
-        self.doc.pixels.masks.remove(&eid);
-        self.doc.pixels.layers.retain(|(id, _), _| *id != eid);
-        let start = match &self.path_cache {
-            Some(c) if c.eid == eid && c.key == key && c.below.len() <= from && shapes.get(..c.below.len()) == Some(&c.below[..]) => {
-                if let Some(m) = &c.mask {
-                    self.doc.pixels.masks.insert(eid, m.clone());
-                }
-                self.doc.pixels.layers.extend(c.layers.iter().cloned());
-                c.below.len()
-            }
-            _ => 0,
-        };
+        let images = &self.images;
+        let alpha = |sh: &PathShape| read_paint(sh).ok().and_then(|p| p.brush.alpha_image).and_then(|n| images.get(&n).cloned());
+        let new: Vec<Painted> = shapes
+            .into_iter()
+            .map(|sh| {
+                let a = alpha(&sh);
+                (sh, a)
+            })
+            .collect();
+        let project = &self.doc.project;
+        let owner = project.effect(eid).and_then(|(o, _)| project.layer(o).ok()).map(|l| l.channels.keys().copied().collect()).unwrap_or_default();
+        let set = project.texture_set(self.ts()).map(|t| t.channel_list()).unwrap_or_default();
+        let key: CacheKey = (self.mesh_id, self.caches.get(self.ts()).map(|c| c.size), owner, set);
+        let old = self.path_cache.take().filter(|c| c.eid == eid && c.key == key);
+        let (prefix, suffix) = old.as_ref().map_or((0, 0), |c| {
+            let p = c.shapes.iter().zip(&new).take_while(|(a, b)| same_path(a, b)).count();
+            (p, c.shapes[p..].iter().rev().zip(new[p..].iter().rev()).take_while(|(a, b)| same_path(a, b)).count())
+        });
+        // Start from the last snapshot kept at or below the first changed path (the first one,
+        // empty, is always kept).
+        let start = old.as_ref().map_or(0, |c| (0..=prefix).rev().find(|&k| c.snaps[k].is_some()).unwrap_or(0));
+        let mut snaps = old.as_ref().map_or_else(|| vec![Some(Snap::new())], |c| c.snaps[..=start].to_vec());
+        let mut tiles = old.as_ref().map_or_else(Vec::new, |c| c.tiles[..start].to_vec());
+        let mut state = snaps[start].clone().unwrap_or_default();
         // Each path goes through the regular stroke and fill code with its own settings; their
         // own history entries are dropped (the caller records one step).
         let saved = (self.tool.clone(), self.camera, self.target, self.quick_mask.editing);
@@ -398,13 +472,22 @@ impl Session {
         self.painting_paths = true;
         let mut out = vec![Value::Null; start];
         let mut result = Ok(());
-        for i in start..=shapes.len() {
-            if i == from.min(shapes.len()) && i > start {
-                let pixels = &self.doc.pixels;
-                let layers = pixels.layers.iter().filter(|((id, _), _)| *id == eid).map(|(k, v)| (*k, v.clone())).collect();
-                self.path_cache = Some(PathCache { eid, key, below: shapes[..i].to_vec(), mask: pixels.masks.get(&eid).cloned(), layers });
+        for (j, (sh, _)) in new.iter().enumerate().skip(start) {
+            // Painting is per tile: over the same tiles, an unchanged path paints the same.
+            let o = if j < prefix { Some(j) } else { (j >= new.len() - suffix).then(|| j + old.as_ref().map_or(0, |c| c.shapes.len()) - new.len()) };
+            if let (Some(c), Some(o)) = (&old, o)
+                && let (Some(below), Some(after)) = (&c.snaps[o], &c.snaps[o + 1])
+                && same_tiles(&state, below, &c.tiles[o])
+            {
+                copy_tiles(&mut state, after, &c.tiles[o]);
+                tiles.push(c.tiles[o].clone());
+                snaps.push(Some(state.clone()));
+                evict(&mut snaps, &tiles, CACHE_BYTES, prefix);
+                out.push(Value::Null);
+                continue;
             }
-            let Some(sh) = shapes.get(i) else { break };
+            self.put_snap(eid, &state);
+            self.path_tiles.clear();
             match self.paint_shape(sh) {
                 Ok(v) => out.push(v),
                 Err(e) => {
@@ -412,11 +495,37 @@ impl Session {
                     break;
                 }
             }
+            state = self.take_snap(eid);
+            tiles.push(std::mem::take(&mut self.path_tiles));
+            snaps.push(Some(state.clone()));
+            evict(&mut snaps, &tiles, CACHE_BYTES, prefix);
         }
+        self.put_snap(eid, &state);
         self.painting_paths = false;
         (self.tool, self.camera, self.target, self.quick_mask.editing) = saved;
         (self.undo, self.redo) = history;
+        if result.is_ok() {
+            self.path_cache = Some(PathCache { eid, key, shapes: new, snaps, tiles });
+        }
         result.map(|_| out)
+    }
+
+    fn take_snap(&self, eid: LayerId) -> Snap {
+        let p = &self.doc.pixels;
+        let mask = p.masks.get(&eid).map(|m| (None, m.clone()));
+        mask.into_iter().chain(p.layers.iter().filter(|((id, _), _)| *id == eid).map(|((_, c), img)| (Some(*c), img.clone()))).collect()
+    }
+
+    fn put_snap(&mut self, eid: LayerId, snap: &Snap) {
+        let p = &mut self.doc.pixels;
+        p.masks.remove(&eid);
+        p.layers.retain(|(id, _), _| *id != eid);
+        for (k, img) in snap {
+            match k {
+                None => p.masks.insert(eid, img.clone()),
+                Some(c) => p.layers.insert((eid, *c), img.clone()),
+            };
+        }
     }
 
     fn paint_shape(&mut self, shape: &PathShape) -> Result<Value> {
@@ -520,7 +629,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use crate::{Session, execute};
 
@@ -531,29 +640,118 @@ mod tests {
         v
     }
 
-    #[test]
-    fn cached_repaint_matches_a_full_repaint() {
-        let mut s = Session::new_project("t", texturecraft_geom::primitives::sphere(1.0, 24, 12), "builtin:test", None, 128).unwrap();
+    /// A session with horizontal UV paths at `rows` (one path sublayer) on a 512 texture.
+    fn with_paths(rows: &[f32]) -> (Session, texturecraft_core::LayerId) {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::sphere(1.0, 24, 12), "builtin:test", None, 512).unwrap();
         s.update();
         execute(&mut s, "tool.brush", &json!({"size": 6})).unwrap();
         let mut eid = 0;
-        for v in [0.2, 0.5, 0.8] {
-            let r = execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, v], [0.9, v + 0.05]], "commit": true})).unwrap();
+        for v in rows {
+            let r = execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, v], [0.9, v]], "commit": true})).unwrap();
             eid = r["committed"]["effect"].as_u64().unwrap();
         }
-        let eid = texturecraft_core::LayerId(eid);
-        // Live edits of the middle path reuse the bottom path's pixels.
-        execute(&mut s, "path.edit", &json!({"effect": eid.0, "index": 1})).unwrap();
-        for v in [0.4, 0.45] {
-            execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, v], [0.5, v], [0.9, v]]})).unwrap();
-        }
-        assert_eq!(s.path_cache.as_ref().map(|c| c.below.len()), Some(1));
-        let r = s.render_paths(eid, 1).unwrap();
-        assert!(r[0].is_null() && !r[1].is_null(), "the bottom path came from the cache: {r:?}");
-        let cached = pixels(&s, eid);
+        (s, texturecraft_core::LayerId(eid))
+    }
+
+    /// Move path `index` to row `v` (a live edit) and check the result against painting every
+    /// path. Returns which paths were repainted.
+    fn edit_row(s: &mut Session, eid: texturecraft_core::LayerId, index: usize, v: f32) -> Vec<bool> {
+        execute(s, "path.edit", &json!({"effect": eid.0, "index": index})).unwrap();
+        let before = s.path_cache.clone();
+        execute(s, "tool.path", &json!({"uvPoints": [[0.1, v], [0.5, v], [0.9, v]]})).unwrap();
+        let cached = pixels(s, eid);
+        s.path_cache = before;
+        let painted = s.render_paths(eid).unwrap().iter().map(|r| !r.is_null()).collect();
+        assert_eq!(cached, pixels(s, eid));
         s.path_cache = None;
-        s.render_paths(eid, 0).unwrap();
-        assert_eq!(cached, pixels(&s, eid), "same pixels as painting every path");
+        s.render_paths(eid).unwrap();
+        assert_eq!(cached, pixels(s, eid), "same pixels as painting every path");
         assert!(!cached.is_empty());
+        s.stop_path_edit();
+        painted
+    }
+
+    #[test]
+    fn cached_repaint_matches_a_full_repaint() {
+        // Rows 0.2, 0.45 and 0.8 of 512 texels are in different 64-texel tile rows.
+        let (mut s, eid) = with_paths(&[0.2, 0.45, 0.8]);
+        assert_eq!(edit_row(&mut s, eid, 1, 0.47), [false, true, false], "only the edited path repaints");
+        assert_eq!(edit_row(&mut s, eid, 0, 0.22), [true, false, false], "paths above keep their tiles");
+        assert_eq!(edit_row(&mut s, eid, 0, 0.79), [true, false, true], "a path over the change repaints");
+    }
+
+    #[test]
+    fn removing_a_path_keeps_the_paths_above() {
+        let (mut s, eid) = with_paths(&[0.2, 0.45, 0.8]);
+        let before = s.path_cache.clone();
+        execute(&mut s, "path.remove", &json!({"effect": eid.0, "index": 0})).unwrap();
+        let cached = pixels(&s, eid);
+        s.path_cache = before;
+        assert!(s.render_paths(eid).unwrap().iter().all(Value::is_null), "both paths above came from the cache");
+        s.path_cache = None;
+        s.render_paths(eid).unwrap();
+        assert_eq!(cached, pixels(&s, eid), "same pixels as painting every path");
+    }
+
+    #[test]
+    fn replacing_the_brush_alpha_image_repaints() {
+        let (mut s, eid) = with_paths(&[0.2]);
+        let img = |v: f32| std::sync::Arc::new(texturecraft_compose::ImageRes { width: 2, height: 2, rgba: vec![[v; 4]; 4], srgb: false });
+        s.images.insert("a".into(), img(1.0));
+        execute(&mut s, "tool.brush", &json!({"alpha": {"image": "a"}})).unwrap();
+        execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, 0.8], [0.9, 0.8]], "commit": true})).unwrap();
+        s.render_paths(eid).unwrap();
+        s.images.insert("a".into(), img(0.5));
+        let r = s.render_paths(eid).unwrap();
+        assert!(r[0].is_null() && !r[1].is_null(), "only the path using the image repaints: {r:?}");
+    }
+
+    #[test]
+    fn snapshots_stay_within_the_budget() {
+        let (mut s, eid) = with_paths(&[0.2, 0.45, 0.8]);
+        let c = s.path_cache.as_mut().unwrap();
+        super::evict(&mut c.snaps, &c.tiles, usize::MAX, 0);
+        assert_eq!(c.snaps.iter().flatten().count(), 4);
+        super::evict(&mut c.snaps, &c.tiles, 0, 0);
+        assert!(c.snaps[0].is_some() && c.snaps[3].is_some() && c.snaps[1..3].iter().all(Option::is_none), "only the free ones stay");
+        // Appending still paints the new path alone.
+        let shape = s.paths(eid).unwrap()[0].clone();
+        if let Some(texturecraft_core::Effect { kind: texturecraft_core::EffectKind::Path(v), .. }) = s.doc.project.effect_mut(eid) {
+            v.push(shape);
+        }
+        let r = s.render_paths(eid).unwrap();
+        assert_eq!(r.iter().map(|x| !x.is_null()).collect::<Vec<_>>(), [false, false, false, true]);
+        // Editing above evicted snapshots repaints from the bottom and matches a full repaint.
+        let c = s.path_cache.as_mut().unwrap();
+        super::evict(&mut c.snaps, &c.tiles, 0, 0);
+        assert_eq!(edit_row(&mut s, eid, 2, 0.81), [true; 4], "the copy of path 1 sits on repainted tiles");
+        // That edit kept the snapshot below path 3 within a zero budget: its next frame starts there.
+        let c = s.path_cache.as_mut().unwrap();
+        super::evict(&mut c.snaps, &c.tiles, 0, 2);
+        assert!(c.snaps[2].is_some() && c.snaps[1].is_none());
+        assert_eq!(edit_row(&mut s, eid, 2, 0.83), [false, false, true, true], "path 4 lost its snapshot too");
+    }
+
+    #[test]
+    fn the_quick_mask_does_not_clip_paths() {
+        let (mut s, eid) = with_paths(&[0.2, 0.8]);
+        let plain = pixels(&s, eid);
+        s.quick_mask.enabled = true;
+        s.path_cache = None;
+        s.render_paths(eid).unwrap();
+        assert_eq!(plain, pixels(&s, eid));
+    }
+
+    #[test]
+    fn owner_channel_change_skips_the_cache() {
+        let (mut s, eid) = with_paths(&[0.3, 0.7]);
+        s.render_paths(eid).unwrap();
+        let owner = s.doc.project.effect(eid).unwrap().0;
+        let layer = s.doc.project.layer_mut(owner).unwrap();
+        let ch = *layer.channels.keys().next().unwrap();
+        layer.channels.remove(&ch);
+        let r = s.render_paths(eid).unwrap();
+        assert!(!r[0].is_null(), "the bottom path was repainted: {r:?}");
+        assert!(!s.doc.pixels.layers.contains_key(&(eid, ch)), "no pixels left in the removed channel");
     }
 }
