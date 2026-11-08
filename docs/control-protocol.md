@@ -19,6 +19,15 @@ index}` reorders an effect within its stack (0 = bottom) and `effect.duplicate {
 one just above itself. `effect.copy {effect?}` and `effect.cut {effect?}` put an effect on the
 layer clipboard, and `effect.paste {layer?, target?}` adds it to another layer's content or mask.
 
+`effect.set {effect, filter: "blur", radius: 5}` replaces a filter in place, preserving its
+stack position, blend, opacity and visibility. Replacement filters start from defaults plus
+the supplied parameters; naming the current filter instead edits it without resetting omitted
+parameters. Default effect names follow the new filter, custom names remain, and an explicit
+`name` overrides either. Only filter effects can be replaced this way, and masks reject
+content-only filters. `filter.list` lists the available IDs; levels and material finishes
+must be added separately with `effect.add.filter`. A successful replacement is one undo step;
+a rejected replacement changes nothing.
+
 `edit.undo {steps?}` and `edit.redo {steps?}` go back or forward several steps at once (as far
 as the history reaches); `edit.history` lists the steps done and the undone ones, next first.
 Any command takes `merge: true` to fold its edit into the previous undo step when that step has

@@ -12,13 +12,15 @@ pub mod control;
 pub mod dock;
 pub mod docking;
 pub mod export_templates;
+mod filter_slot;
 pub mod fonts;
 pub mod gpu;
 pub mod i18n;
 pub mod keymap;
 mod mask_preview_image;
-mod mask_shape;
+mod material_preview_image;
 pub mod menus;
+mod orb_shape;
 pub mod parity;
 mod preview_image;
 mod preview_request;
@@ -26,13 +28,17 @@ mod preview_worker;
 pub mod profile;
 pub mod properties_popup;
 pub mod render_mode;
+mod resource_picker;
+mod resource_picker_item;
 pub mod shelf;
 pub mod shelf_preview;
+mod soft_box;
 pub mod state;
 pub mod theme;
 pub mod thumbs;
 pub mod titlebar;
 pub mod toolbar;
+pub mod uv_paint_point;
 pub mod viewport;
 pub mod web_files;
 pub mod widgets;
@@ -112,6 +118,8 @@ pub struct TextureCraftApp {
     pub profiler: profile::Profiler,
     /// Where the last 3D stroke ended (viewport pixels), for Shift+click straight lines.
     pub last_paint_point: Option<texturecraft_engine::geom::glam::Vec2>,
+    /// The last finished 2D stroke's endpoint, scoped to its mesh and texture set for Shift+click lines
+    pub last_paint_uv: Option<uv_paint_point::UvPaintPoint>,
     /// The decal layer the next click in the 3D view places.
     pub placing_decal: Option<texturecraft_engine::core::LayerId>,
     /// The Properties popup a right click in a view opens.
@@ -135,19 +143,23 @@ pub struct TextureCraftApp {
 }
 
 impl TextureCraftApp {
+    /// The app around `session`, with the saved UI state (or defaults in the OS language) and the GPU viewport.
     pub fn new(cc: &eframe::CreationContext<'_>, session: Session) -> TextureCraftApp {
         theme::install(&cc.egui_ctx);
-        // Bakes cast their rays on a GPU device of their own (created on the first bake).
+
+        // Bakes cast their rays on a GPU device of their own (created on the first bake)
         #[cfg(not(target_arch = "wasm32"))]
         texturecraft_engine::bake::install_gpu_tracer(Arc::new(texturecraft_render::gpu_bake::GpuBaker::new()));
-        let gpu = cc.wgpu_render_state.as_ref().map(|rs| gpu::init(rs, &cc.egui_ctx));
-        // The first run speaks the OS (or browser) language.
-        let ui = cc.storage.and_then(|s| eframe::get_value::<UiState>(s, "ui")).unwrap_or_else(|| {
+        let gpu = cc.wgpu_render_state.as_ref().map(|render_state| gpu::init(render_state, &cc.egui_ctx));
+
+        // The first run speaks the OS (or browser) language
+        let ui = cc.storage.and_then(|storage| eframe::get_value::<UiState>(storage, "ui")).unwrap_or_else(|| {
             let mut ui = UiState::default();
             ui.prefs.language = i18n::os_language().into();
             ui
         });
         let next_autosave = ui.prefs.autosave_minutes as f64 * 60.0;
+
         let mut app = TextureCraftApp {
             camera_glide: None,
             session,
@@ -168,6 +180,7 @@ impl TextureCraftApp {
             brushes: None,
             render: render_mode::RenderView::default(),
             last_paint_point: None,
+            last_paint_uv: None,
             placing_decal: None,
             properties_popup: None,
             render_state: cc.wgpu_render_state.clone(),
@@ -183,17 +196,21 @@ impl TextureCraftApp {
         app.ui.windows.new_project = false;
         i18n::set_language(&app.ui.prefs.language);
         export_templates::load_library(&mut app, cc.storage);
+
         #[cfg(not(target_arch = "wasm32"))]
         {
-            // The first window of the process fixes it; a new folder applies on restart.
+            // The first window of the process fixes it; a new folder applies on restart
             let _ = DATA_FOLDER.set(data_folder(&app.ui.prefs.data_folder));
-            // An export folder still at the default follows the data folder.
+
+            // An export folder still at the default follows the data folder
             if app.ui.export.dir == data_folder("").join("export").display().to_string() {
                 app.ui.export.dir = user_dir("export").display().to_string();
             }
+
             let skipped = app.session.load_templates(user_dir("templates"));
-            app.session.log.extend(skipped.into_iter().map(|w| format!("Project template skipped: {w}")));
+            app.session.log.extend(skipped.into_iter().map(|warning| format!("Project template skipped: {warning}")));
         }
+
         app
     }
 
