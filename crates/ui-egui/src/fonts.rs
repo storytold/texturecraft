@@ -1,5 +1,5 @@
-//! CJK and Arabic fallback fonts for the UI. egui's default fonts have no Japanese, Chinese,
-//! Korean or Arabic glyphs, so translated UIs (and such layer or file names) need more fonts.
+//! CJK, Arabic and Thai fallback fonts for the UI. egui's default fonts have no Japanese, Chinese,
+//! Korean, Arabic or Thai glyphs, so translated UIs (and such layer or file names) need more fonts.
 //! They come from:
 //!
 //! 1. craft-fonts, embedded at build time when `CRAFT_FONTS_DIR` points at a checkout (optional;
@@ -7,8 +7,9 @@
 //! 2. on desktop, the operating system's fonts (Windows, macOS, Linux and BSD paths).
 //!
 //! Fonts load lazily: one script when the UI language needs it, all of them while the language
-//! picker shows every language's own name. They are appended after the app's fonts
-//! (`theme::font_definitions`), so Latin text and row heights keep the interface font; the current language's script goes first, so
+//! picker shows every language's own name. Thai is no interface language, but its face loads in
+//! every language, so Thai layer and file names and typed text draw instead of boxes. They are
+//! appended after the app's fonts (`theme::font_definitions`), so Latin text and row heights keep the interface font; the current language's script goes first, so
 //! shared Han characters take that language's glyph forms. egui shapes Arabic and orders
 //! right-to-left runs itself. In the browser only craft-fonts can supply them (without it, the
 //! language shows its English name in the picker).
@@ -38,10 +39,12 @@ pub enum Script {
     Chinese,
     Korean,
     Arabic,
+    /// Not an interface language: installed in every language so Thai names and typed text draw.
+    Thai,
 }
 
 impl Script {
-    pub const ALL: [Script; 4] = [Script::Japanese, Script::Chinese, Script::Korean, Script::Arabic];
+    pub const ALL: [Script; 5] = [Script::Japanese, Script::Chinese, Script::Korean, Script::Arabic, Script::Thai];
 
     /// The script a UI language needs beyond Latin.
     pub fn of_language(code: &str) -> Option<Script> {
@@ -61,6 +64,7 @@ impl Script {
             Script::Chinese => "Hans",
             Script::Korean => "Kore",
             Script::Arabic => "Arab",
+            Script::Thai => "Thai",
         }
     }
 
@@ -76,6 +80,7 @@ impl Script {
                 Script::Chinese => &["msyh.ttc", "simsun.ttc", "simhei.ttf"],
                 Script::Korean => &["malgun.ttf", "gulim.ttc"],
                 Script::Arabic => &["segoeui.ttf", "tahoma.ttf", "arial.ttf"],
+                Script::Thai => &["LeelawUI.ttf", "leelawad.ttf", "tahoma.ttf"],
             };
             v.extend(files.iter().map(|f| (fonts.join(f), 0)));
         } else if cfg!(target_os = "macos") {
@@ -86,9 +91,19 @@ impl Script {
                 }
                 Script::Korean => &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
                 Script::Arabic => &["/System/Library/Fonts/SFArabic.ttf", "/System/Library/Fonts/Supplemental/GeezaPro.ttc"],
+                Script::Thai => &["/System/Library/Fonts/Supplemental/Thonburi.ttc", "/System/Library/Fonts/Thonburi.ttc"],
             };
             v.extend(files.iter().map(|f| (PathBuf::from(f), 0)));
             v.push((PathBuf::from("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"), 0));
+        } else if self == Script::Thai {
+            for f in [
+                "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+                "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+                "/usr/share/fonts/google-noto/NotoSansThai-Regular.ttf",
+                "/usr/share/fonts/truetype/tlwg/Loma.ttf",
+            ] {
+                v.push((PathBuf::from(f), 0));
+            }
         } else if self == Script::Arabic {
             for f in [
                 "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
@@ -104,7 +119,7 @@ impl Script {
         } else {
             // Noto Sans CJK collections hold JP, KR, SC, TC and HK faces, in that order.
             let face = match self {
-                Script::Japanese | Script::Arabic => 0,
+                Script::Japanese | Script::Arabic | Script::Thai => 0,
                 Script::Korean => 1,
                 Script::Chinese => 2,
             };
@@ -137,15 +152,17 @@ pub struct UiFonts {
 
 impl UiFonts {
     /// Install the fonts `language` needs, or every script's when `all` (the language picker is
-    /// showing). Fonts stay once loaded; the language's script moves to the front.
+    /// showing), and the Thai face in every language. Fonts stay once loaded; the language's
+    /// script moves to the front.
     pub fn update(&mut self, ctx: &egui::Context, language: &str, all: bool) {
         let first = Script::of_language(language);
-        if first.is_none_or(|f| self.installed.first() == Some(&f)) && (!all || self.installed.len() == Script::ALL.len()) {
+        let thai_installed = self.installed.contains(&Script::Thai);
+        if thai_installed && first.is_none_or(|f| self.installed.first() == Some(&f)) && (!all || self.installed.len() == Script::ALL.len()) {
             return;
         }
         let mut want: Vec<Script> = first.into_iter().collect();
         for s in Script::ALL {
-            if (all || self.installed.contains(&s)) && !want.contains(&s) {
+            if (all || s == Script::Thai || self.installed.contains(&s)) && !want.contains(&s) {
                 want.push(s);
             }
         }
@@ -290,14 +307,36 @@ mod tests {
         let ctx = egui::Context::default();
         let mut f = UiFonts::default();
         f.update(&ctx, "en", false);
-        assert!(f.installed.is_empty() && f.loaded.is_empty(), "English loads nothing");
+        assert_eq!(f.installed, [Script::Thai], "English loads only the Thai face");
         f.update(&ctx, "ko", false);
-        assert_eq!(f.installed, [Script::Korean]);
+        assert_eq!(f.installed, [Script::Korean, Script::Thai]);
         f.update(&ctx, "ja", true);
         assert_eq!(f.installed, Script::ALL);
         // Closing the picker keeps what is loaded; each script was read at most once.
         f.update(&ctx, "ja", false);
         assert_eq!(f.installed.len(), Script::ALL.len());
         assert_eq!(f.loaded.len(), Script::ALL.len());
+    }
+
+    /// Thai layer and file names draw in every family whatever the interface language (#362);
+    /// skipped when there is no Thai font.
+    #[test]
+    fn thai_draws_in_every_family_in_every_language() {
+        if load(Script::Thai).is_none() {
+            eprintln!("skipping: no Thai font");
+            return;
+        }
+
+        for language in ["en", "ja", "ar"] {
+            let ctx = egui::Context::default();
+            let mut f = UiFonts::default();
+            f.update(&ctx, language, false);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+            output.textures_delta.clear();
+            for family in [FontFamily::Proportional, FontFamily::Monospace, FontFamily::Name(crate::theme::SEMIBOLD.into())] {
+                let font = egui::FontId::new(13.0, family.clone());
+                assert!(ctx.fonts_mut(|v| v.has_glyphs(&font, "สวัสดีเลเยอร์")), "{language}: {family:?} has no Thai");
+            }
+        }
     }
 }
