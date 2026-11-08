@@ -484,7 +484,8 @@ impl Session {
     // -----------------------------------------------------------------------------------------
     // History
 
-    /// Run an undoable edit. On error the document is left untouched.
+    /// Run an undoable edit. On error, or if `f` panics, the document is left untouched (other
+    /// session state, such as the selection, is not restored).
     pub fn edit<T>(&mut self, label: &str, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
         self.edit_merging(label, self.merge_edits, f)
     }
@@ -493,7 +494,18 @@ impl Session {
     /// same label (a drag in the viewport is one step however many updates it makes).
     pub fn edit_merging<T>(&mut self, label: &str, merge: bool, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
         let before = self.doc.clone();
-        let result = f(self).and_then(|v| match self.doc.project.instance_cycle() {
+        // A panic inside `f` must not leave a half-edited document behind: the automation
+        // servers catch panics and keep serving this session. (On wasm a panic aborts, so
+        // there is nothing to restore.)
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        let result = match ran {
+            Ok(r) => r,
+            Err(panic) => {
+                self.doc = before;
+                std::panic::resume_unwind(panic);
+            }
+        };
+        let result = result.and_then(|v| match self.doc.project.instance_cycle() {
             Some(id) => Err(EngineError::Other(format!("instance layer {} would draw itself", id.0))),
             None => Ok(v),
         });

@@ -390,33 +390,49 @@ impl Session {
         };
         // Each path goes through the regular stroke and fill code with its own settings; their
         // own history entries are dropped (the caller records one step).
+        let mut out = vec![Value::Null; start];
+        let result = self.while_painting_paths(eid, |s| {
+            let mut result = Ok(());
+            for i in start..=shapes.len() {
+                if i == from.min(shapes.len()) && i > start {
+                    let pixels = &s.doc.pixels;
+                    let layers = pixels.layers.iter().filter(|((id, _), _)| *id == eid).map(|(k, v)| (*k, v.clone())).collect();
+                    s.path_cache = Some(PathCache { eid, key, below: shapes[..i].to_vec(), mask: pixels.masks.get(&eid).cloned(), layers });
+                }
+                let Some(sh) = shapes.get(i) else { break };
+                match s.paint_shape(sh) {
+                    Ok(v) => out.push(v),
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+            result
+        });
+        result.map(|_| out)
+    }
+
+    /// Run `f` with the session switched into path-painting state (path tool on sublayer `eid`,
+    /// empty history), then put the tool, camera, target, quick-mask flag and the undo/redo
+    /// stacks back. A panic in `f` restores them too before it continues unwinding: the
+    /// automation servers catch panics and keep serving this session, and must not find its
+    /// history gone.
+    fn while_painting_paths<T>(&mut self, eid: LayerId, f: impl FnOnce(&mut Session) -> T) -> T {
         let saved = (self.tool.clone(), self.camera, self.target, self.quick_mask.editing);
         let history = (std::mem::take(&mut self.undo), std::mem::take(&mut self.redo));
         self.target = StackTarget::Effect(eid);
         self.quick_mask.editing = false;
         self.tool.tool = Tool::Path;
         self.painting_paths = true;
-        let mut out = vec![Value::Null; start];
-        let mut result = Ok(());
-        for i in start..=shapes.len() {
-            if i == from.min(shapes.len()) && i > start {
-                let pixels = &self.doc.pixels;
-                let layers = pixels.layers.iter().filter(|((id, _), _)| *id == eid).map(|(k, v)| (*k, v.clone())).collect();
-                self.path_cache = Some(PathCache { eid, key, below: shapes[..i].to_vec(), mask: pixels.masks.get(&eid).cloned(), layers });
-            }
-            let Some(sh) = shapes.get(i) else { break };
-            match self.paint_shape(sh) {
-                Ok(v) => out.push(v),
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            }
-        }
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         self.painting_paths = false;
         (self.tool, self.camera, self.target, self.quick_mask.editing) = saved;
         (self.undo, self.redo) = history;
-        result.map(|_| out)
+        match ran {
+            Ok(v) => v,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     fn paint_shape(&mut self, shape: &PathShape) -> Result<Value> {
@@ -555,5 +571,28 @@ mod tests {
         s.render_paths(eid, 0).unwrap();
         assert_eq!(cached, pixels(&s, eid), "same pixels as painting every path");
         assert!(!cached.is_empty());
+    }
+
+    #[test]
+    fn a_panic_while_painting_paths_restores_history_and_tool_state() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::sphere(1.0, 24, 12), "builtin:test", None, 128).unwrap();
+        s.update();
+        execute(&mut s, "tool.brush", &json!({"size": 6})).unwrap();
+        let r = execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, 0.2], [0.9, 0.25]], "commit": true})).unwrap();
+        let eid = texturecraft_core::LayerId(r["committed"]["effect"].as_u64().unwrap());
+        assert!(!s.history_labels().is_empty());
+        let labels = s.history_labels();
+        let (target, tool) = (s.target, s.tool.tool);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.while_painting_paths(eid, |s| {
+                s.edit("nested", |_| Ok(())).unwrap();
+                panic!("paint failed");
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(s.history_labels(), labels);
+        assert_eq!((s.target, s.tool.tool), (target, tool));
+        assert!(!s.painting_paths);
     }
 }
