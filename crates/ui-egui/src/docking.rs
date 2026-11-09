@@ -38,10 +38,11 @@ pub enum Panel {
     Shader,
     History,
     Log,
+    Reference,
 }
 
 /// Window ▸ Views items and the panels they show or hide.
-pub const VIEWS: [(&str, Panel); 12] = [
+pub const VIEWS: [(&str, Panel); 13] = [
     ("ui.view.assets", Panel::Assets),
     ("ui.view.bakeMaps", Panel::MeshMapSettings),
     ("ui.view.bakeSettings", Panel::CommonSettings),
@@ -51,6 +52,7 @@ pub const VIEWS: [(&str, Panel); 12] = [
     ("ui.view.log", Panel::Log),
     ("ui.view.meshMapBakers", Panel::MeshMapBakers),
     ("ui.view.properties", Panel::Properties),
+    ("ui.view.reference", Panel::Reference),
     ("ui.view.shader", Panel::Shader),
     ("ui.view.textureSetList", Panel::TextureSetList),
     ("ui.view.textureSetSettings", Panel::TextureSetSettings),
@@ -70,7 +72,7 @@ impl Panel {
         }
     }
 
-    pub const ALL: [Panel; 13] = [
+    pub const ALL: [Panel; 14] = [
         Panel::Viewport,
         Panel::Assets,
         Panel::MeshMapSettings,
@@ -84,6 +86,7 @@ impl Panel {
         Panel::Shader,
         Panel::History,
         Panel::Log,
+        Panel::Reference,
     ];
 
     pub fn name(self) -> &'static str {
@@ -101,6 +104,7 @@ impl Panel {
             Panel::Shader => "Shader Settings",
             Panel::History => "History",
             Panel::Log => "Log",
+            Panel::Reference => "Reference",
         }
     }
 
@@ -111,6 +115,7 @@ impl Panel {
             Panel::Shader => 1.0,
             Panel::History => 2.0,
             Panel::Log => 3.0,
+            Panel::Reference => 4.0,
             _ => return None,
         };
         Some([960.0, 90.0 + 50.0 * slot, 300.0, 380.0])
@@ -464,6 +469,7 @@ impl DockContent<Panel> for Panels<'_> {
             }
             Panel::History => crate::windows::history(app, ui),
             Panel::Log => crate::windows::log(app, ui),
+            Panel::Reference => crate::reference::panel(app, ui),
             Panel::Viewport => {}
         });
     }

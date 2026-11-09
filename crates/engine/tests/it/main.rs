@@ -21,6 +21,7 @@ mod path_tool;
 mod perf;
 mod polygon_fill;
 mod project_recovery;
+mod reference;
 mod sample;
 mod tools;
 mod udim;

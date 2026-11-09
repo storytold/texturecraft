@@ -4407,6 +4407,7 @@ version = "0.3.1"
 name = "texturecraft-ui-egui"
 version = "0.3.1"
 dependencies = [
+ "arboard",
  "base64 0.22.1",
  "craft-dialogs",
  "craft-keymap",

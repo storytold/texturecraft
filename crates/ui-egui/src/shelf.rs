@@ -550,7 +550,8 @@ fn environments(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str, name: &str
 
 fn textures(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: &str, name: &str) {
     let tk = Tokens::get(ctx);
-    let names: Vec<String> = app.session.doc.resources.keys().filter(|n| matches(filter, &[n])).cloned().collect();
+    let names: Vec<String> =
+        app.session.doc.resources.keys().filter(|n| !texturecraft_engine::reference_cmds::is_embedded_copy(n) && matches(filter, &[n])).cloned().collect();
     if !filter.is_empty() && names.is_empty() {
         return;
     }

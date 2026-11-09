@@ -70,6 +70,7 @@ pub const CATALOG: &[Item] = &[
     sub("Window", "Views", "Mesh Map Bakers", "ui.view.meshMapBakers", None),
     sub("Window", "Views", "Mesh Map Settings", "ui.view.bakeMaps", None),
     sub("Window", "Views", "Properties", "ui.view.properties", None),
+    sub("Window", "Views", "Reference", "ui.view.reference", None),
     sub("Window", "Views", "Shader Settings", "ui.view.shader", None),
     sub("Window", "Views", "Texture Sets", "ui.view.textureSetList", None),
     sub("Window", "Views", "Texture Set Settings", "ui.view.textureSetSettings", None),

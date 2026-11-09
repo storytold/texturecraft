@@ -33,6 +33,7 @@ mod preview_request;
 mod preview_worker;
 pub mod profile;
 pub mod properties_popup;
+pub mod reference;
 pub mod render_mode;
 mod resource_picker;
 mod resource_picker_item;
@@ -578,7 +579,10 @@ impl eframe::App for TextureCraftApp {
         web_files::poll(self);
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in &dropped {
-            web_files::dropped(self, ctx, f);
+            // A file dropped on the Reference panel is a reference image.
+            if !reference::take_drop(self, ctx, f) {
+                web_files::dropped(self, ctx, f);
+            }
         }
         self.poll_bake(ctx);
         self.poll_resize(ctx);

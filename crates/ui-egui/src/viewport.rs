@@ -683,6 +683,8 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     add_callback(app, ui, rect, frame, sync);
     polygon_fill_box_overlay(ui, rect, fill_box);
 
+    // The pinned reference image (a screen overlay: never in a render or export).
+    crate::reference::overlay(app, ui, rect);
     // Shelf drops: a material goes above the selection of the set under the pointer, an alpha on the brush
     crate::shelf::drop_target(app, ui, &response, crate::shelf::DropZone::View3d);
 
