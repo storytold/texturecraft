@@ -108,6 +108,8 @@ fn set(layers: Vec<ProjectLayer>) -> ProjectTextureSet {
         shader_model: None,
         layers,
         mesh_maps: vec![],
+        uses_uv_tiles: false,
+        uv_tile_entries: 0,
         unhandled: vec![],
     }
 }
