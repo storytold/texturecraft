@@ -945,10 +945,10 @@ pub fn file_action(app: &mut TextureCraftApp, _ctx: &egui::Context, id: &str) ->
             true
         }
         "file.exportMesh" => {
-            let name = format!("{}.obj", texturecraft_engine::formats::export::sanitize_file_stem(&app.session.doc.project.name));
+            let name = texturecraft_engine::formats::export::sanitize_file_stem(&app.session.doc.project.name);
             let dialog = FileDialog::save()
                 .filter(tr("Wavefront OBJ with MTL, textures alongside"), &["obj"])
-                .filter(tr("glTF binary with textures"), &["glb"])
+                .filter(tr("glTF binary with textures"), &["glb", "gltf"])
                 .filter(tr("USDZ with textures"), &["usdz"])
                 .filter(tr("USD text, textures alongside"), &["usda"])
                 .filter(tr("USD binary, textures alongside"), &["usdc"])
