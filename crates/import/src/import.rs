@@ -13,7 +13,7 @@ use texturecraft_core::{
     BlendMode, Channel, ChannelBlend, Fidelity, Fill, ImportReport, Layer, LayerId, LayerKind, LayerReport, LayerRole, Lock, LockReason, MAX_RESOLUTION,
     MIN_RESOLUTION, NormalFormat, Project, Source, TextureSet, import_report::original_result_layer,
 };
-use texturecraft_geom::Mesh;
+use texturecraft_geom::{Mesh, UvGBuffer};
 use texturecraft_import_reader::decode::assbin::{AssbinGeometry, AssbinScene};
 use texturecraft_import_reader::decode::document::{MaterialRecord, NormalMapSyscoord};
 use texturecraft_import_reader::model::baking::{BAKING_INI, ProjectBakeSettings};
@@ -28,6 +28,7 @@ use crate::graph_library::GraphLibrary;
 use crate::image::Rgba;
 use crate::layers::{self, ImportedStack, SetInput};
 use crate::options::ImportOptions;
+use crate::polygon_fill::geometry::SetGeometry;
 use crate::replay::{ReplayJob, ReplayScene, ReplayTarget, ReplayedPixels, StrokeReplayer};
 use crate::resources::{CacheImage, ProjectImages, read_cache};
 use crate::safety_net::{self, AGREEMENT_STEPS, Score, SetScene, Strategy};
@@ -160,6 +161,8 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     let geometry = AssbinGeometry::parse(&scene).map_err(decode("mesh"))?;
     let materials = AssbinScene::parse(&scene).map_err(decode("mesh"))?.materials;
     let mut mesh = mesh::mesh_of(&geometry).map_err(ImportError::Invalid)?;
+    // per submesh (one per part, in order): the source polygons, for polygon-fill picks
+    let polygon_starts: Vec<Vec<bool>> = geometry.parts.iter().map(|p| p.polygon_starts.clone()).collect();
     let mut report = ImportReport::new(source_label(file, file_name), IMPORTER);
     report.add("mesh", Fidelity::Exact, format!("{} parts, {} triangles, at the file's normalised scale", mesh.submeshes.len(), mesh.triangle_count()));
     hooks.check()?;
@@ -259,6 +262,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
             source,
             project_set,
             mesh: &mesh,
+            polygon_starts: &polygon_starts,
             images: &images,
             options,
             syscoord,
@@ -310,6 +314,8 @@ struct SetContext<'a, 'h> {
     source: &'a SetSource,
     project_set: Option<&'a ProjectTextureSet>,
     mesh: &'a Mesh,
+    /// Per submesh, the per-triangle flags of its source polygons.
+    polygon_starts: &'a [Vec<bool>],
     images: &'a ProjectImages<'a>,
     options: &'a ImportOptions,
     syscoord: Option<NormalMapSyscoord>,
@@ -438,6 +444,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     project.texture_sets.push(set);
     // the layer stack
     let parts: Vec<String> = ctx.mesh.submeshes.iter().filter(|s| s.material == ctx.source.slot).map(|s| s.name.clone()).collect();
+    let geometry = SetGeometry::new(ctx.mesh, ctx.source.slot, ctx.polygon_starts);
     let mut stack = match ctx.project_set {
         Some(project_set) => {
             let replay = ctx.options.replay_strokes && ctx.hooks.replay.is_some();
@@ -449,6 +456,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
                 options: ctx.options,
                 replay,
                 graphs: ctx.graphs,
+                geometry: Some(&geometry),
             };
             let mut stack = layers::import(project_set, &input, project.next_id);
             if let Some(note) = uv_tiles::per_tile_note(project_set, &uv_tiles::mesh_tiles(ctx.mesh, ctx.source.slot)) {
@@ -470,6 +478,12 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         Some(s) => (s.verdict.all_exact(), s.verdict.layer_count),
         None => (false, 0),
     };
+    if let Some(stack) = stack.as_mut()
+        && !stack.fills.is_empty()
+    {
+        ctx.hooks.check()?;
+        lay_polygon_fills(stack, ctx.mesh, ctx.source.slot, resolution, &mut out.pixels);
+    }
     let mut replayed = ReplayCount::default();
     if let Some(stack) = stack.as_mut()
         && let Some(replayer) = ctx.hooks.replay.filter(|_| !stack.jobs.is_empty())
@@ -637,6 +651,16 @@ fn add_correction(
     r.role = LayerRole::Correction;
     r.fidelity = Fidelity::Baked;
     report.add(item(correction::CORRECTION_NAME), Fidelity::Baked, text);
+}
+
+/// Lays the stack's polygon fills into their paint effects' pixels, over the set's UV G-buffer at `resolution`.
+fn lay_polygon_fills(stack: &mut ImportedStack, mesh: &Mesh, slot: usize, resolution: u32, pixels: &mut PixelStore) {
+    let gbuf = UvGBuffer::new(mesh, slot, resolution, resolution);
+    for job in std::mem::take(&mut stack.fills) {
+        if let Some(image) = job.paint(&gbuf) {
+            pixels.masks.insert(job.effect, image);
+        }
+    }
 }
 
 /// One line per blocker of the set: what it is, how many layers it locks and how many by it alone.

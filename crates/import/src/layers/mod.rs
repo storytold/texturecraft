@@ -44,6 +44,8 @@ pub struct SetInput<'a> {
     pub replay: bool,
     /// The project's graphs, decompiled; `None` keeps graph uses placeholders.
     pub graphs: Option<&'a crate::graph_library::GraphLibrary>,
+    /// The set's mesh parts, for polygon-fill picks; `None` keeps polygon fills placeholders.
+    pub geometry: Option<&'a crate::polygon_fill::geometry::SetGeometry<'a>>,
 }
 
 /// One anchor of the set: the effect id it became, whether it sits in a mask, and how exactly what it holds is
@@ -101,6 +103,8 @@ pub struct ImportedStack {
     pub anchors: Anchors,
     /// Strokes to replay into the stack's paint layers and paint effects.
     pub jobs: Vec<crate::replay::ReplayJob>,
+    /// Polygon fills to lay into the stack's mask paint effects.
+    pub fills: Vec<crate::polygon_fill::FillJob>,
 }
 
 /// Hands out layer and effect ids.
@@ -224,6 +228,7 @@ impl<'a> Builder<'a> {
         let (geometry_mask, geometry_status) = geometry::map(l.geometry.as_ref(), self.input.parts, &[]);
         let mut mask = mask::MaskBuilder::new(self.input, self.anchors, &mut self.ids).at(&path).build(l.mask.as_ref());
         self.out.jobs.append(&mut mask.jobs);
+        self.out.fills.append(&mut mask.fills);
         mask.status.and(&geometry_status);
         let mut note = mask.status.clone();
         let own_settings = settings_status(l);

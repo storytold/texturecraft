@@ -515,7 +515,7 @@ mod tests {
     /// Runs `f` with a set input over `lib` (`None`: graphs kept).
     fn with<R>(lib: Option<&GraphLibrary>, f: impl FnOnce(&SetInput, &Anchors) -> R) -> R {
         let (ch, images, options) = (channels(), ProjectImages::none(), ImportOptions::default());
-        let input = SetInput { channels: &ch, images: &images, mesh_maps: &[], parts: &[], options: &options, replay: false, graphs: lib };
+        let input = SetInput { channels: &ch, images: &images, mesh_maps: &[], parts: &[], options: &options, replay: false, graphs: lib, geometry: None };
         let mut anchors = Anchors::new();
         anchors.insert(7, AnchorInfo { id: LayerId(70), in_mask: false, status: Status::Exact });
         f(&input, &anchors)

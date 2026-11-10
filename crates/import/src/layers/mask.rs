@@ -3,22 +3,26 @@
 //!
 //! Uniform fills become grey fills, bitmap fills image fills (a mesh map slot left empty reads black), reference fills
 //! anchor fills; levels and colour selection keep their kind. Painted strokes become paint effects replayed with
-//! TextureCraft's brush when the import has a replayer (approximated; [`crate::replay`]). Compiled-graph generators and
-//! filters, strokes that cannot be replayed, polygon fills, anchors inside the mask and unknown classes are
-//! placeholders, and the first of them makes the mask not computable. An effect group of brush work with its own blending (or
+//! TextureCraft's brush when the import has a replayer (approximated; [`crate::replay`]). Polygon fills become paint
+//! effects whose pixels are their picks resolved on the set's mesh ([`crate::polygon_fill`]). Compiled-graph generators and
+//! filters, strokes that cannot be replayed, polygon fills that cannot be resolved, anchors inside the mask and unknown
+//! classes are placeholders, and the first of them makes the mask not computable. An effect group of brush work with its own blending (or
 //! holding an eraser) becomes one paint effect with the group's blending, its strokes replayed together; other groups are laid
-//! flat (approximated unless they pass through or blend normally at full strength).
+//! flat (approximated unless they pass through or blend normally at full strength). A group of nothing but polygon fills with its
+//! own blending is one paint effect of their picks.
 
 use texturecraft_core::{BlendMode, Effect, EffectKind, Mask, MaskBackground, Source};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{
-    BitmapSource, ColorSelectionEffect, EffectGroup, EffectHeader, FillEffect, MaskInitial, PaintTool, ProjectEffect, ProjectMask, ProjectSource,
+    BitmapSource, ColorSelectionEffect, EffectGroup, EffectHeader, FillEffect, MaskInitial, PaintTool, PolygonFillEffect, ProjectEffect, ProjectMask,
+    ProjectSource,
 };
 
 use super::content::{is_dangling, levels, reference, replay_status};
 use super::{Anchors, Ids, SetInput, effect, projection};
 use crate::blend::ResolvedBlend;
 use crate::graph_uses::{self, GraphUse};
+use crate::polygon_fill::{self, FillJob, FillRun};
 use crate::replay::brush::StepTarget;
 use crate::replay::{PaintMode, ReplayJob, ReplayTarget};
 use crate::resources::{MeshMapAlias, mesh_map_alias};
@@ -31,6 +35,8 @@ pub struct MaskOutcome {
     pub graphs: Vec<String>,
     /// Painted strokes to replay into the mask's paint effects.
     pub jobs: Vec<ReplayJob>,
+    /// Polygon fills to lay into the mask's paint effects.
+    pub fills: Vec<FillJob>,
 }
 
 pub struct MaskBuilder<'a, 'i> {
@@ -45,6 +51,7 @@ pub struct MaskBuilder<'a, 'i> {
     /// The last strokes placeholder: its index, strokes and paint effects so far.
     strokes_run: Option<(usize, usize, usize)>,
     jobs: Vec<ReplayJob>,
+    fills: Vec<FillJob>,
     /// The layer's path, for the replay jobs' labels.
     path: String,
 }
@@ -61,6 +68,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
             counts: true,
             strokes_run: None,
             jobs: Vec::new(),
+            fills: Vec::new(),
             path: String::new(),
         }
     }
@@ -72,7 +80,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
     }
 
     pub fn build(mut self, mask: Option<&ProjectMask>) -> MaskOutcome {
-        let Some(m) = mask else { return MaskOutcome { mask: None, status: Status::Exact, graphs: Vec::new(), jobs: Vec::new() } };
+        let Some(m) = mask else { return MaskOutcome { mask: None, status: Status::Exact, graphs: Vec::new(), jobs: Vec::new(), fills: Vec::new() } };
         let background = match m.initial {
             MaskInitial::Black => MaskBackground::Black,
             MaskInitial::White => MaskBackground::White,
@@ -82,7 +90,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                     true => Status::not_computable(Blocker::feature("mask-initial-value", format!("mask initial value {n}"))),
                     false => Status::Exact,
                 };
-                return MaskOutcome { mask: None, status, graphs: Vec::new(), jobs: Vec::new() };
+                return MaskOutcome { mask: None, status, graphs: Vec::new(), jobs: Vec::new(), fills: Vec::new() };
             }
         };
         self.counts = m.enabled;
@@ -90,7 +98,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
             self.effect(e, true);
         }
         let mask = Mask { enabled: m.enabled, background, effects: self.effects };
-        MaskOutcome { mask: Some(mask), status: self.status, graphs: self.graphs, jobs: self.jobs }
+        MaskOutcome { mask: Some(mask), status: self.status, graphs: self.graphs, jobs: self.jobs, fills: self.fills }
     }
 
     /// Adds the status of a part that counts.
@@ -217,10 +225,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 self.push(header, EffectKind::Levels(ours), on);
             }
             ProjectEffect::ColorSelection(c) => self.color_selection(c, on),
-            ProjectEffect::PolygonFill(_) => {
-                let why = Status::not_computable(Blocker::feature("polygon-fill", "polygon fill in a mask"));
-                self.placeholder(header, "polygon fill", "polygon fills are not computed yet", on, why);
-            }
+            ProjectEffect::PolygonFill(p) => self.polygon_fill(p, on),
             ProjectEffect::Other(raw) => {
                 let why = Status::not_computable(Blocker::class(&raw.class, format!("mask effect {}", raw.class)));
                 self.placeholder(None, &format!("unknown effect {}", raw.class), "an effect class this version does not read", on, why);
@@ -234,6 +239,9 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
     /// composites such a group. False (nothing pushed) when the group holds anything else or a stroke that cannot be
     /// replayed: the caller lays it flat.
     fn group_layer(&mut self, g: &EffectGroup, on: bool) -> bool {
+        if self.polygon_fill_group(g, on) {
+            return true;
+        }
         if !self.input.replay {
             return false;
         }
@@ -275,6 +283,74 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         self.note(on, &status);
         self.jobs.push(job);
         true
+    }
+
+    /// A polygon fill: one paint effect whose pixels are its picks, later ones over earlier ones (as TextureCraft's polygon
+    /// fill tool leaves them); a placeholder when the picks cannot be resolved on the mesh.
+    fn polygon_fill(&mut self, p: &PolygonFillEffect, on: bool) {
+        let runs = polygon_fill::runs(self.input.geometry, p);
+        if !runs.status.is_computable() {
+            self.placeholder(Some(&p.header), "polygon fill", "the polygon fill's picks could not be resolved on the mesh", on, runs.status);
+            return;
+        }
+        let mut status = runs.status.clone();
+        let blend = ResolvedBlend::of_mask(&p.header.blending);
+        let normal = matches!(blend.mode(), BlendMode::Normal | BlendMode::Passthrough) && blend.opacity >= 1.0;
+        if !normal && distinct_values(&runs.runs) > 1 {
+            status.and(&Status::approximated("polygon fill: picks with several values blended as one effect (not measured)"));
+        }
+        self.note(on && blend.contributes(), &status);
+        self.push(Some(&p.header), EffectKind::Paint, on);
+        if !runs.picks_nothing() {
+            self.fill_job(runs.runs, "polygon fill");
+        }
+    }
+
+    /// A group with its own blending holding nothing but polygon fills (switched-off entries aside): one paint effect of
+    /// all their picks laid over each other, blending with the mask below with the group's blend. False (nothing pushed)
+    /// when the group holds anything else or a pick that cannot be resolved.
+    fn polygon_fill_group(&mut self, g: &EffectGroup, on: bool) -> bool {
+        let mut fills = Vec::new();
+        for e in g.effects.iter().filter(|e| e.is_enabled()) {
+            match e {
+                ProjectEffect::PolygonFill(p) => fills.push(p),
+                _ => return false,
+            }
+        }
+        if fills.is_empty() {
+            return false;
+        }
+        let mut status = Status::Exact;
+        let mut all = Vec::new();
+        for p in fills {
+            let runs = polygon_fill::runs(self.input.geometry, p);
+            if !runs.status.is_computable() {
+                return false;
+            }
+            status.and(&runs.status);
+            let own = ResolvedBlend::of_mask(&p.header.blending);
+            let plain = p.header.blending.is_empty() || (matches!(own.mode(), BlendMode::Normal | BlendMode::Passthrough) && own.opacity >= 1.0);
+            if !plain {
+                status.and(&Status::approximated(format!(
+                    "polygon fill with its own blend ({:?} {}) inside a mask group laid over normally",
+                    own.mode(),
+                    own.opacity
+                )));
+            }
+            all.extend(runs.runs);
+        }
+        self.note(on, &status);
+        self.push(Some(&g.header), EffectKind::Paint, on);
+        if all.iter().any(|r| !r.triangles.is_empty()) {
+            self.fill_job(all, "polygon fill group");
+        }
+        true
+    }
+
+    /// Lays `runs` into the paint effect just pushed.
+    fn fill_job(&mut self, runs: Vec<FillRun>, what: &str) {
+        let id = self.effects.last().map_or(texturecraft_core::LayerId(0), |e| e.id);
+        self.fills.push(FillJob { effect: id, runs, label: format!("{} / {what}", self.path) });
     }
 
     /// TextureCraft selects within a per-component tolerance on the set's ID map; the file's hardness is left out.
@@ -355,4 +431,15 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
             }
         }
     }
+}
+
+/// How many different greys the runs write.
+fn distinct_values(runs: &[FillRun]) -> usize {
+    let mut seen: Vec<f32> = Vec::new();
+    for r in runs.iter().filter(|r| !r.triangles.is_empty()) {
+        if !seen.contains(&r.color[0]) {
+            seen.push(r.color[0]);
+        }
+    }
+    seen.len()
 }

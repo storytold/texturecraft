@@ -119,7 +119,8 @@ fn build(layers: Vec<ProjectLayer>) -> ImportedStack {
     let images = ProjectImages::none();
     let options = ImportOptions::default();
     let parts = ["Body".to_string(), "Eyes".to_string()];
-    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: false, graphs: None };
+    let input =
+        SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: false, graphs: None, geometry: None };
     import(&set(layers), &input, 10)
 }
 
@@ -310,7 +311,7 @@ fn build_replaying(layers: Vec<ProjectLayer>) -> ImportedStack {
     let images = ProjectImages::none();
     let options = ImportOptions::default();
     let parts = ["Body".to_string()];
-    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: true, graphs: None };
+    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: true, graphs: None, geometry: None };
     import(&set(layers), &input, 10)
 }
 
@@ -413,7 +414,8 @@ fn a_decompiled_fill_lays_each_channel_with_its_own_blend() {
     lib.insert_as(&["strata".to_string()], "", d);
     let (channels, images, options) = (channels(), ProjectImages::none(), ImportOptions::default());
     let parts = ["Body".to_string()];
-    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: false, graphs: Some(&lib) };
+    let input =
+        SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: false, graphs: Some(&lib), geometry: None };
     let blending = vec![blend(BASE, 2, 1.0), blend(HEIGHT, 4, 1.0)];
     let l = layer(1, "Strata", ProjectLayerKind::Paint, vec![fill(2, BASE | HEIGHT, vec![procedural(BASE | HEIGHT, "strata")], blending)]);
     let stack = import(&set(vec![l]), &input, 10);
@@ -503,4 +505,91 @@ fn a_mask_group_holding_more_than_brush_work_or_without_replay_stays_flat() {
     let stack = build(vec![masked(only_brush)]);
     let m = by_name(&stack, "Masked").mask.as_ref().unwrap();
     assert!(m.effects.iter().all(|e| matches!(e.kind, EffectKind::Placeholder { .. })), "{m:?}");
+}
+
+/// One quad over the whole UV square as part "Body" of material 0 (two triangles, one polygon).
+fn quad_mesh() -> texturecraft_geom::Mesh {
+    use glam::{Vec2, Vec3};
+    texturecraft_geom::Mesh {
+        positions: vec![Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::Y],
+        normals: vec![Vec3::Z; 4],
+        uvs: vec![Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 0.0)],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        submeshes: vec![texturecraft_geom::SubMesh { name: "Body".into(), material: 0, start: 0, count: 6 }],
+        materials: vec!["m".into()],
+        ..texturecraft_geom::Mesh::default()
+    }
+}
+
+fn polygon_fill(uid: u64, grey: f32, q: [f32; 2], blending: Vec<ChannelBlending>) -> ProjectEffect {
+    use texturecraft_import_reader::model::{DecalHit, HitGranularity, HitShape, PolygonFillEffect};
+    let hit = DecalHit {
+        uid: None,
+        shape: HitShape::Point(q),
+        color: [grey; 3],
+        granularity: HitGranularity::Triangle,
+        view: StrokeView::Uv,
+        proj_view_inv: [0.0; 16],
+        duplicate_count: 0,
+        duplicate_matrix: [0.0; 16],
+        paint_through: false,
+        collision: None,
+        occlusion_culling: None,
+    };
+    ProjectEffect::PolygonFill(PolygonFillEffect { header: header(uid, u64::MAX, blending), hits: vec![hit], unread: 0 })
+}
+
+fn build_with_mesh(layers: Vec<ProjectLayer>, mesh: &texturecraft_geom::Mesh) -> ImportedStack {
+    let channels = channels();
+    let images = ProjectImages::none();
+    let options = ImportOptions::default();
+    let parts = ["Body".to_string()];
+    let geometry = crate::polygon_fill::geometry::SetGeometry::new(mesh, 0, &[vec![true, false]]);
+    let input = SetInput {
+        channels: &channels,
+        images: &images,
+        mesh_maps: &[],
+        parts: &parts,
+        options: &options,
+        replay: false,
+        graphs: None,
+        geometry: Some(&geometry),
+    };
+    import(&set(layers), &input, 10)
+}
+
+#[test]
+fn mask_polygon_fills_become_paint_effects_with_their_picks() {
+    use texturecraft_import_reader::model::ProjectBlendMode;
+    let mesh = quad_mesh();
+    let masked = |effects: Vec<ProjectEffect>| {
+        let mut l = layer(1, "Masked", ProjectLayerKind::Fill, vec![fill(2, ROUGH, vec![uniform(ROUGH, [1.0; 3])], vec![])]);
+        l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::Black, effects });
+        l
+    };
+    // a white click on the lower-right triangle (the file's UV, V up), then a click beside the mesh
+    let stack = build_with_mesh(vec![masked(vec![polygon_fill(3, 1.0, [0.9, 0.1], vec![]), polygon_fill(4, 1.0, [3.0, 3.0], vec![])])], &mesh);
+    let l = by_name(&stack, "Masked");
+    let m = l.mask.as_ref().unwrap();
+    assert_eq!(m.effects.len(), 2);
+    assert!(m.effects.iter().all(|e| matches!(e.kind, EffectKind::Paint)), "{m:?}");
+    assert!(!l.is_locked() && stack.verdict.all_exact(), "{:?}", stack.verdict);
+    assert_eq!(stack.fills.len(), 1, "the fill picking nothing paints nothing");
+    assert_eq!((stack.fills[0].effect, stack.fills[0].runs[0].triangles.iter().copied().collect::<Vec<_>>()), (m.effects[0].id, vec![0]));
+    // the pixels: the picked triangle white at full coverage
+    let gbuf = texturecraft_geom::UvGBuffer::new(&mesh, 0, 16, 16);
+    let img = stack.fills[0].paint(&gbuf).unwrap();
+    assert_eq!(img.get(14, 14)[..2], [u16::MAX, u16::MAX]);
+    assert_eq!(img.get(1, 1)[..2], [0, 0]);
+    // a group of polygon fills with its own blending is one paint effect with the group's blend
+    let group = mask_group(5, ProjectBlendMode::Subtract, 1.0, vec![polygon_fill(6, 1.0, [0.9, 0.1], vec![]), polygon_fill(7, 0.5, [0.1, 0.9], vec![])]);
+    let stack = build_with_mesh(vec![masked(vec![group])], &mesh);
+    let m = by_name(&stack, "Masked").mask.as_ref().unwrap();
+    assert_eq!(m.effects.len(), 1);
+    assert_eq!((m.effects[0].blend, stack.fills[0].runs.len()), (BlendMode::Subtract, 2));
+    assert!(stack.verdict.all_exact(), "{:?}", stack.verdict);
+    // without the mesh it stays a locked placeholder
+    let stack = build(vec![masked(vec![polygon_fill(3, 1.0, [0.9, 0.1], vec![])])]);
+    let l = by_name(&stack, "Masked");
+    assert!(l.is_locked() && matches!(l.mask.as_ref().unwrap().effects[0].kind, EffectKind::Placeholder { .. }));
 }

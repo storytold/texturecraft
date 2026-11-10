@@ -32,6 +32,7 @@ pub mod import;
 pub mod layers;
 pub mod mesh;
 pub mod options;
+pub mod polygon_fill;
 pub mod replay;
 pub mod resources;
 pub mod safety_net;
