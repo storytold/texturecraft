@@ -6,11 +6,12 @@
 //! - [`sets`], [`mesh`], [`channels`], [`blend`], [`baked`], [`bake_settings`], [`cameras`]: the mapping tables.
 //! - [`layers`]: the layer tree, content, masks, projections and geometry masks.
 //! - [`graph_uses`]: every use of a compiled graph; placeholders until graphs are computed.
+//! - [`replay`]: brush strokes handed to a [`replay::StrokeReplayer`] (the engine's brush) as replay jobs.
 //! - [`safety_net`]: each stack composited by TextureCraft's compositor and compared with the original's stored result.
 //!
 //! The import reads nothing but the file and its options; nothing of the original file is stored in the project.
-//! Brush strokes are not replayed in this version: paint layers keep only the original's stored result (reported as
-//! baked).
+//! This crate rasterises no strokes: with a replayer ([`Hooks::replay`]) painted masks and brush work become pixels
+//! (approximated) before the safety net measures; without one they stay placeholders.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -26,6 +27,7 @@ pub mod import;
 pub mod layers;
 pub mod mesh;
 pub mod options;
+pub mod replay;
 pub mod resources;
 pub mod safety_net;
 pub mod sets;

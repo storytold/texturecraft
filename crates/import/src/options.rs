@@ -17,10 +17,13 @@ pub struct ImportOptions {
     /// Largest texture set resolution kept (larger sets are imported at this size, the original's result reduced);
     /// `None` keeps the file's resolution.
     pub max_resolution: Option<u32>,
+    /// Replays brush strokes with the replayer the import is given ([`crate::Hooks::replay`]); on by default. Off, or
+    /// without a replayer, strokes stay placeholders and their pixels only in the original's stored result.
+    pub replay_strokes: bool,
 }
 
 impl Default for ImportOptions {
     fn default() -> Self {
-        ImportOptions { original_on_top: false, native_filters: false, measure: true, max_resolution: None }
+        ImportOptions { original_on_top: false, native_filters: false, measure: true, max_resolution: None, replay_strokes: true }
     }
 }

@@ -4,7 +4,8 @@
 //! The translator (`texturecraft-import`) builds the project, its layer pixels, baked maps and image resources; here the
 //! mesh is stored as a binary glTF file in the project (the original's mesh format is not kept) and the result opens
 //! through the same path as a saved project, so an imported project is exactly what its saved file will hold.
-//! Programmatic calls never open dialogs; the two-window import (notice, progress) belongs to the UI.
+//! Brush strokes are replayed with TextureCraft's brush by [`crate::import_replay`], which the translator calls per texture
+//! set. Programmatic calls never open dialogs; the two-window import (notice, progress) belongs to the UI.
 
 use serde_json::{Value, json};
 use texturecraft_formats::ProjectFile;
@@ -23,7 +24,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Import project...",
         [],
         None,
-        "{path?: the project file (native only), bytes?: the project file as base64 (any target), name?: file name for the report (with bytes), originalOnTop?: bool (show the original's stored result on top of stacks that are not reproduced; default false), nativeFilters?: bool (replace a few filter graphs by close built-in filters; default false), maxResolution?: px (cap texture set resolutions), measure?: bool (compare each stack with the stored result; default true)} → the session, plus {import: {sets: [{name, strategy, layers, locked, placeholders, channels, scores}]}}. One-way: the original file is only read",
+        "{path?: the project file (native only), bytes?: the project file as base64 (any target), name?: file name for the report (with bytes), originalOnTop?: bool (show the original's stored result on top of stacks that are not reproduced; default false), nativeFilters?: bool (replace a few filter graphs by close built-in filters; default false), maxResolution?: px (cap texture set resolutions), measure?: bool (compare each stack with the stored result; default true), replayStrokes?: bool (replay brush strokes with TextureCraft's brush, approximated; default true)} → the session, plus {import: {sets: [{name, strategy, layers, locked, placeholders, channels, scores}]}}. One-way: the original file is only read",
         always,
         import
     )]
@@ -40,6 +41,9 @@ fn options(p: &Value) -> Result<ImportOptions> {
     }
     if let Some(v) = boolp(p, "measure") {
         o.measure = v;
+    }
+    if let Some(v) = boolp(p, "replayStrokes") {
+        o.replay_strokes = v;
     }
     if let Some(r) = p.get("maxResolution").filter(|v| !v.is_null()) {
         let r = r.as_u64().and_then(|r| u32::try_from(r).ok()).filter(|r| r.is_power_of_two() && (128..=8192).contains(r));
@@ -84,7 +88,7 @@ impl Session {
             return Err(bad(ID, format!("the file is {} bytes; at most {MAX_BYTES} are read in memory", bytes.len())));
         }
         let mut progress = |_: f32, _: &str| {};
-        let mut hooks = Hooks { progress: &mut progress, cancel: &|| false };
+        let mut hooks = Hooks { progress: &mut progress, cancel: &|| false, replay: Some(&crate::import_replay::BrushReplayer) };
         let imported = texturecraft_import::import_bytes(bytes, name, options, &mut hooks).map_err(|e| bad(ID, e.to_string()))?;
         self.open_imported(imported)
     }
@@ -186,7 +190,7 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
 fn import_path(s: &mut Session, p: &Value, options: &ImportOptions) -> Result<Value> {
     let path = strp(p, "path").filter(|x| !x.trim().is_empty()).ok_or_else(|| bad(ID, "give `path` (a project file) or `bytes`"))?;
     let mut progress = |_: f32, _: &str| {};
-    let mut hooks = Hooks { progress: &mut progress, cancel: &|| false };
+    let mut hooks = Hooks { progress: &mut progress, cancel: &|| false, replay: Some(&crate::import_replay::BrushReplayer) };
     let imported = texturecraft_import::import_path(std::path::Path::new(path), options, &mut hooks).map_err(|e| bad(ID, format!("{path}: {e}")))?;
     s.open_imported(imported)
 }

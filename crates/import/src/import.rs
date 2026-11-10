@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
 use texturecraft_core::{
-    BlendMode, Channel, ChannelBlend, Fidelity, Fill, ImportReport, Layer, LayerKind, LayerReport, LayerRole, MAX_RESOLUTION, MIN_RESOLUTION, NormalFormat,
-    Project, Source, TextureSet, import_report::original_result_layer,
+    BlendMode, Channel, ChannelBlend, Fidelity, Fill, ImportReport, Layer, LayerId, LayerKind, LayerReport, LayerRole, MAX_RESOLUTION, MIN_RESOLUTION,
+    NormalFormat, Project, Source, TextureSet, import_report::original_result_layer,
 };
 use texturecraft_geom::Mesh;
 use texturecraft_import_reader::decode::assbin::{AssbinGeometry, AssbinScene};
@@ -25,6 +25,7 @@ use crate::error::ImportError;
 use crate::image::Rgba;
 use crate::layers::{self, ImportedStack, SetInput};
 use crate::options::ImportOptions;
+use crate::replay::{ReplayJob, ReplayScene, ReplayTarget, ReplayedPixels, StrokeReplayer};
 use crate::resources::{CacheImage, ProjectImages, read_cache};
 use crate::safety_net::{self, AGREEMENT_STEPS, Score, SetScene, Strategy};
 use crate::sets::{SetBinding, SetSource};
@@ -64,10 +65,12 @@ pub struct SetSummary {
     pub placeholders: usize,
 }
 
-/// Progress callback (fraction 0..1, step) and the cancel check the import asks between steps.
+/// Progress callback (fraction 0..1, step), the cancel check the import asks between steps, and the stroke replayer
+/// (the brush engine the import lays strokes with; `None`: strokes stay placeholders).
 pub struct Hooks<'h> {
     pub progress: &'h mut dyn FnMut(f32, &str),
     pub cancel: &'h dyn Fn() -> bool,
+    pub replay: Option<&'h dyn StrokeReplayer>,
 }
 
 impl Hooks<'_> {
@@ -347,9 +350,10 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     project.texture_sets.push(set);
     // the layer stack
     let parts: Vec<String> = ctx.mesh.submeshes.iter().filter(|s| s.material == ctx.source.slot).map(|s| s.name.clone()).collect();
-    let stack = match ctx.project_set {
+    let mut stack = match ctx.project_set {
         Some(project_set) => {
-            let input = SetInput { channels: &declared, images: ctx.images, mesh_maps: &project_set.mesh_maps, parts: &parts, options: ctx.options };
+            let replay = ctx.options.replay_strokes && ctx.hooks.replay.is_some();
+            let input = SetInput { channels: &declared, images: ctx.images, mesh_maps: &project_set.mesh_maps, parts: &parts, options: ctx.options, replay };
             Some(layers::import(project_set, &input, project.next_id))
         }
         None => {
@@ -365,6 +369,14 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         Some(s) => (s.verdict.all_exact(), s.verdict.layer_count),
         None => (false, 0),
     };
+    let mut replayed = ReplayCount::default();
+    if let Some(stack) = stack.as_mut()
+        && let Some(replayer) = ctx.hooks.replay.filter(|_| !stack.jobs.is_empty())
+    {
+        ctx.hooks.check()?;
+        let scene = ReplayScene { mesh: ctx.mesh, material: ctx.source.slot, resolution };
+        replayed = replay_stack(stack, replayer, &scene, &mut out.pixels, &|what: &str| item(what), report);
+    }
     if let Some(stack) = &stack {
         insert_stack(project, ts, stack, report);
     }
@@ -424,7 +436,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         report_blockers(&s.layers, &|what: &str| item(what), report);
     }
     if let Some(project_set) = ctx.project_set {
-        report_strokes(project_set, &item("strokes"), report);
+        report_strokes(project_set, &item("strokes"), &replayed, report);
     }
     // the stored result as a locked layer: the reference, or the result on top
     if !cache.is_empty() {
@@ -478,15 +490,107 @@ fn report_blockers(layers: &[Layer], item: &dyn Fn(&str) -> String, report: &mut
     for (key, (text, n, alone)) in by_key {
         let unlock = match key.split_once(':').map(|(k, _)| k) {
             Some("graph") => "stays a placeholder until compiled graphs are computed",
-            Some("strokes") => "the pixels are in the original's stored result until stroke replay",
+            Some("strokes") => "stroke replay is off; the pixels are in the original's stored result",
+            Some("brush" | "brush-alpha") => "strokes TextureCraft's brush does not replay yet; the pixels are in the original's stored result",
             _ => "not supported yet",
         };
         report.add(item(&format!("blocker {key}")), Fidelity::Baked, format!("{text}: locks {n} layers ({alone} by it alone); {unlock}"));
     }
 }
 
-/// The brush strokes of a set: none is replayed in this version, so their pixels are only in the stored result.
-fn report_strokes(set: &ProjectTextureSet, item: &str, report: &mut ImportReport) {
+/// What a set's stroke replay painted: paint effects and strokes, and jobs that failed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplayCount {
+    pub effects: usize,
+    pub strokes: usize,
+    pub failed: usize,
+}
+
+/// Lays `stack`'s replay jobs with `replayer`: their pixels go into `pixels`; a job that fails becomes a placeholder
+/// that locks its layer (`brush:replay-failed`), reported.
+fn replay_stack(
+    stack: &mut ImportedStack,
+    replayer: &dyn StrokeReplayer,
+    scene: &ReplayScene,
+    pixels: &mut PixelStore,
+    item: &dyn Fn(&str) -> String,
+    report: &mut ImportReport,
+) -> ReplayCount {
+    let jobs = std::mem::take(&mut stack.jobs);
+    let mut results = replayer.replay(scene, &jobs).into_iter();
+    let mut count = ReplayCount::default();
+    for job in &jobs {
+        let result = results.next().unwrap_or_else(|| Err("the replayer gave no result".into()));
+        match (result, job.target) {
+            (Ok(ReplayedPixels::Content(images)), ReplayTarget::Content(id)) => {
+                for (c, img) in images {
+                    pixels.layers.insert((id, c), img);
+                }
+            }
+            (Ok(ReplayedPixels::Mask(img)), ReplayTarget::Mask(id)) => {
+                pixels.masks.insert(id, img);
+            }
+            (Ok(_), _) => {
+                fail_job(stack, job, "the replayer painted the wrong kind of pixels");
+                count.failed += 1;
+                report.add(item(&job.label), Fidelity::Baked, "stroke replay failed: the replayer painted the wrong kind of pixels");
+                continue;
+            }
+            (Err(why), _) => {
+                fail_job(stack, job, &why);
+                count.failed += 1;
+                report.add(item(&job.label), Fidelity::Baked, format!("stroke replay failed ({why}); kept as a placeholder"));
+                continue;
+            }
+        }
+        count.effects += job.steps.len();
+        count.strokes += job.strokes();
+    }
+    stack.jobs = jobs;
+    count
+}
+
+/// A job that could not be painted: its effect becomes a placeholder (a layer's own brush work gets one in front of its
+/// content effects), the layer is locked and its channels count as not computable.
+fn fail_job(stack: &mut ImportedStack, job: &ReplayJob, why: &str) {
+    let blocker = crate::replay::brush::refused("replay-failed", format!("stroke replay failed: {why}"));
+    let id = job.target.id();
+    let label = format!("brush strokes ({} strokes)", job.strokes());
+    let reason = format!("brush strokes are kept in the original result: {}", blocker.text);
+    let holder = stack
+        .layers
+        .iter_mut()
+        .find(|l| l.id == id || l.content_effects.iter().any(|e| e.id == id) || l.mask.as_ref().is_some_and(|m| m.effects.iter().any(|e| e.id == id)));
+    let Some(layer) = holder else { return };
+    if layer.id == id {
+        let mut e = texturecraft_core::Effect::placeholder(LayerId(stack.next_id), &label, &reason);
+        e.visible = true;
+        stack.next_id = stack.next_id.saturating_add(1);
+        layer.content_effects.insert(0, e);
+    } else {
+        let effects = layer.content_effects.iter_mut().chain(layer.mask.iter_mut().flat_map(|m| m.effects.iter_mut()));
+        for e in effects.filter(|e| e.id == id) {
+            e.name = label.clone();
+            e.kind = texturecraft_core::EffectKind::Placeholder { label: label.clone(), reason: reason.clone() };
+        }
+    }
+    let reason = texturecraft_core::LockReason::new(blocker.key.to_string(), blocker.text.clone());
+    match layer.lock.as_mut() {
+        Some(lock) => lock.reasons.push(reason),
+        None => layer.lock = Some(texturecraft_core::Lock::import(vec![reason])),
+    }
+    let layer_id = layer.id;
+    if let Some(r) = stack.reports.get_mut(&layer_id) {
+        r.fidelity = Fidelity::Baked;
+    }
+    let status = crate::status::Status::not_computable(blocker);
+    for c in job.steps.iter().flat_map(|s| s.values.iter().map(|v| v.0)) {
+        stack.verdict.contribute(c, &status);
+    }
+}
+
+/// The brush strokes of a set: how many were replayed; the others' pixels are only in the stored result.
+fn report_strokes(set: &ProjectTextureSet, item: &str, replayed: &ReplayCount, report: &mut ImportReport) {
     fn count(effects: &[texturecraft_import_reader::model::ProjectEffect], strokes: &mut usize, paints: &mut usize) {
         for e in effects {
             match e {
@@ -507,11 +611,15 @@ fn report_strokes(set: &ProjectTextureSet, item: &str, report: &mut ImportReport
         }
     }
     if strokes > 0 {
-        report.add(
-            item,
-            Fidelity::Baked,
-            format!("{strokes} strokes in {paints} paint effects not replayed; their pixels are only in the original's stored result"),
-        );
+        let rest = strokes.saturating_sub(replayed.strokes);
+        let note = match replayed.strokes {
+            0 => format!("{strokes} strokes in {paints} paint effects not replayed; their pixels are only in the original's stored result"),
+            n => format!(
+                "{strokes} strokes in {paints} paint effects; {n} strokes of {} paint effects replayed with TextureCraft's brush (approximated); {rest} not replayed (placeholders, their pixels only in the original's stored result)",
+                replayed.effects
+            ),
+        };
+        report.add(item, if rest == 0 { Fidelity::Approximated } else { Fidelity::Baked }, note);
     }
 }
 

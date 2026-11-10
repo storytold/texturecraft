@@ -2,18 +2,21 @@
 //! effect for effect, and how exactly it reproduces the original.
 //!
 //! Uniform fills become grey fills, bitmap fills image fills (a mesh map slot left empty reads black), reference fills
-//! anchor fills; levels and colour selection keep their kind. Compiled-graph generators and filters, painted strokes,
-//! polygon fills, anchors inside the mask and unknown classes are placeholders, and the first of them makes the mask not
-//! computable. Effect groups are laid flat (approximated unless they pass through or blend normally at full strength).
+//! anchor fills; levels and colour selection keep their kind. Painted strokes become paint effects replayed with
+//! TextureCraft's brush when the import has a replayer (approximated; [`crate::replay`]). Compiled-graph generators and
+//! filters, strokes that cannot be replayed, polygon fills, anchors inside the mask and unknown classes are
+//! placeholders, and the first of them makes the mask not computable. Effect groups are laid flat (approximated unless they pass through or blend normally at full strength).
 
 use texturecraft_core::{BlendMode, Effect, EffectKind, Mask, MaskBackground, Source};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{BitmapSource, ColorSelectionEffect, EffectHeader, FillEffect, MaskInitial, ProjectEffect, ProjectMask, ProjectSource};
 
-use super::content::{is_dangling, levels, reference};
+use super::content::{is_dangling, levels, reference, replay_status};
 use super::{Anchors, Ids, SetInput, effect, projection};
 use crate::blend::ResolvedBlend;
 use crate::graph_uses::{self, GraphUse};
+use crate::replay::brush::StepTarget;
+use crate::replay::{ReplayJob, ReplayTarget};
 use crate::resources::{MeshMapAlias, mesh_map_alias};
 use crate::status::Status;
 
@@ -22,6 +25,8 @@ pub struct MaskOutcome {
     pub mask: Option<Mask>,
     pub status: Status,
     pub graphs: Vec<String>,
+    /// Painted strokes to replay into the mask's paint effects.
+    pub jobs: Vec<ReplayJob>,
 }
 
 pub struct MaskBuilder<'a, 'i> {
@@ -35,15 +40,35 @@ pub struct MaskBuilder<'a, 'i> {
     counts: bool,
     /// The last strokes placeholder: its index, strokes and paint effects so far.
     strokes_run: Option<(usize, usize, usize)>,
+    jobs: Vec<ReplayJob>,
+    /// The layer's path, for the replay jobs' labels.
+    path: String,
 }
 
 impl<'a, 'i> MaskBuilder<'a, 'i> {
     pub fn new(input: &'a SetInput<'a>, anchors: &'a Anchors, ids: &'i mut Ids) -> MaskBuilder<'a, 'i> {
-        MaskBuilder { input, anchors, ids, effects: Vec::new(), status: Status::Exact, graphs: Vec::new(), counts: true, strokes_run: None }
+        MaskBuilder {
+            input,
+            anchors,
+            ids,
+            effects: Vec::new(),
+            status: Status::Exact,
+            graphs: Vec::new(),
+            counts: true,
+            strokes_run: None,
+            jobs: Vec::new(),
+            path: String::new(),
+        }
+    }
+
+    /// The layer's path, for the replay jobs' labels.
+    pub fn at(mut self, path: &str) -> Self {
+        self.path = path.to_string();
+        self
     }
 
     pub fn build(mut self, mask: Option<&ProjectMask>) -> MaskOutcome {
-        let Some(m) = mask else { return MaskOutcome { mask: None, status: Status::Exact, graphs: Vec::new() } };
+        let Some(m) = mask else { return MaskOutcome { mask: None, status: Status::Exact, graphs: Vec::new(), jobs: Vec::new() } };
         let background = match m.initial {
             MaskInitial::Black => MaskBackground::Black,
             MaskInitial::White => MaskBackground::White,
@@ -53,7 +78,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                     true => Status::not_computable(Blocker::feature("mask-initial-value", format!("mask initial value {n}"))),
                     false => Status::Exact,
                 };
-                return MaskOutcome { mask: None, status, graphs: Vec::new() };
+                return MaskOutcome { mask: None, status, graphs: Vec::new(), jobs: Vec::new() };
             }
         };
         self.counts = m.enabled;
@@ -61,7 +86,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
             self.effect(e, true);
         }
         let mask = Mask { enabled: m.enabled, background, effects: self.effects };
-        MaskOutcome { mask: Some(mask), status: self.status, graphs: self.graphs }
+        MaskOutcome { mask: Some(mask), status: self.status, graphs: self.graphs, jobs: self.jobs }
     }
 
     /// Adds the status of a part that counts.
@@ -117,7 +142,25 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 if p.stroke_count() == 0 {
                     return;
                 }
-                let why = Status::not_computable(Blocker::new(BlockerKey::new(BlockerKind::Strokes, "painted-mask"), "painted mask (strokes)"));
+                let blocker = match self.input.replay {
+                    false => Blocker::new(BlockerKey::new(BlockerKind::Strokes, "painted-mask"), "painted mask (strokes)"),
+                    true => match crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images) {
+                        Ok(step) => {
+                            self.push(header, EffectKind::Paint, on);
+                            let id = self.effects.last().map_or(texturecraft_core::LayerId(0), |e| e.id);
+                            let job = ReplayJob { target: ReplayTarget::Mask(id), label: format!("{} / painted mask", self.path), steps: vec![step] };
+                            self.note(on, &replay_status(&job));
+                            self.jobs.push(job);
+                            return;
+                        }
+                        Err(b) => b,
+                    },
+                };
+                let reason = match blocker.key.kind {
+                    BlockerKind::Strokes => "brush strokes are kept in the original result; stroke replay is off".to_string(),
+                    _ => format!("brush strokes are kept in the original result: {}", blocker.text),
+                };
+                let why = Status::not_computable(blocker);
                 // consecutive paint effects share one placeholder
                 if let Some((at, strokes, effects)) = self.strokes_run.as_mut()
                     && *at + 1 == self.effects.len()
@@ -135,7 +178,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                     return;
                 }
                 let label = format!("painted mask ({} strokes)", p.stroke_count());
-                self.placeholder(header, &label, "brush strokes are kept in the original result; stroke replay comes later", on, why);
+                self.placeholder(header, &label, &reason, on, why);
                 self.strokes_run = Some((self.effects.len() - 1, p.stroke_count(), 1));
             }
             ProjectEffect::Anchor(h) => {

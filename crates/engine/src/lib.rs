@@ -21,6 +21,7 @@ pub mod fill_hit_test;
 pub mod fill_mode;
 pub mod filter_lib;
 pub mod import_cmds;
+pub mod import_replay;
 pub mod inspect;
 pub mod instance_cmds;
 pub mod layer_cmds;

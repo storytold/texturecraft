@@ -39,6 +39,9 @@ pub struct SetInput<'a> {
     /// Names of the set's mesh parts, for geometry masks.
     pub parts: &'a [String],
     pub options: &'a ImportOptions,
+    /// Whether strokes are replayed (the import has a replayer and the options ask for it): painted masks and brush
+    /// work become replay jobs instead of placeholders.
+    pub replay: bool,
 }
 
 /// One anchor of the set: the effect id it became, whether it sits in a mask, and how exactly what it holds is
@@ -65,7 +68,7 @@ pub struct Verdict {
 }
 
 impl Verdict {
-    fn contribute(&mut self, channel: Channel, status: &Status) {
+    pub(crate) fn contribute(&mut self, channel: Channel, status: &Status) {
         self.channels.entry(channel).or_default().and(status);
     }
 
@@ -94,6 +97,8 @@ pub struct ImportedStack {
     /// Compiled graphs the stack uses (each one a placeholder for now).
     pub graphs: BTreeSet<String>,
     pub anchors: Anchors,
+    /// Strokes to replay into the stack's paint layers and paint effects.
+    pub jobs: Vec<crate::replay::ReplayJob>,
 }
 
 /// Hands out layer and effect ids.
@@ -215,7 +220,8 @@ impl<'a> Builder<'a> {
         let mut flags = Vec::new();
         // Imported sets are classic (one UV tile).
         let (geometry_mask, geometry_status) = geometry::map(l.geometry.as_ref(), self.input.parts, &[]);
-        let mut mask = mask::MaskBuilder::new(self.input, self.anchors, &mut self.ids).build(l.mask.as_ref());
+        let mut mask = mask::MaskBuilder::new(self.input, self.anchors, &mut self.ids).at(&path).build(l.mask.as_ref());
+        self.out.jobs.append(&mut mask.jobs);
         mask.status.and(&geometry_status);
         let mut note = mask.status.clone();
         let own_settings = settings_status(l);
@@ -253,7 +259,8 @@ impl<'a> Builder<'a> {
                 layer.kind = LayerKind::Group { children: kids, collapsed: false };
             }
             kind => {
-                let mapped = content::ContentMapper::new(self.input, self.anchors, &mut self.ids).map(l);
+                let mut mapped = content::ContentMapper::new(self.input, self.anchors, &mut self.ids).map(l, id, &path);
+                self.out.jobs.append(&mut mapped.jobs);
                 self.out.graphs.extend(mapped.graphs.iter().cloned());
                 for (anchor, status) in &mapped.anchor_status {
                     if let Some(a) = self.out.anchors.get_mut(anchor) {

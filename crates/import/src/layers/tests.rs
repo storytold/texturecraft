@@ -116,7 +116,7 @@ fn build(layers: Vec<ProjectLayer>) -> ImportedStack {
     let images = ProjectImages::none();
     let options = ImportOptions::default();
     let parts = ["Body".to_string(), "Eyes".to_string()];
-    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options };
+    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: false };
     import(&set(layers), &input, 10)
 }
 
@@ -300,4 +300,93 @@ fn unreadable_bitmaps_and_unknown_classes_are_not_computable_and_ids_are_unique(
     let unique: std::collections::BTreeSet<u64> = ids.iter().copied().collect();
     assert_eq!(unique.len(), ids.len(), "{ids:?}");
     assert!(ids.iter().all(|id| *id >= 10 && *id < stack.next_id));
+}
+
+fn build_replaying(layers: Vec<ProjectLayer>) -> ImportedStack {
+    let channels = channels();
+    let images = ProjectImages::none();
+    let options = ImportOptions::default();
+    let parts = ["Body".to_string()];
+    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: true };
+    import(&set(layers), &input, 10)
+}
+
+fn painting(uid: u64, channels: u64, tool: PaintTool, colors: Vec<ProjectSource>) -> ProjectEffect {
+    match paint(uid, channels) {
+        ProjectEffect::Paint(mut p) => {
+            p.tool = tool;
+            p.colors = colors;
+            ProjectEffect::Paint(p)
+        }
+        other => other,
+    }
+}
+
+#[test]
+fn with_a_replayer_brush_work_becomes_the_layers_pixels_unlocked() {
+    let group = ProjectEffect::Group(EffectGroup {
+        header: header(2, u64::MAX, vec![]),
+        effects: vec![
+            painting(3, BASE | ROUGH, PaintTool::Brush, vec![uniform(BASE, [1.0, 0.0, 0.0]), uniform(ROUGH, [0.25; 3])]),
+            painting(9, BASE, PaintTool::Eraser, vec![]),
+        ],
+    });
+    let stack = build_replaying(vec![layer(1, "Paint", ProjectLayerKind::Paint, vec![group])]);
+    let ours = by_name(&stack, "Paint");
+    assert!(ours.lock.is_none() && ours.placeholders().count() == 0 && ours.content_effects.is_empty(), "{ours:?}");
+    assert_eq!(stack.jobs.len(), 1);
+    let job = &stack.jobs[0];
+    assert_eq!(job.target, crate::replay::ReplayTarget::Content(ours.id));
+    assert_eq!(job.steps.len(), 2);
+    assert_eq!(job.steps[0].values, vec![(Channel::BaseColor, [1.0, 0.0, 0.0], 1.0), (Channel::Roughness, [0.25; 3], 1.0)]);
+    assert_eq!(job.steps[1].mode, crate::replay::PaintMode::Erase);
+    assert_eq!(stack.reports[&ours.id].fidelity, Fidelity::Approximated);
+    assert!(matches!(stack.verdict.channels[&Channel::BaseColor], Status::Approximated(_)));
+    assert!(ours.channels.contains_key(&Channel::Roughness));
+}
+
+#[test]
+fn with_a_replayer_painted_masks_become_paint_effects() {
+    let mut l = layer(1, "Masked", ProjectLayerKind::Fill, vec![fill(2, ROUGH, vec![uniform(ROUGH, [1.0; 3])], vec![])]);
+    l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::Black, effects: vec![painting(5, 0, PaintTool::Brush, vec![uniform(0, [0.5; 3])])] });
+    let stack = build_replaying(vec![l]);
+    let ours = by_name(&stack, "Masked");
+    assert!(ours.lock.is_none() && ours.visible, "{:?}", ours.lock);
+    let m = ours.mask.as_ref().unwrap();
+    assert!(matches!(m.effects[0].kind, EffectKind::Paint));
+    assert_eq!(stack.jobs.len(), 1);
+    assert_eq!(stack.jobs[0].target, crate::replay::ReplayTarget::Mask(m.effects[0].id));
+    assert_eq!(stack.jobs[0].steps[0].mask_value, 0.5);
+}
+
+#[test]
+fn strokes_that_cannot_be_replayed_stay_placeholders_with_their_reason() {
+    // a smudge among the brush work keeps all of it a placeholder: they paint one image in order
+    let group = ProjectEffect::Group(EffectGroup {
+        header: header(2, u64::MAX, vec![]),
+        effects: vec![painting(3, BASE, PaintTool::Brush, vec![uniform(BASE, [1.0; 3])]), painting(9, BASE, PaintTool::Smudge, vec![])],
+    });
+    let mut l = layer(1, "Paint", ProjectLayerKind::Paint, vec![group]);
+    let mut particle = paint(5, 0);
+    if let ProjectEffect::Paint(p) = &mut particle {
+        p.brush = Some(texturecraft_import_reader::model::ProjectBrush {
+            emitter: texturecraft_import_reader::model::StampEmitter::Physics(Default::default()),
+            ..Default::default()
+        });
+    }
+    l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::White, effects: vec![particle] });
+    let stack = build_replaying(vec![l]);
+    let ours = by_name(&stack, "Paint");
+    let keys = ours.lock.as_ref().unwrap().keys();
+    assert!(keys.contains(&"brush:smudge") && keys.contains(&"strokes:brush") && keys.contains(&"brush:particle"), "{keys:?}");
+    assert!(stack.jobs.is_empty());
+    let reasons: Vec<String> = ours
+        .placeholders()
+        .chain(ours.mask.iter().flat_map(|m| m.effects.iter()).filter(|e| matches!(e.kind, EffectKind::Placeholder { .. })))
+        .filter_map(|e| match &e.kind {
+            EffectKind::Placeholder { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(reasons.iter().any(|r| r.contains("particle brush")), "{reasons:?}");
 }

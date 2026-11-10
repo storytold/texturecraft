@@ -145,7 +145,14 @@ result), shown by `project.inspect` with every lock and placeholder.
 reference app one way: `import-reader` reads it, `import` maps it onto the model (layers, folders, fills,
 masks, levels, blend modes, geometry masks, baked maps, bake settings) and composites every texture set
 with `compose` to compare it with the file's stored result. Uses of compiled graphs become placeholders
-locked with the key `graph:<name>`; brush strokes stay only in the stored result (`strokes:<tool>`). The
+locked with the key `graph:<name>`. Brush strokes are replayed with TextureCraft's own brush: the translator (L2,
+without `paint`) rasterises nothing but hands replay jobs (stroke records, the brush mapped with the measured rules,
+tip, camera, symmetry, seed, and the layer, content effect or mask effect painted) to a `StrokeReplayer`, which the
+engine implements with `paint` (`engine::import_replay`) and passes in through the import's hooks; the import calls
+it per texture set before the safety net measures. Replayed strokes become approximated pixels, not locked; strokes
+the brush cannot replay yet (particles, ribbons, path strokes, projection, smudge, stencils, graph tips) stay
+placeholders locked with a `brush:<what>` or `brush-alpha:<graph>` key, and with replay switched off with
+`strokes:<tool>`. The
 stored result itself becomes a locked "Original result" paint layer, hidden as a reference unless the
 import is asked to show it. The mesh is kept as binary glTF; nothing else of the original file is kept.
 

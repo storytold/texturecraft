@@ -180,7 +180,17 @@ impl<'a> ProjectImages<'a> {
         result
     }
 
-    fn read(&self, url: &str) -> Result<Loaded, String> {
+    /// The bitmap a `urlToBitmapRes` URL names, decoded but not added to the project's resources (a brush tip); or why
+    /// it cannot be read.
+    pub fn peek(&self, url: &str) -> Result<Arc<ResourceImage>, String> {
+        if let Some(hit) = self.loaded.lock().ok().and_then(|l| l.get(url).cloned()) {
+            return hit.map(|l| l.image);
+        }
+        self.decode(url).map(|(_, read)| Arc::new(read))
+    }
+
+    /// The bitmap `url` names and its dataset id.
+    fn decode(&self, url: &str) -> Result<(String, ResourceImage), String> {
         let (id, shelf) = match split_resource_url(url) {
             Some((_, id)) => (id, false),
             None => match shelf_version(url) {
@@ -196,7 +206,12 @@ impl<'a> ProjectImages<'a> {
         if read.missing_bytes > 0 {
             return Err(format!("bitmap \"{}\": stored data {} bytes short", url_name(url), read.missing_bytes));
         }
-        let name = resource_name(url_name(url), id, read.float);
+        Ok((id.to_string(), read))
+    }
+
+    fn read(&self, url: &str) -> Result<Loaded, String> {
+        let (id, read) = self.decode(url)?;
+        let name = resource_name(url_name(url), &id, read.float);
         let bytes = read.image.resource_bytes(!read.float).map_err(|e| format!("bitmap \"{}\": {e}", url_name(url)))?;
         let res = Arc::new(read.image.image_res(!read.float));
         if let Ok(mut out) = self.out.lock() {

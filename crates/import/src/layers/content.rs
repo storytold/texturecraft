@@ -4,8 +4,12 @@
 //! - The base: a fill layer's first fill becomes a fill layer when it is switched on and writes every channel it
 //!   touches from a value, a bitmap or an anchor at full strength (normal or replace, 100%). Otherwise the base is an
 //!   empty paint layer and the first fill stays an effect.
-//! - A paint layer's brush work stays only in the original's stored result: strokes are not replayed in this
-//!   version, so each paint effect with strokes is a placeholder and the layer is locked (`strokes:<tool>`).
+//! - A paint layer's brush work (its first effect group, paint effects only) becomes the layer's own pixels, replayed
+//!   with TextureCraft's brush ([`crate::replay`]) when the import has a replayer: approximated, not locked. Paint
+//!   effects further up become content paint effects the same way. A paint effect that cannot be replayed (or any
+//!   paint effect when there is no replayer) is a placeholder and locks the layer: `brush:<what>` /
+//!   `brush-alpha:<graph>` for why it cannot be replayed, `strokes:<tool>` when replay is off; one that cannot be
+//!   replayed keeps the rest of its layer's brush work a placeholder too (they paint one image in order).
 //! - Every other effect becomes one of TextureCraft's: a fill becomes one material fill effect per distinct blend
 //!   mode and opacity among its channels (TextureCraft's effects have one blend each) plus one placeholder per compiled
 //!   graph it uses ([`crate::graph_uses`]); levels and anchors keep their kind; filters are placeholders (or a close
@@ -16,16 +20,18 @@
 
 use std::collections::BTreeMap;
 
-use texturecraft_core::{BlendMode, Channel, Effect, EffectKind, Fill, LayerKind, Levels, Projection, Source};
+use texturecraft_core::{BlendMode, Channel, Effect, EffectKind, Fill, LayerId, LayerKind, Levels, Projection, Source};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{
-    EffectHeader, FillEffect, Levels as ProjectLevels, LevelsEffect, ProjectEffect, ProjectLayer, ProjectSource, ReferenceSource,
+    EffectGroup, EffectHeader, FillEffect, Levels as ProjectLevels, LevelsEffect, PaintEffect, ProjectEffect, ProjectLayer, ProjectSource, ReferenceSource,
 };
 
 use super::{Anchors, Ids, SetInput, effect, projection};
 use crate::blend::{Holder, ResolvedBlend};
 use crate::channels::bit_of;
 use crate::graph_uses::{self, GraphUse};
+use crate::replay::brush::{StepTarget, refused};
+use crate::replay::{PaintMode, REPLAYED, ReplayJob, ReplayStep, ReplayTarget};
 use crate::resources::{MeshMapAlias, mesh_map_alias};
 use crate::status::Status;
 
@@ -38,6 +44,8 @@ pub struct Mapped {
     pub graphs: Vec<String>,
     /// The status of what each anchor of the content holds (the content below it).
     pub anchor_status: Vec<(u64, Status)>,
+    /// Brush work to replay into the layer's pixels or its content paint effects.
+    pub jobs: Vec<ReplayJob>,
 }
 
 pub struct ContentMapper<'a, 'i> {
@@ -50,6 +58,11 @@ pub struct ContentMapper<'a, 'i> {
     anchor_status: Vec<(u64, Status)>,
     /// The last strokes placeholder: its index, strokes and paint effects so far.
     strokes_run: Option<(usize, usize, usize)>,
+    jobs: Vec<ReplayJob>,
+    /// Mapping a layer's brush work that could not be replayed as a whole.
+    in_brush_work: bool,
+    /// The layer's path, for the replay jobs' labels.
+    path: String,
 }
 
 /// The channels and sources of one fill, grouped the way TextureCraft lays them on.
@@ -64,11 +77,24 @@ struct FillParts {
 
 impl<'a, 'i> ContentMapper<'a, 'i> {
     pub fn new(input: &'a SetInput<'a>, anchors: &'a Anchors, ids: &'i mut Ids) -> ContentMapper<'a, 'i> {
-        ContentMapper { input, anchors, ids, effects: Vec::new(), written: BTreeMap::new(), graphs: Vec::new(), anchor_status: Vec::new(), strokes_run: None }
+        ContentMapper {
+            input,
+            anchors,
+            ids,
+            effects: Vec::new(),
+            written: BTreeMap::new(),
+            graphs: Vec::new(),
+            anchor_status: Vec::new(),
+            strokes_run: None,
+            jobs: Vec::new(),
+            in_brush_work: false,
+            path: String::new(),
+        }
     }
 
-    /// The base and effects of a layer that is not a folder.
-    pub fn map(mut self, l: &ProjectLayer) -> Mapped {
+    /// The base and effects of a layer that is not a folder; `id` is the layer's, `path` names it.
+    pub fn map(mut self, l: &ProjectLayer, id: LayerId, path: &str) -> Mapped {
+        self.path = path.to_string();
         let mut kind = LayerKind::Paint;
         let mut rest: &[ProjectEffect] = &l.content;
         match (&l.kind, l.content.split_first()) {
@@ -82,8 +108,12 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
             }
             (texturecraft_import_reader::model::LayerKind::Paint, Some((ProjectEffect::Group(g), after))) if g.header.enabled => {
                 // the brush work: what the paint layer holds itself
-                for e in &g.effects {
-                    self.effect(e, true);
+                if !self.replay_brush_work(g, id) {
+                    self.in_brush_work = true;
+                    for e in &g.effects {
+                        self.effect(e, true);
+                    }
+                    self.in_brush_work = false;
                 }
                 rest = after;
             }
@@ -92,7 +122,100 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         for e in rest {
             self.effect(e, true);
         }
-        Mapped { kind, effects: self.effects, written: self.written, graphs: self.graphs, anchor_status: self.anchor_status }
+        Mapped { kind, effects: self.effects, written: self.written, graphs: self.graphs, anchor_status: self.anchor_status, jobs: self.jobs }
+    }
+
+    /// A paint layer's brush work replayed into its own pixels (`id`): every switched-on paint effect with strokes, in
+    /// order. False when there is no replayer, the group holds other effects, or one of them cannot be replayed (the
+    /// caller then lays them as placeholders, each with its reason).
+    fn replay_brush_work(&mut self, g: &EffectGroup, id: LayerId) -> bool {
+        if !self.input.replay {
+            return false;
+        }
+        let mut paints = Vec::new();
+        for e in &g.effects {
+            match e {
+                ProjectEffect::Paint(p) if p.header.enabled && p.stroke_count() > 0 => paints.push(p),
+                ProjectEffect::Paint(_) => {}
+                _ => return false,
+            }
+        }
+        if paints.is_empty() {
+            return false;
+        }
+        let Ok(steps) = paints.iter().map(|p| self.step(p)).collect::<Result<Vec<_>, _>>() else { return false };
+        self.add_job(ReplayTarget::Content(id), "brush work", steps);
+        true
+    }
+
+    /// `p` as a content step, with its own blending folded into the channels' opacity (approximated when it is not
+    /// normal).
+    fn step(&self, p: &PaintEffect) -> Result<(ReplayStep, Status), Blocker> {
+        let mut step = crate::replay::step(p, StepTarget::Content, self.input.channels, self.input.images)?;
+        let mut status = Status::Exact;
+        for (c, _, opacity) in &mut step.values {
+            let blend = ResolvedBlend::of(&p.header.blending, self.input.channels.project_channel(*c), Holder::Layer);
+            *opacity *= blend.opacity.clamp(0.0, 1.0);
+            if !matches!(blend.mode(), BlendMode::Normal | BlendMode::Replace) {
+                status.and(&Status::approximated(format!("a paint effect blending {:?} laid as normal", blend.mode())));
+            }
+        }
+        Ok((step, status))
+    }
+
+    /// Adds a replay job painting `steps` into `target` and notes the channels it paints as replayed.
+    fn add_job(&mut self, target: ReplayTarget, what: &str, steps: Vec<(ReplayStep, Status)>) {
+        let mut status = Status::Exact;
+        let mut channels = Vec::new();
+        for (s, st) in &steps {
+            status.and(st);
+            for (c, ..) in &s.values {
+                if !channels.contains(c) {
+                    channels.push(*c);
+                }
+            }
+        }
+        let steps: Vec<ReplayStep> = steps.into_iter().map(|(s, _)| s).collect();
+        let job = ReplayJob { target, label: format!("{} / {what}", self.path), steps };
+        status.and(&replay_status(&job));
+        for c in channels {
+            self.note(c, &status);
+        }
+        self.jobs.push(job);
+    }
+
+    /// Replays one paint effect above the brush work as a content paint effect; or why it is not.
+    fn replay_effect(&mut self, p: &PaintEffect, on: bool) -> Result<(), Blocker> {
+        let tool = p.tool.name();
+        if !self.input.replay {
+            return Err(Blocker::new(BlockerKey::new(BlockerKind::Strokes, tool), format!("{tool} strokes")));
+        }
+        let step = self.step(p);
+        if self.in_brush_work {
+            return Err(match step {
+                Err(b) => b,
+                Ok(_) => {
+                    Blocker::new(BlockerKey::new(BlockerKind::Strokes, tool), format!("{tool} strokes not replayed: other brush work of the layer cannot be"))
+                }
+            });
+        }
+        let (step, status) = step?;
+        if step.mode == PaintMode::Erase {
+            return Err(refused("eraser-effect", "an eraser above other content effects (it erases what is below it)"));
+        }
+        let id = self.ids.alloc();
+        let mut e = effect(id, &p.header.label, EffectKind::Paint, on);
+        if let Some(c) = step.values.first().map(|v| v.0) {
+            e.blend = ResolvedBlend::of(&p.header.blending, self.input.channels.project_channel(c), Holder::Layer).mode();
+        }
+        self.effects.push(e);
+        if on {
+            self.add_job(ReplayTarget::Content(id), "paint effect", vec![(step, status)]);
+        } else {
+            let job = ReplayJob { target: ReplayTarget::Content(id), label: format!("{} / paint effect", self.path), steps: vec![step] };
+            self.jobs.push(job);
+        }
+        Ok(())
     }
 
     /// Effects on a folder (rare): kept as placeholders, not computed; with the status of every channel they write.
@@ -190,6 +313,10 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                         self.input.channels.all().filter(|c| p.colors.iter().any(|s| s.channels().contains(self.input.channels.project_channel(*c)))).collect()
                     }
                 };
+                let blocker = match self.replay_effect(p, on) {
+                    Ok(()) => return,
+                    Err(b) => b,
+                };
                 let merged = match self.strokes_run.as_mut() {
                     Some((at, strokes, effects)) if *at + 1 == self.effects.len() => {
                         *strokes += p.stroke_count();
@@ -208,11 +335,15 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                 };
                 if !merged {
                     let label = format!("{} strokes ({})", p.tool.name(), p.stroke_count());
-                    self.placeholder(&label, "brush strokes are kept in the original result; stroke replay comes later", on);
+                    let reason = match blocker.key.kind {
+                        BlockerKind::Strokes if !self.input.replay => "brush strokes are kept in the original result; stroke replay is off".to_string(),
+                        _ => format!("brush strokes are kept in the original result: {}", blocker.text),
+                    };
+                    self.placeholder(&label, &reason, on);
                     self.strokes_run = Some((self.effects.len() - 1, p.stroke_count(), 1));
                 }
                 if on {
-                    let why = Status::not_computable(Blocker::new(BlockerKey::new(BlockerKind::Strokes, p.tool.name()), format!("{} strokes", p.tool.name())));
+                    let why = Status::not_computable(blocker);
                     for c in channels {
                         self.note(c, &why);
                     }
@@ -501,4 +632,14 @@ pub fn levels(l: Option<&ProjectLevels>) -> (Levels, Status) {
         false => Status::approximated("levels that differ per colour component (the red one taken)"),
     };
     (ours, status)
+}
+
+/// What a replayed job counts as: approximated, with its notes.
+pub fn replay_status(job: &ReplayJob) -> Status {
+    let mut text = format!("{REPLAYED} ({} strokes)", job.strokes());
+    let notes = job.notes();
+    if !notes.is_empty() {
+        text.push_str(&format!("; {}", notes.join("; ")));
+    }
+    Status::approximated(text)
 }

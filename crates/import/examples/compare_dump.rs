@@ -29,7 +29,7 @@ fn main() {
         std::process::exit(2);
     };
     let mut progress = |_: f32, _: &str| {};
-    let mut hooks = Hooks { progress: &mut progress, cancel: &|| false };
+    let mut hooks = Hooks { progress: &mut progress, cancel: &|| false, replay: None };
     let imported = match import_path(Path::new(file), &Default::default(), &mut hooks) {
         Ok(i) => i,
         Err(e) => {
