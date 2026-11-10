@@ -18,6 +18,7 @@ pub const TABLE: &[(&str, u8)] = &[
     ("import-reader", 0),
     ("graph", 0),
     ("compose", 1),
+    ("import-verify", 1),
     ("bake", 1),
     ("paint", 2),
     ("formats", 2),
