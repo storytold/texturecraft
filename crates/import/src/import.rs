@@ -803,7 +803,7 @@ fn resolve_resolution(record: &MaterialRecord, cache: &[(Channel, CacheImage)], 
 }
 
 /// `image` at `size` square: box-averaged when smaller (coverage-weighted), nearest when larger.
-fn resample(image: &Rgba, size: u32) -> Rgba {
+pub(crate) fn resample(image: &Rgba, size: u32) -> Rgba {
     let (sw, sh) = (image.width.max(1) as usize, image.height.max(1) as usize);
     let n = size.max(1) as usize;
     let mut px = vec![[0.0f32; 4]; n * n];
