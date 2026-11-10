@@ -31,7 +31,8 @@ use crate::replay::{ReplayJob, ReplayScene, ReplayTarget, ReplayedPixels, Stroke
 use crate::resources::{CacheImage, ProjectImages, read_cache};
 use crate::safety_net::{self, AGREEMENT_STEPS, Score, SetScene, Strategy};
 use crate::sets::{SetBinding, SetSource};
-use crate::{bake_settings, baked, mesh};
+use crate::status::Status;
+use crate::{bake_settings, baked, mesh, uv_tiles};
 
 /// Resolution for sets with neither a stored result nor a recorded resolution (the reference app's default).
 const FALLBACK_RESOLUTION: u32 = 2048;
@@ -330,7 +331,10 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     match &ctx.source.cache_set {
         None => report.add(item("stored result"), Fidelity::Approximated, "no stored result (the original never rendered this set)"),
         Some(folder) => {
-            let mut entries: Vec<_> = ctx.cache.iter().filter(|e| &e.set == folder).collect();
+            let (mut entries, other_tiles) = uv_tiles::one_tile(ctx.cache.iter().filter(|e| &e.set == folder).collect());
+            if other_tiles > 0 {
+                report.add(item("stored result"), Fidelity::Approximated, uv_tiles::other_tiles_note(other_tiles));
+            }
             entries.sort_by_key(|e| e.channel_bit);
             for e in entries {
                 ctx.hooks.check()?;
@@ -361,15 +365,20 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let mut declared = SetChannels::default();
     for c in &record.channels {
         match channels::channel_for_bit(c.type_bit) {
-            Some(channel) => declared.declare(channel, channels::channel_format(channel, Some(c.format))),
+            Some(channel) => {
+                declared.declare(channel, channels::channel_format(channel, Some(c.format)));
+                if !c.user_name.is_empty() && channel.user_index().is_some() {
+                    set.channel_names.insert(channel, c.user_name.clone());
+                }
+            }
             None => {
                 let label = if c.user_name.is_empty() {
                     channels::project_channel_name(c.type_bit)
                 } else {
                     format!("{} (\"{}\")", channels::project_channel_name(c.type_bit), c.user_name)
                 };
-                let note = match channels::is_user_channel(c.type_bit) || !c.user_name.is_empty() {
-                    true => "a user channel: TextureCraft has no user channels yet; not imported",
+                let note = match c.type_bit == 0 || !c.user_name.is_empty() {
+                    true => "a channel the file numbers past the eight user channels TextureCraft keeps; not imported",
                     false => "no matching channel in TextureCraft; not imported",
                 };
                 report.add(item(&format!("channel {label}")), Fidelity::Approximated, note);
@@ -440,7 +449,12 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
                 replay,
                 graphs: ctx.graphs,
             };
-            Some(layers::import(project_set, &input, project.next_id))
+            let mut stack = layers::import(project_set, &input, project.next_id);
+            if let Some(note) = uv_tiles::per_tile_note(project_set, &uv_tiles::mesh_tiles(ctx.mesh, ctx.source.slot)) {
+                report.add(item("UV tiles"), Fidelity::Approximated, note.clone());
+                stack.verdict.set_settings.and(&Status::approximated(note));
+            }
+            Some(stack)
         }
         None => {
             report.add(

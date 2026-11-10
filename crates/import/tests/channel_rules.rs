@@ -77,7 +77,8 @@ fn table() -> Vec<Row> {
     ];
     for user in 0..32u32 {
         let old = if user < 8 { User(1 << (14 + user)) } else { Dropped };
-        rows.push((64 + user, old, None, false, grey(1.0), grey(1.0)));
+        let ours = if user < 8 { Channel::user(user as usize) } else { None };
+        rows.push((64 + user, old, ours, false, grey(1.0), grey(1.0)));
     }
     rows
 }

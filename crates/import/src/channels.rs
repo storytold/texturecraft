@@ -75,19 +75,29 @@ const UNCOVERED_ROUGHNESS: f32 = 0.3;
 /// Glossiness where no layer covers it (measured 178/255, also in a float format).
 const UNCOVERED_GLOSSINESS: f32 = 178.0 / 255.0;
 
-/// TextureCraft's channel for a file channel bit.
+/// TextureCraft's channel for a file channel bit (user channel `n` is TextureCraft's user channel `n`).
 pub fn channel_for_bit(bit: u64) -> Option<Channel> {
-    CHANNELS.iter().find(|(b, ..)| *b == bit).map(|(_, c, ..)| *c)
+    match is_user_channel(bit) {
+        true => Channel::user(bit.trailing_zeros().saturating_sub(USER_FIRST_BIT) as usize),
+        false => CHANNELS.iter().find(|(b, ..)| *b == bit).map(|(_, c, ..)| *c),
+    }
 }
 
 /// The file's bit of one of TextureCraft's channels (0 for channels the file has no bit for).
 pub fn bit_of(channel: Channel) -> u64 {
-    CHANNELS.iter().find(|(_, c, ..)| *c == channel).map_or(0, |(b, ..)| *b)
+    match channel.user_index().and_then(|n| u32::try_from(n).ok()) {
+        Some(n) => 1 << (USER_FIRST_BIT + n),
+        None => CHANNELS.iter().find(|(_, c, ..)| *c == channel).map_or(0, |(b, ..)| *b),
+    }
 }
 
-/// How well the mapping of `channel` is known.
+/// How well the mapping of `channel` is known. User channels are measured: their bits, that the file stores their
+/// uniform values as the exports show them (linear, three components) and that uncovered they show white.
 pub fn confidence(channel: Channel) -> ChannelConfidence {
-    CHANNELS.iter().find(|(_, c, ..)| *c == channel).map_or(ChannelConfidence::Named, |(.., k)| *k)
+    match channel.user_index() {
+        Some(_) => ChannelConfidence::Measured,
+        None => CHANNELS.iter().find(|(_, c, ..)| *c == channel).map_or(ChannelConfidence::Named, |(.., k)| *k),
+    }
 }
 
 /// True for the bits of the user channels (`user 0` … `user 7`).
@@ -107,8 +117,23 @@ pub fn project_channel_name(bit: u64) -> String {
     }
 }
 
-/// TextureCraft's storage format for a channel declared with the file's `DataChannel.format` (when known).
+/// TextureCraft's storage format for a channel declared with the file's `DataChannel.format` (when known). User
+/// channels hold three components whatever their format, so theirs is kept as declared (grey or RGB).
 pub fn channel_format(channel: Channel, project_format: Option<u64>) -> ChannelFormat {
+    if channel.kind() == ChannelKind::Data {
+        return match project_format {
+            Some(FORMAT_SRGB8) => ChannelFormat::Srgb8,
+            Some(FORMAT_L8) => ChannelFormat::L8,
+            Some(FORMAT_RGB8) => ChannelFormat::Rgb8,
+            Some(FORMAT_L16) => ChannelFormat::L16,
+            Some(FORMAT_RGB16) => ChannelFormat::Rgb16,
+            Some(FORMAT_L16F) => ChannelFormat::L16F,
+            Some(FORMAT_RGB16F) => ChannelFormat::Rgb16F,
+            Some(FORMAT_L32F) => ChannelFormat::L32F,
+            Some(FORMAT_RGB32F) => ChannelFormat::Rgb32F,
+            _ => ChannelFormat::default_for(channel),
+        };
+    }
     let color = channel.components() == 3;
     match (project_format, color) {
         (Some(FORMAT_SRGB8), true) if channel.kind() == ChannelKind::Color => ChannelFormat::Srgb8,
@@ -226,6 +251,13 @@ mod tests {
         assert_eq!(project_channel_name(1 << 15), "user 1");
         assert_eq!(project_channel_name(1), "Base Color");
         assert!(is_user_channel(1 << 15) && !is_user_channel(256) && !is_user_channel(0));
+        for (n, user) in Channel::USER.into_iter().enumerate() {
+            assert_eq!(channel_for_bit(1 << (14 + n)), Some(user));
+            assert_eq!(bit_of(user), 1 << (14 + n));
+            assert_eq!(confidence(user), ChannelConfidence::Measured);
+            assert_eq!(project_channel_name(bit_of(user)), format!("user {n}"));
+        }
+        assert_eq!(channel_for_bit(1 << 22), Some(Channel::Normal), "past the user channels");
         for (bit, channel, ..) in CHANNELS {
             assert_eq!(channel_for_bit(*bit), Some(*channel));
             assert_eq!(bit_of(*channel), *bit);
@@ -242,6 +274,10 @@ mod tests {
         assert_eq!(channel_format(Channel::Metallic, Some(99)), ChannelFormat::L8);
         assert_eq!(channel_format(Channel::Roughness, Some(7)), ChannelFormat::L32F);
         assert_eq!(channel_format(Channel::SheenColor, Some(4)), ChannelFormat::Rgb16);
+        // user channels keep their declared format, grey or RGB (they always hold three components)
+        assert_eq!(channel_format(Channel::User0, Some(4)), ChannelFormat::Rgb16);
+        assert_eq!(channel_format(Channel::User1, Some(1)), ChannelFormat::L8);
+        assert_eq!(channel_format(Channel::User2, None), ChannelFormat::Rgb8);
     }
 
     #[test]
@@ -262,5 +298,9 @@ mod tests {
         assert_eq!(uncovered_default(Channel::BaseColor, Some(2)), [0.5; 3]);
         assert_eq!(uniform_value(Channel::Roughness, [0.2, 0.8, 0.5]), [0.5; 3]);
         assert_eq!(uniform_value(Channel::BaseColor, [0.2, 0.8, 0.5]), [0.2, 0.8, 0.5]);
+        // measured: a user channel shows its uniform value as stored and white where nothing covers it
+        assert_eq!(uniform_value(Channel::User0, [0.894, 0.106, 0.698]), [0.894, 0.106, 0.698]);
+        assert_eq!(uncovered_default(Channel::User7, Some(SHADER_MODEL_CURRENT)), [1.0; 3]);
+        assert_eq!(uncovered_default(Channel::User7, None), [1.0; 3]);
     }
 }

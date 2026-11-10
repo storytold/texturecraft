@@ -84,7 +84,10 @@ pub fn read(file: &ProjectFile) -> Result<StoredResults, ImportError> {
         };
         let shader_model = source.record.scene_uid.filter(|_| source.in_document).and_then(|uid| model.as_ref()?.texture_set(uid)).and_then(|s| s.shader_model);
         let mut set = StoredSet { name, channels: Vec::new(), notes: Vec::new() };
-        let mut mine: Vec<_> = entries.iter().filter(|e| &e.set == folder).collect();
+        let (mut mine, other_tiles) = crate::uv_tiles::one_tile(entries.iter().filter(|e| &e.set == folder).collect());
+        if other_tiles > 0 {
+            set.notes.push(crate::uv_tiles::other_tiles_note(other_tiles));
+        }
         mine.sort_by_key(|e| e.channel_bit);
         for e in mine {
             let label = channels::project_channel_name(e.channel_bit);

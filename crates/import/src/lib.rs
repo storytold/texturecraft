@@ -10,6 +10,7 @@
 //! - [`replay`]: brush strokes handed to a [`replay::StrokeReplayer`] (the engine's brush) as replay jobs.
 //! - [`safety_net`]: each stack composited by TextureCraft's compositor and compared with the original's stored result.
 //! - [`stored`]: the original's stored results per set and channel, read for `import.verify`.
+//! - [`uv_tiles`]: sets the original paints per UV tile (imported as one texture, with a note).
 //!
 //! The import reads nothing but the file and its options; nothing of the original file is stored in the project.
 //! This crate rasterises no strokes: with a replayer ([`Hooks::replay`]) painted masks and brush work become pixels
@@ -36,6 +37,7 @@ pub mod safety_net;
 pub mod sets;
 pub mod status;
 pub mod stored;
+pub mod uv_tiles;
 
 pub use error::{ImportError, PartError};
 pub use graph_uses::GraphMode;

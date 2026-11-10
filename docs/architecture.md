@@ -157,7 +157,10 @@ the brush cannot replay yet (particles, ribbons, path strokes, projection, smudg
 placeholders locked with a `brush:<what>` or `brush-alpha:<graph>` key, and with replay switched off with
 `strokes:<tool>`. The
 stored result itself becomes a locked "Original result" paint layer, hidden as a reference unless the
-import is asked to show it. The mesh is kept as binary glTF; nothing else of the original file is kept.
+import is asked to show it. The mesh is kept as binary glTF; nothing else of the original file is kept. User channels 0–7 map
+onto TextureCraft's user channels with their names (later ones, which the file numbers past the
+eighth, are reported). A set the original paints per UV tile imports as one texture over UV 0..1 with a
+note in the report: where the file keeps each tile's pixels has not been seen yet.
 
 The import runs as an `engine::import_cmds::ImportTask` reporting to an `ImportProgress`: a fraction, the step (reading
 the file; per texture set converting, replaying strokes and cooking graphs; saving) and a cancel flag. The flag is checked
