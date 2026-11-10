@@ -67,16 +67,18 @@ pub fn paint_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 
 /// Width of `view_buttons`, so the bar knows when to move them into the scrolling strip
 fn view_buttons_width(button_size: f32, spacing: f32) -> f32 {
-    // Two icons, two dropdowns, two separators and the five gaps between them
-    2.0 * button_size + 2.0 * icon_dropdown_button_width(button_size) + 2.0 * BAR_SEPARATOR_WIDTH + 5.0 * spacing
+    // Three icons, two dropdowns, two separators and the six gaps between them
+    3.0 * button_size + 2.0 * icon_dropdown_button_width(button_size) + 2.0 * BAR_SEPARATOR_WIDTH + 6.0 * spacing
 }
 
-/// View buttons in a right-to-left layout, with the screenshot button at the end
+/// View buttons in a right-to-left layout, with the Export image button and the AA toggle at the end
 fn view_buttons(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let button_size = ui.spacing().interact_size.y;
-    if icon_button(ui, ic::CAMERA, tr("Screenshot of the viewport"), false, button_size).clicked() {
-        app.toast(tr("Use the control channel or `texturecraft-cli render` for screenshots"), false);
+    let export_tip = tip(&app.ui.keymap, tr("Export image (resolution, render scale, transparency)"), "ui.imageExport");
+    if icon_button(ui, ic::CAMERA, &export_tip, app.ui.windows.image_export, button_size).clicked() {
+        crate::image_export::toggle(app);
     }
+    aa_toggle(app, ui);
 
     ui.add(egui::Separator::default().spacing(BAR_SEPARATOR_WIDTH));
     projection_dropdown(app, ui);
@@ -302,6 +304,31 @@ fn mode_buttons(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
         if icon_button(ui, icon, &tip(&app.ui.keymap, label, command), app.ui.mode == mode, button_size).clicked() {
             crate::menus::invoke(app, &ui.ctx().clone(), command);
         }
+    }
+}
+
+/// The viewport anti-aliasing switch: a labelled toggle ("AA") on the top bar, lit while on.
+/// It switches 4× MSAA and the idle temporal refinement together (`display.msaa` and
+/// `display.taa`; off is one sample per pixel) and remembers the choice in the preferences;
+/// Alt+A (`ui.viewportAa`) does the same from the keyboard, and the button takes keyboard focus
+/// like any other.
+fn aa_toggle(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    let on = app.viewport_aa();
+    let hint = tip(
+        &app.ui.keymap,
+        if on {
+            tr("Anti-aliasing on: smooth edges, refined while the view is still. Click for crisp texels (faster).")
+        } else {
+            tr("Anti-aliasing off: one sample per pixel, hard edges and crisp texels. Click to smooth edges.")
+        },
+        "ui.viewportAa",
+    );
+    // "AA" is the label in every language (like the units on the sliders); the tooltip and the
+    // accessible name are translated.
+    let resp = icon_button(ui, "AA", &hint, on, ui.spacing().interact_size.y);
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, on, tr("Anti-aliasing")));
+    if resp.clicked() {
+        app.toggle_viewport_aa();
     }
 }
 

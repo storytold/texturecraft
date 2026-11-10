@@ -21,6 +21,7 @@ pub mod fonts;
 pub mod gpu;
 pub mod i18n;
 pub mod id_color_pick;
+pub mod image_export;
 pub mod keymap;
 mod mask_preview_image;
 mod material_preview_image;
@@ -159,6 +160,8 @@ pub struct TextureCraftApp {
     styled: Option<(theme::Brightness, theme::Accent)>,
     /// Whether the window had focus last frame.
     focused: bool,
+    /// The mesh (project) the viewport anti-aliasing preference was last applied to.
+    aa_mesh_id: u64,
     /// The update check and prompt (desktop only).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) updates_rt: updates_ui::Runtime,
@@ -176,6 +179,34 @@ pub struct TextureCraftApp {
 }
 
 impl TextureCraftApp {
+    /// A new or opened project (a new mesh) takes the viewport anti-aliasing preference.
+    pub fn apply_viewport_aa(&mut self) {
+        if self.aa_mesh_id != self.session.mesh_id {
+            self.aa_mesh_id = self.session.mesh_id;
+            self.set_viewport_aa(self.ui.prefs.viewport_aa);
+        }
+    }
+
+    /// Whether the viewport anti-aliases its edges (4× MSAA, what the top-bar AA toggle shows).
+    pub fn viewport_aa(&self) -> bool {
+        self.session.doc.project.display.msaa
+    }
+
+    /// The top-bar AA toggle (`ui.viewportAa`, Alt+A): switch the views' anti-aliasing (4× MSAA
+    /// and the idle temporal refinement together) and remember the choice in the preferences.
+    /// Off renders one sample per pixel: hard edges and crisp texels.
+    pub fn toggle_viewport_aa(&mut self) {
+        let on = !self.viewport_aa();
+        self.set_viewport_aa(on);
+        self.ui.prefs.viewport_aa = on;
+    }
+
+    fn set_viewport_aa(&mut self, on: bool) {
+        let d = &mut self.session.doc.project.display;
+        d.msaa = on;
+        d.taa = on;
+    }
+
     /// The app around `session`, with the saved UI state (or defaults in the OS language) and the GPU viewport.
     pub fn new(cc: &eframe::CreationContext<'_>, session: Session) -> TextureCraftApp {
         theme::install(&cc.egui_ctx);
@@ -227,6 +258,7 @@ impl TextureCraftApp {
             next_autosave,
             styled: None,
             focused: true,
+            aa_mesh_id: 0,
             #[cfg(not(target_arch = "wasm32"))]
             updates_rt: updates_ui::Runtime::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -571,6 +603,7 @@ impl eframe::App for TextureCraftApp {
             theme::apply(ctx, style.0, style.1);
             self.styled = Some(style);
         }
+        self.apply_viewport_aa();
         self.step_camera_glide(ctx);
         control::poll(self, ctx);
         #[cfg(not(target_arch = "wasm32"))]

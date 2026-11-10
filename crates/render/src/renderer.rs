@@ -2,7 +2,8 @@
 //! with an encoder (offscreen render into per-view targets) and [`Renderer::blit`] inside its
 //! own render pass.
 //!
-//! Per view and frame: the scene pass (MSAA, linear HDR premultiplied by scene coverage, resolved)
+//! Per view and frame: the scene pass (4× MSAA and resolved, or one sample per pixel when
+//! [`Shade::msaa`] is off; linear HDR premultiplied by scene coverage)
 //! → the scene effects (only when on: a G-buffer pass, the screen-space subsurface blur and the
 //! depth of field, see fx.wgsl) → the bloom pyramid (only when bloom is on) → the post pass (flat
 //! studio backdrop, exposure,
@@ -159,6 +160,9 @@ pub struct Shade {
     pub parallax: bool,
     /// Idle accumulation of jittered frames in the 3D view.
     pub taa: bool,
+    /// 4× multisampling of the scene pass ([`MSAA`]); off renders one sample per pixel (crisp,
+    /// aliased edges and texels, less GPU memory and fill).
+    pub msaa: bool,
     /// Per-channel diffuse wrap where the scattering weight is 1 (0 = plain Lambert), see
     /// [`scatter_wrap`].
     pub scatter: [f32; 3],
@@ -211,6 +215,7 @@ impl Shade {
             spec_gloss: d.spec_gloss,
             parallax: d.parallax,
             taa: d.taa,
+            msaa: d.msaa,
             scatter: scatter_wrap(d),
             ior: d.ior,
             dof: d.dof.enabled.then_some([d.dof.focus_distance, d.dof.aperture]),
@@ -259,6 +264,7 @@ impl Default for Shade {
             spec_gloss: false,
             parallax: false,
             taa: false,
+            msaa: true,
             scatter: scatter_wrap(&DisplaySettings::default()),
             ior: 1.5,
             dof: None,
@@ -475,7 +481,10 @@ struct Behind {
 
 struct ViewTargets {
     size: [u32; 2],
-    msaa: wgpu::TextureView,
+    /// Samples per pixel of the scene pass: [`MSAA`], or 1 (no multisampled color target: the
+    /// scene renders straight into its resolve target).
+    msaa_samples: u32,
+    msaa: Option<wgpu::TextureView>,
     depth: wgpu::TextureView,
     /// The resolved HDR scene of a jittered accumulation frame.
     hdr: wgpu::TextureView,
@@ -516,6 +525,124 @@ struct ShadowMap {
     bg: wgpu::BindGroup,
 }
 
+/// The pipelines of the scene pass, all at one sample count.
+struct ScenePipelines {
+    mesh: wgpu::RenderPipeline,
+    /// The scene behind transmissive surfaces: `fs_mesh` without them.
+    opaque: wgpu::RenderPipeline,
+    uv: wgpu::RenderPipeline,
+    wire: wgpu::RenderPipeline,
+    wire3d: wgpu::RenderPipeline,
+    /// The highlighted set's mesh edges, wider and in the highlight color
+    highlight: wgpu::RenderPipeline,
+    /// Bake mode: the high poly, the cage's faces and wireframe, the low poly's UV seams
+    bake_high: wgpu::RenderPipeline,
+    cage: wgpu::RenderPipeline,
+    cage_wire: wgpu::RenderPipeline,
+    uv_seam: wgpu::RenderPipeline,
+    bg: wgpu::RenderPipeline,
+}
+
+/// What the scene pass pipelines are built from (kept to build the 1-sample set on demand).
+struct SceneRecipe {
+    module: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    mesh_layout: wgpu::PipelineLayout,
+    bg_layout: wgpu::PipelineLayout,
+}
+
+impl ScenePipelines {
+    fn new(device: &wgpu::Device, r: &SceneRecipe, hdr_format: wgpu::TextureFormat, samples: u32) -> ScenePipelines {
+        let vb = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2],
+        })];
+        let hdr = |fs, blend| Some((fs, hdr_format, blend));
+        let always = || Some(depth_state(false, wgpu::CompareFunction::Always));
+        let less = || Some(depth_state(true, wgpu::CompareFunction::Less));
+        let blend = Some(wgpu::BlendState::ALPHA_BLENDING);
+        let m = &r.module;
+        let [mesh_vertex_layout] = vb.clone();
+        let high_layout = [
+            mesh_vertex_layout,
+            Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<f32>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![4 => Float32],
+            }),
+        ];
+        let corner_layout = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<[f32; 3]>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+        })];
+        ScenePipelines {
+            mesh: pipeline(device, "tc_mesh", &r.mesh_layout, m, "vs_mesh", &vb, hdr("fs_mesh", None), samples, less()),
+            opaque: pipeline(device, "tc_opaque", &r.mesh_layout, m, "vs_mesh", &vb, hdr("fs_opaque", None), samples, less()),
+            uv: pipeline(device, "tc_uv", &r.layout, m, "vs_uv", &vb, hdr("fs_uv", None), samples, always()),
+            wire: pipeline(device, "tc_wire", &r.layout, m, "vs_uv", &vb, hdr("fs_wire", blend), samples, always()),
+            wire3d: pipeline(
+                device,
+                "tc_wire3d",
+                &r.layout,
+                m,
+                "vs_wire3d",
+                &vb,
+                hdr("fs_wire3d", blend),
+                samples,
+                Some(depth_state(false, wgpu::CompareFunction::LessEqual)),
+            ),
+            highlight: pipeline(
+                device,
+                "tc_highlight",
+                &r.layout,
+                m,
+                "vs_wire_highlight",
+                &vb,
+                hdr("fs_wire_highlight", blend),
+                samples,
+                Some(depth_state(false, wgpu::CompareFunction::LessEqual)),
+            ),
+            bake_high: pipeline(device, "tc_bake_high", &r.bg_layout, m, "vs_bake_high", &high_layout, hdr("fs_bake_high", None), samples, less()),
+            cage: pipeline(
+                device,
+                "tc_cage",
+                &r.bg_layout,
+                m,
+                "vs_bake_cage",
+                &corner_layout,
+                hdr("fs_bake_cage", blend),
+                samples,
+                Some(depth_state(false, wgpu::CompareFunction::LessEqual)),
+            ),
+            cage_wire: pipeline(
+                device,
+                "tc_cage_wire",
+                &r.bg_layout,
+                m,
+                "vs_bake_cage_wire",
+                &corner_layout,
+                hdr("fs_wire_bake_cage", blend),
+                samples,
+                Some(depth_state(false, wgpu::CompareFunction::LessEqual)),
+            ),
+            uv_seam: pipeline(
+                device,
+                "tc_uv_seam",
+                &r.layout,
+                m,
+                "vs_wire3d",
+                &vb,
+                hdr("fs_wire_uv_seam", blend),
+                samples,
+                Some(depth_state(false, wgpu::CompareFunction::LessEqual)),
+            ),
+            bg: pipeline(device, "tc_bg", &r.bg_layout, m, "vs_bg", &[], hdr("fs_bg", None), samples, always()),
+        }
+    }
+}
+
 pub struct Renderer {
     target_format: wgpu::TextureFormat,
     /// [`HDR_FORMAT`], or [`COLOR_FORMAT`] where float targets are not renderable (WebGL2
@@ -529,20 +656,11 @@ pub struct Renderer {
     /// The refraction source of the mesh pipelines (group 2), and that bind group reading black.
     refr_bgl: wgpu::BindGroupLayout,
     refr_black: wgpu::BindGroup,
-    mesh_pipeline: wgpu::RenderPipeline,
-    /// The scene behind transmissive surfaces: `fs_mesh` without them.
-    opaque_pipeline: wgpu::RenderPipeline,
-    uv_pipeline: wgpu::RenderPipeline,
-    wire_pipeline: wgpu::RenderPipeline,
-    wire3d_pipeline: wgpu::RenderPipeline,
-    /// The highlighted set's mesh edges, wider and in the highlight color
-    highlight_pipeline: wgpu::RenderPipeline,
-    /// Bake mode: the high poly, the cage's faces and wireframe, the low poly's UV seams
-    bake_high_pipeline: wgpu::RenderPipeline,
-    cage_pipeline: wgpu::RenderPipeline,
-    cage_wire_pipeline: wgpu::RenderPipeline,
-    uv_seam_pipeline: wgpu::RenderPipeline,
-    bg_pipeline: wgpu::RenderPipeline,
+    /// The scene pass pipelines at [`MSAA`] samples, and at 1 sample (anti-aliasing off;
+    /// built the first time a view asks for it).
+    scene_ms: ScenePipelines,
+    scene_single: Option<ScenePipelines>,
+    scene_recipe: SceneRecipe,
     blit_pipeline: wgpu::RenderPipeline,
     post_pipeline: wgpu::RenderPipeline,
     /// Bright pass + first downsample, downsample, additive upsample.
@@ -905,117 +1023,17 @@ impl Renderer {
 
         // shortcut: the RGBA8 fallback clips highlights above 1 and bands in the darks; encode (e.g. RGBM) if WebGL2 without float color buffers turns out to matter
         let hdr_format = if hdr_renderable(device) { HDR_FORMAT } else { COLOR_FORMAT };
-        let hdr_target = |fragment_entry_point, blend| Some((fragment_entry_point, hdr_format, blend));
-        let always = || Some(depth_state(false, wgpu::CompareFunction::Always));
-        let mesh_pipeline = pipeline(
-            device,
-            "tc_mesh",
-            &mesh_layout,
-            &module,
-            "vs_mesh",
-            &vertex_layout,
-            hdr_target("fs_mesh", None),
-            MSAA,
-            Some(depth_state(true, wgpu::CompareFunction::Less)),
-        );
-        let opaque_pipeline = pipeline(
-            device,
-            "tc_opaque",
-            &mesh_layout,
-            &module,
-            "vs_mesh",
-            &vertex_layout,
-            hdr_target("fs_opaque", None),
-            MSAA,
-            Some(depth_state(true, wgpu::CompareFunction::Less)),
-        );
-        let uv_pipeline = pipeline(device, "tc_uv", &layout, &module, "vs_uv", &vertex_layout, hdr_target("fs_uv", None), MSAA, always());
-        let blend = Some(wgpu::BlendState::ALPHA_BLENDING);
-        let wire_pipeline = pipeline(device, "tc_wire", &layout, &module, "vs_uv", &vertex_layout, hdr_target("fs_wire", blend), MSAA, always());
-        let wire3d_depth = Some(depth_state(false, wgpu::CompareFunction::LessEqual));
-        let wire3d_pipeline =
-            pipeline(device, "tc_wire3d", &layout, &module, "vs_wire3d", &vertex_layout, hdr_target("fs_wire3d", blend), MSAA, wire3d_depth.clone());
-        let highlight_pipeline = pipeline(
-            device,
-            "tc_highlight",
-            &layout,
-            &module,
-            "vs_wire_highlight",
-            &vertex_layout,
-            hdr_target("fs_wire_highlight", blend),
-            MSAA,
-            wire3d_depth.clone(),
-        );
-
-        let [mesh_vertex_layout] = vertex_layout.clone();
-        let high_layout = [
-            mesh_vertex_layout,
-            Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<f32>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![4 => Float32],
-            }),
-        ];
-        let bake_high_pipeline = pipeline(
-            device,
-            "tc_bake_high",
-            &background_layout,
-            &module,
-            "vs_bake_high",
-            &high_layout,
-            hdr_target("fs_bake_high", None),
-            MSAA,
-            Some(depth_state(true, wgpu::CompareFunction::Less)),
-        );
-        let corner_layout = [Some(wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<[f32; 3]>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-        })];
-        let cage_pipeline = pipeline(
-            device,
-            "tc_cage",
-            &background_layout,
-            &module,
-            "vs_bake_cage",
-            &corner_layout,
-            hdr_target("fs_bake_cage", blend),
-            MSAA,
-            wire3d_depth.clone(),
-        );
-        let cage_wire_pipeline = pipeline(
-            device,
-            "tc_cage_wire",
-            &background_layout,
-            &module,
-            "vs_bake_cage_wire",
-            &corner_layout,
-            hdr_target("fs_wire_bake_cage", blend),
-            MSAA,
-            wire3d_depth.clone(),
-        );
-        let uv_seam_pipeline =
-            pipeline(device, "tc_uv_seam", &layout, &module, "vs_wire3d", &vertex_layout, hdr_target("fs_wire_uv_seam", blend), MSAA, wire3d_depth.clone());
-        let bg_pipeline = pipeline(device, "tc_bg", &background_layout, &module, "vs_bg", &[], hdr_target("fs_bg", None), MSAA, always());
+        let hdr_target = |fs, blend| Some((fs, hdr_format, blend));
+        let scene_recipe = SceneRecipe { module, layout, mesh_layout, bg_layout: background_layout };
+        let scene_ms = ScenePipelines::new(device, &scene_recipe, hdr_format, MSAA);
+        let (module, mesh_layout) = (&scene_recipe.module, &scene_recipe.mesh_layout);
         let blit_pipeline = pipeline(device, "tc_blit", &blit_layout, &util_module, "vs_blit", &[], Some(("fs_blit", target_format, None)), 1, None);
         let post_pipeline = pipeline(device, "tc_post", &effect_layout, &post_module, "vs_full", &[], Some(("fs_post", COLOR_FORMAT, None)), 1, None);
-        let bloom_pipelines = [("fs_bloom_pre", None), ("fs_bloom_down", None), ("fs_bloom_up", Some(ADDITIVE))].map(|(fragment_entry_point, blend)| {
-            pipeline(device, "tc_bloom", &effect_layout, &post_module, "vs_full", &[], hdr_target(fragment_entry_point, blend), 1, None)
-        });
-        let gbuffer_pipeline = pipeline(
-            device,
-            "tc_gbuf",
-            &mesh_layout,
-            &module,
-            "vs_mesh",
-            &vertex_layout,
-            hdr_target("fs_gbuf", None),
-            1,
-            Some(depth_state(true, wgpu::CompareFunction::Less)),
-        );
-        let sss_pipelines = ["fs_sss_h", "fs_sss_v"].map(|fragment_entry_point| {
-            pipeline(device, "tc_sss", &effect_layout, &post_module, "vs_full", &[], hdr_target(fragment_entry_point, None), 1, None)
-        });
+        let bloom_pipelines = [("fs_bloom_pre", None), ("fs_bloom_down", None), ("fs_bloom_up", Some(ADDITIVE))]
+            .map(|(fs, blend)| pipeline(device, "tc_bloom", &effect_layout, &post_module, "vs_full", &[], hdr_target(fs, blend), 1, None));
+        let gbuffer_pipeline =
+            pipeline(device, "tc_gbuf", mesh_layout, module, "vs_mesh", &vertex_layout, hdr_target("fs_gbuf", None), 1, Some(depth_state(true, wgpu::CompareFunction::Less)));
+        let sss_pipelines = ["fs_sss_h", "fs_sss_v"].map(|fs| pipeline(device, "tc_sss", &effect_layout, &post_module, "vs_full", &[], hdr_target(fs, None), 1, None));
         let dof_pipeline = pipeline(device, "tc_dof", &effect_layout, &post_module, "vs_full", &[], hdr_target("fs_dof", None), 1, None);
         let dof_target = Some(wgpu::ColorTargetState { format: hdr_format, blend: None, write_mask: wgpu::ColorWrites::ALL });
         let dof_gather_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1116,17 +1134,9 @@ impl Renderer {
             fx_bgl: effect_bind_group_layout,
             refr_bgl: refraction_bind_group_layout,
             refr_black: refraction_black,
-            mesh_pipeline,
-            opaque_pipeline,
-            uv_pipeline,
-            wire_pipeline,
-            wire3d_pipeline,
-            highlight_pipeline,
-            bake_high_pipeline,
-            cage_pipeline,
-            cage_wire_pipeline,
-            uv_seam_pipeline,
-            bg_pipeline,
+            scene_ms,
+            scene_single: None,
+            scene_recipe,
             blit_pipeline,
             post_pipeline,
             bloom_pipelines,
@@ -1622,7 +1632,7 @@ impl Renderer {
         })
     }
 
-    fn create_targets(&self, device: &wgpu::Device, size: [u32; 2]) -> ViewTargets {
+    fn create_targets(&self, device: &wgpu::Device, size: [u32; 2], msaa_samples: u32) -> ViewTargets {
         let hdr = target_view(device, "tc_hdr", size, self.hdr_format, 1);
         let accum = target_view(device, "tc_accum", size, self.hdr_format, 1);
         let accum_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1657,8 +1667,9 @@ impl Renderer {
         });
         ViewTargets {
             size,
-            msaa: target_view(device, "tc_msaa", size, self.hdr_format, MSAA),
-            depth: target_view(device, "tc_depth", size, DEPTH_FORMAT, MSAA),
+            msaa_samples,
+            msaa: (msaa_samples > 1).then(|| target_view(device, "tc_msaa", size, self.hdr_format, msaa_samples)),
+            depth: target_view(device, "tc_depth", size, DEPTH_FORMAT, msaa_samples),
             post_bg: self.fx_bind_group(device, &accum, &[], &post_buf),
             hdr,
             accum,
@@ -1703,10 +1714,23 @@ impl Renderer {
         }
     }
 
-    fn targets(&mut self, device: &wgpu::Device, id: u64, size: [u32; 2], bloom: bool, fx: bool, refraction: bool) -> Option<&mut ViewTargets> {
+    #[allow(clippy::too_many_arguments)]
+    fn targets(
+        &mut self,
+        device: &wgpu::Device,
+        id: u64,
+        size: [u32; 2],
+        msaa_samples: u32,
+        bloom: bool,
+        fx: bool,
+        refraction: bool,
+    ) -> Option<&mut ViewTargets> {
         let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
-        if self.views.get(&id).is_none_or(|v| v.size != size) {
-            let v = self.create_targets(device, size);
+        if msaa_samples == 1 && self.scene_single.is_none() {
+            self.scene_single = Some(ScenePipelines::new(device, &self.scene_recipe, self.hdr_format, 1));
+        }
+        if self.views.get(&id).is_none_or(|v| v.size != size || v.msaa_samples != msaa_samples) {
+            let v = self.create_targets(device, size, msaa_samples);
             self.views.insert(id, v);
         }
         if refraction && self.views.get(&id).is_some_and(|v| v.behind.is_none()) {
@@ -1935,7 +1959,8 @@ impl Renderer {
             d: sss_d,
             e: [flag(cam.ortho), sample as f32, 0.0, 0.0],
         };
-        let Some(v) = self.targets(device, frame.view_id, frame.size, bloom, fx_on, refraction) else { return };
+        let msaa_samples = if frame.shade.msaa { MSAA } else { 1 };
+        let Some(v) = self.targets(device, frame.view_id, frame.size, msaa_samples, bloom, fx_on, refraction) else { return };
         queue.write_buffer(&v.globals, 0, bytemuck::bytes_of(&raw));
         queue.write_buffer(&v.post_buf, 0, bytemuck::bytes_of(&post));
         v.ready = true;
@@ -2024,7 +2049,8 @@ impl Renderer {
 
     /// The scene without transmissive surfaces into `b` (MSAA resolved into mip 0), then its mips.
     fn behind_pass(&self, encoder: &mut wgpu::CommandEncoder, v: &ViewTargets, b: &Behind, globals_bg: &wgpu::BindGroup, frame: &Frame) {
-        self.draw_scene(encoder, v, &b.level0, globals_bg, frame, &self.opaque_pipeline, None, None, &self.refr_black);
+        let Some(p) = self.scene_pipelines(v) else { return };
+        self.draw_scene(encoder, v, &b.level0, globals_bg, frame, &p.opaque, None, None, &self.refr_black);
         let Some(pipe) = self.mip_pipelines.get(&self.hdr_format) else { return };
         for (dst, bg) in &b.mips {
             fullscreen(encoder, "tc_behind_mip", dst, CLEAR, pipe, bg);
@@ -2082,14 +2108,20 @@ impl Renderer {
             ViewKind::Scene => None,
             ViewKind::Uv { ts, .. } => Some(ts),
         };
+        let Some(p) = self.scene_pipelines(v) else { return };
         let (pipe, wire) = match uv_ts {
-            None => (&self.mesh_pipeline, frame.shade.wireframe_3d.then_some(&self.wire3d_pipeline)),
-            Some(_) => (&self.uv_pipeline, frame.shade.wireframe.then_some(&self.wire_pipeline)),
+            None => (&p.mesh, frame.shade.wireframe_3d.then_some(&p.wire3d)),
+            Some(_) => (&p.uv, frame.shade.wireframe.then_some(&p.wire)),
         };
         // Transmissive surfaces refract what the behind pass rendered this frame.
         let refr = v.behind.as_ref().filter(|_| frame.shade.refraction).map_or(&self.refr_black, |b| &b.bg);
-        let highlight = frame.shade.highlight.filter(|_| uv_ts.is_none()).map(|highlight| (&self.highlight_pipeline, highlight.set));
+        let highlight = frame.shade.highlight.filter(|_| uv_ts.is_none()).map(|highlight| (&p.highlight, highlight.set));
         self.draw_scene(encoder, v, resolve, globals_bg, frame, pipe, wire, highlight, refr);
+    }
+
+    /// The scene pass pipelines matching `v`'s sample count.
+    fn scene_pipelines(&self, v: &ViewTargets) -> Option<&ScenePipelines> {
+        if v.msaa_samples > 1 { Some(&self.scene_ms) } else { self.scene_single.as_ref() }
     }
 
     /// One scene pass: background, then the mesh with `mesh_pipeline`, the wireframe with `wire` and one set's highlighted edges with `highlight`
@@ -2106,14 +2138,26 @@ impl Renderer {
         highlight: Option<(&wgpu::RenderPipeline, usize)>,
         refraction_source: &wgpu::BindGroup,
     ) {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("tc_view"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &targets.msaa,
+        let Some(p) = self.scene_pipelines(targets) else { return };
+        // Multisampled: draw into the MSAA target and resolve; one sample: draw straight into
+        // `resolve` and keep it.
+        let color = match &targets.msaa {
+            Some(ms) => wgpu::RenderPassColorAttachment {
+                view: ms,
                 resolve_target: Some(resolve),
                 depth_slice: None,
                 ops: wgpu::Operations { load: CLEAR, store: wgpu::StoreOp::Discard },
-            })],
+            },
+            None => wgpu::RenderPassColorAttachment {
+                view: resolve,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations { load: CLEAR, store: wgpu::StoreOp::Store },
+            },
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("tc_view"),
+            color_attachments: &[Some(color)],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &targets.depth,
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
@@ -2124,7 +2168,7 @@ impl Renderer {
             multiview_mask: None,
         });
         pass.set_bind_group(0, globals_bind_group, &[]);
-        pass.set_pipeline(&self.bg_pipeline);
+        pass.set_pipeline(&p.bg);
         pass.draw(0..3, 0..1);
         let Some(mesh) = &self.mesh else { return };
 
@@ -2158,16 +2202,16 @@ impl Renderer {
         }
 
         if let Some(bake) = bake {
-            self.draw_bake(&mut pass, mesh, frame, bake);
+            self.draw_bake(&mut pass, p, mesh, frame, bake);
         }
     }
 
     /// Bake mode's high poly, UV seams and cages over the low poly `low_poly`
-    fn draw_bake(&self, pass: &mut wgpu::RenderPass<'_>, low_poly: &MeshGpu, frame: &Frame, bake: BakeVisualization) {
+    fn draw_bake(&self, pass: &mut wgpu::RenderPass<'_>, p: &ScenePipelines, low_poly: &MeshGpu, frame: &Frame, bake: BakeVisualization) {
         if bake.high_poly
             && let Some(high) = &self.bake_high
         {
-            pass.set_pipeline(&self.bake_high_pipeline);
+            pass.set_pipeline(&p.bake_high);
             pass.set_vertex_buffer(0, high.vertices.slice(..));
             pass.set_vertex_buffer(1, high.missed.slice(..));
             pass.set_index_buffer(high.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -2177,7 +2221,7 @@ impl Renderer {
         if bake.uv_seams
             && let Some(seams) = self.uv_seams.as_ref().filter(|seams| seams.mesh_id == low_poly.id)
         {
-            pass.set_pipeline(&self.uv_seam_pipeline);
+            pass.set_pipeline(&p.uv_seam);
             pass.set_vertex_buffer(0, low_poly.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
             for (range, set) in self.drawable(&seams.line_draws, &frame.visible, bake.only_set) {
@@ -2193,12 +2237,12 @@ impl Renderer {
         let shown = |texture_set: usize| bake.only_set.is_none_or(|only| only == texture_set) && frame.visible.get(texture_set).copied().unwrap_or(true);
         let cages = || self.cages.iter().enumerate().filter(move |(texture_set, _)| shown(*texture_set)).filter_map(|(_, cage)| cage.as_ref());
         // The translucent faces first, then the wireframe over them
-        pass.set_pipeline(&self.cage_pipeline);
+        pass.set_pipeline(&p.cage);
         for cage in cages() {
             pass.set_vertex_buffer(0, cage.corners.slice(..));
             pass.draw(0..cage.corner_count, 0..1);
         }
-        pass.set_pipeline(&self.cage_wire_pipeline);
+        pass.set_pipeline(&p.cage_wire);
         for cage in cages() {
             pass.set_vertex_buffer(0, cage.corners.slice(..));
             pass.set_index_buffer(cage.edges.slice(..), wgpu::IndexFormat::Uint32);
@@ -2236,6 +2280,12 @@ impl Renderer {
     /// Read back the rendered view as tightly packed RGBA8 (sRGB-encoded), blocking.
     pub fn read_view(&self, device: &wgpu::Device, queue: &wgpu::Queue, id: u64) -> Option<(u32, u32, Vec<u8>)> {
         crate::readback::Readback::blocking(device, queue, &self.views.get(&id)?.resolve)
+    }
+
+    /// The frame a view last rendered (its kind, size, camera and shading), if any: what an
+    /// image export renders again at another resolution.
+    pub fn last_frame(&self, id: u64) -> Option<&Frame> {
+        self.views.get(&id)?.history.as_ref().map(|(f, _)| f)
     }
 
     /// Forget a view's targets (e.g. a closed panel).

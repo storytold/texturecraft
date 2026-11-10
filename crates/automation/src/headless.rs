@@ -41,6 +41,19 @@ pub struct RenderOptions {
     pub bounces: Option<u32>,
     /// Path trace on the CPU even when a GPU with compute shaders exists.
     pub cpu: bool,
+    /// A size preset (`texturecraft_render::output::PRESETS`); `width`/`height` override its edges.
+    pub preset: Option<String>,
+    /// Render multiplier per side: 1 (default), 2 or 4, applied after the size is chosen.
+    pub scale: Option<u32>,
+    /// Transparent background (only the mesh, straight alpha). Path-traced renders only, and on
+    /// the CPU tracer: the real-time viewport and the GPU tracer always draw the backdrop.
+    pub transparent: bool,
+}
+
+impl RenderOptions {
+    fn size_request(&self) -> texturecraft_render::output::SizeRequest {
+        texturecraft_render::output::SizeRequest { width: self.width, height: self.height, preset: self.preset.clone(), scale: self.scale }
+    }
 }
 
 /// A PNG render and what drew it (the GPU adapter, or the CPU path tracer).
@@ -292,11 +305,11 @@ impl Headless {
             other => return Err(bad(format!("unknown view `{other}` (3d, 2d or uv)"))),
         };
         let max = if self.trusted() { MAX_LOCAL_RENDER_SIDE } else { MAX_PNG_SIDE };
-        let side = |v: Option<u32>, d: f32| {
-            let v = v.unwrap_or(d.round() as u32);
-            if (16..=max).contains(&v) { Ok(v) } else { Err(bad(format!("render size {v} must be 16 to {max} pixels"))) }
-        };
-        let size = [side(o.width, s.viewport.x)?, side(o.height, s.viewport.y)?];
+        let viewport = [s.viewport.x, s.viewport.y];
+        let request = o.size_request();
+        let resolve =
+            |max_side: u32, limit: &'static str| texturecraft_render::output::resolve(viewport, &request, max_side, limit).map_err(|e| bad(e.to_string()));
+        let size = resolve(max, "export limit")?;
         let mut camera = s.camera;
         for (v, slot, lim) in [(o.yaw, &mut camera.yaw, 1e6), (o.pitch, &mut camera.pitch, 89.0)] {
             if let Some(v) = v {
@@ -312,8 +325,9 @@ impl Headless {
             }
             let settings = texturecraft_render::trace::TraceSettings { bounces: o.bounces.unwrap_or(6).clamp(1, 32) };
             let mut traced = None;
-            let mut by = "CPU path tracer".to_string();
+            let mut by = if o.transparent { "CPU path tracer (transparent background)".to_string() } else { "CPU path tracer".to_string() };
             if !o.cpu
+                && !o.transparent
                 && let Ok(gpu) = self.gpu.get_or_insert_with(Gpu::new)
             {
                 // Last-resort guard, as for viewport renders below.
@@ -332,7 +346,7 @@ impl Headless {
             }
             let (w, h, rgba) = match traced {
                 Some(px) => px,
-                None => crate::render::path_trace(&mut self.session, size, camera, samples, &settings),
+                None => crate::render::path_trace(&mut self.session, size, camera, samples, &settings, o.transparent),
             };
             let png = encode_png(w, h, rgba)?;
             if !self.trusted() {
@@ -340,10 +354,16 @@ impl Headless {
             }
             return Ok(Rendered { width: w, height: h, png, by });
         }
+        if o.transparent {
+            return Err(bad("a transparent background needs a path-traced render (`samples`); the real-time viewport always draws its backdrop"));
+        }
         let gpu = match self.gpu.get_or_insert_with(Gpu::new) {
             Ok(g) => g,
             Err(e) => return Err(AutomationError::Other(format!("cannot render: {e}"))),
         };
+        // The GPU's largest texture can be smaller than the export limit (WebGL-class adapters).
+        let gpu_max = gpu.max_side();
+        let size = if gpu_max < max { resolve(gpu_max, "GPU texture limit")? } else { size };
         // Last-resort guard: wgpu panics on device errors; drop the device and report instead.
         let session = &mut self.session;
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.render(session, kind, size, camera)));

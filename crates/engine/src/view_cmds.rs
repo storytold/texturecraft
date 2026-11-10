@@ -26,7 +26,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Display settings",
             [],
             None,
-            "{environment?: <built-in>|resource:<image resource>, exposure?, blur?, rotation?, opacity?, toneMapping?: linear|aces, fov?, shadows?, aoIntensity?, bloom?, vignette?, sharpen?, grain?, postEffects?, taa?, specGloss?, parallax?, displacement? (the viewport moves the surface by the height channel), scatterColor?: [r,g,b] (linear) | \"#rrggbb\", scatterRadius? (0..1 of the mesh radius), ior? (1..3, transmission), dof?: {enabled?, focusDistance? (view depth, world units; 0 = the orbit target), aperture? (lens radius, 0..1 of the mesh radius)}}",
+            "{environment?: <built-in>|resource:<image resource>, exposure?, blur?, rotation?, opacity?, toneMapping?: linear|aces, fov?, shadows?, aoIntensity?, bloom?, vignette?, sharpen?, grain?, postEffects?, taa?, msaa? (4× multisampling; false: one sample per pixel), specGloss?, parallax?, displacement? (the viewport moves the surface by the height channel), scatterColor?: [r,g,b] (linear) | \"#rrggbb\", scatterRadius? (0..1 of the mesh radius), ior? (1..3, transmission), dof?: {enabled?, focusDistance? (view depth, world units; 0 = the orbit target), aperture? (lens radius, 0..1 of the mesh radius)}}",
             always,
             display
         ),
@@ -250,6 +250,7 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
     for (k, slot) in [
         ("postEffects", &mut d.post_effects),
         ("taa", &mut d.taa),
+        ("msaa", &mut d.msaa),
         ("specGloss", &mut d.spec_gloss),
         ("parallax", &mut d.parallax),
         ("displacement", &mut d.displacement),
@@ -289,12 +290,12 @@ mod tests {
         let r = execute(
             &mut s,
             "display.set",
-            &json!({"environment": env, "specGloss": true, "parallax": true, "displacement": true, "taa": false, "scatterColor": [2.0, 0.5, 0.25], "scatterRadius": 0.3}),
+            &json!({"environment": env, "specGloss": true, "parallax": true, "displacement": true, "taa": false, "msaa": false, "scatterColor": [2.0, 0.5, 0.25], "scatterRadius": 0.3}),
         )
         .unwrap();
         assert_eq!(r["environment"], json!(env));
         let d = &s.doc.project.display;
-        assert!(d.spec_gloss && d.parallax && d.displacement && !d.taa);
+        assert!(d.spec_gloss && d.parallax && d.displacement && !d.taa && !d.msaa);
         assert_eq!((d.scatter_color, d.scatter_radius), ([1.0, 0.5, 0.25], 0.3), "scatter settings (clamped)");
         assert_eq!(d.environment_resource(), Some(name.as_str()));
         execute(&mut s, "file.removeUnused", &Value::Null).unwrap();

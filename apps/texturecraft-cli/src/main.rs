@@ -29,11 +29,16 @@ USAGE:
       Bake mesh maps for every texture set (a project is saved in place without -o).
   texturecraft-cli export <input> <dir> [--preset <name>] [--format <ext>] [--padding <mode>] [--size <px>]
       Export textures (default preset: Document channels + Normal + AO).
-  texturecraft-cli render <input> <out.png> [--size <W>x<H>] [--view 3d|2d] [--camera <name>] [--yaw <deg>]
-                   [--pitch <deg>] [--samples <n>] [--bounces <n>] [--cpu]
+  texturecraft-cli render <input> <out.png> [--size <W>x<H>] [--width <px>] [--height <px>]
+                   [--preset hd|qhd|4k|square-1k|square-2k] [--scale 1|2|4] [--transparent]
+                   [--view 3d|2d] [--camera <name>] [--yaw <deg>] [--pitch <deg>] [--samples <n>]
+                   [--bounces <n>] [--cpu]
       Render the viewport to PNG (needs a GPU or software adapter); --camera looks through a
       camera saved in the project (camera.add); --samples path traces it instead (Rendering
-      mode), on the GPU when it has compute shaders, else (or with --cpu) on the CPU.
+      mode), on the GPU when it has compute shaders, else (or with --cpu) on the CPU. The size
+      defaults to the viewport; one of --width/--height keeps the aspect ratio; --scale
+      multiplies it (up to 4096 px a side and the GPU's texture limit). --transparent drops the
+      backdrop (path-traced renders only, on the CPU tracer).
   texturecraft-cli new <mesh file | builtin:<id>> <out.tcraft> [--resolution <px>] [--sample]
       New project; --sample bakes and applies a smart material to every texture set. The
       sample's mesh maps are baked at the resolution up to 1024 px (most of the file's size),
@@ -58,7 +63,11 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("batch", &[], &[]),
     ("bake", &["-o", "--resolution", "--maps"], &[]),
     ("export", &["--preset", "--format", "--padding", "--size"], &[]),
-    ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
+    (
+        "render",
+        &["--size", "--width", "--height", "--preset", "--scale", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"],
+        &["--cpu", "--transparent"],
+    ),
     ("new", &["--resolution"], &["--sample"]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
     ("serve", &["--port", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
@@ -334,7 +343,11 @@ fn render(a: &Args) -> R {
             let (w, h) = sz.split_once(['x', 'X']).ok_or("--size must be <W>x<H>, e.g. 1280x800")?;
             (Some(w.parse().map_err(|_| "bad --size width")?), Some(h.parse().map_err(|_| "bad --size height")?))
         }
-        None => (None, None),
+        None => (a.num("--width")?, a.num("--height")?),
+    };
+    let scale = match a.get("--scale") {
+        Some(v) => Some(v.trim_end_matches(['x', 'X']).parse().map_err(|_| format!("--scale: `{v}` is not 1, 2 or 4"))?),
+        None => None,
     };
     let o = RenderOptions {
         view: a.get("--view").map(str::to_string),
@@ -345,6 +358,9 @@ fn render(a: &Args) -> R {
         samples: a.num("--samples")?,
         bounces: a.num("--bounces")?,
         cpu: a.has("--cpu"),
+        preset: a.get("--preset").map(str::to_string),
+        scale,
+        transparent: a.has("--transparent"),
     };
     let mut h = open(input, None)?;
     if let Some(name) = a.get("--camera") {

@@ -230,6 +230,18 @@ pub struct RenderParams {
     /// Path trace on the CPU even when a GPU is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<bool>,
+    /// Size preset: hd (1920x1080), qhd (2560x1440), 4k (3840x2160), square-1k, square-2k.
+    /// `width`/`height` override its edges; one edge alone keeps the preset's (or the
+    /// viewport's) aspect ratio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Render multiplier per side, 1 (default), 2 or 4; the result must stay within 2048 px.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<u32>,
+    /// Transparent background (straight alpha, only the mesh). Needs `samples` (path traced on
+    /// the CPU); the real-time viewport refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -237,6 +249,18 @@ pub struct ScreenshotParams {
     /// `3d` (default) or `2d`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<String>,
+    /// With any of width, height, preset or scale the app renders the view again at that
+    /// resolution (else it returns the view as shown). Pixels; one edge keeps the aspect ratio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// hd, qhd, 4k, square-1k or square-2k.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Render multiplier per side: 1, 2 or 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -502,7 +526,8 @@ impl TexturecraftMcp {
     }
 
     #[tool(description = "Headless: render the 3D view (or the 2D UV view) as a PNG image, up to 2048 px a side. Camera yaw/pitch \
-        apply to this render only. In bridge mode use viewport_screenshot.")]
+        apply to this render only. Size: width/height, a preset and a render scale (1, 2, 4); transparent needs samples. \
+        In bridge mode use viewport_screenshot.")]
     async fn viewport_render(&self, Parameters(p): Parameters<RenderParams>) -> Result<CallToolResult, McpError> {
         let note = format!("render {}", params(&p));
         image_result(self.call("render", params(&p)).await, &note, false)

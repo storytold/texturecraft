@@ -2,7 +2,7 @@
 //!
 //! The wgpu viewport renderer: metal/roughness or specular/glossiness PBR with image-based
 //! lighting (procedural environments or imported HDR images, prefiltered on the CPU in [`ibl`]),
-//! height-to-normal, optional parallax occlusion, 4× MSAA plus idle temporal accumulation, channel / mesh-map / UV
+//! height-to-normal, optional parallax occlusion, 4× MSAA (or one sample per pixel) plus idle temporal accumulation, channel / mesh-map / UV
 //! checker debug views, the 2D UV view, a linear HDR scene with a post pass (exposure, Linear /
 //! ACES tone mapping, bloom, sharpen, vignette, grain), key-light shadow maps, a 3D wireframe
 //! overlay, and a [`headless`] device for renders
@@ -24,6 +24,7 @@ pub mod headless;
 mod high_poly_gpu;
 pub mod ibl;
 pub mod mesh_maps;
+pub mod output;
 pub mod readback;
 pub mod renderer;
 pub mod set_highlight;

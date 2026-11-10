@@ -282,6 +282,9 @@ pub struct DisplaySettings {
     pub ao_intensity: f32,
     /// Accumulate jittered frames while the view is still (temporal anti-aliasing).
     pub taa: bool,
+    /// 4× multisample anti-aliasing of the viewport's scene pass; off draws one sample per
+    /// pixel (crisp, aliased edges and texels).
+    pub msaa: bool,
     /// Shader: PBR specular/glossiness (base color = diffuse, Specular = F0 color, Glossiness)
     /// instead of metallic/roughness.
     pub spec_gloss: bool,
@@ -374,6 +377,7 @@ impl Default for DisplaySettings {
             grain: 0.0,
             ao_intensity: 0.75,
             taa: true,
+            msaa: true,
             spec_gloss: false,
             parallax: false,
             displacement: false,
