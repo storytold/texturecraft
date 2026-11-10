@@ -118,6 +118,7 @@ const WASM_PACKAGES: &[&str] = &[
     "texturecraft-bake",
     "texturecraft-paint",
     "texturecraft-formats",
+    "texturecraft-import",
     "texturecraft-engine",
     "texturecraft-render",
     "texturecraft-ui-egui",

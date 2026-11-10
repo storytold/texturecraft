@@ -16,6 +16,7 @@ texturecraft-compose = { workspace = true }
 texturecraft-paint = { workspace = true }
 texturecraft-bake = { workspace = true }
 texturecraft-formats = { workspace = true }
+texturecraft-import = { workspace = true }
 rayon = { workspace = true }
 epaint_default_fonts = { workspace = true }
 serde = { workspace = true }

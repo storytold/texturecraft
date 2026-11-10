@@ -18,6 +18,8 @@ L1  bake      AO, curvature, thickness, world normal, position, ID, normal and h
 L2  paint     strokes -> stamps, camera visibility, texture-space rasterization, commit
 L2  formats   mesh import (glTF/GLB, OBJ, PLY, STL), texture export presets, .tcraft projects,
               image resources
+L2  import    one-way project import: the reader's model of a file (import-reader, L0) as a
+              Project, with the safety net (composite against the file's stored result)
 L3  engine    Session (document + caches + history + tools), the command registry
 L3  render    wgpu viewport renderer (PBR, IBL, post effects, UV view), headless renders,
               GPU path tracing and GPU mesh-map ray casts (compute)
@@ -138,6 +140,14 @@ Placeholder effects (`EffectKind::Placeholder`) stand for imported effects that 
 they composite as identity and cannot be edited. A converted project keeps a `core::ImportReport`
 (fidelity per item and per layer, safety-net flags, layer roles such as the original's stored
 result), shown by `project.inspect` with every lock and placeholder.
+
+`file.importProject` (`engine::import_cmds`, CLI `texturecraft-cli import`) converts a project file of the
+reference app one way: `import-reader` reads it, `import` maps it onto the model (layers, folders, fills,
+masks, levels, blend modes, geometry masks, baked maps, bake settings) and composites every texture set
+with `compose` to compare it with the file's stored result. Uses of compiled graphs become placeholders
+locked with the key `graph:<name>`; brush strokes stay only in the stored result (`strokes:<tool>`). The
+stored result itself becomes a locked "Original result" paint layer, hidden as a reference unless the
+import is asked to show it. The mesh is kept as binary glTF; nothing else of the original file is kept.
 
 ## Commands and automation
 

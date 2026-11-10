@@ -1,0 +1,38 @@
+//! Imports projects of the reference app into TextureCraft projects: the translator on top of
+//! `texturecraft-import-reader`, which reads the file. This crate maps what the reader gives onto TextureCraft's
+//! [`Project`](texturecraft_core::Project), layers, effects and sources:
+//!
+//! - [`import`]: the entry points ([`import_bytes`], [`import_path`]) and the per-set build.
+//! - [`sets`], [`mesh`], [`channels`], [`blend`], [`baked`], [`bake_settings`]: the mapping tables.
+//! - [`layers`]: the layer tree, content, masks, projections and geometry masks.
+//! - [`graph_uses`]: every use of a compiled graph; placeholders until graphs are computed.
+//! - [`safety_net`]: each stack composited by TextureCraft's compositor and compared with the original's stored result.
+//!
+//! The import reads nothing but the file and its options; nothing of the original file is stored in the project.
+//! Brush strokes are not replayed in this version: paint layers keep only the original's stored result (reported as
+//! baked).
+
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+pub mod bake_settings;
+pub mod baked;
+pub mod blend;
+pub mod channels;
+pub mod error;
+pub mod graph_uses;
+pub mod image;
+pub mod import;
+pub mod layers;
+pub mod mesh;
+pub mod options;
+pub mod resources;
+pub mod safety_net;
+pub mod sets;
+pub mod status;
+
+pub use error::{ImportError, PartError};
+#[cfg(not(target_arch = "wasm32"))]
+pub use import::import_path;
+pub use import::{DEFAULTS_LAYER_NAME, Hooks, IMPORTER, Imported, SetSummary, import_bytes};
+pub use options::ImportOptions;
+pub use texturecraft_import_reader::format_names::PROJECT_EXT;

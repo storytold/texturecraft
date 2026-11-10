@@ -1,0 +1,301 @@
+//! Stacks built from synthetic models.
+
+use texturecraft_core::{BlendMode, Channel, ChannelFormat, EffectKind, Fidelity, GeometryMask, LayerKind, MaskBackground, SafetyFlagKind, Source};
+use texturecraft_import_reader::model::{
+    BitmapSource, ChannelBlending, ChannelMask, EffectGroup, EffectHeader, FillEffect, FillPlacement, GeometryMaskKind, LayerKind as ProjectLayerKind,
+    Levels as ProjectLevels, LevelsEffect, MaskInitial, PaintEffect, PaintTool, Procedural, ProceduralSource, ProjectBlendMode, ProjectEffect,
+    ProjectGeometryMask, ProjectLayer, ProjectMask, ProjectSource, ProjectStroke, ProjectTextureSet, RawEntry, ReferenceSource, StrokeView, UniformSource,
+};
+
+use super::*;
+use crate::channels::SetChannels;
+use crate::options::ImportOptions;
+use crate::resources::ProjectImages;
+
+const BASE: u64 = 1;
+const HEIGHT: u64 = 2;
+const ROUGH: u64 = 128;
+
+fn channels() -> SetChannels {
+    let mut c = SetChannels::default();
+    c.declare(Channel::BaseColor, ChannelFormat::Srgb8);
+    c.declare(Channel::Height, ChannelFormat::L16F);
+    c.declare(Channel::Roughness, ChannelFormat::L8);
+    c
+}
+
+fn header(uid: u64, channels: u64, blending: Vec<ChannelBlending>) -> EffectHeader {
+    EffectHeader { uid: Some(uid), enabled: true, label: String::new(), channels: ChannelMask(channels), blending, unhandled: Vec::new() }
+}
+
+fn blend(channels: u64, mode: u64, opacity: f32) -> ChannelBlending {
+    ChannelBlending { channels: ChannelMask(channels), mode: ProjectBlendMode::from_raw(mode), opacity }
+}
+
+fn uniform(channel: u64, v: [f32; 3]) -> ProjectSource {
+    ProjectSource::Uniform(UniformSource { uid: None, channels: ChannelMask(channel), color: v, opacity: 1.0 })
+}
+
+fn procedural(channels: u64, name: &str) -> ProjectSource {
+    let p = Procedural {
+        uid: None,
+        url: format!("resource://shelf/{name}/{name}?version=1"),
+        tweaks: vec![],
+        outputs: vec![],
+        inputs: vec![],
+        alpha_output: String::new(),
+        mono_output: 0,
+    };
+    ProjectSource::Procedural(ProceduralSource { uid: None, channels: ChannelMask(channels), mode: 0, stamp_cycle: 0, stroke_wires: 0, procedural: Some(p) })
+}
+
+fn fill(uid: u64, channels: u64, sources: Vec<ProjectSource>, blending: Vec<ChannelBlending>) -> ProjectEffect {
+    ProjectEffect::Fill(FillEffect {
+        header: header(uid, channels, blending),
+        sources,
+        projection: 6,
+        filtering: 2,
+        uv_transform: None,
+        placement: FillPlacement::default(),
+    })
+}
+
+fn layer(uid: u64, name: &str, kind: ProjectLayerKind, content: Vec<ProjectEffect>) -> ProjectLayer {
+    ProjectLayer { uid: Some(uid), name: name.into(), kind, visible: true, blending: Vec::new(), mask: None, geometry: None, content, unhandled: Vec::new() }
+}
+
+fn stroke() -> ProjectStroke {
+    ProjectStroke {
+        uid: None,
+        points: Vec::new(),
+        pressure: Vec::new(),
+        tilt_keys: 0,
+        complete: true,
+        view_matrix: [0.0; 16],
+        projection_matrix: [0.0; 16],
+        view: StrokeView::Uv,
+        duplicate_count: 0,
+        duplicate_matrix: [0.0; 16],
+        random_seed: 0,
+        lazy_distance: 0.0,
+    }
+}
+
+fn paint(uid: u64, channels: u64) -> ProjectEffect {
+    ProjectEffect::Paint(PaintEffect {
+        header: header(uid, channels, vec![]),
+        tool: PaintTool::Brush,
+        opacity: 1.0,
+        strokes: vec![stroke(), stroke()],
+        paths: vec![],
+        brush_uid: None,
+        brush: None,
+        stamp_blending: 0,
+        colors: vec![],
+        alpha: vec![],
+        stencil: None,
+        stencil_matrix: None,
+    })
+}
+
+fn set(layers: Vec<ProjectLayer>) -> ProjectTextureSet {
+    ProjectTextureSet {
+        uid: Some(1),
+        material_uid: Some(7),
+        name: "S".into(),
+        resolution_log2: Some([10, 10]),
+        channels: vec![],
+        layers,
+        mesh_maps: vec![],
+        unhandled: vec![],
+    }
+}
+
+fn build(layers: Vec<ProjectLayer>) -> ImportedStack {
+    let channels = channels();
+    let images = ProjectImages::none();
+    let options = ImportOptions::default();
+    let parts = ["Body".to_string(), "Eyes".to_string()];
+    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options };
+    import(&set(layers), &input, 10)
+}
+
+fn by_name<'s>(stack: &'s ImportedStack, name: &str) -> &'s texturecraft_core::Layer {
+    stack.layers.iter().find(|l| l.name == name).unwrap()
+}
+
+#[test]
+fn a_full_uniform_fill_is_a_fill_layer_with_its_blending_and_exact() {
+    let mut l =
+        layer(1, "Paint it", ProjectLayerKind::Fill, vec![fill(2, BASE | ROUGH, vec![uniform(BASE, [0.2, 0.4, 0.6]), uniform(ROUGH, [0.3; 3])], vec![])]);
+    l.blending = vec![blend(BASE, 4, 0.5)];
+    let stack = build(vec![l]);
+    let ours = by_name(&stack, "Paint it");
+    let LayerKind::Fill(f) = &ours.kind else { panic!("fill layer expected: {:?}", ours.kind) };
+    assert_eq!(f.sources.get(&Channel::BaseColor), Some(&Source::Uniform([0.2, 0.4, 0.6])));
+    assert_eq!(f.sources.get(&Channel::Roughness), Some(&Source::Uniform([0.3; 3])));
+    let b = ours.blend(Channel::BaseColor).unwrap();
+    assert_eq!((b.mode, b.opacity), (BlendMode::Multiply, 0.5), "layer opacity lives in each channel's opacity");
+    assert_eq!(ours.blend(Channel::Roughness).unwrap().mode, BlendMode::Normal);
+    assert!(ours.blend(Channel::Height).is_none(), "only written channels are enabled");
+    assert!(!ours.is_locked() && stack.verdict.all_exact());
+    assert_eq!(stack.reports[&ours.id].fidelity, Fidelity::Exact);
+    assert_eq!(stack.roots, vec![ours.id]);
+    assert!(stack.next_id > ours.id.0);
+}
+
+#[test]
+fn folders_keep_children_order_paths_and_visibility() {
+    let a = layer(2, "A", ProjectLayerKind::Fill, vec![fill(3, ROUGH, vec![uniform(ROUGH, [0.1; 3])], vec![])]);
+    let mut b = layer(4, "B", ProjectLayerKind::Fill, vec![fill(5, ROUGH, vec![uniform(ROUGH, [0.9; 3])], vec![])]);
+    b.visible = false;
+    let mut folder = layer(1, "Folder", ProjectLayerKind::Group(vec![a, b]), vec![]);
+    folder.blending = vec![blend(ROUGH, 2, 0.25)];
+    let stack = build(vec![folder]);
+    let f = by_name(&stack, "Folder");
+    let kids = f.children().to_vec();
+    let names: Vec<&str> = kids.iter().map(|id| stack.layers.iter().find(|l| l.id == *id).unwrap().name.as_str()).collect();
+    assert_eq!(names, ["A", "B"]);
+    assert_eq!(f.blend(Channel::Roughness).unwrap().opacity, 0.25);
+    assert!(f.blend(Channel::BaseColor).is_some(), "folders blend every declared channel");
+    assert!(!by_name(&stack, "B").visible);
+    assert_eq!(stack.reports[&kids[1]].path, "Folder / B");
+    assert_eq!(stack.verdict.layer_count, 3);
+}
+
+#[test]
+fn a_procedural_fill_is_a_locked_placeholder_keyed_by_its_graph() {
+    let l =
+        layer(1, "Rust", ProjectLayerKind::Fill, vec![fill(2, BASE | ROUGH, vec![procedural(BASE | ROUGH, "rust_fine"), uniform(HEIGHT, [0.0; 3])], vec![])]);
+    let stack = build(vec![l]);
+    let ours = by_name(&stack, "Rust");
+    assert!(matches!(ours.kind, LayerKind::Paint), "not a full fill: an empty base with effects");
+    let ph: Vec<_> = ours.placeholders().collect();
+    assert_eq!(ph.len(), 1);
+    assert!(matches!(&ph[0].kind, EffectKind::Placeholder { label, .. } if label.contains("rust_fine")));
+    assert_eq!(ours.lock.as_ref().unwrap().keys(), ["graph:rust_fine"]);
+    let report = &stack.reports[&ours.id];
+    assert_eq!(report.fidelity, Fidelity::Baked);
+    assert!(report.flags.iter().any(|f| f.kind == SafetyFlagKind::ContentNotComputable && f.key == "graph:rust_fine"));
+    assert!(!stack.verdict.channels[&Channel::BaseColor].is_computable());
+    assert!(stack.graphs.contains("rust_fine"));
+    assert!(ours.blend(Channel::BaseColor).is_some(), "the graph's channels keep their blending for when graphs compute");
+}
+
+#[test]
+fn a_mask_generator_hides_and_locks_the_layer() {
+    let mut l = layer(1, "Dirt", ProjectLayerKind::Fill, vec![fill(2, ROUGH, vec![uniform(ROUGH, [0.8; 3])], vec![])]);
+    l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::Black, effects: vec![fill(3, 0, vec![procedural(0, "mg_dirt")], vec![])] });
+    let stack = build(vec![l]);
+    let ours = by_name(&stack, "Dirt");
+    assert!(!ours.visible, "without its mask it would cover the whole set");
+    let m = ours.mask.as_ref().unwrap();
+    assert_eq!((m.background, m.effects.len()), (MaskBackground::Black, 1));
+    assert!(m.effects[0].is_placeholder());
+    assert_eq!(ours.lock.as_ref().unwrap().keys(), ["graph:mg_dirt"]);
+    assert!(stack.reports[&ours.id].flags.iter().any(|f| f.kind == SafetyFlagKind::MaskNotComputable));
+    assert_eq!(stack.verdict.mask_failures.len(), 1);
+}
+
+#[test]
+fn brush_strokes_stay_in_the_stored_result_and_lock_the_layer() {
+    let group = ProjectEffect::Group(EffectGroup { header: header(2, u64::MAX, vec![]), effects: vec![paint(3, BASE)] });
+    let stack = build(vec![layer(1, "Paint", ProjectLayerKind::Paint, vec![group])]);
+    let ours = by_name(&stack, "Paint");
+    assert!(matches!(ours.kind, LayerKind::Paint));
+    assert_eq!(ours.lock.as_ref().unwrap().keys(), ["strokes:brush"]);
+    assert_eq!(ours.placeholders().count(), 1);
+    assert_eq!(stack.reports[&ours.id].fidelity, Fidelity::Baked);
+}
+
+fn reference(anchor: Option<u64>) -> ReferenceSource {
+    ReferenceSource { uid: None, channels: ChannelMask(0), anchor_uid: anchor, anchor_label: String::new(), levels: None, bindings: vec![(HEIGHT, 0)], mode: 2 }
+}
+
+#[test]
+fn references_read_the_anchor_effect_by_its_id() {
+    let mut anchor = layer(1, "Base", ProjectLayerKind::Fill, vec![fill(2, HEIGHT, vec![uniform(HEIGHT, [0.5; 3])], vec![])]);
+    anchor.content.push(ProjectEffect::Anchor(EffectHeader { uid: Some(99), enabled: true, ..EffectHeader::default() }));
+    let mut reader = layer(3, "Reader", ProjectLayerKind::Fill, vec![fill(4, ROUGH, vec![uniform(ROUGH, [1.0; 3])], vec![])]);
+    reader.mask = Some(ProjectMask {
+        enabled: true,
+        initial: MaskInitial::Black,
+        effects: vec![fill(5, 0, vec![ProjectSource::Reference(reference(Some(99)))], vec![])],
+    });
+    let stack = build(vec![anchor, reader]);
+    let base = by_name(&stack, "Base");
+    let anchor_id = base.content_effects.iter().find(|e| matches!(e.kind, EffectKind::Anchor)).unwrap().id;
+    let m = by_name(&stack, "Reader").mask.as_ref().unwrap();
+    assert!(matches!(&m.effects[0].kind, EffectKind::Fill { source: Source::Anchor { anchor, channel: Channel::Height }, .. } if *anchor == anchor_id));
+    assert!(stack.verdict.all_exact(), "{:?}", stack.verdict);
+    // a missing anchor is not computable
+    let mut lost = layer(6, "Lost", ProjectLayerKind::Fill, vec![fill(7, ROUGH, vec![uniform(ROUGH, [1.0; 3])], vec![])]);
+    lost.mask =
+        Some(ProjectMask { enabled: true, initial: MaskInitial::White, effects: vec![fill(8, 0, vec![ProjectSource::Reference(reference(Some(5)))], vec![])] });
+    let stack = build(vec![lost]);
+    assert_eq!(by_name(&stack, "Lost").lock.as_ref().unwrap().keys(), ["feature:missing-anchor"]);
+}
+
+#[test]
+fn fills_split_by_blend_and_levels_take_the_reciprocal_gamma() {
+    let fx = fill(3, BASE | ROUGH, vec![uniform(BASE, [1.0, 0.0, 0.0]), uniform(ROUGH, [0.5; 3])], vec![blend(BASE, 4, 1.0), blend(ROUGH, 2, 0.5)]);
+    let levels = ProjectEffect::Levels(LevelsEffect {
+        header: header(4, ROUGH | BASE, vec![]),
+        levels: Some(ProjectLevels {
+            input_minimum: [0.0; 3],
+            input_maximum: [1.0; 3],
+            gamma: [0.5; 3],
+            output_minimum: [0.0; 3],
+            output_maximum: [1.0; 3],
+            clamp: 1,
+        }),
+    });
+    let base = fill(2, ROUGH | BASE, vec![uniform(ROUGH, [0.2; 3]), uniform(BASE, [0.2; 3])], vec![]);
+    let stack = build(vec![layer(1, "L", ProjectLayerKind::Fill, vec![base, fx, levels])]);
+    let ours = by_name(&stack, "L");
+    assert!(matches!(ours.kind, LayerKind::Fill(_)));
+    let materials: Vec<_> = ours.content_effects.iter().filter(|e| matches!(e.kind, EffectKind::Material(_))).collect();
+    assert_eq!(materials.len(), 2, "one material fill per blend group");
+    assert_eq!((materials[0].blend, materials[1].blend, materials[1].opacity), (BlendMode::Multiply, BlendMode::Normal, 0.5));
+    let lv = ours.content_effects.iter().find_map(|e| match &e.kind {
+        EffectKind::Levels(l) => Some(*l),
+        _ => None,
+    });
+    assert_eq!(lv.map(|l| l.gamma), Some(2.0));
+    assert!(stack.verdict.all_exact(), "{:?}", stack.verdict.channels);
+}
+
+#[test]
+fn geometry_masks_list_included_parts_and_unknown_blends_are_flagged() {
+    let mut l = layer(1, "Eyes only", ProjectLayerKind::Fill, vec![fill(2, ROUGH, vec![uniform(ROUGH, [0.4; 3])], vec![])]);
+    l.geometry = Some(ProjectGeometryMask {
+        enabled: true,
+        kind: GeometryMaskKind::Meshes,
+        mesh_default: true,
+        mesh_list: vec!["Body".into()],
+        uv_tile_default: true,
+        uv_tile_entries: 0,
+    });
+    l.blending = vec![blend(ROUGH, 77, 1.0)];
+    let stack = build(vec![l]);
+    let ours = by_name(&stack, "Eyes only");
+    assert_eq!(ours.geometry_mask, Some(GeometryMask::Parts(vec!["Eyes".into()])));
+    let r = &stack.reports[&ours.id];
+    assert!(r.flags.iter().any(|f| f.kind == SafetyFlagKind::Guessed), "{:?}", r.flags);
+    assert_eq!(r.fidelity, Fidelity::Approximated);
+}
+
+#[test]
+fn unreadable_bitmaps_and_unknown_classes_are_not_computable_and_ids_are_unique() {
+    let bitmap = ProjectSource::Bitmap(BitmapSource { uid: None, channels: ChannelMask(BASE), url: "/Wood?version=abc".into() });
+    let other = ProjectEffect::Other(RawEntry { class: "DataActionNew".into(), uid: None });
+    let w = layer(1, "W", ProjectLayerKind::Fill, vec![fill(2, BASE, vec![bitmap], vec![]), other]);
+    let stack = build(vec![w, layer(3, "X", ProjectLayerKind::Other("DataLayerNew".into()), vec![])]);
+    assert_eq!(by_name(&stack, "W").lock.as_ref().unwrap().keys(), ["feature:unreadable-bitmap", "class:DataActionNew"]);
+    assert_eq!(by_name(&stack, "X").lock.as_ref().unwrap().keys(), ["class:DataLayerNew"]);
+    let mut ids: Vec<u64> = stack.layers.iter().map(|l| l.id.0).collect();
+    ids.extend(stack.layers.iter().flat_map(|l| l.content_effects.iter().chain(l.mask.iter().flat_map(|m| m.effects.iter())).map(|e| e.id.0)));
+    let unique: std::collections::BTreeSet<u64> = ids.iter().copied().collect();
+    assert_eq!(unique.len(), ids.len(), "{ids:?}");
+    assert!(ids.iter().all(|id| *id >= 10 && *id < stack.next_id));
+}

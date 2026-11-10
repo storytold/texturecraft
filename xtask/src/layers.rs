@@ -20,6 +20,7 @@ pub const TABLE: &[(&str, u8)] = &[
     ("bake", 1),
     ("paint", 2),
     ("formats", 2),
+    ("import", 2),
     ("engine", 3),
     ("render", 3),
     ("automation", 4),

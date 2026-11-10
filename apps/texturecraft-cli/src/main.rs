@@ -38,6 +38,10 @@ USAGE:
       New project; --sample bakes and applies a smart material to every texture set. The
       sample's mesh maps are baked at the resolution up to 1024 px (most of the file's size),
       so a 2048 sample project is as large as a 1024 one.
+  texturecraft-cli import <project file> <out.tcraft> [--original-on-top] [--native-filters]
+                   [--max-resolution <px>] [--no-measure]
+      Convert a project file of the reference app (one-way; the original is only read) and save
+      it; prints what the import found per texture set (file.importProject).
   texturecraft-cli mcp [--bridge <port>] [--token <token>] [--read-root <dir>] [--write-root <dir>]
       MCP server on stdio: headless (file access only below the roots), or bridged to
       `texturecraft --control <port>`. --automation-read-root / --automation-write-root are
@@ -60,6 +64,7 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("export", &["--preset", "--format", "--padding", "--size"], &[]),
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
     ("new", &["--resolution"], &["--sample"]),
+    ("import", &["--max-resolution"], &["--original-on-top", "--native-filters", "--no-measure"]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
     ("serve", &["--port", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
 ];
@@ -174,6 +179,7 @@ fn dispatch(name: &str, a: &Args) -> R {
         "export" => export(a),
         "render" => render(a),
         "new" => new(a),
+        "import" => import(a),
         "mcp" => mcp(a),
         "serve" => serve(a),
         other => Err(format!("unknown command `{other}`")),
@@ -268,6 +274,19 @@ fn run(a: &Args) -> R {
         Some(out) => save(&mut h, out),
         None => Ok(()),
     }
+}
+
+fn import(a: &Args) -> R {
+    let (input, out) = (a.pos(0, "<project file>")?, a.pos(1, "<out.tcraft>")?);
+    let mut p =
+        json!({"path": input, "originalOnTop": a.has("--original-on-top"), "nativeFilters": a.has("--native-filters"), "measure": !a.has("--no-measure")});
+    if let Some(r) = a.num::<u32>("--max-resolution")? {
+        p["maxResolution"] = json!(r);
+    }
+    let mut h = open("builtin:cube", Some(128))?;
+    let reply = h.command_run("file.importProject", p).map_err(s)?;
+    print_json(&json!({"file": input, "import": reply.get("import").cloned().unwrap_or(Value::Null)}))?;
+    save(&mut h, out)
 }
 
 fn batch(a: &Args) -> R {

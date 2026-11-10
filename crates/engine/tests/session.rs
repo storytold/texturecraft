@@ -229,6 +229,9 @@ fn panic_hunt() {
         json!({"layer": 1, "index": -5, "delta": i64::MIN, "above": "x", "points": [[f64::MAX, -1e300]], "size": -1e30}),
         json!({"resolution": 0, "maps": ["x"], "rays": u64::MAX, "antialiasing": 3, "color": [1], "value": "nan"}),
         json!({"effect": 0, "x": 1e30, "y": -1e30, "viewport": [0, 0], "mesh": "../../etc", "material": ""}),
+        json!({"path": "/dev/null", "bytes": "!!not base64", "maxResolution": -1, "originalOnTop": "yes"}),
+        json!({"bytes": [999, -1, "x"], "name": "", "measure": 7}),
+        json!({"bytes": "iUhERg0KGgoAAAAAAAAAAAAAAAAAAAAAAAAA", "maxResolution": 128}),
     ];
     for spec in command_specs() {
         if spec.id == "project.sample" {
