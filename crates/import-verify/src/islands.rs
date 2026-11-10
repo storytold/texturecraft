@@ -44,10 +44,11 @@ impl IslandMask {
             for y in 0..h {
                 for x in 0..w {
                     let edge = x == 0 || y == 0 || x + 1 == w || y + 1 == h;
-                    if on(x, y) && (edge || !on(x - 1, y) || !on(x + 1, y) || !on(x, y - 1) || !on(x, y + 1)) {
-                        if let Some(t) = self.inside.get_mut(y * w + x) {
-                            *t = false;
-                        }
+                    if on(x, y)
+                        && (edge || !on(x - 1, y) || !on(x + 1, y) || !on(x, y - 1) || !on(x, y + 1))
+                        && let Some(t) = self.inside.get_mut(y * w + x)
+                    {
+                        *t = false;
                     }
                 }
             }
