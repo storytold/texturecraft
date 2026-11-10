@@ -16,6 +16,7 @@ use texturecraft_geom::Mesh;
 use texturecraft_import_reader::decode::assbin::{AssbinGeometry, AssbinScene};
 use texturecraft_import_reader::decode::document::{MaterialRecord, NormalMapSyscoord};
 use texturecraft_import_reader::model::baking::{BAKING_INI, ProjectBakeSettings};
+use texturecraft_import_reader::model::cameras::{CAMERA_INI, SavedCameras};
 use texturecraft_import_reader::model::{ProjectDocument, ProjectTextureSet};
 use texturecraft_import_reader::project::{ProjectFile, paths};
 
@@ -108,6 +109,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     });
     let settings = file.document_settings().ok();
     let syscoord = settings.as_ref().and_then(|s| s.normal_map_syscoord);
+    let mut project_cameras = Vec::new();
     let model = match file.model() {
         Ok((document, _)) => Some(document),
         Err(e) => {
@@ -126,7 +128,22 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
             format!("the original derives normals from height with {filter} (document format {}); TextureCraft uses its own", s.format_version),
         );
     }
-    report.add("cameras", Fidelity::Approximated, "the file's saved views are not imported yet");
+    let saved = file.read(CAMERA_INI).ok().map(|d| SavedCameras::parse(&d));
+    let (lo, hi) = mesh.bounds();
+    match saved {
+        Some(Ok(saved)) => {
+            let imported = crate::cameras::cameras(&saved, (lo + hi) * 0.5);
+            let note = format!(
+                "{} imported (the saved view as \"{}\"); depth of field and display settings not taken over",
+                imported.len(),
+                crate::cameras::SAVED_VIEW
+            );
+            report.add("cameras", Fidelity::Approximated, note);
+            project_cameras = imported;
+        }
+        Some(Err(e)) => report.add("cameras", Fidelity::Approximated, format!("the saved cameras could not be read ({e})")),
+        None => report.add("cameras", Fidelity::Exact, "none saved"),
+    }
     let bake_ini = file.read(BAKING_INI).ok().and_then(|d| ProjectBakeSettings::parse(&d).ok());
     let cache_entries = file.cache_entries();
     let cache_sets: BTreeSet<String> = cache_entries.iter().map(|e| e.set.clone()).collect();
@@ -136,6 +153,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     }
     let stem = std::path::Path::new(file_name).file_stem().map_or_else(|| "Imported".to_string(), |s| s.to_string_lossy().into_owned());
     let mut project = Project::new(stem, "mesh.glb");
+    project.cameras = project_cameras;
     project.normal_format = if syscoord == Some(NormalMapSyscoord::DirectX) { NormalFormat::DirectX } else { NormalFormat::OpenGl };
     let images = ProjectImages::new(file);
     let mut imported = Imported {

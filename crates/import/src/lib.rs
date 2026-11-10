@@ -3,7 +3,7 @@
 //! [`Project`](texturecraft_core::Project), layers, effects and sources:
 //!
 //! - [`import`]: the entry points ([`import_bytes`], [`import_path`]) and the per-set build.
-//! - [`sets`], [`mesh`], [`channels`], [`blend`], [`baked`], [`bake_settings`]: the mapping tables.
+//! - [`sets`], [`mesh`], [`channels`], [`blend`], [`baked`], [`bake_settings`], [`cameras`]: the mapping tables.
 //! - [`layers`]: the layer tree, content, masks, projections and geometry masks.
 //! - [`graph_uses`]: every use of a compiled graph; placeholders until graphs are computed.
 //! - [`safety_net`]: each stack composited by TextureCraft's compositor and compared with the original's stored result.
@@ -17,6 +17,7 @@
 pub mod bake_settings;
 pub mod baked;
 pub mod blend;
+pub mod cameras;
 pub mod channels;
 pub mod error;
 pub mod graph_uses;

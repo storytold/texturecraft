@@ -70,6 +70,10 @@ impl Session {
             warnings: Vec::new(),
         };
         let mut s = Session::from_project_file(pf)?;
+        // open with the view the original was saved with
+        if s.doc.project.cameras.iter().any(|c| c.name == texturecraft_import::cameras::SAVED_VIEW) {
+            let _ = crate::execute(&mut s, "camera.select", &json!({"name": texturecraft_import::cameras::SAVED_VIEW}));
+        }
         s.modified = true;
         Ok(s)
     }

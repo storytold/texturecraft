@@ -11,8 +11,8 @@ use texturecraft_core::{Channel, ChannelKind};
 use texturecraft_import_reader::decode::pixels::{Alpha, RowOrder, SourceFormat};
 use texturecraft_texel::{TILE, TILE_AREA, TileImage, srgb_to_linear, to_u16, to_u16_signed};
 
-/// Largest image side read from a file (the reference app's maximum is 8K; anything larger is hostile).
-pub const MAX_SIDE: u32 = 16_384;
+/// Largest image side read from a file: the reference app's maximum (8K); anything larger is refused as hostile.
+pub const MAX_SIDE: u32 = 8192;
 
 /// A float image: rows top first, `width × height` texels.
 #[derive(Debug, Clone, PartialEq)]
