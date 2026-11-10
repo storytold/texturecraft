@@ -1630,7 +1630,15 @@ fn pen_pressure(ui: &Ui) -> f32 {
             ui.data_mut(|d| d.remove_temp::<f32>(id));
             1.0
         }
-        _ => 1.0,
+        _ => {
+            let active = ui.input(|i| i.pointer.primary_down() || i.pointer.any_down() || i.pointer.primary_released() || i.pointer.any_released());
+            if active {
+                ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(1.0)
+            } else {
+                ui.data_mut(|d| d.remove_temp::<f32>(id));
+                1.0
+            }
+        }
     }
 }
 

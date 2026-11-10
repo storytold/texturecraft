@@ -80,3 +80,18 @@ fn a_light_pen_tap_paints_a_small_dab() {
     assert!(mouse > 1.0, "the mouse click painted: {mouse}");
     assert!(light > 0.0 && light < mouse * 0.25, "the tap keeps its contact pressure: {light} vs {mouse}");
 }
+
+#[test]
+fn frames_omitting_touch_events_during_stroke_do_not_spike_pressure() {
+    let to = pos2(800.0, 500.0);
+    let intermittent = paint_2d(|h| {
+        frame(h, Some((TouchPhase::Start, Some(0.2))), FROM, Some(true));
+        for k in 1..=8 {
+            let pen = if k % 2 == 0 { Some((TouchPhase::Move, Some(0.2))) } else { None };
+            frame(h, pen, FROM + (to - FROM) * (k as f32 / 8.0), None);
+        }
+        frame(h, Some((TouchPhase::End, Some(0.2))), to, Some(false));
+    });
+    let mouse = stroke(None);
+    assert!(intermittent > 0.0 && intermittent < mouse * 0.5, "intermittent frames without touch keep light pressure: {intermittent} vs {mouse}");
+}
