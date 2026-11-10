@@ -827,7 +827,7 @@ fn geometry_tool_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     let ts = app.session.doc.project.locate(layer.id).map_or(app.session.ts(), |(ts, _, _)| ts);
     let parts = texturecraft_engine::set_cmds::parts(&app.session, ts);
     for part in &parts {
-        let on = layer.geometry_mask.as_ref().is_none_or(|m| m.contains(part));
+        let on = layer.geometry_mask.as_ref().is_none_or(|m| m.includes_part(part));
         ui.label(RichText::new(format!("{} {part}", if on { ic::EYE } else { ic::EYE_SLASH })).color(if on { tk.text } else { tk.text_dim }));
     }
     if ui.add_enabled(layer.geometry_mask.is_some(), egui::Button::new(tr("Show on all parts"))).clicked() {
@@ -844,7 +844,7 @@ fn geometry_mask_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
         return;
     }
     let lid = layer.id.0;
-    let shown = layer.geometry_mask.clone().unwrap_or_else(|| parts.clone());
+    let shown = layer.geometry_mask.as_ref().and_then(|m| m.parts()).map_or_else(|| parts.clone(), <[String]>::to_vec);
     ui.menu_button(tr("Geometry mask"), |ui| {
         for part in &parts {
             let mut on = shown.contains(part);

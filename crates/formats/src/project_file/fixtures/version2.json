@@ -1,0 +1,540 @@
+{
+ "cameras": [],
+ "display": {
+  "ao_intensity": 0.75,
+  "bloom": 0.0,
+  "displacement": false,
+  "dof": {
+   "aperture": 0.05,
+   "enabled": false,
+   "focusDistance": 0.0
+  },
+  "env_blur": 0.35,
+  "env_exposure": 0.0,
+  "env_opacity": 0.0,
+  "env_rotation": 0.0,
+  "environment": "Studio Soft",
+  "fov": 40.0,
+  "grain": 0.0,
+  "ior": 1.5,
+  "parallax": false,
+  "post_effects": false,
+  "scatter_color": [
+   1.0,
+   0.4,
+   0.25
+  ],
+  "scatter_radius": 0.1,
+  "shadows": false,
+  "sharpen": 0.0,
+  "spec_gloss": false,
+  "taa": true,
+  "tone_mapping": "AcesFilmic",
+  "vignette": 0.0
+ },
+ "format_version": 2,
+ "layers": {
+  "1": {
+   "channels": {
+    "BaseColor": {
+     "mode": "Normal",
+     "opacity": 1.0
+    },
+    "Height": {
+     "mode": "Normal",
+     "opacity": 1.0
+    },
+    "Metallic": {
+     "mode": "Normal",
+     "opacity": 1.0
+    },
+    "Normal": {
+     "mode": "Normal",
+     "opacity": 1.0
+    },
+    "Roughness": {
+     "mode": "Normal",
+     "opacity": 1.0
+    }
+   },
+   "color_tag": null,
+   "content_effects": [],
+   "geometry_mask": null,
+   "height_mask": {
+    "contrast": 1.0,
+    "enabled": false,
+    "offset": 0.0
+   },
+   "id": 1,
+   "kind": "Paint",
+   "mask": null,
+   "name": "Paint",
+   "visible": true
+  },
+  "2": {
+   "channels": {
+    "BaseColor": {
+     "mode": "Normal",
+     "opacity": 1.0
+    },
+    "Height": {
+     "mode": "Normal",
+     "opacity": 1.0
+    },
+    "Metallic": {
+     "mode": "Normal",
+     "opacity": 1.0
+    },
+    "Normal": {
+     "mode": "Normal",
+     "opacity": 1.0
+    },
+    "Roughness": {
+     "mode": "Normal",
+     "opacity": 1.0
+    }
+   },
+   "color_tag": null,
+   "content_effects": [],
+   "geometry_mask": null,
+   "height_mask": {
+    "contrast": 1.0,
+    "enabled": false,
+    "offset": 0.0
+   },
+   "id": 2,
+   "kind": {
+    "Fill": {
+     "projection": {
+      "Uv": {
+       "offset": [
+        0.0,
+        0.0
+       ],
+       "rotation": 0.0,
+       "scale": [
+        1.0,
+        1.0
+       ]
+      }
+     },
+     "sources": {}
+    }
+   },
+   "mask": {
+    "background": "Black",
+    "effects": [
+     {
+      "blend": "Normal",
+      "id": 3,
+      "kind": "Paint",
+      "name": "Paint",
+      "opacity": 1.0,
+      "visible": true
+     }
+    ],
+    "enabled": true
+   },
+   "name": "Masked",
+   "visible": true
+  },
+  "4": {
+   "channels": {
+    "BaseColor": {
+     "mode": "Tint",
+     "opacity": 1.0
+    },
+    "Roughness": {
+     "mode": "Normal",
+     "opacity": 1.0
+    }
+   },
+   "color_tag": null,
+   "content_effects": [
+    {
+     "blend": "Normal",
+     "id": 5,
+     "kind": {
+      "Levels": {
+       "gamma": 1.0,
+       "in_high": 1.0,
+       "in_low": 0.0,
+       "out_high": 1.0,
+       "out_low": 0.0
+      }
+     },
+     "name": "Levels",
+     "opacity": 1.0,
+     "visible": true
+    }
+   ],
+   "geometry_mask": [
+    "Body",
+    "Lid"
+   ],
+   "height_mask": {
+    "contrast": 1.0,
+    "enabled": false,
+    "offset": 0.0
+   },
+   "id": 4,
+   "kind": "Paint",
+   "mask": null,
+   "name": "Parts only",
+   "visible": true
+  }
+ },
+ "mesh": "mesh.glb",
+ "name": "Demo",
+ "next_id": 6,
+ "normal_format": "OpenGl",
+ "texture_sets": [
+  {
+   "ao_mixing": "Multiply",
+   "bake": {
+    "cage": {
+     "average_normals": true,
+     "kind": "DistanceBased",
+     "max_frontal": 0.01,
+     "max_rear": 0.01,
+     "relative_to_bounding_box": true
+    },
+    "common": {
+     "antialiasing": "None",
+     "apply_diffusion": true,
+     "dilation": 1,
+     "is_enabled": true,
+     "resolution": "R2048",
+     "resolution_height": null
+    },
+    "high_poly": {
+     "high_suffix": "_high",
+     "ignore_backface": true,
+     "ignore_backface_suffix": "_ignorebf",
+     "low_suffix": "_low",
+     "match_mode": "Always",
+     "use_low_as_high": false
+    },
+    "maps": {
+     "ao": {
+      "is_enabled": true,
+      "parameters": {
+       "attenuation": "Linear",
+       "ground_plane": {
+        "enabled": false,
+        "offset": 0.0
+       },
+       "ignore_backface": "Never",
+       "rays": {
+        "distribution": "Cosine",
+        "max_distance": 1.0,
+        "min_distance": 1e-05,
+        "rays": 64,
+        "relative_to_bounding_box": true,
+        "spread": 180.0
+       },
+       "self_occlusion": "Always"
+      }
+     },
+     "bent_normal": {
+      "is_enabled": false,
+      "parameters": {
+       "ignore_backface": "Never",
+       "rays": {
+        "distribution": "Cosine",
+        "max_distance": 1.0,
+        "min_distance": 1e-05,
+        "rays": 64,
+        "relative_to_bounding_box": true,
+        "spread": 180.0
+       },
+       "self_occlusion": "Always"
+      }
+     },
+     "curvature": {
+      "is_enabled": true,
+      "parameters": {
+       "mesh": {
+        "auto_tonemapping": true,
+        "rays": 32,
+        "relative_to_bounding_box": true,
+        "sampling_radius": 0.001,
+        "self_intersection": "Always",
+        "value_max": 1.0,
+        "value_min": -1.0
+       },
+       "method": "Mesh",
+       "normal_map": {
+        "details": 0.5,
+        "enable_seams": true,
+        "seams_intensity": 1.0
+       }
+      }
+     },
+     "height": {
+      "is_enabled": false,
+      "parameters": {
+       "normalization": "RelativeToLowMesh",
+       "scaling_divisor": 1.0
+      }
+     },
+     "id": {
+      "is_enabled": true,
+      "parameters": {
+       "generator": "HueShift",
+       "source": "MaterialColor"
+      }
+     },
+     "normal": {
+      "is_enabled": true,
+      "parameters": null
+     },
+     "opacity": {
+      "is_enabled": false,
+      "parameters": null
+     },
+     "position": {
+      "is_enabled": true,
+      "parameters": {
+       "axis": "All",
+       "normalization": "BoundingSphere",
+       "scale": "FullScene"
+      }
+     },
+     "thickness": {
+      "is_enabled": true,
+      "parameters": {
+       "normalization": "RelativeToMinMax",
+       "rays": {
+        "distribution": "Cosine",
+        "max_distance": 0.1,
+        "min_distance": 1e-05,
+        "rays": 64,
+        "relative_to_bounding_box": true,
+        "spread": 180.0
+       },
+       "self_occlusion": "Always"
+      }
+     },
+     "world_normal": {
+      "is_enabled": true,
+      "parameters": null
+     }
+    },
+    "skew": {
+     "edge_contrast": 0.5,
+     "edge_distance": 0.15,
+     "edge_protection": false,
+     "method": "MeshNormalsBased"
+    }
+   },
+   "baked": [],
+   "channels": [
+    [
+     "BaseColor",
+     "Srgb8"
+    ],
+    [
+     "Metallic",
+     "L8"
+    ],
+    [
+     "Roughness",
+     "L8"
+    ],
+    [
+     "Normal",
+     "Rgb16F"
+    ],
+    [
+     "Height",
+     "L16F"
+    ]
+   ],
+   "description": "",
+   "height_strength": 1.0,
+   "material": 0,
+   "name": "A",
+   "normal_mixing": "Combine",
+   "resolution": 128,
+   "stack": [
+    1,
+    4
+   ],
+   "visible": true
+  },
+  {
+   "ao_mixing": "Multiply",
+   "bake": {
+    "cage": {
+     "average_normals": true,
+     "kind": "DistanceBased",
+     "max_frontal": 0.01,
+     "max_rear": 0.01,
+     "relative_to_bounding_box": true
+    },
+    "common": {
+     "antialiasing": "None",
+     "apply_diffusion": true,
+     "dilation": 1,
+     "is_enabled": true,
+     "resolution": "R2048",
+     "resolution_height": null
+    },
+    "high_poly": {
+     "high_suffix": "_high",
+     "ignore_backface": true,
+     "ignore_backface_suffix": "_ignorebf",
+     "low_suffix": "_low",
+     "match_mode": "Always",
+     "use_low_as_high": false
+    },
+    "maps": {
+     "ao": {
+      "is_enabled": true,
+      "parameters": {
+       "attenuation": "Linear",
+       "ground_plane": {
+        "enabled": false,
+        "offset": 0.0
+       },
+       "ignore_backface": "Never",
+       "rays": {
+        "distribution": "Cosine",
+        "max_distance": 1.0,
+        "min_distance": 1e-05,
+        "rays": 64,
+        "relative_to_bounding_box": true,
+        "spread": 180.0
+       },
+       "self_occlusion": "Always"
+      }
+     },
+     "bent_normal": {
+      "is_enabled": false,
+      "parameters": {
+       "ignore_backface": "Never",
+       "rays": {
+        "distribution": "Cosine",
+        "max_distance": 1.0,
+        "min_distance": 1e-05,
+        "rays": 64,
+        "relative_to_bounding_box": true,
+        "spread": 180.0
+       },
+       "self_occlusion": "Always"
+      }
+     },
+     "curvature": {
+      "is_enabled": true,
+      "parameters": {
+       "mesh": {
+        "auto_tonemapping": true,
+        "rays": 32,
+        "relative_to_bounding_box": true,
+        "sampling_radius": 0.001,
+        "self_intersection": "Always",
+        "value_max": 1.0,
+        "value_min": -1.0
+       },
+       "method": "Mesh",
+       "normal_map": {
+        "details": 0.5,
+        "enable_seams": true,
+        "seams_intensity": 1.0
+       }
+      }
+     },
+     "height": {
+      "is_enabled": false,
+      "parameters": {
+       "normalization": "RelativeToLowMesh",
+       "scaling_divisor": 1.0
+      }
+     },
+     "id": {
+      "is_enabled": true,
+      "parameters": {
+       "generator": "HueShift",
+       "source": "MaterialColor"
+      }
+     },
+     "normal": {
+      "is_enabled": true,
+      "parameters": null
+     },
+     "opacity": {
+      "is_enabled": false,
+      "parameters": null
+     },
+     "position": {
+      "is_enabled": true,
+      "parameters": {
+       "axis": "All",
+       "normalization": "BoundingSphere",
+       "scale": "FullScene"
+      }
+     },
+     "thickness": {
+      "is_enabled": true,
+      "parameters": {
+       "normalization": "RelativeToMinMax",
+       "rays": {
+        "distribution": "Cosine",
+        "max_distance": 0.1,
+        "min_distance": 1e-05,
+        "rays": 64,
+        "relative_to_bounding_box": true,
+        "spread": 180.0
+       },
+       "self_occlusion": "Always"
+      }
+     },
+     "world_normal": {
+      "is_enabled": true,
+      "parameters": null
+     }
+    },
+    "skew": {
+     "edge_contrast": 0.5,
+     "edge_distance": 0.15,
+     "edge_protection": false,
+     "method": "MeshNormalsBased"
+    }
+   },
+   "baked": [],
+   "channels": [
+    [
+     "BaseColor",
+     "Srgb8"
+    ],
+    [
+     "Metallic",
+     "L8"
+    ],
+    [
+     "Roughness",
+     "L8"
+    ],
+    [
+     "Normal",
+     "Rgb16F"
+    ],
+    [
+     "Height",
+     "L16F"
+    ]
+   ],
+   "description": "",
+   "height_strength": 1.0,
+   "material": 1,
+   "name": "B",
+   "normal_mixing": "Combine",
+   "resolution": 64,
+   "stack": [
+    2
+   ],
+   "visible": true
+  }
+ ]
+}

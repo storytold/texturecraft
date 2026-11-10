@@ -25,6 +25,7 @@ pub mod instance_cmds;
 pub mod layer_cmds;
 pub mod layer_ops;
 pub mod link_cmds;
+pub mod lock_cmds;
 pub mod mask_cmds;
 mod mask_preview_pixel;
 pub mod material_lib;

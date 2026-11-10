@@ -11,6 +11,7 @@ pub mod bake;
 pub mod blend;
 mod block_scales;
 pub mod channel;
+pub mod import_report;
 pub mod layer;
 pub mod project;
 
@@ -23,10 +24,11 @@ pub use bake::{
 };
 pub use blend::{BlendMode, blend1, blend3, lum, mix3};
 pub use channel::{Channel, ChannelFormat, ChannelKind};
+pub use import_report::{Fidelity, ImportReport, LayerReport, LayerRole, ReportEntry, SafetyFlag, SafetyFlagKind};
 pub use layer::{
-    ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, HeightMask, Layer, LayerId,
-    LayerKind, Levels, LinkParam, LinkPreset, Mask, MaskBackground, MaterialLink, PathShape, Procedural, ProceduralKind, Projection, Source, gradient,
-    hsl_adjust, per_unit,
+    ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, GeometryMask, HeightMask,
+    IMPORT_LOCK_SOURCE, Layer, LayerId, LayerKind, Levels, LinkParam, LinkPreset, Lock, LockReason, Mask, MaskBackground, MaterialLink, PathShape, Procedural,
+    ProceduralKind, Projection, Source, gradient, hsl_adjust, per_unit,
 };
 pub use project::{
     AoMixing, BlockScales, Camera, DepthOfField, DisplaySettings, FORMAT_VERSION, MAX_RESOLUTION, MIN_RESOLUTION, NormalFormat, NormalMixing, Project,

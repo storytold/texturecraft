@@ -2,7 +2,7 @@
 //! per-layer properties set through `layer.set`.
 
 use serde_json::{Value, json};
-use texturecraft_core::{Layer, LayerId, LayerKind};
+use texturecraft_core::{GeometryMask, Layer, LayerId, LayerKind};
 
 use crate::commands::{CommandSpec, bad, boolp, content_param, f32p, has_layer, layer_param, u64p};
 use crate::session::{Document, StackTarget};
@@ -33,7 +33,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set layer properties",
             [],
             None,
-            "{layer?, heightMask?: {enabled?, contrast?: 0..64, offset?: -1..1} | bool, geometryMask?: [part names] | null} — mask with height: m' = saturate(m + contrast·4m(1−m)·(height + offset)); geometry mask: the mesh parts (textureSet.parts) the layer shows on, null for all",
+            "{layer?, heightMask?: {enabled?, contrast?: 0..64, offset?: -1..1} | bool, geometryMask?: [part names] | {uvTiles: [UDIM numbers]} | null} — mask with height: m' = saturate(m + contrast·4m(1−m)·(height + offset)); geometry mask: the mesh parts (textureSet.parts) or UV tiles (1001 = the first; a set without UV tiles is 1001) the layer shows on, null for all",
             has_layer,
             set
         ),
@@ -152,7 +152,9 @@ pub(crate) fn toggle_part_at(s: &mut Session, screen: texturecraft_geom::glam::V
     if !parts.contains(&part) {
         return Err(bad(cmd, format!("mesh part `{part}` is not in the selected layer's texture set")));
     }
-    let mut shown = s.doc.project.layers.get(&layer).and_then(|l| l.geometry_mask.clone()).unwrap_or_else(|| parts.clone());
+    // A UV-tile mask is replaced by a part list.
+    let current = s.doc.project.layers.get(&layer).and_then(|l| l.geometry_mask.as_ref()).and_then(|g| g.parts().map(<[String]>::to_vec));
+    let mut shown = current.unwrap_or_else(|| parts.clone());
     let on = !shown.contains(&part);
     if on {
         shown.push(part.clone());
@@ -161,7 +163,7 @@ pub(crate) fn toggle_part_at(s: &mut Session, screen: texturecraft_geom::glam::V
     }
     // In mesh order; showing every part again clears the mask.
     let ordered: Vec<String> = parts.iter().filter(|p| shown.contains(p)).cloned().collect();
-    let mask = (ordered.len() != parts.len()).then_some(ordered);
+    let mask = (ordered.len() != parts.len()).then_some(GeometryMask::Parts(ordered));
     s.edit(if on { "Show layer on part" } else { "Hide layer on part" }, |s| {
         s.doc.project.layer_mut(layer)?.geometry_mask = mask.clone();
         Ok(())
@@ -191,9 +193,16 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             if let Some(unknown) = names.iter().find(|n| !known.contains(n)) {
                 return Err(bad(cmd, format!("unknown mesh part `{unknown}` (parts: {})", known.join(", "))));
             }
-            Some(Some(names))
+            Some(Some(GeometryMask::Parts(names)))
         }
-        Some(_) => return Err(bad(cmd, "`geometryMask` must be a list of part names or null")),
+        Some(Value::Object(o)) if o.len() == 1 && o.contains_key("uvTiles") => {
+            let tiles: Option<Vec<u32>> =
+                o.get("uvTiles").and_then(Value::as_array).and_then(|a| a.iter().map(|v| v.as_u64().and_then(|t| u32::try_from(t).ok())).collect());
+            let tiles = tiles.filter(|t| t.iter().all(|t| texturecraft_core::UDIM_RANGE.contains(t)));
+            let tiles = tiles.ok_or_else(|| bad(cmd, "`geometryMask.uvTiles` must be a list of UDIM numbers (1001..=2000)"))?;
+            Some(Some(GeometryMask::UvTiles(tiles)))
+        }
+        Some(_) => return Err(bad(cmd, "`geometryMask` must be a list of part names, {uvTiles: [UDIM numbers]} or null")),
     };
     if hm.is_none() && geometry.is_none() {
         return Err(bad(cmd, "give `heightMask` or `geometryMask`"));

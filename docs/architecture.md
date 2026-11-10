@@ -126,6 +126,19 @@ values, the texture set's resolution and its baked mesh maps (`LinkJob::run`, on
 in the UI). Every cook stores its maps under fresh resource names, so undo, redo and the decoded
 image cache never disagree. The apps share the file format and the command line, never code.
 
+## Locked layers and imported projects
+
+A layer can carry a `core::Lock` (a source and reasons): its content stands for something TextureCraft
+cannot compute or edit yet, such as a layer converted from another application's project. Every
+`Session::edit` compares the document before and after (`engine::lock_cmds`) and refuses an edit that
+changed a locked layer's content (fill, pixels, mask, effects, height or geometry mask); painting is
+refused before the stroke starts. Visibility, name, color tag, position, deletion, channel blending
+and opacity and the mask switch stay editable, and `layer.unlock` removes the lock as an undoable step.
+Placeholder effects (`EffectKind::Placeholder`) stand for imported effects that cannot be computed:
+they composite as identity and cannot be edited. A converted project keeps a `core::ImportReport`
+(fidelity per item and per layer, safety-net flags, layer roles such as the original's stored
+result), shown by `project.inspect` with every lock and placeholder.
+
 ## Commands and automation
 
 Every action is a `CommandSpec` in `engine::commands` (id, label, menu path, shortcut, params doc,

@@ -8,9 +8,13 @@ use crate::{BlendMode, Channel, ChannelKind, lum};
 
 mod curvature_detail;
 mod curvature_mode;
+mod geometry_mask;
+mod lock;
 
 pub use curvature_detail::CurvatureDetail;
 pub use curvature_mode::CurvatureMode;
+pub use geometry_mask::GeometryMask;
+pub use lock::{IMPORT_LOCK_SOURCE, Lock, LockReason};
 
 /// Id of a layer or effect (one id space per project).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -48,9 +52,12 @@ pub struct Layer {
     /// Combine the mask with the layer's height ("mask with height").
     #[serde(default)]
     pub height_mask: HeightMask,
-    /// Geometry mask: the mesh parts (submesh names) the layer shows on; None shows it on all.
+    /// Geometry mask: the mesh parts or UV tiles the layer shows on; None shows it everywhere.
     #[serde(default)]
-    pub geometry_mask: Option<Vec<String>>,
+    pub geometry_mask: Option<GeometryMask>,
+    /// Set when the layer's content must not change (see [`Lock`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<Lock>,
 }
 
 /// Mask with height: partial mask values follow the layer's own height, so a transition
@@ -122,6 +129,7 @@ impl Layer {
             color_tag: None,
             height_mask: HeightMask::default(),
             geometry_mask: None,
+            lock: None,
         }
     }
 
@@ -983,6 +991,13 @@ pub enum EffectKind {
     /// Content only: records the composited stack right after its layer (that layer and
     /// everything below) so masks and fills above can read it ([`Source::Anchor`]).
     Anchor,
+    /// Stands for an effect of an imported project that TextureCraft cannot compute: it composites as identity
+    /// (the stack passes through unchanged) and cannot be edited, only hidden, moved or removed. The import locks
+    /// the layer that holds it. `label` names what it stands for, `reason` says why it is not computed.
+    Placeholder {
+        label: String,
+        reason: String,
+    },
 }
 
 /// One path of a path sublayer: its control points and how it was painted.
@@ -1020,6 +1035,7 @@ impl EffectKind {
             EffectKind::Compare { .. } => "Compare mask",
             EffectKind::Material(_) => "Fill",
             EffectKind::Anchor => "Anchor point",
+            EffectKind::Placeholder { .. } => "Placeholder",
         }
     }
 
@@ -1029,7 +1045,7 @@ impl EffectKind {
         match self {
             EffectKind::Material(_) | EffectKind::Anchor => Some(true),
             EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection { .. } | EffectKind::Compare { .. } => Some(false),
-            EffectKind::Paint | EffectKind::Path(_) | EffectKind::Levels(_) | EffectKind::Filter(_) => None,
+            EffectKind::Paint | EffectKind::Path(_) | EffectKind::Levels(_) | EffectKind::Filter(_) | EffectKind::Placeholder { .. } => None,
         }
     }
 
@@ -1073,6 +1089,23 @@ impl Effect {
     pub fn new(id: LayerId, kind: EffectKind) -> Effect {
         // Generators and fills that build a mask usually add on top of the background.
         Effect { id, name: kind.name().to_string(), visible: true, kind, blend: BlendMode::Normal, opacity: 1.0 }
+    }
+
+    /// A [`EffectKind::Placeholder`] named after what it stands for.
+    pub fn placeholder(id: LayerId, label: impl Into<String>, reason: impl Into<String>) -> Effect {
+        let label = label.into();
+        Effect { name: label.clone(), ..Effect::new(id, EffectKind::Placeholder { label, reason: reason.into() }) }
+    }
+
+    pub fn is_placeholder(&self) -> bool {
+        matches!(self.kind, EffectKind::Placeholder { .. })
+    }
+}
+
+impl Layer {
+    /// The placeholder effects of the layer's mask and content.
+    pub fn placeholders(&self) -> impl Iterator<Item = &Effect> {
+        self.mask.iter().flat_map(|m| m.effects.iter()).chain(self.content_effects.iter()).filter(|e| e.is_placeholder())
     }
 }
 
@@ -1208,6 +1241,33 @@ mod tests {
         assert!(hm.apply(0.5, 0.1) > 0.5 && hm.apply(0.5, -0.1) < 0.5);
         assert!(HeightMask { offset: 0.5, ..hm }.apply(0.5, 0.0) > 0.5);
         assert_eq!(hm.apply(0.5, f32::NAN), 0.5);
+    }
+
+    #[test]
+    fn placeholders_name_what_they_stand_for_and_go_in_either_stack() {
+        let e = Effect::placeholder(LayerId(5), "Mask generator \"dirt\"", "compiled graphs are not computed yet");
+        assert_eq!(e.name, "Mask generator \"dirt\"");
+        assert!(e.is_placeholder() && e.kind.content_only().is_none() && !e.kind.painted());
+        let mut l = Layer::new(LayerId(1), "l", LayerKind::Paint, &[Channel::BaseColor]);
+        l.content_effects.push(Effect::new(LayerId(2), EffectKind::Anchor));
+        l.mask = Some(Mask { effects: vec![e.clone()], ..Mask::new(MaskBackground::White) });
+        assert_eq!(l.placeholders().map(|e| e.id).collect::<Vec<_>>(), [LayerId(5)]);
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["kind"], serde_json::json!({"Placeholder": {"label": "Mask generator \"dirt\"", "reason": "compiled graphs are not computed yet"}}));
+        assert_eq!(serde_json::from_value::<Effect>(json).unwrap(), e);
+    }
+
+    #[test]
+    fn layers_without_a_lock_store_none_and_old_layers_load_unlocked() {
+        let l = Layer::new(LayerId(1), "l", LayerKind::Paint, &[Channel::BaseColor]);
+        let mut json = serde_json::to_value(&l).unwrap();
+        assert!(json.get("lock").is_none(), "unlocked layers store no lock");
+        json["geometry_mask"] = serde_json::json!(["Body"]);
+        let old: Layer = serde_json::from_value(json).unwrap();
+        assert_eq!((old.lock, old.geometry_mask), (None, Some(GeometryMask::Parts(vec!["Body".into()]))));
+        let mut locked = l.clone();
+        locked.lock = Some(Lock::import(vec![LockReason::new("graph:x", "fill \"x\"")]));
+        assert_eq!(serde_json::from_value::<Layer>(serde_json::to_value(&locked).unwrap()).unwrap(), locked);
     }
 
     #[test]

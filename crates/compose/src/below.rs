@@ -151,11 +151,12 @@ fn effect_ids(l: &Layer) -> impl Iterator<Item = LayerId> + '_ {
     l.mask.iter().flat_map(|m| m.effects.iter()).chain(l.content_effects.iter()).map(|e| e.id)
 }
 
-/// A layer as far as compositing is concerned (names, color tags and folding don't matter).
+/// A layer as far as compositing is concerned (names, color tags, folding and locks don't matter).
 fn render_view(l: &Layer) -> Layer {
     let mut l = l.clone();
     l.name.clear();
     l.color_tag = None;
+    l.lock = None;
     if let LayerKind::Group { collapsed, .. } = &mut l.kind {
         *collapsed = false;
     }

@@ -12,6 +12,7 @@ mod filter_swap;
 mod filters;
 mod high_poly_missed;
 mod instances;
+mod locks;
 mod materialcraft_link;
 mod materialx;
 mod materialx_import;

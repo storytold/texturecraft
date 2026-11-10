@@ -4,9 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CoreError, Effect, Layer, LayerId, LayerKind, Result};
+use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CoreError, Effect, ImportReport, Layer, LayerId, LayerKind, Result};
 
-pub const FORMAT_VERSION: u32 = 2;
+/// Version of `project.json`. 3 added layer locks, placeholder effects, the import report, geometry masks by UV
+/// tile and the imported blend modes; version 2 files read unchanged.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Maximum group nesting (also bounds recursion over hostile project files)
 pub const MAX_DEPTH: usize = 16;
@@ -408,6 +410,9 @@ pub struct Project {
     /// Saved and imported cameras (the viewport's default camera is not in the list).
     #[serde(default)]
     pub cameras: Vec<Camera>,
+    /// Set on a project converted from another application's file: what was carried over and how faithfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<ImportReport>,
 }
 
 impl Project {
@@ -424,6 +429,7 @@ impl Project {
             next_id: 1,
             display: DisplaySettings::default(),
             cameras: Vec::new(),
+            import: None,
         }
     }
 

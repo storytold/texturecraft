@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use texturecraft_core::{BakedMap, Effect, EffectKind, Fill, Layer, LayerKind, Mask, MaskBackground, TextureSet};
+use texturecraft_core::{BakedMap, BlendMode, Effect, EffectKind, Fill, GeometryMask, Layer, LayerKind, Mask, MaskBackground, TextureSet};
 
 use super::*;
 
@@ -857,4 +857,95 @@ fn zip64_entry_counts_remain_supported_and_bounded() {
             assert!(matches!(result, Err(FormatError::TooLarge(_))), "{result:?}");
         }
     }
+}
+
+/// A project.json written by format version 2 (before locks, placeholders, the import report, UV-tile geometry masks
+/// and the imported blend modes), for `sample()` plus a layer with a part mask, a Tint channel and a levels effect.
+const VERSION_2_PROJECT: &str = include_str!("fixtures/version2.json");
+
+#[test]
+fn version_2_files_still_load_and_resave_as_version_3() {
+    let Sample { pf: sample, paint } = sample();
+    let bytes = edit_archive(&sample, |name, data| {
+        if name == "project.json" {
+            *data = VERSION_2_PROJECT.as_bytes().to_vec();
+        }
+    });
+    let loaded = load_project_bytes(&bytes).unwrap();
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(loaded.project.format_version, FORMAT_VERSION);
+    assert_eq!(FORMAT_VERSION, 3);
+    let parts = loaded.project.layers.values().find(|l| l.name == "Parts only").unwrap();
+    assert_eq!(parts.geometry_mask, Some(GeometryMask::Parts(vec!["Body".into(), "Lid".into()])));
+    assert_eq!(parts.channels[&Channel::BaseColor].mode, BlendMode::Tint);
+    assert!(loaded.project.layers.values().all(|l| l.lock.is_none() && l.placeholders().next().is_none()));
+    assert_eq!(loaded.project.import, None);
+    assert_eq!(loaded.pixels.layer(paint, Channel::BaseColor).map(|i| i.get(127, 127)), Some([65535, 0, 9, 65535]));
+    // Saved again as version 3, a part mask keeps its version 2 form and nothing else is added.
+    let resaved = save_project_bytes(&loaded).unwrap();
+    let json = project_json(&resaved);
+    assert_eq!(json["format_version"], 3);
+    let stored = json["layers"].as_object().unwrap().values().find(|l| l["name"] == "Parts only").unwrap();
+    assert_eq!(stored["geometry_mask"], serde_json::json!(["Body", "Lid"]));
+    assert!(json.get("import").is_none() && json["layers"].as_object().unwrap().values().all(|l| l.get("lock").is_none()));
+    assert_same(&loaded, &load_project_bytes(&resaved).unwrap());
+}
+
+fn project_json(bytes: &[u8]) -> serde_json::Value {
+    let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let mut json = String::new();
+    zip.by_name("project.json").unwrap().read_to_string(&mut json).unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+#[test]
+fn version_3_features_round_trip_identically() {
+    use texturecraft_core::import_report::original_result_layer;
+    use texturecraft_core::{Fidelity, ImportReport, LayerReport, LayerRole, Lock, LockReason, SafetyFlag, SafetyFlagKind};
+
+    let mut s = sample();
+    let p = &mut s.pf.project;
+    let channels = p.texture_sets[0].channel_list();
+    // A locked layer with placeholders in its mask and content, every imported blend mode and a UV-tile mask.
+    let mut locked = Layer::new(p.alloc_id(), "Imported", LayerKind::Paint, &channels);
+    locked.content_effects.push(Effect::placeholder(p.alloc_id(), "Filter \"warp\"", "compiled graphs are not computed yet"));
+    locked.mask = Some(Mask { effects: vec![Effect::placeholder(p.alloc_id(), "Generator \"dirt\"", "not computed")], ..Mask::new(MaskBackground::White) });
+    locked.lock = Some(Lock::import(vec![LockReason::new("graph:warp", "content filter \"warp\""), LockReason::new("", "brush strokes")]));
+    locked.geometry_mask = Some(GeometryMask::UvTiles(vec![1001, 1002]));
+    for (c, m) in channels.iter().zip(BlendMode::IMPORTED) {
+        if let Some(b) = locked.channels.get_mut(c) {
+            b.mode = m;
+        }
+    }
+    let locked = p.insert_layer(0, locked, None, false).unwrap();
+    let original = p.alloc_id();
+    p.insert_layer(0, original_result_layer(original, &channels, false), None, false).unwrap();
+    s.pf.pixels.layer_mut(original, Channel::BaseColor, (128, 128)).set(5, 6, &[1, 2, 3, 65535]);
+    let mut report = ImportReport::new("robot.ext (saved with version 1.2)", "texturecraft-import 0.1.0");
+    report.add("texture set \"A\" / layer stack", Fidelity::Approximated, "2 layers imported");
+    report.add("texture set \"A\" / brush strokes", Fidelity::Baked, "");
+    report.layers.insert(original, LayerReport { role: LayerRole::OriginalResult, fidelity: Fidelity::Baked, ..LayerReport::default() });
+    let flags = vec![
+        SafetyFlag::new(SafetyFlagKind::UnhandledSetting, "Class.field", "setting Class.field = 2 not handled"),
+        SafetyFlag::new(SafetyFlagKind::MaskNotComputable, "", "mask generator not computable"),
+    ];
+    report.layers.insert(locked, LayerReport { role: LayerRole::Imported, fidelity: Fidelity::Approximated, path: "Folder / Imported".into(), flags });
+    p.import = Some(report);
+
+    let bytes = save_project_bytes(&s.pf).unwrap();
+    let back = load_project_bytes(&bytes).unwrap();
+    assert!(back.warnings.is_empty());
+    assert_same(&s.pf, &back);
+    assert_eq!(save_project_bytes(&back).unwrap(), bytes, "saving is deterministic");
+    let json = project_json(&bytes);
+    assert_eq!(json["format_version"], 3);
+    let stored = &json["layers"][locked.0.to_string()];
+    assert_eq!(stored["geometry_mask"], serde_json::json!({"UvTiles": [1001, 1002]}));
+    assert_eq!(stored["lock"]["source"], "Project import");
+    assert_eq!(json["import"]["layers"][original.0.to_string()]["role"], "OriginalResult");
+    // A stored fidelity this version does not know is an error, not a silent default.
+    let mut bad = json.clone();
+    bad["import"]["entries"][0]["fidelity"] = serde_json::json!("KeptRaw");
+    let bytes = edit_project_json(&s.pf, |j| *j = bad.clone());
+    assert!(load_project_bytes(&bytes).is_err());
 }

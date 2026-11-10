@@ -491,14 +491,14 @@ fn geometry_mask_tool_toggles_the_clicked_part() {
     execute(&mut s, "tool.geometryMask", &Value::Null).unwrap();
     let r = execute(&mut s, "tool.click", &lid).unwrap();
     assert_eq!((r["part"].as_str(), r["shown"].as_bool(), &r["geometryMask"]), (Some("Lid"), Some(false), &json!(["Body"])), "{r}");
-    assert_eq!(s.doc.project.layer(layer).unwrap().geometry_mask, Some(vec!["Body".to_string()]));
+    assert_eq!(s.doc.project.layer(layer).unwrap().geometry_mask, Some(texturecraft_core::GeometryMask::Parts(vec!["Body".to_string()])));
     let r = execute(&mut s, "tool.click", &body).unwrap();
     assert_eq!(r["geometryMask"], json!([]), "both hidden");
     execute(&mut s, "tool.click", &lid).unwrap();
     let r = execute(&mut s, "tool.click", &body).unwrap();
     assert_eq!(r["geometryMask"], Value::Null, "shown on every part again: no mask");
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
-    assert_eq!(s.doc.project.layer(layer).unwrap().geometry_mask, Some(vec!["Lid".to_string()]));
+    assert_eq!(s.doc.project.layer(layer).unwrap().geometry_mask, Some(texturecraft_core::GeometryMask::Parts(vec!["Lid".to_string()])));
     assert!(execute(&mut s, "tool.click", &json!({"x": 1, "y": 1})).is_err(), "nothing under the point");
 }
 

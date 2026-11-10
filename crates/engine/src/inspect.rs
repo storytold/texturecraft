@@ -2,7 +2,9 @@
 //! without a screenshot.
 
 use serde_json::{Value, json};
-use texturecraft_core::{Effect, EffectKind, Fill, Filter, Generator, Layer, LayerKind, NormalFormat, Projection, Source};
+use texturecraft_core::{
+    Effect, EffectKind, Fill, Filter, Generator, GeometryMask, ImportReport, Layer, LayerKind, LayerReport, NormalFormat, Projection, Source,
+};
 
 use crate::Session;
 use crate::session::StackTarget;
@@ -56,6 +58,7 @@ fn effect_json(session: &Session, effect: &Effect, content: bool) -> Value {
         EffectKind::Paint => out["tiles"] = json!(mask_tiles()),
         EffectKind::Fill { source, .. } => out["source"] = source_json(source),
         EffectKind::Material(fill) => out["fill"] = fill_json(fill),
+        EffectKind::Placeholder { label, reason } => out["placeholder"] = json!({ "label": label, "reason": reason }),
         EffectKind::Filter(filter) => {
             out["filter"] = json!(filter);
             match filter {
@@ -101,8 +104,16 @@ fn layer_json(s: &Session, l: &Layer, depth: usize) -> Value {
     if l.height_mask.enabled {
         v["heightMask"] = json!({ "contrast": l.height_mask.contrast, "offset": l.height_mask.offset });
     }
-    if let Some(parts) = &l.geometry_mask {
-        v["geometryMask"] = json!(parts);
+    match &l.geometry_mask {
+        Some(GeometryMask::Parts(parts)) => v["geometryMask"] = json!(parts),
+        Some(GeometryMask::UvTiles(tiles)) => v["geometryMask"] = json!({ "uvTiles": tiles }),
+        None => {}
+    }
+    if let Some(lock) = &l.lock {
+        v["locked"] = crate::lock_cmds::lock_json(lock);
+    }
+    if let Some(r) = s.doc.project.import.as_ref().and_then(|r| r.layers.get(&l.id)) {
+        v["import"] = layer_report_json(r);
     }
     if matches!(l.kind, LayerKind::Paint) {
         // Sorted: the store is a hash map, and inspect output must be stable.
@@ -128,6 +139,64 @@ fn layer_json(s: &Session, l: &Layer, depth: usize) -> Value {
         }
     }
     v
+}
+
+fn layer_report_json(r: &LayerReport) -> Value {
+    json!({
+        "role": format!("{:?}", r.role),
+        "fidelity": r.fidelity.id(),
+        "path": r.path,
+        "flags": r.flags.iter().map(|f| json!({ "kind": format!("{:?}", f.kind), "key": f.key, "text": f.text })).collect::<Vec<_>>(),
+    })
+}
+
+/// The import report of a converted project: the item lines, counts per fidelity, the layers (with what the stack
+/// still holds of them), and the locked layers and placeholder effects of the whole project.
+pub fn import_report(s: &Session, r: &ImportReport) -> Value {
+    let p = &s.doc.project;
+    let counts: serde_json::Map<String, Value> = texturecraft_core::Fidelity::ALL.iter().map(|f| (f.id().to_string(), json!(r.count(*f)))).collect();
+    json!({
+        "source": r.source,
+        "importer": r.importer,
+        "exact": r.is_exact(),
+        "counts": counts,
+        "entries": r.entries.iter().map(|e| json!({ "item": e.item, "fidelity": e.fidelity.id(), "note": e.note })).collect::<Vec<_>>(),
+        "layers": r.layers.iter().map(|(id, l)| {
+            let mut v = layer_report_json(l);
+            v["layer"] = json!(id.0);
+            v["present"] = json!(p.locate(*id).is_some());
+            v
+        }).collect::<Vec<_>>(),
+        "originalResults": r.original_results().map(|id| id.0).collect::<Vec<_>>(),
+    })
+}
+
+/// Every locked layer and placeholder effect of the project (any texture set), for agents checking an import.
+pub fn locks(s: &Session) -> Value {
+    let p = &s.doc.project;
+    let in_stack = |l: &&Layer| p.locate(l.id).is_some();
+    let locked: Vec<Value> = p
+        .layers
+        .values()
+        .filter(in_stack)
+        .filter_map(|l| {
+            l.lock.as_ref().map(
+                |lock| json!({ "layer": l.id.0, "name": l.name, "textureSet": p.locate(l.id).map(|(ts, _, _)| ts), "lock": crate::lock_cmds::lock_json(lock) }),
+            )
+        })
+        .collect();
+    let placeholders: Vec<Value> = p
+        .layers
+        .values()
+        .filter(in_stack)
+        .flat_map(|l| {
+            l.placeholders().map(move |e| match &e.kind {
+                EffectKind::Placeholder { label, reason } => json!({ "effect": e.id.0, "layer": l.id.0, "label": label, "reason": reason }),
+                _ => Value::Null,
+            })
+        })
+        .collect();
+    json!({ "lockedLayers": locked, "placeholders": placeholders })
 }
 
 /// The layer stack of texture set `ts`, top → bottom (as displayed).
@@ -193,5 +262,7 @@ pub fn session(s: &Session) -> Value {
         "history": { "undo": s.undo_label(), "redo": s.redo_label(), "depth": s.history_labels().len() },
         "memoryBytes": s.memory().total(),
         "pendingTiles": s.pending_tiles(),
+        "locks": locks(s),
+        "import": s.doc.project.import.as_ref().map_or(Value::Null, |r| import_report(s, r)),
     })
 }

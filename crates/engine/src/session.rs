@@ -514,10 +514,13 @@ impl Session {
         self.end_polygon_fill_box();
 
         let before = self.doc.clone();
-        let result = change(self).and_then(|value| match self.doc.project.instance_cycle() {
-            Some(id) => Err(EngineError::Other(format!("instance layer {} would draw itself", id.0))),
-            None => Ok(value),
-        });
+        let result = change(self)
+            .and_then(|value| match self.doc.project.instance_cycle() {
+                Some(id) => Err(EngineError::Other(format!("instance layer {} would draw itself", id.0))),
+                None => Ok(value),
+            })
+            // Locked layers keep their content whichever command ran (see `lock_cmds`).
+            .and_then(|value| crate::lock_cmds::locked_change(&before, &self.doc).map_or(Ok(value), Err));
         match result {
             Ok(value) => {
                 self.record(label, before, merge);

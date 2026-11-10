@@ -62,6 +62,11 @@ impl Session {
         // Painting an instance paints its source (its own mask when it overrides the mask).
         let p = &self.doc.project;
         let id = if self.target == StackTarget::Mask { p.mask_owner(id) } else { p.content_layer(id).map_or(id, |l| l.id) };
+        let owner = match self.target {
+            StackTarget::Effect(e) => p.effect(e).map_or(id, |(owner, _)| owner),
+            _ => id,
+        };
+        crate::lock_cmds::refuse_locked(p, owner)?;
         match self.target {
             StackTarget::Content => {
                 let l = self.doc.project.layer(id)?;

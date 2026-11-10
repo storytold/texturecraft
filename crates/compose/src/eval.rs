@@ -11,8 +11,8 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use texturecraft_core::{
     BakedMap, BlendMode, BlockScales, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Fill, Filter, Generator,
-    GeneratorKind, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source, TextureSet, TileGrid, blend1,
-    blend3, lum, mix3, per_unit,
+    GeneratorKind, GeometryMask, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source, TextureSet, TileGrid,
+    blend1, blend3, lum, mix3, per_unit,
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer};
@@ -834,8 +834,32 @@ struct Node<'a> {
     /// The node or one of its children records an anchor.
     has_anchor: bool,
     height_mask: HeightMask,
-    /// Geometry mask: whether the layer shows on each mesh submesh (None: everywhere).
-    parts: Option<Vec<bool>>,
+    /// Geometry mask (None: everywhere).
+    geometry: Option<Geometry>,
+}
+
+/// A layer's geometry mask planned for the texture set.
+enum Geometry {
+    /// Whether the layer shows on each mesh submesh.
+    Parts(Vec<bool>),
+    /// Whether the layer shows on each atlas block (`cols` across, `block` texels each), row by row. A set without
+    /// UV tiles is one block, tile 1001.
+    Tiles { cols: u32, rows: u32, block: (u32, u32), allowed: Vec<bool> },
+}
+
+impl Geometry {
+    fn of(inp: &Inputs, mask: &GeometryMask) -> Geometry {
+        match mask {
+            GeometryMask::Parts(names) => Geometry::Parts(inp.mesh.submeshes.iter().map(|s| names.contains(&s.name)).collect()),
+            GeometryMask::UvTiles(tiles) => {
+                let grid = inp.tile_grid();
+                let (cols, rows) = grid.map_or((1, 1), |g| (g.cols.max(1), g.rows.max(1)));
+                let allowed =
+                    (0..rows).flat_map(|by| (0..cols).map(move |bx| (bx, by))).map(|(bx, by)| tiles.contains(&grid.map_or(1001, |g| g.udim(bx, by)))).collect();
+                Geometry::Tiles { cols, rows, block: ((inp.gbuf.width / cols).max(1), (inp.gbuf.height / rows).max(1)), allowed }
+            }
+        }
+    }
 }
 
 /// Plans of the visible effects of a stack: mask effects (`channel` None) or the content
@@ -961,8 +985,8 @@ fn plan_node<'a>(
     let anchors = if fx { anchor_cuts(&layer.content_effects) } else { Vec::new() };
     let has_anchor = !anchors.is_empty() || matches!(&content, Content::Group(nodes) if nodes.iter().any(|n| n.has_anchor));
     // The geometry mask is the layer's own (an instance in another set has other parts).
-    let parts = own.geometry_mask.as_ref().map(|names| inp.mesh.submeshes.iter().map(|s| names.contains(&s.name)).collect());
-    Some(Node { id, content, chans, mask, anchors, has_anchor, height_mask: layer.height_mask, parts })
+    let geometry = own.geometry_mask.as_ref().map(|g| Geometry::of(inp, g));
+    Some(Node { id, content, chans, mask, anchors, has_anchor, height_mask: layer.height_mask, geometry })
 }
 
 /// The visible anchor points of a content stack with where they cut it: after their index among
@@ -1343,8 +1367,8 @@ impl<'a, 'b> Texel<'a, 'b> {
                     let result = if pass { 1.0 } else { 0.0 };
                     value += (result - value) * opacity;
                 }
-                // Content-only effects
-                EffectKind::Material(_) | EffectKind::Anchor => {}
+                // Content-only effects; a placeholder passes the mask through unchanged
+                EffectKind::Material(_) | EffectKind::Anchor | EffectKind::Placeholder { .. } => {}
             }
         }
         value.clamp(0.0, 1.0)
@@ -1464,7 +1488,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// The mask of node `n` at this texel, combined with the layer's height when it masks with
     /// height.
     fn node_mask(&mut self, n: &Node) -> f32 {
-        if n.parts.as_ref().is_some_and(|p| !self.in_parts(p)) {
+        if n.geometry.as_ref().is_some_and(|g| !self.in_geometry(g)) {
             return 0.0;
         }
         let m = match &n.mask {
@@ -1477,6 +1501,17 @@ impl<'a, 'b> Texel<'a, 'b> {
         let height = Channel::Height.index();
         let h = n.chans.iter().find(|c| c.ch == height).and_then(|c| self.content(&n.content, c)).map_or(0.0, |(v, _)| v[0]);
         n.height_mask.apply(m, h)
+    }
+
+    /// Whether this texel lies in what geometry mask `g` shows.
+    fn in_geometry(&self, g: &Geometry) -> bool {
+        match g {
+            Geometry::Parts(allowed) => self.in_parts(allowed),
+            Geometry::Tiles { cols, rows, block, allowed } => {
+                let (bx, by) = ((self.x / block.0).min(cols.saturating_sub(1)), (self.y / block.1).min(rows.saturating_sub(1)));
+                allowed.get((by * cols + bx) as usize).copied().unwrap_or(true)
+            }
+        }
     }
 
     /// Whether this texel's triangle lies in a submesh `allowed` marks (uncovered texels and
@@ -1626,10 +1661,13 @@ impl<'a, 'b> Texel<'a, 'b> {
             },
             // Neighbourhood filters come precomputed through `ChanPlan::start`.
             EffectKind::Filter(f) => (f.point(c.kind, v).map_or(v, |out| mix3(v, out, o)), cov),
-            // Anchors are recorded by `eval`; mask-only effects leave content as it is.
-            EffectKind::Anchor | EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection { .. } | EffectKind::Compare { .. } => {
-                (v, cov)
-            }
+            // Anchors are recorded by `eval`; mask-only effects and placeholders leave content as it is.
+            EffectKind::Anchor
+            | EffectKind::Fill { .. }
+            | EffectKind::Generator(_)
+            | EffectKind::ColorSelection { .. }
+            | EffectKind::Compare { .. }
+            | EffectKind::Placeholder { .. } => (v, cov),
         }
     }
 }
@@ -2863,13 +2901,51 @@ soft {soft:?}"
             (0..64 * 64).filter(|i| close(out.value(Channel::BaseColor, i % 64, i / 64), [1.0, 0.0, 0.0])).count()
         };
         let all = red(&f);
-        f.project.layer_mut(id).unwrap().geometry_mask = Some(vec!["Lid".into()]);
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::Parts(vec!["Lid".into()]));
         let lid = red(&f);
-        f.project.layer_mut(id).unwrap().geometry_mask = Some(vec!["Body".into()]);
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::Parts(vec!["Body".into()]));
         let body = red(&f);
         assert!(lid > 0 && body > 0 && lid + body == all, "{lid} + {body} of {all}");
-        f.project.layer_mut(id).unwrap().geometry_mask = Some(Vec::new());
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::Parts(Vec::new()));
         assert_eq!(red(&f), 0, "no parts: hidden everywhere");
+    }
+
+    #[test]
+    fn geometry_masks_by_uv_tile_show_layers_on_chosen_atlas_blocks_only() {
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [1.0, 0.0, 0.0], 0.2);
+        let red = |f: &Fixture| {
+            let out = run(f, None);
+            (0..64 * 64).filter(|i| close(out.value(Channel::BaseColor, i % 64, i / 64), [1.0, 0.0, 0.0])).map(|i| i % 64).collect::<Vec<_>>()
+        };
+        let all = red(&f).len();
+        assert!(all > 0);
+        // A set without UV tiles is tile 1001.
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::UvTiles(vec![1001]));
+        assert_eq!(red(&f).len(), all);
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::UvTiles(vec![1002]));
+        assert!(red(&f).is_empty(), "tile 1002 is not in a classic set");
+        // Two tiles side by side: the right half of the atlas is tile 1002.
+        f.project.texture_sets[0].uv_tiles = vec![1001, 1002];
+        let right = red(&f);
+        assert!(!right.is_empty() && right.iter().all(|x| *x >= 32), "only the right block");
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::UvTiles(vec![1001]));
+        assert!(red(&f).iter().all(|x| *x < 32));
+    }
+
+    #[test]
+    fn placeholder_effects_pass_content_and_masks_through() {
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.25, 0.5, 0.75], 0.4);
+        let before = run(&f, None);
+        content_fx(&mut f, id, EffectKind::Placeholder { label: "Filter \"x\"".into(), reason: "not computed".into() });
+        f.project.layer_mut(id).unwrap().mask =
+            Some(Mask { effects: vec![Effect::placeholder(LayerId(900), "Generator \"y\"", "not computed")], ..Mask::new(MaskBackground::White) });
+        let after = run(&f, None);
+        for (x, y) in [(5, 5), (30, 40), (60, 10)] {
+            assert_eq!(before.value(Channel::BaseColor, x, y), after.value(Channel::BaseColor, x, y));
+            assert_eq!(before.value(Channel::Roughness, x, y), after.value(Channel::Roughness, x, y));
+        }
     }
 
     #[test]
