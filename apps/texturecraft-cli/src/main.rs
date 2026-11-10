@@ -12,6 +12,8 @@ use texturecraft_automation::{AuthorizedWorkspace, BridgeClient, Filesystem, Hea
 use texturecraft_engine::core::PROJECT_EXT;
 use texturecraft_engine::formats::{MeshReport, import_mesh, import_mesh_bytes, mesh_report};
 
+mod graph;
+
 const USAGE: &str = "\
 texturecraft-cli: headless TextureCraft
 
@@ -42,6 +44,12 @@ USAGE:
                    [--max-resolution <px>] [--no-measure]
       Convert a project file of the reference app (one-way; the original is only read) and save
       it; prints what the import found per texture set (file.importProject).
+  texturecraft-cli graph <graph.tcgraph> <out dir> [--size <px>] [--output <name>]... [--seed <n>]
+                  [--param <name>=<v>[,<v>...]]... [--depth 8|16] [--timeout <s>]
+      Render a graph text file on the CPU: one PNG per output (<out dir>/<output>.png). --size
+      overrides the graph's size (1-8192); --output picks outputs (repeatable); --seed sets the
+      graph's random seed offset; --param sets an exposed parameter by label or an input value by
+      name (repeatable); --timeout cancels the render after that many seconds.
   texturecraft-cli mcp [--bridge <port>] [--token <token>] [--read-root <dir>] [--write-root <dir>]
       MCP server on stdio: headless (file access only below the roots), or bridged to
       `texturecraft --control <port>`. --automation-read-root / --automation-write-root are
@@ -65,6 +73,7 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
     ("new", &["--resolution"], &["--sample"]),
     ("import", &["--max-resolution"], &["--original-on-top", "--native-filters", "--no-measure"]),
+    ("graph", &["--size", "--output", "--seed", "--param", "--depth", "--timeout"], &[]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
     ("serve", &["--port", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
 ];
@@ -83,6 +92,10 @@ impl Args {
     }
     fn num<T: std::str::FromStr>(&self, k: &str) -> Result<Option<T>, String> {
         self.get(k).map(|v| v.parse().map_err(|_| format!("{k}: `{v}` is not a valid number"))).transpose()
+    }
+    /// Every value of a repeatable flag, in order.
+    fn all(&self, k: &str) -> Vec<&str> {
+        self.flags.iter().filter(|(f, _)| f == k).filter_map(|(_, v)| v.as_deref()).collect()
     }
     fn pos(&self, n: usize, what: &str) -> Result<&str, String> {
         self.pos.get(n).map(String::as_str).ok_or_else(|| format!("missing {what}"))
@@ -180,6 +193,7 @@ fn dispatch(name: &str, a: &Args) -> R {
         "render" => render(a),
         "new" => new(a),
         "import" => import(a),
+        "graph" => graph::render(a),
         "mcp" => mcp(a),
         "serve" => serve(a),
         other => Err(format!("unknown command `{other}`")),

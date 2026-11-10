@@ -4353,6 +4353,7 @@ dependencies = [
  "serde_json",
  "texturecraft-automation",
  "texturecraft-engine",
+ "texturecraft-graph",
  "tokio",
  "winresource",
 ]
@@ -4432,6 +4433,14 @@ dependencies = [
  "rayon",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "texturecraft-graph"
+version = "0.6.1"
+dependencies = [
+ "libm",
+ "rayon",
 ]
 
 [[package]]

@@ -46,3 +46,9 @@ Built-in environments (`crates/render/src/ibl.rs`), smart materials and procedur
 (`crates/paint/src/brush.rs`), meshes (`crates/geom/src/primitives.rs`) and shelf thumbnails
 (`crates/ui-egui/src/thumbs.rs`) are generated in code by TextureCraft contributors (MIT OR
 Apache-2.0). None of them is derived from another product's presets, shaders, materials or images.
+
+## Code derived from other projects
+
+| Path | What | Author | Source | License |
+|---|---|---|---|---|
+| `crates/graph`, and the copy of its PNG encoder in `crates/import-reader/src/png_out/` | The graph runtime (node graph text format, parser, CPU evaluator, image codecs), copied and adapted; see `crates/graph/NOTICE`, which covers both | PiJellyPin and contributors | Derived from MaterialCraft by PiJellyPin and contributors | MIT OR Apache-2.0 |
