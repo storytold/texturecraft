@@ -147,6 +147,25 @@ fn content_paints_values_and_the_eraser_lowers_coverage() {
 }
 
 #[test]
+fn a_mask_group_eraser_lowers_coverage_and_keeps_the_grey() {
+    // a mask group's layer: a brush then an eraser across it; the straight grey stays where coverage is left
+    let mesh = wall();
+    let job = ReplayJob {
+        target: ReplayTarget::Mask(LayerId(9)),
+        label: "test".into(),
+        steps: vec![
+            step(PaintMode::Paint, vec![stroke(StrokeSpace::Uv, &[[0.2, 0.5], [0.8, 0.5]])]),
+            step(PaintMode::Erase, vec![stroke(StrokeSpace::Uv, &[[0.5, 0.3], [0.5, 0.7]])]),
+        ],
+    };
+    let out = replay(&mesh, &[job]);
+    let (grey, cover) = mask_at(&out[0], 40, RES / 2);
+    assert!(cover > 0.95 && (grey - 0.5 * cover).abs() < 0.01, "{grey} {cover}");
+    let (grey, cover) = mask_at(&out[0], RES / 2, RES / 2);
+    assert!(cover < 0.05 && grey < 0.03, "erased, not painted black at full coverage: {grey} {cover}");
+}
+
+#[test]
 fn hostile_jobs_do_not_crash() {
     let mesh = wall();
     let nan = StrokeSpace::Mesh { view: [f32::NAN; 16], projection: [0.0; 16] };

@@ -429,3 +429,78 @@ fn a_decompiled_fill_lays_each_channel_with_its_own_blend() {
     assert!(base.1 && height.1, "graph sources");
     assert_ne!(base.0, height.0, "each channel keeps its own blend");
 }
+
+fn mask_group(uid: u64, mode: texturecraft_import_reader::model::ProjectBlendMode, opacity: f32, effects: Vec<ProjectEffect>) -> ProjectEffect {
+    ProjectEffect::Group(EffectGroup { header: header(uid, u64::MAX, vec![blend(0, mode.raw(), opacity)]), effects })
+}
+
+#[test]
+fn a_mask_group_with_its_own_blend_is_one_paint_effect_with_that_blend() {
+    use texturecraft_import_reader::model::ProjectBlendMode;
+    let group = mask_group(
+        4,
+        ProjectBlendMode::Subtract,
+        0.5,
+        vec![painting(5, 0, PaintTool::Brush, vec![uniform(0, [1.0; 3])]), painting(6, 0, PaintTool::Brush, vec![uniform(0, [0.0; 3])])],
+    );
+    let mut l = layer(1, "Masked", ProjectLayerKind::Fill, vec![fill(2, ROUGH, vec![uniform(ROUGH, [1.0; 3])], vec![])]);
+    l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::White, effects: vec![group] });
+    let stack = build_replaying(vec![l]);
+    let m = by_name(&stack, "Masked").mask.as_ref().unwrap();
+    // not one effect per brush laid normally over the mask: one layer of the group's strokes, subtracted at half strength
+    assert_eq!(m.effects.len(), 1, "{:?}", m.effects);
+    assert!(matches!(m.effects[0].kind, EffectKind::Paint));
+    assert_eq!(m.effects[0].blend, texturecraft_core::BlendMode::Subtract);
+    assert!((m.effects[0].opacity - 0.5).abs() < 1e-6);
+    assert_eq!(stack.jobs.len(), 1);
+    let job = &stack.jobs[0];
+    assert_eq!(job.target, crate::replay::ReplayTarget::Mask(m.effects[0].id));
+    assert_eq!(job.steps.iter().map(|s| s.mask_value).collect::<Vec<_>>(), vec![1.0, 0.0]);
+    assert!(job.steps.iter().all(|s| s.mode == crate::replay::PaintMode::Paint));
+}
+
+#[test]
+fn an_eraser_in_a_mask_group_lowers_the_groups_coverage_and_outside_one_paints_black() {
+    use texturecraft_import_reader::model::ProjectBlendMode;
+    let erasing = mask_group(
+        4,
+        ProjectBlendMode::Normal,
+        1.0,
+        vec![painting(5, 0, PaintTool::Brush, vec![uniform(0, [1.0; 3])]), painting(6, 0, PaintTool::Eraser, vec![])],
+    );
+    let mut l = layer(1, "Masked", ProjectLayerKind::Fill, vec![fill(2, ROUGH, vec![uniform(ROUGH, [1.0; 3])], vec![])]);
+    l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::Black, effects: vec![erasing, painting(7, 0, PaintTool::Eraser, vec![])] });
+    let stack = build_replaying(vec![l]);
+    let m = by_name(&stack, "Masked").mask.as_ref().unwrap();
+    assert_eq!(m.effects.len(), 2, "{:?}", m.effects);
+    assert_eq!(stack.jobs.len(), 2);
+    assert_eq!(stack.jobs[0].steps.len(), 2);
+    assert_eq!(stack.jobs[0].steps[1].mode, crate::replay::PaintMode::Erase);
+    // the lone eraser paints black over the whole mask
+    assert_eq!(stack.jobs[1].steps[0].mode, crate::replay::PaintMode::Paint);
+    assert_eq!(stack.jobs[1].steps[0].mask_value, 0.0);
+}
+
+#[test]
+fn a_mask_group_holding_more_than_brush_work_or_without_replay_stays_flat() {
+    use texturecraft_import_reader::model::ProjectBlendMode;
+    let mixed = || {
+        mask_group(
+            4,
+            ProjectBlendMode::Subtract,
+            1.0,
+            vec![painting(5, 0, PaintTool::Brush, vec![uniform(0, [1.0; 3])]), fill(6, 0, vec![uniform(0, [0.5; 3])], vec![])],
+        )
+    };
+    let masked = |group: ProjectEffect| {
+        let mut l = layer(1, "Masked", ProjectLayerKind::Fill, vec![fill(2, ROUGH, vec![uniform(ROUGH, [1.0; 3])], vec![])]);
+        l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::White, effects: vec![group] });
+        l
+    };
+    let stack = build_replaying(vec![masked(mixed())]);
+    assert_eq!(by_name(&stack, "Masked").mask.as_ref().unwrap().effects.len(), 2);
+    let only_brush = mask_group(4, ProjectBlendMode::Subtract, 1.0, vec![painting(5, 0, PaintTool::Brush, vec![uniform(0, [1.0; 3])])]);
+    let stack = build(vec![masked(only_brush)]);
+    let m = by_name(&stack, "Masked").mask.as_ref().unwrap();
+    assert!(m.effects.iter().all(|e| matches!(e.kind, EffectKind::Placeholder { .. })), "{m:?}");
+}

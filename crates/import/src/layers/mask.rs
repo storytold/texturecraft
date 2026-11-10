@@ -5,18 +5,22 @@
 //! anchor fills; levels and colour selection keep their kind. Painted strokes become paint effects replayed with
 //! TextureCraft's brush when the import has a replayer (approximated; [`crate::replay`]). Compiled-graph generators and
 //! filters, strokes that cannot be replayed, polygon fills, anchors inside the mask and unknown classes are
-//! placeholders, and the first of them makes the mask not computable. Effect groups are laid flat (approximated unless they pass through or blend normally at full strength).
+//! placeholders, and the first of them makes the mask not computable. An effect group of brush work with its own blending (or
+//! holding an eraser) becomes one paint effect with the group's blending, its strokes replayed together; other groups are laid
+//! flat (approximated unless they pass through or blend normally at full strength).
 
 use texturecraft_core::{BlendMode, Effect, EffectKind, Mask, MaskBackground, Source};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
-use texturecraft_import_reader::model::{BitmapSource, ColorSelectionEffect, EffectHeader, FillEffect, MaskInitial, ProjectEffect, ProjectMask, ProjectSource};
+use texturecraft_import_reader::model::{
+    BitmapSource, ColorSelectionEffect, EffectGroup, EffectHeader, FillEffect, MaskInitial, PaintTool, ProjectEffect, ProjectMask, ProjectSource,
+};
 
 use super::content::{is_dangling, levels, reference, replay_status};
 use super::{Anchors, Ids, SetInput, effect, projection};
 use crate::blend::ResolvedBlend;
 use crate::graph_uses::{self, GraphUse};
 use crate::replay::brush::StepTarget;
-use crate::replay::{ReplayJob, ReplayTarget};
+use crate::replay::{PaintMode, ReplayJob, ReplayTarget};
 use crate::resources::{MeshMapAlias, mesh_map_alias};
 use crate::status::Status;
 
@@ -131,6 +135,11 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 let blend = ResolvedBlend::of_mask(&g.header.blending);
                 let flat =
                     blend.mode() == BlendMode::Passthrough || (blend.mode() == BlendMode::Normal && blend.opacity >= 1.0) || g.header.blending.is_empty();
+                // an eraser lowers only the group's own coverage, so it needs the group's layer even when it blends normally
+                let isolating = g.effects.iter().any(|e| e.is_enabled() && matches!(e, ProjectEffect::Paint(p) if p.tool == PaintTool::Eraser));
+                if (!flat || isolating) && self.group_layer(g, on) {
+                    return;
+                }
                 if !flat {
                     self.note(on, &Status::approximated("mask effect group with its own blending laid flat"));
                 }
@@ -217,6 +226,55 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 self.placeholder(None, &format!("unknown effect {}", raw.class), "an effect class this version does not read", on, why);
             }
         }
+    }
+
+    /// A group with its own blending (or holding an eraser) whose actions are all brush work: its strokes painted on
+    /// their own, over nothing, into one paint effect (a brush lays its value over what the group holds, an eraser lowers
+    /// the group's coverage) that blends with the mask below with the group's mode and opacity, as the original
+    /// composites such a group. False (nothing pushed) when the group holds anything else or a stroke that cannot be
+    /// replayed: the caller lays it flat.
+    fn group_layer(&mut self, g: &EffectGroup, on: bool) -> bool {
+        if !self.input.replay {
+            return false;
+        }
+        let mut paints = Vec::new();
+        for e in g.effects.iter().filter(|e| e.is_enabled()) {
+            match e {
+                ProjectEffect::Paint(p) => paints.push(p),
+                _ => return false,
+            }
+        }
+        let mut steps = Vec::new();
+        let mut status = Status::Exact;
+        for p in paints.into_iter().filter(|p| p.stroke_count() > 0) {
+            let Ok(mut step) = crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images, self.input.graphs) else {
+                return false;
+            };
+            if p.tool == PaintTool::Eraser {
+                step.mode = PaintMode::Erase;
+            }
+            let own = ResolvedBlend::of_mask(&p.header.blending);
+            let plain = p.header.blending.is_empty() || (matches!(own.mode(), BlendMode::Normal | BlendMode::Passthrough) && own.opacity >= 1.0);
+            if !plain {
+                status.and(&Status::approximated(format!(
+                    "paint effect with its own blend ({:?} {}) inside a mask group laid over normally",
+                    own.mode(),
+                    own.opacity
+                )));
+            }
+            steps.push(step);
+        }
+        if steps.is_empty() {
+            // a group without strokes changes nothing
+            return true;
+        }
+        self.push(Some(&g.header), EffectKind::Paint, on);
+        let id = self.effects.last().map_or(texturecraft_core::LayerId(0), |e| e.id);
+        let job = ReplayJob { target: ReplayTarget::Mask(id), label: format!("{} / painted mask group", self.path), steps };
+        status.and(&replay_status(&job));
+        self.note(on, &status);
+        self.jobs.push(job);
+        true
     }
 
     /// TextureCraft selects within a per-component tolerance on the set's ID map; the file's hardness is left out.
