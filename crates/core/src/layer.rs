@@ -792,7 +792,7 @@ pub fn per_unit(kind: ChannelKind, v: [f32; 3], f: impl Fn(f32) -> f32) -> [f32;
         // One-component channels hold their value in the first slot (read as gray).
         ChannelKind::Signed => [f(v[0] * 0.5 + 0.5) * 2.0 - 1.0; 3],
         ChannelKind::Scalar => [f(v[0]); 3],
-        ChannelKind::Color => v.map(f),
+        ChannelKind::Color | ChannelKind::Data => v.map(f),
     }
 }
 

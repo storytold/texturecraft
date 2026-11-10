@@ -998,7 +998,11 @@ pub(crate) fn texture_set_settings(app: &mut TextureCraftApp, ui: &mut Ui) {
         });
         for (c, f) in &set.channels {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(tr(c.label())).strong());
+                let label = match set.channel_names.get(c) {
+                    Some(name) => format!("{name} ({})", tr(c.label())),
+                    None => tr(c.label()).to_string(),
+                };
+                ui.label(RichText::new(label).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if *c != Channel::BaseColor && icon_button(ui, ic::X, tr("Remove channel"), false, 18.0).clicked() {
                         app.run("textureSet.channel.remove", json!({"ts": ts, "channel": c.id()}));
@@ -1743,7 +1747,7 @@ fn material_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
         }
         let mut value = app.session.tool.values.get(&channel).copied().unwrap_or(channel.default_value());
         match channel.kind() {
-            ChannelKind::Color => {
+            ChannelKind::Color | ChannelKind::Data => {
                 ui.horizontal(|ui| {
                     ui.label(tr(channel.label()));
                     if color_swatch(ui, &format!("tool_{}", channel.id()), &mut value, ui.available_width() - 4.0) {
@@ -2148,7 +2152,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
             });
             match fill.source(c) {
                 Source::Uniform(mut v) => {
-                    if c.kind() == ChannelKind::Color {
+                    if matches!(c.kind(), ChannelKind::Color | ChannelKind::Data) {
                         if color_swatch(ui, &format!("fill_{salt}_{}", c.id()), &mut v, ui.available_width() - 4.0) {
                             app.run("layer.fill.set", set(json!({"color": v})));
                         }
@@ -2179,7 +2183,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                             set(json!({"procedural": pattern.kind.label(), "scale": s, "contrast": con, "seed": seed as u64, "low": low, "high": high, "merge": merge})),
                         );
                     }
-                    if c.kind() == ChannelKind::Color {
+                    if matches!(c.kind(), ChannelKind::Color | ChannelKind::Data) {
                         let (mut lo, mut hi) = (low, high);
                         let mut changed = false;
                         ui.horizontal(|ui| {

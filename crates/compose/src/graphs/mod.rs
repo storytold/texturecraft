@@ -151,11 +151,12 @@ pub fn at_texel(img: &TileImage, x: u32, y: u32, size: (u32, u32)) -> [f32; 4] {
 }
 
 /// A graph's value as channel `kind` holds it. Colour: the graph's display (sRGB) values made linear, unless the output
-/// is declared linear. Height: the graph's 0..1 over the signed −1..1, 0.5 the flat surface. Normal: green flipped (a
+/// is declared linear. Data (user channels): as the graph gives it. Height: the graph's 0..1 over the signed −1..1, 0.5 the flat surface. Normal: green flipped (a
 /// graph's normals point green down) and blue rebuilt from red and green as a unit normal's.
 pub fn graph_to_channel(kind: ChannelKind, v: [f32; 4], linear: bool) -> [f32; 3] {
     match kind {
         ChannelKind::Color if linear => [v[0], v[1], v[2]],
+        ChannelKind::Data => [v[0], v[1], v[2]],
         ChannelKind::Color => [srgb_to_linear(v[0]), srgb_to_linear(v[1]), srgb_to_linear(v[2])],
         ChannelKind::Signed => [2.0 * v[0] - 1.0; 3],
         ChannelKind::NormalMap => {
@@ -170,6 +171,7 @@ pub fn graph_to_channel(kind: ChannelKind, v: [f32; 4], linear: bool) -> [f32; 3
 pub fn channel_to_graph(kind: ChannelKind, v: [f32; 3], linear: bool) -> [f32; 3] {
     match kind {
         ChannelKind::Color if linear => v,
+        ChannelKind::Data => v,
         ChannelKind::Color => v.map(linear_to_srgb),
         ChannelKind::Signed => [(v[0] + 1.0) * 0.5; 3],
         ChannelKind::NormalMap => [v[0], 1.0 - v[1], v[2]],

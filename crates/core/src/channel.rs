@@ -39,6 +39,16 @@ pub enum Channel {
     Transmission,
     /// Tangent-space normal of the clear coat (relative to the mesh normal).
     CoatNormal,
+    /// User channels: free three-component data the shader does not read (masks, packed maps for
+    /// other engines). A set may name them ([`crate::TextureSet::channel_names`]).
+    User0,
+    User1,
+    User2,
+    User3,
+    User4,
+    User5,
+    User6,
+    User7,
 }
 
 /// How a channel's values are stored and interpreted.
@@ -52,10 +62,13 @@ pub enum ChannelKind {
     Scalar,
     /// A signed scalar (height).
     Signed,
+    /// Linear three-component data (user channels): composited, displayed and exported as stored,
+    /// with no color encoding.
+    Data,
 }
 
 impl Channel {
-    pub const ALL: [Channel; 21] = [
+    pub const ALL: [Channel; 29] = [
         Channel::BaseColor,
         Channel::Metallic,
         Channel::Roughness,
@@ -77,7 +90,29 @@ impl Channel {
         Channel::ScatterWeight,
         Channel::Transmission,
         Channel::CoatNormal,
+        Channel::User0,
+        Channel::User1,
+        Channel::User2,
+        Channel::User3,
+        Channel::User4,
+        Channel::User5,
+        Channel::User6,
+        Channel::User7,
     ];
+
+    /// The user channels, in order (`user0` … `user7`).
+    pub const USER: [Channel; 8] =
+        [Channel::User0, Channel::User1, Channel::User2, Channel::User3, Channel::User4, Channel::User5, Channel::User6, Channel::User7];
+
+    /// User channel `n` (0..8).
+    pub fn user(n: usize) -> Option<Channel> {
+        Channel::USER.get(n).copied()
+    }
+
+    /// The number of a user channel (`None` for the others).
+    pub fn user_index(self) -> Option<usize> {
+        Channel::USER.iter().position(|c| *c == self)
+    }
 
     /// The extra shading lobes (clear coat, sheen, anisotropy, subsurface scattering,
     /// transmission). Their defaults switch the lobes off, so a set without them shades exactly
@@ -103,14 +138,17 @@ impl Channel {
             Channel::BaseColor | Channel::Emissive | Channel::Specular | Channel::SheenColor => ChannelKind::Color,
             Channel::Normal | Channel::CoatNormal => ChannelKind::NormalMap,
             Channel::Height => ChannelKind::Signed,
+            Channel::User0 | Channel::User1 | Channel::User2 | Channel::User3 | Channel::User4 | Channel::User5 | Channel::User6 | Channel::User7 => {
+                ChannelKind::Data
+            }
             _ => ChannelKind::Scalar,
         }
     }
 
-    /// Value components (without coverage): 3 for colors and normals, 1 for scalars.
+    /// Value components (without coverage): 3 for colors, normals and user data, 1 for scalars.
     pub fn components(self) -> usize {
         match self.kind() {
-            ChannelKind::Color | ChannelKind::NormalMap => 3,
+            ChannelKind::Color | ChannelKind::NormalMap | ChannelKind::Data => 3,
             ChannelKind::Scalar | ChannelKind::Signed => 1,
         }
     }
@@ -135,6 +173,8 @@ impl Channel {
             Channel::SpecularLevel | Channel::Glossiness => [0.5; 3],
             // F0 of a common dielectric (4 %).
             Channel::Specular => [0.04; 3],
+            // White, as the reference app shows a user channel no layer covers.
+            Channel::User0 | Channel::User1 | Channel::User2 | Channel::User3 | Channel::User4 | Channel::User5 | Channel::User6 | Channel::User7 => [1.0; 3],
         }
     }
 
@@ -161,6 +201,14 @@ impl Channel {
             Channel::ScatterWeight => "Scattering weight",
             Channel::Transmission => "Transmission",
             Channel::CoatNormal => "Coat normal",
+            Channel::User0 => "User 0",
+            Channel::User1 => "User 1",
+            Channel::User2 => "User 2",
+            Channel::User3 => "User 3",
+            Channel::User4 => "User 4",
+            Channel::User5 => "User 5",
+            Channel::User6 => "User 6",
+            Channel::User7 => "User 7",
         }
     }
 
@@ -188,6 +236,14 @@ impl Channel {
             Channel::ScatterWeight => "scatter",
             Channel::Transmission => "transm",
             Channel::CoatNormal => "coat nrm",
+            Channel::User0 => "user 0",
+            Channel::User1 => "user 1",
+            Channel::User2 => "user 2",
+            Channel::User3 => "user 3",
+            Channel::User4 => "user 4",
+            Channel::User5 => "user 5",
+            Channel::User6 => "user 6",
+            Channel::User7 => "user 7",
         }
     }
 
@@ -215,6 +271,14 @@ impl Channel {
             Channel::ScatterWeight => "scatterWeight",
             Channel::Transmission => "transmission",
             Channel::CoatNormal => "coatNormal",
+            Channel::User0 => "user0",
+            Channel::User1 => "user1",
+            Channel::User2 => "user2",
+            Channel::User3 => "user3",
+            Channel::User4 => "user4",
+            Channel::User5 => "user5",
+            Channel::User6 => "user6",
+            Channel::User7 => "user7",
         }
     }
 
@@ -251,6 +315,7 @@ impl ChannelFormat {
             ChannelKind::NormalMap => ChannelFormat::Rgb16F,
             ChannelKind::Scalar => ChannelFormat::L8,
             ChannelKind::Signed => ChannelFormat::L16F,
+            ChannelKind::Data => ChannelFormat::Rgb8,
         }
     }
     pub fn label(self) -> &'static str {
@@ -302,6 +367,24 @@ mod tests {
         }
         assert_eq!(Channel::parse("sheen color"), Some(Channel::SheenColor));
         assert_eq!(Channel::parse("coatWeight"), Some(Channel::CoatWeight));
+    }
+
+    #[test]
+    fn user_channels_are_white_linear_data() {
+        assert_eq!(Channel::USER.len(), 8);
+        for (n, c) in Channel::USER.into_iter().enumerate() {
+            assert_eq!((Channel::user(n), c.user_index()), (Some(c), Some(n)));
+            assert_eq!(c.id(), format!("user{n}"));
+            assert_eq!((c.kind(), c.components(), c.default_value()), (ChannelKind::Data, 3, [1.0; 3]));
+            assert!(Channel::ALL.contains(&c));
+        }
+        assert_eq!((Channel::user(8), Channel::BaseColor.user_index()), (None, None));
+        assert_eq!(Channel::parse("User 3"), Some(Channel::User3));
+        assert_eq!(ChannelFormat::default_for(Channel::User0), ChannelFormat::Rgb8);
+        // old files never name them; new ones round-trip as plain strings (also as map keys)
+        let json = serde_json::to_string(&std::collections::BTreeMap::from([(Channel::User5, 1)])).unwrap();
+        assert_eq!(json, r#"{"User5":1}"#);
+        assert_eq!(serde_json::from_str::<Channel>(r#""User5""#).unwrap(), Channel::User5);
     }
 
     #[test]

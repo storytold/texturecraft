@@ -72,6 +72,10 @@ pub struct TextureSet {
     /// than the atlas block fills the block's top-left corner (see [`TextureSet::to_atlas`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tile_resolutions: BTreeMap<u32, u32>,
+    /// Names the set gives its channels (user channels: what they hold); a channel without one
+    /// shows its [`Channel::label`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub channel_names: BTreeMap<Channel, String>,
 }
 
 /// Smallest and largest texture set (and UV tile) resolutions.
@@ -164,7 +168,13 @@ impl TextureSet {
             uv_tiles: Vec::new(),
             bake_excluded_tiles: BTreeSet::new(),
             tile_resolutions: BTreeMap::new(),
+            channel_names: BTreeMap::new(),
         }
+    }
+
+    /// The name the set shows for `channel`: its own name for it, else the channel's label.
+    pub fn channel_label(&self, channel: Channel) -> &str {
+        self.channel_names.get(&channel).map_or(channel.label(), String::as_str)
     }
 
     /// The atlas grid of a UV-tiled set (None for a classic set).

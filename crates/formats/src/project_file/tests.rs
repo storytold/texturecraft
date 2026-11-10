@@ -194,6 +194,26 @@ fn tiles_are_validated_against_the_texture_set() {
 }
 
 #[test]
+fn user_channels_round_trip_with_their_names_and_pixels() {
+    let mut s = sample();
+    let plain = String::from_utf8_lossy(&serde_json::to_vec(&s.pf.project).unwrap()).to_string();
+    assert!(!plain.contains("channel_names"), "files without named channels look as before");
+    let set = &mut s.pf.project.texture_sets[0];
+    set.channels.push((Channel::User3, texturecraft_core::ChannelFormat::L16));
+    set.channel_names.insert(Channel::User3, "Wetness".into());
+    if let Some(layer) = s.pf.project.layers.get_mut(&s.paint) {
+        layer.channels.insert(Channel::User3, Default::default());
+    }
+    s.pf.pixels.layer_mut(s.paint, Channel::User3, (128, 128)).set(5, 6, &[100, 200, 300, 65535]);
+    let back = load_project_bytes(&save_project_bytes(&s.pf).unwrap()).unwrap();
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+    assert_same(&s.pf, &back);
+    assert_eq!(back.project.texture_sets[0].channel_label(Channel::User3), "Wetness");
+    assert_eq!(back.project.texture_sets[0].channel_label(Channel::User4), "User 4");
+    assert_eq!(back.pixels.layer(s.paint, Channel::User3).unwrap().get(5, 6), [100, 200, 300, 65535]);
+}
+
+#[test]
 fn uv_tiled_sets_round_trip_their_atlas_pixels_and_bakes() {
     let mut s = sample();
     s.pf.project.texture_sets[0].uv_tiles = vec![1001, 1002];

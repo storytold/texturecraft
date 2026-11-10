@@ -1614,7 +1614,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                     ChannelKind::Color if image.srgb => rgb.map(texturecraft_texel::srgb_to_linear),
                     // Normal channels are OpenGL (+Y up the image): a DirectX image's green flips
                     ChannelKind::NormalMap if *normal_format == NormalFormat::DirectX => [rgb[0], 1.0 - rgb[1], rgb[2]],
-                    ChannelKind::Color | ChannelKind::NormalMap => rgb,
+                    ChannelKind::Color | ChannelKind::NormalMap | ChannelKind::Data => rgb,
                     // A one-value channel or mask reads the image's gray, so a color image works as a mask
                     ChannelKind::Scalar => [lum(rgb); 3],
                     ChannelKind::Signed => [lum(rgb) * 2.0 - 1.0; 3],
@@ -1624,7 +1624,8 @@ impl<'a, 'b> Texel<'a, 'b> {
                 // An anchor not evaluated yet (above this layer, hidden) reads the channel default
                 let anchored = self.anchors.iter().rev().find(|(id, _)| id == anchor).and_then(|(_, values)| values.get(channel.index()).copied());
                 let value = anchored.unwrap_or_else(|| channel.default_value());
-                let gray = matches!(channel.kind(), ChannelKind::Color | ChannelKind::NormalMap) && matches!(kind, ChannelKind::Scalar | ChannelKind::Signed);
+                let gray = matches!(channel.kind(), ChannelKind::Color | ChannelKind::NormalMap | ChannelKind::Data)
+                    && matches!(kind, ChannelKind::Scalar | ChannelKind::Signed);
                 if gray { [lum(value); 3] } else { value }
             }
         }
@@ -2639,7 +2640,7 @@ pub fn effect_histogram(inp: &Inputs, effect: LayerId, channel: Channel, bins: u
                 {
                     // As levels reads them (`per_unit`); normal maps pass through levels unchanged.
                     let (vals, signed) = match c.kind {
-                        ChannelKind::Color => (&v[..], false),
+                        ChannelKind::Color | ChannelKind::Data => (&v[..], false),
                         ChannelKind::Scalar => (&v[..1], false),
                         ChannelKind::Signed => (&v[..1], true),
                         ChannelKind::NormalMap => (&v[..0], false),
