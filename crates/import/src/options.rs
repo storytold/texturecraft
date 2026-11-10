@@ -20,10 +20,20 @@ pub struct ImportOptions {
     /// Replays brush strokes with the replayer the import is given ([`crate::Hooks::replay`]); on by default. Off, or
     /// without a replayer, strokes stay placeholders and their pixels only in the original's stored result.
     pub replay_strokes: bool,
+    /// Runs the project's compiled graphs, decompiled ([`crate::GraphMode::Decompile`], the default), or keeps every use
+    /// a locked placeholder.
+    pub graphs: crate::GraphMode,
 }
 
 impl Default for ImportOptions {
     fn default() -> Self {
-        ImportOptions { original_on_top: false, native_filters: false, measure: true, max_resolution: None, replay_strokes: true }
+        ImportOptions {
+            original_on_top: false,
+            native_filters: false,
+            measure: true,
+            max_resolution: None,
+            replay_strokes: true,
+            graphs: crate::GraphMode::Decompile,
+        }
     }
 }

@@ -41,7 +41,7 @@ USAGE:
       sample's mesh maps are baked at the resolution up to 1024 px (most of the file's size),
       so a 2048 sample project is as large as a 1024 one.
   texturecraft-cli import <project file> <out.tcraft> [--original-on-top] [--native-filters]
-                   [--max-resolution <px>] [--no-measure]
+                   [--max-resolution <px>] [--no-measure] [--no-replay] [--graphs decompile|keep]
       Convert a project file of the reference app (one-way; the original is only read) and save
       it; prints what the import found per texture set (file.importProject).
   texturecraft-cli graph <graph.tcgraph> <out dir> [--size <px>] [--output <name>]... [--seed <n>]
@@ -72,7 +72,7 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("export", &["--preset", "--format", "--padding", "--size"], &[]),
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
     ("new", &["--resolution"], &["--sample"]),
-    ("import", &["--max-resolution"], &["--original-on-top", "--native-filters", "--no-measure"]),
+    ("import", &["--max-resolution", "--graphs"], &["--original-on-top", "--native-filters", "--no-measure", "--no-replay"]),
     ("graph", &["--size", "--output", "--seed", "--param", "--depth", "--timeout"], &[]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
     ("serve", &["--port", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
@@ -297,6 +297,12 @@ fn import(a: &Args) -> R {
     if let Some(r) = a.num::<u32>("--max-resolution")? {
         p["maxResolution"] = json!(r);
     }
+    if let Some(g) = a.get("--graphs") {
+        p["graphs"] = json!(g);
+    }
+    if a.has("--no-replay") {
+        p["replayStrokes"] = json!(false);
+    }
     let mut h = open("builtin:cube", Some(128))?;
     let reply = h.command_run("file.importProject", p).map_err(s)?;
     print_json(&json!({"file": input, "import": reply.get("import").cloned().unwrap_or(Value::Null)}))?;
@@ -356,6 +362,10 @@ fn export(a: &Args) -> R {
     }
     for f in r["files"].as_array().into_iter().flatten() {
         println!("{}", f.as_str().unwrap_or_default());
+    }
+    // what the composites cost in graph renders (none for a project whose stored cooks still match)
+    if let Ok(i) = h.command_run("project.inspect", json!({})) {
+        eprintln!("graphs: {}", i["graphs"]);
     }
     Ok(())
 }

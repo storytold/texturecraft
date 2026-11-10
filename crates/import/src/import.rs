@@ -22,6 +22,7 @@ use texturecraft_import_reader::project::{ProjectFile, paths};
 
 use crate::channels::{self, ChannelConfidence, SetChannels, uncovered_default};
 use crate::error::ImportError;
+use crate::graph_library::GraphLibrary;
 use crate::image::Rgba;
 use crate::layers::{self, ImportedStack, SetInput};
 use crate::options::ImportOptions;
@@ -181,6 +182,16 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
             );
         }
     }
+    let library = match options.graphs {
+        crate::GraphMode::Decompile => {
+            (hooks.progress)(0.08, "decompiling graphs");
+            Some(GraphLibrary::from_project(file))
+        }
+        crate::GraphMode::Keep => None,
+    };
+    if let Some(lib) = &library {
+        report.add("compiled graphs", Fidelity::Approximated, format!("{} decompiled and run by TextureCraft's graph runtime", lib.len()));
+    }
     let count = binding.sets.len();
     for (i, source) in binding.sets.iter().enumerate() {
         hooks.check()?;
@@ -197,6 +208,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
             bake: bake_ini.as_ref(),
             cache: &cache_entries,
             hooks: &*hooks,
+            graphs: library.as_ref(),
         };
         let summary = build_set(&ctx, &mut project, &mut imported, &mut report)?;
         imported.sets.push(summary);
@@ -244,6 +256,7 @@ struct SetContext<'a, 'h> {
     bake: Option<&'a ProjectBakeSettings>,
     cache: &'a [texturecraft_import_reader::project::CacheEntryRef],
     hooks: &'a Hooks<'h>,
+    graphs: Option<&'a GraphLibrary>,
 }
 
 /// Builds one texture set into `project` and `out`.
@@ -357,7 +370,15 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let mut stack = match ctx.project_set {
         Some(project_set) => {
             let replay = ctx.options.replay_strokes && ctx.hooks.replay.is_some();
-            let input = SetInput { channels: &declared, images: ctx.images, mesh_maps: &project_set.mesh_maps, parts: &parts, options: ctx.options, replay };
+            let input = SetInput {
+                channels: &declared,
+                images: ctx.images,
+                mesh_maps: &project_set.mesh_maps,
+                parts: &parts,
+                options: ctx.options,
+                replay,
+                graphs: ctx.graphs,
+            };
             Some(layers::import(project_set, &input, project.next_id))
         }
         None => {
@@ -404,14 +425,29 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     if defaults_id.is_some() {
         report.add(item(DEFAULTS_LAYER_NAME), Fidelity::Approximated, "uncovered texels show the original's channel defaults (uniform fill layer)");
     }
-    // the safety net
+    // the texts of the graphs the stack runs
+    if let (Some(lib), Some(s)) = (ctx.graphs, &stack) {
+        for key in s.layers.iter().flat_map(|l| l.graphs()).flat_map(|g| g.text_keys()) {
+            if let Some(text) = lib.text(key) {
+                out.graphs.texts.entry(key.to_string()).or_insert(text);
+            }
+        }
+    }
+    // the safety net; the composite also cooks every graph of the set once, for every channel, so that the project
+    // opens without rendering them
     let cache_channels: Vec<Channel> = cache.iter().map(|(c, _)| *c).collect();
     let mut scores = Vec::new();
-    if ctx.options.measure && !cache.is_empty() && stack.is_some() {
+    let measuring = ctx.options.measure && !cache.is_empty() && stack.is_some();
+    let cooking = stack.as_ref().is_some_and(|s| s.layers.iter().any(|l| !l.graphs().is_empty()));
+    if measuring || cooking {
         ctx.hooks.check()?;
         let store: ImageStore = ctx.images.store();
         let scene = SetScene { project, ts, mesh: ctx.mesh, pixels: &out.pixels, baked: &baked, images: &store, graphs: &out.graphs };
-        if let Some((composite, gbuf)) = safety_net::composite(&scene, &cache_channels) {
+        let mut channels = cache_channels.clone();
+        if cooking {
+            channels.extend(project.texture_set(ts).map(|s| s.channel_list()).unwrap_or_default().into_iter().filter(|c| !cache_channels.contains(c)));
+        }
+        if let Some((composite, gbuf)) = safety_net::composite(&scene, &channels).filter(|_| measuring) {
             for (c, img) in &cache {
                 scores.push((*c, safety_net::score(&composite, &gbuf, *c, img, uncovered_default(*c, shader_model))));
             }

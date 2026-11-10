@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use texturecraft_core::{BakedMap, Channel, ChannelKind, GraphInput, GraphRef, LayerId, MAX_GRAPH_NESTING, StableHash};
 use texturecraft_graph::context::{Cancel, EvalContext, Files};
 use texturecraft_graph::graph::Graph;
+pub use texturecraft_graph::graph::Graph as RuntimeGraph;
 use texturecraft_graph::rayon::ThreadPool;
 pub use texturecraft_graph::tex::Tex;
 use texturecraft_texel::{TILE, TileImage, from_u16, linear_to_srgb, srgb_to_linear, to_u16};
@@ -507,10 +508,7 @@ impl GraphStore {
     fn render(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)], depth: usize) -> Result<Cooked, String> {
         let side = env.side;
         let mut graph = (*self.parsed(&g.key)?).clone();
-        for (name, value) in &g.params {
-            // a value for a parameter the graph does not have changes nothing
-            let _ = graph.set_param(name, &value.lanes());
-        }
+        apply_values(&mut graph, &g.params);
         graph.seed_offset = g.seed;
         let have = graph.output_idents();
         let mut names: Vec<&str> = g.rendered().into_iter().filter(|n| have.iter().any(|h| h == n)).collect();
@@ -554,6 +552,29 @@ impl GraphStore {
         let linear: BTreeSet<String> =
             graph.meta.get("working").map(|w| w.trim_matches('"').split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
         Ok(Cooked::from_textures(outs, linear))
+    }
+}
+
+/// Sets the graph's parameters to `values`. A parameter is every `input_value` node of its name, set to the value as it
+/// is stored, whatever range a slider exposing it offers (a decompiled graph exposes each parameter with its slider
+/// range, and files hold values outside it); a graph without such nodes takes it through its exposed parameter of that
+/// label. A value for a parameter the graph does not have changes nothing.
+pub fn apply_values(graph: &mut Graph, values: &BTreeMap<String, texturecraft_core::GraphValue>) {
+    for (name, value) in values {
+        let lanes = value.lanes();
+        let mut found = false;
+        for n in graph.nodes.values_mut().filter(|n| n.kind == "input_value" && n.strs.get("name").is_some_and(|s| s == name)) {
+            found = true;
+            if let Some(v) = lanes.first() {
+                n.nums.insert("v".to_string(), *v);
+            }
+            for (lane, v) in ["x", "y", "z", "w"].iter().zip(&lanes) {
+                n.nums.insert((*lane).to_string(), *v);
+            }
+        }
+        if !found {
+            let _ = graph.set_param(name, &lanes);
+        }
     }
 }
 

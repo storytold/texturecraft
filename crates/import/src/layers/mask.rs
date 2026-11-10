@@ -144,7 +144,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 }
                 let blocker = match self.input.replay {
                     false => Blocker::new(BlockerKey::new(BlockerKind::Strokes, "painted-mask"), "painted mask (strokes)"),
-                    true => match crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images) {
+                    true => match crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images, self.input.graphs) {
                         Ok(step) => {
                             self.push(header, EffectKind::Paint, on);
                             let id = self.effects.last().map_or(texturecraft_core::LayerId(0), |e| e.id);
@@ -200,7 +200,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                     self.push(header, EffectKind::Filter(filter), on);
                     return;
                 }
-                self.graph_use(&f.header, graph_uses::filter(f, true), on);
+                self.graph_use(&f.header, graph_uses::filter(self.input, self.anchors, f, None), on);
             }
             ProjectEffect::Levels(l) => {
                 let (ours, status) = levels(l.levels.as_ref());
@@ -243,7 +243,13 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 self.push(Some(&fill.header), EffectKind::Fill { source: Source::Uniform([v; 3]), projection }, on);
             }
             ProjectSource::Bitmap(b) => self.bitmap(fill, b, counts, on, mapped),
-            ProjectSource::Procedural(p) => self.graph_use(&fill.header, graph_uses::mask_generator(p), on),
+            ProjectSource::Procedural(p) => {
+                let g = graph_uses::mask_generator(self.input, self.anchors, p, projection);
+                if g.status.is_computable() {
+                    self.note(counts, &mapped.status);
+                }
+                self.graph_use(&fill.header, g, on);
+            }
             ProjectSource::Reference(r) if is_dangling(r) => {
                 // changes nothing, as if hidden
                 self.placeholder(Some(&fill.header), "reference (no anchor)", "the reference reads no anchor", false, Status::Exact);

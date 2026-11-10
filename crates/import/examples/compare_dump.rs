@@ -42,7 +42,8 @@ fn main() {
     for (ts, set) in imported.project.texture_sets.iter().enumerate() {
         let channels: Vec<Channel> = set.channel_list();
         let Some(baked) = imported.baked.get(&ts) else { continue };
-        let scene = SetScene { project: &imported.project, ts, mesh: &imported.mesh, pixels: &imported.pixels, baked, images: &images };
+        let scene =
+            SetScene { project: &imported.project, ts, mesh: &imported.mesh, pixels: &imported.pixels, baked, images: &images, graphs: &imported.graphs };
         let Some((ours, gbuf)) = composite(&scene, &channels) else { continue };
         for c in channels {
             let base = format!("{dir}/{}_{}", set.name, dump_id(c));

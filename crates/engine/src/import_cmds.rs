@@ -24,7 +24,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Import project...",
         [],
         None,
-        "{path?: the project file (native only), bytes?: the project file as base64 (any target), name?: file name for the report (with bytes), originalOnTop?: bool (show the original's stored result on top of stacks that are not reproduced; default false), nativeFilters?: bool (replace a few filter graphs by close built-in filters; default false), maxResolution?: px (cap texture set resolutions), measure?: bool (compare each stack with the stored result; default true), replayStrokes?: bool (replay brush strokes with TextureCraft's brush, approximated; default true)} → the session, plus {import: {sets: [{name, strategy, layers, locked, placeholders, channels, scores}]}}. One-way: the original file is only read",
+        "{path?: the project file (native only), bytes?: the project file as base64 (any target), name?: file name for the report (with bytes), originalOnTop?: bool (show the original's stored result on top of stacks that are not reproduced; default false), nativeFilters?: bool (replace a few filter graphs by close built-in filters; default false), maxResolution?: px (cap texture set resolutions), measure?: bool (compare each stack with the stored result; default true), replayStrokes?: bool (replay brush strokes with TextureCraft's brush, approximated; default true), graphs?: \"decompile\" | \"keep\" (run the project's compiled graphs decompiled, or keep them as locked placeholders; default decompile)} → the session, plus {import: {sets: [{name, strategy, layers, locked, placeholders, channels, scores}]}}. One-way: the original file is only read",
         always,
         import
     )]
@@ -44,6 +44,12 @@ fn options(p: &Value) -> Result<ImportOptions> {
     }
     if let Some(v) = boolp(p, "replayStrokes") {
         o.replay_strokes = v;
+    }
+    match p.get("graphs").filter(|v| !v.is_null()).map(|v| v.as_str()) {
+        None => {}
+        Some(Some("decompile")) => o.graphs = texturecraft_import::GraphMode::Decompile,
+        Some(Some("keep")) => o.graphs = texturecraft_import::GraphMode::Keep,
+        Some(_) => return Err(bad(ID, "`graphs` must be \"decompile\" or \"keep\"")),
     }
     if let Some(r) = p.get("maxResolution").filter(|v| !v.is_null()) {
         let r = r.as_u64().and_then(|r| u32::try_from(r).ok()).filter(|r| r.is_power_of_two() && (128..=8192).contains(r));

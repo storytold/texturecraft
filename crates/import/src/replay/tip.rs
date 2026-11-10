@@ -5,8 +5,8 @@
 //! - The older round shape (`shape`): a smoothstep from 1 at 0.2 of the radius to 0 at the rim, divided by
 //!   `1 − hardness` and cut at 1 (measured); drawn as an image.
 //! - A bitmap alpha: its red × alpha, as an image. A uniform alpha: a full square of its value.
-//! - Any other alpha is a compiled graph: [`graph_tip`] is where its render plugs in; until graphs are computed it is a
-//!   `brush-alpha:<graph>` blocker.
+//! - Any other alpha is a compiled graph: [`graph_tip`] renders its grey output with its tweaks at [`TIP_SIDE`] from the
+//!   project's decompiled graphs; without them it is a `brush-alpha:<graph>` blocker.
 
 use std::sync::Arc;
 
@@ -15,6 +15,7 @@ use texturecraft_import_reader::model::{Procedural, ProjectSource, Tweak, TweakV
 
 use super::ReplayTip;
 use super::brush::refused;
+use crate::graph_library::GraphLibrary;
 use crate::resources::ProjectImages;
 
 /// Side of a drawn tip image.
@@ -28,7 +29,7 @@ const ROUND_SHAPE: &str = "shape_v2";
 const OLD_ROUND_SHAPE: &str = "shape";
 
 /// The tip of `alpha` (the first entry is the alpha) and a note when it is approximated; or why it cannot be had.
-pub fn tip(alpha: &[ProjectSource], images: &ProjectImages) -> Result<(ReplayTip, Option<String>), Blocker> {
+pub fn tip(alpha: &[ProjectSource], images: &ProjectImages, graphs: Option<&GraphLibrary>) -> Result<(ReplayTip, Option<String>), Blocker> {
     match alpha.first() {
         // no alpha: the older round shape, soft
         None => Ok((old_round(0.0), None)),
@@ -37,7 +38,12 @@ pub fn tip(alpha: &[ProjectSource], images: &ProjectImages) -> Result<(ReplayTip
             match (q.name(), round_hardness(&q.tweaks)) {
                 (ROUND_SHAPE, Some(h)) => Ok((ReplayTip::Round { hardness: h }, None)),
                 (OLD_ROUND_SHAPE, Some(h)) => Ok((old_round(h), None)),
-                _ => graph_tip(q).map(|t| (t, None)),
+                _ => {
+                    let tip = graph_tip(q, graphs)?;
+                    // a dynamic alpha cycles through stamps; rendered once, every dab takes the first
+                    let note = (p.stamp_cycle > 1).then(|| format!("brush alpha \"{}\" rendered once (its {} stamps do not cycle)", q.name(), p.stamp_cycle));
+                    Ok((tip, note))
+                }
             }
         }
         Some(ProjectSource::Bitmap(b)) => {
@@ -53,11 +59,14 @@ pub fn tip(alpha: &[ProjectSource], images: &ProjectImages) -> Result<(ReplayTip
     }
 }
 
-/// The tip a compiled-graph alpha renders. The one place a graph's render plugs in (its output read as grey, rendered
-/// with the graph's own tweaks at [`TIP_SIDE`]); compiled graphs are not computed yet, so this is the graph's blocker.
-pub fn graph_tip(graph: &Procedural) -> Result<ReplayTip, Blocker> {
+/// The tip a compiled-graph alpha renders: its grey output with the graph's own tweaks at [`TIP_SIDE`]. Without the
+/// project's graphs decompiled, or when the graph does not render, the graph's blocker.
+pub fn graph_tip(graph: &Procedural, graphs: Option<&GraphLibrary>) -> Result<ReplayTip, Blocker> {
     let name = graph.name();
-    Err(Blocker::new(BlockerKey::new(BlockerKind::BrushAlpha, name), format!("brush alpha \"{name}\" is a compiled graph (not computed yet)")))
+    let blocked = |why: &str| Blocker::new(BlockerKey::new(BlockerKind::BrushAlpha, name), format!("brush alpha \"{name}\" {why}"));
+    let lib = graphs.ok_or_else(|| blocked("is a compiled graph (graphs are kept as placeholders)"))?;
+    let values = crate::graph_uses::render_grey(lib, graph, TIP_SIDE).ok_or_else(|| blocked("is a compiled graph that does not render"))?;
+    Ok(ReplayTip::Image { width: TIP_SIDE, height: TIP_SIDE, values: Arc::from(values) })
 }
 
 /// The hardness of a round shape with no other setting away from its default; `None` for any other shape.

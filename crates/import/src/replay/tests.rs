@@ -89,7 +89,7 @@ fn effect(tool: PaintTool) -> PaintEffect {
 }
 
 fn of(e: &PaintEffect, target: StepTarget) -> Result<ReplayStep, texturecraft_import_reader::blockers::Blocker> {
-    step(e, target, &channels(), &ProjectImages::none())
+    step(e, target, &channels(), &ProjectImages::none(), None)
 }
 
 #[test]

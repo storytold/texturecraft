@@ -79,10 +79,16 @@ pub fn check(effect: &PaintEffect) -> Result<(), Blocker> {
 }
 
 /// `effect` as a step painting into `target`, the declared `channels` of the set; or why it cannot be replayed.
-pub fn step(effect: &PaintEffect, target: StepTarget, channels: &SetChannels, images: &ProjectImages) -> Result<ReplayStep, Blocker> {
+pub fn step(
+    effect: &PaintEffect,
+    target: StepTarget,
+    channels: &SetChannels,
+    images: &ProjectImages,
+    graphs: Option<&crate::graph_library::GraphLibrary>,
+) -> Result<ReplayStep, Blocker> {
     check(effect)?;
     let mut notes = Vec::new();
-    let (tip, tip_note) = tip::tip(&effect.alpha, images)?;
+    let (tip, tip_note) = tip::tip(&effect.alpha, images, graphs)?;
     notes.extend(tip_note);
     let brush = map_brush(effect, tip, &mut notes);
     let (mode, values, mask_value) = values(effect, target, channels)?;

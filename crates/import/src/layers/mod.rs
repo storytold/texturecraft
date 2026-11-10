@@ -42,6 +42,8 @@ pub struct SetInput<'a> {
     /// Whether strokes are replayed (the import has a replayer and the options ask for it): painted masks and brush
     /// work become replay jobs instead of placeholders.
     pub replay: bool,
+    /// The project's graphs, decompiled; `None` keeps graph uses placeholders.
+    pub graphs: Option<&'a crate::graph_library::GraphLibrary>,
 }
 
 /// One anchor of the set: the effect id it became, whether it sits in a mask, and how exactly what it holds is

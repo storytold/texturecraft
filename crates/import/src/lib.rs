@@ -5,7 +5,8 @@
 //! - [`import`]: the entry points ([`import_bytes`], [`import_path`]) and the per-set build.
 //! - [`sets`], [`mesh`], [`channels`], [`blend`], [`baked`], [`bake_settings`], [`cameras`]: the mapping tables.
 //! - [`layers`]: the layer tree, content, masks, projections and geometry masks.
-//! - [`graph_uses`]: every use of a compiled graph; placeholders until graphs are computed.
+//! - [`graph_library`], [`graph_uses`]: the project's compiled graphs decompiled, and every use of one as a graph
+//!   source or effect (a placeholder where it cannot run).
 //! - [`replay`]: brush strokes handed to a [`replay::StrokeReplayer`] (the engine's brush) as replay jobs.
 //! - [`safety_net`]: each stack composited by TextureCraft's compositor and compared with the original's stored result.
 //!
@@ -21,6 +22,7 @@ pub mod blend;
 pub mod cameras;
 pub mod channels;
 pub mod error;
+pub mod graph_library;
 pub mod graph_uses;
 pub mod image;
 pub mod import;
@@ -34,6 +36,7 @@ pub mod sets;
 pub mod status;
 
 pub use error::{ImportError, PartError};
+pub use graph_uses::GraphMode;
 #[cfg(not(target_arch = "wasm32"))]
 pub use import::import_path;
 pub use import::{DEFAULTS_LAYER_NAME, Hooks, IMPORTER, Imported, SetSummary, import_bytes};

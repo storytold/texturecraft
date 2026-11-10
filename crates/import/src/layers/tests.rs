@@ -117,7 +117,7 @@ fn build(layers: Vec<ProjectLayer>) -> ImportedStack {
     let images = ProjectImages::none();
     let options = ImportOptions::default();
     let parts = ["Body".to_string(), "Eyes".to_string()];
-    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: false };
+    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: false, graphs: None };
     import(&set(layers), &input, 10)
 }
 
@@ -308,7 +308,7 @@ fn build_replaying(layers: Vec<ProjectLayer>) -> ImportedStack {
     let images = ProjectImages::none();
     let options = ImportOptions::default();
     let parts = ["Body".to_string()];
-    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: true };
+    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: true, graphs: None };
     import(&set(layers), &input, 10)
 }
 

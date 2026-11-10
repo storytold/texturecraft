@@ -69,8 +69,10 @@ pub struct ContentMapper<'a, 'i> {
 struct FillParts {
     /// Sources by blend: one group per distinct mode and opacity.
     groups: Vec<(ResolvedBlend, BTreeMap<Channel, Source>)>,
-    /// Compiled graphs with the channels they write.
+    /// Compiled graphs that cannot run, with the channels they write.
     graphs: Vec<(GraphUse, Vec<Channel>, ResolvedBlend)>,
+    /// Compiled graphs running as sources of the groups.
+    graph_names: Vec<String>,
     status: BTreeMap<Channel, Status>,
     projection: Projection,
 }
@@ -103,6 +105,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                 if let Some(fill) = as_base(&parts) {
                     kind = LayerKind::Fill(fill);
                     self.note_all(&parts.status);
+                    self.name_graphs(parts.graph_names);
                     rest = after;
                 }
             }
@@ -151,7 +154,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
     /// `p` as a content step, with its own blending folded into the channels' opacity (approximated when it is not
     /// normal).
     fn step(&self, p: &PaintEffect) -> Result<(ReplayStep, Status), Blocker> {
-        let mut step = crate::replay::step(p, StepTarget::Content, self.input.channels, self.input.images)?;
+        let mut step = crate::replay::step(p, StepTarget::Content, self.input.channels, self.input.images, self.input.graphs)?;
         let mut status = Status::Exact;
         for (c, _, opacity) in &mut step.values {
             let blend = ResolvedBlend::of(&p.header.blending, self.input.channels.project_channel(*c), Holder::Layer);
@@ -235,6 +238,14 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
 
     fn note(&mut self, channel: Channel, status: &Status) {
         self.written.entry(channel).or_default().and(status);
+    }
+
+    fn name_graphs(&mut self, names: Vec<String>) {
+        for n in names {
+            if !self.graphs.contains(&n) {
+                self.graphs.push(n);
+            }
+        }
     }
 
     fn note_all(&mut self, statuses: &BTreeMap<Channel, Status>) {
@@ -375,7 +386,8 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                     }
                     return;
                 }
-                self.graph_use(graph_uses::filter(f, false), &channels, blend.as_ref(), on);
+                let g = graph_uses::filter(self.input, self.anchors, f, Some(&channels));
+                self.graph_use(g, &channels, blend.as_ref(), on);
             }
             ProjectEffect::Levels(l) => self.levels(l, on),
             ProjectEffect::ColorSelection(c) => {
@@ -465,6 +477,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         for (g, channels, blend) in parts.graphs {
             self.graph_use(g, &channels, Some(&blend), on);
         }
+        self.name_graphs(parts.graph_names);
         if on {
             self.note_all(&parts.status);
         }
@@ -474,7 +487,8 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
     fn fill_parts(&mut self, fill: &FillEffect) -> FillParts {
         let ch = self.input.channels;
         let mapped = projection::map(fill);
-        let mut parts = FillParts { groups: Vec::new(), graphs: Vec::new(), status: BTreeMap::new(), projection: mapped.projection.clone() };
+        let mut parts =
+            FillParts { groups: Vec::new(), graphs: Vec::new(), graph_names: Vec::new(), status: BTreeMap::new(), projection: mapped.projection.clone() };
         let mut graph_channels: Vec<(usize, Vec<Channel>, ResolvedBlend)> = Vec::new();
         for c in self.writes(&fill.header, Holder::Layer) {
             let pc = ch.project_channel(c);
@@ -540,12 +554,30 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         }
         for (index, channels, blend) in graph_channels {
             let Some(ProjectSource::Procedural(p)) = fill.sources.get(index) else { continue };
-            let names: Vec<String> = channels.iter().map(|c| ch.label(*c)).collect();
-            let g = graph_uses::procedural_fill(p, &names);
-            for c in &channels {
-                parts.status.entry(*c).or_default().and(&g.status);
+            match graph_uses::fill_sources(self.input, self.anchors, p, &channels) {
+                Ok(fg) => {
+                    let mut status = blend.status();
+                    status.and(&mapped.status);
+                    status.and(&fg.status);
+                    // a channel the graph has no output for is not written
+                    for (c, source) in fg.sources {
+                        parts.status.entry(c).or_default().and(&status);
+                        match parts.groups.iter_mut().find(|(b, _)| b.mode() == blend.mode() && b.opacity == blend.opacity) {
+                            Some((_, sources)) => {
+                                sources.insert(c, source);
+                            }
+                            None => parts.groups.push((blend.clone(), BTreeMap::from([(c, source)]))),
+                        }
+                    }
+                    parts.graph_names.push(fg.graph);
+                }
+                Err(g) => {
+                    for c in &channels {
+                        parts.status.entry(*c).or_default().and(&g.status);
+                    }
+                    parts.graphs.push((g, channels, blend));
+                }
             }
-            parts.graphs.push((g, channels, blend));
         }
         parts
     }

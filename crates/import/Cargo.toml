@@ -24,3 +24,4 @@ image = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+texturecraft-graph = { workspace = true }
