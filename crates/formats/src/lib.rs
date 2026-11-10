@@ -35,13 +35,15 @@ pub mod materialx_read;
 pub mod mcmat;
 pub mod mesh_export;
 pub mod mesh_import;
+pub mod pbr_maps;
 pub mod presets;
 pub mod project_file;
+pub mod zip_read;
 
 pub use export::{
     Dest, ExportInput, ExportOptions, ExportPreset, ExportedFile, FileFormat, MapSpec, Padding, PlannedFile, SourceRef, VirtualMap, list_outputs, render_maps,
 };
-pub use image_res::{DecodedImage, coverage_png, decode_image, decode_image_within};
+pub use image_res::{DecodedImage, coverage_png, decode_image, decode_image_within, gray16_png};
 pub use mesh_export::{GlbTextures, NamedFiles, UsdExport, UsdFormat, glb_bytes, glb_export_options, obj_bytes, obj_with_mtl, usd_bytes, usd_export_options};
 pub use mesh_import::{HighPolyMesh, ImportedMesh, MeshFile, MeshReport, import_high_poly_bytes, import_mesh_bytes, mesh_report, self_contained_mesh};
 #[cfg(not(target_arch = "wasm32"))]

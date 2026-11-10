@@ -18,6 +18,7 @@ mod materialx_import;
 mod meshmap_import;
 mod painter_gaps;
 mod path_tool;
+mod pbr_import;
 mod perf;
 mod polygon_fill;
 mod project_recovery;
