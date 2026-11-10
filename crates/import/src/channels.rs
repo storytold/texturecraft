@@ -3,7 +3,12 @@
 //! and [`SetChannels`], the channels one texture set declares seen from both sides.
 //!
 //! Values are kept as TextureCraft holds them: colours linear, scalars as they are, normals packed (`n · 0.5 + 0.5`),
-//! height signed. The file stores uniform values linear too, so they carry over unchanged.
+//! height signed. The file stores uniform values linear too, so colours carry over unchanged; a single-valued
+//! channel shows the mean of the three components the file stores for it.
+//!
+//! Measured in the reference app: a fresh project declared every channel type it offers, one fill gave each channel
+//! its own value, and the saved file, the exports of the filled and of the uncovered channels and an older project
+//! opened there agreed on the identifiers, encodings and uncovered values below.
 
 use texturecraft_core::{Channel, ChannelFormat, ChannelKind};
 use texturecraft_import_reader::model::{ChannelMask, ProjectChannel};
@@ -11,41 +16,64 @@ use texturecraft_import_reader::model::{ChannelMask, ProjectChannel};
 /// How well a channel's mapping is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelConfidence {
-    /// Read off the texture cache of real projects (bits, meaning and defaults).
+    /// Identifier, value encoding and uncovered value measured, and the channel means what TextureCraft's does.
     Measured,
-    /// The bit is named after the outputs that feed it; the meaning matches TextureCraft's channel but was not measured.
+    /// The identifier is measured, but what the original does with the channel differs from TextureCraft's channel
+    /// in some projects (see the table).
     Named,
 }
 
-/// File channel bit, TextureCraft channel, the file's label and how sure the mapping is.
+/// File channel bit (in the older numbering the reader maps every file to), TextureCraft channel, the file's label and
+/// how sure the mapping is. File-format data.
 const CHANNELS: &[(u64, Channel, &str, ChannelConfidence)] = &[
     (1, Channel::BaseColor, "Base Color", ChannelConfidence::Measured),
-    (2, Channel::Height, "Height", ChannelConfidence::Measured),
-    (4, Channel::Specular, "Specular", ChannelConfidence::Named),
-    (8, Channel::Opacity, "Opacity", ChannelConfidence::Measured),
-    (16, Channel::Emissive, "Emissive", ChannelConfidence::Measured),
-    (64, Channel::Glossiness, "Glossiness", ChannelConfidence::Named),
-    (128, Channel::Roughness, "Roughness", ChannelConfidence::Measured),
-    (512, Channel::AnisotropyAngle, "Anisotropy Angle", ChannelConfidence::Named),
-    (8192, Channel::Metallic, "Metallic", ChannelConfidence::Measured),
-    (4_194_304, Channel::Normal, "Normal", ChannelConfidence::Measured),
-    (8_388_608, Channel::AmbientOcclusion, "Ambient Occlusion", ChannelConfidence::Named),
-    (33_554_432, Channel::SpecularLevel, "Specular Level", ChannelConfidence::Named),
-    (134_217_728, Channel::ScatterWeight, "Scattering", ChannelConfidence::Named),
+    (1 << 1, Channel::Height, "Height", ChannelConfidence::Measured),
+    (1 << 2, Channel::Specular, "Specular", ChannelConfidence::Measured),
+    (1 << 3, Channel::Opacity, "Opacity", ChannelConfidence::Measured),
+    (1 << 4, Channel::Emissive, "Emissive", ChannelConfidence::Measured),
+    (1 << 6, Channel::Glossiness, "Glossiness", ChannelConfidence::Measured),
+    (1 << 7, Channel::Roughness, "Roughness", ChannelConfidence::Measured),
+    (1 << 8, Channel::AnisotropyLevel, "Anisotropy Level", ChannelConfidence::Measured),
+    (1 << 9, Channel::AnisotropyAngle, "Anisotropy Angle", ChannelConfidence::Measured),
+    (1 << 13, Channel::Metallic, "Metallic", ChannelConfidence::Measured),
+    (1 << 22, Channel::Normal, "Normal", ChannelConfidence::Measured),
+    (1 << 23, Channel::AmbientOcclusion, "Ambient Occlusion", ChannelConfidence::Measured),
+    (1 << 25, Channel::SpecularLevel, "Specular Level", ChannelConfidence::Measured),
+    // A scattering weight with the older shader model (uncovered 0); a radius scale with SHADER_MODEL_CURRENT
+    // (uncovered 1), where the weight is the translucency channel instead.
+    (1 << 27, Channel::ScatterWeight, "Scattering", ChannelConfidence::Named),
+    (1 << 28, Channel::SheenWeight, "Sheen Opacity", ChannelConfidence::Measured),
+    (1 << 29, Channel::SheenRoughness, "Sheen Roughness", ChannelConfidence::Measured),
+    (1 << 30, Channel::SheenColor, "Sheen Color", ChannelConfidence::Measured),
+    (1 << 40, Channel::CoatWeight, "Coat Opacity", ChannelConfidence::Measured),
+    (1 << 42, Channel::CoatRoughness, "Coat Roughness", ChannelConfidence::Measured),
+    (1 << 44, Channel::CoatNormal, "Coat Normal", ChannelConfidence::Measured),
+    (1 << 52, Channel::Transmission, "Transmission Weight", ChannelConfidence::Measured),
 ];
 
-// File-format data: `DataChannel.format`, the stored format of a channel (read off real projects).
+// File-format data: `DataChannel.format`, the stored format of a channel (measured: the code of every format).
 const FORMAT_SRGB8: u64 = 0;
 const FORMAT_L8: u64 = 1;
+const FORMAT_RGB8: u64 = 2;
 const FORMAT_L16: u64 = 3;
+const FORMAT_RGB16: u64 = 4;
 const FORMAT_L16F: u64 = 5;
 const FORMAT_RGB16F: u64 = 6;
+const FORMAT_L32F: u64 = 7;
+const FORMAT_RGB32F: u64 = 8;
 
-/// What the original shows where no layer covers base colour: 0.5 linear (0.735 as sRGB), measured on partially
-/// covered texels of a real project.
+/// File-format data: `DataMaterialStack.shaderModel` of the projects the reference app creates now. Older files have no
+/// such field and migrated ones store 2; both show the older uncovered values.
+pub const SHADER_MODEL_CURRENT: u64 = 4;
+
+/// Base colour where no layer covers it, linear: 0.5 (measured 0.498, 0.734 as sRGB) with the older shader model.
 const UNCOVERED_BASE_COLOR: f32 = 0.5;
-/// Roughness where no layer covers it (the same texels).
+/// Base colour where no layer covers it with [`SHADER_MODEL_CURRENT`], linear (measured 0.906 as sRGB).
+const UNCOVERED_BASE_COLOR_CURRENT: f32 = 0.8;
+/// Roughness where no layer covers it (measured 0.298, within half an 8-bit step).
 const UNCOVERED_ROUGHNESS: f32 = 0.3;
+/// Glossiness where no layer covers it (measured 178/255, also in a float format).
+const UNCOVERED_GLOSSINESS: f32 = 178.0 / 255.0;
 
 /// TextureCraft's channel for a file channel bit.
 pub fn channel_for_bit(bit: u64) -> Option<Channel> {
@@ -84,26 +112,47 @@ pub fn channel_format(channel: Channel, project_format: Option<u64>) -> ChannelF
     let color = channel.components() == 3;
     match (project_format, color) {
         (Some(FORMAT_SRGB8), true) if channel.kind() == ChannelKind::Color => ChannelFormat::Srgb8,
-        (Some(FORMAT_SRGB8 | FORMAT_L8), true) => ChannelFormat::Rgb8,
-        (Some(FORMAT_SRGB8 | FORMAT_L8), false) => ChannelFormat::L8,
-        (Some(FORMAT_L16), true) => ChannelFormat::Rgb16,
-        (Some(FORMAT_L16), false) => ChannelFormat::L16,
+        (Some(FORMAT_SRGB8 | FORMAT_L8 | FORMAT_RGB8), true) => ChannelFormat::Rgb8,
+        (Some(FORMAT_SRGB8 | FORMAT_L8 | FORMAT_RGB8), false) => ChannelFormat::L8,
+        (Some(FORMAT_L16 | FORMAT_RGB16), true) => ChannelFormat::Rgb16,
+        (Some(FORMAT_L16 | FORMAT_RGB16), false) => ChannelFormat::L16,
         (Some(FORMAT_L16F | FORMAT_RGB16F), true) => ChannelFormat::Rgb16F,
         (Some(FORMAT_L16F | FORMAT_RGB16F), false) => ChannelFormat::L16F,
+        (Some(FORMAT_L32F | FORMAT_RGB32F), true) => ChannelFormat::Rgb32F,
+        (Some(FORMAT_L32F | FORMAT_RGB32F), false) => ChannelFormat::L32F,
         _ => ChannelFormat::default_for(channel),
     }
 }
 
-/// What the original shows where no layer covers `channel`, as TextureCraft holds it (measured for base colour,
-/// roughness, metallic, normal and height; TextureCraft's own default for the rest).
+/// What the original shows where no layer covers `channel` in a project with the older shader model, as TextureCraft
+/// holds it. See [`uncovered_default`].
 pub fn project_channel_default(channel: Channel) -> [f32; 3] {
+    uncovered_default(channel, None)
+}
+
+/// What the original shows where no layer covers `channel`, as TextureCraft holds it, for a set with the stack's
+/// `shaderModel`. Measured for every mapped channel. With [`SHADER_MODEL_CURRENT`] emissive shows 1 and scattering
+/// 1 as well; TextureCraft keeps 0 for both, since its emissive has no separate strength and its scatter weight is
+/// not a radius scale.
+pub fn uncovered_default(channel: Channel, shader_model: Option<u64>) -> [f32; 3] {
     match channel {
+        Channel::BaseColor if shader_model == Some(SHADER_MODEL_CURRENT) => [UNCOVERED_BASE_COLOR_CURRENT; 3],
         Channel::BaseColor => [UNCOVERED_BASE_COLOR; 3],
         Channel::Roughness => [UNCOVERED_ROUGHNESS; 3],
-        Channel::Metallic | Channel::Height | Channel::Emissive => [0.0; 3],
-        Channel::Normal => [0.5, 0.5, 1.0],
+        Channel::Glossiness => [UNCOVERED_GLOSSINESS; 3],
+        Channel::Metallic | Channel::Height | Channel::Emissive | Channel::CoatRoughness | Channel::ScatterWeight => [0.0; 3],
+        Channel::Normal | Channel::CoatNormal => [0.5, 0.5, 1.0],
         Channel::Opacity | Channel::AmbientOcclusion => [1.0; 3],
         other => other.default_value(),
+    }
+}
+
+/// The value a uniform source gives `channel`, from the three components the file stores: colours and directions as
+/// stored, single-valued channels the mean of the three (measured on every grey channel).
+pub fn uniform_value(channel: Channel, stored: [f32; 3]) -> [f32; 3] {
+    match channel.components() {
+        3 => stored,
+        _ => [(stored[0] + stored[1] + stored[2]) / 3.0; 3],
     }
 }
 
@@ -191,6 +240,8 @@ mod tests {
         assert_eq!(channel_format(Channel::Normal, Some(6)), ChannelFormat::Rgb16F);
         assert_eq!(channel_format(Channel::Metallic, None), ChannelFormat::L8);
         assert_eq!(channel_format(Channel::Metallic, Some(99)), ChannelFormat::L8);
+        assert_eq!(channel_format(Channel::Roughness, Some(7)), ChannelFormat::L32F);
+        assert_eq!(channel_format(Channel::SheenColor, Some(4)), ChannelFormat::Rgb16);
     }
 
     #[test]
@@ -207,5 +258,9 @@ mod tests {
         assert_eq!(s.label(Channel::BaseColor), "Base Color");
         assert_eq!(project_channel_default(Channel::Roughness), [0.3; 3]);
         assert_eq!(project_channel_default(Channel::SheenColor), Channel::SheenColor.default_value());
+        assert_eq!(uncovered_default(Channel::BaseColor, Some(SHADER_MODEL_CURRENT)), [0.8; 3]);
+        assert_eq!(uncovered_default(Channel::BaseColor, Some(2)), [0.5; 3]);
+        assert_eq!(uniform_value(Channel::Roughness, [0.2, 0.8, 0.5]), [0.5; 3]);
+        assert_eq!(uniform_value(Channel::BaseColor, [0.2, 0.8, 0.5]), [0.2, 0.8, 0.5]);
     }
 }

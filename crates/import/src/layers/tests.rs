@@ -105,6 +105,7 @@ fn set(layers: Vec<ProjectLayer>) -> ProjectTextureSet {
         name: "S".into(),
         resolution_log2: Some([10, 10]),
         channels: vec![],
+        shader_model: None,
         layers,
         mesh_maps: vec![],
         unhandled: vec![],

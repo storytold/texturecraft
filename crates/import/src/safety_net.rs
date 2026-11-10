@@ -19,7 +19,6 @@ use texturecraft_core::{Channel, Project};
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer};
 use texturecraft_texel::linear_to_srgb;
 
-use crate::channels::project_channel_default;
 use crate::resources::CacheImage;
 
 /// Mean difference at or below this many 8-bit steps counts as reproduced (rounding level).
@@ -118,9 +117,9 @@ pub fn composite(scene: &SetScene, channels: &[Channel]) -> Option<(Composite, U
     Some((out, gbuf))
 }
 
-/// Our composite of `channel` against a stored result image of the same size, on the mesh's texels.
-pub fn score(ours: &Composite, gbuf: &UvGBuffer, channel: Channel, cache: &CacheImage) -> Score {
-    let default = project_channel_default(channel);
+/// Our composite of `channel` against a stored result image of the same size, on the mesh's texels; `default` is what
+/// the original shows where the stored result is uncovered.
+pub fn score(ours: &Composite, gbuf: &UvGBuffer, channel: Channel, cache: &CacheImage, default: [f32; 3]) -> Score {
     let comps = channel.components();
     let (w, h) = (cache.image.width.min(ours.resolution), cache.image.height.min(ours.height));
     let encode = |v: f32| if cache.srgb { linear_to_srgb(v.clamp(0.0, 1.0)) } else { v };
@@ -183,12 +182,12 @@ mod tests {
         let scene = SetScene { project: &p, ts: 0, mesh: &mesh, pixels: &pixels, baked: &baked, images: &images };
         let (ours, gbuf) = composite(&scene, &[Channel::Roughness]).unwrap();
         let cache = |v: f32, a: f32| CacheImage { bit: 128, image: Rgba::solid(128, 128, [v, v, v, a]), srgb: false, missing_bytes: 0 };
-        let same = score(&ours, &gbuf, Channel::Roughness, &cache(0.3, 1.0));
+        let same = score(&ours, &gbuf, Channel::Roughness, &cache(0.3, 1.0), [0.3; 3]);
         assert!(same.reproduced() && same.texels > 16000, "{same:?}");
-        let off = score(&ours, &gbuf, Channel::Roughness, &cache(0.9, 1.0));
+        let off = score(&ours, &gbuf, Channel::Roughness, &cache(0.9, 1.0), [0.3; 3]);
         assert!(off.mean > 100.0, "{off:?}");
         // uncovered texels of the stored result show the channel default (roughness 0.3)
-        assert!(score(&ours, &gbuf, Channel::Roughness, &cache(0.0, 0.0)).reproduced());
+        assert!(score(&ours, &gbuf, Channel::Roughness, &cache(0.0, 0.0), [0.3; 3]).reproduced());
     }
 
     #[test]

@@ -492,7 +492,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                     if projection::shapes_coverage(fill) {
                         status.and(&Status::approximated("uniform fill faded or clipped by its projection"));
                     }
-                    let v = if c.components() == 3 { u.color } else { [u.color[0]; 3] };
+                    let v = crate::channels::uniform_value(c, u.color);
                     Some(Source::Uniform(v.map(|x| if x.is_finite() { x } else { 0.0 })))
                 }
                 ProjectSource::Bitmap(b) => {

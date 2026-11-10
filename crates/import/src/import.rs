@@ -20,7 +20,7 @@ use texturecraft_import_reader::model::cameras::{CAMERA_INI, SavedCameras};
 use texturecraft_import_reader::model::{ProjectDocument, ProjectTextureSet};
 use texturecraft_import_reader::project::{ProjectFile, paths};
 
-use crate::channels::{self, ChannelConfidence, SetChannels, project_channel_default};
+use crate::channels::{self, ChannelConfidence, SetChannels, uncovered_default};
 use crate::error::ImportError;
 use crate::image::Rgba;
 use crate::layers::{self, ImportedStack, SetInput};
@@ -280,6 +280,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         }
     }
     let mut set = TextureSet::new(name.clone(), ctx.source.slot, resolution);
+    let shader_model = ctx.project_set.and_then(|s| s.shader_model);
     let mut declared = SetChannels::default();
     for c in &record.channels {
         match channels::channel_for_bit(c.type_bit) {
@@ -385,7 +386,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         let id = project.alloc_id();
         let mut fill = Fill::default();
         for c in declared.all() {
-            fill.sources.insert(c, Source::Uniform(project_channel_default(c)));
+            fill.sources.insert(c, Source::Uniform(uncovered_default(c, shader_model)));
         }
         let channels: Vec<Channel> = declared.all().collect();
         let layer = Layer::new(id, DEFAULTS_LAYER_NAME, LayerKind::Fill(fill), &channels);
@@ -409,7 +410,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         let scene = SetScene { project, ts, mesh: ctx.mesh, pixels: &out.pixels, baked: &baked, images: &store };
         if let Some((composite, gbuf)) = safety_net::composite(&scene, &cache_channels) {
             for (c, img) in &cache {
-                scores.push((*c, safety_net::score(&composite, &gbuf, *c, img)));
+                scores.push((*c, safety_net::score(&composite, &gbuf, *c, img, uncovered_default(*c, shader_model))));
             }
         }
     }
