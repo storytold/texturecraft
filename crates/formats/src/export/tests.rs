@@ -205,6 +205,25 @@ fn ao_mixes_baked_and_channel() {
 }
 
 #[test]
+fn a_larger_bake_exports_averaged() {
+    // An 8× AO bake with a dark 1-texel crease in every 8 columns, exported at the set's size.
+    let ao_export = |res: u32| {
+        let mut fx = Fx::new(&default_channels());
+        let ao = (0..res * res).map(|i| if (i % res).is_multiple_of(8) { 0.0 } else { 1.0 }).collect();
+        fx.baked = BakedMaps { resolution: res, maps: [(BakedMap::AmbientOcclusion, std::sync::Arc::new(ao))].into() };
+        fx.project.texture_sets[0].baked.insert(BakedMap::AmbientOcclusion);
+        decode(&fx.render_preset("Mesh maps")[0]).to_luma16()
+    };
+    // Every texel covers one crease column in eight, never the crease alone.
+    let ao = ao_export(RES * 8);
+    let averaged = (0.875 * 65535.0f32).round() as i32;
+    assert!(ao.pixels().all(|p| (p[0] as i32 - averaged).abs() <= 1), "{:?}", ao.get_pixel(0, 0));
+    // At the same size, texel for texel.
+    let ao = ao_export(RES);
+    assert!(ao.enumerate_pixels().all(|(x, _, p)| p[0] == if x.is_multiple_of(8) { 0 } else { 65535 }));
+}
+
+#[test]
 fn templates_are_sanitized_and_collisions_suffixed() {
     let fx = Fx::new(&default_channels());
     let rough = |file: &str| MapSpec {

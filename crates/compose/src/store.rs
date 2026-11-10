@@ -56,7 +56,7 @@ pub fn decode(kind: ChannelKind, v: u16) -> f32 {
     if kind == ChannelKind::Signed { from_u16_signed(v) } else { from_u16(v) }
 }
 
-pub use crate::baked_maps::BakedMaps;
+pub use crate::baked_maps::{BakedMaps, BakedView};
 
 /// A decoded image resource sampled by fills (values in the file's encoding; see `srgb`).
 #[derive(Clone, Debug, PartialEq)]

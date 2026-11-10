@@ -19,7 +19,7 @@ use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage, from_u16, nois
 use crate::below::{Band, BelowCache, Level};
 use crate::curvature_sizes::CurvatureSizes;
 use crate::pattern::{Coords, decal_uv, image_samples, procedural, world_noise};
-use crate::store::{BakedMaps, ImageStore, PixelStore, decode};
+use crate::store::{BakedMaps, BakedView, ImageStore, PixelStore, decode};
 
 const NCH: usize = Channel::ALL.len();
 
@@ -614,6 +614,7 @@ fn filter_region(
 
     // Evaluate the stack up to the filter, tile by tile (content premultiplied by coverage)
     let (rx1, ry1) = (rx0 + w, ry0 + h);
+    let baked = baked_view(inp);
     let region_tiles: Vec<(u32, u32)> = (ry0 / TILE..ry1.div_ceil(TILE)).flat_map(|y| (rx0 / TILE..rx1.div_ceil(TILE)).map(move |x| (x, y))).collect();
     let parts: Vec<Vec<(u32, u32, [f32; 4])>> = region_tiles
         .par_iter()
@@ -640,7 +641,7 @@ fn filter_region(
             }
             tile_texels(inp.gbuf, tx, ty)
                 .map(|(x, y, offset)| {
-                    let mut texel = Texel::new(inp, x, y, offset, stroke_at(preview_tile, offset));
+                    let mut texel = Texel::new(inp, &baked, x, y, offset, stroke_at(preview_tile, offset));
                     if !full.is_empty() {
                         texel.anchors_below(&full, id);
                     }
@@ -1013,9 +1014,21 @@ fn over(c: &ChanPlan, mode: BlendMode, v: [f32; 3], cov: f32, p: [f32; 3], a: f3
 /// The plain UV projection a decal's frame coordinates are sampled through.
 const DECAL_UV: Projection = Projection::Uv { scale: [1.0, 1.0], rotation: 0.0, offset: [0.0, 0.0] };
 
+/// Baked maps the compositor reads (mesh-map generators, baked lighting).
+const COMPOSITED_MAPS: [BakedMap; 3] = [BakedMap::AmbientOcclusion, BakedMap::Curvature, BakedMap::Thickness];
+
+/// `inp`'s baked maps as read at the texture set's size: each tile block baked larger than the
+/// set holds it is area-averaged down rather than point sampled (made once per pass, before its
+/// parallel loop).
+fn baked_view<'b>(inp: &'b Inputs) -> BakedView<'b> {
+    let size = (inp.gbuf.width, inp.gbuf.height);
+    inp.baked.view(size, size, &inp.block_scales, &COMPOSITED_MAPS)
+}
+
 /// Per-texel context.
 struct Texel<'a, 'b> {
     inp: &'b Inputs<'a>,
+    baked: &'b BakedView<'b>,
     x: u32,
     y: u32,
     /// Offset of this texel inside a tile (in texels).
@@ -1060,8 +1073,8 @@ impl<'t> Tape<'t> {
 }
 
 impl<'a, 'b> Texel<'a, 'b> {
-    fn new(inp: &'b Inputs<'a>, x: u32, y: u32, o: usize, stroke: f32) -> Self {
-        Texel { inp, x, y, o, res: inp.gbuf.width, coords: None, stroke, stop: None, anchors: Vec::new(), tape: Tape::Off }
+    fn new(inp: &'b Inputs<'a>, baked: &'b BakedView<'b>, x: u32, y: u32, o: usize, stroke: f32) -> Self {
+        Texel { inp, baked, x, y, o, res: inp.gbuf.width, coords: None, stroke, stop: None, anchors: Vec::new(), tape: Tape::Off }
     }
 
     /// Run `f` with `tape` as this texel's tape.
@@ -1143,7 +1156,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     }
 
     fn baked_color(&self, map: BakedMap) -> Option<[f32; 3]> {
-        self.inp.baked.sample_working(map, self.x, self.y, (self.res, self.inp.gbuf.height), &self.inp.block_scales)
+        self.baked.sample(map, self.x, self.y)
     }
 
     /// Where projection `proj` samples this texel: the texel's coordinates, or for a decal its
@@ -1737,6 +1750,7 @@ fn composite_block(
     let stride: usize = lanes.iter().map(|l| l.n).sum();
     let nlev = split.map_or(0, <[Level]>::len);
     let defaults: Acc = Channel::ALL.map(Channel::default_value);
+    let baked = baked_view(inp);
     // Tiles split into bands of rows, so a handful of tiles still keeps every thread busy.
     let bands = TILE / BAND;
     let tasks: Vec<((u32, u32), u32)> = tiles.iter().flat_map(|t| (0..bands).map(move |b| (*t, b))).collect();
@@ -1788,7 +1802,7 @@ fn composite_block(
                     let mut acc = defaults;
                     if covered {
                         any = true;
-                        let mut tex = Texel::new(inp, x, y, o, stroke_at(preview_tile, o));
+                        let mut tex = Texel::new(inp, &baked, x, y, o, stroke_at(preview_tile, o));
                         // Reuse one anchor buffer per band.
                         tex.anchors = std::mem::take(&mut anchors);
                         match &levels {
@@ -1995,11 +2009,12 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
     prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
 
     let fields = neighbourhood_fields(inputs, &channels, &coordinates);
+    let baked = baked_view(inputs);
     let tiles: HashMap<(u32, u32), Vec<u8>> = coordinates
         .par_iter()
         .map(|&tile| {
             let mut values = vec![0u8; TILE_AREA];
-            for (offset, value) in mask_tile(inputs, id, mask, &channels, &fields, tile, 0..TILE_AREA) {
+            for (offset, value) in mask_tile((inputs, &baked), id, mask, &channels, &fields, tile, 0..TILE_AREA) {
                 if let Some(destination) = values.get_mut(offset) {
                     *destination = (value * 255.0 + 0.5) as u8;
                 }
@@ -2053,13 +2068,14 @@ pub fn mask_at(inputs: &Inputs, id: LayerId, texels: &[(u32, u32)]) -> Option<Ve
 
     // Filters and anchors can depend on texels outside the requested tiles
     let fields = neighbourhood_fields(inputs, &channels, &all_tiles(inputs.gbuf.width, inputs.gbuf.height));
+    let baked = baked_view(inputs);
     let values: Vec<(usize, f32)> = requested
         .par_iter_mut()
         .flat_map_iter(|(&tile, requests)| {
             requests.sort_unstable_by_key(|&(offset, _)| offset);
             let groups = requests.chunk_by(|left, right| left.0 == right.0);
             let offsets = groups.clone().filter_map(|group| group.first().map(|&(offset, _)| offset));
-            mask_tile(inputs, id, mask, &channels, &fields, tile, offsets)
+            mask_tile((inputs, &baked), id, mask, &channels, &fields, tile, offsets)
                 .zip(groups)
                 .flat_map(|((_, value), group)| group.iter().map(move |&(_, index)| (index, value)))
         })
@@ -2075,7 +2091,7 @@ pub fn mask_at(inputs: &Inputs, id: LayerId, texels: &[(u32, u32)]) -> Option<Ve
 
 /// Mask values in offset order, including zeros for uncovered texels so request groups stay aligned
 fn mask_tile<'a>(
-    inputs: &'a Inputs<'a>,
+    (inputs, baked): (&'a Inputs<'a>, &'a BakedView<'a>),
     id: LayerId,
     mask: &'a Mask,
     channels: &[Channel],
@@ -2094,7 +2110,7 @@ fn mask_tile<'a>(
             return (offset, 0.0);
         }
 
-        let mut texel = Texel::new(inputs, x, y, offset, 0.0);
+        let mut texel = Texel::new(inputs, baked, x, y, offset, 0.0);
         if !anchor_stack.is_empty() {
             texel.anchors_below(&anchor_stack, id);
         }
@@ -2144,6 +2160,7 @@ pub fn effect_histogram(inp: &Inputs, effect: LayerId, channel: Channel, bins: u
     // is the whole set: with a neighbourhood filter below, each tile gets its own.
     let probe = neighbourhood_fields(&cut_inp, &channels, tiles.get(..1).unwrap_or_default());
     let shared = probe.is_empty().then_some(probe);
+    let baked = baked_view(&cut_inp);
     let bin = |v: f32| ((v.clamp(0.0, 1.0) * bins as f32) as usize).min(bins - 1);
     let hist = tiles
         .par_iter()
@@ -2166,7 +2183,7 @@ pub fn effect_histogram(inp: &Inputs, effect: LayerId, channel: Channel, bins: u
             }
             let full = anchor_plan(&cut_inp, owner, &channels, tx, ty, Some(fields));
             for (x, y, o) in tile_texels(inp.gbuf, tx, ty) {
-                let mut tex = Texel::new(&cut_inp, x, y, o, 0.0);
+                let mut tex = Texel::new(&cut_inp, &baked, x, y, o, 0.0);
                 if !full.is_empty() {
                     tex.anchors_below(&full, owner);
                 }
@@ -2218,6 +2235,7 @@ pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Opti
     }
     let visible_inputs = Inputs { project: &solo, preview: None, block_scales: inputs.block_scales.clone(), ..*inputs };
     let fields = neighbourhood_fields(&visible_inputs, &channels, tiles);
+    let baked = baked_view(&visible_inputs);
 
     let out: Vec<Vec<FlatTile>> = tiles
         .par_iter()
@@ -2236,7 +2254,7 @@ pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Opti
             }
 
             for (x, y, o) in tile_texels(inputs.gbuf, tx, ty) {
-                let mut tex = Texel::new(&visible_inputs, x, y, o, 0.0);
+                let mut tex = Texel::new(&visible_inputs, &baked, x, y, o, 0.0);
                 if !full.is_empty() {
                     tex.anchors_below(&full, id);
                 }
@@ -2339,6 +2357,41 @@ mod tests {
         assert!(close(out.value(Channel::BaseColor, 10, 10), [0.5; 3]));
         assert!(close(out.value(Channel::Roughness, 10, 10), [0.5; 3]));
         assert!(close(out.value(Channel::Normal, 10, 10), [0.5, 0.5, 1.0]));
+    }
+
+    /// A `res²` AO bake: `ao(x)` per column.
+    fn ao_bake(res: u32, ao: impl Fn(u32) -> f32) -> BakedMaps {
+        let data = (0..res * res).map(|i| ao(i % res)).collect();
+        BakedMaps { resolution: res, maps: [(BakedMap::AmbientOcclusion, Arc::new(data))].into() }
+    }
+
+    #[test]
+    fn generators_average_a_larger_bake() {
+        // A white fill masked by the AO generator, over a 64² set.
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [1.0; 3], 1.0);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(f.project.alloc_id(), EffectKind::Generator(Generator::new(GeneratorKind::AmbientOcclusion))));
+        f.project.layer_mut(id).unwrap().mask = Some(mask);
+        let shown = |f: &mut Fixture, baked: BakedMaps| {
+            f.baked = baked;
+            let out = run(f, None);
+            (0..64).flat_map(|y| (0..64).map(move |x| (x, y))).map(|(x, y)| out.value(Channel::BaseColor, x, y)).collect::<Vec<_>>()
+        };
+        // 8× larger with a dark 1-texel crease in every other column: each set texel reads the
+        // average over its 8×8 baked texels, as a same-size bake of that average would (0.5,
+        // mid-way up the generator's default ramp, so it shows).
+        let crease = |x: u32| if x.is_multiple_of(2) { 0.0 } else { 1.0 };
+        let averaged = shown(&mut f, ao_bake(512, crease));
+        assert!(averaged.iter().zip(shown(&mut f, ao_bake(64, |_| 0.5))).all(|(a, b)| close(*a, b)), "{:?}", &averaged[..8]);
+        // Not the crease the nearest texel falls on.
+        assert!(averaged.iter().zip(shown(&mut f, ao_bake(64, |_| 0.0))).all(|(a, b)| !close(*a, b)));
+        // At the same size every texel reads its own baked value.
+        let same = shown(&mut f, ao_bake(64, crease));
+        let (dark, light) = (shown(&mut f, ao_bake(64, |_| 0.0)), shown(&mut f, ao_bake(64, |_| 1.0)));
+        for (i, v) in same.iter().enumerate() {
+            assert!(close(*v, if i.is_multiple_of(2) { dark[i] } else { light[i] }), "texel {i}: {v:?}");
+        }
     }
 
     #[test]

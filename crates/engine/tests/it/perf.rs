@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use serde_json::{Value, json};
-use texturecraft_engine::compose::{DisplayKind, tile_bytes};
+use texturecraft_engine::compose::{DisplayKind, display_view, tile_bytes};
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
 use texturecraft_engine::{Session, execute};
@@ -51,8 +51,9 @@ fn upload_bytes(s: &mut Session) -> usize {
     let tiles = s.take_uploads(0);
     let baked = s.baked(0).cloned().unwrap_or_default();
     let comp = &s.caches[0].composite;
+    let view = display_view(&baked, comp);
     // As the UI does it (in parallel).
-    tiles.par_iter().flat_map_iter(|&(tx, ty)| DisplayKind::ALL.map(|k| tile_bytes(comp, &baked, k, tx, ty).len())).sum()
+    tiles.par_iter().flat_map_iter(|&(tx, ty)| DisplayKind::ALL.map(|k| tile_bytes(comp, &view, k, tx, ty).len())).sum()
 }
 
 fn mb(b: usize) -> f64 {

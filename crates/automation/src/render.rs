@@ -2,7 +2,7 @@
 //! and viewport shading (`ui-egui/src/viewport.rs`), done in one shot.
 
 use rayon::prelude::*;
-use texturecraft_engine::compose::{DisplayKind, all_tiles, tile_bytes};
+use texturecraft_engine::compose::{DisplayKind, all_tiles, display_view, tile_bytes};
 use texturecraft_engine::{Session, ViewMode};
 use texturecraft_render::displace::trace_geometry;
 use texturecraft_render::gpu_trace::GpuTracer;
@@ -59,12 +59,12 @@ impl Gpu {
                 tiles = all_tiles(cache.size.0, cache.size.1);
             }
             let empty = Default::default();
-            let baked = s.doc.baked.get(&ts).unwrap_or(&empty);
             let comp = &cache.composite;
+            let baked = display_view(s.doc.baked.get(&ts).unwrap_or(&empty), comp);
             let bytes: Vec<_> = tiles
                 .par_iter()
                 .flat_map_iter(|&(tx, ty)| DisplayKind::ALL.into_iter().map(move |k| (k, tx, ty)))
-                .map(|(k, tx, ty)| (k, tx, ty, tile_bytes(comp, baked, k, tx, ty)))
+                .map(|(k, tx, ty)| (k, tx, ty, tile_bytes(comp, &baked, k, tx, ty)))
                 .collect();
             for (k, tx, ty, b) in bytes {
                 h.renderer.upload_tile(&h.device, &h.queue, ts, k, tx, ty, &b);
