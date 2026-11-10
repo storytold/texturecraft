@@ -163,7 +163,8 @@ impl ImportProgress {
         self.cancel.is_cancelled()
     }
 
-    fn report(&self, fraction: f32, step: Step) {
+    /// Reports `step` at `fraction` (the import does; a front end's tests may, to show a step).
+    pub fn report(&self, fraction: f32, step: Step) {
         let fraction = {
             let mut state = self.lock();
             let f = if fraction.is_finite() { fraction.clamp(state.0, 1.0) } else { state.0 };
