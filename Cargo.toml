@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/texel", "crates/geom", "crates/compose", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "apps/texturecraft-web", "xtask"]
+members = ["crates/core", "crates/texel", "crates/geom", "crates/import-reader", "crates/compose", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "apps/texturecraft-web", "xtask"]
 exclude = ["vendor"]
-default-members = ["crates/core", "crates/texel", "crates/geom", "crates/compose", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "xtask"]
+default-members = ["crates/core", "crates/texel", "crates/geom", "crates/import-reader", "crates/compose", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "xtask"]
 
 [workspace.package]
 version = "0.6.1"
@@ -16,6 +16,7 @@ repository = "https://github.com/storytold/texturecraft"
 texturecraft-core = { path = "crates/core" }
 texturecraft-texel = { path = "crates/texel" }
 texturecraft-geom = { path = "crates/geom" }
+texturecraft-import-reader = { path = "crates/import-reader" }
 texturecraft-bake = { path = "crates/bake" }
 texturecraft-paint = { path = "crates/paint" }
 texturecraft-formats = { path = "crates/formats" }

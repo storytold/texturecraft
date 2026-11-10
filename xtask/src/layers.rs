@@ -15,6 +15,7 @@ pub const TABLE: &[(&str, u8)] = &[
     ("core", 0),
     ("texel", 0),
     ("geom", 0),
+    ("import-reader", 0),
     ("compose", 1),
     ("bake", 1),
     ("paint", 2),
