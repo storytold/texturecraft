@@ -20,14 +20,8 @@ fn harness_with_job(mesh_id: impl FnOnce(u64) -> u64) -> (Harness<'static, Textu
     // Leak the sender so the channel stays empty instead of closed.
     std::mem::forget(tx);
     std::mem::forget(maps_tx);
-    let running = RunningBake {
-        set_index: 0,
-        progress: progress.clone(),
-        receiver,
-        maps,
-        maps_done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        maps_total: 1,
-    };
+    let running =
+        RunningBake { set_index: 0, progress: progress.clone(), receiver, maps, maps_done: Arc::new(std::sync::atomic::AtomicUsize::new(0)), maps_total: 1 };
     h.state_mut().bake = Some(BakeJob { queue: vec![], current: Some(running), total: 1, mesh_id: id });
     (h, progress)
 }
