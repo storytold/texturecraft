@@ -391,3 +391,39 @@ fn strokes_that_cannot_be_replayed_stay_placeholders_with_their_reason() {
         .collect();
     assert!(reasons.iter().any(|r| r.contains("particle brush")), "{reasons:?}");
 }
+
+/// With the project's graphs decompiled, a procedural fill whose channels blend differently becomes one graph source
+/// per channel, each in the fill effect of its own blend (a material laid on whole with its first channel's blend
+/// added every channel's output), and the layer is not locked.
+#[test]
+fn a_decompiled_fill_lays_each_channel_with_its_own_blend() {
+    use crate::graph_library::GraphLibrary;
+    use texturecraft_import_reader::decompile::Decompiled;
+    let mut lib = GraphLibrary::default();
+    let d = Decompiled {
+        text: "format 3\nnode 1 color r=0.5 g=0.5 b=0.5\noutput grey 1\n".into(),
+        images: vec![],
+        image_defaults: vec![],
+        outputs: vec![("grey".into(), 1)],
+        warnings: vec![],
+        colour_outputs: vec![],
+    };
+    lib.insert_as(&["strata".to_string()], "", d);
+    let (channels, images, options) = (channels(), ProjectImages::none(), ImportOptions::default());
+    let parts = ["Body".to_string()];
+    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: false, graphs: Some(&lib) };
+    let blending = vec![blend(BASE, 2, 1.0), blend(HEIGHT, 4, 1.0)];
+    let l = layer(1, "Strata", ProjectLayerKind::Paint, vec![fill(2, BASE | HEIGHT, vec![procedural(BASE | HEIGHT, "strata")], blending)]);
+    let stack = import(&set(vec![l]), &input, 10);
+    let strata = by_name(&stack, "Strata");
+    assert!(!strata.is_locked() && strata.placeholders().next().is_none());
+    let by_channel = |c: Channel| {
+        strata.content_effects.iter().find_map(|e| match &e.kind {
+            texturecraft_core::EffectKind::Material(f) => f.sources.get(&c).map(|s| (e.blend, s.graph().is_some())),
+            _ => None,
+        })
+    };
+    let (base, height) = (by_channel(Channel::BaseColor).unwrap_or_else(|| panic!("{:#?}", strata.content_effects)), by_channel(Channel::Height).unwrap());
+    assert!(base.1 && height.1, "graph sources");
+    assert_ne!(base.0, height.0, "each channel keeps its own blend");
+}

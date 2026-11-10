@@ -489,7 +489,8 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         let mapped = projection::map(fill);
         let mut parts =
             FillParts { groups: Vec::new(), graphs: Vec::new(), graph_names: Vec::new(), status: BTreeMap::new(), projection: mapped.projection.clone() };
-        let mut graph_channels: Vec<(usize, Vec<Channel>, ResolvedBlend)> = Vec::new();
+        // per fill source: its channels, each with its own blending
+        let mut graph_channels: Vec<(usize, Vec<(Channel, ResolvedBlend)>)> = Vec::new();
         for c in self.writes(&fill.header, Holder::Layer) {
             let pc = ch.project_channel(c);
             let Some(index) = fill.sources.iter().position(|s| {
@@ -532,8 +533,8 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                 },
                 ProjectSource::Procedural(_) => {
                     match graph_channels.iter_mut().find(|(i, ..)| *i == index) {
-                        Some((_, channels, _)) => channels.push(c),
-                        None => graph_channels.push((index, vec![c], blend)),
+                        Some((_, channels)) => channels.push((c, blend)),
+                        None => graph_channels.push((index, vec![(c, blend)])),
                     }
                     continue;
                 }
@@ -552,15 +553,17 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                 }
             }
         }
-        for (index, channels, blend) in graph_channels {
+        for (index, blends) in graph_channels {
             let Some(ProjectSource::Procedural(p)) = fill.sources.get(index) else { continue };
+            let channels: Vec<Channel> = blends.iter().map(|(c, _)| *c).collect();
             match graph_uses::fill_sources(self.input, self.anchors, p, &channels) {
                 Ok(fg) => {
-                    let mut status = blend.status();
-                    status.and(&mapped.status);
-                    status.and(&fg.status);
-                    // a channel the graph has no output for is not written
+                    // a channel the graph has no output for is not written; each is laid on with its own blending
                     for (c, source) in fg.sources {
+                        let Some((_, blend)) = blends.iter().find(|(b, _)| *b == c) else { continue };
+                        let mut status = blend.status();
+                        status.and(&mapped.status);
+                        status.and(&fg.status);
                         parts.status.entry(c).or_default().and(&status);
                         match parts.groups.iter_mut().find(|(b, _)| b.mode() == blend.mode() && b.opacity == blend.opacity) {
                             Some((_, sources)) => {
@@ -575,6 +578,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                     for c in &channels {
                         parts.status.entry(*c).or_default().and(&g.status);
                     }
+                    let Some((_, blend)) = blends.first().cloned() else { continue };
                     parts.graphs.push((g, channels, blend));
                 }
             }
