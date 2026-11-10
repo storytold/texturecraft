@@ -148,7 +148,7 @@ mod tests {
         use crate::layer::{Effect, EffectKind, Fill, GraphInput, GraphRef, GraphValue, Projection, Source, text_key};
         let graph = GraphRef::new(text_key("g"), "g");
         let mut fill = Fill::default();
-        fill.sources.insert(Channel::Roughness, Source::Graph(graph.clone()));
+        fill.sources.insert(Channel::Roughness, Source::Graph(Box::new(graph.clone())));
         let mut a = Layer::new(LayerId(1), "a", LayerKind::Fill(fill), &[Channel::Roughness]);
         a.mask = Some(Mask {
             effects: vec![Effect::new(LayerId(2), EffectKind::Graph { graph, projection: Projection::default() })],

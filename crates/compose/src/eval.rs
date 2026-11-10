@@ -649,6 +649,9 @@ fn filter_region(
     filtered_region(inp, effects, (index, radius_texels, op), (rx0, ry0, w, h), opacity, comps, job, orig, cover)
 }
 
+/// One texel of a region: its position, its stack value and the anchor values recorded below it.
+type RegionTexel = (u32, u32, [f32; 4], Vec<[f32; 3]>);
+
 /// The stack of layer `id` up to effect `index` over texel `region` (content premultiplied by coverage), continued from
 /// `start` when given: one value per texel (`comps` per texel: 1 for a mask, 4 for content), whether each texel was
 /// evaluated, and the values of `anchors` (an anchor point and channel each) recorded below the layer.
@@ -672,7 +675,7 @@ fn stack_region(
     // Evaluate the stack up to the filter, tile by tile (content premultiplied by coverage)
     let (rx1, ry1) = (rx0 + w, ry0 + h);
     let region_tiles: Vec<(u32, u32)> = (ry0 / TILE..ry1.div_ceil(TILE)).flat_map(|y| (rx0 / TILE..rx1.div_ceil(TILE)).map(move |x| (x, y))).collect();
-    let parts: Vec<Vec<(u32, u32, [f32; 4], Vec<[f32; 3]>)>> = region_tiles
+    let parts: Vec<Vec<RegionTexel>> = region_tiles
         .par_iter()
         .map(|&(tx, ty)| {
             let full = anchor_plan(inp, id, channels, tx, ty, Some(below));
@@ -2808,7 +2811,7 @@ mod tests {
             let mut g = GraphRef::new(colour.clone(), "colour");
             g.output = Some(output.into());
             g.keep = ["colour".to_string(), "grey".to_string()].into();
-            Source::Graph(g)
+            Source::Graph(Box::new(g))
         };
         let mut f = fixture();
         let id = fill_layer(&mut f.project, [0.0; 3], 0.0);

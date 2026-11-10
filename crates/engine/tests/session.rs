@@ -288,7 +288,7 @@ fn graph_session() -> Session {
     for (c, g) in
         [(Channel::BaseColor, hostile.clone()), (Channel::Roughness, deep.clone()), (Channel::Metallic, missing.clone()), (Channel::Height, unparsable.clone())]
     {
-        fill.sources.insert(c, Source::Graph(g));
+        fill.sources.insert(c, Source::Graph(Box::new(g)));
     }
     let id = s.doc.project.alloc_id();
     let mut layer = Layer::new(id, "graphs", LayerKind::Fill(fill), &Channel::DEFAULT_SET);

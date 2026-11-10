@@ -260,20 +260,20 @@ fn decompiled(what: &str, name: &str) -> Status {
 
 /// A procedural source of a fill in layer content writing `channels`: one graph source per channel the graph has an
 /// output for (sharing one render), or the placeholder that stands for it.
-pub fn fill_sources(input: &SetInput, anchors: &Anchors, source: &ProceduralSource, channels: &[Channel]) -> Result<FillGraph, GraphUse> {
+pub fn fill_sources(input: &SetInput, anchors: &Anchors, source: &ProceduralSource, channels: &[Channel]) -> Result<FillGraph, Box<GraphUse>> {
     let graph = name_of(source.procedural.as_ref());
     let what = if source.mode == 1 { "material fill" } else { "procedural fill" };
     let names: Vec<String> = channels.iter().map(|c| input.channels.label(*c)).collect();
     let label = if names.is_empty() { format!("{what} \"{graph}\"") } else { format!("{what} \"{graph}\" ({})", names.join(", ")) };
     let Some(p) = source.procedural.as_ref() else {
-        return Err(placeholder(label.clone(), graph.clone(), Status::not_computable(Blocker::graph(&graph, label))));
+        return Err(Box::new(placeholder(label.clone(), graph.clone(), Status::not_computable(Blocker::graph(&graph, label)))));
     };
-    let (lib, g) = library_graph(input, p, &label).map_err(|why| placeholder(label.clone(), graph.clone(), why))?;
+    let (lib, g) = library_graph(input, p, &label).map_err(|why| Box::new(placeholder(label.clone(), graph.clone(), why)))?;
     let mut cook = Cook { input, anchors, lib, status: decompiled(what, &graph) };
     let none = BTreeMap::new();
     let mut base = cook.recipe(p, g, Reads { anchors: false, stack: &none }, 0);
     if !cook.status.is_computable() {
-        return Err(placeholder(label, graph, cook.status));
+        return Err(Box::new(placeholder(label, graph, cook.status)));
     }
     let wired: Vec<(Channel, String)> = channels.iter().filter_map(|c| Some((*c, output_for(p, &g.graph, input.channels.project_channel(*c))?))).collect();
     base.alpha_output = alpha_output(p, &g.graph);
@@ -283,7 +283,7 @@ pub fn fill_sources(input: &SetInput, anchors: &Anchors, source: &ProceduralSour
         .map(|(c, o)| {
             let mut r = base.clone();
             r.output = Some(o);
-            (c, Source::Graph(r))
+            (c, Source::Graph(Box::new(r)))
         })
         .collect();
     Ok(FillGraph { sources, status: cook.status, graph })

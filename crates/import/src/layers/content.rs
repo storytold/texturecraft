@@ -569,7 +569,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                             Some((_, sources)) => {
                                 sources.insert(c, source);
                             }
-                            None => parts.groups.push((blend.clone(), BTreeMap::from([(c, source)]))),
+                            None => parts.groups.push((*blend, BTreeMap::from([(c, source)]))),
                         }
                     }
                     parts.graph_names.push(fg.graph);
@@ -579,7 +579,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                         parts.status.entry(*c).or_default().and(&g.status);
                     }
                     let Some((_, blend)) = blends.first().cloned() else { continue };
-                    parts.graphs.push((g, channels, blend));
+                    parts.graphs.push((*g, channels, blend));
                 }
             }
         }

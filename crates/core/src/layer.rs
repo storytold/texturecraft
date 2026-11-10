@@ -363,7 +363,7 @@ pub enum Source {
     /// `channel`; colors read as gray where a scalar is needed.
     Anchor { anchor: LayerId, channel: Channel },
     /// One output of a node graph ([`GraphRef::output`]), rendered for the texture set and sampled like an image.
-    Graph(GraphRef),
+    Graph(Box<GraphRef>),
 }
 
 impl Source {

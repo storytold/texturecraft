@@ -963,7 +963,7 @@ fn graph_sample() -> (ProjectFile, String) {
     let mut g = GraphRef::new(grey.clone(), "grey");
     g.output = Some("grey".into());
     let mut fill = Fill::default();
-    fill.sources.insert(Channel::Roughness, Source::Graph(g.clone()));
+    fill.sources.insert(Channel::Roughness, Source::Graph(Box::new(g.clone())));
     let id = pf.project.alloc_id();
     let mut layer = Layer::new(id, "Graph fill", LayerKind::Fill(fill), &[Channel::Roughness]);
     let mut outer = GraphRef::new(texturecraft_core::text_key("absent outer"), "outer");
