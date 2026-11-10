@@ -51,9 +51,10 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         crate::toolbar::paint_bar(app, ui);
     }
 
+    crate::id_color_pick::IdColorPick::end_when_stale(app);
     let tokens = Tokens::get(ui.ctx());
     let aux_view = match app.session.view {
-        _ if mode == crate::state::Mode::Painting && app.session.quick_mask.editing => Some(crate::gpu::AuxView::QuickMask),
+        _ if mode == crate::state::Mode::Painting && app.session.quick_mask.editing && app.picking_id_color.is_none() => Some(crate::gpu::AuxView::QuickMask),
         ViewMode::MeshMap(map) => Some(crate::gpu::AuxView::MeshMap(map)),
         ViewMode::Mask(id) => Some(crate::gpu::AuxView::Mask(id)),
         _ => None,
@@ -217,7 +218,7 @@ fn split_divider_grab(ui: &Ui, full: Rect, divider_x: f32) {
 
 fn shade(app: &TextureCraftApp) -> Shade {
     let (view_mode, channel) = match app.session.view {
-        _ if app.ui.mode == crate::state::Mode::Painting && app.session.quick_mask.editing => (2, 0),
+        _ if app.ui.mode == crate::state::Mode::Painting && app.session.quick_mask.editing && app.picking_id_color.is_none() => (2, 0),
         ViewMode::Material => (0, 0),
         ViewMode::Channel(selected_channel) => (1, selected_channel.index() as u32),
         ViewMode::MeshMap(_) | ViewMode::Mask(_) => (2, 0),
@@ -309,30 +310,44 @@ fn frame_size_in_pixels(ui: &Ui, rect: Rect) -> [u32; 2] {
     [pixels(rect.left(), rect.right()), pixels(rect.top(), rect.bottom())]
 }
 
-fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, frame: Frame, sync: &mut PendingSync) {
-    let tk = Tokens::get(ui.ctx());
+fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, mut frame: Frame, sync: &mut PendingSync) {
+    let tokens = Tokens::get(ui.ctx());
+    let bake = bake_visualization(app);
+    frame.shade.bake = bake.filter(|_| frame.kind == ViewKind::Scene);
     let scene = match (sync.0.take(), app.gpu.as_mut()) {
-        (Some(aux), Some(g)) => {
-            let t0 = crate::now_ms();
-            let scene = g.sync(&mut app.session, aux, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms));
-            let reports = g.take_reports();
-            app.profiler.sync_ms += (crate::now_ms() - t0) as f32;
+        (Some(aux), Some(gpu_link)) => {
+            let sync_start_ms = crate::now_ms();
+            let scene = gpu_link.sync(&mut app.session, aux, bake, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms));
+            let reports = gpu_link.take_reports();
+            app.profiler.sync_ms += (crate::now_ms() - sync_start_ms) as f32;
             gpu_report_toasts(app, reports);
-            // Display tiles left for later frames (the frame budget ran out).
-            if app.session.caches.iter().any(|c| !c.upload.is_empty()) {
+
+            // Display tiles left for later frames (the frame budget ran out), or the bake visualization still being worked out
+            if app.session.caches.iter().any(|cache| !cache.upload.is_empty()) || app.gpu.as_ref().is_some_and(crate::gpu::GpuLink::bake_busy) {
                 ui.ctx().request_repaint();
             }
             Some(scene)
         }
         _ => None,
     };
+
     let Some(gpu) = &app.gpu else {
-        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, tr("No GPU renderer available"), egui::FontId::proportional(14.0), tk.viewport_text);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            tr("No GPU renderer available"),
+            egui::FontId::proportional(NO_GPU_TEXT_SIZE),
+            tokens.viewport_text,
+        );
         return;
     };
-    let cb = ViewCallback { frame, sync: Mutex::new(scene), rect, lost: gpu.lost.clone() };
-    ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, cb));
+
+    let callback = ViewCallback { frame, sync: Mutex::new(scene), rect, lost: gpu.lost.clone() };
+    ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, callback));
 }
+
+/// Text size of the notice a view shows without a GPU renderer
+const NO_GPU_TEXT_SIZE: f32 = 14.0;
 
 /// Width of the camera and view pickers centred at the top of a view
 const VIEW_HEADER_WIDTH: f32 = 300.0;
@@ -572,8 +587,29 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     crate::properties_popup::open_on_right_click(app, ui, &response, rect, s_held || v_held);
     let popup = app.properties_popup.is_some();
 
+    // A pending ID color pick takes the next click instead of the brush
+    let picking_id_color = app.picking_id_color.is_some();
+    if picking_id_color {
+        crate::id_color_pick::IdColorPick::draw_cursor(ui, rect);
+        if !alt
+            && response.clicked_by(PointerButton::Primary)
+            && let Some(position) = response.interact_pointer_pos()
+        {
+            let (pixel, viewport) = (local(position), app.session.viewport);
+            crate::id_color_pick::IdColorPick::pick_at(app, json!({"x": pixel.x, "y": pixel.y, "viewport": [viewport.x, viewport.y]}));
+        }
+    }
+
     // The selected decal's frame and handles: drag to move, scale or turn it
-    let decal_drag = !alt && !s_held && !v_held && !focus_pick && !popup && placing.is_none() && touch.is_none() && decal_input(app, ui, &response, rect);
+    let decal_drag = !alt
+        && !s_held
+        && !v_held
+        && !focus_pick
+        && !popup
+        && placing.is_none()
+        && !picking_id_color
+        && touch.is_none()
+        && decal_input(app, ui, &response, rect);
 
     // Painting
     let painting = app.ui.mode == crate::state::Mode::Painting
@@ -584,6 +620,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !v_held
         && !focus_pick
         && placing.is_none()
+        && !picking_id_color
         && touch.is_none()
         && !decal_drag;
     let path_tool = app.session.tool.tool == Tool::Path;
@@ -613,7 +650,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
                         }
                         app.last_paint_point = Some(local(pointer));
                     }
-                    Err(error) => app.toast(error.to_string(), true),
+                    Err(error) => app.toast(tr(&error.to_string()).to_string(), true),
                 }
             }
             if response.clicked_by(PointerButton::Primary)
@@ -654,6 +691,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !navigating
         && response.hovered()
         && brush_tool(app.session.tool.tool)
+        && app.picking_id_color.is_none()
         && let Some(hover_pos) = if adjusting { ui.input(|input| input.pointer.press_origin()) } else { response.hover_pos() }
         && let Some(hit) = app.session.pick(local(hover_pos), app.session.viewport)
     {
@@ -680,17 +718,35 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     stencil_overlay(app, ui, rect);
     decal_overlay(app, ui, rect);
     brush_readout(app, ui, &response, adjusting);
-    if app.session.quick_mask.editing {
+    if app.session.quick_mask.editing && app.picking_id_color.is_none() {
         ui.painter_at(rect).text(
-            rect.left_top() + vec2(12.0, 40.0),
+            rect.left_top() + QUICK_MASK_NOTICE_OFFSET,
             egui::Align2::LEFT_TOP,
             tr("Editing quick mask: paint where painting is allowed (U to finish)"),
-            egui::FontId::proportional(12.0),
-            Color32::from_rgb(0xe8, 0x6a, 0x6a),
+            egui::FontId::proportional(QUICK_MASK_NOTICE_TEXT_SIZE),
+            QUICK_MASK_NOTICE_COLOR,
         );
+    }
+    if app.ui.mode == crate::state::Mode::Baking {
+        crate::bake_mode::bake_visualization_panel(app, ui, rect);
     }
     view_header(app, ui, rect, "v3d");
     axis_gizmo(ui, rect, app, false);
+}
+
+/// Where the quick-mask editing notice sits from the 3D view's top-left corner, its text size and its warning red
+const QUICK_MASK_NOTICE_OFFSET: egui::Vec2 = vec2(12.0, 40.0);
+const QUICK_MASK_NOTICE_TEXT_SIZE: f32 = 12.0;
+const QUICK_MASK_NOTICE_COLOR: Color32 = Color32::from_rgb(0xe8, 0x6a, 0x6a);
+
+/// What bake mode's 3D view draws besides the low poly (nothing in the other modes)
+fn bake_visualization(app: &TextureCraftApp) -> Option<texturecraft_render::BakeVisualization> {
+    // Setup meshes can cover the low-poly map preview; keep the switches for when setup resumes
+    if app.ui.mode != crate::state::Mode::Baking || app.session.bake_preview_active() {
+        return None;
+    }
+
+    app.ui.bake_visualization.visualization(app.session.ts())
 }
 
 /// What a drag on the selected decal's frame does.
@@ -927,6 +983,10 @@ const HANDLE_GRAB: f32 = 8.0;
 /// Path tool keys: Enter applies the path, Backspace removes its last point (Esc, handled with
 /// the global shortcuts, cancels it).
 fn path_keys(app: &mut TextureCraftApp, ui: &Ui) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::updates_ui::blocks_input(app) {
+        return;
+    }
     if app.ui.mode != crate::state::Mode::Painting
         || app.session.tool.tool != Tool::Path
         || app.session.tool.path.points.is_empty()
@@ -1326,8 +1386,21 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
 
     crate::properties_popup::open_on_right_click(app, ui, &response, rect, v_held);
 
+    // A pending ID color pick takes the next click instead of the brush
+    let picking_id_color = app.picking_id_color.is_some();
+    if picking_id_color {
+        crate::id_color_pick::IdColorPick::draw_cursor(ui, rect);
+        if !alt
+            && response.clicked_by(PointerButton::Primary)
+            && let Some(position) = response.interact_pointer_pos()
+        {
+            let uv = to_uv(position);
+            crate::id_color_pick::IdColorPick::pick_at(app, json!({"uv": [uv.x, uv.y]}));
+        }
+    }
+
     // Painting in UV space
-    let painting = app.ui.mode == crate::state::Mode::Painting && app.properties_popup.is_none() && !alt && !adjusting && !v_held;
+    let painting = app.ui.mode == crate::state::Mode::Painting && app.properties_popup.is_none() && !alt && !adjusting && !v_held && !picking_id_color;
     let mut fill_box = None;
     if painting && path_tool {
         path_input(app, ui, &response, true, |_, pointer| Some(to_uv(pointer).extend(0.0)), show);
@@ -1510,6 +1583,28 @@ fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, t
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_bake_preview_hides_setup_overlays_and_restores_their_preferences() {
+        let session = texturecraft_engine::sample_session(256, 64).unwrap();
+        let mut harness = egui_kittest::Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let app = harness.state_mut();
+        app.ui.mode = crate::state::Mode::Baking;
+        let before = bake_visualization(app).unwrap();
+        assert!(before.high_poly && before.cage);
+
+        app.start_bake(vec![0]);
+
+        assert!(bake_visualization(app).is_none(), "setup overlays must not obscure the finished map");
+        for show in [texturecraft_engine::PreviewShow::Pin(BakedMap::Normal), texturecraft_engine::PreviewShow::Material] {
+            app.session.bake_preview_show(show).unwrap();
+            assert!(bake_visualization(app).is_none());
+        }
+
+        app.cancel_bake();
+
+        assert_eq!(bake_visualization(app), Some(before));
+    }
 
     const VIEW: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0));
     const DASH_PERIOD: f32 = RUBBER_BAND_DASH + RUBBER_BAND_GAP;
