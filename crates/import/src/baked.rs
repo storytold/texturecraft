@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use texturecraft_compose::BakedMaps;
 use texturecraft_core::BakedMap;
+use texturecraft_graph::tex::Tex;
 use texturecraft_import_reader::decode::document::{BitmapRef, NormalMapSyscoord};
 use texturecraft_import_reader::project::ProjectFile;
 
@@ -78,7 +79,7 @@ pub fn sources(project: &ProjectFile, set_name: &str, refs: &[BitmapRef]) -> Vec
         .collect()
 }
 
-/// One map read and laid out as TextureCraft holds it at `resolution` (nearest resampling when the bake has another
+/// One map read and laid out as TextureCraft holds it at `resolution` (resampled bilinearly when the bake has another
 /// size), the normal map in OpenGL convention. Returns the dense values and how many bytes the stored block was short.
 pub fn read(
     project: &ProjectFile,
@@ -92,16 +93,25 @@ pub fn read(
     Ok((dense(&read.image, kind, resolution, flip_green), read.missing_bytes))
 }
 
-/// `image` as `kind.components()` floats per texel at `resolution` square, nearest sampling.
+/// `image` as `kind.components()` floats per texel at `resolution` square. A bake of another size is resampled
+/// bilinearly at texel centres, wrapping at the edges: the way the graph runtime samples an image of another size, and
+/// so the way a graph reads a mesh map baked smaller or larger than its set (nearest sampling turned each texel of a
+/// half-size bake into a 2×2 block, and graphs reading it, ambient-occlusion masks among them, steps off along edges).
 pub fn dense(image: &Rgba, kind: BakedMap, resolution: u32, flip_green: bool) -> Vec<f32> {
     let comps = kind.components();
     let r = resolution.max(1) as usize;
+    let same = image.width as usize == r && image.height as usize == r;
+    let resampled = (!same && image.width > 0 && image.height > 0).then(|| {
+        let src = Tex { w: image.width as usize, h: image.height as usize, px: image.px.clone() };
+        Tex::from_fn(r, r, |u, v| src.sample(u, v))
+    });
     let mut out = Vec::with_capacity(r * r * comps);
     for y in 0..r {
-        let sy = (y * image.height as usize / r).min(image.height.saturating_sub(1) as usize) as u32;
         for x in 0..r {
-            let sx = (x * image.width as usize / r).min(image.width.saturating_sub(1) as usize) as u32;
-            let p = image.get(sx, sy);
+            let p = match &resampled {
+                Some(t) => t.px.get(y * r + x).copied().unwrap_or([0.0; 4]),
+                None => image.get(x as u32, y as u32),
+            };
             let p = p.map(|v| if v.is_finite() { v } else { 0.0 });
             if comps == 3 {
                 out.extend([p[0], if flip_green { 1.0 - p[1] } else { p[1] }, p[2]]);
@@ -136,10 +146,40 @@ mod tests {
         let img = Rgba { width: 2, height: 1, px: vec![[0.2, 0.3, 1.0, 1.0], [0.8, 0.9, 1.0, 1.0]] };
         let ao = dense(&img, BakedMap::AmbientOcclusion, 4, false);
         assert_eq!(ao.len(), 16);
-        assert_eq!((ao[0], ao[3]), (0.2, 0.8));
+        // texel centres 1/8 and 3/8 of the way across: bilinear between the two texels, wrapping at the left edge
+        assert!((ao[0] - 0.35).abs() < 1e-6 && (ao[1] - 0.35).abs() < 1e-6, "{ao:?}");
+        assert!((ao[2] - 0.65).abs() < 1e-6 && (ao[3] - 0.65).abs() < 1e-6, "{ao:?}");
         let n = dense(&img, BakedMap::Normal, 2, true);
         assert!((n[1] - 0.7).abs() < 1e-6, "green flipped: {n:?}");
         let m = maps(2, [(BakedMap::Normal, n)].into());
         assert_eq!(m.height(BakedMap::Normal), 2);
+    }
+
+    #[test]
+    fn a_bake_of_the_set_size_is_copied() {
+        let px: Vec<[f32; 4]> = (0..9).map(|i| [i as f32 / 8.0, 0.0, 0.0, 1.0]).collect();
+        let img = Rgba { width: 3, height: 3, px: px.clone() };
+        let ao = dense(&img, BakedMap::AmbientOcclusion, 3, false);
+        assert_eq!(ao, px.iter().map(|p| p[0]).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_half_size_bake_is_smooth_not_blocky() {
+        // a horizontal ramp baked at 8 texels, read by a 16-texel set: nearest sampling repeated every value twice
+        let img = Rgba { width: 8, height: 8, px: (0..64).map(|i| [(i % 8) as f32 / 7.0, 0.0, 0.0, 1.0]).collect() };
+        let ao = dense(&img, BakedMap::AmbientOcclusion, 16, false);
+        let row: Vec<f32> = ao[16 * 5..16 * 6].to_vec();
+        for x in 1..14 {
+            assert!(row[x + 1] > row[x], "strictly rising inside the ramp at {x}: {row:?}");
+        }
+        // between source texels 2 and 3 (values 2/7 and 3/7), a quarter and three quarters of the way
+        assert!((row[5] - (2.25 / 7.0)).abs() < 1e-5 && (row[6] - (2.75 / 7.0)).abs() < 1e-5, "{row:?}");
+    }
+
+    #[test]
+    fn a_double_size_bake_averages_texel_pairs() {
+        let img = Rgba { width: 4, height: 4, px: (0..16).map(|i| [if i % 2 == 0 { 0.0 } else { 1.0 }, 0.0, 0.0, 1.0]).collect() };
+        let ao = dense(&img, BakedMap::AmbientOcclusion, 2, false);
+        assert!(ao.iter().all(|v| (v - 0.5).abs() < 1e-6), "{ao:?}");
     }
 }

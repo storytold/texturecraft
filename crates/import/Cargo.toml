@@ -17,6 +17,8 @@ texturecraft-texel = { workspace = true }
 texturecraft-geom = { workspace = true }
 texturecraft-compose = { workspace = true }
 texturecraft-import-reader = { workspace = true }
+# Resamples baked mesh maps of another size the way graphs sample images.
+texturecraft-graph = { workspace = true }
 glam = { workspace = true }
 rayon = { workspace = true }
 # Writes the project's image resources as PNG (8/16-bit) and EXR (float) files the engine decodes.
@@ -24,4 +26,3 @@ image = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-texturecraft-graph = { workspace = true }
