@@ -230,6 +230,39 @@ fn image_resources_fill_layers_and_round_trip() {
     assert!(s.import_resource_bytes("bad.png", vec![1, 2, 3]).is_err());
 }
 
+/// A name is the exact one the import returned, extension included (#337)
+#[test]
+fn adding_an_image_layer_without_the_extension_says_which_resource_exists() {
+    let mut s = session();
+    let mut png = Vec::new();
+    let img = image::RgbaImage::from_fn(8, 8, |_, _| image::Rgba([255, 0, 0, 255]));
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    assert_eq!(s.import_resource_bytes("C:/x/src_0.png", png).unwrap(), "src_0.png");
+
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "src_0"})).unwrap_err().to_string();
+
+    assert_eq!(err, "`layer.add.image`: no resource `src_0`; available: src_0.png");
+    let doc = command_specs().iter().find(|c| c.id == "layer.add.image").unwrap().params;
+    assert!(doc.contains("with the extension"), "the params doc names the exact name: {doc}");
+}
+
+#[test]
+fn a_missing_resource_message_lists_at_most_eight_names() {
+    let mut s = session();
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "src_0"})).unwrap_err().to_string();
+    assert_eq!(err, "`layer.add.image`: no resource `src_0`; the project has no resources, import one with `resource.import`");
+    for i in 0..10 {
+        s.doc.resources.insert(format!("img_{i}.png"), std::sync::Arc::new(Vec::new()));
+    }
+
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "src_0"})).unwrap_err().to_string();
+
+    assert_eq!(
+        err,
+        "`layer.add.image`: no resource `src_0`; available: img_0.png, img_1.png, img_2.png, img_3.png, img_4.png, img_5.png, img_6.png, img_7.png and 2 more (`resource.list`)"
+    );
+}
+
 #[test]
 fn brush_presets_apply_save_and_load() {
     let mut s = session();

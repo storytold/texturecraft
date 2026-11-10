@@ -21,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add fill layer from image",
             [],
             None,
-            "{name, channel?: baseColor, projection?: uv|triplanar|planar, scale?}",
+            "{name — exactly as `resource.import` or `resource.list` returns it, with the extension (e.g. \"src_0.png\"), channel?: baseColor, projection?: uv|triplanar|planar, scale?}",
             always,
             add_image_fill
         ),
@@ -179,10 +179,31 @@ fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({ "removed": unused }))
 }
 
+/// The error for a name that is not a resource, listing the names the document has
+fn missing_resource(s: &Session, name: &str) -> String {
+    // Enough names to recognise a typo without pasting a whole resource list into the error
+    const MAX_LISTED: usize = 8;
+
+    let mut msg = format!("no resource `{name}`");
+    if s.doc.resources.is_empty() {
+        msg.push_str("; the project has no resources, import one with `resource.import`");
+        return msg;
+    }
+
+    let names: Vec<&str> = s.doc.resources.keys().map(String::as_str).take(MAX_LISTED).collect();
+    msg.push_str(&format!("; available: {}", names.join(", ")));
+    let rest = s.doc.resources.len() - names.len();
+    if rest > 0 {
+        msg.push_str(&format!(" and {rest} more (`resource.list`)"));
+    }
+
+    msg
+}
+
 fn add_image_fill(s: &mut Session, p: &Value) -> Result<Value> {
     let name = strp(p, "name").ok_or_else(|| bad("layer.add.image", "`name` is required"))?.to_string();
     if !s.doc.resources.contains_key(&name) {
-        return Err(bad("layer.add.image", format!("no resource `{name}`")));
+        return Err(bad("layer.add.image", missing_resource(s, &name)));
     }
     let ch = channel_param("layer.add.image", p, "channel")?.unwrap_or(Channel::BaseColor);
     let projection = crate::layer_cmds::projection_from(p, "layer.add.image", None)?;
