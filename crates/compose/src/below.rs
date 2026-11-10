@@ -254,13 +254,14 @@ impl BelowCache {
     /// The path to the hot layer for `inp`: everything off the path is served from the cache.
     /// None when the hot layer is not drawn in the set (or drawn twice), when there is nothing
     /// to cache, or when the cached part could change (anchors read the stack, or it holds the
-    /// live stroke). Empties the cache when what the cached part reads changed.
+    /// live stroke, or effect layers start from it). Empties the cache when what the cached part reads changed.
     pub(crate) fn prepare(&mut self, inp: &Inputs) -> Option<Vec<Level>> {
         let hot = self.hot?;
         let p = inp.project;
         let set = p.texture_set(inp.ts).ok()?;
-        // Anchor readers depend on the stack below them.
-        if p.render_tree(&set.stack).iter().any(|id| p.layers.get(id).is_some_and(Layer::reads_anchor)) {
+        // Anchor readers and effect layers depend on the stack below them.
+        let reads_below = |l: &Layer| l.reads_anchor() || Channel::ALL.iter().any(|c| crate::eval::starts_from_below(l, *c));
+        if p.render_tree(&set.stack).iter().any(|id| p.layers.get(id).is_some_and(reads_below) || p.content_layer(*id).is_some_and(reads_below)) {
             return None;
         }
         let levels = path(p, &set.stack, hot)?;

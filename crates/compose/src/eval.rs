@@ -215,6 +215,8 @@ struct ChanPlan<'a> {
     start: Option<(usize, &'a Field)>,
     /// The cook of a fill's graph source on this channel.
     graph: Option<Arc<Cooked>>,
+    /// An effect layer's channel ([`starts_from_below`]): its content starts from the stack below it.
+    from_below: bool,
 }
 
 enum Content<'a> {
@@ -539,9 +541,26 @@ fn anchor_plan<'a>(inp: &Inputs<'a>, id: LayerId, channels: &[Channel], tx: u32,
     }
 }
 
+/// The whole stack of the set planned for tile (tx, ty), for evaluating what lies below a layer.
+fn stack_plan<'a>(inp: &Inputs<'a>, channels: &[Channel], tx: u32, ty: u32, fields: Option<&'a Fields>) -> Vec<Node<'a>> {
+    match inp.project.texture_set(inp.ts) {
+        Ok(set) => plan(inp, &set.stack, channels, tx, ty, 0, fields),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Whether layer `id` (its own mask, or the content it draws) reads an anchor point.
 pub(crate) fn reads_anchor(p: &Project, id: LayerId) -> bool {
     p.layers.get(&id).is_some_and(Layer::reads_anchor) || p.content_layer(id).is_some_and(Layer::reads_anchor)
+}
+
+/// Whether `l` is an effect layer on `channel`: a paint or fill layer (not a folder) with visible content effects that
+/// blends the channel with `Passthrough`. Its content starts from the stack below it instead of from nothing (its own
+/// paint or fill laid over that), its effects work on that, and the result takes the stack's place by the layer's
+/// strength: a filter on such a layer filters what is below it. Without content effects the result is the same as a
+/// normal blend.
+pub(crate) fn starts_from_below(l: &Layer, channel: Channel) -> bool {
+    !l.is_group() && l.content_effects.iter().any(|e| e.visible) && l.blend(channel).is_some_and(|b| b.mode == BlendMode::Passthrough)
 }
 
 /// The mask layer `id` draws with: its own, or an instance source's.
@@ -678,7 +697,8 @@ fn stack_region(
     let parts: Vec<Vec<RegionTexel>> = region_tiles
         .par_iter()
         .map(|&(tx, ty)| {
-            let full = anchor_plan(inp, id, channels, tx, ty, Some(below));
+            let from_below = matches!(job, Job::Content(c) if inp.project.content_layer(id).is_some_and(|l| starts_from_below(l, c)));
+            let full = if from_below { stack_plan(inp, channels, tx, ty, Some(below)) } else { anchor_plan(inp, id, channels, tx, ty, Some(below)) };
             let preview_tile = inp.preview.and_then(|preview| preview.alpha.tile(tx, ty));
             let mut mask = None;
             let mut nodes = Vec::new();
@@ -701,12 +721,13 @@ fn stack_region(
             tile_texels(inp.gbuf, tx, ty)
                 .map(|(x, y, offset)| {
                     let mut texel = Texel::new(inp, x, y, offset, stroke_at(preview_tile, offset));
-                    if !full.is_empty() {
-                        texel.anchors_below(&full, id);
-                    }
+                    let acc = if full.is_empty() { None } else { Some(texel.anchors_below(&full, id)) };
                     let value = match (&mask, nodes.first()) {
                         (Some(mask_stack), _) => [texel.mask(mask_stack), 0.0, 0.0, 0.0],
-                        (None, Some(node)) => match node.chans.first().and_then(|chan| texel.content(&node.content, chan)) {
+                        (None, Some(node)) => match node.chans.first().and_then(|chan| {
+                            let below = if chan.from_below { acc.and_then(|a| a.get(chan.ch).copied()) } else { None };
+                            texel.content_over(&node.content, chan, usize::MAX, below)
+                        }) {
                             Some((color, cov)) => [color[0] * cov, color[1] * cov, color[2] * cov, cov],
                             None => [0.0; 4],
                         },
@@ -1313,6 +1334,7 @@ fn plan_node<'a>(
                 effects,
                 start,
                 graph,
+                from_below: starts_from_below(layer, *c),
             })
         })
         .collect::<Vec<_>>();
@@ -1468,7 +1490,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     }
 
     /// [`Texel::content`] through the tape: the coverage (0 where empty), then the value.
-    fn tape_content(&mut self, content: &Content, c: &ChanPlan) -> Option<([f32; 3], f32)> {
+    fn tape_content(&mut self, content: &Content, c: &ChanPlan, below: Option<[f32; 3]>) -> Option<([f32; 3], f32)> {
         if let Tape::Replay(..) = self.tape {
             let cov = self.tape.next();
             // Recorded as 0 where empty.
@@ -1478,7 +1500,7 @@ impl<'a, 'b> Texel<'a, 'b> {
             let v = if c.comps == 3 { [self.tape.next(), self.tape.next(), self.tape.next()] } else { [self.tape.next(); 3] };
             return Some((v, cov));
         }
-        let r = self.content(content, c);
+        let r = self.content_over(content, c, usize::MAX, below);
         if let Tape::Record(t) = &mut self.tape {
             match r {
                 Some((v, cov)) => {
@@ -1807,6 +1829,8 @@ impl<'a, 'b> Texel<'a, 'b> {
                 Content::Group(children) if m > 0.0 || n.has_anchor || self.stop.is_some() => {
                     let mut inner = *acc;
                     if self.eval(children, &mut inner) {
+                        // stopped inside: the stack below the stop layer is the folder's inner stack
+                        *acc = inner;
                         return true;
                     }
                     if m > 0.0 {
@@ -1816,7 +1840,8 @@ impl<'a, 'b> Texel<'a, 'b> {
                 Content::Fill(_) | Content::Paint { .. } if m > 0.0 => {
                     let before = if n.anchors.iter().any(|a| a.1.is_some()) { Some(*acc) } else { None };
                     for c in &n.chans {
-                        if let Some((v, cov)) = self.tape_content(&n.content, c) {
+                        let below = if c.from_below { acc.get(c.ch).copied() } else { None };
+                        if let Some((v, cov)) = self.tape_content(&n.content, c, below) {
                             apply(acc, c, v, cov, m);
                         }
                     }
@@ -1825,7 +1850,8 @@ impl<'a, 'b> Texel<'a, 'b> {
                         let rec = match (cut, before) {
                             (Some(k), Some(mut b)) => {
                                 for c in &n.chans {
-                                    if let Some((v, cov)) = self.content_to(&n.content, c, *k) {
+                                    let below = if c.from_below { b.get(c.ch).copied() } else { None };
+                                    if let Some((v, cov)) = self.content_over(&n.content, c, *k, below) {
                                         apply(&mut b, c, v, cov, m);
                                     }
                                 }
@@ -1951,12 +1977,13 @@ impl<'a, 'b> Texel<'a, 'b> {
 
     /// Record the anchors of the stack below layer `id` (`full` is the planned stack), to
     /// evaluate that layer on its own.
-    fn anchors_below(&mut self, full: &[Node], id: LayerId) {
+    fn anchors_below(&mut self, full: &[Node], id: LayerId) -> Acc {
         self.anchors.clear();
         self.stop = Some(id);
         let mut acc = Channel::ALL.map(Channel::default_value);
         self.eval(full, &mut acc);
         self.stop = None;
+        acc
     }
 
     /// Straight value and coverage of one channel of a paint or fill layer at this texel
@@ -1967,6 +1994,13 @@ impl<'a, 'b> Texel<'a, 'b> {
 
     /// [`Texel::content`] with only the first `end` visible content effects.
     fn content_to(&mut self, content: &Content, c: &ChanPlan, end: usize) -> Option<([f32; 3], f32)> {
+        self.content_over(content, c, end, None)
+    }
+
+    /// [`Texel::content_to`] starting from `below` when given (an effect layer's channel: the stack below it, fully
+    /// covered, with the layer's own paint or fill laid over it before its effects). A precomputed field already
+    /// holds it.
+    fn content_over(&mut self, content: &Content, c: &ChanPlan, end: usize, below: Option<[f32; 3]>) -> Option<([f32; 3], f32)> {
         let start = c.start.filter(|(k, _)| *k < end);
         let (mut v, mut cov, skip) = match start.and_then(|(k, f)| f.get(self.x, self.y).map(|d| (k, d))) {
             Some((k, d)) => {
@@ -1988,7 +2022,10 @@ impl<'a, 'b> Texel<'a, 'b> {
                     Content::Paint { preview } => self.painted(c.data.as_deref(), c, *preview),
                     Content::Group(_) => return None,
                 };
-                (v, cov, 0)
+                match below {
+                    Some(b) => (mix3(b, v, cov.clamp(0.0, 1.0)), 1.0, 0),
+                    None => (v, cov, 0),
+                }
             }
         };
         for e in c.effects.iter().take(end).skip(skip) {
@@ -2879,6 +2916,90 @@ mod tests {
         }
         run_with(&f, &graphs);
         assert!(graphs.problems().iter().any(|(u, p)| u.id == LayerId(900) && !p.stale));
+    }
+
+    /// A paint layer with nothing painted, blending base colour with `mode`, holding one content effect.
+    fn filter_layer(f: &mut Fixture, mode: BlendMode, kind: EffectKind) -> LayerId {
+        let id = f.project.alloc_id();
+        let mut l = Layer::new(id, "Filter", LayerKind::Paint, &[Channel::BaseColor]);
+        l.channels.insert(Channel::BaseColor, ChannelBlend { mode, opacity: 1.0 });
+        let id = f.project.insert_layer(0, l, None, false).unwrap();
+        content_fx(f, id, kind);
+        id
+    }
+
+    #[test]
+    fn effect_layers_filter_the_stack_below_them() {
+        use crate::graphs::tests::INVERT;
+        let lin = |v: [f32; 3]| v.map(texturecraft_texel::srgb_to_linear);
+        let mut graphs = GraphStore::default();
+        let invert = graphs.add_text(INVERT);
+        let mut filter = GraphRef::new(invert, "invert");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        let graph = EffectKind::Graph { graph: filter, projection: Projection::default() };
+
+        // a normal paint layer filters its own (empty) content: nothing shows
+        let mut f = fixture();
+        fill_layer(&mut f.project, lin([0.25, 0.5, 0.75]), 0.5);
+        let id = filter_layer(&mut f, BlendMode::Normal, graph.clone());
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), lin([0.25, 0.5, 0.75])), "{:?}", out.value(Channel::BaseColor, 10, 10));
+
+        // passthrough: the graph filters the stack below
+        f.project.layer_mut(id).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 });
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), lin([0.75, 0.5, 0.25])), "{:?}", out.value(Channel::BaseColor, 10, 10));
+        assert!(close(out.value(Channel::Roughness, 10, 10), [0.5; 3]), "channels the layer does not blend stay");
+
+        // its strength fades between the stack and the filtered stack; a mask limits it
+        f.project.layer_mut(id).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Passthrough, opacity: 0.5 });
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), mix3(lin([0.25, 0.5, 0.75]), lin([0.75, 0.5, 0.25]), 0.5)));
+        f.project.layer_mut(id).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 });
+        let me = f.project.alloc_id();
+        f.project.layer_mut(id).unwrap().mask = Some(Mask { effects: vec![Effect::new(me, EffectKind::Paint)], ..Mask::new(MaskBackground::Black) });
+        let img = f.pixels.masks.entry(me).or_insert_with(|| TileImage::new(64, 64, 2));
+        for y in 0..64 {
+            for x in 0..32 {
+                img.set(x, y, &[to_u16(1.0), to_u16(1.0)]);
+            }
+        }
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), lin([0.75, 0.5, 0.25])), "{:?}", out.value(Channel::BaseColor, 10, 10));
+        assert!(close(out.value(Channel::BaseColor, 50, 10), lin([0.25, 0.5, 0.75])), "{:?}", out.value(Channel::BaseColor, 50, 10));
+
+        // a per-texel filter on an effect layer works on the stack below too
+        let mut f = fixture();
+        fill_layer(&mut f.project, [1.0, 0.0, 0.0], 0.2);
+        filter_layer(&mut f, BlendMode::Passthrough, EffectKind::Filter(Filter::Invert));
+        let out = run(&f, None);
+        assert!(close(out.value(Channel::BaseColor, 5, 5), [0.0, 1.0, 1.0]), "{:?}", out.value(Channel::BaseColor, 5, 5));
+        assert!(close(out.value(Channel::Roughness, 5, 5), [0.2; 3]));
+    }
+
+    #[test]
+    fn effect_layers_in_a_folder_start_from_the_folder_stack() {
+        let mut f = fixture();
+        fill_layer(&mut f.project, [1.0, 0.0, 0.0], 0.2);
+        let gid = f.project.alloc_id();
+        let g = Layer::new(gid, "Folder", LayerKind::Group { children: Vec::new(), collapsed: false }, &[Channel::BaseColor]);
+        let gid = f.project.insert_layer(0, g, None, false).unwrap();
+        let inner = f.project.alloc_id();
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::BaseColor, Source::Uniform([0.0, 0.0, 1.0]));
+        let l = Layer::new(inner, "Blue", LayerKind::Fill(fill), &[Channel::BaseColor]);
+        let inner = f.project.insert_layer(0, l, Some(gid), true).unwrap();
+        let fx = f.project.alloc_id();
+        let mut l = Layer::new(fx, "Filter", LayerKind::Paint, &[Channel::BaseColor]);
+        l.channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 });
+        let fx = f.project.insert_layer(0, l, Some(inner), false).unwrap();
+        content_fx(&mut f, fx, EffectKind::Filter(Filter::Invert));
+        let out = run(&f, None);
+        assert!(
+            close(out.value(Channel::BaseColor, 5, 5), [1.0, 1.0, 0.0]),
+            "the blue fill inside the folder inverted: {:?}",
+            out.value(Channel::BaseColor, 5, 5)
+        );
     }
 
     #[test]
