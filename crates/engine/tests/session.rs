@@ -309,6 +309,37 @@ fn image_resources_fill_layers_and_round_trip() {
 }
 
 #[test]
+fn image_resource_lookup_accepts_extension_and_stem() {
+    let mut s = session();
+
+    // No resources imported yet
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "missing"})).unwrap_err();
+    assert!(err.to_string().contains("no resource `missing` (no resources imported: use resource.import)"));
+
+    let mut png = Vec::new();
+    let img = image::RgbaImage::from_fn(4, 4, |_, _| image::Rgba([0, 255, 0, 255]));
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    s.import_resource_bytes("tile.png", png.clone()).unwrap();
+
+    // Lookup by stem
+    let r = execute(&mut s, "layer.add.image", &json!({"name": "tile"})).unwrap();
+    assert!(r["layer"].as_u64().is_some());
+
+    // Lookup by full name
+    let r2 = execute(&mut s, "layer.add.image", &json!({"name": "tile.png"})).unwrap();
+    assert!(r2["layer"].as_u64().is_some());
+
+    // Missing resource lists available
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "wood"})).unwrap_err();
+    assert!(err.to_string().contains("no resource `wood` (available: tile.png)"));
+
+    // Ambiguous stem resolution
+    s.import_resource_bytes("tile.jpg", png).unwrap();
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "tile"})).unwrap_err();
+    assert!(err.to_string().contains("ambiguous resource `tile`"));
+}
+
+#[test]
 fn brush_presets_apply_save_and_load() {
     let mut s = session();
     let list = execute(&mut s, "brush.preset.list", &Value::Null).unwrap();

@@ -21,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add fill layer from image",
             [],
             None,
-            "{name, channel?: baseColor, projection?: uv|triplanar|planar, scale?}",
+            "{name (exact resource name with extension or unique stem), channel?: baseColor, projection?: uv|triplanar|planar, scale?}",
             always,
             add_image_fill
         ),
@@ -179,11 +179,32 @@ fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({ "removed": unused }))
 }
 
-fn add_image_fill(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = strp(p, "name").ok_or_else(|| bad("layer.add.image", "`name` is required"))?.to_string();
-    if !s.doc.resources.contains_key(&name) {
-        return Err(bad("layer.add.image", format!("no resource `{name}`")));
+fn resolve_resource_name(s: &Session, name: &str) -> Result<String> {
+    if s.doc.resources.contains_key(name) {
+        return Ok(name.to_string());
     }
+    let matches: Vec<&String> = s.doc.resources.keys().filter(|k| std::path::Path::new(k).file_stem().and_then(|stem| stem.to_str()) == Some(name)).collect();
+    match matches.as_slice() {
+        [single] => Ok((*single).clone()),
+        [] => {
+            let available: Vec<_> = s.doc.resources.keys().cloned().collect();
+            let hint = if available.is_empty() {
+                " (no resources imported: use resource.import)".to_string()
+            } else {
+                format!(" (available: {})", available.join(", "))
+            };
+            Err(bad("layer.add.image", format!("no resource `{name}`{hint}")))
+        }
+        multiple => {
+            let matches_str = multiple.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", ");
+            Err(bad("layer.add.image", format!("ambiguous resource `{name}` matches {matches_str}: give the full name with extension")))
+        }
+    }
+}
+
+fn add_image_fill(s: &mut Session, p: &Value) -> Result<Value> {
+    let raw_name = strp(p, "name").ok_or_else(|| bad("layer.add.image", "`name` is required"))?;
+    let name = resolve_resource_name(s, raw_name)?;
     let ch = channel_param("layer.add.image", p, "channel")?.unwrap_or(Channel::BaseColor);
     let projection = crate::layer_cmds::projection_from(p, "layer.add.image", None)?;
     let ts = s.ts();
