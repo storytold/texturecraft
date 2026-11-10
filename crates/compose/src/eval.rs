@@ -1584,6 +1584,25 @@ impl<'a, 'b> Texel<'a, 'b> {
         }
     }
 
+    /// A layer content source's coverage: [`Self::source_alpha`], and an image's own alpha (a fill laid with a
+    /// partly transparent image covers only where the image is opaque; a decal's comes through [`Self::cover`]). Masks
+    /// read images by their value alone.
+    fn content_alpha(&mut self, source: Option<&Source>, cooked: Option<&Cooked>, projection: &Projection) -> f32 {
+        match source {
+            Some(Source::Image { name, .. }) if !matches!(projection, Projection::Decal(_)) => {
+                let Some(image) = self.inp.images.get(name) else { return 1.0 };
+                let (coords, projection, _) = self.projected(projection);
+                let alpha: f32 = image_samples(projection, &coords)
+                    .into_iter()
+                    .filter(|(_, weight)| *weight > 0.0)
+                    .map(|(uv, weight)| image.sample(uv.x, uv.y)[3] * weight)
+                    .sum();
+                if alpha.is_finite() { alpha.clamp(0.0, 1.0) } else { 0.0 }
+            }
+            _ => self.source_alpha(source, cooked, projection),
+        }
+    }
+
     /// The value `source` gives this texel through `projection`, read as a channel of `kind` (`cooked` holds a graph source's outputs)
     fn source(&mut self, source: &Source, projection: &Projection, kind: ChannelKind, cooked: Option<&Cooked>) -> [f32; 3] {
         match source {
@@ -1964,7 +1983,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                             Some(s) => self.source(s, &f.projection, ch.kind(), cooked),
                             None => ch.default_value(),
                         };
-                        (v, self.cover(f.sources.values(), &f.projection) * self.source_alpha(f.sources.get(&ch), cooked, &f.projection))
+                        (v, self.cover(f.sources.values(), &f.projection) * self.content_alpha(f.sources.get(&ch), cooked, &f.projection))
                     }
                     Content::Paint { preview } => self.painted(c.data.as_deref(), c, *preview),
                     Content::Group(_) => return None,
@@ -2046,7 +2065,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                 Some((ch, s)) => {
                     let cooked = e.graph.as_deref();
                     let p = self.source(s, &f.projection, ch.kind(), cooked);
-                    let w = o * self.cover(f.sources.values(), &f.projection) * self.source_alpha(Some(s), cooked, &f.projection);
+                    let w = o * self.cover(f.sources.values(), &f.projection) * self.content_alpha(Some(s), cooked, &f.projection);
                     over(c, e.blend, v, cov, p, w)
                 }
                 None => (v, cov),
@@ -3553,6 +3572,39 @@ soft {soft:?}"
         assert!(close(out.value(Channel::BaseColor, 2, 2), [0.5; 3]), "outside the frame");
         let half = composite(0.5);
         assert!(close(half.value(Channel::BaseColor, 32, 32), [0.75, 0.25, 0.25]), "the image alpha shapes the decal");
+    }
+
+    #[test]
+    fn a_fill_image_covers_by_its_alpha() {
+        let mut f = fixture();
+        fill_layer(&mut f.project, [0.2; 3], 1.0);
+        let id = f.project.alloc_id();
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::BaseColor, Source::image("img"));
+        f.project.insert_layer(0, Layer::new(id, "Image", LayerKind::Fill(fill), &[Channel::BaseColor]), None, false).unwrap();
+        let composite = |alpha: f32| {
+            let img = crate::store::ImageRes { width: 2, height: 2, rgba: vec![[1.0, 0.0, 0.0, alpha]; 4], srgb: false };
+            let images: ImageStore = [("img".to_string(), std::sync::Arc::new(img))].into_iter().collect();
+            let inp = Inputs {
+                project: &f.project,
+                ts: 0,
+                mesh: &f.mesh,
+                gbuf: &f.gbuf,
+                pixels: &f.pixels,
+                baked: &f.baked,
+                block_scales: f.project.texture_sets[0].block_scales(),
+                preview: None,
+                images: &images,
+                graphs: crate::GraphStore::empty(),
+                bounds: f.mesh.bounds(),
+            };
+            let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);
+            composite_tiles(&inp, &mut out, &all_tiles(64, 64));
+            out.value(Channel::BaseColor, 9, 9)
+        };
+        assert!(close(composite(1.0), [1.0, 0.0, 0.0]), "{:?}", composite(1.0));
+        assert!(close(composite(0.0), [0.2; 3]), "a transparent image leaves what is below: {:?}", composite(0.0));
+        assert!(close(composite(0.5), [0.6, 0.1, 0.1]), "{:?}", composite(0.5));
     }
 
     #[test]
