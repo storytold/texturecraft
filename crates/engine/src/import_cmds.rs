@@ -7,9 +7,13 @@
 //! Brush strokes are replayed with TextureCraft's brush by [`crate::import_replay`], which the translator calls per texture
 //! set. Programmatic calls never open dialogs; the two-window import (notice, progress) belongs to the UI.
 
+use std::sync::Mutex;
+
 use serde_json::{Value, json};
 use texturecraft_formats::ProjectFile;
-use texturecraft_import::{Hooks, ImportOptions, Imported};
+use texturecraft_import::{Cancel, Hooks, ImportOptions, Imported};
+/// The project file extension the import reads, and the import's steps.
+pub use texturecraft_import::{PROJECT_EXT, Step};
 
 use crate::commands::{CommandSpec, always, bad, boolp, strp};
 use crate::{EngineError, Result, Session, cmd};
@@ -91,25 +95,217 @@ impl Session {
 
     /// Imports the project file `bytes` (`name` names it) and opens it as the session's project.
     pub fn import_project_bytes(&mut self, bytes: Vec<u8>, name: &str, options: &ImportOptions) -> Result<Value> {
-        if bytes.len() > MAX_BYTES {
-            return Err(bad(ID, format!("the file is {} bytes; at most {MAX_BYTES} are read in memory", bytes.len())));
-        }
-        let mut progress = |_: f32, _: &str| {};
-        let mut hooks = Hooks { progress: &mut progress, cancel: &|| false, replay: Some(&crate::import_replay::BrushReplayer) };
-        let imported = texturecraft_import::import_bytes(bytes, name, options, &mut hooks).map_err(|e| bad(ID, e.to_string()))?;
-        self.open_imported(imported)
+        let task = ImportTask { source: ImportSource::Bytes { bytes, name: name.to_string() }, options: options.clone() };
+        let out = task.run(&ImportProgress::new())?;
+        self.apply_import(out)
     }
 
-    fn open_imported(&mut self, imported: Imported) -> Result<Value> {
-        let summary = summary(&imported);
-        let next = Session::from_imported(imported)?;
-        self.switch_to(next);
+    /// Opens a finished import ([`ImportTask::run`]) as the session's project; the reply is the session with the
+    /// import's summary. An import whose progress was cancelled is refused (its graph store renders nothing more).
+    pub fn apply_import(&mut self, out: ImportOutput) -> Result<Value> {
+        if out.cancel.is_cancelled() {
+            return Err(bad(ID, CANCELLED));
+        }
+        self.switch_to(out.session);
         let mut reply = crate::inspect::session(self);
         if let Some(o) = reply.as_object_mut() {
-            o.insert("import".into(), summary);
+            o.insert("import".into(), out.summary);
         }
         Ok(reply)
     }
+}
+
+/// The error text of a cancelled import.
+pub const CANCELLED: &str = "import cancelled";
+
+/// One import's progress (fraction, step) and its cancel flag, shared between the thread running it and whoever
+/// watches (the UI's progress window, a test, a log).
+pub struct ImportProgress {
+    state: Mutex<(f32, Step)>,
+    /// Set to stop the import: it stops between steps, texture sets and strokes, and a graph render in progress stops
+    /// at its next node.
+    pub cancel: Cancel,
+    listener: Option<Box<dyn Fn(f32, Step) + Send + Sync>>,
+}
+
+impl Default for ImportProgress {
+    fn default() -> Self {
+        ImportProgress::new()
+    }
+}
+
+impl ImportProgress {
+    pub fn new() -> ImportProgress {
+        ImportProgress { state: Mutex::new((0.0, Step::ReadingFile)), cancel: Cancel::new(), listener: None }
+    }
+
+    /// Progress that also calls `listener` on every report (fraction, step), on the thread running the import.
+    pub fn with_listener(listener: impl Fn(f32, Step) + Send + Sync + 'static) -> ImportProgress {
+        ImportProgress { listener: Some(Box::new(listener)), ..ImportProgress::new() }
+    }
+
+    /// The fraction done, 0..1 (never goes back).
+    pub fn fraction(&self) -> f32 {
+        self.lock().0
+    }
+
+    /// The step running now (or the step that failed, after a failure).
+    pub fn step(&self) -> Step {
+        self.lock().1
+    }
+
+    /// Asks the import to stop.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    fn report(&self, fraction: f32, step: Step) {
+        let fraction = {
+            let mut state = self.lock();
+            let f = if fraction.is_finite() { fraction.clamp(state.0, 1.0) } else { state.0 };
+            *state = (f, step);
+            f
+        };
+        if let Some(l) = &self.listener {
+            l(fraction, step);
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, (f32, Step)> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.is_cancelled() { Err(bad(ID, CANCELLED)) } else { Ok(()) }
+    }
+}
+
+/// Where an import reads the project file.
+enum ImportSource {
+    #[cfg(not(target_arch = "wasm32"))]
+    Path(String),
+    Bytes {
+        bytes: Vec<u8>,
+        name: String,
+    },
+}
+
+/// One import, ready to run on a worker thread ([`ImportTask::run`]) and be opened by [`Session::apply_import`]; the
+/// command runs the same steps in one go.
+pub struct ImportTask {
+    source: ImportSource,
+    options: ImportOptions,
+}
+
+/// A finished import: the converted project as a session, the summary the command replies with, and the flag it ran
+/// under.
+pub struct ImportOutput {
+    session: Session,
+    summary: Value,
+    cancel: Cancel,
+}
+
+impl ImportOutput {
+    /// The converted project.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+}
+
+impl ImportTask {
+    /// The import `file.importProject` runs for `p` (its params checked).
+    pub fn from_params(p: &Value) -> Result<ImportTask> {
+        let options = options(p)?;
+        if let Some(v) = p.get("bytes").filter(|v| !v.is_null()) {
+            let bytes = bytes_param(v)?;
+            if bytes.len() > MAX_BYTES {
+                return Err(bad(ID, format!("the file is {} bytes; at most {MAX_BYTES} are read in memory", bytes.len())));
+            }
+            let name = strp(p, "name").unwrap_or("Imported project").to_string();
+            return Ok(ImportTask { source: ImportSource::Bytes { bytes, name }, options });
+        }
+        Ok(ImportTask { source: path_source(p)?, options })
+    }
+
+    /// Imports the file at `path` with the default options.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn path(path: impl Into<String>) -> ImportTask {
+        ImportTask { source: ImportSource::Path(path.into()), options: ImportOptions::default() }
+    }
+
+    /// Imports the project file `bytes` (named `name`) with the default options.
+    pub fn bytes(name: impl Into<String>, bytes: Vec<u8>) -> ImportTask {
+        ImportTask { source: ImportSource::Bytes { bytes, name: name.into() }, options: ImportOptions::default() }
+    }
+
+    /// The path the import reads (`None` for bytes).
+    pub fn source_path(&self) -> Option<&str> {
+        match &self.source {
+            #[cfg(not(target_arch = "wasm32"))]
+            ImportSource::Path(p) => Some(p),
+            ImportSource::Bytes { .. } => None,
+        }
+    }
+
+    /// The file name the import reads (without its folder).
+    pub fn file_name(&self) -> String {
+        match &self.source {
+            #[cfg(not(target_arch = "wasm32"))]
+            ImportSource::Path(p) => std::path::Path::new(p).file_name().map_or_else(|| p.clone(), |n| n.to_string_lossy().into_owned()),
+            ImportSource::Bytes { name, .. } => name.clone(),
+        }
+    }
+
+    /// Converts the file and builds the project's session, reporting to `progress` and stopping when it is cancelled.
+    /// The steps: reading the file, per texture set converting, replaying strokes and cooking graphs, then saving
+    /// (the converted project put together and stored as a TextureCraft project, in memory).
+    pub fn run(self, progress: &ImportProgress) -> Result<ImportOutput> {
+        let ImportTask { source, options } = self;
+        run_with(progress, move |hooks| match source {
+            #[cfg(not(target_arch = "wasm32"))]
+            ImportSource::Path(path) => texturecraft_import::import_path(std::path::Path::new(&path), &options, hooks).map_err(|e| (e, Some(path))),
+            ImportSource::Bytes { bytes, name } => {
+                if bytes.len() > MAX_BYTES {
+                    return Err((
+                        texturecraft_import::ImportError::Invalid(format!("the file is {} bytes; at most {MAX_BYTES} are read in memory", bytes.len())),
+                        None,
+                    ));
+                }
+                texturecraft_import::import_bytes(bytes, &name, &options, hooks).map_err(|e| (e, None))
+            }
+        })
+    }
+}
+
+/// Share of the progress bar the translator takes; the rest is saving.
+const CONVERTING: f32 = 0.9;
+
+/// [`ImportTask::run`] with the conversion given (`convert` runs the translator with the hooks; its error may name the
+/// file it read).
+fn run_with(
+    progress: &ImportProgress,
+    convert: impl FnOnce(&mut Hooks) -> std::result::Result<Imported, (texturecraft_import::ImportError, Option<String>)>,
+) -> Result<ImportOutput> {
+    progress.check()?;
+    let report = |f: f32, step: Step| progress.report(f * CONVERTING, step);
+    let replayer = crate::import_replay::CancellableReplayer(progress.cancel.clone());
+    let mut hooks = Hooks { progress: &report, cancel: &progress.cancel, replay: Some(&replayer) };
+    let imported = convert(&mut hooks).map_err(|(e, path)| match (e, path) {
+        (texturecraft_import::ImportError::Cancelled, _) => bad(ID, CANCELLED),
+        (e, Some(path)) => bad(ID, format!("{path}: {e}")),
+        (e, None) => bad(ID, e.to_string()),
+    })?;
+    progress.check()?;
+    progress.report(CONVERTING, Step::Saving);
+    let summary = summary(&imported);
+    let session = Session::from_imported(imported)?;
+    progress.check()?;
+    progress.report(1.0, Step::Saving);
+    Ok(ImportOutput { session, summary, cancel: progress.cancel.clone() })
 }
 
 /// What the safety net found per texture set.
@@ -184,26 +380,18 @@ fn decode_base64(s: &str) -> Option<Vec<u8>> {
 }
 
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
-    let options = options(p)?;
-    if let Some(v) = p.get("bytes").filter(|v| !v.is_null()) {
-        let bytes = bytes_param(v)?;
-        let name = strp(p, "name").unwrap_or("Imported project");
-        return s.import_project_bytes(bytes, name, &options);
-    }
-    import_path(s, p, &options)
+    let out = ImportTask::from_params(p)?.run(&ImportProgress::new())?;
+    s.apply_import(out)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn import_path(s: &mut Session, p: &Value, options: &ImportOptions) -> Result<Value> {
+fn path_source(p: &Value) -> Result<ImportSource> {
     let path = strp(p, "path").filter(|x| !x.trim().is_empty()).ok_or_else(|| bad(ID, "give `path` (a project file) or `bytes`"))?;
-    let mut progress = |_: f32, _: &str| {};
-    let mut hooks = Hooks { progress: &mut progress, cancel: &|| false, replay: Some(&crate::import_replay::BrushReplayer) };
-    let imported = texturecraft_import::import_path(std::path::Path::new(path), options, &mut hooks).map_err(|e| bad(ID, format!("{path}: {e}")))?;
-    s.open_imported(imported)
+    Ok(ImportSource::Path(path.to_string()))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn import_path(_: &mut Session, _: &Value, _: &ImportOptions) -> Result<Value> {
+fn path_source(_: &Value) -> Result<ImportSource> {
     Err(bad(ID, "`path` is not available in the browser: give `bytes`"))
 }
 
@@ -221,6 +409,173 @@ mod tests {
         assert_eq!(bytes_param(&json!([1, 2, 255])).unwrap(), vec![1, 2, 255]);
         assert!(bytes_param(&json!([256])).is_err());
         assert!(bytes_param(&json!(3)).is_err());
+    }
+
+    use std::sync::Arc;
+    use texturecraft_import::ImportError;
+
+    type Converted = std::result::Result<Imported, (ImportError, Option<String>)>;
+
+    /// A small converted project, as the translator hands it over: one sphere set, its graph store under the import's
+    /// flag.
+    fn synthetic(hooks: &Hooks) -> Imported {
+        let s = Session::new_project("synthetic", texturecraft_geom::primitives::builtin("sphere").unwrap(), "builtin:sphere", None, 128).unwrap();
+        Imported {
+            project: s.doc.project.clone(),
+            pixels: s.doc.pixels.clone(),
+            baked: s.doc.baked.clone(),
+            mesh: (*s.mesh).clone(),
+            resources: Default::default(),
+            graphs: texturecraft_compose::GraphStore::with_cancel(hooks.cancel.clone()),
+            sets: Vec::new(),
+        }
+    }
+
+    /// The steps the translator reports for `sets` texture sets, checking the flag between them as it does.
+    fn translate(hooks: &mut Hooks, sets: usize, stop_at: Option<(usize, &ImportProgress)>) -> Converted {
+        let check = |h: &Hooks| if h.cancel.is_cancelled() { Err((ImportError::Cancelled, None)) } else { Ok(()) };
+        (hooks.progress)(0.0, Step::ReadingFile);
+        for i in 0..sets {
+            check(hooks)?;
+            let (set, of) = (i + 1, sets);
+            let start = 0.1 + 0.8 * i as f32 / sets as f32;
+            (hooks.progress)(start, Step::ConvertingSet { set, of });
+            if let Some((at, progress)) = stop_at
+                && at == set
+            {
+                progress.cancel();
+            }
+            check(hooks)?;
+            (hooks.progress)(start + 0.1, Step::ReplayingStrokes { set, of });
+            (hooks.progress)(start + 0.2, Step::CookingGraphs { set, of });
+        }
+        check(hooks)?;
+        (hooks.progress)(0.95, Step::Saving);
+        Ok(synthetic(hooks))
+    }
+
+    fn sphere_session() -> Session {
+        Session::new_project("t", texturecraft_geom::primitives::builtin("sphere").unwrap(), "builtin:sphere", None, 128).unwrap()
+    }
+
+    #[test]
+    fn progress_reports_every_step_in_order_and_the_project_opens() {
+        let seen = Arc::new(Mutex::new(Vec::<(f32, Step)>::new()));
+        let log = seen.clone();
+        let progress = ImportProgress::with_listener(move |f, step| log.lock().unwrap().push((f, step)));
+        let out = run_with(&progress, |hooks| translate(hooks, 2, None)).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        let mut ids: Vec<&str> = seen.iter().map(|(_, s)| s.id()).collect();
+        ids.dedup();
+        assert_eq!(ids, ["reading", "converting", "replaying", "cooking", "converting", "replaying", "cooking", "saving"]);
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "the fraction never goes back: {seen:?}");
+        assert!(seen.iter().filter(|(_, s)| *s != Step::Saving).all(|(f, _)| *f <= CONVERTING), "the translator's share ends where saving starts");
+        assert_eq!(progress.fraction(), 1.0);
+        assert_eq!(progress.step(), Step::Saving);
+        assert_eq!(seen.iter().filter_map(|(_, s)| s.set()).max(), Some((2, 2)));
+        assert_eq!(Step::ConvertingSet { set: 2, of: 5 }.to_string(), "converting texture set 2 of 5");
+        let mut s = sphere_session();
+        let reply = s.apply_import(out).unwrap();
+        assert_eq!(s.project().name, "synthetic");
+        assert!(reply.get("import").is_some(), "the reply carries the import summary");
+    }
+
+    #[test]
+    fn a_cancel_stops_between_steps_and_nothing_opens() {
+        // before anything runs
+        let progress = ImportProgress::new();
+        progress.cancel();
+        let mut ran = false;
+        let e = run_with(&progress, |hooks| {
+            ran = true;
+            translate(hooks, 1, None)
+        });
+        assert!(!ran && e.is_err_and(|e| e.to_string().contains(CANCELLED)));
+        // during the second texture set: the third is never started
+        let seen = Arc::new(Mutex::new(Vec::<Step>::new()));
+        let log = seen.clone();
+        let progress = ImportProgress::with_listener(move |_, step| log.lock().unwrap().push(step));
+        let e = run_with(&progress, |hooks| translate(hooks, 3, Some((2, &progress))));
+        assert!(e.is_err_and(|e| e.to_string().contains(CANCELLED)));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.last(), Some(&Step::ConvertingSet { set: 2, of: 3 }), "{seen:?}");
+        assert_eq!(progress.step(), Step::ConvertingSet { set: 2, of: 3 }, "the step it stopped in stays readable");
+        // after the translator, before the project is put together
+        let progress = ImportProgress::new();
+        let e = run_with(&progress, |hooks| {
+            let r = translate(hooks, 1, None);
+            progress.cancel();
+            r
+        });
+        assert!(e.is_err_and(|e| e.to_string().contains(CANCELLED)));
+    }
+
+    #[test]
+    fn a_finished_import_cancelled_before_it_opens_is_refused() {
+        let progress = ImportProgress::new();
+        let out = run_with(&progress, |hooks| translate(hooks, 1, None)).unwrap();
+        progress.cancel();
+        let mut s = sphere_session();
+        assert!(s.apply_import(out).is_err());
+        assert_eq!(s.project().name, "t", "the session keeps its project");
+    }
+
+    #[test]
+    fn translator_errors_name_the_file_and_keep_their_step() {
+        let progress = ImportProgress::new();
+        let e = run_with(&progress, |hooks| {
+            (hooks.progress)(0.3, Step::ConvertingSet { set: 1, of: 1 });
+            Err((ImportError::Invalid("no texture set".into()), Some("/x/y.file".into())))
+        })
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("/x/y.file: no texture set"), "{e}");
+        assert_eq!(progress.step(), Step::ConvertingSet { set: 1, of: 1 });
+        assert_eq!(ImportTask::path("/x/y.file").file_name(), "y.file");
+        assert_eq!(ImportTask::bytes("z.file", vec![1]).file_name(), "z.file");
+        // the translator's real errors on hostile bytes arrive the same way
+        let e = ImportTask::bytes("z.file", vec![0, 1, 2]).run(&ImportProgress::new());
+        assert!(e.is_err());
+    }
+
+    /// A graph render in progress stops at its next node when the import is cancelled: the import's graph store
+    /// renders under the import's flag.
+    #[test]
+    fn a_cancel_stops_a_graph_render_in_progress() {
+        let mut text = String::from("format 3\nsize 2048\nnode 1 perlin scale=16\n");
+        for i in 2..=40 {
+            text.push_str(&format!("node {i} blur in=@{} radius=48\n", i - 1));
+        }
+        text.push_str("output out 40\n");
+        let progress = ImportProgress::new();
+        let started = std::sync::OnceLock::new();
+        let stopped_after = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                run_with(&progress, |hooks| {
+                    let mut store = texturecraft_compose::GraphStore::with_cancel(hooks.cancel.clone());
+                    let key = store.add_text(&text);
+                    let (baked, images) = (texturecraft_compose::BakedMaps::default(), texturecraft_compose::ImageStore::default());
+                    let env = texturecraft_compose::graphs::RenderEnv { baked: &baked, images: &images, side: 2048 };
+                    let _ = started.set(());
+                    (hooks.progress)(0.5, Step::CookingGraphs { set: 1, of: 1 });
+                    let cooked = store.cook(&texturecraft_core::GraphRef::new(key, "slow"), &env, &[]);
+                    assert!(cooked.is_err(), "the render was stopped");
+                    Err((ImportError::Cancelled, None))
+                })
+            });
+            while started.get().is_none() {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let t = std::time::Instant::now();
+            progress.cancel();
+            let r = worker.join().unwrap();
+            assert!(r.is_err_and(|e| e.to_string().contains(CANCELLED)));
+            t.elapsed()
+        });
+        eprintln!("graph render stopped {:.0} ms after the cancel", stopped_after.as_secs_f64() * 1000.0);
+        assert!(stopped_after < std::time::Duration::from_secs(5), "{stopped_after:?}");
     }
 
     #[test]

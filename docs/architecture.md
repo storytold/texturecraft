@@ -159,6 +159,15 @@ placeholders locked with a `brush:<what>` or `brush-alpha:<graph>` key, and with
 stored result itself becomes a locked "Original result" paint layer, hidden as a reference unless the
 import is asked to show it. The mesh is kept as binary glTF; nothing else of the original file is kept.
 
+The import runs as an `engine::import_cmds::ImportTask` reporting to an `ImportProgress`: a fraction, the step (reading
+the file; per texture set converting, replaying strokes and cooking graphs; saving) and a cancel flag. The flag is checked
+between steps, texture sets and strokes, and the imported project's graph store renders under it, so a graph render in
+progress stops at its next node. The command runs the task in one go; the desktop app (File › Import project..., or
+opening or dropping such a file) shows exactly two windows (`ui-egui::import_ui`): a notice that must be acknowledged,
+then the progress (bar, step, elapsed time, Cancel) with the task on a worker thread, which opens the converted project
+or turns into the error view (one sentence, "Copy details" with the version, step and error, the issue link, Close).
+Called through the control channel or MCP, the command opens no window.
+
 ## Graph sources and cooked results
 
 `compose::graphs` evaluates graph references. A document's `GraphStore` holds the graph texts by key and the cooks:

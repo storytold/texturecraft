@@ -6,7 +6,7 @@ mod common;
 use std::collections::BTreeSet;
 
 use texturecraft_core::{LayerRole, Project};
-use texturecraft_import::{Hooks, ImportOptions, import_path};
+use texturecraft_import::{Cancel, Hooks, ImportOptions, import_path};
 
 /// Every layer of every set, with its id unique across the project's layers and effects.
 fn check(project: &Project) -> Result<(), String> {
@@ -49,8 +49,8 @@ fn corpus_projects_import_into_valid_projects() {
     let Some(files) = common::files() else { return };
     let mut failures = Vec::new();
     for file in &files {
-        let mut progress = |_: f32, _: &str| {};
-        let mut hooks = Hooks { progress: &mut progress, cancel: &|| false, replay: None };
+        let cancel = Cancel::new();
+        let mut hooks = Hooks { progress: &|_, _| {}, cancel: &cancel, replay: None };
         let result = import_path(file, &ImportOptions::default(), &mut hooks).map_err(|e| e.to_string()).and_then(|i| check(&i.project));
         if let Err(e) = result {
             failures.push(format!("{}: {e}", file.display()));
@@ -64,7 +64,8 @@ fn corpus_projects_import_into_valid_projects() {
 fn a_cancelled_import_stops() {
     let Some(files) = common::files() else { return };
     let Some(file) = files.first() else { return };
-    let mut progress = |_: f32, _: &str| {};
-    let mut hooks = Hooks { progress: &mut progress, cancel: &|| true, replay: None };
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let mut hooks = Hooks { progress: &|_, _| {}, cancel: &cancel, replay: None };
     assert!(matches!(import_path(file, &ImportOptions::default(), &mut hooks), Err(texturecraft_import::ImportError::Cancelled)));
 }

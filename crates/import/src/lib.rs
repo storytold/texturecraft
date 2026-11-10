@@ -39,6 +39,7 @@ pub use error::{ImportError, PartError};
 pub use graph_uses::GraphMode;
 #[cfg(not(target_arch = "wasm32"))]
 pub use import::import_path;
-pub use import::{DEFAULTS_LAYER_NAME, Hooks, IMPORTER, Imported, SetSummary, import_bytes};
+pub use import::{DEFAULTS_LAYER_NAME, Hooks, IMPORTER, Imported, SetSummary, Step, import_bytes};
 pub use options::ImportOptions;
+pub use texturecraft_compose::graphs::Cancel;
 pub use texturecraft_import_reader::format_names::PROJECT_EXT;

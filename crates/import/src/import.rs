@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use texturecraft_compose::graphs::Cancel;
 use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, PixelStore};
 use texturecraft_core::{
     BlendMode, Channel, ChannelBlend, Fidelity, Fill, ImportReport, Layer, LayerId, LayerKind, LayerReport, LayerRole, MAX_RESOLUTION, MIN_RESOLUTION,
@@ -68,17 +69,69 @@ pub struct SetSummary {
     pub placeholders: usize,
 }
 
-/// Progress callback (fraction 0..1, step), the cancel check the import asks between steps, and the stroke replayer
-/// (the brush engine the import lays strokes with; `None`: strokes stay placeholders).
+/// What an import is doing, for a progress display. Texture sets count from 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Reading the mesh, the layer document, the settings and the compiled graphs.
+    ReadingFile,
+    /// Building texture set `set` of `of`: its stored result, baked maps and layer stack.
+    ConvertingSet { set: usize, of: usize },
+    /// Laying set `set`'s brush strokes with the replayer.
+    ReplayingStrokes { set: usize, of: usize },
+    /// Rendering set `set`'s graphs (and measuring its stack against the stored result).
+    CookingGraphs { set: usize, of: usize },
+    /// Putting the converted project together (and, in the engine, storing it as a project).
+    Saving,
+}
+
+impl Step {
+    /// A stable id: `reading`, `converting`, `replaying`, `cooking` or `saving`.
+    pub fn id(&self) -> &'static str {
+        match self {
+            Step::ReadingFile => "reading",
+            Step::ConvertingSet { .. } => "converting",
+            Step::ReplayingStrokes { .. } => "replaying",
+            Step::CookingGraphs { .. } => "cooking",
+            Step::Saving => "saving",
+        }
+    }
+
+    /// The texture set (from 1) and the set count, for the per-set steps.
+    pub fn set(&self) -> Option<(usize, usize)> {
+        match *self {
+            Step::ConvertingSet { set, of } | Step::ReplayingStrokes { set, of } | Step::CookingGraphs { set, of } => Some((set, of)),
+            Step::ReadingFile | Step::Saving => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Step {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Step::ReadingFile => f.write_str("reading the file"),
+            Step::ConvertingSet { set, of } => write!(f, "converting texture set {set} of {of}"),
+            Step::ReplayingStrokes { set, of } => write!(f, "replaying strokes (texture set {set} of {of})"),
+            Step::CookingGraphs { set, of } => write!(f, "cooking graphs (texture set {set} of {of})"),
+            Step::Saving => f.write_str("saving"),
+        }
+    }
+}
+
+/// Progress callback (fraction 0..1, step), the cancel flag and the stroke replayer (the brush engine the import lays
+/// strokes with; `None`: strokes stay placeholders).
+///
+/// The import checks the flag between steps, texture sets and stroke and graph passes; the imported project's graph
+/// store renders under the same flag, so a graph render in progress stops at its next node. A replayer that should stop
+/// early reads the flag itself.
 pub struct Hooks<'h> {
-    pub progress: &'h mut dyn FnMut(f32, &str),
-    pub cancel: &'h dyn Fn() -> bool,
+    pub progress: &'h dyn Fn(f32, Step),
+    pub cancel: &'h Cancel,
     pub replay: Option<&'h dyn StrokeReplayer>,
 }
 
 impl Hooks<'_> {
     fn check(&self) -> Result<(), ImportError> {
-        if (self.cancel)() { Err(ImportError::Cancelled) } else { Ok(()) }
+        if self.cancel.is_cancelled() { Err(ImportError::Cancelled) } else { Ok(()) }
     }
 }
 
@@ -99,7 +152,7 @@ pub fn import_path(path: &std::path::Path, options: &ImportOptions, hooks: &mut 
 /// Imports an opened project file.
 pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hooks: &mut Hooks) -> Result<Imported, ImportError> {
     hooks.check()?;
-    (hooks.progress)(0.0, "reading the mesh");
+    (hooks.progress)(0.0, Step::ReadingFile);
     let scene = file.read(paths::SCENE)?;
     let decode = |part| move |source| ImportError::Decode { part, source };
     let geometry = AssbinGeometry::parse(&scene).map_err(decode("mesh"))?;
@@ -108,7 +161,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     let mut report = ImportReport::new(source_label(file, file_name), IMPORTER);
     report.add("mesh", Fidelity::Exact, format!("{} parts, {} triangles, at the file's normalised scale", mesh.submeshes.len(), mesh.triangle_count()));
     hooks.check()?;
-    (hooks.progress)(0.05, "reading the layer document");
+    (hooks.progress)(0.05, Step::ReadingFile);
     let records = file.document_materials().unwrap_or_else(|e| {
         report.add("texture sets", Fidelity::Approximated, format!("the document's texture set list could not be read ({e}); sets named after the mesh"));
         Vec::new()
@@ -168,7 +221,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         baked: BTreeMap::new(),
         mesh: Mesh::default(),
         resources: BTreeMap::new(),
-        graphs: GraphStore::default(),
+        graphs: GraphStore::with_cancel(hooks.cancel.clone()),
         sets: Vec::new(),
     };
     for source in &binding.sets {
@@ -184,7 +237,8 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     }
     let library = match options.graphs {
         crate::GraphMode::Decompile => {
-            (hooks.progress)(0.08, "decompiling graphs");
+            hooks.check()?;
+            (hooks.progress)(0.08, Step::ReadingFile);
             Some(GraphLibrary::from_project(file))
         }
         crate::GraphMode::Keep => None,
@@ -195,7 +249,8 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     let count = binding.sets.len();
     for (i, source) in binding.sets.iter().enumerate() {
         hooks.check()?;
-        (hooks.progress)(0.1 + 0.8 * i as f32 / count as f32, &format!("converting texture set {} of {count}", i + 1));
+        let span = (0.1 + 0.8 * i as f32 / count as f32, 0.8 / count as f32);
+        (hooks.progress)(span.0, Step::ConvertingSet { set: i + 1, of: count });
         let project_set = source.record.scene_uid.filter(|_| source.in_document).and_then(|uid| model.as_ref()?.texture_set(uid));
         let ctx = SetContext {
             file,
@@ -209,6 +264,8 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
             cache: &cache_entries,
             hooks: &*hooks,
             graphs: library.as_ref(),
+            index: (i + 1, count),
+            span,
         };
         let summary = build_set(&ctx, &mut project, &mut imported, &mut report)?;
         imported.sets.push(summary);
@@ -220,7 +277,8 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
             "in the document but on no mesh material (left over from a replaced mesh); not imported",
         );
     }
-    (hooks.progress)(0.95, "finishing the project");
+    hooks.check()?;
+    (hooks.progress)(0.95, Step::Saving);
     if let Some(document) = &model {
         report_unhandled_document(document, &mut report);
     }
@@ -228,7 +286,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     project.import = Some(report);
     imported.project = project;
     imported.mesh = mesh;
-    (hooks.progress)(1.0, "imported");
+    (hooks.progress)(1.0, Step::Saving);
     Ok(imported)
 }
 
@@ -257,6 +315,9 @@ struct SetContext<'a, 'h> {
     cache: &'a [texturecraft_import_reader::project::CacheEntryRef],
     hooks: &'a Hooks<'h>,
     graphs: Option<&'a GraphLibrary>,
+    /// This set's number (from 1) and the set count, and its share of the progress bar (start, length).
+    index: (usize, usize),
+    span: (f32, f32),
 }
 
 /// Builds one texture set into `project` and `out`.
@@ -399,8 +460,12 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         && let Some(replayer) = ctx.hooks.replay.filter(|_| !stack.jobs.is_empty())
     {
         ctx.hooks.check()?;
+        let (set, of) = ctx.index;
+        (ctx.hooks.progress)(ctx.span.0 + 0.25 * ctx.span.1, Step::ReplayingStrokes { set, of });
         let scene = ReplayScene { mesh: ctx.mesh, material: ctx.source.slot, resolution };
         replayed = replay_stack(stack, replayer, &scene, &mut out.pixels, &|what: &str| item(what), report);
+        // a replayer stopped by the flag fails its remaining jobs: they are not reported as failures
+        ctx.hooks.check()?;
     }
     if let Some(stack) = &stack {
         insert_stack(project, ts, stack, report);
@@ -441,6 +506,8 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let cooking = stack.as_ref().is_some_and(|s| s.layers.iter().any(|l| !l.graphs().is_empty()));
     if measuring || cooking {
         ctx.hooks.check()?;
+        let (set, of) = ctx.index;
+        (ctx.hooks.progress)(ctx.span.0 + 0.5 * ctx.span.1, Step::CookingGraphs { set, of });
         let store: ImageStore = ctx.images.store();
         let scene = SetScene { project, ts, mesh: ctx.mesh, pixels: &out.pixels, baked: &baked, images: &store, graphs: &out.graphs };
         let mut channels = cache_channels.clone();
@@ -452,6 +519,8 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
                 scores.push((*c, safety_net::score(&composite, &gbuf, *c, img, uncovered_default(*c, shader_model))));
             }
         }
+        // renders stopped by the flag show nothing: the set is not finished
+        ctx.hooks.check()?;
     }
     let agrees = scores.iter().all(|(_, s)| s.mean <= AGREEMENT_STEPS);
     let strategy = Strategy::choose(exact, !cache.is_empty(), agrees);

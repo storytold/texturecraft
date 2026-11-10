@@ -54,11 +54,25 @@ pub struct BrushReplayer;
 
 impl StrokeReplayer for BrushReplayer {
     fn replay(&self, scene: &ReplayScene, jobs: &[ReplayJob]) -> Vec<Result<ReplayedPixels, String>> {
-        let Some(set) = SetMesh::new(scene) else {
-            return jobs.iter().map(|_| Err("the texture set has no triangles to paint".to_string())).collect();
-        };
-        jobs.par_iter().map(|job| replay_job(&set, job)).collect()
+        replay_jobs(scene, jobs, &|| false)
     }
+}
+
+/// [`BrushReplayer`] that stops when its flag is set: the stroke being laid finishes, the job fails as cancelled, and
+/// so do the jobs not started (the import checks the same flag and discards the set).
+pub struct CancellableReplayer(pub texturecraft_import::Cancel);
+
+impl StrokeReplayer for CancellableReplayer {
+    fn replay(&self, scene: &ReplayScene, jobs: &[ReplayJob]) -> Vec<Result<ReplayedPixels, String>> {
+        replay_jobs(scene, jobs, &|| self.0.is_cancelled())
+    }
+}
+
+fn replay_jobs(scene: &ReplayScene, jobs: &[ReplayJob], stop: &(dyn Fn() -> bool + Sync)) -> Vec<Result<ReplayedPixels, String>> {
+    let Some(set) = SetMesh::new(scene) else {
+        return jobs.iter().map(|_| Err("the texture set has no triangles to paint".to_string())).collect();
+    };
+    jobs.par_iter().map(|job| replay_job(&set, job, stop)).collect()
 }
 
 /// The texture set's own triangles with what painting them needs.
@@ -144,12 +158,15 @@ impl Tip {
 }
 
 /// Lays every step of `job` into its target.
-fn replay_job(set: &SetMesh, job: &ReplayJob) -> Result<ReplayedPixels, String> {
+fn replay_job(set: &SetMesh, job: &ReplayJob, stop: &(dyn Fn() -> bool + Sync)) -> Result<ReplayedPixels, String> {
     let mut pixels = PixelStore::default();
     let id = job.target.id();
     for step in &job.steps {
         let tip = Tip::of(&step.brush.tip)?;
         for stroke in &step.strokes {
+            if stop() {
+                return Err("cancelled".into());
+            }
             let mut canvas = StrokeCanvas::new(set.resolution, set.resolution);
             lay_stroke(set, step, &tip, stroke, &mut canvas);
             if canvas.dirty.is_empty() {

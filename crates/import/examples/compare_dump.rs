@@ -9,6 +9,7 @@ use std::path::Path;
 
 use texturecraft_compose::ImageStore;
 use texturecraft_core::Channel;
+use texturecraft_import::Cancel;
 use texturecraft_import::import::{Hooks, import_path};
 use texturecraft_import::safety_net::{SetScene, composite};
 use texturecraft_texel::linear_to_srgb;
@@ -28,8 +29,8 @@ fn main() {
         eprintln!("usage: compare_dump <project file> <dump dir>");
         std::process::exit(2);
     };
-    let mut progress = |_: f32, _: &str| {};
-    let mut hooks = Hooks { progress: &mut progress, cancel: &|| false, replay: None };
+    let cancel = Cancel::new();
+    let mut hooks = Hooks { progress: &|_, _| {}, cancel: &cancel, replay: None };
     let imported = match import_path(Path::new(file), &Default::default(), &mut hooks) {
         Ok(i) => i,
         Err(e) => {

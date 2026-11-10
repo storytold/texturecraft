@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use texturecraft_core::{BakedMap, Channel, ChannelKind, GraphInput, GraphRef, LayerId, MAX_GRAPH_NESTING, StableHash};
-use texturecraft_graph::context::{Cancel, EvalContext, Files};
+pub use texturecraft_graph::context::Cancel;
+use texturecraft_graph::context::{EvalContext, Files};
 use texturecraft_graph::graph::Graph;
 pub use texturecraft_graph::graph::Graph as RuntimeGraph;
 use texturecraft_graph::rayon::ThreadPool;
@@ -250,6 +251,12 @@ impl GraphStore {
         EMPTY.get_or_init(GraphStore::default)
     }
 
+    /// An empty store whose renders stop when `cancel` is set (a render in progress stops at its next node; later ones
+    /// do not start). The flag stays set: once it is, the store renders nothing more.
+    pub fn with_cancel(cancel: Cancel) -> GraphStore {
+        GraphStore { texts: BTreeMap::new(), cooks: Arc::new(CookCache { cancel, ..CookCache::default() }) }
+    }
+
     /// Adds a graph text, under its key.
     pub fn add_text(&mut self, text: &str) -> String {
         let key = texturecraft_core::text_key(text);
@@ -469,8 +476,8 @@ impl GraphStore {
             self.cooks.renders.fetch_add(1, Ordering::Relaxed);
             self.render(g, env, given, depth).map(Arc::new)
         });
-        // a cancelled render is not remembered as a failure
-        if matches!(&got, Err(e) if e == "cancelled") {
+        // a cancelled render (not started, or stopped part way) is not remembered as a failure
+        if got.is_err() && self.cooks.cancel.is_cancelled() {
             self.cooks.cooks.remove(&key);
         }
         got.map(|c| (key, c))
