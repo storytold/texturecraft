@@ -104,6 +104,20 @@ fn grazing_allowance(depth: &EyeDepth, point: Vec3, facing: f32, pixels_per_unit
     world_per_pixel * NEIGHBOUR_REACH * (1.0 - facing * facing).sqrt() / facing
 }
 
+/// Which surfaces in a stamp's volume it reaches, by how far their normal turns from the stamp's.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Facing {
+    /// Surfaces on the stamp's side (TextureCraft's own painting).
+    #[default]
+    Front,
+    /// A smooth fade over the cosine between a texel's normal and the stamp's: everything at `full` and above,
+    /// nothing at `none` and below (`none` < `full`). Off by default; for strokes replayed from an imported project,
+    /// whose brush fades by that angle and not by the view.
+    Fade { full: f32, none: f32 },
+    /// Every surface in the volume, whichever way it faces.
+    Any,
+}
+
 /// What the rasterizer reads.
 pub struct RasterCtx<'a> {
     pub mesh: &'a Mesh,
@@ -117,6 +131,8 @@ pub struct RasterCtx<'a> {
     /// Angle fade from/to in degrees.
     pub angle_fade: (f32, f32),
     pub shape: Shape<'a>,
+    /// Which surfaces a stamp reaches by their turn from its normal ([`Facing::Front`] for painting).
+    pub facing: Facing,
 }
 
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
@@ -225,7 +241,12 @@ fn scan_triangle(
             }
 
             let normal = (*normal_a * b0 + *normal_b * b1 + *normal_c * b2).try_normalize().unwrap_or(stamp.normal);
-            if normal.dot(stamp.normal) <= 0.0 {
+            let turn = match context.facing {
+                Facing::Front if normal.dot(stamp.normal) <= 0.0 => continue,
+                Facing::Front | Facing::Any => 1.0,
+                Facing::Fade { full, none } => smoothstep(none, full, normal.dot(stamp.normal)),
+            };
+            if turn <= 0.0 {
                 continue;
             }
 
@@ -245,7 +266,7 @@ fn scan_triangle(
             }
 
             let fade = if context.backface_culling { smoothstep(fade_lo, fade_hi, facing) } else { 1.0 };
-            let alpha = shape.sample(local_x, local_y, stamp.hardness, stamp.seed) * stamp.flow * fade;
+            let alpha = shape.sample(local_x, local_y, stamp.hardness, stamp.seed) * stamp.flow * fade * turn;
             if alpha > 0.0 {
                 texels.push((x, y, alpha));
             }
@@ -299,6 +320,7 @@ mod tests {
             backface_culling: true,
             angle_fade: (70.0, 85.0),
             shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, level: 0 },
+            facing: Facing::Front,
         };
         let st = Stamp {
             center: Vec3::ZERO,
@@ -325,6 +347,60 @@ mod tests {
         let below = RasterCtx { eye: Vec3::new(0.0, -5.0, 0.0), ..ctx };
         rasterize(&mut c2, &below, &[st]);
         assert!(c2.dirty.is_empty());
+    }
+
+    #[test]
+    fn facing_fades_or_reaches_surfaces_turned_from_the_stamp() {
+        // a folded strip: the left half faces +Y, the right half turns down to face +X (a wall at x = 0)
+        let mut m = primitives::plane(2.0, 16);
+        for (p, n) in m.positions.iter_mut().zip(m.normals.iter_mut()) {
+            if p.x > 0.0 {
+                *p = Vec3::new(0.0, -p.x, p.z);
+                *n = Vec3::X;
+            }
+        }
+        let bvh = Bvh::new(&m);
+        let g = UvGBuffer::new(&m, 0, 128, 128);
+        let ctx = |facing| RasterCtx {
+            mesh: &m,
+            bvh: &bvh,
+            gbuf: &g,
+            material: 0,
+            depth: None,
+            eye: Vec3::new(1.0, 5.0, 0.0),
+            backface_culling: false,
+            angle_fade: (70.0, 85.0),
+            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, level: 0 },
+            facing,
+        };
+        // a stamp on the fold, facing up: the wall turns a quarter from it (cosine 0)
+        let st = Stamp {
+            center: Vec3::new(0.0, 0.0, 0.0),
+            normal: Vec3::Y,
+            tangent: Vec3::X,
+            bitangent: Vec3::Z,
+            radius: 0.6,
+            flow: 1.0,
+            hardness: 0.9,
+            depth: 1.0,
+            seed: 0,
+            source: None,
+        };
+        let wall = |facing| {
+            let mut c = StrokeCanvas::new(128, 128);
+            rasterize(&mut c, &ctx(facing), &[st]);
+            // a wall texel a quarter below the fold (past the triangles whose normals blend across it), and a floor
+            // texel as far the other way
+            (from_u16(c.alpha.get(64 + 16, 64)[0]), from_u16(c.alpha.get(64 - 16, 64)[0]))
+        };
+        let (front, floor) = wall(Facing::Front);
+        assert_eq!(front, 0.0, "a quarter turn is not on the stamp's side");
+        assert!(floor > 0.9);
+        let (half, floor) = wall(Facing::Fade { full: 0.25, none: -0.25 });
+        assert!((half - 0.5).abs() < 0.05 && floor > 0.9, "cosine 0 sits halfway through the fade: {half}");
+        let (none, _) = wall(Facing::Fade { full: 1.0, none: 0.5 });
+        assert_eq!(none, 0.0);
+        assert!(wall(Facing::Any).0 > 0.9);
     }
 }
 
