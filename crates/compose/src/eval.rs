@@ -1556,6 +1556,11 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// Output `output` of a cook sampled through `projection`, as the graph holds it (RGBA); None without it
     fn graph_sample(&mut self, cooked: Option<&Cooked>, output: Option<&str>, projection: &Projection) -> Option<[f32; 4]> {
         let image = cooked?.output(output)?;
+        // Laid on 1:1: the very texel (the render covers the texture set; interpolated mesh UVs would blur it at island
+        // edges and seams)
+        if matches!(projection, Projection::Uv { scale, rotation, offset } if *scale == [1.0, 1.0] && *rotation == 0.0 && *offset == [0.0, 0.0]) {
+            return Some(graphs::at_texel(image, self.x, self.y, (self.inp.gbuf.width, self.inp.gbuf.height)));
+        }
         let (coords, projection, _) = self.projected(projection);
         let mut sum = [0.0f32; 4];
         for (uv, weight) in image_samples(projection, &coords).into_iter().filter(|(_, weight)| *weight > 0.0) {
