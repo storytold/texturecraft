@@ -204,14 +204,87 @@ fn load(script: Script) -> Option<FontData> {
     None
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn thai_system_files() -> Vec<(std::path::PathBuf, u32)> {
+    use std::path::PathBuf;
+    let mut v: Vec<(PathBuf, u32)> = Vec::new();
+    if cfg!(windows) {
+        let fonts = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
+        for f in ["LeelawUI.ttf", "leelawad.ttf", "tahoma.ttf"] {
+            v.push((fonts.join(f), 0));
+        }
+    } else if cfg!(target_os = "macos") {
+        for f in [
+            "/System/Library/Fonts/Thonburi.ttc",
+            "/System/Library/Fonts/Supplemental/Thonburi.ttc",
+            "/Library/Fonts/Thonburi.ttc",
+            "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
+        ] {
+            v.push((PathBuf::from(f), 0));
+        }
+    } else {
+        for f in [
+            "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+            "/usr/share/fonts/google-noto/NotoSansThai-Regular.ttf",
+            "/usr/local/share/fonts/noto/NotoSansThai-Regular.ttf",
+            "/usr/share/fonts/truetype/tlwg/Loma.ttf",
+            "/usr/share/fonts/truetype/thai/Loma.ttf",
+            "/usr/share/fonts/thai/Loma.ttf",
+        ] {
+            v.push((PathBuf::from(f), 0));
+        }
+    }
+    v
+}
+
+pub fn load_thai() -> Option<FontData> {
+    if let Some(f) = CRAFT_FONTS.iter().find(|f| f.scripts.contains(&"Thai") && f.style == "Regular" && !f.bytes.is_empty()) {
+        return Some(aligned(FontData::from_static(f.bytes)));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    for (path, index) in thai_system_files() {
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_FONT_BYTES {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&path) {
+            let mut data = FontData::from_owned(bytes);
+            data.index = index;
+            return Some(aligned(data));
+        }
+    }
+    None
+}
+
+/// Append an installed Thai font to every font family so Thai text is visible in every language.
+pub fn append_thai(defs: &mut egui::FontDefinitions) {
+    static THAI: std::sync::OnceLock<Option<Arc<FontData>>> = std::sync::OnceLock::new();
+    let data = THAI.get_or_init(|| load_thai().map(Arc::new));
+    if let Some(data) = data {
+        defs.font_data.insert("thai-fallback".into(), data.clone());
+        for list in defs.families.values_mut() {
+            if !list.contains(&"thai-fallback".to_string()) {
+                list.push("thai-fallback".into());
+            }
+        }
+    }
+}
+
+fn primary_line_metrics() -> Option<(f32, f32, f32)> {
+    if let Some(f) = CRAFT_FONTS.iter().find(|f| f.family == "Inter" && f.style == "Regular" && !f.bytes.is_empty()) {
+        line_metrics(f.bytes, 0)
+    } else {
+        let defs = egui::FontDefinitions::default();
+        let ubuntu = defs.font_data.get("Ubuntu-Light")?;
+        line_metrics(ubuntu.font.as_ref().as_ref(), ubuntu.index)
+    }
+}
+
 /// `data` shifted so its baseline meets the UI font's. egui centers a fallback face's line box
 /// in the primary font's, so faces with taller boxes (most CJK fonts) would sit high.
 fn aligned(mut data: FontData) -> FontData {
-    let defs = crate::theme::font_definitions();
-    let primary = defs.families.get(&FontFamily::Proportional).and_then(|f| f.first()).and_then(|n| defs.font_data.get(n));
-    if let (Some((pa, pd, pg)), Some((ca, cd, cg))) =
-        (primary.and_then(|p| line_metrics(p.font.as_ref().as_ref(), p.index)), line_metrics(data.font.as_ref().as_ref(), data.index))
-    {
+    if let (Some((pa, pd, pg)), Some((ca, cd, cg))) = (primary_line_metrics(), line_metrics(data.font.as_ref().as_ref(), data.index)) {
         // Baseline of a fallback glyph: its ascent plus half the difference of the line boxes.
         let drift = ca + 0.5 * ((pa - pd + pg) - (ca - cd + cg)) - pa;
         if drift.is_finite() && drift.abs() < 1.0 {
@@ -299,5 +372,16 @@ mod tests {
         f.update(&ctx, "ja", false);
         assert_eq!(f.installed.len(), Script::ALL.len());
         assert_eq!(f.loaded.len(), Script::ALL.len());
+    }
+
+    #[test]
+    fn thai_fallback_font_is_appended_to_families_when_available() {
+        let defs = crate::theme::font_definitions();
+        if defs.font_data.contains_key("thai-fallback") {
+            for family in [FontFamily::Proportional, FontFamily::Monospace, FontFamily::Name(crate::theme::SEMIBOLD.into())] {
+                let list = defs.families.get(&family).unwrap();
+                assert!(list.contains(&"thai-fallback".to_string()), "{family:?}");
+            }
+        }
     }
 }

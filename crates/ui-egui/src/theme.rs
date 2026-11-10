@@ -318,6 +318,7 @@ pub fn font_definitions() -> egui::FontDefinitions {
         *first = w.to_string();
     }
     fonts.families.insert(FontFamily::Name(SEMIBOLD.into()), list);
+    crate::fonts::append_thai(&mut fonts);
     fonts
 }
 
