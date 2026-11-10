@@ -446,3 +446,22 @@ fn curvature_generators_take_a_mode_and_detail_sizes() {
     assert!(dirt.is_err(), "only curvature generators have a mode");
     assert_eq!(execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string(), inspect, "failed commands leave the project unchanged");
 }
+
+#[test]
+fn unparseable_color_param_returns_error() {
+    let mut s = session();
+    let err = execute(&mut s, "layer.add.fill", &json!({"color": "#fff"})).unwrap_err();
+    assert_eq!(err.to_string(), "`layer.add.fill`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "layer.fill.set", &json!({"channel": "baseColor", "color": "#123"})).unwrap_err();
+    assert_eq!(err.to_string(), "`layer.fill.set`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": "invalid"})).unwrap_err();
+    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "mask.add.colorSelection", &json!({"color": "#xyz"})).unwrap_err();
+    assert_eq!(err.to_string(), "`mask.add.colorSelection`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "display.set", &json!({"scatterColor": "#12345"})).unwrap_err();
+    assert_eq!(err.to_string(), "`display.set`: `scatterColor` must be a color ([r, g, b] linear or \"#rrggbb\")");
+}

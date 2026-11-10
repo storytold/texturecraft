@@ -289,7 +289,9 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
         s.tool.mask_value = v.clamp(0.0, 1.0);
     }
     if let Some(c) = channel_param("tool.material", p, "channel")? {
-        if let Some(v) = color_param(p, "color").or_else(|| color_param(p, "value")) {
+        let color = color_param("tool.material", p, "color")?;
+        let value = color_param("tool.material", p, "value")?;
+        if let Some(v) = color.or(value) {
             let v = if c == Channel::Height { v.map(|x| x.clamp(-1.0, 1.0)) } else { v.map(|x| x.clamp(0.0, 1.0)) };
             s.tool.values.insert(c, v);
             s.tool.enabled.insert(c);
@@ -356,7 +358,7 @@ fn stencil(s: &mut Session, p: &Value) -> Result<Value> {
         s.tool.stencil = Some(st);
     }
     let st = s.tool.stencil.as_mut().ok_or_else(|| bad("tool.stencil", "no stencil: give `image`"))?;
-    if let Some(c) = color_param(p, "center").map(|c| [c[0], c[1]]).or_else(|| pair(p, "center")) {
+    if let Some(c) = pair(p, "center") {
         st.center = c.map(|v| v.clamp(-4.0, 4.0));
     }
     if let Some(v) = f32p(p, "scale") {
@@ -379,10 +381,7 @@ fn stencil(s: &mut Session, p: &Value) -> Result<Value> {
 fn pair(p: &Value, key: &str) -> Option<[f32; 2]> {
     let a = p.get(key)?.as_array()?;
     let v: Vec<f32> = a.iter().filter_map(Value::as_f64).map(|x| x as f32).filter(|x| x.is_finite()).collect();
-    match v.as_slice() {
-        [x, y] => Some([*x, *y]),
-        _ => None,
-    }
+    if v.len() >= 2 { Some([v[0], v[1]]) } else { None }
 }
 
 fn clone_source(s: &mut Session, p: &Value) -> Result<Value> {

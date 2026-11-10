@@ -236,7 +236,7 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(t) = tm {
         d.tone_mapping = t;
     }
-    if let Some(c) = color_param(p, "scatterColor") {
+    if let Some(c) = color_param("display.set", p, "scatterColor")? {
         d.scatter_color = c.map(|v| v.clamp(0.0, 1.0));
     }
     if let Some(b) = boolp(p, "shadows") {
