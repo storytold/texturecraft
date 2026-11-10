@@ -330,7 +330,7 @@ fn summary(imported: &Imported) -> Value {
 }
 
 /// Base64 (standard alphabet, padding optional) or a JSON array of byte values.
-fn bytes_param(v: &Value) -> Result<Vec<u8>> {
+pub(crate) fn bytes_param(v: &Value) -> Result<Vec<u8>> {
     match v {
         Value::String(s) => decode_base64(s).ok_or_else(|| bad(ID, "`bytes` is not valid base64")),
         Value::Array(a) => {

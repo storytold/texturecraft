@@ -85,6 +85,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::text_cmds::specs());
         v.extend(crate::lock_cmds::specs());
         v.extend(crate::import_cmds::specs());
+        v.extend(crate::verify_cmds::specs());
         v
     })
 }

@@ -44,6 +44,12 @@ USAGE:
                    [--max-resolution <px>] [--no-measure] [--no-replay] [--graphs decompile|keep]
       Convert a project file of the reference app (one-way; the original is only read) and save
       it; prints what the import found per texture set (file.importProject).
+  texturecraft-cli verify <project file> [<imported.tcraft>] [--set <name>] [--border <texels>] [--table]
+                   [--max-resolution <px>] [--native-filters] [--no-replay] [--graphs decompile|keep]
+      Compare an imported project with the results stored in the file it came from, per texture
+      set and channel on the mesh's texels, and grade each channel (import.verify). Without
+      <imported.tcraft> the file is imported first (the import flags apply). --table prints a
+      table instead of JSON. Exits with an error when a counted channel is below the pass bar.
   texturecraft-cli graph <graph.tcgraph> <out dir> [--size <px>] [--output <name>]... [--seed <n>]
                   [--param <name>=<v>[,<v>...]]... [--depth 8|16] [--timeout <s>]
       Render a graph text file on the CPU: one PNG per output (<out dir>/<output>.png). --size
@@ -73,6 +79,7 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
     ("new", &["--resolution"], &["--sample"]),
     ("import", &["--max-resolution", "--graphs"], &["--original-on-top", "--native-filters", "--no-measure", "--no-replay"]),
+    ("verify", &["--set", "--border", "--max-resolution", "--graphs"], &["--table", "--native-filters", "--no-replay"]),
     ("graph", &["--size", "--output", "--seed", "--param", "--depth", "--timeout"], &[]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
     ("serve", &["--port", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
@@ -193,6 +200,7 @@ fn dispatch(name: &str, a: &Args) -> R {
         "render" => render(a),
         "new" => new(a),
         "import" => import(a),
+        "verify" => verify(a),
         "graph" => graph::render(a),
         "mcp" => mcp(a),
         "serve" => serve(a),
@@ -290,8 +298,8 @@ fn run(a: &Args) -> R {
     }
 }
 
-fn import(a: &Args) -> R {
-    let (input, out) = (a.pos(0, "<project file>")?, a.pos(1, "<out.tcraft>")?);
+/// `file.importProject` params from the import flags.
+fn import_params(a: &Args, input: &str) -> Result<Value, String> {
     let mut p =
         json!({"path": input, "originalOnTop": a.has("--original-on-top"), "nativeFilters": a.has("--native-filters"), "measure": !a.has("--no-measure")});
     if let Some(r) = a.num::<u32>("--max-resolution")? {
@@ -303,10 +311,47 @@ fn import(a: &Args) -> R {
     if a.has("--no-replay") {
         p["replayStrokes"] = json!(false);
     }
+    Ok(p)
+}
+
+fn import(a: &Args) -> R {
+    let (input, out) = (a.pos(0, "<project file>")?, a.pos(1, "<out.tcraft>")?);
+    let p = import_params(a, input)?;
     let mut h = open("builtin:cube", Some(128))?;
     let reply = h.command_run("file.importProject", p).map_err(s)?;
     print_json(&json!({"file": input, "import": reply.get("import").cloned().unwrap_or(Value::Null)}))?;
     save(&mut h, out)
+}
+
+fn verify(a: &Args) -> R {
+    let original = a.pos(0, "<project file>")?;
+    let mut h = match a.pos.get(1) {
+        Some(imported) => open(imported, None)?,
+        None => {
+            let mut h = open("builtin:cube", Some(128))?;
+            h.command_run("file.importProject", import_params(a, original)?).map_err(s)?;
+            h
+        }
+    };
+    let mut p = json!({"path": original});
+    if let Some(set) = a.get("--set") {
+        p["set"] = json!(set);
+    }
+    if let Some(b) = a.num::<u32>("--border")? {
+        p["border"] = json!(b);
+    }
+    let mut reply = h.command_run("import.verify", p).map_err(s)?;
+    let passes = reply.get("passes").and_then(Value::as_bool).unwrap_or(false);
+    match a.has("--table") {
+        true => print!("{}", reply.get("text").and_then(Value::as_str).unwrap_or_default()),
+        false => {
+            if let Some(o) = reply.as_object_mut() {
+                o.remove("text");
+            }
+            print_json(&reply)?;
+        }
+    }
+    if passes { Ok(()) } else { Err("below the pass bar (or nothing compared)".into()) }
 }
 
 fn batch(a: &Args) -> R {
