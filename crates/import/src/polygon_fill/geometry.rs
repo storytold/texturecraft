@@ -6,7 +6,7 @@
 //! two triangles join across an edge only when exactly two triangles share it. A UV island joins them only where both
 //! sides have the same UVs at the edge's ends.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::OnceLock;
 
@@ -186,7 +186,8 @@ impl<'m> SetGeometry<'m> {
             }));
         }
         // each welded edge: the triangles and their sides using it
-        let mut edges: HashMap<[u32; 2], Vec<(u32, u8)>> = HashMap::new();
+        // sorted by edge, so the groups come out the same every time
+        let mut edges: BTreeMap<[u32; 2], Vec<(u32, u8)>> = BTreeMap::new();
         for (t, w) in tris.iter().enumerate() {
             let Some(w) = w else { continue };
             for k in 0..3usize {
@@ -198,10 +199,7 @@ impl<'m> SetGeometry<'m> {
         }
         let mut pieces: Vec<u32> = (0..n as u32).collect();
         let mut islands = pieces.clone();
-        // deterministic order
-        let mut list: Vec<([u32; 2], Vec<(u32, u8)>)> = edges.into_iter().collect();
-        list.sort_by_key(|(k, _)| *k);
-        for (key, users) in list {
+        for (key, users) in edges {
             let [(a, ka), (b, kb)] = users.as_slice() else { continue };
             join(&mut pieces, *a, *b);
             if self.uv_continuous(p, key, (*a, *ka), (*b, *kb), &tris) {
