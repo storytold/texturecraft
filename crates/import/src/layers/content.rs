@@ -48,6 +48,8 @@ pub struct ContentMapper<'a, 'i> {
     written: BTreeMap<Channel, Status>,
     graphs: Vec<String>,
     anchor_status: Vec<(u64, Status)>,
+    /// The last strokes placeholder: its index, strokes and paint effects so far.
+    strokes_run: Option<(usize, usize, usize)>,
 }
 
 /// The channels and sources of one fill, grouped the way TextureCraft lays them on.
@@ -62,7 +64,7 @@ struct FillParts {
 
 impl<'a, 'i> ContentMapper<'a, 'i> {
     pub fn new(input: &'a SetInput<'a>, anchors: &'a Anchors, ids: &'i mut Ids) -> ContentMapper<'a, 'i> {
-        ContentMapper { input, anchors, ids, effects: Vec::new(), written: BTreeMap::new(), graphs: Vec::new(), anchor_status: Vec::new() }
+        ContentMapper { input, anchors, ids, effects: Vec::new(), written: BTreeMap::new(), graphs: Vec::new(), anchor_status: Vec::new(), strokes_run: None }
     }
 
     /// The base and effects of a layer that is not a folder.
@@ -188,8 +190,27 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                         self.input.channels.all().filter(|c| p.colors.iter().any(|s| s.channels().contains(self.input.channels.project_channel(*c)))).collect()
                     }
                 };
-                let label = format!("{} strokes ({})", p.tool.name(), p.stroke_count());
-                self.placeholder(&label, "brush strokes are kept in the original result; stroke replay comes later", on);
+                let merged = match self.strokes_run.as_mut() {
+                    Some((at, strokes, effects)) if *at + 1 == self.effects.len() => {
+                        *strokes += p.stroke_count();
+                        *effects += 1;
+                        let label = format!("brush strokes ({strokes} strokes in {effects} paint effects)");
+                        if let Some(e) = self.effects.get_mut(*at) {
+                            e.name = label.clone();
+                            e.visible |= on;
+                            if let EffectKind::Placeholder { label: l, .. } = &mut e.kind {
+                                *l = label;
+                            }
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if !merged {
+                    let label = format!("{} strokes ({})", p.tool.name(), p.stroke_count());
+                    self.placeholder(&label, "brush strokes are kept in the original result; stroke replay comes later", on);
+                    self.strokes_run = Some((self.effects.len() - 1, p.stroke_count(), 1));
+                }
                 if on {
                     let why = Status::not_computable(Blocker::new(BlockerKey::new(BlockerKind::Strokes, p.tool.name()), format!("{} strokes", p.tool.name())));
                     for c in channels {

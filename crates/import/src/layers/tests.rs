@@ -199,12 +199,14 @@ fn a_mask_generator_hides_and_locks_the_layer() {
 
 #[test]
 fn brush_strokes_stay_in_the_stored_result_and_lock_the_layer() {
-    let group = ProjectEffect::Group(EffectGroup { header: header(2, u64::MAX, vec![]), effects: vec![paint(3, BASE)] });
+    let group = ProjectEffect::Group(EffectGroup { header: header(2, u64::MAX, vec![]), effects: vec![paint(3, BASE), paint(9, BASE)] });
     let stack = build(vec![layer(1, "Paint", ProjectLayerKind::Paint, vec![group])]);
     let ours = by_name(&stack, "Paint");
     assert!(matches!(ours.kind, LayerKind::Paint));
     assert_eq!(ours.lock.as_ref().unwrap().keys(), ["strokes:brush"]);
-    assert_eq!(ours.placeholders().count(), 1);
+    let ph: Vec<_> = ours.placeholders().collect();
+    assert_eq!(ph.len(), 1, "consecutive paint effects share one placeholder");
+    assert_eq!(ph[0].name, "brush strokes (4 strokes in 2 paint effects)");
     assert_eq!(stack.reports[&ours.id].fidelity, Fidelity::Baked);
 }
 

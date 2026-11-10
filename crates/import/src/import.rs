@@ -115,6 +115,18 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
             None
         }
     };
+    if syscoord == Some(NormalMapSyscoord::DirectX) {
+        report.add("baked normal maps", Fidelity::Exact, "stored DirectX; green flipped to OpenGL");
+    }
+    if let Some(s) = &settings {
+        let filter = if s.format_version <= 61 { "a Sobel filter" } else { "backward differences" };
+        report.add(
+            "height to normal",
+            Fidelity::Approximated,
+            format!("the original derives normals from height with {filter} (document format {}); TextureCraft uses its own", s.format_version),
+        );
+    }
+    report.add("cameras", Fidelity::Approximated, "the file's saved views are not imported yet");
     let bake_ini = file.read(BAKING_INI).ok().and_then(|d| ProjectBakeSettings::parse(&d).ok());
     let cache_entries = file.cache_entries();
     let cache_sets: BTreeSet<String> = cache_entries.iter().map(|e| e.set.clone()).collect();
@@ -384,21 +396,17 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         report.add(item("layer stack"), fidelity, format!("{layer_count} layers; {}; {measured}", strategy.describe()));
     }
     if let Some(s) = &stack {
-        for (id, path, why) in &s.verdict.mask_failures {
-            let _ = id;
+        for (_, path, why) in &s.verdict.mask_failures {
             report.add(
                 item(&format!("layer \"{path}\"")),
                 Fidelity::Approximated,
                 format!("mask not computable yet ({}); layer hidden so it doesn't cover the whole set", why.join("; ")),
             );
         }
-        for g in &s.graphs {
-            report.add(
-                item(&format!("graph {g}")),
-                Fidelity::Baked,
-                "compiled graph kept as a placeholder until graphs are computed; the layers using it are locked",
-            );
-        }
+        report_blockers(&s.layers, &|what: &str| item(what), report);
+    }
+    if let Some(project_set) = ctx.project_set {
+        report_strokes(project_set, &item("strokes"), report);
     }
     // the stored result as a locked layer: the reference, or the result on top
     if !cache.is_empty() {
@@ -432,6 +440,61 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         locked,
         placeholders,
     })
+}
+
+/// One line per blocker of the set: what it is, how many layers it locks and how many by it alone.
+fn report_blockers(layers: &[Layer], item: &dyn Fn(&str) -> String, report: &mut ImportReport) {
+    let mut by_key: BTreeMap<String, (String, usize, usize)> = BTreeMap::new();
+    for l in layers {
+        let Some(lock) = &l.lock else { continue };
+        let keys = lock.keys();
+        for k in &keys {
+            let text = lock.reasons.iter().find(|r| r.key == *k).map_or(String::new(), |r| r.text.clone());
+            let e = by_key.entry(k.to_string()).or_insert((text, 0, 0));
+            e.1 += 1;
+            if keys.len() == 1 {
+                e.2 += 1;
+            }
+        }
+    }
+    for (key, (text, n, alone)) in by_key {
+        let unlock = match key.split_once(':').map(|(k, _)| k) {
+            Some("graph") => "stays a placeholder until compiled graphs are computed",
+            Some("strokes") => "the pixels are in the original's stored result until stroke replay",
+            _ => "not supported yet",
+        };
+        report.add(item(&format!("blocker {key}")), Fidelity::Baked, format!("{text}: locks {n} layers ({alone} by it alone); {unlock}"));
+    }
+}
+
+/// The brush strokes of a set: none is replayed in this version, so their pixels are only in the stored result.
+fn report_strokes(set: &ProjectTextureSet, item: &str, report: &mut ImportReport) {
+    fn count(effects: &[texturecraft_import_reader::model::ProjectEffect], strokes: &mut usize, paints: &mut usize) {
+        for e in effects {
+            match e {
+                texturecraft_import_reader::model::ProjectEffect::Paint(p) if p.stroke_count() > 0 => {
+                    *strokes += p.stroke_count();
+                    *paints += 1;
+                }
+                texturecraft_import_reader::model::ProjectEffect::Group(g) => count(&g.effects, strokes, paints),
+                _ => {}
+            }
+        }
+    }
+    let (mut strokes, mut paints) = (0, 0);
+    for l in set.all_layers() {
+        count(&l.content, &mut strokes, &mut paints);
+        if let Some(m) = &l.mask {
+            count(&m.effects, &mut strokes, &mut paints);
+        }
+    }
+    if strokes > 0 {
+        report.add(
+            item,
+            Fidelity::Baked,
+            format!("{strokes} strokes in {paints} paint effects not replayed; their pixels are only in the original's stored result"),
+        );
+    }
 }
 
 fn status_word(s: &crate::status::Status) -> &'static str {

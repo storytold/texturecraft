@@ -33,11 +33,13 @@ pub struct MaskBuilder<'a, 'i> {
     graphs: Vec<String>,
     /// False for a switched-off mask: its effects are kept but do not count.
     counts: bool,
+    /// The last strokes placeholder: its index, strokes and paint effects so far.
+    strokes_run: Option<(usize, usize, usize)>,
 }
 
 impl<'a, 'i> MaskBuilder<'a, 'i> {
     pub fn new(input: &'a SetInput<'a>, anchors: &'a Anchors, ids: &'i mut Ids) -> MaskBuilder<'a, 'i> {
-        MaskBuilder { input, anchors, ids, effects: Vec::new(), status: Status::Exact, graphs: Vec::new(), counts: true }
+        MaskBuilder { input, anchors, ids, effects: Vec::new(), status: Status::Exact, graphs: Vec::new(), counts: true, strokes_run: None }
     }
 
     pub fn build(mut self, mask: Option<&ProjectMask>) -> MaskOutcome {
@@ -116,8 +118,25 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                     return;
                 }
                 let why = Status::not_computable(Blocker::new(BlockerKey::new(BlockerKind::Strokes, "painted-mask"), "painted mask (strokes)"));
+                // consecutive paint effects share one placeholder
+                if let Some((at, strokes, effects)) = self.strokes_run.as_mut()
+                    && *at + 1 == self.effects.len()
+                    && let Some(EffectKind::Placeholder { label, .. }) = self.effects.get_mut(*at).map(|e| &mut e.kind)
+                {
+                    *strokes += p.stroke_count();
+                    *effects += 1;
+                    *label = format!("painted mask ({strokes} strokes in {effects} paint effects)");
+                    let label = label.clone();
+                    if let Some(e) = self.effects.get_mut(*at) {
+                        e.name = label;
+                        e.visible |= on;
+                    }
+                    self.note(on, &why);
+                    return;
+                }
                 let label = format!("painted mask ({} strokes)", p.stroke_count());
                 self.placeholder(header, &label, "brush strokes are kept in the original result; stroke replay comes later", on, why);
+                self.strokes_run = Some((self.effects.len() - 1, p.stroke_count(), 1));
             }
             ProjectEffect::Anchor(h) => {
                 let why = match self.anchors.get(&h.uid.unwrap_or(0)) {
