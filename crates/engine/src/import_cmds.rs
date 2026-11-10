@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Import project...",
         [],
         None,
-        "{path?: the project file (native only), bytes?: the project file as base64 (any target), name?: file name for the report (with bytes), originalOnTop?: bool (show the original's stored result on top of stacks that are not reproduced; default false), nativeFilters?: bool (replace a few filter graphs by close built-in filters; default false), maxResolution?: px (cap texture set resolutions), measure?: bool (compare each stack with the stored result; default true), replayStrokes?: bool (replay brush strokes with TextureCraft's brush, approximated; default true), graphs?: \"decompile\" | \"keep\" (run the project's compiled graphs decompiled, or keep them as locked placeholders; default decompile)} → the session, plus {import: {sets: [{name, strategy, layers, locked, placeholders, channels, scores}]}}. One-way: the original file is only read",
+        "{path?: the project file (native only), bytes?: the project file as base64 (any target), name?: file name for the report (with bytes), originalOnTop?: bool (show the original's stored result on top of stacks that are not reproduced; default false), originalCorrection?: bool (a locked correction layer on top of stacks that are not reproduced, holding the stored result on the texels the layers miss; default false), nativeFilters?: bool (replace a few filter graphs by close built-in filters; default false), maxResolution?: px (cap texture set resolutions), measure?: bool (compare each stack with the stored result; default true), replayStrokes?: bool (replay brush strokes with TextureCraft's brush, approximated; default true), graphs?: \"decompile\" | \"keep\" (run the project's compiled graphs decompiled, or keep them as locked placeholders; default decompile)} → the session, plus {import: {sets: [{name, strategy, layers, locked, placeholders, channels, scores}]}}. One-way: the original file is only read",
         always,
         import
     )]
@@ -39,6 +39,9 @@ fn options(p: &Value) -> Result<ImportOptions> {
     let mut o = ImportOptions::default();
     if let Some(v) = boolp(p, "originalOnTop") {
         o.original_on_top = v;
+    }
+    if let Some(v) = boolp(p, "originalCorrection") {
+        o.original_correction = v;
     }
     if let Some(v) = boolp(p, "nativeFilters") {
         o.native_filters = v;

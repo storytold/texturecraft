@@ -23,6 +23,7 @@ pub mod baked;
 pub mod blend;
 pub mod cameras;
 pub mod channels;
+pub mod correction;
 pub mod error;
 pub mod graph_library;
 pub mod graph_uses;

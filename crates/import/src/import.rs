@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use texturecraft_compose::graphs::Cancel;
 use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, PixelStore};
 use texturecraft_core::{
-    BlendMode, Channel, ChannelBlend, Fidelity, Fill, ImportReport, Layer, LayerId, LayerKind, LayerReport, LayerRole, MAX_RESOLUTION, MIN_RESOLUTION,
-    NormalFormat, Project, Source, TextureSet, import_report::original_result_layer,
+    BlendMode, Channel, ChannelBlend, Fidelity, Fill, ImportReport, Layer, LayerId, LayerKind, LayerReport, LayerRole, Lock, LockReason, MAX_RESOLUTION,
+    MIN_RESOLUTION, NormalFormat, Project, Source, TextureSet, import_report::original_result_layer,
 };
 use texturecraft_geom::Mesh;
 use texturecraft_import_reader::decode::assbin::{AssbinGeometry, AssbinScene};
@@ -22,6 +22,7 @@ use texturecraft_import_reader::model::{ProjectDocument, ProjectTextureSet};
 use texturecraft_import_reader::project::{ProjectFile, paths};
 
 use crate::channels::{self, ChannelConfidence, SetChannels, uncovered_default};
+use crate::correction;
 use crate::error::ImportError;
 use crate::graph_library::GraphLibrary;
 use crate::image::Rgba;
@@ -516,6 +517,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     // opens without rendering them
     let cache_channels: Vec<Channel> = cache.iter().map(|(c, _)| *c).collect();
     let mut scores = Vec::new();
+    let mut corrections: Vec<correction::ChannelCorrection> = Vec::new();
     let measuring = ctx.options.measure && !cache.is_empty() && stack.is_some();
     let cooking = stack.as_ref().is_some_and(|s| s.layers.iter().any(|l| !l.graphs().is_empty()));
     if measuring || cooking {
@@ -531,6 +533,14 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         if let Some((composite, gbuf)) = safety_net::composite(&scene, &channels).filter(|_| measuring) {
             for (c, img) in &cache {
                 scores.push((*c, safety_net::score(&composite, &gbuf, *c, img, uncovered_default(*c, shader_model))));
+            }
+            if ctx.options.original_correction {
+                let formats = project.texture_set(ts).map(|s| s.channels.clone()).unwrap_or_default();
+                for (c, img) in &cache {
+                    let format = formats.iter().find(|(f, _)| f == c).map_or_else(|| texturecraft_core::ChannelFormat::default_for(*c), |(_, f)| *f);
+                    let tolerance = correction::TEXEL_STEPS * correction::storage_step(format);
+                    corrections.extend(correction::correct(&composite, &gbuf, *c, img, uncovered_default(*c, shader_model), tolerance));
+                }
             }
         }
         // renders stopped by the flag show nothing: the set is not finished
@@ -560,6 +570,12 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     }
     if let Some(project_set) = ctx.project_set {
         report_strokes(project_set, &item("strokes"), &replayed, report);
+    }
+    // the correction on top of the layers, under the stored result
+    if matches!(strategy, Strategy::NotReproduced | Strategy::Disagrees) && corrections.iter().any(|c| c.share > 0.0) {
+        add_correction(project, ts, corrections, &item, out, report);
+    } else if ctx.options.original_correction && !measuring && !cache.is_empty() {
+        report.add(item(correction::CORRECTION_NAME), Fidelity::Approximated, "not added: the stack was not compared with the stored result");
     }
     // the stored result as a locked layer: the reference, or the result on top
     if !cache.is_empty() {
@@ -593,6 +609,34 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         locked,
         placeholders,
     })
+}
+
+/// The correction layer of set `ts` from its corrected channels, pushed on top of its stack.
+fn add_correction(
+    project: &mut Project,
+    ts: usize,
+    corrections: Vec<correction::ChannelCorrection>,
+    item: &dyn Fn(&str) -> String,
+    out: &mut Imported,
+    report: &mut ImportReport,
+) {
+    let shares: Vec<(String, f32)> = corrections.iter().map(|c| (c.channel.label().to_lowercase(), c.share)).collect();
+    let text = correction::describe(&shares);
+    let channels: Vec<Channel> = corrections.iter().map(|c| c.channel).collect();
+    let id = project.alloc_id();
+    let mut layer = Layer::new(id, correction::CORRECTION_NAME, LayerKind::Paint, &channels);
+    layer.lock = Some(Lock::import(vec![LockReason::new(correction::CORRECTION_KEY, text.clone())]));
+    for c in corrections {
+        out.pixels.layers.insert((id, c.channel), c.tiles);
+    }
+    project.layers.insert(id, layer);
+    if let Ok(set) = project.texture_set_mut(ts) {
+        set.stack.push(id);
+    }
+    let r = report.layer_mut(id);
+    r.role = LayerRole::Correction;
+    r.fidelity = Fidelity::Baked;
+    report.add(item(correction::CORRECTION_NAME), Fidelity::Baked, text);
 }
 
 /// One line per blocker of the set: what it is, how many layers it locks and how many by it alone.

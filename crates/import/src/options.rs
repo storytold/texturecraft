@@ -11,6 +11,11 @@ pub struct ImportOptions {
     /// Replaces the few compiled filter graphs that have a close built-in filter (invert, clamp, blur, sharpen, HSL)
     /// with it, approximated. Off by default: every filter graph is a placeholder until graphs are computed.
     pub native_filters: bool,
+    /// Puts a correction layer on top of stacks that do not reproduce the original: the original's stored result on the
+    /// texels the layers don't reproduce ([`crate::correction`]), so the project looks as the original saved it while
+    /// every layer can still be switched on and off underneath. Off by default: the project shows what its layer stack
+    /// computes. Needs [`Self::measure`].
+    pub original_correction: bool,
     /// Composites each texture set and compares it with the original's stored result (the safety net). On by default;
     /// without it every stack counts as not measured.
     pub measure: bool,
@@ -29,6 +34,7 @@ impl Default for ImportOptions {
     fn default() -> Self {
         ImportOptions {
             original_on_top: false,
+            original_correction: false,
             native_filters: false,
             measure: true,
             max_resolution: None,

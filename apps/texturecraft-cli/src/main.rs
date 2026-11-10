@@ -40,12 +40,15 @@ USAGE:
       New project; --sample bakes and applies a smart material to every texture set. The
       sample's mesh maps are baked at the resolution up to 1024 px (most of the file's size),
       so a 2048 sample project is as large as a 1024 one.
-  texturecraft-cli import <project file> <out.tcraft> [--original-on-top] [--native-filters]
-                   [--max-resolution <px>] [--no-measure] [--no-replay] [--graphs decompile|keep]
+  texturecraft-cli import <project file> <out.tcraft> [--original-on-top] [--original-correction]
+                   [--native-filters] [--max-resolution <px>] [--no-measure] [--no-replay]
+                   [--graphs decompile|keep]
       Convert a project file of the reference app (one-way; the original is only read) and save
-      it; prints what the import found per texture set (file.importProject).
+      it; prints what the import found per texture set (file.importProject). --original-correction
+      adds a locked layer holding the original's result where the layers do not reproduce it.
   texturecraft-cli verify <project file> [<imported.tcraft>] [--set <name>] [--border <texels>] [--table]
-                   [--max-resolution <px>] [--native-filters] [--no-replay] [--graphs decompile|keep]
+                   [--max-resolution <px>] [--original-correction] [--native-filters] [--no-replay]
+                   [--graphs decompile|keep]
       Compare an imported project with the results stored in the file it came from, per texture
       set and channel on the mesh's texels, and grade each channel (import.verify). Without
       <imported.tcraft> the file is imported first (the import flags apply). --table prints a
@@ -78,8 +81,8 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("export", &["--preset", "--format", "--padding", "--size"], &[]),
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
     ("new", &["--resolution"], &["--sample"]),
-    ("import", &["--max-resolution", "--graphs"], &["--original-on-top", "--native-filters", "--no-measure", "--no-replay"]),
-    ("verify", &["--set", "--border", "--max-resolution", "--graphs"], &["--table", "--native-filters", "--no-replay"]),
+    ("import", &["--max-resolution", "--graphs"], &["--original-on-top", "--original-correction", "--native-filters", "--no-measure", "--no-replay"]),
+    ("verify", &["--set", "--border", "--max-resolution", "--graphs"], &["--table", "--original-correction", "--native-filters", "--no-replay"]),
     ("graph", &["--size", "--output", "--seed", "--param", "--depth", "--timeout"], &[]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
     ("serve", &["--port", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
@@ -300,8 +303,7 @@ fn run(a: &Args) -> R {
 
 /// `file.importProject` params from the import flags.
 fn import_params(a: &Args, input: &str) -> Result<Value, String> {
-    let mut p =
-        json!({"path": input, "originalOnTop": a.has("--original-on-top"), "nativeFilters": a.has("--native-filters"), "measure": !a.has("--no-measure")});
+    let mut p = json!({"path": input, "originalOnTop": a.has("--original-on-top"), "originalCorrection": a.has("--original-correction"), "nativeFilters": a.has("--native-filters"), "measure": !a.has("--no-measure")});
     if let Some(r) = a.num::<u32>("--max-resolution")? {
         p["maxResolution"] = json!(r);
     }
