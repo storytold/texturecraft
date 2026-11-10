@@ -157,7 +157,11 @@ the brush cannot replay yet (particles, ribbons, path strokes, projection, smudg
 placeholders locked with a `brush:<what>` or `brush-alpha:<graph>` key, and with replay switched off with
 `strokes:<tool>`. The
 stored result itself becomes a locked "Original result" paint layer, hidden as a reference unless the
-import is asked to show it. The mesh is kept as binary glTF; nothing else of the original file is kept. User channels 0–7 map
+import is asked to show it; asked for a correction (`originalCorrection`), the import also puts a locked "Correction to
+original" paint layer on top of a set's layers that holds the stored result only on the texels the layers miss. Polygon
+fills in masks are kept by the file as hits (clicks and rectangles with their camera), not triangles: the import resolves
+them on the set's mesh (`import::polygon_fill`) and lays the picked triangles into a mask paint effect, as TextureCraft's
+polygon fill tool does. The mesh is kept as binary glTF; nothing else of the original file is kept. User channels 0–7 map
 onto TextureCraft's user channels with their names (later ones, which the file numbers past the
 eighth, are reported). A set the original paints per UV tile imports as one texture over UV 0..1 with a
 note in the report: where the file keeps each tile's pixels has not been seen yet.
