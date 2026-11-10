@@ -144,8 +144,11 @@ result), shown by `project.inspect` with every lock and placeholder.
 `file.importProject` (`engine::import_cmds`, CLI `texturecraft-cli import`) converts a project file of the
 reference app one way: `import-reader` reads it, `import` maps it onto the model (layers, folders, fills,
 masks, levels, blend modes, geometry masks, baked maps, bake settings) and composites every texture set
-with `compose` to compare it with the file's stored result. Uses of compiled graphs become placeholders
-locked with the key `graph:<name>`. Brush strokes are replayed with TextureCraft's own brush: the translator (L2,
+with `compose` to compare it with the file's stored result. The file's compiled graphs are decompiled
+(`import-reader`) and run by the graph runtime (`texturecraft-graph`): procedural and material fills become graph
+sources (`Source::Graph`), mask generators and filters graph effects (`EffectKind::Graph`), each a `GraphRef` naming
+its graph text by key with the file's values and input bindings. A use that cannot be fed stays a placeholder locked
+with the key `graph:<name>` (or its input's blocker); `graphs: "keep"` keeps every use a placeholder. Brush strokes are replayed with TextureCraft's own brush: the translator (L2,
 without `paint`) rasterises nothing but hands replay jobs (stroke records, the brush mapped with the measured rules,
 tip, camera, symmetry, seed, and the layer, content effect or mask effect painted) to a `StrokeReplayer`, which the
 engine implements with `paint` (`engine::import_replay`) and passes in through the import's hooks; the import calls
@@ -155,6 +158,19 @@ placeholders locked with a `brush:<what>` or `brush-alpha:<graph>` key, and with
 `strokes:<tool>`. The
 stored result itself becomes a locked "Original result" paint layer, hidden as a reference unless the
 import is asked to show it. The mesh is kept as binary glTF; nothing else of the original file is kept.
+
+## Graph sources and cooked results
+
+`compose::graphs` evaluates graph references. A document's `GraphStore` holds the graph texts by key and the cooks:
+one render of a graph for one texture set, every output it keeps as 16-bit tiles. A cook's key covers the graph text,
+the evaluator versions of the node kinds it uses, its values, seed and inputs (baked maps and images by content,
+nested graphs the same way, a filter's input pixels) and the render side, but not the compiler (renders are the same
+bits everywhere), so a stored cook stays valid across builds. Graphs reading nothing of the stack are cooked before the
+tiles composite and sampled like images; graphs reading the stack below or an anchor run as whole-set neighbourhood
+fields. Renders run on the graph runtime's own thread pool, and no compositor thread waits for a render held further
+down its own stack (`compose::graphs::once`). The `.tcraft` file stores the texts (`graphs/<key>.txt`) and the cooks
+the last composite read (`cooked/`), so a converted project opens without rendering its graphs; a use whose key no
+longer matches is rendered again alone, and one that cannot be keeps its last pixels, flagged in `project.inspect`.
 
 ## Commands and automation
 
