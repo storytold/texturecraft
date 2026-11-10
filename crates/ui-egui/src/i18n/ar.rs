@@ -3,6 +3,7 @@
 pub const TABLE: &[(&str, &str)] = &[
     ("Baking {map} ({n}/{total})", "جارٍ خبز {map} ({n}/{total})"),
     ("Baking {map} ({n}/{total}), texture set {set} of {sets}", "جارٍ خبز {map} ({n}/{total})، مجموعة الخامات {set} من {sets}"),
+    ("Choose channel", "اختر القناة"),
     ("Follow Newest Map", "تتبّع أحدث خريطة"),
     (
         "Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.",
@@ -12,6 +13,7 @@ pub const TABLE: &[(&str, &str)] = &[
         "What the 3D view shows while the bake runs: the newest finished map, one finished map, or the material. Maps not baked yet show a neutral value.",
         "ما يعرضه العرض ثلاثي الأبعاد أثناء الخبز: أحدث خريطة مكتملة، أو أي خريطة مكتملة تختارها، أو الخامة. الخرائط التي لم تُخبز بعد تعرض قيمة محايدة.",
     ),
+    ("This layer has no channel on: choose the channel its painting is for", "لا توجد قناة مفعّلة في هذه الطبقة: اختر القناة المقصودة لطلائها"),
     ("\"{layer}\" has no paint yet: the filter changes what you paint on it.", "لا يوجد رسم على \"{layer}\" بعد: يغيّر المرشح ما ترسمه عليها."),
     ("0 turns autosave off. Copies go to {folder}", "0 يعطل الحفظ التلقائي. تُحفظ النُسخ في {folder}"),
     ("2D view only", "عرض ثنائي الأبعاد فقط"),
@@ -702,6 +704,8 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Select source", "تحديد المصدر"),
     ("Select the mask (Alt+click: show it in the viewport)", "تحديد القناع (Alt+نقر: عرضه في منفذ العرض)"),
     ("Select...", "تحديد..."),
+    ("Send layers to PhotoCraft...", "إرسال الطبقات إلى PhotoCraft..."),
+    ("Sent {n} documents to PhotoCraft; its saves show here", "تم إرسال {n} مستندات إلى PhotoCraft؛ تظهر عمليات الحفظ فيه هنا"),
     ("Settings", "الإعدادات"),
     ("Settings...", "الإعدادات..."),
     ("Shader Settings", "إعدادات المظلل"),
@@ -818,6 +822,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("UV tiles (UDIM)", "بلاطات UV (UDIM)"),
     ("Undo", "تراجع"),
     ("Uniform value", "قيمة موحدة"),
+    ("Updated from PhotoCraft", "تم التحديث من PhotoCraft"),
     ("Use an equirectangular .hdr or .exr image as the environment", "استخدم صورة .hdr أو .exr متساوية المستطيلات كبيئة"),
     ("Use the control channel or `texturecraft-cli render` for screenshots", "استخدم قناة التحكم أو الأمر `texturecraft-cli render` لالتقاط لقطات الشاشة"),
     ("Value", "القيمة"),

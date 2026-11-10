@@ -336,6 +336,80 @@ case and underscores ignored). Usages map to channels of the same id (`baseColor
 OpenGL convention, `roughness`, `metallic`, `height`, `ambientOcclusion`, `emissive`, `opacity`,
 `specular`); missing channels join the texture set.
 
+## PhotoCraft hand-off
+
+`file.sendToPhotoCraft` (File › Send layers to PhotoCraft...) writes texture sets as layered documents
+and opens them in PhotoCraft (`$PHOTOCRAFT`, else `photocraft` next to the TextureCraft executable,
+else on `PATH`). The menu item sends every texture set.
+
+**PSD (the default).** One 16-bit document per texture set, `<mesh>_<set>.psd` (`formats::psd`,
+written from the public file format specification), holding every channel so that a mask edited
+once shapes all of them:
+
+- Every folder is a pass-through group with the folder's mask and, when all its channels share one,
+  its opacity (otherwise 100%, with a warning). A TextureCraft folder blends its children with the
+  layers below it and mixes the result in by its opacity, whatever its mode, which is what a
+  pass-through group does; an isolated group would render a Multiply child differently.
+- Every layer is a pass-through group of the same name. The layer's mask (painted, generators,
+  filters, geometry and height masks included) is the group's own editable layer mask; it is left
+  out when it hides nothing.
+- Inside each layer group, one pixel layer per enabled channel, named after it (`Base color`,
+  `Roughness`, `Metallic`, `Height`, ...), holds the layer's content for that channel (fill sources,
+  generators, filters and content effects, not masked), with the channel's opacity and blend mode
+  (modes the format lacks are sent as Normal with a warning).
+- One layer comp per channel shows only that channel's layers; the document opens on the first.
+  The merged image is the first channel's composite.
+
+**OpenRaster** (`format: "ora"`). One document per texture set and channel,
+`<mesh>_<set>_<channel>.ora` (`formats::ora`). Each layer is rendered alone, times its mask, so the
+mask becomes the layer's transparency; folders become groups (pass-through folders
+`isolation="auto"`) with the channel's visibility, opacity and blend mode (`svg:*` names).
+
+In both, colour channels are sRGB and data channels as stored (height `0.5 + 0.5·h`, normals
+OpenGL), 16-bit with straight alpha.
+
+Every node of a sent PSD gets a layer id (`lyid`, from `0x40000000` up; PhotoCraft keeps ids across
+saves and numbers the layers it adds from 1), and the send records what each id stands for and how
+it looked. Each sent file is a link. When PhotoCraft saves a PSD, TextureCraft **mirrors it into the
+stack** in one undo step:
+
+- A group sent as a folder stays that folder, and a group sent as a layer stays that layer; their
+  names, visibility, order and masks follow the document. An edited mask becomes a painted mask
+  (generators and filters it had are replaced by the result). A folder's changed opacity
+  applies to all its channels (a blend mode other than pass-through only gets a note, since
+  folders always pass through); a layer group's changed opacity scales its channels'.
+- A channel pixel layer whose pixels changed becomes that channel's paint. A fill, instance or
+  other procedural layer becomes a paint layer first, keeping its other channels as they rendered
+  (its content effects are baked in). A changed blend mode or opacity applies to that channel. A
+  removed channel layer turns the channel off.
+- A new group becomes a pass-through folder with its opacity and mask. A new pixel layer becomes a paint
+  layer of the same name, painted in the channel its name says: an id or label in any case and
+  spacing (`Base Color`, `base_color 2`, `rough copy`) or a common name (`Albedo`, `Diffuse`,
+  `Bump`, `Metalness`, `Gloss`, ...). Its transparency and own mask become its coverage. When the
+  name says no channel (or several), it comes in with no channel on, holding its pixels, and
+  `layer.assignChannel` (the warning marker on the layer row) gives it one. Layers added inside a
+  layer's group go above that layer, with the group's mask.
+- A layer brought in this way that PhotoCraft changes again is repainted in its channel; renaming it
+  to another channel's name moves it there.
+- Layers removed in PhotoCraft are removed. Layers the send left out (no channel on) stay next to
+  the layer they were above.
+
+An OpenRaster file brings back its `mergedimage.png` as the image source of a `PhotoCraft: <channel>`
+fill at the top of the set (one undo step per save; the layers below are untouched).
+
+A PSD whose size no longer matches the texture set is refused. Notes on what changed in a way the
+user may not expect (a layer turned into a paint layer, a mask replaced, a layer with no channel)
+go to the log. The desktop app looks at the files' modification times about twice a second and
+never during a stroke. Links last for the session and are not saved with the project.
+
+| Command | Params |
+|---|---|
+| `file.sendToPhotoCraft` | `{dir, ts?: index\|"all" (default: the active set), channels?: [ids], format?: "psd"\|"ora" (default psd), open?: true}` → `{files, warnings}` |
+| `photocraft.links` | `{}` → `[{path, ts, format, channels, layers: {channel: layer id} (ora), nodes: n (psd)}]` |
+| `photocraft.sync` | `{}` → `{updated}`: read the linked files saved since the last look now |
+| `photocraft.unlink` | `{path?}`: stop watching one file, or all |
+| `layer.assignChannel` | `{layer?, channel}`: a paint layer's painting moves to `channel` (converted through the hand-off encoding when it was another channel's) and that becomes its only channel |
+
 ## CLI
 
 ```sh

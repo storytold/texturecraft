@@ -3,6 +3,7 @@
 pub const TABLE: &[(&str, &str)] = &[
     ("Baking {map} ({n}/{total})", "Fazendo o bake de {map} ({n}/{total})"),
     ("Baking {map} ({n}/{total}), texture set {set} of {sets}", "Fazendo o bake de {map} ({n}/{total}), conjunto de texturas {set} de {sets}"),
+    ("Choose channel", "Escolher canal"),
     ("Follow Newest Map", "Seguir o mapa mais recente"),
     (
         "Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.",
@@ -12,6 +13,7 @@ pub const TABLE: &[(&str, &str)] = &[
         "What the 3D view shows while the bake runs: the newest finished map, one finished map, or the material. Maps not baked yet show a neutral value.",
         "O que a vista 3D mostra durante o bake: o último mapa concluído, um mapa concluído à escolha ou o material. Mapas ainda não gerados mostram um valor neutro.",
     ),
+    ("This layer has no channel on: choose the channel its painting is for", "Esta camada não tem nenhum canal ligado: escolha o canal da pintura dela"),
     ("\"{layer}\" has no paint yet: the filter changes what you paint on it.", "\"{layer}\" ainda não tem pintura: o filtro altera o que você pintar nela."),
     ("0 turns autosave off. Copies go to {folder}", "0 desativa o salvamento automático. As cópias vão para {folder}"),
     ("2D view only", "Apenas vista 2D"),
@@ -726,6 +728,8 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Select source", "Selecionar origem"),
     ("Select the mask (Alt+click: show it in the viewport)", "Selecionar a máscara (Alt+clique: exibi-la na viewport)"),
     ("Select...", "Selecionar..."),
+    ("Send layers to PhotoCraft...", "Enviar camadas para o PhotoCraft..."),
+    ("Sent {n} documents to PhotoCraft; its saves show here", "{n} documentos enviados ao PhotoCraft; o que for salvo lá aparece aqui"),
     ("Settings", "Configurações"),
     ("Settings...", "Configurações..."),
     ("Shader Settings", "Configurações do shader"),
@@ -842,6 +846,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("UV tiles (UDIM)", "Tiles UV (UDIM)"),
     ("Undo", "Desfazer"),
     ("Uniform value", "Valor uniforme"),
+    ("Updated from PhotoCraft", "Atualizado a partir do PhotoCraft"),
     ("Use an equirectangular .hdr or .exr image as the environment", "Usar uma imagem equirretangular .hdr ou .exr como ambiente"),
     ("Use the control channel or `texturecraft-cli render` for screenshots", "Use o canal de controle ou `texturecraft-cli render` para capturas de tela"),
     ("Value", "Valor"),

@@ -3,6 +3,7 @@
 pub const TABLE: &[(&str, &str)] = &[
     ("Baking {map} ({n}/{total})", "Cuisson de {map} ({n}/{total})"),
     ("Baking {map} ({n}/{total}), texture set {set} of {sets}", "Cuisson de {map} ({n}/{total}), jeu de textures {set} sur {sets}"),
+    ("Choose channel", "Choisir le canal"),
     ("Follow Newest Map", "Suivre la dernière carte"),
     (
         "Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.",
@@ -747,6 +748,8 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Select source", "Sélectionner la source"),
     ("Select the mask (Alt+click: show it in the viewport)", "Sélectionner le masque (Alt+clic : l'afficher dans la fenêtre d'affichage)"),
     ("Select...", "Sélectionner..."),
+    ("Send layers to PhotoCraft...", "Envoyer les calques vers PhotoCraft..."),
+    ("Sent {n} documents to PhotoCraft; its saves show here", "{n} documents envoyés vers PhotoCraft ; ses enregistrements s'affichent ici"),
     ("Settings", "Paramètres"),
     ("Settings...", "Paramètres..."),
     ("Shader Settings", "Paramètres du shader"),
@@ -834,6 +837,10 @@ pub const TABLE: &[(&str, &str)] = &[
     ("The resize worker stopped", "Le processus de redimensionnement s'est arrêté"),
     ("Thickness", "Épaisseur"),
     ("Thin areas", "Zones fines"),
+    (
+        "This layer has no channel on: choose the channel its painting is for",
+        "Ce calque n'a aucun canal actif : choisissez le canal auquel sa peinture est destinée",
+    ),
     ("Threshold", "Seuil"),
     ("Tile", "Répéter"),
     ("Tiles", "Carreaux"),
@@ -863,6 +870,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("UV tiles (UDIM)", "Tuiles UV (UDIM)"),
     ("Undo", "Annuler"),
     ("Uniform value", "Valeur uniforme"),
+    ("Updated from PhotoCraft", "Mis à jour depuis PhotoCraft"),
     ("Use an equirectangular .hdr or .exr image as the environment", "Utiliser une image équirectangulaire .hdr ou .exr comme environnement"),
     (
         "Use the control channel or `texturecraft-cli render` for screenshots",

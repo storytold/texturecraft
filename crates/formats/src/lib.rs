@@ -15,6 +15,10 @@
 //! - [`materialx`]: a MaterialX (`.mtlx`) OpenPBR document for an exported texture set.
 //! - [`mcmat`]: MaterialCraft portable materials (`.mcmat`) and mesh maps as 16-bit PNGs for
 //!   MaterialCraft graph inputs.
+//! - [`ora`]: layered OpenRaster (`.ora`) documents for an image editor, and their merged image
+//!   read back.
+//! - [`psd`]: layered 16-bit PSD documents (groups, layer masks, layer comps) for an image
+//!   editor, and their layers read back.
 //! - [`presets`]: the built-in export presets and JSON (de)serialization of user presets.
 //! - [`project_file`]: the `.tcraft` project zip (project JSON, sparse lossless pixel tiles,
 //!   baked maps, the original mesh and a thumbnail).
@@ -35,8 +39,10 @@ pub mod materialx_read;
 pub mod mcmat;
 pub mod mesh_export;
 pub mod mesh_import;
+pub mod ora;
 pub mod presets;
 pub mod project_file;
+pub mod psd;
 
 pub use export::{
     Dest, ExportInput, ExportOptions, ExportPreset, ExportedFile, FileFormat, MapSpec, Padding, PlannedFile, SourceRef, VirtualMap, list_outputs, render_maps,

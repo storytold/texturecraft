@@ -371,6 +371,8 @@ pub struct Session {
     pub export_presets: crate::preset_cmds::UserPresets,
     /// The user's project templates (kept when another project opens).
     pub templates: crate::template_cmds::UserTemplates,
+    /// Files sent to PhotoCraft whose saves show live (not saved with the project).
+    pub photocraft: crate::photocraft_cmds::Links,
 }
 
 impl Session {
@@ -421,6 +423,7 @@ impl Session {
             polygon_fill_drag: None,
             export_presets: Default::default(),
             templates: Default::default(),
+            photocraft: Default::default(),
         })
     }
 
@@ -669,6 +672,9 @@ impl Session {
     }
 
     fn after_history(&mut self, other: &Document) {
+        // Ids are never handed out twice, even after an undo: links outside the document (such as
+        // a PhotoCraft hand-off's record) name layers by id, and must not find a later layer.
+        self.doc.project.next_id = self.doc.project.next_id.max(other.project.next_id);
         self.modified = true;
         self.revision = self.revision.wrapping_add(1);
         self.invalidate_changed(other);

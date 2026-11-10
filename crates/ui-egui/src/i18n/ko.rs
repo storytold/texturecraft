@@ -3,6 +3,7 @@
 pub const TABLE: &[(&str, &str)] = &[
     ("Baking {map} ({n}/{total})", "{map} 베이크 중 ({n}/{total})"),
     ("Baking {map} ({n}/{total}), texture set {set} of {sets}", "{map} 베이크 중 ({n}/{total}), 텍스처 세트 {set}/{sets}"),
+    ("Choose channel", "채널 선택"),
     ("Follow Newest Map", "최신 맵 따라가기"),
     (
         "Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.",
@@ -711,6 +712,8 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Select source", "소스 선택"),
     ("Select the mask (Alt+click: show it in the viewport)", "마스크를 선택합니다 (Alt+클릭: 뷰포트에 표시)"),
     ("Select...", "선택..."),
+    ("Send layers to PhotoCraft...", "레이어를 PhotoCraft로 보내기..."),
+    ("Sent {n} documents to PhotoCraft; its saves show here", "문서 {n}개를 PhotoCraft로 보냈습니다. 그곳에서 저장하면 여기에 표시됩니다"),
     ("Settings", "설정"),
     ("Settings...", "설정..."),
     ("Shader Settings", "셰이더 설정"),
@@ -798,6 +801,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("The resize worker stopped", "크기 조정 작업이 중지되었습니다"),
     ("Thickness", "두께"),
     ("Thin areas", "얇은 영역"),
+    ("This layer has no channel on: choose the channel its painting is for", "이 레이어에는 켜진 채널이 없습니다. 페인팅이 적용될 채널을 선택하세요"),
     ("Threshold", "한계값"),
     ("Tile", "타일"),
     ("Tiles", "타일"),
@@ -827,6 +831,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("UV tiles (UDIM)", "UV 타일 (UDIM)"),
     ("Undo", "실행 취소"),
     ("Uniform value", "균일 값"),
+    ("Updated from PhotoCraft", "PhotoCraft에서 업데이트됨"),
     ("Use an equirectangular .hdr or .exr image as the environment", "등장방형 .hdr 또는 .exr 이미지를 환경으로 사용합니다"),
     ("Use the control channel or `texturecraft-cli render` for screenshots", "스크린샷은 제어 채널 또는 `texturecraft-cli render`를 사용하세요"),
     ("Value", "값"),
