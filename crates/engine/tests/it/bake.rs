@@ -639,7 +639,7 @@ fn changing_the_mesh_keeps_the_bake_setup_and_marks_the_project_changed() {
     for uv in &plane.uvs {
         low += &format!("vt {} {}\n", uv.x, 1.0 - uv.y);
     }
-    for t in plane.indices.chunks_exact(3) {
+    for t in plane.indices.as_chunks::<3>().0 {
         low += &format!("f {a}/{a} {b}/{b} {c}/{c}\n", a = t[0] + 1, b = t[1] + 1, c = t[2] + 1);
     }
     let low = temp_file("change_low.obj", &low);
