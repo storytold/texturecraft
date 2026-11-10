@@ -185,16 +185,49 @@ pub(crate) fn blend_param(cmd: &str, p: &Value, key: &str) -> Result<Option<Blen
     }
 }
 
-/// A color: `[r, g, b]` (linear 0..1) or `"#rrggbb"` (sRGB hex, converted to linear).
-pub(crate) fn color_param(p: &Value, key: &str) -> Option<[f32; 3]> {
-    color_of(p.get(key)?)
+/// A color: `[r, g, b]` (linear 0..1), a grey number or `"#rrggbb"` (sRGB hex, converted to
+/// linear). Absent or `null` is `None`; any other value that is not a color is an error rather than
+/// the default.
+pub(crate) fn color_param(cmd: &str, p: &Value, key: &str) -> Result<Option<[f32; 3]>> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => color_of(v)
+            .map(Some)
+            .ok_or_else(|| bad(cmd, format!("`{key}` must be a color, [r, g, b] (linear 0..1), a grey number or \"#rrggbb\" (sRGB), not {v}"))),
+    }
 }
 
-/// A color value (see [`color_param`]).
+/// `N` finite numbers: a point or a direction (`center`, `direction`, color balance offsets), not a
+/// color, so no grey or hex form. Absent or `null` is `None`; any other value is an error.
+pub(crate) fn numbers_param<const N: usize>(cmd: &str, p: &Value, key: &str) -> Result<Option<[f32; N]>> {
+    let v = match p.get(key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    let numbers: Option<Vec<f32>> =
+        v.as_array().filter(|a| a.len() == N).and_then(|a| a.iter().map(|x| x.as_f64().map(|n| n as f32).filter(|n| n.is_finite())).collect());
+    match numbers.and_then(|n| <[f32; N]>::try_from(n).ok()) {
+        Some(n) => Ok(Some(n)),
+        None => Err(bad(cmd, format!("`{key}` must be a list of {N} numbers, not {v}"))),
+    }
+}
+
+/// `color`, or `value` when there is no `color` (a fill or brush channel takes either). `value` is
+/// read only then, so it cannot fail a call that has a good `color`.
+pub(crate) fn color_or_value(cmd: &str, p: &Value) -> Result<Option<[f32; 3]>> {
+    match color_param(cmd, p, "color")? {
+        Some(color) => Ok(Some(color)),
+        None => color_param(cmd, p, "value"),
+    }
+}
+
+/// A color value, or `None` when `v` is not one: `[r, g, b]` numbers (linear; a longer array gives
+/// its first three, so an alpha is ignored), one number for a grey, or `"#rrggbb"` (sRGB). Params
+/// go through [`color_param`], which turns `None` for a given value into an error.
 pub(crate) fn color_of(v: &Value) -> Option<[f32; 3]> {
     match v {
         Value::Array(a) if a.len() >= 3 => {
-            let v: Vec<f32> = a.iter().take(3).map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
+            let v: Vec<f32> = a.iter().take(3).map(|x| x.as_f64().map(|n| n as f32)).collect::<Option<_>>()?;
             if v.iter().all(|x| x.is_finite()) { Some([v[0], v[1], v[2]]) } else { None }
         }
         Value::Number(n) => n.as_f64().map(|v| [v as f32; 3]).filter(|v| v[0].is_finite()),
@@ -207,5 +240,86 @@ pub(crate) fn color_of(v: &Value) -> Option<[f32; 3]> {
             Some([c(0)?, c(2)?, c(4)?])
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `#c8102e` in linear: 200, 16 and 46 out of 255, each through the sRGB curve.
+    fn c8102e() -> [f32; 3] {
+        [200.0, 16.0, 46.0].map(|v| texturecraft_texel::srgb_to_linear(v / 255.0))
+    }
+
+    #[test]
+    fn a_param_that_is_not_a_color_is_an_error() {
+        let rows = [
+            ("absent", json!({}), Ok(None)),
+            ("null", json!({"color": null}), Ok(None)),
+            ("array", json!({"color": [0.5, 0.25, 1]}), Ok(Some([0.5, 0.25, 1.0]))),
+            ("grey", json!({"color": 0.5}), Ok(Some([0.5; 3]))),
+            ("hex", json!({"color": "#c8102e"}), Ok(Some(c8102e()))),
+            ("upper case hex", json!({"color": "#C8102E"}), Ok(Some(c8102e()))),
+            ("bad hex", json!({"color": "#fff"}), Err(())),
+            ("short array", json!({"color": [1, 0]}), Err(())),
+            ("a word for a component", json!({"color": [1, "bad", 0]}), Err(())),
+            ("a null component", json!({"color": [0.5, null, 0.5]}), Err(())),
+            ("object", json!({"color": {"r": 1}}), Err(())),
+        ];
+        for (name, params, expected) in rows {
+            let got = color_param("test.cmd", &params, "color");
+            match (&got, expected) {
+                (Ok(color), Ok(want)) => assert_eq!(*color, want, "{name}"),
+                (Err(e), Err(())) => assert!(e.to_string().contains("`color` must be a color"), "{name}: {e}"),
+                _ => panic!("{name}: {got:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn value_is_read_only_without_a_color() {
+        let rows = [
+            ("color", json!({"color": [0.5, 0.25, 1]}), Ok(Some([0.5, 0.25, 1.0]))),
+            ("value", json!({"value": 0.5}), Ok(Some([0.5; 3]))),
+            ("color wins over value", json!({"color": [1, 0, 0], "value": 0.5}), Ok(Some([1.0, 0.0, 0.0]))),
+            ("good color, bad value", json!({"color": [1, 0, 0], "value": "bad"}), Ok(Some([1.0, 0.0, 0.0]))),
+            ("no color, bad value", json!({"value": "bad"}), Err("`value`")),
+            ("bad color, good value", json!({"color": "bad", "value": 0.5}), Err("`color`")),
+            ("null color, good value", json!({"color": null, "value": 0.5}), Ok(Some([0.5; 3]))),
+            ("null color, bad value", json!({"color": null, "value": "bad"}), Err("`value`")),
+            ("neither", json!({}), Ok(None)),
+        ];
+        for (name, params, expected) in rows {
+            let got = color_or_value("test.cmd", &params);
+            match (&got, expected) {
+                (Ok(color), Ok(want)) => assert_eq!(*color, want, "{name}"),
+                (Err(e), Err(key)) => assert!(e.to_string().contains(key), "{name}: {e}"),
+                _ => panic!("{name}: {got:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_vector_param_is_exactly_its_numbers() {
+        let rows = [
+            ("absent", json!({}), Ok(None)),
+            ("null", json!({"v": null}), Ok(None)),
+            ("three numbers", json!({"v": [0.0, 1, -0.5]}), Ok(Some([0.0, 1.0, -0.5]))),
+            ("two numbers", json!({"v": [0, 1]}), Err(())),
+            ("four numbers", json!({"v": [0, 1, 0, 1]}), Err(())),
+            ("a word", json!({"v": [0, "up", 0]}), Err(())),
+            ("hex", json!({"v": "#ffffff"}), Err(())),
+            ("one number", json!({"v": 0.5}), Err(())),
+            ("too big for f32", json!({"v": [0, 1e300, 0]}), Err(())),
+        ];
+        for (name, params, expected) in rows {
+            let got = numbers_param::<3>("test.cmd", &params, "v");
+            match (&got, expected) {
+                (Ok(v), Ok(want)) => assert_eq!(*v, want, "{name}"),
+                (Err(e), Err(())) => assert!(e.to_string().contains("`v` must be a list of 3 numbers"), "{name}: {e}"),
+                _ => panic!("{name}: {got:?}"),
+            }
+        }
     }
 }

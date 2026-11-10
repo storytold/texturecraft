@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 use texturecraft_core::{Channel, EffectKind, Fill, Filter, Levels, Procedural, ProceduralKind, Projection, Source};
 
-use crate::commands::{CommandSpec, always, bad, color_of, color_param, f32p, u64p};
+use crate::commands::{CommandSpec, always, bad, color_of, color_param, f32p, numbers_param, u64p};
 use crate::{Result, cmd};
 
 /// A filter of the library.
@@ -252,10 +252,11 @@ pub(crate) fn apply(p: &Value, f: &mut Filter, cmd: &str) -> Result<()> {
             set(luminosity, "luminosity", -1.0, 1.0);
         }
         Filter::ColorBalance { shadows, midtones, highlights } => {
-            for (key, slot) in [("shadows", shadows), ("midtones", midtones), ("highlights", highlights)] {
-                if p.get(key).is_some() {
-                    let v = color_param(p, key).ok_or_else(|| bad(cmd, format!("`{key}` must be [r, g, b] offsets in -1..1")))?;
-                    *slot = v.map(|x| x.clamp(-1.0, 1.0));
+            // Offsets, not colors: three numbers each, all read before any is set
+            let offsets = [numbers_param(cmd, p, "shadows")?, numbers_param(cmd, p, "midtones")?, numbers_param(cmd, p, "highlights")?];
+            for (slot, offset) in [shadows, midtones, highlights].into_iter().zip(offsets) {
+                if let Some(v) = offset {
+                    *slot = v.map(|x: f32| x.clamp(-1.0, 1.0));
                 }
             }
         }
@@ -304,9 +305,10 @@ pub(crate) fn apply(p: &Value, f: &mut Filter, cmd: &str) -> Result<()> {
             set(amount, "amount", 0.0, 10.0);
         }
         Filter::ReplaceColor { from, to, tolerance, softness } => {
-            for (key, slot) in [("from", from), ("to", to)] {
-                if p.get(key).is_some() {
-                    let v = color_param(p, key).ok_or_else(|| bad(cmd, format!("`{key}` must be a color ([r, g, b] linear or \"#rrggbb\")")))?;
+            // Both colors read before either is set
+            let colors = [color_param(cmd, p, "from")?, color_param(cmd, p, "to")?];
+            for (slot, color) in [from, to].into_iter().zip(colors) {
+                if let Some(v) = color {
                     *slot = v.map(|x| x.clamp(0.0, 1.0));
                 }
             }
@@ -335,6 +337,25 @@ pub(crate) fn apply(p: &Value, f: &mut Filter, cmd: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bad value leaves the filter as it was, also after a good value earlier in the same call.
+    #[test]
+    fn a_bad_value_changes_nothing_in_the_filter() {
+        let rows = [
+            ("replace colour, good from, bad to", "replaceColor", json!({"from": "#000000", "to": "bad"}), "`to`"),
+            ("replace colour, bad from", "replaceColor", json!({"from": [1, "x", 0]}), "`from`"),
+            ("colour balance, good shadows, bad midtones", "colorBalance", json!({"shadows": [0.1, 0, 0], "midtones": "bad"}), "`midtones`"),
+            ("colour balance, good shadows, short highlights", "colorBalance", json!({"shadows": [0.1, 0, 0], "highlights": [0, 1]}), "`highlights`"),
+            ("colour balance, a hex offset", "colorBalance", json!({"shadows": "#ffffff"}), "`shadows`"),
+        ];
+        for (name, id, params, key) in rows {
+            let Ok(EffectKind::Filter(before)) = build(id, &Value::Null) else { panic!("{name}: {id} does not build") };
+            let mut filter = before.clone();
+            let error = apply(&params, &mut filter, "effect.set").unwrap_err();
+            assert!(error.to_string().contains(key), "{name}: {error}");
+            assert_eq!(filter, before, "{name}");
+        }
+    }
 
     #[test]
     fn every_filter_builds_and_finds_by_id_or_label() {

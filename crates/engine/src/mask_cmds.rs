@@ -6,7 +6,7 @@ use texturecraft_core::{
     Procedural, ProceduralKind, Project, Source,
 };
 
-use crate::commands::{CommandSpec, always, bad, blend_param, boolp, channel_param, color_param, f32p, has_layer, layer_param, strp, u64p};
+use crate::commands::{CommandSpec, always, bad, blend_param, boolp, channel_param, color_param, f32p, has_layer, layer_param, numbers_param, strp, u64p};
 use crate::layer_cmds::projection_from;
 use crate::session::StackTarget;
 use crate::{EngineError, Result, Session, cmd};
@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add generator",
             ["Layers", "Effects"],
             None,
-            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, level?, softness?, noise?, invert?, mode?: edges|cavities|both|raw, sizes?: [7 weights 0..1, finest first] (curvature and edgeWear)}",
+            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, direction?: [x,y,z] (the direction generator's), level?, softness?, noise?, invert?, mode?: edges|cavities|both|raw, sizes?: [7 weights 0..1, finest first] (curvature and edgeWear)}",
             has_layer,
             add_generator
         ),
@@ -141,7 +141,7 @@ fn add_mask(s: &mut Session, p: &Value, bg: MaskBackground) -> Result<Value> {
 }
 
 fn add_color_mask(s: &mut Session, p: &Value) -> Result<Value> {
-    let color = color_param(p, "color").unwrap_or([1.0, 0.0, 0.0]);
+    let color = color_param("mask.add.colorSelection", p, "color")?.unwrap_or([1.0, 0.0, 0.0]);
     let tolerance = f32p(p, "tolerance").unwrap_or(0.1).clamp(0.0, 1.0);
     with_mask(s, p, "mask.add.colorSelection", "Add mask with color selection", |s, id| {
         let eid = s.doc.project.alloc_id();
@@ -285,7 +285,7 @@ fn add_fill(s: &mut Session, p: &Value) -> Result<Value> {
     let blend = blend_param("effect.add.fill", p, "blend")?.unwrap_or(BlendMode::Normal);
     let id = layer_param(s, "effect.add.fill", p)?;
     if content_target(p, "effect.add.fill")? {
-        let mut fill = crate::layer_cmds::fill_from(p);
+        let mut fill = crate::layer_cmds::fill_from("effect.add.fill", p)?;
         if fill.sources.is_empty() {
             fill.sources = s.doc.project.layer(id)?.channels.keys().map(|c| (*c, Source::uniform_of(*c))).collect();
         }
@@ -334,7 +334,8 @@ fn generator_from(command: &str, params: &Value, generator: &mut Generator) -> R
     if let Some(invert) = boolp(params, "invert") {
         generator.invert = invert;
     }
-    if let Some(direction) = color_param(params, "direction") {
+    // A direction, not a color: three numbers
+    if let Some(direction) = numbers_param(command, params, "direction")? {
         generator.direction = direction;
     }
 
