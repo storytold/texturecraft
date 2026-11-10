@@ -13,11 +13,13 @@ fn expr(words: &[u32]) -> Expr {
 }
 
 fn description() -> Description {
-    Description::parse(
-        br#"<sbsdescription><graphs><graph pkgurl="pkg://t" label="T"><inputs>
-        <input uid="4660" identifier="invert" type="4" default="0"/></inputs></graph></graphs></sbsdescription>"#,
-    )
-    .unwrap()
+    // the package description's root element is file data, named once in the reader
+    let root = texturecraft_import_reader::format_names::DESCRIPTION_ELEMENT;
+    let xml = format!(
+        r#"<{root}><graphs><graph pkgurl="pkg://t" label="T"><inputs>
+        <input uid="4660" identifier="invert" type="4" default="0"/></inputs></graph></graphs></{root}>"#
+    );
+    Description::parse(xml.as_bytes()).unwrap()
 }
 
 #[test]
