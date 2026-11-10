@@ -227,9 +227,14 @@ impl Session {
             entry.maps.clear();
         }
 
+        let map_keys: Vec<BakedMap> = maps.keys().copied().collect();
         entry.resolution = resolution;
         entry.maps.extend(maps);
-        self.doc.project.texture_set_mut(texture_set)?.baked = entry.maps.keys().copied().collect();
+        let set = self.doc.project.texture_set_mut(texture_set)?;
+        set.baked = entry.maps.keys().copied().collect();
+        for m in map_keys {
+            set.imported_maps.remove(&m);
+        }
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 //! Texture set commands (Texture Set List / Texture Set Settings).
 
 use serde_json::{Value, json};
-use texturecraft_core::{Channel, ChannelBlend, ChannelFormat};
+use texturecraft_core::{BakedMap, Channel, ChannelBlend, ChannelFormat};
 
 use std::sync::Arc;
 
@@ -275,8 +275,23 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
     let ts = ts_param(s, p, "textureSet.settings")?;
     let nf = normal_format_param("textureSet.settings", p)?;
     s.edit("Texture set settings", |s| {
-        if let Some(n) = nf {
+        if let Some(n) = nf
+            && s.doc.project.normal_format != n
+        {
             s.doc.project.normal_format = n;
+            for (ts, texture_set) in s.doc.project.texture_sets.iter().enumerate() {
+                if texture_set.imported_maps.contains(&BakedMap::Normal) {
+                    if let Some(baked) = s.doc.baked.get_mut(&ts) {
+                        if let Some(normal_map) = baked.maps.get_mut(&BakedMap::Normal) {
+                            let mut flipped = (**normal_map).clone();
+                            for chunk in flipped.chunks_exact_mut(3) {
+                                chunk[1] = 1.0 - chunk[1];
+                            }
+                            *normal_map = Arc::new(flipped);
+                        }
+                    }
+                }
+            }
         }
         let set = s.doc.project.texture_set_mut(ts)?;
         if let Some(d) = strp(p, "description") {
@@ -293,6 +308,44 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_changing_normal_format_flips_imported_normal_mesh_map_not_baked() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        // Texture set 0 has an imported normal map with green = 0.2
+        let entry0 = s.doc.baked.entry(0).or_default();
+        entry0.resolution = 1;
+        entry0.maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.2, 1.0]));
+        let set0 = s.doc.project.texture_set_mut(0).unwrap();
+        set0.baked.insert(BakedMap::Normal);
+        set0.imported_maps.insert(BakedMap::Normal);
+
+        // Texture set 1 has an internally baked normal map with green = 0.3
+        let entry1 = s.doc.baked.entry(1).or_default();
+        entry1.resolution = 1;
+        entry1.maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.3, 1.0]));
+        let set1 = s.doc.project.texture_set_mut(1).unwrap();
+        set1.baked.insert(BakedMap::Normal);
+
+        crate::execute(&mut s, "textureSet.settings", &json!({"normalFormat": "directX"})).unwrap();
+        assert_eq!(s.doc.project.normal_format, texturecraft_core::NormalFormat::DirectX);
+        let green_imported = s.doc.baked[&0].maps[&BakedMap::Normal][1];
+        assert!((green_imported - 0.8).abs() < 1e-4, "imported normal green should flip to 0.8: {green_imported}");
+        let green_baked = s.doc.baked[&1].maps[&BakedMap::Normal][1];
+        assert!((green_baked - 0.3).abs() < 1e-4, "internally baked normal should remain unchanged: {green_baked}");
+
+        // Rebaking set 1 preserves the canonical normal direction
+        let entry1_re = s.doc.baked.get_mut(&1).unwrap();
+        entry1_re.maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.3, 1.0]));
+        assert_eq!(s.doc.baked[&1].maps[&BakedMap::Normal][1], 0.3);
+
+        crate::execute(&mut s, "textureSet.settings", &json!({"normalFormat": "openGl"})).unwrap();
+        assert_eq!(s.doc.project.normal_format, texturecraft_core::NormalFormat::OpenGl);
+        let green_imported_back = s.doc.baked[&0].maps[&BakedMap::Normal][1];
+        assert!((green_imported_back - 0.2).abs() < 1e-4, "imported normal green should flip back to 0.2: {green_imported_back}");
+        let green_baked_still = s.doc.baked[&1].maps[&BakedMap::Normal][1];
+        assert!((green_baked_still - 0.3).abs() < 1e-4, "internally baked normal should still remain unchanged: {green_baked_still}");
+    }
 
     #[test]
     fn visibility_shows_hides_inverts_and_solos() {
