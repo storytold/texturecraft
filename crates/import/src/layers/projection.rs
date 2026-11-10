@@ -4,14 +4,14 @@
 //! |---|---|---|
 //! | `projection` 6 (texture space) | UV, identity | exact |
 //! | `projection` 0, identity UV transform | UV, identity | exact |
-//! | `projection` 0 with tiling, offset or rotation | UV with that placement (radians → degrees) | approximated: the rotation and offset conventions are not verified |
+//! | `projection` 0 with tiling, offset or rotation | UV with that placement about the texture's centre ([`uv_placement`]) | exact; approximated with a rotation (its direction is not verified) |
 //! | `projection` 2 (tri-planar) | tri-planar | approximated: TextureCraft's volume, blend curve and frame differ |
 //! | `projection` 1, 3, 4 (planar, spherical, cylindrical) | planar, spherical, cylindrical | approximated |
 //! | anything else (warp grids, unknown) | UV, identity | approximated |
 //! | `uvSamplingWrap` other than "both" | TextureCraft always repeats | approximated where the placement can show it |
 
 use texturecraft_core::Projection;
-use texturecraft_import_reader::model::FillEffect;
+use texturecraft_import_reader::model::{FillEffect, UvTransform};
 
 use crate::status::Status;
 
@@ -35,6 +35,22 @@ pub struct MappedProjection {
     pub volume: bool,
 }
 
+/// The file's UV placement as TextureCraft's `uv · R(rotation) · scale + offset`. The original tiles, offsets and turns
+/// about the texture's centre: image = `tiling · R(−θ) · (uv − ½ − offset) + ½` (measured: a mask fill tiled 4.37 times
+/// with offset 0.22 lands on the stored result only so). The offset is folded into TextureCraft's and wrapped to 0..1
+/// (the image repeats).
+fn uv_placement(t: &UvTransform) -> ([f32; 2], f32, [f32; 2]) {
+    let scale = t.scale.map(|v| if v.is_finite() { v } else { 1.0 });
+    let [ox, oy] = t.translation.map(|v| if v.is_finite() { v } else { 0.0 });
+    let theta = if t.rotation.is_finite() { t.rotation } else { 0.0 };
+    let (s, c) = theta.sin_cos();
+    // R(−θ) applied to the centre and offset, then scaled per axis
+    let (px, py) = (0.5 + ox, 0.5 + oy);
+    let r = [c * px + s * py, -s * px + c * py];
+    let offset = [0.5 - scale[0] * r[0], 0.5 - scale[1] * r[1]].map(|v| if v.is_finite() { v.rem_euclid(1.0) } else { 0.0 });
+    (scale, -theta.to_degrees(), offset)
+}
+
 pub fn map(fill: &FillEffect) -> MappedProjection {
     let identity = Projection::default();
     let uv = fill.uv_transform.filter(|t| !t.is_identity());
@@ -48,10 +64,11 @@ pub fn map(fill: &FillEffect) -> MappedProjection {
         PROJECTION_UV => match uv {
             None => (identity, Status::Exact, false),
             Some(t) => {
-                let scale = t.scale.map(|v| if v.is_finite() { v } else { 1.0 });
-                let offset = t.translation.map(|v| if v.is_finite() { v } else { 0.0 });
-                let rotation = if t.rotation.is_finite() { t.rotation.to_degrees() } else { 0.0 };
-                let mut status = approx("UV projection with tiling, offset or rotation (placement convention not verified)");
+                let (scale, rotation, offset) = uv_placement(&t);
+                let mut status = match rotation == 0.0 {
+                    true => Status::Exact,
+                    false => approx("UV projection with a rotation (its direction not verified)"),
+                };
                 if fill.placement.uv_wrap.is_some_and(|w| w != WRAP_BOTH) {
                     status.and(&approx("UV projection without repeat (TextureCraft repeats)"));
                 }
@@ -108,14 +125,42 @@ mod tests {
         assert!(m.status.is_exact() && m.projection == Projection::default() && !m.volume);
     }
 
+    /// TextureCraft's placement of `uv` (as the compositor applies [`Projection::Uv`]).
+    fn placed(p: &Projection, uv: [f32; 2]) -> [f32; 2] {
+        let Projection::Uv { scale, rotation, offset } = p else { panic!("uv") };
+        let (sn, cs) = rotation.to_radians().sin_cos();
+        [(uv[0] * cs - uv[1] * sn) * scale[0] + offset[0], (uv[0] * sn + uv[1] * cs) * scale[1] + offset[1]]
+    }
+
+    #[test]
+    fn tiling_and_offset_place_about_the_centre_as_the_original() {
+        let t = UvTransform { scale: [4.37, 3.0], translation: [0.22, -0.1], rotation: 0.0 };
+        let m = map(&fill(0, Some(t)));
+        assert!(m.status.is_exact());
+        for uv in [[0.0, 0.0], [0.5, 0.5], [0.13, 0.71], [0.9, 0.2]] {
+            // the original: tiling · (uv − ½ − offset) + ½, the same texel of the repeating image
+            let want = [4.37 * (uv[0] - 0.5 - 0.22) + 0.5, 3.0 * (uv[1] - 0.5 + 0.1) + 0.5];
+            let got = placed(&m.projection, uv);
+            for k in 0..2 {
+                let d = (got[k] - want[k]).rem_euclid(1.0);
+                assert!(d.min(1.0 - d) < 1e-4, "{uv:?}: {got:?} vs {want:?}");
+            }
+        }
+        // a turn about the centre keeps the centre in place
+        let turned = map(&fill(0, Some(UvTransform { scale: [1.0, 1.0], translation: [0.0, 0.0], rotation: 0.7 })));
+        let c = placed(&turned.projection, [0.5, 0.5]);
+        assert!((c[0].rem_euclid(1.0) - 0.5).abs() < 1e-4 && (c[1].rem_euclid(1.0) - 0.5).abs() < 1e-4, "{c:?}");
+        assert!(!turned.status.is_exact());
+    }
+
     #[test]
     fn placements_and_volumes_are_approximated() {
         let t = UvTransform { scale: [2.0, 2.0], translation: [0.5, 0.0], rotation: std::f32::consts::FRAC_PI_2 };
         let m = map(&fill(0, Some(t)));
         assert!(!m.status.is_exact());
-        let Projection::Uv { scale, rotation, offset } = m.projection else { panic!("uv") };
-        assert_eq!((scale, offset), ([2.0, 2.0], [0.5, 0.0]));
-        assert!((rotation - 90.0).abs() < 1e-4);
+        let Projection::Uv { scale, rotation, .. } = m.projection else { panic!("uv") };
+        assert_eq!(scale, [2.0, 2.0]);
+        assert!((rotation + 90.0).abs() < 1e-4);
         let tri = map(&fill(2, None));
         assert!(tri.volume && matches!(tri.projection, Projection::Triplanar { .. }) && !tri.status.is_exact());
         assert!(!map(&fill(7, None)).status.is_exact());
