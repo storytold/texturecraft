@@ -38,6 +38,7 @@ fn sample() -> Sample {
             .into(),
         thumbnail: Some(vec![137, 80, 78, 71]),
         resources: [("bricks.png".to_string(), vec![9, 8, 7])].into(),
+        graphs: Default::default(),
         warnings: Vec::new(),
     };
     Sample { pf, paint }
@@ -948,4 +949,100 @@ fn version_3_features_round_trip_identically() {
     bad["import"]["entries"][0]["fidelity"] = serde_json::json!("KeptRaw");
     let bytes = edit_project_json(&s.pf, |j| *j = bad.clone());
     assert!(load_project_bytes(&bytes).is_err());
+}
+
+const GREY: &str = "format 3\nsize 8\nnode 1 color r=0.5 g=0.5 b=0.5\noutput grey 1\n";
+const UNUSED: &str = "format 3\nsize 8\nnode 1 color r=1 g=0 b=0\noutput red 1\n";
+
+/// A sample with a graph source, a nested graph in a mask generator, and one cook the source's use read.
+fn graph_sample() -> (ProjectFile, String) {
+    use texturecraft_core::{GraphInput, GraphRef, Projection, Source};
+    let mut pf = sample().pf;
+    let grey = pf.graphs.add_text(GREY);
+    pf.graphs.add_text(UNUSED);
+    let mut g = GraphRef::new(grey.clone(), "grey");
+    g.output = Some("grey".into());
+    let mut fill = Fill::default();
+    fill.sources.insert(Channel::Roughness, Source::Graph(g.clone()));
+    let id = pf.project.alloc_id();
+    let mut layer = Layer::new(id, "Graph fill", LayerKind::Fill(fill), &[Channel::Roughness]);
+    let mut outer = GraphRef::new(texturecraft_core::text_key("absent outer"), "outer");
+    outer.inputs.insert(0, GraphInput::Nested(Box::new(g)));
+    layer.mask = Some(Mask {
+        effects: vec![Effect::new(pf.project.alloc_id(), EffectKind::Graph { graph: outer, projection: Projection::default() })],
+        ..Mask::new(MaskBackground::White)
+    });
+    pf.project.insert_layer(0, layer, None, false).unwrap();
+    let t = texturecraft_compose::graphs::Tex { w: 70, h: 70, px: (0..4900).map(|i| [(i % 70) as f32 / 70.0, 0.25, 0.5, 1.0]).collect() };
+    let key = texturecraft_core::StableHash::of(b"a cook").key();
+    pf.graphs.insert_cooked(
+        key.clone(),
+        Cooked::from_textures([("grey".to_string(), t.clone()), ("odd name/x".to_string(), t)].into(), ["grey".to_string()].into()),
+    );
+    pf.graphs.insert_cooked(texturecraft_core::StableHash::of(b"unused cook").key(), Cooked::from_textures(BTreeMap::new(), Default::default()));
+    pf.graphs.set_uses([(GraphUse { set: 0, id, channel: Some(Channel::Roughness) }, key.clone())].into());
+    (pf, key)
+}
+
+#[test]
+fn graph_texts_and_cooks_round_trip_byte_for_byte() {
+    let (pf, key) = graph_sample();
+    let bytes = save_project_bytes(&pf).unwrap();
+    let back = load_project_bytes(&bytes).unwrap();
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+    assert_same(&pf, &back);
+    // only the referenced text that the project holds is saved (the outer one is missing: it is just not there)
+    assert_eq!(back.graphs.texts.keys().collect::<Vec<_>>(), [&texturecraft_core::text_key(GREY)]);
+    assert_eq!(back.graphs.uses(), pf.graphs.uses());
+    let cooked = back.graphs.cooked(&key).unwrap();
+    assert_eq!(*cooked, *pf.graphs.cooked(&key).unwrap(), "cooks load as they were saved, linear outputs too");
+    assert_eq!(back.graphs.used_cooks().len(), 1, "cooks no use reads are not saved");
+    assert_eq!(save_project_bytes(&back).unwrap(), bytes, "re-saving gives the same bytes");
+    // version 3 files without graphs load as before
+    let plain = sample().pf;
+    let back = load_project_bytes(&save_project_bytes(&plain).unwrap()).unwrap();
+    assert!(back.graphs.texts.is_empty() && back.graphs.uses().is_empty());
+}
+
+#[test]
+fn hostile_graph_entries_are_refused_or_left_out() {
+    let (pf, key) = graph_sample();
+    let grey = texturecraft_core::text_key(GREY);
+    // a text that does not hash to its name
+    let bytes = edit_archive(&pf, |name, data| {
+        if name.starts_with("graphs/") {
+            data.extend_from_slice(b"node 9 color\n");
+        }
+    });
+    assert!(load_project_bytes(&bytes).unwrap_err().to_string().contains("does not match its key"));
+    // a graph entry that is not named by a key
+    let bytes = edit_archive(&pf, |name, _| {
+        if name.starts_with("graphs/") {
+            *name = "graphs/../../x.txt".into();
+        }
+    });
+    assert!(load_project_bytes(&bytes).is_err());
+    // a reference whose key is not a key
+    let bytes = edit_project_json(&pf, |json| {
+        let text = json.to_string().replace(&grey, "../etc");
+        *json = serde_json::from_str(&text).unwrap();
+    });
+    assert!(load_project_bytes(&bytes).is_err());
+    // an unreadable index: no cooks, a note, the project still opens
+    let bytes = edit_archive(&pf, |name, data| {
+        if name == "cooked/index.json" {
+            *data = b"{not json".to_vec();
+        }
+    });
+    let back = load_project_bytes(&bytes).unwrap();
+    assert!(back.graphs.cooked(&key).is_none() && back.warnings.len() == 1);
+    // a cook whose output entry is broken is left out whole
+    let bytes = edit_archive(&pf, |name, data| {
+        if name.starts_with("cooked/") && name.ends_with(".bin") {
+            data.truncate(30);
+        }
+    });
+    let back = load_project_bytes(&bytes).unwrap();
+    assert!(back.graphs.cooked(&key).is_none() && back.warnings.iter().any(|w| w.contains("rendered again")));
+    assert_eq!(back.graphs.texts.len(), 1);
 }

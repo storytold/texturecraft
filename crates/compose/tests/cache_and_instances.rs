@@ -100,6 +100,7 @@ fn inputs<'a>(f: &'a Fixture, ts: usize, images: &'a texturecraft_compose::Image
         block_scales: f.project.texture_sets[ts].block_scales(),
         preview: None,
         images,
+        graphs: texturecraft_compose::GraphStore::empty(),
         bounds: f.mesh.bounds(),
     }
 }

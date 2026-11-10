@@ -250,6 +250,91 @@ fn panic_hunt() {
     }
 }
 
+/// A session whose layers run graphs with hostile references: values that are not numbers, a missing text, a text that
+/// does not parse, nesting past the bound, outputs and anchors that do not exist, a stack input in a nested graph.
+fn graph_session() -> Session {
+    use texturecraft_engine::core::{
+        Effect, EffectKind, Fill, GraphInput, GraphRef, GraphValue, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source,
+    };
+    let mut s = session();
+    let colour = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 color r=0.25 g=0.5 b=0.75\noutput colour 1\nexpose gain 1 r 0 1\n");
+    let broken = s.doc.graphs.add_text("format 3\nnode 1 invert in=@99\nnode 2 nonsense\n");
+    let invert = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 input idx=0\nnode 2 invert in=@1\noutput out 2\n");
+    let mut hostile = GraphRef::new(colour.clone(), "hostile");
+    hostile.params.insert("gain".into(), GraphValue::Vector(vec![f32::NAN, f32::INFINITY, -1e30, 7.0, 9.0]));
+    hostile.params.insert("missing".into(), GraphValue::Int2([i32::MIN, i32::MAX]));
+    hostile.seed = u32::MAX;
+    hostile.output = Some("no such output".into());
+    hostile.alpha_output = Some("neither".into());
+    hostile.inputs.insert(u32::MAX, GraphInput::Image("not a resource".into()));
+    hostile.inputs.insert(3, GraphInput::Anchor { anchor: LayerId(u64::MAX), channel: None, levels: None });
+    let mut deep = GraphRef::new(colour.clone(), "deep");
+    for _ in 0..(texturecraft_engine::core::layer::MAX_GRAPH_NESTING + 3) {
+        let mut outer = GraphRef::new(invert.clone(), "outer");
+        outer.inputs.insert(0, GraphInput::Nested(Box::new(deep)));
+        deep = outer;
+    }
+    let mut nested_stack = GraphRef::new(invert.clone(), "nested stack");
+    let mut inner = GraphRef::new(invert.clone(), "inner");
+    inner.inputs.insert(0, GraphInput::Stack { channel: Some(Channel::Height) });
+    nested_stack.inputs.insert(0, GraphInput::Nested(Box::new(inner)));
+    let mut filter = GraphRef::new(invert.clone(), "filter");
+    filter.inputs.insert(0, GraphInput::Stack { channel: Some(Channel::Normal) });
+    filter.inputs.insert(1, GraphInput::StackAlpha { channel: None });
+    filter.outputs.insert(Channel::Height, "out".into());
+    let missing = GraphRef::new(texturecraft_engine::core::text_key("not stored"), "missing");
+    let unparsable = GraphRef::new(broken, "broken");
+    let mut fill = Fill::default();
+    for (c, g) in
+        [(Channel::BaseColor, hostile.clone()), (Channel::Roughness, deep.clone()), (Channel::Metallic, missing.clone()), (Channel::Height, unparsable.clone())]
+    {
+        fill.sources.insert(c, Source::Graph(g));
+    }
+    let id = s.doc.project.alloc_id();
+    let mut layer = Layer::new(id, "graphs", LayerKind::Fill(fill), &Channel::DEFAULT_SET);
+    let mut effects = Vec::new();
+    for g in [hostile, deep, nested_stack, filter, missing, unparsable] {
+        let e = s.doc.project.alloc_id();
+        effects.push(Effect::new(e, EffectKind::Graph { graph: g, projection: Projection::default() }));
+    }
+    layer.content_effects = effects.clone();
+    for e in &mut effects {
+        e.id = s.doc.project.alloc_id();
+    }
+    layer.mask = Some(Mask { effects, ..Mask::new(MaskBackground::White) });
+    s.doc.project.insert_layer(0, layer, None, false).unwrap();
+    for c in &mut s.caches {
+        c.invalidate_all();
+    }
+    s
+}
+
+/// Every command on a project of hostile graph references returns Ok or Err, and the project composites, saves and opens.
+#[test]
+fn panic_hunt_with_hostile_graphs() {
+    let mut s = graph_session();
+    s.update();
+    let problems = execute(&mut s, "project.inspect", &Value::Null).unwrap()["graphs"]["problems"].as_array().map_or(0, Vec::len);
+    assert!(problems > 0, "graphs that cannot render say so");
+    let bytes = s.to_project_bytes().unwrap();
+    let mut back = Session::from_project_bytes(&bytes).unwrap();
+    back.update();
+    let hostile = [json!({}), json!({"layer": 4, "effect": 5, "key": "../x", "value": f64::NAN, "seed": -1, "output": [1]})];
+    for spec in command_specs() {
+        if spec.id == "project.sample" {
+            continue;
+        }
+        for p in &hostile {
+            let mut s = graph_session();
+            for texture_set in &mut s.doc.project.texture_sets {
+                texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
+            }
+            let _ = execute(&mut s, spec.id, p);
+            s.update();
+        }
+    }
+}
+
 #[test]
 fn copy_paste_flatten_and_resize_keep_the_look() {
     let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 256).unwrap();

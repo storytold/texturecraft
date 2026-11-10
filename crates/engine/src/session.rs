@@ -28,6 +28,8 @@ pub struct Document {
     pub bake_paint: BTreeMap<(usize, texturecraft_core::BakePaintTarget), Arc<texturecraft_bake::BakePaintMap>>,
     /// Imported image resources by name: original file bytes.
     pub resources: BTreeMap<String, Arc<Vec<u8>>>,
+    /// Texts of the graphs the layers run, and their cooked outputs (shared by every snapshot).
+    pub graphs: texturecraft_compose::GraphStore,
 }
 
 /// Derived per-texture-set data (rebuilt when the mesh or resolution changes).
@@ -469,7 +471,14 @@ impl Session {
             project.texture_sets.push(ts);
         }
         let mut s = Session::new(
-            Document { bake_paint: BTreeMap::new(), project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() },
+            Document {
+                bake_paint: BTreeMap::new(),
+                project,
+                pixels: PixelStore::default(),
+                baked: BTreeMap::new(),
+                resources: BTreeMap::new(),
+                graphs: Default::default(),
+            },
             mesh,
             mesh_source,
         )?;
@@ -818,6 +827,7 @@ impl Session {
                     block_scales: cache.composite.block_scales.clone(),
                     preview,
                     images: &self.images,
+                    graphs: &self.doc.graphs,
                     bounds: self.mesh.bounds(),
                 };
                 texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
@@ -907,6 +917,7 @@ impl Session {
             block_scales: cache.composite.block_scales.clone(),
             preview: None,
             images: &self.images,
+            graphs: &self.doc.graphs,
             bounds: self.mesh.bounds(),
         })
     }

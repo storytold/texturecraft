@@ -71,6 +71,7 @@ impl Session {
             bake_paint: Default::default(),
             thumbnail: None,
             resources: imported.resources,
+            graphs: imported.graphs,
             warnings: Vec::new(),
         };
         let mut s = Session::from_project_file(pf)?;

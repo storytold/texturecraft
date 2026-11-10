@@ -3,7 +3,8 @@
 
 use serde_json::{Value, json};
 use texturecraft_core::{
-    Effect, EffectKind, Fill, Filter, Generator, GeometryMask, ImportReport, Layer, LayerKind, LayerReport, NormalFormat, Projection, Source,
+    Effect, EffectKind, Fill, Filter, Generator, GeometryMask, GraphInput, GraphRef, ImportReport, Layer, LayerKind, LayerReport, NormalFormat, Projection,
+    Source,
 };
 
 use crate::Session;
@@ -18,7 +19,52 @@ fn source_json(s: &Source) -> Value {
         Source::Image { name, normal_format: NormalFormat::OpenGl } => json!({ "image": name }),
         Source::Image { name, normal_format: NormalFormat::DirectX } => json!({ "image": name, "normalFormat": "directX" }),
         Source::Anchor { anchor, channel } => json!({ "anchor": anchor.0, "channel": channel.id() }),
+        Source::Graph(g) => json!({ "graph": graph_json(g) }),
     }
+}
+
+/// A graph reference: the graph, its values, what feeds its inputs and the outputs read.
+fn graph_json(g: &GraphRef) -> Value {
+    let input = |i: &GraphInput| match i {
+        GraphInput::Baked(m) => json!({ "baked": m.id() }),
+        GraphInput::Constant(c) => json!({ "constant": c }),
+        GraphInput::Image(name) => json!({ "image": name }),
+        GraphInput::Nested(inner) => json!({ "graph": graph_json(inner) }),
+        GraphInput::Stack { channel } => json!({ "stack": channel.map(|c| c.id()) }),
+        GraphInput::StackAlpha { channel } => json!({ "stackAlpha": channel.map(|c| c.id()) }),
+        GraphInput::Anchor { anchor, channel, levels } => json!({ "anchor": anchor.0, "channel": channel.map(|c| c.id()), "levels": levels.is_some() }),
+    };
+    let mut v = json!({
+        "name": g.name,
+        "key": g.key,
+        "params": g.params.iter().map(|(k, v)| (k.clone(), json!(v.lanes()))).collect::<serde_json::Map<_, _>>(),
+        "inputs": g.inputs.iter().map(|(k, i)| (k.to_string(), input(i))).collect::<serde_json::Map<_, _>>(),
+        "seed": g.seed,
+        "readsStack": g.reads_stack(),
+    });
+    if let Some(o) = &g.output {
+        v["output"] = json!(o);
+    }
+    if !g.outputs.is_empty() {
+        v["outputs"] = g.outputs.iter().map(|(c, o)| (c.id().to_string(), json!(o))).collect::<serde_json::Map<_, _>>().into();
+    }
+    if let Some(a) = &g.alpha_output {
+        v["alphaOutput"] = json!(a);
+    }
+    v
+}
+
+/// The project's graphs: texts held, cooks, renders made in this session and what could not be shown.
+fn graphs_json(s: &Session) -> Value {
+    let g = &s.doc.graphs;
+    let problems: Vec<Value> = g
+        .problems()
+        .into_iter()
+        .map(
+            |(u, p)| json!({ "textureSet": u.set, "id": u.id.0, "channel": u.channel.map(|c| c.id()), "graph": p.graph, "stale": p.stale, "reason": p.reason }),
+        )
+        .collect();
+    json!({ "texts": g.texts.len(), "used": s.doc.project.graph_keys().len(), "cooks": g.used_cooks().len(), "renders": g.renders(), "problems": problems })
 }
 
 fn fill_json(f: &Fill) -> Value {
@@ -59,6 +105,10 @@ fn effect_json(session: &Session, effect: &Effect, content: bool) -> Value {
         EffectKind::Fill { source, .. } => out["source"] = source_json(source),
         EffectKind::Material(fill) => out["fill"] = fill_json(fill),
         EffectKind::Placeholder { label, reason } => out["placeholder"] = json!({ "label": label, "reason": reason }),
+        EffectKind::Graph { graph, projection } => {
+            out["graph"] = graph_json(graph);
+            out["projection"] = json!(projection.label());
+        }
         EffectKind::Filter(filter) => {
             out["filter"] = json!(filter);
             match filter {
@@ -263,6 +313,7 @@ pub fn session(s: &Session) -> Value {
         "memoryBytes": s.memory().total(),
         "pendingTiles": s.pending_tiles(),
         "locks": locks(s),
+        "graphs": graphs_json(s),
         "import": s.doc.project.import.as_ref().map_or(Value::Null, |r| import_report(s, r)),
     })
 }

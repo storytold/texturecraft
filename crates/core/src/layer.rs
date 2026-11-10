@@ -9,11 +9,13 @@ use crate::{BlendMode, Channel, ChannelKind, lum};
 mod curvature_detail;
 mod curvature_mode;
 mod geometry_mask;
+mod graph;
 mod lock;
 
 pub use curvature_detail::CurvatureDetail;
 pub use curvature_mode::CurvatureMode;
 pub use geometry_mask::GeometryMask;
+pub use graph::{GraphInput, GraphRef, GraphValue, MAX_GRAPH_NESTING, StableHash, is_key, text_key};
 pub use lock::{IMPORT_LOCK_SOURCE, Lock, LockReason};
 
 /// Id of a layer or effect (one id space per project).
@@ -360,6 +362,8 @@ pub enum Source {
     /// The stack value recorded by an anchor point effect (`anchor` is the effect id) for
     /// `channel`; colors read as gray where a scalar is needed.
     Anchor { anchor: LayerId, channel: Channel },
+    /// One output of a node graph ([`GraphRef::output`]), rendered for the texture set and sampled like an image.
+    Graph(GraphRef),
 }
 
 impl Source {
@@ -376,6 +380,14 @@ impl Source {
     pub fn anchor(&self) -> Option<LayerId> {
         match self {
             Source::Anchor { anchor, .. } => Some(*anchor),
+            _ => None,
+        }
+    }
+
+    /// The graph this source runs, if any.
+    pub fn graph(&self) -> Option<&GraphRef> {
+        match self {
+            Source::Graph(g) => Some(g),
             _ => None,
         }
     }
@@ -998,6 +1010,13 @@ pub enum EffectKind {
         label: String,
         reason: String,
     },
+    /// A node graph as a mask generator (its [`GraphRef::output`], laid on through `projection`) or, when it reads the
+    /// stack below it ([`GraphRef::reads_stack`]), as a filter of the mask or of each layer channel.
+    Graph {
+        graph: GraphRef,
+        #[serde(default)]
+        projection: Projection,
+    },
 }
 
 /// One path of a path sublayer: its control points and how it was painted.
@@ -1036,6 +1055,7 @@ impl EffectKind {
             EffectKind::Material(_) => "Fill",
             EffectKind::Anchor => "Anchor point",
             EffectKind::Placeholder { .. } => "Placeholder",
+            EffectKind::Graph { .. } => "Graph",
         }
     }
 
@@ -1045,7 +1065,12 @@ impl EffectKind {
         match self {
             EffectKind::Material(_) | EffectKind::Anchor => Some(true),
             EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection { .. } | EffectKind::Compare { .. } => Some(false),
-            EffectKind::Paint | EffectKind::Path(_) | EffectKind::Levels(_) | EffectKind::Filter(_) | EffectKind::Placeholder { .. } => None,
+            EffectKind::Paint
+            | EffectKind::Path(_)
+            | EffectKind::Levels(_)
+            | EffectKind::Filter(_)
+            | EffectKind::Placeholder { .. }
+            | EffectKind::Graph { .. } => None,
         }
     }
 
@@ -1059,7 +1084,18 @@ impl EffectKind {
         match self {
             EffectKind::Fill { source, .. } => source.anchor().is_some(),
             EffectKind::Material(f) => f.sources.values().any(|s| s.anchor().is_some()),
+            EffectKind::Graph { graph, .. } => graph.anchors().next().is_some(),
             _ => false,
+        }
+    }
+
+    /// The graph the effect runs: a graph effect's, or a fill's graph source.
+    pub fn graphs(&self) -> Vec<&GraphRef> {
+        match self {
+            EffectKind::Graph { graph, .. } => vec![graph],
+            EffectKind::Fill { source, .. } => source.graph().into_iter().collect(),
+            EffectKind::Material(f) => f.sources.values().filter_map(Source::graph).collect(),
+            _ => Vec::new(),
         }
     }
 }
@@ -1103,6 +1139,16 @@ impl Effect {
 }
 
 impl Layer {
+    /// Every graph the layer runs (its fill's sources, its content and mask effects), outer references only.
+    pub fn graphs(&self) -> Vec<&GraphRef> {
+        let fill = match &self.kind {
+            LayerKind::Fill(f) => f.sources.values().filter_map(Source::graph).collect(),
+            _ => Vec::new(),
+        };
+        let effects = self.mask.iter().flat_map(|m| m.effects.iter()).chain(self.content_effects.iter());
+        fill.into_iter().chain(effects.flat_map(|e| e.kind.graphs())).collect()
+    }
+
     /// The placeholder effects of the layer's mask and content.
     pub fn placeholders(&self) -> impl Iterator<Item = &Effect> {
         self.mask.iter().flat_map(|m| m.effects.iter()).chain(self.content_effects.iter()).filter(|e| e.is_placeholder())

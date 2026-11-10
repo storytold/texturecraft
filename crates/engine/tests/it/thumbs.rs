@@ -52,6 +52,7 @@ fn inputs<'a>(s: &'a Session, project: &'a texturecraft_engine::core::Project, g
         block_scales: Default::default(),
         preview: None,
         images: &s.images,
+        graphs: texturecraft_engine::compose::GraphStore::empty(),
         bounds: s.mesh.bounds(),
     }
 }

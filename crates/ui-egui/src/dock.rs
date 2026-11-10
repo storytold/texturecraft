@@ -646,7 +646,7 @@ fn content_glyph(p: &egui::Painter, tk: &Tokens, thumb: Rect, layer: &Layer) {
             let c = match f.source(Channel::BaseColor) {
                 Source::Uniform(v) => v,
                 Source::Procedural { low, high, .. } => [(low[0] + high[0]) * 0.5, (low[1] + high[1]) * 0.5, (low[2] + high[2]) * 0.5],
-                Source::Image { .. } | Source::Anchor { .. } => [0.5; 3],
+                Source::Image { .. } | Source::Anchor { .. } | Source::Graph(_) => [0.5; 3],
             };
             crate::thumbs::paint_sphere(p, thumb.center(), thumb.width() * 0.34, c);
         }
@@ -2212,6 +2212,9 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                 Source::Anchor { anchor, channel } => {
                     ui.label(RichText::new(anchor_label(app, anchor, channel)).color(tk.text_dim));
                 }
+                Source::Graph(g) => {
+                    ui.label(RichText::new(trf("Graph: {name}", &[("name", &g.name)])).color(tk.text_dim));
+                }
             }
         });
         // A shelf image dropped on the channel becomes its source.
@@ -2253,6 +2256,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
                 Source::Uniform(_) => tr("Uniform value").to_string(),
                 Source::Procedural { pattern, .. } => tr(pattern.kind.label()).to_string(),
                 Source::Image { name, .. } => trf("Image: {name}", &[("name", name)]),
+                Source::Graph(g) => trf("Graph: {name}", &[("name", &g.name)]),
             };
             combo(ui, tr("Source"), current, |ui| {
                 if ui.selectable_label(matches!(source, Source::Uniform(_)), tr("Uniform value")).clicked() {

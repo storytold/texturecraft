@@ -648,10 +648,18 @@ impl Project {
                 }
             }
         }
+        if let Some(key) = self.layers.values().flat_map(|l| l.graphs()).flat_map(|g| g.text_keys()).find(|k| !crate::layer::is_key(k)) {
+            return Err(CoreError::Invalid(format!("graph key {:?} is not a graph text key", key.chars().take(64).collect::<String>())));
+        }
         match self.instance_cycle() {
             Some(id) => Err(CoreError::Invalid(format!("instance layer {} draws itself", id.0))),
             None => Ok(()),
         }
+    }
+
+    /// The text keys of every graph the project's layers run (nested graphs included).
+    pub fn graph_keys(&self) -> BTreeSet<String> {
+        self.layers.values().flat_map(|l| l.graphs()).flat_map(|g| g.text_keys()).map(str::to_string).collect()
     }
 
     /// Every layer drawn when `roots` are drawn: the roots, folder children and instance

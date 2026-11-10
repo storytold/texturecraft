@@ -4364,8 +4364,10 @@ version = "0.6.1"
 dependencies = [
  "half",
  "rayon",
+ "serde",
  "texturecraft-core",
  "texturecraft-geom",
+ "texturecraft-graph",
  "texturecraft-texel",
 ]
 

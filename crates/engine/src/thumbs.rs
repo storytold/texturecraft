@@ -99,6 +99,9 @@ impl ThumbSnapshot {
             block_scales: self.project.texture_set(self.ts).map(|set| set.block_scales()).unwrap_or_default(),
             preview: None,
             images: &self.images,
+            // Graph sources read as unrendered here: cooking at thumbnail size would replace the cooks the document's
+            // composite reads (and saves)
+            graphs: texturecraft_compose::GraphStore::empty(),
             bounds: self.bounds,
         };
         thumb::render(&inp, target)

@@ -14,7 +14,7 @@
 //! mesh only (the rest of the stored result is padding).
 
 use texturecraft_compose::eval::{Composite, Inputs, all_tiles, composite_tiles};
-use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
+use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, PixelStore};
 use texturecraft_core::{Channel, Project};
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer};
 use texturecraft_texel::linear_to_srgb;
@@ -93,6 +93,7 @@ pub struct SetScene<'a> {
     pub pixels: &'a PixelStore,
     pub baked: &'a BakedMaps,
     pub images: &'a ImageStore,
+    pub graphs: &'a GraphStore,
 }
 
 /// Composites `channels` of the set (its stack as it stands).
@@ -110,6 +111,7 @@ pub fn composite(scene: &SetScene, channels: &[Channel]) -> Option<(Composite, U
         block_scales: set.block_scales(),
         preview: None,
         images: scene.images,
+        graphs: scene.graphs,
         bounds: scene.mesh.bounds(),
     };
     let mut out = Composite::with_size(channels, w, h);
@@ -179,7 +181,7 @@ mod tests {
         let l = Layer::new(p.alloc_id(), "f", LayerKind::Fill(fill), &[Channel::Roughness]);
         p.insert_layer(0, l, None, false).unwrap();
         let (pixels, baked, images) = (PixelStore::default(), BakedMaps::default(), ImageStore::default());
-        let scene = SetScene { project: &p, ts: 0, mesh: &mesh, pixels: &pixels, baked: &baked, images: &images };
+        let scene = SetScene { project: &p, ts: 0, mesh: &mesh, pixels: &pixels, baked: &baked, images: &images, graphs: GraphStore::empty() };
         let (ours, gbuf) = composite(&scene, &[Channel::Roughness]).unwrap();
         let cache = |v: f32, a: f32| CacheImage { bit: 128, image: Rgba::solid(128, 128, [v, v, v, a]), srgb: false, missing_bytes: 0 };
         let same = score(&ours, &gbuf, Channel::Roughness, &cache(0.3, 1.0), [0.3; 3]);

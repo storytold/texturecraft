@@ -142,4 +142,49 @@ mod tests {
         let g = |children| Layer::new(LayerId(2), "g", LayerKind::Group { children, collapsed: false }, &[]);
         assert_eq!(g(vec![LayerId(3)]).content_view(), g(Vec::new()).content_view(), "a folder's children are arranged, not edited");
     }
+
+    #[test]
+    fn graph_sources_and_effects_are_content() {
+        use crate::layer::{Effect, EffectKind, Fill, GraphInput, GraphRef, GraphValue, Projection, Source, text_key};
+        let graph = GraphRef::new(text_key("g"), "g");
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::Roughness, Source::Graph(graph.clone()));
+        let mut a = Layer::new(LayerId(1), "a", LayerKind::Fill(fill), &[Channel::Roughness]);
+        a.mask = Some(Mask {
+            effects: vec![Effect::new(LayerId(2), EffectKind::Graph { graph, projection: Projection::default() })],
+            ..Mask::new(MaskBackground::White)
+        });
+        let edit = |f: &dyn Fn(&mut GraphRef)| {
+            let mut b = a.clone();
+            if let LayerKind::Fill(fill) = &mut b.kind
+                && let Some(Source::Graph(g)) = fill.sources.get_mut(&Channel::Roughness)
+            {
+                f(g);
+            }
+            b
+        };
+        assert_ne!(
+            a.content_view(),
+            edit(&|g| {
+                g.params.insert("scale".into(), GraphValue::Float(2.0));
+            })
+            .content_view(),
+            "a parameter value"
+        );
+        assert_ne!(a.content_view(), edit(&|g| g.seed = 4).content_view(), "the seed");
+        assert_ne!(
+            a.content_view(),
+            edit(&|g| {
+                g.inputs.insert(0, GraphInput::Constant([1.0; 3]));
+            })
+            .content_view(),
+            "an input"
+        );
+        assert_ne!(a.content_view(), edit(&|g| g.output = Some("other".into())).content_view(), "the output read");
+        let mut masked = a.clone();
+        if let Some(EffectKind::Graph { graph, .. }) = masked.mask.as_mut().and_then(|m| m.effects.first_mut()).map(|e| &mut e.kind) {
+            graph.key = text_key("other");
+        }
+        assert_ne!(a.content_view(), masked.content_view(), "the graph a mask effect runs");
+    }
 }

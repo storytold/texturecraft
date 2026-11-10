@@ -12,5 +12,7 @@ workspace = true
 texturecraft-core = { workspace = true }
 texturecraft-texel = { workspace = true }
 texturecraft-geom = { workspace = true }
+texturecraft-graph = { workspace = true }
 rayon = { workspace = true }
 half = { workspace = true }
+serde = { workspace = true }

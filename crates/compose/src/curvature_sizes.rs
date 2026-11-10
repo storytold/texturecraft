@@ -288,6 +288,7 @@ mod tests {
             block_scales: BlockScales::default(),
             preview: None,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: mesh.bounds(),
         };
 
@@ -328,6 +329,7 @@ mod tests {
             block_scales: scales,
             preview: None,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: mesh.bounds(),
         };
 

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use texturecraft_core::{
     BakedMap, BlendMode, BlockScales, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Fill, Filter, Generator,
-    GeneratorKind, GeometryMask, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source, TextureSet, TileGrid,
-    blend1, blend3, lum, mix3, per_unit,
+    GeneratorKind, GeometryMask, GraphInput, GraphRef, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source,
+    TextureSet, TileGrid, blend1, blend3, lum, mix3, per_unit,
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer};
@@ -20,8 +20,10 @@ use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage, from_u16, nois
 
 use crate::below::{Band, BelowCache, Level};
 use crate::curvature_sizes::CurvatureSizes;
+use crate::graphs::{self, Cooked, GraphStore, GraphUse, RenderEnv};
 use crate::pattern::{Coords, decal_uv, image_samples, procedural, world_noise};
 use crate::store::{BakedMaps, ImageStore, PixelStore, decode};
+use texturecraft_graph::tex::Tex;
 
 const NCH: usize = Channel::ALL.len();
 
@@ -102,6 +104,8 @@ pub struct Inputs<'a> {
     pub preview: Option<&'a StrokePreview>,
     /// Imported image resources (fill sources).
     pub images: &'a ImageStore,
+    /// Graph texts and cooked graph outputs (graph sources and effects).
+    pub graphs: &'a GraphStore,
     /// Mesh bounds, for scale-independent procedural coordinates.
     pub bounds: (Vec3, Vec3),
 }
@@ -116,6 +120,20 @@ impl Inputs<'_> {
     /// with it, and with the tile's share of its block.
     fn tile_res(&self) -> u32 {
         self.gbuf.width / self.tile_grid().map_or(1, |g| g.cols.max(1))
+    }
+
+    /// What graphs of this set are rendered with.
+    fn render_env(&self) -> RenderEnv<'_> {
+        RenderEnv { baked: self.baked, images: self.images, side: RenderEnv::side_for((self.gbuf.width, self.gbuf.height)) }
+    }
+
+    /// The cook graph `g` shows for layer or effect `id` (read for `channel`); None for a graph that reads the stack
+    /// (computed with the neighbourhood fields) or that could not be rendered.
+    fn static_cook(&self, id: LayerId, channel: Option<Channel>, g: &GraphRef) -> Option<Arc<Cooked>> {
+        if g.reads_stack() {
+            return None;
+        }
+        self.graphs.cook_for(GraphUse { set: self.ts, id, channel }, g, &self.render_env(), &[])
     }
 }
 
@@ -195,6 +213,8 @@ struct ChanPlan<'a> {
     /// A content neighbourhood filter precomputed over the region: continue the effects after
     /// effect `.0` starting from the field's value.
     start: Option<(usize, &'a Field)>,
+    /// The cook of a fill's graph source on this channel.
+    graph: Option<Arc<Cooked>>,
 }
 
 enum Content<'a> {
@@ -211,6 +231,8 @@ struct EffectPlan<'a> {
     preview: bool,
     /// The curvature detail sizes a generator with detail reads.
     curvature_sizes: Option<Arc<CurvatureSizes>>,
+    /// The cook of a graph effect, or of a fill effect's graph source on the channel planned.
+    graph: Option<Arc<Cooked>>,
 }
 
 struct MaskPlan<'a> {
@@ -271,6 +293,8 @@ enum Op {
     Edge,
     /// Average downhill along a noise height field.
     Slope { scale: f32, seed: u32 },
+    /// A graph reading the stack: rendered from the whole texture set ([`graph_region`]).
+    Graph,
 }
 
 /// The last neighbourhood filter of an effect stack (see [`neighbourhood_filters`]).
@@ -300,6 +324,8 @@ fn neighbourhood_filters(effects: &[Effect], res: u32) -> impl Iterator<Item = (
         EffectKind::Filter(Filter::SlopeBlur { radius, scale, seed }) if *radius > 0.0 => {
             Some((index, texels(*radius), Op::Slope { scale: *scale, seed: *seed }))
         }
+        // reads the whole set: the radius is clamped to the set's longest side
+        EffectKind::Graph { graph, .. } if graph.reads_stack() => Some((index, f32::MAX, Op::Graph)),
         _ => None,
     })
 }
@@ -416,7 +442,7 @@ fn gather(op: Op, orig: &[f32], cover: &[f32], comps: usize, (x0, y0, w, h): (u3
                     let center = |v: f32| ((v / r).floor() + 0.5) * r - 0.5;
                     sample(center(x), center(y), &mut acc);
                 }
-                Op::Blur(_) | Op::HighPass | Op::Bevel | Op::Glow(_) => {}
+                Op::Blur(_) | Op::HighPass | Op::Bevel | Op::Glow(_) | Op::Graph => {}
             }
             if acc[4] > 1e-6
                 && let Some(px) = line.get_mut(col * comps..(col + 1) * comps)
@@ -613,11 +639,40 @@ fn filter_region(
         Job::Mask(_) => 1,
         Job::Content(_) => 4,
     };
+    if let Op::Graph = op {
+        let effect = effects.iter().filter(|effect| effect.visible).nth(index)?;
+        let mut data = graph_region(inp, channels, below, id, job, index, effect, (rx0, ry0, w, h), start)?;
+        unpremultiply(&mut data, comps);
+        return Some(Field { x0: rx0, y0: ry0, w, h, comps, data });
+    }
+    let (orig, cover, _) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &[]);
+    filtered_region(inp, effects, (index, radius_texels, op), (rx0, ry0, w, h), opacity, comps, job, orig, cover)
+}
+
+/// The stack of layer `id` up to effect `index` over texel `region` (content premultiplied by coverage), continued from
+/// `start` when given: one value per texel (`comps` per texel: 1 for a mask, 4 for content), whether each texel was
+/// evaluated, and the values of `anchors` (an anchor point and channel each) recorded below the layer.
+#[allow(clippy::too_many_arguments)]
+fn stack_region(
+    inp: &Inputs,
+    channels: &[Channel],
+    below: &Fields,
+    id: LayerId,
+    job: Job,
+    index: usize,
+    (rx0, ry0, w, h): (u32, u32, u32, u32),
+    start: Option<(usize, &Field)>,
+    anchors: &[(LayerId, Channel)],
+) -> (Vec<f32>, Vec<f32>, Vec<Vec<[f32; 3]>>) {
+    let comps = match job {
+        Job::Mask(_) => 1,
+        Job::Content(_) => 4,
+    };
 
     // Evaluate the stack up to the filter, tile by tile (content premultiplied by coverage)
     let (rx1, ry1) = (rx0 + w, ry0 + h);
     let region_tiles: Vec<(u32, u32)> = (ry0 / TILE..ry1.div_ceil(TILE)).flat_map(|y| (rx0 / TILE..rx1.div_ceil(TILE)).map(move |x| (x, y))).collect();
-    let parts: Vec<Vec<(u32, u32, [f32; 4])>> = region_tiles
+    let parts: Vec<Vec<(u32, u32, [f32; 4], Vec<[f32; 3]>)>> = region_tiles
         .par_iter()
         .map(|&(tx, ty)| {
             let full = anchor_plan(inp, id, channels, tx, ty, Some(below));
@@ -654,7 +709,14 @@ fn filter_region(
                         },
                         (None, None) => [0.0; 4],
                     };
-                    (x, y, value)
+                    let recorded = anchors
+                        .iter()
+                        .map(|(a, c)| {
+                            let held = texel.anchors.iter().rev().find(|(at, _)| at == a).and_then(|(_, acc)| acc.get(c.index()).copied());
+                            held.unwrap_or_else(|| c.default_value())
+                        })
+                        .collect::<Vec<_>>();
+                    (x, y, value, recorded)
                 })
                 .collect()
         })
@@ -667,7 +729,7 @@ fn filter_region(
     let row_tiles = (rx1.div_ceil(TILE) - rx0 / TILE).max(1) as usize;
     let band = (TILE * w) as usize;
     orig.par_chunks_mut(band * comps).zip(cover.par_chunks_mut(band)).zip(parts.par_chunks(row_tiles)).for_each(|((orig, cover), row)| {
-        for &(x, y, value) in row.iter().flatten() {
+        for (x, y, value, _) in row.iter().flatten() {
             let texel = (((y - ry0) % TILE) * w + (x - rx0)) as usize;
             if let (Some(covered), Some(pixel)) = (cover.get_mut(texel), orig.get_mut(texel * comps..(texel + 1) * comps)) {
                 *covered = 1.0;
@@ -675,6 +737,233 @@ fn filter_region(
             }
         }
     });
+    let mut recorded: Vec<Vec<[f32; 3]>> = anchors.iter().map(|(_, c)| vec![c.default_value(); texel_count]).collect();
+    if !anchors.is_empty() {
+        for (x, y, _, values) in parts.iter().flatten() {
+            let texel = ((y - ry0) * w + (x - rx0)) as usize;
+            for (image, v) in recorded.iter_mut().zip(values) {
+                if let Some(slot) = image.get_mut(texel) {
+                    *slot = *v;
+                }
+            }
+        }
+    }
+    (orig, cover, recorded)
+}
+
+/// Where a graph filter's result on a channel covers the layer (its alpha), measured on filters in a fill layer without
+/// height or normal (the reference app's results).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Cover {
+    /// The filter's coverage output for the channel, on any channel (a threshold whose alpha output passes its input's
+    /// alpha through leaves height flat over an empty height).
+    Alpha,
+    /// A colour output's own alpha, on height and normal (a gradient filter passes its input's alpha, the stack's
+    /// coverage, on).
+    OutputAlpha,
+    /// The whole layer, on height and normal, for a grey output of a graph that does not read the stack it runs on
+    /// (a shut-line filter's height leaves −1 over an empty height, whatever is below).
+    Whole,
+    /// What the content below covers: in masks, on the other channels, and on height and normal for a grey output of a
+    /// graph that reads its own stack (a bevel over an empty height leaves height flat).
+    Below,
+}
+
+impl Cover {
+    fn of(g: &GraphRef, channel: Channel, output: Option<&str>) -> Cover {
+        if g.output_alphas.contains_key(&channel) {
+            return Cover::Alpha;
+        }
+        if !matches!(channel.kind(), ChannelKind::Signed | ChannelKind::NormalMap) {
+            return Cover::Below;
+        }
+        if output.is_some_and(|o| g.colour_outputs.contains(o)) {
+            return Cover::OutputAlpha;
+        }
+        let own = g.inputs.values().any(|i| matches!(i, GraphInput::Stack { channel: c } if c.is_none_or(|c| c == channel)));
+        if own { Cover::Below } else { Cover::Whole }
+    }
+}
+
+/// A graph filter (effect `index` of layer `id`, reading the stack) over texel `region`: the stack below it and what
+/// else it reads (other channels, coverage, anchors) given to the graph as images, the graph rendered (or found among
+/// the cooks), and its output laid over the stack with the effect's blending. Content comes back premultiplied (see
+/// [`stack_region`]). A graph that could not be rendered leaves the stack as it is.
+#[allow(clippy::too_many_arguments)]
+fn graph_region(
+    inp: &Inputs,
+    channels: &[Channel],
+    below: &Fields,
+    id: LayerId,
+    job: Job,
+    index: usize,
+    effect: &Effect,
+    (rx0, ry0, w, h): (u32, u32, u32, u32),
+    start: Option<(usize, &Field)>,
+) -> Option<Vec<f32>> {
+    let EffectKind::Graph { graph, .. } = &effect.kind else { return None };
+    let own = match job {
+        Job::Mask(_) => None,
+        Job::Content(c) => Some(c),
+    };
+    let comps = if own.is_some() { 4 } else { 1 };
+    let anchors: Vec<(LayerId, Channel)> = graph
+        .inputs
+        .values()
+        .filter_map(|i| match i {
+            GraphInput::Anchor { anchor, channel, .. } => Some((*anchor, channel.or(own).unwrap_or(Channel::Height))),
+            _ => None,
+        })
+        .collect();
+    let (orig, cover, recorded) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &anchors);
+    let env = inp.render_env();
+    let side = env.side;
+    let working = inp.graphs.working_inputs(&graph.key);
+    let n = (w * h) as usize;
+    let at = |data: &[f32], i: usize, k: usize| data.get(i * comps + k).copied().unwrap_or(0.0);
+    // another channel's stack up to the filter, when the graph reads one
+    let mut others: BTreeMap<Channel, Vec<f32>> = BTreeMap::new();
+    for i in graph.inputs.values() {
+        if let GraphInput::Stack { channel: Some(c) } | GraphInput::StackAlpha { channel: Some(c) } = i
+            && Some(*c) != own
+            && own.is_some()
+            && !others.contains_key(c)
+        {
+            let (values, _, _) = stack_region(inp, channels, below, id, Job::Content(*c), index, (rx0, ry0, w, h), None, &[]);
+            others.insert(*c, values);
+        }
+    }
+    let to_side = |t: Tex| if (t.w, t.h) == (side, side) { t } else { Tex::from_fn(side, side, |u, v| t.sample(u, v)) };
+    let mut given: Vec<(u32, Tex)> = Vec::new();
+    let mut next_anchor = 0;
+    for (k, input) in &graph.inputs {
+        let linear = working.contains(k);
+        let image = match input {
+            GraphInput::Stack { channel } => {
+                let c = channel.or(own);
+                let is_own = c == own;
+                let data = if is_own { Some(&orig) } else { c.and_then(|c| others.get(&c)) };
+                let Some(data) = data else { continue };
+                let px = (0..n)
+                    .map(|i| match c {
+                        // a mask reads its value
+                        None => {
+                            let m = at(data, i, 0);
+                            [m, m, m, 1.0]
+                        }
+                        Some(c) => {
+                            let cov = at(data, i, 3);
+                            // the filter's own input carries the stack's coverage as its alpha
+                            let alpha = if is_own { cov.clamp(0.0, 1.0) } else { 1.0 };
+                            if cov <= 0.0 {
+                                // nothing below: an input named after another channel reads 0; the filter's own reads the flat
+                                // surface on height and normal
+                                let empty = match c.kind() {
+                                    ChannelKind::Signed if is_own => [0.5; 3],
+                                    ChannelKind::NormalMap if is_own => [0.5, 0.5, 1.0],
+                                    _ => [0.0; 3],
+                                };
+                                [empty[0], empty[1], empty[2], alpha]
+                            } else {
+                                let straight = [at(data, i, 0) / cov, at(data, i, 1) / cov, at(data, i, 2) / cov];
+                                let g = graphs::channel_to_graph(c.kind(), straight, linear);
+                                [g[0], g[1], g[2], alpha]
+                            }
+                        }
+                    })
+                    .collect();
+                Tex { w: w as usize, h: h as usize, px }
+            }
+            GraphInput::StackAlpha { channel } => {
+                let c = channel.or(own);
+                let data = if c == own { Some(&orig) } else { c.and_then(|c| others.get(&c)) };
+                let Some(data) = data else { continue };
+                let px = (0..n).map(|i| if c.is_some() { at(data, i, 3) } else { 1.0 }).map(|a| [a, a, a, 1.0]).collect();
+                Tex { w: w as usize, h: h as usize, px }
+            }
+            GraphInput::Anchor { channel, levels, .. } => {
+                let read = channel.or(own).unwrap_or(Channel::Height);
+                let Some(values) = recorded.get(next_anchor) else { continue };
+                next_anchor += 1;
+                let px = values
+                    .iter()
+                    .map(|v| {
+                        let v = levels.map_or(*v, |l| per_unit(read.kind(), *v, |x| l.apply(x)));
+                        let g = graphs::channel_to_graph(read.kind(), v, linear);
+                        [g[0], g[1], g[2], 1.0]
+                    })
+                    .collect();
+                Tex { w: w as usize, h: h as usize, px }
+            }
+            _ => continue,
+        };
+        given.push((*k, to_side(image)));
+    }
+    let cooked = inp.graphs.cook_for(GraphUse { set: inp.ts, id: effect.id, channel: own }, graph, &env, &given);
+    let (Some(cooked), size) = (cooked, (inp.gbuf.width, inp.gbuf.height)) else { return Some(orig) };
+    let opacity = effect.opacity.clamp(0.0, 1.0);
+    let mut data = orig.clone();
+    match own {
+        None => {
+            let Some(plane) = cooked.output(graph.output.as_deref()) else { return Some(orig) };
+            for i in 0..n {
+                if cover.get(i).copied().unwrap_or(0.0) <= 0.0 {
+                    continue;
+                }
+                let (x, y) = (rx0 + i as u32 % w, ry0 + i as u32 / w);
+                let m = at(&orig, i, 0);
+                let g = graphs::at_texel(plane, x, y, size)[0];
+                if let Some(slot) = data.get_mut(i) {
+                    *slot = m + (blend1(effect.blend, m, g) - m) * opacity;
+                }
+            }
+        }
+        Some(c) => {
+            // a filter naming outputs for other channels leaves this one as it is
+            let Some(output) = graph.output_for(c) else { return Some(orig) };
+            let Some(plane) = cooked.output(output) else { return Some(orig) };
+            let linear = cooked.is_linear(output);
+            let alpha_plane = graph.output_alphas.get(&c).and_then(|a| cooked.output(Some(a)));
+            let cover_rule = Cover::of(graph, c, output.or_else(|| cooked.outputs.keys().next().map(String::as_str)));
+            for i in 0..n {
+                if cover.get(i).copied().unwrap_or(0.0) <= 0.0 {
+                    continue;
+                }
+                let (x, y) = (rx0 + i as u32 % w, ry0 + i as u32 / w);
+                let cov = at(&orig, i, 3);
+                let v_in = if cov > 0.0 { [at(&orig, i, 0) / cov, at(&orig, i, 1) / cov, at(&orig, i, 2) / cov] } else { [0.0; 3] };
+                let g = graphs::at_texel(plane, x, y, size);
+                let a = match cover_rule {
+                    Cover::Alpha => alpha_plane.map_or(1.0, |p| graphs::at_texel(p, x, y, size)[0].clamp(0.0, 1.0)),
+                    Cover::OutputAlpha => g[3].clamp(0.0, 1.0),
+                    Cover::Whole => 1.0,
+                    Cover::Below => cov,
+                };
+                let p = graphs::graph_to_channel(c.kind(), g, linear);
+                let (v, nc) = over_comps(c.components(), effect.blend, v_in, cov, p, a * opacity);
+                if let Some(px) = data.get_mut(i * 4..i * 4 + 4) {
+                    px.copy_from_slice(&[v[0] * nc, v[1] * nc, v[2] * nc, nc]);
+                }
+            }
+        }
+    }
+    Some(data)
+}
+
+/// Neighbourhood filter `op` (with its radius in texels) over a region's stack values (see [`stack_region`]).
+#[allow(clippy::too_many_arguments)]
+fn filtered_region(
+    inp: &Inputs,
+    effects: &[Effect],
+    (index, radius_texels, op): (usize, u32, Op),
+    (rx0, ry0, w, h): (u32, u32, u32, u32),
+    opacity: f32,
+    comps: usize,
+    job: Job,
+    orig: Vec<f32>,
+    cover: Vec<f32>,
+) -> Option<Field> {
+    let (rx1, ry1) = (rx0 + w, ry0 + h);
 
     // High pass centers on the channel's mid value (0 for signed channels like height)
     let mid = match job {
@@ -781,6 +1070,7 @@ fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32
     let mut order = Vec::new();
     draw_order(inp.project, list, 0, &mut order);
     prepare_curvature_sizes(inp, &order);
+    prepare_graphs(inp, channels, &order);
 
     for id in order {
         let Some(layer) = inp.project.content_layer(id) else { continue };
@@ -801,6 +1091,44 @@ fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32
         }
     }
     out
+}
+
+/// Cook the graphs of `layers` that read nothing of the stack, once, before tiles composite in parallel (the tiles then
+/// find them; renders run on the graph runtime's own pool).
+fn prepare_graphs(inp: &Inputs, channels: &[Channel], layers: &[LayerId]) {
+    for id in layers {
+        let (Some(own), Some(layer)) = (inp.project.layers.get(id), inp.project.content_layer(*id)) else { continue };
+        if !own.visible {
+            continue;
+        }
+        let used: Vec<Channel> = channels.iter().copied().filter(|c| layer.channels.contains_key(c)).collect();
+        if let LayerKind::Fill(f) = &layer.kind {
+            for c in &used {
+                if let Some(g) = f.sources.get(c).and_then(Source::graph) {
+                    inp.static_cook(layer.id, Some(*c), g);
+                }
+            }
+        }
+        if let Some(mask) = layer_mask(inp.project, *id).filter(|m| m.enabled) {
+            for e in mask.effects.iter().filter(|e| e.visible) {
+                for g in e.kind.graphs() {
+                    inp.static_cook(e.id, None, g);
+                }
+            }
+        }
+        for e in layer.content_effects.iter().filter(|e| e.visible) {
+            for c in &used {
+                let g = match &e.kind {
+                    EffectKind::Graph { graph, .. } => Some(graph),
+                    EffectKind::Material(f) => f.sources.get(c).and_then(Source::graph),
+                    _ => None,
+                };
+                if let Some(g) = g {
+                    inp.static_cook(e.id, Some(*c), g);
+                }
+            }
+        }
+    }
 }
 
 /// Build the curvature detail sizes every visible generator of `layers` reads, once, before tiles composite in parallel.
@@ -877,6 +1205,12 @@ fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tile_x: u32, tile_y
                 EffectKind::Generator(Generator { detail: Some(detail), .. }) => CurvatureSizes::of(inp, &detail.blurred_sizes_in_use()),
                 _ => None,
             };
+            let graph = match &effect.kind {
+                EffectKind::Graph { graph, .. } => inp.static_cook(effect.id, channel, graph),
+                EffectKind::Fill { source: Source::Graph(g), .. } => inp.static_cook(effect.id, None, g),
+                EffectKind::Material(f) => channel.and_then(|c| f.sources.get(&c)).and_then(Source::graph).and_then(|g| inp.static_cook(effect.id, channel, g)),
+                _ => None,
+            };
             EffectPlan {
                 kind: &effect.kind,
                 blend: effect.blend,
@@ -884,6 +1218,7 @@ fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tile_x: u32, tile_y
                 data: if effect.kind.painted() { tile_of(inp, image, tile_x, tile_y, channel) } else { None },
                 preview: previews(inp, target),
                 curvature_sizes,
+                graph,
             }
         })
         .collect()
@@ -961,7 +1296,21 @@ fn plan_node<'a>(
             let data = if paint { tile_of(inp, inp.pixels.layer(layer.id, *c), tx, ty, Some(*c)) } else { None };
             let effects = if fx { effect_plans(inp, &layer.content_effects, tx, ty, Some(*c)) } else { Vec::new() };
             let start = fx_start.zip(fields.and_then(|f| f.get(&FieldKey::Content(id, *c))));
-            Some(ChanPlan { ch: c.index(), kind: c.kind(), comps: c.components(), blend: b.mode, opacity: b.opacity.clamp(0.0, 1.0), data, effects, start })
+            let graph = match &layer.kind {
+                LayerKind::Fill(f) => f.sources.get(c).and_then(Source::graph).and_then(|g| inp.static_cook(layer.id, Some(*c), g)),
+                _ => None,
+            };
+            Some(ChanPlan {
+                ch: c.index(),
+                kind: c.kind(),
+                comps: c.components(),
+                blend: b.mode,
+                opacity: b.opacity.clamp(0.0, 1.0),
+                data,
+                effects,
+                start,
+                graph,
+            })
         })
         .collect::<Vec<_>>();
     let content = match &layer.kind {
@@ -1028,10 +1377,15 @@ fn blend_chan(c: &ChanPlan, mode: BlendMode, a: [f32; 3], b: [f32; 3]) -> [f32; 
 
 /// Lay value `p` with weight `a` over a straight value and coverage (premultiplied "over").
 fn over(c: &ChanPlan, mode: BlendMode, v: [f32; 3], cov: f32, p: [f32; 3], a: f32) -> ([f32; 3], f32) {
+    over_comps(c.comps, mode, v, cov, p, a)
+}
+
+/// [`over`] for a channel of `comps` components.
+fn over_comps(comps: usize, mode: BlendMode, v: [f32; 3], cov: f32, p: [f32; 3], a: f32) -> ([f32; 3], f32) {
     if a <= 0.0 {
         return (v, cov);
     }
-    let b = if cov > 0.0 { blend_chan(c, mode, v, p) } else { p };
+    let b = if cov > 0.0 { if comps == 3 { blend3(mode, v, p) } else { [blend1(mode, v[0], p[0]); 3] } } else { p };
     let nc = a + cov * (1.0 - a);
     (mix3(v, b, a / nc.max(1e-5)), nc)
 }
@@ -1199,9 +1553,37 @@ impl<'a, 'b> Texel<'a, 'b> {
         w * image.map_or(1.0, |img| img.sample(c.uv.x, c.uv.y)[3].clamp(0.0, 1.0))
     }
 
-    /// The value `source` gives this texel through `projection`, read as a channel of `kind`
-    fn source(&mut self, source: &Source, projection: &Projection, kind: ChannelKind) -> [f32; 3] {
+    /// Output `output` of a cook sampled through `projection`, as the graph holds it (RGBA); None without it
+    fn graph_sample(&mut self, cooked: Option<&Cooked>, output: Option<&str>, projection: &Projection) -> Option<[f32; 4]> {
+        let image = cooked?.output(output)?;
+        let (coords, projection, _) = self.projected(projection);
+        let mut sum = [0.0f32; 4];
+        for (uv, weight) in image_samples(projection, &coords).into_iter().filter(|(_, weight)| *weight > 0.0) {
+            for (total, value) in sum.iter_mut().zip(graphs::sample(image, uv.x, uv.y)) {
+                *total += value * weight;
+            }
+        }
+        Some(sum)
+    }
+
+    /// The coverage of a fill source: 1, or a graph source's alpha output
+    fn source_alpha(&mut self, source: Option<&Source>, cooked: Option<&Cooked>, projection: &Projection) -> f32 {
         match source {
+            Some(Source::Graph(graph)) if graph.alpha_output.is_some() => self
+                .graph_sample(cooked, graph.alpha_output.as_deref(), projection)
+                .map_or(1.0, |alpha| if alpha[0].is_finite() { alpha[0].clamp(0.0, 1.0) } else { 0.0 }),
+            _ => 1.0,
+        }
+    }
+
+    /// The value `source` gives this texel through `projection`, read as a channel of `kind` (`cooked` holds a graph source's outputs)
+    fn source(&mut self, source: &Source, projection: &Projection, kind: ChannelKind, cooked: Option<&Cooked>) -> [f32; 3] {
+        match source {
+            Source::Graph(graph) => match self.graph_sample(cooked, graph.output.as_deref(), projection) {
+                Some(value) => graphs::graph_to_channel(kind, value, cooked.is_some_and(|c| c.is_linear(graph.output.as_deref()))),
+                // Not rendered (the reason is in the graph store's problems)
+                None => [0.5; 3],
+            },
             Source::Uniform(value) => *value,
             Source::Procedural { pattern, low, high } => {
                 let (coords, projection, _) = self.projected(projection);
@@ -1339,8 +1721,10 @@ impl<'a, 'b> Texel<'a, 'b> {
                     }
                 }
                 EffectKind::Fill { source, projection } => {
-                    let fill = self.source(source, projection, ChannelKind::Scalar)[0];
-                    value += (blend1(effect.blend, value, fill) - value) * opacity * self.cover(std::iter::once(source), projection);
+                    let cooked = effect.graph.as_deref();
+                    let fill = self.source(source, projection, ChannelKind::Scalar, cooked)[0];
+                    let cover = self.cover(std::iter::once(source), projection) * self.source_alpha(Some(source), cooked, projection);
+                    value += (blend1(effect.blend, value, fill) - value) * opacity * cover;
                 }
                 EffectKind::Generator(generator) => {
                     let generated = self.generator(generator, effect.curvature_sizes.as_deref());
@@ -1366,6 +1750,13 @@ impl<'a, 'b> Texel<'a, 'b> {
                     };
                     let result = if pass { 1.0 } else { 0.0 };
                     value += (result - value) * opacity;
+                }
+                // A graph reading the stack comes precomputed through `MaskPlan::start`; one that could not be rendered
+                // changes nothing
+                EffectKind::Graph { graph, projection } => {
+                    if let Some(v) = self.graph_sample(effect.graph.as_deref(), graph.output.as_deref(), projection) {
+                        value += (blend1(effect.blend, value, v[0]) - value) * opacity;
+                    }
                 }
                 // Content-only effects; a placeholder passes the mask through unchanged
                 EffectKind::Material(_) | EffectKind::Anchor | EffectKind::Placeholder { .. } => {}
@@ -1559,11 +1950,12 @@ impl<'a, 'b> Texel<'a, 'b> {
                     Content::Fill(f) => {
                         let ch = Channel::ALL.get(c.ch).copied()?;
                         // A channel without a source fills with its default (no clone per texel).
+                        let cooked = c.graph.as_deref();
                         let v = match f.sources.get(&ch) {
-                            Some(s) => self.source(s, &f.projection, ch.kind()),
+                            Some(s) => self.source(s, &f.projection, ch.kind(), cooked),
                             None => ch.default_value(),
                         };
-                        (v, self.cover(f.sources.values(), &f.projection))
+                        (v, self.cover(f.sources.values(), &f.projection) * self.source_alpha(f.sources.get(&ch), cooked, &f.projection))
                     }
                     Content::Paint { preview } => self.painted(c.data.as_deref(), c, *preview),
                     Content::Group(_) => return None,
@@ -1643,8 +2035,9 @@ impl<'a, 'b> Texel<'a, 'b> {
             }
             EffectKind::Material(f) => match Channel::ALL.get(c.ch).and_then(|ch| f.sources.get(ch).map(|s| (*ch, s))) {
                 Some((ch, s)) => {
-                    let p = self.source(s, &f.projection, ch.kind());
-                    let w = o * self.cover(f.sources.values(), &f.projection);
+                    let cooked = e.graph.as_deref();
+                    let p = self.source(s, &f.projection, ch.kind(), cooked);
+                    let w = o * self.cover(f.sources.values(), &f.projection) * self.source_alpha(Some(s), cooked, &f.projection);
                     over(c, e.blend, v, cov, p, w)
                 }
                 None => (v, cov),
@@ -1661,6 +2054,25 @@ impl<'a, 'b> Texel<'a, 'b> {
             },
             // Neighbourhood filters come precomputed through `ChanPlan::start`.
             EffectKind::Filter(f) => (f.point(c.kind, v).map_or(v, |out| mix3(v, out, o)), cov),
+            // A graph reading nothing of the stack laid on like a fill: its output for the channel (a graph reading the
+            // stack comes precomputed through `ChanPlan::start`).
+            EffectKind::Graph { graph, projection } => match Channel::ALL.get(c.ch).and_then(|ch| Some((*ch, graph.output_for(*ch)?))) {
+                Some((ch, output)) => {
+                    let cooked = e.graph.as_deref();
+                    match self.graph_sample(cooked, output, projection) {
+                        Some(g) => {
+                            let p = graphs::graph_to_channel(ch.kind(), g, cooked.is_some_and(|k| k.is_linear(output)));
+                            let alpha = match graph.output_alphas.get(&ch).map(String::as_str).or(graph.alpha_output.as_deref()) {
+                                Some(a) => self.graph_sample(cooked, Some(a), projection).map_or(1.0, |a| a[0].clamp(0.0, 1.0)),
+                                None => 1.0,
+                            };
+                            over(c, e.blend, v, cov, p, o * alpha)
+                        }
+                        None => (v, cov),
+                    }
+                }
+                None => (v, cov),
+            },
             // Anchors are recorded by `eval`; mask-only effects and placeholders leave content as it is.
             EffectKind::Anchor
             | EffectKind::Fill { .. }
@@ -2341,6 +2753,7 @@ mod tests {
             block_scales: f.project.texture_sets[0].block_scales(),
             preview,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: f.mesh.bounds(),
         };
         let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);
@@ -2359,6 +2772,85 @@ mod tests {
 
     fn close(a: [f32; 3], b: [f32; 3]) -> bool {
         (0..3).all(|i| (a[i] - b[i]).abs() < 2e-4)
+    }
+
+    fn run_with(f: &Fixture, graphs: &GraphStore) -> Composite {
+        let images = Default::default();
+        let inp = Inputs {
+            project: &f.project,
+            ts: 0,
+            mesh: &f.mesh,
+            gbuf: &f.gbuf,
+            pixels: &f.pixels,
+            baked: &f.baked,
+            block_scales: f.project.texture_sets[0].block_scales(),
+            preview: None,
+            images: &images,
+            graphs,
+            bounds: f.mesh.bounds(),
+        };
+        let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);
+        composite_tiles(&inp, &mut out, &all_tiles(64, 64));
+        out
+    }
+
+    #[test]
+    fn graph_sources_generators_and_filters_composite() {
+        use crate::graphs::tests::{COLOUR, INVERT};
+        let mut graphs = GraphStore::default();
+        let (colour, invert) = (graphs.add_text(COLOUR), graphs.add_text(INVERT));
+        let reading = |output: &str| {
+            let mut g = GraphRef::new(colour.clone(), "colour");
+            g.output = Some(output.into());
+            g.keep = ["colour".to_string(), "grey".to_string()].into();
+            Source::Graph(g)
+        };
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.0; 3], 0.0);
+        if let Some(LayerKind::Fill(fill)) = f.project.layers.get_mut(&id).map(|l| &mut l.kind) {
+            fill.sources.insert(Channel::BaseColor, reading("colour"));
+            fill.sources.insert(Channel::Roughness, reading("grey"));
+        }
+        let out = run_with(&f, &graphs);
+        let lin = |v: [f32; 3]| v.map(texturecraft_texel::srgb_to_linear);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), lin([0.25, 0.5, 0.75])), "{:?}", out.value(Channel::BaseColor, 10, 10));
+        assert!(close(out.value(Channel::Roughness, 10, 10), [0.5; 3]));
+        assert_eq!(graphs.renders(), 1, "the channels of one fill share a render");
+
+        // a filter reading the stack below it: the base color inverted in display values
+        let mut filter = GraphRef::new(invert.clone(), "invert");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        let fx = f.project.alloc_id();
+        if let Some(l) = f.project.layers.get_mut(&id) {
+            l.content_effects.push(Effect::new(fx, EffectKind::Graph { graph: filter, projection: Projection::default() }));
+        }
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), lin([0.75, 0.5, 0.25])), "{:?}", out.value(Channel::BaseColor, 10, 10));
+        let renders = graphs.renders();
+        run_with(&f, &graphs);
+        assert_eq!(graphs.renders(), renders, "the same stack below finds the filter's cook");
+
+        // a mask generator from the grey output: half the fill over the defaults
+        let mask_effect = f.project.alloc_id();
+        if let Some(l) = f.project.layers.get_mut(&id) {
+            l.content_effects.clear();
+            let mut g = GraphRef::new(colour.clone(), "colour");
+            g.output = Some("grey".into());
+            let e = Effect::new(mask_effect, EffectKind::Graph { graph: g, projection: Projection::default() });
+            l.mask = Some(Mask { effects: vec![e], ..Mask::new(MaskBackground::Black) });
+        }
+        let out = run_with(&f, &graphs);
+        let r = out.value(Channel::Roughness, 10, 10)[0];
+        assert!((r - (0.5 * 0.5 + 0.5 * Channel::Roughness.default_value()[0])).abs() < 2e-3, "{r}");
+
+        // a graph whose text is missing shows nothing and composites without panicking
+        let mut missing = GraphRef::new(texturecraft_core::text_key("absent"), "absent");
+        missing.inputs.insert(0, GraphInput::Stack { channel: Some(Channel::Height) });
+        if let Some(l) = f.project.layers.get_mut(&id) {
+            l.content_effects.push(Effect::new(LayerId(900), EffectKind::Graph { graph: missing, projection: Projection::default() }));
+        }
+        run_with(&f, &graphs);
+        assert!(graphs.problems().iter().any(|(u, p)| u.id == LayerId(900) && !p.stale));
     }
 
     #[test]
@@ -2459,6 +2951,7 @@ mod tests {
             block_scales: fixture.project.texture_sets[0].block_scales(),
             preview: None,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: fixture.mesh.bounds(),
         };
         let sparse = mask_at(&inputs, layer, texels);
@@ -2627,6 +3120,7 @@ mod tests {
                 block_scales: BlockScales::default(),
                 preview: None,
                 images: &images,
+                graphs: crate::GraphStore::empty(),
                 bounds: fixture.mesh.bounds(),
             };
             mask_at(&inputs, layer, &(120..137).map(|x| (x, 128)).collect::<Vec<_>>()).unwrap()
@@ -2975,6 +3469,7 @@ soft {soft:?}"
             block_scales: f.project.texture_sets[0].block_scales(),
             preview: None,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: f.mesh.bounds(),
         };
         let flat = flatten_layer(&inp, id, &all_tiles(64, 64)).unwrap();
@@ -3037,6 +3532,7 @@ soft {soft:?}"
                 block_scales: f.project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: crate::GraphStore::empty(),
                 bounds: f.mesh.bounds(),
             };
             let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);

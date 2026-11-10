@@ -11,19 +11,28 @@
 //! | `pixels/mask_<id>.bin` | painted pixels of a mask paint effect |
 //! | `baked/<ts>_<mapId>.bin` | a baked mesh map of texture set `<ts>` |
 //! | `thumbnail.png` | optional preview supplied by the caller |
+//! | `graphs/<key>.txt` | the text of a graph the layers run, once per distinct graph, named by its text key |
+//! | `cooked/<key>_<output>.bin` | one output of a graph's cooked render (pixel tiles), named by the cook's key |
+//! | `cooked/index.json` | the cooks' outputs (and which hold linear colour) and the cook each graph use read last |
 //!
 //! Pixel `.bin` files are sparse and lossless: a header (magic `TCTX`, version, width, height,
 //! components, tile count; u32 LE each) followed, for every allocated 64×64 tile, by `tx`, `ty`
 //! (u32 LE) and the tile's raw `u16` LE components. Baked maps use the same header with a tile
 //! count of 0, followed by `width × height × components` f32 LE. Pixels of a UV-tiled texture
 //! set cover its whole atlas (`resolution` per tile, see `TileGrid`).
+//!
+//! Graph texts are saved once per distinct text, only those the layers reference; a text whose bytes do not hash to its
+//! entry's key is refused. Cooked renders are saved for the uses the last composite read (see
+//! `texturecraft_compose::graphs`): a project opened again finds them by their keys and renders nothing. Cooks whose
+//! entries are missing or malformed are left out with a warning: they are only renders, made again on demand.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Read, Seek, Write};
 use std::sync::Arc;
 
-use texturecraft_compose::{BakedMaps, PixelStore};
+use texturecraft_compose::graphs::{Cooked, GraphUse};
+use texturecraft_compose::{BakedMaps, GraphStore, PixelStore};
 use texturecraft_core::{BakePaintTarget, Channel, FORMAT_VERSION, LayerId, Project};
 use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
@@ -53,6 +62,14 @@ const MAX_RESOURCE: u64 = 512 << 20;
 const MAX_ENTRIES: usize = 100_000;
 /// Bound ZIP index parsing before the archive exposes its entry count.
 const MAX_ZIP_METADATA_BYTES: u64 = 32 << 20;
+/// Largest graph text (they carry the images their graph embeds).
+const MAX_GRAPH_TEXT: u64 = 512 << 20;
+/// Largest index of cooked graph outputs.
+const MAX_COOK_INDEX: u64 = 16 << 20;
+/// Largest side of a cooked graph output (the graph runtime renders at most this).
+const MAX_COOK_SIDE: u32 = 8192;
+/// Version of `cooked/index.json`.
+const COOK_INDEX_VERSION: u32 = 1;
 /// Largest image (texels) of a texture set or baked map: UV-tiled sets hold several tiles.
 const MAX_TEXELS: u64 = 1 << 28;
 
@@ -78,6 +95,8 @@ pub struct ProjectFile {
     pub thumbnail: Option<Vec<u8>>,
     /// Imported resources (images used by fills, alphas, stencils), by name: original bytes.
     pub resources: BTreeMap<String, Vec<u8>>,
+    /// Texts of the graphs the layers run, and their cooked outputs.
+    pub graphs: GraphStore,
     /// Import warnings for the caller's log; never saved in the archive
     pub warnings: Vec<String>,
 }
@@ -267,6 +286,7 @@ fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
             body: Box::new(move |w| w.write_all(bytes)),
         });
     }
+    graph_entries(pf, deflate, &mut out)?;
     Ok(out)
 }
 
@@ -274,6 +294,78 @@ fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
     let mut zip = ZipWriter::new(out);
     entries::write_entries(&mut zip, entries(pf)?)?;
     zip.finish().map_err(zip_err)?;
+    Ok(())
+}
+
+/// What `cooked/index.json` holds.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct CookIndex {
+    version: u32,
+    /// By cook key: its outputs (output name → entry) and which of them hold linear colour.
+    cooks: BTreeMap<String, CookEntry>,
+    /// The cook each graph use read last.
+    #[serde(default)]
+    uses: Vec<(GraphUse, String)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct CookEntry {
+    outputs: BTreeMap<String, String>,
+    #[serde(default)]
+    linear: Vec<String>,
+}
+
+/// An output name as part of an entry name: as it is when it is plain, else hex.
+fn output_entry(key: &str, output: &str) -> String {
+    let plain = !output.is_empty() && output.len() <= 64 && output.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if plain { format!("cooked/{key}_{output}.bin") } else { format!("cooked/{key}_x{}.bin", output.bytes().map(|b| format!("{b:02x}")).collect::<String>()) }
+}
+
+/// The graph texts the project references and the cooks its uses read.
+fn graph_entries<'a>(pf: &'a ProjectFile, deflate: SimpleFileOptions, out: &mut Vec<Entry<'a>>) -> Result<()> {
+    let keys = pf.project.graph_keys();
+    for key in &keys {
+        if !texturecraft_core::is_key(key) {
+            continue;
+        }
+        let Some(text) = pf.graphs.texts.get(key) else { continue };
+        out.push(Entry {
+            name: format!("graphs/{key}.txt"),
+            options: deflate,
+            weight: text.len() as u64,
+            body: Box::new(move |w| w.write_all(text.as_bytes())),
+        });
+    }
+    let uses = pf.graphs.uses();
+    if uses.is_empty() {
+        return Ok(());
+    }
+    let mut index = CookIndex { version: COOK_INDEX_VERSION, ..CookIndex::default() };
+    for (key, cooked) in pf.graphs.used_cooks() {
+        if !texturecraft_core::is_key(&key) {
+            continue;
+        }
+        let mut entry = CookEntry { linear: cooked.linear.iter().cloned().collect(), ..CookEntry::default() };
+        for (output, img) in &cooked.outputs {
+            let name = output_entry(&key, output);
+            let weight = (img.allocated_count() * (TILE_AREA * img.comps() * 2 + 8)) as u64;
+            let (source, name_of_output) = (Arc::clone(&cooked), output.clone());
+            out.push(Entry {
+                name: name.clone(),
+                options: deflate,
+                weight,
+                body: Box::new(move |mut w| match source.outputs.get(&name_of_output) {
+                    Some(img) => write_tiles(&mut w, img),
+                    None => Ok(()),
+                }),
+            });
+            entry.outputs.insert(output.clone(), name);
+        }
+        index.cooks.insert(key, entry);
+    }
+    index.uses = uses.into_iter().filter(|(_, k)| index.cooks.contains_key(k)).collect();
+    let json = serde_json::to_vec_pretty(&index).map_err(|e| FormatError::Invalid(e.to_string()))?;
+    out.push(Entry { name: "cooked/index.json".into(), options: deflate, weight: json.len() as u64, body: Box::new(move |w| w.write_all(&json)) });
     Ok(())
 }
 
@@ -410,6 +502,56 @@ fn read_baked(reader: &mut impl Read, declared_bytes: u64, components: usize, bu
     Ok((width, height, data))
 }
 
+/// The cooks `index` lists, each whole or not at all; a cook with a missing or malformed output is left out with a
+/// warning (it is rendered again when it is needed).
+fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mut ProjectFile, budget: &mut LoadBudget) {
+    let mut dropped = 0usize;
+    for (key, entry) in index.cooks {
+        if !texturecraft_core::is_key(&key) || entry.outputs.is_empty() {
+            dropped += 1;
+            continue;
+        }
+        let mut outputs = BTreeMap::new();
+        let mut whole = true;
+        for (output, file) in &entry.outputs {
+            let img = (|| -> Result<TileImage> {
+                if !file.starts_with("cooked/") || file.contains("..") {
+                    return Err(malformed(KIND, format!("bad cooked entry {file}")));
+                }
+                let mut f = zip.by_name(file).map_err(zip_err)?;
+                let mut head = [0u8; 24];
+                read_exact(&mut f, &mut head, file)?;
+                let (w, h, comps) = (u32_at(&head, 2), u32_at(&head, 3), u32_at(&head, 4) as usize);
+                if w == 0 || h == 0 || w > MAX_COOK_SIDE || h > MAX_COOK_SIDE || !matches!(comps, 1 | 4) {
+                    return Err(malformed(KIND, format!("{file}: bad size {w}×{h}×{comps}")));
+                }
+                drop(f);
+                let mut f = zip.by_name(file).map_err(zip_err)?;
+                read_tiles(&mut f, (w, h), comps, budget, file)
+            })();
+            match img {
+                Ok(img) => {
+                    outputs.insert(output.clone(), img);
+                }
+                Err(_) => {
+                    whole = false;
+                    break;
+                }
+            }
+        }
+        if !whole {
+            dropped += 1;
+            continue;
+        }
+        let linear = entry.linear.into_iter().filter(|l| outputs.contains_key(l)).collect();
+        pf.graphs.insert_cooked(key, Cooked { outputs, linear });
+    }
+    pf.graphs.set_uses(index.uses.into_iter().collect());
+    if dropped > 0 {
+        pf.warnings.push(format!("Note: {dropped} cooked graph result(s) could not be read; they will be rendered again when needed."));
+    }
+}
+
 /// Texture set holding a paint layer, a content effect or a mask effect id.
 fn texture_set_of(project: &Project, id: LayerId) -> Option<usize> {
     let owner = if project.layers.contains_key(&id) { id } else { project.effect(id)?.0 };
@@ -481,9 +623,11 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
         bake_paint: BTreeMap::new(),
         thumbnail: None,
         resources: BTreeMap::new(),
+        graphs: GraphStore::default(),
         warnings: Vec::new(),
         project,
     };
+    let mut cook_index: Option<CookIndex> = None;
 
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(zip_err)?;
@@ -492,6 +636,22 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
         let size_of = |id: LayerId| texture_set_of(&pf.project, id).and_then(|ts| pf.project.texture_sets.get(ts)).map(|t| t.size());
         if name == "thumbnail.png" {
             pf.thumbnail = Some(read_all(&mut f, MAX_THUMBNAIL, &mut budget, &name)?);
+        } else if let Some(key) = name.strip_prefix("graphs/").and_then(|n| n.strip_suffix(".txt")) {
+            if !texturecraft_core::is_key(key) {
+                return Err(malformed(KIND, format!("bad graph entry {name}")));
+            }
+            let bytes = read_all(&mut f, MAX_GRAPH_TEXT, &mut budget, &name)?;
+            let text = String::from_utf8(bytes).map_err(|_| malformed(KIND, format!("{name} is not text")))?;
+            if texturecraft_core::text_key(&text) != key {
+                return Err(malformed(KIND, format!("{name} does not match its key")));
+            }
+            pf.graphs.texts.insert(key.to_string(), Arc::from(text));
+        } else if name == "cooked/index.json" {
+            let json = read_all(&mut f, MAX_COOK_INDEX, &mut budget, &name)?;
+            match serde_json::from_slice::<CookIndex>(&json) {
+                Ok(index) if index.version <= COOK_INDEX_VERSION => cook_index = Some(index),
+                _ => pf.warnings.push("Note: the project's cooked graph results could not be read; graphs will be rendered again.".into()),
+            }
         } else if let Some(res_name) = name.strip_prefix("resources/") {
             if res_name.is_empty() || sanitize_resource_name(res_name) != res_name {
                 return Err(malformed(KIND, format!("bad resource name {name}")));
@@ -562,7 +722,10 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
             }
             maps.maps.insert(m, Arc::new(data));
         }
-        // Ignore other entries from newer minor revisions
+        // Ignore other entries from newer minor revisions (cooked outputs are read through their index below)
+    }
+    if let Some(index) = cook_index {
+        load_cooks(&mut zip, index, &mut pf, &mut budget);
     }
 
     pf.project.format_version = FORMAT_VERSION;

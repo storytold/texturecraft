@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
+use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, PixelStore};
 use texturecraft_core::{
     BlendMode, Channel, ChannelBlend, Fidelity, Fill, ImportReport, Layer, LayerId, LayerKind, LayerReport, LayerRole, MAX_RESOLUTION, MIN_RESOLUTION,
     NormalFormat, Project, Source, TextureSet, import_report::original_result_layer,
@@ -47,6 +47,8 @@ pub struct Imported {
     pub mesh: Mesh,
     /// Image resources by name: file bytes.
     pub resources: BTreeMap<String, Vec<u8>>,
+    /// The texts of the graphs the layers run, and their cooked outputs.
+    pub graphs: GraphStore,
     /// Per texture set: what the safety net found.
     pub sets: Vec<SetSummary>,
 }
@@ -165,6 +167,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         baked: BTreeMap::new(),
         mesh: Mesh::default(),
         resources: BTreeMap::new(),
+        graphs: GraphStore::default(),
         sets: Vec::new(),
     };
     for source in &binding.sets {
@@ -407,7 +410,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     if ctx.options.measure && !cache.is_empty() && stack.is_some() {
         ctx.hooks.check()?;
         let store: ImageStore = ctx.images.store();
-        let scene = SetScene { project, ts, mesh: ctx.mesh, pixels: &out.pixels, baked: &baked, images: &store };
+        let scene = SetScene { project, ts, mesh: ctx.mesh, pixels: &out.pixels, baked: &baked, images: &store, graphs: &out.graphs };
         if let Some((composite, gbuf)) = safety_net::composite(&scene, &cache_channels) {
             for (c, img) in &cache {
                 scores.push((*c, safety_net::score(&composite, &gbuf, *c, img, uncovered_default(*c, shader_model))));
