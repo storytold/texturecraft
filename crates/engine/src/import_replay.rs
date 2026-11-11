@@ -323,7 +323,7 @@ fn facing(brush: &ReplayBrush) -> Facing {
 /// becomes a radius scaled by `1 − J/2` with TextureCraft's symmetric jitter `±(J/2)/(1 − J/2)`, the same draw for
 /// draw; rotation in turns of a half turn; position in radii); pen pressure on size and flow; the rotation turned
 /// counter-clockwise as TextureCraft's angle is.
-fn settings(brush: &ReplayBrush, lazy_pixels: f32) -> (BrushSettings, f32) {
+pub(crate) fn settings(brush: &ReplayBrush, lazy_pixels: f32) -> (BrushSettings, f32) {
     let size_scale = 1.0 - brush.size_jitter * 0.5;
     let settings = BrushSettings {
         min_size: brush.size_pressure.unwrap_or(1.0),
