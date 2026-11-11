@@ -13,7 +13,10 @@
 //! - Every other effect becomes one of TextureCraft's: a fill becomes one material fill effect per distinct blend
 //!   mode and opacity among its channels (TextureCraft's effects have one blend each) plus one placeholder per compiled
 //!   graph it uses ([`crate::graph_uses`]); levels and anchors keep their kind; filters are placeholders (or a close
-//!   built-in filter when asked for); colour selection in content, polygon fills and unknown classes are placeholders.
+//!   built-in filter when asked for); colour selection in content and unknown classes are placeholders.
+//! - A polygon fill becomes a content paint effect whose pixels are its picks' colour in base colour, at full coverage
+//!   on the picked triangles (laid by [`crate::polygon_fill::FillJob`]); measured on one file format: the other
+//!   channels show what is below.
 //!
 //! TextureCraft's levels and filters act on every channel of the layer, the file's only on the channels they list: an
 //! effect listing fewer channels than the layer writes is approximated.
@@ -23,13 +26,15 @@ use std::collections::BTreeMap;
 use texturecraft_core::{BlendMode, Channel, Effect, EffectKind, Fill, LayerId, LayerKind, Levels, Projection, Source};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{
-    EffectGroup, EffectHeader, FillEffect, Levels as ProjectLevels, LevelsEffect, PaintEffect, ProjectEffect, ProjectLayer, ProjectSource, ReferenceSource,
+    EffectGroup, EffectHeader, FillEffect, Levels as ProjectLevels, LevelsEffect, PaintEffect, PolygonFillEffect, ProjectEffect, ProjectLayer, ProjectSource,
+    ReferenceSource,
 };
 
 use super::{Anchors, Ids, SetInput, effect, projection};
 use crate::blend::{Holder, ResolvedBlend};
 use crate::channels::bit_of;
 use crate::graph_uses::{self, GraphUse};
+use crate::polygon_fill::{self, FillJob};
 use crate::replay::brush::{StepTarget, refused};
 use crate::replay::{PaintMode, REPLAYED, ReplayJob, ReplayStep, ReplayTarget};
 use crate::resources::{MeshMapAlias, mesh_map_alias};
@@ -46,6 +51,8 @@ pub struct Mapped {
     pub anchor_status: Vec<(u64, Status)>,
     /// Brush work to replay into the layer's pixels or its content paint effects.
     pub jobs: Vec<ReplayJob>,
+    /// Polygon fills to lay into content paint effects.
+    pub fills: Vec<FillJob>,
 }
 
 pub struct ContentMapper<'a, 'i> {
@@ -59,6 +66,7 @@ pub struct ContentMapper<'a, 'i> {
     /// The last strokes placeholder: its index, strokes and paint effects so far.
     strokes_run: Option<(usize, usize, usize)>,
     jobs: Vec<ReplayJob>,
+    fills: Vec<FillJob>,
     /// Mapping a layer's brush work that could not be replayed as a whole.
     in_brush_work: bool,
     /// The layer's path, for the replay jobs' labels.
@@ -89,6 +97,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
             anchor_status: Vec::new(),
             strokes_run: None,
             jobs: Vec::new(),
+            fills: Vec::new(),
             in_brush_work: false,
             path: String::new(),
         }
@@ -139,7 +148,15 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
             self.effects.extend(after);
             kind = LayerKind::Paint;
         }
-        Mapped { kind, effects: self.effects, written: self.written, graphs: self.graphs, anchor_status: self.anchor_status, jobs: self.jobs }
+        Mapped {
+            kind,
+            effects: self.effects,
+            written: self.written,
+            graphs: self.graphs,
+            anchor_status: self.anchor_status,
+            jobs: self.jobs,
+            fills: self.fills,
+        }
     }
 
     /// A paint layer's brush work replayed into its own pixels (`id`): every switched-on paint effect with strokes, in
@@ -425,13 +442,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                     self.anchor_status.push((uid, held));
                 }
             }
-            ProjectEffect::PolygonFill(p) => {
-                let writes = self.writes(&p.header, Holder::Layer).contains(&Channel::BaseColor);
-                self.placeholder("polygon fill", "polygon fills are not computed yet", on);
-                if on && writes {
-                    self.note(Channel::BaseColor, &Status::not_computable(Blocker::feature("polygon-fill", "polygon fill")));
-                }
-            }
+            ProjectEffect::PolygonFill(p) => self.polygon_fill(p, on),
             ProjectEffect::Other(raw) => {
                 self.placeholder(&format!("unknown effect {}", raw.class), "an effect class this version does not read", on);
                 if on {
@@ -445,6 +456,40 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
     }
 
     /// Approximated when the effect lists fewer channels than the layer writes so far (TextureCraft applies it to all).
+    /// A polygon fill: a paint effect holding its picks' colour in base colour at full coverage on the picked
+    /// triangles, blending with the fill's base colour blending (measured on one file format: it writes base colour
+    /// only, at full strength on its picks; the other channels show what is below). A fill whose picks cover nothing
+    /// writes nothing; picks that cannot be resolved leave a placeholder.
+    fn polygon_fill(&mut self, p: &PolygonFillEffect, on: bool) {
+        let writes = self.writes(&p.header, Holder::Layer).contains(&Channel::BaseColor);
+        let runs = polygon_fill::runs(self.input.geometry, p);
+        if !runs.status.is_computable() {
+            self.placeholder("polygon fill", "the polygon fill's picks could not be resolved on the mesh", on);
+            if on && writes {
+                self.note(Channel::BaseColor, &runs.status);
+            }
+            return;
+        }
+        let blend = ResolvedBlend::of(&p.header.blending, self.input.channels.project_channel(Channel::BaseColor), Holder::Layer);
+        let mut e = effect(self.ids.alloc(), &p.header.label, EffectKind::Paint, on);
+        e.blend = blend.mode();
+        e.opacity = blend.opacity;
+        let id = e.id;
+        self.effects.push(e);
+        if !writes {
+            return;
+        }
+        if on {
+            let mut status = runs.status.clone();
+            status.and(&blend.status());
+            status.and(&Status::approximated("polygon fill in layer content: base colour from its picks' colour (measured on one file format)"));
+            self.note(Channel::BaseColor, &status);
+        }
+        if !runs.picks_nothing() {
+            self.fills.push(FillJob { effect: id, channel: Some(Channel::BaseColor), runs: runs.runs, label: format!("{} / polygon fill", self.path) });
+        }
+    }
+
     fn subset_status(&self, channels: &[Channel]) -> Status {
         match self.written.keys().any(|c| !channels.contains(c)) {
             true => Status::approximated("an effect on some channels applies to every channel of the layer"),

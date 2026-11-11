@@ -354,7 +354,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
     /// Lays `runs` into the paint effect just pushed.
     fn fill_job(&mut self, runs: Vec<FillRun>, what: &str) {
         let id = self.effects.last().map_or(texturecraft_core::LayerId(0), |e| e.id);
-        self.fills.push(FillJob { effect: id, runs, label: format!("{} / {what}", self.path) });
+        self.fills.push(FillJob { effect: id, channel: None, runs, label: format!("{} / {what}", self.path) });
     }
 
     /// TextureCraft selects within a per-component tolerance on the set's ID map; the file's hardness is left out.

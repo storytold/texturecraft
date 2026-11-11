@@ -271,6 +271,7 @@ impl<'a> Builder<'a> {
             kind => {
                 let mut mapped = content::ContentMapper::new(self.input, self.anchors, &mut self.ids).map(l, id, &path);
                 self.out.jobs.append(&mut mapped.jobs);
+                self.out.fills.append(&mut mapped.fills);
                 self.out.graphs.extend(mapped.graphs.iter().cloned());
                 for (anchor, status) in &mapped.anchor_status {
                     if let Some(a) = self.out.anchors.get_mut(anchor) {

@@ -669,7 +669,10 @@ fn lay_polygon_fills(stack: &mut ImportedStack, mesh: &Mesh, slot: usize, resolu
     let gbuf = UvGBuffer::new(mesh, slot, resolution, resolution);
     for job in std::mem::take(&mut stack.fills) {
         if let Some(image) = job.paint(&gbuf) {
-            pixels.masks.insert(job.effect, image);
+            match job.channel {
+                None => pixels.masks.insert(job.effect, image),
+                Some(c) => pixels.layers.insert((job.effect, c), image),
+            };
         }
     }
 }

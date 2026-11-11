@@ -626,6 +626,34 @@ fn mask_polygon_fills_become_paint_effects_with_their_picks() {
     assert!(l.is_locked() && matches!(l.mask.as_ref().unwrap().effects[0].kind, EffectKind::Placeholder { .. }));
 }
 
+#[test]
+fn content_polygon_fills_paint_base_colour_on_their_picks() {
+    let mesh = quad_mesh();
+    let painted = |effects: Vec<ProjectEffect>| layer(1, "Painted", ProjectLayerKind::Paint, effects);
+    // a red click on the lower-right triangle, writing every channel: only base colour gets pixels
+    let mut red = polygon_fill(3, 0.0, [0.9, 0.1], vec![]);
+    if let ProjectEffect::PolygonFill(p) = &mut red {
+        p.hits[0].color = [1.0, 0.0, 0.0];
+    }
+    let stack = build_with_mesh(vec![painted(vec![red])], &mesh);
+    let l = by_name(&stack, "Painted");
+    assert_eq!(l.content_effects.len(), 1);
+    assert!(matches!(l.content_effects[0].kind, EffectKind::Paint) && !l.is_locked(), "{l:?}");
+    assert_eq!(stack.fills.len(), 1);
+    assert_eq!((stack.fills[0].effect, stack.fills[0].channel), (l.content_effects[0].id, Some(Channel::BaseColor)));
+    let gbuf = texturecraft_geom::UvGBuffer::new(&mesh, 0, 16, 16);
+    let img = stack.fills[0].paint(&gbuf).unwrap();
+    assert_eq!(img.get(14, 14)[..4], [u16::MAX, 0, 0, u16::MAX], "red at full coverage on the picked triangle");
+    assert_eq!(img.get(1, 1)[..4], [0, 0, 0, 0], "nothing on the other triangle");
+    // a fill picking nothing writes nothing (no pixels, no lock)
+    let stack = build_with_mesh(vec![painted(vec![polygon_fill(3, 1.0, [3.0, 3.0], vec![])])], &mesh);
+    assert!(stack.fills.is_empty() && !by_name(&stack, "Painted").is_locked());
+    // without the mesh it stays a locked placeholder
+    let stack = build(vec![painted(vec![polygon_fill(3, 1.0, [0.9, 0.1], vec![])])]);
+    let l = by_name(&stack, "Painted");
+    assert!(l.is_locked() && matches!(l.content_effects[0].kind, EffectKind::Placeholder { .. }), "{l:?}");
+}
+
 fn filter(uid: u64, channels: u64, name: &str) -> ProjectEffect {
     let procedural = Procedural {
         uid: None,

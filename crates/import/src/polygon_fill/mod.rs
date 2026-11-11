@@ -9,7 +9,7 @@ pub mod pick;
 
 use std::collections::BTreeSet;
 
-use texturecraft_core::LayerId;
+use texturecraft_core::{Channel, LayerId};
 use texturecraft_geom::{NO_TRI, UvGBuffer};
 use texturecraft_import_reader::blockers::Blocker;
 use texturecraft_import_reader::model::{PolygonFillEffect, StrokeView};
@@ -80,27 +80,36 @@ pub fn runs(geometry: Option<&SetGeometry>, fill: &PolygonFillEffect) -> FillRun
     FillRuns { runs, status }
 }
 
-/// What a polygon fill paints: the mask paint effect `effect` gets `runs`, laid over each other in order.
+/// What a polygon fill paints: the paint effect `effect` gets `runs`, laid over each other in order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FillJob {
     pub effect: LayerId,
+    /// `None` for a paint effect in a mask; the channel of a content paint effect.
+    pub channel: Option<Channel>,
     pub runs: Vec<FillRun>,
     /// The layer's path, for the report.
     pub label: String,
 }
 
 impl FillJob {
-    /// The effect's mask pixels (grey, coverage; premultiplied) at the G-buffer's size: every texel whose triangle a run
-    /// picked gets the run's grey at full coverage, later runs over earlier ones. `None` when nothing is covered.
+    /// The effect's pixels (value, coverage; premultiplied) at the G-buffer's size: every texel whose triangle a run
+    /// picked gets the run's value at full coverage, later runs over earlier ones. A mask takes the grey (the colour's
+    /// first component), a content channel the colour as stored (a one-value channel its mean). `None` when nothing
+    /// is covered.
     pub fn paint(&self, gbuf: &UvGBuffer) -> Option<TileImage> {
-        let mut image = TileImage::new(gbuf.width, gbuf.height, 2);
+        let comps = self.channel.map_or(1, Channel::components);
+        let mut image = TileImage::new(gbuf.width, gbuf.height, comps + 1);
         let w = gbuf.width.max(1) as usize;
         let mut any = false;
         // the last run picking a triangle decides its value
-        let mut value: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+        let mut value: std::collections::HashMap<u32, [f32; 3]> = std::collections::HashMap::new();
         for run in &self.runs {
+            let v = match self.channel {
+                None => [run.color[0]; 3],
+                Some(c) => crate::channels::uniform_value(c, run.color),
+            };
             for t in &run.triangles {
-                value.insert(*t, run.color[0].clamp(0.0, 1.0));
+                value.insert(*t, v.map(|x| x.clamp(0.0, 1.0)));
             }
         }
         if value.is_empty() {
@@ -111,7 +120,9 @@ impl FillJob {
                 continue;
             }
             if let Some(v) = value.get(t) {
-                image.set((i % w) as u32, (i / w) as u32, &[to_u16(*v), u16::MAX]);
+                let mut px: Vec<u16> = v.iter().take(comps).map(|x| to_u16(*x)).collect();
+                px.push(u16::MAX);
+                image.set((i % w) as u32, (i / w) as u32, &px);
                 any = true;
             }
         }
@@ -170,7 +181,7 @@ mod tests {
         assert_eq!(r.runs[0].triangles, BTreeSet::from([0, 1]));
         assert_eq!(r.runs[1].triangles, BTreeSet::from([0]));
         let gbuf = UvGBuffer::new(&m, 0, 16, 16);
-        let job = FillJob { effect: LayerId(5), runs: r.runs, label: String::new() };
+        let job = FillJob { effect: LayerId(5), channel: None, runs: r.runs, label: String::new() };
         let img = job.paint(&gbuf).unwrap();
         // texel rows run top → bottom like glTF v: the file's lower right (u 0.9, V 0.1) is texel (14, 14)
         let at = |x: u32, y: u32| img.get(x, y).iter().take(2).map(|v| from_u16(*v)).collect::<Vec<_>>();
@@ -189,7 +200,7 @@ mod tests {
         // a click beside the mesh picks nothing and writes nothing
         let r = runs(Some(&g), &fill(vec![click([2.0, 2.0], 1.0, HitGranularity::Mesh)]));
         assert!(r.picks_nothing());
-        let job = FillJob { effect: LayerId(1), runs: r.runs, label: String::new() };
+        let job = FillJob { effect: LayerId(1), channel: None, runs: r.runs, label: String::new() };
         assert!(job.paint(&UvGBuffer::new(&m, 0, 8, 8)).is_none());
         // an unknown granularity is not computable
         assert!(!runs(Some(&g), &fill(vec![click([0.5, 0.5], 1.0, HitGranularity::Other(7))])).status.is_computable());
