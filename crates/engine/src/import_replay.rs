@@ -22,6 +22,13 @@
 //!   coverage alike ([`texturecraft_paint::smudge_in_place`], the rule measured on the file's app). A dab further than
 //!   [`SMUDGE_JUMP`] radii from the previous one on the mesh, or [`SMUDGE_SEAM`] radii away in the texture (a seam),
 //!   moves nothing; symmetry copies are not smudged.
+//! - **Path strokes** (curves on the mesh, no view): dabs walked along the stored cubic curve by its length in the
+//!   mesh's space, the first on the first anchor, each next `spacing × diameter` further, none forced onto the last
+//!   (measured to 0.02 texels on flat paths); each dab at the surface point nearest its place on the curve, the tip
+//!   along the path (or its top towards the brush's up direction), jitter drawn from the path's seed as for strokes,
+//!   the anchors' size as the pen's pressure. Where the curve passes under or over a curved surface, its dabs shrink
+//!   with the depth ([`PATH_DEPTH`], fitted on a sphere). Laid after the step's strokes, each path on its own.
+//! - **Ribbons**: a ribbon brush lays its tip along each path as a band ([`texturecraft_paint::rasterize_ribbon`]).
 //! - Dabs reach every surface in their volume whatever the view sees (measured: nothing occludes), faded by the turn
 //!   from the dab's normal as the brush's culling says ([`Facing::Fade`]); each stroke is laid on its own and committed
 //!   with the effect's opacity ("over" for paint, coverage lowered for the eraser).
@@ -36,14 +43,15 @@ use texturecraft_core::Channel;
 use texturecraft_geom::glam::{Mat4, Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, NO_TRI, OrbitCamera, SubMesh, UvGBuffer};
 use texturecraft_import::replay::{
-    PaintMode, ReplayBrush, ReplayJob, ReplayScene, ReplayStencil, ReplayStep, ReplayStroke, ReplayTarget, ReplayTip, ReplayedPixels, StencilImage,
-    StrokeReplayer, StrokeSpace, TipAlignment,
+    PaintMode, ReplayBrush, ReplayJob, ReplayPath, ReplayRibbon, ReplayScene, ReplayStencil, ReplayStep, ReplayStroke, ReplayTarget, ReplayTip, ReplayedPixels,
+    RibbonTiling as ReplayTiling, StencilImage, StrokeReplayer, StrokeSpace, TipAlignment,
 };
 use texturecraft_paint::alphas::AlphaImage;
 use texturecraft_paint::jitter::{Jittered, StrokeRandom, cycle_start};
 use texturecraft_paint::{
-    Alignment, BrushAlpha, BrushSettings, CommitSource, Facing, PickCtx, RasterCtx, SeededJitter, Shape, Staging, Stamp, Stroke, StrokeCanvas, UvStamp,
-    ViewStencil, commit_layer, commit_mask, commit_mask_texels, footprint, footprint_uv, pressure_scale, rasterize, rasterize_uv, smudge_in_place,
+    Alignment, BrushAlpha, BrushSettings, CommitSource, Facing, PickCtx, RasterCtx, Ribbon, RibbonTiling, SeededJitter, Shape, SpaceCurve, SpacePiece, Staging,
+    Stamp, Stroke, StrokeCanvas, UvStamp, ViewStencil, commit_layer, commit_mask, commit_mask_texels, footprint, footprint_uv, pressure_scale, rasterize,
+    rasterize_ribbon, rasterize_uv, smudge_in_place,
 };
 use texturecraft_texel::TileImage;
 
@@ -66,6 +74,14 @@ const MAX_PITCH_DEGREES: f32 = 89.95;
 pub const SMUDGE_JUMP: f32 = 4.0;
 /// A smudge dab whose previous one lies further than this many radii away in the texture draws nothing (a seam).
 pub const SMUDGE_SEAM: f32 = 16.0;
+
+/// How deep under (or over) the surface a path stroke may pass and still lay a dab, in radii of the dab: a dab `d` deep
+/// lays a footprint of radius `r·√(1 − (d / (PATH_DEPTH·r))²)` (fitted on a path through a sphere at spacing 200 %: dabs
+/// 0.025 … 0.08 deep with radius 0.05 shrink from full size to about 0.4).
+pub const PATH_DEPTH: f32 = 1.75;
+/// A path's dab looks for the surface within this many radii of its place on the curve (at least [`PATH_REACH_TEXELS`]).
+const PATH_REACH: f32 = 4.0;
+const PATH_REACH_TEXELS: f32 = 8.0;
 
 /// The replayer `file.importProject` gives the import.
 #[derive(Debug, Clone, Copy, Default)]
@@ -298,6 +314,19 @@ fn replay_job(set: &SetMesh, job: &ReplayJob, stop: &(dyn Fn() -> bool + Sync)) 
                 _ => commit(&mut pixels, set, job.target, step, &canvas),
             }
         }
+        for path in &step.paths {
+            if stop() {
+                return Err("cancelled".into());
+            }
+            let mut canvas = StrokeCanvas::new(set.resolution, set.resolution);
+            match &step.ribbon {
+                Some(ribbon) => lay_ribbon(set, ribbon, &tip, path, &mut canvas),
+                None => lay_dabs(set, &step.brush, &tip, 0, set.center, &path_dabs(set, &step.brush, &tip, path), &mut canvas),
+            }
+            if !canvas.dirty.is_empty() {
+                commit(&mut pixels, set, job.target, step, &canvas);
+            }
+        }
     }
     Ok(match job.target {
         ReplayTarget::Content(_) => {
@@ -528,15 +557,20 @@ fn mesh_dabs(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayStrok
     }
 }
 
-/// The symmetry copies' matrices: the recorded step applied once, twice, … `copies` times.
+/// The symmetry copies' matrices of a stroke: the recorded step applied once, twice, … `copies` times.
 fn symmetry(stroke: &ReplayStroke) -> Vec<Mat4> {
-    let step = Mat4::from_cols_array(&stroke.copy_matrix);
-    if stroke.copies == 0 || !step.is_finite() {
+    copy_matrices(stroke.copies, &stroke.copy_matrix)
+}
+
+/// `step` applied once, twice, … `copies` times.
+fn copy_matrices(copies: u32, step: &[f32; 16]) -> Vec<Mat4> {
+    let step = Mat4::from_cols_array(step);
+    if copies == 0 || !step.is_finite() {
         return Vec::new();
     }
     let mut out = Vec::new();
     let mut power = step;
-    for _ in 0..stroke.copies {
+    for _ in 0..copies {
         out.push(power);
         power = step * power;
     }
@@ -661,6 +695,115 @@ fn uv_dabs(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayStroke)
         left -= l - t;
     }
     dabs
+}
+
+/// A path stroke's curve in the mesh's space.
+fn path_curve(path: &ReplayPath) -> SpaceCurve {
+    let v = Vec3::from_array;
+    let pieces: Vec<SpacePiece> = path.pieces.iter().map(|p| SpacePiece { points: p.points.map(v), normals: p.normals.map(v), size: p.size }).collect();
+    SpaceCurve::new(&pieces, path.anchor.map(|(p, n, size)| (v(p), v(n), size)))
+}
+
+/// The surface point of the set nearest `p` within `reach`, with the surface's normal there.
+fn surface_near(set: &SetMesh, p: Vec3, reach: f32) -> Option<(Vec3, Vec3)> {
+    let hit = set.bvh.nearest(p, reach.max(1e-6), &|_| true)?;
+    let [a, b, c] = set.mesh.tri(hit.tri as usize)?;
+    let w = 1.0 - hit.u - hit.v;
+    let at = |v: &[Vec3]| Some(*v.get(a)? * w + *v.get(b)? * hit.u + *v.get(c)? * hit.v);
+    let (point, normal) = (at(&set.mesh.positions)?, at(&set.mesh.normals)?.try_normalize()?);
+    point.is_finite().then_some((point, normal))
+}
+
+/// Axes `x`, `y` (right and down on a view) turned clockwise by `angle` radians.
+fn turned(x: Vec3, y: Vec3, angle: f32) -> (Vec3, Vec3) {
+    let (s, c) = angle.sin_cos();
+    (x * c + y * s, y * c - x * s)
+}
+
+/// A path stroke's dabs (see the module's notes), symmetry copies after the originals. Dab `k` lays stamp `k` of a
+/// dynamic alpha's cycle.
+fn path_dabs(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, path: &ReplayPath) -> Vec<Stamp> {
+    let curve = path_curve(path);
+    let mut random = StrokeRandom::new(SeededJitter { seed: path.seed, both_axes: brush.position_both, normal: brush.position_normal });
+    let jittered =
+        Jittered { size: brush.size_jitter > 0.0, flow: brush.flow_jitter > 0.0, rotation: brush.rotation_jitter > 0.0, position: brush.position_jitter > 0.0 };
+    let up = brush.up.map(Vec3::from_array);
+    let mut out: Vec<Stamp> = Vec::new();
+    curve.walk(MAX_DABS, |p, heading, size| {
+        let d = random.draw(jittered);
+        let r = brush.radius * pressure_scale(brush.size_pressure.unwrap_or(1.0), size) * (1.0 - brush.size_jitter * (1.0 - d.size));
+        let flow = brush.flow * pressure_scale(brush.flow_pressure.unwrap_or(1.0), size) * (1.0 - brush.flow_jitter * (1.0 - d.flow));
+        if !(r > 0.0 && r.is_finite()) {
+            // a dab of no size lays nothing and ends the walk
+            return f32::MAX;
+        }
+        let step = brush.spacing.max(0.01) * 2.0 * r;
+        let reach = (PATH_REACH * r).max(PATH_REACH_TEXELS * set.world_per_texel);
+        let Some((on, n)) = surface_near(set, p, reach) else { return step };
+        // the path's frame: x along it on the tangent plane, y a quarter turn clockwise (right and down on a view)
+        let along = (heading - n * heading.dot(n)).try_normalize().unwrap_or_else(|| n.any_orthonormal_vector());
+        let (x0, y0) = (along, along.cross(n));
+        // the tip's: along the path, or with its top towards the brush's up direction when it does not follow the path
+        let up = up.map(|v| v - n * v.dot(n)).and_then(|v| (v.length() > 1e-4).then_some(v)).and_then(Vec3::try_normalize);
+        let (tx, ty) = match (brush.follow, up) {
+            (false, Some(up)) => (n.cross(-up), -up),
+            _ => (x0, y0),
+        };
+        let turn = if jittered.rotation { brush.rotation_jitter * (1.0 - 2.0 * d.rotation) } else { 0.0 };
+        let follow = if brush.follow { std::f32::consts::FRAC_PI_2 } else { 0.0 };
+        let (x, y) = turned(tx, ty, brush.rotation + turn + follow);
+        // position jitter in shares of the diameter: both axes in a drawn direction, or across the path
+        let distance = brush.position_jitter * d.distance;
+        let moved = match (jittered.position, brush.position_both) {
+            (false, _) => Vec3::ZERO,
+            (true, true) => {
+                let (sin, cos) = (std::f32::consts::PI * (d.direction - 0.5)).sin_cos();
+                x0 * (distance * sin) + y0 * (distance * cos)
+            }
+            (true, false) => -y0 * distance,
+        } * (2.0 * r);
+        let placed = if moved == Vec3::ZERO { Some((on, n)) } else { surface_near(set, on + moved, reach + 2.0 * r) };
+        // a curve off the surface lays smaller dabs the deeper it is
+        let shrink = 1.0 - ((p - on).length() / (PATH_DEPTH * r)).powi(2);
+        if let (Some((center, normal)), true) = (placed, shrink > 0.0) {
+            let seed = u32::try_from(out.len()).unwrap_or(u32::MAX);
+            out.push(Stamp {
+                center,
+                normal,
+                tangent: x,
+                bitangent: -y,
+                radius: r * shrink.sqrt(),
+                flow: flow.clamp(0.0, 1.0),
+                hardness: tip.hardness,
+                depth: 1.0,
+                seed,
+                source: None,
+            });
+        }
+        step
+    });
+    let originals = out.len();
+    for m in copy_matrices(path.copies, &path.copy_matrix) {
+        for i in 0..originals {
+            if let Some(d) = out.get(i).and_then(|d| copied(d, &m)) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// A ribbon along one path: the tip as a band (see [`texturecraft_paint::ribbon`]).
+fn lay_ribbon(set: &SetMesh, ribbon: &ReplayRibbon, tip: &Tip, path: &ReplayPath, canvas: &mut StrokeCanvas) {
+    let tiling = match ribbon.tiling {
+        ReplayTiling::Repeat => RibbonTiling::Repeat,
+        ReplayTiling::Whole => RibbonTiling::Whole,
+        ReplayTiling::Caps { guides } => RibbonTiling::Caps { guides },
+    };
+    let band = Ribbon { width: ribbon.width, copy: ribbon.copy, tiling, depth: ribbon.depth };
+    // the tip's detail for a copy's shorter side in texels
+    let radius = ribbon.width.min(ribbon.copy) * 0.5 / set.world_per_texel;
+    rasterize_ribbon(canvas, &set.mesh, &set.gbuf, &path_curve(path), &band, tip.shape().at_radius(radius), tip.hardness);
 }
 
 /// A smudge dab: its texels' coverage (the brush's shape, flow and culling), its centre in texels, and its centre and

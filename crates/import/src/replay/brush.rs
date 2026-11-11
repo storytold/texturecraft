@@ -19,17 +19,26 @@
 //! | `sourceStencil`, `projMatrix` | the stencil the strokes go through, placed on the view ([`tip::stencil`]) |
 //! | projection tool | a mask's strokes paint the grey of the first `sourceColor`, placed on the view by `projMatrix` |
 //! | smudge tool | each dab draws what lies at the previous dab's place over its own, values and coverage (measured) |
+//! | `strokes3D` (path strokes) | cubic pieces through the stored anchors and handles in the mesh's space; dabs walked along them ([`ReplayPath`]) |
+//! | anchors' `size` | the pen's pressure along a path, linear between anchors |
+//! | `upVector` | where an unturned tip's top points along a path (Inferred) |
+//! | ribbon brush (`width`, `tilingMode`, `stretchGuides`, `aspectRatioFactor`, `projectionDepthRatio`) | the tip laid along each path as a band ([`ReplayRibbon`]) |
 //! | `stampBlendingMode` ≠ 0, `aspectRatio` ≠ 1, other `alignment` | approximated (noted) |
 //!
-//! Not replayable (a `brush:` blocker): particle brushes, ribbons, path strokes, projection painting without an image or
-//! on a paint layer, a smudge with nothing of its effect before it, brushes painting images, graphs or anchors,
-//! unreadable point lists.
+//! Not replayable (a `brush:` blocker): particle brushes, projection painting without an image or on a paint layer,
+//! smudge or projection painting along path strokes, a smudge with nothing of its effect before it, brushes painting
+//! images, graphs or anchors, unreadable point lists.
 
 use texturecraft_core::Channel;
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
-use texturecraft_import_reader::model::{PaintEffect, PaintTool, ProjectBrush, ProjectSource, ProjectStroke, StampEmitter, StrokeView};
+use texturecraft_import_reader::model::{
+    PaintEffect, PaintTool, ProjectBrush, ProjectSource, ProjectStroke, RibbonBrush, StampEmitter, StrokePath3d, StrokeView,
+};
 
-use super::{PaintMode, ReplayBrush, ReplayStencil, ReplayStep, ReplayStroke, StrokePoint, StrokeSpace, TipAlignment, pressure_at, tip};
+use super::{
+    PaintMode, PathPiece, ReplayBrush, ReplayPath, ReplayRibbon, ReplayStencil, ReplayStep, ReplayStroke, RibbonTiling, StrokePoint, StrokeSpace, TipAlignment,
+    pressure_at, tip,
+};
 use crate::channels::SetChannels;
 use crate::resources::ProjectImages;
 
@@ -39,6 +48,10 @@ pub const SIZE_TO_RADIUS: f32 = 0.5;
 pub const MAX_COPIES: u32 = 64;
 /// Most points read per stroke (a guard against hostile files).
 pub const MAX_POINTS: usize = 1 << 20;
+/// The note a step with path strokes carries: their rules are measured on flat paths and spheres only.
+pub const PATHS_APPROXIMATE: &str = "3D path strokes approximated";
+/// The note a ribbon step carries.
+pub const RIBBON_APPROXIMATE: &str = "3D path ribbons approximated";
 /// A stencil without its matrix spans the view: normalised device coordinates −1..1 onto the image's 0..1.
 const VIEW_STENCIL: [f32; 9] = [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0];
 
@@ -75,13 +88,13 @@ pub fn check(effect: &PaintEffect) -> Result<(), Blocker> {
             StampEmitter::Physics(_) => {
                 return Err(refused("particle", "particle brush: its emitter and receiver scripts are not carried by TextureCraft's particle brush"));
             }
-            StampEmitter::Ribbon(_) => return Err(refused("ribbon", "path ribbon brush (a band laid along a path, no stamps)")),
+            StampEmitter::Ribbon(_) => {}
             StampEmitter::Other(class) if class.is_empty() => return Err(refused("no-emitter", "brush without an emitter")),
             StampEmitter::Other(class) => return Err(Blocker::class(class, format!("brush emitter {class}"))),
         }
     }
-    if !effect.paths.is_empty() {
-        return Err(refused("3d-path", "path strokes (curves along the mesh) are not replayed"));
+    if effect.paths.iter().any(|p| !p.complete) {
+        return Err(refused("unreadable-points", "path points not fully readable"));
     }
     if effect.strokes.iter().any(|s| !s.complete) {
         return Err(refused("unreadable-points", "stroke points not fully readable"));
@@ -130,12 +143,65 @@ pub fn step(
         (PaintTool::Projection, Some(source)) => Some(ReplayStencil { image: tip::stencil(source, images, graphs)?, matrix }),
         _ => None,
     };
-    let strokes: Vec<ReplayStroke> = effect.strokes.iter().filter_map(|s| stroke(s, brush.size_pressure.is_some() || brush.flow_pressure.is_some())).collect();
+    let mut strokes: Vec<ReplayStroke> =
+        effect.strokes.iter().filter_map(|s| stroke(s, brush.size_pressure.is_some() || brush.flow_pressure.is_some())).collect();
     if mode == PaintMode::Smudge && strokes.iter().any(|s| s.copies > 0) {
         notes.push("symmetry copies of smudge strokes left out".to_string());
     }
+    let paths: Vec<ReplayPath> = effect.paths.iter().filter_map(path).collect();
+    let ribbon = match effect.brush.as_ref().map(|b| &b.emitter) {
+        Some(StampEmitter::Ribbon(r)) => Some(ribbon(r)),
+        _ => None,
+    };
+    if ribbon.is_some() {
+        notes.push(format!("{RIBBON_APPROXIMATE}: {} paths", paths.len()));
+        if !strokes.is_empty() {
+            notes.push(format!("{} brush strokes of a ribbon brush left out", strokes.len()));
+            strokes.clear();
+        }
+    } else if !paths.is_empty() {
+        notes.push(format!("{PATHS_APPROXIMATE}: {} paths{}", paths.len(), if stencil.is_some() { ", their stencil left out" } else { "" }));
+    }
     let opacity = if effect.opacity.is_finite() { effect.opacity.clamp(0.0, 1.0) } else { 1.0 };
-    Ok(ReplayStep { mode, values, mask_value, opacity, brush, stencil, projection, strokes, notes })
+    Ok(ReplayStep { mode, values, mask_value, opacity, brush, stencil, projection, strokes, paths, ribbon, notes })
+}
+
+/// The path stroke as recorded; `None` for one without a finite anchor.
+pub fn path(p: &StrokePath3d) -> Option<ReplayPath> {
+    let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
+    let size = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 1.0 };
+    let pieces: Vec<PathPiece> = p
+        .segments()
+        .into_iter()
+        .take(MAX_POINTS)
+        .filter(|s| s.points.iter().chain(&s.normals).all(|v| finite(&v[..])))
+        .map(|s| PathPiece { points: s.points, normals: s.normals, size: s.size.map(size) })
+        .collect();
+    let anchor = match pieces.is_empty() {
+        true => Some(p.anchors().find(|a| finite(&a.position[..]) && finite(&a.normal[..])).map(|a| (a.position, a.normal, size(a.size)))?),
+        false => None,
+    };
+    Some(ReplayPath { pieces, anchor, seed: p.random_seed, copies: p.duplicate_count.min(MAX_COPIES), copy_matrix: p.duplicate_matrix })
+}
+
+/// A ribbon brush in neutral quantities: `tilingMode` 1 one copy over the path (Inferred, panels), 2 capped by the
+/// stretch guides, otherwise repeated; the band reaches `projectionDepthRatio` half widths along the surface's normal,
+/// at least half its width (Inferred from the name).
+pub fn ribbon(r: &RibbonBrush) -> ReplayRibbon {
+    let finite = |v: f32, lo: f32, hi: f32, d: f32| if v.is_finite() { v.clamp(lo, hi) } else { d };
+    let width = finite(r.width, 0.0, 1e3, 0.0);
+    let half = width * 0.5;
+    let tiling = match r.tiling_mode {
+        1 => RibbonTiling::Whole,
+        2 => RibbonTiling::Caps { guides: r.stretch_guides.map(|g| finite(g, 0.0, 1.0, 0.5)) },
+        _ => RibbonTiling::Repeat,
+    };
+    ReplayRibbon {
+        width,
+        copy: (width * finite(r.aspect_ratio, 1e-3, 1e3, 1.0)).max(1e-6),
+        tiling,
+        depth: (finite(r.projection_depth_ratio, 0.0, 1e3, 1.0) * half).max(half),
+    }
 }
 
 /// The brush of `effect` (its defaults when it has none).
@@ -189,6 +255,7 @@ pub(crate) fn map_brush(effect: &PaintEffect, tip: super::ReplayTip, notes: &mut
         tip,
         cycle: Vec::new(),
         cycle_drawn_start: false,
+        up: e.up_vector.filter(|v| v.iter().all(|x| x.is_finite())),
     }
 }
 

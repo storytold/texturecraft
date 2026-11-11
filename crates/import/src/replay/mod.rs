@@ -9,9 +9,10 @@
 //! net composites, so the measured scores include the replayed pixels. Without a replayer, strokes stay placeholders
 //! locked with `strokes:<tool>`.
 //!
-//! Paint effects that cannot be replayed (particles, ribbons, path strokes, projection painting without an image or on a
-//! paint layer, brushes painting images or graphs, tips that are compiled graphs the project does not hold) stay
-//! placeholders with a precise `brush:` or `brush-alpha:` reason.
+//! Paint effects that cannot be replayed (particles, projection painting without an image or on a paint layer, smudge or
+//! projection painting along path strokes, brushes painting images or graphs, tips that are compiled graphs the project
+//! does not hold) stay placeholders with a precise `brush:` or `brush-alpha:` reason. Path strokes (curves on the mesh)
+//! are replayed as dabs walked along the curve ([`ReplayPath`]), or, with a ribbon brush, as a band ([`ReplayRibbon`]).
 
 pub mod brush;
 pub mod tip;
@@ -94,6 +95,9 @@ pub struct ReplayBrush {
     /// `cycle_drawn_start`, drawn from the stroke's seed. Empty: every dab lays `tip`.
     pub cycle: Vec<ReplayTip>,
     pub cycle_drawn_start: bool,
+    /// A path brush's up direction (mesh space): where the top of a tip that does not follow the path points along a
+    /// path stroke, laid on the surface's tangent plane (Inferred). `None`: the tip lies along the path.
+    pub up: Option<[f32; 3]>,
 }
 
 /// A stencil's grey image.
@@ -145,6 +149,52 @@ pub struct ReplayStroke {
     pub copy_matrix: [f32; 16],
 }
 
+/// One cubic piece of a path stroke: from `points[0]` to `points[3]` through the handles `points[1]`, `points[2]` (the
+/// mesh's space), with the surface normal and the anchors' size (0..1, applied as a pen's pressure) at its two ends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathPiece {
+    pub points: [[f32; 3]; 4],
+    pub normals: [[f32; 3]; 2],
+    pub size: [f32; 2],
+}
+
+/// A path stroke as recorded: a curve on the mesh, no view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayPath {
+    /// The curve's pieces, in order; empty for a path of one anchor.
+    pub pieces: Vec<PathPiece>,
+    /// A path of one anchor: its position, normal and size.
+    pub anchor: Option<([f32; 3], [f32; 3], f32)>,
+    pub seed: u32,
+    /// Symmetry: `copies` further copies, each `copy_matrix` (column-major, mesh space) applied once more.
+    pub copies: u32,
+    pub copy_matrix: [f32; 16],
+}
+
+/// How a ribbon places its tip along a path (measured on flat test paths unless marked).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RibbonTiling {
+    /// Whole copies, each [`ReplayRibbon::copy`] long before fitting, as many as fit best, stretched to fill the path.
+    Repeat,
+    /// One copy stretched over the whole path (Inferred: panels).
+    Whole,
+    /// One copy over the whole path, the tip before `guides[0]` and after `guides[1]` kept [`ReplayRibbon::copy`] long,
+    /// the part between stretched.
+    Caps { guides: [f32; 2] },
+}
+
+/// A ribbon brush: the tip laid along each path as a band, no dabs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReplayRibbon {
+    /// The band's full width, mesh units.
+    pub width: f32,
+    /// One copy's length before fitting: the width times the aspect ratio.
+    pub copy: f32,
+    pub tiling: RibbonTiling,
+    /// How far from the path along the surface's normal the band reaches (Inferred).
+    pub depth: f32,
+}
+
 /// One paint effect of the file, ready to lay.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplayStep {
@@ -161,6 +211,10 @@ pub struct ReplayStep {
     /// view, in place of `mask_value`.
     pub projection: Option<ReplayStencil>,
     pub strokes: Vec<ReplayStroke>,
+    /// Path strokes, laid after `strokes` (Inferred), each on its own as a stroke is: dabs walked along the curve, or
+    /// with `ribbon` a band.
+    pub paths: Vec<ReplayPath>,
+    pub ribbon: Option<ReplayRibbon>,
     /// What the step leaves out or approximates, for the report.
     pub notes: Vec<String>,
 }
@@ -192,9 +246,9 @@ pub struct ReplayJob {
 }
 
 impl ReplayJob {
-    /// Strokes in the job.
+    /// Strokes in the job, path strokes included.
     pub fn strokes(&self) -> usize {
-        self.steps.iter().map(|s| s.strokes.len()).sum()
+        self.steps.iter().map(|s| s.strokes.len() + s.paths.len()).sum()
     }
 
     /// Every note of its steps, without repeats.

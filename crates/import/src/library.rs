@@ -403,6 +403,9 @@ impl<'a> Collector<'a> {
 /// alpha or a constant has no tip of TextureCraft's.
 fn brush(p: &PaintEffect) -> Result<OfferedBrush, String> {
     crate::replay::check(p).map_err(|b| b.text)?;
+    if matches!(p.brush.as_ref().map(|b| &b.emitter), Some(texturecraft_import_reader::model::StampEmitter::Ribbon(_))) {
+        return Err("a path ribbon brush (TextureCraft's brush presets lay stamps)".to_string());
+    }
     let (hardness, exact) = match (tip::round_tip_hardness(&p.alpha), p.alpha.first()) {
         (Some(h), _) => h,
         (None, Some(ProjectSource::Bitmap(_))) => return Err("a bitmap alpha (TextureCraft's library keeps no alpha images)".to_string()),

@@ -165,8 +165,10 @@ without `paint`) rasterises nothing but hands replay jobs (stroke records, the b
 tip or a dynamic alpha's stamps, stencil, camera, symmetry, seed, and the layer, content effect or mask effect painted) to a `StrokeReplayer`, which the
 engine implements with `paint` (`engine::import_replay`) and passes in through the import's hooks; the import calls
 it per texture set before the safety net measures. The brush draws each stroke's jitter from its seed as the
-file's app does, and lays strokes through their stencil on the view. Replayed strokes become approximated pixels, not locked; strokes
-the brush cannot replay yet (particles, ribbons, path strokes, projection, smudge, graph tips the project does not hold) stay
+file's app does, and lays strokes through their stencil on the view; path strokes (curves on the mesh) are walked by their
+length in the mesh's space (`paint::path::SpaceCurve`), and ribbon brushes lay their tip along them as a band
+(`paint::ribbon`). Replayed strokes become approximated pixels, not locked; strokes
+the brush cannot replay yet (particles, projection painting on paint layers, smudge or projection along path strokes, graph tips the project does not hold) stay
 placeholders locked with a `brush:<what>` or `brush-alpha:<graph>` key, and with replay switched off with
 `strokes:<tool>`. The
 stored result itself becomes a locked "Original result" paint layer, hidden as a reference unless the

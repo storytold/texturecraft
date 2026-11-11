@@ -5,7 +5,7 @@ use std::sync::Arc;
 use texturecraft_core::LayerId;
 use texturecraft_geom::glam::Mat4;
 use texturecraft_geom::primitives;
-use texturecraft_import::replay::{StrokePoint, StrokeSpace};
+use texturecraft_import::replay::{PathPiece, ReplayPath, ReplayRibbon, RibbonTiling as Tiling, StrokePoint, StrokeSpace};
 use texturecraft_texel::from_u16;
 
 use super::*;
@@ -61,6 +61,7 @@ fn brush(radius: f32) -> ReplayBrush {
         tip: ReplayTip::Round { hardness: 0.9 },
         cycle: vec![],
         cycle_drawn_start: false,
+        up: None,
     }
 }
 
@@ -74,6 +75,8 @@ fn step(mode: PaintMode, strokes: Vec<ReplayStroke>) -> ReplayStep {
         stencil: None,
         projection: None,
         strokes,
+        paths: vec![],
+        ribbon: None,
         notes: vec![],
     }
 }
@@ -389,4 +392,129 @@ fn projection_painting_lays_its_image_grey_on_the_view() {
         assert!(white.1 > 0.95 && (white.0 - white.1).abs() < 0.01, "{space:?}: the image's white: {white:?}");
         assert!(black.1 > 0.95 && black.0 < 0.01, "{space:?}: its black, laid at full coverage: {black:?}");
     }
+}
+
+/// A path on the wall through `anchors` (mesh x, y) with the handles given between them (`out`, `in` per piece).
+fn path_of(anchors: &[[f32; 2]], handles: &[[[f32; 2]; 2]]) -> ReplayPath {
+    let p = |a: [f32; 2]| [a[0], a[1], 0.0];
+    let pieces = anchors
+        .windows(2)
+        .zip(handles)
+        .map(|(w, h)| PathPiece { points: [p(w[0]), p(h[0]), p(h[1]), p(w[1])], normals: [[0.0, 0.0, 1.0]; 2], size: [1.0; 2] })
+        .collect();
+    ReplayPath { pieces, anchor: None, seed: 0, copies: 0, copy_matrix: [0.0; 16] }
+}
+
+/// A straight path with a click's handles (a third of the way from each end).
+fn line_path(from: [f32; 2], to: [f32; 2]) -> ReplayPath {
+    let at = |k: f32| [from[0] + (to[0] - from[0]) * k, from[1] + (to[1] - from[1]) * k];
+    path_of(&[from, to], &[[at(1.0 / 3.0), at(2.0 / 3.0)]])
+}
+
+/// The set of the wall for calling the path code directly.
+fn wall_set(mesh: &Mesh) -> SetMesh {
+    SetMesh::new(&ReplayScene { mesh, material: 0, resolution: RES }).unwrap()
+}
+
+/// Mesh coordinates of texel positions measured on a 2 × 2 sheet at 512.
+fn from_texels(t: [f32; 2]) -> [f32; 2] {
+    [t[0] / 256.0 - 1.0, 1.0 - t[1] / 256.0]
+}
+
+#[test]
+#[allow(clippy::excessive_precision, reason = "the coordinates as the file stores them")]
+fn path_dabs_follow_the_curve_by_its_length() {
+    let mesh = wall();
+    let set = wall_set(&mesh);
+    let tip = Tip::of(&brush(0.05)).unwrap();
+    let mut b = brush(0.05);
+    b.size_pressure = Some(0.05);
+    // three clicks with the handles the reference app placed; its dab centres at spacing 300 % (texels of 512, measured)
+    let arch = path_of(
+        &[[-0.34138179, 0.0], [0.0, 0.36623982], [0.34138179, 0.0]],
+        &[[[-0.26959929, 0.15066466], [-0.16689089, 0.36623982]], [[0.16689089, 0.36623982], [0.26959929, 0.15066466]]],
+    );
+    b.spacing = 3.0;
+    let dabs = path_dabs(&set, &b, &tip, &arch);
+    let measured = [[168.62, 256.02], [207.1, 189.78], [274.32, 165.81], [325.73, 220.93]];
+    assert_eq!(dabs.len(), measured.len());
+    for (d, m) in dabs.iter().zip(measured) {
+        let m = from_texels(m);
+        assert!((d.center.x - m[0]).abs() < 0.15 / 256.0 && (d.center.y - m[1]).abs() < 0.15 / 256.0, "{} vs {m:?}", d.center);
+        assert!(d.center.z.abs() < 1e-5 && (d.radius - 0.05).abs() < 1e-6);
+    }
+    // a straight path: steps of spacing × diameter from the first anchor, none forced onto the last
+    b.spacing = 1.5;
+    let xs: Vec<f32> = path_dabs(&set, &b, &tip, &line_path([-0.34138179, 0.0], [0.34138179, 0.0])).iter().map(|d| d.center.x).collect();
+    assert_eq!(xs.len(), 5);
+    for (x, m) in xs.iter().zip([168.62, 207.03, 245.43, 283.83, 322.23]) {
+        assert!((x - from_texels([m, 0.0])[0]).abs() < 0.15 / 256.0, "{xs:?}");
+    }
+    // one anchor: one dab
+    let one = ReplayPath { pieces: vec![], anchor: Some(([0.1, 0.2, 0.0], [0.0, 0.0, 1.0], 1.0)), seed: 0, copies: 0, copy_matrix: [0.0; 16] };
+    assert_eq!(path_dabs(&set, &b, &tip, &one).len(), 1);
+}
+
+#[test]
+fn path_dabs_lie_along_the_path_shrink_off_the_surface_and_take_symmetry() {
+    let mesh = wall();
+    let set = wall_set(&mesh);
+    let tip = Tip::of(&brush(0.05)).unwrap();
+    let b = brush(0.05);
+    let dabs = path_dabs(&set, &b, &tip, &line_path([-0.5, 0.0], [0.5, 0.0]));
+    // the tip lies along the path (x along it, its top up the wall) unless the brush says where its top points
+    assert!(dabs[0].tangent.abs_diff_eq(Vec3::X, 1e-5) && dabs[0].bitangent.abs_diff_eq(Vec3::Y, 1e-5), "{:?}", dabs[0]);
+    let mut turned = b.clone();
+    turned.up = Some([1.0, 0.0, 0.0]);
+    let d = path_dabs(&set, &turned, &tip, &line_path([-0.5, 0.0], [0.5, 0.0]));
+    assert!(d[0].bitangent.abs_diff_eq(Vec3::X, 1e-5), "its top towards the up direction: {:?}", d[0]);
+    let mut follows = turned.clone();
+    follows.follow = true;
+    let d = path_dabs(&set, &follows, &tip, &line_path([-0.5, 0.0], [0.5, 0.0]));
+    assert!(d[0].bitangent.abs_diff_eq(Vec3::X, 1e-5), "following the path, its top ahead: {:?}", d[0]);
+    // a path 0.07 above the wall: dabs r·√(1 − (0.07 / 1.75r)²) = 0.6·r; 0.1 above: none
+    let lift = |path: ReplayPath, z: f32| ReplayPath {
+        pieces: path.pieces.iter().map(|p| PathPiece { points: p.points.map(|q| [q[0], q[1], z]), ..*p }).collect(),
+        ..path
+    };
+    let high = path_dabs(&set, &b, &tip, &lift(line_path([-0.5, 0.0], [0.5, 0.0]), 0.07));
+    assert!(!high.is_empty() && high.iter().all(|d| (d.radius - 0.03).abs() < 1e-4 && d.center.z.abs() < 1e-5), "{:?}", high[0]);
+    assert!(path_dabs(&set, &b, &tip, &lift(line_path([-0.5, 0.0], [0.5, 0.0]), 0.1)).is_empty());
+    // symmetry: the recorded matrix applied to every dab
+    let mut mirrored = line_path([0.2, 0.3], [0.6, 0.3]);
+    mirrored.copies = 1;
+    mirrored.copy_matrix = Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)).to_cols_array();
+    let d = path_dabs(&set, &b, &tip, &mirrored);
+    let n = d.len() / 2;
+    assert!(n > 0 && d.len() == 2 * n);
+    assert!(d[n].center.abs_diff_eq(Vec3::new(-d[0].center.x, d[0].center.y, 0.0), 1e-5));
+}
+
+#[test]
+fn path_strokes_and_ribbons_paint_into_their_target() {
+    let mesh = wall();
+    let c = RES / 2;
+    // a brush along a path, after the step's strokes
+    let mut s = step(PaintMode::Paint, vec![]);
+    s.brush.radius = 0.05;
+    s.paths = vec![line_path([-0.5, 0.0], [0.5, 0.0])];
+    let out = replay(&mesh, &[job_of(s.clone())]);
+    let (grey, cover) = mask_at(&out[0], c, c);
+    assert!(cover > 0.95 && (grey - 0.5 * cover).abs() < 0.01, "{grey} {cover}");
+    assert!(mask_at(&out[0], c - 30, c).1 > 0.9 && mask_at(&out[0], c, c - 6).1 == 0.0);
+    // a ribbon: a band 0.2 wide (6.4 texels either side), a square tip repeated in copies with gaps between them
+    s.ribbon = Some(ReplayRibbon { width: 0.2, copy: 0.2, tiling: Tiling::Repeat, depth: 0.1 });
+    s.brush.tip = ReplayTip::Image { width: 4, height: 1, values: Arc::from(vec![0.0, 1.0, 1.0, 0.0]) };
+    let out = replay(&mesh, &[job_of(s.clone())]);
+    let along = row(&out[0], c);
+    assert!(along.iter().filter(|v| **v > 0.9).count() > 12, "{along:?}");
+    // copies of 0.2 along a path 1 long: five, each with a gap at both ends (texels 32..96)
+    let gaps = (33..95).filter(|x| along[*x as usize] < 0.1).count();
+    assert!(gaps >= 8, "{along:?}");
+    assert!(mask_at(&out[0], c, c + 5).1 > 0.5 || mask_at(&out[0], c + 2, c + 5).1 > 0.5, "the band's width");
+    assert_eq!(mask_at(&out[0], c, c + 8).1, 0.0);
+    // content targets take the band too
+    let content = ReplayJob { target: ReplayTarget::Content(LayerId(3)), label: String::new(), steps: vec![s] };
+    let Ok(ReplayedPixels::Content(images)) = &replay(&mesh, &[content])[0] else { panic!("content") };
+    assert!(images.iter().any(|(ch, img)| *ch == Channel::BaseColor && from_u16(img.get(c + 1, c)[3]) > 0.5));
 }

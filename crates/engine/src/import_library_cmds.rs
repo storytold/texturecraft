@@ -204,6 +204,7 @@ mod tests {
             tip: ReplayTip::Round { hardness: 0.8 },
             cycle: Vec::new(),
             cycle_drawn_start: false,
+            up: None,
         };
         let offered = OfferedBrush { brush, tip: BrushTip::Round { hardness: 0.8, exact: true }, opacity: 0.7 };
         let settings = brush_settings(&offered);

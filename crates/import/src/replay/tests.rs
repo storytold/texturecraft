@@ -153,10 +153,12 @@ fn what_the_brush_cannot_replay_is_refused_with_a_reason() {
     let b = of(&e, StepTarget::Content).unwrap_err();
     assert_eq!((b.key.kind, b.key.name.as_str()), (BlockerKind::BrushAlpha, "grunge_map"));
     let mut e = effect(PaintTool::Brush);
-    e.paths.push(texturecraft_import_reader::model::StrokePath3d::line([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]));
-    assert_eq!(key(&e), "brush:3d-path");
-    let mut e = effect(PaintTool::Brush);
     e.strokes[0].complete = false;
+    assert_eq!(key(&e), "brush:unreadable-points");
+    let mut e = effect(PaintTool::Brush);
+    let mut path = texturecraft_import_reader::model::StrokePath3d::line([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+    path.complete = false;
+    e.paths.push(path);
     assert_eq!(key(&e), "brush:unreadable-points");
     let mut e = effect(PaintTool::Brush);
     e.colors = match shape("wood", vec![]) {
@@ -321,4 +323,80 @@ fn projection_painting_in_a_mask_places_its_image_on_the_view() {
     assert_eq!(s.projection.map(|p| p.matrix), s.stencil.map(|p| p.matrix));
     // a brush has no projection
     assert!(of(&effect(PaintTool::Brush), StepTarget::Mask).unwrap().projection.is_none());
+}
+
+fn ribbon_brush(tiling: u64) -> ProjectBrush {
+    ProjectBrush {
+        size: 0.3,
+        emitter: StampEmitter::Ribbon(texturecraft_import_reader::model::RibbonBrush {
+            width: 0.1,
+            tiling_mode: tiling,
+            stretch_mode: 1,
+            stretch_guides: [0.25, 0.75],
+            aspect_ratio: 2.0,
+            count: 4,
+            source_direction: 0,
+            alignment: 0,
+            corner_shape: 0,
+            flip_along_width: false,
+            repeat_mirror: false,
+            omit_ends_when_closed: false,
+            alpha_blending: 7,
+            depth_hardness: 1.0,
+            projection_depth_ratio: 3.0,
+        }),
+        ..ProjectBrush::default()
+    }
+}
+
+#[test]
+fn path_strokes_and_ribbons_become_steps() {
+    use texturecraft_import_reader::model::StrokePath3d;
+    // a brush along a path: its pieces as stored, the anchors' size as pressure, the seed and symmetry kept
+    let mut e = effect(PaintTool::Brush);
+    let mut path = StrokePath3d::line([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+    path.random_seed = 7;
+    path.duplicate_count = 500;
+    if let Some(k) = path.points.last_mut() {
+        k.size = 0.5;
+    }
+    e.paths.push(path);
+    if let Some(ProjectBrush { emitter: StampEmitter::Stroke(em), .. }) = &mut e.brush {
+        em.up_vector = Some([0.0, 0.0, 1.0]);
+    }
+    let s = of(&e, StepTarget::Content).unwrap();
+    assert_eq!((s.strokes.len(), s.paths.len(), s.ribbon), (2, 1, None));
+    let p = &s.paths[0];
+    assert_eq!(p.pieces.len(), 1);
+    assert_eq!(p.pieces[0].points[3], [1.0, 0.0, 0.0]);
+    assert_eq!(p.pieces[0].size, [1.0, 0.5]);
+    assert_eq!((p.anchor, p.seed, p.copies), (None, 7, brush::MAX_COPIES));
+    assert_eq!(s.brush.up, Some([0.0, 0.0, 1.0]));
+    assert!(s.notes.iter().any(|n| n.starts_with(brush::PATHS_APPROXIMATE)), "{:?}", s.notes);
+    // one anchor: a path of no pieces at that anchor; one with no finite anchor is dropped
+    let mut one = StrokePath3d::line([0.5; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+    one.points.truncate(1);
+    assert_eq!(brush::path(&one).unwrap().anchor, Some(([0.5; 3], [0.0, 1.0, 0.0], 1.0)));
+    one.points[0].position[0] = f32::NAN;
+    assert_eq!(brush::path(&one), None);
+    // a ribbon brush: its band, its brush strokes left out
+    for (mode, tiling) in [(0, RibbonTiling::Repeat), (1, RibbonTiling::Whole), (2, RibbonTiling::Caps { guides: [0.25, 0.75] })] {
+        let mut e = effect(PaintTool::Brush);
+        e.brush = Some(ribbon_brush(mode));
+        e.paths.push(StrokePath3d::line([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]));
+        let s = of(&e, StepTarget::Mask).unwrap();
+        let r = s.ribbon.unwrap();
+        assert_eq!(r.tiling, tiling);
+        assert!((r.width - 0.1).abs() < 1e-6 && (r.copy - 0.2).abs() < 1e-6 && (r.depth - 0.15).abs() < 1e-6, "{r:?}");
+        assert!(s.strokes.is_empty() && s.paths.len() == 1);
+        assert!(s.notes.iter().any(|n| n.starts_with(brush::RIBBON_APPROXIMATE)) && s.notes.iter().any(|n| n.contains("left out")), "{:?}", s.notes);
+    }
+    // a band reaches at least half its width along the normal
+    let mut e = effect(PaintTool::Brush);
+    let mut b = ribbon_brush(0);
+    if let StampEmitter::Ribbon(r) = &mut b.emitter {
+        r.projection_depth_ratio = 0.1;
+    }
+    e.brush = Some(b);
+    assert!((of(&e, StepTarget::Content).unwrap().ribbon.unwrap().depth - 0.05).abs() < 1e-6);
 }
