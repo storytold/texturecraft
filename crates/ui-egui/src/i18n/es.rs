@@ -177,7 +177,6 @@ pub const TABLE: &[(&str, &str)] = &[
         "Color of the light that travels under the surface (each channel goes as far as its value)",
         "Color de la luz que viaja bajo la superficie (cada canal llega tan lejos como su valor)",
     ),
-    ("Color picker", "Cuentagotas"),
     ("Color selection", "Selección de color"),
     ("Color to replace", "Color a reemplazar"),
     (
@@ -502,6 +501,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("MatFinish Raw", "Acabado en bruto"),
     ("MatFinish Sanded", "Acabado lijado"),
     ("Material", "Material"),
+    ("Material picker", "Cuentagotas de material"),
     ("Material ball", "Bola de material"),
     ("Material finish", "Acabado de material"),
     ("Materials", "Materiales"),
@@ -728,6 +728,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Search commands or keys", "Buscar comandos o teclas"),
     ("Seed", "Semilla"),
     ("Select a layer", "Selecciona una capa"),
+    ("Select a layer to paint on", "Selecciona una capa para pintar"),
     ("Select an output template", "Selecciona una plantilla de salida"),
     ("Select source", "Seleccionar origen"),
     ("Select the mask (Alt+click: show it in the viewport)", "Seleccionar la máscara (Alt+clic: mostrarla en la ventana gráfica)"),

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use texturecraft_compose::{PaintTarget, PixelStore};
-use texturecraft_core::{Channel, Effect, EffectKind, LayerId, Mask, MaskBackground, PathShape};
+use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, PathShape};
 use texturecraft_geom::glam::{Mat3, Vec2, Vec3};
 use texturecraft_geom::{OrbitCamera, surface_at};
 use texturecraft_paint::{BrushSettings, Lasso, PickCtx, fill_coverage, pick, spline, spline_segments};
@@ -706,33 +706,40 @@ impl Session {
         self.path_steps = Default::default();
     }
 
-    /// The selected path sublayer, or a new one on the selected layer's content or mask
-    /// (whichever is selected).
+    /// The selected path sublayer, or a new one on the selected paint layer's content or mask
     fn path_effect(&mut self) -> Result<LayerId> {
-        let id = self.selected_layer().ok_or_else(|| EngineError::Other("select a layer to add the path to".into()))?;
-        let p = &self.doc.project;
+        if self.quick_mask.editing {
+            return Err(EngineError::Other("paths can't edit the quick mask: stop editing it first".into()));
+        }
+
+        let selected = self.selected_layer().ok_or_else(|| EngineError::Other("select a layer to add the path to".into()))?;
+        let project = &self.doc.project;
         let mask = match self.target {
-            StackTarget::Effect(e) => match p.effect(e) {
-                Some((_, x)) if matches!(x.kind, EffectKind::Path(_)) => return Ok(e),
-                Some((owner, _)) => !p.layer(owner)?.content_effects.iter().any(|x| x.id == e),
+            StackTarget::Effect(effect) => match project.effect(effect) {
+                // Paths saved in a fill layer before paths there were removed stay editable
+                Some((_, found)) if matches!(found.kind, EffectKind::Path(_)) => return Ok(effect),
+                Some((owner, _)) => !project.layer(owner)?.content_effects.iter().any(|candidate| candidate.id == effect),
                 None => false,
             },
             StackTarget::Mask => true,
             StackTarget::Content => false,
         };
-        // An instance's content and (unless it has its own) mask belong to its source.
-        let owner = if mask { p.mask_owner(id) } else { p.content_layer(id).map_or(id, |l| l.id) };
-        let eid = self.doc.project.alloc_id();
-        let l = self.doc.project.layer_mut(owner)?;
-        let e = Effect::new(eid, EffectKind::Path(Vec::new()));
+
+        // An instance's content and (unless it has its own) mask belong to its source
+        let owner = if mask { project.mask_owner(selected) } else { project.content_layer(selected).map_or(selected, |layer| layer.id) };
+        let path_id = self.doc.project.alloc_id();
+        let layer = self.doc.project.layer_mut(owner)?;
+        let path = Effect::new(path_id, EffectKind::Path(Vec::new()));
         if mask {
-            l.mask.get_or_insert_with(|| Mask::new(MaskBackground::Black)).effects.push(e);
-        } else if l.is_group() {
-            return Err(EngineError::Other(format!("\"{}\" is a folder: add the path to a layer or a mask", l.name)));
+            layer.mask.get_or_insert_with(|| Mask::new(MaskBackground::Black)).effects.push(path);
+        } else if layer.is_group() {
+            return Err(EngineError::Other(format!("\"{}\" is a folder: add the path to a layer or a mask", layer.name)));
+        } else if matches!(layer.kind, LayerKind::Paint) {
+            layer.content_effects.push(path);
         } else {
-            l.content_effects.push(e);
+            return Err(EngineError::Other(format!("\"{}\" is not a paint layer: add the path to a paint layer or a mask", layer.name)));
         }
-        Ok(eid)
+        Ok(path_id)
     }
 
     /// [`Session::put_path`] recompositing only the tiles it changed, with no undo step: returns the paint report and the document before

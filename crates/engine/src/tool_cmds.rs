@@ -20,7 +20,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("tool.polygonFill", "Polygon fill", ["Tools"], Some("4"), "{}", always, |s, _| set_tool(s, Tool::PolygonFill)),
         cmd!("tool.smudge", "Smudge", ["Tools"], Some("5"), "{}", always, |s, _| set_tool(s, Tool::Smudge)),
         cmd!("tool.clone", "Clone", ["Tools"], Some("6"), "{}", always, |s, _| set_tool(s, Tool::Clone)),
-        cmd!("tool.colorPicker", "Color picker", ["Tools"], Some("P"), "{}", always, |s, _| set_tool(s, Tool::ColorPicker)),
+        cmd!("tool.colorPicker", "Material picker", ["Tools"], Some("P"), "{}", always, |s, _| set_tool(s, Tool::ColorPicker)),
         cmd!(
             "tool.geometryMask",
             "Geometry mask",
@@ -105,7 +105,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Tool click",
             [],
             None,
-            "{x, y, viewport?: [w,h]} — polygon fill / color picker / single dab; polygon fill also takes a box {x0, y0, x1, y1, viewport?}, a 2D view point {uv: [u,v]} or a 2D view box {uv0: [u,v], uv1: [u,v]}",
+            "{x, y, viewport?: [w,h]} — polygon fill / material picker / single dab; polygon fill also takes a box {x0, y0, x1, y1, viewport?}, a 2D view point {uv: [u,v]} or a 2D view box {uv0: [u,v], uv1: [u,v]}",
             always,
             click
         ),

@@ -55,6 +55,7 @@ pub mod smart_masks;
 pub mod template_cmds;
 pub mod text_cmds;
 pub mod thumbs;
+mod tool_availability;
 pub mod tool_cmds;
 mod triangle_partition;
 mod uv_stroke_state;

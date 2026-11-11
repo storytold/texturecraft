@@ -178,8 +178,29 @@ const RUBBER_BAND_GAP: f32 = 4.0;
 /// Opacity of the UV tile outlines in the 2D view
 const UV_TILE_OUTLINE_ALPHA: u8 = 40;
 
+/// Width of the UV tile outlines, in points
+const UV_TILE_OUTLINE_WIDTH: f32 = 1.0;
+
+/// The texture set name in the 2D view's bottom-right corner: its inset from the corner and its text size, in points
+const SET_NAME_INSET: egui::Vec2 = vec2(10.0, 10.0);
+const SET_NAME_TEXT_SIZE: f32 = 11.0;
+
 /// Smallest skew brush circle in the 2D view, in points, so a tiny brush stays visible
 const BAKE_PAINT_CURSOR_MIN_RADIUS: f32 = 2.0;
+
+/// The bake brush cursor's outline: width in points and white alpha
+const BAKE_PAINT_CURSOR_STROKE: f32 = 1.0;
+const BAKE_PAINT_CURSOR_ALPHA: u8 = 200;
+
+/// A UDIM tile label: its offset from the tile's top-left corner and its text size, in points
+const UV_TILE_LABEL_OFFSET: egui::Vec2 = vec2(6.0, 4.0);
+const UV_TILE_LABEL_SIZE: f32 = 11.0;
+
+/// The projection stencil's dashed outline: width, white alpha, dash and gap, in points
+const STENCIL_OUTLINE_STROKE: f32 = 1.0;
+const STENCIL_OUTLINE_ALPHA: u8 = 120;
+const STENCIL_OUTLINE_DASH: f32 = 5.0;
+const STENCIL_OUTLINE_GAP: f32 = 4.0;
 
 /// The 2D view's width when the split divider is at `divider_x`
 fn uv_view_width(full: Rect, divider_x: f32) -> f32 {
@@ -219,18 +240,24 @@ fn split_divider_grab(ui: &Ui, full: Rect, divider_x: f32) {
     ui.interact(zone, split_divider_id(ui), Sense::drag()).on_hover_and_drag_cursor(egui::CursorIcon::ResizeHorizontal);
 }
 
+/// The shader's view modes (`Shade::view_mode`): the material, one channel, the aux texture (mesh map, mask or quick mask), the UV checker
+const VIEW_MODE_MATERIAL: u32 = 0;
+const VIEW_MODE_CHANNEL: u32 = 1;
+const VIEW_MODE_AUX_TEXTURE: u32 = 2;
+const VIEW_MODE_UV_CHECKER: u32 = 3;
+
 fn shade(app: &TextureCraftApp) -> Shade {
     let (view_mode, channel) = match app.session.view {
-        _ if app.ui.mode == crate::state::Mode::Painting && app.session.quick_mask.editing && app.picking_id_color.is_none() => (2, 0),
-        ViewMode::Material => (0, 0),
-        ViewMode::Channel(selected_channel) => (1, selected_channel.index() as u32),
-        ViewMode::MeshMap(_) | ViewMode::Mask(_) => (2, 0),
-        ViewMode::UvChecker => (3, 0),
+        _ if app.ui.mode == crate::state::Mode::Painting && app.session.quick_mask.editing && app.picking_id_color.is_none() => (VIEW_MODE_AUX_TEXTURE, 0),
+        ViewMode::Material => (VIEW_MODE_MATERIAL, 0),
+        ViewMode::Channel(selected_channel) => (VIEW_MODE_CHANNEL, selected_channel.index() as u32),
+        ViewMode::MeshMap(_) | ViewMode::Mask(_) => (VIEW_MODE_AUX_TEXTURE, 0),
+        ViewMode::UvChecker => (VIEW_MODE_UV_CHECKER, 0),
     };
     let set_index = app.session.ts();
     let height_strength = app.session.doc.project.texture_sets.get(set_index).map(|texture_set| texture_set.atlas_height_strength()).unwrap_or(1.0);
     // Polygon fill shows the polygons it fills without changing the saved wireframe toggles
-    let polygon_fill_tool = app.ui.mode == crate::state::Mode::Painting && app.session.tool.tool == Tool::PolygonFill;
+    let polygon_fill_tool = tool_acts(app) && app.session.tool.tool == Tool::PolygonFill;
     Shade {
         height_strength,
         view_mode,
@@ -488,7 +515,9 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // Navigation; S + drag moves the projection stencil instead, below
     let delta = ui.input(|input| input.pointer.delta());
     let s_held = app.ui.mode == crate::state::Mode::Painting && ui.input(|input| input.key_down(egui::Key::S)) && !ui.ctx().egui_wants_keyboard_input();
-    let stencil_drag = s_held && app.session.tool.stencil.is_some();
+    // Only an equipped Projection tool that can act moves its stencil: it isn't drawn otherwise
+    let stencil_moves = tool_acts(app) && app.session.tool.tool == Tool::Projection;
+    let stencil_drag = s_held && stencil_moves && app.session.tool.stencil.is_some();
     if stencil_drag || adjusting {
         // The stencil or the brush changes instead of the camera
     } else if response.dragged_by(PointerButton::Middle) {
@@ -510,8 +539,11 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
         if scroll != 0.0 {
             if shift && app.ui.mode == crate::state::Mode::Painting {
-                let brush = &mut app.session.tool.brush;
-                brush.size = (brush.size * (1.0 + scroll * WHEEL_BRUSH_SIZE_PER_POINT)).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
+                // A tool that can't act keeps its size: its controls are hidden
+                if tool_acts(app) {
+                    let brush = &mut app.session.tool.brush;
+                    brush.size = (brush.size * (1.0 + scroll * WHEEL_BRUSH_SIZE_PER_POINT)).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
+                }
             } else {
                 app.session.camera.zoom(scroll * WHEEL_ZOOM_PER_POINT);
             }
@@ -537,7 +569,10 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
 
     // Stencil: S + left drag turns it, S + right drag scales it, S + middle drag moves it
-    if s_held && let Some(stencil) = app.session.tool.stencil.as_mut() {
+    if s_held
+        && stencil_moves
+        && let Some(stencil) = app.session.tool.stencil.as_mut()
+    {
         if response.dragged_by(PointerButton::Primary) {
             stencil.rotation = (stencil.rotation + delta.x * STENCIL_DEGREES_PER_POINT).rem_euclid(360.0);
         } else if response.dragged_by(PointerButton::Secondary) {
@@ -636,7 +671,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     let symmetry_handle = !app.session.stroke_active() && crate::symmetry::manipulator_hovered(app, ui, rect);
 
     // Painting
-    let painting = app.ui.mode == crate::state::Mode::Painting
+    let painting = tool_acts(app)
         && !popup
         && !alt
         && !adjusting
@@ -716,7 +751,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
 
     // Brush cursor; while a Ctrl+drag changes the brush it stays where the drag began
     let mut symmetry_cursor = None;
-    if app.ui.mode == crate::state::Mode::Painting
+    if tool_acts(app)
         && !navigating
         && response.hovered()
         && brush_tool(app.session.tool.tool)
@@ -746,7 +781,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         }
     }
 
-    if app.ui.mode == crate::state::Mode::Painting && path_tool {
+    if tool_acts(app) && path_tool {
         path_overlay(app, ui, rect, &response, false, show);
     }
     crate::symmetry::overlay(app, ui, rect, symmetry_cursor);
@@ -1008,12 +1043,13 @@ fn decal_overlay(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) {
 
 /// Draw the projection stencil in Paint Mode
 fn stencil_overlay(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) {
-    if app.ui.mode != crate::state::Mode::Painting || app.session.tool.tool != Tool::Projection {
+    if !tool_acts(app) || app.session.tool.tool != Tool::Projection {
         return;
     }
     let Some(stencil) = app.session.tool.stencil.clone() else { return };
     let Some(image) = app.session.images.get(&stencil.image).cloned() else { return };
 
+    // Where the stencil's corners land on screen
     let texture = app.thumbs.stencil(ui.ctx(), &stencil.image, &image);
     let aspect = rect.width() / rect.height().max(1.0);
     let (center, half_size, rotation) = stencil.placement(image.width as f32 / image.height.max(1) as f32, aspect);
@@ -1023,7 +1059,8 @@ fn stencil_overlay(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) {
         let (x, y) = (x * half_size[0], y * half_size[1]);
         to_screen(center[0] + x * cosine - y * sine, center[1] + x * sine + y * cosine)
     };
-    let tint = Color32::from_white_alpha((stencil.opacity * 255.0) as u8);
+
+    let tint = Color32::from_white_alpha((stencil.opacity * f32::from(u8::MAX)) as u8);
     let mut mesh = egui::Mesh::with_texture(texture.id());
     for (x, y, u, v) in [(-1.0, 1.0, 0.0, 0.0), (1.0, 1.0, 1.0, 0.0), (1.0, -1.0, 1.0, 1.0), (-1.0, -1.0, 0.0, 1.0)] {
         mesh.vertices.push(egui::epaint::Vertex { pos: corner(x, y), uv: pos2(u, v), color: tint });
@@ -1031,8 +1068,10 @@ fn stencil_overlay(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) {
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     let painter = ui.painter_at(rect);
     painter.add(egui::Shape::mesh(mesh));
+
     let outline = vec![corner(-1.0, 1.0), corner(1.0, 1.0), corner(1.0, -1.0), corner(-1.0, -1.0), corner(-1.0, 1.0)];
-    painter.add(egui::Shape::dashed_line(&outline, Stroke::new(1.0, Color32::from_white_alpha(120)), 5.0, 4.0));
+    let outline_stroke = Stroke::new(STENCIL_OUTLINE_STROKE, Color32::from_white_alpha(STENCIL_OUTLINE_ALPHA));
+    painter.add(egui::Shape::dashed_line(&outline, outline_stroke, STENCIL_OUTLINE_DASH, STENCIL_OUTLINE_GAP));
 }
 
 /// A world point on screen in the 3D view `rect` (None behind the camera)
@@ -1080,19 +1119,16 @@ fn path_keys(app: &mut TextureCraftApp, ui: &Ui) {
         return;
     }
 
-    if app.ui.mode != crate::state::Mode::Painting
-        || app.session.tool.tool != Tool::Path
-        || app.session.tool.path.points.is_empty()
-        || ui.ctx().egui_wants_keyboard_input()
-    {
+    if !tool_acts(app) || app.session.tool.tool != Tool::Path || app.session.tool.path.points.is_empty() || ui.ctx().egui_wants_keyboard_input() {
         return;
     }
 
-    let (enter, back) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, egui::Key::Enter), i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)));
+    let (enter, backspace) =
+        ui.input_mut(|input| (input.consume_key(egui::Modifiers::NONE, egui::Key::Enter), input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)));
     if enter {
         app.run("tool.path", json!({"commit": true}));
     }
-    if back {
+    if backspace {
         app.session.remove_selected_path_point();
     }
 }
@@ -1482,12 +1518,9 @@ fn polygon_fill_box_overlay(ui: &Ui, rect: Rect, fill_box: Option<Rect>) {
     ui.painter_at(rect).rect(fill_box, 0.0, accent.gamma_multiply(FILL_BOX_TINT), Stroke::new(1.0, accent), egui::StrokeKind::Inside);
 }
 
-/// V held with the Clone tool in painting mode: clicks set the clone source.
+/// V held with the Clone tool in painting mode: clicks set the clone source
 fn clone_source_key(app: &TextureCraftApp, ui: &Ui) -> bool {
-    app.ui.mode == crate::state::Mode::Painting
-        && app.session.tool.tool == Tool::Clone
-        && ui.input(|i| i.key_down(egui::Key::V))
-        && !ui.ctx().egui_wants_keyboard_input()
+    tool_acts(app) && app.session.tool.tool == Tool::Clone && ui.input(|input| input.key_down(egui::Key::V)) && !ui.ctx().egui_wants_keyboard_input()
 }
 
 /// Crosshair where the Clone tool reads from.
@@ -1502,20 +1535,23 @@ fn clone_marker(app: &TextureCraftApp, ui: &Ui, rect: Rect, pos: Vec3) {
     }
 }
 
+/// Whether the active tool can act on the selection now: a greyed tool ignores clicks, keys and drags in the views
+fn tool_acts(app: &TextureCraftApp) -> bool {
+    app.ui.mode == crate::state::Mode::Painting && app.session.tool_usable(app.session.tool.tool)
+}
+
 /// Tools that paint with the brush (and show its cursor).
 fn brush_tool(t: Tool) -> bool {
     matches!(t, Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Smudge | Tool::Clone | Tool::Path)
 }
 
-/// Ctrl (Cmd on macOS) + drag in a view changes the brush instead of painting or navigating: a
-/// right drag its size (left/right) and hardness (up/down), a left drag its flow and angle. True
-/// while Ctrl is held with a brush tool and no stroke is under way.
-fn brush_drag(app: &mut TextureCraftApp, ui: &Ui, resp: &egui::Response) -> bool {
-    let held =
-        app.ui.mode == crate::state::Mode::Painting && brush_tool(app.session.tool.tool) && !app.session.stroke_active() && ui.input(|i| i.modifiers.command);
-    if held && let Some(right) = brush_drag_button(resp) {
-        adjust_brush(&mut app.session.tool.brush, right, ui.input(|i| i.pointer.delta()));
+/// Ctrl (Cmd on macOS) + drag changes the brush instead of painting: true while it applies (see `adjust_brush`)
+fn brush_drag(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response) -> bool {
+    let held = tool_acts(app) && brush_tool(app.session.tool.tool) && !app.session.stroke_active() && ui.input(|input| input.modifiers.command);
+    if held && let Some(right) = brush_drag_button(response) {
+        adjust_brush(&mut app.session.tool.brush, right, ui.input(|input| input.pointer.delta()));
     }
+
     held
 }
 
@@ -1660,8 +1696,8 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
 
     // Conversions between the view's points and the texture set's UV space
-    let ts = app.session.ts();
-    let set = app.session.doc.project.texture_sets.get(ts);
+    let texture_set_index = app.session.ts();
+    let set = app.session.doc.project.texture_sets.get(texture_set_index);
     let [scale_x, scale_y] = texturecraft_render::uv_view_scale(size.x / size.y.max(1.0), app.ui.uv_zoom, set.map_or((1, 1), |texture_set| texture_set.size()));
     let pan = app.ui.uv_pan;
     let to_uv = |pointer: egui::Pos2| {
@@ -1708,7 +1744,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
 
     // Painting in UV space
-    let painting = app.ui.mode == crate::state::Mode::Painting
+    let painting = tool_acts(app)
         && app.properties_popup.is_none()
         && !crate::rail_popup::blocks_paint_input(app, ui.ctx())
         && !alt
@@ -1738,7 +1774,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     let frame = Frame {
         view_id: VIEW_2D,
         size: frame_size_in_pixels(ui, rect),
-        kind: ViewKind::Uv { ts, zoom: app.ui.uv_zoom, pan: app.ui.uv_pan },
+        kind: ViewKind::Uv { ts: texture_set_index, zoom: app.ui.uv_zoom, pan: app.ui.uv_pan },
         camera: app.session.camera,
         shade: shade(app),
         visible: app.session.doc.project.texture_sets.iter().map(|texture_set| texture_set.visible).collect(),
@@ -1750,8 +1786,10 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
 
     // The UV tile outlines (numbered for UDIM sets) and the path being edited
     let painter = ui.painter_at(rect);
-    let set = app.session.doc.project.texture_sets.get(ts);
-    let outline = |tile: Rect| painter.rect_stroke(tile, 0.0, Stroke::new(1.0, Color32::from_white_alpha(UV_TILE_OUTLINE_ALPHA)), egui::StrokeKind::Outside);
+    let set = app.session.doc.project.texture_sets.get(texture_set_index);
+    let outline = |tile: Rect| {
+        painter.rect_stroke(tile, 0.0, Stroke::new(UV_TILE_OUTLINE_WIDTH, Color32::from_white_alpha(UV_TILE_OUTLINE_ALPHA)), egui::StrokeKind::Outside)
+    };
     match set.and_then(|texture_set| Some((texture_set, texture_set.tile_grid()?))) {
         Some((texture_set, grid)) => {
             for (udim, (block_x, block_y)) in texture_set.uv_tiles.iter().filter_map(|udim| Some((*udim, grid.block(*udim)?))) {
@@ -1761,10 +1799,10 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
                 let tile = Rect::from_two_pos(to_screen(u0, v0), to_screen(u0 + tile_scale / grid.cols as f32, v0 + tile_scale / grid.rows as f32));
                 outline(tile);
                 painter.text(
-                    tile.left_top() + vec2(6.0, 4.0),
+                    tile.left_top() + UV_TILE_LABEL_OFFSET,
                     egui::Align2::LEFT_TOP,
                     udim.to_string(),
-                    egui::FontId::proportional(11.0),
+                    egui::FontId::proportional(UV_TILE_LABEL_SIZE),
                     tokens.viewport_text,
                 );
             }
@@ -1773,7 +1811,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             outline(Rect::from_two_pos(to_screen(0.0, 0.0), to_screen(1.0, 1.0)));
         }
     }
-    if app.ui.mode == crate::state::Mode::Painting && path_tool {
+    if tool_acts(app) && path_tool {
         path_overlay(app, ui, rect, &response, true, show);
     }
 
@@ -1792,15 +1830,16 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         bake_paint_overlay(app, ui, &painter, to_screen(0.0, 1.0), to_screen(1.0, 0.0));
         if bake_paint_on && let Some(hover) = response.hover_pos() {
             let radius = (to_screen(app.ui.bake_paint_brush.radius, 0.0).x - to_screen(0.0, 0.0).x).abs().max(BAKE_PAINT_CURSOR_MIN_RADIUS);
-            painter.circle_stroke(hover, radius, Stroke::new(1.0, Color32::from_white_alpha(200)));
+            painter.circle_stroke(hover, radius, Stroke::new(BAKE_PAINT_CURSOR_STROKE, Color32::from_white_alpha(BAKE_PAINT_CURSOR_ALPHA)));
         }
     }
 
     brush_readout(app, ui, &response, adjusting);
     view_header(app, ui, rect, "v2d");
     axis_gizmo(ui, rect, app, true);
-    let name = app.session.doc.project.texture_sets.get(ts).map(|texture_set| texture_set.name.clone()).unwrap_or_default();
-    ui.painter().text(rect.right_bottom() + vec2(-10.0, -10.0), egui::Align2::RIGHT_BOTTOM, name, egui::FontId::proportional(11.0), tokens.viewport_text);
+    let name = app.session.doc.project.texture_sets.get(texture_set_index).map(|texture_set| texture_set.name.clone()).unwrap_or_default();
+    let name_position = rect.right_bottom() - SET_NAME_INSET;
+    ui.painter().text(name_position, egui::Align2::RIGHT_BOTTOM, name, egui::FontId::proportional(SET_NAME_TEXT_SIZE), tokens.viewport_text);
 }
 
 /// Paint in the 2D view: a press starts a stroke, a drag continues it, Shift+click draws a line from the last stroke.

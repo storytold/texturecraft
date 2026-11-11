@@ -1,5 +1,5 @@
 //! Interactive painting on the session: strokes (begin / continue / end / cancel), polygon fill
-//! and the color picker. The UI, CLI and agents all go through these.
+//! and the material picker. The UI, CLI and agents all go through these.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -555,20 +555,22 @@ impl Session {
         Ok(())
     }
 
-    /// Color picker: copy the material under the cursor into the tool's paint values.
+    /// Material picker: copy the material under the cursor into the tool's paint values
     pub fn color_pick(&mut self, screen: Vec2, viewport: Vec2) -> Result<BTreeMap<Channel, [f32; 3]>> {
         let hit = self.pick(screen, viewport).ok_or_else(|| EngineError::Other("nothing under the cursor".into()))?;
-        let ts = self.texture_set_of_material(hit.material).unwrap_or(self.ts());
-        let cache = self.caches.get(ts).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
-        let (w, h) = (cache.size.0 as f32, cache.size.1 as f32);
-        let (x, y) = ((hit.uv.x * w).clamp(0.0, w - 1.0) as u32, (hit.uv.y * h).clamp(0.0, h - 1.0) as u32);
-        let mut out = BTreeMap::new();
-        for c in cache.composite.channels.keys() {
-            let v = cache.composite.value(*c, x, y);
-            self.tool.values.insert(*c, v);
-            out.insert(*c, v);
+        let texture_set = self.texture_set_of_material(hit.material).unwrap_or(self.ts());
+        let cache = self.caches.get(texture_set).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
+
+        let (width, height) = (cache.size.0 as f32, cache.size.1 as f32);
+        let (x, y) = ((hit.uv.x * width).clamp(0.0, width - 1.0) as u32, (hit.uv.y * height).clamp(0.0, height - 1.0) as u32);
+
+        let mut picked = BTreeMap::new();
+        for channel in cache.composite.channels.keys() {
+            let value = cache.composite.value(*channel, x, y);
+            self.tool.values.insert(*channel, value);
+            picked.insert(*channel, value);
         }
-        Ok(out)
+        Ok(picked)
     }
 
     /// The stroke canvas alpha of the active stroke (for overlays and tests).

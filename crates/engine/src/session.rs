@@ -109,7 +109,7 @@ impl Tool {
             Tool::PolygonFill => "Polygon fill",
             Tool::Smudge => "Smudge",
             Tool::Clone => "Clone",
-            Tool::ColorPicker => "Color picker",
+            Tool::ColorPicker => "Material picker",
             Tool::Path => "Path",
             Tool::GeometryMask => "Geometry mask",
         }

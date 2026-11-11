@@ -34,6 +34,7 @@ mod shortcut_keys;
 mod skew_paint;
 mod split_divider;
 mod start_window;
+mod tool_availability;
 mod toolbar;
 
 mod symmetry;
