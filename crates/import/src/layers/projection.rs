@@ -52,6 +52,12 @@ fn uv_placement(t: &UvTransform) -> ([f32; 2], f32, [f32; 2]) {
 }
 
 /// `volume_unit`: [`super::SetInput::volume_unit`].
+/// The file's fill filtering 0 (bilinear): the fill's graph is read at one point per texel, not prefiltered (2, the
+/// default, smooth, prefilters a minified image).
+pub fn bilinear(fill: &FillEffect) -> bool {
+    fill.filtering == 0
+}
+
 pub fn map(fill: &FillEffect, volume_unit: f32) -> MappedProjection {
     let identity = Projection::default();
     let uv = fill.uv_transform.filter(|t| !t.is_identity());
@@ -124,6 +130,12 @@ mod tests {
 
     fn fill(projection: u64, uv: Option<UvTransform>) -> FillEffect {
         FillEffect { header: EffectHeader::default(), sources: Vec::new(), projection, filtering: 2, uv_transform: uv, placement: FillPlacement::default() }
+    }
+
+    #[test]
+    fn only_bilinear_filtering_reads_graphs_unfiltered() {
+        assert!(!bilinear(&fill(0, None)), "smooth, the default");
+        assert!(bilinear(&FillEffect { filtering: 0, ..fill(0, None) }));
     }
 
     #[test]

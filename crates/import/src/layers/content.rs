@@ -578,8 +578,11 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
             match graph_uses::fill_sources(self.input, self.anchors, p, &channels) {
                 Ok(fg) => {
                     // a channel the graph has no output for is not written; each is laid on with its own blending
-                    for (c, source) in fg.sources {
+                    for (c, mut source) in fg.sources {
                         let Some((_, blend)) = blends.iter().find(|(b, _)| *b == c) else { continue };
+                        if let Source::Graph(g) = &mut source {
+                            g.unfiltered = projection::bilinear(fill);
+                        }
                         let mut status = blend.status();
                         status.and(&mapped.status);
                         status.and(&fg.status);

@@ -1627,7 +1627,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     }
 
     /// Output `output` of a cook sampled through `projection`, as the graph holds it (RGBA); None without it
-    fn graph_sample(&mut self, cooked: Option<&Cooked>, output: Option<&str>, projection: &Projection) -> Option<[f32; 4]> {
+    fn graph_sample(&mut self, cooked: Option<&Cooked>, output: Option<&str>, projection: &Projection, unfiltered: bool) -> Option<[f32; 4]> {
         let image = cooked?.output(output)?;
         // Laid on 1:1: the very texel (the render covers the texture set; interpolated mesh UVs would blur it at island
         // edges and seams)
@@ -1635,7 +1635,7 @@ impl<'a, 'b> Texel<'a, 'b> {
             return Some(graphs::at_texel(image, self.x, self.y, (self.inp.gbuf.width, self.inp.gbuf.height)));
         }
         let (coords, projection, _) = self.projected(projection);
-        let footprint = self.footprint(projection);
+        let footprint = if unfiltered { 0.0 } else { self.footprint(projection) };
         let cooked = cooked?;
         let mut sum = [0.0f32; 4];
         for (uv, weight) in image_samples(projection, &coords).into_iter().filter(|(_, weight)| *weight > 0.0) {
@@ -1679,7 +1679,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     fn source_alpha(&mut self, source: Option<&Source>, cooked: Option<&Cooked>, projection: &Projection) -> f32 {
         match source {
             Some(Source::Graph(graph)) if graph.alpha_output.is_some() => self
-                .graph_sample(cooked, graph.alpha_output.as_deref(), projection)
+                .graph_sample(cooked, graph.alpha_output.as_deref(), projection, graph.unfiltered)
                 .map_or(1.0, |alpha| if alpha[0].is_finite() { alpha[0].clamp(0.0, 1.0) } else { 0.0 }),
             _ => 1.0,
         }
@@ -1707,7 +1707,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// The value `source` gives this texel through `projection`, read as a channel of `kind` (`cooked` holds a graph source's outputs)
     fn source(&mut self, source: &Source, projection: &Projection, kind: ChannelKind, cooked: Option<&Cooked>) -> [f32; 3] {
         match source {
-            Source::Graph(graph) => match self.graph_sample(cooked, graph.output.as_deref(), projection) {
+            Source::Graph(graph) => match self.graph_sample(cooked, graph.output.as_deref(), projection, graph.unfiltered) {
                 Some(value) => graphs::graph_to_channel(kind, value, cooked.is_some_and(|c| c.is_linear(graph.output.as_deref()))),
                 // Not rendered (the reason is in the graph store's problems)
                 None => [0.5; 3],
@@ -1883,7 +1883,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                 // A graph reading the stack comes precomputed through `MaskPlan::start`; one that could not be rendered
                 // changes nothing
                 EffectKind::Graph { graph, projection } => {
-                    if let Some(v) = self.graph_sample(effect.graph.as_deref(), graph.output.as_deref(), projection) {
+                    if let Some(v) = self.graph_sample(effect.graph.as_deref(), graph.output.as_deref(), projection, graph.unfiltered) {
                         value += (blend1(effect.blend, value, v[0]) - value) * opacity;
                     }
                 }
@@ -2206,11 +2206,11 @@ impl<'a, 'b> Texel<'a, 'b> {
             EffectKind::Graph { graph, projection } => match Channel::ALL.get(c.ch).and_then(|ch| Some((*ch, graph.output_for(*ch)?))) {
                 Some((ch, output)) => {
                     let cooked = e.graph.as_deref();
-                    match self.graph_sample(cooked, output, projection) {
+                    match self.graph_sample(cooked, output, projection, graph.unfiltered) {
                         Some(g) => {
                             let p = graphs::graph_to_channel(ch.kind(), g, cooked.is_some_and(|k| k.is_linear(output)));
                             let alpha = match graph.output_alphas.get(&ch).map(String::as_str).or(graph.alpha_output.as_deref()) {
-                                Some(a) => self.graph_sample(cooked, Some(a), projection).map_or(1.0, |a| a[0].clamp(0.0, 1.0)),
+                                Some(a) => self.graph_sample(cooked, Some(a), projection, graph.unfiltered).map_or(1.0, |a| a[0].clamp(0.0, 1.0)),
                                 None => 1.0,
                             };
                             over(c, e.blend, v, cov, p, o * alpha)
@@ -3075,6 +3075,30 @@ mod tests {
         // next to the island's border the blur reads the island's value beyond it, not empty texels
         let r = out.value(Channel::Roughness, 30, 20)[0];
         assert!((r - 0.6).abs() < 2e-3, "{r}");
+    }
+
+    #[test]
+    fn minified_graph_fills_average_unless_unfiltered() {
+        // white on the left half of the image, black on the right
+        let halves = "format 3\nsize 64\nsubgraph c\nmeta kind \"function\"\nnode 2 f_pos\nnode 3 f_swizzle a=@2 mask=\"x\"\nnode 4 f_float v=0.5\nnode 5 f_lt a=@3 b=@4\nnode 1 f_out in=@5\nend\nnode 1 pixel_processor fn=\"c\"\noutput out 1\n";
+        let mut graphs = GraphStore::default();
+        let key = graphs.add_text(halves);
+        let roughness = |unfiltered: bool| {
+            let mut f = fixture();
+            let id = fill_layer(&mut f.project, [0.0; 3], 0.0);
+            let mut g = GraphRef::new(key.clone(), "halves");
+            g.unfiltered = unfiltered;
+            if let Some(LayerKind::Fill(fill)) = f.project.layers.get_mut(&id).map(|l| &mut l.kind) {
+                fill.sources.insert(Channel::Roughness, Source::Graph(Box::new(g)));
+                // the image once per texel, each texel's centre on the black half
+                fill.projection = Projection::Uv { scale: [64.0, 64.0], rotation: 0.0, offset: [0.25, 0.0] };
+            }
+            run_with(&f, &graphs).value(Channel::Roughness, 10, 10)[0]
+        };
+        let filtered = roughness(false);
+        assert!((filtered - 0.5).abs() < 0.02, "a texel spanning the whole image reads its mean: {filtered}");
+        let unfiltered = roughness(true);
+        assert!(unfiltered < 0.02, "bilinear at the texel's centre: {unfiltered}");
     }
 
     #[test]

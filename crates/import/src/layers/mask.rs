@@ -378,7 +378,10 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
             }
             ProjectSource::Bitmap(b) => self.bitmap(fill, b, counts, on, mapped),
             ProjectSource::Procedural(p) => {
-                let g = graph_uses::mask_generator(self.input, self.anchors, p, projection);
+                let mut g = graph_uses::mask_generator(self.input, self.anchors, p, projection);
+                if let EffectKind::Graph { graph, .. } = &mut g.effect {
+                    graph.unfiltered = projection::bilinear(fill);
+                }
                 if g.status.is_computable() {
                     self.note(counts, &mapped.status);
                 }

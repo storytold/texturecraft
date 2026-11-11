@@ -120,6 +120,10 @@ pub struct GraphRef {
     /// Added to the graph's random seed.
     #[serde(default)]
     pub seed: u32,
+    /// Read through a projection at one point per texel (bilinear) even where its output is minified, not prefiltered
+    /// through mip levels: a fill set to bilinear filtering.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unfiltered: bool,
 }
 
 impl GraphRef {
@@ -137,6 +141,7 @@ impl GraphRef {
             colour_outputs: BTreeSet::new(),
             keep: BTreeSet::new(),
             seed: 0,
+            unfiltered: false,
         }
     }
 
