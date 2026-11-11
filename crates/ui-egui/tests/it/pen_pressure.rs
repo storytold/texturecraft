@@ -95,3 +95,20 @@ fn frames_omitting_touch_events_during_stroke_do_not_spike_pressure() {
     let mouse = stroke(None);
     assert!(intermittent > 0.0 && intermittent < mouse * 0.5, "intermittent frames without touch keep light pressure: {intermittent} vs {mouse}");
 }
+
+#[test]
+fn mouse_stroke_immediately_after_pen_release_uses_full_pressure() {
+    let to = pos2(800.0, 500.0);
+    let baseline = stroke(None);
+    let immediate_mouse = paint_2d(|h| {
+        let tap_pos = pos2(600.0, 680.0);
+        frame(h, Some((TouchPhase::Start, Some(0.2))), tap_pos, Some(true));
+        frame(h, Some((TouchPhase::End, None)), tap_pos, Some(false));
+        frame(h, None, FROM, Some(true));
+        for k in 1..=8 {
+            frame(h, None, FROM + (to - FROM) * (k as f32 / 8.0), None);
+        }
+        frame(h, None, to, Some(false));
+    });
+    assert!(immediate_mouse > baseline * 0.9, "mouse stroke after pen release keeps full pressure: {immediate_mouse} vs {baseline}");
+}
