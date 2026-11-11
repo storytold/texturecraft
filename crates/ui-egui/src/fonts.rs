@@ -384,4 +384,52 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn thai_fallback_font_renders_sample_glyphs_when_available() {
+        let defs = crate::theme::font_definitions();
+        if !defs.font_data.contains_key("thai-fallback") {
+            return;
+        }
+        let sample = "สวัสดี น้ำ บุญฤทธิ์";
+        let mut without_thai = defs.clone();
+        without_thai.font_data.remove("thai-fallback");
+        for list in without_thai.families.values_mut() {
+            list.retain(|name| name != "thai-fallback");
+        }
+
+        let ctx_with = egui::Context::default();
+        ctx_with.set_fonts(defs);
+        let mut with_uvs = Vec::new();
+        let mut with_bounds = egui::Rect::NOTHING;
+        let mut thai_asc = 0.0;
+        let mut latin_asc = 0.0;
+        let out = ctx_with.run_ui(egui::RawInput::default(), |ui| {
+            let thai = ui.painter().layout_no_wrap(sample.into(), egui::FontId::proportional(13.0), egui::Color32::WHITE);
+            let latin = ui.painter().layout_no_wrap("ABC".into(), egui::FontId::proportional(13.0), egui::Color32::WHITE);
+            with_uvs.extend(thai.rows[0].glyphs.iter().filter(|g| !g.chr.is_whitespace() && !g.uv_rect.is_nothing()).map(|g| g.uv_rect.min));
+            with_bounds = thai.mesh_bounds;
+            thai_asc = thai.rows[0].glyphs[0].font_ascent;
+            latin_asc = latin.rows[0].glyphs[0].font_ascent;
+        });
+        out.drop_without_applying_deltas();
+
+        let ctx_without = egui::Context::default();
+        ctx_without.set_fonts(without_thai);
+        let mut without_uvs = Vec::new();
+        let out = ctx_without.run_ui(egui::RawInput::default(), |ui| {
+            let thai = ui.painter().layout_no_wrap(sample.into(), egui::FontId::proportional(13.0), egui::Color32::WHITE);
+            without_uvs.extend(thai.rows[0].glyphs.iter().filter(|g| !g.chr.is_whitespace() && !g.uv_rect.is_nothing()).map(|g| g.uv_rect.min));
+        });
+        out.drop_without_applying_deltas();
+
+        assert!(with_bounds.width() > 0.0 && with_bounds.height() > 0.0);
+        assert!(with_uvs.len() >= 10, "expected rendered Thai glyphs, got {}", with_uvs.len());
+        let mut unique = with_uvs.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert!(unique.len() >= 8, "expected distinct Thai glyphs and combining marks, got {}", unique.len());
+        assert_ne!(with_uvs, without_uvs, "Thai fallback should resolve real glyphs rather than missing-glyph boxes");
+        assert!((thai_asc - latin_asc).abs() < 1e-3, "Thai ascent {thai_asc} should align with Latin {latin_asc}");
+    }
 }
