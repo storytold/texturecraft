@@ -349,6 +349,7 @@ impl Session {
 
         let settings = &active.stroke.settings;
         let radius = settings.uv_stamp_radius(pressure);
+        let flow = settings.flow * texturecraft_paint::pressure_scale(settings.min_flow, pressure.clamp(0.0, 1.0));
         let step = (settings.spacing * 2.0 * radius).max(MIN_UV_STAMP_STEP);
 
         // Follow path: turn the stamp with the stroke direction (y up on screen, v grows down)
@@ -373,7 +374,7 @@ impl Session {
             while distance <= length && batch.len() < batch_size {
                 let center = start + segment * (distance / length.max(f32::MIN_POSITIVE));
                 let seed = progress.stamps.wrapping_add((stamped + batch.len()) as u32);
-                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow: settings.flow, hardness: settings.hardness, seed });
+                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow, hardness: settings.hardness, seed });
                 distance += step;
             }
 

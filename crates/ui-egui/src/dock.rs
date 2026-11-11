@@ -1474,7 +1474,7 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.label(RichText::new(hint).size(HINT_TEXT_SIZE).color(Tokens::get(ui.ctx()).text_dim));
 
     // Each section's reset puts back only the fields it shows
-    let size_fields = |settings: &BrushSettings| (settings.size, settings.min_size, settings.screen_space);
+    let size_fields = |settings: &BrushSettings| (settings.size, settings.min_size, settings.min_flow, settings.screen_space);
     if section_with_reset(ui, "sec_size", tr("Size"), true, size_fields(brush) == size_fields(&defaults), |ui| {
         let mut size_percent = brush.size / MAX_BRUSH_SIZE * 100.0;
         if slider(ui, tr("Size"), &mut size_percent, 0.05..=100.0, 1).changed() {
@@ -1486,9 +1486,14 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
             brush.min_size = min_size_percent / 100.0;
         }
 
+        let mut min_flow_percent = brush.min_flow * 100.0;
+        if slider(ui, tr("Minimum flow (%)"), &mut min_flow_percent, 0.0..=100.0, 0).changed() {
+            brush.min_flow = min_flow_percent / 100.0;
+        }
+
         ui.checkbox(&mut brush.screen_space, tr("Size in screen space"));
     }) {
-        (brush.size, brush.min_size, brush.screen_space) = size_fields(&defaults);
+        (brush.size, brush.min_size, brush.min_flow, brush.screen_space) = size_fields(&defaults);
     }
 
     let flow_fields = |settings: &BrushSettings| (settings.flow, settings.opacity, settings.spacing, settings.hardness);

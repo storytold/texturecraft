@@ -5,7 +5,7 @@ use texturecraft_geom::glam::{Mat3, Quat, Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, surface_at};
 use texturecraft_texel::noise::pcg3d;
 
-use crate::brush::{Alignment, BrushSettings};
+use crate::brush::{Alignment, BrushSettings, pressure_scale};
 use crate::stamp_source::StampSource;
 
 /// Scene access for picking.
@@ -126,9 +126,7 @@ impl Stroke {
     }
 
     fn radius_at(&self, ctx: &PickCtx, pos: Vec3, pressure: f32) -> f32 {
-        let p = pressure.clamp(0.0, 1.0);
-        let scale = self.settings.min_size + (1.0 - self.settings.min_size) * p;
-        let r = self.radius * if pressure < 1.0 { scale } else { 1.0 };
+        let r = self.radius * pressure_scale(self.settings.min_size, pressure);
         if self.settings.screen_space { r * (pos.distance(ctx.camera.eye()) / ctx.camera.distance.max(1e-4)) } else { r }
     }
 
@@ -139,7 +137,7 @@ impl Stroke {
         };
         let radius = self.radius_at(ctx, hit.pos, pressure);
         let Some(last) = self.last else {
-            out.push(self.stamp(ctx, &hit, radius));
+            out.push(self.stamp(ctx, &hit, radius, pressure));
             self.last = Some(hit);
             self.dist = 0.0;
             return;
@@ -174,7 +172,7 @@ impl Stroke {
                 .and_then(|s| pick(ctx, s))
                 .filter(|h| h.pos.distance(p) < radius * 2.0);
             let h = snapped.unwrap_or(SurfaceHit { pos: p, ..hit });
-            out.push(self.stamp(ctx, &h, radius));
+            out.push(self.stamp(ctx, &h, radius, pressure));
             emitted += 1;
             t += step;
         }
@@ -183,7 +181,7 @@ impl Stroke {
     }
 
     /// The next stamp at `hit`: oriented to the surface or the camera, then jittered
-    fn stamp(&mut self, ctx: &PickCtx, hit: &SurfaceHit, radius: f32) -> Stamp {
+    fn stamp(&mut self, ctx: &PickCtx, hit: &SurfaceHit, radius: f32, pressure: f32) -> Stamp {
         let settings = &self.settings;
         let seed = self.count;
         self.count = self.count.wrapping_add(1);
@@ -210,7 +208,7 @@ impl Stroke {
         let bitangent = normal.cross(tangent);
         let jittered_radius = radius * (1.0 + jitter(JITTER_SIZE, settings.jitter_size)).max(MIN_JITTERED_SIZE);
         let offset = (tangent * jitter(JITTER_ACROSS, 1.0) + bitangent * jitter(JITTER_ALONG, 1.0)) * settings.jitter_position * radius;
-        let flow = (settings.flow * (1.0 - jitter(JITTER_FLOW, settings.jitter_flow).abs())).clamp(0.0, 1.0);
+        let flow = (settings.flow * pressure_scale(settings.min_flow, pressure) * (1.0 - jitter(JITTER_FLOW, settings.jitter_flow).abs())).clamp(0.0, 1.0);
 
         Stamp {
             center: hit.pos + offset,
@@ -407,5 +405,19 @@ mod tests {
         st.symmetry = crate::brush::Symmetry { radial: 200, axis: 9, ..st.symmetry };
         let clean = st.sanitized().symmetry;
         assert_eq!((clean.radial, clean.axis), (32, 2));
+    }
+
+    #[test]
+    fn pen_pressure_lowers_the_flow_only_when_asked() {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let flow = |min_flow: f32, pressure: f32| {
+            let mut s = Stroke::new(&BrushSettings { min_flow, flow: 0.8, ..BrushSettings::default() }, &m);
+            s.add(&ctx, Vec2::new(200.0, 200.0), pressure)[0].flow
+        };
+        assert_eq!(flow(1.0, 0.0), 0.8, "by default pressure leaves the flow alone");
+        assert!((flow(0.25, 0.0) - 0.2).abs() < 1e-6);
+        assert!((flow(0.25, 0.5) - 0.5).abs() < 1e-6);
+        assert_eq!(flow(0.25, 1.0), 0.8);
     }
 }

@@ -125,6 +125,11 @@ pub fn image_alpha(img: &ImageRes, lx: f32, ly: f32) -> f32 {
     ((0.2126 * r + 0.7152 * g + 0.0722 * b) * a).clamp(0.0, 1.0)
 }
 
+/// The share of a pressure-scaled value (size, flow) at pen `pressure`: `minimum` at 0, linear up to all of it at 1.
+pub fn pressure_scale(minimum: f32, pressure: f32) -> f32 {
+    if pressure < 1.0 { minimum + (1.0 - minimum) * pressure.clamp(0.0, 1.0) } else { 1.0 }
+}
+
 pub(crate) fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0).max(1e-6)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -162,6 +167,10 @@ fn enabled_by_default() -> bool {
 
 fn radial_axis() -> u8 {
     1
+}
+
+fn full_flow() -> f32 {
+    1.0
 }
 
 fn full_turn() -> f32 {
@@ -283,6 +292,9 @@ pub struct BrushSettings {
     pub size: f32,
     /// Pen pressure may shrink the size down to this fraction.
     pub min_size: f32,
+    /// Pen pressure may lower the flow down to this fraction (1: pressure leaves the flow alone).
+    #[serde(default = "full_flow")]
+    pub min_flow: f32,
     /// Per-stamp alpha 0..1.
     pub flow: f32,
     /// Caps a whole stroke 0..1.
@@ -327,6 +339,7 @@ impl Default for BrushSettings {
         BrushSettings {
             size: 0.02,
             min_size: 0.05,
+            min_flow: full_flow(),
             flow: 1.0,
             opacity: 1.0,
             spacing: 0.1,
@@ -367,6 +380,7 @@ impl BrushSettings {
         BrushSettings {
             size: clamp_finite(self.size, 0.0005, 0.5, 0.02),
             min_size: clamp_finite(self.min_size, 0.0, 1.0, 0.05),
+            min_flow: clamp_finite(self.min_flow, 0.0, 1.0, 1.0),
             flow: clamp_finite(self.flow, 0.0, 1.0, 1.0),
             opacity: clamp_finite(self.opacity, 0.0, 1.0, 1.0),
             spacing: clamp_finite(self.spacing, 0.01, 10.0, 0.1),
