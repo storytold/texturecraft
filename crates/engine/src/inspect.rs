@@ -86,6 +86,9 @@ fn effect_json(session: &Session, effect: &Effect, content: bool) -> Value {
     let mut out = json!({ "id": effect.id.0, "name": effect.name, "kind": effect.kind.name(), "visible": effect.visible, "blend": effect.blend.label(), "opacity": effect.opacity });
     let mask_tiles = || session.doc.pixels.masks.get(&effect.id).map_or(0, |image| image.allocated_count());
     let content_tiles = || session.doc.pixels.layers.iter().filter(|((id, _), _)| *id == effect.id).map(|(_, image)| image.allocated_count()).sum::<usize>();
+    if content && !effect.channels.is_empty() {
+        out["channels"] = json!(effect.channels.iter().map(|c| c.id()).collect::<Vec<_>>());
+    }
 
     match &effect.kind {
         EffectKind::Generator(generator) => out["generator"] = generator_json(generator),

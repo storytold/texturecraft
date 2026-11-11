@@ -1119,12 +1119,21 @@ pub struct Effect {
     pub kind: EffectKind,
     pub blend: BlendMode,
     pub opacity: f32,
+    /// A content effect that acts on these channels only and leaves the others as they are; empty: every channel.
+    /// Mask effects ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<Channel>,
 }
 
 impl Effect {
     pub fn new(id: LayerId, kind: EffectKind) -> Effect {
         // Generators and fills that build a mask usually add on top of the background.
-        Effect { id, name: kind.name().to_string(), visible: true, kind, blend: BlendMode::Normal, opacity: 1.0 }
+        Effect { id, name: kind.name().to_string(), visible: true, kind, blend: BlendMode::Normal, opacity: 1.0, channels: Vec::new() }
+    }
+
+    /// Whether the effect acts on content channel `channel`.
+    pub fn acts_on(&self, channel: Channel) -> bool {
+        self.channels.is_empty() || self.channels.contains(&channel)
     }
 
     /// A [`EffectKind::Placeholder`] named after what it stands for.

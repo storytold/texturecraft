@@ -235,6 +235,8 @@ struct EffectPlan<'a> {
     curvature_sizes: Option<Arc<CurvatureSizes>>,
     /// The cook of a graph effect, or of a fill effect's graph source on the channel planned.
     graph: Option<Arc<Cooked>>,
+    /// The effect acts on the content channel planned ([`Effect::channels`]); always true in a mask.
+    acts: bool,
 }
 
 struct MaskPlan<'a> {
@@ -1248,6 +1250,7 @@ fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tile_x: u32, tile_y
                 preview: previews(inp, target),
                 curvature_sizes,
                 graph,
+                acts: channel.is_none_or(|c| effect.acts_on(c)),
             }
         })
         .collect()
@@ -2097,6 +2100,9 @@ impl<'a, 'b> Texel<'a, 'b> {
 
     /// Apply one content effect to a channel's straight value and coverage.
     fn content_effect(&mut self, e: &EffectPlan, c: &ChanPlan, v: [f32; 3], cov: f32) -> ([f32; 3], f32) {
+        if !e.acts {
+            return (v, cov);
+        }
         let o = e.opacity.clamp(0.0, 1.0);
         match e.kind {
             EffectKind::Paint | EffectKind::Path(_) => {
@@ -2792,7 +2798,7 @@ pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use texturecraft_core::{ChannelBlend, Effect, Layer, Procedural, ProceduralKind, TextureSet};
+    use texturecraft_core::{ChannelBlend, Effect, Layer, Levels, Procedural, ProceduralKind, TextureSet};
     use texturecraft_geom::primitives;
 
     struct Fixture {
@@ -3408,6 +3414,21 @@ soft {soft:?}"
         let eid = f.project.alloc_id();
         f.project.layer_mut(id).unwrap().content_effects.push(Effect::new(eid, kind));
         eid
+    }
+
+    #[test]
+    fn content_effects_limited_to_channels_leave_the_others() {
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.2, 0.4, 0.6], 0.2);
+        let fx = content_fx(&mut f, id, EffectKind::Levels(Levels { out_low: 1.0, out_high: 0.0, ..Levels::default() }));
+        let out = run(&f, None);
+        assert!(close(out.value(Channel::Roughness, 5, 5), [0.8; 3]), "on every channel by default");
+        assert!(close(out.value(Channel::BaseColor, 5, 5), [0.8, 0.6, 0.4]));
+        let e = f.project.layer_mut(id).unwrap().content_effects.iter_mut().find(|e| e.id == fx).unwrap();
+        e.channels = vec![Channel::BaseColor];
+        let out = run(&f, None);
+        assert!(close(out.value(Channel::BaseColor, 5, 5), [0.8, 0.6, 0.4]));
+        assert!(close(out.value(Channel::Roughness, 5, 5), [0.2; 3]), "a channel the effect does not list is left as it is");
     }
 
     #[test]

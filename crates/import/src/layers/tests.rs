@@ -659,3 +659,23 @@ fn a_fill_layer_whose_filter_writes_channels_the_fill_does_not_hold_lays_its_fil
     let stack = build(vec![l]);
     assert!(matches!(by_name(&stack, "Own").kind, LayerKind::Fill(_)));
 }
+
+#[test]
+fn levels_act_on_the_channels_they_list_only() {
+    let invert =
+        ProjectLevels { input_minimum: [0.0; 3], input_maximum: [1.0; 3], gamma: [1.0; 3], output_minimum: [1.0; 3], output_maximum: [0.0; 3], clamp: 1 };
+    let levels = ProjectEffect::Levels(LevelsEffect { header: header(3, ROUGH, vec![]), levels: Some(invert.clone()) });
+    let base = fill(2, ROUGH | BASE, vec![uniform(ROUGH, [0.2; 3]), uniform(BASE, [0.2; 3])], vec![]);
+    let stack = build(vec![layer(1, "L", ProjectLayerKind::Fill, vec![base, levels])]);
+    let ours = by_name(&stack, "L");
+    let lv = ours.content_effects.iter().find(|e| matches!(e.kind, EffectKind::Levels(_))).unwrap();
+    assert_eq!(lv.channels, [Channel::Roughness], "base colour is left as it is");
+    assert!(lv.visible);
+    assert!(stack.verdict.all_exact(), "{:?}", stack.verdict.channels);
+    // levels on a channel the set does not hold (64: glossiness) change nothing
+    let gloss = ProjectEffect::Levels(LevelsEffect { header: header(3, 64, vec![]), levels: Some(invert) });
+    let base = fill(2, ROUGH | BASE, vec![uniform(ROUGH, [0.2; 3]), uniform(BASE, [0.2; 3])], vec![]);
+    let stack = build(vec![layer(1, "L", ProjectLayerKind::Fill, vec![base, gloss])]);
+    let lv = by_name(&stack, "L").content_effects.iter().find(|e| matches!(e.kind, EffectKind::Levels(_))).unwrap();
+    assert!(!lv.visible, "switched off");
+}

@@ -465,7 +465,12 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                 status.and(&Status::approximated("levels with a blend mode other than normal"));
             }
         }
-        status.and(&self.subset_status(&channels));
+        // the reference app's levels act on the channels they list only; the others are left as they are. Levels listing
+        // none of the set's channels (glossiness only) change nothing: kept, switched off
+        e.channels.clone_from(&channels);
+        if channels.is_empty() {
+            e.visible = false;
+        }
         self.effects.push(e);
         if on {
             for c in channels {
