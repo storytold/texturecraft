@@ -221,10 +221,17 @@ pub fn image_samples(proj: &Projection, c: &Coords) -> [(Vec2, f32); 3] {
             one(uv)
         }
         Projection::Triplanar { scale, sharpness, offset } => {
-            let p = c.pos * *scale + Vec3::from(*offset);
+            // each plane as seen from the side the normal faces, so no face shows its image mirrored (as the reference
+            // app projects): the image's left-right turns with the side on x and z, its up-down with the side on y
+            let (l, o) = (c.pos * *scale, Vec3::from(*offset));
+            let side = |v: f32| if v < 0.0 { -1.0 } else { 1.0 };
             let w = c.nrm.abs().powf(sharpness.max(1.0));
             let w = w / (w.x + w.y + w.z).max(1e-6);
-            [(Vec2::new(p.z, -p.y), w.x), (Vec2::new(p.x, p.z), w.y), (Vec2::new(p.x, -p.y), w.z)]
+            [
+                (Vec2::new(o.z - l.z * side(c.nrm.x), -(l.y + o.y)), w.x),
+                (Vec2::new(l.x + o.x, o.z + l.z * side(c.nrm.y)), w.y),
+                (Vec2::new(o.x + l.x * side(c.nrm.z), -(l.y + o.y)), w.z),
+            ]
         }
         Projection::Planar { scale, axis, offset } => {
             let p = c.pos * *scale + Vec3::from(*offset);
@@ -335,6 +342,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tri_planar_faces_never_show_their_image_mirrored() {
+        let proj = Projection::Triplanar { scale: 1.0, sharpness: 64.0, offset: [0.5; 3] };
+        // the image coordinates of a point on a face, by its position and normal (the dominant plane only)
+        let at = |pos: Vec3, nrm: Vec3| {
+            let s = image_samples(&proj, &Coords { uv: Vec2::ZERO, pos, nrm });
+            s.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|(uv, _)| uv).unwrap()
+        };
+        // walking right as seen from outside each face moves right in the image (u grows), on both sides of each axis
+        let right = |nrm: Vec3, step: Vec3| at(step * 0.1, nrm).x - at(Vec3::ZERO, nrm).x;
+        for (nrm, step) in [(Vec3::Z, Vec3::X), (-Vec3::Z, -Vec3::X), (Vec3::X, -Vec3::Z), (-Vec3::X, Vec3::Z)] {
+            assert!((right(nrm, step) - 0.1).abs() < 1e-5, "{nrm}: {}", right(nrm, step));
+        }
+        // looking down at the top, +z is down the image; looking up at the bottom, +z is up
+        let down = |nrm: Vec3| at(Vec3::Z * 0.1, nrm).y - at(Vec3::ZERO, nrm).y;
+        assert!((down(Vec3::Y) - 0.1).abs() < 1e-5 && (down(-Vec3::Y) + 0.1).abs() < 1e-5);
+        // the centre of the scene is the image's centre
+        assert!((at(Vec3::ZERO, Vec3::Z) - Vec2::new(0.5, -0.5)).length() < 1e-5);
     }
 
     #[test]
