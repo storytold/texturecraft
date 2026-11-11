@@ -204,8 +204,9 @@ pub fn procedural(pr: &Procedural, proj: &Projection, c: &Coords) -> f32 {
             let u = b.atan2(a) / std::f32::consts::TAU + 0.5;
             raw(pr.kind, Vec3::new(u * 4.0, h, 0.0) * *scale * s, pr.seed)
         }
-        // `c.uv` is already in the decal's frame (see [`decal_uv`]).
-        Projection::Decal(_) => raw(pr.kind, (c.uv * s).extend(0.0), pr.seed),
+        // `c.uv` is already in the decal's frame (see [`decal_uv`]), or the image coordinate of a placed projection's tap
+        // (the compositor evaluates those per tap, see [`crate::placed`]).
+        Projection::Decal(_) | Projection::Placed(_) => raw(pr.kind, (c.uv * s).extend(0.0), pr.seed),
     };
     shape(pr, v)
 }
@@ -258,7 +259,8 @@ pub fn image_samples(proj: &Projection, c: &Coords) -> [(Vec2, f32); 3] {
             let u = b.atan2(a) / std::f32::consts::TAU + 0.5;
             one(Vec2::new(u, 0.5 - h * 0.5) * *scale)
         }
-        Projection::Decal(_) => one(c.uv),
+        // a placed projection's taps come from [`crate::placed::taps`]; `c.uv` here is one of them
+        Projection::Decal(_) | Projection::Placed(_) => one(c.uv),
     }
 }
 

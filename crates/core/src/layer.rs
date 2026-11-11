@@ -11,12 +11,14 @@ mod curvature_mode;
 mod geometry_mask;
 mod graph;
 mod lock;
+mod placed;
 
 pub use curvature_detail::CurvatureDetail;
 pub use curvature_mode::CurvatureMode;
 pub use geometry_mask::GeometryMask;
 pub use graph::{GraphInput, GraphRef, GraphValue, MAX_GRAPH_NESTING, StableHash, is_key, text_key};
 pub use lock::{IMPORT_LOCK_SOURCE, Lock, LockReason};
+pub use placed::{FacingFalloff, Falloff, ImagePlacement, PlacedMode, PlacedProjection, Repeat, Volume, WarpGrid, WarpPoint};
 
 /// Id of a layer or effect (one id space per project).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -175,6 +177,10 @@ pub enum Projection {
     /// A geometry decal: the image projected from a frame placed on the surface (outside the
     /// frame, behind it or beyond its depth the fill does not cover).
     Decal(Decal),
+    /// A projection with every placement setting spelled out (volume, image placement, repetition per axis) and the
+    /// sampling rules that go with them ([`PlacedProjection`]). TextureCraft's own fills use the projections above;
+    /// a project import writes this one for fills the others cannot hold.
+    Placed(Box<PlacedProjection>),
 }
 
 /// The frame a decal projects from (world space).
@@ -211,6 +217,14 @@ impl Projection {
             Projection::Spherical { .. } => "Spherical projection",
             Projection::Cylindrical { .. } => "Cylindrical projection",
             Projection::Decal(_) => "Decal projection",
+            Projection::Placed(p) => match p.mode {
+                PlacedMode::Uv { .. } => "UV projection",
+                PlacedMode::TriPlanar { .. } => "Tri-planar projection",
+                PlacedMode::Planar { .. } => "Planar projection",
+                PlacedMode::Spherical => "Spherical projection",
+                PlacedMode::Cylindrical { .. } => "Cylindrical projection",
+                PlacedMode::Warp { .. } => "Warp projection",
+            },
         }
     }
 }

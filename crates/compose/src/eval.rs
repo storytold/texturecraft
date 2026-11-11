@@ -11,8 +11,8 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use texturecraft_core::{
     BakedMap, BlendMode, BlockScales, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Fill, Filter, Generator,
-    GeneratorKind, GeometryMask, GraphInput, GraphRef, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source,
-    TextureSet, TileGrid, blend1, blend3, lum, mix3, per_unit,
+    GeneratorKind, GeometryMask, GraphInput, GraphRef, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, PlacedProjection, Project,
+    Projection, Source, TextureSet, TileGrid, blend1, blend3, lum, mix3, per_unit,
     rules::{BlendRules, mix_over},
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
@@ -23,6 +23,7 @@ use crate::below::{Band, BelowCache, Level};
 use crate::curvature_sizes::CurvatureSizes;
 use crate::graphs::{self, Cooked, GraphStore, GraphUse, RenderEnv};
 use crate::pattern::{Coords, decal_uv, image_samples, procedural, world_noise};
+use crate::placed::{self, Taps};
 use crate::store::{BakedMaps, ImageStore, PixelStore, decode};
 use texturecraft_graph::tex::Tex;
 
@@ -1522,6 +1523,8 @@ struct Texel<'a, 'b> {
     anchors: Vec<(LayerId, Acc)>,
     /// Where `eval` takes layer masks and content from.
     tape: Tape<'b>,
+    /// The taps of the placed projection last asked for at this texel, by its address.
+    placed: Option<(usize, Taps)>,
 }
 
 /// What a layer contributes (its mask, its content value and coverage per channel): evaluated
@@ -1554,7 +1557,7 @@ impl<'t> Tape<'t> {
 
 impl<'a, 'b> Texel<'a, 'b> {
     fn new(inp: &'b Inputs<'a>, x: u32, y: u32, o: usize, stroke: f32) -> Self {
-        Texel { inp, x, y, o, res: inp.gbuf.width, coords: None, stroke, stop: None, anchors: Vec::new(), tape: Tape::Off }
+        Texel { inp, x, y, o, res: inp.gbuf.width, coords: None, stroke, stop: None, anchors: Vec::new(), tape: Tape::Off, placed: None }
     }
 
     /// Run `f` with `tape` as this texel's tape.
@@ -1655,8 +1658,10 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// How much a fill projected by `proj` covers this texel: 1, or for a decal its frame
     /// coverage times the alpha of its first image source.
     fn cover<'s>(&mut self, mut sources: impl Iterator<Item = &'s Source>, proj: &Projection) -> f32 {
-        if !matches!(proj, Projection::Decal(_)) {
-            return 1.0;
+        match proj {
+            Projection::Decal(_) => {}
+            Projection::Placed(p) => return self.placed_cover(p),
+            _ => return 1.0,
         }
         let (c, _, w) = self.projected(proj);
         let image = sources.find_map(|s| match s {
@@ -1668,6 +1673,9 @@ impl<'a, 'b> Texel<'a, 'b> {
 
     /// Output `output` of a cook sampled through `projection`, as the graph holds it (RGBA); None without it
     fn graph_sample(&mut self, cooked: Option<&Cooked>, output: Option<&str>, projection: &Projection, unfiltered: bool) -> Option<[f32; 4]> {
+        if let Projection::Placed(p) = projection {
+            return self.placed_graph(cooked?, output, p, unfiltered);
+        }
         let image = cooked?.output(output)?;
         // Laid on 1:1: the very texel (the render covers the texture set; interpolated mesh UVs would blur it at island
         // edges and seams)
@@ -1695,6 +1703,7 @@ impl<'a, 'b> Texel<'a, 'b> {
             Projection::Uv { scale, .. } => return scale[0].abs().max(scale[1].abs()) / self.inp.tile_res().max(1) as f32,
             Projection::Triplanar { scale, .. } => *scale,
             Projection::Planar { scale, .. } => 0.5 * *scale,
+            // placed projections filter per tap (`placed_graph`)
             _ => return 0.0,
         };
         let g = self.inp.gbuf;
@@ -1715,6 +1724,102 @@ impl<'a, 'b> Texel<'a, 'b> {
         if f.is_finite() { f } else { 0.0 }
     }
 
+    /// Where placed projection `p` samples this texel (computed once per texel and projection).
+    fn placed_taps(&mut self, p: &PlacedProjection) -> Taps {
+        let key = std::ptr::from_ref(p) as usize;
+        if let Some((k, taps)) = self.placed
+            && k == key
+        {
+            return taps;
+        }
+        let taps = placed::taps(p, self.inp.bounds, &self.placed_point());
+        self.placed = Some((key, taps));
+        taps
+    }
+
+    /// What a placed projection needs of this texel: its UVs, surface point and normal, its two axes on the surface.
+    fn placed_point(&mut self) -> placed::Point {
+        let uv = self.coords().uv;
+        let texel_len = 1.0 / self.inp.tile_res().max(1) as f32;
+        let i = (self.y * self.inp.gbuf.width + self.x) as usize;
+        let Some(s) = self.inp.gbuf.surface(self.inp.mesh, i) else {
+            return placed::Point { uv, nrm: Vec3::Y, texel_len, ..placed::Point::default() };
+        };
+        let (axes, world_len) = self.texel_axes().unwrap_or(([Vec3::ZERO; 2], 0.0));
+        placed::Point { uv, pos: s.pos, nrm: s.nrm, axes, world_len, texel_len }
+    }
+
+    /// The world displacement of one texel step along x and along y on this texel's triangle (the surface's
+    /// derivatives over its UVs), and the texel's isotropic size there; None off the mesh or on a degenerate triangle.
+    fn texel_axes(&self) -> Option<([Vec3; 2], f32)> {
+        let g = self.inp.gbuf;
+        let m = self.inp.mesh;
+        let &t = g.tri.get((self.y * g.width + self.x) as usize)?;
+        let [a, b, c] = m.tri(t as usize)?;
+        let (pa, pb, pc) = (*m.positions.get(a)?, *m.positions.get(b)?, *m.positions.get(c)?);
+        let (ta, tb, tc) = (*m.uvs.get(a)?, *m.uvs.get(b)?, *m.uvs.get(c)?);
+        let (e1, e2, d1, d2) = (pb - pa, pc - pa, tb - ta, tc - ta);
+        let det = d1.x * d2.y - d2.x * d1.y;
+        if !det.is_finite() || det.abs() < 1e-14 {
+            return None;
+        }
+        let (w, h) = (g.width.max(1) as f32, g.height.max(1) as f32);
+        let du = (e1 * d2.y - e2 * d1.y) / det;
+        let dv = (e2 * d1.x - e1 * d2.x) / det;
+        let len = (e1.cross(e2).length() / det.abs()).sqrt() / w;
+        let axes = [du / w, dv / h];
+        (axes.iter().all(|a| a.is_finite()) && len.is_finite()).then_some((axes, len))
+    }
+
+    /// How much placed projection `p` covers this texel: its coverage (clip, falloffs) times the share of its taps on
+    /// the image (a tap outside a non-repeating image covers nothing).
+    fn placed_cover(&mut self, p: &PlacedProjection) -> f32 {
+        let taps = self.placed_taps(p);
+        let axes = p.sampling_repeat().axes();
+        let on: f32 = taps.used().iter().filter(|t| placed::covered(t.uv, axes)).map(|t| t.weight).sum();
+        let c = taps.coverage * on;
+        if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 }
+    }
+
+    /// [`Self::placed_cover`] for a placed projection, 1 for the others (a graph laid on through `projection`).
+    fn projection_cover(&mut self, projection: &Projection) -> f32 {
+        match projection {
+            Projection::Placed(p) => self.placed_cover(p),
+            _ => 1.0,
+        }
+    }
+
+    /// The taps of `p` read through `read` (a value at an image coordinate with a footprint, `None` outside), each
+    /// weighted; the taps without a value are left out (their coverage is in [`Self::placed_cover`]).
+    fn placed_read(&mut self, p: &PlacedProjection, mut read: impl FnMut(&placed::Tap) -> Option<[f32; 4]>) -> [f32; 4] {
+        let taps = self.placed_taps(p);
+        let (mut sum, mut total) = ([0.0f32; 4], 0.0f32);
+        for tap in taps.used().iter().filter(|t| t.weight > 0.0) {
+            if let Some(v) = read(tap) {
+                for (s, v) in sum.iter_mut().zip(v) {
+                    *s += v * tap.weight;
+                }
+                total += tap.weight;
+            }
+        }
+        if total > 0.0 { sum.map(|s| s / total) } else { [0.0; 4] }
+    }
+
+    /// Output `output` of a cook through placed projection `p`: each tap prefiltered by its own footprint and probes
+    /// (`unfiltered`: one bilinear read).
+    fn placed_graph(&mut self, cooked: &Cooked, output: Option<&str>, p: &PlacedProjection, unfiltered: bool) -> Option<[f32; 4]> {
+        let image = cooked.output(output)?;
+        let side = image.width().max(image.height());
+        let wrap = p.sampling_repeat().axes();
+        Some(self.placed_read(p, |tap| placed::filtered(tap, side, unfiltered, |uv, footprint| cooked.sample_wrapped(output, uv.x, uv.y, footprint, wrap))))
+    }
+
+    /// An image through placed projection `p` (bilinear per tap).
+    fn placed_image(&mut self, p: &PlacedProjection, image: &crate::store::ImageRes) -> [f32; 4] {
+        let wrap = p.sampling_repeat().axes();
+        self.placed_read(p, |tap| image.sample_wrapped(tap.uv.x, tap.uv.y, wrap))
+    }
+
     /// The coverage of a fill source: 1, or a graph source's alpha output
     fn source_alpha(&mut self, source: Option<&Source>, cooked: Option<&Cooked>, projection: &Projection) -> f32 {
         match source {
@@ -1732,6 +1837,10 @@ impl<'a, 'b> Texel<'a, 'b> {
         match source {
             Some(Source::Image { name, .. }) if !matches!(projection, Projection::Decal(_)) => {
                 let Some(image) = self.inp.images.get(name) else { return 1.0 };
+                if let Projection::Placed(p) = projection {
+                    let alpha = self.placed_image(p, image)[3];
+                    return if alpha.is_finite() { alpha.clamp(0.0, 1.0) } else { 0.0 };
+                }
                 let (coords, projection, _) = self.projected(projection);
                 let alpha: f32 = image_samples(projection, &coords)
                     .into_iter()
@@ -1753,6 +1862,12 @@ impl<'a, 'b> Texel<'a, 'b> {
                 None => [0.5; 3],
             },
             Source::Uniform(value) => *value,
+            Source::Procedural { pattern, low, high } if matches!(projection, Projection::Placed(_)) => {
+                let Projection::Placed(p) = projection else { return *low };
+                let c = self.coords();
+                let amount = self.placed_read(p, |tap| Some([procedural(pattern, projection, &Coords { uv: tap.uv, ..c }); 4]))[0];
+                mix3(*low, *high, amount)
+            }
             Source::Procedural { pattern, low, high } => {
                 let (coords, projection, _) = self.projected(projection);
                 let amount = procedural(pattern, projection, &coords);
@@ -1761,13 +1876,19 @@ impl<'a, 'b> Texel<'a, 'b> {
             Source::Image { name, normal_format } => {
                 let Some(image) = self.inp.images.get(name) else { return [0.5; 3] };
 
-                let (coords, projection, _) = self.projected(projection);
-                let mut sum = [0.0f32; 4];
-                for (uv, weight) in image_samples(projection, &coords).into_iter().filter(|(_, weight)| *weight > 0.0) {
-                    for (total, value) in sum.iter_mut().zip(image.sample(uv.x, uv.y)) {
-                        *total += value * weight;
+                let sum = match projection {
+                    Projection::Placed(p) => self.placed_image(p, image),
+                    _ => {
+                        let (coords, projection, _) = self.projected(projection);
+                        let mut sum = [0.0f32; 4];
+                        for (uv, weight) in image_samples(projection, &coords).into_iter().filter(|(_, weight)| *weight > 0.0) {
+                            for (total, value) in sum.iter_mut().zip(image.sample(uv.x, uv.y)) {
+                                *total += value * weight;
+                            }
+                        }
+                        sum
                     }
-                }
+                };
 
                 let rgb = [sum[0], sum[1], sum[2]];
                 match kind {
@@ -1926,7 +2047,8 @@ impl<'a, 'b> Texel<'a, 'b> {
                 // changes nothing
                 EffectKind::Graph { graph, projection } => {
                     if let Some(v) = self.graph_sample(effect.graph.as_deref(), graph.output.as_deref(), projection, graph.unfiltered) {
-                        value += (rules.blended1(effect.blend, value, v[0], true) - value) * opacity;
+                        let cover = self.projection_cover(projection);
+                        value += (rules.blended1(effect.blend, value, v[0], true) - value) * opacity * cover;
                     }
                 }
                 // Content-only effects; a placeholder passes the mask through unchanged
@@ -2255,7 +2377,8 @@ impl<'a, 'b> Texel<'a, 'b> {
                                 Some(a) => self.graph_sample(cooked, Some(a), projection, graph.unfiltered).map_or(1.0, |a| a[0].clamp(0.0, 1.0)),
                                 None => 1.0,
                             };
-                            over(c, e.blend, v, cov, p, o * alpha)
+                            let cover = self.projection_cover(projection);
+                            over(c, e.blend, v, cov, p, o * alpha * cover)
                         }
                         None => (v, cov),
                     }
@@ -4089,5 +4212,65 @@ soft {soft:?}"
         f.project.insert_layer(0, Layer::new(id, "Top", LayerKind::Fill(fill), &[Channel::Roughness]), None, false).unwrap();
         let expect = texturecraft_core::lum([0.2, 0.4, 0.6]);
         assert!(close(run(&f, None).value(Channel::Roughness, 9, 9), [expect; 3]));
+    }
+
+    /// A placed projection on the 2 × 2 plane (the scene unit is 2): `projection` on a fill of roughness `rough`.
+    fn placed_roughness(projection: texturecraft_core::PlacedProjection, source: Source, graphs: &GraphStore, at: (u32, u32)) -> f32 {
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.0; 3], 0.0);
+        if let Some(LayerKind::Fill(fill)) = f.project.layers.get_mut(&id).map(|l| &mut l.kind) {
+            fill.sources.insert(Channel::Roughness, source);
+            fill.projection = Projection::Placed(Box::new(projection));
+        }
+        run_with(&f, graphs).value(Channel::Roughness, at.0, at.1)[0]
+    }
+
+    #[test]
+    fn placed_tri_planar_prefilters_each_texel_unless_unfiltered() {
+        use texturecraft_core::{ImagePlacement, PlacedMode, PlacedProjection, Repeat, Volume};
+        // white on the left half of the image, black on the right
+        let halves = "format 3\nsize 64\nsubgraph c\nmeta kind \"function\"\nnode 2 f_pos\nnode 3 f_swizzle a=@2 mask=\"x\"\nnode 4 f_float v=0.5\nnode 5 f_lt a=@3 b=@4\nnode 1 f_out in=@5\nend\nnode 1 pixel_processor fn=\"c\"\noutput out 1\n";
+        let mut graphs = GraphStore::default();
+        let key = graphs.add_text(halves);
+        let read = |unfiltered: bool| {
+            let mut g = GraphRef::new(key.clone(), "halves");
+            g.unfiltered = unfiltered;
+            // the image once per texel (64 repetitions over the plane), each texel's centre a quarter into the white half
+            let image = ImagePlacement { tiling: [64.0, 64.0], rotation: 0.0, offset: [-0.25 / 64.0, 0.0] };
+            let p = PlacedProjection { mode: PlacedMode::TriPlanar { hardness: 0.5 }, volume: Volume::default(), image, repeat: Repeat::Both };
+            placed_roughness(p, Source::Graph(Box::new(g)), &graphs, (10, 10))
+        };
+        let filtered = read(false);
+        assert!((filtered - 0.5).abs() < 0.03, "a texel spanning the whole image reads its mean: {filtered}");
+        let unfiltered = read(true);
+        assert!(unfiltered > 0.98, "bilinear at the texel's centre: {unfiltered}");
+    }
+
+    #[test]
+    fn placed_projections_cover_only_their_volume_and_image() {
+        use texturecraft_core::{FacingFalloff, Falloff, ImagePlacement, PlacedMode, PlacedProjection, Repeat, Volume};
+        let graphs = GraphStore::default();
+        // a planar volume a quarter of the scene wide (half a unit of the plane's 2), clipped: texel 32 is inside
+        // (x ≈ 0), texel 60 outside (x ≈ 0.9); outside the empty stack's roughness shows
+        let planar = PlacedProjection {
+            mode: PlacedMode::Planar { depth: Falloff::default(), facing: FacingFalloff::default() },
+            volume: Volume { size: [0.25; 3], clip: true, ..Volume::default() },
+            image: ImagePlacement::default(),
+            repeat: Repeat::Both,
+        };
+        let empty = run(&fixture(), None).value(Channel::Roughness, 60, 32)[0];
+        assert!((placed_roughness(planar.clone(), Source::Uniform([0.9; 3]), &graphs, (32, 32)) - 0.9).abs() < 1e-3);
+        assert!((placed_roughness(planar, Source::Uniform([0.9; 3]), &graphs, (60, 32)) - empty).abs() < 1e-3);
+        // a UV image placed twice as large without repeat covers the UV square's first half only
+        let once = PlacedProjection {
+            mode: PlacedMode::Uv { scale: [2.0, 2.0], rotation: 0.0, offset: [0.0, 0.0] },
+            volume: Volume::default(),
+            image: ImagePlacement::default(),
+            repeat: Repeat::None,
+        };
+        assert!((placed_roughness(once.clone(), Source::Uniform([0.9; 3]), &graphs, (10, 10)) - 0.9).abs() < 1e-3);
+        assert!((placed_roughness(once.clone(), Source::Uniform([0.9; 3]), &graphs, (50, 10)) - empty).abs() < 1e-3);
+        let along_u = PlacedProjection { repeat: Repeat::U, ..once };
+        assert!((placed_roughness(along_u, Source::Uniform([0.9; 3]), &graphs, (50, 10)) - 0.9).abs() < 1e-3);
     }
 }

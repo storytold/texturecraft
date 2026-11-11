@@ -27,9 +27,10 @@ pub use blend::{BlendMode, blend1, blend3, lum, mix3};
 pub use channel::{Channel, ChannelFormat, ChannelKind};
 pub use import_report::{Fidelity, ImportReport, LayerReport, LayerRole, ReportEntry, SafetyFlag, SafetyFlagKind};
 pub use layer::{
-    ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, GeometryMask, GraphInput,
-    GraphRef, GraphValue, HeightMask, IMPORT_LOCK_SOURCE, Layer, LayerId, LayerKind, Levels, LinkParam, LinkPreset, Lock, LockReason, MAX_GRAPH_NESTING, Mask,
-    MaskBackground, MaterialLink, PathShape, Procedural, ProceduralKind, Projection, Source, StableHash, gradient, hsl_adjust, is_key, per_unit, text_key,
+    ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, Effect, EffectKind, FacingFalloff, Falloff, Fill, Filter, Generator, GeneratorKind,
+    GeometryMask, GraphInput, GraphRef, GraphValue, HeightMask, IMPORT_LOCK_SOURCE, ImagePlacement, Layer, LayerId, LayerKind, Levels, LinkParam, LinkPreset,
+    Lock, LockReason, MAX_GRAPH_NESTING, Mask, MaskBackground, MaterialLink, PathShape, PlacedMode, PlacedProjection, Procedural, ProceduralKind, Projection,
+    Repeat, Source, StableHash, Volume, WarpGrid, WarpPoint, gradient, hsl_adjust, is_key, per_unit, text_key,
 };
 pub use project::{
     AoMixing, BlockScales, Camera, DepthOfField, DisplaySettings, FORMAT_VERSION, MAX_RESOLUTION, MIN_RESOLUTION, NormalFormat, NormalMixing, Project,

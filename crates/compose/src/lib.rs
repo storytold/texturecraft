@@ -3,7 +3,8 @@
 //! The CPU layer-stack evaluator: [`eval::composite_tiles`] turns a texture set's layers, masks,
 //! fills and painted pixels into one image per channel, tile by tile in parallel, including the
 //! live preview of a stroke being drawn. [`display`] converts composited tiles into the texture
-//! formats the viewport samples; [`pattern`] evaluates procedurals through projections.
+//! formats the viewport samples; [`pattern`] evaluates procedurals through projections, [`placed`] the placed
+//! projections of imported fills.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -15,6 +16,7 @@ pub mod display;
 pub mod eval;
 pub mod graphs;
 pub mod pattern;
+pub mod placed;
 pub mod store;
 pub mod thumb;
 

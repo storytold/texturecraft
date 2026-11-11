@@ -96,4 +96,27 @@ impl ImageRes {
         }
         out
     }
+
+    /// [`ImageRes::sample`] repeating only along the axes `wrap` names (u, v): along the others the edge texels extend
+    /// and coordinates outside 0..1 have no value (`None`).
+    pub fn sample_wrapped(&self, u: f32, v: f32, wrap: [bool; 2]) -> Option<[f32; 4]> {
+        if wrap == [true, true] {
+            return Some(self.sample(u, v));
+        }
+        if !u.is_finite() || !v.is_finite() || !(wrap[0] || (0.0..=1.0).contains(&u)) || !(wrap[1] || (0.0..=1.0).contains(&v)) {
+            return None;
+        }
+        let (w, h) = (i64::from(self.width.max(1)), i64::from(self.height.max(1)));
+        let at = |x: i64, y: i64| self.texel(if wrap[0] { x } else { x.clamp(0, w - 1) }, if wrap[1] { y } else { y.clamp(0, h - 1) });
+        let fx = u * self.width as f32 - 0.5;
+        let fy = v * self.height as f32 - 0.5;
+        let (x0, y0) = (fx.floor() as i64, fy.floor() as i64);
+        let (tx, ty) = (fx - fx.floor(), fy - fy.floor());
+        let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+        Some(std::array::from_fn(|k| {
+            let top = a[k] + (b[k] - a[k]) * tx;
+            let bot = c[k] + (d[k] - c[k]) * tx;
+            top + (bot - top) * ty
+        }))
+    }
 }

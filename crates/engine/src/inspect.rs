@@ -72,8 +72,10 @@ fn fill_json(f: &Fill) -> Value {
         "projection": f.projection.label(),
         "sources": f.sources.iter().map(|(c, s)| (c.id().to_string(), source_json(s))).collect::<serde_json::Map<_, _>>(),
     });
-    if let Projection::Decal(d) = &f.projection {
-        v["decal"] = json!(d);
+    match &f.projection {
+        Projection::Decal(d) => v["decal"] = json!(d),
+        Projection::Placed(p) => v["placed"] = json!(p),
+        _ => {}
     }
     if let Some(link) = &f.link {
         v["link"] = json!(link);

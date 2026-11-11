@@ -440,7 +440,8 @@ pub(crate) fn projection_from(p: &Value, cmd: &str, current: Option<&Projection>
             *s = scale.map_or(*s, |v| v[0]);
             *a = axis.unwrap_or(*a);
         }
-        Projection::Decal(_) => {}
+        // placed with the settings an import gave it; picking a projection kind replaces it
+        Projection::Decal(_) | Projection::Placed(_) => {}
     }
     Ok(proj)
 }

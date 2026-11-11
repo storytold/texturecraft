@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CompositeRules, CoreError, Effect, ImportReport, Layer, LayerId, LayerKind, Result};
 
 /// Version of `project.json`. 3 added layer locks, placeholder effects, the import report, geometry masks by UV
-/// tile, the imported blend modes and the project's compositing rules ([`Project::rules`]); version 2 files read
-/// unchanged.
+/// tile, the imported blend modes, the project's compositing rules ([`Project::rules`]) and placed projections
+/// ([`crate::PlacedProjection`]); version 2 files read unchanged.
 pub const FORMAT_VERSION: u32 = 3;
 
 /// Maximum group nesting (also bounds recursion over hostile project files)

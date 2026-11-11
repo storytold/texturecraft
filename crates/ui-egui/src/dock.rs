@@ -2028,7 +2028,7 @@ fn projection_transform(ui: &mut Ui, projection: &Projection, edit: &mut impl Fn
         Projection::Triplanar { scale, .. } | Projection::Planar { scale, .. } | Projection::Spherical { scale } | Projection::Cylindrical { scale, .. } => {
             *scale
         }
-        Projection::Decal(_) => return,
+        Projection::Decal(_) | Projection::Placed(_) => return,
     };
     if let Some(merge) = slider_edit(ui, tr("Scale / tiling"), &mut scale, FILL_SCALE_RANGE, 2) {
         edit(json!({"scale": scale, "merge": merge}));
@@ -2049,7 +2049,7 @@ fn projection_transform(ui: &mut Ui, projection: &Projection, edit: &mut impl Fn
                 edit(json!({"offset": edited_offset, "merge": merge}));
             }
         }
-        Projection::Spherical { .. } | Projection::Cylindrical { .. } | Projection::Decal(_) => {}
+        Projection::Spherical { .. } | Projection::Cylindrical { .. } | Projection::Decal(_) | Projection::Placed(_) => {}
     }
 }
 

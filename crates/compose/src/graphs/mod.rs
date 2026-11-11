@@ -97,6 +97,39 @@ impl Cooked {
         Some(std::array::from_fn(|k| a[k] + (b[k] - a[k]) * t))
     }
 
+    /// [`Cooked::sample_filtered`] repeating only along the axes `wrap` names (u, v): along the others the edge pixels
+    /// extend and coordinates outside 0..1 have no value (`None`, as for a missing output).
+    pub fn sample_wrapped(&self, name: Option<&str>, u: f32, v: f32, footprint: f32, wrap: [bool; 2]) -> Option<[f32; 4]> {
+        if wrap == [true, true] {
+            return self.sample_filtered(name, u, v, footprint);
+        }
+        if !u.is_finite() || !v.is_finite() || !(wrap[0] || (0.0..=1.0).contains(&u)) || !(wrap[1] || (0.0..=1.0).contains(&v)) {
+            return None;
+        }
+        let (key, image) = match name {
+            Some(n) => self.outputs.get_key_value(n)?,
+            None => self.outputs.iter().next()?,
+        };
+        let size = image.width().max(image.height()) as f32;
+        let lod = (footprint * size).log2();
+        if !lod.is_finite() || lod <= 0.0 {
+            return Some(sample_wrap(image, u, v, wrap));
+        }
+        let levels = self.mips.0.get_or_init(|| self.outputs.iter().map(|(k, img)| (k.clone(), Arc::new(mip_levels(img)))).collect());
+        let levels = levels.get(key)?;
+        let at = |k: usize| {
+            if k == 0 {
+                sample_wrap(image, u, v, wrap)
+            } else {
+                levels.get(k - 1).or(levels.last()).map_or_else(|| sample_wrap(image, u, v, wrap), |m| m.sample_wrap(u, v, wrap))
+            }
+        };
+        let lo = lod.floor() as usize;
+        let t = lod - lod.floor();
+        let (a, b) = (at(lo), at(lo + 1));
+        Some(std::array::from_fn(|k| a[k] + (b[k] - a[k]) * t))
+    }
+
     pub fn bytes(&self) -> usize {
         self.outputs.values().map(TileImage::bytes).sum()
     }
@@ -138,6 +171,16 @@ impl Mip {
     fn at(&self, x: i64, y: i64) -> [f32; 4] {
         let (w, h) = (self.w.max(1) as i64, self.h.max(1) as i64);
         self.px.get((y.rem_euclid(h) * w + x.rem_euclid(w)) as usize).copied().unwrap_or([0.0; 4])
+    }
+
+    /// Bilinear sample repeating along the axes `wrap` names, the edge extended along the others.
+    fn sample_wrap(&self, u: f32, v: f32, wrap: [bool; 2]) -> [f32; 4] {
+        if !u.is_finite() || !v.is_finite() {
+            return [0.0; 4];
+        }
+        let (w, h) = (self.w.max(1) as i64, self.h.max(1) as i64);
+        let at = |x: i64, y: i64| self.at(if wrap[0] { x } else { x.clamp(0, w - 1) }, if wrap[1] { y } else { y.clamp(0, h - 1) });
+        bilinear_with(u * self.w as f32 - 0.5, v * self.h as f32 - 0.5, at)
     }
 
     /// Bilinear sample with wrap-around (v down), as [`sample`].
@@ -225,6 +268,28 @@ fn texel(img: &TileImage, x: i64, y: i64) -> [f32; 4] {
         }
         _ => v.map(from_u16),
     }
+}
+
+/// Bilinear interpolation around pixel coordinate (`fx`, `fy`) (pixel centres at whole numbers) of `at`'s pixels.
+fn bilinear_with(fx: f32, fy: f32, at: impl Fn(i64, i64) -> [f32; 4]) -> [f32; 4] {
+    let (x0, y0) = (fx.floor() as i64, fy.floor() as i64);
+    let (tx, ty) = (fx - fx.floor(), fy - fy.floor());
+    let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+    std::array::from_fn(|k| {
+        let top = a[k] + (b[k] - a[k]) * tx;
+        let bot = c[k] + (d[k] - c[k]) * tx;
+        top + (bot - top) * ty
+    })
+}
+
+/// [`sample`] repeating along the axes `wrap` names (u, v), the edge pixels extended along the others.
+pub fn sample_wrap(img: &TileImage, u: f32, v: f32, wrap: [bool; 2]) -> [f32; 4] {
+    if !u.is_finite() || !v.is_finite() {
+        return [0.0; 4];
+    }
+    let (w, h) = (i64::from(img.width().max(1)), i64::from(img.height().max(1)));
+    let at = |x: i64, y: i64| texel(img, if wrap[0] { x } else { x.clamp(0, w - 1) }, if wrap[1] { y } else { y.clamp(0, h - 1) });
+    bilinear_with(u * img.width() as f32 - 0.5, v * img.height() as f32 - 0.5, at)
 }
 
 /// Bilinear sample with wrap-around at texture coordinates (v down).

@@ -62,7 +62,10 @@ covered texel it walks the stack bottom to top: paint layers are unpremultiplied
 (value, coverage) tiles, fill layers evaluate uniform values, procedurals (through UV, tri-planar,
 planar, spherical or cylindrical projections) or image resources; masks evaluate their effect
 stack (painted bitmaps, fills, mesh-map generators, levels, filters, ID color selection,
-compare); a layer's geometry mask (mesh part names) zeroes its mask on texels whose triangle, from
+compare). Imported fills can carry a placed projection (`core::PlacedProjection`, evaluated by `compose::placed`):
+a volume placed, turned and sized in the scene's bounding box, the image's placement in it, repetition per image
+axis, the tri-planar blend curve, depth and facing falloffs, cylinder coverage, a Bézier warp grid, and a per-texel
+anisotropic prefilter of graph outputs; TextureCraft's own projections are left as they are. A layer's geometry mask (mesh part names) zeroes its mask on texels whose triangle, from
 the UV G-buffer, lies in another part; each enabled channel blends with its mode and opacity. Only
 dirty tiles are recomposited
 (a stroke dirties the tiles it touches), then padded, converted to display formats and uploaded to
