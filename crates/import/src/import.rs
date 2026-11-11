@@ -14,7 +14,7 @@ use texturecraft_core::{
     MIN_RESOLUTION, NormalFormat, Project, Source, TextureSet, import_report::original_result_layer,
 };
 use texturecraft_geom::{Mesh, UvGBuffer};
-use texturecraft_import_reader::decode::assbin::{AssbinGeometry, AssbinScene};
+use texturecraft_import_reader::decode::assbin::{AssbinGeometry, AssbinScene, Normalization};
 use texturecraft_import_reader::decode::document::{MaterialRecord, NormalMapSyscoord};
 use texturecraft_import_reader::model::baking::{BAKING_INI, ProjectBakeSettings};
 use texturecraft_import_reader::model::cameras::{CAMERA_INI, SavedCameras};
@@ -209,6 +209,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         None => report.add("cameras", Fidelity::Exact, "none saved"),
     }
     let bake_ini = file.read(BAKING_INI).ok().and_then(|d| ProjectBakeSettings::parse(&d).ok());
+    let normalization = file.mesh_normalization(&scene).ok().flatten();
     let cache_entries = file.cache_entries();
     let cache_sets: BTreeSet<String> = cache_entries.iter().map(|e| e.set.clone()).collect();
     let binding = SetBinding::bind(&materials, &records, &cache_sets);
@@ -267,6 +268,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
             options,
             syscoord,
             bake: bake_ini.as_ref(),
+            normalization,
             cache: &cache_entries,
             hooks: &*hooks,
             graphs: library.as_ref(),
@@ -320,6 +322,8 @@ struct SetContext<'a, 'h> {
     options: &'a ImportOptions,
     syscoord: Option<NormalMapSyscoord>,
     bake: Option<&'a ProjectBakeSettings>,
+    /// How the original normalised its mesh (where high-poly files modelled next to it belong).
+    normalization: Option<Normalization>,
     cache: &'a [texturecraft_import_reader::project::CacheEntryRef],
     hooks: &'a Hooks<'h>,
     graphs: Option<&'a GraphLibrary>,
@@ -440,6 +444,9 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     set.bake = mapped.settings;
     if !mapped.unmapped.is_empty() {
         report.add(item("bake settings"), Fidelity::Approximated, format!("not taken over: {}", mapped.unmapped.join("; ")));
+    }
+    if !mapped.meshes.is_empty() {
+        report.add(item("high-poly meshes"), Fidelity::Approximated, mapped.meshes.note(ctx.normalization));
     }
     project.texture_sets.push(set);
     // the layer stack

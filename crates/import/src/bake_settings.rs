@@ -4,6 +4,9 @@
 //! TextureCraft's bake settings accept, is listed so the report can say it was not taken over.
 
 mod bakers;
+mod high;
+
+pub use high::MeshRequest;
 
 use texturecraft_core::{BakeAntialiasing, BakeResolution, BakeSettings, BakedMap};
 use texturecraft_import_reader::model::baking::{MaterialBaking, TweakValue};
@@ -36,6 +39,8 @@ pub struct MappedBake {
     pub settings: BakeSettings,
     /// One line per setting not taken over (`key = value`, with the reason where it is not "no counterpart").
     pub unmapped: Vec<String>,
+    /// The high-poly and cage mesh files the original baked with (not in the file; reported).
+    pub meshes: MeshRequest,
 }
 
 /// What became of one setting.
@@ -111,7 +116,7 @@ pub fn map(settings: Option<&MaterialBaking>, resolution: u32) -> MappedBake {
     let mut unmapped = Vec::new();
     let Some(p) = settings else {
         unmapped.push("no baking settings in the file; defaults used".to_string());
-        return MappedBake { settings: bake, unmapped };
+        return MappedBake { settings: bake, unmapped, meshes: MeshRequest::default() };
     };
     for (k, v) in &p.common.tweaks {
         if let Some(note) = map_common(k, v, &mut bake).note(k, v) {
@@ -144,7 +149,7 @@ pub fn map(settings: Option<&MaterialBaking>, resolution: u32) -> MappedBake {
     ) {
         bake.maps.curvature.parameters.method = method;
     }
-    MappedBake { settings: bake, unmapped }
+    MappedBake { settings: bake, unmapped, meshes: MeshRequest::of(p) }
 }
 
 /// One common setting (size, padding, diffusion).
@@ -199,7 +204,7 @@ fn map_detail(key: &str, v: &TweakValue, bake: &mut BakeSettings) -> Outcome {
         "Detail.UseCage" => Outcome::of(flag(v) == Some(false)),
         // TextureCraft has one filter, the file's first
         "Detail.FilterMethod" => Outcome::of(v.as_f32() == Some(0.0)),
-        // the mesh files themselves are not in the project file
+        // the mesh files are not in the project file: reported as [`MeshRequest`]
         "Detail.HipolyMesh" | "Detail.CageMesh" => Outcome::Taken,
         _ => Outcome::Listed,
     }
@@ -231,7 +236,7 @@ mod tests {
                 params: TweakList { baker: "Bakers.AO".into(), tweaks: vec![("Detail.SecondaryCommon.NbSecondary".into(), TweakValue::Float(64.0))] },
             }],
         );
-        let MappedBake { settings: b, unmapped } = map(Some(&p), 2048);
+        let MappedBake { settings: b, unmapped, .. } = map(Some(&p), 2048);
         assert_eq!((b.common.resolution, b.common.resolution_height), (BakeResolution::R4096, Some(BakeResolution::R2048)));
         assert_eq!((b.common.dilation, b.common.antialiasing), (8, BakeAntialiasing::Subsampling2x2));
         assert_eq!(b.maps.ao.parameters.rays.rays, 64);
@@ -261,7 +266,7 @@ mod tests {
             ],
             Vec::new(),
         );
-        let MappedBake { settings: b, unmapped } = map(Some(&p), 512);
+        let MappedBake { settings: b, unmapped, .. } = map(Some(&p), 512);
         assert!(unmapped.is_empty(), "{unmapped:?}");
         assert_eq!((b.common.resolution, b.common.resolution_height, b.common.apply_diffusion), (BakeResolution::R1024, None, false));
         let h = &b.high_poly;
@@ -283,7 +288,7 @@ mod tests {
             ],
             Vec::new(),
         );
-        let MappedBake { settings: b, unmapped } = map(Some(&p), 2048);
+        let MappedBake { settings: b, unmapped, .. } = map(Some(&p), 2048);
         assert_eq!((b.common.resolution, b.common.dilation), (BakeResolution::R2048, range::DILATION));
         assert_eq!((b.cage.max_frontal, b.cage.max_rear), (range::CAGE_DISTANCE.1, 0.01));
         assert_eq!(b.high_poly.low_suffix, "_low");
