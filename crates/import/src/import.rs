@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use texturecraft_compose::graphs::Cancel;
 use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, PixelStore};
 use texturecraft_core::{
-    BlendMode, Channel, ChannelBlend, Fidelity, Fill, ImportReport, Layer, LayerId, LayerKind, LayerReport, LayerRole, Lock, LockReason, MAX_RESOLUTION,
-    MIN_RESOLUTION, NormalFormat, Project, Source, TextureSet, import_report::original_result_layer,
+    BlendMode, Channel, ChannelBlend, CompositeRules, Fidelity, Fill, HeightNormal, ImportReport, Layer, LayerId, LayerKind, LayerReport, LayerRole, Lock,
+    LockReason, MAX_RESOLUTION, MIN_RESOLUTION, NormalFormat, Project, Source, TextureSet, import_report::original_result_layer,
 };
 use texturecraft_geom::{Mesh, UvGBuffer};
 use texturecraft_import_reader::decode::assbin::{AssbinGeometry, AssbinScene, Normalization};
@@ -186,13 +186,22 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     if syscoord == Some(NormalMapSyscoord::DirectX) {
         report.add("baked normal maps", Fidelity::Exact, "stored DirectX; green flipped to OpenGL");
     }
-    if let Some(s) = &settings {
-        let filter = if s.format_version <= 61 { "a Sobel filter" } else { "backward differences" };
-        report.add(
-            "height to normal",
-            Fidelity::Approximated,
-            format!("the original derives normals from height with {filter} (document format {}); TextureCraft uses its own", s.format_version),
-        );
+    // the rules measured from the original's renders, with the height filter of the file's document format
+    let height_normal = settings.as_ref().map_or(HeightNormal::Backward, |s| HeightNormal::for_document_format(s.format_version));
+    let rules = CompositeRules::measured(height_normal);
+    report.add("blending", Fidelity::Exact, "the project follows the blend rules measured from the original (set in the project's compositing rules)");
+    match &settings {
+        Some(s) => {
+            let filter = if height_normal == HeightNormal::Sobel { "a Sobel filter" } else { "backward differences" };
+            report.add(
+                "height to normal",
+                Fidelity::Exact,
+                format!("exported normals derive height with {filter} at the original's slope (document format {})", s.format_version),
+            );
+        }
+        None => {
+            report.add("height to normal", Fidelity::Approximated, "the document format is unknown: exported normals derive height with backward differences")
+        }
     }
     let saved = file.read(CAMERA_INI).ok().map(|d| SavedCameras::parse(&d));
     let (lo, hi) = mesh.bounds();
@@ -220,6 +229,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     }
     let stem = std::path::Path::new(file_name).file_stem().map_or_else(|| "Imported".to_string(), |s| s.to_string_lossy().into_owned());
     let mut project = Project::new(stem, "mesh.glb");
+    project.rules = rules;
     project.cameras = project_cameras;
     project.normal_format = if syscoord == Some(NormalMapSyscoord::DirectX) { NormalFormat::DirectX } else { NormalFormat::OpenGl };
     let images = ProjectImages::new(file);

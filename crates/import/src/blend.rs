@@ -7,7 +7,8 @@
 //! colour, value) fit an HSV form with doubled value, close but not within one 8-bit step everywhere, so they are
 //! approximated. On a channel of one value per texel, tint, saturation and colour keep what is below (value and the
 //! normal-map modes act as normal). TextureCraft's own formulas for some modes differ from the measured ones (divide,
-//! linear light, soft light, dodge and burn edges); those differences show in the safety net, not here.
+//! linear light, soft light, dodge and burn edges); an imported project switches on the measured ones
+//! ([`texturecraft_core::BlendRules::Measured`]), with the rule tables in `crates/import/tests/rules/`.
 
 use texturecraft_core::BlendMode;
 use texturecraft_import_reader::model::{ChannelBlending, ProjectBlendMode, ProjectChannel, blending_for};

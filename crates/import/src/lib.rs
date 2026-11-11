@@ -36,6 +36,8 @@ pub mod options;
 pub mod polygon_fill;
 pub mod replay;
 pub mod resources;
+#[cfg(test)]
+mod rule_tables;
 pub mod safety_net;
 pub mod sets;
 pub mod status;

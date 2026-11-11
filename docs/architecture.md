@@ -72,6 +72,14 @@ The CPU compositor is the reference for everything users see and export. Export
 (`formats::export`) reads the same composite, adds height-to-normal (Sobel) combined with the
 normal channel and baked normals by reoriented normal mapping, and packs channels per preset.
 
+A project's compositing rules (`core::rules::CompositeRules`, `Project::rules`) default to TextureCraft's own and
+are then left out of the project file. An imported project switches on the rules measured from the reference app's
+renders: measured blend formulas, the blended value clamped to 0..1 before the opacity on channels that store 0..1, a
+layer's mode applying only where something is below (the stack carries coverage), folders that do not pass through
+composited on their own, and the exported normal derived from height with the document's filter (Sobel or backward
+differences) at the measured slope, laid onto the baked normal before the normal channel. Such a project is
+composited without the stack cache below the edited layer (it keeps no coverage).
+
 ### Layer-panel thumbnails
 
 The Layers panel shows each layer's content (in the displayed channel), its mask and every effect
