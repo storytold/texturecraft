@@ -250,10 +250,12 @@ fn adding_an_image_layer_without_the_extension_says_which_resource_exists() {
 fn a_missing_resource_message_lists_at_most_eight_names() {
     let mut s = session();
     let err = execute(&mut s, "layer.add.image", &json!({"name": "src_0"})).unwrap_err().to_string();
-    assert_eq!(err, "`layer.add.image`: no resource `src_0`; the project has no resources, import one with `resource.import`");
+    assert_eq!(err, "`layer.add.image`: no resource `src_0`; the project has no image resources, import one with `resource.import`");
     for i in 0..10 {
         s.doc.resources.insert(format!("img_{i}.png"), std::sync::Arc::new(Vec::new()));
     }
+    // A linked material's package is a resource too, but it is not an image `layer.add.image` can use
+    s.doc.resources.insert("brass.mcraft".into(), std::sync::Arc::new(Vec::new()));
 
     let err = execute(&mut s, "layer.add.image", &json!({"name": "src_0"})).unwrap_err().to_string();
 
@@ -261,6 +263,21 @@ fn a_missing_resource_message_lists_at_most_eight_names() {
         err,
         "`layer.add.image`: no resource `src_0`; available: img_0.png, img_1.png, img_2.png, img_3.png, img_4.png, img_5.png, img_6.png, img_7.png and 2 more (`resource.list`)"
     );
+}
+
+#[test]
+fn a_package_is_not_offered_as_an_image_resource() {
+    let mut s = session();
+    s.doc.resources.insert("brass.mcraft".into(), std::sync::Arc::new(Vec::new()));
+
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "brass"})).unwrap_err().to_string();
+
+    assert_eq!(err, "`layer.add.image`: no resource `brass`; the project has no image resources, import one with `resource.import`");
+
+    s.doc.resources.insert("src_0.png".into(), std::sync::Arc::new(Vec::new()));
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "brass"})).unwrap_err().to_string();
+
+    assert_eq!(err, "`layer.add.image`: no resource `brass`; available: src_0.png");
 }
 
 #[test]

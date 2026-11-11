@@ -179,20 +179,31 @@ fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({ "removed": unused }))
 }
 
+/// Where an image comes from when the project has none: the browser has no file paths
+#[cfg(target_arch = "wasm32")]
+const IMPORT_HINT: &str = "use File > Import resources";
+#[cfg(not(target_arch = "wasm32"))]
+const IMPORT_HINT: &str = "import one with `resource.import`";
+
 /// The error for a name that is not a resource, listing the names the document has
 fn missing_resource(s: &Session, name: &str) -> String {
     // Enough names to recognise a typo without pasting a whole resource list into the error
     const MAX_LISTED: usize = 8;
 
     let mut msg = format!("no resource `{name}`");
-    if s.doc.resources.is_empty() {
-        msg.push_str("; the project has no resources, import one with `resource.import`");
+    // A linked material's package is a resource too, but it is not an image, so `layer.add.image`
+    // cannot use it -- the same rule `sync_images` applies when it skips packages.
+    let package_suffix = format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT);
+    let images: Vec<&str> = s.doc.resources.keys().filter(|k| !k.ends_with(&package_suffix)).map(String::as_str).collect();
+    if images.is_empty() {
+        msg.push_str("; the project has no image resources, ");
+        msg.push_str(IMPORT_HINT);
         return msg;
     }
 
-    let names: Vec<&str> = s.doc.resources.keys().map(String::as_str).take(MAX_LISTED).collect();
-    msg.push_str(&format!("; available: {}", names.join(", ")));
-    let rest = s.doc.resources.len() - names.len();
+    let listed = images.len().min(MAX_LISTED);
+    msg.push_str(&format!("; available: {}", images[..listed].join(", ")));
+    let rest = images.len() - listed;
     if rest > 0 {
         msg.push_str(&format!(" and {rest} more (`resource.list`)"));
     }
