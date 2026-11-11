@@ -144,7 +144,9 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 let flat =
                     blend.mode() == BlendMode::Passthrough || (blend.mode() == BlendMode::Normal && blend.opacity >= 1.0) || g.header.blending.is_empty();
                 // an eraser lowers only the group's own coverage, so it needs the group's layer even when it blends normally
-                let isolating = g.effects.iter().any(|e| e.is_enabled() && matches!(e, ProjectEffect::Paint(p) if p.tool == PaintTool::Eraser));
+                // a smudge moves the strokes before it in the group, so it needs the group's layer too
+                let isolating =
+                    g.effects.iter().any(|e| e.is_enabled() && matches!(e, ProjectEffect::Paint(p) if matches!(p.tool, PaintTool::Eraser | PaintTool::Smudge)));
                 if (!flat || isolating) && self.group_layer(g, on) {
                     return;
                 }
@@ -161,7 +163,9 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 }
                 let blocker = match self.input.replay {
                     false => Blocker::new(BlockerKey::new(BlockerKind::Strokes, "painted-mask"), "painted mask (strokes)"),
-                    true => match crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images, self.input.graphs) {
+                    true => match crate::replay::brush::alone(p)
+                        .and_then(|()| crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images, self.input.graphs))
+                    {
                         Ok(step) => {
                             self.push(header, EffectKind::Paint, on);
                             let id = self.effects.last().map_or(texturecraft_core::LayerId(0), |e| e.id);
@@ -233,9 +237,9 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         }
     }
 
-    /// A group with its own blending (or holding an eraser) whose actions are all brush work: its strokes painted on
-    /// their own, over nothing, into one paint effect (a brush lays its value over what the group holds, an eraser lowers
-    /// the group's coverage) that blends with the mask below with the group's mode and opacity, as the original
+    /// A group with its own blending (or holding an eraser or a smudge) whose actions are all brush work: its strokes
+    /// painted on their own, over nothing, into one paint effect (a brush lays its value over what the group holds, an
+    /// eraser lowers the group's coverage, a smudge moves it) that blends with the mask below with the group's mode and opacity, as the original
     /// composites such a group. False (nothing pushed) when the group holds anything else or a stroke that cannot be
     /// replayed: the caller lays it flat.
     fn group_layer(&mut self, g: &EffectGroup, on: bool) -> bool {

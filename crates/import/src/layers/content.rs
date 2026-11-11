@@ -207,7 +207,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         if !self.input.replay {
             return Err(Blocker::new(BlockerKey::new(BlockerKind::Strokes, tool), format!("{tool} strokes")));
         }
-        let step = self.step(p);
+        let step = crate::replay::brush::alone(p).and_then(|()| self.step(p));
         if self.in_brush_work {
             return Err(match step {
                 Err(b) => b,

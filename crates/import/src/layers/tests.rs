@@ -384,10 +384,13 @@ fn with_a_replayer_painted_masks_become_paint_effects() {
 
 #[test]
 fn strokes_that_cannot_be_replayed_stay_placeholders_with_their_reason() {
-    // a smudge among the brush work keeps all of it a placeholder: they paint one image in order
+    // projection painting among the brush work keeps all of it a placeholder: they paint one image in order
     let group = ProjectEffect::Group(EffectGroup {
         header: header(2, u64::MAX, vec![]),
-        effects: vec![painting(3, BASE, PaintTool::Brush, vec![uniform(BASE, [1.0; 3])]), painting(9, BASE, PaintTool::Smudge, vec![])],
+        effects: vec![
+            painting(3, BASE, PaintTool::Brush, vec![uniform(BASE, [1.0; 3])]),
+            painting(9, BASE, PaintTool::Projection, vec![uniform(BASE, [1.0; 3])]),
+        ],
     });
     let mut l = layer(1, "Paint", ProjectLayerKind::Paint, vec![group]);
     let mut particle = paint(5, 0);
@@ -401,7 +404,7 @@ fn strokes_that_cannot_be_replayed_stay_placeholders_with_their_reason() {
     let stack = build_replaying(vec![l]);
     let ours = by_name(&stack, "Paint");
     let keys = ours.lock.as_ref().unwrap().keys();
-    assert!(keys.contains(&"brush:smudge") && keys.contains(&"strokes:brush") && keys.contains(&"brush:particle"), "{keys:?}");
+    assert!(keys.contains(&"brush:projection") && keys.contains(&"strokes:brush") && keys.contains(&"brush:particle"), "{keys:?}");
     assert!(stack.jobs.is_empty());
     let reasons: Vec<String> = ours
         .placeholders()
@@ -678,4 +681,35 @@ fn levels_act_on_the_channels_they_list_only() {
     let stack = build(vec![layer(1, "L", ProjectLayerKind::Fill, vec![base, gloss])]);
     let lv = by_name(&stack, "L").content_effects.iter().find(|e| matches!(e.kind, EffectKind::Levels(_))).unwrap();
     assert!(!lv.visible, "switched off");
+}
+
+#[test]
+fn a_smudge_moves_the_brush_work_before_it_and_alone_stays_a_placeholder() {
+    use crate::replay::PaintMode;
+    use texturecraft_import_reader::model::ProjectBlendMode;
+    // in a paint layer's brush work: one job, the smudge after the brush
+    let group = ProjectEffect::Group(EffectGroup {
+        header: header(2, u64::MAX, vec![]),
+        effects: vec![painting(3, BASE, PaintTool::Brush, vec![uniform(BASE, [1.0; 3])]), painting(9, BASE, PaintTool::Smudge, vec![])],
+    });
+    let stack = build_replaying(vec![layer(1, "Paint", ProjectLayerKind::Paint, vec![group])]);
+    let ours = by_name(&stack, "Paint");
+    assert!(ours.lock.is_none() && ours.placeholders().count() == 0, "{ours:?}");
+    assert_eq!(stack.jobs.len(), 1);
+    assert_eq!(stack.jobs[0].steps.iter().map(|s| s.mode).collect::<Vec<_>>(), [PaintMode::Paint, PaintMode::Smudge]);
+    assert_eq!(stack.jobs[0].steps[1].values.iter().map(|v| v.0).collect::<Vec<_>>(), [Channel::BaseColor]);
+    // in a mask: a group holding a smudge is one paint effect even when it blends normally; a smudge on its own is not
+    // replayed (what it moves lies below its effect)
+    let smudging = mask_group(4, ProjectBlendMode::Normal, 1.0, vec![painting(5, 0, PaintTool::Brush, vec![]), painting(6, 0, PaintTool::Smudge, vec![])]);
+    let mut l = layer(1, "Masked", ProjectLayerKind::Fill, vec![fill(2, ROUGH, vec![uniform(ROUGH, [1.0; 3])], vec![])]);
+    l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::Black, effects: vec![smudging, painting(7, 0, PaintTool::Smudge, vec![])] });
+    let stack = build_replaying(vec![l]);
+    let ours = by_name(&stack, "Masked");
+    let m = ours.mask.as_ref().unwrap();
+    assert_eq!(m.effects.len(), 2, "{:?}", m.effects);
+    assert!(matches!(m.effects[0].kind, EffectKind::Paint));
+    assert_eq!(stack.jobs.len(), 1);
+    assert_eq!(stack.jobs[0].steps.iter().map(|s| s.mode).collect::<Vec<_>>(), [PaintMode::Paint, PaintMode::Smudge]);
+    assert!(matches!(m.effects[1].kind, EffectKind::Placeholder { .. }));
+    assert!(ours.lock.as_ref().unwrap().keys().contains(&"brush:smudge-alone"), "{:?}", ours.lock);
 }

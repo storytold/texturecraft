@@ -72,6 +72,7 @@ fn step(mode: PaintMode, strokes: Vec<ReplayStroke>) -> ReplayStep {
         opacity: 1.0,
         brush: brush(0.1),
         stencil: None,
+        projection: None,
         strokes,
         notes: vec![],
     }
@@ -318,4 +319,74 @@ fn a_dynamic_alpha_lays_its_stamps_in_turn() {
     // dabs 6.4 texels wide every 6.4 texels from texel 25.6: the first laid, the second not, the third laid
     let at = |k: f32| line[(25.6 + 6.4 * k) as usize];
     assert!(at(0.0) > 0.95 && at(1.0) < 0.01 && at(2.0) > 0.95, "{} {} {}", at(0.0), at(1.0), at(2.0));
+}
+
+/// A job painting a band down the texture at `u` (2D view, or its place through the camera), then smudging along
+/// `smudge` in `space`.
+fn smudge_job(target: ReplayTarget, space: StrokeSpace, band: [[f32; 2]; 2], smudge: [[f32; 2]; 2]) -> ReplayJob {
+    let mut paint = step(PaintMode::Paint, vec![stroke(space.clone(), &band)]);
+    paint.brush.radius = 0.25;
+    let mut smudging = step(PaintMode::Smudge, vec![stroke(space, &smudge)]);
+    smudging.values = vec![(Channel::BaseColor, [0.0; 3], 1.0)];
+    (smudging.brush.spacing, smudging.brush.culling) = (0.05, None);
+    ReplayJob { target, label: "test".into(), steps: vec![paint, smudging] }
+}
+
+#[test]
+fn a_smudge_drags_what_the_steps_before_it_laid_in_both_views() {
+    let mesh = wall();
+    let c = RES / 2;
+    // a band down the left of the wall (texels about 10 to 42), smudged to the right along the middle row
+    let views =
+        [(StrokeSpace::Uv, [[0.2, 0.2], [0.2, 0.8]], [[0.2, 0.5], [0.7, 0.5]]), (camera(Vec3::Y), [[-0.3, -0.3], [-0.3, 0.3]], [[-0.3, 0.0], [0.25, 0.0]])];
+    for (space, band, along) in views {
+        let out = replay(&mesh, &[smudge_job(ReplayTarget::Mask(LayerId(7)), space.clone(), band, along)]);
+        let mut band_only = smudge_job(ReplayTarget::Mask(LayerId(7)), space.clone(), band, along);
+        band_only.steps.truncate(1);
+        let before = replay(&mesh, &[band_only]);
+        let (dragged, untouched) = (mask_at(&out[0], 70, c), mask_at(&out[0], 70, c - 25));
+        assert!(dragged.1 > 0.3 && (dragged.0 / dragged.1 - 0.5).abs() < 0.01, "{space:?}: the band's grey dragged right: {dragged:?}");
+        assert_eq!(untouched.1, 0.0, "{space:?}: nothing off the smudge's path");
+        assert!(mask_at(&before[0], 70, c).1 == 0.0, "{space:?}: the band alone does not reach there");
+        // smudged the other way: the empty right drawn into the band thins it
+        let back = replay(&mesh, &[smudge_job(ReplayTarget::Mask(LayerId(7)), space.clone(), band, [along[1], along[0]])]);
+        let x = if space == StrokeSpace::Uv { 30 } else { 32 };
+        assert!(mask_at(&back[0], x, c).1 < 0.9 * mask_at(&before[0], x, c).1, "{space:?}: {:?}", mask_at(&back[0], x, c));
+    }
+}
+
+#[test]
+fn a_smudge_moves_content_values_with_their_coverage_and_alone_moves_nothing() {
+    let mesh = wall();
+    let c = RES / 2;
+    let out = replay(&mesh, &[smudge_job(ReplayTarget::Content(LayerId(3)), StrokeSpace::Uv, [[0.2, 0.2], [0.2, 0.8]], [[0.2, 0.5], [0.7, 0.5]])]);
+    let Ok(ReplayedPixels::Content(images)) = &out[0] else { panic!("content: {:?}", out[0]) };
+    let (channel, img) = &images[0];
+    assert_eq!(*channel, Channel::BaseColor);
+    let px: Vec<f32> = img.get(70, c).iter().map(|v| from_u16(*v)).collect();
+    assert!(px[3] > 0.3 && (px[0] / px[3] - 1.0).abs() < 0.01 && px[1] < 0.01, "red dragged right, premultiplied: {px:?}");
+    // a smudge with nothing laid before it in its job leaves the target empty
+    let mut alone = smudge_job(ReplayTarget::Mask(LayerId(7)), StrokeSpace::Uv, [[0.2, 0.2], [0.2, 0.8]], [[0.2, 0.5], [0.7, 0.5]]);
+    alone.steps.remove(0);
+    let out = replay(&mesh, &[alone]);
+    let Ok(ReplayedPixels::Mask(img)) = &out[0] else { panic!("a mask: {:?}", out[0]) };
+    assert_eq!(img.allocated_count(), 0);
+}
+
+#[test]
+fn projection_painting_lays_its_image_grey_on_the_view() {
+    let mesh = wall();
+    // the image: left half white, right half black, spanning the view
+    let image = ReplayStencil {
+        image: StencilImage::Image { width: 8, height: 1, values: Arc::from(vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]) },
+        matrix: [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0],
+    };
+    for (space, points) in [(StrokeSpace::Uv, [[0.2, 0.5], [0.8, 0.5]]), (camera(Vec3::Y), [[-0.3, 0.0], [0.3, 0.0]])] {
+        let mut s = step(PaintMode::Paint, vec![stroke(space.clone(), &points)]);
+        s.projection = Some(image.clone());
+        let out = replay(&mesh, &[job_of(s)]);
+        let (white, black) = (mask_at(&out[0], 40, RES / 2), mask_at(&out[0], RES - 40, RES / 2));
+        assert!(white.1 > 0.95 && (white.0 - white.1).abs() < 0.01, "{space:?}: the image's white: {white:?}");
+        assert!(black.1 > 0.95 && black.0 < 0.01, "{space:?}: its black, laid at full coverage: {black:?}");
+    }
 }

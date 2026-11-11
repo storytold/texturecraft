@@ -9,9 +9,9 @@
 //! net composites, so the measured scores include the replayed pixels. Without a replayer, strokes stay placeholders
 //! locked with `strokes:<tool>`.
 //!
-//! Paint effects that cannot be replayed (particles, ribbons, path strokes, projection, smudge, brushes painting images
-//! or graphs, tips that are compiled graphs the project does not hold) stay placeholders with a precise `brush:` or
-//! `brush-alpha:` reason.
+//! Paint effects that cannot be replayed (particles, ribbons, path strokes, projection painting without an image or on a
+//! paint layer, brushes painting images or graphs, tips that are compiled graphs the project does not hold) stay
+//! placeholders with a precise `brush:` or `brush-alpha:` reason.
 
 pub mod brush;
 pub mod tip;
@@ -34,6 +34,9 @@ pub enum PaintMode {
     Paint,
     /// Lowers the coverage of what is there.
     Erase,
+    /// Moves what the job's earlier steps laid (values and coverage, on the step's channels): each dab draws what lies
+    /// at the previous dab's place over its own.
+    Smudge,
 }
 
 /// How a tip that is not round lies on the surface.
@@ -154,6 +157,9 @@ pub struct ReplayStep {
     pub opacity: f32,
     pub brush: ReplayBrush,
     pub stencil: Option<ReplayStencil>,
+    /// Projection painting (masks): the grey laid at each texel is this image's where the texel lies on the stroke's
+    /// view, in place of `mask_value`.
+    pub projection: Option<ReplayStencil>,
     pub strokes: Vec<ReplayStroke>,
     /// What the step leaves out or approximates, for the report.
     pub notes: Vec<String>,

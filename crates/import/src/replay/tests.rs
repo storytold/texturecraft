@@ -130,8 +130,20 @@ fn masks_paint_a_grey_and_erasers_lower_coverage_or_paint_black() {
 #[test]
 fn what_the_brush_cannot_replay_is_refused_with_a_reason() {
     let key = |e: &PaintEffect| of(e, StepTarget::Content).unwrap_err().key.to_string();
-    assert_eq!(key(&effect(PaintTool::Smudge)), "brush:smudge");
+    // projection painting: not on a paint layer, never without an image; neither it nor a smudge along 3D paths
     assert_eq!(key(&effect(PaintTool::Projection)), "brush:projection");
+    let mut e = effect(PaintTool::Projection);
+    e.colors.clear();
+    assert_eq!(of(&e, StepTarget::Mask).unwrap_err().key.to_string(), "brush:projection");
+    for tool in [PaintTool::Projection, PaintTool::Smudge] {
+        let mut e = effect(tool);
+        e.paths.push(texturecraft_import_reader::model::StrokePath3d::line([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]));
+        let b = of(&e, StepTarget::Mask).unwrap_err();
+        assert_eq!(b.key.to_string(), "brush:3d-path");
+        assert!(b.text.contains(if tool == PaintTool::Smudge { "smudge" } else { "projection" }), "{}", b.text);
+    }
+    assert_eq!(brush::alone(&effect(PaintTool::Smudge)).unwrap_err().key.to_string(), "brush:smudge-alone");
+    assert!(brush::alone(&effect(PaintTool::Brush)).is_ok());
     let mut e = effect(PaintTool::Brush);
     e.brush = Some(ProjectBrush { emitter: StampEmitter::Physics(Default::default()), ..ProjectBrush::default() });
     assert_eq!(key(&e), "brush:particle");
@@ -277,4 +289,36 @@ fn a_dynamic_alpha_cycles_through_its_stamps() {
         q.tweaks.clear();
     }
     assert!(with(ProjectSource::Procedural(plain)).brush.cycle.is_empty());
+}
+
+#[test]
+fn a_smudge_moves_what_is_there_on_the_channels_it_works_on() {
+    let mut e = effect(PaintTool::Smudge);
+    e.stencil = Some(uniform(0, [0.8; 3], 1.0));
+    let s = of(&e, StepTarget::Content).unwrap();
+    assert_eq!(s.mode, PaintMode::Smudge);
+    assert_eq!(s.values, vec![(Channel::BaseColor, [0.0; 3], 1.0), (Channel::Roughness, [0.0; 3], 1.0)], "every channel it works on, no value");
+    assert_eq!(s.opacity, 0.5);
+    assert!(s.stencil.is_none() && s.projection.is_none());
+    assert!(s.notes.iter().any(|n| n.contains("stencil")), "{:?}", s.notes);
+    assert!(s.notes.iter().any(|n| n.contains("symmetry copies")), "{:?}", s.notes);
+    let s = of(&e, StepTarget::Mask).unwrap();
+    assert_eq!((s.mode, s.values.len()), (PaintMode::Smudge, 0));
+}
+
+#[test]
+fn projection_painting_in_a_mask_places_its_image_on_the_view() {
+    let mut e = effect(PaintTool::Projection);
+    e.colors = vec![uniform(0, [0.6; 3], 0.5)];
+    let s = of(&e, StepTarget::Mask).unwrap();
+    assert_eq!(s.mode, PaintMode::Paint);
+    assert_eq!(s.projection, Some(ReplayStencil { image: StencilImage::Uniform(0.3), matrix: [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0] }));
+    assert!(s.stencil.is_none());
+    // the image and a stencil share `projMatrix`
+    e.stencil = Some(uniform(0, [1.0; 3], 1.0));
+    e.stencil_matrix = Some([2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.25, 0.0, 1.0]);
+    let s = of(&e, StepTarget::Mask).unwrap();
+    assert_eq!(s.projection.map(|p| p.matrix), s.stencil.map(|p| p.matrix));
+    // a brush has no projection
+    assert!(of(&effect(PaintTool::Brush), StepTarget::Mask).unwrap().projection.is_none());
 }

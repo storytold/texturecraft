@@ -15,6 +15,13 @@
 //! - **Dynamic alphas**: dab `k` lays stamp `k + start` of the cycle (`start` drawn from the seed where the alpha says).
 //! - **Stencil**: once a stroke's dabs are laid, its coverage is multiplied by the stencil where each texel lies on the
 //!   stroke's view ([`texturecraft_paint::ViewStencil`]).
+//! - **Projection painting** (masks): the grey laid at each texel is the projected image's where the texel lies on the
+//!   stroke's view, placed as a stencil is ([`texturecraft_paint::commit_mask_texels`]).
+//! - **Smudge**: dab by dab, in order, each dab's texels (as the brush lays them, times the effect's opacity) draw what
+//!   lies at the previous dab's centre over their own, in place in the pixels the job's earlier steps laid, values and
+//!   coverage alike ([`texturecraft_paint::smudge_in_place`], the rule measured on the file's app). A dab further than
+//!   [`SMUDGE_JUMP`] radii from the previous one on the mesh, or [`SMUDGE_SEAM`] radii away in the texture (a seam),
+//!   moves nothing; symmetry copies are not smudged.
 //! - Dabs reach every surface in their volume whatever the view sees (measured: nothing occludes), faded by the turn
 //!   from the dab's normal as the brush's culling says ([`Facing::Fade`]); each stroke is laid on its own and committed
 //!   with the effect's opacity ("over" for paint, coverage lowered for the eraser).
@@ -36,7 +43,7 @@ use texturecraft_paint::alphas::AlphaImage;
 use texturecraft_paint::jitter::{Jittered, StrokeRandom, cycle_start};
 use texturecraft_paint::{
     Alignment, BrushAlpha, BrushSettings, CommitSource, Facing, PickCtx, RasterCtx, SeededJitter, Shape, Staging, Stamp, Stroke, StrokeCanvas, UvStamp,
-    ViewStencil, commit_layer, commit_mask, pressure_scale, rasterize, rasterize_uv,
+    ViewStencil, commit_layer, commit_mask, commit_mask_texels, footprint, footprint_uv, pressure_scale, rasterize, rasterize_uv, smudge_in_place,
 };
 use texturecraft_texel::TileImage;
 
@@ -54,6 +61,11 @@ const MAX_DABS: usize = 1 << 20;
 const POINTS_PER_BATCH: usize = 64;
 /// Steepest pitch the orbit camera takes (it looks along the vertical badly).
 const MAX_PITCH_DEGREES: f32 = 89.95;
+/// A smudge dab further than this many radii from the previous one on the mesh draws nothing (the pen jumped; measured
+/// rule of the file's app).
+pub const SMUDGE_JUMP: f32 = 4.0;
+/// A smudge dab whose previous one lies further than this many radii away in the texture draws nothing (a seam).
+pub const SMUDGE_SEAM: f32 = 16.0;
 
 /// The replayer `file.importProject` gives the import.
 #[derive(Debug, Clone, Copy, Default)]
@@ -182,6 +194,14 @@ impl Tip {
         if self.drawn_start { cycle_start(seed, self.cycle.len()) } else { 0 }
     }
 
+    /// The shape dab `seed` lays: stamp `seed + start` of the cycle, or the tip.
+    fn shape_of(&self, seed: u32, start: usize) -> Shape<'_> {
+        match self.cycle.len() {
+            0 => self.shape(),
+            n => Shape { library: self.cycle.get((seed as usize).wrapping_add(start) % n), ..self.shape() },
+        }
+    }
+
     /// `dabs` by the shape they lay: dab `k` (its `seed(dab)`) lays stamp `k + start` of the cycle; without a cycle,
     /// all lay the tip.
     fn by_stamp<T: Copy>(&self, dabs: &[T], start: usize, seed: impl Fn(&T) -> u32) -> Vec<(Shape<'_>, Vec<T>)> {
@@ -209,27 +229,40 @@ fn view_stencil(stencil: &ReplayStencil) -> Result<ViewStencil, String> {
     }
 }
 
-/// Multiplies a laid stroke's coverage by `stencil` where each texel lies on the stroke's view: through the recorded
-/// camera for the 3D view (nothing behind it), the texture spanning the view for the 2D view.
-fn through(set: &SetMesh, stroke: &ReplayStroke, stencil: &ViewStencil, canvas: &mut StrokeCanvas) {
-    let res = set.resolution;
-    match &stroke.space {
-        StrokeSpace::Mesh { view, projection } => {
-            let view_projection = Mat4::from_cols_array(projection) * Mat4::from_cols_array(view);
-            canvas.scale(|x, y| {
-                let Some(surface) = set.gbuf.surface(&set.mesh, y as usize * res as usize + x as usize) else { return 0.0 };
-                let clip = view_projection * surface.pos.extend(1.0);
-                if clip.w.is_nan() || clip.w <= 1e-6 {
-                    return 0.0;
-                }
-                stencil.at(Vec2::new(clip.x / clip.w, clip.y / clip.w))
-            });
-        }
-        StrokeSpace::Uv => {
-            let r = res as f32;
-            canvas.scale(|x, y| stencil.at(Vec2::new((x as f32 + 0.5) / r * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / r * 2.0)));
+/// Where a stroke's texels lie on its view.
+enum OnView<'a> {
+    /// Through the recorded camera (view times projection).
+    Mesh(&'a SetMesh, Mat4),
+    /// The 2D view: the texture spans the view.
+    Texture(f32),
+}
+
+impl OnView<'_> {
+    fn of<'a>(set: &'a SetMesh, stroke: &ReplayStroke) -> OnView<'a> {
+        match &stroke.space {
+            StrokeSpace::Mesh { view, projection } => OnView::Mesh(set, Mat4::from_cols_array(projection) * Mat4::from_cols_array(view)),
+            StrokeSpace::Uv => OnView::Texture(set.resolution as f32),
         }
     }
+
+    /// Texel `(x, y)` on the view in normalised device coordinates (y up); `None` off the set or behind the camera.
+    fn at(&self, x: u32, y: u32) -> Option<Vec2> {
+        match self {
+            OnView::Mesh(set, view_projection) => {
+                let surface = set.gbuf.surface(&set.mesh, y as usize * set.resolution as usize + x as usize)?;
+                let clip = *view_projection * surface.pos.extend(1.0);
+                (clip.w > 1e-6).then(|| Vec2::new(clip.x / clip.w, clip.y / clip.w))
+            }
+            OnView::Texture(r) => Some(Vec2::new((x as f32 + 0.5) / r * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / r * 2.0)),
+        }
+    }
+}
+
+/// Multiplies a laid stroke's coverage by `stencil` where each texel lies on the stroke's view (nothing behind the
+/// camera).
+fn through(set: &SetMesh, stroke: &ReplayStroke, stencil: &ViewStencil, canvas: &mut StrokeCanvas) {
+    let on = OnView::of(set, stroke);
+    canvas.scale(|x, y| on.at(x, y).map_or(0.0, |p| stencil.at(p)));
 }
 
 /// Lays every step of `job` into its target.
@@ -238,7 +271,12 @@ fn replay_job(set: &SetMesh, job: &ReplayJob, stop: &(dyn Fn() -> bool + Sync)) 
     let id = job.target.id();
     for step in &job.steps {
         let tip = Tip::of(&step.brush)?;
+        if step.mode == PaintMode::Smudge {
+            smudge_step(set, step, &tip, job.target, &mut pixels, stop)?;
+            continue;
+        }
         let stencil = step.stencil.as_ref().map(view_stencil).transpose()?;
+        let projection = step.projection.as_ref().map(view_stencil).transpose()?;
         for stroke in &step.strokes {
             if stop() {
                 return Err("cancelled".into());
@@ -251,7 +289,14 @@ fn replay_job(set: &SetMesh, job: &ReplayJob, stop: &(dyn Fn() -> bool + Sync)) 
             if canvas.dirty.is_empty() {
                 continue;
             }
-            commit(&mut pixels, set, job.target, step, &canvas);
+            match (&projection, job.target) {
+                (Some(image), ReplayTarget::Mask(id)) => {
+                    let on = OnView::of(set, stroke);
+                    let grey = |x: u32, y: u32| Some(on.at(x, y).map_or(0.0, |p| image.at(p)));
+                    commit_mask_texels(&mut pixels, id, set.size(), &grey, source(step, &canvas, 1.0));
+                }
+                _ => commit(&mut pixels, set, job.target, step, &canvas),
+            }
         }
     }
     Ok(match job.target {
@@ -265,16 +310,21 @@ fn replay_job(set: &SetMesh, job: &ReplayJob, stop: &(dyn Fn() -> bool + Sync)) 
     })
 }
 
-/// Commits one stroke's coverage into the target with the step's values and opacity.
-fn commit(pixels: &mut PixelStore, set: &SetMesh, target: ReplayTarget, step: &ReplayStep, canvas: &StrokeCanvas) {
-    let source = |opacity: f32| CommitSource {
+/// A laid stroke as a commit source with the step's opacity times `opacity`.
+fn source<'a>(step: &ReplayStep, canvas: &'a StrokeCanvas, opacity: f32) -> CommitSource<'a> {
+    CommitSource {
         alpha: &canvas.alpha,
         tiles: &canvas.dirty,
         opacity: (step.opacity * opacity).clamp(0.0, 1.0),
         erase: step.mode == PaintMode::Erase,
         per_texel: None,
         carried: None,
-    };
+    }
+}
+
+/// Commits one stroke's coverage into the target with the step's values and opacity.
+fn commit(pixels: &mut PixelStore, set: &SetMesh, target: ReplayTarget, step: &ReplayStep, canvas: &StrokeCanvas) {
+    let source = |opacity: f32| source(step, canvas, opacity);
     match target {
         ReplayTarget::Mask(id) => commit_mask(pixels, id, set.size(), step.mask_value, source(1.0), &mut Staging::default()),
         ReplayTarget::Content(id) => {
@@ -441,14 +491,20 @@ fn lay_dabs(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, start: usize, eye: Ve
 
 /// A 3D-view stroke through TextureCraft's [`Stroke`], fed point by point, dabs laid batch by batch.
 fn lay_mesh_stroke(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayStroke, camera: &ViewCamera, canvas: &mut StrokeCanvas) {
+    let (eye, start) = (camera.orbit.eye(), tip.start(stroke.seed));
+    mesh_dabs(set, brush, tip, stroke, camera, true, |dabs| lay_dabs(set, brush, tip, start, eye, dabs, canvas));
+}
+
+/// A 3D-view stroke's dabs through TextureCraft's [`Stroke`], fed point by point, handed to `lay` in order batch by
+/// batch; each batch's symmetry copies after its originals when `copies`.
+fn mesh_dabs(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayStroke, camera: &ViewCamera, copies: bool, mut lay: impl FnMut(&[Stamp])) {
     let (mut settings, size_scale) = settings(brush, stroke.lazy * VIEWPORT_HEIGHT);
     settings.hardness = tip.hardness;
     settings.alpha = tip.alpha;
     let mut pen = Stroke::new(&settings, &set.mesh).seeded(seeded(brush, stroke));
     pen.radius = brush.radius * size_scale;
     let ctx = PickCtx { mesh: &set.mesh, bvh: &set.bvh, camera: &camera.orbit, viewport: camera.viewport };
-    let (eye, start) = (camera.orbit.eye(), tip.start(stroke.seed));
-    let copies = symmetry(stroke);
+    let copies = if copies { symmetry(stroke) } else { Vec::new() };
     let mut laid = 0usize;
     for points in stroke.points.chunks(POINTS_PER_BATCH) {
         let mut dabs = Vec::new();
@@ -465,7 +521,7 @@ fn lay_mesh_stroke(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &Repla
             }
         }
         laid = laid.saturating_add(dabs.len());
-        lay_dabs(set, brush, tip, start, eye, &dabs, canvas);
+        lay(&dabs);
         if laid > MAX_DABS {
             break;
         }
@@ -521,6 +577,23 @@ fn trail(points: &[(Vec2, f32)], length: f32) -> Vec<(Vec2, f32)> {
 /// is not laid. Symmetry copies are laid on the mesh.
 fn lay_uv_stroke(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayStroke, canvas: &mut StrokeCanvas) {
     let res = set.resolution as f32;
+    let dabs = uv_dabs(set, brush, tip, stroke);
+    let start = tip.start(stroke.seed);
+    for (shape, group) in tip.by_stamp(&dabs, start, |d| d.seed) {
+        rasterize_uv(canvas, &set.gbuf, shape, &group);
+    }
+    // symmetry: the copies of the dabs' places on the mesh
+    let copies = symmetry(stroke);
+    if !copies.is_empty() {
+        let on_mesh: Vec<Stamp> = dabs.iter().filter_map(|d| d.on_mesh(&set.mesh, &set.gbuf, set.world_per_texel * res)).collect();
+        let copied: Vec<Stamp> = copies.iter().flat_map(|m| on_mesh.iter().filter_map(move |d| copied(d, m))).collect();
+        lay_dabs(set, brush, tip, start, set.center, &copied, canvas);
+    }
+}
+
+/// A 2D-view stroke's dabs in order (see [`lay_uv_stroke`]), without symmetry copies.
+fn uv_dabs(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayStroke) -> Vec<UvStamp> {
+    let res = set.resolution as f32;
     let points: Vec<(Vec2, f32)> = stroke.points.iter().map(|p| (Vec2::new(p.position[0], p.position[1]) * res, p.pressure)).collect();
     let points = trail(&points, stroke.lazy * res);
     let (settings, _) = settings(brush, 0.0);
@@ -559,7 +632,7 @@ fn lay_uv_stroke(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayS
         spots = spots.wrapping_add(1);
         if on_surface(at) { (brush.spacing.max(0.01) * 2.0 * r * UV_STEP).max(1e-3) } else { OFF_SURFACE_STEP * res }
     };
-    let Some(&(first, p0)) = points.first() else { return };
+    let Some(&(first, p0)) = points.first() else { return dabs };
     // the first spot faces along the path's first move
     let heading = points.windows(2).find_map(|w| match w {
         [(a, _), (b, _)] => (*b - *a).try_normalize(),
@@ -587,16 +660,109 @@ fn lay_uv_stroke(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayS
         }
         left -= l - t;
     }
-    let start = tip.start(stroke.seed);
-    for (shape, group) in tip.by_stamp(&dabs, start, |d| d.seed) {
-        rasterize_uv(canvas, &set.gbuf, shape, &group);
+    dabs
+}
+
+/// A smudge dab: its texels' coverage (the brush's shape, flow and culling), its centre in texels, and its centre and
+/// radius on the mesh.
+struct SmudgeDab {
+    texels: Vec<(u32, u32, f32)>,
+    texel: Vec2,
+    center: Vec3,
+    radius: f32,
+}
+
+/// The texel (continuous, texel centres at halves) under a point on the set's surface; `None` off it.
+fn texel_under(set: &SetMesh, p: Vec3, reach: f32) -> Option<Vec2> {
+    let hit = set.bvh.nearest(p, reach.max(1e-4), &|_| true)?;
+    let [a, b, c] = set.mesh.tri(hit.tri as usize)?;
+    let (ua, ub, uc) = (set.mesh.uvs.get(a)?, set.mesh.uvs.get(b)?, set.mesh.uvs.get(c)?);
+    let uv = *ua * (1.0 - hit.u - hit.v) + *ub * hit.u + *uc * hit.v;
+    let t = uv * set.resolution as f32;
+    t.is_finite().then_some(t)
+}
+
+/// One smudge step: each stroke's dabs in order, every dab after the first moving what lies at the previous dab's
+/// centre over its own texels, in place in the target's images the job's earlier steps laid (a step's channels with
+/// their own opacity, or the mask's grey). Images that hold nothing yet have nothing to move.
+fn smudge_step(
+    set: &SetMesh,
+    step: &ReplayStep,
+    tip: &Tip,
+    target: ReplayTarget,
+    pixels: &mut PixelStore,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    // the images moved, each with the share of a dab's coverage it takes
+    let mut images: Vec<(Option<Channel>, f32, TileImage)> = match target {
+        ReplayTarget::Content(id) => {
+            step.values.iter().filter_map(|(c, _, o)| pixels.layers.remove(&(id, *c)).map(|img| (Some(*c), step.opacity * o.clamp(0.0, 1.0), img))).collect()
+        }
+        ReplayTarget::Mask(id) => pixels.masks.remove(&id).map(|img| (None, step.opacity, img)).into_iter().collect(),
+    };
+    let mut result = Ok(());
+    if !images.is_empty() {
+        for stroke in &step.strokes {
+            if stop() {
+                result = Err("cancelled".into());
+                break;
+            }
+            smudge_stroke(set, step, tip, stroke, &mut images);
+        }
     }
-    // symmetry: the copies of the dabs' places on the mesh
-    let copies = symmetry(stroke);
-    if !copies.is_empty() {
-        let on_mesh: Vec<Stamp> = dabs.iter().filter_map(|d| d.on_mesh(&set.mesh, &set.gbuf, set.world_per_texel * res)).collect();
-        let copied: Vec<Stamp> = copies.iter().flat_map(|m| on_mesh.iter().filter_map(move |d| copied(d, m))).collect();
-        lay_dabs(set, brush, tip, start, set.center, &copied, canvas);
+    for (c, _, img) in images {
+        match (target, c) {
+            (ReplayTarget::Content(id), Some(c)) => {
+                pixels.layers.insert((id, c), img);
+            }
+            (ReplayTarget::Mask(id), _) => {
+                pixels.masks.insert(id, img);
+            }
+            (ReplayTarget::Content(_), None) => {}
+        }
+    }
+    result
+}
+
+/// Smudges one stroke into `images` (see [`smudge_step`]).
+fn smudge_stroke(set: &SetMesh, step: &ReplayStep, tip: &Tip, stroke: &ReplayStroke, images: &mut [(Option<Channel>, f32, TileImage)]) {
+    let brush = &step.brush;
+    let start = tip.start(stroke.seed);
+    let res = set.resolution as f32;
+    let mut last: Option<(Vec2, Vec3)> = None;
+    let mut smudge = |dab: Option<SmudgeDab>| {
+        let Some(dab) = dab else { return };
+        let previous = last.replace((dab.texel, dab.center));
+        let Some((from, center)) = previous else { return };
+        let shift = from - dab.texel;
+        if (center - dab.center).length() > SMUDGE_JUMP * dab.radius || shift.length() * set.world_per_texel > SMUDGE_SEAM * dab.radius {
+            return;
+        }
+        images.par_iter_mut().for_each(|(c, share, img)| {
+            let texels: Vec<(u32, u32, f32)> = dab.texels.iter().map(|&(x, y, a)| (x, y, a * *share)).collect();
+            smudge_in_place(img, c.as_ref().map_or(texturecraft_core::ChannelKind::Scalar, |c| c.kind()), &texels, shift.to_array());
+        });
+    };
+    match &stroke.space {
+        StrokeSpace::Mesh { view, projection } => {
+            let Some(camera) = ViewCamera::new(view, projection, set.center, set.radius) else { return };
+            let eye = camera.orbit.eye();
+            mesh_dabs(set, brush, tip, stroke, &camera, false, |dabs| {
+                for d in dabs {
+                    let texels = footprint(&raster_ctx(set, brush, eye, tip.shape_of(d.seed, start)), d);
+                    smudge(texel_under(set, d.center, 2.0 * d.radius).map(|texel| SmudgeDab { texels, texel, center: d.center, radius: d.radius }));
+                }
+            });
+        }
+        StrokeSpace::Uv => {
+            for d in uv_dabs(set, brush, tip, stroke) {
+                let texel = d.center * res;
+                let (x, y) = (texel.x.floor(), texel.y.floor());
+                let Some(surface) = set.gbuf.surface(&set.mesh, y as usize * set.resolution as usize + x as usize) else { continue };
+                let texels = footprint_uv(&set.gbuf, tip.shape_of(d.seed, start), &d);
+                smudge(Some(SmudgeDab { texels, texel, center: surface.pos, radius: d.radius * res * set.world_per_texel }));
+            }
+        }
     }
 }
 

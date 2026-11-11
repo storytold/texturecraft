@@ -17,10 +17,13 @@
 //! | 2D-view points | texture coordinates: the file stores V up, the mesh's UVs run down (measured) |
 //! | `duplicateCount`, `duplicateMatrix` | symmetry copies, the matrix applied once more per copy (both views) |
 //! | `sourceStencil`, `projMatrix` | the stencil the strokes go through, placed on the view ([`tip::stencil`]) |
+//! | projection tool | a mask's strokes paint the grey of the first `sourceColor`, placed on the view by `projMatrix` |
+//! | smudge tool | each dab draws what lies at the previous dab's place over its own, values and coverage (measured) |
 //! | `stampBlendingMode` ≠ 0, `aspectRatio` ≠ 1, other `alignment` | approximated (noted) |
 //!
-//! Not replayable (a `brush:` blocker): particle brushes, ribbons, path strokes, projection painting, smudging, brushes
-//! painting images, graphs or anchors, unreadable point lists.
+//! Not replayable (a `brush:` blocker): particle brushes, ribbons, path strokes, projection painting without an image or
+//! on a paint layer, a smudge with nothing of its effect before it, brushes painting images, graphs or anchors,
+//! unreadable point lists.
 
 use texturecraft_core::Channel;
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
@@ -56,9 +59,15 @@ pub fn refused(what: &str, text: impl Into<String>) -> Blocker {
 /// Why `effect` cannot be replayed, if it cannot (its tip and values are checked by [`step`]).
 pub fn check(effect: &PaintEffect) -> Result<(), Blocker> {
     match effect.tool {
-        PaintTool::Brush | PaintTool::Eraser => {}
-        PaintTool::Projection => return Err(refused("projection", "projection painting (the image placed on the view) is not replayed")),
-        PaintTool::Smudge => return Err(refused("smudge", "smudge strokes are not replayed")),
+        PaintTool::Brush | PaintTool::Eraser | PaintTool::Smudge => {}
+        PaintTool::Projection if effect.colors.is_empty() => return Err(refused("projection", "projection painting without an image")),
+        PaintTool::Projection => {}
+    }
+    if !effect.paths.is_empty() && effect.tool == PaintTool::Projection {
+        return Err(refused("3d-path", "3D path strokes with projection painting"));
+    }
+    if !effect.paths.is_empty() && effect.tool == PaintTool::Smudge {
+        return Err(refused("3d-path", "3D path strokes with the smudge tool"));
     }
     if let Some(b) = &effect.brush {
         match &b.emitter {
@@ -80,6 +89,15 @@ pub fn check(effect: &PaintEffect) -> Result<(), Blocker> {
     Ok(())
 }
 
+/// A smudge replayed as a job of its own moves only what its own effect holds, which is nothing; what it moves in the
+/// stack below is not replayed.
+pub fn alone(effect: &PaintEffect) -> Result<(), Blocker> {
+    match effect.tool {
+        PaintTool::Smudge => Err(refused("smudge-alone", "a smudge on its own (it moves what lies below its effect)")),
+        _ => Ok(()),
+    }
+}
+
 /// `effect` as a step painting into `target`, the declared `channels` of the set; or why it cannot be replayed.
 pub fn step(
     effect: &PaintEffect,
@@ -97,17 +115,27 @@ pub fn step(
     if let Some(n) = tip::uncycled(&effect.alpha, brush.cycle.len()) {
         notes.push(n);
     }
+    let (mode, values, mask_value) = values(effect, target, channels)?;
+    // the stencil and the projected image share `projMatrix`
+    let matrix = effect.stencil_matrix.filter(|m| m.iter().all(|v| v.is_finite())).unwrap_or(VIEW_STENCIL);
     let stencil = match &effect.stencil {
-        Some(source) => {
-            let matrix = effect.stencil_matrix.filter(|m| m.iter().all(|v| v.is_finite())).unwrap_or(VIEW_STENCIL);
-            Some(ReplayStencil { image: tip::stencil(source, images, graphs)?, matrix })
+        Some(_) if mode == PaintMode::Smudge => {
+            notes.push("a smudge's stencil left out".to_string());
+            None
         }
+        Some(source) => Some(ReplayStencil { image: tip::stencil(source, images, graphs)?, matrix }),
         None => None,
     };
-    let (mode, values, mask_value) = values(effect, target, channels)?;
-    let strokes = effect.strokes.iter().filter_map(|s| stroke(s, brush.size_pressure.is_some() || brush.flow_pressure.is_some())).collect();
+    let projection = match (effect.tool, effect.colors.first()) {
+        (PaintTool::Projection, Some(source)) => Some(ReplayStencil { image: tip::stencil(source, images, graphs)?, matrix }),
+        _ => None,
+    };
+    let strokes: Vec<ReplayStroke> = effect.strokes.iter().filter_map(|s| stroke(s, brush.size_pressure.is_some() || brush.flow_pressure.is_some())).collect();
+    if mode == PaintMode::Smudge && strokes.iter().any(|s| s.copies > 0) {
+        notes.push("symmetry copies of smudge strokes left out".to_string());
+    }
     let opacity = if effect.opacity.is_finite() { effect.opacity.clamp(0.0, 1.0) } else { 1.0 };
-    Ok(ReplayStep { mode, values, mask_value, opacity, brush, stencil, strokes, notes })
+    Ok(ReplayStep { mode, values, mask_value, opacity, brush, stencil, projection, strokes, notes })
 }
 
 /// The brush of `effect` (its defaults when it has none).
@@ -196,10 +224,18 @@ pub fn stroke(s: &ProjectStroke, pressure: bool) -> Option<ReplayStroke> {
 type Values = (PaintMode, Vec<(Channel, [f32; 3], f32)>, f32);
 
 /// What `effect` lays: the brush paints its `sourceColor` uniforms (linear, as fills); the eraser lowers coverage on the
-/// channels it works on, or in a mask paints black over what its strokes reach (measured).
+/// channels it works on, or in a mask paints black over what its strokes reach (measured); the smudge moves what is
+/// there on the channels it works on; projection painting in a mask paints its image's grey (the step's projection).
 fn values(effect: &PaintEffect, target: StepTarget, channels: &SetChannels) -> Result<Values, Blocker> {
     let paints_source = |s: &ProjectSource| refused(&format!("paints-{}", s.kind()), format!("brush paints a {} source", s.kind()));
     match (target, effect.tool) {
+        (StepTarget::Content, PaintTool::Projection) => Err(refused("projection", "projection painting on a paint layer")),
+        (StepTarget::Mask, PaintTool::Projection) => Ok((PaintMode::Paint, Vec::new(), 1.0)),
+        (StepTarget::Mask, PaintTool::Smudge) => Ok((PaintMode::Smudge, Vec::new(), 0.0)),
+        (StepTarget::Content, PaintTool::Smudge) => {
+            let worked = worked(effect, channels).into_iter().map(|c| (c, [0.0; 3], 1.0)).collect();
+            Ok((PaintMode::Smudge, worked, 0.0))
+        }
         (StepTarget::Mask, PaintTool::Eraser) => Ok((PaintMode::Paint, Vec::new(), 0.0)),
         (StepTarget::Mask, _) => match effect.colors.first() {
             None => Ok((PaintMode::Paint, Vec::new(), 1.0)),
