@@ -43,6 +43,32 @@ impl StrokeCanvas {
         }
     }
 
+    /// Multiply the stroke's coverage by `factor(x, y)` (clamped to 0..1) on every texel it touched: a stencil limiting
+    /// the stroke as a whole ([`crate::stencil`]).
+    pub fn scale(&mut self, factor: impl Fn(u32, u32) -> f32 + Sync) {
+        let (width, height) = (self.alpha.width(), self.alpha.height());
+        let alpha = &self.alpha;
+        let scaled: Vec<((u32, u32), Vec<u16>)> = self
+            .dirty
+            .par_iter()
+            .filter_map(|&(tx, ty)| {
+                let mut data = alpha.tile(tx, ty)?.to_vec();
+                for (i, v) in data.iter_mut().enumerate() {
+                    let (x, y) = (tx * TILE + i as u32 % TILE, ty * TILE + i as u32 / TILE);
+                    if *v == 0 || x >= width || y >= height {
+                        continue;
+                    }
+                    let f = factor(x, y);
+                    *v = to_u16(from_u16(*v) * if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 });
+                }
+                Some(((tx, ty), data))
+            })
+            .collect();
+        for ((tx, ty), data) in scaled {
+            self.alpha.set_tile(tx, ty, Some(std::sync::Arc::new(data)));
+        }
+    }
+
     fn touch(&mut self, x: u32, y: u32) {
         let t = (x / TILE, y / TILE);
         self.dirty.insert(t);
@@ -413,6 +439,52 @@ pub struct UvStamp {
     pub flow: f32,
     pub hardness: f32,
     pub seed: u32,
+}
+
+impl UvStamp {
+    /// This stamp as a stamp on the mesh, at the surface under its centre: its texture's x and up as the tip's axes
+    /// (turned by its angle), its radius `world_per_uv` mesh units per unit of texture. For laying a 2D-view stamp
+    /// where only the mesh can say where it goes, such as a symmetry copy. `None` off the texture set.
+    pub fn on_mesh(&self, mesh: &Mesh, gbuf: &UvGBuffer, world_per_uv: f32) -> Option<Stamp> {
+        let (w, h) = (gbuf.width, gbuf.height);
+        let (x, y) = (self.center.x * w as f32, self.center.y * h as f32);
+        if !(x >= 0.0 && y >= 0.0 && x < w as f32 && y < h as f32) {
+            return None;
+        }
+        let i = y as usize * w as usize + x as usize;
+        let surface = gbuf.surface(mesh, i)?;
+        let triangle = *gbuf.tri.get(i)?;
+        let [a, b, c] = mesh.tri(triangle as usize)?;
+        let (pa, pb, pc) = (mesh.positions.get(a)?, mesh.positions.get(b)?, mesh.positions.get(c)?);
+        let (ua, ub, uc) = (mesh.uvs.get(a)?, mesh.uvs.get(b)?, mesh.uvs.get(c)?);
+        // the surface's change along the texture's u and v
+        let (e1, e2, d1, d2) = (*pb - *pa, *pc - *pa, *ub - *ua, *uc - *ua);
+        let det = d1.perp_dot(d2);
+        if det.abs() < f32::MIN_POSITIVE {
+            return None;
+        }
+        let along_u = (e1 * d2.y - e2 * d1.y) / det;
+        let along_v = (e2 * d1.x - e1 * d2.x) / det;
+        let normal = surface.nrm.try_normalize()?;
+        let flat = |v: Vec3| (v - normal * normal.dot(v)).try_normalize();
+        // texel rows run down: the tip's up is against v
+        let (right, up) = (flat(along_u)?, flat(-along_v)?);
+        let (sin, cos) = self.angle.to_radians().sin_cos();
+        let tangent = (right * cos + up * sin).try_normalize()?;
+        let radius = self.radius * world_per_uv;
+        (radius.is_finite() && radius > 0.0).then_some(Stamp {
+            center: surface.pos,
+            normal,
+            tangent,
+            bitangent: normal.cross(tangent),
+            radius,
+            flow: self.flow,
+            hardness: self.hardness,
+            depth: 1.0,
+            seed: self.seed,
+            source: None,
+        })
+    }
 }
 
 /// Accumulate UV-space stamps into `canvas` (only texels covered by the texture set).
