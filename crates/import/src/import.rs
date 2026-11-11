@@ -130,6 +130,8 @@ pub struct Hooks<'h> {
     pub progress: &'h dyn Fn(f32, Step),
     pub cancel: &'h Cancel,
     pub replay: Option<&'h dyn StrokeReplayer>,
+    /// Where graph cooks are also kept between imports (a folder on the desktop; `None`: render every one).
+    pub kept_cooks: Option<std::sync::Arc<dyn texturecraft_compose::graphs::KeptCooks>>,
 }
 
 impl Hooks<'_> {
@@ -230,6 +232,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         graphs: GraphStore::with_cancel(hooks.cancel.clone()),
         sets: Vec::new(),
     };
+    imported.graphs.keep_cooks_in(hooks.kept_cooks.clone());
     for source in &binding.sets {
         mesh::merge_slots(&mut mesh, source.slot, &source.merged_slots);
         for m in &source.merged_slots {

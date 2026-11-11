@@ -30,7 +30,7 @@ fn main() {
         std::process::exit(2);
     };
     let cancel = Cancel::new();
-    let mut hooks = Hooks { progress: &|_, _| {}, cancel: &cancel, replay: None };
+    let mut hooks = Hooks { progress: &|_, _| {}, cancel: &cancel, replay: None, kept_cooks: None };
     let imported = match import_path(Path::new(file), &Default::default(), &mut hooks) {
         Ok(i) => i,
         Err(e) => {

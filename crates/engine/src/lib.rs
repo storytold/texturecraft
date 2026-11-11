@@ -52,6 +52,7 @@ pub mod preview;
 pub mod project_cmds;
 pub mod quick_mask;
 pub mod resource_cmds;
+pub mod result_cache;
 pub mod session;
 pub mod set_cmds;
 pub mod smart_masks;

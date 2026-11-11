@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Import project...",
         [],
         None,
-        "{path?: the project file (native only), bytes?: the project file as base64 (any target), name?: file name for the report (with bytes), originalOnTop?: bool (show the original's stored result on top of stacks that are not reproduced; default false), originalCorrection?: bool (a locked correction layer on top of stacks that are not reproduced, holding the stored result on the texels the layers miss; default false), nativeFilters?: bool (replace a few filter graphs by close built-in filters; default false), maxResolution?: px (cap texture set resolutions), measure?: bool (compare each stack with the stored result; default true), replayStrokes?: bool (replay brush strokes with TextureCraft's brush, approximated; default true), graphs?: \"decompile\" | \"keep\" (run the project's compiled graphs decompiled, or keep them as locked placeholders; default decompile)} → the session, plus {import: {sets: [{name, strategy, layers, locked, placeholders, channels, scores}]}}. One-way: the original file is only read",
+        "{path?: the project file (native only), bytes?: the project file as base64 (any target), name?: file name for the report (with bytes), originalOnTop?: bool (show the original's stored result on top of stacks that are not reproduced; default false), originalCorrection?: bool (a locked correction layer on top of stacks that are not reproduced, holding the stored result on the texels the layers miss; default false), nativeFilters?: bool (replace a few filter graphs by close built-in filters; default false), maxResolution?: px (cap texture set resolutions), measure?: bool (compare each stack with the stored result; default true), replayStrokes?: bool (replay brush strokes with TextureCraft's brush, approximated; default true), graphs?: \"decompile\" | \"keep\" (run the project's compiled graphs decompiled, or keep them as locked placeholders; default decompile), resultCache?: folder (native only: keep graph renders there and reuse them in later imports; default none), resultCacheGb?: the folder's limit in GB (default 20)} → the session, plus {import: {sets: [{name, strategy, layers, locked, placeholders, channels, scores}], resultCache?: {folder, found, missed, written, damaged, readBytes, writtenBytes}}}. One-way: the original file is only read",
         always,
         import
     )]
@@ -98,7 +98,7 @@ impl Session {
 
     /// Imports the project file `bytes` (`name` names it) and opens it as the session's project.
     pub fn import_project_bytes(&mut self, bytes: Vec<u8>, name: &str, options: &ImportOptions) -> Result<Value> {
-        let task = ImportTask { source: ImportSource::Bytes { bytes, name: name.to_string() }, options: options.clone() };
+        let task = ImportTask { source: ImportSource::Bytes { bytes, name: name.to_string() }, options: options.clone(), result_cache: None };
         let out = task.run(&ImportProgress::new())?;
         self.apply_import(out)
     }
@@ -203,6 +203,7 @@ enum ImportSource {
 pub struct ImportTask {
     source: ImportSource,
     options: ImportOptions,
+    result_cache: Option<crate::result_cache::ResultCache>,
 }
 
 /// A finished import: the converted project as a session, the summary the command replies with, and the flag it ran
@@ -230,20 +231,30 @@ impl ImportTask {
                 return Err(bad(ID, format!("the file is {} bytes; at most {MAX_BYTES} are read in memory", bytes.len())));
             }
             let name = strp(p, "name").unwrap_or("Imported project").to_string();
-            return Ok(ImportTask { source: ImportSource::Bytes { bytes, name }, options });
+            return Ok(ImportTask {
+                source: ImportSource::Bytes { bytes, name },
+                options,
+                result_cache: crate::result_cache::ResultCache::from_params(ID, p)?,
+            });
         }
-        Ok(ImportTask { source: path_source(p)?, options })
+        Ok(ImportTask { source: path_source(p)?, options, result_cache: crate::result_cache::ResultCache::from_params(ID, p)? })
     }
 
     /// Imports the file at `path` with the default options.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn path(path: impl Into<String>) -> ImportTask {
-        ImportTask { source: ImportSource::Path(path.into()), options: ImportOptions::default() }
+        ImportTask { source: ImportSource::Path(path.into()), options: ImportOptions::default(), result_cache: None }
     }
 
     /// Imports the project file `bytes` (named `name`) with the default options.
     pub fn bytes(name: impl Into<String>, bytes: Vec<u8>) -> ImportTask {
-        ImportTask { source: ImportSource::Bytes { bytes, name: name.into() }, options: ImportOptions::default() }
+        ImportTask { source: ImportSource::Bytes { bytes, name: name.into() }, options: ImportOptions::default(), result_cache: None }
+    }
+
+    /// Also keeps graph renders in `cache`'s folder and reuses those found there (native builds).
+    pub fn with_result_cache(mut self, cache: Option<crate::result_cache::ResultCache>) -> ImportTask {
+        self.result_cache = cache;
+        self
     }
 
     /// The path the import reads (`None` for bytes).
@@ -268,8 +279,13 @@ impl ImportTask {
     /// The steps: reading the file, per texture set converting, replaying strokes and cooking graphs, then saving
     /// (the converted project put together and stored as a TextureCraft project, in memory).
     pub fn run(self, progress: &ImportProgress) -> Result<ImportOutput> {
-        let ImportTask { source, options } = self;
-        run_with(progress, move |hooks| match source {
+        let ImportTask { source, options, result_cache } = self;
+        let cache = result_cache.map(|c| c.open());
+        #[cfg(not(target_arch = "wasm32"))]
+        let kept = cache.as_ref().map(|c| c.kept.clone());
+        #[cfg(target_arch = "wasm32")]
+        let kept = None;
+        let mut out = run_kept(progress, kept, move |hooks| match source {
             #[cfg(not(target_arch = "wasm32"))]
             ImportSource::Path(path) => texturecraft_import::import_path(std::path::Path::new(&path), &options, hooks).map_err(|e| (e, Some(path))),
             ImportSource::Bytes { bytes, name } => {
@@ -281,7 +297,11 @@ impl ImportTask {
                 }
                 texturecraft_import::import_bytes(bytes, &name, &options, hooks).map_err(|e| (e, None))
             }
-        })
+        })?;
+        if let (Some(c), Some(o)) = (&cache, out.summary.as_object_mut()) {
+            o.insert("resultCache".into(), c.summary());
+        }
+        Ok(out)
     }
 }
 
@@ -290,14 +310,24 @@ const CONVERTING: f32 = 0.9;
 
 /// [`ImportTask::run`] with the conversion given (`convert` runs the translator with the hooks; its error may name the
 /// file it read).
+#[cfg(test)]
 fn run_with(
     progress: &ImportProgress,
+    convert: impl FnOnce(&mut Hooks) -> std::result::Result<Imported, (texturecraft_import::ImportError, Option<String>)>,
+) -> Result<ImportOutput> {
+    run_kept(progress, None, convert)
+}
+
+/// Runs the conversion with the import's hooks (and graph cooks also kept in `kept`), then builds the session.
+fn run_kept(
+    progress: &ImportProgress,
+    kept: Option<std::sync::Arc<dyn texturecraft_compose::graphs::KeptCooks>>,
     convert: impl FnOnce(&mut Hooks) -> std::result::Result<Imported, (texturecraft_import::ImportError, Option<String>)>,
 ) -> Result<ImportOutput> {
     progress.check()?;
     let report = |f: f32, step: Step| progress.report(f * CONVERTING, step);
     let replayer = crate::import_replay::CancellableReplayer(progress.cancel.clone());
-    let mut hooks = Hooks { progress: &report, cancel: &progress.cancel, replay: Some(&replayer) };
+    let mut hooks = Hooks { progress: &report, cancel: &progress.cancel, replay: Some(&replayer), kept_cooks: kept };
     let imported = convert(&mut hooks).map_err(|(e, path)| match (e, path) {
         (texturecraft_import::ImportError::Cancelled, _) => bad(ID, CANCELLED),
         (e, Some(path)) => bad(ID, format!("{path}: {e}")),

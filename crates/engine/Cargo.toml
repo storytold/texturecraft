@@ -24,6 +24,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+# Graph cooks kept in a folder across imports (file.importProject `resultCache`); the web build has no folder.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+texturecraft-result-cache = { workspace = true }
+
 [dev-dependencies]
 image = { workspace = true }
 zip = { workspace = true }

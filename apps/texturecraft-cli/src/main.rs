@@ -42,10 +42,12 @@ USAGE:
       so a 2048 sample project is as large as a 1024 one.
   texturecraft-cli import <project file> <out.tcraft> [--original-on-top] [--original-correction]
                    [--native-filters] [--max-resolution <px>] [--no-measure] [--no-replay]
-                   [--graphs decompile|keep]
+                   [--graphs decompile|keep] [--result-cache <dir>] [--result-cache-gb <n>]
       Convert a project file of the reference app (one-way; the original is only read) and save
       it; prints what the import found per texture set (file.importProject). --original-correction
       adds a locked layer holding the original's result where the layers do not reproduce it.
+      --result-cache keeps graph renders in <dir> and reuses them in later imports (at most
+      --result-cache-gb GB, default 20).
   texturecraft-cli verify <project file> [<imported.tcraft>] [--set <name>] [--border <texels>] [--table]
                    [--max-resolution <px>] [--original-correction] [--native-filters] [--no-replay]
                    [--graphs decompile|keep]
@@ -81,7 +83,11 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("export", &["--preset", "--format", "--padding", "--size"], &[]),
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
     ("new", &["--resolution"], &["--sample"]),
-    ("import", &["--max-resolution", "--graphs"], &["--original-on-top", "--original-correction", "--native-filters", "--no-measure", "--no-replay"]),
+    (
+        "import",
+        &["--max-resolution", "--graphs", "--result-cache", "--result-cache-gb"],
+        &["--original-on-top", "--original-correction", "--native-filters", "--no-measure", "--no-replay"],
+    ),
     ("verify", &["--set", "--border", "--max-resolution", "--graphs"], &["--table", "--original-correction", "--native-filters", "--no-replay"]),
     ("graph", &["--size", "--output", "--seed", "--param", "--depth", "--timeout"], &[]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
@@ -312,6 +318,12 @@ fn import_params(a: &Args, input: &str) -> Result<Value, String> {
     }
     if a.has("--no-replay") {
         p["replayStrokes"] = json!(false);
+    }
+    if let Some(dir) = a.get("--result-cache") {
+        p["resultCache"] = json!(dir);
+    }
+    if let Some(gb) = a.num::<f64>("--result-cache-gb")? {
+        p["resultCacheGb"] = json!(gb);
     }
     Ok(p)
 }
