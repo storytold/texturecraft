@@ -550,7 +550,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
     /// What one fill writes per channel.
     fn fill_parts(&mut self, fill: &FillEffect) -> FillParts {
         let ch = self.input.channels;
-        let mapped = projection::map(fill, self.input.volume_unit);
+        let mapped = projection::map(fill);
         let mut parts =
             FillParts { groups: Vec::new(), graphs: Vec::new(), graph_names: Vec::new(), status: BTreeMap::new(), projection: mapped.projection.clone() };
         // per fill source: its channels, each with its own blending
@@ -568,8 +568,9 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
             let mut status = blend.status();
             let ours = match source {
                 ProjectSource::Uniform(u) => {
+                    // laid on through the projection's coverage (clip, falloffs): as exact as the projection
                     if projection::shapes_coverage(fill) {
-                        status.and(&Status::approximated("uniform fill faded or clipped by its projection"));
+                        status.and(&mapped.status);
                     }
                     let v = crate::channels::uniform_value(c, u.color);
                     Some(Source::Uniform(v.map(|x| if x.is_finite() { x } else { 0.0 })))

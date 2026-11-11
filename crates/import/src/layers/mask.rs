@@ -370,13 +370,14 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         let blend = ResolvedBlend::of_mask(&fill.header.blending);
         let counts = on && blend.contributes();
         let Some(source) = fill.sources.first() else { return };
-        let mapped = projection::map(fill, self.input.volume_unit);
+        let mapped = projection::map(fill);
         let projection = mapped.projection.clone();
         match source {
             ProjectSource::Uniform(u) => {
                 let v = if u.color[0].is_finite() { u.color[0] } else { 0.0 };
+                // laid on through the projection's coverage (clip, falloffs): as exact as the projection
                 if projection::shapes_coverage(fill) {
-                    self.note(counts, &Status::approximated("uniform mask fill faded or clipped by its projection"));
+                    self.note(counts, &mapped.status);
                 }
                 self.push(Some(&fill.header), EffectKind::Fill { source: Source::Uniform([v; 3]), projection }, on);
             }

@@ -46,9 +46,6 @@ pub struct SetInput<'a> {
     pub graphs: Option<&'a crate::graph_library::GraphLibrary>,
     /// The set's mesh parts, for polygon-fill picks; `None` keeps polygon fills placeholders.
     pub geometry: Option<&'a crate::polygon_fill::geometry::SetGeometry<'a>>,
-    /// The original's volume unit (the scene's largest extent) in TextureCraft's projection coordinates (positions over
-    /// the mesh's bounding radius): the radius over the largest extent. 1 without a mesh.
-    pub volume_unit: f32,
 }
 
 /// One anchor of the set: the effect id it became, whether it sits in a mask, and how exactly what it holds is

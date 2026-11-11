@@ -477,7 +477,6 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
                 replay,
                 graphs: ctx.graphs,
                 geometry: Some(&geometry),
-                volume_unit: volume_unit(ctx.mesh),
             };
             let mut stack = layers::import(project_set, &input, project.next_id);
             if let Some(note) = uv_tiles::per_tile_note(project_set, &uv_tiles::mesh_tiles(ctx.mesh, ctx.source.slot)) {
@@ -933,12 +932,4 @@ pub(crate) fn resample(image: &Rgba, size: u32) -> Rgba {
         }
     }
     Rgba { width: size, height: size, px }
-}
-
-/// [`layers::SetInput::volume_unit`] of `mesh`: its bounding radius over its largest extent.
-fn volume_unit(mesh: &texturecraft_geom::Mesh) -> f32 {
-    let (lo, hi) = mesh.bounds();
-    let largest = (hi - lo).max_element();
-    let unit = mesh.radius() / largest;
-    if unit.is_finite() && largest > 1e-6 { unit } else { 1.0 }
 }
