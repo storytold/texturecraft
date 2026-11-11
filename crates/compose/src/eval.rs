@@ -804,7 +804,10 @@ impl Cover {
         if output.is_some_and(|o| g.colour_outputs.contains(o)) {
             return Cover::OutputAlpha;
         }
-        let own = g.inputs.values().any(|i| matches!(i, GraphInput::Stack { channel: c } if c.is_none_or(|c| c == channel)));
+        // only the filter's own input (no channel named) counts: an input named after the channel it runs on reads that
+        // channel like any other named input (a weathering filter's `height` input over an empty height lays its height
+        // on whole)
+        let own = g.inputs.values().any(|i| matches!(i, GraphInput::Stack { channel: None }));
         if own { Cover::Below } else { Cover::Whole }
     }
 }
@@ -865,8 +868,10 @@ fn graph_region(
         let image = match input {
             GraphInput::Stack { channel } => {
                 let c = channel.or(own);
-                let is_own = c == own;
-                let data = if is_own { Some(&orig) } else { c.and_then(|c| others.get(&c)) };
+                // the filter's own input (no channel named); an input named after the channel the filter runs on reads the
+                // same stack but as a named input: 0 where nothing is below, opaque
+                let is_own = channel.is_none();
+                let data = if c == own { Some(&orig) } else { c.and_then(|c| others.get(&c)) };
                 let Some(data) = data else { continue };
                 let px = (0..n)
                     .map(|i| match c {
@@ -2975,6 +2980,33 @@ mod tests {
         let out = run(&f, None);
         assert!(close(out.value(Channel::BaseColor, 5, 5), [0.0, 1.0, 1.0]), "{:?}", out.value(Channel::BaseColor, 5, 5));
         assert!(close(out.value(Channel::Roughness, 5, 5), [0.2; 3]));
+    }
+
+    #[test]
+    fn a_named_stack_input_on_its_own_channel_is_not_the_filters_own_input() {
+        use crate::graphs::tests::INVERT;
+        let mut graphs = GraphStore::default();
+        let invert = graphs.add_text(INVERT);
+        // a layer with nothing on height whose filter writes height, reading the stack's height by name (input 0) or as
+        // its own input (no channel named)
+        let height = |input: GraphInput| {
+            let mut f = fixture();
+            let id = f.project.alloc_id();
+            let mut l = Layer::new(id, "Filter", LayerKind::Paint, &[Channel::Height]);
+            l.channels.insert(Channel::Height, ChannelBlend { mode: BlendMode::LinearDodge, opacity: 1.0 });
+            let id = f.project.insert_layer(0, l, None, false).unwrap();
+            let mut filter = GraphRef::new(invert.clone(), "invert");
+            filter.inputs.insert(0, input);
+            filter.outputs.insert(Channel::Height, "out".into());
+            content_fx(&mut f, id, EffectKind::Graph { graph: filter, projection: Projection::default() });
+            run_with(&f, &graphs).value(Channel::Height, 10, 10)[0]
+        };
+        // named: reads 0 over the empty height (inverted: 1, the top of the signed range) and is laid on whole
+        let named = height(GraphInput::Stack { channel: Some(Channel::Height) });
+        assert!((named - 1.0).abs() < 1e-3, "{named}");
+        // own: reads the flat surface (inverted: flat again)
+        let own = height(GraphInput::Stack { channel: None });
+        assert!(own.abs() < 1e-3, "{own}");
     }
 
     #[test]
