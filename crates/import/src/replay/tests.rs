@@ -135,9 +135,11 @@ fn what_the_brush_cannot_replay_is_refused_with_a_reason() {
     let mut e = effect(PaintTool::Brush);
     e.brush = Some(ProjectBrush { emitter: StampEmitter::Physics(Default::default()), ..ProjectBrush::default() });
     assert_eq!(key(&e), "brush:particle");
+    // a stencil drawn by a graph the project does not hold: its own blocker
     let mut e = effect(PaintTool::Brush);
-    e.stencil = Some(uniform(0, [1.0; 3], 1.0));
-    assert_eq!(key(&e), "brush:stencil");
+    e.stencil = Some(shape("grunge_map", vec![]));
+    let b = of(&e, StepTarget::Content).unwrap_err();
+    assert_eq!((b.key.kind, b.key.name.as_str()), (BlockerKind::BrushAlpha, "grunge_map"));
     let mut e = effect(PaintTool::Brush);
     e.paths.push(texturecraft_import_reader::model::StrokePath3d::line([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]));
     assert_eq!(key(&e), "brush:3d-path");
@@ -202,4 +204,77 @@ fn hostile_values_are_bounded() {
     assert_eq!(s.strokes[0].points.len(), 3, "a point that is not a number is left out");
     assert_eq!(s.strokes[0].copies, brush::MAX_COPIES);
     assert_eq!(pressure_at(&[TimelineKey { time: 0.0, value: f32::NAN }], 1.0), 1.0);
+}
+
+#[test]
+fn strokes_go_through_their_stencil_on_the_view() {
+    let mut e = effect(PaintTool::Brush);
+    e.stencil = Some(uniform(0, [0.8; 3], 0.5));
+    let s = of(&e, StepTarget::Content).unwrap();
+    // without a matrix the stencil spans the view
+    assert_eq!(s.stencil, Some(ReplayStencil { image: StencilImage::Uniform(0.4), matrix: [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0] }));
+    e.stencil_matrix = Some([2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.25, 0.0, 1.0]);
+    assert_eq!(of(&e, StepTarget::Content).unwrap().stencil.map(|st| st.matrix), Some([2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.25, 0.0, 1.0]));
+    assert!(of(&effect(PaintTool::Brush), StepTarget::Content).unwrap().stencil.is_none());
+}
+
+#[test]
+fn pressure_jitter_and_symmetry_are_replayed_without_notes() {
+    let mut e = effect(PaintTool::Brush);
+    if let Some(b) = &mut e.brush {
+        (b.flow_jitter, b.size_jitter) = (0.3, 0.2);
+        if let StampEmitter::Stroke(em) = &mut b.emitter {
+            em.pressure_flow = PressureResponse { enabled: true, minimum: 0.3 };
+            (em.position_jitter, em.position_jitter_both_axes, em.position_jitter_distribution) = (0.5, false, 0);
+        }
+    }
+    let s = of(&e, StepTarget::Content).unwrap();
+    let b = &s.brush;
+    assert_eq!((b.flow_pressure, b.position_jitter, b.position_both, b.position_normal), (Some(0.3), 0.5, false, false));
+    // the 2D-view stroke has a symmetry copy too
+    assert_eq!(s.strokes[1].copies, 1);
+    assert!(s.notes.is_empty(), "{:?}", s.notes);
+}
+
+/// A graph alpha with `stampIndex`, cycled through `count` stamps.
+fn dynamic(count: u32, wires: u32) -> ProjectSource {
+    let ProjectSource::Procedural(mut p) = shape("ink_dynamic", vec![Tweak { identifier: "stampIndex".into(), value: TweakValue::Int(0) }]) else {
+        panic!("a procedural")
+    };
+    (p.stamp_cycle, p.stroke_wires) = (count, wires);
+    ProjectSource::Procedural(p)
+}
+
+#[test]
+fn a_dynamic_alpha_cycles_through_its_stamps() {
+    use crate::graph_library::GraphLibrary;
+    use texturecraft_import_reader::decompile::Decompiled;
+    let mut lib = GraphLibrary::default();
+    let d = Decompiled {
+        text: "format 3\nnode 1 color r=0.5 g=0.5 b=0.5\noutput grey 1\n".into(),
+        images: vec![],
+        image_defaults: vec![],
+        outputs: vec![("grey".into(), 1)],
+        warnings: vec![],
+        colour_outputs: vec![],
+    };
+    lib.insert_as(&["ink_dynamic".to_string()], "", d);
+    let with = |alpha: ProjectSource| {
+        let mut e = effect(PaintTool::Brush);
+        e.alpha = vec![alpha];
+        step(&e, StepTarget::Content, &channels(), &ProjectImages::none(), Some(&lib)).unwrap()
+    };
+    let s = with(dynamic(3, texturecraft_import_reader::model::STROKE_WIRE_RANDOM_START));
+    assert_eq!((s.brush.cycle.len(), s.brush.cycle_drawn_start), (3, true));
+    assert!(s.notes.is_empty(), "{:?}", s.notes);
+    let s = with(dynamic(5, 0));
+    assert_eq!((s.brush.cycle.len(), s.brush.cycle_drawn_start), (5, false));
+    // more stamps than the guard: the guard's count
+    assert_eq!(with(dynamic(u32::MAX, 0)).brush.cycle.len(), tip::MAX_CYCLE as usize);
+    // a graph alpha that is not dynamic lays one stamp
+    let ProjectSource::Procedural(mut plain) = dynamic(3, 0) else { panic!("a procedural") };
+    if let Some(q) = &mut plain.procedural {
+        q.tweaks.clear();
+    }
+    assert!(with(ProjectSource::Procedural(plain)).brush.cycle.is_empty());
 }

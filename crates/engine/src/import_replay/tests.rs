@@ -51,17 +51,30 @@ fn brush(radius: f32) -> ReplayBrush {
         size_jitter: 0.0,
         flow_jitter: 0.0,
         position_jitter: 0.0,
+        position_both: true,
+        position_normal: true,
         rotation: 0.0,
         rotation_jitter: 0.0,
         follow: false,
         alignment: TipAlignment::Tangent,
         culling: Some(0.5),
         tip: ReplayTip::Round { hardness: 0.9 },
+        cycle: vec![],
+        cycle_drawn_start: false,
     }
 }
 
 fn step(mode: PaintMode, strokes: Vec<ReplayStroke>) -> ReplayStep {
-    ReplayStep { mode, values: vec![(Channel::BaseColor, [1.0, 0.0, 0.0], 1.0)], mask_value: 0.5, opacity: 1.0, brush: brush(0.1), strokes, notes: vec![] }
+    ReplayStep {
+        mode,
+        values: vec![(Channel::BaseColor, [1.0, 0.0, 0.0], 1.0)],
+        mask_value: 0.5,
+        opacity: 1.0,
+        brush: brush(0.1),
+        stencil: None,
+        strokes,
+        notes: vec![],
+    }
 }
 
 fn mask_job(strokes: Vec<ReplayStroke>) -> ReplayJob {
@@ -201,4 +214,108 @@ fn a_cancelled_replayer_paints_nothing_more() {
     let stopped = CancellableReplayer(cancel).replay(&scene, &jobs);
     assert_eq!(stopped.len(), jobs.len());
     assert!(stopped.iter().all(|r| r.as_ref().is_err_and(|e| e == "cancelled")), "{stopped:?}");
+}
+
+/// The mask's coverage along row `y`.
+fn row(r: &Result<ReplayedPixels, String>, y: u32) -> Vec<f32> {
+    (0..RES).map(|x| mask_at(r, x, y).1).collect()
+}
+
+fn job_of(step: ReplayStep) -> ReplayJob {
+    ReplayJob { target: ReplayTarget::Mask(LayerId(7)), label: "test".into(), steps: vec![step] }
+}
+
+#[test]
+fn pen_pressure_lowers_the_flow_in_both_views() {
+    let mesh = wall();
+    let c = RES / 2;
+    for space in [StrokeSpace::Uv, camera(Vec3::Y)] {
+        let at = if space == StrokeSpace::Uv { [0.5, 0.5] } else { [0.0, 0.0] };
+        let mut light = stroke(space, &[at]);
+        light.points[0].pressure = 0.0;
+        let mut s = step(PaintMode::Paint, vec![light]);
+        s.brush.flow_pressure = Some(0.25);
+        let out = replay(&mesh, &[job_of(s.clone())]);
+        let (_, cover) = mask_at(&out[0], c, c);
+        assert!((cover - 0.25).abs() < 0.02, "flow at the minimum under no pressure: {cover}");
+        // without pressure on flow the same stroke lays full flow
+        s.brush.flow_pressure = None;
+        assert!(mask_at(&replay(&mesh, &[job_of(s)])[0], c, c).1 > 0.95);
+    }
+}
+
+#[test]
+fn jitter_is_drawn_from_the_stroke_seed() {
+    let mesh = wall();
+    let painted = |space: StrokeSpace, seed: u32, jitter: bool| {
+        let mut s = stroke(space.clone(), if space == StrokeSpace::Uv { &[[0.2, 0.5], [0.8, 0.5]] } else { &[[-0.3, 0.0], [0.3, 0.0]] });
+        s.seed = seed;
+        let mut st = step(PaintMode::Paint, vec![s]);
+        st.brush.spacing = 1.0;
+        if jitter {
+            (st.brush.size_jitter, st.brush.flow_jitter, st.brush.position_jitter) = (0.8, 0.5, 0.3);
+        }
+        let out = replay(&mesh, &[job_of(st)]);
+        (0..RES).flat_map(|y| row(&out[0], y)).collect::<Vec<f32>>()
+    };
+    for space in [StrokeSpace::Uv, camera(Vec3::Y)] {
+        assert_eq!(painted(space.clone(), 5, true), painted(space.clone(), 5, true), "the same seed lays the same dabs");
+        assert_ne!(painted(space.clone(), 5, true), painted(space.clone(), 6, true), "another seed other dabs");
+        assert_eq!(painted(space.clone(), 5, false), painted(space, 6, false), "without jitter the seed changes nothing");
+    }
+}
+
+#[test]
+fn symmetry_copies_of_2d_view_strokes_land_on_the_mesh() {
+    let mesh = wall();
+    // a dab left of the centre in the texture: the wall's x runs with the texture's u
+    let mut s = stroke(StrokeSpace::Uv, &[[0.25, 0.5]]);
+    s.copies = 1;
+    s.copy_matrix = Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)).to_cols_array();
+    let out = replay(&mesh, &[mask_job(vec![s])]);
+    let c = RES / 2;
+    let line = row(&out[0], c);
+    assert!(line[(RES / 4) as usize] > 0.95, "the dab itself");
+    assert!(line[(RES * 3 / 4) as usize] > 0.95, "its mirror on the other side");
+    assert_eq!(line[c as usize], 0.0);
+}
+
+#[test]
+fn a_stencil_limits_the_stroke_on_its_view() {
+    let mesh = wall();
+    // left half of the image white, right half black, spanning the view
+    let stencil = ReplayStencil {
+        image: StencilImage::Image { width: 8, height: 1, values: Arc::from(vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]) },
+        matrix: [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0],
+    };
+    for (space, points) in [(StrokeSpace::Uv, [[0.2, 0.5], [0.8, 0.5]]), (camera(Vec3::Y), [[-0.3, 0.0], [0.3, 0.0]])] {
+        let mut s = step(PaintMode::Paint, vec![stroke(space, &points)]);
+        s.stencil = Some(stencil.clone());
+        let out = replay(&mesh, &[job_of(s)]);
+        let line = row(&out[0], RES / 2);
+        assert!(line[40] > 0.95, "painted through the white half: {}", line[40]);
+        assert!(line[(RES - 40) as usize] < 0.01, "held back by the black half: {}", line[(RES - 40) as usize]);
+    }
+    // a uniform stencil scales the whole stroke
+    let mut s = step(PaintMode::Paint, vec![stroke(StrokeSpace::Uv, &[[0.2, 0.5], [0.8, 0.5]])]);
+    s.stencil = Some(ReplayStencil { image: StencilImage::Uniform(0.5), matrix: [0.0; 9] });
+    let (_, cover) = mask_at(&replay(&mesh, &[job_of(s)])[0], RES / 2, RES / 2);
+    assert!((cover - 0.5).abs() < 0.01, "{cover}");
+}
+
+#[test]
+fn a_dynamic_alpha_lays_its_stamps_in_turn() {
+    let mesh = wall();
+    let full = ReplayTip::Image { width: 1, height: 1, values: Arc::from(vec![1.0]) };
+    let empty = ReplayTip::Image { width: 1, height: 1, values: Arc::from(vec![0.0]) };
+    // dabs a diameter apart along the row: every other one lays the empty stamp
+    let mut s = step(PaintMode::Paint, vec![stroke(StrokeSpace::Uv, &[[0.2, 0.5], [0.8, 0.5]])]);
+    (s.brush.spacing, s.brush.radius) = (1.0, 0.05);
+    s.brush.tip = full.clone();
+    s.brush.cycle = vec![full, empty];
+    let out = replay(&mesh, &[job_of(s)]);
+    let line = row(&out[0], RES / 2);
+    // dabs 6.4 texels wide every 6.4 texels from texel 25.6: the first laid, the second not, the third laid
+    let at = |k: f32| line[(25.6 + 6.4 * k) as usize];
+    assert!(at(0.0) > 0.95 && at(1.0) < 0.01 && at(2.0) > 0.95, "{} {} {}", at(0.0), at(1.0), at(2.0));
 }

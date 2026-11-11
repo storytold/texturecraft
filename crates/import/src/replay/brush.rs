@@ -6,6 +6,8 @@
 //! | `brushSize` | dab radius `brushSize / 2` in the mesh's units (measured) |
 //! | `spacing`, `flow`, `opacity` | spacing (share of the diameter), flow per dab, opacity per stroke |
 //! | `brushSizeJitter`, `flowJitter`, `positionJitter`, `rotationJitter` | jitter (position in diameters, rotation in radians) |
+//! | `positionJitterBothAxes`, `positionJitterDistribution` 1 | position jitter along both view axes / normal distance |
+//! | `randomSeed` | the stroke's seed: TextureCraft's brush draws the jitter from it as the file's app does |
 //! | `rotation`, `followPath` | the tip's turn (clockwise on the screen) and whether it follows the stroke |
 //! | `pressureSizeEnabled`/`Minimum`, `pressureFlowEnabled`/`Minimum` | linear in the pen's pressure: the minimum at 0 |
 //! | `alignment` 3, 1 / 4 / 2 | tangent plane / facing the view / the texture's axes |
@@ -13,17 +15,18 @@
 //! | `lazyDistance` | the lazy mouse's string, a share of the view's height |
 //! | 3D-view points | normalised device coordinates: the file stores 0..1 with y up (measured) |
 //! | 2D-view points | texture coordinates: the file stores V up, the mesh's UVs run down (measured) |
-//! | `duplicateCount`, `duplicateMatrix` | symmetry copies, the matrix applied once more per copy |
+//! | `duplicateCount`, `duplicateMatrix` | symmetry copies, the matrix applied once more per copy (both views) |
+//! | `sourceStencil`, `projMatrix` | the stencil the strokes go through, placed on the view ([`tip::stencil`]) |
 //! | `stampBlendingMode` ≠ 0, `aspectRatio` ≠ 1, other `alignment` | approximated (noted) |
 //!
-//! Not replayable (a `brush:` blocker): particle brushes, ribbons, path strokes, projection painting, smudging, stencils,
-//! brushes painting images, graphs or anchors, unreadable point lists.
+//! Not replayable (a `brush:` blocker): particle brushes, ribbons, path strokes, projection painting, smudging, brushes
+//! painting images, graphs or anchors, unreadable point lists.
 
 use texturecraft_core::Channel;
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{PaintEffect, PaintTool, ProjectBrush, ProjectSource, ProjectStroke, StampEmitter, StrokeView};
 
-use super::{PaintMode, ReplayBrush, ReplayStep, ReplayStroke, StrokePoint, StrokeSpace, TipAlignment, pressure_at, tip};
+use super::{PaintMode, ReplayBrush, ReplayStencil, ReplayStep, ReplayStroke, StrokePoint, StrokeSpace, TipAlignment, pressure_at, tip};
 use crate::channels::SetChannels;
 use crate::resources::ProjectImages;
 
@@ -33,6 +36,8 @@ pub const SIZE_TO_RADIUS: f32 = 0.5;
 pub const MAX_COPIES: u32 = 64;
 /// Most points read per stroke (a guard against hostile files).
 pub const MAX_POINTS: usize = 1 << 20;
+/// A stencil without its matrix spans the view: normalised device coordinates −1..1 onto the image's 0..1.
+const VIEW_STENCIL: [f32; 9] = [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0];
 
 /// What a step paints into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +74,6 @@ pub fn check(effect: &PaintEffect) -> Result<(), Blocker> {
     if !effect.paths.is_empty() {
         return Err(refused("3d-path", "path strokes (curves along the mesh) are not replayed"));
     }
-    if effect.stencil.is_some() {
-        return Err(refused("stencil", "strokes through a stencil are not replayed"));
-    }
     if effect.strokes.iter().any(|s| !s.complete) {
         return Err(refused("unreadable-points", "stroke points not fully readable"));
     }
@@ -90,11 +92,22 @@ pub fn step(
     let mut notes = Vec::new();
     let (tip, tip_note) = tip::tip(&effect.alpha, images, graphs)?;
     notes.extend(tip_note);
-    let brush = map_brush(effect, tip, &mut notes);
+    let mut brush = map_brush(effect, tip, &mut notes);
+    (brush.cycle, brush.cycle_drawn_start) = tip::cycle(&effect.alpha, graphs);
+    if let Some(n) = tip::uncycled(&effect.alpha, brush.cycle.len()) {
+        notes.push(n);
+    }
+    let stencil = match &effect.stencil {
+        Some(source) => {
+            let matrix = effect.stencil_matrix.filter(|m| m.iter().all(|v| v.is_finite())).unwrap_or(VIEW_STENCIL);
+            Some(ReplayStencil { image: tip::stencil(source, images, graphs)?, matrix })
+        }
+        None => None,
+    };
     let (mode, values, mask_value) = values(effect, target, channels)?;
     let strokes = effect.strokes.iter().filter_map(|s| stroke(s, brush.size_pressure.is_some() || brush.flow_pressure.is_some())).collect();
     let opacity = if effect.opacity.is_finite() { effect.opacity.clamp(0.0, 1.0) } else { 1.0 };
-    Ok(ReplayStep { mode, values, mask_value, opacity, brush, strokes, notes })
+    Ok(ReplayStep { mode, values, mask_value, opacity, brush, stencil, strokes, notes })
 }
 
 /// The brush of `effect` (its defaults when it has none).
@@ -129,16 +142,6 @@ fn map_brush(effect: &PaintEffect, tip: super::ReplayTip, notes: &mut Vec<String
         notes.push(format!("brush size space {} read as the mesh's units", b.size_space));
     }
     let minimum = |p: &texturecraft_import_reader::model::PressureResponse| p.enabled.then(|| finite(p.minimum, 0.0, 1.0, 0.0));
-    if e.pressure_flow.enabled && effect.strokes.iter().any(|s| !s.pressure.is_empty()) {
-        notes.push("pen pressure on flow left out (TextureCraft's brush scales the size by pressure only)".to_string());
-    }
-    let jittered = [b.size_jitter, b.flow_jitter, e.position_jitter, e.rotation_jitter].iter().any(|j| j.is_finite() && *j > 0.0);
-    if jittered {
-        notes.push("jitter drawn by TextureCraft's brush, not from the stroke's seed".to_string());
-    }
-    if effect.strokes.iter().any(|s| s.view == StrokeView::Uv && s.duplicate_count > 0) {
-        notes.push("symmetry copies of 2D-view strokes left out".to_string());
-    }
     ReplayBrush {
         radius: finite(b.size, 0.0, 1e3, 0.1) * SIZE_TO_RADIUS,
         spacing: finite(e.spacing, 0.0, 100.0, 0.2),
@@ -148,12 +151,16 @@ fn map_brush(effect: &PaintEffect, tip: super::ReplayTip, notes: &mut Vec<String
         size_jitter: finite(b.size_jitter, 0.0, 1.0, 0.0),
         flow_jitter: finite(b.flow_jitter, 0.0, 1.0, 0.0),
         position_jitter: finite(e.position_jitter, 0.0, 10.0, 0.0),
+        position_both: e.position_jitter_both_axes,
+        position_normal: e.position_jitter_distribution == 1,
         rotation: finite(e.rotation, -1e3, 1e3, 0.0),
         rotation_jitter: finite(e.rotation_jitter, 0.0, std::f32::consts::PI, 0.0),
         follow: e.follow_path,
         alignment,
         culling: b.culling.map(|c| finite(c, 0.0, 1.0, 0.5)),
         tip,
+        cycle: Vec::new(),
+        cycle_drawn_start: false,
     }
 }
 

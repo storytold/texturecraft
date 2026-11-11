@@ -9,8 +9,8 @@
 //! net composites, so the measured scores include the replayed pixels. Without a replayer, strokes stay placeholders
 //! locked with `strokes:<tool>`.
 //!
-//! Paint effects that cannot be replayed (particles, ribbons, path strokes, projection, smudge, stencils, brushes
-//! painting images or graphs, tips that are compiled graphs) stay placeholders with a precise `brush:` or
+//! Paint effects that cannot be replayed (particles, ribbons, path strokes, projection, smudge, brushes painting images
+//! or graphs, tips that are compiled graphs the project does not hold) stay placeholders with a precise `brush:` or
 //! `brush-alpha:` reason.
 
 pub mod brush;
@@ -72,8 +72,11 @@ pub struct ReplayBrush {
     /// Size and flow jitter, 0..1: a dab's size and flow are `1 − jitter·u`, `u` even in 0..1.
     pub size_jitter: f32,
     pub flow_jitter: f32,
-    /// Position jitter in diameters.
+    /// Position jitter in diameters: along both of the view's axes in a direction drawn per dab (`position_both`), or
+    /// across the stroke; its distance drawn from a normal distribution (`position_normal`) or evenly in −1..1.
     pub position_jitter: f32,
+    pub position_both: bool,
+    pub position_normal: bool,
     /// The tip's turn, radians, clockwise on the screen; and its jitter, radians either way.
     pub rotation: f32,
     pub rotation_jitter: f32,
@@ -84,6 +87,28 @@ pub struct ReplayBrush {
     /// are not reached; a smooth fade 0.5 wide in the cosine around it (measured). `None`: no culling.
     pub culling: Option<f32>,
     pub tip: ReplayTip,
+    /// A dynamic alpha's stamps: dab `k` of a stroke lays `cycle[(k + start) mod n]` instead of `tip`, `start` 0 or, with
+    /// `cycle_drawn_start`, drawn from the stroke's seed. Empty: every dab lays `tip`.
+    pub cycle: Vec<ReplayTip>,
+    pub cycle_drawn_start: bool,
+}
+
+/// A stencil's grey image.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StencilImage {
+    /// One value everywhere, inside and outside the image.
+    Uniform(f32),
+    /// Rows top first, `width × height` values 0..1; nothing outside it.
+    Image { width: u32, height: u32, values: Arc<[f32]> },
+}
+
+/// The stencil a step's strokes go through: a stroke's coverage times the image at the texel's place on the stroke's
+/// view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayStencil {
+    pub image: StencilImage,
+    /// Column by column, from the view's normalised device coordinates (y up) to the image's (0..1, y up).
+    pub matrix: [f32; 9],
 }
 
 /// Where a stroke was painted.
@@ -128,6 +153,7 @@ pub struct ReplayStep {
     /// The effect's opacity: each stroke lays `opacity × coverage`.
     pub opacity: f32,
     pub brush: ReplayBrush,
+    pub stencil: Option<ReplayStencil>,
     pub strokes: Vec<ReplayStroke>,
     /// What the step leaves out or approximates, for the report.
     pub notes: Vec<String>,

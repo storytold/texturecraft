@@ -150,10 +150,11 @@ sources (`Source::Graph`), mask generators and filters graph effects (`EffectKin
 its graph text by key with the file's values and input bindings. A use that cannot be fed stays a placeholder locked
 with the key `graph:<name>` (or its input's blocker); `graphs: "keep"` keeps every use a placeholder. Brush strokes are replayed with TextureCraft's own brush: the translator (L2,
 without `paint`) rasterises nothing but hands replay jobs (stroke records, the brush mapped with the measured rules,
-tip, camera, symmetry, seed, and the layer, content effect or mask effect painted) to a `StrokeReplayer`, which the
+tip or a dynamic alpha's stamps, stencil, camera, symmetry, seed, and the layer, content effect or mask effect painted) to a `StrokeReplayer`, which the
 engine implements with `paint` (`engine::import_replay`) and passes in through the import's hooks; the import calls
-it per texture set before the safety net measures. Replayed strokes become approximated pixels, not locked; strokes
-the brush cannot replay yet (particles, ribbons, path strokes, projection, smudge, stencils, graph tips) stay
+it per texture set before the safety net measures. The brush draws each stroke's jitter from its seed as the
+file's app does, and lays strokes through their stencil on the view. Replayed strokes become approximated pixels, not locked; strokes
+the brush cannot replay yet (particles, ribbons, path strokes, projection, smudge, graph tips the project does not hold) stay
 placeholders locked with a `brush:<what>` or `brush-alpha:<graph>` key, and with replay switched off with
 `strokes:<tool>`. The
 stored result itself becomes a locked "Original result" paint layer, hidden as a reference unless the

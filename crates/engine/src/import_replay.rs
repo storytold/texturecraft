@@ -6,10 +6,15 @@
 //!
 //! - **3D view**: the stroke's recorded camera becomes an orbit camera (its roll turned into the recorded points, an
 //!   off-centre projection shifted out) on a view [`VIEWPORT_HEIGHT`] pixels high; the pen's points feed a
-//!   [`texturecraft_paint::Stroke`] (picking, lazy mouse, spacing along the surface, jitter), picking only the set's
-//!   own triangles; symmetry copies are the recorded matrix applied once more per copy.
-//! - **2D view**: dabs walked along the path in texels, spaced by the set's average density (measured), laid by
-//!   [`texturecraft_paint::rasterize_uv`].
+//!   [`texturecraft_paint::Stroke`] (picking, lazy mouse, spacing along the surface, jitter drawn from the stroke's seed
+//!   as the file's app draws it), picking only the set's own triangles.
+//! - **2D view**: dabs walked along the path in texels, spaced by the set's average density (measured), jittered from
+//!   the stroke's seed, laid by [`texturecraft_paint::rasterize_uv`].
+//! - **Symmetry**: copies of either view's dabs are the recorded matrix applied once more per copy, laid on the mesh
+//!   (2D-view dabs at the surface under their centre, [`texturecraft_paint::UvStamp::on_mesh`]).
+//! - **Dynamic alphas**: dab `k` lays stamp `k + start` of the cycle (`start` drawn from the seed where the alpha says).
+//! - **Stencil**: once a stroke's dabs are laid, its coverage is multiplied by the stencil where each texel lies on the
+//!   stroke's view ([`texturecraft_paint::ViewStencil`]).
 //! - Dabs reach every surface in their volume whatever the view sees (measured: nothing occludes), faded by the turn
 //!   from the dab's normal as the brush's culling says ([`Facing::Fade`]); each stroke is laid on its own and committed
 //!   with the effect's opacity ("over" for paint, coverage lowered for the eraser).
@@ -24,12 +29,14 @@ use texturecraft_core::Channel;
 use texturecraft_geom::glam::{Mat4, Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, NO_TRI, OrbitCamera, SubMesh, UvGBuffer};
 use texturecraft_import::replay::{
-    PaintMode, ReplayBrush, ReplayJob, ReplayScene, ReplayStep, ReplayStroke, ReplayTarget, ReplayTip, ReplayedPixels, StrokeReplayer, TipAlignment,
+    PaintMode, ReplayBrush, ReplayJob, ReplayScene, ReplayStencil, ReplayStep, ReplayStroke, ReplayTarget, ReplayTip, ReplayedPixels, StencilImage,
+    StrokeReplayer, StrokeSpace, TipAlignment,
 };
 use texturecraft_paint::alphas::AlphaImage;
+use texturecraft_paint::jitter::{Jittered, StrokeRandom, cycle_start};
 use texturecraft_paint::{
-    Alignment, BrushAlpha, BrushSettings, CommitSource, Facing, PickCtx, RasterCtx, Shape, Staging, Stamp, Stroke, StrokeCanvas, UvStamp, commit_layer,
-    commit_mask, rasterize, rasterize_uv,
+    Alignment, BrushAlpha, BrushSettings, CommitSource, Facing, PickCtx, RasterCtx, SeededJitter, Shape, Staging, Stamp, Stroke, StrokeCanvas, UvStamp,
+    ViewStencil, commit_layer, commit_mask, pressure_scale, rasterize, rasterize_uv,
 };
 use texturecraft_texel::TileImage;
 
@@ -139,21 +146,89 @@ struct Tip {
     alpha: BrushAlpha,
     hardness: f32,
     image: Option<AlphaImage>,
+    /// A dynamic alpha's stamps, laid in turn (empty: every dab lays the tip).
+    cycle: Vec<AlphaImage>,
+    drawn_start: bool,
+}
+
+fn tip_image(width: u32, height: u32, values: &[f32]) -> Result<AlphaImage, String> {
+    AlphaImage::from_pixels(width as usize, height as usize, values).ok_or_else(|| "the brush tip image is empty".to_string())
 }
 
 impl Tip {
-    fn of(tip: &ReplayTip) -> Result<Tip, String> {
-        match tip {
-            ReplayTip::Round { hardness } => Ok(Tip { alpha: BrushAlpha::Round, hardness: *hardness, image: None }),
+    fn of(brush: &ReplayBrush) -> Result<Tip, String> {
+        let mut cycle = Vec::with_capacity(brush.cycle.len());
+        for stamp in &brush.cycle {
+            match stamp {
+                ReplayTip::Image { width, height, values } => cycle.push(tip_image(*width, *height, values)?),
+                ReplayTip::Round { .. } => return Err("a dynamic alpha's stamp is not an image".into()),
+            }
+        }
+        let drawn_start = brush.cycle_drawn_start;
+        match &brush.tip {
+            ReplayTip::Round { hardness } => Ok(Tip { alpha: BrushAlpha::Round, hardness: *hardness, image: None, cycle, drawn_start }),
             ReplayTip::Image { width, height, values } => {
-                let image = AlphaImage::from_pixels(*width as usize, *height as usize, values).ok_or_else(|| "the brush tip image is empty".to_string())?;
-                Ok(Tip { alpha: BrushAlpha::Round, hardness: 0.5, image: Some(image) })
+                Ok(Tip { alpha: BrushAlpha::Round, hardness: 0.5, image: Some(tip_image(*width, *height, values)?), cycle, drawn_start })
             }
         }
     }
 
     fn shape(&self) -> Shape<'_> {
         Shape { alpha: self.alpha, image: None, library: self.image.as_ref(), level: 0 }
+    }
+
+    /// Where a stroke with `seed` starts the cycle.
+    fn start(&self, seed: u32) -> usize {
+        if self.drawn_start { cycle_start(seed, self.cycle.len()) } else { 0 }
+    }
+
+    /// `dabs` by the shape they lay: dab `k` (its `seed(dab)`) lays stamp `k + start` of the cycle; without a cycle,
+    /// all lay the tip.
+    fn by_stamp<T: Copy>(&self, dabs: &[T], start: usize, seed: impl Fn(&T) -> u32) -> Vec<(Shape<'_>, Vec<T>)> {
+        let n = self.cycle.len();
+        if n == 0 {
+            return vec![(self.shape(), dabs.to_vec())];
+        }
+        let mut groups: Vec<Vec<T>> = vec![Vec::new(); n];
+        for d in dabs {
+            if let Some(g) = groups.get_mut((seed(d) as usize).wrapping_add(start) % n) {
+                g.push(*d);
+            }
+        }
+        groups.into_iter().zip(&self.cycle).filter(|(g, _)| !g.is_empty()).map(|(g, image)| (Shape { library: Some(image), ..self.shape() }, g)).collect()
+    }
+}
+
+/// A step's stencil, ready to sample.
+fn view_stencil(stencil: &ReplayStencil) -> Result<ViewStencil, String> {
+    match &stencil.image {
+        StencilImage::Uniform(v) => Ok(ViewStencil::uniform(*v)),
+        StencilImage::Image { width, height, values } => {
+            ViewStencil::image(*width as usize, *height as usize, values.clone(), stencil.matrix).ok_or_else(|| "the stencil image is empty".to_string())
+        }
+    }
+}
+
+/// Multiplies a laid stroke's coverage by `stencil` where each texel lies on the stroke's view: through the recorded
+/// camera for the 3D view (nothing behind it), the texture spanning the view for the 2D view.
+fn through(set: &SetMesh, stroke: &ReplayStroke, stencil: &ViewStencil, canvas: &mut StrokeCanvas) {
+    let res = set.resolution;
+    match &stroke.space {
+        StrokeSpace::Mesh { view, projection } => {
+            let view_projection = Mat4::from_cols_array(projection) * Mat4::from_cols_array(view);
+            canvas.scale(|x, y| {
+                let Some(surface) = set.gbuf.surface(&set.mesh, y as usize * res as usize + x as usize) else { return 0.0 };
+                let clip = view_projection * surface.pos.extend(1.0);
+                if clip.w.is_nan() || clip.w <= 1e-6 {
+                    return 0.0;
+                }
+                stencil.at(Vec2::new(clip.x / clip.w, clip.y / clip.w))
+            });
+        }
+        StrokeSpace::Uv => {
+            let r = res as f32;
+            canvas.scale(|x, y| stencil.at(Vec2::new((x as f32 + 0.5) / r * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / r * 2.0)));
+        }
     }
 }
 
@@ -162,13 +237,17 @@ fn replay_job(set: &SetMesh, job: &ReplayJob, stop: &(dyn Fn() -> bool + Sync)) 
     let mut pixels = PixelStore::default();
     let id = job.target.id();
     for step in &job.steps {
-        let tip = Tip::of(&step.brush.tip)?;
+        let tip = Tip::of(&step.brush)?;
+        let stencil = step.stencil.as_ref().map(view_stencil).transpose()?;
         for stroke in &step.strokes {
             if stop() {
                 return Err("cancelled".into());
             }
             let mut canvas = StrokeCanvas::new(set.resolution, set.resolution);
             lay_stroke(set, step, &tip, stroke, &mut canvas);
+            if let Some(stencil) = &stencil {
+                through(set, stroke, stencil, &mut canvas);
+            }
             if canvas.dirty.is_empty() {
                 continue;
             }
@@ -219,12 +298,12 @@ fn commit(pixels: &mut PixelStore, set: &SetMesh, target: ReplayTarget, step: &R
 /// Lays one stroke's dabs into `canvas`.
 fn lay_stroke(set: &SetMesh, step: &ReplayStep, tip: &Tip, stroke: &ReplayStroke, canvas: &mut StrokeCanvas) {
     match &stroke.space {
-        texturecraft_import::replay::StrokeSpace::Mesh { view, projection } => {
+        StrokeSpace::Mesh { view, projection } => {
             if let Some(camera) = ViewCamera::new(view, projection, set.center, set.radius) {
                 lay_mesh_stroke(set, &step.brush, tip, stroke, &camera, canvas);
             }
         }
-        texturecraft_import::replay::StrokeSpace::Uv => lay_uv_stroke(set, &step.brush, tip, stroke, canvas),
+        StrokeSpace::Uv => lay_uv_stroke(set, &step.brush, tip, stroke, canvas),
     }
 }
 
@@ -241,12 +320,14 @@ fn facing(brush: &ReplayBrush) -> Facing {
 }
 
 /// TextureCraft's brush settings for `brush`: the file's jitter ranges mapped onto TextureCraft's (size `1 − J·u`
-/// becomes a radius scaled by `1 − J/2` with TextureCraft's symmetric jitter `±(J/2)/(1 − J/2)`; rotation in turns
-/// of a half turn; position in radii); the rotation turned counter-clockwise as TextureCraft's angle is.
+/// becomes a radius scaled by `1 − J/2` with TextureCraft's symmetric jitter `±(J/2)/(1 − J/2)`, the same draw for
+/// draw; rotation in turns of a half turn; position in radii); pen pressure on size and flow; the rotation turned
+/// counter-clockwise as TextureCraft's angle is.
 fn settings(brush: &ReplayBrush, lazy_pixels: f32) -> (BrushSettings, f32) {
     let size_scale = 1.0 - brush.size_jitter * 0.5;
     let settings = BrushSettings {
         min_size: brush.size_pressure.unwrap_or(1.0),
+        min_flow: brush.flow_pressure.unwrap_or(1.0),
         flow: brush.flow,
         opacity: 1.0,
         spacing: brush.spacing,
@@ -330,33 +411,49 @@ impl ViewCamera {
     }
 }
 
-/// A 3D-view stroke through TextureCraft's [`Stroke`], fed point by point, dabs laid batch by batch.
-fn lay_mesh_stroke(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayStroke, camera: &ViewCamera, canvas: &mut StrokeCanvas) {
-    let (mut settings, size_scale) = settings(brush, stroke.lazy * VIEWPORT_HEIGHT);
-    settings.hardness = tip.hardness;
-    settings.alpha = tip.alpha;
-    let mut pen = Stroke::new(&settings, &set.mesh);
-    pen.radius = brush.radius * size_scale;
-    let ctx = PickCtx { mesh: &set.mesh, bvh: &set.bvh, camera: &camera.orbit, viewport: camera.viewport };
-    let raster = RasterCtx {
+/// What the stroke's seed drives: TextureCraft's brush draws the jitter from it as the file's app does.
+fn seeded(brush: &ReplayBrush, stroke: &ReplayStroke) -> SeededJitter {
+    SeededJitter { seed: stroke.seed, both_axes: brush.position_both, normal: brush.position_normal }
+}
+
+/// The rasteriser's view of the set for `shape`: every surface in a dab's volume, faded as the brush culls.
+fn raster_ctx<'a>(set: &'a SetMesh, brush: &ReplayBrush, eye: Vec3, shape: Shape<'a>) -> RasterCtx<'a> {
+    RasterCtx {
         mesh: &set.mesh,
         bvh: &set.bvh,
         gbuf: &set.gbuf,
         material: set.material,
         depth: None,
-        eye: camera.orbit.eye(),
+        eye,
         backface_culling: false,
         angle_fade: (90.0, 90.0),
-        shape: tip.shape(),
+        shape,
         facing: facing(brush),
-    };
+    }
+}
+
+/// Lays mesh-space `dabs` into `canvas`, each with its stamp of the tip's cycle.
+fn lay_dabs(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, start: usize, eye: Vec3, dabs: &[Stamp], canvas: &mut StrokeCanvas) {
+    for (shape, group) in tip.by_stamp(dabs, start, |d| d.seed) {
+        rasterize(canvas, &raster_ctx(set, brush, eye, shape), &group);
+    }
+}
+
+/// A 3D-view stroke through TextureCraft's [`Stroke`], fed point by point, dabs laid batch by batch.
+fn lay_mesh_stroke(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayStroke, camera: &ViewCamera, canvas: &mut StrokeCanvas) {
+    let (mut settings, size_scale) = settings(brush, stroke.lazy * VIEWPORT_HEIGHT);
+    settings.hardness = tip.hardness;
+    settings.alpha = tip.alpha;
+    let mut pen = Stroke::new(&settings, &set.mesh).seeded(seeded(brush, stroke));
+    pen.radius = brush.radius * size_scale;
+    let ctx = PickCtx { mesh: &set.mesh, bvh: &set.bvh, camera: &camera.orbit, viewport: camera.viewport };
+    let (eye, start) = (camera.orbit.eye(), tip.start(stroke.seed));
     let copies = symmetry(stroke);
     let mut laid = 0usize;
     for points in stroke.points.chunks(POINTS_PER_BATCH) {
         let mut dabs = Vec::new();
         for p in points {
-            let pressure = if brush.size_pressure.is_some() { p.pressure } else { 1.0 };
-            dabs.extend(pen.add(&ctx, camera.screen(p.position), pressure));
+            dabs.extend(pen.add(&ctx, camera.screen(p.position), p.pressure));
         }
         pen.stamps.clear();
         let originals = dabs.len();
@@ -368,7 +465,7 @@ fn lay_mesh_stroke(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &Repla
             }
         }
         laid = laid.saturating_add(dabs.len());
-        rasterize(canvas, &raster, &dabs);
+        lay_dabs(set, brush, tip, start, eye, &dabs, canvas);
         if laid > MAX_DABS {
             break;
         }
@@ -419,39 +516,57 @@ fn trail(points: &[(Vec2, f32)], length: f32) -> Vec<(Vec2, f32)> {
 }
 
 /// A 2D-view stroke: dabs walked along the path in texels, each step `spacing × 2R` at the set's average density
-/// (measured; `R` the dab's radius after pressure), a fixed share of the texture while the path is off the islands.
+/// (measured; `R` the dab's radius after pressure and jitter), a fixed share of the texture while the path is off the
+/// islands. Every spot draws its jitter from the stroke's seed, on the islands or not (measured); a dab moved off them
+/// is not laid. Symmetry copies are laid on the mesh.
 fn lay_uv_stroke(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayStroke, canvas: &mut StrokeCanvas) {
     let res = set.resolution as f32;
     let points: Vec<(Vec2, f32)> = stroke.points.iter().map(|p| (Vec2::new(p.position[0], p.position[1]) * res, p.pressure)).collect();
     let points = trail(&points, stroke.lazy * res);
-    let (settings, size_scale) = settings(brush, 0.0);
-    let radius = brush.radius * size_scale / set.world_per_texel;
-    let scale = |pressure: f32| match brush.size_pressure {
-        Some(m) => m + (1.0 - m) * pressure.clamp(0.0, 1.0),
-        None => 1.0,
-    };
+    let (settings, _) = settings(brush, 0.0);
+    let radius = brush.radius / set.world_per_texel;
     let on_surface = |p: Vec2| {
         let (x, y) = (p.x.floor(), p.y.floor());
         x >= 0.0 && y >= 0.0 && x < res && y < res && set.gbuf.tri.get(y as usize * set.resolution as usize + x as usize).is_some_and(|t| *t != NO_TRI)
     };
+    let mut random = StrokeRandom::new(seeded(brush, stroke));
+    let jittered =
+        Jittered { size: brush.size_jitter > 0.0, flow: brush.flow_jitter > 0.0, rotation: brush.rotation_jitter > 0.0, position: brush.position_jitter > 0.0 };
     let mut dabs: Vec<UvStamp> = Vec::new();
-    let lay = |at: Vec2, heading: Option<Vec2>, pressure: f32, dabs: &mut Vec<UvStamp>| -> f32 {
-        let r = radius * scale(pressure);
-        let angle = match heading.filter(|_| settings.follow_path) {
-            // y up on the screen, rows down
-            Some(h) => settings.angle + (-h.y).atan2(h.x).to_degrees() - 90.0,
-            None => settings.angle,
+    let mut spots = 0u32;
+    let mut lay = |at: Vec2, heading: Vec2, pressure: f32, dabs: &mut Vec<UvStamp>| -> f32 {
+        let d = random.draw(jittered);
+        let r = radius * pressure_scale(brush.size_pressure.unwrap_or(1.0), pressure) * (1.0 - brush.size_jitter * (1.0 - d.size));
+        let flow = brush.flow * pressure_scale(brush.flow_pressure.unwrap_or(1.0), pressure) * (1.0 - brush.flow_jitter * (1.0 - d.flow));
+        // moved by shares of the diameter: along both axes in a drawn direction, or across the stroke (rows down)
+        let distance = brush.position_jitter * d.distance;
+        let (moved, across) = match (jittered.position, brush.position_both) {
+            (false, _) => (Vec2::ZERO, 0.0),
+            (true, true) => {
+                let (sin, cos) = (std::f32::consts::PI * (d.direction - 0.5)).sin_cos();
+                (Vec2::new(distance * sin, distance * cos), 0.0)
+            }
+            (true, false) => (Vec2::ZERO, distance),
         };
-        let seed = dabs.len() as u32;
-        if on_surface(at) {
-            dabs.push(UvStamp { center: at / res, radius: r / res, angle, flow: settings.flow, hardness: tip.hardness, seed });
-            (brush.spacing.max(0.01) * 2.0 * r * UV_STEP).max(1e-3)
-        } else {
-            OFF_SURFACE_STEP * res
+        let center = at + (moved + Vec2::new(-heading.y, heading.x) * across) * 2.0 * r;
+        // the file's turn is clockwise on the screen, TextureCraft's angle counter-clockwise; y up on the screen, rows down
+        let turn = brush.rotation_jitter * (1.0 - 2.0 * d.rotation);
+        let follow = if settings.follow_path { (-heading.y).atan2(heading.x).to_degrees() - 90.0 } else { 0.0 };
+        let angle = settings.angle - turn.to_degrees() + follow;
+        if on_surface(center) {
+            dabs.push(UvStamp { center: center / res, radius: r / res, angle, flow: flow.clamp(0.0, 1.0), hardness: tip.hardness, seed: spots });
         }
+        spots = spots.wrapping_add(1);
+        if on_surface(at) { (brush.spacing.max(0.01) * 2.0 * r * UV_STEP).max(1e-3) } else { OFF_SURFACE_STEP * res }
     };
     let Some(&(first, p0)) = points.first() else { return };
-    let mut left = lay(first, None, p0, &mut dabs);
+    // the first spot faces along the path's first move
+    let heading = points.windows(2).find_map(|w| match w {
+        [(a, _), (b, _)] => (*b - *a).try_normalize(),
+        _ => None,
+    });
+    let mut left = lay(first, heading.unwrap_or(Vec2::X), p0, &mut dabs);
+    let mut walked = 0usize;
     'walk: for pair in points.windows(2) {
         let &[(a, pa), (b, pb)] = pair else { continue };
         let d = b - a;
@@ -464,14 +579,25 @@ fn lay_uv_stroke(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, stroke: &ReplayS
         while l - t >= left {
             t += left;
             let f = t / l;
-            left = lay(a + u * t, Some(u), pa + (pb - pa) * f, &mut dabs);
-            if dabs.len() > MAX_DABS {
+            left = lay(a + u * t, u, pa + (pb - pa) * f, &mut dabs);
+            walked += 1;
+            if walked > MAX_DABS {
                 break 'walk;
             }
         }
         left -= l - t;
     }
-    rasterize_uv(canvas, &set.gbuf, tip.shape(), &dabs);
+    let start = tip.start(stroke.seed);
+    for (shape, group) in tip.by_stamp(&dabs, start, |d| d.seed) {
+        rasterize_uv(canvas, &set.gbuf, shape, &group);
+    }
+    // symmetry: the copies of the dabs' places on the mesh
+    let copies = symmetry(stroke);
+    if !copies.is_empty() {
+        let on_mesh: Vec<Stamp> = dabs.iter().filter_map(|d| d.on_mesh(&set.mesh, &set.gbuf, set.world_per_texel * res)).collect();
+        let copied: Vec<Stamp> = copies.iter().flat_map(|m| on_mesh.iter().filter_map(move |d| copied(d, m))).collect();
+        lay_dabs(set, brush, tip, start, set.center, &copied, canvas);
+    }
 }
 
 #[cfg(test)]
