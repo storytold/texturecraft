@@ -1,5 +1,6 @@
 //! Shelf assets and their preview renderers
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use egui::ColorImage;
@@ -11,7 +12,11 @@ use texturecraft_engine::paint::alphas::LibraryAlpha;
 use texturecraft_engine::paint::presets::BrushPreset;
 use texturecraft_engine::preview;
 
-use crate::preview_image::{alpha_image, image_preview, procedural_image, sphere_image, stroke_preview};
+use crate::preview_image::{alpha_image, environment_image, image_preview, procedural_image, sphere_image, stroke_preview};
+
+/// Larger brush preset files aren't read (the `brush.preset.load` command's limit)
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SAVED_BRUSH_BYTES: u64 = 1 << 20;
 
 /// The asset a shelf tile previews
 pub enum ShelfPreview {
@@ -29,8 +34,12 @@ pub enum ShelfPreview {
     Alpha(&'static LibraryAlpha),
     /// A brush preset's stroke along an S curve
     Brush(&'static BrushPreset),
+    /// A brush preset file the user saved, its stroke along an S curve
+    SavedBrush(PathBuf),
     /// An image resource by name
     Image(String, Arc<ImageRes>),
+    /// A built-in lighting environment's panorama
+    Environment(&'static str),
 }
 
 impl ShelfPreview {
@@ -52,7 +61,9 @@ impl ShelfPreview {
             ShelfPreview::Procedural(kind) => format!("proc:{kind:?}"),
             ShelfPreview::Alpha(alpha) => format!("alpha:{}", alpha.id),
             ShelfPreview::Brush(preset) => format!("brush:{}", preset.id),
+            ShelfPreview::SavedBrush(path) => format!("saved-brush:{}", path.display()),
             ShelfPreview::Image(name, _) => format!("image:{name}"),
+            ShelfPreview::Environment(name) => format!("environment:{name}"),
         }
     }
 
@@ -66,9 +77,30 @@ impl ShelfPreview {
             ShelfPreview::Procedural(kind) => Some(procedural_image(*kind, size)),
             ShelfPreview::Alpha(alpha) => Some(alpha_image(alpha, size)),
             ShelfPreview::Brush(preset) => Some(stroke_preview(&preset.applied(&BrushSettings::default()), size)),
+            ShelfPreview::SavedBrush(path) => Some(stroke_preview(&saved_brush(path)?, size)),
             ShelfPreview::Image(_, image) => Some(image_preview(image, size)),
+            ShelfPreview::Environment(name) => Some(environment_image(name, size)),
         }
     }
+}
+
+/// A saved brush preset's settings; None when the file can't be read (or in the browser, which has no files)
+#[cfg(not(target_arch = "wasm32"))]
+fn saved_brush(path: &std::path::Path) -> Option<BrushSettings> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|file| file.take(MAX_SAVED_BRUSH_BYTES + 1).read_to_end(&mut bytes)).ok()?;
+    if bytes.len() as u64 > MAX_SAVED_BRUSH_BYTES {
+        return None;
+    }
+
+    serde_json::from_slice::<BrushSettings>(&bytes).ok().map(|settings| settings.sanitized())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn saved_brush(_: &std::path::Path) -> Option<BrushSettings> {
+    None
 }
 
 #[cfg(test)]
@@ -93,6 +125,7 @@ mod tests {
             ShelfPreview::Alpha(&alphas::library()[0]),
             ShelfPreview::Brush(&PRESETS[0]),
             ShelfPreview::Image("image".into(), Arc::new(image)),
+            ShelfPreview::Environment(texturecraft_engine::core::project::ENVIRONMENTS[0]),
         ];
         for preview in previews {
             let key = preview.key();

@@ -1,40 +1,45 @@
-//! The asset shelf (the Assets dock tab): tabs (materials, smart materials, smart
-//! masks, filters, alphas, procedurals, environments, textures), all built in and procedural.
-//! Search filters across every tab. Materials (built in and saved), smart masks, filters, alphas
-//! and textures drag onto the layer stack, a layer row, the viewport or the brush properties
-//! ([`ShelfDrag`]); a texture dropped on the 3D view becomes a decal there, in the channel picked from a menu
+//! The Assets panel: built-in, saved and project assets in one grid by type, library and search, dragged onto the layer stack, the views or the brush
 
 use egui::{Color32, RichText, Sense, Stroke, Ui, vec2};
 use egui_phosphor::regular as ic;
 use serde_json::json;
-use texturecraft_engine::core::ProceduralKind;
-use texturecraft_engine::filter_lib::FILTERS;
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_engine::formats::mcmat::MCMAT_EXT;
 use texturecraft_engine::geom::glam::Vec2;
-use texturecraft_engine::materials::MATERIALS;
 use texturecraft_engine::orb_preview::MAX_PREVIEW_SIZE_PX;
-use texturecraft_engine::paint::alphas;
-use texturecraft_engine::paint::presets::{BrushPreset, PRESETS};
-use texturecraft_engine::smart_masks::SMART_MASKS;
-use texturecraft_render::ibl::ENVIRONMENTS;
 
 use crate::TextureCraftApp;
 use crate::decal_drop::DecalDrop;
 use crate::i18n::{tr, trf};
+use crate::shelf_entry::ShelfEntry;
 use crate::shelf_preview::ShelfPreview;
+use crate::shelf_view::ShelfView;
 use crate::theme::Tokens;
 use crate::thumbs::Thumbs;
-use crate::widgets::{dnd_release, icon_button};
+use crate::widgets::dnd_release;
 
-/// A shelf tile's size in points
-const TILE_WIDTH: f32 = 72.0;
-const TILE_HEIGHT: f32 = 86.0;
+/// The gap between tiles in points (their sizes are [`ShelfView`]'s)
+const TILE_GAP: f32 = 2.0;
+/// The gap after a grid or a list of rows, and the size of a hint under a header, in points
+const SECTION_GAP: f32 = 6.0;
+const HINT_SIZE: f32 = 10.0;
+/// The name of a saved material whose file name isn't text
+const SAVED_MATERIAL_NAME: &str = "material";
 /// Corner radius of a tile's hover and selection highlights, in points
 const TILE_ROUNDING: f32 = 3.0;
-/// The thumbnail's size in a tile and its center below the tile's top, in points
-const THUMBNAIL_SIZE: f32 = 56.0;
-const THUMBNAIL_CENTER_Y: f32 = 32.0;
+/// The last clicked or right-clicked tile's [`ShelfEntry::identity`], kept in egui's memory under this id
+const SELECTED_TILE: &str = "shelf_selected_tile";
+/// The outline widths of the selected tile and of the one in use (the brush's alpha, the shown environment), in points
+const SELECTED_OUTLINE_WIDTH: f32 = 1.5;
+const IN_USE_OUTLINE_WIDTH: f32 = 1.0;
+/// The randomness badge's dot radius, dot spacing and inset from the thumbnail's corner, in points
+const BADGE_DOT_RADIUS: f32 = 1.3;
+const BADGE_DOT_SPACING: f32 = 3.6;
+const BADGE_INSET: f32 = 2.5;
+/// The randomness badge's dot colour and its rim's width (points) and colour
+const BADGE_DOT_FILL: Color32 = Color32::from_gray(205);
+const BADGE_DOT_RIM: f32 = 0.8;
+const BADGE_DOT_RIM_COLOR: Color32 = Color32::from_black_alpha(170);
 /// Loading icon size relative to the thumbnail width, and its opacity over the dim text color
 const LOADING_ICON_SCALE: f32 = 0.9;
 const LOADING_ICON_OPACITY: f32 = 0.5;
@@ -56,22 +61,21 @@ pub(crate) enum Tab {
     Filters,
     Brushes,
     Alphas,
-    Procedurals,
-    Environments,
+    /// Procedural patterns and the project's images
     Textures,
+    Environments,
 }
 
-/// The shelf tabs: icon and (English, translated where shown) name.
-pub(crate) const TABS: [(Tab, &str, &str); 9] = [
+/// The shelf tabs: icon and (English, translated where shown) name
+pub(crate) const TABS: [(Tab, &str, &str); 8] = [
     (Tab::Materials, ic::SPHERE, "Materials"),
     (Tab::Smart, ic::STACK, "Smart materials"),
     (Tab::Masks, ic::CIRCLE_HALF, "Smart masks"),
     (Tab::Filters, ic::FUNNEL, "Filters"),
     (Tab::Brushes, ic::PAINT_BRUSH_BROAD, "Brushes"),
     (Tab::Alphas, ic::SHAPES, "Alphas"),
-    (Tab::Procedurals, ic::CHECKERBOARD, "Procedurals"),
-    (Tab::Environments, ic::SUN_HORIZON, "Environments"),
     (Tab::Textures, ic::IMAGE, "Textures"),
+    (Tab::Environments, ic::SUN_HORIZON, "Environments"),
 ];
 
 /// A shelf asset: built in (by id), a saved smart material (file path) or an image resource.
@@ -223,55 +227,105 @@ pub fn drop_target(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response
 
 /// The Assets panel body (a dock tab)
 pub fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tokens = Tokens::get(ui.ctx());
     let ctx = ui.ctx().clone();
-    let mut tab = app.ui.shelf_tab.min(TABS.len() - 1);
-    let searching = !app.ui.shelf_filter.is_empty();
+    let filter = app.ui.shelf_filter.to_lowercase();
+    scan_library(app);
+    scan_brushes(app);
+    let all = ShelfEntry::all(app);
+    let paths = crate::shelf_folders::with_every_library(crate::shelf_folders::paths(&all));
 
-    ui.horizontal_wrapped(|ui| {
-        let button_size = ui.spacing().interact_size.y;
-        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
-        for (i, (_, icon, label)) in TABS.iter().enumerate() {
-            if icon_button(ui, icon, tr(label), i == tab && !searching, button_size).clicked() {
-                tab = i;
-                app.ui.shelf_filter.clear();
-            }
-        }
-    });
-    app.ui.shelf_tab = tab;
+    // A folder that is gone (its last image removed) shows everything again
+    if !paths.iter().any(|path| path.starts_with(&app.ui.shelf_path)) {
+        app.ui.shelf_path.clear();
+    }
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(ic::MAGNIFYING_GLASS).color(tokens.text_dim));
-        ui.add(egui::TextEdit::singleline(&mut app.ui.shelf_filter).hint_text(tr("Search all assets")).desired_width(f32::INFINITY));
-    });
+    let folder = app.ui.shelf_path.clone();
+    let picked_tab = app.ui.shelf_tab;
+    let searched: Vec<ShelfEntry> = all.into_iter().filter(|entry| entry.matches(&filter)).collect();
+    let mut applicable = crate::shelf_folders::paths(searched.iter().filter(|entry| crate::shelf_tabs::shows(picked_tab, entry.tab())));
+    let matching: Vec<ShelfEntry> = searched.into_iter().filter(|entry| entry.in_folder(&folder)).collect();
+    let mut counts: Vec<usize> = TABS.iter().map(|(tab, _, _)| matching.iter().filter(|entry| entry.tab() == *tab).count()).collect();
+
+    // Saved smart materials list under the grid rather than as tiles, so they count apart
+    let in_user_library = folder.len() <= 1 && folder.first().is_none_or(|library| library == crate::shelf_entry::USER);
+    let saved_materials_matching = saved_materials_matching(app, &filter);
+    if in_user_library && let Some(smart) = TABS.iter().position(|(tab, _, _)| *tab == Tab::Smart).and_then(|smart| counts.get_mut(smart)) {
+        *smart += saved_materials_matching;
+    }
+    if saved_materials_matching > 0 && crate::shelf_tabs::shows(picked_tab, Tab::Smart) {
+        applicable.push(vec![crate::shelf_entry::USER.to_string()]);
+    }
+
+    crate::shelf_folders::breadcrumb(app, ui, &paths);
+    search_field(app, ui);
+    crate::shelf_tabs::row(app, ui, &counts, crate::shelf_view::menu);
     ui.add_space(4.0);
 
-    let filter = app.ui.shelf_filter.to_lowercase();
-    egui::ScrollArea::vertical().id_salt("shelf_scroll").auto_shrink([false, false]).show(ui, |ui| {
-        // Searching shows matches from every tab, each under its tab's name
-        for (i, (t, _, title)) in TABS.iter().enumerate() {
-            if filter.is_empty() && i != tab {
-                continue;
-            }
+    let tab = app.ui.shelf_tab;
+    let shown_tab = TABS.get(tab).map(|(shown, _, _)| *shown);
+    let mut entries: Vec<ShelfEntry> = matching.into_iter().filter(|entry| crate::shelf_tabs::shows(tab, entry.tab())).collect();
+    entries.sort_by_cached_key(|entry| entry.label().to_lowercase());
 
-            let title = tr(title);
-            match t {
-                Tab::Materials => materials(app, ui, &ctx, &filter, false, title),
-                Tab::Smart => {
-                    materials(app, ui, &ctx, &filter, true, title);
-                    library(app, ui, &filter);
+    // The toolbar has its own strip at the panel's bottom, so nothing above it can push it out
+    let area = ui.available_rect_before_wrap();
+    let toolbar_top = (area.bottom() - crate::shelf_toolbar::height(ui)).max(area.top());
+    let grid_rect = egui::Rect::from_min_max(area.min, egui::pos2(area.right(), toolbar_top));
+    let toolbar_rect = egui::Rect::from_min_max(egui::pos2(area.left(), toolbar_top), area.max);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(grid_rect).layout(egui::Layout::left_to_right(egui::Align::Min)), |ui| {
+        if let Some(width) = crate::shelf_panes::column_width(app, ui.available_width()) {
+            ui.allocate_ui_with_layout(vec2(width, grid_rect.height()), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_min_size(vec2(width, grid_rect.height()));
+                crate::shelf_panes::column(app, ui, &paths, &applicable);
+            });
+            ui.separator();
+        }
+        // Saved smart materials are files in the user's library, without folders of their own
+        let saved_materials = in_user_library && shown_tab.is_none_or(|shown| shown == Tab::Smart);
+        grid(app, ui, &ctx, &entries, grid_rect.height(), saved_materials, &filter);
+    });
+    ui.scope_builder(egui::UiBuilder::new().max_rect(toolbar_rect), |ui| crate::shelf_toolbar::show(app, ui));
+    drag_preview(&ctx);
+}
+
+/// The tiles of `entries` in a scroll area `height` high, then the saved smart materials when `saved_materials`
+fn grid(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, entries: &[ShelfEntry], height: f32, saved_materials: bool, filter: &str) {
+    let view = app.ui.shelf_view;
+    let selected: Option<(String, String)> = ctx.data(|data| data.get_temp(egui::Id::unique(SELECTED_TILE)));
+    egui::ScrollArea::vertical()
+        .id_salt("shelf_scroll")
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .max_height(height)
+        .show(ui, |ui| {
+            tiles(ui, |ui| {
+                for entry in entries {
+                    let is_selected = selected.as_ref().is_some_and(|(kind, id)| entry.identity() == (kind.as_str(), id.as_str()));
+                    entry_tile(app, ui, ctx, entry, view, is_selected);
                 }
-                Tab::Masks => smart_masks(app, ui, &ctx, &filter, title),
-                Tab::Filters => filters(app, ui, &ctx, &filter, title),
-                Tab::Brushes => brushes(app, ui, &ctx, &filter, title),
-                Tab::Alphas => alpha_library(app, ui, &ctx, &filter, title),
-                Tab::Procedurals => procedurals(app, ui, &ctx, &filter, title),
-                Tab::Environments => environments(app, ui, &filter, title),
-                Tab::Textures => textures(app, ui, &ctx, &filter, title),
+            });
+            if saved_materials {
+                library(app, ui, filter);
             }
+        });
+}
+
+/// How many of the user's saved smart materials match `filter` (none until the library is read)
+fn saved_materials_matching(app: &TextureCraftApp, filter: &str) -> usize {
+    app.library.iter().flatten().filter(|path| matches(filter, &[saved_material_name(path)])).count()
+}
+
+/// The search field: a live filter on names (and categories) with a clear button while it has text
+fn search_field(app: &mut TextureCraftApp, ui: &mut Ui) {
+    let tokens = Tokens::get(ui.ctx());
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(ic::MAGNIFYING_GLASS).color(tokens.text_dim));
+        let clear_width = if app.ui.shelf_filter.is_empty() { 0.0 } else { ui.spacing().interact_size.y + ui.spacing().item_spacing.x };
+        let field = egui::TextEdit::singleline(&mut app.ui.shelf_filter).hint_text(tr("Search")).desired_width(ui.available_width() - clear_width);
+        ui.add(field);
+        if !app.ui.shelf_filter.is_empty() && ui.add(egui::Button::new(ic::X).frame(false)).on_hover_text(tr("Clear")).clicked() {
+            app.ui.shelf_filter.clear();
         }
     });
-    drag_preview(&ctx);
 }
 
 /// The dragged asset's name next to the pointer.
@@ -290,11 +344,6 @@ pub(crate) fn matches(filter: &str, texts: &[&str]) -> bool {
     filter.is_empty() || texts.iter().any(|t| t.to_lowercase().contains(filter))
 }
 
-fn title(ui: &mut Ui, text: &str) {
-    let tk = Tokens::get(ui.ctx());
-    ui.label(RichText::new(text).strong().color(tk.text_strong));
-}
-
 pub(crate) fn header(ui: &mut Ui, text: &str) {
     let tk = Tokens::get(ui.ctx());
     ui.add_space(2.0);
@@ -303,10 +352,10 @@ pub(crate) fn header(ui: &mut Ui, text: &str) {
 
 pub(crate) fn tiles(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
     ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+        ui.spacing_mut().item_spacing = vec2(TILE_GAP, TILE_GAP);
         body(ui);
     });
-    ui.add_space(6.0);
+    ui.add_space(SECTION_GAP);
 }
 
 /// The distinct categories of `items`, in order of first appearance.
@@ -320,46 +369,38 @@ pub(crate) fn categories<T>(items: &[T], category: impl Fn(&T) -> &'static str) 
     out
 }
 
-/// Built-in materials or smart materials, grouped by category
-fn materials(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: &str, smart: bool, name: &str) {
-    let shown: Vec<_> =
-        MATERIALS.iter().filter(|material| material.smart == smart && matches(filter, &[material.label, material.category, material.id])).collect();
-    if shown.is_empty() {
+/// Read the user's saved smart materials (desktop library folder) unless they are already listed
+#[cfg(not(target_arch = "wasm32"))]
+fn scan_library(app: &mut TextureCraftApp) {
+    if app.library.is_some() {
         return;
     }
 
-    title(ui, name);
-    for category in categories(&shown, |material| material.category) {
-        header(ui, category);
-        tiles(ui, |ui| {
-            for material in shown.iter().filter(|material| material.category == category) {
-                let texture = app.thumbs.material(ctx, material.id);
-                let asset = Asset::Material(material.id);
-                if tile(ui, &mut app.thumbs, texture.as_ref(), || ShelfPreview::material(material.id), material.label, Some(&asset)).clicked() {
-                    apply(app, &asset);
-                }
-            }
-        });
-    }
+    let saved_material = |path: &std::path::PathBuf| path.extension().is_some_and(|extension| extension == "tcmat" || extension == MCMAT_EXT);
+    let mut files: Vec<std::path::PathBuf> =
+        std::fs::read_dir(crate::library_dir()).map(|dir| dir.flatten().map(|entry| entry.path()).filter(saved_material).collect()).unwrap_or_default();
+    files.sort();
+    app.library = Some(files);
 }
 
-/// The user's saved smart materials (desktop library folder).
+#[cfg(target_arch = "wasm32")]
+fn scan_library(_: &mut TextureCraftApp) {}
+
+/// A saved smart material's name: its file name without the extension
+fn saved_material_name(path: &std::path::Path) -> &str {
+    path.file_stem().and_then(|stem| stem.to_str()).unwrap_or(SAVED_MATERIAL_NAME)
+}
+
+/// The user's saved smart materials matching `filter`, as rows under the grid
 #[cfg(not(target_arch = "wasm32"))]
 fn library(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str) {
-    let tk = Tokens::get(ui.ctx());
-    if app.library.is_none() {
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(crate::library_dir())
-            .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "tcmat" || x == MCMAT_EXT)).collect())
-            .unwrap_or_default();
-        files.sort();
-        app.library = Some(files);
-    }
+    let tokens = Tokens::get(ui.ctx());
     let files = app.library.clone().unwrap_or_default();
-    let name = |f: &std::path::PathBuf| f.file_stem().and_then(|s| s.to_str()).unwrap_or("material").to_string();
-    let shown: Vec<_> = files.iter().filter(|f| matches(filter, &[&name(f)])).collect();
+    let shown: Vec<_> = files.iter().filter(|path| matches(filter, &[saved_material_name(path)])).collect();
     if !filter.is_empty() && shown.is_empty() {
         return;
     }
+
     ui.horizontal(|ui| {
         header(ui, tr("My smart materials"));
         if ui.small_button(ic::ARROW_CLOCKWISE).on_hover_text(tr("Rescan the library folder")).clicked() {
@@ -367,276 +408,162 @@ fn library(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str) {
         }
     });
     if files.is_empty() {
-        ui.label(RichText::new(tr("Right-click a layer > Create smart material")).size(10.0).color(tk.text_dim));
+        ui.label(RichText::new(tr("Right-click a layer > Create smart material")).size(HINT_SIZE).color(tokens.text_dim));
     }
-    for f in shown {
-        let (label, asset) = (name(f), Asset::Library(f.display().to_string()));
-        // MaterialCraft materials (sent from MaterialCraft) show a graph.
-        let glyph = if f.extension().is_some_and(|x| x == MCMAT_EXT) { ic::GRAPH } else { ic::SPHERE };
-        let r = ui.add(egui::Button::selectable(false, format!("{glyph}  {label}")).sense(Sense::click_and_drag())).on_hover_ui(|ui| {
+
+    for path in shown {
+        let (label, asset) = (saved_material_name(path).to_string(), Asset::Library(path.display().to_string()));
+        // MaterialCraft materials (sent from MaterialCraft) show a graph
+        let glyph = if path.extension().is_some_and(|extension| extension == MCMAT_EXT) { ic::GRAPH } else { ic::SPHERE };
+        let response = ui.add(egui::Button::selectable(false, format!("{glyph}  {label}")).sense(Sense::click_and_drag())).on_hover_ui(|ui| {
             ui.label(crate::i18n::trf(
                 "{file}: add above the selected layer (or drag it into the layer stack or onto the viewport)",
-                &[("file", &f.display())],
+                &[("file", &path.display())],
             ));
         });
-        if r.drag_started() {
-            r.dnd_set_drag_payload(ShelfDrag { asset: asset.clone(), label });
+        if response.drag_started() {
+            response.dnd_set_drag_payload(ShelfDrag { asset: asset.clone(), label });
         }
-        if r.clicked() {
+        if response.clicked() {
             apply(app, &asset);
         }
     }
-    ui.add_space(6.0);
+    ui.add_space(SECTION_GAP);
 }
 
 #[cfg(target_arch = "wasm32")]
 fn library(_: &mut TextureCraftApp, _: &mut Ui, _: &str) {}
 
-fn smart_masks(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: &str, name: &str) {
-    let shown: Vec<_> = SMART_MASKS.iter().filter(|m| matches(filter, &[m.label, m.id])).collect();
-    if shown.is_empty() {
-        return;
-    }
-    title(ui, name);
-    tiles(ui, |ui| {
-        for m in shown {
-            let tex = app.thumbs.smart_mask(ctx, m.id);
-            let asset = Asset::SmartMask(m.id);
-            if tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::SmartMask(m.id), m.label, Some(&asset)).clicked() {
-                apply(app, &asset);
-            }
-        }
-    });
-}
-
-/// The filter library, grouped: a click adds the filter to the selected layer's content (or its
-/// mask when the mask is selected), a drop onto a layer to that layer's content.
-fn filters(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: &str, name: &str) {
-    let shown: Vec<_> = FILTERS.iter().filter(|f| matches(filter, &[f.label, f.group, f.id, tr(f.label), tr(f.group)])).collect();
-    if shown.is_empty() {
-        return;
-    }
-    title(ui, name);
-    for group in categories(&shown, |f| f.group) {
-        header(ui, tr(group));
-        tiles(ui, |ui| {
-            for f in shown.iter().filter(|f| f.group == group) {
-                let tex = app.thumbs.filter(ctx, f.id);
-                let asset = Asset::Filter(f.id);
-                if tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::Filter(f.id), tr(f.label), Some(&asset)).clicked() {
-                    apply(app, &asset);
-                }
-            }
-        });
-    }
-}
-
-/// Brush presets, grouped by category, then the user's own: a click sets the brush's stroke
-/// (alpha, spacing, flow, jitters…) and keeps its size.
-fn brushes(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: &str, name: &str) {
-    let shown: Vec<&BrushPreset> = PRESETS.iter().filter(|p| matches(filter, &[p.label, p.category, p.id])).collect();
-    if !shown.is_empty() {
-        title(ui, name);
-        for cat in categories(&shown, |p| p.category) {
-            header(ui, cat);
-            tiles(ui, |ui| {
-                for p in shown.iter().filter(|p| p.category == cat) {
-                    let tex = app.thumbs.brush_preset(ctx, p);
-                    if tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::Brush(p), p.label, None).clicked() {
-                        app.run("brush.preset.apply", json!({"preset": p.id}));
-                    }
-                }
-            });
-        }
-    }
-    my_brushes(app, ui, filter);
-}
-
-/// The user's saved brush presets (desktop brushes folder) and saving the current brush there.
+/// Read the user's saved brush presets (desktop brushes folder) unless they are already listed
 #[cfg(not(target_arch = "wasm32"))]
-fn my_brushes(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str) {
+fn scan_brushes(app: &mut TextureCraftApp) {
     use texturecraft_engine::brush_preset_cmds::BRUSH_EXT;
-    let dir = crate::user_dir("brushes");
-    if app.brushes.is_none() {
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == BRUSH_EXT)).collect())
-            .unwrap_or_default();
-        files.sort();
-        app.brushes = Some(files);
-    }
-    let files = app.brushes.clone().unwrap_or_default();
-    let name = |f: &std::path::PathBuf| f.file_stem().and_then(|s| s.to_str()).unwrap_or("brush").to_string();
-    let shown: Vec<_> = files.iter().filter(|f| matches(filter, &[&name(f)])).collect();
-    if !filter.is_empty() && shown.is_empty() {
+
+    if app.brushes.is_some() {
         return;
     }
-    ui.horizontal(|ui| {
-        header(ui, tr("My brushes"));
-        if ui.small_button(ic::ARROW_CLOCKWISE).on_hover_text(tr("Rescan the library folder")).clicked() {
-            app.brushes = None;
-        }
-    });
-    for f in shown {
-        if ui
-            .add(egui::Button::selectable(false, format!("{}  {}", ic::PAINT_BRUSH_BROAD, name(f))))
-            .on_hover_text(tr("Use this brush (keeps its size)"))
-            .clicked()
-        {
-            app.run("brush.preset.load", json!({"path": f.display().to_string()}));
-        }
-    }
-    ui.horizontal(|ui| {
-        let id = ui.make_persistent_id("brush_preset_name");
-        let mut new_name: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
-        ui.add(egui::TextEdit::singleline(&mut new_name).hint_text(tr("Brush name")).desired_width(110.0));
-        let file = texturecraft_engine::formats::export::sanitize_file_stem(new_name.trim());
-        if ui.add_enabled(!new_name.trim().is_empty(), egui::Button::new(tr("Save current brush"))).clicked() {
-            let path = dir.join(format!("{file}.{BRUSH_EXT}"));
-            // A folder that can't be made fails the save, which reports it.
-            let _ = std::fs::create_dir_all(&dir);
-            if app.run("brush.preset.save", json!({"path": path.display().to_string()})).is_some() {
-                new_name.clear();
-                app.brushes = None;
-            }
-        }
-        ui.data_mut(|d| d.insert_temp(id, new_name));
-    });
-    ui.add_space(6.0);
+
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(crate::user_dir("brushes"))
+        .map(|dir| dir.flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|extension| extension == BRUSH_EXT)).collect())
+        .unwrap_or_default();
+    files.sort();
+    app.brushes = Some(files);
 }
 
 #[cfg(target_arch = "wasm32")]
-fn my_brushes(_: &mut TextureCraftApp, _: &mut Ui, _: &str) {}
+fn scan_brushes(_: &mut TextureCraftApp) {}
 
-/// The built-in alpha library, grouped by category; the brush's alpha is outlined.
-fn alpha_library(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: &str, name: &str) {
-    let tk = Tokens::get(ctx);
-    let shown: Vec<&'static alphas::LibraryAlpha> = alphas::library().iter().filter(|a| matches(filter, &[&a.label, a.category, &a.id])).collect();
-    if shown.is_empty() {
+/// The tile of `entry`, outlined when `selected`: a click applies it, an image resource has a context menu
+fn entry_tile(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, entry: &ShelfEntry, view: ShelfView, selected: bool) {
+    // An image removed this frame has nothing to show
+    if let ShelfEntry::Image(name) = entry
+        && !app.session.images.contains_key(name)
+    {
         return;
     }
-    title(ui, name);
-    let brush = &app.session.tool.brush;
-    let current = if brush.alpha_image.is_none() { brush.alpha_library.clone() } else { None };
-    for cat in categories(&shown, |a| a.category) {
-        header(ui, cat);
-        tiles(ui, |ui| {
-            for &a in shown.iter().filter(|a| a.category == cat) {
-                let tex = app.thumbs.alpha(ctx, a);
-                let asset = Asset::Alpha(&a.id);
-                let r = tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::Alpha(a), &a.label, Some(&asset));
-                if current.as_deref() == Some(a.id.as_str()) {
-                    ui.painter().rect_stroke(r.rect, TILE_ROUNDING, Stroke::new(1.0, tk.accent), egui::StrokeKind::Inside);
-                }
-                if r.clicked() {
-                    apply(app, &asset);
-                }
+
+    let texture = entry.thumbnail(app, ctx);
+    let asset = entry.asset();
+    let session = &app.session;
+    let response = tile_in_view(ui, &mut app.thumbs, texture.as_ref(), || entry.preview(session), entry.label(), asset.as_ref(), view);
+
+    if selected || entry.in_use(app) {
+        let tokens = Tokens::get(ctx);
+        let width = if selected { SELECTED_OUTLINE_WIDTH } else { IN_USE_OUTLINE_WIDTH };
+        ui.painter().rect_stroke(response.rect, TILE_ROUNDING, Stroke::new(width, tokens.accent), egui::StrokeKind::Inside);
+    }
+
+    if entry.includes_randomness() {
+        randomness_badge(ui.painter(), view.thumbnail_rect(response.rect));
+    }
+
+    if response.clicked() || response.secondary_clicked() {
+        let (kind, id) = entry.identity();
+        ctx.data_mut(|data| data.insert_temp(egui::Id::unique(SELECTED_TILE), (kind.to_string(), id.to_string())));
+    }
+    if response.clicked() {
+        entry.activate(app);
+    }
+
+    if let ShelfEntry::Image(name) = entry {
+        response.context_menu(|ui| {
+            if ui.button(tr("Add as decal (view center)")).clicked() {
+                app.run("layer.add.decal", json!({"image": name}));
+                ui.close();
+            }
+            if ui.button(tr("Remove resource")).clicked() {
+                app.run("resource.remove", json!({"name": name}));
+                ui.close();
             }
         });
     }
 }
 
-fn procedurals(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: &str, name: &str) {
-    let shown: Vec<ProceduralKind> = ProceduralKind::ALL.into_iter().filter(|k| matches(filter, &[k.label(), tr(k.label())])).collect();
-    if shown.is_empty() {
-        return;
-    }
-    title(ui, name);
-    tiles(ui, |ui| {
-        for k in shown {
-            let tex = app.thumbs.procedural(ctx, k);
-            if tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::Procedural(k), tr(k.label()), None).clicked() {
-                app.run("layer.add.fill", json!({"name": k.label()}));
-                app.run("layer.fill.set", json!({"channel": "baseColor", "procedural": k.label(), "low": [0.1, 0.1, 0.1], "high": [0.9, 0.9, 0.9]}));
-            }
-        }
-    });
-}
-
-fn environments(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str, name: &str) {
-    let shown: Vec<&&str> = ENVIRONMENTS.iter().filter(|e| matches(filter, &[e])).collect();
-    if shown.is_empty() {
-        return;
-    }
-    title(ui, name);
-    for env in shown {
-        let on = app.session.doc.project.display.environment == **env;
-        if ui.selectable_label(on, format!("{}  {env}", ic::SUN_HORIZON)).clicked() {
-            app.run("display.set", json!({"environment": env}));
-        }
-    }
-    ui.add_space(6.0);
-}
-
-fn textures(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: &str, name: &str) {
-    let tk = Tokens::get(ctx);
-    let names: Vec<String> = app.session.doc.resources.keys().filter(|n| matches(filter, &[n])).cloned().collect();
-    if !filter.is_empty() && names.is_empty() {
-        return;
-    }
-    ui.horizontal(|ui| {
-        title(ui, name);
-        if ui.small_button(tr("Import...")).clicked() {
-            crate::menus::invoke(app, ctx, "resource.import");
-        }
-    });
-    if names.is_empty() {
-        ui.label(RichText::new(tr("Import images to use them in fills and masks")).size(10.0).color(tk.text_dim));
-    }
-    tiles(ui, |ui| {
-        for name in names {
-            let Some(img) = app.session.images.get(&name).cloned() else { continue };
-
-            let tex = app.thumbs.image(ctx, &name, &img);
-            let asset = Asset::Texture(name.clone());
-            let preview = || ShelfPreview::Image(name.clone(), img);
-            let r = tile(ui, &mut app.thumbs, Some(&tex), preview, &name, Some(&asset));
-            if r.clicked() {
-                apply(app, &asset);
-            }
-            r.context_menu(|ui| {
-                if ui.button(tr("Add as decal (view center)")).clicked() {
-                    app.run("layer.add.decal", json!({"image": name}));
-                    ui.close();
-                }
-                if ui.button(tr("Remove resource")).clicked() {
-                    app.run("resource.remove", json!({"name": name}));
-                    ui.close();
-                }
-            });
-        }
-    });
-}
-
-/// Asset tile with optional dragging and a larger hover preview
+/// Asset tile with optional dragging and a larger hover preview, at the medium size
 pub(crate) fn tile(
     ui: &mut Ui,
     thumbs: &mut Thumbs,
-    tex: Option<&egui::TextureHandle>,
+    texture: Option<&egui::TextureHandle>,
     preview: impl FnOnce() -> ShelfPreview,
     label: &str,
     drag: Option<&Asset>,
 ) -> egui::Response {
-    let tk = Tokens::get(ui.ctx());
+    tile_in_view(ui, thumbs, texture, || Some(preview()), label, drag, ShelfView::Medium)
+}
+
+/// [`tile`] at `view`'s size: a grid tile with the name under the thumbnail, or a list row with it beside; `preview` runs on hover
+fn tile_in_view(
+    ui: &mut Ui,
+    thumbs: &mut Thumbs,
+    texture: Option<&egui::TextureHandle>,
+    preview: impl FnOnce() -> Option<ShelfPreview>,
+    label: &str,
+    drag: Option<&Asset>,
+    view: ShelfView,
+) -> egui::Response {
+    let tokens = Tokens::get(ui.ctx());
     let sense = if drag.is_some() { Sense::click_and_drag() } else { Sense::click() };
-    let (rect, resp) = ui.allocate_exact_size(vec2(TILE_WIDTH, TILE_HEIGHT), sense);
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    let (rect, response) = ui.allocate_exact_size(view.tile_size(ui.available_width()), sense);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     if let Some(asset) = drag
-        && resp.drag_started()
+        && response.drag_started()
     {
-        resp.dnd_set_drag_payload(ShelfDrag { asset: asset.clone(), label: label.to_string() });
+        response.dnd_set_drag_payload(ShelfDrag { asset: asset.clone(), label: label.to_string() });
     }
 
     let painter = ui.painter();
-    if resp.hovered() || resp.dragged() {
-        painter.rect_filled(rect, TILE_ROUNDING, tk.row_hover);
+    if response.hovered() || response.dragged() {
+        painter.rect_filled(rect, TILE_ROUNDING, tokens.row_hover);
     }
-    let image_rect = egui::Rect::from_center_size(rect.center_top() + vec2(0.0, THUMBNAIL_CENTER_Y), vec2(THUMBNAIL_SIZE, THUMBNAIL_SIZE));
-    thumbnail(painter, tex, image_rect, &tk);
-    let galley = painter.layout(label.to_string(), egui::FontId::proportional(LABEL_FONT_SIZE), tk.text, rect.width() - LABEL_MARGIN);
-    painter.galley(egui::pos2(rect.center().x - galley.size().x * 0.5, image_rect.bottom() + LABEL_GAP), galley, tk.text);
 
-    let big = if resp.hovered() { big_preview(ui, thumbs, preview) } else { None };
-    resp.on_hover_ui(|ui| hover_preview(ui, tex, big.as_ref(), label))
+    let image_rect = view.thumbnail_rect(rect);
+    thumbnail(painter, texture, image_rect, &tokens);
+    if view.name_beside() {
+        let left = image_rect.right() + crate::shelf_view::LIST_NAME_GAP;
+        let galley = painter.layout_job(one_line(label, rect.right() - left - LABEL_MARGIN, tokens.text));
+        painter.galley(egui::pos2(left, rect.center().y - galley.size().y * 0.5), galley, tokens.text);
+    } else {
+        let galley = painter.layout_job(one_line(label, rect.width() - LABEL_MARGIN, tokens.text));
+        painter.galley(egui::pos2(rect.center().x - galley.size().x * 0.5, image_rect.bottom() + LABEL_GAP), galley, tokens.text);
+    }
+
+    let big = if response.hovered() { preview().and_then(|preview| big_preview(ui, thumbs, || preview)) } else { None };
+    response.on_hover_ui(|ui| hover_preview(ui, texture, big.as_ref(), label))
+}
+
+/// Three light, dark-rimmed dots at the thumbnail's bottom-right corner: the asset includes randomness
+fn randomness_badge(painter: &egui::Painter, thumbnail: egui::Rect) {
+    let corner = thumbnail.right_bottom() - vec2(BADGE_INSET, BADGE_INSET);
+    for offset in [vec2(0.0, 0.0), vec2(-BADGE_DOT_SPACING, 0.0), vec2(-BADGE_DOT_SPACING * 0.5, -BADGE_DOT_SPACING)] {
+        painter.circle(corner + offset, BADGE_DOT_RADIUS, BADGE_DOT_FILL, Stroke::new(BADGE_DOT_RIM, BADGE_DOT_RIM_COLOR));
+    }
+}
+
+/// A tile label on one line, cut with "…" past `width` points (the hover popup shows the whole name)
+fn one_line(label: &str, width: f32, color: Color32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::single_section(label.to_string(), egui::TextFormat::simple(egui::FontId::proportional(LABEL_FONT_SIZE), color));
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width);
+    job
 }
 
 /// Start rendering during the popup delay once the pointer rests
@@ -688,4 +615,25 @@ fn hover_preview(ui: &mut Ui, small: Option<&egui::TextureHandle>, big: Option<&
         ui.add_space(BIG_PREVIEW_LABEL_GAP);
         ui.label(label);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_label_stays_on_one_line_ending_in_an_ellipsis() {
+        let width = 60.0;
+        let mut laid_out = None;
+        let mut output = egui::Context::default().run_ui(egui::RawInput::default(), |ui| {
+            laid_out = Some(ui.painter().layout_job(one_line("Steel Painted Rust Leaks Extra", width, Color32::WHITE)));
+        });
+        // The font atlas upload is not under test
+        output.textures_delta.clear();
+        let galley = laid_out.unwrap();
+
+        assert_eq!(galley.rows.len(), 1);
+        assert!(galley.size().x <= width);
+        assert_eq!(galley.rows[0].glyphs.last().map(|glyph| glyph.chr), Some('…'));
+    }
 }

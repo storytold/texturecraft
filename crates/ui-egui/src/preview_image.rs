@@ -194,3 +194,20 @@ pub fn stroke_preview(b: &BrushSettings, n: usize) -> ColorImage {
     }
     ColorImage::new([n, n], cover.into_iter().map(|v| Color32::from_gray((v * b.opacity * 255.0 + 0.5) as u8)).collect())
 }
+
+/// Environment `name`'s panorama across a `size²` swatch, transparent above and below
+pub fn environment_image(name: &str, size: usize) -> ColorImage {
+    let panorama = texturecraft_render::ibl::environment(name, u32::try_from(size).unwrap_or(u32::MAX));
+    let (width, height) = (panorama.width as usize, panorama.height as usize);
+    let mut image = ColorImage::filled([size, size], Color32::TRANSPARENT);
+    let top = size.saturating_sub(height) / 2;
+    for (y, row) in panorama.data.chunks(width.max(1)).enumerate() {
+        for (x, linear) in row.iter().enumerate().take(size) {
+            let Some(pixel) = image.pixels.get_mut((top + y) * size + x) else { continue };
+
+            let [r, g, b] = linear.map(|component| (linear_to_srgb(aces(component * EXPOSURE)) * 255.0 + 0.5) as u8);
+            *pixel = Color32::from_rgb(r, g, b);
+        }
+    }
+    image
+}

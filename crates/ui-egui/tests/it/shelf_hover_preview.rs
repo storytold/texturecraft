@@ -20,20 +20,22 @@ const REST: f32 = 0.1;
 /// Real time the worker gets to render
 const WORKER_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Open the Materials tab and find two labels unique to shelf tiles
+/// Open the Materials tab and find the first two labels (the grid is sorted by name) unique to shelf tiles
 fn materials_shelf(step_seconds: f32, pixels_per_point: f32) -> (Harness<'static, TextureCraftApp>, Vec<&'static SmartMaterial>) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder()
+    let mut harness = Harness::builder()
         .with_size(egui::vec2(1600.0, 960.0))
         .with_step_dt(step_seconds)
         .with_pixels_per_point(pixels_per_point)
         .build_eframe(|cc| TextureCraftApp::new(cc, session));
-    h.state_mut().ui.shelf_tab = MATERIALS_TAB;
-    h.run_steps(4);
+    harness.state_mut().ui.shelf_tab = MATERIALS_TAB;
+    harness.run_steps(4);
 
-    let unique: Vec<_> = MATERIALS.iter().filter(|m| !m.smart && h.query_all_by_label(m.label).count() == 1).take(2).collect();
+    let mut plain: Vec<_> = MATERIALS.iter().filter(|material| !material.smart).collect();
+    plain.sort_by_key(|material| material.label.to_lowercase());
+    let unique: Vec<_> = plain.into_iter().filter(|material| harness.query_all_by_label(material.label).count() == 1).take(2).collect();
     assert_eq!(unique.len(), 2, "two materials with unique names");
-    (h, unique)
+    (harness, unique)
 }
 
 /// Largest drawn texture in pixels, excluding fonts and images below `min_width` points

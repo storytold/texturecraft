@@ -1583,6 +1583,10 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
 
     *brush = brush.sanitized();
+
+    // Presets are files, which the browser doesn't have
+    #[cfg(not(target_arch = "wasm32"))]
+    section(ui, "sec_brush_preset", tr("Preset"), false, |ui| crate::brush_preset_save::row(app, ui));
 }
 
 /// One alpha in the picker: a 52×64 tile with the shape drawn by `paint` and a label.

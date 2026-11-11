@@ -133,7 +133,7 @@ fn split(axis: SplitAxis, size: SplitSize, first: Node<Panel>, second: Node<Pane
     Node::Split { axis, size, first: Box::new(first), second: Box::new(second) }
 }
 
-/// The default: assets left of the viewport, then texture sets, layers (tabbed with texture set settings) and properties; ratios fit 1600x960
+/// The default: assets (4 tile columns at 1920 px) left of the viewport, then texture sets, layers (tabbed with texture set settings) and properties
 pub fn default_workspace() -> Workspace {
     use Panel::*;
     let column = split(
@@ -143,7 +143,7 @@ pub fn default_workspace() -> Workspace {
         split(SplitAxis::Vertical, SplitSize::Ratio(0.57), tabs(&[Layers, TextureSetSettings]), tabs(&[Properties])),
     );
     let root =
-        split(SplitAxis::Horizontal, SplitSize::Ratio(0.115), tabs(&[Assets]), split(SplitAxis::Horizontal, SplitSize::Ratio(0.78), tabs(&[Viewport]), column));
+        split(SplitAxis::Horizontal, SplitSize::Ratio(0.16), tabs(&[Assets]), split(SplitAxis::Horizontal, SplitSize::Ratio(0.80), tabs(&[Viewport]), column));
     let mut workspace = Workspace::new(Layout { root: Some(root), floating: Vec::new() });
 
     for panel in Panel::ALL {

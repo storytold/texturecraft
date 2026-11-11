@@ -21,11 +21,13 @@ const PER_FRAME: usize = 2;
 /// Shelf sphere and smart mask thumbnail size in pixels
 const SPHERE_PX: usize = 72;
 /// Shelf procedural swatch size in pixels
-const PROCEDURAL_PX: usize = 56;
+const PROCEDURAL_PX: usize = 64;
 /// Shelf alpha and brush stroke swatch size in pixels
 const SWATCH_PX: usize = 64;
 /// Image resource preview size in pixels
 const IMAGE_PX: usize = 64;
+/// The [`ShelfPreview::key`] prefix of the user's saved files
+const SAVED_FILE_KEY_PREFIX: &str = "saved-";
 /// Big hover previews kept at most (the least recently shown go first)
 const BIG_PREVIEWS_KEPT: usize = 32;
 
@@ -192,6 +194,14 @@ impl Thumbs {
         }
     }
 
+    /// Drop the thumbnails and hover previews of the user's saved files, which may have changed on disk
+    pub fn forget_saved_files(&mut self) {
+        let current = |key: &String| !key.starts_with(SAVED_FILE_KEY_PREFIX);
+        self.shelf.retain(|key, _| current(key));
+        self.rendered.retain(|key, _| current(key));
+        self.big_shown.retain(current);
+    }
+
     /// Smart mask thumbnail; None until the worker returns it
     pub fn smart_mask(&mut self, ctx: &egui::Context, id: &'static str) -> Option<TextureHandle> {
         self.worker_rendered(ctx, ShelfPreview::SmartMask(id), SPHERE_PX, false)
@@ -210,6 +220,16 @@ impl Thumbs {
     /// White-on-black swatch of library alpha `alpha`
     pub fn alpha(&mut self, ctx: &egui::Context, alpha: &'static alphas::LibraryAlpha) -> Option<TextureHandle> {
         self.shelf(ctx, ShelfPreview::Alpha(alpha), SWATCH_PX)
+    }
+
+    /// A lighting environment's panorama
+    pub fn environment(&mut self, ctx: &egui::Context, name: &'static str) -> Option<TextureHandle> {
+        self.shelf(ctx, ShelfPreview::Environment(name), SWATCH_PX)
+    }
+
+    /// A saved brush preset's stroke along an S curve; None while it renders, empty when the file is unreadable
+    pub fn saved_brush(&mut self, ctx: &egui::Context, path: &std::path::Path) -> Option<TextureHandle> {
+        self.shelf(ctx, ShelfPreview::SavedBrush(path.to_path_buf()), SWATCH_PX)
     }
 
     /// A brush preset's stroke along an S curve
