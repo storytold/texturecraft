@@ -436,10 +436,10 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     // bake settings
     let uid = ctx.project_set.and_then(|s| s.uid);
     let bake = ctx.bake.and_then(|b| b.for_material(uid));
-    let (bake_settings, unmapped) = bake_settings::map(bake, resolution);
-    set.bake = bake_settings;
-    if !unmapped.is_empty() {
-        report.add(item("bake settings"), Fidelity::Approximated, format!("not taken over: {}", unmapped.join("; ")));
+    let mapped = bake_settings::map(bake, resolution);
+    set.bake = mapped.settings;
+    if !mapped.unmapped.is_empty() {
+        report.add(item("bake settings"), Fidelity::Approximated, format!("not taken over: {}", mapped.unmapped.join("; ")));
     }
     project.texture_sets.push(set);
     // the layer stack

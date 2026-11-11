@@ -1,9 +1,18 @@
-//! The file's baking settings of one texture set (`/baking/baking.ini`) mapped onto TextureCraft's [`BakeSettings`]
-//! where they fit: output size, padding, antialiasing, which bakers are on, and the ambient-occlusion and thickness
-//! rays. Every other setting is listed so the report can say it was not taken over.
+//! The file's baking settings of one texture set (`/baking/baking.ini`) mapped onto TextureCraft's [`BakeSettings`]:
+//! output size, padding, diffusion, antialiasing, which bakers are on, the high-poly matching (low as high, name
+//! suffixes, backfaces) and the cage distances. Every setting without a counterpart, and every value outside the range
+//! TextureCraft's bake settings accept, is listed so the report can say it was not taken over.
 
 use texturecraft_core::{BakeAntialiasing, BakeResolution, BakeSettings, BakedMap};
-use texturecraft_import_reader::model::baking::{MaterialBaking, TweakValue};
+use texturecraft_import_reader::model::baking::{MaterialBaking, TweakList, TweakValue};
+
+/// The ranges TextureCraft's bake settings accept (the engine refuses settings outside them).
+pub mod range {
+    /// Padding width in texels.
+    pub const DILATION: u32 = 128;
+    /// Frontal and rear cage distances.
+    pub const CAGE_DISTANCE: (f32, f32) = (0.0, 0.05);
+}
 
 /// File-format data: the bakers' `usage` numbers.
 fn usage_map(usage: u64) -> Option<BakedMap> {
@@ -19,49 +28,87 @@ fn usage_map(usage: u64) -> Option<BakedMap> {
     })
 }
 
-/// Settings that change nothing inside the islands or only steer inputs resolved elsewhere.
-const NO_EFFECT: &[&str] =
-    &["Detail.LowAsHigh", "Detail.HipolyMesh", "Detail.CageMesh", "Detail.LowpolySuffix", "Detail.HipolySuffix", "Detail.BackfaceCullingSuffix"];
+/// One set's settings as TextureCraft's, and what of them was not taken over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MappedBake {
+    pub settings: BakeSettings,
+    /// One line per setting not taken over (`key = value`, with the reason where it is not "no counterpart").
+    pub unmapped: Vec<String>,
+}
 
-fn flag(v: &TweakValue) -> Option<bool> {
+/// What became of one setting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Outcome {
+    /// Taken over as it is (or it changes nothing).
+    Taken,
+    /// Outside the range TextureCraft accepts: the nearest value in range was taken.
+    Clamped(f32),
+    /// No counterpart.
+    Listed,
+}
+
+impl Outcome {
+    pub(crate) fn of(taken: bool) -> Outcome {
+        if taken { Outcome::Taken } else { Outcome::Listed }
+    }
+
+    /// The report line of setting `key` = `v` (none when taken over).
+    pub(crate) fn note(self, key: &str, v: &TweakValue) -> Option<String> {
+        match self {
+            Outcome::Taken => None,
+            Outcome::Clamped(used) => Some(format!("{key} = {v} (outside TextureCraft's range; {used} used)")),
+            Outcome::Listed => Some(format!("{key} = {v}")),
+        }
+    }
+}
+
+/// A boolean as the file stores it (a bool, or a number in older files).
+pub(crate) fn flag(v: &TweakValue) -> Option<bool> {
     match v {
         TweakValue::Bool(b) => Some(*b),
         other => other.as_f32().map(|x| x != 0.0),
     }
 }
 
-/// `settings` (the set's, if the file has any) as TextureCraft's, and the settings not taken over.
-pub fn map(settings: Option<&MaterialBaking>, resolution: u32) -> (BakeSettings, Vec<String>) {
+fn text(v: &TweakValue) -> Option<&str> {
+    match v {
+        TweakValue::Text(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// Stores the number `v` into `slot`, clamped to `lo..=hi`; listed when `v` is no finite number.
+pub(crate) fn bounded(v: &TweakValue, lo: f32, hi: f32, slot: &mut f32) -> Outcome {
+    match v.as_f32().filter(|x| x.is_finite()) {
+        Some(x) if (lo..=hi).contains(&x) => {
+            *slot = x;
+            Outcome::Taken
+        }
+        Some(x) => {
+            *slot = x.clamp(lo, hi);
+            Outcome::Clamped(*slot)
+        }
+        None => Outcome::Listed,
+    }
+}
+
+/// `settings` (the set's, if the file has any) as TextureCraft's, at `resolution` when the file names no output size.
+pub fn map(settings: Option<&MaterialBaking>, resolution: u32) -> MappedBake {
     let mut bake = BakeSettings::default();
     bake.common.resolution = BakeResolution::from_pixels(resolution).unwrap_or_default();
     let mut unmapped = Vec::new();
     let Some(p) = settings else {
         unmapped.push("no baking settings in the file; defaults used".to_string());
-        return (bake, unmapped);
+        return MappedBake { settings: bake, unmapped };
     };
-    if let Some(TweakValue::Int2([w, h])) = p.common.get("Common.OutputSize") {
-        let log2 = (*w).max(*h);
-        if let Some(r) = (0..=14).contains(&log2).then(|| 1u32 << log2).and_then(BakeResolution::from_pixels) {
-            bake.common.resolution = r;
+    for (k, v) in &p.common.tweaks {
+        if let Some(note) = map_common(k, v, &mut bake).note(k, v) {
+            unmapped.push(note);
         }
     }
-    if let Some(w) = p.common.f32("Common.DilationWidth").filter(|w| w.is_finite()) {
-        bake.common.dilation = w.clamp(0.0, 128.0) as u32;
-    }
     for (k, v) in &p.detail.tweaks {
-        let mapped = match k.as_str() {
-            "Detail.SubSampling" => v
-                .as_f32()
-                .or_else(|| flag(v).map(f32::from))
-                .map(|s| bake.common.antialiasing = if s > 0.0 { BakeAntialiasing::Subsampling2x2 } else { BakeAntialiasing::None })
-                .is_some(),
-            "Detail.RelativeScale" => flag(v) == Some(true),
-            "Detail.UseCage" => flag(v) == Some(false),
-            k if NO_EFFECT.contains(&k) => true,
-            _ => false,
-        };
-        if !mapped {
-            unmapped.push(format!("{k} = {v}"));
+        if let Some(note) = map_detail(k, v, &mut bake).note(k, v) {
+            unmapped.push(note);
         }
     }
     let enabled: Vec<BakedMap> = p.bakers.iter().filter(|b| b.enabled).filter_map(|b| usage_map(b.usage?)).collect();
@@ -75,61 +122,176 @@ pub fn map(settings: Option<&MaterialBaking>, resolution: u32) -> (BakeSettings,
         for (k, v) in &baker.params.tweaks {
             let mapped = match (kind, k.as_str()) {
                 (Some(BakedMap::AmbientOcclusion), "Detail.SecondaryCommon.NbSecondary") => {
-                    v.as_f32().map(|n| bake.maps.ao.parameters.rays.rays = n.clamp(1.0, 4096.0) as u32).is_some()
+                    v.as_f32().map(|n| bake.maps.ao.parameters.rays.rays = n.clamp(1.0, 256.0) as u32).is_some()
                 }
                 (Some(BakedMap::AmbientOcclusion), "Detail.SecondaryCommon.MaxDistance") => {
-                    v.as_f32().filter(|d| d.is_finite()).map(|d| bake.maps.ao.parameters.rays.max_distance = d.max(1e-5)).is_some()
+                    v.as_f32().filter(|d| d.is_finite()).map(|d| bake.maps.ao.parameters.rays.max_distance = d.clamp(1e-5, 1.0)).is_some()
                 }
                 (Some(BakedMap::AmbientOcclusion), "Detail.SecondaryCommon.Spread") => {
                     v.as_f32().filter(|d| d.is_finite()).map(|s| bake.maps.ao.parameters.rays.spread = s.clamp(0.0, 180.0)).is_some()
                 }
                 (Some(BakedMap::Thickness), "Detail.SecondaryCommon.NbSecondary") => {
-                    v.as_f32().map(|n| bake.maps.thickness.parameters.rays.rays = n.clamp(1.0, 4096.0) as u32).is_some()
+                    v.as_f32().map(|n| bake.maps.thickness.parameters.rays.rays = n.clamp(1.0, 256.0) as u32).is_some()
                 }
                 (Some(BakedMap::Thickness), "Detail.SecondaryCommon.MaxDistance") => {
-                    v.as_f32().filter(|d| d.is_finite()).map(|d| bake.maps.thickness.parameters.rays.max_distance = d.max(1e-5)).is_some()
+                    v.as_f32().filter(|d| d.is_finite()).map(|d| bake.maps.thickness.parameters.rays.max_distance = d.clamp(1e-5, 1.0)).is_some()
                 }
                 _ => false,
             };
             if !mapped {
-                let baker_name = baker.params.baker.rsplit('.').next().unwrap_or(&baker.params.baker);
-                unmapped.push(format!("{baker_name} {k} = {v}"));
+                unmapped.push(format!("{} {k} = {v}", short_baker(&baker.params)));
             }
         }
     }
-    (bake, unmapped)
+    MappedBake { settings: bake, unmapped }
+}
+
+/// One common setting (size, padding, diffusion).
+fn map_common(key: &str, v: &TweakValue, bake: &mut BakeSettings) -> Outcome {
+    match key {
+        // log2 of width and height
+        "Common.OutputSize" => match v {
+            TweakValue::Int2([w, h]) => {
+                let side = |log2: i32| u32::try_from(log2).ok().filter(|l| *l <= 14).and_then(|l| BakeResolution::from_pixels(1 << l));
+                match (side(*w), side(*h)) {
+                    (Some(w), Some(h)) => {
+                        bake.common.resolution = w;
+                        bake.common.resolution_height = (h != w).then_some(h);
+                        Outcome::Taken
+                    }
+                    _ => Outcome::Listed,
+                }
+            }
+            _ => Outcome::Listed,
+        },
+        "Common.DilationWidth" => {
+            let mut width = bake.common.dilation as f32;
+            let outcome = bounded(v, 0.0, range::DILATION as f32, &mut width);
+            bake.common.dilation = width as u32;
+            outcome
+        }
+        "Common.ApplyDiffusion" => Outcome::of(flag(v).map(|b| bake.common.apply_diffusion = b).is_some()),
+        _ => Outcome::Listed,
+    }
+}
+
+/// One detail setting: how rays leave the low poly and which high poly they hit.
+fn map_detail(key: &str, v: &TweakValue, bake: &mut BakeSettings) -> Outcome {
+    let (lo, hi) = range::CAGE_DISTANCE;
+    match key {
+        "Detail.SubSampling" => Outcome::of(
+            v.as_f32()
+                .or_else(|| flag(v).map(f32::from))
+                .map(|s| bake.common.antialiasing = if s > 0.0 { BakeAntialiasing::Subsampling2x2 } else { BakeAntialiasing::None })
+                .is_some(),
+        ),
+        "Detail.LowAsHigh" => Outcome::of(flag(v).map(|b| bake.high_poly.use_low_as_high = b).is_some()),
+        "Detail.IgnoreBackface" => Outcome::of(flag(v).map(|b| bake.high_poly.ignore_backface = b).is_some()),
+        "Detail.LowpolySuffix" => Outcome::of(text(v).map(|s| bake.high_poly.low_suffix = s.to_string()).is_some()),
+        "Detail.HipolySuffix" => Outcome::of(text(v).map(|s| bake.high_poly.high_suffix = s.to_string()).is_some()),
+        "Detail.BackfaceCullingSuffix" => Outcome::of(text(v).map(|s| bake.high_poly.ignore_backface_suffix = s.to_string()).is_some()),
+        "Detail.MaxHeight" => bounded(v, lo, hi, &mut bake.cage.max_frontal),
+        "Detail.MaxDepth" => bounded(v, lo, hi, &mut bake.cage.max_rear),
+        "Detail.RelativeScale" => Outcome::of(flag(v).map(|b| bake.cage.relative_to_bounding_box = b).is_some()),
+        "Detail.SmoothNormals" => Outcome::of(flag(v).map(|b| bake.cage.average_normals = b).is_some()),
+        // a cage file is not part of the project file: only "no cage" is taken over
+        "Detail.UseCage" => Outcome::of(flag(v) == Some(false)),
+        // TextureCraft has one filter, the file's first
+        "Detail.FilterMethod" => Outcome::of(v.as_f32() == Some(0.0)),
+        // the mesh files themselves are not in the project file
+        "Detail.HipolyMesh" | "Detail.CageMesh" => Outcome::Taken,
+        _ => Outcome::Listed,
+    }
+}
+
+/// `GLMapBakerManager.AOFromDetail` → `AOFromDetail`.
+fn short_baker(list: &TweakList) -> &str {
+    list.baker.rsplit('.').next().unwrap_or(&list.baker)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use texturecraft_import_reader::model::baking::{BakerSettings, TweakList};
+    use texturecraft_import_reader::model::baking::BakerSettings;
+
+    fn list(tweaks: &[(&str, TweakValue)]) -> TweakList {
+        TweakList { baker: String::new(), tweaks: tweaks.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() }
+    }
+
+    fn baking(common: &[(&str, TweakValue)], detail: &[(&str, TweakValue)], bakers: Vec<BakerSettings>) -> MaterialBaking {
+        MaterialBaking { material_uid: None, enabled: true, common: list(common), detail: list(detail), bakers }
+    }
 
     #[test]
     fn sizes_padding_bakers_and_rays_map_and_the_rest_is_listed() {
-        let (defaults, notes) = map(None, 1024);
-        assert_eq!((defaults.common.resolution, notes.len()), (BakeResolution::R1024, 1));
-        let p = MaterialBaking {
-            material_uid: None,
-            enabled: true,
-            common: TweakList {
-                baker: String::new(),
-                tweaks: vec![("Common.OutputSize".into(), TweakValue::Int2([12, 11])), ("Common.DilationWidth".into(), TweakValue::Float(8.0))],
-            },
-            detail: TweakList {
-                baker: String::new(),
-                tweaks: vec![("Detail.SubSampling".into(), TweakValue::Float(1.0)), ("Detail.Odd".into(), TweakValue::Float(1.0))],
-            },
-            bakers: vec![BakerSettings {
+        let defaults = map(None, 1024);
+        assert_eq!((defaults.settings.common.resolution, defaults.unmapped.len()), (BakeResolution::R1024, 1));
+        let p = baking(
+            &[("Common.OutputSize", TweakValue::Int2([12, 11])), ("Common.DilationWidth", TweakValue::Float(8.0))],
+            &[("Detail.SubSampling", TweakValue::Float(1.0)), ("Detail.Odd", TweakValue::Float(1.0))],
+            vec![BakerSettings {
                 usage: Some(1),
                 enabled: true,
                 params: TweakList { baker: "Bakers.AO".into(), tweaks: vec![("Detail.SecondaryCommon.NbSecondary".into(), TweakValue::Float(64.0))] },
             }],
-        };
-        let (b, notes) = map(Some(&p), 2048);
-        assert_eq!((b.common.resolution, b.common.dilation, b.common.antialiasing), (BakeResolution::R4096, 8, BakeAntialiasing::Subsampling2x2));
+        );
+        let MappedBake { settings: b, unmapped } = map(Some(&p), 2048);
+        assert_eq!((b.common.resolution, b.common.resolution_height), (BakeResolution::R4096, Some(BakeResolution::R2048)));
+        assert_eq!((b.common.dilation, b.common.antialiasing), (8, BakeAntialiasing::Subsampling2x2));
         assert_eq!(b.maps.ao.parameters.rays.rays, 64);
         assert!(b.maps.is_enabled(BakedMap::AmbientOcclusion) && !b.maps.is_enabled(BakedMap::Curvature));
-        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(unmapped, ["Detail.Odd = 1"]);
+    }
+
+    #[test]
+    fn high_poly_matching_and_cage_distances_are_taken_over() {
+        let text = |s: &str| TweakValue::Text(s.into());
+        let p = baking(
+            &[("Common.OutputSize", TweakValue::Int2([10, 10])), ("Common.ApplyDiffusion", TweakValue::Bool(false))],
+            &[
+                ("Detail.LowAsHigh", TweakValue::Bool(true)),
+                ("Detail.HipolyMesh", text("")),
+                ("Detail.UseCage", TweakValue::Bool(false)),
+                ("Detail.CageMesh", text("")),
+                ("Detail.MaxHeight", TweakValue::Float(0.02)),
+                ("Detail.MaxDepth", TweakValue::Float(0.03)),
+                ("Detail.RelativeScale", TweakValue::Bool(false)),
+                ("Detail.SmoothNormals", TweakValue::Int(0)),
+                ("Detail.IgnoreBackface", TweakValue::Bool(false)),
+                ("Detail.FilterMethod", TweakValue::Int(0)),
+                ("Detail.LowpolySuffix", text("_lp")),
+                ("Detail.HipolySuffix", text("_hp")),
+                ("Detail.BackfaceCullingSuffix", text("_bf")),
+            ],
+            Vec::new(),
+        );
+        let MappedBake { settings: b, unmapped } = map(Some(&p), 512);
+        assert!(unmapped.is_empty(), "{unmapped:?}");
+        assert_eq!((b.common.resolution, b.common.resolution_height, b.common.apply_diffusion), (BakeResolution::R1024, None, false));
+        let h = &b.high_poly;
+        assert!(h.use_low_as_high && !h.ignore_backface);
+        assert_eq!((h.low_suffix.as_str(), h.high_suffix.as_str(), h.ignore_backface_suffix.as_str()), ("_lp", "_hp", "_bf"));
+        assert_eq!((b.cage.max_frontal, b.cage.max_rear, b.cage.relative_to_bounding_box, b.cage.average_normals), (0.02, 0.03, false, false));
+    }
+
+    #[test]
+    fn values_out_of_range_or_without_counterpart_are_listed() {
+        let p = baking(
+            &[("Common.OutputSize", TweakValue::Int2([20, 10])), ("Common.DilationWidth", TweakValue::Int(300))],
+            &[
+                ("Detail.MaxHeight", TweakValue::Float(0.1)),
+                ("Detail.MaxDepth", TweakValue::Float(f32::NAN)),
+                ("Detail.UseCage", TweakValue::Bool(true)),
+                ("Detail.FilterMethod", TweakValue::Int(1)),
+                ("Detail.LowpolySuffix", TweakValue::Int(3)),
+            ],
+            Vec::new(),
+        );
+        let MappedBake { settings: b, unmapped } = map(Some(&p), 2048);
+        assert_eq!((b.common.resolution, b.common.dilation), (BakeResolution::R2048, range::DILATION));
+        assert_eq!((b.cage.max_frontal, b.cage.max_rear), (range::CAGE_DISTANCE.1, 0.01));
+        assert_eq!(b.high_poly.low_suffix, "_low");
+        assert_eq!(unmapped.len(), 7, "{unmapped:?}");
+        assert!(unmapped[2].starts_with("Detail.MaxHeight = 0.1 (outside"), "{unmapped:?}");
     }
 }
