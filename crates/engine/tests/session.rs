@@ -246,13 +246,21 @@ fn adding_an_image_layer_without_the_extension_says_which_resource_exists() {
     assert!(doc.contains("with the extension"), "the params doc names the exact name: {doc}");
 }
 
+/// A tiny PNG, for the cases that need a resource that really decodes
+fn tiny_png() -> Vec<u8> {
+    let mut png = Vec::new();
+    let img = image::RgbaImage::from_fn(8, 8, |_, _| image::Rgba([255, 0, 0, 255]));
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    png
+}
+
 #[test]
 fn a_missing_resource_message_lists_at_most_eight_names() {
     let mut s = session();
     let err = execute(&mut s, "layer.add.image", &json!({"name": "src_0"})).unwrap_err().to_string();
     assert_eq!(err, "`layer.add.image`: no resource `src_0`; the project has no image resources, import one with `resource.import`");
     for i in 0..10 {
-        s.doc.resources.insert(format!("img_{i}.png"), std::sync::Arc::new(Vec::new()));
+        s.import_resource_bytes(&format!("img_{i}.png"), tiny_png()).unwrap();
     }
     // A linked material's package is a resource too, but it is not an image `layer.add.image` can use
     s.doc.resources.insert("brass.mcraft".into(), std::sync::Arc::new(Vec::new()));
@@ -266,18 +274,31 @@ fn a_missing_resource_message_lists_at_most_eight_names() {
 }
 
 #[test]
-fn a_package_is_not_offered_as_an_image_resource() {
+fn only_names_that_decoded_are_offered() {
     let mut s = session();
+    // A package, and a resource whose bytes are not an image: neither can fill a layer
     s.doc.resources.insert("brass.mcraft".into(), std::sync::Arc::new(Vec::new()));
+    s.doc.resources.insert("broken.png".into(), std::sync::Arc::new(vec![1, 2, 3]));
 
     let err = execute(&mut s, "layer.add.image", &json!({"name": "brass"})).unwrap_err().to_string();
 
     assert_eq!(err, "`layer.add.image`: no resource `brass`; the project has no image resources, import one with `resource.import`");
 
-    s.doc.resources.insert("src_0.png".into(), std::sync::Arc::new(Vec::new()));
+    s.import_resource_bytes("src_0.png", tiny_png()).unwrap();
     let err = execute(&mut s, "layer.add.image", &json!({"name": "brass"})).unwrap_err().to_string();
 
     assert_eq!(err, "`layer.add.image`: no resource `brass`; available: src_0.png");
+}
+
+#[test]
+fn an_imported_image_is_offered_whatever_its_extension() {
+    let mut s = session();
+    // The list follows what decoded, not the name: a package suffix does not hide a real image
+    assert_eq!(s.import_resource_bytes("odd.mcraft", tiny_png()).unwrap(), "odd.mcraft");
+
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "odd"})).unwrap_err().to_string();
+
+    assert_eq!(err, "`layer.add.image`: no resource `odd`; available: odd.mcraft");
 }
 
 #[test]

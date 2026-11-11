@@ -191,10 +191,10 @@ fn missing_resource(s: &Session, name: &str) -> String {
     const MAX_LISTED: usize = 8;
 
     let mut msg = format!("no resource `{name}`");
-    // A linked material's package is a resource too, but it is not an image, so `layer.add.image`
-    // cannot use it -- the same rule `sync_images` applies when it skips packages.
-    let package_suffix = format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT);
-    let images: Vec<&str> = s.doc.resources.keys().filter(|k| !k.ends_with(&package_suffix)).map(String::as_str).collect();
+    // Only a decoded image can fill a layer: a linked material's package is not one, and neither is a
+    // resource that failed to decode. `doc.resources` is ordered and `images` is not, so filter the
+    // ordered keys instead of listing `images` itself.
+    let images: Vec<&str> = s.doc.resources.keys().filter(|k| s.images.contains_key(*k)).map(String::as_str).collect();
     if images.is_empty() {
         msg.push_str("; the project has no image resources, ");
         msg.push_str(IMPORT_HINT);
