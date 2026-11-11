@@ -152,6 +152,48 @@ pub enum Facing {
     Any,
 }
 
+/// How far from a stamp's centre a texel lies, and so which surfaces in its volume it reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Reach {
+    /// The texel's offset laid flat on the stamp's plane, cut off at the stamp's depth (TextureCraft's own painting).
+    #[default]
+    Plane,
+    /// The texel's distance along the surface ([`surface_reach`]): a stamp keeps its size on grazing surfaces and
+    /// wraps over edges, and a surface lying off the stamp's surface (a sheet behind another) fades out the further off
+    /// it lies; the stamp's depth is not used. Off by default; for strokes replayed from an imported project, whose
+    /// dabs reach so (measured).
+    Surface,
+}
+
+/// Reach off the smooth curve: the distance scales by `(1 − x²)` to this power (measured on stacked sheets and a
+/// cylinder).
+const OFF_CURVE_POWER: f32 = -0.85;
+
+/// Least `cos(φ / 2)` the surface distance divides by (a texel turned almost a half turn from the stamp).
+const MIN_HALF_TURN: f32 = 0.05;
+
+/// How far from a stamp's centre a texel lies along the surface, as a share of `radius` (infinite: out of reach).
+/// `offset` goes from the centre to the texel, `center_normal` and `texel_normal` are the unit normals there. On a
+/// smooth surface this is the straight-line distance: `t / cos(φ / 2)`, with `t` the offset's length in the centre's
+/// tangent plane and `φ` the turn between the normals. A surface lying off that curve by `x` radii along the centre's
+/// normal comes nearer the rim the further off it lies: the distance scales by `(1 − x²)^−0.85`, and `x ≥ 1` is out of
+/// reach.
+pub fn surface_reach(offset: Vec3, center_normal: Vec3, texel_normal: Vec3, radius: f32) -> f32 {
+    if radius.is_nan() || radius <= 0.0 {
+        return f32::INFINITY;
+    }
+    let along = offset.dot(center_normal);
+    let flat = (offset - center_normal * along).length();
+    let half = (0.5 * (1.0 + center_normal.dot(texel_normal)).clamp(0.0, 2.0)).sqrt();
+    let sin_half = (1.0 - half * half).max(0.0).sqrt();
+    let curve = if half > 1e-3 { flat * sin_half / half } else { 0.0 };
+    let beyond = ((along.abs() - curve).max(0.0) / radius).min(1.0);
+    if beyond >= 1.0 || beyond.is_nan() {
+        return f32::INFINITY;
+    }
+    flat / half.max(MIN_HALF_TURN) / radius * (1.0 - beyond * beyond).powf(OFF_CURVE_POWER)
+}
+
 /// What the rasterizer reads.
 pub struct RasterCtx<'a> {
     pub mesh: &'a Mesh,
@@ -167,6 +209,8 @@ pub struct RasterCtx<'a> {
     pub shape: Shape<'a>,
     /// Which surfaces a stamp reaches by their turn from its normal ([`Facing::Front`] for painting).
     pub facing: Facing,
+    /// How far a stamp reaches ([`Reach::Plane`] for painting).
+    pub reach: Reach,
 }
 
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
@@ -290,14 +334,29 @@ fn scan_triangle(
             let b0 = 1.0 - b1 - b2;
             let position = *position_a * b0 + *position_b * b1 + *position_c * b2;
             let offset = position - stamp.center;
-            let local_x = offset.dot(stamp.tangent) / stamp.radius;
-            let local_y = offset.dot(stamp.bitangent) / stamp.radius;
-            if local_x * local_x + local_y * local_y > 2.0 {
+            let mut local_x = offset.dot(stamp.tangent) / stamp.radius;
+            let mut local_y = offset.dot(stamp.bitangent) / stamp.radius;
+            let flat_squared = local_x * local_x + local_y * local_y;
+            // the surface distance is never shorter than the flat one, so this bound holds for both reaches
+            if flat_squared > 2.0 {
                 continue;
             }
 
-            if offset.dot(stamp.normal).abs() > stamp.radius * stamp.depth {
+            if context.reach == Reach::Plane && offset.dot(stamp.normal).abs() > stamp.radius * stamp.depth {
                 continue;
+            }
+
+            let normal = (*normal_a * b0 + *normal_b * b1 + *normal_c * b2).try_normalize().unwrap_or(stamp.normal);
+            if context.reach == Reach::Surface {
+                // the tip is read at the surface distance, in the offset's direction on the stamp's plane
+                let distance = surface_reach(offset, stamp.normal, normal, stamp.radius);
+                if distance.is_nan() || distance * distance > 2.0 {
+                    continue;
+                }
+                let flat = flat_squared.sqrt();
+                let scale = if flat > 1e-6 { distance / flat } else { 1.0 };
+                local_x *= scale;
+                local_y *= scale;
             }
 
             let distance_squared = offset.length_squared();
@@ -305,7 +364,6 @@ fn scan_triangle(
                 center = ([x as f32 + 0.5, y as f32 + 0.5], distance_squared);
             }
 
-            let normal = (*normal_a * b0 + *normal_b * b1 + *normal_c * b2).try_normalize().unwrap_or(stamp.normal);
             let turn = match context.facing {
                 Facing::Front if normal.dot(stamp.normal) <= 0.0 => continue,
                 Facing::Front | Facing::Any => 1.0,
@@ -386,6 +444,7 @@ mod tests {
             angle_fade: (70.0, 85.0),
             shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, level: 0 },
             facing: Facing::Front,
+            reach: Reach::Plane,
         };
         let st = Stamp {
             center: Vec3::ZERO,
@@ -447,6 +506,7 @@ mod tests {
             angle_fade: (70.0, 85.0),
             shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, level: 0 },
             facing,
+            reach: Reach::Plane,
         };
         // a stamp on the fold, facing up: the wall turns a quarter from it (cosine 0)
         let st = Stamp {
@@ -476,6 +536,113 @@ mod tests {
         let (none, _) = wall(Facing::Fade { full: 1.0, none: 0.5 });
         assert_eq!(none, 0.0);
         assert!(wall(Facing::Any).0 > 0.9);
+    }
+
+    #[test]
+    fn surface_reach_follows_the_measured_rule() {
+        // offset, centre normal, texel normal, radius, expected share (measured on stacked sheets and a cylinder)
+        let z = [0.0, 0.0, 1.0];
+        type Row = ([f32; 3], [f32; 3], [f32; 3], f32, f32);
+        let rows: [Row; 8] = [
+            ([0.05, 0.0, 0.0], z, z, 0.1, 0.5),
+            ([0.05, 0.05, 0.0], z, z, 0.1, std::f32::consts::FRAC_1_SQRT_2),
+            ([0.12, 0.0, 0.0], z, z, 0.1, 1.1999999),
+            ([0.05, 0.0, -0.01], z, [0.38941833, 0.0, 0.921061], 0.1, 0.5101694),
+            ([0.03, 0.0, -0.002], z, [0.19866933, 0.0, 0.9800666], 0.05, 0.6030125),
+            ([0.0, 0.02, -0.03], z, z, 0.1, 0.21669295),
+            ([0.02, 0.0, -0.05], z, z, 0.1, 0.2554041),
+            ([0.0, 0.0, -0.2], z, z, 0.1, f32::INFINITY),
+        ];
+        for (offset, center, texel, radius, expected) in rows {
+            let got = surface_reach(Vec3::from(offset), Vec3::from(center), Vec3::from(texel), radius);
+            let agrees = if expected.is_infinite() { got.is_infinite() } else { (got - expected).abs() < 1e-5 };
+            assert!(agrees, "{offset:?}: got {got}, expected {expected}");
+        }
+    }
+
+    #[test]
+    fn surface_reach_is_the_chord_on_a_curve_and_grows_off_it() {
+        let n = Vec3::Z;
+        assert!((surface_reach(Vec3::new(0.5, 0.0, 0.0), n, n, 1.0) - 0.5).abs() < 1e-6);
+        // a point on a circle of radius 1 a turn `a` from the centre: its distance is the chord, longer than the flat offset
+        let a = 0.6f32;
+        let offset = Vec3::new(a.sin(), 0.0, a.cos() - 1.0);
+        let got = surface_reach(offset, n, Vec3::new(a.sin(), 0.0, a.cos()), 1.0);
+        assert!((got - offset.length()).abs() < 1e-5 && got > a.sin());
+        // straight under the centre stays at the centre; off to the side it nears the rim; too far off is out of reach
+        assert!(surface_reach(Vec3::new(0.0, 0.0, -0.3), n, n, 0.5) < 1e-6);
+        assert!(surface_reach(Vec3::new(0.2, 0.0, -0.3), n, n, 0.5) > 0.4 * 1.4);
+        assert!(surface_reach(Vec3::new(0.1, 0.0, -0.6), n, n, 0.5).is_infinite());
+        // no radius, no reach (and no panic on hostile values)
+        for radius in [0.0, -1.0, f32::NAN] {
+            assert!(surface_reach(Vec3::X, n, n, radius).is_infinite());
+        }
+        let hostile = surface_reach(Vec3::splat(f32::NAN), n, n, 1.0);
+        assert!(hostile.is_nan() || hostile >= 1.0, "a hostile offset reaches nothing");
+    }
+
+    #[test]
+    fn surface_reach_fades_a_sheet_behind_and_plane_reach_does_not() {
+        // two 2 × 2 sheets facing +Y, one `gap` under the other; the top on the left half of the texture, the bottom on the right
+        let radius = 0.4;
+        let gap = 0.5 * radius;
+        let mut m = primitives::plane(2.0, 16);
+        let mut under = m.clone();
+        for uv in &mut m.uvs {
+            uv.x *= 0.5;
+        }
+        for (p, uv) in under.positions.iter_mut().zip(under.uvs.iter_mut()) {
+            p.y = -gap;
+            uv.x = 0.5 + uv.x * 0.5;
+        }
+        under.materials.clear();
+        under.submeshes.clear();
+        m.append(&under);
+        let count = m.indices.len() as u32;
+        if let Some(s) = m.submeshes.first_mut() {
+            s.count = count;
+        }
+        let bvh = Bvh::new(&m);
+        let g = UvGBuffer::new(&m, 0, 256, 128);
+        let st = Stamp {
+            center: Vec3::ZERO,
+            normal: Vec3::Y,
+            tangent: Vec3::X,
+            bitangent: Vec3::Z,
+            radius,
+            flow: 1.0,
+            hardness: 0.5,
+            depth: 1.0,
+            seed: 0,
+            source: None,
+        };
+        let laid = |reach| {
+            let ctx = RasterCtx {
+                mesh: &m,
+                bvh: &bvh,
+                gbuf: &g,
+                material: 0,
+                depth: None,
+                eye: Vec3::new(0.0, 5.0, 0.0),
+                backface_culling: false,
+                angle_fade: (90.0, 90.0),
+                shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, level: 0 },
+                facing: Facing::Any,
+                reach,
+            };
+            let mut c = StrokeCanvas::new(256, 128);
+            rasterize(&mut c, &ctx, &[st]);
+            let sum = |x0: u32| (x0..x0 + 128).flat_map(|x| (0..128).map(move |y| (x, y))).map(|(x, y)| from_u16(c.alpha.get(x, y)[0])).sum::<f32>();
+            // the top sheet, the sheet behind, and a texel of the sheet behind about 0.6 radii off the centre (15 texels of 64 per unit)
+            (sum(0), sum(128), from_u16(c.alpha.get(128 + 64, 64 + 15)[0]))
+        };
+        let (top_plane, under_plane, side_plane) = laid(Reach::Plane);
+        let (top_surface, under_surface, side_surface) = laid(Reach::Surface);
+        assert!((top_plane - top_surface).abs() < 1e-3 * top_plane, "the dab's own surface is the same: {top_plane} vs {top_surface}");
+        assert!((under_plane - top_plane).abs() < 0.02 * top_plane, "the plane reach lays the same disc on the sheet behind");
+        assert!(under_surface < 0.8 * under_plane && under_surface > 0.0, "the sheet behind fades: {under_surface} vs {under_plane}");
+        assert!(side_surface < side_plane, "off the centre the sheet behind nears the rim: {side_surface} vs {side_plane}");
+        assert_eq!(Reach::default(), Reach::Plane);
     }
 }
 

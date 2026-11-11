@@ -456,6 +456,16 @@ fn path_dabs_follow_the_curve_by_its_length() {
 }
 
 #[test]
+fn replayed_dabs_reach_along_the_surface_and_live_painting_keeps_the_plane() {
+    let mesh = wall();
+    let set = wall_set(&mesh);
+    let b = brush(0.1);
+    let tip = Tip::of(&b).unwrap();
+    assert_eq!(raster_ctx(&set, &b, Vec3::Z, tip.shape()).reach, Reach::Surface);
+    assert_eq!(Reach::default(), Reach::Plane);
+}
+
+#[test]
 fn path_dabs_lie_along_the_path_shrink_off_the_surface_and_take_symmetry() {
     let mesh = wall();
     let set = wall_set(&mesh);

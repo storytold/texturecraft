@@ -29,7 +29,8 @@
 //!   the anchors' size as the pen's pressure. Where the curve passes under or over a curved surface, its dabs shrink
 //!   with the depth ([`PATH_DEPTH`], fitted on a sphere). Laid after the step's strokes, each path on its own.
 //! - **Ribbons**: a ribbon brush lays its tip along each path as a band ([`texturecraft_paint::rasterize_ribbon`]).
-//! - Dabs reach every surface in their volume whatever the view sees (measured: nothing occludes), faded by the turn
+//! - Dabs reach every surface in their volume whatever the view sees (measured: nothing occludes), at the texel's
+//!   distance along the surface, a surface lying off the dab's surface fading out ([`Reach::Surface`]), faded by the turn
 //!   from the dab's normal as the brush's culling says ([`Facing::Fade`]); each stroke is laid on its own and committed
 //!   with the effect's opacity ("over" for paint, coverage lowered for the eraser).
 //!
@@ -49,9 +50,9 @@ use texturecraft_import::replay::{
 use texturecraft_paint::alphas::AlphaImage;
 use texturecraft_paint::jitter::{Jittered, StrokeRandom, cycle_start};
 use texturecraft_paint::{
-    Alignment, BrushAlpha, BrushSettings, CommitSource, Facing, PickCtx, RasterCtx, Ribbon, RibbonTiling, SeededJitter, Shape, SpaceCurve, SpacePiece, Staging,
-    Stamp, Stroke, StrokeCanvas, UvStamp, ViewStencil, commit_layer, commit_mask, commit_mask_texels, footprint, footprint_uv, pressure_scale, rasterize,
-    rasterize_ribbon, rasterize_uv, smudge_in_place,
+    Alignment, BrushAlpha, BrushSettings, CommitSource, Facing, PickCtx, RasterCtx, Reach, Ribbon, RibbonTiling, SeededJitter, Shape, SpaceCurve, SpacePiece,
+    Staging, Stamp, Stroke, StrokeCanvas, UvStamp, ViewStencil, commit_layer, commit_mask, commit_mask_texels, footprint, footprint_uv, pressure_scale,
+    rasterize, rasterize_ribbon, rasterize_uv, smudge_in_place,
 };
 use texturecraft_texel::TileImage;
 
@@ -495,7 +496,8 @@ fn seeded(brush: &ReplayBrush, stroke: &ReplayStroke) -> SeededJitter {
     SeededJitter { seed: stroke.seed, both_axes: brush.position_both, normal: brush.position_normal }
 }
 
-/// The rasteriser's view of the set for `shape`: every surface in a dab's volume, faded as the brush culls.
+/// The rasteriser's view of the set for `shape`: every surface in a dab's reach along the surface (measured: a surface
+/// lying off the dab's fades out), faded as the brush culls.
 fn raster_ctx<'a>(set: &'a SetMesh, brush: &ReplayBrush, eye: Vec3, shape: Shape<'a>) -> RasterCtx<'a> {
     RasterCtx {
         mesh: &set.mesh,
@@ -508,6 +510,7 @@ fn raster_ctx<'a>(set: &'a SetMesh, brush: &ReplayBrush, eye: Vec3, shape: Shape
         angle_fade: (90.0, 90.0),
         shape,
         facing: facing(brush),
+        reach: Reach::Surface,
     }
 }
 

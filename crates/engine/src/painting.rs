@@ -410,6 +410,7 @@ impl Session {
             angle_fade: st.stroke.settings.angle_fade,
             shape: Self::shape(&self.images, &st.stroke.settings),
             facing: texturecraft_paint::Facing::Front,
+            reach: texturecraft_paint::Reach::Plane,
         };
         rasterize(&mut st.canvas, &rctx, &stamps);
         self.stroke_painted();

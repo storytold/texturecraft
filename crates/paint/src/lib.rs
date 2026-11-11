@@ -34,7 +34,9 @@ pub use commit::{CommitSource, Staging, TexelFn, commit_coverage, commit_layer, 
 pub use jitter::SeededJitter;
 pub use path::{CurveSpot, Lasso, SpaceCurve, SpacePiece, spline, spline_segments};
 pub use pickup::{Pickup, PickupMode, smudge_in_place};
-pub use raster::{Facing, RasterCtx, StrokeCanvas, UvStamp, fill_coverage, fill_triangles, footprint, footprint_uv, rasterize, rasterize_uv};
+pub use raster::{
+    Facing, RasterCtx, Reach, StrokeCanvas, UvStamp, fill_coverage, fill_triangles, footprint, footprint_uv, rasterize, rasterize_uv, surface_reach,
+};
 pub use ribbon::{Ribbon, RibbonTiling, rasterize_ribbon};
 pub use stamp_source::StampSource;
 pub use stencil::ViewStencil;
