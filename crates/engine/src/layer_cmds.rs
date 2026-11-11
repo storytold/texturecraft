@@ -316,6 +316,10 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
     let solo = boolp(p, "solo") == Some(true);
     let enabled = if solo { Some(true) } else { boolp(p, "enabled") };
     let normal_format = normal_format_param("layer.fill.set", p)?;
+    let low = color_param("layer.fill.set", p, "low")?.unwrap_or([0.0; 3]);
+    let high = color_param("layer.fill.set", p, "high")?.unwrap_or([1.0; 3]);
+    let color = color_param("layer.fill.set", p, "color")?;
+    let value = color_param("layer.fill.set", p, "value")?;
     let source = if let Some(kind) = strp(p, "procedural") {
         let kind = ProceduralKind::parse(kind).ok_or_else(|| bad("layer.fill.set", format!("unknown procedural `{kind}`")))?;
         let mut pr = Procedural::new(kind);
@@ -332,14 +336,8 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
             pr.balance = v.clamp(-1.0, 1.0);
         }
         pr.invert = boolp(p, "invert").unwrap_or(false);
-        let low = color_param("layer.fill.set", p, "low")?.unwrap_or([0.0; 3]);
-        let high = color_param("layer.fill.set", p, "high")?.unwrap_or([1.0; 3]);
         Some(Source::Procedural { pattern: pr, low, high })
-    } else if let Some(c) = {
-        let color = color_param("layer.fill.set", p, "color")?;
-        let value = color_param("layer.fill.set", p, "value")?;
-        color.or(value)
-    } {
+    } else if let Some(c) = color.or(value) {
         Some(Source::Uniform(c))
     } else if let Some(name) = strp(p, "image") {
         Some(Source::Image { name: name.to_string(), normal_format: normal_format.unwrap_or_default() })

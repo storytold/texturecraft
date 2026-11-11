@@ -208,11 +208,11 @@ pub(crate) fn color_of(v: &Value) -> Option<[f32; 3]> {
         Value::Array(a) if a.len() >= 3 => {
             let mut out = [0.0f32; 3];
             for (i, x) in a.iter().take(3).enumerate() {
-                let f = x.as_f64()?;
+                let f = x.as_f64()? as f32;
                 if !f.is_finite() {
                     return None;
                 }
-                out[i] = f as f32;
+                out[i] = f;
             }
             Some(out)
         }
@@ -268,5 +268,11 @@ mod tests {
 
         let short_array = json!({ "color": [0.5, 0.5] });
         assert!(color_param("test.cmd", &short_array, "color").is_err());
+
+        let overflow_array = json!({ "color": [1e40, 0.0, 0.0] });
+        assert!(color_param("test.cmd", &overflow_array, "color").is_err());
+
+        let overflow_scalar = json!({ "color": 1e40 });
+        assert!(color_param("test.cmd", &overflow_scalar, "color").is_err());
     }
 }

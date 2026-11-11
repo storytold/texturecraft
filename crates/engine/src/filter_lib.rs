@@ -253,7 +253,7 @@ pub(crate) fn apply(p: &Value, f: &mut Filter, cmd: &str) -> Result<()> {
         }
         Filter::ColorBalance { shadows, midtones, highlights } => {
             for (key, slot) in [("shadows", shadows), ("midtones", midtones), ("highlights", highlights)] {
-                if let Some(val) = p.get(key) {
+                if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
                     let v = color_of(val).ok_or_else(|| bad(cmd, format!("`{key}` must be [r, g, b] offsets in -1..1")))?;
                     *slot = v.map(|x| x.clamp(-1.0, 1.0));
                 }
