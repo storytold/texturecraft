@@ -4,10 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CoreError, Effect, ImportReport, Layer, LayerId, LayerKind, Result};
+use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CompositeRules, CoreError, Effect, ImportReport, Layer, LayerId, LayerKind, Result};
 
 /// Version of `project.json`. 3 added layer locks, placeholder effects, the import report, geometry masks by UV
-/// tile and the imported blend modes; version 2 files read unchanged.
+/// tile, the imported blend modes and the project's compositing rules ([`Project::rules`]); version 2 files read
+/// unchanged.
 pub const FORMAT_VERSION: u32 = 3;
 
 /// Maximum group nesting (also bounds recursion over hostile project files)
@@ -423,6 +424,10 @@ pub struct Project {
     /// Set on a project converted from another application's file: what was carried over and how faithfully.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import: Option<ImportReport>,
+    /// The rules the compositor and the exporter follow: TextureCraft's own unless the project was imported (left out
+    /// of the file then, so projects made here save and render as before).
+    #[serde(default, skip_serializing_if = "CompositeRules::is_native")]
+    pub rules: CompositeRules,
 }
 
 impl Project {
@@ -440,6 +445,7 @@ impl Project {
             display: DisplaySettings::default(),
             cameras: Vec::new(),
             import: None,
+            rules: CompositeRules::default(),
         }
     }
 
