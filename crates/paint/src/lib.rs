@@ -28,11 +28,11 @@ pub mod text;
 pub mod visibility;
 
 pub use brush::{Alignment, BrushAlpha, BrushSettings, FULL_TURN_DEGREES, MAX_RADIAL_COPIES, Particles, Shape, Symmetry, image_alpha, pressure_scale};
-pub use commit::{CommitSource, Staging, TexelFn, commit_coverage, commit_layer, commit_mask};
+pub use commit::{CommitSource, Staging, TexelFn, commit_coverage, commit_layer, commit_mask, commit_mask_texels};
 pub use jitter::SeededJitter;
 pub use path::{Lasso, spline, spline_segments};
-pub use pickup::{Pickup, PickupMode};
-pub use raster::{Facing, RasterCtx, StrokeCanvas, UvStamp, fill_coverage, fill_triangles, rasterize, rasterize_uv};
+pub use pickup::{Pickup, PickupMode, smudge_in_place};
+pub use raster::{Facing, RasterCtx, StrokeCanvas, UvStamp, fill_coverage, fill_triangles, footprint, footprint_uv, rasterize, rasterize_uv};
 pub use stamp_source::StampSource;
 pub use stencil::ViewStencil;
 pub use stroke::{PickCtx, Stamp, Stroke, SurfaceHit, pick};

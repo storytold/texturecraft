@@ -168,40 +168,71 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 
 /// Accumulate `stamps` into `canvas` ("over": `m = a + m·(1 − a)`).
 pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp]) {
-    let (width, height) = (context.gbuf.width, context.gbuf.height);
     canvas.fit(context.gbuf);
-    let fade_lo = context.angle_fade.1.to_radians().cos();
-    let fade_hi = context.angle_fade.0.to_radians().cos();
-
-    // The camera scale is shared by every candidate texel in this batch
-    let pixels_per_unit = context.depth.map_or(1.0, |depth| {
-        let ndc_per_unit = depth.view_proj.row(1).truncate().length();
-        (depth.height as f32 * ndc_per_unit).max(f32::EPSILON)
-    });
+    let scan = Scan::new(context);
     let mut triangles = Vec::new();
     for stamp in stamps {
-        if stamp.radius.is_nan() || stamp.radius <= 0.0 || !stamp.center.is_finite() {
-            continue;
+        let mut texels = std::mem::take(&mut canvas.texels);
+        let center = scan.stamp(stamp, &mut triangles, &mut texels);
+        canvas.texels = texels;
+        if let Some(center) = center {
+            canvas.add_stamp(center);
         }
+    }
+}
 
+/// The texels one stamp reaches, `(x, y, alpha)` with its shape, flow and fades: what [`rasterize`] lays for it,
+/// without laying it (for tools that use a stamp's texels themselves, such as replayed smudging).
+pub fn footprint(context: &RasterCtx, stamp: &Stamp) -> Vec<(u32, u32, f32)> {
+    let mut texels = Vec::new();
+    Scan::new(context).stamp(stamp, &mut Vec::new(), &mut texels);
+    texels
+}
+
+/// What every stamp of a batch shares while its texels are found.
+struct Scan<'c, 'a> {
+    context: &'c RasterCtx<'a>,
+    fade_lo: f32,
+    fade_hi: f32,
+    /// The camera's scale, shared by every candidate texel.
+    pixels_per_unit: f32,
+}
+
+impl<'c, 'a> Scan<'c, 'a> {
+    fn new(context: &'c RasterCtx<'a>) -> Scan<'c, 'a> {
+        let pixels_per_unit = context.depth.map_or(1.0, |depth| {
+            let ndc_per_unit = depth.view_proj.row(1).truncate().length();
+            (depth.height as f32 * ndc_per_unit).max(f32::EPSILON)
+        });
+        Scan { context, fade_lo: context.angle_fade.1.to_radians().cos(), fade_hi: context.angle_fade.0.to_radians().cos(), pixels_per_unit }
+    }
+
+    /// Appends the texels `stamp` reaches to `texels` (`triangles`: scratch); the texel centre nearest the stamp's
+    /// centre (the pickup's centre), `None` for a stamp that is no stamp.
+    fn stamp(&self, stamp: &Stamp, triangles: &mut Vec<u32>, texels: &mut Vec<(u32, u32, f32)>) -> Option<[f32; 2]> {
+        let context = self.context;
+        if stamp.radius.is_nan() || stamp.radius <= 0.0 || !stamp.center.is_finite() {
+            return None;
+        }
+        let (width, height) = (context.gbuf.width, context.gbuf.height);
         let extent = Vec3::splat(stamp.radius * stamp.depth.max(1.0) * 1.42);
         triangles.clear();
         context.bvh.query_box(stamp.center - extent, stamp.center + extent, |triangle| triangles.push(triangle));
 
         // Each texel belongs to one triangle, so large stamps can scan triangles in parallel
-        let scan = |&triangle: &u32| scan_triangle(context, stamp, triangle, width, height, fade_lo, fade_hi, pixels_per_unit);
+        let scan = |&triangle: &u32| scan_triangle(context, stamp, triangle, width, height, self.fade_lo, self.fade_hi, self.pixels_per_unit);
         let parts: Vec<TriTexels> =
             if triangles.len() > 16 { triangles.par_iter().filter_map(scan).collect() } else { triangles.iter().filter_map(scan).collect() };
 
         // The footprint texel nearest the stamp center supplies the pickup's center
         let mut center = ([0.0f32; 2], f32::MAX);
-        for (texels, nearest) in parts {
+        for (found, nearest) in parts {
             if nearest.1 < center.1 {
                 center = nearest;
             }
-            canvas.texels.extend(texels);
+            texels.extend(found);
         }
-        canvas.add_stamp(center.0);
+        Some(center.0)
     }
 }
 
@@ -368,6 +399,16 @@ mod tests {
         assert!(at(64 + 20, 64) < 0.01);
         assert!(!canvas.dirty.is_empty());
 
+        // its footprint is what it lays
+        let texels = footprint(&ctx, &st);
+        assert!(!texels.is_empty());
+        assert!(texels.iter().all(|&(x, y, a)| (from_u16(canvas.alpha.get(x, y)[0]) - a.min(1.0)).abs() < 1e-4));
+        let uv = UvStamp { center: texturecraft_geom::glam::Vec2::splat(0.5), radius: 0.125, angle: 0.0, flow: 0.5, hardness: 0.9, seed: 0 };
+        let mut c3 = StrokeCanvas::new(128, 128);
+        rasterize_uv(&mut c3, &g, ctx.shape, &[uv]);
+        let texels = footprint_uv(&g, ctx.shape, &uv);
+        assert!(!texels.is_empty() && texels.iter().all(|&(x, y, a)| (from_u16(c3.alpha.get(x, y)[0]) - a).abs() < 1e-4));
+
         // From below (backface), nothing is painted.
         let mut c2 = StrokeCanvas::new(128, 128);
         let below = RasterCtx { eye: Vec3::new(0.0, -5.0, 0.0), ..ctx };
@@ -489,33 +530,50 @@ impl UvStamp {
 
 /// Accumulate UV-space stamps into `canvas` (only texels covered by the texture set).
 pub fn rasterize_uv(canvas: &mut StrokeCanvas, gbuf: &UvGBuffer, shape: Shape, stamps: &[UvStamp]) {
-    let (w, h) = (gbuf.width, gbuf.height);
     canvas.fit(gbuf);
     for s in stamps {
-        if s.radius.is_nan() || s.radius <= 0.0 || !s.center.is_finite() {
-            continue;
+        let mut texels = std::mem::take(&mut canvas.texels);
+        let center = uv_texels(gbuf, shape, s, &mut texels);
+        canvas.texels = texels;
+        if let Some(center) = center {
+            canvas.add_stamp(center);
         }
-        let (cx, cy, r) = (s.center.x * w as f32, s.center.y * h as f32, s.radius * w as f32);
-        let x0 = (cx - r * 1.42).floor().max(0.0) as u32;
-        let x1 = ((cx + r * 1.42).ceil().max(0.0) as u32).min(w);
-        let y0 = (cy - r * 1.42).floor().max(0.0) as u32;
-        let y1 = ((cy + r * 1.42).ceil().max(0.0) as u32).min(h);
-        let (sn, cs) = s.angle.to_radians().sin_cos();
-        let shape = shape.at_radius(r);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                if gbuf.tri.get((y * w + x) as usize).copied().unwrap_or(NO_TRI) == NO_TRI {
-                    continue;
-                }
-                // Local frame with y up on screen (texel rows grow downward), as in the 3D view.
-                let (dx, dy) = ((x as f32 + 0.5 - cx) / r, (cy - y as f32 - 0.5) / r);
-                let (lx, ly) = (dx * cs + dy * sn, -dx * sn + dy * cs);
-                let a = shape.sample(lx, ly, s.hardness, s.seed) * s.flow;
-                if a > 0.0 {
-                    canvas.texels.push((x, y, a));
-                }
+    }
+}
+
+/// The texels one UV-space stamp reaches, `(x, y, alpha)`: what [`rasterize_uv`] lays for it, without laying it.
+pub fn footprint_uv(gbuf: &UvGBuffer, shape: Shape, stamp: &UvStamp) -> Vec<(u32, u32, f32)> {
+    let mut texels = Vec::new();
+    uv_texels(gbuf, shape, stamp, &mut texels);
+    texels
+}
+
+/// Appends the texels `s` reaches to `texels`; its centre in texels, `None` for a stamp that is no stamp.
+fn uv_texels(gbuf: &UvGBuffer, shape: Shape, s: &UvStamp, texels: &mut Vec<(u32, u32, f32)>) -> Option<[f32; 2]> {
+    let (w, h) = (gbuf.width, gbuf.height);
+    if s.radius.is_nan() || s.radius <= 0.0 || !s.center.is_finite() {
+        return None;
+    }
+    let (cx, cy, r) = (s.center.x * w as f32, s.center.y * h as f32, s.radius * w as f32);
+    let x0 = (cx - r * 1.42).floor().max(0.0) as u32;
+    let x1 = ((cx + r * 1.42).ceil().max(0.0) as u32).min(w);
+    let y0 = (cy - r * 1.42).floor().max(0.0) as u32;
+    let y1 = ((cy + r * 1.42).ceil().max(0.0) as u32).min(h);
+    let (sn, cs) = s.angle.to_radians().sin_cos();
+    let shape = shape.at_radius(r);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if gbuf.tri.get((y * w + x) as usize).copied().unwrap_or(NO_TRI) == NO_TRI {
+                continue;
+            }
+            // Local frame with y up on screen (texel rows grow downward), as in the 3D view.
+            let (dx, dy) = ((x as f32 + 0.5 - cx) / r, (cy - y as f32 - 0.5) / r);
+            let (lx, ly) = (dx * cs + dy * sn, -dx * sn + dy * cs);
+            let a = shape.sample(lx, ly, s.hardness, s.seed) * s.flow;
+            if a > 0.0 {
+                texels.push((x, y, a));
             }
         }
-        canvas.add_stamp([cx, cy]);
     }
+    Some([cx, cy])
 }

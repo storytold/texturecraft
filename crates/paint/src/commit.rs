@@ -313,6 +313,16 @@ pub fn commit_mask(pixels: &mut PixelStore, effect: LayerId, size: (u32, u32), v
     over(img, &Blend { kind: ChannelKind::Scalar, value: &value, stencil_color: false, carried: None }, &src, staging.take(None));
 }
 
+/// Commit a stroke into the paint effect `effect` of a mask, painting the grey `grey(x, y)` gives per texel (`None`:
+/// nothing there): projection painting replayed from an imported project, whose grey is an image placed on the view.
+/// The source's own per-texel function is not used.
+pub fn commit_mask_texels(pixels: &mut PixelStore, effect: LayerId, size: (u32, u32), grey: &(dyn Fn(u32, u32) -> Option<f32> + Sync), src: CommitSource) {
+    let per_texel = |x: u32, y: u32| grey(x, y).map(|g| ([if g.is_finite() { g.clamp(0.0, 1.0) } else { 0.0 }; 3], 1.0));
+    let src = CommitSource { per_texel: Some(&per_texel), ..src };
+    let img = pixels.mask_mut(effect, size);
+    over(img, &Blend { kind: ChannelKind::Scalar, value: &[0.0], stencil_color: true, carried: None }, &src, None);
+}
+
 /// Commit a stroke into a coverage-only image (1 component), e.g. the quick mask.
 pub fn commit_coverage(img: &mut TileImage, src: CommitSource) {
     over(img, &Blend { kind: ChannelKind::Scalar, value: &[], stencil_color: false, carried: None }, &src, None);
@@ -440,5 +450,30 @@ mod tests {
         commit_layer(&mut px, LayerId(1), (64, 64), &vals, src(&a, &tiles, 1.0, false), &mut staging);
         commit_mask(&mut px, LayerId(2), (64, 64), 1.0, src(&a, &tiles, 1.0, false), &mut staging);
         assert_eq!((&px.layers, &px.masks), (&expected.layers, &expected.masks));
+    }
+
+    #[test]
+    fn a_mask_commit_can_take_its_grey_per_texel() {
+        let (mut a, tiles) = alpha(1.0);
+        for x in 0..64 {
+            a.set(x, 5, &[to_u16(1.0)]);
+        }
+        let mut px = PixelStore::default();
+        let grey = |x: u32, _y: u32| {
+            if x < 32 {
+                Some(0.25)
+            } else if x < 48 {
+                Some(f32::NAN)
+            } else {
+                None
+            }
+        };
+        commit_mask_texels(&mut px, LayerId(7), (64, 64), &grey, src(&a, &tiles, 0.5, false));
+        let m = &px.masks[&LayerId(7)];
+        let at = |x: u32| (from_u16(m.get(x, 5)[0]), from_u16(m.get(x, 5)[1]));
+        let (v, c) = at(5);
+        assert!((v - 0.125).abs() < 1e-3 && (c - 0.5).abs() < 1e-3, "grey 0.25 at half opacity, premultiplied: {v} {c}");
+        assert!(at(40).0.abs() < 1e-3 && (at(40).1 - 0.5).abs() < 1e-3, "a grey that is no number paints black");
+        assert_eq!(at(50), (0.0, 0.0), "no grey, no paint");
     }
 }
