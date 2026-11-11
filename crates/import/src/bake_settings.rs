@@ -1,10 +1,12 @@
 //! The file's baking settings of one texture set (`/baking/baking.ini`) mapped onto TextureCraft's [`BakeSettings`]:
 //! output size, padding, diffusion, antialiasing, which bakers are on, the high-poly matching (low as high, name
-//! suffixes, backfaces) and the cage distances. Every setting without a counterpart, and every value outside the range
+//! suffixes, backfaces), the cage distances and each baker's own settings ([`bakers`]). Every setting without a counterpart, and every value outside the range
 //! TextureCraft's bake settings accept, is listed so the report can say it was not taken over.
 
+mod bakers;
+
 use texturecraft_core::{BakeAntialiasing, BakeResolution, BakeSettings, BakedMap};
-use texturecraft_import_reader::model::baking::{MaterialBaking, TweakList, TweakValue};
+use texturecraft_import_reader::model::baking::{MaterialBaking, TweakValue};
 
 /// The ranges TextureCraft's bake settings accept (the engine refuses settings outside them).
 pub mod range {
@@ -70,6 +72,16 @@ pub(crate) fn flag(v: &TweakValue) -> Option<bool> {
     }
 }
 
+/// A whole number as the file stores it (an int, a bool, or a float without fraction).
+pub(crate) fn int(v: &TweakValue) -> Option<i64> {
+    match v {
+        TweakValue::Int(i) => Some(*i),
+        TweakValue::Bool(b) => Some(i64::from(*b)),
+        TweakValue::Float(f) if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e9 => Some(*f as i64),
+        _ => None,
+    }
+}
+
 fn text(v: &TweakValue) -> Option<&str> {
     match v {
         TweakValue::Text(t) => Some(t),
@@ -117,31 +129,20 @@ pub fn map(settings: Option<&MaterialBaking>, resolution: u32) -> MappedBake {
             bake.maps.set_enabled(map, enabled.contains(&map));
         }
     }
-    for baker in p.bakers.iter().filter(|b| b.enabled) {
-        let kind = baker.usage.and_then(usage_map);
-        for (k, v) in &baker.params.tweaks {
-            let mapped = match (kind, k.as_str()) {
-                (Some(BakedMap::AmbientOcclusion), "Detail.SecondaryCommon.NbSecondary") => {
-                    v.as_f32().map(|n| bake.maps.ao.parameters.rays.rays = n.clamp(1.0, 256.0) as u32).is_some()
-                }
-                (Some(BakedMap::AmbientOcclusion), "Detail.SecondaryCommon.MaxDistance") => {
-                    v.as_f32().filter(|d| d.is_finite()).map(|d| bake.maps.ao.parameters.rays.max_distance = d.clamp(1e-5, 1.0)).is_some()
-                }
-                (Some(BakedMap::AmbientOcclusion), "Detail.SecondaryCommon.Spread") => {
-                    v.as_f32().filter(|d| d.is_finite()).map(|s| bake.maps.ao.parameters.rays.spread = s.clamp(0.0, 180.0)).is_some()
-                }
-                (Some(BakedMap::Thickness), "Detail.SecondaryCommon.NbSecondary") => {
-                    v.as_f32().map(|n| bake.maps.thickness.parameters.rays.rays = n.clamp(1.0, 256.0) as u32).is_some()
-                }
-                (Some(BakedMap::Thickness), "Detail.SecondaryCommon.MaxDistance") => {
-                    v.as_f32().filter(|d| d.is_finite()).map(|d| bake.maps.thickness.parameters.rays.max_distance = d.clamp(1e-5, 1.0)).is_some()
-                }
-                _ => false,
-            };
-            if !mapped {
-                unmapped.push(format!("{} {k} = {v}", short_baker(&baker.params)));
-            }
+    // every baker's settings are kept (a baker switched on later bakes with them); only the enabled ones are reported
+    for baker in &p.bakers {
+        let notes = match baker.usage.and_then(usage_map) {
+            Some(kind) => bakers::map_baker(kind, &baker.params, &mut bake),
+            None => baker.params.tweaks.iter().map(|(k, v)| format!("{} {k} = {v}", bakers::short_baker(&baker.params))).collect(),
+        };
+        if baker.enabled {
+            unmapped.extend(notes);
         }
+    }
+    if let Some(method) = bakers::curvature_method(
+        p.bakers.iter().filter(|b| b.enabled && b.usage.and_then(usage_map) == Some(BakedMap::Curvature)).map(|b| bakers::short_baker(&b.params)),
+    ) {
+        bake.maps.curvature.parameters.method = method;
     }
     MappedBake { settings: bake, unmapped }
 }
@@ -204,15 +205,10 @@ fn map_detail(key: &str, v: &TweakValue, bake: &mut BakeSettings) -> Outcome {
     }
 }
 
-/// `GLMapBakerManager.AOFromDetail` → `AOFromDetail`.
-fn short_baker(list: &TweakList) -> &str {
-    list.baker.rsplit('.').next().unwrap_or(&list.baker)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use texturecraft_import_reader::model::baking::BakerSettings;
+    use texturecraft_import_reader::model::baking::{BakerSettings, TweakList};
 
     fn list(tweaks: &[(&str, TweakValue)]) -> TweakList {
         TweakList { baker: String::new(), tweaks: tweaks.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() }
