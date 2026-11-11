@@ -365,13 +365,11 @@ fn with_a_replayer_painted_masks_become_paint_effects() {
 
 #[test]
 fn strokes_that_cannot_be_replayed_stay_placeholders_with_their_reason() {
-    // projection painting among the brush work keeps all of it a placeholder: they paint one image in order
+    // projection painting without an image among the brush work keeps all of it a placeholder: they paint one image in
+    // order
     let group = ProjectEffect::Group(EffectGroup {
         header: header(2, u64::MAX, vec![]),
-        effects: vec![
-            painting(3, BASE, PaintTool::Brush, vec![uniform(BASE, [1.0; 3])]),
-            painting(9, BASE, PaintTool::Projection, vec![uniform(BASE, [1.0; 3])]),
-        ],
+        effects: vec![painting(3, BASE, PaintTool::Brush, vec![uniform(BASE, [1.0; 3])]), painting(9, BASE, PaintTool::Projection, vec![])],
     });
     let mut l = layer(1, "Paint", ProjectLayerKind::Paint, vec![group]);
     let mut particle = paint(5, 0);

@@ -379,13 +379,39 @@ pub fn filter(input: &SetInput, anchors: &Anchors, f: &FilterEffect, channels: O
     GraphUse { effect: EffectKind::Graph { graph: r, projection: Projection::default() }, status: cook.status, graph }
 }
 
-/// The grey output of procedural `p`'s graph rendered at `side` with its tweaks (red, row by row), for a brush tip;
-/// image inputs read what their declaration asks for. `None` when the project does not hold the graph or it does not
-/// render.
-pub fn render_grey(lib: &GraphLibrary, p: &Procedural, side: u32) -> Option<Vec<f32>> {
+/// The grey output of procedural `p`'s graph rendered at `side` with its tweaks (red, row by row), for a brush tip or a
+/// stencil. Its image inputs read what the file feeds them: a uniform's colour, another procedural (its grey output,
+/// rendered the same way, nested at most [`GREY_NESTING`] deep), a bitmap (laid on in texture space); the others what
+/// their declaration asks for. `None` when the project does not hold the graph or it does not render.
+pub fn render_grey(lib: &GraphLibrary, p: &Procedural, side: u32, images: &crate::resources::ProjectImages) -> Option<Vec<f32>> {
     use texturecraft_compose::graphs::{RenderEnv, at_texel};
     use texturecraft_compose::{BakedMaps, GraphStore, ImageStore};
+    let mut store = GraphStore::default();
+    let mut bitmaps = ImageStore::default();
+    let r = grey_recipe(lib, p, images, &mut store, &mut bitmaps, 0)?;
+    let baked = BakedMaps::default();
+    let env = RenderEnv { baked: &baked, images: &bitmaps, side: side as usize };
+    let (_, cooked) = store.cook(&r, &env, &[]).ok()?;
+    let out = cooked.output(r.output.as_deref())?;
+    let n = side as usize;
+    Some((0..n * n).map(|i| at_texel(out, (i % n) as u32, (i / n) as u32, (side, side))[0].clamp(0.0, 1.0)).collect())
+}
+
+/// Deepest nesting of procedurals feeding a brush tip's graph that is rendered (deeper ones read their declaration).
+pub const GREY_NESTING: usize = 4;
+
+/// The recipe of `p`'s grey output for [`render_grey`]: its graph's text added to `store`, bitmaps feeding it to
+/// `bitmaps` (under their URL).
+fn grey_recipe(
+    lib: &GraphLibrary,
+    p: &Procedural,
+    images: &crate::resources::ProjectImages,
+    store: &mut texturecraft_compose::GraphStore,
+    bitmaps: &mut texturecraft_compose::ImageStore,
+    depth: usize,
+) -> Option<GraphRef> {
     let g = lib.of(p)?;
+    store.texts.insert(g.key.clone(), g.graph.text.clone());
     let mut r = GraphRef::new(g.key.clone(), p.name());
     for t in &p.tweaks {
         match (t.identifier.as_str(), &t.value) {
@@ -398,20 +424,31 @@ pub fn render_grey(lib: &GraphLibrary, p: &Procedural, side: u32) -> Option<Vec<
             }
         }
     }
-    for (k, d) in g.graph.image_defaults.iter().enumerate() {
-        if let Some(c) = d {
-            r.inputs.insert(k as u32, GraphInput::Constant(*c));
+    for (k, name) in g.graph.images.iter().enumerate() {
+        let source = p.inputs.iter().find(|i| i.identifiers.iter().any(|(id, _)| id == name)).and_then(|i| i.source.as_deref());
+        let fed = match source {
+            Some(ProjectSource::Uniform(u)) => Some(GraphInput::Constant(u.color.map(|v| if v.is_finite() { v } else { 0.0 }))),
+            Some(ProjectSource::Procedural(inner)) if depth < GREY_NESTING => inner
+                .procedural
+                .as_ref()
+                .and_then(|i| grey_recipe(lib, i, images, store, bitmaps, depth + 1))
+                .map(|nested| GraphInput::Nested(Box::new(nested))),
+            Some(ProjectSource::Bitmap(b)) if !b.url.is_empty() => images.peek(&b.url).ok().map(|read| {
+                bitmaps.entry(b.url.clone()).or_insert_with(|| std::sync::Arc::new(read.image.image_res(!read.float)));
+                GraphInput::Image(b.url.clone())
+            }),
+            _ => None,
+        };
+        let fed = fed.or_else(|| g.graph.image_defaults.get(k).copied().flatten().map(GraphInput::Constant));
+        if let Some(f) = fed {
+            r.inputs.insert(k as u32, f);
         }
     }
     r.output = mono_output(p, &g.graph);
-    let mut store = GraphStore::default();
-    store.texts.insert(g.key.clone(), g.graph.text.clone());
-    let (baked, images) = (BakedMaps::default(), ImageStore::default());
-    let env = RenderEnv { baked: &baked, images: &images, side: side as usize };
-    let (_, cooked) = store.cook(&r, &env, &[]).ok()?;
-    let out = cooked.output(r.output.as_deref())?;
-    let n = side as usize;
-    Some((0..n * n).map(|i| at_texel(out, (i % n) as u32, (i / n) as u32, (side, side))[0].clamp(0.0, 1.0)).collect())
+    if depth > 0 {
+        r.keep.extend(r.output.clone());
+    }
+    Some(r)
 }
 
 /// A float tweak of a procedural (its first component).

@@ -89,7 +89,7 @@ fn effect(tool: PaintTool) -> PaintEffect {
 }
 
 fn of(e: &PaintEffect, target: StepTarget) -> Result<ReplayStep, texturecraft_import_reader::blockers::Blocker> {
-    step(e, target, &channels(), &ProjectImages::none(), None)
+    step(e, target, &channels(), &ProjectImages::none(), None, None)
 }
 
 #[test]
@@ -130,8 +130,10 @@ fn masks_paint_a_grey_and_erasers_lower_coverage_or_paint_black() {
 #[test]
 fn what_the_brush_cannot_replay_is_refused_with_a_reason() {
     let key = |e: &PaintEffect| of(e, StepTarget::Content).unwrap_err().key.to_string();
-    // projection painting: not on a paint layer, never without an image; neither it nor a smudge along 3D paths
-    assert_eq!(key(&effect(PaintTool::Projection)), "brush:projection");
+    // projection painting: never without an image; neither it nor a smudge along 3D paths
+    let mut e = effect(PaintTool::Projection);
+    e.colors.clear();
+    assert_eq!(key(&e), "brush:projection");
     let mut e = effect(PaintTool::Projection);
     e.colors.clear();
     assert_eq!(of(&e, StepTarget::Mask).unwrap_err().key.to_string(), "brush:projection");
@@ -276,7 +278,7 @@ fn a_dynamic_alpha_cycles_through_its_stamps() {
     let with = |alpha: ProjectSource| {
         let mut e = effect(PaintTool::Brush);
         e.alpha = vec![alpha];
-        step(&e, StepTarget::Content, &channels(), &ProjectImages::none(), Some(&lib)).unwrap()
+        step(&e, StepTarget::Content, &channels(), &ProjectImages::none(), Some(&lib), None).unwrap()
     };
     let s = with(dynamic(3, texturecraft_import_reader::model::STROKE_WIRE_RANDOM_START));
     assert_eq!((s.brush.cycle.len(), s.brush.cycle_drawn_start), (3, true));
@@ -323,6 +325,21 @@ fn projection_painting_in_a_mask_places_its_image_on_the_view() {
     assert_eq!(s.projection.map(|p| p.matrix), s.stencil.map(|p| p.matrix));
     // a brush has no projection
     assert!(of(&effect(PaintTool::Brush), StepTarget::Mask).unwrap().projection.is_none());
+}
+
+#[test]
+fn projection_painting_on_content_places_each_channels_source_on_the_view() {
+    let mut e = effect(PaintTool::Projection);
+    e.stencil_matrix = Some([2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.25, 0.0, 1.0]);
+    let s = of(&e, StepTarget::Content).unwrap();
+    // the channels' uniforms as values, placed by `projMatrix`; no grey image of its own
+    assert_eq!(s.values.len(), 2);
+    assert_eq!((s.placed, s.projection.is_none()), (Some([2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.25, 0.0, 1.0]), true));
+    assert!(s.notes.iter().any(|n| n == brush::PROJECTED));
+    e.colors = vec![material("")];
+    let s = step(&e, StepTarget::Content, &channels(), &ProjectImages::none(), None, Some(&Graphs)).unwrap();
+    assert!(matches!(&s.sources[..], [(Channel::BaseColor, ReplaySource::Graph(_), _)]) && s.placed.is_some());
+    assert!(of(&effect(PaintTool::Brush), StepTarget::Content).unwrap().placed.is_none());
 }
 
 fn ribbon_brush(tiling: u64) -> ProjectBrush {
@@ -399,4 +416,154 @@ fn path_strokes_and_ribbons_become_steps() {
     }
     e.brush = Some(b);
     assert!((of(&e, StepTarget::Content).unwrap().ribbon.unwrap().depth - 0.05).abs() < 1e-6);
+}
+
+/// The graphs a fill of a source runs, made up: `material` paints base colour and its grey output, nothing else.
+struct Graphs;
+
+impl Graphs {
+    fn of(source: &ProceduralSource) -> Result<texturecraft_core::GraphRef, texturecraft_import_reader::blockers::Blocker> {
+        let name = source.procedural.as_ref().map_or("?", |p| p.name());
+        match name {
+            "material" => Ok(texturecraft_core::GraphRef::new("k", name)),
+            _ => Err(texturecraft_import_reader::blockers::Blocker::graph(name, "not in the project")),
+        }
+    }
+}
+
+impl SourceGraphs for Graphs {
+    fn content(
+        &self,
+        source: &ProceduralSource,
+        channels: &[Channel],
+    ) -> Result<Vec<(Channel, texturecraft_core::GraphRef)>, texturecraft_import_reader::blockers::Blocker> {
+        let g = Graphs::of(source)?;
+        Ok(channels.iter().filter(|c| **c == Channel::BaseColor).map(|c| (*c, g.clone())).collect())
+    }
+
+    fn mask(&self, source: &ProceduralSource) -> Result<texturecraft_core::GraphRef, texturecraft_import_reader::blockers::Blocker> {
+        Graphs::of(source)
+    }
+}
+
+/// A material source on every channel, with a coverage output.
+fn material(alpha_output: &str) -> ProjectSource {
+    let ProjectSource::Procedural(mut p) = shape("material", vec![]) else { panic!("a procedural") };
+    p.channels = ChannelMask(u64::MAX);
+    p.mode = 1;
+    if let Some(q) = &mut p.procedural {
+        q.alpha_output = alpha_output.into();
+    }
+    ProjectSource::Procedural(p)
+}
+
+#[test]
+fn a_brush_painting_a_graph_paints_what_a_fill_of_it_runs() {
+    let mut e = effect(PaintTool::Brush);
+    e.colors = vec![material("")];
+    let s = step(&e, StepTarget::Content, &channels(), &ProjectImages::none(), None, Some(&Graphs)).unwrap();
+    // base colour from the graph; roughness, which it has no output for, not painted
+    assert!(s.values.is_empty());
+    assert_eq!(s.sources.len(), 1);
+    assert!(matches!(&s.sources[0], (Channel::BaseColor, ReplaySource::Graph(g), o) if g.name == "material" && *o == 1.0));
+    assert!(s.notes.iter().any(|n| n == brush::GRAPH_TEXELS), "{:?}", s.notes);
+    // in a mask: its grey output
+    let m = step(&e, StepTarget::Mask, &channels(), &ProjectImages::none(), None, Some(&Graphs)).unwrap();
+    assert!(matches!(&m.mask_source, Some(ReplaySource::Graph(_))) && m.mask_value == 1.0);
+    // without the project's graphs: refused as before; a graph that does not run: its own blocker
+    assert_eq!(of(&e, StepTarget::Content).unwrap_err().key.to_string(), "brush:paints-procedural");
+    e.colors = vec![shape("elsewhere", vec![])];
+    if let ProjectSource::Procedural(p) = &mut e.colors[0] {
+        p.channels = ChannelMask(1);
+    }
+    let b = step(&e, StepTarget::Content, &channels(), &ProjectImages::none(), None, Some(&Graphs)).unwrap_err();
+    assert_eq!((b.key.kind, b.key.name.as_str()), (BlockerKind::Graph, "elsewhere"));
+    // an image in a mask stays refused; an image that cannot be read is refused with its own key
+    let image =
+        ProjectSource::Bitmap(texturecraft_import_reader::model::BitmapSource { uid: None, channels: ChannelMask(u64::MAX), url: "/x?version=1".into() });
+    e.colors = vec![image];
+    assert_eq!(of(&e, StepTarget::Mask).unwrap_err().key.to_string(), "brush:paints-bitmap");
+    assert_eq!(of(&e, StepTarget::Content).unwrap_err().key.to_string(), "brush:bitmap-unreadable");
+}
+
+#[test]
+fn a_material_with_its_own_coverage_is_the_tip_of_a_path_under_a_black_alpha() {
+    let mut e = effect(PaintTool::Brush);
+    e.colors = vec![material("opacity")];
+    e.alpha = vec![uniform(0, [0.0; 3], 1.0)];
+    e.paths.push(texturecraft_import_reader::model::StrokePath3d::line([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]));
+    let s = step(&e, StepTarget::Content, &channels(), &ProjectImages::none(), None, Some(&Graphs)).unwrap();
+    assert_eq!(s.brush.tip, ReplayTip::Image { width: 1, height: 1, values: Arc::from(vec![1.0]) });
+    assert!(s.notes.iter().any(|n| n == brush::SOURCE_ALONG), "{:?}", s.notes);
+    // without paths, or without a coverage output, the black alpha stays
+    let black = ReplayTip::Image { width: 1, height: 1, values: Arc::from(vec![0.0]) };
+    let mut no_paths = e.clone();
+    no_paths.paths.clear();
+    assert_eq!(step(&no_paths, StepTarget::Content, &channels(), &ProjectImages::none(), None, Some(&Graphs)).unwrap().brush.tip, black);
+    e.colors = vec![material("")];
+    assert_eq!(step(&e, StepTarget::Content, &channels(), &ProjectImages::none(), None, Some(&Graphs)).unwrap().brush.tip, black);
+}
+
+#[test]
+fn the_legacy_gaussian_alpha_is_drawn_from_its_name() {
+    let mut e = effect(PaintTool::Brush);
+    let ProjectSource::Procedural(mut p) = shape("gaussian", vec![]) else { panic!("a procedural") };
+    if let Some(q) = &mut p.procedural {
+        q.url = format!("resource://shelf/gaussian/gaussian?version=1{}", texturecraft_import_reader::format_names::LEGACY_ALPHA_SUFFIX);
+    }
+    e.alpha = vec![ProjectSource::Procedural(p)];
+    let s = of(&e, StepTarget::Content).unwrap();
+    let ReplayTip::Image { width, values, .. } = &s.brush.tip else { panic!("an image") };
+    let n = *width as usize;
+    let centre = values[n / 2 * n + n / 2];
+    // exp(−r²/2σ²): 1 in the middle, exp(−4.5) at the middle of a side
+    assert!(centre > 0.99 && (values[n / 2 * n] - (-4.5f32).exp()).abs() < 0.01, "{centre}");
+    assert!(s.notes.iter().any(|n| n == tip::GAUSSIAN_NOTE));
+    // a gaussian of any other package is a graph like any other
+    e.alpha = vec![shape("gaussian", vec![])];
+    assert_eq!(of(&e, StepTarget::Content).unwrap_err().key.kind, BlockerKind::BrushAlpha);
+}
+
+#[test]
+fn a_graph_tip_reads_what_feeds_its_image_inputs() {
+    use crate::graph_library::GraphLibrary;
+    use texturecraft_import_reader::decompile::Decompiled;
+    use texturecraft_import_reader::model::ProceduralInput;
+    let mut lib = GraphLibrary::default();
+    // the tip passes its image input through; the input declares white
+    let pass = Decompiled {
+        text: "format 3\nsize 8\nnode 1 input idx=0\noutput grey 1\n".into(),
+        images: vec!["shape".into()],
+        image_defaults: vec![Some([1.0; 3])],
+        outputs: vec![("grey".into(), 1)],
+        warnings: vec![],
+        colour_outputs: vec![],
+    };
+    lib.insert_as(&["pass".to_string()], "", pass);
+    let grey = Decompiled {
+        text: "format 3\nsize 8\nnode 1 color r=0.5 g=0.5 b=0.5\noutput grey 1\n".into(),
+        images: vec![],
+        image_defaults: vec![],
+        outputs: vec![("grey".into(), 1)],
+        warnings: vec![],
+        colour_outputs: vec![],
+    };
+    lib.insert_as(&["half".to_string()], "", grey);
+    let tip_fed = |source: Option<ProjectSource>| {
+        let ProjectSource::Procedural(mut p) = shape("pass", vec![]) else { panic!("a procedural") };
+        if let Some(q) = &mut p.procedural {
+            q.inputs = vec![ProceduralInput {
+                identifiers: vec![("shape".into(), texturecraft_import_reader::model::ProjectChannel::Bit(0))],
+                source: source.map(Box::new),
+            }];
+        }
+        let mut e = effect(PaintTool::Brush);
+        e.alpha = vec![ProjectSource::Procedural(p)];
+        let s = step(&e, StepTarget::Content, &channels(), &ProjectImages::none(), Some(&lib), None).unwrap();
+        let ReplayTip::Image { values, .. } = s.brush.tip else { panic!("an image") };
+        values[values.len() / 2]
+    };
+    assert!((tip_fed(None) - 1.0).abs() < 0.01, "unfed: its declaration");
+    assert!((tip_fed(Some(uniform(0, [0.25; 3], 1.0))) - 0.25).abs() < 0.01, "a uniform");
+    assert!((tip_fed(Some(shape("half", vec![]))) - 0.5).abs() < 0.01, "another graph's grey");
 }

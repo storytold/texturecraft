@@ -234,7 +234,7 @@ fn a_missing_graph_renders_to_nothing() {
         alpha_output: String::new(),
         mono_output: 0,
     };
-    assert_eq!(texturecraft_import::graph_uses::render_grey(&Default::default(), &p, 8), None);
+    assert_eq!(texturecraft_import::graph_uses::render_grey(&Default::default(), &p, 8, &texturecraft_import::resources::ProjectImages::none()), None);
 }
 
 #[test]

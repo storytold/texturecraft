@@ -17,27 +17,33 @@
 //! | 2D-view points | texture coordinates: the file stores V up, the mesh's UVs run down (measured) |
 //! | `duplicateCount`, `duplicateMatrix` | symmetry copies, the matrix applied once more per copy (both views) |
 //! | `sourceStencil`, `projMatrix` | the stencil the strokes go through, placed on the view ([`tip::stencil`]) |
-//! | projection tool | a mask's strokes paint the grey of the first `sourceColor`, placed on the view by `projMatrix` |
+//! | projection tool | a mask's strokes paint the grey of the first `sourceColor`, placed on the view by `projMatrix`; content channels their own source placed the same way (Inferred) |
 //! | smudge tool | each dab draws what lies at the previous dab's place over its own, values and coverage (measured) |
 //! | `strokes3D` (path strokes) | cubic pieces through the stored anchors and handles in the mesh's space; dabs walked along them ([`ReplayPath`]) |
 //! | anchors' `size` | the pen's pressure along a path, linear between anchors |
 //! | `upVector` | where an unturned tip's top points along a path (Inferred) |
 //! | ribbon brush (`width`, `tilingMode`, `stretchGuides`, `aspectRatioFactor`, `projectionDepthRatio`) | the tip laid along each path as a band ([`ReplayRibbon`]) |
+//! | `sourceColor` bitmap or graph | painted per texel ([`super::source`]): laid on texel for texel, read along paths and ribbons |
+//! | black uniform alpha over a material with a coverage output, on paths | a full square tip: the material's coverage is the shape |
 //! | `stampBlendingMode` ≠ 0, `aspectRatio` ≠ 1, other `alignment` | approximated (noted) |
 //!
-//! Not replayable (a `brush:` blocker): particle brushes, projection painting without an image or on a paint layer,
+//! Not replayable (a `brush:` blocker): particle brushes, projection painting without an image,
 //! smudge or projection painting along path strokes, a smudge with nothing of its effect before it, brushes painting
-//! images, graphs or anchors, unreadable point lists.
+//! anchors or other sources, brushes painting an image into a mask, brushes painting a graph without the project's
+//! graphs ([`SourceGraphs`]), unreadable point lists.
 
-use texturecraft_core::Channel;
+use std::sync::Arc;
+
+use texturecraft_core::{Channel, GraphRef};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{
-    PaintEffect, PaintTool, ProjectBrush, ProjectSource, ProjectStroke, RibbonBrush, StampEmitter, StrokePath3d, StrokeView,
+    PaintEffect, PaintTool, ProceduralSource, ProjectBrush, ProjectSource, ProjectStroke, RibbonBrush, StampEmitter, StrokePath3d, StrokeView,
 };
 
+use super::source::{ReplaySource, ReplayTexels};
 use super::{
-    PaintMode, PathPiece, ReplayBrush, ReplayPath, ReplayRibbon, ReplayStencil, ReplayStep, ReplayStroke, RibbonTiling, StrokePoint, StrokeSpace, TipAlignment,
-    pressure_at, tip,
+    PaintMode, PathPiece, ReplayBrush, ReplayPath, ReplayRibbon, ReplayStencil, ReplayStep, ReplayStroke, ReplayTip, RibbonTiling, StrokePoint, StrokeSpace,
+    TipAlignment, pressure_at, tip,
 };
 use crate::channels::SetChannels;
 use crate::resources::ProjectImages;
@@ -54,6 +60,24 @@ pub const PATHS_APPROXIMATE: &str = "3D path strokes approximated";
 pub const RIBBON_APPROXIMATE: &str = "3D path ribbons approximated";
 /// A stencil without its matrix spans the view: normalised device coordinates −1..1 onto the image's 0..1.
 const VIEW_STENCIL: [f32; 9] = [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0];
+
+/// The note a step painting a graph carries.
+pub const GRAPH_TEXELS: &str = "brush source graph laid on texel for texel";
+/// The note a step painting an image carries.
+pub const IMAGE_TEXELS: &str = "brush source image laid on texel for texel";
+/// The note a projection step on content carries.
+pub const PROJECTED: &str = "projection painting on a paint layer placed as in masks";
+/// The note a step painting an image or a graph along paths carries.
+pub const SOURCE_ALONG: &str = "brush source read along the paths";
+
+/// The graphs a brush painting a compiled graph paints: what a fill of the same source runs.
+pub trait SourceGraphs {
+    /// The graph a fill of `source` runs for each of `channels` it has an output for (one render shared by all; a
+    /// channel without one is not painted); or why the graph cannot run.
+    fn content(&self, source: &ProceduralSource, channels: &[Channel]) -> Result<Vec<(Channel, GraphRef)>, Blocker>;
+    /// The graph of `source`'s grey output, as a mask's generator runs it; or why it cannot run.
+    fn mask(&self, source: &ProceduralSource) -> Result<GraphRef, Blocker>;
+}
 
 /// What a step paints into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,24 +135,29 @@ pub fn alone(effect: &PaintEffect) -> Result<(), Blocker> {
     }
 }
 
-/// `effect` as a step painting into `target`, the declared `channels` of the set; or why it cannot be replayed.
+/// `effect` as a step painting into `target`, the declared `channels` of the set; or why it cannot be replayed. A brush
+/// painting a compiled graph needs `sources` (the graphs a fill of it runs).
 pub fn step(
     effect: &PaintEffect,
     target: StepTarget,
     channels: &SetChannels,
     images: &ProjectImages,
     graphs: Option<&crate::graph_library::GraphLibrary>,
+    sources: Option<&dyn SourceGraphs>,
 ) -> Result<ReplayStep, Blocker> {
     check(effect)?;
     let mut notes = Vec::new();
-    let (tip, tip_note) = tip::tip(&effect.alpha, images, graphs)?;
+    let (tip, tip_note) = match own_alpha_tip(effect) {
+        Some(full) => (full, None),
+        None => tip::tip(&effect.alpha, images, graphs)?,
+    };
     notes.extend(tip_note);
     let mut brush = map_brush(effect, tip, &mut notes);
-    (brush.cycle, brush.cycle_drawn_start) = tip::cycle(&effect.alpha, graphs);
+    (brush.cycle, brush.cycle_drawn_start) = tip::cycle(&effect.alpha, images, graphs);
     if let Some(n) = tip::uncycled(&effect.alpha, brush.cycle.len()) {
         notes.push(n);
     }
-    let (mode, values, mask_value) = values(effect, target, channels)?;
+    let Values { mode, values, mask_value, sources, mask_source } = self::values(effect, target, channels, images, sources)?;
     // the stencil and the projected image share `projMatrix`
     let matrix = effect.stencil_matrix.filter(|m| m.iter().all(|v| v.is_finite())).unwrap_or(VIEW_STENCIL);
     let stencil = match &effect.stencil {
@@ -139,10 +168,11 @@ pub fn step(
         Some(source) => Some(ReplayStencil { image: tip::stencil(source, images, graphs)?, matrix }),
         None => None,
     };
-    let projection = match (effect.tool, effect.colors.first()) {
-        (PaintTool::Projection, Some(source)) => Some(ReplayStencil { image: tip::stencil(source, images, graphs)?, matrix }),
+    let projection = match (effect.tool, effect.colors.first(), target) {
+        (PaintTool::Projection, Some(source), StepTarget::Mask) => Some(ReplayStencil { image: tip::stencil(source, images, graphs)?, matrix }),
         _ => None,
     };
+    let placed = (effect.tool == PaintTool::Projection && target == StepTarget::Content).then_some(matrix);
     let mut strokes: Vec<ReplayStroke> =
         effect.strokes.iter().filter_map(|s| stroke(s, brush.size_pressure.is_some() || brush.flow_pressure.is_some())).collect();
     if mode == PaintMode::Smudge && strokes.iter().any(|s| s.copies > 0) {
@@ -162,8 +192,36 @@ pub fn step(
     } else if !paths.is_empty() {
         notes.push(format!("{PATHS_APPROXIMATE}: {} paths{}", paths.len(), if stencil.is_some() { ", their stencil left out" } else { "" }));
     }
+    let painted = sources.iter().map(|(_, s, _)| s).chain(&mask_source);
+    let (mut graph, mut image) = (false, false);
+    for s in painted {
+        match s {
+            ReplaySource::Texels(t) if matches!(**t, ReplayTexels::Image(_)) => image = true,
+            _ => graph = true,
+        }
+    }
+    if !strokes.is_empty() && effect.tool != PaintTool::Projection {
+        notes.extend(graph.then(|| GRAPH_TEXELS.to_string()));
+        notes.extend(image.then(|| IMAGE_TEXELS.to_string()));
+    }
+    if (graph || image) && !paths.is_empty() {
+        notes.push(SOURCE_ALONG.to_string());
+    }
     let opacity = if effect.opacity.is_finite() { effect.opacity.clamp(0.0, 1.0) } else { 1.0 };
-    Ok(ReplayStep { mode, values, mask_value, opacity, brush, stencil, projection, strokes, paths, ribbon, notes })
+    if placed.is_some() {
+        notes.push(PROJECTED.to_string());
+    }
+    Ok(ReplayStep { mode, values, sources, mask_value, mask_source, opacity, brush, stencil, projection, placed, strokes, paths, ribbon, notes })
+}
+
+/// A full square tip where a path brush paints a material with a coverage output under a black uniform alpha: the
+/// material's coverage is then the shape (Inferred from the material presets: the reference app paints them, and a black
+/// alpha would paint nothing). `None` otherwise.
+fn own_alpha_tip(effect: &PaintEffect) -> Option<ReplayTip> {
+    let own = effect.colors.iter().any(|c| matches!(c, ProjectSource::Procedural(p) if p.procedural.as_ref().is_some_and(|q| !q.alpha_output.is_empty())));
+    let black =
+        matches!(effect.alpha.first(), Some(ProjectSource::Uniform(u)) if (u.color[0] * u.opacity).partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater));
+    (own && black && !effect.paths.is_empty()).then(|| ReplayTip::Image { width: 1, height: 1, values: Arc::from(vec![1.0]) })
 }
 
 /// The path stroke as recorded; `None` for one without a finite anchor.
@@ -287,37 +345,65 @@ pub fn stroke(s: &ProjectStroke, pressure: bool) -> Option<ReplayStroke> {
     Some(ReplayStroke { space, points, seed: s.random_seed, lazy, copies: s.duplicate_count.min(MAX_COPIES), copy_matrix: s.duplicate_matrix })
 }
 
-/// The tool's mode, values per channel (content) and grey value (mask).
-type Values = (PaintMode, Vec<(Channel, [f32; 3], f32)>, f32);
+/// What a step lays: the tool's mode, values per channel (content), sources per channel (content painted with an
+/// image or a graph), grey value and source (mask).
+struct Values {
+    mode: PaintMode,
+    values: Vec<(Channel, [f32; 3], f32)>,
+    mask_value: f32,
+    sources: Vec<(Channel, ReplaySource, f32)>,
+    mask_source: Option<ReplaySource>,
+}
 
-/// What `effect` lays: the brush paints its `sourceColor` uniforms (linear, as fills); the eraser lowers coverage on the
-/// channels it works on, or in a mask paints black over what its strokes reach (measured); the smudge moves what is
-/// there on the channels it works on; projection painting in a mask paints its image's grey (the step's projection).
-fn values(effect: &PaintEffect, target: StepTarget, channels: &SetChannels) -> Result<Values, Blocker> {
+impl Values {
+    fn of(mode: PaintMode, values: Vec<(Channel, [f32; 3], f32)>, mask_value: f32) -> Values {
+        Values { mode, values, mask_value, sources: Vec::new(), mask_source: None }
+    }
+}
+
+/// What `effect` lays: the brush paints its `sourceColor` uniforms (linear, as fills), images and graphs (per texel,
+/// [`super::source`]); the eraser lowers coverage on the channels it works on, or in a mask paints black over what its
+/// strokes reach (measured); the smudge moves what is there on the channels it works on; projection painting in a mask
+/// paints its image's grey (the step's projection), on content each channel's source placed on the view.
+fn values(
+    effect: &PaintEffect,
+    target: StepTarget,
+    channels: &SetChannels,
+    images: &ProjectImages,
+    graphs: Option<&dyn SourceGraphs>,
+) -> Result<Values, Blocker> {
     let paints_source = |s: &ProjectSource| refused(&format!("paints-{}", s.kind()), format!("brush paints a {} source", s.kind()));
+    let library = |p: &ProceduralSource| graphs.ok_or_else(|| paints_source(&ProjectSource::Procedural(p.clone())));
     match (target, effect.tool) {
-        (StepTarget::Content, PaintTool::Projection) => Err(refused("projection", "projection painting on a paint layer")),
-        (StepTarget::Mask, PaintTool::Projection) => Ok((PaintMode::Paint, Vec::new(), 1.0)),
-        (StepTarget::Mask, PaintTool::Smudge) => Ok((PaintMode::Smudge, Vec::new(), 0.0)),
+        (StepTarget::Mask, PaintTool::Projection) => Ok(Values::of(PaintMode::Paint, Vec::new(), 1.0)),
+        (StepTarget::Mask, PaintTool::Smudge) => Ok(Values::of(PaintMode::Smudge, Vec::new(), 0.0)),
         (StepTarget::Content, PaintTool::Smudge) => {
             let worked = worked(effect, channels).into_iter().map(|c| (c, [0.0; 3], 1.0)).collect();
-            Ok((PaintMode::Smudge, worked, 0.0))
+            Ok(Values::of(PaintMode::Smudge, worked, 0.0))
         }
-        (StepTarget::Mask, PaintTool::Eraser) => Ok((PaintMode::Paint, Vec::new(), 0.0)),
+        (StepTarget::Mask, PaintTool::Eraser) => Ok(Values::of(PaintMode::Paint, Vec::new(), 0.0)),
         (StepTarget::Mask, _) => match effect.colors.first() {
-            None => Ok((PaintMode::Paint, Vec::new(), 1.0)),
+            None => Ok(Values::of(PaintMode::Paint, Vec::new(), 1.0)),
             Some(ProjectSource::Uniform(u)) => {
                 let v = u.color[0] * u.opacity;
-                Ok((PaintMode::Paint, Vec::new(), if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }))
+                Ok(Values::of(PaintMode::Paint, Vec::new(), if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }))
+            }
+            // a brush (not an eraser or smudge) painting a graph lays its grey output
+            Some(ProjectSource::Procedural(p)) if effect.tool == PaintTool::Brush => {
+                let source = ReplaySource::Graph(Box::new(library(p)?.mask(p)?));
+                Ok(Values { mask_source: Some(source), ..Values::of(PaintMode::Paint, Vec::new(), 1.0) })
             }
             Some(other) => Err(paints_source(other)),
         },
         (StepTarget::Content, PaintTool::Eraser) => {
             let worked = worked(effect, channels).into_iter().map(|c| (c, [0.0; 3], 1.0)).collect();
-            Ok((PaintMode::Erase, worked, 0.0))
+            Ok(Values::of(PaintMode::Erase, worked, 0.0))
         }
         (StepTarget::Content, _) => {
-            let mut out = Vec::new();
+            let mut out = Values::of(PaintMode::Paint, Vec::new(), 0.0);
+            // each image read once, each graph run once for every channel it paints
+            let mut read: Vec<(&str, Arc<ReplayTexels>)> = Vec::new();
+            let mut by_graph: Vec<(&ProceduralSource, Vec<Channel>)> = Vec::new();
             for c in worked(effect, channels) {
                 let pc = channels.project_channel(c);
                 match effect.colors.iter().find(|s| s.channels().contains(pc)) {
@@ -325,12 +411,38 @@ fn values(effect: &PaintEffect, target: StepTarget, channels: &SetChannels) -> R
                     Some(ProjectSource::Uniform(u)) => {
                         let v = if c.components() == 3 { u.color } else { [u.color[0]; 3] };
                         let opacity = if u.opacity.is_finite() { u.opacity.clamp(0.0, 1.0) } else { 1.0 };
-                        out.push((c, v.map(|x| if x.is_finite() { x } else { 0.0 }), opacity));
+                        out.values.push((c, v.map(|x| if x.is_finite() { x } else { 0.0 }), opacity));
+                    }
+                    Some(ProjectSource::Procedural(p)) => match by_graph.iter_mut().find(|(q, _)| std::ptr::eq(*q, p)) {
+                        Some((_, cs)) => cs.push(c),
+                        None => by_graph.push((p, vec![c])),
+                    },
+                    Some(ProjectSource::Bitmap(b)) => {
+                        let texels = match read.iter().find(|(url, _)| *url == b.url) {
+                            Some((_, t)) => t.clone(),
+                            None => {
+                                let image = images.peek(&b.url).map_err(|e| refused("bitmap-unreadable", format!("brush paints an image: {e}")))?;
+                                if image.image.width == 0 || image.image.height == 0 {
+                                    return Err(refused("bitmap-empty", "brush paints an empty image"));
+                                }
+                                let t = Arc::new(ReplayTexels::Image(Arc::new(image.image.image_res(!image.float))));
+                                read.push((&b.url, t.clone()));
+                                t
+                            }
+                        };
+                        out.sources.push((c, ReplaySource::Texels(texels), 1.0));
                     }
                     Some(other) => return Err(paints_source(other)),
                 }
             }
-            Ok((PaintMode::Paint, out, 0.0))
+            for (p, cs) in by_graph {
+                // a channel the graph has no output for is not painted
+                for (c, g) in library(p)?.content(p, &cs)? {
+                    out.sources.push((c, ReplaySource::Graph(Box::new(g)), 1.0));
+                }
+            }
+            out.sources.sort_by_key(|(c, ..)| *c);
+            Ok(out)
         }
     }
 }

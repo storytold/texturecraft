@@ -29,6 +29,11 @@
 //!   the anchors' size as the pen's pressure. Where the curve passes under or over a curved surface, its dabs shrink
 //!   with the depth ([`PATH_DEPTH`], fitted on a sphere). Laid after the step's strokes, each path on its own.
 //! - **Ribbons**: a ribbon brush lays its tip along each path as a band ([`texturecraft_paint::rasterize_ribbon`]).
+//! - **Brushes painting an image or a graph** ([`texturecraft_import::replay::source`]): a stroke's texels take the
+//!   source's value texel for texel; a path's and a ribbon's take it at their place on the band, or in the tip's square
+//!   of the last dab reaching them, with the source's coverage ([`texturecraft_paint::commit_layer_texels`]).
+//!   Projection painting on content reads each channel's source where the texel lies on the stroke's view, placed as a
+//!   mask's projected image is.
 //! - Dabs reach every surface in their volume whatever the view sees (measured: nothing occludes), at the texel's
 //!   distance along the surface, a surface lying off the dab's surface fading out ([`Reach::Surface`]), faded by the turn
 //!   from the dab's normal as the brush's culling says ([`Facing::Fade`]); each stroke is laid on its own and committed
@@ -36,23 +41,24 @@
 //!
 //! Everything runs on rayon; no files, threads or clocks, so it works in the web build.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use texturecraft_compose::PixelStore;
-use texturecraft_core::Channel;
-use texturecraft_geom::glam::{Mat4, Vec2, Vec3};
+use texturecraft_core::{Channel, ChannelKind};
+use texturecraft_geom::glam::{Mat3, Mat4, Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, NO_TRI, OrbitCamera, SubMesh, UvGBuffer};
 use texturecraft_import::replay::{
-    PaintMode, ReplayBrush, ReplayJob, ReplayPath, ReplayRibbon, ReplayScene, ReplayStencil, ReplayStep, ReplayStroke, ReplayTarget, ReplayTip, ReplayedPixels,
-    RibbonTiling as ReplayTiling, StencilImage, StrokeReplayer, StrokeSpace, TipAlignment,
+    PaintMode, ReplayBrush, ReplayJob, ReplayPath, ReplayRibbon, ReplayScene, ReplaySource, ReplayStencil, ReplayStep, ReplayStroke, ReplayTarget,
+    ReplayTexels, ReplayTip, ReplayedPixels, RibbonTiling as ReplayTiling, StencilImage, StrokeReplayer, StrokeSpace, TipAlignment,
 };
 use texturecraft_paint::alphas::AlphaImage;
 use texturecraft_paint::jitter::{Jittered, StrokeRandom, cycle_start};
 use texturecraft_paint::{
-    Alignment, BrushAlpha, BrushSettings, CommitSource, Facing, PickCtx, RasterCtx, Reach, Ribbon, RibbonTiling, SeededJitter, Shape, SpaceCurve, SpacePiece,
-    Staging, Stamp, Stroke, StrokeCanvas, UvStamp, ViewStencil, commit_layer, commit_mask, commit_mask_texels, footprint, footprint_uv, pressure_scale,
-    rasterize, rasterize_ribbon, rasterize_uv, smudge_in_place,
+    Alignment, BrushAlpha, BrushSettings, ChannelTexels, CommitSource, Facing, PickCtx, RasterCtx, Reach, Ribbon, RibbonTiling, SeededJitter, Shape,
+    SpaceCurve, SpacePiece, Staging, Stamp, Stroke, StrokeCanvas, UvStamp, ViewStencil, commit_layer, commit_layer_texels, commit_mask, commit_mask_texels,
+    footprint, footprint_uv, pressure_scale, rasterize, rasterize_ribbon_at, rasterize_uv, smudge_in_place,
 };
 use texturecraft_texel::TileImage;
 
@@ -167,6 +173,11 @@ impl SetMesh {
 
     fn size(&self) -> (u32, u32) {
         (self.resolution, self.resolution)
+    }
+
+    /// The index of texel `(x, y)` in the set's buffers.
+    fn index(&self, x: u32, y: u32) -> usize {
+        y as usize * self.resolution as usize + x as usize
     }
 }
 
@@ -292,6 +303,7 @@ fn replay_job(set: &SetMesh, job: &ReplayJob, stop: &(dyn Fn() -> bool + Sync)) 
             smudge_step(set, step, &tip, job.target, &mut pixels, stop)?;
             continue;
         }
+        let sources = Sources::of(step)?;
         let stencil = step.stencil.as_ref().map(view_stencil).transpose()?;
         let projection = step.projection.as_ref().map(view_stencil).transpose()?;
         for stroke in &step.strokes {
@@ -309,10 +321,17 @@ fn replay_job(set: &SetMesh, job: &ReplayJob, stop: &(dyn Fn() -> bool + Sync)) 
             match (&projection, job.target) {
                 (Some(image), ReplayTarget::Mask(id)) => {
                     let on = OnView::of(set, stroke);
-                    let grey = |x: u32, y: u32| Some(on.at(x, y).map_or(0.0, |p| image.at(p)));
+                    let grey = |x: u32, y: u32| Some((on.at(x, y).map_or(0.0, |p| image.at(p)), 1.0));
                     commit_mask_texels(&mut pixels, id, set.size(), &grey, source(step, &canvas, 1.0));
                 }
-                _ => commit(&mut pixels, set, job.target, step, &canvas),
+                _ => {
+                    // projection on content: each channel's image where the texel lies on the view; else texel for texel
+                    let reading = match step.placed {
+                        Some(m) => Reading::View(OnView::of(set, stroke), Mat3::from_cols_array(&m)),
+                        None => Reading::Places(HashMap::new()),
+                    };
+                    commit(&mut pixels, set, job.target, step, &canvas, &sources, &reading)
+                }
             }
         }
         for path in &step.paths {
@@ -320,12 +339,25 @@ fn replay_job(set: &SetMesh, job: &ReplayJob, stop: &(dyn Fn() -> bool + Sync)) 
                 return Err("cancelled".into());
             }
             let mut canvas = StrokeCanvas::new(set.resolution, set.resolution);
+            // a source painted along the path is read at each texel's place on the band or in its last dab's square
+            let mut places = HashMap::new();
             match &step.ribbon {
-                Some(ribbon) => lay_ribbon(set, ribbon, &tip, path, &mut canvas),
-                None => lay_dabs(set, &step.brush, &tip, 0, set.center, &path_dabs(set, &step.brush, &tip, path), &mut canvas),
+                Some(ribbon) => {
+                    let laid = lay_ribbon(set, ribbon, &tip, path, &mut canvas);
+                    if !sources.is_empty() {
+                        places.extend(laid.into_iter().map(|(x, y, at)| (set.index(x, y), at)));
+                    }
+                }
+                None => {
+                    let dabs = path_dabs(set, &step.brush, &tip, path);
+                    lay_dabs(set, &step.brush, &tip, 0, set.center, &dabs, &mut canvas);
+                    if !sources.is_empty() {
+                        places = dab_places(set, &step.brush, &tip, &dabs);
+                    }
+                }
             }
             if !canvas.dirty.is_empty() {
-                commit(&mut pixels, set, job.target, step, &canvas);
+                commit(&mut pixels, set, job.target, step, &canvas, &sources, &Reading::Places(places));
             }
         }
     }
@@ -340,6 +372,84 @@ fn replay_job(set: &SetMesh, job: &ReplayJob, stop: &(dyn Fn() -> bool + Sync)) 
     })
 }
 
+/// A step's images and graphs, ready to sample: per channel with its opacity (content), or the mask's grey.
+#[derive(Default)]
+struct Sources {
+    channels: Vec<(Channel, Arc<ReplayTexels>, f32)>,
+    mask: Option<Arc<ReplayTexels>>,
+}
+
+impl Sources {
+    /// `step`'s sources; an error for one that did not render.
+    fn of(step: &ReplayStep) -> Result<Sources, String> {
+        let ready = |s: &ReplaySource| match s {
+            ReplaySource::Texels(t) => Ok(t.clone()),
+            ReplaySource::Failed(why) => Err(why.clone()),
+            ReplaySource::Graph(g) => Err(format!("brush source \"{}\" was not rendered", g.name)),
+        };
+        let mut out = Sources { mask: step.mask_source.as_ref().map(ready).transpose()?, ..Sources::default() };
+        for (c, s, o) in &step.sources {
+            out.channels.push((*c, ready(s)?, *o));
+        }
+        Ok(out)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.channels.is_empty() && self.mask.is_none()
+    }
+}
+
+/// Where a stroke's texels read the step's sources.
+enum Reading<'a> {
+    /// At a place of the source's own image by texel index (a path's texels: the place on the band or in the tip's
+    /// square of the last dab reaching the texel, 0..1 rows down); texels without one read it texel for texel.
+    Places(HashMap<usize, [f32; 2]>),
+    /// Projection painting on content: where the texel lies on the stroke's view, through the matrix to the image's
+    /// place (y up); nothing outside the image or behind the camera.
+    View(OnView<'a>, Mat3),
+}
+
+impl Reading<'_> {
+    /// `source` at texel `(x, y)` as a channel of `kind` holds it, with its coverage factor.
+    fn read(&self, set: &SetMesh, source: &ReplayTexels, kind: ChannelKind, x: u32, y: u32) -> Option<([f32; 3], f32)> {
+        match self {
+            Reading::Places(places) => match places.get(&set.index(x, y)) {
+                Some(at) => source.at_uv(kind, *at),
+                None => source.at_texel(kind, x, y, set.size()),
+            },
+            Reading::View(on, to_image) => {
+                let ndc = on.at(x, y)?;
+                let p = *to_image * Vec3::new(ndc.x, ndc.y, 1.0);
+                // the image's rows run down
+                let uv = [p.x, 1.0 - p.y];
+                uv.iter().all(|v| (0.0..=1.0).contains(v)).then(|| source.at_uv(kind, uv)).flatten()
+            }
+        }
+    }
+}
+
+/// The places in the tip's square of path `dabs` (laid in order: a later dab's place wins) for the texels each reaches:
+/// `0.5 + offset·x / 2r` along the tip's columns, `0.5 + offset·y / 2r` down its rows (measured replay rule).
+fn dab_places(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, dabs: &[Stamp]) -> HashMap<usize, [f32; 2]> {
+    let mut places = HashMap::new();
+    for d in dabs {
+        if d.radius.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            continue;
+        }
+        let texels = footprint(&raster_ctx(set, brush, set.center, tip.shape_of(d.seed, 0)), d);
+        for (x, y, _) in texels {
+            let i = set.index(x, y);
+            let Some(surface) = set.gbuf.surface(&set.mesh, i) else { continue };
+            let off = surface.pos - d.center;
+            let (u, v) = (0.5 + off.dot(d.tangent) / (2.0 * d.radius), 0.5 - off.dot(d.bitangent) / (2.0 * d.radius));
+            if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
+                places.insert(i, [u, v]);
+            }
+        }
+    }
+    places
+}
+
 /// A laid stroke as a commit source with the step's opacity times `opacity`.
 fn source<'a>(step: &ReplayStep, canvas: &'a StrokeCanvas, opacity: f32) -> CommitSource<'a> {
     CommitSource {
@@ -352,11 +462,20 @@ fn source<'a>(step: &ReplayStep, canvas: &'a StrokeCanvas, opacity: f32) -> Comm
     }
 }
 
-/// Commits one stroke's coverage into the target with the step's values and opacity.
-fn commit(pixels: &mut PixelStore, set: &SetMesh, target: ReplayTarget, step: &ReplayStep, canvas: &StrokeCanvas) {
+/// A channel's value and coverage factor read at a texel.
+type TexelRead<'a> = dyn Fn(u32, u32) -> Option<([f32; 3], f32)> + Sync + 'a;
+
+/// Commits one stroke's coverage into the target with the step's values and opacity, its sources read as `places` says.
+fn commit(pixels: &mut PixelStore, set: &SetMesh, target: ReplayTarget, step: &ReplayStep, canvas: &StrokeCanvas, sources: &Sources, places: &Reading) {
     let source = |opacity: f32| source(step, canvas, opacity);
     match target {
-        ReplayTarget::Mask(id) => commit_mask(pixels, id, set.size(), step.mask_value, source(1.0), &mut Staging::default()),
+        ReplayTarget::Mask(id) => match &sources.mask {
+            Some(m) => {
+                let grey = |x: u32, y: u32| places.read(set, m, ChannelKind::Scalar, x, y).map(|(v, a)| (v[0], a));
+                commit_mask_texels(pixels, id, set.size(), &grey, source(1.0));
+            }
+            None => commit_mask(pixels, id, set.size(), step.mask_value, source(1.0), &mut Staging::default()),
+        },
         ReplayTarget::Content(id) => {
             // channels with their own opacity commit apart
             let mut groups: Vec<(f32, BTreeMap<Channel, [f32; 3]>)> = Vec::new();
@@ -370,6 +489,29 @@ fn commit(pixels: &mut PixelStore, set: &SetMesh, target: ReplayTarget, step: &R
             }
             for (o, values) in groups {
                 commit_layer(pixels, id, set.size(), &values, source(o), &mut Staging::default());
+            }
+            if sources.channels.is_empty() {
+                return;
+            }
+            let reads: Vec<(Channel, f32, Box<TexelRead>)> = sources
+                .channels
+                .iter()
+                .map(|(c, texels, o)| {
+                    let (kind, texels) = (c.kind(), texels.as_ref());
+                    let read: Box<TexelRead> = Box::new(move |x, y| places.read(set, texels, kind, x, y));
+                    (*c, *o, read)
+                })
+                .collect();
+            let mut opacities: Vec<f32> = Vec::new();
+            for (_, o, _) in &reads {
+                if !opacities.iter().any(|g| (g - o).abs() < 1e-6) {
+                    opacities.push(*o);
+                }
+            }
+            for o in opacities {
+                let channels: Vec<(Channel, ChannelTexels)> =
+                    reads.iter().filter(|(_, g, _)| (g - o).abs() < 1e-6).map(|(c, _, f)| (*c, f.as_ref() as ChannelTexels)).collect();
+                commit_layer_texels(pixels, id, set.size(), &channels, source(o));
             }
         }
     }
@@ -796,8 +938,9 @@ fn path_dabs(set: &SetMesh, brush: &ReplayBrush, tip: &Tip, path: &ReplayPath) -
     out
 }
 
-/// A ribbon along one path: the tip as a band (see [`texturecraft_paint::ribbon`]).
-fn lay_ribbon(set: &SetMesh, ribbon: &ReplayRibbon, tip: &Tip, path: &ReplayPath, canvas: &mut StrokeCanvas) {
+/// A ribbon along one path: the tip as a band (see [`texturecraft_paint::ribbon`]); every texel laid with its place on
+/// the band.
+fn lay_ribbon(set: &SetMesh, ribbon: &ReplayRibbon, tip: &Tip, path: &ReplayPath, canvas: &mut StrokeCanvas) -> Vec<(u32, u32, [f32; 2])> {
     let tiling = match ribbon.tiling {
         ReplayTiling::Repeat => RibbonTiling::Repeat,
         ReplayTiling::Whole => RibbonTiling::Whole,
@@ -806,7 +949,7 @@ fn lay_ribbon(set: &SetMesh, ribbon: &ReplayRibbon, tip: &Tip, path: &ReplayPath
     let band = Ribbon { width: ribbon.width, copy: ribbon.copy, tiling, depth: ribbon.depth };
     // the tip's detail for a copy's shorter side in texels
     let radius = ribbon.width.min(ribbon.copy) * 0.5 / set.world_per_texel;
-    rasterize_ribbon(canvas, &set.mesh, &set.gbuf, &path_curve(path), &band, tip.shape().at_radius(radius), tip.hardness);
+    rasterize_ribbon_at(canvas, &set.mesh, &set.gbuf, &path_curve(path), &band, tip.shape().at_radius(radius), tip.hardness)
 }
 
 /// A smudge dab: its texels' coverage (the brush's shape, flow and culling), its centre in texels, and its centre and

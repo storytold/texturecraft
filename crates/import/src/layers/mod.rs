@@ -60,6 +60,46 @@ pub struct AnchorInfo {
 /// Every anchor of a set by uid.
 pub type Anchors = BTreeMap<u64, AnchorInfo>;
 
+/// The graphs brushes painting a compiled graph paint: what a fill of the source runs in this set (its graph uses).
+pub struct LayerSources<'a> {
+    pub input: &'a SetInput<'a>,
+    pub anchors: &'a Anchors,
+}
+
+impl crate::replay::SourceGraphs for LayerSources<'_> {
+    fn content(
+        &self,
+        source: &texturecraft_import_reader::model::ProceduralSource,
+        channels: &[Channel],
+    ) -> Result<Vec<(Channel, texturecraft_core::GraphRef)>, Blocker> {
+        match crate::graph_uses::fill_sources(self.input, self.anchors, source, channels) {
+            Ok(fill) => Ok(fill
+                .sources
+                .into_iter()
+                .filter_map(|(c, s)| match s {
+                    texturecraft_core::Source::Graph(g) => Some((c, *g)),
+                    _ => None,
+                })
+                .collect()),
+            Err(placeholder) => Err(graph_blocker(source, &placeholder.status)),
+        }
+    }
+
+    fn mask(&self, source: &texturecraft_import_reader::model::ProceduralSource) -> Result<texturecraft_core::GraphRef, Blocker> {
+        let used = crate::graph_uses::mask_generator(self.input, self.anchors, source, texturecraft_core::Projection::default());
+        match used.effect {
+            EffectKind::Graph { graph, .. } => Ok(graph),
+            _ => Err(graph_blocker(source, &used.status)),
+        }
+    }
+}
+
+/// Why a brush's graph `source` cannot run: the first of `status`'s blockers.
+fn graph_blocker(source: &texturecraft_import_reader::model::ProceduralSource, status: &Status) -> Blocker {
+    let name = source.procedural.as_ref().map_or("?", |p| p.name());
+    status.blockers().first().cloned().unwrap_or_else(|| Blocker::graph(name, format!("brush paints \"{name}\": the graph does not run")))
+}
+
 /// How exact each declared channel is over the visible, contributing layers, and what else the safety net needs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Verdict {

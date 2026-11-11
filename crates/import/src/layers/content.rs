@@ -185,10 +185,12 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
     /// `p` as a content step, with its own blending folded into the channels' opacity (approximated when it is not
     /// normal).
     fn step(&self, p: &PaintEffect) -> Result<(ReplayStep, Status), Blocker> {
-        let mut step = crate::replay::step(p, StepTarget::Content, self.input.channels, self.input.images, self.input.graphs)?;
+        let sources = super::LayerSources { input: self.input, anchors: self.anchors };
+        let mut step = crate::replay::step(p, StepTarget::Content, self.input.channels, self.input.images, self.input.graphs, Some(&sources))?;
         let mut status = Status::Exact;
-        for (c, _, opacity) in &mut step.values {
-            let blend = ResolvedBlend::of(&p.header.blending, self.input.channels.project_channel(*c), Holder::Layer);
+        let channels = step.values.iter_mut().map(|(c, _, o)| (*c, o)).chain(step.sources.iter_mut().map(|(c, _, o)| (*c, o)));
+        for (c, opacity) in channels {
+            let blend = ResolvedBlend::of(&p.header.blending, self.input.channels.project_channel(c), Holder::Layer);
             *opacity *= blend.opacity.clamp(0.0, 1.0);
             if !matches!(blend.mode(), BlendMode::Normal | BlendMode::Replace) {
                 status.and(&Status::approximated(format!("a paint effect blending {:?} laid as normal", blend.mode())));
@@ -203,9 +205,9 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         let mut channels = Vec::new();
         for (s, st) in &steps {
             status.and(st);
-            for (c, ..) in &s.values {
-                if !channels.contains(c) {
-                    channels.push(*c);
+            for c in s.values.iter().map(|v| v.0).chain(s.sources.iter().map(|v| v.0)) {
+                if !channels.contains(&c) {
+                    channels.push(c);
                 }
             }
         }
@@ -239,7 +241,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         }
         let id = self.ids.alloc();
         let mut e = effect(id, &p.header.label, EffectKind::Paint, on);
-        if let Some(c) = step.values.first().map(|v| v.0) {
+        if let Some(c) = step.values.first().map(|v| v.0).or_else(|| step.sources.first().map(|v| v.0)) {
             e.blend = ResolvedBlend::of(&p.header.blending, self.input.channels.project_channel(c), Holder::Layer).mode();
         }
         self.effects.push(e);

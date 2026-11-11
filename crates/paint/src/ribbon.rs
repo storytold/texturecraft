@@ -73,11 +73,34 @@ impl Ribbon {
 /// the canvas holds): every texel of the set in `gbuf` on the band. A curve of fewer than two points or no length lays
 /// nothing.
 pub fn rasterize_ribbon(canvas: &mut StrokeCanvas, mesh: &Mesh, gbuf: &UvGBuffer, curve: &SpaceCurve, ribbon: &Ribbon, shape: Shape, hardness: f32) {
+    rasterize_ribbon_at(canvas, mesh, gbuf, curve, ribbon, shape, hardness);
+}
+
+/// [`rasterize_ribbon`], returning every texel laid with its place on the band: the shape's column along it and its row
+/// across it (0..1, row 0 on the curve's left), where the shape is read. What a band lays along it (a material painted
+/// along a path) is read at that place.
+pub fn rasterize_ribbon_at(
+    canvas: &mut StrokeCanvas,
+    mesh: &Mesh,
+    gbuf: &UvGBuffer,
+    curve: &SpaceCurve,
+    ribbon: &Ribbon,
+    shape: Shape,
+    hardness: f32,
+) -> Vec<(u32, u32, [f32; 2])> {
+    let texels = ribbon_texels(mesh, gbuf, curve, ribbon, shape, hardness);
+    let places = texels.iter().map(|&(x, y, _, at)| (x, y, at)).collect();
+    canvas.add_texels(gbuf, texels.into_iter().map(|(x, y, a, _)| (x, y, a)).collect());
+    places
+}
+
+/// The texels a band lays: coverage and place on the band (see [`rasterize_ribbon_at`]).
+fn ribbon_texels(mesh: &Mesh, gbuf: &UvGBuffer, curve: &SpaceCurve, ribbon: &Ribbon, shape: Shape, hardness: f32) -> Vec<(u32, u32, f32, [f32; 2])> {
     let total = curve.length();
     let half = ribbon.width * 0.5;
     let positive = |v: f32| v > 0.0 && v.is_finite();
     if curve.points().len() < 2 || !positive(total) || !positive(half) {
-        return;
+        return Vec::new();
     }
     let depth = if ribbon.depth.is_finite() { ribbon.depth.max(half) } else { half };
     let search = curve.searcher(depth);
@@ -93,7 +116,7 @@ pub fn rasterize_ribbon(canvas: &mut StrokeCanvas, mesh: &Mesh, gbuf: &UvGBuffer
         let [a, b, c] = mesh.tri(t as usize)?;
         Some(*mesh.positions.get(a)? * (1.0 - b1 - b2) + *mesh.positions.get(b)? * b1 + *mesh.positions.get(c)? * b2)
     };
-    let texels: Vec<(u32, u32, f32)> = (0..gbuf.tri.len())
+    (0..gbuf.tri.len())
         .into_par_iter()
         .filter_map(|i| {
             let p = position(i)?;
@@ -118,10 +141,9 @@ pub fn rasterize_ribbon(canvas: &mut StrokeCanvas, mesh: &Mesh, gbuf: &UvGBuffer
             let v = 0.5 + wide / ribbon.width;
             // the shape's square: x along, y up with its rows across (row 0 on the curve's left)
             let a = shape.sample(2.0 * u - 1.0, 1.0 - 2.0 * v, hardness, 0).min(1.0);
-            (a > 0.0).then_some(((i % w) as u32, (i / w) as u32, a))
+            (a > 0.0).then_some(((i % w) as u32, (i / w) as u32, a, [u, v]))
         })
-        .collect();
-    canvas.add_texels(gbuf, texels);
+        .collect()
 }
 
 #[cfg(test)]
@@ -207,5 +229,32 @@ mod tests {
         rasterize_ribbon(&mut c3, &m, &g, &high, &wide, round, 0.5);
         rasterize_ribbon(&mut c3, &m, &g, &SpaceCurve::new(&[], Some((Vec3::ZERO, Vec3::Z, 1.0))), &wide, round, 0.5);
         assert!(c3.dirty.is_empty());
+    }
+
+    #[test]
+    fn band_texels_carry_their_place_on_the_band() {
+        let m = sheet();
+        let g = UvGBuffer::new(&m, 0, 128, 128);
+        let at = |x: f32| Vec3::new(x, 0.0, 0.0);
+        let curve = SpaceCurve::new(&[SpacePiece { points: [at(-0.5), at(-1.0 / 6.0), at(1.0 / 6.0), at(0.5)], normals: [Vec3::Z; 2], size: [1.0; 2] }], None);
+        let wide = Ribbon { width: 0.25, copy: 0.25, tiling: RibbonTiling::Whole, depth: 0.2 };
+        let round = Shape { alpha: BrushAlpha::Round, image: None, library: None, level: 0 };
+        let mut canvas = StrokeCanvas::new(128, 128);
+        let texels = rasterize_ribbon_at(&mut canvas, &m, &g, &curve, &wide, round, 0.5);
+        let place = |x: u32, y: u32| texels.iter().find(|t| t.0 == x && t.1 == y).map(|t| t.2);
+        // along: the share of the curve walked (the sheet's texel 64 is its middle); across: row 0 on the curve's left
+        let mid = place(64, 64).unwrap();
+        assert!((mid[0] - 0.5).abs() < 0.02 && (mid[1] - 0.5).abs() < 0.07, "{mid:?}");
+        let early = place(40, 64).unwrap();
+        assert!((early[0] - 0.125).abs() < 0.02, "{early:?}");
+        // texture rows run down the sheet's −y: the curve's left (+y, its direction +x turned on the +z surface) is up
+        let (up, down) = (place(64, 58).unwrap(), place(64, 70).unwrap());
+        assert!(up[1] < 0.3 && down[1] > 0.7, "{up:?} {down:?}");
+        // every texel laid has its place, and only those
+        let mut plain = StrokeCanvas::new(128, 128);
+        rasterize_ribbon(&mut plain, &m, &g, &curve, &wide, round, 0.5);
+        let laid = (0..128u32).flat_map(|y| (0..128u32).map(move |x| (x, y))).filter(|&(x, y)| plain.alpha.get(x, y)[0] > 0).count();
+        assert_eq!(laid, texels.len());
+        assert_eq!(plain.alpha.get(64, 64), canvas.alpha.get(64, 64));
     }
 }

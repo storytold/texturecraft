@@ -57,6 +57,11 @@ pub struct MaskBuilder<'a, 'i> {
 }
 
 impl<'a, 'i> MaskBuilder<'a, 'i> {
+    /// The graphs brushes painting a compiled graph paint in this set.
+    fn sources(&self) -> super::LayerSources<'a> {
+        super::LayerSources { input: self.input, anchors: self.anchors }
+    }
+
     pub fn new(input: &'a SetInput<'a>, anchors: &'a Anchors, ids: &'i mut Ids) -> MaskBuilder<'a, 'i> {
         MaskBuilder {
             input,
@@ -163,9 +168,9 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 }
                 let blocker = match self.input.replay {
                     false => Blocker::new(BlockerKey::new(BlockerKind::Strokes, "painted-mask"), "painted mask (strokes)"),
-                    true => match crate::replay::brush::alone(p)
-                        .and_then(|()| crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images, self.input.graphs))
-                    {
+                    true => match crate::replay::brush::alone(p).and_then(|()| {
+                        crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images, self.input.graphs, Some(&self.sources()))
+                    }) {
                         Ok(step) => {
                             self.push(header, EffectKind::Paint, on);
                             let id = self.effects.last().map_or(texturecraft_core::LayerId(0), |e| e.id);
@@ -259,7 +264,8 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         let mut steps = Vec::new();
         let mut status = Status::Exact;
         for p in paints.into_iter().filter(|p| p.stroke_count() > 0) {
-            let Ok(mut step) = crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images, self.input.graphs) else {
+            let Ok(mut step) = crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images, self.input.graphs, Some(&self.sources()))
+            else {
                 return false;
             };
             if p.tool == PaintTool::Eraser {

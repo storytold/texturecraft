@@ -511,6 +511,8 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         ctx.hooks.check()?;
         let (set, of) = ctx.index;
         (ctx.hooks.progress)(ctx.span.0 + 0.25 * ctx.span.1, Step::ReplayingStrokes { set, of });
+        render_brush_sources(stack, ctx.graphs, &out.graphs, &baked, ctx.images, resolution);
+        ctx.hooks.check()?;
         let scene = ReplayScene { mesh: ctx.mesh, material: ctx.source.slot, resolution };
         replayed = replay_stack(stack, replayer, &scene, &mut out.pixels, &|what: &str| item(what), report);
         // a replayer stopped by the flag fails its remaining jobs: they are not reported as failures
@@ -710,6 +712,33 @@ fn report_blockers(layers: &[Layer], item: &dyn Fn(&str) -> String, report: &mut
         };
         report.add(item(&format!("blocker {key}")), Fidelity::Baked, format!("{text}: locks {n} layers ({alone} by it alone); {unlock}"));
     }
+}
+
+/// Renders the graphs brushes of `stack`'s replay jobs paint, as a fill of them renders (the set's baked maps and
+/// images, the texture's side), sharing the import's cooks (`graphs`: renders already held, or kept between imports, are
+/// not made again; the project does not keep them, as no layer reads them).
+fn render_brush_sources(
+    stack: &mut ImportedStack,
+    lib: Option<&GraphLibrary>,
+    graphs: &texturecraft_compose::GraphStore,
+    baked: &texturecraft_compose::BakedMaps,
+    images: &ProjectImages,
+    resolution: u32,
+) {
+    let keys = crate::replay::source::text_keys(&stack.jobs);
+    if keys.is_empty() {
+        return;
+    }
+    let mut store = texturecraft_compose::GraphStore { texts: Default::default(), cooks: graphs.cooks.clone() };
+    for k in keys {
+        if let Some(text) = lib.and_then(|l| l.text(&k)) {
+            store.texts.insert(k, text);
+        }
+    }
+    let images = images.store();
+    let side = texturecraft_compose::graphs::RenderEnv::side_for((resolution, resolution));
+    let env = texturecraft_compose::graphs::RenderEnv { baked, images: &images, side };
+    crate::replay::source::render(&mut stack.jobs, &store, &env);
 }
 
 /// What a set's stroke replay painted: paint effects and strokes, and jobs that failed.

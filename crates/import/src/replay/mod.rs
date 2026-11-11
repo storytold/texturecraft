@@ -9,12 +9,14 @@
 //! net composites, so the measured scores include the replayed pixels. Without a replayer, strokes stay placeholders
 //! locked with `strokes:<tool>`.
 //!
-//! Paint effects that cannot be replayed (particles, projection painting without an image or on a paint layer, smudge or
-//! projection painting along path strokes, brushes painting images or graphs, tips that are compiled graphs the project
-//! does not hold) stay placeholders with a precise `brush:` or `brush-alpha:` reason. Path strokes (curves on the mesh)
-//! are replayed as dabs walked along the curve ([`ReplayPath`]), or, with a ribbon brush, as a band ([`ReplayRibbon`]).
+//! Paint effects that cannot be replayed (particles, projection painting without an image, smudge or projection painting
+//! along path strokes, brushes painting anchors, tips that are compiled graphs the project does not hold) stay
+//! placeholders with a precise `brush:` or `brush-alpha:` reason. Path strokes (curves on the mesh) are replayed as dabs
+//! walked along the curve ([`ReplayPath`]), or, with a ribbon brush, as a band ([`ReplayRibbon`]). Brushes painting an
+//! image or a compiled graph paint it per texel ([`source`]).
 
 pub mod brush;
+pub mod source;
 pub mod tip;
 
 use std::sync::Arc;
@@ -23,7 +25,8 @@ use texturecraft_core::{Channel, LayerId};
 use texturecraft_geom::Mesh;
 use texturecraft_texel::TileImage;
 
-pub use brush::{check, step};
+pub use brush::{SourceGraphs, check, step};
+pub use source::{ReplaySource, ReplayTexels};
 
 /// The words every replay note starts with in the import report.
 pub const REPLAYED: &str = "strokes replayed with TextureCraft's brush";
@@ -201,8 +204,13 @@ pub struct ReplayStep {
     pub mode: PaintMode,
     /// Content targets: value per channel (TextureCraft's linear values) and the channel's own opacity.
     pub values: Vec<(Channel, [f32; 3], f32)>,
+    /// Content targets painted with an image or a graph instead of a value (a channel is in `values` or here, not
+    /// both), with the channel's own opacity.
+    pub sources: Vec<(Channel, ReplaySource, f32)>,
     /// Mask targets: the grey value laid.
     pub mask_value: f32,
+    /// Mask targets painted with a graph's grey output instead of `mask_value`.
+    pub mask_source: Option<ReplaySource>,
     /// The effect's opacity: each stroke lays `opacity × coverage`.
     pub opacity: f32,
     pub brush: ReplayBrush,
@@ -210,6 +218,10 @@ pub struct ReplayStep {
     /// Projection painting (masks): the grey laid at each texel is this image's where the texel lies on the stroke's
     /// view, in place of `mask_value`.
     pub projection: Option<ReplayStencil>,
+    /// Projection painting on content: each channel's image of `sources` is read where the texel lies on the stroke's
+    /// view, placed by this matrix (as [`ReplayStencil::matrix`]; nothing outside the image); `values` are laid as they
+    /// are (Inferred: the mask's measured placement, per channel).
+    pub placed: Option<[f32; 9]>,
     pub strokes: Vec<ReplayStroke>,
     /// Path strokes, laid after `strokes` (Inferred), each on its own as a stroke is: dabs walked along the curve, or
     /// with `ribbon` a band.

@@ -69,11 +69,14 @@ fn step(mode: PaintMode, strokes: Vec<ReplayStroke>) -> ReplayStep {
     ReplayStep {
         mode,
         values: vec![(Channel::BaseColor, [1.0, 0.0, 0.0], 1.0)],
+        sources: vec![],
         mask_value: 0.5,
+        mask_source: None,
         opacity: 1.0,
         brush: brush(0.1),
         stencil: None,
         projection: None,
+        placed: None,
         strokes,
         paths: vec![],
         ribbon: None,
@@ -527,4 +530,134 @@ fn path_strokes_and_ribbons_paint_into_their_target() {
     let content = ReplayJob { target: ReplayTarget::Content(LayerId(3)), label: String::new(), steps: vec![s] };
     let Ok(ReplayedPixels::Content(images)) = &replay(&mesh, &[content])[0] else { panic!("content") };
     assert!(images.iter().any(|(ch, img)| *ch == Channel::BaseColor && from_u16(img.get(c + 1, c)[3]) > 0.5));
+}
+
+/// An image source 16 × 16 (grey, linear): `value(x, y)` per pixel.
+fn image_source(value: impl Fn(u32, u32) -> f32) -> ReplaySource {
+    let rgba = (0..256u32).map(|i| [value(i % 16, i / 16); 3]).map(|v| [v[0], v[1], v[2], 1.0]).collect();
+    let image = texturecraft_compose::ImageRes { width: 16, height: 16, rgba, srgb: false };
+    ReplaySource::Texels(Arc::new(ReplayTexels::Image(Arc::new(image))))
+}
+
+/// Dark on the image's left half, bright on its right.
+fn halves(x: u32, _y: u32) -> f32 {
+    if x < 8 { 0.2 } else { 0.8 }
+}
+
+/// A content job painting roughness from `source` (and nothing else).
+fn source_job(mut s: ReplayStep, source: ReplaySource) -> ReplayJob {
+    s.values.clear();
+    s.sources = vec![(Channel::Roughness, source, 1.0)];
+    ReplayJob { target: ReplayTarget::Content(LayerId(3)), label: "test".into(), steps: vec![s] }
+}
+
+/// Roughness (straight value, coverage) at texel `(x, y)`.
+fn roughness_at(r: &Result<ReplayedPixels, String>, x: u32, y: u32) -> (f32, f32) {
+    let Ok(ReplayedPixels::Content(images)) = r else { panic!("content: {r:?}") };
+    let Some((_, img)) = images.iter().find(|(c, _)| *c == Channel::Roughness) else { return (0.0, 0.0) };
+    let t = img.get(x, y);
+    let cover = from_u16(t[1]);
+    (if cover > 0.0 { from_u16(t[0]) / cover } else { 0.0 }, cover)
+}
+
+#[test]
+fn a_brush_painting_an_image_lays_it_texel_for_texel() {
+    let mesh = wall();
+    let c = RES / 2;
+    // the image: dark on the texture's left half, bright on its right; a stroke across the middle
+    let job = source_job(step(PaintMode::Paint, vec![stroke(StrokeSpace::Uv, &[[0.2, 0.5], [0.8, 0.5]])]), image_source(halves));
+    let out = replay(&mesh, &[job]);
+    let (left, right) = (roughness_at(&out[0], 40, c), roughness_at(&out[0], 90, c));
+    assert!(left.1 > 0.95 && (left.0 - 0.2).abs() < 0.01, "{left:?}");
+    assert!(right.1 > 0.95 && (right.0 - 0.8).abs() < 0.01, "{right:?}");
+    assert_eq!(roughness_at(&out[0], c, c - 20).1, 0.0, "only where the stroke reaches");
+    // an image's alpha scales the coverage
+    let mut half = image_source(|_, _| 0.5);
+    if let ReplaySource::Texels(t) = &mut half
+        && let ReplayTexels::Image(i) = Arc::make_mut(t)
+    {
+        Arc::make_mut(i).rgba.iter_mut().for_each(|p| p[3] = 0.5);
+    }
+    let out = replay(&mesh, &[source_job(step(PaintMode::Paint, vec![stroke(StrokeSpace::Uv, &[[0.2, 0.5], [0.8, 0.5]])]), half)]);
+    assert!((roughness_at(&out[0], 40, c).1 - 0.5).abs() < 0.02);
+}
+
+#[test]
+fn a_graph_source_paints_its_render_and_one_that_failed_fails_the_job() {
+    let mesh = wall();
+    let c = RES / 2;
+    // a render of the texture's size: 0.3 above the middle row, 0.7 below
+    let mut out_img = TileImage::new(RES, RES, 4);
+    for y in 0..RES {
+        for x in 0..RES {
+            let v = if y < c { 0.3 } else { 0.7 };
+            out_img.set(x, y, &[texturecraft_texel::to_u16(v), 0, 0, 65535]);
+        }
+    }
+    let cooked = Arc::new(texturecraft_compose::Cooked::new(BTreeMap::from([("o".to_string(), out_img)]), Default::default()));
+    let graph = ReplaySource::Texels(Arc::new(ReplayTexels::Graph { cooked, output: Some("o".into()), alpha: None }));
+    let up_down = stroke(StrokeSpace::Uv, &[[0.5, 0.2], [0.5, 0.8]]);
+    let out = replay(&mesh, &[source_job(step(PaintMode::Paint, vec![up_down.clone()]), graph)]);
+    assert!((roughness_at(&out[0], c, 40).0 - 0.3).abs() < 0.01 && (roughness_at(&out[0], c, 90).0 - 0.7).abs() < 0.01);
+    let failed = source_job(step(PaintMode::Paint, vec![up_down]), ReplaySource::Failed("did not render".into()));
+    assert_eq!(replay(&mesh, &[failed])[0].as_ref().err().map(String::as_str), Some("did not render"));
+}
+
+#[test]
+fn a_source_along_a_ribbon_is_read_at_each_texels_place_on_the_band() {
+    let mesh = wall();
+    let c = RES / 2;
+    let mut s = step(PaintMode::Paint, vec![]);
+    s.paths = vec![line_path([-0.5, 0.0], [0.5, 0.0])];
+    s.ribbon = Some(ReplayRibbon { width: 0.2, copy: 0.2, tiling: Tiling::Repeat, depth: 0.1 });
+    s.brush.tip = ReplayTip::Image { width: 1, height: 1, values: Arc::from(vec![1.0]) };
+    // dark on each copy's first half, bright on its second: five copies along the path switch nine times
+    let out = replay(&mesh, &[source_job(s.clone(), image_source(halves))]);
+    let along: Vec<f32> = (33..95).map(|x| roughness_at(&out[0], x, c).0).collect();
+    let switches = along.windows(2).filter(|w| (w[0] - 0.5).signum() != (w[1] - 0.5).signum()).count();
+    assert!((8..=10).contains(&switches), "{along:?}");
+    // across the band: the image's top row on the path's left (up the wall), its bottom row on its right
+    let out = replay(&mesh, &[source_job(s, image_source(|_, y| if y < 8 { 0.2 } else { 0.8 }))]);
+    assert!(roughness_at(&out[0], c, c - 4).0 < 0.4 && roughness_at(&out[0], c, c + 4).0 > 0.6);
+}
+
+#[test]
+fn a_source_along_path_dabs_is_read_in_the_last_dabs_square() {
+    let mesh = wall();
+    let c = RES / 2;
+    let mut s = step(PaintMode::Paint, vec![]);
+    s.brush.radius = 0.1;
+    s.brush.spacing = 3.0;
+    s.brush.tip = ReplayTip::Image { width: 1, height: 1, values: Arc::from(vec![1.0]) };
+    // dabs 0.6 apart from x = −0.6: at texels 25.6, 64 and 102.4, 6.4 texels a side; each reads the image over its square
+    s.paths = vec![line_path([-0.6, 0.0], [0.7, 0.0])];
+    let out = replay(&mesh, &[source_job(s.clone(), image_source(halves))]);
+    for centre in [c - 38, c, c + 38] {
+        let (l, r) = (roughness_at(&out[0], centre - 4, c), roughness_at(&out[0], centre + 3, c));
+        assert!(l.1 > 0.9 && (l.0 - 0.2).abs() < 0.05 && (r.0 - 0.8).abs() < 0.05, "{centre}: {l:?} {r:?}");
+    }
+    // a mask painted with a graph along the path reads its grey the same way
+    let mut m = s;
+    m.mask_source = Some(image_source(halves));
+    let out = replay(&mesh, &[job_of(m)]);
+    let (grey, cover) = mask_at(&out[0], c + 3, c);
+    assert!(cover > 0.9 && (grey / cover - 0.8).abs() < 0.05, "{grey} {cover}");
+}
+
+#[test]
+fn projection_painting_on_content_lays_each_channels_source_on_the_view() {
+    let mesh = wall();
+    // the image spans the view, its left half dark: in the 2D view the texture's left, in the 3D view the wall's left
+    for (space, points) in [(StrokeSpace::Uv, [[0.2, 0.5], [0.8, 0.5]]), (camera(Vec3::Y), [[-0.3, 0.0], [0.3, 0.0]])] {
+        let mut s = step(PaintMode::Paint, vec![stroke(space.clone(), &points)]);
+        s.placed = Some([0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0]);
+        let out = replay(&mesh, &[source_job(s.clone(), image_source(halves))]);
+        let (dark, bright) = (roughness_at(&out[0], 40, RES / 2), roughness_at(&out[0], RES - 40, RES / 2));
+        assert!(dark.1 > 0.95 && (dark.0 - 0.2).abs() < 0.02, "{space:?}: {dark:?}");
+        assert!(bright.1 > 0.95 && (bright.0 - 0.8).abs() < 0.02, "{space:?}: {bright:?}");
+        // an image placed on the view's right half only: nothing on its left
+        s.placed = Some([0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 1.0]);
+        let out = replay(&mesh, &[source_job(s, image_source(halves))]);
+        assert_eq!(roughness_at(&out[0], 40, RES / 2).1, 0.0, "{space:?}");
+    }
 }

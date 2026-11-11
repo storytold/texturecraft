@@ -5,8 +5,10 @@
 //! - The older round shape (`shape`): a smoothstep from 1 at 0.2 of the radius to 0 at the rim, divided by
 //!   `1 − hardness` and cut at 1 (measured); drawn as an image.
 //! - A bitmap alpha: its red × alpha, as an image. A uniform alpha: a full square of its value.
-//! - Any other alpha is a compiled graph: [`graph_tip`] renders its grey output with its tweaks at [`TIP_SIDE`] from the
-//!   project's decompiled graphs; without them it is a `brush-alpha:<graph>` blocker.
+//! - Any other alpha is a compiled graph: [`graph_tip`] renders its grey output with its tweaks and the sources feeding
+//!   its image inputs at [`TIP_SIDE`] from the project's decompiled graphs; without them it is a `brush-alpha:<graph>`
+//!   blocker. The legacy `gaussian` alpha of the oldest packages, which does not render, is drawn from its name
+//!   ([`legacy_gaussian`]).
 //! - A dynamic alpha (a graph with a `stampIndex` input, or a source wired to the stroke's seed) cycles through stamps:
 //!   [`cycle`] renders each.
 //! - A stencil ([`stencil`]): a uniform source is its grey everywhere; a bitmap its red × alpha; a graph its grey output
@@ -15,6 +17,7 @@
 use std::sync::Arc;
 
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
+use texturecraft_import_reader::format_names::LEGACY_ALPHA_SUFFIX;
 use texturecraft_import_reader::model::{Procedural, ProjectSource, STROKE_WIRE_RANDOM_START, STROKE_WIRE_SEED, Tweak, TweakValue};
 
 use super::brush::refused;
@@ -43,6 +46,12 @@ const OLD_SHAPE_START: f32 = 0.2;
 /// Name of the newer and the older round shape graphs (file data: the graph names the file refers to).
 const ROUND_SHAPE: &str = "shape_v2";
 const OLD_ROUND_SHAPE: &str = "shape";
+/// Name of the legacy Gaussian alpha (file data: the graph name the file refers to).
+const LEGACY_GAUSSIAN: &str = "gaussian";
+/// The legacy Gaussian alpha's spread: `σ` in halves of the tip's side (Inferred from the name only).
+const GAUSSIAN_SIGMA: f32 = 1.0 / 3.0;
+/// The note a tip drawn from its name carries.
+pub const GAUSSIAN_NOTE: &str = "brush alpha \"gaussian\" (legacy package) drawn as a Gaussian blob, not rendered";
 
 /// The tip of `alpha` (the first entry is the alpha) and a note when it is approximated; or why it cannot be had.
 pub fn tip(alpha: &[ProjectSource], images: &ProjectImages, graphs: Option<&GraphLibrary>) -> Result<(ReplayTip, Option<String>), Blocker> {
@@ -54,7 +63,10 @@ pub fn tip(alpha: &[ProjectSource], images: &ProjectImages, graphs: Option<&Grap
             match (q.name(), round_hardness(&q.tweaks)) {
                 (ROUND_SHAPE, Some(h)) => Ok((ReplayTip::Round { hardness: h }, None)),
                 (OLD_ROUND_SHAPE, Some(h)) => Ok((old_round(h), None)),
-                _ => Ok((graph_tip(q, graphs)?, None)),
+                _ => match graph_tip(q, images, graphs) {
+                    Err(_) if is_legacy_gaussian(q) => Ok((legacy_gaussian(), Some(GAUSSIAN_NOTE.to_string()))),
+                    tip => Ok((tip?, None)),
+                },
             }
         }
         Some(ProjectSource::Bitmap(b)) => {
@@ -72,12 +84,31 @@ pub fn tip(alpha: &[ProjectSource], images: &ProjectImages, graphs: Option<&Grap
 
 /// The tip a compiled-graph alpha renders: its grey output with the graph's own tweaks at [`TIP_SIDE`]. Without the
 /// project's graphs decompiled, or when the graph does not render, the graph's blocker.
-pub fn graph_tip(graph: &Procedural, graphs: Option<&GraphLibrary>) -> Result<ReplayTip, Blocker> {
+pub fn graph_tip(graph: &Procedural, images: &ProjectImages, graphs: Option<&GraphLibrary>) -> Result<ReplayTip, Blocker> {
     let name = graph.name();
     let blocked = |why: &str| Blocker::new(BlockerKey::new(BlockerKind::BrushAlpha, name), format!("brush alpha \"{name}\" {why}"));
     let lib = graphs.ok_or_else(|| blocked("is a compiled graph (graphs are kept as placeholders)"))?;
-    let values = crate::graph_uses::render_grey(lib, graph, TIP_SIDE).ok_or_else(|| blocked("is a compiled graph that does not render"))?;
+    let values = crate::graph_uses::render_grey(lib, graph, TIP_SIDE, images).ok_or_else(|| blocked("is a compiled graph that does not render"))?;
     Ok(ReplayTip::Image { width: TIP_SIDE, height: TIP_SIDE, values: Arc::from(values) })
+}
+
+/// Whether `p` is the legacy Gaussian alpha of the oldest packages.
+fn is_legacy_gaussian(p: &Procedural) -> bool {
+    p.name() == LEGACY_GAUSSIAN && p.url.contains(LEGACY_ALPHA_SUFFIX)
+}
+
+/// The legacy Gaussian alpha drawn from its name: `exp(−r² / 2σ²)`, `r` 1 at the middle of the tip's sides, `σ`
+/// [`GAUSSIAN_SIGMA`] (Inferred from the name only, not measured; seen in one project).
+pub fn legacy_gaussian() -> ReplayTip {
+    let n = TIP_SIDE as usize;
+    let values: Vec<f32> = (0..n * n)
+        .map(|i| {
+            let u = ((i % n) as f32 + 0.5) / n as f32 * 2.0 - 1.0;
+            let v = ((i / n) as f32 + 0.5) / n as f32 * 2.0 - 1.0;
+            (-(u * u + v * v) / (2.0 * GAUSSIAN_SIGMA * GAUSSIAN_SIGMA)).exp()
+        })
+        .collect();
+    ReplayTip::Image { width: TIP_SIDE, height: TIP_SIDE, values: Arc::from(values) }
 }
 
 /// The stamps a dynamic alpha cycles through, and whether the cycle starts at a stamp drawn from the stroke's seed
@@ -85,7 +116,7 @@ pub fn graph_tip(graph: &Procedural, graphs: Option<&GraphLibrary>) -> Result<Re
 /// `stampIndex` `i` and the count set to that number too (the graph's stored count is not used). A source wired to the
 /// stroke's seed gets a cycle too, stamp `i` rendered with seed `i` (inferred: only that the stamps differ is known).
 /// Empty for any other alpha, or when a stamp does not render (every dab then lays the tip).
-pub fn cycle(alpha: &[ProjectSource], graphs: Option<&GraphLibrary>) -> (Vec<ReplayTip>, bool) {
+pub fn cycle(alpha: &[ProjectSource], images: &ProjectImages, graphs: Option<&GraphLibrary>) -> (Vec<ReplayTip>, bool) {
     let (Some(ProjectSource::Procedural(p)), Some(lib)) = (alpha.first(), graphs) else { return (Vec::new(), false) };
     let Some(q) = p.procedural.as_ref() else { return (Vec::new(), false) };
     if matches!(q.name(), ROUND_SHAPE | OLD_ROUND_SHAPE) && round_hardness(&q.tweaks).is_some() {
@@ -123,7 +154,7 @@ pub fn cycle(alpha: &[ProjectSource], graphs: Option<&GraphLibrary>) -> (Vec<Rep
         if seeded {
             set(SEED, i);
         }
-        let Some(values) = crate::graph_uses::render_grey(lib, &stamp, TIP_SIDE) else { return (Vec::new(), false) };
+        let Some(values) = crate::graph_uses::render_grey(lib, &stamp, TIP_SIDE, images) else { return (Vec::new(), false) };
         out.push(ReplayTip::Image { width: TIP_SIDE, height: TIP_SIDE, values: Arc::from(values) });
     }
     (out, p.stroke_wires & STROKE_WIRE_RANDOM_START != 0)
@@ -155,7 +186,7 @@ pub fn stencil(source: &ProjectSource, images: &ProjectImages, graphs: Option<&G
             let name = q.name();
             let blocked = |why: &str| Blocker::new(BlockerKey::new(BlockerKind::BrushAlpha, name), format!("stencil \"{name}\" {why}"));
             let lib = graphs.ok_or_else(|| blocked("is a compiled graph (graphs are kept as placeholders)"))?;
-            let values = crate::graph_uses::render_grey(lib, q, STENCIL_SIDE).ok_or_else(|| blocked("is a compiled graph that does not render"))?;
+            let values = crate::graph_uses::render_grey(lib, q, STENCIL_SIDE, images).ok_or_else(|| blocked("is a compiled graph that does not render"))?;
             Ok(StencilImage::Image { width: STENCIL_SIDE, height: STENCIL_SIDE, values: Arc::from(values) })
         }
         other => Err(refused(&format!("stencil-source-{}", other.kind()), format!("stencil source {}", other.kind()))),
