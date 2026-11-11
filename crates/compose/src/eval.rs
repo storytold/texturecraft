@@ -1635,13 +1635,44 @@ impl<'a, 'b> Texel<'a, 'b> {
             return Some(graphs::at_texel(image, self.x, self.y, (self.inp.gbuf.width, self.inp.gbuf.height)));
         }
         let (coords, projection, _) = self.projected(projection);
+        let footprint = self.footprint(projection);
+        let cooked = cooked?;
         let mut sum = [0.0f32; 4];
         for (uv, weight) in image_samples(projection, &coords).into_iter().filter(|(_, weight)| *weight > 0.0) {
-            for (total, value) in sum.iter_mut().zip(graphs::sample(image, uv.x, uv.y)) {
+            let value = cooked.sample_filtered(output, uv.x, uv.y, footprint).unwrap_or_else(|| graphs::sample(image, uv.x, uv.y));
+            for (total, value) in sum.iter_mut().zip(value) {
                 *total += value * weight;
             }
         }
         Some(sum)
+    }
+
+    /// The size of this texel in the image coordinates `projection` reads ([`image_samples`]): the UV tiling over the
+    /// texels across a UV tile, or a volume projection's scale times the texel's size in projection space (from its
+    /// triangle's area on the surface and in UV); 0 where it is not known (a texel off the mesh, the other projections).
+    fn footprint(&mut self, projection: &Projection) -> f32 {
+        let volume = match projection {
+            Projection::Uv { scale, .. } => return scale[0].abs().max(scale[1].abs()) / self.inp.tile_res().max(1) as f32,
+            Projection::Triplanar { scale, .. } => *scale,
+            Projection::Planar { scale, .. } => 0.5 * *scale,
+            _ => return 0.0,
+        };
+        let g = self.inp.gbuf;
+        let Some(&t) = g.tri.get((self.y * g.width + self.x) as usize) else { return 0.0 };
+        let Some([a, b, c]) = self.inp.mesh.tri(t as usize) else { return 0.0 };
+        let m = self.inp.mesh;
+        let (Some(pa), Some(pb), Some(pc), Some(ta), Some(tb), Some(tc)) =
+            (m.positions.get(a), m.positions.get(b), m.positions.get(c), m.uvs.get(a), m.uvs.get(b), m.uvs.get(c))
+        else {
+            return 0.0;
+        };
+        let (lo, hi) = self.inp.bounds;
+        let r = ((hi - lo).length() * 0.5).max(1e-4);
+        let surface = (*pb - *pa).cross(*pc - *pa).length() / (r * r);
+        let uv = (*tb - *ta).perp_dot(*tc - *ta).abs();
+        let len = (surface / uv).sqrt() / g.width.max(1) as f32;
+        let f = volume.abs() * len;
+        if f.is_finite() { f } else { 0.0 }
     }
 
     /// The coverage of a fill source: 1, or a graph source's alpha output

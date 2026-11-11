@@ -190,3 +190,23 @@ fn quantized_cooks_sample_their_texels() {
     assert_eq!(sample(img, f32::NAN, 0.0), [0.0; 4]);
     assert_eq!(c.output(None).map(TileImage::width), Some(2));
 }
+
+#[test]
+fn minified_reads_average_the_output_instead_of_aliasing() {
+    // an 8 × 8 checker of single pixels
+    let px = (0..64).map(|i| if (i % 8 + i / 8) % 2 == 0 { [1.0; 4] } else { [0.0, 0.0, 0.0, 1.0] }).collect();
+    let cooked = Cooked::from_textures([("out".to_string(), Tex { w: 8, h: 8, px })].into(), BTreeSet::new());
+    let centre = |x: f32| (x + 0.5) / 8.0;
+    // a texel no larger than a pixel reads the pixel
+    let fine = cooked.sample_filtered(None, centre(0.0), centre(0.0), 1.0 / 8.0).unwrap();
+    assert!((fine[0] - 1.0).abs() < 1e-3, "{fine:?}");
+    // a texel spanning four pixels or more reads their mean
+    for footprint in [0.5, 1.0, 4.0] {
+        let v = cooked.sample_filtered(None, centre(3.0), centre(1.0), footprint).unwrap();
+        assert!((v[0] - 0.5).abs() < 1e-3, "{footprint}: {v:?}");
+    }
+    // between levels it blends: √2 pixels across sits halfway between the pixel and the two-by-two mean
+    let half = cooked.sample_filtered(Some("out"), centre(0.0), centre(0.0), 2f32.sqrt() / 8.0).unwrap();
+    assert!((half[0] - 0.75).abs() < 1e-3, "{half:?}");
+    assert!(cooked.sample_filtered(Some("absent"), 0.0, 0.0, 1.0).is_none());
+}

@@ -544,7 +544,7 @@ fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mu
             continue;
         }
         let linear = entry.linear.into_iter().filter(|l| outputs.contains_key(l)).collect();
-        pf.graphs.insert_cooked(key, Cooked { outputs, linear });
+        pf.graphs.insert_cooked(key, Cooked::new(outputs, linear));
     }
     pf.graphs.set_uses(index.uses.into_iter().collect());
     if dropped > 0 {

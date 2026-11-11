@@ -123,7 +123,7 @@ pub fn decode(bytes: &[u8]) -> Option<Cooked> {
             return None;
         }
     }
-    r.0.is_empty().then_some(Cooked { outputs, linear })
+    r.0.is_empty().then_some(Cooked::new(outputs, linear))
 }
 
 #[cfg(test)]
@@ -150,7 +150,7 @@ mod tests {
         // unallocated tiles stay unallocated
         let mut sparse = TileImage::new(200, 200, 1);
         sparse.set(130, 5, &[7]);
-        let c = Cooked { outputs: [("s".to_string(), sparse)].into(), linear: BTreeSet::new() };
+        let c = Cooked::new([("s".to_string(), sparse)].into(), BTreeSet::new());
         let back = decode(&encode(&c)).unwrap();
         assert_eq!(back.outputs["s"].allocated_count(), 1);
         assert_eq!(back, c);
