@@ -593,3 +593,40 @@ fn mask_polygon_fills_become_paint_effects_with_their_picks() {
     let l = by_name(&stack, "Masked");
     assert!(l.is_locked() && matches!(l.mask.as_ref().unwrap().effects[0].kind, EffectKind::Placeholder { .. }));
 }
+
+fn filter(uid: u64, channels: u64, name: &str) -> ProjectEffect {
+    let procedural = Procedural {
+        uid: None,
+        url: format!("resource://shelf/{name}/{name}?version=1"),
+        tweaks: vec![],
+        outputs: vec![],
+        inputs: vec![],
+        alpha_output: String::new(),
+        mono_output: 0,
+    };
+    ProjectEffect::Filter(texturecraft_import_reader::model::FilterEffect {
+        header: header(uid, channels, vec![]),
+        procedural: Some(procedural),
+        inputs: vec![],
+        input_alphas: vec![],
+    })
+}
+
+#[test]
+fn a_fill_layer_whose_filter_writes_channels_the_fill_does_not_hold_lays_its_fill_as_an_effect() {
+    // the filter works on every channel; the fill holds base colour only: on height the original's fill covers nothing
+    let l = layer(1, "Filtered", ProjectLayerKind::Fill, vec![fill(2, BASE, vec![uniform(BASE, [0.2, 0.4, 0.6])], vec![]), filter(3, 0, "warp")]);
+    let stack = build(vec![l]);
+    let ours = by_name(&stack, "Filtered");
+    assert!(matches!(ours.kind, LayerKind::Paint), "{:?}", ours.kind);
+    let EffectKind::Material(f) = &ours.content_effects[0].kind else { panic!("the fill first: {:?}", ours.content_effects) };
+    assert_eq!(f.sources.get(&Channel::BaseColor), Some(&Source::Uniform([0.2, 0.4, 0.6])));
+    assert!(!f.sources.contains_key(&Channel::Height));
+    assert!(ours.blend(Channel::Height).is_some(), "the filter still writes height");
+    assert_eq!(ours.content_effects.len(), 2, "the fill, then the filter");
+
+    // a filter on the fill's own channels only keeps the fill layer
+    let l = layer(1, "Own", ProjectLayerKind::Fill, vec![fill(2, BASE, vec![uniform(BASE, [0.2, 0.4, 0.6])], vec![]), filter(3, BASE, "warp")]);
+    let stack = build(vec![l]);
+    assert!(matches!(by_name(&stack, "Own").kind, LayerKind::Fill(_)));
+}

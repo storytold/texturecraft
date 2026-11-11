@@ -99,6 +99,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         self.path = path.to_string();
         let mut kind = LayerKind::Paint;
         let mut rest: &[ProjectEffect] = &l.content;
+        let mut base = None;
         match (&l.kind, l.content.split_first()) {
             (texturecraft_import_reader::model::LayerKind::Fill, Some((ProjectEffect::Fill(first), after))) if first.header.enabled => {
                 let parts = self.fill_parts(first);
@@ -107,6 +108,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                     self.note_all(&parts.status);
                     self.name_graphs(parts.graph_names);
                     rest = after;
+                    base = Some(first);
                 }
             }
             (texturecraft_import_reader::model::LayerKind::Paint, Some((ProjectEffect::Group(g), after))) if g.header.enabled => {
@@ -124,6 +126,18 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         }
         for e in rest {
             self.effect(e, true);
+        }
+        // A fill layer whose effects write channels its fill does not hold (a filter on every channel over a fill of base
+        // colour only): the original's fill covers nothing on those channels, so a filter there works on nothing and
+        // leaves the stack below as it is. TextureCraft's fill layer lays a channel's default where it has no source;
+        // the fill becomes the first content effect of a paint layer instead, which covers only the channels it holds.
+        if let (LayerKind::Fill(fill), Some(first)) = (&kind, base)
+            && self.written.keys().any(|c| !fill.sources.contains_key(c))
+        {
+            let after = std::mem::take(&mut self.effects);
+            self.fill(first, true);
+            self.effects.extend(after);
+            kind = LayerKind::Paint;
         }
         Mapped { kind, effects: self.effects, written: self.written, graphs: self.graphs, anchor_status: self.anchor_status, jobs: self.jobs }
     }
