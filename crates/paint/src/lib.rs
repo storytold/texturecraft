@@ -6,7 +6,8 @@
 //! over the UV G-buffer, hiding surfaces the camera can't see ([`EyeDepth`]), optionally through a
 //! [`stencil`] on the view; [`commit`] blends the finished stroke into layer pixels. Clone and smudge
 //! strokes carry channel values ([`pickup`]) instead of painting the tool's material.
-//! [`path`] samples the Path tool's curves and lasso coverage; [`particles`] runs the particle
+//! [`path`] samples the Path tool's curves and lasso coverage, and curves on the mesh that strokes follow; [`ribbon`]
+//! lays a brush's shape along such a curve as a band; [`particles`] runs the particle
 //! brush; [`alphas`] is the built-in library of procedural brush alphas and [`presets`] the built-in
 //! brush presets; [`text`] draws text for text alphas and decals.
 #![forbid(unsafe_code)]
@@ -21,6 +22,7 @@ pub mod path;
 pub mod pickup;
 pub mod presets;
 pub mod raster;
+pub mod ribbon;
 pub mod stamp_source;
 pub mod stencil;
 pub mod stroke;
@@ -30,9 +32,10 @@ pub mod visibility;
 pub use brush::{Alignment, BrushAlpha, BrushSettings, FULL_TURN_DEGREES, MAX_RADIAL_COPIES, Particles, Shape, Symmetry, image_alpha, pressure_scale};
 pub use commit::{CommitSource, Staging, TexelFn, commit_coverage, commit_layer, commit_mask, commit_mask_texels};
 pub use jitter::SeededJitter;
-pub use path::{Lasso, spline, spline_segments};
+pub use path::{CurveSpot, Lasso, SpaceCurve, SpacePiece, spline, spline_segments};
 pub use pickup::{Pickup, PickupMode, smudge_in_place};
 pub use raster::{Facing, RasterCtx, StrokeCanvas, UvStamp, fill_coverage, fill_triangles, footprint, footprint_uv, rasterize, rasterize_uv};
+pub use ribbon::{Ribbon, RibbonTiling, rasterize_ribbon};
 pub use stamp_source::StampSource;
 pub use stencil::ViewStencil;
 pub use stroke::{PickCtx, Stamp, Stroke, SurfaceHit, pick};

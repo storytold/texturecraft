@@ -75,6 +75,14 @@ impl StrokeCanvas {
         self.recent.insert(t);
     }
 
+    /// Lays `texels` (`(x, y, alpha)`) as one stamp, "over" what the canvas holds; a canvas not the size of `gbuf`
+    /// starts over first (bands along a path, [`crate::ribbon`]).
+    pub(crate) fn add_texels(&mut self, gbuf: &UvGBuffer, texels: Vec<(u32, u32, f32)>) {
+        self.fit(gbuf);
+        self.texels = texels;
+        self.add_stamp([0.0; 2]);
+    }
+
     /// Blend the gathered stamp texels (stamp center `center` in texels) into the stroke: the
     /// quick mask scales them, then the pickup deposits its values or the alpha accumulates
     /// ("over": `m = a + m·(1 − a)`).
