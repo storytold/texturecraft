@@ -271,7 +271,27 @@ fn stroke_after_undoing_mask_is_paint_stroke() {
     s.update();
 
     let settled = s.caches[0].composite.clone();
+    s.caches[0].below.clear();
     s.caches[0].invalidate_all();
     s.update();
     assert_eq!(settled, s.caches[0].composite, "the composite after the stroke matches a full recomposite");
+}
+
+#[test]
+fn undoing_after_painting_on_instance_source_mask_keeps_mask_target() {
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:random", None, 256).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    execute(&mut s, "mask.add.white", &Value::Null).unwrap();
+    execute(&mut s, "layer.instance", &Value::Null).unwrap();
+    s.update();
+    s.target = StackTarget::Mask;
+    execute(&mut s, "tool.brush", &json!({"size": 20, "hardness": 50, "opacity": 0.8})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[170, 180], [210, 200]]})).unwrap();
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.target, StackTarget::Mask);
+
+    execute(&mut s, "tool.stroke", &json!({"points": [[180, 180], [210, 200]]})).unwrap();
+    let undone = execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(undone["undone"], "Mask stroke");
 }
