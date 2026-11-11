@@ -70,7 +70,7 @@ pub struct Windows {
     pub shortcuts: bool,
     #[serde(default)]
     pub settings: bool,
-    /// Browser File › Export Mesh: the download format choice.
+    /// File › Export Mesh: the export format choice.
     #[serde(default)]
     pub export_mesh: bool,
     /// The start window: new, open, recent projects (the app opens it at launch).

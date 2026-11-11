@@ -25,7 +25,6 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     settings(app, ctx);
     crate::keymap::window(app, ctx);
     crate::windows::export(app, ctx);
-    #[cfg(target_arch = "wasm32")]
     export_mesh(app, ctx);
     unsaved(app, ctx);
 }
@@ -758,23 +757,35 @@ fn settings(app: &mut TextureCraftApp, ctx: &egui::Context) {
     }
 }
 
-/// Browser File › Export Mesh: pick the download format
-#[cfg(target_arch = "wasm32")]
+/// File › Export Mesh: pick the format before opening the save dialog or download.
 fn export_mesh(app: &mut TextureCraftApp, ctx: &egui::Context) {
-    let formats = [
+    if !app.ui.windows.export_mesh {
+        return;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let formats: &[(&str, &str, &str)] = &[
         ("glb", "glTF binary (.glb)", tr("Textures embedded; for game engines and most viewers")),
         ("usdz", "USDZ (.usdz)", tr("Textures packaged; for USD tools and AR Quick Look")),
         ("obj", "Wavefront OBJ (.obj)", tr("Geometry and UVs only")),
     ];
-    if !app.ui.windows.export_mesh {
-        return;
-    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let formats: &[(&str, &str, &str)] = &[
+        ("glb", "glTF binary (.glb)", tr("glTF binary with textures")),
+        ("obj", "Wavefront OBJ (.obj)", tr("Wavefront OBJ with MTL, textures alongside")),
+        ("usdz", "USDZ (.usdz)", tr("USDZ with textures")),
+        ("usda", "USD text (.usda)", tr("USD text, textures alongside")),
+        ("usdc", "USD binary (.usdc)", tr("USD binary, textures alongside")),
+    ];
+    #[cfg(target_arch = "wasm32")]
+    let heading = tr("Download as");
+    #[cfg(not(target_arch = "wasm32"))]
+    let heading = tr("File type");
 
     let mut open = true;
     let mut picked = None;
     dialog("export_mesh", tr("Export mesh"), &mut open).show(ctx, |ui| {
-        ui.label(caption(tr("Download as")));
-        for (extension, label, hint) in formats {
+        ui.label(caption(heading));
+        for &(extension, label, hint) in formats {
             if ui.add_sized(vec2(220.0, ui.spacing().interact_size.y), egui::Button::new(label)).on_hover_text(hint).clicked() {
                 picked = Some(extension);
             }
@@ -782,10 +793,56 @@ fn export_mesh(app: &mut TextureCraftApp, ctx: &egui::Context) {
     });
 
     if let Some(extension) = picked {
+        #[cfg(target_arch = "wasm32")]
         crate::web_files::export_mesh(app, extension);
+        #[cfg(not(target_arch = "wasm32"))]
+        ask_mesh_export(app, Some(extension));
         open = false;
     }
     app.ui.windows.export_mesh = open;
+}
+
+/// Filter label and extensions for a mesh export format.
+#[cfg(not(target_arch = "wasm32"))]
+fn mesh_export_filter(ext: &str) -> (&'static str, &'static [&'static str]) {
+    match ext {
+        "glb" => (tr("glTF binary with textures"), &["glb", "gltf"]),
+        "usdz" => (tr("USDZ with textures"), &["usdz"]),
+        "usda" => (tr("USD text, textures alongside"), &["usda"]),
+        "usdc" => (tr("USD binary, textures alongside"), &["usdc"]),
+        _ => (tr("Wavefront OBJ with MTL, textures alongside"), &["obj"]),
+    }
+}
+
+/// Open the native save dialog for a mesh export, preserving `format` when extensionless while
+/// honoring an explicit known extension chosen in the path.
+#[cfg(not(target_arch = "wasm32"))]
+fn ask_mesh_export(app: &mut TextureCraftApp, format: Option<&'static str>) {
+    let stem = texturecraft_engine::formats::export::sanitize_file_stem(&app.session.doc.project.name);
+    let name = format!("{stem}.{}", format.unwrap_or("obj"));
+    let all = ["obj", "glb", "usdz", "usda", "usdc"];
+    let mut dialog = FileDialog::save();
+    for &ext in all.iter().filter(|&&e| format.is_none_or(|picked| picked == e)) {
+        let (label, exts) = mesh_export_filter(ext);
+        dialog = dialog.filter(label, exts);
+    }
+    app.ask_file(dialog.file_name(name), Bound::Project, move |app, paths| {
+        if let Some(p) = paths.first() {
+            let explicit = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .is_some_and(|e| e == "glft" || texturecraft_engine::file_cmds::MESH_EXPORT_FORMATS.contains(&e.as_str()));
+            let mut params = json!({"path": p.display().to_string()});
+            if let Some(ext) = (!explicit).then_some(format).flatten() {
+                params["format"] = json!(ext);
+            }
+            if let Some(r) = app.run("file.exportMesh", params) {
+                let p = r.get("path").and_then(|p| p.as_str()).unwrap_or_default().to_string();
+                app.toast(trf("Exported mesh to {path}", &[("path", &p)]), false);
+            }
+        }
+    });
 }
 
 fn about(app: &mut TextureCraftApp, ctx: &egui::Context) {
@@ -945,22 +1002,7 @@ pub fn file_action(app: &mut TextureCraftApp, _ctx: &egui::Context, id: &str) ->
             true
         }
         "file.exportMesh" => {
-            let name = texturecraft_engine::formats::export::sanitize_file_stem(&app.session.doc.project.name);
-            let dialog = FileDialog::save()
-                .filter(tr("Wavefront OBJ with MTL, textures alongside"), &["obj"])
-                .filter(tr("glTF binary with textures"), &["glb", "gltf"])
-                .filter(tr("USDZ with textures"), &["usdz"])
-                .filter(tr("USD text, textures alongside"), &["usda"])
-                .filter(tr("USD binary, textures alongside"), &["usdc"])
-                .file_name(name);
-            app.ask_file(dialog, Bound::Project, |app, paths| {
-                if let Some(p) = paths.first()
-                    && let Some(r) = app.run("file.exportMesh", json!({"path": p.display().to_string()}))
-                {
-                    let p = r.get("path").and_then(|p| p.as_str()).unwrap_or_default().to_string();
-                    app.toast(trf("Exported mesh to {path}", &[("path", &p)]), false);
-                }
-            });
+            ask_mesh_export(app, None);
             true
         }
         "file.reimportMesh" => {
