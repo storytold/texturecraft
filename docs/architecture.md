@@ -12,6 +12,7 @@ L0  core      document model: Project, TextureSet, Layer (paint / fill / group),
 L0  texel     TileImage (sparse copy-on-write 64x64 tiles of u16), DilationMap (UV padding),
               deterministic noise, sRGB transfer
 L0  geom      Mesh (+ MikkTSpace tangents), primitives, SAH BVH, UvGBuffer, OrbitCamera, auto-unwrap
+L0  result-cache  results kept in a folder by key across runs (native use only: the import's graph renders)
 L1  compose   the layer-stack compositor (CPU, per tile, rayon), patterns, display conversion
 L1  bake      AO, curvature, thickness, world normal, position, ID, normal and height bakers
               (rays batched through a Tracer: CPU oracle or the render crate's GPU baker)
@@ -188,6 +189,17 @@ fields. Renders run on the graph runtime's own thread pool, and no compositor th
 down its own stack (`compose::graphs::once`). The `.tcraft` file stores the texts (`graphs/<key>.txt`) and the cooks
 the last composite read (`cooked/`), so a converted project opens without rendering its graphs; a use whose key no
 longer matches is rendered again alone, and one that cannot be keeps its last pixels, flagged in `project.inspect`.
+
+Across documents, an import can also keep its cooks in a result cache folder (`resultCache`, CLI
+`--result-cache`; native builds only): the graph store looks there by cook key before rendering and puts each
+finished render there (`compose::graphs::kept`, a `KeptCooks` the engine backs with `texturecraft-result-cache`,
+L0: entries checked by key, length and checksum, the folder kept under a limit, least recently used out first).
+A second import of the same project, or of another one using the same graph the same way, reads the render.
+
+`import.library.list` and `import.library.add` (`engine::import_library_cmds`, over `import::library`) offer what
+a project file brings for the user's asset library (brushes, bitmap alphas, stencils, textures, the environment
+map) with its origin and whether it may be shared; brushes are added as `.tcbrush` presets in the data folder's
+`brushes/`. The other kinds have no place in the library yet and are only listed.
 
 ## Commands and automation
 
