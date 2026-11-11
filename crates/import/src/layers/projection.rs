@@ -51,7 +51,8 @@ fn uv_placement(t: &UvTransform) -> ([f32; 2], f32, [f32; 2]) {
     (scale, -theta.to_degrees(), offset)
 }
 
-pub fn map(fill: &FillEffect) -> MappedProjection {
+/// `volume_unit`: [`super::SetInput::volume_unit`].
+pub fn map(fill: &FillEffect, volume_unit: f32) -> MappedProjection {
     let identity = Projection::default();
     let uv = fill.uv_transform.filter(|t| !t.is_identity());
     let volume_scale = fill.placement.size.map_or(1.0, |s| {
@@ -78,8 +79,16 @@ pub fn map(fill: &FillEffect) -> MappedProjection {
         PROJECTION_TRIPLANAR => {
             let sharpness =
                 fill.placement.side_hardness.filter(|h| h.is_finite()).map_or(DEFAULT_SHARPNESS, |h| 1.0 + h.clamp(0.0, 1.0) * 2.0 * (DEFAULT_SHARPNESS - 1.0));
+            // the original's volume of size 1 is the scene's largest extent, centred on the scene (TextureCraft's positions are
+            // centred too, over the bounding radius: `volume_unit`), and holds one repetition of the image; the UV tiling
+            // repeats it as on a UV fill. TextureCraft's tri-planar has one scale, so uneven tiling takes the mean; the half
+            // offset puts the image's centre on the scene's centre
+            let tiling = uv.map_or(1.0, |t| {
+                let s = t.scale.map(|v| if v.is_finite() { v.abs() } else { 1.0 });
+                (s[0] + s[1]) * 0.5
+            });
             (
-                Projection::Triplanar { scale: volume_scale, sharpness, offset: [0.0; 3] },
+                Projection::Triplanar { scale: volume_scale * tiling * volume_unit, sharpness, offset: [0.5; 3] },
                 approx("tri-planar projection (TextureCraft's volume and blend differ)"),
                 true,
             )
@@ -119,9 +128,9 @@ mod tests {
 
     #[test]
     fn texture_space_and_identity_uv_are_exact() {
-        assert!(map(&fill(6, None)).status.is_exact());
+        assert!(map(&fill(6, None), 1.0).status.is_exact());
         let id = UvTransform { scale: [1.0, 1.0], translation: [0.0, 0.0], rotation: 0.0 };
-        let m = map(&fill(0, Some(id)));
+        let m = map(&fill(0, Some(id)), 1.0);
         assert!(m.status.is_exact() && m.projection == Projection::default() && !m.volume);
     }
 
@@ -135,7 +144,7 @@ mod tests {
     #[test]
     fn tiling_and_offset_place_about_the_centre_as_the_original() {
         let t = UvTransform { scale: [4.37, 3.0], translation: [0.22, -0.1], rotation: 0.0 };
-        let m = map(&fill(0, Some(t)));
+        let m = map(&fill(0, Some(t)), 1.0);
         assert!(m.status.is_exact());
         for uv in [[0.0, 0.0], [0.5, 0.5], [0.13, 0.71], [0.9, 0.2]] {
             // the original: tiling · (uv − ½ − offset) + ½, the same texel of the repeating image
@@ -147,23 +156,33 @@ mod tests {
             }
         }
         // a turn about the centre keeps the centre in place
-        let turned = map(&fill(0, Some(UvTransform { scale: [1.0, 1.0], translation: [0.0, 0.0], rotation: 0.7 })));
+        let turned = map(&fill(0, Some(UvTransform { scale: [1.0, 1.0], translation: [0.0, 0.0], rotation: 0.7 })), 1.0);
         let c = placed(&turned.projection, [0.5, 0.5]);
         assert!((c[0].rem_euclid(1.0) - 0.5).abs() < 1e-4 && (c[1].rem_euclid(1.0) - 0.5).abs() < 1e-4, "{c:?}");
         assert!(!turned.status.is_exact());
     }
 
     #[test]
+    fn tri_planar_repeats_by_its_tiling_in_scene_units() {
+        let t = UvTransform { scale: [3.0, 3.0], translation: [0.0, 0.0], rotation: 0.0 };
+        let Projection::Triplanar { scale, offset, .. } = map(&fill(2, Some(t)), 0.75).projection else { panic!("tri-planar") };
+        assert!((scale - 3.0 * 0.75).abs() < 1e-5, "{scale}");
+        assert_eq!(offset, [0.5; 3], "the image's centre on the scene's centre");
+        let Projection::Triplanar { scale, .. } = map(&fill(2, None), 1.0).projection else { panic!("tri-planar") };
+        assert_eq!(scale, 1.0);
+    }
+
+    #[test]
     fn placements_and_volumes_are_approximated() {
         let t = UvTransform { scale: [2.0, 2.0], translation: [0.5, 0.0], rotation: std::f32::consts::FRAC_PI_2 };
-        let m = map(&fill(0, Some(t)));
+        let m = map(&fill(0, Some(t)), 1.0);
         assert!(!m.status.is_exact());
         let Projection::Uv { scale, rotation, .. } = m.projection else { panic!("uv") };
         assert_eq!(scale, [2.0, 2.0]);
         assert!((rotation + 90.0).abs() < 1e-4);
-        let tri = map(&fill(2, None));
+        let tri = map(&fill(2, None), 1.0);
         assert!(tri.volume && matches!(tri.projection, Projection::Triplanar { .. }) && !tri.status.is_exact());
-        assert!(!map(&fill(7, None)).status.is_exact());
+        assert!(!map(&fill(7, None), 1.0).status.is_exact());
         let mut clipped = fill(1, None);
         clipped.placement.volume_wrap = Some(0);
         assert!(shapes_coverage(&clipped) && !shapes_coverage(&fill(0, None)));

@@ -366,7 +366,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         let blend = ResolvedBlend::of_mask(&fill.header.blending);
         let counts = on && blend.contributes();
         let Some(source) = fill.sources.first() else { return };
-        let mapped = projection::map(fill);
+        let mapped = projection::map(fill, self.input.volume_unit);
         let projection = mapped.projection.clone();
         match source {
             ProjectSource::Uniform(u) => {
