@@ -14,6 +14,7 @@
 //! (colour sRGB, height 0..1 around 0.5, normals with green pointing down), TextureCraft's channels linear colour,
 //! signed height and normals with green up.
 
+pub mod kept;
 pub mod once;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -30,6 +31,7 @@ pub use texturecraft_graph::tex::Tex;
 use texturecraft_texel::{TILE, TileImage, from_u16, linear_to_srgb, srgb_to_linear, to_u16};
 
 use crate::store::{BakedMaps, ImageStore};
+pub use kept::KeptCooks;
 use once::Slots;
 
 /// Largest side a graph is rendered at: renders of larger texture sets are sampled up. A guard of ours (memory and
@@ -219,6 +221,10 @@ pub struct CookCache {
     /// Fingerprints of baked maps and image resources by the address and length of their data.
     fingerprints: Mutex<HashMap<(usize, usize), u128>>,
     pool: OnceLock<Option<Arc<ThreadPool>>>,
+    /// Where cooks are also kept between documents and runs ([`kept`]), if anywhere.
+    kept: Mutex<Option<Arc<dyn KeptCooks>>>,
+    /// Cooks found there instead of rendered.
+    kept_found: AtomicUsize,
     /// Stops renders running for this document.
     pub cancel: Cancel,
 }
@@ -264,6 +270,16 @@ impl GraphStore {
         let key = texturecraft_core::text_key(text);
         self.texts.entry(key.clone()).or_insert_with(|| Arc::from(text));
         key
+    }
+
+    /// Also keeps cooks in `kept` (and looks there before rendering), for every snapshot sharing this store's cooks.
+    pub fn keep_cooks_in(&self, kept: Option<Arc<dyn KeptCooks>>) {
+        *lock(&self.cooks.kept) = kept;
+    }
+
+    /// Cooks found where they are kept ([`GraphStore::keep_cooks_in`]) instead of rendered.
+    pub fn kept_found(&self) -> usize {
+        self.cooks.kept_found.load(Ordering::Relaxed)
     }
 
     /// Renders made since the store was made (by every snapshot sharing its cooks).
@@ -475,8 +491,18 @@ impl GraphStore {
             if self.cooks.cancel.is_cancelled() {
                 return Err("cancelled".to_string());
             }
+            let kept = lock(&self.cooks.kept).clone();
+            if let Some(found) = kept.as_ref().and_then(|k| k.get(&key)).and_then(|bytes| kept::decode(&bytes)) {
+                self.cooks.kept_found.fetch_add(1, Ordering::Relaxed);
+                return Ok(Arc::new(found));
+            }
             self.cooks.renders.fetch_add(1, Ordering::Relaxed);
-            self.render(g, env, given, depth).map(Arc::new)
+            let cooked = self.render(g, env, given, depth)?;
+            // a render stopped part way never gets here: it is an error
+            if let Some(k) = &kept {
+                k.put(&key, &kept::encode(&cooked));
+            }
+            Ok(Arc::new(cooked))
         });
         // a cancelled render (not started, or stopped part way) is not remembered as a failure
         if got.is_err() && self.cooks.cancel.is_cancelled() {
