@@ -777,6 +777,39 @@ fn stack_region(
     (orig, cover, recorded)
 }
 
+/// For each texel of `region`, the evaluated texel (`evaluated` > 0: on the UV islands) whose value it takes: the nearest
+/// one, never across the borders of a UV-tiled set's blocks. Empty when every texel was evaluated or none was.
+fn outside_padding(inp: &Inputs, evaluated: &[f32], (rx0, ry0, w, h): (u32, u32, u32, u32)) -> Vec<u32> {
+    let covered: Vec<bool> = evaluated.iter().map(|c| *c > 0.0).collect();
+    if covered.iter().all(|c| *c) || !covered.contains(&true) {
+        return Vec::new();
+    }
+    let whole = (rx0, ry0, w, h) == (0, 0, inp.gbuf.width, inp.gbuf.height);
+    let block = match inp.tile_grid() {
+        Some(g) if whole => (w / g.cols.max(1), h / g.rows.max(1)),
+        _ => (0, 0),
+    };
+    DilationMap::in_rectangular_blocks(&covered, w, h, None, block).src
+}
+
+/// `data` (`comps` values per texel) with each texel taking the value of its `padding` source; unchanged without padding.
+fn padded<T: Copy>(data: &[T], comps: usize, padding: &[u32]) -> Vec<T> {
+    if padding.is_empty() {
+        return data.to_vec();
+    }
+    let mut out = data.to_vec();
+    for (i, &src) in padding.iter().enumerate() {
+        if src == texturecraft_texel::dilate::NONE || src as usize == i {
+            continue;
+        }
+        let src = src as usize;
+        if let (Some(from), Some(to)) = (data.get(src * comps..(src + 1) * comps), out.get_mut(i * comps..(i + 1) * comps)) {
+            to.copy_from_slice(from);
+        }
+    }
+    out
+}
+
 /// Where a graph filter's result on a channel covers the layer (its alpha), measured on filters in a fill layer without
 /// height or normal (the reference app's results).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -844,7 +877,14 @@ fn graph_region(
             _ => None,
         })
         .collect();
-    let (orig, cover, recorded) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &anchors);
+    let (orig, cover, mut recorded) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &anchors);
+    // the graph reads the stack outside the UV islands too, where the reference app's stack holds values: there it
+    // reads the nearest island texel's, not empty
+    let padding = outside_padding(inp, &cover, (rx0, ry0, w, h));
+    let given_orig = padded(&orig, comps, &padding);
+    for image in &mut recorded {
+        *image = padded(image, 1, &padding);
+    }
     let env = inp.render_env();
     let side = env.side;
     let working = inp.graphs.working_inputs(&graph.key);
@@ -859,7 +899,7 @@ fn graph_region(
             && !others.contains_key(c)
         {
             let (values, _, _) = stack_region(inp, channels, below, id, Job::Content(*c), index, (rx0, ry0, w, h), None, &[]);
-            others.insert(*c, values);
+            others.insert(*c, padded(&values, 4, &padding));
         }
     }
     let to_side = |t: Tex| if (t.w, t.h) == (side, side) { t } else { Tex::from_fn(side, side, |u, v| t.sample(u, v)) };
@@ -873,7 +913,7 @@ fn graph_region(
                 // the filter's own input (no channel named); an input named after the channel the filter runs on reads the
                 // same stack but as a named input: 0 where nothing is below, opaque
                 let is_own = channel.is_none();
-                let data = if c == own { Some(&orig) } else { c.and_then(|c| others.get(&c)) };
+                let data = if c == own { Some(&given_orig) } else { c.and_then(|c| others.get(&c)) };
                 let Some(data) = data else { continue };
                 let px = (0..n)
                     .map(|i| match c {
@@ -907,7 +947,7 @@ fn graph_region(
             }
             GraphInput::StackAlpha { channel } => {
                 let c = channel.or(own);
-                let data = if c == own { Some(&orig) } else { c.and_then(|c| others.get(&c)) };
+                let data = if c == own { Some(&given_orig) } else { c.and_then(|c| others.get(&c)) };
                 let Some(data) = data else { continue };
                 let px = (0..n).map(|i| if c.is_some() { at(data, i, 3) } else { 1.0 }).map(|a| [a, a, a, 1.0]).collect();
                 Tex { w: w as usize, h: h as usize, px }
@@ -2986,6 +3026,24 @@ mod tests {
         let out = run(&f, None);
         assert!(close(out.value(Channel::BaseColor, 5, 5), [0.0, 1.0, 1.0]), "{:?}", out.value(Channel::BaseColor, 5, 5));
         assert!(close(out.value(Channel::Roughness, 5, 5), [0.2; 3]));
+    }
+
+    #[test]
+    fn graph_filters_read_the_stack_padded_outside_the_islands() {
+        let mut graphs = GraphStore::default();
+        let blur = graphs.add_text("format 3\nsize 64\nnode 1 input idx=0\nnode 2 box_blur in=@1 intensity=32\noutput out 2\n");
+        // the plane's UVs squeezed into the left half: the right half of the texture is outside every island
+        let mut f = fixture();
+        f.mesh.uvs.iter_mut().for_each(|uv| uv.x *= 0.5);
+        f.gbuf = UvGBuffer::new(&f.mesh, 0, 64, 64);
+        let id = fill_layer(&mut f.project, [0.6; 3], 0.6);
+        let mut filter = GraphRef::new(blur, "blur");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        content_fx(&mut f, id, EffectKind::Graph { graph: filter, projection: Projection::default() });
+        let out = run_with(&f, &graphs);
+        // next to the island's border the blur reads the island's value beyond it, not empty texels
+        let r = out.value(Channel::Roughness, 30, 20)[0];
+        assert!((r - 0.6).abs() < 2e-3, "{r}");
     }
 
     #[test]
