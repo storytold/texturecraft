@@ -258,6 +258,11 @@ impl BelowCache {
     pub(crate) fn prepare(&mut self, inp: &Inputs) -> Option<Vec<Level>> {
         let hot = self.hot?;
         let p = inp.project;
+        // The stack values it keeps carry no coverage, which the measured blend rules read: such a project (an
+        // imported one) is composited whole.
+        if p.rules.blend.is_measured() {
+            return None;
+        }
         let set = p.texture_set(inp.ts).ok()?;
         // Anchor readers and effect layers depend on the stack below them.
         let reads_below = |l: &Layer| l.reads_anchor() || Channel::ALL.iter().any(|c| crate::eval::starts_from_below(l, *c));

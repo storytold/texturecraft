@@ -13,6 +13,7 @@ use texturecraft_core::{
     BakedMap, BlendMode, BlockScales, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Fill, Filter, Generator,
     GeneratorKind, GeometryMask, GraphInput, GraphRef, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source,
     TextureSet, TileGrid, blend1, blend3, lum, mix3, per_unit,
+    rules::{BlendRules, mix_over},
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer};
@@ -27,8 +28,29 @@ use texturecraft_graph::tex::Tex;
 
 const NCH: usize = Channel::ALL.len();
 
-/// Stack values being composited, per channel.
-type Acc = [[f32; 3]; NCH];
+/// Stack values being composited, per channel, with the coverage each holds. Only the measured blend rules
+/// ([`BlendRules::Measured`]) read the coverage: there a layer's mode applies only where something is below, and a
+/// folder that does not pass through composites its children from nothing.
+#[derive(Clone, Copy)]
+struct Acc {
+    v: [[f32; 3]; NCH],
+    cov: [f32; NCH],
+}
+
+impl Acc {
+    /// The channel defaults, covering nothing.
+    fn defaults() -> Acc {
+        Acc { v: Channel::ALL.map(Channel::default_value), cov: [0.0; NCH] }
+    }
+
+    fn get(&self, ch: usize) -> Option<&[f32; 3]> {
+        self.v.get(ch)
+    }
+
+    fn get_mut(&mut self, ch: usize) -> Option<&mut [f32; 3]> {
+        self.v.get_mut(ch)
+    }
+}
 
 /// What a live stroke paints into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +239,10 @@ struct ChanPlan<'a> {
     graph: Option<Arc<Cooked>>,
     /// An effect layer's channel ([`starts_from_below`]): its content starts from the stack below it.
     from_below: bool,
+    /// The project's blend rules.
+    rules: BlendRules,
+    /// The channel stores 0..1 (the measured rules clamp blends to it before the opacity).
+    unit: bool,
 }
 
 enum Content<'a> {
@@ -985,7 +1011,7 @@ fn graph_region(
                 let m = at(&orig, i, 0);
                 let g = graphs::at_texel(plane, x, y, size)[0];
                 if let Some(slot) = data.get_mut(i) {
-                    *slot = m + (blend1(effect.blend, m, g) - m) * opacity;
+                    *slot = m + (inp.project.rules.blend.blended1(effect.blend, m, g, true) - m) * opacity;
                 }
             }
         }
@@ -1011,7 +1037,7 @@ fn graph_region(
                     Cover::Below => cov,
                 };
                 let p = graphs::graph_to_channel(c.kind(), g, linear);
-                let (v, nc) = over_comps(c.components(), effect.blend, v_in, cov, p, a * opacity);
+                let (v, nc) = over_comps(c.components(), inp.project.rules.blend, stores_unit(inp, c), effect.blend, v_in, cov, p, a * opacity);
                 if let Some(px) = data.get_mut(i * 4..i * 4 + 4) {
                     px.copy_from_slice(&[v[0] * nc, v[1] * nc, v[2] * nc, nc]);
                 }
@@ -1383,6 +1409,8 @@ fn plan_node<'a>(
                 start,
                 graph,
                 from_below: starts_from_below(layer, *c),
+                rules: inp.project.rules.blend,
+                unit: stores_unit(inp, *c),
             })
         })
         .collect::<Vec<_>>();
@@ -1448,17 +1476,29 @@ fn blend_chan(c: &ChanPlan, mode: BlendMode, a: [f32; 3], b: [f32; 3]) -> [f32; 
     if c.comps == 3 { blend3(mode, a, b) } else { [blend1(mode, a[0], b[0]); 3] }
 }
 
-/// Lay value `p` with weight `a` over a straight value and coverage (premultiplied "over").
-fn over(c: &ChanPlan, mode: BlendMode, v: [f32; 3], cov: f32, p: [f32; 3], a: f32) -> ([f32; 3], f32) {
-    over_comps(c.comps, mode, v, cov, p, a)
+/// True if set channel `c` stores 0..1: not a float format, and not the signed height (stored as −1..1, which the
+/// measured clamp to 0..1 would cut in half).
+fn stores_unit(inp: &Inputs, c: Channel) -> bool {
+    use texturecraft_core::ChannelFormat as F;
+    if c.kind() == ChannelKind::Signed {
+        return false;
+    }
+    let format = inp.project.texture_set(inp.ts).ok().and_then(|s| s.channels.iter().find(|(ch, _)| *ch == c).map(|(_, f)| *f));
+    !matches!(format.unwrap_or_else(|| F::default_for(c)), F::L16F | F::Rgb16F | F::L32F | F::Rgb32F)
 }
 
-/// [`over`] for a channel of `comps` components.
-fn over_comps(comps: usize, mode: BlendMode, v: [f32; 3], cov: f32, p: [f32; 3], a: f32) -> ([f32; 3], f32) {
+/// Lay value `p` with weight `a` over a straight value and coverage (premultiplied "over").
+fn over(c: &ChanPlan, mode: BlendMode, v: [f32; 3], cov: f32, p: [f32; 3], a: f32) -> ([f32; 3], f32) {
+    over_comps(c.comps, c.rules, c.unit, mode, v, cov, p, a)
+}
+
+/// [`over`] for a channel of `comps` components under `rules` (`unit`: the channel stores 0..1).
+#[allow(clippy::too_many_arguments)]
+fn over_comps(comps: usize, rules: BlendRules, unit: bool, mode: BlendMode, v: [f32; 3], cov: f32, p: [f32; 3], a: f32) -> ([f32; 3], f32) {
     if a <= 0.0 {
         return (v, cov);
     }
-    let b = if cov > 0.0 { if comps == 3 { blend3(mode, v, p) } else { [blend1(mode, v[0], p[0]); 3] } } else { p };
+    let b = if cov > 0.0 { if comps == 3 { rules.blended3(mode, v, p, unit) } else { [rules.blended1(mode, v[0], p[0], unit); 3] } } else { p };
     let nc = a + cov * (1.0 - a);
     (mix3(v, b, a / nc.max(1e-5)), nc)
 }
@@ -1815,6 +1855,8 @@ impl<'a, 'b> Texel<'a, 'b> {
     }
 
     fn mask(&mut self, plan: &MaskPlan) -> f32 {
+        // masks hold 0..1: the measured rules clamp each blend before its opacity
+        let rules = self.inp.project.rules.blend;
         let mut value = plan.background;
         let mut skip = 0;
         if let Some((filtered_index, field)) = plan.start
@@ -1846,18 +1888,18 @@ impl<'a, 'b> Texel<'a, 'b> {
                     }
                     if cov > 0.0 {
                         let layer_value = painted / cov.max(1e-5);
-                        value += (blend1(effect.blend, value, layer_value) - value) * cov * opacity;
+                        value += (rules.blended1(effect.blend, value, layer_value, true) - value) * cov * opacity;
                     }
                 }
                 EffectKind::Fill { source, projection } => {
                     let cooked = effect.graph.as_deref();
                     let fill = self.source(source, projection, ChannelKind::Scalar, cooked)[0];
                     let cover = self.cover(std::iter::once(source), projection) * self.source_alpha(Some(source), cooked, projection);
-                    value += (blend1(effect.blend, value, fill) - value) * opacity * cover;
+                    value += (rules.blended1(effect.blend, value, fill, true) - value) * opacity * cover;
                 }
                 EffectKind::Generator(generator) => {
                     let generated = self.generator(generator, effect.curvature_sizes.as_deref());
-                    value += (blend1(effect.blend, value, generated) - value) * opacity;
+                    value += (rules.blended1(effect.blend, value, generated, true) - value) * opacity;
                 }
                 EffectKind::Levels(levels) => value += (levels.apply(value) - value) * opacity,
                 EffectKind::Filter(filter) => {
@@ -1869,7 +1911,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                     let id = self.baked_color(BakedMap::Id);
                     let within = |picked: &[f32; 3], color: [f32; 3]| (0..3).all(|component| (picked[component] - color[component]).abs() <= *tolerance);
                     let selected = if id.is_some_and(|color| colors.iter().any(|picked| within(picked, color))) { 1.0 } else { 0.0 };
-                    value += (blend1(effect.blend, value, selected) - value) * opacity;
+                    value += (rules.blended1(effect.blend, value, selected, true) - value) * opacity;
                 }
                 EffectKind::Compare { op, value: compared, tolerance } => {
                     let pass = match op {
@@ -1884,7 +1926,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                 // changes nothing
                 EffectKind::Graph { graph, projection } => {
                     if let Some(v) = self.graph_sample(effect.graph.as_deref(), graph.output.as_deref(), projection, graph.unfiltered) {
-                        value += (blend1(effect.blend, value, v[0]) - value) * opacity;
+                        value += (rules.blended1(effect.blend, value, v[0], true) - value) * opacity;
                     }
                 }
                 // Content-only effects; a placeholder passes the mask through unchanged
@@ -1906,7 +1948,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                 // A masked-out group still runs when it records anchors (they hold its inner
                 // stack) or may hold the stop layer.
                 Content::Group(children) if m > 0.0 || n.has_anchor || self.stop.is_some() => {
-                    let mut inner = *acc;
+                    let mut inner = group_start(acc, &n.chans);
                     if self.eval(children, &mut inner) {
                         // stopped inside: the stack below the stop layer is the folder's inner stack
                         *acc = inner;
@@ -2059,7 +2101,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     fn anchors_below(&mut self, full: &[Node], id: LayerId) -> Acc {
         self.anchors.clear();
         self.stop = Some(id);
-        let mut acc = Channel::ALL.map(Channel::default_value);
+        let mut acc = Acc::defaults();
         self.eval(full, &mut acc);
         self.stop = None;
         acc
@@ -2231,13 +2273,45 @@ impl<'a, 'b> Texel<'a, 'b> {
     }
 }
 
-/// Mix a folder's inner stack into the stack outside it by its opacity and mask `m`.
+/// True if folder channel `c` composites its children on their own: under the measured rules, a folder whose mode is
+/// not passthrough.
+fn isolates(c: &ChanPlan) -> bool {
+    c.rules.is_measured() && c.blend != BlendMode::Passthrough
+}
+
+/// The stack a folder's children start from: the stack below it, except on the channels the folder isolates
+/// ([`isolates`]), which start from nothing.
+fn group_start(acc: &Acc, chans: &[ChanPlan]) -> Acc {
+    let mut inner = *acc;
+    for c in chans.iter().filter(|c| isolates(c)) {
+        if let (Some(slot), Some(cov), Some(d)) = (inner.v.get_mut(c.ch), inner.cov.get_mut(c.ch), Channel::ALL.get(c.ch)) {
+            *slot = d.default_value();
+            *cov = 0.0;
+        }
+    }
+    inner
+}
+
+/// Mix a folder's inner stack into the stack outside it by its opacity and mask `m`: a straight mix, or on the
+/// channels it isolates ([`isolates`]) its own composite laid over with the folder's mode.
 fn mix_group(acc: &mut Acc, inner: &Acc, chans: &[ChanPlan], m: f32) {
     for c in chans {
-        if let (Some(a), Some(b)) = (acc.get(c.ch).copied(), inner.get(c.ch).copied())
-            && let Some(slot) = acc.get_mut(c.ch)
-        {
-            *slot = mix3(a, b, c.opacity * m);
+        let (Some(a), Some(b), Some(&ac), Some(&bc)) = (acc.get(c.ch).copied(), inner.get(c.ch).copied(), acc.cov.get(c.ch), inner.cov.get(c.ch)) else {
+            continue;
+        };
+        let (v, cov) = if isolates(c) {
+            // The folder's composite over nothing at its coverage: straight for the blend, as it shows (over the
+            // channel default) for replace, which lays the whole composite.
+            let empty = Channel::ALL.get(c.ch).map_or([0.0; 3], |d| d.default_value());
+            let top = if c.blend == BlendMode::Replace || bc <= 0.0 { b } else { [0, 1, 2].map(|i| (b[i] - empty[i] * (1.0 - bc)) / bc) };
+            mix_over(c.blend, a, ac, top, bc, c.opacity * m, empty, c.unit, c.comps)
+        } else {
+            let w = c.opacity * m;
+            (mix3(a, b, w), ac + (bc - ac) * w)
+        };
+        if let (Some(slot), Some(slot_cov)) = (acc.v.get_mut(c.ch), acc.cov.get_mut(c.ch)) {
+            *slot = v;
+            *slot_cov = cov;
         }
     }
 }
@@ -2245,6 +2319,15 @@ fn mix_group(acc: &mut Acc, inner: &Acc, chans: &[ChanPlan], m: f32) {
 #[inline]
 fn apply(acc: &mut Acc, c: &ChanPlan, v: [f32; 3], cov: f32, mask: f32) {
     let Some(a) = acc.get(c.ch).copied() else { return };
+    if c.rules.is_measured() {
+        let (Some(&below), Some(empty)) = (acc.cov.get(c.ch), Channel::ALL.get(c.ch).map(|d| d.default_value())) else { return };
+        let (out, out_cov) = mix_over(c.blend, a, below, v, cov, c.opacity * mask, empty, c.unit, c.comps);
+        if let (Some(slot), Some(slot_cov)) = (acc.v.get_mut(c.ch), acc.cov.get_mut(c.ch)) {
+            *slot = out;
+            *slot_cov = out_cov;
+        }
+        return;
+    }
     let w = if c.blend == BlendMode::Replace { c.opacity * mask } else { cov * c.opacity * mask };
     let blended = blend_chan(c, c.blend, a, v);
     if let Some(slot) = acc.get_mut(c.ch) {
@@ -2335,7 +2418,7 @@ fn composite_block(
     let lanes: Vec<Lane> = channels.iter().map(|c| Lane { ch: c.index(), n: c.components(), signed: c.kind() == ChannelKind::Signed }).collect();
     let stride: usize = lanes.iter().map(|l| l.n).sum();
     let nlev = split.map_or(0, <[Level]>::len);
-    let defaults: Acc = Channel::ALL.map(Channel::default_value);
+    let defaults = Acc::defaults();
     // Tiles split into bands of rows, so a handful of tiles still keeps every thread busy.
     let bands = TILE / BAND;
     let tasks: Vec<((u32, u32), u32)> = tiles.iter().flat_map(|t| (0..bands).map(move |b| (*t, b))).collect();
@@ -2869,7 +2952,7 @@ pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use texturecraft_core::{ChannelBlend, Effect, Layer, Levels, Procedural, ProceduralKind, TextureSet};
+    use texturecraft_core::{ChannelBlend, CompositeRules, Effect, HeightNormal, Layer, Levels, Procedural, ProceduralKind, TextureSet};
     use texturecraft_geom::primitives;
 
     struct Fixture {
@@ -3493,6 +3576,107 @@ mod tests {
             "hard {hard:?}
 soft {soft:?}"
         );
+    }
+
+    /// A fill of `values` (channel, value, mode, opacity) at the top of the stack, or of folder `parent`.
+    fn rule_fill(f: &mut Fixture, values: &[(Channel, f32, BlendMode, f32)], parent: Option<LayerId>) -> LayerId {
+        let id = f.project.alloc_id();
+        let mut fill = Fill::default();
+        for (c, v, ..) in values {
+            fill.sources.insert(*c, Source::Uniform([*v; 3]));
+        }
+        let mut l = Layer::new(id, "F", LayerKind::Fill(fill), &[]);
+        for (c, _, mode, opacity) in values {
+            l.channels.insert(*c, ChannelBlend { mode: *mode, opacity: *opacity });
+        }
+        f.project.insert_layer(0, l, parent, parent.is_some()).unwrap()
+    }
+
+    /// Roughness and height at one texel under TextureCraft's own and the measured rules.
+    fn both_rules(f: &mut Fixture) -> [(f32, f32); 2] {
+        let mut out = [(0.0, 0.0); 2];
+        for (slot, rules) in out.iter_mut().zip([CompositeRules::default(), CompositeRules::measured(HeightNormal::Backward)]) {
+            f.project.rules = rules;
+            let c = run(f, None);
+            *slot = (c.value(Channel::Roughness, 10, 10)[0], c.value(Channel::Height, 10, 10)[0]);
+        }
+        f.project.rules = CompositeRules::default();
+        out
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 2e-3
+    }
+
+    #[test]
+    fn measured_rules_lay_a_mode_only_where_something_is_below() {
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.4, BlendMode::Multiply, 1.0)], None);
+        let [native, measured] = both_rules(&mut f);
+        let d = Channel::Roughness.default_value()[0];
+        assert!(near(native.0, d * 0.4), "TextureCraft's own: multiplies the channel default: {native:?}");
+        assert!(near(measured.0, 0.4), "measured: over nothing the fill shows: {measured:?}");
+        // over a full fill both multiply
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.6, BlendMode::Normal, 1.0)], None);
+        rule_fill(&mut f, &[(Channel::Roughness, 0.4, BlendMode::Multiply, 1.0)], None);
+        let [native, measured] = both_rules(&mut f);
+        assert!(near(native.0, 0.24) && near(measured.0, 0.24), "{native:?} {measured:?}");
+    }
+
+    #[test]
+    fn measured_rules_clamp_before_opacity_on_unit_channels_only() {
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.8, BlendMode::Normal, 1.0), (Channel::Height, 0.6, BlendMode::Normal, 1.0)], None);
+        rule_fill(&mut f, &[(Channel::Roughness, 0.7, BlendMode::LinearDodge, 0.5), (Channel::Height, 0.7, BlendMode::LinearDodge, 0.5)], None);
+        let [native, measured] = both_rules(&mut f);
+        assert!(near(native.0, 1.0), "0.8 + 0.35 stored as 1: {native:?}");
+        assert!(near(measured.0, 0.9), "measured: 1.5 clamped to 1, then half way from 0.8: {measured:?}");
+        assert!(near(native.1, 0.95) && near(measured.1, 0.95), "height is a float channel: no clamp {native:?} {measured:?}");
+    }
+
+    #[test]
+    fn measured_rules_composite_folders_on_their_own() {
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.6, BlendMode::Normal, 1.0), (Channel::Height, 0.25, BlendMode::Normal, 1.0)], None);
+        let gid = f.project.alloc_id();
+        let mut g = Layer::new(gid, "G", LayerKind::Group { children: vec![], collapsed: false }, &[]);
+        g.channels.insert(Channel::Roughness, ChannelBlend { mode: BlendMode::Normal, opacity: 1.0 });
+        g.channels.insert(Channel::Height, ChannelBlend { mode: BlendMode::LinearDodge, opacity: 1.0 });
+        let gid = f.project.insert_layer(0, g, None, false).unwrap();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.5, BlendMode::Multiply, 1.0), (Channel::Height, 0.1, BlendMode::Normal, 1.0)], Some(gid));
+        let [native, measured] = both_rules(&mut f);
+        // TextureCraft's own: the children blend straight into the stack below
+        assert!(near(native.0, 0.3) && near(native.1, 0.1), "{native:?}");
+        // measured: the folder's composite (0.5 over nothing; height 0.1) laid normal and added
+        assert!(near(measured.0, 0.5) && near(measured.1, 0.35), "{measured:?}");
+        // a folder passing through behaves alike under both
+        for c in [Channel::Roughness, Channel::Height] {
+            f.project.layer_mut(gid).unwrap().channels.insert(c, ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 });
+        }
+        let [native, measured] = both_rules(&mut f);
+        assert_eq!(native, measured);
+        // at half opacity a folder's composite over nothing mixes by its coverage: 0.5 at half strength over 0.6
+        for (c, mode) in [(Channel::Roughness, BlendMode::Normal), (Channel::Height, BlendMode::LinearDodge)] {
+            f.project.layer_mut(gid).unwrap().channels.insert(c, ChannelBlend { mode, opacity: 0.5 });
+        }
+        let [_, measured] = both_rules(&mut f);
+        assert!(near(measured.0, 0.55) && near(measured.1, 0.3), "{measured:?}");
+    }
+
+    #[test]
+    fn measured_formulas_reach_the_composite() {
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.8, BlendMode::Normal, 1.0)], None);
+        rule_fill(&mut f, &[(Channel::Roughness, 0.4, BlendMode::Divide, 1.0)], None);
+        let [native, measured] = both_rules(&mut f);
+        assert!(near(native.0, 1.0) && near(measured.0, 1.0), "both end at 1 (stored): {native:?} {measured:?}");
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.25, BlendMode::Normal, 1.0)], None);
+        rule_fill(&mut f, &[(Channel::Roughness, 0.7, BlendMode::SoftLight, 1.0)], None);
+        let [native, measured] = both_rules(&mut f);
+        assert!(near(native.0, blend1(BlendMode::SoftLight, 0.25, 0.7)), "{native:?}");
+        assert!(near(measured.0, 2.0 * 0.25 * 0.3 + 0.5 * 0.4), "{measured:?}");
     }
 
     #[test]
