@@ -14,6 +14,8 @@ texturecraft-automation = { workspace = true }
 texturecraft-engine = { workspace = true }
 texturecraft-graph = { workspace = true }
 serde_json = { workspace = true }
+# Free memory, to size how many projects `import <folder> --jobs` converts at once.
+sysinfo = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

@@ -12,6 +12,7 @@ use texturecraft_automation::{AuthorizedWorkspace, BridgeClient, Filesystem, Hea
 use texturecraft_engine::core::PROJECT_EXT;
 use texturecraft_engine::formats::{MeshReport, import_mesh, import_mesh_bytes, mesh_report};
 
+mod batch_import;
 mod graph;
 
 const USAGE: &str = "\
@@ -48,6 +49,10 @@ USAGE:
       adds a locked layer holding the original's result where the layers do not reproduce it.
       --result-cache keeps graph renders in <dir> and reuses them in later imports (at most
       --result-cache-gb GB, default 20).
+  texturecraft-cli import <folder> <out folder> [--jobs <n>] [the import flags above]
+      Convert every project file below <folder>, each saved under the same relative path in
+      <out folder>; one result line per project. --jobs converts up to n at once (default 1)
+      within a memory budget. Exits with an error when any project failed.
   texturecraft-cli verify <project file> [<imported.tcraft>] [--set <name>] [--border <texels>] [--table]
                    [--max-resolution <px>] [--original-correction] [--native-filters] [--no-replay]
                    [--graphs decompile|keep]
@@ -85,7 +90,7 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("new", &["--resolution"], &["--sample"]),
     (
         "import",
-        &["--max-resolution", "--graphs", "--result-cache", "--result-cache-gb"],
+        &["--max-resolution", "--graphs", "--result-cache", "--result-cache-gb", "--jobs"],
         &["--original-on-top", "--original-correction", "--native-filters", "--no-measure", "--no-replay"],
     ),
     ("verify", &["--set", "--border", "--max-resolution", "--graphs"], &["--table", "--original-correction", "--native-filters", "--no-replay"]),
@@ -330,11 +335,30 @@ fn import_params(a: &Args, input: &str) -> Result<Value, String> {
 
 fn import(a: &Args) -> R {
     let (input, out) = (a.pos(0, "<project file>")?, a.pos(1, "<out.tcraft>")?);
+    if Path::new(input).is_dir() {
+        return import_folder(a, input, out);
+    }
     let p = import_params(a, input)?;
     let mut h = open("builtin:cube", Some(128))?;
     let reply = h.command_run("file.importProject", p).map_err(s)?;
     print_json(&json!({"file": input, "import": reply.get("import").cloned().unwrap_or(Value::Null)}))?;
     save(&mut h, out)
+}
+
+/// `import <folder> <out folder>`: every project below the folder ([`batch_import`]).
+fn import_folder(a: &Args, dir: &str, out: &str) -> R {
+    let jobs = a.num::<usize>("--jobs")?.unwrap_or(1);
+    if !(1..=batch_import::MAX_JOBS).contains(&jobs) {
+        return Err(format!("--jobs must be 1 to {}", batch_import::MAX_JOBS));
+    }
+    import_params(a, dir)?;
+    batch_import::convert_folder(Path::new(dir), Path::new(out), jobs, |file, target| {
+        let p = import_params(a, &file.display().to_string())?;
+        let mut h = open("builtin:cube", Some(128))?;
+        let reply = h.command_run("file.importProject", p).map_err(s)?;
+        h.save(Some(&target.display().to_string())).map_err(s)?;
+        Ok(reply.get("import").cloned().unwrap_or(Value::Null))
+    })
 }
 
 fn verify(a: &Args) -> R {
