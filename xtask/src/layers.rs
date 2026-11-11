@@ -17,6 +17,7 @@ pub const TABLE: &[(&str, u8)] = &[
     ("geom", 0),
     ("import-reader", 0),
     ("graph", 0),
+    ("result-cache", 0),
     ("compose", 1),
     ("import-verify", 1),
     ("bake", 1),

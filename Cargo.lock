@@ -4518,6 +4518,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "texturecraft-result-cache"
+version = "0.6.1"
+dependencies = [
+ "lz4_flex",
+]
+
+[[package]]
 name = "texturecraft-texel"
 version = "0.6.1"
 
