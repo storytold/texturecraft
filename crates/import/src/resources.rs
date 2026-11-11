@@ -19,7 +19,7 @@ use crate::error::PartError;
 use crate::image::Rgba;
 
 /// URL scheme of shelf resources (file-format data).
-const SHELF_SCHEME: &str = "resource://";
+pub(crate) const SHELF_SCHEME: &str = "resource://";
 /// URL scheme naming a texture set's mesh map slot (file-format data).
 const ALIAS_SCHEME: &str = "resourcealias:";
 /// What separates a resource's name from its id in a URL (file-format data).

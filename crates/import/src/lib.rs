@@ -30,6 +30,7 @@ pub mod graph_uses;
 pub mod image;
 pub mod import;
 pub mod layers;
+pub mod library;
 pub mod mesh;
 pub mod options;
 pub mod polygon_fill;

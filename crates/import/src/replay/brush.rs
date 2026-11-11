@@ -111,7 +111,7 @@ pub fn step(
 }
 
 /// The brush of `effect` (its defaults when it has none).
-fn map_brush(effect: &PaintEffect, tip: super::ReplayTip, notes: &mut Vec<String>) -> ReplayBrush {
+pub(crate) fn map_brush(effect: &PaintEffect, tip: super::ReplayTip, notes: &mut Vec<String>) -> ReplayBrush {
     let default = ProjectBrush::default();
     let b = effect.brush.as_ref().unwrap_or(&default);
     let default_emitter = texturecraft_import_reader::model::StrokeEmitter::default();

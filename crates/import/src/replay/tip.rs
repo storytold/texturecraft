@@ -162,6 +162,25 @@ pub fn stencil(source: &ProjectSource, images: &ProjectImages, graphs: Option<&G
     }
 }
 
+/// The round shape `alpha` is (the first entry is the alpha), as the hardness of TextureCraft's round tip, and whether
+/// that is the same curve: the newer round shape is, the older one is approximated by a falloff starting where its own
+/// does. No alpha is the older shape, soft. `None` for any other alpha (bitmaps, other graphs, constants).
+pub fn round_tip_hardness(alpha: &[ProjectSource]) -> Option<(f32, bool)> {
+    let old = |h: f32| (OLD_SHAPE_START + (1.0 - OLD_SHAPE_START) * h, false);
+    match alpha.first() {
+        None => Some(old(0.0)),
+        Some(ProjectSource::Procedural(p)) => {
+            let q = p.procedural.as_ref()?;
+            match (q.name(), round_hardness(&q.tweaks)) {
+                (ROUND_SHAPE, Some(h)) => Some((h, true)),
+                (OLD_ROUND_SHAPE, Some(h)) => Some(old(h)),
+                _ => None,
+            }
+        }
+        Some(_) => None,
+    }
+}
+
 /// The hardness of a round shape with no other setting away from its default; `None` for any other shape.
 fn round_hardness(tweaks: &[Tweak]) -> Option<f32> {
     let mut hardness = 0.0;
