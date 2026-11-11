@@ -180,6 +180,30 @@ fn height_becomes_normal_detail() {
 }
 
 #[test]
+fn measured_height_normal_follows_the_project_rules() {
+    use texturecraft_core::{CompositeRules, HeightNormal};
+    let mut fx = Fx::new(&[Channel::BaseColor, Channel::Height]);
+    // A ramp of 1/160 per texel across.
+    fx.set_all(Channel::Height, |x, _| [x as f32 / 160.0; 3]);
+    fx.project.texture_sets[0].height_strength = 8.0;
+    let tilt = |fx: &Fx| {
+        let mut opts = ExportOptions::new(builtin_preset("Separate maps").unwrap());
+        opts.bit_depth_override = Some(16);
+        let p = decode(find(&fx.render(&opts), "_normal.png")).to_rgb16();
+        let p = p.get_pixel(30, 30);
+        let (nx, nz) = (p[0] as f32 / 65535.0 * 2.0 - 1.0, p[2] as f32 / 65535.0 * 2.0 - 1.0);
+        -nx / nz
+    };
+    let native = tilt(&fx);
+    assert!((native - 8.0 * RES as f32 / 16.0 / 160.0).abs() < 2e-3, "TextureCraft's own: block / 16 per unit: {native}");
+    for filter in [HeightNormal::Sobel, HeightNormal::Backward] {
+        fx.project.rules = CompositeRules::measured(filter);
+        let measured = tilt(&fx);
+        assert!((measured - 8.0 * RES as f32 * 0.01 / 160.0).abs() < 2e-3, "{filter:?}: block / 100 per unit: {measured}");
+    }
+}
+
+#[test]
 fn reoriented_normal_mapping_identities() {
     let d = Vec3::new(0.2, -0.3, 0.9).normalize();
     assert!((rnm(Vec3::Z, d) - d).length() < 1e-5);

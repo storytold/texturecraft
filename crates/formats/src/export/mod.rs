@@ -18,7 +18,8 @@ use std::io::Cursor;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use texturecraft_compose::{BakedMaps, Composite};
-use texturecraft_core::{AoMixing, BakedMap, BlockScales, Channel, ChannelKind, NormalFormat, NormalMixing, Project, TextureSet};
+use texturecraft_core::rules::MEASURED_SLOPE;
+use texturecraft_core::{AoMixing, BakedMap, BlockScales, Channel, ChannelKind, HeightNormal, NormalFormat, NormalMixing, Project, TextureSet};
 use texturecraft_geom::glam::Vec3;
 use texturecraft_texel::{ColorSpace, DilationMap, linear_to_srgb};
 
@@ -573,6 +574,8 @@ struct Sampler<'a> {
     /// Normal convention overriding every normal output.
     normal_override: Option<NormalFormat>,
     project_normal: NormalFormat,
+    /// How the height channel turns into normals (the project's rules).
+    height_rule: HeightNormal,
 }
 
 fn unpack(v: [f32; 3]) -> Vec3 {
@@ -607,7 +610,8 @@ impl Sampler<'_> {
         self.coverage.get((y as usize) * self.res as usize + x as usize).copied().unwrap_or(false)
     }
 
-    /// Normal from the height channel (3×3 Sobel; uncovered neighbours repeat the centre).
+    /// Normal from the height channel (3×3 Sobel, or the project's measured filter and slope; uncovered neighbours
+    /// repeat the centre).
     fn height_normal(&self, x: u32, y: u32) -> Vec3 {
         let center = self.channel(Channel::Height, At::Texel(x, y))[0];
         // Clamped to the texel's UV tile.
@@ -617,6 +621,11 @@ impl Sampler<'_> {
             let (sx, sy) = ((x as i64 + dx).clamp(x0, x0 + last) as u32, (y as i64 + dy).clamp(y0, y0 + last) as u32);
             if self.covered(sx, sy) { self.channel(Channel::Height, At::Texel(sx, sy))[0] } else { center }
         };
+        if let Some((gx, gy)) = self.height_rule.gradient(h) {
+            // measured: MEASURED_SLOPE per unit of height per UV unit
+            let s = self.set.height_strength * self.tile_res as f32 * self.scales.at(x, y) * MEASURED_SLOPE;
+            return Vec3::new(-gx * s, gy * s, 1.0).try_normalize().unwrap_or(Vec3::Z);
+        }
         let gx = (h(1, -1) + 2.0 * h(1, 0) + h(1, 1) - h(-1, -1) - 2.0 * h(-1, 0) - h(-1, 1)) / 8.0;
         let gy = (h(-1, 1) + 2.0 * h(0, 1) + h(1, 1) - h(-1, -1) - 2.0 * h(0, -1) - h(1, -1)) / 8.0;
         let s = self.set.height_strength * self.tile_res as f32 * self.scales.at(x, y) / HEIGHT_SPAN;
@@ -624,12 +633,16 @@ impl Sampler<'_> {
         Vec3::new(-gx * s, gy * s, 1.0).try_normalize().unwrap_or(Vec3::Z)
     }
 
-    /// The final tangent-space normal (OpenGL): baked normal ⊕ (height ⊕ normal channel).
+    /// The final tangent-space normal (OpenGL): baked normal ⊕ (height ⊕ normal channel), or under the measured
+    /// height rule (baked normal ⊕ height) ⊕ normal channel.
     fn final_normal(&self, at: At) -> Vec3 {
         let At::Texel(x, y) = at else { return Vec3::Z };
         let base = if self.set.baked.contains(&BakedMap::Normal) { unpack(self.baked(BakedMap::Normal, at)) } else { Vec3::Z };
         let mut detail = if self.set.has_channel(Channel::Normal) { unpack(self.channel(Channel::Normal, at)) } else { Vec3::Z };
         if self.set.normal_mixing == NormalMixing::Combine && self.set.has_channel(Channel::Height) && self.set.height_strength != 0.0 {
+            if self.height_rule.is_measured() {
+                return rnm(rnm(base, self.height_normal(x, y)), detail);
+            }
             detail = rnm(self.height_normal(x, y), detail);
         }
         rnm(base, detail)
@@ -714,6 +727,7 @@ pub fn render_maps(input: &ExportInput, opts: &ExportOptions) -> Result<Vec<Expo
         scales: set.block_scales(),
         normal_override: opts.normal_format,
         project_normal: input.project.normal_format,
+        height_rule: input.project.rules.height_normal,
     };
     planned
         .into_iter()
