@@ -121,12 +121,7 @@ pub fn compute(kind: &str, id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, c
     let need = |slot: &str| -> Result<&Tex, Error> { ins.get(slot).map(|r| r.as_ref()).ok_or_else(|| Error::MissingInput(id, slot.to_string())) };
     Ok(Some(match kind {
         "levels_mid" => {
-            let ch = |k: &str, c: &str, d: f32| n.nums.get(&format!("{k}_{c}")).copied().unwrap_or_else(|| f(k, d));
-            let params: [[f32; 5]; 4] =
-                ["r", "g", "b", "a"].map(|c| [ch("low", c, 0.0), ch("high", c, 1.0), ch("mid", c, 0.5), ch("out_low", c, 0.0), ch("out_high", c, 1.0)]);
-            // a node holding floats keeps output bounds outside 0..1 (measured: bandage #46 and fabric_tear #167, single floats with
-            // bounds -0.15..0.15 and -0.2..0.2, go below zero: mean 9.8 and 19.5 to 0); integer nodes limit them first
-            let float = !matches!(n.nums.get("ofmt").map(|v| v.round() as u32), Some(COMPILED_8_BIT | COMPILED_16_BIT));
+            let (params, float) = levels_params(n);
             need("in")?.map(move |p| {
                 let mut o = p;
                 for (k, v) in o.iter_mut().enumerate() {
@@ -143,37 +138,10 @@ pub fn compute(kind: &str, id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, c
         }
         "transform_matrix" => {
             let bg = [f("bg_r", 0.0), f("bg_g", 0.0), f("bg_b", 0.0), f("bg_a", 0.0)];
-            transform_matrix(n, need("in")?, ctx.size, bg)
+            transform_matrix(n, need("in")?, ctx.size, bg, crate::tex::ToImage)
         }
-        "box_blur" => {
-            let (i, tx, ty) = (f("intensity", BLUR_DEFAULT_INTENSITY), f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
-            let t = need("in")?;
-            let (ax, ay) = (f("aspect_x", 1.0), f("aspect_y", 1.0));
-            let (rx, ry) = (i * ax * t.w as f32 / INTENSITY_SPAN, i * ay * t.h as f32 / INTENSITY_SPAN);
-            let ofmt = f("ofmt", 0.0).round() as u32;
-            if matches!(ofmt, COMPILED_8_BIT | COMPILED_16_BIT | COMPILED_HALF) {
-                // a node holding 8 bits runs across first and holds the pass in 8 bits too (measured on synthetic graphs at radius 0.9 to 2.4:
-                // 99 to 100% of pixels exact, where one rounding at the end gets 86 to 92%)
-                held_blur(t, rx, ry, tx, ty, ofmt)
-            } else {
-                box_axis(&box_columns(t, ry, ty), rx, tx)
-            }
-        }
-        "line_blur" => {
-            let (i, tx, ty) = (f("intensity", LINE_BLUR_DEFAULT_INTENSITY), f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
-            let t = need("in")?;
-            let aspect = [f("aspect_x", 1.0), f("aspect_y", 1.0)];
-            let angle = f("angle", 0.0);
-            let format = f("ofmt", 0.0).round() as u32;
-            let (sn, cs) = math::sin_cos(angle * std::f32::consts::TAU);
-            if sn.abs() < AXIS_SLACK {
-                compiled_box_axis(t, i * aspect[0] * t.w as f32 / INTENSITY_SPAN, tx, format)
-            } else if cs.abs() < AXIS_SLACK {
-                transposed(&compiled_box_axis(&transposed(t), i * aspect[1] * t.h as f32 / INTENSITY_SPAN, ty, format))
-            } else {
-                line_blur(t, i, aspect, angle, tx, ty).ok_or_else(|| Error::BadParam(id, format!("line blur longer than {MAX_SHEARED_SIDE} pixels")))?
-            }
-        }
+        "box_blur" => box_blur(n, need("in")?),
+        "line_blur" => line_blur_node(id, n, need("in")?)?,
         "laplacian_sharpen" => {
             let (i, tx, ty) = (f("intensity", SHARPEN_DEFAULT_INTENSITY), f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
             let t = need("in")?;
@@ -196,49 +164,8 @@ pub fn compute(kind: &str, id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, c
                 })
             }
         }
-        "dir_warp" => {
-            let (t, map) = (need("in")?, need("map")?);
-            let (sn, cs) = math::sin_cos(f("angle", 0.0) * std::f32::consts::TAU);
-            let k = f("intensity", DIR_WARP_DEFAULT_INTENSITY) / INTENSITY_SPAN;
-            // the node's pixel aspect scales the move along each axis (measured by fitting the move to the reference renderer's taps:
-            // a constant (2, 2) or (0.5, 1), or `2 * 2^min(size.yx - size, 0)`, is the factor; no aspect moves by 1)
-            let (ax, ay) = (f("aspect_x", 1.0), f("aspect_y", 1.0));
-            let (off, tx, ty) = (f("map_offset", 0.0), f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
-            Tex::from_fn(t.w, t.h, |u, v| {
-                let d = k * (crate::tex::lum(map.sample(u, v)) - off);
-                sample_edge_stepped(t, u + d * cs * ax, v + d * sn * ay, tx, ty)
-            })
-        }
-        "grad_warp" => {
-            let (t, map) = (need("in")?, need("map")?);
-            let k = f("intensity", GRAD_WARP_DEFAULT_INTENSITY) / INTENSITY_SPAN;
-            // the aspect scales the move along each axis (measured: mg_dripping_rust, 0.4967, mean 2.6 to 0.007)
-            let (ax, ay) = (f("aspect_x", 1.0), f("aspect_y", 1.0));
-            let (mw, mh) = (map.w, map.h);
-            let (tx, ty) = (f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
-            let at = |x: usize, y: usize| crate::tex::lum(map.px_at(y * mw + x));
-            // slopes in uv units on the map's own pixels, from the pixel before (backward differences, wrapped). A result of
-            // another size reads them bilinearly (measured: mg_dripping_rust, a 512 map under a 256 warp, mean 9.8 to 0.06).
-            // An axis that doesn't repeat keeps its edge pixel there, so its first row or column has no slope, and the read
-            // keeps the input's edge value (measured: ornament_leaf, whose map is bright on its left edge only: a wrapped
-            // slope moved the leaf into the first column, which a later clamped read drew as stripes across the tile).
-            let before = |x: usize, n: usize, wrap: bool| if wrap { (x + n - 1) % n } else { x.saturating_sub(1) };
-            let slopes = Tex::from_fn(mw, mh, |u, v| {
-                let (x, y) = (((u * mw as f32) as usize).min(mw - 1), ((v * mh as f32) as usize).min(mh - 1));
-                let gx = (at(x, y) - at(before(x, mw, tx), y)) * mw as f32;
-                let gy = (at(x, y) - at(x, before(y, mh, ty))) * mh as f32;
-                [gx, gy, 0.0, 0.0]
-            });
-            let [w, h] = ctx.size;
-            Tex::from_fn(w, h, |u, v| {
-                let g = slopes.sample(u, v);
-                if tx && ty {
-                    sample_stepped(t, u + k * ax * g[0], v + k * ay * g[1])
-                } else {
-                    sample_edge_stepped(t, u + k * ax * g[0], v + k * ay * g[1], tx, ty)
-                }
-            })
-        }
+        "dir_warp" => dir_warp(n, need("in")?, need("map")?),
+        "grad_warp" => grad_warp(n, need("in")?, need("map")?, ctx.size),
         "pattern_program" => {
             let name = n.strs.get("program").cloned().unwrap_or_default();
             let program = ctx.lib.get(&name).ok_or_else(|| Error::BadParam(id, format!("no pattern program named '{name}'")))?;
@@ -270,23 +197,111 @@ pub fn compute(kind: &str, id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, c
     }))
 }
 
-/// The settings of a `transform_matrix` node that decide whether it keeps a grey input grey: the background colour it
-/// fades to past an edge that doesn't repeat, and whether each axis repeats.
-pub(crate) fn transform_matrix_bg(n: &Node) -> ([f32; 4], bool, bool) {
+/// A `box_blur` node on an image of pixels `P`.
+pub(crate) fn box_blur<P: Pixel>(n: &Node, t: &Image<P>) -> Image<P> {
     let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
-    ([f("bg_r", 0.0), f("bg_g", 0.0), f("bg_b", 0.0), f("bg_a", 0.0)], f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5)
+    let (i, tx, ty) = (f("intensity", BLUR_DEFAULT_INTENSITY), f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
+    let (ax, ay) = (f("aspect_x", 1.0), f("aspect_y", 1.0));
+    let (rx, ry) = (i * ax * t.w as f32 / INTENSITY_SPAN, i * ay * t.h as f32 / INTENSITY_SPAN);
+    let ofmt = f("ofmt", 0.0).round() as u32;
+    if matches!(ofmt, COMPILED_8_BIT | COMPILED_16_BIT | COMPILED_HALF) {
+        // a node holding 8 bits runs across first and holds the pass in 8 bits too (measured on synthetic graphs at radius 0.9 to 2.4:
+        // 99 to 100% of pixels exact, where one rounding at the end gets 86 to 92%)
+        held_blur(t, rx, ry, tx, ty, ofmt)
+    } else {
+        box_axis(&box_columns(t, ry, ty), rx, tx)
+    }
 }
 
-/// Whether a `transform_matrix` keeps a grey, opaque input grey and opaque bit for bit: its background is grey, and the
-/// alpha it gives (`bg + (1 - bg) * k` for a coverage `k`, always 1 when both axes repeat) is exactly 1.
-pub(crate) fn transform_keeps_grey(bg: [f32; 4], tx: bool, ty: bool) -> bool {
-    let grey = bg[0].to_bits() == bg[1].to_bits() && bg[1].to_bits() == bg[2].to_bits();
-    let opaque = if tx && ty { (bg[3] + (1.0 - bg[3]) * 1.0).to_bits() == 1.0f32.to_bits() } else { bg[3].to_bits() == 1.0f32.to_bits() };
-    grey && opaque
+/// A `line_blur` node on an image of pixels `P`.
+pub(crate) fn line_blur_node<P: Pixel>(id: u32, n: &Node, t: &Image<P>) -> Result<Image<P>, Error> {
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    let (i, tx, ty) = (f("intensity", LINE_BLUR_DEFAULT_INTENSITY), f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
+    let aspect = [f("aspect_x", 1.0), f("aspect_y", 1.0)];
+    let angle = f("angle", 0.0);
+    let format = f("ofmt", 0.0).round() as u32;
+    let (sn, cs) = math::sin_cos(angle * std::f32::consts::TAU);
+    Ok(if sn.abs() < AXIS_SLACK {
+        compiled_box_axis(t, i * aspect[0] * t.w as f32 / INTENSITY_SPAN, tx, format)
+    } else if cs.abs() < AXIS_SLACK {
+        transposed(&compiled_box_axis(&transposed(t), i * aspect[1] * t.h as f32 / INTENSITY_SPAN, ty, format))
+    } else {
+        line_blur(t, i, aspect, angle, tx, ty).ok_or_else(|| Error::BadParam(id, format!("line blur longer than {MAX_SHEARED_SIDE} pixels")))?
+    })
+}
+
+/// A `dir_warp` node: image `t` of pixels `P` moved along a direction by the luminance of `map`.
+pub(crate) fn dir_warp<P: Pixel, M: crate::tex::Texels>(n: &Node, t: &Image<P>, map: &M) -> Image<P> {
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    let (sn, cs) = math::sin_cos(f("angle", 0.0) * std::f32::consts::TAU);
+    let k = f("intensity", DIR_WARP_DEFAULT_INTENSITY) / INTENSITY_SPAN;
+    // the node's pixel aspect scales the move along each axis (measured by fitting the move to the reference renderer's taps:
+    // a constant (2, 2) or (0.5, 1), or `2 * 2^min(size.yx - size, 0)`, is the factor; no aspect moves by 1)
+    let (ax, ay) = (f("aspect_x", 1.0), f("aspect_y", 1.0));
+    let (off, tx, ty) = (f("map_offset", 0.0), f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
+    Image::from_fn(t.w, t.h, |u, v| {
+        let d = k * (crate::tex::lum(map.sample(u, v).rgba()) - off);
+        sample_edge_stepped(t, u + d * cs * ax, v + d * sn * ay, tx, ty)
+    })
+}
+
+/// A `grad_warp` node: image `t` of pixels `P` moved along the slopes of the luminance of `map`, to `size`.
+pub(crate) fn grad_warp<P: Pixel, M: crate::tex::Texels>(n: &Node, t: &Image<P>, map: &M, size: [usize; 2]) -> Image<P> {
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    let k = f("intensity", GRAD_WARP_DEFAULT_INTENSITY) / INTENSITY_SPAN;
+    // the aspect scales the move along each axis (measured: mg_dripping_rust, 0.4967, mean 2.6 to 0.007)
+    let (ax, ay) = (f("aspect_x", 1.0), f("aspect_y", 1.0));
+    let (mw, mh) = (map.width(), map.height());
+    let (tx, ty) = (f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
+    let at = |x: usize, y: usize| crate::tex::lum(map.texel(y * mw + x).rgba());
+    // slopes in uv units on the map's own pixels, from the pixel before (backward differences, wrapped). A result of
+    // another size reads them bilinearly (measured: mg_dripping_rust, a 512 map under a 256 warp, mean 9.8 to 0.06).
+    // An axis that doesn't repeat keeps its edge pixel there, so its first row or column has no slope, and the read
+    // keeps the input's edge value (measured: ornament_leaf, whose map is bright on its left edge only: a wrapped
+    // slope moved the leaf into the first column, which a later clamped read drew as stripes across the tile).
+    let before = |x: usize, n: usize, wrap: bool| if wrap { (x + n - 1) % n } else { x.saturating_sub(1) };
+    let slopes = Tex::from_fn(mw, mh, |u, v| {
+        let (x, y) = (((u * mw as f32) as usize).min(mw - 1), ((v * mh as f32) as usize).min(mh - 1));
+        let gx = (at(x, y) - at(before(x, mw, tx), y)) * mw as f32;
+        let gy = (at(x, y) - at(x, before(y, mh, ty))) * mh as f32;
+        [gx, gy, 0.0, 0.0]
+    });
+    let [w, h] = size;
+    Image::from_fn(w, h, |u, v| {
+        let g = slopes.sample(u, v);
+        if tx && ty { sample_stepped(t, u + k * ax * g[0], v + k * ay * g[1]) } else { sample_edge_stepped(t, u + k * ax * g[0], v + k * ay * g[1], tx, ty) }
+    })
+}
+
+/// The background colour of a `transform_matrix` node: what it fades to past an edge that doesn't repeat.
+pub(crate) fn transform_matrix_bg(n: &Node) -> [f32; 4] {
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    [f("bg_r", 0.0), f("bg_g", 0.0), f("bg_b", 0.0), f("bg_a", 0.0)]
+}
+
+/// The alpha a `transform_matrix` gives a grey image of alpha `alpha` (1 or +0), when its result is grey with one alpha
+/// of 1 or +0 bit for bit: its background is grey, and the alpha it computes is the same everywhere. A bilinear read
+/// gives `bg + (alpha - bg) * k` for the coverage `k` (always 1 where both axes repeat), a nearest one `alpha`, or `bg`
+/// past an edge that doesn't repeat.
+pub(crate) fn transform_grey_alpha(n: &Node, alpha: f32) -> Option<f32> {
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    let bg = transform_matrix_bg(n);
+    let (tx, ty, bilinear) = (f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5, f("filter", 1.0) > 0.5);
+    if bg[0].to_bits() != bg[1].to_bits() || bg[1].to_bits() != bg[2].to_bits() {
+        return None;
+    }
+    let out = if tx && ty {
+        if bilinear { bg[3] + (alpha - bg[3]) * 1.0 } else { alpha }
+    } else if bg[3].to_bits() == alpha.to_bits() {
+        alpha
+    } else {
+        return None;
+    };
+    crate::tex::grey_alpha_ok(out).then_some(out)
 }
 
 /// A `transform_matrix` node on an image of pixels `P` (RGBA, or grey when [`transform_keeps_grey`]), `bg` its background.
-pub(crate) fn transform_matrix<P: Pixel>(n: &Node, t: &Image<P>, size: [usize; 2], bg: P) -> Image<P> {
+pub(crate) fn transform_matrix<P: Pixel, E: crate::tex::Emit<P>>(n: &Node, t: &Image<P>, size: [usize; 2], bg: P, out: E) -> E::Out {
     let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
     let m = [f("m00", 1.0), f("m01", 0.0), f("m10", 0.0), f("m11", 1.0)];
     let (ox, oy) = (f("offset_x", 0.0), f("offset_y", 0.0));
@@ -336,11 +351,41 @@ pub(crate) fn transform_matrix<P: Pixel>(n: &Node, t: &Image<P>, size: [usize; 2
     // with the result's)
     let reduces = math::hypot(scaled[0], scaled[1]).max(math::hypot(scaled[2], scaled[3])) > 1.0;
     let fade = if mip < MIP_AUTOMATIC_TOO && level > 0 && reduces { [0, 0] } else { [w, h] };
-    Image::from_fn(w, h, |u, v| {
+    out.emit(w, h, |u, v| {
         let (x, y) = (u - 0.5, v - 0.5);
         let (su, sv) = (m[0] * x + m[2] * y + 0.5 + ox, m[1] * x + m[3] * y + 0.5 + oy);
         if bilinear { sample_bilinear(s, su, sv, tx, ty, bg, fade) } else { sample_nearest(s, su, sv, tx, ty, bg) }
     })
+}
+
+/// A `levels_mid` node's settings per channel (low, high, mid, out low, out high for r, g, b, a), and whether it holds
+/// floats.
+fn levels_params(n: &Node) -> ([[f32; 5]; 4], bool) {
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    let ch = |k: &str, c: &str, d: f32| n.nums.get(&format!("{k}_{c}")).copied().unwrap_or_else(|| f(k, d));
+    let params: [[f32; 5]; 4] =
+        ["r", "g", "b", "a"].map(|c| [ch("low", c, 0.0), ch("high", c, 1.0), ch("mid", c, 0.5), ch("out_low", c, 0.0), ch("out_high", c, 1.0)]);
+    // a node holding floats keeps output bounds outside 0..1 (measured: bandage #46 and fabric_tear #167, single floats with
+    // bounds -0.15..0.15 and -0.2..0.2, go below zero: mean 9.8 and 19.5 to 0); integer nodes limit them first
+    let float = !matches!(n.nums.get("ofmt").map(|v| v.round() as u32), Some(COMPILED_8_BIT | COMPILED_16_BIT));
+    (params, float)
+}
+
+/// `levels_mid` on a grey image, when its result is grey: the same settings for red, green and blue, and an alpha that
+/// comes out 1 or +0. The result and its alpha.
+pub(crate) fn levels_mid_grey(n: &Node, t: crate::tex::GreyIn) -> Option<(crate::tex::Grey, f32)> {
+    let (params, float) = levels_params(n);
+    let level = move |v: f32, q: &[f32; 5]| if float { levels_value_unbounded(v, q) } else { levels_value(v, q) };
+    let [r, g, b, a] = params;
+    let same = |x: &[f32; 5], y: &[f32; 5]| x.iter().zip(y).all(|(x, y)| x.to_bits() == y.to_bits());
+    if !same(&r, &g) || !same(&g, &b) {
+        return None;
+    }
+    let alpha = level(t.alpha(), &a);
+    if !crate::tex::grey_alpha_ok(alpha) {
+        return None;
+    }
+    Some((t.floats().map(move |v| level(v, &r)), alpha))
 }
 
 /// A matrix that only flips or swaps the axes.
@@ -514,7 +559,7 @@ fn stepped_with<P: Pixel>(t: &Image<P>, u: f32, v: f32, at: impl Fn(i64, i64) ->
 /// Each row averaged over a box reaching `r` pixels from every pixel's centre, on the row as a stepped function; beyond
 /// the ends the row repeats or keeps its edge value.
 /// A blur on a node holding 8 or 16 bits or half floats: across, rounded to that, then down.
-fn held_blur(t: &Tex, rx: f32, ry: f32, tx: bool, ty: bool, format: u32) -> Tex {
+fn held_blur<P: Pixel>(t: &Image<P>, rx: f32, ry: f32, tx: bool, ty: bool, format: u32) -> Image<P> {
     let mut across = compiled_box_axis(t, rx, tx, format);
     crate::ops::apply_format(&mut across, format);
     transposed(&compiled_box_axis(&transposed(&across), ry, ty, format))
@@ -530,7 +575,7 @@ fn held_blur(t: &Tex, rx: f32, ry: f32, tx: bool, ty: bool, format: u32) -> Tex 
 ///
 /// The result is the sum over the width, unrounded; the node's format rounds it. Other formats and rows that don't tile keep [`box_axis`].
 /// Measurement "What nodes hold and how they read" ("Box blur along an axis on an integer node"); the rule table `box_blur_plan.tsv`.
-pub(crate) fn compiled_box_axis(t: &Tex, r: f32, wrap: bool, format: u32) -> Tex {
+pub(crate) fn compiled_box_axis<P: Pixel>(t: &Image<P>, r: f32, wrap: bool, format: u32) -> Image<P> {
     let r = f64::from(r.abs());
     if r <= 0.5 {
         return t.clone();
@@ -556,13 +601,13 @@ pub(crate) fn compiled_box_axis(t: &Tex, r: f32, wrap: bool, format: u32) -> Tex
     crate::tex::par_rows(&mut out.px, w, |start, chunk| {
         // (the chunks are whole rows from row `start / w` on)
         for (dst, row) in chunk.chunks_mut(w).zip(t.px.chunks(w.max(1)).skip(start / w.max(1))) {
-            for ch in 0..4 {
+            for ch in 0..P::CH {
                 // (a whole step in single precision comes back up to 0.004 off it)
                 let units = |v: f32| {
                     let u = f64::from(v) * STEPS_16;
                     if (u - u.round()).abs() < WHOLE_STEP_SLACK { u.round() } else { u }
                 };
-                let mut levels: Vec<Vec<f64>> = vec![row.iter().map(|p| units(get(p, ch))).collect()];
+                let mut levels: Vec<Vec<f64>> = vec![row.iter().map(|p| units(p.ch(ch))).collect()];
                 for l in 0..top {
                     let Some(below) = levels.get(l) else { break };
                     if below.len() < 2 {
@@ -597,9 +642,8 @@ pub(crate) fn compiled_box_axis(t: &Tex, r: f32, wrap: bool, format: u32) -> Tex
                     } else {
                         mean
                     };
-                    if let Some(d) = d.get_mut(ch) {
-                        *d = (held / STEPS_16) as f32;
-                    }
+                    let v = (held / STEPS_16) as f32;
+                    *d = P::from_ch(|c| if c == ch { v } else { d.ch(c) });
                 }
             }
         }
@@ -638,7 +682,7 @@ fn pyramid_sum(levels: &[Vec<f64>], s: i64, e: i64, l: usize, top: usize) -> f64
     weight * (at(s) + at(e)) + pyramid_sum(levels, (s + 1).div_euclid(2), (e - 2).div_euclid(2), l + 1, top)
 }
 
-fn box_axis(t: &Tex, r: f32, wrap: bool) -> Tex {
+fn box_axis<P: Pixel>(t: &Image<P>, r: f32, wrap: bool) -> Image<P> {
     let (w, r) = (t.w, f64::from(r.abs()));
     if r <= 0.5 {
         return t.clone();
@@ -651,7 +695,7 @@ fn box_axis(t: &Tex, r: f32, wrap: bool) -> Tex {
             for (x, p) in row.iter().enumerate() {
                 let before = get(&cum, x);
                 if let Some(next) = cum.get_mut(x + 1) {
-                    *next = crate::tex::zip4(before, *p, |a, b| a + f64::from(b));
+                    *next = std::array::from_fn(|c| get(&before, c) + f64::from(p.ch(c)));
                 }
             }
             let total = get(&cum, w);
@@ -662,20 +706,18 @@ fn box_axis(t: &Tex, r: f32, wrap: bool) -> Tex {
                     let k = (x / n).floor();
                     (k, x - k * n, 0.0)
                 } else if x < 0.0 {
-                    return f64::from(get(&get(row, 0), c)) * x;
+                    return f64::from(row.first().map_or(0.0, |p| p.ch(c))) * x;
                 } else if x >= n {
-                    return get(&total, c) + f64::from(get(&get(row, w.saturating_sub(1)), c)) * (x - n);
+                    return get(&total, c) + f64::from(row.get(w.saturating_sub(1)).map_or(0.0, |p| p.ch(c))) * (x - n);
                 } else {
                     (0.0, x, 0.0)
                 };
                 let i = (x.floor() as usize).min(w.saturating_sub(1));
-                whole + cycles * get(&total, c) + get(&get(&cum, i), c) + f64::from(get(&get(row, i), c)) * (x - i as f64)
+                whole + cycles * get(&total, c) + get(&get(&cum, i), c) + f64::from(row.get(i).map_or(0.0, |p| p.ch(c))) * (x - i as f64)
             };
             for (x, d) in dst.iter_mut().enumerate() {
                 let centre = x as f64 + 0.5;
-                for (c, v) in d.iter_mut().enumerate() {
-                    *v = ((integral(centre + r, c) - integral(centre - r, c)) / (2.0 * r)) as f32;
-                }
+                *d = P::from_ch(|c| ((integral(centre + r, c) - integral(centre - r, c)) / (2.0 * r)) as f32);
             }
         }
     });
@@ -687,8 +729,8 @@ fn prof(name: &str) -> Option<crate::profile::Span> {
     crate::profile::enabled().then(|| crate::profile::span(name))
 }
 
-fn transposed(t: &Tex) -> Tex {
-    let mut px = vec![[0.0f32; 4]; t.px.len()];
+fn transposed<P: Pixel>(t: &Image<P>) -> Image<P> {
+    let mut px = vec![P::NONE; t.px.len()];
     // whole result rows (input columns) to each thread
     let h = t.h.max(1);
     crate::par::for_each_run_mut(&mut px, h * 16, |start, chunk| {
@@ -697,10 +739,10 @@ fn transposed(t: &Tex) -> Tex {
             *d = t.px_at((k % h) * t.w + k / h);
         }
     });
-    Tex { w: t.h, h: t.w, px }
+    Image { w: t.h, h: t.w, px }
 }
 
-fn box_columns(t: &Tex, r: f32, wrap: bool) -> Tex {
+fn box_columns<P: Pixel>(t: &Image<P>, r: f32, wrap: bool) -> Image<P> {
     transposed(&box_axis(&transposed(t), r, wrap))
 }
 
@@ -709,7 +751,7 @@ fn box_columns(t: &Tex, r: f32, wrap: bool) -> Tex {
 /// with x the major axis when `|vx| / w >= |vy| / h`. Below one pixel of length a pixel mixes with two reads one step along
 /// the major axis (`line_blur_direct`). From there on the image is sheared along the minor axis, each major-axis line
 /// averaged by a box of half-width `0.5 + |v major|`, and sheared back (`line_blur_sheared`).
-fn line_blur(t: &Tex, intensity: f32, aspect: [f32; 2], angle: f32, tx: bool, ty: bool) -> Option<Tex> {
+fn line_blur<P: Pixel>(t: &Image<P>, intensity: f32, aspect: [f32; 2], angle: f32, tx: bool, ty: bool) -> Option<Image<P>> {
     let (s, c) = math::sin_cos(angle * std::f32::consts::TAU);
     let (rx, ry) = (intensity * aspect[0] * t.w as f32 / INTENSITY_SPAN, intensity * aspect[1] * t.h as f32 / INTENSITY_SPAN);
     if s.abs() < AXIS_SLACK {
@@ -748,13 +790,13 @@ fn shear_lerp(p: f64) -> (i64, f32) {
 }
 
 /// Bilinear along a column.
-fn lerp_rows(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
-    crate::tex::zip4(a, b, |a, b| a + (b - a) * k)
+fn lerp_rows<P: Pixel>(a: P, b: P, k: f32) -> P {
+    a.zip(b, |a, b| a + (b - a) * k)
 }
 
 /// A short line: each pixel with the reads one column to either side, `slope` rows away, with weights that make a box of
 /// half-width `r` (at most the pixel itself when `r` is 0.5).
-fn line_blur_direct(t: &Tex, slope: f32, r: f32, tx: bool, ty: bool) -> Tex {
+fn line_blur_direct<P: Pixel>(t: &Image<P>, slope: f32, r: f32, tx: bool, ty: bool) -> Image<P> {
     let (w, h) = (t.w as i64, t.h as i64);
     let row = |y: i64| if ty { y.rem_euclid(h) } else { y.clamp(0, h - 1) };
     let col = |x: i64| if tx { x.rem_euclid(w) } else { x.clamp(0, w - 1) };
@@ -770,7 +812,7 @@ fn line_blur_direct(t: &Tex, slope: f32, r: f32, tx: bool, ty: bool) -> Tex {
             let k = (start + i) as i64;
             let (x, y) = (k % w, k / w);
             let (l, m, n) = (read(x - 1, y, -f64::from(slope)), t.px_at(k as usize), read(x + 1, y, f64::from(slope)));
-            *d = crate::tex::zip4(m, crate::tex::zip4(l, n, |l, n| l + n), |m, ln| (m + side * ln) / (2.0 * r));
+            *d = m.zip(l.zip(n, |l, n| l + n), |m, ln| (m + side * ln) / (2.0 * r));
         }
     });
     out
@@ -779,7 +821,7 @@ fn line_blur_direct(t: &Tex, slope: f32, r: f32, tx: bool, ty: bool) -> Tex {
 /// Shear, box, shear back. The shear is `slope` rows per column around the image's centre. Rows repeat or keep their edge.
 /// Past a side that doesn't repeat each row keeps its last value, in the sheared image. Past a side that repeats the shear
 /// goes on, so that a line crossing the seam stays straight.
-fn line_blur_sheared(t: &Tex, slope: f32, r: f32, tx: bool, ty: bool) -> Option<Tex> {
+fn line_blur_sheared<P: Pixel>(t: &Image<P>, slope: f32, r: f32, tx: bool, ty: bool) -> Option<Image<P>> {
     let (w, h) = (t.w as i64, t.h as i64);
     let (r64, slope) = (f64::from(r), f64::from(slope));
     let pad = r64.ceil() as i64 + 2;
@@ -793,7 +835,7 @@ fn line_blur_sheared(t: &Tex, slope: f32, r: f32, tx: bool, ty: bool) -> Option<
         return None;
     }
     // the sheared image, averaged along its rows; columns `0..w` of it are kept
-    let blurred: Vec<Vec<[f32; 4]>> = crate::tex::par_map(rows, |ry| {
+    let blurred: Vec<Vec<P>> = crate::tex::par_map(rows, |ry| {
         let y = ry as i64 - extra;
         let mut cum = vec![[0.0f64; 4]; span + 1];
         for k in 0..span {
@@ -804,7 +846,7 @@ fn line_blur_sheared(t: &Tex, slope: f32, r: f32, tx: bool, ty: bool) -> Option<
             let p = lerp_rows(t.px_at((row(i) * w + cx) as usize), t.px_at((row(i + 1) * w + cx) as usize), f);
             let before = get(&cum, k);
             if let Some(next) = cum.get_mut(k + 1) {
-                *next = crate::tex::zip4(before, p, |a, b| a + f64::from(b));
+                *next = std::array::from_fn(|c| get(&before, c) + f64::from(p.ch(c)));
             }
         }
         // the integral of the row, a stepped function, up to a position inside it
@@ -817,7 +859,7 @@ fn line_blur_sheared(t: &Tex, slope: f32, r: f32, tx: bool, ty: bool) -> Option<
         (0..t.w)
             .map(|x| {
                 let centre = (x as i64 + pad) as f64 + 0.5;
-                std::array::from_fn(|c| ((integral(centre + r64, c) - integral(centre - r64, c)) / (2.0 * r64)) as f32)
+                P::from_ch(|c| ((integral(centre + r64, c) - integral(centre - r64, c)) / (2.0 * r64)) as f32)
             })
             .collect()
     });
@@ -828,7 +870,7 @@ fn line_blur_sheared(t: &Tex, slope: f32, r: f32, tx: bool, ty: bool) -> Option<
             let (x, y) = (k % w, k / w);
             let (j, f) = shear_lerp(y as f64 - shift(x));
             let at = |q: i64| if ty { q.rem_euclid(h) as usize } else { (q + extra).clamp(0, rows as i64 - 1) as usize };
-            let read = |row: usize| blurred.get(row).map_or([0.0; 4], |r| get(r, x as usize));
+            let read = |row: usize| blurred.get(row).and_then(|r| r.get(x as usize).copied()).unwrap_or(P::NONE);
             *d = lerp_rows(read(at(j)), read(at(j + 1)), f);
         }
     });
@@ -840,13 +882,13 @@ fn line_blur_sheared(t: &Tex, slope: f32, r: f32, tx: bool, ty: bool) -> Option<
 const MAX_SHEARED_SIDE: usize = 1 << 15;
 
 /// Bilinear read; an axis that does not repeat keeps its edge value.
-fn sample_edge(t: &Tex, u: f32, v: f32, tx: bool, ty: bool) -> [f32; 4] {
+fn sample_edge<P: Pixel>(t: &Image<P>, u: f32, v: f32, tx: bool, ty: bool) -> P {
     let lim = |a: f32, n: usize, wrap: bool| if wrap { a } else { a.clamp(0.5 / n as f32, 1.0 - 0.5 / n as f32) };
     t.sample(lim(u, t.w, tx), lim(v, t.h, ty))
 }
 
 /// [`sample_edge`] with the weights in steps of 1/256.
-fn sample_edge_stepped(t: &Tex, u: f32, v: f32, tx: bool, ty: bool) -> [f32; 4] {
+fn sample_edge_stepped<P: Pixel>(t: &Image<P>, u: f32, v: f32, tx: bool, ty: bool) -> P {
     let lim = |a: f32, n: usize, wrap: bool| if wrap { a } else { a.clamp(0.5 / n as f32, 1.0 - 0.5 / n as f32) };
     sample_stepped(t, lim(u, t.w, tx), lim(v, t.h, ty))
 }

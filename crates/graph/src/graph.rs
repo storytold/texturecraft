@@ -1598,6 +1598,17 @@ impl Graph {
     }
 
     fn evaluate_impl(&self, ec: &EvalContext, size: Option<usize>, images: &[Option<Tex>]) -> Result<BTreeMap<String, Tex>, Error> {
+        // the images held as node results are (grey ones in a quarter of the memory), one copy at a time
+        let ext: Vec<Option<Val>> = images.iter().map(|t| t.as_ref().map(|t| Val::of(t.clone()))).collect();
+        self.evaluate_vals(ec, size, ext)
+    }
+
+    /// Like [`Self::evaluate_in`], taking the images: none is copied (a grey one is held in a quarter of the memory).
+    pub fn evaluate_owned(&self, ec: &EvalContext, size: Option<usize>, images: Vec<Option<Tex>>) -> Result<BTreeMap<String, Tex>, Error> {
+        crate::context::scoped(ec, || self.evaluate_vals(ec, size, images.into_iter().map(|t| t.map(Val::of)).collect()))
+    }
+
+    fn evaluate_vals(&self, ec: &EvalContext, size: Option<usize>, ext: Vec<Option<Val>>) -> Result<BTreeMap<String, Tex>, Error> {
         self.validate()?;
         let size = size.unwrap_or(self.size);
         if size == 0 || size > 8192 {
@@ -1619,7 +1630,6 @@ impl Graph {
         let outs = self.output_nodes();
         let keep: Vec<u32> = outs.iter().map(|o| o.2).collect();
         let mut cache = Cache::for_graph(self, &keep, false, &ec.live);
-        let ext: Vec<Option<Rc<Tex>>> = images.iter().map(|t| t.clone().map(Rc::new)).collect();
         let mut res = BTreeMap::new();
         for (_, name, id) in &outs {
             let t = eval_node(self, *id, &ctx, &ext, &mut cache)?;
@@ -1638,7 +1648,8 @@ impl Graph {
         }
         // hand the textures over without copying when no other output shares them
         cache.map.clear();
-        Ok(res.into_iter().map(|(k, v)| (k, Rc::try_unwrap(v).unwrap_or_else(|rc| (*rc).clone()))).collect())
+        drop(ext);
+        Ok(res.into_iter().map(|(k, v)| (k, v.into_tex())).collect())
     }
 
     /// Evaluate a single node (editor preview). Ignores unrelated incomplete nodes.
@@ -1672,7 +1683,7 @@ impl Graph {
         let mut cache = Cache::for_graph(self, &[id], false, &ec.live);
         let t = eval_node(self, id, &ctx, &[], &mut cache)?;
         cache.map.clear();
-        Ok(Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()))
+        Ok(t.into_tex())
     }
 
     /// Evaluate every node once (shared cache). Produces thumbnails, per-node errors and
@@ -1750,11 +1761,14 @@ impl Graph {
         for id in order {
             match eval_node(self, id, &ctx, &[], &mut cache) {
                 Ok(t) => {
-                    if Some(id) == first {
-                        on_first(&t);
-                    }
-                    if keep.contains(&id) {
-                        r.kept.insert(id, t.clone());
+                    if Some(id) == first || keep.contains(&id) {
+                        let t = t.tex();
+                        if Some(id) == first {
+                            on_first(&t);
+                        }
+                        if keep.contains(&id) {
+                            r.kept.insert(id, t);
+                        }
                     }
                 }
                 Err(Error::Cancelled) => break,
@@ -2014,7 +2028,7 @@ fn hash_graph(g: &Graph, ctx: &Ctx) -> HashMap<u32, u64> {
     memo
 }
 
-fn eval_node(g: &Graph, id: u32, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache: &mut Cache) -> Result<Rc<Tex>, Error> {
+fn eval_node(g: &Graph, id: u32, ctx: &Ctx, ext: &[Option<Val>], cache: &mut Cache) -> Result<Val, Error> {
     eval_node_out(g, id, None, ctx, ext, cache)
 }
 
@@ -2097,9 +2111,9 @@ enum Start<'g> {
 /// The nodes still waiting for inputs are kept in a list of their own, not on the call stack, so a long chain of
 /// nodes needs no more stack than a short one. They are visited in the order a depth-first walk takes (inputs in slot
 /// order, each before the node reading it), so what is computed, freed and reported is the same as by recursion.
-fn eval_node_out(g: &Graph, id: u32, out: Option<&str>, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache: &mut Cache) -> Result<Rc<Tex>, Error> {
+fn eval_node_out(g: &Graph, id: u32, out: Option<&str>, ctx: &Ctx, ext: &[Option<Val>], cache: &mut Cache) -> Result<Val, Error> {
     let mut stack: Vec<Box<Pending>> = match start_node(g, id, out, ctx, cache)? {
-        Start::Done(t) => return Ok(t.tex()),
+        Start::Done(t) => return Ok(t),
         Start::Todo(p) => vec![p],
     };
     loop {
@@ -2118,7 +2132,7 @@ fn eval_node_out(g: &Graph, id: u32, out: Option<&str>, ctx: &Ctx, ext: &[Option
         let Some(done) = stack.pop() else { return Err(Error::MissingNode(0, id)) };
         let t = finish_node(g, *done, ctx, ext, cache)?;
         match stack.last_mut() {
-            None => return Ok(t.tex()),
+            None => return Ok(t),
             Some(parent) => {
                 // the link just asked for
                 if let Some((slot, _, _)) = parent.next.checked_sub(1).and_then(|i| parent.links.get(i)) {
@@ -2200,7 +2214,7 @@ fn start_node<'g>(g: &'g Graph, id: u32, out: Option<&str>, ctx: &Ctx, cache: &m
 }
 
 /// Computes a node whose inputs are all in, stores the result and frees the inputs nobody else waits for.
-fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache: &mut Cache) -> Result<Val, Error> {
+fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mut Cache) -> Result<Val, Error> {
     let Pending { id, key, out, phash, node, mut ins, .. } = p;
     let n: &Node = &node;
     let out = out.as_deref();
@@ -2237,28 +2251,51 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache:
     } else {
         ctx
     };
+    // an explicit per-node Output Format (8 / 16 bit integer, 16 bit float, 5, 6, 7: 8 bit, 16 bit and 16 bit float as compiled graphs do them) quantises the
+    // result; 32 bit float is untouched
+    // (a node's own value 4 forces 32-bit float even when the graph rounds everything else)
+    let fmt = match n.nums.get("ofmt").map(|v| v.round() as u32) {
+        Some(v @ (1..=3 | 5..=7)) => v,
+        Some(4) => 0,
+        _ => g.default_format(),
+    };
+    let read_rounding = matches!(fmt, 5 | 6) && matches!(n.kind.as_str(), "grad_warp" | "dir_warp" | "transform_matrix");
+    // a format of whole 8- or 16-bit steps: results held in them
+    let div = match fmt {
+        crate::measured::FORMAT_8_BIT | crate::measured::COMPILED_8_BIT => Some(crate::measured::STEPS_8 as f32),
+        crate::measured::FORMAT_16_BIT | crate::measured::COMPILED_16_BIT => Some(crate::measured::STEPS_16 as f32),
+        _ => None,
+    };
+    let steps = div.map(|div| crate::tex::Steps { read_rounding, fmt, div });
     // a secondary output of a multi-output node runs the same code with the output index set
     let extra = out.and_then(|o| node_outputs(&n.kind).iter().position(|x| *x == o)).filter(|i| *i > 0);
+    // (for the node log: every input grey)
+    let grey_ins = !ins.is_empty() && ins.values().all(|v| v.grey_in().is_some());
     let t = match n.kind.as_str() {
         "input" => {
             let idx = n.nums.get("idx").copied().unwrap_or(0.0).max(0.0) as usize;
             let _span = prof("node.input");
-            Computed::Rgba(match ext.get(idx).cloned().flatten() {
-                Some(t) if n.nums.get("gray").copied().unwrap_or(0.0) > 0.5 => ops::to_gray(&t),
-                Some(t) => (*t).clone(),
-                None => Tex::solid(ctx.size, ctx.height, [0.0, 0.0, 0.0, 1.0]),
-            })
+            let gray = n.nums.get("gray").copied().unwrap_or(0.0) > 0.5;
+            match ext.get(idx).cloned().flatten() {
+                // the luminance of a grey pixel, as the RGBA form computes it
+                Some(t) if gray => match t.grey_in() {
+                    Some(g) => Computed::Grey(g.floats().map(|v| lum([v, v, v, 1.0])), 1.0),
+                    None => Computed::Rgba(ops::to_gray(&t.tex())),
+                },
+                Some(t) => Computed::Held(t),
+                None => Computed::Rgba(Tex::solid(ctx.size, ctx.height, [0.0, 0.0, 0.0, 1.0])),
+            }
         }
-        "subgraph" => Computed::Rgba(run_sub(id, n, &expanded(&ins), ctx, out)?),
+        "subgraph" => Computed::Held(run_sub(id, n, &ins, ctx, out)?),
         _ => {
             let t0 = ctx.ec.logging.node_times.then(NodeClock::start);
             let _span = crate::profile::enabled().then(|| crate::profile::span(&format!("node.{}", n.kind)));
             // grey inputs, an operation that keeps grey grey: computed on one channel
-            let grey = if extra.is_none() && GREY_KINDS.contains(&n.kind.as_str()) { compute_grey(id, n, &ins, ctx)? } else { None };
+            let grey = if extra.is_none() && GREY_KINDS.contains(&n.kind.as_str()) { compute_grey(id, n, &ins, ctx, steps.as_ref())? } else { None };
             let r = match grey {
                 Some(c) => {
                     #[cfg(test)]
-                    if matches!(c, Computed::Grey(_)) {
+                    if matches!(c, Computed::Grey(..)) {
                         grey_tests::GREY_RUNS.with(|n| n.set(n.get() + 1));
                     }
                     c
@@ -2292,40 +2329,39 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache:
     } else {
         t
     };
-    // an explicit per-node Output Format (8 / 16 bit integer, 16 bit float, 5, 6, 7: 8 bit, 16 bit and 16 bit float as compiled graphs do them) quantises the
-    // result; 32 bit float is untouched
-    // (a node's own value 4 forces 32-bit float even when the graph rounds everything else)
-    let fmt = match n.nums.get("ofmt").map(|v| v.round() as u32) {
-        Some(v @ (1..=3 | 5..=7)) => v,
-        Some(4) => 0,
-        _ => g.default_format(),
-    };
-    let read_rounding = matches!(fmt, 5 | 6) && matches!(n.kind.as_str(), "grad_warp" | "dir_warp" | "transform_matrix");
     let t = match t {
+        // (computed in its format's steps already)
+        Computed::Stepped(v) => Val::Grey16(Rc::new(v)),
+        // (a held result the node doesn't change is not copied)
+        Computed::Held(v) if fmt == 0 && !read_rounding => v,
+        Computed::Held(Val::Rgba(t)) => {
+            let mut t = Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone());
+            finish_format(&mut t, fmt, read_rounding);
+            Val::of(t)
+        }
+        Computed::Held(v) => {
+            // grey (in steps or not): its values
+            let (mut t, a) = match v.grey_in() {
+                Some(g) => (g.floats().into_owned(), g.alpha()),
+                None => (Grey::solid(1, 1, 0.0), 1.0),
+            };
+            finish_format(&mut t, fmt, read_rounding);
+            Val::Grey(Rc::new(t), a)
+        }
         Computed::Rgba(mut t) => {
             finish_format(&mut t, fmt, read_rounding);
             // held grey when it came out grey
             Val::of(t)
         }
-        Computed::Grey(mut t) => {
+        Computed::Grey(mut t, a) => {
             finish_format(&mut t, fmt, read_rounding);
-            Val::Grey(Rc::new(t))
+            Val::Grey(Rc::new(t), a)
         }
     };
-    // a format of whole 8- or 16-bit steps: held in them
-    let t = match fmt {
-        crate::measured::FORMAT_8_BIT | crate::measured::COMPILED_8_BIT => t.quantised(crate::measured::STEPS_8 as f32),
-        crate::measured::FORMAT_16_BIT | crate::measured::COMPILED_16_BIT => t.quantised(crate::measured::STEPS_16 as f32),
-        _ => t,
+    let t = match div {
+        Some(div) => t.quantised(div),
+        None => t,
     };
-    if ctx.ec.logging.node_times {
-        let form = match &t {
-            Val::Rgba(_) => "rgba",
-            Val::Grey(_) => "grey",
-            Val::Grey16(_) => "grey in steps",
-        };
-        eprintln!("         node {id} held {form} {}x{}", sz.0, sz.1);
-    }
     let _span = prof("node.store_and_free");
     // results that outlive the evaluation are kept as RGBA (editor)
     let full = (cache.persist.is_some() || (key == id && cache.thumbs.is_some())).then(|| t.tex());
@@ -2334,6 +2370,14 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache:
         _ => t,
     };
     cache.put(key, t.clone());
+    if ctx.ec.logging.node_times {
+        let form = match &t {
+            Val::Rgba(_) => "rgba",
+            Val::Grey(..) => "grey",
+            Val::Grey16(_) => "grey in steps",
+        };
+        eprintln!("         node {id} held {form} {}x{}{}; results held {} MB", sz.0, sz.1, if grey_ins { ", grey inputs" } else { "" }, cache.live >> 20);
+    }
     if key == id {
         cache.sizes.insert(id, sz.0);
     }
@@ -2365,21 +2409,30 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache:
 /// A node's result as computed, before its format and before it is held.
 enum Computed {
     Rgba(Tex),
-    Grey(Grey),
+    /// grey values and their alpha (1 or +0)
+    Grey(Grey, f32),
+    /// a result held already (a graph input, a subgraph's output): taken over as it is unless the node changes it
+    Held(Val),
+    /// grey in the steps of the node's format, the format applied
+    Stepped(crate::tex::Grey16),
 }
 
 impl Computed {
     fn dims(&self) -> (usize, usize) {
         match self {
             Computed::Rgba(t) => (t.w, t.h),
-            Computed::Grey(t) => (t.w, t.h),
+            Computed::Grey(t, _) => (t.w, t.h),
+            Computed::Held(v) => v.dims(),
+            Computed::Stepped(t) => (t.w, t.h),
         }
     }
 
     fn into_tex(self) -> Tex {
         match self {
             Computed::Rgba(t) => t,
-            Computed::Grey(t) => t.expand(),
+            Computed::Grey(t, a) => t.expand(a),
+            Computed::Held(v) => v.into_tex(),
+            Computed::Stepped(t) => t.expand(),
         }
     }
 }
@@ -2874,12 +2927,21 @@ fn read_resource(id: u32, file: &str, ctx: &Ctx) -> Result<Vec<u8>, Error> {
 
 fn run_function_image(id: u32, n: &Node, fname: &str, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx, once: bool) -> Result<Tex, Error> {
     let images = IMAGE_SLOTS.iter().filter_map(|slot| ins.get(*slot).map(|t| (*slot, crate::tex::ImgRef::Rgba(t)))).collect();
-    Ok(run_function(id, n, fname, images, ctx, once, false)?.into_tex())
+    Ok(run_function(id, n, fname, images, ctx, once, None)?.into_tex())
 }
 
 /// A function run at every pixel ([`run_function_image`]) on the images `images` (by slot). `grey`: a function that gives one
 /// number (or a boolean) at every pixel comes out as a grey image (the same values the RGBA form gives, `[v, v, v, 1]`).
-fn run_function(id: u32, n: &Node, fname: &str, images: Vec<(&str, crate::tex::ImgRef)>, ctx: &Ctx, once: bool, grey: bool) -> Result<Computed, Error> {
+/// `grey`: `Some` to give a grey result where it is one, computed in the steps given when it can be.
+fn run_function(
+    id: u32,
+    n: &Node,
+    fname: &str,
+    images: Vec<(&str, crate::tex::ImgRef)>,
+    ctx: &Ctx,
+    once: bool,
+    grey: Option<Option<&crate::tex::Steps>>,
+) -> Result<Computed, Error> {
     use crate::func::{FnEnv, Value, compile_named};
     let prog = compile_named(ctx.lib, fname).map_err(|e| Error::BadParam(id, e))?;
     let (w, h) = (ctx.size, ctx.height);
@@ -2937,19 +2999,30 @@ fn run_function(id: u32, n: &Node, fname: &str, images: Vec<(&str, crate::tex::I
         Value::Num(x) => x.lanes == 1,
         Value::Bool(_) | Value::Str(_) => true,
     };
-    if grey && one(&first) {
+    if let Some(steps) = grey
+        && one(&first)
+    {
         let other = std::sync::atomic::AtomicBool::new(false);
-        let g = Grey::from_fn_with(w, h, new_frame, |frame, u, v| match prog.run_bound(&env, [u as f64, v as f64], frame) {
-            Ok(r) => {
-                if !one(&r) {
-                    other.store(true, std::sync::atomic::Ordering::Relaxed);
+        let g = crate::tex::grey_from_fn_with(
+            w,
+            h,
+            new_frame,
+            |frame, u, v| match prog.run_bound(&env, [u as f64, v as f64], frame) {
+                Ok(r) => {
+                    if !one(&r) {
+                        other.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    to_px(&r)[0]
                 }
-                to_px(&r)[0]
-            }
-            Err(_) => 0.0,
-        });
+                Err(_) => 0.0,
+            },
+            steps,
+        );
         if !other.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(Computed::Grey(g));
+            return Ok(match g {
+                crate::tex::GreyOut::F(g, a) => Computed::Grey(g, a),
+                crate::tex::GreyOut::Q(g) => Computed::Stepped(g),
+            });
         }
     }
     Ok(Computed::Rgba(Tex::from_fn_with(w, h, new_frame, |frame, u, v| match prog.run_bound(&env, [u as f64, v as f64], frame) {
@@ -2958,7 +3031,7 @@ fn run_function(id: u32, n: &Node, fname: &str, images: Vec<(&str, crate::tex::I
     })))
 }
 
-fn run_sub(id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx, out: Option<&str>) -> Result<Tex, Error> {
+fn run_sub(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx, out: Option<&str>) -> Result<Val, Error> {
     if ctx.depth >= 8 {
         return Err(Error::BadParam(id, "subgraph nesting too deep (recursive?)".into()));
     }
@@ -2973,7 +3046,7 @@ fn run_sub(id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx, out: O
             inner.nums.insert(param.to_string(), *v);
         }
     }
-    let ext: Vec<Option<Rc<Tex>>> = (0..4).map(|i| ins.get(&format!("in{i}")).cloned()).collect();
+    let ext: Vec<Option<Val>> = (0..4).map(|i| ins.get(&format!("in{i}")).cloned()).collect();
     let mut outs = sub.output_nodes();
     outs.sort_by_key(|o| OUTPUT_USAGES.iter().position(|x| *x == o.0).unwrap_or(99));
     let want = out.map(String::from).or_else(|| n.strs.get("output").cloned()).unwrap_or_default();
@@ -3002,7 +3075,7 @@ fn run_sub(id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx, out: O
     let mut cache = Cache::for_graph(&sub, &[out_id], false, &ctx.ec.live);
     let t = eval_node(&sub, out_id, &c2, &ext, &mut cache)?;
     cache.map.clear();
-    Ok(Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone()))
+    Ok(t)
 }
 
 fn compute(id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx) -> Result<Tex, Error> {
@@ -4016,11 +4089,13 @@ mod output_size_tests {
 }
 
 /// The kinds [`compute_grey`] can compute on one channel.
-const GREY_KINDS: &[&str] = &["pixel_processor", "transform_matrix", "blend"];
+const GREY_KINDS: &[&str] =
+    &["pixel_processor", "transform_matrix", "blend", "levels_mid", "box_blur", "line_blur", "dir_warp", "grad_warp", "grayscale_conversion"];
 
 /// Node `n` computed on one channel, when all its inputs are grey and what it does to them keeps them grey bit for bit
 /// (the same arithmetic on each colour channel, alpha staying exactly 1). `None`: computed in RGBA.
-fn compute_grey(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx) -> Result<Option<Computed>, Error> {
+/// With `steps`, a kernel that can computes in the steps of the node's format directly (the format applied).
+fn compute_grey(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx, steps: Option<&crate::tex::Steps>) -> Result<Option<Computed>, Error> {
     #[cfg(test)]
     if grey_tests::RGBA_ONLY.with(std::cell::Cell::get) {
         return Ok(None);
@@ -4035,31 +4110,127 @@ fn compute_grey(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx) -> Re
             Some(fname) => {
                 let images = IMAGE_SLOTS.iter().filter_map(|slot| ins.get(*slot).map(|v| (*slot, v.img_ref()))).collect();
                 // (a function giving more than one number comes back computed in RGBA)
-                Some(run_function(id, n, fname, images, ctx, false, true)?)
+                Some(run_function(id, n, fname, images, ctx, false, Some(steps))?)
             }
             None => None,
         },
-        "transform_matrix" if all_grey => {
-            let (bg, tx, ty) = crate::atomic::transform_matrix_bg(n);
-            match grey("in") {
-                Some(t) if crate::atomic::transform_keeps_grey(bg, tx, ty) => {
+        "transform_matrix" if all_grey => match grey("in") {
+            Some(t) => match crate::atomic::transform_grey_alpha(n, t.alpha()) {
+                Some(alpha) => {
                     // (its input is read many times over, often smaller than the result: as floats)
+                    let bg = crate::atomic::transform_matrix_bg(n)[0];
                     let t = t.floats();
-                    Some(Computed::Grey(after_compute(crate::atomic::transform_matrix(n, &t, [s, hs], bg[0]), n, s, hs)))
+                    // (in steps when its alpha is 1 and nothing moves the result after)
+                    let steps = steps.filter(|_| alpha.to_bits() == 1.0f32.to_bits() && !rolls(n));
+                    Some(match crate::atomic::transform_matrix(n, &t, [s, hs], bg, crate::tex::ToSteps(steps)) {
+                        crate::tex::GreyOut::Q(t) => Computed::Stepped(t),
+                        crate::tex::GreyOut::F(t, _) => Computed::Grey(after_compute(t, n, s, hs), alpha),
+                    })
                 }
-                _ => None,
+                None => None,
+            },
+            None => None,
+        },
+        // the kinds whose alpha is worked out with the value: on (value, alpha) pairs, grey again when the alpha is one
+        // of 1 or +0
+        "box_blur" if all_grey => grey("in").map(|t| from_pairs(after_compute(crate::atomic::box_blur(n, &pairs(t)), n, s, hs))),
+        "line_blur" if all_grey => match grey("in") {
+            Some(t) => Some(from_pairs(after_compute(crate::atomic::line_blur_node(id, n, &pairs(t))?, n, s, hs))),
+            None => None,
+        },
+        "dir_warp" | "grad_warp" => match (grey("in"), ins.get("map")) {
+            (Some(t), Some(map)) => {
+                let t = pairs(t);
+                let out = match (map, map.grey_in()) {
+                    (_, Some(m)) => warp_by(n, &t, &m, [s, hs]),
+                    (Val::Rgba(m), None) => warp_by(n, &t, m.as_ref(), [s, hs]),
+                    _ => return Ok(None),
+                };
+                Some(from_pairs(after_compute(out, n, s, hs)))
             }
+            _ => None,
+        },
+        // grey from any input, its alpha kept
+        "grayscale_conversion" => {
+            let (wr, wg, wb, wa) = (f("r", 0.3), f("g", 0.59), f("b", 0.11), f("a", 0.0));
+            let (lo, hi) = if f("limit", 0.0) > 0.5 { (0.0, 1.0) } else { (f32::MIN, f32::MAX) };
+            let value = |p: [f32; 4]| ((p[0] * wr + p[1] * wg + p[2] * wb + p[3] * wa).clamp(lo, hi), p[3]);
+            let Some(input) = ins.get("in") else { return Ok(None) };
+            let (w, h) = input.dims();
+            let steps = steps.filter(|_| (w, h) == (s, hs));
+            let out = match (input, input.grey_in()) {
+                (_, Some(g)) => crate::tex::fill_grey(w, h, |i| value(g.with_alpha(crate::tex::Texels::texel(&g, i))), steps),
+                (Val::Rgba(t), None) => crate::tex::fill_grey(w, h, |i| value(t.px_at(i)), steps),
+                _ => None,
+            };
+            out.map(|r| match r {
+                crate::tex::GreyOut::F(t, a) => Computed::Grey(after_compute(t, n, s, hs), a),
+                crate::tex::GreyOut::Q(t) => Computed::Stepped(t),
+            })
         }
+        "levels_mid" if all_grey => match grey("in") {
+            Some(t) => crate::atomic::levels_mid_grey(n, t).map(|(t, a)| Computed::Grey(after_compute(t, n, s, hs), a)),
+            None => None,
+        },
         "blend" if all_grey => match (grey("fg"), grey("bg")) {
             (Some(fg), Some(bg)) => {
-                let (mode, op, am) = (f("mode", 0.0).max(0.0) as u32, f("opacity", 1.0), f("alpha_mode", 1.0).max(0.0) as u32);
-                let crop = [f("crop_x0", 0.0), f("crop_y0", 0.0), f("crop_x1", 1.0), f("crop_y1", 1.0)];
-                ops::blend_grey(fg, bg, grey("mask"), mode, op, am, crop).map(|t| Computed::Grey(after_compute(t, n, s, hs)))
+                let set = ops::BlendSet {
+                    mode: f("mode", 0.0).max(0.0) as u32,
+                    opacity: f("opacity", 1.0),
+                    alpha_mode: f("alpha_mode", 1.0).max(0.0) as u32,
+                    crop: [f("crop_x0", 0.0), f("crop_y0", 0.0), f("crop_x1", 1.0), f("crop_y1", 1.0)],
+                };
+                // (in steps when nothing moves or resamples the result after)
+                let steps = steps.filter(|_| crate::tex::Texels::width(&bg) == s && crate::tex::Texels::height(&bg) == hs && !rolls(n));
+                ops::blend_grey(fg, bg, grey("mask"), set, steps).map(|r| match r {
+                    crate::tex::GreyOut::F(t, a) => Computed::Grey(after_compute(t, n, s, hs), a),
+                    crate::tex::GreyOut::Q(t) => Computed::Stepped(t),
+                })
             }
             _ => None,
         },
         _ => None,
     })
+}
+
+/// A grey image as (value, alpha) pairs.
+fn pairs(g: crate::tex::GreyIn) -> crate::tex::Image<[f32; 2]> {
+    use crate::tex::Texels;
+    let a = g.alpha();
+    let mut px = vec![[0.0f32; 2]; g.len()];
+    crate::par::for_each_run_mut(&mut px, 1 << 15, |first, run| {
+        for (i, d) in run.iter_mut().enumerate() {
+            *d = [g.texel(first + i), a];
+        }
+    });
+    crate::tex::Image { w: g.width(), h: g.height(), px }
+}
+
+/// (value, alpha) pairs as a result: grey when the alpha is the same 1 or +0 everywhere, else RGBA.
+fn from_pairs(t: crate::tex::Image<[f32; 2]>) -> Computed {
+    let a = t.px.first().map_or(1.0, |p| p[1]);
+    if crate::tex::grey_alpha_ok(a) && t.px.iter().all(|p| p[1].to_bits() == a.to_bits()) {
+        let mut px = vec![0.0f32; t.px.len()];
+        crate::par::for_each_run_mut(&mut px, 1 << 15, |first, run| {
+            for (i, d) in run.iter_mut().enumerate() {
+                *d = t.px.get(first + i).map_or(0.0, |p| p[0]);
+            }
+        });
+        return Computed::Grey(Grey { w: t.w, h: t.h, px }, a);
+    }
+    Computed::Rgba(crate::tex::Image { w: t.w, h: t.h, px: t.px.iter().map(|p| crate::tex::Pixel::rgba(*p)).collect() })
+}
+
+/// A `dir_warp` or `grad_warp` node on (value, alpha) pairs, moved by `map`.
+fn warp_by<M: crate::tex::Texels>(n: &Node, t: &crate::tex::Image<[f32; 2]>, map: &M, size: [usize; 2]) -> crate::tex::Image<[f32; 2]> {
+    if n.kind == "dir_warp" { crate::atomic::dir_warp(n, t, map) } else { crate::atomic::grad_warp(n, t, map, size) }
+}
+
+/// Whether [`after_compute`] moves the result: a tile offset with a fraction.
+fn rolls(n: &Node) -> bool {
+    let f = |k: &str| n.nums.get(k).copied().unwrap_or(0.0);
+    let (tx, ty) = (f("tile_x"), f("tile_y"));
+    tx - tx.floor() > 0.0 || ty - ty.floor() > 0.0
 }
 
 /// What [`compute`] does to every result of the kinds it computes itself: resampled to the node's size, and moved by
@@ -4096,12 +4267,16 @@ mod grey_tests {
     fn same(body: &str, size: usize, compiled: bool) {
         same_once(body, size, compiled);
         same_once(&body.replace("@1", "@5").replace("@2", "@6"), size, compiled);
+        // grey with an alpha of 0, in floats and in steps
+        same_once(&body.replace("@1", "@7").replace("@2", "@8"), size, compiled);
+        same_once(&body.replace("@2", "@7"), size, compiled);
     }
 
     fn same_once(body: &str, size: usize, compiled: bool) {
         let text = format!(
             "format 3\nsize 64\n{}node 1 perlin scale=4 seed=3\nnode 2 fbm scale=6 seed=5\nnode 3 color gray=1 v=0.25\nnode 4 white_noise seed=9\n\
-             node 5 perlin scale=4 seed=3 ofmt=6\nnode 6 fbm scale=6 seed=5 ofmt=5\n{body}",
+             node 5 perlin scale=4 seed=3 ofmt=6\nnode 6 fbm scale=6 seed=5 ofmt=5\n\
+             node 7 levels_mid in=@1 out_low=1 out_high=0\nnode 8 levels_mid in=@6 out_low=1 out_high=0 ofmt=6\n{body}",
             if compiled { "meta compiled \"1\"\n" } else { "" }
         );
         let g = Graph::parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
@@ -4120,6 +4295,30 @@ mod grey_tests {
         GREY_RUNS.with(|c| c.set(0));
         f();
         GREY_RUNS.with(std::cell::Cell::get)
+    }
+
+    /// A grey result is formatted as one channel, its alpha left as it is: every format keeps an alpha of 1 or +0.
+    #[test]
+    fn formats_keep_an_opaque_alpha() {
+        for fmt in [1, 2, 3, 5, 6, 7] {
+            for read_rounding in [false, true] {
+                for a in [1.0f32, 0.0] {
+                    let mut t = Tex::solid(2, 2, [0.3, 0.3, 0.3, a]);
+                    finish_format(&mut t, fmt, read_rounding);
+                    assert!(t.px.iter().all(|p| p[3].to_bits() == a.to_bits()), "format {fmt}");
+                }
+            }
+        }
+    }
+
+    /// Grey images of alpha 0 (an inverted levels inverts the alpha too) stay grey through blends and transforms.
+    #[test]
+    fn clear_grey_computes_grey() {
+        let n = greys(|| {
+            same_once("node 10 blend fg=@7 bg=@8 mode=1\nnode 11 transform_matrix in=@10 m00=2 m11=2\noutput out 11\n", 16, true);
+        });
+        // (the two levels making the sources, the blend and the transform)
+        assert_eq!(n, 4);
     }
 
     #[test]
@@ -4152,12 +4351,92 @@ mod grey_tests {
     }
 
     #[test]
+    fn levels_mid_grey_is_rgba() {
+        let n = greys(|| {
+            for compiled in [false, true] {
+                for set in [
+                    "low=0.2 high=0.9 mid=0.3",
+                    "out_low=1 out_high=0",
+                    "low=0.1 out_low=-0.2 out_high=1.3",
+                    "low_r=0.1 low_g=0.1 low_b=0.1 out_low_a=0.5",
+                    "low_r=0.2 high=0.7",
+                    "mid=0.8 out_high_a=0",
+                ] {
+                    for fmt in ["", " ofmt=5", " ofmt=6", " ofmt=4"] {
+                        same(&format!("node 10 levels_mid in=@2 {set}{fmt}\noutput out 10\n"), 20, compiled);
+                    }
+                }
+            }
+        });
+        assert!(n > 100, "{n} grey runs");
+    }
+
+    #[test]
+    fn blurs_and_warps_grey_are_rgba() {
+        let n = greys(|| {
+            for compiled in [false, true] {
+                for fmt in ["", " ofmt=5", " ofmt=6", " ofmt=7"] {
+                    for set in ["intensity=0.3", "intensity=2.5 tile_x=0", "intensity=9 aspect_x=0.5 tile_y=0"] {
+                        same(&format!("node 10 box_blur in=@2 {set}{fmt}\noutput out 10\n"), 32, compiled);
+                    }
+                    for set in [
+                        "intensity=0.3 angle=0",
+                        "intensity=3 angle=0.25",
+                        "intensity=0.4 angle=0.1",
+                        "intensity=6 angle=0.37 tile_x=0",
+                        "intensity=12 angle=0.6",
+                    ] {
+                        same(&format!("node 10 line_blur in=@2 {set}{fmt}\noutput out 10\n"), 32, compiled);
+                    }
+                    for (kind, set) in [
+                        ("dir_warp", "intensity=4 angle=0.3"),
+                        ("dir_warp", "intensity=9 tile_x=0 map_offset=0.2"),
+                        ("grad_warp", "intensity=2"),
+                        ("grad_warp", "intensity=7 tile_y=0 aspect_x=2"),
+                    ] {
+                        for map in ["@1", "@4", "@5"] {
+                            same(&format!("node 10 {kind} in=@2 map={map} {set}{fmt}\noutput out 10\n"), 32, compiled);
+                        }
+                    }
+                }
+            }
+        });
+        assert!(n > 300, "{n} grey runs");
+    }
+
+    #[test]
+    fn grayscale_conversion_grey_is_rgba() {
+        let n = greys(|| {
+            for set in ["", "r=0.5 g=0.2 b=0.3 a=0.1", "r=2 limit=1", "a=1"] {
+                for fmt in ["", " ofmt=6", " ofmt=5", " ofmt=3"] {
+                    // a colour input too
+                    for input in ["@2", "@9"] {
+                        same(&format!("node 9 color r=0.2 g=0.5 b=0.9\nnode 10 grayscale_conversion in={input} {set}{fmt}\noutput out 10\n"), 24, true);
+                    }
+                }
+            }
+        });
+        assert!(n > 50, "{n} grey runs");
+    }
+
+    #[test]
     fn blend_grey_is_rgba() {
         let n = greys(|| {
             for compiled in [false, true] {
                 for mode in (0..=21).chain(32..=35) {
                     for am in 0..=4 {
-                        for (op, extra) in [("1", ""), ("0.37", " mask=@4"), ("0.8", " crop_x0=0.2 crop_y1=0.6"), ("-2", " ofmt=6"), ("1e30", " mask=@3")] {
+                        for (op, extra) in [
+                            ("1", ""),
+                            ("0.37", " mask=@4"),
+                            ("0.8", " crop_x0=0.2 crop_y1=0.6"),
+                            ("-2", " ofmt=6"),
+                            ("1e30", " mask=@3"),
+                            ("0.37", " mask=@4 ofmt=5"),
+                            ("1", " ofmt=6"),
+                            ("0.5", " ofmt=2"),
+                            ("0.6", " ofmt=1 tile_x=0.25"),
+                            ("0.6", " ofmt=7"),
+                        ] {
                             let body = format!("node 10 blend fg=@1 bg=@2 mode={mode} alpha_mode={am} opacity={op}{extra}\noutput out 10\n");
                             same(&body, 24, compiled);
                         }

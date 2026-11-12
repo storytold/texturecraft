@@ -6,7 +6,7 @@ use crate::measured::{
     COMPILED_8_BIT, COMPILED_16_BIT, COMPILED_HALF, CUT_16_TO_12, FINE_8, FINE_8_TIE_DOWN, FINE_16, FINE_16_BITS, FINE_16_TIE_DOWN, FORMAT_8_BIT,
     FORMAT_16_BIT, FORMAT_HALF, STEPS_8, STEPS_16, WEIGHT_STEPS,
 };
-use crate::tex::{Grey, GreyIn, Tex, Texels, lum};
+use crate::tex::{GreyIn, GreyOut, Steps, Tex, Texels, lum};
 use std::f32::consts::{PI, TAU};
 
 fn sm(a: f32, b: f32, x: f32) -> f32 {
@@ -644,10 +644,21 @@ pub fn blend_ex(fg: &Tex, bg: &Tex, mask: Option<&Tex>, mode: u32, opacity: f32,
     out
 }
 
-/// [`blend_ex`] on grey images: the same arithmetic on the grey value as on each colour channel there. `None` where the
-/// result would not be grey and opaque bit for bit: the modes that mix the channels (colour, luminosity, dissolve), a
-/// premultiplied copy, images of different sizes, or an alpha that comes out other than exactly 1 at some pixel.
-pub(crate) fn blend_grey(fg: GreyIn, bg: GreyIn, mask: Option<GreyIn>, mode: u32, opacity: f32, alpha_mode: u32, crop: [f32; 4]) -> Option<Grey> {
+/// A blend's settings: mode, opacity, alpha mode and crop rectangle (x0, y0, x1, y1).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BlendSet {
+    pub mode: u32,
+    pub opacity: f32,
+    pub alpha_mode: u32,
+    pub crop: [f32; 4],
+}
+
+/// [`blend_ex`] on grey images: the same arithmetic on the grey value as on each colour channel there, and on the alphas
+/// (1 or +0) as there. `None` where the result would not be grey with one alpha of 1 or +0 bit for bit: the modes that
+/// mix the channels (colour, luminosity, dissolve), a premultiplied copy, images of different sizes, or alphas that come
+/// out otherwise. With `steps`, the result in the steps of the node's format where every value is one.
+pub(crate) fn blend_grey(fg: GreyIn, bg: GreyIn, mask: Option<GreyIn>, set: BlendSet, steps: Option<&Steps>) -> Option<GreyOut> {
+    let BlendSet { mode, opacity, alpha_mode, crop } = set;
     if (17..=19).contains(&mode) || (alpha_mode == 3 && mode == 0) {
         return None;
     }
@@ -655,55 +666,48 @@ pub(crate) fn blend_grey(fg: GreyIn, bg: GreyIn, mask: Option<GreyIn>, mode: u32
         return None;
     }
     let (ow, oh) = (bg.width(), bg.height());
-    let mut out = Grey::solid(ow, oh, 0.0);
     let cropped = crop != [0.0, 0.0, 1.0, 1.0];
-    let not_opaque = std::sync::atomic::AtomicBool::new(false);
-    crate::tex::par_rows(&mut out.px, ow, |start, chunk| {
-        for (j, dst) in chunk.iter_mut().enumerate() {
-            let i = start + j;
-            let f = fg.texel(i);
-            let b = bg.texel(i);
-            let mut m = mask.map(|m| m.texel(i)).map(|p| lum([p, p, p, 1.0])).unwrap_or(1.0) * opacity;
-            if cropped {
-                let (px, py) = (((i % ow) as f32 + 0.5) / ow as f32, ((i / ow) as f32 + 0.5) / oh as f32);
-                if px < crop[0] || px > crop[2] || py < crop[1] || py > crop[3] {
-                    m = 0.0;
-                }
+    let pixel = |i: usize| -> (f32, f32) {
+        let f = fg.texel(i);
+        let b = bg.texel(i);
+        let mut m = mask.map(|m| m.texel(i)).map(|p| lum([p, p, p, 1.0])).unwrap_or(1.0) * opacity;
+        if cropped {
+            let (px, py) = (((i % ow) as f32 + 0.5) / ow as f32, ((i / ow) as f32 + 0.5) / oh as f32);
+            if px < crop[0] || px > crop[2] || py < crop[1] || py > crop[3] {
+                m = 0.0;
             }
-            // the alpha the RGBA form gives from two alphas of 1, which must stay 1
-            let (fa, ba) = (1.0f32, 1.0f32);
-            let m_plain = m;
-            let alpha = match alpha_mode {
-                0 | 2 | 3 | 4 if mode == 21 => ba + (fa - ba) * m,
-                4 => {
-                    m *= fa;
-                    ba
-                }
-                0 => {
-                    let a = ba + (fa - ba) * m_plain;
-                    m *= fa;
-                    a
-                }
-                2 | 3 => {
-                    let a = fa * m_plain + ba * (1.0 - fa * m_plain);
-                    m *= fa;
-                    a
-                }
-                _ => ba,
-            };
-            if alpha.to_bits() != 1.0f32.to_bits() {
-                not_opaque.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            *dst = if (32..=35).contains(&mode) {
-                compiled_blend(mode, f, b, m).clamp(0.0, 1.0)
-            } else if mode == 21 {
-                b + (f - b) * m
-            } else {
-                (b + (bm(mode, f, b).clamp(0.0, 1.0) - b) * m).clamp(0.0, 1.0)
-            };
         }
-    });
-    (!not_opaque.load(std::sync::atomic::Ordering::Relaxed)).then_some(out)
+        // the alpha the RGBA form gives from the two alphas, which must come out the same everywhere: 1 or +0
+        let (fa, ba) = (fg.alpha(), bg.alpha());
+        let m_plain = m;
+        let alpha = match alpha_mode {
+            0 | 2 | 3 | 4 if mode == 21 => ba + (fa - ba) * m,
+            4 => {
+                m *= fa;
+                ba
+            }
+            0 => {
+                let a = ba + (fa - ba) * m_plain;
+                m *= fa;
+                a
+            }
+            2 | 3 => {
+                let a = fa * m_plain + ba * (1.0 - fa * m_plain);
+                m *= fa;
+                a
+            }
+            _ => ba,
+        };
+        let v = if (32..=35).contains(&mode) {
+            compiled_blend(mode, f, b, m).clamp(0.0, 1.0)
+        } else if mode == 21 {
+            b + (f - b) * m
+        } else {
+            (b + (bm(mode, f, b).clamp(0.0, 1.0) - b) * m).clamp(0.0, 1.0)
+        };
+        (v, alpha)
+    };
+    crate::tex::fill_grey(ow, oh, pixel, steps)
 }
 
 /// The blending modes of compiled graphs in which the opacity scales the foreground (or, for divide, acts before the
@@ -2286,16 +2290,24 @@ pub fn quantize_color_full(t: &Tex, k: usize, smoothing: f32, dither: f32, bayer
 /// nodes hold them ([`compiled_8bit`], [`compiled_16bit`], [`compiled_half`]), anything else = 32 bit float (untouched).
 /// Alpha is treated like the colour channels. The codes are in [`crate::measured`].
 pub fn apply_format<P: crate::tex::Pixel>(t: &mut crate::tex::Image<P>, fmt: u32) {
+    if matches!(fmt, FORMAT_8_BIT | FORMAT_16_BIT | FORMAT_HALF | COMPILED_8_BIT | COMPILED_16_BIT | COMPILED_HALF) {
+        map_channels(t, |c| format_value(c, fmt));
+    }
+}
+
+/// One channel value through format `fmt` ([`apply_format`]).
+#[inline]
+pub fn format_value(c: f32, fmt: u32) -> f32 {
     match fmt {
         FORMAT_8_BIT | FORMAT_16_BIT => {
             let k = if fmt == FORMAT_8_BIT { STEPS_8 as f32 } else { STEPS_16 as f32 };
-            map_channels(t, |c| (c.clamp(0.0, 1.0) * k).round() / k);
+            (c.clamp(0.0, 1.0) * k).round() / k
         }
-        FORMAT_HALF => map_channels(t, |c| crate::exr::half_to_f32(crate::exr::f32_to_half(c))),
-        COMPILED_8_BIT => map_channels(t, compiled_8bit),
-        COMPILED_16_BIT => map_channels(t, compiled_16bit),
-        COMPILED_HALF => map_channels(t, compiled_half),
-        _ => {}
+        FORMAT_HALF => crate::exr::half_to_f32(crate::exr::f32_to_half(c)),
+        COMPILED_8_BIT => compiled_8bit(c),
+        COMPILED_16_BIT => compiled_16bit(c),
+        COMPILED_HALF => compiled_half(c),
+        _ => c,
     }
 }
 
@@ -2313,7 +2325,13 @@ pub fn map_channels<P: crate::tex::Pixel>(t: &mut crate::tex::Image<P>, f: impl 
 /// A read of an integer image: each value rounded half up to a 16-bit step (warps, pyramid levels, doublings). Measurement "What
 /// nodes hold and how they read" ("rounds half up to a 16-bit step").
 pub fn round_to_16bit_read<P: crate::tex::Pixel>(t: &mut crate::tex::Image<P>) {
-    map_channels(t, |c| (crate::tex::floor64(f64::from(c) * STEPS_16 + 0.5) / STEPS_16) as f32);
+    map_channels(t, read_rounded);
+}
+
+/// One value of [`round_to_16bit_read`].
+#[inline]
+pub fn read_rounded(c: f32) -> f32 {
+    (crate::tex::floor64(f64::from(c) * STEPS_16 + 0.5) / STEPS_16) as f32
 }
 
 /// A value through an 8-bit node of a compiled graph, as measured over all 256 levels: to 16 bits to the nearest, to 12 bits

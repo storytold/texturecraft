@@ -792,7 +792,8 @@ fn reads_grey(graph: &Graph, idx: u32) -> bool {
 fn evaluate(graph: &Graph, ec: &EvalContext, side: usize, images: Vec<Option<Tex>>, given: &[(u32, Tex)]) -> Result<BTreeMap<String, Tex>, String> {
     let colour: Vec<u32> = given.iter().filter(|(k, t)| reads_grey(graph, *k) && !t.px.iter().all(|p| p[0] == p[1] && p[1] == p[2])).map(|(k, _)| *k).collect();
     if colour.is_empty() {
-        return graph.evaluate_in(ec, Some(side), &images).map_err(|e| e.to_string());
+        // (the images handed over: the runtime holds them without a copy)
+        return graph.evaluate_owned(ec, Some(side), images).map_err(|e| e.to_string());
     }
     let mut merged: BTreeMap<String, Tex> = BTreeMap::new();
     for c in 0..3 {
