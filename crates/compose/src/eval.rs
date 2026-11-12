@@ -51,6 +51,15 @@ impl Acc {
     fn get_mut(&mut self, ch: usize) -> Option<&mut [f32; 3]> {
         self.v.get_mut(ch)
     }
+
+    /// What an effect layer's channel `c` starts from ([`starts_from_below`]): the stack's shown value and its
+    /// coverage. None on other channels.
+    fn below(&self, c: &ChanPlan) -> Option<([f32; 3], f32)> {
+        if !c.from_below {
+            return None;
+        }
+        Some((*self.v.get(c.ch)?, self.cov.get(c.ch).copied().unwrap_or(0.0)))
+    }
 }
 
 /// What a live stroke paints into.
@@ -754,7 +763,7 @@ fn stack_region(
                     let value = match (&mask, nodes.first()) {
                         (Some(mask_stack), _) => [texel.mask(mask_stack), 0.0, 0.0, 0.0],
                         (None, Some(node)) => match node.chans.first().and_then(|chan| {
-                            let below = if chan.from_below { acc.and_then(|a| a.get(chan.ch).copied()) } else { None };
+                            let below = acc.and_then(|a| a.below(chan));
                             texel.content_over(&node.content, chan, usize::MAX, below)
                         }) {
                             Some((color, cov)) => [color[0] * cov, color[1] * cov, color[2] * cov, cov],
@@ -1581,7 +1590,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     }
 
     /// [`Texel::content`] through the tape: the coverage (0 where empty), then the value.
-    fn tape_content(&mut self, content: &Content, c: &ChanPlan, below: Option<[f32; 3]>) -> Option<([f32; 3], f32)> {
+    fn tape_content(&mut self, content: &Content, c: &ChanPlan, below: Option<([f32; 3], f32)>) -> Option<([f32; 3], f32)> {
         if let Tape::Replay(..) = self.tape {
             let cov = self.tape.next();
             // Recorded as 0 where empty.
@@ -2083,7 +2092,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                 Content::Fill(_) | Content::Paint { .. } if m > 0.0 => {
                     let before = if n.anchors.iter().any(|a| a.1.is_some()) { Some(*acc) } else { None };
                     for c in &n.chans {
-                        let below = if c.from_below { acc.get(c.ch).copied() } else { None };
+                        let below = acc.below(c);
                         if let Some((v, cov)) = self.tape_content(&n.content, c, below) {
                             apply(acc, c, v, cov, m);
                         }
@@ -2093,7 +2102,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                         let rec = match (cut, before) {
                             (Some(k), Some(mut b)) => {
                                 for c in &n.chans {
-                                    let below = if c.from_below { b.get(c.ch).copied() } else { None };
+                                    let below = b.below(c);
                                     if let Some((v, cov)) = self.content_over(&n.content, c, *k, below) {
                                         apply(&mut b, c, v, cov, m);
                                     }
@@ -2240,10 +2249,11 @@ impl<'a, 'b> Texel<'a, 'b> {
         self.content_over(content, c, end, None)
     }
 
-    /// [`Texel::content_to`] starting from `below` when given (an effect layer's channel: the stack below it, fully
-    /// covered, with the layer's own paint or fill laid over it before its effects). A precomputed field already
-    /// holds it.
-    fn content_over(&mut self, content: &Content, c: &ChanPlan, end: usize, below: Option<[f32; 3]>) -> Option<([f32; 3], f32)> {
+    /// [`Texel::content_to`] starting from `below` when given (an effect layer's channel: the stack below it, shown
+    /// value and coverage, with the layer's own paint or fill laid over it before its effects). TextureCraft's own
+    /// rules take the stack as fully covered; the measured rules keep its coverage, so over nothing an effect layer
+    /// filters nothing and adds only its own paint or fill. A precomputed field already holds it.
+    fn content_over(&mut self, content: &Content, c: &ChanPlan, end: usize, below: Option<([f32; 3], f32)>) -> Option<([f32; 3], f32)> {
         let start = c.start.filter(|(k, _)| *k < end);
         let (mut v, mut cov, skip) = match start.and_then(|(k, f)| f.get(self.x, self.y).map(|d| (k, d))) {
             Some((k, d)) => {
@@ -2266,7 +2276,14 @@ impl<'a, 'b> Texel<'a, 'b> {
                     Content::Group(_) => return None,
                 };
                 match below {
-                    Some(b) => (mix3(b, v, cov.clamp(0.0, 1.0)), 1.0, 0),
+                    Some((b, a)) if c.rules.is_measured() => {
+                        let empty = Channel::ALL.get(c.ch).map_or([0.0; 3], |d| d.default_value());
+                        let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
+                        let b = if a > 0.0 { [0, 1, 2].map(|i| (b[i] - empty[i] * (1.0 - a)) / a) } else { empty };
+                        let (v, cov) = over(c, BlendMode::Normal, b, a, v, cov.clamp(0.0, 1.0));
+                        (v, cov, 0)
+                    }
+                    Some((b, _)) => (mix3(b, v, cov.clamp(0.0, 1.0)), 1.0, 0),
                     None => (v, cov, 0),
                 }
             }
@@ -2444,7 +2461,14 @@ fn apply(acc: &mut Acc, c: &ChanPlan, v: [f32; 3], cov: f32, mask: f32) {
     let Some(a) = acc.get(c.ch).copied() else { return };
     if c.rules.is_measured() {
         let (Some(&below), Some(empty)) = (acc.cov.get(c.ch), Channel::ALL.get(c.ch).map(|d| d.default_value())) else { return };
-        let (out, out_cov) = mix_over(c.blend, a, below, v, cov, c.opacity * mask, empty, c.unit, c.comps);
+        let (out, out_cov) = if c.from_below {
+            // An effect layer's content is the stack below carried on: it takes the stack's place, value and
+            // coverage, by the layer's strength.
+            let shown = [0, 1, 2].map(|i| v[i] * cov + empty[i] * (1.0 - cov));
+            mix_over(BlendMode::Replace, a, below, shown, cov, c.opacity * mask, empty, c.unit, c.comps)
+        } else {
+            mix_over(c.blend, a, below, v, cov, c.opacity * mask, empty, c.unit, c.comps)
+        };
         if let (Some(slot), Some(slot_cov)) = (acc.v.get_mut(c.ch), acc.cov.get_mut(c.ch)) {
             *slot = out;
             *slot_cov = out_cov;
@@ -3803,6 +3827,38 @@ soft {soft:?}"
         }
         let [_, measured] = both_rules(&mut f);
         assert!(near(measured.0, 0.55) && near(measured.1, 0.3), "{measured:?}");
+    }
+
+    #[test]
+    fn measured_rules_effect_layers_over_nothing_add_nothing() {
+        // the stack: roughness 0.6; on top an isolating folder holding only an effect layer (a point filter, then a
+        // neighbourhood one) that passes roughness through
+        for filter in [Filter::Invert, Filter::Sharpen { amount: 1.0 }] {
+            let mut f = fixture();
+            rule_fill(&mut f, &[(Channel::Roughness, 0.6, BlendMode::Normal, 1.0)], None);
+            let gid = f.project.alloc_id();
+            let mut g = Layer::new(gid, "G", LayerKind::Group { children: vec![], collapsed: false }, &[]);
+            g.channels.insert(Channel::Roughness, ChannelBlend { mode: BlendMode::Normal, opacity: 1.0 });
+            let gid = f.project.insert_layer(0, g, None, false).unwrap();
+            let fx = f.project.alloc_id();
+            let mut l = Layer::new(fx, "Filter", LayerKind::Paint, &[]);
+            l.channels.insert(Channel::Roughness, ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 });
+            let fx = f.project.insert_layer(0, l, Some(gid), true).unwrap();
+            content_fx(&mut f, fx, EffectKind::Filter(filter.clone()));
+            let [native, measured] = both_rules(&mut f);
+            let want = if matches!(filter, Filter::Invert) { 0.4 } else { 0.6 };
+            assert!(near(native.0, want), "TextureCraft's own: the folder passes the filtered stack: {native:?}");
+            assert!(near(measured.0, 0.6), "measured: the folder starts from nothing, the filter adds nothing: {measured:?}");
+
+            // with a fill below it inside the folder the filter works on that fill
+            let inner = rule_fill(&mut f, &[(Channel::Roughness, 0.3, BlendMode::Normal, 1.0)], Some(gid));
+            let LayerKind::Group { children, .. } = &mut f.project.layer_mut(gid).unwrap().kind else { panic!("expected a folder") };
+            children.retain(|c| *c != inner);
+            children.insert(0, inner);
+            let [_, measured] = both_rules(&mut f);
+            let want = if matches!(filter, Filter::Invert) { 0.7 } else { 0.3 };
+            assert!(near(measured.0, want), "{filter:?}: {measured:?}");
+        }
     }
 
     #[test]
