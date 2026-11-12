@@ -488,7 +488,13 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
             self.note(Channel::BaseColor, &status);
         }
         if !runs.picks_nothing() {
-            self.fills.push(FillJob { effect: id, channel: Some(Channel::BaseColor), runs: runs.runs, label: format!("{} / polygon fill", self.path) });
+            self.fills.push(FillJob {
+                effect: id,
+                channel: Some(Channel::BaseColor),
+                runs: runs.runs,
+                label: format!("{} / polygon fill", self.path),
+                over_strokes: false,
+            });
         }
     }
 
@@ -697,9 +703,6 @@ pub fn reference(anchors: &Anchors, r: &ReferenceSource, channel: Channel) -> Re
     let Some(info) = r.anchor_uid.and_then(|u| anchors.get(&u)) else {
         return Err(Status::not_computable(Blocker::feature("missing-anchor", "reference to an anchor that is not in the set")));
     };
-    if info.in_mask {
-        return Err(Status::not_computable(Blocker::feature("mask-anchor", "reference to an anchor in a mask")));
-    }
     if !info.status.is_computable() {
         let mut s = Status::Exact;
         for b in info.status.blockers() {

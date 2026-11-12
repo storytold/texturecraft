@@ -243,6 +243,29 @@ fn references_read_the_anchor_effect_by_its_id() {
 }
 
 #[test]
+fn anchors_inside_masks_are_recorded_and_read() {
+    let mark = || ProjectEffect::Anchor(EffectHeader { uid: Some(42), enabled: true, ..EffectHeader::default() });
+    let read = |uid: u64| fill(uid, 0, vec![ProjectSource::Reference(reference(Some(42)))], vec![]);
+    // the anchor and a fill reading it in the same mask, and a layer above reading it
+    let mut low = layer(1, "Low", ProjectLayerKind::Fill, vec![fill(2, ROUGH, vec![uniform(ROUGH, [1.0; 3])], vec![])]);
+    low.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::Black, effects: vec![fill(3, 0, vec![uniform(0, [0.4; 3])], vec![]), mark(), read(4)] });
+    let mut top = layer(5, "Top", ProjectLayerKind::Fill, vec![fill(6, ROUGH, vec![uniform(ROUGH, [0.5; 3])], vec![])]);
+    top.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::Black, effects: vec![read(7)] });
+    let stack = build(vec![low, top]);
+    assert!(stack.verdict.all_exact(), "{:?}", stack.verdict);
+    let low = by_name(&stack, "Low");
+    assert!(low.lock.is_none(), "{:?}", low.lock);
+    let m = low.mask.as_ref().unwrap();
+    let anchor_id = m.effects.iter().find(|e| matches!(e.kind, EffectKind::Anchor)).unwrap().id;
+    assert!(matches!(&m.effects[2].kind, EffectKind::Fill { source: Source::Anchor { anchor, .. }, .. } if *anchor == anchor_id));
+    let t = by_name(&stack, "Top");
+    assert!(
+        t.lock.is_none()
+            && matches!(&t.mask.as_ref().unwrap().effects[0].kind, EffectKind::Fill { source: Source::Anchor { anchor, .. }, .. } if *anchor == anchor_id)
+    );
+}
+
+#[test]
 fn fills_split_by_blend_and_levels_take_the_reciprocal_gamma() {
     let fx = fill(3, BASE | ROUGH, vec![uniform(BASE, [1.0, 0.0, 0.0]), uniform(ROUGH, [0.5; 3])], vec![blend(BASE, 4, 1.0), blend(ROUGH, 2, 0.5)]);
     let levels = ProjectEffect::Levels(LevelsEffect {
@@ -557,6 +580,41 @@ fn build_with_mesh(layers: Vec<ProjectLayer>, mesh: &texturecraft_geom::Mesh) ->
         geometry: Some(&geometry),
     };
     import(&set(layers), &input, 10)
+}
+
+#[test]
+fn a_mask_group_of_strokes_with_polygon_fills_above_them_is_one_paint_effect() {
+    use texturecraft_import_reader::model::ProjectBlendMode;
+    let mesh = quad_mesh();
+    let build = |group: ProjectEffect| {
+        let mut l = layer(1, "Masked", ProjectLayerKind::Fill, vec![fill(2, ROUGH, vec![uniform(ROUGH, [1.0; 3])], vec![])]);
+        l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::White, effects: vec![group] });
+        let (channels, images, options, parts) = (channels(), ProjectImages::none(), ImportOptions::default(), ["Body".to_string()]);
+        let geometry = crate::polygon_fill::geometry::SetGeometry::new(&mesh, 0, &[vec![true, false]]);
+        let input = SetInput {
+            channels: &channels,
+            images: &images,
+            mesh_maps: &[],
+            parts: &parts,
+            options: &options,
+            replay: true,
+            graphs: None,
+            geometry: Some(&geometry),
+        };
+        import(&set(vec![l]), &input, 10)
+    };
+    let brush = || painting(5, 0, PaintTool::Brush, vec![uniform(0, [1.0; 3])]);
+    let stack = build(mask_group(4, ProjectBlendMode::Subtract, 1.0, vec![brush(), polygon_fill(6, 1.0, [0.9, 0.1], vec![])]));
+    let m = by_name(&stack, "Masked").mask.as_ref().unwrap();
+    assert_eq!(m.effects.len(), 1, "{:?}", m.effects);
+    assert_eq!((m.effects[0].kind.clone(), m.effects[0].blend), (EffectKind::Paint, BlendMode::Subtract));
+    assert_eq!(stack.jobs.len(), 1);
+    assert_eq!(stack.fills.len(), 1);
+    assert!(stack.fills[0].over_strokes && stack.fills[0].effect == m.effects[0].id);
+    // strokes above a polygon fill: laid flat, as before
+    let stack = build(mask_group(4, ProjectBlendMode::Subtract, 1.0, vec![polygon_fill(6, 1.0, [0.9, 0.1], vec![]), brush()]));
+    assert_eq!(by_name(&stack, "Masked").mask.as_ref().unwrap().effects.len(), 2);
+    assert!(stack.fills.iter().all(|f| !f.over_strokes));
 }
 
 #[test]

@@ -28,6 +28,7 @@ use crate::graph_library::GraphLibrary;
 use crate::image::Rgba;
 use crate::layers::{self, ImportedStack, SetInput};
 use crate::options::ImportOptions;
+use crate::polygon_fill::FillJob;
 use crate::polygon_fill::geometry::SetGeometry;
 use crate::replay::{ReplayJob, ReplayScene, ReplayTarget, ReplayedPixels, StrokeReplayer};
 use crate::resources::{CacheImage, ProjectImages, read_cache};
@@ -527,6 +528,11 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         // a replayer stopped by the flag fails its remaining jobs: they are not reported as failures
         ctx.hooks.check()?;
     }
+    if let Some(stack) = stack.as_mut()
+        && !stack.fills.is_empty()
+    {
+        lay_fills_over_strokes(stack, ctx.mesh, ctx.source.slot, resolution, &mut out.pixels);
+    }
     if let Some(stack) = &stack {
         insert_stack(project, ts, stack, report);
     }
@@ -685,14 +691,49 @@ fn add_correction(
 }
 
 /// Lays the stack's polygon fills into their paint effects' pixels, over the set's UV G-buffer at `resolution`.
+/// Fills laid over replayed strokes wait for them (see [`lay_fills_over_strokes`]).
 fn lay_polygon_fills(stack: &mut ImportedStack, mesh: &Mesh, slot: usize, resolution: u32, pixels: &mut PixelStore) {
     let gbuf = UvGBuffer::new(mesh, slot, resolution, resolution);
-    for job in std::mem::take(&mut stack.fills) {
+    let (over, now): (Vec<FillJob>, Vec<FillJob>) = std::mem::take(&mut stack.fills).into_iter().partition(|j| j.over_strokes);
+    stack.fills = over;
+    for job in now {
         if let Some(image) = job.paint(&gbuf) {
             match job.channel {
                 None => pixels.masks.insert(job.effect, image),
                 Some(c) => pixels.layers.insert((job.effect, c), image),
             };
+        }
+    }
+}
+
+/// Lays the polygon fills that sit above replayed strokes in a mask group over the strokes' pixels: a picked texel takes
+/// the fill's value at full coverage, as a fill above strokes in one group paints over them.
+fn lay_fills_over_strokes(stack: &mut ImportedStack, mesh: &Mesh, slot: usize, resolution: u32, pixels: &mut PixelStore) {
+    let gbuf = UvGBuffer::new(mesh, slot, resolution, resolution);
+    for job in std::mem::take(&mut stack.fills) {
+        let Some(top) = job.paint(&gbuf) else { continue };
+        let below = match job.channel {
+            None => pixels.masks.get_mut(&job.effect),
+            Some(c) => pixels.layers.get_mut(&(job.effect, c)),
+        };
+        let Some(below) = below.filter(|b| (b.width(), b.height(), b.comps()) == (top.width(), top.height(), top.comps())) else {
+            match job.channel {
+                None => pixels.masks.insert(job.effect, top),
+                Some(c) => pixels.layers.insert((job.effect, c), top),
+            };
+            continue;
+        };
+        let alpha = top.comps().saturating_sub(1);
+        for (tx, ty) in top.allocated().collect::<Vec<_>>() {
+            let side = texturecraft_texel::TILE;
+            for y in ty * side..((ty + 1) * side).min(top.height()) {
+                for x in tx * side..((tx + 1) * side).min(top.width()) {
+                    let px = top.get(x, y);
+                    if px.get(alpha).copied().unwrap_or(0) > 0 {
+                        below.set(x, y, px.get(..top.comps()).unwrap_or_default());
+                    }
+                }
+            }
         }
     }
 }
@@ -983,4 +1024,45 @@ pub(crate) fn resample(image: &Rgba, size: u32) -> Rgba {
         }
     }
     Rgba { width: size, height: size, px }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::polygon_fill::FillRun;
+    use texturecraft_core::LayerId;
+    use texturecraft_texel::TileImage;
+
+    #[test]
+    fn polygon_fills_above_strokes_paint_over_the_strokes_pixels() {
+        use glam::{Vec2, Vec3};
+        let mesh = Mesh {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::Y],
+            normals: vec![Vec3::Z; 4],
+            uvs: vec![Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 0.0)],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            submeshes: vec![texturecraft_geom::SubMesh { name: "Body".into(), material: 0, start: 0, count: 6 }],
+            materials: vec!["m".into()],
+            ..Mesh::default()
+        };
+        // the strokes' pixels: grey 0.5 everywhere; the fill picks triangle 0 at 0
+        let effect = LayerId(7);
+        let mut strokes = TileImage::new(16, 16, 2);
+        for y in 0..16 {
+            for x in 0..16 {
+                strokes.set(x, y, &[u16::MAX / 2, u16::MAX]);
+            }
+        }
+        let mut pixels = PixelStore::default();
+        pixels.masks.insert(effect, strokes);
+        let run = FillRun { color: [0.0; 3], triangles: [0u32].into_iter().collect() };
+        let job = FillJob { effect, channel: None, runs: vec![run], label: String::new(), over_strokes: true };
+        let mut stack = ImportedStack { fills: vec![job], ..ImportedStack::default() };
+        lay_fills_over_strokes(&mut stack, &mesh, 0, 16, &mut pixels);
+        let img = pixels.masks.get(&effect).unwrap();
+        // picked: the fill's value; elsewhere the strokes stay
+        assert_eq!(img.get(14, 14)[..2], [0, u16::MAX]);
+        assert_eq!(img.get(1, 1)[..2], [u16::MAX / 2, u16::MAX]);
+        assert!(stack.fills.is_empty());
+    }
 }

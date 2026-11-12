@@ -269,6 +269,11 @@ impl<'a> Builder<'a> {
         let mut mask = mask::MaskBuilder::new(self.input, self.anchors, &mut self.ids).at(&path).build(l.mask.as_ref());
         self.out.jobs.append(&mut mask.jobs);
         self.out.fills.append(&mut mask.fills);
+        for (anchor, status) in &mask.anchor_status {
+            if let Some(a) = self.out.anchors.get_mut(anchor) {
+                a.status = status.clone();
+            }
+        }
         mask.status.and(&geometry_status);
         let mut note = mask.status.clone();
         let own_settings = settings_status(l);

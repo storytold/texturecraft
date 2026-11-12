@@ -37,6 +37,8 @@ pub struct MaskOutcome {
     pub jobs: Vec<ReplayJob>,
     /// Polygon fills to lay into the mask's paint effects.
     pub fills: Vec<FillJob>,
+    /// What each anchor point in the mask holds: the mask below it, as computable as that is.
+    pub anchor_status: Vec<(u64, Status)>,
 }
 
 pub struct MaskBuilder<'a, 'i> {
@@ -54,6 +56,7 @@ pub struct MaskBuilder<'a, 'i> {
     fills: Vec<FillJob>,
     /// The layer's path, for the replay jobs' labels.
     path: String,
+    anchor_status: Vec<(u64, Status)>,
 }
 
 impl<'a, 'i> MaskBuilder<'a, 'i> {
@@ -75,6 +78,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
             jobs: Vec::new(),
             fills: Vec::new(),
             path: String::new(),
+            anchor_status: Vec::new(),
         }
     }
 
@@ -85,7 +89,9 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
     }
 
     pub fn build(mut self, mask: Option<&ProjectMask>) -> MaskOutcome {
-        let Some(m) = mask else { return MaskOutcome { mask: None, status: Status::Exact, graphs: Vec::new(), jobs: Vec::new(), fills: Vec::new() } };
+        let Some(m) = mask else {
+            return MaskOutcome { mask: None, status: Status::Exact, graphs: Vec::new(), jobs: Vec::new(), fills: Vec::new(), anchor_status: Vec::new() };
+        };
         let background = match m.initial {
             MaskInitial::Black => MaskBackground::Black,
             MaskInitial::White => MaskBackground::White,
@@ -95,7 +101,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                     true => Status::not_computable(Blocker::feature("mask-initial-value", format!("mask initial value {n}"))),
                     false => Status::Exact,
                 };
-                return MaskOutcome { mask: None, status, graphs: Vec::new(), jobs: Vec::new(), fills: Vec::new() };
+                return MaskOutcome { mask: None, status, graphs: Vec::new(), jobs: Vec::new(), fills: Vec::new(), anchor_status: Vec::new() };
             }
         };
         self.counts = m.enabled;
@@ -103,7 +109,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
             self.effect(e, true);
         }
         let mask = Mask { enabled: m.enabled, background, effects: self.effects };
-        MaskOutcome { mask: Some(mask), status: self.status, graphs: self.graphs, jobs: self.jobs, fills: self.fills }
+        MaskOutcome { mask: Some(mask), status: self.status, graphs: self.graphs, jobs: self.jobs, fills: self.fills, anchor_status: self.anchor_status }
     }
 
     /// Adds the status of a part that counts.
@@ -207,13 +213,14 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 self.placeholder(header, &label, &reason, on, why);
                 self.strokes_run = Some((self.effects.len() - 1, p.stroke_count(), 1));
             }
-            ProjectEffect::Anchor(h) => {
-                let why = match self.anchors.get(&h.uid.unwrap_or(0)) {
-                    Some(_) => Status::approximated("anchor point inside a mask (TextureCraft's anchors record layer content)"),
-                    None => Status::Exact,
-                };
-                self.placeholder(header, "anchor point", "anchors inside masks are not recorded", on, why);
-            }
+            // An anchor point records the mask below it (grey on every channel) for the fills reading it
+            ProjectEffect::Anchor(h) => match h.uid.and_then(|u| self.anchors.get(&u).map(|a| (u, a.id))) {
+                Some((uid, id)) => {
+                    self.effects.push(effect(id, &h.label, EffectKind::Anchor, on));
+                    self.anchor_status.push((uid, self.status.clone()));
+                }
+                None => self.placeholder(header, "anchor point", "an anchor point nothing can read", false, Status::Exact),
+            },
             ProjectEffect::Fill(fill) => self.fill(fill, on),
             ProjectEffect::Filter(f) if f.procedural.is_none() => {
                 self.placeholder(header, "filter (none selected)", "the original's filter has no graph selected", false, Status::Exact);
@@ -254,10 +261,13 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         if !self.input.replay {
             return false;
         }
+        // strokes, then (above them all) polygon fills laid over the replayed strokes
         let mut paints = Vec::new();
+        let mut polygons = Vec::new();
         for e in g.effects.iter().filter(|e| e.is_enabled()) {
             match e {
-                ProjectEffect::Paint(p) => paints.push(p),
+                ProjectEffect::Paint(p) if polygons.is_empty() || p.stroke_count() == 0 => paints.push(p),
+                ProjectEffect::PolygonFill(p) => polygons.push(p),
                 _ => return false,
             }
         }
@@ -282,8 +292,26 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
             }
             steps.push(step);
         }
+        let mut picks = Vec::new();
+        for p in polygons {
+            let runs = polygon_fill::runs(self.input.geometry, p);
+            if !runs.status.is_computable() {
+                return false;
+            }
+            status.and(&runs.status);
+            let own = ResolvedBlend::of_mask(&p.header.blending);
+            let plain = p.header.blending.is_empty() || (matches!(own.mode(), BlendMode::Normal | BlendMode::Passthrough) && own.opacity >= 1.0);
+            if !plain {
+                status.and(&Status::approximated(format!(
+                    "polygon fill with its own blend ({:?} {}) inside a mask group laid over normally",
+                    own.mode(),
+                    own.opacity
+                )));
+            }
+            picks.extend(runs.runs);
+        }
         if steps.is_empty() {
-            // a group without strokes changes nothing
+            // a group without strokes changes nothing (one of polygon fills alone is laid by `polygon_fill_group`)
             return true;
         }
         self.push(Some(&g.header), EffectKind::Paint, on);
@@ -292,6 +320,10 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         status.and(&replay_status(&job));
         self.note(on, &status);
         self.jobs.push(job);
+        if picks.iter().any(|r| !r.triangles.is_empty()) {
+            let label = format!("{} / polygon fills of a painted mask group", self.path);
+            self.fills.push(FillJob { effect: id, channel: None, runs: picks, label, over_strokes: true });
+        }
         true
     }
 
@@ -360,7 +392,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
     /// Lays `runs` into the paint effect just pushed.
     fn fill_job(&mut self, runs: Vec<FillRun>, what: &str) {
         let id = self.effects.last().map_or(texturecraft_core::LayerId(0), |e| e.id);
-        self.fills.push(FillJob { effect: id, channel: None, runs, label: format!("{} / {what}", self.path) });
+        self.fills.push(FillJob { effect: id, channel: None, runs, label: format!("{} / {what}", self.path), over_strokes: false });
     }
 
     /// TextureCraft selects within a per-component tolerance on the baked map the selection's bitmap names (the ID map

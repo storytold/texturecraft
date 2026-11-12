@@ -89,6 +89,9 @@ pub struct FillJob {
     pub runs: Vec<FillRun>,
     /// The layer's path, for the report.
     pub label: String,
+    /// Laid over the effect's replayed strokes (a mask group of strokes with polygon fills above them) instead of being
+    /// the effect's only pixels.
+    pub over_strokes: bool,
 }
 
 impl FillJob {
@@ -181,7 +184,7 @@ mod tests {
         assert_eq!(r.runs[0].triangles, BTreeSet::from([0, 1]));
         assert_eq!(r.runs[1].triangles, BTreeSet::from([0]));
         let gbuf = UvGBuffer::new(&m, 0, 16, 16);
-        let job = FillJob { effect: LayerId(5), channel: None, runs: r.runs, label: String::new() };
+        let job = FillJob { effect: LayerId(5), channel: None, runs: r.runs, label: String::new(), over_strokes: false };
         let img = job.paint(&gbuf).unwrap();
         // texel rows run top → bottom like glTF v: the file's lower right (u 0.9, V 0.1) is texel (14, 14)
         let at = |x: u32, y: u32| img.get(x, y).iter().take(2).map(|v| from_u16(*v)).collect::<Vec<_>>();
@@ -200,7 +203,7 @@ mod tests {
         // a click beside the mesh picks nothing and writes nothing
         let r = runs(Some(&g), &fill(vec![click([2.0, 2.0], 1.0, HitGranularity::Mesh)]));
         assert!(r.picks_nothing());
-        let job = FillJob { effect: LayerId(1), channel: None, runs: r.runs, label: String::new() };
+        let job = FillJob { effect: LayerId(1), channel: None, runs: r.runs, label: String::new(), over_strokes: false };
         assert!(job.paint(&UvGBuffer::new(&m, 0, 8, 8)).is_none());
         // an unknown granularity is not computable
         assert!(!runs(Some(&g), &fill(vec![click([0.5, 0.5], 1.0, HitGranularity::Other(7))])).status.is_computable());

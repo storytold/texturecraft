@@ -48,6 +48,11 @@ impl Acc {
         self.v.get(ch)
     }
 
+    /// What an anchor point inside a mask records: the mask's value on every channel, fully covered.
+    fn uniform(value: f32) -> Acc {
+        Acc { v: [[value; 3]; NCH], cov: [1.0; NCH] }
+    }
+
     fn get_mut(&mut self, ch: usize) -> Option<&mut [f32; 3]> {
         self.v.get_mut(ch)
     }
@@ -262,6 +267,7 @@ enum Content<'a> {
 }
 
 struct EffectPlan<'a> {
+    id: LayerId,
     kind: &'a EffectKind,
     blend: BlendMode,
     opacity: f32,
@@ -292,15 +298,31 @@ pub struct Field {
     h: u32,
     comps: usize,
     data: Vec<f32>,
+    /// A mask's anchor points below the filter, each with the mask value it recorded per texel of the region
+    /// (unfiltered): a mask continued from the field records them again.
+    marks: Marks,
 }
 
+/// Anchor points inside a mask with one recorded value per texel of a region.
+type Marks = Vec<(LayerId, Vec<f32>)>;
+
 impl Field {
-    fn get(&self, x: u32, y: u32) -> Option<&[f32]> {
+    fn index(&self, x: u32, y: u32) -> Option<usize> {
         if x < self.x0 || y < self.y0 || x >= self.x0 + self.w || y >= self.y0 + self.h {
             return None;
         }
-        let i = ((y - self.y0) * self.w + (x - self.x0)) as usize * self.comps;
+        Some(((y - self.y0) * self.w + (x - self.x0)) as usize)
+    }
+
+    fn get(&self, x: u32, y: u32) -> Option<&[f32]> {
+        let i = self.index(x, y)? * self.comps;
         self.data.get(i..i + self.comps)
+    }
+
+    /// The mask anchor points recorded below the filter at texel (x, y), with their values.
+    fn marks_at(&self, x: u32, y: u32) -> impl Iterator<Item = (LayerId, f32)> + '_ {
+        let i = self.index(x, y);
+        self.marks.iter().filter_map(move |(id, values)| Some((*id, *values.get(i?)?)))
     }
 }
 
@@ -698,13 +720,19 @@ fn filter_region(
     };
     if let Op::Graph = op {
         let effect = effects.iter().filter(|effect| effect.visible).nth(index)?;
-        let mut data = graph_region(inp, channels, below, id, job, index, effect, (rx0, ry0, w, h), start)?;
+        let (mut data, marks) = graph_region(inp, channels, below, id, job, index, effect, (rx0, ry0, w, h), start)?;
         unpremultiply(&mut data, comps);
-        return Some(Field { x0: rx0, y0: ry0, w, h, comps, data });
+        return Some(Field { x0: rx0, y0: ry0, w, h, comps, data, marks });
     }
-    let (orig, cover, _) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &[]);
-    filtered_region(inp, effects, (index, radius_texels, op), (rx0, ry0, w, h), opacity, comps, job, orig, cover)
+    let (orig, cover, _, marks) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &[]);
+    let mut field = filtered_region(inp, effects, (index, radius_texels, op), (rx0, ry0, w, h), opacity, comps, job, orig, cover)?;
+    field.marks = marks;
+    Some(field)
 }
+
+/// A region's stack values, whether each texel was evaluated, the anchor values asked for and the mask's own anchor
+/// points (see [`stack_region`]).
+type StackRegion = (Vec<f32>, Vec<f32>, Vec<Vec<[f32; 3]>>, Marks);
 
 /// One texel of a region: its position, its stack value and the anchor values recorded below it.
 type RegionTexel = (u32, u32, [f32; 4], Vec<[f32; 3]>);
@@ -722,12 +750,19 @@ fn stack_region(
     index: usize,
     (rx0, ry0, w, h): (u32, u32, u32, u32),
     start: Option<(usize, &Field)>,
-    anchors: &[(LayerId, Channel)],
-) -> (Vec<f32>, Vec<f32>, Vec<Vec<[f32; 3]>>) {
+    asked: &[(LayerId, Channel)],
+) -> StackRegion {
     let comps = match job {
         Job::Mask(_) => 1,
         Job::Content(_) => 4,
     };
+    // A mask's own anchor points are recorded too, for the field to carry them past the filter
+    let own: Vec<LayerId> = match job {
+        Job::Mask(m) => mask_anchors(m).collect(),
+        Job::Content(_) => Vec::new(),
+    };
+    let anchors: Vec<(LayerId, Channel)> = asked.iter().copied().chain(own.iter().map(|a| (*a, Channel::Height))).collect();
+    let anchors = anchors.as_slice();
 
     // Evaluate the stack up to the filter, tile by tile (content premultiplied by coverage)
     let (rx1, ry1) = (rx0 + w, ry0 + h);
@@ -810,7 +845,14 @@ fn stack_region(
             }
         }
     }
-    (orig, cover, recorded)
+    let marks =
+        recorded.split_off(asked.len().min(recorded.len())).into_iter().zip(own).map(|(values, a)| (a, values.into_iter().map(|v| v[0]).collect())).collect();
+    (orig, cover, recorded, marks)
+}
+
+/// The visible anchor points inside a mask.
+fn mask_anchors(m: &Mask) -> impl Iterator<Item = LayerId> + '_ {
+    m.effects.iter().filter(|e| e.visible && matches!(e.kind, EffectKind::Anchor)).map(|e| e.id)
 }
 
 /// For each texel of `region`, the evaluated texel (`evaluated` > 0: on the UV islands) whose value it takes: the nearest
@@ -898,7 +940,7 @@ fn graph_region(
     effect: &Effect,
     (rx0, ry0, w, h): (u32, u32, u32, u32),
     start: Option<(usize, &Field)>,
-) -> Option<Vec<f32>> {
+) -> Option<(Vec<f32>, Marks)> {
     let EffectKind::Graph { graph, .. } = &effect.kind else { return None };
     let own = match job {
         Job::Mask(_) => None,
@@ -913,7 +955,7 @@ fn graph_region(
             _ => None,
         })
         .collect();
-    let (orig, cover, mut recorded) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &anchors);
+    let (orig, cover, mut recorded, marks) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &anchors);
     // the graph reads the stack outside the UV islands too, where the reference app's stack holds values: there it
     // reads the nearest island texel's, not empty
     let padding = outside_padding(inp, &cover, (rx0, ry0, w, h));
@@ -934,7 +976,7 @@ fn graph_region(
             && own.is_some()
             && !others.contains_key(c)
         {
-            let (values, _, _) = stack_region(inp, channels, below, id, Job::Content(*c), index, (rx0, ry0, w, h), None, &[]);
+            let (values, _, _, _) = stack_region(inp, channels, below, id, Job::Content(*c), index, (rx0, ry0, w, h), None, &[]);
             others.insert(*c, padded(&values, 4, &padding));
         }
     }
@@ -1007,12 +1049,12 @@ fn graph_region(
         given.push((*k, to_side(image)));
     }
     let cooked = inp.graphs.cook_for(GraphUse { set: inp.ts, id: effect.id, channel: own }, graph, &env, &given);
-    let (Some(cooked), size) = (cooked, (inp.gbuf.width, inp.gbuf.height)) else { return Some(orig) };
+    let (Some(cooked), size) = (cooked, (inp.gbuf.width, inp.gbuf.height)) else { return Some((orig, marks)) };
     let opacity = effect.opacity.clamp(0.0, 1.0);
     let mut data = orig.clone();
     match own {
         None => {
-            let Some(plane) = cooked.output(graph.output.as_deref()) else { return Some(orig) };
+            let Some(plane) = cooked.output(graph.output.as_deref()) else { return Some((orig, marks)) };
             for i in 0..n {
                 if cover.get(i).copied().unwrap_or(0.0) <= 0.0 {
                     continue;
@@ -1027,8 +1069,8 @@ fn graph_region(
         }
         Some(c) => {
             // a filter naming outputs for other channels leaves this one as it is
-            let Some(output) = graph.output_for(c) else { return Some(orig) };
-            let Some(plane) = cooked.output(output) else { return Some(orig) };
+            let Some(output) = graph.output_for(c) else { return Some((orig, marks)) };
+            let Some(plane) = cooked.output(output) else { return Some((orig, marks)) };
             let linear = cooked.is_linear(output);
             let alpha_plane = graph.output_alphas.get(&c).and_then(|a| cooked.output(Some(a)));
             let cover_rule = Cover::of(graph, c, output.or_else(|| cooked.outputs.keys().next().map(String::as_str)));
@@ -1054,7 +1096,7 @@ fn graph_region(
             }
         }
     }
-    Some(data)
+    Some((data, marks))
 }
 
 /// Neighbourhood filter `op` (with its radius in texels) over a region's stack values (see [`stack_region`]).
@@ -1140,7 +1182,7 @@ fn filtered_region(
     }
 
     unpremultiply(&mut data, comps);
-    Some(Field { x0: rx0, y0: ry0, w, h, comps, data })
+    Some(Field { x0: rx0, y0: ry0, w, h, comps, data, marks: Vec::new() })
 }
 
 /// Clamp filtered masks to 0..1, and turn filtered content back into straight values.
@@ -1319,6 +1361,7 @@ fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tile_x: u32, tile_y
                 _ => None,
             };
             EffectPlan {
+                id: effect.id,
                 kind: &effect.kind,
                 blend: effect.blend,
                 opacity: effect.opacity,
@@ -1443,7 +1486,8 @@ fn plan_node<'a>(
     }
     let mask = layer_mask(inp.project, id).and_then(|m| mask_plan(inp, id, m, tx, ty, fields));
     let anchors = if fx { anchor_cuts(&layer.content_effects) } else { Vec::new() };
-    let has_anchor = !anchors.is_empty() || matches!(&content, Content::Group(nodes) if nodes.iter().any(|n| n.has_anchor));
+    let mask_anchor = layer_mask(inp.project, id).is_some_and(|m| m.enabled && mask_anchors(m).next().is_some());
+    let has_anchor = !anchors.is_empty() || mask_anchor || matches!(&content, Content::Group(nodes) if nodes.iter().any(|n| n.has_anchor));
     // The geometry mask is the layer's own (an instance in another set has other parts).
     let geometry = own.geometry_mask.as_ref().map(|g| Geometry::of(inp, g));
     Some(Node { id, content, chans, mask, anchors, has_anchor, height_mask: layer.height_mask, geometry })
@@ -1994,6 +2038,9 @@ impl<'a, 'b> Texel<'a, 'b> {
         {
             value = filtered;
             skip = filtered_index + 1;
+            for (anchor, recorded) in field.marks_at(self.x, self.y) {
+                self.anchors.push((anchor, Acc::uniform(recorded)));
+            }
         }
 
         for effect in plan.effects.iter().skip(skip) {
@@ -2060,8 +2107,10 @@ impl<'a, 'b> Texel<'a, 'b> {
                         value += (rules.blended1(effect.blend, value, v[0], true) - value) * opacity * cover;
                     }
                 }
+                // An anchor point inside a mask (imported projects) records the mask so far for fills reading it
+                EffectKind::Anchor => self.anchors.push((effect.id, Acc::uniform(value.clamp(0.0, 1.0)))),
                 // Content-only effects; a placeholder passes the mask through unchanged
-                EffectKind::Material(_) | EffectKind::Anchor | EffectKind::Placeholder { .. } => {}
+                EffectKind::Material(_) | EffectKind::Placeholder { .. } => {}
             }
         }
         value.clamp(0.0, 1.0)
@@ -4196,6 +4245,37 @@ soft {soft:?}"
         // An anchor above its reader is not evaluated yet: it reads the channel default (0).
         f.project.move_layer(low, 1).unwrap();
         assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.5; 3]));
+    }
+
+    #[test]
+    fn anchors_inside_masks_record_the_mask_below_them() {
+        let mut f = fixture();
+        fill_layer(&mut f.project, [0.0; 3], 0.0);
+        let low = fill_layer(&mut f.project, [1.0; 3], 0.0);
+        let anchor = f.project.alloc_id();
+        let uniform = |f: &mut Fixture, v: f32| {
+            Effect::new(f.project.alloc_id(), EffectKind::Fill { source: Source::Uniform([v; 3]), projection: Projection::default() })
+        };
+        let read = |f: &mut Fixture| {
+            let source = Source::Anchor { anchor, channel: Channel::Height };
+            Effect::new(f.project.alloc_id(), EffectKind::Fill { source, projection: Projection::default() })
+        };
+        // 0.4, recorded, covered by 0, then read back: 0.4
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects = vec![uniform(&mut f, 0.4), Effect::new(anchor, EffectKind::Anchor), uniform(&mut f, 0.0), read(&mut f)];
+        f.project.layer_mut(low).unwrap().mask = Some(mask.clone());
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.4; 3]));
+        // A neighbourhood filter between the anchor and its reader: the field carries what the anchor recorded
+        let blur = Effect::new(f.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 }));
+        mask.effects.insert(3, blur);
+        f.project.layer_mut(low).unwrap().mask = Some(mask);
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.4; 3]));
+        // A layer above reads it too: 0.5 over 0.4 at 0.4
+        let top = fill_layer(&mut f.project, [0.5; 3], 0.0);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects = vec![read(&mut f)];
+        f.project.layer_mut(top).unwrap().mask = Some(mask);
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.44; 3]));
     }
 
     #[test]
