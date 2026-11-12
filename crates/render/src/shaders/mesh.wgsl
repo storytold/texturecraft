@@ -47,6 +47,7 @@ struct Globals {
 
 // The scene behind transmissive surfaces (screen-space refraction), black when off.
 @group(2) @binding(0) var behind_tex: texture_2d<f32>;
+@group(2) @binding(1) var behind_samp: sampler;
 
 struct VIn {
     @location(0) pos: vec3<f32>,
@@ -540,7 +541,7 @@ fn shade_mesh(i: VOut, front: bool) -> Shaded {
             let suv = vec2<f32>(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5);
             if (p.w > 0.0 && all(suv >= vec2<f32>(0.0)) && all(suv <= vec2<f32>(1.0))) {
                 let lod = g.refr.y * rough * clamp(g.material.w * 2.0 - 2.0, 0.0, 1.0);
-                let seen = textureSampleLevel(behind_tex, samp, suv, lod);
+                let seen = textureSampleLevel(behind_tex, behind_samp, suv, lod);
                 behind = seen.rgb + behind * (1.0 - seen.a);
             }
         }
