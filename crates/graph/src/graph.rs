@@ -4090,7 +4090,7 @@ mod output_size_tests {
 
 /// The kinds [`compute_grey`] can compute on one channel.
 const GREY_KINDS: &[&str] =
-    &["pixel_processor", "transform_matrix", "blend", "levels_mid", "box_blur", "line_blur", "dir_warp", "grad_warp", "grayscale_conversion"];
+    &["pixel_processor", "transform_matrix", "blend", "levels_mid", "box_blur", "line_blur", "dir_warp", "grad_warp", "grayscale_conversion", "output", "dot"];
 
 /// Node `n` computed on one channel, when all its inputs are grey and what it does to them keeps them grey bit for bit
 /// (the same arithmetic on each colour channel, alpha staying exactly 1). `None`: computed in RGBA.
@@ -4148,6 +4148,11 @@ fn compute_grey(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx, steps
                 };
                 Some(from_pairs(after_compute(out, n, s, hs)))
             }
+            _ => None,
+        },
+        // passed on as it is, held: no copy
+        "output" | "dot" => match ins.get("in") {
+            Some(v) if v.dims() == (s, hs) && !rolls(n) => Some(Computed::Held(v.clone())),
             _ => None,
         },
         // grey from any input, its alpha kept
