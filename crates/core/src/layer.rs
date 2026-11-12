@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BlendMode, Channel, ChannelKind, lum};
 
+/// The map a color selection picks from when the file names none.
+fn id_map() -> crate::BakedMap {
+    crate::BakedMap::Id
+}
+
+fn is_id_map(map: &crate::BakedMap) -> bool {
+    *map == crate::BakedMap::Id
+}
+
 mod curvature_detail;
 mod curvature_mode;
 mod geometry_mask;
@@ -1000,10 +1009,13 @@ pub enum EffectKind {
     Generator(Generator),
     Levels(Levels),
     Filter(Filter),
-    /// Select ID-map colors within a tolerance.
+    /// Select colors of a baked map (the ID map unless another is named) within a tolerance.
     ColorSelection {
         colors: Vec<[f32; 3]>,
         tolerance: f32,
+        /// The baked map the colors are picked from.
+        #[serde(default = "id_map", skip_serializing_if = "is_id_map")]
+        map: crate::BakedMap,
     },
     /// Compare the mask with a constant.
     Compare {
@@ -1181,6 +1193,16 @@ impl Layer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_color_selection_without_a_map_picks_from_the_id_map_and_another_map_round_trips() {
+        let old: EffectKind = serde_json::from_str(r#"{"ColorSelection":{"colors":[[0.5,0.5,0.5]],"tolerance":0.1}}"#).unwrap();
+        assert_eq!(old, EffectKind::ColorSelection { colors: vec![[0.5; 3]], tolerance: 0.1, map: crate::BakedMap::Id });
+        assert!(!serde_json::to_string(&old).unwrap().contains("map"), "the ID map is not written, as before");
+        let curvature = EffectKind::ColorSelection { colors: vec![[0.5; 3]], tolerance: 0.0, map: crate::BakedMap::Curvature };
+        let text = serde_json::to_string(&curvature).unwrap();
+        assert_eq!(serde_json::from_str::<EffectKind>(&text).unwrap(), curvature);
+    }
 
     #[test]
     fn generator_offset_shifts_the_mask_value() {

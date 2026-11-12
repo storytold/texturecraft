@@ -95,9 +95,10 @@ fn effect_json(session: &Session, effect: &Effect, content: bool) -> Value {
     match &effect.kind {
         EffectKind::Generator(generator) => out["generator"] = generator_json(generator),
         EffectKind::Levels(levels) => out["levels"] = json!([levels.in_low, levels.in_high, levels.gamma, levels.out_low, levels.out_high]),
-        EffectKind::ColorSelection { colors, tolerance } => {
+        EffectKind::ColorSelection { colors, tolerance, map } => {
             out["colors"] = json!(colors);
             out["tolerance"] = json!(tolerance);
+            out["map"] = json!(map.id());
         }
         EffectKind::Path(paths) => {
             out["paths"] = json!(

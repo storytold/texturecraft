@@ -147,7 +147,7 @@ fn add_color_mask(s: &mut Session, p: &Value) -> Result<Value> {
         let eid = s.doc.project.alloc_id();
         let l = s.doc.project.layer_mut(s.doc.project.mask_owner(id))?;
         let m = l.mask.get_or_insert_with(|| Mask::new(MaskBackground::Black));
-        m.effects.push(Effect::new(eid, EffectKind::ColorSelection { colors: vec![color], tolerance }));
+        m.effects.push(Effect::new(eid, EffectKind::ColorSelection { colors: vec![color], tolerance, map: texturecraft_core::BakedMap::Id }));
         Ok(())
     })?;
     Ok(Value::Null)
@@ -522,7 +522,7 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
                     *source = Source::Uniform([value.clamp(0.0, 1.0); 3]);
                 }
             }
-            EffectKind::ColorSelection { colors, tolerance } => crate::color_selection_cmds::apply_params(params, colors, tolerance)?,
+            EffectKind::ColorSelection { colors, tolerance, .. } => crate::color_selection_cmds::apply_params(params, colors, tolerance)?,
             EffectKind::Compare { tolerance, .. } => {
                 if let Some(value) = f32p(params, "tolerance") {
                     *tolerance = value.clamp(0.0, 1.0);

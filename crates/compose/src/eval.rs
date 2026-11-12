@@ -2028,8 +2028,8 @@ impl<'a, 'b> Texel<'a, 'b> {
                     let filtered = filter.point(ChannelKind::Scalar, [value; 3]).map_or(value, |gray| gray[0]);
                     value += (filtered - value) * opacity;
                 }
-                EffectKind::ColorSelection { colors, tolerance } => {
-                    let id = self.baked_color(BakedMap::Id);
+                EffectKind::ColorSelection { colors, tolerance, map } => {
+                    let id = self.baked_color(*map);
                     let within = |picked: &[f32; 3], color: [f32; 3]| (0..3).all(|component| (picked[component] - color[component]).abs() <= *tolerance);
                     let selected = if id.is_some_and(|color| colors.iter().any(|picked| within(picked, color))) { 1.0 } else { 0.0 };
                     value += (rules.blended1(effect.blend, value, selected, true) - value) * opacity;
@@ -3659,6 +3659,24 @@ mod tests {
                 let expected = if mode == CurvatureMode::Raw { 0.5 } else { 0.0 };
                 assert!(values.iter().all(|value| (value - expected).abs() < 0.001), "{kind:?} {mode:?} paints noise on flat curvature: {values:?}");
             }
+        }
+    }
+
+    #[test]
+    fn color_selection_picks_from_the_baked_map_it_names() {
+        let mut fixture = fixture();
+        // curvature flat (0.5) on the left half, a ridge on the right; the ID map black everywhere
+        let curvature: Vec<f32> = (0..64 * 64).map(|i| if i % 64 < 32 { 0.5 } else { 0.8 }).collect();
+        fixture.baked =
+            BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(curvature)), (BakedMap::Id, Arc::new(vec![0.0; 64 * 64 * 3]))].into() };
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let texels = [(8, 32), (48, 32)];
+        for (map, expected) in [(BakedMap::Curvature, [1.0, 0.0]), (BakedMap::Id, [0.0, 0.0])] {
+            let mut mask = Mask::new(MaskBackground::Black);
+            mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::ColorSelection { colors: vec![[0.5; 3]], tolerance: 0.0, map }));
+            fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+            let values = assert_sparse_mask_matches_image(&fixture, layer, &texels).unwrap();
+            assert!(values.iter().zip(expected).all(|(v, e)| (v - e).abs() < 0.001), "{map:?}: {values:?}");
         }
     }
 

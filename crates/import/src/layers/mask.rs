@@ -11,11 +11,11 @@
 //! flat (approximated unless they pass through or blend normally at full strength). A group of nothing but polygon fills with its
 //! own blending is one paint effect of their picks.
 
-use texturecraft_core::{BlendMode, Effect, EffectKind, Mask, MaskBackground, Source};
+use texturecraft_core::{BakedMap, BlendMode, Effect, EffectKind, Mask, MaskBackground, Source};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{
-    BitmapSource, ColorSelectionEffect, EffectGroup, EffectHeader, FillEffect, MaskInitial, PaintTool, PolygonFillEffect, ProjectEffect, ProjectMask,
-    ProjectSource,
+    BitmapSource, ColorSelectionEffect, EffectGroup, EffectHeader, FillEffect, MaskInitial, MeshMapRef, PaintTool, PolygonFillEffect, ProjectEffect,
+    ProjectMask, ProjectSource,
 };
 
 use super::content::{is_dangling, levels, reference, replay_status};
@@ -25,7 +25,7 @@ use crate::graph_uses::{self, GraphUse};
 use crate::polygon_fill::{self, FillJob, FillRun};
 use crate::replay::brush::StepTarget;
 use crate::replay::{PaintMode, ReplayJob, ReplayTarget};
-use crate::resources::{MeshMapAlias, mesh_map_alias};
+use crate::resources::{MeshMapAlias, mesh_map_alias, split_resource_url};
 use crate::status::Status;
 
 /// The mask for a layer (`None` = no mask) and how exact it is.
@@ -363,12 +363,21 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         self.fills.push(FillJob { effect: id, channel: None, runs, label: format!("{} / {what}", self.path) });
     }
 
-    /// TextureCraft selects within a per-component tolerance on the set's ID map; the file's hardness is left out.
+    /// TextureCraft selects within a per-component tolerance on the baked map the selection's bitmap names (the ID map
+    /// when it names none, or a bitmap that is no mesh map of the set); the file's hardness is left out.
     fn color_selection(&mut self, c: &ColorSelectionEffect, on: bool) {
         let tolerance = if c.tolerance.is_finite() { c.tolerance.clamp(0.0, 1.0) } else { 0.0 };
         self.note(on, &Status::approximated("colour selection: tolerance per component, hardness left out"));
+        let map = match selection_map(&c.bitmap_url, self.input.mesh_maps) {
+            Some(map) => map,
+            None if c.bitmap_url.is_empty() => BakedMap::Id,
+            None => {
+                self.note(on, &Status::approximated("colour selection from a bitmap that is not one of the set's mesh maps: picked on the ID map"));
+                BakedMap::Id
+            }
+        };
         let colors = c.colors.iter().map(|v| v.map(|x| if x.is_finite() { x } else { 0.0 })).collect();
-        self.push(Some(&c.header), EffectKind::ColorSelection { colors, tolerance }, on);
+        self.push(Some(&c.header), EffectKind::ColorSelection { colors, tolerance, map }, on);
     }
 
     /// A fill, by its (first) source.
@@ -447,6 +456,21 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
     }
 }
 
+/// The baked map a colour selection picks from: the mesh map of the set its bitmap URL names (directly, through a mesh
+/// map slot, or by the resource name the file gives baked maps); `None` for any other bitmap and for an empty slot.
+pub(crate) fn selection_map(url: &str, maps: &[MeshMapRef]) -> Option<BakedMap> {
+    let url = match mesh_map_alias(url, maps) {
+        MeshMapAlias::NotAlias => url,
+        MeshMapAlias::Assigned(assigned) => assigned,
+        MeshMapAlias::Unassigned(_) | MeshMapAlias::Unknown => return None,
+    };
+    if let Some(m) = maps.iter().find(|m| m.url == url) {
+        return crate::baked::baked_kind(m.usage);
+    }
+    let (name, _) = split_resource_url(url)?;
+    crate::baked::baked_kind_of_name(name)
+}
+
 /// How many different greys the runs write.
 fn distinct_values(runs: &[FillRun]) -> usize {
     let mut seen: Vec<f32> = Vec::new();
@@ -456,4 +480,35 @@ fn distinct_values(runs: &[FillRun]) -> usize {
         }
     }
     seen.len()
+}
+
+#[cfg(test)]
+mod selection_map_tests {
+    use super::*;
+
+    fn maps() -> Vec<MeshMapRef> {
+        vec![
+            MeshMapRef { usage: Some(0), url: "/Color Map from Mesh S?version=a".to_string() },
+            MeshMapRef { usage: Some(2), url: "/Curvature Map from Mesh S?version=b".to_string() },
+            MeshMapRef { usage: Some(1), url: "resourcealias:AmbientOcclusion".to_string() },
+            MeshMapRef { usage: Some(5), url: "/my thickness?version=c".to_string() },
+        ]
+    }
+
+    #[test]
+    fn a_colour_selection_picks_from_the_mesh_map_its_bitmap_names() {
+        let maps = maps();
+        assert_eq!(selection_map("/Curvature Map from Mesh S?version=b", &maps), Some(BakedMap::Curvature));
+        assert_eq!(selection_map("/Color Map from Mesh S?version=a", &maps), Some(BakedMap::Id));
+        // a slot's assigned map, under any resource name
+        assert_eq!(selection_map("/my thickness?version=c", &maps), Some(BakedMap::Thickness));
+        assert_eq!(selection_map("resourcealias:Thickness", &maps), Some(BakedMap::Thickness));
+        // a baked map the set does not list, by the name the file gives baked maps
+        assert_eq!(selection_map("/Ambient Occlusion Map from Mesh S?version=d", &maps), Some(BakedMap::AmbientOcclusion));
+        // an empty slot, an unknown slot, any other bitmap, nothing
+        assert_eq!(selection_map("resourcealias:AmbientOcclusion", &maps), None);
+        assert_eq!(selection_map("resourcealias:Nonsense", &maps), None);
+        assert_eq!(selection_map("/painted grunge?version=e", &maps), None);
+        assert_eq!(selection_map("", &maps), None);
+    }
 }
