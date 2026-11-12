@@ -307,6 +307,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         report_unhandled_document(document, &mut report);
     }
     imported.resources = images.files();
+    mesh::number_materials_by_appearance(&mut mesh, project.texture_sets.iter_mut().map(|s| &mut s.material));
     project.import = Some(report);
     imported.project = project;
     imported.mesh = mesh;

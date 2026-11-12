@@ -64,9 +64,55 @@ pub fn merge_slots(mesh: &mut Mesh, slot: usize, merged: &[usize]) {
     }
 }
 
+/// Numbers the mesh's materials in the order their triangles first appear, and points `set_materials` (each texture
+/// set's material) along. A saved project stores the mesh as glTF, whose reader numbers materials that way (and leaves
+/// out materials without triangles); numbered otherwise, a reopened project would show each set's layers on another
+/// set's part. Triangle order is kept.
+pub fn number_materials_by_appearance<'a>(mesh: &mut Mesh, set_materials: impl IntoIterator<Item = &'a mut usize>) {
+    let mut order: Vec<usize> = Vec::new();
+    for s in mesh.submeshes.iter().filter(|s| s.count >= 3) {
+        if !order.contains(&s.material) {
+            order.push(s.material);
+        }
+    }
+    for m in 0..mesh.materials.len() {
+        if !order.contains(&m) {
+            order.push(m);
+        }
+    }
+    let new_index = |old: usize| order.iter().position(|m| *m == old).unwrap_or(old);
+    if order.iter().enumerate().all(|(i, m)| i == *m) {
+        return;
+    }
+    for s in &mut mesh.submeshes {
+        s.material = new_index(s.material);
+    }
+    for m in set_materials {
+        *m = new_index(*m);
+    }
+    let names = std::mem::take(&mut mesh.materials);
+    mesh.materials = order.iter().filter_map(|m| names.get(*m).cloned()).collect();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materials_are_numbered_as_a_reopened_project_numbers_them() {
+        let scene = SceneMesh { materials: vec!["a".into(), "b".into(), "c".into()], parts: vec![part(2, true), part(0, true)] };
+        let mut mesh = mesh_of(&scene).unwrap();
+        let mut sets = [0usize, 1, 2];
+        number_materials_by_appearance(&mut mesh, sets.iter_mut());
+        // c's triangles come first, then a's; b has none
+        assert_eq!(mesh.materials, vec!["c".to_string(), "a".to_string(), "b".to_string()]);
+        assert_eq!(mesh.submeshes.iter().map(|s| s.material).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(sets, [1, 2, 0]);
+        // already in order: unchanged
+        let mut again = sets;
+        number_materials_by_appearance(&mut mesh, again.iter_mut());
+        assert_eq!(again, sets);
+    }
     use texturecraft_import_reader::decode::assbin::ScenePart;
 
     fn part(material: usize, normals: bool) -> ScenePart {
