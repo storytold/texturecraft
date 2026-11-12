@@ -6,7 +6,7 @@ use crate::measured::{
     COMPILED_8_BIT, COMPILED_16_BIT, COMPILED_HALF, CUT_16_TO_12, FINE_8, FINE_8_TIE_DOWN, FINE_16, FINE_16_BITS, FINE_16_TIE_DOWN, FORMAT_8_BIT,
     FORMAT_16_BIT, FORMAT_HALF, STEPS_8, STEPS_16, WEIGHT_STEPS,
 };
-use crate::tex::{Tex, lum};
+use crate::tex::{Grey, GreyIn, Tex, Texels, lum};
 use std::f32::consts::{PI, TAU};
 
 fn sm(a: f32, b: f32, x: f32) -> f32 {
@@ -337,7 +337,7 @@ pub fn adjust(t: &Tex, brightness: f32, contrast: f32) -> Tex {
 }
 
 /// Cyclic shift by a fraction of the tile (output pixel (x, y) reads input pixel (x + fx * w, y + fy * h)).
-pub fn roll(t: &Tex, fx: f32, fy: f32) -> Tex {
+pub fn roll<P: crate::tex::Pixel>(t: &crate::tex::Image<P>, fx: f32, fy: f32) -> crate::tex::Image<P> {
     let (w, h) = (t.w, t.h);
     if w == 0 || h == 0 {
         // the remainders below would divide by zero
@@ -345,7 +345,7 @@ pub fn roll(t: &Tex, fx: f32, fy: f32) -> Tex {
     }
     let sx = ((fx * w as f32).round() as i64).rem_euclid(w as i64) as usize;
     let sy = ((fy * h as f32).round() as i64).rem_euclid(h as i64) as usize;
-    Tex { w, h, px: (0..w * h).map(|i| t.px_at(((i / w + sy) % h) * w + (i % w + sx) % w)).collect() }
+    crate::tex::Image { w, h, px: (0..w * h).map(|i| t.px_at(((i / w + sy) % h) * w + (i % w + sx) % w)).collect() }
 }
 
 pub fn invert(t: &Tex) -> Tex {
@@ -642,6 +642,68 @@ pub fn blend_ex(fg: &Tex, bg: &Tex, mask: Option<&Tex>, mode: u32, opacity: f32,
         }
     });
     out
+}
+
+/// [`blend_ex`] on grey images: the same arithmetic on the grey value as on each colour channel there. `None` where the
+/// result would not be grey and opaque bit for bit: the modes that mix the channels (colour, luminosity, dissolve), a
+/// premultiplied copy, images of different sizes, or an alpha that comes out other than exactly 1 at some pixel.
+pub(crate) fn blend_grey(fg: GreyIn, bg: GreyIn, mask: Option<GreyIn>, mode: u32, opacity: f32, alpha_mode: u32, crop: [f32; 4]) -> Option<Grey> {
+    if (17..=19).contains(&mode) || (alpha_mode == 3 && mode == 0) {
+        return None;
+    }
+    if fg.len() != bg.len() || mask.is_some_and(|m| m.len() != bg.len()) {
+        return None;
+    }
+    let (ow, oh) = (bg.width(), bg.height());
+    let mut out = Grey::solid(ow, oh, 0.0);
+    let cropped = crop != [0.0, 0.0, 1.0, 1.0];
+    let not_opaque = std::sync::atomic::AtomicBool::new(false);
+    crate::tex::par_rows(&mut out.px, ow, |start, chunk| {
+        for (j, dst) in chunk.iter_mut().enumerate() {
+            let i = start + j;
+            let f = fg.texel(i);
+            let b = bg.texel(i);
+            let mut m = mask.map(|m| m.texel(i)).map(|p| lum([p, p, p, 1.0])).unwrap_or(1.0) * opacity;
+            if cropped {
+                let (px, py) = (((i % ow) as f32 + 0.5) / ow as f32, ((i / ow) as f32 + 0.5) / oh as f32);
+                if px < crop[0] || px > crop[2] || py < crop[1] || py > crop[3] {
+                    m = 0.0;
+                }
+            }
+            // the alpha the RGBA form gives from two alphas of 1, which must stay 1
+            let (fa, ba) = (1.0f32, 1.0f32);
+            let m_plain = m;
+            let alpha = match alpha_mode {
+                0 | 2 | 3 | 4 if mode == 21 => ba + (fa - ba) * m,
+                4 => {
+                    m *= fa;
+                    ba
+                }
+                0 => {
+                    let a = ba + (fa - ba) * m_plain;
+                    m *= fa;
+                    a
+                }
+                2 | 3 => {
+                    let a = fa * m_plain + ba * (1.0 - fa * m_plain);
+                    m *= fa;
+                    a
+                }
+                _ => ba,
+            };
+            if alpha.to_bits() != 1.0f32.to_bits() {
+                not_opaque.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            *dst = if (32..=35).contains(&mode) {
+                compiled_blend(mode, f, b, m).clamp(0.0, 1.0)
+            } else if mode == 21 {
+                b + (f - b) * m
+            } else {
+                (b + (bm(mode, f, b).clamp(0.0, 1.0) - b) * m).clamp(0.0, 1.0)
+            };
+        }
+    });
+    (!not_opaque.load(std::sync::atomic::Ordering::Relaxed)).then_some(out)
 }
 
 /// The blending modes of compiled graphs in which the opacity scales the foreground (or, for divide, acts before the
@@ -1868,7 +1930,7 @@ pub fn resize_keep_edge(t: &Tex, w: usize, h: usize) -> Tex {
     Tex::from_fn(w, h, |u, v| t.sample(u.clamp(hx, 1.0 - hx), v.clamp(hy, 1.0 - hy)))
 }
 
-pub fn resize_to(t: &Tex, w: usize, h: usize) -> Tex {
+pub fn resize_to<P: crate::tex::Pixel>(t: &crate::tex::Image<P>, w: usize, h: usize) -> crate::tex::Image<P> {
     let (w, h) = (w.max(1), h.max(1));
     if t.w == w && t.h == h {
         return t.clone();
@@ -1876,21 +1938,21 @@ pub fn resize_to(t: &Tex, w: usize, h: usize) -> Tex {
     if t.w >= w && t.h >= h && t.w.is_multiple_of(w) && t.h.is_multiple_of(h) {
         let (fx, fy) = (t.w / w, t.h / h);
         let inv = 1.0 / (fx * fy) as f32;
-        return Tex::from_fn(w, h, |u, v| {
+        return crate::tex::Image::from_fn(w, h, |u, v| {
             let (x0, y0) = (((u * w as f32) as usize).min(w - 1) * fx, ((v * h as f32) as usize).min(h - 1) * fy);
             let mut a = [0.0f32; 4];
             for y in y0..y0 + fy {
                 for x in x0..x0 + fx {
                     let p = t.px_at(y * t.w + x);
-                    for (ac, pc) in a.iter_mut().zip(p) {
-                        *ac += pc;
+                    for (c, ac) in a.iter_mut().enumerate().take(P::CH) {
+                        *ac += p.ch(c);
                     }
                 }
             }
-            [a[0] * inv, a[1] * inv, a[2] * inv, a[3] * inv]
+            P::from_ch(|c| crate::tex::get(&a, c) * inv)
         });
     }
-    Tex::from_fn(w, h, |u, v| t.sample(u, v))
+    crate::tex::Image::from_fn(w, h, |u, v| t.sample(u, v))
 }
 
 // ---------- gradient map with alpha, addressing and smoothness ----------
@@ -2223,7 +2285,7 @@ pub fn quantize_color_full(t: &Tex, k: usize, smoothing: f32, dither: f32, bayer
 /// 0..1 and quantise), 3 = 16 bit float (rounds to half precision, keeps values above 1), 5 to 7 as the compiled format's
 /// nodes hold them ([`compiled_8bit`], [`compiled_16bit`], [`compiled_half`]), anything else = 32 bit float (untouched).
 /// Alpha is treated like the colour channels. The codes are in [`crate::measured`].
-pub fn apply_format(t: &mut Tex, fmt: u32) {
+pub fn apply_format<P: crate::tex::Pixel>(t: &mut crate::tex::Image<P>, fmt: u32) {
     match fmt {
         FORMAT_8_BIT | FORMAT_16_BIT => {
             let k = if fmt == FORMAT_8_BIT { STEPS_8 as f32 } else { STEPS_16 as f32 };
@@ -2240,19 +2302,17 @@ pub fn apply_format(t: &mut Tex, fmt: u32) {
 /// Every channel value of `t` through `f`, spread over the cores in runs of pixels. Never stops early (unlike
 /// `tex::par_rows`, which gives up on a stale editor job): what comes out is always whole, and each value depends on
 /// itself alone, so the result is the same as one pass in order.
-pub fn map_channels(t: &mut Tex, f: impl Fn(f32) -> f32 + Sync) {
+pub fn map_channels<P: crate::tex::Pixel>(t: &mut crate::tex::Image<P>, f: impl Fn(f32) -> f32 + Sync) {
     crate::par::for_each_run_mut(&mut t.px, 1 << 15, |_, run| {
         for p in run {
-            for c in p.iter_mut() {
-                *c = f(*c);
-            }
+            *p = p.each(&f);
         }
     });
 }
 
 /// A read of an integer image: each value rounded half up to a 16-bit step (warps, pyramid levels, doublings). Measurement "What
 /// nodes hold and how they read" ("rounds half up to a 16-bit step").
-pub fn round_to_16bit_read(t: &mut Tex) {
+pub fn round_to_16bit_read<P: crate::tex::Pixel>(t: &mut crate::tex::Image<P>) {
     map_channels(t, |c| (crate::tex::floor64(f64::from(c) * STEPS_16 + 0.5) / STEPS_16) as f32);
 }
 

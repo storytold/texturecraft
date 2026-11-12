@@ -1,11 +1,132 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Float RGBA texture with wrapped (tileable) sampling.
+//! Float images with wrapped (tileable) sampling: RGBA ([`Tex`]) or grey ([`Grey`], one value per pixel standing for
+//! the opaque RGBA pixel `[v, v, v, 1]`).
 
+/// An image of `w` x `h` pixels of type `P`, row by row.
 #[derive(Clone, Debug)]
-pub struct Tex {
+pub struct Image<P> {
     pub w: usize,
     pub h: usize,
-    pub px: Vec<[f32; 4]>,
+    pub px: Vec<P>,
+}
+
+/// A float RGBA image.
+pub type Tex = Image<[f32; 4]>;
+
+/// A grey, opaque float image: pixel `v` is the RGBA pixel `[v, v, v, 1]`. Every operation on it applies to `v` the same
+/// arithmetic the RGBA form applies to each colour channel, so expanding a grey result gives bit for bit what the RGBA
+/// computation gives on the expanded inputs.
+pub type Grey = Image<f32>;
+
+/// A pixel of an [`Image`]: RGBA, or a grey value.
+pub trait Pixel: Copy + Send + Sync + std::fmt::Debug + 'static {
+    /// What a read past the end of an image gives: transparent black (a grey image reads 0).
+    const NONE: Self;
+    /// The same function on each pair of channels.
+    fn zip(self, o: Self, f: impl Fn(f32, f32) -> f32) -> Self;
+    /// The same function on each channel.
+    fn each(self, f: impl Fn(f32) -> f32) -> Self;
+    /// As an RGBA pixel.
+    fn rgba(self) -> [f32; 4];
+    /// How many channels it has.
+    const CH: usize;
+    /// Channel `c` (0 past the last).
+    fn ch(self, c: usize) -> f32;
+    /// A pixel of channels `f(0)`, `f(1)`, ..
+    fn from_ch(f: impl Fn(usize) -> f32) -> Self;
+}
+
+impl Pixel for [f32; 4] {
+    const NONE: Self = [0.0; 4];
+    #[inline(always)]
+    fn zip(self, o: Self, f: impl Fn(f32, f32) -> f32) -> Self {
+        zip4(self, o, f)
+    }
+    #[inline(always)]
+    fn each(self, f: impl Fn(f32) -> f32) -> Self {
+        [f(self[0]), f(self[1]), f(self[2]), f(self[3])]
+    }
+    #[inline(always)]
+    fn rgba(self) -> [f32; 4] {
+        self
+    }
+    const CH: usize = 4;
+    #[inline(always)]
+    fn ch(self, c: usize) -> f32 {
+        get(&self, c)
+    }
+    #[inline(always)]
+    fn from_ch(f: impl Fn(usize) -> f32) -> Self {
+        [f(0), f(1), f(2), f(3)]
+    }
+}
+
+impl Pixel for f32 {
+    const NONE: Self = 0.0;
+    #[inline(always)]
+    fn zip(self, o: Self, f: impl Fn(f32, f32) -> f32) -> Self {
+        f(self, o)
+    }
+    #[inline(always)]
+    fn each(self, f: impl Fn(f32) -> f32) -> Self {
+        f(self)
+    }
+    #[inline(always)]
+    fn rgba(self) -> [f32; 4] {
+        [self, self, self, 1.0]
+    }
+    const CH: usize = 1;
+    #[inline(always)]
+    fn ch(self, c: usize) -> f32 {
+        if c == 0 { self } else { 0.0 }
+    }
+    #[inline(always)]
+    fn from_ch(f: impl Fn(usize) -> f32) -> Self {
+        f(0)
+    }
+}
+
+/// The bits of 1.0: a grey pixel's alpha.
+const ONE_BITS: u32 = 0x3f80_0000;
+
+/// Whether `p` is a grey, opaque pixel bit for bit (the same three colour channels, alpha exactly 1).
+#[inline(always)]
+pub fn is_grey_px(p: [f32; 4]) -> bool {
+    p[0].to_bits() == p[1].to_bits() && p[1].to_bits() == p[2].to_bits() && p[3].to_bits() == ONE_BITS
+}
+
+impl Grey {
+    /// As an RGBA image: each pixel `[v, v, v, 1]`.
+    pub fn expand(&self) -> Tex {
+        let mut px = vec![[0.0f32; 4]; self.px.len()];
+        crate::par::for_each_run_mut(&mut px, 1 << 15, |first, run| {
+            for (i, d) in run.iter_mut().enumerate() {
+                *d = get(&self.px, first + i).rgba();
+            }
+        });
+        Tex { w: self.w, h: self.h, px }
+    }
+
+    /// `t` as a grey image when every pixel of it is grey and opaque bit for bit ([`is_grey_px`]).
+    pub fn of(t: &Tex) -> Option<Grey> {
+        // (the first pixel tells most colour images apart at once)
+        if !t.px.first().is_none_or(|p| is_grey_px(*p)) {
+            return None;
+        }
+        let mut px = vec![0.0f32; t.px.len()];
+        let colour = std::sync::atomic::AtomicBool::new(false);
+        crate::par::for_each_run_mut(&mut px, 1 << 15, |first, run| {
+            for (i, d) in run.iter_mut().enumerate() {
+                let p = t.px_at(first + i);
+                if !is_grey_px(p) {
+                    colour.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                *d = p[0];
+            }
+        });
+        (!colour.load(std::sync::atomic::Ordering::Relaxed)).then_some(Grey { w: t.w, h: t.h, px })
+    }
 }
 
 /// floor() without a libm call: the baseline x86-64 target has no SSE4.1 rounding instruction, so `f32::floor` is a
@@ -51,23 +172,23 @@ pub fn zip4<A: Copy, B: Copy, R>(a: [A; 4], b: [B; 4], f: impl Fn(A, B) -> R) ->
     [f(a[0], b[0]), f(a[1], b[1]), f(a[2], b[2]), f(a[3], b[3])]
 }
 
-impl Tex {
-    pub fn solid(w: usize, h: usize, c: [f32; 4]) -> Tex {
-        Tex { w, h, px: vec![c; w * h] }
+impl<P: Pixel> Image<P> {
+    pub fn solid(w: usize, h: usize, c: P) -> Image<P> {
+        Image { w, h, px: vec![c; w * h] }
     }
 
     /// Build a texture from a per-pixel function of (u, v) in [0,1). Runs multi-threaded.
-    pub fn from_fn<F: Fn(f32, f32) -> [f32; 4] + Sync>(w: usize, h: usize, f: F) -> Tex {
-        Tex::from_fn_with(w, h, || (), |_, u, v| f(u, v))
+    pub fn from_fn<F: Fn(f32, f32) -> P + Sync>(w: usize, h: usize, f: F) -> Image<P> {
+        Image::from_fn_with(w, h, || (), |_, u, v| f(u, v))
     }
 
     /// As [`Tex::from_fn`], with working state: `init` makes it for each band of rows (one per thread), `f` gets it for
     /// each pixel.
     /// What a pixel gets must not depend on the pixels computed with the same state before it.
-    pub fn from_fn_with<S, I: Fn() -> S + Sync, F: Fn(&mut S, f32, f32) -> [f32; 4] + Sync>(w: usize, h: usize, init: I, f: F) -> Tex {
+    pub fn from_fn_with<S, I: Fn() -> S + Sync, F: Fn(&mut S, f32, f32) -> P + Sync>(w: usize, h: usize, init: I, f: F) -> Image<P> {
         let w = w.max(1);
         let h = h.max(1);
-        let mut px = vec![[0.0f32; 4]; w * h];
+        let mut px = vec![P::NONE; w * h];
         // one band of whole rows per thread: a state can be costly to make (a function's position-independent part
         // runs once per state), and a cancel check per row
         let rows_per = h.div_ceil(crate::par::helpers() + 1);
@@ -82,64 +203,53 @@ impl Tex {
                 let x = idx % w;
                 let y = idx / w;
                 let o = f(&mut state, (x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
-                *p = [san(o[0]), san(o[1]), san(o[2]), san(o[3])];
+                *p = o.each(san);
             }
         });
-        Tex { w, h, px }
+        Image { w, h, px }
     }
 
-    pub fn gray_fn<F: Fn(f32, f32) -> f32 + Sync>(w: usize, h: usize, f: F) -> Tex {
-        Tex::from_fn(w, h, |u, v| {
-            let g = f(u, v);
-            [g, g, g, 1.0]
-        })
-    }
-
-    /// Pixel `i` (counted row by row), transparent black past the end.
+    /// Pixel `i` (counted row by row), [`Pixel::NONE`] past the end.
     #[inline]
-    pub fn px_at(&self, i: usize) -> [f32; 4] {
-        self.px.get(i).copied().unwrap_or([0.0; 4])
+    pub fn px_at(&self, i: usize) -> P {
+        self.px.get(i).copied().unwrap_or(P::NONE)
     }
 
     /// Sets pixel `i` (counted row by row); past the end, nothing.
     #[inline]
-    pub fn set_px(&mut self, i: usize, v: [f32; 4]) {
+    pub fn set_px(&mut self, i: usize, v: P) {
         if let Some(p) = self.px.get_mut(i) {
             *p = v;
         }
     }
 
-    pub fn at(&self, x: i64, y: i64) -> [f32; 4] {
-        // a branch instead of a division when the pixel is inside, as most are
-        let wrap = |i: i64, n: usize| if i >= 0 && (i as usize) < n { i as usize } else { i.rem_euclid((n as i64).max(1)) as usize };
-        self.px_at(wrap(y, self.h) * self.w + wrap(x, self.w))
+    pub fn at(&self, x: i64, y: i64) -> P {
+        Texels::at(self, x, y)
     }
 
     /// Bilinear, wrapped sampling in uv space.
     #[inline]
-    pub fn sample(&self, u: f32, v: f32) -> [f32; 4] {
-        let u = if u.is_finite() { u } else { 0.0 };
-        let v = if v.is_finite() { v } else { 0.0 };
-        let x = u * self.w as f32 - 0.5;
-        let y = v * self.h as f32 - 0.5;
-        let x0 = ffloor(x);
-        let y0 = ffloor(y);
-        let fx = x - x0;
-        let fy = y - y0;
-        let (w, h) = (self.w as i64, self.h as i64);
-        // wrap the two columns and the two rows once (a branch instead of a division in the common case)
-        let wrap = |i: i64, n: i64| if i >= 0 && i < n { i } else { i.rem_euclid(n.max(1)) };
-        let (xa, ya) = (wrap(x0 as i64, w), wrap(y0 as i64, h));
-        let xb = if xa + 1 == w { 0 } else { xa + 1 };
-        let yb = if ya + 1 == h { 0 } else { ya + 1 };
-        let (r0, r1) = ((ya * w) as usize, (yb * w) as usize);
-        let a = self.px_at(r0 + xa as usize);
-        let b = self.px_at(r0 + xb as usize);
-        let c = self.px_at(r1 + xa as usize);
-        let d = self.px_at(r1 + xb as usize);
-        let top = zip4(a, b, |a, b| a + (b - a) * fx);
-        let bot = zip4(c, d, |c, d| c + (d - c) * fx);
-        zip4(top, bot, |top, bot| top + (bot - top) * fy)
+    pub fn sample(&self, u: f32, v: f32) -> P {
+        Texels::sample(self, u, v)
+    }
+
+    pub fn map<F: Fn(P) -> P + Sync>(&self, f: F) -> Image<P> {
+        let mut out = self.clone();
+        par_rows(&mut out.px, self.w.max(1), |_, chunk| {
+            for p in chunk.iter_mut() {
+                *p = f(*p);
+            }
+        });
+        out
+    }
+}
+
+impl Tex {
+    pub fn gray_fn<F: Fn(f32, f32) -> f32 + Sync>(w: usize, h: usize, f: F) -> Tex {
+        Tex::from_fn(w, h, |u, v| {
+            let g = f(u, v);
+            [g, g, g, 1.0]
+        })
     }
 
     /// Catmull-Rom (bicubic) wrapped sampling in uv space: sharper than bilinear for rotations, scaling and warps. The
@@ -181,16 +291,6 @@ impl Tex {
         o
     }
 
-    pub fn map<F: Fn([f32; 4]) -> [f32; 4] + Sync>(&self, f: F) -> Tex {
-        let mut out = self.clone();
-        par_rows(&mut out.px, self.w.max(1), |_, chunk| {
-            for p in chunk.iter_mut() {
-                *p = f(*p);
-            }
-        });
-        out
-    }
-
     pub fn gray_at(&self, x: i64, y: i64) -> f32 {
         lum(self.at(x, y))
     }
@@ -198,7 +298,7 @@ impl Tex {
 
 /// Run `f(first_index, chunk)` on consecutive pieces of `px` in parallel. Pieces are 16 whole rows of width `w`, and a
 /// cancelled evaluation stops between pieces, so it gives the CPU back quickly.
-pub fn par_rows<F: Fn(usize, &mut [[f32; 4]]) + Sync>(px: &mut [[f32; 4]], w: usize, f: F) {
+pub fn par_rows<T: Send, F: Fn(usize, &mut [T]) + Sync>(px: &mut [T], w: usize, f: F) {
     let cancel = &crate::context::current_cancel();
     crate::par::for_each_run_mut(px, w.max(1) * 16, |first, piece| {
         if !crate::context::is_set(cancel) {
@@ -281,6 +381,334 @@ mod fast_path_tests {
             for x in -11..12i64 {
                 assert_eq!(t.at(x, y), t.px[y.rem_euclid(3) as usize * 5 + x.rem_euclid(5) as usize], "{x} {y}");
             }
+        }
+    }
+}
+
+/// Images read pixel by pixel: [`Image`]s, and grey images held in steps ([`Grey16`]) read as their values. The reads
+/// here are the same arithmetic for every kind.
+pub trait Texels: Sync {
+    type P: Pixel;
+    fn width(&self) -> usize;
+    fn height(&self) -> usize;
+    /// Pixel `i` (counted row by row), [`Pixel::NONE`] past the end.
+    fn texel(&self, i: usize) -> Self::P;
+
+    /// Pixel (x, y), wrapped.
+    fn at(&self, x: i64, y: i64) -> Self::P {
+        // a branch instead of a division when the pixel is inside, as most are
+        let wrap = |i: i64, n: usize| if i >= 0 && (i as usize) < n { i as usize } else { i.rem_euclid((n as i64).max(1)) as usize };
+        self.texel(wrap(y, self.height()) * self.width() + wrap(x, self.width()))
+    }
+
+    /// Bilinear, wrapped sampling in uv space.
+    #[inline]
+    fn sample(&self, u: f32, v: f32) -> Self::P {
+        let u = if u.is_finite() { u } else { 0.0 };
+        let v = if v.is_finite() { v } else { 0.0 };
+        let x = u * self.width() as f32 - 0.5;
+        let y = v * self.height() as f32 - 0.5;
+        let x0 = ffloor(x);
+        let y0 = ffloor(y);
+        let fx = x - x0;
+        let fy = y - y0;
+        let (w, h) = (self.width() as i64, self.height() as i64);
+        // wrap the two columns and the two rows once (a branch instead of a division in the common case)
+        let wrap = |i: i64, n: i64| if i >= 0 && i < n { i } else { i.rem_euclid(n.max(1)) };
+        let (xa, ya) = (wrap(x0 as i64, w), wrap(y0 as i64, h));
+        let xb = if xa + 1 == w { 0 } else { xa + 1 };
+        let yb = if ya + 1 == h { 0 } else { ya + 1 };
+        let (r0, r1) = ((ya * w) as usize, (yb * w) as usize);
+        let a = self.texel(r0 + xa as usize);
+        let b = self.texel(r0 + xb as usize);
+        let c = self.texel(r1 + xa as usize);
+        let d = self.texel(r1 + xb as usize);
+        let top = a.zip(b, |a, b| a + (b - a) * fx);
+        let bot = c.zip(d, |c, d| c + (d - c) * fx);
+        top.zip(bot, |top, bot| top + (bot - top) * fy)
+    }
+}
+
+impl<P: Pixel> Texels for Image<P> {
+    type P = P;
+    #[inline(always)]
+    fn width(&self) -> usize {
+        self.w
+    }
+    #[inline(always)]
+    fn height(&self) -> usize {
+        self.h
+    }
+    #[inline(always)]
+    fn texel(&self, i: usize) -> P {
+        self.px_at(i)
+    }
+}
+
+impl Texels for Grey16 {
+    type P = f32;
+    #[inline(always)]
+    fn width(&self) -> usize {
+        self.w
+    }
+    #[inline(always)]
+    fn height(&self) -> usize {
+        self.h
+    }
+    #[inline(always)]
+    fn texel(&self, i: usize) -> f32 {
+        match self.px.get(i) {
+            Some(k) => f32::from(*k) / self.div,
+            None => 0.0,
+        }
+    }
+}
+
+/// A grey image held in whole steps: pixel `k` is the grey value `k as f32 / div` (an image quantised to 8 or 16 bits
+/// holds nothing else, so it is kept in a eighth of the memory of RGBA floats).
+#[derive(Clone, Debug)]
+pub struct Grey16 {
+    pub w: usize,
+    pub h: usize,
+    pub px: Vec<u16>,
+    pub div: f32,
+}
+
+impl Grey16 {
+    /// `g` in steps of `1 / div`, when every value of it is exactly `k as f32 / div` for a whole `k` (bit for bit).
+    pub(crate) fn of(g: &Grey, div: f32) -> Option<Grey16> {
+        let mut px = vec![0u16; g.px.len()];
+        let inexact = std::sync::atomic::AtomicBool::new(false);
+        crate::par::for_each_run_mut(&mut px, 1 << 15, |first, run| {
+            for (i, d) in run.iter_mut().enumerate() {
+                let v = get(&g.px, first + i);
+                let k = (v * div).round();
+                let q = if (0.0..=65535.0).contains(&k) { k as u16 } else { 0 };
+                if !(0.0..=65535.0).contains(&k) || (f32::from(q) / div).to_bits() != v.to_bits() {
+                    inexact.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                *d = q;
+            }
+        });
+        (!inexact.load(std::sync::atomic::Ordering::Relaxed)).then_some(Grey16 { w: g.w, h: g.h, px, div })
+    }
+
+    /// The grey values.
+    pub(crate) fn widen(&self) -> Grey {
+        let mut px = vec![0.0f32; self.px.len()];
+        let div = self.div;
+        crate::par::for_each_run_mut(&mut px, 1 << 15, |first, run| {
+            for (i, d) in run.iter_mut().enumerate() {
+                *d = f32::from(get(&self.px, first + i)) / div;
+            }
+        });
+        Grey { w: self.w, h: self.h, px }
+    }
+
+    /// As an RGBA image: each pixel `[v, v, v, 1]`.
+    pub(crate) fn expand(&self) -> Tex {
+        let mut px = vec![[0.0f32; 4]; self.px.len()];
+        let div = self.div;
+        crate::par::for_each_run_mut(&mut px, 1 << 15, |first, run| {
+            for (i, d) in run.iter_mut().enumerate() {
+                *d = (f32::from(get(&self.px, first + i)) / div).rgba();
+            }
+        });
+        Tex { w: self.w, h: self.h, px }
+    }
+}
+
+/// A node result as the runtime holds it: RGBA, or grey (a quarter of the memory) when every pixel is grey and opaque,
+/// in whole 8- or 16-bit steps (an eighth) when its format quantises it.
+#[derive(Clone, Debug)]
+pub(crate) enum Val {
+    Rgba(std::sync::Arc<Tex>),
+    Grey(std::sync::Arc<Grey>),
+    Grey16(std::sync::Arc<Grey16>),
+}
+
+impl Val {
+    /// `t`, held grey when it is grey bit for bit.
+    pub(crate) fn of(t: Tex) -> Val {
+        match Grey::of(&t) {
+            Some(g) => Val::Grey(std::sync::Arc::new(g)),
+            None => Val::Rgba(std::sync::Arc::new(t)),
+        }
+    }
+
+    /// As an RGBA image (a grey one expanded: a new image).
+    pub(crate) fn tex(&self) -> std::sync::Arc<Tex> {
+        match self {
+            Val::Rgba(t) => t.clone(),
+            Val::Grey(g) => std::sync::Arc::new(g.expand()),
+            Val::Grey16(g) => std::sync::Arc::new(g.expand()),
+        }
+    }
+
+    /// Held in steps of `1 / div` when it is grey and exactly that; else as it is.
+    pub(crate) fn quantised(self, div: f32) -> Val {
+        match &self {
+            Val::Grey(g) => match Grey16::of(g, div) {
+                Some(q) => Val::Grey16(std::sync::Arc::new(q)),
+                None => self,
+            },
+            _ => self,
+        }
+    }
+
+    pub(crate) fn dims(&self) -> (usize, usize) {
+        match self {
+            Val::Rgba(t) => (t.w, t.h),
+            Val::Grey(g) => (g.w, g.h),
+            Val::Grey16(g) => (g.w, g.h),
+        }
+    }
+
+    /// Bytes of pixels held.
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            Val::Rgba(t) => t.px.len() * 16,
+            Val::Grey(g) => g.px.len() * 4,
+            Val::Grey16(g) => g.px.len() * 2,
+        }
+    }
+
+    /// As an image a function reads.
+    pub(crate) fn img_ref(&self) -> ImgRef<'_> {
+        match self {
+            Val::Rgba(t) => ImgRef::Rgba(t),
+            Val::Grey(g) => ImgRef::Grey(g),
+            Val::Grey16(g) => ImgRef::Grey16(g),
+        }
+    }
+
+    /// The grey values, however they are held; `None` for RGBA.
+    pub(crate) fn grey_in(&self) -> Option<GreyIn<'_>> {
+        match self {
+            Val::Grey(g) => Some(GreyIn::F(g)),
+            Val::Grey16(g) => Some(GreyIn::Q(g)),
+            Val::Rgba(_) => None,
+        }
+    }
+}
+
+/// An image a function reads: RGBA, or grey (read as `[v, v, v, 1]`, the same values the expanded image gives).
+#[derive(Clone, Copy, Debug)]
+pub enum ImgRef<'a> {
+    Rgba(&'a Tex),
+    Grey(&'a Grey),
+    Grey16(&'a Grey16),
+}
+
+impl<'a> From<&'a Tex> for ImgRef<'a> {
+    fn from(t: &'a Tex) -> ImgRef<'a> {
+        ImgRef::Rgba(t)
+    }
+}
+
+impl ImgRef<'_> {
+    pub fn w(&self) -> usize {
+        match self {
+            ImgRef::Rgba(t) => t.w,
+            ImgRef::Grey(t) => t.w,
+            ImgRef::Grey16(t) => t.w,
+        }
+    }
+
+    pub fn h(&self) -> usize {
+        match self {
+            ImgRef::Rgba(t) => t.h,
+            ImgRef::Grey(t) => t.h,
+            ImgRef::Grey16(t) => t.h,
+        }
+    }
+
+    /// Pixel (x, y), wrapped: [`Image::at`].
+    pub fn at(&self, x: i64, y: i64) -> [f32; 4] {
+        match self {
+            ImgRef::Rgba(t) => t.at(x, y),
+            ImgRef::Grey(t) => t.at(x, y).rgba(),
+            ImgRef::Grey16(t) => Texels::at(*t, x, y).rgba(),
+        }
+    }
+
+    /// Bilinear, wrapped: [`Image::sample`].
+    pub fn sample(&self, u: f32, v: f32) -> [f32; 4] {
+        match self {
+            ImgRef::Rgba(t) => t.sample(u, v),
+            ImgRef::Grey(t) => t.sample(u, v).rgba(),
+            ImgRef::Grey16(t) => Texels::sample(*t, u, v).rgba(),
+        }
+    }
+
+    /// Every pixel in order, as RGBA.
+    pub fn for_each_px(&self, mut f: impl FnMut([f32; 4])) {
+        match self {
+            ImgRef::Rgba(t) => t.px.iter().for_each(|p| f(*p)),
+            ImgRef::Grey(t) => t.px.iter().for_each(|p| f(p.rgba())),
+            ImgRef::Grey16(t) => (0..t.px.len()).for_each(|i| f(t.texel(i).rgba())),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            ImgRef::Rgba(t) => t.px.len(),
+            ImgRef::Grey(t) => t.px.len(),
+            ImgRef::Grey16(t) => t.px.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A grey image as held: floats, or steps.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GreyIn<'a> {
+    F(&'a Grey),
+    Q(&'a Grey16),
+}
+
+impl GreyIn<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            GreyIn::F(g) => g.px.len(),
+            GreyIn::Q(g) => g.px.len(),
+        }
+    }
+
+    /// As floats (a new image when held in steps).
+    pub(crate) fn floats(&self) -> std::borrow::Cow<'_, Grey> {
+        match self {
+            GreyIn::F(g) => std::borrow::Cow::Borrowed(*g),
+            GreyIn::Q(g) => std::borrow::Cow::Owned(g.widen()),
+        }
+    }
+}
+
+impl Texels for GreyIn<'_> {
+    type P = f32;
+    #[inline(always)]
+    fn width(&self) -> usize {
+        match self {
+            GreyIn::F(g) => g.w,
+            GreyIn::Q(g) => g.w,
+        }
+    }
+    #[inline(always)]
+    fn height(&self) -> usize {
+        match self {
+            GreyIn::F(g) => g.h,
+            GreyIn::Q(g) => g.h,
+        }
+    }
+    #[inline(always)]
+    fn texel(&self, i: usize) -> f32 {
+        match self {
+            GreyIn::F(g) => g.px_at(i),
+            GreyIn::Q(g) => g.texel(i),
         }
     }
 }

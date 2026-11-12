@@ -24,7 +24,7 @@ use crate::func::{FnEnv, FnFrame, FnState, Prog, Value, compile_named};
 use crate::graph::{Graph, Node, Spec};
 use crate::lcg_rand;
 use crate::math;
-use crate::tex::Tex;
+use crate::tex::{ImgRef, Tex};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -198,7 +198,7 @@ impl Walk<'_> {
         env.cell = self.cell;
         env.graph_inputs = self.ctx.graph_inputs;
         for (slot, t) in crate::graph::IMAGE_SLOTS.iter().zip(self.images) {
-            env.images.push((slot, t));
+            env.images.push((slot, ImgRef::Rgba(t)));
         }
         prog.bind(&env, frame);
         // every expression starts from the record's state
@@ -538,13 +538,13 @@ const MAX_MIP_LEVEL: f32 = 12.0;
 
 /// Level `level` of the image's pyramid, each level the 2x2 mean of the one before, an axis stopping at one pixel. `None`
 /// for level 0: the image itself.
-pub fn mip_of(t: &Tex, level: u32) -> Option<Tex> {
+pub fn mip_of<P: crate::tex::Pixel>(t: &crate::tex::Image<P>, level: u32) -> Option<crate::tex::Image<P>> {
     let (w, h) = (t.w.checked_shr(level).unwrap_or(0).max(1), t.h.checked_shr(level).unwrap_or(0).max(1));
     if level == 0 || (w, h) == (t.w, t.h) {
         return None;
     }
     // each level is the 2x2 mean of the one before, rounded half up to a 16-bit step
-    let half = |t: &Tex| {
+    let half = |t: &crate::tex::Image<P>| {
         let mut m = crate::ops::resize_to(t, (t.w / 2).max(1), (t.h / 2).max(1));
         crate::ops::round_to_16bit_read(&mut m);
         m

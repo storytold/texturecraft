@@ -25,7 +25,7 @@ pub use vm::Frame as FnFrame;
 use crate::graph::{Graph, Pin, Spec};
 use crate::math;
 use crate::noise::rnd;
-use crate::tex::{Tex, get, lum};
+use crate::tex::{ImgRef, get, lum};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -34,17 +34,17 @@ use std::sync::Arc;
 const HUGE: f64 = 1e30;
 
 /// A pixel of `t` at (u, v): `filter` bit 0 bilinear, else nearest; bit 1 keep the edge, else repeat.
-fn sample_filtered(t: &Tex, u: f32, v: f32, filter: u32) -> [f32; 4] {
+fn sample_filtered(t: ImgRef, u: f32, v: f32, filter: u32) -> [f32; 4] {
     let (u, v) = if filter & 2 != 0 { (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0)) } else { (u, v) };
     if filter & 1 == 0 {
         let at = |a: f32, n: usize| {
             let i = (a * n as f32).floor() as i64;
             if filter & 2 != 0 { i.clamp(0, n as i64 - 1) } else { i }
         };
-        return t.at(at(u, t.w), at(v, t.h));
+        return t.at(at(u, t.w()), at(v, t.h()));
     }
     if filter & 2 != 0 {
-        let (hx, hy) = (0.5 / t.w as f32, 0.5 / t.h as f32);
+        let (hx, hy) = (0.5 / t.w() as f32, 0.5 / t.h() as f32);
         return t.sample(u.clamp(hx, 1.0 - hx), v.clamp(hy, 1.0 - hy));
     }
     t.sample(u, v)
@@ -926,7 +926,7 @@ pub struct FnEnv<'a> {
     /// the cell a pattern program is walking: its size in uv and how many quadrants deep it is
     pub cell: [f64; 2],
     /// input images by slot name (`in`, `in2`, ...), read by the sampling nodes
-    pub images: Vec<(&'a str, &'a Tex)>,
+    pub images: Vec<(&'a str, ImgRef<'a>)>,
     /// values of the Input Value nodes of the graph the caller lives in
     pub graph_inputs: &'a BTreeMap<String, Value>,
     /// the function's own inputs (`f_input`)
@@ -962,21 +962,21 @@ impl<'a> FnEnv<'a> {
             .iter()
             .map(|(name, t)| {
                 let (mut sum, mut mn, mut mx) = ([0.0f64; 4], [f32::MAX; 4], [f32::MIN; 4]);
-                for p in &t.px {
+                t.for_each_px(|p| {
                     for (((sum, mn), mx), p) in sum.iter_mut().zip(mn.iter_mut()).zip(mx.iter_mut()).zip(p) {
-                        *sum += *p as f64;
-                        *mn = mn.min(*p);
-                        *mx = mx.max(*p);
+                        *sum += p as f64;
+                        *mn = mn.min(p);
+                        *mx = mx.max(p);
                     }
-                }
-                let n = t.px.len().max(1) as f64;
+                });
+                let n = t.len().max(1) as f64;
                 (name.to_string(), [(sum[0] / n) as f32, (sum[1] / n) as f32, (sum[2] / n) as f32, (sum[3] / n) as f32], mn, mx)
             })
             .collect();
         self
     }
 
-    fn image(&self, slot: &str) -> Option<&'a Tex> {
+    fn image(&self, slot: &str) -> Option<ImgRef<'a>> {
         self.images.iter().find(|(n, _)| *n == slot).map(|(_, t)| *t)
     }
 }

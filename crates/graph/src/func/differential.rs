@@ -133,7 +133,7 @@ fn check(src: &str, lib: &BTreeMap<String, Graph>, images: &[(&str, &Tex)], ginp
     env.seed = 5;
     env.index = 3;
     env.graph_inputs = ginputs;
-    env.images = images.to_vec();
+    env.images = images.iter().map(|(n, t)| (*n, (*t).into())).collect();
     env = env.with_stats();
     env.args.insert("p1".into(), Value::vec(2, [0.5, -0.5, 0.0, 0.0]));
     let mut frame = p.frame();
@@ -249,7 +249,7 @@ fn count_work_of_a_graph() {
         let mut env = FnEnv::new([64.0, 64.0]);
         env.graph_inputs = &ginputs;
         for slot in crate::graph::IMAGE_SLOTS {
-            env.images.push((slot, &tex));
+            env.images.push((slot, (&tex).into()));
         }
         env = env.with_stats();
         let mut f = p.frame();
@@ -311,7 +311,7 @@ fn corpus_functions_match_the_reference() {
                         env.graph_inputs = &ginputs;
                         env.seed = 3;
                         for slot in crate::graph::IMAGE_SLOTS.iter().take(4) {
-                            env.images.push((slot, &tex));
+                            env.images.push((slot, (&tex).into()));
                         }
                         if p.uses_stats {
                             env = env.with_stats();

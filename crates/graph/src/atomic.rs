@@ -6,7 +6,7 @@
 use crate::graph::{Error, Node, Spec};
 use crate::math;
 use crate::measured::{COMPILED_8_BIT, COMPILED_16_BIT, COMPILED_HALF, FINE_16, FINE_16_TIE_DOWN, INTENSITY_SPAN, STEPS_16, WEIGHT_STEPS};
-use crate::tex::{Tex, get};
+use crate::tex::{Image, Pixel, Tex, get};
 use std::collections::BTreeMap;
 use std::sync::Arc as Rc;
 
@@ -142,61 +142,8 @@ pub fn compute(kind: &str, id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, c
             need("in")?.map(move |p| hsl_shift(p, h, s, l))
         }
         "transform_matrix" => {
-            let m = [f("m00", 1.0), f("m01", 0.0), f("m10", 0.0), f("m11", 1.0)];
-            let (ox, oy) = (f("offset_x", 0.0), f("offset_y", 0.0));
-            let (tx, ty) = (f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
             let bg = [f("bg_r", 0.0), f("bg_g", 0.0), f("bg_b", 0.0), f("bg_a", 0.0)];
-            let (bilinear, mip) = (f("filter", 1.0) > 0.5, f("mip", MIP_AUTOMATIC as f32).round() as u32);
-            let t = need("in")?;
-            let [w, h] = ctx.size;
-            // a size that changes unequally per axis: each axis reduces on its own by box, where one pyramid level for both would blur the axis
-            // that keeps its size (measured: 0.002 at most on 38 of 38 such nodes, ours 0.44 to 2)
-            let per_axis;
-            let t = if bilinear && mip >= MIP_AUTOMATIC_TOO && ox == 0.0 && oy == 0.0 && is_axis_swap(m) {
-                let (tw, th) = if m[0] == 0.0 { (h, w) } else { (w, h) };
-                if (t.w > tw || t.h > th) && t.w * th != t.h * tw {
-                    let _span = prof("transform_matrix.per_axis");
-                    per_axis = reduced_per_axis(t, tw, th);
-                    &per_axis
-                } else {
-                    t
-                }
-            } else {
-                t
-            };
-            // a transform that changes nothing but the size enlarges by doubling, not with one bilinear read; with nearest
-            // filtering it just repeats pixels (measured: mean 0.00 on every enlarging filter=0 node, about 30 with doubling)
-            let doubled;
-            let t = if bilinear && mip == MIP_AUTOMATIC && ox == 0.0 && oy == 0.0 && (t.w < w || t.h < h) && is_axis_swap(m) {
-                let (w, h) = if m[0] == 0.0 { (h, w) } else { (w, h) };
-                let _span = prof("transform_matrix.doubling");
-                doubled = doubled_to(t, w, h, tx, ty, f("ofmt", 0.0).round() as u32);
-                &doubled
-            } else {
-                t
-            };
-            // the pyramid goes by input pixels per output pixel, and the input can have another size than the result
-            let (iw, ih, ow, oh) = (t.w as f32, t.h as f32, w.max(1) as f32, h.max(1) as f32);
-            let scaled = [m[0] * iw / ow, m[1] * ih / ow, m[2] * iw / oh, m[3] * ih / oh];
-            let level = transform_mip(mip, scaled);
-            let reduced = {
-                let _span = prof("transform_matrix.pyramid");
-                crate::patterns::mip_of(t, level)
-            };
-            let s = reduced.as_ref().unwrap_or(t);
-            let _span = prof("transform_matrix.reads");
-            // a level chosen by the node itself fades out at a non-repeating edge over one of its own pixels, not one of the result's
-            // (measured: an 8 x 8 white squeezed by 3 at level 3, rows 1/16, 7/16, 13/16 as a 1 x 1 level read bilinearly over black gives)
-            // when the transform reduces (grunge_scratches_rough's node 71 too); one that enlarges keeps the result's pixel
-            // (baked_lighting_material's 8 x 8 enlarged to 512 at level 1: 5.7 steps from the reference renderer with the level's pixel, 0.11
-            // with the result's)
-            let reduces = math::hypot(scaled[0], scaled[1]).max(math::hypot(scaled[2], scaled[3])) > 1.0;
-            let fade = if mip < MIP_AUTOMATIC_TOO && level > 0 && reduces { [0, 0] } else { [w, h] };
-            Tex::from_fn(w, h, |u, v| {
-                let (x, y) = (u - 0.5, v - 0.5);
-                let (su, sv) = (m[0] * x + m[2] * y + 0.5 + ox, m[1] * x + m[3] * y + 0.5 + oy);
-                if bilinear { sample_bilinear(s, su, sv, tx, ty, bg, fade) } else { sample_nearest(s, su, sv, tx, ty, bg) }
-            })
+            transform_matrix(n, need("in")?, ctx.size, bg)
         }
         "box_blur" => {
             let (i, tx, ty) = (f("intensity", BLUR_DEFAULT_INTENSITY), f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
@@ -323,6 +270,79 @@ pub fn compute(kind: &str, id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, c
     }))
 }
 
+/// The settings of a `transform_matrix` node that decide whether it keeps a grey input grey: the background colour it
+/// fades to past an edge that doesn't repeat, and whether each axis repeats.
+pub(crate) fn transform_matrix_bg(n: &Node) -> ([f32; 4], bool, bool) {
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    ([f("bg_r", 0.0), f("bg_g", 0.0), f("bg_b", 0.0), f("bg_a", 0.0)], f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5)
+}
+
+/// Whether a `transform_matrix` keeps a grey, opaque input grey and opaque bit for bit: its background is grey, and the
+/// alpha it gives (`bg + (1 - bg) * k` for a coverage `k`, always 1 when both axes repeat) is exactly 1.
+pub(crate) fn transform_keeps_grey(bg: [f32; 4], tx: bool, ty: bool) -> bool {
+    let grey = bg[0].to_bits() == bg[1].to_bits() && bg[1].to_bits() == bg[2].to_bits();
+    let opaque = if tx && ty { (bg[3] + (1.0 - bg[3]) * 1.0).to_bits() == 1.0f32.to_bits() } else { bg[3].to_bits() == 1.0f32.to_bits() };
+    grey && opaque
+}
+
+/// A `transform_matrix` node on an image of pixels `P` (RGBA, or grey when [`transform_keeps_grey`]), `bg` its background.
+pub(crate) fn transform_matrix<P: Pixel>(n: &Node, t: &Image<P>, size: [usize; 2], bg: P) -> Image<P> {
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    let m = [f("m00", 1.0), f("m01", 0.0), f("m10", 0.0), f("m11", 1.0)];
+    let (ox, oy) = (f("offset_x", 0.0), f("offset_y", 0.0));
+    let (tx, ty) = (f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
+    let (bilinear, mip) = (f("filter", 1.0) > 0.5, f("mip", MIP_AUTOMATIC as f32).round() as u32);
+    let [w, h] = size;
+    // a size that changes unequally per axis: each axis reduces on its own by box, where one pyramid level for both would blur the axis
+    // that keeps its size (measured: 0.002 at most on 38 of 38 such nodes, ours 0.44 to 2)
+    let per_axis;
+    let t = if bilinear && mip >= MIP_AUTOMATIC_TOO && ox == 0.0 && oy == 0.0 && is_axis_swap(m) {
+        let (tw, th) = if m[0] == 0.0 { (h, w) } else { (w, h) };
+        if (t.w > tw || t.h > th) && t.w * th != t.h * tw {
+            let _span = prof("transform_matrix.per_axis");
+            per_axis = reduced_per_axis(t, tw, th);
+            &per_axis
+        } else {
+            t
+        }
+    } else {
+        t
+    };
+    // a transform that changes nothing but the size enlarges by doubling, not with one bilinear read; with nearest
+    // filtering it just repeats pixels (measured: mean 0.00 on every enlarging filter=0 node, about 30 with doubling)
+    let doubled;
+    let t = if bilinear && mip == MIP_AUTOMATIC && ox == 0.0 && oy == 0.0 && (t.w < w || t.h < h) && is_axis_swap(m) {
+        let (w, h) = if m[0] == 0.0 { (h, w) } else { (w, h) };
+        let _span = prof("transform_matrix.doubling");
+        doubled = doubled_to(t, w, h, tx, ty, f("ofmt", 0.0).round() as u32);
+        &doubled
+    } else {
+        t
+    };
+    // the pyramid goes by input pixels per output pixel, and the input can have another size than the result
+    let (iw, ih, ow, oh) = (t.w as f32, t.h as f32, w.max(1) as f32, h.max(1) as f32);
+    let scaled = [m[0] * iw / ow, m[1] * ih / ow, m[2] * iw / oh, m[3] * ih / oh];
+    let level = transform_mip(mip, scaled);
+    let reduced = {
+        let _span = prof("transform_matrix.pyramid");
+        crate::patterns::mip_of(t, level)
+    };
+    let s = reduced.as_ref().unwrap_or(t);
+    let _span = prof("transform_matrix.reads");
+    // a level chosen by the node itself fades out at a non-repeating edge over one of its own pixels, not one of the result's
+    // (measured: an 8 x 8 white squeezed by 3 at level 3, rows 1/16, 7/16, 13/16 as a 1 x 1 level read bilinearly over black gives)
+    // when the transform reduces (grunge_scratches_rough's node 71 too); one that enlarges keeps the result's pixel
+    // (baked_lighting_material's 8 x 8 enlarged to 512 at level 1: 5.7 steps from the reference renderer with the level's pixel, 0.11
+    // with the result's)
+    let reduces = math::hypot(scaled[0], scaled[1]).max(math::hypot(scaled[2], scaled[3])) > 1.0;
+    let fade = if mip < MIP_AUTOMATIC_TOO && level > 0 && reduces { [0, 0] } else { [w, h] };
+    Image::from_fn(w, h, |u, v| {
+        let (x, y) = (u - 0.5, v - 0.5);
+        let (su, sv) = (m[0] * x + m[2] * y + 0.5 + ox, m[1] * x + m[3] * y + 0.5 + oy);
+        if bilinear { sample_bilinear(s, su, sv, tx, ty, bg, fade) } else { sample_nearest(s, su, sv, tx, ty, bg) }
+    })
+}
+
 /// A matrix that only flips or swaps the axes.
 fn is_axis_swap(m: [f32; 4]) -> bool {
     let unit = |a: f32, b: f32| (a.abs() == 1.0 && b == 0.0) || (a == 0.0 && b.abs() == 1.0);
@@ -331,11 +351,11 @@ fn is_axis_swap(m: [f32; 4]) -> bool {
 
 /// Halved along each axis longer than the size, an axis on its own, every pass held in 16-bit steps as a pyramid's level is
 /// (measurement "What nodes hold and how they read": pyramid levels hold 16-bit steps per pass, P).
-fn reduced_per_axis(t: &Tex, w: usize, h: usize) -> Tex {
+fn reduced_per_axis<P: Pixel>(t: &Image<P>, w: usize, h: usize) -> Image<P> {
     let mut o = t.clone();
     while o.w / 2 >= w.max(1) || o.h / 2 >= h.max(1) {
         let (nw, nh) = (if o.w / 2 >= w.max(1) { o.w / 2 } else { o.w }, if o.h / 2 >= h.max(1) { o.h / 2 } else { o.h });
-        let mut n = Tex::solid(nw, nh, [0.0; 4]);
+        let mut n = Image::solid(nw, nh, P::NONE);
         let (fx, fy) = (o.w / nw, o.h / nh);
         for y in 0..nh {
             for x in 0..nw {
@@ -343,10 +363,10 @@ fn reduced_per_axis(t: &Tex, w: usize, h: usize) -> Tex {
                 for j in 0..fy {
                     for i in 0..fx {
                         let p = o.px_at((y * fy + j) * o.w + x * fx + i);
-                        s.iter_mut().zip(p).for_each(|(a, b)| *a += f64::from(b));
+                        s.iter_mut().enumerate().take(P::CH).for_each(|(c, a)| *a += f64::from(p.ch(c)));
                     }
                 }
-                n.set_px(y * nw + x, s.map(|v| ((v / (fx * fy) as f64 * STEPS_16 + 0.5).floor() / STEPS_16) as f32));
+                n.set_px(y * nw + x, P::from_ch(|c| ((get(&s, c) / (fx * fy) as f64 * STEPS_16 + 0.5).floor() / STEPS_16) as f32));
             }
         }
         o = n;
@@ -356,7 +376,7 @@ fn reduced_per_axis(t: &Tex, w: usize, h: usize) -> Tex {
 
 /// Enlarged by doubling until it reaches the size: every new pixel 3/4 of the nearer pixel and 1/4 of the next. Measured:
 /// exact to 0.002 of an 8-bit step, where a single bilinear read of a 32 times larger image is 5 steps off on average.
-fn doubled_to(t: &Tex, w: usize, h: usize, tx: bool, ty: bool, format: u32) -> Tex {
+fn doubled_to<P: Pixel>(t: &Image<P>, w: usize, h: usize, tx: bool, ty: bool, format: u32) -> Image<P> {
     let mut o = t.clone();
     while o.w < w || o.h < h {
         if o.w < w {
@@ -375,9 +395,9 @@ fn doubled_to(t: &Tex, w: usize, h: usize, tx: bool, ty: bool, format: u32) -> T
 }
 
 /// Twice the columns: [`double_rows`] across, without transposing the image there and back (the same values).
-fn double_columns(t: &Tex, wrap: bool) -> Tex {
+fn double_columns<P: Pixel>(t: &Image<P>, wrap: bool) -> Image<P> {
     let (w, h) = (t.w, t.h);
-    let mut o = Tex::solid(2 * w, h, [0.0; 4]);
+    let mut o = Image::solid(2 * w, h, P::NONE);
     let neighbour = |x: usize, left: bool| match (left, wrap) {
         (true, true) => (x + w - 1) % w,
         (true, false) => x.saturating_sub(1),
@@ -390,16 +410,16 @@ fn double_columns(t: &Tex, wrap: bool) -> Tex {
             let (col, y) = (k % (2 * w), k / (2 * w));
             let (x, left) = (col / 2, col % 2 == 0);
             let (a, b) = (t.px_at(y * w + x), t.px_at(y * w + neighbour(x, left)));
-            *d = crate::tex::zip4(a, b, |a, b| DOUBLING_NEAR * a + DOUBLING_FAR * b);
+            *d = a.zip(b, |a, b| DOUBLING_NEAR * a + DOUBLING_FAR * b);
         }
     });
     o
 }
 
 /// Twice the rows.
-fn double_rows(t: &Tex, wrap: bool) -> Tex {
+fn double_rows<P: Pixel>(t: &Image<P>, wrap: bool) -> Image<P> {
     let (w, h) = (t.w, t.h);
-    let mut o = Tex::solid(w, 2 * h, [0.0; 4]);
+    let mut o = Image::solid(w, 2 * h, P::NONE);
     let neighbour = |y: usize, up: bool| match (up, wrap) {
         (true, true) => (y + h - 1) % h,
         (true, false) => y.saturating_sub(1),
@@ -412,7 +432,7 @@ fn double_rows(t: &Tex, wrap: bool) -> Tex {
             let (x, row) = (k % w, k / w);
             let (y, up) = (row / 2, row % 2 == 0);
             let (a, b) = (t.px_at(y * w + x), t.px_at(neighbour(y, up) * w + x));
-            *d = crate::tex::zip4(a, b, |a, b| DOUBLING_NEAR * a + DOUBLING_FAR * b);
+            *d = a.zip(b, |a, b| DOUBLING_NEAR * a + DOUBLING_FAR * b);
         }
     });
     o
@@ -429,21 +449,21 @@ fn transform_mip(mip: u32, m: [f32; 4]) -> u32 {
 }
 
 /// A pixel of `t`; on an axis that does not repeat, `bg` outside the image.
-fn border_px(t: &Tex, x: i64, y: i64, tx: bool, ty: bool, bg: [f32; 4]) -> [f32; 4] {
+fn border_px<P: Pixel>(t: &Image<P>, x: i64, y: i64, tx: bool, ty: bool, bg: P) -> P {
     if (!tx && !(0..t.w as i64).contains(&x)) || (!ty && !(0..t.h as i64).contains(&y)) {
         return bg;
     }
     t.at(x, y)
 }
 
-fn sample_nearest(t: &Tex, u: f32, v: f32, tx: bool, ty: bool, bg: [f32; 4]) -> [f32; 4] {
+fn sample_nearest<P: Pixel>(t: &Image<P>, u: f32, v: f32, tx: bool, ty: bool, bg: P) -> P {
     border_px(t, (u * t.w as f32).floor() as i64, (v * t.h as f32).floor() as i64, tx, ty, bg)
 }
 
 /// A bilinear read. On an axis that does not repeat the colour keeps its edge value and fades to `bg` across the edge,
 /// over one pixel of the input, or of the result when the input is smaller than the result (measured: at the same size
 /// the edge pixels mix with `bg`, while a 16 pixel wide input enlarged to 512 doesn't fade over a whole input pixel).
-fn sample_bilinear(t: &Tex, u: f32, v: f32, tx: bool, ty: bool, bg: [f32; 4], result: [usize; 2]) -> [f32; 4] {
+fn sample_bilinear<P: Pixel>(t: &Image<P>, u: f32, v: f32, tx: bool, ty: bool, bg: P, result: [usize; 2]) -> P {
     let axis = |a: f32, n: usize, out: usize, wrap: bool| -> (f32, f32) {
         if wrap {
             return (a, 1.0);
@@ -455,12 +475,12 @@ fn sample_bilinear(t: &Tex, u: f32, v: f32, tx: bool, ty: bool, bg: [f32; 4], re
     let (sv, cy) = axis(v, t.h, result[1], ty);
     let c = sample_stepped(t, su, sv);
     let k = cx * cy;
-    crate::tex::zip4(bg, c, |bg, c| bg + (c - bg) * k)
+    bg.zip(c, |bg, c| bg + (c - bg) * k)
 }
 
 /// A bilinear read with the weights in steps of 1/256, as texture hardware has them. Wrapped. Measurement "Transforms" and "What
 /// nodes hold and how they read"; the rule table `bilinear_read.tsv`.
-pub(crate) fn sample_stepped(t: &Tex, u: f32, v: f32) -> [f32; 4] {
+pub(crate) fn sample_stepped<P: Pixel>(t: &Image<P>, u: f32, v: f32) -> P {
     stepped_with(t, u, v, |i, j| t.at(i, j))
 }
 
@@ -472,7 +492,7 @@ pub(crate) fn sample_stepped_bordered(t: &Tex, u: f32, v: f32) -> [f32; 4] {
     stepped_with(t, u, v, |i, j| if (0..w).contains(&i) && (0..h).contains(&j) { t.px_at((j * w + i) as usize) } else { [0.0; 4] })
 }
 
-fn stepped_with(t: &Tex, u: f32, v: f32, at: impl Fn(i64, i64) -> [f32; 4]) -> [f32; 4] {
+fn stepped_with<P: Pixel>(t: &Image<P>, u: f32, v: f32, at: impl Fn(i64, i64) -> P) -> P {
     let (x, y) = (f64::from(u) * t.w as f64 - 0.5, f64::from(v) * t.h as f64 - 0.5);
     let (x0, y0) = (crate::tex::floor64(x), crate::tex::floor64(y));
     // round() without a libm call: from 0.5 on, adding a half is exact or can't cross an integer, so the floor of it is
@@ -487,8 +507,8 @@ fn stepped_with(t: &Tex, u: f32, v: f32, at: impl Fn(i64, i64) -> [f32; 4]) -> [
     let (i, j) = (x0 as i64, y0 as i64);
     let (i1, j1) = (i.wrapping_add(1), j.wrapping_add(1));
     let (a, b, c, d) = (at(i, j), at(i1, j), at(i, j1), at(i1, j1));
-    let (top, bottom) = (crate::tex::zip4(a, b, |a, b| a + (b - a) * fx), crate::tex::zip4(c, d, |c, d| c + (d - c) * fx));
-    crate::tex::zip4(top, bottom, |top, bottom| top + (bottom - top) * fy)
+    let (top, bottom) = (a.zip(b, |a, b| a + (b - a) * fx), c.zip(d, |c, d| c + (d - c) * fx));
+    top.zip(bottom, |top, bottom| top + (bottom - top) * fy)
 }
 
 /// Each row averaged over a box reaching `r` pixels from every pixel's centre, on the row as a stepped function; beyond

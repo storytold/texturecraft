@@ -9,7 +9,7 @@ use crate::noise;
 use crate::ops;
 use crate::png;
 use crate::scatter;
-use crate::tex::{Tex, lum};
+use crate::tex::{Grey, Tex, Val, lum};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc as Rc;
@@ -2035,7 +2035,7 @@ fn prof(name: &str) -> Option<crate::profile::Span> {
 /// Output size of a node, the Output Size setting: "Relative to input" (default; falls back to the parent size when
 /// nothing is connected), "Relative to parent", or "Absolute" (a power of two). The relative modifier moves the size
 /// up or down in powers of two (-12 .. +12), so a heavy node can run at half or quarter resolution.
-fn node_size(n: &Node, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx) -> (usize, usize) {
+fn node_size(n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx) -> (usize, usize) {
     let get = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
     let mode = get("osize_mode", 0.0).round() as i32;
     let rel = get("osize_rel", 0.0).round().clamp(-12.0, 12.0) as i32;
@@ -2056,7 +2056,7 @@ fn node_size(n: &Node, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx) -> (usize, us
             (w, h)
         }
         1 => (ctx.size, ctx.height),
-        _ => ins.get("in").or_else(|| ins.get("bg")).or_else(|| ins.values().next()).map(|t| (t.w, t.h)).unwrap_or((ctx.size, ctx.height)),
+        _ => ins.get("in").or_else(|| ins.get("bg")).or_else(|| ins.values().next()).map(Val::dims).unwrap_or((ctx.size, ctx.height)),
     };
     let shift = |b: usize| -> usize {
         if mode != 2 && rel != 0 {
@@ -2083,12 +2083,12 @@ struct Pending<'g> {
     links: Vec<(String, u32, Option<String>)>,
     /// how many of `links` have been asked for
     next: usize,
-    ins: BTreeMap<String, Rc<Tex>>,
+    ins: BTreeMap<String, Val>,
 }
 
 /// What looking at a node first gives: its result when it is cached, else the node to evaluate.
 enum Start<'g> {
-    Done(Rc<Tex>),
+    Done(Val),
     Todo(Box<Pending<'g>>),
 }
 
@@ -2099,7 +2099,7 @@ enum Start<'g> {
 /// order, each before the node reading it), so what is computed, freed and reported is the same as by recursion.
 fn eval_node_out(g: &Graph, id: u32, out: Option<&str>, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache: &mut Cache) -> Result<Rc<Tex>, Error> {
     let mut stack: Vec<Box<Pending>> = match start_node(g, id, out, ctx, cache)? {
-        Start::Done(t) => return Ok(t),
+        Start::Done(t) => return Ok(t.tex()),
         Start::Todo(p) => vec![p],
     };
     loop {
@@ -2118,7 +2118,7 @@ fn eval_node_out(g: &Graph, id: u32, out: Option<&str>, ctx: &Ctx, ext: &[Option
         let Some(done) = stack.pop() else { return Err(Error::MissingNode(0, id)) };
         let t = finish_node(g, *done, ctx, ext, cache)?;
         match stack.last_mut() {
-            None => return Ok(t),
+            None => return Ok(t.tex()),
             Some(parent) => {
                 // the link just asked for
                 if let Some((slot, _, _)) = parent.next.checked_sub(1).and_then(|i| parent.links.get(i)) {
@@ -2178,6 +2178,7 @@ fn start_node<'g>(g: &'g Graph, id: u32, out: Option<&str>, ctx: &Ctx, cache: &m
     if let (Some(p), Some(h)) = (&cache.persist, phash)
         && let Some((t, th, sz)) = p.get(h)
     {
+        let t = Val::Rgba(t);
         cache.put(key, t.clone());
         if key == id {
             cache.sizes.insert(id, sz);
@@ -2199,7 +2200,7 @@ fn start_node<'g>(g: &'g Graph, id: u32, out: Option<&str>, ctx: &Ctx, cache: &m
 }
 
 /// Computes a node whose inputs are all in, stores the result and frees the inputs nobody else waits for.
-fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache: &mut Cache) -> Result<Rc<Tex>, Error> {
+fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache: &mut Cache) -> Result<Val, Error> {
     let Pending { id, key, out, phash, node, mut ins, .. } = p;
     let n: &Node = &node;
     let out = out.as_deref();
@@ -2209,11 +2210,12 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache:
     // works out itself reads the input as it is)
     let compiled = g.meta.contains_key("compiled");
     let reads_positions = compiled && matches!(n.kind.as_str(), "pixel_processor" | "transform_matrix" | "laplacian_sharpen" | "grad_warp" | "pattern_program");
-    if !reads_positions && ins.values().any(|t| t.w != sz.0 || t.h != sz.1) {
+    if !reads_positions && ins.values().any(|t| t.dims() != sz) {
         let _span = prof("node.resize_inputs");
         for t in ins.values_mut() {
-            if t.w != sz.0 || t.h != sz.1 {
-                *t = Rc::new(if compiled { ops::resize_keep_edge(t, sz.0, sz.1) } else { ops::resize_to(t, sz.0, sz.1) });
+            if t.dims() != sz {
+                let full = t.tex();
+                *t = Val::of(if compiled { ops::resize_keep_edge(&full, sz.0, sz.1) } else { ops::resize_to(&full, sz.0, sz.1) });
             }
         }
     }
@@ -2235,29 +2237,43 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache:
     } else {
         ctx
     };
+    // a secondary output of a multi-output node runs the same code with the output index set
+    let extra = out.and_then(|o| node_outputs(&n.kind).iter().position(|x| *x == o)).filter(|i| *i > 0);
     let t = match n.kind.as_str() {
         "input" => {
             let idx = n.nums.get("idx").copied().unwrap_or(0.0).max(0.0) as usize;
             let _span = prof("node.input");
-            match ext.get(idx).cloned().flatten() {
+            Computed::Rgba(match ext.get(idx).cloned().flatten() {
                 Some(t) if n.nums.get("gray").copied().unwrap_or(0.0) > 0.5 => ops::to_gray(&t),
                 Some(t) => (*t).clone(),
                 None => Tex::solid(ctx.size, ctx.height, [0.0, 0.0, 0.0, 1.0]),
-            }
+            })
         }
-        "subgraph" => run_sub(id, n, &ins, ctx, out)?,
+        "subgraph" => Computed::Rgba(run_sub(id, n, &expanded(&ins), ctx, out)?),
         _ => {
             let t0 = ctx.ec.logging.node_times.then(NodeClock::start);
             let _span = crate::profile::enabled().then(|| crate::profile::span(&format!("node.{}", n.kind)));
-            // a secondary output of a multi-output node runs the same code with the output index set
-            let extra = out.and_then(|o| node_outputs(&n.kind).iter().position(|x| *x == o)).filter(|i| *i > 0);
-            let r = match extra {
-                Some(i) => {
-                    let mut n2 = n.clone();
-                    n2.nums.insert("_out".into(), i as f32);
-                    compute(id, &n2, &ins, ctx)?
+            // grey inputs, an operation that keeps grey grey: computed on one channel
+            let grey = if extra.is_none() && GREY_KINDS.contains(&n.kind.as_str()) { compute_grey(id, n, &ins, ctx)? } else { None };
+            let r = match grey {
+                Some(c) => {
+                    #[cfg(test)]
+                    if matches!(c, Computed::Grey(_)) {
+                        grey_tests::GREY_RUNS.with(|n| n.set(n.get() + 1));
+                    }
+                    c
                 }
-                None => compute(id, n, &ins, ctx)?,
+                None => {
+                    let ins = expanded(&ins);
+                    Computed::Rgba(match extra {
+                        Some(i) => {
+                            let mut n2 = n.clone();
+                            n2.nums.insert("_out".into(), i as f32);
+                            compute(id, &n2, &ins, ctx)?
+                        }
+                        None => compute(id, n, &ins, ctx)?,
+                    })
+                }
             };
             if let Some(t0) = t0 {
                 t0.report(id, &n.kind);
@@ -2265,13 +2281,14 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache:
             r
         }
     };
+    drop(ins);
     // a superseded evaluation can leave a half-finished texture behind: never keep or show it
     if ctx.ec.is_cancelled() {
         return Err(Error::Cancelled);
     }
-    let mut t = if t.w != sz.0 || t.h != sz.1 {
+    let t = if t.dims() != sz {
         let _span = prof("node.resize_result");
-        ops::resize_to(&t, sz.0, sz.1)
+        Computed::Rgba(ops::resize_to(&t.into_tex(), sz.0, sz.1))
     } else {
         t
     };
@@ -2283,24 +2300,49 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache:
         Some(4) => 0,
         _ => g.default_format(),
     };
-    // a read of an integer image rounds to a 16-bit step, half up: what one read gives doesn't meet the node's own rounding (measured on warps)
-    if matches!(fmt, 5 | 6) && matches!(n.kind.as_str(), "grad_warp" | "dir_warp" | "transform_matrix") {
-        let _span = prof("node.read_rounding");
-        ops::round_to_16bit_read(&mut t);
-    }
-    if fmt != 0 {
-        let _span = prof("node.format");
-        ops::apply_format(&mut t, fmt);
+    let read_rounding = matches!(fmt, 5 | 6) && matches!(n.kind.as_str(), "grad_warp" | "dir_warp" | "transform_matrix");
+    let t = match t {
+        Computed::Rgba(mut t) => {
+            finish_format(&mut t, fmt, read_rounding);
+            // held grey when it came out grey
+            Val::of(t)
+        }
+        Computed::Grey(mut t) => {
+            finish_format(&mut t, fmt, read_rounding);
+            Val::Grey(Rc::new(t))
+        }
+    };
+    // a format of whole 8- or 16-bit steps: held in them
+    let t = match fmt {
+        crate::measured::FORMAT_8_BIT | crate::measured::COMPILED_8_BIT => t.quantised(crate::measured::STEPS_8 as f32),
+        crate::measured::FORMAT_16_BIT | crate::measured::COMPILED_16_BIT => t.quantised(crate::measured::STEPS_16 as f32),
+        _ => t,
+    };
+    if ctx.ec.logging.node_times {
+        let form = match &t {
+            Val::Rgba(_) => "rgba",
+            Val::Grey(_) => "grey",
+            Val::Grey16(_) => "grey in steps",
+        };
+        eprintln!("         node {id} held {form} {}x{}", sz.0, sz.1);
     }
     let _span = prof("node.store_and_free");
-    let rc = Rc::new(t);
-    cache.put(key, rc.clone());
+    // results that outlive the evaluation are kept as RGBA (editor)
+    let full = (cache.persist.is_some() || (key == id && cache.thumbs.is_some())).then(|| t.tex());
+    let t = match (&full, &cache.persist) {
+        (Some(f), Some(_)) => Val::Rgba(f.clone()),
+        _ => t,
+    };
+    cache.put(key, t.clone());
     if key == id {
         cache.sizes.insert(id, sz.0);
     }
-    let thumb = if key == id && (cache.thumbs.is_some() || cache.persist.is_some()) { thumbnail(&rc) } else { Vec::new() };
-    if let (Some(p), Some(h)) = (&cache.persist, phash) {
-        p.put(h, rc.clone(), thumb.clone(), sz.0);
+    let thumb = match &full {
+        Some(f) if key == id => thumbnail(f),
+        _ => Vec::new(),
+    };
+    if let (Some(p), Some(h), Some(f)) = (&cache.persist, phash, &full) {
+        p.put(h, f.clone(), thumb.clone(), sz.0);
     }
     if key == id
         && let Some(th) = cache.thumbs.as_mut()
@@ -2317,19 +2359,59 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Rc<Tex>>], cache:
             }
         }
     }
-    Ok(rc)
+    Ok(t)
+}
+
+/// A node's result as computed, before its format and before it is held.
+enum Computed {
+    Rgba(Tex),
+    Grey(Grey),
+}
+
+impl Computed {
+    fn dims(&self) -> (usize, usize) {
+        match self {
+            Computed::Rgba(t) => (t.w, t.h),
+            Computed::Grey(t) => (t.w, t.h),
+        }
+    }
+
+    fn into_tex(self) -> Tex {
+        match self {
+            Computed::Rgba(t) => t,
+            Computed::Grey(t) => t.expand(),
+        }
+    }
+}
+
+/// The node's format applied to its result: for warps of an integer format a read rounded to 16 bits first.
+fn finish_format<P: crate::tex::Pixel>(t: &mut crate::tex::Image<P>, fmt: u32, read_rounding: bool) {
+    // a read of an integer image rounds to a 16-bit step, half up: what one read gives doesn't meet the node's own rounding (measured on warps)
+    if read_rounding {
+        let _span = prof("node.read_rounding");
+        ops::round_to_16bit_read(t);
+    }
+    if fmt != 0 {
+        let _span = prof("node.format");
+        ops::apply_format(t, fmt);
+    }
+}
+
+/// The inputs as RGBA images, for the operations that compute in RGBA (a grey input expanded: a copy).
+fn expanded(ins: &BTreeMap<String, Val>) -> BTreeMap<String, Rc<Tex>> {
+    ins.iter().map(|(k, v)| (k.clone(), v.tex())).collect()
 }
 
 /// Textures of finished nodes, plus what is needed to free them early.
 struct Cache {
-    map: HashMap<u32, Rc<Tex>>,
+    map: HashMap<u32, Val>,
     /// how many not-yet-evaluated links still read each cached entry; an entry is freed when it reaches zero
     left: HashMap<u32, u32>,
     keep: HashSet<u32>,
     /// thumbnails taken while evaluating (editor preview)
     thumbs: Option<HashMap<u32, Vec<u8>>>,
     sizes: HashMap<u32, usize>,
-    /// bytes of the results in `map` (as 4-channel float), and the most at once
+    /// bytes of the results in `map` (as held: 4-channel or grey float), and the most at once
     live: usize,
     peak: usize,
     /// where the evaluation's context counts the bytes held
@@ -2376,11 +2458,11 @@ impl Cache {
         c
     }
 
-    fn put(&mut self, key: u32, t: Rc<Tex>) {
-        let b = t.px.len() * 16;
+    fn put(&mut self, key: u32, t: Val) {
+        let b = t.bytes();
         if let Some(old) = self.map.insert(key, t) {
-            self.live = self.live.saturating_sub(old.px.len() * 16);
-            self.counter.sub(old.px.len() * 16);
+            self.live = self.live.saturating_sub(old.bytes());
+            self.counter.sub(old.bytes());
         }
         self.live += b;
         self.peak = self.peak.max(self.live);
@@ -2389,8 +2471,8 @@ impl Cache {
 
     fn drop_entry(&mut self, key: u32) {
         if let Some(old) = self.map.remove(&key) {
-            self.live = self.live.saturating_sub(old.px.len() * 16);
-            self.counter.sub(old.px.len() * 16);
+            self.live = self.live.saturating_sub(old.bytes());
+            self.counter.sub(old.bytes());
         }
     }
 }
@@ -2791,6 +2873,13 @@ fn read_resource(id: u32, file: &str, ctx: &Ctx) -> Result<Vec<u8>, Error> {
 }
 
 fn run_function_image(id: u32, n: &Node, fname: &str, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx, once: bool) -> Result<Tex, Error> {
+    let images = IMAGE_SLOTS.iter().filter_map(|slot| ins.get(*slot).map(|t| (*slot, crate::tex::ImgRef::Rgba(t)))).collect();
+    Ok(run_function(id, n, fname, images, ctx, once, false)?.into_tex())
+}
+
+/// A function run at every pixel ([`run_function_image`]) on the images `images` (by slot). `grey`: a function that gives one
+/// number (or a boolean) at every pixel comes out as a grey image (the same values the RGBA form gives, `[v, v, v, 1]`).
+fn run_function(id: u32, n: &Node, fname: &str, images: Vec<(&str, crate::tex::ImgRef)>, ctx: &Ctx, once: bool, grey: bool) -> Result<Computed, Error> {
     use crate::func::{FnEnv, Value, compile_named};
     let prog = compile_named(ctx.lib, fname).map_err(|e| Error::BadParam(id, e))?;
     let (w, h) = (ctx.size, ctx.height);
@@ -2803,11 +2892,7 @@ fn run_function_image(id: u32, n: &Node, fname: &str, ins: &BTreeMap<String, Rc<
     }
     env.seed = (n.nums.get("seed").copied().unwrap_or(0.0).max(0.0) as u32).wrapping_add(ctx.so);
     env.graph_inputs = ctx.gin;
-    for slot in IMAGE_SLOTS.iter().copied() {
-        if let Some(t) = ins.get(slot) {
-            env.images.push((slot, t.as_ref()));
-        }
-    }
+    env.images = images;
     for (ak, av) in &n.nums {
         if let Some(input) = ak.strip_prefix("fa.") {
             let pin = prog.inputs.iter().find(|i| i.0 == input).map(|i| i.1).unwrap_or(crate::graph::Pin::Float);
@@ -2838,7 +2923,7 @@ fn run_function_image(id: u32, n: &Node, fname: &str, ins: &BTreeMap<String, Rc<
         return Err(Error::BadParam(id, format!("{fname}: the result must be a number, vector or boolean")));
     }
     if once {
-        return Ok(Tex::solid(w, h, to_px(&first)));
+        return Ok(Computed::Rgba(Tex::solid(w, h, to_px(&first))));
     }
     // each worker keeps its registers, so what doesn't change from pixel to pixel is computed once
     let new_frame = || {
@@ -2846,10 +2931,31 @@ fn run_function_image(id: u32, n: &Node, fname: &str, ins: &BTreeMap<String, Rc<
         prog.bind(&env, &mut f);
         f
     };
-    Ok(Tex::from_fn_with(w, h, new_frame, |frame, u, v| match prog.run_bound(&env, [u as f64, v as f64], frame) {
+    // one number at every pixel: grey. The first pixel tells; a pixel that gives anything else (a function whose result
+    // type changes from pixel to pixel) sends it back to RGBA
+    let one = |v: &Value| match v {
+        Value::Num(x) => x.lanes == 1,
+        Value::Bool(_) | Value::Str(_) => true,
+    };
+    if grey && one(&first) {
+        let other = std::sync::atomic::AtomicBool::new(false);
+        let g = Grey::from_fn_with(w, h, new_frame, |frame, u, v| match prog.run_bound(&env, [u as f64, v as f64], frame) {
+            Ok(r) => {
+                if !one(&r) {
+                    other.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                to_px(&r)[0]
+            }
+            Err(_) => 0.0,
+        });
+        if !other.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(Computed::Grey(g));
+        }
+    }
+    Ok(Computed::Rgba(Tex::from_fn_with(w, h, new_frame, |frame, u, v| match prog.run_bound(&env, [u as f64, v as f64], frame) {
         Ok(r) => to_px(&r),
         Err(_) => [0.0, 0.0, 0.0, 1.0],
-    }))
+    })))
 }
 
 fn run_sub(id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx, out: Option<&str>) -> Result<Tex, Error> {
@@ -3906,5 +4012,180 @@ mod output_size_tests {
         let t = &g.evaluate(Some(8)).unwrap()["o"];
         let lit: Vec<usize> = (0..64).filter(|&i| t.px[i][0] > 0.5).collect();
         assert_eq!(lit, vec![8 + 6, 6 * 8 + 1], "{lit:?}");
+    }
+}
+
+/// The kinds [`compute_grey`] can compute on one channel.
+const GREY_KINDS: &[&str] = &["pixel_processor", "transform_matrix", "blend"];
+
+/// Node `n` computed on one channel, when all its inputs are grey and what it does to them keeps them grey bit for bit
+/// (the same arithmetic on each colour channel, alpha staying exactly 1). `None`: computed in RGBA.
+fn compute_grey(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx) -> Result<Option<Computed>, Error> {
+    #[cfg(test)]
+    if grey_tests::RGBA_ONLY.with(std::cell::Cell::get) {
+        return Ok(None);
+    }
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    let grey = |slot: &str| ins.get(slot).and_then(Val::grey_in);
+    let all_grey = ins.values().all(|v| v.grey_in().is_some());
+    let (s, hs) = (ctx.size, ctx.height);
+    Ok(match n.kind.as_str() {
+        // a function giving one number is grey whatever it reads
+        "pixel_processor" => match n.strs.get("fn") {
+            Some(fname) => {
+                let images = IMAGE_SLOTS.iter().filter_map(|slot| ins.get(*slot).map(|v| (*slot, v.img_ref()))).collect();
+                // (a function giving more than one number comes back computed in RGBA)
+                Some(run_function(id, n, fname, images, ctx, false, true)?)
+            }
+            None => None,
+        },
+        "transform_matrix" if all_grey => {
+            let (bg, tx, ty) = crate::atomic::transform_matrix_bg(n);
+            match grey("in") {
+                Some(t) if crate::atomic::transform_keeps_grey(bg, tx, ty) => {
+                    // (its input is read many times over, often smaller than the result: as floats)
+                    let t = t.floats();
+                    Some(Computed::Grey(after_compute(crate::atomic::transform_matrix(n, &t, [s, hs], bg[0]), n, s, hs)))
+                }
+                _ => None,
+            }
+        }
+        "blend" if all_grey => match (grey("fg"), grey("bg")) {
+            (Some(fg), Some(bg)) => {
+                let (mode, op, am) = (f("mode", 0.0).max(0.0) as u32, f("opacity", 1.0), f("alpha_mode", 1.0).max(0.0) as u32);
+                let crop = [f("crop_x0", 0.0), f("crop_y0", 0.0), f("crop_x1", 1.0), f("crop_y1", 1.0)];
+                ops::blend_grey(fg, bg, grey("mask"), mode, op, am, crop).map(|t| Computed::Grey(after_compute(t, n, s, hs)))
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// What [`compute`] does to every result of the kinds it computes itself: resampled to the node's size, and moved by
+/// the fraction of its tile offset.
+fn after_compute<P: crate::tex::Pixel>(out: crate::tex::Image<P>, n: &Node, s: usize, hs: usize) -> crate::tex::Image<P> {
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    let (tx, ty) = (f("tile_x", 0.0), f("tile_y", 0.0));
+    let out = if out.w != s || out.h != hs { ops::resize_to(&out, s, hs) } else { out };
+    let (fx, fy) = (tx - tx.floor(), ty - ty.floor());
+    if fx > 0.0 || fy > 0.0 {
+        return ops::roll(&out, fx, fy);
+    }
+    out
+}
+
+/// The grey kernels against the RGBA ones: every graph here rendered both ways must give the same bits.
+#[cfg(test)]
+mod grey_tests {
+    use super::*;
+
+    thread_local! {
+        /// every node computed in RGBA (the grey inputs expanded), as before grey kernels
+        pub(super) static RGBA_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// nodes computed grey
+        pub(super) static GREY_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn bits(outs: &BTreeMap<String, Tex>) -> Vec<(String, Vec<u32>)> {
+        outs.iter().map(|(k, t)| (k.clone(), t.px.iter().flat_map(|p| p.map(f32::to_bits)).collect())).collect()
+    }
+
+    /// `body` (nodes 10 and up, reading the grey sources 1 to 4) rendered grey and RGBA at `size`: the same bits. Then
+    /// again with sources 1 and 2 held in 16- and 8-bit steps.
+    fn same(body: &str, size: usize, compiled: bool) {
+        same_once(body, size, compiled);
+        same_once(&body.replace("@1", "@5").replace("@2", "@6"), size, compiled);
+    }
+
+    fn same_once(body: &str, size: usize, compiled: bool) {
+        let text = format!(
+            "format 3\nsize 64\n{}node 1 perlin scale=4 seed=3\nnode 2 fbm scale=6 seed=5\nnode 3 color gray=1 v=0.25\nnode 4 white_noise seed=9\n\
+             node 5 perlin scale=4 seed=3 ofmt=6\nnode 6 fbm scale=6 seed=5 ofmt=5\n{body}",
+            if compiled { "meta compiled \"1\"\n" } else { "" }
+        );
+        let g = Graph::parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        RGBA_ONLY.with(|c| c.set(true));
+        let want = g.evaluate(Some(size));
+        RGBA_ONLY.with(|c| c.set(false));
+        let got = g.evaluate(Some(size));
+        match (want, got) {
+            (Ok(w), Ok(g)) => assert!(bits(&w) == bits(&g), "grey and RGBA differ:\n{text}"),
+            (w, g) => panic!("{:?} {:?}\n{text}", w.err(), g.err()),
+        }
+    }
+
+    /// Runs `f`, and how many nodes it computed grey.
+    fn greys(f: impl FnOnce()) -> usize {
+        GREY_RUNS.with(|c| c.set(0));
+        f();
+        GREY_RUNS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn transform_matrix_grey_is_rgba() {
+        let mats =
+            ["m00=1 m01=0 m10=0 m11=1", "m00=0.5 m01=0.1 m10=-0.2 m11=0.7", "m00=3 m01=0 m10=0 m11=3", "m00=0 m01=1 m10=1 m11=0", "m00=-1 m01=0 m10=0 m11=1"];
+        let bgs = ["", "bg_r=0.5 bg_g=0.5 bg_b=0.5 bg_a=1", "bg_r=0.2 bg_g=0.3 bg_b=0.2 bg_a=1", "bg_a=0.5"];
+        let n = greys(|| {
+            for compiled in [false, true] {
+                for m in mats {
+                    for bg in bgs {
+                        for tiles in ["tile_x=1 tile_y=1", "tile_x=0 tile_y=1", "tile_x=0 tile_y=0"] {
+                            for filt in ["filter=1 mip=31", "filter=0", "filter=1 mip=2", "filter=1 mip=30"] {
+                                for (osz, fmt) in [
+                                    ("", ""),
+                                    (" osize_log2_x=7 osize_log2_y=7", " ofmt=6"),
+                                    (" osize_log2_x=4 osize_log2_y=5", " ofmt=5"),
+                                    (" osize_log2_x=6 osize_log2_y=6", " ofmt=6 offset_x=0.13 offset_y=-0.3"),
+                                ] {
+                                    let body = format!("node 10 transform_matrix in=@2 {m} {bg} {tiles} {filt}{osz}{fmt}\noutput out 10\n");
+                                    same(&body, 32, compiled);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        assert!(n > 300, "{n} grey runs");
+    }
+
+    #[test]
+    fn blend_grey_is_rgba() {
+        let n = greys(|| {
+            for compiled in [false, true] {
+                for mode in (0..=21).chain(32..=35) {
+                    for am in 0..=4 {
+                        for (op, extra) in [("1", ""), ("0.37", " mask=@4"), ("0.8", " crop_x0=0.2 crop_y1=0.6"), ("-2", " ofmt=6"), ("1e30", " mask=@3")] {
+                            let body = format!("node 10 blend fg=@1 bg=@2 mode={mode} alpha_mode={am} opacity={op}{extra}\noutput out 10\n");
+                            same(&body, 24, compiled);
+                        }
+                    }
+                }
+            }
+        });
+        assert!(n > 300, "{n} grey runs");
+    }
+
+    #[test]
+    fn pixel_processor_function_grey_is_rgba() {
+        let fns = [
+            // one number from a grey read
+            "node 1 f_pos\nnode 2 f_sample_gray a=@1 slot=\"in\" filter=1\nnode 3 f_float v=0.3\nnode 4 f_mul a=@2 b=@3\nnode 5 f_out in=@4\n",
+            // a colour read: four lanes
+            "node 1 f_pos\nnode 2 f_sample_color a=@1 slot=\"in\" filter=3\nnode 5 f_out in=@2\n",
+            // a boolean
+            "node 1 f_pos\nnode 2 f_swizzle a=@1 mask=\"x\"\nnode 3 f_float v=0.5\nnode 4 f_gt a=@2 b=@3\nnode 5 f_out in=@4\n",
+        ];
+        let n = greys(|| {
+            for (k, f) in fns.iter().enumerate() {
+                for (src, extra) in [("@2", ""), ("@1", " in2=@4"), ("@2", " ofmt=5"), ("@5", ""), ("@6", " in2=@5 ofmt=6")] {
+                    let body = format!("subgraph fx\nmeta kind \"function\"\n{f}end\nnode 10 pixel_processor fn=\"fx\" in={src}{extra}\noutput out 10\n");
+                    same_once(&body, 24 + k, true);
+                }
+            }
+        });
+        assert!(n >= 6, "{n} grey runs");
     }
 }
