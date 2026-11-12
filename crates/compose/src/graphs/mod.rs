@@ -14,8 +14,10 @@
 //! (colour sRGB, height 0..1 around 0.5, normals with green pointing down), TextureCraft's channels linear colour,
 //! signed height and normals with green up.
 
+pub mod budget;
 pub mod kept;
 pub mod once;
+pub mod spill;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -390,6 +392,8 @@ pub struct CookCache {
     kept: Mutex<Option<Arc<dyn KeptCooks>>>,
     /// Cooks found there instead of rendered.
     kept_found: AtomicUsize,
+    /// Cooks moved out of memory ([`GraphStore::spill_cooks`]).
+    spilled: spill::Spill,
     /// Stops renders running for this document.
     pub cancel: Cancel,
 }
@@ -472,9 +476,42 @@ impl GraphStore {
         *lock(&self.cooks.uses) = uses;
     }
 
-    /// The cook under `key`, if one is held (rendered or loaded).
+    /// The cook under `key`, if one is held (rendered or loaded; a spilled one is read back, not held again).
     pub fn cooked(&self, key: &str) -> Option<Arc<Cooked>> {
-        self.cooks.cooks.get(&key.to_string()).and_then(Result::ok)
+        match self.cooks.cooks.get(&key.to_string()) {
+            Some(held) => held.ok(),
+            None => self.cooks.spilled.get(key).map(Arc::new),
+        }
+    }
+
+    /// What the cook under `key` holds (outputs, their tiles, linear ones), without reading a spilled one back.
+    pub fn cook_outline(&self, key: &str) -> Option<spill::CookOutline> {
+        match self.cooks.cooks.get(&key.to_string()) {
+            Some(held) => held.ok().map(|c| spill::CookOutline::of(&c)),
+            None => self.cooks.spilled.outline(key),
+        }
+    }
+
+    /// Moves every cook held in memory out to a file of its own (read back when something needs it), so that what
+    /// was cooked so far stops taking memory: an import does this after each texture set. Cooks that cannot be written
+    /// out stay. Returns how many moved; none in the web build.
+    pub fn spill_cooks(&self) -> usize {
+        let mut moved = 0;
+        for (key, held) in self.cooks.cooks.values() {
+            let Ok(cooked) = held else { continue };
+            // (one read back from its file is there already)
+            if self.cooks.spilled.outline(&key).is_some() || self.cooks.spilled.put(&key, &cooked) {
+                self.cooks.cooks.remove(&key);
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// The keys of the cooks the uses read that are held or spilled (what a project file saves), sorted.
+    pub fn used_cook_keys(&self) -> Vec<String> {
+        let keys: BTreeSet<String> = self.uses().into_values().collect();
+        keys.into_iter().filter(|k| self.cook_outline(k).is_some()).collect()
     }
 
     /// Puts a cook in under `key` (loading a project file).
@@ -482,7 +519,8 @@ impl GraphStore {
         self.cooks.cooks.insert(key, Ok(Arc::new(cooked)));
     }
 
-    /// The cooks the uses read, by key (what a project file saves), sorted.
+    /// The cooks the uses read, by key, sorted (spilled ones read back: [`GraphStore::used_cook_keys`] and
+    /// [`GraphStore::cooked`] read them one at a time).
     pub fn used_cooks(&self) -> Vec<(String, Arc<Cooked>)> {
         let keys: BTreeSet<String> = self.uses().into_values().collect();
         keys.into_iter().filter_map(|k| self.cooked(&k).map(|c| (k, c))).collect()
@@ -496,6 +534,7 @@ impl GraphStore {
         let used: BTreeSet<String> = self.uses().into_values().collect();
         let failed: BTreeSet<String> = self.cooks.cooks.values().into_iter().filter(|(_, v)| v.is_err()).map(|(k, _)| k).collect();
         self.cooks.cooks.retain(|k| used.contains(k) || failed.contains(k));
+        self.cooks.spilled.retain(|k| used.contains(k));
     }
 
     fn pool(&self) -> Option<Arc<ThreadPool>> {
@@ -661,13 +700,20 @@ impl GraphStore {
             if self.cooks.cancel.is_cancelled() {
                 return Err("cancelled".to_string());
             }
+            if let Some(back) = self.cooks.spilled.get(&key) {
+                return Ok(Arc::new(back));
+            }
             let kept = lock(&self.cooks.kept).clone();
             if let Some(found) = kept.as_ref().and_then(|k| k.get(&key)).and_then(|bytes| kept::decode(&bytes)) {
                 self.cooks.kept_found.fetch_add(1, Ordering::Relaxed);
                 return Ok(Arc::new(found));
             }
             self.cooks.renders.fetch_add(1, Ordering::Relaxed);
-            let cooked = self.render(g, env, given, depth)?;
+            // a share of the render budget for its estimated peak; nested graphs render within their parent's
+            let share = if depth == 0 { Some(budget::acquire(budget::estimate(&*self.parsed(&g.key)?, env.side))) } else { None };
+            let cooked = self.render(g, env, given, depth);
+            drop(share);
+            let cooked = cooked?;
             // a render stopped part way never gets here: it is an error
             if let Some(k) = &kept {
                 k.put(&key, &kept::encode(&cooked));

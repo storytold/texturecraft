@@ -48,11 +48,13 @@ USAGE:
   texturecraft-cli import <project file> <out.tcraft> [--original-on-top] [--original-correction]
                    [--native-filters] [--max-resolution <px>] [--no-measure] [--no-replay]
                    [--graphs decompile|keep] [--result-cache <dir>] [--result-cache-gb <n>]
+                   [--render-budget-gb <n>]
       Convert a project file of the reference app (one-way; the original is only read) and save
       it; prints what the import found per texture set (file.importProject). --original-correction
       adds a locked layer holding the original's result where the layers do not reproduce it.
       --result-cache keeps graph renders in <dir> and reuses them in later imports (at most
-      --result-cache-gb GB, default 20).
+      --result-cache-gb GB, default 20). --render-budget-gb caps the memory graph renders running
+      at once may take (default half the machine's RAM; also for export and verify).
   texturecraft-cli import <folder> <out folder> [--jobs <n>] [the import flags above]
       Convert every project file below <folder>, each saved under the same relative path in
       <out folder>; one result line per project. --jobs converts up to n at once (default 1)
@@ -89,15 +91,19 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("run", &["-o"], &[]),
     ("batch", &[], &[]),
     ("bake", &["-o", "--resolution", "--maps"], &[]),
-    ("export", &["--preset", "--format", "--padding", "--size", "--frame-budget-ms", "--frame-limit-s"], &[]),
+    ("export", &["--preset", "--format", "--padding", "--size", "--frame-budget-ms", "--frame-limit-s", "--render-budget-gb"], &[]),
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
     ("new", &["--resolution"], &["--sample"]),
     (
         "import",
-        &["--max-resolution", "--graphs", "--result-cache", "--result-cache-gb", "--jobs"],
+        &["--max-resolution", "--graphs", "--result-cache", "--result-cache-gb", "--jobs", "--render-budget-gb"],
         &["--original-on-top", "--original-correction", "--native-filters", "--no-measure", "--no-replay"],
     ),
-    ("verify", &["--set", "--border", "--max-resolution", "--graphs"], &["--table", "--original-correction", "--native-filters", "--no-replay"]),
+    (
+        "verify",
+        &["--set", "--border", "--max-resolution", "--graphs", "--render-budget-gb"],
+        &["--table", "--original-correction", "--native-filters", "--no-replay"],
+    ),
     ("graph", &["--size", "--output", "--seed", "--param", "--depth", "--timeout"], &[]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
     ("serve", &["--port", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
@@ -208,6 +214,12 @@ fn main() {
 type R = Result<(), String>;
 
 fn dispatch(name: &str, a: &Args) -> R {
+    if let Some(gb) = a.num::<f64>("--render-budget-gb")? {
+        if !(gb.is_finite() && gb > 0.0) {
+            return Err("--render-budget-gb must be a number of GB above 0".into());
+        }
+        texturecraft_engine::compose::graphs::budget::set_limit(Some((gb * (1u64 << 30) as f64) as u64));
+    }
     match name {
         "info" => info(a),
         "commands" => commands(a),

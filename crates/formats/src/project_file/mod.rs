@@ -373,22 +373,40 @@ fn graph_entries<'a>(pf: &'a ProjectFile, deflate: SimpleFileOptions, out: &mut 
         return Ok(());
     }
     let mut index = CookIndex { version: COOK_INDEX_VERSION, ..CookIndex::default() };
-    for (key, cooked) in pf.graphs.used_cooks() {
+    // cooks one at a time: a spilled one is read back only while its outputs are written
+    for key in pf.graphs.used_cook_keys() {
         if !texturecraft_core::is_key(&key) {
             continue;
         }
-        let mut entry = CookEntry { linear: cooked.linear.iter().cloned().collect(), ..CookEntry::default() };
-        for (output, img) in &cooked.outputs {
+        let Some(outline) = pf.graphs.cook_outline(&key) else { continue };
+        let mut entry = CookEntry { linear: outline.linear.iter().cloned().collect(), ..CookEntry::default() };
+        // the cook read once for all its outputs, and let go when the last is written
+        let shared: Arc<std::sync::Mutex<(Option<Arc<Cooked>>, usize)>> = Arc::new(std::sync::Mutex::new((None, outline.outputs.len())));
+        for (output, (comps, allocated)) in &outline.outputs {
             let name = output_entry(&key, output);
-            let weight = (img.allocated_count() * (TILE_AREA * img.comps() * 2 + 8)) as u64;
-            let (source, name_of_output) = (Arc::clone(&cooked), output.clone());
+            let weight = (allocated * (TILE_AREA * comps * 2 + 8)) as u64;
+            let (key_of_cook, name_of_output, shared) = (key.clone(), output.clone(), Arc::clone(&shared));
             out.push(Entry {
                 name: name.clone(),
                 options: deflate,
                 weight,
-                body: Box::new(move |mut w| match source.outputs.get(&name_of_output) {
-                    Some(img) => write_tiles(&mut w, img),
-                    None => Ok(()),
+                body: Box::new(move |mut w| {
+                    let cooked = {
+                        let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if s.0.is_none() {
+                            s.0 = pf.graphs.cooked(&key_of_cook);
+                        }
+                        let c = s.0.clone();
+                        s.1 = s.1.saturating_sub(1);
+                        if s.1 == 0 {
+                            s.0 = None;
+                        }
+                        c
+                    };
+                    match cooked.as_ref().and_then(|c| c.outputs.get(&name_of_output)) {
+                        Some(img) => write_tiles(&mut w, img),
+                        None => Ok(()),
+                    }
                 }),
             });
             entry.outputs.insert(output.clone(), name);

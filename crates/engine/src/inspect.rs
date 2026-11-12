@@ -64,7 +64,7 @@ fn graphs_json(s: &Session) -> Value {
             |(u, p)| json!({ "textureSet": u.set, "id": u.id.0, "channel": u.channel.map(|c| c.id()), "graph": p.graph, "stale": p.stale, "reason": p.reason }),
         )
         .collect();
-    json!({ "texts": g.texts.len(), "used": s.doc.project.graph_keys().len(), "cooks": g.used_cooks().len(), "renders": g.renders(), "problems": problems })
+    json!({ "texts": g.texts.len(), "used": s.doc.project.graph_keys().len(), "cooks": g.used_cook_keys().len(), "renders": g.renders(), "problems": problems })
 }
 
 fn fill_json(f: &Fill) -> Value {

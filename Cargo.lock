@@ -4380,6 +4380,7 @@ dependencies = [
  "half",
  "rayon",
  "serde",
+ "sysinfo",
  "texturecraft-core",
  "texturecraft-geom",
  "texturecraft-graph",

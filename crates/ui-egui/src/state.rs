@@ -125,6 +125,9 @@ pub struct Prefs {
     pub project_open_limit_gib: u32,
     /// Percent of the free RAM a project save may hold at once (desktop; 1 to 100).
     pub save_ram_percent: u8,
+    /// Percent of the machine's RAM graph renders running at once may take (imports, composites, exports; 1 to
+    /// 100): a render waits while the others leave no room for its estimated peak.
+    pub render_ram_percent: u8,
 }
 
 impl Default for Prefs {
@@ -142,6 +145,7 @@ impl Default for Prefs {
             reserved_cores: 1,
             project_open_limit_gib: texturecraft_engine::formats::DEFAULT_PROJECT_OPEN_LIMIT_GIB,
             save_ram_percent: 50,
+            render_ram_percent: texturecraft_engine::compose::graphs::budget::DEFAULT_PERCENT,
         }
     }
 }
@@ -150,6 +154,8 @@ impl Prefs {
     /// Apply resource preferences before commands or file workers can start.
     pub fn apply_resource_limits(&self) {
         texturecraft_engine::formats::set_project_open_limit_gib(self.project_open_limit_gib);
+        let budget = texturecraft_engine::compose::graphs::budget::limit_for_percent(self.render_ram_percent);
+        texturecraft_engine::compose::graphs::budget::set_limit(Some(budget));
         #[cfg(not(target_arch = "wasm32"))]
         texturecraft_engine::formats::set_save_resources(self.reserved_cores as usize, self.save_ram_percent);
     }

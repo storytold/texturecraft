@@ -210,3 +210,27 @@ fn minified_reads_average_the_output_instead_of_aliasing() {
     assert!((half[0] - 0.75).abs() < 1e-3, "{half:?}");
     assert!(cooked.sample_filtered(Some("absent"), 0.0, 0.0, 1.0).is_none());
 }
+
+#[test]
+fn spilled_cooks_are_read_back_exactly_and_not_rendered_again() {
+    let s = store(&[COLOUR]);
+    let (baked, images) = (BakedMaps::default(), ImageStore::default());
+    let e = env(&baked, &images);
+    let use_ = GraphUse { set: 0, id: LayerId(4), channel: Some(Channel::BaseColor) };
+    let g = GraphRef::new(text_key(COLOUR), "colour");
+    let before = s.cook_for(use_.clone(), &g, &e, &[]).unwrap();
+    let key = s.used_cook_keys().pop().unwrap();
+    let outline = s.cook_outline(&key).unwrap();
+    assert_eq!(s.spill_cooks(), 1);
+    // out of memory, still known, read back to the bit
+    assert_eq!(s.used_cook_keys(), std::slice::from_ref(&key));
+    assert_eq!(s.cook_outline(&key), Some(outline));
+    assert_eq!(*s.cooked(&key).unwrap(), *before);
+    let again = s.cook_for(use_, &g, &e, &[]).unwrap();
+    assert_eq!(*again, *before);
+    assert_eq!(s.renders(), 1, "read back, not rendered again");
+    // spilling again does not write it twice; pruned, it is gone
+    assert_eq!(s.spill_cooks(), 1);
+    s.prune(|_| false);
+    assert!(s.used_cook_keys().is_empty() && s.cooked(&key).is_none());
+}

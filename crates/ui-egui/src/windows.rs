@@ -706,6 +706,15 @@ fn settings(app: &mut TextureCraftApp, ctx: &egui::Context) {
                     ui.label(format!("≈ {:.2} GiB", budget_bytes as f64 / (1_u64 << 30) as f64));
                 });
                 ui.end_row();
+                let label = ui.label(tr("Max RAM for graph renders"));
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut p.render_ram_percent).range(1..=100).suffix(" %"))
+                        .labelled_by(label.id)
+                        .on_hover_text(tr("Graph renders running at once share this part of the RAM; a render waits until the others leave room for it."));
+                    let budget_bytes = texturecraft_engine::compose::graphs::budget::limit_for_percent(p.render_ram_percent);
+                    ui.label(format!("≈ {:.2} GiB", budget_bytes as f64 / (1_u64 << 30) as f64));
+                });
+                ui.end_row();
             }
         });
         #[cfg(not(target_arch = "wasm32"))]

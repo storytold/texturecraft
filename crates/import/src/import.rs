@@ -294,6 +294,11 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         };
         let summary = build_set(&ctx, &mut project, &mut imported, &mut report)?;
         imported.sets.push(summary);
+        // the set's cooks out of memory (read back when a composite or the save needs them), so that the sets do not
+        // all hold theirs at once; the last set's stay, the project opens with them
+        if i + 1 < count {
+            imported.graphs.spill_cooks();
+        }
     }
     for r in &binding.unused {
         report.add(
