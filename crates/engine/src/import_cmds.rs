@@ -85,6 +85,7 @@ impl Session {
             thumbnail: None,
             resources: imported.resources,
             graphs: imported.graphs,
+            strokes: imported.strokes,
             warnings: Vec::new(),
         };
         let mut s = Session::from_project_file(pf)?;
@@ -462,6 +463,7 @@ mod tests {
             resources: Default::default(),
             graphs: texturecraft_compose::GraphStore::with_cancel(hooks.cancel.clone()),
             sets: Vec::new(),
+            strokes: Default::default(),
         }
     }
 

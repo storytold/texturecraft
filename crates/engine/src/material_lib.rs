@@ -85,6 +85,7 @@ impl Session {
             baked: BTreeMap::new(),
             resources: BTreeMap::new(),
             graphs: Default::default(),
+            strokes: BTreeMap::new(),
         };
         let new = crate::layer_ops::copy_tree(&self.doc, id, &mut mini, 0, None, false, 0)?;
         if let Ok(l) = mini.project.layer_mut(new) {
@@ -104,6 +105,7 @@ impl Session {
             thumbnail: None,
             resources,
             graphs: mini.graphs,
+            strokes: BTreeMap::new(),
             warnings: Vec::new(),
         };
         texturecraft_formats::save_project_bytes(&pf).map_err(fe)
@@ -135,6 +137,7 @@ impl Session {
             baked: BTreeMap::new(),
             resources: resources.clone(),
             graphs: pf.graphs,
+            strokes: BTreeMap::new(),
         };
         let id = self.edit("Add smart material", |s| {
             for (k, v) in &resources {

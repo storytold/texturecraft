@@ -39,6 +39,7 @@ fn sample() -> Sample {
         thumbnail: Some(vec![137, 80, 78, 71]),
         resources: [("bricks.png".to_string(), vec![9, 8, 7])].into(),
         graphs: Default::default(),
+        strokes: BTreeMap::new(),
         warnings: Vec::new(),
     };
     Sample { pf, paint }
@@ -1065,4 +1066,209 @@ fn hostile_graph_entries_are_refused_or_left_out() {
     let back = load_project_bytes(&bytes).unwrap();
     assert!(back.graphs.cooked(&key).is_none() && back.warnings.iter().any(|w| w.contains("rendered again")));
     assert_eq!(back.graphs.texts.len(), 1);
+}
+
+/// A record with every kind of part, keyed by nothing yet.
+fn sample_record(seed: u32) -> texturecraft_core::StrokeRecord {
+    use texturecraft_core::strokes::*;
+    let tip = StrokeTip::Image { width: 2, height: 1, values: vec![0.25, f32::NAN] };
+    let brush = StrokeBrush {
+        radius: 0.05,
+        spacing: 0.1,
+        flow: 0.8,
+        size_pressure: Some(0.2),
+        flow_pressure: None,
+        size_jitter: 0.1,
+        flow_jitter: 0.0,
+        position_jitter: 0.3,
+        position_both: true,
+        position_normal: false,
+        rotation: 1.5,
+        rotation_jitter: 0.25,
+        follow: true,
+        alignment: StrokeTipAlignment::Camera,
+        culling: Some(0.5),
+        tip: StrokeTip::Round { hardness: 0.9 },
+        cycle: vec![tip.clone(), tip],
+        cycle_drawn_start: true,
+        up: Some([0.0, 1.0, 0.0]),
+    };
+    let graph = texturecraft_core::GraphRef { output: Some("basecolor".into()), seed: 3, ..texturecraft_core::GraphRef::new("k".repeat(16), "grunge") };
+    let stroke = RecordedStroke {
+        space: StrokeSpace::Mesh { view: [1.0; 16], projection: [-0.0; 16] },
+        points: vec![StrokePoint { position: [0.1, -0.2], pressure: 0.5 }, StrokePoint { position: [0.3, 0.4], pressure: 1.0 }],
+        seed,
+        lazy: 0.02,
+        copies: 1,
+        copy_matrix: [2.0; 16],
+    };
+    let path = PathStroke {
+        pieces: vec![PathPiece { points: [[0.0; 3], [1.0; 3], [2.0; 3], [3.0; 3]], normals: [[0.0, 0.0, 1.0]; 2], size: [0.5, 1.0] }],
+        anchor: None,
+        seed: seed + 1,
+        copies: 0,
+        copy_matrix: [0.0; 16],
+    };
+    let step = StrokeStep {
+        mode: StrokeMode::Paint,
+        values: vec![(Channel::BaseColor, [1.0, 0.5, 0.0], 1.0)],
+        sources: vec![(Channel::Roughness, StrokeSource::Graph(Box::new(graph)), 0.5), (Channel::Metallic, StrokeSource::NotKept("an image".into()), 1.0)],
+        mask_value: 0.0,
+        mask_source: None,
+        opacity: 0.75,
+        brush,
+        stencil: Some(StrokeStencil { image: StencilValues::Image { width: 1, height: 2, values: vec![0.0, 1.0] }, matrix: [0.5; 9] }),
+        projection: Some(StrokeStencil { image: StencilValues::Uniform(0.3), matrix: [1.0; 9] }),
+        placed: Some([0.25; 9]),
+        strokes: vec![stroke.clone(), RecordedStroke { space: StrokeSpace::Uv, ..stroke }],
+        paths: vec![path],
+        ribbon: Some(StrokeRibbon { width: 0.1, copy: 0.4, tiling: RibbonTiling::Caps { guides: [0.2, 0.8] }, depth: 0.05 }),
+        particles: Some(StrokeParticles {
+            per_point: 2.0,
+            per_length: 0.5,
+            budget: 64.0,
+            speed: 0.3,
+            speed_rand: 0.2,
+            life: 0.5,
+            life_rand: 0.1,
+            gravity: 1.0,
+            friction: 0.5,
+            wander: 0.1,
+            curl: 0.2,
+            fan: 1.0,
+            heading: 0.3,
+            away: true,
+            kink_time: 0.1,
+            kink_angle: 0.4,
+            kink_branches: 2.0,
+            kink_speed: 1.0,
+            stop_speed: 0.01,
+            view_bias: 0.2,
+            spread: 1.0,
+            scatter: 0.1,
+            fade_size: 0.2,
+            fade_size_rand: 0.1,
+            fade_flow: 0.3,
+            fade_flow_rand: 0.1,
+            size: 0.8,
+            flow: 0.9,
+            step: 0.01,
+            file_units: false,
+        }),
+    };
+    let smudge = StrokeStep { mode: StrokeMode::Smudge, sources: vec![], ..step.clone() };
+    StrokeRecord { target: StrokeTarget::Content, label: "Layer 1 / brush strokes".into(), steps: vec![step, smudge] }
+}
+
+fn mask_effect(pf: &ProjectFile) -> LayerId {
+    pf.project.layers.values().find_map(|l| l.mask.as_ref()?.effects.first().map(|e| e.id)).unwrap()
+}
+
+fn stroke_entries(bytes: &[u8]) -> Vec<String> {
+    payloads(bytes).into_iter().map(|p| p.0).filter(|n| n.starts_with("strokes/")).collect()
+}
+
+#[test]
+fn stroke_records_round_trip_bit_for_bit() {
+    let mut s = sample();
+    let mask = mask_effect(&s.pf);
+    let record = sample_record(7);
+    s.pf.strokes.insert(s.paint, record.clone().into());
+    let mut on_mask = sample_record(9);
+    on_mask.target = texturecraft_core::strokes::StrokeTarget::Mask;
+    s.pf.strokes.insert(mask, on_mask.into());
+    let bytes = save_project_bytes(&s.pf).unwrap();
+    assert_eq!(stroke_entries(&bytes), [format!("strokes/{}.bin", s.paint.0), format!("strokes/{}.bin", mask.0)]);
+    let back = load_project_bytes(&bytes).unwrap();
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+    assert_same(&s.pf, &back);
+    // floats keep their bits (NaN, -0.0), so the encodings agree too
+    let read = back.strokes.get(&s.paint).and_then(StoredStrokes::record).unwrap();
+    assert_eq!(strokes::encode(read).unwrap(), strokes::encode(&record).unwrap());
+    assert_eq!(back.strokes.len(), 2);
+    assert_eq!(save_project_bytes(&back).unwrap(), bytes, "saving again writes the same file");
+}
+
+#[test]
+fn projects_without_stroke_records_are_written_as_before() {
+    let s = sample();
+    let bytes = save_project_bytes(&s.pf).unwrap();
+    assert!(stroke_entries(&bytes).is_empty());
+    let names: Vec<String> = payloads(&bytes).into_iter().map(|p| p.0).collect();
+    let mut with = s.pf.clone();
+    with.strokes.insert(s.paint, sample_record(1).into());
+    let more: Vec<String> = payloads(&save_project_bytes(&with).unwrap()).into_iter().map(|p| p.0).filter(|n| !n.starts_with("strokes/")).collect();
+    // a record adds its entry (and the text of a graph it paints when the store holds it), nothing else changes
+    assert_eq!(names, more);
+    assert!(load_project_bytes(&bytes).unwrap().strokes.is_empty());
+}
+
+#[test]
+fn records_of_removed_pixels_are_neither_saved_nor_loaded() {
+    let mut s = sample();
+    s.pf.strokes.insert(LayerId(9999), sample_record(1).into());
+    assert!(stroke_entries(&save_project_bytes(&s.pf).unwrap()).is_empty());
+    let record = strokes::encode(&sample_record(1)).unwrap();
+    let back = load_project_bytes(&zip_with(&[("strokes/9999.bin", record.clone()), (&format!("strokes/{}.bin", s.paint.0), record)])).unwrap();
+    assert_eq!(back.strokes.keys().copied().collect::<Vec<_>>(), [s.paint]);
+    assert!(matches!(load_project_bytes(&zip_with(&[("strokes/x.bin", vec![])])), Err(FormatError::Malformed { .. })));
+}
+
+#[test]
+fn unreadable_stroke_records_are_kept_as_their_bytes() {
+    let s = sample();
+    let good = strokes::encode(&sample_record(1)).unwrap();
+    let mut newer = good.clone();
+    newer[4] = 2;
+    let mut trailing = good.clone();
+    trailing.push(0);
+    for (bytes, why) in [(newer, "version 2"), (trailing, "after the stroke record"), (b"TCSR".to_vec(), "cut short"), (b"PNG!....".to_vec(), "not a stroke")] {
+        let back = load_project_bytes(&zip_with(&[(&format!("strokes/{}.bin", s.paint.0), bytes.clone())])).unwrap();
+        let Some(StoredStrokes::Unreadable(u)) = back.strokes.get(&s.paint) else { panic!("unreadable: {:?}", back.strokes) };
+        assert!(u.reason.contains(why), "{why}: {}", u.reason);
+        assert_eq!(*u.bytes, bytes);
+        assert!(back.warnings.iter().any(|w| w.contains("stroke record")), "{:?}", back.warnings);
+        // saved again unchanged
+        let again = load_project_bytes(&save_project_bytes(&back).unwrap()).unwrap();
+        assert_eq!(again.strokes.get(&s.paint), back.strokes.get(&s.paint));
+    }
+}
+
+#[test]
+fn damaged_stroke_records_never_panic() {
+    let good = strokes::encode(&sample_record(1)).unwrap();
+    // (NaN tips: compared by their encodings)
+    assert_eq!(strokes::encode(&strokes::decode(&good).unwrap()).unwrap(), good);
+    for n in 0..good.len() {
+        assert!(strokes::decode(&good[..n]).is_err(), "cut at {n}");
+    }
+    let mut state = 0x9e37_79b9u32;
+    for i in 0..4000 {
+        let mut b = good.clone();
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let at = 8 + state as usize % (b.len() - 8);
+        b[at] ^= (i % 255 + 1) as u8;
+        let _ = strokes::decode(&b);
+    }
+    // a length that claims far more than the entry holds
+    let mut huge = good[..8].to_vec();
+    huge.extend_from_slice(&[0, 0, 0xff, 0xff, 0xff, 0xff, 0x0f]);
+    assert!(strokes::decode(&huge).is_err());
+}
+
+#[test]
+fn graphs_painted_by_stroke_records_keep_their_texts() {
+    let mut s = sample();
+    let text = "graph text the brush paints".to_string();
+    let key = texturecraft_core::text_key(&text);
+    let mut record = sample_record(1);
+    if let texturecraft_core::strokes::StrokeSource::Graph(g) = &mut record.steps[0].sources[0].1 {
+        g.key = key.clone();
+    }
+    s.pf.strokes.insert(s.paint, record.into());
+    s.pf.graphs.texts.insert(key.clone(), Arc::from(text.as_str()));
+    let back = load_project_bytes(&save_project_bytes(&s.pf).unwrap()).unwrap();
+    assert_eq!(back.graphs.texts.get(&key).map(|t| t.to_string()), Some(text));
 }

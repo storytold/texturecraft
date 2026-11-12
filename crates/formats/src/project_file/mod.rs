@@ -14,6 +14,7 @@
 //! | `graphs/<key>.txt` | the text of a graph the layers run, once per distinct graph, named by its text key |
 //! | `cooked/<key>_<output>.bin` | one output of a graph's cooked render (pixel tiles), named by the cook's key |
 //! | `cooked/index.json` | the cooks' outputs (and which hold linear colour) and the cook each graph use read last |
+//! | `strokes/<id>.bin` | the stroke record behind the pixels keyed by `<id>` (see [`strokes`]) |
 //!
 //! Pixel `.bin` files are sparse and lossless: a header (magic `TCTX`, version, width, height,
 //! components, tile count; u32 LE each) followed, for every allocated 64×64 tile, by `tx`, `ty`
@@ -25,6 +26,10 @@
 //! entry's key is refused. Cooked renders are saved for the uses the last composite read (see
 //! `texturecraft_compose::graphs`): a project opened again finds them by their keys and renders nothing. Cooks whose
 //! entries are missing or malformed are left out with a warning: they are only renders, made again on demand.
+//!
+//! Stroke records are saved for the paint layers and paint effects that still exist; a record that cannot be read is
+//! kept as its bytes and saved again unchanged. They add entries only, so a project without them is written as before
+//! and older builds open a project with them (they skip the entries).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
@@ -33,7 +38,7 @@ use std::sync::Arc;
 
 use texturecraft_compose::graphs::{Cooked, GraphUse};
 use texturecraft_compose::{BakedMaps, GraphStore, PixelStore};
-use texturecraft_core::{BakePaintTarget, Channel, FORMAT_VERSION, LayerId, Project};
+use texturecraft_core::{BakePaintTarget, Channel, FORMAT_VERSION, LayerId, Project, StoredStrokes};
 use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -47,6 +52,7 @@ mod entries;
 mod load_budget;
 mod metadata_reader;
 mod project_open_limit;
+pub mod strokes;
 #[cfg(not(target_arch = "wasm32"))]
 pub use entries::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, save_ram_budget, set_save_resources};
 pub use project_open_limit::{DEFAULT_PROJECT_OPEN_LIMIT_GIB, project_open_limit_gib, set_project_open_limit_gib};
@@ -97,6 +103,8 @@ pub struct ProjectFile {
     pub resources: BTreeMap<String, Vec<u8>>,
     /// Texts of the graphs the layers run, and their cooked outputs.
     pub graphs: GraphStore,
+    /// Stroke records by the id of the pixels they belong to (a paint layer, a content or mask paint effect).
+    pub strokes: BTreeMap<LayerId, StoredStrokes>,
     /// Import warnings for the caller's log; never saved in the archive
     pub warnings: Vec<String>,
 }
@@ -287,6 +295,16 @@ fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
         });
     }
     graph_entries(pf, deflate, &mut out)?;
+    for (id, stored) in &pf.strokes {
+        if texture_set_of(&pf.project, *id).is_none() {
+            continue;
+        }
+        let bytes = strokes::entry_bytes(stored).map_err(FormatError::Invalid)?;
+        if bytes.is_empty() {
+            continue;
+        }
+        out.push(Entry { name: strokes::entry_name(*id), options: deflate, weight: bytes.len() as u64, body: Box::new(move |w| w.write_all(&bytes)) });
+    }
     Ok(out)
 }
 
@@ -323,7 +341,10 @@ fn output_entry(key: &str, output: &str) -> String {
 
 /// The graph texts the project references and the cooks its uses read.
 fn graph_entries<'a>(pf: &'a ProjectFile, deflate: SimpleFileOptions, out: &mut Vec<Entry<'a>>) -> Result<()> {
-    let keys = pf.project.graph_keys();
+    let mut keys = pf.project.graph_keys();
+    // the graphs stroke records paint, so that the strokes can be laid again
+    let painted = pf.strokes.values().filter_map(StoredStrokes::record).flat_map(|r| r.graphs()).flat_map(|g| g.text_keys());
+    keys.extend(painted.map(str::to_string));
     for key in &keys {
         if !texturecraft_core::is_key(key) {
             continue;
@@ -624,9 +645,11 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
         thumbnail: None,
         resources: BTreeMap::new(),
         graphs: GraphStore::default(),
+        strokes: BTreeMap::new(),
         warnings: Vec::new(),
         project,
     };
+    let mut unreadable_strokes = 0usize;
     let mut cook_index: Option<CookIndex> = None;
 
     for i in 0..zip.len() {
@@ -701,6 +724,15 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
 
             let img = read_tiles(&mut f, size, 2, &mut budget, &name)?;
             pf.pixels.masks.insert(id, img);
+        } else if let Some(id) = strokes::entry_id(&name) {
+            let id = id.ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
+            // Drop records of pixels that are no longer in any stack
+            if size_of(id).is_none() {
+                continue;
+            }
+            let stored = strokes::read(read_all(&mut f, strokes::MAX_ENTRY, &mut budget, &name)?);
+            unreadable_strokes += usize::from(matches!(stored, StoredStrokes::Unreadable(_)));
+            pf.strokes.insert(id, stored);
         } else if let Some(rest) = name.strip_prefix("baked/").and_then(|r| r.strip_suffix(".bin")) {
             let (ts, map) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
             let ts: usize = ts.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?;
@@ -729,6 +761,10 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
     }
 
     pf.project.format_version = FORMAT_VERSION;
+    if unreadable_strokes > 0 {
+        pf.warnings
+            .push(format!("Note: {unreadable_strokes} stroke record(s) could not be read; the pixels are unchanged and the records are kept as they are."));
+    }
 
     if recovered {
         pf.warnings.push(

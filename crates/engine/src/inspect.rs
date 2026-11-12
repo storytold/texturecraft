@@ -124,7 +124,18 @@ fn effect_json(session: &Session, effect: &Effect, content: bool) -> Value {
         }
         _ => {}
     }
+    if let Some(v) = strokes_json(session, effect.id) {
+        out["strokes"] = v;
+    }
     out
+}
+
+/// The stroke record behind the pixels keyed by `id`: its steps and strokes, or why it could not be read.
+fn strokes_json(s: &Session, id: texturecraft_core::LayerId) -> Option<Value> {
+    Some(match s.doc.strokes.get(&id)? {
+        texturecraft_core::StoredStrokes::Record(r) => json!({ "steps": r.steps.len(), "strokes": r.stroke_count() }),
+        texturecraft_core::StoredStrokes::Unreadable(u) => json!({ "unreadable": u.reason }),
+    })
 }
 
 /// A generator's settings, with its curvature mode and detail size weights when it has them.
@@ -176,6 +187,9 @@ fn layer_json(s: &Session, l: &Layer, depth: usize) -> Value {
             s.doc.pixels.layers.iter().filter(|((id, _), _)| *id == l.id).map(|((_, c), img)| (c.id(), img.allocated_count())).collect();
         painted.sort_unstable();
         v["painted"] = json!(painted.iter().map(|(c, n)| json!({ "channel": c, "tiles": n })).collect::<Vec<_>>());
+    }
+    if let Some(strokes) = strokes_json(s, l.id) {
+        v["strokes"] = strokes;
     }
     if let Some(m) = &l.mask {
         v["mask"] = json!({

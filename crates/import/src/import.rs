@@ -11,7 +11,7 @@ use texturecraft_compose::graphs::Cancel;
 use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, PixelStore};
 use texturecraft_core::{
     BlendMode, Channel, ChannelBlend, CompositeRules, Fidelity, Fill, HeightNormal, ImportReport, Layer, LayerId, LayerKind, LayerReport, LayerRole, Lock,
-    LockReason, MAX_RESOLUTION, MIN_RESOLUTION, NormalFormat, Project, Source, TextureSet, import_report::original_result_layer,
+    LockReason, MAX_RESOLUTION, MIN_RESOLUTION, NormalFormat, Project, Source, StoredStrokes, TextureSet, import_report::original_result_layer,
 };
 use texturecraft_geom::{Mesh, UvGBuffer};
 use texturecraft_import_reader::decode::assbin::{AssbinGeometry, AssbinScene, Normalization};
@@ -56,6 +56,8 @@ pub struct Imported {
     pub graphs: GraphStore,
     /// Per texture set: what the safety net found.
     pub sets: Vec<SetSummary>,
+    /// The stroke records of the replay jobs, by the id of the pixels they paint.
+    pub strokes: BTreeMap<LayerId, StoredStrokes>,
 }
 
 /// What the safety net found for one texture set.
@@ -241,6 +243,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         resources: BTreeMap::new(),
         graphs: GraphStore::with_cancel(hooks.cancel.clone()),
         sets: Vec::new(),
+        strokes: BTreeMap::new(),
     };
     imported.graphs.keep_cooks_in(hooks.kept_cooks.clone());
     for source in &binding.sets {
@@ -504,6 +507,11 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         ctx.hooks.check()?;
         lay_polygon_fills(stack, ctx.mesh, ctx.source.slot, resolution, &mut out.pixels);
     }
+    if let Some(stack) = stack.as_mut() {
+        // particle speeds in the stored mesh's units first: the records keep what the replay reads
+        crate::replay::particles::in_file_units(&mut stack.jobs, ctx.normalization.map(|n| n.radius));
+        record_strokes(stack, ctx.graphs, out);
+    }
     let mut replayed = ReplayCount::default();
     if let Some(stack) = stack.as_mut()
         && let Some(replayer) = ctx.hooks.replay.filter(|_| !stack.jobs.is_empty())
@@ -513,7 +521,6 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         (ctx.hooks.progress)(ctx.span.0 + 0.25 * ctx.span.1, Step::ReplayingStrokes { set, of });
         render_brush_sources(stack, ctx.graphs, &out.graphs, &baked, ctx.images, resolution);
         ctx.hooks.check()?;
-        crate::replay::particles::in_file_units(&mut stack.jobs, ctx.normalization.map(|n| n.radius));
         let scene = ReplayScene { mesh: ctx.mesh, material: ctx.source.slot, resolution };
         replayed = replay_stack(stack, replayer, &scene, &mut out.pixels, &|what: &str| item(what), report);
         // a replayer stopped by the flag fails its remaining jobs: they are not reported as failures
@@ -740,6 +747,19 @@ fn render_brush_sources(
     let side = texturecraft_compose::graphs::RenderEnv::side_for((resolution, resolution));
     let env = texturecraft_compose::graphs::RenderEnv { baked, images: &images, side };
     crate::replay::source::render(&mut stack.jobs, &store, &env);
+}
+
+/// Keeps the record of every replay job of `stack` (taken before brush graphs render, so they keep their references), and
+/// the texts of the graphs they paint.
+fn record_strokes(stack: &ImportedStack, lib: Option<&GraphLibrary>, out: &mut Imported) {
+    for job in &stack.jobs {
+        out.strokes.insert(job.target.id(), crate::replay::record::record(job).into());
+    }
+    for key in crate::replay::source::text_keys(&stack.jobs) {
+        if let Some(text) = lib.and_then(|l| l.text(&key)) {
+            out.graphs.texts.entry(key).or_insert(text);
+        }
+    }
 }
 
 /// What a set's stroke replay painted: paint effects and strokes, and jobs that failed.

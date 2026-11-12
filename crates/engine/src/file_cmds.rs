@@ -179,7 +179,15 @@ impl Session {
         let source = pf.mesh.clone();
         let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
         let mut s = Session::new(
-            Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources, graphs: pf.graphs },
+            Document {
+                bake_paint: Default::default(),
+                project: pf.project,
+                pixels: pf.pixels,
+                baked: pf.baked,
+                resources,
+                graphs: pf.graphs,
+                strokes: pf.strokes,
+            },
             mesh,
             source,
         )?;
@@ -221,6 +229,7 @@ impl Session {
             thumbnail: None,
             resources: self.doc.resources.iter().map(|(k, v)| (k.clone(), v.as_ref().clone())).collect(),
             graphs: self.doc.graphs.clone(),
+            strokes: self.doc.strokes.clone(),
             warnings: Vec::new(),
         }
     }

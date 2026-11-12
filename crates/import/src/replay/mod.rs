@@ -18,6 +18,7 @@
 
 pub mod brush;
 pub mod particles;
+pub mod record;
 pub mod source;
 pub mod tip;
 

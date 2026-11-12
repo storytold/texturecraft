@@ -57,6 +57,7 @@ pub mod result_cache;
 pub mod session;
 pub mod set_cmds;
 pub mod smart_masks;
+pub mod stroke_records;
 pub mod template_cmds;
 pub mod text_cmds;
 pub mod thumbs;

@@ -30,6 +30,8 @@ pub struct Document {
     pub resources: BTreeMap<String, Arc<Vec<u8>>>,
     /// Texts of the graphs the layers run, and their cooked outputs (shared by every snapshot).
     pub graphs: texturecraft_compose::GraphStore,
+    /// Stroke records behind imported pixels, by the id that keys the pixels (saved with the project).
+    pub strokes: BTreeMap<texturecraft_core::LayerId, texturecraft_core::StoredStrokes>,
 }
 
 /// Derived per-texture-set data (rebuilt when the mesh or resolution changes).
@@ -478,6 +480,7 @@ impl Session {
                 baked: BTreeMap::new(),
                 resources: BTreeMap::new(),
                 graphs: Default::default(),
+                strokes: BTreeMap::new(),
             },
             mesh,
             mesh_source,

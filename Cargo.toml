@@ -64,6 +64,8 @@ rmcp = { version = "3.5", default-features = false, features = ["server", "macro
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "net", "io-util", "time"] }
 schemars = "1"
 base64 = "0.22"
+# Stroke records in project files: a compact, exact binary layout of serde types (no_std, no further crates).
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 cap-std = "4"
 getrandom = "0.3"
 # Opening the control token file without following symlinks, and the effective uid (Unix).

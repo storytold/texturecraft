@@ -206,6 +206,13 @@ down its own stack (`compose::graphs::once`). The `.tcraft` file stores the text
 the last composite read (`cooked/`), so a converted project opens without rendering its graphs; a use whose key no
 longer matches is rendered again alone, and one that cannot be keeps its last pixels, flagged in `project.inspect`.
 
+An import also keeps the stroke records behind the pixels it replayed (`core::strokes`, one `strokes/<id>.bin` entry
+per paint layer or paint effect, written by `formats::project_file::strokes`): each replay job as the replayer reads it
+(pen points, camera, seed, symmetry, the mapped brush and tip, a particle brush's simulation settings, the values laid), so `Session::replay_stroke_record`
+lays the strokes again from the saved project alone, to the same pixels. Images a brush paints are not kept (that step
+cannot be laid again); graphs it paints are kept by reference, their texts saved with the project. A record that cannot
+be read stays as its bytes and is saved unchanged; older builds skip the entries.
+
 Across documents, an import can also keep its cooks in a result cache folder (`resultCache`, CLI
 `--result-cache`; native builds only): the graph store looks there by cook key before rendering and puts each
 finished render there (`compose::graphs::kept`, a `KeptCooks` the engine backs with `texturecraft-result-cache`,

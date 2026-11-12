@@ -15,6 +15,7 @@ pub mod import_report;
 pub mod layer;
 pub mod project;
 pub mod rules;
+pub mod strokes;
 
 pub use bake::{
     AmbientOcclusionAttenuation, AmbientOcclusionSettings, BackfaceMode, BakeAntialiasing, BakePaintTarget, BakeResolution, BakeSettings, BakedMap,
@@ -37,6 +38,7 @@ pub use project::{
     TextureSet, TileGrid, ToneMapping, UDIM_RANGE, udim_at,
 };
 pub use rules::{BlendRules, CompositeRules, HeightNormal};
+pub use strokes::{StoredStrokes, StrokeRecord};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum CoreError {
