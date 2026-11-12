@@ -146,9 +146,6 @@ fn what_the_brush_cannot_replay_is_refused_with_a_reason() {
     }
     assert_eq!(brush::alone(&effect(PaintTool::Smudge)).unwrap_err().key.to_string(), "brush:smudge-alone");
     assert!(brush::alone(&effect(PaintTool::Brush)).is_ok());
-    let mut e = effect(PaintTool::Brush);
-    e.brush = Some(ProjectBrush { emitter: StampEmitter::Physics(Default::default()), ..ProjectBrush::default() });
-    assert_eq!(key(&e), "brush:particle");
     // a stencil drawn by a graph the project does not hold: its own blocker
     let mut e = effect(PaintTool::Brush);
     e.stencil = Some(shape("grunge_map", vec![]));
@@ -566,4 +563,52 @@ fn a_graph_tip_reads_what_feeds_its_image_inputs() {
     assert!((tip_fed(None) - 1.0).abs() < 0.01, "unfed: its declaration");
     assert!((tip_fed(Some(uniform(0, [0.25; 3], 1.0))) - 0.25).abs() < 0.01, "a uniform");
     assert!((tip_fed(Some(shape("half", vec![]))) - 0.5).abs() < 0.01, "another graph's grey");
+}
+
+#[test]
+fn a_particle_brush_replays_its_strokes_as_a_simulation() {
+    let mut e = effect(PaintTool::Brush);
+    let physics = texturecraft_import_reader::model::PhysicsEmitter {
+        emitter: "shelf/EmitSingle?version=1".into(),
+        receiver: "shelf/RcvLeak?version=1".into(),
+        delta_time: Some(0.01),
+        ..Default::default()
+    };
+    e.brush = Some(ProjectBrush { size: 0.2, flow: 0.8, emitter: StampEmitter::Physics(physics), ..ProjectBrush::default() });
+    // a tip that cannot be made does not stop it: a soft round dab stands in
+    e.alpha = vec![shape("not_in_the_project", vec![])];
+    let s = of(&e, StepTarget::Content).unwrap();
+    let p = s.particles.expect("particles");
+    assert_eq!((p.per_point, p.gravity, p.step, p.file_units), (1.0, 0.5, 0.01, false));
+    assert_eq!(s.strokes.len(), 2);
+    assert_eq!(s.brush.tip, ReplayTip::Round { hardness: 0.5 });
+    assert!(s.notes.iter().any(|n| n == "particles approximated: leak on single"), "{:?}", s.notes);
+    assert!(s.notes.iter().any(|n| n.starts_with("particle tip laid as a soft round dab")), "{:?}", s.notes);
+    // the same in a mask
+    assert!(of(&e, StepTarget::Mask).unwrap().particles.is_some());
+    // strokes without particles carry none
+    assert!(of(&effect(PaintTool::Brush), StepTarget::Content).unwrap().particles.is_none());
+}
+
+#[test]
+fn particle_speeds_in_the_imported_files_units_shrink_by_its_radius() {
+    let mut e = effect(PaintTool::Brush);
+    let physics = texturecraft_import_reader::model::PhysicsEmitter {
+        emitter: "shelf/EmitSingle?version=1".into(),
+        receiver: "shelf/RcvBrush?version=1".into(),
+        ..Default::default()
+    };
+    e.brush = Some(ProjectBrush { emitter: StampEmitter::Physics(physics), ..ProjectBrush::default() });
+    let s = of(&e, StepTarget::Content).unwrap();
+    let job = |s: &ReplayStep| ReplayJob { target: ReplayTarget::Mask(texturecraft_core::LayerId(1)), label: String::new(), steps: vec![s.clone()] };
+    let mut jobs = vec![job(&s)];
+    particles::in_file_units(&mut jobs, Some(1730.0));
+    let p = jobs[0].steps[0].particles.unwrap();
+    assert!((p.speed - 0.25 / 1730.0).abs() < 1e-9 && !p.file_units);
+    // once only, and nothing when the radius is not known
+    particles::in_file_units(&mut jobs, Some(1730.0));
+    assert_eq!(jobs[0].steps[0].particles.unwrap().speed, p.speed);
+    let mut jobs = vec![job(&s)];
+    particles::in_file_units(&mut jobs, None);
+    assert_eq!(jobs[0].steps[0].particles.unwrap().speed, 0.25);
 }

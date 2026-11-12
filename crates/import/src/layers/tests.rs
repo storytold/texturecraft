@@ -372,18 +372,18 @@ fn strokes_that_cannot_be_replayed_stay_placeholders_with_their_reason() {
         effects: vec![painting(3, BASE, PaintTool::Brush, vec![uniform(BASE, [1.0; 3])]), painting(9, BASE, PaintTool::Projection, vec![])],
     });
     let mut l = layer(1, "Paint", ProjectLayerKind::Paint, vec![group]);
-    let mut particle = paint(5, 0);
-    if let ProjectEffect::Paint(p) = &mut particle {
+    let mut emitterless = paint(5, 0);
+    if let ProjectEffect::Paint(p) = &mut emitterless {
         p.brush = Some(texturecraft_import_reader::model::ProjectBrush {
-            emitter: texturecraft_import_reader::model::StampEmitter::Physics(Default::default()),
+            emitter: texturecraft_import_reader::model::StampEmitter::Other(String::new()),
             ..Default::default()
         });
     }
-    l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::White, effects: vec![particle] });
+    l.mask = Some(ProjectMask { enabled: true, initial: MaskInitial::White, effects: vec![emitterless] });
     let stack = build_replaying(vec![l]);
     let ours = by_name(&stack, "Paint");
     let keys = ours.lock.as_ref().unwrap().keys();
-    assert!(keys.contains(&"brush:projection") && keys.contains(&"strokes:brush") && keys.contains(&"brush:particle"), "{keys:?}");
+    assert!(keys.contains(&"brush:projection") && keys.contains(&"strokes:brush") && keys.contains(&"brush:no-emitter"), "{keys:?}");
     assert!(stack.jobs.is_empty());
     let reasons: Vec<String> = ours
         .placeholders()
@@ -393,7 +393,7 @@ fn strokes_that_cannot_be_replayed_stay_placeholders_with_their_reason() {
             _ => None,
         })
         .collect();
-    assert!(reasons.iter().any(|r| r.contains("particle brush")), "{reasons:?}");
+    assert!(reasons.iter().any(|r| r.contains("without an emitter")), "{reasons:?}");
 }
 
 /// With the project's graphs decompiled, a procedural fill whose channels blend differently becomes one graph source

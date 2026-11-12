@@ -25,9 +25,10 @@
 //! | ribbon brush (`width`, `tilingMode`, `stretchGuides`, `aspectRatioFactor`, `projectionDepthRatio`) | the tip laid along each path as a band ([`ReplayRibbon`]) |
 //! | `sourceColor` bitmap or graph | painted per texel ([`super::source`]): laid on texel for texel, read along paths and ribbons |
 //! | black uniform alpha over a material with a coverage output, on paths | a full square tip: the material's coverage is the shape |
+//! | particle brush (`urlEmitter`, `urlReceiver`, `tweaksEmitter`, `tweaksReceiver`, `deltaTime`) | dabs of a simulation per stroke ([`super::particles`], approximated) |
 //! | `stampBlendingMode` ≠ 0, `aspectRatio` ≠ 1, other `alignment` | approximated (noted) |
 //!
-//! Not replayable (a `brush:` blocker): particle brushes, projection painting without an image,
+//! Not replayable (a `brush:` blocker): projection painting without an image,
 //! smudge or projection painting along path strokes, a smudge with nothing of its effect before it, brushes painting
 //! anchors or other sources, brushes painting an image into a mask, brushes painting a graph without the project's
 //! graphs ([`SourceGraphs`]), unreadable point lists.
@@ -109,9 +110,7 @@ pub fn check(effect: &PaintEffect) -> Result<(), Blocker> {
     if let Some(b) = &effect.brush {
         match &b.emitter {
             StampEmitter::Stroke(_) | StampEmitter::Stroke3D(_) => {}
-            StampEmitter::Physics(_) => {
-                return Err(refused("particle", "particle brush: its emitter and receiver scripts are not carried by TextureCraft's particle brush"));
-            }
+            StampEmitter::Physics(_) => {}
             StampEmitter::Ribbon(_) => {}
             StampEmitter::Other(class) if class.is_empty() => return Err(refused("no-emitter", "brush without an emitter")),
             StampEmitter::Other(class) => return Err(Blocker::class(class, format!("brush emitter {class}"))),
@@ -147,9 +146,13 @@ pub fn step(
 ) -> Result<ReplayStep, Blocker> {
     check(effect)?;
     let mut notes = Vec::new();
-    let (tip, tip_note) = match own_alpha_tip(effect) {
-        Some(full) => (full, None),
-        None => tip::tip(&effect.alpha, images, graphs)?,
+    let (tip, tip_note) = match (own_alpha_tip(effect), super::particles::emitter(effect)) {
+        (Some(full), _) => (full, None),
+        (None, particle) => match (tip::tip(&effect.alpha, images, graphs), particle) {
+            // particles are small: a soft round dab stands in for a tip that cannot be made
+            (Err(b), Some(_)) => (ReplayTip::Round { hardness: 0.5 }, Some(format!("particle tip laid as a soft round dab ({})", b.text))),
+            (tip, _) => tip?,
+        },
     };
     notes.extend(tip_note);
     let mut brush = map_brush(effect, tip, &mut notes);
@@ -207,11 +210,16 @@ pub fn step(
     if (graph || image) && !paths.is_empty() {
         notes.push(SOURCE_ALONG.to_string());
     }
+    let particles = super::particles::emitter(effect).map(|p| {
+        let (particles, note) = super::particles::particles(p);
+        notes.push(note);
+        particles
+    });
     let opacity = if effect.opacity.is_finite() { effect.opacity.clamp(0.0, 1.0) } else { 1.0 };
     if placed.is_some() {
         notes.push(PROJECTED.to_string());
     }
-    Ok(ReplayStep { mode, values, sources, mask_value, mask_source, opacity, brush, stencil, projection, placed, strokes, paths, ribbon, notes })
+    Ok(ReplayStep { mode, values, sources, mask_value, mask_source, opacity, brush, stencil, projection, placed, strokes, paths, ribbon, particles, notes })
 }
 
 /// A full square tip where a path brush paints a material with a coverage output under a black uniform alpha: the

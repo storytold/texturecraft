@@ -9,13 +9,15 @@
 //! net composites, so the measured scores include the replayed pixels. Without a replayer, strokes stay placeholders
 //! locked with `strokes:<tool>`.
 //!
-//! Paint effects that cannot be replayed (particles, projection painting without an image, smudge or projection painting
+//! Paint effects that cannot be replayed (projection painting without an image, smudge or projection painting
 //! along path strokes, brushes painting anchors, tips that are compiled graphs the project does not hold) stay
 //! placeholders with a precise `brush:` or `brush-alpha:` reason. Path strokes (curves on the mesh) are replayed as dabs
 //! walked along the curve ([`ReplayPath`]), or, with a ribbon brush, as a band ([`ReplayRibbon`]). Brushes painting an
 //! image or a compiled graph paint it per texel ([`source`]).
+//! Particle brushes lay the dabs of a small simulation per stroke ([`ReplayParticles`], approximated: [`particles`]).
 
 pub mod brush;
+pub mod particles;
 pub mod source;
 pub mod tip;
 
@@ -198,6 +200,45 @@ pub struct ReplayRibbon {
     pub depth: f32,
 }
 
+/// A particle brush: each stroke's dabs come from a simulation of particles spawned along it (TextureCraft's
+/// `particles::simulate` takes these numbers; see there for their meaning). Lengths mesh units, times seconds, angles
+/// radians.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReplayParticles {
+    pub per_point: f32,
+    pub per_length: f32,
+    pub budget: f32,
+    pub speed: f32,
+    pub speed_rand: f32,
+    pub life: f32,
+    pub life_rand: f32,
+    pub gravity: f32,
+    pub friction: f32,
+    pub wander: f32,
+    pub curl: f32,
+    pub fan: f32,
+    pub heading: f32,
+    pub away: bool,
+    pub kink_time: f32,
+    pub kink_angle: f32,
+    pub kink_branches: f32,
+    pub kink_speed: f32,
+    pub stop_speed: f32,
+    pub view_bias: f32,
+    pub spread: f32,
+    pub scatter: f32,
+    pub fade_size: f32,
+    pub fade_size_rand: f32,
+    pub fade_flow: f32,
+    pub fade_flow_rand: f32,
+    pub size: f32,
+    pub flow: f32,
+    pub step: f32,
+    /// `speed` is still in the units of the mesh file the original imported ([`particles::in_file_units`] puts it in the
+    /// stored mesh's before the replay).
+    pub file_units: bool,
+}
+
 /// One paint effect of the file, ready to lay.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplayStep {
@@ -227,6 +268,8 @@ pub struct ReplayStep {
     /// with `ribbon` a band.
     pub paths: Vec<ReplayPath>,
     pub ribbon: Option<ReplayRibbon>,
+    /// A particle brush: each stroke lays the dabs of its particles instead of its own.
+    pub particles: Option<ReplayParticles>,
     /// What the step leaves out or approximates, for the report.
     pub notes: Vec<String>,
 }

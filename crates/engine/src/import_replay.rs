@@ -34,6 +34,7 @@
 //!   of the last dab reaching them, with the source's coverage ([`texturecraft_paint::commit_layer_texels`]).
 //!   Projection painting on content reads each channel's source where the texel lies on the stroke's view, placed as a
 //!   mask's projected image is.
+//! - **Particles**: a particle brush's strokes lay the dabs of their particles ([`particles`]).
 //! - Dabs reach every surface in their volume whatever the view sees (measured: nothing occludes), at the texel's
 //!   distance along the surface, a surface lying off the dab's surface fading out ([`Reach::Surface`]), faded by the turn
 //!   from the dab's normal as the brush's culling says ([`Facing::Fade`]); each stroke is laid on its own and committed
@@ -519,6 +520,9 @@ fn commit(pixels: &mut PixelStore, set: &SetMesh, target: ReplayTarget, step: &R
 
 /// Lays one stroke's dabs into `canvas`.
 fn lay_stroke(set: &SetMesh, step: &ReplayStep, tip: &Tip, stroke: &ReplayStroke, canvas: &mut StrokeCanvas) {
+    if let Some(p) = &step.particles {
+        return particles::lay(set, &step.brush, tip, p, stroke, canvas);
+    }
     match &stroke.space {
         StrokeSpace::Mesh { view, projection } => {
             if let Some(camera) = ViewCamera::new(view, projection, set.center, set.radius) {
@@ -1055,5 +1059,6 @@ fn smudge_stroke(set: &SetMesh, step: &ReplayStep, tip: &Tip, stroke: &ReplayStr
     }
 }
 
+mod particles;
 #[cfg(test)]
 mod tests;

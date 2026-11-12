@@ -513,6 +513,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         (ctx.hooks.progress)(ctx.span.0 + 0.25 * ctx.span.1, Step::ReplayingStrokes { set, of });
         render_brush_sources(stack, ctx.graphs, &out.graphs, &baked, ctx.images, resolution);
         ctx.hooks.check()?;
+        crate::replay::particles::in_file_units(&mut stack.jobs, ctx.normalization.map(|n| n.radius));
         let scene = ReplayScene { mesh: ctx.mesh, material: ctx.source.slot, resolution };
         replayed = replay_stack(stack, replayer, &scene, &mut out.pixels, &|what: &str| item(what), report);
         // a replayer stopped by the flag fails its remaining jobs: they are not reported as failures

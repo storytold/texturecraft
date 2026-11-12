@@ -80,6 +80,7 @@ fn step(mode: PaintMode, strokes: Vec<ReplayStroke>) -> ReplayStep {
         strokes,
         paths: vec![],
         ribbon: None,
+        particles: None,
         notes: vec![],
     }
 }

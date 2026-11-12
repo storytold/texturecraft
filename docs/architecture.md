@@ -167,10 +167,11 @@ engine implements with `paint` (`engine::import_replay`) and passes in through t
 it per texture set before the safety net measures. The brush draws each stroke's jitter from its seed as the
 file's app does, and lays strokes through their stencil on the view; path strokes (curves on the mesh) are walked by their
 length in the mesh's space (`paint::path::SpaceCurve`), and ribbon brushes lay their tip along them as a band
-(`paint::ribbon`). Brushes painting an image or a compiled graph paint it per texel (the graph a fill of it runs,
+(`paint::ribbon`); particle brushes lay the dabs of a small simulation per stroke (`paint::particles::simulate`,
+the receiver's numbers read by `import::replay::particles`). Brushes painting an image or a compiled graph paint it per texel (the graph a fill of it runs,
 rendered before the replay with the import's cooks; `paint::commit::commit_layer_texels`), read along paths and ribbons
 at each texel's place on the band. Replayed strokes become approximated pixels, not locked; strokes
-the brush cannot replay yet (particles, smudge or projection along path strokes, graph tips the project does not hold, an eraser above other content effects) stay
+the brush cannot replay yet (smudge or projection along path strokes, graph tips the project does not hold, an eraser above other content effects) stay
 placeholders locked with a `brush:<what>` or `brush-alpha:<graph>` key, and with replay switched off with
 `strokes:<tool>`. The
 stored result itself becomes a locked "Original result" paint layer, hidden as a reference unless the
