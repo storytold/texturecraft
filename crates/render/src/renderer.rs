@@ -626,8 +626,9 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 pub(crate) fn display_format(k: DisplayKind) -> wgpu::TextureFormat {
     match k {
         DisplayKind::BaseColor | DisplayKind::Emissive | DisplayKind::Sheen => wgpu::TextureFormat::Rgba8UnormSrgb,
-        DisplayKind::Orm | DisplayKind::Normal | DisplayKind::Lobes | DisplayKind::Extra => wgpu::TextureFormat::Rgba8Unorm,
-        DisplayKind::Height => wgpu::TextureFormat::Rgba16Float,
+        DisplayKind::Orm | DisplayKind::Lobes | DisplayKind::Extra => wgpu::TextureFormat::Rgba8Unorm,
+        // Baked normals are smooth high-precision data: 8 bits band the shading
+        DisplayKind::Normal | DisplayKind::Height => wgpu::TextureFormat::Rgba16Float,
     }
 }
 

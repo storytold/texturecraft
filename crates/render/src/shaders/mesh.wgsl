@@ -249,8 +249,8 @@ fn rnm(base: vec3<f32>, detail: vec3<f32>) -> vec3<f32> {
     return normalize(t * dot(t, u) - u * t.z);
 }
 
-// Signed values packed in 8 bits: byte 128 decodes to exactly 0, so flat normals stay flat
-// (the CPU packing and both path tracers use the same rule).
+// Signed values packed in 8 bits (the coat normal in Extra): byte 128 decodes to exactly 0, so
+// flat normals stay flat (the CPU packing uses the same rule).
 fn snorm8(v: vec3<f32>) -> vec3<f32> {
     return clamp((v * 255.0 - 128.0) / 127.0, vec3<f32>(-1.0), vec3<f32>(1.0));
 }
@@ -407,7 +407,8 @@ fn shade_mesh(i: VOut, front: bool) -> Shaded {
     // Same slope rule as texture export: strength 1 tilts 45° for a height change of 1 over 1/16 of the width.
     let k = g.mode.z * dims.x / 16.0 * tile_scale(uv);
     let n_height = normalize(vec3<f32>(-(hr - hl) * 0.5 * k, (hd - hu) * 0.5 * k, 1.0));
-    var n_detail = snorm8(nrm_s);
+    // The Normal texture holds the signed normal in half floats (flat is exactly +z)
+    var n_detail = clamp(nrm_s, vec3<f32>(-1.0), vec3<f32>(1.0));
     n_detail.y *= g.mode.w;
     let n_ts = rnm(n_height, normalize(n_detail));
     let n = normalize(t * n_ts.x + b * n_ts.y + n_geo * n_ts.z);
@@ -601,7 +602,7 @@ fn fs_uv(i: VOut) -> @location(0) vec4<f32> {
         switch ch {
             case 1: { return data_out(vec3<f32>(orm.b)); }
             case 2: { return data_out(vec3<f32>(orm.g)); }
-            case 3: { return raw_out(textureSample(t_nrm, samp, i.uv).rgb); }
+            case 3: { return raw_out(textureSample(t_nrm, samp, i.uv).rgb * 0.5 + 0.5); }
             case 4: { return raw_out(vec3<f32>(textureSample(t_height, samp, i.uv).r * 0.5 + 0.5)); }
             case 5: { return data_out(textureSample(t_emis, samp, i.uv).rgb); }
             case 6: { return raw_out(vec3<f32>(base_s.a)); }

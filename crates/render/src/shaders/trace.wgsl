@@ -299,9 +299,8 @@ fn surface(hit: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
         let hy = textureLoad(t_height, texel(layer, 3u, uv, 0, 1), layer, 0).r - textureLoad(t_height, texel(layer, 3u, uv, 0, -1), layer, 0).r;
         n_height = normalize_or(vec3<f32>(-hx * 0.5 * k, hy * 0.5 * k, 1.0), vec3<f32>(0.0, 0.0, 1.0));
     }
-    // 8-bit normals centred on 128, so the flat normal (128, 128, 255) is exactly +z (with
-    // `× 2 − 1` it would lean 0.3°, shifting every reflection).
-    let detail = normalize_or((nrm_t.rgb * 255.0 - 128.0) / 127.0, vec3<f32>(0.0, 0.0, 1.0));
+    // The signed normal in half floats, as in mesh.wgsl (flat is exactly +z)
+    let detail = normalize_or(clamp(nrm_t.rgb, vec3<f32>(-1.0), vec3<f32>(1.0)), vec3<f32>(0.0, 0.0, 1.0));
     let n_ts = rnm(n_height, detail);
     let tt = normalize_or(tw - n_geo * dot(n_geo, tw), onb_t(n_geo));
     let b = cross(n_geo, tt) * tsign;
