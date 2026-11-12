@@ -340,6 +340,36 @@ fn image_resource_lookup_accepts_extension_and_stem() {
 }
 
 #[test]
+fn image_resource_lookup_ignores_linked_packages() {
+    use std::sync::Arc;
+    use texturecraft_engine::core::{LayerId, LayerKind, Source};
+
+    let mut s = session();
+    s.doc.resources.insert("wood.mcraft".into(), Arc::new(b"package bytes".to_vec()));
+    s.sync_images();
+    assert!(!s.images.contains_key("wood.mcraft"));
+
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "wood"})).unwrap_err();
+    assert!(err.to_string().contains("no resources imported"), "{err}");
+
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "wood.mcraft"})).unwrap_err();
+    assert!(err.to_string().contains("no resource `wood.mcraft` (no resources imported"), "{err}");
+
+    let mut png = Vec::new();
+    let img = image::RgbaImage::from_fn(4, 4, |_, _| image::Rgba([0, 255, 0, 255]));
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    s.import_resource_bytes("wood.png", png).unwrap();
+
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "missing"})).unwrap_err();
+    assert!(err.to_string().contains("no resource `missing` (available: wood.png)"), "{err}");
+
+    let res = execute(&mut s, "layer.add.image", &json!({"name": "wood"})).unwrap();
+    let id = LayerId(res["layer"].as_u64().unwrap());
+    let LayerKind::Fill(fill) = &s.doc.project.layer(id).unwrap().kind else { panic!("expected fill layer") };
+    assert_eq!(fill.sources.get(&Channel::BaseColor), Some(&Source::image("wood.png")));
+}
+
+#[test]
 fn brush_presets_apply_save_and_load() {
     let mut s = session();
     let list = execute(&mut s, "brush.preset.list", &Value::Null).unwrap();

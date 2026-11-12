@@ -179,24 +179,27 @@ fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({ "removed": unused }))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+const IMPORT_HINT: &str = "resource.import";
+#[cfg(target_arch = "wasm32")]
+const IMPORT_HINT: &str = "File > Import resources";
+
+/// Resolve an image resource by exact name or unique file stem.
 fn resolve_resource_name(s: &Session, name: &str) -> Result<String> {
-    if s.doc.resources.contains_key(name) {
+    if s.images.contains_key(name) {
         return Ok(name.to_string());
     }
-    let matches: Vec<&String> = s.doc.resources.keys().filter(|k| std::path::Path::new(k).file_stem().and_then(|stem| stem.to_str()) == Some(name)).collect();
+    let matches: Vec<&String> = s.images.keys().filter(|k| std::path::Path::new(k).file_stem().and_then(|stem| stem.to_str()) == Some(name)).collect();
     match matches.as_slice() {
         [single] => Ok((*single).clone()),
         [] => {
-            let available: Vec<_> = s.doc.resources.keys().cloned().collect();
-            let hint = if available.is_empty() {
-                " (no resources imported: use resource.import)".to_string()
-            } else {
-                format!(" (available: {})", available.join(", "))
-            };
+            let available: Vec<&str> = s.images.keys().map(String::as_str).collect();
+            let hint =
+                if available.is_empty() { format!(" (no resources imported: use {IMPORT_HINT})") } else { format!(" (available: {})", available.join(", ")) };
             Err(bad("layer.add.image", format!("no resource `{name}`{hint}")))
         }
         multiple => {
-            let matches_str = multiple.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", ");
+            let matches_str = multiple.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
             Err(bad("layer.add.image", format!("ambiguous resource `{name}` matches {matches_str}: give the full name with extension")))
         }
     }
