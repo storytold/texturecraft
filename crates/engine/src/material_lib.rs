@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use texturecraft_compose::PixelStore;
-use texturecraft_core::{EffectKind, LayerId, LayerKind, Project, Source, TextureSet};
+use texturecraft_core::{LayerId, LayerKind, Project, Source, TextureSet};
 
 use crate::commands::{CommandSpec, always, has_layer};
 use crate::materials::Place;
@@ -36,27 +36,26 @@ fn fe(e: texturecraft_formats::FormatError) -> EngineError {
     EngineError::Other(e.to_string())
 }
 
-/// Image resources a layer subtree uses (fill sources and fill effects).
-pub(crate) fn images_used(p: &Project, id: LayerId, out: &mut Vec<String>, depth: usize) {
+/// Image resources a layer subtree uses (fill sources, mask fills and generator inputs).
+pub(crate) fn images_used(project: &Project, id: LayerId, out: &mut Vec<String>, depth: usize) {
     if depth > texturecraft_core::project::MAX_DEPTH {
         return;
     }
-    let Some(l) = p.layers.get(&id) else { return };
-    if let LayerKind::Fill(f) = &l.kind {
-        for s in f.sources.values() {
-            if let Source::Image { name, .. } = s {
+    let Some(layer) = project.layers.get(&id) else { return };
+
+    if let LayerKind::Fill(fill) = &layer.kind {
+        for source in fill.sources.values() {
+            if let Source::Image { name, .. } = source {
                 out.push(name.clone());
             }
         }
-        out.extend(f.link.as_ref().map(|link| link.package.clone()));
+        out.extend(fill.link.as_ref().map(|link| link.package.clone()));
     }
-    for e in l.mask.iter().flat_map(|m| m.effects.iter()) {
-        if let EffectKind::Fill { source: Source::Image { name, .. }, .. } = &e.kind {
-            out.push(name.clone());
-        }
+    for effect in layer.mask.iter().flat_map(|mask| mask.effects.iter()) {
+        out.extend(effect.kind.images_read().map(str::to_string));
     }
-    for c in l.children() {
-        images_used(p, *c, out, depth + 1);
+    for child in layer.children() {
+        images_used(project, *child, out, depth + 1);
     }
 }
 

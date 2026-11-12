@@ -20,6 +20,7 @@ pub mod export_templates;
 pub mod file_dialogs;
 mod filter_slot;
 pub mod fonts;
+mod generator_panel;
 pub mod gpu;
 pub mod i18n;
 pub mod id_color_pick;

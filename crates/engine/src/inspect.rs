@@ -69,9 +69,16 @@ fn effect_json(session: &Session, effect: &Effect, content: bool) -> Value {
     out
 }
 
-/// A generator's settings, with its curvature mode and detail size weights when it has them.
+/// A generator's settings: global adjustments, then its resolution, replaced inputs and curvature detail when it has them.
 fn generator_json(generator: &Generator) -> Value {
-    let mut out = json!({ "type": format!("{:?}", generator.kind), "level": generator.level, "softness": generator.softness, "noise": generator.noise_amount, "offset": generator.offset, "invert": generator.invert });
+    let mut out = json!({ "type": format!("{:?}", generator.kind), "level": generator.level, "softness": generator.softness, "noise": generator.noise_amount, "offset": generator.offset, "invert": generator.invert, "blur": generator.global.blur, "balance": generator.global.balance, "contrast": generator.global.contrast });
+    if !generator.resolution.is_default() {
+        out["resolution"] =
+            json!({ "mode": format!("{:?}", generator.resolution.mode), "custom": generator.resolution.custom, "factor": generator.resolution.factor });
+    }
+    if !generator.inputs.is_empty() {
+        out["inputs"] = generator.inputs.iter().map(|(map, source)| (map.id().to_string(), json!(source))).collect::<serde_json::Map<_, _>>().into();
+    }
     if let Some(detail) = &generator.detail {
         out["mode"] = json!(format!("{:?}", detail.mode));
         out["sizes"] = json!(detail.weights);

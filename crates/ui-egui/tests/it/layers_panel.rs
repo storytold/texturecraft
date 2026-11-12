@@ -58,9 +58,9 @@ fn mask_and_content_thumbnails_select_their_own_target() {
     let at = thumb(&h, "Masked fill", false);
     click(&mut h, at);
     assert_eq!(h.state().session.target, StackTarget::Content, "the content thumbnail routes back");
-    // Clicking an effect row still selects that effect.
-    let r = h.get_by_label("Effect A").rect();
-    click(&mut h, egui::pos2(r.right() - 40.0, r.center().y));
+    // Clicking an effect row's name still selects that effect (its right end holds the blend mode and opacity)
+    let row = h.get_by_label("Effect A").rect();
+    click(&mut h, row.center());
     assert!(matches!(h.state().session.target, StackTarget::Effect(_)));
 }
 

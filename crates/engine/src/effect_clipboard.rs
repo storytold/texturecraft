@@ -2,7 +2,7 @@
 //! clipboard: it holds a layer or an effect.
 
 use serde_json::{Value, json};
-use texturecraft_core::{EffectKind, LayerId, Mask, MaskBackground, Source};
+use texturecraft_core::{EffectKind, LayerId, Mask, MaskBackground};
 
 use crate::commands::{CommandSpec, bad, has_layer, layer_param, strp};
 use crate::layer_ops::{empty_texel, fit};
@@ -55,26 +55,29 @@ fn cut(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "cut": eid }))
 }
 
-fn paste(s: &mut Session, p: &Value) -> Result<Value> {
+fn paste(session: &mut Session, params: &Value) -> Result<Value> {
     const CMD: &str = "effect.paste";
-    let (src, eid) = s.clipboard.clone().ok_or_else(|| bad(CMD, "the clipboard holds no effect"))?;
-    let effect = src.project.effect(eid).map(|(_, e)| e.clone()).ok_or_else(|| bad(CMD, "the clipboard holds no effect"))?;
-    let layer = layer_param(s, CMD, p)?;
-    // The selected effect's stack, or the content or mask the selection targets.
-    let selected = match s.target {
-        StackTarget::Effect(x) if s.selected_layer() == Some(layer) => Some(x),
+    let (copied, copied_id) = session.clipboard.clone().ok_or_else(|| bad(CMD, "the clipboard holds no effect"))?;
+    let effect = copied.project.effect(copied_id).map(|(_, effect)| effect.clone()).ok_or_else(|| bad(CMD, "the clipboard holds no effect"))?;
+    let layer = layer_param(session, CMD, params)?;
+
+    // The selected effect's stack, or the content or mask the selection targets
+    let selected = match session.target {
+        StackTarget::Effect(selected) if session.selected_layer() == Some(layer) => Some(selected),
         _ => None,
     };
-    let in_content = |s: &Session, x: LayerId| {
-        s.doc.project.effect(x).and_then(|(o, _)| s.doc.project.layers.get(&o)).is_some_and(|l| l.content_effects.iter().any(|e| e.id == x))
+    let in_content = |session: &Session, effect_id: LayerId| {
+        let owner = session.doc.project.effect(effect_id).and_then(|(owner, _)| session.doc.project.layers.get(&owner));
+        owner.is_some_and(|owner| owner.content_effects.iter().any(|effect| effect.id == effect_id))
     };
-    let asked = strp(p, "target").is_some();
+    let asked = strp(params, "target").is_some();
     let content = match selected {
-        _ if asked => content_target(p, CMD)?,
-        Some(x) => in_content(s, x),
-        None => s.target == StackTarget::Content && s.selected_layer() == Some(layer),
+        _ if asked => content_target(params, CMD)?,
+        Some(selected) => in_content(session, selected),
+        None => session.target == StackTarget::Content && session.selected_layer() == Some(layer),
     };
-    // Effects that fit one stack only go there, unless another was asked for.
+
+    // Effects that fit one stack only go there, unless another was asked for
     let content = match effect.kind.content_only() {
         Some(only) if only != content && asked => {
             return Err(bad(CMD, format!("{} effects go on the {}", effect.kind.name(), if only { "layer content" } else { "mask" })));
@@ -82,46 +85,52 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
         Some(only) => only,
         None => content,
     };
-    // An instance's content and (unless it has its own) mask belong to its source.
-    let owner = if content { s.doc.project.content_layer(layer).map_or(layer, |l| l.id) } else { s.doc.project.mask_owner(layer) };
-    let owner_layer = s.doc.project.layer(owner)?;
+
+    // An instance's content and (unless it has its own) mask belong to its source
+    let owner = if content { session.doc.project.content_layer(layer).map_or(layer, |source| source.id) } else { session.doc.project.mask_owner(layer) };
+    let owner_layer = session.doc.project.layer(owner)?;
     if content && owner_layer.is_group() {
         return Err(EngineError::Other(format!("\"{}\" is a folder: content effects go on paint and fill layers", owner_layer.name)));
     }
-    // A fill reading an anchor point needs one below its new layer.
-    if let EffectKind::Fill { source: Source::Anchor { anchor, channel }, .. } = &effect.kind {
-        anchor_source(s, CMD, owner, *anchor, *channel)?;
+
+    // Each anchor point the effect reads must be below its new layer
+    for (anchor, channel) in effect.kind.anchors_read() {
+        anchor_source(session, CMD, owner, anchor, channel)?;
     }
-    let (ts, _, _) = s.doc.project.locate(owner).ok_or_else(|| bad(CMD, "the layer is not in a stack"))?;
-    let (size, channels) = s.doc.project.texture_set(ts).map(|t| (t.size(), t.channel_list()))?;
-    let new = s.edit("Paste effect", |s| {
-        let new = s.doc.project.alloc_id();
-        let l = s.doc.project.layer_mut(owner)?;
-        let list = if content {
-            &mut l.content_effects
+    let (set, _, _) = session.doc.project.locate(owner).ok_or_else(|| bad(CMD, "the layer is not in a stack"))?;
+    let (size, channels) = session.doc.project.texture_set(set).map(|texture_set| (texture_set.size(), texture_set.channel_list()))?;
+
+    let pasted = session.edit("Paste effect", |session| {
+        let pasted = session.doc.project.alloc_id();
+        let owner_layer = session.doc.project.layer_mut(owner)?;
+        let stack = if content {
+            &mut owner_layer.content_effects
         } else {
-            let bg = if matches!(effect.kind, EffectKind::Generator(_) | EffectKind::Fill { .. }) { MaskBackground::Black } else { MaskBackground::White };
-            &mut l.mask.get_or_insert_with(|| Mask::new(bg)).effects
+            let background =
+                if matches!(effect.kind, EffectKind::Generator(_) | EffectKind::Fill { .. }) { MaskBackground::Black } else { MaskBackground::White };
+            &mut owner_layer.mask.get_or_insert_with(|| Mask::new(background)).effects
         };
-        let at = selected.and_then(|x| list.iter().position(|e| e.id == x)).map_or(list.len(), |i| i + 1);
-        list.insert(at, texturecraft_core::Effect { id: new, ..effect.clone() });
-        // Painted pixels come along, resampled to the set's size (a mask's paint stays a mask's).
-        if let Some(img) = src.pixels.masks.get(&eid).filter(|_| !content) {
-            s.doc.pixels.masks.insert(new, fit(img, size, &[0, 0]));
+        let index = selected.and_then(|selected| stack.iter().position(|effect| effect.id == selected)).map_or(stack.len(), |position| position + 1);
+        stack.insert(index, texturecraft_core::Effect { id: pasted, ..effect.clone() });
+
+        // Painted pixels come along, resampled to the set's size (a mask's paint stays a mask's)
+        if let Some(image) = copied.pixels.masks.get(&copied_id).filter(|_| !content) {
+            session.doc.pixels.masks.insert(pasted, fit(image, size, &[0, 0]));
         }
-        for c in channels.iter().copied().filter(|_| content) {
-            if let Some(img) = src.pixels.layer(eid, c) {
-                s.doc.pixels.layers.insert((new, c), fit(img, size, &empty_texel(c)));
+        for channel in channels.iter().copied().filter(|_| content) {
+            if let Some(image) = copied.pixels.layer(copied_id, channel) {
+                session.doc.pixels.layers.insert((pasted, channel), fit(image, size, &empty_texel(channel)));
             }
         }
-        // The target belongs to the active set's selection: a paste into another set leaves it.
-        if let Some((lts, _, _)) = s.doc.project.locate(layer) {
-            s.selected.insert(lts, layer);
-            if lts == s.ts() {
-                s.target = StackTarget::Effect(new);
+
+        // The target belongs to the active set's selection: a paste into another set leaves it
+        if let Some((layer_set, _, _)) = session.doc.project.locate(layer) {
+            session.selected.insert(layer_set, layer);
+            if layer_set == session.ts() {
+                session.target = StackTarget::Effect(pasted);
             }
         }
-        Ok(new)
+        Ok(pasted)
     })?;
-    Ok(json!({ "effect": new.0 }))
+    Ok(json!({ "effect": pasted.0 }))
 }
