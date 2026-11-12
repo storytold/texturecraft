@@ -18,6 +18,7 @@
 //! [`crate::ImportOptions::native_filters`] asks for it.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use texturecraft_core::{Channel, EffectKind, Filter, GraphInput, GraphRef, Levels, MAX_GRAPH_NESTING, Projection, Source};
 use texturecraft_import_reader::blockers::Blocker;
@@ -382,8 +383,10 @@ pub fn filter(input: &SetInput, anchors: &Anchors, f: &FilterEffect, channels: O
 /// The grey output of procedural `p`'s graph rendered at `side` with its tweaks (red, row by row), for a brush tip or a
 /// stencil. Its image inputs read what the file feeds them: a uniform's colour, another procedural (its grey output,
 /// rendered the same way, nested at most [`GREY_NESTING`] deep), a bitmap (laid on in texture space); the others what
-/// their declaration asks for. `None` when the project does not hold the graph or it does not render.
-pub fn render_grey(lib: &GraphLibrary, p: &Procedural, side: u32, images: &crate::resources::ProjectImages) -> Option<Vec<f32>> {
+/// their declaration asks for. `None` when the project does not hold the graph or it does not render. Rendered once per
+/// cook key: the library keeps the values and every later call with the same graph, values, seed, inputs and side
+/// shares them ([`GraphLibrary::shared_grey`]).
+pub fn render_grey(lib: &GraphLibrary, p: &Procedural, side: u32, images: &crate::resources::ProjectImages) -> Option<Arc<[f32]>> {
     use texturecraft_compose::graphs::{RenderEnv, at_texel};
     use texturecraft_compose::{BakedMaps, GraphStore, ImageStore};
     let mut store = GraphStore::default();
@@ -391,10 +394,16 @@ pub fn render_grey(lib: &GraphLibrary, p: &Procedural, side: u32, images: &crate
     let r = grey_recipe(lib, p, images, &mut store, &mut bitmaps, 0)?;
     let baked = BakedMaps::default();
     let env = RenderEnv { baked: &baked, images: &bitmaps, side: side as usize };
-    let (_, cooked) = store.cook(&r, &env, &[]).ok()?;
-    let out = cooked.output(r.output.as_deref())?;
-    let n = side as usize;
-    Some((0..n * n).map(|i| at_texel(out, (i % n) as u32, (i / n) as u32, (side, side))[0].clamp(0.0, 1.0)).collect())
+    let render = || {
+        let (_, cooked) = store.cook(&r, &env, &[]).ok()?;
+        let out = cooked.output(r.output.as_deref())?;
+        let n = side as usize;
+        Some((0..n * n).map(|i| at_texel(out, (i % n) as u32, (i / n) as u32, (side, side))[0].clamp(0.0, 1.0)).collect::<Arc<[f32]>>())
+    };
+    match store.cook_key(&r, &env, &[]) {
+        Some(key) => lib.shared_grey(format!("{key}/{side}/{}", r.output.as_deref().unwrap_or_default()), render),
+        None => render(),
+    }
 }
 
 /// Deepest nesting of procedurals feeding a brush tip's graph that is rendered (deeper ones read their declaration).

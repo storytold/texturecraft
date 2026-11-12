@@ -566,6 +566,36 @@ fn a_graph_tip_reads_what_feeds_its_image_inputs() {
 }
 
 #[test]
+fn a_graph_tip_is_rendered_once_and_shared() {
+    use crate::graph_library::GraphLibrary;
+    use texturecraft_import_reader::decompile::Decompiled;
+    let mut lib = GraphLibrary::default();
+    let grey = Decompiled {
+        text: "format 3\nsize 8\nnode 1 color r=0.5 g=0.5 b=0.5\noutput grey 1\n".into(),
+        images: vec![],
+        image_defaults: vec![],
+        outputs: vec![("grey".into(), 1)],
+        warnings: vec![],
+        colour_outputs: vec![],
+    };
+    lib.insert_as(&["half".to_string()], "", grey);
+    let tip = |seed: Option<i32>| {
+        let mut e = effect(PaintTool::Brush);
+        let tweaks = seed.map(|v| vec![Tweak { identifier: "$randomseed".into(), value: TweakValue::Int(v) }]).unwrap_or_default();
+        e.alpha = vec![shape("half", tweaks)];
+        let s = step(&e, StepTarget::Content, &channels(), &ProjectImages::none(), Some(&lib), None).unwrap();
+        let ReplayTip::Image { values, .. } = s.brush.tip else { panic!("an image") };
+        values
+    };
+    let (a, b) = (tip(None), tip(None));
+    // the same graph, values and seed: one render, its values shared
+    assert!(Arc::ptr_eq(&a, &b));
+    // another seed is another render (of the same values here)
+    let c = tip(Some(7));
+    assert!(!Arc::ptr_eq(&a, &c) && a == c);
+}
+
+#[test]
 fn a_particle_brush_replays_its_strokes_as_a_simulation() {
     let mut e = effect(PaintTool::Brush);
     let physics = texturecraft_import_reader::model::PhysicsEmitter {
