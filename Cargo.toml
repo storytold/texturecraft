@@ -5,7 +5,7 @@ exclude = ["vendor"]
 default-members = ["crates/core", "crates/texel", "crates/geom", "crates/compose", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "xtask"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -65,6 +65,8 @@ getrandom = "0.3"
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 # Shared Craft egui components (widget palette, icon buttons, panel docking): storytold/craft-libs,
 # MIT OR Apache-2.0, pinned to one rev.
+# Shared catalog lookup, pinned with the other Craft libraries.
+craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
 craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["serde"] }
 # Who draws the window frame, and the app-drawn strip as the title bar (crates/ui-egui/src/titlebar.rs).
 craft-window = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["egui"] }
@@ -114,6 +116,13 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Fast optimized verification: each test executable otherwise repeats cross-crate LTO.
+# `false` keeps thin LTO within each crate; release packaging keeps the profile above.
+[profile.verify]
+inherits = "release"
+lto = false
+codegen-units = 16
 
 [profile.wasm-release]
 inherits = "release"

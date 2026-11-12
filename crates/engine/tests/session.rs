@@ -55,6 +55,84 @@ fn layers_masks_materials_and_bake() {
 }
 
 #[test]
+fn generator_offset_is_settable_and_clamped() {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let r = execute(&mut s, "effect.add.generator", &json!({"generator": "position", "offset": 0.25})).unwrap();
+    let eff = r["effect"].as_u64().unwrap();
+    let offset = |s: &Session| {
+        let layer = s.doc.project.layers.values().find(|l| l.mask.is_some()).unwrap();
+        layer
+            .mask
+            .as_ref()
+            .unwrap()
+            .effects
+            .iter()
+            .find_map(|e| match &e.kind {
+                texturecraft_engine::core::EffectKind::Generator(g) => Some(g.offset),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(offset(&s), 0.25);
+    execute(&mut s, "effect.set", &json!({"effect": eff, "offset": 5.0})).unwrap();
+    assert_eq!(offset(&s), 1.0, "clamped to 1");
+}
+
+fn generator_offset_of(s: &Session) -> f32 {
+    let layer = s.doc.project.layers.values().find(|l| l.mask.is_some()).unwrap();
+    layer
+        .mask
+        .as_ref()
+        .unwrap()
+        .effects
+        .iter()
+        .find_map(|e| match &e.kind {
+            texturecraft_engine::core::EffectKind::Generator(g) => Some(g.offset),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn generator_offset_survives_save_and_reopen_and_undo_restores_it() {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let r = execute(&mut s, "effect.add.generator", &json!({"generator": "position", "offset": 0.25})).unwrap();
+    let eff = r["effect"].as_u64().unwrap();
+    execute(&mut s, "effect.set", &json!({"effect": eff, "offset": -0.6})).unwrap();
+    assert_eq!(generator_offset_of(&s), -0.6);
+
+    let path = std::env::temp_dir().join(format!("tc-generator-offset-{}.tcraft", std::process::id()));
+    let path = path.to_str().unwrap();
+    execute(&mut s, "file.saveCopy", &json!({"path": path})).unwrap();
+    let reopened = texturecraft_engine::file_cmds::open_path(path);
+    let _ = std::fs::remove_file(path);
+    assert_eq!(generator_offset_of(&reopened.unwrap()), -0.6, "the offset is saved and read back");
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(generator_offset_of(&s), 0.25, "undo restores the previous offset");
+}
+
+#[test]
+fn generator_offset_works_alongside_curvature_mode_and_sizes() {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let r = execute(&mut s, "effect.add.generator", &json!({"generator": "curvature", "mode": "cavities", "offset": 0.5})).unwrap();
+    let eff = r["effect"].as_u64().unwrap();
+    assert_eq!(generator_offset_of(&s), 0.5);
+
+    execute(&mut s, "effect.set", &json!({"effect": eff, "offset": -0.5, "sizes": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5]})).unwrap();
+    assert_eq!(generator_offset_of(&s), -0.5);
+    let inspect = execute(&mut s, "project.inspect", &Value::Null).unwrap().to_string();
+    assert!(inspect.contains(r#""offset":-0.5"#) && inspect.contains(r#""mode":"Cavities""#), "{inspect}");
+    assert!(inspect.contains(r#""sizes":[0.0,0.0,0.0,1.0,0.0,0.0,0.5]"#), "{inspect}");
+}
+
+#[test]
 fn layer_rename_and_undo() {
     let mut s = session();
     let layer_id = s.selected_layer().unwrap();
@@ -228,6 +306,67 @@ fn image_resources_fill_layers_and_round_trip() {
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     assert!(s.images.is_empty(), "undoing the import forgets the decoded image");
     assert!(s.import_resource_bytes("bad.png", vec![1, 2, 3]).is_err());
+}
+
+#[test]
+fn image_resource_lookup_accepts_extension_and_stem() {
+    let mut s = session();
+
+    // No resources imported yet
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "missing"})).unwrap_err();
+    assert!(err.to_string().contains("no resource `missing` (no resources imported: use resource.import)"));
+
+    let mut png = Vec::new();
+    let img = image::RgbaImage::from_fn(4, 4, |_, _| image::Rgba([0, 255, 0, 255]));
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    s.import_resource_bytes("tile.png", png.clone()).unwrap();
+
+    // Lookup by stem
+    let r = execute(&mut s, "layer.add.image", &json!({"name": "tile"})).unwrap();
+    assert!(r["layer"].as_u64().is_some());
+
+    // Lookup by full name
+    let r2 = execute(&mut s, "layer.add.image", &json!({"name": "tile.png"})).unwrap();
+    assert!(r2["layer"].as_u64().is_some());
+
+    // Missing resource lists available
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "wood"})).unwrap_err();
+    assert!(err.to_string().contains("no resource `wood` (available: tile.png)"));
+
+    // Ambiguous stem resolution
+    s.import_resource_bytes("tile.jpg", png).unwrap();
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "tile"})).unwrap_err();
+    assert!(err.to_string().contains("ambiguous resource `tile`"));
+}
+
+#[test]
+fn image_resource_lookup_ignores_linked_packages() {
+    use std::sync::Arc;
+    use texturecraft_engine::core::{LayerId, LayerKind, Source};
+
+    let mut s = session();
+    s.doc.resources.insert("wood.mcraft".into(), Arc::new(b"package bytes".to_vec()));
+    s.sync_images();
+    assert!(!s.images.contains_key("wood.mcraft"));
+
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "wood"})).unwrap_err();
+    assert!(err.to_string().contains("no resources imported"), "{err}");
+
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "wood.mcraft"})).unwrap_err();
+    assert!(err.to_string().contains("no resource `wood.mcraft` (no resources imported"), "{err}");
+
+    let mut png = Vec::new();
+    let img = image::RgbaImage::from_fn(4, 4, |_, _| image::Rgba([0, 255, 0, 255]));
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    s.import_resource_bytes("wood.png", png).unwrap();
+
+    let err = execute(&mut s, "layer.add.image", &json!({"name": "missing"})).unwrap_err();
+    assert!(err.to_string().contains("no resource `missing` (available: wood.png)"), "{err}");
+
+    let res = execute(&mut s, "layer.add.image", &json!({"name": "wood"})).unwrap();
+    let id = LayerId(res["layer"].as_u64().unwrap());
+    let LayerKind::Fill(fill) = &s.doc.project.layer(id).unwrap().kind else { panic!("expected fill layer") };
+    assert_eq!(fill.sources.get(&Channel::BaseColor), Some(&Source::image("wood.png")));
 }
 
 #[test]
@@ -445,4 +584,53 @@ fn curvature_generators_take_a_mode_and_detail_sizes() {
     let dirt = execute(&mut state, "effect.add.generator", &json!({"generator": "dirt", "mode": "edges"}));
     assert!(dirt.is_err(), "only curvature generators have a mode");
     assert_eq!(execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string(), inspect, "failed commands leave the project unchanged");
+}
+
+#[test]
+fn unparseable_color_param_returns_error() {
+    let mut s = session();
+    let err = execute(&mut s, "layer.add.fill", &json!({"color": "#fff"})).unwrap_err();
+    assert_eq!(err.to_string(), "`layer.add.fill`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "layer.fill.set", &json!({"channel": "baseColor", "color": "#123"})).unwrap_err();
+    assert_eq!(err.to_string(), "`layer.fill.set`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": "invalid"})).unwrap_err();
+    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "mask.add.colorSelection", &json!({"color": "#xyz"})).unwrap_err();
+    assert_eq!(err.to_string(), "`mask.add.colorSelection`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "display.set", &json!({"scatterColor": "#12345"})).unwrap_err();
+    assert_eq!(err.to_string(), "`display.set`: `scatterColor` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let rev_before = s.revision;
+    let exposure_before = s.doc.project.display.env_exposure;
+    let err = execute(&mut s, "display.set", &json!({"exposure": 2.0, "scatterColor": "invalid"})).unwrap_err();
+    assert_eq!(err.to_string(), "`display.set`: `scatterColor` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(s.doc.project.display.env_exposure, exposure_before);
+    assert_eq!(s.revision, rev_before);
+
+    let mask_before = s.tool.mask_value;
+    let err = execute(&mut s, "tool.material", &json!({"maskValue": 0.25, "channel": "baseColor", "color": "invalid"})).unwrap_err();
+    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(s.tool.mask_value, mask_before);
+    assert_eq!(s.revision, rev_before);
+
+    let err = execute(&mut s, "tool.material", &json!({"color": "invalid"})).unwrap_err();
+    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(s.revision, rev_before);
+
+    let err = execute(&mut s, "layer.add.fill", &json!({"color": [1e40, 0.0, 0.0]})).unwrap_err();
+    assert_eq!(err.to_string(), "`layer.add.fill`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(s.revision, rev_before);
+
+    let err = execute(&mut s, "layer.fill.set", &json!({"channel": "baseColor", "procedural": "noise", "color": "red"})).unwrap_err();
+    assert_eq!(err.to_string(), "`layer.fill.set`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(s.revision, rev_before);
+
+    assert!(execute(&mut s, "tool.cloneSource", &json!({"uv": [0.2, 0.8, 0.4]})).is_err());
+    execute(&mut s, "tool.polygonFill", &Value::Null).unwrap();
+    let err = execute(&mut s, "tool.click", &json!({"uv": [0.2, 0.8, 0.4]})).unwrap_err();
+    assert_eq!(err.to_string(), "`tool.click`: a 2D view point needs `uv` as [u, v]");
 }

@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add generator",
             ["Layers", "Effects"],
             None,
-            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, level?, softness?, noise?, invert?, mode?: edges|cavities|both|raw, sizes?: [7 weights 0..1, finest first] (curvature and edgeWear)}",
+            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, level?, softness?, noise?, offset?: -1..1 added to the result, invert?, mode?: edges|cavities|both|raw, sizes?: [7 weights 0..1, finest first] (curvature and edgeWear)}",
             has_layer,
             add_generator
         ),
@@ -94,7 +94,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit effect",
             [],
             None,
-            "{effect, visible?, blend?, opacity?, name?, filter?: id from filter.list (a filter effect only: swaps its type, keeping position, blend and opacity; its current id edits it in place), level?, softness?, noise?, noiseScale?, invert?, mode?, sizes?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, colors?: [[r,g,b], ...] (a color selection's ID colors), filter parameters (see effect.add.filter)}",
+            "{effect, visible?, blend?, opacity?, name?, filter?: id from filter.list (a filter effect only: swaps its type, keeping position, blend and opacity; its current id edits it in place), level?, softness?, noise?, noiseScale?, offset?, invert?, mode?, sizes?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, colors?: [[r,g,b], ...] (a color selection's ID colors), filter parameters (see effect.add.filter)}",
             has_layer,
             set
         ),
@@ -141,7 +141,7 @@ fn add_mask(s: &mut Session, p: &Value, bg: MaskBackground) -> Result<Value> {
 }
 
 fn add_color_mask(s: &mut Session, p: &Value) -> Result<Value> {
-    let color = color_param(p, "color").unwrap_or([1.0, 0.0, 0.0]);
+    let color = color_param("mask.add.colorSelection", p, "color")?.unwrap_or([1.0, 0.0, 0.0]);
     let tolerance = f32p(p, "tolerance").unwrap_or(0.1).clamp(0.0, 1.0);
     with_mask(s, p, "mask.add.colorSelection", "Add mask with color selection", |s, id| {
         let eid = s.doc.project.alloc_id();
@@ -285,7 +285,7 @@ fn add_fill(s: &mut Session, p: &Value) -> Result<Value> {
     let blend = blend_param("effect.add.fill", p, "blend")?.unwrap_or(BlendMode::Normal);
     let id = layer_param(s, "effect.add.fill", p)?;
     if content_target(p, "effect.add.fill")? {
-        let mut fill = crate::layer_cmds::fill_from(p);
+        let mut fill = crate::layer_cmds::fill_from("effect.add.fill", p)?;
         if fill.sources.is_empty() {
             fill.sources = s.doc.project.layer(id)?.channels.keys().map(|c| (*c, Source::uniform_of(*c))).collect();
         }
@@ -325,6 +325,9 @@ fn generator_from(command: &str, params: &Value, generator: &mut Generator) -> R
     if let Some(noise) = f32p(params, "noise") {
         generator.noise_amount = noise.clamp(0.0, 2.0);
     }
+    if let Some(offset) = f32p(params, "offset") {
+        generator.offset = offset.clamp(-1.0, 1.0);
+    }
     if let Some(noise_scale) = f32p(params, "noiseScale") {
         generator.noise_scale = noise_scale.clamp(0.01, 1000.0);
     }
@@ -334,7 +337,7 @@ fn generator_from(command: &str, params: &Value, generator: &mut Generator) -> R
     if let Some(invert) = boolp(params, "invert") {
         generator.invert = invert;
     }
-    if let Some(direction) = color_param(params, "direction") {
+    if let Some(direction) = color_param(command, params, "direction")? {
         generator.direction = direction;
     }
 
