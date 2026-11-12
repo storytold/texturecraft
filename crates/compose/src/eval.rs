@@ -991,6 +991,64 @@ fn mask_anchors(m: &Mask) -> impl Iterator<Item = LayerId> + '_ {
     m.effects.iter().filter(|e| e.visible && matches!(e.kind, EffectKind::Anchor)).map(|e| e.id)
 }
 
+/// Mask `mask` of layer `id` up to effect `index` at the texels of `region` outside the UV islands (those `padding`
+/// sends elsewhere), written into `given`: evaluated at the texel itself, so painted effects add nothing there, with the
+/// surface (position, normal, UV) of the nearest island texel for what fills and generators read.
+#[allow(clippy::too_many_arguments)]
+fn mask_outside(
+    inp: &Inputs,
+    channels: &[Channel],
+    below: &Fields,
+    id: LayerId,
+    mask: &Mask,
+    index: usize,
+    (rx0, ry0, w, h): (u32, u32, u32, u32),
+    start: Option<(usize, &Field)>,
+    padding: &[u32],
+    given: &mut [f32],
+) {
+    let (rx1, ry1) = (rx0 + w, ry0 + h);
+    let region_tiles: Vec<(u32, u32)> = (ry0 / TILE..ry1.div_ceil(TILE)).flat_map(|y| (rx0 / TILE..rx1.div_ceil(TILE)).map(move |x| (x, y))).collect();
+    let (gw, gh) = (inp.gbuf.width, inp.gbuf.height);
+    let values: Vec<(usize, f32)> = region_tiles
+        .par_iter()
+        .flat_map_iter(|&(tx, ty)| {
+            let mut out = Vec::new();
+            let Some(mut plan) = mask_plan(inp, id, mask, tx, ty, None) else { return out };
+            plan.effects.truncate(index);
+            plan.start = start;
+            let full = anchor_plan(inp, id, channels, tx, ty, Some(below));
+            for ly in 0..TILE {
+                for lx in 0..TILE {
+                    let (x, y) = (tx * TILE + lx, ty * TILE + ly);
+                    if x < rx0 || y < ry0 || x >= rx1 || y >= ry1 || x >= gw || y >= gh {
+                        continue;
+                    }
+                    let i = ((y - ry0) * w + (x - rx0)) as usize;
+                    let Some(&src) = padding.get(i) else { continue };
+                    if src == texturecraft_texel::dilate::NONE || src as usize == i {
+                        continue;
+                    }
+                    let (sx, sy) = (rx0 + src % w, ry0 + src / w);
+                    let surface = Texel::new(inp, sx, sy, 0, 0.0).coords();
+                    let mut texel = Texel::new(inp, x, y, (ly * TILE + lx) as usize, 0.0);
+                    texel.coords = Some(surface);
+                    if !full.is_empty() {
+                        texel.anchors_below(&full, id);
+                    }
+                    out.push((i, texel.mask(&plan)));
+                }
+            }
+            out
+        })
+        .collect();
+    for (i, v) in values {
+        if let Some(slot) = given.get_mut(i) {
+            *slot = v;
+        }
+    }
+}
+
 /// For each texel of `region`, the evaluated texel (`evaluated` > 0: on the UV islands) whose value it takes: the nearest
 /// one, never across the borders of a UV-tiled set's blocks. Empty when every texel was evaluated or none was.
 fn outside_padding(inp: &Inputs, evaluated: &[f32], (rx0, ry0, w, h): (u32, u32, u32, u32)) -> Vec<u32> {
@@ -1095,7 +1153,17 @@ fn graph_region(
     // the graph reads the stack outside the UV islands too, where the reference app's stack holds values: there it
     // reads the nearest island texel's, not empty
     let padding = outside_padding(inp, &cover, (rx0, ry0, w, h));
-    let given_orig = padded(&orig, comps, &padding);
+    let given_orig = match job {
+        // under the measured rules a mask outside the islands holds what its fills and graphs give there (read at the
+        // nearest island texel's surface), but no paint: strokes and polygon fills cover the islands only, so a filter
+        // finds the edge of a painted mask at the islands' borders
+        Job::Mask(mask) if !padding.is_empty() && inp.project.rules.blend.is_measured() => {
+            let mut given = padded(&orig, comps, &padding);
+            mask_outside(inp, channels, below, id, mask, index, (rx0, ry0, w, h), start, &padding, &mut given);
+            given
+        }
+        _ => padded(&orig, comps, &padding),
+    };
     for image in &mut recorded {
         *image = padded(image, 1, &padding);
     }
