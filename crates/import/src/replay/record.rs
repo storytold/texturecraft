@@ -6,8 +6,8 @@
 //! hold: images a brush paints (the record names them as not kept: a job read back from it fails with that reason) and
 //! the report notes. A brush painting a graph keeps the graph's reference; the job read back renders it again
 //! ([`super::source::render`]).
-
-use std::sync::Arc;
+//!
+//! Tip and stencil images are shared between a job and its record (and every record laying the same tip), not copied.
 
 use texturecraft_core::LayerId;
 use texturecraft_core::strokes::{
@@ -246,21 +246,21 @@ fn replay_brush(b: &StrokeBrush) -> ReplayBrush {
 fn tip(t: &ReplayTip) -> StrokeTip {
     match t {
         ReplayTip::Round { hardness } => StrokeTip::Round { hardness: *hardness },
-        ReplayTip::Image { width, height, values } => StrokeTip::Image { width: *width, height: *height, values: values.to_vec() },
+        ReplayTip::Image { width, height, values } => StrokeTip::Image { width: *width, height: *height, values: values.clone() },
     }
 }
 
 fn replay_tip(t: &StrokeTip) -> ReplayTip {
     match t {
         StrokeTip::Round { hardness } => ReplayTip::Round { hardness: *hardness },
-        StrokeTip::Image { width, height, values } => ReplayTip::Image { width: *width, height: *height, values: Arc::from(values.as_slice()) },
+        StrokeTip::Image { width, height, values } => ReplayTip::Image { width: *width, height: *height, values: values.clone() },
     }
 }
 
 fn stencil(s: &ReplayStencil) -> StrokeStencil {
     let image = match &s.image {
         StencilImage::Uniform(v) => StencilValues::Uniform(*v),
-        StencilImage::Image { width, height, values } => StencilValues::Image { width: *width, height: *height, values: values.to_vec() },
+        StencilImage::Image { width, height, values } => StencilValues::Image { width: *width, height: *height, values: values.clone() },
     };
     StrokeStencil { image, matrix: s.matrix }
 }
@@ -268,7 +268,7 @@ fn stencil(s: &ReplayStencil) -> StrokeStencil {
 fn replay_stencil(s: &StrokeStencil) -> ReplayStencil {
     let image = match &s.image {
         StencilValues::Uniform(v) => StencilImage::Uniform(*v),
-        StencilValues::Image { width, height, values } => StencilImage::Image { width: *width, height: *height, values: Arc::from(values.as_slice()) },
+        StencilValues::Image { width, height, values } => StencilImage::Image { width: *width, height: *height, values: values.clone() },
     };
     ReplayStencil { image, matrix: s.matrix }
 }
@@ -433,6 +433,14 @@ mod tests {
             let original = ReplayJob { target, label: "Layer / effect".into(), steps: vec![step(PaintMode::Paint), smudge, erase] };
             assert_eq!(job(id, &record(&original)), original);
         }
+    }
+
+    #[test]
+    fn a_record_shares_its_tips_with_the_job() {
+        let s = step(PaintMode::Paint);
+        let r = record(&ReplayJob { target: ReplayTarget::Content(LayerId(1)), label: String::new(), steps: vec![s.clone()] });
+        let (ReplayTip::Image { values, .. }, Some(kept)) = (&s.brush.tip, r.steps[0].brush.tip.values()) else { panic!("an image tip") };
+        assert!(Arc::ptr_eq(values, kept));
     }
 
     #[test]

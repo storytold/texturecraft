@@ -18,8 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Channel, GraphRef};
 
-/// Version of the record layout written by this build. Records of another version stay [`StoredStrokes::Unreadable`].
-pub const STROKE_RECORD_VERSION: u32 = 1;
+/// Version of the record layout written by this build: its tip and stencil images are kept once per project, apart
+/// from the records, which name them ([`StrokeRecord::images`]). Version 1 held every image inside the record and is
+/// still read ([`STROKE_RECORD_VERSION_INLINE`]). Records of other versions stay [`StoredStrokes::Unreadable`].
+pub const STROKE_RECORD_VERSION: u32 = 2;
+/// The older record layout, every image inside the record.
+pub const STROKE_RECORD_VERSION_INLINE: u32 = 1;
 
 /// A stroke record as it sits in a document: read, or kept as the bytes that could not be read.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +69,29 @@ impl StrokeRecord {
     /// Strokes over every step, path strokes included.
     pub fn stroke_count(&self) -> usize {
         self.steps.iter().map(|s| s.strokes.len() + s.paths.len()).sum()
+    }
+
+    /// The record's grey images (tips, cycle stamps, stencils), in a fixed order: step by step the tip, the cycle's
+    /// stamps, the stencil, the projection image.
+    pub fn images(&self) -> Vec<&Arc<[f32]>> {
+        let mut out = Vec::new();
+        for s in &self.steps {
+            out.extend(s.brush.tip.values());
+            out.extend(s.brush.cycle.iter().filter_map(StrokeTip::values));
+            out.extend(s.stencil.iter().chain(&s.projection).filter_map(|st| st.image.values()));
+        }
+        out
+    }
+
+    /// [`StrokeRecord::images`], to change.
+    pub fn images_mut(&mut self) -> Vec<&mut Arc<[f32]>> {
+        let mut out = Vec::new();
+        for s in &mut self.steps {
+            out.extend(s.brush.tip.values_mut());
+            out.extend(s.brush.cycle.iter_mut().filter_map(StrokeTip::values_mut));
+            out.extend(s.stencil.iter_mut().chain(&mut s.projection).filter_map(|st| st.image.values_mut()));
+        }
+        out
     }
 
     /// The graphs the record's steps paint, for keeping their texts with the record.
@@ -228,8 +255,30 @@ pub enum StrokeTipAlignment {
 pub enum StrokeTip {
     /// The round tip: full inside `hardness` of the radius, then a smoothstep to 0 at the rim.
     Round { hardness: f32 },
-    /// A grey image stretched over the dab's square (rows top first, `width × height` values 0..1).
-    Image { width: u32, height: u32, values: Vec<f32> },
+    /// A grey image stretched over the dab's square (rows top first, `width × height` values 0..1). Shared: the brushes
+    /// and stamps laying one tip hold one copy.
+    Image {
+        width: u32,
+        height: u32,
+        #[serde(with = "shared_values")]
+        values: Arc<[f32]>,
+    },
+}
+
+impl StrokeTip {
+    pub fn values(&self) -> Option<&Arc<[f32]>> {
+        match self {
+            StrokeTip::Image { values, .. } => Some(values),
+            StrokeTip::Round { .. } => None,
+        }
+    }
+
+    pub fn values_mut(&mut self) -> Option<&mut Arc<[f32]>> {
+        match self {
+            StrokeTip::Image { values, .. } => Some(values),
+            StrokeTip::Round { .. } => None,
+        }
+    }
 }
 
 /// A grey image a step's strokes go through, placed on the stroke's view.
@@ -246,7 +295,28 @@ pub enum StencilValues {
     /// One value everywhere.
     Uniform(f32),
     /// Rows top first, `width × height` values 0..1; nothing outside it.
-    Image { width: u32, height: u32, values: Vec<f32> },
+    Image {
+        width: u32,
+        height: u32,
+        #[serde(with = "shared_values")]
+        values: Arc<[f32]>,
+    },
+}
+
+impl StencilValues {
+    pub fn values(&self) -> Option<&Arc<[f32]>> {
+        match self {
+            StencilValues::Image { values, .. } => Some(values),
+            StencilValues::Uniform(_) => None,
+        }
+    }
+
+    pub fn values_mut(&mut self) -> Option<&mut Arc<[f32]>> {
+        match self {
+            StencilValues::Image { values, .. } => Some(values),
+            StencilValues::Uniform(_) => None,
+        }
+    }
 }
 
 /// Where a stroke was painted.
@@ -321,6 +391,21 @@ pub struct StrokeRibbon {
     pub tiling: RibbonTiling,
     /// How far from the path along the surface's normal the band reaches.
     pub depth: f32,
+}
+
+/// Shared values in the layout of a plain list (as version 1 wrote `Vec<f32>`).
+mod shared_values {
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Arc<[f32]>, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(v.iter())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<[f32]>, D::Error> {
+        Vec::<f32>::deserialize(d).map(Arc::from)
+    }
 }
 
 /// A graph reference kept as its JSON text inside a record, so that reading one is bounded the way `project.json` is

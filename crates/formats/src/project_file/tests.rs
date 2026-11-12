@@ -1071,7 +1071,7 @@ fn hostile_graph_entries_are_refused_or_left_out() {
 /// A record with every kind of part, keyed by nothing yet.
 fn sample_record(seed: u32) -> texturecraft_core::StrokeRecord {
     use texturecraft_core::strokes::*;
-    let tip = StrokeTip::Image { width: 2, height: 1, values: vec![0.25, f32::NAN] };
+    let tip = StrokeTip::Image { width: 2, height: 1, values: Arc::from(vec![0.25, f32::NAN]) };
     let brush = StrokeBrush {
         radius: 0.05,
         spacing: 0.1,
@@ -1117,7 +1117,7 @@ fn sample_record(seed: u32) -> texturecraft_core::StrokeRecord {
         mask_source: None,
         opacity: 0.75,
         brush,
-        stencil: Some(StrokeStencil { image: StencilValues::Image { width: 1, height: 2, values: vec![0.0, 1.0] }, matrix: [0.5; 9] }),
+        stencil: Some(StrokeStencil { image: StencilValues::Image { width: 1, height: 2, values: Arc::from(vec![0.0, 1.0]) }, matrix: [0.5; 9] }),
         projection: Some(StrokeStencil { image: StencilValues::Uniform(0.3), matrix: [1.0; 9] }),
         placed: Some([0.25; 9]),
         strokes: vec![stroke.clone(), RecordedStroke { space: StrokeSpace::Uv, ..stroke }],
@@ -1168,6 +1168,14 @@ fn stroke_entries(bytes: &[u8]) -> Vec<String> {
     payloads(bytes).into_iter().map(|p| p.0).filter(|n| n.starts_with("strokes/")).collect()
 }
 
+fn stroke_image_entries(bytes: &[u8]) -> Vec<String> {
+    payloads(bytes).into_iter().map(|p| p.0).filter(|n| n.starts_with(strokes::IMAGE_DIR)).collect()
+}
+
+fn encode(record: &texturecraft_core::StrokeRecord) -> Vec<u8> {
+    strokes::encode(record, &mut strokes::ImageTable::default()).unwrap()
+}
+
 #[test]
 fn stroke_records_round_trip_bit_for_bit() {
     let mut s = sample();
@@ -1179,13 +1187,18 @@ fn stroke_records_round_trip_bit_for_bit() {
     s.pf.strokes.insert(mask, on_mask.into());
     let bytes = save_project_bytes(&s.pf).unwrap();
     assert_eq!(stroke_entries(&bytes), [format!("strokes/{}.bin", s.paint.0), format!("strokes/{}.bin", mask.0)]);
+    // the tip (laid by four stamps of two records) and the stencil are kept once each
+    assert_eq!(stroke_image_entries(&bytes).len(), 2);
     let back = load_project_bytes(&bytes).unwrap();
     assert!(back.warnings.is_empty(), "{:?}", back.warnings);
     assert_same(&s.pf, &back);
     // floats keep their bits (NaN, -0.0), so the encodings agree too
     let read = back.strokes.get(&s.paint).and_then(StoredStrokes::record).unwrap();
-    assert_eq!(strokes::encode(read).unwrap(), strokes::encode(&record).unwrap());
+    assert_eq!(encode(read), encode(&record));
     assert_eq!(back.strokes.len(), 2);
+    // read back, the records share one copy of each image
+    let other = back.strokes.get(&mask).and_then(StoredStrokes::record).unwrap();
+    assert!(Arc::ptr_eq(read.images()[0], other.images()[0]));
     assert_eq!(save_project_bytes(&back).unwrap(), bytes, "saving again writes the same file");
 }
 
@@ -1197,7 +1210,11 @@ fn projects_without_stroke_records_are_written_as_before() {
     let names: Vec<String> = payloads(&bytes).into_iter().map(|p| p.0).collect();
     let mut with = s.pf.clone();
     with.strokes.insert(s.paint, sample_record(1).into());
-    let more: Vec<String> = payloads(&save_project_bytes(&with).unwrap()).into_iter().map(|p| p.0).filter(|n| !n.starts_with("strokes/")).collect();
+    let more: Vec<String> = payloads(&save_project_bytes(&with).unwrap())
+        .into_iter()
+        .map(|p| p.0)
+        .filter(|n| !n.starts_with("strokes/") && !n.starts_with(strokes::IMAGE_DIR))
+        .collect();
     // a record adds its entry (and the text of a graph it paints when the store holds it), nothing else changes
     assert_eq!(names, more);
     assert!(load_project_bytes(&bytes).unwrap().strokes.is_empty());
@@ -1208,7 +1225,7 @@ fn records_of_removed_pixels_are_neither_saved_nor_loaded() {
     let mut s = sample();
     s.pf.strokes.insert(LayerId(9999), sample_record(1).into());
     assert!(stroke_entries(&save_project_bytes(&s.pf).unwrap()).is_empty());
-    let record = strokes::encode(&sample_record(1)).unwrap();
+    let record = strokes::encode_inline(&sample_record(1)).unwrap();
     let back = load_project_bytes(&zip_with(&[("strokes/9999.bin", record.clone()), (&format!("strokes/{}.bin", s.paint.0), record)])).unwrap();
     assert_eq!(back.strokes.keys().copied().collect::<Vec<_>>(), [s.paint]);
     assert!(matches!(load_project_bytes(&zip_with(&[("strokes/x.bin", vec![])])), Err(FormatError::Malformed { .. })));
@@ -1217,12 +1234,18 @@ fn records_of_removed_pixels_are_neither_saved_nor_loaded() {
 #[test]
 fn unreadable_stroke_records_are_kept_as_their_bytes() {
     let s = sample();
-    let good = strokes::encode(&sample_record(1)).unwrap();
+    let good = strokes::encode_inline(&sample_record(1)).unwrap();
     let mut newer = good.clone();
-    newer[4] = 2;
+    newer[4] = 3;
     let mut trailing = good.clone();
     trailing.push(0);
-    for (bytes, why) in [(newer, "version 2"), (trailing, "after the stroke record"), (b"TCSR".to_vec(), "cut short"), (b"PNG!....".to_vec(), "not a stroke")] {
+    for (bytes, why) in [
+        (newer, "version 3"),
+        (encode(&sample_record(1)), "missing"),
+        (trailing, "after the stroke record"),
+        (b"TCSR".to_vec(), "cut short"),
+        (b"PNG!....".to_vec(), "not a stroke"),
+    ] {
         let back = load_project_bytes(&zip_with(&[(&format!("strokes/{}.bin", s.paint.0), bytes.clone())])).unwrap();
         let Some(StoredStrokes::Unreadable(u)) = back.strokes.get(&s.paint) else { panic!("unreadable: {:?}", back.strokes) };
         assert!(u.reason.contains(why), "{why}: {}", u.reason);
@@ -1236,11 +1259,14 @@ fn unreadable_stroke_records_are_kept_as_their_bytes() {
 
 #[test]
 fn damaged_stroke_records_never_panic() {
-    let good = strokes::encode(&sample_record(1)).unwrap();
+    let mut table = strokes::ImageTable::default();
+    let good = strokes::encode(&sample_record(1), &mut table).unwrap();
+    let images: std::collections::HashMap<String, Arc<[f32]>> = table.by_key.into_iter().collect();
+    let decode = |b: &[u8]| strokes::decode(b, &mut images.clone());
     // (NaN tips: compared by their encodings)
-    assert_eq!(strokes::encode(&strokes::decode(&good).unwrap()).unwrap(), good);
+    assert_eq!(encode(&decode(&good).unwrap()), good);
     for n in 0..good.len() {
-        assert!(strokes::decode(&good[..n]).is_err(), "cut at {n}");
+        assert!(decode(&good[..n]).is_err(), "cut at {n}");
     }
     let mut state = 0x9e37_79b9u32;
     for i in 0..4000 {
@@ -1250,12 +1276,37 @@ fn damaged_stroke_records_never_panic() {
         state ^= state << 5;
         let at = 8 + state as usize % (b.len() - 8);
         b[at] ^= (i % 255 + 1) as u8;
-        let _ = strokes::decode(&b);
+        let _ = decode(&b);
     }
     // a length that claims far more than the entry holds
     let mut huge = good[..8].to_vec();
     huge.extend_from_slice(&[0, 0, 0xff, 0xff, 0xff, 0xff, 0x0f]);
-    assert!(strokes::decode(&huge).is_err());
+    assert!(decode(&huge).is_err());
+    // an image entry that is cut, damaged or not of its key is not read
+    let (key, values) = images.iter().next().unwrap();
+    let bytes = strokes::encode_image(values);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&strokes::decode_image(key, &bytes).unwrap()), bits(values), "(NaN tips: compared by their bits)");
+    assert!(strokes::decode_image(key, &bytes[..bytes.len() - 1]).is_err());
+    assert!(strokes::decode_image(&"0".repeat(32), &bytes).is_err());
+    assert!(strokes::decode_image(key, b"TCSI").is_err());
+}
+
+#[test]
+fn stroke_records_of_the_older_layout_are_still_read() {
+    let s = sample();
+    let record = sample_record(1);
+    let old = strokes::encode_inline(&record).unwrap();
+    let back = load_project_bytes(&zip_with(&[(&format!("strokes/{}.bin", s.paint.0), old)])).unwrap();
+    let read = back.strokes.get(&s.paint).and_then(StoredStrokes::record).unwrap();
+    assert_eq!(encode(read), encode(&record));
+    // its copies of one image are shared once read
+    let images = read.images();
+    assert!(Arc::ptr_eq(images[0], images[1]));
+    // and saved in the newer layout, the images apart
+    let mut pf = s.pf.clone();
+    pf.strokes = back.strokes.clone();
+    assert_eq!(stroke_image_entries(&save_project_bytes(&pf).unwrap()).len(), 2);
 }
 
 #[test]
