@@ -66,7 +66,8 @@ pub struct Cooked {
 
 impl Cooked {
     pub fn new(outputs: BTreeMap<String, TileImage>, linear: BTreeSet<String>) -> Cooked {
-        Cooked { outputs, linear, mips: Mips::default() }
+        let mips = Mips(outputs.keys().map(|k| (k.clone(), OnceLock::new())).collect());
+        Cooked { outputs, linear, mips }
     }
 
     /// Every output stored as it is rendered: the same data whether rendered here or loaded from a file.
@@ -89,8 +90,8 @@ impl Cooked {
         if !lod.is_finite() || lod <= 0.0 {
             return Some(sample(image, u, v));
         }
-        let levels = self.mips.0.get_or_init(|| self.outputs.iter().map(|(k, img)| (k.clone(), Arc::new(mip_levels(img)))).collect());
-        let levels = levels.get(key)?;
+        let mut spare = Vec::new();
+        let levels = self.mips.of(key, image, &mut spare);
         let at =
             |k: usize| if k == 0 { sample(image, u, v) } else { levels.get(k - 1).or(levels.last()).map_or_else(|| sample(image, u, v), |m| m.sample(u, v)) };
         let lo = lod.floor() as usize;
@@ -117,8 +118,8 @@ impl Cooked {
         if !lod.is_finite() || lod <= 0.0 {
             return Some(sample_wrap(image, u, v, wrap));
         }
-        let levels = self.mips.0.get_or_init(|| self.outputs.iter().map(|(k, img)| (k.clone(), Arc::new(mip_levels(img)))).collect());
-        let levels = levels.get(key)?;
+        let mut spare = Vec::new();
+        let levels = self.mips.of(key, image, &mut spare);
         let at = |k: usize| {
             if k == 0 {
                 sample_wrap(image, u, v, wrap)
@@ -151,9 +152,24 @@ impl Cooked {
     }
 }
 
-/// The mip levels of a cook's outputs, by output (a cache: cooks holding the same outputs compare equal whatever it holds).
+/// The mip levels of a cook's outputs, by output, each built when that output is first read smaller than it is
+/// rendered (a cache: cooks holding the same outputs compare equal whatever it holds).
 #[derive(Clone, Debug, Default)]
-struct Mips(OnceLock<BTreeMap<String, Arc<Vec<Mip>>>>);
+struct Mips(BTreeMap<String, OnceLock<Arc<Vec<Mip>>>>);
+
+impl Mips {
+    /// The levels of output `key` (`image`), built now if they are not yet.
+    fn of<'a>(&'a self, key: &str, image: &TileImage, spare: &'a mut Vec<Mip>) -> &'a [Mip] {
+        match self.0.get(key) {
+            Some(slot) => slot.get_or_init(|| Arc::new(mip_levels(image))),
+            // an output put in after the cook was made: built for this read only
+            None => {
+                *spare = mip_levels(image);
+                spare
+            }
+        }
+    }
+}
 
 impl PartialEq for Mips {
     fn eq(&self, _: &Mips) -> bool {
@@ -161,18 +177,31 @@ impl PartialEq for Mips {
     }
 }
 
-/// One mip level: RGBA, row by row.
+/// One mip level, row by row.
 #[derive(Debug)]
 struct Mip {
     w: usize,
     h: usize,
-    px: Vec<[f32; 4]>,
+    px: MipPixels,
+}
+
+/// A level's pixels: RGBA, or one value for a grey opaque output (read as that value three times and alpha 1, which is
+/// what the RGBA form of such an output holds bit for bit: the mean of four equal channels is the same in each, and
+/// the mean of four ones is one).
+#[derive(Debug)]
+enum MipPixels {
+    Rgba(Vec<[f32; 4]>),
+    Grey(Vec<f32>),
 }
 
 impl Mip {
     fn at(&self, x: i64, y: i64) -> [f32; 4] {
         let (w, h) = (self.w.max(1) as i64, self.h.max(1) as i64);
-        self.px.get((y.rem_euclid(h) * w + x.rem_euclid(w)) as usize).copied().unwrap_or([0.0; 4])
+        let i = (y.rem_euclid(h) * w + x.rem_euclid(w)) as usize;
+        match &self.px {
+            MipPixels::Rgba(px) => px.get(i).copied().unwrap_or([0.0; 4]),
+            MipPixels::Grey(px) => px.get(i).map_or([0.0; 4], |g| [*g, *g, *g, 1.0]),
+        }
     }
 
     /// Bilinear sample repeating along the axes `wrap` names, the edge extended along the others.
@@ -205,13 +234,15 @@ impl Mip {
     /// Half the size (at least one pixel): each pixel the mean of the two by two it covers.
     fn halved(&self) -> Mip {
         let (w, h) = ((self.w / 2).max(1), (self.h / 2).max(1));
-        let px = (0..w * h)
-            .map(|i| {
-                let (x, y) = ((i % w) as i64 * 2, (i / w) as i64 * 2);
-                let q = [self.at(x, y), self.at(x + 1, y), self.at(x, y + 1), self.at(x + 1, y + 1)];
-                std::array::from_fn(|k| (q[0][k] + q[1][k] + q[2][k] + q[3][k]) * 0.25)
-            })
-            .collect();
+        let mean = |i: usize| -> [f32; 4] {
+            let (x, y) = ((i % w) as i64 * 2, (i / w) as i64 * 2);
+            let q = [self.at(x, y), self.at(x + 1, y), self.at(x, y + 1), self.at(x + 1, y + 1)];
+            std::array::from_fn(|k| (q[0][k] + q[1][k] + q[2][k] + q[3][k]) * 0.25)
+        };
+        let px = match &self.px {
+            MipPixels::Rgba(_) => MipPixels::Rgba((0..w * h).map(mean).collect()),
+            MipPixels::Grey(_) => MipPixels::Grey((0..w * h).map(|i| mean(i)[0]).collect()),
+        };
         Mip { w, h, px }
     }
 }
@@ -219,7 +250,10 @@ impl Mip {
 /// The mip levels of `img` below itself, halving down to one pixel.
 fn mip_levels(img: &TileImage) -> Vec<Mip> {
     let (w, h) = (img.width() as usize, img.height() as usize);
-    let base = Mip { w, h, px: (0..w * h).map(|i| texel(img, (i % w.max(1)) as i64, (i / w.max(1)) as i64)).collect() };
+    let at = |i: usize| texel(img, (i % w.max(1)) as i64, (i / w.max(1)) as i64);
+    // a one-component output reads as its value three times and alpha 1
+    let px = if img.comps() == 1 { MipPixels::Grey((0..w * h).map(|i| at(i)[0]).collect()) } else { MipPixels::Rgba((0..w * h).map(at).collect()) };
+    let base = Mip { w, h, px };
     let mut levels = vec![base];
     while let Some(last) = levels.last()
         && (last.w > 1 || last.h > 1)

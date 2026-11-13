@@ -234,3 +234,31 @@ fn spilled_cooks_are_read_back_exactly_and_not_rendered_again() {
     s.prune(|_| false);
     assert!(s.used_cook_keys().is_empty() && s.cooked(&key).is_none());
 }
+
+#[test]
+fn a_grey_output_reads_minified_exactly_as_its_rgba_form() {
+    use texturecraft_texel::TileImage;
+    // the same picture as one component and as four (grey three times, alpha 1)
+    let (w, h) = (96u32, 80u32);
+    let (mut grey, mut rgba) = (TileImage::new(w, h, 1), TileImage::new(w, h, 4));
+    for y in 0..h {
+        for x in 0..w {
+            let v = (x.wrapping_mul(2654435761u32.wrapping_mul(y + 7)) >> 11) as u16;
+            grey.set(x, y, &[v]);
+            rgba.set(x, y, &[v, v, v, u16::MAX]);
+        }
+    }
+    let cook = |img: TileImage| Cooked::new([("out".to_string(), img)].into(), Default::default());
+    let (g, c) = (cook(grey), cook(rgba));
+    for i in 0..400u32 {
+        let (u, v) = ((i as f32 * 0.137).fract() * 1.4 - 0.2, (i as f32 * 0.311).fract() * 1.4 - 0.2);
+        for footprint in [0.0, 0.004, 0.02, 0.07, 0.3, 1.0, 5.0] {
+            let (a, b) = (g.sample_filtered(Some("out"), u, v, footprint), c.sample_filtered(Some("out"), u, v, footprint));
+            assert_eq!(a.map(|p| p.map(f32::to_bits)), b.map(|p| p.map(f32::to_bits)), "at {u},{v} footprint {footprint}");
+            for wrap in [[true, false], [false, true], [false, false]] {
+                let (a, b) = (g.sample_wrapped(Some("out"), u, v, footprint, wrap), c.sample_wrapped(Some("out"), u, v, footprint, wrap));
+                assert_eq!(a.map(|p| p.map(f32::to_bits)), b.map(|p| p.map(f32::to_bits)), "wrapped {wrap:?} at {u},{v} footprint {footprint}");
+            }
+        }
+    }
+}
