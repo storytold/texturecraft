@@ -1,78 +1,60 @@
-//! STL (binary and ascii). Facets keep their own corners, so shading is flat; there are no UVs.
+//! STL (binary and ASCII), read by the shared bounded mesh importer.
 
-use texturecraft_geom::glam::Vec3;
+use texturecraft_geom::glam::{Vec3, Vec4};
 
 use super::{RawMesh, check_triangles};
-use crate::{Result, malformed};
+use crate::{FormatError, Result};
 
 const KIND: &str = "STL";
 
 pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
-    let count = bytes.get(80..84).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
-    let binary_len = count.and_then(|c| c.checked_mul(50)).and_then(|n| n.checked_add(84));
-    let looks_ascii = bytes.iter().position(|b| !b.is_ascii_whitespace()).and_then(|i| bytes.get(i..i + 5)) == Some(b"solid".as_slice());
-    let tris = match (count, binary_len) {
-        // Exact size wins: many binary files also start with "solid".
-        (Some(c), Some(len)) if len == bytes.len() => binary(bytes, c)?,
-        _ if looks_ascii => ascii(bytes)?,
-        (Some(c), Some(len)) if len < bytes.len() => binary(bytes, c)?,
-        _ => return Err(malformed(KIND, "neither a complete binary STL nor an ascii STL")),
-    };
+    let scene = craft_mesh::stl::read(bytes, &craft_mesh::Limits::default()).map_err(|e| FormatError::Invalid(e.to_string()))?;
     let mut raw = RawMesh::default();
-    check_triangles(0, tris.len())?;
-    let mut normals = Vec::with_capacity(tris.len() * 3);
-    for t in &tris {
-        let n = (t[1] - t[0]).cross(t[2] - t[0]).try_normalize().unwrap_or(Vec3::Y);
-        raw.positions.extend_from_slice(t);
-        normals.extend_from_slice(&[n; 3]);
-    }
-    raw.normals = Some(normals);
-    raw.groups.push(("Default".into(), String::new(), (0..raw.positions.len() as u32).collect()));
-    Ok(raw)
-}
+    raw.warnings = scene.warnings;
 
-fn binary(bytes: &[u8], count: usize) -> Result<Vec<[Vec3; 3]>> {
-    check_triangles(0, count)?;
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let f = |k: usize| -> Result<f32> {
-            let o = 84 + i * 50 + 12 + k * 4;
-            let b = bytes.get(o..o + 4).ok_or_else(|| malformed(KIND, "truncated facet"))?;
-            Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        };
-        let v = |c: usize| -> Result<Vec3> { Ok(Vec3::new(f(c * 3)?, f(c * 3 + 1)?, f(c * 3 + 2)?)) };
-        out.push([v(0)?, v(1)?, v(2)?]);
-    }
-    Ok(out)
-}
-
-fn ascii(bytes: &[u8]) -> Result<Vec<[Vec3; 3]>> {
-    let text = std::str::from_utf8(bytes).map_err(|_| malformed(KIND, "ascii STL is not text"))?;
-    let mut out = Vec::new();
-    let mut facet: Vec<Vec3> = Vec::new();
-    let mut words = text.split_whitespace();
-    while let Some(w) = words.next() {
-        match w {
-            "vertex" => {
-                let mut c = [0.0f32; 3];
-                for v in &mut c {
-                    let tok = words.next().ok_or_else(|| malformed(KIND, "truncated vertex"))?;
-                    *v = tok.parse().map_err(|_| malformed(KIND, format!("bad number \"{tok}\"")))?;
-                }
-                facet.push(Vec3::from(c));
+    let mut tri_count = 0;
+    let mut vertex_colors = Vec::new();
+    let has_colors = !scene.materials.is_empty();
+    for mesh in scene.meshes {
+        // The shared model groups colored facets into parts. Position indices still reflect
+        // source order, so merge the parts back into STL order for TextureCraft's raw mesh.
+        let mut triangles = Vec::new();
+        for part in mesh.parts {
+            let material = part.material.and_then(|i| scene.materials.get(i));
+            let color = material.map(|m| Vec4::from_array(m.base_color));
+            for tri in part.triangles() {
+                let first_position = tri.iter().map(|c| c.position).min().unwrap_or(u32::MAX);
+                triangles.push((first_position, tri, color));
             }
-            "endfacet" => {
-                for i in 1..facet.len().saturating_sub(1) {
-                    check_triangles(out.len(), 1)?;
-                    out.push([facet[0], facet[i], facet[i + 1]]);
-                }
-                facet.clear();
+        }
+        triangles.sort_by_key(|(first_position, _, _)| *first_position);
+        for (_, tri, color) in triangles {
+            check_triangles(tri_count, 1)?;
+            tri_count += 1;
+            let mut points = [Vec3::ZERO; 3];
+            for (i, corner) in tri.into_iter().enumerate() {
+                let p = mesh.positions.get(corner.position as usize).ok_or_else(|| FormatError::Invalid(format!("{KIND}: position index out of range")))?;
+                points[i] = Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
             }
-            _ => {}
+            // Recompute per-facet normals as TextureCraft's old importer did; stored STL
+            // normals are often zero or disagree with the vertex winding.
+            let normal = (points[1] - points[0]).cross(points[2] - points[0]).try_normalize().unwrap_or(Vec3::Y);
+            raw.positions.extend_from_slice(&points);
+            raw.normals.get_or_insert_with(Vec::new).extend_from_slice(&[normal; 3]);
+            if has_colors {
+                // The shared reader normalizes STL's color extensions to linear RGBA.
+                // Uncolored facets alongside colored ones receive its neutral gray material.
+                let color = color.unwrap_or(Vec4::new(0.6, 0.6, 0.6, 1.0));
+                vertex_colors.extend_from_slice(&[color; 3]);
+            }
         }
     }
-    if out.is_empty() {
-        return Err(malformed(KIND, "no facets"));
+    if raw.positions.is_empty() {
+        return Err(crate::malformed(KIND, "no facets"));
     }
-    Ok(out)
+    if has_colors {
+        raw.colors = Some(vertex_colors);
+    }
+    raw.groups.push(("Default".into(), String::new(), (0..raw.positions.len() as u32).collect()));
+    Ok(raw)
 }

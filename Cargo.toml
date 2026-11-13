@@ -69,6 +69,7 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "b8f70b46ee0c5fbfd552cbe2a4dae68652519153" }
 craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "b8f70b46ee0c5fbfd552cbe2a4dae68652519153", features = ["serde"] }
 craft-materialx = { git = "https://github.com/storytold/craft-libs", rev = "b8f70b46ee0c5fbfd552cbe2a4dae68652519153" }
+craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "d6ed8c20f12188c1f39c89b3a8436bd0d09c3748", default-features = false, features = ["stl"] }
 # Who draws the window frame, and the app-drawn strip as the title bar (crates/ui-egui/src/titlebar.rs).
 craft-window = { git = "https://github.com/storytold/craft-libs", rev = "b8f70b46ee0c5fbfd552cbe2a4dae68652519153", features = ["egui"] }
 # Release checks, the update prompt and the update helper (crates/ui-egui/src/updates_ui.rs).

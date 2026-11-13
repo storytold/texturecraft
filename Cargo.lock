@@ -829,6 +829,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-mesh"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=d6ed8c20f12188c1f39c89b3a8436bd0d09c3748#d6ed8c20f12188c1f39c89b3a8436bd0d09c3748"
+
+[[package]]
 name = "craft-quit"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
@@ -4388,6 +4393,7 @@ version = "0.6.1"
 dependencies = [
  "base64 0.22.1",
  "craft-materialx",
+ "craft-mesh",
  "exr",
  "flate2",
  "gltf",
