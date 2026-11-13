@@ -573,3 +573,161 @@ fn gathering_filters_composite_identically_in_any_grouping_and_cached() {
         assert!(!check_cached(&f, 0, hot).is_empty());
     }
 }
+
+/// Composite every tile in chunks of `chunk`, telling the cache the `ahead` tiles that follow each chunk, as a pass spread over frames does.
+fn run_sliced(f: &Fixture, cache: &mut BelowCache, chunk: usize, ahead: usize) -> Composite {
+    let all = all_tiles(RES, RES);
+    let (images, baked) = (Default::default(), Default::default());
+    let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), RES);
+    for (index, tiles) in all.chunks(chunk).enumerate() {
+        let done = (index * chunk + tiles.len()).min(all.len());
+        cache.ahead = all.iter().skip(done).take(ahead).copied().collect();
+        composite_tiles_cached(&inputs(f, 0, &images, &baked), &mut out, tiles, Some(&mut *cache));
+        assert_eq!(cache.holds_fields(), !cache.ahead.is_empty(), "fields are kept exactly while tiles follow (chunk {chunk}, ahead {ahead})");
+    }
+    out
+}
+
+#[test]
+fn filter_fields_kept_across_the_chunks_of_a_pass_composite_exactly() {
+    let mut f = fixture();
+    let top = heavy_stack(&mut f);
+    let blurred_fill = f.project.texture_sets[0].stack[1];
+    let want = reference(&f, 0);
+    for hot in [None, Some(top), Some(blurred_fill)] {
+        // Short and long runs of kept tiles: chunks inside a run reuse it, chunks past its end filter again
+        for (chunk, ahead) in [(1, 1), (1, 5), (3, 4), (5, 16), (2, 0)] {
+            let mut cache = BelowCache::default();
+            cache.set_hot(hot);
+            assert!(run_sliced(&f, &mut cache, chunk, ahead) == want, "a cold sliced pass differs (hot {hot:?}, chunk {chunk}, ahead {ahead})");
+            // The hot-layer cache is warm now: only the hot layer's fields are needed
+            assert!(run_sliced(&f, &mut cache, chunk, ahead) == want, "a warm sliced pass differs (hot {hot:?}, chunk {chunk}, ahead {ahead})");
+        }
+    }
+
+    // A cache too small for the set drops tiles while a run of kept fields is in use: those tiles need every layer's fields again
+    let mut full = BelowCache::default();
+    full.set_hot(Some(top));
+    run(&f, 0, &all_tiles(RES, RES), Some(&mut full));
+    let tile_bytes = full.tile_bytes().unwrap();
+    for tiles_held in [2, 5, 9] {
+        for (chunk, ahead) in [(1, 5), (3, 4), (2, 16)] {
+            let mut cache = BelowCache::default();
+            cache.budget = tiles_held * tile_bytes;
+            cache.set_hot(Some(top));
+            for pass in 0..3 {
+                assert!(run_sliced(&f, &mut cache, chunk, ahead) == want, "pass {pass} differs with {tiles_held} cached tiles (chunk {chunk}, ahead {ahead})");
+            }
+        }
+    }
+}
+
+#[test]
+fn kept_filter_fields_are_not_used_after_an_edit_or_under_a_live_stroke() {
+    let mut f = fixture();
+    let top = heavy_stack(&mut f);
+    let all = all_tiles(RES, RES);
+    let (first, rest) = all.split_at(3);
+    let mut cache = BelowCache::default();
+    cache.set_hot(Some(top));
+
+    // Fields are kept for the tiles after the first chunk…
+    cache.ahead = rest.to_vec();
+    let mut out = run(&f, 0, first, Some(&mut cache));
+    assert!(cache.holds_fields());
+
+    // …then the blurred mask of the hot layer changes before they are composited
+    let mask = f.project.layer_mut(top).unwrap().mask.as_mut().unwrap();
+    mask.effects[1].kind = EffectKind::Filter(Filter::Blur { radius: 6.0 });
+    let (images, baked) = (Default::default(), Default::default());
+    cache.ahead = Vec::new();
+    composite_tiles_cached(&inputs(&f, 0, &images, &baked), &mut out, &all, Some(&mut cache));
+    assert!(out == reference(&f, 0), "fields kept from before an edit were used after it");
+    assert!(!cache.holds_fields());
+
+    // A live stroke is not part of what kept fields are compared by: it composites without them
+    let preview = stroke(top);
+    cache.ahead = rest.to_vec();
+    let mut live = run_with(&f, 0, first, Some(&mut cache), Some(&preview));
+    assert!(!cache.holds_fields());
+    let mut inp = inputs(&f, 0, &images, &baked);
+    inp.preview = Some(&preview);
+    composite_tiles_cached(&inp, &mut live, rest, Some(&mut cache));
+    assert!(live == run_with(&f, 0, &all, None, Some(&preview)), "a live stroke over a sliced pass differs");
+}
+
+/// Kept fields hold a layer off the hot path only over the tiles the cache lacked when they were built. A tile the cache drops
+/// while they are in use needs that layer's fields again.
+#[test]
+fn tiles_the_cache_drops_during_a_kept_run_are_filtered_again() {
+    const SIZE: u32 = 512;
+    let mesh = primitives::sphere(1.0, 32, 16);
+    let gbuf = UvGBuffer::new(&mesh, 0, SIZE, SIZE);
+    let mut project = Project::new("t", "builtin:sphere");
+    project.texture_sets.push(TextureSet::new("A", 0, SIZE));
+    let mut f = Fixture { project, mesh, gbuf, pixels: PixelStore::default() };
+    add(&mut f, 0, fill(&[(Channel::BaseColor, procedural(ProceduralKind::Clouds, 0.1, 0.9))]), None);
+    // A pattern with detail on every tile, so a tile composited without its blur shows
+    let mut blurred = Mask::new(MaskBackground::Black);
+    blurred.effects.push(effect(&mut f, EffectKind::Fill { source: procedural(ProceduralKind::Checker, 0.0, 1.0), projection: Projection::default() }));
+    blurred.effects.push(effect(&mut f, EffectKind::Filter(Filter::Blur { radius: 40.0 })));
+    add(&mut f, 0, fill(&[(Channel::Roughness, procedural(ProceduralKind::Grunge, 0.0, 1.0))]), Some(blurred));
+    // A paint layer on top leaves the blurred layer in sight
+    let hot = add(&mut f, 0, LayerKind::Paint, None);
+    paint_rect_at(&mut f, hot, SIZE, (10, 10), (40, 40), 0.2);
+
+    let mut all = all_tiles(SIZE, SIZE);
+    all.sort_by_key(|&(x, y)| (y, x));
+    let channels = f.project.texture_sets[0].channel_list();
+    let (images, baked) = (Default::default(), Default::default());
+    let mut want = Composite::new(&channels, SIZE);
+    composite_tiles(&inputs(&f, 0, &images, &baked), &mut want, &all);
+
+    // The cache holds the two bottom rows of tiles, and no more than that
+    let rows = (SIZE / TILE) as usize;
+    let (above, bottom) = all.split_at(all.len() - 2 * rows);
+    let mut cache = BelowCache::default();
+    cache.set_hot(Some(hot));
+    let mut out = Composite::new(&channels, SIZE);
+    composite_tiles_cached(&inputs(&f, 0, &images, &baked), &mut out, bottom, Some(&mut cache));
+    assert_eq!(cache.len(), bottom.len());
+    cache.budget = cache.bytes();
+
+    // One tile at a time with every later tile ahead: the first composite keeps fields for the whole set, the blurred layer's
+    // only over the rows above. Recording those rows then drops the bottom ones from the cache before their turn
+    let mut out = Composite::new(&channels, SIZE);
+    for (index, tile) in all.iter().enumerate() {
+        cache.ahead = all.iter().skip(index + 1).copied().collect();
+        composite_tiles_cached(&inputs(&f, 0, &images, &baked), &mut out, &[*tile], Some(&mut cache));
+        if index == 0 {
+            assert!(cache.holds_fields());
+        }
+    }
+    assert!(above.len() > bottom.len());
+    assert!(out == want, "a tile dropped from the cache was composited with fields that lack the layers off the hot path");
+}
+
+/// A stroke that starts while fields are kept must not leave them allocated for as long as it lasts, even though tiles still follow.
+#[test]
+fn a_live_stroke_releases_the_fields_kept_before_it_started() {
+    let mut f = fixture();
+    let top = heavy_stack(&mut f);
+    let all = all_tiles(RES, RES);
+    let (first, rest) = all.split_at(3);
+    let mut cache = BelowCache::default();
+    cache.set_hot(Some(top));
+
+    cache.ahead = rest.to_vec();
+    run(&f, 0, first, Some(&mut cache));
+    assert!(cache.holds_fields());
+
+    // The stroke begins with tiles still following: the pass is not over, so nothing else would clear them
+    let preview = stroke(top);
+    let mut live = run_with(&f, 0, first, Some(&mut cache), Some(&preview));
+    assert!(!cache.holds_fields(), "fields kept before the stroke stay allocated while it lasts");
+    let (images, baked) = (Default::default(), Default::default());
+    let mut inp = inputs(&f, 0, &images, &baked);
+    inp.preview = Some(&preview);
+    composite_tiles_cached(&inp, &mut live, rest, Some(&mut cache));
+    assert!(live == run_with(&f, 0, &all, None, Some(&preview)), "a stroke that starts during a sliced pass differs");
+}

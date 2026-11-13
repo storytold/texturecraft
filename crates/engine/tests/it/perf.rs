@@ -397,3 +397,41 @@ fn bench_layer_thumbs_4k() {
     }
     eprintln!("  every target once: {:.1} ms ({} pictures)", total.as_secs_f64() * 1e3, targets.len());
 }
+
+/// A full recomposite in one call against the same one spread over frames, as the UI runs it, with and without a blurred mask
+/// in the stack: neighbourhood filters are what a frame slice pays for apart from its own tiles.
+#[test]
+#[ignore]
+fn bench_sliced_filters_4k() {
+    for blur in [false, true] {
+        let mut s = Session::new_project("sliced", primitives::sphere(1.0, 64, 32), "builtin:sphere", None, 4096).unwrap();
+        s.viewport = Vec2::new(800.0, 800.0);
+        let run = |s: &mut Session, id: &str, p: Value| execute(s, id, &p).unwrap();
+        run(&mut s, "layer.add.fill", json!({"color": [0.6, 0.5, 0.4], "roughness": 0.6}));
+        run(&mut s, "layer.add.fill", json!({"color": [0.1, 0.3, 0.6]}));
+        run(&mut s, "mask.add.black", Value::Null);
+        run(&mut s, "effect.add.generator", json!({"generator": "position", "level": 0.5}));
+        if blur {
+            run(&mut s, "effect.add.filter", json!({"filter": "blur", "radius": 8}));
+        }
+        s.update();
+
+        s.caches[0].invalidate_all();
+        let t = Instant::now();
+        s.update();
+        let direct = t.elapsed();
+
+        s.caches[0].invalidate_all();
+        let clock = Instant::now();
+        let ms = || clock.elapsed().as_secs_f64() * 1000.0;
+        let (mut frames, mut worst) = (0, Duration::ZERO);
+        while s.pending_tiles() > 0 {
+            let t = Instant::now();
+            s.update_for(30.0, ms);
+            worst = worst.max(t.elapsed());
+            frames += 1;
+        }
+        let label = if blur { "blurred mask" } else { "no filter" };
+        println!("[sliced 4096², {label}] one call {direct:.2?}; in 30 ms slices {frames} frames, worst {worst:.2?}, total {:.2?}", clock.elapsed());
+    }
+}

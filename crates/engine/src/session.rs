@@ -817,6 +817,8 @@ impl Session {
                     images: &self.images,
                     bounds: self.mesh.bounds(),
                 };
+                // A pass spread over frames tells the compositor what comes next, so neighbourhood filters run once over a run of tiles
+                cache.below.ahead = if budget_ms.is_finite() { tiles_ahead(&cache.dirty, &tiles) } else { Vec::new() };
                 texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
                 // The composited tiles and the neighbours their padding reached change.
                 let padded = pad_tiles(&mut cache.composite, &cache.dilation, &tiles);
@@ -977,6 +979,19 @@ fn next_chunk(dirty: &mut BTreeSet<(u32, u32)>, n: usize) -> Vec<(u32, u32)> {
 }
 
 /// Valid texture set resolutions: powers of two from 128 to 8192.
+/// Dirty tiles a neighbourhood filter runs over ahead of the chunk being composited (see [`tiles_ahead`]).
+const FILTER_AHEAD: usize = 64;
+
+/// The dirty tiles composited after `chunk` in its 16 × 16 tile blocks, in the order [`next_chunk`] takes them, at most [`FILTER_AHEAD`].
+fn tiles_ahead(dirty: &BTreeSet<(u32, u32)>, chunk: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let block = |&(x, y): &(u32, u32)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK);
+    let blocks: BTreeSet<(u32, u32)> = chunk.iter().map(block).collect();
+    let mut ahead: Vec<(u32, u32)> = dirty.iter().copied().filter(|tile| blocks.contains(&block(tile))).collect();
+    ahead.sort_by_key(|tile| (block(tile), tile.1, tile.0));
+    ahead.truncate(FILTER_AHEAD);
+    ahead
+}
+
 pub fn check_resolution(r: u32) -> Result<u32> {
     if (128..=8192).contains(&r) && r.is_power_of_two() {
         Ok(r)

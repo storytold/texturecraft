@@ -13,7 +13,7 @@ use texturecraft_core::project::MAX_DEPTH;
 use texturecraft_core::{BakedMap, Channel, Layer, LayerId, LayerKind, Project, TextureSet};
 use texturecraft_texel::TileImage;
 
-use crate::eval::{Inputs, PaintTarget};
+use crate::eval::{Fields, Inputs, PaintTarget};
 use crate::store::{BakedMaps, ImageStore, PixelStore};
 
 /// Default byte budget of a [`BelowCache`], per nesting level it holds (see
@@ -40,11 +40,47 @@ pub struct BelowCache {
     /// Tiles of the whole pass a caller splits into several composites (0: each composite is a
     /// pass). A pass larger than the cache records only what fits.
     pub pass: usize,
+    /// Tiles the caller composites next in this pass, after those of the coming composite (empty: none, or a pass that is one
+    /// composite). A stack with neighbourhood filters then filters the coming tiles and these at once and keeps the result for
+    /// the composites that follow, instead of filtering each small chunk's surroundings again.
+    pub ahead: Vec<(u32, u32)>,
+    pub(crate) held: Option<HeldFields>,
+}
+
+/// Neighbourhood-filter fields kept between the composites of one pass.
+pub(crate) struct HeldFields {
+    /// Everything the fields read.
+    pub key: Arc<StackKey>,
+    /// The working size they were built at.
+    pub size: (u32, u32),
+    /// The tiles every layer's fields hold.
+    pub stack_tiles: BTreeSet<(u32, u32)>,
+    /// The tiles the hot layer's fields hold (the same tiles when the stack was not split).
+    pub hot_tiles: BTreeSet<(u32, u32)>,
+    pub fields: Arc<Fields>,
+}
+
+impl std::fmt::Debug for HeldFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldFields").field("stack_tiles", &self.stack_tiles.len()).field("hot_tiles", &self.hot_tiles.len()).finish_non_exhaustive()
+    }
 }
 
 impl Default for BelowCache {
     fn default() -> Self {
-        BelowCache { hot: None, key: None, tiles: HashMap::new(), order: VecDeque::new(), clock: 0, bytes: 0, budget: BELOW_BUDGET, levels: 1, pass: 0 }
+        BelowCache {
+            hot: None,
+            key: None,
+            tiles: HashMap::new(),
+            order: VecDeque::new(),
+            clock: 0,
+            bytes: 0,
+            budget: BELOW_BUDGET,
+            levels: 1,
+            pass: 0,
+            ahead: Vec::new(),
+            held: None,
+        }
     }
 }
 
@@ -184,10 +220,17 @@ impl BelowCache {
         self.order.clear();
         self.bytes = 0;
         self.key = None;
+        // Held fields tell the hot layer's tiles from the others'
+        self.held = None;
     }
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Whether neighbourhood-filter fields are kept for the composites that follow (see [`BelowCache::ahead`]).
+    pub fn holds_fields(&self) -> bool {
+        self.held.is_some()
     }
 
     /// The byte limit: the budget for the top level and as much again for a hot layer nested in
