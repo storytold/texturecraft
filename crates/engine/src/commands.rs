@@ -198,7 +198,7 @@ pub(crate) fn blend_param(cmd: &str, p: &Value, key: &str) -> Result<Option<Blen
 pub(crate) fn color_param(cmd: &str, p: &Value, key: &str) -> Result<Option<[f32; 3]>> {
     match p.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(v) => color_of(v).map(Some).ok_or_else(|| bad(cmd, format!("`{key}` must be a color ([r, g, b] linear or \"#rrggbb\")"))),
+        Some(v) => color_of(v).map(Some).ok_or_else(|| bad(cmd, format!("`{key}` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)"))),
     }
 }
 
@@ -252,10 +252,10 @@ mod tests {
     #[test]
     fn color_param_rejects_invalid_forms() {
         let bad_cases = [
-            ("#fff", "`color` must be a color ([r, g, b] linear or \"#rrggbb\")"),
-            ("red", "`color` must be a color ([r, g, b] linear or \"#rrggbb\")"),
-            ("#12345", "`color` must be a color ([r, g, b] linear or \"#rrggbb\")"),
-            ("#gggggg", "`color` must be a color ([r, g, b] linear or \"#rrggbb\")"),
+            ("#fff", "`color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)"),
+            ("red", "`color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)"),
+            ("#12345", "`color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)"),
+            ("#gggggg", "`color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)"),
         ];
         for (input, expected_err) in bad_cases {
             let p = json!({ "color": input });
