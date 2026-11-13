@@ -777,6 +777,40 @@ impl Session {
     /// goes first; settling tiles (see [`SetCache::settle`]) get at most [`SETTLE_BUDGET_MS`]
     /// of a finite budget, after the dirty ones.
     pub fn update_for(&mut self, budget_ms: f64, clock: impl Fn() -> f64) -> bool {
+        let active = self.ts();
+        let order: Vec<usize> = std::iter::once(active).chain((0..self.caches.len()).filter(|ts| *ts != active)).collect();
+        let changed = self.update_sets(&order, budget_ms, clock);
+        self.trim_set_caches(None);
+        changed
+    }
+
+    /// [`Session::update`] for the texture sets `sets` only, in that order (the others keep their dirty tiles): an
+    /// export or a windowless render works through a project one set at a time.
+    pub fn update_only(&mut self, sets: &[usize]) -> bool {
+        let changed = self.update_sets(sets, f64::INFINITY, || 0.0);
+        self.trim_set_caches(None);
+        changed
+    }
+
+    /// Keeps what the texture sets cache for recompositing (whole-set fields and the stack around the edited layer)
+    /// within [`SET_CACHE_BUDGET`] for the whole document: beyond it, the sets that are neither active nor `working`
+    /// let theirs go, the largest first. What is let go is computed again when the set next composites, so nothing
+    /// changes but the time of that composite. Without this every set of a large project kept its own (up to 2 GiB of
+    /// fields each), whether it was ever edited or not.
+    fn trim_set_caches(&mut self, working: Option<usize>) {
+        let active = self.ts();
+        let held = |c: &SetCache| c.below.bytes().saturating_add(c.below.fields.bytes());
+        let mut total: usize = self.caches.iter().map(held).sum();
+        while total > SET_CACHE_BUDGET {
+            let largest = self.caches.iter_mut().enumerate().filter(|(i, c)| *i != active && Some(*i) != working && held(c) > 0).max_by_key(|(_, c)| held(c));
+            let Some((_, cache)) = largest else { break };
+            total = total.saturating_sub(held(cache));
+            cache.below.fields.clear();
+            cache.below.clear();
+        }
+    }
+
+    fn update_sets(&mut self, order: &[usize], budget_ms: f64, clock: impl Fn() -> f64) -> bool {
         let start = clock();
         let first = if budget_ms.is_finite() { rayon::current_num_threads().clamp(1, CHUNK) } else { CHUNK };
         // The layer being edited: everything else is cached per tile.
@@ -794,10 +828,12 @@ impl Session {
                 carried: s.canvas.pickup.as_ref().map(|p| p.values.clone()).unwrap_or_default(),
             })
         });
-        let active = self.ts();
-        let order = std::iter::once(active).chain((0..self.caches.len()).filter(|ts| *ts != active));
         let mut changed = false;
-        for ts in order {
+        for &ts in order {
+            // room for this set's caches before it composites
+            if self.caches.get(ts).is_some_and(|c| !c.dirty.is_empty()) {
+                self.trim_set_caches(Some(ts));
+            }
             let Some(cache) = self.caches.get_mut(ts) else { continue };
             cache.below.set_hot(hot);
             cache.below.pass = cache.dirty.len() + cache.settle.len();
@@ -975,6 +1011,9 @@ impl Memory {
 
 /// Most tiles per composite chunk (a 1024² region).
 const CHUNK: usize = 256;
+/// Bytes the texture sets of a document may hold together in recompositing caches (see `Session::trim_set_caches`);
+/// one set's whole-set fields alone may reach this ([`texturecraft_compose::FIELD_BUDGET`]).
+pub const SET_CACHE_BUDGET: usize = 2 << 30;
 /// The most a budgeted update spends on settling tiles (what they show is already right).
 pub const SETTLE_BUDGET_MS: f64 = 6.0;
 
