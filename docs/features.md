@@ -148,8 +148,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   layouts, on any drive (Settings › Folders; `Documents/TextureCraft` by default).
 - A **shortcut editor** with conflict detection, and every shortcut shown in its tooltip.
 - A **History** panel: click any step to go back to it, or forward again to an undone one.
-- **10 languages:** English, French, German, Spanish, Portuguese, Italian, Japanese, Chinese,
-  Korean and Arabic, switchable live.
+- **11 languages:** English, French, German, Spanish, Portuguese, Italian, Japanese, Chinese,
+  Korean, Arabic and Georgian, switchable live.
 - **In the browser:** the same app compiled to WebAssembly, on WebGPU or WebGL2, with touch
   navigation and project open, save and download.
 

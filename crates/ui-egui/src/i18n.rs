@@ -37,7 +37,7 @@ pub struct Language {
     pub english: &'static str,
 }
 
-const COUNT: usize = 10;
+const COUNT: usize = 11;
 
 pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "en", name: "English", english: "English" },
@@ -50,6 +50,7 @@ pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "zh-Hans", name: "简体中文", english: "Chinese (Simplified)" },
     Language { code: "ko", name: "한국어", english: "Korean" },
     Language { code: "ar", name: "العربية", english: "Arabic" },
+    Language { code: "ka", name: "ქართული", english: "Georgian" },
 ];
 
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
@@ -294,9 +295,17 @@ mod tests",
         assert_eq!(trf("Saved {path}", &[("path", &"a.tcraft")]), "Saved a.tcraft");
         assert_eq!(trf("{a} of {b} {c}", &[("a", &1), ("b", &2)]), "1 of 2 {c}");
         assert_eq!(trf("{unclosed", &[]), "{unclosed");
-        for (locale, code) in
-            [("de-AT", "de"), ("pt_PT.UTF-8", "pt-BR"), ("zh-Hant-TW", "zh-Hans"), ("ja", "ja"), ("ko_KR", "ko"), ("ar-EG", "ar"), ("nl-NL", "en"), ("", "en")]
-        {
+        for (locale, code) in [
+            ("de-AT", "de"),
+            ("pt_PT.UTF-8", "pt-BR"),
+            ("zh-Hant-TW", "zh-Hans"),
+            ("ja", "ja"),
+            ("ko_KR", "ko"),
+            ("ar-EG", "ar"),
+            ("ka-GE", "ka"),
+            ("nl-NL", "en"),
+            ("", "en"),
+        ] {
             assert_eq!(language_for_locale(locale), code, "{locale}");
         }
         set_language("de");
