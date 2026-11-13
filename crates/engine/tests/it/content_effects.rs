@@ -1,7 +1,7 @@
 //! Content effects, HSL and anchor points through engine commands.
 
 use serde_json::{Value, json};
-use texturecraft_engine::core::{Channel, EffectKind, LayerId};
+use texturecraft_engine::core::{Channel, EffectKind, LayerId, Projection, Source};
 use texturecraft_engine::geom::primitives;
 use texturecraft_engine::{Session, StackTarget, execute};
 
@@ -280,4 +280,68 @@ fn merged_edits_are_one_undo_step() {
     assert_eq!(opacity(&s), 0.4);
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     assert_eq!(opacity(&s), 1.0, "one undo reverts the whole drag");
+}
+
+/// The fill source of effect `effect`, or a panic if it is not a fill.
+fn fill_source(s: &Session, effect: u64) -> &Source {
+    match &s.doc.project.effect(LayerId(effect)).unwrap().1.kind {
+        EffectKind::Fill { source, .. } => source,
+        other => panic!("effect {effect} is not a fill: {other:?}"),
+    }
+}
+
+/// The projection of fill effect `effect`, or a panic if it is not a fill.
+fn fill_projection(s: &Session, effect: u64) -> &Projection {
+    match &s.doc.project.effect(LayerId(effect)).unwrap().1.kind {
+        EffectKind::Fill { projection, .. } => projection,
+        other => panic!("effect {effect} is not a fill: {other:?}"),
+    }
+}
+
+/// Imports a small solid image as resource `file` and returns the resource's name.
+fn import_image(s: &mut Session, file: &str) -> String {
+    let mut png = Vec::new();
+    let image = image::RgbaImage::from_fn(4, 4, |_, _| image::Rgba([200, 100, 50, 255]));
+    image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    s.import_resource_bytes(file, png).unwrap()
+}
+
+/// A mask Fill can take an imported image as its source, both when added and when edited, so the
+/// UI, CLI and MCP can all set one (fill layers already accept image sources).
+#[test]
+fn mask_fill_can_use_an_image_source() {
+    let mut s = session();
+    let layer = id(execute(&mut s, "layer.add.fill", &json!({"roughness": 0.3})).unwrap(), "layer");
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let (brick, wood) = (import_image(&mut s, "brick.png"), import_image(&mut s, "wood.png"));
+
+    // effect.add.fill reads `image` as the fill's source.
+    let fill = id(execute(&mut s, "effect.add.fill", &json!({"target": "mask", "image": brick})).unwrap(), "effect");
+    assert!(matches!(fill_source(&s, fill), Source::Image { name, .. } if *name == brick), "{:?}", fill_source(&s, fill));
+
+    // effect.set switches an existing fill to a different image.
+    execute(&mut s, "effect.set", &json!({"effect": fill, "image": wood})).unwrap();
+    assert!(matches!(fill_source(&s, fill), Source::Image { name, .. } if *name == wood), "{:?}", fill_source(&s, fill));
+
+    // effect.set edits the mask fill's projection and its transforms (the image keeps its source).
+    execute(&mut s, "effect.set", &json!({"effect": fill, "projection": "triplanar", "scale": 2.0, "sharpness": 16.0})).unwrap();
+    match fill_projection(&s, fill) {
+        Projection::Triplanar { scale, sharpness, .. } => {
+            assert!((scale - 2.0).abs() < 1e-3 && (sharpness - 16.0).abs() < 1e-3, "{scale} {sharpness}");
+        }
+        other => panic!("expected a tri-planar projection, got {other:?}"),
+    }
+    assert!(matches!(fill_source(&s, fill), Source::Image { name, .. } if *name == wood), "editing the projection keeps the image");
+
+    // An image that was never imported is an error that changes nothing, not a flat gray mask
+    let mask_effects = |s: &Session| s.doc.project.layer(LayerId(layer)).unwrap().mask.as_ref().unwrap().effects.len();
+    let effects_before = mask_effects(&s);
+    assert!(execute(&mut s, "effect.add.fill", &json!({"target": "mask", "image": "nope.png"})).is_err());
+    assert_eq!(mask_effects(&s), effects_before, "the failed add leaves the mask as it was");
+    assert!(execute(&mut s, "effect.set", &json!({"effect": fill, "image": "nope.png"})).is_err());
+    assert!(matches!(fill_source(&s, fill), Source::Image { name, .. } if *name == wood), "the failed edit leaves the source as it was");
+
+    // The Source menu's "Uniform value" sends `value`, which takes the fill back from an image
+    execute(&mut s, "effect.set", &json!({"effect": fill, "value": 0.25})).unwrap();
+    assert!(matches!(fill_source(&s, fill), Source::Uniform(v) if (v[0] - 0.25).abs() < 1e-6), "{:?}", fill_source(&s, fill));
 }

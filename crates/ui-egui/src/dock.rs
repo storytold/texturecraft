@@ -1068,16 +1068,52 @@ pub(crate) fn texture_set_settings(app: &mut TextureCraftApp, ui: &mut Ui) {
     });
 }
 
-/// Menu items listing the image resources, then Import...: the image picked, if any.
+/// Menu listing the decoded image resources with a name filter and thumbnails, then Import...: the
+/// image picked, if any. A resource that did not decode is not offered, as the commands that take
+/// an image refuse it.
 fn image_menu(app: &mut TextureCraftApp, ui: &mut Ui) -> Option<String> {
     ui.label(caption(tr("Images")));
+    let ctx = ui.ctx().clone();
+    // A name filter atop the list, kept across frames while the menu stays open.
+    let search_id = ui.make_persistent_id("image_search");
+    let mut search: String = ui.data(|data| data.get_temp(search_id)).unwrap_or_default();
+    if !app.session.images.is_empty() {
+        ui.add(egui::TextEdit::singleline(&mut search).hint_text(tr("Search")).desired_width(f32::INFINITY));
+    }
+    let query = search.trim().to_lowercase();
+    ui.data_mut(|data| data.insert_temp(search_id, search));
+    // Gather the matching names with their cached thumbnails before drawing, so the borrow of the
+    // session and the thumbnail cache is released before the list closure runs.
+    let shown: Vec<(String, Option<egui::TextureHandle>)> = app
+        .session
+        .doc
+        .resources
+        .keys()
+        .filter(|name| app.session.images.contains_key(name.as_str()) && (query.is_empty() || name.to_lowercase().contains(&query)))
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|name| {
+            let tex = app.session.images.get(&name).cloned().map(|img| app.thumbs.image(&ctx, &name, &img));
+            (name, tex)
+        })
+        .collect();
     let mut picked = None;
     // Bounded, so Import... and the items after it stay on screen with many images.
     egui::ScrollArea::vertical().id_salt("image_menu").max_height(240.0).show(ui, |ui| {
-        for name in app.session.doc.resources.keys() {
-            if ui.button(name.as_str()).clicked() {
-                picked = Some(name.clone());
-            }
+        for (name, tex) in &shown {
+            ui.horizontal(|ui| {
+                let (rect, thumb_resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                if let Some(tex) = tex {
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+                }
+                // Clicking the thumbnail selects the image, like clicking its name.
+                let thumb_resp = thumb_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if thumb_resp.clicked() || ui.button(name.as_str()).clicked() {
+                    picked = Some(name.clone());
+                }
+            });
         }
     });
     if ui.button(tr("Import...")).clicked() {
@@ -1939,7 +1975,7 @@ fn fill_editor(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Value
     if let Projection::Decal(decal) = &fill.projection {
         decal_editor(app, ui, decal, reader);
     } else {
-        projection_editor(app, ui, fill, base, &salt);
+        projection_editor(app, ui, &fill.projection, "layer.fill.projection", base, &salt);
     }
 
     ui.add_space(FILL_MATERIAL_GAP);
@@ -1974,8 +2010,8 @@ const FILL_ROTATION_DEGREES_RANGE: std::ops::RangeInclusive<f32> = 0.0..=360.0;
 const TRIPLANAR_HARDNESS_RANGE: std::ops::RangeInclusive<f32> = 1.0..=64.0;
 
 /// A fill's projection kind, axis and hardness, then its collapsible UV transformations
-fn projection_editor(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Value, salt: &str) {
-    let projection_label = fill.projection.label();
+fn projection_editor(app: &mut TextureCraftApp, ui: &mut Ui, projection: &Projection, cmd: &str, base: &Value, salt: &str) {
+    let projection_label = projection.label();
     combo(ui, tr("Projection"), tr(projection_label), |ui| {
         for (id, label) in [
             ("uv", n_("UV projection")),
@@ -1985,21 +2021,21 @@ fn projection_editor(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: 
             ("cylindrical", n_("Cylindrical projection")),
         ] {
             if ui.selectable_label(projection_label == label, tr(label)).clicked() {
-                app.run("layer.fill.projection", with(base, json!({"projection": id})));
+                app.run(cmd, with(base, json!({"projection": id})));
             }
         }
     });
 
     // Each edit sends only the fields it changed; the command keeps the others
     let mut edit = |fields: Value| {
-        app.run("layer.fill.projection", with(base, fields));
+        app.run(cmd, with(base, fields));
     };
-    if let Projection::Planar { axis, .. } | Projection::Cylindrical { axis, .. } = &fill.projection
+    if let Projection::Planar { axis, .. } | Projection::Cylindrical { axis, .. } = projection
         && let Some(picked_axis) = axis_combo(ui, *axis)
     {
         edit(json!({"axis": picked_axis}));
     }
-    if let Projection::Triplanar { sharpness, .. } = &fill.projection {
+    if let Projection::Triplanar { sharpness, .. } = projection {
         let mut hardness = *sharpness;
         if let Some(merge) = slider_edit(ui, tr("Hardness"), &mut hardness, TRIPLANAR_HARDNESS_RANGE, 1) {
             edit(json!({"sharpness": hardness, "merge": merge}));
@@ -2008,7 +2044,7 @@ fn projection_editor(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: 
 
     // One id per fill so each keeps its own open or closed state
     section(ui, &format!("sec_fill_transform{salt}"), tr("UV transformations"), true, |ui| {
-        projection_transform(ui, &fill.projection, &mut edit);
+        projection_transform(ui, projection, &mut edit);
     });
 }
 
@@ -2245,7 +2281,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
     match &effect.kind {
         EffectKind::Generator(generator) => generator_properties(app, ui, id, generator),
         EffectKind::Levels(levels) => crate::levels_properties::levels_properties(app, ui, layer, eid, levels),
-        EffectKind::Fill { source, .. } => {
+        EffectKind::Fill { source, projection } => {
             ui.label(caption(tr("Fill")));
             let anchors = anchors_below(app, layer.id);
             let current = match source {
@@ -2254,7 +2290,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
                 Source::Procedural { pattern, .. } => tr(pattern.kind.label()).to_string(),
                 Source::Image { name, .. } => trf("Image: {name}", &[("name", name)]),
             };
-            combo(ui, tr("Source"), current, |ui| {
+            let source_resp = combo(ui, tr("Source"), current, |ui| {
                 if ui.selectable_label(matches!(source, Source::Uniform(_)), tr("Uniform value")).clicked() {
                     app.run("effect.set", json!({"effect": id, "value": 1.0}));
                 }
@@ -2263,7 +2299,14 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
                         app.run("effect.set", json!({"effect": id, "anchor": anchor.0}));
                     }
                 }
+                if let Some(name) = image_menu(app, ui) {
+                    app.run("effect.set", json!({"effect": id, "image": name}));
+                }
             });
+            // A shelf image dropped on the Source selector becomes the fill's source.
+            if let Some(name) = image_drop(ui, &source_resp.interact(Sense::hover())) {
+                app.run("effect.set", json!({"effect": id, "image": name}));
+            }
             match source {
                 Source::Uniform(color) => {
                     let mut value = color[0];
@@ -2281,6 +2324,10 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
                         }
                     });
                     ui.label(RichText::new(tr("Colors read as gray. Add a levels or blur effect above to shape the result.")).color(tk.text_dim));
+                }
+                Source::Image { .. } => {
+                    // How the image is projected onto the mask, with its transforms.
+                    projection_editor(app, ui, projection, "effect.set", &json!({"effect": id}), &format!("maskfill{id}"));
                 }
                 _ => {}
             }
