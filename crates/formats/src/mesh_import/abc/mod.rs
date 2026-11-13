@@ -1,14 +1,21 @@
-//! Alembic (`.abc`) in the Ogawa container: every PolyMesh object at its first sample, in world
-//! space through the Xform hierarchy (matrix, translate, rotate, scale ops; `.inherits`), with
-//! positions (`P`), polygons (`.faceIndices` / `.faceCounts`, Alembic's clockwise winding turned
-//! counter-clockwise), normals (`N`) and UVs (`uv`), indexed or not, at any geometry scope, and
-//! FaceSet children as materials. Alembic is Y up; units are kept as written.
+//! Alembic (`.abc`) in the Ogawa or the HDF5 container: every PolyMesh object at its first
+//! sample, in world space through the Xform hierarchy (matrix, translate, rotate, scale ops;
+//! `.inherits`), with positions (`P`), polygons (`.faceIndices` / `.faceCounts`, Alembic's
+//! clockwise winding turned counter-clockwise), normals (`N`) and UVs (`uv`), indexed or not, at
+//! any geometry scope, and FaceSet children as materials. Alembic is Y up; units are kept as
+//! written.
 //!
-//! The Ogawa container is a tree of groups (child offset lists) and data blocks; Alembic stores
-//! an archive group, objects (property compound, children, header block) and properties
-//! (bit-packed header blocks, one group per property holding its samples). Sample hashes are
-//! skipped. HDF5-based Alembic files are refused with a clear error.
+//! The mesh walk reads objects and properties through [`Archive`], which each container
+//! implements. The Ogawa container is a tree of groups (child offset lists) and data blocks;
+//! Alembic stores an archive group, objects (property compound, children, header block) and
+//! properties (bit-packed header blocks, one group per property holding its samples). Sample
+//! hashes are skipped. The HDF5 container is read by [`hdf5`] and mapped onto objects and
+//! properties by [`hdf5_archive`].
 
+mod hdf5;
+mod hdf5_archive;
+#[cfg(test)]
+mod hdf5_tests;
 #[cfg(test)]
 mod tests;
 
@@ -19,7 +26,6 @@ use crate::{FormatError, Result, malformed};
 
 const KIND: &str = "Alembic";
 const OGAWA_MAGIC: &[u8] = b"Ogawa";
-const HDF5_MAGIC: &[u8] = b"\x89HDF\r\n\x1a\n";
 /// Set on a child reference that points at a data block (clear: a group).
 const DATA_BIT: u64 = 1 << 63;
 /// Deepest object nesting followed.
@@ -45,21 +51,69 @@ struct Ogawa<'a> {
     indexed_meta: Vec<String>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum PropKind {
     Compound,
     Scalar,
     Array,
 }
 
-/// A property header and the reference to its group.
-struct Prop {
+/// A property header and where its container keeps it (`H`).
+struct Prop<H> {
     name: String,
     meta: String,
     kind: PropKind,
     pod: u32,
     extent: usize,
-    group: u64,
+    at: H,
+}
+
+/// What the mesh walk reads from an Alembic container: objects, their properties and the first
+/// sample of a property.
+trait Archive {
+    /// An object or a property inside the container.
+    type Handle;
+
+    /// Child objects of `object` in order: name, metadata and handle.
+    fn children(&mut self, object: &Self::Handle) -> Result<Vec<(String, String, Self::Handle)>>;
+
+    /// The properties of `object`'s top compound property.
+    fn properties(&mut self, object: &Self::Handle) -> Result<Vec<Prop<Self::Handle>>>;
+
+    /// The properties inside compound property `property`.
+    fn compound(&mut self, property: &Prop<Self::Handle>) -> Result<Vec<Prop<Self::Handle>>>;
+
+    /// The first sample of a scalar or array property as numbers (`extent` per item).
+    fn values(&mut self, property: &Prop<Self::Handle>) -> Result<Vec<f64>>;
+}
+
+/// Numbers of a POD type, little-endian (Alembic's POD numbering: 0 bool, 1 u8, 2 i8, 3 u16,
+/// 4 i16, 5 u32, 6 i32, 7 u64, 8 i64, 10 f32, 11 f64); `None` for other types.
+fn pod_values(pod: u32, raw: &[u8]) -> Option<Vec<f64>> {
+    Some(match pod {
+        0 | 1 => raw.iter().map(|v| *v as f64).collect(),
+        2 => raw.iter().map(|v| *v as i8 as f64).collect(),
+        3 => raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c) as f64).collect(),
+        4 => raw.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c) as f64).collect(),
+        5 => raw.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c) as f64).collect(),
+        6 => raw.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c) as f64).collect(),
+        7 => raw.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c) as f64).collect(),
+        8 => raw.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c) as f64).collect(),
+        10 => raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c) as f64).collect(),
+        11 => raw.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect(),
+        _ => return None,
+    })
+}
+
+/// Bytes per value of a POD type.
+fn pod_bytes(pod: u32) -> Option<usize> {
+    match pod {
+        0..=2 => Some(1),
+        3 | 4 => Some(2),
+        5 | 6 | 10 => Some(4),
+        7 | 8 | 11 => Some(8),
+        _ => None,
+    }
 }
 
 /// Value of `key` in Alembic metadata (`key=value;key=value`).
@@ -162,7 +216,7 @@ impl<'a> Ogawa<'a> {
     }
 
     /// The properties of the compound property group at `r`.
-    fn compound(&mut self, r: u64) -> Result<Vec<Prop>> {
+    fn compound_at(&mut self, r: u64) -> Result<Vec<Prop<u64>>> {
         let children = self.group(r)?;
         let Some(&last) = children.last().filter(|c| **c & DATA_BIT != 0) else { return Ok(Vec::new()) };
         let block = self.data(last)?;
@@ -198,14 +252,14 @@ impl<'a> Ogawa<'a> {
                 self.meta_at(meta_index)
             };
             let group = children.get(out.len()).copied().ok_or_else(|| malformed(KIND, format!("property \"{name}\" has no group")))?;
-            out.push(Prop { name, meta, kind, pod, extent, group });
+            out.push(Prop { name, meta, kind, pod, extent, at: group });
         }
         Ok(out)
     }
 
     /// The first sample of a scalar or array property as numbers (`extent` per item).
-    fn values(&mut self, property: &Prop) -> Result<Vec<f64>> {
-        let samples = self.group(property.group)?;
+    fn first_sample(&mut self, property: &Prop<u64>) -> Result<Vec<f64>> {
+        let samples = self.group(property.at)?;
         let Some(&first) = samples.first() else { return Ok(Vec::new()) };
 
         let raw = self.data(first)?;
@@ -215,27 +269,10 @@ impl<'a> Ogawa<'a> {
             raw.get(KEY_BYTES..).ok_or_else(|| malformed(KIND, format!("sample of \"{}\" is shorter than its key", property.name)))?
         };
 
-        let value_bytes = match property.pod {
-            0..=2 => 1,
-            3 | 4 => 2,
-            5 | 6 | 10 => 4,
-            7 | 8 | 11 => 8,
-            other => return Err(FormatError::Unsupported(format!("Alembic property \"{}\" of data type {other}", property.name))),
-        };
+        let unsupported = || FormatError::Unsupported(format!("Alembic property \"{}\" of data type {}", property.name, property.pod));
+        let value_bytes = pod_bytes(property.pod).ok_or_else(unsupported)?;
         self.charge((raw.len() / value_bytes).saturating_mul(8))?;
-
-        Ok(match property.pod {
-            0 | 1 => raw.iter().map(|v| *v as f64).collect(),
-            2 => raw.iter().map(|v| *v as i8 as f64).collect(),
-            3 => raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c) as f64).collect(),
-            4 => raw.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c) as f64).collect(),
-            5 => raw.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c) as f64).collect(),
-            6 => raw.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c) as f64).collect(),
-            7 => raw.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c) as f64).collect(),
-            8 => raw.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c) as f64).collect(),
-            10 => raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c) as f64).collect(),
-            _ => raw.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect(),
-        })
+        pod_values(property.pod, raw).ok_or_else(unsupported)
     }
 
     /// Object headers (name, metadata) of the object group's last child.
@@ -262,16 +299,52 @@ impl<'a> Ogawa<'a> {
     }
 }
 
+impl Archive for Ogawa<'_> {
+    /// A group reference.
+    type Handle = u64;
+
+    fn children(&mut self, object: &u64) -> Result<Vec<(String, String, u64)>> {
+        let children = self.group(*object)?;
+        let headers = self.object_headers(&children)?;
+        headers
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, meta))| {
+                let group = children.get(i + 1).copied().filter(|g| g & DATA_BIT == 0);
+                let group = group.ok_or_else(|| malformed(KIND, format!("object \"{name}\" has no group")))?;
+                Ok((name, meta, group))
+            })
+            .collect()
+    }
+
+    fn properties(&mut self, object: &u64) -> Result<Vec<Prop<u64>>> {
+        match self.group(*object)?.first() {
+            Some(&p) if p & DATA_BIT == 0 => self.compound_at(p),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn compound(&mut self, property: &Prop<u64>) -> Result<Vec<Prop<u64>>> {
+        self.compound_at(property.at)
+    }
+
+    fn values(&mut self, property: &Prop<u64>) -> Result<Vec<f64>> {
+        self.first_sample(property)
+    }
+}
+
 pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
     crate::guard(KIND, || read_inner(bytes))
 }
 
 fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
-    if bytes.starts_with(HDF5_MAGIC) {
-        return Err(FormatError::Unsupported("HDF5-based Alembic (re-export the file as Alembic Ogawa, the default since Alembic 1.5)".into()));
+    if !bytes.starts_with(OGAWA_MAGIC) && hdf5::superblock_at(bytes).is_some() {
+        let mut archive = hdf5_archive::H5Archive::open(bytes)?;
+        let top = archive.top()?;
+        return walk(archive, &top);
     }
     if !bytes.starts_with(OGAWA_MAGIC) || bytes.len() < 16 {
-        return Err(malformed(KIND, "not an Alembic Ogawa file"));
+        return Err(malformed(KIND, "not an Alembic file (neither the Ogawa nor the HDF5 container)"));
     }
     let mut o = Ogawa { b: bytes, budget: MAX_DECODED_BYTES, indexed_meta: vec![String::new()] };
     let root_ref = o.u64_at(8)?;
@@ -287,14 +360,19 @@ fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
         let n = c.u8()? as usize;
         o.indexed_meta.push(c.string(n)?);
     }
+    walk(o, &root[2])
+}
+
+/// Every mesh under the top object `top` of `archive`.
+fn walk<A: Archive>(archive: A, top: &A::Handle) -> Result<RawMesh> {
     let mut sink = PolygonSink::default();
-    let mut walk = Walk { o, sink: &mut sink, visits: 0 };
-    walk.object(root[2], Mat4::IDENTITY, "", 0)?;
+    let mut walk = Walk { a: archive, sink: &mut sink, visits: 0 };
+    walk.object(top, Mat4::IDENTITY, "", 0)?;
     Ok(sink.finish())
 }
 
-struct Walk<'a, 'b> {
-    o: Ogawa<'a>,
+struct Walk<'b, A> {
+    a: A,
     sink: &'b mut PolygonSink,
     visits: usize,
 }
@@ -333,69 +411,62 @@ impl Param {
     }
 }
 
-fn find<'p>(props: &'p [Prop], name: &str) -> Option<&'p Prop> {
+fn find<'p, H>(props: &'p [Prop<H>], name: &str) -> Option<&'p Prop<H>> {
     props.iter().find(|p| p.name == name)
 }
 
 /// The schema compound of an object: the compound whose metadata names `schema`, else `name`.
-fn schema_compound<'p>(props: &'p [Prop], schema: &str, name: &str) -> Option<&'p Prop> {
+fn schema_compound<'p, H>(props: &'p [Prop<H>], schema: &str, name: &str) -> Option<&'p Prop<H>> {
     let compounds = || props.iter().filter(|p| p.kind == PropKind::Compound);
     compounds().find(|p| meta_get(&p.meta, "schema") == Some(schema)).or_else(|| compounds().find(|p| p.name == name))
 }
 
-impl Walk<'_, '_> {
-    /// The children of object group `r`, placed by `parent` (world matrix); `xform` names the
-    /// Xform object `r` is (empty otherwise): meshes take their transform's name, as DCC
-    /// exports expect (`pCube1` / `pCubeShape1`, object / mesh data).
-    fn object(&mut self, r: u64, parent: Mat4, xform: &str, depth: usize) -> Result<()> {
+impl<A: Archive> Walk<'_, A> {
+    /// The children of object `r`, placed by `parent` (world matrix); `xform` names the Xform
+    /// object `r` is (empty otherwise): meshes take their transform's name, as DCC exports
+    /// expect (`pCube1` / `pCubeShape1`, object / mesh data).
+    fn object(&mut self, r: &A::Handle, parent: Mat4, xform: &str, depth: usize) -> Result<()> {
         self.visits += 1;
         if depth > MAX_DEPTH || self.visits > MAX_OBJECT_VISITS {
             return Err(malformed(KIND, "objects are nested too deeply or shared too often"));
         }
-        let children = self.o.group(r)?;
-        let headers = self.o.object_headers(&children)?;
-        for (i, (name, meta)) in headers.iter().enumerate() {
-            let group = children.get(i + 1).copied().filter(|g| g & DATA_BIT == 0).ok_or_else(|| malformed(KIND, format!("object \"{name}\" has no group")))?;
-            let schema = meta_get(meta, "schema").unwrap_or_default();
-            let kids = self.o.group(group)?;
-            let props = match kids.first() {
-                Some(&p) if p & DATA_BIT == 0 => self.o.compound(p)?,
-                _ => Vec::new(),
-            };
+        for (name, meta, child) in self.a.children(r)? {
+            let schema = meta_get(&meta, "schema").unwrap_or_default();
+            let props = self.a.properties(&child)?;
             let mut world = parent;
             if schema.starts_with("AbcGeom_Xform") {
                 if let Some(xf) = schema_compound(&props, schema, ".xform") {
-                    let (local, inherits) = self.xform(xf.group)?;
+                    let (local, inherits) = self.xform(xf)?;
                     world = if inherits { parent * local } else { local };
                 }
             } else if schema.starts_with("AbcGeom_PolyMesh")
                 && let Some(geom) = schema_compound(&props, schema, ".geom")
             {
                 self.sink.part = if xform.is_empty() { name.clone() } else { xform.to_string() };
-                let sets = self.face_sets(&kids)?;
-                self.mesh(geom.group, world, &sets)?;
+                let sets = self.face_sets(&child)?;
+                self.mesh(geom, world, &sets)?;
             }
             if !schema.starts_with("AbcGeom_FaceSet") {
                 let owner = if schema.starts_with("AbcGeom_Xform") { name.as_str() } else { "" };
-                self.object(group, world, owner, depth + 1)?;
+                self.object(&child, world, owner, depth + 1)?;
             }
         }
         Ok(())
     }
 
     /// Local matrix and `.inherits` of an Xform schema compound.
-    fn xform(&mut self, r: u64) -> Result<(Mat4, bool)> {
-        let props = self.o.compound(r)?;
+    fn xform(&mut self, xf: &Prop<A::Handle>) -> Result<(Mat4, bool)> {
+        let props = self.a.compound(xf)?;
         let ops = match find(&props, ".ops") {
-            Some(p) => self.o.values(p)?,
+            Some(p) => self.a.values(p)?,
             None => Vec::new(),
         };
         let vals = match find(&props, ".vals") {
-            Some(p) => self.o.values(p)?,
+            Some(p) => self.a.values(p)?,
             None => Vec::new(),
         };
         let inherits = match find(&props, ".inherits") {
-            Some(p) => self.o.values(p)?.first().is_none_or(|v| *v != 0.0),
+            Some(p) => self.a.values(p)?.first().is_none_or(|v| *v != 0.0),
             None => true,
         };
         let mut m = Mat4::IDENTITY;
@@ -434,39 +505,34 @@ impl Walk<'_, '_> {
     }
 
     /// Face set children of a PolyMesh object: (name, faces), in header order.
-    fn face_sets(&mut self, kids: &[u64]) -> Result<Vec<(String, Vec<f64>)>> {
-        let headers = self.o.object_headers(kids)?;
+    fn face_sets(&mut self, mesh: &A::Handle) -> Result<Vec<(String, Vec<f64>)>> {
         let mut out = Vec::new();
-        for (i, (name, meta)) in headers.iter().enumerate() {
-            let schema = meta_get(meta, "schema").unwrap_or_default();
+        for (name, meta, child) in self.a.children(mesh)? {
+            let schema = meta_get(&meta, "schema").unwrap_or_default();
             if !schema.starts_with("AbcGeom_FaceSet") {
                 continue;
             }
-            let Some(&g) = kids.get(i + 1).filter(|g| **g & DATA_BIT == 0) else { continue };
-            let props = match self.o.group(g)?.first() {
-                Some(&p) if p & DATA_BIT == 0 => self.o.compound(p)?,
-                _ => continue,
-            };
+            let props = self.a.properties(&child)?;
             let Some(fs) = schema_compound(&props, schema, ".faceset") else { continue };
-            let inner = self.o.compound(fs.group)?;
+            let inner = self.a.compound(fs)?;
             if let Some(faces) = find(&inner, ".faces") {
-                out.push((name.clone(), self.o.values(faces)?));
+                out.push((name, self.a.values(faces)?));
             }
         }
         Ok(out)
     }
 
     /// A geometry parameter `name`: an array property, or a compound of `.vals` and `.indices`.
-    fn param(&mut self, props: &[Prop], name: &str, counts: [usize; 3]) -> Result<Option<Param>> {
+    fn param(&mut self, props: &[Prop<A::Handle>], name: &str, counts: [usize; 3]) -> Result<Option<Param>> {
         let Some(p) = find(props, name) else { return Ok(None) };
         let (vals, indices) = match p.kind {
-            PropKind::Array => (self.o.values(p)?, None),
+            PropKind::Array => (self.a.values(p)?, None),
             PropKind::Compound => {
-                let inner = self.o.compound(p.group)?;
+                let inner = self.a.compound(p)?;
                 let Some(v) = find(&inner, ".vals") else { return Ok(None) };
-                let vals = self.o.values(v)?;
+                let vals = self.a.values(v)?;
                 let indices = match find(&inner, ".indices") {
-                    Some(ix) => Some(self.o.values(ix)?),
+                    Some(ix) => Some(self.a.values(ix)?),
                     None => None,
                 };
                 (vals, indices)
@@ -490,18 +556,18 @@ impl Walk<'_, '_> {
         Ok(Some(Param { vals, indices, scope }))
     }
 
-    fn mesh(&mut self, r: u64, world: Mat4, sets: &[(String, Vec<f64>)]) -> Result<()> {
-        let properties = self.o.compound(r)?;
-        let get = |o: &mut Ogawa, name: &str| -> Result<Vec<f64>> {
+    fn mesh(&mut self, geom: &Prop<A::Handle>, world: Mat4, sets: &[(String, Vec<f64>)]) -> Result<()> {
+        let properties = self.a.compound(geom)?;
+        let get = |a: &mut A, name: &str| -> Result<Vec<f64>> {
             match find(&properties, name) {
-                Some(p) => o.values(p),
+                Some(p) => a.values(p),
                 None => Err(malformed(KIND, format!("PolyMesh has no {name}"))),
             }
         };
 
-        let p = get(&mut self.o, "P")?;
-        let indices = get(&mut self.o, ".faceIndices")?;
-        let counts = get(&mut self.o, ".faceCounts")?;
+        let p = get(&mut self.a, "P")?;
+        let indices = get(&mut self.a, ".faceIndices")?;
+        let counts = get(&mut self.a, ".faceCounts")?;
         check_vertices(p.len() / 3)?;
         let points: Vec<Vec3> = p.as_chunks::<3>().0.iter().map(|c| world.transform_point3(Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32))).collect();
         let n = [points.len(), counts.len(), indices.len()];
