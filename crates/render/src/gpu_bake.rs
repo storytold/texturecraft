@@ -21,6 +21,9 @@ const WORKGROUP: u32 = 64;
 /// Rays per dispatch: short dispatches keep slow GPUs clear of driver watchdogs.
 const RAYS_PER_DISPATCH: usize = 1 << 24;
 const NONE: u32 = u32::MAX;
+/// Fewest items per parallel write when uploading a batch.
+/// Every write has its own staging allocation in wgpu, so 2^12 (128-256 KiB of rows) keeps them few and large.
+const FILL_CHUNK: usize = 1 << 12;
 const UNIFORM: u32 = 1;
 const IGNORE_BACKFACE: u32 = 2;
 const SAME_KEY: u32 = 4;
@@ -170,17 +173,23 @@ impl Tracer for GpuBaker {
             (buffer(&gpu.device, "tc_bake_nodes", bytemuck::cast_slice(&nodes)), buffer(&gpu.device, "tc_bake_tris", bytemuck::cast_slice(&tris)))
         })
         .map_err(BakeError::Tracer)?;
-        Ok(Box::new(GpuScene { gpu, nodes, tris, roots, io: None }))
+        Ok(Box::new(GpuScene { gpu, roots, batches: Batches { gpu, nodes, tris, io: None } }))
     }
 }
 
-/// The meshes of one bake on the GPU: every BVH in one node and one triangle buffer.
+/// The meshes of one bake on the GPU.
 struct GpuScene<'g> {
+    gpu: &'g Gpu,
+    /// Root node of each mesh.
+    roots: Vec<u32>,
+    batches: Batches<'g>,
+}
+
+/// Every BVH in one node and one triangle buffer, and the batch buffers that run passes over them.
+struct Batches<'g> {
     gpu: &'g Gpu,
     nodes: wgpu::Buffer,
     tris: wgpu::Buffer,
-    /// Root node of each mesh.
-    roots: Vec<u32>,
     /// Batch buffers, grown as needed and reused across batches.
     io: Option<Io>,
 }
@@ -205,7 +214,9 @@ impl GpuScene<'_> {
     fn root(&self, mesh: usize) -> Result<u32, BakeError> {
         self.roots.get(mesh).copied().ok_or_else(|| err(format!("no scene mesh {mesh}")))
     }
+}
 
+impl Batches<'_> {
     /// Batch buffers of at least these sizes (bytes).
     fn io(&mut self, items: u64, results: u64, params: u64) -> Result<&Io, BakeError> {
         let fits = |io: &Io| io.items.size() >= items && io.results.size() >= results && io.params.size() >= params;
@@ -238,13 +249,13 @@ impl GpuScene<'_> {
         self.io.as_ref().ok_or_else(|| err("no batch buffers"))
     }
 
-    /// Run `pipeline` over `n` items (`items`: their rows) once per pass in one submission, and
-    /// hand `read` one result row per item and pass (pass after pass).
-    fn run<R: Default>(
+    /// Run `pipeline` over `n` items (item `i`: the `N` bytes of `item(i)`) once per pass in one
+    /// submission, and hand `read` one result row per item and pass (pass after pass).
+    fn run<R: Default, const N: usize>(
         &mut self,
         pipeline: &wgpu::ComputePipeline,
-        items: &[u8],
         n: usize,
+        item: impl Fn(usize) -> Result<[u8; N], BakeError> + Sync,
         passes: &[Pass],
         read: impl FnOnce(&[[u32; 4]]) -> R,
     ) -> Result<R, BakeError> {
@@ -264,14 +275,14 @@ impl GpuScene<'_> {
                 blocks.resize(blocks.len().next_multiple_of(g.stride), 0);
             }
         }
-        let (in_bytes, out_bytes) = (items.len() as u64, (n * passes.len()) as u64 * 16);
+        let (in_bytes, out_bytes) = ((n as u64).saturating_mul(N as u64), (n * passes.len()) as u64 * 16);
         if in_bytes.max(out_bytes) > g.max_buffer() {
             return Err(err("a batch exceeds this GPU's buffer limit"));
         }
         let io = self.io(in_bytes, out_bytes, blocks.len() as u64)?;
         let dev = &g.device;
         scoped(dev, "GPU baking: dispatch", || {
-            g.queue.write_buffer(&io.items, 0, items);
+            upload(dev, &g.queue, &io.items, n, item)?;
             g.queue.write_buffer(&io.params, 0, &blocks);
             let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_bake") });
             {
@@ -284,8 +295,9 @@ impl GpuScene<'_> {
             }
             enc.copy_buffer_to_buffer(&io.results, 0, &io.staging, 0, out_bytes);
             g.queue.submit([enc.finish()]);
+            Ok(())
         })
-        .map_err(BakeError::Tracer)?;
+        .map_err(BakeError::Tracer)??;
         let slice = io.staging.slice(..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -301,6 +313,42 @@ impl GpuScene<'_> {
     }
 }
 
+/// Upload `item(i)` as the `i`-th `N`-byte row of `buffer`: built in parallel straight into wgpu's
+/// staging memory, each thread a contiguous range of rows. wgpu's error scopes are per thread, so
+/// each write runs in a scope of its own on the thread that makes it: a failed write (out of memory,
+/// say) is an error here rather than lost to the uncaptured-error handler.
+fn upload<const N: usize>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    n: usize,
+    item: impl Fn(usize) -> Result<[u8; N], BakeError> + Sync,
+) -> Result<(), BakeError> {
+    let chunk = n.div_ceil(rayon::current_num_threads().max(1)).max(FILL_CHUNK);
+    (0..n.div_ceil(chunk)).into_par_iter().try_for_each(|k| {
+        let start = k.saturating_mul(chunk);
+        let rows = start..start.saturating_add(chunk).min(n);
+        let Some(size) = wgpu::BufferSize::new(rows.len().saturating_mul(N) as u64) else { return Ok(()) };
+        scoped(device, "GPU baking: upload", || {
+            // None when the write is invalid: the scope reports why
+            let Some(mut view) = queue.write_buffer_with(buffer, start.saturating_mul(N) as u64, size) else { return Ok(()) };
+            let (slots, _) = view.slice(..).into_chunks::<N>();
+            slots.into_iter().zip(rows).try_for_each(|(slot, i)| item(i).map(|row| slot.write(row)))
+        })
+        .map_err(BakeError::Tracer)?
+    })
+}
+
+/// Threads per query and queries per dispatch of a hemisphere pass of `rays` rays per texel, for
+/// queries that split their texel's rays into between `fewest` and `most` subsets. A query's rays
+/// spread over `lanes` threads of a workgroup (a power of two), sized for the usual full texel's
+/// share; a dispatch holds as many queries as keep it under RAYS_PER_DISPATCH even if they all cast
+/// the largest share (an edge texel with few covered subsamples casts more rays per query).
+fn hemisphere_sizes(rays: u32, (fewest, most): (u32, u32)) -> (u32, usize) {
+    let lanes = rays.div_ceil(most.max(1)).clamp(1, WORKGROUP).next_power_of_two();
+    (lanes, RAYS_PER_DISPATCH / rays.div_ceil(fewest.max(1)).max(1) as usize)
+}
+
 /// A row of `v` (as bits) and `w`.
 fn row(v: Vec3, w: u32) -> [u32; 4] {
     [v.x.to_bits(), v.y.to_bits(), v.z.to_bits(), w]
@@ -314,26 +362,29 @@ impl RayScene for GpuScene<'_> {
             per_group: WORKGROUP as usize,
         };
         let gpu = self.gpu;
-        self.run(&gpu.transfer, bytemuck::cast_slice(rays), rays.len(), &[pass], |out| {
+        let ray = |i: usize| rays.get(i).map(|&ray| bytemuck::cast::<Ray, [u8; 32]>(ray)).ok_or_else(|| err("ray out of range"));
+        self.batches.run(&gpu.transfer, rays.len(), ray, &[pass], |out| {
             out.par_iter().map(|&[t, u, v, tri]| (tri != NONE).then(|| Hit { t: f32::from_bits(t), tri, u: f32::from_bits(u), v: f32::from_bits(v) })).collect()
         })
     }
 
     fn hemispheres(&mut self, passes: &[Hemisphere], queries: &[Query]) -> Result<Vec<Vec<[f32; 4]>>, BakeError> {
         let roots = &self.roots;
-        let items = queries
-            .par_iter()
-            .map(|q| {
-                let root = roots.get(q.mesh as usize).copied().ok_or_else(|| err(format!("no scene mesh {}", q.mesh)))?;
-                Ok([row(q.pos, q.rot[0].to_bits()), row(q.nrm, q.rot[1].to_bits()), row(q.geo, q.key), [root, 0, 0, 0]])
-            })
-            .collect::<Result<Vec<_>, BakeError>>()?
-            .concat();
+        let item = |i: usize| {
+            let q = queries.get(i).ok_or_else(|| err("query out of range"))?;
+            let root = roots.get(q.mesh as usize).copied().ok_or_else(|| err(format!("no scene mesh {}", q.mesh)))?;
+            let rows = [row(q.pos, q.rot[0].to_bits()), row(q.nrm, q.rot[1].to_bits()), row(q.geo, q.key), [root, q.subset, q.subsets.max(1), 0]];
+            Ok(bytemuck::cast::<[[u32; 4]; 4], [u8; 64]>(rows))
+        };
+        // Antialiased texels split their rays between subsamples: size the lanes for a full texel's share
+        // (from the bake's subsamples, not this batch's queries, so batching never changes a result),
+        // and the dispatches for the largest share (an edge texel's few subsamples cast more rays each),
+        // so that no dispatch casts more than RAYS_PER_DISPATCH rays.
+        let fewest_subsets = queries.par_iter().map(|q| q.subsets).min().unwrap_or(1).max(1);
         let passes: Vec<Pass> = passes
             .iter()
             .map(|h| {
-                // A sample's rays spread over `lanes` threads of a workgroup (a power of two).
-                let lanes = h.rays.clamp(1, WORKGROUP).next_power_of_two();
+                let (lanes, per_dispatch) = hemisphere_sizes(h.rays, (fewest_subsets, h.subsamples));
                 let flags =
                     [(h.uniform, UNIFORM), (h.ground_height.is_some(), 8), (h.same_key, SAME_KEY)].iter().filter(|(on, _)| *on).fold(0, |f, (_, b)| f | b);
                 let params = Params {
@@ -359,12 +410,12 @@ impl RayScene for GpuScene<'_> {
                     lanes,
                     ..Params::default()
                 };
-                Pass { params, per_dispatch: RAYS_PER_DISPATCH / h.rays.max(1) as usize, per_group: (WORKGROUP / lanes) as usize }
+                Pass { params, per_dispatch, per_group: (WORKGROUP / lanes) as usize }
             })
             .collect();
         let gpu = self.gpu;
-        self.run(&gpu.hemisphere, bytemuck::cast_slice(&items), queries.len(), &passes, |out| {
-            out.chunks(queries.len().max(1)).map(|c| c.iter().map(|v| v.map(f32::from_bits)).collect()).collect()
+        self.batches.run(&gpu.hemisphere, queries.len(), item, &passes, |out| {
+            out.chunks(queries.len().max(1)).map(|c| c.par_iter().map(|v| v.map(f32::from_bits)).collect()).collect()
         })
     }
 }
@@ -382,6 +433,121 @@ mod tests {
     use texturecraft_geom::{Bvh, Mesh, primitives};
 
     use super::*;
+    use texturecraft_bake::tracing::CpuTracer;
+
+    /// However a batch mixes fully and partly covered antialiased texels, no hemisphere dispatch casts
+    /// more than RAYS_PER_DISPATCH rays (the driver-watchdog bound), and unsplit queries are sized as
+    /// before rays were split.
+    #[test]
+    fn hemisphere_dispatches_stay_under_the_ray_budget() {
+        for rays in [1, 7, 64, 1000, 4096] {
+            for (fewest, most) in [(1, 1), (1, 4), (1, 64), (3, 16), (64, 64)] {
+                let (lanes, per_dispatch) = hemisphere_sizes(rays, (fewest, most));
+                assert!(lanes.is_power_of_two() && lanes <= WORKGROUP, "{rays} rays, {fewest}..{most} subsets: {lanes} lanes");
+                let worst = per_dispatch * rays.div_ceil(fewest) as usize;
+                assert!(worst <= RAYS_PER_DISPATCH, "{rays} rays, {fewest}..{most} subsets: up to {worst} rays per dispatch");
+            }
+            assert_eq!(hemisphere_sizes(rays, (1, 1)), (rays.clamp(1, WORKGROUP).next_power_of_two(), RAYS_PER_DISPATCH / rays as usize));
+        }
+    }
+
+    /// Probe passes for a bake whose texels split their rays into at most `subsamples` shares.
+    fn probe_passes(subsamples: u32) -> [Hemisphere; 2] {
+        let pass = |kind, rays| Hemisphere {
+            kind,
+            rays,
+            subsamples,
+            dmax: 0.5,
+            min_distance: 1e-5,
+            attenuation: AmbientOcclusionAttenuation::Linear,
+            ground_height: None,
+            eps: 1e-4,
+            cos_max: 0.0,
+            sin_max: 1.0,
+            uniform: false,
+            ignore_backface: BackfaceMode::Never,
+            same_key: false,
+        };
+        [pass(RayKind::Occlusion, 64), pass(RayKind::Thickness, 16)]
+    }
+
+    /// Every share of 1, 3, 4, 16 and 64 of the rays at some triangle centres of `mesh`; every other
+    /// centre leans its shading normal so that some shares lose every ray.
+    fn probe_queries(mesh: &Mesh) -> Vec<Query> {
+        (0..mesh.triangle_count())
+            .step_by(211)
+            .filter_map(|t| mesh.tri(t).map(|corners| corners.map(|v| mesh.positions.get(v).copied().unwrap_or_default())))
+            .enumerate()
+            .flat_map(|(i, [a, b, c])| {
+                let geo = (b - a).cross(c - a).normalize_or_zero();
+                let nrm = if i % 2 == 0 { geo } else { (geo + 1.5 * (b - a).normalize_or_zero()).normalize_or_zero() };
+                let rot = [(i as f32 * 0.618_034).fract(), (i as f32 * 0.414_214).fract()];
+                let query = |(subset, subsets)| Query { pos: (a + b + c) / 3.0, nrm, geo, rot, key: ANY, mesh: 0, subset, subsets };
+                [1u32, 3, 4, 16, 64].into_iter().flat_map(|subsets| (0..subsets).map(move |subset| (subset, subsets))).map(query).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Query by query, the GPU tracer returns what the CPU tracer does for every share of a texel's
+    /// rays (a query casts rays subset, subset + subsets, …), whole texels mixed into the same batch.
+    /// A bake-level comparison averages shares away; this catches a shader that walks the wrong rays.
+    #[test]
+    fn gpu_hemisphere_queries_match_the_cpu_share_by_share() {
+        let Some(baker) = gpu() else { return };
+        let ball = primitives::material_ball();
+        let bvh = Bvh::new(&ball);
+        let meshes = [TraceMesh { mesh: &ball, bvh: &bvh, keys: &[], backface_culling: &[] }];
+        let (passes, queries) = (probe_passes(64), probe_queries(&ball));
+        let cpu = CpuTracer.scene(&meshes).unwrap().hemispheres(&passes, &queries).unwrap();
+        let gpu = baker.scene(&meshes).unwrap().hemispheres(&passes, &queries).unwrap();
+        assert_eq!((cpu.len(), gpu.len()), (passes.len(), passes.len()));
+        let mut empty_shares = 0;
+        for ((pass, cpu), gpu) in passes.iter().zip(&cpu).zip(&gpu) {
+            assert_eq!((cpu.len(), gpu.len()), (queries.len(), queries.len()));
+            for ((query, cpu), gpu) in queries.iter().zip(cpu).zip(gpu) {
+                for (c, g) in cpu.iter().zip(gpu) {
+                    let agree = if c.is_nan() { g.is_nan() } else { (c - g).abs() <= 1e-4 * c.abs().max(1.0) };
+                    assert!(agree, "{:?} share {} of {}: CPU {cpu:?}, GPU {gpu:?}", pass.kind, query.subset, query.subsets);
+                }
+                empty_shares += usize::from(cpu[0].is_nan());
+            }
+        }
+        assert!(empty_shares > 0, "no share lost every ray: the test misses that case");
+    }
+
+    /// A query's GPU result does not depend on the batch it is traced in: a batch of only edge
+    /// texels' large shares (as a run of thin UV slivers gives) returns the same bytes as when those
+    /// queries share a batch with fully covered texels.
+    #[test]
+    fn gpu_hemisphere_results_do_not_depend_on_batching() {
+        let Some(baker) = gpu() else { return };
+        let ball = primitives::material_ball();
+        let bvh = Bvh::new(&ball);
+        let meshes = [TraceMesh { mesh: &ball, bvh: &bvh, keys: &[], backface_culling: &[] }];
+        let passes = probe_passes(64);
+        let (edge, full): (Vec<Query>, Vec<Query>) = probe_queries(&ball).into_iter().partition(|query| query.subsets <= 4);
+        let mixed: Vec<Query> = edge.iter().chain(&full).copied().collect();
+        let mut scene = baker.scene(&meshes).unwrap();
+        let (alone, together) = (scene.hemispheres(&passes, &edge).unwrap(), scene.hemispheres(&passes, &mixed).unwrap());
+        let bits = |results: &[[f32; 4]]| results.iter().map(|value| value.map(f32::to_bits)).collect::<Vec<_>>();
+        for ((pass, alone), together) in passes.iter().zip(&alone).zip(&together) {
+            assert!(bits(alone) == bits(together.get(..edge.len()).unwrap()), "{:?}: a batch of edge shares changed their results", pass.kind);
+        }
+    }
+
+    /// A write that fails while a batch uploads on worker threads is reported (wgpu's error scopes
+    /// are per thread, so the caller's scope never sees a worker's error), not silently dropped.
+    #[test]
+    fn a_failed_upload_is_an_error() {
+        let Some(baker) = gpu() else { return };
+        let g = baker.gpu().unwrap();
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let small = g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tc_bake_test"), size: 256, usage, mapped_at_creation: false });
+        // Every write runs on a worker of its own pool, as in a bake, and runs past the buffer's end
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let caught = scoped(&g.device, "test upload", || pool.install(|| upload(&g.device, &g.queue, &small, 4 * FILL_CHUNK, |_| Ok([0u8; 64]))));
+        assert!(!matches!(caught, Ok(Ok(()))), "an overrunning upload was reported as written");
+    }
 
     /// The GPU baker, or None (test skipped) without a hardware adapter.
     fn gpu() -> Option<GpuBaker> {
