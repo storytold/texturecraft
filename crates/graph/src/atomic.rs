@@ -619,7 +619,7 @@ pub(crate) fn compiled_box_axis<P: Pixel>(t: &Image<P>, r: f32, wrap: bool, form
                         break;
                     }
                     // (a level of odd length has no pair for its last texel: it is left out)
-                    let next = below.chunks_exact(2).map(|p| if let [a, b] = p { hold((a + b) / 2.0) } else { 0.0 }).collect();
+                    let next = below.as_chunks::<2>().0.iter().map(|[a, b]| hold((a + b) / 2.0)).collect();
                     levels.push(next);
                 }
                 let base = levels.first().map_or(&[][..], Vec::as_slice);

@@ -630,9 +630,7 @@ fn call(p: &Prog, c: &Code, i: usize, env: &FnEnv, fr: &mut Frame) -> Result<Val
     let callee = p.nodes.get(i).and_then(|n| n.callee.as_ref()).ok_or_else(|| "call without a function".to_string())?;
     let cc = callee.code();
     let mut kid = fr.kids.get_mut(i).and_then(Option::take).unwrap_or_else(|| Box::new(callee.frame()));
-    for a in &mut kid.args {
-        *a = None;
-    }
+    kid.args.fill(None);
     let Some(inst) = c.insts.get(i) else { return Err(no_instruction(i)) };
     let mut failed = None;
     for (k, ((_, pin, _), operand)) in callee.inputs.iter().zip(inst.ins).enumerate() {

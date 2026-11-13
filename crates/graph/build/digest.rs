@@ -34,9 +34,9 @@ impl Digest {
             return None;
         }
         let mut out = [0u8; 32];
-        for (o, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-            let digit = |b: Option<&u8>| char::from(*b.unwrap_or(&b'x')).to_digit(16);
-            *o = (digit(pair.first())? * 16 + digit(pair.get(1))?) as u8;
+        for (o, [high, low]) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            let digit = |b: u8| char::from(b).to_digit(16);
+            *o = (digit(*high)? * 16 + digit(*low)?) as u8;
         }
         Some(Digest(out))
     }
@@ -83,13 +83,10 @@ impl Fingerprint {
             self.compress(&block);
             self.filled = 0;
         }
-        let mut chunks = data.chunks_exact(64);
-        for chunk in &mut chunks {
-            if let Ok(block) = <&[u8; 64]>::try_from(chunk) {
-                self.compress(block);
-            }
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
+            self.compress(block);
         }
-        let rest = chunks.remainder();
         if let Some(slot) = self.block.get_mut(..rest.len()) {
             slot.copy_from_slice(rest);
         }
@@ -119,7 +116,7 @@ impl Fingerprint {
         self.u64(values.len() as u64);
         let mut buffer = [0u8; 4096];
         for chunk in values.chunks(buffer.len() / 4) {
-            for (o, v) in buffer.chunks_exact_mut(4).zip(chunk) {
+            for (o, v) in buffer.as_chunks_mut::<4>().0.iter_mut().zip(chunk) {
                 o.copy_from_slice(&v.to_bits().to_le_bytes());
             }
             if let Some(used) = buffer.get(..chunk.len() * 4) {
@@ -136,7 +133,7 @@ impl Fingerprint {
         }
         self.raw(&bits.to_be_bytes());
         let mut out = [0u8; 32];
-        for (o, s) in out.chunks_exact_mut(4).zip(self.state) {
+        for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
             o.copy_from_slice(&s.to_be_bytes());
         }
         Digest(out)
@@ -144,10 +141,8 @@ impl Fingerprint {
 
     fn compress(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
-        for (o, c) in w.iter_mut().zip(block.chunks_exact(4)) {
-            let mut word = [0u8; 4];
-            word.copy_from_slice(c);
-            *o = u32::from_be_bytes(word);
+        for (o, c) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+            *o = u32::from_be_bytes(*c);
         }
         for i in 16..64 {
             let at = |k: usize| w.get(i - k).copied().unwrap_or(0);

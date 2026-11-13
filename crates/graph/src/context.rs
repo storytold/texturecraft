@@ -71,7 +71,11 @@ impl LiveBytes {
     }
 
     pub(crate) fn sub(&self, b: usize) {
-        let _ = self.0.0.fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_sub(b)));
+        // a compare-exchange loop: `fetch_update` is deprecated on newer toolchains and `try_update` is not on older ones
+        let mut now = self.0.0.load(Relaxed);
+        while let Err(seen) = self.0.0.compare_exchange_weak(now, now.saturating_sub(b), Relaxed, Relaxed) {
+            now = seen;
+        }
     }
 }
 

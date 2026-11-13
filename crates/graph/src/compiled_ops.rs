@@ -224,7 +224,7 @@ fn strips_coverage(strips: &[Vec<[f32; 2]>], w: usize, h: usize) -> Vec<f32> {
                     }
                 }
             }
-            for (cell, m) in row.iter_mut().zip(mask.chunks_exact(SS)) {
+            for (cell, m) in row.iter_mut().zip(mask.as_chunks::<SS>().0) {
                 *cell += m.iter().filter(|m| **m).count() as u8;
             }
         }

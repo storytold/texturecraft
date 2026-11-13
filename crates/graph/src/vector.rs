@@ -805,10 +805,8 @@ fn shape_segs(t: &Tag) -> Vec<Seg> {
             let v: Vec<f32> =
                 a("points").unwrap_or("").split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()).filter_map(|t| t.parse().ok()).collect();
             let mut s = Vec::new();
-            for (i, c) in v.chunks_exact(2).enumerate() {
-                if let [x, y] = *c {
-                    s.push(if i == 0 { Seg::Move([x, y]) } else { Seg::Line([x, y]) });
-                }
+            for (i, &[x, y]) in v.as_chunks::<2>().0.iter().enumerate() {
+                s.push(if i == 0 { Seg::Move([x, y]) } else { Seg::Line([x, y]) });
             }
             if t.name == "polygon" && !s.is_empty() {
                 s.push(Seg::Close);
