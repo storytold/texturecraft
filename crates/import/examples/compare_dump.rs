@@ -3,7 +3,7 @@
 //! height as h / 2 + 0.5) the same channel of TextureCraft's composite is encoded alike and compared on the texels
 //! `<set>_<channel>_islands.png` marks, in 8-bit steps. Also writes TextureCraft's image as `<set>_<channel>_tc.png`.
 //!
-//! `cargo run --release -p texturecraft-import --example compare_dump -- <project file> <dump dir>`
+//! `cargo run --release -p texturecraft-import --features dev-tools --example compare_dump -- <project file> <dump dir>`
 
 use std::path::Path;
 

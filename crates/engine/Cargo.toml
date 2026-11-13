@@ -31,3 +31,12 @@ texturecraft-result-cache = { workspace = true }
 [dev-dependencies]
 image = { workspace = true }
 zip = { workspace = true }
+
+[features]
+# Developer tools in examples/ that read local project files. Off by default, so `cargo test` (the CI gate) does
+# not build them; run one with `cargo run -p texturecraft-engine --features dev-tools --example <name> -- ...`.
+dev-tools = []
+
+[[example]]
+name = "import_progress"
+required-features = ["dev-tools"]

@@ -26,3 +26,12 @@ image = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+[features]
+# Developer tools in examples/ that read local project files. Off by default, so `cargo test` (the CI gate) does
+# not build them; run one with `cargo run -p texturecraft-import --features dev-tools --example <name> -- ...`.
+dev-tools = []
+
+[[example]]
+name = "compare_dump"
+required-features = ["dev-tools"]

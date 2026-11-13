@@ -4,7 +4,7 @@
 //! A line is printed per step change and per 1 % the bar moves. With `--view` the run also composites the converted
 //! project's view, as the desktop app's import does.
 //!
-//! `cargo run --release -p texturecraft-engine --example import_progress -- <project file> [--cancel-in cooking 2000] [--view]`
+//! `cargo run --release -p texturecraft-engine --features dev-tools --example import_progress -- <project file> [--cancel-in cooking 2000] [--view]`
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
