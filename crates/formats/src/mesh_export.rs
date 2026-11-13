@@ -325,7 +325,9 @@ pub fn glb_bytes(mesh: &Mesh, name: &str, textures: &[GlbTextures]) -> Result<Ve
     if mesh.uvs.len() == n {
         attributes.insert("TEXCOORD_0".into(), g.attribute(mesh.uvs.iter().flat_map(|t| t.to_array()), "VEC2", n));
     }
-    let mut primitives = Vec::new();
+    // one glTF mesh and node per part (in the order parts first appear), named after it, so that reading the file
+    // back finds the parts by name again (geometry masks select parts by name)
+    let mut by_part: Vec<(String, Vec<Value>)> = Vec::new();
     for sm in parts(mesh, name) {
         let tris = mesh.indices.get(sm.start as usize..(sm.start as usize).saturating_add(sm.count as usize)).unwrap_or_default();
         let tris = tris.get(..tris.len() / 3 * 3).unwrap_or_default();
@@ -337,16 +339,21 @@ pub fn glb_bytes(mesh: &Mesh, name: &str, textures: &[GlbTextures]) -> Result<Ve
         if sm.material < mesh.materials.len() {
             p["material"] = sm.material.into();
         }
-        primitives.push(p);
+        match by_part.iter_mut().find(|(n, _)| *n == sm.name) {
+            Some((_, primitives)) => primitives.push(p),
+            None => by_part.push((sm.name.clone(), vec![p])),
+        }
     }
+    let nodes: Vec<Value> = by_part.iter().enumerate().map(|(i, (part, _))| json!({ "mesh": i, "name": part })).collect();
+    let meshes: Vec<Value> = by_part.into_iter().map(|(part, primitives)| json!({ "name": part, "primitives": primitives })).collect();
     let none = GlbTextures::default();
     let materials: Vec<Value> = mesh.materials.iter().enumerate().map(|(i, m)| g.material(m, textures.get(i).unwrap_or(&none))).collect();
     let mut doc = json!({
         "asset": { "version": "2.0", "generator": "TextureCraft" },
         "scene": 0,
-        "scenes": [{ "nodes": [0] }],
-        "nodes": [{ "mesh": 0, "name": name }],
-        "meshes": [{ "name": name, "primitives": primitives }],
+        "scenes": [{ "nodes": (0..nodes.len()).collect::<Vec<_>>() }],
+        "nodes": nodes,
+        "meshes": meshes,
         "buffers": [{ "byteLength": g.bin.len() }],
         "bufferViews": g.views,
         "accessors": g.accessors,
@@ -422,6 +429,26 @@ mod tests {
             mtl.contains("newmtl Mat_A\nKd 1 1 1\nmap_Kd m_Mat_A_BaseColor.png") && mtl.contains("newmtl mat_a_2\nKd 1 1 1\nmap_Kd m_mat_a_2_BaseColor.png"),
             "{mtl}"
         );
+    }
+
+    #[test]
+    fn glb_round_trips_part_names() {
+        let mut mesh = texturecraft_geom::primitives::cube(1.0);
+        mesh.materials = vec!["Skin".into(), "Horn".into()];
+        let n = mesh.indices.len() as u32;
+        mesh.submeshes = vec![
+            SubMesh { name: "Body_low".into(), material: 0, start: 0, count: 12 },
+            SubMesh { name: "Horns_low".into(), material: 1, start: 12, count: 12 },
+            SubMesh { name: "Body_low".into(), material: 1, start: 24, count: n - 24 },
+        ];
+        let back = crate::import_mesh_bytes("mesh.glb", &glb_bytes(&mesh, "Project", &[]).unwrap()).unwrap().mesh;
+        assert_eq!(back.triangle_count(), mesh.triangle_count());
+        let tris = |m: &Mesh, part: &str| m.submeshes.iter().filter(|s| s.name == part).map(|s| s.count).sum::<u32>();
+        // the parts come back by name (not under the project's name), with their triangles
+        for part in ["Body_low", "Horns_low"] {
+            assert_eq!(tris(&back, part), tris(&mesh, part), "{part}");
+        }
+        assert!(back.submeshes.iter().all(|s| s.name != "Project"));
     }
 
     #[test]
