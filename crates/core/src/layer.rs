@@ -254,10 +254,22 @@ pub enum ProceduralKind {
     Pores,
     /// Sharp-edged paint chips.
     Chips,
+    /// Hexagon tiles with joints (0 = joint).
+    HexagonTiles,
+    /// Rows of overlapping fan-shaped waves, each a set of concentric arcs.
+    WaveScales,
+    /// Herringbone planks with gaps and grain (0 = gap).
+    HerringbonePlanks,
+    /// A halftone screen: dots on a diagonal grid, growing and shrinking across the pattern.
+    HalftoneDots,
+    /// Raised diamonds of concentric rings on a twill ground.
+    DiamondBrocade,
+    /// Truchet tiles: quarter-circle arcs that join into winding paths.
+    TruchetArcs,
 }
 
 impl ProceduralKind {
-    pub const ALL: [ProceduralKind; 23] = [
+    pub const ALL: [ProceduralKind; 29] = [
         ProceduralKind::Clouds,
         ProceduralKind::Perlin,
         ProceduralKind::Noise,
@@ -281,6 +293,12 @@ impl ProceduralKind {
         ProceduralKind::Smudges,
         ProceduralKind::Pores,
         ProceduralKind::Chips,
+        ProceduralKind::HexagonTiles,
+        ProceduralKind::WaveScales,
+        ProceduralKind::HerringbonePlanks,
+        ProceduralKind::HalftoneDots,
+        ProceduralKind::DiamondBrocade,
+        ProceduralKind::TruchetArcs,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -307,6 +325,12 @@ impl ProceduralKind {
             ProceduralKind::Smudges => "Fingerprints",
             ProceduralKind::Pores => "Pores",
             ProceduralKind::Chips => "Paint chips",
+            ProceduralKind::HexagonTiles => "Hexagon tiles",
+            ProceduralKind::WaveScales => "Wave scales",
+            ProceduralKind::HerringbonePlanks => "Herringbone planks",
+            ProceduralKind::HalftoneDots => "Halftone dots",
+            ProceduralKind::DiamondBrocade => "Diamond brocade",
+            ProceduralKind::TruchetArcs => "Truchet arcs",
         }
     }
     pub fn parse(s: &str) -> Option<ProceduralKind> {

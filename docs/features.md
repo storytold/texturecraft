@@ -49,9 +49,11 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   mask to view it alone. Drag an effect to reorder its stack, or right-click it to duplicate it
   (painted strokes included) or copy it onto another layer or mask (Ctrl+C, Ctrl+V); with an
   effect selected, Ctrl+D and Delete duplicate or remove it.
-- **Fill layers** take uniform values, **23 procedurals** (clouds, cells, grunge, scratches, wood
-  grain, bricks, fabric weave, twill, leather grain, marble veins, Voronoi, paint chips…) or your own
-  **images**, through UV, tri-planar, planar, spherical, cylindrical or decal projection, with
+- **Fill layers** take uniform values, **29 procedurals** (clouds, cells, grunge, scratches, wood
+  grain, bricks, fabric weave, twill, leather grain, marble veins, Voronoi, paint chips, hexagon
+  tiles, wave scales, herringbone planks, halftone dots, Truchet arcs…) or your own **images**,
+  through UV, tri-planar, planar,
+  spherical, cylindrical or decal projection, with
   the UV scale, rotation and offset, the tri-planar blend sharpness and offset, the planar axis
   and offset, and the cylindrical axis in the fill's properties. Each channel takes its own image (a normal, roughness or height map, say): pick it in the channel's
   source menu, which also imports one, or drop it from the Assets panel onto the channel. A
