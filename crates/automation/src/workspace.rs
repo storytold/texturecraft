@@ -14,6 +14,15 @@ use serde_json::Value;
 
 use crate::{AutomationError, bad};
 
+/// Open for reading without blocking on a FIFO with no writer; the callers then reject non-regular files.
+fn open_nonblocking(dir: &Dir, rel: &Path) -> std::io::Result<cap_std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    cap_std::fs::OpenOptionsExt::custom_flags(&mut options, rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    dir.open_with(rel, &options)
+}
+
 /// Largest file read through automation (the mesh importer's own limit).
 pub const MAX_READ_BYTES: u64 = texturecraft_engine::formats::mesh_import::MAX_MESH_FILE_BYTES;
 
@@ -33,7 +42,7 @@ impl AuthorizedWorkspace {
     pub fn read(&self, path: &str) -> Result<Vec<u8>, AutomationError> {
         let rel = relative_path(path)?;
         let root = self.read.as_ref().ok_or_else(|| denied("read"))?;
-        let file = root.open(&rel).map_err(|e| file_error("read", path, e))?;
+        let file = open_nonblocking(root, &rel).map_err(|e| file_error("read", path, e))?;
         let meta = file.metadata().map_err(|e| file_error("read", path, e))?;
         if !meta.is_file() {
             return Err(bad(format!("not a regular file: `{path}`")));
@@ -43,6 +52,29 @@ impl AuthorizedWorkspace {
         }
         let mut bytes = Vec::new();
         file.take(MAX_READ_BYTES).read_to_end(&mut bytes).map_err(|e| file_error("read", path, e))?;
+        Ok(bytes)
+    }
+
+    /// Read one regular file of at most `cap` bytes from `relative`, a path below the folder `dir` of the read root
+    /// (`.` for the root itself): the folder is opened first and the file is resolved beneath it, so a link that leaves
+    /// the folder fails (a mesh's references must stay in the mesh's folder), and no more than `cap` bytes are read.
+    pub fn read_beneath(&self, dir: &str, relative: &str, cap: u64) -> Result<Vec<u8>, AutomationError> {
+        let rel = relative_path(relative)?;
+        let root = self.read.as_ref().ok_or_else(|| denied("read"))?;
+        let folder = if dir == "." { root.try_clone() } else { root.open_dir(relative_path(dir)?) }.map_err(|e| file_error("read", dir, e))?;
+        let file = open_nonblocking(&folder, &rel).map_err(|e| file_error("read", relative, e))?;
+        let meta = file.metadata().map_err(|e| file_error("read", relative, e))?;
+        if !meta.is_file() {
+            return Err(bad(format!("not a regular file: `{relative}`")));
+        }
+        if meta.len() > cap {
+            return Err(bad(format!("`{relative}` is {} bytes (limit {cap})", meta.len())));
+        }
+        let mut bytes = Vec::new();
+        file.take(cap.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| file_error("read", relative, e))?;
+        if bytes.len() as u64 > cap {
+            return Err(bad(format!("`{relative}` grew past the limit {cap}")));
+        }
         Ok(bytes)
     }
 
@@ -167,6 +199,40 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         let ws = AuthorizedWorkspace::new(Some(&inside), Some(&inside)).unwrap();
         (inside, outside, ws)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reference_read_stays_in_its_folder_and_under_its_cap() {
+        let (inside, _, ws) = roots("beneath");
+        std::fs::create_dir_all(inside.join("mesh")).unwrap();
+        std::fs::create_dir_all(inside.join("other")).unwrap();
+        std::fs::write(inside.join("mesh/tex.png"), b"pixels").unwrap();
+        std::fs::write(inside.join("other/secret.png"), b"secret").unwrap();
+        // a link to a sibling folder of the same workspace leaves the mesh's folder
+        std::os::unix::fs::symlink("../other/secret.png", inside.join("mesh/linked.png")).unwrap();
+        assert_eq!(ws.read_beneath("mesh", "tex.png", 6).unwrap(), b"pixels");
+        assert!(ws.read_beneath("mesh", "tex.png", 5).is_err(), "over the cap");
+        assert!(ws.read_beneath("mesh", "linked.png", 16).is_err(), "a link out of the folder");
+        assert!(ws.read_beneath("mesh", "../other/secret.png", 16).is_err());
+        std::fs::write(inside.join("top.png"), b"top").unwrap();
+        assert_eq!(ws.read_beneath(".", "top.png", 16).unwrap(), b"top");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        use rustix::fs::{CWD, FileType, Mode, mknodat};
+        let (inside, _, ws) = roots("fifo");
+        std::fs::create_dir_all(inside.join("mesh")).unwrap();
+        for name in ["pipe", "mesh/pipe"] {
+            mknodat(CWD, inside.join(name), FileType::Fifo, Mode::from_raw_mode(0o600), 0).unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((ws.read("pipe").is_err(), ws.read_beneath("mesh", "pipe", 16).is_err()));
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a FIFO read blocked"), (true, true));
     }
 
     #[test]

@@ -40,6 +40,16 @@ rotation, shelf packing per material with one texel density). Tangents are MikkT
 2 GiB files, `MAX_TRIANGLES` triangles, 3 × that many vertices; meshes whose triangles are all
 degenerate are refused (MikkTSpace crashes on them).
 
+Referenced files are opened beneath a held mesh-directory handle, so replacement symlinks cannot
+redirect a read outside that directory. Links whose targets remain inside the folder still work.
+FBX/USD references are limited to 256 MiB each, with a 2 GiB combined layer-and-texture budget;
+exceeding that budget prevents further reference reads. Native whole-file reads enforce their byte
+limit during reading as well as against metadata.
+
+Portable `.mcmat` materials accept at most 64 map listings, 512 MiB per ZIP entry, and 4 GiB across
+the manifest, every listed map and the source package. Repeated map references count each time.
+These import limits are independent of the configurable `.tcraft` project-open limit.
+
 ### Mesh export (`mesh_export`)
 
 ```rust

@@ -4349,6 +4349,7 @@ name = "texturecraft-engine"
 version = "0.6.1"
 dependencies = [
  "epaint_default_fonts",
+ "getrandom 0.3.4",
  "image",
  "rayon",
  "serde",
@@ -4361,6 +4362,7 @@ dependencies = [
  "texturecraft-paint",
  "texturecraft-texel",
  "thiserror 2.0.21",
+ "tokio",
  "zip",
 ]
 
@@ -4369,6 +4371,7 @@ name = "texturecraft-formats"
 version = "0.6.1"
 dependencies = [
  "base64 0.22.1",
+ "cap-std",
  "exr",
  "flate2",
  "gltf",
@@ -4377,6 +4380,7 @@ dependencies = [
  "lz4_flex",
  "quick-xml 0.41.0",
  "rayon",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "sysinfo",
@@ -4598,6 +4602,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

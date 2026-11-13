@@ -102,6 +102,8 @@ impl Session {
     /// [`Session::add_smart_material_bytes`] at `place` (shelf drag and drop). MaterialCraft
     /// portable materials and packages become linked fill layers.
     pub fn add_smart_material_bytes_at(&mut self, bytes: &[u8], place: Place) -> Result<LayerId> {
+        // the browser hands over whole files, so `material.load`'s read cap is applied here for every caller
+        check_loadable(bytes.len()).map_err(EngineError::Other)?;
         if texturecraft_formats::mcmat::is_mcmat(bytes) || texturecraft_formats::mcmat::is_mcraft(bytes) {
             return self.add_linked_material_bytes_at(bytes, place);
         }
@@ -143,6 +145,8 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
     let path = strp(p, "path").ok_or_else(|| bad("material.save", "`path` is required"))?;
     let name = strp(p, "name").map(str::to_string).unwrap_or_else(|| s.doc.project.layer(id).map(|l| l.name.clone()).unwrap_or_default());
     let bytes = s.smart_material_bytes(id, &name)?;
+    // what `material.load` would refuse is not written (a layer subtree holding several large images)
+    check_loadable(bytes.len()).map_err(|why| bad("material.save", why))?;
     let path = if path.ends_with(&format!(".{SMART_MATERIAL_EXT}")) { path.to_string() } else { format!("{path}.{SMART_MATERIAL_EXT}") };
     if let Some(dir) = std::path::Path::new(&path).parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| bad("material.save", format!("cannot create {}: {e}", dir.display())))?;
@@ -152,10 +156,18 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "path": path }))
 }
 
+/// A smart material of `len` bytes must be one `material.load` reads back (the mesh importer's file limit).
+fn check_loadable(len: usize) -> std::result::Result<(), String> {
+    let limit = texturecraft_formats::mesh_import::MAX_MESH_FILE_BYTES;
+    if len as u64 > limit { Err(format!("the smart material is {len} bytes, over the {limit} byte limit `material.load` reads")) } else { Ok(()) }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn load(s: &mut Session, p: &Value) -> Result<Value> {
     let path = strp(p, "path").ok_or_else(|| bad("material.load", "`path` is required"))?;
-    let bytes = std::fs::read(path).map_err(|e| bad("material.load", format!("cannot read {path}: {e}")))?;
+    let bytes = texturecraft_formats::read_capped(std::path::Path::new(path), texturecraft_formats::mesh_import::MAX_MESH_FILE_BYTES)
+        .map_err(|e| bad("material.load", format!("cannot read {path}: {e}")))?;
+
     let id = s.add_smart_material_bytes_at(&bytes, Place::from_params(p))?;
     Ok(json!({ "layer": id.0 }))
 }
@@ -168,4 +180,16 @@ fn save(_: &mut Session, _: &Value) -> Result<Value> {
 #[cfg(target_arch = "wasm32")]
 fn load(_: &mut Session, _: &Value) -> Result<Value> {
     Err(EngineError::Other("file paths are not available in the browser".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_loadable;
+
+    #[test]
+    fn a_smart_material_over_the_load_limit_is_not_saved() {
+        let limit = texturecraft_formats::mesh_import::MAX_MESH_FILE_BYTES as usize;
+        assert!(check_loadable(limit).is_ok());
+        assert!(check_loadable(limit + 1).is_err());
+    }
 }

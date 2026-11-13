@@ -12,6 +12,8 @@ use texturecraft_core::{LinkParam, LinkPreset};
 
 use crate::{FormatError, Result};
 
+mod map_entries_visitor;
+
 /// The portable material extension.
 pub const MCMAT_EXT: &str = "mcmat";
 /// MaterialCraft's package extension.
@@ -20,6 +22,10 @@ const FORMAT: &str = "craft-material";
 const VERSION: u32 = 1;
 /// Largest entry read (maps are at most 8192² × 16 bits, compressed).
 const MAX_ENTRY: u64 = 512 << 20;
+/// Most maps a manifest may list (there are 9 usages; generous headroom).
+const MAX_MAPS: usize = 64;
+/// Most decompressed bytes read from one `.mcmat` in total (a zip bomb may list one entry many times).
+const MAX_TOTAL: u64 = 4 << 30;
 const KIND: &str = "MaterialCraft material";
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -30,6 +36,7 @@ pub struct Manifest {
     pub name: String,
     pub graph: String,
     pub size: [u32; 2],
+    #[serde(deserialize_with = "bounded_maps")]
     pub maps: Vec<MapEntry>,
     #[serde(default)]
     pub parameters: Vec<LinkParam>,
@@ -38,6 +45,13 @@ pub struct Manifest {
     #[serde(default)]
     pub presets: Vec<LinkPreset>,
     pub source: String,
+}
+
+const MAPS_LIMIT_MSG: &str = "too many maps";
+
+/// Reads `maps` while enforcing `MAX_MAPS`, so a hostile manifest cannot make serde allocate every entry first.
+fn bounded_maps<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Vec<MapEntry>, D::Error> {
+    deserializer.deserialize_seq(map_entries_visitor::MapEntriesVisitor)
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -68,23 +82,41 @@ fn malformed(msg: impl Into<String>) -> FormatError {
 
 /// Read `.mcmat` bytes.
 pub fn read_mcmat(bytes: &[u8]) -> Result<PortableMaterial> {
-    let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| malformed(e.to_string()))?;
+    read_with_limits(bytes, MAX_ENTRY, MAX_TOTAL)
+}
+
+fn read_with_limits(bytes: &[u8], max_entry: u64, max_total: u64) -> Result<PortableMaterial> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| malformed(error.to_string()))?;
+    let mut total = 0u64;
     let mut read = |name: &str| -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        let f = z.by_name(name).map_err(|_| malformed(format!("{name} is missing")))?;
-        f.take(MAX_ENTRY + 1).read_to_end(&mut out).map_err(|e| malformed(format!("{name}: {e}")))?;
-        if out.len() as u64 > MAX_ENTRY {
+        let entry = archive.by_name(name).map_err(|_| malformed(format!("{name} is missing")))?;
+        let remaining = max_entry.min(max_total.saturating_sub(total));
+        if entry.size() > remaining {
             return Err(FormatError::TooLarge(name.to_string()));
         }
-        Ok(out)
+
+        // Declared sizes are untrusted; enforce the same allowance while decompressing
+        let mut data = Vec::new();
+        entry.take(remaining.saturating_add(1)).read_to_end(&mut data).map_err(|error| malformed(format!("{name}: {error}")))?;
+        if data.len() as u64 > remaining {
+            return Err(FormatError::TooLarge(name.to_string()));
+        }
+
+        total += data.len() as u64;
+        Ok(data)
     };
-    let manifest: Manifest = serde_json::from_slice(&read("material.json")?).map_err(|e| malformed(format!("material.json: {e}")))?;
+    let manifest: Manifest = serde_json::from_slice(&read("material.json")?).map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains(MAPS_LIMIT_MSG) { FormatError::TooLarge(format!("more than {MAX_MAPS} maps")) } else { malformed(format!("material.json: {msg}")) }
+    })?;
     if manifest.format != FORMAT {
         return Err(malformed(format!("format `{}`", manifest.format)));
     }
+
     if manifest.version > VERSION {
         return Err(FormatError::Unsupported(format!("{KIND} version {} (this version reads up to {VERSION})", manifest.version)));
     }
+
     let maps = manifest.maps.iter().map(|m| Ok((m.usage.clone(), read(&m.file)?))).collect::<Result<Vec<_>>>()?;
     let source = read(&manifest.source)?;
     Ok(PortableMaterial { manifest, maps, source })
@@ -165,6 +197,58 @@ mod tests {
         assert_eq!(m.source, b"pkg");
         assert!(matches!(read_mcmat(&sample(2)), Err(FormatError::Unsupported(_))));
         assert!(read_mcmat(b"junk").is_err());
+    }
+
+    #[test]
+    fn rejects_a_manifest_listing_too_many_maps() {
+        let maps: Vec<_> = (0..=MAX_MAPS).map(|_| serde_json::json!({"usage": "baseColor", "file": "maps/baseColor.png"})).collect();
+        let manifest =
+            serde_json::json!({"format": "craft-material", "version": 1, "name": "n", "graph": "g", "size": [4, 4], "maps": maps, "source": "source.mcraft"});
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        z.start_file("material.json", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(manifest.to_string().as_bytes()).unwrap();
+        let bytes = z.finish().unwrap().into_inner();
+
+        assert!(matches!(read_mcmat(&bytes), Err(FormatError::TooLarge(_))));
+    }
+
+    #[test]
+    fn manifest_map_list_is_bounded_while_parsing() {
+        let entry = r#"{"usage":"a","file":"b"}"#;
+        let head = r#"{"format":"craft-material","version":1,"name":"n","graph":"g","size":[4,4],"source":"s","maps":["#;
+        let json = |n: usize| format!("{head}{}]}}", vec![entry; n].join(","));
+
+        assert_eq!(serde_json::from_str::<Manifest>(&json(MAX_MAPS)).unwrap().maps.len(), MAX_MAPS);
+        let err = serde_json::from_str::<Manifest>(&json(100_000)).unwrap_err().to_string();
+        assert!(err.contains(MAPS_LIMIT_MSG), "{err}");
+    }
+
+    #[test]
+    fn repeated_entries_and_source_share_the_total_budget() {
+        let manifest = serde_json::json!({
+            "format": FORMAT, "version": VERSION, "name": "Repeated", "graph": "g", "size": [4, 4],
+            "maps": [{"usage": "baseColor", "file": "map"}, {"usage": "roughness", "file": "map"}], "source": "source"
+        })
+        .to_string();
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, data) in [("material.json", manifest.as_bytes()), ("map", &[0; 4096][..]), ("source", &[0; 128][..])] {
+            archive.start_file(name, options).unwrap();
+            archive.write_all(data).unwrap();
+        }
+        let bytes = archive.finish().unwrap().into_inner();
+        let total = manifest.len() as u64 + 2 * 4096 + 128;
+
+        let material = read_with_limits(&bytes, 4096, total).unwrap();
+        let repeated_map_error = read_with_limits(&bytes, 4096, total - 4096);
+        let source_error = read_with_limits(&bytes, 4096, total - 1);
+        let entry_error = read_with_limits(&bytes, 4095, total);
+
+        assert_eq!(material.maps.len(), 2);
+        assert!(bytes.len() < 1024, "the fixture must exercise compression amplification");
+        assert!(matches!(repeated_map_error, Err(FormatError::TooLarge(name)) if name == "map"));
+        assert!(matches!(source_error, Err(FormatError::TooLarge(name)) if name == "source"));
+        assert!(matches!(entry_error, Err(FormatError::TooLarge(name)) if name == "map"));
     }
 
     #[test]
