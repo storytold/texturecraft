@@ -362,7 +362,9 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let item = |what: &str| format!("texture set \"{name}\" / {what}");
     // the stored result
     let mut cache: Vec<(Channel, CacheImage)> = Vec::new();
-    match &ctx.source.cache_set {
+    let only = ctx.options.translate_only;
+    match ctx.source.cache_set.as_ref().filter(|_| !only) {
+        None if only => {}
         None => report.add(item("stored result"), Fidelity::Approximated, "no stored result (the original never rendered this set)"),
         Some(folder) => {
             let (mut entries, other_tiles) = uv_tiles::one_tile(ctx.cache.iter().filter(|e| &e.set == folder).collect());
@@ -442,7 +444,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let ts = project.texture_sets.len();
     // baked mesh maps
     let mut maps = BTreeMap::new();
-    for b in baked::sources(ctx.file, &name, &record.baked) {
+    for b in baked::sources(ctx.file, &name, &record.baked).into_iter().filter(|_| !only) {
         ctx.hooks.check()?;
         let Some(kind) = b.kind else {
             report.add(item(&format!("baked map \"{}\"", b.name)), Fidelity::Approximated, format!("usage {:?} has no counterpart; not imported", b.usage));
@@ -477,7 +479,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let geometry = SetGeometry::new(ctx.mesh, ctx.source.slot, ctx.polygon_starts);
     let mut stack = match ctx.project_set {
         Some(project_set) => {
-            let replay = ctx.options.replay_strokes && ctx.hooks.replay.is_some();
+            let replay = ctx.options.replay_strokes && (ctx.hooks.replay.is_some() || only);
             let input = SetInput {
                 channels: &declared,
                 images: ctx.images,
@@ -508,7 +510,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         Some(s) => (s.verdict.all_exact(), s.verdict.layer_count),
         None => (false, 0),
     };
-    if let Some(stack) = stack.as_mut()
+    if let Some(stack) = stack.as_mut().filter(|_| !only)
         && !stack.fills.is_empty()
     {
         ctx.hooks.check()?;
@@ -521,7 +523,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     }
     let mut replayed = ReplayCount::default();
     if let Some(stack) = stack.as_mut()
-        && let Some(replayer) = ctx.hooks.replay.filter(|_| !stack.jobs.is_empty())
+        && let Some(replayer) = ctx.hooks.replay.filter(|_| !stack.jobs.is_empty() && !only)
     {
         ctx.hooks.check()?;
         let (set, of) = ctx.index;
@@ -533,7 +535,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         // a replayer stopped by the flag fails its remaining jobs: they are not reported as failures
         ctx.hooks.check()?;
     }
-    if let Some(stack) = stack.as_mut()
+    if let Some(stack) = stack.as_mut().filter(|_| !only)
         && !stack.fills.is_empty()
     {
         lay_fills_over_strokes(stack, ctx.mesh, ctx.source.slot, resolution, &mut out.pixels);
@@ -575,7 +577,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let mut scores = Vec::new();
     let mut corrections: Vec<correction::ChannelCorrection> = Vec::new();
     let measuring = ctx.options.measure && !cache.is_empty() && stack.is_some();
-    let cooking = stack.as_ref().is_some_and(|s| s.layers.iter().any(|l| !l.graphs().is_empty()));
+    let cooking = !only && stack.as_ref().is_some_and(|s| s.layers.iter().any(|l| !l.graphs().is_empty()));
     if measuring || cooking {
         ctx.hooks.check()?;
         let (set, of) = ctx.index;

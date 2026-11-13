@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Import project...",
         [],
         None,
-        "{path?: the project file (native only), bytes?: the project file as base64 (any target), name?: file name for the report (with bytes), originalOnTop?: bool (show the original's stored result on top of stacks that are not reproduced; default false), originalCorrection?: bool (a locked correction layer on top of stacks that are not reproduced, holding the stored result on the texels the layers miss; default false), nativeFilters?: bool (replace a few filter graphs by close built-in filters; default false), maxResolution?: px (cap texture set resolutions), measure?: bool (compare each stack with the stored result; default true), replayStrokes?: bool (replay brush strokes with TextureCraft's brush, approximated; default true), graphs?: \"decompile\" | \"keep\" (run the project's compiled graphs decompiled, or keep them as locked placeholders; default decompile), resultCache?: folder (native only: keep graph renders there and reuse them in later imports; default none), resultCacheGb?: the folder's limit in GB (default 20)} → the session, plus {import: {sets: [{name, strategy, layers, locked, placeholders, channels, scores}], resultCache?: {folder, found, missed, written, damaged, readBytes, writtenBytes}}}. One-way: the original file is only read",
+        "{path?: the project file (native only), bytes?: the project file as base64 (any target), name?: file name for the report (with bytes), originalOnTop?: bool (show the original's stored result on top of stacks that are not reproduced; default false), originalCorrection?: bool (a locked correction layer on top of stacks that are not reproduced, holding the stored result on the texels the layers miss; default false), nativeFilters?: bool (replace a few filter graphs by close built-in filters; default false), maxResolution?: px (cap texture set resolutions), measure?: bool (compare each stack with the stored result; default true), replayStrokes?: bool (replay brush strokes with TextureCraft's brush, approximated; default true), graphs?: \"decompile\" | \"keep\" (run the project's compiled graphs decompiled, or keep them as locked placeholders; default decompile), resultCache?: folder (native only: keep graph renders there and reuse them in later imports; default none), resultCacheGb?: the folder's limit in GB (default 20), translateOnly?: bool (translate the layer stacks only: no stored result, strokes, graph cooks or safety net; the project holds no pixels, for a census of locks and placeholders; default false)} → the session, plus {import: {sets: [{name, strategy, layers, locked, placeholders, channels, scores}], resultCache?: {folder, found, missed, written, damaged, readBytes, writtenBytes}}}. One-way: the original file is only read",
         always,
         import
     )]
@@ -51,6 +51,9 @@ fn options(p: &Value) -> Result<ImportOptions> {
     }
     if let Some(v) = boolp(p, "replayStrokes") {
         o.replay_strokes = v;
+    }
+    if let Some(v) = boolp(p, "translateOnly") {
+        o.translate_only = v;
     }
     match p.get("graphs").filter(|v| !v.is_null()).map(|v| v.as_str()) {
         None => {}

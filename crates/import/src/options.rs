@@ -28,6 +28,10 @@ pub struct ImportOptions {
     /// Runs the project's compiled graphs, decompiled ([`crate::GraphMode::Decompile`], the default), or keeps every use
     /// a locked placeholder.
     pub graphs: crate::GraphMode,
+    /// Translates the layer stacks and nothing else: no stored result or baked maps read, no strokes replayed, no
+    /// polygon fills laid, no graph cooked, no safety net. Strokes count as replayable (as with a replayer). For a
+    /// census of the layers an import locks and the placeholders it leaves; the project holds no pixels. Off by default.
+    pub translate_only: bool,
 }
 
 impl Default for ImportOptions {
@@ -40,6 +44,7 @@ impl Default for ImportOptions {
             max_resolution: None,
             replay_strokes: true,
             graphs: crate::GraphMode::Decompile,
+            translate_only: false,
         }
     }
 }
