@@ -7,10 +7,45 @@ use texturecraft_core::{BakedMap, BlockScales};
 /// A baked map's texels as they are held: floats, or 16-bit steps (`q / 65535`) when every value is exactly one, which
 /// halves the map and reads back the very same floats (most baked maps are written from 16-bit images; tangent-space
 /// normal maps usually are not, and stay floats).
+///
+/// A map opened from a project file can be [`Texels::lazy`]: read from the file when first needed, and let go again
+/// ([`Texels::release`]) while it is unchanged.
 #[derive(Clone, Debug)]
 pub enum Texels {
     F32(Vec<f32>),
     U16(Vec<u16>),
+    Lazy(LazyTexels),
+}
+
+/// Reads a baked map's values again (from the file it was opened from); `None` when they cannot be read any more.
+pub type TexelSource = std::sync::Arc<dyn Fn() -> Option<Vec<f32>> + Send + Sync>;
+
+/// See [`Texels::lazy`].
+#[derive(Clone)]
+pub struct LazyTexels {
+    len: usize,
+    held: std::sync::OnceLock<std::sync::Arc<Texels>>,
+    source: TexelSource,
+}
+
+impl std::fmt::Debug for LazyTexels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyTexels").field("len", &self.len).field("held", &self.held.get().is_some()).finish()
+    }
+}
+
+impl LazyTexels {
+    /// The values read now (16-bit steps where exact); zeros when they cannot be read or are not `len` values.
+    fn read(&self) -> Texels {
+        match (self.source)() {
+            Some(values) if values.len() == self.len => Texels::new(values),
+            _ => Texels::F32(vec![0.0; self.len]),
+        }
+    }
+
+    fn held(&self) -> &Texels {
+        self.held.get_or_init(|| std::sync::Arc::new(self.read()))
+    }
 }
 
 /// The 16-bit step `q` as a float (the one way it is read back, so the exactness check and the reads agree bit for bit).
@@ -47,10 +82,28 @@ impl Texels {
         Texels::U16(steps)
     }
 
+    /// `len` values that `source` reads when they are first needed.
+    pub fn lazy(len: usize, source: TexelSource) -> Texels {
+        Texels::Lazy(LazyTexels { len, held: std::sync::OnceLock::new(), source })
+    }
+
+    /// Lets go of the values of a lazy map; they are read again when next needed. Returns the bytes let go.
+    pub fn release(&mut self) -> usize {
+        match self {
+            Texels::Lazy(l) => {
+                let bytes = l.held.get().map_or(0, |h| h.bytes());
+                l.held = std::sync::OnceLock::new();
+                bytes
+            }
+            _ => 0,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Texels::F32(d) => d.len(),
             Texels::U16(d) => d.len(),
+            Texels::Lazy(l) => l.len,
         }
     }
 
@@ -63,6 +116,7 @@ impl Texels {
         match self {
             Texels::F32(d) => d.len() * 4,
             Texels::U16(d) => d.len() * 2,
+            Texels::Lazy(l) => l.held.get().map_or(0, |h| h.bytes()),
         }
     }
 
@@ -72,6 +126,7 @@ impl Texels {
         match self {
             Texels::F32(d) => d.get(i).copied(),
             Texels::U16(d) => d.get(i).map(|q| step(*q)),
+            Texels::Lazy(l) => l.held().get(i),
         }
     }
 
@@ -80,6 +135,7 @@ impl Texels {
         match self {
             Texels::F32(d) => Cow::Borrowed(d),
             Texels::U16(d) => Cow::Owned(d.iter().map(|q| step(*q)).collect()),
+            Texels::Lazy(l) => l.held().to_f32(),
         }
     }
 
@@ -87,6 +143,11 @@ impl Texels {
     pub fn try_for_chunks<E>(&self, n: usize, mut f: impl FnMut(&[f32]) -> Result<(), E>) -> Result<(), E> {
         match self {
             Texels::F32(d) => d.chunks(n.max(1)).try_for_each(f),
+            // read for the call and let go after when not held (what saving does)
+            Texels::Lazy(l) => match l.held.get() {
+                Some(h) => h.try_for_chunks(n, f),
+                None => l.read().try_for_chunks(n, f),
+            },
             Texels::U16(d) => {
                 let mut buf = Vec::with_capacity(n.max(1));
                 for c in d.chunks(n.max(1)) {
@@ -101,11 +162,16 @@ impl Texels {
 
     /// The values as floats, in order.
     pub fn iter(&self) -> impl Iterator<Item = f32> + '_ {
-        let (f, u) = match self {
-            Texels::F32(d) => (Some(d.iter().copied()), None),
-            Texels::U16(d) => (None, Some(d.iter().map(|q| step(*q)))),
+        let (f, u, l) = match self {
+            Texels::F32(d) => (Some(d.iter().copied()), None, None),
+            Texels::U16(d) => (None, Some(d.iter().map(|q| step(*q))), None),
+            Texels::Lazy(l) => (None, None, Some(l.held())),
         };
-        f.into_iter().flatten().chain(u.into_iter().flatten())
+        let inner: Box<dyn Iterator<Item = f32> + '_> = match l {
+            Some(h) => Box::new(h.iter()),
+            None => Box::new(std::iter::empty()),
+        };
+        f.into_iter().flatten().chain(u.into_iter().flatten()).chain(inner)
     }
 }
 
@@ -219,5 +285,43 @@ mod tests {
             assert_eq!(steps.sample(BakedMap::Position, x, y, (16, 8)), floats.sample(BakedMap::Position, x, y, (16, 8)));
         }
         assert_eq!(steps, floats);
+    }
+}
+
+#[cfg(test)]
+mod lazy_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn a_lazy_map_reads_when_needed_and_again_after_it_lets_go() {
+        let values: Vec<f32> = (0..300).map(|i| f32::from(i as u16 * 200) / 65535.0).collect();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (v, r) = (values.clone(), reads.clone());
+        let mut lazy = Texels::lazy(
+            values.len(),
+            Arc::new(move || {
+                r.fetch_add(1, Ordering::Relaxed);
+                Some(v.clone())
+            }),
+        );
+        assert_eq!((lazy.len(), lazy.bytes(), reads.load(Ordering::Relaxed)), (300, 0, 0));
+        let mut chunked = Vec::new();
+        lazy.try_for_chunks::<()>(64, |c| {
+            chunked.extend_from_slice(c);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(chunked, values);
+        assert_eq!(lazy.bytes(), 0, "saving does not keep it");
+        assert_eq!(lazy.get(7).map(f32::to_bits), Some(values[7].to_bits()));
+        assert_eq!(lazy.bytes(), 600, "held as 16-bit steps");
+        assert_eq!(lazy, Texels::F32(values.clone()));
+        assert_eq!(lazy.release(), 600);
+        assert_eq!(lazy.to_f32().as_ref(), values.as_slice());
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+        assert_eq!(Texels::lazy(4, Arc::new(|| None)).get(3), Some(0.0), "unreadable: zeros");
     }
 }
