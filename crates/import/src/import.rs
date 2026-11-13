@@ -272,6 +272,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     let count = binding.sets.len();
     // the finished sets' layer pixels, out of memory until the import returns
     let mut finished = crate::pixel_spill::PixelSpill::default();
+    let mut finished_baked = crate::pixel_spill::BakedSpill::default();
     for (i, source) in binding.sets.iter().enumerate() {
         hooks.check()?;
         let span = (0.1 + 0.8 * i as f32 / count as f32, 0.8 / count as f32);
@@ -301,11 +302,13 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         if i + 1 < count {
             imported.graphs.spill_cooks();
             finished.spill(&mut imported.pixels);
+            finished_baked.spill(&mut imported.baked);
         }
         // and its decoded images: a later set that uses one reads it again
         images.release();
     }
-    finished.restore(&mut imported.pixels).map_err(|e| ImportError::Invalid(format!("the finished texture sets' pixels could not be read back: {e}")))?;
+    // read from the spill file when needed (a save of the import writes them one by one)
+    finished.hand_over(&mut imported.pixels);
     for r in &binding.unused {
         report.add(
             format!("texture set \"{}\"", r.name),
