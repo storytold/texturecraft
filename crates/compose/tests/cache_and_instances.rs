@@ -573,3 +573,51 @@ fn gathering_filters_composite_identically_in_any_grouping_and_cached() {
         assert!(!check_cached(&f, 0, hot).is_empty());
     }
 }
+
+#[test]
+fn image_dependency_probe() {
+    use std::sync::Arc;
+    use std::time::Instant;
+    use texturecraft_compose::{ImageRes, ImageStore};
+
+    let mut f = fixture();
+    let hot = heavy_stack(&mut f);
+    let bottom = f.project.texture_sets[0].stack[0];
+    let LayerKind::Fill(fill) = &mut f.project.layer_mut(bottom).unwrap().kind else { panic!("expected fill") };
+    fill.sources.insert(Channel::Roughness, Source::Image { name: "used".into(), normal_format: Default::default() });
+    let image = |value| Arc::new(ImageRes { width: 1, height: 1, rgba: vec![[value; 4]], srgb: false });
+    let mut images = ImageStore::default();
+    let baked = Default::default();
+    let tiles = all_tiles(RES, RES);
+    let mut cache = BelowCache::default();
+    cache.set_hot(Some(hot));
+    let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), RES);
+    for stage in ["cold", "resolve", "unused1", "unused2", "unused3", "replace", "remove"] {
+        match stage {
+            "resolve" => {
+                images.insert("used".into(), image(1.0));
+            }
+            "replace" => {
+                images.insert("used".into(), image(0.4));
+            }
+            "remove" => {
+                images.remove("used");
+            }
+            "cold" => {}
+            _ => {
+                images.insert(stage.into(), image(0.5));
+            }
+        }
+        f.pixels.layer_mut(hot, Channel::BaseColor, (RES, RES)).set(5, 5, &[stage.len() as u16, 0, 0, u16::MAX]);
+        let inp = inputs(&f, 0, &images, &baked);
+        let start = Instant::now();
+        composite_tiles_cached(&inp, &mut out, &tiles[..1], Some(&mut cache));
+        let retained = cache.len() - 1;
+        composite_tiles_cached(&inp, &mut out, &tiles[1..], Some(&mut cache));
+        println!("{stage}: {:?}, retained other tiles {retained}", start.elapsed());
+        assert_eq!(retained, if stage.starts_with("unused") { tiles.len() - 1 } else { 0 }, "{stage}");
+        let mut expected = Composite::new(&f.project.texture_sets[0].channel_list(), RES);
+        composite_tiles(&inp, &mut expected, &tiles);
+        assert!(out == expected, "{stage}");
+    }
+}

@@ -576,15 +576,34 @@ impl Session {
     pub(crate) fn invalidate_changed(&mut self, other: &Document) {
         self.follow_uv_layouts(&other.project);
         self.sync_caches();
-        let resources = |d: &Document| d.resources.iter().map(|(n, b)| (n.clone(), Arc::as_ptr(b))).collect::<Vec<_>>();
-        let all = resources(other) != resources(&self.doc);
+        // Retain broad invalidation on removal or replacement. A newly added resource
+        // can also satisfy an existing, previously unresolved image reference.
+        let all = other.resources.iter().any(|(name, old)| !self.doc.resources.get(name).is_some_and(|new| Arc::ptr_eq(old, new)));
+        let added: BTreeSet<_> = self.doc.resources.keys().filter(|name| !other.resources.contains_key(*name)).collect();
+        let uses_added = |ts: usize| {
+            use texturecraft_core::{EffectKind, Fill, Source};
+            let uses_source = |src: &Source| matches!(src, Source::Image { name, .. } if added.contains(name));
+            let uses_fill = |f: &Fill| f.sources.values().any(uses_source) || f.link.as_ref().is_some_and(|l| added.contains(&l.package));
+            let project = &self.doc.project;
+            !added.is_empty()
+                && project.texture_sets.get(ts).is_some_and(|set| {
+                    project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)).any(|layer| {
+                        matches!(&layer.kind, LayerKind::Fill(f) if uses_fill(f))
+                            || layer.mask.iter().flat_map(|m| &m.effects).chain(&layer.content_effects).any(|e| match &e.kind {
+                                EffectKind::Fill { source, .. } => uses_source(source),
+                                EffectKind::Material(f) => uses_fill(f),
+                                _ => false,
+                            })
+                    })
+                })
+        };
         let (empty, images) = (BakedMaps::default(), Default::default());
         let key = |d: &Document, ts: usize| {
             let stack = d.project.texture_sets.get(ts).map(|s| s.stack.as_slice()).unwrap_or_default();
             StackKey::new(&d.project, &d.pixels, d.baked.get(&ts).unwrap_or(&empty), &images, ts, stack)
         };
         for ts in 0..self.caches.len() {
-            if (all || key(other, ts) != key(&self.doc, ts))
+            if (all || key(other, ts) != key(&self.doc, ts) || uses_added(ts))
                 && let Some(c) = self.caches.get_mut(ts)
             {
                 c.invalidate_all();

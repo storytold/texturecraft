@@ -10,11 +10,11 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use texturecraft_core::project::MAX_DEPTH;
-use texturecraft_core::{BakedMap, Channel, Layer, LayerId, LayerKind, Project, TextureSet};
+use texturecraft_core::{BakedMap, Channel, EffectKind, Layer, LayerId, LayerKind, Project, Source, TextureSet};
 use texturecraft_texel::TileImage;
 
 use crate::eval::{Inputs, PaintTarget};
-use crate::store::{BakedMaps, ImageStore, PixelStore};
+use crate::store::{BakedMaps, ImageRes, ImageStore, PixelStore};
 
 /// Default byte budget of a [`BelowCache`], per nesting level it holds (see
 /// [`BelowCache::limit`]).
@@ -78,7 +78,7 @@ pub struct StackKey {
     layers: Vec<Layer>,
     pixels: Vec<(LayerId, Option<Channel>, Shared)>,
     baked: (u32, Vec<(BakedMap, usize)>),
-    images: Vec<(String, usize)>,
+    images: Vec<(String, ImageIdentity)>,
 }
 
 impl StackKey {
@@ -111,8 +111,29 @@ impl StackKey {
                 layer.chain(pixels.masks.get(id).map(|img| (*id, None, Shared(img.clone()))))
             })
             .collect();
-        let mut images: Vec<(String, usize)> = images.iter().map(|(n, i)| (n.clone(), Arc::as_ptr(i) as usize)).collect();
-        images.sort();
+        let mut names = BTreeSet::new();
+        if !images.is_empty() {
+            let mut record = |source: &Source| {
+                if let Source::Image { name, .. } = source
+                    && let Some((name, _)) = images.get_key_value(name)
+                {
+                    names.insert(name);
+                }
+            };
+            for layer in tree.iter().filter_map(|id| project.layers.get(id)) {
+                if let LayerKind::Fill(fill) = &layer.kind {
+                    fill.sources.values().for_each(&mut record);
+                }
+                for effect in layer.mask.iter().flat_map(|m| &m.effects).chain(&layer.content_effects) {
+                    match &effect.kind {
+                        EffectKind::Fill { source, .. } => record(source),
+                        EffectKind::Material(fill) => fill.sources.values().for_each(&mut record),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let images = names.into_iter().map(|name| (name.clone(), ImageIdentity(Arc::downgrade(&images[name])))).collect();
         Some(StackKey {
             set,
             roots,
@@ -121,6 +142,16 @@ impl StackKey {
             baked: (baked.resolution, baked.maps.iter().map(|(m, d)| (*m, Arc::as_ptr(d) as usize)).collect()),
             images,
         })
+    }
+}
+
+// Keep the allocation identity stable even when an image is removed between composites.
+#[derive(Debug)]
+struct ImageIdentity(std::sync::Weak<ImageRes>);
+
+impl PartialEq for ImageIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
     }
 }
 
