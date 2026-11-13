@@ -4089,8 +4089,20 @@ mod output_size_tests {
 }
 
 /// The kinds [`compute_grey`] can compute on one channel.
-const GREY_KINDS: &[&str] =
-    &["pixel_processor", "transform_matrix", "blend", "levels_mid", "box_blur", "line_blur", "dir_warp", "grad_warp", "grayscale_conversion", "output", "dot"];
+const GREY_KINDS: &[&str] = &[
+    "pixel_processor",
+    "transform_matrix",
+    "blend",
+    "levels_mid",
+    "box_blur",
+    "line_blur",
+    "dir_warp",
+    "grad_warp",
+    "grayscale_conversion",
+    "output",
+    "dot",
+    "pattern_program",
+];
 
 /// Node `n` computed on one channel, when all its inputs are grey and what it does to them keeps them grey bit for bit
 /// (the same arithmetic on each colour channel, alpha staying exactly 1). `None`: computed in RGBA.
@@ -4150,6 +4162,32 @@ fn compute_grey(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx, steps
             }
             _ => None,
         },
+        // a grey fx-map on a grey background (or none) draws on a grey canvas
+        "pattern_program" if n.nums.get("color").copied().unwrap_or(0.0) <= 0.5 => {
+            let bg = match ins.get("bg") {
+                Some(v) => match v.grey_in() {
+                    Some(g) => Some((g.floats().into_owned(), g.alpha())),
+                    None => return Ok(None),
+                },
+                None => None,
+            };
+            let name = n.strs.get("program").cloned().unwrap_or_default();
+            let Some(program) = ctx.lib.get(&name) else { return Ok(None) };
+            // the images it draws, by position (a missing one leaves a gap), as RGBA
+            let held: Vec<(usize, Rc<Tex>)> = IMAGE_SLOTS.iter().enumerate().filter_map(|(k, slot)| ins.get(*slot).map(|v| (k, v.tex()))).collect();
+            let mut images: Vec<&Tex> = Vec::new();
+            for (k, t) in &held {
+                images.resize(*k, t.as_ref());
+                images.push(t.as_ref());
+            }
+            let pctx = crate::patterns::Context { lib: ctx.lib, size: [s, hs], graph_inputs: ctx.gin, seed: ctx.so, graph: ctx.graph };
+            let seed = f("seed", 0.0) as u32;
+            match crate::patterns::render_grey(program, &pctx, seed, &images, bg.as_ref().map(|(t, a)| (t, *a)), crate::atomic::pattern_frame(n)) {
+                Ok(Some((t, a))) => Some(Computed::Grey(after_compute(t, n, s, hs), a)),
+                // (an error is the RGBA form's to report)
+                Ok(None) | Err(_) => None,
+            }
+        }
         // passed on as it is, held: no copy
         "output" | "dot" => match ins.get("in") {
             Some(v) if v.dims() == (s, hs) && !rolls(n) => Some(Computed::Held(v.clone())),
@@ -4422,6 +4460,31 @@ mod grey_tests {
             }
         });
         assert!(n > 50, "{n} grey runs");
+    }
+
+    #[test]
+    fn pattern_program_grey_is_rgba() {
+        let progs = [
+            "node 1 pp_quadrant pattern=0 draws=1 size_x=0.3 size_y=0.3 luminance=0.6\nnode 2 pp_quadrant draws=0 q0=@1 q3=@1\nnode 3 pp_out in=@2\n",
+            "node 1 pp_quadrant pattern=3 draws=1 max=1 size_x=0.7 size_y=0.4\nnode 2 pp_quadrant draws=0 q0=@1 q1=@1 q2=@1\nnode 3 pp_out in=@2\n",
+            "node 1 pp_quadrant pattern=0 draws=1 image=1 image_filter=1 size_x=0.5 size_y=0.5\nnode 2 pp_out in=@1\n",
+        ];
+        let n = greys(|| {
+            for prog in progs {
+                for set in
+                    ["", " bg=@2", " background=0.3 roughness=0.4", " bg=@7 opacity=0.5", " background_r=0.2 background_g=0.2 background_b=0.2", " tile_x=0"]
+                {
+                    for fmt in ["", " ofmt=6"] {
+                        same_once(
+                            &format!("subgraph p\nmeta kind \"patterns\"\n{prog}end\nnode 10 pattern_program program=\"p\" in=@1{set}{fmt}\noutput out 10\n"),
+                            32,
+                            true,
+                        );
+                    }
+                }
+            }
+        });
+        assert!(n > 20, "{n} grey runs");
     }
 
     #[test]

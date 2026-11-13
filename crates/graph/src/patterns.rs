@@ -112,10 +112,54 @@ struct Cell {
     h: f32,
 }
 
+/// What a pattern program draws on: RGBA, or grey (a grey fx-map on a grey background: every instance adds to or keeps
+/// the larger of the three colour channels alike and leaves the alpha alone, so one channel and the alpha hold it all).
+pub enum Canvas {
+    Rgba(Tex),
+    /// grey values and their alpha
+    Grey(crate::tex::Grey, f32),
+}
+
+impl Canvas {
+    fn dims(&self) -> (usize, usize) {
+        match self {
+            Canvas::Rgba(t) => (t.w, t.h),
+            Canvas::Grey(t, _) => (t.w, t.h),
+        }
+    }
+
+    /// One instance onto pixel `i` ([`blend`]).
+    #[inline]
+    fn draw(&mut self, i: usize, value: [f32; 4], brightness: [f32; 4], keep_larger: bool, color: bool) {
+        match self {
+            Canvas::Rgba(t) => {
+                if let Some(p) = t.px.get_mut(i) {
+                    blend(p, value, brightness, keep_larger, color);
+                }
+            }
+            // (grey only when the fx-map isn't in colour)
+            Canvas::Grey(t, _) => {
+                if let Some(p) = t.px.get_mut(i) {
+                    let v = value[0] * brightness[0];
+                    *p = if keep_larger { p.max(v) } else { *p + v };
+                }
+            }
+        }
+    }
+
+    /// As an RGBA image.
+    pub fn into_tex(self) -> Tex {
+        match self {
+            Canvas::Rgba(t) => t,
+            Canvas::Grey(t, a) => t.expand(a),
+        }
+    }
+}
+
 struct Walk<'a> {
     g: &'a Graph,
     ctx: &'a Context<'a>,
-    canvas: Tex,
+    canvas: Canvas,
     state: FnState,
     progs: BTreeMap<String, (Prog, FnFrame)>,
     seed: u32,
@@ -250,7 +294,11 @@ impl Walk<'_> {
         };
         if let Some(bg) = scalar(self.function_value(node, "background")?) {
             let bg = bg.clamp(0.0, 1.0);
-            self.canvas = Tex::solid(self.canvas.w, self.canvas.h, [bg, bg, bg, 1.0]);
+            let (w, h) = self.canvas.dims();
+            self.canvas = match self.canvas {
+                Canvas::Rgba(_) => Canvas::Rgba(Tex::solid(w, h, [bg, bg, bg, 1.0])),
+                Canvas::Grey(..) => Canvas::Grey(crate::tex::Grey::solid(w, h, bg), 1.0),
+            };
         }
         if let Some(r) = scalar(self.function_value(node, "roughness")?) {
             self.levels = depth_levels(r, self.tree_depth);
@@ -369,7 +417,7 @@ impl Walk<'_> {
         let (cx, cy) = (cell.x + off[0], cell.y + off[1]);
         // half the pattern's box, signed: a negative size flips it
         let (hw, hh) = (size[0] * cell.w * 0.5, size[1] * cell.h * 0.5);
-        let (cw, ch) = (self.canvas.w as i64, self.canvas.h as i64);
+        let (cw, ch) = (self.canvas.dims().0 as i64, self.canvas.dims().1 as i64);
         let rad = (hw * hw + hh * hh).sqrt();
         if rad <= 0.0 || !rad.is_finite() || !cx.is_finite() || !cy.is_finite() || hw == 0.0 || hh == 0.0 {
             return;
@@ -439,9 +487,7 @@ impl Walk<'_> {
                     for j in ky.clone() {
                         for i in kx.clone() {
                             let Some(a) = sample(px + i as f32 * px_, py + j as f32 * py_) else { continue };
-                            if let Some(d) = self.canvas.px.get_mut((y * cw + x) as usize) {
-                                blend(d, a, brightness, keep_larger, color);
-                            }
+                            self.canvas.draw((y * cw + x) as usize, a, brightness, keep_larger, color);
                         }
                     }
                 }
@@ -465,9 +511,7 @@ impl Walk<'_> {
             for x in x0..=x1 {
                 let Some(a) = sample((x as f32 + 0.5) / cw as f32, (y as f32 + 0.5) / ch as f32) else { continue };
                 let i = (y.rem_euclid(ch) * cw + x.rem_euclid(cw)) as usize;
-                if let Some(p) = self.canvas.px.get_mut(i) {
-                    blend(p, a, brightness, keep_larger, color);
-                }
+                self.canvas.draw(i, a, brightness, keep_larger, color);
             }
         }
     }
@@ -632,21 +676,57 @@ pub(crate) fn shape(kind: i32, x: f32, y: f32, variation: f32) -> Option<f32> {
 
 /// Run `program` on a canvas of the context's size.
 pub fn render(program: &Graph, ctx: &Context<'_>, seed: u32, images: &[&Tex], background: Option<&Tex>, frame: Frame) -> Result<Tex, String> {
+    let [w, h] = ctx.size;
+    let bg = frame.background.clamp(0.0, 1.0);
+    let canvas = Canvas::Rgba(match background {
+        // an image to draw on, read once per pixel as any other input of another size
+        Some(t) if (t.w, t.h) == (w, h) => t.clone(),
+        Some(t) => Tex::from_fn(w, h, |u, v| crate::atomic::sample_stepped(t, u, v)),
+        None => Tex::solid(w, h, frame.background_color.unwrap_or([bg, bg, bg, 1.0])),
+    });
+    Ok(render_on(program, ctx, seed, images, canvas, frame)?.into_tex())
+}
+
+/// [`render`] of a grey fx-map (not in colour) on a grey background (`background`: an image of alpha `alpha`, or none):
+/// grey, the same values. `None` where it can't be: in colour, or a background colour that isn't grey.
+pub(crate) fn render_grey(
+    program: &Graph,
+    ctx: &Context<'_>,
+    seed: u32,
+    images: &[&Tex],
+    background: Option<(&crate::tex::Grey, f32)>,
+    frame: Frame,
+) -> Result<Option<(crate::tex::Grey, f32)>, String> {
+    if frame.color {
+        return Ok(None);
+    }
+    let [w, h] = ctx.size;
+    let bg = frame.background.clamp(0.0, 1.0);
+    let canvas = match background {
+        Some((t, a)) if (t.w, t.h) == (w, h) => Canvas::Grey(t.clone(), a),
+        Some((t, a)) => Canvas::Grey(crate::tex::Grey::from_fn(w, h, |u, v| crate::atomic::sample_stepped(t, u, v)), a),
+        None => match frame.background_color.unwrap_or([bg, bg, bg, 1.0]) {
+            c if c[0].to_bits() == c[1].to_bits() && c[1].to_bits() == c[2].to_bits() && crate::tex::grey_alpha_ok(c[3]) => {
+                Canvas::Grey(crate::tex::Grey::solid(w, h, c[0]), c[3])
+            }
+            _ => return Ok(None),
+        },
+    };
+    Ok(match render_on(program, ctx, seed, images, canvas, frame)? {
+        Canvas::Grey(t, a) => Some((t, a)),
+        Canvas::Rgba(_) => None,
+    })
+}
+
+fn render_on(program: &Graph, ctx: &Context<'_>, seed: u32, images: &[&Tex], canvas: Canvas, frame: Frame) -> Result<Canvas, String> {
     let roots: Vec<u32> = program.nodes.iter().filter(|(_, n)| n.kind == "pp_out").map(|(i, _)| *i).collect();
     let [root] = roots.as_slice() else { return Err("a pattern program needs exactly one pp_out node".into()) };
     program.check_cycles().map_err(|e| e.to_string())?;
-    let [w, h] = ctx.size;
     let depth = tree_depth(program, *root, &mut BTreeMap::new(), 0).max(0) as u32;
-    let bg = frame.background.clamp(0.0, 1.0);
     let mut walk = Walk {
         g: program,
         ctx,
-        canvas: match background {
-            // an image to draw on, read once per pixel as any other input of another size
-            Some(t) if (t.w, t.h) == (w, h) => t.clone(),
-            Some(t) => Tex::from_fn(w, h, |u, v| crate::atomic::sample_stepped(t, u, v)),
-            None => Tex::solid(w, h, frame.background_color.unwrap_or([bg, bg, bg, 1.0])),
-        },
+        canvas,
         state: FnState::default(),
         progs: BTreeMap::new(),
         mips: BTreeMap::new(),
@@ -667,10 +747,15 @@ pub fn render(program: &Graph, ctx: &Context<'_>, seed: u32, images: &[&Tex], ba
     };
     walk.visit(*root, Cell { x: 0.5, y: 0.5, w: 1.0, h: 1.0 }, 0, 0)?;
     let mut out = walk.canvas;
-    for p in &mut out.px {
-        for c in p.iter_mut().take(3) {
-            *c = c.clamp(0.0, 1.0);
+    match &mut out {
+        Canvas::Rgba(t) => {
+            for p in &mut t.px {
+                for c in p.iter_mut().take(3) {
+                    *c = c.clamp(0.0, 1.0);
+                }
+            }
         }
+        Canvas::Grey(t, _) => t.px.iter_mut().for_each(|c| *c = c.clamp(0.0, 1.0)),
     }
     Ok(out)
 }

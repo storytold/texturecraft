@@ -177,24 +177,29 @@ pub fn compute(kind: &str, id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, c
                     images.push(t.as_ref());
                 }
             }
-            let frame = crate::patterns::Frame {
-                background: f("background", 0.0),
-                roughness: f("roughness", 1.0),
-                opacity: f("opacity", 1.0),
-                region: [f("frame_x0", 0.0), f("frame_x1", 1.0), f("frame_y0", 0.0), f("frame_y1", 1.0)],
-                tile: [f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5],
-                repeat: [f("repeat_x0", 0.0), f("repeat_x1", 1.0), f("repeat_y0", 0.0), f("repeat_y1", 1.0)],
-                color: f("color", 0.0) > 0.5,
-                background_color: n
-                    .nums
-                    .contains_key("background_r")
-                    .then(|| [f("background_r", 0.0), f("background_g", 0.0), f("background_b", 0.0), f("background_a", 1.0)]),
-            };
-            crate::patterns::render(program, ctx, f("seed", 0.0) as u32, &images, ins.get("bg").map(|t| t.as_ref()), frame)
+            crate::patterns::render(program, ctx, f("seed", 0.0) as u32, &images, ins.get("bg").map(|t| t.as_ref()), pattern_frame(n))
                 .map_err(|e| Error::BadParam(id, e))?
         }
         other => return crate::compiled_ops::compute(other, id, n, ins, ctx.size),
     }))
+}
+
+/// A `pattern_program` node's frame.
+pub(crate) fn pattern_frame(n: &Node) -> crate::patterns::Frame {
+    let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
+    crate::patterns::Frame {
+        background: f("background", 0.0),
+        roughness: f("roughness", 1.0),
+        opacity: f("opacity", 1.0),
+        region: [f("frame_x0", 0.0), f("frame_x1", 1.0), f("frame_y0", 0.0), f("frame_y1", 1.0)],
+        tile: [f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5],
+        repeat: [f("repeat_x0", 0.0), f("repeat_x1", 1.0), f("repeat_y0", 0.0), f("repeat_y1", 1.0)],
+        color: f("color", 0.0) > 0.5,
+        background_color: n
+            .nums
+            .contains_key("background_r")
+            .then(|| [f("background_r", 0.0), f("background_g", 0.0), f("background_b", 0.0), f("background_a", 1.0)]),
+    }
 }
 
 /// A `box_blur` node on an image of pixels `P`.
