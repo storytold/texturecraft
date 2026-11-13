@@ -221,6 +221,49 @@ mod tests {
         assert!(!worker.is_stopped());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn user_smart_material_files_render_and_anything_else_gets_none() {
+        use texturecraft_engine::geom::primitives;
+        use texturecraft_engine::{Session, materials};
+
+        let folder = std::env::temp_dir().join(format!("tc-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut source = Session::new_project("Source", primitives::sphere(1.0, 16, 8), "builtin:sphere", None, 128).unwrap();
+        let group = materials::apply(&mut source, "steel_painted_worn").unwrap();
+        let saved = source.smart_material_bytes(group, "My steel").unwrap();
+        let (steel, junk, renamed, missing) = (folder.join("steel.tcmat"), folder.join("junk.tcmat"), folder.join("steel.png"), folder.join("gone.tcmat"));
+        std::fs::write(&steel, &saved).unwrap();
+        std::fs::write(&junk, b"not a smart material").unwrap();
+        std::fs::write(&renamed, &saved).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut worker = PreviewWorker::default();
+        let size_px = 32;
+        let requests = [("steel", steel), ("junk", junk), ("other extension", renamed), ("missing", missing)];
+        let requests_sent = requests.len();
+        for (key, path) in requests {
+            let request = PreviewRequest { key: key.into(), preview: ShelfPreview::UserMaterial(path), size_px, hover: false };
+            assert!(worker.request(&ctx, request), "{key}");
+        }
+
+        let mut answers = HashMap::new();
+        let start = Instant::now();
+        while answers.len() < requests_sent && start.elapsed() < Duration::from_secs(120) {
+            answers.extend(worker.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let image = answers.get("steel").and_then(Option::as_ref).unwrap_or_else(|| panic!("steel: {answers:?}"));
+        assert_eq!(image.size, [size_px, size_px]);
+        for key in ["junk", "other extension", "missing"] {
+            assert!(matches!(answers.get(key), Some(None)), "{key}: {answers:?}");
+        }
+        assert!(!worker.is_stopped());
+
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
     #[test]
     fn the_newest_hover_preview_goes_first_then_the_oldest_request() {
         let request = |key: &str, hover| PreviewRequest { key: key.into(), preview: ShelfPreview::Material("steel"), size_px: 8, hover };

@@ -103,13 +103,26 @@ impl OrbPreview {
     /// Row-major `size²` pixels of built-in material `id`, with None outside the shape
     /// Returns None for unknown materials or sizes outside 1..=[`MAX_PREVIEW_SIZE_PX`]
     pub fn material(&mut self, id: &str, size: usize) -> Option<Vec<Option<MaterialPreviewPixel>>> {
+        self.render_material(size, |session| materials::apply(session, id))
+    }
+
+    /// Row-major `size²` pixels of the user smart material saved in `bytes` (a `.tcmat` file), with None outside the shape
+    /// Returns None for files that are not smart materials or sizes outside 1..=[`MAX_PREVIEW_SIZE_PX`]
+    pub fn material_from_bytes(&mut self, bytes: &[u8], size: usize) -> Option<Vec<Option<MaterialPreviewPixel>>> {
+        self.render_material(size, |session| session.add_smart_material_bytes(bytes))
+    }
+
+    /// Put the material that `apply` adds on the bare orb and read it back
+    fn render_material(&mut self, size: usize, apply: impl FnOnce(&mut Session) -> Result<LayerId>) -> Option<Vec<Option<MaterialPreviewPixel>>> {
         if !valid_size(size) {
             return None;
         }
 
         // Each material goes on the bare shape, not over the previous one
         (self.session.doc, self.session.selected) = self.bare.clone();
-        let applied = materials::apply(&mut self.session, id);
+        // Images decoded for the previous material must not stand in for this one's resources of the same name
+        self.session.images.clear();
+        let applied = apply(&mut self.session);
         // Previews need no undo history; retaining snapshots grows memory across materials
         self.session.undo.clear();
         applied.ok()?;
@@ -293,5 +306,59 @@ mod tests {
         // Each material starts from the bare orb: rendering another one in between changes nothing
         preview.material("iron_rusted", size).unwrap();
         assert_eq!(preview.material("steel_painted_worn", size).unwrap(), worn);
+    }
+
+    /// The `.tcmat` bytes of a one-layer smart material that fills with a solid `color` image named `tex.png`
+    fn solid_image_material(color: [u8; 3]) -> Vec<u8> {
+        let mut source = Session::new_project("Source", primitives::sphere(1.0, 16, 8), "builtin:sphere", None, 128).unwrap();
+        let mut png = Vec::new();
+        let image = image::RgbaImage::from_fn(8, 8, |_, _| image::Rgba([color[0], color[1], color[2], 255]));
+        image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let name = source.import_resource_bytes("tex.png", png).unwrap();
+        let layer = crate::execute(&mut source, "layer.add.image", &json!({ "name": name })).unwrap()["layer"].as_u64().unwrap();
+        source.smart_material_bytes(LayerId(layer), "Solid").unwrap()
+    }
+
+    /// Mean base color over the pixels a preview sees
+    fn mean_base(pixels: &[Option<MaterialPreviewPixel>]) -> [f32; 3] {
+        let seen = pixels.iter().flatten().count().max(1) as f32;
+        [0, 1, 2].map(|component| pixels.iter().flatten().map(|pixel| pixel.sample.base[component]).sum::<f32>() / seen)
+    }
+
+    #[test]
+    fn user_smart_materials_render_from_their_file_and_other_bytes_are_rejected() {
+        let size = 24;
+        let mut preview = OrbPreview::new().unwrap();
+        let mut source = Session::new_project("Source", primitives::sphere(1.0, 16, 8), "builtin:sphere", None, 128).unwrap();
+        let group = materials::apply(&mut source, "steel_painted_worn").unwrap();
+        let bytes = source.smart_material_bytes(group, "My steel").unwrap();
+
+        // A saved smart material looks like the built-in one it was saved from
+        let saved = preview.material_from_bytes(&bytes, size).unwrap();
+        assert_eq!(saved.len(), size * size);
+        assert!(saved[0].is_none(), "the corners are outside the shape");
+        assert_eq!(saved, preview.material("steel_painted_worn", size).unwrap());
+
+        // Anything else gets no preview, and sizes outside the camera's limits are refused
+        for junk in [b"junk".as_slice(), &[]] {
+            assert!(preview.material_from_bytes(junk, size).is_none());
+        }
+        assert!(preview.material_from_bytes(&bytes, 0).is_none());
+        assert!(preview.material_from_bytes(&bytes, MAX_PREVIEW_SIZE_PX + 1).is_none());
+
+        // A refused file leaves the orb bare for the next one
+        assert_eq!(preview.material_from_bytes(&bytes, size).unwrap(), saved);
+    }
+
+    #[test]
+    fn user_smart_materials_do_not_borrow_each_others_images_of_the_same_name() {
+        let size = 24;
+        let mut preview = OrbPreview::new().unwrap();
+        let (red, green) = (solid_image_material([255, 0, 0]), solid_image_material([0, 255, 0]));
+
+        let red_orb = mean_base(&preview.material_from_bytes(&red, size).unwrap());
+        let green_orb = mean_base(&preview.material_from_bytes(&green, size).unwrap());
+        assert!(red_orb[0] > 0.8 && red_orb[1] < 0.2, "red material: {red_orb:?}");
+        assert!(green_orb[1] > 0.8 && green_orb[0] < 0.2, "green material after the red one: {green_orb:?}");
     }
 }
