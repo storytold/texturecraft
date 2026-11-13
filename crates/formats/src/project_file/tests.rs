@@ -711,9 +711,9 @@ fn project_open_limit_counts_every_loaded_entry_kind() {
         let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
         let total_bytes: u64 = (0..archive.len()).map(|index| archive.by_index(index).unwrap().size()).sum();
 
-        let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes)).unwrap();
-        let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1)).unwrap_err();
-        let raised_limit = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes + 1)).unwrap();
+        let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes), None).unwrap();
+        let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1), None).unwrap_err();
+        let raised_limit = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes + 1), None).unwrap();
 
         assert!(matches!(error, FormatError::TooLarge(_)), "{name}: {error}");
         assert!(error.to_string().contains(&format!("{} bytes", total_bytes - 1)), "{name}: {error}");
@@ -728,8 +728,8 @@ fn project_open_limit_is_shared_across_the_whole_archive() {
     let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
     let total_bytes: u64 = (0..archive.len()).map(|index| archive.by_index(index).unwrap().size()).sum();
 
-    let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes)).unwrap();
-    let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1)).unwrap_err();
+    let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes), None).unwrap();
+    let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1), None).unwrap_err();
 
     assert_same(&project, &accepted);
     assert!(matches!(error, FormatError::TooLarge(_)), "{error}");
@@ -1005,6 +1005,29 @@ fn graph_sample() -> (ProjectFile, String) {
     pf.graphs.insert_cooked(texturecraft_core::StableHash::of(b"unused cook").key(), Cooked::from_textures(BTreeMap::new(), Default::default()));
     pf.graphs.set_uses([(GraphUse { set: 0, id, channel: Some(Channel::Roughness) }, key.clone())].into());
     (pf, key)
+}
+
+#[test]
+fn a_project_opened_from_its_file_reads_cooks_when_they_are_needed() {
+    let (pf, key) = graph_sample();
+    let dir = std::env::temp_dir().join(format!("tc-formats-lazy-cooks-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("lazy.tcraft");
+    save_project(&path, &pf).unwrap();
+    let back = load_project(&path).unwrap();
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+    assert_eq!(back.graphs.held_bytes(), 0, "no cook is held after opening");
+    assert_eq!(back.graphs.used_cook_keys(), vec![key.clone()]);
+    assert_eq!(*back.graphs.cooked(&key).unwrap(), *pf.graphs.cooked(&key).unwrap(), "read from the file as it was saved");
+    // saved again (over itself and elsewhere) it holds the same cooks, byte for byte
+    let bytes = save_project_bytes(&pf).unwrap();
+    assert_eq!(save_project_bytes(&back).unwrap(), bytes);
+    save_project(&path, &back).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(*back.graphs.cooked(&key).unwrap(), *pf.graphs.cooked(&key).unwrap(), "still read after the save over the file");
+    // without the file the cook is not there (it is rendered again when it is needed)
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(back.graphs.cooked(&key).is_none());
 }
 
 #[test]

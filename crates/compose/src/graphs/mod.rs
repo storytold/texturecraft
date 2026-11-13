@@ -542,6 +542,33 @@ impl GraphStore {
         moved
     }
 
+    /// The cooks `source` holds (their outlines by key) are read from it when something needs them, instead of being
+    /// held from the start: what a document opened from a project file does with the file's cooks.
+    pub fn read_cooks_from(&self, source: Arc<dyn spill::CookSource>, outlines: HashMap<String, spill::CookOutline>) {
+        self.cooks.spilled.set_source(source, outlines);
+    }
+
+    /// Bytes of the cooks held in memory.
+    pub fn held_bytes(&self) -> usize {
+        self.cooks.cooks.values().into_iter().filter_map(|(_, v)| v.ok()).map(|c| c.bytes()).sum()
+    }
+
+    /// When the cooks held in memory take more than `limit` bytes, lets go of those that can be read again (spilled,
+    /// or kept by the project file); they come back when a composite or a save needs them. Returns how many went.
+    pub fn release_reloadable(&self, limit: usize) -> usize {
+        if self.held_bytes() <= limit {
+            return 0;
+        }
+        let mut gone = 0;
+        for (key, held) in self.cooks.cooks.values() {
+            if held.is_ok() && self.cooks.spilled.outline(&key).is_some() {
+                self.cooks.cooks.remove(&key);
+                gone += 1;
+            }
+        }
+        gone
+    }
+
     /// The keys of the cooks the uses read that are held or spilled (what a project file saves), sorted.
     pub fn used_cook_keys(&self) -> Vec<String> {
         let keys: BTreeSet<String> = self.uses().into_values().collect();

@@ -379,6 +379,8 @@ pub struct Session {
     pub export_presets: crate::preset_cmds::UserPresets,
     /// The user's project templates (kept when another project opens).
     pub templates: crate::template_cmds::UserTemplates,
+    /// The texture set that composited last (another one starting is when cooks held beyond their budget go).
+    pub(crate) last_composited: Option<usize>,
 }
 
 impl Session {
@@ -430,6 +432,7 @@ impl Session {
             polygon_fill_drag: None,
             export_presets: Default::default(),
             templates: Default::default(),
+            last_composited: None,
         })
     }
 
@@ -833,6 +836,11 @@ impl Session {
             // room for this set's caches before it composites
             if self.caches.get(ts).is_some_and(|c| !c.dirty.is_empty()) {
                 self.trim_set_caches(Some(ts));
+                // and for its cooks: those the project file keeps come back from it when a set needs them again
+                if self.last_composited.is_some_and(|last| last != ts) {
+                    self.doc.graphs.release_reloadable(COOK_BUDGET);
+                }
+                self.last_composited = Some(ts);
             }
             let Some(cache) = self.caches.get_mut(ts) else { continue };
             cache.below.set_hot(hot);
@@ -1014,6 +1022,9 @@ const CHUNK: usize = 256;
 /// Bytes the texture sets of a document may hold together in recompositing caches (see `Session::trim_set_caches`);
 /// one set's whole-set fields alone may reach this ([`texturecraft_compose::FIELD_BUDGET`]).
 pub const SET_CACHE_BUDGET: usize = 2 << 30;
+/// Bytes of graph cooks a document holds before those that can be read again are let go when another texture set
+/// starts compositing (`GraphStore::release_reloadable`).
+pub const COOK_BUDGET: usize = 512 << 20;
 /// The most a budgeted update spends on settling tiles (what they show is already right).
 pub const SETTLE_BUDGET_MS: f64 = 6.0;
 

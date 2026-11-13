@@ -337,7 +337,7 @@ struct CookIndex {
     uses: Vec<(GraphUse, String)>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
 struct CookEntry {
     outputs: BTreeMap<String, String>,
     #[serde(default)]
@@ -426,10 +426,13 @@ pub fn load_project_bytes(bytes: &[u8]) -> Result<ProjectFile> {
     crate::guard(KIND, || load(Cursor::new(bytes)))
 }
 
+/// The project in the file at `path`. Its cooked graph results are not read now: the project's graph store reads each
+/// from the file when a composite or a save needs it (see [`FileCooks`]), so a large project does not hold them all.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_project(path: &std::path::Path) -> Result<ProjectFile> {
     let file = std::fs::File::open(path)?;
-    crate::guard(KIND, || load(std::io::BufReader::new(file)))
+    let limit_bytes = u64::from(project_open_limit_gib()) << 30;
+    crate::guard(KIND, || load_with_budget(std::io::BufReader::new(file), LoadBudget::new(limit_bytes), Some(path)))
 }
 
 fn read_all(reader: &mut impl Read, cap: u64, budget: &mut LoadBudget, what: &str) -> Result<Vec<u8>> {
@@ -552,53 +555,103 @@ fn read_baked(reader: &mut impl Read, declared_bytes: u64, components: usize, bu
     Ok((width, height, data))
 }
 
+/// One cook of the index read whole from the archive, or `None` when an output is missing or malformed.
+fn read_cook<R: Read + Seek>(zip: &mut ZipArchive<R>, entry: &CookEntry, budget: &mut LoadBudget) -> Option<Cooked> {
+    let mut outputs = BTreeMap::new();
+    for (output, file) in &entry.outputs {
+        let (w, h, comps, _) = cook_output_head(zip, file).ok()?;
+        let mut f = zip.by_name(file).ok()?;
+        outputs.insert(output.clone(), read_tiles(&mut f, (w, h), comps, budget, file).ok()?);
+    }
+    let linear = entry.linear.iter().filter(|l| outputs.contains_key(*l)).cloned().collect();
+    Some(Cooked::new(outputs, linear))
+}
+
+/// The size, components and tile count the cooked output entry `file` declares.
+fn cook_output_head<R: Read + Seek>(zip: &mut ZipArchive<R>, file: &str) -> Result<(u32, u32, usize, usize)> {
+    if !file.starts_with("cooked/") || file.contains("..") {
+        return Err(malformed(KIND, format!("bad cooked entry {file}")));
+    }
+    let mut f = zip.by_name(file).map_err(zip_err)?;
+    let mut head = [0u8; BIN_HEADER_BYTES];
+    read_exact(&mut f, &mut head, file)?;
+    let (w, h, comps, count) = (u32_at(&head, 2), u32_at(&head, 3), u32_at(&head, 4) as usize, u32_at(&head, 5) as usize);
+    if w == 0 || h == 0 || w > MAX_COOK_SIDE || h > MAX_COOK_SIDE || !matches!(comps, 1 | 4) {
+        return Err(malformed(KIND, format!("{file}: bad size {w}×{h}×{comps}")));
+    }
+    Ok((w, h, comps, count))
+}
+
 /// The cooks `index` lists, each whole or not at all; a cook with a missing or malformed output is left out with a
-/// warning (it is rendered again when it is needed).
-fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mut ProjectFile, budget: &mut LoadBudget) {
+/// warning (it is rendered again when it is needed). With `lazy` (the file the archive is read from) the cooks are
+/// not read now: the store is told what the file holds and reads each when it is needed.
+fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mut ProjectFile, budget: &mut LoadBudget, lazy: Option<&std::path::Path>) {
     let mut dropped = 0usize;
+    let mut kept: BTreeMap<String, CookEntry> = BTreeMap::new();
+    let mut outlines = std::collections::HashMap::new();
     for (key, entry) in index.cooks {
         if !texturecraft_core::is_key(&key) || entry.outputs.is_empty() {
             dropped += 1;
             continue;
         }
-        let mut outputs = BTreeMap::new();
-        let mut whole = true;
-        for (output, file) in &entry.outputs {
-            let img = (|| -> Result<TileImage> {
-                if !file.starts_with("cooked/") || file.contains("..") {
-                    return Err(malformed(KIND, format!("bad cooked entry {file}")));
+        if lazy.is_some() {
+            // what the cook holds, from its outputs' headers
+            let heads: Option<BTreeMap<String, (usize, usize)>> = entry
+                .outputs
+                .iter()
+                .map(|(output, file)| cook_output_head(zip, file).ok().map(|(_, _, comps, count)| (output.clone(), (comps, count))))
+                .collect();
+            match heads {
+                Some(outputs) => {
+                    let linear = entry.linear.iter().filter(|l| outputs.contains_key(*l)).cloned().collect();
+                    outlines.insert(key.clone(), texturecraft_compose::graphs::spill::CookOutline { outputs, linear });
+                    kept.insert(key, entry);
                 }
-                let mut f = zip.by_name(file).map_err(zip_err)?;
-                let mut head = [0u8; 24];
-                read_exact(&mut f, &mut head, file)?;
-                let (w, h, comps) = (u32_at(&head, 2), u32_at(&head, 3), u32_at(&head, 4) as usize);
-                if w == 0 || h == 0 || w > MAX_COOK_SIDE || h > MAX_COOK_SIDE || !matches!(comps, 1 | 4) {
-                    return Err(malformed(KIND, format!("{file}: bad size {w}×{h}×{comps}")));
-                }
-                drop(f);
-                let mut f = zip.by_name(file).map_err(zip_err)?;
-                read_tiles(&mut f, (w, h), comps, budget, file)
-            })();
-            match img {
-                Ok(img) => {
-                    outputs.insert(output.clone(), img);
-                }
-                Err(_) => {
-                    whole = false;
-                    break;
-                }
+                None => dropped += 1,
             }
-        }
-        if !whole {
-            dropped += 1;
             continue;
         }
-        let linear = entry.linear.into_iter().filter(|l| outputs.contains_key(l)).collect();
-        pf.graphs.insert_cooked(key, Cooked::new(outputs, linear));
+        match read_cook(zip, &entry, budget) {
+            Some(cooked) => pf.graphs.insert_cooked(key, cooked),
+            None => dropped += 1,
+        }
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(path) = lazy
+        && !kept.is_empty()
+    {
+        pf.graphs.read_cooks_from(Arc::new(FileCooks { path: path.to_path_buf(), cooks: kept }), outlines);
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (kept, outlines);
     pf.graphs.set_uses(index.uses.into_iter().collect());
     if dropped > 0 {
         pf.warnings.push(format!("Note: {dropped} cooked graph result(s) could not be read; they will be rendered again when needed."));
+    }
+}
+
+/// The cooked graph results a project file holds, read from it one at a time when they are needed. The file is opened
+/// for each read, by its path: a save over it (written beside it and renamed) keeps every cook the project still
+/// reads, under the same entry names. A cook that cannot be read any more is rendered again, the same pixels.
+#[cfg(not(target_arch = "wasm32"))]
+struct FileCooks {
+    path: std::path::PathBuf,
+    cooks: BTreeMap<String, CookEntry>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl texturecraft_compose::graphs::spill::CookSource for FileCooks {
+    fn get(&self, key: &str) -> Option<Cooked> {
+        let entry = self.cooks.get(key)?;
+        let limit_bytes = u64::from(project_open_limit_gib()) << 30;
+        crate::guard(KIND, || {
+            let file = std::fs::File::open(&self.path)?;
+            let metadata_only = Cell::new(true);
+            let mut zip = open_archive(std::io::BufReader::new(file), &metadata_only, MAX_ZIP_METADATA_BYTES)?;
+            Ok(read_cook(&mut zip, entry, &mut LoadBudget::new(limit_bytes)))
+        })
+        .ok()
+        .flatten()
     }
 }
 
@@ -610,7 +663,7 @@ fn texture_set_of(project: &Project, id: LayerId) -> Option<usize> {
 
 fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
     let limit_bytes = u64::from(project_open_limit_gib()) << 30;
-    load_with_budget(reader, LoadBudget::new(limit_bytes))
+    load_with_budget(reader, LoadBudget::new(limit_bytes), None)
 }
 
 fn check_archive<R: Read + Seek>(zip: &mut ZipArchive<R>, limit_bytes: u64) -> Result<()> {
@@ -642,7 +695,7 @@ fn open_archive<'a, R: Read + Seek>(reader: R, metadata_only: &'a Cell<bool>, me
     Ok(archive)
 }
 
-fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result<ProjectFile> {
+fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget, lazy_cooks: Option<&std::path::Path>) -> Result<ProjectFile> {
     let metadata_only = Cell::new(true);
     let mut zip = open_archive(reader, &metadata_only, MAX_ZIP_METADATA_BYTES)?;
     check_archive(&mut zip, budget.remaining())?;
@@ -800,7 +853,7 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
         // Ignore other entries from newer minor revisions (cooked outputs are read through their index below)
     }
     if let Some(index) = cook_index {
-        load_cooks(&mut zip, index, &mut pf, &mut budget);
+        load_cooks(&mut zip, index, &mut pf, &mut budget, lazy_cooks);
     }
 
     for (id, bytes) in stroke_entries {

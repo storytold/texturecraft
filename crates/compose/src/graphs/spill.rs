@@ -25,12 +25,24 @@ impl CookOutline {
     }
 }
 
-/// The spilled cooks of one store: their folder (made at the first spill) and outlines by key.
+/// Where cooks can be read again when they are not held: a project's file keeps the cooks it was saved with, so a
+/// document opened from it need not hold them all ([`super::GraphStore::read_cooks_from`]). A cook that cannot be
+/// read (the file is gone or was replaced) is `None`: it is then rendered again when it is needed, the same pixels.
+pub trait CookSource: Send + Sync {
+    fn get(&self, key: &str) -> Option<Cooked>;
+}
+
+/// A source and the outlines of the cooks it holds, by key.
+type Sourced = (std::sync::Arc<dyn CookSource>, HashMap<String, CookOutline>);
+
+/// The cooks of one store that are not held in memory: the spilled ones (their folder, made at the first spill, and
+/// outlines by key) and the ones its project file keeps.
 #[derive(Default)]
 pub struct Spill {
     #[cfg(not(target_arch = "wasm32"))]
     dir: Mutex<Option<std::path::PathBuf>>,
     outlines: Mutex<HashMap<String, CookOutline>>,
+    source: Mutex<Option<Sourced>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -57,10 +69,16 @@ impl Spill {
         false
     }
 
-    /// The cook spilled under `key`, read back.
+    /// The cooks `source` holds (their outlines by key) can be read from it from now on.
+    pub fn set_source(&self, source: std::sync::Arc<dyn CookSource>, outlines: HashMap<String, CookOutline>) {
+        *lock(&self.source) = Some((source, outlines));
+    }
+
+    /// The cook spilled under `key` or kept by the source, read back.
     pub fn get(&self, key: &str) -> Option<Cooked> {
         if !lock(&self.outlines).contains_key(key) {
-            return None;
+            let source = lock(&self.source).as_ref().filter(|(_, o)| o.contains_key(key)).map(|(s, _)| s.clone());
+            return source.and_then(|s| s.get(key));
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -74,15 +92,21 @@ impl Spill {
     }
 
     pub fn outline(&self, key: &str) -> Option<CookOutline> {
-        lock(&self.outlines).get(key).cloned()
+        let spilled = lock(&self.outlines).get(key).cloned();
+        spilled.or_else(|| lock(&self.source).as_ref().and_then(|(_, o)| o.get(key).cloned()))
     }
 
     pub fn keys(&self) -> Vec<String> {
-        lock(&self.outlines).keys().cloned().collect()
+        let mut keys: BTreeSet<String> = lock(&self.outlines).keys().cloned().collect();
+        keys.extend(lock(&self.source).iter().flat_map(|(_, o)| o.keys().cloned()));
+        keys.into_iter().collect()
     }
 
     /// Forgets (and deletes) the cooks `keep` does not keep.
     pub fn retain(&self, keep: impl Fn(&str) -> bool) {
+        if let Some((_, o)) = lock(&self.source).as_mut() {
+            o.retain(|k, _| keep(k));
+        }
         let mut outlines = lock(&self.outlines);
         let gone: Vec<String> = outlines.keys().filter(|k| !keep(k)).cloned().collect();
         for k in gone {
