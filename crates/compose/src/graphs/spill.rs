@@ -125,12 +125,49 @@ impl Spill {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let mut dir = lock(&self.dir);
         if dir.is_none() {
-            let d = std::env::temp_dir().join(format!("texturecraft-cooks-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let root = spill_root();
+            remove_orphans(&root);
+            let d = root.join(format!("texturecraft-cooks-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
             std::fs::create_dir_all(&d).ok()?;
             *dir = Some(d);
         }
         dir.clone()
     }
+}
+
+/// Where spilled cooks go: the user's cache folder on Linux and the BSDs (their temporary folder is often held in RAM,
+/// which spilling must not fill), the system's temporary folder elsewhere.
+#[cfg(not(target_arch = "wasm32"))]
+fn spill_root() -> std::path::PathBuf {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let cache = std::env::var_os("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")));
+        if let Some(dir) = cache.map(|c| c.join("texturecraft")).filter(|d| std::fs::create_dir_all(d).is_ok()) {
+            return dir;
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Removes the spill folders in `root` that processes no longer running left behind (stopped before they could clean
+/// up). Only where a process's liveness can be read (Linux).
+#[cfg(not(target_arch = "wasm32"))]
+fn remove_orphans(root: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("texturecraft-cooks-")).and_then(|r| r.split('-').next()) else { continue };
+            if pid.parse::<u32>().is_ok() && !std::path::Path::new("/proc").join(pid).exists() {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = root;
 }
 
 impl Drop for Spill {
