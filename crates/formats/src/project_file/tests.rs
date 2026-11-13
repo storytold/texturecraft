@@ -314,8 +314,10 @@ fn save_plan_follows_the_reserved_cores_and_the_ram_share() {
     // The share is of the RAM given, clamped to 1..=100 percent, and never overflows.
     assert_eq!(entries::plan(2, 1, 5, 1000, 0).1, 10);
     assert_eq!(entries::plan(2, 1, 5, 1000, 250).1, 1000);
-    assert_eq!(entries::plan(2, 1, 5, u64::MAX, 100).1, u64::MAX);
-    assert_eq!(entries::plan(2, 1, 5, u64::MAX, 50).1, u64::MAX / 2);
+    assert_eq!(entries::plan(2, 1, 5, u64::MAX, 100).1, entries::MAX_SAVE_IN_FLIGHT);
+    // A large machine's share is capped: the save runs beside a full project.
+    assert_eq!(entries::plan(2, 1, 5, 32 << 30, 50).1, entries::MAX_SAVE_IN_FLIGHT);
+    assert_eq!(entries::plan(2, 1, 5, 2 << 30, 50).1, 1 << 30);
 }
 
 #[test]
