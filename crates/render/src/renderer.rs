@@ -328,6 +328,20 @@ pub fn aux_size(size: (u32, u32)) -> u32 {
 
 impl Tex {
     fn new(device: &wgpu::Device, label: &str, w: u32, h: u32, format: wgpu::TextureFormat, mips: u32) -> Tex {
+        // COPY_SRC: the GPU path tracer copies the display textures into its arrays.
+        let usage =
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+        Self::with_usage(device, label, w, h, format, mips, usage)
+    }
+
+    /// The environment map, uploaded from the CPU and sampled, never drawn into. As a render target
+    /// it would need float color buffers, which GLES and WebGL2 may lack (see [`hdr_renderable`]).
+    fn environment(device: &wgpu::Device, w: u32, h: u32) -> Tex {
+        let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+        Self::with_usage(device, "tc_env", w, h, wgpu::TextureFormat::Rgba16Float, ENV_LEVELS, usage)
+    }
+
+    fn with_usage(device: &wgpu::Device, label: &str, w: u32, h: u32, format: wgpu::TextureFormat, mips: u32, usage: wgpu::TextureUsages) -> Tex {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -335,11 +349,7 @@ impl Tex {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            // COPY_SRC: the GPU path tracer copies the display textures into its arrays.
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC,
+            usage,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1113,7 +1123,7 @@ impl Renderer {
             layout: &refraction_bind_group_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&black) }],
         });
-        let env = Tex::new(device, "tc_env", PLACEHOLDER_ENV_SIZE[0], PLACEHOLDER_ENV_SIZE[1], wgpu::TextureFormat::Rgba16Float, ENV_LEVELS);
+        let env = Tex::environment(device, PLACEHOLDER_ENV_SIZE[0], PLACEHOLDER_ENV_SIZE[1]);
 
         let mut renderer = Renderer {
             target_format,
@@ -1198,7 +1208,7 @@ impl Renderer {
         };
         let levels = ibl::prefilter(&img, ENV_LEVELS);
         if self.env.texture.width() != img.width || self.env.texture.height() != img.height {
-            self.env = Tex::new(device, "tc_env", img.width, img.height, wgpu::TextureFormat::Rgba16Float, ENV_LEVELS);
+            self.env = Tex::environment(device, img.width, img.height);
         }
         for (l, lv) in levels.iter().enumerate() {
             let bytes: Vec<u8> = lv.data.iter().flat_map(|c| [c[0], c[1], c[2], 1.0]).flat_map(|v| half::f16::from_f32(v).to_le_bytes()).collect();
@@ -2384,6 +2394,23 @@ mod tests {
 
     fn base_width(h: &Headless) -> u32 {
         h.renderer.display_textures()[0][0].width()
+    }
+
+    /// The environment map is only uploaded and sampled. A render target usage would ask for float
+    /// color buffers, which GLES and WebGL2 adapters may not have.
+    #[test]
+    fn the_environment_map_is_not_a_render_target() {
+        let Ok(mut h) = Headless::new() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+        assert_eq!(h.renderer.env.texture.usage(), usage, "the built-in environment");
+        // An imported image of another size makes a new texture.
+        let image = ImageRes { width: 256, height: 128, rgba: vec![[0.5, 0.5, 0.5, 1.0]; 256 * 128], srgb: false };
+        h.renderer.set_environment(&h.device, &h.queue, "resource:grey", Some(&image));
+        assert_eq!(h.renderer.env.texture.width(), 256);
+        assert_eq!(h.renderer.env.texture.usage(), usage, "an imported environment");
     }
 
     fn prepare(h: &mut Headless) {

@@ -163,6 +163,34 @@ fn render_writes_a_png() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Without a GPU, the viewport render's error says what still works, and that does work. A backend
+/// this platform lacks stands in for a machine without a GPU: the CLI's wgpu instance reads
+/// `WGPU_BACKEND`.
+#[test]
+fn render_without_a_gpu_points_to_path_tracing() {
+    let d = tmp("no-gpu");
+    let out = d.join("cube.png");
+    let absent = if cfg!(target_os = "macos") { "dx12" } else { "metal" };
+    let render = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_texturecraft-cli"))
+            .env("WGPU_BACKEND", absent)
+            .env_remove("WGPU_ADAPTER_NAME")
+            .env_remove("WGPU_POWER_PREF")
+            .args(["render", "builtin:cube", p(&out), "--size", "64x64"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let o = render(&[]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("cannot render") && err.contains("path tracing (`samples`) needs no GPU"), "{err}");
+    let o = render(&["--samples", "2"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(image::open(&out).unwrap().width(), 64);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn path_traced_render_needs_no_gpu() {
     let d = tmp("trace");

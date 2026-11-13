@@ -29,3 +29,7 @@ wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 image = { workspace = true }
+
+# The noop backend stands in for an adapter without compute shaders in the headless tests.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+wgpu = { workspace = true, features = ["noop"] }
