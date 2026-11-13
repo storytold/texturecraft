@@ -230,3 +230,60 @@ fn budgeted_updates_spread_work_and_end_identical() {
     assert!(s.caches[0].composite == full, "chunked compositing gives the same pixels");
     assert!(s.memory().composites > 0);
 }
+
+#[test]
+fn visible_tiles_are_processed_before_hidden_tiles() {
+    let mut s = session();
+    let mut visible = texturecraft_engine::session::VisibleTiles::default();
+    visible.refresh(&s, || false);
+    let mut hidden_count = 0;
+    let mut visible_count = 0;
+    for (ts, cache) in s.caches.iter_mut().enumerate() {
+        cache.invalidate_all();
+        cache.chunk = 1;
+        for tile in &cache.dirty {
+            if visible.contains(ts, tile) {
+                visible_count += 1;
+            } else {
+                hidden_count += 1;
+            }
+        }
+    }
+    assert!(visible_count > 0 && hidden_count > 0);
+    for _ in 0..visible_count {
+        for cache in &mut s.caches {
+            cache.chunk = 1;
+        }
+        s.update_with_visible(0.0, || 1.0, Some(&visible));
+    }
+    assert_eq!(s.pending_tiles(), hidden_count);
+    assert!(s.caches.iter().enumerate().all(|(ts, cache)| cache.dirty.iter().all(|tile| !visible.contains(ts, tile))));
+    s.camera.yaw += 1.0;
+    assert!(!visible.view_matches(&s));
+    visible.refresh(&s, || false);
+    assert!(visible.view_matches(&s));
+    s.update_with_visible(f64::INFINITY, || 0.0, Some(&visible));
+    assert_eq!(s.pending_tiles(), 0);
+}
+
+#[test]
+fn hiding_the_front_material_reveals_the_tiles_behind_it() {
+    let mut mesh = primitives::plane(2.0, 1);
+    // Two coincident UV layouts on parallel surfaces, viewed straight from above.
+    let mut back = mesh.clone();
+    for position in &mut back.positions {
+        position.y -= 0.1;
+    }
+    mesh.append(&back);
+    let mut s = Session::new_project("overlap", mesh, "test", None, 128).unwrap();
+    s.camera.pitch = 1.55;
+    s.camera.ortho = true;
+    let mut hint = texturecraft_engine::session::VisibleTiles::default();
+    hint.refresh(&s, || false);
+    assert!(hint.contains(0, &(0, 0)));
+    s.doc.project.texture_sets[0].visible = false;
+    assert!(!hint.view_matches(&s));
+    hint.refresh(&s, || false);
+    assert!(!hint.contains(0, &(0, 0)));
+    assert!(hint.contains(1, &(0, 0)));
+}

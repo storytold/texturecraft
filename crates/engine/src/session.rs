@@ -14,6 +14,64 @@ use texturecraft_texel::DilationMap;
 use crate::fill_mode::FillMode;
 use crate::{EngineError, Result};
 
+/// First-hit UV tiles sampled from the 3D viewport. A hint only: all dirty tiles still drain.
+#[derive(Default)]
+pub struct VisibleTiles {
+    view: Option<(u64, OrbitCamera, Vec2)>,
+    layout: Vec<((u32, u32), usize, bool)>,
+    tiles: Vec<BTreeSet<(u32, u32)>>,
+    next_sample: usize,
+}
+
+impl VisibleTiles {
+    /// Refine the hint across frames. Each pass starts with samples spread across the view,
+    /// so even a camera that moves every frame gets a fresh coarse hint.
+    pub fn refresh(&mut self, session: &Session, out_of_time: impl Fn() -> bool) {
+        if !self.view_matches(session) {
+            self.view = Some((session.mesh_id, session.camera, session.viewport));
+            self.layout = session.doc.project.texture_sets.iter().map(|set| (set.size(), set.material, set.visible)).collect();
+            self.tiles = vec![BTreeSet::new(); self.layout.len()];
+            self.next_sample = 0;
+        }
+        const GRID: usize = 96;
+        const STRIDE: usize = 8;
+        const CELLS: usize = GRID / STRIDE;
+        let vp = session.viewport.max(Vec2::ONE);
+        let sets = &session.doc.project.texture_sets;
+        let visible_set = |tri: u32| session.texture_set_of_material(session.mesh.material_of(tri as usize).unwrap_or(0)).filter(|&ts| sets[ts].visible);
+        for index in self.next_sample..(self.next_sample + 512).min(GRID * GRID) {
+            // A coprime permutation visits all coarse cells before refining any of them.
+            let cell = (index * 89) % (CELLS * CELLS);
+            let phase = index / (CELLS * CELLS);
+            let x = cell % CELLS * STRIDE + (phase + STRIDE / 2) % STRIDE;
+            let y = cell / CELLS * STRIDE + (phase / STRIDE + STRIDE / 2) % STRIDE;
+            let ndc = Vec2::new((x as f32 + 0.5) * 2.0 / GRID as f32 - 1.0, 1.0 - (y as f32 + 0.5) * 2.0 / GRID as f32);
+            let ray = session.camera.ray(ndc, vp.x / vp.y);
+            if let Some(hit) = session.bvh.closest_filtered(ray.origin, ray.dir, f32::MAX, &|tri| visible_set(tri).is_some())
+                && let Some(ts) = visible_set(hit.tri)
+                && let Some(surface) = texturecraft_geom::surface_at(&session.mesh, hit.tri, hit.u, hit.v)
+            {
+                let (w, h) = sets[ts].size();
+                let tile = |uv: f32, n: u32| ((uv * n as f32) as u32).min(n.saturating_sub(1)) / texturecraft_texel::TILE;
+                self.tiles[ts].insert((tile(surface.uv.x, w), tile(surface.uv.y, h)));
+            }
+            self.next_sample += 1;
+            if out_of_time() {
+                break;
+            }
+        }
+    }
+
+    pub fn view_matches(&self, session: &Session) -> bool {
+        self.view == Some((session.mesh_id, session.camera, session.viewport))
+            && session.doc.project.texture_sets.iter().map(|set| (set.size(), set.material, set.visible)).eq(self.layout.iter().copied())
+    }
+
+    pub fn contains(&self, ts: usize, tile: &(u32, u32)) -> bool {
+        self.tiles.get(ts).is_some_and(|tiles| tiles.contains(tile))
+    }
+}
+
 /// Padding (texels) applied to composites for display.
 pub const DISPLAY_PADDING: u32 = 8;
 /// Undo steps kept.
@@ -762,6 +820,10 @@ impl Session {
     /// goes first; settling tiles (see [`SetCache::settle`]) get at most [`SETTLE_BUDGET_MS`]
     /// of a finite budget, after the dirty ones.
     pub fn update_for(&mut self, budget_ms: f64, clock: impl Fn() -> f64) -> bool {
+        self.update_with_visible(budget_ms, clock, None)
+    }
+
+    pub fn update_with_visible(&mut self, budget_ms: f64, clock: impl Fn() -> f64, visible: Option<&VisibleTiles>) -> bool {
         let start = clock();
         let first = if budget_ms.is_finite() { rayon::current_num_threads().clamp(1, CHUNK) } else { CHUNK };
         // The layer being edited: everything else is cached per tile.
@@ -782,7 +844,7 @@ impl Session {
         let active = self.ts();
         let order = std::iter::once(active).chain((0..self.caches.len()).filter(|ts| *ts != active));
         let mut changed = false;
-        for ts in order {
+        for (ts, priority) in visible.into_iter().flat_map(|v| order.clone().map(move |ts| (ts, v.tiles.get(ts)))).chain(order.clone().map(|ts| (ts, None))) {
             let Some(cache) = self.caches.get_mut(ts) else { continue };
             cache.below.set_hot(hot);
             cache.below.pass = cache.dirty.len() + cache.settle.len();
@@ -793,6 +855,9 @@ impl Session {
             let mut chunk = if budget_ms.is_finite() && cache.chunk > 0 { cache.chunk } else { first };
             loop {
                 if cache.dirty.is_empty() {
+                    if priority.is_some() {
+                        break;
+                    }
                     if cache.settle.is_empty() || clock() - start >= budget_ms.min(SETTLE_BUDGET_MS) {
                         break;
                     }
@@ -800,7 +865,18 @@ impl Session {
                     cache.dirty.extend(next_chunk(&mut cache.settle, chunk.min(first)));
                 }
                 let t0 = clock();
-                let tiles = next_chunk(&mut cache.dirty, chunk);
+                let tiles = if let Some(preferred) = priority {
+                    let selected: Vec<_> = preferred.intersection(&cache.dirty).copied().take(chunk).collect();
+                    if selected.is_empty() {
+                        break;
+                    }
+                    for tile in &selected {
+                        cache.dirty.remove(tile);
+                    }
+                    selected
+                } else {
+                    next_chunk(&mut cache.dirty, chunk)
+                };
                 for t in &tiles {
                     cache.settle.remove(t);
                 }

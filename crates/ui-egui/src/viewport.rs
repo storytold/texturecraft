@@ -320,7 +320,14 @@ fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, mut frame: Frame
     let scene = match (sync.0.take(), app.gpu.as_mut()) {
         (Some(aux), Some(gpu_link)) => {
             let sync_start_ms = crate::now_ms();
-            let scene = gpu_link.sync(&mut app.session, aux, bake, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms));
+            let scene = gpu_link.sync(
+                &mut app.session,
+                aux,
+                bake,
+                u32::from(app.ui.prefs.viewport_texture.min(2)),
+                f64::from(app.profiler.logic_ms),
+                frame.kind == ViewKind::Scene,
+            );
             let reports = gpu_link.take_reports();
             app.profiler.sync_ms += (crate::now_ms() - sync_start_ms) as f32;
             gpu_report_toasts(app, reports);

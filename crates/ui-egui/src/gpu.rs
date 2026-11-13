@@ -91,6 +91,8 @@ pub struct GpuLink {
     /// What each set's aux texture holds: (mesh map or mask key, revision).
     aux: BTreeMap<usize, (String, u64)>,
     pub adapter: String,
+
+    visible: texturecraft_engine::session::VisibleTiles,
     /// Most tiles waiting to be composited since compositing last caught up (progress).
     composite_total: usize,
     bake_scene: BakeSceneLink,
@@ -139,6 +141,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         env: Default::default(),
         aux: BTreeMap::new(),
         adapter: format!("{} ({:?})", info.name, info.backend),
+        visible: Default::default(),
         composite_total: 0,
         bake_scene: BakeSceneLink::default(),
     }
@@ -162,13 +165,28 @@ impl GpuLink {
     }
 
     /// Collect everything the GPU needs this frame, running the compositor first: `bake` is what bake mode's 3D view draws besides the low poly, `spent_ms` the time this frame already took
-    pub fn sync(&mut self, session: &mut Session, aux_map: Option<AuxView>, bake: Option<BakeVisualization>, shift: u32, spent_ms: f64) -> SceneSync {
+    pub fn sync(
+        &mut self,
+        session: &mut Session,
+        aux_map: Option<AuxView>,
+        bake: Option<BakeVisualization>,
+        shift: u32,
+        spent_ms: f64,
+        scene_view: bool,
+    ) -> SceneSync {
         let start_ms = crate::now_ms();
         let mut queued = 0usize;
         let time_left_ms = |queued: usize| FRAME_BUDGET_MS - spent_ms - (crate::now_ms() - start_ms) - queued as f64 * UPLOAD_MS_PER_TILE;
         let pending = session.pending_tiles();
         self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
-        session.update_for(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms);
+        let prioritize = scene_view && pending >= 32 && !session.stroke_active();
+        let uploads_pending = session.caches.iter().any(|cache| !cache.upload.is_empty());
+        let use_hint = scene_view && !session.stroke_active() && (prioritize || uploads_pending);
+        if use_hint {
+            let deadline = crate::now_ms() + time_left_ms(0).clamp(0.0, 1.0);
+            self.visible.refresh(session, || crate::now_ms() >= deadline);
+        }
+        session.update_with_visible(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms, prioritize.then_some(&self.visible));
 
         let mut out = SceneSync::default();
         if self.lost.swap(false, Ordering::AcqRel) {
@@ -208,7 +226,10 @@ impl GpuLink {
         }
 
         for texture_set in 0..session.caches.len() {
-            let tiles = session.take_uploads(texture_set);
+            let mut tiles = session.take_uploads(texture_set);
+            if use_hint {
+                tiles.sort_by_key(|tile| !self.visible.contains(texture_set, tile));
+            }
             if tiles.is_empty() {
                 continue;
             }
