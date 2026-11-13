@@ -21,7 +21,7 @@ use texturecraft_render::ibl::ENVIRONMENTS;
 
 use crate::TextureCraftApp;
 use crate::decal_drop::DecalDrop;
-use crate::i18n::{tr, trf};
+use crate::i18n::{n_, tr, trf};
 use crate::shelf_preview::ShelfPreview;
 use crate::theme::Tokens;
 use crate::thumbs::Thumbs;
@@ -96,6 +96,11 @@ impl Asset {
         self.is_material() || matches!(self, Asset::Texture(_))
     }
 }
+
+/// What a click or drag on a material tile does (see [`apply`], and `drop_target` and the layer rows for drops); translated where shown
+const MATERIAL_HINT: &str = n_("Click to add as a layer. Drag onto the layer stack or a view to place it.");
+/// Font size of the hint under a tile's name in the hover popup
+const HINT_FONT_SIZE: f32 = 11.0;
 
 /// The drag-and-drop payload of a shelf tile.
 #[derive(Clone, Debug)]
@@ -335,7 +340,8 @@ fn materials(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter
             for material in shown.iter().filter(|material| material.category == category) {
                 let texture = app.thumbs.material(ctx, material.id);
                 let asset = Asset::Material(material.id);
-                if tile(ui, &mut app.thumbs, texture.as_ref(), || ShelfPreview::material(material.id), material.label, Some(&asset)).clicked() {
+                let hint = Some(tr(MATERIAL_HINT));
+                if tile_with_hint(ui, &mut app.thumbs, texture.as_ref(), || ShelfPreview::material(material.id), material.label, Some(&asset), hint).clicked() {
                     apply(app, &asset);
                 }
             }
@@ -616,6 +622,19 @@ pub(crate) fn tile(
     label: &str,
     drag: Option<&Asset>,
 ) -> egui::Response {
+    tile_with_hint(ui, thumbs, tex, preview, label, drag, None)
+}
+
+/// [`tile`] whose hover popup also shows `hint`, a line saying what a click and a drag do
+pub(crate) fn tile_with_hint(
+    ui: &mut Ui,
+    thumbs: &mut Thumbs,
+    tex: Option<&egui::TextureHandle>,
+    preview: impl FnOnce() -> ShelfPreview,
+    label: &str,
+    drag: Option<&Asset>,
+    hint: Option<&str>,
+) -> egui::Response {
     let tk = Tokens::get(ui.ctx());
     let sense = if drag.is_some() { Sense::click_and_drag() } else { Sense::click() };
     let (rect, resp) = ui.allocate_exact_size(vec2(TILE_WIDTH, TILE_HEIGHT), sense);
@@ -636,7 +655,7 @@ pub(crate) fn tile(
     painter.galley(egui::pos2(rect.center().x - galley.size().x * 0.5, image_rect.bottom() + LABEL_GAP), galley, tk.text);
 
     let big = if resp.hovered() { big_preview(ui, thumbs, preview) } else { None };
-    resp.on_hover_ui(|ui| hover_preview(ui, tex, big.as_ref(), label))
+    resp.on_hover_ui(|ui| hover_preview(ui, tex, big.as_ref(), label, hint))
 }
 
 /// Start rendering during the popup delay once the pointer rests
@@ -679,7 +698,7 @@ fn thumbnail(painter: &egui::Painter, texture: Option<&egui::TextureHandle>, rec
 }
 
 /// Use the thumbnail as a placeholder until the hover preview arrives
-fn hover_preview(ui: &mut Ui, small: Option<&egui::TextureHandle>, big: Option<&egui::TextureHandle>, label: &str) {
+fn hover_preview(ui: &mut Ui, small: Option<&egui::TextureHandle>, big: Option<&egui::TextureHandle>, label: &str, hint: Option<&str>) {
     let tk = Tokens::get(ui.ctx());
     ui.set_max_width(BIG_PREVIEW_SIZE);
     ui.vertical_centered(|ui| {
@@ -687,5 +706,8 @@ fn hover_preview(ui: &mut Ui, small: Option<&egui::TextureHandle>, big: Option<&
         thumbnail(ui.painter(), big.or(small), rect, &tk);
         ui.add_space(BIG_PREVIEW_LABEL_GAP);
         ui.label(label);
+        if let Some(hint) = hint {
+            ui.label(RichText::new(hint).size(HINT_FONT_SIZE).color(tk.text_dim));
+        }
     });
 }

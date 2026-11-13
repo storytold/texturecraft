@@ -29,6 +29,8 @@ fn materials_shelf(step_seconds: f32, pixels_per_point: f32) -> (Harness<'static
         .with_pixels_per_point(pixels_per_point)
         .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.shelf_tab = MATERIALS_TAB;
+    // The tests look for English labels and hint text whatever language the machine uses.
+    h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
 
     let unique: Vec<_> = MATERIALS.iter().filter(|m| !m.smart && h.query_all_by_label(m.label).count() == 1).take(2).collect();
@@ -171,4 +173,50 @@ fn check_high_dpi_orb_hover(shelf_tab: usize, label: &str) {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(largest_drawn_texture(&harness, BIG_PREVIEW_SIZE), expected, "the popup uses a bounded big preview at 300% scale");
+}
+
+/// The hint under a material's name in the hover popup
+const MATERIAL_HINT: &str = "Click to add as a layer. Drag onto the layer stack or a view to place it.";
+/// The Smart materials and Alphas shelf tabs
+const SMART_TAB: usize = 1;
+const ALPHAS_TAB: usize = 5;
+
+/// Hover the tile labelled `label` until its popup shows (one more node carries the name); false on timeout
+fn hover_until_popup(h: &mut Harness<'static, TextureCraftApp>, label: &str) -> bool {
+    let before = h.query_all_by_label(label).count();
+    h.get_by_role_and_label(egui::Role::Button, label).hover();
+    let started = Instant::now();
+    while h.query_all_by_label(label).count() <= before && started.elapsed() < WORKER_TIMEOUT {
+        h.run_steps(1);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    h.query_all_by_label(label).count() > before
+}
+
+#[test]
+fn a_material_tile_hover_says_what_click_and_drag_do() {
+    let (mut h, materials) = materials_shelf(1.0 / 4.0, 1.0);
+    assert!(h.query_by_label(MATERIAL_HINT).is_none(), "no hint before the hover");
+    assert!(hover_until_popup(&mut h, materials[0].label), "the popup opens");
+    assert!(h.query_by_label(MATERIAL_HINT).is_some(), "the popup explains click and drag");
+}
+
+#[test]
+fn a_smart_material_tile_hover_says_what_click_and_drag_do() {
+    let (mut h, _) = materials_shelf(1.0 / 4.0, 1.0);
+    h.state_mut().ui.shelf_tab = SMART_TAB;
+    h.run_steps(4);
+    assert!(hover_until_popup(&mut h, "Steel Painted Worn"), "the popup opens");
+    assert!(h.query_by_label(MATERIAL_HINT).is_some(), "the popup explains click and drag");
+}
+
+#[test]
+fn an_alpha_tile_hover_has_no_material_hint() {
+    let (mut h, _) = materials_shelf(1.0 / 4.0, 1.0);
+    h.state_mut().ui.shelf_tab = ALPHAS_TAB;
+    h.run_steps(4);
+    let alpha =
+        texturecraft_engine::paint::alphas::library().iter().find(|a| h.query_all_by_label(&a.label).count() == 1).expect("an alpha with a unique label");
+    assert!(hover_until_popup(&mut h, &alpha.label), "the popup opens");
+    assert!(h.query_by_label(MATERIAL_HINT).is_none(), "alphas do not get the material hint");
 }
