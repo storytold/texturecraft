@@ -26,7 +26,10 @@ fn sample() -> Sample {
     pixels.layer_mut(paint, Channel::Height, (128, 128)).set(70, 3, &[40000, 65535]);
     pixels.mask_mut(effect, (64, 64)).set(10, 60, &[30000, 65535]);
     let ao: Vec<f32> = (0..256).map(|i| i as f32 / 255.0).collect();
-    let baked = BakedMaps { resolution: 16, maps: [(BakedMap::AmbientOcclusion, Arc::new(ao)), (BakedMap::Normal, Arc::new(vec![0.5; 16 * 16 * 3]))].into() };
+    let baked = BakedMaps {
+        resolution: 16,
+        maps: [(BakedMap::AmbientOcclusion, Arc::new(ao.into())), (BakedMap::Normal, Arc::new(vec![0.5; 16 * 16 * 3].into()))].into(),
+    };
     let pf = ProjectFile {
         project: p,
         pixels,
@@ -94,7 +97,7 @@ fn legacy_bakes_load_as_is_without_layout_conversion() {
     set.uv_tiles = vec![1001, 1002];
     set.tile_resolutions.insert(1002, 128);
     let pixels: Vec<f32> = (0..16).flat_map(|y| (0..32).map(move |x| (y * 32 + x) as f32)).collect();
-    sample.pf.baked.insert(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(pixels))].into() });
+    sample.pf.baked.insert(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(pixels.into()))].into() });
 
     let loaded = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
     assert_eq!(loaded.project.format_version, FORMAT_VERSION);
@@ -221,7 +224,7 @@ fn uv_tiled_sets_round_trip_their_atlas_pixels_and_bakes() {
     let mut pixels = PixelStore::default();
     pixels.layer_mut(s.paint, Channel::BaseColor, (256, 128)).set(200, 100, &[1, 2, 3, 4]);
     s.pf.pixels = pixels;
-    let baked = BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 32 * 16]))].into() };
+    let baked = BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 32 * 16].into()))].into() };
     s.pf.baked = [(0, baked)].into();
     let back = load_project_bytes(&save_project_bytes(&s.pf).unwrap()).unwrap();
     assert_same(&s.pf, &back);
@@ -281,7 +284,7 @@ fn big_sample() -> ProjectFile {
     let r = 300usize;
     let maps = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Position]
         .into_iter()
-        .map(|m| (m, Arc::new(noise(r * r * m.components()))))
+        .map(|m| (m, Arc::new(noise(r * r * m.components()).into())))
         .collect();
     s.pf.baked.insert(1, BakedMaps { resolution: r as u32, maps });
     s.pf.mesh = Some(("obj".into(), noise(5000).iter().map(|v| (v * 200.0) as u8).collect()));
@@ -444,8 +447,8 @@ fn edit_project_json(project_file: &ProjectFile, mut edit: impl FnMut(&mut serde
 fn recovery_loads_legacy_bake_settings_and_map_names() {
     let mut expected = sample().pf;
     let maps = expected.baked.get_mut(&0).unwrap();
-    maps.maps.insert(BakedMap::WorldNormal, Arc::new(vec![0.5; 16 * 16 * 3]));
-    maps.maps.insert(BakedMap::BentNormal, Arc::new(vec![0.5; 16 * 16 * 3]));
+    maps.maps.insert(BakedMap::WorldNormal, Arc::new(vec![0.5; 16 * 16 * 3].into()));
+    maps.maps.insert(BakedMap::BentNormal, Arc::new(vec![0.5; 16 * 16 * 3].into()));
     expected.project.texture_sets[0].baked = maps.maps.keys().copied().collect();
     expected.project.texture_sets[1].bake.common.dilation = 12;
 

@@ -47,10 +47,10 @@ fn streamed_maps_are_the_pixels_of_one_bake() {
     assert_eq!((combined.resolution, combined.height), (whole.resolution, whole.height));
     assert_eq!(combined.maps.keys().collect::<Vec<_>>(), whole.maps.keys().collect::<Vec<_>>());
     for (map, pixels) in &whole.maps {
-        assert!(*combined.maps[map] == *pixels, "{map:?} differs between a streamed and a single bake");
+        assert!(*combined.maps[map] == pixels.clone().into(), "{map:?} differs between a streamed and a single bake");
     }
     for map in &streamed {
-        assert!(*map.data == whole.maps[&map.map], "{:?} handed over differs from the bake", map.map);
+        assert!(*map.data == whole.maps[&map.map].clone().into(), "{:?} handed over differs from the bake", map.map);
     }
 }
 
@@ -194,7 +194,7 @@ fn cancelling_mid_bake_leaves_the_document_and_the_shown_maps_whole() {
     let shown = session.bake_preview_baked(0).unwrap();
     assert_eq!(shown.maps.len(), 2);
     for (map, data) in &shown.maps {
-        assert!(**data == full.maps[map], "{map:?}");
+        assert!(**data == full.maps[map].clone().into(), "{map:?}");
     }
 
     // What the app does on cancel: end the preview; the document keeps what it had
@@ -269,9 +269,9 @@ fn a_resized_partial_streamed_bake_keeps_unchecked_maps() {
         BakedMaps {
             resolution: 64,
             maps: [
-                (BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 64 * 32])),
-                (BakedMap::Normal, Arc::new(vec![0.4; 64 * 32 * 3])),
-                (BakedMap::Height, Arc::new(vec![0.75; 64 * 32])),
+                (BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 64 * 32].into())),
+                (BakedMap::Normal, Arc::new(vec![0.4; 64 * 32 * 3].into())),
+                (BakedMap::Height, Arc::new(vec![0.75; 64 * 32].into())),
             ]
             .into(),
         },
@@ -288,7 +288,7 @@ fn a_resized_partial_streamed_bake_keeps_unchecked_maps() {
     assert_eq!((output.resolution, output.height), (128, 64));
     assert_eq!(output.maps.keys().collect::<Vec<_>>(), whole.maps.keys().collect::<Vec<_>>());
     for (map, pixels) in &whole.maps {
-        assert_eq!(*output.maps[map], *pixels, "{map:?} must match a whole bake, including retained pixels");
+        assert_eq!(*output.maps[map], pixels.clone().into(), "{map:?} must match a whole bake, including retained pixels");
     }
     assert_eq!(streamed.iter().map(|map| map.map).collect::<Vec<_>>(), [BakedMap::AmbientOcclusion, BakedMap::Height]);
     for map in &streamed {
@@ -298,7 +298,7 @@ fn a_resized_partial_streamed_bake_keeps_unchecked_maps() {
     session.apply_streamed_bake(0, output).unwrap();
 
     for (map, pixels) in &whole.maps {
-        assert_eq!(*session.doc.baked[&0].maps[map], *pixels);
+        assert_eq!(*session.doc.baked[&0].maps[map], pixels.clone().into());
     }
     session.undo().unwrap();
     assert_eq!(session.doc.baked, before);

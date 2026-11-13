@@ -209,6 +209,7 @@ fn remap_baked(baked: &BakedMaps, old: &TextureSet, new: &TextureSet, map: &(dyn
     for (kind, data) in &baked.maps {
         let (component_count, old_width, old_height) = (kind.components(), baked.resolution as usize, baked.height(*kind) as usize);
         let neutral = kind.neutral();
+        let data = data.to_f32();
         let mut texels = vec![0.0f32; width as usize * height as usize * component_count];
         texels.par_chunks_mut(width as usize * component_count).enumerate().for_each(|(y, row)| {
             for (x, pixel) in row.chunks_mut(component_count).enumerate() {
@@ -221,7 +222,7 @@ fn remap_baked(baked: &BakedMaps, old: &TextureSet, new: &TextureSet, map: &(dyn
                 pixel.copy_from_slice(source.unwrap_or(&neutral[..component_count]));
             }
         });
-        output.maps.insert(*kind, Arc::new(texels));
+        output.maps.insert(*kind, Arc::new(texels.into()));
     }
     Some(output)
 }

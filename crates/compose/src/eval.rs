@@ -3881,7 +3881,7 @@ mod tests {
         fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, 256, 256);
         fixture.project.texture_sets[0].resolution = 256;
         let ridge: Vec<f32> = (0..256 * 256).map(|texel| if texel % 256 == 128 { 1.0 } else { 0.5 }).collect();
-        fixture.baked = BakedMaps { resolution: 256, maps: [(BakedMap::Curvature, Arc::new(ridge))].into() };
+        fixture.baked = BakedMaps { resolution: 256, maps: [(BakedMap::Curvature, Arc::new(ridge.into()))].into() };
         let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
         let row_with = |fixture: &mut Fixture, weights: [f32; 7]| -> Vec<f32> {
             let detail = CurvatureDetail { mode: CurvatureMode::Edges, weights };
@@ -3917,7 +3917,7 @@ mod tests {
     #[test]
     fn curvature_detail_noise_keeps_flat_areas_neutral() {
         let mut fixture = fixture();
-        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64]))].into() };
+        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64].into()))].into() };
         let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
         let texels: Vec<_> = (0..64).map(|x| (x, 32)).collect();
 
@@ -3941,8 +3941,10 @@ mod tests {
         let mut fixture = fixture();
         // curvature flat (0.5) on the left half, a ridge on the right; the ID map black everywhere
         let curvature: Vec<f32> = (0..64 * 64).map(|i| if i % 64 < 32 { 0.5 } else { 0.8 }).collect();
-        fixture.baked =
-            BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(curvature)), (BakedMap::Id, Arc::new(vec![0.0; 64 * 64 * 3]))].into() };
+        fixture.baked = BakedMaps {
+            resolution: 64,
+            maps: [(BakedMap::Curvature, Arc::new(curvature.into())), (BakedMap::Id, Arc::new(vec![0.0; 64 * 64 * 3].into()))].into(),
+        };
         let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
         let texels = [(8, 32), (48, 32)];
         for (map, expected) in [(BakedMap::Curvature, [1.0, 0.0]), (BakedMap::Id, [0.0, 0.0])] {

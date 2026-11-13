@@ -634,6 +634,21 @@ impl GraphStore {
         f
     }
 
+    /// [`GraphStore::fingerprint_floats`] of a baked map's values, however they are held.
+    fn fingerprint_texels(&self, data: &Arc<crate::Texels>) -> u128 {
+        let at = (Arc::as_ptr(data) as usize, data.len());
+        if let Some(f) = lock(&self.cooks.fingerprints).get(&at) {
+            return *f;
+        }
+        let mut h = StableHash::new();
+        for v in data.iter() {
+            h.f32(v);
+        }
+        let f = h.finish();
+        lock(&self.cooks.fingerprints).insert(at, f);
+        f
+    }
+
     fn fingerprint_pixels(&self, data: &[[f32; 4]]) -> u128 {
         self.fingerprint_floats(data.as_flattened())
     }
@@ -666,7 +681,7 @@ impl GraphStore {
             match input {
                 GraphInput::Baked(m) => {
                     h.str("baked").str(m.id());
-                    let fp = env.baked.maps.get(m).map_or(0, |d| self.fingerprint_floats(d));
+                    let fp = env.baked.maps.get(m).map_or(0, |d| self.fingerprint_texels(d));
                     h.u64(u64::from(env.baked.resolution)).bytes(&fp.to_le_bytes());
                 }
                 GraphInput::Constant(c) => {

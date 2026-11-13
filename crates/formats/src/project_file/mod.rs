@@ -38,7 +38,7 @@ use std::io::{Cursor, Read, Seek, Write};
 use std::sync::Arc;
 
 use texturecraft_compose::graphs::{Cooked, GraphUse};
-use texturecraft_compose::{BakedMaps, GraphStore, PixelStore};
+use texturecraft_compose::{BakedMaps, GraphStore, PixelStore, Texels};
 use texturecraft_core::{BakePaintTarget, Channel, FORMAT_VERSION, LayerId, Project, StoredStrokes};
 use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
@@ -211,6 +211,17 @@ fn write_baked(w: &mut dyn Write, res: u32, h: u32, comps: usize, data: &[f32]) 
     Ok(())
 }
 
+/// A baked map's entry: its header, then its values as little-endian floats (also those held as 16-bit steps).
+fn write_texels(w: &mut dyn Write, res: u32, h: u32, comps: usize, data: &Texels) -> std::io::Result<()> {
+    w.write_all(&header(res, h, comps, 0))?;
+    let mut buf = Vec::with_capacity(BAKED_CHUNK * 4);
+    data.try_for_chunks(BAKED_CHUNK, |chunk| {
+        buf.clear();
+        buf.extend(chunk.iter().flat_map(|v| v.to_le_bytes()));
+        w.write_all(&buf)
+    })
+}
+
 /// The zip entries of a project file, in file order. Bodies run later, possibly on other threads.
 fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
     let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true);
@@ -279,7 +290,7 @@ fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
                 name: format!("baked/{ts}_{}.bin", m.id()),
                 options: deflate,
                 weight: data.len() as u64 * 4,
-                body: Box::new(move |w| write_baked(w, r, h, comps, data)),
+                body: Box::new(move |w| write_texels(w, r, h, comps, data)),
             });
         }
     }
@@ -848,7 +859,7 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget, lazy_cook
             } else if maps.resolution != res || maps.maps.keys().next().is_some_and(|k| maps.height(*k) != height) {
                 return Err(malformed(KIND, format!("{name}: baked maps of one texture set differ in size")));
             }
-            maps.maps.insert(m, Arc::new(data));
+            maps.maps.insert(m, Arc::new(Texels::new(data)));
         }
         // Ignore other entries from newer minor revisions (cooked outputs are read through their index below)
     }

@@ -268,7 +268,7 @@ mod tests {
     fn the_baked_normal_is_the_base_of_the_shown_normal() {
         // A baked normal tilted to +X (packed), 64² like the set.
         let tilted = [0.8f32, 0.5, 0.9];
-        let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(tilted.repeat(64 * 64)))].into_iter().collect() };
+        let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(tilted.repeat(64 * 64).into()))].into_iter().collect() };
         let shown = |comp: &Composite| tile_bytes(comp, &baked, DisplayKind::Normal, 0, 0)[..3].to_vec();
         let pack = |v: [f32; 3]| v.map(|x| (x * 255.0 + 0.5) as u8).to_vec();
         // No normal channel: the baked normal as it is.

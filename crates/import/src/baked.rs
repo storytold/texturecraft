@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use texturecraft_compose::BakedMaps;
+use texturecraft_compose::{BakedMaps, Texels};
 use texturecraft_core::BakedMap;
 use texturecraft_graph::tex::Tex;
 use texturecraft_import_reader::decode::document::{BitmapRef, NormalMapSyscoord};
@@ -125,7 +125,7 @@ pub fn dense(image: &Rgba, kind: BakedMap, resolution: u32, flip_green: bool) ->
 
 /// Collects a set's maps.
 pub fn maps(resolution: u32, maps: BTreeMap<BakedMap, Vec<f32>>) -> BakedMaps {
-    BakedMaps { resolution, maps: maps.into_iter().map(|(k, v)| (k, Arc::new(v))).collect() }
+    BakedMaps { resolution, maps: maps.into_iter().map(|(k, v)| (k, Arc::new(Texels::new(v)))).collect() }
 }
 
 #[cfg(test)]

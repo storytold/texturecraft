@@ -450,13 +450,13 @@ mod tests {
         let mut session = test_session().unwrap();
         let baked = session.doc.baked.entry(0).or_default();
         baked.resolution = 1;
-        baked.maps.insert(texturecraft_core::BakedMap::Height, Arc::new(vec![f32::NAN]));
+        baked.maps.insert(texturecraft_core::BakedMap::Height, Arc::new(vec![f32::NAN].into()));
         let snapshot = ThumbSnapshot::new(&session, 0, &mut GbufCache::default()).unwrap();
 
         assert!(snapshot.matches(&session, 0), "unchanged shared data must not invalidate every frame");
 
         let map = session.doc.baked.get_mut(&0).unwrap().maps.get_mut(&texturecraft_core::BakedMap::Height).unwrap();
-        Arc::make_mut(map)[0] = 0.5;
+        *Arc::make_mut(map) = vec![0.5].into();
         assert!(!snapshot.matches(&session, 0), "a copy-on-write edit must invalidate the snapshot");
     }
 
@@ -466,8 +466,8 @@ mod tests {
         let mut session = test_session().unwrap();
         let baked = session.doc.baked.entry(0).or_default();
         baked.resolution = 4096;
-        baked.maps.insert(texturecraft_core::BakedMap::Normal, Arc::new(vec![0.5; 4096 * 4096 * 3]));
-        baked.maps.insert(texturecraft_core::BakedMap::AmbientOcclusion, Arc::new(vec![0.5; 4096 * 4096]));
+        baked.maps.insert(texturecraft_core::BakedMap::Normal, Arc::new(vec![0.5; 4096 * 4096 * 3].into()));
+        baked.maps.insert(texturecraft_core::BakedMap::AmbientOcclusion, Arc::new(vec![0.5; 4096 * 4096].into()));
         let snapshot = ThumbSnapshot::new(&session, 0, &mut GbufCache::default()).unwrap();
         let start = std::time::Instant::now();
 

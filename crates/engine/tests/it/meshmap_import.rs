@@ -134,7 +134,7 @@ fn a_uv_tiled_set_takes_one_file_per_tile_however_each_is_written() {
 
     assert_eq!(file_names(&result["assigned"]).len(), 2, "{result}");
     let baked = &s.doc.baked[&0];
-    let ao = &baked.maps[&BakedMap::AmbientOcclusion];
+    let ao = baked.maps[&BakedMap::AmbientOcclusion].to_f32();
     let width = baked.resolution as usize;
     let middle_row = ao.len() / width / 2 * width;
     assert!(ao[middle_row + width / 4] < ao[middle_row + 3 * width / 4], "each tile reads its own file");
@@ -251,7 +251,7 @@ fn tiled_import_uses_new_images_when_resource_names_collide() {
     import(&mut session, &dir, &files.map(|file| (file, None)));
 
     let baked = &session.doc.baked[&0];
-    let ao = &baked.maps[&BakedMap::AmbientOcclusion];
+    let ao = baked.maps[&BakedMap::AmbientOcclusion].to_f32();
     let width = baked.resolution as usize;
     let row = ao.len() / width / 2 * width;
     assert!((ao[row + width / 4] - 20.0 / 255.0).abs() < 1e-5);

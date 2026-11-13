@@ -217,7 +217,7 @@ fn ao_mixes_baked_and_channel() {
     channels.push(Channel::AmbientOcclusion);
     let mut fx = Fx::new(&channels);
     fx.set_all(Channel::AmbientOcclusion, |_, _| [0.5; 3]);
-    fx.baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, std::sync::Arc::new(vec![0.5; (RES * RES) as usize]))].into() };
+    fx.baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, std::sync::Arc::new(vec![0.5; (RES * RES) as usize].into()))].into() };
     fx.project.texture_sets[0].baked.insert(BakedMap::AmbientOcclusion);
     let orm = decode(find(&fx.render_preset("glTF PBR Metal Roughness"), "Metallic.png")).to_rgb8();
     assert!((orm.get_pixel(3, 3)[0] as i32 - 64).abs() <= 1);

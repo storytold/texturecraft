@@ -75,7 +75,7 @@ pub(crate) fn use_images(s: &mut Session, cmd: &str, ts: usize, map: BakedMap, i
 
     let entry = s.doc.baked.entry(ts).or_default();
     entry.resolution = width;
-    entry.maps.insert(map, Arc::new(data));
+    entry.maps.insert(map, Arc::new(data.into()));
     s.doc.project.texture_set_mut(ts)?.baked.insert(map);
     Ok(width)
 }

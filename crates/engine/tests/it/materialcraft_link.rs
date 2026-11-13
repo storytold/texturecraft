@@ -161,7 +161,10 @@ fn duplicates_keep_their_maps_and_mesh_maps_feed_inputs() {
     assert!(session.doc.resources.contains_key(&shared), "the duplicate still shows the first cook");
 
     let maps = [BakedMap::Curvature, BakedMap::Normal, BakedMap::WorldNormal, BakedMap::AmbientOcclusion, BakedMap::BentNormal];
-    session.doc.baked.insert(0, BakedMaps { resolution: 4, maps: maps.into_iter().map(|map| (map, Arc::new(vec![0.5f32; 16 * map.components()]))).collect() });
+    session
+        .doc
+        .baked
+        .insert(0, BakedMaps { resolution: 4, maps: maps.into_iter().map(|map| (map, Arc::new(vec![0.5f32; 16 * map.components()].into()))).collect() });
     let job = session.link_job(id, &serde_json::Map::new()).unwrap();
     assert_eq!(job.inputs.iter().map(|(identifier, _)| identifier.as_str()).collect::<Vec<_>>(), maps.map(BakedMap::id));
     assert_eq!(maps.map(BakedMap::id), ["curvature", "normal", "worldNormal", "ambientOcclusion", "bentNormal"]);
