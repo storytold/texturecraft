@@ -609,3 +609,15 @@ fn directx_normal_images_flip_green() {
     let old: texturecraft_engine::core::Source = serde_json::from_value(json!({"Image": {"name": "n"}})).unwrap();
     assert_eq!(old, texturecraft_engine::core::Source::image("n"));
 }
+
+#[test]
+fn layer_move_with_huge_delta_saturates() {
+    let mut s = session();
+    let a = id(execute(&mut s, "layer.add.paint", &Value::Null).unwrap(), "layer");
+    let b = id(execute(&mut s, "layer.add.paint", &Value::Null).unwrap(), "layer");
+    execute(&mut s, "layer.move", &json!({"layer": a.0, "delta": i64::MAX})).unwrap();
+    let top = s.doc.project.locate(a).unwrap().2;
+    assert!(top > s.doc.project.locate(b).unwrap().2);
+    execute(&mut s, "layer.move", &json!({"layer": a.0, "delta": i64::MIN})).unwrap();
+    assert_eq!(s.doc.project.locate(a).unwrap().2, 0);
+}

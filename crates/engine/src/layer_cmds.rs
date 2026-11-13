@@ -223,7 +223,7 @@ fn move_layer(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("Move layer", |s| {
         if let Some(d) = p.get("delta").and_then(Value::as_i64) {
             let (_, _, i) = s.doc.project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
-            let to = (i as i64 + d).max(0) as usize;
+            let to = (i as i64).saturating_add(d).max(0) as usize;
             s.doc.project.move_layer(id, to)?;
         } else if let Some(i) = u64p(p, "index") {
             s.doc.project.move_layer(id, usize::try_from(i).unwrap_or(usize::MAX))?;
