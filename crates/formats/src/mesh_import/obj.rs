@@ -13,7 +13,7 @@ pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
 
 fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
     let text = String::from_utf8_lossy(bytes);
-
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     // A synthetic library lets tobj assign usemtl names without reading external MTL files
     let mut names: Vec<&str> = Vec::new();
     for line in text.lines().map(str::trim) {
