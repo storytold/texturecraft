@@ -385,6 +385,10 @@ impl Default for DisplaySettings {
     }
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub format_version: u32,
@@ -395,6 +399,10 @@ pub struct Project {
     /// it, so parts the file leaves unnamed get the same name (from it) as on import.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mesh_file: String,
+    /// Animation frame (sample index) of the stored mesh the project is on. The session holds
+    /// the live value and writes it here when saving.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub mesh_frame: u32,
     /// Where the mesh file was imported from (the project's "3D mesh path"). Reimport mesh reads
     /// it again from there, so edits made to the file since are picked up. Empty when unknown
     /// (built-in meshes, web imports, projects saved before it was kept).
@@ -417,6 +425,7 @@ impl Project {
             name: name.into(),
             mesh: mesh.into(),
             mesh_file: String::new(),
+            mesh_frame: 0,
             mesh_path: String::new(),
             normal_format: NormalFormat::OpenGl,
             texture_sets: Vec::new(),
