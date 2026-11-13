@@ -225,6 +225,15 @@ fn obj_flips_v_and_keeps_usemtl_materials() {
 }
 
 #[test]
+fn obj_ignores_bare_usemtl() {
+    for src in [&b"v 0 0 0\nv 1 0 0\nv 0 1 0\nusemtl \nf 1 2 3\n"[..], b"v 0 0 0\nv 1 0 0\nv 0 1 0\nusemtl\nf 1 2 3\n"] {
+        let im = import_mesh_bytes("a.obj", src).unwrap();
+        assert_eq!(im.mesh.materials, vec!["Default".to_string()]);
+        assert_eq!(im.mesh.submeshes.iter().map(|s| s.count / 3).sum::<u32>(), 1);
+    }
+}
+
+#[test]
 fn obj_without_uvs_or_normals_is_completed() {
     let im = import_mesh_bytes("b.OBJ", b"v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 3 2\nf 1 2 4\nf 1 4 3\nf 2 3 4\n").unwrap();
     assert!(im.report.uvs_generated);

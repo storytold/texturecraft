@@ -27,7 +27,14 @@ fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
     }
 
     let library: String = names.iter().map(|name| format!("newmtl {name}\n")).collect();
-    let source = format!("mtllib texturecraft-usemtl.mtl\n{text}");
+    // A bare `usemtl` has no library entry, and tobj would reject the unknown name: drop the line
+    let mut source = String::from("mtllib texturecraft-usemtl.mtl\n");
+    for line in text.lines() {
+        if line.trim() != "usemtl" {
+            source.push_str(line);
+            source.push('\n');
+        }
+    }
 
     // Polygons stay whole so the wireframe can show them; `RawMesh::polygon` triangulates
     let options = tobj::LoadOptions { single_index: true, triangulate: false, ignore_points: true, ignore_lines: true };
