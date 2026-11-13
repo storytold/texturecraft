@@ -23,6 +23,7 @@ mod mask_value_swap;
 mod new_project_baked_maps;
 mod path_in_view;
 mod path_list;
+mod pattern_scale_slider;
 mod pen_pressure;
 mod polygon_fill;
 mod properties_popup;

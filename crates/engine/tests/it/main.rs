@@ -19,6 +19,7 @@ mod meshmap_import;
 mod painter_gaps;
 mod path_perf;
 mod path_tool;
+mod pattern_scale;
 mod perf;
 mod polygon_fill;
 mod project_recovery;

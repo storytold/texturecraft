@@ -2174,9 +2174,12 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                     let mut seed = pattern.seed as f32;
                     let r3 = slider_edit(ui, tr("Seed"), &mut seed, 0.0..=999.0, 0);
                     if let Some(merge) = r1.or(r2).or(r3) {
+                        // The slider is f32; send its value only when the Seed slider moved, so a
+                        // Scale or Contrast drag keeps seeds above 2^24 exactly.
+                        let seed = if r3.is_some() { seed as u64 } else { u64::from(pattern.seed) };
                         app.run(
                             "layer.fill.set",
-                            set(json!({"procedural": pattern.kind.label(), "scale": s, "contrast": con, "seed": seed as u64, "low": low, "high": high, "merge": merge})),
+                            set(json!({"procedural": pattern.kind.label(), "scale": s, "contrast": con, "seed": seed, "balance": pattern.balance, "invert": pattern.invert, "low": low, "high": high, "merge": merge})),
                         );
                     }
                     if c.kind() == ChannelKind::Color {
@@ -2191,7 +2194,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                         if changed {
                             app.run(
                                 "layer.fill.set",
-                                set(json!({"procedural": pattern.kind.label(), "scale": s, "contrast": con, "seed": pattern.seed, "low": lo, "high": hi})),
+                                set(json!({"procedural": pattern.kind.label(), "scale": s, "contrast": con, "seed": pattern.seed, "balance": pattern.balance, "invert": pattern.invert, "low": lo, "high": hi})),
                             );
                         }
                     }
