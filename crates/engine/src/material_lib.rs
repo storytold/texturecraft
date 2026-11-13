@@ -25,7 +25,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add smart material from file",
             [],
             None,
-            "{path: .tcmat smart material, .mcmat MaterialCraft material or .mcraft package, above?: layer id, inside?: bool, index?: n} — above the selection by default, or placed like material.apply",
+            "{path: .tcmat smart material, .mcmat/.mcraft MaterialCraft material, or .spsm/.spmsk/.sbsar, above?: layer id, inside?: bool, index?: n} — above the selection by default, or placed like material.apply",
             always,
             load
         ),
@@ -155,6 +155,13 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(not(target_arch = "wasm32"))]
 fn load(s: &mut Session, p: &Value) -> Result<Value> {
     let path = strp(p, "path").ok_or_else(|| bad("material.load", "`path` is required"))?;
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if ext == "spp" {
+        return Err(bad("material.load", "use file.open to open .spp projects"));
+    }
+    if matches!(ext.as_str(), "spsm" | "spmsk" | "sbsar") {
+        return crate::project_import::dispatch(s, path, Place::from_params(p));
+    }
     let bytes = std::fs::read(path).map_err(|e| bad("material.load", format!("cannot read {path}: {e}")))?;
     let id = s.add_smart_material_bytes_at(&bytes, Place::from_params(p))?;
     Ok(json!({ "layer": id.0 }))
@@ -168,4 +175,16 @@ fn save(_: &mut Session, _: &Value) -> Result<Value> {
 #[cfg(target_arch = "wasm32")]
 fn load(_: &mut Session, _: &Value) -> Result<Value> {
     Err(EngineError::Other("file paths are not available in the browser".into()))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_rejects_project_files() {
+        let mut session = Session::new_project("ball", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        let err = load(&mut session, &serde_json::json!({ "path": "project.spp" })).unwrap_err();
+        assert!(err.to_string().contains("file.open"), "{err}");
+    }
 }
