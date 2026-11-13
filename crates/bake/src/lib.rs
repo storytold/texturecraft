@@ -257,7 +257,7 @@ fn bake_in_strips(
                 if progress.cancel.load(Relaxed) {
                     return Err(BakeError::Cancelled);
                 }
-                // Global sample indices keep noise unchanged across strip and batch sizes
+                // Global texel indices keep noise unchanged across strip and batch sizes
                 bake_rows(
                     &context,
                     &maps,
@@ -266,7 +266,7 @@ fn bake_in_strips(
                     scene.as_mut(),
                     batch,
                     batch_index * rows_per_batch,
-                    (width, samples_per_axis, sample_start_y * sample_width),
+                    (width, samples_per_axis, strip_start * width),
                 )?;
                 rows_done += batch.len() as u64;
                 progress.done.store((rows_done.saturating_mul(10_000) / total_rows).min(10_000) as u32, Relaxed);
@@ -324,7 +324,7 @@ fn bake_rows(
     scene: &mut dyn RayScene,
     rows: &mut [OutRow],
     first_row: usize,
-    (width, samples_per_axis, first_sample_seed): (usize, usize, usize),
+    (width, samples_per_axis, first_texel_seed): (usize, usize, usize),
 ) -> Result<(), BakeError> {
     let sample_width = width * samples_per_axis;
     let samples_by_row: Vec<Vec<map::Sample>> = (first_row..first_row + rows.len())
@@ -335,16 +335,26 @@ fn bake_rows(
                     (x, (row * samples_per_axis + sample_index / samples_per_axis) * sample_width + x * samples_per_axis + sample_index % samples_per_axis)
                 })
             });
-            subsamples
+            let mut samples = subsamples
                 .filter_map(|(x, sample_index)| {
                     Some(map::Sample {
                         x,
                         surface: gbuffer.surface(mesh, sample_index)?,
                         bary: *gbuffer.bary.get(sample_index)?,
-                        seed: (first_sample_seed + sample_index) as u64,
+                        seed: (first_texel_seed + row * width + x) as u64,
+                        subset: 0,
+                        subsets: 1,
                     })
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            // The covered subsamples of a texel share its rays
+            for texel in samples.chunk_by_mut(|a, b| a.x == b.x) {
+                let subsets = u32::try_from(texel.len()).unwrap_or(u32::MAX);
+                for (subset, sample) in (0..).zip(texel) {
+                    (sample.subset, sample.subsets) = (subset, subsets);
+                }
+            }
+            samples
         })
         .collect();
     let row_offsets: Vec<usize> = samples_by_row
@@ -382,7 +392,7 @@ fn bake_rows(
             .par_iter()
             .zip(&row_offsets)
             .flat_map_iter(|(row, &first)| row.iter().zip(first..))
-            .map(|(sample, sample_index)| context.query(transfer(sample_index), &sample.surface, sample.seed))
+            .map(|(sample, sample_index)| context.query(transfer(sample_index), &sample.surface, sample.seed, (sample.subset, sample.subsets)))
             .collect(),
         false => Vec::new(),
     };
@@ -394,33 +404,43 @@ fn bake_rows(
     let (occlusion_results, separate_bent_results, thickness) =
         (next(context.ao.is_some()), next(separate_bent_pass.is_some()), next(context.thickness.is_some()));
     let bent_results = if separate_bent_pass.is_some() { &separate_bent_results } else { &occlusion_results };
+    // What a thickness query with no accepted ray reports (Hemisphere::evaluate)
+    let thickness_dmax = context.thickness.map_or(1.0, |pass| pass.dmax);
 
     rows.par_iter_mut().zip(&samples_by_row).zip(&row_offsets).for_each(|((row, samples), &first)| {
         let mut sample_values = [[0.0f32; 3]; BakedMap::ALL.len()];
         let mut row_sample_index = 0;
         for x in 0..width {
+            let texel_samples = samples.get(row_sample_index..).unwrap_or_default().iter().take_while(|sample| sample.x == x).count();
+            let texel = first + row_sample_index..first + row_sample_index + texel_samples;
+            let bent = texel_bent_normal(bent_results, texel.clone());
+            // A split texel none of whose rays was accepted reports what one query with no accepted ray does
+            let (ao_unset, thickness_unset) = (no_accepted_ray(&occlusion_results, texel.clone()), no_accepted_ray(&thickness, texel));
+            // Per map: a subsample without a finite value (a ray subset with no accepted ray) is skipped
             let mut accumulated = [[0.0f32; 3]; BakedMap::ALL.len()];
-            let mut sample_count = 0u32;
+            let mut counts = [0u32; BakedMap::ALL.len()];
             while let Some(sample) = samples.get(row_sample_index).filter(|sample| sample.x == x) {
                 let sample_index = first + row_sample_index;
                 let traced = map::Traced {
-                    ao: occlusion_results.get(sample_index).map_or(1.0, |value| value[0]),
-                    bent: bent_results.get(sample_index).map(|value| Vec3::new(value[1], value[2], value[3])),
-                    thickness: thickness.get(sample_index).map_or(1.0, |value| value[0]),
+                    ao: occlusion_results.get(sample_index).map_or(1.0, |value| if ao_unset { 1.0 } else { value[0] }),
+                    bent,
+                    thickness: thickness.get(sample_index).map_or(1.0, |value| if thickness_unset { thickness_dmax } else { value[0] }),
                     curvature: curvature.get(sample_index).copied().unwrap_or(0.5),
                 };
                 context.evaluate(maps, &sample.surface, sample.bary, transfer(sample_index), &traced, &mut sample_values);
-                for (sum, value) in accumulated.iter_mut().zip(&sample_values) {
-                    sum.iter_mut().zip(value).for_each(|(sum, value)| *sum += value);
+                for ((sum, count), value) in accumulated.iter_mut().zip(&mut counts).zip(&sample_values) {
+                    if value.iter().all(|value| value.is_finite()) {
+                        sum.iter_mut().zip(value).for_each(|(sum, value)| *sum += value);
+                        *count += 1;
+                    }
                 }
-                sample_count += 1;
                 row_sample_index += 1;
             }
 
-            for ((map, destination), sum) in maps.iter().zip(row.iter_mut()).zip(&accumulated) {
+            for (((map, destination), sum), &count) in maps.iter().zip(row.iter_mut()).zip(&accumulated).zip(&counts) {
                 let component_count = map.components();
-                let mean = sum.map(|sum| sum / sample_count.max(1) as f32);
-                let value = if sample_count == 0 || mean.iter().any(|value| !value.is_finite()) { map.neutral() } else { mean };
+                let mean = sum.map(|sum| sum / count.max(1) as f32);
+                let value = if count == 0 || mean.iter().any(|value| !value.is_finite()) { map.neutral() } else { mean };
                 if let Some(pixel) = destination.get_mut(x * component_count..(x + 1) * component_count) {
                     pixel.iter_mut().zip(value).for_each(|(component, value)| *component = value);
                 }
@@ -428,4 +448,24 @@ fn bake_rows(
         }
     });
     Ok(())
+}
+
+/// Whether the texel whose subsamples have these hemisphere results split its rays and none of them
+/// was accepted (every subset reported NaN). Such a texel takes the value a single query with no
+/// accepted ray gives (unoccluded, or the maximum ray distance), as it would without antialiasing,
+/// rather than the map's display neutral. A texel traced as one query never reports NaN.
+fn no_accepted_ray(results: &[[f32; 4]], texel: std::ops::Range<usize>) -> bool {
+    results.get(texel).is_some_and(|values| values.len() > 1 && values.iter().all(|value| value[0].is_nan()))
+}
+
+/// The bent normal of the texel whose subsamples have these hemisphere results. A texel traced as one
+/// query has its own; subsamples that split a texel's rays hold unnormalized sums of open directions
+/// (NaN for a subset with no accepted ray), normalized here once for the texel. None (each subsample
+/// then falls back to its surface normal) without a bent pass or when no ray is open.
+fn texel_bent_normal(results: &[[f32; 4]], texel: std::ops::Range<usize>) -> Option<Vec3> {
+    let mut bent = results.get(texel)?.iter().map(|value| Vec3::new(value[1], value[2], value[3]));
+    match bent.len() {
+        1 => bent.next(),
+        _ => bent.filter(|value| value.is_finite()).sum::<Vec3>().try_normalize(),
+    }
 }
