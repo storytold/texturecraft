@@ -291,15 +291,19 @@ impl Headless {
             Some(Value::String(a)) if a == "all" => (0..n).collect(),
             Some(v) => vec![v.as_u64().and_then(|t| usize::try_from(t).ok()).filter(|t| *t < n).ok_or_else(|| bad(format!("invalid `ts` {v}")))?],
         };
-        let files = self.session.export_files(&sets, &opts)?;
         self.create_dir_all(dir)?;
         let mut written = Vec::new();
-        for f in &files {
-            let path = join(dir, &f.name);
-            self.write(&path, &f.bytes)?;
-            written.push(path);
+        let mut warnings: Vec<String> = Vec::new();
+        // set by set, each one's files written before the next is composited: a large project's maps are never all
+        // held at once
+        for ts in sets {
+            for f in self.session.export_files(&[ts], &opts)? {
+                let path = join(dir, &f.name);
+                self.write(&path, &f.bytes)?;
+                written.push(path);
+                warnings.extend(f.warnings);
+            }
         }
-        let warnings: Vec<&String> = files.iter().flat_map(|f| &f.warnings).collect();
         Ok(json!({ "files": written, "warnings": warnings }))
     }
 

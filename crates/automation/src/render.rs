@@ -9,6 +9,9 @@ use texturecraft_render::gpu_trace::GpuTracer;
 use texturecraft_render::trace::{TraceDisplay, TraceScene, TraceSet, TraceSettings, Tracer};
 use texturecraft_render::{Frame, Shade, ViewKind};
 
+/// Display tiles converted and uploaded between two hand-overs to the device.
+const UPLOAD_CHUNK: usize = 256;
+
 /// A headless GPU device that remembers what it already holds of the session.
 pub struct Gpu {
     h: texturecraft_render::headless::Headless,
@@ -31,7 +34,6 @@ impl Gpu {
 
     /// Bring the GPU up to date with `s` (mesh, texture sets, environment, dirty tiles).
     fn sync(&mut self, s: &mut Session) {
-        s.update();
         let h = &mut self.h;
         let mut reupload = false;
         if self.mesh_id != s.mesh_id {
@@ -53,6 +55,8 @@ impl Gpu {
             self.env.clone_from(&d.environment);
         }
         for ts in 0..s.caches.len() {
+            // one set at a time: composited, uploaded and handed to the device before the next
+            s.update_only(&[ts]);
             let mut tiles = s.take_uploads(ts);
             let Some(cache) = s.caches.get(ts) else { continue };
             if reupload {
@@ -61,13 +65,18 @@ impl Gpu {
             let empty = Default::default();
             let baked = s.doc.baked.get(&ts).unwrap_or(&empty);
             let comp = &cache.composite;
-            let bytes: Vec<_> = tiles
-                .par_iter()
-                .flat_map_iter(|&(tx, ty)| DisplayKind::ALL.into_iter().map(move |k| (k, tx, ty)))
-                .map(|(k, tx, ty)| (k, tx, ty, tile_bytes(comp, baked, k, tx, ty)))
-                .collect();
-            for (k, tx, ty, b) in bytes {
-                h.renderer.upload_tile(&h.device, &h.queue, ts, k, tx, ty, &b);
+            // in chunks, so the display bytes of a whole 4K set (36 bytes a texel) are never held at once
+            for chunk in tiles.chunks(UPLOAD_CHUNK) {
+                let bytes: Vec<_> = chunk
+                    .par_iter()
+                    .flat_map_iter(|&(tx, ty)| DisplayKind::ALL.into_iter().map(move |k| (k, tx, ty)))
+                    .map(|(k, tx, ty)| (k, tx, ty, tile_bytes(comp, baked, k, tx, ty)))
+                    .collect();
+                for (k, tx, ty, b) in bytes {
+                    h.renderer.upload_tile(&h.device, &h.queue, ts, k, tx, ty, &b);
+                }
+                // what the queue staged goes to the device now, not when every set is queued
+                h.flush();
             }
             // The aux texture behind the mesh-map and mask views (rebuilt every render).
             let res = texturecraft_render::aux_size(cache.size);

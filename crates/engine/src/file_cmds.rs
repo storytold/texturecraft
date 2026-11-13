@@ -240,11 +240,12 @@ impl Session {
 
     /// Render every export file for texture sets `sets` (in memory; works on the web).
     pub fn export_files(&mut self, sets: &[usize], opts: &ExportOptions) -> Result<Vec<ExportedFile>> {
-        self.update();
         let mesh_name = stem_of(self.doc.project.mesh.trim_start_matches("builtin:"));
         let mut out = Vec::new();
         let empty = Default::default();
         for &ts in sets {
+            // one set at a time: the others composite when they are exported or shown
+            self.update_only(&[ts]);
             let cache = self.caches.get(ts).ok_or_else(|| EngineError::Other(format!("no texture set {ts}")))?;
             let coverage = cache.gbuf.coverage_mask();
             let input = ExportInput {
@@ -498,9 +499,13 @@ fn export_textures(s: &mut Session, p: &Value) -> Result<Value> {
     let opts = export_options(s, p, "file.exportTextures")?;
     let sets = sets_param(s, p, "file.exportTextures")?;
     std::fs::create_dir_all(&dir).map_err(|e| bad("file.exportTextures", format!("cannot create {dir}: {e}")))?;
-    let files = s.export_files(&sets, &opts)?;
-    let mut warnings: Vec<String> = files.iter().flat_map(|f| f.warnings.iter().cloned()).collect();
-    let mut written = texturecraft_formats::write_files(&files, std::path::Path::new(&dir)).map_err(fe)?;
+    // set by set, each one's files written before the next is composited
+    let (mut warnings, mut written) = (Vec::new(), Vec::new());
+    for &ts in &sets {
+        let files = s.export_files(&[ts], &opts)?;
+        warnings.extend(files.iter().flat_map(|f| f.warnings.iter().cloned()));
+        written.extend(texturecraft_formats::write_files(&files, std::path::Path::new(&dir)).map_err(fe)?);
+    }
     if p.get("materialX").and_then(Value::as_bool).unwrap_or(false) {
         written.extend(write_materialx(s, &sets, &opts, std::path::Path::new(&dir), &mut warnings)?);
     }

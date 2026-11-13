@@ -20,6 +20,13 @@ impl Headless {
         Ok(Headless { device, queue, renderer, adapter_name })
     }
 
+    /// Hands what the queue holds (texture uploads) to the device and waits until it is taken, so that the uploads'
+    /// staging memory is free again.
+    pub fn flush(&self) {
+        self.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
+        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+    }
+
     /// Render a frame and read it back as RGBA8 (sRGB-encoded).
     pub fn render(&mut self, frame: &crate::Frame) -> Option<(u32, u32, Vec<u8>)> {
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_headless") });
