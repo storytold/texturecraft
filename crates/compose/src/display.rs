@@ -6,12 +6,15 @@
 //! |-----------|----------|-------------------|----------------|-------------------|-------------------|
 //! | BaseColor | sRGB8    | base color        |                |                   | opacity           |
 //! | Orm       | RGBA8    | AO (× baked)      | roughness      | metallic          | specular level    |
-//! | Normal    | RGBA8    | normal x          | normal y       | normal z          | sheen roughness   |
+//! | Normal    | RGBA16F  | normal x          | normal y       | normal z          | sheen roughness   |
 //! | Height    | RGBA16F  | height            | Specular (F0) r| g                 | b                 |
 //! | Emissive  | sRGB8    | emissive          |                |                   | scattering weight |
 //! | Lobes     | RGBA8    | coat weight       | coat roughness | anisotropy level  | anisotropy angle  |
 //! | Sheen     | sRGB8    | sheen color       |                |                   | sheen weight      |
 //! | Extra     | RGBA8    | coat normal x     | coat normal y  | transmission      | tile scale        |
+//!
+//! Normal holds the tangent-space normal signed (flat is `(0, 0, 1)`) in half floats: baked
+//! normals are high-precision data, and 8 bits per axis bands smooth surfaces in the shading.
 //!
 //! Extra packs the coat normal's x and y as `128 + 127 × n` (the default normal is exactly 0;
 //! z is rebuilt in the shader). Its alpha is the [`Composite::block_scales`] of the texel's UV
@@ -36,7 +39,7 @@ pub enum DisplayKind {
     /// RGBA8 linear: ambient occlusion (channel × baked), roughness (1 − glossiness when the set
     /// has a Glossiness channel), metallic, specular level.
     Orm,
-    /// RGBA8: painted tangent-space normal.
+    /// RGBA16F: the shown tangent-space normal, signed (flat is `(0, 0, 1)`), alpha = sheen roughness.
     Normal,
     /// RGBA16F: height in r, the linear Specular (F0) color in gba.
     Height,
@@ -64,7 +67,7 @@ impl DisplayKind {
 
     /// Bytes per texel of the upload format.
     pub fn bytes_per_texel(self) -> usize {
-        if self == DisplayKind::Height { 8 } else { 4 }
+        if matches!(self, DisplayKind::Height | DisplayKind::Normal) { 8 } else { 4 }
     }
 
     /// Display textures affected by a channel.
@@ -176,29 +179,23 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
             }
         }
         DisplayKind::Normal => {
-            let (n, sheen_roughness) = (get(Channel::Normal), scalar8(Channel::SheenRoughness));
-            for i in 0..TILE_AREA {
-                let pixel = &mut out[i * 4..i * 4 + 4];
-
+            let (n, sheen_roughness) = (get(Channel::Normal), get(Channel::SheenRoughness));
+            let sheen_default = Channel::SheenRoughness.default_value()[0];
+            for (i, pixel) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 // The baked normal is the base the painted normal details sit on (as in export)
                 let (x, y) = (tx * TILE + (i as u32 % TILE), ty * TILE + (i as u32 / TILE));
                 let base = baked.sample_working(BakedMap::Normal, x, y, (resolution, composite.height), &composite.block_scales);
-                match (n, base) {
-                    (Some(t), None) => {
-                        for (k, d) in pixel.iter_mut().take(3).enumerate() {
-                            *d = u8_of(t.get(i * 3 + k).copied().unwrap_or(0));
-                        }
-                    }
-                    (detail, Some(base)) => {
-                        let detail = detail.map_or([0.5, 0.5, 1.0], |t| [0, 1, 2].map(|k| t.get(i * 3 + k).map_or(0.0, |v| *v as f32 / 65535.0)));
-                        let v = texturecraft_core::blend::rnm(base, detail);
-                        for (d, v) in pixel.iter_mut().zip(v) {
-                            *d = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                        }
-                    }
-                    (None, None) => pixel[..3].copy_from_slice(&[128, 128, 255]),
+                let painted = n.map(|t| [0, 1, 2].map(|k| t.get(i * 3 + k).map_or(0.0, |v| *v as f32 / 65535.0)));
+                let packed = match (painted, base) {
+                    (Some(painted), None) => painted,
+                    (painted, Some(base)) => texturecraft_core::blend::rnm(base, painted.unwrap_or([0.5, 0.5, 1.0])),
+                    (None, None) => [0.5, 0.5, 1.0],
+                };
+                let sheen = sheen_roughness.and_then(|t| t.get(i)).map_or(sheen_default, |v| *v as f32 / 65535.0);
+                let [x, y, z] = packed.map(|v| (v * 2.0 - 1.0).clamp(-1.0, 1.0));
+                for (k, c) in [x, y, z, sheen].into_iter().enumerate() {
+                    pixel[k * 2..k * 2 + 2].copy_from_slice(&half::f16::from_f32(c).to_le_bytes());
                 }
-                pixel[3] = sheen_roughness(i);
             }
         }
         DisplayKind::Height => {
@@ -250,8 +247,7 @@ mod tests {
         let comp = Composite::new(&[], 64);
         let orm = tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Orm, 0, 0);
         assert_eq!(&orm[..4], &[255, 128, 0, 128]);
-        let n = tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Normal, 0, 0);
-        assert_eq!(&n[..4], &[128, 128, 255, 128], "sheen roughness 0.5 rides in alpha");
+        assert_eq!(normal_texel(&comp, &BakedMaps::default(), 0), [0.0, 0.0, 1.0, 0.5], "flat, sheen roughness 0.5 rides in alpha");
         assert_eq!(&tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Emissive, 0, 0)[..4], &[0, 0, 0, 0]);
         assert_eq!(&tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Lobes, 0, 0)[..4], &[0, 25, 0, 0], "lobes off, coat roughness 0.1");
         assert_eq!(&tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Sheen, 0, 0)[..4], &[255, 255, 255, 0]);
@@ -269,16 +265,34 @@ mod tests {
         // A baked normal tilted to +X (packed), 64² like the set.
         let tilted = [0.8f32, 0.5, 0.9];
         let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(tilted.repeat(64 * 64)))].into_iter().collect() };
-        let shown = |comp: &Composite| tile_bytes(comp, &baked, DisplayKind::Normal, 0, 0)[..3].to_vec();
-        let pack = |v: [f32; 3]| v.map(|x| (x * 255.0 + 0.5) as u8).to_vec();
+        let shown = |comp: &Composite| normal_texel(comp, &baked, 0)[..3].to_vec();
+        let pack = |v: [f32; 3]| v.map(|x| half::f16::from_f32(x * 2.0 - 1.0).to_f32()).to_vec();
         // No normal channel: the baked normal as it is.
         assert_eq!(shown(&Composite::new(&[], 64)), pack(tilted));
         // A flat painted normal leaves it; a painted detail is re-oriented onto it.
         let mut comp = Composite::new(&[Channel::Normal], 64);
         comp.channels.get_mut(&Channel::Normal).unwrap().set(0, 0, &[to_u16(0.5), to_u16(0.5), to_u16(1.0)]);
-        assert!(shown(&comp).iter().zip(pack(tilted)).all(|(a, b)| (*a as i32 - b as i32).abs() <= 1), "{:?}", shown(&comp));
+        assert!(shown(&comp).iter().zip(pack(tilted)).all(|(a, b)| (a - b).abs() < 1e-3), "{:?}", shown(&comp));
         comp.channels.get_mut(&Channel::Normal).unwrap().set(0, 0, &[to_u16(0.5), to_u16(0.8), to_u16(0.9)]);
         assert_eq!(shown(&comp), pack(texturecraft_core::blend::rnm(tilted, [0.5, 0.8, 0.9])));
+    }
+
+    /// Texel `i` of the Normal display tile (0, 0) decoded: signed normal, sheen roughness.
+    fn normal_texel(comp: &Composite, baked: &BakedMaps, i: usize) -> [f32; 4] {
+        let t = tile_bytes(comp, baked, DisplayKind::Normal, 0, 0);
+        [0, 1, 2, 3].map(|k| half::f16::from_le_bytes([t[i * 8 + k * 2], t[i * 8 + k * 2 + 1]]).to_f32())
+    }
+
+    #[test]
+    fn baked_normals_keep_more_than_8_bits_in_the_viewport() {
+        // A smooth baked gradient steps 1/1024 per texel: 8 bits rounded four texels to one value,
+        // which shaded as visible bands on curved surfaces.
+        let ramp: Vec<f32> = (0..64 * 64).flat_map(|i| [0.5 + (i % 64) as f32 / 1024.0, 0.5, 0.9]).collect();
+        let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(ramp))].into_iter().collect() };
+        let comp = Composite::new(&[], 64);
+        let xs: Vec<f32> = (0..8).map(|i| normal_texel(&comp, &baked, i)[0]).collect();
+        assert!(xs.windows(2).all(|w| w[1] > w[0]), "every texel of the gradient is distinct: {xs:?}");
+        assert!(xs.windows(2).all(|w| w[1] - w[0] < 1.0 / 255.0), "steps finer than one 8-bit level: {xs:?}");
     }
 
     #[test]
@@ -314,7 +328,7 @@ mod tests {
         let near = |a: &[u8], b: &[u8]| a.iter().zip(b).all(|(x, y)| x.abs_diff(*y) <= 1);
         assert!(near(&px(DisplayKind::Lobes), &[255, 51, 153, 64]), "{:?}", px(DisplayKind::Lobes));
         assert!(near(&px(DisplayKind::Sheen), &[255, 0, 188, 204]), "{:?}", px(DisplayKind::Sheen));
-        assert!(near(&px(DisplayKind::Normal)[3..], &[77]) && near(&px(DisplayKind::Emissive)[3..], &[102]));
+        assert!((normal_texel(&comp, &BakedMaps::default(), 1)[3] - 0.3).abs() < 1e-3 && near(&px(DisplayKind::Emissive)[3..], &[102]));
         assert!(near(&px(DisplayKind::Extra), &[255, 128, 153, 0]), "{:?}", px(DisplayKind::Extra));
         for c in Channel::LOBES {
             assert_ne!(DisplayKind::of_channel(c), DisplayKind::Orm, "{c:?}");
