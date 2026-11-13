@@ -320,15 +320,17 @@ fn panic_hunt_with_hostile_graphs() {
     let mut back = Session::from_project_bytes(&bytes).unwrap();
     back.update();
     let hostile = [json!({}), json!({"layer": 4, "effect": 5, "key": "../x", "value": f64::NAN, "seed": -1, "output": [1]})];
+    // One graph session per command takes both inputs in turn: the second finds the graphs already rendered, so the
+    // hunt costs one set of renders per command instead of two (the stock panic hunt above covers fresh sessions).
     for spec in command_specs() {
         if spec.id == "project.sample" {
             continue;
         }
+        let mut s = graph_session();
+        for texture_set in &mut s.doc.project.texture_sets {
+            texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
+        }
         for p in &hostile {
-            let mut s = graph_session();
-            for texture_set in &mut s.doc.project.texture_sets {
-                texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
-            }
             let _ = execute(&mut s, spec.id, p);
             s.update();
         }
