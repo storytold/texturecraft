@@ -215,7 +215,10 @@ mod tests {
     }
 
     /// The fixed `powi` gives what the compiler's gives (on the machine the tests run on), constant exponents included.
+    /// Windows' MSVC toolchain multiplies negative powers in another order (0.001^-12 lands 2 ulp away), so the
+    /// comparison only holds where `powi` is compiler-rt's `__powidf2`.
     #[test]
+    #[cfg_attr(target_env = "msvc", ignore = "the MSVC toolchain's powi is not compiler-rt's")]
     #[allow(clippy::disallowed_methods)]
     fn powi_matches_the_compilers() {
         for x in samples() {
