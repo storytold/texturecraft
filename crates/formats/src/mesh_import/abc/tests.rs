@@ -291,3 +291,22 @@ fn self_referencing_groups_are_bounded() {
     let bytes = a.archive(at, &[]);
     assert!(read(&bytes).is_err());
 }
+
+#[test]
+fn indexed_metadata_stops_at_the_entries_a_byte_can_index() {
+    // One real entry followed by a million empty ones: a byte each in the file, a `String` each
+    // in memory, and no index past 254 can be used anyway.
+    let mut block = vec![3, b'a', b'b', b'c'];
+    block.extend(std::iter::repeat_n(0u8, 1_000_000));
+    let mut kept = vec![String::new()];
+    read_indexed_meta(&block, &mut kept).unwrap();
+    assert_eq!(kept.len(), MAX_INDEXED_META);
+    assert_eq!(kept.get(1).map(String::as_str), Some("abc"));
+
+    // The file still imports, with its metadata read through the index as before.
+    let mut a = Abc { w: Writer::new() };
+    let top = a.object(vec![], &[]);
+    let mut metas = vec!["schema=AbcGeom_PolyMesh_v1"];
+    metas.extend(std::iter::repeat_n("", 5_000));
+    assert!(read(&a.archive(top, &metas)).is_ok());
+}

@@ -280,17 +280,28 @@ fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
     if root.len() < 6 || !(0..6).all(|i| is_data(i) != (i == 2)) {
         return Err(malformed(KIND, "the archive group does not have the Alembic layout"));
     }
-    // Indexed metadata: a u8 length before each string.
     let block = o.data(root[5])?;
-    let mut c = Cursor { b: block, pos: 0 };
-    while c.pos < block.len() {
-        let n = c.u8()? as usize;
-        o.indexed_meta.push(c.string(n)?);
-    }
+    read_indexed_meta(block, &mut o.indexed_meta)?;
     let mut sink = PolygonSink::default();
     let mut walk = Walk { o, sink: &mut sink, visits: 0 };
     walk.object(root[2], Mat4::IDENTITY, "", 0)?;
     Ok(sink.finish())
+}
+
+/// The most indexed metadata entries that can ever be used: objects and properties refer to one
+/// with a single byte, and 0xff already means "stored inline", so only 0 to 254 are reachable.
+const MAX_INDEXED_META: usize = 255;
+
+/// Indexed metadata: a u8 length before each string. `out` starts with the empty entry 0. Reading
+/// stops once `out` holds [`MAX_INDEXED_META`] entries, because no later entry can be referred to
+/// and an empty one costs a whole `String` in memory for one byte of file.
+fn read_indexed_meta(block: &[u8], out: &mut Vec<String>) -> Result<()> {
+    let mut c = Cursor { b: block, pos: 0 };
+    while c.pos < block.len() && out.len() < MAX_INDEXED_META {
+        let n = c.u8()? as usize;
+        out.push(c.string(n)?);
+    }
+    Ok(())
 }
 
 struct Walk<'a, 'b> {
