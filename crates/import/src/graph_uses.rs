@@ -207,15 +207,13 @@ impl Cook<'_, '_> {
     }
 
     /// An anchor feeding an image input, read in the channel the reference's first binding names, through its levels.
+    /// An anchor inside a mask gives the mask's grey there, whatever the channel (the compositor records it while it
+    /// evaluates the mask).
     fn anchor(&mut self, r: &ReferenceSource) -> Option<GraphInput> {
         let Some(info) = r.anchor_uid.and_then(|u| self.anchors.get(&u)) else {
             self.block(Blocker::feature("missing-anchor", "graph input reads an anchor that is not in the set"));
             return None;
         };
-        if info.in_mask {
-            self.block(Blocker::feature("mask-anchor", "graph input reads an anchor in a mask"));
-            return None;
-        }
         if !info.status.is_computable() {
             for b in info.status.blockers() {
                 self.status.and(&Status::not_computable(b.through("reads an anchor")));
@@ -564,6 +562,7 @@ mod tests {
         let input = SetInput { channels: &ch, images: &images, mesh_maps: &[], parts: &[], options: &options, replay: false, graphs: lib, geometry: None };
         let mut anchors = Anchors::new();
         anchors.insert(7, AnchorInfo { id: LayerId(70), in_mask: false, status: Status::Exact });
+        anchors.insert(8, AnchorInfo { id: LayerId(80), in_mask: true, status: Status::Exact });
         f(&input, &anchors)
     }
 
@@ -642,6 +641,26 @@ mod tests {
         let fill = with(Some(&lib), |i, a| fill_sources(i, a, &source(p), &[Channel::Roughness])).unwrap_err();
         assert_eq!(fill.status.blockers()[0].key.to_string(), "feature:graph-input-anchor");
         assert!(matches!(fill.effect, EffectKind::Placeholder { .. }));
+    }
+
+    #[test]
+    fn an_anchor_inside_a_mask_feeds_a_graph_input() {
+        let anchor = ReferenceSource {
+            uid: None,
+            channels: ChannelMask::default(),
+            anchor_uid: Some(8),
+            anchor_label: String::new(),
+            levels: None,
+            bindings: vec![(bit_of(Channel::Height), 0)],
+            mode: 2,
+        };
+        let mut p = procedural("mask_editor");
+        p.inputs = vec![input("mask", ProjectSource::Reference(anchor))];
+        let lib = library(vec![("mask_editor", graph("mask_editor", &["mask"], &["output"]))]);
+        let g = with(Some(&lib), |i, a| mask_generator(i, a, &source(p), Projection::default()));
+        let EffectKind::Graph { graph: r, .. } = &g.effect else { panic!("a graph effect, not locked: {g:?}") };
+        assert_eq!(r.inputs[&0], GraphInput::Anchor { anchor: LayerId(80), channel: Some(Channel::Height), levels: None });
+        assert!(g.status.is_computable());
     }
 
     #[test]
