@@ -378,6 +378,10 @@ mod native {
         let path = if ext_of(path) == PROJECT_EXT { path.to_string() } else { format!("{path}.{PROJECT_EXT}") };
         texturecraft_formats::save_project(Path::new(&path), &s.project_file()).map_err(fe)?;
         if adopt {
+            // what the document has not read yet comes from the new file from now on
+            if let Some(old) = s.path.as_deref().filter(|old| *old != path) {
+                texturecraft_formats::project_moved(Path::new(old), Path::new(&path));
+            }
             s.path = Some(path.clone());
             s.modified = false;
         }

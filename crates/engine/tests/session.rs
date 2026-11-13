@@ -723,3 +723,34 @@ fn unparseable_color_param_returns_error() {
     let err = execute(&mut s, "tool.click", &json!({"uv": [0.2, 0.8, 0.4]})).unwrap_err();
     assert_eq!(err.to_string(), "`tool.click`: a 2D view point needs `uv` as [u, v]");
 }
+
+#[test]
+fn an_opened_project_reads_its_pixels_when_it_composites_and_composites_the_same() {
+    let mut s = session();
+    execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [1.0, 0.0, 0.0]})).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 20, "hardness": 90})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[180, 200], [220, 200]]})).unwrap();
+    s.update();
+    let dir = std::env::temp_dir().join(format!("tc-lazy-open-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (path, moved) = (dir.join("a.tcraft"), dir.join("b.tcraft"));
+    execute(&mut s, "file.saveCopy", &json!({"path": path.to_str().unwrap()})).unwrap();
+
+    let mut back = texturecraft_engine::file_cmds::open_path(path.to_str().unwrap()).unwrap();
+    assert!(!back.doc.pixels.layers.is_empty());
+    assert!(back.doc.pixels.layers.values().all(|img| !img.is_loaded()), "nothing read at open");
+    back.update();
+    assert!(back.doc.pixels.layers.values().any(|img| img.is_loaded()), "read to composite");
+    for c in [Channel::BaseColor, Channel::Roughness] {
+        assert!(back.caches[0].composite.channels.get(&c) == s.caches[0].composite.channels.get(&c), "{c:?} composites the same");
+    }
+    // saved under another name, the document lives there
+    execute(&mut back, "file.save", &json!({"path": moved.to_str().unwrap()})).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    for img in back.doc.pixels.layers.values_mut() {
+        img.release();
+    }
+    assert!(back.doc.pixels.layers.values().all(|img| img.allocated_count() > 0 && !img.is_loaded()));
+    assert_eq!(back.doc.pixels.layers, s.doc.pixels.layers, "read from the new file");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

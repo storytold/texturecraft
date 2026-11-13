@@ -58,7 +58,7 @@ pub use export::write_files;
 pub use mesh_import::{import_mesh, read_mesh_file};
 #[cfg(not(target_arch = "wasm32"))]
 pub use project_file::{
-    DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, load_project, save_project, save_ram_budget, set_save_resources,
+    DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, load_project, project_moved, save_project, save_ram_budget, set_save_resources,
 };
 
 #[derive(Debug, thiserror::Error)]

@@ -877,6 +877,41 @@ impl Session {
         }
     }
 
+    /// Keeps the layer pixels and baked maps held of a project opened from its file within [`SET_DATA_BUDGET`]: beyond
+    /// it, those of the sets that are neither active nor `working` and unchanged since the file was opened let go of
+    /// what they read (read again, the same, when next needed).
+    fn trim_set_data(&mut self, working: usize) {
+        let active = self.ts();
+        let pixels = &mut self.doc.pixels;
+        let held = pixels.layers.values().chain(pixels.masks.values()).map(|i| i.bytes()).sum::<usize>()
+            + self.doc.baked.values().flat_map(|b| b.maps.values()).map(|m| m.bytes()).sum::<usize>();
+        if held <= SET_DATA_BUDGET {
+            return;
+        }
+        let project = &self.doc.project;
+        let other = |id: LayerId| {
+            let owner = project.effect(id).map_or(id, |(owner, _)| owner);
+            project.locate(owner).is_some_and(|(ts, _, _)| ts != working && ts != active)
+        };
+        for ((id, _), img) in pixels.layers.iter_mut() {
+            if other(*id) {
+                img.release();
+            }
+        }
+        for (id, img) in pixels.masks.iter_mut() {
+            if other(*id) {
+                img.release();
+            }
+        }
+        for (_, maps) in self.doc.baked.iter_mut().filter(|(ts, _)| **ts != working && **ts != active) {
+            for map in maps.maps.values_mut() {
+                if let Some(texels) = Arc::get_mut(map) {
+                    texels.release();
+                }
+            }
+        }
+    }
+
     fn update_sets(&mut self, order: &[usize], budget_ms: f64, clock: impl Fn() -> f64) -> bool {
         let start = clock();
         let first = if budget_ms.is_finite() { rayon::current_num_threads().clamp(1, CHUNK) } else { CHUNK };
@@ -906,6 +941,7 @@ impl Session {
                     self.doc.graphs.release_reloadable(COOK_BUDGET);
                     self.images.release(IMAGE_BUDGET);
                     self.trim_lookups(ts);
+                    self.trim_set_data(ts);
                 }
                 self.last_composited = Some(ts);
             }
@@ -1091,6 +1127,9 @@ const CHUNK: usize = 256;
 /// Bytes the texture sets of a document may hold together in recompositing caches (see `Session::trim_set_caches`);
 /// one set's whole-set fields alone may reach this ([`texturecraft_compose::FIELD_BUDGET`]).
 pub const SET_CACHE_BUDGET: usize = 2 << 30;
+/// Bytes of layer pixels and baked maps read from a project's file that a document holds before those of sets not
+/// compositing are let go when another set starts compositing (`Session::trim_set_data`).
+pub const SET_DATA_BUDGET: usize = 1 << 30;
 /// Bytes of UV lookups and padding maps the texture sets hold together before those of sets not compositing are let
 /// go when another set starts compositing (`Session::trim_lookups`).
 pub const LOOKUP_BUDGET: usize = 512 << 20;

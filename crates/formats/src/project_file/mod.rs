@@ -161,6 +161,16 @@ fn header(w: u32, h: u32, comps: usize, count: usize) -> Vec<u8> {
 }
 
 fn write_tiles(w: &mut impl Write, img: &TileImage) -> std::io::Result<()> {
+    // an image not held is read for the entry and let go after (its file's count may not be what reads)
+    if !img.is_loaded() {
+        let mut copy = TileImage::new(img.width(), img.height(), img.comps());
+        img.for_each_tile::<()>(|tx, ty, t| {
+            copy.set_tile(tx, ty, Some(Arc::new(t.to_vec())));
+            Ok(())
+        })
+        .unwrap_or_default();
+        return write_tiles(w, &copy);
+    }
     w.write_all(&header(img.width(), img.height(), img.comps(), img.allocated_count()))?;
     let mut buf = Vec::with_capacity(TILE_AREA * img.comps() * 2 + 8);
     for (tx, ty) in img.allocated() {
@@ -437,13 +447,102 @@ pub fn load_project_bytes(bytes: &[u8]) -> Result<ProjectFile> {
     crate::guard(KIND, || load(Cursor::new(bytes)))
 }
 
-/// The project in the file at `path`. Its cooked graph results are not read now: the project's graph store reads each
-/// from the file when a composite or a save needs it (see [`FileCooks`]), so a large project does not hold them all.
+/// The project in the file at `path`. Its layer pixels, baked maps and cooked graph results are not read now: each is
+/// read from the file when a composite or a save needs it (see [`FileCooks`], [`TileImage::lazy`], [`Texels::lazy`]),
+/// and can be let go again while unchanged, so a large project does not hold them all. A save that moves the
+/// document to another file tells them where it went ([`project_moved`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_project(path: &std::path::Path) -> Result<ProjectFile> {
     let file = std::fs::File::open(path)?;
     let limit_bytes = u64::from(project_open_limit_gib()) << 30;
-    crate::guard(KIND, || load_with_budget(std::io::BufReader::new(file), LoadBudget::new(limit_bytes), Some(path)))
+    let origin = Origin::new(path);
+    crate::guard(KIND, || load_with_budget(std::io::BufReader::new(file), LoadBudget::new(limit_bytes), Some(&origin)))
+}
+
+/// Where the lazily read parts of a project come from: the file it was opened from, until a save moves it.
+#[derive(Clone)]
+struct Origin(Arc<std::sync::RwLock<std::path::PathBuf>>);
+
+/// The origins of every project opened lazily and still in use.
+static ORIGINS: std::sync::Mutex<Vec<std::sync::Weak<std::sync::RwLock<std::path::PathBuf>>>> = std::sync::Mutex::new(Vec::new());
+
+impl Origin {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn new(path: &std::path::Path) -> Origin {
+        let origin = Origin(Arc::new(std::sync::RwLock::new(path.to_path_buf())));
+        let mut all = ORIGINS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.retain(|o| o.strong_count() > 0);
+        all.push(Arc::downgrade(&origin.0));
+        origin
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// The archive, opened again for one read.
+    fn open(&self) -> Result<ZipArchive<std::io::BufReader<std::fs::File>>> {
+        let file = std::fs::File::open(self.path())?;
+        let zip = ZipArchive::with_config(zip::read::Config { archive_offset: zip::read::ArchiveOffset::Known(0) }, std::io::BufReader::new(file));
+        zip.map_err(zip_err)
+    }
+}
+
+/// A project opened lazily from `from` was saved to `to` and is from now on that file: its parts not read yet are read
+/// from there (the save wrote them under the same names).
+pub fn project_moved(from: &std::path::Path, to: &std::path::Path) {
+    let all = ORIGINS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for origin in all.iter().filter_map(std::sync::Weak::upgrade) {
+        let mut path = origin.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *path == from {
+            *path = to.to_path_buf();
+        }
+    }
+}
+
+/// The tiles of the entry `name` (a `size` image of `comps` components) read from `origin`, slot by slot.
+fn lazy_tiles(origin: &Origin, name: &str, size: (u32, u32), comps: usize) -> Option<Vec<Option<texturecraft_texel::TileData>>> {
+    let mut zip = origin.open().ok()?;
+    let mut f = zip.by_name(name).ok()?;
+    let limit_bytes = u64::from(project_open_limit_gib()) << 30;
+    let img = read_tiles(&mut f, size, comps, &mut LoadBudget::new(limit_bytes), name).ok()?;
+    Some((0..img.tiles_y()).flat_map(|ty| (0..img.tiles_x()).map(move |tx| (tx, ty))).map(|(tx, ty)| img.tile_handle(tx, ty).cloned()).collect())
+}
+
+/// The image of entry `name`: its header read and checked now, its tiles from `origin` when needed.
+fn lazy_image(f: &mut impl Read, origin: &Origin, name: &str, size: (u32, u32), comps: usize, budget: &mut LoadBudget) -> Result<TileImage> {
+    budget.take(BIN_HEADER_BYTES as u64).map_err(FormatError::TooLarge)?;
+    let (width, height, stored, count) = read_header(f, name)?;
+    if (width, height) != size || stored != comps {
+        return Err(malformed(KIND, format!("{name}: {width}×{height}×{stored} does not match the texture set ({}×{}×{comps})", size.0, size.1)));
+    }
+    let probe = TileImage::new(width, height, comps);
+    if count > (probe.tiles_x() as usize) * (probe.tiles_y() as usize) {
+        return Err(malformed(KIND, format!("{name}: {count} tiles is more than the image holds")));
+    }
+    let (origin, entry) = (origin.clone(), name.to_string());
+    Ok(TileImage::lazy(width, height, comps, count, Arc::new(move || lazy_tiles(&origin, &entry, size, comps))))
+}
+
+/// The baked map of entry `name`: its header read and checked now, its values from `origin` when needed.
+fn lazy_baked(f: &mut impl Read, origin: &Origin, name: &str, declared_bytes: u64, components: usize, budget: &mut LoadBudget) -> Result<(u32, u32, Texels)> {
+    budget.take(BIN_HEADER_BYTES as u64).map_err(FormatError::TooLarge)?;
+    let (width, height, stored, _) = read_header(f, name)?;
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_TEXELS || stored != components {
+        return Err(malformed(KIND, format!("{name}: bad size {width}×{height}×{stored}")));
+    }
+    let count = u64::from(width) * u64::from(height) * components as u64;
+    if declared_bytes != BIN_HEADER_BYTES as u64 + count * 4 {
+        return Err(malformed(KIND, format!("{name}: {declared_bytes} bytes for a {width}×{height}×{components} map")));
+    }
+    let (origin, entry) = (origin.clone(), name.to_string());
+    let source = Arc::new(move || {
+        let mut zip = origin.open().ok()?;
+        let mut f = zip.by_name(&entry).ok()?;
+        let limit_bytes = u64::from(project_open_limit_gib()) << 30;
+        read_baked(&mut f, declared_bytes, components, &mut LoadBudget::new(limit_bytes), &entry).ok().map(|(_, _, values)| values)
+    });
+    Ok((width, height, Texels::lazy(count as usize, source)))
 }
 
 fn read_all(reader: &mut impl Read, cap: u64, budget: &mut LoadBudget, what: &str) -> Result<Vec<u8>> {
@@ -596,7 +695,7 @@ fn cook_output_head<R: Read + Seek>(zip: &mut ZipArchive<R>, file: &str) -> Resu
 /// The cooks `index` lists, each whole or not at all; a cook with a missing or malformed output is left out with a
 /// warning (it is rendered again when it is needed). With `lazy` (the file the archive is read from) the cooks are
 /// not read now: the store is told what the file holds and reads each when it is needed.
-fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mut ProjectFile, budget: &mut LoadBudget, lazy: Option<&std::path::Path>) {
+fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mut ProjectFile, budget: &mut LoadBudget, lazy: Option<&Origin>) {
     let mut dropped = 0usize;
     let mut kept: BTreeMap<String, CookEntry> = BTreeMap::new();
     let mut outlines = std::collections::HashMap::new();
@@ -628,10 +727,10 @@ fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mu
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some(path) = lazy
+    if let Some(origin) = lazy
         && !kept.is_empty()
     {
-        pf.graphs.read_cooks_from(Arc::new(FileCooks { path: path.to_path_buf(), cooks: kept }), outlines);
+        pf.graphs.read_cooks_from(Arc::new(FileCooks { origin: origin.clone(), cooks: kept }), outlines);
     }
     #[cfg(target_arch = "wasm32")]
     let _ = (kept, outlines);
@@ -646,7 +745,7 @@ fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mu
 /// reads, under the same entry names. A cook that cannot be read any more is rendered again, the same pixels.
 #[cfg(not(target_arch = "wasm32"))]
 struct FileCooks {
-    path: std::path::PathBuf,
+    origin: Origin,
     cooks: BTreeMap<String, CookEntry>,
 }
 
@@ -656,7 +755,7 @@ impl texturecraft_compose::graphs::spill::CookSource for FileCooks {
         let entry = self.cooks.get(key)?;
         let limit_bytes = u64::from(project_open_limit_gib()) << 30;
         crate::guard(KIND, || {
-            let file = std::fs::File::open(&self.path)?;
+            let file = std::fs::File::open(self.origin.path())?;
             let metadata_only = Cell::new(true);
             let mut zip = open_archive(std::io::BufReader::new(file), &metadata_only, MAX_ZIP_METADATA_BYTES)?;
             Ok(read_cook(&mut zip, entry, &mut LoadBudget::new(limit_bytes)))
@@ -706,7 +805,7 @@ fn open_archive<'a, R: Read + Seek>(reader: R, metadata_only: &'a Cell<bool>, me
     Ok(archive)
 }
 
-fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget, lazy_cooks: Option<&std::path::Path>) -> Result<ProjectFile> {
+fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget, lazy: Option<&Origin>) -> Result<ProjectFile> {
     let metadata_only = Cell::new(true);
     let mut zip = open_archive(reader, &metadata_only, MAX_ZIP_METADATA_BYTES)?;
     check_archive(&mut zip, budget.remaining())?;
@@ -812,13 +911,19 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget, lazy_cook
             // Drop pixels of layers that are no longer in any stack
             let Some(size) = size_of(id) else { continue };
 
-            let img = read_tiles(&mut f, size, c.components() + 1, &mut budget, &name)?;
+            let img = match lazy {
+                Some(origin) => lazy_image(&mut f, origin, &name, size, c.components() + 1, &mut budget)?,
+                None => read_tiles(&mut f, size, c.components() + 1, &mut budget, &name)?,
+            };
             pf.pixels.layers.insert((id, c), img);
         } else if let Some(rest) = name.strip_prefix("pixels/mask_").and_then(|r| r.strip_suffix(".bin")) {
             let id = LayerId(rest.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?);
             let Some(size) = size_of(id) else { continue };
 
-            let img = read_tiles(&mut f, size, 2, &mut budget, &name)?;
+            let img = match lazy {
+                Some(origin) => lazy_image(&mut f, origin, &name, size, 2, &mut budget)?,
+                None => read_tiles(&mut f, size, 2, &mut budget, &name)?,
+            };
             pf.pixels.masks.insert(id, img);
         } else if let Some(id) = strokes::entry_id(&name) {
             let id = id.ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
@@ -852,19 +957,25 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget, lazy_cook
                 continue;
             }
 
-            let (res, height, data) = read_baked(&mut f, declared_bytes, m.components(), &mut budget, &name)?;
+            let (res, height, data) = match lazy {
+                Some(origin) => lazy_baked(&mut f, origin, &name, declared_bytes, m.components(), &mut budget)?,
+                None => {
+                    let (res, height, values) = read_baked(&mut f, declared_bytes, m.components(), &mut budget, &name)?;
+                    (res, height, Texels::new(values))
+                }
+            };
             let maps = pf.baked.entry(ts).or_default();
             if maps.maps.is_empty() {
                 maps.resolution = res;
             } else if maps.resolution != res || maps.maps.keys().next().is_some_and(|k| maps.height(*k) != height) {
                 return Err(malformed(KIND, format!("{name}: baked maps of one texture set differ in size")));
             }
-            maps.maps.insert(m, Arc::new(Texels::new(data)));
+            maps.maps.insert(m, Arc::new(data));
         }
         // Ignore other entries from newer minor revisions (cooked outputs are read through their index below)
     }
     if let Some(index) = cook_index {
-        load_cooks(&mut zip, index, &mut pf, &mut budget, lazy_cooks);
+        load_cooks(&mut zip, index, &mut pf, &mut budget, lazy);
     }
 
     for (id, bytes) in stroke_entries {

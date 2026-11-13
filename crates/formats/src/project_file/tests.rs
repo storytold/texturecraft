@@ -1351,3 +1351,32 @@ fn graphs_painted_by_stroke_records_keep_their_texts() {
     let back = load_project_bytes(&save_project_bytes(&s.pf).unwrap()).unwrap();
     assert_eq!(back.graphs.texts.get(&key).map(|t| t.to_string()), Some(text));
 }
+
+#[test]
+fn a_project_opened_from_its_file_reads_pixels_and_baked_maps_when_needed_and_follows_a_save_elsewhere() {
+    let Sample { pf, .. } = sample();
+    let dir = std::env::temp_dir().join(format!("tc-formats-lazy-parts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (path, moved) = (dir.join("lazy.tcraft"), dir.join("moved.tcraft"));
+    save_project(&path, &pf).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let mut back = load_project(&path).unwrap();
+    assert!(!back.pixels.layers.is_empty() && !back.baked.is_empty());
+    assert!(back.pixels.layers.values().chain(back.pixels.masks.values()).all(|img| !img.is_loaded()), "no pixels read at open");
+    assert!(back.baked.values().flat_map(|b| b.maps.values()).all(|m| m.bytes() == 0), "no baked map read at open");
+    // saved without reading them into memory, the same file
+    save_project(&path, &back).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(back.pixels.layers.values().all(|img| !img.is_loaded()));
+    assert_same(&pf, &back);
+    for img in back.pixels.layers.values_mut().chain(back.pixels.masks.values_mut()) {
+        img.release();
+    }
+    // saved elsewhere and moved there: the old file can go
+    save_project(&moved, &back).unwrap();
+    project_moved(&path, &moved);
+    std::fs::remove_file(&path).unwrap();
+    assert_same(&pf, &back);
+    assert_eq!(save_project_bytes(&back).unwrap(), bytes);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
