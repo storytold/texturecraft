@@ -185,9 +185,7 @@ mod tests {
         for p in &mut m.positions {
             *p = Vec3::new(p.x, -p.z, 0.0);
         }
-        for n in &mut m.normals {
-            *n = Vec3::Z;
-        }
+        m.normals.fill(Vec3::Z);
         m
     }
 

@@ -114,7 +114,7 @@ pub fn decode_image(key: &str, bytes: &[u8]) -> Result<Arc<[f32]>, String> {
     if body.len() % 4 != 0 {
         return Err("stroke image cut short".into());
     }
-    let values: Arc<[f32]> = body.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let values: Arc<[f32]> = body.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
     if image_key(&values) != key {
         return Err("stroke image does not match its key".into());
     }

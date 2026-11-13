@@ -109,7 +109,7 @@ pub fn decode(bytes: &[u8]) -> Option<Cooked> {
                 match r.byte()? {
                     0 => {}
                     1 => {
-                        let data: Vec<u16> = r.take(tile_bytes)?.chunks_exact(2).map(|b| <[u8; 2]>::try_from(b).map_or(0, u16::from_le_bytes)).collect();
+                        let data: Vec<u16> = r.take(tile_bytes)?.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
                         img.set_tile(tx, ty, Some(Arc::new(data)));
                     }
                     _ => return None,
