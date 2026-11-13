@@ -19,7 +19,7 @@ use texturecraft_import_reader::decode::document::{MaterialRecord, NormalMapSysc
 use texturecraft_import_reader::model::baking::{BAKING_INI, ProjectBakeSettings};
 use texturecraft_import_reader::model::cameras::{CAMERA_INI, SavedCameras};
 use texturecraft_import_reader::model::{ProjectDocument, ProjectTextureSet};
-use texturecraft_import_reader::project::{ProjectFile, paths};
+use texturecraft_import_reader::project::{CacheEntryRef, ProjectFile, paths};
 
 use crate::channels::{self, ChannelConfidence, SetChannels, uncovered_default};
 use crate::correction;
@@ -299,6 +299,8 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         if i + 1 < count {
             imported.graphs.spill_cooks();
         }
+        // and its decoded images: a later set that uses one reads it again
+        images.release();
     }
     for r in &binding.unused {
         report.add(
@@ -355,13 +357,33 @@ struct SetContext<'a, 'h> {
     span: (f32, f32),
 }
 
+/// One channel of a set's stored result: where it is in the file, its size and how many bytes it is short.
+struct StoredChannel<'e> {
+    channel: Channel,
+    entry: &'e CacheEntryRef,
+    size: (u32, u32),
+    missing_bytes: usize,
+}
+
+impl StoredChannel<'_> {
+    /// The channel read from the file, at `resolution` square.
+    fn read(&self, file: &ProjectFile, resolution: u32) -> Option<CacheImage> {
+        let mut img = read_cache(file, self.entry).ok()?;
+        if (img.image.width, img.image.height) != (resolution, resolution) {
+            img.image = resample(&img.image, resolution);
+        }
+        Some(img)
+    }
+}
+
 /// Builds one texture set into `project` and `out`.
 fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report: &mut ImportReport) -> Result<SetSummary, ImportError> {
     let record = &ctx.source.record;
     let name = record.name.clone();
     let item = |what: &str| format!("texture set \"{name}\" / {what}");
-    // the stored result
-    let mut cache: Vec<(Channel, CacheImage)> = Vec::new();
+    // the stored result: each channel read once now (whether it reads, its size), and again one at a time where it is
+    // compared and kept, so that a set never holds all its channels as floats at once
+    let mut cache: Vec<StoredChannel> = Vec::new();
     match &ctx.source.cache_set {
         None => report.add(item("stored result"), Fidelity::Approximated, "no stored result (the original never rendered this set)"),
         Some(folder) => {
@@ -382,18 +404,13 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
                     continue;
                 };
                 match read_cache(ctx.file, e) {
-                    Ok(img) => cache.push((channel, img)),
+                    Ok(img) => cache.push(StoredChannel { channel, entry: e, size: (img.image.width, img.image.height), missing_bytes: img.missing_bytes }),
                     Err(err) => report.add(item(&format!("channel {label}")), Fidelity::Approximated, format!("unreadable stored result: {err}")),
                 }
             }
         }
     }
-    let resolution = resolve_resolution(record, &cache, ctx.options, &name, report);
-    for (_, img) in cache.iter_mut() {
-        if (img.image.width, img.image.height) != (resolution, resolution) {
-            img.image = resample(&img.image, resolution);
-        }
-    }
+    let resolution = resolve_resolution(record, cache.first().map(|s| s.size), ctx.options, &name, report);
     let mut set = TextureSet::new(name.clone(), ctx.source.slot, resolution);
     let shader_model = ctx.project_set.and_then(|s| s.shader_model);
     let mut declared = SetChannels::default();
@@ -419,8 +436,8 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
             }
         }
     }
-    for (channel, _) in &cache {
-        declared.declare(*channel, texturecraft_core::ChannelFormat::default_for(*channel));
+    for s in &cache {
+        declared.declare(s.channel, texturecraft_core::ChannelFormat::default_for(s.channel));
     }
     // The original's sets always have a normal channel (it is not always declared).
     declared.declare(Channel::Normal, channels::channel_format(Channel::Normal, None));
@@ -453,7 +470,8 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
                 let fidelity = if missing > 0 { Fidelity::Approximated } else { Fidelity::Exact };
                 let note = if missing > 0 { format!("stored data {missing} bytes short (zeros)") } else { String::new() };
                 report.add(item(&format!("baked map \"{}\"", b.name)), fidelity, note);
-                maps.insert(kind, values);
+                // held as 16-bit steps where it is exact, before the next map is read
+                maps.insert(kind, texturecraft_compose::Texels::new(values));
                 set.baked.insert(kind);
             }
             Err(e) => report.add(item(&format!("baked map \"{}\"", b.name)), Fidelity::Approximated, format!("unreadable: {e}")),
@@ -571,7 +589,9 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     }
     // the safety net; the composite also cooks every graph of the set once, for every channel, so that the project
     // opens without rendering them
-    let cache_channels: Vec<Channel> = cache.iter().map(|(c, _)| *c).collect();
+    let cache_channels: Vec<Channel> = cache.iter().map(|s| s.channel).collect();
+    // the stored result's channels as layer pixels, made where a channel is read for the comparison
+    let mut kept: BTreeMap<Channel, texturecraft_texel::TileImage> = BTreeMap::new();
     let mut scores = Vec::new();
     let mut corrections: Vec<correction::ChannelCorrection> = Vec::new();
     let measuring = ctx.options.measure && !cache.is_empty() && stack.is_some();
@@ -587,16 +607,17 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
             channels.extend(project.texture_set(ts).map(|s| s.channel_list()).unwrap_or_default().into_iter().filter(|c| !cache_channels.contains(c)));
         }
         if let Some((composite, gbuf)) = safety_net::composite(&scene, &channels).filter(|_| measuring) {
-            for (c, img) in &cache {
-                scores.push((*c, safety_net::score(&composite, &gbuf, *c, img, uncovered_default(*c, shader_model))));
-            }
-            if ctx.options.original_correction {
-                let formats = project.texture_set(ts).map(|s| s.channels.clone()).unwrap_or_default();
-                for (c, img) in &cache {
+            let formats = project.texture_set(ts).map(|s| s.channels.clone()).unwrap_or_default();
+            for stored in &cache {
+                let c = &stored.channel;
+                let Some(img) = stored.read(ctx.file, resolution) else { continue };
+                scores.push((*c, safety_net::score(&composite, &gbuf, *c, &img, uncovered_default(*c, shader_model))));
+                if ctx.options.original_correction {
                     let format = formats.iter().find(|(f, _)| f == c).map_or_else(|| texturecraft_core::ChannelFormat::default_for(*c), |(_, f)| *f);
                     let tolerance = correction::TEXEL_STEPS * correction::storage_step(format);
-                    corrections.extend(correction::correct(&composite, &gbuf, *c, img, uncovered_default(*c, shader_model), tolerance));
+                    corrections.extend(correction::correct(&composite, &gbuf, *c, &img, uncovered_default(*c, shader_model), tolerance));
                 }
+                kept.insert(*c, img.image.layer_tiles(*c));
             }
         }
         // renders stopped by the flag show nothing: the set is not finished
@@ -638,9 +659,12 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         let shown = ctx.options.original_on_top && matches!(strategy, Strategy::NotReproduced | Strategy::Disagrees) || stack.is_none();
         let id = project.alloc_id();
         let layer = original_result_layer(id, &cache_channels, shown);
-        for (c, img) in &cache {
-            out.pixels.layers.insert((id, *c), img.image.layer_tiles(*c));
-            let missing = img.missing_bytes;
+        for stored in &cache {
+            let c = &stored.channel;
+            let tiles = kept.remove(c).or_else(|| stored.read(ctx.file, resolution).map(|img| img.image.layer_tiles(*c)));
+            let Some(tiles) = tiles else { continue };
+            out.pixels.layers.insert((id, *c), tiles);
+            let missing = stored.missing_bytes;
             let note =
                 if missing > 0 { format!("the original's stored result, {missing} bytes short (zeros)") } else { "the original's stored result".to_string() };
             report.add(item(&format!("channel {}", declared.label(*c))), Fidelity::Baked, note);
@@ -972,9 +996,9 @@ fn provides_base(project: &Project, ts: usize, channels: &SetChannels) -> bool {
 
 /// The stored result's size; else the document's; else the fallback; a power of two within TextureCraft's limits and the
 /// options' cap.
-fn resolve_resolution(record: &MaterialRecord, cache: &[(Channel, CacheImage)], options: &ImportOptions, name: &str, report: &mut ImportReport) -> u32 {
+fn resolve_resolution(record: &MaterialRecord, cached: Option<(u32, u32)>, options: &ImportOptions, name: &str, report: &mut ImportReport) -> u32 {
     let recorded = record.resolution_log2.filter(|r| r.iter().all(|v| (0..=14).contains(v))).map(|[w, h]| (1u32 << w).max(1u32 << h));
-    let cached = cache.first().map(|(_, i)| i.image.width.max(i.image.height));
+    let cached = cached.map(|(w, h)| w.max(h));
     let mut r = cached.or(recorded).unwrap_or(FALLBACK_RESOLUTION);
     let mut notes = Vec::new();
     if cached.is_none() && recorded.is_none() {

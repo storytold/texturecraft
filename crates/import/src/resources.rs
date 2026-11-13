@@ -139,8 +139,9 @@ pub fn read_cache(project: &ProjectFile, entry: &CacheEntryRef) -> Result<CacheI
     Ok(CacheImage { bit: entry.channel_bit, image, srgb: format == SourceFormat::CacheSrgb8Alpha8, missing_bytes: pixels.missing })
 }
 
-/// A resource of the imported project: its file bytes and the image the compositor samples.
-type Resource = (Vec<u8>, Arc<ImageRes>);
+/// A resource of the imported project: its file bytes, and the image the compositor samples while it is held (see
+/// [`ProjectImages::release`]).
+type Resource = (Vec<u8>, Option<Arc<ImageRes>>);
 
 /// A bitmap loaded for the imported project: its resource name there and its pixels.
 #[derive(Clone)]
@@ -150,43 +151,88 @@ pub struct Loaded {
 }
 
 /// The project's images as the import uses them: each bitmap URL read once, and the resources the imported project
-/// carries (by name, as files) with the decoded images the safety net composites with.
+/// carries (by name, as files) with the decoded images the safety net composites with. The decoded images are held
+/// until [`ProjectImages::release`] (after each texture set), and read from the file again when a later set uses them.
 pub struct ProjectImages<'a> {
     /// `None` for a stack built without a file (tests): no bitmap can be read.
     project: Option<&'a ProjectFile>,
-    loaded: Mutex<HashMap<String, Result<Loaded, String>>>,
+    /// By URL: the resource name, or why it cannot be read.
+    loaded: Mutex<HashMap<String, Result<String, String>>>,
+    /// By URL: the decoded images held.
+    held: Mutex<HashMap<String, Arc<ResourceImage>>>,
     out: Mutex<BTreeMap<String, Resource>>,
 }
 
 impl<'a> ProjectImages<'a> {
     pub fn new(project: &'a ProjectFile) -> Self {
-        ProjectImages { project: Some(project), loaded: Mutex::new(HashMap::new()), out: Mutex::new(BTreeMap::new()) }
+        ProjectImages { project: Some(project), loaded: Mutex::default(), held: Mutex::default(), out: Mutex::default() }
     }
 
     /// Images of no file: every bitmap is missing.
     pub fn none() -> ProjectImages<'static> {
-        ProjectImages { project: None, loaded: Mutex::new(HashMap::new()), out: Mutex::new(BTreeMap::new()) }
+        ProjectImages { project: None, loaded: Mutex::default(), held: Mutex::default(), out: Mutex::default() }
     }
 
     /// The bitmap a `urlToBitmapRes` URL names, added to the project's resources; or why it cannot be read.
     pub fn load(&self, url: &str) -> Result<Loaded, String> {
-        if let Some(hit) = self.loaded.lock().ok().and_then(|l| l.get(url).cloned()) {
-            return hit;
+        let hit = self.loaded.lock().ok().and_then(|l| l.get(url).cloned());
+        let name = match hit {
+            Some(Err(why)) => return Err(why),
+            Some(Ok(name)) => name,
+            None => {
+                let result = self.read(url);
+                if let Ok(mut l) = self.loaded.lock() {
+                    l.insert(url.to_string(), result.as_ref().map(|l| l.name.clone()).map_err(String::clone));
+                }
+                return result;
+            }
+        };
+        // read before and let go since: read again (the same pixels)
+        let image = self.held(url)?;
+        if let Ok(mut out) = self.out.lock()
+            && let Some(resource) = out.get_mut(&name)
+            && resource.1.is_none()
+        {
+            resource.1 = Some(Arc::new(image.image.image_res(!image.float)));
         }
-        let result = self.read(url);
-        if let Ok(mut l) = self.loaded.lock() {
-            l.insert(url.to_string(), result.clone());
+        Ok(Loaded { name, image })
+    }
+
+    /// The decoded image `url` names: the one held, or read again.
+    fn held(&self, url: &str) -> Result<Arc<ResourceImage>, String> {
+        if let Some(image) = self.held.lock().ok().and_then(|h| h.get(url).cloned()) {
+            return Ok(image);
         }
-        result
+        let image = Arc::new(self.decode(url)?.1);
+        if let Ok(mut h) = self.held.lock() {
+            h.insert(url.to_string(), image.clone());
+        }
+        Ok(image)
     }
 
     /// The bitmap a `urlToBitmapRes` URL names, decoded but not added to the project's resources (a brush tip); or why
     /// it cannot be read.
     pub fn peek(&self, url: &str) -> Result<Arc<ResourceImage>, String> {
-        if let Some(hit) = self.loaded.lock().ok().and_then(|l| l.get(url).cloned()) {
-            return hit.map(|l| l.image);
+        if let Some(image) = self.held.lock().ok().and_then(|h| h.get(url).cloned()) {
+            return Ok(image);
+        }
+        if let Some(Err(why)) = self.loaded.lock().ok().and_then(|l| l.get(url).cloned()) {
+            return Err(why);
         }
         self.decode(url).map(|(_, read)| Arc::new(read))
+    }
+
+    /// Lets go of the decoded images (a texture set is done); the resources' files stay, and a later set that uses an
+    /// image reads it again.
+    pub fn release(&self) {
+        if let Ok(mut h) = self.held.lock() {
+            h.clear();
+        }
+        if let Ok(mut out) = self.out.lock() {
+            for resource in out.values_mut() {
+                resource.1 = None;
+            }
+        }
     }
 
     /// The bitmap `url` names and its dataset id.
@@ -214,10 +260,14 @@ impl<'a> ProjectImages<'a> {
         let name = resource_name(url_name(url), &id, read.float);
         let bytes = read.image.resource_bytes(!read.float).map_err(|e| format!("bitmap \"{}\": {e}", url_name(url)))?;
         let res = Arc::new(read.image.image_res(!read.float));
+        let image = Arc::new(read);
         if let Ok(mut out) = self.out.lock() {
-            out.insert(name.clone(), (bytes, res));
+            out.insert(name.clone(), (bytes, Some(res)));
         }
-        Ok(Loaded { name, image: Arc::new(read) })
+        if let Ok(mut h) = self.held.lock() {
+            h.insert(url.to_string(), image.clone());
+        }
+        Ok(Loaded { name, image })
     }
 
     /// The resources the imported project carries: name → file bytes.
@@ -225,9 +275,9 @@ impl<'a> ProjectImages<'a> {
         self.out.lock().map(|o| o.iter().map(|(k, (b, _))| (k.clone(), b.clone())).collect()).unwrap_or_default()
     }
 
-    /// The same resources decoded, as the compositor samples them.
+    /// The resources decoded and held (those the texture set being built uses), as the compositor samples them.
     pub fn store(&self) -> ImageStore {
-        self.out.lock().map(|o| o.iter().map(|(k, (_, r))| (k.clone(), r.clone())).collect()).unwrap_or_default()
+        self.out.lock().map(|o| o.iter().filter_map(|(k, (_, r))| Some((k.clone(), r.clone()?))).collect()).unwrap_or_default()
     }
 }
 

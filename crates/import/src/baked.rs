@@ -124,8 +124,8 @@ pub fn dense(image: &Rgba, kind: BakedMap, resolution: u32, flip_green: bool) ->
 }
 
 /// Collects a set's maps.
-pub fn maps(resolution: u32, maps: BTreeMap<BakedMap, Vec<f32>>) -> BakedMaps {
-    BakedMaps { resolution, maps: maps.into_iter().map(|(k, v)| (k, Arc::new(Texels::new(v)))).collect() }
+pub fn maps(resolution: u32, maps: BTreeMap<BakedMap, Texels>) -> BakedMaps {
+    BakedMaps { resolution, maps: maps.into_iter().map(|(k, v)| (k, Arc::new(v))).collect() }
 }
 
 #[cfg(test)]
@@ -151,7 +151,7 @@ mod tests {
         assert!((ao[2] - 0.65).abs() < 1e-6 && (ao[3] - 0.65).abs() < 1e-6, "{ao:?}");
         let n = dense(&img, BakedMap::Normal, 2, true);
         assert!((n[1] - 0.7).abs() < 1e-6, "green flipped: {n:?}");
-        let m = maps(2, [(BakedMap::Normal, n)].into());
+        let m = maps(2, [(BakedMap::Normal, n.into())].into());
         assert_eq!(m.height(BakedMap::Normal), 2);
     }
 
