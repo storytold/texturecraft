@@ -270,6 +270,8 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         report.add("compiled graphs", Fidelity::Approximated, format!("{} decompiled and run by TextureCraft's graph runtime", lib.len()));
     }
     let count = binding.sets.len();
+    // the finished sets' layer pixels, out of memory until the import returns
+    let mut finished = crate::pixel_spill::PixelSpill::default();
     for (i, source) in binding.sets.iter().enumerate() {
         hooks.check()?;
         let span = (0.1 + 0.8 * i as f32 / count as f32, 0.8 / count as f32);
@@ -298,10 +300,12 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         // all hold theirs at once; the last set's stay, the project opens with them
         if i + 1 < count {
             imported.graphs.spill_cooks();
+            finished.spill(&mut imported.pixels);
         }
         // and its decoded images: a later set that uses one reads it again
         images.release();
     }
+    finished.restore(&mut imported.pixels).map_err(|e| ImportError::Invalid(format!("the finished texture sets' pixels could not be read back: {e}")))?;
     for r in &binding.unused {
         report.add(
             format!("texture set \"{}\"", r.name),

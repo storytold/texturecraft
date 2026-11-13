@@ -121,21 +121,29 @@ impl Spill {
     /// The folder, made on first use in the system's temporary folder.
     #[cfg(not(target_arch = "wasm32"))]
     fn dir(&self) -> Option<std::path::PathBuf> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let mut dir = lock(&self.dir);
         if dir.is_none() {
-            let root = spill_root();
-            remove_orphans(&root);
-            let d = root.join(format!("texturecraft-cooks-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-            std::fs::create_dir_all(&d).ok()?;
-            *dir = Some(d);
+            *dir = Some(spill_folder("cooks")?);
         }
         dir.clone()
     }
 }
 
-/// Where spilled cooks go: the user's cache folder on Linux and the BSDs (their temporary folder is often held in RAM,
+/// A new folder for data moved out of memory (`kind` names what), made in [`spill_root`]; the caller removes it. The
+/// folders of the same kind that processes no longer running left behind are removed first.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spill_folder(kind: &str) -> Option<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = spill_root();
+    let prefix = format!("texturecraft-{kind}-");
+    remove_orphans(&root, &prefix);
+    let dir = root.join(format!("{prefix}{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Where data moved out of memory goes: the user's cache folder on Linux and the BSDs (their temporary folder is often held in RAM,
 /// which spilling must not fill), the system's temporary folder elsewhere.
 #[cfg(not(target_arch = "wasm32"))]
 fn spill_root() -> std::path::PathBuf {
@@ -152,22 +160,22 @@ fn spill_root() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
-/// Removes the spill folders in `root` that processes no longer running left behind (stopped before they could clean
-/// up). Only where a process's liveness can be read (Linux).
+/// Removes the spill folders (`prefix` and a process id) in `root` that processes no longer running left behind (stopped
+/// before they could clean up). Only where a process's liveness can be read (Linux).
 #[cfg(not(target_arch = "wasm32"))]
-fn remove_orphans(root: &std::path::Path) {
+fn remove_orphans(root: &std::path::Path, prefix: &str) {
     #[cfg(target_os = "linux")]
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("texturecraft-cooks-")).and_then(|r| r.split('-').next()) else { continue };
+            let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(prefix)).and_then(|r| r.split('-').next()) else { continue };
             if pid.parse::<u32>().is_ok() && !std::path::Path::new("/proc").join(pid).exists() {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = root;
+    let _ = (root, prefix);
 }
 
 impl Drop for Spill {

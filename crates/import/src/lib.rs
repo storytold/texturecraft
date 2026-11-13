@@ -33,6 +33,7 @@ pub mod layers;
 pub mod library;
 pub mod mesh;
 pub mod options;
+pub mod pixel_spill;
 pub mod polygon_fill;
 pub mod replay;
 pub mod resources;
