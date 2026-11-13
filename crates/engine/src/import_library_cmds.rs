@@ -11,7 +11,9 @@
 //! `place: null` and are not added.
 
 use serde_json::{Value, json};
-use texturecraft_import::library::{BrushTip, ItemKind, ItemSource, LibraryItem, LibraryOffer, OfferedBrush};
+#[cfg(not(target_arch = "wasm32"))]
+use texturecraft_import::library::ItemSource;
+use texturecraft_import::library::{BrushTip, ItemKind, LibraryItem, LibraryOffer, OfferedBrush};
 use texturecraft_paint::{BrushAlpha, BrushSettings};
 
 use crate::commands::{CommandSpec, always, bad, strp};
@@ -22,6 +24,7 @@ const ADD: &str = "import.library.add";
 /// The folder of the data folder holding brush presets (as the desktop app keeps them).
 pub const BRUSHES_FOLDER: &str = "brushes";
 /// Most keys one add takes.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_KEYS: usize = 4096;
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -56,6 +59,7 @@ pub fn place(kind: ItemKind) -> Option<&'static str> {
 }
 
 /// Why a kind is not added.
+#[cfg(not(target_arch = "wasm32"))]
 fn no_place(kind: ItemKind) -> String {
     format!("TextureCraft's asset library has no place for {} images yet (they belong to one project there)", kind.id())
 }
