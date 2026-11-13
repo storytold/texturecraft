@@ -303,10 +303,17 @@ fn indexed_metadata_stops_at_the_entries_a_byte_can_index() {
     assert_eq!(kept.len(), MAX_INDEXED_META);
     assert_eq!(kept.get(1).map(String::as_str), Some("abc"));
 
-    // The file still imports, with its metadata read through the index as before.
+    // The mesh schema comes from metadata index 1 even when the table has unreachable entries.
     let mut a = Abc { w: Writer::new() };
-    let top = a.object(vec![], &[]);
+    let pp = a.array("P", "", F32, 3, &f32s(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0]));
+    let fi = a.array(".faceIndices", "", I32, 1, &i32s(&[0, 1, 2]));
+    let fc = a.array(".faceCounts", "", I32, 1, &i32s(&[3]));
+    let geom = a.compound(".geom", "schema=AbcGeom_PolyMesh_v1", vec![pp, fi, fc]);
+    let mesh = a.object(vec![geom], &[]);
+    let top = a.object(vec![], &[("tri", "", mesh)]);
     let mut metas = vec!["schema=AbcGeom_PolyMesh_v1"];
     metas.extend(std::iter::repeat_n("", 5_000));
-    assert!(read(&a.archive(top, &metas)).is_ok());
+    let raw = read(&a.archive(top, &metas)).unwrap();
+    assert_eq!(raw.positions, [Vec3::X, Vec3::Y, Vec3::ZERO]);
+    assert_eq!(raw.groups, vec![(DEFAULT_MATERIAL.into(), "tri".into(), vec![0, 1, 2])]);
 }
