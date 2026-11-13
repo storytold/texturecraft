@@ -21,6 +21,7 @@ use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage, from_u16, nois
 
 use crate::below::{Band, BelowCache, Level};
 use crate::curvature_sizes::CurvatureSizes;
+use crate::field_cache::FieldCache;
 use crate::graphs::{self, Cooked, GraphStore, GraphUse, RenderEnv};
 use crate::pattern::{Coords, decal_uv, image_samples, procedural, world_noise};
 use crate::placed::{self, Taps};
@@ -301,12 +302,20 @@ pub struct Field {
     /// A mask's anchor points below the filter, each with the mask value it recorded per texel of the region
     /// (unfiltered): a mask continued from the field records them again.
     marks: Marks,
+    /// The same whatever tiles are composited, and exact (its graph was cooked): a composite may keep it for every
+    /// block (see [`FieldCache`]).
+    shared: bool,
 }
 
 /// Anchor points inside a mask with one recorded value per texel of a region.
 type Marks = Vec<(LayerId, Vec<f32>)>;
 
 impl Field {
+    /// Bytes the field holds.
+    pub(crate) fn bytes(&self) -> usize {
+        (self.data.len() + self.marks.iter().map(|(_, v)| v.len()).sum::<usize>()) * std::mem::size_of::<f32>()
+    }
+
     fn index(&self, x: u32, y: u32) -> Option<usize> {
         if x < self.x0 || y < self.y0 || x >= self.x0 + self.w || y >= self.y0 + self.h {
             return None;
@@ -332,7 +341,7 @@ pub enum FieldKey {
     Content(LayerId, Channel),
 }
 
-pub type Fields = HashMap<FieldKey, Field>;
+pub type Fields = HashMap<FieldKey, Arc<Field>>;
 
 /// How a neighbourhood filter reads around a texel.
 #[derive(Clone, Copy)]
@@ -649,8 +658,18 @@ enum Job<'a> {
     Content(Channel),
 }
 
-/// A layer's mask or content channel after every neighbourhood filter of its stack, over `tiles`.
-fn field(inp: &Inputs, channels: &[Channel], below: &Fields, id: LayerId, job: Job, tiles: &[(u32, u32)]) -> Option<Field> {
+/// A layer's mask or content channel after every neighbourhood filter of its stack, over `tiles`. With `cache`, the
+/// filters of a chain holding a graph filter that reads the stack (their regions cover the whole set) are taken from
+/// it or kept in it when they are the same whatever the tiles (see [`FieldCache`]).
+fn field(
+    inp: &Inputs,
+    channels: &[Channel],
+    below: &Fields,
+    id: LayerId,
+    job: Job,
+    tiles: &[(u32, u32)],
+    mut cache: Option<&mut FieldCache>,
+) -> Option<Arc<Field>> {
     let effects = match job {
         Job::Mask(mask) => &mask.effects,
         Job::Content(_) => &inp.project.content_layer(id)?.content_effects,
@@ -664,14 +683,79 @@ fn field(inp: &Inputs, channels: &[Channel], below: &Fields, id: LayerId, job: J
         margins[index] += margins[index + 1];
     }
 
-    let mut previous: Option<(usize, Field)> = None;
-    for (&filter, &margin) in filters.iter().zip(&margins) {
+    // Only chains holding a graph filter that reads the stack (the others reach a few tiles around the block)
+    let whole_set = filters.iter().any(|f| matches!(f.2, Op::Graph));
+    let cache_slot = match job {
+        Job::Mask(_) => FieldKey::Mask(id),
+        Job::Content(c) => FieldKey::Content(id, c),
+    };
+    // What the fields read: the layer, and every layer drawn before it when it reads the stack below
+    let reads_below = reads_stack_below(inp, id, job);
+    let deps_shared = below.iter().filter(|(k, _)| reads_below || field_layer(k) == id).all(|(_, f)| f.shared);
+    let read = match &cache {
+        Some(_) if whole_set && deps_shared => fields_read(inp, id, reads_below),
+        _ => None,
+    };
+
+    let mut previous: Option<(usize, Arc<Field>)> = None;
+    for (k, (&filter, &margin)) in filters.iter().zip(&margins).enumerate() {
         let region = region_around(inp, tiles, margin)?;
-        let start = previous.as_ref().map(|(index, field)| (*index, field));
-        let filtered = filter_region(inp, channels, below, id, job, effects, filter, region, start)?;
+        let start_shared = previous.as_ref().is_none_or(|(_, f)| f.shared);
+        let shareable = region == (0, 0, inp.gbuf.width, inp.gbuf.height) && start_shared;
+        let kept = match (&read, cache.as_deref_mut()) {
+            (Some((roots, tree)), Some(c)) if shareable => c.get(inp, (cache_slot, k), roots, tree),
+            _ => None,
+        };
+        if let Some(kept) = kept {
+            previous = Some((filter.0, kept));
+            continue;
+        }
+        let start = previous.as_ref().map(|(index, field)| (*index, field.as_ref()));
+        let mut filtered = filter_region(inp, channels, below, id, job, effects, filter, region, start)?;
+        filtered.shared &= shareable && deps_shared;
+        let filtered = Arc::new(filtered);
+        if let (Some((roots, tree)), Some(c)) = (&read, cache.as_deref_mut())
+            && filtered.shared
+        {
+            c.put(inp, (cache_slot, k), roots, tree, &filtered);
+        }
         previous = Some((filter.0, filtered));
     }
     previous.map(|(_, field)| field)
+}
+
+/// The layer a field belongs to.
+fn field_layer(k: &FieldKey) -> LayerId {
+    match k {
+        FieldKey::Mask(id) | FieldKey::Content(id, _) => *id,
+    }
+}
+
+/// Whether a field of layer `id` evaluates the stack below the layer (see [`stack_region`]): an effect layer starts
+/// from it, and anchor readers record anchor points in it. Otherwise it reads only the layer's own fields.
+fn reads_stack_below(inp: &Inputs, id: LayerId, job: Job) -> bool {
+    let effect_layer = match job {
+        Job::Mask(_) => false,
+        Job::Content(_) => inp.project.content_layer(id).is_some_and(|l| Channel::ALL.iter().any(|c| starts_from_below(l, *c))),
+    };
+    effect_layer || reads_anchor(inp.project, id)
+}
+
+/// The layers a field of layer `id` is computed from, drawn as the returned roots arrange them: the layer itself, or
+/// with `below` every layer drawn before it in the set (with their folders) as well. None when `id` is not drawn.
+fn fields_read(inp: &Inputs, id: LayerId, below: bool) -> Option<(Vec<LayerId>, std::collections::BTreeSet<LayerId>)> {
+    let roots = if below {
+        let stack = inp.project.texture_set(inp.ts).ok()?;
+        let mut order = Vec::new();
+        draw_order(inp.project, &stack.stack, 0, &mut order);
+        let at = order.iter().position(|l| *l == id)?;
+        order.truncate(at + 1);
+        order
+    } else {
+        vec![id]
+    };
+    let tree = inp.project.render_tree(&roots);
+    Some((roots, tree))
 }
 
 /// The tile-aligned texel region `(x0, y0, w, h)` around `tiles` plus `margin` tiles, clipped to the set.
@@ -720,9 +804,9 @@ fn filter_region(
     };
     if let Op::Graph = op {
         let effect = effects.iter().filter(|effect| effect.visible).nth(index)?;
-        let (mut data, marks) = graph_region(inp, channels, below, id, job, index, effect, (rx0, ry0, w, h), start)?;
+        let (mut data, marks, cooked) = graph_region(inp, channels, below, id, job, index, effect, (rx0, ry0, w, h), start)?;
         unpremultiply(&mut data, comps);
-        return Some(Field { x0: rx0, y0: ry0, w, h, comps, data, marks });
+        return Some(Field { x0: rx0, y0: ry0, w, h, comps, data, marks, shared: cooked });
     }
     let (orig, cover, _, marks) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &[]);
     let mut field = filtered_region(inp, effects, (index, radius_texels, op), (rx0, ry0, w, h), opacity, comps, job, orig, cover)?;
@@ -940,7 +1024,7 @@ fn graph_region(
     effect: &Effect,
     (rx0, ry0, w, h): (u32, u32, u32, u32),
     start: Option<(usize, &Field)>,
-) -> Option<(Vec<f32>, Marks)> {
+) -> Option<(Vec<f32>, Marks, bool)> {
     let EffectKind::Graph { graph, .. } = &effect.kind else { return None };
     let own = match job {
         Job::Mask(_) => None,
@@ -1048,13 +1132,16 @@ fn graph_region(
         };
         given.push((*k, to_side(image)));
     }
-    let cooked = inp.graphs.cook_for(GraphUse { set: inp.ts, id: effect.id, channel: own }, graph, &env, &given);
-    let (Some(cooked), size) = (cooked, (inp.gbuf.width, inp.gbuf.height)) else { return Some((orig, marks)) };
+    let use_ = GraphUse { set: inp.ts, id: effect.id, channel: own };
+    let cooked = inp.graphs.cook_for(use_.clone(), graph, &env, &given);
+    // a cook that failed now (none, or the one the use read last) may be found later: not kept for other blocks
+    let exact = !inp.graphs.has_problem(&use_);
+    let (Some(cooked), size) = (cooked, (inp.gbuf.width, inp.gbuf.height)) else { return Some((orig, marks, exact)) };
     let opacity = effect.opacity.clamp(0.0, 1.0);
     let mut data = orig.clone();
     match own {
         None => {
-            let Some(plane) = cooked.output(graph.output.as_deref()) else { return Some((orig, marks)) };
+            let Some(plane) = cooked.output(graph.output.as_deref()) else { return Some((orig, marks, exact)) };
             for i in 0..n {
                 if cover.get(i).copied().unwrap_or(0.0) <= 0.0 {
                     continue;
@@ -1069,8 +1156,8 @@ fn graph_region(
         }
         Some(c) => {
             // a filter naming outputs for other channels leaves this one as it is
-            let Some(output) = graph.output_for(c) else { return Some((orig, marks)) };
-            let Some(plane) = cooked.output(output) else { return Some((orig, marks)) };
+            let Some(output) = graph.output_for(c) else { return Some((orig, marks, exact)) };
+            let Some(plane) = cooked.output(output) else { return Some((orig, marks, exact)) };
             let linear = cooked.is_linear(output);
             let alpha_plane = graph.output_alphas.get(&c).and_then(|a| cooked.output(Some(a)));
             let cover_rule = Cover::of(graph, c, output.or_else(|| cooked.outputs.keys().next().map(String::as_str)));
@@ -1096,7 +1183,7 @@ fn graph_region(
             }
         }
     }
-    Some((data, marks))
+    Some((data, marks, exact))
 }
 
 /// Neighbourhood filter `op` (with its radius in texels) over a region's stack values (see [`stack_region`]).
@@ -1182,7 +1269,7 @@ fn filtered_region(
     }
 
     unpremultiply(&mut data, comps);
-    Some(Field { x0: rx0, y0: ry0, w, h, comps, data, marks: Vec::new() })
+    Some(Field { x0: rx0, y0: ry0, w, h, comps, data, marks: Vec::new(), shared: true })
 }
 
 /// Clamp filtered masks to 0..1, and turn filtered content back into straight values.
@@ -1205,11 +1292,12 @@ fn unpremultiply(data: &mut [f32], comps: usize) {
 /// (and anchors) below it. Cheap when no layer has a blur or sharpen.
 pub fn neighbourhood_fields(inp: &Inputs, channels: &[Channel], tiles: &[(u32, u32)]) -> Fields {
     let stack = inp.project.texture_set(inp.ts).map(|s| s.stack.as_slice()).unwrap_or_default();
-    fields_of(inp, channels, stack, tiles)
+    fields_of(inp, channels, stack, tiles, None)
 }
 
-/// [`neighbourhood_fields`] of the layers drawn by `list` only.
-fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32, u32)]) -> Fields {
+/// [`neighbourhood_fields`] of the layers drawn by `list` only. `cache` (only for the whole stack: a field of a list
+/// holding part of it reads fewer fields below) keeps the fields that cover the whole set (see [`FieldCache`]).
+fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32, u32)], mut cache: Option<&mut FieldCache>) -> Fields {
     let mut out = Fields::new();
     if tiles.is_empty() || inp.gbuf.width == 0 {
         return out;
@@ -1225,7 +1313,7 @@ fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32
         let Some(layer) = inp.project.content_layer(id) else { continue };
 
         if let Some(mask) = layer_mask(inp.project, id).filter(|mask| mask.enabled && neighbourhood(&mask.effects, working_width).is_some())
-            && let Some(filtered) = field(inp, channels, &out, id, Job::Mask(mask), tiles)
+            && let Some(filtered) = field(inp, channels, &out, id, Job::Mask(mask), tiles, cache.as_deref_mut())
         {
             out.insert(FieldKey::Mask(id), filtered);
         }
@@ -1234,7 +1322,7 @@ fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32
             continue;
         }
         for channel in channels.iter().filter(|channel| layer.channels.contains_key(channel)) {
-            if let Some(filtered) = field(inp, channels, &out, id, Job::Content(*channel), tiles) {
+            if let Some(filtered) = field(inp, channels, &out, id, Job::Content(*channel), tiles, cache.as_deref_mut()) {
                 out.insert(FieldKey::Content(id, *channel), filtered);
             }
         }
@@ -1404,7 +1492,8 @@ fn mask_plan<'a>(inp: &Inputs<'a>, id: LayerId, mask: &'a Mask, tx: u32, ty: u32
     }
     let background = if mask.background == MaskBackground::White { 1.0 } else { 0.0 };
     let effects = effect_plans(inp, &mask.effects, tx, ty, None);
-    let start = fields.and_then(|f| f.get(&FieldKey::Mask(id))).and_then(|field| neighbourhood(&mask.effects, inp.gbuf.width).map(|(k, _, _)| (k, field)));
+    let start =
+        fields.and_then(|f| f.get(&FieldKey::Mask(id))).and_then(|field| neighbourhood(&mask.effects, inp.gbuf.width).map(|(k, _, _)| (k, field.as_ref())));
     Some(MaskPlan { background, effects, start })
 }
 
@@ -1446,7 +1535,7 @@ fn plan_node<'a>(
             }
             let data = if paint { tile_of(inp, inp.pixels.layer(layer.id, *c), tx, ty, Some(*c)) } else { None };
             let effects = if fx { effect_plans(inp, &layer.content_effects, tx, ty, Some(*c)) } else { Vec::new() };
-            let start = fx_start.zip(fields.and_then(|f| f.get(&FieldKey::Content(id, *c))));
+            let start = fx_start.zip(fields.and_then(|f| f.get(&FieldKey::Content(id, *c))).map(Arc::as_ref));
             let graph = match &layer.kind {
                 LayerKind::Fill(f) => f.sources.get(c).and_then(Source::graph).and_then(|g| inp.static_cook(layer.id, Some(*c), g)),
                 _ => None,
@@ -2557,6 +2646,13 @@ pub fn composite_tiles_cached(inp: &Inputs, out: &mut Composite, tiles: &[(u32, 
     for t in tiles {
         blocks.entry((t.1 / BLOCK, t.0 / BLOCK)).or_default().push(*t);
     }
+    // Whole-set fields are computed once for every block: kept by the set's cache across composites, or for this
+    // composite only
+    let mut fields = match below.as_deref_mut() {
+        Some(b) => std::mem::take(&mut b.fields),
+        None => FieldCache::single(),
+    };
+    fields.begin();
     for block in blocks.values() {
         let quota = match below.as_deref() {
             Some(_) if fits => usize::MAX,
@@ -2564,7 +2660,7 @@ pub fn composite_tiles_cached(inp: &Inputs, out: &mut Composite, tiles: &[(u32, 
             None => 0,
         };
         let cached = below.as_deref().zip(split.as_deref());
-        let records = composite_block(inp, &set.stack, out, block, cached, quota);
+        let records = composite_block(inp, &set.stack, out, block, cached, quota, &mut fields);
         if let Some(b) = below.as_deref_mut() {
             for t in block {
                 b.touch(*t);
@@ -2573,6 +2669,10 @@ pub fn composite_tiles_cached(inp: &Inputs, out: &mut Composite, tiles: &[(u32, 
                 b.insert(t, bands);
             }
         }
+    }
+    fields.end(inp);
+    if let Some(b) = below {
+        b.fields = fields;
     }
 }
 
@@ -2595,6 +2695,7 @@ fn composite_block(
     tiles: &[(u32, u32)],
     below: Option<(&BelowCache, &[Level])>,
     quota: usize,
+    kept: &mut FieldCache,
 ) -> Vec<((u32, u32), Vec<Band>)> {
     let channels: Vec<Channel> = inp.project.texture_set(inp.ts).map(|s| s.channel_list()).unwrap_or_default();
     let (w, h) = (out.resolution, out.height);
@@ -2605,11 +2706,11 @@ fn composite_block(
     // Off the path, layers are only evaluated on tiles the cache lacks.
     let fields = match split.and_then(<[Level]>::last) {
         Some(hot) if fresh.len() < tiles.len() => {
-            let mut fields = fields_of(inp, &channels, stack, &fresh);
-            fields.extend(fields_of(inp, &channels, &[hot.at], tiles));
+            let mut fields = fields_of(inp, &channels, stack, &fresh, Some(kept));
+            fields.extend(fields_of(inp, &channels, &[hot.at], tiles, None));
             fields
         }
-        _ => fields_of(inp, &channels, stack, tiles),
+        _ => fields_of(inp, &channels, stack, tiles, Some(kept)),
     };
     let lanes: Vec<Lane> = channels.iter().map(|c| Lane { ch: c.index(), n: c.components(), signed: c.kind() == ChannelKind::Signed }).collect();
     let stride: usize = lanes.iter().map(|l| l.n).sum();
@@ -3336,6 +3437,106 @@ mod tests {
         let out = run(&f, None);
         assert!(close(out.value(Channel::BaseColor, 5, 5), [0.0, 1.0, 1.0]), "{:?}", out.value(Channel::BaseColor, 5, 5));
         assert!(close(out.value(Channel::Roughness, 5, 5), [0.2; 3]));
+    }
+
+    fn run_cached(f: &Fixture, graphs: &GraphStore, below: &mut BelowCache) -> Composite {
+        let images = Default::default();
+        let inp = Inputs {
+            project: &f.project,
+            ts: 0,
+            mesh: &f.mesh,
+            gbuf: &f.gbuf,
+            pixels: &f.pixels,
+            baked: &f.baked,
+            block_scales: f.project.texture_sets[0].block_scales(),
+            preview: None,
+            images: &images,
+            graphs,
+            bounds: f.mesh.bounds(),
+        };
+        let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);
+        composite_tiles_cached(&inp, &mut out, &all_tiles(64, 64), Some(below));
+        out
+    }
+
+    #[test]
+    fn whole_set_fields_are_kept_until_an_edit_below_them() {
+        let mut graphs = GraphStore::default();
+        let blur = graphs.add_text("format 3\nsize 64\nnode 1 input idx=0\nnode 2 box_blur in=@1 intensity=8\noutput out 2\n");
+        let mut filter = GraphRef::new(blur, "blur");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        let mut f = fixture();
+        let below = fill_layer(&mut f.project, [0.25, 0.5, 0.75], 0.5);
+        // a paint layer below the fill's colour: half of it painted, so the blur has an edge to work on
+        let paint = f.project.alloc_id();
+        let l = Layer::new(paint, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+        let paint = f.project.insert_layer(0, l, None, false).unwrap();
+        f.project.texture_sets[0].stack.retain(|id| *id != paint);
+        f.project.texture_sets[0].stack.insert(0, paint);
+        let img = f.pixels.layers.entry((paint, Channel::BaseColor)).or_insert_with(|| TileImage::new(64, 64, 4));
+        for y in 0..64 {
+            for x in 0..32 {
+                img.set(x, y, &[to_u16(1.0), to_u16(0.0), to_u16(0.0), to_u16(1.0)]);
+            }
+        }
+        f.project.layer_mut(below).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Normal, opacity: 0.5 });
+        let id = filter_layer(&mut f, BlendMode::Passthrough, EffectKind::Graph { graph: filter, projection: Projection::default() });
+
+        let mut cache = BelowCache::default();
+        let first = run_cached(&f, &graphs, &mut cache);
+        assert_eq!(first, run_with(&f, &graphs), "the same as without the cache");
+        assert_eq!(cache.fields.len(), 1, "the whole-set field is kept");
+        assert_eq!(cache.fields.reused(), 0);
+
+        // composited again (as the next frame would): taken from the cache
+        assert_eq!(run_cached(&f, &graphs, &mut cache), first);
+        assert_eq!(cache.fields.reused(), 1);
+
+        // an edit above the filter does not touch it
+        let top = fill_layer(&mut f.project, [0.0; 3], 0.0);
+        f.project.layer_mut(top).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Normal, opacity: 0.25 });
+        assert_eq!(run_cached(&f, &graphs, &mut cache), run_with(&f, &graphs));
+        assert_eq!(cache.fields.reused(), 2);
+
+        // edits below it: content, parameters, order, visibility; each one computes the field again
+        let edits: [&dyn Fn(&mut Fixture); 4] = [
+            &|f| f.pixels.layers.get_mut(&(paint, Channel::BaseColor)).unwrap().set(40, 20, &[to_u16(0.0), to_u16(1.0), to_u16(0.0), to_u16(1.0)]),
+            &|f| {
+                f.project
+                    .layer_mut(below)
+                    .unwrap()
+                    .channels
+                    .insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Normal, opacity: 0.8 })
+                    .map(|_| ())
+                    .unwrap()
+            },
+            &|f| {
+                let stack = &mut f.project.texture_sets[0].stack;
+                let (a, b) = (stack.iter().position(|l| *l == paint).unwrap(), stack.iter().position(|l| *l == below).unwrap());
+                stack.swap(a, b);
+            },
+            &|f| f.project.layer_mut(paint).unwrap().visible = false,
+        ];
+        let mut last = run_cached(&f, &graphs, &mut cache);
+        for (n, edit) in edits.iter().enumerate() {
+            edit(&mut f);
+            let reused = cache.fields.reused();
+            let now = run_cached(&f, &graphs, &mut cache);
+            assert_eq!(now, run_with(&f, &graphs), "edit {n}: the same as without the cache");
+            assert_ne!(now, last, "edit {n} changes the result");
+            assert_eq!(cache.fields.reused(), reused, "edit {n}: the field is computed again");
+            assert_eq!(cache.fields.len(), 1, "edit {n}: the stale field is replaced");
+            last = now;
+        }
+
+        // the filter's own parameters too; and deleting it drops the kept field
+        f.project.layer_mut(id).unwrap().content_effects[0].opacity = 0.5;
+        let reused = cache.fields.reused();
+        assert_eq!(run_cached(&f, &graphs, &mut cache), run_with(&f, &graphs));
+        assert_eq!(cache.fields.reused(), reused);
+        f.project.layer_mut(id).unwrap().content_effects.clear();
+        assert_eq!(run_cached(&f, &graphs, &mut cache), run_with(&f, &graphs));
+        assert!(cache.fields.is_empty(), "nothing kept for a filter that is gone");
     }
 
     #[test]

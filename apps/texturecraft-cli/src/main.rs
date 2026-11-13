@@ -31,7 +31,11 @@ USAGE:
   texturecraft-cli bake <input> [-o <out.tcraft>] [--resolution <px>] [--maps <id,id,...>]
       Bake mesh maps for every texture set (a project is saved in place without -o).
   texturecraft-cli export <input> <dir> [--preset <name>] [--format <ext>] [--padding <mode>] [--size <px>]
-      Export textures (default preset: Document channels + Normal + AO).
+                  [--frame-budget-ms <ms>] [--frame-limit-s <s>]
+      Export textures (default preset: Document channels + Normal + AO). --frame-budget-ms first
+      composites the project in frames of that budget as the desktop app's viewport does and prints
+      the frames and the time to the first full composite; --frame-limit-s stops that after so many
+      seconds (without exporting).
   texturecraft-cli render <input> <out.png> [--size <W>x<H>] [--view 3d|2d] [--camera <name>] [--yaw <deg>]
                    [--pitch <deg>] [--samples <n>] [--bounces <n>] [--cpu]
       Render the viewport to PNG (needs a GPU or software adapter); --camera looks through a
@@ -85,7 +89,7 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("run", &["-o"], &[]),
     ("batch", &[], &[]),
     ("bake", &["-o", "--resolution", "--maps"], &[]),
-    ("export", &["--preset", "--format", "--padding", "--size"], &[]),
+    ("export", &["--preset", "--format", "--padding", "--size", "--frame-budget-ms", "--frame-limit-s"], &[]),
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
     ("new", &["--resolution"], &["--sample"]),
     (
@@ -439,6 +443,12 @@ fn export(a: &Args) -> R {
         p["size"] = json!(v);
     }
     let mut h = open(input, None)?;
+    if let Some(budget) = a.num::<f64>("--frame-budget-ms")? {
+        let limit = a.num::<f64>("--frame-limit-s")?;
+        if !frames(&mut h, budget, limit) {
+            return Ok(());
+        }
+    }
     let r = h.export(&p).map_err(s)?;
     for w in r["warnings"].as_array().into_iter().flatten() {
         eprintln!("warning: {}", w.as_str().unwrap_or_default());
@@ -451,6 +461,32 @@ fn export(a: &Args) -> R {
         eprintln!("graphs: {}", i["graphs"]);
     }
     Ok(())
+}
+
+/// Composite `h`'s project in frames of `budget_ms` as the desktop app's viewport does, printing each frame and the time
+/// to the first full composite. False when `limit_s` seconds passed first.
+fn frames(h: &mut Headless, budget_ms: f64, limit_s: Option<f64>) -> bool {
+    let t0 = std::time::Instant::now();
+    let clock = move || t0.elapsed().as_secs_f64() * 1000.0;
+    let (mut frame, mut longest) = (0usize, 0.0f64);
+    let total = h.session.pending_tiles();
+    loop {
+        let pending = h.session.pending_tiles();
+        if pending == 0 {
+            eprintln!("frames: {frame} frames, {total} tiles, first full composite in {:.1} s, longest frame {longest:.0} ms", clock() / 1000.0);
+            return true;
+        }
+        if limit_s.is_some_and(|l| clock() >= l * 1000.0) {
+            eprintln!("frames: stopped after {frame} frames and {:.1} s, {} of {total} tiles left, longest frame {longest:.0} ms", clock() / 1000.0, pending);
+            return false;
+        }
+        let f0 = clock();
+        h.session.update_for(budget_ms, clock);
+        let took = clock() - f0;
+        longest = longest.max(took);
+        frame += 1;
+        eprintln!("frame {frame}: {took:.0} ms, tiles pending {pending} -> {}", h.session.pending_tiles());
+    }
 }
 
 fn render(a: &Args) -> R {

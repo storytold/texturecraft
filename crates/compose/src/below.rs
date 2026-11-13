@@ -14,6 +14,7 @@ use texturecraft_core::{BakedMap, Channel, Layer, LayerId, LayerKind, Project, T
 use texturecraft_texel::TileImage;
 
 use crate::eval::{Inputs, PaintTarget};
+use crate::field_cache::FieldCache;
 use crate::store::{BakedMaps, ImageStore, PixelStore};
 
 /// Default byte budget of a [`BelowCache`], per nesting level it holds (see
@@ -40,11 +41,25 @@ pub struct BelowCache {
     /// Tiles of the whole pass a caller splits into several composites (0: each composite is a
     /// pass). A pass larger than the cache records only what fits.
     pub pass: usize,
+    /// Whole-set fields of graph filters reading the stack, kept across composites (see
+    /// [`FieldCache`]). Not emptied with the tiles: they do not depend on the hot layer.
+    pub fields: FieldCache,
 }
 
 impl Default for BelowCache {
     fn default() -> Self {
-        BelowCache { hot: None, key: None, tiles: HashMap::new(), order: VecDeque::new(), clock: 0, bytes: 0, budget: BELOW_BUDGET, levels: 1, pass: 0 }
+        BelowCache {
+            hot: None,
+            key: None,
+            tiles: HashMap::new(),
+            order: VecDeque::new(),
+            clock: 0,
+            bytes: 0,
+            budget: BELOW_BUDGET,
+            levels: 1,
+            pass: 0,
+            fields: FieldCache::default(),
+        }
     }
 }
 
@@ -88,7 +103,7 @@ impl StackKey {
     }
 
     /// The key of the layers in `tree` (and their effects), drawn as `roots` arrange them.
-    fn of_tree(
+    pub(crate) fn of_tree(
         project: &Project,
         pixels: &PixelStore,
         baked: &BakedMaps,
@@ -147,7 +162,7 @@ impl PartialEq for Shared {
 }
 
 /// Ids of a layer's mask and content effects.
-fn effect_ids(l: &Layer) -> impl Iterator<Item = LayerId> + '_ {
+pub(crate) fn effect_ids(l: &Layer) -> impl Iterator<Item = LayerId> + '_ {
     l.mask.iter().flat_map(|m| m.effects.iter()).chain(l.content_effects.iter()).map(|e| e.id)
 }
 
