@@ -27,7 +27,23 @@ fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
     }
 
     let library: String = names.iter().map(|name| format!("newmtl {name}\n")).collect();
-    let source = format!("mtllib texturecraft-usemtl.mtl\n{text}");
+    // tobj also splits models at material changes. Give each explicit object/group
+    // declaration its own key so repeated materials regroup within that declaration only.
+    let mut source = String::from("mtllib texturecraft-usemtl.mtl\n");
+    let mut part_names = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        match trimmed.split_whitespace().next() {
+            Some("o" | "g") => {
+                source.push_str(&format!("o {}\n", part_names.len()));
+                part_names.push(trimmed[1..].trim());
+            }
+            _ => {
+                source.push_str(line);
+                source.push('\n');
+            }
+        }
+    }
 
     // Polygons stay whole so the wireframe can show them; `RawMesh::polygon` triangulates
     let options = tobj::LoadOptions { single_index: true, triangulate: false, ignore_points: true, ignore_lines: true };
@@ -95,6 +111,13 @@ fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
             if arity >= 3 {
                 raw.polygon(&name, part, &corners);
             }
+        }
+    }
+
+    // Restore user-facing names after all faces have been grouped by declaration.
+    for (_, part, _) in &mut raw.groups {
+        if let Some(name) = part.parse::<usize>().ok().and_then(|id| part_names.get(id)) {
+            *part = (*name).to_owned();
         }
     }
 

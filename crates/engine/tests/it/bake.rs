@@ -612,3 +612,18 @@ fn a_failed_multi_set_bake_restores_settings_pixels_and_history() {
     assert_eq!(session.doc.baked, original.baked);
     assert_eq!(session.history_labels(), history);
 }
+
+#[test]
+fn obj_submesh_id_separates_objects_with_the_same_name_and_material() {
+    use texturecraft_engine::{core::IdColorSource, formats::import_mesh_bytes};
+    let file = b"o Part\nusemtl Shared\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 0.45 0\nvt 0 1\nf 1/1 2/2 3/3\no Part\nusemtl Shared\nv 2 0 0\nv 3 0 0\nv 2 1 0\nvt 0.5 0\nvt 0.95 0\nvt 0.5 1\nf 4/4 5/5 6/6";
+    let mesh = import_mesh_bytes("parts.obj", file).unwrap().mesh;
+    assert_eq!(mesh.materials.len(), 1);
+    assert_eq!(mesh.submeshes.len(), 2);
+    let mut session = Session::new_project("parts", mesh, "parts.obj", None, 128).unwrap();
+    session.doc.project.texture_sets[0].bake.maps.id.parameters.source = IdColorSource::Submesh;
+    execute(&mut session, "bake.run", &json!({"resolution":128,"maps":["id"],"dilation":0})).unwrap();
+    let map = &session.doc.baked[&0].maps[&BakedMap::Id];
+    let pixel = |x: usize| &map[(100 * 128 + x) * 3..(100 * 128 + x) * 3 + 3];
+    assert_ne!(pixel(10), pixel(74));
+}
