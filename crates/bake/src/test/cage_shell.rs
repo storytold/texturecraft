@@ -101,3 +101,54 @@ fn the_cage_follows_the_frontal_distance_and_a_cage_mesh() {
     assert!(corners.iter().all(|corner| (corner.abs().max_element() - 0.75).abs() < 1e-6), "the cage mesh is drawn as it is");
     assert!(corners.iter().all(|corner| corner.is_finite() && *corner != Vec3::ZERO));
 }
+
+#[test]
+fn the_cage_lists_its_hard_edges_without_a_uv_seam() {
+    // A quad whose diagonal is split into two vertices with the same UV, smooth or hard by the copy's normal
+    let quad_with_diagonal_normal = |normal: Vec3| {
+        let mut mesh = Mesh::from_parts(
+            vec![Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::Y],
+            None,
+            vec![Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 0.0)],
+            vec![0, 1, 2, 0, 2, 3],
+            "Default",
+        )
+        .unwrap();
+        mesh.positions.push(mesh.positions[0]);
+        mesh.normals.push(normal);
+        mesh.tangents.push(mesh.tangents[0]);
+        mesh.uvs.push(mesh.uvs[0]);
+        mesh.indices[3] = 4;
+        mesh
+    };
+    let shell_of = |low: &Mesh| {
+        let bvh = Bvh::new(low);
+        let bake_settings = settings(16, &[BakedMap::Normal]);
+        let request = BakeRequest {
+            low_base_color: &[],
+            mesh: low,
+            bvh: &bvh,
+            material: 0,
+            settings: &bake_settings,
+            high: Some(HighPoly { file_ids: &[], mesh: low, bvh: &bvh, base_color: &[] }),
+            cage: None,
+            skew: None,
+            cage_paint: None,
+            tiles: (1, 1),
+        };
+        CageShell::new(&request).unwrap()
+    };
+
+    let smooth = quad_with_diagonal_normal(Vec3::Z);
+    assert!(shell_of(&smooth).missing_seams.is_empty(), "the same normal on both sides is a smooth edge");
+
+    let hard = quad_with_diagonal_normal(Vec3::new(1.0, 0.0, 1.0).normalize());
+    let shell = shell_of(&hard);
+    let diagonal = [Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0)];
+    assert_eq!(shell.missing_seams.len(), 2, "the diagonal, once per triangle");
+    for [from, to] in &shell.missing_seams {
+        let mut ends = [shell.positions[*from as usize], shell.positions[*to as usize]];
+        ends.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert_eq!(ends, diagonal, "the line runs along the hard diagonal");
+    }
+}

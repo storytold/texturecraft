@@ -16,6 +16,8 @@ pub struct CageShell {
     pub starts: Vec<RayStart>,
     /// Corner pairs along the low poly's polygon edges, for the wireframe
     pub edges: Vec<[u32; 2]>,
+    /// Corner pairs along the low poly's hard edges without a UV seam
+    pub missing_seams: Vec<[u32; 2]>,
     /// World units per unit of the max frontal distance setting
     pub cage_units: f32,
 }
@@ -37,7 +39,8 @@ impl CageShell {
             .unzip();
 
         let wire_edges: HashSet<(u32, u32)> = mesh.wire_edges().into_iter().nth(request.material).unwrap_or_default().into_iter().collect();
-        let mut edge_corners = HashMap::new();
+        let missing_seam_edges: HashSet<(u32, u32)> = mesh.missing_seam_edges().into_iter().nth(request.material).unwrap_or_default().into_iter().collect();
+        let (mut edge_corners, mut seam_corners) = (HashMap::new(), HashMap::new());
         for (triangle_index, &triangle) in triangles.iter().enumerate() {
             let Some(vertices) = mesh.tri(triangle) else { continue };
 
@@ -45,16 +48,23 @@ impl CageShell {
                 let next = (corner + 1) % 3;
                 let (from, to) = (vertices[corner] as u32, vertices[next] as u32);
                 let key = (from.min(to), from.max(to));
+                let first_corner = (triangle_index * 3) as u32;
+                let corners = [first_corner + corner as u32, first_corner + next as u32];
                 if wire_edges.contains(&key) {
-                    let first_corner = (triangle_index * 3) as u32;
-                    edge_corners.entry(key).or_insert([first_corner + corner as u32, first_corner + next as u32]);
+                    edge_corners.entry(key).or_insert(corners);
+                }
+                if missing_seam_edges.contains(&key) {
+                    seam_corners.entry(key).or_insert(corners);
                 }
             }
         }
-        let mut edges: Vec<[u32; 2]> = edge_corners.into_values().collect();
-        edges.sort_unstable();
+        let sorted = |corners: HashMap<(u32, u32), [u32; 2]>| {
+            let mut pairs: Vec<[u32; 2]> = corners.into_values().collect();
+            pairs.sort_unstable();
+            pairs
+        };
 
-        Ok(CageShell { positions, starts, edges, cage_units: ray_frame.cage_units })
+        Ok(CageShell { positions, starts, edges: sorted(edge_corners), missing_seams: sorted(seam_corners), cage_units: ray_frame.cage_units })
     }
 
     /// Each corner's cage position at `max_frontal`, the setting before relative-to-bounding-box scaling

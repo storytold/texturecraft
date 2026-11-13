@@ -26,6 +26,14 @@ struct Globals {
     refr: vec4<f32>,     // x screen-space refraction on (1), y lods of the scene behind, z refraction depth (world units), w -
     highlight: vec4<f32>, // rgb highlighted set's edge color in the scene (before exposure and tone mapping), a opacity
     highlight_shift: vec4<f32>, // xy sideways shift of each highlight line copy (clip units), zw -
+    bake_high: vec4<f32>, // bake mode: rgb high poly color, a -
+    bake_matching_error: vec4<f32>, // rgb color where the bake's rays miss the high poly, a its strength (0 hidden)
+    bake_cage: vec4<f32>, // rgb cage surface color, a opacity
+    bake_cage_wire: vec4<f32>, // rgb cage wireframe color, a opacity
+    bake_missing_seam: vec4<f32>, // rgb color of hard edges without a UV seam, a opacity
+    bake_neutral_color: vec4<f32>, // rgb the neutral material's color, a its reflection samples this frame
+    bake_neutral: vec4<f32>, // x roughness, y metallic, z AO intensity of the neutral material, w on (1)
+    bake_bent_normal: vec4<f32>, // x, y how much the bent normal (in the aux texture) turns the diffuse light and dims reflections, zw -
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -444,6 +452,10 @@ fn shade_mesh(i: VOut, front: bool) -> Shaded {
         let tint = vec3<f32>(fract(uv.x), fract(uv.y), 0.5) * 0.25;
         let diff = max(dot(n, normalize(vec3<f32>(0.4, 0.8, 0.5))), 0.0) * 0.6 + 0.4;
         return unlit(data_out((col + tint) * diff));
+    }
+
+    if (g.bake_neutral.w > 0.5) {
+        return Shaded(neutral_color(n, n_geo, v, i.wpos, orm.r, aux.rgb), vec3<f32>(0.0));
     }
 
     // Opacity: dithered alpha test (a new pattern per accumulated frame, so it averages out).

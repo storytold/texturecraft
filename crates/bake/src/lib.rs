@@ -9,6 +9,7 @@ mod bake_request;
 mod cage;
 mod high_poly;
 mod mesh_extent;
+mod name_pair;
 mod progress;
 
 pub use bake_error::BakeError;
@@ -17,6 +18,7 @@ pub use bake_request::BakeRequest;
 pub use cage::{CageShell, HighPolyReach, RayStart, VertexReach};
 pub use high_poly::HighPoly;
 pub(crate) use mesh_extent::MeshExtent;
+pub use name_pair::NamePair;
 pub use progress::Progress;
 
 mod map;

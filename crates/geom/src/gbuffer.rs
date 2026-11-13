@@ -20,7 +20,7 @@ pub struct UvGBuffer {
     pub tri: Vec<u32>,
     /// Barycentric weights of the triangle's second and third vertices.
     pub bary: Vec<[f32; 2]>,
-    /// Texels written by more than one triangle (overlapping UVs).
+    /// Covers past the first on texels where any cover has the texel center strictly inside (overlapping UVs; an edge two neighbours share is no overlap)
     pub overlaps: u32,
 }
 
@@ -41,74 +41,95 @@ fn edge(a: Vec2, b: Vec2, p: Vec2) -> f32 {
     (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
 }
 
+/// Twice-areas (in texels²) below this are degenerate triangles, which cover nothing
+const MIN_DOUBLE_AREA: f32 = 1e-12;
+
+/// How far outside a triangle (as a share of its double area) a texel center may sit and still count as covered, so shared edges leave no gaps
+const EDGE_TOLERANCE: f32 = 1e-6;
+
 impl UvGBuffer {
-    /// Rasterize the triangles of material `material` at `width × height`.
+    /// Rasterize the triangles of material `material` at `width × height`
     pub fn new(mesh: &Mesh, material: usize, width: u32, height: u32) -> UvGBuffer {
-        let (w, h) = (width.max(1), height.max(1));
-        let size = Vec2::new(w as f32, h as f32);
-        let bands = h.div_ceil(BAND) as usize;
-        let mut bins: Vec<Vec<u32>> = vec![Vec::new(); bands];
-        for t in mesh.triangles_of(material) {
-            let Some([a, b, c]) = mesh.tri(t) else { continue };
-            let (Some(ua), Some(ub), Some(uc)) = (mesh.uvs.get(a), mesh.uvs.get(b), mesh.uvs.get(c)) else { continue };
-            let y0 = (ua.y.min(ub.y).min(uc.y) * size.y).floor().max(0.0) as i64;
-            let y1 = (ua.y.max(ub.y).max(uc.y) * size.y).ceil().min(size.y) as i64;
-            if y1 <= y0 || !ua.is_finite() || !ub.is_finite() || !uc.is_finite() {
+        let (width, height) = (width.max(1), height.max(1));
+        let size = Vec2::new(width as f32, height as f32);
+        let corner_uvs = |triangle: usize| {
+            let [first, second, third] = mesh.tri(triangle)?;
+            Some([*mesh.uvs.get(first)?, *mesh.uvs.get(second)?, *mesh.uvs.get(third)?])
+        };
+
+        // Sort triangles into bands of rows so each band rasterizes on its own thread
+        let mut bands: Vec<Vec<u32>> = vec![Vec::new(); height.div_ceil(BAND) as usize];
+        for triangle in mesh.triangles_of(material) {
+            let Some(uvs) = corner_uvs(triangle) else { continue };
+            let top = (uvs.iter().map(|uv| uv.y).fold(f32::INFINITY, f32::min) * size.y).floor().max(0.0) as i64;
+            let bottom = (uvs.iter().map(|uv| uv.y).fold(f32::NEG_INFINITY, f32::max) * size.y).ceil().min(size.y) as i64;
+            if bottom <= top || !uvs.iter().all(|uv| uv.is_finite()) {
                 continue;
             }
-            let (b0, b1) = ((y0 / BAND as i64) as usize, ((y1 - 1).max(0) / BAND as i64) as usize);
-            for bin in bins.iter_mut().take(b1 + 1).skip(b0) {
-                bin.push(t as u32);
+
+            let (first_band, last_band) = ((top / BAND as i64) as usize, ((bottom - 1).max(0) / BAND as i64) as usize);
+            for band in bands.iter_mut().take(last_band + 1).skip(first_band) {
+                band.push(triangle as u32);
             }
         }
-        let n = w as usize * h as usize;
-        let mut tri = vec![NO_TRI; n];
-        let mut bary = vec![[0.0f32; 2]; n];
-        let band_len = (BAND * w) as usize;
+
+        let texel_count = width as usize * height as usize;
+        let mut tri = vec![NO_TRI; texel_count];
+        let mut bary = vec![[0.0f32; 2]; texel_count];
+        let band_texels = (BAND * width) as usize;
         let overlaps: u32 = tri
-            .par_chunks_mut(band_len)
-            .zip(bary.par_chunks_mut(band_len))
+            .par_chunks_mut(band_texels)
+            .zip(bary.par_chunks_mut(band_texels))
             .enumerate()
-            .map(|(bi, (tri, bary))| {
-                let mut overlaps = 0u32;
-                let row0 = bi as u32 * BAND;
-                let rows = (tri.len() as u32) / w;
-                for &t in bins.get(bi).map(Vec::as_slice).unwrap_or(&[]) {
-                    let Some([a, b, c]) = mesh.tri(t as usize) else { continue };
-                    let (Some(&ua), Some(&ub), Some(&uc)) = (mesh.uvs.get(a), mesh.uvs.get(b), mesh.uvs.get(c)) else { continue };
-                    let (pa, pb, pc) = (ua * size, ub * size, uc * size);
-                    let area = edge(pa, pb, pc);
-                    if area.abs() < 1e-12 {
+            .map(|(band_index, (band_tri, band_bary))| {
+                // Per texel: how many triangles cover it, and whether any has its center strictly inside, so the count doesn't depend on triangle order
+                let mut covers = vec![0u32; band_tri.len()];
+                let mut strict_cover = vec![false; band_tri.len()];
+                let first_row = band_index as u32 * BAND;
+                let band_rows = (band_tri.len() as u32) / width;
+                for &triangle in bands.get(band_index).map(Vec::as_slice).unwrap_or(&[]) {
+                    let Some(uvs) = corner_uvs(triangle as usize) else { continue };
+                    let [a, b, c] = uvs.map(|uv| uv * size);
+                    let double_area = edge(a, b, c);
+                    if double_area.abs() < MIN_DOUBLE_AREA {
                         continue;
                     }
-                    let eps = -1e-6 * area.abs();
-                    let x0 = pa.x.min(pb.x).min(pc.x).floor().max(0.0) as u32;
-                    let x1 = (pa.x.max(pb.x).max(pc.x).ceil().min(w as f32) as u32).min(w);
-                    let y0 = (pa.y.min(pb.y).min(pc.y).floor().max(row0 as f32) as u32).max(row0);
-                    let y1 = (pa.y.max(pb.y).max(pc.y).ceil() as u32).min(row0 + rows);
-                    for y in y0..y1 {
-                        for x in x0..x1 {
-                            let p = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
-                            let (w0, w1, w2) = (edge(pb, pc, p) * area.signum(), edge(pc, pa, p) * area.signum(), edge(pa, pb, p) * area.signum());
-                            if w0 < eps || w1 < eps || w2 < eps {
+
+                    let tolerance = EDGE_TOLERANCE * double_area.abs();
+                    let (sign, inverse_area) = (double_area.signum(), 1.0 / double_area.abs());
+                    let left = a.x.min(b.x).min(c.x).floor().max(0.0) as u32;
+                    let right = (a.x.max(b.x).max(c.x).ceil().min(width as f32) as u32).min(width);
+                    let top = (a.y.min(b.y).min(c.y).floor().max(first_row as f32) as u32).max(first_row);
+                    let bottom = (a.y.max(b.y).max(c.y).ceil() as u32).min(first_row + band_rows);
+                    for y in top..bottom {
+                        for x in left..right {
+                            let center = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                            let weights = [edge(b, c, center) * sign, edge(c, a, center) * sign, edge(a, b, center) * sign];
+                            if weights.iter().any(|weight| *weight < -tolerance) {
                                 continue;
                             }
-                            let i = ((y - row0) * w + x) as usize;
-                            if let (Some(slot), Some(bw)) = (tri.get_mut(i), bary.get_mut(i)) {
-                                if *slot != NO_TRI {
-                                    overlaps += 1;
-                                }
-                                *slot = t;
-                                let inv = 1.0 / area.abs();
-                                *bw = [w1 * inv, w2 * inv];
-                            }
+
+                            let index = ((y - first_row) * width + x) as usize;
+                            let (Some(slot), Some(slot_bary), Some(cover_count), Some(strict)) =
+                                (band_tri.get_mut(index), band_bary.get_mut(index), covers.get_mut(index), strict_cover.get_mut(index))
+                            else {
+                                continue;
+                            };
+
+                            *cover_count += 1;
+                            *strict |= weights.iter().all(|weight| *weight > tolerance);
+                            *slot = triangle;
+                            *slot_bary = [weights[1] * inverse_area, weights[2] * inverse_area];
                         }
                     }
                 }
-                overlaps
+
+                // Every cover past the first overlaps, unless all of them only touch the texel center with an edge (neighbours sharing it)
+                covers.iter().zip(&strict_cover).filter(|(_, strict)| **strict).map(|(count, _)| count.saturating_sub(1)).sum::<u32>()
             })
             .sum();
-        UvGBuffer { width: w, height: h, tri, bary, overlaps }
+
+        UvGBuffer { width, height, tri, bary, overlaps }
     }
 
     pub fn covered(&self, i: usize) -> bool {
@@ -169,6 +190,27 @@ mod tests {
             }
         }
         assert_eq!(g.overlaps, 0);
+    }
+
+    #[test]
+    fn neighbours_sharing_an_edge_through_texel_centers_do_not_overlap() {
+        // An 8×8 grid of quads at 512 texels: each quad's diagonal runs through 64 texel centers
+        let grid = primitives::plane(1.0, 8);
+        let gbuffer = UvGBuffer::new(&grid, 0, 512, 512);
+        assert_eq!(gbuffer.covered_count(), 512 * 512);
+        assert_eq!(gbuffer.overlaps, 0);
+    }
+
+    #[test]
+    fn an_edge_through_a_covered_texel_center_counts_both_edge_covers() {
+        // The texel center (0.5, 0.5) lies inside the first triangle and on the diagonal the other two share
+        let uv = vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.2), Vec2::new(0.2, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)];
+        let positions = vec![Vec3::ZERO; uv.len()];
+        // In either order: the inside cover first, or the two edge covers first
+        for indices in [vec![0, 1, 2, 0, 3, 4, 0, 5, 3], vec![0, 3, 4, 0, 5, 3, 0, 1, 2]] {
+            let m = Mesh::from_parts(positions.clone(), None, uv.clone(), indices.clone(), "m").unwrap();
+            assert_eq!(UvGBuffer::new(&m, 0, 1, 1).overlaps, 2, "{indices:?}");
+        }
     }
 
     #[test]

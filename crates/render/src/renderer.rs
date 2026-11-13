@@ -31,14 +31,15 @@ use texturecraft_geom::{Mesh, OrbitCamera};
 use texturecraft_texel::TILE;
 
 use crate::bake_visualization::BakeVisualization;
+use crate::cage_geometry::CageGeometry;
 use crate::cage_gpu::CageGpu;
 use crate::gpu_trace::{Checked, checked};
 use crate::high_poly_gpu::HighPolyGpu;
 use crate::ibl;
+use crate::missing_seam_gpu::MissingSeamGpu;
 use crate::overlay_quad::OverlayQuad;
 use crate::set_highlight::SetHighlight;
 use crate::subdivide::{self, Vertex};
-use crate::uv_seam_gpu::UvSeamGpu;
 
 pub const MSAA: u32 = 4;
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -84,6 +85,14 @@ struct GlobalsRaw {
     refr: [f32; 4],
     highlight: [f32; 4],
     highlight_shift: [f32; 4],
+    bake_high: [f32; 4],
+    bake_matching_error: [f32; 4],
+    bake_cage: [f32; 4],
+    bake_cage_wire: [f32; 4],
+    bake_missing_seam: [f32; 4],
+    bake_neutral_color: [f32; 4],
+    bake_neutral: [f32; 4],
+    bake_bent_normal: [f32; 4],
 }
 
 /// The post pass uniform (see `Post` in post.wgsl).
@@ -548,7 +557,10 @@ pub struct Renderer {
     bake_high_pipeline: wgpu::RenderPipeline,
     cage_pipeline: wgpu::RenderPipeline,
     cage_wire_pipeline: wgpu::RenderPipeline,
-    uv_seam_pipeline: wgpu::RenderPipeline,
+    missing_seam_pipeline: wgpu::RenderPipeline,
+    /// The missing seams along the cage, and in the 2D view
+    cage_missing_seam_pipeline: wgpu::RenderPipeline,
+    uv_missing_seam_pipeline: wgpu::RenderPipeline,
     bg_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     post_pipeline: wgpu::RenderPipeline,
@@ -585,7 +597,7 @@ pub struct Renderer {
     bake_high: Option<HighPolyGpu>,
     /// Each texture set's cage, by set index
     cages: Vec<Option<CageGpu>>,
-    uv_seams: Option<UvSeamGpu>,
+    missing_seams: Option<MissingSeamGpu>,
     sets: Vec<SetGpu>,
     /// Viewport texture resolution: display textures at 1/2^shift of each set's size (at least
     /// as reduced as the device's texture limit needs).
@@ -1001,8 +1013,30 @@ impl Renderer {
             MSAA,
             wire3d_depth.clone(),
         );
-        let uv_seam_pipeline =
-            pipeline(device, "tc_uv_seam", &layout, &module, "vs_wire3d", &vertex_layout, hdr_target("fs_wire_uv_seam", blend), MSAA, wire3d_depth.clone());
+        let cage_missing_seam_pipeline = pipeline(
+            device,
+            "tc_cage_missing_seam",
+            &background_layout,
+            &module,
+            "vs_bake_cage_wire",
+            &corner_layout,
+            hdr_target("fs_wire_cage_missing_seam", blend),
+            MSAA,
+            wire3d_depth.clone(),
+        );
+        let uv_missing_seam_pipeline =
+            pipeline(device, "tc_uv_missing_seam", &layout, &module, "vs_uv", &vertex_layout, hdr_target("fs_wire_missing_seam", blend), MSAA, always());
+        let missing_seam_pipeline = pipeline(
+            device,
+            "tc_missing_seam",
+            &layout,
+            &module,
+            "vs_wire3d",
+            &vertex_layout,
+            hdr_target("fs_wire_missing_seam", blend),
+            MSAA,
+            wire3d_depth.clone(),
+        );
         let bg_pipeline = pipeline(device, "tc_bg", &background_layout, &module, "vs_bg", &[], hdr_target("fs_bg", None), MSAA, always());
         let overlay_pipeline =
             pipeline(device, "tc_overlay", &background_layout, &module, "vs_overlay", &vertex_layout, hdr_target("fs_overlay", blend), MSAA, wire3d_depth);
@@ -1135,7 +1169,9 @@ impl Renderer {
             bake_high_pipeline,
             cage_pipeline,
             cage_wire_pipeline,
-            uv_seam_pipeline,
+            missing_seam_pipeline,
+            cage_missing_seam_pipeline,
+            uv_missing_seam_pipeline,
             bg_pipeline,
             blit_pipeline,
             post_pipeline,
@@ -1162,7 +1198,7 @@ impl Renderer {
             mesh: None,
             bake_high: None,
             cages: Vec::new(),
-            uv_seams: None,
+            missing_seams: None,
             sets: Vec::new(),
             display_shift: 0,
             material_sets: Vec::new(),
@@ -1289,8 +1325,8 @@ impl Renderer {
         self.content_rev += 1;
     }
 
-    /// Texture set `texture_set`'s cage: `corners` three per triangle and `edges` as corner pairs; `None` removes it. The same `topology` as before only rewrites the corners
-    pub fn set_bake_cage(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, cage: Option<(&[Vec3], &[[u32; 2]])>, topology: u64) {
+    /// Texture set `texture_set`'s cage; `None` removes it. The same `topology` as before only rewrites the corners
+    pub fn set_bake_cage(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, cage: Option<CageGeometry<'_>>, topology: u64) {
         if self.cages.len() <= texture_set {
             self.cages.resize_with(texture_set + 1, || None);
         }
@@ -1298,16 +1334,18 @@ impl Renderer {
 
         match (cage, slot.as_mut()) {
             (None, _) => *slot = None,
-            (Some((corners, _)), Some(gpu)) if gpu.topology == topology && gpu.corner_count as usize == corners.len() => {
-                queue.write_buffer(&gpu.corners, 0, bytemuck::cast_slice(corners));
+            (Some(cage), Some(gpu)) if gpu.topology == topology && gpu.corner_count as usize == cage.corners.len() => {
+                queue.write_buffer(&gpu.corners, 0, bytemuck::cast_slice(cage.corners));
             }
-            (Some((corners, edges)), _) => {
+            (Some(cage), _) => {
                 *slot = Some(CageGpu {
                     topology,
-                    corners: upload_buffer(device, queue, "tc_cage_vb", bytemuck::cast_slice(corners), wgpu::BufferUsages::VERTEX),
-                    corner_count: corners.len() as u32,
-                    edges: upload_buffer(device, queue, "tc_cage_ib", bytemuck::cast_slice(edges), wgpu::BufferUsages::INDEX),
-                    edge_index_count: (edges.len() * 2) as u32,
+                    corners: upload_buffer(device, queue, "tc_cage_vb", bytemuck::cast_slice(cage.corners), wgpu::BufferUsages::VERTEX),
+                    corner_count: cage.corners.len() as u32,
+                    edges: upload_buffer(device, queue, "tc_cage_ib", bytemuck::cast_slice(cage.edges), wgpu::BufferUsages::INDEX),
+                    edge_index_count: (cage.edges.len() * 2) as u32,
+                    missing_seams: upload_buffer(device, queue, "tc_cage_seam_ib", bytemuck::cast_slice(cage.missing_seams), wgpu::BufferUsages::INDEX),
+                    missing_seam_index_count: (cage.missing_seams.len() * 2) as u32,
                 });
             }
         }
@@ -1322,8 +1360,8 @@ impl Renderer {
         }
     }
 
-    /// The low poly's UV seams as vertex pairs per material ([`Mesh::uv_seam_edges`]) for mesh `mesh_id`
-    pub fn set_uv_seams(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh_id: u64, seams: &[Vec<(u32, u32)>]) {
+    /// The low poly's hard edges without a UV seam as vertex pairs per material ([`Mesh::missing_seam_edges`]) for mesh `mesh_id`
+    pub fn set_missing_seams(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh_id: u64, seams: &[Vec<(u32, u32)>]) {
         let mut line_indices: Vec<u32> = Vec::new();
         let mut line_draws = Vec::new();
         for (material, edges) in seams.iter().enumerate() {
@@ -1332,8 +1370,8 @@ impl Renderer {
             line_draws.push((start, line_indices.len() as u32 - start, material));
         }
 
-        let lines = upload_buffer(device, queue, "tc_uv_seams", bytemuck::cast_slice(&line_indices), wgpu::BufferUsages::INDEX);
-        self.uv_seams = Some(UvSeamGpu { mesh_id, lines, line_draws });
+        let lines = upload_buffer(device, queue, "tc_missing_seams", bytemuck::cast_slice(&line_indices), wgpu::BufferUsages::INDEX);
+        self.missing_seams = Some(MissingSeamGpu { mesh_id, lines, line_draws });
         self.content_rev += 1;
     }
 
@@ -1938,6 +1976,7 @@ impl Renderer {
             refr: [if refraction { 1.0 } else { 0.0 }, (BEHIND_LEVELS - 1) as f32, REFRACTION_DEPTH * radius, 0.0],
             highlight: highlight_globals(s, data),
             highlight_shift: highlight_shift(frame.size),
+            ..bake_globals(s.bake)
         };
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         let post = PostRaw {
@@ -2148,14 +2187,13 @@ impl Renderer {
         pass.set_bind_group(2, refraction_source, &[]);
         let geometry = self.geometry(mesh, frame);
         let bake = frame.shade.bake.filter(|_| uv_set.is_none());
-        let low_poly_shown = bake.is_none_or(|bake| bake.low_poly);
-        let low_poly_set = bake.and_then(|bake| bake.only_set).or(uv_set);
-        let (highlight, highlight_set) = highlight.filter(|(_, set)| low_poly_shown && low_poly_set.is_none_or(|only| only == *set)).unzip();
+        let low_poly_shown = bake.is_none_or(|bake| bake.low_poly.shown);
+        let (highlight, highlight_set) = highlight.filter(|(_, set)| low_poly_shown && uv_set.is_none_or(|only| only == *set)).unzip();
 
         // The wireframe and the highlight draw the mesh's own edges (displaced in the vertex shader too)
         let passes = [
-            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, low_poly_set, 1),
-            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, low_poly_set, 1),
+            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, uv_set, 1),
+            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, uv_set, 1),
             (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
         ];
         for (pipeline, vertices, indices, ranges, only_set, instances) in passes {
@@ -2173,6 +2211,18 @@ impl Renderer {
         if let Some(bake) = bake {
             self.draw_bake(&mut pass, mesh, frame, bake);
         }
+        if let Some(texture_set) = uv_set
+            && frame.shade.bake.is_some_and(|bake| bake.missing_seams.shown)
+            && let Some(seams) = self.missing_seams.as_ref().filter(|seams| seams.mesh_id == mesh.id)
+        {
+            pass.set_pipeline(&self.uv_missing_seam_pipeline);
+            pass.set_vertex_buffer(0, mesh.geo.vb.slice(..));
+            pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
+            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, Some(texture_set)) {
+                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.draw_indexed(range, 0, 0..1);
+            }
+        }
 
         // Overlay quads last, so the mesh's depth hides what is behind it
         if uv_set.is_none()
@@ -2184,9 +2234,9 @@ impl Renderer {
         }
     }
 
-    /// Bake mode's high poly, UV seams and cages over the low poly `low_poly`
+    /// Bake mode's high poly, missing seams and cages over the low poly `low_poly`
     fn draw_bake(&self, pass: &mut wgpu::RenderPass<'_>, low_poly: &MeshGpu, frame: &Frame, bake: BakeVisualization) {
-        if bake.high_poly
+        if bake.high_poly.shown
             && let Some(high) = &self.bake_high
         {
             pass.set_pipeline(&self.bake_high_pipeline);
@@ -2196,35 +2246,45 @@ impl Renderer {
             pass.draw_indexed(0..high.index_count, 0, 0..1);
         }
 
-        if bake.uv_seams
-            && let Some(seams) = self.uv_seams.as_ref().filter(|seams| seams.mesh_id == low_poly.id)
+        if bake.missing_seams.shown
+            && let Some(seams) = self.missing_seams.as_ref().filter(|seams| seams.mesh_id == low_poly.id)
         {
-            pass.set_pipeline(&self.uv_seam_pipeline);
+            pass.set_pipeline(&self.missing_seam_pipeline);
             pass.set_vertex_buffer(0, low_poly.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, bake.only_set) {
+            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, None) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
         }
 
-        if !bake.cage {
-            return;
-        }
-
         let shown = |texture_set: usize| bake.only_set.is_none_or(|only| only == texture_set) && frame.visible.get(texture_set).copied().unwrap_or(true);
         let cages = || self.cages.iter().enumerate().filter(move |(texture_set, _)| shown(*texture_set)).filter_map(|(_, cage)| cage.as_ref());
         // The translucent faces first, then the wireframe over them
-        pass.set_pipeline(&self.cage_pipeline);
-        for cage in cages() {
-            pass.set_vertex_buffer(0, cage.corners.slice(..));
-            pass.draw(0..cage.corner_count, 0..1);
+        if bake.cage_surface.shown {
+            pass.set_pipeline(&self.cage_pipeline);
+            for cage in cages() {
+                pass.set_vertex_buffer(0, cage.corners.slice(..));
+                pass.draw(0..cage.corner_count, 0..1);
+            }
         }
-        pass.set_pipeline(&self.cage_wire_pipeline);
-        for cage in cages() {
-            pass.set_vertex_buffer(0, cage.corners.slice(..));
-            pass.set_index_buffer(cage.edges.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..cage.edge_index_count, 0, 0..1);
+
+        if bake.cage_wire.shown {
+            pass.set_pipeline(&self.cage_wire_pipeline);
+            for cage in cages() {
+                pass.set_vertex_buffer(0, cage.corners.slice(..));
+                pass.set_index_buffer(cage.edges.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..cage.edge_index_count, 0, 0..1);
+            }
+        }
+
+        if bake.missing_seams.shown && bake.cage_shown() {
+            pass.set_pipeline(&self.cage_missing_seam_pipeline);
+            for cage in cages() {
+                pass.set_vertex_buffer(0, cage.corners.slice(..));
+                pass.set_index_buffer(cage.missing_seams.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..cage.missing_seam_index_count, 0, 0..1);
+            }
         }
     }
 
@@ -2334,6 +2394,26 @@ fn highlight_globals(shade: &Shade, data: bool) -> [f32; 4] {
 
     let [r, g, b] = if data { highlight.color } else { highlight.scene_color(shade.exposure_ev, shade.aces) };
     [r, g, b, HIGHLIGHT_OPACITY]
+}
+
+/// The globals of bake mode's overlays and neutral material for `bake` (all zero without it)
+fn bake_globals(bake: Option<BakeVisualization>) -> GlobalsRaw {
+    let Some(bake) = bake else { return GlobalsRaw::zeroed() };
+
+    let [red, green, blue] = bake.low_poly.color;
+    let neutral = bake.shown_neutral();
+    let samples_per_frame = neutral.map_or(0, |neutral| neutral.samples_per_frame());
+    GlobalsRaw {
+        bake_high: bake.high_poly.globals(),
+        bake_matching_error: bake.matching_error.globals(),
+        bake_cage: bake.cage_surface.globals(),
+        bake_cage_wire: bake.cage_wire.globals(),
+        bake_missing_seam: bake.missing_seams.globals(),
+        bake_neutral_color: [red, green, blue, samples_per_frame as f32],
+        bake_neutral: neutral.map_or([0.0; 4], |neutral| neutral.globals()),
+        bake_bent_normal: neutral.map_or([0.0; 4], |neutral| neutral.bent_normal_globals()),
+        ..GlobalsRaw::zeroed()
+    }
 }
 
 /// Globals `highlight_shift`: how far each of the highlight's line copies moves sideways, in clip units of a `size` pixel target

@@ -1,3 +1,4 @@
+use super::part_key::part_key;
 use super::sampling::{generated_hue, interpolate, splitmix64};
 use crate::BakeRequest;
 use crate::tracing::{ANY, TraceMesh};
@@ -50,21 +51,24 @@ impl<'a> Source<'a> {
         let mut mesh_ids = Vec::with_capacity(mesh.submeshes.len());
         let mut part_keys = Vec::with_capacity(mesh.submeshes.len());
         let backface_suffix = settings.ignore_backface_suffix.trim().to_lowercase();
+
         for (part_index, submesh) in mesh.submeshes.iter().enumerate() {
             let first_triangle = (submesh.start / 3) as usize;
             let last_triangle = (submesh.start.saturating_add(submesh.count) / 3) as usize;
             let range = first_triangle.min(last_triangle)..last_triangle.min(triangle_count);
             part.get_mut(range.clone()).unwrap_or_default().fill(part_index as u32);
-            let name = submesh.name.trim().to_lowercase();
-            let ignore_backface = !backface_suffix.is_empty() && name.ends_with(&backface_suffix);
+
+            let (key, ignore_backface, name) = part_key(&submesh.name, suffix, &backface_suffix, keys);
             backface_culling.get_mut(range).unwrap_or_default().fill(ignore_backface);
-            let name = if ignore_backface { name.strip_suffix(&backface_suffix).unwrap_or(&name) } else { &name };
-            part_keys.push(match_key(name, suffix, keys));
+            part_keys.push(key);
+
             let next = mesh_keys.len() as u32;
             let file_id = file_ids.get(part_index).copied().unwrap_or(0);
-            mesh_ids.push(*mesh_keys.entry((file_id, name.to_owned())).or_insert(next));
+            mesh_ids.push(*mesh_keys.entry((file_id, name)).or_insert(next));
         }
+
         let key = part.iter().map(|part_index| part_keys.get(*part_index as usize).copied().unwrap_or(ANY)).collect();
+
         Source {
             mesh,
             bvh,
@@ -137,12 +141,4 @@ fn base_color(material: &BaseColor, uv: Vec2) -> Vec4 {
     };
     let color = sampled_color * material.factor;
     Vec4::new(linear_to_srgb(color.x), linear_to_srgb(color.y), linear_to_srgb(color.z), color.w)
-}
-
-fn match_key(name: &str, suffix: &str, keys: &mut HashMap<String, u32>) -> u32 {
-    let name = name.trim().to_lowercase();
-    let suffix = suffix.trim().to_lowercase();
-    let base = name.strip_suffix(suffix.as_str()).filter(|_| !suffix.is_empty()).unwrap_or(&name).to_string();
-    let next = keys.len() as u32;
-    *keys.entry(base).or_insert(next)
 }

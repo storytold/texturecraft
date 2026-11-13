@@ -13,7 +13,9 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod bake_overlay;
 pub mod bake_visualization;
+pub mod cage_geometry;
 mod cage_gpu;
 pub mod displace;
 #[cfg(not(target_arch = "wasm32"))]
@@ -24,15 +26,19 @@ pub mod headless;
 mod high_poly_gpu;
 pub mod ibl;
 pub mod mesh_maps;
+mod missing_seam_gpu;
+pub mod neutral_material;
 pub mod overlay_quad;
 pub mod readback;
 pub mod renderer;
 pub mod set_highlight;
 mod subdivide;
 pub mod trace;
-mod uv_seam_gpu;
 
+pub use bake_overlay::BakeOverlay;
 pub use bake_visualization::BakeVisualization;
+pub use cage_geometry::CageGeometry;
+pub use neutral_material::NeutralMaterial;
 pub use overlay_quad::OverlayQuad;
 pub use renderer::{COLOR_FORMAT, Frame, MSAA, Renderer, Shade, ViewKind, aux_size, uv_view_scale};
 pub use set_highlight::SetHighlight;

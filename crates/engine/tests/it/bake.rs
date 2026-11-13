@@ -505,6 +505,21 @@ fn the_skew_map_is_saved_with_the_project() {
 }
 
 #[test]
+fn the_skew_map_steers_only_a_distance_cage_with_averaged_normals() {
+    let mut s = leaning_session(false);
+    execute(&mut s, "bake.skew.set", &json!({ "value": 0.25 })).unwrap();
+    assert!(s.bake_task(0).unwrap().skew.is_some());
+
+    s.doc.project.texture_sets[0].bake.cage.average_normals = false;
+    assert!(s.bake_task(0).unwrap().skew.is_none(), "without averaged normals the skew map is left out");
+    s.doc.project.texture_sets[0].bake.cage.average_normals = true;
+    let cage = obj(&s.mesh.clone(), 0.05, f32::MAX, [1.0; 3]);
+    s.set_cage_bytes("cage.obj", cage.into_bytes()).unwrap();
+    s.doc.project.texture_sets[0].bake.cage.kind = texturecraft_core::CageType::CustomFile;
+    assert!(s.bake_task(0).unwrap().skew.is_none(), "a cage file sets the rays itself");
+}
+
+#[test]
 fn painting_skew_widens_a_map_and_bad_strokes_change_nothing() {
     let mut s = leaning_session(true);
     // Painting with no map makes a black one at `size` and puts the dab in it.

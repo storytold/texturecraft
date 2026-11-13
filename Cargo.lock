@@ -4425,6 +4425,7 @@ dependencies = [
  "log",
  "pollster 0.4.0",
  "rayon",
+ "serde",
  "texturecraft-bake",
  "texturecraft-compose",
  "texturecraft-core",

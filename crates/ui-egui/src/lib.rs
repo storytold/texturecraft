@@ -46,6 +46,7 @@ pub mod render_mode;
 mod resource_picker;
 mod resource_picker_item;
 mod running_bake;
+mod screen_color_pick;
 pub mod shelf;
 pub mod shelf_preview;
 mod soft_box;

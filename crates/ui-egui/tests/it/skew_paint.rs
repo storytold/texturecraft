@@ -6,6 +6,10 @@ use egui_kittest::kittest::Queryable;
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::state::{Mode, ViewLayout};
 
+/// A stroke inside the 2D view, right of bake mode's two settings columns
+const STROKE_START: egui::Pos2 = egui::pos2(700.0, 500.0);
+const STROKE_END: egui::Pos2 = egui::pos2(900.0, 500.0);
+
 /// A bake-mode app with a high poly, the 2D view, and Common Settings in front
 fn harness() -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
@@ -24,34 +28,46 @@ fn the_bake_panel_has_the_bake_paint_brush_and_dragging_paints_the_map() {
     let mut h = harness();
     h.get_by_label("Skew Correction");
     assert!(h.state().session.doc.bake_paint.is_empty() && !h.state().ui.bake_paint_brush.on);
-    // Off: a drag in the view paints nothing.
-    h.drag_at(egui::pos2(600.0, 500.0));
-    h.hover_at(egui::pos2(800.0, 500.0));
-    h.drop_at(egui::pos2(800.0, 500.0));
+    // Off: a drag in the view paints nothing
+    h.drag_at(STROKE_START);
+    h.hover_at(STROKE_END);
+    h.drop_at(STROKE_END);
     h.run_steps(3);
     assert!(h.state().session.doc.bake_paint.is_empty(), "the brush is off");
 
-    // On: the checkbox turns it on, and the same drag makes a map with paint along the stroke.
+    // On: the checkbox turns it on, and the same drag makes a map with paint along the stroke
     h.get_by_label("Paint Skew Correction").scroll_to_me();
     h.run_steps(3);
     h.get_by_label("Paint Skew Correction").click();
     h.run_steps(3);
     assert!(h.state().ui.bake_paint_brush.on);
     h.get_by_label("Radius");
-    h.drag_at(egui::pos2(600.0, 500.0));
+    h.drag_at(STROKE_START);
     h.run_steps(2);
-    h.hover_at(egui::pos2(800.0, 500.0));
+    h.hover_at(STROKE_END);
     h.run_steps(2);
-    h.drop_at(egui::pos2(800.0, 500.0));
+    h.drop_at(STROKE_END);
     h.run_steps(3);
     let map = h.state().session.doc.bake_paint.get(&(0, texturecraft_engine::core::BakePaintTarget::Skew)).cloned().expect("the stroke made a skew map");
     let painted = map.values.iter().filter(|v| **v > 0.5).count();
     assert!(painted > 50 && painted < map.values.len() / 2, "a stroke, not the whole map: {painted} of {}", map.values.len());
 
-    // Removing it from the panel clears the map.
+    // Removing it from the panel clears the map
     h.get_by_label("Remove Skew Correction").scroll_to_me();
     h.run_steps(3);
     h.get_by_label("Remove Skew Correction").click();
     h.run_steps(3);
     assert!(h.state().session.doc.bake_paint.is_empty());
+}
+
+#[test]
+fn turning_average_normals_off_stops_the_skew_brush() {
+    let mut h = harness();
+    h.state_mut().ui.bake_paint_brush.on = true;
+    h.run_steps(2);
+    assert!(h.state().ui.bake_paint_brush.on, "skew correction applies with the default cage");
+
+    h.state_mut().session.doc.project.texture_sets[0].bake.cage.average_normals = false;
+    h.run_steps(2);
+    assert!(!h.state().ui.bake_paint_brush.on, "the bake would leave the skew map out");
 }

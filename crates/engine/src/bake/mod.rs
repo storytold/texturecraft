@@ -1,6 +1,7 @@
 //! Baking tasks, commands, settings helpers, and the mesh-map baking API
 
 mod bake_cage_inputs;
+mod bake_checks;
 mod bake_mesh;
 mod bake_meshes;
 mod bake_task;
@@ -19,7 +20,7 @@ pub use bake_cage_inputs::BakeCageInputs;
 pub use bake_mesh::BakeMesh;
 pub use bake_meshes::BakeMeshes;
 pub use bake_task::BakeTask;
-pub use high_poly_missed::high_poly_missed;
+pub use high_poly_missed::{HIDDEN_HIGH_POLY_VERTEX, high_poly_missed};
 pub use merged_high::MergedHigh;
 pub use mesh_map_command::{install_gpu_tracer, meshes_json, settings_params};
 pub use model_patch::settings_patch;

@@ -11,7 +11,7 @@ use texturecraft_engine::Session;
 use texturecraft_engine::compose::{DisplayKind, ImageRes, tile_bytes};
 use texturecraft_engine::core::BakedMap;
 use texturecraft_engine::geom::Mesh;
-use texturecraft_render::{BakeVisualization, Frame, Renderer, wgpu};
+use texturecraft_render::{BakeVisualization, CageGeometry, Frame, Renderer, wgpu};
 
 use crate::bake_scene::{BakeSceneLink, CageUpload};
 
@@ -27,8 +27,8 @@ pub enum AuxView {
 /// A texture set's texels across and down, and its mesh material.
 pub type SetLayout = ((u32, u32), usize);
 
-/// The low poly's UV seam edges (vertex pairs) per material
-pub type UvSeamEdges = Vec<Vec<(u32, u32)>>;
+/// The low poly's hard edges without a UV seam (vertex pairs) per material
+pub type MissingSeamEdges = Vec<Vec<(u32, u32)>>;
 
 /// What the renderer must catch up with before drawing.
 #[derive(Default)]
@@ -49,8 +49,8 @@ pub struct SceneSync {
     pub bake_cages: Vec<(usize, Option<CageUpload>, u64)>,
     /// Texture sets left after some were removed: their cages go too
     pub bake_cage_count: Option<usize>,
-    /// The low poly's UV seams per material, for mesh id
-    pub uv_seams: Option<(u64, UvSeamEdges)>,
+    /// The low poly's hard edges without a UV seam per material, for mesh id
+    pub missing_seams: Option<(u64, MissingSeamEdges)>,
 }
 
 /// Lives in egui's callback resources.
@@ -366,11 +366,15 @@ impl CallbackTrait for ViewCallback {
                 gpu.renderer.truncate_bake_cages(count);
             }
             for (texture_set, cage, topology) in &sync.bake_cages {
-                let cage = cage.as_ref().map(|upload| (upload.corners.as_slice(), upload.shell.edges.as_slice()));
+                let cage = cage.as_ref().map(|upload| CageGeometry {
+                    corners: &upload.corners,
+                    edges: &upload.shell.edges,
+                    missing_seams: &upload.shell.missing_seams,
+                });
                 gpu.renderer.set_bake_cage(device, queue, *texture_set, cage, *topology);
             }
-            if let Some((mesh_id, seams)) = &sync.uv_seams {
-                gpu.renderer.set_uv_seams(device, queue, *mesh_id, seams);
+            if let Some((mesh_id, seams)) = &sync.missing_seams {
+                gpu.renderer.set_missing_seams(device, queue, *mesh_id, seams);
             }
         }
 

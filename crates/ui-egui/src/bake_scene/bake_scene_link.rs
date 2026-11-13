@@ -11,7 +11,7 @@ use super::reach_link::ReachLink;
 use super::shared_handle::SharedHandle;
 use crate::gpu::SceneSync;
 
-/// What the GPU has of bake mode's visualization: the high poly, each set's cage and the UV seams
+/// What the GPU has of bake mode's visualization: the high poly, each set's cage and the missing seams
 #[derive(Default)]
 pub struct BakeSceneLink {
     /// The high poly sent to the GPU and the id it was sent under (each new high poly gets the next one)
@@ -51,7 +51,7 @@ impl BakeSceneLink {
 
         let Some(visualization) = visualization else { return };
 
-        if visualization.high_poly {
+        if visualization.high_poly.shown {
             let high = session.bake_meshes.merged_high().map(|high| high.mesh.clone());
             let handle = SharedHandle::of(high.as_ref());
             if handle != self.high {
@@ -64,14 +64,19 @@ impl BakeSceneLink {
                 self.high_sent = true;
             }
             self.reach.sync(session, self.high_id, visualization.only_set, out);
+        } else if self.high_sent {
+            // A hidden high poly leaves the GPU; showing it again sends it and its colours under the same id, so its reach is not worked out again
+            out.bake_high = Some((None, self.high_id));
+            self.high_sent = false;
+            self.reach.resend();
         }
 
-        if visualization.uv_seams && self.seams_mesh_id != Some(session.mesh_id) {
+        if visualization.missing_seams.shown && self.seams_mesh_id != Some(session.mesh_id) {
             self.seams_mesh_id = Some(session.mesh_id);
-            out.uv_seams = Some((session.mesh_id, session.mesh.uv_seam_edges()));
+            out.missing_seams = Some((session.mesh_id, session.mesh.missing_seam_edges()));
         }
 
-        if visualization.cage {
+        if visualization.cage_shown() {
             self.sync_cages(session, out);
         }
     }
@@ -117,7 +122,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const EVERYTHING: BakeVisualization = BakeVisualization { high_poly: true, cage: true, uv_seams: true, low_poly: true, only_set: None };
+    /// Every part of the visualization shown
+    fn everything() -> BakeVisualization {
+        let parts = BakeVisualization::default();
+        let shown = |overlay: texturecraft_render::BakeOverlay| texturecraft_render::BakeOverlay { shown: true, ..overlay };
+        BakeVisualization {
+            high_poly: shown(parts.high_poly),
+            matching_error: shown(parts.matching_error),
+            cage_surface: shown(parts.cage_surface),
+            cage_wire: shown(parts.cage_wire),
+            missing_seams: shown(parts.missing_seams),
+            low_poly: shown(parts.low_poly),
+            ..parts
+        }
+    }
 
     /// How long a test waits for the reach worker: frames, and the pause between them
     const WAIT_FRAMES: usize = 2000;
@@ -165,28 +183,28 @@ mod tests {
     #[test]
     fn a_new_distance_moves_the_corners_and_new_settings_rebuild_the_cage() {
         let (mut session, mut link) = (session(), BakeSceneLink::default());
-        let first = sync(&mut link, &session, EVERYTHING);
-        assert!(first.bake_high.is_some() && first.uv_seams.is_some() && first.bake_cage_count == Some(session.doc.project.texture_sets.len()));
+        let first = sync(&mut link, &session, everything());
+        assert!(first.bake_high.is_some() && first.missing_seams.is_some() && first.bake_cage_count == Some(session.doc.project.texture_sets.len()));
         let (_, Some(cage), topology) = first.bake_cages.first().unwrap() else { panic!("set 0 has a cage") };
 
-        let unchanged = sync(&mut link, &session, EVERYTHING);
-        assert!(unchanged.bake_high.is_none() && unchanged.bake_cages.is_empty() && unchanged.uv_seams.is_none(), "nothing changed, nothing is sent");
+        let unchanged = sync(&mut link, &session, everything());
+        assert!(unchanged.bake_high.is_none() && unchanged.bake_cages.is_empty() && unchanged.missing_seams.is_none(), "nothing changed, nothing is sent");
 
         set_distances(&mut session, 0.03);
-        let moved = sync(&mut link, &session, EVERYTHING);
+        let moved = sync(&mut link, &session, everything());
         let (_, Some(moved_cage), moved_topology) = moved.bake_cages.first().unwrap() else { panic!("set 0 has a cage") };
         assert_eq!(moved_topology, topology, "a distance only moves the corners");
         assert_ne!(moved_cage.corners, cage.corners);
 
         texturecraft_engine::execute(&mut session, "bake.settings", &json!({"ts": "all", "averageNormals": false})).unwrap();
-        let rebuilt = sync(&mut link, &session, EVERYTHING);
+        let rebuilt = sync(&mut link, &session, everything());
         assert_ne!(rebuilt.bake_cages.first().unwrap().2, *topology, "new settings rebuild the cage");
         // The rebuilt cage starts a new reach: let it finish so the last check sees only what the resend starts
-        red_share(&mut link, &session, EVERYTHING);
+        red_share(&mut link, &session, everything());
 
         link.resend();
-        let resent = sync(&mut link, &session, EVERYTHING);
-        assert!(resent.bake_high.is_some() && resent.uv_seams.is_some() && resent.bake_cage_count.is_some(), "a lost frame sends everything again");
+        let resent = sync(&mut link, &session, everything());
+        assert!(resent.bake_high.is_some() && resent.missing_seams.is_some() && resent.bake_cage_count.is_some(), "a lost frame sends everything again");
         assert_eq!(resent.bake_cages.len(), rebuilt.bake_cages.len());
         assert_eq!(resent.bake_cages.first().unwrap().2, rebuilt.bake_cages.first().unwrap().2, "the cages are not rebuilt for a lost frame");
         assert_eq!(resent.bake_high.unwrap().1, first.bake_high.unwrap().1, "the high poly goes again under the same id");
@@ -194,12 +212,32 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_high_poly_leaves_the_gpu_and_comes_back_without_a_new_reach() {
+        let (session, mut link) = (session(), BakeSceneLink::default());
+        let sent = |out: SceneSync| out.bake_high.map(|(high, id)| (high.is_some(), id));
+        let hidden = BakeVisualization { high_poly: BakeVisualization::default().high_poly, ..everything() };
+        let first = sent(sync(&mut link, &session, everything()));
+        red_share(&mut link, &session, everything());
+        let dropped = sent(sync(&mut link, &session, hidden));
+        assert!(sync(&mut link, &session, hidden).bake_high.is_none(), "dropped once");
+        let back = sync(&mut link, &session, everything());
+        assert!(!link.busy(), "showing it again starts no new reach");
+        assert!(back.bake_high_missed.is_some(), "its colours are sent again with it");
+
+        let (Some((true, first_id)), Some((false, dropped_id)), Some((true, back_id))) = (first, dropped, sent(back)) else {
+            panic!("the high poly is sent, dropped, then sent again")
+        };
+
+        assert_eq!((dropped_id, back_id), (first_id, first_id));
+    }
+
+    #[test]
     fn a_reach_finishes_while_nothing_is_drawn() {
         let session = session();
-        let no_high_poly = BakeVisualization { high_poly: false, ..EVERYTHING };
+        let no_high_poly = BakeVisualization { high_poly: BakeVisualization::default().high_poly, ..everything() };
         for hidden in [None, Some(no_high_poly)] {
             let mut link = BakeSceneLink::default();
-            sync(&mut link, &session, EVERYTHING);
+            sync(&mut link, &session, everything());
             assert!(link.busy(), "the first frame starts working out the reach");
 
             let finished = (0..WAIT_FRAMES).any(|_| {
@@ -215,11 +253,11 @@ mod tests {
     fn the_red_follows_the_distances_and_the_selected_set() {
         let (mut session, mut link) = (session(), BakeSceneLink::default());
         set_distances(&mut session, 0.0);
-        let at_zero = red_share(&mut link, &session, EVERYTHING);
+        let at_zero = red_share(&mut link, &session, everything());
         assert!(at_zero > 0.5, "at frontal 0 the high poly outside the low poly is red: {at_zero}");
 
         set_distances(&mut session, 0.05);
-        let covered = red_share(&mut link, &session, EVERYTHING);
+        let covered = red_share(&mut link, &session, everything());
         assert!(covered < at_zero / 10.0, "a cage past the high poly reaches it: {covered}");
 
         set_distances(&mut session, 0.0);
@@ -230,10 +268,11 @@ mod tests {
             }
         };
         by_name(&mut session, "_no_such_suffix");
-        let by_name_red = red_share(&mut link, &session, EVERYTHING);
+        let by_name_red = red_share(&mut link, &session, everything());
         assert!(by_name_red > 0.5, "matching by name and other suffixes works out the reach again: {by_name_red}");
 
-        let no_set = BakeVisualization { only_set: Some(session.doc.project.texture_sets.len()), ..EVERYTHING };
-        assert_eq!(red_share(&mut link, &session, no_set), 0.0, "sets left out by the filter color nothing");
+        let no_set = BakeVisualization { only_set: Some(session.doc.project.texture_sets.len()), ..everything() };
+        let hidden = texturecraft_engine::bake::HIDDEN_HIGH_POLY_VERTEX;
+        assert_eq!(red_share(&mut link, &session, no_set), hidden, "a filter that keeps no set hides the whole high poly");
     }
 }

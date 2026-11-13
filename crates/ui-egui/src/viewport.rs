@@ -46,7 +46,13 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         && app.ui.bake_paint_brush.on
         && !app.session.bake_meshes.high.is_empty()
         && app.session.doc.project.texture_sets.get(app.session.ts()).is_some_and(|texture_set| {
-            !texture_set.bake.high_poly.use_low_as_high && texture_set.bake.cage.kind == texturecraft_engine::core::CageType::DistanceBased
+            let settings = &texture_set.bake;
+            match app.ui.bake_paint_brush.target {
+                texturecraft_engine::core::BakePaintTarget::Skew => settings.skew_applies(),
+                texturecraft_engine::core::BakePaintTarget::Cage => {
+                    !settings.high_poly.use_low_as_high && settings.cage.kind == texturecraft_engine::core::CageType::DistanceBased
+                }
+            }
         });
     app.ui.bake_paint_brush.on = bake_painting;
 
@@ -60,6 +66,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         _ if mode == crate::state::Mode::Painting && app.session.quick_mask.editing && app.picking_id_color.is_none() => Some(crate::gpu::AuxView::QuickMask),
         ViewMode::MeshMap(map) => Some(crate::gpu::AuxView::MeshMap(map)),
         ViewMode::Mask(id) => Some(crate::gpu::AuxView::Mask(id)),
+        _ if mode == crate::state::Mode::Baking && app.ui.bake_visualization.bent_normal_shown() => Some(crate::gpu::AuxView::MeshMap(BakedMap::BentNormal)),
         _ => None,
     };
     let mut sync = PendingSync(Some(aux_view));
@@ -100,6 +107,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
     if mode == crate::state::Mode::Baking {
         crate::bake_mode::bake_bar(app, ui.ctx(), full);
+        crate::bake_mode::bake_warnings(app, ui.ctx(), full);
     }
 
     // Keep drawing until the 3D view finishes accumulating anti-aliasing samples
@@ -316,7 +324,7 @@ fn frame_size_in_pixels(ui: &Ui, rect: Rect) -> [u32; 2] {
 fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, mut frame: Frame, sync: &mut PendingSync) {
     let tokens = Tokens::get(ui.ctx());
     let bake = bake_visualization(app);
-    frame.shade.bake = bake.filter(|_| frame.kind == ViewKind::Scene);
+    frame.shade.bake = bake;
     let scene = match (sync.0.take(), app.gpu.as_mut()) {
         (Some(aux), Some(gpu_link)) => {
             let sync_start_ms = crate::now_ms();
@@ -394,33 +402,53 @@ fn view_header(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, id: &str) {
         }
     });
 
+    // Bake mode lights the project mesh with the neutral material unless the painted one is asked for
+    let baking = app.ui.mode == crate::state::Mode::Baking;
+    let neutral = baking && app.session.view == ViewMode::Material && app.ui.bake_visualization.neutral_shown;
     let label = match app.session.view {
+        _ if neutral => "Neutral Material".to_owned(),
         ViewMode::MeshMap(map) => crate::i18n::baked_map_label(map).to_owned(),
         _ => app.session.view.label(),
     };
     let channels = app.session.doc.project.texture_set(app.session.ts()).map(|texture_set| texture_set.channel_list()).unwrap_or_default();
     egui::ComboBox::from_id_salt(format!("{id}_mode")).width(VIEW_PICKER_WIDTH).selected_text(tr(&label)).show_ui(&mut child, |ui| {
-        if ui.selectable_label(app.session.view == ViewMode::Material, tr("Material")).clicked() {
+        if baking && ui.selectable_label(neutral, tr("Neutral Material")).clicked() {
+            app.ui.bake_visualization.neutral_shown = true;
+            app.run("viewport.view", json!({"mode": "material"}));
+        }
+        if ui.selectable_label(app.session.view == ViewMode::Material && !neutral, tr("Material")).clicked() {
+            // Only bake mode's pick turns the neutral material off; painting mode's Material leaves bake mode's choice alone
+            app.ui.bake_visualization.neutral_shown &= !baking;
             app.run("viewport.view", json!({"mode": "material"}));
         }
         ui.separator();
+        if baking {
+            mesh_map_entries(app, ui);
+            return;
+        }
+
         for channel in channels {
             if ui.selectable_label(app.session.view == ViewMode::Channel(channel), tr(channel.label())).clicked() {
                 app.run("viewport.view", json!({"mode": channel.id()}));
             }
         }
         ui.separator();
-        for map in BakedMap::ALL {
-            let map_label = trf("Mesh map: {map}", &[("map", &tr(crate::i18n::baked_map_label(map)))]);
-            if ui.selectable_label(app.session.view == ViewMode::MeshMap(map), map_label).clicked() {
-                app.run("viewport.view", json!({"mode": format!("map:{}", map.id())}));
-            }
-        }
+        mesh_map_entries(app, ui);
         ui.separator();
         if ui.selectable_label(app.session.view == ViewMode::UvChecker, tr("UV checker")).clicked() {
             app.run("viewport.view", json!({"mode": "uvChecker"}));
         }
     });
+}
+
+/// The view picker's entries that show one baked mesh map
+fn mesh_map_entries(app: &mut TextureCraftApp, ui: &mut Ui) {
+    for map in BakedMap::ALL {
+        let map_label = trf("Mesh map: {map}", &[("map", &tr(crate::i18n::baked_map_label(map)))]);
+        if ui.selectable_label(app.session.view == ViewMode::MeshMap(map), map_label).clicked() {
+            app.run("viewport.view", json!({"mode": format!("map:{}", map.id())}));
+        }
+    }
 }
 
 fn axis_gizmo(ui: &Ui, rect: Rect, app: &TextureCraftApp, uv: bool) {
@@ -783,7 +811,7 @@ fn bake_visualization(app: &TextureCraftApp) -> Option<texturecraft_render::Bake
         return None;
     }
 
-    app.ui.bake_visualization.visualization(app.session.ts())
+    Some(app.ui.bake_visualization.visualization(app.session.ts()))
 }
 
 /// What a drag on the selected decal's frame does.
@@ -2137,7 +2165,7 @@ mod tests {
         let app = harness.state_mut();
         app.ui.mode = crate::state::Mode::Baking;
         let before = bake_visualization(app).unwrap();
-        assert!(before.high_poly && before.cage);
+        assert!(before.high_poly.shown && before.cage_shown());
 
         app.start_bake(vec![0]);
 

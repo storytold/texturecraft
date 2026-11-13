@@ -1,4 +1,4 @@
-use texturecraft_engine::bake::{HighPolyReach, RayStart, VertexReach, high_poly_missed};
+use texturecraft_engine::bake::{HIDDEN_HIGH_POLY_VERTEX, HighPolyReach, RayStart, VertexReach, high_poly_missed};
 use texturecraft_engine::geom::glam::Vec3;
 
 fn vertex(height: f32) -> Option<VertexReach> {
@@ -30,12 +30,13 @@ fn each_owning_set_uses_its_own_frontal_and_rear_distances() {
 }
 
 #[test]
-fn selected_set_filter_leaves_other_sets_unmarked() {
+fn selected_set_filter_hides_other_sets_vertices() {
+    const H: f32 = HIDDEN_HIGH_POLY_VERTEX;
     let reaches = sets();
-    assert_eq!(high_poly_missed(&reaches, &DISTANCES, Some(1), 6), vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-    assert_eq!(high_poly_missed(&reaches, &DISTANCES, Some(2), 6), vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    assert_eq!(high_poly_missed(&reaches, &DISTANCES, Some(1), 6), vec![1.0, 0.0, H, H, H, H]);
+    assert_eq!(high_poly_missed(&reaches, &DISTANCES, Some(2), 6), vec![H, H, 0.0, 1.0, H, H]);
     for only_set in [0, reaches.len(), usize::MAX] {
-        assert_eq!(high_poly_missed(&reaches, &DISTANCES, Some(only_set), 6), vec![0.0; 6]);
+        assert_eq!(high_poly_missed(&reaches, &DISTANCES, Some(only_set), 6), vec![H; 6], "a set without a reach shows none of the high poly");
     }
 }
 
