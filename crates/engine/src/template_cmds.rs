@@ -236,7 +236,18 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(not(target_arch = "wasm32"))]
 fn write(lib: &UserTemplates, t: &ProjectTemplate) -> std::result::Result<Option<String>, String> {
     let Some(dir) = &lib.dir else { return Ok(None) };
-    let path = dir.join(format!("{}.json", texturecraft_formats::export::sanitize_file_stem(&t.name)));
+    let stem = texturecraft_formats::export::sanitize_file_stem(&t.name);
+    // Distinct names can sanitize alike: reuse the file of this template, else take a free `_2`, `_3`... name.
+    let candidate = |n: usize| if n == 1 { dir.join(format!("{stem}.json")) } else { dir.join(format!("{stem}_{n}.json")) };
+    let mine = |path: &std::path::Path| {
+        let ok = std::fs::metadata(path).is_ok_and(|m| m.len() <= MAX_FILE_BYTES);
+        let owner = if ok { std::fs::read(path).ok().and_then(|b| serde_json::from_slice::<ProjectTemplate>(&b).ok()) } else { None };
+        owner.is_some_and(|o| same(&o.name, &t.name))
+    };
+    let path = (1..=MAX_USER_TEMPLATES + 1)
+        .map(candidate)
+        .find(|p| !p.exists() || mine(p))
+        .ok_or_else(|| format!("too many templates share the file name `{stem}`"))?;
     let json = serde_json::to_string_pretty(t).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     texturecraft_formats::write_atomic(&path, json.as_bytes()).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -309,6 +320,28 @@ mod tests {
         // Templates survive opening another project.
         execute(&mut fresh, "project.new", &json!({})).unwrap();
         assert!(fresh.template("My glow").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn colliding_template_files() {
+        let dir = std::env::temp_dir().join(format!("tc_templates_collide_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 256).unwrap();
+        assert!(s.load_templates(dir.clone()).is_empty());
+        execute(&mut s, "project.template.save", &json!({"name": "My glow"})).unwrap();
+        execute(&mut s, "textureSet.channel.add", &json!({"channel": "emissive"})).unwrap();
+        execute(&mut s, "project.template.save", &json!({"name": "My_glow"})).unwrap();
+        // Saving again replaces in place and keeps the file.
+        execute(&mut s, "project.template.save", &json!({"name": "my_glow"})).unwrap();
+        let mut fresh = Session::new_project("f", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        assert!(fresh.load_templates(dir.clone()).is_empty());
+        assert_eq!(fresh.templates.list.len(), 2, "templates after restart");
+        let glow = fresh.template("My glow").expect("My glow survives");
+        let under = fresh.template("My_glow").expect("My_glow survives");
+        assert!(!glow.channels.iter().any(|(c, _)| *c == Channel::Emissive), "My glow keeps its original channels");
+        assert!(under.channels.iter().any(|(c, _)| *c == Channel::Emissive), "My_glow keeps the emissive channel");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "re-saving replaces the file in place");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
