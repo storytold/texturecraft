@@ -216,10 +216,10 @@ fn a_cancelled_replayer_paints_nothing_more() {
     let jobs = vec![mask_job(vec![stroke(camera(Vec3::Y), &[[0.3, 0.5], [0.7, 0.5]])]); 3];
     let scene = ReplayScene { mesh: &mesh, material: 0, resolution: RES };
     let cancel = texturecraft_import::Cancel::new();
-    let running = CancellableReplayer(cancel.clone()).replay(&scene, &jobs);
+    let running = CancellableReplayer::new(cancel.clone()).replay(&scene, &jobs);
     assert!(running.iter().all(Result::is_ok), "an unset flag replays as the plain replayer does");
     cancel.cancel();
-    let stopped = CancellableReplayer(cancel).replay(&scene, &jobs);
+    let stopped = CancellableReplayer::new(cancel).replay(&scene, &jobs);
     assert_eq!(stopped.len(), jobs.len());
     assert!(stopped.iter().all(|r| r.as_ref().is_err_and(|e| e == "cancelled")), "{stopped:?}");
 }

@@ -394,6 +394,10 @@ pub struct CookCache {
     kept_found: AtomicUsize,
     /// Cooks moved out of memory ([`GraphStore::spill_cooks`]).
     spilled: spill::Spill,
+    /// Cooks made available since the store was made: rendered, found where kept or read back from a spill.
+    filled: AtomicUsize,
+    /// Renders running now: their finished nodes and the nodes they run (see [`GraphStore::cook_progress`]).
+    running: Mutex<Vec<(Arc<AtomicUsize>, usize)>>,
     /// Stops renders running for this document.
     pub cancel: Cancel,
 }
@@ -454,6 +458,14 @@ impl GraphStore {
     /// Renders made since the store was made (by every snapshot sharing its cooks).
     pub fn renders(&self) -> usize {
         self.cooks.renders.load(Ordering::Relaxed)
+    }
+
+    /// How far cooking has come since the store was made, in cooks: one per cook made available (rendered, found where
+    /// kept or read back), plus each running render's share of its nodes finished (at most 0.95). For a progress
+    /// display; it only grows while nothing is cancelled.
+    pub fn cook_progress(&self) -> f32 {
+        let running: f32 = lock(&self.cooks.running).iter().map(|(done, nodes)| (done.load(Ordering::Relaxed) as f32 / (*nodes).max(1) as f32).min(0.95)).sum();
+        self.cooks.filled.load(Ordering::Relaxed) as f32 + running
     }
 
     /// Uses whose graph showed nothing, or showed stale pixels, the last time they were composited.
@@ -714,11 +726,13 @@ impl GraphStore {
             return Err("cancelled".to_string());
         }
         if let Some(back) = self.cooks.spilled.get(key) {
+            self.cooks.filled.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::new(back));
         }
         let kept = lock(&self.cooks.kept).clone();
         if let Some(found) = kept.as_ref().and_then(|k| k.get(key)).and_then(|bytes| kept::decode(&bytes)) {
             self.cooks.kept_found.fetch_add(1, Ordering::Relaxed);
+            self.cooks.filled.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::new(found));
         }
         self.cooks.renders.fetch_add(1, Ordering::Relaxed);
@@ -731,6 +745,7 @@ impl GraphStore {
         if let Some(k) = &kept {
             k.put(key, &kept::encode(&cooked));
         }
+        self.cooks.filled.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(cooked))
     }
 
@@ -805,11 +820,33 @@ impl GraphStore {
         for (k, t) in given {
             put(*k, t.clone());
         }
-        let ec = EvalContext { cancel: self.cooks.cancel.clone(), pool: self.pool(), files: Files::none(), ..EvalContext::default() };
+        // the render's nodes as they finish, for the store's progress (nothing computed depends on it)
+        let done = Arc::new(AtomicUsize::new(0));
+        let _running = Running::start(&self.cooks.running, done.clone(), graph.work_nodes());
+        let ec = EvalContext { cancel: self.cooks.cancel.clone(), pool: self.pool(), files: Files::none(), nodes_done: Some(done), ..EvalContext::default() };
         let outs = evaluate(&graph, &ec, side, images, given)?;
         let linear: BTreeSet<String> =
             graph.meta.get("working").map(|w| w.trim_matches('"').split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
         Ok(Cooked::from_textures(outs, linear))
+    }
+}
+
+/// A render listed among the running ones (see [`GraphStore::cook_progress`]) until dropped.
+struct Running<'a> {
+    list: &'a Mutex<Vec<(Arc<AtomicUsize>, usize)>>,
+    done: Arc<AtomicUsize>,
+}
+
+impl<'a> Running<'a> {
+    fn start(list: &'a Mutex<Vec<(Arc<AtomicUsize>, usize)>>, done: Arc<AtomicUsize>, nodes: usize) -> Running<'a> {
+        lock(list).push((done.clone(), nodes));
+        Running { list, done }
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        lock(self.list).retain(|(d, _)| !Arc::ptr_eq(d, &self.done));
     }
 }
 

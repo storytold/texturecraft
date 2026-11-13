@@ -97,25 +97,49 @@ pub struct BrushReplayer;
 
 impl StrokeReplayer for BrushReplayer {
     fn replay(&self, scene: &ReplayScene, jobs: &[ReplayJob]) -> Vec<Result<ReplayedPixels, String>> {
-        replay_jobs(scene, jobs, &|| false)
+        replay_jobs(scene, jobs, &|| false, None)
     }
 }
 
 /// [`BrushReplayer`] that stops when its flag is set: the stroke being laid finishes, the job fails as cancelled, and
-/// so do the jobs not started (the import checks the same flag and discards the set).
-pub struct CancellableReplayer(pub texturecraft_import::Cancel);
+/// so do the jobs not started (the import checks the same flag and discards the set). It counts the strokes it laid,
+/// for the import's progress.
+pub struct CancellableReplayer(pub texturecraft_import::Cancel, pub std::sync::atomic::AtomicUsize);
 
-impl StrokeReplayer for CancellableReplayer {
-    fn replay(&self, scene: &ReplayScene, jobs: &[ReplayJob]) -> Vec<Result<ReplayedPixels, String>> {
-        replay_jobs(scene, jobs, &|| self.0.is_cancelled())
+impl CancellableReplayer {
+    pub fn new(cancel: texturecraft_import::Cancel) -> CancellableReplayer {
+        CancellableReplayer(cancel, std::sync::atomic::AtomicUsize::new(0))
     }
 }
 
-fn replay_jobs(scene: &ReplayScene, jobs: &[ReplayJob], stop: &(dyn Fn() -> bool + Sync)) -> Vec<Result<ReplayedPixels, String>> {
+impl StrokeReplayer for CancellableReplayer {
+    fn replay(&self, scene: &ReplayScene, jobs: &[ReplayJob]) -> Vec<Result<ReplayedPixels, String>> {
+        replay_jobs(scene, jobs, &|| self.0.is_cancelled(), Some(&self.1))
+    }
+
+    fn strokes_done(&self) -> Option<usize> {
+        Some(self.1.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+fn replay_jobs(
+    scene: &ReplayScene,
+    jobs: &[ReplayJob],
+    stop: &(dyn Fn() -> bool + Sync),
+    done: Option<&std::sync::atomic::AtomicUsize>,
+) -> Vec<Result<ReplayedPixels, String>> {
     let Some(set) = SetMesh::new(scene) else {
         return jobs.iter().map(|_| Err("the texture set has no triangles to paint".to_string())).collect();
     };
-    jobs.par_iter().map(|job| replay_job(&set, job, stop)).collect()
+    jobs.par_iter()
+        .map(|job| {
+            let out = replay_job(&set, job, stop);
+            if let Some(done) = done {
+                done.fetch_add(job.strokes(), std::sync::atomic::Ordering::Relaxed);
+            }
+            out
+        })
+        .collect()
 }
 
 /// The texture set's own triangles with what painting them needs.

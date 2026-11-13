@@ -119,8 +119,17 @@ fn build(layers: Vec<ProjectLayer>) -> ImportedStack {
     let images = ProjectImages::none();
     let options = ImportOptions::default();
     let parts = ["Body".to_string(), "Eyes".to_string()];
-    let input =
-        SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: false, graphs: None, geometry: None };
+    let input = SetInput {
+        channels: &channels,
+        images: &images,
+        mesh_maps: &[],
+        parts: &parts,
+        options: &options,
+        replay: false,
+        graphs: None,
+        geometry: None,
+        layers_done: None,
+    };
     import(&set(layers), &input, 10)
 }
 
@@ -334,7 +343,17 @@ fn build_replaying(layers: Vec<ProjectLayer>) -> ImportedStack {
     let images = ProjectImages::none();
     let options = ImportOptions::default();
     let parts = ["Body".to_string()];
-    let input = SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: true, graphs: None, geometry: None };
+    let input = SetInput {
+        channels: &channels,
+        images: &images,
+        mesh_maps: &[],
+        parts: &parts,
+        options: &options,
+        replay: true,
+        graphs: None,
+        geometry: None,
+        layers_done: None,
+    };
     import(&set(layers), &input, 10)
 }
 
@@ -438,8 +457,17 @@ fn a_decompiled_fill_lays_each_channel_with_its_own_blend() {
     lib.insert_as(&["strata".to_string()], "", d);
     let (channels, images, options) = (channels(), ProjectImages::none(), ImportOptions::default());
     let parts = ["Body".to_string()];
-    let input =
-        SetInput { channels: &channels, images: &images, mesh_maps: &[], parts: &parts, options: &options, replay: false, graphs: Some(&lib), geometry: None };
+    let input = SetInput {
+        channels: &channels,
+        images: &images,
+        mesh_maps: &[],
+        parts: &parts,
+        options: &options,
+        replay: false,
+        graphs: Some(&lib),
+        geometry: None,
+        layers_done: None,
+    };
     let blending = vec![blend(BASE, 2, 1.0), blend(HEIGHT, 4, 1.0)];
     let l = layer(1, "Strata", ProjectLayerKind::Paint, vec![fill(2, BASE | HEIGHT, vec![procedural(BASE | HEIGHT, "strata")], blending)]);
     let stack = import(&set(vec![l]), &input, 10);
@@ -578,6 +606,7 @@ fn build_with_mesh(layers: Vec<ProjectLayer>, mesh: &texturecraft_geom::Mesh) ->
         replay: false,
         graphs: None,
         geometry: Some(&geometry),
+        layers_done: None,
     };
     import(&set(layers), &input, 10)
 }
@@ -600,6 +629,7 @@ fn a_mask_group_of_strokes_with_polygon_fills_above_them_is_one_paint_effect() {
             replay: true,
             graphs: None,
             geometry: Some(&geometry),
+            layers_done: None,
         };
         import(&set(vec![l]), &input, 10)
     };

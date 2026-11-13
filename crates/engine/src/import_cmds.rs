@@ -99,7 +99,7 @@ impl Session {
 
     /// Imports the project file `bytes` (`name` names it) and opens it as the session's project.
     pub fn import_project_bytes(&mut self, bytes: Vec<u8>, name: &str, options: &ImportOptions) -> Result<Value> {
-        let task = ImportTask { source: ImportSource::Bytes { bytes, name: name.to_string() }, options: options.clone(), result_cache: None };
+        let task = ImportTask { source: ImportSource::Bytes { bytes, name: name.to_string() }, options: options.clone(), result_cache: None, view: false };
         let out = task.run(&ImportProgress::new())?;
         self.apply_import(out)
     }
@@ -205,6 +205,8 @@ pub struct ImportTask {
     source: ImportSource,
     options: ImportOptions,
     result_cache: Option<crate::result_cache::ResultCache>,
+    /// Whether the run also composites the converted project's view ([`ImportTask::with_view`]).
+    view: bool,
 }
 
 /// A finished import: the converted project as a session, the summary the command replies with, and the flag it ran
@@ -236,20 +238,30 @@ impl ImportTask {
                 source: ImportSource::Bytes { bytes, name },
                 options,
                 result_cache: crate::result_cache::ResultCache::from_params(ID, p)?,
+                view: false,
             });
         }
-        Ok(ImportTask { source: path_source(p)?, options, result_cache: crate::result_cache::ResultCache::from_params(ID, p)? })
+        Ok(ImportTask { source: path_source(p)?, options, result_cache: crate::result_cache::ResultCache::from_params(ID, p)?, view: false })
     }
 
     /// Imports the file at `path` with the default options.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn path(path: impl Into<String>) -> ImportTask {
-        ImportTask { source: ImportSource::Path(path.into()), options: ImportOptions::default(), result_cache: None }
+        ImportTask { source: ImportSource::Path(path.into()), options: ImportOptions::default(), result_cache: None, view: false }
     }
 
     /// Imports the project file `bytes` (named `name`) with the default options.
     pub fn bytes(name: impl Into<String>, bytes: Vec<u8>) -> ImportTask {
-        ImportTask { source: ImportSource::Bytes { bytes, name: name.into() }, options: ImportOptions::default(), result_cache: None }
+        ImportTask { source: ImportSource::Bytes { bytes, name: name.into() }, options: ImportOptions::default(), result_cache: None, view: false }
+    }
+
+    /// Also composites the converted project's view before the run ends (step [`Step::ComputingView`]), so that the
+    /// project opens with nothing left to composite: a front end showing progress keeps it until the project can be
+    /// shown, and the first composite (on a large project it can take a minute) runs on the import's thread instead of
+    /// the front end's. The pixels are the ones the front end would composite itself.
+    pub fn with_view(mut self, view: bool) -> ImportTask {
+        self.view = view;
+        self
     }
 
     /// Also keeps graph renders in `cache`'s folder and reuses those found there (native builds).
@@ -280,13 +292,13 @@ impl ImportTask {
     /// The steps: reading the file, per texture set converting, replaying strokes and cooking graphs, then saving
     /// (the converted project put together and stored as a TextureCraft project, in memory).
     pub fn run(self, progress: &ImportProgress) -> Result<ImportOutput> {
-        let ImportTask { source, options, result_cache } = self;
+        let ImportTask { source, options, result_cache, view } = self;
         let cache = result_cache.map(|c| c.open());
         #[cfg(not(target_arch = "wasm32"))]
         let kept = cache.as_ref().map(|c| c.kept.clone());
         #[cfg(target_arch = "wasm32")]
         let kept = None;
-        let mut out = run_kept(progress, kept, move |hooks| match source {
+        let mut out = run_kept(progress, kept, view, move |hooks| match source {
             #[cfg(not(target_arch = "wasm32"))]
             ImportSource::Path(path) => texturecraft_import::import_path(std::path::Path::new(&path), &options, hooks).map_err(|e| (e, Some(path))),
             ImportSource::Bytes { bytes, name } => {
@@ -308,6 +320,11 @@ impl ImportTask {
 
 /// Share of the progress bar the translator takes; the rest is saving.
 const CONVERTING: f32 = 0.9;
+/// With the view composited: the translator's share, then saving up to [`VIEW`], then the view.
+const CONVERTING_WITH_VIEW: f32 = 0.85;
+const VIEW: f32 = 0.88;
+/// How long one composite call of the view step may take before the bar moves (milliseconds).
+const VIEW_SLICE_MS: f64 = 250.0;
 
 /// [`ImportTask::run`] with the conversion given (`convert` runs the translator with the hooks; its error may name the
 /// file it read).
@@ -316,18 +333,20 @@ fn run_with(
     progress: &ImportProgress,
     convert: impl FnOnce(&mut Hooks) -> std::result::Result<Imported, (texturecraft_import::ImportError, Option<String>)>,
 ) -> Result<ImportOutput> {
-    run_kept(progress, None, convert)
+    run_kept(progress, None, false, convert)
 }
 
 /// Runs the conversion with the import's hooks (and graph cooks also kept in `kept`), then builds the session.
 fn run_kept(
     progress: &ImportProgress,
     kept: Option<std::sync::Arc<dyn texturecraft_compose::graphs::KeptCooks>>,
+    view: bool,
     convert: impl FnOnce(&mut Hooks) -> std::result::Result<Imported, (texturecraft_import::ImportError, Option<String>)>,
 ) -> Result<ImportOutput> {
     progress.check()?;
-    let report = |f: f32, step: Step| progress.report(f * CONVERTING, step);
-    let replayer = crate::import_replay::CancellableReplayer(progress.cancel.clone());
+    let (converting, saved) = if view { (CONVERTING_WITH_VIEW, VIEW) } else { (CONVERTING, 1.0) };
+    let report = |f: f32, step: Step| progress.report(f * converting, step);
+    let replayer = crate::import_replay::CancellableReplayer::new(progress.cancel.clone());
     let mut hooks = Hooks { progress: &report, cancel: &progress.cancel, replay: Some(&replayer), kept_cooks: kept };
     let imported = convert(&mut hooks).map_err(|(e, path)| match (e, path) {
         (texturecraft_import::ImportError::Cancelled, _) => bad(ID, CANCELLED),
@@ -335,12 +354,68 @@ fn run_kept(
         (e, None) => bad(ID, e.to_string()),
     })?;
     progress.check()?;
-    progress.report(CONVERTING, Step::Saving);
+    progress.report(converting, Step::Saving);
     let summary = summary(&imported);
     let session = Session::from_imported(imported)?;
     progress.check()?;
-    progress.report(1.0, Step::Saving);
-    Ok(ImportOutput { session, summary, cancel: progress.cancel.clone() })
+    progress.report(saved, Step::Saving);
+    let mut out = ImportOutput { session, summary, cancel: progress.cancel.clone() };
+    if view {
+        out.compute_view(progress)?;
+    }
+    Ok(out)
+}
+
+impl ImportOutput {
+    /// A finished import of a project converted already (`session`), with an empty summary: for front ends' tests.
+    pub fn from_session(session: Session) -> ImportOutput {
+        ImportOutput { session, summary: json!({}), cancel: Cancel::new() }
+    }
+
+    /// Composites the converted project's view until no tile is left (step [`Step::ComputingView`], from where the bar
+    /// is to its end; [`ImportTask::with_view`] runs it). It is the session's own budgeted update, in slices so that the
+    /// bar moves between them and a cancel stops after the slice in progress (the import then fails as cancelled). The
+    /// first slice computes what a whole set reads at once (graph filters over the stack), which can take a minute on a
+    /// large project. The pixels are those of [`Session::update`].
+    pub fn compute_view(&mut self, progress: &ImportProgress) -> Result<()> {
+        compute_view(&mut self.session, progress, progress.fraction())
+    }
+}
+
+fn compute_view(session: &mut Session, progress: &ImportProgress, from: f32) -> Result<()> {
+    let total = session.pending_tiles().max(1) as f32;
+    progress.report(from, Step::ComputingView);
+    let start = clock::Clock::start();
+    while session.pending_tiles() > 0 {
+        progress.check()?;
+        session.update_for(VIEW_SLICE_MS, || start.ms());
+        let done = 1.0 - session.pending_tiles() as f32 / total;
+        progress.report(from + (1.0 - from) * done, Step::ComputingView);
+    }
+    progress.check()?;
+    progress.report(1.0, Step::ComputingView);
+    Ok(())
+}
+
+/// Milliseconds since a start, for the view step's slices (the web build has no clock here: every slice runs one chunk).
+mod clock {
+    pub struct Clock(#[cfg(not(target_arch = "wasm32"))] std::time::Instant);
+
+    impl Clock {
+        pub fn start() -> Clock {
+            #[cfg(not(target_arch = "wasm32"))]
+            return Clock(std::time::Instant::now());
+            #[cfg(target_arch = "wasm32")]
+            return Clock();
+        }
+
+        pub fn ms(&self) -> f64 {
+            #[cfg(not(target_arch = "wasm32"))]
+            return self.0.elapsed().as_secs_f64() * 1000.0;
+            #[cfg(target_arch = "wasm32")]
+            return f64::INFINITY;
+        }
+    }
 }
 
 /// What the safety net found per texture set.
@@ -514,6 +589,36 @@ mod tests {
         let reply = s.apply_import(out).unwrap();
         assert_eq!(s.project().name, "synthetic");
         assert!(reply.get("import").is_some(), "the reply carries the import summary");
+    }
+
+    /// With the view asked for, the run ends by compositing the converted project: the bar keeps going up through
+    /// the view step and the project opens with no tile left, its composite the one an update makes.
+    #[test]
+    fn the_view_step_composites_the_project_before_the_run_ends() {
+        let seen = Arc::new(Mutex::new(Vec::<(f32, Step)>::new()));
+        let log = seen.clone();
+        let progress = ImportProgress::with_listener(move |f, step| log.lock().unwrap().push((f, step)));
+        let out = run_kept(&progress, None, true, |hooks| translate(hooks, 1, None)).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        let mut ids: Vec<&str> = seen.iter().map(|(_, s)| s.id()).collect();
+        ids.dedup();
+        assert_eq!(ids, ["reading", "converting", "replaying", "cooking", "saving", "view"]);
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "the fraction never goes back: {seen:?}");
+        assert!(seen.iter().filter(|(_, s)| *s != Step::ComputingView).all(|(f, _)| *f <= VIEW), "the view has its own share: {seen:?}");
+        assert_eq!(seen.last(), Some(&(1.0, Step::ComputingView)));
+        assert_eq!(out.session().pending_tiles(), 0, "nothing left to composite");
+        // the same pixels an update of the converted project gives
+        let mut plain = run_with(&ImportProgress::new(), |hooks| translate(hooks, 1, None)).unwrap();
+        assert!(plain.session.pending_tiles() > 0);
+        plain.session.update();
+        for (a, b) in out.session().caches.iter().zip(&plain.session.caches) {
+            assert_eq!(a.composite, b.composite);
+        }
+        // a cancel during the view stops the run
+        let progress = ImportProgress::with_listener(|_, _| {});
+        let mut out = run_with(&progress, |hooks| translate(hooks, 1, None)).unwrap();
+        progress.cancel();
+        assert!(out.compute_view(&progress).unwrap_err().to_string().contains(CANCELLED));
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub struct SetInput<'a> {
     pub graphs: Option<&'a crate::graph_library::GraphLibrary>,
     /// The set's mesh parts, for polygon-fill picks; `None` keeps polygon fills placeholders.
     pub geometry: Option<&'a crate::polygon_fill::geometry::SetGeometry<'a>>,
+    /// Counts the layers translated (once per layer and pass), for a progress display; `None` counts nothing.
+    pub layers_done: Option<&'a std::sync::atomic::AtomicUsize>,
 }
 
 /// One anchor of the set: the effect id it became, whether it sits in a mask, and how exactly what it holds is
@@ -260,6 +262,9 @@ impl<'a> Builder<'a> {
 
     fn layer(&mut self, l: &ProjectLayer, ctx: &Context) -> LayerId {
         self.out.verdict.layer_count += 1;
+        if let Some(done) = self.input.layers_done {
+            done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let id = self.ids.alloc();
         let path = if ctx.path.is_empty() { l.name.clone() } else { format!("{} / {}", ctx.path, l.name) };
         let visible = ctx.visible && l.visible;

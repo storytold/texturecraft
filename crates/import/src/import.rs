@@ -6,6 +6,7 @@
 //! the layers use become image resources of the project; the stored result becomes locked "Original result" layers.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use texturecraft_compose::graphs::Cancel;
 use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, PixelStore};
@@ -30,6 +31,7 @@ use crate::layers::{self, ImportedStack, SetInput};
 use crate::options::ImportOptions;
 use crate::polygon_fill::FillJob;
 use crate::polygon_fill::geometry::SetGeometry;
+use crate::progress::{WATCH_PERIOD, share, watching};
 use crate::replay::{ReplayJob, ReplayScene, ReplayTarget, ReplayedPixels, StrokeReplayer};
 use crate::resources::{CacheImage, ProjectImages, read_cache};
 use crate::safety_net::{self, AGREEMENT_STEPS, Score, SetScene, Strategy};
@@ -88,10 +90,12 @@ pub enum Step {
     CookingGraphs { set: usize, of: usize },
     /// Putting the converted project together (and, in the engine, storing it as a project).
     Saving,
+    /// Compositing the opened project's view once (a front end that shows the project when the import finishes).
+    ComputingView,
 }
 
 impl Step {
-    /// A stable id: `reading`, `converting`, `replaying`, `cooking` or `saving`.
+    /// A stable id: `reading`, `converting`, `replaying`, `cooking`, `saving` or `view`.
     pub fn id(&self) -> &'static str {
         match self {
             Step::ReadingFile => "reading",
@@ -99,6 +103,7 @@ impl Step {
             Step::ReplayingStrokes { .. } => "replaying",
             Step::CookingGraphs { .. } => "cooking",
             Step::Saving => "saving",
+            Step::ComputingView => "view",
         }
     }
 
@@ -106,7 +111,7 @@ impl Step {
     pub fn set(&self) -> Option<(usize, usize)> {
         match *self {
             Step::ConvertingSet { set, of } | Step::ReplayingStrokes { set, of } | Step::CookingGraphs { set, of } => Some((set, of)),
-            Step::ReadingFile | Step::Saving => None,
+            Step::ReadingFile | Step::Saving | Step::ComputingView => None,
         }
     }
 }
@@ -119,6 +124,7 @@ impl std::fmt::Display for Step {
             Step::ReplayingStrokes { set, of } => write!(f, "replaying strokes (texture set {set} of {of})"),
             Step::CookingGraphs { set, of } => write!(f, "cooking graphs (texture set {set} of {of})"),
             Step::Saving => f.write_str("saving"),
+            Step::ComputingView => f.write_str("computing the view"),
         }
     }
 }
@@ -130,7 +136,7 @@ impl std::fmt::Display for Step {
 /// store renders under the same flag, so a graph render in progress stops at its next node. A replayer that should stop
 /// early reads the flag itself.
 pub struct Hooks<'h> {
-    pub progress: &'h dyn Fn(f32, Step),
+    pub progress: &'h (dyn Fn(f32, Step) + Sync),
     pub cancel: &'h Cancel,
     pub replay: Option<&'h dyn StrokeReplayer>,
     /// Where graph cooks are also kept between imports (a folder on the desktop; `None`: render every one).
@@ -355,6 +361,36 @@ struct SetContext<'a, 'h> {
     span: (f32, f32),
 }
 
+/// Shares of a set's span (start, length): translating its layers, replaying strokes, cooking graphs (the composite
+/// that cooks them and measures the stack). Reading the stored result and baked maps comes before the first.
+const TRANSLATING: (f32, f32) = (0.02, 0.08);
+const REPLAYING: (f32, f32) = (0.1, 0.25);
+const COOKING: (f32, f32) = (0.35, 0.65);
+/// Share of the replay step that renders the brushes' graphs (the rest lays the strokes).
+const BRUSH_GRAPHS: f32 = 0.3;
+
+impl SetContext<'_, '_> {
+    /// The overall fraction at `share` (0..1) of this set's span.
+    fn at(&self) -> impl Fn(f32) -> f32 + Sync + use<> {
+        let span = self.span;
+        move |share: f32| span.0 + share.clamp(0.0, 1.0) * span.1
+    }
+}
+
+/// Layers of the tree, folders and their children included.
+fn layer_count(layers: &[texturecraft_import_reader::model::ProjectLayer]) -> usize {
+    layers.iter().map(|l| 1 + layer_count(l.children())).sum()
+}
+
+/// Graphs the stack runs that differ in what they render (a graph, its values and inputs, nested graphs included).
+fn distinct_graphs(layers: &[Layer]) -> usize {
+    let mut seen = BTreeSet::new();
+    for g in layers.iter().flat_map(|l| l.graphs()).flat_map(|g| g.graphs()) {
+        seen.insert(format!("{}{:?}{:?}{}", g.key, g.params, g.inputs, g.seed));
+    }
+    seen.len()
+}
+
 /// Builds one texture set into `project` and `out`.
 fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report: &mut ImportReport) -> Result<SetSummary, ImportError> {
     let record = &ctx.source.record;
@@ -478,6 +514,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let mut stack = match ctx.project_set {
         Some(project_set) => {
             let replay = ctx.options.replay_strokes && ctx.hooks.replay.is_some();
+            let done = AtomicUsize::new(0);
             let input = SetInput {
                 channels: &declared,
                 images: ctx.images,
@@ -487,8 +524,13 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
                 replay,
                 graphs: ctx.graphs,
                 geometry: Some(&geometry),
+                layers_done: Some(&done),
             };
-            let mut stack = layers::import(project_set, &input, project.next_id);
+            // the layers as they are translated (brush tips render here)
+            let expected = layer_count(&project_set.layers) as f32;
+            let (progress, at, step) = (ctx.hooks.progress, ctx.at(), Step::ConvertingSet { set: ctx.index.0, of: ctx.index.1 });
+            let poll = || progress(at(TRANSLATING.0 + TRANSLATING.1 * share(done.load(Ordering::Relaxed) as f32, expected)), step);
+            let mut stack = watching(WATCH_PERIOD, &poll, || layers::import(project_set, &input, project.next_id));
             if let Some(note) = uv_tiles::per_tile_note(project_set, &uv_tiles::mesh_tiles(ctx.mesh, ctx.source.slot)) {
                 report.add(item("UV tiles"), Fidelity::Approximated, note.clone());
                 stack.verdict.set_settings.and(&Status::approximated(note));
@@ -525,11 +567,23 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     {
         ctx.hooks.check()?;
         let (set, of) = ctx.index;
-        (ctx.hooks.progress)(ctx.span.0 + 0.25 * ctx.span.1, Step::ReplayingStrokes { set, of });
-        render_brush_sources(stack, ctx.graphs, &out.graphs, &baked, ctx.images, resolution);
+        let (progress, at, step) = (ctx.hooks.progress, ctx.at(), Step::ReplayingStrokes { set, of });
+        progress(at(REPLAYING.0), step);
+        // the brush graphs (a share of the step by the graphs rendered), then the strokes (by the strokes laid)
+        let (base, expected) = (out.graphs.cook_progress(), crate::replay::source::text_keys(&stack.jobs).len() as f32);
+        let poll = || progress(at(REPLAYING.0 + BRUSH_GRAPHS * REPLAYING.1 * share(out.graphs.cook_progress() - base, expected)), step);
+        watching(WATCH_PERIOD, &poll, || render_brush_sources(stack, ctx.graphs, &out.graphs, &baked, ctx.images, resolution));
         ctx.hooks.check()?;
         let scene = ReplayScene { mesh: ctx.mesh, material: ctx.source.slot, resolution };
-        replayed = replay_stack(stack, replayer, &scene, &mut out.pixels, &|what: &str| item(what), report);
+        let (base, strokes) = (replayer.strokes_done(), stack.jobs.iter().map(ReplayJob::strokes).sum::<usize>() as f32);
+        let from = REPLAYING.0 + BRUSH_GRAPHS * REPLAYING.1;
+        let poll = || {
+            if let (Some(now), Some(base)) = (replayer.strokes_done(), base) {
+                progress(at(from + (1.0 - BRUSH_GRAPHS) * REPLAYING.1 * share(now.saturating_sub(base) as f32, strokes)), step);
+            }
+        };
+        let pixels = &mut out.pixels;
+        replayed = watching(WATCH_PERIOD, &poll, || replay_stack(stack, replayer, &scene, pixels, &|what: &str| item(what), report));
         // a replayer stopped by the flag fails its remaining jobs: they are not reported as failures
         ctx.hooks.check()?;
     }
@@ -579,14 +633,20 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     if measuring || cooking {
         ctx.hooks.check()?;
         let (set, of) = ctx.index;
-        (ctx.hooks.progress)(ctx.span.0 + 0.5 * ctx.span.1, Step::CookingGraphs { set, of });
+        let (progress, at, step) = (ctx.hooks.progress, ctx.at(), Step::CookingGraphs { set, of });
+        progress(at(COOKING.0), step);
         let store: ImageStore = ctx.images.store();
         let scene = SetScene { project, ts, mesh: ctx.mesh, pixels: &out.pixels, baked: &baked, images: &store, graphs: &out.graphs };
         let mut channels = cache_channels.clone();
         if cooking {
             channels.extend(project.texture_set(ts).map(|s| s.channel_list()).unwrap_or_default().into_iter().filter(|c| !cache_channels.contains(c)));
         }
-        if let Some((composite, gbuf)) = safety_net::composite(&scene, &channels).filter(|_| measuring) {
+        // by the graphs cooked (each running render by its nodes), against the distinct graphs the stack runs
+        let expected = stack.as_ref().map_or(0, |s| distinct_graphs(&s.layers)) as f32;
+        let base = out.graphs.cook_progress();
+        let poll = || progress(at(COOKING.0 + COOKING.1 * share(out.graphs.cook_progress() - base, expected)), step);
+        let composite = watching(WATCH_PERIOD, &poll, || safety_net::composite(&scene, &channels));
+        if let Some((composite, gbuf)) = composite.filter(|_| measuring) {
             for (c, img) in &cache {
                 scores.push((*c, safety_net::score(&composite, &gbuf, *c, img, uncovered_default(*c, shader_model))));
             }

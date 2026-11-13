@@ -1652,6 +1652,13 @@ impl Graph {
         Ok(res.into_iter().map(|(k, v)| (k, v.into_tex())).collect())
     }
 
+    /// The nodes an evaluation of the graph's outputs runs at its own level (what [`EvalContext::nodes_done`] counts
+    /// up to; a node with several outputs read may count once per output).
+    pub fn work_nodes(&self) -> usize {
+        let outs: Vec<u32> = self.output_nodes().iter().map(|o| o.2).collect();
+        reached(self, &outs).len()
+    }
+
     /// Evaluate a single node (editor preview). Ignores unrelated incomplete nodes.
     pub fn evaluate_node(&self, id: u32, size: usize) -> Result<Tex, Error> {
         self.evaluate_node_in(&EvalContext::default(), id, size)
@@ -2363,6 +2370,11 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
         None => t,
     };
     let _span = prof("node.store_and_free");
+    if ctx.depth == 0
+        && let Some(done) = &ctx.ec.nodes_done
+    {
+        done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     // results that outlive the evaluation are kept as RGBA (editor)
     let full = (cache.persist.is_some() || (key == id && cache.thumbs.is_some())).then(|| t.tex());
     let t = match (&full, &cache.persist) {
