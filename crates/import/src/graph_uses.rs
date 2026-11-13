@@ -443,7 +443,9 @@ fn grey_recipe(
                 .and_then(|i| grey_recipe(lib, i, images, store, bitmaps, depth + 1))
                 .map(|nested| GraphInput::Nested(Box::new(nested))),
             Some(ProjectSource::Bitmap(b)) if !b.url.is_empty() => images.peek(&b.url).ok().map(|read| {
-                bitmaps.entry(b.url.clone()).or_insert_with(|| std::sync::Arc::new(read.image.image_res(!read.float)));
+                if !bitmaps.has_slot(&b.url) {
+                    bitmaps.insert(b.url.clone(), std::sync::Arc::new(read.image.image_res(!read.float)));
+                }
                 GraphInput::Image(b.url.clone())
             }),
             _ => None,

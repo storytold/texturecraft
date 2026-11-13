@@ -389,6 +389,7 @@ fn image_resources_fill_layers_and_round_trip() {
     let bytes = s.to_project_bytes().unwrap();
     let back = Session::from_project_bytes(&bytes).unwrap();
     assert_eq!(back.doc.resources.len(), 1);
+    assert_eq!(back.images.decoded_bytes(), 0, "an opened project decodes its images when they are read");
     assert_eq!(back.images.len(), 1);
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
@@ -494,7 +495,7 @@ fn text_becomes_a_brush_alpha_and_a_decal() {
     assert_eq!(name, "Text_TEXT.png");
     assert!(r["width"].as_u64().unwrap() > r["height"].as_u64().unwrap() / 2, "two short lines");
     // White with the glyphs in alpha.
-    let img = s.images[&name].clone();
+    let img = s.images.get(&name).unwrap().clone();
     assert!(img.rgba.iter().any(|t| t[3] > 0.99) && img.rgba.iter().any(|t| t[3] == 0.0) && img.rgba.iter().all(|t| t[0] == 1.0));
     // As the brush alpha it paints (keeping its proportions), and it places as a decal.
     execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [1.0, 0.0, 0.0]})).unwrap();

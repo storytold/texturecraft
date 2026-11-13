@@ -29,5 +29,5 @@ pub use eval::{
 };
 pub use field_cache::{FIELD_BUDGET, FieldCache};
 pub use graphs::{Cooked, GraphStore, GraphUse};
-pub use store::{BakedMaps, ImageRes, ImageStore, PixelStore, Texels};
+pub use store::{BakedMaps, ImageRes, ImageSource, ImageStore, PixelStore, Texels};
 pub use thumb::{THUMB_TEXELS, ThumbImage, ThumbTarget};

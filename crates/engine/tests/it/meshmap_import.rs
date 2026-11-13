@@ -285,14 +285,14 @@ fn tga_maps_survive_undo_redo_and_project_reload() {
     let result = import(&mut session, &dir, &[("Ball_normal.tga", None), ("Base_ao.png", None)]);
     assert_eq!(result["assigned"].as_array().unwrap().len(), 2);
     assert!(has_map(&session, 0, BakedMap::Normal));
-    let image = session.images["Ball_normal.tga"].clone();
+    let image = session.images.get("Ball_normal.tga").unwrap().clone();
 
     session.undo().unwrap();
     assert!(session.images.is_empty());
     session.redo().unwrap();
-    assert_eq!(session.images["Ball_normal.tga"].rgba, image.rgba);
+    assert_eq!(session.images.get("Ball_normal.tga").unwrap().rgba, image.rgba);
     let reloaded = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
-    assert_eq!(reloaded.images["Ball_normal.tga"].rgba, image.rgba);
+    assert_eq!(reloaded.images.get("Ball_normal.tga").unwrap().rgba, image.rgba);
     assert_eq!(reloaded.doc.baked, session.doc.baked);
     std::fs::remove_dir_all(dir).unwrap();
 }

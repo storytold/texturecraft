@@ -837,8 +837,10 @@ impl Session {
             if self.caches.get(ts).is_some_and(|c| !c.dirty.is_empty()) {
                 self.trim_set_caches(Some(ts));
                 // and for its cooks: those the project file keeps come back from it when a set needs them again
+                // and for its images: those decoded from the document's resources are decoded again when read
                 if self.last_composited.is_some_and(|last| last != ts) {
                     self.doc.graphs.release_reloadable(COOK_BUDGET);
+                    self.images.release(IMAGE_BUDGET);
                 }
                 self.last_composited = Some(ts);
             }
@@ -1022,6 +1024,9 @@ const CHUNK: usize = 256;
 /// Bytes the texture sets of a document may hold together in recompositing caches (see `Session::trim_set_caches`);
 /// one set's whole-set fields alone may reach this ([`texturecraft_compose::FIELD_BUDGET`]).
 pub const SET_CACHE_BUDGET: usize = 2 << 30;
+/// Bytes of decoded images a document holds before those that can be decoded again are let go when another texture
+/// set starts compositing (`ImageStore::release`).
+pub const IMAGE_BUDGET: usize = 512 << 20;
 /// Bytes of graph cooks a document holds before those that can be read again are let go when another texture set
 /// starts compositing (`GraphStore::release_reloadable`).
 pub const COOK_BUDGET: usize = 512 << 20;

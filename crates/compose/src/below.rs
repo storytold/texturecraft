@@ -126,7 +126,7 @@ impl StackKey {
                 layer.chain(pixels.masks.get(id).map(|img| (*id, None, Shared(img.clone()))))
             })
             .collect();
-        let mut images: Vec<(String, usize)> = images.iter().map(|(n, i)| (n.clone(), Arc::as_ptr(i) as usize)).collect();
+        let mut images: Vec<(String, usize)> = images.ids().map(|(n, id)| (n.clone(), id)).collect();
         images.sort();
         Some(StackKey {
             set,

@@ -206,7 +206,7 @@ mod tests {
         let mesh = texturecraft_engine::geom::primitives::material_ball();
         let mut s = Session::new_project("t", mesh, "builtin:material_ball", None, 256).unwrap();
         let name = s.import_resource_bytes("sky.hdr", sky_hdr()).unwrap();
-        assert!(s.images[&name].rgba[0][0] > 10.0, "the decoder keeps HDR values");
+        assert!(s.images.get(&name).unwrap().rgba[0][0] > 10.0, "the decoder keeps HDR values");
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;

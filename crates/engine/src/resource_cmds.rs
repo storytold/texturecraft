@@ -62,22 +62,27 @@ impl Session {
         Ok(name)
     }
 
-    /// Decode resources that are not decoded yet and forget removed ones (after undo, redo, load).
+    /// Images for the resources that have none yet, and none for removed ones (after undo, redo, load). An image is
+    /// decoded from its resource when something first reads it (see [`texturecraft_compose::ImageStore`]); a resource
+    /// whose header does not read as an image is left out, with a note in the log.
     pub fn sync_images(&mut self) {
-        let keep: Vec<String> = self.doc.resources.keys().cloned().collect();
-        self.images.retain(|k, _| keep.contains(k));
+        let resources = &self.doc.resources;
+        self.images.retain_names(|k| resources.contains_key(k));
         // Linked materials' packages are resources too, not images.
         let missing: Vec<(String, Arc<Vec<u8>>)> = self
             .doc
             .resources
             .iter()
-            .filter(|(k, _)| !self.images.contains_key(*k) && !k.ends_with(&format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT)))
+            .filter(|(k, _)| !self.images.has_slot(k) && !k.ends_with(&format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT)))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         for (k, bytes) in missing {
-            match texturecraft_formats::decode_image(&bytes) {
-                Ok(d) => {
-                    self.images.insert(k, decoded(d));
+            match texturecraft_formats::probe_image(&bytes) {
+                Ok(_) => {
+                    let id = Arc::as_ptr(&bytes) as usize;
+                    let source: texturecraft_compose::ImageSource =
+                        Arc::new(move || texturecraft_formats::decode_image(&bytes).ok().map(|d| Arc::unwrap_or_clone(decoded(d))));
+                    self.images.insert_source(k, id, source);
                 }
                 Err(e) => self.log.push(format!("resource {k}: {e}")),
             }
@@ -91,7 +96,8 @@ fn list(s: &Session) -> Value {
             .resources
             .iter()
             .map(|(k, v)| {
-                let (w, h) = s.images.get(k).map(|i| (i.width, i.height)).unwrap_or((0, 0));
+                // from the header: listing does not decode
+                let (w, h) = if s.images.has_slot(k) { texturecraft_formats::probe_image(v).unwrap_or((0, 0)) } else { (0, 0) };
                 json!({"name": k, "bytes": v.len(), "width": w, "height": h})
             })
             .collect::<Vec<_>>()

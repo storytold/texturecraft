@@ -21,6 +21,24 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage> {
 /// [`decode_image`] for an image of at most `max_texels` (width × height), checked from the
 /// header, before any pixel is decoded or allocated.
 pub fn decode_image_within(bytes: &[u8], max_texels: u64) -> Result<DecodedImage> {
+    let (format, _, _) = image_head(bytes, max_texels)?;
+    let image =
+        crate::guard("image", || image::load_from_memory_with_format(bytes, format).map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() }))?;
+    let srgb = !matches!(image, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_));
+    let float_image = image.into_rgba32f();
+    let (width, height) = float_image.dimensions();
+    let rgba = float_image.pixels().map(|pixel| pixel.0).collect();
+    Ok(DecodedImage { width, height, rgba, srgb })
+}
+
+/// The size of the image `bytes` hold, read from its header (without decoding a pixel): an error where
+/// [`decode_image`] fails before it decodes.
+pub fn probe_image(bytes: &[u8]) -> Result<(u32, u32)> {
+    image_head(bytes, u64::MAX).map(|(_, w, h)| (w, h))
+}
+
+/// The format and size of the image `bytes` hold, checked against the limits.
+fn image_head(bytes: &[u8], max_texels: u64) -> Result<(image::ImageFormat, u32, u32)> {
     let mut reader =
         image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() })?;
 
@@ -35,14 +53,7 @@ pub fn decode_image_within(bytes: &[u8], max_texels: u64) -> Result<DecodedImage
     if u64::from(width) * u64::from(height) > max_texels {
         return Err(FormatError::TooLarge(format!("image is {width}x{height}, more than {max_texels} texels")));
     }
-
-    let image =
-        crate::guard("image", || image::load_from_memory_with_format(bytes, format).map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() }))?;
-    let srgb = !matches!(image, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_));
-    let float_image = image.into_rgba32f();
-    let (width, height) = float_image.dimensions();
-    let rgba = float_image.pixels().map(|pixel| pixel.0).collect();
-    Ok(DecodedImage { width, height, rgba, srgb })
+    Ok((format, width, height))
 }
 
 /// PNG bytes of an `rgb` (sRGB) image whose alpha is `coverage` (`width × height`, top row first):

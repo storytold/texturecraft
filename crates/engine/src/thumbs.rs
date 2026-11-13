@@ -83,8 +83,7 @@ impl ThumbSnapshot {
             && self.project == session.doc.project
             && same_pixels
             && same_baked
-            && self.images.len() == session.images.len()
-            && self.images.iter().all(|(key, image)| session.images.get(key).is_some_and(|current| Arc::ptr_eq(current, image)))
+            && self.images.same_as(&session.images)
     }
 
     /// Render `target`: the work of one job.
