@@ -48,6 +48,11 @@ pub struct Mesh {
     pub diagonals: Vec<u8>,
 }
 
+/// [`Mesh::diagonals`] marks of the two fan triangles of a quad: the first has the diagonal as
+/// its edge 2 (last corner back to the first), the second as its edge 0.
+const QUAD_FIRST_MARK: u8 = 0b100;
+const QUAD_SECOND_MARK: u8 = 0b001;
+
 /// Hard cap on mesh size accepted from files (triangles).
 pub const MAX_TRIANGLES: usize = 20_000_000;
 
@@ -214,7 +219,63 @@ impl Mesh {
         self.normals = normals.into_iter().map(|v| v.try_normalize().unwrap_or(Vec3::Y)).collect();
     }
 
-    /// MikkTSpace tangents (falls back to per-triangle tangents if generation fails).
+    /// The faces MikkTSpace sees: each importer quad (a fan pair marked in [`Mesh::diagonals`])
+    /// as one four-corner face, like Blender hands it over, and every other triangle as a
+    /// triangle. Polygons with more than four corners stay fan triangles. The vertex and index
+    /// buffers are untouched; only tangent generation looks at the quads.
+    fn tangent_faces(&self) -> Vec<TangentFace> {
+        let triangles = self.indices.len() / 3;
+        let mut faces = Vec::with_capacity(triangles);
+        let mut t = 0;
+        while t < triangles {
+            if let Some(corners) = self.quad_at(t) {
+                faces.push(TangentFace { corners: [corners[0], corners[1], corners[2], corners[3]], count: 4 });
+                t += 2;
+                continue;
+            }
+            let c = |k: usize| self.indices.get(t * 3 + k).copied().unwrap_or(0);
+            faces.push(TangentFace { corners: [c(0), c(1), c(2), 0], count: 3 });
+            t += 1;
+        }
+        faces
+    }
+
+    /// The four corners of the quad whose fan triangles are `t` and `t + 1`, or `None` when they
+    /// are not an intact quad: the marks must be exactly the shared diagonal (a fan of more
+    /// corners marks more edges), the triangles must share the fan's first corner and the
+    /// diagonal's end, the four vertices must differ, have finite UVs and make two triangles of
+    /// positive area (anything else keeps its triangles, which MikkTSpace already survives).
+    fn quad_at(&self, t: usize) -> Option<[u32; 4]> {
+        if self.diagonals.get(t).copied()? != QUAD_FIRST_MARK || self.diagonals.get(t + 1).copied()? != QUAD_SECOND_MARK {
+            return None;
+        }
+        let a = self.indices.get(t * 3..t * 3 + 3)?;
+        let b = self.indices.get(t * 3 + 3..t * 3 + 6)?;
+        if a[0] != b[0] || a[2] != b[1] {
+            return None;
+        }
+        let corners = [a[0], a[1], a[2], b[2]];
+        if (1..4).any(|i| corners[..i].contains(&corners[i])) {
+            return None;
+        }
+        let point = |c: usize| self.positions.get(corners[c] as usize).copied();
+        let (p0, p1, p2, p3) = (point(0)?, point(1)?, point(2)?, point(3)?);
+        let points = [p0, p1, p2, p3];
+        // Distinct corner indices can still share one position (a seam); MikkTSpace compares
+        // positions exactly and underflows when every triangle of a folded quad is dropped.
+        if (1..4).any(|i| points[..i].contains(&points[i])) {
+            return None;
+        }
+        let area = |p: Vec3, q: Vec3, r: Vec3| (q - p).cross(r - p).length_squared() > 0.0;
+        if area(p0, p1, p2) && area(p0, p2, p3) && corners.iter().all(|&c| self.uvs.get(c as usize).is_some_and(|uv| uv.is_finite())) {
+            Some(corners)
+        } else {
+            None
+        }
+    }
+
+    /// MikkTSpace tangents (falls back to per-triangle tangents if generation fails). Quads the
+    /// importer split ([`Mesh::diagonals`]) are tangent-generated as quads, as Blender does.
     pub fn compute_tangents(&mut self) {
         self.tangents = vec![Vec4::new(1.0, 0.0, 0.0, 1.0); self.positions.len()];
         if self.normals.len() != self.positions.len() {
@@ -225,7 +286,8 @@ impl Mesh {
         }
         // mikktspace crashes (out-of-bounds) when every triangle is degenerate; skip it then.
         let usable = !crate::unwrap::all_triangles_degenerate(self);
-        let mut g = Mikk { mesh: self };
+        let faces = self.tangent_faces();
+        let mut g = Mikk { mesh: self, faces };
         if !usable || !mikktspace::generate_tangents(&mut g) {
             self.simple_tangents();
         }
@@ -402,22 +464,30 @@ impl Mesh {
     }
 }
 
+/// One MikkTSpace face: a triangle or a quad, as vertex indices.
+struct TangentFace {
+    corners: [u32; 4],
+    /// 3 or 4 corners in use.
+    count: usize,
+}
+
 struct Mikk<'a> {
     mesh: &'a mut Mesh,
+    faces: Vec<TangentFace>,
 }
 
 impl Mikk<'_> {
     fn vi(&self, face: usize, vert: usize) -> usize {
-        self.mesh.indices.get(face * 3 + vert).copied().unwrap_or(0) as usize
+        self.faces.get(face).and_then(|f| f.corners.get(vert)).copied().unwrap_or(0) as usize
     }
 }
 
 impl mikktspace::Geometry for Mikk<'_> {
     fn num_faces(&self) -> usize {
-        self.mesh.indices.len() / 3
+        self.faces.len()
     }
-    fn num_vertices_of_face(&self, _face: usize) -> usize {
-        3
+    fn num_vertices_of_face(&self, face: usize) -> usize {
+        self.faces.get(face).map_or(3, |f| f.count)
     }
     fn position(&self, face: usize, vert: usize) -> [f32; 3] {
         self.mesh.positions.get(self.vi(face, vert)).copied().unwrap_or_default().to_array()
@@ -532,6 +602,148 @@ mod tests {
         assert_eq!(mesh.uv_seam_edges(), vec![vec![(0, 2)], vec![(2, 4)]]);
         mesh.uvs[4] = mesh.uvs[0];
         assert_eq!(mesh.uv_seam_edges(), vec![Vec::<(u32, u32)>::new(); 2], "a material boundary alone is not a UV seam");
+    }
+
+    /// MikkTSpace run directly on one quad, the way Blender hands it over (the reference the
+    /// triangle-corner results are held to).
+    struct QuadRef<'a> {
+        mesh: &'a Mesh,
+        out: [Vec4; 4],
+    }
+
+    impl mikktspace::Geometry for QuadRef<'_> {
+        fn num_faces(&self) -> usize {
+            1
+        }
+        fn num_vertices_of_face(&self, _face: usize) -> usize {
+            4
+        }
+        fn position(&self, _face: usize, vert: usize) -> [f32; 3] {
+            self.mesh.positions[vert].to_array()
+        }
+        fn normal(&self, _face: usize, vert: usize) -> [f32; 3] {
+            self.mesh.normals[vert].to_array()
+        }
+        fn tex_coord(&self, _face: usize, vert: usize) -> [f32; 2] {
+            [self.mesh.uvs[vert].x, 1.0 - self.mesh.uvs[vert].y]
+        }
+        fn set_tangent_encoded(&mut self, tangent: [f32; 4], _face: usize, vert: usize) {
+            self.out[vert] = Vec4::from_array(tangent);
+        }
+    }
+
+    /// A non-planar quad with a trapezoid UV layout, split as the importer does (two fan
+    /// triangles, the diagonal marked), tangents computed.
+    fn warped_quad() -> Mesh {
+        let mut m = Mesh::from_parts(
+            vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 0.6), Vec3::new(0.0, 1.0, 0.0)],
+            None,
+            vec![Vec2::new(0.0, 0.9), Vec2::new(1.0, 1.0), Vec2::new(0.9, 0.0), Vec2::new(0.3, 0.2)],
+            vec![0, 1, 2, 0, 2, 3],
+            "Default",
+        )
+        .unwrap();
+        m.diagonals = vec![0b100, 0b001];
+        m.compute_tangents();
+        m
+    }
+
+    /// Largest angle in degrees between the tangents of `a` and `b`, and whether any sign differs.
+    fn tangent_gap(a: &[Vec4], b: &[Vec4]) -> (f32, bool) {
+        let angle = a.iter().zip(b).map(|(x, y)| x.truncate().dot(y.truncate()).clamp(-1.0, 1.0).acos().to_degrees()).fold(0.0, f32::max);
+        (angle, a.iter().zip(b).any(|(x, y)| x.w != y.w))
+    }
+
+    #[test]
+    fn warped_quad_tangents_match_quad_mikktspace() {
+        let m = warped_quad();
+        let mut reference = QuadRef { mesh: &m, out: [Vec4::ZERO; 4] };
+        assert!(mikktspace::generate_tangents(&mut reference));
+        let n = m.normals.clone();
+        let reference: Vec<Vec4> = reference
+            .out
+            .iter()
+            .zip(&n)
+            .map(|(t, n)| {
+                let v = t.truncate();
+                (v - *n * n.dot(v)).normalize().extend(t.w)
+            })
+            .collect();
+        let (angle, sign) = tangent_gap(&m.tangents, &reference);
+        assert!(angle < 0.01 && !sign, "tangents differ from quad MikkTSpace by {angle} degrees (sign differs: {sign})");
+
+        // Without the polygon marks the mesh is two triangles, whose tangents are another frame.
+        let mut tris = m.clone();
+        tris.diagonals.clear();
+        tris.compute_tangents();
+        assert!(tangent_gap(&tris.tangents, &reference).0 > 0.5, "the quad and the triangle frames must differ for this test to mean anything");
+    }
+
+    #[test]
+    fn planar_quad_tangents_do_not_change() {
+        let mut m = quad();
+        let before = m.tangents.clone();
+        m.diagonals = vec![0b100, 0b001];
+        m.compute_tangents();
+        let (angle, flipped) = tangent_gap(&m.tangents, &before);
+        assert!(angle < 1e-3 && !flipped, "angle {angle}, flipped {flipped}");
+    }
+
+    #[test]
+    fn folded_quad_sharing_a_position_does_not_crash_mikktspace() {
+        // Corner 3 reuses corner 1's position with its own UV (a 4-line OBJ makes this). With
+        // only this quad in the mesh every MikkTSpace triangle used to be dropped and it crashed.
+        let mut m = Mesh::from_parts(
+            vec![Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::X],
+            Some(vec![Vec3::Z; 4]),
+            vec![Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.5, 0.5)],
+            vec![0, 1, 2, 0, 2, 3],
+            "Default",
+        )
+        .unwrap();
+        m.diagonals = vec![0b100, 0b001];
+        m.compute_tangents();
+        assert!(m.tangents.iter().all(|t| t.is_finite()), "{:?}", m.tangents);
+    }
+
+    #[test]
+    fn hostile_quads_keep_triangle_tangents_and_do_not_panic() {
+        // A repeated corner, a non-finite UV and a collapsed quad: no panic, tangents stay finite.
+        for edit in 0..3 {
+            let mut m = warped_quad();
+            match edit {
+                0 => m.indices = vec![0, 1, 1, 0, 1, 3],
+                1 => m.uvs[2] = Vec2::new(f32::NAN, 0.0),
+                _ => m.positions = vec![Vec3::ZERO; 4],
+            }
+            m.compute_tangents();
+            assert!(m.tangents.iter().all(|t| t.is_finite()), "edit {edit}: {:?}", m.tangents);
+        }
+        // Diagonal marks on triangles that are not a fan pair are ignored.
+        let mut m = warped_quad();
+        m.diagonals = vec![0b100, 0b100];
+        m.compute_tangents();
+        let mut plain = warped_quad();
+        plain.diagonals.clear();
+        plain.compute_tangents();
+        assert_eq!(m.tangents, plain.tangents);
+    }
+
+    #[test]
+    fn polygons_beyond_four_corners_stay_triangles() {
+        // A fan of three triangles (a pentagon) marks 0b100, 0b101, 0b001: no quad is found.
+        let mut m = Mesh::from_parts(
+            vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.3, 1.0, 0.4), Vec3::new(0.5, 1.5, 0.0), Vec3::new(-0.3, 1.0, 0.0)],
+            Some(vec![Vec3::Z; 5]),
+            vec![Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(0.8, 0.0), Vec2::new(0.5, 0.0), Vec2::new(0.2, 0.0)],
+            vec![0, 1, 2, 0, 2, 3, 0, 3, 4],
+            "Default",
+        )
+        .unwrap();
+        let before = m.tangents.clone();
+        m.diagonals = vec![0b100, 0b101, 0b001];
+        m.compute_tangents();
+        assert_eq!(m.tangents, before);
     }
 
     #[test]

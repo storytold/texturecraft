@@ -278,6 +278,46 @@ fn polygons_keep_their_edges_for_the_wireframe() {
     assert_eq!(tris.wire_edges()[0].len(), 5);
 }
 
+#[test]
+fn imported_quads_get_quad_tangents() {
+    // A non-planar OBJ quad with sheared UVs: the importer keeps the quad for MikkTSpace, so its
+    // tangents differ from the same corners written as two triangles (Blender hands quads over).
+    let corners = "v 0 0 0
+v 1 0 0
+v 1 1 0.6
+v 0 1 0
+vt 0 0.1
+vt 1 0
+vt 0.9 1
+vt 0.3 0.8
+";
+    let quad = import_mesh_bytes(
+        "q.obj",
+        format!(
+            "{corners}f 1/1 2/2 3/3 4/4
+"
+        )
+        .as_bytes(),
+    )
+    .unwrap()
+    .mesh;
+    let tris = import_mesh_bytes(
+        "t.obj",
+        format!(
+            "{corners}f 1/1 2/2 3/3
+f 1/1 3/3 4/4
+"
+        )
+        .as_bytes(),
+    )
+    .unwrap()
+    .mesh;
+    assert_eq!((quad.indices.clone(), quad.positions.clone()), (tris.indices.clone(), tris.positions.clone()), "the render triangles are the same");
+    let widest = quad.tangents.iter().zip(&tris.tangents).map(|(a, b)| a.truncate().dot(b.truncate()).clamp(-1.0, 1.0).acos().to_degrees()).fold(0.0, f32::max);
+    assert!(widest > 1.0, "quad tangents differ from triangle tangents by only {widest} degrees");
+    assert!(quad.tangents.iter().all(|t| t.is_finite()));
+}
+
 fn ply_ascii() -> String {
     "ply\nformat ascii 1.0\ncomment test\nelement vertex 4\nproperty float x\nproperty float y\nproperty float z\nproperty float s\nproperty float t\n\
      element face 1\nproperty list uchar int vertex_indices\nend_header\n\
