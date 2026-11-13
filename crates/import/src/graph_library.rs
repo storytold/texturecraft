@@ -35,7 +35,21 @@ pub struct GraphLibrary {
     /// By package version and graph name.
     by_version: BTreeMap<(String, String), LibraryGraph>,
     by_key: BTreeMap<String, LibraryGraph>,
+    /// Grey renders already made ([`crate::graph_uses::render_grey`]), by cook key, output and side: a brush tip is
+    /// rendered once and shared by every brush and stamp using it (a project lays one tip thousands of times).
+    grey: std::sync::Mutex<GreyRenders>,
 }
+
+/// See [`GraphLibrary::shared_grey`].
+#[derive(Debug, Default)]
+struct GreyRenders {
+    by_key: std::collections::HashMap<String, Option<Arc<[f32]>>>,
+    /// Bytes of values held.
+    bytes: usize,
+}
+
+/// Most bytes of grey renders the library keeps for sharing; past it a render is made and not kept.
+const MAX_GREY_BYTES: usize = 1 << 30;
 
 impl GraphLibrary {
     /// Decompiles every graph of the project's embedded packages, one package's bytes at a time. Packages or graphs
@@ -85,6 +99,23 @@ impl GraphLibrary {
     /// The text under `key`, if a graph of the library has it.
     pub fn text(&self, key: &str) -> Option<Arc<str>> {
         self.by_key.get(key).map(|g| g.graph.text.clone())
+    }
+
+    /// The grey render kept under `key`, or `render()` kept under it (within [`MAX_GREY_BYTES`]). A render depends only
+    /// on what its cook key covers, so a kept one is the same values.
+    pub fn shared_grey(&self, key: String, render: impl FnOnce() -> Option<Arc<[f32]>>) -> Option<Arc<[f32]>> {
+        if let Some(hit) = self.grey.lock().ok().and_then(|m| m.by_key.get(&key).cloned()) {
+            return hit;
+        }
+        let values = render();
+        if let Ok(mut m) = self.grey.lock() {
+            let bytes = values.as_ref().map_or(0, |v| v.len() * size_of::<f32>());
+            if m.bytes + bytes <= MAX_GREY_BYTES && !m.by_key.contains_key(&key) {
+                m.bytes += bytes;
+                m.by_key.insert(key, values.clone());
+            }
+        }
+        values
     }
 
     pub fn len(&self) -> usize {

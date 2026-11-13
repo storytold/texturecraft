@@ -15,6 +15,7 @@
 //! | `cooked/<key>_<output>.bin` | one output of a graph's cooked render (pixel tiles), named by the cook's key |
 //! | `cooked/index.json` | the cooks' outputs (and which hold linear colour) and the cook each graph use read last |
 //! | `strokes/<id>.bin` | the stroke record behind the pixels keyed by `<id>` (see [`strokes`]) |
+//! | `stroke_images/<key>.bin` | a tip or stencil image stroke records lay, kept once (see [`strokes`]) |
 //!
 //! Pixel `.bin` files are sparse and lossless: a header (magic `TCTX`, version, width, height,
 //! components, tile count; u32 LE each) followed, for every allocated 64×64 tile, by `tx`, `ty`
@@ -295,15 +296,25 @@ fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
         });
     }
     graph_entries(pf, deflate, &mut out)?;
+    // the images the records lay, each once however many records and stamps lay it
+    let mut images = strokes::ImageTable::default();
     for (id, stored) in &pf.strokes {
         if texture_set_of(&pf.project, *id).is_none() {
             continue;
         }
-        let bytes = strokes::entry_bytes(stored).map_err(FormatError::Invalid)?;
+        let bytes = strokes::entry_bytes(stored, &mut images).map_err(FormatError::Invalid)?;
         if bytes.is_empty() {
             continue;
         }
         out.push(Entry { name: strokes::entry_name(*id), options: deflate, weight: bytes.len() as u64, body: Box::new(move |w| w.write_all(&bytes)) });
+    }
+    for (key, values) in images.by_key {
+        out.push(Entry {
+            name: strokes::image_entry_name(&key),
+            options: deflate,
+            weight: values.len() as u64 * 4,
+            body: Box::new(move |w| w.write_all(&strokes::encode_image(&values))),
+        });
     }
     Ok(out)
 }
@@ -650,6 +661,9 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
         project,
     };
     let mut unreadable_strokes = 0usize;
+    let mut dropped_strokes = 0usize;
+    let mut stroke_entries = Vec::new();
+    let mut stroke_images = std::collections::HashMap::new();
     let mut cook_index: Option<CookIndex> = None;
 
     for i in 0..zip.len() {
@@ -730,9 +744,20 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
             if size_of(id).is_none() {
                 continue;
             }
-            let stored = strokes::read(read_all(&mut f, strokes::MAX_ENTRY, &mut budget, &name)?);
-            unreadable_strokes += usize::from(matches!(stored, StoredStrokes::Unreadable(_)));
-            pf.strokes.insert(id, stored);
+            // A record larger than any this build writes (older builds kept every stamp's tip inside it) is left
+            // out: the project still opens, its pixels unchanged
+            if declared_bytes > strokes::MAX_ENTRY {
+                dropped_strokes += 1;
+                continue;
+            }
+            // read once the images they name are known (entries come in any order)
+            stroke_entries.push((id, read_all(&mut f, strokes::MAX_ENTRY, &mut budget, &name)?));
+        } else if let Some(key) = strokes::image_entry_key(&name) {
+            let key = key.ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
+            // an image that cannot be read leaves the records naming it unreadable (kept as they are)
+            if let Ok(values) = strokes::decode_image(key, &read_all(&mut f, strokes::MAX_IMAGE_ENTRY, &mut budget, &name)?) {
+                stroke_images.insert(key.to_string(), values);
+            }
         } else if let Some(rest) = name.strip_prefix("baked/").and_then(|r| r.strip_suffix(".bin")) {
             let (ts, map) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
             let ts: usize = ts.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?;
@@ -760,7 +785,18 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
         load_cooks(&mut zip, index, &mut pf, &mut budget);
     }
 
+    for (id, bytes) in stroke_entries {
+        let stored = strokes::read(bytes, &mut stroke_images);
+        unreadable_strokes += usize::from(matches!(stored, StoredStrokes::Unreadable(_)));
+        pf.strokes.insert(id, stored);
+    }
+    drop(stroke_images);
+
     pf.project.format_version = FORMAT_VERSION;
+    if dropped_strokes > 0 {
+        pf.warnings
+            .push(format!("Note: {dropped_strokes} stroke record(s) larger than {} MiB were left out; the pixels are unchanged.", strokes::MAX_ENTRY >> 20));
+    }
     if unreadable_strokes > 0 {
         pf.warnings
             .push(format!("Note: {unreadable_strokes} stroke record(s) could not be read; the pixels are unchanged and the records are kept as they are."));

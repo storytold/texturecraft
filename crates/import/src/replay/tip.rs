@@ -89,7 +89,7 @@ pub fn graph_tip(graph: &Procedural, images: &ProjectImages, graphs: Option<&Gra
     let blocked = |why: &str| Blocker::new(BlockerKey::new(BlockerKind::BrushAlpha, name), format!("brush alpha \"{name}\" {why}"));
     let lib = graphs.ok_or_else(|| blocked("is a compiled graph (graphs are kept as placeholders)"))?;
     let values = crate::graph_uses::render_grey(lib, graph, TIP_SIDE, images).ok_or_else(|| blocked("is a compiled graph that does not render"))?;
-    Ok(ReplayTip::Image { width: TIP_SIDE, height: TIP_SIDE, values: Arc::from(values) })
+    Ok(ReplayTip::Image { width: TIP_SIDE, height: TIP_SIDE, values })
 }
 
 /// Whether `p` is the legacy Gaussian alpha of the oldest packages.
@@ -155,7 +155,7 @@ pub fn cycle(alpha: &[ProjectSource], images: &ProjectImages, graphs: Option<&Gr
             set(SEED, i);
         }
         let Some(values) = crate::graph_uses::render_grey(lib, &stamp, TIP_SIDE, images) else { return (Vec::new(), false) };
-        out.push(ReplayTip::Image { width: TIP_SIDE, height: TIP_SIDE, values: Arc::from(values) });
+        out.push(ReplayTip::Image { width: TIP_SIDE, height: TIP_SIDE, values });
     }
     (out, p.stroke_wires & STROKE_WIRE_RANDOM_START != 0)
 }
@@ -187,7 +187,7 @@ pub fn stencil(source: &ProjectSource, images: &ProjectImages, graphs: Option<&G
             let blocked = |why: &str| Blocker::new(BlockerKey::new(BlockerKind::BrushAlpha, name), format!("stencil \"{name}\" {why}"));
             let lib = graphs.ok_or_else(|| blocked("is a compiled graph (graphs are kept as placeholders)"))?;
             let values = crate::graph_uses::render_grey(lib, q, STENCIL_SIDE, images).ok_or_else(|| blocked("is a compiled graph that does not render"))?;
-            Ok(StencilImage::Image { width: STENCIL_SIDE, height: STENCIL_SIDE, values: Arc::from(values) })
+            Ok(StencilImage::Image { width: STENCIL_SIDE, height: STENCIL_SIDE, values })
         }
         other => Err(refused(&format!("stencil-source-{}", other.kind()), format!("stencil source {}", other.kind()))),
     }
