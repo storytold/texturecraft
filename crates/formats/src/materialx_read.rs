@@ -1,41 +1,16 @@
-//! Reading a MaterialX (`.mtlx`) material into TextureCraft's channels, written from the ASWF
-//! MaterialX specification (1.39) and the OpenPBR Surface and glTF PBR node definitions. Pure
-//! Rust: no MaterialX library is linked.
+//! MaterialX material import adapted to TextureCraft's channel model.
 //!
-//! [`read_materialx`] finds a `surfacematerial`, follows its `surfaceshader` to an
-//! `open_pbr_surface`, `standard_surface` or `gltf_pbr` node, and turns each input TextureCraft
-//! has a channel for into a literal value or an image file:
-//!
-//! - a literal `value` becomes a constant (`color3` values tagged `srgb_texture` are converted
-//!   to linear; a colour given for a scalar channel is averaged);
-//! - an input wired to a `tiledimage` or `image` node (directly or through a `nodegraph`
-//!   output) becomes that node's `file` (with `fileprefix` applied); `normalmap`, `convert` and
-//!   `constant` nodes in between are passed through;
-//! - the material's `displacementshader` becomes the height channel;
-//! - `uvtiling` of the first tiled image is returned as the UV tiling.
-//!
-//! Anything else (maths nodes, procedural patterns, other shaders) is skipped with a warning
-//! rather than guessed at. Emission follows the specifications' defaults: OpenPBR emits nothing
-//! unless `emission_luminance` is above 0, and `standard_surface` unless `emission` is.
-//!
-//! The reader takes untrusted bytes: the document size, nesting and element count are capped, a
-//! wiring loop stops at a depth limit, and every failure is an error, never a panic.
+//! XML parsing, nodegraph traversal and shader input resolution live in `craft-materialx`.
+//! This module maps those format-level values to TextureCraft's channels and color handling.
 
-use std::collections::HashMap;
-
-use quick_xml::events::{BytesStart, Event};
-use texturecraft_core::Channel;
+use texturecraft_core::{Channel, ChannelKind};
 use texturecraft_texel::srgb_to_linear;
 
 use crate::{FormatError, Result, malformed};
 
 const KIND: &str = "MaterialX document";
 /// Largest document read, in bytes.
-pub const MAX_BYTES: usize = 16 << 20;
-const MAX_DEPTH: usize = 64;
-const MAX_ELEMENTS: usize = 200_000;
-/// Longest chain of nodes followed from one shader input.
-const MAX_HOPS: usize = 16;
+pub const MAX_BYTES: usize = craft_materialx::MAX_BYTES;
 
 /// What one channel is set from.
 #[derive(Clone, Debug, PartialEq)]
@@ -58,259 +33,40 @@ pub struct Material {
     pub warnings: Vec<String>,
 }
 
-// ---------------------------------------------------------------------------------------------
-// XML.
-
-#[derive(Default)]
-struct El {
-    name: String,
-    attrs: Vec<(String, String)>,
-    children: Vec<El>,
+fn channel(shader: craft_materialx::Shader, input: &str) -> Option<Channel> {
+    use craft_materialx::Shader::{GltfPbr, OpenPbr, StandardSurface};
+    Some(match (shader, input) {
+        (OpenPbr, "base_color") | (StandardSurface, "base_color") | (GltfPbr, "base_color") => Channel::BaseColor,
+        (OpenPbr, "base_metalness") | (StandardSurface, "metalness") | (GltfPbr, "metallic") => Channel::Metallic,
+        (OpenPbr, "specular_roughness") | (StandardSurface, "specular_roughness") | (GltfPbr, "roughness") => Channel::Roughness,
+        (OpenPbr, "geometry_normal") | (StandardSurface, "normal") | (GltfPbr, "normal") => Channel::Normal,
+        (OpenPbr, "geometry_opacity") | (StandardSurface, "opacity") | (GltfPbr, "alpha") => Channel::Opacity,
+        (OpenPbr, "emission_color") | (StandardSurface, "emission_color") | (GltfPbr, "emission") => Channel::Emissive,
+        (OpenPbr, "coat_weight") | (StandardSurface, "coat") | (GltfPbr, "clearcoat") => Channel::CoatWeight,
+        (OpenPbr, "coat_roughness") | (StandardSurface, "coat_roughness") | (GltfPbr, "clearcoat_roughness") => Channel::CoatRoughness,
+        (OpenPbr, "geometry_coat_normal") | (StandardSurface, "coat_normal") | (GltfPbr, "clearcoat_normal") => Channel::CoatNormal,
+        (OpenPbr, "fuzz_weight") | (StandardSurface, "sheen") => Channel::SheenWeight,
+        (OpenPbr, "fuzz_color") | (StandardSurface, "sheen_color") | (GltfPbr, "sheen_color") => Channel::SheenColor,
+        (OpenPbr, "fuzz_roughness") | (StandardSurface, "sheen_roughness") | (GltfPbr, "sheen_roughness") => Channel::SheenRoughness,
+        (OpenPbr, "specular_roughness_anisotropy") | (StandardSurface, "specular_anisotropy") => Channel::AnisotropyLevel,
+        (OpenPbr, "transmission_weight") | (StandardSurface, "transmission") | (GltfPbr, "transmission") => Channel::Transmission,
+        (OpenPbr, "subsurface_weight") | (StandardSurface, "subsurface") => Channel::ScatterWeight,
+        (GltfPbr, "occlusion") => Channel::AmbientOcclusion,
+        _ => return None,
+    })
 }
 
-impl El {
-    fn attr(&self, k: &str) -> Option<&str> {
-        self.attrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+fn constant(channel: Channel, values: &[f32], colorspace: Option<&str>) -> [f32; 3] {
+    let mut values = values.to_vec();
+    if let Some(space) = colorspace
+        && (space.starts_with("srgb") || space.starts_with("g22") || space.starts_with("g18"))
+        && values.len() >= 3
+    {
+        values.iter_mut().take(3).for_each(|c| *c = srgb_to_linear(*c));
     }
-
-    /// The child element named `name` (the `name` attribute: inputs and nodes are looked up by it).
-    fn input(&self, name: &str) -> Option<&El> {
-        self.children.iter().find(|c| c.attr("name") == Some(name))
-    }
-}
-
-fn element(e: &BytesStart) -> El {
-    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-    let attrs = e
-        .attributes()
-        .with_checks(false)
-        .flatten()
-        .map(|a| {
-            (text(a.key.local_name().as_ref()), a.normalized_value(quick_xml::XmlVersion::Implicit1_0).map_or_else(|_| text(&a.value), |v| v.into_owned()))
-        })
-        .collect();
-    El { name: text(e.local_name().as_ref()), attrs, children: Vec::new() }
-}
-
-fn parse_xml(bytes: &[u8]) -> Result<El> {
-    let mut reader = quick_xml::Reader::from_reader(bytes);
-    let mut stack = vec![El::default()];
-    let mut count = 0usize;
-    loop {
-        let event = reader.read_event().map_err(|e| malformed(KIND, e))?;
-        if matches!(event, Event::Start(_) | Event::Empty(_)) {
-            count += 1;
-            if count > MAX_ELEMENTS || stack.len() > MAX_DEPTH {
-                return Err(FormatError::TooLarge(format!(
-                    "the MaterialX document has more than {MAX_ELEMENTS} elements or is nested deeper than {MAX_DEPTH}"
-                )));
-            }
-        }
-        match event {
-            Event::Start(e) => stack.push(element(&e)),
-            Event::Empty(e) => {
-                if let Some(parent) = stack.last_mut() {
-                    parent.children.push(element(&e));
-                }
-            }
-            Event::End(_) => {
-                let el = stack.pop().filter(|_| !stack.is_empty()).ok_or_else(|| malformed(KIND, "unbalanced end tag"))?;
-                if let Some(parent) = stack.last_mut() {
-                    parent.children.push(el);
-                }
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-    }
-    match (stack.pop(), stack.is_empty()) {
-        (Some(root), true) => Ok(root),
-        _ => Err(malformed(KIND, "unclosed elements at the end of the document")),
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Shader input tables: (shader input, channel). `kind` says how to read the value.
-
-#[derive(Clone, Copy, PartialEq)]
-enum Shader {
-    OpenPbr,
-    Standard,
-    Gltf,
-}
-
-const OPEN_PBR: &[(&str, Channel)] = &[
-    ("base_color", Channel::BaseColor),
-    ("base_metalness", Channel::Metallic),
-    ("specular_roughness", Channel::Roughness),
-    ("geometry_normal", Channel::Normal),
-    ("geometry_opacity", Channel::Opacity),
-    ("emission_color", Channel::Emissive),
-    ("coat_weight", Channel::CoatWeight),
-    ("coat_roughness", Channel::CoatRoughness),
-    ("geometry_coat_normal", Channel::CoatNormal),
-    ("fuzz_weight", Channel::SheenWeight),
-    ("fuzz_color", Channel::SheenColor),
-    ("fuzz_roughness", Channel::SheenRoughness),
-    ("specular_roughness_anisotropy", Channel::AnisotropyLevel),
-    ("transmission_weight", Channel::Transmission),
-    ("subsurface_weight", Channel::ScatterWeight),
-];
-
-const STANDARD: &[(&str, Channel)] = &[
-    ("base_color", Channel::BaseColor),
-    ("metalness", Channel::Metallic),
-    ("specular_roughness", Channel::Roughness),
-    ("normal", Channel::Normal),
-    ("opacity", Channel::Opacity),
-    ("emission_color", Channel::Emissive),
-    ("coat", Channel::CoatWeight),
-    ("coat_roughness", Channel::CoatRoughness),
-    ("coat_normal", Channel::CoatNormal),
-    ("sheen", Channel::SheenWeight),
-    ("sheen_color", Channel::SheenColor),
-    ("sheen_roughness", Channel::SheenRoughness),
-    ("specular_anisotropy", Channel::AnisotropyLevel),
-    ("transmission", Channel::Transmission),
-    ("subsurface", Channel::ScatterWeight),
-];
-
-const GLTF: &[(&str, Channel)] = &[
-    ("base_color", Channel::BaseColor),
-    ("metallic", Channel::Metallic),
-    ("roughness", Channel::Roughness),
-    ("normal", Channel::Normal),
-    ("alpha", Channel::Opacity),
-    ("emission", Channel::Emissive),
-    ("occlusion", Channel::AmbientOcclusion),
-    ("clearcoat", Channel::CoatWeight),
-    ("clearcoat_roughness", Channel::CoatRoughness),
-    ("clearcoat_normal", Channel::CoatNormal),
-    ("sheen_color", Channel::SheenColor),
-    ("sheen_roughness", Channel::SheenRoughness),
-    ("transmission", Channel::Transmission),
-];
-
-// ---------------------------------------------------------------------------------------------
-// Resolving what feeds an input.
-
-struct Doc<'a> {
-    root: &'a El,
-    /// Every node by name: the document's own, and each nodegraph's (qualified `graph/node`).
-    nodes: HashMap<String, &'a El>,
-    /// Each nodegraph's outputs: `graph/output` to the node name inside (qualified).
-    outputs: HashMap<String, String>,
-    tiling: Option<[f32; 2]>,
-    warnings: Vec<String>,
-}
-
-enum Found {
-    Constant(Vec<f32>),
-    Image(String),
-    None,
-}
-
-fn numbers(text: &str) -> Option<Vec<f32>> {
-    let v: Option<Vec<f32>> = text.split(',').map(|p| p.trim().parse::<f32>().ok().filter(|f| f.is_finite())).collect();
-    v.filter(|v| !v.is_empty() && v.len() <= 4)
-}
-
-impl<'a> Doc<'a> {
-    fn new(root: &'a El) -> Doc<'a> {
-        let mut nodes = HashMap::new();
-        let mut outputs = HashMap::new();
-        for c in &root.children {
-            match (c.name.as_str(), c.attr("name")) {
-                ("nodegraph", Some(g)) => {
-                    for n in &c.children {
-                        let Some(name) = n.attr("name") else { continue };
-                        if n.name == "output" {
-                            if let Some(from) = n.attr("nodename") {
-                                outputs.insert(format!("{g}/{name}"), format!("{g}/{from}"));
-                            }
-                        } else {
-                            nodes.insert(format!("{g}/{name}"), n);
-                        }
-                    }
-                }
-                (_, Some(name)) => {
-                    nodes.insert(name.to_owned(), c);
-                }
-                _ => {}
-            }
-        }
-        Doc { root, nodes, outputs, tiling: None, warnings: Vec::new() }
-    }
-
-    /// What `input` (an `<input>` element of a node) resolves to; `scope` is the nodegraph the
-    /// node lives in, if any.
-    fn resolve(&mut self, input: &El, scope: Option<&str>, hops: usize) -> Found {
-        if hops > MAX_HOPS {
-            self.warnings.push("a node chain is longer than 16 nodes (or loops); skipped".into());
-            return Found::None;
-        }
-        if let Some(v) = input.attr("value") {
-            return numbers(v).map_or(Found::None, |n| Found::Constant(self.tag(input, n)));
-        }
-        let target = match (input.attr("nodegraph"), input.attr("output"), input.attr("nodename")) {
-            (Some(g), out, _) => {
-                let out = out.map(str::to_owned).or_else(|| self.outputs.keys().find_map(|k| k.strip_prefix(&format!("{g}/")).map(str::to_owned)));
-                out.and_then(|o| self.outputs.get(&format!("{g}/{o}")).cloned())
-            }
-            (None, _, Some(n)) => {
-                Some(scope.map_or_else(|| n.to_owned(), |g| format!("{g}/{n}"))).filter(|q| self.nodes.contains_key(q)).or_else(|| Some(n.to_owned()))
-            }
-            _ => None,
-        };
-        let Some(node) = target.as_deref().and_then(|t| self.nodes.get(t).copied()) else { return Found::None };
-        let scope = target.as_deref().and_then(|t| t.split_once('/')).map(|(g, _)| g.to_owned());
-        let scope = scope.as_deref();
-        match node.name.as_str() {
-            "tiledimage" | "image" => {
-                let Some(file) = node.input("file").and_then(|f| f.attr("value")) else {
-                    self.warnings.push(format!("image node {:?} has no file", node.attr("name").unwrap_or("")));
-                    return Found::None;
-                };
-                let prefix =
-                    [node.input("file").and_then(|f| f.attr("fileprefix")), node.attr("fileprefix"), self.root.attr("fileprefix")].into_iter().flatten().next();
-                if self.tiling.is_none()
-                    && let Some(t) =
-                        node.input("uvtiling").and_then(|t| t.attr("value")).and_then(numbers).filter(|t| t.len() == 2 && t.iter().all(|v| *v > 0.0))
-                {
-                    // The range a fill's UV scale accepts (`layer.fill.projection`).
-                    self.tiling = Some([t[0].clamp(0.001, 1000.0), t[1].clamp(0.001, 1000.0)]);
-                }
-                Found::Image(format!("{}{file}", prefix.unwrap_or("")))
-            }
-            "normalmap" | "convert" => match node.input("in") {
-                Some(i) => self.resolve(i, scope, hops + 1),
-                None => Found::None,
-            },
-            "constant" => match node.input("value") {
-                Some(v) => self.resolve(v, scope, hops + 1),
-                None => Found::None,
-            },
-            other => {
-                self.warnings.push(format!("a {other} node ({:?}) is not supported; its input was skipped", node.attr("name").unwrap_or("")));
-                Found::None
-            }
-        }
-    }
-
-    /// Literal values tagged with an sRGB colour space are converted to linear.
-    fn tag(&self, input: &El, mut n: Vec<f32>) -> Vec<f32> {
-        let space = input.attr("colorspace").or_else(|| self.root.attr("colorspace")).unwrap_or("");
-        if input.attr("colorspace").is_some() && (space.starts_with("srgb") || space.starts_with("g22") || space.starts_with("g18")) && n.len() >= 3 {
-            n.iter_mut().take(3).for_each(|c| *c = srgb_to_linear(*c));
-        }
-        n
-    }
-}
-
-fn to_constant(channel: Channel, n: &[f32]) -> [f32; 3] {
-    match (channel.kind(), n) {
+    match (channel.kind(), values.as_slice()) {
         (_, [a]) => [*a; 3],
-        (texturecraft_core::ChannelKind::Color, [r, g, b, ..]) => [*r, *g, *b],
+        (ChannelKind::Color, [r, g, b, ..]) => [*r, *g, *b],
         (_, [r, g, b, ..]) => {
             let mean = (r + g + b) / 3.0;
             [mean; 3]
@@ -319,9 +75,11 @@ fn to_constant(channel: Channel, n: &[f32]) -> [f32; 3] {
     }
 }
 
-/// The literal number of `input`, if it is one.
-fn literal(shader: &El, name: &str) -> Option<f32> {
-    shader.input(name).and_then(|i| i.attr("value")).and_then(numbers).and_then(|n| n.first().copied())
+fn app_value(channel: Channel, value: craft_materialx::Value) -> Value {
+    match value {
+        craft_materialx::Value::Constant { values, colorspace } => Value::Constant(constant(channel, &values, colorspace.as_deref())),
+        craft_materialx::Value::Image(file) => Value::Image(file),
+    }
 }
 
 /// Read the material called `material` (default: the first) from a `.mtlx` document.
@@ -330,79 +88,30 @@ pub fn read_materialx(bytes: &[u8], material: Option<&str>) -> Result<Material> 
 }
 
 fn read_inner(bytes: &[u8], material: Option<&str>) -> Result<Material> {
-    if bytes.len() > MAX_BYTES {
-        return Err(FormatError::TooLarge(format!("the MaterialX document is over {} MiB", MAX_BYTES >> 20)));
-    }
-    let top = parse_xml(bytes)?;
-    let root = top.children.iter().find(|c| c.name == "materialx").ok_or_else(|| malformed(KIND, "no <materialx> element"))?;
-    let mut doc = Doc::new(root);
-    let materials: Vec<&El> = root.children.iter().filter(|c| c.name == "surfacematerial").collect();
-    let mat = match material {
-        Some(name) => materials
-            .iter()
-            .copied()
-            .find(|m| m.attr("name") == Some(name))
-            .ok_or_else(|| FormatError::Invalid(format!("no material named {name:?} (found: {})", names(&materials))))?,
-        None => materials.first().copied().ok_or_else(|| FormatError::Unsupported("the document has no surfacematerial".into()))?,
-    };
-    let mut out = Material { name: mat.attr("name").unwrap_or("Material").to_owned(), channels: Vec::new(), uv_tiling: [1.0, 1.0], warnings: Vec::new() };
-    let shader = mat
-        .input("surfaceshader")
-        .and_then(|i| i.attr("nodename"))
-        .and_then(|n| doc.nodes.get(n).copied())
-        .ok_or_else(|| malformed(KIND, "the material has no surface shader"))?;
-    let (kind, table) = match shader.name.as_str() {
-        "open_pbr_surface" => (Shader::OpenPbr, OPEN_PBR),
-        "standard_surface" => (Shader::Standard, STANDARD),
-        "gltf_pbr" => (Shader::Gltf, GLTF),
-        other => return Err(FormatError::Unsupported(format!("the surface shader is a {other}; open_pbr_surface, standard_surface and gltf_pbr are read"))),
-    };
-    // Emission is off by default in OpenPBR and standard_surface.
-    let emits = match kind {
-        Shader::OpenPbr => {
-            shader.input("emission_luminance").is_some_and(|i| i.attr("value").is_none() || literal(shader, "emission_luminance").is_some_and(|v| v > 0.0))
-        }
-        Shader::Standard => shader.input("emission").is_some_and(|i| i.attr("value").is_none() || literal(shader, "emission").is_some_and(|v| v > 0.0)),
-        Shader::Gltf => true,
-    };
-    let weight = match kind {
-        Shader::OpenPbr => literal(shader, "base_weight"),
-        Shader::Standard => literal(shader, "base"),
-        Shader::Gltf => None,
-    };
-    if weight.is_some_and(|w| (w - 1.0).abs() > 1e-6) {
-        doc.warnings.push("the base weight isn't 1; it was ignored".into());
-    }
-    for &(input, channel) in table {
-        let Some(el) = shader.input(input) else { continue };
-        if channel == Channel::Emissive && !emits && kind != Shader::Gltf {
-            doc.warnings.push(format!("{input} was skipped: the shader's emission is 0"));
-            continue;
-        }
-        match doc.resolve(el, None, 0) {
-            Found::Constant(n) => out.channels.push((channel, Value::Constant(to_constant(channel, &n)))),
-            Found::Image(f) => out.channels.push((channel, Value::Image(f))),
-            Found::None => {}
+    let document = craft_materialx::Document::parse(bytes).map_err(map_error)?;
+    let shared = document.read_material(material).map_err(map_error)?;
+    let mut channels = Vec::new();
+    for (input, value) in shared.inputs {
+        if let Some(channel) = channel(shared.shader, &input) {
+            channels.push((channel, app_value(channel, value)));
         }
     }
-    // The displacement shader's `displacement` input is the height.
-    if let Some(d) = mat.input("displacementshader").and_then(|i| i.attr("nodename")).and_then(|n| doc.nodes.get(n).copied())
-        && let Some(i) = d.input("displacement")
-    {
-        match doc.resolve(i, None, 0) {
-            Found::Constant(n) => out.channels.push((Channel::Height, Value::Constant(to_constant(Channel::Height, &n)))),
-            Found::Image(f) => out.channels.push((Channel::Height, Value::Image(f))),
-            Found::None => {}
-        }
+    if let Some(value) = shared.displacement {
+        channels.push((Channel::Height, app_value(Channel::Height, value)));
     }
-    out.uv_tiling = doc.tiling.unwrap_or([1.0, 1.0]);
-    out.warnings = doc.warnings;
-    Ok(out)
+    Ok(Material { name: shared.name, channels, uv_tiling: shared.uv_tiling, warnings: shared.warnings })
 }
 
-fn names(materials: &[&El]) -> String {
-    let n: Vec<&str> = materials.iter().filter_map(|m| m.attr("name")).collect();
-    if n.is_empty() { "none".into() } else { n.join(", ") }
+fn map_error(error: craft_materialx::Error) -> FormatError {
+    use craft_materialx::Error;
+    match error {
+        Error::Xml(xml) if xml.is_limit() => FormatError::TooLarge(xml.to_string()),
+        Error::MissingMaterial(name) => FormatError::Invalid(format!("no material named {name:?}")),
+        Error::Unsupported(message) => FormatError::Unsupported(message),
+        Error::Malformed(message) => malformed(KIND, message),
+        Error::Root => malformed(KIND, "no <materialx> element"),
+        Error::Xml(other) => malformed(KIND, other),
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +163,24 @@ mod tests {
         assert!(m.warnings.is_empty(), "{:?}", m.warnings);
         let extreme = OPENPBR.replace(r#"value="4, 2""#, r#"value="1e9, 1e-9""#);
         assert_eq!(read_materialx(extreme.as_bytes(), None).unwrap().uv_tiling, [1000.0, 0.001], "clamped like a fill's UV scale");
+    }
+
+    #[test]
+    fn nodegraph_input_without_output_uses_the_first_output() {
+        let xml = r#"<materialx version="1.38">
+  <nodegraph name="NG">
+    <tiledimage name="a" type="color3"><input name="file" type="filename" value="first.png" /></tiledimage>
+    <tiledimage name="b" type="color3"><input name="file" type="filename" value="second.png" /></tiledimage>
+    <output name="o1" type="color3" nodename="a" />
+    <output name="o2" type="color3" nodename="b" />
+  </nodegraph>
+  <standard_surface name="S" type="surfaceshader"><input name="base_color" type="color3" nodegraph="NG" /></standard_surface>
+  <surfacematerial name="M" type="material"><input name="surfaceshader" type="surfaceshader" nodename="S" /></surfacematerial>
+</materialx>"#;
+        for _ in 0..50 {
+            let material = read_materialx(xml.as_bytes(), None).unwrap();
+            assert_eq!(get(&material, Channel::BaseColor), Some(&Value::Image("first.png".into())));
+        }
     }
 
     #[test]
