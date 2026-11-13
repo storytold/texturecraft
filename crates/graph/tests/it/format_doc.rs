@@ -2,7 +2,7 @@
 
 use texturecraft_graph::graph::{self, Graph};
 
-const DOC: &str = include_str!("../../../docs/graph-format.md");
+const DOC: &str = include_str!("../../../../docs/graph-format.md");
 
 #[test]
 fn the_example_renders() {

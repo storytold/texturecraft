@@ -2,11 +2,9 @@
 //! splitting works on the real code, not only on small examples. `TC_VERSIONS_DUMP=1` prints what each kind's version
 //! covers. The build script's own modules are compiled here as well, so their unit tests run.
 
+// The build script's `digest` module is declared at the test crate's root (`main.rs`), where `source` looks for it.
 #[allow(dead_code)]
-#[path = "../build/digest.rs"]
-mod digest;
-#[allow(dead_code)]
-#[path = "../build/source/mod.rs"]
+#[path = "../../build/source/mod.rs"]
 mod source;
 
 use source::items::Dispatcher;
