@@ -310,17 +310,18 @@ pub struct Field {
 /// Anchor points inside a mask with one recorded value per texel of a region.
 type Marks = Vec<(LayerId, Vec<f32>)>;
 
-/// A field's values: floats while it is made, half floats once it covers the whole set (see [`Field::compact`]).
+/// A field's values: floats while it is made; once it covers the whole set, 16-bit steps of 0..1 when every value
+/// lies there (see [`Field::compact`]).
 enum FieldData {
     F32(Vec<f32>),
-    F16(Vec<half::f16>),
+    U16(Vec<u16>),
 }
 
 impl FieldData {
     fn bytes(&self) -> usize {
         match self {
             FieldData::F32(d) => d.len() * 4,
-            FieldData::F16(d) => d.len() * 2,
+            FieldData::U16(d) => d.len() * 2,
         }
     }
 }
@@ -331,11 +332,14 @@ impl Field {
         self.data.bytes() + self.marks.iter().map(|(_, v)| v.len()).sum::<usize>() * std::mem::size_of::<f32>()
     }
 
-    /// Holds the values as half floats: a field that covers the whole set (one per layer and channel that reads the
-    /// stack through a graph, 268 MB each at 4096 as floats) takes half the memory, at about three decimal digits.
+    /// Holds the values as 16-bit steps of 0..1 when every value lies there (a field that covers the whole set, one
+    /// per layer and channel that reads the stack through a graph, is 268 MB at 4096 as floats): half the memory, each
+    /// value within 1/131070 of what it was. A field with any value outside 0..1 stays floats.
     fn compact(&mut self) {
-        if let FieldData::F32(d) = &self.data {
-            self.data = FieldData::F16(d.iter().map(|v| half::f16::from_f32(*v)).collect());
+        if let FieldData::F32(d) = &self.data
+            && d.iter().all(|v| (0.0..=1.0).contains(v))
+        {
+            self.data = FieldData::U16(d.iter().map(|v| (v * 65535.0).round() as u16).collect());
         }
     }
 
@@ -352,7 +356,7 @@ impl Field {
         let mut out = [0.0; 4];
         match &self.data {
             FieldData::F32(d) => out.iter_mut().zip(d.get(i..i + self.comps)?).for_each(|(o, v)| *o = *v),
-            FieldData::F16(d) => out.iter_mut().zip(d.get(i..i + self.comps)?).for_each(|(o, v)| *o = v.to_f32()),
+            FieldData::U16(d) => out.iter_mut().zip(d.get(i..i + self.comps)?).for_each(|(o, v)| *o = f32::from(*v) / 65535.0),
         }
         Some(out)
     }
@@ -742,8 +746,8 @@ fn field(
         let start = previous.as_ref().map(|(index, field)| (*index, field.as_ref()));
         let mut filtered = filter_region(inp, channels, below, id, job, effects, filter, region, start)?;
         filtered.shared &= shareable && deps_shared;
-        // a chain with a graph reading the stack covers the whole set whatever the block: its fields are held as half
-        // floats (the same in every block, cached or not)
+        // a chain with a graph reading the stack covers the whole set whatever the block: its fields are held as 16-bit
+        // steps where they can be (the same in every block, cached or not)
         if whole_set {
             filtered.compact();
         }
