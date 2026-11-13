@@ -298,7 +298,7 @@ pub struct Field {
     w: u32,
     h: u32,
     comps: usize,
-    data: Vec<f32>,
+    data: FieldData,
     /// A mask's anchor points below the filter, each with the mask value it recorded per texel of the region
     /// (unfiltered): a mask continued from the field records them again.
     marks: Marks,
@@ -310,10 +310,33 @@ pub struct Field {
 /// Anchor points inside a mask with one recorded value per texel of a region.
 type Marks = Vec<(LayerId, Vec<f32>)>;
 
+/// A field's values: floats while it is made, half floats once it covers the whole set (see [`Field::compact`]).
+enum FieldData {
+    F32(Vec<f32>),
+    F16(Vec<half::f16>),
+}
+
+impl FieldData {
+    fn bytes(&self) -> usize {
+        match self {
+            FieldData::F32(d) => d.len() * 4,
+            FieldData::F16(d) => d.len() * 2,
+        }
+    }
+}
+
 impl Field {
     /// Bytes the field holds.
     pub(crate) fn bytes(&self) -> usize {
-        (self.data.len() + self.marks.iter().map(|(_, v)| v.len()).sum::<usize>()) * std::mem::size_of::<f32>()
+        self.data.bytes() + self.marks.iter().map(|(_, v)| v.len()).sum::<usize>() * std::mem::size_of::<f32>()
+    }
+
+    /// Holds the values as half floats: a field that covers the whole set (one per layer and channel that reads the
+    /// stack through a graph, 268 MB each at 4096 as floats) takes half the memory, at about three decimal digits.
+    fn compact(&mut self) {
+        if let FieldData::F32(d) = &self.data {
+            self.data = FieldData::F16(d.iter().map(|v| half::f16::from_f32(*v)).collect());
+        }
     }
 
     fn index(&self, x: u32, y: u32) -> Option<usize> {
@@ -323,9 +346,15 @@ impl Field {
         Some(((y - self.y0) * self.w + (x - self.x0)) as usize)
     }
 
-    fn get(&self, x: u32, y: u32) -> Option<&[f32]> {
+    /// The texel's `comps` values (zeros past them).
+    fn get(&self, x: u32, y: u32) -> Option<[f32; 4]> {
         let i = self.index(x, y)? * self.comps;
-        self.data.get(i..i + self.comps)
+        let mut out = [0.0; 4];
+        match &self.data {
+            FieldData::F32(d) => out.iter_mut().zip(d.get(i..i + self.comps)?).for_each(|(o, v)| *o = *v),
+            FieldData::F16(d) => out.iter_mut().zip(d.get(i..i + self.comps)?).for_each(|(o, v)| *o = v.to_f32()),
+        }
+        Some(out)
     }
 
     /// The mask anchor points recorded below the filter at texel (x, y), with their values.
@@ -713,6 +742,11 @@ fn field(
         let start = previous.as_ref().map(|(index, field)| (*index, field.as_ref()));
         let mut filtered = filter_region(inp, channels, below, id, job, effects, filter, region, start)?;
         filtered.shared &= shareable && deps_shared;
+        // a chain with a graph reading the stack covers the whole set whatever the block: its fields are held as half
+        // floats (the same in every block, cached or not)
+        if whole_set {
+            filtered.compact();
+        }
         let filtered = Arc::new(filtered);
         if let (Some((roots, tree)), Some(c)) = (&read, cache.as_deref_mut())
             && filtered.shared
@@ -806,7 +840,7 @@ fn filter_region(
         let effect = effects.iter().filter(|effect| effect.visible).nth(index)?;
         let (mut data, marks, cooked) = graph_region(inp, channels, below, id, job, index, effect, (rx0, ry0, w, h), start)?;
         unpremultiply(&mut data, comps);
-        return Some(Field { x0: rx0, y0: ry0, w, h, comps, data, marks, shared: cooked });
+        return Some(Field { x0: rx0, y0: ry0, w, h, comps, data: FieldData::F32(data), marks, shared: cooked });
     }
     let (orig, cover, _, marks) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &[]);
     let mut field = filtered_region(inp, effects, (index, radius_texels, op), (rx0, ry0, w, h), opacity, comps, job, orig, cover)?;
@@ -1269,7 +1303,7 @@ fn filtered_region(
     }
 
     unpremultiply(&mut data, comps);
-    Some(Field { x0: rx0, y0: ry0, w, h, comps, data, marks: Vec::new(), shared: true })
+    Some(Field { x0: rx0, y0: ry0, w, h, comps, data: FieldData::F32(data), marks: Vec::new(), shared: true })
 }
 
 /// Clamp filtered masks to 0..1, and turn filtered content back into straight values.
@@ -2123,7 +2157,7 @@ impl<'a, 'b> Texel<'a, 'b> {
         let mut value = plan.background;
         let mut skip = 0;
         if let Some((filtered_index, field)) = plan.start
-            && let Some(filtered) = field.get(self.x, self.y).and_then(|texel| texel.first().copied())
+            && let Some([filtered, ..]) = field.get(self.x, self.y)
         {
             value = filtered;
             skip = filtered_index + 1;
@@ -2394,10 +2428,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     fn content_over(&mut self, content: &Content, c: &ChanPlan, end: usize, below: Option<([f32; 3], f32)>) -> Option<([f32; 3], f32)> {
         let start = c.start.filter(|(k, _)| *k < end);
         let (mut v, mut cov, skip) = match start.and_then(|(k, f)| f.get(self.x, self.y).map(|d| (k, d))) {
-            Some((k, d)) => {
-                let px = |i: usize| d.get(i).copied().unwrap_or(0.0);
-                ([px(0), px(1), px(2)], px(3), k + 1)
-            }
+            Some((k, d)) => ([d[0], d[1], d[2]], d[3], k + 1),
             None => {
                 let (v, cov) = match content {
                     Content::Fill(f) => {
