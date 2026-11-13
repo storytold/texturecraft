@@ -7,8 +7,13 @@
 //!
 //! Graph renders run their parallel work on the runtime's own pool ([`super::GraphStore`]'s), never on the pool the
 //! compositor runs on, so no thread of the compositor's pool can hold a piece of a render: others may wait for a
-//! render safely ([`Slots::get_or_fill_own_pool`]). Only the claiming thread itself (which runs other work of its own
-//! pool while it waits for the render's pool) gets its own copy.
+//! render safely ([`Slots::get_or_fill_own_pool`]). Only the claiming thread itself asking again gets its own copy.
+//!
+//! A pool thread that waits for another pool (`install`) runs pending work of its own pool meanwhile, and that work
+//! may ask for the slot the thread is filling: it would fill it again, one copy deeper on the same stack for every
+//! piece it picks up. A compositor tile asking for a graph's cook is such a piece (Doll.spp: 320 nested renders of
+//! one graph, 16 GB, then a stack overflow). So a fill that waits for its own pool runs through [`wait_outside`],
+//! which waits on a plain thread and so picks up nothing.
 //!
 //! Copies cost time, not correctness: fills are deterministic.
 
@@ -121,6 +126,30 @@ impl<K: Hash + Eq, V> Drop for Release<'_, K, V> {
     }
 }
 
+/// Stack of the thread [`wait_outside`] starts: the size of a main thread's, as renders on the main thread have.
+const OUTSIDE_STACK: usize = 8 << 20;
+
+/// Runs `f`, which waits for work on `pool`, so that the waiting thread runs no other pending work: on a thread of
+/// any other pool, `f` runs on a plain thread of its own while the caller blocks (see the module docs). Elsewhere, and
+/// where no thread can be started, `f` runs here.
+pub fn wait_outside<T: Send>(pool: Option<&rayon::ThreadPool>, f: impl FnOnce() -> Result<T, String> + Send) -> Result<T, String> {
+    let foreign = rayon::current_thread_index().is_some() && pool.is_some_and(|p| p.current_thread_index().is_none());
+    if !foreign {
+        return f();
+    }
+    let job = Mutex::new(Some(f));
+    let run = || job.lock().unwrap_or_else(PoisonError::into_inner).take().map(|f| f());
+    let ran = std::thread::scope(|scope| {
+        let started = std::thread::Builder::new().name("texturecraft-render".into()).stack_size(OUTSIDE_STACK).spawn_scoped(scope, run);
+        started.ok().map(|h| h.join().unwrap_or_else(|_| Some(Err("the render stopped with an internal error".to_string()))))
+    });
+    match ran.flatten() {
+        Some(r) => r,
+        // the thread could not start: run here
+        None => run().unwrap_or_else(|| Err("the render did not run".to_string())),
+    }
+}
+
 /// A shareable [`Slots`].
 pub type SharedSlots<K, V> = Arc<Slots<K, V>>;
 
@@ -175,6 +204,48 @@ mod tests {
         let v = finished.recv_timeout(std::time::Duration::from_secs(20)).expect("a pool thread waited for a fill held below it");
         assert_eq!(v, 5);
         assert_eq!(slots.get(&1), Some(5));
+    }
+
+    /// Doll.spp: a compositor thread filling a graph's cook waits for the render's pool and meanwhile runs other tiles,
+    /// which ask for the same cook and fill it again, one copy deeper each. Waiting outside, it takes no other tile.
+    #[test]
+    fn a_fill_waiting_for_its_own_pool_takes_no_other_work() {
+        use rayon::prelude::*;
+        let compositor = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let render = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let slots: Slots<u32, u32> = Slots::default();
+        let fills = std::sync::atomic::AtomicUsize::new(0);
+        let got: Vec<u32> = compositor.install(|| {
+            (0..64)
+                .into_par_iter()
+                .map(|_| {
+                    slots.get_or_fill_own_pool(&1, || {
+                        fills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let rendered = wait_outside(Some(&render), || {
+                            Ok(render.install(|| {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                7
+                            }))
+                        });
+                        rendered.unwrap()
+                    })
+                })
+                .collect()
+        });
+        assert!(got.iter().all(|v| *v == 7));
+        assert_eq!(fills.into_inner(), 1, "the filling thread took other tiles while it waited and filled again");
+    }
+
+    #[test]
+    fn work_on_the_render_pool_itself_runs_in_place() {
+        let render = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let caller = std::thread::current().id();
+        let here = render.install(|| {
+            let me = std::thread::current().id();
+            wait_outside(Some(&render), || Ok(std::thread::current().id() == me)).unwrap()
+        });
+        assert!(here);
+        assert_eq!(wait_outside(Some(&render), || Ok(std::thread::current().id())).unwrap(), caller, "outside any pool");
     }
 
     #[test]

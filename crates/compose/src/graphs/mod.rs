@@ -696,35 +696,42 @@ impl GraphStore {
 
     fn cook_at(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)], depth: usize) -> Result<(String, Arc<Cooked>), String> {
         let key = self.cook_key(g, env, given).ok_or_else(|| format!("graphs nested deeper than {MAX_GRAPH_NESTING}"))?;
+        let pool = self.pool();
         let got = self.cooks.cooks.get_or_fill_own_pool(&key, || {
-            if self.cooks.cancel.is_cancelled() {
-                return Err("cancelled".to_string());
-            }
-            if let Some(back) = self.cooks.spilled.get(&key) {
-                return Ok(Arc::new(back));
-            }
-            let kept = lock(&self.cooks.kept).clone();
-            if let Some(found) = kept.as_ref().and_then(|k| k.get(&key)).and_then(|bytes| kept::decode(&bytes)) {
-                self.cooks.kept_found.fetch_add(1, Ordering::Relaxed);
-                return Ok(Arc::new(found));
-            }
-            self.cooks.renders.fetch_add(1, Ordering::Relaxed);
-            // a share of the render budget for its estimated peak; nested graphs render within their parent's
-            let share = if depth == 0 { Some(budget::acquire(budget::estimate(&*self.parsed(&g.key)?, env.side))) } else { None };
-            let cooked = self.render(g, env, given, depth);
-            drop(share);
-            let cooked = cooked?;
-            // a render stopped part way never gets here: it is an error
-            if let Some(k) = &kept {
-                k.put(&key, &kept::encode(&cooked));
-            }
-            Ok(Arc::new(cooked))
+            // waiting for the render's pool here must not pick up the caller's pool's work (see `once`)
+            once::wait_outside(pool.as_deref(), || self.fill_cook(g, env, given, depth, &key))
         });
         // a cancelled render (not started, or stopped part way) is not remembered as a failure
         if got.is_err() && self.cooks.cancel.is_cancelled() {
             self.cooks.cooks.remove(&key);
         }
         got.map(|c| (key, c))
+    }
+
+    /// The cook under `key`: spilled or kept earlier, or rendered now.
+    fn fill_cook(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)], depth: usize, key: &str) -> Result<Arc<Cooked>, String> {
+        if self.cooks.cancel.is_cancelled() {
+            return Err("cancelled".to_string());
+        }
+        if let Some(back) = self.cooks.spilled.get(key) {
+            return Ok(Arc::new(back));
+        }
+        let kept = lock(&self.cooks.kept).clone();
+        if let Some(found) = kept.as_ref().and_then(|k| k.get(key)).and_then(|bytes| kept::decode(&bytes)) {
+            self.cooks.kept_found.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::new(found));
+        }
+        self.cooks.renders.fetch_add(1, Ordering::Relaxed);
+        // a share of the render budget for its estimated peak; nested graphs render within their parent's
+        let share = if depth == 0 { Some(budget::acquire(budget::estimate(&*self.parsed(&g.key)?, env.side))) } else { None };
+        let cooked = self.render(g, env, given, depth);
+        drop(share);
+        let cooked = cooked?;
+        // a render stopped part way never gets here: it is an error
+        if let Some(k) = &kept {
+            k.put(key, &kept::encode(&cooked));
+        }
+        Ok(Arc::new(cooked))
     }
 
     /// The cook `use_` reads for `g` (see [`GraphStore::cook`]), remembered as the use's; when there is none now, the one
