@@ -223,8 +223,11 @@ impl Mesh {
         if self.uvs.len() != self.positions.len() {
             self.uvs = vec![Vec2::ZERO; self.positions.len()];
         }
-        // mikktspace crashes (out-of-bounds) when every triangle is degenerate; skip it then.
-        let usable = !crate::unwrap::all_triangles_degenerate(self);
+        // mikktspace crashes (out-of-bounds) when every triangle is degenerate; skip it then. Its
+        // callbacks read a missing vertex as the origin, which the degenerate check cannot see, so
+        // an index past the last vertex skips it too.
+        let n = self.positions.len();
+        let usable = self.indices.iter().all(|&i| (i as usize) < n) && !crate::unwrap::all_triangles_degenerate(self);
         let mut g = Mikk { mesh: self };
         if !usable || !mikktspace::generate_tangents(&mut g) {
             self.simple_tangents();
@@ -381,6 +384,9 @@ impl Mesh {
 
     /// A single-material mesh from raw attributes; computes missing normals and tangents.
     pub fn from_parts(positions: Vec<Vec3>, normals: Option<Vec<Vec3>>, uvs: Vec<Vec2>, indices: Vec<u32>, material: &str) -> Result<Mesh> {
+        if let Some(bad) = indices.iter().find(|&&i| i as usize >= positions.len()) {
+            return Err(GeomError::Invalid(format!("index {bad} out of range ({} vertices)", positions.len())));
+        }
         let count = indices.len() as u32;
         let mut m = Mesh {
             normals: normals.unwrap_or_default(),
@@ -585,5 +591,31 @@ mod tests {
         }
         assert_eq!(m.uv_tiles(1).into_iter().collect::<Vec<_>>(), vec![(1, 0)]);
         assert_eq!(m.uv_tiles(0).into_iter().collect::<Vec<_>>(), vec![(0, 0)]);
+    }
+
+    /// An index past the last vertex reads as the origin in MikkTSpace's callbacks. With two
+    /// positions at the origin and one missing, the degenerate-mesh guard (which sees the missing
+    /// vertex as different) let it through while MikkTSpace saw every triangle as degenerate and
+    /// underflowed: a panic in debug builds, an out-of-bounds walk in release.
+    #[test]
+    fn from_parts_refuses_an_out_of_range_index_without_crashing() {
+        let positions = vec![Vec3::ZERO, Vec3::X];
+        let uvs = vec![Vec2::ZERO, Vec2::X];
+        let e = Mesh::from_parts(positions, None, uvs, vec![0, 1, 2], "M").unwrap_err();
+        assert!(e.to_string().contains("out of range"), "{e}");
+    }
+
+    #[test]
+    fn tangents_of_a_mesh_with_an_out_of_range_index_fall_back_without_crashing() {
+        for indices in [vec![0, 1, 2], vec![0, 0, 2], vec![0, 1, 5, 0, 1, 1]] {
+            let mut m = Mesh::from_parts(vec![Vec3::ZERO, Vec3::X, Vec3::Y], None, vec![Vec2::ZERO, Vec2::X, Vec2::Y], vec![0, 1, 2], "M").unwrap();
+            m.positions.truncate(2);
+            m.normals.truncate(2);
+            m.uvs.truncate(2);
+            m.indices = indices;
+            m.compute_tangents();
+            assert_eq!(m.tangents.len(), 2);
+            assert!(m.tangents.iter().all(|t| t.is_finite()), "{:?}", m.tangents);
+        }
     }
 }
