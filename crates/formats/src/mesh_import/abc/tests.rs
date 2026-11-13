@@ -291,3 +291,43 @@ fn self_referencing_groups_are_bounded() {
     let bytes = a.archive(at, &[]);
     assert!(read(&bytes).is_err());
 }
+
+/// A triangle mesh under a chain of `xforms` nested Xforms with 63-character names, each
+/// translating by +1 in x: the shape of exports with long transform hierarchies.
+fn chain_file(xforms: usize) -> Vec<u8> {
+    let mut a = Abc { w: Writer::new() };
+    let tp = a.array("P", "", F32, 3, &f32s(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0]));
+    let ti = a.array(".faceIndices", "", I32, 1, &i32s(&[0, 1, 2]));
+    let tc = a.array(".faceCounts", "", I32, 1, &i32s(&[3]));
+    let geom = a.compound(".geom", "schema=AbcGeom_PolyMesh_v1", vec![tp, ti, tc]);
+    let mesh = a.object(vec![geom], &[]);
+    let mut child = ("CubeShape".to_string(), "schema=AbcGeom_PolyMesh_v1;schemaObjTitle=AbcGeom_PolyMesh_v1:.geom", mesh);
+    for level in 0..xforms {
+        let ops = a.scalar(".ops", U8, 1, &[0x10]);
+        let xv: Vec<u8> = [1.0f64, 0.0, 0.0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let vals = a.scalar(".vals", F64, 3, &xv);
+        let xform = a.compound(".xform", "schema=AbcGeom_Xform_v3", vec![ops, vals]);
+        let group = a.object(vec![xform], &[(child.0.as_str(), child.1, child.2)]);
+        child = (format!("{level:0>63}"), "schema=AbcGeom_Xform_v3;schemaObjTitle=AbcGeom_Xform_v3:.xform", group);
+    }
+    let top = a.object(vec![], &[(child.0.as_str(), child.1, child.2)]);
+    a.archive(top, &[])
+}
+
+#[test]
+fn long_transform_chains_import() {
+    // 64 nested Xforms over a mesh (65 levels) used to trip the nesting guard.
+    for xforms in [64, 200] {
+        let raw = read(&chain_file(xforms)).unwrap_or_else(|e| panic!("{xforms} levels: {e}"));
+        assert_eq!(raw.triangle_count(), 1);
+        // Every level's translation is inherited.
+        let min_x = raw.positions.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        assert_eq!(min_x, xforms as f32);
+    }
+}
+
+#[test]
+fn nesting_past_the_limit_is_an_error() {
+    let e = read(&chain_file(MAX_DEPTH + 1)).err().unwrap().to_string();
+    assert!(e.contains("nested too deeply"), "{e}");
+}
