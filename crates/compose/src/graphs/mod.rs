@@ -457,6 +457,11 @@ impl GraphStore {
         lock(&self.cooks.problems).iter().map(|(u, p)| (u.clone(), p.clone())).collect()
     }
 
+    /// Whether the last cook of `use_` failed (see [`GraphStore::cook_for`]).
+    pub fn has_problem(&self, use_: &GraphUse) -> bool {
+        lock(&self.cooks.problems).contains_key(use_)
+    }
+
     /// The cook each use read last.
     pub fn uses(&self) -> BTreeMap<GraphUse, String> {
         lock(&self.cooks.uses).clone()
