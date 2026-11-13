@@ -247,7 +247,7 @@ impl Session {
             // one set at a time: the others composite when they are exported or shown
             self.update_only(&[ts]);
             let cache = self.caches.get(ts).ok_or_else(|| EngineError::Other(format!("no texture set {ts}")))?;
-            let coverage = cache.gbuf.coverage_mask();
+            let coverage = cache.gbuf().coverage_mask();
             let input = ExportInput {
                 project: &self.doc.project,
                 ts,

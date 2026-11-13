@@ -38,8 +38,12 @@ pub struct Document {
 pub struct SetCache {
     /// Texels across and down (`TextureSet::size`).
     pub size: (u32, u32),
-    pub gbuf: Arc<UvGBuffer>,
-    pub dilation: Arc<DilationMap>,
+    /// The UV lookup and padding map, built when first needed (see [`SetCache::gbuf`]).
+    lookup: std::sync::OnceLock<Lookup>,
+    /// What the lookup is built from: the mesh, the set's material and its UV tiles' block size.
+    mesh: Arc<Mesh>,
+    material: usize,
+    block: u32,
     pub covered_tiles: Arc<Vec<(u32, u32)>>,
     pub composite: Composite,
     /// Tiles to recomposite.
@@ -57,18 +61,38 @@ pub struct SetCache {
     pub chunk: usize,
 }
 
-impl SetCache {
-    pub(crate) fn new(mesh: &Mesh, ts: &TextureSet) -> SetCache {
-        let (w, h) = ts.size();
-        let gbuf = UvGBuffer::new(mesh, ts.material, w, h);
+/// A texture set's UV lookup (which triangle each texel shows) and the map that pads its composite.
+struct Lookup {
+    gbuf: Arc<UvGBuffer>,
+    dilation: Arc<DilationMap>,
+}
+
+impl Lookup {
+    fn build(mesh: &Mesh, material: usize, (w, h): (u32, u32), block: u32) -> Lookup {
+        let gbuf = UvGBuffer::new(mesh, material, w, h);
         // Padding stays inside each UV tile.
-        let dilation = DilationMap::in_blocks(&gbuf.coverage_mask(), w, h, Some(DISPLAY_PADDING), ts.block_resolution());
-        let covered = covered_tiles(&gbuf);
+        let dilation = DilationMap::in_blocks(&gbuf.coverage_mask(), w, h, Some(DISPLAY_PADDING), block);
+        Lookup { gbuf: Arc::new(gbuf), dilation: Arc::new(dilation) }
+    }
+
+    fn bytes(&self) -> usize {
+        self.gbuf.tri.len() * 4 + self.gbuf.bary.len() * 8 + self.dilation.src.len() * 4
+    }
+}
+
+impl SetCache {
+    /// The cache of texture set `ts` drawn on `mesh`. Its UV lookup is built now for the tiles it covers, and let go:
+    /// a project of many large sets does not hold every set's at once (see [`SetCache::gbuf`]).
+    pub(crate) fn new(mesh: &Arc<Mesh>, ts: &TextureSet) -> SetCache {
+        let (w, h) = ts.size();
+        let covered = covered_tiles(&UvGBuffer::new(mesh, ts.material, w, h));
         let all: BTreeSet<(u32, u32)> = texturecraft_compose::all_tiles(w, h).into_iter().collect();
         SetCache {
             size: (w, h),
-            gbuf: Arc::new(gbuf),
-            dilation: Arc::new(dilation),
+            lookup: std::sync::OnceLock::new(),
+            mesh: mesh.clone(),
+            material: ts.material,
+            block: ts.block_resolution(),
             covered_tiles: Arc::new(covered),
             composite: Composite { block_scales: ts.block_scales(), ..Composite::with_size(&ts.channel_list(), w, h) },
             dirty: all.clone(),
@@ -78,6 +102,30 @@ impl SetCache {
             below: BelowCache::default(),
             chunk: 0,
         }
+    }
+
+    fn lookup(&self) -> &Lookup {
+        self.lookup.get_or_init(|| Lookup::build(&self.mesh, self.material, self.size, self.block))
+    }
+
+    /// The UV lookup: which triangle each texel shows, and where on it (built when first needed).
+    pub fn gbuf(&self) -> &Arc<UvGBuffer> {
+        &self.lookup().gbuf
+    }
+
+    /// The map that pads the composite past the UV islands (built with [`SetCache::gbuf`]).
+    pub fn dilation(&self) -> &Arc<DilationMap> {
+        &self.lookup().dilation
+    }
+
+    /// Bytes the UV lookup and padding map hold (0 while they are not built).
+    pub fn lookup_bytes(&self) -> usize {
+        self.lookup.get().map_or(0, Lookup::bytes)
+    }
+
+    /// Lets go of the UV lookup and padding map; they are built again when next needed, the same.
+    pub fn release_lookup(&mut self) {
+        self.lookup = std::sync::OnceLock::new();
     }
 
     pub fn invalidate_all(&mut self) {
@@ -813,6 +861,22 @@ impl Session {
         }
     }
 
+    /// Keeps the texture sets' UV lookups within [`LOOKUP_BUDGET`]: beyond it, the sets that are neither active nor
+    /// `working` let theirs go (built again, the same, when next needed).
+    fn trim_lookups(&mut self, working: usize) {
+        let active = self.ts();
+        let mut total: usize = self.caches.iter().map(SetCache::lookup_bytes).sum();
+        for (i, cache) in self.caches.iter_mut().enumerate() {
+            if total <= LOOKUP_BUDGET {
+                break;
+            }
+            if i != working && i != active {
+                total = total.saturating_sub(cache.lookup_bytes());
+                cache.release_lookup();
+            }
+        }
+    }
+
     fn update_sets(&mut self, order: &[usize], budget_ms: f64, clock: impl Fn() -> f64) -> bool {
         let start = clock();
         let first = if budget_ms.is_finite() { rayon::current_num_threads().clamp(1, CHUNK) } else { CHUNK };
@@ -841,6 +905,7 @@ impl Session {
                 if self.last_composited.is_some_and(|last| last != ts) {
                     self.doc.graphs.release_reloadable(COOK_BUDGET);
                     self.images.release(IMAGE_BUDGET);
+                    self.trim_lookups(ts);
                 }
                 self.last_composited = Some(ts);
             }
@@ -866,11 +931,12 @@ impl Session {
                     cache.settle.remove(t);
                 }
                 let empty = BakedMaps::default();
+                let gbuf = cache.gbuf().clone();
                 let inputs = texturecraft_compose::Inputs {
                     project: &self.doc.project,
                     ts,
                     mesh: &self.mesh,
-                    gbuf: &cache.gbuf,
+                    gbuf: &gbuf,
                     pixels: &self.doc.pixels,
                     baked: self.doc.baked.get(&ts).unwrap_or(&empty),
                     block_scales: cache.composite.block_scales.clone(),
@@ -881,7 +947,8 @@ impl Session {
                 };
                 texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
                 // The composited tiles and the neighbours their padding reached change.
-                let padded = pad_tiles(&mut cache.composite, &cache.dilation, &tiles);
+                let dilation = cache.dilation().clone();
+                let padded = pad_tiles(&mut cache.composite, &dilation, &tiles);
                 cache.upload.extend(tiles.iter().copied().chain(padded));
                 cache.revision = cache.revision.wrapping_add(1);
                 changed = true;
@@ -960,7 +1027,7 @@ impl Session {
             project: &self.doc.project,
             ts,
             mesh: &self.mesh,
-            gbuf: &cache.gbuf,
+            gbuf: cache.gbuf(),
             pixels: &self.doc.pixels,
             baked: self.doc.baked.get(&ts).unwrap_or(&empty),
             block_scales: cache.composite.block_scales.clone(),
@@ -1024,6 +1091,9 @@ const CHUNK: usize = 256;
 /// Bytes the texture sets of a document may hold together in recompositing caches (see `Session::trim_set_caches`);
 /// one set's whole-set fields alone may reach this ([`texturecraft_compose::FIELD_BUDGET`]).
 pub const SET_CACHE_BUDGET: usize = 2 << 30;
+/// Bytes of UV lookups and padding maps the texture sets hold together before those of sets not compositing are let
+/// go when another set starts compositing (`Session::trim_lookups`).
+pub const LOOKUP_BUDGET: usize = 512 << 20;
 /// Bytes of decoded images a document holds before those that can be decoded again are let go when another texture
 /// set starts compositing (`ImageStore::release`).
 pub const IMAGE_BUDGET: usize = 512 << 20;
@@ -1123,4 +1193,24 @@ fn tiled_mesh(source: &Arc<Mesh>, project: &Project) -> Arc<Mesh> {
         }
     }
     Arc::new(mesh)
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    #[test]
+    fn a_sets_uv_lookup_is_built_when_needed_and_again_the_same_after_it_is_let_go() {
+        let mut s = Session::new_project("lookup", texturecraft_geom::primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        assert_eq!(s.caches[0].lookup_bytes(), 0, "not held before anything needs it");
+        assert!(!s.caches[0].covered_tiles.is_empty());
+        s.update();
+        let built = s.caches[0].gbuf().clone();
+        assert!(s.caches[0].lookup_bytes() > 0);
+        let padding = s.caches[0].dilation().src.clone();
+        s.caches[0].release_lookup();
+        assert_eq!(s.caches[0].lookup_bytes(), 0);
+        assert_eq!((&s.caches[0].gbuf().tri, &s.caches[0].gbuf().bary), (&built.tri, &built.bary));
+        assert_eq!(s.caches[0].dilation().src, padding);
+    }
 }

@@ -285,7 +285,7 @@ mod tests {
     fn paint_all(s: &mut Session, value: u16) {
         let id = s.doc.project.texture_sets[0].stack[0];
         let size = s.doc.project.texture_sets[0].size();
-        let gbuf = s.caches[0].gbuf.clone();
+        let gbuf = s.caches[0].gbuf().clone();
         let img = s.doc.pixels.layer_mut(id, Channel::BaseColor, size);
         for y in 0..size.1 {
             for x in 0..size.0 {
@@ -300,7 +300,7 @@ mod tests {
     fn painted_fraction(s: &Session) -> f64 {
         let id = s.doc.project.texture_sets[0].stack[0];
         let img = s.doc.pixels.layer(id, Channel::BaseColor).unwrap();
-        let gbuf = &s.caches[0].gbuf;
+        let gbuf = &s.caches[0].gbuf();
         let (mut sum, mut n) = (0.0, 0.0);
         for (i, t) in gbuf.tri.iter().enumerate() {
             if *t != texturecraft_geom::NO_TRI {
@@ -385,7 +385,7 @@ mod tests {
     fn paint_across_tiles(s: &mut Session, c: Channel, f: impl Fn(f32) -> Vec<u16>) {
         let set = s.doc.project.texture_sets[0].clone();
         let (grid, (w, h)) = (set.tile_grid().unwrap(), set.size());
-        let gbuf = s.caches[0].gbuf.clone();
+        let gbuf = s.caches[0].gbuf().clone();
         let img = s.doc.pixels.layer_mut(set.stack[0], c, (w, h));
         for y in 0..h {
             for x in 0..w {
@@ -460,7 +460,7 @@ mod tests {
         // Tile 1001 keeps the classic set's painting; tile 1002 was never painted.
         let id = s.doc.project.texture_sets[0].stack[0];
         let img = s.doc.pixels.layer(id, Channel::BaseColor).unwrap();
-        let gbuf = s.caches[0].gbuf.clone();
+        let gbuf = s.caches[0].gbuf().clone();
         let covered = |x: u32| (0..256).filter(|y| gbuf.covered((y * 512 + x) as usize)).collect::<Vec<_>>();
         let x = (0..256).find(|x| !covered(*x).is_empty()).unwrap();
         assert!(covered(x).iter().all(|y| img.get(x, *y)[3] > 60000));

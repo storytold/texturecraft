@@ -122,7 +122,7 @@ impl Session {
         let set = project.texture_sets.get(ts)?;
         let cache = self.caches.get(ts)?;
         let (w, h) = set.size();
-        let mut mask = IslandMask::from_gbuf(&cache.gbuf);
+        let mut mask = IslandMask::from_gbuf(cache.gbuf());
         if (mask.width, mask.height) != (w, h) {
             return None;
         }
@@ -136,7 +136,7 @@ impl Session {
             project,
             ts,
             mesh: &self.mesh,
-            gbuf: &cache.gbuf,
+            gbuf: cache.gbuf(),
             pixels: &self.doc.pixels,
             baked: self.doc.baked.get(&ts).unwrap_or(&empty),
             block_scales: cache.composite.block_scales.clone(),

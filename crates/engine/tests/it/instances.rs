@@ -21,7 +21,7 @@ fn id(v: Value, key: &str) -> LayerId {
 
 /// A texel covered by texture set `ts`.
 fn covered(s: &Session, ts: usize) -> (u32, u32) {
-    let g = &s.caches[ts].gbuf;
+    let g = &s.caches[ts].gbuf();
     let i = g.tri.iter().position(|t| *t != texturecraft_engine::geom::NO_TRI).unwrap();
     (i as u32 % g.width, i as u32 / g.width)
 }
@@ -37,7 +37,7 @@ fn reds(s: &Session, ts: usize) -> usize {
     let c = &s.caches[ts].composite;
     (0..256)
         .flat_map(|y| (0..256).map(move |x| (x, y)))
-        .filter(|&(x, y)| s.caches[ts].gbuf.tri[(y * 256 + x) as usize] != u32::MAX)
+        .filter(|&(x, y)| s.caches[ts].gbuf().tri[(y * 256 + x) as usize] != u32::MAX)
         .filter(|&(x, y)| {
             let v = c.value(Channel::BaseColor, x, y);
             v[0] > 0.8 && v[1] < 0.2

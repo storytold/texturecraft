@@ -310,7 +310,7 @@ fn instances_show_their_source_in_sets_of_another_resolution() {
         let (w, h) = c.size;
         (0..h)
             .flat_map(|y| (0..w).map(move |x| (x, y)))
-            .filter(|&(x, y)| c.gbuf.tri[(y * w + x) as usize] != NO_TRI && red(c.composite.value(Channel::BaseColor, x, y)))
+            .filter(|&(x, y)| c.gbuf().tri[(y * w + x) as usize] != NO_TRI && red(c.composite.value(Channel::BaseColor, x, y)))
             .count()
     };
     let same = reds(&mut s);
