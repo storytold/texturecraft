@@ -67,7 +67,7 @@ pub use commands::{CommandSpec, command_specs, execute, find};
 pub use fill_hit_test::FillHitTest;
 pub use fill_mode::FillMode;
 pub use path_tool::PathState;
-pub use project_cmds::sample_session;
+pub use project_cmds::{sample_session, sample_session_cpu};
 pub use session::{CloneFrom, CloneSource, Document, Session, SetCache, StackTarget, StencilState, Tool, ToolState, ViewMode};
 pub use set_cmds::{ResizeOutput, ResizeTask};
 
