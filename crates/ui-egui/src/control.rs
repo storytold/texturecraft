@@ -171,6 +171,8 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
         }
         // the project import's windows, as a person drives them: open a file (the notice shows), acknowledge the
         // notice, read what the windows show
+        // opening a file by its path: not in the web build, which has no file system
+        #[cfg(not(target_arch = "wasm32"))]
         "ui.import.open" => {
             let Some(path) = p.get("path").and_then(Value::as_str) else { return err("`path` is required") };
             crate::windows::open_path(app, path);
