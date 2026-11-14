@@ -134,8 +134,10 @@ fn every_command_with_any_params_leaves_a_locked_layer_alone() {
                 p["effect"] = json!(placeholder.0);
             }
             let (project, before) = (s.project_id, content(&s, paint));
-            let _ = execute(&mut s, spec.id, &p);
-            s.update();
+            // A refused command leaves the document as it was: only one that ran needs the frame that settles it.
+            if execute(&mut s, spec.id, &p).is_ok() {
+                s.update();
+            }
             if s.project_id != project {
                 continue; // another project was opened or created
             }
