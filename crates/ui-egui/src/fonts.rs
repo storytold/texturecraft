@@ -47,7 +47,7 @@ impl Script {
     pub fn of_language(code: &str) -> Option<Script> {
         match code {
             "ja" => Some(Script::Japanese),
-            "zh-Hans" => Some(Script::Chinese),
+            "zh-Hans" | "zh-Hant" => Some(Script::Chinese),
             "ko" => Some(Script::Korean),
             "ar" => Some(Script::Arabic),
             _ => None,
@@ -73,7 +73,7 @@ impl Script {
             let fonts = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
             let files: &[&str] = match self {
                 Script::Japanese => &["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"],
-                Script::Chinese => &["msyh.ttc", "simsun.ttc", "simhei.ttf"],
+                Script::Chinese => &["msjh.ttc", "msyh.ttc", "simsun.ttc", "simhei.ttf"],
                 Script::Korean => &["malgun.ttf", "gulim.ttc"],
                 Script::Arabic => &["segoeui.ttf", "tahoma.ttf", "arial.ttf"],
             };

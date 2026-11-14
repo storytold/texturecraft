@@ -37,7 +37,7 @@ pub struct Language {
     pub english: &'static str,
 }
 
-const COUNT: usize = 10;
+const COUNT: usize = 11;
 
 pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "en", name: "English", english: "English" },
@@ -48,6 +48,7 @@ pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "it", name: "Italiano", english: "Italian" },
     Language { code: "ja", name: "日本語", english: "Japanese" },
     Language { code: "zh-Hans", name: "简体中文", english: "Chinese (Simplified)" },
+    Language { code: "zh-Hant", name: "繁體中文", english: "Chinese (Traditional)" },
     Language { code: "ko", name: "한국어", english: "Korean" },
     Language { code: "ar", name: "العربية", english: "Arabic" },
 ];
@@ -102,8 +103,12 @@ pub fn trf(template: &str, args: &[(&str, &dyn Display)]) -> String {
 }
 
 /// The supported language for a locale such as "de-AT", "pt_BR.UTF-8" or "zh-Hant-TW" ("en" when
-/// none matches). Chinese locales get Simplified Chinese; Portuguese ones get Brazilian Portuguese.
+/// none matches). Chinese locales get Simplified or Traditional Chinese; Portuguese ones get Brazilian Portuguese.
 pub fn language_for_locale(locale: &str) -> &'static str {
+    let lower = locale.to_ascii_lowercase();
+    if lower.contains("hant") || lower.contains("zh-tw") || lower.contains("zh_tw") || lower.contains("zh-hk") || lower.contains("zh_hk") || lower.contains("zh-mo") || lower.contains("zh_mo") {
+        return "zh-Hant";
+    }
     let lang = locale.split(['-', '_', '.', '@']).next().unwrap_or("").to_ascii_lowercase();
     match lang.as_str() {
         "pt" => "pt-BR",
@@ -296,9 +301,19 @@ mod tests",
         assert_eq!(trf("Saved {path}", &[("path", &"a.tcraft")]), "Saved a.tcraft");
         assert_eq!(trf("{a} of {b} {c}", &[("a", &1), ("b", &2)]), "1 of 2 {c}");
         assert_eq!(trf("{unclosed", &[]), "{unclosed");
-        for (locale, code) in
-            [("de-AT", "de"), ("pt_PT.UTF-8", "pt-BR"), ("zh-Hant-TW", "zh-Hans"), ("ja", "ja"), ("ko_KR", "ko"), ("ar-EG", "ar"), ("nl-NL", "en"), ("", "en")]
-        {
+        for (locale, code) in [
+            ("de-AT", "de"),
+            ("pt_PT.UTF-8", "pt-BR"),
+            ("zh-Hant-TW", "zh-Hant"),
+            ("zh_TW", "zh-Hant"),
+            ("zh-Hans-CN", "zh-Hans"),
+            ("zh_CN", "zh-Hans"),
+            ("ja", "ja"),
+            ("ko_KR", "ko"),
+            ("ar-EG", "ar"),
+            ("nl-NL", "en"),
+            ("", "en"),
+        ] {
             assert_eq!(language_for_locale(locale), code, "{locale}");
         }
         set_language("de");
