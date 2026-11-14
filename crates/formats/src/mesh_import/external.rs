@@ -52,12 +52,34 @@ pub fn self_contained_mesh(name: &str, bytes: Vec<u8>, read: &mut dyn FnMut(&str
 }
 
 /// Read mesh file `path` with the files it references from its folder (see
-/// [`self_contained_mesh`]), each at most [`MAX_MESH_FILE_BYTES`].
+/// [`self_contained_mesh`]), each at most [`MAX_MESH_FILE_BYTES`]. A referenced file is used only
+/// when, after symbolic links and junctions are followed, it is still inside the mesh's folder;
+/// one that leads outside counts as not found (a warning, like a missing file), while links that
+/// stay inside the folder work. Hard links cannot be told apart by path: see [`read_inside`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_mesh_file(path: &std::path::Path) -> Result<MeshFile> {
     let bytes = crate::read_capped(path, MAX_MESH_FILE_BYTES)?;
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
-    self_contained_mesh(&path.to_string_lossy(), bytes, &mut |rel| crate::read_capped(&dir.join(rel), MAX_MESH_FILE_BYTES).ok())
+    self_contained_mesh(&path.to_string_lossy(), bytes, &mut |rel| read_inside(dir, rel))
+}
+
+/// `rel` (already checked by [`below`]) read from below `dir`, or None when it is missing, too big,
+/// or, once symbolic links and junctions are followed, is not inside `dir`: `below` only looks at
+/// the text of the path, so a link in the folder could otherwise lead to any file.
+///
+/// Limit: a HARD link is an ordinary directory entry, so a hard link in the folder to a file
+/// outside it looks like a file inside it and is read. Telling them apart needs the link count,
+/// which std offers only on Unix (and a count above one is also what legitimate files can have);
+/// we don't use `unsafe`, so it is not checked. Making a hard link needs write access to the
+/// folder and read access to the target.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_inside(dir: &std::path::Path, rel: &str) -> Option<Vec<u8>> {
+    let root = std::fs::canonicalize(if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir }).ok()?;
+    let file = std::fs::canonicalize(dir.join(rel)).ok()?;
+    if !file.starts_with(&root) {
+        return None;
+    }
+    crate::read_capped(&file, MAX_MESH_FILE_BYTES).ok()
 }
 
 /// `asset` as a path below the mesh's folder (`/`-separated, `.` and `..` resolved), or None when
@@ -125,6 +147,69 @@ fn image_mime(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link `link` inside `dir` leading to `target` (a folder): a symbolic link on Unix, a junction
+    /// on Windows. False when the system refuses to make one.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn link_dir(link: &std::path::Path, target: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        return std::os::unix::fs::symlink(target, link).is_ok();
+        #[cfg(windows)]
+        return std::process::Command::new("cmd.exe").args(["/D", "/C", "mklink", "/J"]).arg(link).arg(target).output().is_ok_and(|o| o.status.success());
+        #[cfg(not(any(unix, windows)))]
+        return false;
+    }
+
+    /// Files are read through ordinary paths and links that stay inside the folder, but not through a link
+    /// (folder or file) that leads outside it. Fails when the system refuses to make the links (Unix
+    /// symbolic links and Windows junctions need no privilege), so it cannot pass without testing them.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_link_in_the_mesh_folder_cannot_lead_outside_it() {
+        let base = std::env::temp_dir().join(format!("tc-mesh-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (dir, outside) = (base.join("model"), base.join("secret"));
+        let result = std::panic::catch_unwind(|| {
+            std::fs::create_dir_all(dir.join("tex")).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("key.txt"), b"private").unwrap();
+            std::fs::write(dir.join("tex/a.png"), b"inside").unwrap();
+            assert_eq!(read_inside(&dir, "tex/a.png").as_deref(), Some(&b"inside"[..]), "ordinary files below the folder are read");
+            assert_eq!(read_inside(&dir, "tex/missing.png"), None);
+            assert!(link_dir(&dir.join("out"), &outside), "this system would not make a link");
+            assert_eq!(read_inside(&dir, "out/key.txt"), None, "through a link to another folder");
+            // A link that stays inside the folder is an ordinary shortcut and still works.
+            assert!(link_dir(&dir.join("shortcut"), &dir.join("tex")), "this system would not make a link");
+            assert_eq!(read_inside(&dir, "shortcut/a.png").as_deref(), Some(&b"inside"[..]), "through a link to a folder inside");
+            // A link to a single outside file (Unix symbolic links; Windows file links need privileges).
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(outside.join("key.txt"), dir.join("tex/key.png")).unwrap();
+                assert_eq!(read_inside(&dir, "tex/key.png"), None, "through a link to an outside file");
+            }
+            // The mesh's own folder reached through a link is fine: both sides are resolved.
+            assert!(link_dir(&base.join("alias"), &dir), "this system would not make a link");
+            assert_eq!(read_inside(&base.join("alias"), "tex/a.png").as_deref(), Some(&b"inside"[..]), "folder given through a link");
+
+            // The same through read_mesh_file: the outside bytes must not end up in the glTF.
+            std::fs::write(
+                dir.join("m.gltf"),
+                br#"{"asset": {"version": "2.0"}, "buffers": [{"uri": "out/key.txt", "byteLength": 7}, {"uri": "tex/a.png", "byteLength": 6}]}"#,
+            )
+            .unwrap();
+            let mesh = read_mesh_file(&dir.join("m.gltf")).unwrap();
+            let text = String::from_utf8(mesh.bytes).unwrap();
+            let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+            assert!(!text.contains(&b64(b"private")), "outside bytes were inlined");
+            assert!(text.contains(&b64(b"inside")), "the inside file is inlined");
+            assert_eq!(mesh.warnings.len(), 1, "{:?}", mesh.warnings);
+            assert!(mesh.warnings[0].contains("out/key.txt"), "{:?}", mesh.warnings);
+        });
+        let _ = std::fs::remove_dir_all(&base);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
 
     #[test]
     fn below_keeps_paths_inside_the_folder() {
