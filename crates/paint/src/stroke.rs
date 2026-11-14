@@ -139,7 +139,7 @@ impl Stroke {
         };
         let radius = self.radius_at(ctx, hit.pos, pressure);
         let Some(last) = self.last else {
-            out.push(self.stamp(ctx, &hit, radius));
+            out.push(self.stamp(ctx, &hit, radius, pressure));
             self.last = Some(hit);
             self.dist = 0.0;
             return;
@@ -174,7 +174,7 @@ impl Stroke {
                 .and_then(|s| pick(ctx, s))
                 .filter(|h| h.pos.distance(p) < radius * 2.0);
             let h = snapped.unwrap_or(SurfaceHit { pos: p, ..hit });
-            out.push(self.stamp(ctx, &h, radius));
+            out.push(self.stamp(ctx, &h, radius, pressure));
             emitted += 1;
             t += step;
         }
@@ -183,7 +183,7 @@ impl Stroke {
     }
 
     /// The next stamp at `hit`: oriented to the surface or the camera, then jittered
-    fn stamp(&mut self, ctx: &PickCtx, hit: &SurfaceHit, radius: f32) -> Stamp {
+    fn stamp(&mut self, ctx: &PickCtx, hit: &SurfaceHit, radius: f32, pressure: f32) -> Stamp {
         let settings = &self.settings;
         let seed = self.count;
         self.count = self.count.wrapping_add(1);
@@ -210,7 +210,9 @@ impl Stroke {
         let bitangent = normal.cross(tangent);
         let jittered_radius = radius * (1.0 + jitter(JITTER_SIZE, settings.jitter_size)).max(MIN_JITTERED_SIZE);
         let offset = (tangent * jitter(JITTER_ACROSS, 1.0) + bitangent * jitter(JITTER_ALONG, 1.0)) * settings.jitter_position * radius;
-        let flow = (settings.flow * (1.0 - jitter(JITTER_FLOW, settings.jitter_flow).abs())).clamp(0.0, 1.0);
+        let p = pressure.clamp(0.0, 1.0);
+        let pressure_flow = if p < 1.0 { settings.min_flow + (1.0 - settings.min_flow) * p } else { 1.0 };
+        let flow = (settings.flow * pressure_flow * (1.0 - jitter(JITTER_FLOW, settings.jitter_flow).abs())).clamp(0.0, 1.0);
 
         Stamp {
             center: hit.pos + offset,

@@ -1487,11 +1487,16 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         (brush.size, brush.min_size, brush.screen_space) = size_fields(&defaults);
     }
 
-    let flow_fields = |settings: &BrushSettings| (settings.flow, settings.opacity, settings.spacing, settings.hardness);
+    let flow_fields = |settings: &BrushSettings| (settings.flow, settings.min_flow, settings.opacity, settings.spacing, settings.hardness);
     if section_with_reset(ui, "sec_flow", tr("Flow and opacity"), true, flow_fields(brush) == flow_fields(&defaults), |ui| {
         let mut flow_percent = brush.flow * 100.0;
         if slider(ui, tr("Flow"), &mut flow_percent, 0.0..=100.0, 0).changed() {
             brush.flow = flow_percent / 100.0;
+        }
+
+        let mut min_flow_percent = brush.min_flow * 100.0;
+        if slider(ui, tr("Minimum flow (%)"), &mut min_flow_percent, 0.0..=100.0, 0).changed() {
+            brush.min_flow = min_flow_percent / 100.0;
         }
 
         let mut opacity_percent = brush.opacity * 100.0;
@@ -1509,7 +1514,7 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
             brush.hardness = hardness_percent / 100.0;
         }
     }) {
-        (brush.flow, brush.opacity, brush.spacing, brush.hardness) = flow_fields(&defaults);
+        (brush.flow, brush.min_flow, brush.opacity, brush.spacing, brush.hardness) = flow_fields(&defaults);
     }
 
     let angle_fields = |settings: &BrushSettings| (settings.angle, settings.follow_path);
