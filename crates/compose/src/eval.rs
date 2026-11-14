@@ -885,6 +885,11 @@ fn stack_region(
     };
     let anchors: Vec<(LayerId, Channel)> = asked.iter().copied().chain(own.iter().map(|a| (*a, Channel::Height))).collect();
     let anchors = anchors.as_slice();
+    // Content reading an anchor point inside the layer's own mask: the mask is evaluated first, recording it
+    let own_mask = match job {
+        Job::Content(_) => layer_mask(inp.project, id).filter(|m| mask_anchors(m).any(|a| asked.iter().any(|(at, _)| *at == a))),
+        Job::Mask(_) => None,
+    };
 
     // Evaluate the stack up to the filter, tile by tile (content premultiplied by coverage)
     let (rx1, ry1) = (rx0 + w, ry0 + h);
@@ -895,6 +900,7 @@ fn stack_region(
             let from_below = matches!(job, Job::Content(c) if inp.project.content_layer(id).is_some_and(|l| starts_from_below(l, c)));
             let full = if from_below { stack_plan(inp, channels, tx, ty, Some(below)) } else { anchor_plan(inp, id, channels, tx, ty, Some(below)) };
             let preview_tile = inp.preview.and_then(|preview| preview.alpha.tile(tx, ty));
+            let own_mask = own_mask.and_then(|m| mask_plan(inp, id, m, tx, ty, Some(below)));
             let mut mask = None;
             let mut nodes = Vec::new();
             match job {
@@ -917,6 +923,9 @@ fn stack_region(
                 .map(|(x, y, offset)| {
                     let mut texel = Texel::new(inp, x, y, offset, stroke_at(preview_tile, offset));
                     let acc = if full.is_empty() { None } else { Some(texel.anchors_below(&full, id)) };
+                    if let Some(own_mask) = &own_mask {
+                        texel.mask(own_mask);
+                    }
                     let value = match (&mask, nodes.first()) {
                         (Some(mask_stack), _) => [texel.mask(mask_stack), 0.0, 0.0, 0.0],
                         (None, Some(node)) => match node.chans.first().and_then(|chan| {
@@ -970,6 +979,11 @@ fn stack_region(
     let marks =
         recorded.split_off(asked.len().min(recorded.len())).into_iter().zip(own).map(|(values, a)| (a, values.into_iter().map(|v| v[0]).collect())).collect();
     (orig, cover, recorded, marks)
+}
+
+/// Whether anchor point `anchor` sits inside a layer's mask (imported projects only).
+fn in_a_mask(p: &Project, anchor: LayerId) -> bool {
+    p.layers.values().any(|l| l.mask.as_ref().is_some_and(|m| m.effects.iter().any(|e| e.id == anchor)))
 }
 
 /// The visible anchor points inside a mask.
@@ -1152,15 +1166,16 @@ fn graph_region(
                 let px = (0..n).map(|i| if c.is_some() { at(data, i, 3) } else { 1.0 }).map(|a| [a, a, a, 1.0]).collect();
                 Tex { w: w as usize, h: h as usize, px }
             }
-            GraphInput::Anchor { channel, levels, .. } => {
-                let read = channel.or(own).unwrap_or(Channel::Height);
+            GraphInput::Anchor { anchor, channel, levels } => {
+                // an anchor point inside a mask holds the mask's grey, whatever the channel
+                let read = if in_a_mask(inp.project, *anchor) { ChannelKind::Scalar } else { channel.or(own).unwrap_or(Channel::Height).kind() };
                 let Some(values) = recorded.get(next_anchor) else { continue };
                 next_anchor += 1;
                 let px = values
                     .iter()
                     .map(|v| {
-                        let v = levels.map_or(*v, |l| per_unit(read.kind(), *v, |x| l.apply(x)));
-                        let g = graphs::channel_to_graph(read.kind(), v, linear);
+                        let v = levels.map_or(*v, |l| per_unit(read, *v, |x| l.apply(x)));
+                        let g = graphs::channel_to_graph(read, v, linear);
                         [g[0], g[1], g[2], 1.0]
                     })
                     .collect();
@@ -4514,6 +4529,49 @@ soft {soft:?}"
         mask.effects = vec![read(&mut f)];
         f.project.layer_mut(top).unwrap().mask = Some(mask);
         assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.44; 3]));
+    }
+
+    #[test]
+    fn graphs_read_anchors_inside_masks_as_the_masks_grey() {
+        use crate::graphs::tests::INVERT;
+        let mut graphs = GraphStore::default();
+        let invert = graphs.add_text(INVERT);
+        let reader = |anchor: LayerId, channel: Channel| {
+            let mut g = GraphRef::new(invert.clone(), "invert");
+            g.inputs.insert(0, GraphInput::Anchor { anchor, channel: Some(channel), levels: None });
+            EffectKind::Graph { graph: g, projection: Projection::default() }
+        };
+        let uniform = |f: &mut Fixture, v: f32| {
+            Effect::new(f.project.alloc_id(), EffectKind::Fill { source: Source::Uniform([v; 3]), projection: Projection::default() })
+        };
+        // a mask records 0.3 at its anchor; the mask of a layer above runs a graph on it: its grey, not a height
+        let mut f = fixture();
+        fill_layer(&mut f.project, [0.0; 3], 0.0);
+        let low = fill_layer(&mut f.project, [1.0; 3], 0.0);
+        let anchor = f.project.alloc_id();
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects = vec![uniform(&mut f, 0.3), Effect::new(anchor, EffectKind::Anchor)];
+        f.project.layer_mut(low).unwrap().mask = Some(mask);
+        let top = fill_layer(&mut f.project, [1.0; 3], 0.0);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects = vec![Effect::new(f.project.alloc_id(), reader(anchor, Channel::Height))];
+        f.project.layer_mut(top).unwrap().mask = Some(mask);
+        let v = run_with(&f, &graphs).value(Channel::BaseColor, 5, 5)[0];
+        assert!((v - (0.3 * 0.3 + 0.7)).abs() < 2e-3, "1 over 0.3 through the inverted mask 0.7: {v}");
+
+        // content reading an anchor in its own layer's mask: the mask is evaluated first
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.0; 3], 0.0);
+        let anchor = f.project.alloc_id();
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects = vec![uniform(&mut f, 0.3), Effect::new(anchor, EffectKind::Anchor), uniform(&mut f, 1.0)];
+        let fx = f.project.alloc_id();
+        let l = f.project.layer_mut(id).unwrap();
+        l.mask = Some(mask);
+        l.content_effects.push(Effect::new(fx, reader(anchor, Channel::BaseColor)));
+        let v = run_with(&f, &graphs).value(Channel::BaseColor, 5, 5)[0];
+        let want = texturecraft_texel::srgb_to_linear(0.7);
+        assert!((v - want).abs() < 2e-3, "the content is the inverted grey 0.3: {v} (want {want})");
     }
 
     #[test]

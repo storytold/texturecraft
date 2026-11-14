@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use texturecraft_core::{BlendMode, Channel, Effect, EffectKind, Fill, LayerId, LayerKind, Levels, Projection, Source};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{
-    EffectGroup, EffectHeader, FillEffect, Levels as ProjectLevels, LevelsEffect, PaintEffect, PolygonFillEffect, ProjectEffect, ProjectLayer, ProjectSource,
-    ReferenceSource,
+    EffectGroup, EffectHeader, FillEffect, Levels as ProjectLevels, LevelsEffect, PaintEffect, PaintTool, PolygonFillEffect, ProjectEffect, ProjectLayer,
+    ProjectSource, ReferenceSource,
 };
 
 use super::{Anchors, Ids, SetInput, effect, projection};
@@ -35,7 +35,7 @@ use crate::blend::{Holder, ResolvedBlend};
 use crate::channels::bit_of;
 use crate::graph_uses::{self, GraphUse};
 use crate::polygon_fill::{self, FillJob};
-use crate::replay::brush::{StepTarget, refused};
+use crate::replay::brush::StepTarget;
 use crate::replay::{PaintMode, REPLAYED, ReplayJob, ReplayStep, ReplayTarget};
 use crate::resources::{MeshMapAlias, mesh_map_alias};
 use crate::status::Status;
@@ -226,6 +226,12 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         if !self.input.replay {
             return Err(Blocker::new(BlockerKey::new(BlockerKind::Strokes, tool), format!("{tool} strokes")));
         }
+        // a smudge or an eraser above other content effects works on what lies below its own effect, which a replay into
+        // the effect does not reach: kept as an empty paint effect, it changes nothing (approximated, as the fork did)
+        if !self.in_brush_work && p.tool == PaintTool::Smudge {
+            self.inert_paint(p, on, "a smudge on its own (it moves what lies below its effect) is not replayed: it changes nothing");
+            return Ok(());
+        }
         let step = crate::replay::brush::alone(p).and_then(|()| self.step(p));
         if self.in_brush_work {
             return Err(match step {
@@ -237,7 +243,8 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         }
         let (step, status) = step?;
         if step.mode == PaintMode::Erase {
-            return Err(refused("eraser-effect", "an eraser above other content effects (it erases what is below it)"));
+            self.inert_paint(p, on, "an eraser above other content effects (it erases what is below it) is not replayed: it changes nothing");
+            return Ok(());
         }
         let id = self.ids.alloc();
         let mut e = effect(id, &p.header.label, EffectKind::Paint, on);
@@ -252,6 +259,18 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
             self.jobs.push(job);
         }
         Ok(())
+    }
+
+    /// `p` as an empty paint effect: nothing replayed into it, so it changes nothing; its channels approximated by `why`.
+    fn inert_paint(&mut self, p: &PaintEffect, on: bool, why: &str) {
+        let id = self.ids.alloc();
+        self.effects.push(effect(id, &p.header.label, EffectKind::Paint, on));
+        if on {
+            let status = Status::approximated(why);
+            for c in self.channels_of(Some(&p.header)) {
+                self.note(c, &status);
+            }
+        }
     }
 
     /// Effects on a folder (rare): kept as placeholders, not computed; with the status of every channel they write.

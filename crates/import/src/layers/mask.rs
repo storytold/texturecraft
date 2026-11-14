@@ -172,6 +172,13 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 if p.stroke_count() == 0 {
                     return;
                 }
+                // a smudge on its own moves what lies below its effect, which a replay into the effect does not reach: kept as
+                // an empty paint effect, it changes nothing (approximated, as the fork did)
+                if self.input.replay && p.tool == PaintTool::Smudge {
+                    self.push(header, EffectKind::Paint, on);
+                    self.note(on, &Status::approximated("a smudge on its own (it moves what lies below its effect) is not replayed: it changes nothing"));
+                    return;
+                }
                 let blocker = match self.input.replay {
                     false => Blocker::new(BlockerKey::new(BlockerKind::Strokes, "painted-mask"), "painted mask (strokes)"),
                     true => match crate::replay::brush::alone(p).and_then(|()| {

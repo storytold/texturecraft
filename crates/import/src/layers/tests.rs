@@ -739,7 +739,7 @@ fn levels_act_on_the_channels_they_list_only() {
 }
 
 #[test]
-fn a_smudge_moves_the_brush_work_before_it_and_alone_stays_a_placeholder() {
+fn a_smudge_moves_the_brush_work_before_it_and_alone_changes_nothing() {
     use crate::replay::PaintMode;
     use texturecraft_import_reader::model::ProjectBlendMode;
     // in a paint layer's brush work: one job, the smudge after the brush
@@ -765,6 +765,14 @@ fn a_smudge_moves_the_brush_work_before_it_and_alone_stays_a_placeholder() {
     assert!(matches!(m.effects[0].kind, EffectKind::Paint));
     assert_eq!(stack.jobs.len(), 1);
     assert_eq!(stack.jobs[0].steps.iter().map(|s| s.mode).collect::<Vec<_>>(), [PaintMode::Paint, PaintMode::Smudge]);
-    assert!(matches!(m.effects[1].kind, EffectKind::Placeholder { .. }));
-    assert!(ours.lock.as_ref().unwrap().keys().contains(&"brush:smudge-alone"), "{:?}", ours.lock);
+    assert!(matches!(m.effects[1].kind, EffectKind::Paint), "an empty paint effect: it changes nothing");
+    assert!(ours.lock.is_none() && ours.placeholders().count() == 0, "{:?}", ours.lock);
+    // in layer content, above other content effects: an empty paint effect as well, and so is an eraser there
+    let base = fill(2, BASE, vec![uniform(BASE, [0.5; 3])], vec![]);
+    let effects = vec![base, painting(3, BASE, PaintTool::Smudge, vec![]), painting(4, BASE, PaintTool::Eraser, vec![])];
+    let stack = build_replaying(vec![layer(1, "Content", ProjectLayerKind::Fill, effects)]);
+    let ours = by_name(&stack, "Content");
+    assert!(ours.lock.is_none() && ours.placeholders().count() == 0, "{:?}", ours.lock);
+    assert!(stack.jobs.is_empty(), "nothing replayed into them");
+    assert_eq!(ours.content_effects.iter().filter(|e| matches!(e.kind, EffectKind::Paint)).count(), 2, "{:?}", ours.content_effects);
 }

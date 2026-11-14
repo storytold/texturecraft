@@ -48,12 +48,14 @@ USAGE:
   texturecraft-cli import <project file> <out.tcraft> [--original-on-top] [--original-correction]
                    [--native-filters] [--max-resolution <px>] [--no-measure] [--no-replay]
                    [--graphs decompile|keep] [--result-cache <dir>] [--result-cache-gb <n>]
-                   [--render-budget-gb <n>]
+                   [--render-budget-gb <n>] [--census]
       Convert a project file of the reference app (one-way; the original is only read) and save
       it; prints what the import found per texture set (file.importProject). --original-correction
       adds a locked layer holding the original's result where the layers do not reproduce it.
       --result-cache keeps graph renders in <dir> and reuses them in later imports (at most
-      --result-cache-gb GB, default 20). --render-budget-gb caps the memory graph renders running
+      --result-cache-gb GB, default 20). --census translates the layer stacks only (no strokes
+      replayed, graphs cooked or result measured; <out.tcraft> not needed, nothing saved) and prints
+      every locked layer and placeholder with its reasons. --render-budget-gb caps the memory graph renders running
       at once may take (default half the machine's RAM; also for export and verify).
   texturecraft-cli import <folder> <out folder> [--jobs <n>] [the import flags above]
       Convert every project file below <folder>, each saved under the same relative path in
@@ -97,7 +99,7 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     (
         "import",
         &["--max-resolution", "--graphs", "--result-cache", "--result-cache-gb", "--jobs", "--render-budget-gb"],
-        &["--original-on-top", "--original-correction", "--native-filters", "--no-measure", "--no-replay"],
+        &["--original-on-top", "--original-correction", "--native-filters", "--no-measure", "--no-replay", "--census"],
     ),
     (
         "verify",
@@ -340,6 +342,10 @@ fn import_params(a: &Args, input: &str) -> Result<Value, String> {
     if a.has("--no-replay") {
         p["replayStrokes"] = json!(false);
     }
+    if a.has("--census") {
+        p["translateOnly"] = json!(true);
+        p["measure"] = json!(false);
+    }
     if let Some(dir) = a.get("--result-cache") {
         p["resultCache"] = json!(dir);
     }
@@ -350,6 +356,9 @@ fn import_params(a: &Args, input: &str) -> Result<Value, String> {
 }
 
 fn import(a: &Args) -> R {
+    if a.has("--census") {
+        return census(a);
+    }
     let (input, out) = (a.pos(0, "<project file>")?, a.pos(1, "<out.tcraft>")?);
     if Path::new(input).is_dir() {
         return import_folder(a, input, out);
@@ -359,6 +368,17 @@ fn import(a: &Args) -> R {
     let reply = h.command_run("file.importProject", p).map_err(s)?;
     print_json(&json!({"file": input, "import": reply.get("import").cloned().unwrap_or(Value::Null)}))?;
     save(&mut h, out)
+}
+
+/// `import <project file> --census`: the layer stacks translated only (nothing replayed, cooked or measured, nothing
+/// saved); prints the import summary and every locked layer and placeholder with its reasons.
+fn census(a: &Args) -> R {
+    let input = a.pos(0, "<project file>")?;
+    let p = import_params(a, input)?;
+    let mut h = open("builtin:cube", Some(128))?;
+    let reply = h.command_run("file.importProject", p).map_err(s)?;
+    let locks = h.inspect().get("locks").cloned().unwrap_or(Value::Null);
+    print_json(&json!({"file": input, "import": reply.get("import").cloned().unwrap_or(Value::Null), "locks": locks}))
 }
 
 /// `import <folder> <out folder>`: every project below the folder ([`batch_import`]).
