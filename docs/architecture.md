@@ -185,7 +185,11 @@ eighth, are reported). A set the original paints per UV tile imports as one text
 note in the report: where the file keeps each tile's pixels has not been seen yet.
 
 The import runs as an `engine::import_cmds::ImportTask` reporting to an `ImportProgress`: a fraction, the step (reading
-the file; per texture set converting, replaying strokes and cooking graphs; saving) and a cancel flag. The flag is checked
+the file; per texture set converting, replaying strokes and cooking graphs; saving; for the desktop app also computing
+the view, the first composite of the converted project, so that it opens with nothing left to composite and that
+composite never holds up the window) and a cancel flag. Inside a long step the bar moves by the work done: layers
+translated, strokes laid, graphs cooked (a running render by its nodes) against the graphs the stack runs, tiles
+composited. The flag is checked
 between steps, texture sets and strokes, and the imported project's graph store renders under it, so a graph render in
 progress stops at its next node. The command runs the task in one go; the desktop app (File › Import project..., or
 opening or dropping such a file) shows exactly two windows (`ui-egui::import_ui`): a notice that must be acknowledged,

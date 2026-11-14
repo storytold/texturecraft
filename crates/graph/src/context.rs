@@ -167,6 +167,9 @@ pub struct EvalContext {
     pub pool: Option<Arc<rayon::ThreadPool>>,
     /// Where files the graph names but does not carry are read from.
     pub files: Files,
+    /// Counts the graph's own nodes as they finish (not those inside subgraphs), for a host showing a render's progress
+    /// against [`crate::Graph::work_nodes`]; `None` counts nothing. Nothing computed depends on it.
+    pub nodes_done: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl std::fmt::Debug for EvalContext {
@@ -178,6 +181,7 @@ impl std::fmt::Debug for EvalContext {
             .field("live", &self.live)
             .field("pool", &self.pool.as_ref().map(|p| p.current_num_threads()))
             .field("files", &"..")
+            .field("nodes_done", &self.nodes_done)
             .finish()
     }
 }

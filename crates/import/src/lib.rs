@@ -35,6 +35,7 @@ pub mod mesh;
 pub mod options;
 pub mod pixel_spill;
 pub mod polygon_fill;
+pub mod progress;
 pub mod replay;
 pub mod resources;
 #[cfg(test)]

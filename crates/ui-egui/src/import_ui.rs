@@ -50,6 +50,7 @@ pub fn step_label(step: Step) -> String {
         Step::ReplayingStrokes { set: n, of } => set(tr("Converting texture set {n} of {m}: replaying strokes"), n, of),
         Step::CookingGraphs { set: n, of } => set(tr("Converting texture set {n} of {m}: cooking graphs"), n, of),
         Step::Saving => tr("Saving").to_string(),
+        Step::ComputingView => tr("Computing the view").to_string(),
     }
 }
 
@@ -127,13 +128,56 @@ fn notice(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> O
     if !go {
         return Some(ImportUi::Notice { task });
     }
+    Some(start(app, ctx, task))
+}
+
+/// Starts the conversion the notice was acknowledged for: window 2 shows its progress. The run also composites the
+/// converted project's view, so the window stays until the project can be shown as it is and the first composite does
+/// not hold up the window.
+fn start(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> ImportUi {
     let (file, path) = (task.file_name(), task.source_path().map(str::to_string));
     let progress = Arc::new(ImportProgress::new());
     let worker = progress.clone();
-    let rx = crate::spawn_worker("texturecraft-import", move || task.run(&worker));
+    let rx = crate::spawn_worker("texturecraft-import", move || task.with_view(true).run(&worker));
     let started = ctx.input(|i| i.time);
     app.session.log.push(format!("Import {file}: started"));
-    Some(ImportUi::Running { file, path, progress, rx, started })
+    ImportUi::Running { file, path, progress, rx, started }
+}
+
+/// "I understand, convert" on the notice showing (the control channel's `ui.import.convert`, as a click): whether
+/// a notice was showing.
+pub fn acknowledge(app: &mut TextureCraftApp, ctx: &egui::Context) -> bool {
+    match app.import.take() {
+        Some(ImportUi::Notice { task }) => {
+            app.import = Some(start(app, ctx, task));
+            true
+        }
+        other => {
+            app.import = other;
+            false
+        }
+    }
+}
+
+/// What the import windows show, for the control channel (`ui.import.status`): the window (`none`, `notice`,
+/// `running`, `failed`), and while running the step, its id, the fraction and the seconds elapsed; when failed the
+/// step and the error.
+pub fn status(app: &TextureCraftApp, now: f64) -> serde_json::Value {
+    use serde_json::json;
+    match &app.import {
+        None => json!({ "window": "none" }),
+        Some(ImportUi::Notice { task }) => json!({ "window": "notice", "file": task.file_name() }),
+        Some(ImportUi::Running { file, progress, started, .. }) => json!({
+            "window": "running",
+            "file": file,
+            "step": step_label(progress.step()),
+            "stepId": progress.step().id(),
+            "fraction": progress.fraction(),
+            "elapsed": now - started,
+            "cancelled": progress.is_cancelled(),
+        }),
+        Some(ImportUi::Failed { file, step, error }) => json!({ "window": "failed", "file": file, "step": step.id(), "error": error }),
+    }
 }
 
 fn running(

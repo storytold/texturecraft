@@ -1,8 +1,10 @@
 //! Runs `file.importProject` as the UI does (an import task with progress, then opened) and prints every progress
 //! report with the time it came. With `--cancel-in <step id> <ms>` the import is cancelled that long after the step
 //! first shows (`reading`, `converting`, `replaying`, `cooking`, `saving`) and the time it took to stop is printed.
+//! A line is printed per step change and per 1 % the bar moves. With `--view` the run also composites the converted
+//! project's view, as the desktop app's import does.
 //!
-//! `cargo run --release -p texturecraft-engine --example import_progress -- <project file> [--cancel-in cooking 2000]`
+//! `cargo run --release -p texturecraft-engine --example import_progress -- <project file> [--cancel-in cooking 2000] [--view]`
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,6 +17,7 @@ fn main() {
         eprintln!("usage: import_progress <project file> [--cancel-in <step id> <ms>]");
         std::process::exit(2);
     };
+    let view = args.iter().any(|a| a == "--view");
     let cancel_in = match args.get(2).map(String::as_str) {
         Some("--cancel-in") => match (args.get(3), args.get(4).and_then(|m| m.parse::<u64>().ok())) {
             (Some(step), Some(ms)) => Some((step.clone(), Duration::from_millis(ms))),
@@ -29,12 +32,13 @@ fn main() {
     // when each step id first showed
     let first: Arc<Mutex<Vec<(String, Instant)>>> = Arc::default();
     let seen = first.clone();
-    let last = Mutex::new(None::<Step>);
+    // the last step and fraction printed: a line per step change and per 1 % moved
+    let last = Mutex::new(None::<(Step, f32)>);
     let progress = Arc::new(ImportProgress::with_listener(move |f, step| {
         let mut last = last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *last != Some(step) {
+        if last.is_none_or(|(s, at)| s != step || f >= at + 0.01) {
             println!("{:>8.2} s  {:>5.1}%  {step}", t0.elapsed().as_secs_f64(), f * 100.0);
-            *last = Some(step);
+            *last = Some((step, f));
         }
         let mut seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !seen.iter().any(|(id, _)| id == step.id()) {
@@ -62,7 +66,7 @@ fn main() {
             }
         })
     });
-    let result = ImportTask::path(file.clone()).run(&progress);
+    let result = ImportTask::path(file.clone()).with_view(view).run(&progress);
     let end = Instant::now();
     if let Some(w) = watcher {
         let _ = w.join();
@@ -81,10 +85,11 @@ fn main() {
                     let sets = reply.pointer("/import/sets").and_then(|s| s.as_array()).map_or(0, Vec::len);
                     let layers: u64 = reply.pointer("/import/sets").and_then(|s| s.as_array()).into_iter().flatten().filter_map(|s| s["layers"].as_u64()).sum();
                     println!(
-                        "{:>8.2} s  opened \"{}\": {sets} texture sets, {layers} layers, {} graph renders",
+                        "{:>8.2} s  opened \"{}\": {sets} texture sets, {layers} layers, {} graph renders, {} tiles left to composite",
                         t0.elapsed().as_secs_f64(),
                         session.project().name,
-                        session.doc.graphs.renders()
+                        session.doc.graphs.renders(),
+                        session.pending_tiles()
                     );
                 }
                 Err(e) => println!("{:>8.2} s  not opened: {e}", t0.elapsed().as_secs_f64()),

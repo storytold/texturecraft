@@ -339,6 +339,12 @@ pub enum ReplayedPixels {
 pub trait StrokeReplayer: Sync {
     /// Paints `jobs` on `scene`: one result per job, in order; an error says why a job could not be painted.
     fn replay(&self, scene: &ReplayScene, jobs: &[ReplayJob]) -> Vec<Result<ReplayedPixels, String>>;
+
+    /// Strokes laid so far by every [`StrokeReplayer::replay`] call (path strokes included, a job's strokes counted
+    /// when it finishes), for a progress display; `None` when the replayer does not count.
+    fn strokes_done(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The pressure timeline at `time`: linear between keys, held before the first and after the last; 1 without keys.
