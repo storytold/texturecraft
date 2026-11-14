@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | `projection` 6 (texture space) | UV, identity | exact |
 //! | `projection` 0, identity UV transform | UV, identity | exact |
-//! | `projection` 0 with tiling, offset or rotation | UV with that placement about the texture's centre ([`uv_placement`]) | exact; approximated with a rotation (its direction is not verified) |
+//! | `projection` 0 with tiling, offset or rotation | UV with that placement about the texture's centre, v up ([`uv_placement`]) | exact |
 //! | `projection` 0 with `uvSamplingWrap` 0, 1, 2 | the same placement as a [`PlacedMode::Uv`] repeating along none, u or v | as above; 1 and 2 approximated (which is u and which v is not verified) |
 //! | `projection` 2 (tri-planar) | [`PlacedMode::TriPlanar`]: the volume ([`volume`]), `sideHardness` as the blend hardness, UV tiling and rotation as the image placement | exact (measured, see below); approximated with a UV offset (left out: its direction is not measured on tri-planar), tiling uneven and rotation together (their order is unmeasured), a size mode other than tiling, or a clipped volume |
 //! | `projection` 1 (planar) | [`PlacedMode::Planar`] with the depth (`depthCulling*`) and facing (`backfaceCulling*`, angle × 180°) falloffs | exact without falloffs or clipping (the volume and image placement measured as tri-planar's); approximated with them (the falloff curves are not measured) |
@@ -61,23 +61,25 @@ pub struct MappedProjection {
 }
 
 /// The file's UV placement as TextureCraft's `uv · R(rotation) · scale + offset`. The original tiles, offsets and turns
-/// about the texture's centre: image = `tiling · R(−θ) · (uv − ½ − offset) + ½` (measured: a mask fill tiled 4.37 times
-/// with offset 0.22 lands on the stored result only so). The offset is folded into TextureCraft's and wrapped to 0..1
-/// when the image repeats both ways.
+/// about the texture's centre with v up: image = `tiling · R(−θ) · (uv − ½ − offset) + ½` in v-up coordinates
+/// (measured: a mask fill tiled 4.37 times with offset 0.22 lands on the stored result only so; a decal tiled −5.6 ×
+/// −5.2, turned 1.28 rad with offset (−0.30, −0.07) and not repeated lands on its stored copy only so). In
+/// TextureCraft's texel rows (v down) that is `tiling · R(θ) · (uv − ½ − (offset_u, −offset_v)) + ½`. The offset is
+/// folded into TextureCraft's and wrapped to 0..1 when the image repeats both ways.
 fn uv_placement(t: &UvTransform, wrap: bool) -> ([f32; 2], f32, [f32; 2]) {
     let scale = t.scale.map(|v| if v.is_finite() { v } else { 1.0 });
     let [ox, oy] = t.translation.map(|v| if v.is_finite() { v } else { 0.0 });
     let theta = if t.rotation.is_finite() { t.rotation } else { 0.0 };
     let (s, c) = theta.sin_cos();
-    // R(−θ) applied to the centre and offset, then scaled per axis
-    let (px, py) = (0.5 + ox, 0.5 + oy);
-    let r = [c * px + s * py, -s * px + c * py];
+    // R(θ) applied to the centre and offset (v down), then scaled per axis
+    let (px, py) = (0.5 + ox, 0.5 - oy);
+    let r = [c * px - s * py, s * px + c * py];
     let offset = [0.5 - scale[0] * r[0], 0.5 - scale[1] * r[1]].map(|v| match v.is_finite() {
         true if wrap => v.rem_euclid(1.0),
         true => v,
         false => 0.0,
     });
-    (scale, -theta.to_degrees(), offset)
+    (scale, theta.to_degrees(), offset)
 }
 
 /// The file's fill filtering 0 (bilinear): the fill's graph is read at one point per texel, not prefiltered (2, the
@@ -173,11 +175,7 @@ pub fn map(fill: &FillEffect) -> MappedProjection {
             uv => {
                 let t = uv.unwrap_or(UvTransform { scale: [1.0, 1.0], translation: [0.0, 0.0], rotation: 0.0 });
                 let (scale, rotation, offset) = uv_placement(&t, wrap == WRAP_BOTH);
-                let mut status = match rotation == 0.0 {
-                    true => Status::Exact,
-                    false => approx("UV projection with a rotation (its direction not verified)"),
-                };
-                status.and(&one_axis());
+                let status = one_axis();
                 let projection = match wrap {
                     WRAP_BOTH => Projection::Uv { scale, rotation, offset },
                     _ => Projection::Placed(Box::new(PlacedProjection {
@@ -299,8 +297,8 @@ mod tests {
         let m = map(&fill(0, Some(t)));
         assert!(m.status.is_exact());
         for uv in [[0.0, 0.0], [0.5, 0.5], [0.13, 0.71], [0.9, 0.2]] {
-            // the original: tiling · (uv − ½ − offset) + ½, the same texel of the repeating image
-            let want = [4.37 * (uv[0] - 0.5 - 0.22) + 0.5, 3.0 * (uv[1] - 0.5 + 0.1) + 0.5];
+            // the original: tiling · (uv − ½ − offset) + ½ with v up, the same texel of the repeating image
+            let want = [4.37 * (uv[0] - 0.5 - 0.22) + 0.5, 3.0 * (uv[1] - 0.5 - 0.1) + 0.5];
             let got = placed_uv(&m.projection, uv);
             for k in 0..2 {
                 let d = (got[k] - want[k]).rem_euclid(1.0);
@@ -311,7 +309,30 @@ mod tests {
         let turned = map(&fill(0, Some(UvTransform { scale: [1.0, 1.0], translation: [0.0, 0.0], rotation: 0.7 })));
         let c = placed_uv(&turned.projection, [0.5, 0.5]);
         assert!((c[0].rem_euclid(1.0) - 0.5).abs() < 1e-4 && (c[1].rem_euclid(1.0) - 0.5).abs() < 1e-4, "{c:?}");
-        assert!(!turned.status.is_exact());
+        assert!(turned.status.is_exact());
+    }
+
+    /// A decal laid on once with negative tiling, a turn and an offset (a vase's moth): placed where the original's
+    /// stored result shows it only with the turn and the offset's v read with v up (texel rows run down).
+    #[test]
+    fn turned_decals_follow_the_original_v_up() {
+        let (theta, o, sc) = (1.278_377_4_f32, [-0.302_425_83_f32, -0.065_312_92], [-5.590_565_f32, -5.162_55]);
+        let mut decal = fill(0, Some(UvTransform { scale: sc, translation: o, rotation: theta }));
+        decal.placement.uv_wrap = Some(0);
+        let m = map(&decal);
+        assert!(m.status.is_exact());
+        let PlacedMode::Uv { scale, rotation, offset } = placed_of(&m).mode else { panic!("uv") };
+        let place = |uv: [f32; 2]| placed_uv(&Projection::Uv { scale, rotation, offset }, uv);
+        // the image's centre sits at uv (½ + offset_u, ½ − offset_v) in texel rows: the moth's body on the stored result
+        let centre = place([0.5 + o[0], 0.5 - o[1]]);
+        assert!((centre[0] - 0.5).abs() < 1e-4 && (centre[1] - 0.5).abs() < 1e-4, "{centre:?}");
+        let (s, c) = theta.sin_cos();
+        for uv in [[0.1, 0.6], [0.25, 0.5], [0.2, 0.62]] {
+            let (dx, dy) = (uv[0] - 0.5 - o[0], uv[1] - 0.5 + o[1]);
+            let want = [sc[0] * (c * dx - s * dy) + 0.5, sc[1] * (s * dx + c * dy) + 0.5];
+            let got = place(uv);
+            assert!((got[0] - want[0]).abs() < 1e-3 && (got[1] - want[1]).abs() < 1e-3, "{uv:?}: {got:?} vs {want:?}");
+        }
     }
 
     #[test]
