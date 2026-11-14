@@ -59,6 +59,16 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// A baked material ball with smart materials on both texture sets
 pub fn sample_session(resolution: u32, bake_resolution: u32) -> Result<Session> {
+    sample_session_with_tracer(resolution, bake_resolution, false)
+}
+
+/// The desktop startup sample is baked on the CPU before the GPU bake tracer is installed. Keep
+/// that output when startup moves the sample construction to a worker thread.
+pub fn sample_session_cpu(resolution: u32, bake_resolution: u32) -> Result<Session> {
+    sample_session_with_tracer(resolution, bake_resolution, true)
+}
+
+fn sample_session_with_tracer(resolution: u32, bake_resolution: u32, cpu: bool) -> Result<Session> {
     let mut session = Session::new_project("Material Ball", primitives::material_ball(), "builtin:material_ball", None, resolution)?;
     for set_index in 0..session.set_count() {
         let set = session.doc.project.texture_set_mut(set_index)?;
@@ -72,7 +82,7 @@ pub fn sample_session(resolution: u32, bake_resolution: u32) -> Result<Session> 
         {
             ray_settings.rays = 24;
         }
-        session.bake_now(set_index, false)?;
+        session.bake_now(set_index, cpu)?;
     }
     session.active_set = 1;
     crate::materials::apply(&mut session, "iron_rusted")?;
