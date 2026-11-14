@@ -400,6 +400,9 @@ pub struct Project {
     /// (built-in meshes, web imports, projects saved before it was kept).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mesh_path: String,
+    /// Saved project file stem (without extension), or empty when unsaved.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_file: String,
     pub normal_format: NormalFormat,
     pub texture_sets: Vec<TextureSet>,
     pub layers: BTreeMap<LayerId, Layer>,
@@ -418,6 +421,7 @@ impl Project {
             mesh: mesh.into(),
             mesh_file: String::new(),
             mesh_path: String::new(),
+            project_file: String::new(),
             normal_format: NormalFormat::OpenGl,
             texture_sets: Vec::new(),
             layers: BTreeMap::new(),
