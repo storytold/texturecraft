@@ -368,7 +368,8 @@ impl Session {
             while distance <= length && batch.len() < batch_size {
                 let center = start + segment * (distance / length.max(f32::MIN_POSITIVE));
                 let seed = progress.stamps.wrapping_add((stamped + batch.len()) as u32);
-                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow: settings.flow, hardness: settings.hardness, seed });
+                let flow = settings.uv_stamp_flow(pressure);
+                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow, hardness: settings.hardness, seed });
                 distance += step;
             }
 

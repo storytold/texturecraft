@@ -143,6 +143,9 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
     if let Some(value) = percent("flow") {
         settings.flow = value;
     }
+    if let Some(value) = percent("minFlow") {
+        settings.min_flow = value;
+    }
     if let Some(value) = percent("opacity") {
         settings.opacity = value;
     }
@@ -268,7 +271,7 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
 pub(crate) fn brush_json(session: &Session) -> Value {
     let settings = &session.tool.brush;
     json!({
-        "size": settings.size / 0.25 * 100.0, "minSize": settings.min_size * 100.0, "flow": settings.flow * 100.0, "opacity": settings.opacity * 100.0,
+        "size": settings.size / 0.25 * 100.0, "minSize": settings.min_size * 100.0, "flow": settings.flow * 100.0, "minFlow": settings.min_flow * 100.0, "opacity": settings.opacity * 100.0,
         "spacing": settings.spacing * 100.0, "hardness": settings.hardness * 100.0, "angle": settings.angle, "followPath": settings.follow_path,
         "alignment": format!("{:?}", settings.alignment).to_lowercase(), "lazy": settings.lazy,
         "alpha": match (&settings.alpha_image, &settings.alpha_library) {
