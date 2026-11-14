@@ -4,7 +4,12 @@ use texturecraft_engine::geom::primitives;
 use texturecraft_engine::{Session, command_specs, execute};
 
 fn session() -> Session {
-    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 256).unwrap();
+    session_at(256)
+}
+
+/// The fixture session with texture sets of `resolution` texels a side.
+fn session_at(resolution: u32) -> Session {
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, resolution).unwrap();
     s.viewport = texturecraft_engine::geom::glam::Vec2::new(400.0, 400.0);
     s.camera.yaw = 0.0;
     s.camera.pitch = 0.0;
@@ -253,10 +258,15 @@ fn panic_hunt() {
 /// A session whose layers run graphs with hostile references: values that are not numbers, a missing text, a text that
 /// does not parse, nesting past the bound, outputs and anchors that do not exist, a stack input in a nested graph.
 fn graph_session() -> Session {
+    graph_session_at(256)
+}
+
+/// [`graph_session`] with texture sets of `resolution` texels a side.
+fn graph_session_at(resolution: u32) -> Session {
     use texturecraft_engine::core::{
         Effect, EffectKind, Fill, GraphInput, GraphRef, GraphValue, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source,
     };
-    let mut s = session();
+    let mut s = session_at(resolution);
     let colour = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 color r=0.25 g=0.5 b=0.75\noutput colour 1\nexpose gain 1 r 0 1\n");
     let broken = s.doc.graphs.add_text("format 3\nnode 1 invert in=@99\nnode 2 nonsense\n");
     let invert = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 input idx=0\nnode 2 invert in=@1\noutput out 2\n");
@@ -320,19 +330,28 @@ fn panic_hunt_with_hostile_graphs() {
     let mut back = Session::from_project_bytes(&bytes).unwrap();
     back.update();
     let hostile = [json!({}), json!({"layer": 4, "effect": 5, "key": "../x", "value": f64::NAN, "seed": -1, "output": [1]})];
-    // One graph session per command takes both inputs in turn: the second finds the graphs already rendered, so the
-    // hunt costs one set of renders per command instead of two (the stock panic hunt above covers fresh sessions).
+    // A command gets the hostile-graph session as built: a fresh one after any command that ran, the same one after
+    // commands that were refused (a refused edit leaves the document as it was). Building it renders every graph, so
+    // the hunt builds it only as often as a command changed it, and at the smallest texture size: the hostile
+    // references, not the size, are what it hunts (the start of this test reads them at full size).
+    let fresh = || {
+        let mut s = graph_session_at(128);
+        for texture_set in &mut s.doc.project.texture_sets {
+            texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
+        }
+        s
+    };
+    let mut s = fresh();
     for spec in command_specs() {
         if spec.id == "project.sample" {
             continue;
         }
-        let mut s = graph_session();
-        for texture_set in &mut s.doc.project.texture_sets {
-            texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
-        }
         for p in &hostile {
-            let _ = execute(&mut s, spec.id, p);
+            let ran = execute(&mut s, spec.id, p).is_ok();
             s.update();
+            if ran {
+                s = fresh();
+            }
         }
     }
 }
