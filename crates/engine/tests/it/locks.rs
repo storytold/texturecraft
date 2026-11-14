@@ -125,9 +125,16 @@ fn every_command_with_any_params_leaves_a_locked_layer_alone() {
     ];
     // Undo and redo restore history, which here goes back to before the fixture locked the layer.
     let skip = |id: &str| id == "project.sample" || id.starts_with("bake.") || matches!(id, "edit.undo" | "edit.redo" | "edit.history");
+    // A fresh fixture after any command that ran; a refused command leaves the document as it was, so the next one
+    // reuses the fixture (building it paints and composites, which was most of this sweep's time).
+    let (mut s, paint, _, placeholder) = locked_session();
+    let mut stale = false;
     for spec in command_specs().iter().filter(|c| !skip(c.id)) {
         for p in &params {
-            let (mut s, paint, _, placeholder) = locked_session();
+            if stale {
+                (s, ..) = locked_session();
+                stale = false;
+            }
             let mut p = p.clone();
             if p.get("layer").is_some_and(|v| v == 0) {
                 p["layer"] = json!(paint.0);
@@ -137,6 +144,7 @@ fn every_command_with_any_params_leaves_a_locked_layer_alone() {
             // A refused command leaves the document as it was: only one that ran needs the frame that settles it.
             if execute(&mut s, spec.id, &p).is_ok() {
                 s.update();
+                stale = true;
             }
             if s.project_id != project {
                 continue; // another project was opened or created
