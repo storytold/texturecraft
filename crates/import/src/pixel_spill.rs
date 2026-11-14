@@ -147,7 +147,7 @@ impl PixelSpill {
                     bytes.resize(len * 2, 0);
                     r.read_exact(&mut bytes).ok()?;
                     let slot = slots.get_mut((ty * probe.tiles_x() + tx) as usize)?;
-                    *slot = Some(Arc::new(bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect()));
+                    *slot = Some(Arc::new(bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect()));
                 }
                 Some(slots)
             });
@@ -174,7 +174,7 @@ impl PixelSpill {
             for len in &self.lengths {
                 bytes.resize(len * 2, 0);
                 r.read_exact(&mut bytes)?;
-                tiles.push(Arc::new(bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect()));
+                tiles.push(Arc::new(bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect()));
             }
             Ok(tiles)
         })();
@@ -254,7 +254,7 @@ impl BakedSpill {
                         r.seek(std::io::SeekFrom::Start(start)).ok()?;
                         let mut bytes = vec![0u8; len * 4];
                         r.read_exact(&mut bytes).ok()?;
-                        Some(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+                        Some(bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect())
                     }),
                 ));
                 moved += 1;
