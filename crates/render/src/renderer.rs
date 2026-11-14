@@ -352,6 +352,8 @@ struct SetGpu {
     size: (u32, u32),
     /// Display textures hold the set at `size >> shift`: halved until they fit the device.
     shift: u32,
+    /// True when packed from multiple UV tiles (edge-clamped so adjacent tiles never bleed).
+    tiled: bool,
     /// The display textures in [`DisplayKind::ALL`] order, then the aux (mesh map) texture.
     /// Each starts as a 1×1 neutral placeholder and gets its full size with the first tile (or
     /// aux image) that holds something else, so a mesh with many materials costs no GPU memory
@@ -564,6 +566,7 @@ pub struct Renderer {
     mip_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     util_module: wgpu::ShaderModule,
     sampler: wgpu::Sampler,
+    clamp_sampler: wgpu::Sampler,
     env_sampler: wgpu::Sampler,
     shadow_sampler: wgpu::Sampler,
     shadow: ShadowMap,
@@ -887,7 +890,7 @@ impl Renderer {
             })
             .collect();
         let set_bind_group_layout = bind_group_layout("tc_set", &set_entries);
-        let refraction_bind_group_layout = bind_group_layout("tc_refr", &[tex_entry(0)]);
+        let refraction_bind_group_layout = bind_group_layout("tc_refr", &[tex_entry(0), sampler_entry(1)]);
         let blit_bind_group_layout = bind_group_layout("tc_blit", &[tex_entry(0), sampler_entry(1), uniform_entry(2)]);
         let mip_bind_group_layout = bind_group_layout("tc_mip", &[tex_entry(0), sampler_entry(1)]);
         let effect_bind_group_layout =
@@ -1062,6 +1065,16 @@ impl Renderer {
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("tc_tex"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: MAX_ANISOTROPY,
+            ..Default::default()
+        });
+        let clamp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("tc_clamp"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
@@ -1111,7 +1124,10 @@ impl Renderer {
         let refraction_black = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tc_refr_black"),
             layout: &refraction_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&black) }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&black) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&clamp_sampler) },
+            ],
         });
         let env = Tex::new(device, "tc_env", PLACEHOLDER_ENV_SIZE[0], PLACEHOLDER_ENV_SIZE[1], wgpu::TextureFormat::Rgba16Float, ENV_LEVELS);
 
@@ -1149,6 +1165,7 @@ impl Renderer {
             mip_pipelines: HashMap::new(),
             util_module,
             sampler,
+            clamp_sampler,
             env_sampler,
             shadow_sampler,
             shadow,
@@ -1374,7 +1391,16 @@ impl Renderer {
             tex.push(neutral_tex(device, queue, (1, 1), wgpu::TextureFormat::Rgba8Unorm, 1, &AUX_NEUTRAL));
             let bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &tex);
             let n = tex.len();
-            let gpu = SetGpu { size, shift, tex, bind_group, mips_dirty: vec![true; n], failed: vec![false; n], pending: (0..n).map(|_| None).collect() };
+            let gpu = SetGpu {
+                size,
+                shift,
+                tiled: false,
+                tex,
+                bind_group,
+                mips_dirty: vec![true; n],
+                failed: vec![false; n],
+                pending: (0..n).map(|_| None).collect(),
+            };
             if i < self.sets.len() {
                 self.sets[i] = gpu;
             } else {
@@ -1389,6 +1415,19 @@ impl Renderer {
             }
         }
         reset
+    }
+
+    /// Mark each texture set as UV-tiled (edge-clamped) or single-tile (wrapping).
+    pub fn set_tiled_sets(&mut self, device: &wgpu::Device, tiled: &[bool]) {
+        for (i, set) in self.sets.iter_mut().enumerate() {
+            let want = tiled.get(i).copied().unwrap_or(false);
+            if set.tiled != want {
+                set.tiled = want;
+                let sampler = if want { &self.clamp_sampler } else { &self.sampler };
+                set.bind_group = set_bind_group(device, &self.set_bgl, sampler, &set.tex);
+                self.content_rev += 1;
+            }
+        }
     }
 
     /// Upload one 64×64 tile of a display texture (bytes from `compose::tile_bytes`).
@@ -1411,7 +1450,8 @@ impl Renderer {
             }
             let what = format!("texture set {} ({kind:?}, {}×{})", ts + 1, dims.0, dims.1);
             let full = checked(device, &what, || neutral_tex(device, queue, dims, display_format(kind), mip_count(dims.0.max(dims.1)), texel));
-            if !grow(set, ts, ki, full, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
+            let sampler = if set.tiled { &self.clamp_sampler } else { &self.sampler };
+            if !grow(set, ts, ki, full, (device, &self.set_bgl, sampler), &mut self.memory_failures) {
                 return;
             }
         }
@@ -1468,7 +1508,8 @@ impl Renderer {
             }
             let what = format!("texture set {} (mesh map view, {size}×{size})", ts + 1);
             let full = checked(device, &what, || neutral_tex(device, queue, (size, size), wgpu::TextureFormat::Rgba8Unorm, mip_count(size), &AUX_NEUTRAL));
-            if !grow(set, ts, ai, full, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
+            let sampler = if set.tiled { &self.clamp_sampler } else { &self.sampler };
+            if !grow(set, ts, ai, full, (device, &self.set_bgl, sampler), &mut self.memory_failures) {
                 return;
             }
         }
@@ -1517,7 +1558,8 @@ impl Renderer {
                 let Some(p) = set.pending.get_mut(slot).and_then(Option::take) else { continue };
                 match verdict {
                     None => {
-                        install(set, slot, p.tex, device, &self.set_bgl, &self.sampler);
+                        let sampler = if set.tiled { &self.clamp_sampler } else { &self.sampler };
+                        install(set, slot, p.tex, device, &self.set_bgl, sampler);
                         self.content_rev += 1;
                     }
                     Some(e) => {
@@ -1549,12 +1591,13 @@ impl Renderer {
                 for level in 1..t.mips {
                     let src = t.texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level - 1, mip_level_count: Some(1), ..Default::default() });
                     let dst = t.texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level, mip_level_count: Some(1), ..Default::default() });
+                    let sampler = if self.sets[si].tiled { &self.clamp_sampler } else { &self.sampler };
                     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("tc_mip"),
                         layout: &self.mip_bgl,
                         entries: &[
                             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src) },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
                         ],
                     });
                     fullscreen(encoder, "tc_mip", &dst, CLEAR, pipe, &bg);
@@ -1600,7 +1643,7 @@ impl Renderer {
                 layout: &self.mip_bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.clamp_sampler) },
                 ],
             })
         };
@@ -1609,7 +1652,10 @@ impl Renderer {
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tc_refr"),
             layout: &self.refr_bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&all) }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&all) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.clamp_sampler) },
+            ],
         });
         Behind { level0: level(0), bg, mips }
     }
@@ -1623,7 +1669,7 @@ impl Renderer {
             layout: &self.fx_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.clamp_sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: post.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: tex(0) },
                 wgpu::BindGroupEntry { binding: 5, resource: tex(1) },
@@ -1640,7 +1686,7 @@ impl Renderer {
             layout: &self.mip_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.clamp_sampler) },
             ],
         });
         let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
@@ -1661,7 +1707,7 @@ impl Renderer {
             layout: &self.blit_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&resolve_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.clamp_sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: blit_buf.as_entire_binding() },
             ],
         });
@@ -1975,7 +2021,7 @@ impl Renderer {
                     layout: &self.mip_bgl,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(out) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.clamp_sampler) },
                     ],
                 });
                 fullscreen_blend(encoder, "tc_accum", &v.accum, wgpu::LoadOp::Load, &self.accum_pipeline, &bg, weight);

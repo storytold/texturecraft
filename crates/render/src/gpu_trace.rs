@@ -814,7 +814,7 @@ mod tests {
         }
         let mesh = Arc::new(primitives::sphere(1.0, 32, 16));
         let bvh = Arc::new(Bvh::new(&mesh));
-        TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0 }], Arc::new(env), 0.0)
+        TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0, tiled: false }], Arc::new(env), 0.0)
     }
 
     fn gpu() -> Option<(Headless, GpuTracer)> {
@@ -996,7 +996,7 @@ mod tests {
         let mesh = Arc::new(primitives::sphere(1.0, 32, 16));
         let bvh = Arc::new(Bvh::new(&mesh));
         let env = crate::ibl::environment("Studio Contrast", 256);
-        let scene = TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0 }], Arc::new(env), 0.0);
+        let scene = TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0, tiled: false }], Arc::new(env), 0.0);
         let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false };
         let settings = TraceSettings { bounces: 4 };
         let (_, _, gpu) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &settings, &d, [48, 36], 1024).unwrap();

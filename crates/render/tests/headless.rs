@@ -900,3 +900,58 @@ fn painted_placeholders_render_like_full_textures() {
     let [r1, g1, _] = red.at(w / 2, hgt / 2);
     assert!(r1 > r0 && g1 < g0, "the painted base color shows: {:?} → {:?}", before.at(w / 2, hgt / 2), red.at(w / 2, hgt / 2));
 }
+
+#[test]
+fn offset_uv_repeats_classic_sets_and_clamps_tiled_sets() {
+    let Ok(mut h) = Headless::new() else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    let mut mesh = primitives::plane(2.0, 2);
+    for uv in &mut mesh.uvs {
+        uv.x += 1.0;
+    }
+    h.renderer.set_mesh(&h.device, &h.queue, &mesh, 1);
+    h.renderer.set_texture_sets(&h.device, &h.queue, &[((128, 128), 0)], 1);
+    let red = [230u8, 30, 30, 255].repeat(64 * 64);
+    let blue = [30u8, 30, 230, 255].repeat(64 * 64);
+    for ty in 0..2 {
+        h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, 0, ty, &red);
+        h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, 1, ty, &blue);
+    }
+    let pitch = std::f32::consts::FRAC_PI_2 - 0.001;
+    let camera = OrbitCamera { target: Vec3::ZERO, yaw: 0.0, pitch, distance: 3.0, fov: 45.0, scene_radius: 2.0, ortho: false };
+    let shade = Shade { view_mode: 1, channel: 0, aces: false, ..Shade::default() };
+    let frame = Frame { view_id: 1, size: [480, 360], kind: ViewKind::Scene, camera, shade, visible: vec![true], overlay: Vec::new() };
+    let repeated = render(&mut h, &frame, "offset_uv_repeat");
+    let [rl, _, bl] = repeated.at(180, 180);
+    let [rr, _, br] = repeated.at(300, 180);
+    assert!(rl > 150 && bl < 80, "classic offset UVs wrap into left half: {:?}", repeated.at(180, 180));
+    assert!(br > 150 && rr < 80, "classic offset UVs wrap into right half: {:?}", repeated.at(300, 180));
+
+    h.renderer.set_tiled_sets(&h.device, &[true]);
+    let clamped = render(&mut h, &frame, "offset_uv_clamped");
+    let [rl, _, bl] = clamped.at(180, 180);
+    let [rr, _, br] = clamped.at(300, 180);
+    assert!(bl > 150 && rl < 80 && br > 150 && rr < 80, "UV-tiled sets clamp instead of wrapping across atlas borders");
+}
+
+#[test]
+fn bloom_does_not_wrap_across_screen_edges() {
+    let Some((mut h, mut frame)) = setup() else { return };
+    frame.camera.yaw = 0.0;
+    frame.camera.pitch = 0.0;
+    frame.camera.target.x += 2.2;
+    frame.shade.env_opacity = 0.0;
+    frame.shade.exposure_ev = 2.0;
+    frame.shade.post_effects = true;
+    fill(&mut h, &[0, 1], DisplayKind::Emissive, &[255, 255, 255, 255]);
+    frame.shade.bloom = 0.0;
+    let sharp = render(&mut h, &frame, "bloom_no_wrap_off");
+    frame.shade.bloom = 1.0;
+    let img = render(&mut h, &frame, "bloom_clamp");
+    let left_glow = img.mean(0, 120, 20, 240) - sharp.mean(0, 120, 20, 240);
+    let right_glow = img.mean(460, 120, 480, 240) - sharp.mean(460, 120, 480, 240);
+    assert!(left_glow > 4.0, "left edge should glow ({left_glow})");
+    assert!(right_glow < 1.0, "bloom must not wrap from the left edge to the right ({right_glow})");
+}

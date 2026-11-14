@@ -37,6 +37,8 @@ pub struct SceneSync {
     /// (texels across and down, material) per texture set, the mesh material count and the
     /// viewport texture resolution (display shift).
     pub sets: Option<(Vec<SetLayout>, usize, u32)>,
+    /// Whether each texture set is UV-tiled (edge-clamped instead of repeating).
+    pub tiled: Option<Vec<bool>>,
     /// The environment name and, for `resource:<name>`, its decoded image.
     pub env: Option<(String, Option<Arc<ImageRes>>)>,
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
@@ -84,6 +86,7 @@ pub struct GpuLink {
     pub lost: Arc<AtomicBool>,
     mesh_id: u64,
     sets: Vec<SetLayout>,
+    tiled: Vec<bool>,
     /// The display shift the GPU has (`Prefs::viewport_texture`).
     shift: u32,
     /// The environment the GPU has: name and image identity (a re-imported resource differs).
@@ -135,6 +138,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         lost: Arc::new(AtomicBool::new(false)),
         mesh_id: 0,
         sets: Vec::new(),
+        tiled: Vec::new(),
         shift: 0,
         env: Default::default(),
         aux: BTreeMap::new(),
@@ -174,6 +178,7 @@ impl GpuLink {
         if self.lost.swap(false, Ordering::AcqRel) {
             self.mesh_id = 0;
             self.sets.clear();
+            self.tiled.clear();
             self.env = Default::default();
             self.bake_scene.resend();
             self.reset.store(true, Ordering::Release);
@@ -190,6 +195,11 @@ impl GpuLink {
             out.sets = Some((sets.clone(), session.mesh.materials.len().max(1), shift));
             self.sets = sets;
             self.shift = shift;
+        }
+        let tiled: Vec<bool> = session.doc.project.texture_sets.iter().map(|texture_set| !texture_set.uv_tiles.is_empty()).collect();
+        if tiled != self.tiled || out.sets.is_some() {
+            out.tiled = Some(tiled.clone());
+            self.tiled = tiled;
         }
 
         let display = &session.doc.project.display;
@@ -343,6 +353,9 @@ impl CallbackTrait for ViewCallback {
                 if !reset.is_empty() {
                     gpu.reset.store(true, Ordering::Release);
                 }
+            }
+            if let Some(tiled) = &sync.tiled {
+                gpu.renderer.set_tiled_sets(device, tiled);
             }
             for (texture_set, kind, tile_x, tile_y, bytes) in &sync.tiles {
                 gpu.renderer.upload_tile(device, queue, *texture_set, *kind, *tile_x, *tile_y, bytes);

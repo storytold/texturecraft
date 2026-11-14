@@ -14,6 +14,7 @@ pub struct Gpu {
     h: texturecraft_render::headless::Headless,
     mesh_id: u64,
     sets: Vec<((u32, u32), usize)>,
+    tiled: Vec<bool>,
     env: String,
     /// The GPU path tracer, created by the first [`Gpu::path_trace`].
     tracer: Option<GpuTracer>,
@@ -22,7 +23,7 @@ pub struct Gpu {
 impl Gpu {
     /// Errors when there is no GPU (or software) adapter.
     pub fn new() -> Result<Gpu, String> {
-        Ok(Gpu { h: texturecraft_render::headless::Headless::new()?, mesh_id: 0, sets: Vec::new(), env: String::new(), tracer: None })
+        Ok(Gpu { h: texturecraft_render::headless::Headless::new()?, mesh_id: 0, sets: Vec::new(), tiled: Vec::new(), env: String::new(), tracer: None })
     }
 
     pub fn adapter(&self) -> &str {
@@ -38,13 +39,20 @@ impl Gpu {
             h.renderer.set_mesh(&h.device, &h.queue, &s.mesh, s.mesh_id);
             self.mesh_id = s.mesh_id;
             self.sets.clear();
+            self.tiled.clear();
             reupload = true;
         }
         let sets: Vec<((u32, u32), usize)> = s.doc.project.texture_sets.iter().map(|t| (t.size(), t.material)).collect();
-        if sets != self.sets {
+        let sets_changed = sets != self.sets;
+        if sets_changed {
             h.renderer.set_texture_sets(&h.device, &h.queue, &sets, s.mesh.materials.len().max(1));
             self.sets = sets;
             reupload = true;
+        }
+        let tiled: Vec<bool> = s.doc.project.texture_sets.iter().map(|t| !t.uv_tiles.is_empty()).collect();
+        if tiled != self.tiled || sets_changed {
+            h.renderer.set_tiled_sets(&h.device, &tiled);
+            self.tiled = tiled;
         }
         let d = &s.doc.project.display;
         if d.environment != self.env {
@@ -127,7 +135,12 @@ fn trace_inputs(s: &mut Session) -> (TraceScene, TraceDisplay) {
         .texture_sets
         .iter()
         .zip(&s.caches)
-        .map(|(ts, c)| TraceSet { material: ts.material, composite: c.composite.clone(), height_strength: ts.atlas_height_strength() })
+        .map(|(ts, c)| TraceSet {
+            material: ts.material,
+            composite: c.composite.clone(),
+            height_strength: ts.atlas_height_strength(),
+            tiled: !ts.uv_tiles.is_empty(),
+        })
         .collect();
     let d = &s.doc.project.display;
     let env_image = d.environment_resource().and_then(|n| s.images.get(n));
