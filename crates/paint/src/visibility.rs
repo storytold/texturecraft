@@ -161,31 +161,57 @@ impl EyeDepth {
 
     /// Whether world point `p` is visible (not hidden behind other geometry, inside the view).
     pub fn visible(&self, p: Vec3) -> bool {
+        // Conservative: the nearest surface among the pixel and its neighbours.
+        self.neighbourhood(p).is_some_and(|(near, _, _)| p.distance(self.eye) <= near + self.tolerance(near))
+    }
+
+    /// Whether world point `p`, inside the view, lies no farther than the farthest surface in its
+    /// pixel's neighbourhood, or has an empty pixel beside it: then the buffer alone can't tell
+    /// whether it is hidden (on a surface turned far from the camera, neighbouring pixels of the
+    /// same surface are much nearer, and where such a surface ends between pixel centres its edge
+    /// lies beyond every finite neighbour), while a point behind every surface all around it is
+    /// hidden for sure.
+    pub fn uncertain(&self, p: Vec3) -> bool {
+        self.neighbourhood(p).is_some_and(|(_, far, has_empty)| has_empty || (far < f32::MAX && p.distance(self.eye) <= far + self.tolerance(far)))
+    }
+
+    /// Allowance at eye distance `d`: a bias that grows with distance (depth buffer resolution).
+    fn tolerance(&self, d: f32) -> f32 {
+        self.bias + d * 0.002
+    }
+
+    /// The nearest and farthest surface among the pixel `p` lands in and its neighbours (f32::MAX
+    /// for both where they are all empty), and whether any of those pixels is empty, or None
+    /// outside the view or behind the camera.
+    fn neighbourhood(&self, p: Vec3) -> Option<(f32, f32, bool)> {
         let c = self.view_proj * p.extend(1.0);
         if c.w <= 1e-6 {
-            return false;
+            return None;
         }
         let (nx, ny) = (c.x / c.w, c.y / c.w);
         if nx.abs() > 1.0 || ny.abs() > 1.0 {
-            return false;
+            return None;
         }
         let x = (((nx * 0.5 + 0.5) * self.width as f32) as u32).min(self.width - 1);
         let y = (((0.5 - ny * 0.5) * self.height as f32) as u32).min(self.height - 1);
-        // Conservative: the nearest surface among the pixel and its neighbours.
-        let mut near = f32::MAX;
+        let (mut near, mut far, mut has_empty) = (f32::MAX, f32::MIN, false);
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
                 let (sx, sy) = (x as i32 + dx, y as i32 + dy);
                 if sx < 0 || sy < 0 || sx >= self.width as i32 || sy >= self.height as i32 {
                     continue;
                 }
-                if let Some(d) = self.dist.get((sy as u32 * self.width + sx as u32) as usize) {
-                    near = near.min(*d);
+                if let Some(&d) = self.dist.get((sy as u32 * self.width + sx as u32) as usize) {
+                    near = near.min(d);
+                    if d < f32::MAX {
+                        far = far.max(d);
+                    } else {
+                        has_empty = true;
+                    }
                 }
             }
         }
-        // Allow a bias that grows with distance (depth buffer resolution).
-        p.distance(self.eye) <= near + self.bias + near * 0.002
+        Some((near, if far == f32::MIN { f32::MAX } else { far }, has_empty))
     }
 }
 
@@ -206,5 +232,11 @@ mod tests {
         assert!(d.visible(toward * 1.0));
         assert!(!d.visible(-toward * 1.0));
         assert!(!d.visible(Vec3::new(100.0, 0.0, 0.0)));
+        // The far side is behind every surface around it: hidden for sure, no exact test needed
+        assert!(!d.uncertain(-toward * 1.0));
+        assert!(d.uncertain(toward * 1.0));
+        assert!(!d.uncertain(Vec3::new(100.0, 0.0, 0.0)), "outside the view");
+        // Beside empty pixels (a silhouette) the buffer can't prove a point hidden
+        assert!(d.uncertain(Vec3::new(0.0, 1.0, 0.0)), "on the silhouette");
     }
 }

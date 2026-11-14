@@ -104,6 +104,31 @@ fn grazing_allowance(depth: &EyeDepth, point: Vec3, facing: f32, pixels_per_unit
     world_per_pixel * NEIGHBOUR_REACH * (1.0 - facing * facing).sqrt() / facing
 }
 
+/// How far off the surface [`ray_reaches_eye`] starts its ray, so it doesn't hit the texel's own
+/// triangle, as a fraction of [`EyeDepth::bias`] (itself 0.4 % of the mesh radius: this is
+/// 0.001 % of the radius)
+const RAY_START_PER_BIAS: f32 = 0.0025;
+
+/// Whether a ray from `point` (on a surface facing `facing` toward the eye along `to_eye`) reaches
+/// the eye without hitting the mesh, ignoring the first `skip` world units. The depth buffer is
+/// asked first; this exact test only checks the texels it calls hidden but can't rule out
+/// ([`EyeDepth::uncertain`]): its pixels are coarse, so on a surface turned far from the camera it
+/// hides texels the camera does see, and strokes painted at a steep angle came out in stripes and
+/// jagged gaps
+fn ray_reaches_eye(context: &RasterCtx, depth: &EyeDepth, point: Vec3, normal: Vec3, facing: f32, to_eye: Vec3, skip: f32) -> bool {
+    let eye_distance = context.eye.distance(point);
+    let lift = depth.bias * RAY_START_PER_BIAS;
+    let start = skip.max(0.0) + lift;
+    if !eye_distance.is_finite() || start >= eye_distance {
+        return true;
+    }
+
+    // Lift off the surface on the eye's side, so back faces (culling off) don't hit themselves
+    let side = if facing < 0.0 { -normal } else { normal };
+    let origin = point + side * lift + to_eye * start;
+    !context.bvh.occluded(origin, to_eye, eye_distance - start)
+}
+
 /// What the rasterizer reads.
 pub struct RasterCtx<'a> {
     pub mesh: &'a Mesh,
@@ -238,10 +263,14 @@ fn scan_triangle(
                 continue;
             }
 
-            if let Some(depth) = context.depth
-                && !depth.visible(seen + to_eye * (grazing_allowance(depth, seen, facing, pixels_per_unit) + off_surface))
-            {
-                continue;
+            if let Some(depth) = context.depth {
+                let skip = grazing_allowance(depth, seen, facing, pixels_per_unit) + off_surface;
+                let tested = seen + to_eye * skip;
+                // The exact test runs only where the buffer calls a texel hidden but can't be sure
+                let hidden = !depth.visible(tested) && (!depth.uncertain(tested) || !ray_reaches_eye(context, depth, seen, seen_normal, facing, to_eye, skip));
+                if hidden {
+                    continue;
+                }
             }
 
             let fade = if context.backface_culling { smoothstep(fade_lo, fade_hi, facing) } else { 1.0 };
@@ -282,6 +311,175 @@ pub fn fill_coverage(canvas: &mut StrokeCanvas, gbuf: &UvGBuffer, coverage: impl
 mod tests {
     use super::*;
     use texturecraft_geom::primitives;
+
+    /// Texels a stamp of `radius` at `center` paints (alpha above 1 %) on `mesh` seen by `camera`,
+    /// with the brush's visibility test (as a 3D stroke) or without it.
+    fn painted(mesh: &Mesh, camera: &texturecraft_geom::OrbitCamera, center: Vec3, radius: f32, culling: bool, visibility: bool) -> usize {
+        painted_texels(mesh, camera, center, radius, culling, visibility).len()
+    }
+
+    fn painted_texels(mesh: &Mesh, camera: &texturecraft_geom::OrbitCamera, center: Vec3, radius: f32, culling: bool, visibility: bool) -> Vec<(u32, u32)> {
+        let bvh = Bvh::new(mesh);
+        let g = UvGBuffer::new(mesh, 0, 256, 256);
+        let mut canvas = StrokeCanvas::new(256, 256);
+        // Half a 960×540 viewport, as the session renders it for a stroke
+        let depth = EyeDepth::render(mesh, camera, 480, 270);
+        let ctx = RasterCtx {
+            mesh,
+            bvh: &bvh,
+            gbuf: &g,
+            material: 0,
+            depth: visibility.then_some(&depth),
+            eye: camera.eye(),
+            backface_culling: culling,
+            angle_fade: (89.0, 90.0),
+            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, level: 0 },
+        };
+        let stamp =
+            Stamp { center, normal: Vec3::Y, tangent: Vec3::X, bitangent: Vec3::Z, radius, flow: 1.0, hardness: 0.9, depth: 1.0, seed: 0, source: None };
+        rasterize(&mut canvas, &ctx, &[stamp]);
+        (0..256).flat_map(|y| (0..256).map(move |x| (x, y))).filter(|&(x, y)| from_u16(canvas.alpha.get(x, y)[0]) > 0.01).collect()
+    }
+
+    fn looking_down(pitch_degrees: f32) -> texturecraft_geom::OrbitCamera {
+        texturecraft_geom::OrbitCamera { pitch: pitch_degrees.to_radians(), ..Default::default() }
+    }
+
+    /// A plane seen almost edge-on: every texel of the stamp is in plain view, so the brush must
+    /// paint all of them. The coarse depth buffer used to call many hidden, and strokes painted at
+    /// a steep angle came out in stripes and jagged gaps.
+    #[test]
+    fn a_surface_seen_at_a_grazing_angle_takes_the_whole_stamp() {
+        let plane = primitives::plane(2.0, 8);
+        for pitch in [10.0, 3.0, 1.0] {
+            let all = painted(&plane, &looking_down(pitch), Vec3::ZERO, 0.3, true, false);
+            let seen = painted(&plane, &looking_down(pitch), Vec3::ZERO, 0.3, true, true);
+            assert!(all > 1000, "the stamp covers the plane: {all}");
+            assert_eq!(seen, all, "at {pitch}° every texel the stamp covers is visible");
+        }
+    }
+
+    /// A shelf over half of a floor: under it the brush paints nothing, steep angle or not, while
+    /// the open half takes the stamp.
+    #[test]
+    fn geometry_in_front_still_hides_what_is_behind_it() {
+        let floor = [Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0), Vec3::new(-1.0, 0.0, 1.0)];
+        let shelf = [Vec3::new(-1.0, 0.3, -1.0), Vec3::new(0.0, 0.3, -1.0), Vec3::new(0.0, 0.3, 1.0), Vec3::new(-1.0, 0.3, 1.0)];
+        let uv = |p: Vec3| texturecraft_geom::glam::Vec2::new((p.x + 1.0) / 2.0, (p.z + 1.0) / 2.0);
+        // The shelf maps to one corner point of the texture, so only the floor has texels
+        let uvs = floor.iter().map(|p| uv(*p)).chain([texturecraft_geom::glam::Vec2::ONE; 4]).collect();
+        // Wound to face up (+Y), toward the camera
+        let quads = [0u32, 2, 1, 0, 3, 2];
+        let indices = quads.iter().copied().chain(quads.iter().map(|i| i + 4)).collect();
+        let mesh = Mesh::from_parts(floor.into_iter().chain(shelf).collect(), None, uvs, indices, "m").unwrap();
+        for pitch in [60.0, 30.0] {
+            let camera = looking_down(pitch);
+            let open = Vec3::new(0.5, 0.0, -0.5);
+            assert!(painted(&mesh, &camera, open, 0.2, true, false) > 100, "the stamp covers the open half");
+            assert_eq!(
+                painted(&mesh, &camera, open, 0.2, true, true),
+                painted(&mesh, &camera, open, 0.2, true, false),
+                "the open half takes the stamp at {pitch}°"
+            );
+            let under = Vec3::new(-0.5, 0.0, -0.5);
+            assert!(painted(&mesh, &camera, under, 0.2, true, false) > 100, "the stamp reaches under the shelf");
+            assert_eq!(painted(&mesh, &camera, under, 0.2, true, true), 0, "the shelf hides the floor under it at {pitch}°");
+            // Across the shelf's edge (x = 0, texel column 128) the buffer can't tell the two sides
+            // apart, and the exact test decides: the open side is painted, the side under the shelf isn't
+            let edge = Vec3::new(0.0, 0.0, -0.5);
+            let all = painted_texels(&mesh, &camera, edge, 0.2, true, false);
+            let seen = painted_texels(&mesh, &camera, edge, 0.2, true, true);
+            let open: Vec<_> = all.iter().filter(|t| t.0 >= 129).copied().collect();
+            assert!(open.len() > 100 && all.len() > open.len() + 100, "the stamp straddles the edge");
+            assert!(open.iter().all(|t| seen.contains(t)), "every open texel is painted at {pitch}°");
+            assert!(seen.iter().all(|t| t.0 >= 127), "nothing under the shelf is painted at {pitch}°");
+        }
+    }
+
+    /// A stamp at the far edge of a grazing plane: the pixels beyond the edge are empty, so the
+    /// texels at the edge lie farther than every finite neighbour. They are in plain view, so they
+    /// must still be painted (the buffer can't prove them hidden, the exact test must decide).
+    #[test]
+    fn the_far_edge_of_a_grazing_surface_takes_paint() {
+        let plane = primitives::plane(2.0, 8);
+        for culling in [true, false] {
+            for pitch in [10.0, 3.0, 1.0, -3.0] {
+                if culling && pitch < 0.0 {
+                    continue;
+                }
+                for edge in [Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 0.0, 1.0), Vec3::new(-1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)] {
+                    let all = painted_texels(&plane, &looking_down(pitch), edge, 0.3, culling, false);
+                    let seen = painted_texels(&plane, &looking_down(pitch), edge, 0.3, culling, true);
+                    assert!(all.len() > 200, "the stamp covers part of the plane: {}", all.len());
+                    assert_eq!(seen.len(), all.len(), "edge {edge} at {pitch} degrees (culling {culling}): every texel is in view");
+                }
+            }
+        }
+    }
+
+    /// With backface culling off, a single-sided surface seen from behind still takes paint: the
+    /// exact test starts on the eye's side of the surface, so it doesn't hit the surface itself.
+    #[test]
+    fn a_back_face_with_culling_off_takes_paint() {
+        let plane = primitives::plane(2.0, 8);
+        for pitch in [-45.0, -3.0] {
+            let all = painted(&plane, &looking_down(pitch), Vec3::ZERO, 0.3, false, false);
+            assert!(all > 1000);
+            assert_eq!(painted(&plane, &looking_down(pitch), Vec3::ZERO, 0.3, false, true), all, "from below at {pitch}°");
+        }
+    }
+
+    /// Stamps along a sphere's silhouette, half of each really hidden: the most texels the exact
+    /// ray test has to check. `cargo test --release -p texturecraft-paint --lib -- --ignored benchmark_silhouette --nocapture`
+    #[test]
+    #[ignore = "release performance measurement"]
+    fn benchmark_silhouette_stamps() {
+        let sphere = primitives::sphere(1.0, 256, 128);
+        let bvh = Bvh::new(&sphere);
+        let g = UvGBuffer::new(&sphere, 0, 2048, 2048);
+        let camera = looking_down(0.0);
+        let depth = EyeDepth::render(&sphere, &camera, 960, 540);
+        let ctx = RasterCtx {
+            mesh: &sphere,
+            bvh: &bvh,
+            gbuf: &g,
+            material: 0,
+            depth: Some(&depth),
+            eye: camera.eye(),
+            backface_culling: false,
+            angle_fade: (89.0, 90.0),
+            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, level: 0 },
+        };
+        // The silhouette seen from +Z is the circle z = 0
+        let stamps: Vec<Stamp> = (0..64)
+            .map(|k| {
+                let a = k as f32 / 64.0 * std::f32::consts::TAU;
+                let center = Vec3::new(a.cos(), a.sin(), 0.0);
+                let tangent = Vec3::Z;
+                Stamp {
+                    center,
+                    normal: center,
+                    tangent,
+                    bitangent: center.cross(tangent),
+                    radius: 0.15,
+                    flow: 1.0,
+                    hardness: 0.9,
+                    depth: 1.0,
+                    seed: k,
+                    source: None,
+                }
+            })
+            .collect();
+        let mut times = Vec::new();
+        for _ in 0..9 {
+            let mut canvas = StrokeCanvas::new(2048, 2048);
+            let start = std::time::Instant::now();
+            rasterize(&mut canvas, &ctx, &stamps);
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!("64 silhouette stamps at 2048²: median {:.2} ms, range {:.2}..{:.2} ms", times[4], times[0], times[8]);
+    }
 
     #[test]
     fn one_stamp_on_a_plane_paints_a_disc() {
