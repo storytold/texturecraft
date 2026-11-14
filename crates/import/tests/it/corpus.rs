@@ -1,7 +1,7 @@
 //! Imports of real projects (`TC_IMPORT_CORPUS`, see `common`): every file imports without an error into a valid
 //! project whose locks, placeholders and report agree. Ignored by default; nothing read is kept.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 
