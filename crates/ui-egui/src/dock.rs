@@ -1828,12 +1828,24 @@ fn link_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: LayerId, link:
             app.cook_link(layer);
         }
         if ui.button(tr("Open in MaterialCraft")).clicked() {
-            let path = std::env::temp_dir().join(format!("{}.mcraft", texturecraft_engine::formats::export::sanitize_file_stem(&link.name)));
+            let file = format!("{}.mcraft", texturecraft_engine::formats::export::sanitize_file_stem(&link.name));
             let opened = app
                 .session
                 .link_package(layer)
-                .and_then(|b| std::fs::write(&path, b.as_slice()).map_err(|e| texturecraft_engine::EngineError::Other(e.to_string())))
-                .and_then(|()| texturecraft_engine::link_cmds::open_in_materialcraft(&path));
+                // A folder of its own, so a file or link another user left under the same name in the temp folder is never written through.
+                .and_then(|b| {
+                    // Folders from earlier hand-offs that are over a week old are removed first (MaterialCraft may still be using a young one).
+                    texturecraft_engine::link_cmds::sweep_old_temp_dirs("texturecraft-open", std::time::Duration::from_secs(7 * 24 * 3600));
+                    let dir = texturecraft_engine::link_cmds::private_temp_dir("texturecraft-open")?;
+                    let path = dir.join(file);
+                    if let Err(e) = std::fs::write(&path, b.as_slice()) {
+                        // Do not leave an empty folder (or a partial file) behind.
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return Err(texturecraft_engine::EngineError::Other(e.to_string()));
+                    }
+                    Ok(path)
+                })
+                .and_then(|path| texturecraft_engine::link_cmds::open_in_materialcraft(&path));
             match opened {
                 Ok(()) => app.toast(tr("Opened in MaterialCraft: use File > Send to TextureCraft there to bring your changes back"), false),
                 Err(e) => app.toast(e.to_string(), true),

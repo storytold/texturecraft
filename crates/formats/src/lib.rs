@@ -108,15 +108,72 @@ pub(crate) fn read_capped(path: &std::path::Path, cap: u64) -> Result<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }
 
-/// Write `bytes` to `path` atomically: `<path>.tmp` first, then rename over the target.
+/// A short suffix that is different on every call and hard to guess: process id, a nanosecond clock reading and a counter.
+/// Used to name temporary files and folders so another local user cannot plant a link at the name in advance.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn unique_suffix() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    // Mix in the address of a stack local too (ASLR), so two processes started in the same nanosecond still differ.
+    let local = 0u8;
+    let aslr = std::ptr::addr_of!(local) as usize;
+    format!("{:x}-{:x}-{:x}-{}", std::process::id(), nanos, aslr, COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Write `bytes` to `path` atomically: a sibling temporary file first, then rename over the target.
+///
+/// The temporary file has an unpredictable name (`<path>.<suffix>.tmp`) and is created exclusively
+/// (`create_new`, which never follows a link planted at that name), so a shared folder cannot be used to make the
+/// write land on another file. It is removed again if anything fails.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.tmp", unique_suffix()));
     let tmp = std::path::PathBuf::from(tmp);
-    let res = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path));
+    let res = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes).and_then(|()| f.flush()))
+        .and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     Ok(res?)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod atomic_tests {
+    use super::{unique_suffix, write_atomic};
+
+    /// A file already sitting at the old, predictable `<path>.tmp` name is never written through, and no temporary file is left.
+    #[test]
+    fn write_atomic_ignores_a_planted_predictable_tmp_name() {
+        let dir = std::env::temp_dir().join(format!("tc-write-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"precious").unwrap();
+        // Stand-in for a planted link: a hard link to the victim at the predictable temporary name.
+        std::fs::hard_link(&victim, dir.join("out.bin.tmp")).unwrap();
+        write_atomic(&dir.join("out.bin"), b"new").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "the planted name was written through");
+        assert_eq!(std::fs::read(dir.join("out.bin")).unwrap(), b"new");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().all(|n| !n.ends_with(".tmp") || n == "out.bin.tmp"), "{names:?}");
+        // A failed rename (target is a folder) removes its temporary file.
+        std::fs::create_dir(dir.join("dst")).unwrap();
+        assert!(write_atomic(&dir.join("dst"), b"x").is_err());
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.iter().filter(|n| n.ends_with(".tmp")).count(), 1, "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Suffixes differ on every call.
+    #[test]
+    fn unique_suffixes_differ() {
+        let all: std::collections::HashSet<_> = (0..1000).map(|_| unique_suffix()).collect();
+        assert_eq!(all.len(), 1000);
+    }
 }

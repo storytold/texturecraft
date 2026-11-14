@@ -203,9 +203,6 @@ pub struct LinkJob {
     pub inputs: Vec<(String, Vec<u8>)>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// A MaterialCraft executable: `$<env>`, else next to this program, else `name` on `PATH`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn materialcraft_tool(name: &str, env: &str) -> std::path::PathBuf {
@@ -214,6 +211,65 @@ pub fn materialcraft_tool(name: &str, env: &str) -> std::path::PathBuf {
     }
     let exe = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join(&exe))).filter(|p| p.is_file()).unwrap_or_else(|| exe.into())
+}
+
+/// A new, empty directory under the temp folder, made for this process alone: it is created with
+/// `create_dir` (which fails if anything, such as a link planted by another local user, already
+/// has that name) and, on Unix, readable by its owner only. Names are `<prefix>-<unpredictable suffix>`
+/// (process id, nanosecond clock, address and counter), so they cannot be pre-created ahead of time.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn private_temp_dir(prefix: &str) -> Result<std::path::PathBuf> {
+    private_dir_in(&std::env::temp_dir(), prefix, texturecraft_formats::unique_suffix)
+}
+
+/// [`private_temp_dir`] under `base`, taking each attempt's name suffix from `next`.
+#[cfg(not(target_arch = "wasm32"))]
+fn private_dir_in(base: &std::path::Path, prefix: &str, mut next: impl FnMut() -> String) -> Result<std::path::PathBuf> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    let mut last = None;
+    for _ in 0..64 {
+        let dir = base.join(format!("{prefix}-{}", next()));
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(EngineError::Other(format!("{}: {e}", dir.display()))),
+        }
+    }
+    Err(EngineError::Other(format!("no free temporary folder for {prefix}: {}", last.map(|e| e.to_string()).unwrap_or_default())))
+}
+
+/// Best-effort removal of folders that [`private_temp_dir`] made under the temp folder for `prefix` (named
+/// `<prefix>-…`) and that were last modified at least `max_age` ago; returns how many were removed.
+/// Only real directories with that exact prefix are touched: files, links (never followed) and everything
+/// else are left alone, and any error just skips that entry.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn sweep_old_temp_dirs(prefix: &str, max_age: std::time::Duration) -> usize {
+    sweep_old_dirs_in(&std::env::temp_dir(), prefix, max_age)
+}
+
+/// [`sweep_old_temp_dirs`] under `base`.
+#[cfg(not(target_arch = "wasm32"))]
+fn sweep_old_dirs_in(base: &std::path::Path, prefix: &str, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(base) else { return 0 };
+    let want = format!("{prefix}-");
+    let mut removed = 0;
+    for e in entries.flatten() {
+        if !e.file_name().to_string_lossy().starts_with(&want) {
+            continue;
+        }
+        // `DirEntry::file_type` does not follow links, so a symlink (even to a folder) is not a directory here.
+        if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= max_age);
+        if old && std::fs::remove_dir_all(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// A command for a MaterialCraft executable that opens no console window.
@@ -242,9 +298,7 @@ impl LinkJob {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn run(&self) -> Result<Vec<u8>> {
         let other = |e: String| EngineError::Other(e);
-        let n = NEXT_JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("texturecraft-link-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).map_err(|e| other(format!("{}: {e}", dir.display())))?;
+        let dir = private_temp_dir("texturecraft-link")?;
         let result = (|| {
             let utf8 = |p: &std::path::Path| p.to_str().map(str::to_string).ok_or_else(|| other(format!("{} is not a UTF-8 path", p.display())));
             let write = |name: &str, bytes: &[u8]| {
@@ -448,4 +502,79 @@ fn put_maps(s: &mut Session, stem: &str, maps: &[(Channel, Vec<u8>, texturecraft
         names.push(name);
     }
     names
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::{private_dir_in, private_temp_dir, sweep_old_dirs_in};
+
+    /// Two private temp folders are different, existing and empty.
+    #[test]
+    fn private_temp_dirs_are_new_empty_and_distinct() {
+        let a = private_temp_dir("texturecraft-test").unwrap();
+        let b = private_temp_dir("texturecraft-test").unwrap();
+        assert_ne!(a, b);
+        for d in [&a, &b] {
+            assert!(d.is_dir());
+            assert_eq!(std::fs::read_dir(d).unwrap().count(), 0);
+        }
+        for d in [a, b] {
+            let _ = std::fs::remove_dir(d);
+        }
+    }
+
+    /// Names already taken (a folder, a planted file) are skipped untouched, and no free name is an error.
+    #[test]
+    fn a_taken_name_is_skipped_never_reused() {
+        let base = std::env::temp_dir().join(format!("tc-private-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // Another user's folder (or file) already has the first two names.
+        std::fs::create_dir(base.join("p-0")).unwrap();
+        std::fs::write(base.join("p-1"), b"planted").unwrap();
+        let mut n = 0;
+        let dir = private_dir_in(&base, "p", || {
+            n += 1;
+            format!("{}", n - 1)
+        })
+        .unwrap();
+        assert_eq!(dir, base.join("p-2"));
+        assert_eq!(std::fs::read(base.join("p-1")).unwrap(), b"planted", "the planted file is untouched");
+        // Nothing free at all is an error, not a loop or a panic.
+        assert!(private_dir_in(&base, "p", || "0".to_string()).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The real names are not guessable from the process id and a counter alone.
+    #[test]
+    fn private_temp_names_carry_an_unpredictable_part() {
+        let a = private_temp_dir("texturecraft-test2").unwrap();
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        let _ = std::fs::remove_dir(&a);
+        let parts: Vec<_> = name.strip_prefix("texturecraft-test2-").unwrap().split('-').collect();
+        assert_eq!(parts.len(), 4, "{name}");
+        assert_ne!(parts[1], "0", "clock part");
+    }
+
+    /// The sweep removes only old folders with the exact prefix, and leaves files, other prefixes and young folders.
+    #[test]
+    fn sweep_removes_only_old_folders_with_our_prefix() {
+        use std::time::Duration;
+        let base = std::env::temp_dir().join(format!("tc-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(base.join("texturecraft-open-a")).unwrap();
+        std::fs::write(base.join("texturecraft-open-a/x.mcraft"), b"x").unwrap();
+        std::fs::create_dir(base.join("other-a")).unwrap();
+        std::fs::create_dir(base.join("texturecraft-opened")).unwrap();
+        std::fs::write(base.join("texturecraft-open-file"), b"f").unwrap();
+        // Too young: kept.
+        assert_eq!(sweep_old_dirs_in(&base, "texturecraft-open", Duration::from_secs(3600)), 0);
+        assert!(base.join("texturecraft-open-a/x.mcraft").exists());
+        // Old enough (zero age): only our folder goes.
+        assert_eq!(sweep_old_dirs_in(&base, "texturecraft-open", Duration::ZERO), 1);
+        assert!(!base.join("texturecraft-open-a").exists());
+        assert!(base.join("other-a").is_dir() && base.join("texturecraft-opened").is_dir() && base.join("texturecraft-open-file").is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

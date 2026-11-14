@@ -546,11 +546,16 @@ fn write_materialx(s: &Session, sets: &[usize], opts: &ExportOptions, dir: &std:
     Ok(out)
 }
 
+/// `file.exportMesh`: exports the mesh in the requested format, writing its textures first and then the mesh
+/// file, each atomically, and returns the paths written.
 #[cfg(not(target_arch = "wasm32"))]
 fn export_mesh(s: &mut Session, p: &Value) -> Result<Value> {
     let path = native::path_param(p, "path", "file.exportMesh")?;
     let out = s.mesh_export(path, strp(p, "format"))?;
-    let write = |path: &str, bytes: &[u8]| std::fs::write(path, bytes).map_err(|e| bad("file.exportMesh", format!("cannot write {path}: {e}")));
+    // Atomic, so a full disk or a crash leaves the old file, not half of a new one.
+    let write = |path: &str, bytes: &[u8]| {
+        texturecraft_formats::write_atomic(std::path::Path::new(path), bytes).map_err(|e| bad("file.exportMesh", format!("cannot write {path}: {e}")))
+    };
     let dir = std::path::Path::new(&out.path).parent().unwrap_or(std::path::Path::new(""));
     let mut textures = Vec::new();
     for (name, bytes) in &out.textures {
@@ -688,6 +693,7 @@ f 1/1 2/2 3/3
         assert_eq!(saved.project_id, project, "a reimport stays the same project");
     }
 
+    /// Exports an OBJ by default and a textured GLB, with atomic writes: a rewrite replaces the file, no `.tmp` is left, and an unwritable target is an error.
     #[test]
     fn export_mesh_writes_obj_by_default_and_textured_glb() {
         let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
@@ -722,6 +728,24 @@ f 1/1 2/2 3/3
         // Base color, ORM and normal per texture set.
         assert_eq!(bytes.windows(9).filter(|w| *w == b"image/png").count(), 3 * s.mesh.materials.len());
         assert!(crate::execute(&mut s, "file.exportMesh", &json!({ "path": base, "format": "fbx" })).is_err());
+        // The writes are atomic: no half-written `.tmp` sibling is left, and a rewrite replaces the file.
+        std::fs::write(dir.join("ball.obj"), b"old").unwrap();
+        crate::execute(&mut s, "file.exportMesh", &json!({ "path": base })).unwrap();
+        assert!(std::fs::read_to_string(dir.join("ball.obj")).unwrap().contains("mtllib ball.mtl"), "replaced");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // Atomic means replaced, not written through: a hard link to the old file keeps the old bytes (a plain `std::fs::write` would change them).
+        std::fs::write(dir.join("keep.obj"), b"kept").unwrap();
+        std::fs::remove_file(dir.join("ball.obj")).unwrap();
+        std::fs::hard_link(dir.join("keep.obj"), dir.join("ball.obj")).unwrap();
+        crate::execute(&mut s, "file.exportMesh", &json!({ "path": base })).unwrap();
+        assert_eq!(std::fs::read(dir.join("keep.obj")).unwrap(), b"kept", "the old file was written through");
+        assert!(std::fs::read_to_string(dir.join("ball.obj")).unwrap().contains("mtllib ball.mtl"));
+        // A target that cannot be replaced (a folder) is an error that leaves no `.tmp` behind either.
+        std::fs::remove_file(dir.join("ball.obj")).unwrap();
+        std::fs::create_dir(dir.join("ball.obj")).unwrap();
+        assert!(crate::execute(&mut s, "file.exportMesh", &json!({ "path": base })).is_err());
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
