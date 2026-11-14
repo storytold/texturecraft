@@ -33,6 +33,7 @@ generator, filter and brush alpha names (**KEYS** strings, counted by the
 | Japanese | `ja` | KEYS (100%) | yes | CJK glyphs: craft-fonts (BIZ UDPGothic) or system fonts on desktop | no | full | 2 h (review) |
 | German | `de` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
 | Korean | `ko` | KEYS (100%) | yes | Hangul glyphs: system fonts on desktop (craft-fonts has no Korean face yet) | no | full | 2 h (review) |
+| Hebrew | `he` | KEYS (100%) | yes | Hebrew glyphs: system fonts on desktop (Segoe UI, David, Arial, Tahoma on Windows; SF Hebrew on macOS; Noto Sans Hebrew on Linux); egui orders right to left | no | full | 2 h (review) |
 | Vietnamese | `vi` | 0 | no | Latin with diacritics | no | none | 3 h |
 | Italian | `it` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
 
@@ -41,7 +42,7 @@ user content (layer, texture set, project names), file format and technical name
 RGB, OpenGL, DirectX), and error details that come from the engine (shown after a translated
 "Couldn't …:" prefix).
 
-## Fonts for Chinese, Japanese, Korean and Arabic
+## Fonts for Chinese, Japanese, Korean, Arabic and Hebrew
 
 egui's built-in fonts have no CJK or Arabic glyphs. `crates/ui-egui/src/fonts.rs` adds fallbacks after the
 app's own fonts (Latin text and row heights keep the default font), loading them only when the

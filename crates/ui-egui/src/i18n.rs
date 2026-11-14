@@ -37,7 +37,7 @@ pub struct Language {
     pub english: &'static str,
 }
 
-const COUNT: usize = 10;
+const COUNT: usize = 11;
 
 pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "en", name: "English", english: "English" },
@@ -50,6 +50,7 @@ pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "zh-Hans", name: "简体中文", english: "Chinese (Simplified)" },
     Language { code: "ko", name: "한국어", english: "Korean" },
     Language { code: "ar", name: "العربية", english: "Arabic" },
+    Language { code: "he", name: "עברית", english: "Hebrew" },
 ];
 
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
@@ -108,8 +109,19 @@ pub fn language_for_locale(locale: &str) -> &'static str {
     match lang.as_str() {
         "pt" => "pt-BR",
         "zh" => "zh-Hans",
+        "he" | "iw" => "he",
         l => LANGUAGES.iter().find(|x| x.code == l).map_or("en", |x| x.code),
     }
+}
+
+/// Whether `code` is a right-to-left language ("ar" or "he").
+pub fn is_rtl_code(code: &str) -> bool {
+    matches!(code, "ar" | "he")
+}
+
+/// Whether the current UI language is right-to-left.
+pub fn is_rtl() -> bool {
+    is_rtl_code(current().code)
 }
 
 /// The operating system's (or browser's) UI language, for the first run.
@@ -296,11 +308,24 @@ mod tests",
         assert_eq!(trf("Saved {path}", &[("path", &"a.tcraft")]), "Saved a.tcraft");
         assert_eq!(trf("{a} of {b} {c}", &[("a", &1), ("b", &2)]), "1 of 2 {c}");
         assert_eq!(trf("{unclosed", &[]), "{unclosed");
-        for (locale, code) in
-            [("de-AT", "de"), ("pt_PT.UTF-8", "pt-BR"), ("zh-Hant-TW", "zh-Hans"), ("ja", "ja"), ("ko_KR", "ko"), ("ar-EG", "ar"), ("nl-NL", "en"), ("", "en")]
-        {
+        for (locale, code) in [
+            ("de-AT", "de"),
+            ("pt_PT.UTF-8", "pt-BR"),
+            ("zh-Hant-TW", "zh-Hans"),
+            ("ja", "ja"),
+            ("ko_KR", "ko"),
+            ("ar-EG", "ar"),
+            ("he-IL", "he"),
+            ("iw_IL", "he"),
+            ("nl-NL", "en"),
+            ("", "en"),
+        ] {
             assert_eq!(language_for_locale(locale), code, "{locale}");
         }
+        assert!(is_rtl_code("ar"));
+        assert!(is_rtl_code("he"));
+        assert!(!is_rtl_code("en"));
+        assert!(!is_rtl_code("ja"));
         set_language("de");
         assert_eq!(current().code, if available("de") { "de" } else { "en" });
         assert_eq!(tr("not a key"), "not a key");
