@@ -299,6 +299,18 @@ fn fbx_binary_32_and_64_bit_compressed_or_not() {
 }
 
 /// [`scene`] with a diffuse color on Red and an embedded diffuse texture on Blue.
+#[test]
+fn fbx_camera_models_are_capped_during_import() {
+    let mut nodes = scene(false);
+    let objects = nodes.iter_mut().find(|node| node.name == "Objects").unwrap();
+    for id in 100..199 {
+        objects.children.push(n("Model", vec![P::L(id), P::S("Camera\\u{0}\\u{1}Model"), P::S("Camera")], vec![]));
+    }
+
+    let raw = fbx::read(&binary_fbx(&nodes, 7500, true)).unwrap();
+    assert_eq!(raw.cameras.len(), MAX_CAMERAS);
+}
+
 fn textured_scene(png: &[u8]) -> Vec<N> {
     let mut nodes = scene(false);
     let objects = nodes.iter_mut().find(|n| n.name == "Objects").unwrap();
@@ -413,6 +425,24 @@ fn fbx_ascii_and_z_up() {
     check_fbx_camera(&im);
     check_fbx_scene(&import_mesh_bytes("z.fbx", ascii_fbx(&scene(true)).as_bytes()).unwrap().mesh, true);
     check_fbx_scene(&import_mesh_bytes("z.fbx", &binary_fbx(&scene(true), 7700, true)).unwrap().mesh, true);
+}
+
+#[test]
+fn fbx_duplicate_geometry_connections_do_not_duplicate_instances() {
+    let mut nodes = scene(false);
+    let connections = nodes.iter_mut().find(|node| node.name == "Connections").unwrap();
+    for _ in 0..50 {
+        connections.children.push(n("C", vec![P::S("OO"), P::L(10), P::L(21)], vec![]));
+    }
+    let imported = import_mesh_bytes("scene.fbx", ascii_fbx(&nodes).as_bytes()).unwrap();
+    assert_eq!(imported.report.triangles, 3);
+
+    let objects = nodes.iter_mut().find(|node| node.name == "Objects").unwrap();
+    objects.children.push(n("Model", vec![P::L(22), P::S("Other\u{0}\u{1}Model"), P::S("Mesh")], vec![]));
+    let connections = nodes.iter_mut().find(|node| node.name == "Connections").unwrap();
+    connections.children.push(n("C", vec![P::S("OO"), P::L(10), P::L(22)], vec![]));
+    let imported = import_mesh_bytes("scene.fbx", ascii_fbx(&nodes).as_bytes()).unwrap();
+    assert_eq!(imported.report.triangles, 6, "a different model must remain a distinct instance");
 }
 
 /// The scene of [`scene`] (Y up) as FBX 6.1 writes it: geometry inside the Model, objects named
@@ -589,25 +619,64 @@ fn fbx_old_versions_and_garbage_are_errors() {
     assert!(import_mesh_bytes("h.fbx", &huge).is_err());
 }
 
+// Keep these fixtures independently schedulable: one serial test took 24 minutes in
+// instrumented coverage. Splitting cases keeps every mutation and assertion intact.
 #[test]
-fn malformed_fbx_and_dae_never_panic() {
+fn malformed_fbx_and_dae_never_panic_binary_7400() {
     hammer("x.fbx", &binary_fbx(&scene(false), 7400, false));
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_binary_7500() {
     hammer("x.fbx", &binary_fbx(&scene(true), 7500, true));
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_ascii() {
     hammer("x.fbx", ascii_fbx(&scene(false)).as_bytes());
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_collada() {
     hammer("x.dae", DAE.as_bytes());
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_random_binary() {
+    random_scene_corruptions(0);
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_random_ascii() {
+    random_scene_corruptions(1);
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_random_collada() {
+    random_scene_corruptions(2);
+}
+
+fn random_scene_corruptions(selected_fixture: usize) {
     // Random multi-byte corruptions (a fixed LCG keeps failures reproducible).
     let mut seed = 0x2545_f491_4f6c_dd1du64;
     let mut next = move || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (seed >> 33) as usize
     };
-    for good in [binary_fbx(&scene(false), 7500, true), ascii_fbx(&scene(true)).into_bytes(), DAE.as_bytes().to_vec()] {
+    // Replay earlier mutations without parsing them so each fixture receives exactly
+    // its original LCG stream, not a fresh seed. Fixture sizes and all 1,500 cases
+    // per fixture stay unchanged; generating these bytes is cheap next to parsing.
+    let fixtures = [binary_fbx(&scene(false), 7500, true), ascii_fbx(&scene(true)).into_bytes(), DAE.as_bytes().to_vec()];
+    for (fixture, good) in fixtures.into_iter().enumerate().take(selected_fixture + 1) {
         let name = if good.starts_with(b"<?xml") { "r.dae" } else { "r.fbx" };
         for _ in 0..1500 {
             let mut b = good.clone();
             for _ in 0..1 + next() % 4 {
                 let i = next() % b.len();
                 b[i] = next() as u8;
+            }
+            if fixture != selected_fixture {
+                continue;
             }
             if let Err(e) = import_mesh_bytes(name, &b) {
                 assert!(!e.to_string().contains("parser failed"), "{name}: a parser panicked");

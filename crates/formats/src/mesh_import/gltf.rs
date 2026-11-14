@@ -20,8 +20,34 @@ pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
     crate::guard(KIND, || read_inner(bytes))
 }
 
+/// Loads and validates the document like `gltf::Gltf::from_slice`, except that a scene without a
+/// `nodes` array is an empty scene. The `gltf` crate declares the field as required, but the
+/// glTF 2.0 schema lists no required properties for a scene, and exporters write such scenes
+/// for scenes that contain no objects.
+fn parse(bytes: &[u8]) -> Result<(gltf::Document, Option<Vec<u8>>)> {
+    let (json, blob) = if bytes.starts_with(b"glTF") {
+        let mut glb = gltf::Glb::from_slice(bytes).map_err(|e| malformed(KIND, e))?;
+        let blob = glb.bin.take().map(std::borrow::Cow::into_owned);
+        (glb.json.into_owned(), blob)
+    } else {
+        (bytes.to_vec(), None)
+    };
+    let mut value: serde_json::Value = serde_json::from_slice(&json).map_err(|e| malformed(KIND, e))?;
+    if let Some(scenes) = value.get_mut("scenes").and_then(serde_json::Value::as_array_mut) {
+        for scene in scenes {
+            if let Some(scene) = scene.as_object_mut() {
+                scene.entry("nodes").or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            }
+        }
+    }
+    let json = serde_json::to_vec(&value).map_err(|e| malformed(KIND, e))?;
+    let root = gltf::json::Root::from_slice(&json).map_err(|e| malformed(KIND, e))?;
+    let document = gltf::Document::from_json(root).map_err(|e| malformed(KIND, e))?;
+    Ok((document, blob))
+}
+
 fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
-    let gltf::Gltf { document, blob } = gltf::Gltf::from_slice(bytes).map_err(|e| malformed(KIND, e))?;
+    let (document, blob) = parse(bytes)?;
     check_buffer_uris(&document)?;
     let buffers = gltf::import_buffers(&document, None, blob).map_err(|e| match e {
         gltf::Error::ExternalReferenceInSliceImport => FormatError::Unsupported(

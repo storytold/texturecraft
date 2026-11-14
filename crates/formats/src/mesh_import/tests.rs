@@ -118,6 +118,48 @@ fn glb_two_materials_mirrored_node() {
     m.validate().unwrap();
 }
 
+/// A scene without a `nodes` array is legal glTF (Blender writes one for a scene with no exported
+/// objects); it must not stop the default scene from importing.
+#[test]
+fn gltf_scene_without_nodes_imports_the_default_scene() {
+    let mut json: serde_json::Value = serde_json::from_slice(&embedded_gltf()).unwrap();
+    json["scenes"] = serde_json::json!([{ "name": "EmptyReviewScene" }, { "nodes": [0] }]);
+    json["scene"] = 1.into();
+    let im = import_mesh_bytes("scene.gltf", &serde_json::to_vec(&json).unwrap()).unwrap();
+    assert_eq!(im.report.triangles, 2);
+    // Only an empty scene: nothing to import, but a clear error rather than a parse failure.
+    json["scenes"] = serde_json::json!([{ "name": "EmptyReviewScene" }]);
+    json["scene"] = 0.into();
+    let err = import_mesh_bytes("scene.gltf", &serde_json::to_vec(&json).unwrap()).unwrap_err();
+    assert!(!err.to_string().contains("missing field"), "{err}");
+}
+
+#[test]
+fn glb_scene_without_nodes_keeps_binary_mesh_in_default_scene() {
+    let original = glb(true, true);
+    let jlen = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
+    let mut json: serde_json::Value = serde_json::from_slice(&original[20..20 + jlen]).unwrap();
+    json["scenes"] = serde_json::json!([{ "name": "EmptyReviewScene" }, { "nodes": [0] }]);
+    json["scene"] = 1.into();
+    let mut js = serde_json::to_vec(&json).unwrap();
+    while !js.len().is_multiple_of(4) {
+        js.push(b' ');
+    }
+    let bin_chunk = &original[20 + jlen..];
+    let mut glb = Vec::new();
+    glb.extend(b"glTF");
+    glb.extend(2u32.to_le_bytes());
+    glb.extend(((20 + js.len() + bin_chunk.len()) as u32).to_le_bytes());
+    glb.extend((js.len() as u32).to_le_bytes());
+    glb.extend(b"JSON");
+    glb.extend(js);
+    glb.extend(bin_chunk);
+    let im = import_mesh_bytes("scene.glb", &glb).unwrap();
+    assert_eq!(im.report.triangles, 2);
+    assert_eq!(im.mesh.materials, ["Red", "Material_1"]);
+    assert_outward(&im.mesh);
+}
+
 #[test]
 fn gltf_embedded_buffers_and_missing_attributes() {
     let im = import_mesh_bytes("scene.gltf", &embedded_gltf()).unwrap();

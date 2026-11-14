@@ -125,8 +125,9 @@ fn store(curvature: &Arc<Vec<f32>>, key: CacheKey, scales: &BlockScales, sizes: 
         sizes
     };
 
-    // One layout per curvature map, with the most recently used map at the end
-    cache.retain(|(source, ..)| source.strong_count() > 0 && !std::ptr::eq(source.as_ptr(), Arc::as_ptr(curvature)));
+    // Keep distinct layouts: thumbnails and the viewport alternate on the same bake.
+    // Replacing only this variant prevents them from repeatedly rebuilding each other.
+    cache.retain(|entry| entry.0.strong_count() > 0 && !is_entry_for(entry, curvature, key, scales));
     let sizes = Arc::new(sizes);
     cache.push((Arc::downgrade(curvature), key, scales.clone(), sizes.clone()));
     trim_cache(&mut cache, CACHE_BYTES);
@@ -338,6 +339,7 @@ mod tests {
 
     #[test]
     fn unused_maps_are_evicted_even_while_undo_keeps_the_sources_alive() {
+        let _guard = CACHE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let sources: Vec<_> = (0..=CACHE_MAPS).map(|_| Arc::new(vec![0.5; 16])).collect();
         let scales = BlockScales::default();
         let key = ((4, 4), (4, 4), (4, 4));
@@ -408,18 +410,46 @@ mod tests {
         }
     }
 
+    // Cache lifecycle tests must not evict each other's entries in parallel.
+    static CACHE_TESTS: Mutex<()> = Mutex::new(());
+
     #[test]
-    fn a_new_layout_replaces_the_sizes_of_the_old_one() {
+    fn alternating_layouts_reuse_their_cached_sizes() {
+        let _guard = CACHE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let curvature = Arc::new(vec![0.5; 16]);
         let scales = BlockScales::default();
-        let entries_for_curvature = || {
-            let cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.iter().filter(|(source, ..)| std::ptr::eq(source.as_ptr(), Arc::as_ptr(&curvature))).count()
-        };
+        let viewport_key = ((4, 4), (4, 4), (4, 4));
+        let thumbnail_key = ((4, 4), (4, 4), (2, 2));
+        let viewport = store(&curvature, viewport_key, &scales, CurvatureSizes { levels: Vec::new() });
+        let thumbnail = store(&curvature, thumbnail_key, &scales, CurvatureSizes { levels: Vec::new() });
 
-        store(&curvature, ((4, 4), (4, 4), (4, 4)), &scales, CurvatureSizes { levels: Vec::new() });
-        store(&curvature, ((4, 4), (2, 2), (8, 8)), &scales, CurvatureSizes { levels: Vec::new() });
-        assert_eq!(entries_for_curvature(), 1, "only the latest layout of a curvature map stays cached");
+        assert!(Arc::ptr_eq(&cached(&curvature, viewport_key, &scales).unwrap(), &viewport), "a thumbnail must not evict the viewport layout");
+        assert!(Arc::ptr_eq(&cached(&curvature, thumbnail_key, &scales).unwrap(), &thumbnail), "both layouts stay reusable");
+        let mut set = texturecraft_core::TextureSet::new("Tiles", 0, 4);
+        set.uv_tiles = vec![1001, 1002];
+        set.tile_resolutions.insert(1002, 2);
+        let scaled = set.block_scales();
+        assert_ne!(scaled, scales);
+        assert!(cached(&curvature, viewport_key, &scaled).is_none(), "different tile scales cannot read the unscaled result");
+        let scaled_sizes = store(&curvature, viewport_key, &scaled, CurvatureSizes { levels: Vec::new() });
+        assert!(Arc::ptr_eq(&cached(&curvature, viewport_key, &scaled).unwrap(), &scaled_sizes));
+        assert!(Arc::ptr_eq(&cached(&curvature, viewport_key, &scales).unwrap(), &viewport), "scale variants also coexist");
+        let replacement = store(&curvature, viewport_key, &scales, CurvatureSizes { levels: Vec::new() });
+        assert!(Arc::ptr_eq(&cached(&curvature, viewport_key, &scales).unwrap(), &replacement));
+        assert!(Arc::ptr_eq(&cached(&curvature, thumbnail_key, &scales).unwrap(), &thumbnail), "updating one layout keeps the other");
+    }
+
+    #[test]
+    fn layout_variants_obey_the_entry_limit() {
+        let _guard = CACHE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let curvature = Arc::new(vec![0.5; 16]);
+        let scales = BlockScales::default();
+        let key = |size| ((4, 4), (4, 4), (size, size));
+        for size in 1..=CACHE_MAPS as u32 + 1 {
+            store(&curvature, key(size), &scales, CurvatureSizes { levels: Vec::new() });
+        }
+        assert!(cached(&curvature, key(1), &scales).is_none(), "layout variants cannot grow without bound");
+        assert!(cached(&curvature, key(CACHE_MAPS as u32 + 1), &scales).is_some(), "the newest layout stays cached");
     }
 
     #[test]

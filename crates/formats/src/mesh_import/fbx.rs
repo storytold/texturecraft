@@ -32,6 +32,8 @@ const MIN_VERSION: i64 = 6000;
 const MAX_DEPTH: usize = 64;
 /// Memory budget for parsed nodes and properties (arrays are held as f64).
 const MAX_DECODED_BYTES: usize = 1 << 31;
+/// Maximum control points transformed across all mesh instances in one import.
+const MAX_INSTANCE_POINTS: usize = 200_000_000;
 /// Approximate memory charged per node and per scalar property.
 const NODE_COST: usize = 96;
 const PROP_COST: usize = 32;
@@ -128,14 +130,15 @@ impl Node {
         if let Some(a) = self.child("a") {
             return a.arr();
         }
-        Cow::Owned(self.props.iter().filter_map(Prop::num).collect())
+        Cow::Owned(self.props.iter().map(|p| p.num().unwrap_or(f64::NAN)).collect())
     }
 
     /// The numbers of entry `name` in Properties70 (`P: name, type, subtype, flags, values`) or
     /// Properties60 (`Property: name, type, flags, values`).
     fn property(&self, name: &str) -> Option<Vec<f64>> {
         let list = self.child("Properties70").or_else(|| self.child("Properties60"))?;
-        list.children.iter().find(|p| p.str_at(0) == name).map(|p| p.props.iter().filter_map(Prop::num).collect())
+        let first_value = if list.name == "Properties70" { 4 } else { 3 };
+        list.children.iter().find(|p| p.str_at(0) == name).map(|p| p.props.iter().skip(first_value).map(|v| v.num().unwrap_or(f64::NAN)).collect())
     }
 
     fn vec3(&self, name: &str, default: Vec3) -> Vec3 {
@@ -542,6 +545,9 @@ fn read_inner(bytes: &[u8], files: &mut Files) -> Result<RawMesh> {
             attribute_of.insert(parent, *a);
         }
     }
+    // Repeated connections describe the same instance; keep distinct model placements in order.
+    let mut seen_instances = HashSet::new();
+    instances.retain(|instance| seen_instances.insert(instance.clone()));
     let placed: HashSet<&String> = instances.iter().map(|(g, _)| g).collect();
     let mut unplaced: Vec<String> = geometries.keys().filter(|g| !placed.contains(g)).cloned().collect();
     unplaced.sort_unstable();
@@ -550,6 +556,7 @@ fn read_inner(bytes: &[u8], files: &mut Files) -> Result<RawMesh> {
     let base_colors = base_colors(&materials, &textures, &videos, &connections, files);
     let global = global_transform(root("GlobalSettings").or_else(|| objects.child("GlobalSettings")));
     let mut sink = PolygonSink::default();
+    let mut remaining_points = MAX_INSTANCE_POINTS;
     let no_slots = Vec::new();
     for (geom, model) in instances {
         let Some(g) = geometries.get(&geom) else { continue };
@@ -564,12 +571,15 @@ fn read_inner(bytes: &[u8], files: &mut Files) -> Result<RawMesh> {
             }
         };
         let names = model.as_ref().and_then(|m| slots.get(m)).unwrap_or(&no_slots);
-        add_geometry(&mut sink, g, global * m, names)?;
+        add_geometry(&mut sink, g, global * m, names, &mut remaining_points)?;
     }
     let mut raw = sink.finish();
     raw.base_colors = base_colors;
     // In file order; FBX 6's built-in "Producer" views are not the scene's cameras.
     for o in objects.children.iter().filter(|o| o.name == "Model" && o.class() == "Camera" && !o.object_name().starts_with("Producer ")) {
+        if raw.cameras.len() >= super::MAX_CAMERAS {
+            break;
+        }
         let Some(id) = o.id_at(0) else { continue };
         if let Ok(m) = world(&models, &parents, &id) {
             raw.cameras.push(camera(o, attribute_of.get(&id).copied().unwrap_or(o), global * m));
@@ -783,14 +793,25 @@ impl Layer<'_> {
     }
 }
 
-fn add_geometry(sink: &mut PolygonSink, geometry: &Node, transform: Mat4, slots: &[String]) -> Result<()> {
+fn add_geometry(sink: &mut PolygonSink, geometry: &Node, transform: Mat4, slots: &[String], remaining_points: &mut usize) -> Result<()> {
     let vertices = geometry.child("Vertices").map(Node::arr).unwrap_or_default();
     check_vertices(vertices.len() / 3)?;
+    *remaining_points = remaining_points
+        .checked_sub(vertices.len() / 3)
+        .ok_or_else(|| FormatError::TooLarge(format!("FBX instances exceed the {MAX_INSTANCE_POINTS} control-point work limit")))?;
     let points: Vec<Vec3> = vertices.as_chunks::<3>().0.iter().map(|c| transform.transform_point3(Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32))).collect();
     let polygon_indices = geometry.child("PolygonVertexIndex").map(Node::arr).unwrap_or_default();
     let normals = Layer::read(geometry, "LayerElementNormal", "Normals", "NormalsIndex");
     let uvs = Layer::read(geometry, "LayerElementUV", "UV", "UVIndex");
     let materials = Layer::read(geometry, "LayerElementMaterial", "Materials", "");
+    if vertices.iter().chain(polygon_indices.iter()).any(|v| !v.is_finite())
+        || [&normals, &uvs, &materials]
+            .into_iter()
+            .flatten()
+            .any(|layer| layer.data.iter().any(|v| !v.is_finite()) || layer.index.as_ref().is_some_and(|index| index.iter().any(|v| !v.is_finite())))
+    {
+        return Err(malformed(KIND, "mesh array contains a non-numeric or non-finite value"));
+    }
     let normal_transform = Mat3::from_mat4(transform).inverse().transpose();
     let flip = transform.determinant() < 0.0;
     let (mut corners, mut polygon_index, mut bad_normals, mut bad_uvs) = (Vec::new(), 0usize, 0usize, 0usize);
@@ -838,4 +859,98 @@ fn add_geometry(sink: &mut PolygonSink, geometry: &Node, transform: Mat4, slots:
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod instance_budget_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_array_keeps_invalid_values_in_place() {
+        let (nodes, _) = parse_ascii(
+            br#"FBXHeaderExtension: { FBXVersion: 7400 }
+Vertices: 1, 1.#INF, 3, "x", 5
+"#,
+        )
+        .unwrap();
+        let values = nodes[1].arr();
+        assert_eq!(values.len(), 5);
+        assert!(values[1].is_nan() && values[3].is_nan());
+        assert_eq!((values[0], values[2], values[4]), (1.0, 3.0, 5.0));
+    }
+
+    #[test]
+    fn ascii_bad_vertex_is_rejected() {
+        let (nodes, _) = parse_ascii(
+            br#"FBXHeaderExtension: { FBXVersion: 7400 }
+Geometry: { Vertices: 0, 0, 0, 1, -1.#IND, 0, 0, 1, 0
+PolygonVertexIndex: 0, 1, -3 }
+"#,
+        )
+        .unwrap();
+        let mut remaining = usize::MAX;
+        let result = add_geometry(&mut PolygonSink::default(), &nodes[1], Mat4::IDENTITY, &[], &mut remaining);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ascii_bad_index_and_uv_are_rejected() {
+        for payload in [
+            "PolygonVertexIndex: 0, oops, -3",
+            "PolygonVertexIndex: 0, 1, -3\nLayerElementUV: 0 { MappingInformationType: \"ByPolygonVertex\"\nReferenceInformationType: \"Direct\"\nUV: 0, 0, oops, 1, 1, 0 }",
+        ] {
+            let source = format!("FBXHeaderExtension: {{ FBXVersion: 7400 }}\nGeometry: {{ Vertices: 0, 0, 0, 1, 0, 0, 0, 1, 0\n{payload} }}");
+            let (nodes, _) = parse_ascii(source.as_bytes()).unwrap();
+            let mut remaining = usize::MAX;
+            assert!(add_geometry(&mut PolygonSink::default(), &nodes[1], Mat4::IDENTITY, &[], &mut remaining).is_err());
+        }
+    }
+
+    #[test]
+    fn ascii_transform_metadata_does_not_shift_values() {
+        let (nodes, _) = parse_ascii(
+            br#"FBXHeaderExtension: { FBXVersion: 7400 }
+Model: { Properties70: { P: "Lcl Translation", "Lcl Translation", "", "A", 1, 2, 3 } }
+"#,
+        )
+        .unwrap();
+        assert_eq!(nodes[1].property("Lcl Translation"), Some(vec![1.0, 2.0, 3.0]));
+        let (nodes, _) = parse_ascii(
+            br#"FBXHeaderExtension: { FBXVersion: 7400 }
+Model: { Properties60: { Property: "Lcl Translation", "Lcl Translation", "A", 1, 2, 3 } }
+"#,
+        )
+        .unwrap();
+        assert_eq!(nodes[1].property("Lcl Translation"), Some(vec![1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn malformed_transform_value_keeps_its_position_in_both_property_formats() {
+        for (list, entry) in [
+            ("Properties70", "P: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\", 1, oops, 3"),
+            ("Properties60", "Property: \"Lcl Translation\", \"Lcl Translation\", \"A\", 1, oops, 3"),
+        ] {
+            let source = format!("FBXHeaderExtension: {{ FBXVersion: 7400 }}\nModel: {{ {list}: {{ {entry} }} }}");
+            let (nodes, _) = parse_ascii(source.as_bytes()).unwrap();
+            let values = nodes[1].property("Lcl Translation").unwrap();
+            assert_eq!(values.len(), 3);
+            assert_eq!((values[0], values[2]), (1.0, 3.0));
+            assert!(values[1].is_nan());
+        }
+    }
+
+    #[test]
+    fn instance_points_are_charged_before_transforming_each_copy() {
+        let geometry = Node {
+            name: "Geometry".into(),
+            props: vec![],
+            children: vec![Node { name: "Vertices".into(), props: vec![Prop::Arr(vec![0.0; 9])], children: vec![] }],
+        };
+        let mut sink = PolygonSink::default();
+        let mut remaining = 5;
+        add_geometry(&mut sink, &geometry, Mat4::IDENTITY, &[], &mut remaining).unwrap();
+        assert_eq!(remaining, 2);
+        assert!(matches!(add_geometry(&mut sink, &geometry, Mat4::IDENTITY, &[], &mut remaining), Err(FormatError::TooLarge(_))));
+        assert_eq!(remaining, 2);
+    }
 }
