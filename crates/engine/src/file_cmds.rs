@@ -349,6 +349,7 @@ mod native {
             let pf = texturecraft_formats::load_project(p).map_err(fe)?;
             let mut s = Session::from_project_file(pf)?;
             s.path = Some(path.to_string());
+            s.doc.project.project_file = stem_of(path);
             s.modified = false;
             Ok(s)
         } else {
@@ -362,6 +363,9 @@ mod native {
 
     pub fn save_to(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
         let path = if ext_of(path) == PROJECT_EXT { path.to_string() } else { format!("{path}.{PROJECT_EXT}") };
+        if adopt {
+            s.doc.project.project_file = stem_of(&path);
+        }
         texturecraft_formats::save_project(Path::new(&path), &s.project_file()).map_err(fe)?;
         if adopt {
             s.path = Some(path.clone());
