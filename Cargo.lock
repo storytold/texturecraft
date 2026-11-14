@@ -4512,6 +4512,7 @@ dependencies = [
  "harfrust",
  "rayon",
  "serde",
+ "serde_json",
  "skrifa 0.44.0",
  "texturecraft-compose",
  "texturecraft-core",
