@@ -758,7 +758,7 @@ dependencies = [
 [[package]]
 name = "craft-dialogs"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=6e03f65bf45181db77ba6229716e6624db9eb25b#6e03f65bf45181db77ba6229716e6624db9eb25b"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
 dependencies = [
  "block2 0.6.2",
  "objc2 0.6.5",
@@ -771,12 +771,12 @@ dependencies = [
 [[package]]
 name = "craft-fonts-build"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=6e03f65bf45181db77ba6229716e6624db9eb25b#6e03f65bf45181db77ba6229716e6624db9eb25b"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
 
 [[package]]
 name = "craft-i18n"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=6e03f65bf45181db77ba6229716e6624db9eb25b#6e03f65bf45181db77ba6229716e6624db9eb25b"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
 dependencies = [
  "fixed_decimal",
  "icu_decimal",
@@ -799,7 +799,7 @@ dependencies = [
 [[package]]
 name = "craft-keymap"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=6e03f65bf45181db77ba6229716e6624db9eb25b#6e03f65bf45181db77ba6229716e6624db9eb25b"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
 dependencies = [
  "egui",
  "serde",
@@ -807,9 +807,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-materialx"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
+dependencies = [
+ "craft-xml",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "craft-menu"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=6e03f65bf45181db77ba6229716e6624db9eb25b#6e03f65bf45181db77ba6229716e6624db9eb25b"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
 dependencies = [
  "craft-keymap",
  "craft-quit",
@@ -820,9 +829,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-mesh"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=d6ed8c20f12188c1f39c89b3a8436bd0d09c3748#d6ed8c20f12188c1f39c89b3a8436bd0d09c3748"
+
+[[package]]
 name = "craft-quit"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=6e03f65bf45181db77ba6229716e6624db9eb25b#6e03f65bf45181db77ba6229716e6624db9eb25b"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
 dependencies = [
  "dispatch2",
  "egui",
@@ -833,7 +847,7 @@ dependencies = [
 [[package]]
 name = "craft-ui"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=6e03f65bf45181db77ba6229716e6624db9eb25b#6e03f65bf45181db77ba6229716e6624db9eb25b"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
 dependencies = [
  "craft-fonts-build",
  "craft-i18n",
@@ -854,7 +868,7 @@ dependencies = [
 [[package]]
 name = "craft-update"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=6e03f65bf45181db77ba6229716e6624db9eb25b#6e03f65bf45181db77ba6229716e6624db9eb25b"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
 dependencies = [
  "chrono",
  "dunce",
@@ -881,12 +895,21 @@ dependencies = [
 [[package]]
 name = "craft-window"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=6e03f65bf45181db77ba6229716e6624db9eb25b#6e03f65bf45181db77ba6229716e6624db9eb25b"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
 dependencies = [
  "egui",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "wayland-client",
+]
+
+[[package]]
+name = "craft-xml"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=b8f70b46ee0c5fbfd552cbe2a4dae68652519153#b8f70b46ee0c5fbfd552cbe2a4dae68652519153"
+dependencies = [
+ "quick-xml 0.41.0",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4369,6 +4392,8 @@ name = "texturecraft-formats"
 version = "0.6.1"
 dependencies = [
  "base64 0.22.1",
+ "craft-materialx",
+ "craft-mesh",
  "exr",
  "flate2",
  "gltf",

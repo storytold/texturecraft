@@ -1,20 +1,7 @@
-//! MaterialX documents for exported texture sets, written from the ASWF MaterialX specification
-//! (version 1.39) and the OpenPBR Surface specification. Pure Rust: no MaterialX library is
-//! linked, and nothing is read from any other application.
+//! TextureCraft's MaterialX export adapter.
 //!
-//! [`write`] takes a material's name and the texture files an export produced, each tagged with
-//! the OpenPBR input it feeds, and gives the text of a `.mtlx` file: an `open_pbr_surface` shader
-//! whose inputs read `tiledimage` nodes, wrapped in a `surfacematerial`. The inputs are the ones
-//! the built-in "OpenPBR (separate maps)" export preset writes ([`INPUTS`]); `height` becomes a
-//! `displacement` shader on the material and `geometry_normal` goes through a `normalmap` node
-//! (OpenGL, +Y up, which is what that node expects).
-//!
-//! Colour textures (base, fuzz and emission colour) are tagged with the colour space they were
-//! exported in ([`colorspace_name`]); every data map is left untagged (linear). UDIM sets write the `<UDIM>` filename token MaterialX defines.
-//! Texture file names are relative to the document.
-
-use std::collections::HashSet;
-use std::fmt::Write as _;
+//! The shared `craft-materialx` crate owns the MaterialX document writer. This module maps the
+//! built-in preset's map names and TextureCraft color spaces to that format-level API.
 
 use texturecraft_texel::ColorSpace;
 
@@ -51,7 +38,6 @@ pub const INPUTS: &[(&str, Kind)] = &[
     ("height", Kind::Height),
 ];
 
-/// The file-name prefix of the built-in OpenPBR preset's maps.
 const PREFIX: &str = "$mesh_$textureSet_";
 
 /// One exported texture: the OpenPBR input it feeds and the file (relative to the `.mtlx`).
@@ -59,14 +45,11 @@ const PREFIX: &str = "$mesh_$textureSet_";
 pub struct Texture {
     pub input: String,
     pub file: String,
-    /// The MaterialX colour space of the file's values (`srgb_texture`, `lin_rec709`, ...);
-    /// used for colour inputs only, data maps are always linear.
+    /// The MaterialX colour space of the file's values; used for color inputs only.
     pub colorspace: &'static str,
 }
 
-/// The MaterialX colour space of colour maps written in `space`. MaterialX 1.39 defines no
-/// ACES2065-1 (AP0) space: it gets `lin_ap0_scene`, its name in later versions of the
-/// specification, which 1.39 readers may not know.
+/// The MaterialX colour space of colour maps written in `space`.
 pub fn colorspace_name(space: ColorSpace) -> &'static str {
     match space {
         ColorSpace::Srgb => "srgb_texture",
@@ -76,116 +59,28 @@ pub fn colorspace_name(space: ColorSpace) -> &'static str {
     }
 }
 
-/// The OpenPBR input a preset map's file template feeds (`$mesh_$textureSet_base_color` →
-/// `base_color`), or None for templates this module has no place for.
+/// The OpenPBR input a preset map's file template feeds, or None for unsupported templates.
 pub fn input_of_template(template: &str) -> Option<&'static str> {
     let suffix = template.strip_prefix(PREFIX)?;
-    INPUTS.iter().find(|(n, _)| *n == suffix).map(|(n, _)| *n)
-}
-
-fn kind_of(input: &str) -> Option<Kind> {
-    INPUTS.iter().find(|(n, _)| *n == input).map(|(_, k)| *k)
+    INPUTS.iter().find(|(name, _)| *name == suffix).map(|(name, _)| *name)
 }
 
 /// A MaterialX name: letters, digits and underscores, not starting with a digit.
-pub fn node_name(s: &str) -> String {
-    let mut out: String = s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+pub fn node_name(name: &str) -> String {
+    let mut out: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
     if out.is_empty() || out.starts_with(|c: char| c.is_ascii_digit()) {
         out.insert(0, '_');
     }
     out
 }
 
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            c if c.is_control() => out.push(' '),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn image_name(input: &str) -> String {
-    format!("image_{}", node_name(input))
-}
-
-/// The text of a MaterialX document for `name` with the given textures. `physical_size_cm` goes
-/// into the material's `doc` attribute. Inputs this module has no place for are skipped, and so
-/// are repeats of one input (the first wins).
+/// The text of a MaterialX OpenPBR document for `name` and the given texture files.
 pub fn write(name: &str, textures: &[Texture], physical_size_cm: Option<[f32; 2]>) -> String {
-    let base = node_name(name);
-    let mut seen = HashSet::new();
-    let tex: Vec<(&Texture, Kind)> = textures.iter().filter_map(|t| kind_of(&t.input).map(|k| (t, k))).filter(|(t, _)| seen.insert(t.input.as_str())).collect();
-    let has = |i: &str| tex.iter().any(|(t, _)| t.input == i);
-    let mut x = String::new();
-    let _ = writeln!(x, "<?xml version=\"1.0\"?>");
-    let _ = writeln!(x, "<materialx version=\"1.39\" colorspace=\"lin_rec709\">");
-
-    let shader = format!("OPBR_{base}");
-    let _ = writeln!(x, "  <open_pbr_surface name=\"{}\" type=\"surfaceshader\">", esc(&shader));
-    for (t, kind) in &tex {
-        let (ty, node) = match kind {
-            Kind::Color => ("color3", image_name(&t.input)),
-            Kind::Float => ("float", image_name(&t.input)),
-            Kind::Normal => ("vector3", "normalmap".to_owned()),
-            Kind::Height => continue,
-        };
-        let _ = writeln!(x, "    <input name=\"{}\" type=\"{ty}\" nodename=\"{node}\" />", t.input);
-    }
-    if has("emission_color") {
-        let _ = writeln!(x, "    <input name=\"emission_luminance\" type=\"float\" value=\"1\" />");
-    }
-    let _ = writeln!(x, "  </open_pbr_surface>");
-
-    for (t, kind) in &tex {
-        let (ty, space) = match kind {
-            Kind::Color => ("color3", Some(t.colorspace)),
-            Kind::Normal => ("vector3", None),
-            Kind::Float | Kind::Height => ("float", None),
-        };
-        let node = image_name(&t.input);
-        let _ = writeln!(x, "  <tiledimage name=\"{node}\" type=\"{ty}\">");
-        match space {
-            Some(space) => {
-                let _ = writeln!(x, "    <input name=\"file\" type=\"filename\" value=\"{}\" colorspace=\"{space}\" />", esc(&t.file));
-            }
-            None => {
-                let _ = writeln!(x, "    <input name=\"file\" type=\"filename\" value=\"{}\" />", esc(&t.file));
-            }
-        }
-        let _ = writeln!(x, "  </tiledimage>");
-    }
-    if has("geometry_normal") {
-        let _ = writeln!(x, "  <normalmap name=\"normalmap\" type=\"vector3\">");
-        let _ = writeln!(x, "    <input name=\"in\" type=\"vector3\" nodename=\"{}\" />", image_name("geometry_normal"));
-        let _ = writeln!(x, "  </normalmap>");
-    }
-    if has("height") {
-        let _ = writeln!(x, "  <displacement name=\"DISP_{base}\" type=\"displacementshader\">");
-        let _ = writeln!(x, "    <input name=\"displacement\" type=\"float\" nodename=\"{}\" />", image_name("height"));
-        let _ = writeln!(x, "    <input name=\"scale\" type=\"float\" value=\"1\" />");
-        let _ = writeln!(x, "  </displacement>");
-    }
-
-    let doc = match physical_size_cm {
-        Some([w, h]) if w.is_finite() && h.is_finite() => format!(" doc=\"Tiles every {w} x {h} cm\""),
-        _ => String::new(),
-    };
-    let _ = writeln!(x, "  <surfacematerial name=\"{}\" type=\"material\"{doc}>", esc(&base));
-    let _ = writeln!(x, "    <input name=\"surfaceshader\" type=\"surfaceshader\" nodename=\"{}\" />", esc(&shader));
-    if has("height") {
-        let _ = writeln!(x, "    <input name=\"displacementshader\" type=\"displacementshader\" nodename=\"DISP_{base}\" />");
-    }
-    let _ = writeln!(x, "  </surfacematerial>");
-    let _ = writeln!(x, "</materialx>");
-    x
+    let textures: Vec<craft_materialx::Texture> = textures
+        .iter()
+        .map(|texture| craft_materialx::Texture { input: texture.input.clone(), file: texture.file.clone(), colorspace: texture.colorspace.to_owned() })
+        .collect();
+    craft_materialx::write_open_pbr(name, &textures, physical_size_cm)
 }
 
 #[cfg(test)]
@@ -247,7 +142,7 @@ mod tests {
             assert!(x.contains(want), "missing {want}\n{x}");
         }
         // Data textures carry no colour space, and height is not an OpenPBR input.
-        assert!(x.contains("value=\"stone_specular_roughness.png\" />"));
+        assert!(x.contains("value=\"stone_specular_roughness.png\"/>"));
         assert!(!x.contains("name=\"height\""));
     }
 
@@ -265,7 +160,7 @@ mod tests {
     fn colour_inputs_carry_their_files_space_and_data_inputs_none() {
         let lin = |input: &str, file: &str| Texture { colorspace: "lin_rec709", ..tex(input, file) };
         let x = write("m", &[lin("base_color", "c.exr"), lin("specular_roughness", "r.exr")], None);
-        assert!(x.contains("value=\"c.exr\" colorspace=\"lin_rec709\"") && x.contains("value=\"r.exr\" />"), "{x}");
+        assert!(x.contains("value=\"c.exr\" colorspace=\"lin_rec709\"") && x.contains("value=\"r.exr\"/>"), "{x}");
     }
 
     #[test]
@@ -292,7 +187,9 @@ mod tests {
         assert_eq!(node_name(""), "_");
         let x = write("a<b>&\"c", &[tex("base_color", "x\"&<'>.<UDIM>.png")], Some([f32::NAN, 1.0]));
         assert!(balanced(&x.replace("&lt;UDIM&gt;", "UDIM")), "{x}");
-        assert!(x.contains("value=\"x&quot;&amp;&lt;&apos;&gt;.&lt;UDIM&gt;.png\""));
+        let doc = craft_materialx::Document::parse(x.as_bytes()).unwrap();
+        let material = doc.read_material(None).unwrap();
+        assert!(material.inputs.iter().any(|(input, value)| input == "base_color" && value == &craft_materialx::Value::Image("x\"&<'>.<UDIM>.png".into())));
         assert!(!x.contains("doc="), "a non-finite size is left out");
         assert!(x.contains("OPBR_a_b___c"));
     }
