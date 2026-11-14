@@ -1,6 +1,7 @@
 //! One integration-test executable avoids linking the same dependencies for every feature.
 //! Keep feature tests in their own modules; the standalone ui_snapshots.rs target remains available.
 
+mod bake_job_mesh;
 mod bake_mode;
 mod brush_drag;
 mod brush_section_reset;

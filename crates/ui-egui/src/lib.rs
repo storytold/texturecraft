@@ -327,7 +327,7 @@ impl TextureCraftApp {
         }
 
         let total = sets.len();
-        self.bake = Some(BakeJob { queue: sets, current: None, total });
+        self.bake = Some(BakeJob { queue: sets, current: None, total, mesh_id: self.session.mesh_id });
     }
 
     /// Re-cook MaterialCraft material layer `layer` in the background. While one cook of the layer
@@ -392,6 +392,15 @@ impl TextureCraftApp {
             self.session.bake_preview_end();
             return;
         };
+
+        if job.mesh_id != self.session.mesh_id {
+            // The mesh was swapped under the job: stop it and drop its result.
+            if let Some(running) = &job.current {
+                running.progress.cancel.store(true, Ordering::Relaxed);
+            }
+            self.bake = None;
+            return;
+        }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
         if let Some(running) = &job.current {

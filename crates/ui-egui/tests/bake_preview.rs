@@ -125,9 +125,11 @@ fn a_ready_result_waits_for_the_map_stream_to_close() {
     result_sender.send(Ok(output)).unwrap();
     let app = harness.state_mut();
     app.start_bake(vec![0]);
+    let mesh_id = app.session.mesh_id;
     app.bake = Some(BakeJob {
         queue: Vec::new(),
         total: 1,
+        mesh_id,
         current: Some(RunningBake {
             set_index: 0,
             progress: Arc::new(Progress::new()),
