@@ -281,3 +281,46 @@ fn merged_edits_are_one_undo_step() {
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     assert_eq!(opacity(&s), 1.0, "one undo reverts the whole drag");
 }
+
+#[test]
+fn mask_fill_supports_image_source() {
+    use texturecraft_engine::core::Source;
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({"color": [0.0, 0.0, 0.0]})).unwrap();
+    let _top = id(execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap(), "layer");
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    assert!(close(center(&mut s, Channel::BaseColor), [0.0, 0.0, 0.0]));
+
+    let mut png = Vec::new();
+    let img = image::RgbaImage::from_fn(4, 4, |_, _| image::Rgba([204, 204, 204, 255]));
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    s.import_resource_bytes("mask_tex.png", png).unwrap();
+
+    let res = execute(&mut s, "effect.add.fill", &json!({"target": "mask", "image": "mask_tex.png"})).unwrap();
+    let eff_id = res["effect"].as_u64().unwrap();
+    let effect = s.doc.project.effect(LayerId(eff_id)).unwrap().1;
+    assert_eq!(effect.kind, EffectKind::Fill { source: Source::image("mask_tex.png"), projection: Default::default() });
+
+    assert!(close(center(&mut s, Channel::BaseColor), [0.8, 0.8, 0.8]), "{:?}", center(&mut s, Channel::BaseColor));
+
+    execute(&mut s, "effect.set", &json!({"effect": eff_id, "value": 0.4})).unwrap();
+    let effect = s.doc.project.effect(LayerId(eff_id)).unwrap().1;
+    assert_eq!(effect.kind, EffectKind::Fill { source: Source::Uniform([0.4; 3]), projection: Default::default() });
+    assert!(close(center(&mut s, Channel::BaseColor), [0.4, 0.4, 0.4]));
+
+    let anchor_id = id(execute(&mut s, "effect.add.anchor", &json!({"layer": 1, "name": "BaseAnchor"})).unwrap(), "effect");
+
+    execute(&mut s, "effect.set", &json!({"effect": eff_id, "anchor": anchor_id})).unwrap();
+    let effect = s.doc.project.effect(LayerId(eff_id)).unwrap().1;
+    assert!(matches!(effect.kind, EffectKind::Fill { source: Source::Anchor { .. }, .. }));
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    let effect = s.doc.project.effect(LayerId(eff_id)).unwrap().1;
+    assert_eq!(effect.kind, EffectKind::Fill { source: Source::Uniform([0.4; 3]), projection: Default::default() });
+    assert!(close(center(&mut s, Channel::BaseColor), [0.4, 0.4, 0.4]));
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    let effect = s.doc.project.effect(LayerId(eff_id)).unwrap().1;
+    assert_eq!(effect.kind, EffectKind::Fill { source: Source::image("mask_tex.png"), projection: Default::default() });
+    assert!(close(center(&mut s, Channel::BaseColor), [0.8, 0.8, 0.8]));
+}

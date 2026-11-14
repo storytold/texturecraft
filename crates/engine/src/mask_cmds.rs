@@ -40,7 +40,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add fill",
             ["Layers", "Effects"],
             None,
-            "{layer?, target?: mask|content, name?, mask: value?: 0..1 | procedural?: kind, scale?, seed? | anchor?: anchor effect id, anchorChannel?: channel (height); content: color?, roughness?, metallic?, height?, opacity? (default: every layer channel); projection?}",
+            "{layer?, target?: mask|content, name?, mask: value?: 0..1 | procedural?: kind, scale?, seed? | image?: resource name | anchor?: anchor effect id, anchorChannel?: channel (height); content: color?, roughness?, metallic?, height?, opacity? (default: every layer channel); projection?}",
             has_layer,
             add_fill
         ),
@@ -94,7 +94,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit effect",
             [],
             None,
-            "{effect, visible?, blend?, opacity?, name?, filter?: id from filter.list (a filter effect only: swaps its type, keeping position, blend and opacity; its current id edits it in place), level?, softness?, noise?, noiseScale?, offset?, invert?, mode?, sizes?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, colors?: [[r,g,b], ...] (a color selection's ID colors), filter parameters (see effect.add.filter)}",
+            "{effect, visible?, blend?, opacity?, name?, filter?: id from filter.list (a filter effect only: swaps its type, keeping position, blend and opacity; its current id edits it in place), level?, softness?, noise?, noiseScale?, offset?, invert?, mode?, sizes?, value?, image?, procedural?, scale?, seed?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, colors?: [[r,g,b], ...] (a color selection's ID colors), filter parameters (see effect.add.filter)}",
             has_layer,
             set
         ),
@@ -297,19 +297,20 @@ fn add_fill(s: &mut Session, p: &Value) -> Result<Value> {
         let source = anchor_source(s, "effect.add.fill", id, LayerId(a), channel)?;
         return push_effect(s, p, EffectKind::Fill { source, projection }, blend);
     }
-    let source = match strp(p, "procedural") {
-        Some(k) => {
-            let kind = ProceduralKind::parse(k).ok_or_else(|| bad("effect.add.fill", format!("unknown procedural `{k}`")))?;
-            let mut pr = Procedural::new(kind);
-            if let Some(v) = f32p(p, "scale") {
-                pr.scale = v.clamp(0.001, 1000.0);
-            }
-            if let Some(v) = u64p(p, "seed") {
-                pr.seed = v as u32;
-            }
-            Source::Procedural { pattern: pr, low: [0.0; 3], high: [1.0; 3] }
+    let source = if let Some(image) = strp(p, "image") {
+        Source::image(image)
+    } else if let Some(k) = strp(p, "procedural") {
+        let kind = ProceduralKind::parse(k).ok_or_else(|| bad("effect.add.fill", format!("unknown procedural `{k}`")))?;
+        let mut pr = Procedural::new(kind);
+        if let Some(v) = f32p(p, "scale") {
+            pr.scale = v.clamp(0.001, 1000.0);
         }
-        None => Source::Uniform([f32p(p, "value").unwrap_or(1.0).clamp(0.0, 1.0); 3]),
+        if let Some(v) = u64p(p, "seed") {
+            pr.seed = v as u32;
+        }
+        Source::Procedural { pattern: pr, low: [0.0; 3], high: [1.0; 3] }
+    } else {
+        Source::Uniform([f32p(p, "value").unwrap_or(1.0).clamp(0.0, 1.0); 3])
     };
     push_effect(s, p, EffectKind::Fill { source, projection }, blend)
 }
@@ -516,9 +517,28 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
             EffectKind::Fill { source, .. } => {
                 if let Some(anchor) = anchor {
                     *source = anchor;
-                } else if let Some(value) = f32p(params, "value")
-                    && matches!(source, Source::Uniform(_) | Source::Anchor { .. })
+                } else if let Some(image) = strp(params, "image") {
+                    *source = Source::image(image);
+                } else if let Some(k) = strp(params, "procedural") {
+                    let kind = ProceduralKind::parse(k).ok_or_else(|| bad(CMD, format!("unknown procedural `{k}`")))?;
+                    let mut pr = Procedural::new(kind);
+                    if let Some(v) = f32p(params, "scale") {
+                        pr.scale = v.clamp(0.001, 1000.0);
+                    }
+                    if let Some(v) = u64p(params, "seed") {
+                        pr.seed = v as u32;
+                    }
+                    *source = Source::Procedural { pattern: pr, low: [0.0; 3], high: [1.0; 3] };
+                } else if let Source::Procedural { pattern, .. } = source
+                    && (f32p(params, "scale").is_some() || u64p(params, "seed").is_some())
                 {
+                    if let Some(v) = f32p(params, "scale") {
+                        pattern.scale = v.clamp(0.001, 1000.0);
+                    }
+                    if let Some(v) = u64p(params, "seed") {
+                        pattern.seed = v as u32;
+                    }
+                } else if let Some(value) = f32p(params, "value") {
                     *source = Source::Uniform([value.clamp(0.0, 1.0); 3]);
                 }
             }

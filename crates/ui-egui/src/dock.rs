@@ -2254,37 +2254,59 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
                 Source::Procedural { pattern, .. } => tr(pattern.kind.label()).to_string(),
                 Source::Image { name, .. } => trf("Image: {name}", &[("name", name)]),
             };
-            combo(ui, tr("Source"), current, |ui| {
-                if ui.selectable_label(matches!(source, Source::Uniform(_)), tr("Uniform value")).clicked() {
-                    app.run("effect.set", json!({"effect": id, "value": 1.0}));
-                }
-                for (anchor, label) in &anchors {
-                    if ui.selectable_label(source.anchor() == Some(*anchor), trf("Anchor: {name}", &[("name", label)])).clicked() {
-                        app.run("effect.set", json!({"effect": id, "anchor": anchor.0}));
+            let group = ui.group(|ui| {
+                combo(ui, tr("Source"), current, |ui| {
+                    if ui.selectable_label(matches!(source, Source::Uniform(_)), tr("Uniform value")).clicked() {
+                        app.run("effect.set", json!({"effect": id, "value": 1.0}));
+                    }
+                    for (anchor, label) in &anchors {
+                        if ui.selectable_label(source.anchor() == Some(*anchor), trf("Anchor: {name}", &[("name", label)])).clicked() {
+                            app.run("effect.set", json!({"effect": id, "anchor": anchor.0}));
+                        }
+                    }
+                    let mut resources: Vec<String> = app.session.images.keys().cloned().collect();
+                    resources.sort();
+                    for res in &resources {
+                        let active = matches!(source, Source::Image { name, .. } if name == res);
+                        if ui.selectable_label(active, trf("Image: {name}", &[("name", res)])).clicked() {
+                            app.run("effect.set", json!({"effect": id, "image": res}));
+                        }
+                    }
+                });
+                match source {
+                    Source::Uniform(color) => {
+                        let mut value = color[0];
+                        if let Some(merge) = slider_edit(ui, tr("Value"), &mut value, 0.0..=1.0, 2) {
+                            app.run("effect.set", json!({"effect": id, "value": value, "merge": merge}));
+                        }
+                    }
+                    Source::Image { name, .. } => {
+                        ui.label(trf("Image: {name}", &[("name", name)]));
+                        ui.label(RichText::new(tr("Colors read as gray. Add a levels or blur effect above to shape the result.")).color(tk.text_dim));
+                    }
+                    Source::Procedural { pattern, .. } => {
+                        let mut s = pattern.scale;
+                        if let Some(merge) = slider_edit(ui, tr("Scale"), &mut s, 0.01..=100.0, 2) {
+                            app.run("effect.set", json!({"effect": id, "scale": s, "merge": merge}));
+                        }
+                    }
+                    Source::Anchor { channel, .. } => {
+                        let channels = app.session.doc.project.texture_set(app.session.ts()).map(|set| set.channel_list()).unwrap_or_default();
+                        combo(ui, tr("Channel"), tr(channel.label()), |ui| {
+                            for option in channels {
+                                if ui.selectable_label(option == *channel, tr(option.label())).clicked() {
+                                    app.run("effect.set", json!({"effect": id, "anchorChannel": option.id()}));
+                                }
+                            }
+                        });
+                        ui.label(RichText::new(tr("Colors read as gray. Add a levels or blur effect above to shape the result.")).color(tk.text_dim));
                     }
                 }
             });
-            match source {
-                Source::Uniform(color) => {
-                    let mut value = color[0];
-                    if let Some(merge) = slider_edit(ui, tr("Value"), &mut value, 0.0..=1.0, 2) {
-                        app.run("effect.set", json!({"effect": id, "value": value, "merge": merge}));
-                    }
-                }
-                Source::Anchor { channel, .. } => {
-                    let channels = app.session.doc.project.texture_set(app.session.ts()).map(|set| set.channel_list()).unwrap_or_default();
-                    combo(ui, tr("Channel"), tr(channel.label()), |ui| {
-                        for option in channels {
-                            if ui.selectable_label(option == *channel, tr(option.label())).clicked() {
-                                app.run("effect.set", json!({"effect": id, "anchorChannel": option.id()}));
-                            }
-                        }
-                    });
-                    ui.label(RichText::new(tr("Colors read as gray. Add a levels or blur effect above to shape the result.")).color(tk.text_dim));
-                }
-                _ => {}
+            if let Some(name) = image_drop(ui, &group.response.interact(Sense::hover())) {
+                app.run("effect.set", json!({"effect": id, "image": name}));
             }
-            if anchors.is_empty() {
+            if anchors.is_empty() && !matches!(source, Source::Anchor { .. }) {
                 ui.label(RichText::new(tr("Add an anchor point to a layer below to use its stack as a mask.")).color(tk.text_dim));
             }
         }
