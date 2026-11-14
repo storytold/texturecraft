@@ -163,8 +163,13 @@ fn startup_project_token(session: &Session) -> StartupProjectToken {
     StartupProjectToken(session.project_id)
 }
 
-fn startup_sample_can_replace(session: &Session, project_token: StartupProjectToken) -> bool {
-    startup_project_token(session) == project_token && session.path.is_none() && !session.modified
+fn startup_sample_can_replace(session: &Session, project_token: StartupProjectToken, bake_running: bool, resize_running: bool) -> bool {
+    startup_project_token(session) == project_token
+        && session.path.is_none()
+        && !session.modified
+        && !session.stroke_active()
+        && !bake_running
+        && !resize_running
 }
 
 impl eframe::App for Shell {
@@ -205,7 +210,7 @@ impl eframe::App for Shell {
             }
             StartupSample::Baking { receiver, project_token } => match receiver.try_recv() {
                 Ok(Ok(session)) => {
-                    if startup_sample_can_replace(&self.app.session, *project_token) {
+                    if startup_sample_can_replace(&self.app.session, *project_token, self.app.bake.is_some(), self.app.resize.is_some()) {
                         let revision = self.app.session.revision;
                         let camera = self.app.session.camera;
                         let active_set = self.app.session.active_set;
@@ -366,23 +371,49 @@ fn fatal(msg: &str, dialog: bool) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn deferred_sample_survives_view_changes_but_not_project_switches_or_edits() {
-        let mut session =
+    fn startup_session() -> (Session, StartupProjectToken) {
+        let session =
             Session::new_project("Material Ball", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 2048).unwrap();
         let token = startup_project_token(&session);
+        (session, token)
+    }
+
+    #[test]
+    fn deferred_sample_survives_view_changes_but_not_project_switches_or_edits() {
+        let (mut session, token) = startup_session();
         session.revision = session.revision.wrapping_add(1);
         session.camera.yaw += 0.2;
         session.view = texturecraft_engine::ViewMode::UvChecker;
-        assert!(startup_sample_can_replace(&session, token));
+        assert!(startup_sample_can_replace(&session, token, false, false));
 
         let replacement =
             Session::new_project("Untitled", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 2048).unwrap();
         session.switch_to(replacement);
-        assert!(!startup_sample_can_replace(&session, token));
+        assert!(!startup_sample_can_replace(&session, token, false, false));
 
         session.modified = true;
-        assert!(!startup_sample_can_replace(&session, startup_project_token(&session)));
+        assert!(!startup_sample_can_replace(&session, startup_project_token(&session), false, false));
+    }
+
+    #[test]
+    fn deferred_sample_does_not_replace_during_a_stroke() {
+        let (mut session, token) = startup_session();
+        texturecraft_engine::execute(&mut session, "layer.add.paint", &serde_json::Value::Null).unwrap();
+        session.modified = false;
+        session.begin_stroke_uv([0.5, 0.5].into(), 1.0).unwrap();
+        assert!(!startup_sample_can_replace(&session, token, false, false));
+    }
+
+    #[test]
+    fn deferred_sample_does_not_replace_during_a_user_bake() {
+        let (session, token) = startup_session();
+        assert!(!startup_sample_can_replace(&session, token, true, false));
+    }
+
+    #[test]
+    fn deferred_sample_does_not_replace_during_a_resize() {
+        let (session, token) = startup_session();
+        assert!(!startup_sample_can_replace(&session, token, false, true));
     }
 
     #[test]
