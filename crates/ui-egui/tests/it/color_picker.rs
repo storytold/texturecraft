@@ -71,3 +71,17 @@ fn the_copy_button_copies_the_rgb_values() {
     let copied = h.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == "255, 0, 0"));
     assert!(copied, "{:?}", h.output().platform_output.commands);
 }
+
+#[test]
+fn parse_hex_color_supports_hex_formats_and_rgb_strings() {
+    use texturecraft_ui_egui::widgets::parse_hex_color;
+
+    assert_eq!(parse_hex_color("#ff00aa"), Some([255, 0, 170]));
+    assert_eq!(parse_hex_color("FF00AA"), Some([255, 0, 170]));
+    assert_eq!(parse_hex_color("#f0a"), Some([255, 0, 170]));
+    assert_eq!(parse_hex_color("f0a"), Some([255, 0, 170]));
+    assert_eq!(parse_hex_color("255, 128, 64"), Some([255, 128, 64]));
+    assert_eq!(parse_hex_color("rgb(10, 20, 30)"), Some([10, 20, 30]));
+    assert_eq!(parse_hex_color("invalid"), None);
+}
+
