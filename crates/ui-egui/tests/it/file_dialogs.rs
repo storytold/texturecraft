@@ -263,3 +263,40 @@ fn a_save_elsewhere_does_not_answer_the_prompt() {
     assert!(!sends(&mut h, 3, &ViewportCommand::Close), "only the prompt's own Save goes on");
     assert_eq!(h.state().ui.windows.unsaved, Some(Unsaved::Quit));
 }
+
+#[test]
+fn ui_export_mesh_preserves_selected_format_and_honors_explicit_extension() {
+    let dir = temp_file("export-mesh-ui", "chosen").parent().unwrap().to_path_buf();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut h = harness(false);
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let store = seen.clone();
+    let extensionless = dir.join("mesh");
+    let reply_path = extensionless.clone();
+    answer(&mut h, move |request| {
+        *store.borrow_mut() = Some(request.clone());
+        Answer::Paths(vec![reply_path.clone()])
+    });
+    invoke(&mut h, "ui.exportMesh");
+    h.run_steps(2);
+    assert!(h.state().ui.windows.export_mesh);
+    h.get_by_label("glTF binary (.glb)").click();
+    h.run_steps(3);
+    let Some(Request::File(dialog)) = seen.borrow().clone() else { panic!("no file dialog was asked for") };
+    assert!(dialog.file_name.is_some_and(|name| name.ends_with(".glb")));
+    assert_eq!(dialog.filters.first().map(|f| f.extensions.clone()), Some(vec!["glb".to_string(), "gltf".to_string()]));
+    assert!(dir.join("mesh.glb").is_file(), "extensionless save must keep pre-selected GLB format");
+    assert!(!dir.join("mesh.obj").exists(), "extensionless GLB save must not write OBJ");
+
+    let explicit_obj = dir.join("custom.obj");
+    let reply_explicit = explicit_obj.clone();
+    answer(&mut h, move |_| Answer::Paths(vec![reply_explicit.clone()]));
+    invoke(&mut h, "ui.exportMesh");
+    h.run_steps(2);
+    h.get_by_label("glTF binary (.glb)").click();
+    h.run_steps(3);
+    assert!(explicit_obj.is_file(), "explicit .obj extension must be honored over pre-selected GLB");
+    assert!(!dir.join("custom.glb").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -49,7 +49,7 @@ pub const CATALOG: &[Item] = &[
     it("File", "Import MaterialX material...", "file.importMaterialX", None),
     it("File", "Import material...", "material.load", None),
     it("File", "Export Textures...", "ui.export", Some("Ctrl+Shift+E")),
-    it("File", "Export Mesh...", "file.exportMesh", None),
+    it("File", "Export Mesh...", "ui.exportMesh", None),
     sep("File"),
     it("File", "Quit", "ui.quit", Some("Ctrl+Q")),
     it("Edit", "Undo", "edit.undo", Some("Ctrl+Z")),
@@ -155,6 +155,7 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
     match id {
         "ui.newProject" => app.ui.windows.new_project = true,
         "ui.export" => app.ui.windows.export = true,
+        "ui.exportMesh" => app.ui.windows.export_mesh = true,
         "ui.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         "ui.projectConfig" => crate::rail_popup::open(app, crate::docking::Panel::Display),
         "ui.settings" => app.ui.windows.settings = true,
