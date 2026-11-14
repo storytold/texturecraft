@@ -634,3 +634,17 @@ fn unparseable_color_param_returns_error() {
     let err = execute(&mut s, "tool.click", &json!({"uv": [0.2, 0.8, 0.4]})).unwrap_err();
     assert_eq!(err.to_string(), "`tool.click`: a 2D view point needs `uv` as [u, v]");
 }
+
+#[test]
+fn direction_generator_sets_and_inspects_direction() {
+    let mut state = state();
+    let layer = execute(&mut state, "layer.add.fill", &json!({})).unwrap()["layer"].clone();
+    execute(&mut state, "mask.add.black", &json!({"layer": layer})).unwrap();
+    let added = execute(&mut state, "effect.add.generator", &json!({"generator": "direction"})).unwrap();
+    let effect = added["effect"].clone();
+
+    execute(&mut state, "effect.set", &json!({"effect": effect, "direction": [1.0, 0.0, 0.0]})).unwrap();
+    let inspect = execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string();
+    assert!(inspect.contains(r#""direction":[1.0,0.0,0.0]"#), "{inspect}");
+}
+

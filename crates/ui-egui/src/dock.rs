@@ -2369,12 +2369,58 @@ fn generator_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, generat
         );
     }
 
+    if matches!(generator.kind, GeneratorKind::Direction | GeneratorKind::Position) {
+        direction_properties(app, ui, id, generator.direction);
+    }
     if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear) {
         curvature_detail_properties(app, ui, id, generator.detail.as_ref());
     }
     if !app.session.doc.baked.contains_key(&app.session.ts()) {
         ui.label(RichText::new(format!("{} {}", ic::WARNING, tr("Bake mesh maps (F8) for curvature, AO and thickness based generators."))).color(tk.warning));
     }
+}
+
+/// The direction controls for Light / direction and Position gradient generators.
+fn direction_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, direction: [f32; 3]) {
+    ui.label(caption(tr("Light direction")));
+    let len = (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]).sqrt();
+    let [nx, ny, nz] = if len > 1e-6 { [direction[0] / len, direction[1] / len, direction[2] / len] } else { [0.0, 1.0, 0.0] };
+    let mut horizontal = nz.atan2(nx).to_degrees();
+    let mut vertical = ny.clamp(-1.0, 1.0).asin().to_degrees();
+
+    let h_edit = slider_edit(ui, tr("Horizontal angle"), &mut horizontal, -180.0..=180.0, 0);
+    let v_edit = slider_edit(ui, tr("Vertical angle"), &mut vertical, -90.0..=90.0, 0);
+    if let Some(merge) = h_edit.or(v_edit) {
+        let rad_h = horizontal.to_radians();
+        let rad_v = vertical.to_radians();
+        let cos_v = rad_v.cos();
+        let new_dir = [cos_v * rad_h.cos(), rad_v.sin(), cos_v * rad_h.sin()];
+        app.run("effect.set", json!({"effect": id, "direction": new_dir, "merge": merge}));
+    }
+
+    let mut dir = direction;
+    let mut edit = None;
+    for (axis, val) in ["X", "Y", "Z"].iter().zip(dir.iter_mut()) {
+        edit = edit.or(slider_edit(ui, &trf("Direction {axis}", &[("axis", axis)]), val, -1.0..=1.0, 2));
+    }
+    if let Some(merge) = edit {
+        app.run("effect.set", json!({"effect": id, "direction": dir, "merge": merge}));
+    }
+
+    ui.horizontal(|ui| {
+        for (label, target) in [
+            (tr("Top"), [0.0, 1.0, 0.0]),
+            (tr("Bottom"), [0.0, -1.0, 0.0]),
+            (tr("Front"), [0.0, 0.0, 1.0]),
+            (tr("Back"), [0.0, 0.0, -1.0]),
+            (tr("Left"), [-1.0, 0.0, 0.0]),
+            (tr("Right"), [1.0, 0.0, 0.0]),
+        ] {
+            if ui.button(label).clicked() {
+                app.run("effect.set", json!({"effect": id, "direction": target, "merge": false}));
+            }
+        }
+    });
 }
 
 /// The curvature mode and detail size weights of generator effect `id` (`detail` None: saved before detail sizes).
