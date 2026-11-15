@@ -268,18 +268,27 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         if !self.input.replay {
             return false;
         }
-        // strokes, then (above them all) polygon fills laid over the replayed strokes
+        // strokes, then (above them all) polygon fills laid over the replayed strokes. Strokes above a polygon fill are
+        // laid under it too (approximated): laying the group flat instead would lose its blending, which matters more
+        // (a subtracting group laid flat adds what it should take away)
         let mut paints = Vec::new();
         let mut polygons = Vec::new();
+        let mut strokes_above_fills = false;
         for e in g.effects.iter().filter(|e| e.is_enabled()) {
             match e {
-                ProjectEffect::Paint(p) if polygons.is_empty() || p.stroke_count() == 0 => paints.push(p),
+                ProjectEffect::Paint(p) => {
+                    strokes_above_fills |= !polygons.is_empty() && p.stroke_count() > 0;
+                    paints.push(p);
+                }
                 ProjectEffect::PolygonFill(p) => polygons.push(p),
                 _ => return false,
             }
         }
         let mut steps = Vec::new();
         let mut status = Status::Exact;
+        if strokes_above_fills {
+            status.and(&Status::approximated("mask group: strokes above a polygon fill laid under it (the group's polygon fills lie over all its strokes)"));
+        }
         for p in paints.into_iter().filter(|p| p.stroke_count() > 0) {
             let Ok(mut step) = crate::replay::step(p, StepTarget::Mask, self.input.channels, self.input.images, self.input.graphs, Some(&self.sources()))
             else {

@@ -641,10 +641,13 @@ fn a_mask_group_of_strokes_with_polygon_fills_above_them_is_one_paint_effect() {
     assert_eq!(stack.jobs.len(), 1);
     assert_eq!(stack.fills.len(), 1);
     assert!(stack.fills[0].over_strokes && stack.fills[0].effect == m.effects[0].id);
-    // strokes above a polygon fill: laid flat, as before
+    // strokes above a polygon fill: still one paint effect with the group's blending (laid flat, a subtracting group
+    // would add its strokes and picks), the picks laid over the strokes
     let stack = build(mask_group(4, ProjectBlendMode::Subtract, 1.0, vec![polygon_fill(6, 1.0, [0.9, 0.1], vec![]), brush()]));
-    assert_eq!(by_name(&stack, "Masked").mask.as_ref().unwrap().effects.len(), 2);
-    assert!(stack.fills.iter().all(|f| !f.over_strokes));
+    let m = by_name(&stack, "Masked").mask.as_ref().unwrap();
+    assert_eq!(m.effects.len(), 1, "{:?}", m.effects);
+    assert_eq!((m.effects[0].kind.clone(), m.effects[0].blend), (EffectKind::Paint, BlendMode::Subtract));
+    assert!(stack.fills.len() == 1 && stack.fills[0].over_strokes);
 }
 
 #[test]
