@@ -681,6 +681,9 @@ impl GraphStore {
             lanes.iter().for_each(|v| {
                 h.f32(*v);
             });
+            if let texturecraft_core::GraphValue::Text(t) = value {
+                h.str(t);
+            }
         }
         h.u64(u64::from(g.seed));
         let rendered = g.rendered();
@@ -932,6 +935,13 @@ impl Drop for Running<'_> {
 /// label. A value for a parameter the graph does not have changes nothing.
 pub fn apply_values(graph: &mut Graph, values: &BTreeMap<String, texturecraft_core::GraphValue>) {
     for (name, value) in values {
+        // a text sets the text of every `input_value` node of its name (a text parameter has no exposed slider)
+        if let texturecraft_core::GraphValue::Text(t) = value {
+            for n in graph.nodes.values_mut().filter(|n| n.kind == "input_value" && n.strs.get("name").is_some_and(|s| s == name)) {
+                n.strs.insert("v".to_string(), t.clone());
+            }
+            continue;
+        }
         let lanes = value.lanes();
         let mut found = false;
         for n in graph.nodes.values_mut().filter(|n| n.kind == "input_value" && n.strs.get("name").is_some_and(|s| s == name)) {

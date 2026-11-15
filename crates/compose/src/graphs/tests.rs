@@ -63,6 +63,28 @@ fn parameters_seed_and_size_change_the_key_and_the_pixels() {
     assert!(s.cook(&unknown, &e, &[]).is_ok());
 }
 
+/// A text parameter feeding a text node through a function, as a decompiled font graph has it.
+const TEXT: &str = "format 3\nsize 32\nsubgraph t\nmeta kind \"function\"\nnode 2 f_graph_input name=\"text\" type=9\nnode 1 f_out in=@2\nend\nnode 100 input_value name=\"text\" type=9 v=\"\"\nnode 1 text fn.text=\"t\" size=0.8\noutput o 1\n";
+
+#[test]
+fn text_parameters_reach_text_nodes_and_the_key() {
+    let s = store(&[TEXT]);
+    let (baked, images) = (BakedMaps::default(), ImageStore::default());
+    let e = env(&baked, &images);
+    let g = GraphRef::new(text_key(TEXT), "text");
+    let ink = |g: &GraphRef| {
+        let (_, cooked) = s.cook(g, &e, &[]).unwrap();
+        (0..8 * 8).map(|i| at_texel(&cooked.outputs["o"], i % 8, i / 8, (8, 8))[0]).sum::<f32>()
+    };
+    assert!(ink(&g) < 1e-6, "no text, no ink");
+    let mut written = g.clone();
+    written.params.insert("text".into(), GraphValue::Text("H".into()));
+    assert!(ink(&written) > 0.5, "the text is drawn");
+    let mut other = g.clone();
+    other.params.insert("text".into(), GraphValue::Text("I".into()));
+    assert_ne!(s.cook_key(&written, &e, &[]), s.cook_key(&other, &e, &[]), "the text is part of the key");
+}
+
 #[test]
 fn keys_are_stable_across_stores() {
     let (baked, images) = (BakedMaps::default(), ImageStore::default());

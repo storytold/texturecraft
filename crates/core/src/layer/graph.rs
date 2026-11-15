@@ -27,6 +27,8 @@ pub enum GraphValue {
     Int(i32),
     Int2([i32; 2]),
     Bool(bool),
+    /// A text parameter (a font graph's text).
+    Text(String),
 }
 
 /// A number as JSON holds it: a value that is not a number (written as `null`) reads 0.
@@ -44,8 +46,8 @@ fn colour<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[f32; 3], D::Error> 
 }
 
 impl GraphValue {
-    /// The value as the lanes the graph runtime takes (one to four numbers); non-finite lanes read 0, lanes past the
-    /// fourth are left out.
+    /// The value as the lanes the graph runtime takes (one to four numbers; none for a text); non-finite lanes read 0,
+    /// lanes past the fourth are left out.
     pub fn lanes(&self) -> Vec<f32> {
         let finite = |v: f32| if v.is_finite() { v } else { 0.0 };
         match self {
@@ -54,6 +56,7 @@ impl GraphValue {
             GraphValue::Int(v) => vec![*v as f32],
             GraphValue::Int2([a, b]) => vec![*a as f32, *b as f32],
             GraphValue::Bool(b) => vec![if *b { 1.0 } else { 0.0 }],
+            GraphValue::Text(_) => Vec::new(),
         }
     }
 }

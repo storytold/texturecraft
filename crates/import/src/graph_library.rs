@@ -142,7 +142,7 @@ pub fn baked_map_for(identifier: &str) -> Option<BakedMap> {
     })
 }
 
-/// A tweak's value as a graph parameter value; `None` for text and values of unknown classes.
+/// A tweak's value as a graph parameter value; `None` for values of unknown classes.
 pub fn tweak_value(v: &texturecraft_import_reader::model::TweakValue) -> Option<GraphValue> {
     use texturecraft_import_reader::model::TweakValue;
     let finite = |x: f32| if x.is_finite() { x } else { 0.0 };
@@ -154,7 +154,8 @@ pub fn tweak_value(v: &texturecraft_import_reader::model::TweakValue) -> Option<
             [x] => GraphValue::Float(finite(*x)),
             many => GraphValue::Vector(many.iter().copied().map(finite).collect()),
         },
-        TweakValue::Text(_) | TweakValue::Other(_) => return None,
+        TweakValue::Text(t) => GraphValue::Text(t.clone()),
+        TweakValue::Other(_) => return None,
     })
 }
 
@@ -202,7 +203,7 @@ mod tests {
         assert_eq!(tweak_value(&TweakValue::Floats(vec![0.5])), Some(GraphValue::Float(0.5)));
         assert_eq!(tweak_value(&TweakValue::Floats(vec![1.0, f32::NAN])), Some(GraphValue::Vector(vec![1.0, 0.0])));
         assert_eq!(tweak_value(&TweakValue::Int2([8, 8])), Some(GraphValue::Int2([8, 8])));
-        assert_eq!(tweak_value(&TweakValue::Text("x".into())), None);
+        assert_eq!(tweak_value(&TweakValue::Text("x".into())), Some(GraphValue::Text("x".into())));
         assert_eq!(tweak_value(&TweakValue::Floats(Vec::new())), None);
     }
 }
