@@ -772,6 +772,25 @@ fn levels_act_on_the_channels_they_list_only() {
 }
 
 #[test]
+fn levels_on_height_keep_its_signed_range() {
+    // Signs' hammered relief: the file counts height levels in −1..1 (out inverted, 0.205 → −0.419)
+    let file =
+        ProjectLevels { input_minimum: [-1.0; 3], input_maximum: [1.0; 3], gamma: [1.0; 3], output_minimum: [0.205; 3], output_maximum: [-0.419; 3], clamp: 0 };
+    let levels = ProjectEffect::Levels(LevelsEffect { header: header(3, HEIGHT, vec![]), levels: Some(file) });
+    let base = fill(2, HEIGHT, vec![uniform(HEIGHT, [0.0; 3])], vec![]);
+    let stack = build(vec![layer(1, "L", ProjectLayerKind::Fill, vec![base, levels])]);
+    let lv = by_name(&stack, "L").content_effects.iter().find_map(|e| match &e.kind {
+        EffectKind::Levels(l) => Some(*l),
+        _ => None,
+    });
+    let lv = lv.unwrap();
+    // applied as the compositor does on a signed channel: −1 → 0.205, 1 → −0.419, 0 halfway; negatives stay negative
+    let at = |h: f32| texturecraft_core::per_unit(texturecraft_core::ChannelKind::Signed, [h; 3], |x| lv.apply(x))[0];
+    assert!((at(-1.0) - 0.205).abs() < 1e-5 && (at(1.0) + 0.419).abs() < 1e-5, "{} {}", at(-1.0), at(1.0));
+    assert!((at(0.0) - (0.205 - 0.419) / 2.0).abs() < 1e-5);
+}
+
+#[test]
 fn a_smudge_moves_the_brush_work_before_it_and_alone_changes_nothing() {
     use crate::replay::PaintMode;
     use texturecraft_import_reader::model::ProjectBlendMode;

@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use texturecraft_core::{BlendMode, Channel, Effect, EffectKind, Fill, LayerId, LayerKind, Levels, Projection, Source};
+use texturecraft_core::{BlendMode, Channel, ChannelKind, Effect, EffectKind, Fill, LayerId, LayerKind, Levels, Projection, Source};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{
     EffectGroup, EffectHeader, FillEffect, Levels as ProjectLevels, LevelsEffect, PaintEffect, PaintTool, PolygonFillEffect, ProjectEffect, ProjectLayer,
@@ -527,6 +527,10 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
     fn levels(&mut self, l: &LevelsEffect, on: bool) {
         let channels = self.writes(&l.header, Holder::Filter);
         let (levels, mut status) = levels(l.levels.as_ref());
+        // on a signed channel (height) the file's levels count in its −1..1 range; TextureCraft's act on the channel
+        // mapped to 0..1 (measured on Signs: the hammered relief keeps the original's range only this way)
+        let signed = !channels.is_empty() && channels.iter().all(|c| c.kind() == ChannelKind::Signed);
+        let levels = if signed { signed_levels(levels) } else { levels };
         let blend = channels.first().map(|c| ResolvedBlend::of(&l.header.blending, self.input.channels.project_channel(*c), Holder::Filter));
         let mut e = effect(self.ids.alloc(), &l.header.label, EffectKind::Levels(levels), on);
         if let Some(b) = &blend {
@@ -760,6 +764,13 @@ pub fn levels(l: Option<&ProjectLevels>) -> (Levels, Status) {
         false => Status::approximated("levels that differ per colour component (the red one taken)"),
     };
     (ours, status)
+}
+
+/// Levels counted in a signed channel's −1..1 range as TextureCraft applies them, on the channel mapped to 0..1
+/// (`v / 2 + 0.5`); the gamma stays.
+pub fn signed_levels(l: Levels) -> Levels {
+    let unit = |v: f32| v * 0.5 + 0.5;
+    Levels { in_low: unit(l.in_low), in_high: unit(l.in_high), gamma: l.gamma, out_low: unit(l.out_low), out_high: unit(l.out_high) }
 }
 
 /// What a replayed job counts as: approximated, with its notes.
