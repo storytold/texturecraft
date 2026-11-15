@@ -497,6 +497,43 @@ fn parallax_follows_the_height_channel() {
     assert!(on.mean(200, 100, 280, 180) > 20.0);
 }
 
+/// Mean tilt of the shown tangent-space normal (channel view 3) over the ball: |x| + |y| in 8-bit levels.
+fn normal_tilt(img: &Img) -> f32 {
+    let mut sum = 0.0;
+    for y in 100..180 {
+        for x in 200..280 {
+            let [r, g, _] = img.at(x, y);
+            sum += (r as f32 - 128.0).abs() + (g as f32 - 128.0).abs();
+        }
+    }
+    sum / 6400.0
+}
+
+#[test]
+fn height_to_normal_follows_the_project_rule() {
+    use texturecraft_core::rules::HeightNormal;
+    let Some((mut h, frame)) = setup() else { return };
+    let normals = |rule: HeightNormal| {
+        shaded(&frame, |s| {
+            s.view_mode = 1;
+            s.channel = 3;
+            s.height_normal = rule;
+        })
+    };
+    upload_height(&mut h, |x, y| [((x as f32 * 0.2).sin() + (y as f32 * 0.2).sin()) * 0.25, 0.04, 0.04, 0.04]);
+    let native = render(&mut h, &normals(HeightNormal::Native), "height_normal_native");
+    let default = render(&mut h, &shaded(&frame, |s| (s.view_mode, s.channel) = (1, 3)), "height_normal_default");
+    assert_same(&native, &default, "rules off keep the viewport's own height bumps");
+    let sobel = render(&mut h, &normals(HeightNormal::Sobel), "height_normal_sobel");
+    let backward = render(&mut h, &normals(HeightNormal::Backward), "height_normal_backward");
+    let (n, s, b) = (normal_tilt(&native), normal_tilt(&sobel), normal_tilt(&backward));
+    // The measured slope is 0.16 of the native one.
+    assert!(n > 10.0, "the height field tilts the native normals ({n})");
+    assert!(s > 0.5 && s < n * 0.3, "Sobel at the measured slope tilts far less ({s} vs {n})");
+    assert!(b > 0.5 && b < n * 0.3, "backward differences at the measured slope tilt far less ({b} vs {n})");
+    assert_ne!(sobel.px, backward.px, "the two measured filters differ");
+}
+
 #[test]
 fn idle_accumulation_converges_then_stops() {
     let Some((mut h, frame)) = setup() else { return };

@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use texturecraft_compose::{DisplayKind, ImageRes};
+use texturecraft_core::rules::{HeightNormal, MEASURED_SLOPE};
 use texturecraft_core::{Channel, DisplaySettings, Project, ToneMapping};
 use texturecraft_geom::glam::{Mat4, Vec3};
 use texturecraft_geom::{Mesh, OrbitCamera};
@@ -126,6 +127,9 @@ pub struct Shade {
     pub env_opacity: f32,
     pub ao_intensity: f32,
     pub height_strength: f32,
+    /// How height becomes normal detail: the project's rule ([`Project::rules`]), the same filter and slope as texture
+    /// export. Set by [`Shade::from_project`].
+    pub height_normal: HeightNormal,
     /// -1 for DirectX normal maps in the normal channel, 1 for OpenGL.
     pub normal_y: f32,
     /// 0 material, 1 channel, 2 mesh map (aux texture), 3 UV checker.
@@ -182,6 +186,18 @@ pub struct Shade {
     pub bake: Option<BakeVisualization>,
 }
 
+/// The height-to-normal rule as the mesh shader reads it: (filter, slope). Filter 0 is TextureCraft's own (central
+/// differences, 45° at strength 1 for a height change of 1 over 1/16 of the width), 1 the measured 3×3 Sobel and 2 the
+/// measured backward differences; slope is the normal tilt per unit of height per texel at strength 1 as a fraction of
+/// the texture width (the export's `height_normal`).
+fn height_normal_globals(h: HeightNormal) -> [f32; 2] {
+    match h {
+        HeightNormal::Native => [0.0, 1.0 / 16.0],
+        HeightNormal::Sobel => [1.0, MEASURED_SLOPE],
+        HeightNormal::Backward => [2.0, MEASURED_SLOPE],
+    }
+}
+
 /// The viewport's subsurface scattering approximation: the diffuse lighting wraps around the
 /// terminator by `min(1, 4 × radius × color)` per channel (radius as a fraction of the mesh
 /// size, about the softening angle on mesh-scale curvature; the path tracer walks the real
@@ -229,6 +245,7 @@ impl Shade {
         Shade {
             sss_blur: scatters.then(|| d.scatter_color.map(|c| c.max(0.0) * d.scatter_radius)),
             refraction: has(Channel::Transmission),
+            height_normal: p.rules.height_normal,
             ..Shade::from_display(d)
         }
     }
@@ -244,6 +261,7 @@ impl Default for Shade {
             env_opacity: 0.0,
             ao_intensity: 0.75,
             height_strength: 1.0,
+            height_normal: HeightNormal::Native,
             normal_y: 1.0,
             view_mode: 0,
             channel: 0,
@@ -1981,8 +1999,8 @@ impl Renderer {
             shadow: [if shadow_vp.is_some() { 1.0 } else { 0.0 }, 1.0 / SHADOW_SIZE as f32, radius * 3.0 / SHADOW_SIZE as f32, 0.0],
             material: [if s.spec_gloss { 1.0 } else { 0.0 }, if s.parallax { 1.0 } else { 0.0 }, sample as f32, s.ior],
             scatter: [s.scatter[0], s.scatter[1], s.scatter[2], if sss.is_some() { 1.0 } else { 0.0 }],
-            fwd: [fwd.x, fwd.y, fwd.z, 0.0],
-            disp,
+            fwd: [fwd.x, fwd.y, fwd.z, height_normal_globals(s.height_normal)[1]],
+            disp: [disp[0], disp[1], disp[2], height_normal_globals(s.height_normal)[0]],
             refr: [if refraction { 1.0 } else { 0.0 }, (BEHIND_LEVELS - 1) as f32, REFRACTION_DEPTH * radius, 0.0],
             highlight: highlight_globals(s, data),
             highlight_shift: highlight_shift(frame.size),
@@ -2406,6 +2424,22 @@ fn highlight_shift(size: [u32; 2]) -> [f32; 4] {
 mod tests {
     use super::*;
     use crate::headless::Headless;
+    use texturecraft_core::rules::CompositeRules;
+
+    #[test]
+    fn height_to_normal_follows_the_project_rule() {
+        let mut project = Project::new("p", "m.obj");
+        let native = Shade::from_project(&project);
+        assert_eq!(native.height_normal, HeightNormal::Native);
+        // Native projects keep the viewport's own slope: 45° for a height change of 1 over 1/16 of the width.
+        assert_eq!(height_normal_globals(native.height_normal), [0.0, 1.0 / 16.0]);
+        for (rule, filter) in [(HeightNormal::Sobel, 1.0), (HeightNormal::Backward, 2.0)] {
+            project.rules = CompositeRules::measured(rule);
+            let shade = Shade::from_project(&project);
+            assert_eq!(shade.height_normal, rule);
+            assert_eq!(height_normal_globals(shade.height_normal), [filter, MEASURED_SLOPE]);
+        }
+    }
 
     #[test]
     fn oversized_overlays_leave_the_view_usable() {
