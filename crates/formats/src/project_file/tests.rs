@@ -773,8 +773,8 @@ fn archive_preflight_counts_ignored_entries_and_allows_the_exact_limit() {
     let bytes = writer.finish().unwrap().into_inner();
     let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
 
-    check_archive(&mut archive, 32).unwrap();
-    let error = check_archive(&mut archive, 31).unwrap_err();
+    check_archive(&mut archive, 32, false).unwrap();
+    let error = check_archive(&mut archive, 31, false).unwrap_err();
 
     assert!(matches!(error, FormatError::TooLarge(_)), "{error}");
 }
@@ -788,7 +788,7 @@ fn overlapping_archive_entries_are_rejected_before_decompression() {
     let bytes = writer.finish().unwrap().into_inner();
     let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
 
-    let error = check_archive(&mut archive, 32).unwrap_err();
+    let error = check_archive(&mut archive, 32, false).unwrap_err();
 
     assert!(error.to_string().contains("overlapping ZIP entries"), "{error}");
 }
@@ -803,7 +803,7 @@ fn actual_decompression_is_bounded_even_when_the_declared_size_is_small() {
     // The central header stores the uncompressed size at byte 24
     bytes.get_mut(directory + 24..directory + 28).unwrap().copy_from_slice(&1u32.to_le_bytes());
     let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
-    check_archive(&mut archive, 1024).unwrap();
+    check_archive(&mut archive, 1024, false).unwrap();
     let mut entry = archive.by_index(0).unwrap();
     let mut budget = LoadBudget::new(1024);
 
@@ -875,7 +875,7 @@ fn zip64_entry_counts_remain_supported_and_bounded() {
         let metadata_only = Cell::new(true);
 
         let mut archive = open_archive(Cursor::new(bytes), &metadata_only, MAX_ZIP_METADATA_BYTES).unwrap();
-        let result = check_archive(&mut archive, 0);
+        let result = check_archive(&mut archive, 0, false);
 
         assert_eq!(archive.len(), count);
         if count <= MAX_ENTRIES {
@@ -1378,5 +1378,36 @@ fn a_project_opened_from_its_file_reads_pixels_and_baked_maps_when_needed_and_fo
     std::fs::remove_file(&path).unwrap();
     assert_same(&pf, &back);
     assert_eq!(save_project_bytes(&back).unwrap(), bytes);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_lazy_open_charges_lazily_read_entries_their_header_only() {
+    let project = sample().pf;
+    let dir = std::env::temp_dir().join(format!("tc-formats-lazy-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("budget.tcraft");
+    save_project(&path, &project).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+    let sizes: Vec<(String, u64)> = (0..archive.len())
+        .map(|index| {
+            let entry = archive.by_index(index).unwrap();
+            (entry.name().unwrap().into_owned(), entry.size())
+        })
+        .collect();
+    let total: u64 = sizes.iter().map(|(_, size)| size).sum();
+    let held: u64 = sizes.iter().map(|(name, size)| if read_lazily(name) { (*size).min(BIN_HEADER_BYTES as u64) } else { *size }).sum();
+    assert!(held < total, "the sample holds layer pixels read lazily");
+
+    // the eager open needs the whole file; the lazy one only what it holds
+    let eager = load_with_budget(Cursor::new(&bytes), LoadBudget::new(held), None).unwrap_err();
+    assert!(matches!(eager, FormatError::TooLarge(_)), "{eager}");
+    let origin = Origin::new(&path);
+    let lazy = load_with_budget(std::io::BufReader::new(std::fs::File::open(&path).unwrap()), LoadBudget::new(held), Some(&origin)).unwrap();
+    assert_same(&project, &lazy);
+    let short = load_with_budget(std::io::BufReader::new(std::fs::File::open(&path).unwrap()), LoadBudget::new(held - 1), Some(&origin)).unwrap_err();
+    assert!(matches!(short, FormatError::TooLarge(_)), "{short}");
     std::fs::remove_dir_all(&dir).unwrap();
 }

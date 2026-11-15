@@ -776,7 +776,16 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
     load_with_budget(reader, LoadBudget::new(limit_bytes), None)
 }
 
-fn check_archive<R: Read + Seek>(zip: &mut ZipArchive<R>, limit_bytes: u64) -> Result<()> {
+/// Whether a lazy open reads only the header of entry `name` and the rest when a composite or a save needs it (layer
+/// and mask pixels, baked maps, cooked graph outputs). Each later read checks that entry on its own against the limit.
+fn read_lazily(name: &str) -> bool {
+    let bin = name.ends_with(".bin");
+    bin && (name.starts_with("pixels/layer_") || name.starts_with("pixels/mask_") || name.starts_with("baked/") || name.starts_with("cooked/"))
+}
+
+/// Checks the archive before any decompression. With `lazy` an entry read lazily is charged its header only: the open
+/// does not hold the rest, so the limit counts what the open actually holds.
+fn check_archive<R: Read + Seek>(zip: &mut ZipArchive<R>, limit_bytes: u64, lazy: bool) -> Result<()> {
     if zip.len() > MAX_ENTRIES {
         return Err(FormatError::TooLarge(format!("project file has more than {MAX_ENTRIES} entries")));
     }
@@ -785,7 +794,8 @@ fn check_archive<R: Read + Seek>(zip: &mut ZipArchive<R>, limit_bytes: u64) -> R
     let mut declared_budget = LoadBudget::new(limit_bytes);
     for index in 0..zip.len() {
         let entry = zip.by_index_raw(index).map_err(zip_err)?;
-        declared_budget.take(entry.size()).map_err(FormatError::TooLarge)?;
+        let held = if lazy && entry.name().is_ok_and(|name| read_lazily(&name)) { entry.size().min(BIN_HEADER_BYTES as u64) } else { entry.size() };
+        declared_budget.take(held).map_err(FormatError::TooLarge)?;
     }
 
     // Shared compressed ranges can amplify one payload into many apparent files
@@ -808,7 +818,7 @@ fn open_archive<'a, R: Read + Seek>(reader: R, metadata_only: &'a Cell<bool>, me
 fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget, lazy: Option<&Origin>) -> Result<ProjectFile> {
     let metadata_only = Cell::new(true);
     let mut zip = open_archive(reader, &metadata_only, MAX_ZIP_METADATA_BYTES)?;
-    check_archive(&mut zip, budget.remaining())?;
+    check_archive(&mut zip, budget.remaining(), lazy.is_some())?;
 
     let json = read_all(&mut zip.by_name("project.json").map_err(zip_err)?, MAX_JSON, &mut budget, "project.json")?;
     #[derive(serde::Deserialize)]
