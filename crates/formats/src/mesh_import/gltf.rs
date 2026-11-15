@@ -28,9 +28,9 @@ fn parse(bytes: &[u8]) -> Result<(gltf::Document, Option<Vec<u8>>)> {
     let (json, blob) = if bytes.starts_with(b"glTF") {
         let mut glb = gltf::Glb::from_slice(bytes).map_err(|e| malformed(KIND, e))?;
         let blob = glb.bin.take().map(std::borrow::Cow::into_owned);
-        (glb.json.into_owned(), blob)
+        (glb.json, blob)
     } else {
-        (bytes.to_vec(), None)
+        (std::borrow::Cow::Borrowed(bytes), None)
     };
     let mut value: serde_json::Value = serde_json::from_slice(&json).map_err(|e| malformed(KIND, e))?;
     if let Some(scenes) = value.get_mut("scenes").and_then(serde_json::Value::as_array_mut) {
@@ -40,8 +40,8 @@ fn parse(bytes: &[u8]) -> Result<(gltf::Document, Option<Vec<u8>>)> {
             }
         }
     }
-    let json = serde_json::to_vec(&value).map_err(|e| malformed(KIND, e))?;
-    let root = gltf::json::Root::from_slice(&json).map_err(|e| malformed(KIND, e))?;
+    // Consume the DOM directly rather than serialising it back to a second full-size buffer.
+    let root: gltf::json::Root = serde_json::from_value(value).map_err(|e| malformed(KIND, e))?;
     let document = gltf::Document::from_json(root).map_err(|e| malformed(KIND, e))?;
     Ok((document, blob))
 }

@@ -1,5 +1,7 @@
 //! Wavefront OBJ (via `tobj`): polygons fan-triangulated, one vertex per unique v/vt/vn.
 
+use std::io::{BufReader, Read};
+
 use texturecraft_geom::glam::{Vec2, Vec3, Vec4};
 
 use super::{RawMesh, check_triangles, check_vertices};
@@ -27,12 +29,15 @@ fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
     }
 
     let library: String = names.iter().map(|name| format!("newmtl {name}\n")).collect();
-    let source = format!("mtllib texturecraft-usemtl.mtl\n{text}");
+    let prefix = "mtllib texturecraft-usemtl.mtl\n";
+
+    // Feed the prefix and the borrowed (or lossily converted) body as one reader: neither a
+    // whole-file copy nor an extra string is needed before tobj parses it.
+    let mut source = BufReader::new(prefix.as_bytes().chain(text.as_bytes()));
 
     // Polygons stay whole so the wireframe can show them; `RawMesh::polygon` triangulates
     let options = tobj::LoadOptions { single_index: true, triangulate: false, ignore_points: true, ignore_lines: true };
-    let (models, materials) =
-        tobj::load_obj_buf(&mut source.as_bytes(), &options, |_| tobj::load_mtl_buf(&mut library.as_bytes())).map_err(|e| malformed(KIND, e))?;
+    let (models, materials) = tobj::load_obj_buf(&mut source, &options, |_| tobj::load_mtl_buf(&mut library.as_bytes())).map_err(|e| malformed(KIND, e))?;
     let materials = materials.unwrap_or_default();
 
     let mut raw = RawMesh::default();

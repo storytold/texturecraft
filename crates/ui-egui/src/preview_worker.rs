@@ -206,7 +206,13 @@ mod tests {
 
         let mut answers = HashMap::new();
         let start = Instant::now();
-        while answers.len() < requests_sent && start.elapsed() < Duration::from_secs(120) {
+        // Instrumented orb baking can take several minutes on coverage runners.
+        let timeout = if std::env::var_os("LLVM_PROFILE_FILE").is_some() || std::env::var("RUSTFLAGS").is_ok_and(|f| f.contains("instrument-coverage")) {
+            Duration::from_secs(600)
+        } else {
+            Duration::from_secs(120)
+        };
+        while answers.len() < requests_sent && start.elapsed() < timeout {
             answers.extend(worker.poll());
             std::thread::sleep(Duration::from_millis(10));
         }

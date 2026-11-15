@@ -95,6 +95,10 @@ pub(crate) fn guard<T>(kind: &'static str, f: impl FnOnce() -> Result<T>) -> Res
 /// Largest image edge accepted or produced anywhere in this crate.
 pub const MAX_IMAGE_SIZE: u32 = 16_384;
 
+/// Most texels an imported image resource may decode to by default (8192 × 8192).
+/// Larger images are refused from their header before any pixels are decoded.
+pub const MAX_RESOURCE_TEXELS: u64 = 1 << 26;
+
 /// Read a whole file, refusing files over `cap` bytes.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn read_capped(path: &std::path::Path, cap: u64) -> Result<Vec<u8>> {
@@ -108,15 +112,64 @@ pub(crate) fn read_capped(path: &std::path::Path, cap: u64) -> Result<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }
 
-/// Write `bytes` to `path` atomically: `<path>.tmp` first, then rename over the target.
+/// Create a new temporary file beside `path`, refusing to reuse an existing (possibly symlinked) name.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn create_temp(path: &std::path::Path) -> Result<(std::path::PathBuf, std::fs::File)> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("out");
+
+    // Bound retries when stale files or concurrent writers occupy candidate names
+    const MAX_TEMP_ATTEMPTS: u32 = 100;
+
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
+        let temporary_path = parent.join(format!(".{name}.{}.{attempt}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary_path) {
+            Ok(file) => return Ok((temporary_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(FormatError::Io(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "could not create a temporary file")))
+}
+
+/// Write `bytes` to `path` atomically: a new temporary file first, then rename over the target.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    let res = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path));
-    if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    use std::io::Write;
+
+    let (temporary_path, mut file) = create_temp(path)?;
+    let result = file.write_all(bytes).and_then(|_| file.sync_all());
+    drop(file);
+
+    let result = result.and_then(|_| std::fs::rename(&temporary_path, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
     }
-    Ok(res?)
+
+    Ok(result?)
+}
+
+#[cfg(all(test, unix))]
+mod atomic_tests {
+    use super::write_atomic;
+
+    #[test]
+    fn write_atomic_does_not_follow_a_planted_temp_symlink() -> std::io::Result<()> {
+        let directory = std::env::temp_dir().join(format!("tc-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let target = directory.join("out.png");
+        let victim = directory.join("victim.txt");
+        std::fs::write(&victim, b"safe")?;
+        std::os::unix::fs::symlink(&victim, directory.join("out.png.tmp"))?;
+
+        write_atomic(&target, b"new").map_err(std::io::Error::other)?;
+
+        assert_eq!(std::fs::read(&victim)?, b"safe");
+        assert_eq!(std::fs::read(&target)?, b"new");
+
+        let _ = std::fs::remove_dir_all(&directory);
+        Ok(())
+    }
 }

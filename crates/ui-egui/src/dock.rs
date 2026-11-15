@@ -1828,7 +1828,8 @@ fn link_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: LayerId, link:
             app.cook_link(layer);
         }
         if ui.button(tr("Open in MaterialCraft")).clicked() {
-            let path = std::env::temp_dir().join(format!("{}.mcraft", texturecraft_engine::formats::export::sanitize_file_stem(&link.name)));
+            let ext = texturecraft_engine::link_cmds::source_extension(&link.package);
+            let path = std::env::temp_dir().join(format!("{}.{ext}", texturecraft_engine::formats::export::sanitize_file_stem(&link.name)));
             let opened = app
                 .session
                 .link_package(layer)

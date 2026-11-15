@@ -155,6 +155,15 @@ fn high_dpi_smart_material_hover_stays_within_the_renderer_limit() {
     check_high_dpi_orb_hover(1, "Steel Painted Worn");
 }
 
+// Coverage instrumentation makes the 512px software-rendered preview substantially slower.
+fn high_dpi_worker_timeout() -> Duration {
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() || std::env::var("RUSTFLAGS").is_ok_and(|f| f.contains("instrument-coverage")) {
+        Duration::from_secs(600)
+    } else {
+        WORKER_TIMEOUT
+    }
+}
+
 fn check_high_dpi_orb_hover(shelf_tab: usize, label: &str) {
     use texturecraft_engine::orb_preview::MAX_PREVIEW_SIZE_PX;
 
@@ -166,7 +175,7 @@ fn check_high_dpi_orb_hover(shelf_tab: usize, label: &str) {
 
     let expected = Some([MAX_PREVIEW_SIZE_PX; 2]);
     let started = Instant::now();
-    while largest_drawn_texture(&harness, BIG_PREVIEW_SIZE) != expected && started.elapsed() < WORKER_TIMEOUT {
+    while largest_drawn_texture(&harness, BIG_PREVIEW_SIZE) != expected && started.elapsed() < high_dpi_worker_timeout() {
         harness.run_steps(1);
         std::thread::sleep(Duration::from_millis(20));
     }

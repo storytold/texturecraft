@@ -38,7 +38,7 @@ pub(crate) fn decoded(d: texturecraft_formats::DecodedImage) -> Arc<ImageRes> {
 impl Session {
     /// Add an image resource from bytes (one undo step); returns its unique, sanitized name
     pub fn import_resource_bytes(&mut self, file_name: &str, bytes: Vec<u8>) -> Result<String> {
-        self.edit("Import resource", |s| s.add_image_resource(file_name, bytes, u64::MAX))
+        self.edit("Import resource", |session| session.add_image_resource(file_name, bytes, texturecraft_formats::MAX_RESOURCE_TEXELS))
     }
 
     /// Add an image within a decoded texel budget, inside the caller's edit
@@ -47,39 +47,38 @@ impl Session {
             return Err(EngineError::Other(format!("{file_name} is larger than {} MB", MAX_BYTES >> 20)));
         }
 
-        let image = texturecraft_formats::decode_image_within(&bytes, max_texels).map_err(|e| EngineError::Other(format!("{file_name}: {e}")))?;
-        let leaf = std::path::Path::new(file_name).file_name().and_then(|n| n.to_str()).unwrap_or("image");
+        let image = texturecraft_formats::decode_image_within(&bytes, max_texels).map_err(|error| EngineError::Other(format!("{file_name}: {error}")))?;
+        let leaf = std::path::Path::new(file_name).file_name().and_then(|name| name.to_str()).unwrap_or("image");
         let base = texturecraft_formats::sanitize_resource_name(leaf);
         let mut name = base.clone();
-        let mut n = 2;
+        let mut duplicate_index = 2;
         while self.doc.resources.contains_key(&name) {
-            name = format!("{n}_{base}");
-            n += 1;
+            name = format!("{duplicate_index}_{base}");
+            duplicate_index += 1;
         }
 
         self.doc.resources.insert(name.clone(), Arc::new(bytes));
         self.images.insert(name.clone(), decoded(image));
+
         Ok(name)
     }
 
     /// Decode resources that are not decoded yet and forget removed ones (after undo, redo, load).
     pub fn sync_images(&mut self) {
-        let keep: Vec<String> = self.doc.resources.keys().cloned().collect();
-        self.images.retain(|k, _| keep.contains(k));
-        // Linked materials' packages are resources too, not images.
-        let missing: Vec<(String, Arc<Vec<u8>>)> = self
-            .doc
-            .resources
-            .iter()
-            .filter(|(k, _)| !self.images.contains_key(*k) && !k.ends_with(&format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT)))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (k, bytes) in missing {
-            match texturecraft_formats::decode_image(&bytes) {
-                Ok(d) => {
-                    self.images.insert(k, decoded(d));
+        self.images.retain(|name, _| self.doc.resources.contains_key(name));
+
+        // Linked material packages are resources but cannot be decoded as images
+        let package_suffix = format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT);
+        for (name, bytes) in &self.doc.resources {
+            if self.images.contains_key(name) || name.ends_with(&package_suffix) {
+                continue;
+            }
+
+            match texturecraft_formats::decode_image(bytes) {
+                Ok(image) => {
+                    self.images.insert(name.clone(), decoded(image));
                 }
-                Err(e) => self.log.push(format!("resource {k}: {e}")),
+                Err(error) => self.log.push(format!("resource {name}: {error}")),
             }
         }
     }
