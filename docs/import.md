@@ -272,6 +272,53 @@ The stored blend id goes through the import's blend table (`crates/import/src/bl
 TextureCraft's measured blend rules (`texturecraft_core::rules`, which an imported project switches on). Runners are in
 `crates/import/src/rule_tables.rs`. Run them all with `cargo test -p texturecraft-import --lib rule_table_`.
 
+## Large projects: known limits and where to look
+
+Imported projects are ordinary TextureCraft projects, but they are often far larger than what TextureCraft has been
+used with (several texture sets at 4096², dozens of layers, many anchors and graph filters reading the stack). On such
+projects editing works but is slow: toggling a layer can take minutes where the reference app needs seconds. This is a
+property of TextureCraft's compositor, not of the import, and fixing it is general optimization work any large
+project will need. What we found, for whoever picks it up:
+
+- **The compositor recomputes the whole stack on most edits.** It runs on the CPU, tile by tile (`compose::eval`),
+  and keeps no result per layer. Every edit marks the whole texture set dirty (`engine/src/session.rs`, the
+  `update_for` path), so a visibility toggle composites every layer for every texel again.
+- **The one stack cache only serves the selected layer.** `compose/src/below.rs` (`BelowCache`, `StackKey`) keeps the
+  composite of the layers below the layer being edited; it speeds up painting and slider drags on that layer, not a
+  toggle elsewhere (it is built around the selection in `engine/src/session.rs` and nothing fills it ahead).
+- **Imported projects don't get that cache at all yet.** They switch on the measured compositing rules
+  (`core::rules::CompositeRules`), and the cache keeps no coverage, which those rules need (a layer's mode applies
+  only where something is below). The running stack already carries coverage (`Acc.cov` in `compose/src/eval.rs`);
+  `store_below`/`load_below` would have to keep it, `eval_split` would have to call `group_start` when it enters a
+  folder, `StackKey` would have to include the rules, and the gate in `below.rs` that turns the cache off for them
+  would go. The bit-exact cached-vs-full test (`compose/tests/cache_and_instances.rs`, `check_cached`) should then run
+  under both rule sets.
+- **Anchors, effect layers and filters reading the stack turn the cache off by themselves**, in native projects
+  too (`below.rs`, the checks next to the rules gate). A large imported project has many of them. The cache could
+  stay on unless such a layer actually reads the edited layer.
+- **Filters reading the stack run as whole-set fields** (`compose/src/field_cache.rs`, `compose::graphs`); painting
+  bypasses the field cache, and the mask view and the Levels histogram recompute them on the UI thread.
+- **Reopening recomposites everything.** A saved project stores its layers, graph texts and graph renders, but not
+  the composited result, so the first view after opening composites the whole stack again (minutes on a large
+  project; the UI blocks on it when clicked). Storing a composite per texture set in the project file and showing it
+  until the first recomposite would make large projects open as fast as the reference app does (a file format change).
+- **Graph results made while editing are never freed** (`compose/src/graphs/mod.rs`), and `GraphStore::prune` is
+  never called, so results of deleted layers stay in the project file.
+
+The direction that would get closer to the reference app: keep each layer's result (and recompute only layers whose
+inputs changed, following anchors and stack readers), so a toggle re-blends cached results instead of recompositing;
+later, composite on the GPU. The second touches the "CPU compositor is the reference" principle and is a decision for
+the maintainers.
+
+Other gaps between imported and native editing, all in the UI: locks and placeholder reasons are not shown (an edit
+fails with a toast; nothing in the UI unlocks), graph fills and effects have no parameter editor (`effect.set`
+ignores them), placed projections show as an empty "UV projection" panel, and there is no window for the import
+report. The engine already treats imported layers as ordinary layers; these need UI.
+
+The viewport derives normal detail from height with the project's rule (filter and slope), as export does; two
+smaller differences remain: the viewport combines height with the baked and painted normal in one step where export
+lays height onto the baked normal first, and the CPU path tracer (`render/src/trace.rs`) still uses the native slope.
+
 ## Graph text format
 
 The graph runtime (`crates/graph`, package `texturecraft-graph`) reads node graphs from a plain text format and
