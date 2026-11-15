@@ -152,6 +152,28 @@ impl TileImage {
         self.tile_index(tx, ty).and_then(|i| self.slots().get(i)).and_then(|t| t.as_deref().map(Vec::as_slice))
     }
 
+    /// Whether `other` holds the same texels by identity, without comparing texels: both unchanged since read from
+    /// the same source (a change drops it), or sharing every tile. A clone of a lazy image taken before its tiles were
+    /// read reads its own copy of them, so comparing tile handles alone would call two clones of one unchanged image
+    /// different (and read the tiles to find out). False may still mean the same texels.
+    pub fn same_tiles(&self, other: &TileImage) -> bool {
+        if (self.width, self.height, self.comps) != (other.width, other.height, other.comps) {
+            return false;
+        }
+        if let (Some((a, _)), Some((b, _))) = (&self.source, &other.source)
+            && Arc::ptr_eq(a, b)
+        {
+            return true;
+        }
+        (0..self.tiles_y).all(|ty| {
+            (0..self.tiles_x).all(|tx| match (self.tile_handle(tx, ty), other.tile_handle(tx, ty)) {
+                (None, None) => true,
+                (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+                _ => false,
+            })
+        })
+    }
+
     /// The shared tile handle (for undo snapshots and change fingerprints).
     pub fn tile_handle(&self, tx: u32, ty: u32) -> Option<&TileData> {
         self.tile_index(tx, ty).and_then(|i| self.slots().get(i)).and_then(Option::as_ref)
@@ -540,6 +562,30 @@ mod lazy_tests {
         img.set(0, 0, &[5, 5]);
         assert_eq!(img.release(), 0, "a changed image keeps its tiles");
         assert_eq!(img.get(0, 0), [5, 5, 0, 0]);
+    }
+
+    #[test]
+    fn clones_of_an_unchanged_lazy_image_hold_the_same_tiles_without_reading_them() {
+        let full = sample();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tiles: Vec<Option<Vec<u16>>> =
+            (0..full.tiles_y()).flat_map(|ty| (0..full.tiles_x()).map(move |tx| (tx, ty))).map(|(tx, ty)| full.tile(tx, ty).map(<[u16]>::to_vec)).collect();
+        let counter = reads.clone();
+        // every read a new copy, as reading from the file is
+        let source: TileSource = Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(tiles.iter().map(|t| t.clone().map(Arc::new)).collect())
+        });
+        let img = TileImage::lazy(full.width(), full.height(), full.comps(), full.allocated_count(), source);
+        let before = img.clone();
+        assert_eq!(img.get(3, 4), [7, 9, 0, 0]);
+        assert!(img.same_tiles(&before) && before.same_tiles(&img));
+        assert!(!before.is_loaded(), "compared without reading");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let mut changed = img.clone();
+        changed.set(0, 0, &[5, 5]);
+        assert!(!changed.same_tiles(&img) && !changed.same_tiles(&before));
+        assert!(img.same_tiles(&img.clone()) && !img.same_tiles(&sample()));
     }
 
     #[test]

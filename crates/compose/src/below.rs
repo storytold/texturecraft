@@ -180,23 +180,15 @@ fn image_name(source: &Source) -> Option<&str> {
 
 /// An image compared by tile identity: holding the clone keeps its tiles alive, and a tile
 /// rewritten since is a different allocation (copy-on-write), so pointer equality means the
-/// same pixels without reading them.
+/// same pixels without reading them. An image read lazily from the project file and unchanged
+/// since is the same as long as its source is (see [`TileImage::same_tiles`]): a key taken before
+/// its tiles were read stays equal after.
 #[derive(Debug)]
 struct Shared(TileImage);
 
 impl PartialEq for Shared {
     fn eq(&self, other: &Self) -> bool {
-        let (a, b) = (&self.0, &other.0);
-        a.width() == b.width()
-            && a.height() == b.height()
-            && a.comps() == b.comps()
-            && (0..a.tiles_y()).all(|ty| {
-                (0..a.tiles_x()).all(|tx| match (a.tile_handle(tx, ty), b.tile_handle(tx, ty)) {
-                    (None, None) => true,
-                    (Some(x), Some(y)) => Arc::ptr_eq(x, y),
-                    _ => false,
-                })
-            })
+        self.0.same_tiles(&other.0)
     }
 }
 

@@ -3681,6 +3681,43 @@ mod tests {
     }
 
     #[test]
+    fn whole_set_fields_over_pixels_read_from_the_file_are_kept_across_frames() {
+        // A project opened from its file holds layer pixels that read their tiles when first needed, each read a new
+        // copy. The key a composite keeps may be taken before the tiles are read: it is the same pixels after.
+        let mut graphs = GraphStore::default();
+        let blur = graphs.add_text("format 3\nsize 64\nnode 1 input idx=0\nnode 2 box_blur in=@1 intensity=8\noutput out 2\n");
+        let mut filter = GraphRef::new(blur, "blur");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        let mut f = fixture();
+        let paint = f.project.alloc_id();
+        let l = Layer::new(paint, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+        let paint = f.project.insert_layer(0, l, None, false).unwrap();
+        let mut painted = TileImage::new(64, 64, 4);
+        for y in 0..64 {
+            for x in 0..32 {
+                painted.set(x, y, &[to_u16(1.0), to_u16(0.0), to_u16(0.0), to_u16(1.0)]);
+            }
+        }
+        let texels: Vec<u16> = painted.tile(0, 0).unwrap().to_vec();
+        let from_file = |texels: Vec<u16>| TileImage::lazy(64, 64, 4, 1, Arc::new(move || Some(vec![Some(Arc::new(texels.clone()))])));
+        f.pixels.layers.insert((paint, Channel::BaseColor), from_file(texels.clone()));
+        // pixels no composite reads (a channel the layer does not draw) are never read at all
+        f.pixels.layers.insert((paint, Channel::Roughness), from_file(texels));
+        filter_layer(&mut f, BlendMode::Passthrough, EffectKind::Graph { graph: filter, projection: Projection::default() });
+
+        let mut cache = BelowCache::default();
+        let first = run_cached(&f, &graphs, &mut cache);
+        assert_eq!(first, run_with(&f, &graphs), "the same as without the cache");
+        assert_eq!(cache.fields.len(), 1);
+        // the frames after: each takes the field from the cache instead of computing it again
+        for frame in 1..4 {
+            assert_eq!(run_cached(&f, &graphs, &mut cache), first);
+            assert_eq!(cache.fields.reused(), frame, "frame {frame}: the field is computed once");
+        }
+        assert!(!f.pixels.layers[&(paint, Channel::Roughness)].is_loaded(), "comparing keys reads no pixels");
+    }
+
+    #[test]
     fn graph_filters_read_the_stack_padded_outside_the_islands() {
         let mut graphs = GraphStore::default();
         let blur = graphs.add_text("format 3\nsize 64\nnode 1 input idx=0\nnode 2 box_blur in=@1 intensity=32\noutput out 2\n");
