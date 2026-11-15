@@ -12,6 +12,7 @@ workspace = true
 craft-usd.workspace = true
 # ICC v2 serialization prerequisite: craft-libs#1735; app colour policy stays local.
 craft-cms-icc-v2 = { package = "craft-cms", version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "272a095b61257917693da3d09f2f8ecccd7f0295" }
+craft-dds = { workspace = true }
 craft-materialx = { workspace = true }
 craft-mesh = { workspace = true }
 craft-mcmat = { workspace = true }

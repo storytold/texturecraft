@@ -1093,7 +1093,22 @@ pub(crate) fn export_params(app: &TextureCraftApp) -> serde_json::Value {
     if !e.color_space.is_empty() {
         p["colorSpace"] = json!(e.color_space);
     }
+    if !e.dds_compression.is_empty() {
+        p["ddsCompression"] = json!(e.dds_compression);
+    }
+    if e.dds_mipmaps {
+        p["ddsMipmaps"] = json!(true);
+    }
     p
+}
+
+/// Whether the export writes DDS files: the file type chosen, or a map of the template.
+fn exports_dds(app: &TextureCraftApp) -> bool {
+    use texturecraft_engine::formats::FileFormat;
+    match app.ui.export.format.as_str() {
+        "" => app.session.export_preset(&app.ui.export.preset).is_some_and(|p| p.maps.iter().any(|m| m.format == FileFormat::Dds)),
+        f => FileFormat::from_extension(f) == Some(FileFormat::Dds),
+    }
 }
 
 fn export_settings_tab(app: &mut TextureCraftApp, ui: &mut Ui, presets: &[texturecraft_engine::formats::ExportPreset]) {
@@ -1133,7 +1148,7 @@ fn export_settings_tab(app: &mut TextureCraftApp, ui: &mut Ui, presets: &[textur
             let label = if app.ui.export.format.is_empty() { tr("From template").to_string() } else { app.ui.export.format.clone() };
             egui::ComboBox::from_id_salt("exp_fmt").selected_text(label).show_ui(ui, |ui| {
                 ui.selectable_value(&mut app.ui.export.format, String::new(), tr("From template"));
-                for f in ["png", "jpeg", "tga", "tiff", "bmp", "webp", "exr", "hdr"] {
+                for f in ["png", "jpeg", "tga", "tiff", "bmp", "webp", "exr", "hdr", "dds"] {
                     ui.selectable_value(&mut app.ui.export.format, f.to_string(), f);
                 }
             });
@@ -1203,6 +1218,30 @@ fn export_settings_tab(app: &mut TextureCraftApp, ui: &mut Ui, presets: &[textur
             }
         });
         ui.end_row();
+        if exports_dds(app) {
+            ui.label(tr("DDS compression"));
+            ui.horizontal(|ui| {
+                // The block compressions go by their format names, untranslated.
+                let label = |c: &str| match c {
+                    "none" => tr("None").to_string(),
+                    "bc1" => "BC1 / DXT1".to_string(),
+                    "bc3" => "BC3 / DXT5".to_string(),
+                    _ => tr("Automatic (per map)").to_string(),
+                };
+                egui::ComboBox::from_id_salt("exp_dds")
+                    .width(180.0)
+                    .selected_text(label(&app.ui.export.dds_compression))
+                    .show_ui(ui, |ui| {
+                        for c in ["", "none", "bc1", "bc3"] {
+                            ui.selectable_value(&mut app.ui.export.dds_compression, c.to_string(), label(c));
+                        }
+                    })
+                    .response
+                    .on_hover_text(tr("Automatic: normal maps BC5, maps with alpha BC3, grayscale maps BC4, the others BC1. DDS files are 8-bit."));
+                ui.checkbox(&mut app.ui.export.dds_mipmaps, tr("Generate mipmaps"));
+            });
+            ui.end_row();
+        }
     });
 }
 
@@ -1383,5 +1422,38 @@ mod tests {
         h.get_by_label("Cancel").click();
         h.run_steps(2);
         assert!(h.state().ui.windows.unsaved.is_none());
+    }
+
+    /// DDS is a file type of the export dialog; its options show only for DDS and reach the
+    /// export command.
+    #[test]
+    fn the_export_dialog_offers_dds_and_passes_its_options() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut h = harness();
+        h.state_mut().ui.windows.export = true;
+        h.run_steps(2);
+        assert!(h.query_by_label("Generate mipmaps").is_none(), "no DDS options for PNG");
+        let app = h.state_mut();
+        assert!(!exports_dds(app));
+        app.ui.export.format = "dds".into();
+        assert!(exports_dds(app));
+        let p = export_params(app);
+        assert!(p.get("ddsCompression").is_none() && p.get("ddsMipmaps").is_none(), "automatic, no mipmaps: {p}");
+        h.run_steps(2);
+        assert!(h.query_by_label("Generate mipmaps").is_some(), "DDS options shown");
+        let app = h.state_mut();
+        app.ui.export.dds_compression = "bc3".into();
+        app.ui.export.dds_mipmaps = true;
+        let mut p = export_params(app);
+        assert_eq!((&p["format"], &p["ddsCompression"], &p["ddsMipmaps"]), (&json!("dds"), &json!("bc3"), &json!(true)));
+        p["ts"] = json!("all");
+        let plan = texturecraft_engine::execute(&mut app.session, "export.plan", &p).unwrap();
+        let files = plan.as_array().unwrap();
+        assert!(!files.is_empty() && files.iter().all(|f| f["format"] == "dds"), "{plan}");
+        // Saved dialog settings from before DDS still load.
+        let mut old = serde_json::to_value(&app.ui.export).unwrap();
+        old.as_object_mut().unwrap().retain(|k, _| !k.starts_with("dds"));
+        let loaded: crate::state::ExportUi = serde_json::from_value(old).unwrap();
+        assert_eq!((loaded.dds_compression.as_str(), loaded.dds_mipmaps), ("", false));
     }
 }

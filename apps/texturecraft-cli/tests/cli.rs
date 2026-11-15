@@ -107,6 +107,23 @@ fn new_info_run_bake_export_batch() {
 }
 
 #[test]
+fn export_writes_dds_with_its_options() {
+    let d = tmp("dds");
+    let tex = d.join("tex");
+    let files = ok(&["export", "builtin:cube", p(&tex), "--format", "dds", "--size", "128", "--dds-compression", "bc1", "--dds-mipmaps"]);
+    assert!(files.lines().count() >= 3, "{files}");
+    let le32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    for f in files.lines() {
+        assert!(f.ends_with(".dds"), "{f}");
+        let b = std::fs::read(f).unwrap();
+        assert_eq!((&b[..4], &b[84..88]), (&b"DDS "[..], &b"DXT1"[..]), "{f}");
+        assert_eq!(le32(&b, 28), 8, "{f}: 128 px down to 1 px is eight mip levels");
+    }
+    assert_eq!(cli(&["export", "builtin:cube", p(&tex), "--format", "dds", "--dds-compression", "bc9"]).status.code(), Some(1));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn info_on_a_mesh_reports_uvs() {
     let d = tmp("mesh");
     let obj = d.join("quad.obj");

@@ -1,3 +1,4 @@
+use craft_dds::DdsOptions;
 use image::{DynamicImage, GenericImageView, ImageFormat};
 use texturecraft_core::{ChannelFormat, Project, TextureSet};
 use texturecraft_texel::{to_u16, to_u16_signed};
@@ -66,7 +67,25 @@ fn find<'a>(files: &'a [ExportedFile], suffix: &str) -> &'a ExportedFile {
 
 fn decode(f: &ExportedFile) -> DynamicImage {
     let ext = f.name.rsplit('.').next().unwrap();
+    if ext == "dds" {
+        return decode_dds(&f.bytes);
+    }
     image::load_from_memory_with_format(&f.bytes, ImageFormat::from_extension(ext).unwrap()).unwrap()
+}
+
+/// A DDS file (its top level) through craft-dds' reader, in the layout it was stored in (BC4
+/// reads back as gray, BC5 as RGB with blue 0).
+fn decode_dds(bytes: &[u8]) -> DynamicImage {
+    use craft_dds::Layout as L;
+    let tex = craft_dds::Texture::parse(bytes).unwrap();
+    let (w, h) = (tex.width(), tex.height());
+    let data = tex.decode().unwrap();
+    match tex.layout() {
+        L::Gray => DynamicImage::ImageLuma8(image::GrayImage::from_raw(w, h, data).unwrap()),
+        L::GrayA => DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_raw(w, h, data).unwrap()),
+        L::Rgb => DynamicImage::ImageRgb8(image::RgbImage::from_raw(w, h, data).unwrap()),
+        L::Rgba => DynamicImage::ImageRgba8(image::RgbaImage::from_raw(w, h, data).unwrap()),
+    }
 }
 
 fn default_channels() -> Vec<Channel> {
@@ -657,12 +676,12 @@ fn a_chosen_colour_space_is_embedded_as_an_icc_profile() {
             }
             for space in ColorSpace::ALL {
                 let mut warnings = Vec::new();
-                let bytes = encode(format, depth, (8, 8), 3, &data, &[false; 3], Some(space), &mut warnings).unwrap();
+                let bytes = encode(format, depth, (8, 8), 3, &data, &[false; 3], Some(space), DdsOptions::default(), &mut warnings).unwrap();
                 assert_eq!(embedded_icc(format, &bytes), crate::icc::profile(space), "{format:?} {depth}-bit {space:?}");
                 assert!(warnings.is_empty(), "{warnings:?}");
             }
             // No colour space chosen (a data map, or the default): nothing is embedded.
-            let bytes = encode(format, depth, (8, 8), 3, &data, &[false; 3], None, &mut Vec::new()).unwrap();
+            let bytes = encode(format, depth, (8, 8), 3, &data, &[false; 3], None, DdsOptions::default(), &mut Vec::new()).unwrap();
             assert_eq!(embedded_icc(format, &bytes), None, "{format:?} {depth}-bit");
         }
     }
@@ -675,9 +694,10 @@ fn exr_carries_the_chromaticities_of_the_space() {
         let meta = exr::meta::MetaData::read_from_buffered(Cursor::new(bytes), false).unwrap();
         meta.headers[0].shared_attributes.chromaticities
     };
-    assert!(read(&encode(FileFormat::Exr, 16, (4, 4), 3, &data, &[false; 3], None, &mut Vec::new()).unwrap()).is_none());
+    assert!(read(&encode(FileFormat::Exr, 16, (4, 4), 3, &data, &[false; 3], None, DdsOptions::default(), &mut Vec::new()).unwrap()).is_none());
     for space in ColorSpace::ALL {
-        let c = read(&encode(FileFormat::Exr, 32, (4, 4), 3, &data, &[false; 3], Some(space), &mut Vec::new()).unwrap()).unwrap_or_else(|| panic!("{space:?}"));
+        let c = read(&encode(FileFormat::Exr, 32, (4, 4), 3, &data, &[false; 3], Some(space), DdsOptions::default(), &mut Vec::new()).unwrap())
+            .unwrap_or_else(|| panic!("{space:?}"));
         let [r, g, b, w] = space.chromaticities();
         for (got, want) in [(c.red, r), (c.green, g), (c.blue, b), (c.white, w)] {
             assert!((f64::from(got.0) - want[0]).abs() < 1e-5 && (f64::from(got.1) - want[1]).abs() < 1e-5, "{space:?}: {got:?} vs {want:?}");
@@ -688,12 +708,252 @@ fn exr_carries_the_chromaticities_of_the_space() {
 #[test]
 fn formats_without_a_place_for_a_colour_space_say_so() {
     let data = vec![0.25f32; 4 * 4 * 3];
-    for format in [FileFormat::Tga, FileFormat::Bmp, FileFormat::Hdr] {
+    for format in [FileFormat::Tga, FileFormat::Bmp, FileFormat::Hdr, FileFormat::Dds] {
         let mut warnings = Vec::new();
-        encode(format, 8, (4, 4), 3, &data, &[false; 3], Some(ColorSpace::AcesCg), &mut warnings).unwrap();
+        encode(format, 8, (4, 4), 3, &data, &[false; 3], Some(ColorSpace::AcesCg), DdsOptions::default(), &mut warnings).unwrap();
         assert!(warnings.iter().any(|w| w.contains("colour space") && w.contains("ACEScg")), "{format:?}: {warnings:?}");
         let mut quiet = Vec::new();
-        encode(format, 8, (4, 4), 3, &data, &[false; 3], None, &mut quiet).unwrap();
+        encode(format, 8, (4, 4), 3, &data, &[false; 3], None, DdsOptions::default(), &mut quiet).unwrap();
         assert!(quiet.is_empty(), "{format:?}: nothing to say without a chosen space: {quiet:?}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// DDS.
+
+const DDPF_FOURCC: u32 = 0x4;
+const DDSCAPS_MIPMAP: u32 = 0x40_0000;
+
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+fn dds_opts(preset: &ExportPreset, compression: DdsCompression, mipmaps: bool) -> ExportOptions {
+    ExportOptions { format_override: Some(FileFormat::Dds), dds: DdsExport { compression, mipmaps }, ..ExportOptions::new(preset.clone()) }
+}
+
+/// The default channels with an opacity ramp (transparent at the left, opaque at the right), so
+/// the base colour map has a soft alpha.
+fn fx_with_alpha() -> Fx {
+    let mut channels = default_channels();
+    channels.push(Channel::Opacity);
+    let mut fx = Fx::new(&channels);
+    fx.set_all(Channel::Opacity, |x, _| [x as f32 / 63.0; 3]);
+    fx
+}
+
+#[test]
+fn uncompressed_dds_reads_back_exactly_as_the_8_bit_png() {
+    let fx = fx_with_alpha();
+    let preset = builtin_preset("glTF PBR Metal Roughness").unwrap();
+    let png = fx.render(&ExportOptions { format_override: Some(FileFormat::Png), bit_depth_override: Some(8), ..ExportOptions::new(preset.clone()) });
+    let dds = fx.render(&dds_opts(&preset, DdsCompression::None, false));
+    assert_eq!(dds.len(), 3);
+    for (d, p) in dds.iter().zip(&png) {
+        assert_eq!(d.name.replace(".dds", ".png"), p.name);
+        assert_eq!(&d.bytes[..4], b"DDS ", "{}", d.name);
+        assert_eq!(le32(&d.bytes, 80) & DDPF_FOURCC, 0, "{}: uncompressed", d.name);
+        let (dd, pp) = (decode(d), decode(p));
+        assert_eq!(dd.color(), pp.color(), "{}: same channels", d.name);
+        assert_eq!(dd.as_bytes(), pp.as_bytes(), "{}: same pixels", d.name);
+    }
+}
+
+#[test]
+fn block_compressed_dds_stays_within_the_block_error() {
+    let fx = fx_with_alpha();
+    let preset = builtin_preset("glTF PBR Metal Roughness").unwrap();
+    let png = fx.render(&ExportOptions { format_override: Some(FileFormat::Png), bit_depth_override: Some(8), ..ExportOptions::new(preset.clone()) });
+    for (compression, fourcc) in [(DdsCompression::Bc1, b"DXT1"), (DdsCompression::Bc3, b"DXT5")] {
+        let files = fx.render(&dds_opts(&preset, compression, false));
+        for (d, p) in files.iter().zip(&png) {
+            assert_eq!(&d.bytes[84..88], fourcc, "{}", d.name);
+            let (dd, pp) = (decode(d).to_rgba8(), decode(p).to_rgba8());
+            assert_eq!(dd.dimensions(), (RES, RES));
+            for (got, want) in dd.pixels().zip(pp.pixels()) {
+                let colour = (0..3).map(|k| got[k].abs_diff(want[k])).max().unwrap();
+                if compression == DdsCompression::Bc1 {
+                    // BC1 alpha is on or off; transparent texels are black.
+                    assert!(got[3] == 0 || got[3] == 255, "{}: {got:?}", d.name);
+                    if want[3] <= 100 || want[3] >= 155 {
+                        assert_eq!(got[3] == 255, want[3] >= 128, "{}: {got:?} vs {want:?}", d.name);
+                    }
+                    if got[3] == 255 {
+                        assert!(colour <= 24, "{}: {got:?} vs {want:?}", d.name);
+                    }
+                } else {
+                    assert!(got[3].abs_diff(want[3]) <= 4, "{}: alpha {got:?} vs {want:?}", d.name);
+                    // Near black the sRGB ramps in red and green are steep, so a 4x4 block spans
+                    // a square of about 0-62 in both: four colours on one line can be up to about
+                    // 30 levels off in one channel there. Transparent texels' colour is never seen.
+                    assert!(want[3] == 0 || colour <= 36, "{}: {got:?} vs {want:?}", d.name);
+                }
+            }
+        }
+        let alpha_warning = find(&files, "_BaseColor.").warnings.iter().any(|w| w.contains("BC1"));
+        assert_eq!(alpha_warning, compression == DdsCompression::Bc1, "BC1 says it loses the soft alpha");
+    }
+}
+
+/// The DXGI format of a DX10 DDS file (BC4 and BC5), or `None` for a legacy header.
+fn dxgi(b: &[u8]) -> Option<u32> {
+    (&b[84..88] == b"DX10").then(|| le32(b, 128))
+}
+
+/// Where the top level starts: after the DX10 header when there is one.
+fn dds_data_start(b: &[u8]) -> usize {
+    if dxgi(b).is_some() { 148 } else { 128 }
+}
+
+#[test]
+fn automatic_dds_compression_writes_normals_as_bc5_and_they_keep_their_convention() {
+    let mut fx = fx_with_alpha();
+    // A normal tilted up and turning from left to right, so the DirectX green flip and the
+    // rebuilt Z show.
+    fx.set_all(Channel::Normal, |x, _| [0.3 + x as f32 / 157.5, 0.8, 0.9]);
+    let preset = builtin_preset("glTF PBR Metal Roughness").unwrap();
+    let files = fx.render(&dds_opts(&preset, DdsCompression::Auto, false));
+    assert_eq!(&find(&files, "_BaseColor.").bytes[84..88], b"DXT5", "colour with alpha: BC3");
+    assert_eq!(&find(&files, "OcclusionRoughnessMetallic.").bytes[84..88], b"DXT1", "packed RGB without alpha: BC1");
+    let normal = |format, compression| {
+        let opts = ExportOptions { normal_format: Some(format), ..dds_opts(&preset, compression, false) };
+        let files = fx.render(&opts);
+        let f = find(&files, "_Normal.");
+        (dxgi(&f.bytes), decode(f).to_rgb8())
+    };
+    for format in [NormalFormat::OpenGl, NormalFormat::DirectX] {
+        let (code, bc5) = normal(format, DdsCompression::Auto);
+        assert_eq!(code, Some(83), "{format:?}: normal maps are BC5 (DXGI_FORMAT_BC5_UNORM)");
+        let (code, exact) = normal(format, DdsCompression::None);
+        assert_eq!(code, None);
+        assert_eq!(bc5.dimensions(), (RES, RES));
+        let unit = |v: u8| v as f32 / 255.0 * 2.0 - 1.0;
+        for (got, want) in bc5.pixels().zip(exact.pixels()) {
+            assert!(got[0].abs_diff(want[0]) <= 4 && got[1].abs_diff(want[1]) <= 4, "{format:?}: X and Y {got:?} vs {want:?}");
+            assert_eq!(got[2], 0, "BC5 has no third channel");
+            // What a renderer does: Z from X and Y of the unit normal.
+            let (x, y) = (unit(got[0]), unit(got[1]));
+            let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+            assert!((z - unit(want[2])).abs() < 0.06, "{format:?}: Z {z} vs {want:?}");
+        }
+    }
+    let (gl, dx) = (normal(NormalFormat::OpenGl, DdsCompression::Auto).1, normal(NormalFormat::DirectX, DdsCompression::Auto).1);
+    let (gl, dx) = (gl.get_pixel(9, 9).0, dx.get_pixel(9, 9).0);
+    assert!(gl[1] > 140, "tilted up: {gl:?}");
+    assert!(gl[0].abs_diff(dx[0]) <= 2);
+    assert!((gl[1] as i32 + dx[1] as i32 - 255).abs() <= 3, "DirectX flips green: {gl:?} {dx:?}");
+}
+
+#[test]
+fn automatic_dds_compression_writes_grayscale_maps_as_bc4() {
+    let mut fx = Fx::new(&default_channels());
+    fx.set_all(Channel::Roughness, |x, y| [(x + y) as f32 / 126.0; 3]);
+    let preset = builtin_preset("Document channels + Normal + AO").unwrap();
+    let png = fx.render(&ExportOptions { format_override: Some(FileFormat::Png), bit_depth_override: Some(8), ..ExportOptions::new(preset.clone()) });
+    let dds = fx.render(&dds_opts(&preset, DdsCompression::Auto, false));
+    assert_eq!(dds.len(), png.len());
+    let mut gray = 0;
+    for (d, p) in dds.iter().zip(&png) {
+        let want = decode(p);
+        let code = dxgi(&d.bytes);
+        match want.color() {
+            image::ColorType::L8 => {
+                gray += 1;
+                assert_eq!(code, Some(80), "{}: grayscale maps are BC4 (DXGI_FORMAT_BC4_UNORM)", d.name);
+                let got = decode(d);
+                assert_eq!(got.color(), image::ColorType::L8, "{}: BC4 reads back as gray", d.name);
+                for (g, w) in got.to_luma8().pixels().zip(want.to_luma8().pixels()) {
+                    assert!(g[0].abs_diff(w[0]) <= 2, "{}: {g:?} vs {w:?}", d.name);
+                }
+            }
+            _ if d.name.contains("_normal.") => assert_eq!(code, Some(83), "{}", d.name),
+            _ => assert_eq!(&d.bytes[84..88], b"DXT1", "{}: colour without alpha", d.name),
+        }
+    }
+    assert!(gray >= 3, "roughness, metallic, height and the other gray maps: {gray}");
+}
+
+#[test]
+fn a_normal_in_red_and_green_with_a_constant_blue_is_bc5_but_a_packed_one_is_not() {
+    let json = r#"{"name":"Game","maps":[
+        {"file":"$textureSet_nrg","format":"Dds","bit_depth":8,"channels":[["R",{"Virtual":{"map":"NormalOpenGl","component":0}}],["G",{"Virtual":{"map":"NormalOpenGl","component":1}}],["B",{"Constant":1.0}]]},
+        {"file":"$textureSet_packed","format":"Dds","bit_depth":8,"channels":[["R",{"Virtual":{"map":"NormalOpenGl","component":0}}],["G",{"Virtual":{"map":"NormalOpenGl","component":1}}],["B",{"Channel":{"channel":"Roughness"}}]]}]}"#;
+    let files = Fx::new(&default_channels()).render(&ExportOptions::new(preset_from_json(json).unwrap()));
+    assert_eq!(dxgi(&find(&files, "_nrg.").bytes), Some(83), "X and Y with a constant Z: BC5");
+    assert_eq!(&find(&files, "_packed.").bytes[84..88], b"DXT1", "roughness in blue must survive: BC1");
+}
+
+#[test]
+fn explicit_dds_compressions_ignore_the_map_kind() {
+    let fx = Fx::new(&default_channels());
+    let preset = builtin_preset("Document channels + Normal + AO").unwrap();
+    for (compression, fourcc) in [(DdsCompression::Bc1, b"DXT1"), (DdsCompression::Bc3, b"DXT5")] {
+        for f in fx.render(&dds_opts(&preset, compression, false)) {
+            assert_eq!(&f.bytes[84..88], fourcc, "{compression:?} {}: grayscale and normal maps too", f.name);
+            assert_eq!(decode(&f).dimensions(), (RES, RES));
+        }
+    }
+    for f in fx.render(&dds_opts(&preset, DdsCompression::None, false)) {
+        assert_eq!(le32(&f.bytes, 80) & DDPF_FOURCC, 0, "{}: uncompressed", f.name);
+    }
+}
+
+#[test]
+fn dds_mipmaps_add_the_whole_chain_below_the_same_top_level() {
+    let fx = Fx::new(&default_channels());
+    // Gray (BC4), normal (BC5) and colour maps with every compression.
+    let preset = builtin_preset("Document channels + Normal + AO").unwrap();
+    for compression in DdsCompression::ALL {
+        let flat = fx.render(&dds_opts(&preset, compression, false));
+        let mipped = fx.render(&dds_opts(&preset, compression, true));
+        for (f, m) in flat.iter().zip(&mipped) {
+            assert_eq!((le32(&f.bytes, 28), le32(&f.bytes, 108) & DDSCAPS_MIPMAP), (1, 0), "{compression:?} {}", f.name);
+            assert_eq!((le32(&m.bytes, 28), le32(&m.bytes, 108) & DDSCAPS_MIPMAP), (7, DDSCAPS_MIPMAP), "{compression:?} {}: 64 px to 1 px", m.name);
+            assert_eq!(dxgi(&m.bytes), dxgi(&f.bytes), "{compression:?} {}", m.name);
+            assert!(m.bytes.len() > f.bytes.len());
+            let start = dds_data_start(&f.bytes);
+            assert_eq!(m.bytes[start..f.bytes.len()], f.bytes[start..], "{compression:?} {}: the same top level", m.name);
+            assert_eq!(decode(m).as_bytes(), decode(f).as_bytes(), "{compression:?} {}", m.name);
+        }
+    }
+}
+
+#[test]
+fn dds_is_written_at_8_bits_whatever_depth_is_asked() {
+    let fx = Fx::new(&default_channels());
+    let preset = builtin_preset("glTF PBR Metal Roughness").unwrap();
+    let eight = fx.render(&dds_opts(&preset, DdsCompression::None, false));
+    for depth in [16u8, 32] {
+        let opts = ExportOptions { bit_depth_override: Some(depth), ..dds_opts(&preset, DdsCompression::None, false) };
+        assert!(list_outputs(&fx.project, 0, "sphere", &opts).unwrap().iter().all(|p| p.format == FileFormat::Dds && p.bit_depth == 8));
+        assert_eq!(fx.render(&opts), eight, "a {depth}-bit request writes the same 8-bit files");
+    }
+    assert_eq!(FileFormat::from_extension(".DDS"), Some(FileFormat::Dds));
+}
+
+#[test]
+fn a_preset_with_dds_maps_round_trips_and_exports_dds() {
+    let json = r#"{"name":"Game","maps":[
+        {"file":"$textureSet_albedo","format":"Dds","bit_depth":16,"channels":[["R",{"Channel":{"channel":"BaseColor","component":0}}],["G",{"Channel":{"channel":"BaseColor","component":1}}],["B",{"Channel":{"channel":"BaseColor","component":2}}]]},
+        {"file":"$textureSet_rough","format":"Png","bit_depth":8,"channels":[["L",{"Channel":{"channel":"Roughness"}}]]}]}"#;
+    let preset = preset_from_json(json).unwrap();
+    assert_eq!(preset.maps[0].format, FileFormat::Dds);
+    assert_eq!(preset_from_json(&preset_to_json(&preset).unwrap()).unwrap(), preset);
+    let fx = Fx::new(&default_channels());
+    let opts = ExportOptions::new(preset);
+    let files = fx.render(&opts);
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["Body_Set_albedo.dds", "Body_Set_rough.png"]);
+    assert_eq!(list_outputs(&fx.project, 0, "sphere", &opts).unwrap().first().map(|p| p.bit_depth), Some(8));
+    assert_eq!(&files[0].bytes[84..88], b"DXT1", "automatic: colour without alpha is BC1");
+    // The options themselves survive a serde round trip, and old option JSON without them loads.
+    let with = ExportOptions { dds: DdsExport { compression: DdsCompression::Bc3, mipmaps: true }, ..opts.clone() };
+    assert_eq!(serde_json::from_str::<ExportOptions>(&serde_json::to_string(&with).unwrap()).unwrap().dds, with.dds);
+    let mut old = serde_json::to_value(&opts).unwrap();
+    old.as_object_mut().unwrap().remove("dds");
+    assert_eq!(serde_json::from_value::<ExportOptions>(old).unwrap().dds, DdsExport::default());
+    for (name, c) in [("auto", DdsCompression::Auto), ("NONE", DdsCompression::None), ("dxt1", DdsCompression::Bc1), ("Bc3", DdsCompression::Bc3)] {
+        assert_eq!(DdsCompression::from_name(name), Some(c));
+    }
+    assert_eq!(DdsCompression::from_name("bc5"), None);
 }

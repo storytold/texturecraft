@@ -444,3 +444,29 @@ async fn mesh_files_export_bake_and_reimport_in_the_workspace() {
     shutdown(c, server).await;
     std::fs::remove_dir_all(&base).unwrap();
 }
+
+/// `textures_export` writes DDS textures with the compression and mipmaps asked for, and refuses
+/// a compression it doesn't write.
+#[tokio::test(flavor = "multi_thread")]
+async fn textures_export_writes_dds() {
+    let base = tmp("dds");
+    let (c, server) = connect(workspace(&base)).await;
+    run(&c, "layer.add.fill", json!({"color": [0.8, 0.2, 0.1], "roughness": 0.4})).await;
+    let le32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    let r =
+        tool(&c, "textures_export", json!({"dir": "dds", "preset": "glTF PBR Metal Roughness", "format": "dds", "ddsCompression": "bc3", "ddsMipmaps": true}))
+            .await;
+    let files: Vec<&str> = r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
+    assert!(files.len() >= 3 && files.iter().all(|f| f.ends_with(".dds")), "{r}");
+    for f in &files {
+        let b = std::fs::read(base.join(f)).unwrap();
+        assert_eq!(&b[..4], b"DDS ", "{f}");
+        assert_eq!(&b[84..88], b"DXT5", "{f}: BC3 asked for");
+        // A 128 px set: 128, 64, … 1 is eight levels.
+        assert_eq!((le32(&b, 12), le32(&b, 16), le32(&b, 28)), (128, 128, 8), "{f}");
+    }
+    let e = tool_err(&c, "textures_export", json!({"dir": "dds", "format": "dds", "ddsCompression": "bc7"})).await;
+    assert!(e.contains("ddsCompression"), "{e}");
+    shutdown(c, server).await;
+    std::fs::remove_dir_all(&base).unwrap();
+}

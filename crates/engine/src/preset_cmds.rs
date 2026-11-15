@@ -305,6 +305,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A user preset with DDS maps keeps their format through save and get, and exports DDS
+    /// files: the normal map BC5 (automatic compression) in its DirectX convention, the colour
+    /// map BC1.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_user_preset_with_dds_maps_saves_and_exports_dds() {
+        let mut s = session();
+        run(&mut s, "layer.add.fill", json!({"color": [0.9, 0.1, 0.1], "roughness": 0.3})).unwrap();
+        let normal = |map: &str| {
+            let slots: Vec<Value> = ["R", "G", "B"].iter().zip(0..).map(|(d, k)| json!([d, {"Virtual": {"map": map, "component": k}}])).collect();
+            json!(slots)
+        };
+        let colour: Vec<Value> = ["R", "G", "B"].iter().zip(0..).map(|(d, k)| json!([d, {"Channel": {"channel": "BaseColor", "component": k}}])).collect();
+        let game = json!({"name": "Game DDS", "maps": [
+            {"file": "$textureSet_albedo", "format": "Dds", "bit_depth": 8, "channels": colour},
+            {"file": "$textureSet_dx", "format": "Dds", "bit_depth": 8, "channels": normal("NormalDirectX")},
+            {"file": "$textureSet_gl", "format": "Png", "bit_depth": 8, "channels": normal("NormalOpenGl")},
+        ]});
+        run(&mut s, "export.preset.save", json!({"preset": game})).unwrap();
+        let got = run(&mut s, "export.preset.get", json!({"name": "Game DDS"})).unwrap();
+        let formats: Vec<&str> = got["maps"].as_array().unwrap().iter().map(|m| m["format"].as_str().unwrap()).collect();
+        assert_eq!(formats, ["Dds", "Dds", "Png"], "{got}");
+        s.update();
+        let coverage = s.caches[0].gbuf.coverage_mask();
+        let i = coverage.iter().position(|c| *c).unwrap();
+        let res = s.doc.project.texture_sets[0].resolution as usize;
+        let set = s.doc.project.texture_sets[0].name.clone();
+        let dir = std::env::temp_dir().join(format!("tc_user_preset_dds_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let r = run(&mut s, "file.exportTextures", json!({"dir": dir.display().to_string(), "preset": "Game DDS", "ts": 0})).unwrap();
+        let mut names: Vec<String> =
+            r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().rsplit(['/', '\\']).next().unwrap().to_string()).collect();
+        names.sort();
+        assert_eq!(names, [format!("{set}_albedo.dds"), format!("{set}_dx.dds"), format!("{set}_gl.png")]);
+        let le32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        let albedo = std::fs::read(dir.join(format!("{set}_albedo.dds"))).unwrap();
+        assert_eq!((&albedo[..4], &albedo[84..88]), (&b"DDS "[..], &b"DXT1"[..]), "colour without alpha: BC1");
+        let dx = std::fs::read(dir.join(format!("{set}_dx.dds"))).unwrap();
+        assert_eq!((&dx[84..88], le32(&dx, 128)), (&b"DX10"[..], 83), "normal maps are BC5 (DXGI_FORMAT_BC5_UNORM)");
+        // BC5 keeps X and Y (red and green) and reads back with blue 0.
+        let rg = &craft_dds::Texture::parse(&dx).unwrap().decode().unwrap()[i * 3..i * 3 + 3];
+        let gl = image::open(dir.join(format!("{set}_gl.png"))).unwrap().to_rgb8().get_pixel((i % res) as u32, (i / res) as u32).0;
+        assert!(rg[0].abs_diff(gl[0]) <= 4 && rg[2] == 0, "{rg:?} vs {gl:?}");
+        assert!((gl[1] as i32 + rg[1] as i32 - 255).abs() <= 4, "DirectX flips green: {gl:?} {rg:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn the_library_folder_mirrors_saves_renames_and_removals() {

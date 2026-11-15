@@ -9,6 +9,7 @@ mod bake_tiles;
 mod color_selection;
 mod content_effects;
 mod export_colour_space;
+mod export_dds;
 mod filter_swap;
 mod filters;
 mod generator_inputs;

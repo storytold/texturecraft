@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_core::{NormalFormat, PROJECT_EXT};
 use texturecraft_core::{Project, TextureSet};
-use texturecraft_formats::{ExportInput, ExportOptions, ExportedFile, FileFormat, Padding, ProjectFile};
+use texturecraft_formats::{DdsCompression, ExportInput, ExportOptions, ExportedFile, FileFormat, Padding, ProjectFile};
 use texturecraft_geom::{Mesh, primitives};
 
 use crate::commands::{CommandSpec, always, bad, normal_format_param, strp, u64p};
@@ -51,7 +51,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export textures",
             ["File"],
             None,
-            "{dir, preset?: built-in or user preset name, or a preset object {name, maps}, ts?: index|\"all\", format?: png|jpg|tga|tif|exr|..., bitDepth?, padding?: none|dilation|dilationDefault|infinite, dilation?: px, size?: px, normalFormat?: openGl|directX, colorSpace?: sRGB (default for 8/16-bit files)|Linear Rec.709 (default for exr, hdr)|ACEScg|ACES2065-1 (colour maps are converted, data maps never are; 8/16-bit files clamp to 0-1; a chosen space is also recorded in the colour maps: an ICC profile in PNG, JPEG, TIFF and WebP, the chromaticities in EXR; TGA, BMP and HDR can't hold one and warn), materialX?: bool (also write a .mtlx OpenPBR material per texture set; needs the \"OpenPBR (separate maps)\" preset)}",
+            "{dir, preset?: built-in or user preset name, or a preset object {name, maps}, ts?: index|\"all\", format?: png|jpg|tga|tif|exr|dds|..., bitDepth? (8-bit-only formats such as jpg, tga, bmp and dds write 8 bits), padding?: none|dilation|dilationDefault|infinite, dilation?: px, size?: px, normalFormat?: openGl|directX, colorSpace?: sRGB (default for 8/16-bit files)|Linear Rec.709 (default for exr, hdr)|ACEScg|ACES2065-1 (colour maps are converted, data maps never are; 8/16-bit files clamp to 0-1; a chosen space is also recorded in the colour maps: an ICC profile in PNG, JPEG, TIFF and WebP, the chromaticities in EXR; TGA, BMP, HDR and DDS can't hold one and warn), ddsCompression?: auto (default: normal maps bc5, maps with alpha bc3, grayscale maps bc4, others bc1)|none|bc1|bc3 (BC7 is not written), ddsMipmaps?: bool (DDS: also write the full mip chain; default false), materialX?: bool (also write a .mtlx OpenPBR material per texture set; needs the \"OpenPBR (separate maps)\" preset)}",
             always,
             export_textures
         ),
@@ -69,7 +69,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "List export outputs",
             [],
             None,
-            "{preset?: name or preset object, ts?, format?, bitDepth?, size?, colorSpace?} → [{ts, map, file, format, bitDepth, warnings}]",
+            "{preset?: name or preset object, ts?, format?, bitDepth?, size?, colorSpace?, ddsCompression?, ddsMipmaps?} → [{ts, map, file, format, bitDepth, warnings}]",
             always,
             plan
         ),
@@ -307,6 +307,18 @@ pub fn export_options(s: &Session, p: &Value, cmd: &str) -> Result<ExportOptions
         }
         // A value of the wrong type is an error, not the format's default space.
         Some(other) => return Err(bad(cmd, format!("`colorSpace` is a name (sRGB, Linear Rec.709, ACEScg or ACES2065-1), not {other}"))),
+    }
+    match p.get("ddsCompression") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(name)) => {
+            o.dds.compression = DdsCompression::from_name(name).ok_or_else(|| bad(cmd, format!("unknown ddsCompression `{name}` (auto, none, bc1 or bc3)")))?;
+        }
+        Some(other) => return Err(bad(cmd, format!("`ddsCompression` is a name (auto, none, bc1 or bc3), not {other}"))),
+    }
+    match p.get("ddsMipmaps") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(on)) => o.dds.mipmaps = *on,
+        Some(other) => return Err(bad(cmd, format!("`ddsMipmaps` is true or false, not {other}"))),
     }
     Ok(o)
 }

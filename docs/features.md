@@ -111,6 +111,12 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   anisotropy, transmission and subsurface maps), separate maps, mesh maps and document channels, in
   PNG, JPEG, TGA, TIFF, BMP, WEBP, EXR or HDR at 8, 16 or 32 bits, with UV padding, size
   override and OpenGL or DirectX normals.
+- **DDS export** for game engines: 8-bit DDS textures, uncompressed or block-compressed, with or
+  without the full mip chain. Automatic compression picks per map: normal maps BC5 (X and Y; the
+  renderer rebuilds Z), maps with alpha BC3 / DXT5, grayscale maps (roughness, metallic, height,
+  ambient occlusion) BC4 and the other colour maps BC1 / DXT1. BC1 or BC3 can also be forced for
+  every map, or no compression. 16- and 32-bit requests are written at 8 bits. The normal map
+  format (OpenGL or DirectX) applies as for any other format. BC7 is not written.
 - **Output template editor:** build your own presets with per-channel packing and converted maps,
   and share them as JSON.
 - **Mesh export** to OBJ with an MTL material library and its maps (PBR extension keys for

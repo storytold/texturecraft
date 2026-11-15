@@ -75,11 +75,23 @@ pub enum FileFormat {
     Webp,
     Exr,
     Hdr,
+    /// DirectDraw Surface: 8 bits per channel, uncompressed or BC1/BC3/BC4/BC5, optionally with
+    /// mipmaps ([`DdsExport`]).
+    Dds,
 }
 
 impl FileFormat {
-    pub const ALL: [FileFormat; 8] =
-        [FileFormat::Png, FileFormat::Jpeg, FileFormat::Tga, FileFormat::Tiff, FileFormat::Bmp, FileFormat::Webp, FileFormat::Exr, FileFormat::Hdr];
+    pub const ALL: [FileFormat; 9] = [
+        FileFormat::Png,
+        FileFormat::Jpeg,
+        FileFormat::Tga,
+        FileFormat::Tiff,
+        FileFormat::Bmp,
+        FileFormat::Webp,
+        FileFormat::Exr,
+        FileFormat::Hdr,
+        FileFormat::Dds,
+    ];
 
     pub fn extension(self) -> &'static str {
         match self {
@@ -91,6 +103,7 @@ impl FileFormat {
             FileFormat::Webp => "webp",
             FileFormat::Exr => "exr",
             FileFormat::Hdr => "hdr",
+            FileFormat::Dds => "dds",
         }
     }
 
@@ -122,6 +135,70 @@ impl FileFormat {
     pub fn depth(self, want: u8) -> u8 {
         self.bit_depths().iter().copied().min_by_key(|d| (d.abs_diff(want), std::cmp::Reverse(*d))).unwrap_or(8)
     }
+}
+
+/// How DDS files are compressed. BC4 (one channel) and BC5 (two channels) are picked per map by
+/// [`DdsCompression::Auto`]; BC7 is not written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DdsCompression {
+    /// Per map: normal maps BC5 (X and Y; the renderer rebuilds Z), maps with alpha BC3,
+    /// grayscale maps BC4, the other colour maps BC1.
+    #[default]
+    Auto,
+    /// 8 bits per channel, lossless.
+    None,
+    /// BC1 (DXT1), 4 bits per pixel; alpha is only on or off.
+    Bc1,
+    /// BC3 (DXT5), 8 bits per pixel with smooth alpha.
+    Bc3,
+}
+
+impl DdsCompression {
+    pub const ALL: [DdsCompression; 4] = [DdsCompression::Auto, DdsCompression::None, DdsCompression::Bc1, DdsCompression::Bc3];
+
+    /// The name commands use: `auto`, `none`, `bc1` or `bc3`.
+    pub fn name(self) -> &'static str {
+        match self {
+            DdsCompression::Auto => "auto",
+            DdsCompression::None => "none",
+            DdsCompression::Bc1 => "bc1",
+            DdsCompression::Bc3 => "bc3",
+        }
+    }
+
+    /// [`Self::name`] back to a compression, also taking `dxt1` and `dxt5`, in any case.
+    pub fn from_name(name: &str) -> Option<DdsCompression> {
+        match name.to_ascii_lowercase().as_str() {
+            "auto" => Some(DdsCompression::Auto),
+            "none" => Some(DdsCompression::None),
+            "bc1" | "dxt1" => Some(DdsCompression::Bc1),
+            "bc3" | "dxt5" => Some(DdsCompression::Bc3),
+            _ => None,
+        }
+    }
+
+    /// The compression a map of `n` components (1 L, 2 LA, 3 RGB, 4 RGBA) is written with;
+    /// `normal` for a normal map.
+    fn resolve(self, normal: bool, n: usize) -> craft_dds::DdsCompression {
+        use craft_dds::DdsCompression as C;
+        match self {
+            DdsCompression::Auto if normal && n == 3 => C::Bc5,
+            DdsCompression::Auto if matches!(n, 2 | 4) => C::Bc3,
+            DdsCompression::Auto if n == 1 => C::Bc4,
+            DdsCompression::Auto => C::Bc1,
+            DdsCompression::None => C::None,
+            DdsCompression::Bc1 => C::Bc1,
+            DdsCompression::Bc3 => C::Bc3,
+        }
+    }
+}
+
+/// What DDS files are written with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DdsExport {
+    pub compression: DdsCompression,
+    /// Also write the full mip chain down to 1×1 (each level a box filter of the one above).
+    pub mipmaps: bool,
 }
 
 /// Destination channel of an output file. `L` alone writes grayscale; `L` + `A` gray + alpha.
@@ -327,6 +404,9 @@ pub struct ExportOptions {
     /// into 8/16-bit files and linear Rec.709 into float files (EXR, HDR).
     #[serde(skip)]
     pub color_space: Option<ColorSpace>,
+    /// Compression and mipmaps of DDS files.
+    #[serde(default)]
+    pub dds: DdsExport,
 }
 
 impl ExportOptions {
@@ -347,6 +427,7 @@ impl ExportOptions {
             normal_format: None,
             atlas: false,
             color_space: None,
+            dds: DdsExport::default(),
         }
     }
 }
@@ -437,6 +518,23 @@ fn is_color(map: &MapSpec) -> bool {
                 _ => false,
             }
     })
+}
+
+/// A map holding only a normal (tangent-space, world-space or bent) in its colour channels, or
+/// one in red and green with a constant blue: automatic DDS compression writes it as BC5, which
+/// keeps X and Y and drops Z. A map that packs a normal component next to other data is not one.
+fn is_normal(map: &MapSpec) -> bool {
+    map.channels.iter().any(|(d, _)| *d != Dest::A)
+        && map.channels.iter().all(|(d, s)| {
+            *d == Dest::A
+                || (*d == Dest::B && matches!(s, SourceRef::Constant(_)))
+                || matches!(
+                    s,
+                    SourceRef::Channel { channel: Channel::Normal, .. }
+                        | SourceRef::Virtual { map: VirtualMap::NormalOpenGl | VirtualMap::NormalDirectX | VirtualMap::HeightNormal, .. }
+                        | SourceRef::Baked { map: BakedMap::Normal | BakedMap::WorldNormal | BakedMap::BentNormal, .. }
+                )
+        })
 }
 
 fn channel_label(map: &MapSpec) -> &'static str {
@@ -775,7 +873,8 @@ pub fn render_maps(input: &ExportInput, opts: &ExportOptions) -> Result<Vec<Expo
             let srgb: Vec<bool> = lay.iter().map(|(d, _)| *d != Dest::A && is_color(map) && !p.format.is_float() && space == ColorSpace::Srgb).collect();
             // A colour space the user chose is written into the colour maps (data maps have none).
             let embed = (opts.color_space.is_some() && is_color(map) && rgb).then_some(space);
-            let bytes = encode(p.format, p.bit_depth, size, n, &data, &srgb, embed, &mut warnings)?;
+            let dds = craft_dds::DdsOptions { compression: opts.dds.compression.resolve(is_normal(map), n), mipmaps: opts.dds.mipmaps };
+            let bytes = encode(p.format, p.bit_depth, size, n, &data, &srgb, embed, dds, &mut warnings)?;
             Ok(ExportedFile { name: p.name, bytes, width: size.0, height: size.1, warnings })
         })
         .collect()
@@ -818,7 +917,7 @@ fn resize(data: Vec<f32>, from: (u32, u32), n: usize, to: (u32, u32)) -> Vec<f32
 }
 
 /// Encode a `size` (width, height) image of `n` components (1 L, 2 LA, 3 RGB, 4 RGBA; linear
-/// values).
+/// values). `dds` is used by DDS files only.
 #[allow(clippy::too_many_arguments)]
 fn encode(
     format: FileFormat,
@@ -828,13 +927,14 @@ fn encode(
     data: &[f32],
     srgb: &[bool],
     embed: Option<ColorSpace>,
+    dds: craft_dds::DdsOptions,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<u8>> {
     let failed = |e: &dyn std::fmt::Display| FormatError::Invalid(format!("{} encoding failed: {e}", format.extension()));
     // Where the colour space goes: an ICC profile in PNG, JPEG, TIFF and WebP, the chromaticities
     // attribute in EXR. The other formats have no place for it.
     if let Some(space) = embed
-        && matches!(format, FileFormat::Tga | FileFormat::Bmp | FileFormat::Hdr)
+        && matches!(format, FileFormat::Tga | FileFormat::Bmp | FileFormat::Hdr | FileFormat::Dds)
     {
         warnings.push(format!("{} files can't record a colour space; the colours are in {}", format.extension().to_ascii_uppercase(), space.name()));
     }
@@ -861,6 +961,11 @@ fn encode(
         (FileFormat::Tiff, 2) => (remap(&encoded, 2, &[0, 0, 0, 1]), 4),
         _ => (encoded, n),
     };
+    // DDS holds 8 bits per channel only (the closest depth `FileFormat::depth` picks).
+    if format == FileFormat::Dds {
+        let bytes: Vec<u8> = encoded.iter().map(|v| (v * 255.0 + 0.5) as u8).collect();
+        return write_dds(bytes, size, n, dds, warnings).map_err(|e| failed(&e));
+    }
     use image::ExtendedColorType as C;
     let (bytes, color) = if depth == 16 {
         let b: Vec<u8> = encoded.iter().flat_map(|v| ((v * 65535.0 + 0.5) as u16).to_ne_bytes()).collect();
@@ -923,9 +1028,47 @@ fn write_image(format: FileFormat, bytes: &[u8], (w, h): (u32, u32), color: imag
         FileFormat::Webp => image::ImageFormat::WebP,
         FileFormat::Hdr => image::ImageFormat::Hdr,
         FileFormat::Exr => image::ImageFormat::OpenExr,
+        // Written by `write_dds` (`image` is built without DDS support and refuses it).
+        FileFormat::Dds => image::ImageFormat::Dds,
     };
     image::write_buffer_with_format(&mut out, bytes, w, h, color, fmt)?;
     Ok(out.into_inner())
+}
+
+/// A DDS texture of 8-bit `bytes` (`n` = 1 L, 2 LA, 3 RGB, 4 RGBA), through craft-dds. Block
+/// compressions take the layout [`craft_dds::DdsCompression::layout`] names: BC1 and BC3 RGBA
+/// (gray spread to red, green and blue, opaque without alpha), BC4 gray, BC5 RGB.
+fn write_dds(
+    bytes: Vec<u8>,
+    (w, h): (u32, u32),
+    n: usize,
+    dds: craft_dds::DdsOptions,
+    warnings: &mut Vec<String>,
+) -> std::result::Result<Vec<u8>, craft_dds::DdsError> {
+    use craft_dds::Layout;
+    let given = match n {
+        1 => Layout::Gray,
+        2 => Layout::GrayA,
+        3 => Layout::Rgb,
+        _ => Layout::Rgba,
+    };
+    if dds.compression == craft_dds::DdsCompression::Bc1
+        && matches!(n, 2 | 4)
+        && bytes.chunks_exact(n).any(|px| px.last().is_some_and(|a| *a != 0 && *a != 255))
+    {
+        warnings.push("BC1 keeps alpha only fully on or off; use BC3 to keep partial transparency".into());
+    }
+    let layout = dds.compression.layout().unwrap_or(given);
+    let pixels = match (given, layout) {
+        (from, to) if from == to => bytes,
+        (Layout::Gray, Layout::Rgba) => bytes.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        (Layout::GrayA, Layout::Rgba) => bytes.as_chunks::<2>().0.iter().flat_map(|&[g, a]| [g, g, g, a]).collect(),
+        (Layout::Rgb, Layout::Rgba) => bytes.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect(),
+        // `DdsCompression::resolve` picks BC4 for gray and BC5 for RGB only; craft-dds refuses
+        // any other pairing with an error.
+        _ => bytes,
+    };
+    craft_dds::encode(w, h, layout, &pixels, dds)
 }
 
 /// OpenEXR with Y / YA / RGB / RGBA channels, half or full float, ZIP compression.

@@ -28,7 +28,10 @@ USAGE:
   texturecraft-cli bake <input> [-o <out.tcraft>] [--resolution <px>] [--maps <id,id,...>]
       Bake mesh maps for every texture set (a project is saved in place without -o).
   texturecraft-cli export <input> <dir> [--preset <name>] [--format <ext>] [--padding <mode>] [--size <px>]
-      Export textures (default preset: Document channels + Normal + AO).
+                   [--dds-compression auto|none|bc1|bc3] [--dds-mipmaps]
+      Export textures (default preset: Document channels + Normal + AO). DDS files are 8-bit;
+      auto compression writes normal maps as BC5, maps with alpha as BC3, grayscale maps as BC4
+      and the others as BC1.
   texturecraft-cli render <input> <out.png> [--size <W>x<H>] [--view 3d|2d] [--camera <name>] [--yaw <deg>]
                    [--pitch <deg>] [--samples <n>] [--bounces <n>] [--cpu]
       Render the viewport to PNG (needs a GPU or software adapter); --camera looks through a
@@ -57,7 +60,7 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("run", &["-o"], &[]),
     ("batch", &[], &[]),
     ("bake", &["-o", "--resolution", "--maps"], &[]),
-    ("export", &["--preset", "--format", "--padding", "--size"], &[]),
+    ("export", &["--preset", "--format", "--padding", "--size", "--dds-compression"], &["--dds-mipmaps"]),
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
     ("new", &["--resolution"], &["--sample"]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
@@ -315,6 +318,12 @@ fn export(a: &Args) -> R {
     }
     if let Some(v) = a.num::<u32>("--size")? {
         p["size"] = json!(v);
+    }
+    if let Some(v) = a.get("--dds-compression") {
+        p["ddsCompression"] = json!(v);
+    }
+    if a.has("--dds-mipmaps") {
+        p["ddsMipmaps"] = json!(true);
     }
     let mut h = open(input, None)?;
     let r = h.export(&p).map_err(s)?;

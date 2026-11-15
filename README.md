@@ -126,7 +126,7 @@ traced on the GPU by `texturecraft-cli render`.
 - **Robust.** No panics in shipped code, every command tested with hostile input, unlimited undo
   from copy-on-write snapshots, and lossless `.tcraft` projects.
 - **Open.** glTF/GLB, FBX, COLLADA, USD, Alembic, OBJ, PLY and STL in; PNG, JPEG, TGA, TIFF, BMP,
-  WEBP, EXR and HDR textures out at 8, 16 or 32 bits, with UDIM tiles; textured OBJ, GLB and USD
+  WEBP, EXR, HDR and DDS (8-bit; BC1/BC3/BC4/BC5, mipmaps) textures out at 8, 16 or 32 bits, with UDIM tiles; textured OBJ, GLB and USD
   mesh export. Every material, environment, brush alpha and built-in mesh is procedural.
 - **Works with MaterialCraft.** Node-based materials from
   [MaterialCraft](https://github.com/storytold/materialcraft) (`.mcmat`, sent straight to the

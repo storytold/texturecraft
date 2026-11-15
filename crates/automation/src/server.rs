@@ -149,7 +149,7 @@ pub struct ExportParams {
     /// Texture set index or "all" (default all).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts: Option<Value>,
-    /// File format override: png, jpg, tga, tif, exr, …
+    /// File format override: png, jpg, tga, tif, exr, dds, …
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// none | dilation | dilationDefault | infinite
@@ -158,6 +158,13 @@ pub struct ExportParams {
     /// Output size in pixels (power of two).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u32>,
+    /// DDS files: auto (default: normal maps bc5, maps with alpha bc3, grayscale maps bc4, others
+    /// bc1), none, bc1 or bc3.
+    #[serde(default, rename = "ddsCompression", skip_serializing_if = "Option::is_none")]
+    pub dds_compression: Option<String>,
+    /// DDS files: also write the full mip chain (default false).
+    #[serde(default, rename = "ddsMipmaps", skip_serializing_if = "Option::is_none")]
+    pub dds_mipmaps: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
