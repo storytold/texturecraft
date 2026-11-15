@@ -1,14 +1,13 @@
-use std::sync::{Arc, Weak};
+use crate::store::ImageOrigin;
 
-use crate::store::ImageRes;
-
-/// Keeps an image's allocation identity stable without retaining pixels after resource removal.
+/// Keeps an image's allocation identity stable without retaining its bytes or pixels after resource removal, and
+/// without decoding it: images decoded on first read and released again keep their identity.
 #[derive(Debug)]
-pub(crate) struct ImageIdentity(Weak<ImageRes>);
+pub(crate) struct ImageIdentity(ImageOrigin);
 
 impl ImageIdentity {
-    pub(crate) fn new(image: &Arc<ImageRes>) -> Self {
-        Self(Arc::downgrade(image))
+    pub(crate) fn new(origin: ImageOrigin) -> Self {
+        Self(origin)
     }
 }
 

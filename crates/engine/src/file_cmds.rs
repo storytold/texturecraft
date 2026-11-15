@@ -178,8 +178,19 @@ impl Session {
         check_materials(&pf.project, &mesh)?;
         let source = pf.mesh.clone();
         let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
-        let mut s =
-            Session::new(Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources }, mesh, source)?;
+        let mut s = Session::new(
+            Document {
+                bake_paint: Default::default(),
+                project: pf.project,
+                pixels: pf.pixels,
+                baked: pf.baked,
+                resources,
+                graphs: pf.graphs,
+                strokes: pf.strokes,
+            },
+            mesh,
+            source,
+        )?;
 
         s.sync_images();
         s.load_bake_meshes(pf.high_poly, pf.cage);
@@ -217,6 +228,8 @@ impl Session {
             bake_paint: self.saved_bake_paint(),
             thumbnail: None,
             resources: self.doc.resources.iter().map(|(k, v)| (k.clone(), v.as_ref().clone())).collect(),
+            graphs: self.doc.graphs.clone(),
+            strokes: self.doc.strokes.clone(),
             warnings: Vec::new(),
         }
     }
@@ -227,13 +240,14 @@ impl Session {
 
     /// Render every export file for texture sets `sets` (in memory; works on the web).
     pub fn export_files(&mut self, sets: &[usize], opts: &ExportOptions) -> Result<Vec<ExportedFile>> {
-        self.update();
         let mesh_name = stem_of(self.doc.project.mesh.trim_start_matches("builtin:"));
         let mut out = Vec::new();
         let empty = Default::default();
         for &ts in sets {
+            // one set at a time: the others composite when they are exported or shown
+            self.update_only(&[ts]);
             let cache = self.caches.get(ts).ok_or_else(|| EngineError::Other(format!("no texture set {ts}")))?;
-            let coverage = cache.gbuf.coverage_mask();
+            let coverage = cache.gbuf().coverage_mask();
             let input = ExportInput {
                 project: &self.doc.project,
                 ts,
@@ -364,6 +378,10 @@ mod native {
         let path = if ext_of(path) == PROJECT_EXT { path.to_string() } else { format!("{path}.{PROJECT_EXT}") };
         texturecraft_formats::save_project(Path::new(&path), &s.project_file()).map_err(fe)?;
         if adopt {
+            // what the document has not read yet comes from the new file from now on
+            if let Some(old) = s.path.as_deref().filter(|old| *old != path) {
+                texturecraft_formats::project_moved(Path::new(old), Path::new(&path));
+            }
             s.path = Some(path.clone());
             s.modified = false;
         }
@@ -485,9 +503,13 @@ fn export_textures(s: &mut Session, p: &Value) -> Result<Value> {
     let opts = export_options(s, p, "file.exportTextures")?;
     let sets = sets_param(s, p, "file.exportTextures")?;
     std::fs::create_dir_all(&dir).map_err(|e| bad("file.exportTextures", format!("cannot create {dir}: {e}")))?;
-    let files = s.export_files(&sets, &opts)?;
-    let mut warnings: Vec<String> = files.iter().flat_map(|f| f.warnings.iter().cloned()).collect();
-    let mut written = texturecraft_formats::write_files(&files, std::path::Path::new(&dir)).map_err(fe)?;
+    // set by set, each one's files written before the next is composited
+    let (mut warnings, mut written) = (Vec::new(), Vec::new());
+    for &ts in &sets {
+        let files = s.export_files(&[ts], &opts)?;
+        warnings.extend(files.iter().flat_map(|f| f.warnings.iter().cloned()));
+        written.extend(texturecraft_formats::write_files(&files, std::path::Path::new(&dir)).map_err(fe)?);
+    }
     if p.get("materialX").and_then(Value::as_bool).unwrap_or(false) {
         written.extend(write_materialx(s, &sets, &opts, std::path::Path::new(&dir), &mut warnings)?);
     }

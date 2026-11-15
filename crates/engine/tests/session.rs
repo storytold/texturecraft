@@ -4,7 +4,12 @@ use texturecraft_engine::geom::primitives;
 use texturecraft_engine::{Session, command_specs, execute};
 
 fn session() -> Session {
-    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 256).unwrap();
+    session_at(256)
+}
+
+/// The fixture session with texture sets of `resolution` texels a side.
+fn session_at(resolution: u32) -> Session {
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, resolution).unwrap();
     s.viewport = texturecraft_engine::geom::glam::Vec2::new(400.0, 400.0);
     s.camera.yaw = 0.0;
     s.camera.pitch = 0.0;
@@ -229,6 +234,9 @@ fn panic_hunt() {
         json!({"layer": 1, "index": -5, "delta": i64::MIN, "above": "x", "points": [[f64::MAX, -1e300]], "size": -1e30}),
         json!({"resolution": 0, "maps": ["x"], "rays": u64::MAX, "antialiasing": 3, "color": [1], "value": "nan"}),
         json!({"effect": 0, "x": 1e30, "y": -1e30, "viewport": [0, 0], "mesh": "../../etc", "material": ""}),
+        json!({"path": "/dev/null", "bytes": "!!not base64", "maxResolution": -1, "originalOnTop": "yes"}),
+        json!({"bytes": [999, -1, "x"], "name": "", "measure": 7}),
+        json!({"bytes": "iUhERg0KGgoAAAAAAAAAAAAAAAAAAAAAAAAA", "maxResolution": 128}),
     ];
     for spec in command_specs() {
         if spec.id == "project.sample" {
@@ -243,6 +251,107 @@ fn panic_hunt() {
             }
             let _ = execute(&mut s, spec.id, p);
             s.update();
+        }
+    }
+}
+
+/// A session whose layers run graphs with hostile references: values that are not numbers, a missing text, a text that
+/// does not parse, nesting past the bound, outputs and anchors that do not exist, a stack input in a nested graph.
+fn graph_session() -> Session {
+    graph_session_at(256)
+}
+
+/// [`graph_session`] with texture sets of `resolution` texels a side.
+fn graph_session_at(resolution: u32) -> Session {
+    use texturecraft_engine::core::{
+        Effect, EffectKind, Fill, GraphInput, GraphRef, GraphValue, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source,
+    };
+    let mut s = session_at(resolution);
+    let colour = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 color r=0.25 g=0.5 b=0.75\noutput colour 1\nexpose gain 1 r 0 1\n");
+    let broken = s.doc.graphs.add_text("format 3\nnode 1 invert in=@99\nnode 2 nonsense\n");
+    let invert = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 input idx=0\nnode 2 invert in=@1\noutput out 2\n");
+    let mut hostile = GraphRef::new(colour.clone(), "hostile");
+    hostile.params.insert("gain".into(), GraphValue::Vector(vec![f32::NAN, f32::INFINITY, -1e30, 7.0, 9.0]));
+    hostile.params.insert("missing".into(), GraphValue::Int2([i32::MIN, i32::MAX]));
+    hostile.seed = u32::MAX;
+    hostile.output = Some("no such output".into());
+    hostile.alpha_output = Some("neither".into());
+    hostile.inputs.insert(u32::MAX, GraphInput::Image("not a resource".into()));
+    hostile.inputs.insert(3, GraphInput::Anchor { anchor: LayerId(u64::MAX), channel: None, levels: None });
+    let mut deep = GraphRef::new(colour.clone(), "deep");
+    for _ in 0..(texturecraft_engine::core::layer::MAX_GRAPH_NESTING + 3) {
+        let mut outer = GraphRef::new(invert.clone(), "outer");
+        outer.inputs.insert(0, GraphInput::Nested(Box::new(deep)));
+        deep = outer;
+    }
+    let mut nested_stack = GraphRef::new(invert.clone(), "nested stack");
+    let mut inner = GraphRef::new(invert.clone(), "inner");
+    inner.inputs.insert(0, GraphInput::Stack { channel: Some(Channel::Height) });
+    nested_stack.inputs.insert(0, GraphInput::Nested(Box::new(inner)));
+    let mut filter = GraphRef::new(invert.clone(), "filter");
+    filter.inputs.insert(0, GraphInput::Stack { channel: Some(Channel::Normal) });
+    filter.inputs.insert(1, GraphInput::StackAlpha { channel: None });
+    filter.outputs.insert(Channel::Height, "out".into());
+    let missing = GraphRef::new(texturecraft_engine::core::text_key("not stored"), "missing");
+    let unparsable = GraphRef::new(broken, "broken");
+    let mut fill = Fill::default();
+    for (c, g) in
+        [(Channel::BaseColor, hostile.clone()), (Channel::Roughness, deep.clone()), (Channel::Metallic, missing.clone()), (Channel::Height, unparsable.clone())]
+    {
+        fill.sources.insert(c, Source::Graph(Box::new(g)));
+    }
+    let id = s.doc.project.alloc_id();
+    let mut layer = Layer::new(id, "graphs", LayerKind::Fill(fill), &Channel::DEFAULT_SET);
+    let mut effects = Vec::new();
+    for g in [hostile, deep, nested_stack, filter, missing, unparsable] {
+        let e = s.doc.project.alloc_id();
+        effects.push(Effect::new(e, EffectKind::Graph { graph: g, projection: Projection::default() }));
+    }
+    layer.content_effects = effects.clone();
+    for e in &mut effects {
+        e.id = s.doc.project.alloc_id();
+    }
+    layer.mask = Some(Mask { effects, ..Mask::new(MaskBackground::White) });
+    s.doc.project.insert_layer(0, layer, None, false).unwrap();
+    for c in &mut s.caches {
+        c.invalidate_all();
+    }
+    s
+}
+
+/// Every command on a project of hostile graph references returns Ok or Err, and the project composites, saves and opens.
+#[test]
+fn panic_hunt_with_hostile_graphs() {
+    let mut s = graph_session();
+    s.update();
+    let problems = execute(&mut s, "project.inspect", &Value::Null).unwrap()["graphs"]["problems"].as_array().map_or(0, Vec::len);
+    assert!(problems > 0, "graphs that cannot render say so");
+    let bytes = s.to_project_bytes().unwrap();
+    let mut back = Session::from_project_bytes(&bytes).unwrap();
+    back.update();
+    let hostile = [json!({}), json!({"layer": 4, "effect": 5, "key": "../x", "value": f64::NAN, "seed": -1, "output": [1]})];
+    // A command gets the hostile-graph session as built: a fresh one after any command that ran, the same one after
+    // commands that were refused (a refused edit leaves the document as it was). Building it renders every graph, so
+    // the hunt builds it only as often as a command changed it, and at the smallest texture size: the hostile
+    // references, not the size, are what it hunts (the start of this test reads them at full size).
+    let fresh = || {
+        let mut s = graph_session_at(128);
+        for texture_set in &mut s.doc.project.texture_sets {
+            texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
+        }
+        s
+    };
+    let mut s = fresh();
+    for spec in command_specs() {
+        if spec.id == "project.sample" {
+            continue;
+        }
+        for p in &hostile {
+            let ran = execute(&mut s, spec.id, p).is_ok();
+            s.update();
+            if ran {
+                s = fresh();
+            }
         }
     }
 }
@@ -301,6 +410,7 @@ fn image_resources_fill_layers_and_round_trip() {
     let bytes = s.to_project_bytes().unwrap();
     let back = Session::from_project_bytes(&bytes).unwrap();
     assert_eq!(back.doc.resources.len(), 1);
+    assert_eq!(back.images.decoded_bytes(), 0, "an opened project decodes its images when they are read");
     assert_eq!(back.images.len(), 1);
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
@@ -406,7 +516,7 @@ fn text_becomes_a_brush_alpha_and_a_decal() {
     assert_eq!(name, "Text_TEXT.png");
     assert!(r["width"].as_u64().unwrap() > r["height"].as_u64().unwrap() / 2, "two short lines");
     // White with the glyphs in alpha.
-    let img = s.images[&name].clone();
+    let img = s.images.get(&name).unwrap().clone();
     assert!(img.rgba.iter().any(|t| t[3] > 0.99) && img.rgba.iter().any(|t| t[3] == 0.0) && img.rgba.iter().all(|t| t[0] == 1.0));
     // As the brush alpha it paints (keeping its proportions), and it places as a decal.
     execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [1.0, 0.0, 0.0]})).unwrap();
@@ -633,4 +743,65 @@ fn unparseable_color_param_returns_error() {
     execute(&mut s, "tool.polygonFill", &Value::Null).unwrap();
     let err = execute(&mut s, "tool.click", &json!({"uv": [0.2, 0.8, 0.4]})).unwrap_err();
     assert_eq!(err.to_string(), "`tool.click`: a 2D view point needs `uv` as [u, v]");
+}
+
+#[test]
+fn an_opened_project_reads_its_pixels_when_it_composites_and_composites_the_same() {
+    let mut s = session();
+    execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [1.0, 0.0, 0.0]})).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 20, "hardness": 90})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[180, 200], [220, 200]]})).unwrap();
+    s.update();
+    let dir = std::env::temp_dir().join(format!("tc-lazy-open-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (path, moved) = (dir.join("a.tcraft"), dir.join("b.tcraft"));
+    execute(&mut s, "file.saveCopy", &json!({"path": path.to_str().unwrap()})).unwrap();
+
+    let mut back = texturecraft_engine::file_cmds::open_path(path.to_str().unwrap()).unwrap();
+    assert!(!back.doc.pixels.layers.is_empty());
+    assert!(back.doc.pixels.layers.values().all(|img| !img.is_loaded()), "nothing read at open");
+    back.update();
+    assert!(back.doc.pixels.layers.values().any(|img| img.is_loaded()), "read to composite");
+    for c in [Channel::BaseColor, Channel::Roughness] {
+        assert!(back.caches[0].composite.channels.get(&c) == s.caches[0].composite.channels.get(&c), "{c:?} composites the same");
+    }
+    // saved under another name, the document lives there
+    execute(&mut back, "file.save", &json!({"path": moved.to_str().unwrap()})).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    for img in back.doc.pixels.layers.values_mut() {
+        img.release();
+    }
+    assert!(back.doc.pixels.layers.values().all(|img| img.allocated_count() > 0 && !img.is_loaded()));
+    assert_eq!(back.doc.pixels.layers, s.doc.pixels.layers, "read from the new file");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A fill channel reading a graph's alpha output itself (a material's opacity output on the opacity channel) lays that
+/// value whole; the other channels of the source are covered by it.
+#[test]
+fn a_source_reading_its_own_alpha_output_is_not_gated_by_it() {
+    use texturecraft_engine::core::{Fill, GraphRef, Layer, LayerKind, Source};
+    let mut s = session();
+    let text = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 color r=0.25 g=0.25 b=0.25\nnode 2 color r=0.75 g=0.75 b=0.75\noutput a 1\noutput v 2\n");
+    let mut own = GraphRef::new(text.clone(), "material");
+    own.output = Some("a".into());
+    own.alpha_output = Some("a".into());
+    let mut other = own.clone();
+    other.output = Some("v".into());
+    let mut fill = Fill::default();
+    fill.sources.insert(Channel::Roughness, Source::Graph(Box::new(own)));
+    fill.sources.insert(Channel::Metallic, Source::Graph(Box::new(other)));
+    let id = s.doc.project.alloc_id();
+    let layer = Layer::new(id, "material", LayerKind::Fill(fill), &Channel::DEFAULT_SET);
+    s.doc.project.insert_layer(0, layer, None, false).unwrap();
+    for c in &mut s.caches {
+        c.invalidate_all();
+    }
+    let below = s.caches[0].composite.value(Channel::Metallic, 128, 128)[0];
+    s.update();
+    let rough = s.caches[0].composite.value(Channel::Roughness, 128, 128)[0];
+    let metal = s.caches[0].composite.value(Channel::Metallic, 128, 128)[0];
+    assert!((rough - 0.25).abs() < 0.02, "the alpha output laid whole: {rough}");
+    let expected = 0.75 * 0.25 + below * 0.75;
+    assert!((metal - expected).abs() < 0.02, "another output covered by the alpha: {metal} (below {below})");
 }

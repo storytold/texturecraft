@@ -9,6 +9,6 @@ use texturecraft_core::BakedMap;
 pub struct StreamedBake {
     pub resolution: u32,
     pub height: u32,
-    pub maps: BTreeMap<BakedMap, Arc<Vec<f32>>>,
+    pub maps: BTreeMap<BakedMap, Arc<texturecraft_compose::Texels>>,
     pub tracer: String,
 }

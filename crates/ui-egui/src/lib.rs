@@ -23,6 +23,7 @@ pub mod fonts;
 pub mod gpu;
 pub mod i18n;
 pub mod id_color_pick;
+pub mod import_ui;
 pub mod keymap;
 pub mod layer_panel;
 mod levels_editor;
@@ -127,6 +128,8 @@ pub struct TextureCraftApp {
     pub(crate) gpu_memory: (Vec<String>, Option<String>),
     pub bake: Option<BakeJob>,
     pub resize: Option<ResizeJob>,
+    /// The project import's windows and the conversion running behind them.
+    pub import: Option<import_ui::ImportUi>,
     pub link_cooks: Vec<LinkCook>,
     pub thumbs: thumbs::Thumbs,
     /// The Layers panel's thumbnails and folded groups.
@@ -217,6 +220,7 @@ impl TextureCraftApp {
             gpu_memory: (Vec::new(), None),
             bake: None,
             resize: None,
+            import: None,
             link_cooks: Vec::new(),
             thumbs: thumbs::Thumbs::default(),
             layer_panel: layer_panel::LayerPanel::default(),

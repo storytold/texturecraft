@@ -41,7 +41,7 @@ pub mod project_file;
 pub use export::{
     Dest, ExportInput, ExportOptions, ExportPreset, ExportedFile, FileFormat, MapSpec, Padding, PlannedFile, SourceRef, VirtualMap, list_outputs, render_maps,
 };
-pub use image_res::{DecodedImage, coverage_png, decode_image, decode_image_within};
+pub use image_res::{DecodedImage, coverage_png, decode_image, decode_image_within, probe_image};
 pub use mesh_export::{GlbTextures, NamedFiles, UsdExport, UsdFormat, glb_bytes, glb_export_options, obj_bytes, obj_with_mtl, usd_bytes, usd_export_options};
 pub use mesh_import::{HighPolyMesh, ImportedMesh, MeshFile, MeshReport, import_high_poly_bytes, import_mesh_bytes, mesh_report, self_contained_mesh};
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,7 +58,7 @@ pub use export::write_files;
 pub use mesh_import::{import_mesh, read_mesh_file};
 #[cfg(not(target_arch = "wasm32"))]
 pub use project_file::{
-    DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, load_project, save_project, save_ram_budget, set_save_resources,
+    DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, load_project, project_moved, save_project, save_ram_budget, set_save_resources,
 };
 
 #[derive(Debug, thiserror::Error)]

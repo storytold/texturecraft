@@ -28,6 +28,7 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     #[cfg(target_arch = "wasm32")]
     export_mesh(app, ctx);
     unsaved(app, ctx);
+    crate::import_ui::show(app, ctx);
 }
 
 /// Hold `then` (quitting, opening or closing a project) behind the unsaved-changes dialog when
@@ -705,6 +706,15 @@ fn settings(app: &mut TextureCraftApp, ctx: &egui::Context) {
                     ui.label(format!("≈ {:.2} GiB", budget_bytes as f64 / (1_u64 << 30) as f64));
                 });
                 ui.end_row();
+                let label = ui.label(tr("Max RAM for graph renders"));
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut p.render_ram_percent).range(1..=100).suffix(" %"))
+                        .labelled_by(label.id)
+                        .on_hover_text(tr("Graph renders running at once share this part of the RAM; a render waits until the others leave room for it."));
+                    let budget_bytes = texturecraft_engine::compose::graphs::budget::limit_for_percent(p.render_ram_percent);
+                    ui.label(format!("≈ {:.2} GiB", budget_bytes as f64 / (1_u64 << 30) as f64));
+                });
+                ui.end_row();
             }
         });
         #[cfg(not(target_arch = "wasm32"))]
@@ -929,6 +939,15 @@ pub fn file_action(app: &mut TextureCraftApp, _ctx: &egui::Context, id: &str) ->
             });
             true
         }
+        "file.importProject" => {
+            let ext = texturecraft_engine::import_cmds::PROJECT_EXT;
+            app.ask_file(FileDialog::open().filter(tr("Project to convert"), &[ext]), Bound::App, |app, paths| {
+                if let Some(p) = paths.first() {
+                    crate::import_ui::ask(app, texturecraft_engine::import_cmds::ImportTask::path(p.display().to_string()));
+                }
+            });
+            true
+        }
         "file.importMaterialX" => {
             app.ask_file(FileDialog::open().filter(tr("MaterialX materials"), &["mtlx"]), Bound::Project, |app, paths| {
                 if let Some(p) = paths.first()
@@ -1025,6 +1044,12 @@ pub fn open_path(app: &mut TextureCraftApp, path: &str) {
     if ask_to_save(app, crate::state::Unsaved::Open(path.into())) {
         return;
     }
+    // a project file of the reference app is converted, behind the import's notice
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if ext == texturecraft_engine::import_cmds::PROJECT_EXT {
+        crate::import_ui::ask(app, texturecraft_engine::import_cmds::ImportTask::path(path));
+        return;
+    }
     if app.run("file.open", json!({"path": path})).is_some() {
         remember(app, path);
         app.ui.mode = Mode::Painting;
@@ -1036,6 +1061,7 @@ pub fn open_path(app: &mut TextureCraftApp, path: &str) {
 pub fn file_action(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) -> bool {
     match id {
         "file.open" => crate::web_files::open(ctx),
+        "file.importProject" => crate::web_files::import_project(ctx),
         "file.importResources" | "resource.import" => crate::web_files::import_images(ctx),
         "material.load" => crate::web_files::import_material(ctx),
         "file.save" | "file.saveAs" | "file.saveCopy" => crate::web_files::save_project(app),

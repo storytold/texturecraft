@@ -5,7 +5,8 @@ use texturecraft_geom::glam::{Mat3, Quat, Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, surface_at};
 use texturecraft_texel::noise::pcg3d;
 
-use crate::brush::{Alignment, BrushSettings};
+use crate::brush::{Alignment, BrushSettings, pressure_scale};
+use crate::jitter::{Jittered, SeededJitter, StrokeRandom};
 use crate::stamp_source::StampSource;
 
 /// Scene access for picking.
@@ -81,6 +82,10 @@ pub struct Stroke {
     lazy: Option<Vec2>,
     count: u32,
     last_dir: Option<Vec3>,
+    /// Jitter drawn from the stroke's seed ([`Stroke::seeded`]); `None`: each stamp hashes its index.
+    random: Option<StrokeRandom>,
+    /// Seeded jitter: the step after the last stamp, which follows the size that stamp got.
+    last_step: Option<f32>,
     /// Every stamp emitted so far (for replay, inspect and tests).
     pub stamps: Vec<Stamp>,
 }
@@ -94,7 +99,29 @@ impl Stroke {
         let s = settings.sanitized();
         let (lo, hi) = mesh.bounds();
         let diag = (hi - lo).length().max(1e-4);
-        Stroke { radius: s.size * diag, settings: s, center: (lo + hi) * 0.5, last: None, dist: 0.0, lazy: None, count: 0, last_dir: None, stamps: Vec::new() }
+        Stroke {
+            radius: s.size * diag,
+            settings: s,
+            center: (lo + hi) * 0.5,
+            last: None,
+            dist: 0.0,
+            lazy: None,
+            count: 0,
+            last_dir: None,
+            random: None,
+            last_step: None,
+            stamps: Vec::new(),
+        }
+    }
+
+    /// This stroke with its jitter drawn from `jitter`'s seed: the same seed lays the same jitter, stamp for stamp
+    /// ([`crate::jitter`]). The ranges keep their meaning, with these differences from the default: flow falls by up
+    /// to `jitter_flow` evenly; position jitter moves the stamp across the stroke or along the view's axes on the
+    /// surface (not along the turned tip's), by `jitter_position` radii times an even or normal draw; and the step
+    /// to the next stamp follows the size the stamp got.
+    pub fn seeded(mut self, jitter: SeededJitter) -> Stroke {
+        self.random = Some(StrokeRandom::new(jitter));
+        self
     }
 
     /// Feed a pointer position (pixels) with pen pressure (1 for a mouse). Returns new stamps.
@@ -126,9 +153,7 @@ impl Stroke {
     }
 
     fn radius_at(&self, ctx: &PickCtx, pos: Vec3, pressure: f32) -> f32 {
-        let p = pressure.clamp(0.0, 1.0);
-        let scale = self.settings.min_size + (1.0 - self.settings.min_size) * p;
-        let r = self.radius * if pressure < 1.0 { scale } else { 1.0 };
+        let r = self.radius * pressure_scale(self.settings.min_size, pressure);
         if self.settings.screen_space { r * (pos.distance(ctx.camera.eye()) / ctx.camera.distance.max(1e-4)) } else { r }
     }
 
@@ -139,7 +164,9 @@ impl Stroke {
         };
         let radius = self.radius_at(ctx, hit.pos, pressure);
         let Some(last) = self.last else {
-            out.push(self.stamp(ctx, &hit, radius));
+            let stamp = self.stamp(ctx, &hit, radius, pressure);
+            self.after(&stamp);
+            out.push(stamp);
             self.last = Some(hit);
             self.dist = 0.0;
             return;
@@ -149,7 +176,10 @@ impl Stroke {
         if len < 1e-9 {
             return;
         }
-        let step = (self.settings.spacing * 2.0 * radius).max(1e-6);
+        let mut step = match (self.random.is_some(), self.last_step) {
+            (true, Some(after_last)) => after_last,
+            _ => (self.settings.spacing * 2.0 * radius).max(1e-6),
+        };
         if len > 4.0 * radius && depth < 4 {
             // Jumped across a silhouette or gap: resample in screen space, never through air.
             let n = ((len / radius).ceil() as u32).clamp(2, 64);
@@ -174,7 +204,11 @@ impl Stroke {
                 .and_then(|s| pick(ctx, s))
                 .filter(|h| h.pos.distance(p) < radius * 2.0);
             let h = snapped.unwrap_or(SurfaceHit { pos: p, ..hit });
-            out.push(self.stamp(ctx, &h, radius));
+            let stamp = self.stamp(ctx, &h, radius, pressure);
+            if let Some(after) = self.after(&stamp) {
+                step = after;
+            }
+            out.push(stamp);
             emitted += 1;
             t += step;
         }
@@ -182,12 +216,30 @@ impl Stroke {
         self.last = Some(hit);
     }
 
+    /// Seeded jitter: the step to the next stamp follows the size `stamp` got (`None` without seeded jitter).
+    fn after(&mut self, stamp: &Stamp) -> Option<f32> {
+        self.random.as_ref()?;
+        let step = (self.settings.spacing * 2.0 * stamp.radius).max(1e-6);
+        self.last_step = Some(step);
+        Some(step)
+    }
+
     /// The next stamp at `hit`: oriented to the surface or the camera, then jittered
-    fn stamp(&mut self, ctx: &PickCtx, hit: &SurfaceHit, radius: f32) -> Stamp {
+    fn stamp(&mut self, ctx: &PickCtx, hit: &SurfaceHit, radius: f32, pressure: f32) -> Stamp {
         let settings = &self.settings;
         let seed = self.count;
         self.count = self.count.wrapping_add(1);
-        let jitter = |channel: u32, amount: f32| if amount > 0.0 { (rand01(seed, channel) * 2.0 - 1.0) * amount } else { 0.0 };
+        let jittered = Jittered {
+            size: settings.jitter_size > 0.0,
+            flow: settings.jitter_flow > 0.0,
+            rotation: settings.jitter_angle > 0.0,
+            position: settings.jitter_position > 0.0,
+        };
+        // Each jitter's number in 0..1: hashed from the stamp's index, or the stroke's seeded draw
+        let draw = self.random.as_mut().map(|r| (r.draw(jittered), r.jitter()));
+        let unit = |channel: u32, seeded: Option<f32>| seeded.unwrap_or_else(|| rand01(seed, channel));
+        let jitter = |channel: u32, amount: f32, seeded: Option<f32>| if amount > 0.0 { (unit(channel, seeded) * 2.0 - 1.0) * amount } else { 0.0 };
+        let (size_draw, angle_draw) = (draw.map(|(d, _)| d.size), draw.map(|(d, _)| d.rotation));
 
         // Frame: the normal, and an up direction from the camera or the stroke's path
         let normal = match settings.alignment {
@@ -204,13 +256,32 @@ impl Stroke {
         let unturned_tangent = up.cross(normal).try_normalize().unwrap_or_else(|| normal.any_orthonormal_vector());
 
         // Jitter: angle, size, position and flow
-        let angle = (settings.angle + jitter(JITTER_ANGLE, settings.jitter_angle) * HALF_TURN_DEGREES).to_radians();
+        let angle = (settings.angle + jitter(JITTER_ANGLE, settings.jitter_angle, angle_draw) * HALF_TURN_DEGREES).to_radians();
         let turn = Quat::from_axis_angle(normal, angle);
         let tangent = turn * unturned_tangent;
         let bitangent = normal.cross(tangent);
-        let jittered_radius = radius * (1.0 + jitter(JITTER_SIZE, settings.jitter_size)).max(MIN_JITTERED_SIZE);
-        let offset = (tangent * jitter(JITTER_ACROSS, 1.0) + bitangent * jitter(JITTER_ALONG, 1.0)) * settings.jitter_position * radius;
-        let flow = (settings.flow * (1.0 - jitter(JITTER_FLOW, settings.jitter_flow).abs())).clamp(0.0, 1.0);
+        let jittered_radius = radius * (1.0 + jitter(JITTER_SIZE, settings.jitter_size, size_draw)).max(MIN_JITTERED_SIZE);
+        let (offset, flow_drop) = match draw {
+            None => (
+                (tangent * jitter(JITTER_ACROSS, 1.0, None) + bitangent * jitter(JITTER_ALONG, 1.0, None)) * settings.jitter_position * radius,
+                jitter(JITTER_FLOW, settings.jitter_flow, None).abs(),
+            ),
+            Some((d, how)) => {
+                // Across the stroke (up the view from its direction), or along the view's right and down at an angle drawn
+                // over half a turn, the distance's sign giving the rest
+                let view_right = ctx.camera.forward().cross(Vec3::Y);
+                let right = (view_right - normal * normal.dot(view_right)).try_normalize().unwrap_or(unturned_tangent);
+                let direction = if how.both_axes {
+                    let (sin, cos) = (std::f32::consts::PI * (d.direction - 0.5)).sin_cos();
+                    right * sin + right.cross(normal) * cos
+                } else {
+                    let along = self.last_dir.map(|dir| dir - normal * normal.dot(dir)).and_then(Vec3::try_normalize).unwrap_or(right);
+                    normal.cross(along)
+                };
+                (direction * d.distance * settings.jitter_position * jittered_radius, settings.jitter_flow * (1.0 - d.flow))
+            }
+        };
+        let flow = (settings.flow * pressure_scale(settings.min_flow, pressure) * (1.0 - flow_drop)).clamp(0.0, 1.0);
 
         Stamp {
             center: hit.pos + offset,
@@ -407,5 +478,40 @@ mod tests {
         st.symmetry = crate::brush::Symmetry { radial: 200, axis: 9, ..st.symmetry };
         let clean = st.sanitized().symmetry;
         assert_eq!((clean.radial, clean.axis), (32, 2));
+    }
+
+    #[test]
+    fn pen_pressure_lowers_the_flow_only_when_asked() {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let flow = |min_flow: f32, pressure: f32| {
+            let mut s = Stroke::new(&BrushSettings { min_flow, flow: 0.8, ..BrushSettings::default() }, &m);
+            s.add(&ctx, Vec2::new(200.0, 200.0), pressure)[0].flow
+        };
+        assert_eq!(flow(1.0, 0.0), 0.8, "by default pressure leaves the flow alone");
+        assert!((flow(0.25, 0.0) - 0.2).abs() < 1e-6);
+        assert!((flow(0.25, 0.5) - 0.5).abs() < 1e-6);
+        assert_eq!(flow(0.25, 1.0), 0.8);
+    }
+
+    #[test]
+    fn seeded_jitter_repeats_per_seed_and_leaves_the_default_alone() {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let settings = BrushSettings { jitter_size: 0.5, jitter_angle: 0.3, jitter_flow: 0.4, jitter_position: 0.5, spacing: 0.2, ..BrushSettings::default() };
+        let run = |seed: Option<u32>| {
+            let mut s = Stroke::new(&settings, &m);
+            if let Some(seed) = seed {
+                s = s.seeded(SeededJitter { seed, both_axes: true, normal: false });
+            }
+            (0..=40).flat_map(|i| s.add(&ctx, Vec2::new(150.0 + i as f32 * 2.5, 200.0), 1.0)).collect::<Vec<Stamp>>()
+        };
+        assert_eq!(run(Some(3)), run(Some(3)));
+        assert_ne!(run(Some(3)), run(Some(4)));
+        assert_ne!(run(None), run(Some(3)));
+        for st in run(Some(9)) {
+            // flow falls by up to the jitter, never rises
+            assert!(st.flow <= 1.0 && st.flow >= 0.6 - 1e-6, "{}", st.flow);
+        }
     }
 }

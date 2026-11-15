@@ -41,10 +41,12 @@ fn normal(map_kind: VirtualMap) -> Vec<(Dest, SourceRef)> {
     rgb(|k| virt(map_kind, k))
 }
 
-/// One file per channel: RGB for colors and normals, grayscale (16-bit for height) otherwise.
+/// One file per channel: RGB for colors and normals (16-bit for user channels' linear data), grayscale (16-bit for
+/// height) otherwise.
 fn channel_map(c: Channel) -> MapSpec {
     let (channels, depth) = match c.kind() {
         ChannelKind::Color | ChannelKind::NormalMap => (rgb(|k| ch(c, k)), 8),
+        ChannelKind::Data => (rgb(|k| ch(c, k)), 16),
         ChannelKind::Signed => (gray(ch(c, 0)), 16),
         ChannelKind::Scalar => (gray(ch(c, 0)), 8),
     };

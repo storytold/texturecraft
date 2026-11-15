@@ -44,7 +44,7 @@ fn tile_selection_is_inspectable_saved_and_undoable() {
 #[test]
 fn partial_bake_preserves_unchecked_tiles_and_uses_the_workers_selection() {
     let mut session = session();
-    session.doc.baked.insert(0, BakedMaps { resolution: 64, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 64 * 32]))].into() });
+    session.doc.baked.insert(0, BakedMaps { resolution: 64, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 64 * 32].into()))].into() });
     execute(&mut session, "bake.tile.set", &json!({"tile": 1002, "enabled": false})).unwrap();
     let mut task = session.bake_task(0).unwrap();
     task.tracer = None;
@@ -57,7 +57,7 @@ fn partial_bake_preserves_unchecked_tiles_and_uses_the_workers_selection() {
     let output = task.run(&Progress::new()).unwrap();
     session.apply_bake(0, output).unwrap();
 
-    let pixels = &session.doc.baked[&0].maps[&BakedMap::AmbientOcclusion];
+    let pixels = session.doc.baked[&0].maps[&BakedMap::AmbientOcclusion].to_f32();
     for row in pixels.as_chunks::<64>().0 {
         assert!(row[..32].iter().all(|value| *value > 0.99));
         assert!(row[32..].iter().all(|value| *value == 0.25));
@@ -74,7 +74,7 @@ fn partial_bake_resizes_retained_tiles_and_unchecked_map_outputs() {
         0,
         BakedMaps {
             resolution: 64,
-            maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 64 * 32])), (BakedMap::Normal, Arc::new(vec![0.4; 64 * 32 * 3]))].into(),
+            maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 64 * 32].into())), (BakedMap::Normal, Arc::new(vec![0.4; 64 * 32 * 3].into()))].into(),
         },
     );
     execute(&mut session, "bake.tile.set", &json!({"tile": 1002, "enabled": false})).unwrap();
@@ -85,12 +85,12 @@ fn partial_bake_resizes_retained_tiles_and_unchecked_map_outputs() {
 
     let baked = &session.doc.baked[&0];
     assert_eq!((baked.resolution, baked.height(BakedMap::AmbientOcclusion)), (128, 64));
-    for row in baked.maps[&BakedMap::AmbientOcclusion].as_chunks::<128>().0 {
+    for row in baked.maps[&BakedMap::AmbientOcclusion].to_f32().as_chunks::<128>().0 {
         assert!(row[..64].iter().all(|value| *value > 0.99));
         assert!(row[64..].iter().all(|value| *value == 0.25));
     }
     assert_eq!(baked.maps[&BakedMap::Normal].len(), 128 * 64 * 3);
-    assert!(baked.maps[&BakedMap::Normal].iter().all(|value| *value == 0.4));
+    assert!(baked.maps[&BakedMap::Normal].iter().all(|value| value == 0.4));
 
     let reopened = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
     assert_eq!(reopened.doc.baked, session.doc.baked);
@@ -106,11 +106,11 @@ fn tile_selection_preserves_the_correct_udim_row() {
     }
     let mut session = Session::new_project("Vertical UV tiles", mesh, "builtin:udim_plane", None, 128).unwrap();
     assert_eq!(session.doc.project.texture_sets[0].uv_tiles, [1001, 1011]);
-    session.doc.baked.insert(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 32 * 64]))].into() });
+    session.doc.baked.insert(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 32 * 64].into()))].into() });
     execute(&mut session, "bake.tile.set", &json!({"tile": 1011, "enabled": false})).unwrap();
     execute(&mut session, "bake.run", &json!({"resolution": 32, "maps": ["ambientOcclusion"], "rays": 2, "cpu": true})).unwrap();
 
-    let pixels = &session.doc.baked[&0].maps[&BakedMap::AmbientOcclusion];
+    let pixels = session.doc.baked[&0].maps[&BakedMap::AmbientOcclusion].to_f32();
     assert!(pixels[..32 * 32].iter().all(|value| *value == 0.25));
     assert!(pixels[32 * 32..].iter().all(|value| *value > 0.99));
 }
@@ -122,7 +122,7 @@ fn excluded_tiles_without_previous_pixels_use_neutral_values() {
     execute(&mut session, "bake.run", &json!({"maps": ["normal", "ambientOcclusion"], "cpu": true})).unwrap();
     let baked = &session.doc.baked[&0];
     for map in [BakedMap::Normal, BakedMap::AmbientOcclusion] {
-        for row in baked.maps[&map].chunks_exact(64 * map.components()) {
+        for row in baked.maps[&map].to_f32().chunks_exact(64 * map.components()) {
             for pixel in row[..32 * map.components()].chunks_exact(map.components()) {
                 assert_eq!(pixel, &map.neutral()[..map.components()]);
             }

@@ -11,20 +11,35 @@
 //! | `pixels/mask_<id>.bin` | painted pixels of a mask paint effect |
 //! | `baked/<ts>_<mapId>.bin` | a baked mesh map of texture set `<ts>` |
 //! | `thumbnail.png` | optional preview supplied by the caller |
+//! | `graphs/<key>.txt` | the text of a graph the layers run, once per distinct graph, named by its text key |
+//! | `cooked/<key>_<output>.bin` | one output of a graph's cooked render (pixel tiles), named by the cook's key |
+//! | `cooked/index.json` | the cooks' outputs (and which hold linear colour) and the cook each graph use read last |
+//! | `strokes/<id>.bin` | the stroke record behind the pixels keyed by `<id>` (see [`strokes`]) |
+//! | `stroke_images/<key>.bin` | a tip or stencil image stroke records lay, kept once (see [`strokes`]) |
 //!
 //! Pixel `.bin` files are sparse and lossless: a header (magic `TCTX`, version, width, height,
 //! components, tile count; u32 LE each) followed, for every allocated 64×64 tile, by `tx`, `ty`
 //! (u32 LE) and the tile's raw `u16` LE components. Baked maps use the same header with a tile
 //! count of 0, followed by `width × height × components` f32 LE. Pixels of a UV-tiled texture
 //! set cover its whole atlas (`resolution` per tile, see `TileGrid`).
+//!
+//! Graph texts are saved once per distinct text, only those the layers reference; a text whose bytes do not hash to its
+//! entry's key is refused. Cooked renders are saved for the uses the last composite read (see
+//! `texturecraft_compose::graphs`): a project opened again finds them by their keys and renders nothing. Cooks whose
+//! entries are missing or malformed are left out with a warning: they are only renders, made again on demand.
+//!
+//! Stroke records are saved for the paint layers and paint effects that still exist; a record that cannot be read is
+//! kept as its bytes and saved again unchanged. They add entries only, so a project without them is written as before
+//! and older builds open a project with them (they skip the entries).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Read, Seek, Write};
 use std::sync::Arc;
 
-use texturecraft_compose::{BakedMaps, PixelStore};
-use texturecraft_core::{BakePaintTarget, Channel, FORMAT_VERSION, LayerId, Project};
+use texturecraft_compose::graphs::{Cooked, GraphUse};
+use texturecraft_compose::{BakedMaps, GraphStore, PixelStore, Texels};
+use texturecraft_core::{BakePaintTarget, Channel, FORMAT_VERSION, LayerId, Project, StoredStrokes};
 use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -38,6 +53,7 @@ mod entries;
 mod load_budget;
 mod metadata_reader;
 mod project_open_limit;
+pub mod strokes;
 #[cfg(not(target_arch = "wasm32"))]
 pub use entries::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, save_ram_budget, set_save_resources};
 pub use project_open_limit::{DEFAULT_PROJECT_OPEN_LIMIT_GIB, project_open_limit_gib, set_project_open_limit_gib};
@@ -53,6 +69,14 @@ const MAX_RESOURCE: u64 = 512 << 20;
 const MAX_ENTRIES: usize = 100_000;
 /// Bound ZIP index parsing before the archive exposes its entry count.
 const MAX_ZIP_METADATA_BYTES: u64 = 32 << 20;
+/// Largest graph text (they carry the images their graph embeds).
+const MAX_GRAPH_TEXT: u64 = 512 << 20;
+/// Largest index of cooked graph outputs.
+const MAX_COOK_INDEX: u64 = 16 << 20;
+/// Largest side of a cooked graph output (the graph runtime renders at most this).
+const MAX_COOK_SIDE: u32 = 8192;
+/// Version of `cooked/index.json`.
+const COOK_INDEX_VERSION: u32 = 1;
 /// Largest image (texels) of a texture set or baked map: UV-tiled sets hold several tiles.
 const MAX_TEXELS: u64 = 1 << 28;
 
@@ -78,6 +102,10 @@ pub struct ProjectFile {
     pub thumbnail: Option<Vec<u8>>,
     /// Imported resources (images used by fills, alphas, stencils), by name: original bytes.
     pub resources: BTreeMap<String, Vec<u8>>,
+    /// Texts of the graphs the layers run, and their cooked outputs.
+    pub graphs: GraphStore,
+    /// Stroke records by the id of the pixels they belong to (a paint layer, a content or mask paint effect).
+    pub strokes: BTreeMap<LayerId, StoredStrokes>,
     /// Import warnings for the caller's log; never saved in the archive
     pub warnings: Vec<String>,
 }
@@ -133,6 +161,16 @@ fn header(w: u32, h: u32, comps: usize, count: usize) -> Vec<u8> {
 }
 
 fn write_tiles(w: &mut impl Write, img: &TileImage) -> std::io::Result<()> {
+    // an image not held is read for the entry and let go after (its file's count may not be what reads)
+    if !img.is_loaded() {
+        let mut copy = TileImage::new(img.width(), img.height(), img.comps());
+        img.for_each_tile::<()>(|tx, ty, t| {
+            copy.set_tile(tx, ty, Some(Arc::new(t.to_vec())));
+            Ok(())
+        })
+        .unwrap_or_default();
+        return write_tiles(w, &copy);
+    }
     w.write_all(&header(img.width(), img.height(), img.comps(), img.allocated_count()))?;
     let mut buf = Vec::with_capacity(TILE_AREA * img.comps() * 2 + 8);
     for (tx, ty) in img.allocated() {
@@ -181,6 +219,17 @@ fn write_baked(w: &mut dyn Write, res: u32, h: u32, comps: usize, data: &[f32]) 
         w.write_all(&buf)?;
     }
     Ok(())
+}
+
+/// A baked map's entry: its header, then its values as little-endian floats (also those held as 16-bit steps).
+fn write_texels(w: &mut dyn Write, res: u32, h: u32, comps: usize, data: &Texels) -> std::io::Result<()> {
+    w.write_all(&header(res, h, comps, 0))?;
+    let mut buf = Vec::with_capacity(BAKED_CHUNK * 4);
+    data.try_for_chunks(BAKED_CHUNK, |chunk| {
+        buf.clear();
+        buf.extend(chunk.iter().flat_map(|v| v.to_le_bytes()));
+        w.write_all(&buf)
+    })
 }
 
 /// The zip entries of a project file, in file order. Bodies run later, possibly on other threads.
@@ -251,7 +300,7 @@ fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
                 name: format!("baked/{ts}_{}.bin", m.id()),
                 options: deflate,
                 weight: data.len() as u64 * 4,
-                body: Box::new(move |w| write_baked(w, r, h, comps, data)),
+                body: Box::new(move |w| write_texels(w, r, h, comps, data)),
             });
         }
     }
@@ -267,6 +316,27 @@ fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
             body: Box::new(move |w| w.write_all(bytes)),
         });
     }
+    graph_entries(pf, deflate, &mut out)?;
+    // the images the records lay, each once however many records and stamps lay it
+    let mut images = strokes::ImageTable::default();
+    for (id, stored) in &pf.strokes {
+        if texture_set_of(&pf.project, *id).is_none() {
+            continue;
+        }
+        let bytes = strokes::entry_bytes(stored, &mut images).map_err(FormatError::Invalid)?;
+        if bytes.is_empty() {
+            continue;
+        }
+        out.push(Entry { name: strokes::entry_name(*id), options: deflate, weight: bytes.len() as u64, body: Box::new(move |w| w.write_all(&bytes)) });
+    }
+    for (key, values) in images.by_key {
+        out.push(Entry {
+            name: strokes::image_entry_name(&key),
+            options: deflate,
+            weight: values.len() as u64 * 4,
+            body: Box::new(move |w| w.write_all(&strokes::encode_image(&values))),
+        });
+    }
     Ok(out)
 }
 
@@ -277,6 +347,99 @@ fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
     Ok(())
 }
 
+/// What `cooked/index.json` holds.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct CookIndex {
+    version: u32,
+    /// By cook key: its outputs (output name → entry) and which of them hold linear colour.
+    cooks: BTreeMap<String, CookEntry>,
+    /// The cook each graph use read last.
+    #[serde(default)]
+    uses: Vec<(GraphUse, String)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct CookEntry {
+    outputs: BTreeMap<String, String>,
+    #[serde(default)]
+    linear: Vec<String>,
+}
+
+/// An output name as part of an entry name: as it is when it is plain, else hex.
+fn output_entry(key: &str, output: &str) -> String {
+    let plain = !output.is_empty() && output.len() <= 64 && output.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if plain { format!("cooked/{key}_{output}.bin") } else { format!("cooked/{key}_x{}.bin", output.bytes().map(|b| format!("{b:02x}")).collect::<String>()) }
+}
+
+/// The graph texts the project references and the cooks its uses read.
+fn graph_entries<'a>(pf: &'a ProjectFile, deflate: SimpleFileOptions, out: &mut Vec<Entry<'a>>) -> Result<()> {
+    let mut keys = pf.project.graph_keys();
+    // the graphs stroke records paint, so that the strokes can be laid again
+    let painted = pf.strokes.values().filter_map(StoredStrokes::record).flat_map(|r| r.graphs()).flat_map(|g| g.text_keys());
+    keys.extend(painted.map(str::to_string));
+    for key in &keys {
+        if !texturecraft_core::is_key(key) {
+            continue;
+        }
+        let Some(text) = pf.graphs.texts.get(key) else { continue };
+        out.push(Entry {
+            name: format!("graphs/{key}.txt"),
+            options: deflate,
+            weight: text.len() as u64,
+            body: Box::new(move |w| w.write_all(text.as_bytes())),
+        });
+    }
+    let uses = pf.graphs.uses();
+    if uses.is_empty() {
+        return Ok(());
+    }
+    let mut index = CookIndex { version: COOK_INDEX_VERSION, ..CookIndex::default() };
+    // cooks one at a time: a spilled one is read back only while its outputs are written
+    for key in pf.graphs.used_cook_keys() {
+        if !texturecraft_core::is_key(&key) {
+            continue;
+        }
+        let Some(outline) = pf.graphs.cook_outline(&key) else { continue };
+        let mut entry = CookEntry { linear: outline.linear.iter().cloned().collect(), ..CookEntry::default() };
+        // the cook read once for all its outputs, and let go when the last is written
+        let shared: Arc<std::sync::Mutex<(Option<Arc<Cooked>>, usize)>> = Arc::new(std::sync::Mutex::new((None, outline.outputs.len())));
+        for (output, (comps, allocated)) in &outline.outputs {
+            let name = output_entry(&key, output);
+            let weight = (allocated * (TILE_AREA * comps * 2 + 8)) as u64;
+            let (key_of_cook, name_of_output, shared) = (key.clone(), output.clone(), Arc::clone(&shared));
+            out.push(Entry {
+                name: name.clone(),
+                options: deflate,
+                weight,
+                body: Box::new(move |mut w| {
+                    let cooked = {
+                        let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if s.0.is_none() {
+                            s.0 = pf.graphs.cooked(&key_of_cook);
+                        }
+                        let c = s.0.clone();
+                        s.1 = s.1.saturating_sub(1);
+                        if s.1 == 0 {
+                            s.0 = None;
+                        }
+                        c
+                    };
+                    match cooked.as_ref().and_then(|c| c.outputs.get(&name_of_output)) {
+                        Some(img) => write_tiles(&mut w, img),
+                        None => Ok(()),
+                    }
+                }),
+            });
+            entry.outputs.insert(output.clone(), name);
+        }
+        index.cooks.insert(key, entry);
+    }
+    index.uses = uses.into_iter().filter(|(_, k)| index.cooks.contains_key(k)).collect();
+    let json = serde_json::to_vec_pretty(&index).map_err(|e| FormatError::Invalid(e.to_string()))?;
+    out.push(Entry { name: "cooked/index.json".into(), options: deflate, weight: json.len() as u64, body: Box::new(move |w| w.write_all(&json)) });
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Load.
 
@@ -284,10 +447,102 @@ pub fn load_project_bytes(bytes: &[u8]) -> Result<ProjectFile> {
     crate::guard(KIND, || load(Cursor::new(bytes)))
 }
 
+/// The project in the file at `path`. Its layer pixels, baked maps and cooked graph results are not read now: each is
+/// read from the file when a composite or a save needs it (see [`FileCooks`], [`TileImage::lazy`], [`Texels::lazy`]),
+/// and can be let go again while unchanged, so a large project does not hold them all. A save that moves the
+/// document to another file tells them where it went ([`project_moved`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_project(path: &std::path::Path) -> Result<ProjectFile> {
     let file = std::fs::File::open(path)?;
-    crate::guard(KIND, || load(std::io::BufReader::new(file)))
+    let limit_bytes = u64::from(project_open_limit_gib()) << 30;
+    let origin = Origin::new(path);
+    crate::guard(KIND, || load_with_budget(std::io::BufReader::new(file), LoadBudget::new(limit_bytes), Some(&origin)))
+}
+
+/// Where the lazily read parts of a project come from: the file it was opened from, until a save moves it.
+#[derive(Clone)]
+struct Origin(Arc<std::sync::RwLock<std::path::PathBuf>>);
+
+/// The origins of every project opened lazily and still in use.
+static ORIGINS: std::sync::Mutex<Vec<std::sync::Weak<std::sync::RwLock<std::path::PathBuf>>>> = std::sync::Mutex::new(Vec::new());
+
+impl Origin {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn new(path: &std::path::Path) -> Origin {
+        let origin = Origin(Arc::new(std::sync::RwLock::new(path.to_path_buf())));
+        let mut all = ORIGINS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.retain(|o| o.strong_count() > 0);
+        all.push(Arc::downgrade(&origin.0));
+        origin
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// The archive, opened again for one read.
+    fn open(&self) -> Result<ZipArchive<std::io::BufReader<std::fs::File>>> {
+        let file = std::fs::File::open(self.path())?;
+        let zip = ZipArchive::with_config(zip::read::Config { archive_offset: zip::read::ArchiveOffset::Known(0) }, std::io::BufReader::new(file));
+        zip.map_err(zip_err)
+    }
+}
+
+/// A project opened lazily from `from` was saved to `to` and is from now on that file: its parts not read yet are read
+/// from there (the save wrote them under the same names).
+pub fn project_moved(from: &std::path::Path, to: &std::path::Path) {
+    let all = ORIGINS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for origin in all.iter().filter_map(std::sync::Weak::upgrade) {
+        let mut path = origin.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *path == from {
+            *path = to.to_path_buf();
+        }
+    }
+}
+
+/// The tiles of the entry `name` (a `size` image of `comps` components) read from `origin`, slot by slot.
+fn lazy_tiles(origin: &Origin, name: &str, size: (u32, u32), comps: usize) -> Option<Vec<Option<texturecraft_texel::TileData>>> {
+    let mut zip = origin.open().ok()?;
+    let mut f = zip.by_name(name).ok()?;
+    let limit_bytes = u64::from(project_open_limit_gib()) << 30;
+    let img = read_tiles(&mut f, size, comps, &mut LoadBudget::new(limit_bytes), name).ok()?;
+    Some((0..img.tiles_y()).flat_map(|ty| (0..img.tiles_x()).map(move |tx| (tx, ty))).map(|(tx, ty)| img.tile_handle(tx, ty).cloned()).collect())
+}
+
+/// The image of entry `name`: its header read and checked now, its tiles from `origin` when needed.
+fn lazy_image(f: &mut impl Read, origin: &Origin, name: &str, size: (u32, u32), comps: usize, budget: &mut LoadBudget) -> Result<TileImage> {
+    budget.take(BIN_HEADER_BYTES as u64).map_err(FormatError::TooLarge)?;
+    let (width, height, stored, count) = read_header(f, name)?;
+    if (width, height) != size || stored != comps {
+        return Err(malformed(KIND, format!("{name}: {width}×{height}×{stored} does not match the texture set ({}×{}×{comps})", size.0, size.1)));
+    }
+    let probe = TileImage::new(width, height, comps);
+    if count > (probe.tiles_x() as usize) * (probe.tiles_y() as usize) {
+        return Err(malformed(KIND, format!("{name}: {count} tiles is more than the image holds")));
+    }
+    let (origin, entry) = (origin.clone(), name.to_string());
+    Ok(TileImage::lazy(width, height, comps, count, Arc::new(move || lazy_tiles(&origin, &entry, size, comps))))
+}
+
+/// The baked map of entry `name`: its header read and checked now, its values from `origin` when needed.
+fn lazy_baked(f: &mut impl Read, origin: &Origin, name: &str, declared_bytes: u64, components: usize, budget: &mut LoadBudget) -> Result<(u32, u32, Texels)> {
+    budget.take(BIN_HEADER_BYTES as u64).map_err(FormatError::TooLarge)?;
+    let (width, height, stored, _) = read_header(f, name)?;
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_TEXELS || stored != components {
+        return Err(malformed(KIND, format!("{name}: bad size {width}×{height}×{stored}")));
+    }
+    let count = u64::from(width) * u64::from(height) * components as u64;
+    if declared_bytes != BIN_HEADER_BYTES as u64 + count * 4 {
+        return Err(malformed(KIND, format!("{name}: {declared_bytes} bytes for a {width}×{height}×{components} map")));
+    }
+    let (origin, entry) = (origin.clone(), name.to_string());
+    let source = Arc::new(move || {
+        let mut zip = origin.open().ok()?;
+        let mut f = zip.by_name(&entry).ok()?;
+        let limit_bytes = u64::from(project_open_limit_gib()) << 30;
+        read_baked(&mut f, declared_bytes, components, &mut LoadBudget::new(limit_bytes), &entry).ok().map(|(_, _, values)| values)
+    });
+    Ok((width, height, Texels::lazy(count as usize, source)))
 }
 
 fn read_all(reader: &mut impl Read, cap: u64, budget: &mut LoadBudget, what: &str) -> Result<Vec<u8>> {
@@ -410,6 +665,106 @@ fn read_baked(reader: &mut impl Read, declared_bytes: u64, components: usize, bu
     Ok((width, height, data))
 }
 
+/// One cook of the index read whole from the archive, or `None` when an output is missing or malformed.
+fn read_cook<R: Read + Seek>(zip: &mut ZipArchive<R>, entry: &CookEntry, budget: &mut LoadBudget) -> Option<Cooked> {
+    let mut outputs = BTreeMap::new();
+    for (output, file) in &entry.outputs {
+        let (w, h, comps, _) = cook_output_head(zip, file).ok()?;
+        let mut f = zip.by_name(file).ok()?;
+        outputs.insert(output.clone(), read_tiles(&mut f, (w, h), comps, budget, file).ok()?);
+    }
+    let linear = entry.linear.iter().filter(|l| outputs.contains_key(*l)).cloned().collect();
+    Some(Cooked::new(outputs, linear))
+}
+
+/// The size, components and tile count the cooked output entry `file` declares.
+fn cook_output_head<R: Read + Seek>(zip: &mut ZipArchive<R>, file: &str) -> Result<(u32, u32, usize, usize)> {
+    if !file.starts_with("cooked/") || file.contains("..") {
+        return Err(malformed(KIND, format!("bad cooked entry {file}")));
+    }
+    let mut f = zip.by_name(file).map_err(zip_err)?;
+    let mut head = [0u8; BIN_HEADER_BYTES];
+    read_exact(&mut f, &mut head, file)?;
+    let (w, h, comps, count) = (u32_at(&head, 2), u32_at(&head, 3), u32_at(&head, 4) as usize, u32_at(&head, 5) as usize);
+    if w == 0 || h == 0 || w > MAX_COOK_SIDE || h > MAX_COOK_SIDE || !matches!(comps, 1 | 4) {
+        return Err(malformed(KIND, format!("{file}: bad size {w}×{h}×{comps}")));
+    }
+    Ok((w, h, comps, count))
+}
+
+/// The cooks `index` lists, each whole or not at all; a cook with a missing or malformed output is left out with a
+/// warning (it is rendered again when it is needed). With `lazy` (the file the archive is read from) the cooks are
+/// not read now: the store is told what the file holds and reads each when it is needed.
+fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mut ProjectFile, budget: &mut LoadBudget, lazy: Option<&Origin>) {
+    let mut dropped = 0usize;
+    let mut kept: BTreeMap<String, CookEntry> = BTreeMap::new();
+    let mut outlines = std::collections::HashMap::new();
+    for (key, entry) in index.cooks {
+        if !texturecraft_core::is_key(&key) || entry.outputs.is_empty() {
+            dropped += 1;
+            continue;
+        }
+        if lazy.is_some() {
+            // what the cook holds, from its outputs' headers
+            let heads: Option<BTreeMap<String, (usize, usize)>> = entry
+                .outputs
+                .iter()
+                .map(|(output, file)| cook_output_head(zip, file).ok().map(|(_, _, comps, count)| (output.clone(), (comps, count))))
+                .collect();
+            match heads {
+                Some(outputs) => {
+                    let linear = entry.linear.iter().filter(|l| outputs.contains_key(*l)).cloned().collect();
+                    outlines.insert(key.clone(), texturecraft_compose::graphs::spill::CookOutline { outputs, linear });
+                    kept.insert(key, entry);
+                }
+                None => dropped += 1,
+            }
+            continue;
+        }
+        match read_cook(zip, &entry, budget) {
+            Some(cooked) => pf.graphs.insert_cooked(key, cooked),
+            None => dropped += 1,
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(origin) = lazy
+        && !kept.is_empty()
+    {
+        pf.graphs.read_cooks_from(Arc::new(FileCooks { origin: origin.clone(), cooks: kept }), outlines);
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (kept, outlines);
+    pf.graphs.set_uses(index.uses.into_iter().collect());
+    if dropped > 0 {
+        pf.warnings.push(format!("Note: {dropped} cooked graph result(s) could not be read; they will be rendered again when needed."));
+    }
+}
+
+/// The cooked graph results a project file holds, read from it one at a time when they are needed. The file is opened
+/// for each read, by its path: a save over it (written beside it and renamed) keeps every cook the project still
+/// reads, under the same entry names. A cook that cannot be read any more is rendered again, the same pixels.
+#[cfg(not(target_arch = "wasm32"))]
+struct FileCooks {
+    origin: Origin,
+    cooks: BTreeMap<String, CookEntry>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl texturecraft_compose::graphs::spill::CookSource for FileCooks {
+    fn get(&self, key: &str) -> Option<Cooked> {
+        let entry = self.cooks.get(key)?;
+        let limit_bytes = u64::from(project_open_limit_gib()) << 30;
+        crate::guard(KIND, || {
+            let file = std::fs::File::open(self.origin.path())?;
+            let metadata_only = Cell::new(true);
+            let mut zip = open_archive(std::io::BufReader::new(file), &metadata_only, MAX_ZIP_METADATA_BYTES)?;
+            Ok(read_cook(&mut zip, entry, &mut LoadBudget::new(limit_bytes)))
+        })
+        .ok()
+        .flatten()
+    }
+}
+
 /// Texture set holding a paint layer, a content effect or a mask effect id.
 fn texture_set_of(project: &Project, id: LayerId) -> Option<usize> {
     let owner = if project.layers.contains_key(&id) { id } else { project.effect(id)?.0 };
@@ -418,10 +773,19 @@ fn texture_set_of(project: &Project, id: LayerId) -> Option<usize> {
 
 fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
     let limit_bytes = u64::from(project_open_limit_gib()) << 30;
-    load_with_budget(reader, LoadBudget::new(limit_bytes))
+    load_with_budget(reader, LoadBudget::new(limit_bytes), None)
 }
 
-fn check_archive<R: Read + Seek>(zip: &mut ZipArchive<R>, limit_bytes: u64) -> Result<()> {
+/// Whether a lazy open reads only the header of entry `name` and the rest when a composite or a save needs it (layer
+/// and mask pixels, baked maps, cooked graph outputs). Each later read checks that entry on its own against the limit.
+fn read_lazily(name: &str) -> bool {
+    let bin = name.ends_with(".bin");
+    bin && (name.starts_with("pixels/layer_") || name.starts_with("pixels/mask_") || name.starts_with("baked/") || name.starts_with("cooked/"))
+}
+
+/// Checks the archive before any decompression. With `lazy` an entry read lazily is charged its header only: the open
+/// does not hold the rest, so the limit counts what the open actually holds.
+fn check_archive<R: Read + Seek>(zip: &mut ZipArchive<R>, limit_bytes: u64, lazy: bool) -> Result<()> {
     if zip.len() > MAX_ENTRIES {
         return Err(FormatError::TooLarge(format!("project file has more than {MAX_ENTRIES} entries")));
     }
@@ -430,7 +794,8 @@ fn check_archive<R: Read + Seek>(zip: &mut ZipArchive<R>, limit_bytes: u64) -> R
     let mut declared_budget = LoadBudget::new(limit_bytes);
     for index in 0..zip.len() {
         let entry = zip.by_index_raw(index).map_err(zip_err)?;
-        declared_budget.take(entry.size()).map_err(FormatError::TooLarge)?;
+        let held = if lazy && entry.name().is_ok_and(|name| read_lazily(&name)) { entry.size().min(BIN_HEADER_BYTES as u64) } else { entry.size() };
+        declared_budget.take(held).map_err(FormatError::TooLarge)?;
     }
 
     // Shared compressed ranges can amplify one payload into many apparent files
@@ -450,10 +815,10 @@ fn open_archive<'a, R: Read + Seek>(reader: R, metadata_only: &'a Cell<bool>, me
     Ok(archive)
 }
 
-fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result<ProjectFile> {
+fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget, lazy: Option<&Origin>) -> Result<ProjectFile> {
     let metadata_only = Cell::new(true);
     let mut zip = open_archive(reader, &metadata_only, MAX_ZIP_METADATA_BYTES)?;
-    check_archive(&mut zip, budget.remaining())?;
+    check_archive(&mut zip, budget.remaining(), lazy.is_some())?;
 
     let json = read_all(&mut zip.by_name("project.json").map_err(zip_err)?, MAX_JSON, &mut budget, "project.json")?;
     #[derive(serde::Deserialize)]
@@ -481,9 +846,16 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
         bake_paint: BTreeMap::new(),
         thumbnail: None,
         resources: BTreeMap::new(),
+        graphs: GraphStore::default(),
+        strokes: BTreeMap::new(),
         warnings: Vec::new(),
         project,
     };
+    let mut unreadable_strokes = 0usize;
+    let mut dropped_strokes = 0usize;
+    let mut stroke_entries = Vec::new();
+    let mut stroke_images = std::collections::HashMap::new();
+    let mut cook_index: Option<CookIndex> = None;
 
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(zip_err)?;
@@ -492,6 +864,22 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
         let size_of = |id: LayerId| texture_set_of(&pf.project, id).and_then(|ts| pf.project.texture_sets.get(ts)).map(|t| t.size());
         if name == "thumbnail.png" {
             pf.thumbnail = Some(read_all(&mut f, MAX_THUMBNAIL, &mut budget, &name)?);
+        } else if let Some(key) = name.strip_prefix("graphs/").and_then(|n| n.strip_suffix(".txt")) {
+            if !texturecraft_core::is_key(key) {
+                return Err(malformed(KIND, format!("bad graph entry {name}")));
+            }
+            let bytes = read_all(&mut f, MAX_GRAPH_TEXT, &mut budget, &name)?;
+            let text = String::from_utf8(bytes).map_err(|_| malformed(KIND, format!("{name} is not text")))?;
+            if texturecraft_core::text_key(&text) != key {
+                return Err(malformed(KIND, format!("{name} does not match its key")));
+            }
+            pf.graphs.texts.insert(key.to_string(), Arc::from(text));
+        } else if name == "cooked/index.json" {
+            let json = read_all(&mut f, MAX_COOK_INDEX, &mut budget, &name)?;
+            match serde_json::from_slice::<CookIndex>(&json) {
+                Ok(index) if index.version <= COOK_INDEX_VERSION => cook_index = Some(index),
+                _ => pf.warnings.push("Note: the project's cooked graph results could not be read; graphs will be rendered again.".into()),
+            }
         } else if let Some(res_name) = name.strip_prefix("resources/") {
             if res_name.is_empty() || sanitize_resource_name(res_name) != res_name {
                 return Err(malformed(KIND, format!("bad resource name {name}")));
@@ -533,14 +921,40 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
             // Drop pixels of layers that are no longer in any stack
             let Some(size) = size_of(id) else { continue };
 
-            let img = read_tiles(&mut f, size, c.components() + 1, &mut budget, &name)?;
+            let img = match lazy {
+                Some(origin) => lazy_image(&mut f, origin, &name, size, c.components() + 1, &mut budget)?,
+                None => read_tiles(&mut f, size, c.components() + 1, &mut budget, &name)?,
+            };
             pf.pixels.layers.insert((id, c), img);
         } else if let Some(rest) = name.strip_prefix("pixels/mask_").and_then(|r| r.strip_suffix(".bin")) {
             let id = LayerId(rest.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?);
             let Some(size) = size_of(id) else { continue };
 
-            let img = read_tiles(&mut f, size, 2, &mut budget, &name)?;
+            let img = match lazy {
+                Some(origin) => lazy_image(&mut f, origin, &name, size, 2, &mut budget)?,
+                None => read_tiles(&mut f, size, 2, &mut budget, &name)?,
+            };
             pf.pixels.masks.insert(id, img);
+        } else if let Some(id) = strokes::entry_id(&name) {
+            let id = id.ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
+            // Drop records of pixels that are no longer in any stack
+            if size_of(id).is_none() {
+                continue;
+            }
+            // A record larger than any this build writes (older builds kept every stamp's tip inside it) is left
+            // out: the project still opens, its pixels unchanged
+            if declared_bytes > strokes::MAX_ENTRY {
+                dropped_strokes += 1;
+                continue;
+            }
+            // read once the images they name are known (entries come in any order)
+            stroke_entries.push((id, read_all(&mut f, strokes::MAX_ENTRY, &mut budget, &name)?));
+        } else if let Some(key) = strokes::image_entry_key(&name) {
+            let key = key.ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
+            // an image that cannot be read leaves the records naming it unreadable (kept as they are)
+            if let Ok(values) = strokes::decode_image(key, &read_all(&mut f, strokes::MAX_IMAGE_ENTRY, &mut budget, &name)?) {
+                stroke_images.insert(key.to_string(), values);
+            }
         } else if let Some(rest) = name.strip_prefix("baked/").and_then(|r| r.strip_suffix(".bin")) {
             let (ts, map) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
             let ts: usize = ts.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?;
@@ -553,7 +967,13 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
                 continue;
             }
 
-            let (res, height, data) = read_baked(&mut f, declared_bytes, m.components(), &mut budget, &name)?;
+            let (res, height, data) = match lazy {
+                Some(origin) => lazy_baked(&mut f, origin, &name, declared_bytes, m.components(), &mut budget)?,
+                None => {
+                    let (res, height, values) = read_baked(&mut f, declared_bytes, m.components(), &mut budget, &name)?;
+                    (res, height, Texels::new(values))
+                }
+            };
             let maps = pf.baked.entry(ts).or_default();
             if maps.maps.is_empty() {
                 maps.resolution = res;
@@ -562,10 +982,28 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
             }
             maps.maps.insert(m, Arc::new(data));
         }
-        // Ignore other entries from newer minor revisions
+        // Ignore other entries from newer minor revisions (cooked outputs are read through their index below)
+    }
+    if let Some(index) = cook_index {
+        load_cooks(&mut zip, index, &mut pf, &mut budget, lazy);
     }
 
+    for (id, bytes) in stroke_entries {
+        let stored = strokes::read(bytes, &mut stroke_images);
+        unreadable_strokes += usize::from(matches!(stored, StoredStrokes::Unreadable(_)));
+        pf.strokes.insert(id, stored);
+    }
+    drop(stroke_images);
+
     pf.project.format_version = FORMAT_VERSION;
+    if dropped_strokes > 0 {
+        pf.warnings
+            .push(format!("Note: {dropped_strokes} stroke record(s) larger than {} MiB were left out; the pixels are unchanged.", strokes::MAX_ENTRY >> 20));
+    }
+    if unreadable_strokes > 0 {
+        pf.warnings
+            .push(format!("Note: {unreadable_strokes} stroke record(s) could not be read; the pixels are unchanged and the records are kept as they are."));
+    }
 
     if recovered {
         pf.warnings.push(

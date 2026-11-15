@@ -62,6 +62,11 @@ impl Session {
         // Painting an instance paints its source (its own mask when it overrides the mask).
         let p = &self.doc.project;
         let id = if self.target == StackTarget::Mask { p.mask_owner(id) } else { p.content_layer(id).map_or(id, |l| l.id) };
+        let owner = match self.target {
+            StackTarget::Effect(e) => p.effect(e).map_or(id, |(owner, _)| owner),
+            _ => id,
+        };
+        crate::lock_cmds::refuse_locked(p, owner)?;
         match self.target {
             StackTarget::Content => {
                 let l = self.doc.project.layer(id)?;
@@ -221,8 +226,8 @@ impl Session {
                 m => m,
             };
             canvas.pickup = Some(match &layer_source {
-                Some(flat) => Pickup::from_layer(mode, flat, size, cache.gbuf.clone(), values.keys().copied()),
-                None => Pickup::new(mode, cache.composite.clone(), cache.gbuf.clone(), values.keys().copied()),
+                Some(flat) => Pickup::from_layer(mode, flat, size, cache.gbuf().clone(), values.keys().copied()),
+                None => Pickup::new(mode, cache.composite.clone(), cache.gbuf().clone(), values.keys().copied()),
             });
             if tool == Tool::Clone
                 && let Some(src) = self.tool.clone_source.as_mut()
@@ -344,6 +349,7 @@ impl Session {
 
         let settings = &active.stroke.settings;
         let radius = settings.uv_stamp_radius(pressure);
+        let flow = settings.flow * texturecraft_paint::pressure_scale(settings.min_flow, pressure.clamp(0.0, 1.0));
         let step = (settings.spacing * 2.0 * radius).max(MIN_UV_STAMP_STEP);
 
         // Follow path: turn the stamp with the stroke direction (y up on screen, v grows down)
@@ -368,12 +374,12 @@ impl Session {
             while distance <= length && batch.len() < batch_size {
                 let center = start + segment * (distance / length.max(f32::MIN_POSITIVE));
                 let seed = progress.stamps.wrapping_add((stamped + batch.len()) as u32);
-                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow: settings.flow, hardness: settings.hardness, seed });
+                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow, hardness: settings.hardness, seed });
                 distance += step;
             }
 
             stamped += batch.len();
-            texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, &batch);
+            texturecraft_paint::rasterize_uv(&mut active.canvas, cache.gbuf(), shape, &batch);
         }
 
         // At most one step, so a segment cut off at the stamp limit can't push the next one's stamps backwards
@@ -396,13 +402,15 @@ impl Session {
         let rctx = RasterCtx {
             mesh: &self.mesh,
             bvh: &self.bvh,
-            gbuf: &cache.gbuf,
+            gbuf: cache.gbuf(),
             material,
             depth: st.depth.as_deref(),
             eye: st.camera.eye(),
             backface_culling: st.stroke.settings.backface_culling,
             angle_fade: st.stroke.settings.angle_fade,
             shape: Self::shape(&self.images, &st.stroke.settings),
+            facing: texturecraft_paint::Facing::Front,
+            reach: texturecraft_paint::Reach::Plane,
         };
         rasterize(&mut st.canvas, &rctx, &stamps);
         self.stroke_painted();
@@ -419,7 +427,7 @@ impl Session {
             self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
             return;
         };
-        let gbuf = self.caches.get(ts).map(|c| c.gbuf.clone());
+        let gbuf = self.caches.get(ts).map(|c| c.gbuf().clone());
         let (pixels, mask_value) = (&self.doc.pixels, self.tool.mask_value);
         let mut staging = std::mem::take(&mut st.staging);
         with_commit_source(st, gbuf.as_deref(), &self.mesh, &recent, |src| match t {
@@ -443,7 +451,7 @@ impl Session {
             self.doc = st.before;
             return Ok(());
         }
-        let gbuf = self.caches.get(st.ts).map(|c| c.gbuf.clone());
+        let gbuf = self.caches.get(st.ts).map(|c| c.gbuf().clone());
         let mesh = self.mesh.clone();
         let mut staging = std::mem::take(&mut st.staging);
         let mask_value = self.tool.mask_value;
@@ -516,7 +524,7 @@ impl Session {
     /// The G-buffer of texture set `ts` and an empty canvas for a one-shot fill, limited by the
     /// quick mask unless the fill edits it.
     pub(crate) fn fill_canvas(&self, ts: usize) -> Result<(std::sync::Arc<texturecraft_geom::UvGBuffer>, StrokeCanvas)> {
-        let gbuf = self.caches.get(ts).map(|c| c.gbuf.clone()).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
+        let gbuf = self.caches.get(ts).map(|c| c.gbuf().clone()).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
         let mut canvas = StrokeCanvas::new(gbuf.width, gbuf.height);
         if !self.quick_mask.editing {
             canvas.limit = self.stroke_limit(ts, (gbuf.width, gbuf.height));
@@ -585,7 +593,7 @@ impl Session {
         if !((0.0..1.0).contains(&uv.x) && (0.0..1.0).contains(&uv.y)) {
             return None;
         }
-        let g = &self.caches.get(self.ts())?.gbuf;
+        let g = &self.caches.get(self.ts())?.gbuf();
         let (x, y) = ((uv.x * g.width as f32) as usize, (uv.y * g.height as f32) as usize);
         Some(g.surface(&self.mesh, y * g.width as usize + x)?.pos)
     }

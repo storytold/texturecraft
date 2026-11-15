@@ -4,9 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CoreError, Effect, Layer, LayerId, LayerKind, Result};
+use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CompositeRules, CoreError, Effect, ImportReport, Layer, LayerId, LayerKind, Result};
 
-pub const FORMAT_VERSION: u32 = 2;
+/// Version of `project.json`. 3 added layer locks, placeholder effects, the import report, geometry masks by UV
+/// tile, the imported blend modes, the project's compositing rules ([`Project::rules`]) and placed projections
+/// ([`crate::PlacedProjection`]); version 2 files read unchanged.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Maximum group nesting (also bounds recursion over hostile project files)
 pub const MAX_DEPTH: usize = 16;
@@ -70,6 +73,10 @@ pub struct TextureSet {
     /// than the atlas block fills the block's top-left corner (see [`TextureSet::to_atlas`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tile_resolutions: BTreeMap<u32, u32>,
+    /// Names the set gives its channels (user channels: what they hold); a channel without one
+    /// shows its [`Channel::label`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub channel_names: BTreeMap<Channel, String>,
 }
 
 /// Smallest and largest texture set (and UV tile) resolutions.
@@ -162,7 +169,13 @@ impl TextureSet {
             uv_tiles: Vec::new(),
             bake_excluded_tiles: BTreeSet::new(),
             tile_resolutions: BTreeMap::new(),
+            channel_names: BTreeMap::new(),
         }
+    }
+
+    /// The name the set shows for `channel`: its own name for it, else the channel's label.
+    pub fn channel_label(&self, channel: Channel) -> &str {
+        self.channel_names.get(&channel).map_or(channel.label(), String::as_str)
     }
 
     /// The atlas grid of a UV-tiled set (None for a classic set).
@@ -408,6 +421,13 @@ pub struct Project {
     /// Saved and imported cameras (the viewport's default camera is not in the list).
     #[serde(default)]
     pub cameras: Vec<Camera>,
+    /// Set on a project converted from another application's file: what was carried over and how faithfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<ImportReport>,
+    /// The rules the compositor and the exporter follow: TextureCraft's own unless the project was imported (left out
+    /// of the file then, so projects made here save and render as before).
+    #[serde(default, skip_serializing_if = "CompositeRules::is_native")]
+    pub rules: CompositeRules,
 }
 
 impl Project {
@@ -424,6 +444,8 @@ impl Project {
             next_id: 1,
             display: DisplaySettings::default(),
             cameras: Vec::new(),
+            import: None,
+            rules: CompositeRules::default(),
         }
     }
 
@@ -642,10 +664,18 @@ impl Project {
                 }
             }
         }
+        if let Some(key) = self.layers.values().flat_map(|l| l.graphs()).flat_map(|g| g.text_keys()).find(|k| !crate::layer::is_key(k)) {
+            return Err(CoreError::Invalid(format!("graph key {:?} is not a graph text key", key.chars().take(64).collect::<String>())));
+        }
         match self.instance_cycle() {
             Some(id) => Err(CoreError::Invalid(format!("instance layer {} draws itself", id.0))),
             None => Ok(()),
         }
+    }
+
+    /// The text keys of every graph the project's layers run (nested graphs included).
+    pub fn graph_keys(&self) -> BTreeSet<String> {
+        self.layers.values().flat_map(|l| l.graphs()).flat_map(|g| g.text_keys()).map(str::to_string).collect()
     }
 
     /// Every layer drawn when `roots` are drawn: the roots, folder children and instance

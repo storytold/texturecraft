@@ -1,0 +1,6 @@
+texturecraft-graph
+Derived from MaterialCraft by PiJellyPin and contributors (https://github.com/PiJellyPin/MaterialCraft, not
+storytold/materialcraft): copied and adapted, not a dependency.
+This notice also covers the copy of this crate's PNG encoder in crates/import-reader/src/png_out/.
+
+Dual licensed under the Apache License 2.0 or the MIT License, at your option.

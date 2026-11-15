@@ -1,0 +1,20 @@
+[package]
+name = "texturecraft-import-verify"
+description = "Neutral scoring for imported projects: per-channel metrics on the mesh's UV islands, grades and the per-channel report behind import.verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+texturecraft-geom = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+glam = { workspace = true }
+serde_json = { workspace = true }

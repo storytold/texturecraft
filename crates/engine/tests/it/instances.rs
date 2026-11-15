@@ -21,7 +21,7 @@ fn id(v: Value, key: &str) -> LayerId {
 
 /// A texel covered by texture set `ts`.
 fn covered(s: &Session, ts: usize) -> (u32, u32) {
-    let g = &s.caches[ts].gbuf;
+    let g = &s.caches[ts].gbuf();
     let i = g.tri.iter().position(|t| *t != texturecraft_engine::geom::NO_TRI).unwrap();
     (i as u32 % g.width, i as u32 / g.width)
 }
@@ -37,7 +37,7 @@ fn reds(s: &Session, ts: usize) -> usize {
     let c = &s.caches[ts].composite;
     (0..256)
         .flat_map(|y| (0..256).map(move |x| (x, y)))
-        .filter(|&(x, y)| s.caches[ts].gbuf.tri[(y * 256 + x) as usize] != u32::MAX)
+        .filter(|&(x, y)| s.caches[ts].gbuf().tri[(y * 256 + x) as usize] != u32::MAX)
         .filter(|&(x, y)| {
             let v = c.value(Channel::BaseColor, x, y);
             v[0] > 0.8 && v[1] < 0.2
@@ -231,7 +231,7 @@ fn importing_images_invalidates_only_sets_with_newly_resolved_references() {
     session.update();
     let (x, y) = covered(&session, 1);
     assert!(session.caches[1].composite.value(Channel::BaseColor, x, y)[0] > 0.9);
-    let imported_image = Arc::downgrade(&session.images["later.png"]);
+    let imported_image = Arc::downgrade(session.images.get("later.png").unwrap());
 
     session.undo().unwrap();
     assert!(!session.caches[0].dirty.is_empty(), "resource removal retains broad invalidation");
@@ -241,15 +241,15 @@ fn importing_images_invalidates_only_sets_with_newly_resolved_references() {
     session.redo().unwrap();
     assert!(session.caches[0].dirty.is_empty());
     assert!(!session.caches[1].dirty.is_empty());
-    assert!(!imported_image.ptr_eq(&Arc::downgrade(&session.images["later.png"])), "redo decodes a new image allocation");
+    assert!(!imported_image.ptr_eq(&Arc::downgrade(session.images.get("later.png").unwrap())), "redo decodes a new image allocation");
     session.update();
 
     session.import_resource_bytes("unused.png", image_bytes).unwrap();
     assert!(session.caches.iter().all(|cache| cache.dirty.is_empty()), "unused image leaves every set clean");
 
-    let resolved_image = Arc::downgrade(&session.images["later.png"]);
+    let resolved_image = Arc::downgrade(session.images.get("later.png").unwrap());
     session.sync_images();
-    assert!(resolved_image.ptr_eq(&Arc::downgrade(&session.images["later.png"])), "sync reuses already decoded images");
+    assert!(resolved_image.ptr_eq(&Arc::downgrade(session.images.get("later.png").unwrap())), "sync reuses already decoded images");
 }
 
 #[test]

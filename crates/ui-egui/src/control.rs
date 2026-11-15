@@ -169,6 +169,30 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
             crate::menus::invoke(app, ctx, id);
             ok(Value::Null)
         }
+        // the project import's windows, as a person drives them: open a file (the notice shows), acknowledge the
+        // notice, read what the windows show
+        // opening a file by its path: not in the web build, which has no file system
+        #[cfg(not(target_arch = "wasm32"))]
+        "ui.import.open" => {
+            let Some(path) = p.get("path").and_then(Value::as_str) else { return err("`path` is required") };
+            crate::windows::open_path(app, path);
+            ok(crate::import_ui::status(app, ctx.input(|i| i.time)))
+        }
+        "ui.import.convert" => {
+            if !crate::import_ui::acknowledge(app, ctx) {
+                return err("no import notice is showing");
+            }
+            ok(crate::import_ui::status(app, ctx.input(|i| i.time)))
+        }
+        "ui.import.status" => {
+            let mut status = crate::import_ui::status(app, ctx.input(|i| i.time));
+            if let Some(o) = status.as_object_mut() {
+                o.insert("pendingTiles".into(), json!(app.session.pending_tiles()));
+                o.insert("project".into(), json!(app.session.project().name));
+                o.insert("uiMs".into(), json!(app.ui_ms));
+            }
+            ok(status)
+        }
         "ui.set" => {
             let mut cur = serde_json::to_value(&app.ui).unwrap_or(Value::Null);
             if let (Some(obj), Some(patch)) = (cur.as_object_mut(), p.as_object()) {

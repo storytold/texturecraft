@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use texturecraft_compose::{DisplayKind, ImageRes};
+use texturecraft_core::rules::{HeightNormal, MEASURED_SLOPE};
 use texturecraft_core::{Channel, DisplaySettings, Project, ToneMapping};
 use texturecraft_geom::glam::{Mat4, Vec3};
 use texturecraft_geom::{Mesh, OrbitCamera};
@@ -126,6 +127,9 @@ pub struct Shade {
     pub env_opacity: f32,
     pub ao_intensity: f32,
     pub height_strength: f32,
+    /// How height becomes normal detail: the project's rule ([`Project::rules`]), the same filter and slope as texture
+    /// export. Set by [`Shade::from_project`].
+    pub height_normal: HeightNormal,
     /// -1 for DirectX normal maps in the normal channel, 1 for OpenGL.
     pub normal_y: f32,
     /// 0 material, 1 channel, 2 mesh map (aux texture), 3 UV checker.
@@ -182,6 +186,18 @@ pub struct Shade {
     pub bake: Option<BakeVisualization>,
 }
 
+/// The height-to-normal rule as the mesh shader reads it: (filter, slope). Filter 0 is TextureCraft's own (central
+/// differences, 45° at strength 1 for a height change of 1 over 1/16 of the width), 1 the measured 3×3 Sobel and 2 the
+/// measured backward differences; slope is the normal tilt per unit of height per texel at strength 1 as a fraction of
+/// the texture width (the export's `height_normal`).
+fn height_normal_globals(h: HeightNormal) -> [f32; 2] {
+    match h {
+        HeightNormal::Native => [0.0, 1.0 / 16.0],
+        HeightNormal::Sobel => [1.0, MEASURED_SLOPE],
+        HeightNormal::Backward => [2.0, MEASURED_SLOPE],
+    }
+}
+
 /// The viewport's subsurface scattering approximation: the diffuse lighting wraps around the
 /// terminator by `min(1, 4 × radius × color)` per channel (radius as a fraction of the mesh
 /// size, about the softening angle on mesh-scale curvature; the path tracer walks the real
@@ -229,6 +245,7 @@ impl Shade {
         Shade {
             sss_blur: scatters.then(|| d.scatter_color.map(|c| c.max(0.0) * d.scatter_radius)),
             refraction: has(Channel::Transmission),
+            height_normal: p.rules.height_normal,
             ..Shade::from_display(d)
         }
     }
@@ -244,6 +261,7 @@ impl Default for Shade {
             env_opacity: 0.0,
             ao_intensity: 0.75,
             height_strength: 1.0,
+            height_normal: HeightNormal::Native,
             normal_y: 1.0,
             view_mode: 0,
             channel: 0,
@@ -440,6 +458,16 @@ struct MeshGpu {
     /// Bounding sphere (center, radius) for fitting the shadow map.
     center: Vec3,
     radius: f32,
+    /// The parts after the first of a mesh too large for one buffer ([`crate::mesh_parts`]), each with its own
+    /// vertices; `geo` and `lines` hold the first.
+    extra: Vec<MeshPartGpu>,
+}
+
+/// One more part of a mesh split over several buffers: its triangles and its wireframe lines.
+struct MeshPartGpu {
+    geo: Geometry,
+    lines: wgpu::Buffer,
+    line_draws: Vec<(u32, u32, usize)>,
 }
 
 /// The scene effect targets of a view (full resolution unless noted), created the first time
@@ -1225,6 +1253,15 @@ impl Renderer {
         }
         let verts = subdivide::vertices(mesh);
         let mk = |label: &str, data: &[u8], usage: wgpu::BufferUsages| upload_buffer(device, queue, label, data, usage);
+        // a mesh larger than one buffer is drawn in parts, each within the device's limit (headroom for the
+        // wireframe's copied ends)
+        let limit = device.limits().max_buffer_size;
+        let max_verts = (limit / std::mem::size_of::<Vertex>() as u64 / 10 * 9) as usize;
+        let max_indices = (limit / 4 / 3 * 3) as usize;
+        if verts.len() > max_verts || mesh.indices.len() > max_indices {
+            self.set_mesh_parts(device, queue, mesh, id, verts, max_verts, max_indices);
+            return;
+        }
         let mut idx_bytes = bytemuck::cast_slice::<u32, u8>(&mesh.indices).to_vec();
         idx_bytes.resize(idx_bytes.len().next_multiple_of(4), 0);
         let vb = mk("tc_vb", bytemuck::cast_slice(&verts), wgpu::BufferUsages::VERTEX);
@@ -1245,7 +1282,33 @@ impl Renderer {
         let world_per_uv = subdivide::world_per_uv(&verts, &mesh.indices).unwrap_or(radius);
         let coarse = (subdivide::level_for(triangles) > 0).then(|| (verts, mesh.indices.clone()));
         let geo = Geometry { vb, ib, draws, triangles };
-        self.mesh = Some(MeshGpu { id, geo, coarse, dense: None, world_per_uv, lines, line_draws, center, radius });
+        self.mesh = Some(MeshGpu { id, geo, coarse, dense: None, world_per_uv, lines, line_draws, center, radius, extra: Vec::new() });
+        self.content_rev += 1;
+    }
+
+    /// [`Self::set_mesh`] for a mesh over the buffer limit: its triangles and wireframe in parts of at most
+    /// `max_verts` vertices and `max_indices` indices, uploaded one by one. No displacement copy is made (a mesh this
+    /// dense is not subdivided).
+    #[allow(clippy::too_many_arguments)]
+    fn set_mesh_parts(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh, id: u64, verts: Vec<Vertex>, max_verts: usize, max_indices: usize) {
+        let draws: Vec<(u32, u32, usize)> = mesh.submeshes.iter().map(|s| (s.start, s.count, s.material)).collect();
+        let (lo, hi) = mesh.bounds();
+        let (center, radius) = ((lo + hi) * 0.5, ((hi - lo).length() * 0.5).max(1e-3));
+        let triangles = mesh.indices.len() / 3;
+        let world_per_uv = subdivide::world_per_uv(&verts, &mesh.indices).unwrap_or(radius);
+        let parts = crate::mesh_parts::split(&verts, &mesh.indices, &draws, &mesh.wire_edges(), max_verts, max_indices);
+        drop(verts);
+        let mut uploaded = parts.into_iter().map(|p| {
+            let vb = upload_buffer(device, queue, "tc_vb", bytemuck::cast_slice(&p.verts), wgpu::BufferUsages::VERTEX);
+            let ib = upload_buffer(device, queue, "tc_ib", bytemuck::cast_slice(&p.indices), wgpu::BufferUsages::INDEX);
+            let lines = upload_buffer(device, queue, "tc_lines", bytemuck::cast_slice(&p.lines), wgpu::BufferUsages::INDEX);
+            let part_triangles = p.indices.len() / 3;
+            MeshPartGpu { geo: Geometry { vb, ib, draws: p.draws, triangles: part_triangles }, lines, line_draws: p.line_draws }
+        });
+        let Some(first) = uploaded.next() else { return };
+        let extra: Vec<MeshPartGpu> = uploaded.collect();
+        let geo = Geometry { triangles, ..first.geo };
+        self.mesh = Some(MeshGpu { id, geo, coarse: None, dense: None, world_per_uv, lines: first.lines, line_draws: first.line_draws, center, radius, extra });
         self.content_rev += 1;
     }
 
@@ -1824,11 +1887,14 @@ impl Renderer {
         pass.set_bind_group(0, &self.shadow.bg, &[]);
         if let Some(m) = &self.mesh {
             let geo = m.dense.as_ref().filter(|_| displacing).unwrap_or(&m.geo);
-            pass.set_vertex_buffer(0, geo.vb.slice(..));
-            pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&geo.draws, visible, None) {
-                pass.set_bind_group(1, &set.bind_group, &[]);
-                pass.draw_indexed(range, 0, 0..1);
+            let extra = if std::ptr::eq(geo, &m.geo) { m.extra.as_slice() } else { &[] };
+            for geo in std::iter::once(geo).chain(extra.iter().map(|p| &p.geo)) {
+                pass.set_vertex_buffer(0, geo.vb.slice(..));
+                pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
+                for (range, set) in self.drawable(&geo.draws, visible, None) {
+                    pass.set_bind_group(1, &set.bind_group, &[]);
+                    pass.draw_indexed(range, 0, 0..1);
+                }
             }
         }
         drop(pass);
@@ -1933,8 +1999,8 @@ impl Renderer {
             shadow: [if shadow_vp.is_some() { 1.0 } else { 0.0 }, 1.0 / SHADOW_SIZE as f32, radius * 3.0 / SHADOW_SIZE as f32, 0.0],
             material: [if s.spec_gloss { 1.0 } else { 0.0 }, if s.parallax { 1.0 } else { 0.0 }, sample as f32, s.ior],
             scatter: [s.scatter[0], s.scatter[1], s.scatter[2], if sss.is_some() { 1.0 } else { 0.0 }],
-            fwd: [fwd.x, fwd.y, fwd.z, 0.0],
-            disp,
+            fwd: [fwd.x, fwd.y, fwd.z, height_normal_globals(s.height_normal)[1]],
+            disp: [disp[0], disp[1], disp[2], height_normal_globals(s.height_normal)[0]],
             refr: [if refraction { 1.0 } else { 0.0 }, (BEHIND_LEVELS - 1) as f32, REFRACTION_DEPTH * radius, 0.0],
             highlight: highlight_globals(s, data),
             highlight_shift: highlight_shift(frame.size),
@@ -2022,11 +2088,14 @@ impl Renderer {
         pass.set_bind_group(0, globals_bg, &[]);
         pass.set_bind_group(2, &self.refr_black, &[]);
         let geo = self.geometry(m, frame);
-        pass.set_vertex_buffer(0, geo.vb.slice(..));
-        pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-        for (range, set) in self.drawable(&geo.draws, &frame.visible, None) {
-            pass.set_bind_group(1, &set.bind_group, &[]);
-            pass.draw_indexed(range, 0, 0..1);
+        let extra = if std::ptr::eq(geo, &m.geo) { m.extra.as_slice() } else { &[] };
+        for geo in std::iter::once(geo).chain(extra.iter().map(|p| &p.geo)) {
+            pass.set_vertex_buffer(0, geo.vb.slice(..));
+            pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
+            for (range, set) in self.drawable(&geo.draws, &frame.visible, None) {
+                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.draw_indexed(range, 0, 0..1);
+            }
         }
     }
 
@@ -2153,11 +2222,18 @@ impl Renderer {
         let (highlight, highlight_set) = highlight.filter(|(_, set)| low_poly_shown && low_poly_set.is_none_or(|only| only == *set)).unzip();
 
         // The wireframe and the highlight draw the mesh's own edges (displaced in the vertex shader too)
-        let passes = [
+        let mut passes = vec![
             (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, low_poly_set, 1),
             (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, low_poly_set, 1),
             (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
         ];
+        // the further parts of a mesh split over several buffers
+        let extra = if std::ptr::eq(geometry, &mesh.geo) { mesh.extra.as_slice() } else { &[] };
+        for p in extra {
+            passes.push((low_poly_shown.then_some(mesh_pipeline), &p.geo.vb, &p.geo.ib, &p.geo.draws, low_poly_set, 1));
+            passes.push((wire.filter(|_| low_poly_shown), &p.geo.vb, &p.lines, &p.line_draws, low_poly_set, 1));
+            passes.push((highlight, &p.geo.vb, &p.lines, &p.line_draws, highlight_set, HIGHLIGHT_SHIFTS));
+        }
         for (pipeline, vertices, indices, ranges, only_set, instances) in passes {
             let Some(pipeline) = pipeline else { continue };
 
@@ -2197,7 +2273,7 @@ impl Renderer {
         }
 
         if bake.uv_seams
-            && let Some(seams) = self.uv_seams.as_ref().filter(|seams| seams.mesh_id == low_poly.id)
+            && let Some(seams) = self.uv_seams.as_ref().filter(|seams| seams.mesh_id == low_poly.id && low_poly.extra.is_empty())
         {
             pass.set_pipeline(&self.uv_seam_pipeline);
             pass.set_vertex_buffer(0, low_poly.geo.vb.slice(..));
@@ -2348,6 +2424,22 @@ fn highlight_shift(size: [u32; 2]) -> [f32; 4] {
 mod tests {
     use super::*;
     use crate::headless::Headless;
+    use texturecraft_core::rules::CompositeRules;
+
+    #[test]
+    fn height_to_normal_follows_the_project_rule() {
+        let mut project = Project::new("p", "m.obj");
+        let native = Shade::from_project(&project);
+        assert_eq!(native.height_normal, HeightNormal::Native);
+        // Native projects keep the viewport's own slope: 45° for a height change of 1 over 1/16 of the width.
+        assert_eq!(height_normal_globals(native.height_normal), [0.0, 1.0 / 16.0]);
+        for (rule, filter) in [(HeightNormal::Sobel, 1.0), (HeightNormal::Backward, 2.0)] {
+            project.rules = CompositeRules::measured(rule);
+            let shade = Shade::from_project(&project);
+            assert_eq!(shade.height_normal, rule);
+            assert_eq!(height_normal_globals(shade.height_normal), [filter, MEASURED_SLOPE]);
+        }
+    }
 
     #[test]
     fn oversized_overlays_leave_the_view_usable() {

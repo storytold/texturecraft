@@ -404,7 +404,7 @@ impl Session {
             for identifier in &link.inputs {
                 let Some((map, data)) = BakedMap::parse(identifier).and_then(|map| Some((map, baked.maps.get(&map)?))) else { continue };
 
-                let png = texturecraft_formats::mcmat::mesh_map_png(baked.resolution, map.components(), data)
+                let png = texturecraft_formats::mcmat::mesh_map_png(baked.resolution, map.components(), &data.to_f32())
                     .map_err(|error| EngineError::Other(error.to_string()))?;
                 inputs.push((identifier.clone(), png));
             }

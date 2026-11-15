@@ -25,7 +25,15 @@ pub fn specs() -> Vec<CommandSpec> {
             |s, p| Ok(crate::inspect::texture_set(s, ts_param(s, p, "textureSet.inspect")?))
         ),
         cmd!("textureSet.resolution", "Texture set size", [], None, "{ts?, resolution: 128..8192 (power of two)}", always, resolution),
-        cmd!("textureSet.channel.add", "Add channel", [], None, "{ts?, channel}", always, |s, p| channel(s, p, true)),
+        cmd!(
+            "textureSet.channel.add",
+            "Add channel",
+            [],
+            None,
+            "{ts?, channel, name?: what the set calls it (user channels; on a present channel it renames it, \"\" clears)}",
+            always,
+            |s, p| channel(s, p, true)
+        ),
         cmd!("textureSet.channel.remove", "Remove channel", [], None, "{ts?, channel}", always, |s, p| channel(s, p, false)),
         cmd!("textureSet.visible", "Toggle texture set visibility", [], None, "{ts?, visible?}", always, visible),
         cmd!(
@@ -194,17 +202,31 @@ impl Session {
     }
 }
 
+/// Longest channel name kept, in characters.
+const MAX_CHANNEL_NAME: usize = 256;
+
 fn channel(s: &mut Session, p: &Value, add: bool) -> Result<Value> {
     let ts = ts_param(s, p, "textureSet.channel")?;
     let c = channel_param("textureSet.channel", p, "channel")?.ok_or_else(|| bad("textureSet.channel", "`channel` is required"))?;
+    let name = strp(p, "name").map(|n| n.trim().chars().take(MAX_CHANNEL_NAME).collect::<String>());
     s.edit(if add { "Add channel" } else { "Remove channel" }, |s| {
         if add {
-            return add_channel(s, ts, c);
+            add_channel(s, ts, c)?;
+            if let Some(name) = name {
+                let set = s.doc.project.texture_set_mut(ts)?;
+                match name.is_empty() {
+                    true => set.channel_names.remove(&c),
+                    false => set.channel_names.insert(c, name),
+                };
+            }
+            return Ok(());
         }
         if c == Channel::BaseColor {
             return Err(bad("textureSet.channel.remove", "base color can't be removed"));
         }
-        s.doc.project.texture_set_mut(ts)?.channels.retain(|(x, _)| *x != c);
+        let set = s.doc.project.texture_set_mut(ts)?;
+        set.channels.retain(|(x, _)| *x != c);
+        set.channel_names.remove(&c);
         Ok(())
     })?;
     Ok(Value::Null)
@@ -306,5 +328,28 @@ mod tests {
         assert_eq!(run(json!({"mode": "invert"})).unwrap(), json!([false, true]));
         assert_eq!(run(json!({"mode": "showAll"})).unwrap(), json!([true, true]));
         assert!(run(json!({"mode": "sideways"})).is_err() && run(json!({"mode": "solo", "ts": 9})).is_err());
+    }
+
+    #[test]
+    fn user_channels_are_added_named_renamed_and_removed() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        let mut run = |id: &str, p: Value| crate::execute(&mut s, id, &p);
+        run("layer.add.fill", json!({})).unwrap();
+        run("textureSet.channel.add", json!({"channel": "user2", "name": "  Wetness  "})).unwrap();
+        let info = run("textureSet.inspect", json!({})).unwrap();
+        let user = info["channels"].as_array().unwrap().iter().find(|c| c["channel"] == "user2").cloned().unwrap();
+        assert_eq!((user["name"].as_str(), user["format"].as_str()), (Some("Wetness"), Some("RGB8")));
+        // a present channel is renamed; "" clears the name
+        run("textureSet.channel.add", json!({"channel": "User 2", "name": "Dirt"})).unwrap();
+        assert_eq!(run("textureSet.inspect", json!({})).unwrap()["channels"].to_string().matches("Dirt").count(), 1);
+        run("textureSet.channel.add", json!({"channel": "user2", "name": ""})).unwrap();
+        assert!(!run("textureSet.inspect", json!({})).unwrap()["channels"].to_string().contains("\"name\""));
+        // the layers get the channel; uncovered it shows white
+        let layers = run("project.inspect", json!({})).unwrap().to_string();
+        assert!(layers.contains("user2"), "{layers}");
+        run("textureSet.channel.add", json!({"channel": "user2", "name": "x".repeat(10_000)})).unwrap();
+        run("textureSet.channel.remove", json!({"channel": "user2"})).unwrap();
+        assert!(s.doc.project.texture_sets[0].channel_names.is_empty() && !s.doc.project.texture_sets[0].has_channel(Channel::User2));
+        assert_eq!(Channel::User2.default_value(), [1.0; 3]);
     }
 }

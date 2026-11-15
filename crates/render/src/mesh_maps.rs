@@ -50,8 +50,8 @@ mod tests {
         let mut set = TextureSet::new("Tiles", 0, 256);
         set.uv_tiles = vec![1001, 1002];
         set.tile_resolutions.insert(1002, 128);
-        let pixels = (0..128).flat_map(|y| (0..256).map(move |x| ((x % 128) + y) as f32 / 255.0)).collect();
-        let baked = BakedMaps { resolution: 256, maps: [(BakedMap::AmbientOcclusion, Arc::new(pixels))].into() };
+        let pixels: Vec<f32> = (0..128).flat_map(|y| (0..256).map(move |x| ((x % 128) + y) as f32 / 255.0)).collect();
+        let baked = BakedMaps { resolution: 256, maps: [(BakedMap::AmbientOcclusion, Arc::new(pixels.into()))].into() };
         let preview = mesh_map_rgba(Some(&baked), BakedMap::AmbientOcclusion, 512, set.size(), &set.block_scales());
         assert_eq!(preview[(240 * 512 + 376) * 4], 240);
         assert_eq!(preview[(400 * 512 + 500) * 4], 128, "unused working block area stays neutral");

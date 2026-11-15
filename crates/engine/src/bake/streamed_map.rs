@@ -13,5 +13,5 @@ pub struct StreamedMap {
     pub resolution: u32,
     pub height: u32,
     /// Row-major, `map.components()` floats per texel, padded.
-    pub data: Arc<Vec<f32>>,
+    pub data: Arc<texturecraft_compose::Texels>,
 }

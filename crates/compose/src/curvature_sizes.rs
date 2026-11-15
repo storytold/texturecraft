@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use texturecraft_core::{BakedMap, BlockScales, CurvatureDetail};
 use texturecraft_texel::dilate::{DilationMap, NONE};
 
+use crate::Texels;
 use crate::curvature_size_level::{CurvatureSizeLevel, DEVIATION_SCALE};
 use crate::eval::{BLUR_BOX_PASSES, Inputs, blur};
 
@@ -20,7 +21,7 @@ pub struct CurvatureSizes {
 type CacheKey = ((u32, u32), (u32, u32), (u32, u32));
 
 /// Built sizes by the curvature data they come from, their layout and the tiles' scales.
-type CacheEntry = (Weak<Vec<f32>>, CacheKey, BlockScales, Arc<CurvatureSizes>);
+type CacheEntry = (Weak<Texels>, CacheKey, BlockScales, Arc<CurvatureSizes>);
 
 static CACHE: Mutex<Vec<CacheEntry>> = Mutex::new(Vec::new());
 
@@ -58,7 +59,7 @@ impl CurvatureSizes {
 
     /// Pad and blur each UV tile at the requested sizes, reusing levels already in `built`
     fn build(
-        curvature: &[f32],
+        curvature: &Texels,
         (width, height): (u32, u32),
         covered: &[bool],
         block: (u32, u32),
@@ -67,7 +68,7 @@ impl CurvatureSizes {
     ) -> CurvatureSizes {
         let padding = DilationMap::in_rectangular_blocks(covered, width, height, None, block);
         let deviation: Vec<f32> =
-            padding.src.par_iter().map(|&source| if source == NONE { 0.0 } else { curvature.get(source as usize).copied().unwrap_or(0.5) - 0.5 }).collect();
+            padding.src.par_iter().map(|&source| if source == NONE { 0.0 } else { curvature.get(source as usize).unwrap_or(0.5) - 0.5 }).collect();
         let (block_width, block_height) = (block.0.max(1).min(width), block.1.max(1).min(height));
 
         let levels = CurvatureDetail::SIZES
@@ -105,7 +106,7 @@ impl CurvatureSizes {
 }
 
 /// The cached sizes of `curvature` for layout `key` and tile `scales`, if any
-fn cached(curvature: &Arc<Vec<f32>>, key: CacheKey, scales: &BlockScales) -> Option<Arc<CurvatureSizes>> {
+fn cached(curvature: &Arc<Texels>, key: CacheKey, scales: &BlockScales) -> Option<Arc<CurvatureSizes>> {
     let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.retain(|(source, ..)| source.strong_count() > 0);
     let index = cache.iter().position(|entry| is_entry_for(entry, curvature, key, scales))?;
@@ -116,7 +117,7 @@ fn cached(curvature: &Arc<Vec<f32>>, key: CacheKey, scales: &BlockScales) -> Opt
 }
 
 /// Cache `sizes`, merging any levels another thread stored meanwhile
-fn store(curvature: &Arc<Vec<f32>>, key: CacheKey, scales: &BlockScales, sizes: CurvatureSizes) -> Arc<CurvatureSizes> {
+fn store(curvature: &Arc<Texels>, key: CacheKey, scales: &BlockScales, sizes: CurvatureSizes) -> Arc<CurvatureSizes> {
     let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let sizes = if let Some((.., cached_sizes)) = cache.iter().find(|entry| is_entry_for(entry, curvature, key, scales)) {
         let levels = cached_sizes.levels.iter().zip(sizes.levels).map(|(cached, built)| cached.clone().or(built)).collect();
@@ -151,7 +152,7 @@ fn trim_cache(cache: &mut Vec<CacheEntry>, budget: usize) {
 }
 
 /// Whether cache `entry` holds the sizes of `curvature` for layout `key` and tile `scales`.
-fn is_entry_for((source, cached_key, cached_scales, _): &CacheEntry, curvature: &Arc<Vec<f32>>, key: CacheKey, scales: &BlockScales) -> bool {
+fn is_entry_for((source, cached_key, cached_scales, _): &CacheEntry, curvature: &Arc<Texels>, key: CacheKey, scales: &BlockScales) -> bool {
     source.upgrade().is_some_and(|data| Arc::ptr_eq(&data, curvature)) && *cached_key == key && cached_scales == scales
 }
 
@@ -256,7 +257,7 @@ mod tests {
         let block = (256, 256);
         let curvature: Vec<f32> = (0..width * height).map(|texel| if (texel % width) / block.0 == (texel / width) / block.1 { 0.8 } else { 0.2 }).collect();
         let covered = vec![true; curvature.len()];
-        let sizes = CurvatureSizes::build(&curvature, (width, height), &covered, block, &[true; CurvatureDetail::BLURRED_SIZES], None);
+        let sizes = CurvatureSizes::build(&Texels::F32(curvature.clone()), (width, height), &covered, block, &[true; CurvatureDetail::BLURRED_SIZES], None);
 
         for level in sizes.levels.iter().flatten() {
             for (x, y) in [(255, 128), (256, 128), (128, 255), (128, 256), (255, 255), (256, 256)] {
@@ -288,6 +289,7 @@ mod tests {
             block_scales: BlockScales::default(),
             preview: None,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: mesh.bounds(),
         };
 
@@ -328,6 +330,7 @@ mod tests {
             block_scales: scales,
             preview: None,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: mesh.bounds(),
         };
 
@@ -340,7 +343,7 @@ mod tests {
     #[test]
     fn unused_maps_are_evicted_even_while_undo_keeps_the_sources_alive() {
         let _guard = CACHE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let sources: Vec<_> = (0..=CACHE_MAPS).map(|_| Arc::new(vec![0.5; 16])).collect();
+        let sources: Vec<_> = (0..=CACHE_MAPS).map(|_| Arc::new(Texels::F32(vec![0.5; 16]))).collect();
         let scales = BlockScales::default();
         let key = ((4, 4), (4, 4), (4, 4));
         let sizes = store(&sources[0], key, &scales, CurvatureSizes { levels: Vec::new() });
@@ -355,7 +358,7 @@ mod tests {
 
     #[test]
     fn cache_budget_evicts_old_levels_but_keeps_one_large_map() {
-        let source = Arc::new(vec![0.5]);
+        let source = Arc::new(Texels::F32(vec![0.5]));
         let key = ((1, 1), (1, 1), (1, 1));
         let entry = || {
             let level = CurvatureSizeLevel { step: 1, width: 4, height: 1, block: (4, 1), deviation: vec![0; 4] };
@@ -381,7 +384,7 @@ mod tests {
         let curvature: Vec<f32> = (0..map_size * map_size).map(|texel| if left_half(texel) { 1.0 } else { 0.0 }).collect();
         let covered: Vec<bool> = (0..map_size * map_size).map(left_half).collect();
         let shape = (map_size, map_size);
-        let sizes = CurvatureSizes::build(&curvature, shape, &covered, shape, &[true; CurvatureDetail::BLURRED_SIZES], None);
+        let sizes = CurvatureSizes::build(&Texels::F32(curvature.clone()), shape, &covered, shape, &[true; CurvatureDetail::BLURRED_SIZES], None);
 
         // The last covered column, halfway down
         let (border_x, border_y) = (map_size / 2 - 1, map_size / 2);
@@ -399,7 +402,8 @@ mod tests {
         let curvature = vec![CURVATURE; (map_width * map_height) as usize];
         let covered = vec![true; curvature.len()];
         let block = (map_width / 2, map_height);
-        let sizes = CurvatureSizes::build(&curvature, (map_width, map_height), &covered, block, &[true; CurvatureDetail::BLURRED_SIZES], None);
+        let sizes =
+            CurvatureSizes::build(&Texels::F32(curvature.clone()), (map_width, map_height), &covered, block, &[true; CurvatureDetail::BLURRED_SIZES], None);
 
         // The map's corner, then the last texel of the left block and the first of the right one, halfway down
         let border_texels = [(0, 0), (block.0 - 1, map_height / 2), (block.0, map_height / 2)];
@@ -416,7 +420,7 @@ mod tests {
     #[test]
     fn alternating_layouts_reuse_their_cached_sizes() {
         let _guard = CACHE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let curvature = Arc::new(vec![0.5; 16]);
+        let curvature = Arc::new(Texels::F32(vec![0.5; 16]));
         let scales = BlockScales::default();
         let viewport_key = ((4, 4), (4, 4), (4, 4));
         let thumbnail_key = ((4, 4), (4, 4), (2, 2));
@@ -442,7 +446,7 @@ mod tests {
     #[test]
     fn layout_variants_obey_the_entry_limit() {
         let _guard = CACHE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let curvature = Arc::new(vec![0.5; 16]);
+        let curvature = Arc::new(Texels::F32(vec![0.5; 16]));
         let scales = BlockScales::default();
         let key = |size| ((4, 4), (4, 4), (size, size));
         for size in 1..=CACHE_MAPS as u32 + 1 {
@@ -460,13 +464,13 @@ mod tests {
         let covered = vec![true; (map_size * map_size) as usize];
         let shape = (map_size, map_size);
         let all = vec![true; CurvatureDetail::BLURRED_SIZES];
-        let full = CurvatureSizes::build(&curvature, shape, &covered, shape, &all, None);
+        let full = CurvatureSizes::build(&Texels::F32(curvature.clone()), shape, &covered, shape, &all, None);
 
         let even: Vec<bool> = (0..all.len()).map(|level| level % 2 == 0).collect();
-        let partial = CurvatureSizes::build(&curvature, shape, &covered, shape, &even, None);
+        let partial = CurvatureSizes::build(&Texels::F32(curvature.clone()), shape, &covered, shape, &even, None);
         assert!(partial.levels.iter().zip(&even).all(|(level, needed)| level.is_some() == *needed), "only the needed sizes are built");
 
-        let completed = CurvatureSizes::build(&curvature, shape, &covered, shape, &all, Some(&partial));
+        let completed = CurvatureSizes::build(&Texels::F32(curvature.clone()), shape, &covered, shape, &all, Some(&partial));
         for ((built, expected), earlier) in completed.levels.iter().zip(&full.levels).zip(&partial.levels) {
             assert_eq!(built.as_ref().map(|level| &level.deviation), expected.as_ref().map(|level| &level.deviation), "the same values either way");
             if let (Some(built), Some(earlier)) = (built, earlier) {

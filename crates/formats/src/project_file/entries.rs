@@ -82,10 +82,18 @@ pub fn available_save_resources() -> (usize, u64) {
     (cores, limits::available_ram())
 }
 
-/// Estimated in-flight entry budget, shared by the save planner and the Settings readout.
+/// Most bytes entries in flight may hold, whatever the RAM share: a save runs beside a project that already fills
+/// memory (an import saves right after computing every set), and ten or so baked maps in flight keep the workers busy.
+/// Doll.spp (5 sets at 4096): the share of a 30 GB machine let the save add 10 GB on top of the import.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_SAVE_IN_FLIGHT: u64 = 2 << 30;
+
+/// Estimated in-flight entry budget, shared by the save planner and the Settings readout: the share of the available
+/// RAM, at most [`MAX_SAVE_IN_FLIGHT`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_ram_budget(available_ram_bytes: u64, ram_percent: u8) -> u64 {
-    u64::try_from(u128::from(available_ram_bytes) * u128::from(ram_percent.clamp(1, 100)) / 100).unwrap_or(u64::MAX)
+    let share = u64::try_from(u128::from(available_ram_bytes) * u128::from(ram_percent.clamp(1, 100)) / 100).unwrap_or(u64::MAX);
+    share.min(MAX_SAVE_IN_FLIGHT)
 }
 
 /// Worker threads and in-flight byte budget for a save of `entries` entries.

@@ -24,6 +24,7 @@ pub mod headless;
 mod high_poly_gpu;
 pub mod ibl;
 pub mod mesh_maps;
+mod mesh_parts;
 pub mod overlay_quad;
 pub mod readback;
 pub mod renderer;

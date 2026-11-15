@@ -165,10 +165,31 @@ impl Headless {
         if ext_of(path) != PROJECT_EXT {
             return self.import_mesh(path, None, None);
         }
-        let mut next = Session::from_project_bytes(&self.read(path)?)?;
+        let mut next = self.load_project(path)?;
         next.path = Some(path.to_string());
         next.modified = false;
         Ok(self.replace(next))
+    }
+
+    /// The project in `path`. A trusted local file is read entry by entry from disk, so a project of any size opens
+    /// without a whole-file copy in memory (an imported Doll.spp is 3.4 GB); other access reads it whole, capped.
+    fn load_project(&self, path: &str) -> Result<Session, AutomationError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.trusted() {
+            return Ok(file_cmds::open_path(path)?);
+        }
+        Ok(Session::from_project_bytes(&self.read(path)?)?)
+    }
+
+    /// Writes the project to `path`: a trusted local file streams to disk (atomically, as [`Headless::write`]), so
+    /// saving never holds the whole file in memory; other access writes it as one buffer.
+    fn write_project(&self, path: &str) -> Result<(), AutomationError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.trusted() {
+            let pf = self.session.project_file();
+            return texturecraft_engine::formats::save_project(Path::new(path), &pf).map_err(|e| AutomationError::Io(format!("cannot write {path}: {e}")));
+        }
+        self.write(path, &self.session.to_project_bytes()?)
     }
 
     /// A new project from a mesh file: one texture set per material.
@@ -254,7 +275,7 @@ impl Headless {
             Some(p) => format!("{p}.{PROJECT_EXT}"),
             None => return Err(bad("the project has no file yet: give `path`")),
         };
-        self.write(&target, &self.session.to_project_bytes()?)?;
+        self.write_project(&target)?;
         self.session.path = Some(target.clone());
         self.session.modified = false;
         Ok(json!({ "path": target }))
@@ -270,15 +291,19 @@ impl Headless {
             Some(Value::String(a)) if a == "all" => (0..n).collect(),
             Some(v) => vec![v.as_u64().and_then(|t| usize::try_from(t).ok()).filter(|t| *t < n).ok_or_else(|| bad(format!("invalid `ts` {v}")))?],
         };
-        let files = self.session.export_files(&sets, &opts)?;
         self.create_dir_all(dir)?;
         let mut written = Vec::new();
-        for f in &files {
-            let path = join(dir, &f.name);
-            self.write(&path, &f.bytes)?;
-            written.push(path);
+        let mut warnings: Vec<String> = Vec::new();
+        // set by set, each one's files written before the next is composited: a large project's maps are never all
+        // held at once
+        for ts in sets {
+            for f in self.session.export_files(&[ts], &opts)? {
+                let path = join(dir, &f.name);
+                self.write(&path, &f.bytes)?;
+                written.push(path);
+                warnings.extend(f.warnings);
+            }
         }
-        let warnings: Vec<&String> = files.iter().flat_map(|f| &f.warnings).collect();
         Ok(json!({ "files": written, "warnings": warnings }))
     }
 

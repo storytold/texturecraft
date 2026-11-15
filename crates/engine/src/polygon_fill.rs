@@ -31,7 +31,7 @@ impl Session {
     /// Fill like [`Session::polygon_fill`] at texture coordinate `uv` (the 2D view): the triangle covering that texel's center, so slivers thinner than a texel can't be clicked
     pub fn polygon_fill_uv(&mut self, uv: Vec2) -> Result<usize> {
         self.refuse_while_baking()?;
-        let gbuf = self.caches.get(self.ts()).map(|cache| cache.gbuf.clone()).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
+        let gbuf = self.caches.get(self.ts()).map(|cache| cache.gbuf().clone()).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
         let size = Vec2::new(gbuf.width as f32, gbuf.height as f32);
         let texel = (uv * size).floor();
         let triangle = (texel.cmpge(Vec2::ZERO).all() && texel.cmplt(size).all())

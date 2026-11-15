@@ -12,6 +12,9 @@ use texturecraft_automation::{AuthorizedWorkspace, BridgeClient, Filesystem, Hea
 use texturecraft_engine::core::PROJECT_EXT;
 use texturecraft_engine::formats::{MeshReport, import_mesh, import_mesh_bytes, mesh_report};
 
+mod batch_import;
+mod graph;
+
 const USAGE: &str = "\
 texturecraft-cli: headless TextureCraft
 
@@ -28,7 +31,11 @@ USAGE:
   texturecraft-cli bake <input> [-o <out.tcraft>] [--resolution <px>] [--maps <id,id,...>]
       Bake mesh maps for every texture set (a project is saved in place without -o).
   texturecraft-cli export <input> <dir> [--preset <name>] [--format <ext>] [--padding <mode>] [--size <px>]
-      Export textures (default preset: Document channels + Normal + AO).
+                  [--frame-budget-ms <ms>] [--frame-limit-s <s>]
+      Export textures (default preset: Document channels + Normal + AO). --frame-budget-ms first
+      composites the project in frames of that budget as the desktop app's viewport does and prints
+      the frames and the time to the first full composite; --frame-limit-s stops that after so many
+      seconds (without exporting).
   texturecraft-cli render <input> <out.png> [--size <W>x<H>] [--view 3d|2d] [--camera <name>] [--yaw <deg>]
                    [--pitch <deg>] [--samples <n>] [--bounces <n>] [--cpu]
       Render the viewport to PNG (needs a GPU or software adapter); --camera looks through a
@@ -38,6 +45,35 @@ USAGE:
       New project; --sample bakes and applies a smart material to every texture set. The
       sample's mesh maps are baked at the resolution up to 1024 px (most of the file's size),
       so a 2048 sample project is as large as a 1024 one.
+  texturecraft-cli import <project file> <out.tcraft> [--original-on-top] [--original-correction]
+                   [--native-filters] [--max-resolution <px>] [--no-measure] [--no-replay]
+                   [--graphs decompile|keep] [--result-cache <dir>] [--result-cache-gb <n>]
+                   [--render-budget-gb <n>] [--census]
+      Convert a project file of the reference app (one-way; the original is only read) and save
+      it; prints what the import found per texture set (file.importProject). --original-correction
+      adds a locked layer holding the original's result where the layers do not reproduce it.
+      --result-cache keeps graph renders in <dir> and reuses them in later imports (at most
+      --result-cache-gb GB, default 20). --census translates the layer stacks only (no strokes
+      replayed, graphs cooked or result measured; <out.tcraft> not needed, nothing saved) and prints
+      every locked layer and placeholder with its reasons. --render-budget-gb caps the memory graph renders running
+      at once may take (default half the machine's RAM; also for export and verify).
+  texturecraft-cli import <folder> <out folder> [--jobs <n>] [the import flags above]
+      Convert every project file below <folder>, each saved under the same relative path in
+      <out folder>; one result line per project. --jobs converts up to n at once (default 1)
+      within a memory budget. Exits with an error when any project failed.
+  texturecraft-cli verify <project file> [<imported.tcraft>] [--set <name>] [--border <texels>] [--table]
+                   [--max-resolution <px>] [--original-correction] [--native-filters] [--no-replay]
+                   [--graphs decompile|keep]
+      Compare an imported project with the results stored in the file it came from, per texture
+      set and channel on the mesh's texels, and grade each channel (import.verify). Without
+      <imported.tcraft> the file is imported first (the import flags apply). --table prints a
+      table instead of JSON. Exits with an error when a counted channel is below the pass bar.
+  texturecraft-cli graph <graph.tcgraph> <out dir> [--size <px>] [--output <name>]... [--seed <n>]
+                  [--param <name>=<v>[,<v>...]]... [--depth 8|16] [--timeout <s>]
+      Render a graph text file on the CPU: one PNG per output (<out dir>/<output>.png). --size
+      overrides the graph's size (1-8192); --output picks outputs (repeatable); --seed sets the
+      graph's random seed offset; --param sets an exposed parameter by label or an input value by
+      name (repeatable); --timeout cancels the render after that many seconds.
   texturecraft-cli mcp [--bridge <port>] [--token <token>] [--read-root <dir>] [--write-root <dir>]
       MCP server on stdio: headless (file access only below the roots), or bridged to
       `texturecraft --control <port>`. --automation-read-root / --automation-write-root are
@@ -57,9 +93,20 @@ const SUBCOMMANDS: &[(&str, &[&str], &[&str])] = &[
     ("run", &["-o"], &[]),
     ("batch", &[], &[]),
     ("bake", &["-o", "--resolution", "--maps"], &[]),
-    ("export", &["--preset", "--format", "--padding", "--size"], &[]),
+    ("export", &["--preset", "--format", "--padding", "--size", "--frame-budget-ms", "--frame-limit-s", "--render-budget-gb"], &[]),
     ("render", &["--size", "--view", "--camera", "--yaw", "--pitch", "--samples", "--bounces"], &["--cpu"]),
     ("new", &["--resolution"], &["--sample"]),
+    (
+        "import",
+        &["--max-resolution", "--graphs", "--result-cache", "--result-cache-gb", "--jobs", "--render-budget-gb"],
+        &["--original-on-top", "--original-correction", "--native-filters", "--no-measure", "--no-replay", "--census"],
+    ),
+    (
+        "verify",
+        &["--set", "--border", "--max-resolution", "--graphs", "--render-budget-gb"],
+        &["--table", "--original-correction", "--native-filters", "--no-replay"],
+    ),
+    ("graph", &["--size", "--output", "--seed", "--param", "--depth", "--timeout"], &[]),
     ("mcp", &["--bridge", "--token", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
     ("serve", &["--port", "--read-root", "--write-root", "--automation-read-root", "--automation-write-root"], &[]),
 ];
@@ -78,6 +125,10 @@ impl Args {
     }
     fn num<T: std::str::FromStr>(&self, k: &str) -> Result<Option<T>, String> {
         self.get(k).map(|v| v.parse().map_err(|_| format!("{k}: `{v}` is not a valid number"))).transpose()
+    }
+    /// Every value of a repeatable flag, in order.
+    fn all(&self, k: &str) -> Vec<&str> {
+        self.flags.iter().filter(|(f, _)| f == k).filter_map(|(_, v)| v.as_deref()).collect()
     }
     fn pos(&self, n: usize, what: &str) -> Result<&str, String> {
         self.pos.get(n).map(String::as_str).ok_or_else(|| format!("missing {what}"))
@@ -165,6 +216,12 @@ fn main() {
 type R = Result<(), String>;
 
 fn dispatch(name: &str, a: &Args) -> R {
+    if let Some(gb) = a.num::<f64>("--render-budget-gb")? {
+        if !(gb.is_finite() && gb > 0.0) {
+            return Err("--render-budget-gb must be a number of GB above 0".into());
+        }
+        texturecraft_engine::compose::graphs::budget::set_limit(Some((gb * (1u64 << 30) as f64) as u64));
+    }
     match name {
         "info" => info(a),
         "commands" => commands(a),
@@ -174,6 +231,9 @@ fn dispatch(name: &str, a: &Args) -> R {
         "export" => export(a),
         "render" => render(a),
         "new" => new(a),
+        "import" => import(a),
+        "verify" => verify(a),
+        "graph" => graph::render(a),
         "mcp" => mcp(a),
         "serve" => serve(a),
         other => Err(format!("unknown command `{other}`")),
@@ -270,6 +330,104 @@ fn run(a: &Args) -> R {
     }
 }
 
+/// `file.importProject` params from the import flags.
+fn import_params(a: &Args, input: &str) -> Result<Value, String> {
+    let mut p = json!({"path": input, "originalOnTop": a.has("--original-on-top"), "originalCorrection": a.has("--original-correction"), "nativeFilters": a.has("--native-filters"), "measure": !a.has("--no-measure")});
+    if let Some(r) = a.num::<u32>("--max-resolution")? {
+        p["maxResolution"] = json!(r);
+    }
+    if let Some(g) = a.get("--graphs") {
+        p["graphs"] = json!(g);
+    }
+    if a.has("--no-replay") {
+        p["replayStrokes"] = json!(false);
+    }
+    if a.has("--census") {
+        p["translateOnly"] = json!(true);
+        p["measure"] = json!(false);
+    }
+    if let Some(dir) = a.get("--result-cache") {
+        p["resultCache"] = json!(dir);
+    }
+    if let Some(gb) = a.num::<f64>("--result-cache-gb")? {
+        p["resultCacheGb"] = json!(gb);
+    }
+    Ok(p)
+}
+
+fn import(a: &Args) -> R {
+    if a.has("--census") {
+        return census(a);
+    }
+    let (input, out) = (a.pos(0, "<project file>")?, a.pos(1, "<out.tcraft>")?);
+    if Path::new(input).is_dir() {
+        return import_folder(a, input, out);
+    }
+    let p = import_params(a, input)?;
+    let mut h = open("builtin:cube", Some(128))?;
+    let reply = h.command_run("file.importProject", p).map_err(s)?;
+    print_json(&json!({"file": input, "import": reply.get("import").cloned().unwrap_or(Value::Null)}))?;
+    save(&mut h, out)
+}
+
+/// `import <project file> --census`: the layer stacks translated only (nothing replayed, cooked or measured, nothing
+/// saved); prints the import summary and every locked layer and placeholder with its reasons.
+fn census(a: &Args) -> R {
+    let input = a.pos(0, "<project file>")?;
+    let p = import_params(a, input)?;
+    let mut h = open("builtin:cube", Some(128))?;
+    let reply = h.command_run("file.importProject", p).map_err(s)?;
+    let locks = h.inspect().get("locks").cloned().unwrap_or(Value::Null);
+    print_json(&json!({"file": input, "import": reply.get("import").cloned().unwrap_or(Value::Null), "locks": locks}))
+}
+
+/// `import <folder> <out folder>`: every project below the folder ([`batch_import`]).
+fn import_folder(a: &Args, dir: &str, out: &str) -> R {
+    let jobs = a.num::<usize>("--jobs")?.unwrap_or(1);
+    if !(1..=batch_import::MAX_JOBS).contains(&jobs) {
+        return Err(format!("--jobs must be 1 to {}", batch_import::MAX_JOBS));
+    }
+    import_params(a, dir)?;
+    batch_import::convert_folder(Path::new(dir), Path::new(out), jobs, |file, target| {
+        let p = import_params(a, &file.display().to_string())?;
+        let mut h = open("builtin:cube", Some(128))?;
+        let reply = h.command_run("file.importProject", p).map_err(s)?;
+        h.save(Some(&target.display().to_string())).map_err(s)?;
+        Ok(reply.get("import").cloned().unwrap_or(Value::Null))
+    })
+}
+
+fn verify(a: &Args) -> R {
+    let original = a.pos(0, "<project file>")?;
+    let mut h = match a.pos.get(1) {
+        Some(imported) => open(imported, None)?,
+        None => {
+            let mut h = open("builtin:cube", Some(128))?;
+            h.command_run("file.importProject", import_params(a, original)?).map_err(s)?;
+            h
+        }
+    };
+    let mut p = json!({"path": original});
+    if let Some(set) = a.get("--set") {
+        p["set"] = json!(set);
+    }
+    if let Some(b) = a.num::<u32>("--border")? {
+        p["border"] = json!(b);
+    }
+    let mut reply = h.command_run("import.verify", p).map_err(s)?;
+    let passes = reply.get("passes").and_then(Value::as_bool).unwrap_or(false);
+    match a.has("--table") {
+        true => print!("{}", reply.get("text").and_then(Value::as_str).unwrap_or_default()),
+        false => {
+            if let Some(o) = reply.as_object_mut() {
+                o.remove("text");
+            }
+            print_json(&reply)?;
+        }
+    }
+    if passes { Ok(()) } else { Err("below the pass bar (or nothing compared)".into()) }
+}
+
 fn batch(a: &Args) -> R {
     let path = a.pos(0, "<script.json>")?;
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -317,6 +475,12 @@ fn export(a: &Args) -> R {
         p["size"] = json!(v);
     }
     let mut h = open(input, None)?;
+    if let Some(budget) = a.num::<f64>("--frame-budget-ms")? {
+        let limit = a.num::<f64>("--frame-limit-s")?;
+        if !frames(&mut h, budget, limit) {
+            return Ok(());
+        }
+    }
     let r = h.export(&p).map_err(s)?;
     for w in r["warnings"].as_array().into_iter().flatten() {
         eprintln!("warning: {}", w.as_str().unwrap_or_default());
@@ -324,7 +488,37 @@ fn export(a: &Args) -> R {
     for f in r["files"].as_array().into_iter().flatten() {
         println!("{}", f.as_str().unwrap_or_default());
     }
+    // what the composites cost in graph renders (none for a project whose stored cooks still match)
+    if let Ok(i) = h.command_run("project.inspect", json!({})) {
+        eprintln!("graphs: {}", i["graphs"]);
+    }
     Ok(())
+}
+
+/// Composite `h`'s project in frames of `budget_ms` as the desktop app's viewport does, printing each frame and the time
+/// to the first full composite. False when `limit_s` seconds passed first.
+fn frames(h: &mut Headless, budget_ms: f64, limit_s: Option<f64>) -> bool {
+    let t0 = std::time::Instant::now();
+    let clock = move || t0.elapsed().as_secs_f64() * 1000.0;
+    let (mut frame, mut longest) = (0usize, 0.0f64);
+    let total = h.session.pending_tiles();
+    loop {
+        let pending = h.session.pending_tiles();
+        if pending == 0 {
+            eprintln!("frames: {frame} frames, {total} tiles, first full composite in {:.1} s, longest frame {longest:.0} ms", clock() / 1000.0);
+            return true;
+        }
+        if limit_s.is_some_and(|l| clock() >= l * 1000.0) {
+            eprintln!("frames: stopped after {frame} frames and {:.1} s, {} of {total} tiles left, longest frame {longest:.0} ms", clock() / 1000.0, pending);
+            return false;
+        }
+        let f0 = clock();
+        h.session.update_for(budget_ms, clock);
+        let took = clock() - f0;
+        longest = longest.max(took);
+        frame += 1;
+        eprintln!("frame {frame}: {took:.0} ms, tiles pending {pending} -> {}", h.session.pending_tiles());
+    }
 }
 
 fn render(a: &Args) -> R {

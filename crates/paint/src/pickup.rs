@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use texturecraft_compose::Composite;
 use texturecraft_compose::eval::FlatTile;
-use texturecraft_core::Channel;
+use texturecraft_core::{Channel, ChannelKind};
 use texturecraft_geom::{NO_TRI, UvGBuffer};
-use texturecraft_texel::{TILE_AREA, TileImage, from_u16, to_u16};
+use texturecraft_texel::{TILE, TILE_AREA, TileImage, from_u16, to_u16};
 
 use crate::commit::{dec, enc};
 
@@ -160,6 +160,86 @@ impl Pickup {
     }
 }
 
+/// One smudge stamp laid in place on an image of premultiplied values and coverage (a paint layer's channel or a mask's
+/// paint effect, `kind` its values' encoding): each texel `(x, y, a)` the stamp reaches becomes
+/// `(1 − a)·itself + a·(the image at (x, y) + shift)`, values and coverage alike, read bilinearly (texel centres at
+/// half texels, nothing outside the image) before any texel changes. Coverage moves with the values, so smudging
+/// from an empty place thins what is there. `shift` is in texels: from the stamp to the place it draws from, the
+/// previous stamp's centre.
+///
+/// The rule of strokes replayed from an imported project (measured on the reference app's smudge); live smudging
+/// carries the values in the stroke instead ([`Pickup`]).
+pub fn smudge_in_place(image: &mut TileImage, kind: ChannelKind, texels: &[(u32, u32, f32)], shift: [f32; 2]) {
+    let comps = image.comps();
+    if comps == 0 || !shift.iter().all(|v| v.is_finite()) {
+        return;
+    }
+    let n = comps - 1;
+    let empty = empty_texel(kind, comps);
+    let mut moved = vec![0.0f32; texels.len() * comps];
+    let mut corner = vec![0.0f32; comps];
+    for (&(x, y, _), out) in texels.iter().zip(moved.chunks_exact_mut(comps)) {
+        let (px, py) = (x as f32 + shift[0], y as f32 + shift[1]);
+        let (x0, y0) = (px.floor(), py.floor());
+        let (fx, fy) = (px - x0, py - y0);
+        for (dx, dy, w) in [(0, 0, (1.0 - fx) * (1.0 - fy)), (1, 0, fx * (1.0 - fy)), (0, 1, (1.0 - fx) * fy), (1, 1, fx * fy)] {
+            if w <= 0.0 {
+                continue;
+            }
+            decoded(image, kind, x0 as i64 + dx, y0 as i64 + dy, &mut corner);
+            for (o, c) in out.iter_mut().zip(&corner) {
+                *o += c * w;
+            }
+        }
+    }
+    let mut here = vec![0.0f32; comps];
+    let mut mixed = vec![0u16; comps];
+    for (&(x, y, a), source) in texels.iter().zip(moved.chunks_exact(comps)) {
+        let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
+        if a <= 0.0 {
+            continue;
+        }
+        decoded(image, kind, i64::from(x), i64::from(y), &mut here);
+        for (k, m) in mixed.iter_mut().enumerate() {
+            let v = here.get(k).copied().unwrap_or(0.0) * (1.0 - a) + source.get(k).copied().unwrap_or(0.0) * a;
+            *m = if k < n { enc(kind, v) } else { to_u16(v) };
+        }
+        if x >= image.width() || y >= image.height() {
+            continue;
+        }
+        let o = ((y % TILE) * TILE + x % TILE) as usize * comps;
+        if let Some(t) = image.tile_mut(x / TILE, y / TILE, &empty)
+            && let Some(dst) = t.get_mut(o..o + comps)
+        {
+            dst.copy_from_slice(&mixed);
+        }
+    }
+}
+
+/// Texel `(x, y)` of an image of values and coverage, decoded into `out` (values then coverage); outside the image
+/// and in unallocated tiles it is empty.
+fn decoded(image: &TileImage, kind: ChannelKind, x: i64, y: i64, out: &mut [f32]) {
+    out.iter_mut().for_each(|v| *v = 0.0);
+    if x < 0 || y < 0 || x >= i64::from(image.width()) || y >= i64::from(image.height()) {
+        return;
+    }
+    let (x, y, comps) = (x as u32, y as u32, image.comps());
+    let Some(t) = image.tile(x / TILE, y / TILE) else { return };
+    let o = ((y % TILE) * TILE + x % TILE) as usize * comps;
+    let n = comps.saturating_sub(1);
+    for (k, v) in out.iter_mut().enumerate().take(comps) {
+        let raw = t.get(o + k).copied().unwrap_or(0);
+        *v = if k < n { dec(kind, raw) } else { from_u16(raw) };
+    }
+}
+
+/// One empty texel: zero values (in the channel's encoding) and zero coverage.
+fn empty_texel(kind: ChannelKind, comps: usize) -> Vec<u16> {
+    let mut t = vec![enc(kind, 0.0); comps.saturating_sub(1)];
+    t.push(0);
+    t
+}
+
 /// Largest side of a stamp's texel bounding box.
 fn extent(texels: &[(u32, u32, f32)]) -> f32 {
     let (mut lo, mut hi) = ([u32::MAX; 2], [0u32; 2]);
@@ -174,7 +254,7 @@ fn extent(texels: &[(u32, u32, f32)]) -> f32 {
 mod tests {
     use super::*;
     use texturecraft_geom::primitives;
-    use texturecraft_texel::{TILE, to_u16};
+    use texturecraft_texel::{TILE, to_u16, to_u16_signed};
 
     /// A 64² plane (fully covered) whose roughness is `f(x)`.
     fn setup(f: impl Fn(u32) -> f32) -> (Composite, Arc<UvGBuffer>) {
@@ -253,5 +333,59 @@ mod tests {
         assert!(v > 0.5 && from_u16(alpha.get(30, 32)[0]) > 0.99, "white dragged to the right: {v}");
         // A jump larger than the stamp deposits nothing.
         assert!(!p.stamp(&mut alpha, &disc(50, 10, 3), [50.0, 10.0]));
+    }
+
+    /// A 64² image of `comps` (values then coverage) whose left `edge` columns hold `value` at full coverage.
+    fn half(kind: ChannelKind, comps: usize, edge: u32, value: f32) -> TileImage {
+        let mut img = TileImage::new(TILE, TILE, comps);
+        for y in 0..TILE {
+            for x in 0..edge {
+                let mut px = vec![enc(kind, value); comps - 1];
+                px.push(to_u16(1.0));
+                img.set(x, y, &px);
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn smudging_in_place_moves_values_and_coverage_from_the_shifted_place() {
+        // values on the left 20 columns; a dab at x 20..24 drawing from 4 texels to its left takes them over
+        let mut img = half(ChannelKind::Scalar, 2, 20, 0.8);
+        let dab: Vec<(u32, u32, f32)> = (20..24).map(|x| (x, 32, 1.0)).collect();
+        smudge_in_place(&mut img, ChannelKind::Scalar, &dab, [-4.0, 0.0]);
+        let px = img.get(22, 32);
+        assert!((from_u16(px[0]) - 0.8).abs() < 1e-3 && from_u16(px[1]) > 0.999, "{px:?}");
+        // half strength, half a texel of shift: a bilinear read mixed with what was there
+        let mut img = half(ChannelKind::Scalar, 2, 20, 0.8);
+        smudge_in_place(&mut img, ChannelKind::Scalar, &[(20, 32, 0.5)], [-0.5, 0.0]);
+        let px = img.get(20, 32);
+        assert!((from_u16(px[1]) - 0.25).abs() < 1e-3, "coverage 0.5 · (0.5 · 1 + 0.5 · 0): {px:?}");
+        assert!((from_u16(px[0]) - 0.2).abs() < 1e-3, "premultiplied value: {px:?}");
+        // drawing from the empty right thins what is there
+        let mut img = half(ChannelKind::Scalar, 2, 20, 0.8);
+        smudge_in_place(&mut img, ChannelKind::Scalar, &[(19, 32, 0.75)], [10.0, 0.0]);
+        let px = img.get(19, 32);
+        assert!((from_u16(px[1]) - 0.25).abs() < 1e-3 && (from_u16(px[0]) - 0.2).abs() < 1e-3, "{px:?}");
+    }
+
+    #[test]
+    fn smudging_in_place_reads_before_it_writes_and_keeps_signed_empties_empty() {
+        // every texel of a row draws from its left neighbour: one dab moves the row by one, not all the way
+        let mut img = half(ChannelKind::Scalar, 2, 1, 1.0);
+        let dab: Vec<(u32, u32, f32)> = (1..10).map(|x| (x, 0, 1.0)).collect();
+        smudge_in_place(&mut img, ChannelKind::Scalar, &dab, [-1.0, 0.0]);
+        assert!(from_u16(img.get(1, 0)[1]) > 0.999);
+        assert_eq!(img.get(2, 0)[1], 0);
+        // a signed channel: an empty texel holds the encoded 0, unallocated tiles read as empty, and so do texels moved in
+        let mut img = TileImage::new(2 * TILE, TILE, 4);
+        smudge_in_place(&mut img, ChannelKind::Signed, &[(TILE + 3, 3, 1.0)], [-(TILE as f32), 0.0]);
+        assert_eq!(img.get(TILE + 3, 3), [to_u16_signed(0.0), to_u16_signed(0.0), to_u16_signed(0.0), 0]);
+        assert_eq!(img.get(TILE + 4, 3)[0], to_u16_signed(0.0), "a tile allocated by the dab starts empty");
+        // nothing changes for a shift that is no number
+        let mut img = half(ChannelKind::Scalar, 2, 20, 0.8);
+        let before = img.get(10, 10);
+        smudge_in_place(&mut img, ChannelKind::Scalar, &[(10, 10, 1.0)], [f32::NAN, 0.0]);
+        assert_eq!(img.get(10, 10), before);
     }
 }

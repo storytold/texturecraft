@@ -15,6 +15,7 @@ mod fill_channel_image;
 mod fill_projection_section;
 mod filter_picker;
 mod history_panel;
+mod import_windows;
 mod layer_clipboard;
 mod layer_rename;
 mod layers_panel;

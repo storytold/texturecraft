@@ -139,6 +139,11 @@ pub fn load(app: &mut TextureCraftApp, name: &str, bytes: Vec<u8>) {
     if crate::windows::ask_to_save(app, crate::state::Unsaved::Load(name.into(), bytes.clone())) {
         return;
     }
+    // a project file of the reference app is converted, behind the import's notice
+    if ext == texturecraft_engine::import_cmds::PROJECT_EXT {
+        crate::import_ui::ask(app, texturecraft_engine::import_cmds::ImportTask::bytes(name, std::sync::Arc::unwrap_or_clone(bytes)));
+        return;
+    }
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
     let next = if ext == PROJECT_EXT { Session::from_project_bytes(&bytes) } else { Session::from_mesh_bytes(name, &bytes, MESH_RESOLUTION, stem) };
     match next {
@@ -205,8 +210,8 @@ fn zip_files(files: &[ExportedFile]) -> Result<Vec<u8>, String> {
 
 #[cfg(target_arch = "wasm32")]
 pub use web::{
-    download, export_mesh, export_textures, import_bake_mesh, import_environment, import_images, import_material, import_preset, open, save_project,
-    sync_unsaved, unsaved,
+    download, export_mesh, export_textures, import_bake_mesh, import_environment, import_images, import_material, import_preset, import_project, open,
+    save_project, sync_unsaved, unsaved,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -231,6 +236,11 @@ mod web {
     /// File › Open: the browser's file picker; the file loads on a later frame (see [`poll`]).
     pub fn open(ctx: &egui::Context) {
         pick(ctx, tr("Projects and meshes"), OPEN_EXTS, false, Pick::Open);
+    }
+
+    /// File › Import project: pick a project file to convert; it loads on a later frame and asks with the notice.
+    pub fn import_project(ctx: &egui::Context) {
+        pick(ctx, tr("Project to convert"), &[texturecraft_engine::import_cmds::PROJECT_EXT], false, Pick::Open);
     }
 
     /// File › Import material: pick materials; they add as layers on a later frame.

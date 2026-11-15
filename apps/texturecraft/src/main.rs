@@ -83,8 +83,15 @@ fn parse_args_from<I: IntoIterator<Item = String>>(it: I) -> Result<Option<Args>
     Ok(Some(args))
 }
 
+/// A project file of the reference app: it opens behind the import's notice, not as the first session.
+fn to_convert(args: &Args) -> Option<String> {
+    let f = args.file.as_ref()?;
+    let ext = std::path::Path::new(f).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    (ext == texturecraft_engine::import_cmds::PROJECT_EXT).then(|| f.clone())
+}
+
 fn initial_session(args: &Args) -> Session {
-    if let Some(f) = &args.file {
+    if let Some(f) = args.file.as_ref().filter(|_| to_convert(args).is_none()) {
         match texturecraft_engine::file_cmds::open_path(f) {
             Ok(s) => return s,
             Err(e) => eprintln!("texturecraft: could not open {f}: {e}"),
@@ -208,6 +215,7 @@ fn main() {
     let prefs = saved_prefs(ui_file.as_deref(), persistence_path.as_deref());
     prefs.apply_resource_limits();
     let session = initial_session(&args);
+    let convert = to_convert(&args);
     let title_bar = TitleBar::decide(prefs.system_title_bar);
     let mut viewport = egui::ViewportBuilder::default().with_title(APP_NAME).with_inner_size(DEFAULT_SIZE).with_min_inner_size(MIN_SIZE);
     if let Some(i) = icon() {
@@ -240,6 +248,9 @@ fn main() {
             app.title_bar = title_bar;
             app.ui.windows.start = start && app.ui.prefs.start_window;
             app.set_startup_update_check(checks_for_updates_at_start(control));
+            if let Some(f) = convert {
+                texturecraft_ui_egui::import_ui::ask(&mut app, texturecraft_engine::import_cmds::ImportTask::path(f));
+            }
             if let Some(port) = control {
                 app.control = Some(control_server::start(port, cc.egui_ctx.clone()));
             }

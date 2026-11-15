@@ -26,7 +26,7 @@ pub(crate) fn preserve_strokes(old: &Session, next: &mut Session) -> usize {
             continue;
         }
         let ((w, h), material) = (nc.size, set.material);
-        let (omesh, nmesh, bvh, gbuf) = (&old.mesh, &next.mesh, &old.bvh, &nc.gbuf);
+        let (omesh, nmesh, bvh, gbuf) = (&old.mesh, &next.mesh, &old.bvh, &nc.gbuf());
         let mine = |t: u32| omesh.material_of(t as usize) == Some(material);
         // Old texel position (NaN: none) per texel of each covered destination tile.
         let table: HashMap<(u32, u32), Vec<[f32; 2]>> = nc
@@ -76,7 +76,7 @@ mod tests {
         let mut s = Session::new_project("p", primitives::builtin("plane").unwrap(), "builtin:plane", None, 128).unwrap();
         let id = s.doc.project.texture_sets[0].stack[0];
         // Paint the texels whose surface point has x > 0 (one half of the plane).
-        let gbuf = s.caches[0].gbuf.clone();
+        let gbuf = s.caches[0].gbuf().clone();
         let img = s.doc.pixels.layer_mut(id, Channel::BaseColor, (128, 128));
         for i in 0..128 * 128 {
             if gbuf.surface(&s.mesh, i).is_some_and(|p| p.pos.x > 0.0) {
@@ -92,7 +92,7 @@ mod tests {
         let mut next = Session::new(doc, mesh, None).unwrap();
         assert!(preserve_strokes(&s, &mut next) > 128 * 100);
         let img = next.doc.pixels.layer(id, Channel::BaseColor).unwrap();
-        let gbuf = &next.caches[0].gbuf;
+        let gbuf = &next.caches[0].gbuf();
         let (mut right, mut wrong) = (0, 0);
         for i in 0..128 * 128 {
             let Some(p) = gbuf.surface(&next.mesh, i) else { continue };
