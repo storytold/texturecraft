@@ -373,7 +373,7 @@ impl Session {
             let name = s.doc.project.next_layer_name(ts, &m.manifest.name);
             let lid = crate::layer_cmds::insert_selected(s, Layer::new(lid, name, LayerKind::Fill(fill), &channels))?;
             place.apply(s, lid)?;
-            s.selected.insert(ts, lid);
+            s.select_one(ts, lid);
             s.target = crate::session::StackTarget::Content;
             Ok((lid, names))
         })?;

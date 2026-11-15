@@ -63,6 +63,18 @@ impl Session {
         }
     }
 
+    /// Select layer `id` alone in texture set `ts`.
+    pub(crate) fn select_one(&mut self, ts: usize, id: LayerId) {
+        self.selected.insert(ts, id);
+        self.multi.remove(&ts);
+    }
+
+    /// Select no layer in texture set `ts`.
+    pub(crate) fn select_none(&mut self, ts: usize) {
+        self.selected.remove(&ts);
+        self.multi.remove(&ts);
+    }
+
     /// Select `layers` of texture set `ts` with `active` as the active layer (one of them) and
     /// `anchor` where the next Shift+click range starts.
     pub(crate) fn select_several(&mut self, ts: usize, active: LayerId, anchor: LayerId, layers: Vec<LayerId>) {

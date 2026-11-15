@@ -2,7 +2,9 @@
 //! per-channel blending and fill sources.
 
 use serde_json::{Value, json};
-use texturecraft_core::{BlendMode, Channel, ChannelBlend, EffectKind, Fill, Layer, LayerId, LayerKind, Procedural, ProceduralKind, Projection, Source};
+use texturecraft_core::{
+    BlendMode, Channel, ChannelBlend, EffectKind, Fill, Layer, LayerId, LayerKind, Procedural, ProceduralKind, Project, Projection, Source,
+};
 
 use crate::commands::{
     CommandSpec, always, bad, blend_param, boolp, channel_param, color_param, content_param, f32p, has_layer, layer_param, normal_format_param, strp, u64p,
@@ -16,7 +18,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("layer.add.fill", "Add fill layer", ["Layers"], None, "{name?, color?, roughness?, metallic?}", always, add_fill),
         cmd!("layer.add.group", "Add folder", ["Layers"], None, "{name?}", always, add_group),
         cmd!("layer.remove", "Remove layer(s)", ["Layers"], Some("Delete"), "{layer? | layers?: [id]} — default: every selected layer", has_layer, remove),
-        cmd!("layer.duplicate", "Duplicate layer(s)", ["Layers"], Some("Ctrl+D"), "{layer? | layers?: [id]} — default: every selected layer", has_layer, duplicate),
+        cmd!(
+            "layer.duplicate",
+            "Duplicate layer(s)",
+            ["Layers"],
+            Some("Ctrl+D"),
+            "{layer? | layers?: [id]} — default: every selected layer",
+            has_layer,
+            duplicate
+        ),
         cmd!("layer.group", "Group layer(s)", ["Layers"], Some("Ctrl+G"), "{layer? | layers?: [id]} — default: every selected layer", has_layer, group),
         cmd!(
             "layer.select",
@@ -68,7 +78,7 @@ pub(crate) fn insert_selected(s: &mut Session, layer: Layer) -> Result<LayerId> 
     let sel = s.selected_layer();
     let inside = sel.and_then(|id| s.doc.project.layer(id).ok()).is_some_and(|l| l.is_group());
     let id = s.doc.project.insert_layer(ts, layer, sel, inside)?;
-    s.selected.insert(ts, id);
+    s.select_one(ts, id);
     s.target = StackTarget::Content;
     Ok(id)
 }
@@ -142,10 +152,9 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
             };
             let next = list.get(i.saturating_sub(1)).or(list.first()).copied().or(parent);
             match next {
-                Some(n) => s.selected.insert(ts, n),
-                None => s.selected.remove(&ts),
-            };
-            s.multi.remove(&ts);
+                Some(n) => s.select_one(ts, n),
+                None => s.select_none(ts),
+            }
         }
         // Instances of what was removed keep their look as independent layers.
         crate::instance_cmds::detach_orphans(s, &before)?;
@@ -170,7 +179,8 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(copies)
     })?;
     // The copies are selected; the active layer's copy stays the active one
-    let active = s.selected.get(&ts).and_then(|active| ids.iter().position(|id| id == active)).and_then(|i| copies.get(i)).or(copies.first()).copied().unwrap_or(first);
+    let active =
+        s.selected.get(&ts).and_then(|active| ids.iter().position(|id| id == active)).and_then(|i| copies.get(i)).or(copies.first()).copied().unwrap_or(first);
     s.select_several(ts, active, active, copies.clone());
     Ok(json!({ "layer": active.0, "layers": ids_json(&copies) }))
 }
@@ -189,9 +199,8 @@ fn group(s: &mut Session, p: &Value) -> Result<Value> {
             b.mode = BlendMode::Passthrough;
         }
         s.doc.project.insert_layer(ts, gl, Some(id), false)?;
-        move_stacked(s, &ids, Some(gid), true)?;
-        s.selected.insert(ts, gid);
-        s.multi.remove(&ts);
+        move_stacked(&mut s.doc.project, &ids, Some(gid), true)?;
+        s.select_one(ts, gid);
         Ok(gid)
     })?;
     Ok(json!({ "layer": g.0 }))
@@ -220,8 +229,7 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
     }
 
     s.active_set = ts;
-    s.selected.insert(ts, id);
-    s.multi.remove(&ts);
+    s.select_one(ts, id);
     s.target = match p.get("target") {
         Some(Value::String(t)) if t == "mask" => {
             if s.doc.project.layer(s.doc.project.mask_owner(id))?.mask.is_none() {
@@ -270,37 +278,59 @@ fn visible(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Move `ids` (top row first) above `target` (inside it when `inside`), keeping their order:
 /// the lowest goes first and each next one above it.
-fn move_stacked(s: &mut Session, ids: &[LayerId], target: Option<LayerId>, inside: bool) -> Result<()> {
+fn move_stacked(project: &mut Project, ids: &[LayerId], target: Option<LayerId>, inside: bool) -> Result<()> {
     let (mut target, mut inside) = (target, inside);
     for id in ids.iter().rev() {
-        s.doc.project.move_above(*id, target, inside)?;
+        project.move_above(*id, target, inside)?;
         (target, inside) = (Some(*id), false);
     }
     Ok(())
 }
 
+/// Apply `change` to a copy of the project and, when it moved anything, make it one undo step;
+/// a move that leaves every layer where it was records nothing.
+fn apply_move(s: &mut Session, change: impl FnOnce(&mut Project) -> Result<()>) -> Result<Value> {
+    let mut moved = s.doc.project.clone();
+    change(&mut moved)?;
+    if moved != s.doc.project {
+        s.edit("Move layer", |s| {
+            s.doc.project = moved;
+            Ok(())
+        })?;
+    }
+    Ok(Value::Null)
+}
+
 /// `layer.move {layers, index | above}`: the listed layers move together, keeping their order.
 fn move_layers(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = batch_param(s, "layer.move", p, true)?;
-    s.edit("Move layer", |s| {
-        if let Some(i) = u64p(p, "index") {
-            // Top row first: each next one lands under the one before
-            let to = usize::try_from(i).unwrap_or(usize::MAX);
-            for id in &ids {
-                s.doc.project.move_layer(*id, to)?;
+    if let Some(i) = u64p(p, "index") {
+        // The lowest one goes to `index` of the texture set's stack, the others right above it in their order
+        let to = usize::try_from(i).unwrap_or(usize::MAX);
+        apply_move(s, |project| {
+            let mut below = None;
+            for id in ids.iter().rev() {
+                match below {
+                    None => {
+                        project.move_above(*id, None, false)?;
+                        project.move_layer(*id, to)?;
+                    }
+                    Some(below) => project.move_above(*id, Some(below), false)?,
+                }
+                below = Some(*id);
             }
-        } else if p.get("above").is_some() {
-            let above = u64p(p, "above").map(LayerId);
-            if above.is_some_and(|above| ids.contains(&above)) {
-                return Err(bad("layer.move", "`above` is one of the moved layers"));
-            }
-            move_stacked(s, &ids, above, boolp(p, "inside").unwrap_or(false))?;
-        } else {
-            return Err(bad("layer.move", "give `index` or `above` with `layers`"));
+            Ok(())
+        })
+    } else if p.get("above").is_some() {
+        let above = u64p(p, "above").map(LayerId);
+        if above.is_some_and(|above| ids.contains(&above)) {
+            return Err(bad("layer.move", "`above` is one of the moved layers"));
         }
-        Ok(())
-    })?;
-    Ok(Value::Null)
+        let inside = boolp(p, "inside").unwrap_or(false);
+        apply_move(s, |project| move_stacked(project, &ids, above, inside))
+    } else {
+        Err(bad("layer.move", "give `index` or `above` with `layers`"))
+    }
 }
 
 fn move_layer(s: &mut Session, p: &Value) -> Result<Value> {
@@ -308,22 +338,21 @@ fn move_layer(s: &mut Session, p: &Value) -> Result<Value> {
         return move_layers(s, p);
     }
     let id = layer_param(s, "layer.move", p)?;
-    s.edit("Move layer", |s| {
+    apply_move(s, |project| {
         if let Some(d) = p.get("delta").and_then(Value::as_i64) {
-            let (_, _, i) = s.doc.project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
+            let (_, _, i) = project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
             let to = (i as i64 + d).max(0) as usize;
-            s.doc.project.move_layer(id, to)?;
+            project.move_layer(id, to)?;
         } else if let Some(i) = u64p(p, "index") {
-            s.doc.project.move_layer(id, usize::try_from(i).unwrap_or(usize::MAX))?;
+            project.move_layer(id, usize::try_from(i).unwrap_or(usize::MAX))?;
         } else if p.get("above").is_some() {
             let above = u64p(p, "above").map(LayerId);
-            s.doc.project.move_above(id, above, boolp(p, "inside").unwrap_or(false))?;
+            project.move_above(id, above, boolp(p, "inside").unwrap_or(false))?;
         } else {
             return Err(bad("layer.move", "give `delta`, `index` or `above`"));
         }
         Ok(())
-    })?;
-    Ok(Value::Null)
+    })
 }
 
 fn blend(s: &mut Session, p: &Value) -> Result<Value> {

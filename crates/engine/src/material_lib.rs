@@ -122,7 +122,7 @@ impl Session {
             let inside = sel.and_then(|l| s.doc.project.layer(l).ok()).is_some_and(|l| l.is_group());
             let id = crate::layer_ops::copy_tree(&src, root, &mut s.doc, ts, sel, inside, 0)?;
             place.apply(s, id)?;
-            s.selected.insert(ts, id);
+            s.select_one(ts, id);
             s.target = StackTarget::Content;
             Ok(id)
         })?;

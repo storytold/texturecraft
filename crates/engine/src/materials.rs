@@ -759,7 +759,7 @@ pub fn apply_at(s: &mut Session, id: &str, place: Place) -> Result<LayerId> {
             for l in layers {
                 s.doc.project.insert_layer(ts, l, Some(gid), true)?;
             }
-            s.selected.insert(ts, gid);
+            s.select_one(ts, gid);
             gid
         };
         place.apply(s, top)?;

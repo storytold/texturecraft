@@ -767,6 +767,8 @@ impl Session {
 
     fn after_history(&mut self, other: &Document) {
         self.modified = true;
+        // Layers picked together belong to the stack they were picked in
+        self.multi.clear();
         self.revision = self.revision.wrapping_add(1);
         self.invalidate_changed(other);
 

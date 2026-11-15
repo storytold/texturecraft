@@ -233,7 +233,7 @@ fn click_layer(app: &mut TextureCraftApp, modifiers: egui::Modifiers, layer: u64
 }
 
 /// The selected layers when `layer` is one of several selected ones, so an action on its row
-/// (visibility, drag, context menu) applies to all of them.
+/// (drag and drop, the row menu) applies to all of them.
 fn selection_with(app: &TextureCraftApp, layer: LayerId) -> Option<Vec<u64>> {
     let selected = app.session.selected_layers();
     (selected.len() > 1 && selected.contains(&layer)).then(|| selected.iter().map(|id| id.0).collect())
@@ -523,11 +523,9 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         egui::FontId::proportional(LAYER_EYE_FONT_SIZE),
         if layer.visible { tokens.text } else { tokens.text_dim },
     );
+    // The eye shows or hides its own layer only, even on one of several selected rows
     if eye_response.clicked() {
-        match &several {
-            Some(layers) => app.run("layer.visible", json!({"layers": layers, "visible": !layer.visible})),
-            None => app.run("layer.visible", json!({"layer": layer.id.0})),
-        };
+        app.run("layer.visible", json!({"layer": layer.id.0}));
     }
 
     // A folder's caret

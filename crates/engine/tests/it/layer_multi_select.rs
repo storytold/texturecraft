@@ -129,13 +129,14 @@ fn another_selected_layer_ends_the_multiple_selection() {
 #[test]
 fn delete_removes_every_selected_layer_in_one_undo_step() {
     let mut s = session();
-    let [_, b, _, d] = four(&mut s);
+    let [a, b, _, d] = four(&mut s);
     execute(&mut s, "layer.select", &json!({"layers": [b.0, d.0]})).unwrap();
     let depth = s.history_labels().len();
     let r = execute(&mut s, "layer.remove", &Value::Null).unwrap();
     assert_eq!(r["removed"], json!([d.0, b.0]));
     assert_eq!(rows(&s)[..2], ["C", "A"]);
-    assert_eq!(s.selected_layers().len(), 1);
+    assert_eq!(selected(&s), ["A"], "the layer under the lowest removed one is selected");
+    assert_eq!(s.selected_layer(), Some(a));
     assert_eq!(s.history_labels().len(), depth + 1, "one undo step");
     s.undo().unwrap();
     assert_eq!(rows(&s)[..4], ["D", "C", "B", "A"]);
@@ -205,13 +206,101 @@ fn selected_layers_move_together_keeping_their_order() {
     s.undo().unwrap();
     assert_eq!(rows(&s)[..4], ["D", "C", "B", "A"]);
 
-    // Into a folder, and to the bottom of the stack
+    // Into a folder
     let folder = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
     execute(&mut s, "layer.move", &json!({"layers": [d.0, b.0], "above": folder.0, "inside": true})).unwrap();
     assert_eq!(s.doc.project.layer(folder).unwrap().children(), [b, d]);
-    execute(&mut s, "layer.move", &json!({"layers": [d.0, b.0], "index": 0})).unwrap();
-    assert_eq!(s.doc.project.layer(folder).unwrap().children(), [b, d], "`index` moves within each layer's own list");
     assert!(execute(&mut s, "layer.move", &json!({"layers": [a.0, c.0], "above": c.0})).is_err(), "not above one of themselves");
+}
+
+#[test]
+fn selected_layers_moved_to_an_index_keep_their_order() {
+    for (pair, expected) in [("B", ["C", "D", "B", "A", "Layer 1"]), ("A", ["C", "D", "A", "B", "Layer 1"])] {
+        let mut s = session();
+        let [a, b, _, d] = four(&mut s);
+        let lower = if pair == "A" { a } else { b };
+        execute(&mut s, "layer.move", &json!({"layers": [d.0, lower.0], "index": 2})).unwrap();
+        assert_eq!(rows(&s)[..5], expected, "D and {pair} to index 2");
+    }
+}
+
+#[test]
+fn layers_in_and_out_of_a_folder_dropped_below_the_stack_stay_together_at_its_bottom() {
+    let mut s = session();
+    let [_, b, _, d] = four(&mut s);
+    let folder = id(execute(&mut s, "layer.group", &json!({"layer": b.0})).unwrap(), "layer");
+    execute(&mut s, "layer.move", &json!({"layers": [d.0, b.0], "index": 0})).unwrap();
+    assert_eq!(s.doc.project.texture_sets[0].stack[..2], [b, d], "B at the bottom, D right above it");
+    assert!(s.doc.project.layer(folder).unwrap().children().is_empty(), "B left its folder");
+}
+
+#[test]
+fn a_move_that_changes_nothing_is_not_an_undo_step() {
+    let mut s = session();
+    let [a, b, c, _] = four(&mut s);
+    let depth = s.history_labels().len();
+    execute(&mut s, "layer.move", &json!({"layer": b.0, "above": a.0})).unwrap();
+    execute(&mut s, "layer.move", &json!({"layers": [c.0, b.0], "above": a.0})).unwrap();
+    assert_eq!(s.history_labels().len(), depth, "B already sits above A, and C above B");
+    execute(&mut s, "layer.move", &json!({"layer": a.0, "above": c.0})).unwrap();
+    assert_eq!(s.history_labels().len(), depth + 1);
+}
+
+#[test]
+fn an_explicit_layer_acts_on_that_layer_only_while_several_are_selected() {
+    let select = |s: &mut Session, b: LayerId, d: LayerId| execute(s, "layer.select", &json!({"layers": [b.0, d.0]})).unwrap();
+
+    let mut s = session();
+    let [_, b, _, d] = four(&mut s);
+    select(&mut s, b, d);
+    execute(&mut s, "layer.remove", &json!({"layer": b.0})).unwrap();
+    assert_eq!(rows(&s)[..3], ["D", "C", "A"], "remove");
+
+    let mut s = session();
+    let [_, b, _, d] = four(&mut s);
+    select(&mut s, b, d);
+    execute(&mut s, "layer.duplicate", &json!({"layer": b.0})).unwrap();
+    assert_eq!(rows(&s)[..5], ["D", "C", "B copy", "B", "A"], "duplicate");
+
+    let mut s = session();
+    let [_, b, _, d] = four(&mut s);
+    select(&mut s, b, d);
+    let folder = id(execute(&mut s, "layer.group", &json!({"layer": b.0})).unwrap(), "layer");
+    assert_eq!(s.doc.project.layer(folder).unwrap().children(), [b], "group");
+
+    let mut s = session();
+    let [_, b, _, d] = four(&mut s);
+    select(&mut s, b, d);
+    execute(&mut s, "layer.visible", &json!({"layer": b.0})).unwrap();
+    assert!(!s.doc.project.layer(b).unwrap().visible && s.doc.project.layer(d).unwrap().visible, "visible");
+}
+
+#[test]
+fn undo_and_redo_end_the_multiple_selection() {
+    let mut s = session();
+    let [_, b, ..] = four(&mut s);
+    let e = add(&mut s, "E");
+    execute(&mut s, "layer.select", &json!({"layers": [b.0, e.0]})).unwrap();
+    s.undo().unwrap();
+    s.redo().unwrap();
+    assert_eq!(selected(&s), ["E"], "E is back alone, B is not picked again");
+    add(&mut s, "F");
+    assert_eq!(s.selected_layers().len(), 1);
+    assert!(!s.is_layer_selected(b));
+}
+
+#[test]
+fn reselecting_an_earlier_active_layer_does_not_bring_back_its_multiple_selection() {
+    let mut s = session();
+    let [_, b, c, d] = four(&mut s);
+    click(&mut s, c, "plain");
+    let effect = execute(&mut s, "effect.add.filter", &json!({"target": "content", "filter": "invert"})).unwrap()["effect"].as_u64().unwrap();
+    execute(&mut s, "effect.copy", &json!({ "effect": effect })).unwrap();
+    execute(&mut s, "layer.select", &json!({"layers": [b.0, d.0], "layer": d.0})).unwrap();
+    add(&mut s, "E");
+    // Pasting the effect onto D selects D again, alone
+    execute(&mut s, "effect.paste", &json!({"layer": d.0})).unwrap();
+    assert_eq!(selected(&s), ["D"]);
 }
 
 #[test]

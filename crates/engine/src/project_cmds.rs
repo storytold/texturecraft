@@ -82,7 +82,7 @@ pub fn sample_session(resolution: u32, bake_resolution: u32) -> Result<Session> 
     // Paint above the smart material so new strokes remain visible
     for set_index in (0..session.set_count()).rev() {
         session.active_set = set_index;
-        session.selected.remove(&set_index);
+        session.select_none(set_index);
         crate::execute(&mut session, "layer.add.paint", &Value::Null)?;
     }
     session.undo.clear();
