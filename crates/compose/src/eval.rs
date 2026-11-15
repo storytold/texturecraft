@@ -1684,18 +1684,22 @@ fn plan_node<'a>(
         // `content_layer` already followed instance links.
         LayerKind::Instance { .. } => return None,
     };
+    let anchors = if fx { anchor_cuts(&layer.content_effects) } else { Vec::new() };
     // A paint layer with nothing painted (and not being painted) or added by its content
-    // effects contributes nothing.
+    // effects contributes nothing; a layer blending none of the channels neither. Unless it
+    // holds an anchor point: that records the stack at the layer whatever the layer draws
+    // (an imported anchor layer often blends no channel at all), and fills, masks and graphs
+    // above read it.
     if let Content::Paint { preview: false } = content
         && chans.iter().all(|c| c.data.is_none() && c.effects.is_empty())
+        && anchors.is_empty()
     {
         return None;
     }
-    if chans.is_empty() {
+    if chans.is_empty() && anchors.is_empty() {
         return None;
     }
     let mask = layer_mask(inp.project, id).and_then(|m| mask_plan(inp, id, m, tx, ty, fields));
-    let anchors = if fx { anchor_cuts(&layer.content_effects) } else { Vec::new() };
     let mask_anchor = layer_mask(inp.project, id).is_some_and(|m| m.enabled && mask_anchors(m).next().is_some());
     let has_anchor = !anchors.is_empty() || mask_anchor || matches!(&content, Content::Group(nodes) if nodes.iter().any(|n| n.has_anchor));
     // The geometry mask is the layer's own (an instance in another set has other parts).
@@ -4566,6 +4570,26 @@ soft {soft:?}"
         // An anchor above its reader is not evaluated yet: it reads the channel default (0).
         f.project.move_layer(low, 1).unwrap();
         assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.5; 3]));
+    }
+
+    #[test]
+    fn an_anchor_on_a_layer_blending_no_channel_still_records_the_stack() {
+        let mut f = fixture();
+        let low = f.project.alloc_id();
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::Height, Source::Uniform([0.4; 3]));
+        f.project.insert_layer(0, Layer::new(low, "Low", LayerKind::Fill(fill), &[Channel::Height]), None, false).unwrap();
+        // an imported anchor layer: an empty paint layer with no channel, holding only the anchor point
+        let holder = f.project.alloc_id();
+        f.project.insert_layer(0, Layer::new(holder, "Anchor", LayerKind::Paint, &[]), None, false).unwrap();
+        let anchor = content_fx(&mut f, holder, EffectKind::Anchor);
+        let top = fill_layer(&mut f.project, [1.0; 3], 0.5);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let source = Source::Anchor { anchor, channel: Channel::Height };
+        mask.effects.push(Effect::new(f.project.alloc_id(), EffectKind::Fill { source, projection: Projection::default() }));
+        f.project.layer_mut(top).unwrap().mask = Some(mask);
+        // 1.0 over 0.5 by the recorded 0.4 (not the channel default)
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.7; 3]));
     }
 
     #[test]
