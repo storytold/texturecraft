@@ -103,3 +103,16 @@ fn truetype_system_font_if_present() {
         }
     }
 }
+
+#[test]
+fn text_y_counts_up_with_y_up() {
+    // the mean row of the lit pixels: y=0.25 moves the text down, with y_up=1 up
+    let row = |extra: &str| {
+        let g = Graph::parse(&format!("size 32\nnode 1 text text=\"HI\" size=0.3 y=0.25{extra}\noutput o 1\n")).unwrap();
+        let out = g.evaluate(Some(32)).unwrap();
+        let lit: Vec<usize> = out["o"].px.iter().enumerate().filter(|(_, p)| p[0] > 0.5).map(|(i, _)| i / 32).collect();
+        lit.iter().sum::<usize>() as f32 / lit.len().max(1) as f32
+    };
+    let (down, up) = (row(""), row(" y_up=1"));
+    assert!(down > 20.0 && up < 12.0, "rows {down} {up}");
+}

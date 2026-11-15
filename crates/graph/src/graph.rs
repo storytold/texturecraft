@@ -111,7 +111,12 @@ pub const SPECS: &[Spec] = &[
     ),
     s!("curve", ["in"], [], "tone curves: points (master), points_r points_g points_b points_a as \"x:y,x:y\" lists"),
     s!("svg", [], [], "vector image: file=\"art.svg\" fit (0 contain 1 stretch 2 cover) scale x y"),
-    s!("text", [], [], "text: text=\"...\" font=\"face.ttf\" (optional) size x y align (0 left 1 centre 2 right) spacing line_spacing rotation value"),
+    s!(
+        "text",
+        [],
+        [],
+        "text: text=\"...\" font=\"face.ttf\" (optional) size x y (y_up=1: y counts up) align (0 left 1 centre 2 right) spacing line_spacing rotation value"
+    ),
     s!(
         "channel_shuffle",
         ["in"],
@@ -3701,8 +3706,10 @@ fn compute(id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx) -> Res
                 None => crate::font::Font::Builtin,
             };
             let text = n.strs.get("text").cloned().unwrap_or_default();
+            // compiled font graphs count the position's y up the image
+            let y = if f("y_up", 0.0) > 0.5 { -f("y", 0.0) } else { f("y", 0.0) };
             let xf = crate::vector::Xf::rotate(f("rotation", 0.0).to_radians())
-                .then(crate::vector::Xf::translate((0.5 + f("x", 0.0)) * s as f32, (0.5 + f("y", 0.0)) * hs as f32));
+                .then(crate::vector::Xf::translate((0.5 + f("x", 0.0)) * s as f32, (0.5 + y) * hs as f32));
             let polys = font.layout(&text, f("size", 0.2).max(0.001) * hs as f32, f("align", 1.0) as u32, f("spacing", 0.0), f("line_spacing", 1.0), &xf);
             let mask = crate::vector::fill(&polys, s, hs, false);
             let v = f("value", 1.0);
