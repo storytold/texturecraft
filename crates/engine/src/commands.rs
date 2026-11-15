@@ -144,6 +144,21 @@ pub(crate) fn vec3(params: &Value, key: &str) -> Option<Vec3> {
     vector.is_finite().then_some(vector)
 }
 
+/// `N` finite numbers: a point, a direction or per-channel offsets, not a color, so no hex or grey
+/// form. Absent or `null` is `None`; any other value is an error that names `form`.
+pub(crate) fn numbers_param<const N: usize>(cmd: &str, p: &Value, key: &str, form: &str) -> Result<Option<[f32; N]>> {
+    let v = match p.get(key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    let numbers: Option<Vec<f32>> =
+        v.as_array().filter(|a| a.len() == N).and_then(|a| a.iter().map(|x| x.as_f64().map(|n| n as f32).filter(|n| n.is_finite())).collect());
+    match numbers.and_then(|n| <[f32; N]>::try_from(n).ok()) {
+        Some(n) => Ok(Some(n)),
+        None => Err(bad(cmd, format!("`{key}` must be {form}, not {v}"))),
+    }
+}
+
 pub(crate) fn boolp(p: &Value, key: &str) -> Option<bool> {
     p.get(key).and_then(Value::as_bool)
 }
@@ -274,5 +289,28 @@ mod tests {
 
         let overflow_scalar = json!({ "color": 1e40 });
         assert!(color_param("test.cmd", &overflow_scalar, "color").is_err());
+    }
+
+    #[test]
+    fn a_point_or_direction_param_is_exactly_its_numbers() {
+        let rows = [
+            ("absent", json!({}), Ok(None)),
+            ("null", json!({"v": null}), Ok(None)),
+            ("three numbers", json!({"v": [0.0, 1, -0.5]}), Ok(Some([0.0, 1.0, -0.5]))),
+            ("two numbers", json!({"v": [0, 1]}), Err(())),
+            ("four numbers", json!({"v": [0, 1, 0, 1]}), Err(())),
+            ("a word inside", json!({"v": [0, "up", 0]}), Err(())),
+            ("a hex colour", json!({"v": "#ffffff"}), Err(())),
+            ("one number", json!({"v": 0.5}), Err(())),
+            ("too big for f32", json!({"v": [0, 1e300, 0]}), Err(())),
+        ];
+        for (name, params, expected) in rows {
+            let got = numbers_param::<3>("test.cmd", &params, "v", "[x, y, z]");
+            match (&got, expected) {
+                (Ok(v), Ok(want)) => assert_eq!(*v, want, "{name}"),
+                (Err(e), Err(())) => assert!(e.to_string().contains("`v` must be [x, y, z]"), "{name}: {e}"),
+                _ => panic!("{name}: {got:?}"),
+            }
+        }
     }
 }

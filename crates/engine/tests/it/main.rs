@@ -20,6 +20,7 @@ mod painter_gaps;
 mod path_perf;
 mod path_tool;
 mod perf;
+mod point_params;
 mod polygon_fill;
 mod project_recovery;
 mod sample;
