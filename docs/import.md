@@ -305,6 +305,13 @@ project will need. What we found, for whoever picks it up:
 - **Graph results made while editing are never freed** (`compose/src/graphs/mod.rs`), and `GraphStore::prune` is
   never called, so results of deleted layers stay in the project file.
 
+- **The graph runtime itself is slower than it could be.** Measured against the latest PiJellyPin/MaterialCraft
+  (15 Nov) on the same graph text at 2048², ours is about 1.3–1.9× slower on the CPU, mostly thread-scheduling
+  overhead and the deliberately exact maths library (`libm`, for bit-identical renders everywhere); its GPU path is
+  about 10× faster again but not bit-identical. Our grey/16-bit storage needs about half the memory on large graphs.
+  In the long run a narrow shared graph crate with storytold/materialcraft (for example in `storytold/craft-libs`)
+  would let both apps share this work; that needs the maintainers' agreement (`AGENTS.md` keeps the apps' crates apart).
+
 The direction that would get closer to the reference app: keep each layer's result (and recompute only layers whose
 inputs changed, following anchors and stack readers), so a toggle re-blends cached results instead of recompositing;
 later, composite on the GPU. The second touches the "CPU compositor is the reference" principle and is a decision for
