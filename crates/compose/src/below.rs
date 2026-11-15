@@ -15,6 +15,7 @@ use texturecraft_texel::TileImage;
 
 use crate::eval::{Inputs, PaintTarget};
 use crate::field_cache::FieldCache;
+use crate::held_fields::HeldFields;
 use crate::image_identity::ImageIdentity;
 use crate::store::{BakedMaps, ImageStore, PixelStore};
 
@@ -45,6 +46,11 @@ pub struct BelowCache {
     /// Whole-set fields of graph filters reading the stack, kept across composites (see
     /// [`FieldCache`]). Not emptied with the tiles: they do not depend on the hot layer.
     pub fields: FieldCache,
+    /// Tiles the caller composites next in this pass, after those of the coming composite (empty: none, or a pass that is one
+    /// composite). A stack with neighbourhood filters then filters the coming tiles and these at once and keeps the result for
+    /// the composites that follow, instead of filtering each small chunk's surroundings again.
+    pub ahead: Vec<(u32, u32)>,
+    pub(crate) held: Option<HeldFields>,
 }
 
 impl Default for BelowCache {
@@ -60,6 +66,8 @@ impl Default for BelowCache {
             levels: 1,
             pass: 0,
             fields: FieldCache::default(),
+            ahead: Vec::new(),
+            held: None,
         }
     }
 }
@@ -220,21 +228,28 @@ impl BelowCache {
 
     pub fn clear(&mut self) {
         let tiles = std::mem::take(&mut self.tiles);
-        // Freeing a full cache (up to the byte budget in small bands) can take most of a
-        // second: a thread does it so the frame that switched the hot layer doesn't stall.
+
+        // Native builds free cached bands off-thread to avoid a frame stall
         #[cfg(not(target_arch = "wasm32"))]
         if !tiles.is_empty() {
             let _ = std::thread::Builder::new().name("texturecraft-free".into()).spawn(move || drop(tiles));
         }
         #[cfg(target_arch = "wasm32")]
         drop(tiles);
+
         self.order.clear();
         self.bytes = 0;
         self.key = None;
+        self.held = None;
     }
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Whether neighbourhood-filter fields are kept for the composites that follow (see [`BelowCache::ahead`]).
+    pub fn holds_fields(&self) -> bool {
+        self.held.is_some()
     }
 
     /// The byte limit: the budget for the top level and as much again for a hot layer nested in
@@ -303,49 +318,63 @@ impl BelowCache {
     /// live stroke, or effect layers start from it). Empties the cache when what the cached part reads changed.
     pub(crate) fn prepare(&mut self, inp: &Inputs) -> Option<Vec<Level>> {
         let hot = self.hot?;
-        let p = inp.project;
+        let project = inp.project;
         // The stack values it keeps carry no coverage, which the measured blend rules read: such a project (an
         // imported one) is composited whole.
-        if p.rules.blend.is_measured() {
+        if project.rules.blend.is_measured() {
             return None;
         }
-        let set = p.texture_set(inp.ts).ok()?;
-        // Anchor readers and effect layers depend on the stack below them.
-        let reads_below = |l: &Layer| l.reads_anchor() || Channel::ALL.iter().any(|c| crate::eval::starts_from_below(l, *c));
-        if p.render_tree(&set.stack).iter().any(|id| p.layers.get(id).is_some_and(reads_below) || p.content_layer(*id).is_some_and(reads_below)) {
+        let set = project.texture_set(inp.ts).ok()?;
+
+        // Anchor readers and effect layers depend on the stack below them
+        let reads_below = |layer: &Layer| layer.reads_anchor() || Channel::ALL.iter().any(|channel| crate::eval::starts_from_below(layer, *channel));
+        if project
+            .render_tree(&set.stack)
+            .iter()
+            .any(|id| project.layers.get(id).is_some_and(reads_below) || project.content_layer(*id).is_some_and(reads_below))
+        {
             return None;
         }
-        let levels = path(p, &set.stack, hot)?;
-        let rest: Vec<LayerId> = levels.iter().flat_map(|l| l.below.iter().chain(&l.above)).copied().collect();
-        if rest.is_empty() && levels.len() == 1 {
+
+        let levels = path(project, &set.stack, hot)?;
+        let off_path_roots: Vec<LayerId> = levels.iter().flat_map(|level| level.below.iter().chain(&level.above)).copied().collect();
+        if off_path_roots.is_empty() && levels.len() == 1 {
             return None;
         }
-        let mut tree = p.render_tree(&rest);
-        // Folders holding the hot layer (and the folders their instances draw) count with their
-        // own state only, not their children.
-        for l in levels.iter().take(levels.len() - 1) {
-            let mut id = Some(l.at);
+
+        let mut cached_tree = project.render_tree(&off_path_roots);
+
+        // Cache containing folders by state, without their children
+        for level in levels.iter().take(levels.len() - 1) {
+            let mut id = Some(level.at);
             for _ in 0..=MAX_DEPTH {
-                let Some(i) = id.filter(|i| tree.insert(*i)) else { break };
-                id = p.layers.get(&i).and_then(Layer::instance_source);
+                let Some(instance_id) = id.filter(|instance_id| cached_tree.insert(*instance_id)) else { break };
+                id = project.layers.get(&instance_id).and_then(Layer::instance_source);
             }
         }
-        if tree.contains(&hot) {
+
+        // Repeated hot instances cannot share the off-path cache
+        if cached_tree.contains(&hot) {
             return None;
         }
-        if let Some(pv) = inp.preview {
-            let (PaintTarget::Layer(t) | PaintTarget::Mask(t)) = pv.target;
-            if tree.contains(&t) || tree.iter().filter_map(|id| p.layers.get(id)).flat_map(effect_ids).any(|e| e == t) {
+
+        if let Some(preview) = inp.preview {
+            let (PaintTarget::Layer(target) | PaintTarget::Mask(target)) = preview.target;
+            if cached_tree.contains(&target)
+                || cached_tree.iter().filter_map(|id| project.layers.get(id)).flat_map(effect_ids).any(|effect_id| effect_id == target)
+            {
                 return None;
             }
         }
-        let roots = set.stack.iter().chain(levels.iter().map(|l| &l.at)).copied().collect();
-        let key = StackKey::of_tree(p, inp.pixels, inp.baked, inp.images, inp.ts, roots, &tree)?;
+
+        let roots = set.stack.iter().chain(levels.iter().map(|level| &level.at)).copied().collect();
+        let key = StackKey::of_tree(project, inp.pixels, inp.baked, inp.images, inp.ts, roots, &cached_tree)?;
         self.levels = levels.len();
         if self.key.as_ref() != Some(&key) {
             self.clear();
             self.key = Some(key);
         }
+
         Some(levels)
     }
 }

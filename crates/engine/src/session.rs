@@ -946,22 +946,24 @@ impl Session {
 
     fn update_sets(&mut self, order: &[usize], budget_ms: f64, clock: impl Fn() -> f64) -> bool {
         let start = clock();
-        let first = if budget_ms.is_finite() { rayon::current_num_threads().clamp(1, CHUNK) } else { CHUNK };
-        // The layer being edited: everything else is cached per tile.
-        let hot = self.stroke.as_ref().and_then(|s| s.target).map(|t| self.paint_owner(t)).or_else(|| self.selected_layer());
-        let stroke_size = self.stroke.as_ref().and_then(|s| self.caches.get(s.ts)).map(|c| c.size);
-        let preview = self.stroke.as_ref().and_then(|s| {
+        let initial_chunk_size = if budget_ms.is_finite() { rayon::current_num_threads().clamp(1, CHUNK) } else { CHUNK };
+
+        // The layer being edited: everything else is cached per tile
+        let hot = self.stroke.as_ref().and_then(|stroke| stroke.target).map(|target| self.paint_owner(target)).or_else(|| self.selected_layer());
+        let stroke_size = self.stroke.as_ref().and_then(|stroke| self.caches.get(stroke.ts)).map(|cache| cache.size);
+        let preview = self.stroke.as_ref().and_then(|stroke| {
             Some(StrokePreview {
-                target: s.target?,
-                alpha: s.canvas.alpha.clone(),
-                opacity: s.stroke.settings.opacity,
-                erase: s.erase,
-                values: s.values.clone(),
+                target: stroke.target?,
+                alpha: stroke.canvas.alpha.clone(),
+                opacity: stroke.stroke.settings.opacity,
+                erase: stroke.erase,
+                values: stroke.values.clone(),
                 mask_value: self.tool.mask_value,
-                stencil: s.stencil.clone(),
-                carried: s.canvas.pickup.as_ref().map(|p| p.values.clone()).unwrap_or_default(),
+                stencil: stroke.stencil.clone(),
+                carried: stroke.canvas.pickup.as_ref().map(|pickup| pickup.values.clone()).unwrap_or_default(),
             })
         });
+
         let mut changed = false;
         for &ts in order {
             // room for this set's caches before it composites
@@ -980,24 +982,27 @@ impl Session {
             let Some(cache) = self.caches.get_mut(ts) else { continue };
             cache.below.set_hot(hot);
             cache.below.pass = cache.dirty.len() + cache.settle.len();
-            // Instances in sets of the stroke's size show the live stroke too.
+
+            // Instances in sets of the stroke's size show the live stroke too
             let preview = preview.as_ref().filter(|_| Some(cache.size) == stroke_size);
-            // Start at the size that fit the budget last time: with a heavy stack (smart
-            // materials at 8K) one tile per thread alone would take several frames' budget.
-            let mut chunk = if budget_ms.is_finite() && cache.chunk > 0 { cache.chunk } else { first };
+
+            // Reuse the last affordable chunk size for heavy stacks
+            let mut chunk = if budget_ms.is_finite() && cache.chunk > 0 { cache.chunk } else { initial_chunk_size };
             loop {
                 if cache.dirty.is_empty() {
                     if cache.settle.is_empty() || clock() - start >= budget_ms.min(SETTLE_BUDGET_MS) {
                         break;
                     }
-                    // Small chunks: the settle slice of the budget is short.
-                    cache.dirty.extend(next_chunk(&mut cache.settle, chunk.min(first)));
+
+                    // Small chunks: the settle slice of the budget is short
+                    cache.dirty.extend(next_chunk(&mut cache.settle, chunk.min(initial_chunk_size)));
                 }
-                let t0 = clock();
+                let chunk_started = clock();
                 let tiles = next_chunk(&mut cache.dirty, chunk);
-                for t in &tiles {
-                    cache.settle.remove(t);
+                for tile in &tiles {
+                    cache.settle.remove(tile);
                 }
+
                 let empty = BakedMaps::default();
                 let gbuf = cache.gbuf().clone();
                 let inputs = texturecraft_compose::Inputs {
@@ -1013,31 +1018,40 @@ impl Session {
                     graphs: &self.doc.graphs,
                     bounds: self.mesh.bounds(),
                 };
+
+                // Look ahead so sliced updates filter a run of tiles once
+                cache.below.ahead = if budget_ms.is_finite() { tiles_ahead(&cache.dirty, &tiles) } else { Vec::new() };
                 texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
-                // The composited tiles and the neighbours their padding reached change.
+
+                // The composited tiles and the neighbours their padding reached change
                 let dilation = cache.dilation().clone();
                 let padded = pad_tiles(&mut cache.composite, &dilation, &tiles);
                 cache.upload.extend(tiles.iter().copied().chain(padded));
                 cache.revision = cache.revision.wrapping_add(1);
                 changed = true;
+
                 let now = clock();
-                let left = budget_ms - (now - start);
-                // As many tiles as fit in what is left, at the pace of this chunk.
-                let per_tile = (now - t0) / tiles.len().max(1) as f64;
-                if budget_ms.is_finite() && per_tile > 0.0 {
-                    // Never above one tile per thread: work can turn heavy from one frame to the next.
-                    cache.chunk = ((budget_ms / per_tile) as usize).clamp(1, first);
+                let remaining_ms = budget_ms - (now - start);
+
+                // Estimate how many tiles fit in the remaining frame budget
+                let ms_per_tile = (now - chunk_started) / tiles.len().max(1) as f64;
+                if budget_ms.is_finite() && ms_per_tile > 0.0 {
+                    // Never above one tile per thread: work can turn heavy from one frame to the next
+                    cache.chunk = ((budget_ms / ms_per_tile) as usize).clamp(1, initial_chunk_size);
                 }
-                if left <= 0.0 {
+                if remaining_ms <= 0.0 {
                     return changed;
                 }
-                let fit = if per_tile > 0.0 { (left / per_tile) as usize } else { CHUNK };
-                if fit == 0 {
+
+                let fitting_tiles = if ms_per_tile > 0.0 { (remaining_ms / ms_per_tile) as usize } else { CHUNK };
+                if fitting_tiles == 0 {
                     return changed;
                 }
-                chunk = fit.min(CHUNK);
+
+                chunk = fitting_tiles.min(CHUNK);
             }
         }
+
         changed
     }
 
@@ -1180,13 +1194,28 @@ fn next_chunk(dirty: &mut BTreeSet<(u32, u32)>, n: usize) -> Vec<(u32, u32)> {
     if dirty.len() <= n {
         return std::mem::take(dirty).into_iter().collect();
     }
+
     let mut tiles: Vec<(u32, u32)> = dirty.iter().copied().collect();
-    tiles.sort_by_key(|&(x, y)| (y / 16, x / 16, y, x));
+    tiles.sort_by_key(|&(x, y)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK, y, x));
     tiles.truncate(n);
-    for t in &tiles {
-        dirty.remove(t);
+    for tile in &tiles {
+        dirty.remove(tile);
     }
+
     tiles
+}
+
+/// Dirty tiles a neighbourhood filter runs over ahead of the chunk being composited.
+const FILTER_AHEAD: usize = 64;
+
+/// The dirty tiles composited after `chunk` in its 16 × 16 tile blocks, in the order [`next_chunk`] takes them, at most [`FILTER_AHEAD`].
+fn tiles_ahead(dirty: &BTreeSet<(u32, u32)>, chunk: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let block = |&(x, y): &(u32, u32)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK);
+    let blocks: BTreeSet<(u32, u32)> = chunk.iter().map(block).collect();
+    let mut ahead: Vec<(u32, u32)> = dirty.iter().copied().filter(|tile| blocks.contains(&block(tile))).collect();
+    ahead.sort_by_key(|tile| (block(tile), tile.1, tile.0));
+    ahead.truncate(FILTER_AHEAD);
+    ahead
 }
 
 /// Valid texture set resolutions: powers of two from 128 to 8192.

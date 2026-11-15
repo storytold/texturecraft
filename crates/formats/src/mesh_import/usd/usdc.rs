@@ -255,7 +255,7 @@ impl<'a> Crate<'a> {
             return Err(FormatError::TooLarge(format!("the USD path table has {path_count} entries (limit {MAX_PATHS})")));
         }
 
-        // Account for the actual path slot allocation
+        // Charge slot storage before allocating the table
         budget.take(path_count.saturating_mul(std::mem::size_of::<Option<PathEl>>()))?;
         self.paths = vec![None; path_count];
         let mut pending_branches: Vec<(usize, Option<usize>)> = vec![(0, None)];
@@ -276,15 +276,20 @@ impl<'a> Crate<'a> {
                     None => PathEl { text: "/".into(), parent: None, name: String::new(), prop: false },
                     Some(parent_index) => {
                         let element_token = *elements.get(node_index).ok_or_else(path_error)?;
-                        let name = self.token(element_token.unsigned_abs())?.to_string();
+                        let name = self.token(element_token.unsigned_abs())?;
                         let parent_path = self.paths.get(parent_index).and_then(Option::as_ref).map(|b| b.text.as_str()).ok_or_else(path_error)?;
+                        let separator_bytes = usize::from(element_token < 0 || (!name.starts_with('{') && parent_path != "/"));
+                        let text_bytes = parent_path.len().saturating_add(name.len()).saturating_add(separator_bytes);
+
+                        // Charge both retained strings before allocating either one
+                        budget.take(text_bytes.saturating_add(name.len()))?;
+                        let name = name.to_string();
                         let text = match (element_token < 0, parent_path) {
                             (true, _) => format!("{parent_path}.{name}"),
                             (false, _) if name.starts_with('{') => format!("{parent_path}{name}"),
                             (false, "/") => format!("/{name}"),
                             (false, _) => format!("{parent_path}/{name}"),
                         };
-                        budget.take(text.len())?;
                         PathEl { text, parent: Some(parent_index), name, prop: element_token < 0 }
                     }
                 };
@@ -658,6 +663,42 @@ mod tests {
         let comp = codec::compress(&codec::encode_ints(v, 4));
         out.extend_from_slice(&(comp.len() as u64).to_le_bytes());
         out.extend_from_slice(&comp);
+    }
+
+    #[test]
+    fn repeated_path_names_count_toward_the_decode_budget() {
+        let name = "long_name_reused";
+        let mut section = Vec::new();
+        section.extend_from_slice(&3u64.to_le_bytes());
+        section.extend_from_slice(&3u64.to_le_bytes());
+        compressed_ints(&mut section, &[0, 1, 2]);
+        compressed_ints(&mut section, &[0, 0, 0]);
+        compressed_ints(&mut section, &[-1, 0, -2]);
+        let mut crate_data = crate_over(&section, (0, 8, 0));
+        crate_data.tokens.push(name.into());
+
+        let decoded_arrays_bytes = 3 * 3 * std::mem::size_of::<i64>();
+        let path_slots_bytes = 3 * std::mem::size_of::<Option<PathEl>>();
+        let path_text_bytes = 2 * (1 + name.len());
+        let one_name_budget = decoded_arrays_bytes + path_slots_bytes + path_text_bytes + name.len();
+        let mut insufficient_budget = Budget(one_name_budget);
+
+        let rejected = crate_data.read_paths(Cur { b: &section, pos: 0 }, &mut insufficient_budget);
+
+        assert!(matches!(rejected, Err(FormatError::TooLarge(_))), "two path names cannot fit a one-name budget");
+        drop(crate_data);
+
+        let mut complete_budget = Budget(one_name_budget + name.len());
+        let mut crate_data = crate_over(&section, (0, 8, 0));
+        crate_data.tokens.push(name.into());
+        crate_data.read_paths(Cur { b: &section, pos: 0 }, &mut complete_budget).unwrap();
+
+        assert_eq!(complete_budget.0, 0);
+        assert_eq!(crate_data.path(1).unwrap().text, format!("/{name}"));
+        assert_eq!(crate_data.path(2).unwrap().text, format!("/{name}"));
+        let retained_name_bytes: usize = crate_data.paths.iter().filter_map(Option::as_ref).map(|path| path.name.capacity()).sum();
+        assert!(retained_name_bytes >= 2 * name.len());
+        println!("retained names: 2, buffer capacity: {retained_name_bytes} bytes");
     }
 
     #[test]

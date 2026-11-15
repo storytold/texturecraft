@@ -34,14 +34,14 @@ pub(crate) type Slot = (FieldKey, usize);
 /// Everything a cached field reads (see the module docs).
 #[derive(Debug, PartialEq)]
 struct Key {
-    stack: StackKey,
+    stack: Arc<StackKey>,
     rules: CompositeRules,
 }
 
 impl Key {
     fn of(inp: &Inputs, roots: Vec<LayerId>, tree: &BTreeSet<LayerId>) -> Option<Key> {
         let stack = StackKey::of_tree(inp.project, inp.pixels, inp.baked, inp.images, inp.ts, roots, tree)?;
-        Some(Key { stack, rules: inp.project.rules })
+        Some(Key { stack: Arc::new(stack), rules: inp.project.rules })
     }
 }
 
@@ -75,6 +75,8 @@ pub struct FieldCache {
     single: bool,
     /// Fields taken from the cache instead of computed, since it was made.
     reused: u64,
+    /// The whole stack's key for this composite, when the caller built it already (see [`FieldCache::begin`]).
+    stack_key: Option<Arc<StackKey>>,
 }
 
 impl std::fmt::Debug for FieldCache {
@@ -95,6 +97,7 @@ impl Default for FieldCache {
             confirmed: HashSet::new(),
             single: false,
             reused: 0,
+            stack_key: None,
         }
     }
 }
@@ -132,8 +135,10 @@ impl FieldCache {
         self.current = None;
     }
 
-    /// Start a composite (one call of `composite_tiles_cached`).
-    pub(crate) fn begin(&mut self) {
+    /// Start a composite (one call of `composite_tiles_cached`). `stack_key`: the key of the set's whole stack for its
+    /// inputs, when the caller built one (the cache then does not build it again).
+    pub(crate) fn begin(&mut self, stack_key: Option<Arc<StackKey>>) {
+        self.stack_key = stack_key;
         self.pass += 1;
         self.current = None;
         self.confirmed.clear();
@@ -159,6 +164,7 @@ impl FieldCache {
             self.bytes = self.bytes.saturating_sub(freed);
         }
         self.current = None;
+        self.stack_key = None;
     }
 
     /// Whether every entry is current for `inp` (computed once per composite).
@@ -169,8 +175,13 @@ impl FieldCache {
         if let Some(c) = self.current {
             return c;
         }
-        let stack = inp.project.texture_set(inp.ts).map(|s| s.stack.clone()).unwrap_or_default();
-        let key = Key::of(inp, stack.clone(), &inp.project.render_tree(&stack));
+        let key = match &self.stack_key {
+            Some(stack) => Some(Key { stack: stack.clone(), rules: inp.project.rules }),
+            None => {
+                let stack = inp.project.texture_set(inp.ts).map(|s| s.stack.clone()).unwrap_or_default();
+                Key::of(inp, stack.clone(), &inp.project.render_tree(&stack))
+            }
+        };
         let same = key.is_some() && key == self.whole;
         if !same {
             self.whole = key;

@@ -575,6 +575,174 @@ fn gathering_filters_composite_identically_in_any_grouping_and_cached() {
     }
 }
 
+/// Composite every tile in chunks of `chunk`, telling the cache the `ahead` tiles that follow each chunk, as a pass spread over frames does.
+fn run_sliced(fixture: &Fixture, cache: &mut BelowCache, chunk: usize, ahead: usize) -> Composite {
+    let all = all_tiles(RES, RES);
+    let (images, baked) = (Default::default(), Default::default());
+    let mut out = Composite::new(&fixture.project.texture_sets[0].channel_list(), RES);
+
+    for (index, tiles) in all.chunks(chunk).enumerate() {
+        let done = (index * chunk + tiles.len()).min(all.len());
+        cache.ahead = all.iter().skip(done).take(ahead).copied().collect();
+        composite_tiles_cached(&inputs(fixture, 0, &images, &baked), &mut out, tiles, Some(&mut *cache));
+        assert_eq!(cache.holds_fields(), !cache.ahead.is_empty(), "fields are kept exactly while tiles follow (chunk {chunk}, ahead {ahead})");
+    }
+
+    out
+}
+
+#[test]
+fn filter_fields_kept_across_the_chunks_of_a_pass_composite_exactly() {
+    let mut fixture = fixture();
+    let top = heavy_stack(&mut fixture);
+    let blurred_fill = fixture.project.texture_sets[0].stack[1];
+    let expected = reference(&fixture, 0);
+
+    for hot in [None, Some(top), Some(blurred_fill)] {
+        // Exercise reuse within and recomputation beyond retained runs
+        for (chunk, ahead) in [(1, 1), (1, 5), (3, 4), (5, 16), (2, 0)] {
+            let mut cache = BelowCache::default();
+            cache.set_hot(hot);
+            assert!(run_sliced(&fixture, &mut cache, chunk, ahead) == expected, "a cold sliced pass differs (hot {hot:?}, chunk {chunk}, ahead {ahead})");
+
+            // A warm hot-layer cache needs fewer fields
+            assert!(run_sliced(&fixture, &mut cache, chunk, ahead) == expected, "a warm sliced pass differs (hot {hot:?}, chunk {chunk}, ahead {ahead})");
+        }
+    }
+
+    // Evicted tiles need fields from every layer again
+    let mut full = BelowCache::default();
+    full.set_hot(Some(top));
+    run(&fixture, 0, &all_tiles(RES, RES), Some(&mut full));
+    let tile_bytes = full.tile_bytes().unwrap();
+    for tiles_held in [2, 5, 9] {
+        for (chunk, ahead) in [(1, 5), (3, 4), (2, 16)] {
+            let mut cache = BelowCache::default();
+            cache.budget = tiles_held * tile_bytes;
+            cache.set_hot(Some(top));
+            for pass in 0..3 {
+                assert!(
+                    run_sliced(&fixture, &mut cache, chunk, ahead) == expected,
+                    "pass {pass} differs with {tiles_held} cached tiles (chunk {chunk}, ahead {ahead})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn kept_filter_fields_are_not_used_after_an_edit_or_under_a_live_stroke() {
+    let mut fixture = fixture();
+    let top = heavy_stack(&mut fixture);
+    let all = all_tiles(RES, RES);
+    let (first, rest) = all.split_at(3);
+    let mut cache = BelowCache::default();
+    cache.set_hot(Some(top));
+
+    // Keep fields for the remaining tiles
+    cache.ahead = rest.to_vec();
+    let mut out = run(&fixture, 0, first, Some(&mut cache));
+    assert!(cache.holds_fields());
+
+    // Changing the hot mask must invalidate the retained fields
+    let mask = fixture.project.layer_mut(top).unwrap().mask.as_mut().unwrap();
+    mask.effects[1].kind = EffectKind::Filter(Filter::Blur { radius: 6.0 });
+    let (images, baked) = (Default::default(), Default::default());
+    cache.ahead = Vec::new();
+    composite_tiles_cached(&inputs(&fixture, 0, &images, &baked), &mut out, &all, Some(&mut cache));
+    assert!(out == reference(&fixture, 0), "fields kept from before an edit were used after it");
+    assert!(!cache.holds_fields());
+
+    // A live stroke must bypass retained fields
+    let preview = stroke(top);
+    cache.ahead = rest.to_vec();
+    let mut live = run_with(&fixture, 0, first, Some(&mut cache), Some(&preview));
+    assert!(!cache.holds_fields());
+
+    let mut inp = inputs(&fixture, 0, &images, &baked);
+    inp.preview = Some(&preview);
+    composite_tiles_cached(&inp, &mut live, rest, Some(&mut cache));
+    assert!(live == run_with(&fixture, 0, &all, None, Some(&preview)), "a live stroke over a sliced pass differs");
+}
+
+/// Kept fields hold a layer off the hot path only over the tiles the cache lacked when they were built. A tile the cache drops
+/// while they are in use needs that layer's fields again.
+#[test]
+fn tiles_the_cache_drops_during_a_kept_run_are_filtered_again() {
+    const SIZE: u32 = 512;
+    let mesh = primitives::sphere(1.0, 32, 16);
+    let gbuf = UvGBuffer::new(&mesh, 0, SIZE, SIZE);
+    let mut project = Project::new("t", "builtin:sphere");
+    project.texture_sets.push(TextureSet::new("A", 0, SIZE));
+    let mut fixture = Fixture { project, mesh, gbuf, pixels: PixelStore::default() };
+    add(&mut fixture, 0, fill(&[(Channel::BaseColor, procedural(ProceduralKind::Clouds, 0.1, 0.9))]), None);
+
+    // Pattern detail exposes any missing blur field
+    let mut blurred = Mask::new(MaskBackground::Black);
+    blurred.effects.push(effect(&mut fixture, EffectKind::Fill { source: procedural(ProceduralKind::Checker, 0.0, 1.0), projection: Projection::default() }));
+    blurred.effects.push(effect(&mut fixture, EffectKind::Filter(Filter::Blur { radius: 40.0 })));
+    add(&mut fixture, 0, fill(&[(Channel::Roughness, procedural(ProceduralKind::Grunge, 0.0, 1.0))]), Some(blurred));
+
+    // Keep the blurred layer visible under the hot layer
+    let hot = add(&mut fixture, 0, LayerKind::Paint, None);
+    paint_rect_at(&mut fixture, hot, SIZE, (10, 10), (40, 40), 0.2);
+
+    let mut all = all_tiles(SIZE, SIZE);
+    all.sort_by_key(|&(x, y)| (y, x));
+    let channels = fixture.project.texture_sets[0].channel_list();
+    let (images, baked) = (Default::default(), Default::default());
+    let mut expected = Composite::new(&channels, SIZE);
+    composite_tiles(&inputs(&fixture, 0, &images, &baked), &mut expected, &all);
+
+    // Prime the cache with only the two bottom rows
+    let rows = (SIZE / TILE) as usize;
+    let (above, bottom) = all.split_at(all.len() - 2 * rows);
+    let mut cache = BelowCache::default();
+    cache.set_hot(Some(hot));
+    let mut out = Composite::new(&channels, SIZE);
+    composite_tiles_cached(&inputs(&fixture, 0, &images, &baked), &mut out, bottom, Some(&mut cache));
+    assert_eq!(cache.len(), bottom.len());
+    cache.budget = cache.bytes();
+
+    // Cache eviction during the run must rebuild missing lower-layer fields
+    let mut out = Composite::new(&channels, SIZE);
+    for (index, tile) in all.iter().enumerate() {
+        cache.ahead = all.iter().skip(index + 1).copied().collect();
+        composite_tiles_cached(&inputs(&fixture, 0, &images, &baked), &mut out, &[*tile], Some(&mut cache));
+        if index == 0 {
+            assert!(cache.holds_fields());
+        }
+    }
+    assert!(above.len() > bottom.len());
+    assert!(out == expected, "a tile dropped from the cache was composited with fields that lack the layers off the hot path");
+}
+
+/// A stroke that starts while fields are kept must not leave them allocated for as long as it lasts, even though tiles still follow.
+#[test]
+fn a_live_stroke_releases_the_fields_kept_before_it_started() {
+    let mut fixture = fixture();
+    let top = heavy_stack(&mut fixture);
+    let all = all_tiles(RES, RES);
+    let (first, rest) = all.split_at(3);
+    let mut cache = BelowCache::default();
+    cache.set_hot(Some(top));
+
+    cache.ahead = rest.to_vec();
+    run(&fixture, 0, first, Some(&mut cache));
+    assert!(cache.holds_fields());
+
+    // A stroke must release fields even while tiles remain
+    let preview = stroke(top);
+    let mut live = run_with(&fixture, 0, first, Some(&mut cache), Some(&preview));
+    assert!(!cache.holds_fields(), "fields kept before the stroke stay allocated while it lasts");
+
+    let (images, baked) = (Default::default(), Default::default());
+    let mut inp = inputs(&fixture, 0, &images, &baked);
+    inp.preview = Some(&preview);
+    composite_tiles_cached(&inp, &mut live, rest, Some(&mut cache));
+    assert!(live == run_with(&fixture, 0, &all, None, Some(&preview)), "a stroke that starts during a sliced pass differs");
+}
+
 #[test]
 fn cached_stack_tracks_referenced_images_only() {
     use std::sync::Arc;

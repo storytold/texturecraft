@@ -16,6 +16,7 @@ pub mod display;
 pub mod eval;
 pub mod field_cache;
 pub mod graphs;
+mod held_fields;
 mod image_identity;
 pub mod pattern;
 pub mod placed;
@@ -25,8 +26,8 @@ pub mod thumb;
 pub use below::{BelowCache, StackKey};
 pub use display::{DisplayKind, tile_bytes};
 pub use eval::{
-    Composite, Inputs, PaintTarget, Stencil, StrokePreview, all_tiles, composite_tiles, composite_tiles_cached, covered_tiles, effect_histogram, flatten_layer,
-    mask_at, mask_image, pad_tiles,
+    BLOCK, Composite, Inputs, PaintTarget, Stencil, StrokePreview, all_tiles, composite_tiles, composite_tiles_cached, covered_tiles, effect_histogram,
+    flatten_layer, mask_at, mask_image, pad_tiles,
 };
 pub use field_cache::{FIELD_BUDGET, FieldCache};
 pub use graphs::{Cooked, GraphStore, GraphUse};
