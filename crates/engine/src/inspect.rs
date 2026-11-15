@@ -190,6 +190,7 @@ pub fn session(s: &Session) -> Value {
         "bakeMeshes": crate::bake::meshes_json(s),
         "activeTextureSet": ts,
         "selectedLayer": s.selected_layer().map(|l| l.0),
+        "selectedLayers": crate::layer_selection::ids_json(&s.selected_layers()),
         "target": match s.target { StackTarget::Content => json!("content"), StackTarget::Mask => json!("mask"), StackTarget::Effect(e) => json!(e.0) },
         "layers": stack(s, ts),
         "tool": { "tool": s.tool.tool.id(), "brush": crate::tool_cmds::brush_json(s) },

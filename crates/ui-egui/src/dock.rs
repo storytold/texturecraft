@@ -192,7 +192,9 @@ pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if free.is_finite() { free.max(24.0) } else { 24.0 }), Sense::hover());
         if let Some(dragged) = dnd_release::<u64>(&resp) {
             let bottom = app.session.doc.project.texture_sets.get(ts).and_then(|t| t.stack.first().copied());
-            if bottom.map(|b| b.0) != Some(*dragged) {
+            if let Some(layers) = selection_with(app, LayerId(*dragged)) {
+                app.run("layer.move", json!({"layers": layers, "index": 0}));
+            } else if bottom.map(|b| b.0) != Some(*dragged) {
                 app.run("layer.move", json!({"layer": *dragged, "index": 0}));
             }
         }
@@ -211,6 +213,30 @@ pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
         }
     });
     app.layer_panel.end(ui.ctx(), &app.session);
+}
+
+/// A click on a layer row or its content thumbnail, as in the reference app: Shift selects the
+/// rows from the last clicked layer to this one, Ctrl/Cmd adds or takes out this layer, and a
+/// plain click selects it alone (on `target`, when given).
+fn click_layer(app: &mut TextureCraftApp, modifiers: egui::Modifiers, layer: u64, target: Option<&str>) {
+    let params = if modifiers.shift {
+        json!({"layer": layer, "range": true})
+    } else if modifiers.command {
+        json!({"layer": layer, "toggle": true})
+    } else {
+        match target {
+            Some(target) => json!({"layer": layer, "target": target}),
+            None => json!({"layer": layer}),
+        }
+    };
+    app.run("layer.select", params);
+}
+
+/// The selected layers when `layer` is one of several selected ones, so an action on its row
+/// (visibility, drag, context menu) applies to all of them.
+fn selection_with(app: &TextureCraftApp, layer: LayerId) -> Option<Vec<u64>> {
+    let selected = app.session.selected_layers();
+    (selected.len() > 1 && selected.contains(&layer)).then(|| selected.iter().map(|id| id.0).collect())
 }
 
 /// Whether the selection targets the layer content (the content or one of its effects) rather
@@ -447,15 +473,18 @@ fn thumb_box(ui: &Ui, app: &mut TextureCraftApp, rect: Rect, target: ThumbTarget
 fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize, index: usize) {
     let tokens = Tokens::get(ui.ctx());
     let selected = app.session.selected_layer() == Some(layer.id);
+    // One of several selected layers (Shift/Ctrl+click) is highlighted like the active one
+    let highlighted = selected || app.session.is_layer_selected(layer.id);
+    let several = selection_with(app, layer.id);
     let content_target = selected && targets_content(app);
     let preferred_size = layer_preview_size(app);
     let row_height = layer_row_height(preferred_size);
     let (rect, row) = ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click_and_drag());
-    row.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListItem, true, selected, &layer.name));
+    row.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListItem, true, highlighted, &layer.name));
 
-    // Background, folder lines, the selected row's accent edge and the colour tag
+    // Background, folder lines, the selected rows' accent edge and the colour tag
     let painter = ui.painter().clone();
-    let background = if selected {
+    let background = if highlighted {
         tokens.row_selected
     } else if row.hovered() {
         tokens.row_hover
@@ -476,7 +505,7 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         let x = rect.left() + FOLDER_BRANCH_OFFSET + indent - INDENT;
         painter.hline(x..=x + INDENT * 0.5, rect.center().y, line);
     }
-    if selected {
+    if highlighted {
         painter.rect_filled(Rect::from_min_size(rect.min, vec2(SELECTED_EDGE_WIDTH, row_height)), 0.0, tokens.accent);
     }
     if let Some(tag) = layer.color_tag.and_then(|tag| TAG_COLORS.get(tag as usize)) {
@@ -495,7 +524,10 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         if layer.visible { tokens.text } else { tokens.text_dim },
     );
     if eye_response.clicked() {
-        app.run("layer.visible", json!({"layer": layer.id.0}));
+        match &several {
+            Some(layers) => app.run("layer.visible", json!({"layers": layers, "visible": !layer.visible})),
+            None => app.run("layer.visible", json!({"layer": layer.id.0})),
+        };
     }
 
     // A folder's caret
@@ -528,7 +560,8 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
     painter.rect_stroke(thumbnail, THUMBNAIL_ROUNDING, target_stroke(&tokens, content_target), egui::StrokeKind::Outside);
     let content_response = ui.interact(thumbnail, ui.scope_id().with(("content", layer.id.0)), Sense::click()).on_hover_text(tr("Select the layer content"));
     if content_response.clicked() {
-        app.run("layer.select", json!({"layer": layer.id.0, "target": "content"}));
+        let modifiers = ui.input(|input| input.modifiers);
+        click_layer(app, modifiers, layer.id.0, Some("content"));
     }
     x = thumbnail.right() + THUMBNAIL_SPACING;
 
@@ -669,10 +702,12 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
 
     // Interaction: select, rename, drag & drop, context menu
     let on_control = eye_response.clicked() || content_response.clicked();
+    // Shift or Ctrl/Cmd clicks in quick succession pick layers; only a plain double click renames
+    let modifiers = ui.input(|input| input.modifiers);
     if row.clicked() && !on_control && !renaming {
-        app.run("layer.select", json!({"layer": layer.id.0}));
+        click_layer(app, modifiers, layer.id.0, None);
     }
-    if row.double_clicked() && !on_control && !renaming && show_name {
+    if row.double_clicked() && !on_control && !renaming && show_name && !modifiers.shift && !modifiers.command {
         app.ui.rename = Some((layer.id.0, layer.name.clone()));
     }
     if row.drag_started() && !renaming {
@@ -683,7 +718,9 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
     let inside = layer.is_group()
         && ui.input(|input| input.pointer.hover_pos()).is_some_and(|pointer| (pointer.y - rect.center().y).abs() < row_height * FOLDER_DROP_ZONE);
     let shelf = row.dnd_hover_payload::<ShelfDrag>().map(|drag| drag.asset.clone());
-    let moving = row.dnd_hover_payload::<u64>().is_some_and(|dragged| *dragged != layer.id.0);
+    // Several selected layers move together, so none of them is a place to drop them
+    let in_drag = |dragged: u64| dragged == layer.id.0 || several.as_ref().is_some_and(|layers| layers.contains(&dragged));
+    let moving = row.dnd_hover_payload::<u64>().is_some_and(|dragged| !in_drag(*dragged));
     let drop_stroke = Stroke::new(DROP_LINE_WIDTH, tokens.accent);
     if moving || shelf.as_ref().is_some_and(Asset::is_material) {
         if inside {
@@ -697,9 +734,12 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         painter.rect_stroke(rect, THUMBNAIL_ROUNDING, drop_stroke, egui::StrokeKind::Inside);
     }
     if let Some(dragged) = dnd_release::<u64>(&row)
-        && *dragged != layer.id.0
+        && !in_drag(*dragged)
     {
-        app.run("layer.move", json!({"layer": *dragged, "above": layer.id.0, "inside": inside}));
+        match selection_with(app, LayerId(*dragged)) {
+            Some(layers) => app.run("layer.move", json!({"layers": layers, "above": layer.id.0, "inside": inside})),
+            None => app.run("layer.move", json!({"layer": *dragged, "above": layer.id.0, "inside": inside})),
+        };
     }
     match dnd_release::<ShelfDrag>(&row).map(|drag| drag.asset.clone()) {
         Some(Asset::Material(material)) => {
@@ -1072,14 +1112,22 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     ui.set_min_width(230.0);
     let lid = layer.id.0;
     let keymap = app.ui.keymap.clone();
+    // On one of several selected layers, remove, duplicate and group act on all of them
+    let several = selection_with(app, layer.id);
     let run = |app: &mut TextureCraftApp, ui: &mut Ui, label: &str, id: &str, p: Value, enabled: bool| {
         let mut b = egui::Button::new(label);
         if let Some(sc) = crate::keymap::shortcut_of(&keymap, id) {
             b = b.shortcut_text(sc);
         }
         if ui.add_enabled(enabled, b).clicked() {
-            app.run("layer.select", json!({"layer": lid}));
-            app.run(id, p);
+            let batch = matches!(id, "layer.remove" | "layer.duplicate" | "layer.group");
+            match several.as_ref().filter(|_| batch) {
+                Some(layers) => app.run(id, json!({"layers": layers})),
+                None => {
+                    app.run("layer.select", json!({"layer": lid}));
+                    app.run(id, p)
+                }
+            };
             ui.close();
         }
     };

@@ -18,6 +18,12 @@ effect's input), so an agent can pick its input range from the data. `effect.mov
 index}` reorders an effect within its stack (0 = bottom) and `effect.duplicate {effect}` copies
 one just above itself. `effect.copy {effect?}` and `effect.cut {effect?}` put an effect on the
 layer clipboard, and `effect.paste {layer?, target?}` adds it to another layer's content or mask.
+`layer.select {layers: [id], layer?}` selects several layers of one texture set at once (`layer`
+is the active one), and `{layer, range: true}` / `{layer, toggle: true}` do what Shift+click and
+Ctrl+click do in the Layers panel. Without `layer`, `layer.remove`, `layer.duplicate`,
+`layer.group` and `layer.visible` act on every selected layer; each of them and `layer.move
+{layers, above | index}` also take an explicit `layers` list. `session.inspect` lists the
+selection as `selectedLayers` (top row first).
 
 `effect.set {effect, filter: "blur", radius: 5}` replaces a filter in place, preserving its
 stack position, blend, opacity and visibility. Replacement filters start from defaults plus

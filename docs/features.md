@@ -36,6 +36,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   duplicate, group, flatten, cut, copy and paste across texture sets, and **geometry masks** that
   show a layer only on the mesh parts you pick (right-click a layer, or click parts with the
   **Geometry mask** tool, 8).
+- **Several layers at once:** Shift+click a layer to select the rows from the last clicked one,
+  Ctrl+click (Cmd+click on macOS) to add or take out one layer. Delete, duplicate (Ctrl+D), group
+  (Ctrl+G), the eye and drag-and-drop then act on every selected layer, each as one undo step.
 - **Filters and content effects** on any layer or mask: **31 filters** (HSL, levels,
   contrast/luminosity, color balance, gradient map, posterize, clamp, histogram scan, range and
   shift, invert, threshold, grayscale, replace color, edge detect, normal invert, baked lighting,

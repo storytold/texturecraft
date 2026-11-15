@@ -24,6 +24,7 @@ pub mod inspect;
 pub mod instance_cmds;
 pub mod layer_cmds;
 pub mod layer_ops;
+pub mod layer_selection;
 pub mod link_cmds;
 pub mod mask_cmds;
 mod mask_preview_pixel;

@@ -13,6 +13,7 @@ mod filters;
 mod generator_inputs;
 mod high_poly_missed;
 mod instances;
+mod layer_multi_select;
 mod materialcraft_link;
 mod materialx;
 mod materialx_import;

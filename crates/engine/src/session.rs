@@ -338,6 +338,9 @@ pub struct Session {
     pub active_set: usize,
     /// Selected layer per texture set.
     pub selected: BTreeMap<usize, LayerId>,
+    /// Layers selected together with the selected one (Shift+click, Ctrl+click), per texture set.
+    /// Counts only while the selected layer is the one they were picked with (see [`Session::selected_layers`]).
+    pub(crate) multi: BTreeMap<usize, crate::layer_selection::MultiSelection>,
     pub target: StackTarget,
     pub camera: OrbitCamera,
     pub view: ViewMode,
@@ -405,6 +408,7 @@ impl Session {
             tool: ToolState::default(),
             active_set: 0,
             selected,
+            multi: BTreeMap::new(),
             target: StackTarget::Content,
             camera,
             view: ViewMode::Material,

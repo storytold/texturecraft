@@ -18,6 +18,7 @@ mod filter_picker;
 mod generator_panel;
 mod history_panel;
 mod layer_clipboard;
+mod layer_multi_select;
 mod layer_rename;
 mod layers_panel;
 mod levels_editor;

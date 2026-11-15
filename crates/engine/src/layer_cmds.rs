@@ -7,6 +7,7 @@ use texturecraft_core::{BlendMode, Channel, ChannelBlend, EffectKind, Fill, Laye
 use crate::commands::{
     CommandSpec, always, bad, blend_param, boolp, channel_param, color_param, content_param, f32p, has_layer, layer_param, normal_format_param, strp, u64p,
 };
+use crate::layer_selection::{batch_param, ids_json};
 use crate::{EngineError, Result, Session, cmd, session::StackTarget};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -14,13 +15,29 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("layer.add.paint", "Add paint layer", ["Layers"], None, "{name?}", always, add_paint),
         cmd!("layer.add.fill", "Add fill layer", ["Layers"], None, "{name?, color?, roughness?, metallic?}", always, add_fill),
         cmd!("layer.add.group", "Add folder", ["Layers"], None, "{name?}", always, add_group),
-        cmd!("layer.remove", "Remove layer(s)", ["Layers"], Some("Delete"), "{layer?}", has_layer, remove),
-        cmd!("layer.duplicate", "Duplicate layer(s)", ["Layers"], Some("Ctrl+D"), "{layer?}", has_layer, duplicate),
-        cmd!("layer.group", "Group layer(s)", ["Layers"], Some("Ctrl+G"), "{layer?}", has_layer, group),
-        cmd!("layer.select", "Select layer", [], None, "{layer, target?: content|mask|<effect id>}", always, select),
+        cmd!("layer.remove", "Remove layer(s)", ["Layers"], Some("Delete"), "{layer? | layers?: [id]} — default: every selected layer", has_layer, remove),
+        cmd!("layer.duplicate", "Duplicate layer(s)", ["Layers"], Some("Ctrl+D"), "{layer? | layers?: [id]} — default: every selected layer", has_layer, duplicate),
+        cmd!("layer.group", "Group layer(s)", ["Layers"], Some("Ctrl+G"), "{layer? | layers?: [id]} — default: every selected layer", has_layer, group),
+        cmd!(
+            "layer.select",
+            "Select layer",
+            [],
+            None,
+            "{layer, target?: content|mask|<effect id>} | {layer, toggle: true} (Ctrl+click: add or take out one layer) | {layer, range: true} (Shift+click: the rows from the last clicked layer) | {layers: [id], layer?} (select several; `layer` is the active one)",
+            always,
+            select
+        ),
         cmd!("layer.rename", "Rename layer", [], None, "{layer?, name}", has_layer, rename),
-        cmd!("layer.visible", "Toggle layer visibility", [], None, "{layer?, visible?}", has_layer, visible),
-        cmd!("layer.move", "Move layer", [], None, "{layer?, index?} | {layer?, above?: id|null, inside?: bool} | {layer?, delta: ±n}", has_layer, move_layer),
+        cmd!("layer.visible", "Toggle layer visibility", [], None, "{layer? | layers?: [id], visible?} — default: every selected layer", has_layer, visible),
+        cmd!(
+            "layer.move",
+            "Move layer",
+            [],
+            None,
+            "{layer? | layers?: [id], index?} | {layer? | layers?: [id], above?: id|null, inside?: bool} | {layer?, delta: ±n}",
+            has_layer,
+            move_layer
+        ),
         cmd!("layer.blend", "Set channel blending", [], None, "{layer?, channel?: id|all, mode?, opacity?: 0..1, enabled?}", has_layer, blend),
         cmd!(
             "layer.fill.set",
@@ -110,45 +127,59 @@ fn add_group(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, "layer.remove", p)?;
+    let ids = batch_param(s, "layer.remove", p, true)?;
     let before = s.doc.clone();
     let removed = s.edit("Remove layer", |s| {
-        let (ts, parent, i) = s.doc.project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
-        let removed = s.doc.project.remove_layer(id)?;
+        let mut removed = Vec::new();
+        // Top row first, so the layer under the lowest removed one is never removed after it is chosen
+        for id in &ids {
+            let (ts, parent, i) = s.doc.project.locate(*id).ok_or(EngineError::Other("layer not in a stack".into()))?;
+            removed.extend(s.doc.project.remove_layer(*id)?);
+            // Select the layer below (or above) the removed one.
+            let list = match parent {
+                Some(g) => s.doc.project.layer(g).map(|l| l.children().to_vec()).unwrap_or_default(),
+                None => s.doc.project.texture_set(ts).map(|t| t.stack.clone()).unwrap_or_default(),
+            };
+            let next = list.get(i.saturating_sub(1)).or(list.first()).copied().or(parent);
+            match next {
+                Some(n) => s.selected.insert(ts, n),
+                None => s.selected.remove(&ts),
+            };
+            s.multi.remove(&ts);
+        }
         // Instances of what was removed keep their look as independent layers.
         crate::instance_cmds::detach_orphans(s, &before)?;
-        // Select the layer below (or above) the removed one.
-        let list = match parent {
-            Some(g) => s.doc.project.layer(g).map(|l| l.children().to_vec()).unwrap_or_default(),
-            None => s.doc.project.texture_set(ts).map(|t| t.stack.clone()).unwrap_or_default(),
-        };
-        let next = list.get(i.saturating_sub(1)).or(list.first()).copied().or(parent);
-        match next {
-            Some(n) => s.selected.insert(ts, n),
-            None => s.selected.remove(&ts),
-        };
         Ok(removed)
     })?;
     Ok(json!({ "removed": removed.iter().map(|l| l.0).collect::<Vec<_>>() }))
 }
 
 fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, "layer.duplicate", p)?;
-    let (ts, _, _) = s.doc.project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
+    let ids = batch_param(s, "layer.duplicate", p, true)?;
+    let first = ids.first().copied().ok_or_else(|| bad("layer.duplicate", "no layer to duplicate"))?;
+    let (ts, _, _) = s.doc.project.locate(first).ok_or(EngineError::Other("layer not in a stack".into()))?;
     let src = s.doc.clone();
-    let new = s.edit("Duplicate layer", |s| {
-        let new = crate::layer_ops::copy_tree(&src, id, &mut s.doc, ts, Some(id), false, 0)?;
-        let name = format!("{} copy", src.project.layer(id)?.name);
-        s.doc.project.layer_mut(new)?.name = name;
-        Ok(new)
+    let copies = s.edit("Duplicate layer", |s| {
+        let mut copies = Vec::new();
+        for id in &ids {
+            let new = crate::layer_ops::copy_tree(&src, *id, &mut s.doc, ts, Some(*id), false, 0)?;
+            let name = format!("{} copy", src.project.layer(*id)?.name);
+            s.doc.project.layer_mut(new)?.name = name;
+            copies.push(new);
+        }
+        Ok(copies)
     })?;
-    s.selected.insert(ts, new);
-    Ok(json!({ "layer": new.0 }))
+    // The copies are selected; the active layer's copy stays the active one
+    let active = s.selected.get(&ts).and_then(|active| ids.iter().position(|id| id == active)).and_then(|i| copies.get(i)).or(copies.first()).copied().unwrap_or(first);
+    s.select_several(ts, active, active, copies.clone());
+    Ok(json!({ "layer": active.0, "layers": ids_json(&copies) }))
 }
 
 fn group(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, "layer.group", p)?;
+    let ids = batch_param(s, "layer.group", p, true)?;
     let g = s.edit("Group layers", |s| {
+        // The folder takes the top layer's place; the others follow it in, keeping their order
+        let id = ids.first().copied().ok_or_else(|| bad("layer.group", "no layer to group"))?;
         let (ts, _, _) = s.doc.project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
         let gid = s.doc.project.alloc_id();
         let name = s.doc.project.next_layer_name(ts, "Folder");
@@ -158,14 +189,18 @@ fn group(s: &mut Session, p: &Value) -> Result<Value> {
             b.mode = BlendMode::Passthrough;
         }
         s.doc.project.insert_layer(ts, gl, Some(id), false)?;
-        s.doc.project.move_above(id, Some(gid), true)?;
+        move_stacked(s, &ids, Some(gid), true)?;
         s.selected.insert(ts, gid);
+        s.multi.remove(&ts);
         Ok(gid)
     })?;
     Ok(json!({ "layer": g.0 }))
 }
 
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("layers").is_some() {
+        return crate::layer_selection::select_list(s, p);
+    }
     let id = layer_param(s, "layer.select", p)?;
     let (ts, _, _) = s.doc.project.locate(id).ok_or_else(|| bad("layer.select", "layer not in a stack"))?;
 
@@ -174,8 +209,19 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
         s.finish_path()?;
     }
 
+    // Shift+click and Ctrl/Cmd+click select several layers, each on its content
+    let range = boolp(p, "range") == Some(true);
+    if range || boolp(p, "toggle") == Some(true) {
+        s.active_set = ts;
+        let active = crate::layer_selection::extend(s, ts, id, range);
+        s.target = StackTarget::Content;
+        s.revision = s.revision.wrapping_add(1);
+        return Ok(json!({ "layer": active.0, "textureSet": ts, "layers": ids_json(&s.selected_layers()) }));
+    }
+
     s.active_set = ts;
     s.selected.insert(ts, id);
+    s.multi.remove(&ts);
     s.target = match p.get("target") {
         Some(Value::String(t)) if t == "mask" => {
             if s.doc.project.layer(s.doc.project.mask_owner(id))?.mask.is_none() {
@@ -192,7 +238,7 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
     };
 
     s.revision = s.revision.wrapping_add(1);
-    Ok(json!({ "layer": id.0, "textureSet": ts }))
+    Ok(json!({ "layer": id.0, "textureSet": ts, "layers": [id.0] }))
 }
 
 fn rename(s: &mut Session, p: &Value) -> Result<Value> {
@@ -209,16 +255,58 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn visible(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, "layer.visible", p)?;
+    let ids = batch_param(s, "layer.visible", p, false)?;
+    // Without `visible`, every layer takes the opposite of the active one's (or the top one's)
+    let lead = s.selected_layer().filter(|active| ids.contains(active)).or(ids.first().copied()).ok_or_else(|| bad("layer.visible", "no layer given"))?;
     let v = s.edit("Layer visibility", |s| {
-        let l = s.doc.project.layer_mut(id)?;
-        l.visible = boolp(p, "visible").unwrap_or(!l.visible);
-        Ok(l.visible)
+        let v = boolp(p, "visible").unwrap_or(!s.doc.project.layer(lead)?.visible);
+        for id in &ids {
+            s.doc.project.layer_mut(*id)?.visible = v;
+        }
+        Ok(v)
     })?;
     Ok(json!({ "visible": v }))
 }
 
+/// Move `ids` (top row first) above `target` (inside it when `inside`), keeping their order:
+/// the lowest goes first and each next one above it.
+fn move_stacked(s: &mut Session, ids: &[LayerId], target: Option<LayerId>, inside: bool) -> Result<()> {
+    let (mut target, mut inside) = (target, inside);
+    for id in ids.iter().rev() {
+        s.doc.project.move_above(*id, target, inside)?;
+        (target, inside) = (Some(*id), false);
+    }
+    Ok(())
+}
+
+/// `layer.move {layers, index | above}`: the listed layers move together, keeping their order.
+fn move_layers(s: &mut Session, p: &Value) -> Result<Value> {
+    let ids = batch_param(s, "layer.move", p, true)?;
+    s.edit("Move layer", |s| {
+        if let Some(i) = u64p(p, "index") {
+            // Top row first: each next one lands under the one before
+            let to = usize::try_from(i).unwrap_or(usize::MAX);
+            for id in &ids {
+                s.doc.project.move_layer(*id, to)?;
+            }
+        } else if p.get("above").is_some() {
+            let above = u64p(p, "above").map(LayerId);
+            if above.is_some_and(|above| ids.contains(&above)) {
+                return Err(bad("layer.move", "`above` is one of the moved layers"));
+            }
+            move_stacked(s, &ids, above, boolp(p, "inside").unwrap_or(false))?;
+        } else {
+            return Err(bad("layer.move", "give `index` or `above` with `layers`"));
+        }
+        Ok(())
+    })?;
+    Ok(Value::Null)
+}
+
 fn move_layer(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("layers").is_some() {
+        return move_layers(s, p);
+    }
     let id = layer_param(s, "layer.move", p)?;
     s.edit("Move layer", |s| {
         if let Some(d) = p.get("delta").and_then(Value::as_i64) {
