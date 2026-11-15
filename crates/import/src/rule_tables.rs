@@ -1,4 +1,4 @@
-//! Runners for the rule tables in `crates/import/tests/rules/` (see the README there): each table holds a measured
+//! Runners for the rule tables in `crates/import/tests/rules/` (see "Rule tables" in `docs/import.md`): each table holds a measured
 //! rule as plain numbers, inputs and expected outputs, so another implementation can run the same data. The runners
 //! here run the blend tables against TextureCraft's measured blend rules ([`BlendRules::Measured`]) through the
 //! import's blend table. Run them with `cargo test -p texturecraft-import --lib rule_table_`.

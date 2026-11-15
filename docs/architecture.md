@@ -62,10 +62,7 @@ covered texel it walks the stack bottom to top: paint layers are unpremultiplied
 (value, coverage) tiles, fill layers evaluate uniform values, procedurals (through UV, tri-planar,
 planar, spherical or cylindrical projections) or image resources; masks evaluate their effect
 stack (painted bitmaps, fills, mesh-map generators, levels, filters, ID color selection,
-compare). Imported fills can carry a placed projection (`core::PlacedProjection`, evaluated by `compose::placed`):
-a volume placed, turned and sized in the scene's bounding box, the image's placement in it, repetition per image
-axis, the tri-planar blend curve, depth and facing falloffs, cylinder coverage, a Bézier warp grid, and a per-texel
-anisotropic prefilter of graph outputs; TextureCraft's own projections are left as they are. A layer's geometry mask (mesh part names) zeroes its mask on texels whose triangle, from
+compare); a layer's geometry mask (mesh part names) zeroes its mask on texels whose triangle, from
 the UV G-buffer, lies in another part; each enabled channel blends with its mode and opacity. Only
 dirty tiles are recomposited
 (a stroke dirties the tiles it touches), then padded, converted to display formats and uploaded to
@@ -74,14 +71,6 @@ the GPU.
 The CPU compositor is the reference for everything users see and export. Export
 (`formats::export`) reads the same composite, adds height-to-normal (Sobel) combined with the
 normal channel and baked normals by reoriented normal mapping, and packs channels per preset.
-
-A project's compositing rules (`core::rules::CompositeRules`, `Project::rules`) default to TextureCraft's own and
-are then left out of the project file. An imported project switches on the rules measured from the reference app's
-renders: measured blend formulas, the blended value clamped to 0..1 before the opacity on channels that store 0..1, a
-layer's mode applying only where something is below (the stack carries coverage), folders that do not pass through
-composited on their own, and the exported normal derived from height with the document's filter (Sobel or backward
-differences) at the measured slope, laid onto the baked normal before the normal channel. Such a project is
-composited without the stack cache below the edited layer (it keeps no coverage).
 
 ### Layer-panel thumbnails
 
@@ -140,94 +129,6 @@ values, the texture set's resolution and its baked mesh maps (`LinkJob::run`, on
 in the UI). Every cook stores its maps under fresh resource names, so undo, redo and the decoded
 image cache never disagree. The apps share the file format and the command line, never code.
 
-## Locked layers and imported projects
-
-A layer can carry a `core::Lock` (a source and reasons): its content stands for something TextureCraft
-cannot compute or edit yet, such as a layer converted from another application's project. Every
-`Session::edit` compares the document before and after (`engine::lock_cmds`) and refuses an edit that
-changed a locked layer's content (fill, pixels, mask, effects, height or geometry mask); painting is
-refused before the stroke starts. Visibility, name, color tag, position, deletion, channel blending
-and opacity and the mask switch stay editable, and `layer.unlock` removes the lock as an undoable step.
-Placeholder effects (`EffectKind::Placeholder`) stand for imported effects that cannot be computed:
-they composite as identity and cannot be edited. A converted project keeps a `core::ImportReport`
-(fidelity per item and per layer, safety-net flags, layer roles such as the original's stored
-result), shown by `project.inspect` with every lock and placeholder.
-
-`file.importProject` (`engine::import_cmds`, CLI `texturecraft-cli import`) converts a project file of the
-reference app one way: `import-reader` reads it, `import` maps it onto the model (layers, folders, fills,
-masks, levels, blend modes, geometry masks, baked maps, bake settings) and composites every texture set
-with `compose` to compare it with the file's stored result. The file's compiled graphs are decompiled
-(`import-reader`) and run by the graph runtime (`texturecraft-graph`): procedural and material fills become graph
-sources (`Source::Graph`), mask generators and filters graph effects (`EffectKind::Graph`), each a `GraphRef` naming
-its graph text by key with the file's values and input bindings. A use that cannot be fed stays a placeholder locked
-with the key `graph:<name>` (or its input's blocker); `graphs: "keep"` keeps every use a placeholder. Brush strokes are replayed with TextureCraft's own brush: the translator (L2,
-without `paint`) rasterises nothing but hands replay jobs (stroke records, the brush mapped with the measured rules,
-tip or a dynamic alpha's stamps, stencil, camera, symmetry, seed, and the layer, content effect or mask effect painted) to a `StrokeReplayer`, which the
-engine implements with `paint` (`engine::import_replay`) and passes in through the import's hooks; the import calls
-it per texture set before the safety net measures. The brush draws each stroke's jitter from its seed as the
-file's app does, and lays strokes through their stencil on the view; path strokes (curves on the mesh) are walked by their
-length in the mesh's space (`paint::path::SpaceCurve`), and ribbon brushes lay their tip along them as a band
-(`paint::ribbon`); particle brushes lay the dabs of a small simulation per stroke (`paint::particles::simulate`,
-the receiver's numbers read by `import::replay::particles`). Brushes painting an image or a compiled graph paint it per texel (the graph a fill of it runs,
-rendered before the replay with the import's cooks; `paint::commit::commit_layer_texels`), read along paths and ribbons
-at each texel's place on the band. Replayed strokes become approximated pixels, not locked; strokes
-the brush cannot replay yet (smudge or projection along path strokes, graph tips the project does not hold, an eraser above other content effects) stay
-placeholders locked with a `brush:<what>` or `brush-alpha:<graph>` key, and with replay switched off with
-`strokes:<tool>`. The
-stored result itself becomes a locked "Original result" paint layer, hidden as a reference unless the
-import is asked to show it; asked for a correction (`originalCorrection`), the import also puts a locked "Correction to
-original" paint layer on top of a set's layers that holds the stored result only on the texels the layers miss. Polygon
-fills in masks are kept by the file as hits (clicks and rectangles with their camera), not triangles: the import resolves
-them on the set's mesh (`import::polygon_fill`) and lays the picked triangles into a mask paint effect, as TextureCraft's
-polygon fill tool does. The mesh is kept as binary glTF; nothing else of the original file is kept. User channels 0–7 map
-onto TextureCraft's user channels with their names (later ones, which the file numbers past the
-eighth, are reported). A set the original paints per UV tile imports as one texture over UV 0..1 with a
-note in the report: where the file keeps each tile's pixels has not been seen yet.
-
-The import runs as an `engine::import_cmds::ImportTask` reporting to an `ImportProgress`: a fraction, the step (reading
-the file; per texture set converting, replaying strokes and cooking graphs; saving; for the desktop app also computing
-the view, the first composite of the converted project, so that it opens with nothing left to composite and that
-composite never holds up the window) and a cancel flag. Inside a long step the bar moves by the work done: layers
-translated, strokes laid, graphs cooked (a running render by its nodes) against the graphs the stack runs, tiles
-composited. The flag is checked
-between steps, texture sets and strokes, and the imported project's graph store renders under it, so a graph render in
-progress stops at its next node. The command runs the task in one go; the desktop app (File › Import project..., or
-opening or dropping such a file) shows exactly two windows (`ui-egui::import_ui`): a notice that must be acknowledged,
-then the progress (bar, step, elapsed time, Cancel) with the task on a worker thread, which opens the converted project
-or turns into the error view (one sentence, "Copy details" with the version, step and error, the issue link, Close).
-Called through the control channel or MCP, the command opens no window.
-
-## Graph sources and cooked results
-
-`compose::graphs` evaluates graph references. A document's `GraphStore` holds the graph texts by key and the cooks:
-one render of a graph for one texture set, every output it keeps as 16-bit tiles. A cook's key covers the graph text,
-the evaluator versions of the node kinds it uses, its values, seed and inputs (baked maps and images by content,
-nested graphs the same way, a filter's input pixels) and the render side, but not the compiler (renders are the same
-bits everywhere), so a stored cook stays valid across builds. Graphs reading nothing of the stack are cooked before the
-tiles composite and sampled like images; graphs reading the stack below or an anchor run as whole-set neighbourhood
-fields. Renders run on the graph runtime's own thread pool, and no compositor thread waits for a render held further
-down its own stack (`compose::graphs::once`). The `.tcraft` file stores the texts (`graphs/<key>.txt`) and the cooks
-the last composite read (`cooked/`), so a converted project opens without rendering its graphs; a use whose key no
-longer matches is rendered again alone, and one that cannot be keeps its last pixels, flagged in `project.inspect`.
-
-An import also keeps the stroke records behind the pixels it replayed (`core::strokes`, one `strokes/<id>.bin` entry
-per paint layer or paint effect, written by `formats::project_file::strokes`): each replay job as the replayer reads it
-(pen points, camera, seed, symmetry, the mapped brush and tip, a particle brush's simulation settings, the values laid), so `Session::replay_stroke_record`
-lays the strokes again from the saved project alone, to the same pixels. Images a brush paints are not kept (that step
-cannot be laid again); graphs it paints are kept by reference, their texts saved with the project. A record that cannot
-be read stays as its bytes and is saved unchanged; older builds skip the entries.
-
-Across documents, an import can also keep its cooks in a result cache folder (`resultCache`, CLI
-`--result-cache`; native builds only): the graph store looks there by cook key before rendering and puts each
-finished render there (`compose::graphs::kept`, a `KeptCooks` the engine backs with `texturecraft-result-cache`,
-L0: entries checked by key, length and checksum, the folder kept under a limit, least recently used out first).
-A second import of the same project, or of another one using the same graph the same way, reads the render.
-
-`import.library.list` and `import.library.add` (`engine::import_library_cmds`, over `import::library`) offer what
-a project file brings for the user's asset library (brushes, bitmap alphas, stencils, textures, the environment
-map) with its origin and whether it may be shared; brushes are added as `.tcbrush` presets in the data folder's
-`brushes/`. The other kinds have no place in the library yet and are only listed.
-
 ## Commands and automation
 
 Every action is a `CommandSpec` in `engine::commands` (id, label, menu path, shortcut, params doc,
@@ -235,3 +136,5 @@ enabled predicate, run). The menus, shortcuts, the desktop app's control channel
 (`--control <port>`), the CLI and the MCP server all execute commands by id, so an agent can do
 anything a user can and verify it through `project.inspect`. See
 [`control-protocol.md`](control-protocol.md).
+
+The project import (crates `import-reader`, `import`, `graph`) is described in [`import.md`](import.md).

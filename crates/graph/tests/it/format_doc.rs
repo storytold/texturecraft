@@ -1,8 +1,8 @@
-//! `docs/graph-format.md` stays in step with the runtime: its example parses and renders, and it lists every node kind.
+//! `docs/import.md` stays in step with the runtime: its example parses and renders, and it lists every node kind.
 
 use texturecraft_graph::graph::{self, Graph};
 
-const DOC: &str = include_str!("../../../../docs/graph-format.md");
+const DOC: &str = include_str!("../../../../docs/import.md");
 
 #[test]
 fn the_example_renders() {
@@ -24,5 +24,5 @@ fn every_node_kind_is_listed() {
         .chain(texturecraft_graph::fxmap::FXM_SPECS)
         .chain(texturecraft_graph::patterns::SPECS);
     let missing: Vec<&str> = all.map(|s| s.kind).filter(|k| !DOC.contains(&format!("| `{k}` |"))).collect();
-    assert!(missing.is_empty(), "docs/graph-format.md does not list {missing:?}");
+    assert!(missing.is_empty(), "docs/import.md does not list {missing:?}");
 }
