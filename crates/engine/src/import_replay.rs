@@ -286,7 +286,8 @@ fn view_stencil(stencil: &ReplayStencil) -> Result<ViewStencil, String> {
 enum OnView<'a> {
     /// Through the recorded camera (view times projection).
     Mesh(&'a SetMesh, Mat4),
-    /// The 2D view: the texture spans the view.
+    /// The 2D view: the place is the texel's texture coordinates, 0..1 with V up, which `projMatrix` maps onto its
+    /// image (a 2D-view dab of an image brush lands its centre on the image's centre; measured on a feather card).
     Texture(f32),
 }
 
@@ -298,7 +299,8 @@ impl OnView<'_> {
         }
     }
 
-    /// Texel `(x, y)` on the view in normalised device coordinates (y up); `None` off the set or behind the camera.
+    /// Texel `(x, y)` on the view (y up): normalised device coordinates through a camera, texture coordinates in the 2D
+    /// view; `None` off the set or behind the camera.
     fn at(&self, x: u32, y: u32) -> Option<Vec2> {
         match self {
             OnView::Mesh(set, view_projection) => {
@@ -306,7 +308,7 @@ impl OnView<'_> {
                 let clip = *view_projection * surface.pos.extend(1.0);
                 (clip.w > 1e-6).then(|| Vec2::new(clip.x / clip.w, clip.y / clip.w))
             }
-            OnView::Texture(r) => Some(Vec2::new((x as f32 + 0.5) / r * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / r * 2.0)),
+            OnView::Texture(r) => Some(Vec2::new((x as f32 + 0.5) / r, 1.0 - (y as f32 + 0.5) / r)),
         }
     }
 }

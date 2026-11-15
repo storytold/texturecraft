@@ -12,6 +12,15 @@ use super::*;
 
 const RES: u32 = 128;
 
+/// `ndc` (a placement from the view's normalised device coordinates) as the stroke's view takes it: the 2D view places
+/// by texture coordinates (0..1, V up), so the matrix is composed with texture coordinates → device coordinates.
+fn on_view(space: &StrokeSpace, ndc: [f32; 9]) -> [f32; 9] {
+    match space {
+        StrokeSpace::Uv => (Mat3::from_cols_array(&ndc) * Mat3::from_cols_array(&[2.0, 0.0, 0.0, 0.0, 2.0, 0.0, -1.0, -1.0, 1.0])).to_cols_array(),
+        StrokeSpace::Mesh { .. } => ndc,
+    }
+}
+
 /// A 2 × 2 wall at z = 0 facing +z; texture coordinates from its corners, the top row up.
 fn wall() -> Mesh {
     let mut m = primitives::plane(2.0, 16);
@@ -295,8 +304,8 @@ fn a_stencil_limits_the_stroke_on_its_view() {
         matrix: [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0],
     };
     for (space, points) in [(StrokeSpace::Uv, [[0.2, 0.5], [0.8, 0.5]]), (camera(Vec3::Y), [[-0.3, 0.0], [0.3, 0.0]])] {
-        let mut s = step(PaintMode::Paint, vec![stroke(space, &points)]);
-        s.stencil = Some(stencil.clone());
+        let mut s = step(PaintMode::Paint, vec![stroke(space.clone(), &points)]);
+        s.stencil = Some(ReplayStencil { matrix: on_view(&space, stencil.matrix), ..stencil.clone() });
         let out = replay(&mesh, &[job_of(s)]);
         let line = row(&out[0], RES / 2);
         assert!(line[40] > 0.95, "painted through the white half: {}", line[40]);
@@ -388,7 +397,7 @@ fn projection_painting_lays_its_image_grey_on_the_view() {
     };
     for (space, points) in [(StrokeSpace::Uv, [[0.2, 0.5], [0.8, 0.5]]), (camera(Vec3::Y), [[-0.3, 0.0], [0.3, 0.0]])] {
         let mut s = step(PaintMode::Paint, vec![stroke(space.clone(), &points)]);
-        s.projection = Some(image.clone());
+        s.projection = Some(ReplayStencil { matrix: on_view(&space, image.matrix), ..image.clone() });
         let out = replay(&mesh, &[job_of(s)]);
         let (white, black) = (mask_at(&out[0], 40, RES / 2), mask_at(&out[0], RES - 40, RES / 2));
         assert!(white.1 > 0.95 && (white.0 - white.1).abs() < 0.01, "{space:?}: the image's white: {white:?}");
@@ -649,14 +658,36 @@ fn projection_painting_on_content_lays_each_channels_source_on_the_view() {
     // the image spans the view, its left half dark: in the 2D view the texture's left, in the 3D view the wall's left
     for (space, points) in [(StrokeSpace::Uv, [[0.2, 0.5], [0.8, 0.5]]), (camera(Vec3::Y), [[-0.3, 0.0], [0.3, 0.0]])] {
         let mut s = step(PaintMode::Paint, vec![stroke(space.clone(), &points)]);
-        s.placed = Some([0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0]);
+        s.placed = Some(on_view(&space, [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5, 0.5, 1.0]));
         let out = replay(&mesh, &[source_job(s.clone(), image_source(halves))]);
         let (dark, bright) = (roughness_at(&out[0], 40, RES / 2), roughness_at(&out[0], RES - 40, RES / 2));
         assert!(dark.1 > 0.95 && (dark.0 - 0.2).abs() < 0.02, "{space:?}: {dark:?}");
         assert!(bright.1 > 0.95 && (bright.0 - 0.8).abs() < 0.02, "{space:?}: {bright:?}");
         // an image placed on the view's right half only: nothing on its left
-        s.placed = Some([0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 1.0]);
+        s.placed = Some(on_view(&space, [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 1.0]));
         let out = replay(&mesh, &[source_job(s, image_source(halves))]);
         assert_eq!(roughness_at(&out[0], 40, RES / 2).1, 0.0, "{space:?}");
     }
+}
+
+#[test]
+fn a_2d_view_image_dab_lands_on_its_image_centre_through_the_recorded_matrix() {
+    // the feather card of a real project: one 2D-view dab at (0.663, 0.714) (texture coordinates, V up) with this
+    // `projMatrix`; the reference app shows the whole feather centred on the dab
+    let matrix = [-1.5838053, 1.3170246, 0.0, -1.3170246, -1.5838053, 0.0, 2.4961915, 0.7766184, 1.0];
+    let centre = Mat3::from_cols_array(&matrix) * Vec3::new(0.66268516, 0.71387213, 1.0);
+    assert!((centre.x - 0.5).abs() < 0.01 && (centre.y - 0.5).abs() < 0.03, "{centre}");
+    // replayed: the texel under a dab at the texture's centre reads the image's centre (an identity placement), and
+    // an image placed on the texture's right half leaves its left half unpainted
+    let mesh = wall();
+    let mut s = step(PaintMode::Paint, vec![stroke(StrokeSpace::Uv, &[[0.5, 0.5]])]);
+    s.brush = brush(0.6);
+    s.placed = Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    let out = replay(&mesh, &[source_job(s.clone(), image_source(halves))]);
+    let (left, right) = (roughness_at(&out[0], RES / 2 - 8, RES / 2), roughness_at(&out[0], RES / 2 + 8, RES / 2));
+    assert!((left.0 - 0.2).abs() < 0.02 && (right.0 - 0.8).abs() < 0.02, "{left:?} {right:?}");
+    s.placed = Some([2.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0, 1.0]);
+    let out = replay(&mesh, &[source_job(s, image_source(halves))]);
+    assert_eq!(roughness_at(&out[0], RES / 2 - 8, RES / 2).1, 0.0);
+    assert!(roughness_at(&out[0], RES / 2 + 8, RES / 2).1 > 0.5);
 }

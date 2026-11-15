@@ -23,7 +23,7 @@
 //! | anchors' `size` | the pen's pressure along a path, linear between anchors |
 //! | `upVector` | where an unturned tip's top points along a path (Inferred) |
 //! | ribbon brush (`width`, `tilingMode`, `stretchGuides`, `aspectRatioFactor`, `projectionDepthRatio`) | the tip laid along each path as a band ([`ReplayRibbon`]) |
-//! | `sourceColor` bitmap or graph | painted per texel ([`super::source`]): laid on texel for texel, read along paths and ribbons |
+//! | `sourceColor` bitmap or graph | painted per texel ([`super::source`]): a brush painting only images places them on the view by `projMatrix` as projection painting does (measured on a 2D-view dab); a graph laid on texel for texel; both read along paths and ribbons |
 //! | black uniform alpha over a material with a coverage output, on paths | a full square tip: the material's coverage is the shape |
 //! | particle brush (`urlEmitter`, `urlReceiver`, `tweaksEmitter`, `tweaksReceiver`, `deltaTime`) | dabs of a simulation per stroke ([`super::particles`], approximated) |
 //! | `stampBlendingMode` ≠ 0, `aspectRatio` ≠ 1, other `alignment` | approximated (noted) |
@@ -68,6 +68,8 @@ pub const GRAPH_TEXELS: &str = "brush source graph laid on texel for texel";
 pub const IMAGE_TEXELS: &str = "brush source image laid on texel for texel";
 /// The note a projection step on content carries.
 pub const PROJECTED: &str = "projection painting on a paint layer placed as in masks";
+/// The note a brush painting images carries: its images are placed on the view by `projMatrix`.
+pub const IMAGE_PLACED: &str = "brush source image placed on the view";
 /// The note a step painting an image or a graph along paths carries.
 pub const SOURCE_ALONG: &str = "brush source read along the paths";
 
@@ -175,7 +177,7 @@ pub fn step(
         (PaintTool::Projection, Some(source), StepTarget::Mask) => Some(ReplayStencil { image: tip::stencil(source, images, graphs)?, matrix }),
         _ => None,
     };
-    let placed = (effect.tool == PaintTool::Projection && target == StepTarget::Content).then_some(matrix);
+    let placed = placement(effect.tool, target, &sources, matrix);
     let mut strokes: Vec<ReplayStroke> =
         effect.strokes.iter().filter_map(|s| stroke(s, brush.size_pressure.is_some() || brush.flow_pressure.is_some())).collect();
     if mode == PaintMode::Smudge && strokes.iter().any(|s| s.copies > 0) {
@@ -203,7 +205,7 @@ pub fn step(
             _ => graph = true,
         }
     }
-    if !strokes.is_empty() && effect.tool != PaintTool::Projection {
+    if !strokes.is_empty() && placed.is_none() {
         notes.extend(graph.then(|| GRAPH_TEXELS.to_string()));
         notes.extend(image.then(|| IMAGE_TEXELS.to_string()));
     }
@@ -217,9 +219,25 @@ pub fn step(
     });
     let opacity = if effect.opacity.is_finite() { effect.opacity.clamp(0.0, 1.0) } else { 1.0 };
     if placed.is_some() {
-        notes.push(PROJECTED.to_string());
+        notes.push(if effect.tool == PaintTool::Projection { PROJECTED } else { IMAGE_PLACED }.to_string());
     }
     Ok(ReplayStep { mode, values, sources, mask_value, mask_source, opacity, brush, stencil, projection, placed, strokes, paths, ribbon, particles, notes })
+}
+
+/// Where content sources are read on the stroke's view through `matrix` (`projMatrix`) instead of texel for texel:
+/// projection painting, and a brush painting images only (a bitmap material is placed on the view as the projected
+/// image is: a single 2D-view dab of an image brush lands its centre on the image's centre through `projMatrix`,
+/// measured on a feather card). A brush painting a graph keeps laying it texel for texel.
+pub(super) fn placement(tool: PaintTool, target: StepTarget, sources: &[(Channel, ReplaySource, f32)], matrix: [f32; 9]) -> Option<[f32; 9]> {
+    if target != StepTarget::Content {
+        return None;
+    }
+    let images_only = !sources.is_empty() && sources.iter().all(|(_, s, _)| matches!(s, ReplaySource::Texels(t) if matches!(**t, ReplayTexels::Image(_))));
+    match tool {
+        PaintTool::Projection => Some(matrix),
+        PaintTool::Brush if images_only => Some(matrix),
+        _ => None,
+    }
 }
 
 /// A full square tip where a path brush paints a material with a coverage output under a black uniform alpha: the

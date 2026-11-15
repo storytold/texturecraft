@@ -642,3 +642,21 @@ fn particle_speeds_in_the_imported_files_units_shrink_by_its_radius() {
     particles::in_file_units(&mut jobs, None);
     assert_eq!(jobs[0].steps[0].particles.unwrap().speed, 0.25);
 }
+
+#[test]
+fn a_brush_painting_images_only_places_them_on_the_view() {
+    let image = || {
+        let res = texturecraft_compose::ImageRes { width: 1, height: 1, rgba: vec![[0.5; 4]], srgb: false };
+        ReplaySource::Texels(Arc::new(ReplayTexels::Image(Arc::new(res))))
+    };
+    let m = [2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.25, 0.0, 1.0];
+    let images = vec![(Channel::BaseColor, image(), 1.0), (Channel::Normal, image(), 1.0)];
+    assert_eq!(brush::placement(PaintTool::Brush, StepTarget::Content, &images, m), Some(m));
+    // a graph among them, no source, a mask or another tool: laid texel for texel as before
+    let mixed = vec![(Channel::BaseColor, image(), 1.0), (Channel::Roughness, ReplaySource::Failed("x".into()), 1.0)];
+    assert_eq!(brush::placement(PaintTool::Brush, StepTarget::Content, &mixed, m), None);
+    assert_eq!(brush::placement(PaintTool::Brush, StepTarget::Content, &[], m), None);
+    assert_eq!(brush::placement(PaintTool::Brush, StepTarget::Mask, &images, m), None);
+    assert_eq!(brush::placement(PaintTool::Eraser, StepTarget::Content, &images, m), None);
+    assert_eq!(brush::placement(PaintTool::Projection, StepTarget::Content, &[], m), Some(m));
+}
