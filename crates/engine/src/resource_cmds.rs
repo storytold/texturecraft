@@ -38,7 +38,7 @@ pub(crate) fn decoded(d: texturecraft_formats::DecodedImage) -> Arc<ImageRes> {
 impl Session {
     /// Add an image resource from bytes (one undo step); returns its unique, sanitized name
     pub fn import_resource_bytes(&mut self, file_name: &str, bytes: Vec<u8>) -> Result<String> {
-        self.edit("Import resource", |s| s.add_image_resource(file_name, bytes, u64::MAX))
+        self.edit("Import resource", |session| session.add_image_resource(file_name, bytes, texturecraft_formats::MAX_RESOURCE_TEXELS))
     }
 
     /// Add an image within a decoded texel budget, inside the caller's edit
@@ -47,18 +47,19 @@ impl Session {
             return Err(EngineError::Other(format!("{file_name} is larger than {} MB", MAX_BYTES >> 20)));
         }
 
-        let image = texturecraft_formats::decode_image_within(&bytes, max_texels).map_err(|e| EngineError::Other(format!("{file_name}: {e}")))?;
-        let leaf = std::path::Path::new(file_name).file_name().and_then(|n| n.to_str()).unwrap_or("image");
+        let image = texturecraft_formats::decode_image_within(&bytes, max_texels).map_err(|error| EngineError::Other(format!("{file_name}: {error}")))?;
+        let leaf = std::path::Path::new(file_name).file_name().and_then(|name| name.to_str()).unwrap_or("image");
         let base = texturecraft_formats::sanitize_resource_name(leaf);
         let mut name = base.clone();
-        let mut n = 2;
+        let mut duplicate_index = 2;
         while self.doc.resources.contains_key(&name) {
-            name = format!("{n}_{base}");
-            n += 1;
+            name = format!("{duplicate_index}_{base}");
+            duplicate_index += 1;
         }
 
         self.doc.resources.insert(name.clone(), Arc::new(bytes));
         self.images.insert(name.clone(), decoded(image));
+
         Ok(name)
     }
 
@@ -67,24 +68,28 @@ impl Session {
     /// whose header does not read as an image is left out, with a note in the log.
     pub fn sync_images(&mut self) {
         let resources = &self.doc.resources;
-        self.images.retain_names(|k| resources.contains_key(k));
-        // Linked materials' packages are resources too, not images.
+        self.images.retain_names(|name| resources.contains_key(name));
+
+        // Linked material packages are resources but cannot be decoded as images
+        let package_suffix = format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT);
         let missing: Vec<(String, Arc<Vec<u8>>)> = self
             .doc
             .resources
             .iter()
-            .filter(|(k, _)| !self.images.has_slot(k) && !k.ends_with(&format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT)))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .filter(|(name, _)| !self.images.has_slot(name) && !name.ends_with(&package_suffix))
+            .map(|(name, bytes)| (name.clone(), bytes.clone()))
             .collect();
-        for (k, bytes) in missing {
+        for (name, bytes) in missing {
+            // The header is checked against the same limits (the default texel budget included) as the decode.
             match texturecraft_formats::probe_image(&bytes) {
                 Ok(_) => {
-                    let id = Arc::as_ptr(&bytes) as usize;
+                    let origin: Arc<dyn std::any::Any + Send + Sync> = bytes.clone();
+                    let origin = Arc::downgrade(&origin);
                     let source: texturecraft_compose::ImageSource =
-                        Arc::new(move || texturecraft_formats::decode_image(&bytes).ok().map(|d| Arc::unwrap_or_clone(decoded(d))));
-                    self.images.insert_source(k, id, source);
+                        Arc::new(move || texturecraft_formats::decode_image(&bytes).ok().map(|image| Arc::unwrap_or_clone(decoded(image))));
+                    self.images.insert_source(name, origin, source);
                 }
-                Err(e) => self.log.push(format!("resource {k}: {e}")),
+                Err(error) => self.log.push(format!("resource {name}: {error}")),
             }
         }
     }

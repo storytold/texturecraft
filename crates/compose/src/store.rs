@@ -1,8 +1,9 @@
 //! Pixel data owned by a document: painted layer channels, painted mask effects and baked mesh
 //! maps. Everything is copy-on-write, so cloning the store for undo is cheap.
 
+use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use texturecraft_core::{Channel, ChannelKind, LayerId};
 use texturecraft_texel::{TileImage, from_u16, from_u16_signed};
@@ -72,12 +73,16 @@ pub struct ImageRes {
 /// Decodes an image resource from what it was made from (its file bytes, held by the caller's closure).
 pub type ImageSource = Arc<dyn Fn() -> Option<ImageRes> + Send + Sync>;
 
+/// What an image is made from (its file bytes, or the decoded image itself), held by allocation: it stays the same
+/// while the content does, whether the image is decoded or released, and holding it keeps no bytes or pixels alive.
+pub type ImageOrigin = Weak<dyn Any + Send + Sync>;
+
 /// One image of an [`ImageStore`]: decoded at the first read when it has a source, or given decoded.
 struct ImageSlot {
     decoded: OnceLock<Option<Arc<ImageRes>>>,
     source: Option<ImageSource>,
-    /// What the image is made from: the same for as long as its content is (see [`ImageStore::ids`]).
-    id: usize,
+    /// What the image is made from: the same for as long as its content is (see [`ImageStore::origin`]).
+    origin: ImageOrigin,
 }
 
 impl ImageSlot {
@@ -113,15 +118,16 @@ impl ImageStore {
 
     /// Adds the decoded image `image` under `name`, in place of any other.
     pub fn insert(&mut self, name: String, image: Arc<ImageRes>) {
-        let id = Arc::as_ptr(&image) as usize;
-        let slot = ImageSlot { decoded: OnceLock::from(Some(image)), source: None, id };
+        let decoded: Arc<dyn Any + Send + Sync> = image.clone();
+        let origin = Arc::downgrade(&decoded);
+        let slot = ImageSlot { decoded: OnceLock::from(Some(image)), source: None, origin };
         self.slots.insert(name, Arc::new(slot));
     }
 
-    /// Adds image `name`, decoded by `source` when it is first read; `id` names what it is made from (two sources
-    /// with the same id decode the same image).
-    pub fn insert_source(&mut self, name: String, id: usize, source: ImageSource) {
-        self.slots.insert(name, Arc::new(ImageSlot { decoded: OnceLock::new(), source: Some(source), id }));
+    /// Adds image `name`, decoded by `source` when it is first read; `origin` is what it is made from (two sources
+    /// with the same origin decode the same image). The source should hold `origin` alive.
+    pub fn insert_source(&mut self, name: String, origin: ImageOrigin, source: ImageSource) {
+        self.slots.insert(name, Arc::new(ImageSlot { decoded: OnceLock::new(), source: Some(source), origin }));
     }
 
     /// Whether `name` is in the store, decoded or not.
@@ -129,10 +135,10 @@ impl ImageStore {
         self.slots.contains_key(name)
     }
 
-    /// Names and ids of every image, decoded or not, without decoding any: what a cache keyed by the images' contents
-    /// compares.
-    pub fn ids(&self) -> impl Iterator<Item = (&String, usize)> {
-        self.slots.iter().map(|(n, s)| (n, s.id))
+    /// What image `name` is made from, decoded or not, without decoding it: what a cache keyed by the image's content
+    /// compares (with [`Weak::ptr_eq`]).
+    pub fn origin(&self, name: &str) -> Option<(&String, ImageOrigin)> {
+        self.slots.get_key_value(name).map(|(n, s)| (n, s.origin.clone()))
     }
 
     /// Whether `other` holds the very same images under the same names (a clone does, until either changes or lets
@@ -186,7 +192,7 @@ impl ImageStore {
         let mut gone = 0;
         for slot in self.slots.values_mut() {
             if slot.source.is_some() && matches!(slot.decoded.get(), Some(Some(_))) {
-                *slot = Arc::new(ImageSlot { decoded: OnceLock::new(), source: slot.source.clone(), id: slot.id });
+                *slot = Arc::new(ImageSlot { decoded: OnceLock::new(), source: slot.source.clone(), origin: slot.origin.clone() });
                 gone += 1;
             }
         }
@@ -278,9 +284,11 @@ mod image_store_tests {
     fn an_image_is_decoded_when_first_read_and_again_after_it_is_let_go() {
         let decodes = Arc::new(AtomicUsize::new(0));
         let mut store = ImageStore::default();
-        store.insert_source("a.png".into(), 7, counting_source(&decodes));
-        store.insert_source("broken.png".into(), 8, Arc::new(|| None));
-        assert!(store.has_slot("a.png") && store.ids().any(|(n, id)| n == "a.png" && id == 7));
+        let (bytes, broken): (Arc<dyn Any + Send + Sync>, Arc<dyn Any + Send + Sync>) = (Arc::new(vec![7u8]), Arc::new(vec![8u8]));
+        store.insert_source("a.png".into(), Arc::downgrade(&bytes), counting_source(&decodes));
+        store.insert_source("broken.png".into(), Arc::downgrade(&broken), Arc::new(|| None));
+        let is_a = |store: &ImageStore| store.origin("a.png").is_some_and(|(n, origin)| n == "a.png" && origin.ptr_eq(&Arc::downgrade(&bytes)));
+        assert!(store.has_slot("a.png") && is_a(&store));
         assert_eq!((decodes.load(Ordering::Relaxed), store.decoded_bytes()), (0, 0), "nothing is decoded before it is read");
 
         let first = store.get("a.png").cloned().unwrap();
@@ -295,7 +303,7 @@ mod image_store_tests {
         assert_eq!(store.release(0), 1);
         assert_eq!(store.decoded_bytes(), 0);
         assert!(!shared.same_as(&store), "a clone keeps what it decoded");
-        assert!(store.ids().any(|(n, id)| n == "a.png" && id == 7), "the image's id stays");
+        assert!(is_a(&store), "the image's origin stays");
         assert_eq!(**store.get("a.png").unwrap(), *first, "decoded again, the same image");
         assert_eq!(decodes.load(Ordering::Relaxed), 2);
     }

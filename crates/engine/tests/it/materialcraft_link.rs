@@ -108,47 +108,55 @@ fn imports_as_a_linked_fill_with_its_maps() {
 /// An image marked DirectX keeps the mark when a re-cook replaces it.
 #[test]
 fn recooks_keep_the_normal_format_of_a_map() {
-    let mut s = session();
-    let id = s.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
-    execute(&mut s, "layer.fill.set", &json!({"layer": id.0, "channel": "roughness", "normalFormat": "directX"})).unwrap();
-    s.apply_link_cook(id, &mcmat(0.75, 0.5), false).unwrap();
-    let LayerKind::Fill(fill) = &s.doc.project.layer(id).unwrap().kind else { panic!("a fill") };
+    let mut session = session();
+    let id = session.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
+    execute(&mut session, "layer.fill.set", &json!({"layer": id.0, "channel": "roughness", "normalFormat": "directX"})).unwrap();
+
+    session.apply_link_cook(id, &mcmat(0.75, 0.5), false).unwrap();
+
+    let LayerKind::Fill(fill) = &session.doc.project.layer(id).unwrap().kind else { panic!("a fill") };
+
     assert!(matches!(fill.sources.get(&Channel::Roughness), Some(Source::Image { normal_format: NormalFormat::DirectX, .. })));
 }
 
 #[test]
 fn parameters_are_checked_stored_and_recooked_in_one_undo_step() {
-    let mut s = session();
-    let id = s.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
-    let set = |s: &mut Session, p: Value| execute(s, "material.link.set", &p);
-    assert!(set(&mut s, json!({"id": "nope", "value": 1, "cook": false})).is_err());
-    assert!(set(&mut s, json!({"id": "wear", "value": "soft", "cook": false})).is_err());
-    assert!(set(&mut s, json!({"id": "wear", "value": f64::NAN, "cook": false})).is_err());
-    set(&mut s, json!({"id": "tint", "value": "#ff0000", "cook": false})).unwrap();
-    assert_eq!(link(&s, id).params[1].value, json!({"t": "color", "v": [1.0, 0.0, 0.0, 1.0]}));
-    set(&mut s, json!({"id": "wear", "value": 0.9, "cook": false})).unwrap();
-    assert_eq!(link(&s, id).params[0].value, json!({"t": "float", "v": 0.9}));
+    let mut session = session();
+    let id = session.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
+    let set = |session: &mut Session, params: Value| execute(session, "material.link.set", &params);
 
-    // The job carries every value and the texture set's resolution.
-    let job = s.link_job(id, &serde_json::Map::new()).unwrap();
+    assert!(set(&mut session, json!({"id": "nope", "value": 1, "cook": false})).is_err());
+    assert!(set(&mut session, json!({"id": "wear", "value": "soft", "cook": false})).is_err());
+    assert!(set(&mut session, json!({"id": "wear", "value": f64::NAN, "cook": false})).is_err());
+    set(&mut session, json!({"id": "tint", "value": "#ff0000", "cook": false})).unwrap();
+    assert_eq!(link(&session, id).params[1].value, json!({"t": "color", "v": [1.0, 0.0, 0.0, 1.0]}));
+    set(&mut session, json!({"id": "wear", "value": 0.9, "cook": false})).unwrap();
+    assert_eq!(link(&session, id).params[0].value, json!({"t": "float", "v": 0.9}));
+
+    // Cooks follow the texture set resolution
+    let job = session.link_job(id, &serde_json::Map::new()).unwrap();
+
     assert_eq!(job.size, 128);
     assert_eq!(job.values["wear"], json!({"t": "float", "v": 0.9}));
 
-    // What the job cooked (here: built by hand) replaces the maps, merged into the edit.
-    let old = map_name(&s, id, Channel::Roughness);
-    s.apply_link_cook(id, &mcmat(0.75, 0.9), true).unwrap();
-    assert!((roughness(&mut s) - 0.75).abs() < 2e-3);
-    assert!(!s.doc.resources.contains_key(&old), "old maps are dropped");
-    execute(&mut s, "edit.undo", &Value::Null).unwrap();
-    assert!((roughness(&mut s) - 0.25).abs() < 2e-3, "undo restores the earlier maps");
-    assert_eq!(link(&s, id).params[0].value, json!({"t": "float", "v": 0.5}));
-    execute(&mut s, "edit.redo", &Value::Null).unwrap();
-    assert!((roughness(&mut s) - 0.75).abs() < 2e-3);
+    // Merge the cooked maps into the parameter edit
+    let old = map_name(&session, id, Channel::Roughness);
+    session.apply_link_cook(id, &mcmat(0.75, 0.9), true).unwrap();
 
-    // Presets skip inputs the painter can't set; unknown presets are errors.
-    assert!(execute(&mut s, "material.link.preset", &json!({"name": "Nope", "cook": false})).is_err());
-    execute(&mut s, "material.link.preset", &json!({"name": "Worn", "cook": false})).unwrap();
-    assert_eq!(link(&s, id).params[0].value, json!({"t": "float", "v": 1.0}));
+    assert!((roughness(&mut session) - 0.75).abs() < 2e-3);
+    assert!(!session.doc.resources.contains_key(&old), "old maps are dropped");
+
+    execute(&mut session, "edit.undo", &Value::Null).unwrap();
+    assert!((roughness(&mut session) - 0.25).abs() < 2e-3, "undo restores the earlier maps");
+    assert_eq!(link(&session, id).params[0].value, json!({"t": "float", "v": 0.5}));
+
+    execute(&mut session, "edit.redo", &Value::Null).unwrap();
+    assert!((roughness(&mut session) - 0.75).abs() < 2e-3);
+
+    // Presets skip unsupported inputs and reject unknown names
+    assert!(execute(&mut session, "material.link.preset", &json!({"name": "Nope", "cook": false})).is_err());
+    execute(&mut session, "material.link.preset", &json!({"name": "Worn", "cook": false})).unwrap();
+    assert_eq!(link(&session, id).params[0].value, json!({"t": "float", "v": 1.0}));
 }
 
 #[test]

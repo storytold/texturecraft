@@ -10,11 +10,12 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use texturecraft_core::project::MAX_DEPTH;
-use texturecraft_core::{BakedMap, Channel, Layer, LayerId, LayerKind, Project, TextureSet};
+use texturecraft_core::{BakedMap, Channel, EffectKind, GraphInput, Layer, LayerId, LayerKind, Project, Source, TextureSet};
 use texturecraft_texel::TileImage;
 
 use crate::eval::{Inputs, PaintTarget};
 use crate::field_cache::FieldCache;
+use crate::image_identity::ImageIdentity;
 use crate::store::{BakedMaps, ImageStore, PixelStore};
 
 /// Default byte budget of a [`BelowCache`], per nesting level it holds (see
@@ -93,50 +94,88 @@ pub struct StackKey {
     layers: Vec<Layer>,
     pixels: Vec<(LayerId, Option<Channel>, Shared)>,
     baked: (u32, Vec<(BakedMap, usize)>),
-    images: Vec<(String, usize)>,
+    images: Vec<(String, ImageIdentity)>,
 }
 
 impl StackKey {
-    /// The key of `roots` (layers of texture set `ts`, bottom → top) and their effects.
-    pub fn new(project: &Project, pixels: &PixelStore, baked: &BakedMaps, images: &ImageStore, ts: usize, roots: &[LayerId]) -> Option<StackKey> {
-        StackKey::of_tree(project, pixels, baked, images, ts, roots.to_vec(), &project.render_tree(roots))
+    /// The key of `roots` (layers of a texture set, bottom → top) and their effects.
+    pub fn new(
+        project: &Project,
+        pixels: &PixelStore,
+        baked: &BakedMaps,
+        images: &ImageStore,
+        texture_set_index: usize,
+        roots: &[LayerId],
+    ) -> Option<StackKey> {
+        StackKey::of_tree(project, pixels, baked, images, texture_set_index, roots.to_vec(), &project.render_tree(roots))
     }
 
-    /// The key of the layers in `tree` (and their effects), drawn as `roots` arrange them.
+    /// The key of the layers in `render_tree` (and their effects), drawn as `roots` arrange them.
     pub(crate) fn of_tree(
         project: &Project,
         pixels: &PixelStore,
         baked: &BakedMaps,
         images: &ImageStore,
-        ts: usize,
+        texture_set_index: usize,
         roots: Vec<LayerId>,
-        tree: &BTreeSet<LayerId>,
+        render_tree: &BTreeSet<LayerId>,
     ) -> Option<StackKey> {
-        let mut set = project.texture_set(ts).ok()?.clone();
+        let mut set = project.texture_set(texture_set_index).ok()?.clone();
         set.name.clear();
         set.description.clear();
         set.stack.clear();
         set.bake = Default::default();
-        let effects: BTreeSet<LayerId> = tree.iter().filter_map(|id| project.layers.get(id)).flat_map(effect_ids).collect();
-        let pixels = tree
+
+        let effect_ids: BTreeSet<LayerId> = render_tree.iter().filter_map(|id| project.layers.get(id)).flat_map(effect_ids).collect();
+        let pixel_handles = render_tree
             .iter()
-            .chain(&effects)
+            .chain(&effect_ids)
             .flat_map(|id| {
-                let layer = Channel::ALL.into_iter().filter_map(move |c| pixels.layer(*id, c).map(|img| (*id, Some(c), Shared(img.clone()))));
-                layer.chain(pixels.masks.get(id).map(|img| (*id, None, Shared(img.clone()))))
+                let layer_channels =
+                    Channel::ALL.into_iter().filter_map(move |channel| pixels.layer(*id, channel).map(|image| (*id, Some(channel), Shared(image.clone()))));
+                layer_channels.chain(pixels.masks.get(id).map(|image| (*id, None, Shared(image.clone()))))
             })
             .collect();
-        let mut images: Vec<(String, usize)> = images.ids().map(|(n, id)| (n.clone(), id)).collect();
-        images.sort();
+
+        // Only the images the drawn layers read, compared by what they are made from: neither decodes an image
+        let mut referenced_names: Vec<&str> = Vec::new();
+        for layer in render_tree.iter().filter_map(|id| project.layers.get(id)) {
+            if let LayerKind::Fill(fill) = &layer.kind {
+                referenced_names.extend(fill.sources.values().filter_map(image_name));
+            }
+            for effect in layer.mask.iter().flat_map(|mask| &mask.effects).chain(&layer.content_effects) {
+                match &effect.kind {
+                    EffectKind::Fill { source, .. } => referenced_names.extend(image_name(source)),
+                    EffectKind::Material(fill) => referenced_names.extend(fill.sources.values().filter_map(image_name)),
+                    _ => {}
+                }
+            }
+            // Images feeding the layer's graphs (nested ones included)
+            for graph in layer.graphs().into_iter().flat_map(|graph| graph.graphs()) {
+                referenced_names.extend(graph.inputs.values().filter_map(|input| match input {
+                    GraphInput::Image(name) => Some(name.as_str()),
+                    _ => None,
+                }));
+            }
+        }
+        let image_identities: std::collections::BTreeMap<&String, ImageIdentity> =
+            referenced_names.into_iter().filter_map(|name| images.origin(name)).map(|(name, origin)| (name, ImageIdentity::new(origin))).collect();
+        let image_identities = image_identities.into_iter().map(|(name, identity)| (name.clone(), identity)).collect();
+
         Some(StackKey {
             set,
             roots,
-            layers: tree.iter().filter_map(|id| project.layers.get(id)).map(render_view).collect(),
-            pixels,
-            baked: (baked.resolution, baked.maps.iter().map(|(m, d)| (*m, Arc::as_ptr(d) as usize)).collect()),
-            images,
+            layers: render_tree.iter().filter_map(|id| project.layers.get(id)).map(render_view).collect(),
+            pixels: pixel_handles,
+            baked: (baked.resolution, baked.maps.iter().map(|(map, data)| (*map, Arc::as_ptr(data) as usize)).collect()),
+            images: image_identities,
         })
     }
+}
+
+/// The image resource `source` reads, if it reads one.
+fn image_name(source: &Source) -> Option<&str> {
+    if let Source::Image { name, .. } = source { Some(name) } else { None }
 }
 
 /// An image compared by tile identity: holding the clone keeps its tiles alive, and a tile

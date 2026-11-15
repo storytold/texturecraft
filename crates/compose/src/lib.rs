@@ -16,6 +16,7 @@ pub mod display;
 pub mod eval;
 pub mod field_cache;
 pub mod graphs;
+mod image_identity;
 pub mod pattern;
 pub mod placed;
 pub mod store;
@@ -29,5 +30,5 @@ pub use eval::{
 };
 pub use field_cache::{FIELD_BUDGET, FieldCache};
 pub use graphs::{Cooked, GraphStore, GraphUse};
-pub use store::{BakedMaps, ImageRes, ImageSource, ImageStore, PixelStore, Texels};
+pub use store::{BakedMaps, ImageOrigin, ImageRes, ImageSource, ImageStore, PixelStore, Texels};
 pub use thumb::{THUMB_TEXELS, ThumbImage, ThumbTarget};

@@ -383,38 +383,45 @@ impl Session {
     /// With `merge`, this folds into the previous undo step when that was an edit of the same kind
     /// (a parameter set while the cook ran).
     pub fn apply_link_cook(&mut self, id: LayerId, bytes: &[u8], merge: bool) -> Result<()> {
-        let m = read_mcmat(bytes).map_err(|e| EngineError::Other(e.to_string()))?;
-        let maps = decoded_maps(&m)?;
-        let names = self.edit_merging(EDIT, merge, |s| {
-            let LayerKind::Fill(mut fill) = s.doc.project.layer(id)?.kind.clone() else {
+        let material = read_mcmat(bytes).map_err(|error| EngineError::Other(error.to_string()))?;
+        let maps = decoded_maps(&material)?;
+
+        let names = self.edit_merging(EDIT, merge, |session| {
+            let LayerKind::Fill(mut fill) = session.doc.project.layer(id)?.kind.clone() else {
                 return Err(EngineError::Other(format!("layer {} is not a fill", id.0)));
             };
+
             let link = fill.link.as_mut().ok_or_else(|| EngineError::Other(format!("layer {} is not a MaterialCraft material", id.0)))?;
-            for p in &mut link.params {
-                if let Some(cooked) = m.manifest.parameters.iter().find(|c| c.id == p.id) {
-                    p.value = cooked.value.clone();
+            for parameter in &mut link.params {
+                if let Some(cooked) = material.manifest.parameters.iter().find(|candidate| candidate.id == parameter.id) {
+                    parameter.value = cooked.value.clone();
                 }
             }
-            link.size = m.manifest.size[0];
+            link.size = material.manifest.size[0];
             let stem = texturecraft_formats::sanitize_resource_name(&link.name);
-            let old: Vec<String> =
-                fill.sources.values().filter_map(|src| if let Source::Image { name, .. } = src { Some(name.clone()) } else { None }).collect();
-            let names = put_maps(s, &stem, &maps, &mut fill);
-            s.doc.project.layer_mut(id)?.kind = LayerKind::Fill(fill);
-            // Old maps go unless another layer (a duplicate) still shows them.
-            let mut used = Vec::new();
-            for set in 0..s.doc.project.texture_sets.len() {
-                for root in s.doc.project.texture_sets.get(set).map(|t| t.stack.clone()).unwrap_or_default() {
-                    crate::material_lib::images_used(&s.doc.project, root, &mut used, 0);
+            let old_names: Vec<String> =
+                fill.sources.values().filter_map(|source| if let Source::Image { name, .. } = source { Some(name.clone()) } else { None }).collect();
+            let names = put_maps(session, &stem, &maps, &mut fill);
+            session.doc.project.layer_mut(id)?.kind = LayerKind::Fill(fill);
+
+            // Duplicated layers may still use the earlier maps
+            let mut used_names = Vec::new();
+            for set in 0..session.doc.project.texture_sets.len() {
+                for root in session.doc.project.texture_sets.get(set).map(|texture_set| texture_set.stack.clone()).unwrap_or_default() {
+                    crate::material_lib::images_used(&session.doc.project, root, &mut used_names, 0);
                 }
             }
-            for name in old.iter().filter(|n| !used.contains(n)) {
-                s.doc.resources.remove(name);
+            for name in old_names.iter().filter(|name| !used_names.contains(name)) {
+                session.doc.resources.remove(name);
             }
+
             Ok(names)
         })?;
-        self.sync_images();
+
+        // Reuse the validated maps before synchronization considers decoding missing images
         self.cache_decoded(names, maps);
+        self.sync_images();
+
         Ok(())
     }
 

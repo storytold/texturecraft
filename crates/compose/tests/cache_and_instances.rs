@@ -574,3 +574,61 @@ fn gathering_filters_composite_identically_in_any_grouping_and_cached() {
         assert!(!check_cached(&f, 0, hot).is_empty());
     }
 }
+
+#[test]
+fn cached_stack_tracks_referenced_images_only() {
+    use std::sync::Arc;
+    use texturecraft_compose::{ImageRes, ImageStore};
+
+    let mut fixture = fixture();
+    let hot_layer = heavy_stack(&mut fixture);
+    let bottom_layer = fixture.project.texture_sets[0].stack[0];
+    let LayerKind::Fill(fill) = &mut fixture.project.layer_mut(bottom_layer).unwrap().kind else { panic!("expected fill") };
+
+    fill.sources.insert(Channel::Roughness, Source::Image { name: "used".into(), normal_format: Default::default() });
+    let image_with_value = |value| Arc::new(ImageRes { width: RES, height: RES, rgba: vec![[value; 4]; (RES * RES) as usize], srgb: false });
+    let mut images = ImageStore::default();
+    let baked = Default::default();
+    let tiles = all_tiles(RES, RES);
+    let mut cache = BelowCache::default();
+    cache.set_hot(Some(hot_layer));
+    let mut output = Composite::new(&fixture.project.texture_sets[0].channel_list(), RES);
+    let mut previous_image = None;
+
+    for stage in ["cold", "resolve", "unused1", "unused2", "unused3", "replace", "remove"] {
+        match stage {
+            "resolve" => {
+                let image = image_with_value(1.0);
+                previous_image = Some(Arc::downgrade(&image));
+                images.insert("used".into(), image);
+            }
+            "replace" => {
+                let replacement = image_with_value(0.4);
+                let replacement_weak = Arc::downgrade(&replacement);
+                images.insert("used".into(), replacement);
+                assert!(previous_image.as_ref().is_some_and(|old| old.upgrade().is_none()), "cached key must not retain replaced image pixels");
+                previous_image = Some(replacement_weak);
+            }
+            "remove" => {
+                images.remove("used");
+                assert!(previous_image.as_ref().is_some_and(|old| old.upgrade().is_none()), "cached key must not retain removed image pixels");
+            }
+            "cold" => {}
+            _ => {
+                images.insert(stage.into(), image_with_value(0.5));
+            }
+        }
+
+        fixture.pixels.layer_mut(hot_layer, Channel::BaseColor, (RES, RES)).set(5, 5, &[stage.len() as u16, 0, 0, u16::MAX]);
+        let input = inputs(&fixture, 0, &images, &baked);
+        composite_tiles_cached(&input, &mut output, &tiles[..1], Some(&mut cache));
+        assert!(!cache.is_empty(), "{stage}: first tile should be cached");
+        let retained = cache.len() - 1;
+        composite_tiles_cached(&input, &mut output, &tiles[1..], Some(&mut cache));
+        assert_eq!(retained, if stage.starts_with("unused") { tiles.len() - 1 } else { 0 }, "{stage}");
+
+        let mut expected = Composite::new(&fixture.project.texture_sets[0].channel_list(), RES);
+        composite_tiles(&input, &mut expected, &tiles);
+        assert!(output == expected, "{stage}");
+    }
+}

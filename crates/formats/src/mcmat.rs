@@ -20,6 +20,10 @@ const FORMAT: &str = "craft-material";
 const VERSION: u32 = 1;
 /// Largest entry read (maps are at most 8192² × 16 bits, compressed).
 const MAX_ENTRY: u64 = 512 << 20;
+/// Most map entries one manifest may name (a material has at most nine usages).
+const MAX_MAPS: usize = 64;
+/// Largest total payload read from one `.mcmat`: maps and source together (audit: TextureCraft #4).
+const MAX_TOTAL: u64 = 1 << 30;
 const KIND: &str = "MaterialCraft material";
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -66,27 +70,53 @@ fn malformed(msg: impl Into<String>) -> FormatError {
     FormatError::Malformed { kind: KIND, msg: msg.into() }
 }
 
+fn read_entry(name: &str, entry: impl Read, total_bytes: &mut u64) -> Result<Vec<u8>> {
+    // Earlier maps remain live while the next entry is read
+    let remaining_bytes = MAX_TOTAL.saturating_sub(*total_bytes);
+    let entry_limit = MAX_ENTRY.min(remaining_bytes);
+    let mut bytes = Vec::new();
+    entry.take(entry_limit + 1).read_to_end(&mut bytes).map_err(|error| malformed(format!("{name}: {error}")))?;
+    if bytes.len() as u64 > MAX_ENTRY {
+        return Err(FormatError::TooLarge(name.to_string()));
+    }
+
+    let next_total = total_bytes.saturating_add(bytes.len() as u64);
+    if next_total > MAX_TOTAL {
+        return Err(FormatError::TooLarge(format!("{KIND} payload (over {MAX_TOTAL} bytes)")));
+    }
+
+    // Keep spare read capacity from accumulating across retained map entries
+    bytes.shrink_to_fit();
+    *total_bytes = next_total;
+
+    Ok(bytes)
+}
+
 /// Read `.mcmat` bytes.
 pub fn read_mcmat(bytes: &[u8]) -> Result<PortableMaterial> {
-    let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| malformed(e.to_string()))?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| malformed(error.to_string()))?;
+    let mut total_bytes = 0u64;
     let mut read = |name: &str| -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        let f = z.by_name(name).map_err(|_| malformed(format!("{name} is missing")))?;
-        f.take(MAX_ENTRY + 1).read_to_end(&mut out).map_err(|e| malformed(format!("{name}: {e}")))?;
-        if out.len() as u64 > MAX_ENTRY {
-            return Err(FormatError::TooLarge(name.to_string()));
-        }
-        Ok(out)
+        let entry = archive.by_name(name).map_err(|_| malformed(format!("{name} is missing")))?;
+        read_entry(name, entry, &mut total_bytes)
     };
-    let manifest: Manifest = serde_json::from_slice(&read("material.json")?).map_err(|e| malformed(format!("material.json: {e}")))?;
+
+    let manifest: Manifest = serde_json::from_slice(&read("material.json")?).map_err(|error| malformed(format!("material.json: {error}")))?;
     if manifest.format != FORMAT {
         return Err(malformed(format!("format `{}`", manifest.format)));
     }
+
     if manifest.version > VERSION {
         return Err(FormatError::Unsupported(format!("{KIND} version {} (this version reads up to {VERSION})", manifest.version)));
     }
-    let maps = manifest.maps.iter().map(|m| Ok((m.usage.clone(), read(&m.file)?))).collect::<Result<Vec<_>>>()?;
+
+    if manifest.maps.len() > MAX_MAPS {
+        return Err(malformed(format!("{} maps, over the {MAX_MAPS} map limit", manifest.maps.len())));
+    }
+
+    let maps = manifest.maps.iter().map(|map| Ok((map.usage.clone(), read(&map.file)?))).collect::<Result<Vec<_>>>()?;
     let source = read(&manifest.source)?;
+
     Ok(PortableMaterial { manifest, maps, source })
 }
 
@@ -153,18 +183,64 @@ mod tests {
     #[test]
     fn reads_manifest_maps_and_source() {
         let bytes = sample(1);
+
         assert!(is_mcmat(&bytes) && !is_mcraft(&bytes));
-        let m = read_mcmat(&bytes).unwrap();
-        assert_eq!(m.manifest.graph, "Brick_wall");
-        assert_eq!(m.manifest.parameters[0].id, "wear");
-        assert_eq!(m.manifest.parameters[0].value, serde_json::json!({"t": "float", "v": 0.25}));
-        assert_eq!(m.manifest.presets[0].name, "Worn");
-        assert_eq!(m.manifest.inputs[0].identifier, "curvature");
-        assert_eq!(m.maps[0].0, "baseColor");
-        assert_eq!(crate::decode_image(&m.maps[0].1).unwrap().width, 4);
-        assert_eq!(m.source, b"pkg");
+        let material = read_mcmat(&bytes).unwrap();
+
+        assert_eq!(material.manifest.graph, "Brick_wall");
+        assert_eq!(material.manifest.parameters[0].id, "wear");
+        assert_eq!(material.manifest.parameters[0].value, serde_json::json!({"t": "float", "v": 0.25}));
+        assert_eq!(material.manifest.presets[0].name, "Worn");
+        assert_eq!(material.manifest.inputs[0].identifier, "curvature");
+        assert_eq!(material.maps[0].0, "baseColor");
+        assert_eq!(crate::decode_image(&material.maps[0].1).unwrap().width, 4);
+        assert_eq!(material.source, b"pkg");
         assert!(matches!(read_mcmat(&sample(2)), Err(FormatError::Unsupported(_))));
         assert!(read_mcmat(b"junk").is_err());
+    }
+
+    #[test]
+    fn an_unbounded_map_list_is_refused() {
+        let maps: Vec<_> = (0..=MAX_MAPS).map(|_| serde_json::json!({"usage": "baseColor", "file": "maps/baseColor.png"})).collect();
+        let manifest =
+            serde_json::json!({"format": FORMAT, "version": VERSION, "name": "n", "graph": "g", "size": [4, 4], "maps": maps, "source": "source.mcraft"});
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("material.json", options).unwrap();
+        archive.write_all(manifest.to_string().as_bytes()).unwrap();
+        archive.start_file("maps/baseColor.png", options).unwrap();
+        archive.write_all(&mesh_map_png(4, 3, &[0.5; 48]).unwrap()).unwrap();
+        archive.start_file("source.mcraft", options).unwrap();
+        archive.write_all(b"pkg").unwrap();
+
+        let result = read_mcmat(&archive.finish().unwrap().into_inner());
+
+        assert!(matches!(result, Err(FormatError::Malformed { .. })));
+    }
+
+    #[test]
+    fn entry_read_stops_at_the_remaining_payload_budget() {
+        let payload = vec![7u8; 1024];
+        let mut input = Cursor::new(&payload);
+        let mut total_bytes = MAX_TOTAL - 8;
+
+        let result = read_entry("maps/extra.png", &mut input, &mut total_bytes);
+
+        assert!(matches!(result, Err(FormatError::TooLarge(_))));
+        assert_eq!(input.position(), 9, "only one byte beyond the remaining budget is needed to reject the entry");
+        assert_eq!(total_bytes, MAX_TOTAL - 8, "a rejected entry does not consume the payload budget");
+    }
+
+    #[test]
+    fn payload_budget_accepts_the_exact_limit_and_empty_entries() {
+        let mut total_bytes = MAX_TOTAL - 4;
+
+        let bytes = read_entry("map.png", Cursor::new([1, 2, 3, 4]), &mut total_bytes).unwrap();
+
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        assert_eq!(total_bytes, MAX_TOTAL);
+        assert!(read_entry("empty.mcraft", Cursor::new([]), &mut total_bytes).unwrap().is_empty());
+        assert!(matches!(read_entry("extra.png", Cursor::new([1]), &mut total_bytes), Err(FormatError::TooLarge(_))));
     }
 
     #[test]
