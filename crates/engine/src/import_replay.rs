@@ -601,6 +601,9 @@ pub(crate) fn settings(brush: &ReplayBrush, lazy_pixels: f32) -> (BrushSettings,
     (settings, size_scale.max(0.0))
 }
 
+/// How far behind the scene centre, in scene radii, an orthographic view's orbit camera sits.
+const ORTHO_BACK: f32 = 3.0;
+
 /// A recorded 3D-view camera as an orbit camera with the place of its points on the orbit camera's view.
 struct ViewCamera {
     orbit: OrbitCamera,
@@ -633,7 +636,17 @@ impl ViewCamera {
         }
         let aspect = m11 / m00;
         let ortho = p.w_axis.w.abs() > 0.5 && p.z_axis.w.abs() < 0.5;
-        let distance = (center - eye).dot(forward).max(radius * 0.05).max(1e-4);
+        let depth = (center - eye).dot(forward);
+        // an orthographic view sees the same wherever its eye sits on the view axis, and the recorded eye may sit inside
+        // or in front of the mesh (its depth range reaches behind the eye): the orbit camera looks from behind the
+        // whole scene, at the scene centre's depth, so every surface on the view lies in front of it
+        let (eye, distance) = match ortho {
+            true if depth.is_finite() => (eye + forward * (depth - ORTHO_BACK * radius), ORTHO_BACK * radius),
+            _ => (eye, depth.max(radius * 0.05).max(1e-4)),
+        };
+        if !distance.is_finite() || distance <= 0.0 {
+            return None;
+        }
         let (fov, shift) = match ortho {
             true => ((2.0 * (1.0 / m11 / distance).atan()).to_degrees(), Vec2::new(-p.w_axis.x, -p.w_axis.y)),
             false => ((2.0 * (1.0 / m11).atan()).to_degrees(), Vec2::new(p.z_axis.x, p.z_axis.y)),

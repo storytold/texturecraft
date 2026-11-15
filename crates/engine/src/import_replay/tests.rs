@@ -691,3 +691,19 @@ fn a_2d_view_image_dab_lands_on_its_image_centre_through_the_recorded_matrix() {
     assert_eq!(roughness_at(&out[0], RES / 2 - 8, RES / 2).1, 0.0);
     assert!(roughness_at(&out[0], RES / 2 + 8, RES / 2).1 > 0.5);
 }
+
+#[test]
+fn an_orthographic_view_paints_surfaces_behind_its_recorded_eye() {
+    // the reference app's orthographic eye may sit past the mesh, its depth range reaching behind it: here the eye is
+    // 0.5 past the wall looking on along -z, the wall's front 0.5 behind the eye
+    let mesh = wall();
+    // as stored: symmetric depth around the eye (z scale only, no translation), the view 1.2 high
+    let projection = Mat4::from_cols_array(&[1.0 / 0.6, 0.0, 0.0, 0.0, 0.0, 1.0 / 0.6, 0.0, 0.0, 0.0, 0.0, -0.03, 0.0, 0.0, 0.0, 0.0, 1.0]);
+    let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, -0.5), Vec3::new(0.0, 0.0, -1.5), Vec3::Y);
+    let space = StrokeSpace::Mesh { view: view.to_cols_array(), projection: projection.to_cols_array() };
+    let out = replay(&mesh, &[mask_job(vec![stroke(space, &[[-0.3, 0.0], [0.3, 0.0]])])]);
+    let c = RES / 2;
+    assert!(mask_at(&out[0], c, c).1 > 0.95, "painted through the orthographic view: {:?}", mask_at(&out[0], c, c));
+    // ±0.3 of a view 1.2 high is ±0.18 on the 2 wide wall: 0.18 of a half texture either side
+    assert!(mask_at(&out[0], c + 8, c).1 > 0.95 && mask_at(&out[0], c + 20, c).1 == 0.0);
+}
