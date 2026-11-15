@@ -670,6 +670,19 @@ fn layer_mask(p: &Project, id: LayerId) -> Option<&Mask> {
     p.layers.get(&p.mask_owner(id))?.mask.as_ref()
 }
 
+/// Whether layer `id` (or, for a folder, a layer inside it) holds an anchor point: a visible one among its content effects,
+/// or one inside its enabled mask.
+fn holds_anchor(p: &Project, id: LayerId, depth: usize) -> bool {
+    if depth > texturecraft_core::project::MAX_DEPTH {
+        return false;
+    }
+    layer_mask(p, id).is_some_and(|m| m.enabled && mask_anchors(m).next().is_some())
+        || p.content_layer(id).is_some_and(|l| {
+            (!l.is_group() && l.content_effects.iter().any(|e| e.visible && matches!(e.kind, EffectKind::Anchor)))
+                || l.children().iter().any(|c| holds_anchor(p, *c, depth + 1))
+        })
+}
+
 /// Layers of `list` in drawing order (bottom → top, folder and instanced folder contents after
 /// their folder).
 fn draw_order(p: &Project, list: &[LayerId], depth: usize, out: &mut Vec<LayerId>) {
@@ -1641,7 +1654,13 @@ fn plan_node<'a>(
     let own: &'a Layer = inp.project.layers.get(&id)?;
     // Instances draw their source's content (a missing source draws nothing).
     let layer: &'a Layer = inp.project.content_layer(id)?;
-    if !own.visible {
+    // A layer holding anchor points (in its content or its mask) is always planned, to record them for the layers
+    // reading them; it draws only when visible and blending something. The original evaluates them whatever the
+    // layer's visibility (Trimmsheet: a height fill reads the masks of three hidden layers), and an imported anchor
+    // layer often blends no channel at all (an empty fill holding only the anchor point: MORA, Roads3, 12324).
+    let anchors_only = !own.visible;
+    let holds = holds_anchor(inp.project, id, depth);
+    if anchors_only && !holds {
         return None;
     }
     let paint = matches!(layer.kind, LayerKind::Paint);
@@ -1649,6 +1668,7 @@ fn plan_node<'a>(
     let fx_start = if fx { neighbourhood(&layer.content_effects, inp.gbuf.width).map(|n| n.0) } else { None };
     let chans = channels
         .iter()
+        .filter(|_| !anchors_only)
         .filter_map(|c| {
             let b = layer.blend(*c)?;
             if b.mode == BlendMode::Disable || b.opacity <= 0.0 {
@@ -1686,17 +1706,14 @@ fn plan_node<'a>(
     };
     let anchors = if fx { anchor_cuts(&layer.content_effects) } else { Vec::new() };
     // A paint layer with nothing painted (and not being painted) or added by its content
-    // effects contributes nothing; a layer blending none of the channels neither. Unless it
-    // holds an anchor point: that records the stack at the layer whatever the layer draws
-    // (an imported anchor layer often blends no channel at all), and fills, masks and graphs
-    // above read it.
-    if let Content::Paint { preview: false } = content
+    // effects contributes nothing; a layer blending none of the channels neither (unless it holds anchors, above).
+    if !holds
+        && let Content::Paint { preview: false } = content
         && chans.iter().all(|c| c.data.is_none() && c.effects.is_empty())
-        && anchors.is_empty()
     {
         return None;
     }
-    if chans.is_empty() && anchors.is_empty() {
+    if chans.is_empty() && !holds {
         return None;
     }
     let mask = layer_mask(inp.project, id).and_then(|m| mask_plan(inp, id, m, tx, ty, fields));
@@ -4621,6 +4638,29 @@ soft {soft:?}"
         mask.effects = vec![read(&mut f)];
         f.project.layer_mut(top).unwrap().mask = Some(mask);
         assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.44; 3]));
+    }
+
+    #[test]
+    fn anchors_inside_hidden_layers_masks_still_record() {
+        let mut f = fixture();
+        fill_layer(&mut f.project, [0.0; 3], 0.0);
+        // a hidden layer whose mask records 0.4: it draws nothing, but its anchor is evaluated
+        let hidden = fill_layer(&mut f.project, [1.0; 3], 0.0);
+        let anchor = f.project.alloc_id();
+        let mut mask = Mask::new(MaskBackground::Black);
+        let uniform = Effect::new(f.project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.4; 3]), projection: Projection::default() });
+        mask.effects = vec![uniform, Effect::new(anchor, EffectKind::Anchor)];
+        let l = f.project.layer_mut(hidden).unwrap();
+        l.mask = Some(mask);
+        l.visible = false;
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.0; 3]), "the hidden layer draws nothing");
+        // a layer above reads it: 0.5 at 0.4
+        let top = fill_layer(&mut f.project, [0.5; 3], 0.0);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let source = Source::Anchor { anchor, channel: Channel::Height };
+        mask.effects = vec![Effect::new(f.project.alloc_id(), EffectKind::Fill { source, projection: Projection::default() })];
+        f.project.layer_mut(top).unwrap().mask = Some(mask);
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.2; 3]));
     }
 
     #[test]
