@@ -2104,10 +2104,12 @@ impl<'a, 'b> Texel<'a, 'b> {
         self.placed_read(p, |tap| image.sample_wrapped(tap.uv.x, tap.uv.y, wrap))
     }
 
-    /// The coverage of a fill source: 1, or a graph source's alpha output
+    /// The coverage of a fill source: 1, or a graph source's alpha output. A source reading its alpha output itself (a
+    /// material's opacity output on the opacity channel) is laid whole: its value is the coverage, not gated by itself
+    /// (the reference app's cut-out leaves show the material's opacity, not opacity² over the channel's default).
     fn source_alpha(&mut self, source: Option<&Source>, cooked: Option<&Cooked>, projection: &Projection) -> f32 {
         match source {
-            Some(Source::Graph(graph)) if graph.alpha_output.is_some() => self
+            Some(Source::Graph(graph)) if graph.alpha_output.is_some() && graph.output != graph.alpha_output => self
                 .graph_sample(cooked, graph.alpha_output.as_deref(), projection, graph.unfiltered)
                 .map_or(1.0, |alpha| if alpha[0].is_finite() { alpha[0].clamp(0.0, 1.0) } else { 0.0 }),
             _ => 1.0,

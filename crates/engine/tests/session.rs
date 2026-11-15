@@ -775,3 +775,33 @@ fn an_opened_project_reads_its_pixels_when_it_composites_and_composites_the_same
     assert_eq!(back.doc.pixels.layers, s.doc.pixels.layers, "read from the new file");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A fill channel reading a graph's alpha output itself (a material's opacity output on the opacity channel) lays that
+/// value whole; the other channels of the source are covered by it.
+#[test]
+fn a_source_reading_its_own_alpha_output_is_not_gated_by_it() {
+    use texturecraft_engine::core::{Fill, GraphRef, Layer, LayerKind, Source};
+    let mut s = session();
+    let text = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 color r=0.25 g=0.25 b=0.25\nnode 2 color r=0.75 g=0.75 b=0.75\noutput a 1\noutput v 2\n");
+    let mut own = GraphRef::new(text.clone(), "material");
+    own.output = Some("a".into());
+    own.alpha_output = Some("a".into());
+    let mut other = own.clone();
+    other.output = Some("v".into());
+    let mut fill = Fill::default();
+    fill.sources.insert(Channel::Roughness, Source::Graph(Box::new(own)));
+    fill.sources.insert(Channel::Metallic, Source::Graph(Box::new(other)));
+    let id = s.doc.project.alloc_id();
+    let layer = Layer::new(id, "material", LayerKind::Fill(fill), &Channel::DEFAULT_SET);
+    s.doc.project.insert_layer(0, layer, None, false).unwrap();
+    for c in &mut s.caches {
+        c.invalidate_all();
+    }
+    let below = s.caches[0].composite.value(Channel::Metallic, 128, 128)[0];
+    s.update();
+    let rough = s.caches[0].composite.value(Channel::Roughness, 128, 128)[0];
+    let metal = s.caches[0].composite.value(Channel::Metallic, 128, 128)[0];
+    assert!((rough - 0.25).abs() < 0.02, "the alpha output laid whole: {rough}");
+    let expected = 0.75 * 0.25 + below * 0.75;
+    assert!((metal - expected).abs() < 0.02, "another output covered by the alpha: {metal} (below {below})");
+}
