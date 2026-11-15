@@ -441,6 +441,24 @@ static CACHE: Mutex<Vec<(WarpGrid, Arc<WarpSurface>)>> = Mutex::new(Vec::new());
 
 /// The surface of `grid`, built once and shared while it stays among the grids used last.
 pub fn surface_for(grid: &WarpGrid) -> Result<Arc<WarpSurface>, String> {
+    // Asked once per texel: the grid used last on this thread answers without the shared lock or a copy of the grid
+    // (the compositor's threads would otherwise queue on `CACHE` for every texel of a warped layer).
+    let same = |k: &WarpGrid| k.rows == grid.rows && k.columns == grid.columns && k.points == grid.points;
+    if let Some(s) = LAST.with(|last| last.borrow().as_ref().filter(|(k, _)| same(k)).map(|(_, s)| Arc::clone(s))) {
+        return Ok(s);
+    }
+    let s = surface_shared(grid)?;
+    LAST.with(|last| *last.borrow_mut() = Some((WarpGrid { depth: 0.0, ..grid.clone() }, Arc::clone(&s))));
+    Ok(s)
+}
+
+thread_local! {
+    /// The grid this thread asked for last, and its surface.
+    static LAST: std::cell::RefCell<Option<(WarpGrid, Arc<WarpSurface>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`surface_for`] through the cache shared by all threads.
+fn surface_shared(grid: &WarpGrid) -> Result<Arc<WarpSurface>, String> {
     let key = WarpGrid { depth: 0.0, ..grid.clone() };
     if let Ok(cache) = CACHE.lock()
         && let Some((_, s)) = cache.iter().find(|(k, _)| *k == key)
@@ -470,6 +488,23 @@ mod tests {
             assert!((hit.image_per_grid - 0.5).abs() < 1e-6 && hit.pos[2].abs() < 1e-9);
         }
         assert!(s.locate([1.5, 0.0]).is_none(), "off the grid");
+    }
+
+    #[test]
+    fn a_grid_asked_again_shares_its_surface_and_another_grid_gets_its_own() {
+        let a = WarpGrid { rows: 3, columns: 3, depth: 0.1, points: Vec::new() };
+        let mut moved = regular_points(3, 3);
+        if let Some(p) = moved.get_mut(4) {
+            p.pos = [0.3, 0.2, 0.1];
+        }
+        let b = WarpGrid { rows: 3, columns: 3, depth: 0.1, points: moved };
+        let (a1, b1) = (surface_for(&a).unwrap(), surface_for(&b).unwrap());
+        let a2 = surface_for(&WarpGrid { depth: 0.4, ..a.clone() }).unwrap();
+        assert!(Arc::ptr_eq(&a1, &a2), "the depth is not part of the surface");
+        assert!(!Arc::ptr_eq(&a1, &b1));
+        assert!(Arc::ptr_eq(&b1, &surface_for(&b).unwrap()));
+        let hit = b1.locate([0.3, 0.2]).unwrap();
+        assert!((hit.uv[0] - 0.5).abs() < 1e-5, "{hit:?}");
     }
 
     #[test]
