@@ -167,7 +167,7 @@ fn rgb(c: [f32; 3]) -> Source {
 }
 
 fn pat(kind: ProceduralKind, scale: f32, seed: u32, contrast: f32, low: [f32; 3], high: [f32; 3]) -> Source {
-    Source::Procedural { pattern: Procedural { kind, scale, seed, contrast, balance: 0.0, invert: false }, low, high }
+    Source::Procedural { pattern: Procedural { kind, scale, seed, contrast, balance: 0.0, invert: false }, low, high, ramp: Vec::new() }
 }
 
 /// A scalar pattern between `lo` and `hi`.

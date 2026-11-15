@@ -56,6 +56,10 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   and offset, and the cylindrical axis in the fill's properties. Each channel takes its own image (a normal, roughness or height map, say): pick it in the channel's
   source menu, which also imports one, or drop it from the Assets panel onto the channel. A
   normal map image made for DirectX (Y down) is marked with **DirectX normal map** under it.
+  A color channel's procedural or anchor point takes a **gradient map** (*Gradient map* in the
+  channel's source menu): up to 16 color stops, dark to light, color the pattern, or recolor
+  the stack below by its lightness, without touching the other channels. The **Gradient map**
+  filter does the same for a whole layer's content.
   Alt+click a material channel (of a fill or the brush) to keep that channel alone.
 - **72 materials** (metals from measured reflectance, car paint, brushed anisotropic steel,
   velvet, skin, wax, glass, ice, woods, bamboo, bark, stone, cobblestone, gravel, plaster, sand,

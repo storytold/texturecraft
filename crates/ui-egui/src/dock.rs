@@ -2322,6 +2322,9 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                             app.run("layer.fill.set", set(json!({"value": c.default_value()})));
                             ui.close();
                         }
+                        if c.kind() == ChannelKind::Color {
+                            gradient_map_item(app, ui, &fill.source(c), &set);
+                        }
                         ui.separator();
                         for k in ProceduralKind::ALL {
                             if ui.button(tr(k.label())).clicked() {
@@ -2365,7 +2368,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                         }
                     }
                 }
-                Source::Procedural { pattern, low, high } => {
+                Source::Procedural { pattern, low, high, ramp } => {
                     ui.label(
                         RichText::new(trf(
                             "{pattern} (scale {scale}, seed {seed})",
@@ -2385,7 +2388,9 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                             set(json!({"procedural": pattern.kind.label(), "scale": s, "contrast": con, "seed": seed as u64, "low": low, "high": high, "merge": merge})),
                         );
                     }
-                    if c.kind() == ChannelKind::Color {
+                    if !ramp.is_empty() {
+                        ramp_editor(app, ui, &ramp, &format!("ramp_{salt}_{}", c.id()), &set);
+                    } else if c.kind() == ChannelKind::Color {
                         let (mut lo, mut hi) = (low, high);
                         let mut changed = false;
                         ui.horizontal(|ui| {
@@ -2415,8 +2420,11 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                         }
                     }
                 }
-                Source::Anchor { anchor, channel } => {
+                Source::Anchor { anchor, channel, ramp } => {
                     ui.label(RichText::new(anchor_label(app, anchor, channel)).color(tk.text_dim));
+                    if !ramp.is_empty() {
+                        ramp_editor(app, ui, &ramp, &format!("ramp_{salt}_{}", c.id()), &set);
+                    }
                 }
             }
         });
@@ -2425,6 +2433,54 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
             app.run("layer.fill.set", set(json!({"image": name})));
         }
     }
+}
+
+/// The Gradient map item of a color channel's source menu: turns the color stops of its
+/// procedural (starting from its low and high, so the look holds) or anchor on, or off.
+fn gradient_map_item(app: &mut TextureCraftApp, ui: &mut Ui, source: &Source, set: &impl Fn(Value) -> Value) {
+    let start = match source {
+        Source::Procedural { low, high, .. } => Some(vec![*low, std::array::from_fn(|k| (low[k] + high[k]) * 0.5), *high]),
+        Source::Anchor { .. } => Some(vec![[0.0; 3], [0.5; 3], [1.0; 3]]),
+        _ => None,
+    };
+    let on = !source.ramp().is_empty();
+    let hint = tr("Colors the procedural or anchor from dark to light through color stops");
+    let item = ui.add_enabled_ui(start.is_some(), |ui| ui.selectable_label(on, tr("Gradient map"))).inner;
+    if item.on_hover_text(hint).on_disabled_hover_text(hint).clicked() {
+        let colors = if on { Vec::new() } else { start.unwrap_or_default() };
+        app.run("layer.fill.set", set(json!({ "colors": colors })));
+        ui.close();
+    }
+}
+
+/// The color stops of a fill channel's gradient map.
+fn ramp_editor(app: &mut TextureCraftApp, ui: &mut Ui, ramp: &[[f32; 3]], salt: &str, set: &impl Fn(Value) -> Value) {
+    let mut stops = ramp.to_vec();
+    if gradient_stops(ui, salt, &mut stops) {
+        app.run("layer.fill.set", set(json!({ "colors": stops })));
+    }
+}
+
+/// Swatches for gradient map stops (dark to light) with Add color and Remove last; true when
+/// they changed.
+fn gradient_stops(ui: &mut Ui, salt: &str, stops: &mut Vec<[f32; 3]>) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        for (i, stop) in stops.iter_mut().enumerate() {
+            changed |= color_swatch(ui, &format!("{salt}_{i}"), stop, FILTER_SWATCH_WIDTH);
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.add_enabled(stops.len() < MAX_GRADIENT_STOPS, egui::Button::new(format!("{} {}", ic::PLUS, tr("Add color")))).clicked() {
+            stops.push(stops.last().copied().unwrap_or([1.0; 3]));
+            changed = true;
+        }
+        if ui.add_enabled(stops.len() > 1, egui::Button::new(format!("{} {}", ic::MINUS, tr("Remove last")))).clicked() {
+            stops.pop();
+            changed = true;
+        }
+    });
+    changed
 }
 
 /// The properties of effect `effect_id` of `layer`: each kind's own settings.
@@ -2441,7 +2497,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
             ui.label(caption(tr("Fill")));
             let anchors = anchors_below(app, layer.id);
             let current = match source {
-                Source::Anchor { anchor, channel } => anchor_label(app, *anchor, *channel),
+                Source::Anchor { anchor, channel, .. } => anchor_label(app, *anchor, *channel),
                 Source::Uniform(_) => tr("Uniform value").to_string(),
                 Source::Procedural { pattern, .. } => tr(pattern.kind.label()).to_string(),
                 Source::Image { name, .. } => trf("Image: {name}", &[("name", name)]),
@@ -2591,23 +2647,7 @@ fn filter_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, filter: &F
         }
         Filter::GradientMap { colors } => {
             let mut stops = colors.clone();
-            let mut changed = false;
-            ui.horizontal_wrapped(|ui| {
-                for (i, stop) in stops.iter_mut().enumerate() {
-                    changed |= color_swatch(ui, &format!("gradient_{id}_{i}"), stop, FILTER_SWATCH_WIDTH);
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.add_enabled(stops.len() < MAX_GRADIENT_STOPS, egui::Button::new(format!("{} {}", ic::PLUS, tr("Add color")))).clicked() {
-                    stops.push(stops.last().copied().unwrap_or([1.0; 3]));
-                    changed = true;
-                }
-                if ui.add_enabled(stops.len() > 1, egui::Button::new(format!("{} {}", ic::MINUS, tr("Remove last")))).clicked() {
-                    stops.pop();
-                    changed = true;
-                }
-            });
-            if changed {
+            if gradient_stops(ui, &format!("gradient_{id}"), &mut stops) {
                 set(app, "colors", json!(stops), false);
             }
             ui.label(RichText::new(tr("Dark to light: the content's luminance picks a color along these stops.")).size(FILTER_HINT_SIZE).color(tk.text_dim));

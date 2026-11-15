@@ -275,7 +275,7 @@ pub(crate) fn anchor_source(s: &Session, cmd: &str, reader: LayerId, anchor: Lay
     let order: Vec<LayerId> = s.doc.project.walk(ts).into_iter().map(|(id, _)| id).collect();
     let pos = |id: LayerId| order.iter().position(|x| *x == id);
     match (pos(owner), pos(reader)) {
-        (Some(o), Some(r)) if o < r => Ok(Source::Anchor { anchor, channel }),
+        (Some(o), Some(r)) if o < r => Ok(Source::Anchor { anchor, channel, ramp: Vec::new() }),
         _ => Err(bad(cmd, "the anchor point must be on a layer below this one in the same texture set")),
     }
 }
@@ -307,7 +307,7 @@ fn add_fill(s: &mut Session, p: &Value) -> Result<Value> {
             if let Some(v) = u64p(p, "seed") {
                 pr.seed = v as u32;
             }
-            Source::Procedural { pattern: pr, low: [0.0; 3], high: [1.0; 3] }
+            Source::Procedural { pattern: pr, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() }
         }
         None => Source::Uniform([f32p(p, "value").unwrap_or(1.0).clamp(0.0, 1.0); 3]),
     };
@@ -519,7 +519,7 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
     let anchor = match session.doc.project.effect(effect) {
         Some((owner, Effect { kind: EffectKind::Fill { source, .. }, .. })) => {
             let (current, channel) = match source {
-                Source::Anchor { anchor, channel } => (Some(*anchor), *channel),
+                Source::Anchor { anchor, channel, .. } => (Some(*anchor), *channel),
                 _ => (None, Channel::Height),
             };
             let channel_param = channel_param(CMD, params, "anchorChannel")?;

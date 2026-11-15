@@ -1052,6 +1052,12 @@ fn previews(inp: &Inputs, target: PaintTarget) -> bool {
     inp.preview.is_some_and(|p| p.target == target && (p.alpha.width(), p.alpha.height()) == (inp.gbuf.width, inp.gbuf.height))
 }
 
+/// A gradient map's color for lightness `t` (0..1): only color channels read a source's ramp,
+/// and an empty ramp leaves the source as it was (None).
+fn gradient_map(ramp: &[[f32; 3]], kind: ChannelKind, t: f32) -> Option<[f32; 3]> {
+    if kind == ChannelKind::Color { texturecraft_core::gradient(ramp, t) } else { None }
+}
+
 /// Tile (tx, ty) of painted pixels `img` (of `channel`, or a mask when None) at the size of the
 /// set being composited: as stored, or resampled (bilinear, premultiplied) when the pixels
 /// belong to a layer instanced from a set of another resolution.
@@ -1360,10 +1366,10 @@ impl<'a, 'b> Texel<'a, 'b> {
     fn source(&mut self, source: &Source, projection: &Projection, kind: ChannelKind) -> [f32; 3] {
         match source {
             Source::Uniform(value) => *value,
-            Source::Procedural { pattern, low, high } => {
+            Source::Procedural { pattern, low, high, ramp } => {
                 let (coords, projection, _) = self.projected(projection);
                 let amount = procedural(pattern, projection, &coords);
-                mix3(*low, *high, amount)
+                gradient_map(ramp, kind, amount).unwrap_or_else(|| mix3(*low, *high, amount))
             }
             Source::Image { name, normal_format } => {
                 let Some(image) = self.inp.images.get(name) else { return [0.5; 3] };
@@ -1387,10 +1393,15 @@ impl<'a, 'b> Texel<'a, 'b> {
                     ChannelKind::Signed => [lum(rgb) * 2.0 - 1.0; 3],
                 }
             }
-            Source::Anchor { anchor, channel } => {
+            Source::Anchor { anchor, channel, ramp } => {
                 // An anchor not evaluated yet (above this layer, hidden) reads the channel default
                 let anchored = self.anchors.iter().rev().find(|(id, _)| id == anchor).and_then(|(_, values)| values.get(channel.index()).copied());
                 let value = anchored.unwrap_or_else(|| channel.default_value());
+                // A gradient map reads the lightness: signed values (height) span -1..1
+                let lightness = if channel.kind() == ChannelKind::Signed { lum(value) * 0.5 + 0.5 } else { lum(value) };
+                if let Some(color) = gradient_map(ramp, kind, lightness) {
+                    return color;
+                }
                 let gray = matches!(channel.kind(), ChannelKind::Color | ChannelKind::NormalMap) && matches!(kind, ChannelKind::Scalar | ChannelKind::Signed);
                 if gray { [lum(value); 3] } else { value }
             }
@@ -2729,7 +2740,7 @@ mod tests {
         let pattern = Procedural::new(ProceduralKind::Checker);
         mask.effects.push(Effect::new(
             eid,
-            EffectKind::Fill { source: Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3] }, projection: Projection::default() },
+            EffectKind::Fill { source: Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() }, projection: Projection::default() },
         ));
         f.project.layer_mut(id).unwrap().mask = Some(mask);
         let out = run(&f, None);
@@ -2779,7 +2790,7 @@ mod tests {
         let pattern = Procedural::new(ProceduralKind::Checker);
         mask.effects.push(Effect::new(
             effect,
-            EffectKind::Fill { source: Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3] }, projection: Projection::default() },
+            EffectKind::Fill { source: Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() }, projection: Projection::default() },
         ));
         fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
 
@@ -2821,13 +2832,16 @@ mod tests {
         let lower = fill_layer(&mut fixture.project, [0.0; 3], 1.0);
         let LayerKind::Fill(fill) = &mut fixture.project.layer_mut(lower).unwrap().kind else { panic!("expected a fill layer") };
 
-        fill.sources.insert(Channel::BaseColor, Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] });
+        fill.sources.insert(
+            Channel::BaseColor,
+            Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() },
+        );
         let anchor = content_fx(&mut fixture, lower, EffectKind::Anchor);
         let upper = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
         let mut mask = Mask::new(MaskBackground::Black);
         mask.effects.push(Effect::new(
             fixture.project.alloc_id(),
-            EffectKind::Fill { source: Source::Anchor { anchor, channel: Channel::BaseColor }, projection: Projection::default() },
+            EffectKind::Fill { source: Source::Anchor { anchor, channel: Channel::BaseColor, ramp: Vec::new() }, projection: Projection::default() },
         ));
         fixture.project.layer_mut(upper).unwrap().mask = Some(mask.clone());
         let texels: Vec<_> = (0..128).map(|x| (x, 63)).collect();
@@ -2849,7 +2863,7 @@ mod tests {
         fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, 128, 128);
         fixture.project.texture_sets[0].resolution = 128;
         let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
-        let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] };
+        let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
         let warp = Filter::DirectionalWarp { intensity: 256.0, angle: 90.0, scale: 4.0, seed: 3 };
         let texels: Vec<_> = (0..128).map(|x| (x, 63)).collect();
         let mut masked = |filters: &[Filter]| {
@@ -2874,7 +2888,10 @@ mod tests {
         let layer = fill_layer(&mut fixture.project, [0.0; 3], 1.0);
         let LayerKind::Fill(fill) = &mut fixture.project.layer_mut(layer).unwrap().kind else { panic!("expected a fill layer") };
 
-        fill.sources.insert(Channel::BaseColor, Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] });
+        fill.sources.insert(
+            Channel::BaseColor,
+            Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() },
+        );
         let warp = Filter::DirectionalWarp { intensity: 256.0, angle: 90.0, scale: 4.0, seed: 3 };
         let warp_effect = content_fx(&mut fixture, layer, EffectKind::Filter(warp));
         let row = |fixture: &Fixture| -> Vec<f32> {
@@ -2969,7 +2986,7 @@ mod tests {
     fn generator_blur_softens_only_the_generator_not_the_stack_below() {
         let (mut fixture, layer) = ridge_fixture(100);
         let mut row_with = |blur: f32| {
-            let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] };
+            let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
             let below = Effect::new(fixture.project.alloc_id(), EffectKind::Fill { source: checker, projection: Projection::default() });
             let mut generator = ridge_generator();
             generator.global.blur = blur;
@@ -3087,7 +3104,7 @@ mod tests {
         let (e1, e2) = (f.project.alloc_id(), f.project.alloc_id());
         mask.effects.push(Effect::new(
             e1,
-            EffectKind::Fill { source: Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3] }, projection: Projection::default() },
+            EffectKind::Fill { source: Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() }, projection: Projection::default() },
         ));
         f.project.layer_mut(id).unwrap().mask = Some(mask.clone());
         let hard: Vec<f32> = (0..64).map(|x| run(&f, None).value(Channel::BaseColor, x, 20)[0]).collect();
@@ -3173,7 +3190,10 @@ soft {soft:?}"
         let mut f = fixture();
         let id = f.project.alloc_id();
         let mut fill = Fill::default();
-        fill.sources.insert(Channel::Roughness, Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] });
+        fill.sources.insert(
+            Channel::Roughness,
+            Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() },
+        );
         f.project.insert_layer(0, Layer::new(id, "F", LayerKind::Fill(fill), &[Channel::Roughness]), None, false).unwrap();
         let row = |f: &Fixture| {
             let out = run(f, None);
@@ -3203,7 +3223,10 @@ soft {soft:?}"
         let mut f = fixture();
         let id = f.project.alloc_id();
         let mut fill = Fill::default();
-        fill.sources.insert(Channel::Roughness, Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] });
+        fill.sources.insert(
+            Channel::Roughness,
+            Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() },
+        );
         f.project.insert_layer(0, Layer::new(id, "F", LayerKind::Fill(fill), &[Channel::Roughness]), None, false).unwrap();
         let plain = run(&f, None);
         let edges = content_fx(&mut f, id, EffectKind::Filter(Filter::EdgeDetect { width: 32.0 }));
@@ -3235,7 +3258,10 @@ soft {soft:?}"
         let checker = |f: &mut Fixture| {
             let id = f.project.alloc_id();
             let mut fill = Fill::default();
-            fill.sources.insert(Channel::Roughness, Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] });
+            fill.sources.insert(
+                Channel::Roughness,
+                Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() },
+            );
             f.project.insert_layer(0, Layer::new(id, "F", LayerKind::Fill(fill), &[Channel::Roughness]), None, false).unwrap();
             id
         };
@@ -3358,7 +3384,7 @@ soft {soft:?}"
         let anchor = content_fx(&mut f, low, EffectKind::Anchor);
         let top = fill_layer(&mut f.project, [1.0; 3], 0.5);
         let mut mask = Mask::new(MaskBackground::Black);
-        let source = Source::Anchor { anchor, channel: Channel::Height };
+        let source = Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() };
         mask.effects.push(Effect::new(f.project.alloc_id(), EffectKind::Fill { source, projection: Projection::default() }));
         f.project.layer_mut(top).unwrap().mask = Some(mask.clone());
         assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.7; 3]));
@@ -3421,9 +3447,88 @@ soft {soft:?}"
         let anchor = content_fx(&mut f, low, EffectKind::Anchor);
         let id = f.project.alloc_id();
         let mut fill = Fill::default();
-        fill.sources.insert(Channel::Roughness, Source::Anchor { anchor, channel: Channel::BaseColor });
+        fill.sources.insert(Channel::Roughness, Source::Anchor { anchor, channel: Channel::BaseColor, ramp: Vec::new() });
         f.project.insert_layer(0, Layer::new(id, "Top", LayerKind::Fill(fill), &[Channel::Roughness]), None, false).unwrap();
         let expect = texturecraft_core::lum([0.2, 0.4, 0.6]);
         assert!(close(run(&f, None).value(Channel::Roughness, 9, 9), [expect; 3]));
+    }
+
+    const RAMP: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+    #[test]
+    fn a_gradient_map_colors_only_color_channels_and_hits_its_stops() {
+        let ramp = RAMP.to_vec();
+        for (t, want) in [(0.0, [1.0, 0.0, 0.0]), (0.25, [0.5, 0.5, 0.0]), (0.5, [0.0, 1.0, 0.0]), (0.75, [0.0, 0.5, 0.5]), (1.0, [0.0, 0.0, 1.0])] {
+            assert_eq!(gradient_map(&ramp, ChannelKind::Color, t), Some(want), "lightness {t}");
+        }
+        assert_eq!(gradient_map(&[], ChannelKind::Color, 0.5), None, "no stops: the source's own values");
+        assert_eq!(gradient_map(&ramp, ChannelKind::Scalar, 0.5), None, "a scalar channel ignores the stops");
+        assert_eq!(gradient_map(&ramp, ChannelKind::Signed, 0.5), None);
+    }
+
+    #[test]
+    fn an_anchor_gradient_map_recolors_the_stack_below_by_its_lightness() {
+        for (gray, want) in [(0.0, [1.0, 0.0, 0.0]), (0.25, [0.5, 0.5, 0.0]), (0.5, [0.0, 1.0, 0.0]), (1.0, [0.0, 0.0, 1.0])] {
+            let mut f = fixture();
+            let low = fill_layer(&mut f.project, [gray; 3], 0.5);
+            let anchor = content_fx(&mut f, low, EffectKind::Anchor);
+            let id = f.project.alloc_id();
+            let mut fill = Fill::default();
+            fill.sources.insert(Channel::BaseColor, Source::Anchor { anchor, channel: Channel::BaseColor, ramp: RAMP.to_vec() });
+            // A scalar channel reading the same anchor with stops keeps reading its gray.
+            fill.sources.insert(Channel::Roughness, Source::Anchor { anchor, channel: Channel::BaseColor, ramp: RAMP.to_vec() });
+            fill.sources.insert(Channel::Metallic, Source::Uniform([0.3; 3]));
+            let channels = [Channel::BaseColor, Channel::Roughness, Channel::Metallic];
+            f.project.insert_layer(0, Layer::new(id, "Top", LayerKind::Fill(fill), &channels), None, false).unwrap();
+            let out = run(&f, None);
+            assert!(close(out.value(Channel::BaseColor, 9, 9), want), "gray {gray}: {:?}", out.value(Channel::BaseColor, 9, 9));
+            assert!(close(out.value(Channel::Roughness, 9, 9), [gray; 3]), "gray {gray}: {:?}", out.value(Channel::Roughness, 9, 9));
+            assert!(close(out.value(Channel::Metallic, 9, 9), [0.3; 3]));
+        }
+    }
+
+    #[test]
+    fn an_anchor_gradient_map_reads_signed_height_from_minus_one_to_one() {
+        for (height, want) in [(-1.0, [1.0, 0.0, 0.0]), (0.0, [0.0, 1.0, 0.0]), (0.5, [0.0, 0.5, 0.5])] {
+            let mut f = fixture();
+            let low = f.project.alloc_id();
+            let mut below = Fill::default();
+            below.sources.insert(Channel::Height, Source::Uniform([height; 3]));
+            f.project.insert_layer(0, Layer::new(low, "Below", LayerKind::Fill(below), &[Channel::Height]), None, false).unwrap();
+            let anchor = content_fx(&mut f, low, EffectKind::Anchor);
+            let id = f.project.alloc_id();
+            let mut fill = Fill::default();
+            fill.sources.insert(Channel::BaseColor, Source::Anchor { anchor, channel: Channel::Height, ramp: RAMP.to_vec() });
+            f.project.insert_layer(0, Layer::new(id, "Top", LayerKind::Fill(fill), &[Channel::BaseColor]), None, false).unwrap();
+            let out = run(&f, None);
+            assert!(close(out.value(Channel::BaseColor, 9, 9), want), "height {height}: {:?}", out.value(Channel::BaseColor, 9, 9));
+        }
+    }
+
+    #[test]
+    fn a_procedural_gradient_map_replaces_low_and_high_and_no_stops_keep_them() {
+        let (low, high) = ([0.2, 0.3, 0.4], [0.8, 0.7, 0.6]);
+        let composite = |ramp: Vec<[f32; 3]>, lo: [f32; 3], hi: [f32; 3]| {
+            let mut f = fixture();
+            let id = f.project.alloc_id();
+            let mut fill = Fill::default();
+            let pattern = Procedural::new(ProceduralKind::Gradient);
+            fill.sources.insert(Channel::BaseColor, Source::Procedural { pattern: pattern.clone(), low: lo, high: hi, ramp: ramp.clone() });
+            fill.sources.insert(Channel::Roughness, Source::Procedural { pattern, low: lo, high: hi, ramp });
+            f.project.insert_layer(0, Layer::new(id, "Fill", LayerKind::Fill(fill), &[Channel::BaseColor, Channel::Roughness]), None, false).unwrap();
+            let out = run(&f, None);
+            (0..64).map(|x| (out.value(Channel::BaseColor, x, 20), out.value(Channel::Roughness, x, 20))).collect::<Vec<_>>()
+        };
+        // The pattern's own 0..1 values, then the same pattern through low and high and through the stops.
+        let gray = composite(Vec::new(), [0.0; 3], [1.0; 3]);
+        let plain = composite(Vec::new(), low, high);
+        let mapped = composite(RAMP.to_vec(), low, high);
+        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 1e-3);
+        assert!(gray.iter().any(|(v, _)| v[0] < 0.25) && gray.iter().any(|(v, _)| v[0] > 0.75), "the gradient spans dark to light");
+        for (((t, _), (p, _)), (m, rough)) in gray.iter().zip(&plain).zip(&mapped) {
+            assert!(near(*p, mix3(low, high, t[0])), "no stops: low to high");
+            assert!(near(*m, texturecraft_core::gradient(&RAMP, t[0]).unwrap()), "{t:?} -> {m:?}");
+            assert!((rough[0] - mix3(low, high, t[0])[0]).abs() < 1e-3, "roughness ignores the stops: {rough:?}");
+        }
     }
 }

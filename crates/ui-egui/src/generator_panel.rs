@@ -303,7 +303,7 @@ fn input_slot(app: &mut TextureCraftApp, ui: &mut Ui, (layer, id): (LayerId, u64
         None => trf("Mesh map: {map}", &[("map", &tr(baked_map_label(map)))]),
         Some(Source::Image { name, .. }) => trf("Image: {name}", &[("name", name)]),
         Some(Source::Uniform(_)) => tr("Uniform value").to_string(),
-        Some(Source::Anchor { anchor, channel }) => anchor_label(app, *anchor, *channel),
+        Some(Source::Anchor { anchor, channel, .. }) => anchor_label(app, *anchor, *channel),
         Some(Source::Procedural { .. }) => tr("Procedural").to_string(),
     };
     let group = ui.group(|ui| {

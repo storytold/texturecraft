@@ -346,8 +346,15 @@ impl Procedural {
 pub enum Source {
     /// A constant value (linear RGB for colors; `[v, v, v]` for scalars).
     Uniform([f32; 3]),
-    /// A procedural pattern mixing two values.
-    Procedural { pattern: Procedural, low: [f32; 3], high: [f32; 3] },
+    /// A procedural pattern mixing two values, or on a color channel colored by `ramp` when it
+    /// has stops (a gradient map: dark to light through evenly spaced linear RGB colors).
+    Procedural {
+        pattern: Procedural,
+        low: [f32; 3],
+        high: [f32; 3],
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ramp: Vec<[f32; 3]>,
+    },
     /// An imported image resource, by name. `normal_format` is the convention of a normal map
     /// image (DirectX images have their green flipped where a normal channel samples them).
     Image {
@@ -356,8 +363,14 @@ pub enum Source {
         normal_format: crate::NormalFormat,
     },
     /// The stack value recorded by an anchor point effect (`anchor` is the effect id) for
-    /// `channel`; colors read as gray where a scalar is needed.
-    Anchor { anchor: LayerId, channel: Channel },
+    /// `channel`; colors read as gray where a scalar is needed. On a color channel a `ramp` with
+    /// stops recolors the value by its lightness (a gradient map).
+    Anchor {
+        anchor: LayerId,
+        channel: Channel,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ramp: Vec<[f32; 3]>,
+    },
 }
 
 impl Source {
@@ -368,6 +381,14 @@ impl Source {
     /// Image resource `name` (an OpenGL normal map where a normal channel samples it).
     pub fn image(name: impl Into<String>) -> Source {
         Source::Image { name: name.into(), normal_format: crate::NormalFormat::OpenGl }
+    }
+
+    /// The gradient map stops of a procedural or anchor source (empty: none).
+    pub fn ramp(&self) -> &[[f32; 3]] {
+        match self {
+            Source::Procedural { ramp, .. } | Source::Anchor { ramp, .. } => ramp,
+            _ => &[],
+        }
     }
 
     /// The anchor point this source reads, if any.
@@ -1106,7 +1127,7 @@ impl EffectKind {
         sources
             .into_iter()
             .filter_map(|source| match source {
-                Source::Anchor { anchor, channel } => Some((*anchor, *channel)),
+                Source::Anchor { anchor, channel, .. } => Some((*anchor, *channel)),
                 _ => None,
             })
             .collect()
@@ -1283,13 +1304,36 @@ mod tests {
     }
 
     #[test]
+    fn gradient_map_stops_round_trip_and_sources_without_them_save_as_before() {
+        let ramp = vec![[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let procedural = |ramp: Vec<[f32; 3]>| Source::Procedural { pattern: Procedural::new(ProceduralKind::Clouds), low: [0.25; 3], high: [0.75; 3], ramp };
+        let anchor = |ramp: Vec<[f32; 3]>| Source::Anchor { anchor: LayerId(7), channel: Channel::BaseColor, ramp };
+        for source in [procedural(ramp.clone()), anchor(ramp.clone())] {
+            let json = serde_json::to_value(&source).unwrap();
+            assert!(json.to_string().contains("\"ramp\""), "{json}");
+            assert_eq!(serde_json::from_value::<Source>(json).unwrap(), source);
+            assert_eq!(source.ramp(), ramp.as_slice());
+        }
+        // No stops: no `ramp` key, so projects without gradient maps save as they did; files from
+        // before gradient maps (no key) load with none.
+        let old_procedural = serde_json::json!({"Procedural": {"pattern": serde_json::to_value(Procedural::new(ProceduralKind::Clouds)).unwrap(), "low": [0.25, 0.25, 0.25], "high": [0.75, 0.75, 0.75]}});
+        let old_anchor = serde_json::json!({"Anchor": {"anchor": 7, "channel": "BaseColor"}});
+        for (old, source) in [(old_procedural, procedural(Vec::new())), (old_anchor, anchor(Vec::new()))] {
+            assert_eq!(serde_json::to_value(&source).unwrap(), old);
+            assert_eq!(serde_json::from_value::<Source>(old).unwrap(), source);
+            assert!(source.ramp().is_empty());
+        }
+        assert!(Source::Uniform([0.5; 3]).ramp().is_empty());
+    }
+
+    #[test]
     fn effect_targets_and_anchor_reads() {
         assert_eq!(EffectKind::Anchor.content_only(), Some(true));
         assert_eq!(EffectKind::Generator(Generator::new(GeneratorKind::Dirt)).content_only(), Some(false));
         assert_eq!(EffectKind::Filter(Filter::Invert).content_only(), None);
         let mut l = Layer::new(LayerId(1), "l", LayerKind::Paint, &[Channel::BaseColor]);
         assert!(!l.reads_anchor());
-        let source = Source::Anchor { anchor: LayerId(9), channel: Channel::Height };
+        let source = Source::Anchor { anchor: LayerId(9), channel: Channel::Height, ramp: Vec::new() };
         l.mask = Some(Mask {
             effects: vec![Effect::new(LayerId(2), EffectKind::Fill { source, projection: Projection::default() })],
             ..Mask::new(MaskBackground::Black)

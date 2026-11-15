@@ -787,7 +787,7 @@ mod tests {
         ];
         let id = p.insert_layer(0, l, None, false).unwrap();
         let mut top = paint(&mut p, "y");
-        let source = Source::Anchor { anchor, channel: Channel::Height };
+        let source = Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() };
         top.mask = Some(Mask {
             effects: vec![Effect::new(p.alloc_id(), EffectKind::Fill { source, projection: Projection::default() })],
             ..Mask::new(MaskBackground::Black)

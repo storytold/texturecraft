@@ -16,6 +16,7 @@ mod fill_channel_image;
 mod fill_projection_section;
 mod filter_picker;
 mod generator_panel;
+mod gradient_map_menu;
 mod history_panel;
 mod layer_clipboard;
 mod layer_rename;

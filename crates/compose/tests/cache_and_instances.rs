@@ -31,7 +31,7 @@ fn fixture() -> Fixture {
 }
 
 fn procedural(kind: ProceduralKind, low: f32, high: f32) -> Source {
-    Source::Procedural { pattern: Procedural::new(kind), low: [low; 3], high: [high; 3] }
+    Source::Procedural { pattern: Procedural::new(kind), low: [low; 3], high: [high; 3], ramp: Vec::new() }
 }
 
 fn add(f: &mut Fixture, ts: usize, kind: LayerKind, mask: Option<Mask>) -> LayerId {
@@ -200,7 +200,7 @@ fn mask_with_height_follows_the_layer_height() {
     // -0.25 (right).
     let mut ramp = Procedural::new(ProceduralKind::Gradient);
     ramp.scale = 1.0;
-    let height = Source::Procedural { pattern: ramp, low: [0.25; 3], high: [-0.25; 3] };
+    let height = Source::Procedural { pattern: ramp, low: [0.25; 3], high: [-0.25; 3], ramp: Vec::new() };
     let id = add(&mut f, 0, fill(&[(Channel::BaseColor, Source::Uniform([1.0; 3])), (Channel::Height, height)]), None);
     let mut mask = Mask::new(MaskBackground::Black);
     mask.effects.push(effect(&mut f, EffectKind::Fill { source: Source::Uniform([0.5; 3]), projection: Projection::default() }));
@@ -406,7 +406,7 @@ fn anchor_readers_fall_back_to_full_evaluation() {
     let mut f = fixture();
     let n = nested_stack(&mut f);
     let anchor = effect(&mut f, EffectKind::Anchor);
-    let source = Source::Anchor { anchor: anchor.id, channel: Channel::Height };
+    let source = Source::Anchor { anchor: anchor.id, channel: Channel::Height, ramp: Vec::new() };
     f.project.layer_mut(n.base).unwrap().content_effects.push(anchor);
     // A mask above the hot layer reads the stack below it.
     let reader = effect(&mut f, EffectKind::Fill { source, projection: Projection::default() });
@@ -516,7 +516,7 @@ fn anchors_inside_a_content_stack_record_the_content_up_to_them() {
     assert!(!check_cached(&f, 0, top).is_empty());
     // Readers: roughness reads the anchor inside the stack, metallic the one at its end.
     for (c, anchor) in [(Channel::Roughness, mid_id), (Channel::Metallic, end_id)] {
-        let reader = add(&mut f, 0, fill(&[(c, Source::Anchor { anchor, channel: Channel::Height })]), None);
+        let reader = add(&mut f, 0, fill(&[(c, Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() })]), None);
         f.project.layer_mut(reader).unwrap().channels.retain(|x, _| *x == c);
     }
     let out = reference(&f, 0);

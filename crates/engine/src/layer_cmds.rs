@@ -27,7 +27,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set fill source",
             [],
             None,
-            "{layer? | effect?: content fill effect id, channel, color?|value?|procedural?: kind, scale?, seed?, contrast?, balance?, invert?, low?, high?|image?, normalFormat?: openGl|directX (the image's normal map convention; alone, it changes the channel's image)|anchor?: anchor effect id, anchorChannel?, enabled?, solo?: true (this channel on, every other one off)}",
+            "{layer? | effect?: content fill effect id, channel, color?|value?|procedural?: kind, scale?, seed?, contrast?, balance?, invert?, low?, high?|image?, normalFormat?: openGl|directX (the image's normal map convention; alone, it changes the channel's image)|anchor?: anchor effect id, anchorChannel?, colors?: gradient map of a color channel's procedural or anchor, 1 to 16 colors dark to light ([r, g, b] linear or \"#rrggbb\"; [] removes it; absent keeps it; alone, it changes the channel's source), enabled?, solo?: true (this channel on, every other one off)}",
             has_layer,
             fill_set
         ),
@@ -320,6 +320,7 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
     let high = color_param("layer.fill.set", p, "high")?.unwrap_or([1.0; 3]);
     let color = color_param("layer.fill.set", p, "color")?;
     let value = color_param("layer.fill.set", p, "value")?;
+    let colors = ramp_param(p, ch)?;
     let source = if let Some(kind) = strp(p, "procedural") {
         let kind = ProceduralKind::parse(kind).ok_or_else(|| bad("layer.fill.set", format!("unknown procedural `{kind}`")))?;
         let mut pr = Procedural::new(kind);
@@ -336,7 +337,7 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
             pr.balance = v.clamp(-1.0, 1.0);
         }
         pr.invert = boolp(p, "invert").unwrap_or(false);
-        Some(Source::Procedural { pattern: pr, low, high })
+        Some(Source::Procedural { pattern: pr, low, high, ramp: Vec::new() })
     } else if let Some(c) = color.or(value) {
         Some(Source::Uniform(c))
     } else if let Some(name) = strp(p, "image") {
@@ -349,10 +350,10 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
         let reader = reader.ok_or_else(|| bad("layer.fill.set", "the fill is not in a layer"))?;
         let anchor_channel = channel_param("layer.fill.set", p, "anchorChannel")?.unwrap_or(ch);
         Some(crate::mask_cmds::anchor_source(s, "layer.fill.set", reader, LayerId(a), anchor_channel)?)
-    } else if enabled.is_some() || normal_format.is_some() {
+    } else if enabled.is_some() || normal_format.is_some() || colors.is_some() {
         None
     } else {
-        return Err(bad("layer.fill.set", "give `color`, `value`, `procedural`, `image`, `anchor`, `normalFormat`, `enabled` or `solo`"));
+        return Err(bad("layer.fill.set", "give `color`, `value`, `procedural`, `image`, `anchor`, `colors`, `normalFormat`, `enabled` or `solo`"));
     };
     if normal_format.is_some() && source.as_ref().is_some_and(|src| !matches!(src, Source::Image { .. })) {
         return Err(bad("layer.fill.set", "`normalFormat` goes with `image` or alone"));
@@ -368,6 +369,7 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
                 _ => return Err(bad("layer.fill.set", "`normalFormat` needs an image on the channel")),
             }
         }
+        let source = with_ramp(f.sources.get(&ch), source, colors)?;
         match target {
             // A fill effect's channel is on while it has a source.
             FillTarget::Effect(_) if enabled == Some(false) => {
@@ -398,6 +400,35 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(Value::Null)
+}
+
+/// The gradient map stops `colors` gives for channel `ch` (None when absent, empty to remove).
+fn ramp_param(p: &Value, ch: Channel) -> Result<Option<Vec<[f32; 3]>>> {
+    let Some(list) = p.get("colors").filter(|v| !v.is_null()) else { return Ok(None) };
+    let parsed: Option<Vec<[f32; 3]>> =
+        list.as_array().and_then(|a| a.iter().map(|c| crate::commands::color_of(c).map(|v| v.map(|x| x.clamp(0.0, 1.0)))).collect());
+    match parsed {
+        Some(c) if c.len() <= 16 && (c.is_empty() || ch.kind() == texturecraft_core::ChannelKind::Color) => Ok(Some(c)),
+        Some(c) if c.len() <= 16 => Err(bad("layer.fill.set", "`colors` (a gradient map) goes on a color channel")),
+        _ => Err(bad("layer.fill.set", "`colors` must be up to 16 colors ([r, g, b] linear or \"#rrggbb\")")),
+    }
+}
+
+/// `source` (or, for `colors` alone, the channel's `current` source) with its gradient map stops:
+/// `colors` when given, else those of `current`, so picking another pattern or anchor keeps them.
+fn with_ramp(current: Option<&Source>, source: Option<Source>, colors: Option<Vec<[f32; 3]>>) -> Result<Option<Source>> {
+    let mut source = match (source, &colors) {
+        (Some(source), _) => source,
+        (None, Some(_)) => current.cloned().ok_or_else(|| bad("layer.fill.set", "`colors` needs a procedural or an anchor on the channel"))?,
+        (None, None) => return Ok(None),
+    };
+    let kept = current.map(|c| c.ramp().to_vec()).unwrap_or_default();
+    match &mut source {
+        Source::Procedural { ramp, .. } | Source::Anchor { ramp, .. } => *ramp = colors.unwrap_or(kept),
+        _ if colors.is_some() => return Err(bad("layer.fill.set", "`colors` needs a procedural or an anchor on the channel")),
+        _ => {}
+    }
+    Ok(Some(source))
 }
 
 /// The projection `p` asks for. Fields it does not give keep their values from `current` when
