@@ -1,4 +1,4 @@
-//! The Gradient map item of a fill's Base color source menu turns color stops on and off.
+//! The Gradient Map item of a fill's Base color source menu turns color stops on and off.
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -11,16 +11,19 @@ fn base_color<'a>(h: &'a Harness<'_, TextureCraftApp>) -> egui_kittest::Node<'a>
     h.get_all_by_label("Base color").max_by(|a, b| a.rect().right().total_cmp(&b.rect().right())).unwrap()
 }
 
-/// Opens the Base color source menu and clicks its Gradient map item.
+/// Opens the Base color source menu and clicks its Gradient Map item.
 fn click_gradient_map(h: &mut Harness<'_, TextureCraftApp>) {
     base_color(h).scroll_to_me();
     // The scroll animates for about twenty frames.
     h.run_steps(30);
     let row = base_color(h).rect().center().y;
     let menu = h.get_all_by_label(egui_phosphor::regular::DOTS_THREE).find(|n| (n.rect().center().y - row).abs() < 6.0).unwrap();
+    let at = menu.rect().center();
     menu.click();
     h.run_steps(2);
-    h.get_by_label("Gradient map").click();
+    // The filter of the same name may show elsewhere (the shelf): the menu's item is the nearest.
+    let item = h.get_all_by_label("Gradient Map").min_by(|a, b| a.rect().center().distance(at).total_cmp(&b.rect().center().distance(at))).unwrap();
+    item.click();
     h.run_steps(3);
 }
 

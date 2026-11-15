@@ -2355,6 +2355,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                     .on_hover_text(tr("Channel source: uniform value, procedural, image or anchor"));
                 });
             });
+            let ramp = fill.source(c).ramp().to_vec();
             match fill.source(c) {
                 Source::Uniform(mut v) => {
                     if c.kind() == ChannelKind::Color {
@@ -2368,7 +2369,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                         }
                     }
                 }
-                Source::Procedural { pattern, low, high, ramp } => {
+                Source::Procedural { pattern, low, high, .. } => {
                     ui.label(
                         RichText::new(trf(
                             "{pattern} (scale {scale}, seed {seed})",
@@ -2388,9 +2389,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                             set(json!({"procedural": pattern.kind.label(), "scale": s, "contrast": con, "seed": seed as u64, "low": low, "high": high, "merge": merge})),
                         );
                     }
-                    if !ramp.is_empty() {
-                        ramp_editor(app, ui, &ramp, &format!("ramp_{salt}_{}", c.id()), &set);
-                    } else if c.kind() == ChannelKind::Color {
+                    if c.kind() == ChannelKind::Color && ramp.is_empty() {
                         let (mut lo, mut hi) = (low, high);
                         let mut changed = false;
                         ui.horizontal(|ui| {
@@ -2420,12 +2419,12 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                         }
                     }
                 }
-                Source::Anchor { anchor, channel, ramp } => {
+                Source::Anchor { anchor, channel, .. } => {
                     ui.label(RichText::new(anchor_label(app, anchor, channel)).color(tk.text_dim));
-                    if !ramp.is_empty() {
-                        ramp_editor(app, ui, &ramp, &format!("ramp_{salt}_{}", c.id()), &set);
-                    }
                 }
+            }
+            if c.kind() == ChannelKind::Color && !ramp.is_empty() {
+                ramp_editor(app, ui, &ramp, &format!("ramp_{salt}_{}", c.id()), &set);
             }
         });
         // A shelf image dropped on the channel becomes its source
@@ -2435,7 +2434,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
     }
 }
 
-/// The Gradient map item of a color channel's source menu: turns the color stops of its
+/// The Gradient Map item of a color channel's source menu: turns the color stops of its
 /// procedural (starting from its low and high, so the look holds) or anchor on, or off.
 fn gradient_map_item(app: &mut TextureCraftApp, ui: &mut Ui, source: &Source, set: &impl Fn(Value) -> Value) {
     let start = match source {
@@ -2445,7 +2444,7 @@ fn gradient_map_item(app: &mut TextureCraftApp, ui: &mut Ui, source: &Source, se
     };
     let on = !source.ramp().is_empty();
     let hint = tr("Colors the procedural or anchor from dark to light through color stops");
-    let item = ui.add_enabled_ui(start.is_some(), |ui| ui.selectable_label(on, tr("Gradient map"))).inner;
+    let item = ui.add_enabled_ui(start.is_some(), |ui| ui.selectable_label(on, tr("Gradient Map"))).inner;
     if item.on_hover_text(hint).on_disabled_hover_text(hint).clicked() {
         let colors = if on { Vec::new() } else { start.unwrap_or_default() };
         app.run("layer.fill.set", set(json!({ "colors": colors })));

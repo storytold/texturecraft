@@ -369,7 +369,7 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
                 _ => return Err(bad("layer.fill.set", "`normalFormat` needs an image on the channel")),
             }
         }
-        let source = with_ramp(f.sources.get(&ch), source, colors)?;
+        let source = with_ramp(ch, f.sources.get(&ch), source, colors)?;
         match target {
             // A fill effect's channel is on while it has a source.
             FillTarget::Effect(_) if enabled == Some(false) => {
@@ -416,16 +416,24 @@ fn ramp_param(p: &Value, ch: Channel) -> Result<Option<Vec<[f32; 3]>>> {
 
 /// `source` (or, for `colors` alone, the channel's `current` source) with its gradient map stops:
 /// `colors` when given, else those of `current`, so picking another pattern or anchor keeps them.
-fn with_ramp(current: Option<&Source>, source: Option<Source>, colors: Option<Vec<[f32; 3]>>) -> Result<Option<Source>> {
-    let mut source = match (source, &colors) {
+/// Only color channels keep stops, so a source copied onto another channel loses them; removing
+/// stops (`colors: []`) where there are none changes nothing.
+fn with_ramp(ch: Channel, current: Option<&Source>, source: Option<Source>, colors: Option<Vec<[f32; 3]>>) -> Result<Option<Source>> {
+    let adds = colors.as_ref().is_some_and(|c| !c.is_empty());
+    let needs = || bad("layer.fill.set", "`colors` needs a procedural or an anchor on the channel");
+    let mut source = match (source, current) {
         (Some(source), _) => source,
-        (None, Some(_)) => current.cloned().ok_or_else(|| bad("layer.fill.set", "`colors` needs a procedural or an anchor on the channel"))?,
-        (None, None) => return Ok(None),
+        (None, Some(current)) if colors.is_some() => current.clone(),
+        _ if adds => return Err(needs()),
+        _ => return Ok(None),
     };
-    let kept = current.map(|c| c.ramp().to_vec()).unwrap_or_default();
+    let kept = match current {
+        Some(current) if ch.kind() == texturecraft_core::ChannelKind::Color => current.ramp().to_vec(),
+        _ => Vec::new(),
+    };
     match &mut source {
         Source::Procedural { ramp, .. } | Source::Anchor { ramp, .. } => *ramp = colors.unwrap_or(kept),
-        _ if colors.is_some() => return Err(bad("layer.fill.set", "`colors` needs a procedural or an anchor on the channel")),
+        _ if adds => return Err(needs()),
         _ => {}
     }
     Ok(Some(source))

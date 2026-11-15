@@ -1052,12 +1052,6 @@ fn previews(inp: &Inputs, target: PaintTarget) -> bool {
     inp.preview.is_some_and(|p| p.target == target && (p.alpha.width(), p.alpha.height()) == (inp.gbuf.width, inp.gbuf.height))
 }
 
-/// A gradient map's color for lightness `t` (0..1): only color channels read a source's ramp,
-/// and an empty ramp leaves the source as it was (None).
-fn gradient_map(ramp: &[[f32; 3]], kind: ChannelKind, t: f32) -> Option<[f32; 3]> {
-    if kind == ChannelKind::Color { texturecraft_core::gradient(ramp, t) } else { None }
-}
-
 /// Tile (tx, ty) of painted pixels `img` (of `channel`, or a mask when None) at the size of the
 /// set being composited: as stored, or resampled (bilinear, premultiplied) when the pixels
 /// belong to a layer instanced from a set of another resolution.
@@ -1362,14 +1356,32 @@ impl<'a, 'b> Texel<'a, 'b> {
         w * image.map_or(1.0, |img| img.sample(c.uv.x, c.uv.y)[3].clamp(0.0, 1.0))
     }
 
+    /// The stack value anchor point `anchor` recorded for `channel` (the channel default for an
+    /// anchor not evaluated yet)
+    fn anchored(&self, anchor: LayerId, channel: Channel) -> [f32; 3] {
+        let values = self.anchors.iter().rev().find(|(id, _)| *id == anchor).and_then(|(_, values)| values.get(channel.index()).copied());
+        values.unwrap_or_else(|| channel.default_value())
+    }
+
     /// The value `source` gives this texel through `projection`, read as a channel of `kind`
     fn source(&mut self, source: &Source, projection: &Projection, kind: ChannelKind) -> [f32; 3] {
         match source {
             Source::Uniform(value) => *value,
-            Source::Procedural { pattern, low, high, ramp } => {
+            // A gradient map: on color channels the value picks a color along the stops
+            Source::Procedural { pattern, ramp, .. } if kind == ChannelKind::Color && !ramp.is_empty() => {
+                let (coords, projection, _) = self.projected(projection);
+                texturecraft_core::gradient(ramp, procedural(pattern, projection, &coords)).unwrap_or_default()
+            }
+            Source::Anchor { anchor, channel, ramp } if kind == ChannelKind::Color && !ramp.is_empty() => {
+                let value = self.anchored(*anchor, *channel);
+                // Signed values (height) span -1..1
+                let lightness = if channel.kind() == ChannelKind::Signed { lum(value) * 0.5 + 0.5 } else { lum(value) };
+                texturecraft_core::gradient(ramp, lightness).unwrap_or_default()
+            }
+            Source::Procedural { pattern, low, high, .. } => {
                 let (coords, projection, _) = self.projected(projection);
                 let amount = procedural(pattern, projection, &coords);
-                gradient_map(ramp, kind, amount).unwrap_or_else(|| mix3(*low, *high, amount))
+                mix3(*low, *high, amount)
             }
             Source::Image { name, normal_format } => {
                 let Some(image) = self.inp.images.get(name) else { return [0.5; 3] };
@@ -1393,15 +1405,10 @@ impl<'a, 'b> Texel<'a, 'b> {
                     ChannelKind::Signed => [lum(rgb) * 2.0 - 1.0; 3],
                 }
             }
-            Source::Anchor { anchor, channel, ramp } => {
+            Source::Anchor { anchor, channel, .. } => {
                 // An anchor not evaluated yet (above this layer, hidden) reads the channel default
                 let anchored = self.anchors.iter().rev().find(|(id, _)| id == anchor).and_then(|(_, values)| values.get(channel.index()).copied());
                 let value = anchored.unwrap_or_else(|| channel.default_value());
-                // A gradient map reads the lightness: signed values (height) span -1..1
-                let lightness = if channel.kind() == ChannelKind::Signed { lum(value) * 0.5 + 0.5 } else { lum(value) };
-                if let Some(color) = gradient_map(ramp, kind, lightness) {
-                    return color;
-                }
                 let gray = matches!(channel.kind(), ChannelKind::Color | ChannelKind::NormalMap) && matches!(kind, ChannelKind::Scalar | ChannelKind::Signed);
                 if gray { [lum(value); 3] } else { value }
             }
@@ -3456,19 +3463,9 @@ soft {soft:?}"
     const RAMP: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
     #[test]
-    fn a_gradient_map_colors_only_color_channels_and_hits_its_stops() {
-        let ramp = RAMP.to_vec();
-        for (t, want) in [(0.0, [1.0, 0.0, 0.0]), (0.25, [0.5, 0.5, 0.0]), (0.5, [0.0, 1.0, 0.0]), (0.75, [0.0, 0.5, 0.5]), (1.0, [0.0, 0.0, 1.0])] {
-            assert_eq!(gradient_map(&ramp, ChannelKind::Color, t), Some(want), "lightness {t}");
-        }
-        assert_eq!(gradient_map(&[], ChannelKind::Color, 0.5), None, "no stops: the source's own values");
-        assert_eq!(gradient_map(&ramp, ChannelKind::Scalar, 0.5), None, "a scalar channel ignores the stops");
-        assert_eq!(gradient_map(&ramp, ChannelKind::Signed, 0.5), None);
-    }
-
-    #[test]
     fn an_anchor_gradient_map_recolors_the_stack_below_by_its_lightness() {
-        for (gray, want) in [(0.0, [1.0, 0.0, 0.0]), (0.25, [0.5, 0.5, 0.0]), (0.5, [0.0, 1.0, 0.0]), (1.0, [0.0, 0.0, 1.0])] {
+        // The stops at 0, 0.5 and 1, and halfway between them
+        for (gray, want) in [(0.0, [1.0, 0.0, 0.0]), (0.25, [0.5, 0.5, 0.0]), (0.5, [0.0, 1.0, 0.0]), (0.75, [0.0, 0.5, 0.5]), (1.0, [0.0, 0.0, 1.0])] {
             let mut f = fixture();
             let low = fill_layer(&mut f.project, [gray; 3], 0.5);
             let anchor = content_fx(&mut f, low, EffectKind::Anchor);

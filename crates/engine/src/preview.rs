@@ -36,9 +36,9 @@ fn coords(n: Vec3) -> Coords {
 fn source(s: &Source, proj: &Projection, c: &Coords) -> Option<[f32; 3]> {
     match s {
         Source::Uniform(v) => Some(*v),
-        Source::Procedural { pattern, low, high, ramp } => {
+        Source::Procedural { pattern, low, high, .. } => {
             let t = procedural(pattern, proj, c);
-            Some(texturecraft_core::gradient(ramp, t).unwrap_or_else(|| [0, 1, 2].map(|k| low[k] + (high[k] - low[k]) * t)))
+            Some([0, 1, 2].map(|k| low[k] + (high[k] - low[k]) * t))
         }
         _ => None,
     }

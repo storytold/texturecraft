@@ -117,6 +117,33 @@ fn gradient_map_colors_are_refused_where_they_cannot_apply() {
     assert!(set(&mut s, json!({"channel": "baseColor", "procedural": "Clouds", "colors": vec![[0.5; 3]; 17]})).is_err(), "at most 16 stops");
     assert!(set(&mut s, json!({"channel": "baseColor", "procedural": "Clouds", "colors": ["red"]})).is_err());
     assert!(ramp(&s, layer).is_empty(), "a refused edit changes nothing");
+    // Removing stops where there are none (a uniform color) changes nothing either.
+    let before = s.doc.project.clone();
+    set(&mut s, json!({"channel": "baseColor", "colors": []})).unwrap();
+    assert_eq!(s.doc.project, before);
     set(&mut s, json!({"channel": "baseColor", "procedural": "Clouds", "colors": [[2.0, -1.0, 0.5]]})).unwrap();
     assert_eq!(ramp(&s, layer), vec![[1.0, 0.0, 0.5]], "stops clamp to 0..1");
+}
+
+#[test]
+fn a_scalar_channel_drops_stuck_stops_when_its_source_is_set() {
+    let mut s = session();
+    let layer = id(execute(&mut s, "layer.add.fill", &json!({"roughness": 0.4})).unwrap(), "layer");
+    // Stops on a scalar channel (a source copied from a color channel, or written by hand): the
+    // panel shows no stop editor there, so setting the source again must not keep them.
+    let stuck = |s: &mut Session| {
+        let LayerKind::Fill(fill) = &mut s.doc.project.layer_mut(LayerId(layer)).unwrap().kind else { panic!("not a fill layer") };
+        let pattern = texturecraft_engine::core::Procedural::new(texturecraft_engine::core::ProceduralKind::Clouds);
+        fill.sources.insert(Channel::Roughness, Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: RGB.to_vec() });
+    };
+    let roughness_ramp = |s: &Session| match &s.doc.project.layer(LayerId(layer)).unwrap().kind {
+        LayerKind::Fill(fill) => fill.source(Channel::Roughness).ramp().to_vec(),
+        _ => panic!("not a fill layer"),
+    };
+    stuck(&mut s);
+    execute(&mut s, "layer.fill.set", &json!({"layer": layer, "channel": "roughness", "procedural": "Clouds", "scale": 8.0})).unwrap();
+    assert!(roughness_ramp(&s).is_empty(), "a new pattern on roughness keeps no stops");
+    stuck(&mut s);
+    execute(&mut s, "layer.fill.set", &json!({"layer": layer, "channel": "roughness", "colors": []})).unwrap();
+    assert!(roughness_ramp(&s).is_empty(), "`colors: []` removes them");
 }
