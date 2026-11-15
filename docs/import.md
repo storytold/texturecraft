@@ -276,7 +276,7 @@ TextureCraft's measured blend rules (`texturecraft_core::rules`, which an import
 
 Imported projects are ordinary TextureCraft projects, but they are often far larger than what TextureCraft has been
 used with (several texture sets at 4096², dozens of layers, many anchors and graph filters reading the stack). On such
-projects editing works but is slow: toggling a layer can take minutes where the reference app needs seconds. This is a
+projects editing works but is slow: toggling a layer takes close to a minute where the reference app needs seconds. This is a
 property of TextureCraft's compositor, not of the import, and fixing it is general optimization work any large
 project will need. What we found, for whoever picks it up:
 
@@ -299,8 +299,8 @@ project will need. What we found, for whoever picks it up:
 - **Filters reading the stack run as whole-set fields** (`compose/src/field_cache.rs`, `compose::graphs`); painting
   bypasses the field cache, and the mask view and the Levels histogram recompute them on the UI thread.
 - **Reopening recomposites everything.** A saved project stores its layers, graph texts and graph renders, but not
-  the composited result, so the first view after opening composites the whole stack again (minutes on a large
-  project; the UI blocks on it when clicked). Storing a composite per texture set in the project file and showing it
+  the composited result, so the first view after opening composites the whole stack again (about 1.5 minutes on the
+  largest test project; the UI blocks on it when clicked). Storing a composite per texture set in the project file and showing it
   until the first recomposite would make large projects open as fast as the reference app does (a file format change).
 - **Graph results made while editing are never freed** (`compose/src/graphs/mod.rs`), and `GraphStore::prune` is
   never called, so results of deleted layers stay in the project file.
