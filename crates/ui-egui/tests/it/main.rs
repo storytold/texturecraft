@@ -5,6 +5,7 @@ mod bake_job_mesh;
 mod bake_mode;
 mod brush_drag;
 mod brush_section_reset;
+mod camera_views;
 mod close_unsaved;
 mod color_picker;
 mod color_selection_editor;

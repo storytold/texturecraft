@@ -529,10 +529,11 @@ mod tests {
     #[test]
     fn a_stored_shortcut_replaces_the_default_and_an_empty_one_unbinds() {
         let mut keymap = Keymap::new();
-        keymap.insert("file.save".into(), "F5".into());
+        // F7 is bound to nothing else, so the stored shortcut alone decides (F5 is Perspective)
+        keymap.insert("file.save".into(), "F7".into());
         keymap.insert("edit.undo".into(), String::new());
         let resolved = bindings_for(&keymap);
-        assert_eq!(resolved.command_of(&press(Key::F5, Modifiers::NONE)).as_deref(), Some("file.save"));
+        assert_eq!(resolved.command_of(&press(Key::F7, Modifiers::NONE)).as_deref(), Some("file.save"));
         assert_eq!(resolved.command_of(&press(Key::S, Modifiers::COMMAND)), None);
         assert_eq!(resolved.command_of(&press(Key::Z, Modifiers::COMMAND)), None);
     }

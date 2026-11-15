@@ -129,8 +129,10 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   light, environment importance sampling, displaced geometry, a denoiser and one-click PNG save,
   traced on the GPU
   (compute shaders, about 25× the CPU tracer, desktop and WebGPU) or on the CPU.
-- View any channel, any baked mesh map, or a UV checker; Alt+drag to orbit, middle-drag to pan,
-  wheel to zoom, F to frame, M / C / B to cycle views.
+- View any channel, any baked mesh map, or a UV checker; Alt+drag to orbit (Alt+Shift+drag in 90°
+  steps), middle-drag to pan, wheel to zoom, F to frame, M / C / B to cycle views.
+- **Perspective (F5) or orthographic (F6)** projection, and **front, back, left, right, top and
+  bottom views** that frame the mesh (Viewport menu; bind your own keys in Settings).
 - **3D and UV wireframes** that show the mesh's own polygons: quads and n-gons from OBJ, FBX,
   COLLADA, USD, Alembic and PLY files keep their edges, without the triangulation's diagonals.
 

@@ -320,6 +320,15 @@ is at), `camera.select {index? | name?}` restores one, `camera.rename {index? | 
 go to the first nine. Commands jump straight to the view; the desktop UI glides there over about a third
 of a second.
 
+## Camera views and projection
+
+`camera.view {view}` looks at the mesh from one side (`front` from +Z, `back`, `left` from -X,
+`right`, `top` and `bottom` at the orbit's ±89° pitch limit) and frames it; the projection stays.
+`camera.view.front` … `camera.view.bottom` do the same without params (Viewport menu, no default
+shortcut, bindable in Settings ▸ Keyboard). `camera.perspective` (F5) and `camera.orthographic` (F6)
+change only the projection; position and rotation stay. None of them is an undo step. In the 3D
+view, Alt+Shift+left drag orbits in 90° steps.
+
 ## MaterialCraft materials
 
 A `.mcmat` portable material (MaterialCraft's format, read here by `formats::mcmat`; the manifest is

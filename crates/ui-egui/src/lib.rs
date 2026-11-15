@@ -118,6 +118,8 @@ pub struct TextureCraftApp {
     pub session: Session,
     /// A smooth move to a saved camera in progress.
     camera_glide: Option<CameraGlide>,
+    /// Yaw and pitch an Alt+Shift drag has reached before snapping to 90° steps (see `viewport`).
+    orbit_snap: Option<(f32, f32)>,
     pub ui: UiState,
     /// Where `ui` is saved between runs
     ui_store: ui_state_store::UiStateStore,
@@ -209,6 +211,7 @@ impl TextureCraftApp {
 
         let mut app = TextureCraftApp {
             camera_glide: None,
+            orbit_snap: None,
             session,
             ui,
             ui_store,
@@ -278,8 +281,9 @@ impl TextureCraftApp {
     pub fn run(&mut self, id: &str, params: Value) -> Option<Value> {
         self.ui.prefs.apply_resource_limits();
 
-        // Going to a saved camera glides there; the control channel and CLI jump straight away
-        let glide_from = (id.starts_with("camera.select") || id.starts_with("camera.bookmark")).then_some(self.session.camera);
+        // Going to a saved camera or a fixed view glides there; the control channel and CLI jump straight away
+        let glides = id.starts_with("camera.select") || id.starts_with("camera.bookmark") || id.starts_with("camera.view");
+        let glide_from = glides.then_some(self.session.camera);
         match texturecraft_engine::execute(&mut self.session, id, &params) {
             Ok(v) => {
                 if let Some(from) = glide_from.filter(|f| *f != self.session.camera) {

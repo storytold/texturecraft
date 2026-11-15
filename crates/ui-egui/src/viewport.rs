@@ -517,6 +517,19 @@ const MAX_STENCIL_SCALE: f32 = 10.0;
 /// Smallest viewport the camera projects into, so a collapsed view keeps a usable aspect (points)
 const MIN_CAMERA_VIEWPORT: f32 = 16.0;
 
+/// Alt+Shift+left drag: orbit in 90° steps. The drag's own yaw and pitch follow the pointer; the
+/// camera takes the nearest step, with the pitch held inside the orbit's ±89° limit.
+fn snapped_orbit(app: &mut TextureCraftApp, delta: egui::Vec2) {
+    let step = std::f32::consts::FRAC_PI_2;
+    let limit = 89f32.to_radians();
+    let camera = &mut app.session.camera;
+    let (yaw, pitch) = app.orbit_snap.get_or_insert((camera.yaw, camera.pitch));
+    *yaw -= delta.x * ORBIT_RADIANS_PER_POINT;
+    *pitch = (*pitch + delta.y * ORBIT_RADIANS_PER_POINT).clamp(-step, step);
+    camera.yaw = (*yaw / step).round() * step;
+    camera.pitch = ((*pitch / step).round() * step).clamp(-limit, limit);
+}
+
 fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut PendingSync) {
     let response = ui.interact(rect, ui.scope_id().with("view3d"), Sense::click_and_drag());
     app.viewport_rect = rect;
@@ -539,7 +552,11 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     } else if response.dragged_by(PointerButton::Middle) {
         app.session.camera.pan(delta.x / size.y, delta.y / size.y);
     } else if alt && response.dragged_by(PointerButton::Primary) {
-        app.session.camera.orbit(delta.x * ORBIT_RADIANS_PER_POINT, delta.y * ORBIT_RADIANS_PER_POINT);
+        if shift {
+            snapped_orbit(app, delta);
+        } else {
+            app.session.camera.orbit(delta.x * ORBIT_RADIANS_PER_POINT, delta.y * ORBIT_RADIANS_PER_POINT);
+        }
     } else if response.dragged_by(PointerButton::Secondary) {
         if alt {
             app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT);
@@ -549,6 +566,11 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         } else {
             app.session.camera.orbit(delta.x * ORBIT_RADIANS_PER_POINT, delta.y * ORBIT_RADIANS_PER_POINT);
         }
+    }
+
+    // The next snapping drag starts again from where the camera is
+    if !(alt && shift && response.dragged_by(PointerButton::Primary)) {
+        app.orbit_snap = None;
     }
 
     if response.hovered() {
