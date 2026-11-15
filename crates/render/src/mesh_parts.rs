@@ -30,7 +30,7 @@ pub(crate) fn split(verts: &[Vertex], indices: &[u32], draws: &[Draw], wire: &[V
     for &(start, count, material) in draws {
         let mut first = part.indices.len() as u32;
         let tris = indices.get(start as usize..(start as usize).saturating_add(count as usize)).unwrap_or(&[]);
-        for tri in tris.chunks_exact(3) {
+        for tri in tris.as_chunks::<3>().0 {
             if tri.iter().any(|&v| v as usize >= verts.len()) {
                 continue;
             }
