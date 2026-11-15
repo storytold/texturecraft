@@ -605,7 +605,8 @@ mod tests {
         assert_eq!(rough.seed, (-3i32) as u32);
         assert_eq!(rough.params.get("tint"), Some(&GraphValue::Vector(vec![0.25, 0.5, 0.75])));
         assert_eq!(rough.params.get("on"), Some(&GraphValue::Int(1)));
-        assert!(!rough.params.contains_key("$outputsize") && !rough.params.contains_key("label"), "the size is the texture set's");
+        assert!(!rough.params.contains_key("$outputsize"), "the size is the texture set's");
+        assert_eq!(rough.params.get("label"), Some(&GraphValue::Text("x".into())), "text tweaks pass through");
         let base = graph_of(&fill.sources[&Channel::BaseColor]);
         assert_eq!(GraphRef { output: None, ..base.clone() }, GraphRef { output: None, ..rough.clone() }, "the channels share one render");
         assert!(fill.status.is_computable() && !fill.status.is_exact());
