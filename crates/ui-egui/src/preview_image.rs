@@ -153,44 +153,84 @@ pub fn image_preview(img: &ImageRes, size: usize) -> ColorImage {
     preview
 }
 
-/// Preview the brush along an S curve in an `n`-pixel square
-pub fn stroke_preview(b: &BrushSettings, n: usize) -> ColorImage {
-    let library = b.alpha_library.as_deref().and_then(alphas::find).map(alphas::LibraryAlpha::image);
-    let radius = n as f32 * 0.11;
-    let shape = Shape { alpha: b.alpha, image: None, library, level: 0 }.at_radius(radius);
-    let curve = |t: f32| (n as f32 * (0.15 + 0.7 * t), n as f32 * (0.5 - 0.22 * (t * std::f32::consts::TAU).sin()));
-    let mut cover = vec![0f32; n * n];
-    // Stable jitter keeps the preview reproducible
-    let rnd = |i: u32, k: u32| (i.wrapping_mul(0x9E37_79B9) ^ k.wrapping_mul(0x85EB_CA6B)).wrapping_mul(0xC2B2_AE35) as f32 / u32::MAX as f32;
-    let step = (b.spacing * 2.0 * radius).max(0.5);
+/// Preview the brush along an S curve in a `size_px` square
+pub fn stroke_preview(brush: &BrushSettings, size_px: usize, image: Option<&ImageRes>) -> ColorImage {
+    // Leave room around the S curve and cap work for a single preview
+    const STROKE_RADIUS_FRACTION: f32 = 0.11;
+    const CURVE_SAMPLE_STEP: f32 = 0.002;
+    const MIN_STAMP_SPACING_PX: f32 = 0.5;
+    const MAX_STAMPS: u32 = 2000;
+    const CURVE_HORIZONTAL_INSET: f32 = 0.15;
+    const CURVE_HORIZONTAL_SPAN: f32 = 0.7;
+    const CURVE_WAVE_AMPLITUDE: f32 = 0.22;
+
+    let library = brush.alpha_library.as_deref().and_then(alphas::find).map(alphas::LibraryAlpha::image);
+    let radius = size_px as f32 * STROKE_RADIUS_FRACTION;
+    let shape = Shape { alpha: brush.alpha, image, library, level: 0 }.at_radius(radius);
+
+    // The horizontal inset and vertical wave keep the S curve inside the swatch
+    let curve = |t: f32| {
+        (
+            size_px as f32 * (CURVE_HORIZONTAL_INSET + CURVE_HORIZONTAL_SPAN * t),
+            size_px as f32 * (0.5 - CURVE_WAVE_AMPLITUDE * (t * std::f32::consts::TAU).sin()),
+        )
+    };
+    let mut cover = vec![0f32; size_px * size_px];
+
+    // Odd multipliers decorrelate reproducible jitter across stamps and channels
+    let jitter_sample = |stamp_index: u32, channel: u32| {
+        (stamp_index.wrapping_mul(0x9E37_79B9) ^ channel.wrapping_mul(0x85EB_CA6B)).wrapping_mul(0xC2B2_AE35) as f32 / u32::MAX as f32
+    };
+    let step = (brush.spacing * 2.0 * radius).max(MIN_STAMP_SPACING_PX);
     let (mut t, mut travelled, mut i) = (0.0f32, step, 0u32);
     let mut last = curve(0.0);
-    while t <= 1.0 && i < 2000 {
+
+    while t <= 1.0 && i < MAX_STAMPS {
         let p = curve(t);
         travelled += (p.0 - last.0).hypot(p.1 - last.1);
         last = p;
-        t += 0.002;
+        t += CURVE_SAMPLE_STEP;
         if travelled < step {
             continue;
         }
         travelled = 0.0;
         i += 1;
-        let r = radius * (1.0 - b.jitter_size * rnd(i, 1));
-        let tangent = if b.follow_path { (curve(t).1 - p.1).atan2(curve(t).0 - p.0) } else { 0.0 };
-        let angle = b.angle.to_radians() + tangent + b.jitter_angle * std::f32::consts::TAU * rnd(i, 2);
-        let (cx, cy) = (p.0 + b.jitter_position * radius * (rnd(i, 3) * 2.0 - 1.0), p.1 + b.jitter_position * radius * (rnd(i, 4) * 2.0 - 1.0));
-        let flow = b.flow * (1.0 - b.jitter_flow * rnd(i, 5));
+        let stamp_radius = radius * (1.0 - brush.jitter_size * jitter_sample(i, 1));
+        let tangent = if brush.follow_path { (curve(t).1 - p.1).atan2(curve(t).0 - p.0) } else { 0.0 };
+        let angle = brush.angle.to_radians() + tangent + brush.jitter_angle * std::f32::consts::TAU * jitter_sample(i, 2);
+        let (cx, cy) = (
+            p.0 + brush.jitter_position * radius * (jitter_sample(i, 3) * 2.0 - 1.0),
+            p.1 + brush.jitter_position * radius * (jitter_sample(i, 4) * 2.0 - 1.0),
+        );
+        let flow = brush.flow * (1.0 - brush.jitter_flow * jitter_sample(i, 5));
         let (sin, cos) = angle.sin_cos();
-        let (x0, x1) = ((cx - r).floor().max(0.0) as usize, ((cx + r).ceil() as usize).min(n));
-        let (y0, y1) = ((cy - r).floor().max(0.0) as usize, ((cy + r).ceil() as usize).min(n));
+        let (x0, x1) = ((cx - stamp_radius).floor().max(0.0) as usize, ((cx + stamp_radius).ceil() as usize).min(size_px));
+        let (y0, y1) = ((cy - stamp_radius).floor().max(0.0) as usize, ((cy + stamp_radius).ceil() as usize).min(size_px));
         for y in y0..y1 {
             for x in x0..x1 {
-                let (dx, dy) = ((x as f32 + 0.5 - cx) / r, (cy - y as f32 - 0.5) / r);
-                let a = shape.sample(dx * cos + dy * sin, -dx * sin + dy * cos, b.hardness, i) * flow;
-                let c = &mut cover[y * n + x];
-                *c = 1.0 - (1.0 - *c) * (1.0 - a.clamp(0.0, 1.0));
+                let (dx, dy) = ((x as f32 + 0.5 - cx) / stamp_radius, (cy - y as f32 - 0.5) / stamp_radius);
+                let alpha = shape.sample(dx * cos + dy * sin, -dx * sin + dy * cos, brush.hardness, i) * flow;
+                let coverage = &mut cover[y * size_px + x];
+                *coverage = 1.0 - (1.0 - *coverage) * (1.0 - alpha.clamp(0.0, 1.0));
             }
         }
     }
-    ColorImage::new([n, n], cover.into_iter().map(|v| Color32::from_gray((v * b.opacity * 255.0 + 0.5) as u8)).collect())
+    ColorImage::new([size_px, size_px], cover.into_iter().map(|v| Color32::from_gray((v * brush.opacity * 255.0 + 0.5) as u8)).collect())
+}
+
+/// Environment `name`'s panorama across a `size²` swatch, transparent above and below
+pub fn environment_image(name: &str, size: usize) -> ColorImage {
+    let panorama = texturecraft_render::ibl::environment(name, u32::try_from(size).unwrap_or(u32::MAX));
+    let (width, height) = (panorama.width as usize, panorama.height as usize);
+    let mut image = ColorImage::filled([size, size], Color32::TRANSPARENT);
+    let top = size.saturating_sub(height) / 2;
+    for (y, row) in panorama.data.chunks(width.max(1)).enumerate() {
+        for (x, linear) in row.iter().enumerate().take(size) {
+            let Some(pixel) = image.pixels.get_mut((top + y) * size + x) else { continue };
+
+            let [r, g, b] = linear.map(|component| (linear_to_srgb(aces(component * EXPOSURE)) * 255.0 + 0.5) as u8);
+            *pixel = Color32::from_rgb(r, g, b);
+        }
+    }
+    image
 }
