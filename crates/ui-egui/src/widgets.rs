@@ -442,15 +442,25 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
     });
     let mut hex_buf = ui.data(|d| d.get_temp::<String>(id.with("hex"))).unwrap_or_else(|| format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]));
     ui.horizontal(|ui| {
-        ui.label(crate::i18n::tr("Hex"));
-        let resp = ui.add(egui::TextEdit::singleline(&mut hex_buf).desired_width(120.0));
-        if resp.changed() {
-            if let Some(parsed) = parse_hex_color(&hex_buf) {
-                srgb = parsed;
-                typed = true;
-            }
-        } else if !resp.has_focus() {
+        let hex_label = ui.label(crate::i18n::tr("Hex"));
+        let resp = ui.add(egui::TextEdit::singleline(&mut hex_buf).char_limit(32).desired_width(120.0)).labelled_by(hex_label.id);
+        let enter = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let lost_focus = resp.lost_focus();
+        let parsed = parse_hex_color(&hex_buf);
+        let is_six = is_six_digit_hex(&hex_buf);
+
+        if ((resp.changed() && is_six) || enter || lost_focus)
+            && let Some(parsed_color) = parsed
+        {
+            srgb = parsed_color;
+            typed = true;
+        }
+
+        if !resp.has_focus() {
             hex_buf = format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]);
+        } else if parsed.is_none() && !hex_buf.trim().is_empty() && hex_buf.trim() != "#" {
+            ui.painter().rect_stroke(resp.rect, 2.0, egui::Stroke::new(1.0, tk.warning), egui::StrokeKind::Outside);
+            let _ = resp.on_hover_text(crate::i18n::tr("Invalid color format (use #RRGGBB, #RGB or R, G, B)"));
         }
         ui.data_mut(|d| d.insert_temp(id.with("hex"), hex_buf.clone()));
         if icon_button(ui, egui_phosphor::regular::COPY, crate::i18n::tr("Copy Hex code"), false, 20.0).clicked() {
@@ -521,9 +531,31 @@ pub fn panel_header(ui: &mut Ui, title: &str, trailing: impl FnOnce(&mut Ui)) {
     });
 }
 
+/// Whether the string represents a complete 6-digit hex color code (with or without a single leading `#`).
+fn is_six_digit_hex(s: &str) -> bool {
+    let t = s.trim();
+    let t = if let Some(stripped) = t.strip_prefix('#') {
+        if stripped.starts_with('#') {
+            return false;
+        }
+        stripped
+    } else {
+        t
+    };
+    t.len() == 6 && t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Parse a color from a hexadecimal string (e.g. `#ffaa00`, `ffaa00`, `#f80`) or comma-separated sRGB numbers.
 pub fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
-    let t = s.trim().trim_start_matches('#');
+    let t = s.trim();
+    let t = if let Some(stripped) = t.strip_prefix('#') {
+        if stripped.starts_with('#') {
+            return None;
+        }
+        stripped
+    } else {
+        t
+    };
     if t.len() == 6 && t.chars().all(|c| c.is_ascii_hexdigit()) {
         let r = u8::from_str_radix(t.get(0..2)?, 16).ok()?;
         let g = u8::from_str_radix(t.get(2..4)?, 16).ok()?;
@@ -538,7 +570,7 @@ pub fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
     }
     let clean = s.trim().trim_start_matches("rgb(").trim_end_matches(')');
     let parts: Vec<&str> = clean.split([',', ' ', ';']).filter(|p| !p.trim().is_empty()).collect();
-    if parts.len() >= 3 {
+    if parts.len() == 3 {
         let r: u8 = parts.first()?.trim().parse().ok()?;
         let g: u8 = parts.get(1)?.trim().parse().ok()?;
         let b: u8 = parts.get(2)?.trim().parse().ok()?;

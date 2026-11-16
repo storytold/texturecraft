@@ -98,6 +98,31 @@ fn the_hex_input_and_copy_button_interact() {
 }
 
 #[test]
+fn hex_intermediate_typing_does_not_commit_partial_colors() {
+    let mut h = open_picker([1.0, 0.0, 0.0]);
+    let hex_field = h.get_all_by_role(Role::TextInput).next().unwrap();
+    hex_field.focus();
+    h.run_steps(2);
+
+    for _ in 0..7 {
+        h.key_press(egui::Key::Backspace);
+        h.run_steps(1);
+    }
+
+    for c in "#00F".chars() {
+        h.get_all_by_role(Role::TextInput).next().unwrap().type_text(&c.to_string());
+        h.run_steps(1);
+    }
+    let [r, _, b] = *h.state();
+    assert!(r > 0.9 && b < 0.05, "intermediate 3-digit hex does not change color while typing: {:?}", h.state());
+
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    let [r, _, b] = *h.state();
+    assert!(b > 0.9 && r < 0.05, "pressing Enter commits 3-digit hex: {:?}", h.state());
+}
+
+#[test]
 fn parse_hex_color_supports_hex_formats_and_rgb_strings() {
     use texturecraft_ui_egui::widgets::parse_hex_color;
 
@@ -107,5 +132,8 @@ fn parse_hex_color_supports_hex_formats_and_rgb_strings() {
     assert_eq!(parse_hex_color("f0a"), Some([255, 0, 170]));
     assert_eq!(parse_hex_color("255, 128, 64"), Some([255, 128, 64]));
     assert_eq!(parse_hex_color("rgb(10, 20, 30)"), Some([10, 20, 30]));
+    assert_eq!(parse_hex_color("###fff"), None);
+    assert_eq!(parse_hex_color("1, 2, 3, 4"), None);
+    assert_eq!(parse_hex_color("#FF000080"), None);
     assert_eq!(parse_hex_color("invalid"), None);
 }
