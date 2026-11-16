@@ -88,9 +88,7 @@ impl Script {
                 Script::Chinese => {
                     &["/System/Library/Fonts/Hiragino Sans GB.ttc", "/System/Library/Fonts/STHeiti Light.ttc", "/System/Library/Fonts/PingFang.ttc"]
                 }
-                Script::TraditionalChinese => {
-                    &["/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/STHeiti Medium.ttc"]
-                }
+                Script::TraditionalChinese => &["/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/STHeiti Medium.ttc"],
                 Script::Korean => &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
                 Script::Arabic => &["/System/Library/Fonts/SFArabic.ttf", "/System/Library/Fonts/Supplemental/GeezaPro.ttc"],
             };
