@@ -109,4 +109,3 @@ fn parse_hex_color_supports_hex_formats_and_rgb_strings() {
     assert_eq!(parse_hex_color("rgb(10, 20, 30)"), Some([10, 20, 30]));
     assert_eq!(parse_hex_color("invalid"), None);
 }
-
