@@ -287,14 +287,7 @@ mod tests {
         let (lo, hi) = s.mesh.bounds();
         let mut framed = s.camera;
         framed.frame(lo, hi);
-        let sides = [
-            ("front", Vec3::Z),
-            ("back", Vec3::NEG_Z),
-            ("left", Vec3::NEG_X),
-            ("right", Vec3::X),
-            ("top", Vec3::Y),
-            ("bottom", Vec3::NEG_Y),
-        ];
+        let sides = [("front", Vec3::Z), ("back", Vec3::NEG_Z), ("left", Vec3::NEG_X), ("right", Vec3::X), ("top", Vec3::Y), ("bottom", Vec3::NEG_Y)];
         for ortho in [false, true] {
             execute(&mut s, "camera.set", &json!({"ortho": ortho})).unwrap();
             for (view, side) in sides {
