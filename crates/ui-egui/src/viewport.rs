@@ -487,7 +487,7 @@ fn solo_notice(app: &TextureCraftApp, ui: &Ui, rect: Rect) {
 /// The camera and view pickers at the top of a view, left out when the view is too narrow to hold them
 fn view_header(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, id: &str) {
     let Some(header) = view_header_rect(rect) else { return };
-    if ui.input(|i| i.pointer.hover_pos().is_some_and(|p| header.expand(2.0).contains(p))) {
+    if !app.session.stroke_active() && ui.input(|i| !i.pointer.any_down() && i.pointer.hover_pos().is_some_and(|p| header.expand(2.0).contains(p))) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
     }
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(header).layout(egui::Layout::left_to_right(egui::Align::Center)));
@@ -909,8 +909,9 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // A handle owns a new click, but a stroke already under way must still finish over it
     let symmetry_handle = !app.session.stroke_active() && crate::symmetry::manipulator_hovered(app, ui, rect);
 
-    let header_hovered = view_header_rect(rect)
-        .is_some_and(|header| response.hover_pos().or_else(|| response.interact_pointer_pos()).is_some_and(|p| header.expand(2.0).contains(p)));
+    let header_hovered = !app.session.stroke_active()
+        && !response.dragged()
+        && view_header_rect(rect).is_some_and(|header| response.hover_pos().is_some_and(|p| header.expand(2.0).contains(p)));
 
     // Painting
     let painting = tool_acts(app)
@@ -1006,7 +1007,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !crate::symmetry::manipulator_hovered(app, ui, rect)
         && app.picking_id_color.is_none()
         // The view header's pickers keep the normal pointer.
-        && !view_header_rect(rect).is_some_and(|header| header.expand(2.0).contains(response.hover_pos().unwrap_or_default()))
+        && (!view_header_rect(rect).is_some_and(|header| header.expand(2.0).contains(response.hover_pos().unwrap_or_default())) || adjusting)
         && let Some(hover_pos) = if adjusting { ui.input(|input| input.pointer.press_origin()) } else { response.hover_pos() }
         && let Some(hit) = app.session.pick(local(hover_pos), app.session.viewport)
     {

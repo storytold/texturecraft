@@ -184,8 +184,12 @@ fn the_3d_view_header_restores_default_cursor_and_ignores_strokes() {
     h.run_steps(2);
     h.event(Event::PointerButton { pos: mesh_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
     h.run_steps(2);
+    h.hover_at(mesh_pos + egui::vec2(15.0, 0.0));
+    h.run_steps(2);
     h.hover_at(header_pos);
     h.run_steps(2);
     h.event(Event::PointerButton { pos: header_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
     h.run_steps(2);
+    assert_eq!(h.state().session.history_labels().len(), history_before + 1, "stroke released over header completes and commits to history");
+    assert!(!h.state().session.stroke_active(), "stroke is not left active after releasing over header");
 }
