@@ -163,5 +163,9 @@ fn removing_stops_from_an_absent_channel_adds_no_channel() {
     assert_eq!(s.doc.project, before, "no base color channel appears on the layer");
     // Turning the channel on still adds it.
     execute(&mut s, "layer.fill.set", &json!({"effect": effect, "channel": "baseColor", "enabled": true})).unwrap();
-    assert_ne!(s.doc.project, before);
+    let (_, x) = s.doc.project.effect(texturecraft_engine::core::LayerId(effect)).unwrap();
+    match &x.kind {
+        texturecraft_engine::core::EffectKind::Material(f) => assert!(f.sources.contains_key(&Channel::BaseColor), "enabled adds the channel"),
+        _ => panic!("not a content fill effect"),
+    }
 }
