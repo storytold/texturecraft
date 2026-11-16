@@ -71,6 +71,10 @@ impl UvGBuffer {
             .enumerate()
             .map(|(bi, (tri, bary))| {
                 let mut overlaps = 0u32;
+                // Texels a triangle's centre was strictly inside; a write on an edge must not
+                // erase that, or a later interior write would be missed (or a boundary-only one
+                // counted).
+                let mut interior = vec![false; tri.len()];
                 let row0 = bi as u32 * BAND;
                 let rows = (tri.len() as u32) / w;
                 for &t in bins.get(bi).map(Vec::as_slice).unwrap_or(&[]) {
@@ -81,6 +85,9 @@ impl UvGBuffer {
                     if area.abs() < 1e-12 {
                         continue;
                     }
+                    // A centre this close to an edge (in area units) is on it, shared with the
+                    // triangle next door rather than inside an overlapping island.
+                    let boundary = 1e-5 * area.abs();
                     let eps = -1e-6 * area.abs();
                     let x0 = pa.x.min(pb.x).min(pc.x).floor().max(0.0) as u32;
                     let x1 = (pa.x.max(pb.x).max(pc.x).ceil().min(w as f32) as u32).min(w);
@@ -94,10 +101,16 @@ impl UvGBuffer {
                                 continue;
                             }
                             let i = ((y - row0) * w + x) as usize;
+                            // A centre on this triangle's edge is the same surface as the
+                            // neighbour's, not an overlapping island.
+                            let strict = w0 > boundary && w1 > boundary && w2 > boundary;
+                            if strict && interior.get(i).copied().unwrap_or(false) {
+                                overlaps += 1;
+                            }
+                            if let Some(seen) = interior.get_mut(i) {
+                                *seen |= strict;
+                            }
                             if let (Some(slot), Some(bw)) = (tri.get_mut(i), bary.get_mut(i)) {
-                                if *slot != NO_TRI {
-                                    overlaps += 1;
-                                }
                                 *slot = t;
                                 let inv = 1.0 / area.abs();
                                 *bw = [w1 * inv, w2 * inv];
@@ -169,6 +182,19 @@ mod tests {
             }
         }
         assert_eq!(g.overlaps, 0);
+    }
+
+    #[test]
+    fn a_quad_has_no_overlap_along_its_shared_diagonal() {
+        let uv = vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(0.0, 1.0)];
+        for indices in [[0, 1, 2, 0, 2, 3], [0, 2, 3, 0, 1, 2]] {
+            let m = Mesh::from_parts(vec![Vec3::ZERO, Vec3::X, Vec3::ONE, Vec3::Y], None, uv.clone(), indices.to_vec(), "m").unwrap();
+
+            let g = UvGBuffer::new(&m, 0, 16, 16);
+
+            assert_eq!(g.covered_count(), 16 * 16, "{indices:?}");
+            assert_eq!(g.overlaps, 0, "{indices:?}: a quad's shared diagonal is not an overlapping UV island");
+        }
     }
 
     #[test]
