@@ -375,6 +375,8 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
             FillTarget::Effect(_) if enabled == Some(false) => {
                 f.sources.remove(&ch);
             }
+            // Removing stops (`colors: []`) from a channel the fill does not have adds nothing.
+            FillTarget::Effect(_) if source.is_none() && enabled != Some(true) && !f.sources.contains_key(&ch) => {}
             FillTarget::Effect(_) => {
                 let src = source.unwrap_or_else(|| f.source(ch));
                 f.sources.insert(ch, src);

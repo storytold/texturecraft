@@ -147,3 +147,21 @@ fn a_scalar_channel_drops_stuck_stops_when_its_source_is_set() {
     execute(&mut s, "layer.fill.set", &json!({"layer": layer, "channel": "roughness", "colors": []})).unwrap();
     assert!(roughness_ramp(&s).is_empty(), "`colors: []` removes them");
 }
+
+#[test]
+fn removing_stops_from_an_absent_channel_adds_no_channel() {
+    let mut s = session();
+    // A content fill effect that supplies only roughness: a default gray base color would cover the layer.
+    let effect = id(execute(&mut s, "effect.add.fill", &json!({"target": "content", "roughness": 0.7})).unwrap(), "effect");
+    let before = s.doc.project.clone();
+    execute(&mut s, "layer.fill.set", &json!({"effect": effect, "channel": "baseColor", "colors": []})).unwrap();
+    assert_eq!(s.doc.project, before, "no base color source appears on the effect");
+    // The same on a fill layer that has no base color channel.
+    let layer = id(execute(&mut s, "layer.add.fill", &json!({"roughness": 0.4})).unwrap(), "layer");
+    let before = s.doc.project.clone();
+    execute(&mut s, "layer.fill.set", &json!({"layer": layer, "channel": "baseColor", "colors": []})).unwrap();
+    assert_eq!(s.doc.project, before, "no base color channel appears on the layer");
+    // Turning the channel on still adds it.
+    execute(&mut s, "layer.fill.set", &json!({"effect": effect, "channel": "baseColor", "enabled": true})).unwrap();
+    assert_ne!(s.doc.project, before);
+}
