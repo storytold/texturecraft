@@ -401,69 +401,75 @@ const SHELF_PADDING: egui::Margin = egui::Margin::symmetric(3, 6);
 pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let tokens = Tokens::get(ui.ctx());
     let rtl = craft_ui::direction::is_rtl(ui);
-    craft_ui::direction::start_panel(ui, "tool_shelf").resizable(false).exact_size(SHELF_WIDTH).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
-        // The tools start level with the panels' contents, below their tab strips
-        let (left_m, right_m) = if rtl { (0, GUTTER) } else { (GUTTER, 0) };
-        let top = GUTTER + crate::docking::TAB_HEIGHT as i8;
-        card(ui, &tokens, egui::Margin { left: left_m, right: right_m, top, bottom: GUTTER }, SHELF_PADDING, |ui| {
-            ui.spacing_mut().item_spacing.y = SHELF_BUTTON_SPACING;
+    craft_ui::direction::start_panel(ui, "tool_shelf").resizable(false).exact_size(SHELF_WIDTH).show_separator_line(false).frame(egui::Frame::NONE).show(
+        ui,
+        |ui| {
+            // The tools start level with the panels' contents, below their tab strips
+            let (left_m, right_m) = if rtl { (0, GUTTER) } else { (GUTTER, 0) };
+            let top = GUTTER + crate::docking::TAB_HEIGHT as i8;
+            card(ui, &tokens, egui::Margin { left: left_m, right: right_m, top, bottom: GUTTER }, SHELF_PADDING, |ui| {
+                ui.spacing_mut().item_spacing.y = SHELF_BUTTON_SPACING;
 
-            // Rendering has nothing to paint, so its shelf keeps only the buttons below the tools
-            let tools: &[Tool] = match app.ui.mode {
-                Mode::Painting => &SHELF_TOOLS,
-                Mode::Baking => &BAKING_SHELF_TOOLS,
-                Mode::Rendering => &[],
-            };
-            if !tools.is_empty() {
-                for &tool in tools {
-                    let command = format!("tool.{}", tool.id());
-                    let hint = tip(&app.ui.keymap, tr(tool.label()), &command);
-                    let (usable, selected) = match app.ui.mode {
-                        // In bake mode Paint is the cage or skew brush while one of them is being painted
-                        Mode::Baking => {
-                            let bake_brush = tool == Tool::Paint && app.ui.bake_paint_brush.on;
-                            (bake_brush, bake_brush)
+                // Rendering has nothing to paint, so its shelf keeps only the buttons below the tools
+                let tools: &[Tool] = match app.ui.mode {
+                    Mode::Painting => &SHELF_TOOLS,
+                    Mode::Baking => &BAKING_SHELF_TOOLS,
+                    Mode::Rendering => &[],
+                };
+                if !tools.is_empty() {
+                    for &tool in tools {
+                        let command = format!("tool.{}", tool.id());
+                        let hint = tip(&app.ui.keymap, tr(tool.label()), &command);
+                        let (usable, selected) = match app.ui.mode {
+                            // In bake mode Paint is the cage or skew brush while one of them is being painted
+                            Mode::Baking => {
+                                let bake_brush = tool == Tool::Paint && app.ui.bake_paint_brush.on;
+                                (bake_brush, bake_brush)
+                            }
+                            // A greyed tool never shows as selected, even while it stays equipped
+                            _ => {
+                                let usable = crate::menus::enabled(app, &command);
+                                (usable, usable && app.session.tool.tool == tool)
+                            }
+                        };
+                        let button = ui.add_enabled_ui(usable, |ui| icon_button(ui, tool_icon(tool), &hint, selected, SHELF_BUTTON_SIZE)).inner;
+                        if button.on_disabled_hover_text(tr(tool.label())).clicked() && app.ui.mode == Mode::Painting {
+                            app.run("tool.select", json!({"tool": tool.id()}));
                         }
-                        // A greyed tool never shows as selected, even while it stays equipped
-                        _ => {
-                            let usable = crate::menus::enabled(app, &command);
-                            (usable, usable && app.session.tool.tool == tool)
-                        }
-                    };
-                    let button = ui.add_enabled_ui(usable, |ui| icon_button(ui, tool_icon(tool), &hint, selected, SHELF_BUTTON_SIZE)).inner;
-                    if button.on_disabled_hover_text(tr(tool.label())).clicked() && app.ui.mode == Mode::Painting {
-                        app.run("tool.select", json!({"tool": tool.id()}));
+                    }
+
+                    ui.add_space(SHELF_GROUP_GAP);
+                    ui.separator();
+                    ui.add_space(SHELF_GROUP_GAP);
+                }
+
+                let quick_mask = &app.session.quick_mask;
+                for (command, icon, label, selected) in [
+                    ("viewport.quickMask", ic::SELECTION_BACKGROUND, tr("Quick mask"), quick_mask.enabled),
+                    ("viewport.quickMask.edit", ic::SELECTION, tr("Edit quick mask"), quick_mask.editing),
+                    ("viewport.quickMask.invert", ic::SELECTION_INVERSE, tr("Invert quick mask"), quick_mask.inverted),
+                ] {
+                    let hint = tip(&app.ui.keymap, label, command);
+                    let button = ui.add_enabled_ui(crate::menus::enabled(app, command), |ui| icon_button(ui, icon, &hint, selected, SHELF_BUTTON_SIZE)).inner;
+                    if button.on_disabled_hover_text(label).clicked() {
+                        app.run(command, json!({}));
                     }
                 }
 
                 ui.add_space(SHELF_GROUP_GAP);
                 ui.separator();
                 ui.add_space(SHELF_GROUP_GAP);
-            }
-
-            let quick_mask = &app.session.quick_mask;
-            for (command, icon, label, selected) in [
-                ("viewport.quickMask", ic::SELECTION_BACKGROUND, tr("Quick mask"), quick_mask.enabled),
-                ("viewport.quickMask.edit", ic::SELECTION, tr("Edit quick mask"), quick_mask.editing),
-                ("viewport.quickMask.invert", ic::SELECTION_INVERSE, tr("Invert quick mask"), quick_mask.inverted),
-            ] {
-                let hint = tip(&app.ui.keymap, label, command);
-                let button = ui.add_enabled_ui(crate::menus::enabled(app, command), |ui| icon_button(ui, icon, &hint, selected, SHELF_BUTTON_SIZE)).inner;
-                if button.on_disabled_hover_text(label).clicked() {
-                    app.run(command, json!({}));
+                let painting = app.ui.mode == Mode::Painting;
+                if ui
+                    .add_enabled_ui(painting, |ui| icon_button(ui, ic::SPHERE, tr("Add smart material from the shelf"), false, SHELF_BUTTON_SIZE))
+                    .inner
+                    .clicked()
+                {
+                    app.ui.dock.focus(Panel::Assets);
                 }
-            }
-
-            ui.add_space(SHELF_GROUP_GAP);
-            ui.separator();
-            ui.add_space(SHELF_GROUP_GAP);
-            let painting = app.ui.mode == Mode::Painting;
-            if ui.add_enabled_ui(painting, |ui| icon_button(ui, ic::SPHERE, tr("Add smart material from the shelf"), false, SHELF_BUTTON_SIZE)).inner.clicked()
-            {
-                app.ui.dock.focus(Panel::Assets);
-            }
-        });
-    });
+            });
+        },
+    );
 }
 
 /// Width of the icon rail beside the dock

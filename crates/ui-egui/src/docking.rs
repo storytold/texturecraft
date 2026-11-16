@@ -258,18 +258,25 @@ pub fn mirror_workspace(workspace: &mut Workspace, container_width: f32) {
                 }
                 _ => {}
             },
-            Placement::SplitSized { zone, size, outer } => {
-                match zone {
-                    Zone::Left => *zone = Zone::Right,
-                    Zone::Right => *zone = Zone::Left,
-                    _ => {}
+            Placement::SplitSized { zone, size, outer } => match zone {
+                Zone::Left => {
+                    *zone = Zone::Right;
+                    mirror_split_size(size);
+                    mirror_split_size(outer);
+                    if let Some(s) = location.size.as_mut() {
+                        mirror_split_size(s);
+                    }
                 }
-                mirror_split_size(size);
-                mirror_split_size(outer);
-                if let Some(s) = location.size.as_mut() {
-                    mirror_split_size(s);
+                Zone::Right => {
+                    *zone = Zone::Left;
+                    mirror_split_size(size);
+                    mirror_split_size(outer);
+                    if let Some(s) = location.size.as_mut() {
+                        mirror_split_size(s);
+                    }
                 }
-            }
+                _ => {}
+            },
             Placement::Edge(zone) => match zone {
                 Zone::Left => *zone = Zone::Right,
                 Zone::Right => *zone = Zone::Left,
@@ -533,7 +540,6 @@ fn style(ui: &Ui, tokens: &Tokens) -> DockStyle {
     dock_style.title_bar_docks = false;
     dock_style
 }
-}
 
 /// Whether a modal layer or update dialog holds the input, so the panels, floating ones included,
 /// do not take it.
@@ -728,6 +734,26 @@ mod tests {
             }
             _ => panic!("unexpected placement"),
         }
+    }
+
+    #[test]
+    fn mirror_workspace_preserves_vertical_split_sized_placements() {
+        let mut w = default_workspace();
+        if let Some(loc) = w.hidden.iter_mut().find(|(p, _)| *p == Panel::Shader) {
+            loc.1.placement = Placement::SplitSized { zone: Zone::Bottom, size: SplitSize::Ratio(0.25), outer: SplitSize::Ratio(0.75) };
+            loc.1.size = Some(SplitSize::Ratio(0.25));
+        }
+        mirror_workspace(&mut w, DEFAULT_WINDOW_WIDTH);
+        let loc = w.hidden.iter().find(|(p, _)| *p == Panel::Shader).unwrap();
+        match &loc.1.placement {
+            Placement::SplitSized { zone, size, outer } => {
+                assert_eq!(*zone, Zone::Bottom, "vertical zone must not change");
+                assert_eq!(*size, SplitSize::Ratio(0.25), "vertical split size must remain unchanged");
+                assert_eq!(*outer, SplitSize::Ratio(0.75), "vertical outer size must remain unchanged");
+            }
+            _ => panic!("unexpected placement"),
+        }
+        assert_eq!(loc.1.size, Some(SplitSize::Ratio(0.25)), "location size must remain unchanged for vertical placement");
     }
 
     #[test]
