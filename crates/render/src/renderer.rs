@@ -2016,7 +2016,10 @@ impl Renderer {
         }
         let disp = match self.mesh.as_ref().filter(|_| displace) {
             // A unit height across 1/16 of UV space tilts 45°; use the mip nearest vertex spacing
-            Some(m) => [1.0, m.world_per_uv / 16.0 * s.displacement_scale.max(0.0), 1.0 / (m.dense.as_ref().unwrap_or(&m.geo).triangles.max(1) as f32 * 0.5).sqrt(), 0.0],
+            Some(m) => {
+                let tris = m.dense.as_ref().unwrap_or(&m.geo).triangles.max(1) as f32 * 0.5;
+                [1.0, m.world_per_uv / 16.0 * s.displacement_scale.max(0.0), 1.0 / tris.sqrt(), 0.0]
+            }
             None => [0.0; 4],
         };
         let shadow_disp = [disp[0], disp[1] * s.height_strength, disp[2], 0.0];

@@ -340,6 +340,13 @@ mod tests {
         assert_eq!(d.displacement_scale, 2.5);
         assert_eq!((d.scatter_color, d.scatter_radius), ([1.0, 0.5, 0.25], 0.3), "scatter settings (clamped)");
         assert_eq!(d.environment_resource(), Some(name.as_str()));
+
+        // Boundary testing for displacementScale (clamped to 0.0..=10.0)
+        execute(&mut s, "display.set", &json!({"displacementScale": -5.0})).unwrap();
+        assert_eq!(s.doc.project.display.displacement_scale, 0.0);
+        execute(&mut s, "display.set", &json!({"displacementScale": 15.0})).unwrap();
+        assert_eq!(s.doc.project.display.displacement_scale, 10.0);
+
         execute(&mut s, "file.removeUnused", &Value::Null).unwrap();
         assert!(s.doc.resources.contains_key(&name), "the environment's image counts as used");
     }

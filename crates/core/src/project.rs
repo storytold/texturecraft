@@ -903,4 +903,24 @@ mod tests {
         q.format_version = FORMAT_VERSION + 1;
         assert!(q.validate().is_err());
     }
+
+    #[test]
+    fn display_settings_displacement_scale_serialization() {
+        let d = DisplaySettings::default();
+        assert_eq!(d.displacement_scale, 1.0);
+        let json = serde_json::to_string(&d).unwrap();
+        let back: DisplaySettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.displacement_scale, 1.0);
+
+        let mut val: serde_json::Value = serde_json::to_value(&d).unwrap();
+        val.as_object_mut().unwrap().remove("displacement_scale");
+        let def: DisplaySettings = serde_json::from_value(val).unwrap();
+        assert_eq!(def.displacement_scale, 1.0);
+
+        let mut custom = d;
+        custom.displacement_scale = 4.5;
+        let custom_json = serde_json::to_string(&custom).unwrap();
+        let custom_back: DisplaySettings = serde_json::from_str(&custom_json).unwrap();
+        assert_eq!(custom_back.displacement_scale, 4.5);
+    }
 }
