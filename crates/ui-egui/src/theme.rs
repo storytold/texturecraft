@@ -295,7 +295,7 @@ pub(crate) const SEMIBOLD: &str = "ui-semibold";
 
 /// The app's fonts: Inter (regular and semibold) when built with craft-fonts, egui's defaults
 /// otherwise, egui's monospace face for values, and the Phosphor icon font (`fonts::UiFonts`
-/// adds CJK).
+/// adds CJK, Arabic, and Thai fallback).
 pub fn font_definitions() -> egui::FontDefinitions {
     use std::sync::Arc;
     let mut fonts = egui::FontDefinitions::default();

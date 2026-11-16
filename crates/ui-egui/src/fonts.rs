@@ -1,5 +1,5 @@
-//! CJK and Arabic fallback fonts for the UI. egui's default fonts have no Japanese, Chinese,
-//! Korean or Arabic glyphs, so translated UIs (and such layer or file names) need more fonts.
+//! CJK, Arabic and Thai fallback fonts for the UI. egui's default fonts have no Japanese, Chinese,
+//! Korean, Arabic or Thai glyphs, so translated UIs (and such layer or file names) need more fonts.
 //! They come from:
 //!
 //! 1. craft-fonts, embedded at build time when `CRAFT_FONTS_DIR` points at a checkout (optional;
@@ -186,7 +186,9 @@ impl UiFonts {
 
 /// The first available font for `script`: craft-fonts' (embedded), then the system's.
 fn load(script: Script) -> Option<FontData> {
-    if let Some(f) = CRAFT_FONTS.iter().find(|f| f.scripts.contains(&script.iso()) && f.style == "Regular" && !f.bytes.is_empty()) {
+    if let Some(f) =
+        CRAFT_FONTS.iter().find(|f| f.scripts.contains(&script.iso()) && f.style == "Regular" && !f.bytes.is_empty() && line_metrics(f.bytes, 0).is_some())
+    {
         return Some(aligned(FontData::from_static(f.bytes)));
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -196,6 +198,9 @@ fn load(script: Script) -> Option<FontData> {
             continue;
         }
         if let Ok(bytes) = std::fs::read(&path) {
+            if line_metrics(&bytes, index).is_none() {
+                continue;
+            }
             let mut data = FontData::from_owned(bytes);
             data.index = index;
             return Some(aligned(data));
@@ -227,6 +232,7 @@ fn thai_system_files() -> Vec<(std::path::PathBuf, u32)> {
             "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
             "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
             "/usr/share/fonts/google-noto/NotoSansThai-Regular.ttf",
+            "/usr/share/fonts/google-noto-vf/NotoSansThai[wght].ttf",
             "/usr/local/share/fonts/noto/NotoSansThai-Regular.ttf",
             "/usr/share/fonts/truetype/tlwg/Loma.ttf",
             "/usr/share/fonts/truetype/thai/Loma.ttf",
@@ -239,7 +245,9 @@ fn thai_system_files() -> Vec<(std::path::PathBuf, u32)> {
 }
 
 pub fn load_thai() -> Option<FontData> {
-    if let Some(f) = CRAFT_FONTS.iter().find(|f| f.scripts.contains(&"Thai") && f.style == "Regular" && !f.bytes.is_empty()) {
+    if let Some(f) =
+        CRAFT_FONTS.iter().find(|f| f.scripts.contains(&"Thai") && f.style == "Regular" && !f.bytes.is_empty() && line_metrics(f.bytes, 0).is_some())
+    {
         return Some(aligned(FontData::from_static(f.bytes)));
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -249,11 +257,15 @@ pub fn load_thai() -> Option<FontData> {
             continue;
         }
         if let Ok(bytes) = std::fs::read(&path) {
+            if line_metrics(&bytes, index).is_none() {
+                continue;
+            }
             let mut data = FontData::from_owned(bytes);
             data.index = index;
             return Some(aligned(data));
         }
     }
+    log::warn!("no font found for Thai text; it shows as boxes");
     None
 }
 
@@ -431,5 +443,11 @@ mod tests {
         assert!(unique.len() >= 8, "expected distinct Thai glyphs and combining marks, got {}", unique.len());
         assert_ne!(with_uvs, without_uvs, "Thai fallback should resolve real glyphs rather than missing-glyph boxes");
         assert!((thai_asc - latin_asc).abs() < 1e-3, "Thai ascent {thai_asc} should align with Latin {latin_asc}");
+    }
+
+    #[test]
+    fn load_thai_skips_corrupted_font_data() {
+        assert!(line_metrics(b"not a valid font", 0).is_none());
+        assert!(line_metrics(b"corrupt font data", 0).is_none());
     }
 }
