@@ -428,8 +428,10 @@ fn initial_ramp(ch: Channel, source: &Option<Source>, current: Option<&Source>) 
     if ch.kind() != texturecraft_core::ChannelKind::Color {
         return Err(bad("layer.fill.set", "`gradientMap` goes on a color channel"));
     }
+    if let Some(kept) = current.map(Source::ramp).filter(|r| !r.is_empty()) {
+        return Ok(Some(kept.to_vec()));
+    }
     match source.as_ref().or(current) {
-        Some(src) if !src.ramp().is_empty() => Ok(Some(src.ramp().to_vec())),
         Some(Source::Procedural { low, high, .. }) => Ok(Some(vec![*low, std::array::from_fn(|k| (low[k] + high[k]) * 0.5), *high])),
         Some(Source::Anchor { .. }) => Ok(Some(vec![[0.0; 3], [0.5; 3], [1.0; 3]])),
         _ => Err(bad("layer.fill.set", "`gradientMap` needs a procedural or an anchor on the channel")),

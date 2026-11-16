@@ -190,6 +190,9 @@ fn gradient_map_true_starts_the_stops_from_the_current_source() {
     set(&mut s, json!({"colors": RGB})).unwrap();
     set(&mut s, json!({"gradientMap": true})).unwrap();
     assert_eq!(ramp(&s, layer), RGB.to_vec());
+    // Set together with a new pattern, the stops stay.
+    set(&mut s, json!({"procedural": "Voronoi", "gradientMap": true})).unwrap();
+    assert_eq!(ramp(&s, layer), RGB.to_vec());
     // It cannot go with `colors`, and it undoes in one step.
     assert!(set(&mut s, json!({"gradientMap": true, "colors": RGB})).is_err());
     set(&mut s, json!({"colors": []})).unwrap();
