@@ -36,18 +36,20 @@ const MAX_FONT_BYTES: u64 = 128 << 20;
 pub enum Script {
     Japanese,
     Chinese,
+    TraditionalChinese,
     Korean,
     Arabic,
 }
 
 impl Script {
-    pub const ALL: [Script; 4] = [Script::Japanese, Script::Chinese, Script::Korean, Script::Arabic];
+    pub const ALL: [Script; 5] = [Script::Japanese, Script::Chinese, Script::TraditionalChinese, Script::Korean, Script::Arabic];
 
     /// The script a UI language needs beyond Latin.
     pub fn of_language(code: &str) -> Option<Script> {
         match code {
             "ja" => Some(Script::Japanese),
-            "zh-Hans" | "zh-Hant" => Some(Script::Chinese),
+            "zh-Hans" => Some(Script::Chinese),
+            "zh-Hant" => Some(Script::TraditionalChinese),
             "ko" => Some(Script::Korean),
             "ar" => Some(Script::Arabic),
             _ => None,
@@ -59,6 +61,7 @@ impl Script {
         match self {
             Script::Japanese => "Jpan",
             Script::Chinese => "Hans",
+            Script::TraditionalChinese => "Hant",
             Script::Korean => "Kore",
             Script::Arabic => "Arab",
         }
@@ -73,7 +76,8 @@ impl Script {
             let fonts = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
             let files: &[&str] = match self {
                 Script::Japanese => &["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"],
-                Script::Chinese => &["msjh.ttc", "msyh.ttc", "simsun.ttc", "simhei.ttf"],
+                Script::Chinese => &["msyh.ttc", "simsun.ttc", "simhei.ttf"],
+                Script::TraditionalChinese => &["msjh.ttc", "mingliu.ttc"],
                 Script::Korean => &["malgun.ttf", "gulim.ttc"],
                 Script::Arabic => &["segoeui.ttf", "tahoma.ttf", "arial.ttf"],
             };
@@ -83,6 +87,9 @@ impl Script {
                 Script::Japanese => &["/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", "/System/Library/Fonts/Hiragino Sans GB.ttc"],
                 Script::Chinese => {
                     &["/System/Library/Fonts/Hiragino Sans GB.ttc", "/System/Library/Fonts/STHeiti Light.ttc", "/System/Library/Fonts/PingFang.ttc"]
+                }
+                Script::TraditionalChinese => {
+                    &["/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/STHeiti Medium.ttc"]
                 }
                 Script::Korean => &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
                 Script::Arabic => &["/System/Library/Fonts/SFArabic.ttf", "/System/Library/Fonts/Supplemental/GeezaPro.ttc"],

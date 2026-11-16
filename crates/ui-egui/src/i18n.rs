@@ -106,7 +106,14 @@ pub fn trf(template: &str, args: &[(&str, &dyn Display)]) -> String {
 /// none matches). Chinese locales get Simplified or Traditional Chinese; Portuguese ones get Brazilian Portuguese.
 pub fn language_for_locale(locale: &str) -> &'static str {
     let lower = locale.to_ascii_lowercase();
-    if lower.contains("hant") || lower.contains("zh-tw") || lower.contains("zh_tw") || lower.contains("zh-hk") || lower.contains("zh_hk") || lower.contains("zh-mo") || lower.contains("zh_mo") {
+    if lower.contains("hant")
+        || lower.contains("zh-tw")
+        || lower.contains("zh_tw")
+        || lower.contains("zh-hk")
+        || lower.contains("zh_hk")
+        || lower.contains("zh-mo")
+        || lower.contains("zh_mo")
+    {
         return "zh-Hant";
     }
     let lang = locale.split(['-', '_', '.', '@']).next().unwrap_or("").to_ascii_lowercase();
