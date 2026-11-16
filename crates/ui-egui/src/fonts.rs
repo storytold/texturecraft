@@ -51,7 +51,7 @@ impl Script {
             "zh-Hans" => Some(Script::Chinese),
             "ko" => Some(Script::Korean),
             "ar" => Some(Script::Arabic),
-            "he" | "iw" => Some(Script::Hebrew),
+            "he" => Some(Script::Hebrew),
             _ => None,
         }
     }

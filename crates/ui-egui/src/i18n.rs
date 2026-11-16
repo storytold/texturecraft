@@ -114,16 +114,6 @@ pub fn language_for_locale(locale: &str) -> &'static str {
     }
 }
 
-/// Whether `code` is a right-to-left language ("ar" or "he").
-pub fn is_rtl_code(code: &str) -> bool {
-    matches!(code, "ar" | "he")
-}
-
-/// Whether the current UI language is right-to-left.
-pub fn is_rtl() -> bool {
-    is_rtl_code(current().code)
-}
-
 /// The operating system's (or browser's) UI language, for the first run.
 pub fn os_language() -> &'static str {
     #[cfg(not(target_arch = "wasm32"))]
@@ -322,10 +312,6 @@ mod tests",
         ] {
             assert_eq!(language_for_locale(locale), code, "{locale}");
         }
-        assert!(is_rtl_code("ar"));
-        assert!(is_rtl_code("he"));
-        assert!(!is_rtl_code("en"));
-        assert!(!is_rtl_code("ja"));
         set_language("de");
         assert_eq!(current().code, if available("de") { "de" } else { "en" });
         assert_eq!(tr("not a key"), "not a key");

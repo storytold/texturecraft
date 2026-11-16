@@ -58,8 +58,11 @@ UI language needs them or the language picker shows every language's own name:
    Windows; Hiragino, PingFang / STHeiti and Apple SD Gothic Neo on macOS; Noto Sans CJK, WenQuanYi,
    Droid Sans Fallback and Nanum Gothic on Linux and FreeBSD. Arabic: Segoe UI / Tahoma / Arial on
    Windows, SF Arabic / Geeza Pro on macOS, Noto Sans Arabic or DejaVu Sans on Linux and FreeBSD.
+   Hebrew: Segoe UI / David / Arial / Tahoma on Windows, SF Hebrew / Arial Hebrew on macOS, Noto Sans Hebrew on Linux and FreeBSD.
+   Hebrew: Segoe UI / David / Arial / Tahoma on Windows, SF Hebrew / Arial Hebrew on macOS, Noto
+   Sans Hebrew or DejaVu Sans on Linux and FreeBSD.
 
-**Web limitation:** a browser page can't read system fonts, so the web build shows CJK text only
+**Web limitation:** a browser page can't read system fonts, so the web build shows CJK, Arabic and Hebrew text only
 with the fonts it embeds: Japanese (and most shared Han characters) and Arabic when built with
 craft-fonts, none without it. A language no available font can draw appears in the picker under its English
 name and can't be selected.
