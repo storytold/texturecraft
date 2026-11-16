@@ -2452,17 +2452,13 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
 /// The Gradient Map item of a color channel's source menu: turns the color stops of its
 /// procedural (starting from its low and high, so the look holds) or anchor on, or off.
 fn gradient_map_item(app: &mut TextureCraftApp, ui: &mut Ui, source: &Source, set: &impl Fn(Value) -> Value) {
-    let start = match source {
-        Source::Procedural { low, high, .. } => Some(vec![*low, std::array::from_fn(|k| (low[k] + high[k]) * 0.5), *high]),
-        Source::Anchor { .. } => Some(vec![[0.0; 3], [0.5; 3], [1.0; 3]]),
-        _ => None,
-    };
+    let can = matches!(source, Source::Procedural { .. } | Source::Anchor { .. });
     let on = !source.ramp().is_empty();
     let hint = tr("Colors the procedural or anchor from dark to light through color stops");
-    let item = ui.add_enabled_ui(start.is_some(), |ui| ui.selectable_label(on, tr("Gradient Map"))).inner;
+    let item = ui.add_enabled_ui(can, |ui| ui.selectable_label(on, tr("Gradient Map"))).inner;
     if item.on_hover_text(hint).on_disabled_hover_text(hint).clicked() {
-        let colors = if on { Vec::new() } else { start.unwrap_or_default() };
-        app.run("layer.fill.set", set(json!({ "colors": colors })));
+        let params = if on { json!({ "colors": [] }) } else { json!({ "gradientMap": true }) };
+        app.run("layer.fill.set", set(params));
         ui.close();
     }
 }

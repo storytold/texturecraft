@@ -169,3 +169,40 @@ fn removing_stops_from_an_absent_channel_adds_no_channel() {
         _ => panic!("not a content fill effect"),
     }
 }
+
+#[test]
+fn gradient_map_true_starts_the_stops_from_the_current_source() {
+    let mut s = session();
+    let layer = id(execute(&mut s, "layer.add.fill", &json!({})).unwrap(), "layer");
+    let set = |s: &mut Session, p: Value| {
+        let mut p = p;
+        p["layer"] = json!(layer);
+        p["channel"] = json!("baseColor");
+        execute(s, "layer.fill.set", &p)
+    };
+    // A uniform color has nothing to start from.
+    assert!(set(&mut s, json!({"gradientMap": true})).is_err());
+    // A procedural starts at low, halfway and high, so its look holds.
+    set(&mut s, json!({"procedural": "Clouds", "low": [0.0, 0.25, 0.5], "high": [1.0, 0.75, 0.5]})).unwrap();
+    set(&mut s, json!({"gradientMap": true})).unwrap();
+    assert_eq!(ramp(&s, layer), vec![[0.0, 0.25, 0.5], [0.5; 3], [1.0, 0.75, 0.5]]);
+    // Stops already there stay.
+    set(&mut s, json!({"colors": RGB})).unwrap();
+    set(&mut s, json!({"gradientMap": true})).unwrap();
+    assert_eq!(ramp(&s, layer), RGB.to_vec());
+    // It cannot go with `colors`, and it undoes in one step.
+    assert!(set(&mut s, json!({"gradientMap": true, "colors": RGB})).is_err());
+    set(&mut s, json!({"colors": []})).unwrap();
+    set(&mut s, json!({"gradientMap": true})).unwrap();
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert!(ramp(&s, layer).is_empty());
+    // An anchor starts at black, gray and white.
+    execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+    let anchor = id(execute(&mut s, "effect.add.anchor", &json!({})).unwrap(), "effect");
+    let top = id(execute(&mut s, "layer.add.fill", &json!({})).unwrap(), "layer");
+    execute(&mut s, "layer.fill.set", &json!({"layer": top, "channel": "baseColor", "anchor": anchor})).unwrap();
+    execute(&mut s, "layer.fill.set", &json!({"layer": top, "channel": "baseColor", "gradientMap": true})).unwrap();
+    assert_eq!(ramp(&s, top), vec![[0.0; 3], [0.5; 3], [1.0; 3]]);
+    // A scalar channel has no stops.
+    assert!(execute(&mut s, "layer.fill.set", &json!({"layer": top, "channel": "roughness", "gradientMap": true})).is_err());
+}
