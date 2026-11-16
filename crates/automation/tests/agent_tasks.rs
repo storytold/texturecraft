@@ -430,6 +430,15 @@ async fn mesh_files_export_bake_and_reimport_in_the_workspace() {
     assert!(!textures.is_empty() && textures.iter().all(|t| base.join(t.as_str().unwrap()).is_file()), "{usda}");
     assert_eq!(tool(&c, "mesh_export", json!({"path": "out/cube.glb"})).await["path"], "out/cube.glb");
     assert!(base.join("out/cube.usda").is_file() && base.join("out/cube.glb").is_file());
+
+    // Requesting an export that rewrites .gltf to an already-existing .glb fails unless overwrite is true.
+    let glb_file = base.join("out/cube.glb");
+    let original_bytes = std::fs::read(&glb_file).unwrap();
+    let err = tool_err(&c, "mesh_export", json!({"path": "out/cube.gltf"})).await;
+    assert!(err.contains("already exists"), "{err}");
+    assert_eq!(std::fs::read(&glb_file).unwrap(), original_bytes, "existing rewritten destination must remain byte-for-byte intact without consent");
+    let over = tool(&c, "mesh_export", json!({"path": "out/cube.gltf", "overwrite": true})).await;
+    assert_eq!(over["path"], "out/cube.glb");
     // The loose usda arrives packaged with its textures.
     let high = tool(&c, "bake_mesh_add", json!({"path": "out/cube.usda"})).await;
     assert_eq!(high["name"], "cube.usdz", "{high}");

@@ -124,6 +124,14 @@ impl Headless {
         }
     }
 
+    fn exists(&self, path: &str) -> bool {
+        match &self.fs {
+            Filesystem::Denied => false,
+            Filesystem::TrustedLocal => Path::new(path).exists(),
+            Filesystem::Workspace(w) => w.exists(path),
+        }
+    }
+
     /// Replace the session, keeping the viewport size scripted strokes use.
     fn replace(&mut self, mut next: Session) -> Value {
         next.viewport = self.session.viewport;
@@ -202,8 +210,11 @@ impl Headless {
 
     /// Export the working mesh to `path` (obj, glb, usda, usdc or usdz, from `format` or the
     /// extension); obj writes its .mtl and textures, usda and usdc their textures, next to it.
-    pub fn export_mesh(&mut self, path: &str, format: Option<&str>) -> Result<Value, AutomationError> {
+    pub fn export_mesh(&mut self, path: &str, format: Option<&str>, overwrite: bool) -> Result<Value, AutomationError> {
         let out = self.session.mesh_export(path, format)?;
+        if out.path != path && self.exists(&out.path) && !overwrite {
+            return Err(bad(format!("{} already exists", out.path)));
+        }
         let dir = Path::new(&out.path).parent().and_then(|d| d.to_str()).filter(|d| !d.is_empty()).unwrap_or(".");
         self.create_dir_all(dir)?;
         let mut textures = Vec::new();

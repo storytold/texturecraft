@@ -815,7 +815,9 @@ fn mesh_export_filter(ext: &str) -> (&'static str, &'static [&'static str]) {
 }
 
 /// Open the native save dialog for a mesh export, preserving `format` when extensionless while
-/// honoring an explicit known extension chosen in the path.
+/// honoring an explicit known extension chosen in the path. If destination rewriting (such as .gltf
+/// to .glb) targets an existing file, file.exportMesh refuses without overwrite: true, and the error
+/// is surfaced as an application toast so the user can choose another filename.
 #[cfg(not(target_arch = "wasm32"))]
 fn ask_mesh_export(app: &mut TextureCraftApp, format: Option<&'static str>) {
     let stem = texturecraft_engine::formats::export::sanitize_file_stem(&app.session.doc.project.name);

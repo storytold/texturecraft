@@ -75,6 +75,13 @@ impl AuthorizedWorkspace {
         let root = self.write.as_ref().ok_or_else(|| denied("write"))?;
         root.create_dir_all(&rel).map_err(|e| file_error("create", path, e))
     }
+
+    /// Returns true if a file or directory exists below the write root.
+    pub fn exists(&self, path: &str) -> bool {
+        let Ok(rel) = relative_path(path) else { return false };
+        let Some(root) = self.write.as_ref() else { return false };
+        root.metadata(&rel).is_ok()
+    }
 }
 
 fn open_root(path: Option<&Path>, authority: &str) -> Result<Option<Arc<Dir>>, AutomationError> {

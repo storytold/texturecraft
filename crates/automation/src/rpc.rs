@@ -94,7 +94,7 @@ impl Headless {
             "project.save" => self.save(str_of(p, "path")),
             "mesh.import" => self.import_mesh(required(p, "path")?, u32_of(p, "resolution")?, str_of(p, "name")),
             "mesh.reimport" => self.reimport_mesh(str_of(p, "path"), bool_of(p, "preserveStrokes")?),
-            "mesh.export" => self.export_mesh(required(p, "path")?, str_of(p, "format")),
+            "mesh.export" => self.export_mesh(required(p, "path")?, str_of(p, "format"), bool_of(p, "overwrite")?.unwrap_or(false)),
             "bake.mesh.add" => self.add_bake_mesh(required(p, "path")?, bool_of(p, "cage")?),
             "resource.import" => self.import_resource(required(p, "path")?),
             "material.save" => self.material_save(p),

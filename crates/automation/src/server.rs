@@ -137,6 +137,9 @@ pub struct MeshExportParams {
     /// written next to it) or usdz (textures packaged); default: from the extension, else obj.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    /// Overwrite an existing destination even if rewritten (e.g. .gltf targeting an existing .glb).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
