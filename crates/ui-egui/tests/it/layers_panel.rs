@@ -120,3 +120,35 @@ fn deeply_nested_effect_visibility_is_reachable_in_a_narrow_panel() {
     let content = &h.state().session.doc.project.layers[&layer].content_effects;
     assert!(!content.iter().find(|effect| effect.name == "Effect A").unwrap().visible, "the compact eye toggles the effect instead of missing the panel");
 }
+
+/// Press and release the secondary button at `at` without moving.
+fn right_click(h: &mut Harness<'_, TextureCraftApp>, at: egui::Pos2) {
+    h.hover_at(at);
+    h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(3);
+}
+
+#[test]
+fn the_mask_thumbnail_menu_adds_effects_to_the_mask() {
+    let (mut h, layer) = harness();
+    // Select the content: the row's own menu would then add to the content.
+    let at = thumb(&h, "Masked fill", false);
+    click(&mut h, at);
+    assert_eq!(h.state().session.target, StackTarget::Content);
+
+    let at = thumb(&h, "Masked fill", true);
+    right_click(&mut h, at);
+    assert!(h.query_by_label("Add to the mask").is_some(), "the mask menu is open");
+    h.get_by_label("Add fill").click();
+    h.run_steps(3);
+
+    let layer = &h.state().session.doc.project.layers[&layer];
+    let mask = layer.mask.as_ref().expect("the layer keeps its mask");
+    assert_eq!(mask.effects.len(), 2, "the mask menu adds a fill beside the pre-existing mask effect");
+    assert_eq!(layer.content_effects.len(), 1, "the content effects are untouched");
+    // effect.add.* selects the effect it adds, on the mask like in the content stack.
+    let added = mask.effects.last().map(|e| e.id).expect("the mask menu adds an effect");
+    assert_eq!(h.state().session.target, StackTarget::Effect(added), "the new mask effect is selected");
+}
