@@ -112,6 +112,7 @@ impl Script {
                 Script::Japanese | Script::Arabic => 0,
                 Script::Korean => 1,
                 Script::Chinese => 2,
+                Script::TraditionalChinese => 3,
             };
             for dir in ["/usr/share/fonts/opentype/noto", "/usr/share/fonts/noto-cjk", "/usr/share/fonts/google-noto-cjk", "/usr/local/share/fonts/noto"] {
                 v.push((PathBuf::from(dir).join("NotoSansCJK-Regular.ttc"), face));
@@ -280,6 +281,7 @@ mod tests {
     fn languages_map_to_scripts() {
         assert_eq!(Script::of_language("ja"), Some(Script::Japanese));
         assert_eq!(Script::of_language("zh-Hans"), Some(Script::Chinese));
+        assert_eq!(Script::of_language("zh-Hant"), Some(Script::TraditionalChinese));
         assert_eq!(Script::of_language("ko"), Some(Script::Korean));
         assert_eq!(Script::of_language("ar"), Some(Script::Arabic));
         assert_eq!(Script::of_language("de"), None);
