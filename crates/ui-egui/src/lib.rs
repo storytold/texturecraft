@@ -290,6 +290,14 @@ impl TextureCraftApp {
                     self.camera_glide = Some(CameraGlide { from, to: self.session.camera, start: self.last_time });
                     self.session.camera = from;
                 }
+
+                // The glide would put back the projection it recorded, so it follows the switch
+                if matches!(id, "camera.perspective" | "camera.orthographic")
+                    && let Some(glide) = &mut self.camera_glide
+                {
+                    glide.from.ortho = self.session.camera.ortho;
+                    glide.to.ortho = self.session.camera.ortho;
+                }
                 Some(v)
             }
             Err(e) => {

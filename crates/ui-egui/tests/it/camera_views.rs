@@ -98,3 +98,83 @@ fn alt_shift_drag_orbits_in_quarter_turns() {
     let camera = h.state().session.camera;
     assert!(at_step(camera.yaw, 1.0) && (camera.pitch - 89f32.to_radians()).abs() < 1e-5, "pitch {}", camera.pitch.to_degrees());
 }
+
+/// A harness whose frames are 10 ms apart, so a 0.35 s glide spans about 35 frames and a drag fits inside it.
+fn slow_glide_harness() -> Harness<'static, TextureCraftApp> {
+    let session = texturecraft_engine::sample_session(256, 64).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_step_dt(0.01).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.run_steps(4);
+    h
+}
+
+/// Start the glide to the front view from a turned camera.
+fn start_front_glide(h: &mut Harness<'_, TextureCraftApp>) {
+    h.state_mut().run("camera.set", json!({"yaw": 70, "pitch": 30}));
+    h.run_steps(2);
+    h.state_mut().run("camera.view.front", json!({}));
+    h.run_steps(2);
+}
+
+#[test]
+fn f6_during_a_glide_keeps_the_orthographic_projection_when_the_glide_ends() {
+    let mut h = slow_glide_harness();
+    start_front_glide(&mut h);
+    assert!(!h.state().session.camera.ortho);
+    press(&mut h, Key::F6);
+    h.run_steps(60);
+    let camera = h.state().session.camera;
+    let looking_from = (camera.eye() - camera.target).normalize();
+    assert!(looking_from.z > 0.999, "the glide still reaches the front view: {looking_from}");
+    assert!(camera.ortho, "F6 pressed during the glide is not undone when it ends");
+
+    // And back: F5 during a glide to a view of an orthographic camera
+    start_front_glide(&mut h);
+    press(&mut h, Key::F5);
+    h.run_steps(60);
+    assert!(!h.state().session.camera.ortho, "F5 pressed during the glide is not undone either");
+}
+
+#[test]
+fn alt_shift_drag_during_a_glide_is_not_overwritten_by_it() {
+    let mut h = slow_glide_harness();
+    start_front_glide(&mut h);
+    let center = h.state().viewport_rect.center();
+    drag(&mut h, center, vec2(-100.0, 0.0), Modifiers::ALT | Modifiers::SHIFT);
+    h.run_steps(60);
+    let camera = h.state().session.camera;
+    assert!(
+        (camera.yaw - FRAC_PI_2).abs() < 1e-5 && camera.pitch.abs() < 1e-5,
+        "the snapped orbit stays: yaw {} pitch {}",
+        camera.yaw.to_degrees(),
+        camera.pitch.to_degrees()
+    );
+}
+
+#[test]
+fn alt_drag_during_a_glide_is_not_overwritten_by_it() {
+    let mut h = slow_glide_harness();
+    start_front_glide(&mut h);
+    let center = h.state().viewport_rect.center();
+    drag(&mut h, center, vec2(-200.0, 0.0), Modifiers::ALT);
+    h.run_steps(60);
+    let camera = h.state().session.camera;
+    // The glide ends at yaw 0 and pitch 0; the drag turned the camera away from the front by far more than a degree
+    assert!(camera.yaw.abs() > 0.1, "the orbit stays: yaw {}", camera.yaw.to_degrees());
+}
+
+#[test]
+fn the_wheel_during_a_glide_is_not_overwritten_by_it() {
+    let end_distance = |scroll: f32| {
+        let mut h = slow_glide_harness();
+        start_front_glide(&mut h);
+        let center = h.state().viewport_rect.center();
+        h.hover_at(center);
+        h.run_steps(1);
+        if scroll != 0.0 {
+            h.event(Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, scroll), modifiers: Modifiers::NONE });
+        }
+        h.run_steps(80);
+        h.state().session.camera.distance
+    };
+    assert!(end_distance(100.0) != end_distance(0.0), "the wheel zoom stays");
+}

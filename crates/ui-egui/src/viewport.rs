@@ -550,14 +550,18 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     if stencil_drag || adjusting {
         // The stencil or the brush changes instead of the camera
     } else if response.dragged_by(PointerButton::Middle) {
+        app.camera_glide = None;
         app.session.camera.pan(delta.x / size.y, delta.y / size.y);
     } else if alt && response.dragged_by(PointerButton::Primary) {
+        // Navigating takes over from a glide in progress, which would put the camera back
+        app.camera_glide = None;
         if shift {
             snapped_orbit(app, delta);
         } else {
             app.session.camera.orbit(delta.x * ORBIT_RADIANS_PER_POINT, delta.y * ORBIT_RADIANS_PER_POINT);
         }
     } else if response.dragged_by(PointerButton::Secondary) {
+        app.camera_glide = None;
         if alt {
             app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT);
         } else if shift {
@@ -583,6 +587,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
                     brush.size = (brush.size * (1.0 + scroll * WHEEL_BRUSH_SIZE_PER_POINT)).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
                 }
             } else {
+                app.camera_glide = None;
                 app.session.camera.zoom(scroll * WHEEL_ZOOM_PER_POINT);
             }
         }
@@ -595,6 +600,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             app.session.cancel_stroke();
         }
 
+        app.camera_glide = None;
         let moved = gesture.translation_delta;
         if gesture.num_touches >= 3 {
             app.session.camera.pan(moved.x / size.y, moved.y / size.y);
