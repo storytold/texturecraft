@@ -909,9 +909,8 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // A handle owns a new click, but a stroke already under way must still finish over it
     let symmetry_handle = !app.session.stroke_active() && crate::symmetry::manipulator_hovered(app, ui, rect);
 
-    let header_hovered = view_header_rect(rect).is_some_and(|header| {
-        response.hover_pos().or_else(|| response.interact_pointer_pos()).is_some_and(|p| header.expand(2.0).contains(p))
-    });
+    let header_hovered = view_header_rect(rect)
+        .is_some_and(|header| response.hover_pos().or_else(|| response.interact_pointer_pos()).is_some_and(|p| header.expand(2.0).contains(p)));
 
     // Painting
     let painting = tool_acts(app)
