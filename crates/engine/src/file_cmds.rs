@@ -372,11 +372,13 @@ mod native {
 
     pub fn save_to(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
         let path = if ext_of(path) == PROJECT_EXT { path.to_string() } else { format!("{path}.{PROJECT_EXT}") };
+        let mut pf = s.project_file();
+        if adopt {
+            pf.project.project_file = stem_of(&path);
+        }
+        texturecraft_formats::save_project(Path::new(&path), &pf).map_err(fe)?;
         if adopt {
             s.doc.project.project_file = stem_of(&path);
-        }
-        texturecraft_formats::save_project(Path::new(&path), &s.project_file()).map_err(fe)?;
-        if adopt {
             s.path = Some(path.clone());
             s.modified = false;
         }
@@ -921,5 +923,29 @@ f 1/1 2/2 3/3
         old.project.mesh_file.clear();
         let mut old = Session::from_project_bytes(&texturecraft_formats::save_project_bytes(&old).unwrap()).unwrap();
         assert_eq!(parts(&mut old), json!(["mesh"]));
+    }
+
+    #[test]
+    fn failed_save_as_preserves_session_path_and_project_file_token() {
+        let dir = std::env::temp_dir().join(format!("tc_failed_save_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let valid_file = dir.join("initial_project.tcp");
+        let valid_path = valid_file.display().to_string();
+
+        let mut s = Session::new_project("InitialProject", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        native::save_to(&mut s, &valid_path, true).unwrap();
+        assert_eq!(s.path.as_deref(), Some(valid_path.as_str()));
+        assert_eq!(s.doc.project.project_file, "initial_project");
+
+        // Attempt to save to an unwritable non-existent path
+        let invalid_path = dir.join("missing_dir").join("sub").join("fail.tcp").display().to_string();
+        let err = native::save_to(&mut s, &invalid_path, true);
+        assert!(err.is_err(), "saving to non-existent directory must fail");
+
+        // Both session path and project_file stem remain unchanged
+        assert_eq!(s.path.as_deref(), Some(valid_path.as_str()), "session path must remain unchanged after failed save");
+        assert_eq!(s.doc.project.project_file, "initial_project", "project_file token stem must remain unchanged");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
