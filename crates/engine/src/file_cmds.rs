@@ -929,7 +929,7 @@ f 1/1 2/2 3/3
     fn failed_save_as_preserves_session_path_and_project_file_token() {
         let dir = std::env::temp_dir().join(format!("tc_failed_save_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let valid_file = dir.join("initial_project.tcp");
+        let valid_file = dir.join(format!("initial_project.{PROJECT_EXT}"));
         let valid_path = valid_file.display().to_string();
 
         let mut s = Session::new_project("InitialProject", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
@@ -938,7 +938,7 @@ f 1/1 2/2 3/3
         assert_eq!(s.doc.project.project_file, "initial_project");
 
         // Attempt to save to an unwritable non-existent path
-        let invalid_path = dir.join("missing_dir").join("sub").join("fail.tcp").display().to_string();
+        let invalid_path = dir.join("missing_dir").join("sub").join(format!("fail.{PROJECT_EXT}")).display().to_string();
         let err = native::save_to(&mut s, &invalid_path, true);
         assert!(err.is_err(), "saving to non-existent directory must fail");
 
