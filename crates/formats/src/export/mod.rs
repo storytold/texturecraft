@@ -520,11 +520,12 @@ fn is_color(map: &MapSpec) -> bool {
     })
 }
 
-/// A map holding only a normal (tangent-space, world-space or bent) in its colour channels, or
-/// one in red and green with a constant blue: automatic DDS compression writes it as BC5, which
-/// keeps X and Y and drops Z. A map that packs a normal component next to other data is not one.
+/// A map holding only a tangent-space (or bent) normal in its colour channels, or one in red and
+/// green with a constant blue: automatic DDS compression writes it as BC5, which keeps X and Y and
+/// drops Z. A map that packs a normal component next to other data is not one, nor is one without
+/// its X and Y in red and green, nor a world-space normal, whose Z can point below the horizon.
 fn is_normal(map: &MapSpec) -> bool {
-    map.channels.iter().any(|(d, _)| *d != Dest::A)
+    [Dest::R, Dest::G].iter().all(|wanted| map.channels.iter().any(|(d, s)| d == wanted && !matches!(s, SourceRef::Constant(_))))
         && map.channels.iter().all(|(d, s)| {
             *d == Dest::A
                 || (*d == Dest::B && matches!(s, SourceRef::Constant(_)))
@@ -532,7 +533,7 @@ fn is_normal(map: &MapSpec) -> bool {
                     s,
                     SourceRef::Channel { channel: Channel::Normal, .. }
                         | SourceRef::Virtual { map: VirtualMap::NormalOpenGl | VirtualMap::NormalDirectX | VirtualMap::HeightNormal, .. }
-                        | SourceRef::Baked { map: BakedMap::Normal | BakedMap::WorldNormal | BakedMap::BentNormal, .. }
+                        | SourceRef::Baked { map: BakedMap::Normal | BakedMap::BentNormal, .. }
                 )
         })
 }

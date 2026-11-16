@@ -884,6 +884,22 @@ fn a_normal_in_red_and_green_with_a_constant_blue_is_bc5_but_a_packed_one_is_not
 }
 
 #[test]
+fn only_a_normal_with_its_x_and_y_in_red_and_green_is_bc5() {
+    let spec = |channels: &str| {
+        let json = format!(r#"{{"name":"Game","maps":[{{"file":"$textureSet_m","format":"Dds","bit_depth":8,"channels":[{channels}]}}]}}"#);
+        preset_from_json(&json).unwrap().maps.remove(0)
+    };
+    let gl = |dest: &str, component: u8| format!(r#"["{dest}",{{"Virtual":{{"map":"NormalOpenGl","component":{component}}}}}]"#);
+    let world = |dest: &str, component: u8| format!(r#"["{dest}",{{"Baked":{{"map":"WorldNormal","component":{component}}}}}]"#);
+    let bent = |dest: &str, component: u8| format!(r#"["{dest}",{{"Baked":{{"map":"BentNormal","component":{component}}}}}]"#);
+    assert!(is_normal(&spec(&[gl("R", 0), gl("G", 1), gl("B", 2)].join(","))));
+    assert!(is_normal(&spec(&[bent("R", 0), bent("G", 1), bent("B", 2)].join(","))), "a tangent-space bent normal keeps a positive Z");
+    assert!(!is_normal(&spec(&gl("B", 2))), "a normal's Z alone in blue would be dropped by BC5");
+    assert!(!is_normal(&spec(&[gl("G", 1), gl("B", 2)].join(","))), "no X in red");
+    assert!(!is_normal(&spec(&[world("R", 0), world("G", 1), world("B", 2)].join(","))), "world-space Z can be negative");
+}
+
+#[test]
 fn explicit_dds_compressions_ignore_the_map_kind() {
     let fx = Fx::new(&default_channels());
     let preset = builtin_preset("Document channels + Normal + AO").unwrap();
