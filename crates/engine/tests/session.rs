@@ -703,14 +703,16 @@ fn unparseable_color_param_returns_error() {
 
 #[test]
 fn direction_generator_sets_and_inspects_direction() {
-    let mut state = state();
-    let layer = execute(&mut state, "layer.add.fill", &json!({})).unwrap()["layer"].clone();
-    execute(&mut state, "mask.add.black", &json!({"layer": layer})).unwrap();
-    let added = execute(&mut state, "effect.add.generator", &json!({"generator": "direction"})).unwrap();
+    let mut s = session();
+    let layer = execute(&mut s, "layer.add.fill", &json!({})).unwrap()["layer"].clone();
+    execute(&mut s, "mask.add.black", &json!({"layer": layer})).unwrap();
+    let added = execute(&mut s, "effect.add.generator", &json!({"generator": "direction"})).unwrap();
     let effect = added["effect"].clone();
 
-    execute(&mut state, "effect.set", &json!({"effect": effect, "direction": [1.0, 0.0, 0.0]})).unwrap();
-    let inspect = execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string();
-    assert!(inspect.contains(r#""direction":[1.0,0.0,0.0]"#), "{inspect}");
+    execute(&mut s, "effect.set", &json!({"effect": effect, "direction": [1.0, 0.0, 0.0]})).unwrap();
+    let inspect = execute(&mut s, "project.inspect", &Value::Null).unwrap();
+    let effects = inspect["layers"][0]["mask"]["effects"].as_array().expect("mask effects array");
+    let gen_entry = &effects[0]["generator"];
+    assert_eq!(gen_entry["type"], "Direction");
+    assert_eq!(gen_entry["direction"], json!([1.0, 0.0, 0.0]));
 }
-
