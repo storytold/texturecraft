@@ -2480,41 +2480,25 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
                         }
                     }
                 });
-                match source {
-                    Source::Uniform(color) => {
-                        let mut value = color[0];
-                        if let Some(merge) = slider_edit(ui, tr("Value"), &mut value, 0.0..=1.0, 2) {
-                            app.run("effect.set", json!({"effect": id, "value": value, "merge": merge}));
-                        }
-                    }
-                    Source::Image { name, .. } => {
-                        ui.label(trf("Image: {name}", &[("name", name)]));
-                        ui.label(RichText::new(tr("Colors read as gray. Add a levels or blur effect above to shape the result.")).color(tk.text_dim));
-                    }
-                    Source::Procedural { pattern, .. } => {
-                        let mut s = pattern.scale;
-                        if let Some(merge) = slider_edit(ui, tr("Scale"), &mut s, 0.01..=100.0, 2) {
-                            app.run("effect.set", json!({"effect": id, "scale": s, "merge": merge}));
-                        }
-                    }
-                    Source::Anchor { channel, .. } => {
-                        let channels = app.session.doc.project.texture_set(app.session.ts()).map(|set| set.channel_list()).unwrap_or_default();
-                        combo(ui, tr("Channel"), tr(channel.label()), |ui| {
-                            for option in channels {
-                                if ui.selectable_label(option == *channel, tr(option.label())).clicked() {
-                                    app.run("effect.set", json!({"effect": id, "anchorChannel": option.id()}));
-                                }
-                            }
-                        });
-                        ui.label(RichText::new(tr("Colors read as gray. Add a levels or blur effect above to shape the result.")).color(tk.text_dim));
-                    }
-                }
             });
+            if let Some(name) = image_drop(ui, &group.response.interact(Sense::hover())) {
+                app.run("effect.set", json!({"effect": id, "image": name}));
+            }
             match source {
                 Source::Uniform(color) => {
                     let mut value = color[0];
                     if let Some(merge) = slider_edit(ui, tr("Value"), &mut value, 0.0..=1.0, 2) {
                         app.run("effect.set", json!({"effect": id, "value": value, "merge": merge}));
+                    }
+                }
+                Source::Image { name, .. } => {
+                    ui.label(trf("Image: {name}", &[("name", name)]));
+                    ui.label(RichText::new(tr("Colors read as gray. Add a levels or blur effect above to shape the result.")).color(tokens.text_dim));
+                }
+                Source::Procedural { pattern, .. } => {
+                    let mut s = pattern.scale;
+                    if let Some(merge) = slider_edit(ui, tr("Scale"), &mut s, 0.01..=100.0, 2) {
+                        app.run("effect.set", json!({"effect": id, "scale": s, "merge": merge}));
                     }
                 }
                 Source::Anchor { channel, .. } => {
@@ -2528,10 +2512,6 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
                     });
                     ui.label(RichText::new(tr("Colors read as gray. Add a levels or blur effect above to shape the result.")).color(tokens.text_dim));
                 }
-                _ => {}
-            }
-            if let Some(name) = image_drop(ui, &group.response.interact(Sense::hover())) {
-                app.run("effect.set", json!({"effect": id, "image": name}));
             }
             if anchors.is_empty() && !matches!(source, Source::Anchor { .. }) {
                 ui.label(RichText::new(tr("Add an anchor point to a layer below to use its stack as a mask.")).color(tokens.text_dim));

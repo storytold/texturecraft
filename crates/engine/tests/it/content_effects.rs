@@ -291,6 +291,8 @@ fn mask_fill_supports_image_source() {
     execute(&mut s, "mask.add.black", &Value::Null).unwrap();
     assert!(close(center(&mut s, Channel::BaseColor), [0.0, 0.0, 0.0]));
 
+    let anchor_id = id(execute(&mut s, "effect.add.anchor", &json!({"layer": 1, "name": "BaseAnchor"})).unwrap(), "effect");
+
     let mut png = Vec::new();
     let img = image::RgbaImage::from_fn(4, 4, |_, _| image::Rgba([204, 204, 204, 255]));
     img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
@@ -307,8 +309,6 @@ fn mask_fill_supports_image_source() {
     let effect = s.doc.project.effect(LayerId(eff_id)).unwrap().1;
     assert_eq!(effect.kind, EffectKind::Fill { source: Source::Uniform([0.4; 3]), projection: Default::default() });
     assert!(close(center(&mut s, Channel::BaseColor), [0.4, 0.4, 0.4]));
-
-    let anchor_id = id(execute(&mut s, "effect.add.anchor", &json!({"layer": 1, "name": "BaseAnchor"})).unwrap(), "effect");
 
     execute(&mut s, "effect.set", &json!({"effect": eff_id, "anchor": anchor_id})).unwrap();
     let effect = s.doc.project.effect(LayerId(eff_id)).unwrap().1;
