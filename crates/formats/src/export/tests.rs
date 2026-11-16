@@ -701,10 +701,7 @@ fn formats_without_a_place_for_a_colour_space_say_so() {
 #[test]
 fn project_file_token_resolves_saved_stem_or_falls_back_to_project_name() {
     let mut fx = Fx::new(&default_channels());
-    let preset = ExportPreset {
-        name: "TestProjectFile".into(),
-        maps: vec![gray_map("$projectFile_$project_$channel", SourceRef::Constant(1.0))],
-    };
+    let preset = ExportPreset { name: "TestProjectFile".into(), maps: vec![gray_map("$projectFile_$project_$channel", SourceRef::Constant(1.0))] };
     let opts = ExportOptions::new(preset);
 
     // Unsaved: $projectFile falls back to $project ("My Project")
@@ -716,4 +713,3 @@ fn project_file_token_resolves_saved_stem_or_falls_back_to_project_name() {
     let planned2 = list_outputs(&fx.project, 0, "sphere", &opts).unwrap();
     assert_eq!(planned2[0].name, "hero_asset_v02_My Project_basecolor.png");
 }
-
