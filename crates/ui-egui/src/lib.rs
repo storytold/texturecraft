@@ -296,9 +296,14 @@ impl TextureCraftApp {
         let glide_from = glides.then_some(self.session.camera);
         match texturecraft_engine::execute(&mut self.session, id, &params) {
             Ok(v) => {
-                if let Some(from) = glide_from.filter(|f| *f != self.session.camera) {
-                    self.camera_glide = Some(CameraGlide { from, to: self.session.camera, start: self.last_time });
-                    self.session.camera = from;
+                match glide_from {
+                    Some(from) if from != self.session.camera => {
+                        self.camera_glide = Some(CameraGlide { from, to: self.session.camera, start: self.last_time });
+                        self.session.camera = from;
+                    }
+                    // Already at the destination: drop a glide an earlier command in the same frame started
+                    Some(_) => self.camera_glide = None,
+                    None => {}
                 }
 
                 // The glide would put back the projection it recorded, so it follows the switch

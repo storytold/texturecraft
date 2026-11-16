@@ -135,6 +135,20 @@ fn f6_during_a_glide_keeps_the_orthographic_projection_when_the_glide_ends() {
 }
 
 #[test]
+fn a_view_that_returns_to_the_starting_camera_cancels_the_glide_of_the_earlier_view() {
+    let mut h = slow_glide_harness();
+    start_front_glide(&mut h);
+    h.run_steps(60);
+    // Back, then Front again before a frame runs: the camera is already at the front
+    h.state_mut().run("camera.view.back", json!({}));
+    h.state_mut().run("camera.view.front", json!({}));
+    h.run_steps(60);
+    let camera = h.state().session.camera;
+    let looking_from = (camera.eye() - camera.target).normalize();
+    assert!(looking_from.z > 0.999, "the camera stays at the front instead of gliding to the back: {looking_from}");
+}
+
+#[test]
 fn alt_shift_drag_during_a_glide_is_not_overwritten_by_it() {
     let mut h = slow_glide_harness();
     start_front_glide(&mut h);
