@@ -1326,17 +1326,21 @@ pub(crate) fn mesh_map_color(map: BakedMap) -> Color32 {
 // ---------------------------------------------------------------------------------------------
 // Properties
 
-/// The Properties tab title: what the panel edits.
+/// The Properties tab title: what the panel edits
 pub(crate) fn properties_title(app: &TextureCraftApp) -> String {
     let project = &app.session.doc.project;
+    let tool = app.session.tool.tool;
+    let tool_usable = app.session.tool_usable(tool);
     let what = match (app.session.selected_layer().and_then(|id| project.layers.get(&id)), app.session.target) {
-        // Polygon fill keeps its own properties whatever is selected
-        _ if app.session.tool.tool == Tool::PolygonFill => tr(app.session.tool.tool.label()).to_string(),
+        // Polygon fill keeps its own properties wherever it can fill
+        _ if tool == Tool::PolygonFill && tool_usable => tr(tool.label()).to_string(),
         (Some(_), StackTarget::Effect(effect)) => project.effect(effect).map(|(_, found)| found.name.clone()).unwrap_or_default(),
         (Some(layer), StackTarget::Content) if matches!(layer.kind, LayerKind::Fill(_)) => tr("Fill").to_string(),
         (Some(layer), StackTarget::Content) if layer.is_group() => tr("Folder").to_string(),
         (Some(layer), StackTarget::Content) if layer.instance_source().is_some() => tr("Instance").to_string(),
-        _ => tr(app.session.tool.tool.label()).to_string(),
+        (Some(_), StackTarget::Mask) if !tool_usable => tr("Mask").to_string(),
+        (None, _) if !tool_usable => return tr("Properties").to_string(),
+        _ => tr(tool.label()).to_string(),
     };
     format!("{} - {what}", tr("Properties"))
 }
@@ -1347,14 +1351,16 @@ pub(crate) fn properties(app: &mut TextureCraftApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().id_salt("props").auto_shrink([false, false]).show(ui, |ui| properties_contents(app, ui));
 }
 
-/// What the Properties panel edits: polygon fill's own settings, the selected effect, fill, folder or instance, else the tool
+/// What the Properties panel edits: polygon fill's own settings, the selected effect, fill, folder, instance or mask, else the tool (or a hint to select a layer when it can't act)
 pub(crate) fn properties_contents(app: &mut TextureCraftApp, ui: &mut Ui) {
     let tokens = Tokens::get(ui.ctx());
     let selected = app.session.selected_layer().and_then(|id| app.session.doc.project.layers.get(&id).cloned());
+    let tool = app.session.tool.tool;
+    let tool_usable = app.session.tool_usable(tool);
 
     match (&selected, app.session.target) {
-        // Polygon fill shows its own settings and says what it fills into, whatever is selected
-        _ if app.session.tool.tool == Tool::PolygonFill => polygon_fill_properties(app, ui),
+        // Polygon fill shows its own settings and says what it fills into, wherever it can fill
+        _ if tool == Tool::PolygonFill && tool_usable => polygon_fill_properties(app, ui),
         (Some(layer), StackTarget::Effect(effect)) => effect_properties(app, ui, layer, effect),
         (Some(layer), StackTarget::Content) if matches!(layer.kind, LayerKind::Fill(_)) => fill_properties(app, ui, layer),
         (Some(layer), StackTarget::Content) if layer.is_group() => {
@@ -1363,8 +1369,13 @@ pub(crate) fn properties_contents(app: &mut TextureCraftApp, ui: &mut Ui) {
         (Some(layer), StackTarget::Content) if layer.instance_source().is_some() => instance_properties(app, ui, layer),
         (Some(layer), StackTarget::Mask) => {
             height_mask_section(app, ui, layer);
-            ui.separator();
-            tool_properties(app, ui);
+            if tool_usable {
+                ui.separator();
+                tool_properties(app, ui);
+            }
+        }
+        (None, _) if !tool_usable => {
+            ui.label(RichText::new(tr("Select a layer to paint on")).color(tokens.text_dim));
         }
         _ => tool_properties(app, ui),
     }
@@ -1788,6 +1799,10 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
 
     *brush = brush.sanitized();
+
+    // Presets are files, which the browser doesn't have
+    #[cfg(not(target_arch = "wasm32"))]
+    section(ui, "sec_brush_preset", tr("Preset"), false, |ui| crate::brush_preset_save::row(app, ui));
 }
 
 /// One alpha in the picker: a 52×64 tile with the shape drawn by `paint` and a label.
@@ -2554,7 +2569,9 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
                 tr("Paint on the mesh to edit this mask. Use the Material tab's mask value for gray.")
             };
             ui.label(RichText::new(hint).color(tokens.text_dim));
-            tool_properties(app, ui);
+            if app.session.tool_usable(app.session.tool.tool) {
+                tool_properties(app, ui);
+            }
         }
         EffectKind::Path(paths) => {
             ui.label(
@@ -2577,7 +2594,9 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
                     }
                 });
             }
-            tool_properties(app, ui);
+            if app.session.tool_usable(app.session.tool.tool) {
+                tool_properties(app, ui);
+            }
         }
         EffectKind::Filter(filter) => filter_properties(app, ui, id, filter),
         EffectKind::ColorSelection { colors, tolerance } => crate::color_selection_editor::color_selection_properties(app, ui, effect_id, colors, *tolerance),

@@ -109,7 +109,7 @@ impl Tool {
             Tool::PolygonFill => "Polygon fill",
             Tool::Smudge => "Smudge",
             Tool::Clone => "Clone",
-            Tool::ColorPicker => "Color picker",
+            Tool::ColorPicker => "Material picker",
             Tool::Path => "Path",
             Tool::GeometryMask => "Geometry mask",
         }
@@ -765,7 +765,8 @@ impl Session {
         self.modified = true;
         self.revision = self.revision.wrapping_add(1);
         self.invalidate_changed(other);
-        // An undone add or duplicate takes the selected effect away: select the stack it was in.
+
+        // An undone add or duplicate takes the selected effect away
         if let StackTarget::Effect(e) = self.target
             && self.doc.project.effect(e).is_none()
         {
@@ -1010,14 +1011,22 @@ pub const SETTLE_BUDGET_MS: f64 = 6.0;
 
 /// Take up to `n` dirty tiles, block by block (16 × 16 tiles) so neighbourhood filters
 /// evaluate compact regions.
-fn next_chunk(dirty: &mut BTreeSet<(u32, u32)>, n: usize) -> Vec<(u32, u32)> {
-    if dirty.len() <= n {
+fn next_chunk(dirty: &mut BTreeSet<(u32, u32)>, max_tiles: usize) -> Vec<(u32, u32)> {
+    // A zero-sized request cannot select a pivot
+    if max_tiles == 0 {
+        return Vec::new();
+    }
+
+    if dirty.len() <= max_tiles {
         return std::mem::take(dirty).into_iter().collect();
     }
 
     let mut tiles: Vec<(u32, u32)> = dirty.iter().copied().collect();
+
+    // Partition by block order so only the requested chunk needs sorting
+    tiles.select_nth_unstable_by_key(max_tiles - 1, |&(x, y)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK, y, x));
+    tiles.truncate(max_tiles);
     tiles.sort_by_key(|&(x, y)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK, y, x));
-    tiles.truncate(n);
     for tile in &tiles {
         dirty.remove(tile);
     }

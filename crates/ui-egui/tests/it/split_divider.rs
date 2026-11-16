@@ -158,6 +158,26 @@ fn the_divider_position_survives_a_restart_and_old_saved_states_load_centred() {
 }
 
 #[test]
+fn old_textures_tab_index_migrates_without_changing_new_all_types() {
+    let mut storage = MemoryStorage::default();
+    let mut state = UiState::default();
+    state.shelf_tab = 8;
+    UiStateStore::default().save(&state, &mut storage);
+
+    assert_eq!(UiStateStore::default().load(Some(&storage)).map(|ui| ui.shelf_tab), Some(8));
+
+    let mut legacy: serde_json::Value = serde_json::from_str(&storage.0["ui.json"]).unwrap();
+    legacy.as_object_mut().unwrap().remove("shelf_path");
+    legacy.as_object_mut().unwrap().insert("shelf_filter".into(), "shelf_path".into());
+    storage.0.insert("ui.json".into(), legacy.to_string());
+    assert_eq!(UiStateStore::default().load(Some(&storage)).map(|ui| ui.shelf_tab), Some(6));
+
+    state.shelf_tab = 0;
+    UiStateStore::default().save(&state, &mut storage);
+    assert_eq!(UiStateStore::default().load(Some(&storage)).map(|ui| ui.shelf_tab), Some(0));
+}
+
+#[test]
 fn dragging_the_divider_keeps_the_uv_texture_size_and_offset_on_screen() {
     // Zoomed in, a 2D sliver needs a zoom far past the one the view starts with
     for zoom in [1.0, 4.0] {

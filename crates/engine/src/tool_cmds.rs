@@ -20,7 +20,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("tool.polygonFill", "Polygon fill", ["Tools"], Some("4"), "{}", always, |s, _| set_tool(s, Tool::PolygonFill)),
         cmd!("tool.smudge", "Smudge", ["Tools"], Some("5"), "{}", always, |s, _| set_tool(s, Tool::Smudge)),
         cmd!("tool.clone", "Clone", ["Tools"], Some("6"), "{}", always, |s, _| set_tool(s, Tool::Clone)),
-        cmd!("tool.colorPicker", "Color picker", ["Tools"], Some("P"), "{}", always, |s, _| set_tool(s, Tool::ColorPicker)),
+        cmd!("tool.colorPicker", "Material picker", ["Tools"], Some("P"), "{}", always, |s, _| set_tool(s, Tool::ColorPicker)),
         cmd!(
             "tool.geometryMask",
             "Geometry mask",
@@ -105,7 +105,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Tool click",
             [],
             None,
-            "{x, y, viewport?: [w,h]} — polygon fill / color picker / single dab; polygon fill also takes a box {x0, y0, x1, y1, viewport?}, a 2D view point {uv: [u,v]} or a 2D view box {uv0: [u,v], uv1: [u,v]}",
+            "{x, y, viewport?: [w,h]} — polygon fill / material picker / single dab; polygon fill also takes a box {x0, y0, x1, y1, viewport?}, a 2D view point {uv: [u,v]} or a 2D view box {uv0: [u,v], uv1: [u,v]}",
             always,
             click
         ),
@@ -115,6 +115,7 @@ pub fn specs() -> Vec<CommandSpec> {
 
 pub(crate) fn set_tool(session: &mut Session, tool: Tool) -> Result<Value> {
     session.cancel_stroke();
+
     // A box fill under way keeps what it filled as one undo step
     session.end_polygon_fill_box();
     session.tool.tool = tool;
@@ -342,40 +343,44 @@ fn swap_mask_value(session: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({ "maskValue": session.tool.mask_value }))
 }
 
-fn stencil(s: &mut Session, p: &Value) -> Result<Value> {
-    if boolp(p, "clear") == Some(true) {
-        s.tool.stencil = None;
+fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
+    if boolp(params, "clear") == Some(true) {
+        session.tool.stencil = None;
         return Ok(Value::Null);
     }
-    if let Some(name) = strp(p, "image") {
-        if !s.doc.resources.contains_key(name) {
+
+    if let Some(name) = strp(params, "image") {
+        if !session.doc.resources.contains_key(name) {
             return Err(bad("tool.stencil", format!("no resource `{name}` (import it first)")));
         }
-        let keep = s.tool.stencil.take();
-        let mut st = crate::session::StencilState::new(name);
-        if let Some(k) = keep {
-            st = crate::session::StencilState { image: name.to_string(), ..k };
+
+        let previous_stencil = session.tool.stencil.take();
+        let mut stencil_state = crate::session::StencilState::new(name);
+        if let Some(previous_stencil) = previous_stencil {
+            stencil_state = crate::session::StencilState { image: name.to_string(), ..previous_stencil };
         }
-        s.tool.stencil = Some(st);
+        session.tool.stencil = Some(stencil_state);
     }
-    let st = s.tool.stencil.as_mut().ok_or_else(|| bad("tool.stencil", "no stencil: give `image`"))?;
-    if let Some(c) = pair(p, "center").or_else(|| p.get("center").and_then(color_of).map(|c| [c[0], c[1]])) {
-        st.center = c.map(|v| v.clamp(-4.0, 4.0));
+
+    let stencil_state = session.tool.stencil.as_mut().ok_or_else(|| bad("tool.stencil", "no stencil: give `image`"))?;
+    if let Some(center) = pair(params, "center").or_else(|| params.get("center").and_then(color_of).map(|color| [color[0], color[1]])) {
+        stencil_state.center = center.map(|value| value.clamp(-4.0, 4.0));
     }
-    if let Some(v) = f32p(p, "scale") {
-        st.scale = v.clamp(0.01, 10.0);
+    if let Some(scale) = f32p(params, "scale") {
+        stencil_state.scale = scale.clamp(0.01, 10.0);
     }
-    if let Some(v) = f32p(p, "rotation") {
-        st.rotation = v.rem_euclid(360.0);
+    if let Some(rotation) = f32p(params, "rotation") {
+        stencil_state.rotation = rotation.rem_euclid(360.0);
     }
-    if let Some(v) = boolp(p, "tile") {
-        st.tile = v;
+    if let Some(tile) = boolp(params, "tile") {
+        stencil_state.tile = tile;
     }
-    if let Some(v) = f32p(p, "opacity") {
-        st.opacity = v.clamp(0.0, 1.0);
+    if let Some(opacity) = f32p(params, "opacity") {
+        stencil_state.opacity = opacity.clamp(0.0, 1.0);
     }
-    s.revision = s.revision.wrapping_add(1);
-    Ok(serde_json::to_value(&s.tool.stencil).unwrap_or(Value::Null))
+
+    session.revision = session.revision.wrapping_add(1);
+    Ok(serde_json::to_value(&session.tool.stencil).unwrap_or(Value::Null))
 }
 
 /// A `[a, b]` param of two finite numbers.

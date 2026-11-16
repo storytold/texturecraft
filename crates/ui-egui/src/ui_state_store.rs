@@ -13,6 +13,9 @@ const STORAGE_STEM: &str = "ui";
 
 /// eframe storage key under which earlier builds kept the UI state, as RON
 const RON_STORAGE_KEY: &str = "ui";
+/// Textures moved from index 8 to index 6 when procedurals joined that type
+const LEGACY_TEXTURES_TAB: usize = 8;
+const TEXTURES_TAB: usize = 6;
 
 /// Maximum encoded UI state size for both reads and writes; typical states are a few kilobytes
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -65,7 +68,7 @@ impl UiStateStore {
             return None;
         }
 
-        let ui = serde_json::from_slice::<UiState>(&bytes).ok();
+        let ui = decode_json_ui(&bytes);
         if !ui.as_ref().is_some_and(fully_read) {
             self.unreadable = Some((bytes, "json"));
         }
@@ -75,7 +78,10 @@ impl UiStateStore {
     /// Preserve the original RON when decoding loses either dock, even if other settings load
     fn load_ron(&mut self, storage: &dyn eframe::Storage) -> Option<UiState> {
         let text = storage.get_string(RON_STORAGE_KEY)?;
-        let ui = eframe::get_value::<UiState>(storage, RON_STORAGE_KEY);
+        let mut ui = eframe::get_value::<UiState>(storage, RON_STORAGE_KEY);
+        if let Some(ui) = &mut ui {
+            migrate_shelf_tab(ui, ron_has_shelf_path(&text));
+        }
         if !ui.as_ref().is_some_and(fully_read) {
             self.unreadable = Some((text.into_bytes(), "ron"));
         }
@@ -158,9 +164,52 @@ impl UiStateStore {
     }
 }
 
+/// Old saved states have no shelf path, so their former Textures index needs remapping
+fn migrate_shelf_tab(ui: &mut UiState, has_shelf_path: bool) {
+    if ui.shelf_tab == LEGACY_TEXTURES_TAB && !has_shelf_path {
+        ui.shelf_tab = TEXTURES_TAB;
+    }
+}
+
+/// Decode JSON settings and map the old Textures index only when its new fields are absent
+fn decode_json_ui(bytes: &[u8]) -> Option<UiState> {
+    let mut ui = serde_json::from_slice::<UiState>(bytes).ok()?;
+    if ui.shelf_tab == LEGACY_TEXTURES_TAB {
+        let has_shelf_path = serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|state| state.as_object().map(|fields| fields.contains_key("shelf_path")))
+            .unwrap_or(true);
+        migrate_shelf_tab(&mut ui, has_shelf_path);
+    }
+    Some(ui)
+}
+
+/// Ignore user text while looking for the field in legacy RON settings
+fn ron_has_shelf_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                quoted = false;
+            }
+        } else if *byte == b'"' {
+            quoted = true;
+        } else if bytes[index..].starts_with(b"shelf_path:") && (index == 0 || matches!(bytes[index - 1], b',' | b'(' | b' ' | b'\n')) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The UI state saved in `file`, if it reads
 pub fn read(file: &Path) -> Option<UiState> {
-    serde_json::from_slice(&read_bytes(file).ok()?).ok()
+    decode_json_ui(&read_bytes(file).ok()?)
 }
 
 /// eframe's browser storage reports write failures only through logging, so verify before discarding old settings
@@ -309,6 +358,20 @@ pub(crate) mod tests {
         store.save(&loaded, &mut storage);
         assert!(!storage.values.contains_key(RON_STORAGE_KEY));
         assert_eq!(UiStateStore::default().load(Some(&storage)).unwrap(), loaded);
+    }
+
+    #[test]
+    fn legacy_ron_textures_index_migrates_to_the_combined_type() {
+        let mut storage = MemoryStorage::default();
+        let legacy = include_str!("../tests/fixture/ui_state_before_json.ron")
+            .replace("shelf_tab:0", "shelf_tab:8")
+            .replace("shelf_filter:\"\"", "shelf_filter:\"shelf_path:\"");
+        assert!(legacy.contains("shelf_tab:8") && !ron_has_shelf_path(&legacy));
+        storage.values.insert(RON_STORAGE_KEY.into(), legacy);
+
+        let loaded = UiStateStore::default().load(Some(&storage)).expect("the legacy state loads");
+
+        assert_eq!(loaded.shelf_tab, TEXTURES_TAB);
     }
 
     #[test]

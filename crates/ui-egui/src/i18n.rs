@@ -158,35 +158,36 @@ mod tests {
     fn catalog_keys() -> Vec<&'static str> {
         use texturecraft_engine::core::{BlendMode, Channel, EffectKind, GeneratorKind, ProceduralKind};
         use texturecraft_engine::filter_lib::{FILTERS, build, scalar_params};
-        let mut k: Vec<&'static str> = Vec::new();
-        k.extend(crate::menus::TOP);
-        for i in crate::menus::CATALOG.iter().filter(|i| i.label != "-") {
-            k.push(i.label);
-            k.extend(i.sub);
+        let mut keys: Vec<&'static str> = Vec::new();
+        keys.extend(crate::menus::TOP);
+        for item in crate::menus::CATALOG.iter().filter(|item| item.label != "-") {
+            keys.push(item.label);
+            keys.extend(item.sub);
         }
-        k.extend(crate::docking::VIEWS.iter().map(|(_, p)| p.name()));
-        for b in crate::keymap::bindings() {
-            k.push(b.label);
-            k.push(b.group);
+        keys.extend(crate::docking::VIEWS.iter().map(|(_, panel)| panel.name()));
+        for binding in crate::keymap::bindings() {
+            keys.push(binding.label);
+            keys.push(binding.group);
         }
-        k.extend(crate::shelf::TABS.iter().map(|t| t.2));
-        k.extend(Channel::ALL.iter().flat_map(|c| [c.label(), c.short()]));
-        k.extend(BlendMode::all().map(|m| m.label()));
-        k.extend(texturecraft_engine::formats::export::VirtualMap::ALL.iter().map(|m| m.label()));
-        k.extend(texturecraft_engine::Tool::ALL.iter().map(|t| t.label()));
-        k.extend(ProceduralKind::ALL.iter().map(|p| p.label()));
-        k.extend(GeneratorKind::ALL.iter().map(|g| g.label()));
-        k.extend(texturecraft_engine::paint::BrushAlpha::ALL.iter().map(|a| a.label()));
-        k.extend(texturecraft_engine::geom::primitives::BUILTINS.iter().map(|(_, l)| *l));
-        for f in FILTERS {
-            k.extend([f.label, f.group]);
-            if let Ok(EffectKind::Filter(x)) = build(f.id, &serde_json::Value::Null) {
-                k.push(x.label());
-                k.extend(scalar_params(&x).into_iter().map(|p| p.1));
+        keys.extend(crate::shelf::TABS.iter().map(|tab| tab.2));
+        keys.extend(Channel::ALL.iter().flat_map(|channel| [channel.label(), channel.short()]));
+        keys.extend(BlendMode::all().map(|mode| mode.label()));
+        keys.extend(texturecraft_engine::formats::export::VirtualMap::ALL.iter().map(|map| map.label()));
+        keys.extend(texturecraft_engine::Tool::ALL.iter().map(|tool| tool.label()));
+        keys.extend(ProceduralKind::ALL.iter().map(|kind| kind.label()));
+        keys.extend(GeneratorKind::ALL.iter().map(|kind| kind.label()));
+        keys.extend(texturecraft_engine::paint::BrushAlpha::ALL.iter().map(|alpha| alpha.label()));
+        keys.extend(texturecraft_engine::geom::primitives::BUILTINS.iter().map(|(_, label)| *label));
+        for filter in FILTERS {
+            keys.extend([filter.label, filter.group]);
+            if let Ok(EffectKind::Filter(effect)) = build(filter.id, &serde_json::Value::Null) {
+                keys.push(effect.label());
+                keys.extend(scalar_params(&effect).into_iter().map(|parameter| parameter.1));
             }
         }
-        // Effect, view and camera names the engine gives.
-        k.extend([
+
+        // Include effect, view and camera names supplied by the engine
+        keys.extend([
             "Paint",
             "Path",
             "Fill",
@@ -199,8 +200,8 @@ mod tests {
             texturecraft_engine::camera_cmds::DEFAULT_CAMERA,
             crate::dock::SOLO_HINT,
         ]);
-        k.retain(|s| !s.is_empty() && !UNTRANSLATED.contains(s));
-        k
+        keys.retain(|key| !key.is_empty() && !UNTRANSLATED.contains(key));
+        keys
     }
 
     /// String literals passed straight to `tr(` or `trf(` in `src`.
@@ -254,7 +255,8 @@ mod tests",
         for &(locale, common, app) in CRAFT_I18N {
             let Some(lang) = I18N.from_code(locale) else { continue };
             let missing: Vec<_> = keys.iter().filter(|key| I18N.get(lang, "", key).is_none()).collect();
-            // Decode TSV escapes for comparison with the literal source strings.
+
+            // Decode TSV escapes to compare with literal source strings
             let mut rows = HashMap::new();
             for text in [common, app] {
                 for line in text.lines().filter(|l| !l.starts_with('#')) {
@@ -335,17 +337,18 @@ mod tests",
         let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let keys = keys();
         set_language("ja");
-        let t = std::time::Instant::now();
-        let mut n = 0usize;
+        let started = std::time::Instant::now();
+        let mut total_chars = 0usize;
         for _ in 0..100 {
-            for k in &keys {
-                n += tr(k).len();
+            for key in &keys {
+                total_chars += tr(key).len();
             }
         }
-        let per = t.elapsed().as_secs_f64() * 1e9 / (100 * keys.len()) as f64;
+        let ns_per_lookup = started.elapsed().as_secs_f64() * 1e9 / (100 * keys.len()) as f64;
         set_language("en");
-        assert!(n > 0);
-        // A frame looks up a few hundred strings: well under a microsecond each.
-        assert!(per < 1000.0, "{per:.0} ns per lookup");
+        assert!(total_chars > 0);
+
+        // A frame looks up a few hundred strings, each expected below one microsecond
+        assert!(ns_per_lookup < 1000.0, "{ns_per_lookup:.0} ns per lookup");
     }
 }

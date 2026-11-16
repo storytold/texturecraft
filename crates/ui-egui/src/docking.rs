@@ -133,17 +133,28 @@ fn split(axis: SplitAxis, size: SplitSize, first: Node<Panel>, second: Node<Pane
     Node::Split { axis, size, first: Box::new(first), second: Box::new(second) }
 }
 
-/// The default: assets left of the viewport, then texture sets, layers (tabbed with texture set settings) and properties; ratios fit 1600x960
+/// The default: assets (4 tile columns at 1920 px) left of the viewport, then texture sets, layers (tabbed with texture set settings) and properties
 pub fn default_workspace() -> Workspace {
     use Panel::*;
+
+    // The Assets split keeps four tiles visible at the reference window width
+    const ASSETS_SPLIT_RATIO: f32 = 0.16;
+    const VIEWPORT_SPLIT_RATIO: f32 = 0.80;
+    const TEXTURE_SET_SPLIT_RATIO: f32 = 0.125;
+    const LAYERS_SPLIT_RATIO: f32 = 0.57;
+
     let column = split(
         SplitAxis::Vertical,
-        SplitSize::Ratio(0.125),
+        SplitSize::Ratio(TEXTURE_SET_SPLIT_RATIO),
         tabs(&[TextureSetList]),
-        split(SplitAxis::Vertical, SplitSize::Ratio(0.57), tabs(&[Layers, TextureSetSettings]), tabs(&[Properties])),
+        split(SplitAxis::Vertical, SplitSize::Ratio(LAYERS_SPLIT_RATIO), tabs(&[Layers, TextureSetSettings]), tabs(&[Properties])),
     );
-    let root =
-        split(SplitAxis::Horizontal, SplitSize::Ratio(0.115), tabs(&[Assets]), split(SplitAxis::Horizontal, SplitSize::Ratio(0.78), tabs(&[Viewport]), column));
+    let root = split(
+        SplitAxis::Horizontal,
+        SplitSize::Ratio(ASSETS_SPLIT_RATIO),
+        tabs(&[Assets]),
+        split(SplitAxis::Horizontal, SplitSize::Ratio(VIEWPORT_SPLIT_RATIO), tabs(&[Viewport]), column),
+    );
     let mut workspace = Workspace::new(Layout { root: Some(root), floating: Vec::new() });
 
     for panel in Panel::ALL {
@@ -214,6 +225,9 @@ pub fn validate(workspace: &Workspace) -> Result<(), String> {
 
 // ---------------------------------------------------------------------------------------------
 // The live dock
+
+/// Height of a panel group's tab strip, in points
+pub(crate) const TAB_HEIGHT: f32 = 30.0;
 
 /// Width of the bake layout's texture set and mesh map bakers column, in points
 const BAKERS_COLUMN_WIDTH: f32 = 200.0;
@@ -367,29 +381,42 @@ fn area_id() -> Id {
     Id::unique("texturecraft-docking")
 }
 
-/// The dock look: every panel group is a card on the window's frame colour, its tab strip
-/// without hard lines, the shown tab a pill.
-fn style(ui: &Ui, t: &Tokens) -> DockStyle {
-    let mut s = DockStyle::from_ui(ui);
-    s.gap = f32::from(crate::theme::GUTTER);
-    // Smallest panel extent a divider drag leaves.
-    s.min_pane = 60.0;
-    s.background = t.panel;
-    s.tab_background = t.panel;
-    s.active_background = t.button;
-    s.text = t.text_strong;
-    s.inactive_text = t.text_dim;
-    s.border = egui::Stroke::NONE;
-    s.accent = t.accent;
-    s.floating_background = t.panel;
-    s.floating_stroke = egui::Stroke::new(1.0, t.button_border);
-    s.font = egui::FontId::proportional(12.5);
-    s.min_tab_width = 54.0;
-    s.tab_height = 30.0;
-    // Panels arrange in a split tree around the viewport; floating title bars only move windows.
-    s.new_dock_zones = false;
-    s.title_bar_docks = false;
-    s
+/// Smallest panel extent a divider drag leaves, in points
+const MIN_PANE_EXTENT: f32 = 60.0;
+
+/// Border width of a floating panel, in points
+const FLOATING_BORDER_WIDTH: f32 = 1.0;
+
+/// Text size of the panel tabs, in points
+const TAB_TEXT_SIZE: f32 = 12.5;
+
+/// Narrowest panel tab, in points
+const MIN_TAB_WIDTH: f32 = 54.0;
+
+/// The dock look: each panel group a card on the window's frame colour, tab strips without hard lines, the shown tab a pill
+fn style(ui: &Ui, tokens: &Tokens) -> DockStyle {
+    let mut dock_style = DockStyle::from_ui(ui);
+    dock_style.gap = f32::from(crate::theme::GUTTER);
+    dock_style.min_pane = MIN_PANE_EXTENT;
+
+    dock_style.background = tokens.panel;
+    dock_style.tab_background = tokens.panel;
+    dock_style.active_background = tokens.button;
+    dock_style.text = tokens.text_strong;
+    dock_style.inactive_text = tokens.text_dim;
+    dock_style.border = egui::Stroke::NONE;
+    dock_style.accent = tokens.accent;
+    dock_style.floating_background = tokens.panel;
+    dock_style.floating_stroke = egui::Stroke::new(FLOATING_BORDER_WIDTH, tokens.button_border);
+
+    dock_style.font = egui::FontId::proportional(TAB_TEXT_SIZE);
+    dock_style.min_tab_width = MIN_TAB_WIDTH;
+    dock_style.tab_height = TAB_HEIGHT;
+
+    // Panels arrange in a split tree around the viewport; floating title bars only move windows
+    dock_style.new_dock_zones = false;
+    dock_style.title_bar_docks = false;
+    dock_style
 }
 
 /// Whether a modal layer or update dialog holds the input, so the panels, floating ones included,

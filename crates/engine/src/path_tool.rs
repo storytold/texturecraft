@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use texturecraft_compose::{PaintTarget, PixelStore};
-use texturecraft_core::{Channel, Effect, EffectKind, LayerId, Mask, MaskBackground, PathShape};
+use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, PathShape};
 use texturecraft_geom::glam::{Mat3, Vec2, Vec3};
 use texturecraft_geom::{OrbitCamera, surface_at};
 use texturecraft_paint::{BrushSettings, Lasso, PickCtx, fill_coverage, pick, spline, spline_segments};
@@ -368,6 +368,10 @@ impl Session {
 
     /// Store the Path tool's curve (new, or the path being edited) and repaint its sublayer as one undo step, then clear the tool
     pub fn commit_path(&mut self, viewport: Vec2) -> Result<Value> {
+        if self.quick_mask.editing {
+            return Err(EngineError::Other("paths can't edit the quick mask: stop editing it first".into()));
+        }
+
         if let Some((effect, index)) = self.tool.path.editing
             && self.paths(effect).and_then(|paths| paths.get(index)).is_some_and(|stored| self.same_as_stored(stored))
         {
@@ -396,20 +400,20 @@ impl Session {
         let shape = self.path_shape(self.camera, viewport);
         let editing = self.tool.path.editing;
         let label = editing.map_or(NEW_PATH_LABEL.to_string(), |(_, i)| format!("Edit path {}", i + 1));
-        let out = self.edit_merging(&label, editing.is_some() && self.tool.path.edited, |s| {
-            let (eid, index) = match editing {
+        let report = self.edit_merging(&label, editing.is_some() && self.tool.path.edited, |session| {
+            let (effect_id, index) = match editing {
                 Some(at) => at,
-                None => (s.path_effect()?, usize::MAX),
+                None => (session.path_effect()?, usize::MAX),
             };
-            s.put_path(eid, index, shape)
+            session.put_path(effect_id, index, shape)
         })?;
 
-        if let Some(eid) = out.get("effect").and_then(Value::as_u64) {
-            self.target = StackTarget::Effect(LayerId(eid));
+        if let Some(effect_id) = report.get("effect").and_then(Value::as_u64) {
+            self.target = StackTarget::Effect(LayerId(effect_id));
         }
         self.tool.path.clear();
 
-        Ok(out)
+        Ok(report)
     }
 
     /// Repaint the edited path (one merged undo step) or a new path's preview (no step) when its points, brush or material changed; called every frame
@@ -429,9 +433,13 @@ impl Session {
 
     /// Preview a command's points in its supplied viewport, or the UI's current viewport
     fn path_live_in_view(&mut self, viewport: Vec2) -> Result<bool> {
+        if self.quick_mask.editing {
+            return Ok(false);
+        }
+
         let stored = match self.tool.path.editing {
-            Some((eid, index)) => match self.paths(eid).and_then(|v| v.get(index)).cloned() {
-                Some(shape) => Some((eid, index, shape)),
+            Some((effect_id, index)) => match self.paths(effect_id).and_then(|paths| paths.get(index)).cloned() {
+                Some(shape) => Some((effect_id, index, shape)),
                 None => {
                     self.stop_path_edit();
                     return Ok(false);
@@ -661,6 +669,11 @@ impl Session {
         let from = if back { &self.path_steps.0 } else { &self.path_steps.1 };
         let Some((index, state)) = from.iter().enumerate().rfind(|(_, state)| !state.same_curve(&self.tool.path)) else { return Ok(false) };
 
+        // Returning false here would let undo/redo consume document history instead.
+        if self.quick_mask.editing {
+            return Err(EngineError::Other("paths can't edit the quick mask: stop editing it first".into()));
+        }
+
         let path = &mut self.tool.path;
         let previous = std::mem::replace(path, PathState { editing: path.editing, edited: path.edited, ..state.clone() });
         if let Err(error) = self.path_live() {
@@ -706,33 +719,40 @@ impl Session {
         self.path_steps = Default::default();
     }
 
-    /// The selected path sublayer, or a new one on the selected layer's content or mask
-    /// (whichever is selected).
+    /// The selected path sublayer, or a new one on the selected paint layer's content or mask
     fn path_effect(&mut self) -> Result<LayerId> {
-        let id = self.selected_layer().ok_or_else(|| EngineError::Other("select a layer to add the path to".into()))?;
-        let p = &self.doc.project;
+        if self.quick_mask.editing {
+            return Err(EngineError::Other("paths can't edit the quick mask: stop editing it first".into()));
+        }
+
+        let selected = self.selected_layer().ok_or_else(|| EngineError::Other("select a layer to add the path to".into()))?;
+        let project = &self.doc.project;
         let mask = match self.target {
-            StackTarget::Effect(e) => match p.effect(e) {
-                Some((_, x)) if matches!(x.kind, EffectKind::Path(_)) => return Ok(e),
-                Some((owner, _)) => !p.layer(owner)?.content_effects.iter().any(|x| x.id == e),
+            StackTarget::Effect(effect) => match project.effect(effect) {
+                // Paths saved in a fill layer before paths there were removed stay editable
+                Some((_, found)) if matches!(found.kind, EffectKind::Path(_)) => return Ok(effect),
+                Some((owner, _)) => !project.layer(owner)?.content_effects.iter().any(|candidate| candidate.id == effect),
                 None => false,
             },
             StackTarget::Mask => true,
             StackTarget::Content => false,
         };
-        // An instance's content and (unless it has its own) mask belong to its source.
-        let owner = if mask { p.mask_owner(id) } else { p.content_layer(id).map_or(id, |l| l.id) };
-        let eid = self.doc.project.alloc_id();
-        let l = self.doc.project.layer_mut(owner)?;
-        let e = Effect::new(eid, EffectKind::Path(Vec::new()));
+
+        // An instance's content and (unless it has its own) mask belong to its source
+        let owner = if mask { project.mask_owner(selected) } else { project.content_layer(selected).map_or(selected, |layer| layer.id) };
+        let path_id = self.doc.project.alloc_id();
+        let layer = self.doc.project.layer_mut(owner)?;
+        let path = Effect::new(path_id, EffectKind::Path(Vec::new()));
         if mask {
-            l.mask.get_or_insert_with(|| Mask::new(MaskBackground::Black)).effects.push(e);
-        } else if l.is_group() {
-            return Err(EngineError::Other(format!("\"{}\" is a folder: add the path to a layer or a mask", l.name)));
+            layer.mask.get_or_insert_with(|| Mask::new(MaskBackground::Black)).effects.push(path);
+        } else if layer.is_group() {
+            return Err(EngineError::Other(format!("\"{}\" is a folder: add the path to a layer or a mask", layer.name)));
+        } else if matches!(layer.kind, LayerKind::Paint) {
+            layer.content_effects.push(path);
         } else {
-            l.content_effects.push(e);
+            return Err(EngineError::Other(format!("\"{}\" is not a paint layer: add the path to a paint layer or a mask", layer.name)));
         }
-        Ok(eid)
+        Ok(path_id)
     }
 
     /// [`Session::put_path`] recompositing only the tiles it changed, with no undo step: returns the paint report and the document before
@@ -1069,6 +1089,29 @@ mod tests {
         assert_eq!(changed_tiles(&before, &before.clone(), effect), BTreeSet::new());
         assert_eq!(changed_tiles(&before, &after, effect), BTreeSet::from([(0, 0), (1, 0), (2, 1)]));
         assert_eq!(changed_tiles(&before, &after, LayerId(8)), BTreeSet::new());
+    }
+
+    #[test]
+    fn quick_mask_preserves_pending_path_undo_and_redo() {
+        let mut session = Session::new_project("t", texturecraft_geom::primitives::plane(1.0, 1), "builtin:test", None, 128).unwrap();
+        execute(&mut session, "tool.path", &json!({"uvPoints": [[0.2, 0.5], [0.8, 0.5]]})).unwrap();
+        session.path_checkpoint();
+        session.tool.path.points[0].y = 0.3;
+        session.path_live().unwrap();
+        for back in [true, false] {
+            let curve = session.tool.path.clone();
+            let steps = (session.path_steps.0.len(), session.path_steps.1.len());
+            let history = (session.history_labels(), session.redo_labels());
+            let pixels = session.doc.pixels.clone();
+            session.quick_mask.editing = true;
+            assert!(if back { session.undo() } else { session.redo() }.is_err());
+            assert!(curve.same_curve(&session.tool.path));
+            assert_eq!(steps, (session.path_steps.0.len(), session.path_steps.1.len()));
+            assert_eq!(history, (session.history_labels(), session.redo_labels()));
+            assert_eq!(format!("{:?}", pixels), format!("{:?}", session.doc.pixels));
+            session.quick_mask.editing = false;
+            if back { session.undo() } else { session.redo() }.unwrap();
+        }
     }
 
     #[test]

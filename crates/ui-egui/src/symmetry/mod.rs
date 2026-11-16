@@ -29,9 +29,10 @@ pub(crate) fn applies_to(tool: Tool) -> bool {
     matches!(tool, Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Clone | Tool::Path)
 }
 
-/// Whether the 3D view shows symmetry now
+/// Whether the 3D view shows symmetry now: not while the active tool can't act on the selection
 pub(crate) fn shown(app: &TextureCraftApp) -> bool {
-    app.ui.mode == crate::state::Mode::Painting && applies_to(app.session.tool.tool) && app.session.tool.brush.symmetry.any()
+    let tool = app.session.tool.tool;
+    app.ui.mode == crate::state::Mode::Painting && applies_to(tool) && app.session.tool_usable(tool) && app.session.tool.brush.symmetry.any()
 }
 
 /// The world axes any active mirror plane or radial axis can move along, even while symmetry is disabled

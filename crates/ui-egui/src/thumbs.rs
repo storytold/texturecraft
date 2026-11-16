@@ -3,13 +3,14 @@
 //! Smart masks, smart materials and hover previews use [`PreviewWorker`]
 
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use egui::{Color32, ColorImage, Painter, Pos2, Rect, TextureHandle, TextureOptions};
 use texturecraft_engine::compose::{ImageRes, ImageStore};
 use texturecraft_engine::core::ProceduralKind;
 use texturecraft_engine::paint::presets::BrushPreset;
-use texturecraft_engine::paint::{BrushAlpha, alphas};
+use texturecraft_engine::paint::{BrushAlpha, BrushSettings, alphas};
 use texturecraft_engine::texel::linear_to_srgb;
 
 use crate::preview_image::{aces, image_preview, shade};
@@ -23,21 +24,30 @@ const PER_FRAME: usize = 2;
 /// Shelf sphere and smart mask thumbnail size in pixels
 const SPHERE_PX: usize = 72;
 /// Shelf procedural swatch size in pixels
-const PROCEDURAL_PX: usize = 56;
+const PROCEDURAL_PX: usize = 64;
 /// Shelf alpha and brush stroke swatch size in pixels
 const SWATCH_PX: usize = 64;
 /// Image resource preview size in pixels
 const IMAGE_PX: usize = 64;
+/// The [`ShelfPreview::key`] prefix of the user's saved files
+const SAVED_FILE_KEY_PREFIX: &str = "saved-";
 /// Largest stencil preview dimension in pixels
 const STENCIL_MAX_SIZE_PX: f32 = 1024.0;
 /// Big hover previews kept at most (the least recently shown go first)
 const BIG_PREVIEWS_KEPT: usize = 32;
+
+/// Parsed settings, weak image identity and preview revision for a saved brush
+type SavedBrushCacheEntry = (Option<BrushSettings>, Option<Weak<ImageRes>>, u64);
 
 /// The shelf's and the brush panel's preview textures
 #[derive(Default)]
 pub struct Thumbs {
     /// Shelf thumbnails by [`ShelfPreview::key`]
     shelf: HashMap<String, TextureHandle>,
+    /// Parsed settings, weak image identity and preview revision for each saved brush
+    saved_brush_previews: HashMap<PathBuf, SavedBrushCacheEntry>,
+    /// Refresh generation; queued results from earlier generations must not match new requests
+    saved_files_epoch: u64,
     images: HashMap<String, (Weak<ImageRes>, TextureHandle)>,
     images_revision: Option<u64>,
     /// (frame, thumbnails rendered in it)
@@ -145,7 +155,7 @@ impl Thumbs {
     fn worker_rendered(&mut self, ctx: &egui::Context, preview: ShelfPreview, size_px: usize, hover: bool) -> Option<TextureHandle> {
         self.receive(ctx);
 
-        let key = worker_key(&preview, size_px);
+        let key = self.worker_key(&preview, size_px);
         if !self.rendered.contains_key(&key) && self.may_request(ctx) {
             let queued = self.worker.request(ctx, PreviewRequest { key: key.clone(), preview, size_px, hover });
             self.rendered.insert(key.clone(), if queued { WorkerPreview::Rendering } else { WorkerPreview::Failed });
@@ -194,7 +204,7 @@ impl Thumbs {
 
     /// Request a hover preview and evict the least recently shown beyond the cache limit
     pub fn big(&mut self, ctx: &egui::Context, preview: ShelfPreview, size_px: usize) -> Option<TextureHandle> {
-        let key = worker_key(&preview, size_px);
+        let key = self.worker_key(&preview, size_px);
         self.big_shown.retain(|k| *k != key);
         self.big_shown.push_back(key);
         while self.big_shown.len() > BIG_PREVIEWS_KEPT {
@@ -209,7 +219,7 @@ impl Thumbs {
     /// The big preview of `preview` if the worker already rendered it (requests nothing)
     pub fn rendered_big(&mut self, ctx: &egui::Context, preview: &ShelfPreview, size_px: usize) -> Option<TextureHandle> {
         self.receive(ctx);
-        self.ready(&worker_key(preview, size_px))
+        self.ready(&self.worker_key(preview, size_px))
     }
 
     /// Material thumbnail: smart materials come from the worker's orb, plain ones are spheres
@@ -218,6 +228,16 @@ impl Thumbs {
             preview @ ShelfPreview::SmartMaterial(_) => self.worker_rendered(ctx, preview, SPHERE_PX, false),
             preview => self.shelf(ctx, preview, SPHERE_PX),
         }
+    }
+
+    /// Drop the thumbnails and hover previews of the user's saved files, which may have changed on disk
+    pub fn forget_saved_files(&mut self) {
+        self.saved_files_epoch = self.saved_files_epoch.wrapping_add(1);
+        let current = |key: &String| !key.starts_with(SAVED_FILE_KEY_PREFIX);
+        self.shelf.retain(|key, _| current(key));
+        self.rendered.retain(|key, _| current(key));
+        self.big_shown.retain(current);
+        self.saved_brush_previews.clear();
     }
 
     /// Smart mask thumbnail; None until the worker returns it
@@ -240,15 +260,67 @@ impl Thumbs {
         self.shelf(ctx, ShelfPreview::Alpha(alpha), SWATCH_PX)
     }
 
+    /// A lighting environment's panorama
+    pub fn environment(&mut self, ctx: &egui::Context, name: &'static str) -> Option<TextureHandle> {
+        self.shelf(ctx, ShelfPreview::Environment(name), SWATCH_PX)
+    }
+
+    /// A saved brush preset's stroke along an S curve; None while it renders, empty when the file is unreadable
+    pub fn saved_brush(&mut self, ctx: &egui::Context, path: &Path, images: &ImageStore) -> Option<TextureHandle> {
+        let key = format!("saved-brush:{}", path.display());
+        let cached_preview = self.saved_brush_previews.contains_key(path).then(|| self.saved_brush_preview(path, images));
+        if let Some(texture) = self.shelf.get(&key) {
+            return Some(texture.clone());
+        }
+        if !self.spend_budget(ctx, 1) {
+            return None;
+        }
+
+        let preview = cached_preview.unwrap_or_else(|| self.saved_brush_preview(path, images));
+        let image = preview.image(SWATCH_PX).unwrap_or_else(|| ColorImage::filled([SWATCH_PX, SWATCH_PX], Color32::TRANSPARENT));
+        let texture = ctx.load_texture(format!("thumb_{key}"), image, TextureOptions::LINEAR);
+        self.shelf.insert(key, texture.clone());
+        Some(texture)
+    }
+
+    /// Reuse parsed settings until refresh; rebuild previews when their project image changes
+    pub fn saved_brush_preview(&mut self, path: &Path, images: &ImageStore) -> ShelfPreview {
+        let cached = self.saved_brush_previews.entry(path.to_path_buf()).or_insert_with(|| (crate::shelf_preview::read_saved_brush(path), None, 0));
+        let (settings, previous_image, revision) = cached;
+        let image = settings.as_ref().and_then(|brush| brush.alpha_image.as_ref()).and_then(|name| images.get(name));
+        let image_changed = match (previous_image.as_ref(), image) {
+            (Some(previous), Some(current)) => previous.upgrade().is_none_or(|previous| !Arc::ptr_eq(&previous, current)),
+            (None, None) => false,
+            _ => true,
+        };
+        *previous_image = image.map(Arc::downgrade);
+        if image_changed {
+            *revision = revision.wrapping_add(1);
+            let key = format!("saved-brush:{}", path.display());
+            let rendered_prefix = format!("{key}@");
+            self.shelf.remove(&key);
+            self.rendered.retain(|rendered, _| !rendered.starts_with(&rendered_prefix));
+            self.big_shown.retain(|rendered| !rendered.starts_with(&rendered_prefix));
+        }
+
+        ShelfPreview::SavedBrush { path: path.to_path_buf(), settings: settings.clone(), image: image.cloned() }
+    }
+
+    /// A saved-brush key also identifies the refresh and image version of its request
+    fn worker_key(&self, preview: &ShelfPreview, size_px: usize) -> String {
+        let key = format!("{}@{size_px}", preview.key());
+        if let ShelfPreview::SavedBrush { path, .. } = preview {
+            let revision = self.saved_brush_previews.get(path).map_or(0, |(_, _, revision)| *revision);
+            format!("{key}#{}:{revision}", self.saved_files_epoch)
+        } else {
+            key
+        }
+    }
+
     /// A brush preset's stroke along an S curve
     pub fn brush_preset(&mut self, ctx: &egui::Context, preset: &'static BrushPreset) -> Option<TextureHandle> {
         self.shelf(ctx, ShelfPreview::Brush(preset), SWATCH_PX)
     }
-}
-
-/// The key of a worker-rendered preview: one per asset and size
-fn worker_key(preview: &ShelfPreview, size_px: usize) -> String {
-    format!("{}@{size_px}", preview.key())
 }
 
 /// A small shaded sphere drawn with a vertex-colored mesh (layer thumbnails, previews).
@@ -307,11 +379,133 @@ pub fn paint_alpha(p: &Painter, rect: Rect, a: BrushAlpha, hardness: f32) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use texturecraft_engine::compose::{ImageRes, ImageStore};
+    use crate::orb_shape::OrbShape;
 
-    use super::Thumbs;
+    static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn saved_brush_refresh_discards_old_worker_result() {
+        let ctx = egui::Context::default();
+        let mut thumbs = Thumbs { worker: PreviewWorker::Inline { shape: OrbShape::default(), results: Vec::new() }, ..Thumbs::default() };
+        let preview = ShelfPreview::SavedBrush { path: PathBuf::from("refreshed.tcbrush"), settings: None, image: None };
+
+        assert!(thumbs.big(&ctx, preview.clone(), 8).is_none());
+        thumbs.forget_saved_files();
+        assert!(thumbs.big(&ctx, preview.clone(), 8).is_none());
+
+        let PreviewWorker::Inline { results, .. } = &mut thumbs.worker else { panic!("test worker must render inline") };
+        let old_key = results[0].0.clone();
+        let current_key = results[1].0.clone();
+        *results = vec![(current_key, None), (old_key, Some(ColorImage::filled([8, 8], Color32::RED)))];
+
+        let mut output = ctx.run_pass(Default::default(), |_| {});
+        output.textures_delta.clear();
+        assert!(thumbs.rendered_big(&ctx, &preview, 8).is_none(), "an old completion must not replace the current failed result");
+    }
+
+    #[test]
+    fn saved_brush_image_replacement_preserves_current_worker_result() {
+        let ctx = egui::Context::default();
+        let mut thumbs = Thumbs { worker: PreviewWorker::Inline { shape: OrbShape::default(), results: Vec::new() }, ..Thumbs::default() };
+        let path = PathBuf::from("changed-alpha.tcbrush");
+        let settings = BrushSettings { alpha_image: Some("alpha.png".into()), ..BrushSettings::default() };
+        thumbs.saved_brush_previews.insert(path.clone(), (Some(settings), None, 0));
+        let image = |value| Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[value; 4]; 4], srgb: false });
+        let mut images: ImageStore = [("alpha.png".into(), image(0.2))].into();
+
+        let old_preview = thumbs.saved_brush_preview(&path, &images);
+        assert!(thumbs.big(&ctx, old_preview, 8).is_none());
+        images.insert("alpha.png".into(), image(0.8));
+        let current_preview = thumbs.saved_brush_preview(&path, &images);
+        assert!(thumbs.big(&ctx, current_preview.clone(), 8).is_none());
+
+        let PreviewWorker::Inline { results, .. } = &mut thumbs.worker else { panic!("test worker must render inline") };
+        let old_key = results[0].0.clone();
+        let current_key = results[1].0.clone();
+        *results = vec![(current_key, Some(ColorImage::filled([8, 8], Color32::RED))), (old_key, None)];
+
+        let mut output = ctx.run_pass(Default::default(), |_| {});
+        output.textures_delta.clear();
+        assert!(thumbs.rendered_big(&ctx, &current_preview, 8).is_some(), "the current completion must survive an old failure");
+    }
+
+    #[test]
+    fn saved_brush_file_read_waits_for_the_thumbnail_budget() {
+        let path = std::env::temp_dir().join(format!("texturecraft-brush-budget-{}-{}.tcbrush", std::process::id(), NEXT_FILE.fetch_add(1, Ordering::Relaxed)));
+        std::fs::write(&path, serde_json::to_vec(&BrushSettings::default()).unwrap()).unwrap();
+        let context = egui::Context::default();
+        let mut thumbs = Thumbs::default();
+        thumbs.budget = (context.cumulative_pass_nr(), PER_FRAME);
+
+        assert!(thumbs.saved_brush(&context, &path, &ImageStore::new()).is_none());
+        assert!(thumbs.saved_brush_previews.is_empty(), "a deferred thumbnail has not read its file");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn saved_brush_settings_are_read_once_until_refresh() {
+        let path =
+            std::env::temp_dir().join(format!("texturecraft-brush-preview-{}-{}.tcbrush", std::process::id(), NEXT_FILE.fetch_add(1, Ordering::Relaxed)));
+        std::fs::write(&path, serde_json::to_vec(&BrushSettings::default()).unwrap()).unwrap();
+        let mut thumbs = Thumbs::default();
+        let images = ImageStore::new();
+
+        assert!(matches!(thumbs.saved_brush_preview(&path, &images), ShelfPreview::SavedBrush { settings: Some(_), .. }));
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            matches!(thumbs.saved_brush_preview(&path, &images), ShelfPreview::SavedBrush { settings: Some(_), .. }),
+            "cached settings avoid a second file read"
+        );
+
+        thumbs.forget_saved_files();
+        assert!(matches!(thumbs.saved_brush_preview(&path, &images), ShelfPreview::SavedBrush { settings: None, .. }), "refresh reads the file again");
+    }
+
+    #[test]
+    fn saved_brush_cache_releases_old_images_on_change_and_refresh() {
+        const IMAGE_SIDE: u32 = 512;
+        const IMAGE_TEXELS: usize = IMAGE_SIDE as usize * IMAGE_SIDE as usize;
+        const IMAGE_BYTES: usize = IMAGE_TEXELS * std::mem::size_of::<[f32; 4]>();
+
+        let mut thumbs = Thumbs::default();
+        let first_path = PathBuf::from("first.tcbrush");
+        let second_path = PathBuf::from("second.tcbrush");
+        let settings = BrushSettings { alpha_image: Some("alpha.png".into()), ..BrushSettings::default() };
+        let old_image = Arc::new(ImageRes { width: IMAGE_SIDE, height: IMAGE_SIDE, rgba: vec![[1.0; 4]; IMAGE_TEXELS], srgb: false });
+        let other_image = Arc::new(ImageRes { width: IMAGE_SIDE, height: IMAGE_SIDE, rgba: vec![[0.5; 4]; IMAGE_TEXELS], srgb: false });
+        let old_weak = Arc::downgrade(&old_image);
+        let other_weak = Arc::downgrade(&other_image);
+        assert!(old_image.rgba.iter().map(|pixel| std::hint::black_box(pixel[0])).sum::<f32>() > 0.0);
+        assert!(other_image.rgba.iter().map(|pixel| std::hint::black_box(pixel[0])).sum::<f32>() > 0.0);
+
+        thumbs.saved_brush_previews.insert(first_path.clone(), (Some(settings.clone()), None, 0));
+        thumbs.saved_brush_previews.insert(second_path.clone(), (Some(settings), None, 0));
+        let mut images: ImageStore = [("alpha.png".into(), old_image.clone())].into();
+        drop(thumbs.saved_brush_preview(&first_path, &images));
+        images.insert("alpha.png".into(), other_image.clone());
+        drop(thumbs.saved_brush_preview(&second_path, &images));
+        drop(old_image);
+        drop(other_image);
+        assert!(old_weak.upgrade().is_none(), "cached settings do not retain a replaced image");
+        assert!(other_weak.upgrade().is_some(), "the project still owns its current image");
+        eprintln!(
+            "saved brush cache after first replacement: 0 of {IMAGE_BYTES} old image bytes retained, {} current image strong owners",
+            Arc::strong_count(&images["alpha.png"])
+        );
+
+        let replacement = Arc::new(ImageRes { width: IMAGE_SIDE, height: IMAGE_SIDE, rgba: vec![[0.0; 4]; IMAGE_TEXELS], srgb: false });
+        images.insert("alpha.png".into(), replacement);
+        drop(thumbs.saved_brush_preview(&first_path, &images));
+        assert!(other_weak.upgrade().is_none(), "another saved brush does not retain the old project image");
+        eprintln!("saved brush cache after second replacement: 0 of {IMAGE_BYTES} previous image bytes retained");
+
+        thumbs.forget_saved_files();
+        assert!(thumbs.saved_brush_previews.is_empty(), "refresh releases parsed brush settings");
+    }
 
     #[test]
     fn replacing_an_image_rebuilds_its_preview() {

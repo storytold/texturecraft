@@ -26,6 +26,7 @@ mod polygon_fill;
 mod project_recovery;
 mod sample;
 mod thumbs;
+mod tool_availability;
 mod tools;
 mod udim;
 mod uv_strokes;
