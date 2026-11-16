@@ -171,7 +171,13 @@ fn the_wheel_during_a_glide_is_not_overwritten_by_it() {
         h.hover_at(center);
         h.run_steps(1);
         if scroll != 0.0 {
-            h.event(Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, scroll), modifiers: Modifiers::NONE });
+            h.event(Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, scroll),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: Modifiers::NONE,
+            });
         }
         h.run_steps(80);
         h.state().session.camera.distance
