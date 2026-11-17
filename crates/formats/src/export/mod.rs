@@ -253,6 +253,10 @@ pub struct MapSpec {
     pub format: FileFormat,
     pub bit_depth: u8,
     pub channels: Vec<(Dest, SourceRef)>,
+    /// Destination channels written as `1 - value` (absent in old files: none). The source value
+    /// is inverted before the colour-space encoding, so a colour map is inverted in linear light.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inverted: Vec<Dest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -287,6 +291,10 @@ impl ExportPreset {
             }
             if dests.contains(&Dest::L) && dests.iter().any(|d| matches!(d, Dest::R | Dest::G | Dest::B)) {
                 return bad(format!("map \"{}\" mixes L with R/G/B", m.file));
+            }
+            let inv: BTreeSet<Dest> = m.inverted.iter().copied().collect();
+            if inv.len() != m.inverted.len() || !inv.is_subset(&dests) {
+                return bad(format!("map \"{}\" inverts a channel it does not write, or one twice", m.file));
             }
             if m.channels.iter().any(|(_, s)| matches!(s, SourceRef::Constant(v) if !v.is_finite())) {
                 return bad(format!("map \"{}\" has a non-finite constant", m.file));
@@ -729,6 +737,7 @@ pub fn render_maps(input: &ExportInput, opts: &ExportOptions) -> Result<Vec<Expo
             let map = opts.preset.maps.get(p.map).ok_or_else(|| FormatError::Invalid("planned map out of range".into()))?;
             let lay = layout(set, map);
             let n = lay.len();
+            let inverted: Vec<bool> = lay.iter().map(|(d, _)| map.inverted.contains(d)).collect();
             // The texels written: one tile, or the whole set.
             let (x0, y0, w, h) = match (p.tile, grid) {
                 (Some(t), Some(g)) => {
@@ -755,7 +764,8 @@ pub fn render_maps(input: &ExportInput, opts: &ExportOptions) -> Result<Vec<Expo
                     let mut cache = None;
                     for (k, (_, src)) in lay.iter().enumerate() {
                         if let Some(v) = row.get_mut(col * n + k) {
-                            *v = sampler.sample(src, at, &mut cache);
+                            let s = sampler.sample(src, at, &mut cache);
+                            *v = if inverted.get(k).copied().unwrap_or(false) { 1.0 - s } else { s };
                         }
                     }
                 }

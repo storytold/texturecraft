@@ -117,7 +117,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   anisotropy, transmission and subsurface maps), separate maps, mesh maps and document channels, in
   PNG, JPEG, TGA, TIFF, BMP, WEBP, EXR or HDR at 8, 16 or 32 bits, with UV padding, size
   override and OpenGL or DirectX normals.
-- **Output template editor:** build your own presets with per-channel packing and converted maps,
+- **Output template editor:** build your own presets with per-channel packing, converted maps and per-channel inversion,
   and share them as JSON.
 - **Mesh export** to OBJ with an MTL material library and its maps (PBR extension keys for
   roughness, metallic, normal and coat; UV-tiled sets keep their UDIM UVs and export their maps

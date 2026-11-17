@@ -39,6 +39,7 @@ mod skew_paint;
 mod split_divider;
 mod start_window;
 mod tool_availability;
+mod template_invert;
 mod toolbar;
 
 mod symmetry;

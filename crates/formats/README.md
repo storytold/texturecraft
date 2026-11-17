@@ -78,7 +78,7 @@ pub fn preset_from_json(json: &str) -> Result<ExportPreset>;
 pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
 ```
 
-- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)> }`
+- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)>, inverted: Vec<Dest> }`
   (serde JSON, so presets can be user files).
 - `Dest`: `R G B A` or `L` (gray; `L` + `A` = gray + alpha).
 - `SourceRef`: `Channel { channel, component }` (`Normal` = the **final** normal in the export

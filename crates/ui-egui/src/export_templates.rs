@@ -120,6 +120,13 @@ fn is_rgb(d: Dest) -> bool {
 fn set_layout(map: &mut MapSpec, layout: Layout) {
     let get = |d: Dest| map.channels.iter().find(|(x, _)| *x == d).map(|(_, s)| s.clone());
     let color = get(Dest::R).or_else(|| get(Dest::L)).unwrap_or(SourceRef::Constant(0.0));
+    // A source that moves to a new channel keeps its inversion.
+    let color_inverted = map.inverted.contains(if get(Dest::R).is_some() { &Dest::R } else { &Dest::L });
+    let was_inverted = |d: Dest| match get(d) {
+        Some(_) => map.inverted.contains(&d),
+        None => !matches!(d, Dest::A) && color_inverted,
+    };
+    let inverted: Vec<Dest> = layout.dests().iter().copied().filter(|&d| was_inverted(d)).collect();
     let channels = layout
         .dests()
         .iter()
@@ -132,10 +139,11 @@ fn set_layout(map: &mut MapSpec, layout: Layout) {
         })
         .collect();
     map.channels = channels;
+    map.inverted = inverted;
 }
 
 fn new_map(layout: Layout) -> MapSpec {
-    let mut map = MapSpec { file: "$mesh_$textureSet_Output".into(), format: FileFormat::Png, bit_depth: 8, channels: Vec::new() };
+    let mut map = MapSpec { file: "$mesh_$textureSet_Output".into(), format: FileFormat::Png, bit_depth: 8, channels: Vec::new(), inverted: Vec::new() };
     set_layout(&mut map, layout);
     map
 }
@@ -147,6 +155,8 @@ fn drop_input(map: &mut MapSpec, dest: Dest, input: &SourceRef) {
     for (d, s) in &mut map.channels {
         if *d == dest || (fill_rgb && is_rgb(*d)) {
             *s = with_component(input, slot_component(*d));
+            // A new source starts un-inverted.
+            map.inverted.retain(|x| x != d);
         }
     }
 }
@@ -587,7 +597,8 @@ fn channel_slots(ui: &mut Ui, mi: usize, map: &mut MapSpec) -> bool {
     let tk = Tokens::get(ui.ctx());
     let mut changed = false;
     let mut dropped = None;
-    for (k, (dest, src)) in map.channels.iter_mut().enumerate() {
+    let MapSpec { channels, inverted, .. } = map;
+    for (k, (dest, src)) in channels.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             let dest_name = match *dest {
                 Dest::L => tr("Gray"),
@@ -627,6 +638,14 @@ fn channel_slots(ui: &mut Ui, mi: usize, map: &mut MapSpec) -> bool {
                     });
                 }
                 _ => {}
+            }
+            let on = inverted.contains(dest);
+            if ui.selectable_label(on, tr("Invert")).on_hover_text(tr("Write 1 minus the value in this channel")).clicked() {
+                inverted.retain(|x| x != dest);
+                if !on {
+                    inverted.push(*dest);
+                }
+                changed = true;
             }
         });
     }

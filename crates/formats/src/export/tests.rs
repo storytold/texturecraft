@@ -242,6 +242,7 @@ fn templates_are_sanitized_and_collisions_suffixed() {
         format: FileFormat::Png,
         bit_depth: 8,
         channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 })],
+        inverted: Vec::new(),
     };
     let preset = ExportPreset {
         name: "t".into(),
@@ -316,6 +317,7 @@ fn every_format_encodes_and_decodes() {
         format: FileFormat::Png,
         bit_depth: 8,
         channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 }), (Dest::A, SourceRef::Constant(0.5))],
+        inverted: Vec::new(),
     };
     let mut preset = builtin_preset("glTF PBR Metal Roughness").unwrap();
     preset.maps.push(gray_alpha);
@@ -407,7 +409,7 @@ fn write_files_accepts_planned_name_with_max_length_stem() {
 }
 
 fn gray_map(file: &str, src: SourceRef) -> MapSpec {
-    MapSpec { file: file.into(), format: FileFormat::Png, bit_depth: 8, channels: vec![(Dest::L, src)] }
+    MapSpec { file: file.into(), format: FileFormat::Png, bit_depth: 8, channels: vec![(Dest::L, src)], inverted: Vec::new() }
 }
 
 #[test]
@@ -449,6 +451,7 @@ fn converted_maps_invert_and_derive_normals() {
         format: FileFormat::Png,
         bit_depth: 8,
         channels: [Dest::R, Dest::G, Dest::B].into_iter().zip(0u8..).map(|(d, k)| (d, SourceRef::Virtual { map, component: k })).collect(),
+        inverted: Vec::new(),
     };
     let preset = ExportPreset {
         name: "converted".into(),
@@ -505,6 +508,7 @@ fn uv_tiles_export_one_file_per_tile_without_padding_across() {
                 (Dest::G, SourceRef::Channel { channel: Channel::BaseColor, component: 1 }),
                 (Dest::B, SourceRef::Channel { channel: Channel::BaseColor, component: 2 }),
             ],
+            inverted: Vec::new(),
         }],
     };
     let files = render_maps(&input, &ExportOptions::new(preset.clone())).unwrap();
@@ -534,7 +538,7 @@ fn the_udim_name_is_the_file_name_with_its_tile_number_as_placeholder() {
     project.texture_sets.push(ts);
     let udim_names = |file: String| {
         let channels = vec![(Dest::R, SourceRef::Channel { channel: Channel::BaseColor, component: 0 })];
-        let preset = ExportPreset { name: "t".into(), maps: vec![MapSpec { file, format: FileFormat::Png, bit_depth: 8, channels }] };
+        let preset = ExportPreset { name: "t".into(), maps: vec![MapSpec { file, format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new() }] };
         list_outputs(&project, 0, "m", &ExportOptions::new(preset)).unwrap().into_iter().map(|f| f.udim_name).collect::<Vec<_>>()
     };
     let placeholder = Some("Body_<UDIM>.png".to_string());
@@ -635,6 +639,7 @@ fn colour_space_names_the_files_and_warns_when_integer_files_clamp() {
                 (Dest::G, SourceRef::Channel { channel: Channel::BaseColor, component: 1 }),
                 (Dest::B, SourceRef::Channel { channel: Channel::BaseColor, component: 2 }),
             ],
+            inverted: Vec::new(),
         }],
     };
     let plan = |space: Option<ColorSpace>, format: Option<FileFormat>| {
@@ -726,4 +731,81 @@ fn formats_without_a_place_for_a_colour_space_say_so() {
         encode(format, 8, (4, 4), 3, &data, &[false; 3], None, &mut quiet).unwrap();
         assert!(quiet.is_empty(), "{format:?}: nothing to say without a chosen space: {quiet:?}");
     }
+}
+
+/// R packs roughness (0.25) and B metallic (0.75); G and A are constants.
+fn invert_map(depth: u8, inverted: Vec<Dest>) -> MapSpec {
+    let ch = |channel| SourceRef::Channel { channel, component: 0 };
+    MapSpec {
+        file: "packed".into(),
+        format: FileFormat::Png,
+        bit_depth: depth,
+        channels: vec![
+            (Dest::R, ch(Channel::Roughness)),
+            (Dest::G, SourceRef::Constant(0.5)),
+            (Dest::B, ch(Channel::Metallic)),
+            (Dest::A, SourceRef::Constant(1.0)),
+        ],
+        inverted,
+    }
+}
+
+#[test]
+fn inverted_channels_write_one_minus_the_source() {
+    let fx = Fx::new(&default_channels());
+    for depth in [8u8, 16] {
+        let preset = |inverted| ExportPreset { name: "inv".into(), maps: vec![invert_map(depth, inverted)] };
+        let px = |p: ExportPreset| {
+            let files = fx.render(&ExportOptions::new(p));
+            let img = decode(find(&files, "packed")).to_rgba16();
+            let p = img.get_pixel(9, 9).0;
+            // Compare 16-bit values for both depths: an 8-bit file widens to value * 257.
+            p.map(i32::from)
+        };
+        let plain = px(preset(Vec::new()));
+        let inv = px(preset(vec![Dest::R, Dest::A]));
+        let tol = if depth == 8 { 257 } else { 2 };
+        // Roughness 0.25 inverts to 0.75, constant alpha 1 to 0; G and B stay.
+        assert!((inv[0] - (65535 - plain[0])).abs() <= tol, "depth {depth}: R {} vs {}", inv[0], 65535 - plain[0]);
+        assert!((inv[0] - 49151).abs() <= tol, "depth {depth}: R {}", inv[0]);
+        assert!(inv[3] <= tol, "depth {depth}: A {}", inv[3]);
+        assert_eq!((inv[1], inv[2]), (plain[1], plain[2]), "depth {depth}: channels not listed stay as they are");
+        assert!((plain[0] - 16384).abs() <= tol && plain[3] == 65535, "depth {depth}: un-inverted {plain:?}");
+    }
+    // Gray maps and float files too.
+    let mut gray = gray_map("g", SourceRef::Channel { channel: Channel::Metallic, component: 0 });
+    gray.inverted = vec![Dest::L];
+    let files = fx.render(&ExportOptions::new(ExportPreset { name: "inv".into(), maps: vec![gray.clone()] }));
+    assert_eq!(decode(find(&files, "g.png")).to_luma8().get_pixel(4, 4)[0], 64, "1 - metallic 0.75");
+    gray.format = FileFormat::Exr;
+    gray.bit_depth = 32;
+    let files = fx.render(&ExportOptions::new(ExportPreset { name: "inv".into(), maps: vec![gray] }));
+    let v = decode(find(&files, "g.exr")).to_rgb32f().get_pixel(4, 4)[0];
+    assert!((v - 0.25).abs() < 1e-3, "{v}");
+}
+
+#[test]
+fn inverted_flag_round_trips_and_old_json_loads() {
+    let mut map = invert_map(8, vec![Dest::B]);
+    let preset = ExportPreset { name: "Mine".into(), maps: vec![map.clone()] };
+    let json = preset_to_json(&preset).unwrap();
+    assert_eq!(preset_from_json(&json).unwrap(), preset);
+    // A file written before the flag existed has no `inverted` and keeps none on save.
+    map.inverted.clear();
+    let old = ExportPreset { name: "Old".into(), maps: vec![map] };
+    let json = preset_to_json(&old).unwrap();
+    assert!(!json.contains("inverted"), "{json}");
+    assert_eq!(preset_from_json(&json).unwrap(), old);
+    assert!(preset_from_json(&json).unwrap().maps[0].inverted.is_empty());
+}
+
+#[test]
+fn validation_rejects_inverting_a_channel_the_map_lacks() {
+    let ok = ExportPreset { name: "Mine".into(), maps: vec![invert_map(8, vec![Dest::R])] };
+    ok.validate().unwrap();
+    let mut bad = ok.clone();
+    bad.maps[0].inverted = vec![Dest::L];
+    assert!(bad.validate().is_err());
+    bad.maps[0].inverted = vec![Dest::R, Dest::R];
+    assert!(bad.validate().is_err());
 }
