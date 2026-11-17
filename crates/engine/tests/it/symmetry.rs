@@ -348,7 +348,9 @@ fn a_2d_dab_with_four_radial_copies_paints_three_more() {
 
     let at = hit.pos;
     assert!(red_at(&session, at), "the dab");
-    for (name, point) in [("a quarter turn", Vec3::new(-at.y, at.x, 0.0)), ("a half turn", Vec3::new(-at.x, -at.y, 0.0)), ("three quarters", Vec3::new(at.y, -at.x, 0.0))] {
+    for (name, point) in
+        [("a quarter turn", Vec3::new(-at.y, at.x, 0.0)), ("a half turn", Vec3::new(-at.x, -at.y, 0.0)), ("three quarters", Vec3::new(at.y, -at.x, 0.0))]
+    {
         assert!(red_at(&session, point), "the copy {name} around Z");
     }
     assert!(!red_at(&session, Vec3::new(at.x, -at.y, 0.0)), "no mirrored copy");
