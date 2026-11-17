@@ -52,10 +52,15 @@ fn drag(harness: &mut Harness<'_, TextureCraftApp>, from: Pos2, by: egui::Vec2) 
     harness.run_steps(3);
 }
 
+/// The text of the toast that says the sample project's second set is not active
+fn hint_text(harness: &Harness<'_, TextureCraftApp>) -> String {
+    let name = &harness.state().session.doc.project.texture_sets[1].name;
+    format!("Texture set '{name}' is not active for painting. Select it in the Texture Sets list.")
+}
+
 /// How many toasts say that the sample project's second set is not active
 fn hint_count(harness: &Harness<'_, TextureCraftApp>) -> usize {
-    let name = &harness.state().session.doc.project.texture_sets[1].name;
-    let hint = format!("Texture set '{name}' is not active for painting. Select it in the Texture Sets list.");
+    let hint = hint_text(harness);
     harness.state().toasts.iter().filter(|toast| toast.text == hint).count()
 }
 
@@ -72,9 +77,13 @@ fn a_stroke_starting_on_another_set_shows_the_hint_once_and_paints_nothing() {
     assert_eq!(harness.state().session.ts(), 0, "the stroke does not switch the active set");
 
     // A second stroke on that set says it again (the first toast may have expired by then)
-    let first_until = harness.state().toasts.iter().map(|toast| toast.until).fold(f64::MIN, f64::max);
+    let hint = hint_text(&harness);
+    let first_until = harness.state().toasts.iter().filter(|toast| toast.text == hint).map(|toast| toast.until).fold(f64::MIN, f64::max);
     drag(&mut harness, base + vec2(0.0, 12.0), vec2(24.0, 0.0));
-    assert!(harness.state().toasts.iter().any(|toast| toast.until > first_until), "the second stroke shows a new toast");
+    assert!(
+        harness.state().toasts.iter().any(|toast| toast.text == hint && toast.until > first_until),
+        "the second stroke shows a new inactive-set hint, not just any toast"
+    );
 }
 
 #[test]
