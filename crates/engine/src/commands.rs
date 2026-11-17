@@ -26,13 +26,28 @@ pub struct CommandSpec {
 
 impl CommandSpec {
     /// Whether a keyboard shortcut can run this command: it acts with no parameters at all, or
-    /// every parameter in its first `params` form is optional (`name?`). A command with a required
-    /// parameter (a path, a name, a texture set) cannot be run from a key, and neither can the
-    /// commands that only return data (lists, inspections) or that offer several alternative
-    /// parameter forms.
+    /// every parameter in its first `params` form is optional (`name?`) and none of them is one
+    /// of several alternatives. Left out: commands that need a path, name or similar, commands
+    /// that only return data or do nothing without parameters, and the ones that replace the
+    /// open project (the menu asks to save first).
     pub fn bindable(&self) -> bool {
-        const QUERIES: [&str; 5] = ["project.inspect", "tool.state", "text.fonts", "camera.get", "edit.history"];
-        !(self.id.ends_with(".list") || QUERIES.contains(&self.id) || self.params.contains('\u{2192}')) && params_all_optional(self.params)
+        const NOT_FROM_A_KEY: [&str; 13] = [
+            "project.inspect",
+            "project.templates",
+            "project.new",
+            "tool.state",
+            "text.fonts",
+            "export.presets",
+            "edit.history",
+            "camera.get",
+            "textureSet.parts",
+            "bake.settings",
+            "bake.preview",
+            "camera.set",
+            "textureSet.settings",
+        ];
+        const NOTHING_WITHOUT_PARAMS: [&str; 4] = ["layer.blend", "tool.stencil", "tool.fillSelection", "tool.path"];
+        !(self.id.ends_with(".list") || NOT_FROM_A_KEY.contains(&self.id) || NOTHING_WITHOUT_PARAMS.contains(&self.id)) && params_all_optional(self.params)
     }
 }
 
@@ -59,8 +74,8 @@ fn params_all_optional(params: &str) -> bool {
     }
     entries.push(&body[start..end]);
     entries.iter().filter(|entry| !entry.trim().is_empty()).all(|entry| {
-        // `index? | name?`: every alternative must be optional.
-        entry.split(" | ").all(|alternative| alternative.trim().split([':', ' ', '(']).next().is_some_and(|key| key.ends_with('?')))
+        // `index? | name?` asks for one of the two, so it is not optional as a whole.
+        !entry.contains(" | ") && entry.trim().split([':', ' ', '(']).next().is_some_and(|key| key.ends_with('?'))
     })
 }
 
@@ -277,23 +292,23 @@ mod tests {
     #[test]
     fn only_commands_a_key_can_run_are_bindable() {
         let bindable = |id: &str| find(id).unwrap_or_else(|| panic!("{id} is gone")).bindable();
-        for id in ["layer.add.paint", "layer.add.fill", "layer.add.group", "mask.invert", "mask.clear", "layer.visible", "effect.add.paint", "file.save", "tool.paint", "camera.add"] {
+        for id in ["layer.add.paint", "layer.add.fill", "layer.add.group", "mask.invert", "mask.clear", "layer.visible", "effect.add.paint", "file.save", "tool.paint", "camera.add", "effect.duplicate", "effect.paste"] {
             assert!(bindable(id), "{id} needs no parameters");
         }
-        for id in ["file.saveCopy", "textureSet.select", "layer.rename", "tool.select", "layer.select", "viewport.focusAt", "tool.stroke", "mask.smart.apply", "bake.skew.set", "textureSet.resolution", "effect.move"] {
+        for id in ["file.saveCopy", "textureSet.select", "layer.rename", "tool.select", "layer.select", "viewport.focusAt", "tool.stroke", "mask.smart.apply", "bake.skew.set", "textureSet.resolution", "effect.move", "camera.remove", "bake.highPoly.remove"] {
             assert!(!bindable(id), "{id} needs a parameter");
         }
-        for id in ["layer.move", "layer.list", "project.inspect", "edit.history", "export.presets", "tool.state"] {
+        for id in ["layer.move", "layer.list", "project.inspect", "edit.history", "export.presets", "tool.state", "project.new", "camera.set", "layer.blend"] {
             assert!(!bindable(id), "{id} is a query or has several forms");
         }
     }
 
     #[test]
     fn params_texts_are_read_by_their_required_entries() {
-        for ok in ["{}", "{layer?}", "{enabled?: bool} \u{2014} toggles when omitted", "{index? | name? | all?: true}", "{effect?: the selected effect}"] {
+        for ok in ["{}", "{layer?}", "{enabled?: bool} \u{2014} toggles when omitted", "{effect?: the selected effect}"] {
             assert!(params_all_optional(ok), "{ok}");
         }
-        for no in ["{path}", "{layer?, name}", "{x, y (viewport pixels), viewport?: [w, h]}", "{a?} | {b}", "{ts?, value?: 0..1 | path: image}", "no braces"] {
+        for no in ["{path}", "{layer?, name}", "{x, y (viewport pixels), viewport?: [w, h]}", "{a?} | {b}", "{index? | name?}", "{ts?, value?: 0..1 | path: image}", "no braces"] {
             assert!(!params_all_optional(no), "{no}");
         }
     }
@@ -347,5 +362,16 @@ mod tests {
         assert_eq!(color_of(&json!("#-00000")), None);
         assert_eq!(color_of(&json!("#GGGGGG")), None);
         assert!(color_of(&json!("#ff8000")).is_some());
+    }
+
+    #[test]
+    fn every_bindable_command_runs_without_parameters() {
+        for spec in command_specs().iter().filter(|c| c.bindable() && c.shortcut.is_none()) {
+            let mut session = crate::sample_session(64, 32).unwrap();
+            if (spec.enabled)(&session).is_ok() {
+                let result = execute(&mut session, spec.id, &Value::Null);
+                assert!(result.is_ok(), "{} fails without parameters: {:?}", spec.id, result.err());
+            }
+        }
     }
 }
