@@ -656,6 +656,10 @@ fn a_decal_moved_onto_another_facing_surface_keeps_a_valid_frame_with_the_carrie
     assert_eq!(plane_up(&r["decal"]), Vec3::Y);
     let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, 1.0, 0.0], "normal": [0.0, 1.0, 0.0]})).unwrap();
     assert!((plane_up(&r["decal"]) - Vec3::NEG_Z).length() < 1e-4, "the up that pointed up the +Z face points away over the edge: {:?}", r["decal"]["up"]);
+    // Onto the opposite face there is no smallest turn: the frame is still valid and follows the camera rule
+    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, 0.0, -1.0], "normal": [0.0, 0.0, -1.0]})).unwrap();
+    let up = plane_up(&r["decal"]);
+    assert!((up.length() - 1.0).abs() < 1e-4 && up.dot(Vec3::Z).abs() < 1e-4, "{up}");
     // An explicit up still wins
     let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [1.0, 0.0, 0.0], "normal": [1.0, 0.0, 0.0], "up": [0.0, 0.0, 1.0]})).unwrap();
     assert_eq!(plane_up(&r["decal"]), Vec3::Z);
