@@ -353,6 +353,12 @@ pub struct UiState {
     /// The Baking Visualization panel's settings, under a key of their own since the reference defaults: older saved ones start over
     #[serde(default, rename = "baking_visualization")]
     pub bake_visualization: crate::bake_mode::BakeVisualizationToggles,
+    /// Panel arrangements saved under a name (Window > Layouts), in the order they were saved
+    #[serde(default)]
+    pub named_layouts: Vec<crate::named_layouts::NamedLayout>,
+    /// The save, replace or manage dialog of the named layouts
+    #[serde(skip)]
+    pub layout_dialog: Option<crate::named_layouts::LayoutDialog>,
 }
 
 impl UiState {
@@ -386,6 +392,8 @@ impl UiState {
         self.recent = keep.recent;
         self.prefs = keep.prefs;
         self.keymap = keep.keymap;
+        self.named_layouts = keep.named_layouts;
+        self.layout_dialog = None;
         self.rename = None;
 
         // The shelf's search, type and folder are one query, and saved searches are the user's own
@@ -433,6 +441,8 @@ impl Default for UiState {
             bake_paint_brush: crate::bake_mode::BakePaintBrush::default(),
             symmetry: crate::symmetry::SymmetryDisplay::default(),
             bake_visualization: crate::bake_mode::BakeVisualizationToggles::default(),
+            named_layouts: Vec::new(),
+            layout_dialog: None,
         }
     }
 }

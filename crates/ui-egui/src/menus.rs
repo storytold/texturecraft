@@ -233,6 +233,9 @@ pub fn menu_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                     }
                     menu_item(app, &ctx, ui, item);
                 }
+                if top == "Window" {
+                    crate::named_layouts::menu(app, ui);
+                }
             });
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

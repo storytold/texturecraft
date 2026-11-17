@@ -22,6 +22,7 @@ mod layer_rename;
 mod layers_panel;
 mod levels_editor;
 mod mask_value_swap;
+mod named_layouts;
 mod new_project_baked_maps;
 mod path_in_view;
 mod path_list;

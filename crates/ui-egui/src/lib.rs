@@ -35,6 +35,7 @@ mod levels_properties;
 mod mask_preview_image;
 mod material_preview_image;
 pub mod menus;
+pub mod named_layouts;
 pub mod new_project_advanced;
 mod orb_shape;
 pub mod parity;
