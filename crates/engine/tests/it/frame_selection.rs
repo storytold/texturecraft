@@ -96,3 +96,15 @@ fn a_set_without_triangles_frames_the_whole_mesh() {
 
     assert!(near(target(&session), whole.0) && (session.camera.distance - whole.1).abs() < 1e-3);
 }
+
+#[test]
+fn a_saved_overview_camera_is_restored_after_framing_a_set() {
+    let mut session = scene();
+    execute(&mut session, "camera.add", &json!({"name": "Overview"})).unwrap();
+    let overview = session.camera.distance;
+    execute(&mut session, "viewport.frameSelection", &Value::Null).unwrap();
+
+    execute(&mut session, "camera.select", &json!({"name": "Overview"})).unwrap();
+
+    assert!((session.camera.distance - overview).abs() < 1e-3, "{} vs {overview}", session.camera.distance);
+}

@@ -135,6 +135,8 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let i = which(s, "camera.select", p)?;
     if let Some(c) = s.doc.project.cameras.get(i).cloned() {
+        // A saved view is clamped against the whole mesh, not against a part framed with F
+        s.camera.scene_radius = s.mesh.radius();
         apply(&mut s.camera, &c);
     }
     s.revision = s.revision.wrapping_add(1);
