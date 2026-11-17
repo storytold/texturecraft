@@ -128,6 +128,6 @@ fn ticking_materialx_with_another_template_says_why_no_material_was_written() {
     assert!(names(&dir, ".mtlx").is_empty());
     let toasts: Vec<&str> = h.state().toasts.iter().filter(|t| t.error && t.text.starts_with("MaterialX:")).map(|t| t.text.as_str()).collect();
     assert!(!toasts.is_empty(), "a MaterialX warning is shown");
-    assert!(toasts.windows(2).all(|w| w[0] != w[1]), "the same warning is not repeated per texture set: {toasts:?}");
+    assert!(toasts.iter().collect::<std::collections::HashSet<_>>().len() == toasts.len(), "the same warning is not repeated per texture set: {toasts:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

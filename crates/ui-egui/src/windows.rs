@@ -1076,7 +1076,8 @@ fn export_sets(app: &mut TextureCraftApp) -> bool {
         }
     }
     // A MaterialX file that could not be written (wrong template, clashing names) must not pass silently.
-    warnings.dedup();
+    let mut seen = std::collections::HashSet::new();
+    warnings.retain(|w| seen.insert(w.clone()));
     for w in warnings {
         app.toast(w, true);
     }
