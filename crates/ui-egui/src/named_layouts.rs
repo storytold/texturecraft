@@ -116,6 +116,7 @@ pub(crate) fn entries(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 
 /// The save, overwrite and manage dialogs
 pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    forget_finished_focus(app, ctx);
     let Some(shown) = app.ui.layout_dialog.clone() else { return };
 
     let mut open = true;
@@ -125,8 +126,12 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         LayoutDialog::Manage { renaming, deleting } => manage_dialog(app, ctx, &mut open, renaming, deleting),
     };
     app.ui.layout_dialog = if open { next } else { None };
+    forget_finished_focus(app, ctx);
+}
 
-    // The next Save or rename focuses its field again
+/// The next Save or rename focuses its field again. Also runs while no dialog is shown, since
+/// loading or resetting the layout closes a dialog from outside.
+fn forget_finished_focus(app: &TextureCraftApp, ctx: &egui::Context) {
     ctx.data_mut(|data| {
         if !matches!(app.ui.layout_dialog, Some(LayoutDialog::Save(_))) {
             data.remove_temp::<String>(egui::Id::unique(SAVE_FOCUS));

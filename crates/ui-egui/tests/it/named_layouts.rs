@@ -195,3 +195,20 @@ fn a_long_list_of_layouts_scrolls_and_keeps_close_on_screen() {
     let close = harness.get_by_role_and_label(Role::Button, "Close").rect();
     assert!(screen.contains_rect(close), "Close is inside the window: {close:?} in {screen:?}");
 }
+
+#[test]
+fn a_save_dialog_closed_by_a_reset_still_focuses_its_field_next_time() {
+    let mut harness = app();
+    layouts_menu(&mut harness, "Save current layout as...");
+    harness.run_steps(3);
+    assert!(dialog_input(&harness).is_focused());
+
+    // Reset UI closes the dialog from outside
+    harness.state_mut().ui.adopt_layout(texturecraft_ui_egui::state::UiState::default());
+    harness.run_steps(3);
+    assert!(harness.state().ui.layout_dialog.is_none());
+
+    layouts_menu(&mut harness, "Save current layout as...");
+    harness.run_steps(3);
+    assert!(dialog_input(&harness).is_focused(), "the field is ready for typing again");
+}
