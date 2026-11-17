@@ -361,7 +361,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
                     (tr("Ctrl + wheel"), tr("Brush size (wheel up smaller, down larger)")),
                     (tr("Ctrl + RMB drag"), tr("Brush size (left/right) and hardness (up/down)")),
                     (tr("Ctrl + LMB drag"), tr("Brush flow (left/right) and angle (up/down)")),
-                    (tr("Ctrl + Shift + drag"), tr("The same in fine steps, a tenth of the change")),
+                    (tr("Ctrl + Shift + RMB drag"), tr("Brush size and hardness in fine steps")),
                     ("Esc", tr("Cancel the stroke")),
                 ] {
                     ui.label(RichText::new(k).strong());

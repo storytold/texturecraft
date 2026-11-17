@@ -98,27 +98,34 @@ fn shift_wheel_changes_the_brush_size_in_the_2d_view_and_does_not_zoom() {
 }
 
 #[test]
-fn shift_during_a_ctrl_drag_changes_the_brush_in_fine_steps() {
+fn shift_during_a_ctrl_right_drag_changes_size_and_hardness_in_fine_steps() {
     let mut h = app(texturecraft_ui_egui::state::ViewLayout::Only3D);
     let c = h.state().viewport_rect.center();
     let before = h.state().session.tool.brush.clone();
     let history = h.state().session.history_labels().len();
-    // Right drag up: harder; left drag up: turned. Once with Ctrl, once with Ctrl+Shift.
-    drag(&mut h, PointerButton::Secondary, c, vec2(0.0, -40.0), Modifiers::COMMAND);
-    drag(&mut h, PointerButton::Primary, c, vec2(0.0, -40.0), Modifiers::COMMAND);
+    // Right drag to the right and up: bigger and harder. Once with Ctrl, once with Ctrl+Shift.
+    drag(&mut h, PointerButton::Secondary, c, vec2(10.0, -40.0), Modifiers::COMMAND);
     let coarse = h.state().session.tool.brush.clone();
     h.state_mut().session.tool.brush = before.clone();
     h.run_steps(2);
-    drag(&mut h, PointerButton::Secondary, c, vec2(0.0, -40.0), Modifiers::COMMAND | Modifiers::SHIFT);
-    drag(&mut h, PointerButton::Primary, c, vec2(0.0, -40.0), Modifiers::COMMAND | Modifiers::SHIFT);
+    drag(&mut h, PointerButton::Secondary, c, vec2(10.0, -40.0), Modifiers::COMMAND | Modifiers::SHIFT);
     let fine = h.state().session.tool.brush.clone();
     assert_eq!(h.state().session.history_labels().len(), history, "nothing painted");
     let (coarse_hardness, fine_hardness) = (coarse.hardness - before.hardness, fine.hardness - before.hardness);
     assert!(coarse_hardness > 0.05 && fine_hardness > 0.0, "{coarse_hardness} {fine_hardness}");
     assert!((fine_hardness * 10.0 - coarse_hardness).abs() < 0.01, "hardness {coarse_hardness} vs {fine_hardness}");
-    let (coarse_angle, fine_angle) = (coarse.angle - before.angle, fine.angle - before.angle);
-    assert!(coarse_angle.abs() > 5.0 && fine_angle != 0.0, "{coarse_angle} {fine_angle}");
-    assert!((fine_angle * 10.0 - coarse_angle).abs() < 0.1, "angle {coarse_angle} vs {fine_angle}");
+    let (coarse_size, fine_size) = (coarse.size / before.size - 1.0, fine.size / before.size - 1.0);
+    assert!(coarse_size > 0.01 && fine_size > 0.0 && fine_size < coarse_size / 5.0, "size {coarse_size} vs {fine_size}");
+}
+
+#[test]
+fn ctrl_shift_left_drag_does_not_change_flow_or_angle() {
+    let mut h = app(texturecraft_ui_egui::state::ViewLayout::Only3D);
+    let c = h.state().viewport_rect.center();
+    let before = h.state().session.tool.brush.clone();
+    drag(&mut h, PointerButton::Primary, c, vec2(-80.0, -40.0), Modifiers::COMMAND | Modifiers::SHIFT);
+    let after = &h.state().session.tool.brush;
+    assert_eq!((after.flow, after.angle), (before.flow, before.angle));
 }
 
 #[test]

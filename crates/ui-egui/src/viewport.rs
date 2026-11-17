@@ -1639,7 +1639,11 @@ fn scale_brush_by_wheel(app: &mut TextureCraftApp, scroll: f32) {
 
 /// Ctrl (Cmd on macOS) + drag changes the brush instead of painting: true while it applies (see `adjust_brush`)
 fn brush_drag(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response) -> bool {
-    let held = tool_acts(app) && brush_tool(app.session.tool.tool) && !app.session.stroke_active() && ui.input(|input| input.modifiers.command);
+    // Ctrl+Shift+left is not a brush change: it is left to the snapped straight line
+    let held = tool_acts(app)
+        && brush_tool(app.session.tool.tool)
+        && !app.session.stroke_active()
+        && ui.input(|input| input.modifiers.command && (!input.modifiers.shift || input.pointer.secondary_down()));
     if held && let Some(right) = brush_drag_button(response) {
         let (delta, fine) = ui.input(|input| (input.pointer.delta(), input.modifiers.shift));
         adjust_brush(&mut app.session.tool.brush, right, if fine { delta * CTRL_DRAG_FINE_FACTOR } else { delta });
@@ -1680,7 +1684,7 @@ fn brush_readout(app: &TextureCraftApp, ui: &Ui, response: &egui::Response, adju
     painter.galley(readout_rect.min + vec2(6.0, 3.0), galley, tokens.text_strong);
 }
 
-/// Part of the change a Ctrl+drag makes while Shift is also held (fine mode)
+/// Part of the change a Ctrl+right drag makes while Shift is also held (fine mode)
 const CTRL_DRAG_FINE_FACTOR: f32 = 0.1;
 
 /// Size fraction, hardness and flow change per point of a Ctrl+drag

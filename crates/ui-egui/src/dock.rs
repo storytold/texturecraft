@@ -1837,7 +1837,7 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.label(caption(tr("Brush")));
     let hint = tr("Ctrl+right-drag in a view sets the size and hardness, Ctrl+left-drag the flow and angle.");
     ui.label(RichText::new(hint).size(HINT_TEXT_SIZE).color(Tokens::get(ui.ctx()).text_dim));
-    ui.label(RichText::new(tr("Hold Shift too for fine steps.")).size(HINT_TEXT_SIZE).color(Tokens::get(ui.ctx()).text_dim));
+    ui.label(RichText::new(tr("Ctrl+Shift+right-drag: size and hardness in fine steps.")).size(HINT_TEXT_SIZE).color(Tokens::get(ui.ctx()).text_dim));
 
     // Each section's reset puts back only the fields it shows
     let size_fields = |settings: &BrushSettings| (settings.size, settings.min_size, settings.screen_space);
