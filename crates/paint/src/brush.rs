@@ -120,7 +120,9 @@ impl Shape<'_> {
 
     /// This shape for a stamp `radius` texels wide (picks the library alpha's mip level).
     pub fn at_radius(self, radius: f32) -> Self {
-        Shape { level: self.library.map_or(0, |l| l.level_for(radius)), ..self }
+        // A shrunk alpha covers fewer texels, so it wants a finer mip level
+        let covered = radius * self.params.size_x.min(self.params.size_y);
+        Shape { level: self.library.map_or(0, |l| l.level_for(covered)), ..self }
     }
 }
 
