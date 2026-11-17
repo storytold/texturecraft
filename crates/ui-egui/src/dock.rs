@@ -268,6 +268,18 @@ fn row_shade(tokens: &Tokens, index: usize) -> Color32 {
     if index.is_multiple_of(2) { tokens.row } else { tokens.row.lerp_to_gamma(tokens.row_hover, ALTERNATE_LAYER_SHADE) }
 }
 
+/// Fill of the active layer's row: the panel tinted well towards the accent so the row stands out
+/// from its neighbours at any scale, while the lettering on it keeps its contrast.
+pub fn selected_layer_fill(tokens: &Tokens) -> Color32 {
+    tokens.row_selected.lerp_to_gamma(tokens.accent_dim, SELECTED_LAYER_TINT)
+}
+
+/// Glyph colour of a layer's eye and the chip behind it: a visible layer shows a bright eye on an
+/// accent chip, a hidden one only the dim crossed-out eye, so the two states differ by more than a glyph.
+pub fn layer_eye_colors(tokens: &Tokens, visible: bool) -> (Color32, Option<Color32>) {
+    if visible { (tokens.text_strong, Some(tokens.accent_dim)) } else { (tokens.text_dim, None) }
+}
+
 /// Width of the blend mode / opacity column at the right of a layer row.
 const RIGHT_COLUMN: f32 = 58.0;
 /// Indent per folder level, and per level of the effect tree.
@@ -283,7 +295,12 @@ const ROW_CONTROL_GAP: f32 = 4.0;
 const ROW_LEFT_PADDING: f32 = 7.0;
 const ROW_RIGHT_PADDING: f32 = 6.0;
 /// Width of the selected row's accent edge.
-const SELECTED_EDGE_WIDTH: f32 = 3.0;
+const SELECTED_EDGE_WIDTH: f32 = 4.0;
+/// How far the active layer's fill moves from the plain selected shade to the accent tint.
+const SELECTED_LAYER_TINT: f32 = 0.6;
+/// The chip behind a visible layer's eye: its inset from the eye's hit area and its rounding.
+const EYE_CHIP_INSET: f32 = 1.0;
+const EYE_CHIP_ROUNDING: f32 = 4.0;
 /// An effect thumbnail's corner rounding and border, the strike across a hidden effect's, and the line marking where a drag drops.
 const THUMBNAIL_ROUNDING: f32 = 2.0;
 const THUMBNAIL_BORDER_WIDTH: f32 = 1.0;
@@ -311,7 +328,7 @@ const ROW_FIELD_PADDING: f32 = 4.0;
 const OPACITY_DRAG_SPEED: f64 = 0.5;
 /// A layer row's eye: its hit area, its glyph size and the column it sits in.
 const LAYER_EYE_SIZE: f32 = 18.0;
-const LAYER_EYE_FONT_SIZE: f32 = 13.0;
+const LAYER_EYE_FONT_SIZE: f32 = 14.0;
 const LAYER_EYE_COLUMN_WIDTH: f32 = 20.0;
 /// A folder's caret: its size (the space it takes before the thumbnail) and its center from where it starts.
 const FOLDER_CARET_SIZE: f32 = 14.0;
@@ -458,7 +475,7 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
     // Background, folder lines, the selected row's accent edge and the colour tag
     let painter = ui.painter().clone();
     let background = if selected {
-        tokens.row_selected
+        selected_layer_fill(&tokens)
     } else if row.hovered() {
         tokens.row_hover
     } else {
@@ -489,12 +506,16 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
     let content_left = rect.left() + ROW_LEFT_PADDING + indent;
     let eye = Rect::from_center_size(pos2(content_left + EYE_SIZE * 0.5, rect.center().y), vec2(LAYER_EYE_SIZE, LAYER_EYE_SIZE));
     let eye_response = ui.interact(eye, ui.scope_id().with(("eye", layer.id.0)), Sense::click()).on_hover_text(tr("Show or hide the layer"));
+    let (eye_color, eye_chip) = layer_eye_colors(&tokens, layer.visible);
+    if let Some(chip) = eye_chip {
+        painter.rect_filled(eye.shrink(EYE_CHIP_INSET), EYE_CHIP_ROUNDING, chip);
+    }
     painter.text(
         eye.center(),
         egui::Align2::CENTER_CENTER,
         if layer.visible { ic::EYE } else { ic::EYE_SLASH },
         egui::FontId::proportional(LAYER_EYE_FONT_SIZE),
-        if layer.visible { tokens.text } else { tokens.text_dim },
+        eye_color,
     );
     if eye_response.clicked() {
         app.run("layer.visible", json!({"layer": layer.id.0}));
