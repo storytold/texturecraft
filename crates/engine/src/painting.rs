@@ -225,6 +225,7 @@ impl Session {
                 None => Pickup::new(mode, cache.composite.clone(), cache.gbuf.clone(), values.keys().copied()),
             });
             if tool == Tool::Clone
+                && self.tool.clone_aligned
                 && let Some(src) = self.tool.clone_source.as_mut()
             {
                 src.offset.get_or_insert(offset);
@@ -266,7 +267,9 @@ impl Session {
             Tool::Clone => {
                 let src =
                     self.tool.clone_source.ok_or_else(|| EngineError::Other("set a clone source first: V + click on the mesh (tool.cloneSource)".into()))?;
-                let offset = match (src.offset, first_uv) {
+                // Not aligned: every stroke measures the offset from its own first point.
+                let kept = if self.tool.clone_aligned { src.offset } else { None };
+                let offset = match (kept, first_uv) {
                     (Some(o), _) => o,
                     (None, Some(p)) => [src.uv[0] - p.x, src.uv[1] - p.y],
                     (None, None) => return Err(EngineError::Other("start the clone stroke on the mesh".into())),
@@ -576,17 +579,22 @@ impl Session {
         self.stroke.as_ref().map(|s| s.canvas.dirty.len()).unwrap_or(0)
     }
 
-    /// Where the Clone tool reads for destination `at` (texture coordinates) as a surface
-    /// point: the source itself until the first stroke fixes the offset, or when `at` is None.
-    pub fn clone_source_point(&self, at: Option<Vec2>) -> Option<texturecraft_geom::glam::Vec3> {
+    /// Where the Clone tool reads for destination `at` (texture coordinates), in texture
+    /// coordinates: the source itself until the first stroke fixes the offset, or when `at` is
+    /// None. None without a source or when that spot is outside the texture.
+    pub fn clone_source_uv(&self, at: Option<Vec2>) -> Option<Vec2> {
         let src = self.tool.clone_source?;
         let uv = match (src.offset, at) {
             (Some(o), Some(p)) => Vec2::new(p.x + o[0], p.y + o[1]),
             _ => Vec2::from(src.uv),
         };
-        if !((0.0..1.0).contains(&uv.x) && (0.0..1.0).contains(&uv.y)) {
-            return None;
-        }
+        ((0.0..1.0).contains(&uv.x) && (0.0..1.0).contains(&uv.y)).then_some(uv)
+    }
+
+    /// Where the Clone tool reads for destination `at` (texture coordinates) as a surface
+    /// point: the source itself until the first stroke fixes the offset, or when `at` is None.
+    pub fn clone_source_point(&self, at: Option<Vec2>) -> Option<texturecraft_geom::glam::Vec3> {
+        let uv = self.clone_source_uv(at)?;
         let g = &self.caches.get(self.ts())?.gbuf;
         let (x, y) = ((uv.x * g.width as f32) as usize, (uv.y * g.height as f32) as usize);
         Some(g.surface(&self.mesh, y * g.width as usize + x)?.pos)

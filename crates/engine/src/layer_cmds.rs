@@ -172,6 +172,8 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
     // Paths paint into the active set
     if ts != s.ts() {
         s.finish_path()?;
+        // The clone source is a point of the set it was picked in
+        s.tool.clone_source = None;
     }
 
     s.active_set = ts;

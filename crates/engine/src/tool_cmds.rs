@@ -36,7 +36,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Brush settings",
             [],
             None,
-            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
+            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), cloneAligned? (default true: the first stroke fixes the offset to the source for the following strokes; false: every stroke starts sampling at the source point), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
             always,
             brush
         ),
@@ -258,6 +258,15 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
 
     session.tool.brush = settings.sanitized();
     session.tool.clone_from = clone_from;
+    if let Some(aligned) = boolp(params, "cloneAligned")
+        && aligned != session.tool.clone_aligned
+    {
+        session.tool.clone_aligned = aligned;
+        // A new mode starts without the offset of an earlier stroke
+        if let Some(source) = session.tool.clone_source.as_mut() {
+            source.offset = None;
+        }
+    }
     if let Some(value) = f32p(params, "smudgeStrength") {
         session.tool.smudge_strength = (value / 100.0).clamp(0.0, 1.0);
     }
@@ -282,6 +291,7 @@ pub(crate) fn brush_json(session: &Session) -> Value {
         "symmetryOffset": settings.symmetry.offset, "symmetryOn": settings.symmetry.enabled, "symmetryAngleSpan": settings.symmetry.angle_span,
         "smudgeStrength": session.tool.smudge_strength * 100.0, "particles": settings.particles,
         "cloneSource": if session.tool.clone_from == CloneFrom::Layer { "layer" } else { "composite" },
+        "cloneAligned": session.tool.clone_aligned,
     })
 }
 

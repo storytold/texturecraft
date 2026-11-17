@@ -33,6 +33,13 @@ as the history reaches); `edit.history` lists the steps done and the undone ones
 Any command takes `merge: true` to fold its edit into the previous undo step when that step has
 the same label: a drag that applies a value on every frame stays one step.
 
+`tool.cloneSource {uv: [u, v]}` (or `{x, y}` for a point on the mesh, or `{clear: true}`) sets the
+Clone tool's source. The source belongs to the active texture set: selecting another texture set
+(`textureSet.select`, or `layer.select` of a layer in another set) clears it. `tool.brush
+{cloneAligned}` (default `true`) chooses how later strokes use it: aligned keeps the offset the
+first stroke fixed, so the source moves along with the brush; `false` makes every stroke start
+sampling at the source point. Changing `cloneAligned` forgets the offset of earlier strokes.
+
 Bake mode applies edits in Common Settings and Mesh Map Settings to every texture set. Each
 set keeps its own enabled mesh-map checkboxes and Include in Bake flag. Edits update only the
 changed fields; Restore Defaults resets the whole parameter section across all sets.

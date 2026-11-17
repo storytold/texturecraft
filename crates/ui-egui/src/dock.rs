@@ -1690,6 +1690,14 @@ fn clone_section(app: &mut TextureCraftApp, ui: &mut Ui) {
             }
         }
     });
+    let mut aligned = app.session.tool.clone_aligned;
+    if ui
+        .checkbox(&mut aligned, tr("Aligned"))
+        .on_hover_text(tr("On: the offset from the first stroke is kept. Off: every stroke starts at the source point."))
+        .changed()
+    {
+        app.run("tool.brush", json!({"cloneAligned": aligned}));
+    }
     let Some(src) = app.session.tool.clone_source else {
         ui.label(RichText::new(tr("Hold V and click the mesh to set the source, then paint elsewhere to copy it.")).color(tk.text_dim));
         return;
@@ -1700,7 +1708,9 @@ fn clone_section(app: &mut TextureCraftApp, ui: &mut Ui) {
             app.run("tool.cloneSource", json!({"clear": true}));
         }
     });
-    let hint = if src.offset.is_some() {
+    let hint = if !app.session.tool.clone_aligned {
+        tr("Not aligned: every stroke starts at the source. V + click sets a new source.")
+    } else if src.offset.is_some() {
         tr("Aligned: the offset set by the first stroke is kept. V + click sets a new source.")
     } else {
         tr("The first stroke sets the offset from the source.")

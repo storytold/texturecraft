@@ -62,6 +62,71 @@ fn clone_copies_values_from_the_source_offset() {
     assert!(!red(color_at(&s, 240.0, 200.0)));
 }
 
+/// A red dab at (160, 200) as the clone source, the Clone tool selected with a small brush.
+fn clone_ready() -> Session {
+    let mut s = session();
+    paint_red(&mut s, 20.0);
+    dab(&mut s, 160.0, 200.0);
+    execute(&mut s, "tool.clone", &Value::Null).unwrap();
+    execute(&mut s, "tool.cloneSource", &json!({"x": 160, "y": 200})).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 6})).unwrap();
+    s
+}
+
+#[test]
+fn aligned_clone_keeps_the_first_offset_for_later_strokes() {
+    let mut s = clone_ready();
+    assert_eq!(execute(&mut s, "tool.brush", &Value::Null).unwrap()["cloneAligned"], true, "aligned by default");
+    dab(&mut s, 240.0, 200.0);
+    assert!(red(color_at(&s, 240.0, 200.0)));
+    // The second stroke reads at the same offset, 40 points left of the first source: nothing red there.
+    dab(&mut s, 200.0, 200.0);
+    assert!(!red(color_at(&s, 200.0, 200.0)), "aligned: the source moved along");
+    assert!(s.tool.clone_source.unwrap().offset.is_some());
+}
+
+#[test]
+fn not_aligned_clone_starts_every_stroke_at_the_source() {
+    let mut s = clone_ready();
+    let r = execute(&mut s, "tool.brush", &json!({"cloneAligned": false})).unwrap();
+    assert_eq!(r["cloneAligned"], false);
+    dab(&mut s, 240.0, 200.0);
+    assert!(red(color_at(&s, 240.0, 200.0)), "first stroke copies the source");
+    assert!(s.tool.clone_source.unwrap().offset.is_none(), "no offset is kept");
+    dab(&mut s, 200.0, 200.0);
+    assert!(red(color_at(&s, 200.0, 200.0)), "the second stroke starts at the source again");
+}
+
+#[test]
+fn switching_the_clone_mode_forgets_the_offset_of_earlier_strokes() {
+    let mut s = clone_ready();
+    dab(&mut s, 240.0, 200.0);
+    assert!(s.tool.clone_source.unwrap().offset.is_some());
+    execute(&mut s, "tool.brush", &json!({"cloneAligned": false})).unwrap();
+    execute(&mut s, "tool.brush", &json!({"cloneAligned": true})).unwrap();
+    assert!(s.tool.clone_source.unwrap().offset.is_none(), "the next aligned stroke fixes a fresh offset");
+}
+
+#[test]
+fn the_clone_source_is_forgotten_when_another_texture_set_becomes_active() {
+    let mut s = texturecraft_engine::sample_session(256, 64).unwrap();
+    execute(&mut s, "tool.clone", &Value::Null).unwrap();
+    execute(&mut s, "tool.cloneSource", &json!({"uv": [0.3, 0.6]})).unwrap();
+    // Selecting the active set again keeps it
+    execute(&mut s, "textureSet.select", &json!({"ts": s.ts()})).unwrap();
+    assert!(s.tool.clone_source.is_some());
+    execute(&mut s, "textureSet.select", &json!({"ts": 1})).unwrap();
+    assert!(s.tool.clone_source.is_none(), "a point of set 0 means nothing in set 1");
+    assert!(execute(&mut s, "tool.stroke", &json!({"points": [[200, 200]]})).is_err(), "asks for a source again");
+
+    // The same through selecting a layer that lives in another set
+    let other = s.doc.project.texture_sets[0].stack.last().copied().expect("set 0 has a layer");
+    execute(&mut s, "tool.cloneSource", &json!({"uv": [0.3, 0.6]})).unwrap();
+    execute(&mut s, "layer.select", &json!({"layer": other.0})).unwrap();
+    assert_eq!(s.ts(), 0);
+    assert!(s.tool.clone_source.is_none());
+}
+
 #[test]
 fn smudge_drags_color_along_the_stroke() {
     let mut s = session();

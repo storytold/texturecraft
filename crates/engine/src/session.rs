@@ -216,9 +216,14 @@ pub struct ToolState {
     /// Smudge tool: how much of the picked-up values each stamp deposits (0..1).
     #[serde(default = "default_smudge_strength")]
     pub smudge_strength: f32,
-    /// Clone tool source (V + click).
+    /// Clone tool source (V + click). It belongs to the active texture set: switching the set
+    /// (`textureSet.select`, `layer.select` into another set) clears it.
     #[serde(default)]
     pub clone_source: Option<CloneSource>,
+    /// Clone tool: keep the offset of the first stroke for the following strokes (aligned, the
+    /// default). Off, every stroke starts sampling at the source point.
+    #[serde(default = "default_clone_aligned")]
+    pub clone_aligned: bool,
     /// What the Clone tool copies: the composite or the selected layer alone.
     #[serde(default)]
     pub clone_from: CloneFrom,
@@ -229,6 +234,10 @@ pub struct ToolState {
 
 fn default_smudge_strength() -> f32 {
     0.5
+}
+
+fn default_clone_aligned() -> bool {
+    true
 }
 
 fn default_fill_visible_only() -> bool {
@@ -250,7 +259,7 @@ pub enum CloneFrom {
 pub struct CloneSource {
     pub uv: [f32; 2],
     /// Source minus destination, fixed by the first stroke after the source was set and kept
-    /// for the following strokes (aligned cloning).
+    /// for the following strokes (aligned cloning; never set when the tool is not aligned).
     pub offset: Option<[f32; 2]>,
 }
 
@@ -269,6 +278,7 @@ impl Default for ToolState {
             stencil: None,
             smudge_strength: default_smudge_strength(),
             clone_source: None,
+            clone_aligned: true,
             clone_from: CloneFrom::Composite,
             path: Default::default(),
         };

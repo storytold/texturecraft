@@ -1570,9 +1570,14 @@ fn clone_source_key(app: &TextureCraftApp, ui: &Ui) -> bool {
 
 /// Crosshair where the Clone tool reads from.
 fn clone_marker(app: &TextureCraftApp, ui: &Ui, rect: Rect, pos: Vec3) {
-    let tokens = Tokens::get(ui.ctx());
-    let Some(center) = project(app, rect, pos) else { return };
+    if let Some(center) = project(app, rect, pos) {
+        clone_marker_at(ui, rect, center);
+    }
+}
 
+/// The clone source crosshair centred on the screen point `center`
+fn clone_marker_at(ui: &Ui, rect: Rect, center: Pos2) {
+    let tokens = Tokens::get(ui.ctx());
     let painter = ui.painter_at(rect);
     for (stroke_width, color) in [(3.0, Color32::from_black_alpha(140)), (1.2, tokens.viewport_accent)] {
         painter.circle_stroke(center, 7.0, Stroke::new(stroke_width, color));
@@ -1925,6 +1930,14 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
     if tool_acts(app) && path_tool {
         path_overlay(app, ui, rect, &response, true, show);
+    }
+
+    // Clone source: where the tool reads, as in the 3D view
+    if tool_acts(app)
+        && app.session.tool.tool == Tool::Clone
+        && let Some(source) = app.session.clone_source_uv(response.hover_pos().map(to_uv))
+    {
+        clone_marker_at(ui, rect, to_screen(source.x, source.y));
     }
 
     // Shift: preview the straight line Shift+click paints from the last stroke
