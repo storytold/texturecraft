@@ -27,6 +27,7 @@ pub mod gpu;
 mod grid_tile;
 pub mod i18n;
 pub mod id_color_pick;
+mod inactive_set_hint;
 pub mod keymap;
 pub mod layer_panel;
 mod levels_editor;
