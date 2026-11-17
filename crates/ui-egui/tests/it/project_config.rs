@@ -209,6 +209,9 @@ fn a_delayed_selection_does_not_change_a_window_reopened_after_layout_reset() {
 
     let context = harness.ctx.clone();
     texturecraft_ui_egui::menus::invoke(harness.state_mut(), &context, "ui.resetUi");
+    harness.run_steps(2);
+    harness.get_by_label("Reset").click();
+    harness.run_steps(2);
     open_window(&mut harness);
 
     assert!(harness.state().ui.windows.project_config.as_ref().is_some_and(|config| config.mesh.is_none()));
