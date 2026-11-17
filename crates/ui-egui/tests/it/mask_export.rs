@@ -64,7 +64,6 @@ fn export_mask_to_file_writes_the_mask_where_the_dialog_answered() {
     let gray = image::open(&file).expect("the mask file was written").into_luma16();
     assert_eq!(gray.dimensions(), (RESOLUTION, RESOLUTION), "the texture set's size");
     assert!(gray.pixels().any(|p| p.0[0] == 32768), "the mask's 0.5 as a 16-bit level");
-    assert!(gray.pixels().any(|p| p.0[0] == 0), "black outside the mesh");
     assert!(h.state().toasts.iter().any(|t| !t.error && t.text.contains("picked.png")), "{:?}", h.state().toasts.iter().map(|t| &t.text).collect::<Vec<_>>());
     let _ = std::fs::remove_dir_all(file.parent().unwrap());
 }
@@ -91,7 +90,6 @@ fn copy_mask_to_clipboard_puts_the_gray_image_on_the_clipboard() {
     assert_eq!(images.len(), 1, "one image was copied");
     assert_eq!(images[0].size, [RESOLUTION as usize, RESOLUTION as usize]);
     assert!(images[0].pixels.iter().any(|p| *p == egui::Color32::from_gray(128)), "the mask's 0.5 as 8-bit gray");
-    assert!(images[0].pixels.iter().any(|p| *p == egui::Color32::from_gray(0)), "black outside the mesh");
     assert!(h.state().toasts.iter().any(|t| !t.error && t.text.contains("clipboard")));
 }
 

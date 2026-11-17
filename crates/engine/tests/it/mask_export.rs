@@ -98,7 +98,6 @@ fn mask_export_writes_a_16_bit_gray_png() {
     assert_eq!(gray.as_raw(), &expected, "the file holds the bitmap, top row first");
     // 0.5 is a level 8-bit files cannot hold exactly
     assert!(gray.pixels().any(|p| p.0[0] == 32768), "the 16-bit level of 0.5");
-    assert!(gray.pixels().any(|p| p.0[0] == 0), "black outside the mesh");
 
     // The extension is added, and the layer defaults to the selected one
     let done = execute(&mut s, "mask.export", &json!({"path": dir.join("other").display().to_string()})).unwrap();

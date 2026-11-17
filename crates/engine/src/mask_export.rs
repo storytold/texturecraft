@@ -11,9 +11,9 @@ use serde_json::Value;
 use serde_json::json;
 use texturecraft_core::LayerId;
 
+use crate::commands::{CommandSpec, bad, has_layer};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::commands::{layer_param, strp};
-use crate::commands::{CommandSpec, bad, has_layer};
 use crate::{EngineError, Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -51,13 +51,7 @@ impl MaskBitmap {
 
     /// A 16-bit grayscale PNG.
     pub fn to_png16(&self) -> Result<Vec<u8>> {
-        use image::ImageEncoder;
-        let bytes: Vec<u8> = self.gray16().iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let mut out = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut out)
-            .write_image(&bytes, self.width, self.height, image::ExtendedColorType::L16)
-            .map_err(|e| EngineError::Other(format!("PNG encoding failed: {e}")))?;
-        Ok(out)
+        texturecraft_formats::gray16_png(self.width, self.height, self.values.iter().copied()).map_err(|e| EngineError::Other(e.to_string()))
     }
 }
 
