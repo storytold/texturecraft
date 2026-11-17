@@ -228,6 +228,9 @@ fn manage_dialog(
             ui.horizontal(|ui| match renaming.clone().filter(|(from, _)| *from == name) {
                 Some((from, mut to)) => {
                     let edit = ui.add(egui::TextEdit::singleline(&mut to).desired_width(180.0));
+                    if !edit.has_focus() && !edit.lost_focus() {
+                        edit.request_focus();
+                    }
                     let taken = app.ui.named_layouts.iter().any(|layout| layout.name == to.trim() && layout.name != from);
                     let valid = !to.trim().is_empty() && !taken;
                     let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -305,7 +308,6 @@ mod tests {
     fn both_mode_docks_are_saved_and_the_current_mode_stays() {
         let mut ui = UiState::default();
         ui.dock.close(Panel::Assets);
-        ui.inactive_mode_dock.close(Panel::Log);
         ui.save_named_layout("Both");
 
         // Saved while painting, applied while baking: each dock lands in its own slot
@@ -316,8 +318,8 @@ mod tests {
 
         assert_eq!(baking.mode, Mode::Baking);
         assert!(baking.dock_is_baking);
-        assert!(!baking.dock.is_open(Panel::Log), "the baking dock is the saved baking dock");
-        assert!(!baking.inactive_mode_dock.is_open(Panel::Assets), "the painting dock is the saved painting dock");
+        assert!(baking.dock.is_open(Panel::MeshMapBakers) && !baking.dock.is_open(Panel::Layers), "the baking dock is the saved baking dock");
+        assert!(baking.inactive_mode_dock.is_open(Panel::Layers) && !baking.inactive_mode_dock.is_open(Panel::Assets), "the painting dock is the saved painting dock");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use egui::Role;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::docking::Panel;
 use texturecraft_ui_egui::state::Mode;
@@ -24,9 +24,15 @@ fn layouts_menu(harness: &mut Harness<'_, TextureCraftApp>, entry: &str) {
     harness.run_steps(3);
 }
 
+/// The dialog's text field: the one nearest the window center, where dialogs open (the shelf search is another)
+fn dialog_input<'a>(harness: &'a Harness<'_, TextureCraftApp>) -> egui_kittest::Node<'a> {
+    let center = harness.ctx.content_rect().center();
+    harness.get_all_by_role(Role::TextInput).min_by(|a, b| a.rect().center().distance(center).total_cmp(&b.rect().center().distance(center))).expect("the dialog's field")
+}
+
 fn save_as(harness: &mut Harness<'_, TextureCraftApp>, name: &str) {
     layouts_menu(harness, "Save current layout as...");
-    harness.get_by_role(Role::TextInput).type_text(name);
+    dialog_input(&*harness).type_text(name);
     harness.run_steps(2);
     harness.get_by_role_and_label(Role::Button, "Save").click();
     harness.run_steps(3);
@@ -78,7 +84,7 @@ fn a_layout_is_renamed_and_deleted_from_the_manage_dialog() {
     harness.get_by_role_and_label(Role::Button, "Rename").click();
     harness.run_steps(2);
     // The field starts with the old name; typing continues it
-    harness.get_by_role(Role::TextInput).type_text("2");
+    dialog_input(&harness).type_text("2");
     harness.run_steps(2);
     harness.get_by_role_and_label(Role::Button, "Rename").click();
     harness.run_steps(3);
