@@ -429,13 +429,6 @@ fn projection_tool_paints_the_stencil_colors() {
     // Without a stencil the tool explains what's missing.
     assert!(execute(&mut s, "tool.stroke", &json!({"points": [[150, 200]]})).is_err());
     execute(&mut s, "tool.stencil", &json!({"image": name, "scale": 1.0, "tile": true})).unwrap();
-    // A reset puts back the placement only
-    let mut moved = s.tool.stencil.clone().unwrap();
-    moved.center = [0.4, -0.2];
-    moved.rotation = 30.0;
-    moved.opacity = 0.9;
-    moved.reset_placement();
-    assert_eq!((moved.center, moved.scale, moved.rotation, moved.opacity, moved.tile), ([0.0, 0.0], 0.8, 0.0, 0.9, true));
     execute(&mut s, "tool.brush", &json!({"size": 6, "hardness": 90})).unwrap();
     for x in [150.0f32, 250.0] {
         execute(&mut s, "tool.stroke", &json!({"points": [[x, 200.0]]})).unwrap();
@@ -797,4 +790,16 @@ fn unparseable_color_param_returns_error() {
     execute(&mut s, "tool.polygonFill", &Value::Null).unwrap();
     let err = execute(&mut s, "tool.click", &json!({"uv": [0.2, 0.8, 0.4]})).unwrap_err();
     assert_eq!(err.to_string(), "`tool.click`: a 2D view point needs `uv` as [u, v]");
+}
+
+#[test]
+fn resetting_a_stencil_puts_back_its_placement_only() {
+    let mut stencil = texturecraft_engine::StencilState::new("logo.png");
+    stencil.center = [0.4, -0.2];
+    stencil.scale = 2.0;
+    stencil.rotation = 30.0;
+    stencil.opacity = 0.9;
+    stencil.tile = true;
+    stencil.reset_placement();
+    assert_eq!((stencil.center, stencil.scale, stencil.rotation, stencil.opacity, stencil.tile), ([0.0, 0.0], 0.8, 0.0, 0.9, true));
 }

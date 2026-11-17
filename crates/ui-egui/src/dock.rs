@@ -1679,7 +1679,7 @@ fn stencil_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         slider(ui, tr("Overlay opacity"), &mut st.opacity, 0.0..=1.0, 2);
         ui.checkbox(&mut st.tile, tr("Tile"));
         ui.label(RichText::new(tr("Hold S: left-drag rotates, right-drag scales, middle-drag moves the stencil.")).size(10.5).color(tk.text_dim));
-        ui.label(RichText::new(tr("Hold S and Shift: left-drag moves the stencil.")).size(10.5).color(tk.text_dim));
+        ui.label(RichText::new(tr("Without a middle button: hold S and Shift and left-drag to move it.")).size(10.5).color(tk.text_dim));
     }
 }
 

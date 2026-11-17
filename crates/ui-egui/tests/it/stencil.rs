@@ -24,6 +24,32 @@ fn projection_app() -> (Harness<'static, TextureCraftApp>, String) {
     (harness, name)
 }
 
+/// The number field beside a uniquely labelled slider
+fn number_field<'a>(harness: &'a Harness<'_, TextureCraftApp>, label: &str) -> egui_kittest::Node<'a> {
+    let row = harness.get_by_label(label).rect().center().y;
+    harness.get_all(by().role(Role::TextInput)).find(|node| (node.rect().center().y - row).abs() < 4.0).unwrap()
+}
+
+/// Type a complete value in the number field beside a uniquely labelled slider
+fn set_number(harness: &mut Harness<'_, TextureCraftApp>, label: &str, value: &str) {
+    let length = number_field(harness, label).value().unwrap().len();
+    number_field(harness, label).focus();
+    harness.run_steps(2);
+    harness.key_press(Key::End);
+    harness.run_steps(1);
+    for _ in 0..length {
+        harness.key_press(Key::Backspace);
+        harness.run_steps(1);
+    }
+    number_field(harness, label).type_text(value);
+    harness.run_steps(1);
+    harness.key_press(Key::Enter);
+    harness.run_steps(2);
+}
+
+/// A point on the UV square in the 2D-only layout
+const FIRST_DRAG: Pos2 = egui::pos2(700.0, 420.0);
+
 fn history(harness: &Harness<'_, TextureCraftApp>) -> usize {
     harness.state().session.history_labels().len()
 }
@@ -80,21 +106,7 @@ fn the_position_fields_move_the_stencil_and_reset_puts_it_back() {
     harness.run_steps(3);
 
     // Typing in a position field moves the stencil
-    let field = |harness: &Harness<'_, TextureCraftApp>, label: &str| {
-        let row = harness.get_by_label(label).rect().center().y;
-        harness.get_all(by().role(Role::TextInput)).find(|node| (node.rect().center().y - row).abs() < 4.0).unwrap().rect().center()
-    };
-    let at = field(&harness, "Position X");
-    harness.event(Event::PointerMoved(at));
-    harness.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
-    harness.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
-    harness.run_steps(2);
-    harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
-    harness.run_steps(1);
-    harness.event(Event::Text("-0.75".into()));
-    harness.run_steps(1);
-    harness.key_press(Key::Enter);
-    harness.run_steps(3);
+    set_number(&mut harness, "Position X", "-0.75");
     let moved = harness.state().session.tool.stencil.clone().unwrap();
     assert_eq!(moved.center, [-0.75, -0.25], "only X changed");
     harness.get_by_label("Position Y");
@@ -135,7 +147,7 @@ fn the_2d_view_says_projection_paints_in_3d_and_paints_nothing() {
     let (mut harness, name) = projection_app();
     harness.state_mut().ui.layout = ViewLayout::Only2D;
     harness.run_steps(4);
-    let from = harness.state().viewport_rect.center();
+    let from = FIRST_DRAG;
     let steps = history(&harness);
 
     // Without a stencil
