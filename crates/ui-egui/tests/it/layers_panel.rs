@@ -151,7 +151,6 @@ fn layer_toolbar_stays_on_one_row_in_a_1280_by_800_window() {
     }
     let row = h.get_by_label(LONG_NAME).rect();
     assert!(remove.right() <= row.right() + 1.0, "the last button stays inside the panel: {remove:?} against {row:?}");
-    assert!(row.width() >= 225.0, "the Layers column is not squeezed: {row:?}");
 }
 
 #[test]

@@ -146,10 +146,10 @@ pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.horizontal_wrapped(|ui| {
         // Keep menu buttons as compact as the adjacent icon buttons
         ui.spacing_mut().button_padding.x = 4.0;
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.x = TOOLBAR_SPACING;
         let chans = app.session.doc.project.texture_set(app.session.ts()).map(|t| t.channel_list()).unwrap_or_default();
         // The channel box takes what the six buttons leave, so the toolbar stays on one row in a narrow column
-        let buttons = 6.0 * (ICON_BUTTON_SIZE + 4.0) + 12.0;
+        let buttons = 2.0 * (MENU_BUTTON_WIDTH + TOOLBAR_SPACING) + 4.0 * (TOOLBAR_ICON_SIZE + TOOLBAR_SPACING);
         let channel_width = (ui.available_width() - buttons).clamp(CHANNEL_BOX_MIN_WIDTH, CHANNEL_BOX_WIDTH);
         ui.allocate_ui(vec2(channel_width, ICON_BUTTON_SIZE), |ui| {
             egui::ComboBox::from_id_salt("layer_channel").width(channel_width).truncate().selected_text(tr(app.ui.layer_channel.label())).show_ui(ui, |ui| {
@@ -168,16 +168,16 @@ pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
         .response
         .on_hover_text(tr("Add effect"));
         ui.menu_button(RichText::new(ic::SELECTION_BACKGROUND).size(14.0), |ui| add_mask_menu(app, ui, None)).response.on_hover_text(tr("Add mask"));
-        if icon_button(ui, ic::PAINT_BRUSH, tr("Add paint layer"), false, 22.0).clicked() {
+        if icon_button(ui, ic::PAINT_BRUSH, tr("Add paint layer"), false, TOOLBAR_ICON_SIZE).clicked() {
             app.run("layer.add.paint", Value::Null);
         }
-        if icon_button(ui, ic::PAINT_BUCKET, tr("Add fill layer"), false, 22.0).clicked() {
+        if icon_button(ui, ic::PAINT_BUCKET, tr("Add fill layer"), false, TOOLBAR_ICON_SIZE).clicked() {
             app.run("layer.add.fill", Value::Null);
         }
-        if icon_button(ui, ic::FOLDER_SIMPLE, tr("Add folder"), false, 22.0).clicked() {
+        if icon_button(ui, ic::FOLDER_SIMPLE, tr("Add folder"), false, TOOLBAR_ICON_SIZE).clicked() {
             app.run("layer.add.group", Value::Null);
         }
-        if icon_button(ui, ic::TRASH, &crate::keymap::tip(&app.ui.keymap, tr("Remove layer"), "layer.remove"), false, 22.0).clicked() {
+        if icon_button(ui, ic::TRASH, &crate::keymap::tip(&app.ui.keymap, tr("Remove layer"), "layer.remove"), false, TOOLBAR_ICON_SIZE).clicked() {
             app.run("layer.remove", Value::Null);
         }
     });
@@ -280,6 +280,11 @@ const INDENT: f32 = 14.0;
 /// Width of the Layers toolbar's channel box when there is room, and the least it shrinks to.
 const CHANNEL_BOX_WIDTH: f32 = 86.0;
 const CHANNEL_BOX_MIN_WIDTH: f32 = 40.0;
+/// Gap between the Layers toolbar's buttons.
+const TOOLBAR_SPACING: f32 = 2.0;
+/// Edge of the toolbar's icon buttons, and the width of its two menu buttons.
+const TOOLBAR_ICON_SIZE: f32 = 20.0;
+const MENU_BUTTON_WIDTH: f32 = 22.0;
 /// Edge of the small icon buttons in the properties panel.
 const ICON_BUTTON_SIZE: f32 = 22.0;
 /// Height of a blend mode menu or opacity field in a stack row, and the rounding of its hover fill.
