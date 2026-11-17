@@ -154,7 +154,7 @@ impl Writer {
             UsdValue::Ints(v) if v.len() >= codec::MIN_COMPRESSED_ARRAY => {
                 let at = self.offset();
                 self.out.extend_from_slice(&(v.len() as u64).to_le_bytes());
-                self.ints(&v.iter().map(|&i| i64::from(i)).collect::<Vec<_>>());
+                self.ints(&v.iter().map(|&i| i64::from(i)).collect::<Vec<_>>())?;
                 rep(ty::INT, codec::IS_ARRAY | codec::IS_COMPRESSED, at)
             }
             UsdValue::Ints(v) => self.raw_array(ty::INT, v.len(), v.iter().flat_map(|i| i.to_le_bytes())),
@@ -174,10 +174,11 @@ impl Writer {
     }
 
     /// Compressed integers: their compressed size, then the LZ4-framed coding.
-    fn ints(&mut self, v: &[i64]) {
-        let comp = codec::compress(&codec::encode_ints(v, 4));
+    fn ints(&mut self, v: &[i64]) -> Result<()> {
+        let comp = codec::compress(&codec::encode_ints(v, 4)?)?;
         self.out.extend_from_slice(&(comp.len() as u64).to_le_bytes());
         self.out.extend_from_slice(&comp);
+        Ok(())
     }
 
     fn spec(&mut self, path: usize, kind: i64, fields: Vec<(&str, u64)>) {
@@ -303,7 +304,7 @@ impl Writer {
         self.out.extend_from_slice(&(v as u64).to_le_bytes());
     }
 
-    fn sections(&mut self) {
+    fn sections(&mut self) -> Result<()> {
         let mut toc = Vec::new();
         let start = self.offset();
         let mut raw = Vec::new();
@@ -311,7 +312,7 @@ impl Writer {
             raw.extend_from_slice(t.as_bytes());
             raw.push(0);
         }
-        let comp = codec::compress(&raw);
+        let comp = codec::compress(&raw)?;
         self.u64(self.tokens.len());
         self.u64(raw.len());
         self.u64(comp.len());
@@ -327,9 +328,9 @@ impl Writer {
         let start = self.offset();
         let fields = std::mem::take(&mut self.fields);
         self.u64(fields.len());
-        self.ints(&fields.iter().map(|f| i64::from(f.0)).collect::<Vec<_>>());
+        self.ints(&fields.iter().map(|f| i64::from(f.0)).collect::<Vec<_>>())?;
         let reps: Vec<u8> = fields.iter().flat_map(|f| f.1.to_le_bytes()).collect();
-        let comp = codec::compress(&reps);
+        let comp = codec::compress(&reps)?;
         self.u64(comp.len());
         self.out.extend_from_slice(&comp);
         self.section(&mut toc, "FIELDS", start);
@@ -337,7 +338,7 @@ impl Writer {
         let start = self.offset();
         let sets = std::mem::take(&mut self.fieldsets);
         self.u64(sets.len());
-        self.ints(&sets);
+        self.ints(&sets)?;
         self.section(&mut toc, "FIELDSETS", start);
 
         let start = self.offset();
@@ -345,7 +346,7 @@ impl Writer {
         self.u64(self.paths.len());
         self.u64(self.paths.len());
         for column in &table {
-            self.ints(column);
+            self.ints(column)?;
         }
         self.section(&mut toc, "PATHS", start);
 
@@ -353,7 +354,7 @@ impl Writer {
         let specs = std::mem::take(&mut self.specs);
         self.u64(specs.len());
         for k in 0..3 {
-            self.ints(&specs.iter().map(|s| s.get(k).copied().unwrap_or_default()).collect::<Vec<_>>());
+            self.ints(&specs.iter().map(|s| s.get(k).copied().unwrap_or_default()).collect::<Vec<_>>())?;
         }
         self.section(&mut toc, "SPECS", start);
 
@@ -371,6 +372,7 @@ impl Writer {
         if let Some(slot) = self.out.get_mut(16..24) {
             slot.copy_from_slice(&toc_at.to_le_bytes());
         }
+        Ok(())
     }
 }
 
@@ -400,9 +402,9 @@ impl Writer {
         Ok(())
     }
 
-    fn finish(mut self) -> Vec<u8> {
-        self.sections();
-        self.out
+    fn finish(mut self) -> Result<Vec<u8>> {
+        self.sections()?;
+        Ok(self.out)
     }
 }
 
@@ -413,7 +415,7 @@ pub(crate) fn write(layer: &UsdLayer) -> Result<Vec<u8>> {
     w.add_prim_paths(0, "/", root);
     w.root_spec(&root.name)?;
     w.prim_specs(&format!("/{}", root.name), root)?;
-    Ok(w.finish())
+    w.finish()
 }
 
 #[cfg(test)]
@@ -504,7 +506,7 @@ mod tests {
         for (path, value) in attrs.into_iter().zip([points, counts, indices]) {
             w.spec(path, SPEC_ATTRIBUTE, vec![("default", value)]);
         }
-        let bytes = w.finish();
+        let bytes = w.finish().unwrap();
 
         let m = crate::import_mesh_bytes("crafted.usdc", &bytes).unwrap().mesh;
         assert_eq!(m.triangle_count(), 1, "the class prim itself is not drawn");

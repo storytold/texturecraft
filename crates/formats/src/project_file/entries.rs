@@ -36,6 +36,8 @@ pub(super) struct Entry<'a> {
 mod limits {
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
+    const FALLBACK_AVAILABLE_RAM_BYTES: u64 = 8 << 30;
+
     /// Cores a save leaves to the UI (an autosave runs while the user keeps painting).
     static RESERVED_CORES: AtomicUsize = AtomicUsize::new(DEFAULT_RESERVED_CORES);
     /// Share of the available RAM, in percent, that entries in flight may hold.
@@ -56,11 +58,30 @@ mod limits {
     /// RAM the system can give out now, in bytes (the total when the system does not say it; 8 GiB
     /// when the system tells nothing).
     pub fn available_ram() -> u64 {
-        let Ok(mut sys) = sysinfo::System::new() else { return 8 << 30 };
+        let Ok(mut sys) = sysinfo::System::new() else { return FALLBACK_AVAILABLE_RAM_BYTES };
         sys.refresh_memory();
-        match sys.available_memory() {
-            0 => sys.total_memory(),
-            n => n,
+        reported_ram(sys.available_memory(), sys.total_memory())
+    }
+
+    fn reported_ram(available: u64, total: u64) -> u64 {
+        if available != 0 {
+            available
+        } else if total != 0 {
+            total
+        } else {
+            FALLBACK_AVAILABLE_RAM_BYTES
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::reported_ram;
+
+        #[test]
+        fn missing_memory_readings_use_fallback() {
+            assert_eq!(reported_ram(0, 0), 8 << 30);
+            assert_eq!(reported_ram(0, 12 << 30), 12 << 30);
+            assert_eq!(reported_ram(3 << 30, 12 << 30), 3 << 30);
         }
     }
 }

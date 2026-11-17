@@ -12,6 +12,7 @@ rust-version = "1.95"
 repository = "https://github.com/storytold/texturecraft"
 
 [workspace.dependencies]
+craft-usd = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "f7655fb3ea59d6b21681700c0ff880823f5bb709" }
 # internal
 texturecraft-core = { path = "crates/core" }
 texturecraft-texel = { path = "crates/texel" }
@@ -49,7 +50,6 @@ wgpu = "30"
 rfd = "0.17"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names", "KHR_materials_emissive_strength"] }
-tobj = { version = "4", default-features = false }
 flate2 = "1"
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 quick-xml = "0.41"
@@ -70,8 +70,10 @@ craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0
 craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585", features = ["serde"] }
 craft-materialx = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585" }
 craft-tcraft = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
+# Isolated aligned writer; existing archive readers retain their pin and behavior.
+craft-zip-usdz = { package = "craft-zip", git = "https://github.com/storytold/craft-libs", rev = "6128eabbfb98e5fe486fa7ee4413724e2a4ca908" }
 craft-zip = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
-craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "d6ed8c20f12188c1f39c89b3a8436bd0d09c3748", default-features = false, features = ["stl"] }
+craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "b952ca0231867c8ad6749ac44cab5fc903c3ad52", default-features = false, features = ["stl", "ply", "fbx", "obj"] }
 craft-mcmat = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
 # Who draws the window frame, and the app-drawn strip as the title bar (crates/ui-egui/src/titlebar.rs).
 craft-window = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585", features = ["egui"] }

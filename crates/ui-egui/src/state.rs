@@ -9,6 +9,9 @@ use crate::saved_search::SavedSearch;
 use crate::shelf_panes::ShelfPanes;
 use crate::shelf_view::ShelfView;
 
+mod project_config;
+pub use project_config::ProjectConfig;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Mode {
     #[default]
@@ -79,6 +82,9 @@ pub struct Windows {
     /// The start window: new, open, recent projects (the app opens it at launch).
     #[serde(skip)]
     pub start: bool,
+    /// Edit > Project Configuration: what is chosen so far, applied by OK.
+    #[serde(skip)]
+    pub project_config: Option<ProjectConfig>,
     /// What waits on the unsaved-changes dialog: save, don't save or cancel.
     #[serde(skip)]
     pub unsaved: Option<Unsaved>,
@@ -267,7 +273,7 @@ fn default_split_ratio() -> f32 {
     0.5
 }
 /// The bake layout's version: saved bake docks from an older one load as `Dock::for_baking`
-const BAKE_LAYOUT_VERSION: u32 = 1;
+const BAKE_LAYOUT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
@@ -344,8 +350,8 @@ pub struct UiState {
     /// How the 3D view shows symmetry
     #[serde(default)]
     pub symmetry: crate::symmetry::SymmetryDisplay,
-    /// What bake mode's 3D view draws besides the low poly (the Baking Visualization panel)
-    #[serde(default)]
+    /// The Baking Visualization panel's settings, under a key of their own since the reference defaults: older saved ones start over
+    #[serde(default, rename = "baking_visualization")]
     pub bake_visualization: crate::bake_mode::BakeVisualizationToggles,
 }
 

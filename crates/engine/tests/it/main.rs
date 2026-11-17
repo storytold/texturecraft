@@ -2,6 +2,7 @@
 //! Keep feature tests in their own modules; the standalone session.rs target remains available.
 
 mod bake;
+mod bake_checks;
 mod bake_resolution;
 mod bake_settings;
 mod bake_tiles;
@@ -20,6 +21,7 @@ mod meshmap_import;
 mod painter_gaps;
 mod path_perf;
 mod path_tool;
+mod pbr_import;
 mod perf;
 mod polygon_fill;
 mod project_recovery;
