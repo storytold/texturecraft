@@ -1421,6 +1421,8 @@ mod image_menu_tests {
 
     #[test]
     fn image_menu_previews_only_visible_rows_and_keeps_later_images_selectable() {
+        // The harness draws the UI, and the i18n tests switch the process-wide language to ones its fonts cannot draw
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         const IMAGE_COUNT: usize = 128;
         let mut harness = image_menu_harness(IMAGE_COUNT).unwrap();
         let (initial_previews, _) = preview_stats(&harness.ctx);

@@ -2106,6 +2106,8 @@ mod tests {
 
     #[test]
     fn unavailable_tools_finish_strokes_and_box_fills() {
+        // The harness draws the UI, and the i18n tests switch the process-wide language to ones its fonts cannot draw
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use texturecraft_engine::{StackTarget, core::LayerId, geom::primitives};
 
         for tool in [Tool::Paint, Tool::PolygonFill] {
@@ -2133,6 +2135,8 @@ mod tests {
 
     #[test]
     fn stored_surfaces_release_after_a_frame_without_paths() {
+        // The harness draws the UI, and the i18n tests switch the process-wide language to ones its fonts cannot draw
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use texturecraft_engine::{core::EffectKind, execute, geom::primitives};
 
         let mut session = Session::new_project("Path cache", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 256).unwrap();
@@ -2219,6 +2223,8 @@ mod tests {
 
     #[test]
     fn decal_frame_rejects_a_stale_effect_after_failed_layer_selection() {
+        // The harness draws the UI, and the i18n tests switch the process-wide language to ones its fonts cannot draw
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use texturecraft_engine::{StackTarget, execute};
 
         for texture_set in [0, 1] {
@@ -2250,6 +2256,8 @@ mod tests {
 
     #[test]
     fn decal_frame_keeps_an_instances_inherited_mask_effect_editable() {
+        // The harness draws the UI, and the i18n tests switch the process-wide language to ones its fonts cannot draw
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use texturecraft_engine::execute;
 
         let mut harness = decal_frame_app(false);
@@ -2274,6 +2282,8 @@ mod tests {
 
     #[test]
     fn decal_frame_rejects_a_source_mask_overridden_by_the_selected_instance() {
+        // The harness draws the UI, and the i18n tests switch the process-wide language to ones its fonts cannot draw
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use texturecraft_engine::execute;
 
         let mut harness = decal_frame_app(false);
@@ -2292,6 +2302,8 @@ mod tests {
     #[test]
     #[ignore = "requires an offscreen GPU adapter and TC_UI_SNAPSHOTS"]
     fn decal_frame_selection_snapshots() {
+        // The harness draws the UI, and the i18n tests switch the process-wide language to ones its fonts cannot draw
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use texturecraft_engine::execute;
 
         let Some(directory) = std::env::var_os("TC_UI_SNAPSHOTS").map(std::path::PathBuf::from) else { return };
@@ -2320,6 +2332,8 @@ mod tests {
 
     #[test]
     fn live_bake_preview_hides_setup_overlays_and_restores_their_preferences() {
+        // The harness draws the UI, and the i18n tests switch the process-wide language to ones its fonts cannot draw
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let session = texturecraft_engine::sample_session(256, 64).unwrap();
         let mut harness = egui_kittest::Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
         let app = harness.state_mut();

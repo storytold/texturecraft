@@ -1352,6 +1352,8 @@ mod tests {
 
     #[test]
     fn a_save_a_copy_answer_does_not_end_the_prompts_wait() {
+        // The harness draws the UI, and the i18n tests switch the process-wide language to ones its fonts cannot draw
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut h = harness();
         let app = h.state_mut();
         app.file_dialogs.set_override(Some(Box::new(|_| crate::file_dialogs::Answer::Cancelled)));
@@ -1363,6 +1365,8 @@ mod tests {
 
     #[test]
     fn a_save_as_already_on_its_way_ends_the_prompts_wait() {
+        // The harness draws the UI, and the i18n tests switch the process-wide language to ones its fonts cannot draw
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut h = harness();
         let app = h.state_mut();
         // One call site, as File › Save As and the prompt's Save share one.
