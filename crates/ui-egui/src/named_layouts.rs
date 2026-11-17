@@ -319,7 +319,10 @@ mod tests {
         assert_eq!(baking.mode, Mode::Baking);
         assert!(baking.dock_is_baking);
         assert!(baking.dock.is_open(Panel::MeshMapBakers) && !baking.dock.is_open(Panel::Layers), "the baking dock is the saved baking dock");
-        assert!(baking.inactive_mode_dock.is_open(Panel::Layers) && !baking.inactive_mode_dock.is_open(Panel::Assets), "the painting dock is the saved painting dock");
+        assert!(
+            baking.inactive_mode_dock.is_open(Panel::Layers) && !baking.inactive_mode_dock.is_open(Panel::Assets),
+            "the painting dock is the saved painting dock"
+        );
     }
 
     #[test]

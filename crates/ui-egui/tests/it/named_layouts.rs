@@ -2,14 +2,15 @@
 
 use egui::Role;
 use egui_kittest::Harness;
-use egui_kittest::kittest::{NodeT, Queryable};
+use egui_kittest::kittest::Queryable;
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::docking::Panel;
 use texturecraft_ui_egui::state::Mode;
 
 fn app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_accessibility_check(false).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness =
+        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_accessibility_check(false).build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(4);
     harness
 }
@@ -27,7 +28,10 @@ fn layouts_menu(harness: &mut Harness<'_, TextureCraftApp>, entry: &str) {
 /// The dialog's text field: the one nearest the window center, where dialogs open (the shelf search is another)
 fn dialog_input<'a>(harness: &'a Harness<'_, TextureCraftApp>) -> egui_kittest::Node<'a> {
     let center = harness.ctx.content_rect().center();
-    harness.get_all_by_role(Role::TextInput).min_by(|a, b| a.rect().center().distance(center).total_cmp(&b.rect().center().distance(center))).expect("the dialog's field")
+    harness
+        .get_all_by_role(Role::TextInput)
+        .min_by(|a, b| a.rect().center().distance(center).total_cmp(&b.rect().center().distance(center)))
+        .expect("the dialog's field")
 }
 
 fn save_as(harness: &mut Harness<'_, TextureCraftApp>, name: &str) {
