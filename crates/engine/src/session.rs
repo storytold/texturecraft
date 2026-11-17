@@ -324,11 +324,9 @@ pub const HISTORY_TEMPLATES: &[&str] = &[
     "Clone on {layer}",
     "Smudge on {layer}",
     "Projection on {layer}",
-    "Path on {layer}",
     "Paint mask of {layer}",
     "Erase mask of {layer}",
     "Projection mask of {layer}",
-    "Path mask of {layer}",
     EDIT_PATH_TEMPLATE,
     APPLY_SMART_MASK_TEMPLATE,
 ];
@@ -354,8 +352,6 @@ pub fn stroke_template(tool: Tool, on_mask: bool) -> &'static str {
         (Tool::Smudge, _) => "Smudge on {layer}",
         (Tool::Projection, false) => "Projection on {layer}",
         (Tool::Projection, true) => "Projection mask of {layer}",
-        (Tool::Path, false) => "Path on {layer}",
-        (Tool::Path, true) => "Path mask of {layer}",
         (_, false) => "Paint on {layer}",
         (_, true) => "Paint mask of {layer}",
     }

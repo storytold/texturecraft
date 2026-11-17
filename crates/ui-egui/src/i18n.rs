@@ -105,7 +105,16 @@ pub fn trf(template: &str, args: &[(&str, &dyn Display)]) -> String {
 /// smart mask name in it ("Paint on Rust") is matched to its engine template, which is translated
 /// and filled in again; any other label is translated as it is.
 pub fn tr_history(label: &str) -> String {
-    let matched = texturecraft_engine::HISTORY_TEMPLATES
+    match history_template(label) {
+        Some((template, name, value)) => trf(template, &[(name, &value)]),
+        None => tr(label).to_string(),
+    }
+}
+
+/// The engine template a history label was made from, its placeholder name and the value in it.
+/// The template with the longest fixed start wins.
+fn history_template(label: &str) -> Option<(&'static str, &'static str, &str)> {
+    texturecraft_engine::HISTORY_TEMPLATES
         .iter()
         .filter_map(|template| {
             let (open, close) = (template.find('{')?, template.find('}')?);
@@ -113,11 +122,8 @@ pub fn tr_history(label: &str) -> String {
             let value = label.strip_prefix(prefix)?.strip_suffix(suffix)?;
             Some((prefix.len(), *template, &template[open + 1..close], value))
         })
-        .max_by_key(|(prefix_length, ..)| *prefix_length);
-    match matched {
-        Some((_, template, name, value)) => trf(template, &[(name, &value)]),
-        None => tr(label).to_string(),
-    }
+        .max_by_key(|(prefix_length, ..)| *prefix_length)
+        .map(|(_, template, name, value)| (template, name, value))
 }
 
 /// The supported language for a locale such as "de-AT", "pt_BR.UTF-8" or "zh-Hant-TW" ("en" when
@@ -309,6 +315,13 @@ mod tests",
     fn history_labels_are_matched_to_their_templates() {
         let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         set_language("en");
+        assert_eq!(history_template("Paint on Rust"), Some(("Paint on {layer}", "layer", "Rust")));
+        assert_eq!(history_template("Paint on Paint mask of x"), Some(("Paint on {layer}", "layer", "Paint mask of x")));
+        assert_eq!(history_template("Paint mask of Paint on x"), Some(("Paint mask of {layer}", "layer", "Paint on x")));
+        assert_eq!(history_template("Erase mask of Rust"), Some(("Erase mask of {layer}", "layer", "Rust")));
+        assert_eq!(history_template("Edit path 2"), Some(("Edit path {n}", "n", "2")));
+        assert_eq!(history_template("Apply smart mask Dirt"), Some(("Apply smart mask {name}", "name", "Dirt")));
+        assert_eq!(history_template("Rename layer"), None);
         assert_eq!(tr_history("Paint on Rust"), "Paint on Rust");
         assert_eq!(tr_history("Paint mask of Paint on Rust"), "Paint mask of Paint on Rust");
         assert_eq!(tr_history("Edit path 2"), "Edit path 2");
