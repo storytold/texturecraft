@@ -114,6 +114,20 @@ fn sets_with_the_same_file_name_warn_instead_of_overwriting() {
 }
 
 #[test]
+fn a_list_of_sets_in_one_command_finds_file_names_they_share() {
+    let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+    execute(&mut s, "textureSet.rename", &json!({"ts": 0, "name": "a b"})).unwrap();
+    execute(&mut s, "textureSet.rename", &json!({"ts": 1, "name": "A_B"})).unwrap();
+    let dir = temp("clash_list");
+    let sets: Vec<usize> = (0..s.set_count()).collect();
+    let r = execute(&mut s, "file.exportTextures", &json!({"dir": dir.display().to_string(), "preset": OPENPBR, "ts": sets, "materialX": true})).unwrap();
+    assert_eq!(files(&r).iter().filter(|f| f.ends_with(".mtlx")).count(), s.set_count() - 1, "{r}");
+    assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("\"A_B\"")), "{r}");
+    let bad = execute(&mut s, "file.exportTextures", &json!({"dir": dir.display().to_string(), "preset": OPENPBR, "ts": [0, 99]}));
+    assert!(bad.is_err(), "an index past the last set is refused");
+}
+
+#[test]
 fn udim_sets_use_the_udim_token() {
     let mut s = Session::new_project("t", primitives::udim_plane(), "builtin:udim_plane", None, 128).unwrap();
     let dir = temp("udim");

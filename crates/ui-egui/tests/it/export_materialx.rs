@@ -131,3 +131,28 @@ fn ticking_materialx_with_another_template_says_why_no_material_was_written() {
     assert!(toasts.iter().collect::<std::collections::HashSet<_>>().len() == toasts.len(), "the same warning is not repeated per texture set: {toasts:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn two_sets_with_the_same_material_file_name_do_not_overwrite_each_other() {
+    let dir = temp_dir("clash", "ui");
+    let mut s = session();
+    assert!(s.set_count() >= 2);
+    execute(&mut s, "textureSet.rename", &json!({"ts": 0, "name": "a b"})).unwrap();
+    execute(&mut s, "textureSet.rename", &json!({"ts": 1, "name": "A_B"})).unwrap();
+    let count = s.set_count();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, s));
+    h.state_mut().ui.export.dir = dir.display().to_string();
+    h.state_mut().ui.export.preset = OPENPBR.to_string();
+    h.state_mut().ui.windows.export = true;
+    h.run_steps(4);
+    h.get_by_label(OPTION).click();
+    h.run_steps(2);
+    h.get_by_label("Export").click();
+    h.run_steps(4);
+    assert_eq!(names(&dir, ".mtlx").len(), count - 1, "the second set's material was skipped, not written over the first");
+    assert!(
+        h.state().toasts.iter().any(|t| t.error && t.text.starts_with("MaterialX:") && t.text.contains("\"A_B\"")),
+        "the skipped set is named in a warning"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1061,28 +1061,22 @@ fn export_selection(app: &TextureCraftApp) -> Vec<usize> {
 /// Export the selected texture sets; false when a command failed (its error is already shown).
 #[cfg(not(target_arch = "wasm32"))]
 fn export_sets(app: &mut TextureCraftApp) -> bool {
-    let mut written = 0usize;
-    let mut warnings: Vec<String> = Vec::new();
-    for ts in export_selection(app) {
-        let mut p = export_params(app);
-        p["dir"] = json!(app.ui.export.dir);
-        p["ts"] = json!(ts);
-        match app.run("file.exportTextures", p) {
-            Some(r) => {
-                written += r.get("files").and_then(|f| f.as_array()).map(Vec::len).unwrap_or(0);
-                warnings.extend(
-                    r.get("warnings")
-                        .and_then(|w| w.as_array())
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|w| w.as_str())
-                        .filter(|w| w.starts_with("MaterialX:"))
-                        .map(str::to_owned),
-                );
-            }
-            None => return false,
-        }
-    }
+    // One command for every ticked set: the MaterialX file names are checked across all of them, so
+    // two sets that give the same name cannot overwrite each other's file.
+    let mut p = export_params(app);
+    p["dir"] = json!(app.ui.export.dir);
+    p["ts"] = json!(export_selection(app));
+    let Some(r) = app.run("file.exportTextures", p) else { return false };
+    let written = r.get("files").and_then(|f| f.as_array()).map(Vec::len).unwrap_or(0);
+    let mut warnings: Vec<String> = r
+        .get("warnings")
+        .and_then(|w| w.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w.as_str())
+        .filter(|w| w.starts_with("MaterialX:"))
+        .map(str::to_owned)
+        .collect();
     // A MaterialX file that could not be written (wrong template, clashing names) must not pass silently.
     let mut seen = std::collections::HashSet::new();
     warnings.retain(|w| seen.insert(w.clone()));
