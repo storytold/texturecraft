@@ -161,8 +161,8 @@ pub struct TextureCraftApp {
     pub ui_ms: f32,
     /// Frame timing and the scripted paint test (`debug.*` control methods).
     pub profiler: profile::Profiler,
-    /// Where the last 3D stroke ended (viewport pixels), for Shift+click straight lines.
-    pub last_paint_point: Option<texturecraft_engine::geom::glam::Vec2>,
+    /// Where the last 3D stroke ended on the model, scoped to its mesh and texture set, for Shift+click straight lines.
+    pub last_paint_point: Option<uv_paint_point::SurfacePaintPoint>,
     /// The last finished 2D stroke's endpoint, scoped to its mesh and texture set for Shift+click lines
     pub last_paint_uv: Option<uv_paint_point::UvPaintPoint>,
     /// The decal layer the next click in the 3D view places.

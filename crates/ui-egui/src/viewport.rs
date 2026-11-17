@@ -546,6 +546,20 @@ const MAX_STENCIL_SCALE: f32 = 10.0;
 /// Smallest viewport the camera projects into, so a collapsed view keeps a usable aspect (points)
 const MIN_CAMERA_VIEWPORT: f32 = 16.0;
 
+/// Remember the model point under viewport pixel `screen` as the start of the next Shift+click line
+fn remember_line_anchor(app: &mut TextureCraftApp, screen: Vec2) {
+    if let Some(hit) = app.session.pick(screen, app.session.viewport) {
+        app.last_paint_point = Some(crate::uv_paint_point::SurfacePaintPoint::new(&app.session, hit.pos));
+    }
+}
+
+/// Where the remembered line start is in the view now (viewport pixels), also when the model hides it
+fn line_anchor_screen(app: &TextureCraftApp, rect: Rect) -> Option<Vec2> {
+    let pos = app.last_paint_point?.position_for(&app.session)?;
+    let screen = project(app, rect, pos)?;
+    Some(Vec2::new(screen.x - rect.left(), screen.y - rect.top()))
+}
+
 fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut PendingSync) {
     let response = ui.interact(rect, ui.scope_id().with("view3d"), Sense::click_and_drag());
     app.viewport_rect = rect;
@@ -747,15 +761,15 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     } else if painting {
         let pressure = pen_pressure(ui);
         if response.drag_started_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary) {
-            // Shift+click paints a straight line from where the last stroke ended
-            let line_from = if shift { app.last_paint_point } else { None };
+            // Shift+click paints a straight line from where the last stroke ended on the model
+            let line_from = if shift { line_anchor_screen(app, rect) } else { None };
             if let Some(pointer) = response.interact_pointer_pos() {
                 match app.session.begin_stroke(line_from.unwrap_or(local(pointer)), app.session.viewport, pressure) {
                     Ok(_) => {
                         if line_from.is_some() {
                             app.session.continue_stroke(local(pointer), pressure);
                         }
-                        app.last_paint_point = Some(local(pointer));
+                        remember_line_anchor(app, local(pointer));
                     }
                     Err(error) => app.toast(tr(&error.to_string()).to_string(), true),
                 }
@@ -770,7 +784,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             && let Some(pointer) = response.interact_pointer_pos()
         {
             app.session.continue_stroke(local(pointer), pressure);
-            app.last_paint_point = Some(local(pointer));
+            remember_line_anchor(app, local(pointer));
         }
         if response.drag_stopped_by(PointerButton::Primary)
             && let Err(error) = app.session.end_stroke()
@@ -820,7 +834,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         // Shift: preview the straight line Shift+click paints from the last stroke
         if shift
             && !path_tool
-            && let Some(from) = app.last_paint_point
+            && let Some(from) = line_anchor_screen(app, rect)
         {
             rubber_band(ui, rect, &[pos2(rect.left() + from.x, rect.top() + from.y), hover_pos]);
         }
