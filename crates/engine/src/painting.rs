@@ -219,7 +219,7 @@ impl Session {
                 Some(flat) => Pickup::from_layer(mode, flat, size, cache.gbuf.clone(), values.keys().copied()),
                 None => Pickup::new(mode, cache.composite.clone(), cache.gbuf.clone(), values.keys().copied()),
             };
-            if tool == Tool::Smudge && stroke.settings.symmetry.any() {
+            if tool == Tool::Smudge && !uv_mode && stroke.settings.symmetry.any() {
                 // Every mirrored copy of a smudge drags its own trail.
                 pickup.isolate_copies();
             }
