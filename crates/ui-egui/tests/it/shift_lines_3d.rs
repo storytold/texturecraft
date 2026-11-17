@@ -84,6 +84,9 @@ fn after_first_click() -> (Harness<'static, TextureCraftApp>, Pos2, Vec2) {
     let first = model_pixel_near(&harness, harness.state().session.viewport * 0.5);
     let (blank, width) = alpha(&harness);
     assert!(blank.iter().all(|alpha| *alpha == 0.0), "the layer starts empty");
+    let app = harness.state();
+    let local = Vec2::new(first.x - app.viewport_rect.left(), first.y - app.viewport_rect.top());
+    assert_eq!(app.session.texture_set_at(local, app.session.viewport), Some(app.session.ts()), "the click lands on the active texture set");
     click(&mut harness, first, false);
     let (dab, _) = alpha(&harness);
     let dab_centre = centre(&dab, width);
