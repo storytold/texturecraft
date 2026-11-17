@@ -220,7 +220,9 @@ fn a_mask_fill_effects_decal_is_edited_like_a_layer_decal() {
     let before = effect_decal(&s, effect);
     let steps = s.history_labels().len();
 
-    // Only the effect id (the selected layer is the other decal)
+    // Only the effect id, with no layer selected
+    s.selected.clear();
+    assert!(s.selected_layer().is_none());
     let r = execute(&mut s, "layer.decal.set", &json!({"effect": effect.0, "size": [0.3, 0.2], "offset": [0.1, -0.05], "rotation": 30, "depth": 0.2})).unwrap();
     assert_eq!(r["layer"], json!(layer.0), "the owning layer is reported");
     let after = effect_decal(&s, effect);
