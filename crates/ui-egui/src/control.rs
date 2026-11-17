@@ -95,8 +95,15 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
         "command.run" => {
             let Some(id) = p.get("id").and_then(Value::as_str) else { return err("`id` is required") };
             let params = p.get("params").cloned().unwrap_or(Value::Null);
+            let before = app.session.camera;
             match texturecraft_engine::execute(&mut app.session, id, &params) {
-                Ok(v) => ok(v),
+                Ok(v) => {
+                    // A command that moved the camera takes over from a glide in progress, which would put it back
+                    if app.session.camera != before {
+                        app.camera_glide = None;
+                    }
+                    ok(v)
+                }
                 Err(e) => err(e),
             }
         }

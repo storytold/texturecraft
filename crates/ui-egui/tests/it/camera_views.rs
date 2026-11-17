@@ -149,6 +149,36 @@ fn a_view_that_returns_to_the_starting_camera_cancels_the_glide_of_the_earlier_v
 }
 
 #[test]
+fn a_camera_command_from_the_control_channel_during_a_glide_is_not_overwritten_by_it() {
+    let mut h = slow_glide_harness();
+    start_front_glide(&mut h);
+    let context = h.ctx.clone();
+    let reply = texturecraft_ui_egui::control::handle(h.state_mut(), &context, "command.run", &json!({"id": "camera.set", "params": {"yaw": 20, "pitch": 10}}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    h.run_steps(60);
+    let camera = h.state().session.camera;
+    assert!(
+        (camera.yaw.to_degrees() - 20.0).abs() < 1e-3 && (camera.pitch.to_degrees() - 10.0).abs() < 1e-3,
+        "yaw {} pitch {}",
+        camera.yaw.to_degrees(),
+        camera.pitch.to_degrees()
+    );
+}
+
+#[test]
+fn a_control_command_that_leaves_the_camera_alone_does_not_stop_the_glide() {
+    let mut h = slow_glide_harness();
+    start_front_glide(&mut h);
+    let context = h.ctx.clone();
+    let reply = texturecraft_ui_egui::control::handle(h.state_mut(), &context, "command.run", &json!({"id": "camera.get", "params": {}}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    h.run_steps(60);
+    let camera = h.state().session.camera;
+    let looking_from = (camera.eye() - camera.target).normalize();
+    assert!(looking_from.z > 0.999, "the glide still reaches the front view: {looking_from}");
+}
+
+#[test]
 fn alt_shift_drag_during_a_glide_is_not_overwritten_by_it() {
     let mut h = slow_glide_harness();
     start_front_glide(&mut h);
