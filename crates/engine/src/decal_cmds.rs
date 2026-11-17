@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 use texturecraft_core::{Channel, Decal, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source};
-use texturecraft_geom::glam::{Vec2, Vec3};
+use texturecraft_geom::glam::{Quat, Vec2, Vec3};
 
 use crate::commands::{CommandSpec, always, bad, channel_param, f32p, has_layer, layer_param, strp, u64p, vec3};
 use crate::tool_cmds::viewport_of;
@@ -25,7 +25,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit decal",
             [],
             None,
-            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z], size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
+            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z] (default: the decal's up carried along when it moves onto a surface facing another way), size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
             has_layer,
             set
         ),
@@ -89,6 +89,20 @@ fn decal_up(s: &Session, cmd: &str, p: &Value, normal: Vec3) -> Result<Vec3> {
     let to_world = s.camera.view().inverse();
     let up = to_world.transform_vector3(Vec3::Y);
     Ok(if up.normalize_or_zero().cross(normal).length_squared() > 1e-4 { up } else { to_world.transform_vector3(Vec3::NEG_Z) })
+}
+
+/// The up of a decal moved from a surface facing `from.0` (up `from.1`) onto one facing `to`: the
+/// old up turned by the smallest rotation that takes the old normal to the new one (parallel
+/// transport), so it follows the surface smoothly and never degenerates. A surface turned
+/// exactly away has no smallest rotation: the camera rule of a new decal decides there.
+fn carried_up(s: &Session, from: (Vec3, Vec3), to: Vec3) -> Vec3 {
+    let (old_normal, old_up) = from;
+    let (Some(old_normal), Some(new_normal)) = (old_normal.try_normalize(), to.try_normalize()) else { return old_up };
+    if old_normal.dot(new_normal) < -0.9999 {
+        return decal_up(s, "", &Value::Null, new_normal).unwrap_or(old_up);
+    }
+
+    Quat::from_rotation_arc(old_normal, new_normal) * old_up
 }
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
@@ -192,7 +206,13 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
             return Err(bad(command, "that surface belongs to another texture set"));
         }
 
+        // Moving onto a surface facing another way carries the decal's up along (a stale up would
+        // lie in the new surface or flip the decal), unless `up` says otherwise below
+        let previous = (Vec3::from(decal.normal), Vec3::from(decal.up));
         (decal.center, decal.normal, decal.offset) = (center.to_array(), normal.to_array(), [0.0; 2]);
+        if params.get("up").is_none() {
+            decal.up = carried_up(session, previous, normal).to_array();
+        }
     }
     if params.get("up").is_some() {
         decal.up = decal_up(session, command, params, Vec3::from(decal.normal))?.to_array();

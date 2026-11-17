@@ -626,3 +626,66 @@ fn directx_normal_images_flip_green() {
     let old: texturecraft_engine::core::Source = serde_json::from_value(json!({"Image": {"name": "n"}})).unwrap();
     assert_eq!(old, texturecraft_engine::core::Source::image("n"));
 }
+
+/// A decal's up as the projection shows it: the stored up inside the surface plane.
+fn plane_up(decal: &Value) -> texturecraft_engine::geom::glam::Vec3 {
+    use texturecraft_engine::geom::glam::Vec3;
+    let v = |key: &str| Vec3::new(decal[key][0].as_f64().unwrap() as f32, decal[key][1].as_f64().unwrap() as f32, decal[key][2].as_f64().unwrap() as f32);
+    let normal = v("normal").normalize();
+    (v("up") - normal * normal.dot(v("up"))).normalize_or_zero()
+}
+
+#[test]
+fn a_decal_moved_onto_another_facing_surface_keeps_a_valid_frame_with_the_carried_up() {
+    use texturecraft_engine::geom::glam::Vec3;
+    let mut s = Session::new_project("t", primitives::cube(2.0), "builtin:cube", None, 256).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    let name = s.import_resource_bytes("logo.png", png(8, 4, |_, _| [255, 0, 0, 255])).unwrap();
+    // On the +Z face, its up turned halfway between world X and Y, size and turn set by the user
+    let place = json!({"image": name, "position": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0], "up": [1.0, 1.0, 0.0], "size": [0.6, 0.3], "rotation": 25});
+    let layer = id(execute(&mut s, "layer.add.decal", &place).unwrap(), "layer");
+    // Onto the +Y face: the up turns with the surface and follows the old up's direction in it
+    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.2, 1.0, 0.1], "normal": [0.0, 1.0, 0.0]})).unwrap();
+    let up = plane_up(&r["decal"]);
+    assert!((up.length() - 1.0).abs() < 1e-4 && up.dot(Vec3::Y).abs() < 1e-4, "an up inside the +Y face: {up}");
+    assert!(up.x > 0.5, "the old up's X side stays on the X side: {up}");
+    assert_eq!(r["decal"]["rotation"], json!(25.0), "the user's turn stays");
+    assert_eq!(r["decal"]["size"], json!([0.6, 0.3]), "and the size");
+    // Straight up the face with the old up along the new normal: no degenerate frame, nothing arbitrary
+    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0], "up": [0.0, 1.0, 0.0]})).unwrap();
+    assert_eq!(plane_up(&r["decal"]), Vec3::Y);
+    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, 1.0, 0.0], "normal": [0.0, 1.0, 0.0]})).unwrap();
+    assert!((plane_up(&r["decal"]) - Vec3::NEG_Z).length() < 1e-4, "the up that pointed up the +Z face points away over the edge: {:?}", r["decal"]["up"]);
+    // An explicit up still wins
+    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [1.0, 0.0, 0.0], "normal": [1.0, 0.0, 0.0], "up": [0.0, 0.0, 1.0]})).unwrap();
+    assert_eq!(plane_up(&r["decal"]), Vec3::Z);
+    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "up": [0.0, 1.0, 0.0]})).unwrap();
+    assert_eq!(plane_up(&r["decal"]), Vec3::Y, "an up without a move too");
+}
+
+#[test]
+fn a_decal_dragged_over_the_sphere_never_flips_its_up_between_steps() {
+    use texturecraft_engine::geom::glam::Vec3;
+    let mut s = session();
+    let name = s.import_resource_bytes("logo.png", png(8, 8, |_, _| [255, 0, 0, 255])).unwrap();
+    let place = json!({"image": name, "position": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0], "up": [0.0, 1.0, 0.0], "size": 0.3});
+    let layer = id(execute(&mut s, "layer.add.decal", &place).unwrap(), "layer");
+    // Over the pole (the old up lies along the normal there) and down the far side, in 5 degree steps
+    let mut last = Vec3::Y;
+    for step in 0..=72 {
+        let angle = (step as f32 * 5.0).to_radians();
+        let normal = [0.0, angle.sin(), angle.cos()];
+        let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": normal, "normal": normal, "merge": step > 0})).unwrap();
+        let up = plane_up(&r["decal"]);
+        assert!((up.length() - 1.0).abs() < 1e-4, "step {step}: no frame at {normal:?}");
+        assert!(up.dot(last) > 0.0, "step {step}: up turned from {last} to {up}");
+        last = up;
+    }
+    // The same drag through viewport points (what the 3D view sends), from the middle to the edge
+    for step in 0..25 {
+        let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "x": 200.0 + step as f32 * 2.0, "y": 200.0 - step as f32 * 2.0, "merge": true})).unwrap();
+        let up = plane_up(&r["decal"]);
+        assert!((up.length() - 1.0).abs() < 1e-4 && up.dot(last) > 0.0, "viewport step {step}: {last} to {up}");
+        last = up;
+    }
+}
