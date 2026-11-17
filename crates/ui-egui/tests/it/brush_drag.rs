@@ -57,7 +57,13 @@ fn app(layout: texturecraft_ui_egui::state::ViewLayout) -> Harness<'static, Text
 fn wheel(h: &mut Harness<'_, TextureCraftApp>, at: Pos2, delta_y: f32, modifiers: Modifiers) {
     h.event(Event::ModifiersChanged(modifiers));
     h.hover_at(at);
-    h.event(Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, delta_y), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers });
+    h.event(Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: vec2(0.0, delta_y),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Wheel,
+        modifiers,
+    });
     h.run_steps(12);
     h.event(Event::ModifiersChanged(Modifiers::NONE));
     h.run_steps(2);
