@@ -1,7 +1,7 @@
 //! Renaming an effect row and mask anchor points, driven through the interface: the row's Rename action, Undo and Redo,
 //! Save and Open, and the Add effect menu and Source picker that link a fill on a higher layer to an anchor in a mask.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use egui::accesskit::Role;
 use egui::{Key, Modifiers};
@@ -37,8 +37,8 @@ fn temp_file(test: &str) -> PathBuf {
     dir.join("project.tcraft")
 }
 
-fn save_to(h: &mut Harness<'_, TextureCraftApp>, file: &PathBuf) {
-    let path = file.clone();
+fn save_to(h: &mut Harness<'_, TextureCraftApp>, file: &Path) {
+    let path = file.to_path_buf();
     h.state_mut().file_dialogs.set_override(Some(Box::new(move |_| Answer::Paths(vec![path.clone()]))));
     let ctx = h.ctx.clone();
     texturecraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "file.saveAs");
@@ -47,8 +47,8 @@ fn save_to(h: &mut Harness<'_, TextureCraftApp>, file: &PathBuf) {
     assert!(!h.state().session.modified, "the project counts as saved");
 }
 
-fn reopen(h: &mut Harness<'_, TextureCraftApp>, file: &PathBuf) {
-    let path = file.clone();
+fn reopen(h: &mut Harness<'_, TextureCraftApp>, file: &Path) {
+    let path = file.to_path_buf();
     h.state_mut().file_dialogs.set_override(Some(Box::new(move |_| Answer::Paths(vec![path.clone()]))));
     let ctx = h.ctx.clone();
     texturecraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "file.open");
@@ -184,10 +184,7 @@ fn a_fill_on_a_higher_layer_reads_a_mask_anchor_added_in_the_interface() {
     h.get_by_label("Add anchor point").click();
     h.run_steps(3);
     let anchor = mask_anchor_of(&h, low).expect("the anchor point is in the mask of Low");
-    assert!(
-        h.state().session.doc.project.layer(LayerId(low)).unwrap().content_effects.is_empty(),
-        "the anchor point is not on the layer content"
-    );
+    assert!(h.state().session.doc.project.layer(LayerId(low)).unwrap().content_effects.is_empty(), "the anchor point is not on the layer content");
 
     // A higher layer with a mask fill, added through the same menu
     let high = high_layer(&mut h.state_mut().session);
