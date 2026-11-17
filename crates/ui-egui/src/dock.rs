@@ -393,6 +393,11 @@ fn layer_name_layout(rect: Rect, left: f32) -> (Rect, bool) {
     (Rect::from_min_max(pos2(left, rect.top() + 4.0), pos2(name_right.max(left), rect.bottom() - 4.0)), show_blend)
 }
 
+/// Whether `text` at font `size` is wider than `width`, so a row shows it shortened.
+fn text_is_cut(painter: &egui::Painter, text: &str, size: f32, width: f32) -> bool {
+    painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), Color32::WHITE).size().x > width
+}
+
 /// Preserve the effect eye, preview and a readable name before spending space on nesting.
 fn effect_row_indent(width: f32, level: usize, preview: f32) -> f32 {
     (level as f32 * INDENT).min((width - ROW_LEFT_PADDING - EYE_COLUMN_WIDTH - preview - THUMBNAIL_GAP - MIN_NAME_WIDTH - ROW_RIGHT_PADDING).max(0.0))
@@ -654,8 +659,9 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         };
 
         // A name or subtitle cut short by a narrow panel is shown in full on hover
-        let cut = |text: &str, size: f32| painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), tokens.text).size().x > name_rect.width();
-        if cut(&layer.name, LAYER_NAME_FONT_SIZE) || cut(&subtitle, LAYER_SUBTITLE_FONT_SIZE) {
+        if text_is_cut(&painter, &layer.name, LAYER_NAME_FONT_SIZE, name_rect.width())
+            || text_is_cut(&painter, &subtitle, LAYER_SUBTITLE_FONT_SIZE, name_rect.width())
+        {
             row.clone().on_hover_text(format!("{}\n{subtitle}", layer.name));
         }
         let subtitle = elided(&painter, subtitle, LAYER_SUBTITLE_FONT_SIZE, tokens.text_dim, name_rect.width());
@@ -977,7 +983,11 @@ fn effect_row(
         let name_rect = Rect::from_min_max(pos2(name_left, rect.center().y - half_height), pos2(name_right, rect.center().y + half_height));
         effect_rename_editor(app, ui, name_rect, effect);
     } else {
-        let galley = elided(&painter, effect.name.clone(), EFFECT_NAME_FONT_SIZE, name_color, (name_right - name_left).max(MIN_NAME_WIDTH));
+        let name_width = (name_right - name_left).max(MIN_NAME_WIDTH);
+        if text_is_cut(&painter, &effect.name, EFFECT_NAME_FONT_SIZE, name_width) {
+            row.clone().on_hover_text(&effect.name);
+        }
+        let galley = elided(&painter, effect.name.clone(), EFFECT_NAME_FONT_SIZE, name_color, name_width);
         painter.galley(pos2(name_left, rect.center().y - galley.size().y * 0.5), galley, tokens.text);
     }
     if show_blend {

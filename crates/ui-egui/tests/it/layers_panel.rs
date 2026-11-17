@@ -162,3 +162,22 @@ fn a_layer_name_cut_short_shows_in_full_on_hover() {
     h.run_steps(30);
     assert_eq!(h.query_all_by_label_contains(LONG_NAME).count(), before + 1, "the tooltip carries the full name");
 }
+
+const LONG_EFFECT_NAME: &str = "Edge wear from curvature with dirt accumulation";
+
+#[test]
+fn an_effect_name_cut_short_shows_in_full_on_hover() {
+    let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
+    let layer = id(execute(&mut session, "layer.add.fill", &json!({"color": "#336699"})).unwrap(), "layer");
+    execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
+    execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert", "name": LONG_EFFECT_NAME})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.prefs.language = "en".into();
+    h.run_steps(4);
+
+    let row = h.get_by_label(LONG_EFFECT_NAME).rect();
+    let before = h.query_all_by_label_contains(LONG_EFFECT_NAME).count();
+    h.hover_at(egui::pos2(row.left() + 75.0, row.center().y));
+    h.run_steps(30);
+    assert_eq!(h.query_all_by_label_contains(LONG_EFFECT_NAME).count(), before + 1, "the tooltip carries the full effect name");
+}
