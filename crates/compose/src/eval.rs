@@ -1269,8 +1269,8 @@ struct Texel<'a, 'b> {
     stroke: f32,
     /// `eval` stops when it reaches this layer.
     stop: Option<LayerId>,
-    /// Stack values recorded by the anchor points evaluated so far.
-    anchors: Vec<(LayerId, Acc)>,
+    /// Stack values recorded by the anchor points evaluated so far; true marks a mask anchor (gray, not channel values).
+    anchors: Vec<(LayerId, Acc, bool)>,
     /// Where `eval` takes layer masks and content from.
     tape: Tape<'b>,
 }
@@ -1420,8 +1420,13 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// The stack value anchor point `anchor` recorded for `channel` (the channel default for an
     /// anchor not evaluated yet)
     fn anchored(&self, anchor: LayerId, channel: Channel) -> [f32; 3] {
-        let values = self.anchors.iter().rev().find(|(id, _)| *id == anchor).and_then(|(_, values)| values.get(channel.index()).copied());
+        let values = self.anchors.iter().rev().find(|(id, ..)| *id == anchor).and_then(|(_, values, _)| values.get(channel.index()).copied());
         values.unwrap_or_else(|| channel.default_value())
+    }
+
+    /// Whether anchor point `anchor` sits in a mask, where every channel holds the mask's gray.
+    fn is_mask_anchor(&self, anchor: LayerId) -> bool {
+        self.anchors.iter().rev().find(|(id, ..)| *id == anchor).is_some_and(|(_, _, mask)| *mask)
     }
 
     /// The value `source` gives this texel through `projection`, read as a channel of `kind`
@@ -1435,8 +1440,9 @@ impl<'a, 'b> Texel<'a, 'b> {
             }
             Source::Anchor { anchor, channel, ramp } if kind == ChannelKind::Color && !ramp.is_empty() => {
                 let value = self.anchored(*anchor, *channel);
-                // Signed values (height) span -1..1
-                let lightness = if channel.kind() == ChannelKind::Signed { lum(value) * 0.5 + 0.5 } else { lum(value) };
+                // Signed values (height) span -1..1; a mask anchor's gray already spans 0..1 in every channel
+                let signed = channel.kind() == ChannelKind::Signed && !self.is_mask_anchor(*anchor);
+                let lightness = if signed { lum(value) * 0.5 + 0.5 } else { lum(value) };
                 texturecraft_core::gradient(ramp, lightness).unwrap_or_default()
             }
             Source::Procedural { pattern, low, high, .. } => {
@@ -1672,7 +1678,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                 }
 
                 // Every channel of a mask anchor reads the mask's gray
-                EffectKind::Anchor => self.anchors.push((effect.id, [[value.clamp(0.0, 1.0); 3]; NCH])),
+                EffectKind::Anchor => self.anchors.push((effect.id, [[value.clamp(0.0, 1.0); 3]; NCH], true)),
 
                 // Content-only effects
                 EffectKind::Material(_) => {}
@@ -1721,14 +1727,14 @@ impl<'a, 'b> Texel<'a, 'b> {
                             }
                             _ => *acc,
                         };
-                        self.anchors.push((*a, rec));
+                        self.anchors.push((*a, rec, false));
                     }
                     continue;
                 }
                 _ => {}
             }
             for (a, _) in &n.anchors {
-                self.anchors.push((*a, *acc));
+                self.anchors.push((*a, *acc, false));
             }
         }
         false
@@ -3791,6 +3797,28 @@ soft {soft:?}"
             f.project.insert_layer(0, Layer::new(id, "Top", LayerKind::Fill(fill), &[Channel::BaseColor]), None, false).unwrap();
             let out = run(&f, None);
             assert!(close(out.value(Channel::BaseColor, 9, 9), want), "height {height}: {:?}", out.value(Channel::BaseColor, 9, 9));
+        }
+    }
+
+    #[test]
+    fn a_gradient_map_reads_a_mask_anchors_gray_from_zero_to_one_in_every_channel() {
+        for channel in [Channel::BaseColor, Channel::Height] {
+            for (gray, want) in [(0.0, [1.0, 0.0, 0.0]), (0.25, [0.5, 0.5, 0.0]), (0.5, [0.0, 1.0, 0.0]), (1.0, [0.0, 0.0, 1.0])] {
+                let mut f = fixture();
+                let low = fill_layer(&mut f.project, [0.0; 3], 0.5);
+                let anchor = f.project.alloc_id();
+                let mut mask = Mask::new(MaskBackground::Black);
+                mask.effects
+                    .push(Effect::new(f.project.alloc_id(), EffectKind::Fill { source: Source::Uniform([gray; 3]), projection: Projection::default() }));
+                mask.effects.push(Effect::new(anchor, EffectKind::Anchor));
+                f.project.layer_mut(low).unwrap().mask = Some(mask);
+                let id = f.project.alloc_id();
+                let mut fill = Fill::default();
+                fill.sources.insert(Channel::BaseColor, Source::Anchor { anchor, channel, ramp: RAMP.to_vec() });
+                f.project.insert_layer(0, Layer::new(id, "Top", LayerKind::Fill(fill), &[Channel::BaseColor]), None, false).unwrap();
+                let out = run(&f, None);
+                assert!(close(out.value(Channel::BaseColor, 9, 9), want), "{channel:?}, gray {gray}: {:?}", out.value(Channel::BaseColor, 9, 9));
+            }
         }
     }
 
