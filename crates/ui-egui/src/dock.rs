@@ -2260,8 +2260,14 @@ mod mask_anchor_label_tests {
     use super::{anchor_label, anchors_below, effect_anchors_below};
     use crate::TextureCraftApp;
 
+    /// Held while a test builds the app: the language is process-wide, and the i18n tests switch to ones the test fonts cannot draw
+    fn language() -> std::sync::MutexGuard<'static, ()> {
+        crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn disabled_mask_anchors_keep_their_selection_and_show_off() {
+        let _language = language();
         let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
         let lower = execute(&mut session, "layer.add.fill", &Value::Null).unwrap()["layer"].as_u64().unwrap();
         execute(&mut session, "mask.add.black", &json!({"layer": lower})).unwrap();
@@ -2282,6 +2288,7 @@ mod mask_anchor_label_tests {
 
     #[test]
     fn inherited_effect_pickers_list_anchors_below_the_owner() {
+        let _language = language();
         let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
         let lower = execute(&mut session, "layer.add.fill", &Value::Null).unwrap()["layer"].as_u64().unwrap();
         let valid = execute(&mut session, "effect.add.anchor", &json!({"layer": lower})).unwrap()["effect"].as_u64().unwrap();
@@ -2307,6 +2314,7 @@ mod mask_anchor_label_tests {
 
     #[test]
     fn inherited_effect_pickers_hide_unrecorded_source_set_anchors() {
+        let _language = language();
         let mesh = texturecraft_engine::geom::primitives::material_ball();
         let mut session = texturecraft_engine::Session::new_project("test", mesh, "builtin:material_ball", None, 256).unwrap();
         let lower = execute(&mut session, "layer.add.fill", &Value::Null).unwrap()["layer"].as_u64().unwrap();
