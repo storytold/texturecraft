@@ -88,20 +88,16 @@ fn visible(h: &Harness<'_, TextureCraftApp>, layer: LayerId) -> bool {
 }
 
 #[test]
-fn the_eye_of_a_selected_row_shows_or_hides_every_selected_layer() {
-    let (mut h, [a, b, c, _]) = harness();
+fn the_eye_of_a_selected_row_shows_or_hides_that_layer_only() {
+    let (mut h, [a, _, c, _]) = harness();
     click(&mut h, "Row A", Modifiers::NONE);
     click(&mut h, "Row C", Modifiers::COMMAND);
     click_eye(&mut h, "Row C");
-    assert!(!visible(&h, c) && !visible(&h, a), "both selected layers are hidden");
-    assert!(visible(&h, b), "an unselected layer stays shown");
+    assert!(!visible(&h, c), "C is hidden");
+    assert!(visible(&h, a), "A, also selected, stays shown");
     assert_eq!(h.state().session.selected_layers(), [c, a], "the selection stays");
-
-    // They all take the opposite of the clicked layer's state, whatever their own was
-    execute(&mut h.state_mut().session, "layer.visible", &json!({"layer": a.0, "visible": true})).unwrap();
-    h.run_steps(2);
     click_eye(&mut h, "Row C");
-    assert!(visible(&h, c) && visible(&h, a), "C was hidden, so both are shown");
+    assert!(visible(&h, c), "a second click shows C again");
 }
 
 #[test]
@@ -116,7 +112,7 @@ fn the_eye_of_an_unselected_row_acts_on_its_own_layer_and_keeps_the_selection() 
 }
 
 #[test]
-fn ctrl_a_over_the_layers_panel_selects_every_layer_including_collapsed_folders() {
+fn ctrl_a_over_the_layers_panel_selects_every_shown_row_but_not_the_layers_in_a_collapsed_folder() {
     let (mut h, [a, b, c, d]) = harness();
     let session = &mut h.state_mut().session;
     let folder = LayerId(execute(session, "layer.add.group", &json!(null)).unwrap()["layer"].as_u64().unwrap());
@@ -132,11 +128,12 @@ fn ctrl_a_over_the_layers_panel_selects_every_layer_including_collapsed_folders(
     h.key_press_modifiers(Modifiers::COMMAND, Key::A);
     h.run_steps(3);
     let session = &h.state().session;
-    let every_row = texturecraft_engine::layer_selection::stack_rows(&session.doc.project, 0, false);
-    for layer in [a, b, c, d, folder] {
+    let every_row = texturecraft_engine::layer_selection::stack_rows(&session.doc.project, 0, true);
+    for layer in [c, d, folder] {
         assert!(session.is_layer_selected(layer), "layer {} is selected", layer.0);
     }
-    assert_eq!(session.selected_layers().len(), every_row.len(), "every row of the set is selected, the collapsed folder's layers too");
+    assert_eq!(session.selected_layers().len(), every_row.len(), "every shown row is selected");
+    assert!(!session.is_layer_selected(a) && !session.is_layer_selected(b), "the collapsed folder's layers are not");
     assert_eq!(h.state().session.selected_layer(), Some(d), "the active layer stays");
 }
 

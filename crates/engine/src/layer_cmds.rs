@@ -33,7 +33,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select layer",
             [],
             None,
-            "{layer, target?: content|mask|<effect id>} | {layer, toggle: true} (Ctrl+click: add or take out one layer) | {layer, range: true} (Shift+click: the rows from the last clicked layer) | {all: true} (Ctrl+A: every layer of the active texture set, folder contents included) | {layers: [id], layer?} (select several; `layer` is the active one)",
+            "{layer, target?: content|mask|<effect id>} | {layer, toggle: true} (Ctrl+click: add or take out one layer) | {layer, range: true} (Shift+click: the rows from the last clicked layer) | {all: true} (Ctrl+A: every shown row of the active texture set, folder rows and the layers of open folders included) | {layers: [id], layer?} (select several; `layer` is the active one)",
             always,
             select
         ),
@@ -177,12 +177,17 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
     let (ts, _, _) = s.doc.project.locate(first).ok_or(EngineError::Other("layer not in a stack".into()))?;
     let src = s.doc.clone();
     let copies = s.edit("Duplicate layer", |s| {
+        // One block of copies directly above the topmost selected layer, at its level, in stack
+        // order (also the copy of a layer from inside a folder): the lowest goes in first, each
+        // next one above it
         let mut copies = Vec::new();
-        for id in &ids {
-            let new = crate::layer_ops::copy_tree(&src, *id, &mut s.doc, ts, Some(*id), false, 0)?;
+        let mut above = first;
+        for id in ids.iter().rev() {
+            let new = crate::layer_ops::copy_tree(&src, *id, &mut s.doc, ts, Some(above), false, 0)?;
             let name = format!("{} copy", src.project.layer(*id)?.name);
             s.doc.project.layer_mut(new)?.name = name;
-            copies.push(new);
+            copies.insert(0, new);
+            above = new;
         }
         Ok(copies)
     })?;
@@ -196,7 +201,7 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
 fn group(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = batch_param(s, "layer.group", p, true)?;
     let g = s.edit("Group layers", |s| {
-        // The folder takes the top layer's place; the others follow it in, keeping their order
+        // The folder takes the top layer's place and parent; the others follow it in, in stack order
         let id = ids.first().copied().ok_or_else(|| bad("layer.group", "no layer to group"))?;
         let (ts, _, _) = s.doc.project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
         let gid = s.doc.project.alloc_id();
@@ -236,7 +241,7 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
         let active = crate::layer_selection::extend(s, ts, id, range);
         s.target = StackTarget::Content;
         s.revision = s.revision.wrapping_add(1);
-        return Ok(json!({ "layer": active.0, "textureSet": ts, "layers": ids_json(&s.selected_layers()) }));
+        return Ok(json!({ "layer": active.map(|active| active.0), "textureSet": ts, "layers": ids_json(&s.selected_layers()) }));
     }
 
     s.active_set = ts;

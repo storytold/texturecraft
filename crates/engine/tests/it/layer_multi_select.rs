@@ -80,7 +80,13 @@ fn ctrl_click_adds_and_takes_out_one_layer() {
     assert_eq!(selected(&s), ["A"], "a second Ctrl+click takes the layer out");
     assert_eq!(s.selected_layer(), Some(a), "the remaining layer becomes the active one");
     click(&mut s, a, "ctrl");
-    assert_eq!(selected(&s), ["A"], "the last selected layer stays selected");
+    assert!(selected(&s).is_empty(), "Ctrl+click on the only selected layer leaves an empty selection");
+    assert_eq!(s.selected_layer(), None);
+    // The next Shift+click has no anchor and starts over at the clicked layer
+    click(&mut s, c, "shift");
+    assert_eq!(selected(&s), ["C"]);
+    click(&mut s, a, "ctrl");
+    assert_eq!(selected(&s), ["C", "A"]);
 }
 
 #[test]
@@ -154,16 +160,44 @@ fn a_folder_and_its_own_layer_selected_remove_together() {
 }
 
 #[test]
-fn duplicate_copies_every_selected_layer_above_itself() {
+fn duplicate_puts_the_copies_in_one_block_above_the_topmost_selected_layer() {
     let mut s = session();
     let [_, b, _, d] = four(&mut s);
     execute(&mut s, "layer.select", &json!({"layers": [d.0, b.0], "layer": b.0})).unwrap();
     execute(&mut s, "layer.duplicate", &Value::Null).unwrap();
-    assert_eq!(rows(&s)[..6], ["D copy", "D", "C", "B copy", "B", "A"]);
+    assert_eq!(rows(&s)[..6], ["D copy", "B copy", "D", "C", "B", "A"], "the block sits directly above D, in stack order");
     assert_eq!(selected(&s), ["D copy", "B copy"], "the copies are selected");
     assert_eq!(names(&s, &[s.selected_layer().unwrap()]), ["B copy"], "the active layer's copy is the active one");
     s.undo().unwrap();
     assert_eq!(rows(&s)[..4], ["D", "C", "B", "A"]);
+}
+
+#[test]
+fn duplicate_block_lands_at_the_topmost_layers_level_also_for_a_layer_from_a_folder() {
+    let mut s = session();
+    let [a, _, c, _] = four(&mut s);
+    let folder = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
+    execute(&mut s, "layer.move", &json!({"layers": [a.0], "above": folder.0, "inside": true})).unwrap();
+    assert_eq!(rows(&s)[..5], ["Folder 1", "A", "D", "C", "B"]);
+    // The topmost selected row is A, inside the folder, so the block goes there
+    execute(&mut s, "layer.select", &json!({"layers": [c.0, a.0]})).unwrap();
+    execute(&mut s, "layer.duplicate", &Value::Null).unwrap();
+    assert_eq!(rows(&s)[..7], ["Folder 1", "A copy", "C copy", "A", "D", "C", "B"]);
+    assert_eq!(selected(&s), ["A copy", "C copy"], "the copies are the selection");
+}
+
+#[test]
+fn duplicate_of_a_root_layer_and_a_folder_layer_with_the_root_one_higher() {
+    let mut s = session();
+    let [a, b, _, d] = four(&mut s);
+    let folder = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
+    execute(&mut s, "layer.move", &json!({"layers": [a.0], "above": folder.0, "inside": true})).unwrap();
+    execute(&mut s, "layer.move", &json!({"layers": [folder.0], "above": b.0})).unwrap();
+    // Rows from the top: D, C, Folder 1 (A), B... select D (root, topmost) and A (in the folder)
+    assert_eq!(rows(&s)[..5], ["D", "C", "Folder 1", "A", "B"]);
+    execute(&mut s, "layer.select", &json!({"layers": [d.0, a.0]})).unwrap();
+    execute(&mut s, "layer.duplicate", &Value::Null).unwrap();
+    assert_eq!(rows(&s)[..4], ["D copy", "A copy", "D", "C"], "the block is at the root, above D");
 }
 
 #[test]
@@ -227,30 +261,83 @@ fn group_of_a_layer_inside_a_folder_and_one_outside_keeps_the_topmost_place() {
 }
 
 #[test]
-fn select_all_takes_every_layer_of_the_set_with_folder_contents() {
+fn group_with_the_topmost_layer_at_the_root_takes_the_folder_layer_out_of_its_folder() {
+    let mut s = session();
+    execute(&mut s, "textureSet.select", &json!({"ts": 0})).unwrap();
+    let [x, fa, fb] = ["X", "Fill A", "Fill B"].map(|n| add(&mut s, n));
+    let outer = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
+    execute(&mut s, "layer.move", &json!({"layers": [fa.0, fb.0], "above": outer.0, "inside": true})).unwrap();
+    // Folder 1 (Fill B, Fill A) at the root above X; add Fill 3 above the folder
+    let f3 = add(&mut s, "Fill 3");
+    execute(&mut s, "layer.move", &json!({"layers": [f3.0], "above": outer.0})).unwrap();
+    assert_eq!(rows(&s)[..5], ["Fill 3", "Folder 1", "Fill B", "Fill A", "X"]);
+    execute(&mut s, "layer.select", &json!({"layers": [f3.0, fa.0]})).unwrap();
+    let folder = id(execute(&mut s, "layer.group", &Value::Null).unwrap(), "layer");
+    assert_eq!(rows(&s)[..6], ["Folder 2", "Fill 3", "Fill A", "Folder 1", "Fill B", "X"], "the new folder is at the root slot of Fill 3");
+    assert_eq!(s.doc.project.layer(folder).unwrap().children(), [fa, f3], "stack order inside: the folder's own layer is lower");
+    assert_eq!(s.doc.project.layer(outer).unwrap().children(), [fb], "Fill A left its folder");
+    let _ = x;
+}
+
+#[test]
+fn shift_range_counts_the_folder_row_and_skips_the_layers_of_a_collapsed_folder() {
+    let mut s = session();
+    let [a, b, c, d] = four(&mut s);
+    let folder = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
+    execute(&mut s, "layer.move", &json!({"layers": [b.0, c.0], "above": folder.0, "inside": true})).unwrap();
+    // Rows from the top: Folder 1 (C, B), D, A... move the folder between D and A
+    execute(&mut s, "layer.move", &json!({"layers": [folder.0], "above": a.0})).unwrap();
+    assert_eq!(rows(&s)[..5], ["D", "Folder 1", "C", "B", "A"]);
+
+    click(&mut s, d, "plain");
+    click(&mut s, a, "shift");
+    assert_eq!(selected(&s), ["D", "Folder 1", "C", "B", "A"], "an open folder: the row and its layers");
+
+    if let LayerKind::Group { collapsed, .. } = &mut s.doc.project.layer_mut(folder).unwrap().kind {
+        *collapsed = true;
+    }
+    click(&mut s, d, "plain");
+    click(&mut s, a, "shift");
+    assert_eq!(selected(&s), ["D", "Folder 1", "A"], "a collapsed folder: the row, not its layers");
+}
+
+#[test]
+fn select_all_takes_the_folder_rows_and_the_layers_of_open_folders_only() {
     let mut s = session();
     let [a, b, c, d] = four(&mut s);
     let folder = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
     execute(&mut s, "layer.move", &json!({"layers": [a.0, b.0], "above": folder.0, "inside": true})).unwrap();
+    click(&mut s, c, "plain");
+    let depth = s.history_labels().len();
+
+    // Open folder: the folder row and its layers
+    let r = execute(&mut s, "layer.select", &json!({"all": true})).unwrap();
+    let shown = stack_rows(&s.doc.project, 0, true);
+    assert_eq!(selected(&s)[..5], ["Folder 1", "B", "A", "D", "C"]);
+    assert_eq!(s.selected_layers(), shown, "every row of the set");
+    assert_eq!(r["layers"].as_array().unwrap().len(), shown.len());
+    assert_eq!(s.selected_layer(), Some(c), "the active layer stays");
+    assert_eq!(s.history_labels().len(), depth, "selecting is no undo step");
+
+    // Collapsed folder: the folder row, not its layers
     if let LayerKind::Group { collapsed, .. } = &mut s.doc.project.layer_mut(folder).unwrap().kind {
         *collapsed = true;
     }
-    click(&mut s, c, "plain");
-    let depth = s.history_labels().len();
-    let r = execute(&mut s, "layer.select", &json!({"all": true})).unwrap();
-    // The set also holds the project's own first layer at the bottom
-    assert_eq!(selected(&s)[..5], ["Folder 1", "B", "A", "D", "C"]);
-    let every_row = stack_rows(&s.doc.project, 0, false);
-    assert_eq!(s.selected_layers(), every_row, "every row of the set, folder contents included");
-    assert_eq!(r["layers"].as_array().unwrap().len(), every_row.len());
-    assert_eq!(s.selected_layer(), Some(c), "the active layer stays");
-    assert_eq!(s.history_labels().len(), depth, "selecting is no undo step");
-    assert!(s.is_layer_selected(a) && s.is_layer_selected(d));
-
-    // The active layer stays when it is picked again
     execute(&mut s, "layer.select", &json!({"layer": d.0})).unwrap();
     execute(&mut s, "layer.select", &json!({"all": true})).unwrap();
+    assert_eq!(selected(&s)[..3], ["Folder 1", "D", "C"]);
+    assert!(!s.is_layer_selected(a) && !s.is_layer_selected(b), "the collapsed folder's layers stay unselected");
     assert_eq!(s.selected_layer(), Some(d), "the active layer stays when it is picked again");
+}
+
+#[test]
+fn the_visibility_of_one_layer_leaves_the_other_selected_layers_alone() {
+    let mut s = session();
+    let [a, _, c, _] = four(&mut s);
+    execute(&mut s, "layer.select", &json!({"layers": [a.0, c.0]})).unwrap();
+    execute(&mut s, "layer.visible", &json!({"layer": c.0})).unwrap();
+    assert!(!s.doc.project.layer(c).unwrap().visible && s.doc.project.layer(a).unwrap().visible, "only C is hidden");
+    assert_eq!(s.selected_layers().len(), 2, "the selection stays");
 }
 
 #[test]

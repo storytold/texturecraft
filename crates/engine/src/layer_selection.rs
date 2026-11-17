@@ -113,14 +113,14 @@ fn push_rows(project: &Project, list: &[LayerId], expanded_only: bool, depth: us
 }
 
 /// `layer.select` with `toggle` (Ctrl/Cmd+click) or `range` (Shift+click) on `id` of texture set
-/// `ts`. Returns the layer that becomes the active one.
+/// `ts`. Returns the layer that becomes the active one (none when nothing stays selected).
 ///
 /// A range covers the rows shown between the anchor and `id` (a collapsed folder's layers are
 /// not shown, so they are not selected); `id` becomes active and the anchor stays. A toggle adds
 /// `id` and makes it the active layer and the anchor, or takes it out when it was selected (the
 /// active layer and the anchor stay, or the last picked layer takes their place when it was them);
-/// the last selected layer is never taken out, so a layer stays selected.
-pub(crate) fn extend(s: &mut Session, ts: usize, id: LayerId, range: bool) -> LayerId {
+/// taking out the only selected layer leaves an empty selection.
+pub(crate) fn extend(s: &mut Session, ts: usize, id: LayerId, range: bool) -> Option<LayerId> {
     let current = s.selection_in(ts);
     let anchor = s.multi_in(ts).map(|multi| multi.anchor).filter(|anchor| current.contains(anchor)).or_else(|| s.active_in(ts));
     if range {
@@ -134,23 +134,25 @@ pub(crate) fn extend(s: &mut Session, ts: usize, id: LayerId, range: bool) -> La
             // Nothing to range from (or it is hidden in a collapsed folder): start over at `id`
             None => s.select_several(ts, id, id, vec![id]),
         }
-        return id;
+        return Some(id);
     }
 
     let mut layers = current;
     if layers.contains(&id) {
-        if layers.len() > 1 {
-            layers.retain(|layer| *layer != id);
-        }
-        let last = layers.last().copied().unwrap_or(id);
+        layers.retain(|layer| *layer != id);
+        // Taking out the only selected layer leaves nothing selected
+        let Some(last) = layers.last().copied() else {
+            s.select_none(ts);
+            return None;
+        };
         let kept = |layer: Option<LayerId>| layer.filter(|layer| layers.contains(layer)).unwrap_or(last);
         let (active, anchor) = (kept(s.active_in(ts)), kept(anchor));
         s.select_several(ts, active, anchor, layers);
-        active
+        Some(active)
     } else {
         layers.push(id);
         s.select_several(ts, id, id, layers);
-        id
+        Some(id)
     }
 }
 
@@ -176,17 +178,17 @@ pub(crate) fn select_list(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "layer": active.0, "textureSet": ts, "layers": ids_json(&s.selected_layers()) }))
 }
 
-/// `layer.select {all: true}` (Ctrl/Cmd+A in the Layers panel): every layer of the active texture
-/// set, folder contents included whether the folder is open or collapsed. The active layer and
-/// the Shift+click anchor stay when they are in the set, else the top row takes their place. An
-/// empty stack changes nothing.
+/// `layer.select {all: true}` (Ctrl/Cmd+A in the Layers panel): every row shown in the active
+/// texture set: the folder rows and the layers inside open folders, but not the layers inside
+/// collapsed ones. The active layer and the Shift+click anchor stay when they are among them,
+/// else the top row takes their place. An empty stack changes nothing.
 pub(crate) fn select_all(s: &mut Session) -> Result<Value> {
     let ts = s.ts();
-    let rows = stack_rows(&s.doc.project, ts, false);
+    let rows = stack_rows(&s.doc.project, ts, true);
     let Some(top) = rows.first().copied() else {
         return Ok(json!({ "layer": Value::Null, "textureSet": ts, "layers": [] }));
     };
-    let active = s.active_in(ts).unwrap_or(top);
+    let active = s.active_in(ts).filter(|active| rows.contains(active)).unwrap_or(top);
     let anchor = s.multi_in(ts).map(|multi| multi.anchor).filter(|anchor| rows.contains(anchor)).unwrap_or(active);
     s.select_several(ts, active, anchor, rows);
     s.target = StackTarget::Content;

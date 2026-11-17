@@ -21,9 +21,13 @@ layer clipboard, and `effect.paste {layer?, target?}` adds it to another layer's
 `layer.select {layers: [id], layer?}` selects several layers of one texture set at once (`layer`
 is the active one), and `{layer, range: true}` / `{layer, toggle: true}` do what Shift+click and
 Ctrl+click do in the Layers panel. `layer.select {all: true}` (Ctrl+A with the pointer over the
-Layers panel) selects every layer of the active texture set, folder contents included. With
-`layers`, `layer.visible {layers, layer}` gives every listed layer the opposite of `layer`'s
-visibility (the row whose eye was clicked). Without `layer`, `layer.remove`, `layer.duplicate`,
+Layers panel) selects every shown row of the active texture set: the folder rows and the layers
+of open folders, not the layers of collapsed ones. `{layer, toggle: true}` on the only selected
+layer leaves nothing selected. `layer.visible {layers, layer}` gives every listed layer the
+opposite of `layer`'s visibility (the Layers panel's eye uses `{layer}` and acts on that layer
+only). `layer.group` puts the new folder at the place and in the folder of the topmost selected
+layer, the others in stack order; `layer.duplicate` puts the copies in one block above the
+topmost selected layer. Without `layer`, `layer.remove`, `layer.duplicate`,
 `layer.group` and `layer.visible` act on every selected layer; each of them and `layer.move
 {layers, above | index}` also take an explicit `layers` list. `session.inspect` lists the
 selection as `selectedLayers` (top row first).
