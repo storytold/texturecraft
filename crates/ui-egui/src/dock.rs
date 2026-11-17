@@ -295,9 +295,11 @@ const ROW_CONTROL_GAP: f32 = 4.0;
 const ROW_LEFT_PADDING: f32 = 7.0;
 const ROW_RIGHT_PADDING: f32 = 6.0;
 /// Width of the selected row's accent edge.
-const SELECTED_EDGE_WIDTH: f32 = 4.0;
+const SELECTED_EDGE_WIDTH: f32 = 3.0;
+/// The same edge on a layer row, wide enough to read on a dense display.
+const SELECTED_LAYER_EDGE_WIDTH: f32 = 4.0;
 /// How far the active layer's fill moves from the plain selected shade to the accent tint.
-const SELECTED_LAYER_TINT: f32 = 0.6;
+const SELECTED_LAYER_TINT: f32 = 0.4;
 /// The chip behind a visible layer's eye: its inset from the eye's hit area and its rounding.
 const EYE_CHIP_INSET: f32 = 1.0;
 const EYE_CHIP_ROUNDING: f32 = 4.0;
@@ -329,6 +331,8 @@ const OPACITY_DRAG_SPEED: f64 = 0.5;
 /// A layer row's eye: its hit area, its glyph size and the column it sits in.
 const LAYER_EYE_SIZE: f32 = 18.0;
 const LAYER_EYE_FONT_SIZE: f32 = 14.0;
+/// The wand on a mask thumbnail that has effects.
+const LAYER_WAND_FONT_SIZE: f32 = 13.0;
 const LAYER_EYE_COLUMN_WIDTH: f32 = 20.0;
 /// A folder's caret: its size (the space it takes before the thumbnail) and its center from where it starts.
 const FOLDER_CARET_SIZE: f32 = 14.0;
@@ -496,10 +500,10 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         painter.hline(x..=x + INDENT * 0.5, rect.center().y, line);
     }
     if selected {
-        painter.rect_filled(Rect::from_min_size(rect.min, vec2(SELECTED_EDGE_WIDTH, row_height)), 0.0, tokens.accent);
+        painter.rect_filled(Rect::from_min_size(rect.min, vec2(SELECTED_LAYER_EDGE_WIDTH, row_height)), 0.0, tokens.accent);
     }
     if let Some(tag) = layer.color_tag.and_then(|tag| TAG_COLORS.get(tag as usize)) {
-        painter.rect_filled(Rect::from_min_size(rect.min + vec2(SELECTED_EDGE_WIDTH, 0.0), vec2(TAG_WIDTH, row_height)), 0.0, *tag);
+        painter.rect_filled(Rect::from_min_size(rect.min + vec2(SELECTED_LAYER_EDGE_WIDTH, 0.0), vec2(TAG_WIDTH, row_height)), 0.0, *tag);
     }
 
     // The eye
@@ -573,7 +577,7 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
             let white = mask.background == texturecraft_engine::core::MaskBackground::White;
             painter.rect_filled(mask_rect, THUMBNAIL_ROUNDING, Color32::from_gray(if white { WHITE_MASK_GRAY } else { BLACK_MASK_GRAY }));
             if !mask.effects.is_empty() {
-                painter.text(mask_rect.center(), egui::Align2::CENTER_CENTER, ic::MAGIC_WAND, egui::FontId::proportional(LAYER_EYE_FONT_SIZE), tokens.text_dim);
+                painter.text(mask_rect.center(), egui::Align2::CENTER_CENTER, ic::MAGIC_WAND, egui::FontId::proportional(LAYER_WAND_FONT_SIZE), tokens.text_dim);
             }
         }
         painter.rect_stroke(mask_rect, THUMBNAIL_ROUNDING, target_stroke(&tokens, mask_target), egui::StrokeKind::Outside);
