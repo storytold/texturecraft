@@ -71,7 +71,7 @@ craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd
 craft-materialx = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585" }
 craft-tcraft = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
 # Isolated aligned writer; existing archive readers retain their pin and behavior.
-craft-zip-usdz = { package = "craft-zip", git = "https://github.com/storytold/craft-libs", rev = "6128eabbfb98e5fe486fa7ee4413724e2a4ca908" }
+craft-zip-usdz = { package = "craft-zip", git = "https://github.com/storytold/craft-libs", rev = "5631e99fe126cffb74c673eb458db04299f2bb9b" }
 craft-zip = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
 craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "b952ca0231867c8ad6749ac44cab5fc903c3ad52", default-features = false, features = ["stl", "ply", "fbx", "obj"] }
 craft-mcmat = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
