@@ -126,10 +126,15 @@ mod tests {
 
     #[test]
     fn the_tile_number_goes_before_the_png_extension() {
-        let name = |path: &str, tile| file_path(path, tile).display().to_string();
-        assert_eq!(name("/a/mask.png", None), "/a/mask.png");
-        assert_eq!(name("/a/mask", None), "/a/mask.png");
-        assert_eq!(name("/a/mask.PNG", Some(1002)), "/a/mask.1002.png");
-        assert_eq!(name("/a/skin.v2", Some(1001)), "/a/skin.v2.1001.png");
+        // Compared as paths: Windows writes the folder with backslashes.
+        let name = |path: &str, tile| {
+            let file = file_path(path, tile);
+            assert_eq!(file.parent(), std::path::Path::new(path).parent(), "the folder is kept");
+            file.file_name().unwrap().to_string_lossy().into_owned()
+        };
+        assert_eq!(name("/a/mask.png", None), "mask.png");
+        assert_eq!(name("/a/mask", None), "mask.png");
+        assert_eq!(name("/a/mask.PNG", Some(1002)), "mask.1002.png");
+        assert_eq!(name("/a/skin.v2", Some(1001)), "skin.v2.1001.png");
     }
 }
