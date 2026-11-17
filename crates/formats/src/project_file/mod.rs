@@ -23,7 +23,7 @@ use std::io::{Cursor, Read, Seek, Write};
 use std::sync::Arc;
 
 use texturecraft_compose::{BakedMaps, PixelStore};
-use texturecraft_core::{BakePaintTarget, Channel, FORMAT_VERSION, LayerId, Project};
+use texturecraft_core::{BakePaintTarget, BakedMap, Channel, FORMAT_VERSION, LayerId, Project, TANGENT_BENT_NORMAL_VERSION};
 use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -466,6 +466,9 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
         // Ignore other entries from newer minor revisions
     }
 
+    if version < TANGENT_BENT_NORMAL_VERSION {
+        drop_world_space_bent_normals(&mut pf);
+    }
     pf.project.format_version = FORMAT_VERSION;
 
     if recovered {
@@ -475,6 +478,26 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
     }
 
     Ok(pf)
+}
+
+/// Older files hold bent normal maps in world space, which every reader now takes as tangent
+/// space: drop them (the bake settings stay) and ask for a re-bake.
+fn drop_world_space_bent_normals(pf: &mut ProjectFile) {
+    // Pixels and declaration go for every set, either one alone is enough to name the set in the warning
+    let mut names = Vec::new();
+    for (i, set) in pf.project.texture_sets.iter_mut().enumerate() {
+        let had_pixels = pf.baked.get_mut(&i).is_some_and(|maps| maps.maps.remove(&BakedMap::BentNormal).is_some());
+        if set.baked.remove(&BakedMap::BentNormal) || had_pixels {
+            names.push(format!("\"{}\"", set.name));
+        }
+    }
+    pf.baked.retain(|_, maps| !maps.maps.is_empty());
+    if !names.is_empty() {
+        pf.warnings.push(format!(
+            "Warning: This project was saved with bent normal maps in world space. TextureCraft now bakes them in tangent space and removed the old ones from texture set {}. Bake the Bent Normals map again, or set its image again if it came from a file.",
+            names.join(", ")
+        ));
+    }
 }
 
 #[cfg(test)]

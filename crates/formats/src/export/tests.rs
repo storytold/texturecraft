@@ -205,6 +205,36 @@ fn ao_mixes_baked_and_channel() {
 }
 
 #[test]
+fn mesh_maps_write_tangent_normals_with_the_green_of_the_project_format() {
+    let green = |fx: &Fx, opts: &ExportOptions, name: &str| {
+        let files = render_maps(&fx.input(), opts).unwrap();
+        decode(find(&files, name)).to_rgb16().get_pixel(3, 3)[1] as i32
+    };
+    let mut fx = Fx::new(&default_channels());
+    let stored = |v: f32| std::sync::Arc::new([0.5, v, 0.5].repeat((RES * RES) as usize));
+    fx.baked = BakedMaps { resolution: RES, maps: [(BakedMap::BentNormal, stored(0.25)), (BakedMap::Normal, stored(0.25))].into() };
+    fx.project.texture_sets[0].baked.extend([BakedMap::BentNormal, BakedMap::Normal]);
+    let opts = ExportOptions::new(builtin_preset("Mesh maps").unwrap());
+    let quarter = (0.25f32 * 65535.0).round() as i32;
+    let three_quarters = (0.75f32 * 65535.0).round() as i32;
+    for name in ["_bentNormal.png", "_normal.png"] {
+        assert!((green(&fx, &opts, name) - quarter).abs() <= 1, "{name}: OpenGL project keeps the stored green");
+    }
+    fx.project.normal_format = NormalFormat::DirectX;
+    for name in ["_bentNormal.png", "_normal.png"] {
+        assert!((green(&fx, &opts, name) - three_quarters).abs() <= 1, "{name}: DirectX project flips green");
+    }
+    // The export's own format wins over the project's
+    let mut gl = opts.clone();
+    gl.normal_format = Some(NormalFormat::OpenGl);
+    assert!((green(&fx, &gl, "_bentNormal.png") - quarter).abs() <= 1);
+    fx.project.normal_format = NormalFormat::OpenGl;
+    let mut dx = opts.clone();
+    dx.normal_format = Some(NormalFormat::DirectX);
+    assert!((green(&fx, &dx, "_bentNormal.png") - three_quarters).abs() <= 1, "a DirectX export of an OpenGL project flips green");
+}
+
+#[test]
 fn templates_are_sanitized_and_collisions_suffixed() {
     let fx = Fx::new(&default_channels());
     let rough = |file: &str| MapSpec {

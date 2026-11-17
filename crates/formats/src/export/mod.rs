@@ -675,7 +675,15 @@ impl Sampler<'_> {
                     [if self.set.ao_mixing == AoMixing::Multiply { ch * baked } else { ch }; 3]
                 }
             },
-            SourceRef::Baked { map, .. } => self.baked(*map, at),
+            SourceRef::Baked { map, .. } => {
+                let v = self.baked(*map, at);
+                // Tangent-space maps are stored with OpenGL green, like the normal map: write the format of the export
+                if matches!(map, BakedMap::Normal | BakedMap::BentNormal) && self.normal_override.unwrap_or(self.project_normal) == NormalFormat::DirectX {
+                    [v[0], 1.0 - v[1], v[2]]
+                } else {
+                    v
+                }
+            }
         };
         v.get(k).copied().unwrap_or(0.0)
     }

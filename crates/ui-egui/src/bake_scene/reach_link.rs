@@ -64,7 +64,11 @@ impl ReachLink {
             .enumerate()
             .map(|(texture_set, set)| Some((CageShellKey::of(session, texture_set)?, set.bake.high_poly.clone())))
             .collect();
+
         if keys != self.keys || high_id != self.high_id {
+            // The GPU keeps displayed colors; stale CPU arrays need not overlap the rebuild
+            self.reach.clear();
+
             let inputs: Vec<_> = (0..set_count).map(|texture_set| session.bake_cage_inputs(texture_set).ok().flatten()).collect();
             self.job = Some(crate::spawn_worker("texturecraft-bake-reach", move || {
                 inputs.iter().map(|inputs| inputs.as_ref().and_then(|inputs| inputs.high_poly_reach().ok())).collect()
@@ -100,7 +104,30 @@ mod tests {
     use texturecraft_engine::geom::primitives;
 
     #[test]
+    fn rebuilding_reach_releases_previous_vertex_arrays_before_starting_work() {
+        const PREVIOUS_SET_COUNT: usize = 2;
+        const PREVIOUS_VERTEX_COUNT: usize = 64;
+
+        let mut session = Session::new_project("Reach", primitives::plane(1.0, 1), "plane", None, 128).unwrap();
+        session.add_high_poly_bytes("high.obj", b"v 0 0.1 0\nv 0.1 0.1 0\nv 0 0.1 0.1\nf 1 2 3\n".to_vec()).unwrap();
+        let mut link = ReachLink {
+            reach: (0..PREVIOUS_SET_COUNT).map(|_| Some(HighPolyReach { vertices: vec![None; PREVIOUS_VERTEX_COUNT], ..Default::default() })).collect(),
+            ..Default::default()
+        };
+        let mut out = SceneSync::default();
+
+        link.sync(&session, 1, None, &mut out);
+
+        let retained_slots: usize = link.reach.iter().flatten().map(|reach| reach.vertices.capacity()).sum();
+        assert_eq!(retained_slots, 0, "obsolete CPU arrays must not overlap their replacements");
+        assert!(out.bake_high_missed.is_none(), "the GPU keeps its displayed colors until the replacement arrives");
+    }
+
+    #[test]
     fn input_changes_wait_for_the_running_reach_then_use_the_latest_inputs() {
+        const WAIT_FRAMES: usize = 2000;
+        const WAIT_FRAME_PAUSE: Duration = Duration::from_millis(5);
+
         let mut session = Session::new_project("Reach", primitives::plane(1.0, 1), "plane", None, 128).unwrap();
         session.add_high_poly_bytes("high.obj", b"v 0 0.1 0\nv 0.1 0.1 0\nv 0 0.1 0.1\nf 1 2 3\n".to_vec()).unwrap();
         let (sender, receiver) = mpsc::channel();
@@ -113,6 +140,7 @@ mod tests {
             link.sync(&session, 2, None, &mut out);
             assert!(out.bake_high_missed.is_none());
         }
+
         assert!(sender.send(Vec::new()).is_ok(), "input changes must keep the running job's receiver");
         link.poll();
 
@@ -123,13 +151,15 @@ mod tests {
         assert!(link.busy());
         assert!(out.bake_high_missed.is_none());
 
-        for _ in 0..2000 {
+        for _ in 0..WAIT_FRAMES {
             link.poll();
             if !link.busy() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+
+            std::thread::sleep(WAIT_FRAME_PAUSE);
         }
+
         assert!(!link.busy(), "the latest reach must finish");
         link.sync(&session, 2, None, &mut out);
         let (high_id, missed) = out.bake_high_missed.unwrap();

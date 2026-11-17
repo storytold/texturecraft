@@ -152,6 +152,10 @@ tile-resolution overrides. Older projects load their stored bake pixels as-is, w
 the old layout; their appearance may change until rebaked. Painted layers and cage/skew correction
 maps retain their working atlas layout.
 
+Project format version 3 stores baked bent normal maps in tangent space (OpenGL green, like the
+normal map). Version 2 and older files held them in world space: loading drops those maps, keeps
+the bake settings and warns that the Bent Normals map needs a re-bake.
+
 Loading runs `Project::validate`, refuses a newer `format_version` (`FormatError::NewerVersion`),
 checks every tile against its texture set's resolution and component count, rejects repeated or
 out-of-range tiles and trailing data, and drops pixels of layers that are in no stack. Total

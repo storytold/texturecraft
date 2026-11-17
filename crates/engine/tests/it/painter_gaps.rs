@@ -537,6 +537,23 @@ fn images_fill_mesh_map_slots() {
 }
 
 #[test]
+fn bent_normal_images_are_read_in_the_project_normal_format() {
+    use texturecraft_engine::core::BakedMap;
+    let mut s = session();
+    let image = s.import_resource_bytes("bent.png", png(2, 2, |_, _| [128, 64, 255, 255])).unwrap();
+    let sample = |s: &Session| s.baked(0).unwrap().sample(BakedMap::BentNormal, 50, 50, (100, 100)).unwrap();
+
+    execute(&mut s, "textureSet.meshMap.set", &json!({"map": "bentNormal", "image": image})).unwrap();
+    assert!((sample(&s)[1] - 64.0 / 255.0).abs() < 1e-3, "OpenGL: green as stored {:?}", sample(&s));
+
+    // A tangent-space map like the normal map: DirectX green flipped
+    execute(&mut s, "textureSet.settings", &json!({"normalFormat": "directX"})).unwrap();
+    execute(&mut s, "textureSet.meshMap.set", &json!({"map": "bentNormal", "image": image})).unwrap();
+    let v = sample(&s);
+    assert!((v[0] - 128.0 / 255.0).abs() < 1e-3 && (v[1] - (1.0 - 64.0 / 255.0)).abs() < 1e-3 && (v[2] - 1.0).abs() < 1e-3, "{v:?}");
+}
+
+#[test]
 fn fill_projection_edits_keep_what_they_do_not_change() {
     let mut s = session();
     let layer = id(execute(&mut s, "layer.add.fill", &json!({"color": [0.5, 0.2, 0.1]})).unwrap(), "layer");

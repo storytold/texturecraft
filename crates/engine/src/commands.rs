@@ -74,6 +74,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::bake::specs());
         v.extend(crate::bake_preview::specs());
         v.extend(crate::materialx_cmds::specs());
+        v.extend(crate::pbr_cmds::specs());
         v.extend(crate::file_cmds::specs());
         v.extend(crate::preset_cmds::specs());
         v.extend(crate::resource_cmds::specs());
@@ -219,7 +220,7 @@ pub(crate) fn color_of(v: &Value) -> Option<[f32; 3]> {
         Value::Number(n) => n.as_f64().map(|v| [v as f32; 3]).filter(|v| v[0].is_finite()),
         Value::String(s) => {
             let s = s.trim_start_matches('#');
-            if s.len() != 6 {
+            if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return None;
             }
             let c = |i: usize| u8::from_str_radix(s.get(i..i + 2)?, 16).ok().map(|v| texturecraft_texel::srgb_to_linear(v as f32 / 255.0));
@@ -274,5 +275,13 @@ mod tests {
 
         let overflow_scalar = json!({ "color": 1e40 });
         assert!(color_param("test.cmd", &overflow_scalar, "color").is_err());
+    }
+
+    #[test]
+    fn hex_color_rejects_signs_and_non_hex() {
+        assert_eq!(color_of(&json!("#+f+f+f")), None);
+        assert_eq!(color_of(&json!("#-00000")), None);
+        assert_eq!(color_of(&json!("#GGGGGG")), None);
+        assert!(color_of(&json!("#ff8000")).is_some());
     }
 }
