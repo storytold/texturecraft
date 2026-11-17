@@ -20,7 +20,15 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             frame
         ),
-        cmd!("viewport.frameSelection", "Frame texture set", ["Viewport"], Some("F"), "{} → the camera, framing the active texture set's geometry", always, |s, _| frame_target(s, FrameTarget::Selection)),
+        cmd!(
+            "viewport.frameSelection",
+            "Frame texture set",
+            ["Viewport"],
+            Some("F"),
+            "{} → the camera, framing the active texture set's geometry",
+            always,
+            |s, _| frame_target(s, FrameTarget::Selection)
+        ),
         cmd!("viewport.displayMaterial", "Display material", ["Viewport"], Some("M"), "{}", always, |s, _| set_view(s, ViewMode::Material)),
         cmd!("viewport.nextChannel", "Display next channel", ["Viewport"], Some("C"), "{}", always, |s, _| cycle_channel(s, 1)),
         cmd!("viewport.previousChannel", "Display previous channel", ["Viewport"], Some("Shift+C"), "{}", always, |s, _| cycle_channel(s, -1)),
