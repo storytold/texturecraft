@@ -6,6 +6,7 @@ mod bake_mode;
 mod brush_drag;
 mod brush_section_reset;
 mod close_unsaved;
+mod decal_drag_up;
 mod color_picker;
 mod color_selection_editor;
 mod curvature_generator;
