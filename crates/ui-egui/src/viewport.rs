@@ -581,14 +581,10 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
 
     if response.hovered() {
-        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+        let scroll = wheel_scroll(ui, shift);
         if scroll != 0.0 {
             if shift && app.ui.mode == crate::state::Mode::Painting {
-                // A tool that can't act keeps its size: its controls are hidden
-                if tool_acts(app) {
-                    let brush = &mut app.session.tool.brush;
-                    brush.size = (brush.size * (1.0 + scroll * WHEEL_BRUSH_SIZE_PER_POINT)).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
-                }
+                scale_brush_by_wheel(app, scroll);
             } else {
                 app.session.camera.zoom(scroll * WHEEL_ZOOM_PER_POINT);
             }
@@ -1608,11 +1604,29 @@ fn brush_tool(t: Tool) -> bool {
     matches!(t, Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Smudge | Tool::Clone | Tool::Path)
 }
 
+/// Wheel travel this frame in points. egui turns a Shift+wheel into a horizontal scroll, so with Shift held
+/// the travel arrives on x (on a mac the system already does this); the sum covers both.
+fn wheel_scroll(ui: &Ui, shift: bool) -> f32 {
+    ui.input(|input| {
+        let delta = input.smooth_scroll_delta;
+        if shift { delta.x + delta.y } else { delta.y }
+    })
+}
+
+/// Shift+wheel: scale the brush size. A tool that can't act keeps its size: its controls are hidden.
+fn scale_brush_by_wheel(app: &mut TextureCraftApp, scroll: f32) {
+    if tool_acts(app) {
+        let brush = &mut app.session.tool.brush;
+        brush.size = (brush.size * (1.0 + scroll * WHEEL_BRUSH_SIZE_PER_POINT)).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
+    }
+}
+
 /// Ctrl (Cmd on macOS) + drag changes the brush instead of painting: true while it applies (see `adjust_brush`)
 fn brush_drag(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response) -> bool {
     let held = tool_acts(app) && brush_tool(app.session.tool.tool) && !app.session.stroke_active() && ui.input(|input| input.modifiers.command);
     if held && let Some(right) = brush_drag_button(response) {
-        adjust_brush(&mut app.session.tool.brush, right, ui.input(|input| input.pointer.delta()));
+        let (delta, fine) = ui.input(|input| (input.pointer.delta(), input.modifiers.shift));
+        adjust_brush(&mut app.session.tool.brush, right, if fine { delta * CTRL_DRAG_FINE_FACTOR } else { delta });
     }
 
     held
@@ -1649,6 +1663,9 @@ fn brush_readout(app: &TextureCraftApp, ui: &Ui, response: &egui::Response, adju
     painter.rect_filled(readout_rect, 3.0, tokens.panel);
     painter.galley(readout_rect.min + vec2(6.0, 3.0), galley, tokens.text_strong);
 }
+
+/// Part of the change a Ctrl+drag makes while Shift is also held (fine mode)
+const CTRL_DRAG_FINE_FACTOR: f32 = 0.1;
 
 /// Size fraction, hardness and flow change per point of a Ctrl+drag
 const CTRL_DRAG_RATE_PER_POINT: f32 = 0.005;
@@ -1793,8 +1810,10 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         app.ui.uv_pan[1] -= delta.y / size.y * 2.0;
     }
     if response.hovered() {
-        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-        if scroll != 0.0 {
+        let scroll = wheel_scroll(ui, shift);
+        if scroll != 0.0 && shift && app.ui.mode == crate::state::Mode::Painting {
+            scale_brush_by_wheel(app, scroll);
+        } else if scroll != 0.0 {
             let old_zoom = app.ui.uv_zoom;
             let new_zoom = (old_zoom * (1.0 + scroll * UV_WHEEL_ZOOM_PER_POINT)).clamp(UV_VIEW_MIN_ZOOM, UV_VIEW_MAX_ZOOM);
             if let Some(hover_pos) = response.hover_pos() {

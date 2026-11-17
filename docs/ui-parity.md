@@ -107,8 +107,10 @@ built-in `udim_plane`, a uniform fill and a tile-1002 resolution override.
   cursor/painting reports on this setup.
 - Brush size/hardness and flow/angle gestures have a visible hint. Hardness is present under
   Flow and opacity; Angle has its own section. Their absence must not be inferred from the initial
-  scrolled position. The broader precision/shortcut concerns in
-  [#545](https://github.com/storytold/texturecraft/issues/545) still need an input-device task test.
+  scrolled position. The shortcut overview lists Shift+wheel (brush size, 3D and 2D view),
+  Ctrl+right-drag, Ctrl+left-drag and the fine mode (Shift held during the Ctrl+drag changes by a
+  tenth). Pen precision in [#545](https://github.com/storytold/texturecraft/issues/545) still needs an
+  input-device task test.
 - The shelf displayed four columns at the larger size, with type controls and search. Do not
   treat every older shelf-layout request as a currently missing implementation.
 - A missing mask-thumbnail menu does not mean mask effects are unavailable: the layer-name menu
