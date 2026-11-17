@@ -1288,9 +1288,20 @@ fn path_input(
     {
         let path = &app.session.tool.path;
         let (closed, len) = (path.closed, path.points.len());
-        let hit = path_hit(app, ui, (rect, uv), at, &show);
+
+        // Points live in one view's coordinates; a press in the other view keeps them and says why
+        let other_view = (len > 0 || path.editing.is_some()) && path.uv != uv;
+        let hit = if other_view { PathHit::Miss } else { path_hit(app, ui, (rect, uv), at, &show) };
 
         let grab = match hit {
+            _ if other_view => {
+                let hint =
+                    if path.uv { "Finish or cancel the path first; it is in the 2D view" } else { "Finish or cancel the path first; it is in the 3D view" };
+                if !app.toasts.iter().any(|t| t.text == tr(hint)) {
+                    app.toast(tr(hint), false);
+                }
+                None
+            }
             PathHit::Point(0) if clicked && !closed && len >= 3 => {
                 app.session.set_path_closed(true);
                 None
