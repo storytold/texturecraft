@@ -75,7 +75,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
     crate::id_color_pick::IdColorPick::end_when_stale(app);
     let tokens = Tokens::get(ui.ctx());
     let aux_view = match app.session.view {
-        _ if mode == crate::state::Mode::Painting && app.session.quick_mask.editing && app.picking_id_color.is_none() => Some(crate::gpu::AuxView::QuickMask),
+        _ if quick_mask_shown(app) => Some(crate::gpu::AuxView::QuickMask),
         ViewMode::MeshMap(map) => Some(crate::gpu::AuxView::MeshMap(map)),
         ViewMode::Mask(id) => Some(crate::gpu::AuxView::Mask(id)),
         _ if mode == crate::state::Mode::Baking && app.ui.bake_visualization.bent_normal_shown() => Some(crate::gpu::AuxView::MeshMap(BakedMap::BentNormal)),
@@ -269,7 +269,7 @@ const VIEW_MODE_UV_CHECKER: u32 = 3;
 
 fn shade(app: &TextureCraftApp) -> Shade {
     let (view_mode, channel) = match app.session.view {
-        _ if app.ui.mode == crate::state::Mode::Painting && app.session.quick_mask.editing && app.picking_id_color.is_none() => (VIEW_MODE_AUX_TEXTURE, 0),
+        _ if quick_mask_shown(app) => (VIEW_MODE_AUX_TEXTURE, 0),
         ViewMode::Material => (VIEW_MODE_MATERIAL, 0),
         ViewMode::Channel(selected_channel) => (VIEW_MODE_CHANNEL, selected_channel.index() as u32),
         ViewMode::MeshMap(_) | ViewMode::Mask(_) => (VIEW_MODE_AUX_TEXTURE, 0),
@@ -501,9 +501,22 @@ const MASK_BADGE_INSET: f32 = 14.0;
 /// Text size of the "Mask" label
 const MASK_BADGE_TEXT_SIZE: f32 = 15.0;
 
+/// Whether the quick mask replaces whatever view mode is chosen: editing it in Painting mode, unless picking an ID colour
+fn quick_mask_shown(app: &TextureCraftApp) -> bool {
+    app.ui.mode == crate::state::Mode::Painting && app.session.quick_mask.editing && app.picking_id_color.is_none()
+}
+
+/// The layer whose mask the view really displays: none while the quick mask takes over the view
+fn mask_view_layer(app: &TextureCraftApp) -> Option<texturecraft_engine::core::LayerId> {
+    match app.session.view {
+        ViewMode::Mask(layer) if !quick_mask_shown(app) => Some(layer),
+        _ => None,
+    }
+}
+
 /// The label that says a view shows one layer's mask alone and how to leave it
 fn mask_view_badge(app: &TextureCraftApp, ui: &Ui, rect: Rect) {
-    let ViewMode::Mask(layer) = app.session.view else { return };
+    let Some(layer) = mask_view_layer(app) else { return };
     let tk = Tokens::get(ui.ctx());
     let name = app.session.doc.project.layers.get(&layer).map(|layer| layer.name.as_str()).unwrap_or_default();
     let text = trf("MASK: {layer}", &[("layer", &name)]);
@@ -2155,6 +2168,23 @@ mod tests {
             finish_unavailable_tool_gestures(app, None);
             assert_eq!(app.session.history_labels().len(), history + 1, "cleanup records the gesture only once");
         }
+    }
+
+    #[test]
+    fn the_mask_label_hides_while_the_quick_mask_replaces_the_mask_view() {
+        use texturecraft_engine::{core::LayerId, geom::primitives};
+
+        let session = Session::new_project("t", primitives::plane(2.0, 4), "test", None, 128).unwrap();
+        let mut harness = egui_kittest::Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let app = harness.state_mut();
+        app.ui.mode = crate::state::Mode::Painting;
+        app.session.view = ViewMode::Mask(LayerId(7));
+        assert_eq!(mask_view_layer(app), Some(LayerId(7)));
+        app.session.quick_mask.editing = true;
+        assert!(quick_mask_shown(app));
+        assert_eq!(mask_view_layer(app), None, "the quick mask is on screen, not the layer mask");
+        app.session.quick_mask.editing = false;
+        assert_eq!(mask_view_layer(app), Some(LayerId(7)), "the label returns with the mask view");
     }
 
     #[test]
