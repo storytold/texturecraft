@@ -492,6 +492,30 @@ fn mesh_map_entries(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
 }
 
+/// Height above a view's bottom edge of the "Mask" label, clear of the axis gizmo
+const MASK_BADGE_RAISE: f32 = 70.0;
+
+/// Left inset of the "Mask" label
+const MASK_BADGE_INSET: f32 = 14.0;
+
+/// Text size of the "Mask" label
+const MASK_BADGE_TEXT_SIZE: f32 = 15.0;
+
+/// The label that says a view shows one layer's mask alone and how to leave it
+fn mask_view_badge(app: &TextureCraftApp, ui: &Ui, rect: Rect) {
+    let ViewMode::Mask(layer) = app.session.view else { return };
+    let tk = Tokens::get(ui.ctx());
+    let name = app.session.doc.project.layers.get(&layer).map(|layer| layer.name.as_str()).unwrap_or_default();
+    let text = trf("MASK: {layer} (M: back to the material)", &[("layer", name)]);
+    ui.painter_at(rect).text(
+        pos2(rect.left() + MASK_BADGE_INSET, rect.bottom() - MASK_BADGE_RAISE),
+        egui::Align2::LEFT_BOTTOM,
+        text,
+        egui::FontId::proportional(MASK_BADGE_TEXT_SIZE),
+        tk.viewport_accent,
+    );
+}
+
 fn axis_gizmo(ui: &Ui, rect: Rect, app: &TextureCraftApp, uv: bool) {
     let tk = Tokens::get(ui.ctx());
     let o = pos2(rect.left() + 28.0, rect.bottom() - 28.0);
@@ -846,6 +870,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         crate::bake_mode::bake_visualization_panel(app, ui, rect);
     }
     view_header(app, ui, rect, "v3d");
+    mask_view_badge(app, ui, rect);
     axis_gizmo(ui, rect, app, false);
 }
 
@@ -1970,6 +1995,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
     brush_readout(app, ui, &response, adjusting);
     view_header(app, ui, rect, "v2d");
+    mask_view_badge(app, ui, rect);
     axis_gizmo(ui, rect, app, true);
     let name = app.session.doc.project.texture_sets.get(texture_set_index).map(|texture_set| texture_set.name.clone()).unwrap_or_default();
     let name_position = rect.right_bottom() - SET_NAME_INSET;

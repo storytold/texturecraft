@@ -306,6 +306,17 @@ impl GpuLink {
                         self.aux.insert(texture_set, key);
                     }
                 }
+                // The other texture sets show nothing of this mask: a flat dark gray
+                let shown = session.doc.project.locate(id).map(|(texture_set, _, _)| texture_set);
+                for texture_set in (0..session.caches.len()).filter(|set| Some(*set) != shown) {
+                    let Some(cache) = session.caches.get(texture_set) else { continue };
+                    let key = ("maskblank".to_owned(), 0);
+                    if self.aux.get(&texture_set) != Some(&key) {
+                        let resolution = texturecraft_render::aux_size(cache.size);
+                        out.aux.push((texture_set, resolution, MASK_VIEW_BLANK.repeat((resolution * resolution) as usize)));
+                        self.aux.insert(texture_set, key);
+                    }
+                }
             }
             Some(AuxView::QuickMask) => {
                 for texture_set in 0..session.caches.len() {
@@ -349,6 +360,9 @@ fn record_recreated_uploads(recreated: &mut BTreeMap<usize, BTreeSet<DisplayKind
 
 /// Mask view resolution for a texture set without a composite cache
 const MASK_VIEW_FALLBACK_RESOLUTION: u32 = 1024;
+
+/// RGBA of the texel the other texture sets show in the mask view
+const MASK_VIEW_BLANK: [u8; 4] = [38, 38, 38, 255];
 
 /// Paint callback for one view.
 pub struct ViewCallback {

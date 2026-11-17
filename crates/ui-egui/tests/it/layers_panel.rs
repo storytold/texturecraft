@@ -120,3 +120,45 @@ fn deeply_nested_effect_visibility_is_reachable_in_a_narrow_panel() {
     let content = &h.state().session.doc.project.layers[&layer].content_effects;
     assert!(!content.iter().find(|effect| effect.name == "Effect A").unwrap().visible, "the compact eye toggles the effect instead of missing the panel");
 }
+
+fn alt_click(h: &mut Harness<'_, TextureCraftApp>, at: egui::Pos2) {
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::ALT));
+    h.hover_at(at);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::ALT });
+        h.run_steps(2);
+    }
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run_steps(3);
+}
+
+#[test]
+fn alt_click_on_a_mask_thumbnail_shows_that_mask_alone_without_changing_the_document() {
+    let (mut h, layer) = harness();
+    let history = h.state().session.history_labels().len();
+    let project = h.state().session.doc.project.clone();
+
+    let at = thumb(&h, "Masked fill", true);
+    click(&mut h, at);
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Material, "a plain click only selects");
+
+    alt_click(&mut h, at);
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Mask(layer));
+    let gray = h.state().session.mask_view_rgba(layer, 64).unwrap();
+    assert!(gray.chunks(4).all(|px| px[0] == px[1] && px[1] == px[2] && px[3] == 255), "the mask is shown in gray");
+    assert!(gray.chunks(4).any(|px| px[0] != gray[0]), "the position generator shapes the mask");
+    assert_eq!(h.state().session.history_labels().len(), history, "view only: no history step");
+    assert_eq!(h.state().session.doc.project, project, "view only: the project is unchanged");
+
+    execute(&mut h.state_mut().session, "viewport.displayMaterial", &Value::Null).unwrap();
+    h.run_steps(2);
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Material, "Display material (M) returns");
+}
+
+#[test]
+fn alt_click_on_the_content_thumbnail_leaves_the_view_alone() {
+    let (mut h, _) = harness();
+    let at = thumb(&h, "Masked fill", false);
+    alt_click(&mut h, at);
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Material);
+}
