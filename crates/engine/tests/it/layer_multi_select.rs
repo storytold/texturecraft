@@ -264,7 +264,7 @@ fn group_of_a_layer_inside_a_folder_and_one_outside_keeps_the_topmost_place() {
 fn group_with_the_topmost_layer_at_the_root_takes_the_folder_layer_out_of_its_folder() {
     let mut s = session();
     execute(&mut s, "textureSet.select", &json!({"ts": 0})).unwrap();
-    let [x, fa, fb] = ["X", "Fill A", "Fill B"].map(|n| add(&mut s, n));
+    let [_x, fa, fb] = ["X", "Fill A", "Fill B"].map(|n| add(&mut s, n));
     let outer = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
     execute(&mut s, "layer.move", &json!({"layers": [fa.0, fb.0], "above": outer.0, "inside": true})).unwrap();
     // Folder 1 (Fill B, Fill A) at the root above X; add Fill 3 above the folder
@@ -276,7 +276,6 @@ fn group_with_the_topmost_layer_at_the_root_takes_the_folder_layer_out_of_its_fo
     assert_eq!(rows(&s)[..6], ["Folder 2", "Fill 3", "Fill A", "Folder 1", "Fill B", "X"], "the new folder is at the root slot of Fill 3");
     assert_eq!(s.doc.project.layer(folder).unwrap().children(), [fa, f3], "stack order inside: the folder's own layer is lower");
     assert_eq!(s.doc.project.layer(outer).unwrap().children(), [fb], "Fill A left its folder");
-    let _ = x;
 }
 
 #[test]
