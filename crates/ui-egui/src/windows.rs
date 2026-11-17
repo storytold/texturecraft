@@ -4,7 +4,7 @@ use egui::{Color32, RichText, Ui, vec2};
 use egui_phosphor::regular as ic;
 use serde_json::json;
 use texturecraft_engine::core::ToneMapping;
-use texturecraft_engine::core::project::ENV_RESOURCE_PREFIX;
+use texturecraft_engine::core::project::{DisplaySettings, ENV_RESOURCE_PREFIX};
 use texturecraft_engine::geom::primitives::BUILTINS;
 use texturecraft_render::ibl::ENVIRONMENTS;
 
@@ -16,7 +16,7 @@ use crate::i18n::{tr, trf};
 use crate::new_project_advanced::COMBO_WIDTH;
 use crate::state::Mode;
 use crate::theme::{Accent, Brightness, Tokens, caption};
-use crate::widgets::{color_swatch, combo, icon_button, primary_button, section, slider};
+use crate::widgets::{color_swatch, combo, icon_button, primary_button, section, section_with_reset, slider};
 
 pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     start(app, ctx);
@@ -222,6 +222,21 @@ pub(crate) fn display(app: &mut TextureCraftApp, ui: &mut Ui) {
             crate::viewport::set_focus_picking(ui.ctx(), !picking);
         }
     });
+    ui.add_space(6.0);
+    // The switch gates all four amounts (the engine has one switch for the group); each amount 0 leaves that effect out
+    let post_effect_fields = |d: &DisplaySettings| (d.post_effects, d.bloom, d.vignette, d.sharpen, d.grain);
+    let post_effect_defaults = post_effect_fields(&DisplaySettings::default());
+    if section_with_reset(ui, "sec_post_effects", tr("Post effects"), false, post_effect_fields(&d) == post_effect_defaults, |ui| {
+        ui.checkbox(&mut d.post_effects, tr("Post effects (viewport and Rendering mode)"));
+        ui.add_enabled_ui(d.post_effects, |ui| {
+            slider(ui, tr("Glow"), &mut d.bloom, 0.0..=1.0, 2).on_hover_text(tr("Bright areas bleed light into their surroundings"));
+            slider(ui, tr("Vignette"), &mut d.vignette, 0.0..=1.0, 2).on_hover_text(tr("Darkens the corners of the view"));
+            slider(ui, tr("Sharpen"), &mut d.sharpen, 0.0..=1.0, 2).on_hover_text(tr("Brings out fine detail"));
+            slider(ui, tr("Film grain"), &mut d.grain, 0.0..=1.0, 2).on_hover_text(tr("Adds fine noise over the view"));
+        });
+    }) {
+        (d.post_effects, d.bloom, d.vignette, d.sharpen, d.grain) = post_effect_defaults;
+    }
     ui.add_space(6.0);
     ui.label(caption(tr("Viewer settings")));
     ui.checkbox(&mut app.ui.wireframe_3d, tr("Show wireframe in the 3D view"));
