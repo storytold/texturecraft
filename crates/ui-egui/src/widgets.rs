@@ -367,6 +367,7 @@ pub fn chip(ui: &mut Ui, text: &str, on: bool) -> Response {
     let galley = ui.painter().layout_no_wrap(text.into(), egui::FontId::proportional(11.0), tk.text);
     let size = vec2(galley.size().x + 14.0, 20.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, text));
     let p = ui.painter();
     let fill = if on {
         tk.tool_active

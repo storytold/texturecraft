@@ -1716,6 +1716,10 @@ fn smudge_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         app.session.tool.smudge_strength = (v / 100.0).clamp(0.0, 1.0);
     }
     ui.label(RichText::new(tr("Drags the layer stack's values along the stroke into the selected layer.")).size(10.5).color(tk.text_dim));
+    ui.add_space(4.0);
+    ui.label(tr("Channels dragged"));
+    material_channel_chips(app, ui);
+    ui.label(RichText::new(tr("These are the brush's material channels, the same ones Paint writes and the Material tab shows.")).size(10.5).color(tk.text_dim));
 }
 
 fn path_section(app: &mut TextureCraftApp, ui: &mut Ui) {
@@ -2085,11 +2089,9 @@ fn material_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     material_controls(app, ui);
 }
 
-/// The tool's material: channel chips, then each enabled channel's value (or the mask gray while painting a mask)
-fn material_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
-    use texturecraft_engine::core::ChannelKind;
-
-    let tokens = Tokens::get(ui.ctx());
+/// One chip per channel of the texture set, on while the tool's material has it enabled; returns the channels.
+/// The Material tab and the Smudge panel both draw these, so they share one set of flags.
+fn material_channel_chips(app: &mut TextureCraftApp, ui: &mut Ui) -> Vec<Channel> {
     let channels = app.session.doc.project.texture_set(app.session.ts()).map(|set| set.channel_list()).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
         for channel in &channels {
@@ -2100,6 +2102,15 @@ fn material_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
             }
         }
     });
+    channels
+}
+
+/// The tool's material: channel chips, then each enabled channel's value (or the mask gray while painting a mask)
+fn material_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
+    use texturecraft_engine::core::ChannelKind;
+
+    let tokens = Tokens::get(ui.ctx());
+    let channels = material_channel_chips(app, ui);
     ui.add_space(4.0);
 
     if !targets_content(app) {
