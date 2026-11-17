@@ -351,15 +351,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
         ui.add_space(4.0);
         section(ui, "keymap_nav", tr("Viewport and brush (fixed)"), false, |ui| {
             egui::Grid::new("keymap_fixed").striped(true).show(ui, |ui| {
-                for (k, v) in [
-                    (tr("Alt + LMB drag"), tr("Orbit")),
-                    (tr("MMB drag / Alt + MMB"), tr("Pan")),
-                    (tr("Wheel / Alt + RMB drag"), tr("Zoom")),
-                    (tr("LMB"), tr("Paint with the current tool")),
-                    ("[ / ]", tr("Brush size down / up")),
-                    (tr("Shift + wheel"), tr("Brush size")),
-                    ("Esc", tr("Cancel the stroke")),
-                ] {
+                for (k, v) in fixed_gestures() {
                     ui.label(RichText::new(k).strong());
                     ui.label(v);
                     ui.end_row();
@@ -384,6 +376,37 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
     });
 }
 
+/// The mouse gestures and hold keys of the viewports, as (gesture, what it does) rows for the
+/// shortcut window. The hold keys come from the constants the viewport reads, so a rebound hold key
+/// is named from the same constant. The rows cover every gesture the 3D and 2D views handle.
+pub fn fixed_gestures() -> Vec<(String, String)> {
+    let stencil = crate::viewport::STENCIL_KEY.name();
+    let clone = crate::viewport::CLONE_SOURCE_KEY.name();
+    let keyed = |template: &str| trf(template, &[("key", &stencil)]);
+    vec![
+        (tr("Alt + LMB drag").into(), tr("Orbit").into()),
+        (tr("RMB drag").into(), tr("Orbit (3D view)").into()),
+        (tr("MMB drag / Alt + MMB").into(), tr("Pan").into()),
+        (tr("Wheel / Alt + RMB drag").into(), tr("Zoom").into()),
+        (tr("Shift + RMB drag").into(), tr("Turn the environment light (3D view)").into()),
+        (tr("LMB").into(), tr("Paint with the current tool").into()),
+        (tr("Shift + LMB").into(), tr("Paint a straight line from where the last stroke ended").into()),
+        ("[ / ]".into(), tr("Brush size down / up").into()),
+        (tr("Shift + wheel").into(), tr("Brush size").into()),
+        (keyed("{key} + LMB drag"), tr("Projection: rotate the stencil").into()),
+        (keyed("{key} + RMB drag"), tr("Projection: scale the stencil").into()),
+        (keyed("{key} + MMB drag"), tr("Projection: move the stencil").into()),
+        (trf("{key} + LMB", &[("key", &clone)]), tr("Clone: pick the point to copy from").into()),
+        (tr("Click (Path tool)").into(), tr("Path: add a point; on the curve it inserts one").into()),
+        (tr("LMB drag on a point (Path tool)").into(), tr("Path: move the point").into()),
+        (tr("Click the first point (Path tool)").into(), tr("Path: close it (needs 3 points)").into()),
+        ("Enter".into(), tr("Path: apply it with the brush").into()),
+        ("Backspace".into(), tr("Path: remove the selected or last point").into()),
+        ("Esc".into(), tr("Cancel the stroke").into()),
+        (tr("Esc (Path tool)").into(), tr("Path: cancel it").into()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +421,29 @@ mod tests {
         assert!(captured(Modifiers::NONE, Key::F8) && captured(Modifiers::ALT, Key::W));
         assert!(!captured(ctrl, Key::C) && !captured(ctrl, Key::V) && !captured(ctrl, Key::X), "clipboard keys reach the browser");
         assert!(!captured(Modifiers::NONE, Key::M) && !captured(Modifiers::NONE, Key::F), "plain keys need no capture");
+    }
+
+    #[test]
+    fn gesture_rows_name_the_hold_keys_and_cover_every_gesture() {
+        let rows = fixed_gestures();
+        let has = |gesture: &str, what: &str| rows.iter().any(|(g, w)| g == gesture && w.contains(what));
+        let (s, v) = (crate::viewport::STENCIL_KEY.name(), crate::viewport::CLONE_SOURCE_KEY.name());
+        assert!(has(&format!("{s} + LMB drag"), "rotate") && has(&format!("{s} + RMB drag"), "scale") && has(&format!("{s} + MMB drag"), "move"));
+        assert!(has(&format!("{v} + LMB"), "Clone"));
+        for (gesture, what) in [
+            ("Shift + LMB", "straight line"),
+            ("Shift + RMB drag", "environment light"),
+            ("Enter", "apply"),
+            ("Backspace", "remove"),
+            ("Esc (Path tool)", "cancel"),
+            ("Click the first point (Path tool)", "close"),
+            ("LMB drag on a point (Path tool)", "move"),
+            ("Click (Path tool)", "add a point"),
+        ] {
+            assert!(has(gesture, what), "no row {gesture} / {what}");
+        }
+        let mut seen = std::collections::HashSet::new();
+        assert!(rows.iter().all(|(g, w)| seen.insert((g.clone(), w.clone()))), "duplicate row");
     }
 
     #[test]

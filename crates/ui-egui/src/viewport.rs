@@ -22,6 +22,11 @@ use crate::state::ViewLayout;
 use crate::theme::Tokens;
 use crate::toolbar::{MAX_BRUSH_SIZE, MIN_BRUSH_SIZE};
 
+/// Hold this key with the Projection tool to rotate, scale or move the stencil with the mouse
+pub const STENCIL_KEY: egui::Key = egui::Key::S;
+/// Hold this key with the Clone tool and click to set the source
+pub const CLONE_SOURCE_KEY: egui::Key = egui::Key::V;
+
 pub const VIEW_3D: u64 = 1;
 pub const VIEW_2D: u64 = 2;
 
@@ -558,7 +563,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
 
     // Navigation; S + drag moves the projection stencil instead, below
     let delta = ui.input(|input| input.pointer.delta());
-    let s_held = app.ui.mode == crate::state::Mode::Painting && ui.input(|input| input.key_down(egui::Key::S)) && !ui.ctx().egui_wants_keyboard_input();
+    let s_held = app.ui.mode == crate::state::Mode::Painting && ui.input(|input| input.key_down(STENCIL_KEY)) && !ui.ctx().egui_wants_keyboard_input();
 
     // Only an equipped Projection tool that can act moves its stencil: it isn't drawn otherwise
     let stencil_moves = tool_acts(app) && app.session.tool.tool == Tool::Projection;
@@ -1565,7 +1570,7 @@ fn polygon_fill_box_overlay(ui: &Ui, rect: Rect, fill_box: Option<Rect>) {
 
 /// V held with the Clone tool in painting mode: clicks set the clone source
 fn clone_source_key(app: &TextureCraftApp, ui: &Ui) -> bool {
-    tool_acts(app) && app.session.tool.tool == Tool::Clone && ui.input(|input| input.key_down(egui::Key::V)) && !ui.ctx().egui_wants_keyboard_input()
+    tool_acts(app) && app.session.tool.tool == Tool::Clone && ui.input(|input| input.key_down(CLONE_SOURCE_KEY)) && !ui.ctx().egui_wants_keyboard_input()
 }
 
 /// Crosshair where the Clone tool reads from.

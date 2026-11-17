@@ -34,6 +34,7 @@ mod shelf_drop;
 mod shelf_hover_preview;
 mod shelf_panel;
 mod shift_lines_2d;
+mod shortcut_gestures;
 mod shortcut_keys;
 mod skew_paint;
 mod split_divider;
