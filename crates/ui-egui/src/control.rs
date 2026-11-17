@@ -170,7 +170,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
             crate::menus::invoke(app, ctx, id);
             ok(Value::Null)
         }
-        // What Window > Reset UI does after its question is answered Reset
+        // What Window > Reset UI does once the question is answered with Reset.
         "ui.reset" => {
             app.ui.adopt_layout(crate::UiState::default());
             ok(Value::Null)
