@@ -15,12 +15,12 @@ fn temp_dir(test: &str) -> PathBuf {
     dir
 }
 
-/// A session of `mesh` with a fill layer whose mask is 0.5 wherever the mesh covers the texture.
-fn session_with_half_mask(mesh: texturecraft_engine::geom::Mesh, name: &str, resolution: u32) -> (Session, LayerId) {
+/// A session of `mesh` with a fill layer whose mask is `value` wherever the mesh covers the texture.
+fn session_with_mask(mesh: texturecraft_engine::geom::Mesh, name: &str, resolution: u32, value: f32) -> (Session, LayerId) {
     let mut s = Session::new_project("t", mesh, name, None, resolution).unwrap();
     let layer = LayerId(execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap()["layer"].as_u64().unwrap());
     execute(&mut s, "mask.add.black", &Value::Null).unwrap();
-    execute(&mut s, "effect.add.fill", &json!({"value": 0.5})).unwrap();
+    execute(&mut s, "effect.add.fill", &json!({"value": value})).unwrap();
     s.update();
     (s, layer)
 }
@@ -70,12 +70,12 @@ fn the_bitmap_is_the_mask_the_composite_is_drawn_with_in_the_same_orientation() 
 }
 
 #[test]
-fn the_bitmap_follows_a_painted_mask_not_a_flat_value() {
-    let (mut s, layer) = session_with_half_mask(primitives::material_ball(), "builtin:material_ball", 128);
+fn inverting_changes_the_bitmap_and_a_switched_off_or_missing_mask_is_an_error() {
+    let (mut s, layer) = session_with_mask(primitives::material_ball(), "builtin:material_ball", 128, 0.25);
     execute(&mut s, "mask.invert", &json!({"layer": layer.0})).unwrap();
     let bitmap = s.mask_bitmaps(layer, false).unwrap().remove(0);
     let (x, y) = (0..128 * 128).map(|i| (i % 128, i / 128)).find(|&(x, y)| covered(&s, x, y)).unwrap();
-    assert!((bitmap.values[(y * 128 + x) as usize] - 0.5).abs() < 1e-3, "inverting 0.5 gives 0.5");
+    assert!((bitmap.values[(y * 128 + x) as usize] - 0.75).abs() < 1e-3, "inverting 0.25 gives 0.75");
     execute(&mut s, "mask.toggle", &json!({"layer": layer.0, "enabled": false})).unwrap();
     assert!(s.mask_bitmaps(layer, false).is_err(), "a switched-off mask has nothing to export");
     execute(&mut s, "mask.remove", &json!({"layer": layer.0})).unwrap();
@@ -84,7 +84,7 @@ fn the_bitmap_follows_a_painted_mask_not_a_flat_value() {
 
 #[test]
 fn mask_export_writes_a_16_bit_gray_png() {
-    let (mut s, layer) = session_with_half_mask(primitives::material_ball(), "builtin:material_ball", 128);
+    let (mut s, layer) = session_with_mask(primitives::material_ball(), "builtin:material_ball", 128, 0.5);
     let dir = temp_dir("png");
     let path = dir.join("ball_mask.png");
     let done = execute(&mut s, "mask.export", &json!({"layer": layer.0, "path": path.display().to_string()})).unwrap();
@@ -110,16 +110,16 @@ fn mask_export_writes_a_16_bit_gray_png() {
 
 #[test]
 fn a_tiled_set_exports_one_file_per_tile_at_each_tiles_size() {
-    let (mut s, layer) = session_with_half_mask(primitives::udim_plane(), "builtin:udim_plane", 128);
-    execute(&mut s, "textureSet.tile.resolution", &json!({"ts": 0, "tile": 1002, "resolution": 64})).unwrap();
+    let (mut s, layer) = session_with_mask(primitives::udim_plane(), "builtin:udim_plane", 256, 0.5);
+    execute(&mut s, "textureSet.tile.resolution", &json!({"ts": 0, "tile": 1002, "resolution": 128})).unwrap();
     s.update();
     let (width, height) = s.caches[0].size;
-    assert_eq!((width, height), (256, 128), "two blocks of the larger tile's size");
+    assert_eq!((width, height), (512, 256), "two blocks of the larger tile's size");
 
     let bitmaps = s.mask_bitmaps(layer, true).unwrap();
-    assert_eq!(bitmaps.iter().map(|b| (b.tile, b.width, b.height)).collect::<Vec<_>>(), [(Some(1001), 128, 128), (Some(1002), 64, 64)]);
+    assert_eq!(bitmaps.iter().map(|b| (b.tile, b.width, b.height)).collect::<Vec<_>>(), [(Some(1001), 256, 256), (Some(1002), 128, 128)]);
     // The smaller tile fills the top-left corner of its block
-    for (bitmap, block_x) in bitmaps.iter().zip([0, 128]) {
+    for (bitmap, block_x) in bitmaps.iter().zip([0, 256]) {
         for y in 0..bitmap.height {
             for x in 0..bitmap.width {
                 let expected = if covered(&s, block_x + x, y) { 0.5 } else { 0.0 };
@@ -132,13 +132,13 @@ fn a_tiled_set_exports_one_file_per_tile_at_each_tiles_size() {
 
     let atlas = s.mask_bitmaps(layer, false).unwrap();
     assert_eq!(atlas.len(), 1);
-    assert_eq!((atlas[0].tile, atlas[0].width, atlas[0].height), (None, 256, 128), "the clipboard copy is the whole atlas");
+    assert_eq!((atlas[0].tile, atlas[0].width, atlas[0].height), (None, 512, 256), "the clipboard copy is the whole atlas");
 
     let dir = temp_dir("tiles");
     let path = dir.join("plane_mask.png");
     let done = execute(&mut s, "mask.export", &json!({"layer": layer.0, "path": path.display().to_string()})).unwrap();
     assert_eq!(done["files"], json!([dir.join("plane_mask.1001.png").display().to_string(), dir.join("plane_mask.1002.png").display().to_string()]));
-    assert_eq!(image::open(dir.join("plane_mask.1001.png")).unwrap().into_luma16().dimensions(), (128, 128));
-    assert_eq!(image::open(dir.join("plane_mask.1002.png")).unwrap().into_luma16().dimensions(), (64, 64));
+    assert_eq!(image::open(dir.join("plane_mask.1001.png")).unwrap().into_luma16().dimensions(), (256, 256));
+    assert_eq!(image::open(dir.join("plane_mask.1002.png")).unwrap().into_luma16().dimensions(), (128, 128));
     let _ = std::fs::remove_dir_all(dir);
 }
