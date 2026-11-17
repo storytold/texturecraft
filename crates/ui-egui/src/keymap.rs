@@ -567,7 +567,7 @@ mod tests {
             assert!(b.default.is_none() && shortcut(&Keymap::new(), b).is_none(), "{id} is listed without a key");
         }
         assert_eq!(binding("mask.invert").group, "Layers");
-        for id in ["textureSet.select", "layer.rename", "file.saveCopy", "tool.select", "layer.list", "project.inspect"] {
+        for id in ["textureSet.select", "layer.rename", "tool.select", "layer.list", "project.inspect"] {
             assert!(bindings().iter().all(|b| b.id != id), "{id} cannot run from a key");
         }
         let ids: Vec<_> = bindings().iter().map(|b| b.id).collect();

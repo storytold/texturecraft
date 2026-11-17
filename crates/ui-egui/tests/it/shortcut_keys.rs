@@ -109,14 +109,14 @@ fn a_pasted_image_counts_as_the_paste_shortcut() {
 fn a_command_without_a_default_key_runs_from_the_key_it_is_bound_to() {
     let mut h = harness();
     let before = h.state().session.doc.project.layers.len();
-    h.event(press(Key::F9, Modifiers::NONE, false));
+    h.event(press(Key::F6, Modifiers::NONE, false));
     h.run_steps(2);
-    assert_eq!(h.state().session.doc.project.layers.len(), before, "F9 is free");
-    h.state_mut().ui.keymap.insert("layer.add.fill".into(), "F9".into());
+    assert_eq!(h.state().session.doc.project.layers.len(), before, "F6 is free");
+    h.state_mut().ui.keymap.insert("layer.add.fill".into(), "F6".into());
     h.run_steps(2);
-    h.event(press(Key::F9, Modifiers::NONE, false));
+    h.event(press(Key::F6, Modifiers::NONE, false));
     h.run_steps(2);
-    assert_eq!(h.state().session.doc.project.layers.len(), before + 1, "F9 added a fill layer");
+    assert_eq!(h.state().session.doc.project.layers.len(), before + 1, "F6 added a fill layer");
 }
 
 #[test]
@@ -124,6 +124,6 @@ fn the_shortcut_editor_lists_a_command_without_a_key_and_hides_one_that_needs_a_
     let mut h = harness();
     h.state_mut().ui.windows.shortcuts = true;
     h.run_steps(4);
-    assert!(h.query_by_label("Add fill layer").is_some(), "Add fill layer is listed");
+    assert!(h.query_by_label("Toggle layer visibility").is_some(), "Toggle layer visibility is listed");
     assert!(h.query_by_label("Select texture set").is_none(), "Select texture set needs a texture set");
 }
