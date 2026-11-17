@@ -180,6 +180,89 @@ fn group_puts_the_selected_layers_into_one_folder_in_their_order() {
 }
 
 #[test]
+fn group_puts_the_folder_at_the_topmost_selected_layer_with_gaps_between() {
+    let mut s = session();
+    execute(&mut s, "textureSet.select", &json!({"ts": 0})).unwrap();
+    let [l1, l2, l3, l4, l5] = ["L1", "L2", "L3", "L4", "L5"].map(|n| add(&mut s, n));
+    execute(&mut s, "layer.select", &json!({"layers": [l2.0, l4.0]})).unwrap();
+    let folder = id(execute(&mut s, "layer.group", &Value::Null).unwrap(), "layer");
+    assert_eq!(rows(&s)[..6], ["L5", "Folder 1", "L4", "L2", "L3", "L1"], "the folder sits where L4 was, L3 stays below it");
+    assert_eq!(s.doc.project.layer(folder).unwrap().children(), [l2, l4], "L2 stays below L4 inside");
+    let stack = &s.doc.project.texture_sets[0].stack;
+    assert_eq!(stack[stack.len() - 4..], [l1, l3, folder, l5], "L5 stays above the folder");
+
+    // Same result when the layers are picked in the other order
+    s.undo().unwrap();
+    execute(&mut s, "layer.select", &json!({"layers": [l4.0, l2.0]})).unwrap();
+    execute(&mut s, "layer.group", &Value::Null).unwrap();
+    assert_eq!(rows(&s)[..6], ["L5", "Folder 1", "L4", "L2", "L3", "L1"]);
+}
+
+#[test]
+fn group_of_a_layer_inside_a_folder_and_one_outside_keeps_the_topmost_place() {
+    let mut s = session();
+    execute(&mut s, "textureSet.select", &json!({"ts": 0})).unwrap();
+    let [x, y, z] = ["X", "Y", "Z"].map(|n| add(&mut s, n));
+    let outer = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
+    execute(&mut s, "layer.move", &json!({"layers": [y.0, z.0], "above": outer.0, "inside": true})).unwrap();
+    // Rows from the top: Folder 1 (Z, Y), X
+    assert_eq!(rows(&s)[..4], ["Folder 1", "Z", "Y", "X"]);
+
+    // The topmost selected layer Z is inside the folder: the new folder replaces it there
+    execute(&mut s, "layer.select", &json!({"layers": [z.0, x.0]})).unwrap();
+    let folder = id(execute(&mut s, "layer.group", &Value::Null).unwrap(), "layer");
+    assert_eq!(rows(&s)[..5], ["Folder 1", "Folder 2", "Z", "X", "Y"]);
+    assert_eq!(s.doc.project.layer(outer).unwrap().children(), [y, folder], "Z's place in the outer folder");
+    assert_eq!(s.doc.project.layer(folder).unwrap().children(), [x, z], "X keeps its place below Z");
+    s.undo().unwrap();
+    assert_eq!(rows(&s)[..4], ["Folder 1", "Z", "Y", "X"]);
+
+    // X is outside and Y inside: Y is the topmost, so the folder appears inside the outer folder
+    execute(&mut s, "layer.select", &json!({"layers": [x.0, y.0]})).unwrap();
+    let folder = id(execute(&mut s, "layer.group", &Value::Null).unwrap(), "layer");
+    assert_eq!(rows(&s)[..5], ["Folder 1", "Z", "Folder 2", "Y", "X"]);
+    assert_eq!(s.doc.project.texture_sets[0].stack.last(), Some(&outer), "the outer folder stays on top");
+    assert_eq!(s.doc.project.layer(outer).unwrap().children(), [folder, z]);
+    assert_eq!(s.doc.project.layer(folder).unwrap().children(), [x, y]);
+}
+
+#[test]
+fn select_all_takes_every_layer_of_the_set_with_folder_contents() {
+    let mut s = session();
+    let [a, b, c, d] = four(&mut s);
+    let folder = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
+    execute(&mut s, "layer.move", &json!({"layers": [a.0, b.0], "above": folder.0, "inside": true})).unwrap();
+    if let LayerKind::Group { collapsed, .. } = &mut s.doc.project.layer_mut(folder).unwrap().kind {
+        *collapsed = true;
+    }
+    click(&mut s, c, "plain");
+    let depth = s.history_labels().len();
+    let r = execute(&mut s, "layer.select", &json!({"all": true})).unwrap();
+    assert_eq!(selected(&s), ["Folder 1", "B", "A", "D", "C"]);
+    assert_eq!(r["layers"].as_array().unwrap().len(), 5);
+    assert_eq!(s.selected_layer(), Some(c), "the active layer stays");
+    assert_eq!(s.history_labels().len(), depth, "selecting is no undo step");
+    assert!(s.is_layer_selected(a) && s.is_layer_selected(d));
+
+    // With nothing selected the top row becomes the active layer
+    execute(&mut s, "layer.select", &json!({"layer": d.0})).unwrap();
+    execute(&mut s, "layer.select", &json!({"all": true})).unwrap();
+    assert_eq!(s.selected_layer(), Some(d), "the active layer stays when it is picked again");
+}
+
+#[test]
+fn visibility_of_several_layers_follows_the_layer_given_as_lead() {
+    let mut s = session();
+    let [a, b, c, _] = four(&mut s);
+    execute(&mut s, "layer.visible", &json!({"layer": a.0, "visible": false})).unwrap();
+    // The active layer is C (shown), but the eye of A (hidden) was clicked: all are shown
+    execute(&mut s, "layer.select", &json!({"layers": [a.0, b.0, c.0], "layer": c.0})).unwrap();
+    execute(&mut s, "layer.visible", &json!({"layers": [a.0, b.0, c.0], "layer": a.0})).unwrap();
+    let shown = |s: &Session| [a, b, c].map(|l| s.doc.project.layer(l).unwrap().visible);
+    assert_eq!(shown(&s), [true; 3], "A was hidden, so all are shown");
+}
+
+#[test]
 fn visibility_toggles_every_selected_layer_the_way_of_the_active_one() {
     let mut s = session();
     let [a, b, c, _] = four(&mut s);

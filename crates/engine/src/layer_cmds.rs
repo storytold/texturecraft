@@ -33,12 +33,12 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select layer",
             [],
             None,
-            "{layer, target?: content|mask|<effect id>} | {layer, toggle: true} (Ctrl+click: add or take out one layer) | {layer, range: true} (Shift+click: the rows from the last clicked layer) | {layers: [id], layer?} (select several; `layer` is the active one)",
+            "{layer, target?: content|mask|<effect id>} | {layer, toggle: true} (Ctrl+click: add or take out one layer) | {layer, range: true} (Shift+click: the rows from the last clicked layer) | {all: true} (Ctrl+A: every layer of the active texture set, folder contents included) | {layers: [id], layer?} (select several; `layer` is the active one)",
             always,
             select
         ),
         cmd!("layer.rename", "Rename layer", [], None, "{layer?, name}", has_layer, rename),
-        cmd!("layer.visible", "Toggle layer visibility", [], None, "{layer? | layers?: [id], visible?} — default: every selected layer", has_layer, visible),
+        cmd!("layer.visible", "Toggle layer visibility", [], None, "{layer? | layers?: [id], visible?} — default: every selected layer; with `layers`, `layer` is the one the others follow", has_layer, visible),
         cmd!(
             "layer.move",
             "Move layer",
@@ -207,6 +207,9 @@ fn group(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
+    if boolp(p, "all") == Some(true) {
+        return crate::layer_selection::select_all(s);
+    }
     if p.get("layers").is_some() {
         return crate::layer_selection::select_list(s, p);
     }
@@ -264,8 +267,9 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn visible(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = batch_param(s, "layer.visible", p, false)?;
-    // Without `visible`, every layer takes the opposite of the active one's (or the top one's)
-    let lead = s.selected_layer().filter(|active| ids.contains(active)).or(ids.first().copied()).ok_or_else(|| bad("layer.visible", "no layer given"))?;
+    // Without `visible`, every layer takes the opposite of the lead's: `layer` when it is one of
+    // them (the row whose eye was clicked), else the active one, else the top one
+    let lead = u64p(p, "layer").map(LayerId).filter(|lead| ids.contains(lead)).or(s.selected_layer().filter(|active| ids.contains(active))).or(ids.first().copied()).ok_or_else(|| bad("layer.visible", "no layer given"))?;
     let v = s.edit("Layer visibility", |s| {
         let v = boolp(p, "visible").unwrap_or(!s.doc.project.layer(lead)?.visible);
         for id in &ids {

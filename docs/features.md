@@ -37,8 +37,10 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   show a layer only on the mesh parts you pick (right-click a layer, or click parts with the
   **Geometry mask** tool, 8).
 - **Several layers at once:** Shift+click a layer to select the rows from the last clicked one,
-  Ctrl+click (Cmd+click on macOS) to add or take out one layer. Delete, the trash button, duplicate
-  (Ctrl+D), group (Ctrl+G), the row menu and drag-and-drop then act on every selected layer, each
+  Ctrl+click (Cmd+click on macOS) to add or take out one layer, Ctrl+A (Cmd+A) with the pointer
+  over the Layers panel to select every layer, folder contents included. The eye of a selected
+  row shows or hides all selected layers; the eye of another row only its own layer. Delete, the trash button, duplicate
+  (Ctrl+D), group (Ctrl+G; the new folder takes the topmost selected layer's place), the row menu and drag-and-drop then act on every selected layer, each
   as one undo step.
 - **Filters and content effects** on any layer or mask: **31 filters** (HSL, levels,
   contrast/luminosity, color balance, gradient map, posterize, clamp, histogram scan, range and

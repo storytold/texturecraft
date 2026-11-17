@@ -213,6 +213,20 @@ pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
         }
     });
     app.layer_panel.end(ui.ctx(), &app.session);
+    select_all_layers(app, ui);
+}
+
+/// Ctrl+A (Cmd+A on macOS) with the pointer over the Layers panel selects every layer of the
+/// active texture set. A focused text field (a rename, a number field) keeps the key for itself,
+/// and the key is left alone over other panels.
+fn select_all_layers(app: &mut TextureCraftApp, ui: &Ui) {
+    let ctx = ui.ctx();
+    if ctx.egui_wants_keyboard_input() || !ui.ui_contains_pointer() {
+        return;
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+        app.run("layer.select", json!({"all": true}));
+    }
 }
 
 /// A click on a layer row or its content thumbnail, as in the reference app: Shift selects the
@@ -525,9 +539,13 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         egui::FontId::proportional(LAYER_EYE_FONT_SIZE),
         if layer.visible { tokens.text } else { tokens.text_dim },
     );
-    // The eye shows or hides its own layer only, even on one of several selected rows
+    // The eye of one of several selected rows sets every selected layer to the opposite of this
+    // one's state; the eye of any other row acts on its own layer and keeps the selection
     if eye_response.clicked() {
-        app.run("layer.visible", json!({"layer": layer.id.0}));
+        match &several {
+            Some(layers) => app.run("layer.visible", json!({"layers": layers, "layer": layer.id.0})),
+            None => app.run("layer.visible", json!({"layer": layer.id.0})),
+        };
     }
 
     // A folder's caret

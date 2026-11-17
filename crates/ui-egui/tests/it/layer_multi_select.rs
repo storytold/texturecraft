@@ -2,11 +2,11 @@
 //! reference app, and the selected rows are highlighted.
 
 use egui::accesskit::Toggled;
-use egui::{Event, Modifiers, PointerButton, Pos2};
+use egui::{Event, Key, Modifiers, PointerButton, Pos2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use serde_json::json;
-use texturecraft_engine::core::LayerId;
+use texturecraft_engine::core::{LayerId, LayerKind};
 use texturecraft_engine::execute;
 use texturecraft_ui_egui::TextureCraftApp;
 
@@ -74,21 +74,90 @@ fn ctrl_click_adds_and_takes_out_a_row() {
     assert!(h.state().ui.rename.is_none(), "two quick Ctrl+clicks do not start a rename");
 }
 
-#[test]
-fn the_eye_of_a_selected_row_shows_or_hides_that_layer_only() {
-    let (mut h, [a, _, c, _]) = harness();
-    click(&mut h, "Row A", Modifiers::NONE);
-    click(&mut h, "Row C", Modifiers::COMMAND);
-    // The eye sits at the left of a top-level row, after the 7-point edge
-    let row = h.get_by_label("Row C").rect();
+/// Click the eye of the row `name` (it sits at the left of a top-level row, after the 7-point edge).
+fn click_eye(h: &mut Harness<'_, TextureCraftApp>, name: &str) {
+    let row = h.get_by_label(name).rect();
     let eye = egui::pos2(row.left() + 7.0 + 8.0, row.center().y);
     h.drag_at(eye);
     h.drop_at(eye);
     h.run_steps(3);
-    let project = &h.state().session.doc.project;
-    assert!(!project.layer(c).unwrap().visible, "C is hidden");
-    assert!(project.layer(a).unwrap().visible, "A, also selected, stays shown");
+}
+
+fn visible(h: &Harness<'_, TextureCraftApp>, layer: LayerId) -> bool {
+    h.state().session.doc.project.layer(layer).unwrap().visible
+}
+
+#[test]
+fn the_eye_of_a_selected_row_shows_or_hides_every_selected_layer() {
+    let (mut h, [a, b, c, _]) = harness();
+    click(&mut h, "Row A", Modifiers::NONE);
+    click(&mut h, "Row C", Modifiers::COMMAND);
+    click_eye(&mut h, "Row C");
+    assert!(!visible(&h, c) && !visible(&h, a), "both selected layers are hidden");
+    assert!(visible(&h, b), "an unselected layer stays shown");
     assert_eq!(h.state().session.selected_layers(), [c, a], "the selection stays");
+
+    // They all take the opposite of the clicked layer's state, whatever their own was
+    execute(&mut h.state_mut().session, "layer.visible", &json!({"layer": a.0, "visible": true})).unwrap();
+    h.run_steps(2);
+    click_eye(&mut h, "Row C");
+    assert!(visible(&h, c) && visible(&h, a), "C was hidden, so both are shown");
+}
+
+#[test]
+fn the_eye_of_an_unselected_row_acts_on_its_own_layer_and_keeps_the_selection() {
+    let (mut h, [a, b, c, _]) = harness();
+    click(&mut h, "Row A", Modifiers::NONE);
+    click(&mut h, "Row C", Modifiers::COMMAND);
+    click_eye(&mut h, "Row B");
+    assert!(!visible(&h, b), "B is hidden");
+    assert!(visible(&h, a) && visible(&h, c), "the selected layers stay shown");
+    assert_eq!(h.state().session.selected_layers(), [c, a], "the selection stays");
+}
+
+#[test]
+fn ctrl_a_over_the_layers_panel_selects_every_layer_including_collapsed_folders() {
+    let (mut h, [a, b, c, d]) = harness();
+    let session = &mut h.state_mut().session;
+    let folder = LayerId(execute(session, "layer.add.group", &json!(null)).unwrap()["layer"].as_u64().unwrap());
+    execute(session, "layer.move", &json!({"layers": [a.0, b.0], "above": folder.0, "inside": true})).unwrap();
+    if let LayerKind::Group { collapsed, .. } = &mut session.doc.project.layer_mut(folder).unwrap().kind {
+        *collapsed = true;
+    }
+    execute(session, "layer.select", &json!({"layer": d.0})).unwrap();
+    h.run_steps(3);
+    let at = h.get_by_label("Row C").rect().center();
+    h.event(Event::PointerMoved(at));
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(3);
+    let mut all = h.state().session.selected_layers();
+    all.sort();
+    let mut expected = vec![a, b, c, d, folder];
+    expected.sort();
+    assert_eq!(all, expected, "the folder and the layers hidden in it are selected");
+    assert_eq!(h.state().session.selected_layer(), Some(d), "the active layer stays");
+}
+
+#[test]
+fn ctrl_a_leaves_text_fields_and_other_panels_alone() {
+    let (mut h, [_, _, c, d]) = harness();
+    // Pointer outside every panel: nothing is selected
+    h.event(Event::PointerGone);
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(3);
+    assert_eq!(h.state().session.selected_layers(), [d], "no pointer over the Layers panel");
+
+    // A rename field over the panel keeps Ctrl+A for its own text
+    h.state_mut().ui.rename = Some((c.0, "Row C".into()));
+    h.run_steps(3);
+    let at = h.get_by_label("Row B").rect().center();
+    h.event(Event::PointerMoved(at));
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(3);
+    assert_eq!(h.state().session.selected_layers().len(), 1, "Ctrl+A in the rename field selects text, not layers");
 }
 
 /// Right-click the row `name` and choose the menu item whose label starts with `item`.

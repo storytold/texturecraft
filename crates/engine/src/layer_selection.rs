@@ -176,6 +176,24 @@ pub(crate) fn select_list(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "layer": active.0, "textureSet": ts, "layers": ids_json(&s.selected_layers()) }))
 }
 
+/// `layer.select {all: true}` (Ctrl/Cmd+A in the Layers panel): every layer of the active texture
+/// set, folder contents included whether the folder is open or collapsed. The active layer and
+/// the Shift+click anchor stay when they are in the set, else the top row takes their place. An
+/// empty stack changes nothing.
+pub(crate) fn select_all(s: &mut Session) -> Result<Value> {
+    let ts = s.ts();
+    let rows = stack_rows(&s.doc.project, ts, false);
+    let Some(top) = rows.first().copied() else {
+        return Ok(json!({ "layer": Value::Null, "textureSet": ts, "layers": [] }));
+    };
+    let active = s.active_in(ts).unwrap_or(top);
+    let anchor = s.multi_in(ts).map(|multi| multi.anchor).filter(|anchor| rows.contains(anchor)).unwrap_or(active);
+    s.select_several(ts, active, anchor, rows);
+    s.target = StackTarget::Content;
+    s.revision = s.revision.wrapping_add(1);
+    Ok(json!({ "layer": active.0, "textureSet": ts, "layers": ids_json(&s.selected_layers()) }))
+}
+
 /// The `layers` param: ids of layers in one texture set's stack, without repeats.
 fn ids_param(s: &Session, cmd: &str, p: &Value) -> Result<(usize, Vec<LayerId>)> {
     let list = p.get("layers").and_then(Value::as_array).ok_or_else(|| bad(cmd, "`layers` must be a list of layer ids"))?;
