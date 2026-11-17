@@ -36,6 +36,7 @@ mod mask_preview_image;
 mod material_preview_image;
 pub mod menus;
 pub mod new_project_advanced;
+pub mod nav_buttons;
 mod orb_shape;
 pub mod parity;
 mod path_hit;

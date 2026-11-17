@@ -136,7 +136,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   traced on the GPU
   (compute shaders, about 25× the CPU tracer, desktop and WebGPU) or on the CPU.
 - View any channel, any baked mesh map, or a UV checker; Alt+drag to orbit, middle-drag to pan,
-  wheel to zoom, F to frame, M / C / B to cycle views.
+  wheel to zoom, F to frame, M / C / B to cycle views. Orbit, pan and zoom buttons in the corner of
+  each view do the same with a plain drag, so a pen and tablet can navigate without a keyboard or
+  wheel (Viewport menu ▸ Navigation buttons hides them).
 - **3D and UV wireframes** that show the mesh's own polygons: quads and n-gons from OBJ, FBX,
   COLLADA, USD, Alembic and PLY files keep their edges, without the triangulation's diagonals.
 

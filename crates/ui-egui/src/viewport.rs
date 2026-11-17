@@ -182,13 +182,13 @@ fn split_divider_x(app: &mut TextureCraftApp, ui: &Ui, full: Rect) -> f32 {
 }
 
 /// Lowest 2D zoom, for the wheel and the divider (inside the renderer's own limit of 0.05)
-const UV_VIEW_MIN_ZOOM: f32 = 0.1;
+pub(crate) const UV_VIEW_MIN_ZOOM: f32 = 0.1;
 
 /// Highest 2D zoom, for the wheel and the divider (inside the renderer's own limit of 64)
-const UV_VIEW_MAX_ZOOM: f32 = 40.0;
+pub(crate) const UV_VIEW_MAX_ZOOM: f32 = 40.0;
 
 /// UV zoom change per point of mouse wheel, as a fraction of the zoom
-const UV_WHEEL_ZOOM_PER_POINT: f32 = 0.002;
+pub(crate) const UV_WHEEL_ZOOM_PER_POINT: f32 = 0.002;
 
 /// Dash length of the straight-line preview, in points
 const RUBBER_BAND_DASH: f32 = 6.0;
@@ -517,10 +517,10 @@ fn axis_gizmo(ui: &Ui, rect: Rect, app: &TextureCraftApp, uv: bool) {
 }
 
 /// Camera turn per point of a drag (radians)
-const ORBIT_RADIANS_PER_POINT: f32 = 0.008;
+pub(crate) const ORBIT_RADIANS_PER_POINT: f32 = 0.008;
 
 /// Camera zoom per point of an Alt+right drag
-const DRAG_ZOOM_PER_POINT: f32 = 0.01;
+pub(crate) const DRAG_ZOOM_PER_POINT: f32 = 0.01;
 
 /// Camera zoom per point of mouse wheel
 const WHEEL_ZOOM_PER_POINT: f32 = 0.0025;
@@ -847,6 +847,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
     view_header(app, ui, rect, "v3d");
     axis_gizmo(ui, rect, app, false);
+    crate::nav_buttons::show(app, ui, rect, crate::nav_buttons::NavView::Scene);
 }
 
 /// Where the quick-mask editing notice sits from the 3D view's top-left corner, its text size and its warning red
@@ -1959,6 +1960,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && let Some(cursor_center) = if adjusting { ui.input(|input| input.pointer.press_origin()) } else { response.hover_pos().or_else(|| response.interact_pointer_pos()) }
         // Header pickers need the normal pointer
         && !view_header_rect(rect).is_some_and(|header| header.expand(2.0).contains(cursor_center))
+        && !crate::nav_buttons::covers(app, rect, crate::nav_buttons::NavView::Uv, cursor_center)
     {
         // Match the pressure-scaled radius used by continue_stroke_uv
         let radius_points =
@@ -1971,6 +1973,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     brush_readout(app, ui, &response, adjusting);
     view_header(app, ui, rect, "v2d");
     axis_gizmo(ui, rect, app, true);
+    crate::nav_buttons::show(app, ui, rect, crate::nav_buttons::NavView::Uv);
     let name = app.session.doc.project.texture_sets.get(texture_set_index).map(|texture_set| texture_set.name.clone()).unwrap_or_default();
     let name_position = rect.right_bottom() - SET_NAME_INSET;
     ui.painter().text(name_position, egui::Align2::RIGHT_BOTTOM, name, egui::FontId::proportional(SET_NAME_TEXT_SIZE), tokens.viewport_text);

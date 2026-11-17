@@ -272,6 +272,11 @@ fn default_export_dir() -> String {
 fn default_split_ratio() -> f32 {
     0.5
 }
+
+/// Settings that start on, for saved states that predate them
+fn default_true() -> bool {
+    true
+}
 /// The bake layout's version: saved bake docks from an older one load as `Dock::for_baking`
 const BAKE_LAYOUT_VERSION: u32 = 2;
 
@@ -332,6 +337,9 @@ pub struct UiState {
     /// Show the mesh wireframe over the 3D view.
     #[serde(default)]
     pub wireframe_3d: bool,
+    /// Show the orbit, pan and zoom buttons in the corner of the 3D and 2D views (Viewport menu)
+    #[serde(default = "default_true")]
+    pub nav_buttons: bool,
     #[serde(default)]
     pub render: RenderUi,
     #[serde(default)]
@@ -425,6 +433,7 @@ impl Default for UiState {
             new_project: NewProject::default(),
             uv_wireframe: true,
             wireframe_3d: false,
+            nav_buttons: true,
             render: RenderUi::default(),
             prefs: Prefs::default(),
             export: ExportUi::default(),
