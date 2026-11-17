@@ -1124,6 +1124,7 @@ fn export_settings_tab(app: &mut TextureCraftApp, ui: &mut Ui, presets: &[textur
             ui.end_row();
         }
         ui.label(tr("Output template"));
+        let before = app.ui.export.preset.clone();
         egui::ComboBox::from_id_salt("exp_preset").width(360.0).selected_text(app.ui.export.preset.clone()).show_ui(ui, |ui| {
             for p in presets {
                 ui.selectable_value(&mut app.ui.export.preset, p.name.clone(), &p.name);
@@ -1135,6 +1136,10 @@ fn export_settings_tab(app: &mut TextureCraftApp, ui: &mut Ui, presets: &[textur
                 ui.selectable_value(&mut app.ui.export.preset, p.name.clone(), &p.name);
             }
         });
+        if app.ui.export.preset != before {
+            let picked = std::mem::replace(&mut app.ui.export.preset, before);
+            crate::export_templates::select(app, picked);
+        }
         ui.end_row();
         ui.label(tr("File type"));
         ui.horizontal(|ui| {
@@ -1217,6 +1222,7 @@ fn export_settings_tab(app: &mut TextureCraftApp, ui: &mut Ui, presets: &[textur
 pub fn export(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let tk = Tokens::get(ctx);
     if !app.ui.windows.export {
+        app.ui.export.ask = None;
         return;
     }
     let mut open = true;
@@ -1292,6 +1298,7 @@ pub fn export(app: &mut TextureCraftApp, ctx: &egui::Context) {
             });
         });
     });
+    crate::export_templates::ask(app, ctx);
     if do_export && export_sets(app) {
         app.ui.windows.export = false;
     }

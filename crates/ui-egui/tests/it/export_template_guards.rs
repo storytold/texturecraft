@@ -69,8 +69,10 @@ fn delete_asks_and_cancel_keeps_the_template() {
     h.get_by_label("Delete the selected template").click();
     h.run_steps(3);
     assert_eq!(library.files(), 2, "nothing is deleted before the answer");
-    h.get_by_label("Cancel").click();
+    // The export dialog has a Cancel too; the question's comes last.
+    h.get_all_by_label("Cancel").last().unwrap().click();
     h.run_steps(3);
+    assert!(h.state().ui.windows.export, "the export dialog stays open");
     assert_eq!(library.files(), 2, "Cancel keeps the file");
     assert!(h.state().session.export_presets.list.iter().any(|p| p.name == "Alpha tpl"));
     assert!(h.state().ui.export.ask.is_none());
@@ -161,4 +163,18 @@ fn a_saved_edit_switches_without_asking() {
     assert!(h.state().ui.export.ask.is_none(), "nothing to ask: the edit is saved");
     assert_eq!(selected(&h), "Beta tpl");
     assert_eq!(h.state().session.export_preset("Alpha tpl").unwrap().maps[0].file, "$mesh_Edited");
+}
+
+#[test]
+fn the_settings_dropdown_asks_about_an_unfinished_edit_too() {
+    let library = Library::new("dropdown");
+    let mut h = harness(&library);
+    break_draft(&mut h);
+    texturecraft_ui_egui::export_templates::select(h.state_mut(), "Beta tpl".into());
+    assert_eq!(selected(&h), "Alpha tpl");
+    assert!(h.state().ui.export.ask.is_some());
+    h.state_mut().ui.export.ask = None;
+    h.state_mut().ui.export.draft.as_mut().unwrap().maps[0].file = "$mesh_ok".into();
+    texturecraft_ui_egui::export_templates::select(h.state_mut(), "Beta tpl".into());
+    assert_eq!(selected(&h), "Beta tpl", "a valid edit switches at once");
 }

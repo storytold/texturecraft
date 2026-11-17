@@ -227,7 +227,16 @@ pub fn tab(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]) {
     if let Some(a) = list_action {
         apply(app, ui.ctx(), a);
     }
-    ask(app, ui.ctx());
+}
+
+/// Select template `name` from outside the list (the Settings tab's dropdown); an unfinished
+/// edit of the current one is asked about first.
+pub fn select(app: &mut TextureCraftApp, name: String) {
+    if name != app.ui.export.preset && unfinished(app).is_some() {
+        app.ui.export.ask = Some(Ask::Leave(ListAction::Select(name)));
+    } else {
+        app.ui.export.preset = name;
+    }
 }
 
 fn preset_list(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]) -> Option<ListAction> {
@@ -299,7 +308,6 @@ fn unfinished(app: &TextureCraftApp) -> Option<String> {
 
 /// Run `act`; deleting a template and leaving one with an unfinished edit ask first.
 fn apply(app: &mut TextureCraftApp, ctx: &egui::Context, act: ListAction) {
-    app.ui.export.renaming = None;
     let leaves = match &act {
         ListAction::Select(name) | ListAction::StartRename(name) => *name != app.ui.export.preset,
         ListAction::New | ListAction::Duplicate | ListAction::Imported(_) => true,
@@ -315,6 +323,7 @@ fn apply(app: &mut TextureCraftApp, ctx: &egui::Context, act: ListAction) {
 }
 
 fn perform(app: &mut TextureCraftApp, ctx: &egui::Context, act: ListAction) {
+    app.ui.export.renaming = None;
     match act {
         ListAction::Select(name) => app.ui.export.preset = name,
         ListAction::New => {
@@ -349,8 +358,13 @@ fn remove(app: &mut TextureCraftApp, name: String) {
 }
 
 /// The open question, if any: Escape or Cancel keeps things as they are.
-fn ask(app: &mut TextureCraftApp, ctx: &egui::Context) {
+pub(crate) fn ask(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let Some(question) = app.ui.export.ask.clone() else { return };
+    // The edit was fixed while the question was open: nothing is dropped any more.
+    if matches!(question, Ask::Leave(_)) && unfinished(app).is_none() {
+        app.ui.export.ask = None;
+        return;
+    }
     let mut cancel = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     let mut yes = false;
     let (title, text, yes_label, no_label) = match &question {
