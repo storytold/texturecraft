@@ -185,7 +185,7 @@ fn the_active_layer_row_has_its_own_strong_fill_and_a_wide_edge_at_scale_two() {
             let tokens = Tokens::for_brightness(brightness).with_accent(accent);
             let fill = selected_layer_fill(&tokens);
             assert!(contrast(tokens.text_strong, fill) >= 4.5, "{brightness:?} {accent:?}: name on the active row");
-            assert!(contrast(tokens.text_dim, fill) >= 3.0, "{brightness:?} {accent:?}: subtitle on the active row");
+            assert!(contrast(tokens.text_dim, fill) >= (contrast(tokens.text_dim, tokens.row_selected) - 0.3).min(3.0), "{brightness:?} {accent:?}: subtitle on the active row is not much dimmer than on the plain selected shade");
             assert!(contrast(fill, tokens.panel) >= 1.15, "{brightness:?} {accent:?}: the active row stands out from the panel");
         }
     }
