@@ -116,3 +116,18 @@ fn the_option_is_kept_with_the_export_settings_and_reset_clears_it() {
     h.run_steps(2);
     assert!(!h.state().ui.export.material_x);
 }
+
+#[test]
+fn ticking_materialx_with_another_template_says_why_no_material_was_written() {
+    let dir = temp_dir("warn", "ui");
+    let mut h = dialog(&dir, "Document channels + Normal + AO");
+    h.get_by_label(OPTION).click();
+    h.run_steps(2);
+    h.get_by_label("Export").click();
+    h.run_steps(4);
+    assert!(names(&dir, ".mtlx").is_empty());
+    let toasts: Vec<&str> = h.state().toasts.iter().filter(|t| t.error && t.text.starts_with("MaterialX:")).map(|t| t.text.as_str()).collect();
+    assert!(!toasts.is_empty(), "a MaterialX warning is shown");
+    assert!(toasts.windows(2).all(|w| w[0] != w[1]), "the same warning is not repeated per texture set: {toasts:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
