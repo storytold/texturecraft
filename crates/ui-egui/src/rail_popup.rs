@@ -102,6 +102,7 @@ pub(crate) fn toggle(app: &mut TextureCraftApp, panel: Panel) {
 }
 
 /// Open `panel` from the rail: in its popup, or where it is in the dock (bake mode has no rail)
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn open(app: &mut TextureCraftApp, panel: Panel) {
     if app.ui.mode == Mode::Baking || app.ui.dock.is_open(panel) {
         app.ui.dock.focus(panel);

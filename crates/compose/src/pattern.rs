@@ -151,6 +151,45 @@ fn raw(kind: ProceduralKind, p: Vec3, seed: u32) -> f32 {
     }
 }
 
+/// `values` raised to a triplanar `sharpness` (at least 1): whole sharpnesses up to 16 (the usual
+/// ones) by repeated squaring, a few multiplies instead of three `powf` calls per texel.
+#[inline]
+fn sharpen(values: Vec3, sharpness: f32) -> Vec3 {
+    const MAX_INTEGER_SHARPNESS: f32 = 16.0;
+    let exponent = sharpness.max(1.0);
+    if exponent > MAX_INTEGER_SHARPNESS || exponent.fract() != 0.0 {
+        return values.powf(exponent);
+    }
+
+    let (mut remaining, mut base, mut result) = (exponent as u32, values, Vec3::ONE);
+    while remaining > 0 {
+        if remaining & 1 == 1 {
+            result *= base;
+        }
+        base *= base;
+        remaining >>= 1;
+    }
+
+    result
+}
+
+/// A triplanar plane whose weight, times the gain applied after blending, stays under this is
+/// not evaluated: even two skipped planes change a value by less than 1/65536, under the u16
+/// step layers are stored at. With sharp blends most texels need one plane, not three.
+const TRIPLANAR_SKIP: f32 = 1.0 / 131_072.0;
+
+/// Normalized triplanar blend weights (YZ, XZ, XY planes) for normal `nrm`; planes too light
+/// to change a 0..1 value scaled by `gain` afterwards weigh 0 (see [`TRIPLANAR_SKIP`]).
+fn triplanar_weights(nrm: Vec3, sharpness: f32, gain: f32) -> Vec3 {
+    let weights = sharpen(nrm.abs(), sharpness);
+    let weights = weights / (weights.x + weights.y + weights.z).max(1e-6);
+    let skip_threshold = TRIPLANAR_SKIP / gain.max(1.0);
+    let retained = Vec3::select(weights.cmplt(Vec3::splat(skip_threshold)), Vec3::ZERO, weights);
+
+    // Preserve the blend if thresholding would discard every plane
+    if retained == Vec3::ZERO { weights } else { retained }
+}
+
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -162,72 +201,76 @@ fn shape(pr: &Procedural, v: f32) -> f32 {
 }
 
 /// Evaluate a procedural through a projection.
-pub fn procedural(pr: &Procedural, proj: &Projection, c: &Coords) -> f32 {
-    let s = pr.scale.max(1e-4);
-    let v = match proj {
+pub fn procedural(pattern: &Procedural, projection: &Projection, coords: &Coords) -> f32 {
+    let pattern_scale = pattern.scale.max(1e-4);
+    let value = match projection {
         Projection::Uv { scale, rotation, offset } => {
             let (sn, cs) = rotation.to_radians().sin_cos();
-            let uv = Vec2::new(c.uv.x * cs - c.uv.y * sn, c.uv.x * sn + c.uv.y * cs) * Vec2::from(*scale) + Vec2::from(*offset);
-            // 2D patterns sample a slice of the 3D pattern.
-            raw(pr.kind, (uv * s).extend(0.0), pr.seed)
+            let uv = Vec2::new(coords.uv.x * cs - coords.uv.y * sn, coords.uv.x * sn + coords.uv.y * cs) * Vec2::from(*scale) + Vec2::from(*offset);
+
+            // Evaluate two-dimensional patterns on a slice of the volume
+            raw(pattern.kind, (uv * pattern_scale).extend(0.0), pattern.seed)
         }
         Projection::Triplanar { scale, sharpness, offset } => {
-            let p = c.pos * *scale * s + Vec3::from(*offset);
-            let w = c.nrm.abs().powf(sharpness.max(1.0));
-            let w = w / (w.x + w.y + w.z).max(1e-6);
-            raw(pr.kind, Vec3::new(p.z, p.y, 0.0), pr.seed) * w.x
-                + raw(pr.kind, Vec3::new(p.x, p.z, 0.0), pr.seed) * w.y
-                + raw(pr.kind, Vec3::new(p.x, p.y, 0.0), pr.seed) * w.z
+            let p = coords.pos * *scale * pattern_scale + Vec3::from(*offset);
+
+            // Shape scales the blend by the contrast
+            let w = triplanar_weights(coords.nrm, *sharpness, pattern.contrast);
+            let planes = [(w.x, Vec3::new(p.z, p.y, 0.0)), (w.y, Vec3::new(p.x, p.z, 0.0)), (w.z, Vec3::new(p.x, p.y, 0.0))];
+            planes.into_iter().filter(|(w, _)| *w > 0.0).map(|(w, q)| raw(pattern.kind, q, pattern.seed) * w).sum()
         }
         Projection::Planar { scale, axis, offset } => {
-            let p = c.pos * *scale * s + Vec3::from(*offset);
+            let p = coords.pos * *scale * pattern_scale + Vec3::from(*offset);
             let q = match axis {
                 0 => Vec3::new(p.z, p.y, 0.0),
                 1 => Vec3::new(p.x, p.z, 0.0),
                 _ => Vec3::new(p.x, p.y, 0.0),
             };
-            raw(pr.kind, q, pr.seed)
+            raw(pattern.kind, q, pattern.seed)
         }
         Projection::Spherical { scale } => {
-            let d = c.pos.try_normalize().unwrap_or(Vec3::Y);
+            let d = coords.pos.try_normalize().unwrap_or(Vec3::Y);
             let u = d.z.atan2(d.x) / std::f32::consts::TAU + 0.5;
             let v = d.y.clamp(-1.0, 1.0).acos() / std::f32::consts::PI;
-            raw(pr.kind, Vec3::new(u * 4.0, v * 2.0, 0.0) * *scale * s, pr.seed)
+            raw(pattern.kind, Vec3::new(u * 4.0, v * 2.0, 0.0) * *scale * pattern_scale, pattern.seed)
         }
         Projection::Cylindrical { scale, axis } => {
-            let p = c.pos;
+            let p = coords.pos;
             let (a, h, b) = match axis {
                 0 => (p.y, p.x, p.z),
                 2 => (p.x, p.z, p.y),
                 _ => (p.x, p.y, p.z),
             };
             let u = b.atan2(a) / std::f32::consts::TAU + 0.5;
-            raw(pr.kind, Vec3::new(u * 4.0, h, 0.0) * *scale * s, pr.seed)
+            raw(pattern.kind, Vec3::new(u * 4.0, h, 0.0) * *scale * pattern_scale, pattern.seed)
         }
-        // `c.uv` is already in the decal's frame (see [`decal_uv`]).
-        Projection::Decal(_) => raw(pr.kind, (c.uv * s).extend(0.0), pr.seed),
+        // The decal already supplied coordinates in its local frame
+        Projection::Decal(_) => raw(pattern.kind, (coords.uv * pattern_scale).extend(0.0), pattern.seed),
     };
-    shape(pr, v)
+
+    shape(pattern, value)
 }
 
 /// Texture coordinates (and blend weights) at which an image is sampled for a projection
 /// (unused slots weigh 0; no allocation per texel).
-pub fn image_samples(proj: &Projection, c: &Coords) -> [(Vec2, f32); 3] {
+pub fn image_samples(projection: &Projection, coords: &Coords) -> [(Vec2, f32); 3] {
     let one = |uv: Vec2| [(uv, 1.0), (Vec2::ZERO, 0.0), (Vec2::ZERO, 0.0)];
-    match proj {
+    match projection {
         Projection::Uv { scale, rotation, offset } => {
             let (sn, cs) = rotation.to_radians().sin_cos();
-            let uv = Vec2::new(c.uv.x * cs - c.uv.y * sn, c.uv.x * sn + c.uv.y * cs) * Vec2::from(*scale) + Vec2::from(*offset);
+            let uv = Vec2::new(coords.uv.x * cs - coords.uv.y * sn, coords.uv.x * sn + coords.uv.y * cs) * Vec2::from(*scale) + Vec2::from(*offset);
             one(uv)
         }
         Projection::Triplanar { scale, sharpness, offset } => {
-            let p = c.pos * *scale + Vec3::from(*offset);
-            let w = c.nrm.abs().powf(sharpness.max(1.0));
-            let w = w / (w.x + w.y + w.z).max(1e-6);
-            [(Vec2::new(p.z, -p.y), w.x), (Vec2::new(p.x, p.z), w.y), (Vec2::new(p.x, -p.y), w.z)]
+            let p = coords.pos * *scale + Vec3::from(*offset);
+
+            // Float images can exceed 1, so even a tiny plane weight can carry visible detail
+            let weights = coords.nrm.abs().powf(sharpness.max(1.0));
+            let weights = weights / (weights.x + weights.y + weights.z).max(1e-6);
+            [(Vec2::new(p.z, -p.y), weights.x), (Vec2::new(p.x, p.z), weights.y), (Vec2::new(p.x, -p.y), weights.z)]
         }
         Projection::Planar { scale, axis, offset } => {
-            let p = c.pos * *scale + Vec3::from(*offset);
+            let p = coords.pos * *scale + Vec3::from(*offset);
             let q = match axis {
                 0 => Vec2::new(p.z, -p.y),
                 1 => Vec2::new(p.x, p.z),
@@ -236,13 +279,13 @@ pub fn image_samples(proj: &Projection, c: &Coords) -> [(Vec2, f32); 3] {
             one(q * 0.5 + Vec2::splat(0.5))
         }
         Projection::Spherical { scale } => {
-            let d = c.pos.try_normalize().unwrap_or(Vec3::Y);
+            let d = coords.pos.try_normalize().unwrap_or(Vec3::Y);
             let u = d.z.atan2(d.x) / std::f32::consts::TAU + 0.5;
             let v = d.y.clamp(-1.0, 1.0).acos() / std::f32::consts::PI;
             one(Vec2::new(u, v) * *scale)
         }
         Projection::Cylindrical { scale, axis } => {
-            let p = c.pos;
+            let p = coords.pos;
             let (a, h, b) = match axis {
                 0 => (p.y, p.x, p.z),
                 2 => (p.x, p.z, p.y),
@@ -251,7 +294,7 @@ pub fn image_samples(proj: &Projection, c: &Coords) -> [(Vec2, f32); 3] {
             let u = b.atan2(a) / std::f32::consts::TAU + 0.5;
             one(Vec2::new(u, 0.5 - h * 0.5) * *scale)
         }
-        Projection::Decal(_) => one(c.uv),
+        Projection::Decal(_) => one(coords.uv),
     }
 }
 
@@ -333,6 +376,85 @@ mod tests {
                     let v = procedural(&pr, proj, &c);
                     assert!((0.0..=1.0).contains(&v), "{k:?} {proj:?} {v}");
                 }
+            }
+        }
+    }
+
+    /// Skipping light triplanar planes stays within a u16 step of evaluating all three, at any
+    /// contrast; near an axis it does skip.
+    #[test]
+    fn triplanar_plane_skipping_stays_under_one_u16_step() {
+        let full = |pattern: &Procedural, sharpness: f32, coords: &Coords| {
+            let position = coords.pos * pattern.scale;
+            let weights = coords.nrm.abs().powf(sharpness);
+            let weights = weights / (weights.x + weights.y + weights.z);
+            shape(
+                pattern,
+                raw(pattern.kind, Vec3::new(position.z, position.y, 0.0), pattern.seed) * weights.x
+                    + raw(pattern.kind, Vec3::new(position.x, position.z, 0.0), pattern.seed) * weights.y
+                    + raw(pattern.kind, Vec3::new(position.x, position.y, 0.0), pattern.seed) * weights.z,
+            )
+        };
+        let mut largest_difference = 0.0f32;
+        for kind in ProceduralKind::ALL {
+            for contrast in [1.0, 4.0, 16.0] {
+                let pattern = Procedural { contrast, ..Procedural::new(kind) };
+                for sharpness in [1.0, 4.0, 8.0, 16.0] {
+                    let projection = Projection::Triplanar { scale: 1.0, sharpness, offset: [0.0; 3] };
+                    for index in 0..400 {
+                        // Cover axis aligned and oblique normals at varied positions
+                        let position = index as f32 / 400.0;
+                        let normal = Vec3::new(position * 1.3, 1.0, (position * 7.0).sin() * position).normalize();
+                        let coords = Coords { uv: Vec2::ZERO, pos: Vec3::new((position * 11.0).sin(), (position * 5.0).cos(), position * 3.0), nrm: normal };
+                        largest_difference = largest_difference.max((procedural(&pattern, &projection, &coords) - full(&pattern, sharpness, &coords)).abs());
+                    }
+                }
+            }
+        }
+
+        assert!(largest_difference < 1.0 / 65535.0, "worst difference {largest_difference}");
+        let near_axis = triplanar_weights(Vec3::new(0.2, 1.0, 0.1).normalize(), 8.0, 1.0);
+        assert_eq!((near_axis.x, near_axis.z), (0.0, 0.0), "{near_axis}");
+
+        // An oblique normal skips no plane
+        let oblique = triplanar_weights(Vec3::ONE.normalize(), 8.0, 16.0);
+        assert!((oblique - Vec3::splat(1.0 / 3.0)).abs().max_element() < 1e-6, "{oblique}");
+
+        // Tiny weights must survive together when their sum exceeds a u16 step
+        for sharpness in [47.0, 64.0] {
+            let diagonal = triplanar_weights(Vec3::ONE.normalize(), sharpness, 1.0);
+            assert!(diagonal.min_element() > 0.0, "sharpness {sharpness}: {diagonal}");
+        }
+    }
+
+    #[test]
+    fn triplanar_image_sampling_preserves_bright_float_pixels() {
+        let image = crate::ImageRes { width: 2, height: 2, rgba: vec![[0.0; 4], [0.0; 4], [0.0; 4], [100_000.0; 4]], srgb: false };
+        let coords = Coords { uv: Vec2::ZERO, pos: Vec3::new(0.25, 0.25, 0.75), nrm: Vec3::new(0.2, 1.0, 0.1).normalize() };
+        let projection = Projection::Triplanar { scale: 1.0, sharpness: 8.0, offset: [0.0; 3] };
+        let weights = coords.nrm.abs().powf(8.0);
+        let expected = 100_000.0 * weights.x / (weights.x + weights.y + weights.z);
+
+        let actual: f32 =
+            image_samples(&projection, &coords).into_iter().filter(|(_, weight)| *weight > 0.0).map(|(uv, weight)| image.sample(uv.x, uv.y)[0] * weight).sum();
+
+        assert!(expected > 0.25, "the light plane must make a visible contribution");
+        assert!((actual - expected).abs() < 1.0 / 65535.0, "expected {expected}, got {actual}");
+    }
+
+    /// Repeated squaring agrees with `powf` to a few ulps for whole sharpnesses, and falls back
+    /// to `powf` for the rest.
+    #[test]
+    fn sharpen_matches_powf() {
+        for index in 0..=100 {
+            let values = Vec3::new(index as f32 / 100.0, 1.0 - index as f32 / 100.0, (index as f32 * 0.37).fract());
+            for sharpness in [0.0, 1.0, 2.0, 3.0, 4.0, 7.0, 8.0, 16.0] {
+                let (actual, expected) = (sharpen(values, sharpness), values.powf(sharpness.max(1.0)));
+                assert!((actual - expected).abs().max_element() <= 1e-6, "{values} ^ {sharpness}: {actual} vs {expected}");
+            }
+
+            for sharpness in [2.5, 17.0, 64.0] {
+                assert_eq!(sharpen(values, sharpness), values.powf(sharpness));
             }
         }
     }

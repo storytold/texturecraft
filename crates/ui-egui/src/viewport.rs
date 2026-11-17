@@ -46,7 +46,13 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         && app.ui.bake_paint_brush.on
         && !app.session.bake_meshes.high.is_empty()
         && app.session.doc.project.texture_sets.get(app.session.ts()).is_some_and(|texture_set| {
-            !texture_set.bake.high_poly.use_low_as_high && texture_set.bake.cage.kind == texturecraft_engine::core::CageType::DistanceBased
+            let settings = &texture_set.bake;
+            match app.ui.bake_paint_brush.target {
+                texturecraft_engine::core::BakePaintTarget::Skew => settings.skew_applies(),
+                texturecraft_engine::core::BakePaintTarget::Cage => {
+                    !settings.high_poly.use_low_as_high && settings.cage.kind == texturecraft_engine::core::CageType::DistanceBased
+                }
+            }
         });
     app.ui.bake_paint_brush.on = bake_painting;
 
@@ -72,6 +78,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         _ if mode == crate::state::Mode::Painting && app.session.quick_mask.editing && app.picking_id_color.is_none() => Some(crate::gpu::AuxView::QuickMask),
         ViewMode::MeshMap(map) => Some(crate::gpu::AuxView::MeshMap(map)),
         ViewMode::Mask(id) => Some(crate::gpu::AuxView::Mask(id)),
+        _ if mode == crate::state::Mode::Baking && app.ui.bake_visualization.bent_normal_shown() => Some(crate::gpu::AuxView::MeshMap(BakedMap::BentNormal)),
         _ => None,
     };
     let mut sync = PendingSync(Some(aux_view));
@@ -90,6 +97,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
             let divider_x = split_divider_x(app, ui, full);
             let left = Rect::from_min_max(full.min, pos2(divider_x - SPLIT_LINE_HALF_WIDTH, full.max.y));
             let right = Rect::from_min_max(pos2(divider_x + SPLIT_LINE_HALF_WIDTH, full.min.y), full.max);
+
             // Each view draws only on its side, so overlays such as the texture set name stay out of a narrow neighbour
             let clip = ui.clip_rect();
             ui.set_clip_rect(left.intersect(clip));
@@ -112,6 +120,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
     if mode == crate::state::Mode::Baking {
         crate::bake_mode::bake_bar(app, ui.ctx(), full);
+        crate::bake_mode::bake_warnings(app, ui.ctx(), full);
     }
 
     // Keep drawing until the 3D view finishes accumulating anti-aliasing samples
@@ -356,7 +365,7 @@ fn frame_size_in_pixels(ui: &Ui, rect: Rect) -> [u32; 2] {
 fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, mut frame: Frame, sync: &mut PendingSync) {
     let tokens = Tokens::get(ui.ctx());
     let bake = bake_visualization(app);
-    frame.shade.bake = bake.filter(|_| frame.kind == ViewKind::Scene);
+    frame.shade.bake = bake;
     let scene = match (sync.0.take(), app.gpu.as_mut()) {
         (Some(aux), Some(gpu_link)) => {
             let sync_start_ms = crate::now_ms();
@@ -434,33 +443,53 @@ fn view_header(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, id: &str) {
         }
     });
 
+    // Bake mode lights the project mesh with the neutral material unless the painted one is asked for
+    let baking = app.ui.mode == crate::state::Mode::Baking;
+    let neutral = baking && app.session.view == ViewMode::Material && app.ui.bake_visualization.neutral_shown;
     let label = match app.session.view {
+        _ if neutral => "Neutral Material".to_owned(),
         ViewMode::MeshMap(map) => crate::i18n::baked_map_label(map).to_owned(),
         _ => app.session.view.label(),
     };
     let channels = app.session.doc.project.texture_set(app.session.ts()).map(|texture_set| texture_set.channel_list()).unwrap_or_default();
     egui::ComboBox::from_id_salt(format!("{id}_mode")).width(VIEW_PICKER_WIDTH).selected_text(tr(&label)).show_ui(&mut child, |ui| {
-        if ui.selectable_label(app.session.view == ViewMode::Material, tr("Material")).clicked() {
+        if baking && ui.selectable_label(neutral, tr("Neutral Material")).clicked() {
+            app.ui.bake_visualization.neutral_shown = true;
+            app.run("viewport.view", json!({"mode": "material"}));
+        }
+        if ui.selectable_label(app.session.view == ViewMode::Material && !neutral, tr("Material")).clicked() {
+            // Only bake mode's pick turns the neutral material off; painting mode's Material leaves bake mode's choice alone
+            app.ui.bake_visualization.neutral_shown &= !baking;
             app.run("viewport.view", json!({"mode": "material"}));
         }
         ui.separator();
+        if baking {
+            mesh_map_entries(app, ui);
+            return;
+        }
+
         for channel in channels {
             if ui.selectable_label(app.session.view == ViewMode::Channel(channel), tr(channel.label())).clicked() {
                 app.run("viewport.view", json!({"mode": channel.id()}));
             }
         }
         ui.separator();
-        for map in BakedMap::ALL {
-            let map_label = trf("Mesh map: {map}", &[("map", &tr(crate::i18n::baked_map_label(map)))]);
-            if ui.selectable_label(app.session.view == ViewMode::MeshMap(map), map_label).clicked() {
-                app.run("viewport.view", json!({"mode": format!("map:{}", map.id())}));
-            }
-        }
+        mesh_map_entries(app, ui);
         ui.separator();
         if ui.selectable_label(app.session.view == ViewMode::UvChecker, tr("UV checker")).clicked() {
             app.run("viewport.view", json!({"mode": "uvChecker"}));
         }
     });
+}
+
+/// The view picker's entries that show one baked mesh map
+fn mesh_map_entries(app: &mut TextureCraftApp, ui: &mut Ui) {
+    for map in BakedMap::ALL {
+        let map_label = trf("Mesh map: {map}", &[("map", &tr(crate::i18n::baked_map_label(map)))]);
+        if ui.selectable_label(app.session.view == ViewMode::MeshMap(map), map_label).clicked() {
+            app.run("viewport.view", json!({"mode": format!("map:{}", map.id())}));
+        }
+    }
 }
 
 fn axis_gizmo(ui: &Ui, rect: Rect, app: &TextureCraftApp, uv: bool) {
@@ -832,7 +861,7 @@ fn bake_visualization(app: &TextureCraftApp) -> Option<texturecraft_render::Bake
         return None;
     }
 
-    app.ui.bake_visualization.visualization(app.session.ts())
+    Some(app.ui.bake_visualization.visualization(app.session.ts()))
 }
 
 /// What a drag on the selected decal's frame does.
@@ -1601,7 +1630,7 @@ fn brush_readout(app: &TextureCraftApp, ui: &Ui, response: &egui::Response, adju
     let Some(right_drag) = brush_drag_button(response).filter(|_| adjusting) else { return };
     let Some(press_origin) = ui.input(|input| input.pointer.press_origin()) else { return };
 
-    // Keep the brush cursor at the drag origin so the pointer does not cover the values
+    // Keep the values clear of the pointer and the brush cursor at its press origin
     if ui.input(|input| input.pointer.latest_pos()).is_some_and(|pointer| response.rect.contains(pointer)) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::None);
     }
@@ -1680,28 +1709,72 @@ pub(crate) fn brush_cursor(app: &TextureCraftApp, ui: &Ui, rect: Rect, position:
 /// windowing layer reports it for Windows Ink pens, and in the browser for pens that send touch
 /// events (tablets and phones); other pens come through as a mouse.
 /// shortcut: the windowing layer reports no pen tilt, so tilt can't drive the brush angle yet.
-fn pen_pressure(ui: &Ui) -> f32 {
-    let id = egui::Id::unique("pen_pressure");
-    let touch = ui.input(|i| {
-        i.raw.events.iter().rev().find_map(|e| match e {
-            egui::Event::Touch { phase, force, .. } => Some((*phase, force.filter(|f| f.is_finite()))),
+pub fn pen_pressure(ui: &Ui) -> f32 {
+    let pressure_id = egui::Id::unique("pen_pressure");
+    let touch = ui.input(|input| {
+        let events = &input.raw.events;
+        events.iter().enumerate().rev().find_map(|(index, event)| match event {
+            egui::Event::Touch { device_id, id: touch_id, phase, force, .. } => {
+                let mut contact_force = force.filter(|pressure| pressure.is_finite());
+                let mut effective_phase = *phase;
+                if contact_force.is_none() && matches!(*phase, egui::TouchPhase::Move | egui::TouchPhase::End) {
+                    // Recover pressure only from this contact, including an unforced press-frame move
+                    for previous_event in events[..index].iter().rev() {
+                        if let egui::Event::Touch { device_id: previous_device_id, id: previous_touch_id, phase: previous_phase, force: previous_force, .. } =
+                            previous_event
+                            && previous_device_id == device_id
+                            && previous_touch_id == touch_id
+                        {
+                            // A completed contact cannot supply pressure to a reused touch ID
+                            if matches!(previous_phase, egui::TouchPhase::End | egui::TouchPhase::Cancel) {
+                                effective_phase = egui::TouchPhase::Cancel;
+                                break;
+                            }
+
+                            contact_force = previous_force.filter(|pressure| pressure.is_finite());
+                            if contact_force.is_none() && *previous_phase == egui::TouchPhase::Start {
+                                effective_phase = egui::TouchPhase::Start;
+                                break;
+                            }
+
+                            if contact_force.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                Some((effective_phase, contact_force))
+            }
             _ => None,
         })
     });
+
     match touch {
-        Some((_, Some(f))) => {
-            let f = f.clamp(0.0, 1.0);
-            ui.data_mut(|d| d.insert_temp(id, f));
-            f
+        Some((_, Some(pressure))) => {
+            let pressure = pressure.clamp(0.0, 1.0);
+            ui.data_mut(|data| *data.get_temp_mut_or(pressure_id, pressure) = pressure);
+            pressure
         }
         // A pen lifts with no pressure, so keep its contact pressure for a tap
-        Some((egui::TouchPhase::End, None)) => ui.data(|d| d.get_temp(id)).unwrap_or(1.0),
-        // A finger must not inherit an earlier pen's pressure
-        Some((egui::TouchPhase::Start, None)) => {
-            ui.data_mut(|d| d.remove_temp::<f32>(id));
+        Some((egui::TouchPhase::End, None)) => ui.data(|data| data.get_temp(pressure_id)).unwrap_or(1.0),
+        // A touch without pressure must not inherit an earlier pen's pressure
+        Some((egui::TouchPhase::Start | egui::TouchPhase::Cancel, None)) => {
+            ui.data_mut(|data| data.remove_temp::<f32>(pressure_id));
             1.0
         }
-        _ => 1.0,
+        _ => {
+            let (primary_pressed, primary_active) =
+                ui.input(|input| (input.pointer.primary_pressed(), input.pointer.primary_down() || input.pointer.primary_released()));
+
+            // A fresh mouse press must not inherit the previous pen's pressure
+            if primary_active && !primary_pressed {
+                ui.data(|data| data.get_temp::<f32>(pressure_id)).unwrap_or(1.0)
+            } else {
+                ui.data_mut(|data| data.remove_temp::<f32>(pressure_id));
+                1.0
+            }
+        }
     }
 }
 
@@ -1873,21 +1946,21 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         }
     }
 
-    // Brush cursor shows the stamp's size and hardness at the pointer
+    // Match the 3D view's stamp size and hardness
     let show_brush_cursor = tool_acts(app) && !alt && !v_held;
     let pointer_in_view = ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| rect.contains(p));
     if show_brush_cursor
         && !path_tool
         && brush_tool(app.session.tool.tool)
         && !response.dragged_by(PointerButton::Middle)
-        // A drag can retain stale hover while the pointer is outside the view
+        // Egui keeps hover during drags; adjustment may continue outside the view
         && (adjusting || pointer_in_view)
-        // Ctrl+drag keeps the brush outline at the press origin
+        // Keep the brush outline at the press origin while adjusting
         && let Some(cursor_center) = if adjusting { ui.input(|input| input.pointer.press_origin()) } else { response.hover_pos().or_else(|| response.interact_pointer_pos()) }
-        // View header pickers keep the normal pointer
+        // Header pickers need the normal pointer
         && !view_header_rect(rect).is_some_and(|header| header.expand(2.0).contains(cursor_center))
     {
-        // Match the stamp radius used by `continue_stroke_uv`, including pen pressure
+        // Match the pressure-scaled radius used by continue_stroke_uv
         let radius_points =
             (to_screen(app.session.tool.brush.uv_stamp_radius(pen_pressure(ui)), 0.0).x - to_screen(0.0, 0.0).x).abs().max(BRUSH_CURSOR_MIN_RADIUS_POINTS);
         if pointer_in_view {
@@ -2252,7 +2325,7 @@ mod tests {
         let app = harness.state_mut();
         app.ui.mode = crate::state::Mode::Baking;
         let before = bake_visualization(app).unwrap();
-        assert!(before.high_poly && before.cage);
+        assert!(before.high_poly.shown && before.cage_shown());
 
         app.start_bake(vec![0]);
 

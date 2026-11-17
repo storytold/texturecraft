@@ -7,6 +7,9 @@ use crate::{GeomError, Result};
 /// An edge by the bits of its two end positions, the lower one first
 type EdgePositions = ([u32; 3], [u32; 3]);
 
+/// Normals closer than about one degree are the same normal: the edge between them is smooth
+const SAME_NORMAL_MIN_COSINE: f32 = 0.9998;
+
 /// A contiguous index range drawn with one material.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubMesh {
@@ -85,36 +88,37 @@ impl Mesh {
     /// split it from its twin), per material in `0..materials.len().max(1)`.
     pub fn wire_edges(&self) -> Vec<Vec<(u32, u32)>> {
         (0..self.materials.len().max(1))
-            .map(|m| {
-                // Edge → (real in some triangle, triangles using it), in first-seen order.
+            .map(|material| {
+                // Keep first-seen edge order while counting its triangle uses
                 let mut edges: Vec<((u32, u32), bool, u8)> = Vec::new();
-                let mut at: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
-                for t in self.triangles_of(m) {
-                    let Some(v) = self.indices.get(t * 3..t * 3 + 3) else { continue };
-                    let hidden = self.diagonals.get(t).copied().unwrap_or(0);
-                    for (i, (a, b)) in [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])].into_iter().enumerate() {
-                        let key = (a.min(b), a.max(b));
-                        let real = hidden >> i & 1 == 0;
-                        let e = *at.entry(key).or_insert_with(|| {
+                let mut edge_indices: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
+                for triangle in self.triangles_of(material) {
+                    let Some(vertices) = self.indices.get(triangle * 3..triangle * 3 + 3) else { continue };
+                    let hidden = self.diagonals.get(triangle).copied().unwrap_or(0);
+                    for (side, (from, to)) in [(vertices[0], vertices[1]), (vertices[1], vertices[2]), (vertices[2], vertices[0])].into_iter().enumerate() {
+                        let key = (from.min(to), from.max(to));
+                        let is_polygon_edge = hidden >> side & 1 == 0;
+                        let edge_index = *edge_indices.entry(key).or_insert_with(|| {
                             edges.push((key, false, 0));
                             edges.len() - 1
                         });
-                        if let Some((_, r, n)) = edges.get_mut(e) {
-                            *r |= real;
-                            *n = n.saturating_add(1);
+                        if let Some((_, edge_is_polygon_side, triangle_count)) = edges.get_mut(edge_index) {
+                            *edge_is_polygon_side |= is_polygon_edge;
+                            *triangle_count = triangle_count.saturating_add(1);
                         }
                     }
                 }
-                edges.into_iter().filter(|(_, real, n)| *real || *n == 1).map(|(k, ..)| k).collect()
+                edges.into_iter().filter(|(_, is_polygon_edge, triangle_count)| *is_polygon_edge || *triangle_count == 1).map(|(edge, ..)| edge).collect()
             })
             .collect()
     }
 
-    /// Edges where the UV layout splits: two triangles meet there in 3D but not in UV space, per material in `0..materials.len().max(1)`
-    pub fn uv_seam_edges(&self) -> Vec<Vec<(u32, u32)>> {
+    /// Hard edges the UV layout does not split, which bake visible lines into the normal map: two triangles meet there with different normals but the same UVs, per material in `0..materials.len().max(1)`
+    pub fn missing_seam_edges(&self) -> Vec<Vec<(u32, u32)>> {
         // Signed zero denotes the same position on either side of an imported seam
         let bits = |position: Vec3| position.to_array().map(|coordinate| if coordinate == 0.0 { 0 } else { coordinate.to_bits() });
         let mut seams = vec![Vec::new(); self.materials.len().max(1)];
+
         // Match across materials before grouping the lines for texture-set visibility
         let mut sides: std::collections::HashMap<EdgePositions, Vec<(u32, u32, usize)>> = std::collections::HashMap::new();
         for material in 0..seams.len() {
@@ -132,10 +136,19 @@ impl Mesh {
         }
 
         let uv = |index: u32| self.uvs.get(index as usize).copied();
+
+        // Imported normals need not be unit length; two missing normals agree
+        let direction = |index: u32| self.normals.get(index as usize).map_or(Vec3::ZERO, |normal| normal.normalize_or_zero());
+        let same_normal = |a: u32, b: u32| {
+            let (a, b) = (direction(a), direction(b));
+            a == b || a.dot(b) >= SAME_NORMAL_MIN_COSINE
+        };
         for pairs in sides.into_values() {
             let Some(&(first_from, first_to, _)) = pairs.first() else { continue };
 
-            if pairs.iter().any(|&(from, to, _)| (uv(from), uv(to)) != (uv(first_from), uv(first_to))) {
+            let uv_split = pairs.iter().any(|&(from, to, _)| (uv(from), uv(to)) != (uv(first_from), uv(first_to)));
+            let hard = pairs.iter().any(|&(from, to, _)| !same_normal(from, first_from) || !same_normal(to, first_to));
+            if hard && !uv_split {
                 for (from, to, material) in pairs {
                     if let Some(edges) = seams.get_mut(material) {
                         edges.push((from.min(to), from.max(to)));
@@ -471,67 +484,77 @@ mod tests {
     fn wire_edges_leave_out_polygon_diagonals() {
         let mut m = quad();
         assert_eq!(m.wire_edges(), vec![vec![(0, 1), (1, 2), (0, 2), (2, 3), (0, 3)]], "triangles show every edge");
-        // Edge 2 of (0, 1, 2) and edge 0 of (0, 2, 3) split the quad.
+
+        // Hide the quad's shared diagonal
         m.diagonals = vec![0b100, 0b001];
         assert_eq!(m.wire_edges(), vec![vec![(0, 1), (1, 2), (2, 3), (0, 3)]]);
-        // A diagonal whose twin a seam split off (vertex 4 copies vertex 0) stays.
+
+        // Keep the diagonal when a seam splits its twin
         let mut seam = m.clone();
         seam.indices[3] = 4;
         assert_eq!(seam.wire_edges()[0].len(), 6);
-        // Appending keeps each side's diagonals on its own triangles.
+
+        // Appending preserves each side's own diagonals
         let mut a = Mesh::from_parts(m.positions.clone(), None, m.uvs.clone(), vec![0, 1, 2], "A").unwrap();
         a.append(&m);
         assert_eq!(a.diagonals, vec![0, 0b100, 0b001]);
         assert_eq!(crate::primitives::plane(1.0, 2).wire_edges()[0].len(), 12, "a 2×2 grid of quads has 12 edges");
     }
 
-    #[test]
-    fn uv_seams_are_where_the_uv_layout_splits() {
-        let mesh = quad();
-        assert_eq!(mesh.uv_seam_edges(), vec![Vec::<(u32, u32)>::new()], "one UV island has no seam");
-
-        // Vertex 4 copies vertex 0's position with another UV: the diagonal (0, 2) / (4, 2) is cut
-        let mut seam = mesh.clone();
-        seam.positions.push(seam.positions[0]);
-        seam.normals.push(seam.normals[0]);
-        seam.tangents.push(seam.tangents[0]);
-        seam.uvs.push(Vec2::new(0.9, 0.9));
-        seam.indices[3] = 4;
-        assert_eq!(seam.uv_seam_edges(), vec![vec![(0, 2), (2, 4)]]);
-
-        // The same split with the same UV is a hard edge, not a seam
-        let mut hard = seam.clone();
-        hard.uvs[4] = hard.uvs[0];
-        assert_eq!(hard.uv_seam_edges(), vec![Vec::<(u32, u32)>::new()]);
-    }
-
-    #[test]
-    fn uv_seams_join_positions_with_opposite_signed_zero() {
-        let mut mesh = quad();
-        mesh.positions.push(Vec3::new(-0.0, 0.0, 0.0));
-        mesh.normals.push(mesh.normals[0]);
-        mesh.tangents.push(mesh.tangents[0]);
-        mesh.uvs.push(Vec2::new(0.9, 0.9));
-        mesh.indices[3] = 4;
-        assert_eq!(mesh.positions[0], mesh.positions[4]);
-        assert_eq!(mesh.uv_seam_edges(), vec![vec![(0, 2), (2, 4)]]);
-    }
-
-    #[test]
-    fn uv_seams_between_materials_belong_to_both_materials() {
+    /// `quad` with vertex 4 a copy of vertex 0 at `uv` with `normal`, used by the second triangle: the diagonal (0, 2) / (4, 2) has two sides
+    fn split_quad(uv: Vec2, normal: Vec3) -> Mesh {
         let mut mesh = quad();
         mesh.positions.push(mesh.positions[0]);
-        mesh.normals.push(mesh.normals[0]);
+        mesh.normals.push(normal);
         mesh.tangents.push(mesh.tangents[0]);
-        mesh.uvs.push(Vec2::new(0.9, 0.9));
+        mesh.uvs.push(uv);
         mesh.indices[3] = 4;
+        mesh
+    }
+
+    #[test]
+    fn missing_seams_are_hard_edges_the_uv_layout_does_not_split() {
+        let none = vec![Vec::<(u32, u32)>::new()];
+        assert_eq!(quad().missing_seam_edges(), none, "a smooth quad has no hard edge");
+
+        let shared_uv = quad().uvs[0];
+        let smooth_split = split_quad(shared_uv, Vec3::Z);
+        assert_eq!(smooth_split.missing_seam_edges(), none, "the same normal on both sides is a smooth edge");
+
+        let hard = split_quad(shared_uv, Vec3::new(1.0, 0.0, 1.0).normalize());
+        assert_eq!(hard.missing_seam_edges(), vec![vec![(0, 2), (2, 4)]], "a hard edge inside one UV island");
+
+        let seamed = split_quad(Vec2::new(0.9, 0.9), hard.normals[4]);
+        assert_eq!(seamed.missing_seam_edges(), none, "a hard edge on a UV seam is fine");
+
+        let mut short_normals = quad();
+        short_normals.normals.iter_mut().for_each(|normal| *normal *= 0.5);
+        assert_eq!(short_normals.missing_seam_edges(), none, "normals shorter than unit length point the same way");
+        assert_eq!(split_quad(shared_uv, Vec3::Z * 0.5).missing_seam_edges(), none, "normals of different lengths point the same way");
+
+        let mut no_normals = quad();
+        no_normals.normals.fill(Vec3::ZERO);
+        assert_eq!(no_normals.missing_seam_edges(), none, "two missing normals agree");
+    }
+
+    #[test]
+    fn missing_seams_join_positions_with_opposite_signed_zero() {
+        let mut mesh = split_quad(quad().uvs[0], Vec3::X);
+        mesh.positions[4] = Vec3::new(-0.0, 0.0, 0.0);
+        assert_eq!(mesh.positions[0], mesh.positions[4]);
+        assert_eq!(mesh.missing_seam_edges(), vec![vec![(0, 2), (2, 4)]]);
+    }
+
+    #[test]
+    fn missing_seams_between_materials_belong_to_both_materials() {
+        let mut mesh = split_quad(quad().uvs[0], Vec3::X);
         mesh.materials.push("second".into());
         mesh.submeshes[0].count = 3;
         mesh.submeshes.push(SubMesh { name: "second".into(), material: 1, start: 3, count: 3 });
 
-        assert_eq!(mesh.uv_seam_edges(), vec![vec![(0, 2)], vec![(2, 4)]]);
-        mesh.uvs[4] = mesh.uvs[0];
-        assert_eq!(mesh.uv_seam_edges(), vec![Vec::<(u32, u32)>::new(); 2], "a material boundary alone is not a UV seam");
+        assert_eq!(mesh.missing_seam_edges(), vec![vec![(0, 2)], vec![(2, 4)]]);
+        mesh.normals[4] = mesh.normals[0];
+        assert_eq!(mesh.missing_seam_edges(), vec![Vec::<(u32, u32)>::new(); 2], "a material boundary alone is not a hard edge");
     }
 
     #[test]

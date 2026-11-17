@@ -660,7 +660,7 @@ mod tests {
     }
 
     fn compressed_ints(out: &mut Vec<u8>, v: &[i64]) {
-        let comp = codec::compress(&codec::encode_ints(v, 4));
+        let comp = codec::compress(&codec::encode_ints(v, 4).unwrap()).unwrap();
         out.extend_from_slice(&(comp.len() as u64).to_le_bytes());
         out.extend_from_slice(&comp);
     }
@@ -721,7 +721,7 @@ mod tests {
         compressed_ints(&mut b, &idx);
         let i64_at = b.len() as u64;
         b.extend_from_slice(&(n as u64).to_le_bytes());
-        let comp = codec::compress(&codec::encode_ints(&(0..n as i64).map(|i| i << 33).collect::<Vec<_>>(), 8));
+        let comp = codec::compress(&codec::encode_ints(&(0..n as i64).map(|i| i << 33).collect::<Vec<_>>(), 8).unwrap()).unwrap();
         b.extend_from_slice(&(comp.len() as u64).to_le_bytes());
         b.extend_from_slice(&comp);
         let c = crate_over(&b, (0, 8, 0));

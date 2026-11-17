@@ -39,6 +39,7 @@ pub mod orb_preview;
 pub mod painting;
 mod path_draft;
 pub mod path_tool;
+pub mod pbr_cmds;
 mod polygon_fill;
 mod polygon_fill_drag;
 // Mesh reimport reads files on native targets only

@@ -229,8 +229,8 @@ pub fn validate(workspace: &Workspace) -> Result<(), String> {
 /// Height of a panel group's tab strip, in points
 pub(crate) const TAB_HEIGHT: f32 = 30.0;
 
-/// Width of the bake layout's texture set and mesh map bakers column, in points
-const BAKERS_COLUMN_WIDTH: f32 = 200.0;
+/// Width of the bake layout's texture set and mesh map bakers column in points: the reference's scaled to our larger font
+const BAKERS_COLUMN_WIDTH: f32 = 232.0;
 /// Width of the bake layout's common and mesh map settings column, in points
 const SETTINGS_COLUMN_WIDTH: f32 = 330.0;
 /// Height of the log under the bake layout's columns, in points

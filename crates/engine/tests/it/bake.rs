@@ -464,7 +464,8 @@ fn leaning_session(lean: bool) -> Session {
     }
     let high_text = obj(&mesh, 0.1, f32::MAX, [1.0; 3]);
     let mut s = Session::new_project("t", mesh, "builtin:plane", None, 256).unwrap();
-    // A folder of its own per call: tests run in parallel, and another one removes the shared folder.
+
+    // Tests run in parallel, so each call needs its own folder
     static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("texturecraft-lean-test-{}-{call}", std::process::id()));
@@ -472,7 +473,8 @@ fn leaning_session(lean: bool) -> Session {
     let high = dir.join("high.obj");
     std::fs::write(&high, high_text).unwrap();
     execute(&mut s, "bake.highPoly.add", &json!({ "path": high.display().to_string() })).unwrap();
-    // The mesh is parsed and kept on add, so the file can go.
+
+    // The imported mesh remains after its source file is removed
     let _ = std::fs::remove_dir_all(&dir);
     execute(
         &mut s,
@@ -489,10 +491,12 @@ fn the_skew_map_is_saved_with_the_project() {
     execute(&mut s, "bake.skew.set", &json!({ "value": 0.25 })).unwrap();
     let back = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
     assert_eq!(back.doc.bake_paint, s.doc.bake_paint);
-    // No skew: none comes back.
+
+    // Clearing skew persists
     execute(&mut s, "bake.skew.clear", &Value::Null).unwrap();
     assert!(Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap().doc.bake_paint.is_empty());
-    // A map with a non-finite value is skipped with a log line, and the project still opens.
+
+    // Invalid saved skew is skipped without preventing project load
     let mut pf = s.project_file();
     pf.bake_paint.insert((0, texturecraft_core::BakePaintTarget::Skew), texturecraft_formats::BakePaintData { width: 1, height: 1, values: vec![f32::NAN] });
     let opened = Session::from_project_file(pf).unwrap();
@@ -505,26 +509,45 @@ fn the_skew_map_is_saved_with_the_project() {
 }
 
 #[test]
+fn the_skew_map_steers_only_a_distance_cage_with_averaged_normals() {
+    let mut s = leaning_session(false);
+    execute(&mut s, "bake.skew.set", &json!({ "value": 0.25 })).unwrap();
+    assert!(s.bake_task(0).unwrap().skew.is_some());
+
+    s.doc.project.texture_sets[0].bake.cage.average_normals = false;
+    assert!(s.bake_task(0).unwrap().skew.is_none(), "without averaged normals the skew map is left out");
+    s.doc.project.texture_sets[0].bake.cage.average_normals = true;
+    let cage = obj(&s.mesh.clone(), 0.05, f32::MAX, [1.0; 3]);
+    s.set_cage_bytes("cage.obj", cage.into_bytes()).unwrap();
+    s.doc.project.texture_sets[0].bake.cage.kind = texturecraft_core::CageType::CustomFile;
+    assert!(s.bake_task(0).unwrap().skew.is_none(), "a cage file sets the rays itself");
+}
+
+#[test]
 fn painting_skew_widens_a_map_and_bad_strokes_change_nothing() {
     let mut s = leaning_session(true);
-    // Painting with no map makes a black one at `size` and puts the dab in it.
+
+    // The first stroke creates a black map at the requested size
     let r = execute(&mut s, "bake.skew.paint", &json!({ "points": [[0.5, 0.5]], "radius": 0.1, "size": 64 })).unwrap();
     assert_eq!(r["skew"]["width"], 64);
     let map = s.doc.bake_paint.get(&(0, texturecraft_core::BakePaintTarget::Skew)).cloned().unwrap();
     assert!(map.values.iter().any(|v| *v > 0.99) && map.values.contains(&0.0));
     let rev = s.revision;
-    // Erasing with value 0 brings it back down; the size stays.
+
+    // Erasing retains the map size
     execute(&mut s, "bake.skew.paint", &json!({ "points": [[0.5, 0.5]], "radius": 0.2, "value": 0.0, "hardness": 1.0 })).unwrap();
     let after = s.doc.bake_paint.get(&(0, texturecraft_core::BakePaintTarget::Skew)).cloned().unwrap();
     assert_eq!(after.width, 64);
     assert!(after.values.iter().all(|v| *v < 0.01) && s.revision > rev);
-    // A constant map is widened, keeping its value where nothing is painted.
+
+    // Resizing preserves untouched constant values
     execute(&mut s, "bake.skew.set", &json!({ "value": 0.5 })).unwrap();
     execute(&mut s, "bake.skew.paint", &json!({ "points": [[0.1, 0.1]], "radius": 0.05, "size": 32 })).unwrap();
     let wide = s.doc.bake_paint.get(&(0, texturecraft_core::BakePaintTarget::Skew)).cloned().unwrap();
     assert_eq!(wide.width, 32);
     assert!((wide.values[wide.values.len() / 2] - 0.5).abs() < 1e-5, "{}", wide.values[wide.values.len() / 2]);
-    // Hostile input is an error and leaves the map alone.
+
+    // Invalid strokes leave the map unchanged
     let before = s.doc.bake_paint.get(&(0, texturecraft_core::BakePaintTarget::Skew)).cloned();
     for bad in [
         json!({}),
@@ -541,7 +564,8 @@ fn painting_skew_widens_a_map_and_bad_strokes_change_nothing() {
         assert!(execute(&mut s, "bake.skew.paint", &bad).is_err(), "{bad}");
     }
     assert_eq!(s.doc.bake_paint.get(&(0, texturecraft_core::BakePaintTarget::Skew)).cloned(), before);
-    // And the painted map is saved with the project.
+
+    // Painted skew survives a project round trip
     let back = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
     assert_eq!(back.doc.bake_paint, s.doc.bake_paint);
 }

@@ -144,6 +144,7 @@ pub fn load(app: &mut TextureCraftApp, name: &str, bytes: Vec<u8>) {
     match next {
         Ok(next) => {
             app.session.switch_to(next);
+            app.pbr_import = None;
             app.toast(trf("Opened {name}", &[("name", &name)]), false);
         }
         Err(e) => app.toast(trf("Couldn't open {name}: {error}", &[("name", &name), ("error", &e)]), true),

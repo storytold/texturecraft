@@ -311,6 +311,64 @@ printf '%s\n' '{"id":1,"method":"command.run","params":{"id":"project.new","para
               '{"id":2,"method":"render","params":{"width":512,"height":512}}' | texturecraft-cli serve
 ```
 
+## PBR texture folders
+
+`file.importPbrFolder` turns a folder, a `.zip` or a list of image files of PBR maps into one fill layer
+(one undo step), the way `file.importMaterialX` does for a `.mtlx`. `file.scanPbrFolder` takes the same
+`path` / `files` and reports what would be used without changing anything. Both are `file.*` commands, so
+they run over the control channel and the CLI, not through MCP `command_run` (which refuses `file.*`
+commands and host paths).
+
+| Command | Params |
+|---|---|
+| `file.importPbrFolder` | `{path \| files, name?, normalFormat?: auto\|openGl\|directX, projection?: uv\|triplanar\|planar..., scale?, choose?: {map: file}}` → `{layer, name, maps, candidates, normalFormat, channels, resources, ignored, warnings}` |
+| `file.scanPbrFolder` | `{path \| files, name?, normalFormat?, choose?, projection?, scale?}` → `{name, maps, candidates, normalFormat, ignored, channelsAvailable}` |
+
+Maps are found by file name, case-insensitively, from the last known word in the name; resolution
+(`2k`, `4096`), bit depth and other tokens are skipped:
+
+| Map (`maps` key) | Words |
+|---|---|
+| `baseColor` | `basecolor`, `base_color`, `albedo`, `diffuse`, `diff`, `col`, `color`, `bc`, `basemap`, `maintex` |
+| `roughness` | `roughness`, `rough`, `rgh` |
+| `glossiness` (inverted into roughness; a roughness file wins) | `gloss`, `glossiness`, `smoothness` |
+| `metallic` | `metallic`, `metalness`, `metal`, `mtl` |
+| `normal` | `normal`, `nrm`, `nor`, `norm`, `normalmap`, `bumpmap`, a trailing `n` |
+| `height` | `height`, `disp`, `displacement`, `hgt`, `bump` (weakest) |
+| `ambientOcclusion` | `ao`, `ambientocclusion`, `ambient_occlusion`, `occlusion`, `occ` |
+| `emissive` | `emissive`, `emission`, `emit`, `glow` |
+| `opacity` | `opacity`, `alpha`, `transparency` |
+| `orm` (split: R occlusion, G roughness, B metallic; separate files win) | `orm`, `arm`, `ao_rough_metal` |
+
+- **Normal convention.** `gl` / `opengl` in the name is OpenGL, `dx` / `directx` is DirectX (the layer's
+  normal source is flagged DirectX, so its green is flipped where it is sampled). With neither the map is
+  OpenGL. `normalFormat: openGl|directX` forces every normal map; `auto` (the default) reads the name.
+- **Ignored**: other files, dot files and `__MACOSX`, preview images (`preview`, `thumb`, `thumbnail`,
+  `sphere`, `render`, `swatch`, `icon`), and maps with no channel here (cavity, curvature, specular...).
+  Each is listed in `ignored` with the reason.
+- **Several files for one map** (resolutions, formats, GL and DX): the OpenGL normal, then the highest
+  resolution token, then the largest file wins. A programmatic call never asks; `candidates` lists the
+  alternatives and `choose: {"baseColor": "file.png"}` picks one (the app's dialog shows a drop-down).
+- **Where.** A folder's own files if they hold maps; otherwise the one sub-folder that does (several are
+  an error that names them). The layer is named after the folder, archive or shared file-name prefix.
+  The import reply's `name` is the created layer's unique name, including its numeric suffix.
+  A blank `name` uses the same source-derived default as an omitted name.
+- **Channels** the texture set doesn't have are skipped with a warning. Projection defaults to UV
+  (`scale` 1); `projection: triplanar` is the option for models without good UVs.
+- **Hostile input.** Links, pipes and devices are rejected as sources. A scan admits at most 4096
+  directory entries (including subdirectories), selected files, or ZIP entries. Folder traversal is
+  limited to four levels below the root; exceeding a scan limit returns an error instead of a partial list.
+  A file or ZIP entry is at most 256 MiB, an archive 512 MiB, an image 64 Mi texels (320 Mi per import).
+  Actual reads are capped even if a file grows. Decoded sources and outputs also share an estimated
+  memory budget: one quarter of available memory, capped at 4 GiB (1 GiB for the byte API on the web).
+  Compressed inputs already held by the caller and existing project/GPU memory are outside that estimate.
+  An image that exceeds the budget or cannot decode is skipped with a warning; if none decodes the
+  import is an error that changes nothing. `maps` describes detection; `channels` and `resources`
+  describe the successful import. Scan validates import options without decoding pixels.
+
+In the app: File › Import PBR texture folder... or drop a folder, a `.zip` or several map files on the
+window. The dialog shows the maps found, lets you pick between candidates, set the normal convention and
+projection, and keep the material in the library (shelf › Materials).
 ## Camera bookmarks
 
 Saved cameras (`Project.cameras`, stored in the `.tcraft` file) are the camera bookmarks.
@@ -342,9 +400,10 @@ Re-cooks use `materialcraft-cli batch` to open the saved graph by name and run `
 (the app is `$MATERIALCRAFT` / `materialcraft`). Baked maps feed graph input nodes whose identifier
 matches the map's shared id (`ambientOcclusion`, `curvature`, `thickness`, `position`,
 `worldNormal`, `normal`, `height`, `id`, `bentNormal`, `opacity`, `colorMap`, `worldDirection`;
-case and underscores ignored). Usages map to channels of the same id (`baseColor`, `normal` in
-OpenGL convention, `roughness`, `metallic`, `height`, `ambientOcclusion`, `emissive`, `opacity`,
-`specular`); missing channels join the texture set.
+case and underscores ignored; `normal` and `bentNormal` are tangent space, OpenGL green). Usages
+map to channels of the same id (`baseColor`, `normal` in OpenGL convention, `roughness`, `metallic`,
+`height`, `ambientOcclusion`, `emissive`, `opacity`, `specular`); missing channels join the texture
+set.
 
 ## CLI
 

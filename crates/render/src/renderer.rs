@@ -31,14 +31,16 @@ use texturecraft_geom::{Mesh, OrbitCamera};
 use texturecraft_texel::TILE;
 
 use crate::bake_visualization::BakeVisualization;
+use crate::cage_geometry::CageGeometry;
 use crate::cage_gpu::CageGpu;
 use crate::gpu_trace::{Checked, checked};
 use crate::high_poly_gpu::HighPolyGpu;
 use crate::ibl;
+use crate::mips_dirty::MipsDirty;
+use crate::missing_seam_gpu::MissingSeamGpu;
 use crate::overlay_quad::OverlayQuad;
 use crate::set_highlight::SetHighlight;
 use crate::subdivide::{self, Vertex};
-use crate::uv_seam_gpu::UvSeamGpu;
 
 pub const MSAA: u32 = 4;
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -84,6 +86,14 @@ struct GlobalsRaw {
     refr: [f32; 4],
     highlight: [f32; 4],
     highlight_shift: [f32; 4],
+    bake_high: [f32; 4],
+    bake_matching_error: [f32; 4],
+    bake_cage: [f32; 4],
+    bake_cage_wire: [f32; 4],
+    bake_missing_seam: [f32; 4],
+    bake_neutral_color: [f32; 4],
+    bake_neutral: [f32; 4],
+    bake_bent_normal: [f32; 4],
 }
 
 /// The post pass uniform (see `Post` in post.wgsl).
@@ -358,7 +368,7 @@ struct SetGpu {
     /// until its sets are painted.
     tex: Vec<Tex>,
     bind_group: wgpu::BindGroup,
-    mips_dirty: Vec<bool>,
+    mips_dirty: Vec<MipsDirty>,
     /// Textures whose full-size allocation failed (out of GPU memory): they keep their
     /// placeholder until the set is re-created, instead of retrying on every tile.
     failed: Vec<bool>,
@@ -382,7 +392,7 @@ fn install(set: &mut SetGpu, slot: usize, tex: Tex, device: &wgpu::Device, layou
     }
     set.bind_group = set_bind_group(device, layout, sampler, &set.tex);
     if let Some(d) = set.mips_dirty.get_mut(slot) {
-        *d = true;
+        *d = MipsDirty::All;
     }
 }
 
@@ -548,7 +558,10 @@ pub struct Renderer {
     bake_high_pipeline: wgpu::RenderPipeline,
     cage_pipeline: wgpu::RenderPipeline,
     cage_wire_pipeline: wgpu::RenderPipeline,
-    uv_seam_pipeline: wgpu::RenderPipeline,
+    missing_seam_pipeline: wgpu::RenderPipeline,
+    /// The missing seams along the cage, and in the 2D view
+    cage_missing_seam_pipeline: wgpu::RenderPipeline,
+    uv_missing_seam_pipeline: wgpu::RenderPipeline,
     bg_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     post_pipeline: wgpu::RenderPipeline,
@@ -585,7 +598,7 @@ pub struct Renderer {
     bake_high: Option<HighPolyGpu>,
     /// Each texture set's cage, by set index
     cages: Vec<Option<CageGpu>>,
-    uv_seams: Option<UvSeamGpu>,
+    missing_seams: Option<MissingSeamGpu>,
     sets: Vec<SetGpu>,
     /// Viewport texture resolution: display textures at 1/2^shift of each set's size (at least
     /// as reduced as the device's texture limit needs).
@@ -626,8 +639,9 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 pub(crate) fn display_format(k: DisplayKind) -> wgpu::TextureFormat {
     match k {
         DisplayKind::BaseColor | DisplayKind::Emissive | DisplayKind::Sheen => wgpu::TextureFormat::Rgba8UnormSrgb,
-        DisplayKind::Orm | DisplayKind::Normal | DisplayKind::Lobes | DisplayKind::Extra => wgpu::TextureFormat::Rgba8Unorm,
-        DisplayKind::Height => wgpu::TextureFormat::Rgba16Float,
+        DisplayKind::Orm | DisplayKind::Lobes | DisplayKind::Extra => wgpu::TextureFormat::Rgba8Unorm,
+        // Baked normals are smooth high-precision data: 8 bits band the shading
+        DisplayKind::Normal | DisplayKind::Height => wgpu::TextureFormat::Rgba16Float,
     }
 }
 
@@ -818,6 +832,39 @@ fn fullscreen_blend(
     pass.draw(0..3, 0..1);
 }
 
+/// [`fullscreen`] over the `(x, y, w, h)` scissor rectangle only, keeping the rest of `target`
+/// (with `None`: the whole target, cleared, as [`fullscreen`]).
+fn mip_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    pipe: &wgpu::RenderPipeline,
+    bg: &wgpu::BindGroup,
+    scissor: Option<(u32, u32, u32, u32)>,
+) {
+    let Some((x, y, w, h)) = scissor else {
+        return fullscreen(encoder, label, target, CLEAR, pipe, bg);
+    };
+
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, bg, &[]);
+    pass.set_scissor_rect(x, y, w, h);
+    pass.draw(0..3, 0..1);
+}
+
 /// Halton low-discrepancy value of `i` in `base` (0..1).
 fn halton(mut i: u32, base: u32) -> f32 {
     let (mut f, mut r) = (1.0, 0.0);
@@ -872,8 +919,10 @@ impl Renderer {
                 fragment_entry(4, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison)),
             ],
         );
+
         // The display textures, the aux texture, the sampler
         let textures = DisplayKind::ALL.len() as u32 + 1;
+
         // Displacement reads the height (and the sampler) in the vertex shader
         let height = DisplayKind::ALL.iter().position(|kind| *kind == DisplayKind::Height).unwrap_or(0) as u32;
         let set_entries: Vec<_> = (0..textures)
@@ -910,7 +959,7 @@ impl Renderer {
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2],
         })];
 
-        // shortcut: the RGBA8 fallback clips highlights above 1 and bands in the darks; encode (e.g. RGBM) if WebGL2 without float color buffers turns out to matter
+        // RGBA8 fallback clips bright highlights and dark gradients
         let hdr_format = if hdr_renderable(device) { HDR_FORMAT } else { COLOR_FORMAT };
         let hdr_target = |fragment_entry_point, blend| Some((fragment_entry_point, hdr_format, blend));
         let always = || Some(depth_state(false, wgpu::CompareFunction::Always));
@@ -1001,8 +1050,30 @@ impl Renderer {
             MSAA,
             wire3d_depth.clone(),
         );
-        let uv_seam_pipeline =
-            pipeline(device, "tc_uv_seam", &layout, &module, "vs_wire3d", &vertex_layout, hdr_target("fs_wire_uv_seam", blend), MSAA, wire3d_depth.clone());
+        let cage_missing_seam_pipeline = pipeline(
+            device,
+            "tc_cage_missing_seam",
+            &background_layout,
+            &module,
+            "vs_bake_cage_wire",
+            &corner_layout,
+            hdr_target("fs_wire_cage_missing_seam", blend),
+            MSAA,
+            wire3d_depth.clone(),
+        );
+        let uv_missing_seam_pipeline =
+            pipeline(device, "tc_uv_missing_seam", &layout, &module, "vs_uv", &vertex_layout, hdr_target("fs_wire_missing_seam", blend), MSAA, always());
+        let missing_seam_pipeline = pipeline(
+            device,
+            "tc_missing_seam",
+            &layout,
+            &module,
+            "vs_wire3d",
+            &vertex_layout,
+            hdr_target("fs_wire_missing_seam", blend),
+            MSAA,
+            wire3d_depth.clone(),
+        );
         let bg_pipeline = pipeline(device, "tc_bg", &background_layout, &module, "vs_bg", &[], hdr_target("fs_bg", None), MSAA, always());
         let overlay_pipeline =
             pipeline(device, "tc_overlay", &background_layout, &module, "vs_overlay", &vertex_layout, hdr_target("fs_overlay", blend), MSAA, wire3d_depth);
@@ -1135,7 +1206,9 @@ impl Renderer {
             bake_high_pipeline,
             cage_pipeline,
             cage_wire_pipeline,
-            uv_seam_pipeline,
+            missing_seam_pipeline,
+            cage_missing_seam_pipeline,
+            uv_missing_seam_pipeline,
             bg_pipeline,
             blit_pipeline,
             post_pipeline,
@@ -1162,7 +1235,7 @@ impl Renderer {
             mesh: None,
             bake_high: None,
             cages: Vec::new(),
-            uv_seams: None,
+            missing_seams: None,
             sets: Vec::new(),
             display_shift: 0,
             material_sets: Vec::new(),
@@ -1223,6 +1296,7 @@ impl Renderer {
         if self.mesh.as_ref().is_some_and(|m| m.id == id) {
             return;
         }
+
         let verts = subdivide::vertices(mesh);
         let mk = |label: &str, data: &[u8], usage: wgpu::BufferUsages| upload_buffer(device, queue, label, data, usage);
         let mut idx_bytes = bytemuck::cast_slice::<u32, u8>(&mesh.indices).to_vec();
@@ -1230,7 +1304,8 @@ impl Renderer {
         let vb = mk("tc_vb", bytemuck::cast_slice(&verts), wgpu::BufferUsages::VERTEX);
         let ib = mk("tc_ib", &idx_bytes, wgpu::BufferUsages::INDEX);
         let draws: Vec<(u32, u32, usize)> = mesh.submeshes.iter().map(|s| (s.start, s.count, s.material)).collect();
-        // Mesh edges per material (polygons, not their triangles), for the wireframes.
+
+        // Use polygon edges for each material's wireframe
         let mut line_idx: Vec<u32> = Vec::new();
         let mut line_draws = Vec::new();
         for (m, edges) in mesh.wire_edges().into_iter().enumerate() {
@@ -1289,8 +1364,8 @@ impl Renderer {
         self.content_rev += 1;
     }
 
-    /// Texture set `texture_set`'s cage: `corners` three per triangle and `edges` as corner pairs; `None` removes it. The same `topology` as before only rewrites the corners
-    pub fn set_bake_cage(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, cage: Option<(&[Vec3], &[[u32; 2]])>, topology: u64) {
+    /// Texture set `texture_set`'s cage; `None` removes it. The same `topology` as before only rewrites the corners
+    pub fn set_bake_cage(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, cage: Option<CageGeometry<'_>>, topology: u64) {
         if self.cages.len() <= texture_set {
             self.cages.resize_with(texture_set + 1, || None);
         }
@@ -1298,16 +1373,18 @@ impl Renderer {
 
         match (cage, slot.as_mut()) {
             (None, _) => *slot = None,
-            (Some((corners, _)), Some(gpu)) if gpu.topology == topology && gpu.corner_count as usize == corners.len() => {
-                queue.write_buffer(&gpu.corners, 0, bytemuck::cast_slice(corners));
+            (Some(cage), Some(gpu)) if gpu.topology == topology && gpu.corner_count as usize == cage.corners.len() => {
+                queue.write_buffer(&gpu.corners, 0, bytemuck::cast_slice(cage.corners));
             }
-            (Some((corners, edges)), _) => {
+            (Some(cage), _) => {
                 *slot = Some(CageGpu {
                     topology,
-                    corners: upload_buffer(device, queue, "tc_cage_vb", bytemuck::cast_slice(corners), wgpu::BufferUsages::VERTEX),
-                    corner_count: corners.len() as u32,
-                    edges: upload_buffer(device, queue, "tc_cage_ib", bytemuck::cast_slice(edges), wgpu::BufferUsages::INDEX),
-                    edge_index_count: (edges.len() * 2) as u32,
+                    corners: upload_buffer(device, queue, "tc_cage_vb", bytemuck::cast_slice(cage.corners), wgpu::BufferUsages::VERTEX),
+                    corner_count: cage.corners.len() as u32,
+                    edges: upload_buffer(device, queue, "tc_cage_ib", bytemuck::cast_slice(cage.edges), wgpu::BufferUsages::INDEX),
+                    edge_index_count: (cage.edges.len() * 2) as u32,
+                    missing_seams: upload_buffer(device, queue, "tc_cage_seam_ib", bytemuck::cast_slice(cage.missing_seams), wgpu::BufferUsages::INDEX),
+                    missing_seam_index_count: (cage.missing_seams.len() * 2) as u32,
                 });
             }
         }
@@ -1322,8 +1399,8 @@ impl Renderer {
         }
     }
 
-    /// The low poly's UV seams as vertex pairs per material ([`Mesh::uv_seam_edges`]) for mesh `mesh_id`
-    pub fn set_uv_seams(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh_id: u64, seams: &[Vec<(u32, u32)>]) {
+    /// The low poly's hard edges without a UV seam as vertex pairs per material ([`Mesh::missing_seam_edges`]) for mesh `mesh_id`
+    pub fn set_missing_seams(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh_id: u64, seams: &[Vec<(u32, u32)>]) {
         let mut line_indices: Vec<u32> = Vec::new();
         let mut line_draws = Vec::new();
         for (material, edges) in seams.iter().enumerate() {
@@ -1332,8 +1409,8 @@ impl Renderer {
             line_draws.push((start, line_indices.len() as u32 - start, material));
         }
 
-        let lines = upload_buffer(device, queue, "tc_uv_seams", bytemuck::cast_slice(&line_indices), wgpu::BufferUsages::INDEX);
-        self.uv_seams = Some(UvSeamGpu { mesh_id, lines, line_draws });
+        let lines = upload_buffer(device, queue, "tc_missing_seams", bytemuck::cast_slice(&line_indices), wgpu::BufferUsages::INDEX);
+        self.missing_seams = Some(MissingSeamGpu { mesh_id, lines, line_draws });
         self.content_rev += 1;
     }
 
@@ -1362,19 +1439,20 @@ impl Renderer {
         self.sets.truncate(sets.len());
         let max = device.limits().max_texture_dimension_2d.max(1);
         for (i, &(size, _)) in sets.iter().enumerate() {
-            // shortcut: a set larger than the device's textures shows every 2^shift-th texel;
-            // a texture array per UV tile would keep full detail on such devices.
+            // Downscale sets that exceed the device's texture dimension limit
             let shift = (0..31).find(|s| size.0.max(size.1) >> s <= max).unwrap_or(0).max(self.display_shift);
             if self.sets.get(i).is_some_and(|s| s.size == size && s.shift == shift) {
                 continue;
             }
-            // Placeholders only: full-size textures come with the first non-neutral upload.
+
+            // Allocate full-size textures on the first non-neutral upload
             let mut tex: Vec<Tex> =
                 DisplayKind::ALL.iter().zip(&self.default_texels).map(|(k, texel)| neutral_tex(device, queue, (1, 1), display_format(*k), 1, texel)).collect();
             tex.push(neutral_tex(device, queue, (1, 1), wgpu::TextureFormat::Rgba8Unorm, 1, &AUX_NEUTRAL));
             let bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &tex);
             let n = tex.len();
-            let gpu = SetGpu { size, shift, tex, bind_group, mips_dirty: vec![true; n], failed: vec![false; n], pending: (0..n).map(|_| None).collect() };
+            let gpu =
+                SetGpu { size, shift, tex, bind_group, mips_dirty: vec![MipsDirty::All; n], failed: vec![false; n], pending: (0..n).map(|_| None).collect() };
             if i < self.sets.len() {
                 self.sets[i] = gpu;
             } else {
@@ -1393,101 +1471,123 @@ impl Renderer {
 
     /// Upload one 64×64 tile of a display texture (bytes from `compose::tile_bytes`).
     #[allow(clippy::too_many_arguments)]
-    pub fn upload_tile(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, kind: DisplayKind, tx: u32, ty: u32, bytes: &[u8]) {
-        let Some(set) = self.sets.get_mut(ts) else { return };
-        let Some(ki) = DisplayKind::ALL.iter().position(|k| *k == kind) else { return };
-        let (Some(t), Some(texel)) = (set.tex.get(ki), self.default_texels.get(ki)) else { return };
-        let bpt = kind.bytes_per_texel() as u32;
-        let (x, y) = (tx * TILE, ty * TILE);
-        if x >= set.size.0 || y >= set.size.1 || bytes.len() < (TILE * TILE * bpt) as usize {
+    pub fn upload_tile(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, kind: DisplayKind, tile_x: u32, tile_y: u32, bytes: &[u8]) {
+        let Some(set) = self.sets.get_mut(texture_set) else { return };
+        let Some(kind_index) = DisplayKind::ALL.iter().position(|k| *k == kind) else { return };
+        let (Some(texture), Some(texel)) = (set.tex.get(kind_index), self.default_texels.get(kind_index)) else { return };
+        let bytes_per_texel = kind.bytes_per_texel() as u32;
+
+        // Reject overflowing coordinates before a GPU origin can wrap to another tile
+        let (Some(x), Some(y)) = (tile_x.checked_mul(TILE), tile_y.checked_mul(TILE)) else { return };
+        if x >= set.size.0 || y >= set.size.1 || bytes.len() < (TILE * TILE * bytes_per_texel) as usize {
             return;
         }
-        let dims = display_dims(set.size, set.shift);
-        let awaiting = set.pending.get(ki).is_some_and(Option::is_some);
-        if !awaiting && (t.texture.width() < dims.0 || t.texture.height() < dims.1) {
-            // A placeholder: neutral tiles change nothing, the first real one allocates it.
-            if set.failed.get(ki).copied().unwrap_or(true) || bytes.chunks_exact(texel.len()).all(|px| px == texel.as_slice()) {
+
+        let display_size = display_dims(set.size, set.shift);
+        let allocation_pending = set.pending.get(kind_index).is_some_and(Option::is_some);
+        if !allocation_pending && (texture.texture.width() < display_size.0 || texture.texture.height() < display_size.1) {
+            // A neutral tile needs no full-size texture allocation
+            if set.failed.get(kind_index).copied().unwrap_or(true) || bytes.chunks_exact(texel.len()).all(|px| px == texel.as_slice()) {
                 return;
             }
-            let what = format!("texture set {} ({kind:?}, {}×{})", ts + 1, dims.0, dims.1);
-            let full = checked(device, &what, || neutral_tex(device, queue, dims, display_format(kind), mip_count(dims.0.max(dims.1)), texel));
-            if !grow(set, ts, ki, full, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
+
+            let allocation_label = format!("texture set {} ({kind:?}, {}×{})", texture_set + 1, display_size.0, display_size.1);
+            let full_texture = checked(device, &allocation_label, || {
+                neutral_tex(device, queue, display_size, display_format(kind), mip_count(display_size.0.max(display_size.1)), texel)
+            });
+            if !grow(set, texture_set, kind_index, full_texture, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
                 return;
             }
         }
-        // While WebGPU has not confirmed the full-size texture, tiles go into it (its errors, if
-        // it is invalid, are dropped with these scopes) and the placeholder stays bound.
-        let pending = set.pending.get(ki).and_then(Option::as_ref).map(|p| &p.tex);
-        let Some(t) = pending.or(set.tex.get(ki)) else { return };
-        let oom = pending.is_some().then(|| device.push_error_scope(wgpu::ErrorFilter::OutOfMemory));
-        let invalid = pending.is_some().then(|| device.push_error_scope(wgpu::ErrorFilter::Validation));
-        // Downscaled sets take every `step`-th texel of the tile.
-        let (step, n) = (1usize << set.shift.min(6), TILE >> set.shift.min(6));
-        let small: Vec<u8>;
-        let data = if step == 1 {
+
+        // Pending WebGPU textures receive tiles before replacing their placeholders
+        // Error scopes contain writes if a pending allocation is rejected
+        let pending = set.pending.get(kind_index).and_then(Option::as_ref).map(|p| &p.tex);
+        let Some(texture) = pending.or(set.tex.get(kind_index)) else { return };
+        let out_of_memory_scope = pending.is_some().then(|| device.push_error_scope(wgpu::ErrorFilter::OutOfMemory));
+        let validation_scope = pending.is_some().then(|| device.push_error_scope(wgpu::ErrorFilter::Validation));
+
+        // Downscaled sets take every `step`-th texel of the tile
+        let (step, tile_extent) = (1usize << set.shift.min(6), TILE >> set.shift.min(6));
+        let downscaled_bytes: Vec<u8>;
+        let upload_bytes = if step == 1 {
             bytes
         } else {
-            let texel = |r: usize, c: usize| bytes.get((r * TILE as usize + c) * bpt as usize..).unwrap_or_default().iter().take(bpt as usize);
-            small = (0..n as usize).flat_map(|r| (0..n as usize).flat_map(move |c| texel(r * step, c * step))).copied().collect();
-            &small
+            let texel = |row: usize, column: usize| {
+                bytes.get((row * TILE as usize + column) * bytes_per_texel as usize..).unwrap_or_default().iter().take(bytes_per_texel as usize)
+            };
+            downscaled_bytes =
+                (0..tile_extent as usize).flat_map(|row| (0..tile_extent as usize).flat_map(move |column| texel(row * step, column * step))).copied().collect();
+            &downscaled_bytes
         };
-        let (ox, oy) = (x >> set.shift, y >> set.shift);
-        let (w, h) = (n.min(dims.0.saturating_sub(ox)), n.min(dims.1.saturating_sub(oy)));
+        let (origin_x, origin_y) = (x >> set.shift, y >> set.shift);
+        let (w, h) = (tile_extent.min(display_size.0.saturating_sub(origin_x)), tile_extent.min(display_size.1.saturating_sub(origin_y)));
         if w == 0 || h == 0 {
             return;
         }
+
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &t.texture, mip_level: 0, origin: wgpu::Origin3d { x: ox, y: oy, z: 0 }, aspect: wgpu::TextureAspect::All },
-            data,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * bpt), rows_per_image: Some(n) },
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: origin_x, y: origin_y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            upload_bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(tile_extent * bytes_per_texel), rows_per_image: Some(tile_extent) },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
-        // Innermost scope first.
-        drop(invalid);
-        drop(oom);
+
+        // Drop the innermost error scope first
+        drop(validation_scope);
+        drop(out_of_memory_scope);
         self.content_rev += 1;
-        if let Some(d) = set.mips_dirty.get_mut(ki) {
-            *d = true;
+        if let Some(d) = set.mips_dirty.get_mut(kind_index) {
+            d.add(origin_x, origin_y, origin_x + w, origin_y + h);
         }
     }
 
     /// Upload the aux (mesh map / debug) texture of a set: RGBA8, `size × size` with `size` from
     /// [`aux_size`]. The first upload allocates it.
-    pub fn upload_aux(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, size: u32, rgba: &[u8]) {
-        let Some(set) = self.sets.get_mut(ts) else { return };
-        let want = aux_size(set.size);
-        let ai = set.tex.len().saturating_sub(1);
-        let Some(t) = set.tex.last() else { return };
-        if size != want || rgba.len() < (size as usize) * (size as usize) * 4 {
+    pub fn upload_aux(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, size: u32, rgba: &[u8]) {
+        let Some(set) = self.sets.get_mut(texture_set) else { return };
+        let desired_size = aux_size(set.size);
+        let aux_index = set.tex.len().saturating_sub(1);
+        let Some(texture) = set.tex.last() else { return };
+        if size != desired_size || rgba.len() < (size as usize) * (size as usize) * 4 {
             return;
         }
-        let awaiting = set.pending.get(ai).is_some_and(Option::is_some);
-        if !awaiting && t.texture.width() != size {
-            if set.failed.get(ai).copied().unwrap_or(true) {
+
+        let allocation_pending = set.pending.get(aux_index).is_some_and(Option::is_some);
+        if !allocation_pending && texture.texture.width() != size {
+            if set.failed.get(aux_index).copied().unwrap_or(true) {
                 return;
             }
-            let what = format!("texture set {} (mesh map view, {size}×{size})", ts + 1);
-            let full = checked(device, &what, || neutral_tex(device, queue, (size, size), wgpu::TextureFormat::Rgba8Unorm, mip_count(size), &AUX_NEUTRAL));
-            if !grow(set, ts, ai, full, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
+
+            let allocation_label = format!("texture set {} (mesh map view, {size}×{size})", texture_set + 1);
+            let full_texture =
+                checked(device, &allocation_label, || neutral_tex(device, queue, (size, size), wgpu::TextureFormat::Rgba8Unorm, mip_count(size), &AUX_NEUTRAL));
+            if !grow(set, texture_set, aux_index, full_texture, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
                 return;
             }
         }
-        let pending = set.pending.get(ai).and_then(Option::as_ref).map(|p| &p.tex);
-        let Some(t) = pending.or(set.tex.last()) else { return };
-        let (w, h) = (t.texture.width(), t.texture.height());
-        let oom = pending.is_some().then(|| device.push_error_scope(wgpu::ErrorFilter::OutOfMemory));
-        let invalid = pending.is_some().then(|| device.push_error_scope(wgpu::ErrorFilter::Validation));
+
+        let pending = set.pending.get(aux_index).and_then(Option::as_ref).map(|p| &p.tex);
+        let Some(texture) = pending.or(set.tex.last()) else { return };
+        let (w, h) = (texture.texture.width(), texture.texture.height());
+        let out_of_memory_scope = pending.is_some().then(|| device.push_error_scope(wgpu::ErrorFilter::OutOfMemory));
+        let validation_scope = pending.is_some().then(|| device.push_error_scope(wgpu::ErrorFilter::Validation));
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &t.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &texture.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             rgba,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
-        drop(invalid);
-        drop(oom);
+        drop(validation_scope);
+        drop(out_of_memory_scope);
         self.content_rev += 1;
         if let Some(d) = set.mips_dirty.last_mut() {
-            *d = true;
+            *d = MipsDirty::All;
         }
     }
 
@@ -1537,19 +1637,40 @@ impl Renderer {
     }
 
     fn generate_mips(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
-        for si in 0..self.sets.len() {
-            for ti in 0..self.sets[si].tex.len() {
-                if !self.sets[si].mips_dirty.get(ti).copied().unwrap_or(false) {
+        for set_index in 0..self.sets.len() {
+            for texture_index in 0..self.sets[set_index].tex.len() {
+                let dirty = self.sets[set_index].mips_dirty.get(texture_index).copied().unwrap_or(MipsDirty::Clean);
+                if dirty == MipsDirty::Clean {
                     continue;
                 }
-                let format = self.sets[si].tex[ti].format;
+
+                let format = self.sets[set_index].tex[texture_index].format;
                 self.ensure_mip_pipeline(device, format);
-                let Some(pipe) = self.mip_pipelines.get(&format) else { continue };
-                let t = &self.sets[si].tex[ti];
-                for level in 1..t.mips {
-                    let src = t.texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level - 1, mip_level_count: Some(1), ..Default::default() });
-                    let dst = t.texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level, mip_level_count: Some(1), ..Default::default() });
-                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                let Some(pipeline) = self.mip_pipelines.get(&format) else { continue };
+                let texture = &self.sets[set_index].tex[texture_index];
+
+                // Track the stale rectangle in the preceding mip level
+                let mut rect = match dirty {
+                    MipsDirty::Region { x0, y0, x1, y1 } => Some((x0, y0, x1, y1)),
+                    _ => None,
+                };
+
+                for level in 1..texture.mips {
+                    // Odd atlas dimensions widen the bilinear footprint beyond a 2×2 parent
+                    // Expand by one texel so edge changes reach every affected destination
+                    let scissor = rect.map(|(px0, py0, px1, py1)| {
+                        let (w, h) = ((texture.texture.width() >> level).max(1), (texture.texture.height() >> level).max(1));
+                        let (x0, y0) = ((px0 / 2).saturating_sub(1).min(w - 1), (py0 / 2).saturating_sub(1).min(h - 1));
+                        let (x1, y1) = ((px1.div_ceil(2) + 1).clamp(x0 + 1, w), (py1.div_ceil(2) + 1).clamp(y0 + 1, h));
+                        (x0, y0, x1, y1)
+                    });
+                    rect = scissor;
+
+                    let src =
+                        texture.texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level - 1, mip_level_count: Some(1), ..Default::default() });
+                    let dst =
+                        texture.texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level, mip_level_count: Some(1), ..Default::default() });
+                    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("tc_mip"),
                         layout: &self.mip_bgl,
                         entries: &[
@@ -1557,10 +1678,11 @@ impl Renderer {
                             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                         ],
                     });
-                    fullscreen(encoder, "tc_mip", &dst, CLEAR, pipe, &bg);
+                    mip_pass(encoder, "tc_mip", &dst, pipeline, &bind_group, scissor.map(|(x0, y0, x1, y1)| (x0, y0, x1 - x0, y1 - y0)));
                 }
-                if let Some(d) = self.sets[si].mips_dirty.get_mut(ti) {
-                    *d = false;
+
+                if let Some(d) = self.sets[set_index].mips_dirty.get_mut(texture_index) {
+                    *d = MipsDirty::Clean;
                 }
             }
         }
@@ -1858,10 +1980,11 @@ impl Renderer {
         if sample >= TAA_SAMPLES {
             return;
         }
+
         let aspect = frame.size[0].max(1) as f32 / frame.size[1].max(1) as f32;
         let mut vp = frame.camera.view_proj(aspect);
         if sample > 0 {
-            // Sub-pixel jitter in clip space: a box filter over the pixel once averaged.
+            // Sub-pixel jitter averages into a box filter
             let (jx, jy) = (halton(sample, 2) - 0.5, halton(sample, 3) - 0.5);
             vp = Mat4::from_translation(Vec3::new(2.0 * jx / frame.size[0].max(1) as f32, 2.0 * jy / frame.size[1].max(1) as f32, 0.0)) * vp;
         }
@@ -1873,13 +1996,13 @@ impl Renderer {
                 (1.0, [sx, sy, pan[0], pan[1]])
             }
         };
-        // Data views (channels, mesh maps, UV checker, the 2D view) show values as they are: no
-        // exposure, tone mapping, effects or shadows.
+
+        // Data views bypass exposure, tone mapping, effects and shadows
         let data = uv_view > 0.5 || s.view_mode != 0;
         let fx = |v: f32| if s.post_effects && !data { v.clamp(0.0, 1.0) } else { 0.0 };
         let bloom = fx(s.bloom) > 0.0;
-        // The key light lives in the environment: turn it with it (the inverse of env_rotate in
-        // mesh.wgsl maps environment directions to world directions).
+
+        // Turn the key light with the environment
         let (sin, cos) = s.env_rotation_deg.to_radians().sin_cos();
         let [lx, ly, lz, lw] = s.light;
         let light = Vec3::new(cos * lx + sin * lz, ly, cos * lz - sin * lx);
@@ -1888,19 +2011,19 @@ impl Renderer {
             self.ensure_dense(device, queue);
         }
         let disp = match self.mesh.as_ref().filter(|_| displace) {
-            // Height-to-normal's slope: strength 1 tilts 45° for a height change of 1 over 1/16 of
-            // the UV square; the vertex shader samples the mip whose texels match the vertex spacing.
+            // A unit height across 1/16 of UV space tilts 45°; use the mip nearest vertex spacing
             Some(m) => [1.0, m.world_per_uv / 16.0, 1.0 / (m.dense.as_ref().unwrap_or(&m.geo).triangles.max(1) as f32 * 0.5).sqrt(), 0.0],
             None => [0.0; 4],
         };
         let shadow_disp = [disp[0], disp[1] * s.height_strength, disp[2], 0.0];
         let shadow_vp = if !data && s.shadows && lw > 0.0 { self.update_shadow(device, queue, encoder, light, shadow_disp, &frame.visible) } else { None };
         let radius = self.mesh.as_ref().map_or(1.0, |m| m.radius);
-        // Background rays come from a perspective camera even in orthographic views (an ortho
-        // ray grid would show a single flat environment color).
+
+        // Perspective background rays prevent flat color in orthographic views
         let bg_vp = OrbitCamera { ortho: false, ..frame.camera }.view_proj(aspect);
         let e = frame.camera.eye();
-        // Scene effects (3D material view; they need float targets for depths and signed light).
+
+        // Scene effects need float targets for depths and signed light
         let scene_fx = !data && frame.kind == ViewKind::Scene && self.hdr_format == HDR_FORMAT && self.mesh.is_some();
         let dof = s.dof.filter(|_| scene_fx);
         let sss = s.sss_blur.filter(|m| scene_fx && m.iter().any(|v| *v > 0.0));
@@ -1909,7 +2032,8 @@ impl Renderer {
         let cam = &frame.camera;
         let half_h = (cam.fov.clamp(5.0, 150.0).to_radians() * 0.5).tan();
         let height = frame.size[1].max(1) as f32;
-        // Pixels per world unit at view depth z: k / z in perspective, k in orthographic views.
+
+        // Perspective pixels per world unit vary with depth
         let k = if cam.ortho { height / (2.0 * cam.distance.max(1e-6) * half_h) } else { height / (2.0 * half_h) };
         let ppw = |z: f32| if cam.ortho { k } else { k / z.max(1e-6) };
         let dof_c = dof.map_or([0.0; 4], |[focus, aperture]| {
@@ -1929,7 +2053,7 @@ impl Renderer {
             uv_xform,
             light: [light.x, light.y, light.z, lw],
             light_vp: shadow_vp.unwrap_or(Mat4::IDENTITY).to_cols_array_2d(),
-            // Normal offset: 1.5 shadow texels of the light frustum (2 × radius wide).
+            // Offset by 1.5 shadow texels to avoid self-shadowing
             shadow: [if shadow_vp.is_some() { 1.0 } else { 0.0 }, 1.0 / SHADOW_SIZE as f32, radius * 3.0 / SHADOW_SIZE as f32, 0.0],
             material: [if s.spec_gloss { 1.0 } else { 0.0 }, if s.parallax { 1.0 } else { 0.0 }, sample as f32, s.ior],
             scatter: [s.scatter[0], s.scatter[1], s.scatter[2], if sss.is_some() { 1.0 } else { 0.0 }],
@@ -1938,6 +2062,7 @@ impl Renderer {
             refr: [if refraction { 1.0 } else { 0.0 }, (BEHIND_LEVELS - 1) as f32, REFRACTION_DEPTH * radius, 0.0],
             highlight: highlight_globals(s, data),
             highlight_shift: highlight_shift(frame.size),
+            ..bake_globals(s.bake)
         };
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         let post = PostRaw {
@@ -1961,9 +2086,7 @@ impl Renderer {
         }
         let weight = 1.0 / f64::from(sample + 1);
         match v.fx.as_ref().filter(|_| fx_on) {
-            // The effects run on every frame before it joins the average, so idle accumulation
-            // also smooths the depth of field's sampling pattern (turned each frame). Their
-            // G-buffer (unjittered) stays valid while the view accumulates.
+            // Effects run before averaging; the unjittered G-buffer remains valid
             Some(f) => {
                 self.scene_pass(encoder, v, &v.hdr, globals_bg, frame);
                 if sample == 0 {
@@ -2099,7 +2222,8 @@ impl Renderer {
             None => (&self.mesh_pipeline, frame.shade.wireframe_3d.then_some(&self.wire3d_pipeline)),
             Some(_) => (&self.uv_pipeline, frame.shade.wireframe.then_some(&self.wire_pipeline)),
         };
-        // Transmissive surfaces refract what the behind pass rendered this frame.
+
+        // Transmissive surfaces refract the current behind pass
         let refr = v.behind.as_ref().filter(|_| frame.shade.refraction).map_or(&self.refr_black, |b| &b.bg);
         let highlight = frame.shade.highlight.filter(|_| uv_ts.is_none()).map(|highlight| (&self.highlight_pipeline, highlight.set));
         self.draw_scene(encoder, v, resolve, globals_bg, frame, pipe, wire, highlight, refr);
@@ -2148,14 +2272,13 @@ impl Renderer {
         pass.set_bind_group(2, refraction_source, &[]);
         let geometry = self.geometry(mesh, frame);
         let bake = frame.shade.bake.filter(|_| uv_set.is_none());
-        let low_poly_shown = bake.is_none_or(|bake| bake.low_poly);
-        let low_poly_set = bake.and_then(|bake| bake.only_set).or(uv_set);
-        let (highlight, highlight_set) = highlight.filter(|(_, set)| low_poly_shown && low_poly_set.is_none_or(|only| only == *set)).unzip();
+        let low_poly_shown = bake.is_none_or(|bake| bake.low_poly.shown);
+        let (highlight, highlight_set) = highlight.filter(|(_, set)| low_poly_shown && uv_set.is_none_or(|only| only == *set)).unzip();
 
         // The wireframe and the highlight draw the mesh's own edges (displaced in the vertex shader too)
         let passes = [
-            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, low_poly_set, 1),
-            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, low_poly_set, 1),
+            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, uv_set, 1),
+            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, uv_set, 1),
             (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
         ];
         for (pipeline, vertices, indices, ranges, only_set, instances) in passes {
@@ -2173,6 +2296,18 @@ impl Renderer {
         if let Some(bake) = bake {
             self.draw_bake(&mut pass, mesh, frame, bake);
         }
+        if let Some(texture_set) = uv_set
+            && frame.shade.bake.is_some_and(|bake| bake.missing_seams.shown)
+            && let Some(seams) = self.missing_seams.as_ref().filter(|seams| seams.mesh_id == mesh.id)
+        {
+            pass.set_pipeline(&self.uv_missing_seam_pipeline);
+            pass.set_vertex_buffer(0, mesh.geo.vb.slice(..));
+            pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
+            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, Some(texture_set)) {
+                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.draw_indexed(range, 0, 0..1);
+            }
+        }
 
         // Overlay quads last, so the mesh's depth hides what is behind it
         if uv_set.is_none()
@@ -2184,9 +2319,9 @@ impl Renderer {
         }
     }
 
-    /// Bake mode's high poly, UV seams and cages over the low poly `low_poly`
+    /// Bake mode's high poly, missing seams and cages over the low poly `low_poly`
     fn draw_bake(&self, pass: &mut wgpu::RenderPass<'_>, low_poly: &MeshGpu, frame: &Frame, bake: BakeVisualization) {
-        if bake.high_poly
+        if bake.high_poly.shown
             && let Some(high) = &self.bake_high
         {
             pass.set_pipeline(&self.bake_high_pipeline);
@@ -2196,35 +2331,46 @@ impl Renderer {
             pass.draw_indexed(0..high.index_count, 0, 0..1);
         }
 
-        if bake.uv_seams
-            && let Some(seams) = self.uv_seams.as_ref().filter(|seams| seams.mesh_id == low_poly.id)
+        if bake.missing_seams.shown
+            && let Some(seams) = self.missing_seams.as_ref().filter(|seams| seams.mesh_id == low_poly.id)
         {
-            pass.set_pipeline(&self.uv_seam_pipeline);
+            pass.set_pipeline(&self.missing_seam_pipeline);
             pass.set_vertex_buffer(0, low_poly.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, bake.only_set) {
+            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, None) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
         }
 
-        if !bake.cage {
-            return;
-        }
-
         let shown = |texture_set: usize| bake.only_set.is_none_or(|only| only == texture_set) && frame.visible.get(texture_set).copied().unwrap_or(true);
         let cages = || self.cages.iter().enumerate().filter(move |(texture_set, _)| shown(*texture_set)).filter_map(|(_, cage)| cage.as_ref());
+
         // The translucent faces first, then the wireframe over them
-        pass.set_pipeline(&self.cage_pipeline);
-        for cage in cages() {
-            pass.set_vertex_buffer(0, cage.corners.slice(..));
-            pass.draw(0..cage.corner_count, 0..1);
+        if bake.cage_surface.shown {
+            pass.set_pipeline(&self.cage_pipeline);
+            for cage in cages() {
+                pass.set_vertex_buffer(0, cage.corners.slice(..));
+                pass.draw(0..cage.corner_count, 0..1);
+            }
         }
-        pass.set_pipeline(&self.cage_wire_pipeline);
-        for cage in cages() {
-            pass.set_vertex_buffer(0, cage.corners.slice(..));
-            pass.set_index_buffer(cage.edges.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..cage.edge_index_count, 0, 0..1);
+
+        if bake.cage_wire.shown {
+            pass.set_pipeline(&self.cage_wire_pipeline);
+            for cage in cages() {
+                pass.set_vertex_buffer(0, cage.corners.slice(..));
+                pass.set_index_buffer(cage.edges.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..cage.edge_index_count, 0, 0..1);
+            }
+        }
+
+        if bake.missing_seams.shown && bake.cage_shown() {
+            pass.set_pipeline(&self.cage_missing_seam_pipeline);
+            for cage in cages() {
+                pass.set_vertex_buffer(0, cage.corners.slice(..));
+                pass.set_index_buffer(cage.missing_seams.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..cage.missing_seam_index_count, 0, 0..1);
+            }
         }
     }
 
@@ -2336,6 +2482,26 @@ fn highlight_globals(shade: &Shade, data: bool) -> [f32; 4] {
     [r, g, b, HIGHLIGHT_OPACITY]
 }
 
+/// The globals of bake mode's overlays and neutral material for `bake` (all zero without it)
+fn bake_globals(bake: Option<BakeVisualization>) -> GlobalsRaw {
+    let Some(bake) = bake else { return GlobalsRaw::zeroed() };
+
+    let [red, green, blue] = bake.low_poly.color;
+    let neutral = bake.shown_neutral();
+    let samples_per_frame = neutral.map_or(0, |neutral| neutral.samples_per_frame());
+    GlobalsRaw {
+        bake_high: bake.high_poly.globals(),
+        bake_matching_error: bake.matching_error.globals(),
+        bake_cage: bake.cage_surface.globals(),
+        bake_cage_wire: bake.cage_wire.globals(),
+        bake_missing_seam: bake.missing_seams.globals(),
+        bake_neutral_color: [red, green, blue, samples_per_frame as f32],
+        bake_neutral: neutral.map_or([0.0; 4], |neutral| neutral.globals()),
+        bake_bent_normal: neutral.map_or([0.0; 4], |neutral| neutral.bent_normal_globals()),
+        ..GlobalsRaw::zeroed()
+    }
+}
+
 /// Globals `highlight_shift`: how far each of the highlight's line copies moves sideways, in clip units of a `size` pixel target
 fn highlight_shift(size: [u32; 2]) -> [f32; 4] {
     let half_extra_width = (HIGHLIGHT_WIDTH_PX - 1.0) * 0.5;
@@ -2407,6 +2573,12 @@ mod tests {
         assert_eq!(base_width(&h), 256, "accepted: installed");
         assert!(!h.renderer.awaiting_gpu());
         assert!(h.renderer.take_memory_failures().is_empty());
+        // The tile went in while the placeholder's (one-level) chain was rebuilt: installing
+        // must rebuild the new texture's whole chain.
+        let installed = mip_levels(&h, DisplayKind::BaseColor);
+        h.renderer.sets[0].mips_dirty[0] = MipsDirty::All;
+        prepare(&mut h);
+        assert_eq!(installed, mip_levels(&h, DisplayKind::BaseColor), "the installed texture's mips are complete");
     }
 
     #[test]
@@ -2450,5 +2622,142 @@ mod tests {
         prepare(&mut h);
         assert_eq!(base_width(&h), 1);
         assert_eq!(h.renderer.take_memory_failures(), vec![0]);
+    }
+
+    /// Compare regional and full mip work after one tile upload on an 8K set.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_mips() {
+        let Ok(mut h) = Headless::new() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((8192, 8192), 0)], 1);
+        let tile = [200, 30, 30, 255].repeat(64 * 64);
+        h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, 0, 0, &tile);
+        prepare(&mut h);
+        let _ = h.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let mut regional_times = Vec::new();
+        let mut full_times = Vec::new();
+        for iteration in 0..10u32 {
+            for full in [iteration % 2 == 0, iteration % 2 != 0] {
+                h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, 10 + iteration, 10, &tile);
+                if full {
+                    h.renderer.sets[0].mips_dirty[0] = MipsDirty::All;
+                }
+
+                let start = std::time::Instant::now();
+                prepare(&mut h);
+                let _ = h.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+                let times = if full { &mut full_times } else { &mut regional_times };
+                times.push(start.elapsed());
+            }
+        }
+        regional_times.sort_unstable();
+        full_times.sort_unstable();
+        let median = |times: &[std::time::Duration]| (times[4] + times[5]) / 2;
+        eprintln!(
+            "bench_mips [{}] 8192^2, 10 paired tiles: regional median {:?}, range {:?}..{:?}; full median {:?}, range {:?}..{:?}",
+            h.adapter_name,
+            median(&regional_times),
+            regional_times[0],
+            regional_times[9],
+            median(&full_times),
+            full_times[0],
+            full_times[9]
+        );
+    }
+
+    #[test]
+    fn overflowing_tile_coordinates_do_not_upload_into_the_first_tile() {
+        let Ok(mut headless) = Headless::new() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+
+        headless.renderer.set_texture_sets(&headless.device, &headless.queue, &[((64, 64), 0)], 1);
+        let revision = headless.renderer.content_rev;
+        let tile = [200, 30, 30, 255].repeat(64 * 64);
+        let overflowing_tile = u32::MAX / TILE + 1;
+
+        headless.renderer.upload_tile(&headless.device, &headless.queue, 0, DisplayKind::BaseColor, overflowing_tile, 0, &tile);
+        headless.renderer.upload_tile(&headless.device, &headless.queue, 0, DisplayKind::BaseColor, 0, overflowing_tile, &tile);
+
+        assert_eq!(headless.renderer.content_rev, revision);
+        assert_eq!(headless.renderer.display_textures()[0][0].width(), 1);
+    }
+
+    /// Every mip level below 0 of the `kind` texture of set 0.
+    fn mip_levels(h: &Headless, kind: DisplayKind) -> Vec<Vec<u8>> {
+        let ki = DisplayKind::ALL.iter().position(|k| *k == kind).unwrap();
+        let tex = h.renderer.display_textures()[0][ki];
+        let last = mip_count(tex.width().max(tex.height())) - 1;
+        (1..=last).map(|l| crate::readback::Readback::blocking_level(&h.device, &h.queue, tex, l).unwrap().2).collect()
+    }
+
+    /// Paint `first` tiles of `kind` (an RGBA8 format), settle, then upload each frame of `later`
+    /// (its tiles all before one prepare) regionally and compare every level against a forced
+    /// full regeneration.
+    fn assert_regional_equals_full(kind: DisplayKind, size: (u32, u32), first: &[(u32, u32)], later: &[&[(u32, u32)]]) {
+        let Ok(mut h) = Headless::new() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+
+        let ki = DisplayKind::ALL.iter().position(|k| *k == kind).unwrap();
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[(size, 0)], 1);
+        let colour = |i: u32| [(37 * i % 200 + 40) as u8, (91 * i % 200 + 40) as u8, (151 * i % 200 + 40) as u8, 255];
+        let up = |h: &mut Headless, i: u32, (tx, ty): (u32, u32)| {
+            h.renderer.upload_tile(&h.device, &h.queue, 0, kind, tx, ty, &colour(i).repeat(64 * 64));
+        };
+        assert!(h.renderer.sets[0].mips_dirty.iter().all(|d| *d == MipsDirty::All), "new textures: every chain stale");
+        for (i, t) in (0..).zip(first) {
+            up(&mut h, i, *t);
+        }
+        prepare(&mut h);
+        assert!(h.renderer.sets[0].mips_dirty.iter().all(|d| *d == MipsDirty::Clean));
+        for (i, frame) in (10..).step_by(10).zip(later) {
+            for (j, t) in (i..).zip(*frame) {
+                up(&mut h, j, *t);
+            }
+            assert!(matches!(h.renderer.sets[0].mips_dirty[ki], MipsDirty::Region { .. }));
+            prepare(&mut h);
+            assert_eq!(h.renderer.sets[0].mips_dirty[ki], MipsDirty::Clean);
+            let regional = mip_levels(&h, kind);
+            h.renderer.sets[0].mips_dirty[ki] = MipsDirty::All;
+            prepare(&mut h);
+            let full = mip_levels(&h, kind);
+            for (level, (a, b)) in regional.iter().zip(&full).enumerate() {
+                assert_eq!(a, b, "{kind:?} {size:?}, tiles {frame:?}: regional and full mips differ at level {}", level + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn regional_mips_match_full() {
+        // Include the last column and row to exercise edge clamping
+        assert_regional_equals_full(DisplayKind::BaseColor, (512, 512), &[(0, 0), (4, 4), (7, 2)], &[&[(3, 5)], &[(7, 7)]]);
+    }
+
+    #[test]
+    fn regional_mips_match_full_in_a_linear_format() {
+        // Orm uses a linear mip pipeline distinct from base color
+        assert_regional_equals_full(DisplayKind::Orm, (512, 512), &[(0, 0), (4, 4)], &[&[(3, 5)], &[(7, 0)]]);
+    }
+
+    #[test]
+    fn regional_mips_match_full_for_several_tiles_in_one_frame() {
+        // Disjoint tiles rebuild their union's bounding rectangle
+        assert_regional_equals_full(DisplayKind::BaseColor, (512, 512), &[(2, 2)], &[&[(0, 7), (6, 1), (3, 3)], &[(7, 7), (0, 0)]]);
+        assert_regional_equals_full(DisplayKind::Orm, (192, 192), &[(0, 0)], &[&[(2, 0), (0, 2)]]);
+    }
+
+    #[test]
+    fn regional_mips_match_full_on_non_power_of_two_sets() {
+        // Three tiles make odd widths further down the chain
+        assert_regional_equals_full(DisplayKind::BaseColor, (192, 64), &[(0, 0)], &[&[(1, 0)], &[(2, 0)]]);
+        // Exercise odd dimensions on both axes
+        assert_regional_equals_full(DisplayKind::BaseColor, (192, 192), &[(0, 0)], &[&[(1, 1)], &[(2, 2)], &[(0, 2)]]);
     }
 }
