@@ -652,7 +652,8 @@ fn a_decal_moved_onto_another_facing_surface_keeps_a_valid_frame_with_the_carrie
     assert_eq!(r["decal"]["rotation"], json!(25.0), "the user's turn stays");
     assert_eq!(r["decal"]["size"], json!([0.6_f32, 0.3_f32]), "and the size");
     // Straight up the face with the old up along the new normal: no degenerate frame, nothing arbitrary
-    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0], "up": [0.0, 1.0, 0.0]})).unwrap();
+    let r =
+        execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0], "up": [0.0, 1.0, 0.0]})).unwrap();
     assert_eq!(plane_up(&r["decal"]), Vec3::Y);
     let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, 1.0, 0.0], "normal": [0.0, 1.0, 0.0]})).unwrap();
     assert!((plane_up(&r["decal"]) - Vec3::NEG_Z).length() < 1e-4, "the up that pointed up the +Z face points away over the edge: {:?}", r["decal"]["up"]);
@@ -661,7 +662,8 @@ fn a_decal_moved_onto_another_facing_surface_keeps_a_valid_frame_with_the_carrie
     let up = plane_up(&r["decal"]);
     assert!((up.length() - 1.0).abs() < 1e-4 && up.dot(Vec3::Y).abs() < 1e-4, "{up}");
     // An explicit up still wins
-    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [1.0, 0.0, 0.0], "normal": [1.0, 0.0, 0.0], "up": [0.0, 0.0, 1.0]})).unwrap();
+    let r =
+        execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [1.0, 0.0, 0.0], "normal": [1.0, 0.0, 0.0], "up": [0.0, 0.0, 1.0]})).unwrap();
     assert_eq!(plane_up(&r["decal"]), Vec3::Z);
     let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "up": [0.0, 1.0, 0.0]})).unwrap();
     assert_eq!(plane_up(&r["decal"]), Vec3::Y, "an up without a move too");
@@ -687,7 +689,8 @@ fn a_decal_dragged_over_the_sphere_never_flips_its_up_between_steps() {
     }
     // The same drag through viewport points (what the 3D view sends), from the middle to the edge
     for step in 0..25 {
-        let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "x": 200.0 + step as f32 * 2.0, "y": 200.0 - step as f32 * 2.0, "merge": true})).unwrap();
+        let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "x": 200.0 + step as f32 * 2.0, "y": 200.0 - step as f32 * 2.0, "merge": true}))
+            .unwrap();
         let up = plane_up(&r["decal"]);
         assert!((up.length() - 1.0).abs() < 1e-4 && up.dot(last) > 0.0, "viewport step {step}: {last} to {up}");
         last = up;
