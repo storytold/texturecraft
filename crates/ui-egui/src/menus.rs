@@ -79,6 +79,7 @@ pub const CATALOG: &[Item] = &[
     sub("Window", "Save UI Layout", "Save current layout...", "ui.layout.save", None),
     it("Window", "Load UI Layout", "ui.layout.load", None),
     it("Window", "Hide UI", "ui.hideUi", Some("Tab")),
+    it("Window", "Reset panel layout", "ui.resetPanelLayout", None),
     it("Window", "Reset UI", "ui.resetUi", None),
     it("Viewport", "Display material", "viewport.displayMaterial", Some("M")),
     it("Viewport", "Display next channel", "viewport.nextChannel", Some("C")),
@@ -177,7 +178,8 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         "ui.mode.paint" => app.ui.mode = Mode::Painting,
         "ui.mode.render" => app.ui.mode = Mode::Rendering,
         "ui.hideUi" => app.ui.hide_ui = !app.ui.hide_ui,
-        "ui.resetUi" => app.ui.adopt_layout(crate::UiState::default()),
+        "ui.resetPanelLayout" => app.ui.reset_panel_layout(),
+        "ui.resetUi" => app.ui.windows.confirm_reset_ui = true,
         "ui.layout.save" => crate::windows::layout_file(app, true),
         "ui.layout.load" => crate::windows::layout_file(app, false),
         "ui.uvChecker" => {
@@ -381,7 +383,12 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
             app.session.tool.brush.size = (app.session.tool.brush.size * scale).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
         }
 
-        if app.ui.windows.project_config.is_some() {
+        if app.ui.windows.confirm_reset_ui {
+            // Escape keeps everything, Enter resets (unless a button has the keyboard)
+            if !popup_open {
+                crate::windows::reset_ui_keys(app, input, ctx.memory(|memory| memory.focused().is_none()));
+            }
+        } else if app.ui.windows.project_config.is_some() {
             // Its keys are Escape (close) and Enter (OK); a stroke in progress isn't touched
             #[cfg(not(target_arch = "wasm32"))]
             crate::project_config::keys_in(app, input, nothing_focused, popup_open);

@@ -31,6 +31,41 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     export_mesh(app, ctx);
     crate::pbr_import::window(app, ctx);
     unsaved(app, ctx);
+    reset_ui(app, ctx);
+}
+
+/// Window ▸ Reset UI asks first: Escape closes the question, Enter answers Reset.
+pub(crate) fn reset_ui_keys(app: &mut TextureCraftApp, input: &mut egui::InputState, nothing_focused: bool) {
+    if input.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+        app.ui.windows.confirm_reset_ui = false;
+    } else if nothing_focused && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+        app.ui.adopt_layout(crate::UiState::default());
+        app.ui.windows.confirm_reset_ui = false;
+    }
+}
+
+fn reset_ui(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    if !app.ui.windows.confirm_reset_ui {
+        return;
+    }
+
+    let mut open = true;
+    let (mut reset, mut cancel) = (false, false);
+    dialog("reset_ui", tr("Reset UI"), &mut open).show(ctx, |ui| {
+        ui.label(tr("Reset the panels, view layout, zoom and every other view setting to their defaults? Settings and shortcuts stay. To reset only the panels, use Reset panel layout."));
+        ui.add_space(8.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            reset = ui.add(primary_button(ui, tr("Reset"))).clicked();
+            cancel = ui.button(tr("Cancel")).clicked();
+        });
+    });
+
+    if reset {
+        app.ui.adopt_layout(crate::UiState::default());
+    }
+    if reset || cancel || !open {
+        app.ui.windows.confirm_reset_ui = false;
+    }
 }
 
 /// Hold `then` (quitting, opening or closing a project) behind the unsaved-changes dialog when

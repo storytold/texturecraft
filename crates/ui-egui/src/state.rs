@@ -88,6 +88,9 @@ pub struct Windows {
     /// What waits on the unsaved-changes dialog: save, don't save or cancel.
     #[serde(skip)]
     pub unsaved: Option<Unsaved>,
+    /// Window ▸ Reset UI is waiting for its answer.
+    #[serde(skip)]
+    pub confirm_reset_ui: bool,
 }
 
 /// An action that replaces or ends the project, held while the project has unsaved changes.
@@ -378,6 +381,15 @@ impl UiState {
         self.bake_layout_version = BAKE_LAYOUT_VERSION;
     }
 
+    /// Put the panels, tabs and floating panels of both modes back to their defaults; the view split,
+    /// zoom, wireframes, symmetry display, mode and every setting stay as they are
+    pub fn reset_panel_layout(&mut self) {
+        let (painting, baking) = (Dock::default(), Dock::for_baking());
+        (self.dock, self.inactive_mode_dock) = if self.dock_is_baking { (baking, painting) } else { (painting, baking) };
+        self.bake_layout_version = BAKE_LAYOUT_VERSION;
+        self.rail_panel = None;
+    }
+
     /// Take `layout`'s panels, windows and view settings, keeping this state's dialogs, settings, files and shelf query
     pub fn adopt_layout(&mut self, layout: UiState) {
         let keep = std::mem::replace(self, layout);
@@ -455,6 +467,29 @@ mod tests {
         assert_eq!(ui.recent, vec!["a.tcraft".to_string()]);
         assert_eq!(ui.export.preset, "Mine");
         assert_eq!(ui.keymap.get("file.save").map(String::as_str), Some("F5"));
+    }
+
+    #[test]
+    fn resetting_the_panel_layout_restores_both_docks_and_keeps_the_rest() {
+        for baking in [false, true] {
+            let mode = if baking { Mode::Baking } else { Mode::Painting };
+            let mut ui = UiState { mode, ..UiState::default() };
+            ui.sync_mode_dock();
+            ui.dock.close(crate::docking::Panel::Log);
+            ui.inactive_mode_dock.close(crate::docking::Panel::Log);
+            ui.layout = ViewLayout::Only3D;
+            ui.uv_zoom = 3.0;
+            ui.wireframe_3d = true;
+            ui.recent = vec!["a.tcraft".into()];
+
+            ui.reset_panel_layout();
+
+            let mut fresh = UiState { mode, ..UiState::default() };
+            fresh.sync_mode_dock();
+            assert_eq!((&ui.dock, &ui.inactive_mode_dock), (&fresh.dock, &fresh.inactive_mode_dock), "baking: {baking}");
+            assert_eq!((ui.layout, ui.uv_zoom, ui.wireframe_3d, ui.mode), (ViewLayout::Only3D, 3.0, true, mode));
+            assert_eq!(ui.recent, vec!["a.tcraft".to_string()]);
+        }
     }
 
     #[test]
