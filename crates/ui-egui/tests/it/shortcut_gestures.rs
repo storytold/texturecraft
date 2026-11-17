@@ -2,16 +2,13 @@
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable as _;
-use texturecraft_ui_egui::TextureCraftApp;
 
 #[test]
-fn the_shortcut_overview_lists_the_stencil_clone_line_and_path_gestures() {
-    let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
-    h.run_steps(4);
-    h.state_mut().ui.windows.shortcuts = true;
-    h.run_steps(3);
-    h.get_by_label("Viewport and brush (fixed)").click();
+fn the_gesture_grid_of_the_shortcut_window_lists_the_stencil_clone_line_and_path_gestures() {
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(700.0, 900.0))
+        .with_context_setup(texturecraft_ui_egui::theme::install)
+        .build_ui(texturecraft_ui_egui::keymap::fixed_gestures_grid);
     h.run_steps(3);
     for text in [
         "Shift + LMB",

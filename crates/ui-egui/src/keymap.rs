@@ -350,13 +350,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
         });
         ui.add_space(4.0);
         section(ui, "keymap_nav", tr("Viewport and brush (fixed)"), false, |ui| {
-            egui::Grid::new("keymap_fixed").striped(true).show(ui, |ui| {
-                for (k, v) in fixed_gestures() {
-                    ui.label(RichText::new(k).strong());
-                    ui.label(v);
-                    ui.end_row();
-                }
-            });
+            fixed_gestures_grid(ui);
         });
     });
     app.ui.windows.shortcuts = open;
@@ -372,6 +366,17 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
             None => {
                 d.remove::<usize>(capture_id);
             }
+        }
+    });
+}
+
+/// The fixed gestures as a two-column grid (the "Viewport and brush" section of the shortcut window)
+pub fn fixed_gestures_grid(ui: &mut egui::Ui) {
+    egui::Grid::new("keymap_fixed").striped(true).show(ui, |ui| {
+        for (k, v) in fixed_gestures() {
+            ui.label(RichText::new(k).strong());
+            ui.label(v);
+            ui.end_row();
         }
     });
 }
