@@ -171,6 +171,8 @@ pub struct TextureCraftApp {
     pub properties_popup: Option<properties_popup::PropertiesPopup>,
     /// The color selection the next click in the 3D or 2D view picks an ID color for
     pub picking_id_color: Option<id_color_pick::IdColorPick>,
+    /// Whether the next click on the model places the symmetry planes (Pick point in the symmetry settings)
+    pub picking_symmetry_plane: bool,
     /// The wgpu state (screenshots read the renderer's targets).
     pub render_state: Option<eframe::egui_wgpu::RenderState>,
     /// CJK fallback fonts for the UI language.
@@ -250,6 +252,7 @@ impl TextureCraftApp {
             placing_decal: None,
             properties_popup: None,
             picking_id_color: None,
+            picking_symmetry_plane: false,
             render_state: cc.wgpu_render_state.clone(),
             fonts: fonts::UiFonts::default(),
             banner: None,
