@@ -378,8 +378,8 @@ places an image on the surface; `layer.decal.set` moves, resizes or turns it lat
 through the plane across the mesh center, perpendicular to that axis. The copy is part of the
 decal, not a second layer, so it follows every later edit and is saved with the project.
 `symmetryFlip` (`none`, `u`, `v`) additionally flips the copy's image (U swaps left and right,
-V swaps top and bottom); with a copy on, either param may be sent alone and keeps the other.
-`session.inspect` shows the setting as `decal.symmetry` (`{axis: 0|1|2, flip}`, absent without
+V swaps top and bottom). `symmetryOffset` moves the mirror plane along the axis, in world units from the mesh center (default 0, kept within the mesh, as the brush symmetry's offset). With a copy on, each of the three params may be sent alone and keeps the others.
+`session.inspect` shows the setting as `decal.symmetry` (`{axis: 0|1|2, flip, offset?}`, absent without
 a copy).
 
 ## Camera bookmarks

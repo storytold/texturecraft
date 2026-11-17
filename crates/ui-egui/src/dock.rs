@@ -2566,6 +2566,16 @@ fn decal_symmetry_editor(app: &mut TextureCraftApp, ui: &mut Ui, d: &Decal, laye
         });
     }
 
+    if let Some(symmetry) = d.symmetry {
+        // The plane moves within the mesh, as the symmetry popup's axis position does
+        let (lo, hi) = app.session.mesh.bounds();
+        let limit = ((hi - lo) * 0.5)[usize::from(symmetry.axis.min(2))];
+        let mut offset = symmetry.offset;
+        if let Some(merge) = slider_edit(ui, tr("Axis position"), &mut offset, -limit..=limit, 2) {
+            picked = Some(json!({"symmetryOffset": offset, "merge": merge}));
+        }
+    }
+
     if let Some(change) = picked {
         app.run("layer.decal.set", with(&json!({"layer": layer.0}), change));
     }

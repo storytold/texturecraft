@@ -18,7 +18,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add decal",
             [],
             None,
-            "{image: resource name, channel?: a channel id (default baseColor) | \"mask\" (a new fill layer masked by the image's gray), x?, y?: viewport pixels (default: the view center; a point on another texture set selects it), viewport?: [w,h] | position?: [x,y,z], normal?: [x,y,z] (on the selected texture set), up?: [x,y,z] (the image's up; default the view's up, or the view direction when that is along the normal), size?: height | [w,h] (world units; default a quarter of the mesh), rotation?: degrees, depth?, symmetry?: x|y|z|off (also place a mirrored copy across the mesh center, perpendicular to that axis; it follows this decal), symmetryFlip?: none|u|v (flip the copy's image on top of the reflection), name?} → {layer, decal, maskEffect: the mask fill effect holding the image with channel \"mask\", else null} — a fill layer projecting the image from a frame placed on the surface; seen from the front, the image reads the right way round",
+            "{image: resource name, channel?: a channel id (default baseColor) | \"mask\" (a new fill layer masked by the image's gray), x?, y?: viewport pixels (default: the view center; a point on another texture set selects it), viewport?: [w,h] | position?: [x,y,z], normal?: [x,y,z] (on the selected texture set), up?: [x,y,z] (the image's up; default the view's up, or the view direction when that is along the normal), size?: height | [w,h] (world units; default a quarter of the mesh), rotation?: degrees, depth?, symmetry?: x|y|z|off (also place a mirrored copy across the mesh center, perpendicular to that axis; it follows this decal), symmetryFlip?: none|u|v (flip the copy's image on top of the reflection), symmetryOffset?: world units from the mesh center along the axis to the mirror plane (default 0, within the mesh), name?} → {layer, decal, maskEffect: the mask fill effect holding the image with channel \"mask\", else null} — a fill layer projecting the image from a frame placed on the surface; seen from the front, the image reads the right way round",
             always,
             add
         ),
@@ -27,7 +27,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit decal",
             [],
             None,
-            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z], size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, symmetry?: x|y|z|off, symmetryFlip?: none|u|v (the mirrored copy; flip alone keeps the axis), image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
+            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z], size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, symmetry?: x|y|z|off, symmetryFlip?: none|u|v, symmetryOffset? (the mirrored copy; the flip and offset alone keep the axis), image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
             has_layer,
             set
         ),
@@ -95,7 +95,7 @@ fn decal_up(s: &Session, cmd: &str, p: &Value, normal: Vec3) -> Result<Vec3> {
 
 /// The mirrored copy asked for by `symmetry` (x, y, z or off) and `symmetryFlip` (none, u or v),
 /// starting from `current` for what the params leave out
-fn symmetry_param(cmd: &str, p: &Value, current: Option<DecalSymmetry>) -> Result<Option<DecalSymmetry>> {
+fn symmetry_param(cmd: &str, p: &Value, current: Option<DecalSymmetry>, bounds: (Vec3, Vec3)) -> Result<Option<DecalSymmetry>> {
     let axis = match strp(p, "symmetry").map(str::to_ascii_lowercase).as_deref() {
         None => current.map(|symmetry| symmetry.axis),
         Some("off" | "none") => None,
@@ -111,7 +111,19 @@ fn symmetry_param(cmd: &str, p: &Value, current: Option<DecalSymmetry>) -> Resul
         Some("v") => DecalFlip::V,
         Some(other) => return Err(bad(cmd, format!("unknown symmetryFlip `{other}` (none, u or v)"))),
     };
-    Ok(axis.map(|axis| DecalSymmetry { axis, flip }))
+    // The plane stays within the mesh, as the brush symmetry's offset does
+    let (lo, hi) = bounds;
+    let half_extent = (hi - lo) * 0.5;
+    let offset = match (f32p(p, "symmetryOffset"), current) {
+        (Some(offset), _) if !offset.is_finite() => return Err(bad(cmd, "`symmetryOffset` must be a number")),
+        (Some(offset), _) => offset,
+        (None, Some(symmetry)) => symmetry.offset,
+        (None, None) => 0.0,
+    };
+    Ok(axis.map(|axis| {
+        let limit = half_extent[usize::from(axis)];
+        DecalSymmetry { axis, flip, offset: offset.clamp(-limit, limit) }
+    }))
 }
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
@@ -145,7 +157,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         offset: [0.0; 2],
         // By default it reaches half its larger side into the surface
         depth: f32p(p, "depth").map_or(size[0].max(size[1]) * 0.5, |depth| depth.clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE)),
-        symmetry: symmetry_param(cmd, p, None)?,
+        symmetry: symmetry_param(cmd, p, None, s.mesh.bounds())?,
     };
 
     // A decal dropped on another texture set goes there and selects it, as a dropped material does
@@ -236,7 +248,7 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
     if let Some(depth) = f32p(params, "depth") {
         decal.depth = depth.clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE);
     }
-    decal.symmetry = symmetry_param(command, params, decal.symmetry)?;
+    decal.symmetry = symmetry_param(command, params, decal.symmetry, session.mesh.bounds())?;
 
     let image = strp(params, "image").map(str::to_string);
     if let Some(name) = &image

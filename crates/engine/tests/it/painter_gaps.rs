@@ -675,18 +675,27 @@ fn a_decal_with_symmetry_also_covers_the_mirrored_side_and_follows_its_edits() {
 
     // A flip alone keeps the axis; off removes the copy
     execute(&mut s, "layer.decal.set", &json!({"symmetryFlip": "v"})).unwrap();
-    assert_eq!(decal_of(&s, layer).symmetry, Some(DecalSymmetry { axis: 0, flip: DecalFlip::V }));
+    assert_eq!(decal_of(&s, layer).symmetry, Some(DecalSymmetry { axis: 0, flip: DecalFlip::V, offset: 0.0 }));
     execute(&mut s, "layer.decal.set", &json!({"symmetry": "z"})).unwrap();
-    assert_eq!(decal_of(&s, layer).symmetry, Some(DecalSymmetry { axis: 2, flip: DecalFlip::V }), "a new axis keeps the flip");
+    assert_eq!(decal_of(&s, layer).symmetry, Some(DecalSymmetry { axis: 2, flip: DecalFlip::V, offset: 0.0 }), "a new axis keeps the flip");
     execute(&mut s, "layer.decal.set", &json!({"symmetry": "x"})).unwrap();
+
+    // The mirror plane's position is kept across axis changes, stays within the mesh and is saved
+    let r = execute(&mut s, "layer.decal.set", &json!({"symmetryOffset": 0.5})).unwrap();
+    assert_eq!(r["decal"]["symmetry"]["offset"], json!(0.5));
+    assert_eq!(red_on_minus_x(&mut s, |_, _| true), 0, "a plane at x = 0.5 puts the copy out of reach of the -X face");
+    let r = execute(&mut s, "layer.decal.set", &json!({"symmetryOffset": 9.0})).unwrap();
+    assert_eq!(r["decal"]["symmetry"]["offset"], json!(1.0), "the cube is 2 wide: at most 1 from its center");
+    assert_eq!(r["decal"]["symmetry"]["axis"], json!(0), "the axis is kept");
+    execute(&mut s, "layer.decal.set", &json!({"symmetryOffset": 0.5})).unwrap();
 
     // Saved with the project
     let reopened = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
     assert_eq!(reopened.doc.project, s.doc.project);
-    assert_eq!(decal_of(&reopened, layer).symmetry, Some(DecalSymmetry { axis: 0, flip: DecalFlip::V }));
+    assert_eq!(decal_of(&reopened, layer).symmetry, Some(DecalSymmetry { axis: 0, flip: DecalFlip::V, offset: 0.5 }));
 
-    // Seven edits since the copy was asked for: undoing them all leaves the decal as placed
-    for _ in 0..7 {
+    // Ten edits since the copy was asked for: undoing them all leaves the decal as placed
+    for _ in 0..10 {
         execute(&mut s, "edit.undo", &Value::Null).unwrap();
     }
     assert_eq!(decal_of(&s, layer).symmetry, None);
@@ -699,5 +708,12 @@ fn a_decal_with_symmetry_also_covers_the_mirrored_side_and_follows_its_edits() {
 
     // A decal can be added with a copy right away
     let both = execute(&mut s, "layer.add.decal", &json!({"image": name, "position": [0.0, 1.0, 0.0], "normal": [0.0, 1.0, 0.0], "symmetry": "y"})).unwrap();
-    assert_eq!(both["decal"]["symmetry"], json!({"axis": 1, "flip": "none"}));
+    assert_eq!(both["decal"]["symmetry"], json!({"axis": 1, "flip": "none"}), "no offset is written while it is 0");
+    let shifted = execute(
+        &mut s,
+        "layer.add.decal",
+        &json!({"image": name, "position": [0.0, 1.0, 0.0], "normal": [0.0, 1.0, 0.0], "symmetry": "y", "symmetryOffset": -0.4}),
+    )
+    .unwrap();
+    assert!((shifted["decal"]["symmetry"]["offset"].as_f64().unwrap() + 0.4).abs() < 1e-6);
 }

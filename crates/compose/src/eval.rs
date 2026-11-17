@@ -3796,7 +3796,7 @@ soft {soft:?}"
         use texturecraft_core::{DecalFlip, DecalSymmetry};
         let at = (0.1, -0.2);
         let on_x = |flip| {
-            cube_decal_texels(cube_decal([1.0, at.0, at.1], 1.0, Some(DecalSymmetry { axis: 0, flip })), |p, n| {
+            cube_decal_texels(cube_decal([1.0, at.0, at.1], 1.0, Some(DecalSymmetry { axis: 0, flip, offset: 0.0 })), |p, n| {
                 if n.x > 0.99 {
                     face_expect(p.y, p.z, at, 1.0)
                 } else if n.x < -0.99 {
@@ -3823,7 +3823,7 @@ soft {soft:?}"
 
         // Mirrored across Z, the copy sits on the same face on the other side of the Z = 0 plane
         let at = (0.1, -0.5);
-        let across_z = Some(DecalSymmetry { axis: 2, flip: DecalFlip::None });
+        let across_z = Some(DecalSymmetry { axis: 2, flip: DecalFlip::None, offset: 0.0 });
         let on_z = cube_decal_texels(cube_decal([1.0, at.0, at.1], 0.4, across_z), |p, n| {
             if n.x > 0.99 {
                 match (face_expect(p.y, p.z, at, 0.4), face_expect(p.y, -p.z, at, 0.4)) {
@@ -3839,9 +3839,29 @@ soft {soft:?}"
     }
 
     #[test]
+    fn the_mirror_plane_can_be_moved_along_its_axis() {
+        use texturecraft_core::{DecalFlip, DecalSymmetry};
+        // Mirrored across Z with the plane at z = 0.3: a decal at z = -0.2 gets its copy at z = 0.8
+        let at = (0.1, -0.2);
+        let moved = Some(DecalSymmetry { axis: 2, flip: DecalFlip::None, offset: 0.3 });
+        let checked = cube_decal_texels(cube_decal([1.0, at.0, at.1], 0.4, moved), |p, n| {
+            if n.x > 0.99 {
+                match (face_expect(p.y, p.z, at, 0.4), face_expect(p.y, 0.6 - p.z, at, 0.4)) {
+                    (Some(Some(texel)), _) | (_, Some(Some(texel))) => Some(Some(texel)),
+                    (Some(None), Some(None)) => Some(None),
+                    _ => None,
+                }
+            } else {
+                Some(None)
+            }
+        });
+        assert!(checked > 800);
+    }
+
+    #[test]
     fn moving_the_decal_moves_its_mirrored_copy() {
         use texturecraft_core::{DecalFlip, DecalSymmetry};
-        let symmetry = Some(DecalSymmetry { axis: 0, flip: DecalFlip::None });
+        let symmetry = Some(DecalSymmetry { axis: 0, flip: DecalFlip::None, offset: 0.0 });
         for at in [(0.5, 0.3), (-0.4, -0.5)] {
             let checked =
                 cube_decal_texels(

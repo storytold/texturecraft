@@ -40,6 +40,13 @@ fn app_with_decal() -> (Harness<'static, TextureCraftApp>, u64) {
     (harness, layer)
 }
 
+fn offset_of(harness: &Harness<'_, TextureCraftApp>, layer: u64) -> f32 {
+    let project = &harness.state().session.doc.project;
+    let LayerKind::Fill(fill) = &project.layer(texturecraft_engine::core::LayerId(layer)).unwrap().kind else { panic!("a fill layer") };
+    let Projection::Decal(decal) = &fill.projection else { panic!("a decal") };
+    decal.symmetry.expect("a mirrored copy").offset
+}
+
 fn symmetry_of(harness: &Harness<'_, TextureCraftApp>, layer: u64) -> Option<(u8, DecalFlip)> {
     let project = &harness.state().session.doc.project;
     let LayerKind::Fill(fill) = &project.layer(texturecraft_engine::core::LayerId(layer)).unwrap().kind else { panic!("a fill layer") };
@@ -75,4 +82,24 @@ fn the_mirror_axis_and_flip_are_set_from_the_decal_editor() {
     pick(&mut harness, "Z", "Off");
     assert_eq!(symmetry_of(&harness, layer), None);
     assert!(harness.query_by_label("Flip the copy's image").is_none());
+}
+
+#[test]
+fn the_axis_position_slider_moves_the_mirror_plane() {
+    let (mut harness, layer) = app_with_decal();
+    assert!(harness.query_by_label("Axis position").is_none(), "the position needs a copy to place");
+    pick(&mut harness, "Off", "Y");
+    assert_eq!(offset_of(&harness, layer), 0.0);
+
+    // Press near the track's left end, drag toward its middle and right, release there
+    let label_rect = harness.get_by_label("Axis position").rect();
+    let y = label_rect.bottom() + 10.0;
+    harness.drag_at(egui::pos2(label_rect.left() + 20.0, y));
+    harness.run_steps(2);
+    harness.hover_at(egui::pos2(label_rect.left() + 120.0, y));
+    harness.run_steps(2);
+    harness.drop_at(egui::pos2(label_rect.left() + 120.0, y));
+    harness.run_steps(SETTLE_FRAMES);
+    assert!(offset_of(&harness, layer).abs() > 0.01, "the dragged position applies: {}", offset_of(&harness, layer));
+    assert_eq!(symmetry_of(&harness, layer).map(|symmetry| symmetry.0), Some(1), "the axis is kept");
 }

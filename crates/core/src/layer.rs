@@ -198,7 +198,7 @@ pub struct Decal {
     pub symmetry: Option<DecalSymmetry>,
 }
 
-/// The mirrored copy of a decal: reflected through the plane across the mesh center, perpendicular to `axis`.
+/// The mirrored copy of a decal: reflected through the plane perpendicular to `axis`, across the mesh center (moved by `offset`).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DecalSymmetry {
     /// Axis the mirror plane is perpendicular to (0 = X, 1 = Y, 2 = Z)
@@ -206,6 +206,13 @@ pub struct DecalSymmetry {
     /// Extra flip of the image on the mirrored copy, on top of the reflection itself
     #[serde(default)]
     pub flip: DecalFlip,
+    /// Where the mirror plane sits, relative to the mesh center along `axis` (world units, as the brush symmetry's offset)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: f32,
+}
+
+fn is_zero(value: &f32) -> bool {
+    *value == 0.0
 }
 
 /// How the mirrored decal's image is turned over
@@ -1207,12 +1214,18 @@ mod tests {
         assert_eq!(decal.symmetry, None);
         assert_eq!(serde_json::to_string(&decal).unwrap(), old.replace(' ', ""), "nothing new is written for a decal without a copy");
 
-        let mirrored = Decal { symmetry: Some(DecalSymmetry { axis: 2, flip: DecalFlip::V }), ..decal };
+        let mirrored = Decal { symmetry: Some(DecalSymmetry { axis: 2, flip: DecalFlip::V, offset: 0.0 }), ..decal };
         let json = serde_json::to_string(&mirrored).unwrap();
         assert!(json.contains(r#""symmetry":{"axis":2,"flip":"v"}"#), "{json}");
         assert_eq!(serde_json::from_str::<Decal>(&json).unwrap(), mirrored);
         let without_flip = json.replace(r#","flip":"v""#, "");
-        assert_eq!(serde_json::from_str::<Decal>(&without_flip).unwrap().symmetry, Some(DecalSymmetry { axis: 2, flip: DecalFlip::None }));
+        assert_eq!(serde_json::from_str::<Decal>(&without_flip).unwrap().symmetry, Some(DecalSymmetry { axis: 2, flip: DecalFlip::None, offset: 0.0 }));
+
+        // The plane's offset is written only when it is not zero
+        let moved = Decal { symmetry: Some(DecalSymmetry { axis: 1, flip: DecalFlip::None, offset: -0.25 }), ..decal };
+        let json = serde_json::to_string(&moved).unwrap();
+        assert!(json.contains(r#""offset":-0.25}"#), "{json}");
+        assert_eq!(serde_json::from_str::<Decal>(&json).unwrap(), moved);
     }
 
     #[test]

@@ -338,13 +338,13 @@ pub fn decal_uv(d: &Decal, p: Vec3, nrm: Vec3) -> Option<(Vec2, f32)> {
 
 /// [`decal_uv`] for a decal with a mirrored copy: whichever of the decal and its copy covers the
 /// point more. The copy is the decal reflected through the plane across `center` (the mesh
-/// center), so a point is looked up as its reflection and the image flipped as asked.
+/// center), so a point is looked up as its reflection (the plane is `offset` away from the center) and the image flipped as asked.
 pub fn decal_uv_symmetric(d: &Decal, p: Vec3, nrm: Vec3, center: Vec3) -> Option<(Vec2, f32)> {
     let direct = decal_uv(d, p, nrm);
     let Some(symmetry) = d.symmetry else { return direct };
     let axis = usize::from(symmetry.axis.min(2));
     let (mut mp, mut mn) = (p, nrm);
-    mp[axis] = 2.0 * center[axis] - p[axis];
+    mp[axis] = 2.0 * (center[axis] + symmetry.offset) - p[axis];
     mn[axis] = -nrm[axis];
     let mirrored = decal_uv(d, mp, mn).map(|(uv, w)| {
         let uv = match symmetry.flip {
