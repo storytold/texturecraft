@@ -1935,7 +1935,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // Clone source: where the tool reads, as in the 3D view
     if tool_acts(app)
         && app.session.tool.tool == Tool::Clone
-        && let Some(source) = app.session.clone_source_uv(response.hover_pos().map(to_uv))
+        && let Some(source) = app.session.clone_source_marker_uv(response.hover_pos().map(to_uv))
     {
         clone_marker_at(ui, rect, to_screen(source.x, source.y));
     }

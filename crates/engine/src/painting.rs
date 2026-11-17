@@ -581,14 +581,22 @@ impl Session {
 
     /// Where the Clone tool reads for destination `at` (texture coordinates), in texture
     /// coordinates: the source itself until the first stroke fixes the offset, or when `at` is
-    /// None. None without a source or when that spot is outside the texture.
-    pub fn clone_source_uv(&self, at: Option<Vec2>) -> Option<Vec2> {
+    /// None. None without a source or when that spot is outside the texture. The far edge
+    /// (1.0) counts as inside, so the 2D marker shows a source set on the edge; reads of the
+    /// surface use `clone_source_uv`, which stays half-open.
+    pub fn clone_source_marker_uv(&self, at: Option<Vec2>) -> Option<Vec2> {
         let src = self.tool.clone_source?;
         let uv = match (src.offset, at) {
             (Some(o), Some(p)) => Vec2::new(p.x + o[0], p.y + o[1]),
             _ => Vec2::from(src.uv),
         };
-        ((0.0..1.0).contains(&uv.x) && (0.0..1.0).contains(&uv.y)).then_some(uv)
+        ((0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y)).then_some(uv)
+    }
+
+    /// Like `clone_source_marker_uv`, but half-open: None on the far edge, where the G-buffer
+    /// has no texel.
+    pub fn clone_source_uv(&self, at: Option<Vec2>) -> Option<Vec2> {
+        self.clone_source_marker_uv(at).filter(|uv| uv.x < 1.0 && uv.y < 1.0)
     }
 
     /// Where the Clone tool reads for destination `at` (texture coordinates) as a surface

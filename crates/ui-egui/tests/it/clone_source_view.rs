@@ -66,6 +66,19 @@ fn the_2d_view_draws_a_crosshair_at_the_clone_source() {
 }
 
 #[test]
+fn the_2d_view_draws_the_crosshair_for_a_source_on_the_far_edge() {
+    let mut harness = clone_app();
+    set_source(&mut harness, [1.0, 0.5]);
+    let edge = marker_at(&harness);
+    set_source(&mut harness, [0.5, 0.5]);
+    let middle = marker_at(&harness);
+    assert!(edge.x > middle.x + 50.0, "the edge source sits right of the middle: {edge:?} {middle:?}");
+    set_source(&mut harness, [0.5, 1.0]);
+    let bottom = marker_at(&harness);
+    assert!(bottom.y > middle.y + 50.0, "v = 1.0 shows too: {bottom:?} {middle:?}");
+}
+
+#[test]
 fn the_2d_crosshair_only_shows_for_the_clone_tool() {
     let mut harness = clone_app();
     set_source(&mut harness, [0.5, 0.5]);
