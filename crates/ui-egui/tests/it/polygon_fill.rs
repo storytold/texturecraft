@@ -108,6 +108,23 @@ fn a_new_press_after_release_does_not_resume_the_previous_box() {
 }
 
 #[test]
+fn the_symmetry_toggle_is_offered_for_polygon_fill_and_a_symmetric_click_is_one_step() {
+    use egui_kittest::kittest::Queryable;
+
+    let mut harness = polygon_fill_app();
+    harness.get_by_label("Symmetry settings");
+    harness.get_by_label("Symmetry").click();
+    harness.run_steps(2);
+    assert!(harness.state().session.tool.brush.symmetry.any(), "the toggle turns mirroring on for the fill");
+
+    let center = harness.state().viewport_rect.center();
+    let before = history(&harness).len();
+    click(&mut harness, center);
+    assert_eq!(history(&harness).len(), before + 1, "the fill and its mirror copies are one undo step");
+    assert_eq!(history(&harness).last().map(String::as_str), Some("Polygon fill"));
+}
+
+#[test]
 #[ignore = "requires an offscreen GPU adapter and TC_UI_SNAPSHOTS"]
 fn polygon_fill_snapshots() {
     let Some(directory) = std::env::var_os("TC_UI_SNAPSHOTS").map(std::path::PathBuf::from) else { return };

@@ -24,9 +24,9 @@ use crate::widgets::{icon_badge_dropdown_button, icon_button};
 /// Radial copies a brush gets when radial symmetry is enabled
 const DEFAULT_RADIAL_COUNT: u8 = 6;
 
-/// Whether `tool` paints symmetry copies
+/// Whether `tool` paints or fills symmetry copies
 pub(crate) fn applies_to(tool: Tool) -> bool {
-    matches!(tool, Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Clone | Tool::Path)
+    matches!(tool, Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Clone | Tool::Path | Tool::PolygonFill)
 }
 
 /// Whether the 3D view shows symmetry now: not while the active tool can't act on the selection

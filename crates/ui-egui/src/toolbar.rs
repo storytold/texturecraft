@@ -293,7 +293,11 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
                 path_controls(app, ui);
             }
         }
-        Tool::PolygonFill => fill_mode_buttons(app, ui),
+        Tool::PolygonFill => {
+            fill_mode_buttons(app, ui);
+            ui.separator();
+            crate::symmetry::toolbar_controls(app, ui);
+        }
         Tool::ColorPicker => {
             ui.label(RichText::new(tr("Click the mesh to pick its material into the brush")).color(tokens.text_dim));
         }
