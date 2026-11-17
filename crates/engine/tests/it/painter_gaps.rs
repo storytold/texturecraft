@@ -650,7 +650,7 @@ fn a_decal_moved_onto_another_facing_surface_keeps_a_valid_frame_with_the_carrie
     assert!((up.length() - 1.0).abs() < 1e-4 && up.dot(Vec3::Y).abs() < 1e-4, "an up inside the +Y face: {up}");
     assert!(up.x > 0.5, "the old up's X side stays on the X side: {up}");
     assert_eq!(r["decal"]["rotation"], json!(25.0), "the user's turn stays");
-    assert_eq!(r["decal"]["size"], json!([0.6, 0.3]), "and the size");
+    assert_eq!(r["decal"]["size"], json!([0.6_f32, 0.3_f32]), "and the size");
     // Straight up the face with the old up along the new normal: no degenerate frame, nothing arbitrary
     let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0], "up": [0.0, 1.0, 0.0]})).unwrap();
     assert_eq!(plane_up(&r["decal"]), Vec3::Y);
