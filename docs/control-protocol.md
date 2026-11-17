@@ -369,6 +369,7 @@ Maps are found by file name, case-insensitively, from the last known word in the
 In the app: File › Import PBR texture folder... or drop a folder, a `.zip` or several map files on the
 window. The dialog shows the maps found, lets you pick between candidates, set the normal convention and
 projection, and keep the material in the library (shelf › Materials).
+
 ## Geometry decals
 
 `layer.add.decal {image, position?, normal?, up?, size?, rotation?, depth?, symmetry?, symmetryFlip?}`
