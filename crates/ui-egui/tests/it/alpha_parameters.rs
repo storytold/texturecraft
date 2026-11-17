@@ -29,19 +29,30 @@ fn restore_defaults<'tree>(harness: &'tree Harness<'_, TextureCraftApp>) -> egui
     harness.get_by_role_and_label(egui::Role::Button, "Restore defaults")
 }
 
+fn invert_checkbox<'tree>(harness: &'tree Harness<'_, TextureCraftApp>) -> Option<egui_kittest::Node<'tree>> {
+    harness.query_all_by_role_and_label(egui::Role::CheckBox, "Invert").next()
+}
+
+fn show_group(harness: &mut Harness<'_, TextureCraftApp>) {
+    restore_defaults(harness).scroll_to_me();
+    harness.run_steps(SETTLE_FRAMES);
+}
+
 #[test]
 fn the_group_shows_hardness_and_every_shared_parameter() {
     let harness = app_with_brush(BrushSettings::default());
 
-    for label in ["Parameters", "Hardness", "Size X", "Size Y", "Roundness", "Contrast", "Invert"] {
+    for label in ["Parameters", "Hardness", "Size X", "Size Y", "Roundness", "Contrast"] {
         assert!(harness.query_by_label(label).is_some(), "{label} is in the Alpha tab");
     }
+    assert!(invert_checkbox(&harness).is_some());
 }
 
 #[test]
 fn restore_defaults_puts_back_hardness_and_the_parameters_but_keeps_the_alpha() {
     let brush = BrushSettings { hardness: 0.9, alpha: BrushAlpha::Star, alpha_params: changed_params(), size: 0.1, flow: 0.4, ..BrushSettings::default() };
     let mut harness = app_with_brush(brush.clone());
+    show_group(&mut harness);
     assert!(!restore_defaults(&harness).accesskit_node().is_disabled());
 
     restore_defaults(&harness).click();
@@ -56,15 +67,20 @@ fn restore_defaults_puts_back_hardness_and_the_parameters_but_keeps_the_alpha() 
 #[test]
 fn the_invert_checkbox_sets_the_brush_parameter() {
     let mut harness = app_with_brush(BrushSettings::default());
+    show_group(&mut harness);
     assert!(restore_defaults(&harness).accesskit_node().is_disabled(), "at the defaults there is nothing to restore");
 
-    harness.get_by_role_and_label(egui::Role::CheckBox, "Invert").click();
+    if let Some(node) = invert_checkbox(&harness) {
+        node.click();
+    }
     harness.run_steps(SETTLE_FRAMES);
 
     assert!(harness.state().session.tool.brush.alpha_params.invert);
     assert!(!restore_defaults(&harness).accesskit_node().is_disabled());
 
-    harness.get_by_role_and_label(egui::Role::CheckBox, "Invert").click();
+    if let Some(node) = invert_checkbox(&harness) {
+        node.click();
+    }
     harness.run_steps(SETTLE_FRAMES);
     assert_eq!(harness.state().session.tool.brush, BrushSettings::default());
 }

@@ -483,7 +483,12 @@ mod tests {
 
     #[test]
     fn default_parameters_reproduce_every_alpha_exactly() {
-        let img = ImageRes { width: 3, height: 2, rgba: vec![[1.0; 4], [0.3, 0.3, 0.3, 1.0], [0.0, 0.0, 0.0, 1.0], [0.6, 0.6, 0.6, 1.0], [0.9; 4], [0.1, 0.1, 0.1, 1.0]], srgb: true };
+        let img = ImageRes {
+            width: 3,
+            height: 2,
+            rgba: vec![[1.0; 4], [0.3, 0.3, 0.3, 1.0], [0.0, 0.0, 0.0, 1.0], [0.6, 0.6, 0.6, 1.0], [0.9; 4], [0.1, 0.1, 0.1, 1.0]],
+            srgb: true,
+        };
         let library = crate::alphas::library().first().map(|alpha| alpha.image());
         let kinds = BrushAlpha::ALL.map(|alpha| Shape { alpha, image: None, library: None, params: AlphaParams::default(), level: 0 });
         for shape in kinds.into_iter().chain([
@@ -564,28 +569,6 @@ mod tests {
         assert!(low.0 < 0.5 && low.1 < low.0, "dark values get darker: {low:?}");
         assert!(high.0 > 0.5 && high.1 > high.0, "light values get lighter: {high:?}");
         assert_eq!(hard.sample(1.2, 0.0, 0.0, 0), 0.0, "outside the shape stays empty");
-    }
-
-    #[test]
-    fn brushes_saved_without_alpha_parameters_load_unchanged() {
-        let mut saved = serde_json::to_value(BrushSettings::default()).unwrap_or_default();
-        assert!(saved.as_object_mut().is_some_and(|fields| fields.remove("alpha_params").is_some()));
-        let loaded: Result<BrushSettings, _> = serde_json::from_value(saved);
-        assert_eq!(loaded.ok(), Some(BrushSettings::default()));
-
-        let partial: Result<BrushSettings, _> = serde_json::from_value(serde_json::json!({
-            "size": 0.02, "min_size": 0.05, "flow": 1.0, "opacity": 1.0, "spacing": 0.1, "hardness": 0.5, "angle": 0.0, "follow_path": false,
-            "alignment": "Tangent", "angle_fade": [70.0, 85.0], "lazy": 0.0, "jitter_size": 0.0, "jitter_angle": 0.0, "jitter_flow": 0.0,
-            "jitter_position": 0.0, "alpha": "Round", "backface_culling": true, "depth": 1.0,
-            "symmetry": { "x": false, "y": false, "z": false }, "screen_space": false,
-            "alpha_params": { "size_x": 0.5, "invert": true }
-        }));
-        let params = loaded_params(partial);
-        assert_eq!(params, AlphaParams { size_x: 0.5, invert: true, ..AlphaParams::default() });
-    }
-
-    fn loaded_params(brush: Result<BrushSettings, serde_json::Error>) -> AlphaParams {
-        brush.map(|brush| brush.alpha_params).unwrap_or_default()
     }
 
     #[test]

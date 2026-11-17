@@ -310,13 +310,14 @@ fn red_width(s: &Session, y: f32) -> usize {
 
 #[test]
 fn brush_alpha_parameters_are_set_read_back_and_narrow_the_stamp() {
+    let mut full_session = session();
+    paint_red(&mut full_session, 30.0);
+    dab(&mut full_session, 200.0, 200.0);
+    let full = red_width(&full_session, 200.0);
+    assert!(full > 20, "{full}");
+
     let mut s = session();
     paint_red(&mut s, 30.0);
-    dab(&mut s, 200.0, 200.0);
-    let full = red_width(&s, 200.0);
-    assert!(full > 20, "{full}");
-    execute(&mut s, "edit.undo", &Value::Null).unwrap();
-    assert_eq!(red_width(&s, 200.0), 0);
 
     let brush = execute(&mut s, "tool.brush", &json!({"alphaSizeX": 50, "alphaRoundness": 0, "alphaContrast": 2.5, "alphaInvert": false})).unwrap();
     assert_eq!((brush["alphaSizeX"].as_f64(), brush["alphaSizeY"].as_f64(), brush["alphaRoundness"].as_f64()), (Some(50.0), Some(100.0), Some(0.0)));
@@ -329,4 +330,18 @@ fn brush_alpha_parameters_are_set_read_back_and_narrow_the_stamp() {
     // Out-of-range values are clamped, not rejected
     let brush = execute(&mut s, "tool.brush", &json!({"alphaSizeX": 0, "alphaContrast": 99})).unwrap();
     assert_eq!((brush["alphaSizeX"].as_f64(), brush["alphaContrast"].as_f64()), (Some(5.0), Some(8.0)));
+}
+
+#[test]
+fn brushes_saved_without_alpha_parameters_load_unchanged() {
+    use texturecraft_engine::paint::{AlphaParams, BrushSettings};
+
+    let mut saved = serde_json::to_value(BrushSettings::default()).unwrap();
+    assert!(saved.as_object_mut().unwrap().remove("alpha_params").is_some());
+    let loaded: BrushSettings = serde_json::from_value(saved.clone()).unwrap();
+    assert_eq!(loaded, BrushSettings::default());
+
+    saved["alpha_params"] = json!({"size_x": 0.5, "invert": true});
+    let partial: BrushSettings = serde_json::from_value(saved).unwrap();
+    assert_eq!(partial.alpha_params, AlphaParams { size_x: 0.5, invert: true, ..AlphaParams::default() });
 }
