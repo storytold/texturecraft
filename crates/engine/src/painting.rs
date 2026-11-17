@@ -7,7 +7,7 @@ use texturecraft_compose::PaintTarget;
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_paint::{
-    CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask, pick,
+    CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stamp, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask, pick,
     rasterize,
 };
 
@@ -384,11 +384,16 @@ impl Session {
 
     /// Add a pointer sample to the active stroke. Returns whether it hit the mesh.
     pub fn continue_stroke(&mut self, screen: Vec2, pressure: f32) -> bool {
+        self.continue_stroke_with(|stroke, ctx| stroke.add(ctx, screen, pressure))
+    }
+
+    /// Stamp the active stroke with `add`, then rasterize its new stamps. Returns whether the stroke is on the mesh.
+    fn continue_stroke_with(&mut self, add: impl FnOnce(&mut Stroke, &PickCtx) -> Vec<Stamp>) -> bool {
         let Some(st) = self.stroke.as_mut() else { return false };
         let Some(cache) = self.caches.get_mut(st.ts) else { return false };
         let material = self.doc.project.texture_sets.get(st.ts).map(|t| t.material).unwrap_or(0);
         let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &st.camera, viewport: st.viewport };
-        let stamps = st.stroke.add(&ctx, screen, pressure);
+        let stamps = add(&mut st.stroke, &ctx);
         let hit = st.stroke.last_hit().is_some();
         if stamps.is_empty() {
             return hit;
@@ -498,6 +503,33 @@ impl Session {
         let stamps = self.stroke.as_ref().map(|s| s.stroke.stamps.len()).unwrap_or(0);
         self.end_stroke()?;
         let _ = hits;
+        Ok(stamps)
+    }
+
+    /// Paint a whole 3D stroke through points on the surface, wherever they are seen from: no
+    /// camera visibility or backface test (a 3D path). Returns the stamp count.
+    /// A None point (off the mesh) leaves a gap.
+    pub(crate) fn stroke_surface_points(&mut self, hits: &[Option<SurfaceHit>], viewport: Vec2) -> Result<usize> {
+        self.cancel_stroke();
+        self.start_stroke(viewport, false, None)?;
+        if let Some(st) = self.stroke.as_mut() {
+            st.depth = None;
+            st.stroke.settings.backface_culling = false;
+        }
+        for hit in hits {
+            match hit {
+                Some(hit) => {
+                    self.continue_stroke_with(|stroke, ctx| stroke.add_surface(ctx, *hit, 1.0));
+                }
+                None => {
+                    if let Some(st) = self.stroke.as_mut() {
+                        st.stroke.lift();
+                    }
+                }
+            }
+        }
+        let stamps = self.stroke.as_ref().map(|s| s.stroke.stamps.len()).unwrap_or(0);
+        self.end_stroke()?;
         Ok(stamps)
     }
 

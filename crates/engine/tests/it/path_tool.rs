@@ -709,3 +709,27 @@ fn removing_the_final_stored_point_removes_the_path_and_undo_restores_it() {
     assert_eq!(session.doc.project, before.project);
     assert_eq!(session.doc.pixels.layers, before.pixels.layers);
 }
+
+#[test]
+fn moving_one_point_keeps_points_hidden_from_the_view_where_they_are() {
+    let mut s = session(primitives::sphere(1.0, 48, 24));
+    execute(&mut s, "tool.path", &json!({"points": [[200, 200], [150, 200]]})).unwrap();
+    let far = Vec3::new(-0.53, 0.0, -0.848);
+    s.tool.path.points = vec![Vec3::new(0.0, 0.0, 1.0), Vec3::new(-0.707, 0.0, 0.707), far];
+    s.path_live().unwrap();
+    assert!(s.move_path_point(0, Vec3::new(0.0, 0.1, 0.995), true));
+    s.path_live().unwrap();
+    s.update();
+
+    let surface = s.path_surface(&s.tool.path.points, false, s.camera, s.viewport);
+    let painted_far = surface.last().and_then(|segment| *segment.last()?);
+    assert!(painted_far.is_some_and(|p| p.distance(far) < 0.05), "the untouched far point is drawn at {painted_far:?}, stored at {far:?}");
+
+    // Look at the far side: the curve's end is painted there
+    s.camera.yaw = std::f32::consts::PI;
+    let ndc = s.camera.project(far, 1.0).unwrap();
+    let screen = Vec2::new((ndc.x * 0.5 + 0.5) * s.viewport.x, (0.5 - ndc.y * 0.5) * s.viewport.y);
+    let hit = s.pick(screen, s.viewport).unwrap();
+    assert!(hit.pos.distance(far) < 0.05, "the far point faces the turned camera");
+    assert!(red_at(&s, screen.x, screen.y), "the far point is painted where it is stored");
+}

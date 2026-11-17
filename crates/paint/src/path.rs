@@ -1,7 +1,10 @@
 //! Path tool geometry: a smooth curve through control points and the antialiased coverage of
-//! a closed curve (lasso fill). Works in any 2D space (screen pixels or texels).
+//! a closed curve (lasso fill). Works in any 2D space (screen pixels or texels), and the curve also
+//! in 3D (along the surface).
 
-use texturecraft_geom::glam::Vec2;
+use std::ops::{Add, Mul, Sub};
+
+use texturecraft_geom::glam::{Vec2, Vec3};
 
 /// Most samples per curve segment.
 const MAX_SEGMENT_SAMPLES: f32 = 1024.0;
@@ -20,8 +23,30 @@ pub fn spline_segments(points: &[Vec2], closed: bool, step: f32) -> Vec<Vec<Vec2
     segment_samples(points, closed, step).map(Iterator::collect).collect()
 }
 
+/// [`spline_segments`] through points in 3D, sampled about every `step` world units
+pub fn spline_segments_3d(points: &[Vec3], closed: bool, step: f32) -> Vec<Vec<Vec3>> {
+    segment_samples(points, closed, step).map(Iterator::collect).collect()
+}
+
+/// A curve point: 2D (screen pixels, texels) or 3D (world units)
+trait CurvePoint: Copy + Default + Add<Output = Self> + Sub<Output = Self> + Mul<f32, Output = Self> {
+    fn len(self) -> f32;
+}
+
+impl CurvePoint for Vec2 {
+    fn len(self) -> f32 {
+        self.length()
+    }
+}
+
+impl CurvePoint for Vec3 {
+    fn len(self) -> f32 {
+        self.length()
+    }
+}
+
 /// Stream samples so a flat curve does not allocate and retain every segment alongside its output
-fn segment_samples(points: &[Vec2], closed: bool, step: f32) -> impl Iterator<Item = impl Iterator<Item = Vec2>> + '_ {
+fn segment_samples<P: CurvePoint>(points: &[P], closed: bool, step: f32) -> impl Iterator<Item = impl Iterator<Item = P>> + '_ {
     let n = points.len();
     let at = move |i: isize| {
         let i = if closed { i.rem_euclid(n as isize) } else { i.clamp(0, n as isize - 1) };
@@ -37,11 +62,11 @@ fn segment_samples(points: &[Vec2], closed: bool, step: f32) -> impl Iterator<It
     } as isize;
     (0..segments).map(move |s| {
         let (p0, p1, p2, p3) = (at(s - 1), at(s), at(s + 1), at(s + 2));
-        let k = ((p2 - p1).length() / step).ceil().clamp(1.0, MAX_SEGMENT_SAMPLES) as usize;
+        let k = ((p2 - p1).len() / step).ceil().clamp(1.0, MAX_SEGMENT_SAMPLES) as usize;
         (1..=k).map(move |j| {
             let t = j as f32 / k as f32;
             let (t2, t3) = (t * t, t * t * t);
-            0.5 * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)
+            (p1 * 2.0 + (p2 - p0) * t + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2 + (p1 * 3.0 - p0 - p2 * 3.0 + p3) * t3) * 0.5
         })
     })
 }

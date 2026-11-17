@@ -38,6 +38,13 @@ pub fn pick(ctx: &PickCtx, screen: Vec2) -> Option<SurfaceHit> {
     Some(SurfaceHit { pos: s.pos, nrm: s.nrm, tri: hit.tri, uv: s.uv, material: ctx.mesh.material_of(hit.tri as usize).unwrap_or(0), screen })
 }
 
+/// The surface point nearest to `p` within `max_dist`, independent of any view (`screen` is zero)
+pub fn nearest_surface(mesh: &Mesh, bvh: &Bvh, p: Vec3, max_dist: f32) -> Option<SurfaceHit> {
+    let hit = bvh.nearest(p, max_dist, &|_| true)?;
+    let s = surface_at(mesh, hit.tri, hit.u, hit.v)?;
+    Some(SurfaceHit { pos: s.pos, nrm: s.nrm, tri: hit.tri, uv: s.uv, material: mesh.material_of(hit.tri as usize).unwrap_or(0), screen: Vec2::ZERO })
+}
+
 /// Random channels of a stamp's jitters (each draws its own number from the stamp's seed)
 const JITTER_ANGLE: u32 = 1;
 const JITTER_SIZE: u32 = 2;
@@ -113,6 +120,25 @@ impl Stroke {
         }
         let mut out = Vec::new();
         self.feed(ctx, p, pressure, 0, &mut out);
+        self.finish(ctx, out)
+    }
+
+    /// Feed a point already on the surface (a 3D path sample, painted where it lies rather than
+    /// where the view sees it). Stamps between samples snap to the nearest surface. Returns new stamps.
+    pub fn add_surface(&mut self, ctx: &PickCtx, hit: SurfaceHit, pressure: f32) -> Vec<Stamp> {
+        let mut out = Vec::new();
+        let radius = self.radius_at(ctx, hit.pos, pressure);
+        self.advance(ctx, hit, radius, &mut out, |p| nearest_surface(ctx.mesh, ctx.bvh, p, radius * 2.0));
+        self.finish(ctx, out)
+    }
+
+    /// The next point starts a new run: the curve left the surface in between
+    pub fn lift(&mut self) {
+        self.last = None;
+    }
+
+    /// Particles and symmetry copies of new stamps, kept in the stroke
+    fn finish(&mut self, ctx: &PickCtx, mut out: Vec<Stamp>) -> Vec<Stamp> {
         if self.settings.particles.enabled {
             out = out.iter().flat_map(|s| crate::particles::emit(ctx, &self.settings.particles, s)).collect();
         }
@@ -138,6 +164,32 @@ impl Stroke {
             return;
         };
         let radius = self.radius_at(ctx, hit.pos, pressure);
+        if let Some(last) = self.last
+            && hit.pos.distance(last.pos) > 4.0 * radius
+            && depth < 4
+        {
+            // Jumped across a silhouette or gap: resample in screen space, never through air.
+            let n = ((hit.pos.distance(last.pos) / radius).ceil() as u32).clamp(2, 64);
+            let a = last.screen;
+            for k in 1..=n {
+                let s = a + (screen - a) * (k as f32 / n as f32);
+                self.feed(ctx, s, pressure, depth + 1, out);
+            }
+            return;
+        }
+        self.advance(ctx, hit, radius, out, |p| {
+            // Snap to the surface by re-picking through the projected point.
+            let aspect = ctx.viewport.x.max(1.0) / ctx.viewport.y.max(1.0);
+            ctx.camera
+                .project(p, aspect)
+                .map(|ndc| Vec2::new((ndc.x * 0.5 + 0.5) * ctx.viewport.x, (0.5 - ndc.y * 0.5) * ctx.viewport.y))
+                .and_then(|s| pick(ctx, s))
+                .filter(|h| h.pos.distance(p) < radius * 2.0)
+        });
+    }
+
+    /// Stamp every spacing step from the last hit to `hit`, each snapped to the surface by `snap`
+    fn advance(&mut self, ctx: &PickCtx, hit: SurfaceHit, radius: f32, out: &mut Vec<Stamp>, snap: impl Fn(Vec3) -> Option<SurfaceHit>) {
         let Some(last) = self.last else {
             out.push(self.stamp(ctx, &hit, radius));
             self.last = Some(hit);
@@ -150,30 +202,12 @@ impl Stroke {
             return;
         }
         let step = (self.settings.spacing * 2.0 * radius).max(1e-6);
-        if len > 4.0 * radius && depth < 4 {
-            // Jumped across a silhouette or gap: resample in screen space, never through air.
-            let n = ((len / radius).ceil() as u32).clamp(2, 64);
-            let a = last.screen;
-            for k in 1..=n {
-                let s = a + (screen - a) * (k as f32 / n as f32);
-                self.feed(ctx, s, pressure, depth + 1, out);
-            }
-            return;
-        }
         self.last_dir = Some(seg / len);
         let mut t = step - self.dist;
         let mut emitted = 0;
         while t <= len && emitted < 4096 {
             let p = last.pos + seg * (t / len);
-            // Snap to the surface by re-picking through the projected point.
-            let aspect = ctx.viewport.x.max(1.0) / ctx.viewport.y.max(1.0);
-            let snapped = ctx
-                .camera
-                .project(p, aspect)
-                .map(|ndc| Vec2::new((ndc.x * 0.5 + 0.5) * ctx.viewport.x, (0.5 - ndc.y * 0.5) * ctx.viewport.y))
-                .and_then(|s| pick(ctx, s))
-                .filter(|h| h.pos.distance(p) < radius * 2.0);
-            let h = snapped.unwrap_or(SurfaceHit { pos: p, ..hit });
+            let h = snap(p).unwrap_or(SurfaceHit { pos: p, ..hit });
             out.push(self.stamp(ctx, &h, radius));
             emitted += 1;
             t += step;

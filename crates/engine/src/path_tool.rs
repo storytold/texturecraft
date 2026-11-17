@@ -15,7 +15,7 @@ use texturecraft_compose::{PaintTarget, PixelStore};
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, PathShape};
 use texturecraft_geom::glam::{Mat3, Vec2, Vec3};
 use texturecraft_geom::{OrbitCamera, surface_at};
-use texturecraft_paint::{BrushSettings, Lasso, PickCtx, fill_coverage, pick, spline, spline_segments};
+use texturecraft_paint::{BrushSettings, Lasso, PickCtx, SurfaceHit, fill_coverage, nearest_surface, pick, spline, spline_segments, spline_segments_3d};
 use texturecraft_texel::TileImage;
 
 use crate::commands::{CommandSpec, always, bad, boolp, has_layer, u64p};
@@ -36,6 +36,12 @@ const MIN_PAINT_VIEWPORT_PX: f32 = 16.0;
 const MAX_PAINT_VIEWPORT_PX: f32 = 16384.0;
 /// Sampling step of a 3D path's curve on the mesh for the views, in its paint viewport pixels
 const SURFACE_STEP_PX: f32 = 4.0;
+/// A control point is seen by a view when picking where it projects lands this close (viewport pixels)
+const VISIBLE_TOLERANCE_PX: f32 = 2.0;
+/// Finest 3D curve sampling step, as a share of the mesh's bounding diagonal
+const MIN_SURFACE_STEP_SHARE: f32 = 1e-4;
+/// How far a 3D curve sample may be from the mesh and still snap to it, as a share of the mesh's bounding diagonal (a curve between distant points cuts through the inside)
+const SURFACE_SNAP_SHARE: f32 = 0.5;
 const MIN_PROJECTIVE_W: f32 = 1e-6;
 // Match the minimum world-space scale used by brush stamps
 const MIN_BRUSH_SCALE: f32 = 1e-4;
@@ -868,17 +874,68 @@ impl Session {
 
     /// Where a 3D path's curve lands on the mesh painted through `camera`, per segment as [`spline_segments`] (None off the mesh)
     pub fn path_surface(&self, points: &[Vec3], closed: bool, camera: OrbitCamera, viewport: Vec2) -> Vec<Vec<Option<Vec3>>> {
-        let aspect = viewport.x.max(1.0) / viewport.y.max(1.0);
-        let Some(screen) = points.iter().map(|p| camera.project(*p, aspect).map(|n| to_pixels(n.truncate(), viewport))).collect::<Option<Vec<_>>>() else {
-            return Vec::new();
-        };
+        let (_, segments) = self.surface_segments(points, closed, camera, viewport, SURFACE_STEP_PX);
+        segments.into_iter().map(|segment| segment.into_iter().map(|hit| hit.map(|hit| hit.pos)).collect()).collect()
+    }
 
+    /// A 3D path's curve on the mesh, sampled about every `step_px` pixels of `camera` and `viewport`: the first point's hit and each
+    /// segment from its first point. A segment between points the view sees follows the curve on screen; one touching a point it
+    /// can't see (far side, behind the camera) follows the curve in 3D, snapped to the nearest surface, so that point stays where it is.
+    fn surface_segments(
+        &self,
+        points: &[Vec3],
+        closed: bool,
+        camera: OrbitCamera,
+        viewport: Vec2,
+        step_px: f32,
+    ) -> (Option<SurfaceHit>, Vec<Vec<Option<SurfaceHit>>>) {
+        let aspect = viewport.x.max(1.0) / viewport.y.max(1.0);
         let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &camera, viewport };
-        spline_segments(&screen, closed, SURFACE_STEP_PX)
+        let (lo, hi) = self.mesh.bounds();
+        let reach = (hi - lo).length() * SURFACE_SNAP_SHARE;
+        let tolerance = self.world_step(&camera, viewport, VISIBLE_TOLERANCE_PX);
+        let snap = |p: Vec3| nearest_surface(&self.mesh, &self.bvh, p, reach);
+
+        let projected: Vec<Option<Vec2>> = points.iter().map(|p| camera.project(*p, aspect).map(|n| to_pixels(n.truncate(), viewport))).collect();
+        let hits: Vec<Option<SurfaceHit>> = points
+            .iter()
+            .zip(&projected)
+            .map(|(p, screen)| screen.and_then(|screen| pick(&ctx, screen)).filter(|hit| hit.pos.distance(*p) <= tolerance))
+            .collect();
+        // A point behind the camera only bends its neighbours' screen curves: use the last one in front
+        let mut last = projected.iter().flatten().next().copied().unwrap_or_default();
+        let screen: Vec<Vec2> = projected
+            .iter()
+            .map(|q| {
+                last = q.unwrap_or(last);
+                last
+            })
+            .collect();
+
+        let n = points.len();
+        let first = hits.first().copied().flatten().or_else(|| points.first().and_then(|p| snap(*p)));
+        let segments = spline_segments(&screen, closed, step_px)
             .into_iter()
-            .zip(&screen)
-            .map(|(samples, first)| std::iter::once(*first).chain(samples).map(|q| pick(&ctx, q).map(|hit| hit.pos)).collect())
-            .collect()
+            .zip(spline_segments_3d(points, closed, self.world_step(&camera, viewport, step_px)))
+            .enumerate()
+            .map(|(i, (on_screen, in_3d))| {
+                let start = hits.get(i).copied().flatten().or_else(|| points.get(i).and_then(|p| snap(*p)));
+                let seen = hits.get(i).is_some_and(Option::is_some) && hits.get((i + 1) % n.max(1)).is_some_and(Option::is_some);
+                let samples: Vec<Option<SurfaceHit>> =
+                    if seen { on_screen.into_iter().map(|q| pick(&ctx, q)).collect() } else { in_3d.into_iter().map(snap).collect() };
+                std::iter::once(start).chain(samples).collect()
+            })
+            .collect();
+        (first, segments)
+    }
+
+    /// World units that `px` pixels of `viewport` span at `camera`'s target, at least a small share of the mesh size
+    fn world_step(&self, camera: &OrbitCamera, viewport: Vec2, px: f32) -> f32 {
+        let (lo, hi) = self.mesh.bounds();
+        let finest = (hi - lo).length().max(MIN_BRUSH_SCALE) * MIN_SURFACE_STEP_SHARE;
+        let half_height = camera.distance * (camera.fov.clamp(5.0, 150.0).to_radians() * 0.5).tan();
+        let step = px * 2.0 * half_height / viewport.y.max(1.0);
+        if step.is_finite() { step.max(finest) } else { finest }
     }
 
     /// [`Session::path_surface`] of a stored 3D path through the camera and viewport it paints with
@@ -898,6 +955,17 @@ impl Session {
     fn paint_path(&mut self, viewport: Vec2) -> Result<Value> {
         let (uv, closed) = (self.tool.path.uv, self.tool.path.closed);
         let fill = closed && self.tool.path.fill;
+        if !uv && !fill {
+            // Points the view can't see are painted where they are, not where the view projects them
+            let points = &self.tool.path.points;
+            if points.is_empty() {
+                return Err(EngineError::Other("the path has no points: click the surface to add some".into()));
+            }
+            let (first, segments) = self.surface_segments(points, closed, self.camera, viewport, STEP_PX);
+            // Each segment starts with the previous one's end
+            let hits: Vec<Option<SurfaceHit>> = std::iter::once(first).chain(segments.into_iter().flat_map(|segment| segment.into_iter().skip(1))).collect();
+            return Ok(json!({ "stamps": self.stroke_surface_points(&hits, viewport)? }));
+        }
         let pts: Vec<Vec2> = self.path_view_points(viewport).into_iter().flatten().collect();
         if pts.is_empty() {
             return Err(EngineError::Other("the path has no points: click the surface to add some".into()));
@@ -906,13 +974,7 @@ impl Session {
             return Err(EngineError::Other("a filled path needs at least three points".into()));
         }
         let curve = spline(&pts, closed, if uv { STEP_UV } else { STEP_PX });
-        Ok(if fill {
-            json!({ "filledTiles": self.lasso_fill(curve, uv, viewport)? })
-        } else if uv {
-            json!({ "tiles": self.stroke_uv_points(&curve)? })
-        } else {
-            json!({ "stamps": self.stroke_points(&curve, viewport)? })
-        })
+        Ok(if fill { json!({ "filledTiles": self.lasso_fill(curve, uv, viewport)? }) } else { json!({ "tiles": self.stroke_uv_points(&curve)? }) })
     }
 
     /// Fill the inside of `polygon` (viewport pixels over the visible surface, or texture coordinates); returns the touched tiles
