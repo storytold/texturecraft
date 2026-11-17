@@ -33,7 +33,7 @@ pub fn specs() -> Vec<CommandSpec> {
             [],
             None,
             "{layer?, path: .tcmask file, name?} — saves the layer's mask (all effects, parameters, painted pixels and images) as a user smart mask",
-            has_mask,
+            has_layer,
             create_cmd
         ),
         cmd!("mask.smart.list", "List smart masks", [], None, "{}", always, |_, _| Ok(json!(
@@ -44,12 +44,6 @@ pub fn specs() -> Vec<CommandSpec> {
 
 /// Smart mask file extension.
 pub const SMART_MASK_EXT: &str = "tcmask";
-
-fn has_mask(s: &Session) -> std::result::Result<(), String> {
-    let layer = s.selected_layer().ok_or("no layer selected")?;
-    let owner = s.doc.project.mask_owner(layer);
-    if s.doc.project.layer(owner).is_ok_and(|l| l.mask.is_some()) { Ok(()) } else { Err("the layer has no mask".into()) }
-}
 
 pub struct SmartMask {
     pub id: &'static str,
@@ -237,10 +231,29 @@ impl Session {
         self.edit(&format!("Apply smart mask {label}"), |s| {
             let (ts, _, _) = s.doc.project.locate(layer).ok_or_else(|| EngineError::Other("layer not in a stack".into()))?;
             let size = s.doc.project.texture_set(ts)?.size();
-            for (k, v) in &resources {
-                s.doc.resources.entry(k.clone()).or_insert_with(|| v.clone());
+            // An image whose name the project already uses for other bytes comes in under a new name
+            let mut renames = BTreeMap::new();
+            for (name, bytes) in &resources {
+                let mut taken = name.clone();
+                let mut number = 2;
+                while s.doc.resources.get(&taken).is_some_and(|have| have != bytes) {
+                    let (stem, ext) = name.rsplit_once('.').map_or((name.as_str(), String::new()), |(stem, ext)| (stem, format!(".{ext}")));
+                    taken = format!("{stem}_{number}{ext}");
+                    number += 1;
+                }
+                s.doc.resources.entry(taken.clone()).or_insert_with(|| bytes.clone());
+                if taken != *name {
+                    renames.insert(name.clone(), taken);
+                }
             }
-            let new = copy_mask(&src, &mask, &mut s.doc, size);
+            let mut new = copy_mask(&src, &mask, &mut s.doc, size);
+            for source in new.effects.iter_mut().flat_map(|effect| sources_mut(&mut effect.kind)) {
+                if let Source::Image { name, .. } = source
+                    && let Some(renamed) = renames.get(name.as_str())
+                {
+                    *name = renamed.clone();
+                }
+            }
             let old = s.doc.project.layer_mut(layer)?.mask.replace(new);
             for e in old.map(|m| m.effects).unwrap_or_default() {
                 s.doc.pixels.masks.remove(&e.id);
@@ -253,14 +266,34 @@ impl Session {
     }
 }
 
-/// `mask` of document `src` with fresh effect ids from `dst`, its painted pixels moved to `dst` at `size`.
+/// The sources an effect reads.
+fn sources_mut(kind: &mut EffectKind) -> Vec<&mut Source> {
+    match kind {
+        EffectKind::Fill { source, .. } => vec![source],
+        EffectKind::Material(fill) => fill.sources.values_mut().collect(),
+        EffectKind::Generator(generator) => generator.inputs.values_mut().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `mask` of document `src` with fresh effect ids from `dst` (anchor sources follow), its painted pixels moved to `dst` at `size`.
 fn copy_mask(src: &crate::session::Document, mask: &Mask, dst: &mut crate::session::Document, size: (u32, u32)) -> Mask {
     let mut copy = mask.clone();
+    let mut moved = BTreeMap::new();
     for e in &mut copy.effects {
         let old = e.id;
         e.id = dst.project.alloc_id();
+        moved.insert(old, e.id);
         if let Some(img) = src.pixels.masks.get(&old) {
             dst.pixels.masks.insert(e.id, crate::layer_ops::fit(img, size, &[0, 0]));
+        }
+    }
+    // Sources that read an anchor effect of this mask follow it to its new id
+    for source in copy.effects.iter_mut().flat_map(|effect| sources_mut(&mut effect.kind)) {
+        if let Source::Anchor { anchor, .. } = source
+            && let Some(new) = moved.get(anchor)
+        {
+            *anchor = *new;
         }
     }
     copy

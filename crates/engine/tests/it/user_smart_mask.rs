@@ -132,3 +132,50 @@ fn a_file_without_a_mask_is_refused_and_a_disabled_mask_comes_back_on() {
     s.apply_smart_mask_bytes(plain, &bytes).unwrap();
     assert!(s.doc.project.layer(plain).unwrap().mask.as_ref().unwrap().enabled);
 }
+
+#[test]
+fn an_image_name_the_project_uses_for_other_bytes_gets_a_new_name() {
+    let mut s = session(128);
+    let (source, image) = multi_effect_mask(&mut s);
+    let bytes = s.smart_mask_bytes(source, "Stencil").unwrap();
+
+    let mut other = session(128);
+    let mut png = Vec::new();
+    image::RgbaImage::from_fn(4, 4, |_, _| image::Rgba([1, 2, 3, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    assert_eq!(other.import_resource_bytes("stencil.png", png).unwrap(), image);
+    let own = other.doc.resources[&image].clone();
+    let target = layer(&mut other);
+    other.apply_smart_mask_bytes(target, &bytes).unwrap();
+
+    assert_eq!(other.doc.resources[&image], own, "the project's own image is untouched");
+    let mask = other.doc.project.layer(target).unwrap().mask.as_ref().unwrap();
+    let read: Vec<&str> = mask.effects.iter().flat_map(|effect| effect.kind.images_read()).collect();
+    assert_eq!(read.len(), 1);
+    assert_ne!(read[0], image, "the mask reads its own image under another name");
+    assert_eq!(other.doc.resources[read[0]], s.doc.resources[&image]);
+}
+
+#[test]
+fn effects_reading_an_anchor_of_the_mask_follow_it() {
+    let mut s = session(128);
+    let id = layer(&mut s);
+    let anchor = execute(&mut s, "effect.add.anchor", &json!({"layer": id.0, "target": "mask"})).unwrap()["effect"].as_u64().unwrap();
+    let fill = execute(&mut s, "effect.add.fill", &json!({"layer": id.0, "target": "mask"})).unwrap()["effect"].as_u64().unwrap();
+    let mask = s.doc.project.layer_mut(id).unwrap().mask.as_mut().unwrap();
+    for effect in &mut mask.effects {
+        if effect.id.0 == fill {
+            effect.kind = EffectKind::Fill { source: Source::Anchor { anchor: LayerId(anchor), channel: texturecraft_engine::core::Channel::Height }, projection: Default::default() };
+        }
+    }
+    let bytes = s.smart_mask_bytes(id, "Anchored").unwrap();
+
+    let target = layer(&mut s);
+    s.apply_smart_mask_bytes(target, &bytes).unwrap();
+    let mask = s.doc.project.layer(target).unwrap().mask.as_ref().unwrap();
+    let new_anchor = mask.effects.iter().find(|effect| matches!(effect.kind, EffectKind::Anchor)).unwrap().id;
+    let reads = mask.effects.iter().find_map(|effect| match &effect.kind {
+        EffectKind::Fill { source: Source::Anchor { anchor, .. }, .. } => Some(*anchor),
+        _ => None,
+    });
+    assert_eq!(reads, Some(new_anchor), "the fill reads the copied anchor, not the old one");
+}

@@ -1153,6 +1153,7 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     }
     #[cfg(not(target_arch = "wasm32"))]
     if ui.add_enabled(has_mask, egui::Button::new(tr("Create smart mask"))).clicked() {
+        app.run("layer.select", json!({"layer": lid}));
         crate::smart_mask_menu::save(app, layer, &crate::library_dir());
         ui.close();
     }
