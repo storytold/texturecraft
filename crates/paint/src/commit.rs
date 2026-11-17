@@ -244,7 +244,7 @@ impl Staging {
     /// the same arguments will write.
     pub fn stage_mask(&mut self, pixels: &PixelStore, effect: LayerId, value: f32, src: &CommitSource) {
         let value = [value.clamp(0.0, 1.0)];
-        let b = Blend { kind: ChannelKind::Scalar, value: &value, stencil_color: false, carried: None };
+        let b = Blend { kind: ChannelKind::Scalar, value: &value, stencil_color: false, carried: mask_carried(&src) };
         self.images.entry(None).or_default().stage(pixels.masks.get(&effect), 2, &b, src);
     }
 
@@ -306,11 +306,16 @@ pub fn commit_layer(pixels: &mut PixelStore, layer: LayerId, size: (u32, u32), v
     images.into_par_iter().for_each(|(c, img, staged)| over(img, &layer_blend(c, values, &src), &src, staged));
 }
 
+/// The mask values a clone or smudge stroke carries (see [`texturecraft_compose::MASK_CHANNEL`]).
+fn mask_carried<'a>(src: &CommitSource<'a>) -> Option<&'a TileImage> {
+    src.carried.and_then(|m| m.get(&texturecraft_compose::MASK_CHANNEL))
+}
+
 /// Commit a stroke into the paint effect `effect` of a mask, painting gray `value`.
 pub fn commit_mask(pixels: &mut PixelStore, effect: LayerId, size: (u32, u32), value: f32, src: CommitSource, staging: &mut Staging) {
     let img = pixels.mask_mut(effect, size);
     let value = [value.clamp(0.0, 1.0)];
-    over(img, &Blend { kind: ChannelKind::Scalar, value: &value, stencil_color: false, carried: None }, &src, staging.take(None));
+    over(img, &Blend { kind: ChannelKind::Scalar, value: &value, stencil_color: false, carried: mask_carried(&src) }, &src, staging.take(None));
 }
 
 /// Commit a stroke into a coverage-only image (1 component), e.g. the quick mask.

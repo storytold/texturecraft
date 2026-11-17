@@ -56,16 +56,13 @@ impl Selection {
 
     /// Whether the shelf offers `tool` for this selection
     pub(super) fn offers(self, tool: Tool) -> bool {
-        let reads_content = matches!(tool, Tool::Smudge | Tool::Clone);
         match tool {
             Tool::ColorPicker => true,
             Tool::GeometryMask => !matches!(self, Selection::Nothing | Selection::QuickMaskOverNothing),
             _ => match self {
                 Selection::PaintContent | Selection::PaintSublayer => true,
                 Selection::PaintSublayerInFill => tool != Tool::Path,
-                Selection::PaintMask | Selection::FillMask | Selection::FolderMask | Selection::InstanceOwnMask | Selection::PaintSublayerInMask => {
-                    !reads_content
-                }
+                Selection::PaintMask | Selection::FillMask | Selection::FolderMask | Selection::InstanceOwnMask | Selection::PaintSublayerInMask => true,
                 Selection::PathSublayer => tool == Tool::Path,
                 Selection::QuickMaskOverPaint | Selection::QuickMaskOverFill | Selection::QuickMaskOverNothing => tool != Tool::Path,
                 _ => false,

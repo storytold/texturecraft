@@ -5,13 +5,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use texturecraft_compose::Composite;
+use texturecraft_compose::{Composite, MASK_CHANNEL};
 use texturecraft_compose::eval::FlatTile;
 use texturecraft_core::Channel;
 use texturecraft_geom::{NO_TRI, UvGBuffer};
 use texturecraft_texel::{TILE_AREA, TileImage, from_u16, to_u16};
 
 use crate::commit::{dec, enc};
+
 
 /// How a pickup stroke finds the values it deposits.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -91,6 +92,14 @@ impl Pickup {
         let mut p = Pickup::new(mode, source, gbuf, channels);
         p.coverage = Some(coverage);
         p
+    }
+
+    /// A pickup reading mask `values` (one component per texel, at the stroke's size): the stroke
+    /// carries mask values under [`MASK_CHANNEL`].
+    pub fn from_mask(mode: PickupMode, values: TileImage, gbuf: Arc<UvGBuffer>) -> Pickup {
+        let mut source = Composite::with_size(&[MASK_CHANNEL], values.width(), values.height());
+        source.channels.insert(MASK_CHANNEL, values);
+        Pickup::new(mode, source, gbuf, [MASK_CHANNEL])
     }
 
     fn covered(&self, x: u32, y: u32) -> bool {

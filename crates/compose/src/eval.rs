@@ -72,6 +72,10 @@ impl Stencil {
     }
 }
 
+/// The channel under which a clone or smudge stroke on a mask carries its mask values (the mask
+/// has no channels of its own; any scalar channel works).
+pub const MASK_CHANNEL: Channel = Channel::Roughness;
+
 /// The stroke being drawn, shown before it is committed.
 #[derive(Clone, Debug)]
 pub struct StrokePreview {
@@ -1615,7 +1619,9 @@ impl<'a, 'b> Texel<'a, 'b> {
                             painted *= 1.0 - stroke;
                             coverage *= 1.0 - stroke;
                         } else {
-                            painted = preview.mask_value * stroke + painted * (1.0 - stroke);
+                            // Clone and smudge show the values they carry instead of the mask gray
+                            let deposited = preview.carried.get(&MASK_CHANNEL).map_or(preview.mask_value, |carried| from_u16(carried.get(self.x, self.y)[0]));
+                            painted = deposited * stroke + painted * (1.0 - stroke);
                             coverage = stroke + coverage * (1.0 - stroke);
                         }
                     }
@@ -2416,6 +2422,37 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
         }
     }
     Some(output)
+}
+
+/// The layer mask as one-component values at the texture set's full resolution over `tiles`
+/// (uncovered texels read zero). Clone and smudge read it. Unlike [`mask_image`] it also reads a
+/// disabled mask; None when the layer has no mask.
+pub fn mask_values(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Option<TileImage> {
+    let mask = layer_mask(inputs.project, id)?;
+    let channels = inputs.project.texture_set(inputs.ts).map(|set| set.channel_list()).unwrap_or_default();
+    let (width, height) = (inputs.gbuf.width, inputs.gbuf.height);
+
+    prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
+
+    let fields = neighbourhood_fields(inputs, &channels, tiles);
+    let computed: Vec<((u32, u32), Vec<u16>)> = tiles
+        .par_iter()
+        .map(|&tile| {
+            let mut values = vec![0u16; TILE_AREA];
+            for (offset, value) in mask_tile(inputs, id, mask, &channels, &fields, tile, 0..TILE_AREA) {
+                if let Some(destination) = values.get_mut(offset) {
+                    *destination = to_u16(value.clamp(0.0, 1.0));
+                }
+            }
+            (tile, values)
+        })
+        .collect();
+
+    let mut image = TileImage::new(width, height, 1);
+    for ((tx, ty), values) in computed {
+        image.set_tile(tx, ty, Some(std::sync::Arc::new(values)));
+    }
+    Some(image)
 }
 
 /// Mask values at texture-set coordinates, in request order; None without an enabled mask

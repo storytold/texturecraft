@@ -14,6 +14,7 @@ mod filters;
 mod generator_inputs;
 mod high_poly_missed;
 mod instances;
+mod mask_clone_smudge;
 mod materialcraft_link;
 mod materialx;
 mod materialx_import;

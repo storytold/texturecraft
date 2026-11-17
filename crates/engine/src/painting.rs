@@ -103,6 +103,29 @@ impl Session {
         }
     }
 
+    /// Whether the stroke the selection starts paints a mask (the layer's mask, or a paint or
+    /// filter sublayer inside it).
+    fn paints_mask(&self) -> bool {
+        match self.target {
+            StackTarget::Content => false,
+            StackTarget::Mask => true,
+            StackTarget::Effect(effect) => {
+                let project = &self.doc.project;
+                project.effect(effect).and_then(|(owner, _)| project.layers.get(&owner)).is_some_and(|l| !l.content_effects.iter().any(|e| e.id == effect))
+            }
+        }
+    }
+
+    /// The mask that paint effect `effect` belongs to as values per texel (zero everywhere when
+    /// the layer has no mask yet), for a clone or smudge stroke to read.
+    fn mask_values_before(&self, ts: usize, effect: LayerId) -> Option<texturecraft_texel::TileImage> {
+        let (owner, _) = self.doc.project.effect(effect)?;
+        let cache = self.caches.get(ts)?;
+        let tiles: Vec<(u32, u32)> = cache.covered_tiles.iter().copied().collect();
+        let empty = || texturecraft_texel::TileImage::new(cache.gbuf.width, cache.gbuf.height, 1);
+        Some(self.with_inputs(ts, |inputs| texturecraft_compose::mask_values(inputs, owner, &tiles)).unwrap_or_else(empty))
+    }
+
     /// What a stroke paints while non-paint effect `effect` of layer `owner` is selected: the
     /// nearest paint effect below it in the same stack, else the paint layer's own pixels (for
     /// content) or a new paint effect inserted just below it (for a mask).
@@ -168,7 +191,7 @@ impl Session {
         }
         // Cloning from the selected layer reads that layer alone.
         let layer_source = match self.selected_layer() {
-            Some(id) if pickup.is_some() && tool == Tool::Clone && self.tool.clone_from == CloneFrom::Layer => {
+            Some(id) if pickup.is_some() && tool == Tool::Clone && self.tool.clone_from == CloneFrom::Layer && !self.paints_mask() => {
                 Some(self.flatten(ts, id).ok_or_else(|| EngineError::Other("clone from a paint or fill layer (folders have no content of their own)".into()))?)
             }
             _ => None,
@@ -186,11 +209,14 @@ impl Session {
             }
         };
         let values = target.map(|t| self.stroke_values(t)).unwrap_or_default();
+        // Clone and smudge on a mask read the mask as it was before the stroke.
+        let mask_source = match target {
+            Some(PaintTarget::Mask(effect)) if pickup.is_some() => self.mask_values_before(ts, effect),
+            _ => None,
+        };
         let stencil = if tool == Tool::Projection && !quick_mask { self.capture_stencil(viewport) } else { None };
         let problem = if !erase && values.is_empty() && matches!(target, Some(PaintTarget::Layer(_))) {
             Some("no channel enabled to paint: enable channels in the tool's material")
-        } else if pickup.is_some() && matches!(target, Some(PaintTarget::Mask(_))) {
-            Some("the Clone and Smudge tools paint layer content: select the layer instead of its mask")
         } else if tool == Tool::Projection && !quick_mask && stencil.is_none() && !uv_mode {
             Some("the Projection tool needs a stencil: pick an image in the tool properties (tool.stencil)")
         } else {
@@ -220,9 +246,11 @@ impl Session {
                 }
                 m => m,
             };
-            canvas.pickup = Some(match &layer_source {
-                Some(flat) => Pickup::from_layer(mode, flat, size, cache.gbuf.clone(), values.keys().copied()),
-                None => Pickup::new(mode, cache.composite.clone(), cache.gbuf.clone(), values.keys().copied()),
+            canvas.pickup = Some(match (&layer_source, mask_source) {
+                // On a mask the stroke reads the mask's own values.
+                (_, Some(values)) => Pickup::from_mask(mode, values, cache.gbuf.clone()),
+                (Some(flat), None) => Pickup::from_layer(mode, flat, size, cache.gbuf.clone(), values.keys().copied()),
+                (None, None) => Pickup::new(mode, cache.composite.clone(), cache.gbuf.clone(), values.keys().copied()),
             });
             if tool == Tool::Clone
                 && let Some(src) = self.tool.clone_source.as_mut()
