@@ -21,7 +21,7 @@ use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage, from_u16, nois
 use crate::below::{Band, BelowCache, Level, StackKey};
 use crate::curvature_sizes::CurvatureSizes;
 use crate::held_fields::HeldFields;
-use crate::pattern::{Coords, decal_uv, image_samples, procedural, world_noise};
+use crate::pattern::{Coords, decal_uv_symmetric, image_samples, procedural, world_noise};
 use crate::store::{BakedMaps, ImageStore, PixelStore, decode};
 
 const NCH: usize = Channel::ALL.len();
@@ -1394,8 +1394,10 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// position in the decal's frame (then sampled as UVs) and the decal's coverage.
     fn projected<'p>(&mut self, proj: &'p Projection) -> (Coords, &'p Projection, f32) {
         let c = self.coords();
+        let (lo, hi) = self.inp.bounds;
+        let center = (lo + hi) * 0.5;
         match proj {
-            Projection::Decal(d) => match self.world().and_then(|p| decal_uv(d, p, c.nrm)) {
+            Projection::Decal(d) => match self.world().and_then(|p| decal_uv_symmetric(d, p, c.nrm, center)) {
                 Some((uv, w)) => (Coords { uv, ..c }, &DECAL_UV, w),
                 None => (c, &DECAL_UV, 0.0),
             },
@@ -3676,6 +3678,7 @@ soft {soft:?}"
             rotation: 0.0,
             offset: [0.0; 2],
             depth: 0.5,
+            symmetry: None,
         };
         let id = f.project.alloc_id();
         let mut fill = Fill { projection: Projection::Decal(d), ..Fill::default() };
@@ -3705,6 +3708,147 @@ soft {soft:?}"
         assert!(close(out.value(Channel::BaseColor, 2, 2), [0.5; 3]), "outside the frame");
         let half = composite(0.5);
         assert!(close(half.value(Channel::BaseColor, 32, 32), [0.75, 0.25, 0.25]), "the image alpha shapes the decal");
+    }
+
+    /// Composites a cube with a decal of a four-colored image, and checks each texel of the
+    /// faces picked by `expect` against the image at the coordinates it gives (None: the texel
+    /// is not part of the check). Returns how many texels were checked.
+    fn cube_decal_texels(d: texturecraft_core::Decal, expect: impl Fn(Vec3, Vec3) -> Option<Option<(f32, f32)>>) -> usize {
+        let mesh = primitives::cube(2.0);
+        let gbuf = UvGBuffer::new(&mesh, 0, 64, 64);
+        let mut project = Project::new("t", "builtin:cube");
+        project.texture_sets.push(TextureSet::new("Cube", 0, 64));
+        let id = project.alloc_id();
+        let mut fill = Fill { projection: Projection::Decal(d), ..Fill::default() };
+        fill.sources.insert(Channel::BaseColor, Source::image("decal"));
+        project.insert_layer(0, Layer::new(id, "Decal", LayerKind::Fill(fill), &[Channel::BaseColor]), None, false).unwrap();
+        // Top left red, top right blue, bottom left green, bottom right yellow
+        let img = crate::store::ImageRes {
+            width: 2,
+            height: 2,
+            rgba: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 1.0], [1.0, 1.0, 0.0, 1.0]],
+            srgb: false,
+        };
+        let images: ImageStore = [("decal".to_string(), std::sync::Arc::new(img.clone()))].into_iter().collect();
+        let pixels = PixelStore::default();
+        let baked = BakedMaps::default();
+        let inp = Inputs {
+            project: &project,
+            ts: 0,
+            mesh: &mesh,
+            gbuf: &gbuf,
+            pixels: &pixels,
+            baked: &baked,
+            block_scales: project.texture_sets[0].block_scales(),
+            preview: None,
+            images: &images,
+            bounds: mesh.bounds(),
+        };
+        let mut out = Composite::new(&project.texture_sets[0].channel_list(), 64);
+        composite_tiles(&inp, &mut out, &all_tiles(64, 64));
+
+        let mut checked = 0;
+        for i in 0..64 * 64 {
+            let Some(surface) = gbuf.surface(&mesh, i) else { continue };
+            let Some(want) = expect(surface.pos, surface.nrm) else { continue };
+            let got = out.value(Channel::BaseColor, (i % 64) as u32, (i / 64) as u32);
+            let want = want.map_or([0.5; 3], |(u, v)| {
+                let c = img.sample(u, v);
+                [c[0], c[1], c[2]]
+            });
+            assert!(close(got, want), "texel at {:?} on a face turned to {:?}: {got:?}, expected {want:?}", surface.pos, surface.nrm);
+            checked += 1;
+        }
+        checked
+    }
+
+    /// A 1 by 1 decal on the cube's +X face (the image's right runs toward -Z, its up toward +Y)
+    fn cube_decal(center: [f32; 3], size: f32, symmetry: Option<texturecraft_core::DecalSymmetry>) -> texturecraft_core::Decal {
+        texturecraft_core::Decal { center, normal: [1.0, 0.0, 0.0], up: [0.0, 1.0, 0.0], size: [size; 2], rotation: 0.0, offset: [0.0; 2], depth: 0.5, symmetry }
+    }
+
+    /// What the decal of `size` centered at (cy, cz) on the +X face gives the point (y, z) of
+    /// that face: the image coordinates well inside the frame, None for a bare texel clearly
+    /// outside it, and None for texels near its edge (not part of the checks).
+    fn face_expect(y: f32, z: f32, (cy, cz): (f32, f32), size: f32) -> Option<Option<(f32, f32)>> {
+        let (u, v) = (0.5 - (z - cz) / size, 0.5 - (y - cy) / size);
+        let off = (u - 0.5).abs().max((v - 0.5).abs());
+        if off < 0.4 {
+            Some(Some((u, v)))
+        } else if off > 0.6 {
+            Some(None)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn a_mirrored_decal_lands_on_the_opposite_cube_face_with_its_flip() {
+        use texturecraft_core::{DecalFlip, DecalSymmetry};
+        let at = (0.1, -0.2);
+        let on_x = |flip| {
+            cube_decal_texels(cube_decal([1.0, at.0, at.1], 1.0, Some(DecalSymmetry { axis: 0, flip })), |p, n| {
+                if n.x > 0.99 {
+                    face_expect(p.y, p.z, at, 1.0)
+                } else if n.x < -0.99 {
+                    // The mirror image: the point's reflection, then the flip of the copy
+                    face_expect(p.y, p.z, at, 1.0).map(|texel| {
+                        texel.map(|(u, v)| match flip {
+                            DecalFlip::None => (u, v),
+                            DecalFlip::U => (1.0 - u, v),
+                            DecalFlip::V => (u, 1.0 - v),
+                        })
+                    })
+                } else {
+                    Some(None)
+                }
+            })
+        };
+        for flip in [DecalFlip::None, DecalFlip::U, DecalFlip::V] {
+            assert!(on_x(flip) > 800, "{flip:?}: most of the cube was checked");
+        }
+
+        // No symmetry: the -X face stays bare
+        let bare = cube_decal_texels(cube_decal([1.0, at.0, at.1], 1.0, None), |p, n| {
+            if n.x > 0.99 {
+                face_expect(p.y, p.z, at, 1.0)
+            } else {
+                Some(None)
+            }
+        });
+        assert!(bare > 800);
+
+        // Mirrored across Z, the copy sits on the same face on the other side of the Z = 0 plane
+        let at = (0.1, -0.5);
+        let across_z = Some(DecalSymmetry { axis: 2, flip: DecalFlip::None });
+        let on_z = cube_decal_texels(cube_decal([1.0, at.0, at.1], 0.4, across_z), |p, n| {
+            if n.x > 0.99 {
+                match (face_expect(p.y, p.z, at, 0.4), face_expect(p.y, -p.z, at, 0.4)) {
+                    (Some(Some(texel)), _) | (_, Some(Some(texel))) => Some(Some(texel)),
+                    (Some(None), Some(None)) => Some(None),
+                    _ => None,
+                }
+            } else {
+                Some(None)
+            }
+        });
+        assert!(on_z > 800);
+    }
+
+    #[test]
+    fn moving_the_decal_moves_its_mirrored_copy() {
+        use texturecraft_core::{DecalFlip, DecalSymmetry};
+        let symmetry = Some(DecalSymmetry { axis: 0, flip: DecalFlip::None });
+        for at in [(0.5, 0.3), (-0.4, -0.5)] {
+            let checked = cube_decal_texels(cube_decal([1.0, at.0, at.1], 0.4, symmetry), |p, n| {
+                if n.x.abs() > 0.99 {
+                    face_expect(p.y, p.z, at, 0.4)
+                } else {
+                    Some(None)
+                }
+            });
+            assert!(checked > 800, "{at:?}");
+        }
     }
 
     #[test]

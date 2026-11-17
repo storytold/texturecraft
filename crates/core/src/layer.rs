@@ -192,6 +192,33 @@ pub struct Decal {
     pub offset: [f32; 2],
     /// How far in front of and behind the frame the decal reaches (world units).
     pub depth: f32,
+    /// A mirrored copy of the decal on the other side of the mesh (None: no copy). The copy
+    /// follows this frame, so moving, scaling or turning the decal moves it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symmetry: Option<DecalSymmetry>,
+}
+
+/// The mirrored copy of a decal: reflected through the plane across the mesh center, perpendicular to `axis`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecalSymmetry {
+    /// Axis the mirror plane is perpendicular to (0 = X, 1 = Y, 2 = Z)
+    pub axis: u8,
+    /// Extra flip of the image on the mirrored copy, on top of the reflection itself
+    #[serde(default)]
+    pub flip: DecalFlip,
+}
+
+/// How the mirrored decal's image is turned over
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecalFlip {
+    /// Only the reflection: the copy is the decal's mirror image
+    #[default]
+    None,
+    /// The image's left and right swapped
+    U,
+    /// The image's top and bottom swapped
+    V,
 }
 
 impl Default for Projection {
@@ -1172,6 +1199,21 @@ impl Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_decal_saved_without_symmetry_loads_unchanged_and_saves_without_it() {
+        let old = r#"{"center":[0.0,0.0,1.0],"normal":[0.0,0.0,1.0],"up":[0.0,1.0,0.0],"size":[1.0,1.0],"rotation":0.0,"offset":[0.0,0.0],"depth":0.5}"#;
+        let decal: Decal = serde_json::from_str(old).unwrap();
+        assert_eq!(decal.symmetry, None);
+        assert_eq!(serde_json::to_string(&decal).unwrap(), old.replace(' ', ""), "nothing new is written for a decal without a copy");
+
+        let mirrored = Decal { symmetry: Some(DecalSymmetry { axis: 2, flip: DecalFlip::V }), ..decal };
+        let json = serde_json::to_string(&mirrored).unwrap();
+        assert!(json.contains(r#""symmetry":{"axis":2,"flip":"v"}"#), "{json}");
+        assert_eq!(serde_json::from_str::<Decal>(&json).unwrap(), mirrored);
+        let without_flip = json.replace(r#","flip":"v""#, "");
+        assert_eq!(serde_json::from_str::<Decal>(&without_flip).unwrap().symmetry, Some(DecalSymmetry { axis: 2, flip: DecalFlip::None }));
+    }
 
     #[test]
     fn material_effect_images_are_reported_as_used() {

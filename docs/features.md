@@ -19,7 +19,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   **particle brush**, **smudge**, **clone** (V + click sets the source), material picker, Shift+click
   straight lines, and painting directly in the **2D UV view**.
 - **Geometry decals:** drop an image on the surface, then move, scale and turn its frame; it stays
-  an editable fill layer.
+  an editable fill layer. Mirror across X, Y or Z (optionally flipping the copy's image in U or V)
+  to place a copy on the opposite side of the mesh; it follows the decal.
 - **Text** in any installed font (or the built-in ones), shaped for every script with kerning and
   ligatures, one or more lines: stamp it with the brush as its alpha, or place it as a decal in the
   tool's base color (Properties › Alpha › Text).

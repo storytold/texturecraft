@@ -369,6 +369,18 @@ Maps are found by file name, case-insensitively, from the last known word in the
 In the app: File › Import PBR texture folder... or drop a folder, a `.zip` or several map files on the
 window. The dialog shows the maps found, lets you pick between candidates, set the normal convention and
 projection, and keep the material in the library (shelf › Materials).
+## Geometry decals
+
+`layer.add.decal {image, position?, normal?, up?, size?, rotation?, depth?, symmetry?, symmetryFlip?}`
+places an image on the surface; `layer.decal.set` moves, resizes or turns it later. `symmetry`
+(`x`, `y`, `z` or `off`) adds a mirrored copy on the other side of the mesh: the decal reflected
+through the plane across the mesh center, perpendicular to that axis. The copy is part of the
+decal, not a second layer, so it follows every later edit and is saved with the project.
+`symmetryFlip` (`none`, `u`, `v`) additionally flips the copy's image (U swaps left and right,
+V swaps top and bottom); with a copy on, either param may be sent alone and keeps the other.
+`session.inspect` shows the setting as `decal.symmetry` (`{axis: 0|1|2, flip}`, absent without
+a copy).
+
 ## Camera bookmarks
 
 Saved cameras (`Project.cameras`, stored in the `.tcraft` file) are the camera bookmarks.

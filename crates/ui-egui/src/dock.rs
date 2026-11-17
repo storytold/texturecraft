@@ -6,7 +6,7 @@ use egui_phosphor::regular as ic;
 use serde_json::{Value, json};
 use texturecraft_engine::compose::ThumbTarget;
 use texturecraft_engine::core::{
-    BakedMap, BlendMode, Channel, Decal, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind, LinkParam, MaterialLink, ProceduralKind, Projection,
+    BakedMap, BlendMode, Channel, Decal, DecalFlip, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind, LinkParam, MaterialLink, ProceduralKind, Projection,
     Source,
 };
 use texturecraft_engine::filter_lib::scalar_params;
@@ -2530,11 +2530,45 @@ fn decal_editor(app: &mut TextureCraftApp, ui: &mut Ui, d: &Decal, layer: LayerI
     if let Some(merge) = edit {
         app.run("layer.decal.set", json!({"layer": layer.0, "size": [v[0], v[1]], "rotation": v[2], "offset": [v[3], v[4]], "depth": v[5], "merge": merge}));
     }
+    decal_symmetry_editor(app, ui, d, layer);
     ui.label(
         RichText::new(tr("The image's alpha cuts the decal's shape; faces turned away and surfaces beyond its depth stay clear."))
             .size(10.5)
             .color(tk.text_dim),
     );
+}
+
+/// The decal's mirrored copy on the other side of the mesh: the axis it is mirrored across and how its image is flipped
+fn decal_symmetry_editor(app: &mut TextureCraftApp, ui: &mut Ui, d: &Decal, layer: LayerId) {
+    let axes = ["X", "Y", "Z"];
+    let axis = d.symmetry.map(|symmetry| usize::from(symmetry.axis));
+    let mut picked = None;
+    combo(ui, tr("Mirror across"), axis.and_then(|axis| axes.get(axis).copied()).unwrap_or_else(|| tr("Off")), |ui| {
+        if ui.selectable_label(axis.is_none(), tr("Off")).clicked() && axis.is_some() {
+            picked = Some(json!({"symmetry": "off"}));
+        }
+        for (i, name) in axes.into_iter().enumerate() {
+            if ui.selectable_label(axis == Some(i), name).clicked() && axis != Some(i) {
+                picked = Some(json!({"symmetry": name.to_ascii_lowercase()}));
+            }
+        }
+    });
+
+    if let Some(symmetry) = d.symmetry {
+        let flips = [(DecalFlip::None, tr("None"), "none"), (DecalFlip::U, "U", "u"), (DecalFlip::V, "V", "v")];
+        let current = flips.iter().find(|flip| flip.0 == symmetry.flip).map_or("", |flip| flip.1);
+        combo(ui, tr("Flip the copy's image"), current, |ui| {
+            for (flip, name, id) in flips {
+                if ui.selectable_label(flip == symmetry.flip, name).clicked() && flip != symmetry.flip {
+                    picked = Some(json!({"symmetryFlip": id}));
+                }
+            }
+        });
+    }
+
+    if let Some(change) = picked {
+        app.run("layer.decal.set", with(&json!({"layer": layer.0}), change));
+    }
 }
 
 /// The source of one fill channel: uniform, procedural, image or anchor.

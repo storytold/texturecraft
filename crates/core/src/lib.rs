@@ -24,7 +24,7 @@ pub use bake::{
 pub use blend::{BlendMode, blend1, blend3, lum, mix3};
 pub use channel::{Channel, ChannelFormat, ChannelKind};
 pub use layer::{
-    ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, Effect, EffectKind, Fill, Filter, Generator, GeneratorGlobal, GeneratorKind, HeightMask,
+    ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, DecalFlip, DecalSymmetry, Effect, EffectKind, Fill, Filter, Generator, GeneratorGlobal, GeneratorKind, HeightMask,
     Layer, LayerId, LayerKind, Levels, LinkParam, LinkPreset, Mask, MaskBackground, MaterialLink, MicroDetail, OutputResolution, PathShape, Procedural,
     ProceduralKind, Projection, ResolutionMode, Source, gradient, hsl_adjust, per_unit,
 };

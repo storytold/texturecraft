@@ -626,3 +626,78 @@ fn directx_normal_images_flip_green() {
     let old: texturecraft_engine::core::Source = serde_json::from_value(json!({"Image": {"name": "n"}})).unwrap();
     assert_eq!(old, texturecraft_engine::core::Source::image("n"));
 }
+
+/// Red texels of the cube's -X face (turned away from where the decals are placed) whose position satisfies `inside`
+fn red_on_minus_x(s: &mut Session, inside: impl Fn(f32, f32) -> bool) -> usize {
+    s.update();
+    let cache = &s.caches[0];
+    let (w, h) = cache.size;
+    (0..w * h)
+        .filter(|&i| {
+            let Some(surface) = cache.gbuf.surface(&s.mesh, i as usize) else { return false };
+            surface.nrm.x < -0.99 && inside(surface.pos.y, surface.pos.z) && red(cache.composite.value(Channel::BaseColor, i % w, i / w))
+        })
+        .count()
+}
+
+fn decal_of(s: &Session, layer: LayerId) -> texturecraft_engine::core::Decal {
+    let LayerKind::Fill(fill) = &s.doc.project.layer(layer).unwrap().kind else { panic!("a fill layer") };
+    let Projection::Decal(decal) = fill.projection else { panic!("a decal") };
+    decal
+}
+
+#[test]
+fn a_decal_with_symmetry_also_covers_the_mirrored_side_and_follows_its_edits() {
+    use texturecraft_engine::core::{DecalFlip, DecalSymmetry};
+    let mut s = Session::new_project("t", primitives::cube(2.0), "builtin:cube", None, 256).unwrap();
+    let name = s.import_resource_bytes("logo.png", png(8, 8, |_, _| [255, 0, 0, 255])).unwrap();
+    let place = json!({"image": name, "position": [1.0, 0.0, 0.0], "normal": [1.0, 0.0, 0.0], "up": [0.0, 1.0, 0.0], "size": 0.6});
+    let layer = id(execute(&mut s, "layer.add.decal", &place).unwrap(), "layer");
+    assert_eq!(decal_of(&s, layer).symmetry, None, "no copy unless asked for");
+    assert_eq!(red_on_minus_x(&mut s, |_, _| true), 0);
+
+    assert!(execute(&mut s, "layer.decal.set", &json!({"symmetry": "w"})).is_err());
+    assert!(execute(&mut s, "layer.decal.set", &json!({"symmetryFlip": "up"})).is_err());
+    let depth = s.history_labels().len();
+    let r = execute(&mut s, "layer.decal.set", &json!({"symmetry": "x", "symmetryFlip": "u"})).unwrap();
+    assert_eq!(r["decal"]["symmetry"], json!({"axis": 0, "flip": "u"}));
+    assert_eq!(s.history_labels().len(), depth + 1, "one undo step");
+    let centered = red_on_minus_x(&mut s, |y, z| y.abs() < 0.2 && z.abs() < 0.2);
+    assert!(centered > 20, "the mirrored copy shows opposite the decal: {centered}");
+
+    // The copy follows the decal when it moves (offset along its up) and when it grows
+    execute(&mut s, "layer.decal.set", &json!({"offset": [0.0, 0.5]})).unwrap();
+    assert!(red_on_minus_x(&mut s, |y, _| y > 0.3) > 20, "moved up with the decal");
+    assert_eq!(red_on_minus_x(&mut s, |y, _| y.abs() < 0.1), 0, "and left the middle");
+    execute(&mut s, "layer.decal.set", &json!({"size": 1.6})).unwrap();
+    assert!(red_on_minus_x(&mut s, |y, _| y.abs() < 0.1) > 20, "bigger with the decal");
+    execute(&mut s, "layer.decal.set", &json!({"size": 0.6})).unwrap();
+
+    // A flip alone keeps the axis; off removes the copy
+    execute(&mut s, "layer.decal.set", &json!({"symmetryFlip": "v"})).unwrap();
+    assert_eq!(decal_of(&s, layer).symmetry, Some(DecalSymmetry { axis: 0, flip: DecalFlip::V }));
+    execute(&mut s, "layer.decal.set", &json!({"symmetry": "z"})).unwrap();
+    assert_eq!(decal_of(&s, layer).symmetry, Some(DecalSymmetry { axis: 2, flip: DecalFlip::V }), "a new axis keeps the flip");
+    execute(&mut s, "layer.decal.set", &json!({"symmetry": "x"})).unwrap();
+
+    // Saved with the project
+    let reopened = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.doc.project, s.doc.project);
+    assert_eq!(decal_of(&reopened, layer).symmetry, Some(DecalSymmetry { axis: 0, flip: DecalFlip::V }));
+
+    // Seven edits since the copy was asked for: undoing them all leaves the decal as placed
+    for _ in 0..7 {
+        execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    }
+    assert_eq!(decal_of(&s, layer).symmetry, None);
+    assert_eq!(red_on_minus_x(&mut s, |_, _| true), 0);
+    execute(&mut s, "edit.redo", &Value::Null).unwrap();
+    assert!(red_on_minus_x(&mut s, |_, _| true) > 20, "redo brings the copy back");
+    execute(&mut s, "layer.decal.set", &json!({"symmetry": "off"})).unwrap();
+    assert_eq!(decal_of(&s, layer).symmetry, None);
+    assert_eq!(red_on_minus_x(&mut s, |_, _| true), 0, "off: the other side is bare again");
+
+    // A decal can be added with a copy right away
+    let both = execute(&mut s, "layer.add.decal", &json!({"image": name, "position": [0.0, 1.0, 0.0], "normal": [0.0, 1.0, 0.0], "symmetry": "y"})).unwrap();
+    assert_eq!(both["decal"]["symmetry"], json!({"axis": 1, "flip": "none"}));
+}

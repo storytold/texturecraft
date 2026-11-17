@@ -1,6 +1,6 @@
 //! Procedural patterns and projections.
 
-use texturecraft_core::{Decal, Procedural, ProceduralKind, Projection};
+use texturecraft_core::{Decal, DecalFlip, Procedural, ProceduralKind, Projection};
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_texel::noise;
 
@@ -336,6 +336,30 @@ pub fn decal_uv(d: &Decal, p: Vec3, nrm: Vec3) -> Option<(Vec2, f32)> {
     Some((Vec2::new(lx + 0.5, 0.5 - ly), w))
 }
 
+/// [`decal_uv`] for a decal with a mirrored copy: whichever of the decal and its copy covers the
+/// point more. The copy is the decal reflected through the plane across `center` (the mesh
+/// center), so a point is looked up as its reflection and the image flipped as asked.
+pub fn decal_uv_symmetric(d: &Decal, p: Vec3, nrm: Vec3, center: Vec3) -> Option<(Vec2, f32)> {
+    let direct = decal_uv(d, p, nrm);
+    let Some(symmetry) = d.symmetry else { return direct };
+    let axis = usize::from(symmetry.axis.min(2));
+    let (mut mp, mut mn) = (p, nrm);
+    mp[axis] = 2.0 * center[axis] - p[axis];
+    mn[axis] = -nrm[axis];
+    let mirrored = decal_uv(d, mp, mn).map(|(uv, w)| {
+        let uv = match symmetry.flip {
+            DecalFlip::None => uv,
+            DecalFlip::U => Vec2::new(1.0 - uv.x, uv.y),
+            DecalFlip::V => Vec2::new(uv.x, 1.0 - uv.y),
+        };
+        (uv, w)
+    });
+    match (direct, mirrored) {
+        (Some(a), Some(b)) => Some(if b.1 > a.1 { b } else { a }),
+        (a, b) => a.or(b),
+    }
+}
+
 /// World-space noise used by generators (seamless across UV islands).
 pub fn world_noise(pos: Vec3, scale: f32, seed: u32) -> f32 {
     noise::fbm((pos * scale.max(1e-3)).to_array(), 4, seed, noise::perlin)
@@ -361,6 +385,7 @@ mod tests {
                 rotation: 0.0,
                 offset: [0.0; 2],
                 depth: 1.0,
+                symmetry: None,
             }),
         ];
         for k in ProceduralKind::ALL {
@@ -461,7 +486,7 @@ mod tests {
 
     #[test]
     fn decals_cover_their_frame_facing_them() {
-        let d = Decal { center: [0.0; 3], normal: [0.0, 0.0, 1.0], up: [0.0, 1.0, 0.0], size: [2.0, 1.0], rotation: 0.0, offset: [0.0; 2], depth: 0.5 };
+        let d = Decal { center: [0.0; 3], normal: [0.0, 0.0, 1.0], up: [0.0, 1.0, 0.0], size: [2.0, 1.0], rotation: 0.0, offset: [0.0; 2], depth: 0.5, symmetry: None };
         let z = Vec3::Z;
         let (uv, w) = decal_uv(&d, Vec3::new(0.5, 0.25, 0.0), z).unwrap();
         assert!((uv - Vec2::new(0.75, 0.25)).length() < 1e-5 && (w - 1.0).abs() < 1e-5, "{uv} {w}");

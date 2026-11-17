@@ -2,7 +2,7 @@
 //! (a decal fill with a planar projection), as a fill layer with a decal projection.
 
 use serde_json::{Value, json};
-use texturecraft_core::{Channel, Decal, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source};
+use texturecraft_core::{Channel, Decal, DecalFlip, DecalSymmetry, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source};
 use texturecraft_geom::glam::{Vec2, Vec3};
 
 use crate::commands::{CommandSpec, always, bad, channel_param, f32p, has_layer, layer_param, strp, u64p, vec3};
@@ -16,7 +16,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add decal",
             [],
             None,
-            "{image: resource name, channel?: a channel id (default baseColor) | \"mask\" (a new fill layer masked by the image's gray), x?, y?: viewport pixels (default: the view center; a point on another texture set selects it), viewport?: [w,h] | position?: [x,y,z], normal?: [x,y,z] (on the selected texture set), up?: [x,y,z] (the image's up; default the view's up, or the view direction when that is along the normal), size?: height | [w,h] (world units; default a quarter of the mesh), rotation?: degrees, depth?, name?} → {layer, decal, maskEffect: the mask fill effect holding the image with channel \"mask\", else null} — a fill layer projecting the image from a frame placed on the surface; seen from the front, the image reads the right way round",
+            "{image: resource name, channel?: a channel id (default baseColor) | \"mask\" (a new fill layer masked by the image's gray), x?, y?: viewport pixels (default: the view center; a point on another texture set selects it), viewport?: [w,h] | position?: [x,y,z], normal?: [x,y,z] (on the selected texture set), up?: [x,y,z] (the image's up; default the view's up, or the view direction when that is along the normal), size?: height | [w,h] (world units; default a quarter of the mesh), rotation?: degrees, depth?, symmetry?: x|y|z|off (also place a mirrored copy across the mesh center, perpendicular to that axis; it follows this decal), symmetryFlip?: none|u|v (flip the copy's image on top of the reflection), name?} → {layer, decal, maskEffect: the mask fill effect holding the image with channel \"mask\", else null} — a fill layer projecting the image from a frame placed on the surface; seen from the front, the image reads the right way round",
             always,
             add
         ),
@@ -25,7 +25,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit decal",
             [],
             None,
-            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z], size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
+            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z], size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, symmetry?: x|y|z|off, symmetryFlip?: none|u|v (the mirrored copy; flip alone keeps the axis), image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
             has_layer,
             set
         ),
@@ -91,6 +91,27 @@ fn decal_up(s: &Session, cmd: &str, p: &Value, normal: Vec3) -> Result<Vec3> {
     Ok(if up.normalize_or_zero().cross(normal).length_squared() > 1e-4 { up } else { to_world.transform_vector3(Vec3::NEG_Z) })
 }
 
+/// The mirrored copy asked for by `symmetry` (x, y, z or off) and `symmetryFlip` (none, u or v),
+/// starting from `current` for what the params leave out
+fn symmetry_param(cmd: &str, p: &Value, current: Option<DecalSymmetry>) -> Result<Option<DecalSymmetry>> {
+    let axis = match strp(p, "symmetry").map(str::to_ascii_lowercase).as_deref() {
+        None => current.map(|symmetry| symmetry.axis),
+        Some("off" | "none") => None,
+        Some("x") => Some(0),
+        Some("y") => Some(1),
+        Some("z") => Some(2),
+        Some(other) => return Err(bad(cmd, format!("unknown symmetry `{other}` (x, y, z or off)"))),
+    };
+    let flip = match strp(p, "symmetryFlip").map(str::to_ascii_lowercase).as_deref() {
+        None => current.map_or(DecalFlip::None, |symmetry| symmetry.flip),
+        Some("none" | "off") => DecalFlip::None,
+        Some("u") => DecalFlip::U,
+        Some("v") => DecalFlip::V,
+        Some(other) => return Err(bad(cmd, format!("unknown symmetryFlip `{other}` (none, u or v)"))),
+    };
+    Ok(axis.map(|axis| DecalSymmetry { axis, flip }))
+}
+
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "layer.add.decal";
     let image = strp(p, "image").ok_or_else(|| bad(cmd, "`image` is required"))?.to_string();
@@ -122,6 +143,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         offset: [0.0; 2],
         // By default it reaches half its larger side into the surface
         depth: f32p(p, "depth").map_or(size[0].max(size[1]) * 0.5, |depth| depth.clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE)),
+        symmetry: symmetry_param(cmd, p, None)?,
     };
 
     // A decal dropped on another texture set goes there and selects it, as a dropped material does
@@ -212,6 +234,7 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
     if let Some(depth) = f32p(params, "depth") {
         decal.depth = depth.clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE);
     }
+    decal.symmetry = symmetry_param(command, params, decal.symmetry)?;
 
     let image = strp(params, "image").map(str::to_string);
     if let Some(name) = &image
