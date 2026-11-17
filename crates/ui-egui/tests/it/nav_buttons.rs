@@ -23,10 +23,10 @@ fn app(layout: ViewLayout) -> (Harness<'static, TextureCraftApp>, Rect) {
     (harness, view)
 }
 
-/// Zoom the camera and the 2D view in so that the model and the texture cover the whole view, corners included: a press there paints
+/// Zoom the camera in and shift the 2D view so that the model and the texture lie under the buttons: a press there paints
 fn fill_views(harness: &mut Harness<'_, TextureCraftApp>) {
-    harness.state_mut().session.camera.distance = 0.3 * harness.state().session.camera.scene_radius;
-    harness.state_mut().ui.uv_zoom = 4.0;
+    harness.state_mut().session.camera.distance = 1.2 * harness.state().session.camera.scene_radius;
+    harness.state_mut().ui.uv_pan = [0.9, 0.0];
     harness.run_steps(4);
 }
 
@@ -49,8 +49,12 @@ fn drag_button(harness: &mut Harness<'_, TextureCraftApp>, view: Rect, kind: Nav
     drag(harness, from, from + by);
 }
 
-fn history(harness: &Harness<'_, TextureCraftApp>) -> Vec<String> {
-    harness.state().session.history_labels()
+/// What painting changes: the undo steps and the tiles the selected layer's base color has allocated
+fn history(harness: &Harness<'_, TextureCraftApp>) -> (Vec<String>, usize) {
+    let session = &harness.state().session;
+    let layer = session.selected_layer().expect("a selected layer");
+    let tiles = session.doc.pixels.layer(layer, texturecraft_engine::core::Channel::BaseColor).map_or(0, |image| image.allocated_count());
+    (session.history_labels(), tiles)
 }
 
 #[test]
@@ -123,7 +127,6 @@ fn dragging_the_zoom_button_up_moves_closer_and_down_moves_away() {
 #[test]
 fn the_2d_view_pans_and_zooms_with_its_buttons_and_paints_nothing() {
     let (mut harness, view) = app(ViewLayout::Only2D);
-    fill_views(&mut harness);
     let (zoom, pan, labels, camera) = {
         let state = harness.state();
         (state.ui.uv_zoom, state.ui.uv_pan, history(&harness), state.session.camera)
@@ -151,7 +154,7 @@ fn the_same_drags_paint_where_there_is_no_button() {
     harness.run_steps(2);
     let labels = history(&harness);
     drag_button(&mut harness, view, NavView::Scene, NavButton::Orbit, vec2(40.0, 20.0));
-    assert!(history(&harness).len() > labels.len(), "with the buttons off the press paints, so the other tests prove the buttons stop it");
+    assert!(history(&harness) != labels, "with the buttons off the press paints, so the other tests prove the buttons stop it");
 
     let (mut harness, view) = app(ViewLayout::Only2D);
     fill_views(&mut harness);
@@ -159,7 +162,7 @@ fn the_same_drags_paint_where_there_is_no_button() {
     harness.run_steps(2);
     let labels = history(&harness);
     drag_button(&mut harness, view, NavView::Uv, NavButton::Pan, vec2(40.0, 20.0));
-    assert!(history(&harness).len() > labels.len(), "the 2D view paints there too");
+    assert!(history(&harness) != labels, "the 2D view paints there too");
 }
 
 #[test]

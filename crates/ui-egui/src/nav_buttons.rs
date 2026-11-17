@@ -1,7 +1,7 @@
 //! Orbit, pan and zoom buttons in the corner of the 3D and 2D views. Pressing one with the primary button (mouse or pen tip) and
 //! dragging moves the view like the mouse shortcuts do, without painting, so a pen and tablet can navigate without a keyboard or wheel.
 
-use egui::{Area, CursorIcon, Id, Order, PointerButton, Rect, Sense, Ui, Vec2, pos2, vec2};
+use egui::{Area, CursorIcon, Order, PointerButton, Rect, Sense, Ui, Vec2, pos2, vec2};
 use egui_phosphor::regular as icon;
 
 use crate::TextureCraftApp;
@@ -106,7 +106,7 @@ pub(crate) fn show(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, view: NavView
         ui.allocate_rect(strip.expand(BUTTON_GAP), Sense::click_and_drag());
         for &button in view.buttons() {
             let Some(button_rect) = button_rect(rect, view, button) else { continue };
-            let response = ui.interact(button_rect, Id::new((area_id, button)), Sense::click_and_drag());
+            let response = ui.interact(button_rect, area_id.with(button), Sense::click_and_drag());
             let response = response.on_hover_text(tr(button.tooltip(view))).on_hover_cursor(CursorIcon::Grab);
             let pressed = response.dragged_by(PointerButton::Primary);
             if pressed {
