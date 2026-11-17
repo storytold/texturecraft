@@ -428,13 +428,15 @@ const SOLO_NOTICE_TEXT_SIZE: f32 = 12.0;
 fn solo_notice(app: &TextureCraftApp, ui: &Ui, rect: Rect) {
     let Some(solo) = app.session.solo else { return };
     let Some(layer) = app.session.doc.project.layers.get(&solo.layer) else { return };
-    let text = if solo.ignore_mask {
-        trf("Solo: {layer} (mask ignored)", &[("layer", &layer.name)])
-    } else {
-        trf("Solo: {layer}", &[("layer", &layer.name)])
-    };
+    let text = if solo.ignore_mask { trf("Solo: {layer} (mask ignored)", &[("layer", &layer.name)]) } else { trf("Solo: {layer}", &[("layer", &layer.name)]) };
     let tokens = Tokens::get(ui.ctx());
-    ui.painter_at(rect).text(rect.left_top() + SOLO_NOTICE_OFFSET, egui::Align2::LEFT_TOP, text, egui::FontId::proportional(SOLO_NOTICE_TEXT_SIZE), tokens.warning);
+    ui.painter_at(rect).text(
+        rect.left_top() + SOLO_NOTICE_OFFSET,
+        egui::Align2::LEFT_TOP,
+        text,
+        egui::FontId::proportional(SOLO_NOTICE_TEXT_SIZE),
+        tokens.warning,
+    );
 }
 
 /// The camera and view pickers at the top of a view, left out when the view is too narrow to hold them

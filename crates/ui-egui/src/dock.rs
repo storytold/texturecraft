@@ -494,12 +494,10 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
     // The eye
     let content_left = rect.left() + ROW_LEFT_PADDING + indent;
     let eye = Rect::from_center_size(pos2(content_left + EYE_SIZE * 0.5, rect.center().y), vec2(LAYER_EYE_SIZE, LAYER_EYE_SIZE));
-    let eye_response = ui
-        .interact(eye, ui.scope_id().with(("eye", layer.id.0)), Sense::click())
-        .on_hover_ui(|ui| {
-            ui.label(tr("Show or hide the layer"));
-            ui.label(tr("Alt+click: show only this layer. Alt+Shift+click: without its mask."));
-        });
+    let eye_response = ui.interact(eye, ui.scope_id().with(("eye", layer.id.0)), Sense::click()).on_hover_ui(|ui| {
+        ui.label(tr("Show or hide the layer"));
+        ui.label(tr("Alt+click: show only this layer. Alt+Shift+click: without its mask."));
+    });
     painter.text(
         eye.center(),
         egui::Align2::CENTER_CENTER,

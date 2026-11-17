@@ -73,7 +73,8 @@ fn the_solo_composite_equals_the_layer_alone_without_its_mask() {
 #[test]
 fn the_solo_changes_neither_the_document_nor_the_history_nor_the_saved_file() {
     let (mut s, _, green) = masked_stack();
-    let (project, labels, saved) = (s.doc.project.clone(), s.history_labels(), Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap().doc.project);
+    let (project, labels, saved) =
+        (s.doc.project.clone(), s.history_labels(), Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap().doc.project);
     s.set_solo(Some(Solo { layer: green, ignore_mask: true }));
     s.update();
     assert_eq!(s.doc.project, project);
@@ -133,7 +134,7 @@ fn the_view_solo_command_sets_reports_and_ends_the_solo() {
     let (mut s, _, green) = masked_stack();
     let r = execute(&mut s, "view.solo", &json!({"layer": green.0, "ignoreMask": true})).unwrap();
     assert_eq!(r, json!({"layer": green.0, "ignoreMask": true}));
-    assert_eq!(execute(&mut s, "session.inspect", &Value::Null).unwrap()["solo"], json!({"layer": green.0, "ignoreMask": true}));
+    assert_eq!(texturecraft_engine::inspect::session(&s)["solo"], json!({"layer": green.0, "ignoreMask": true}));
     // The selected layer is the default
     execute(&mut s, "view.solo", &json!({"layer": null})).unwrap();
     assert_eq!(s.solo, None);
@@ -141,7 +142,7 @@ fn the_view_solo_command_sets_reports_and_ends_the_solo() {
     let r = execute(&mut s, "view.solo", &json!({})).unwrap();
     assert_eq!(r, json!({"layer": green.0, "ignoreMask": false}));
     assert!(execute(&mut s, "view.solo", &json!({"layer": 999_999})).is_err());
-    assert_eq!(execute(&mut s, "session.inspect", &Value::Null).unwrap()["solo"]["layer"], json!(green.0));
+    assert_eq!(texturecraft_engine::inspect::session(&s)["solo"]["layer"], json!(green.0));
     execute(&mut s, "view.solo", &json!({"layer": null})).unwrap();
-    assert_eq!(execute(&mut s, "session.inspect", &Value::Null).unwrap()["solo"], Value::Null);
+    assert_eq!(texturecraft_engine::inspect::session(&s)["solo"], Value::Null);
 }

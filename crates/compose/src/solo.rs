@@ -43,10 +43,11 @@ pub fn solo_project(project: &Project, layer: LayerId, ignore_mask: bool) -> Opt
         if !ignore_mask {
             continue;
         }
+        let instance = drawn.instance_source().is_some();
         match drawn.mask.as_mut() {
             Some(mask) => mask.enabled = false,
             // An instance without its own mask draws its source's: an own, disabled one overrides it
-            None if drawn.instance_source().is_some() => drawn.mask = Some(Mask { enabled: false, ..Mask::new(MaskBackground::White) }),
+            None if instance => drawn.mask = Some(Mask { enabled: false, ..Mask::new(MaskBackground::White) }),
             None => {}
         }
     }
@@ -94,7 +95,8 @@ mod tests {
     #[test]
     fn solo_hides_the_others_and_leaves_the_original_alone() {
         let mut p = project();
-        let (below, rust, other_set) = (add(&mut p, 0, LayerKind::Paint, None, false), add(&mut p, 0, LayerKind::Paint, None, false), add(&mut p, 1, LayerKind::Paint, None, false));
+        let (below, rust, other_set) =
+            (add(&mut p, 0, LayerKind::Paint, None, false), add(&mut p, 0, LayerKind::Paint, None, false), add(&mut p, 1, LayerKind::Paint, None, false));
         p.layer_mut(rust).unwrap().visible = false;
         let before = p.clone();
         let view = solo_project(&p, rust, false).unwrap();

@@ -145,7 +145,9 @@ impl Session {
         self.without_solo(|session| {
             (0..materials)
                 .map(|m| match session.texture_set_of_material(m) {
-                    Some(ts) if tiled || session.doc.project.texture_sets.get(ts).is_some_and(|t| t.tile_grid().is_none()) => session.export_files(&[ts], &opts),
+                    Some(ts) if tiled || session.doc.project.texture_sets.get(ts).is_some_and(|t| t.tile_grid().is_none()) => {
+                        session.export_files(&[ts], &opts)
+                    }
                     _ => Ok(Vec::new()),
                 })
                 .collect()

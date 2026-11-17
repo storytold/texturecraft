@@ -71,9 +71,9 @@ pub use fill_hit_test::FillHitTest;
 pub use fill_mode::FillMode;
 pub use path_tool::PathState;
 pub use project_cmds::sample_session;
-pub use solo::Solo;
 pub use session::{CloneFrom, CloneSource, Document, Session, SetCache, StackTarget, StencilState, Tool, ToolState, ViewMode};
 pub use set_cmds::{ResizeOutput, ResizeTask};
+pub use solo::Solo;
 
 pub use texturecraft_compose as compose;
 pub use texturecraft_core as core;
