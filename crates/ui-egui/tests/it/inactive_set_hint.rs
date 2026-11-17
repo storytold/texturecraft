@@ -19,7 +19,10 @@ fn sample_app() -> Harness<'static, TextureCraftApp> {
     harness
 }
 
-/// The first point of the 3D view showing texture set `set`
+/// How far around a point `set` must still show, so a drag that starts there stays on the set
+const MARGIN: f32 = 32.0;
+
+/// The first point of the 3D view with texture set `set` all around it
 fn point_over(harness: &Harness<'_, TextureCraftApp>, set: usize) -> Pos2 {
     let app = harness.state();
     let rect = app.viewport_rect;
@@ -27,7 +30,11 @@ fn point_over(harness: &Harness<'_, TextureCraftApp>, set: usize) -> Pos2 {
 
     steps(rect.height())
         .flat_map(|y| steps(rect.width()).map(move |x| (x, y)))
-        .find(|&(x, y)| app.session.texture_set_at(Vec2::new(x, y), app.session.viewport) == Some(set))
+        .find(|&(x, y)| {
+            [(0.0, 0.0), (MARGIN, 0.0), (-MARGIN, 0.0), (0.0, MARGIN), (0.0, -MARGIN)]
+                .iter()
+                .all(|(dx, dy)| app.session.texture_set_at(Vec2::new(x + dx, y + dy), app.session.viewport) == Some(set))
+        })
         .map(|(x, y)| rect.min + vec2(x, y))
         .unwrap()
 }
@@ -64,9 +71,10 @@ fn a_stroke_starting_on_another_set_shows_the_hint_once_and_paints_nothing() {
     assert_eq!(harness.state().session.history_labels().len(), history, "nothing was painted");
     assert_eq!(harness.state().session.ts(), 0, "the stroke does not switch the active set");
 
-    // A second stroke on that set says it again
-    drag(&mut harness, base, vec2(24.0, 0.0));
-    assert_eq!(hint_count(&harness), 2);
+    // A second stroke on that set says it again (the first toast may have expired by then)
+    let first_until = harness.state().toasts.iter().map(|toast| toast.until).fold(f64::MIN, f64::max);
+    drag(&mut harness, base + vec2(0.0, 12.0), vec2(24.0, 0.0));
+    assert!(harness.state().toasts.iter().any(|toast| toast.until > first_until), "the second stroke shows a new toast");
 }
 
 #[test]
