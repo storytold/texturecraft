@@ -927,8 +927,9 @@ struct DecalFrame {
 
 impl DecalFrame {
     /// The selected decal: its layer (the mask's owner for an effect), the mask fill effect holding it when placed as a mask, and the decal
-    fn selected(app: &TextureCraftApp) -> Option<(LayerId, Option<LayerId>, Decal)> {
-        use texturecraft_engine::core::{Decal, LayerId};
+    fn selected(
+        app: &TextureCraftApp,
+    ) -> Option<(texturecraft_engine::core::LayerId, Option<texturecraft_engine::core::LayerId>, texturecraft_engine::core::Decal)> {
         use texturecraft_engine::StackTarget;
         use texturecraft_engine::core::{EffectKind, Fill, LayerKind, Projection};
 

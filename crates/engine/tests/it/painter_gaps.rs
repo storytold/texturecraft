@@ -244,6 +244,7 @@ fn a_mask_fill_effects_decal_is_edited_like_a_layer_decal() {
 
     // Errors: unknown effect, an effect that is not a decal, an effect of another layer
     assert!(execute(&mut s, "layer.decal.set", &json!({"effect": 999_999, "size": 1})).is_err());
+    execute(&mut s, "layer.select", &json!({"layer": layer.0})).unwrap();
     let levels = id(execute(&mut s, "effect.add.filter", &json!({"layer": layer.0, "filter": "levels"})).unwrap(), "effect");
     assert!(execute(&mut s, "layer.decal.set", &json!({"effect": levels.0, "size": 1})).is_err());
     assert!(execute(&mut s, "layer.decal.set", &json!({"effect": effect.0, "layer": layer_decal.0, "size": 1})).is_err());

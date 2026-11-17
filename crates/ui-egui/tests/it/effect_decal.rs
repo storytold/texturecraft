@@ -37,15 +37,15 @@ fn the_width_slider_resizes_a_mask_effects_decal_in_one_undo_step() {
 
     let label_rect = harness.get_by_label("Width").rect();
     let y = label_rect.bottom() + 10.0;
-    harness.drag_at(egui::pos2(label_rect.left() + 100.0, y));
+    harness.drag_at(egui::pos2(label_rect.left() + 10.0, y));
     harness.run_steps(2);
-    harness.hover_at(egui::pos2(label_rect.left() + 20.0, y));
+    harness.hover_at(egui::pos2(label_rect.left() + 150.0, y));
     harness.run_steps(2);
-    harness.drop_at(egui::pos2(label_rect.left() + 20.0, y));
+    harness.drop_at(egui::pos2(label_rect.left() + 150.0, y));
     harness.run_steps(3);
 
     let after = decal(&harness, effect);
-    assert!(after.size[0] < before.size[0], "the dragged width applies: {} -> {}", before.size[0], after.size[0]);
+    assert!(after.size[0] > before.size[0], "the dragged width applies: {} -> {}", before.size[0], after.size[0]);
     assert_eq!(after.size[1], before.size[1]);
     assert_eq!(harness.state().session.history_labels().len(), steps + 1, "one undo step for the drag");
     harness.state_mut().run("edit.undo", json!({})).unwrap();
