@@ -800,15 +800,15 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
     let before = read(&s);
     execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"baseColor": {"mode": "Multiply", "opacity": 0.25}, "roughness": {"opacity": 0.5}}})).unwrap();
     let after = read(&s);
-    assert_eq!((after[&Channel::BaseColor].mode.label(), after[&Channel::BaseColor].opacity), ("Multiply", 0.25));
+    assert_eq!((after[&Channel::BaseColor].mode, after[&Channel::BaseColor].opacity), (texturecraft_engine::core::BlendMode::Multiply, 0.25));
     assert_eq!((after[&Channel::Roughness].mode, after[&Channel::Roughness].opacity), (before[&Channel::Roughness].mode, 0.5));
     assert_eq!(after[&Channel::Metallic], before[&Channel::Metallic], "channels not listed stay as they were");
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(read(&s), before, "one undo step restores every listed channel");
+    execute(&mut s, "edit.redo", &Value::Null).unwrap();
     // A channel the layer has disabled stays disabled
     execute(&mut s, "layer.blend", &json!({"layer": layer, "channel": "metallic", "enabled": false})).unwrap();
     execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"metallic": {"opacity": 0.1}}})).unwrap();
     assert!(!read(&s).contains_key(&Channel::Metallic));
     assert!(execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"nope": {}}})).is_err());
-    execute(&mut s, "edit.undo", &Value::Null).unwrap();
-    execute(&mut s, "edit.undo", &Value::Null).unwrap();
-    assert_eq!(read(&s), after, "each call was one undo step");
 }
