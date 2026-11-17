@@ -111,6 +111,8 @@ fn the_position_fields_move_the_stencil_and_reset_puts_it_back() {
     assert_eq!(moved.center, [-0.75, -0.25], "only X changed");
     harness.get_by_label("Position Y");
 
+    harness.get_by_label("Reset stencil").scroll_to_me();
+    harness.run_steps(3);
     harness.get_by_label("Reset stencil").click();
     harness.run_steps(3);
     let reset = harness.state().session.tool.stencil.clone().unwrap();
