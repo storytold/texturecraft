@@ -1045,6 +1045,10 @@ pub enum EffectKind {
 pub struct PathShape {
     /// Surface positions (3D view) or texture coordinates with z = 0 (2D view).
     pub points: Vec<[f32; 3]>,
+    /// Per point: the curve turns sharply there instead of passing smoothly through. Empty (and absent from old
+    /// projects) when every point is smooth; a missing entry is smooth too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub corners: Vec<bool>,
     pub uv: bool,
     pub closed: bool,
     /// A closed path fills its interior instead of stroking the curve.

@@ -350,6 +350,12 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
         app.session.set_path_fill(!fill);
     }
 
+    let corner = path.selected.is_some_and(|i| path.is_corner(i));
+    if ui.add_enabled_ui(selected, |ui| icon_button(ui, ic::ANGLE, tr("Corner point (Shift+click places one)"), corner, button_size)).inner.clicked() {
+        // The command repaints an edited path and is one undo step
+        app.run("path.corner", json!({}));
+    }
+
     if ui.add_enabled_ui(selected, |ui| icon_button(ui, ic::BACKSPACE, tr("Remove point"), false, button_size)).inner.clicked() {
         app.session.remove_selected_path_point();
     }

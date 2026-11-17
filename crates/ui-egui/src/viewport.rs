@@ -1190,9 +1190,9 @@ fn other_paths(app: &TextureCraftApp) -> Vec<(texturecraft_engine::core::LayerId
 }
 
 /// The screen curve through `points` per segment, each starting on its first point
-fn screen_segments(points: &[Pos2], closed: bool) -> Vec<Vec<Pos2>> {
+fn screen_segments(points: &[Pos2], corners: &[bool], closed: bool) -> Vec<Vec<Pos2>> {
     let pts: Vec<Vec2> = points.iter().map(|p| Vec2::new(p.x, p.y)).collect();
-    texturecraft_engine::paint::spline_segments(&pts, closed, PATH_SCREEN_STEP)
+    texturecraft_engine::paint::spline_segments_with_corners(&pts, corners, closed, PATH_SCREEN_STEP)
         .into_iter()
         .zip(points)
         .map(|(samples, first)| std::iter::once(*first).chain(samples.into_iter().map(|v| pos2(v.x, v.y))).collect())
@@ -1226,12 +1226,12 @@ fn curve_on_screen(
 ) -> ScreenCurve {
     if uv {
         let Some(points) = path.points.iter().map(|p| show(app, *p)).collect::<Option<Vec<_>>>() else { return Vec::new() };
-        return screen_segments(&points, path.closed).into_iter().map(|segment| segment.into_iter().map(|at| Some((at, true))).collect()).collect();
+        return screen_segments(&points, &path.corners, path.closed).into_iter().map(|segment| segment.into_iter().map(|at| Some((at, true))).collect()).collect();
     }
     let s = &app.session;
     let surface = stored
         .and_then(|(eid, index)| stored_surface(app, ui, eid, index))
-        .unwrap_or_else(|| Arc::new(s.path_surface(&path.points, path.closed, s.camera, s.viewport)));
+        .unwrap_or_else(|| Arc::new(s.path_surface_with_corners(&path.points, &path.corners, path.closed, s.camera, s.viewport)));
     surface
         .iter()
         .map(|segment| segment.iter().map(|p| p.and_then(|p| show(app, p).map(|at| (at, !depth_test || path_point_visible(app, rect, p, at))))).collect())
@@ -1289,6 +1289,7 @@ fn path_input(
         let path = &app.session.tool.path;
         let (closed, len) = (path.closed, path.points.len());
         let hit = path_hit(app, ui, (rect, uv), at, &show);
+        let corner = ui.input(|i| i.modifiers.shift);
 
         let grab = match hit {
             PathHit::Point(0) if clicked && !closed && len >= 3 => {
@@ -1305,7 +1306,10 @@ fn path_input(
             }
             hit => match place(app, if let PathHit::Curve(_, on) = hit { on } else { at }) {
                 Some(p) => match hit {
+                    // Shift+click places a corner point
+                    PathHit::Curve(i, _) if corner => app.session.insert_path_corner(i + 1, p),
                     PathHit::Curve(i, _) => app.session.insert_path_point(i + 1, p),
+                    _ if corner => app.session.append_path_corner(p, uv),
                     _ => app.session.append_path_point(p, uv),
                 },
                 None => {
@@ -1402,9 +1406,11 @@ fn path_overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, resp: &egui::Respons
             && !handles.is_empty()
             && let Some((to, PathHit::Miss)) = hit
         {
+            // The preview segment starts on the last placed point, which may be a corner
             let mut next = handles.clone();
             next.push(to);
-            if let Some(segment) = screen_segments(&next, false).last() {
+            let flags: Vec<bool> = path.points.iter().enumerate().filter(|(_, q)| show(app, **q).is_some()).map(|(i, _)| path.is_corner(i)).collect();
+            if let Some(segment) = screen_segments(&next, &flags, false).last() {
                 rubber_band(ui, rect, segment);
             }
         }
@@ -1415,10 +1421,18 @@ fn path_overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, resp: &egui::Respons
             // Keep the point's original index when earlier points project behind the camera
             let hovered = hover.is_some_and(|m| m.distance(handle) < HANDLE_GRAB);
             let radius = if hovered { PATH_POINT_RADIUS + PATH_POINT_HOVER_GROWTH } else { PATH_POINT_RADIUS };
+            // A corner point is drawn as a square, a smooth one as a circle
+            let marker = |radius: f32, fill: Color32, stroke: Stroke| {
+                if path.is_corner(index) {
+                    painter.rect(Rect::from_center_size(handle, vec2(radius * 2.0, radius * 2.0)), 0.0, fill, stroke, egui::StrokeKind::Middle);
+                } else {
+                    painter.circle(handle, radius, fill, stroke);
+                }
+            };
             if path.selected == Some(index) {
-                painter.circle(handle, radius + PATH_POINT_SELECTED_GROWTH, tk.viewport_accent, Stroke::new(1.0, Color32::from_black_alpha(160)));
+                marker(radius + PATH_POINT_SELECTED_GROWTH, tk.viewport_accent, Stroke::new(1.0, Color32::from_black_alpha(160)));
             } else {
-                painter.circle(handle, radius, Color32::from_black_alpha(110), Stroke::new(1.0, Color32::from_white_alpha(if hovered { 230 } else { 150 })));
+                marker(radius, Color32::from_black_alpha(110), Stroke::new(1.0, Color32::from_white_alpha(if hovered { 230 } else { 150 })));
             }
         }
     }

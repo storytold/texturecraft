@@ -15,7 +15,7 @@ use texturecraft_compose::{PaintTarget, PixelStore};
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, PathShape};
 use texturecraft_geom::glam::{Mat3, Vec2, Vec3};
 use texturecraft_geom::{OrbitCamera, surface_at};
-use texturecraft_paint::{BrushSettings, Lasso, PickCtx, fill_coverage, pick, spline, spline_segments};
+use texturecraft_paint::{BrushSettings, Lasso, PickCtx, fill_coverage, pick, spline_segments_with_corners, spline_with_corners};
 use texturecraft_texel::TileImage;
 
 use crate::commands::{CommandSpec, always, bad, boolp, has_layer, u64p};
@@ -47,6 +47,10 @@ const RAY_HIT_RELATIVE_TOLERANCE: f32 = 0.001;
 pub struct PathState {
     /// Control points: surface positions (3D view) or texture coordinates with z = 0 (2D view)
     pub points: Vec<Vec3>,
+    /// Per control point: the curve turns sharply there (a corner). Empty or shorter than `points` means smooth;
+    /// read it through [`PathState::is_corner`] and [`PathState::corner_flags`]
+    #[serde(default)]
+    pub corners: Vec<bool>,
     /// The points are texture coordinates (placed in the 2D view)
     pub uv: bool,
     /// The curve loops back to its first point
@@ -69,11 +73,35 @@ impl PathState {
     pub fn push(&mut self, point: Vec3, uv: bool) {
         if uv != self.uv {
             self.points.clear();
+            self.corners.clear();
             self.uv = uv;
         }
         if self.points.len() < MAX_PATH_POINTS {
             self.points.push(point);
+            if !self.corners.is_empty() {
+                self.corners.resize(self.points.len(), false);
+            }
         }
+    }
+
+    /// Does the curve turn sharply at point `i`?
+    pub fn is_corner(&self, i: usize) -> bool {
+        self.corners.get(i).copied().unwrap_or(false)
+    }
+
+    /// One flag per point for the curve and storage: empty when no point is a corner, so smooth paths look like old ones
+    pub fn corner_flags(&self) -> Vec<bool> {
+        if self.points.iter().enumerate().any(|(i, _)| self.is_corner(i)) { (0..self.points.len()).map(|i| self.is_corner(i)).collect() } else { Vec::new() }
+    }
+
+    /// Make point `i` a corner or smooth; false when there is no such point or it already is
+    pub fn set_corner(&mut self, i: usize, corner: bool) -> bool {
+        if i >= self.points.len() || self.is_corner(i) == corner {
+            return false;
+        }
+        self.corners.resize(self.points.len(), false);
+        self.corners[i] = corner;
+        true
     }
 
     /// Insert a control point before point `at` (on the segment ending there) and select it; None when it can't
@@ -83,18 +111,23 @@ impl PathState {
         }
 
         self.points.insert(at, point);
+        if !self.corners.is_empty() {
+            self.corners.resize(self.points.len() - 1, false);
+            self.corners.insert(at, false);
+        }
         self.selected = Some(at);
         self.selected
     }
 
     /// The same curve (points, open or closed, filled, view) as `other`
     fn same_curve(&self, other: &PathState) -> bool {
-        (&self.points, self.closed, self.fill, self.uv) == (&other.points, other.closed, other.fill, other.uv)
+        (&self.points, self.corner_flags(), self.closed, self.fill, self.uv) == (&other.points, other.corner_flags(), other.closed, other.fill, other.uv)
     }
 
     /// Empty the tool for the next path: no points, open, nothing selected or edited
     pub fn clear(&mut self) {
         self.points.clear();
+        self.corners.clear();
         self.closed = false;
         self.selected = None;
         self.editing = None;
@@ -106,6 +139,10 @@ impl PathState {
         let at = self.selected.take().filter(|i| *i < self.points.len()).or(self.points.len().checked_sub(1));
         if let Some(i) = at {
             self.points.remove(i);
+            if !self.corners.is_empty() {
+                self.corners.resize(self.points.len() + 1, false);
+                self.corners.remove(i);
+            }
         }
         if self.closed && self.points.len() < 3 {
             self.closed = false;
@@ -143,9 +180,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Path",
             ["Tools"],
             Some("7"),
-            "{points?: [[x,y],...] viewport pixels on the mesh | uvPoints?: [[u,v],...], viewport?: [w,h], closed?, fill?, commit?: bool, clear?: bool} — selects the Path tool and edits its curve; commit adds the path to the selected path sublayer (or a new one), painted with the current brush or filled when closed and filled. While a stored path is edited (path.edit), changes repaint it at once",
+            "{points?: [[x,y],...] viewport pixels on the mesh | uvPoints?: [[u,v],...], corners?: [bool,...] one per point (true: the curve turns sharply there; default smooth, applies to the points given in this call), viewport?: [w,h], closed?, fill?, commit?: bool, clear?: bool} — selects the Path tool and edits its curve; commit adds the path to the selected path sublayer (or a new one), painted with the current brush or filled when closed and filled. While a stored path is edited (path.edit), changes repaint it at once",
             always,
             path
+        ),
+        cmd!(
+            "path.corner",
+            "Toggle path corner",
+            ["Tools"],
+            None,
+            "{index?: point (default: the selected point), corner?: bool (default: toggle)} — makes a control point of the Path tool's curve a corner (the curve turns sharply there) or smooth again; one undo step per change, repainting the edited path at once",
+            always,
+            path_corner
         ),
         cmd!(
             "path.edit",
@@ -198,7 +244,15 @@ fn path(s: &mut Session, p: &Value) -> Result<Value> {
         }
 
         s.tool.path.points = points;
+        s.tool.path.corners.clear();
         s.tool.path.uv = uv;
+    }
+    if let Some(flags) = p.get("corners") {
+        let flags = flags
+            .as_array()
+            .and_then(|a| a.iter().map(Value::as_bool).collect::<Option<Vec<_>>>())
+            .ok_or_else(|| bad(CMD, "`corners` must be an array of booleans"))?;
+        s.tool.path.corners = flags;
     }
     if let Some(v) = boolp(p, "closed") {
         s.tool.path.closed = v;
@@ -222,6 +276,24 @@ fn path(s: &mut Session, p: &Value) -> Result<Value> {
     let path = &s.tool.path;
     let editing = path.editing.map(|(e, i)| json!({ "effect": e.0, "index": i }));
     Ok(json!({ "points": path.points.len(), "uv": path.uv, "closed": path.closed, "fill": path.fill, "editing": editing, "committed": committed }))
+}
+
+/// Make a control point a corner or smooth (a toggle by default) as one undoable point edit
+fn path_corner(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "path.corner";
+    let path = &s.tool.path;
+    let index = match u64p(p, "index") {
+        Some(i) => usize::try_from(i).ok().filter(|i| *i < path.points.len()),
+        None => path.selected.filter(|i| *i < path.points.len()),
+    }
+    .ok_or_else(|| bad(CMD, "no such point: pass `index` or select a point of the Path tool's curve"))?;
+    let corner = boolp(p, "corner").unwrap_or(!path.is_corner(index));
+    s.set_path_point_corner(index, corner);
+    s.revision = s.revision.wrapping_add(1);
+    if s.path_live()? {
+        s.update();
+    }
+    Ok(json!({ "index": index, "corner": s.tool.path.is_corner(index) }))
 }
 
 /// The `effect` and `index` params naming a stored path, with the path.
@@ -282,7 +354,13 @@ fn read_paint(shape: &PathShape) -> Result<PathPaint> {
 /// The Path tool state showing a stored path (finite points only, at most [`MAX_PATH_POINTS`])
 fn state_of(shape: &PathShape) -> PathState {
     let points = shape.points.iter().filter(|p| p.iter().all(|v| v.is_finite())).take(MAX_PATH_POINTS).map(|p| Vec3::from_array(*p)).collect();
-    PathState { points, uv: shape.uv, closed: shape.closed, fill: shape.fill, ..PathState::default() }
+    // Points dropped as unreadable shift the later flags with them
+    let corners = if shape.corners.is_empty() {
+        Vec::new()
+    } else {
+        shape.points.iter().zip(shape.corners.iter().copied().chain(std::iter::repeat(false))).filter(|(p, _)| p.iter().all(|v| v.is_finite())).take(MAX_PATH_POINTS).map(|(_, c)| c).collect()
+    };
+    PathState { points, corners, uv: shape.uv, closed: shape.closed, fill: shape.fill, ..PathState::default() }
 }
 
 /// Tiles (x, y) where sublayer `eid`'s pixels differ between `before` and `after` (copy-on-write: an unchanged tile is the same allocation)
@@ -358,6 +436,7 @@ impl Session {
         let paint = PathPaint { brush: t.brush.clone(), values: t.values.clone(), enabled: t.enabled.clone(), mask_value: t.mask_value, camera };
         PathShape {
             points: path.points.iter().map(|p| p.to_array()).collect(),
+            corners: path.corner_flags(),
             uv: path.uv,
             closed: path.closed,
             fill: path.fill,
@@ -426,7 +505,9 @@ impl Session {
         // JSON round trips can change float representation without changing the paint settings
         read_paint(stored).is_ok_and(|paint| {
             let current = self.path_shape(paint.camera, Vec2::from_array(stored.viewport));
-            (&current.points, current.uv, current.closed, current.fill) == (&stored.points, stored.uv, stored.closed, stored.fill)
+            let stored_corners = if stored.corners.iter().any(|c| *c) { stored.corners.clone() } else { Vec::new() };
+            (&current.points, &current.corners, current.uv, current.closed, current.fill)
+                == (&stored.points, &stored_corners, stored.uv, stored.closed, stored.fill)
                 && read_paint(&current).is_ok_and(|current_paint| current_paint == paint)
         })
     }
@@ -586,6 +667,37 @@ impl Session {
 
         self.path_checkpoint();
         self.tool.path.remove_selected();
+    }
+
+    /// Make a point a corner or smooth again, with point undo; false when nothing changed
+    pub fn set_path_point_corner(&mut self, index: usize, corner: bool) -> bool {
+        if index >= self.tool.path.points.len() || self.tool.path.is_corner(index) == corner {
+            return false;
+        }
+
+        self.path_checkpoint();
+        self.tool.path.set_corner(index, corner)
+    }
+
+    /// Switch the selected point between corner and smooth, with point undo; false without a selected point
+    pub fn toggle_selected_path_corner(&mut self) -> bool {
+        let Some(i) = self.tool.path.selected.filter(|i| *i < self.tool.path.points.len()) else { return false };
+        let corner = !self.tool.path.is_corner(i);
+        self.set_path_point_corner(i, corner)
+    }
+
+    /// Append a point that is a corner, selecting it; as [`Session::append_path_point`]
+    pub fn append_path_corner(&mut self, point: Vec3, uv: bool) -> Option<usize> {
+        let at = self.append_path_point(point, uv)?;
+        self.tool.path.set_corner(at, true);
+        Some(at)
+    }
+
+    /// Insert a point that is a corner, selecting it; as [`Session::insert_path_point`]
+    pub fn insert_path_corner(&mut self, index: usize, point: Vec3) -> Option<usize> {
+        let at = self.insert_path_point(index, point)?;
+        self.tool.path.set_corner(at, true);
+        Some(at)
     }
 
     /// Change whether the path loops back to its first point, with point undo
@@ -866,15 +978,20 @@ impl Session {
         self.paint_path(viewport)
     }
 
-    /// Where a 3D path's curve lands on the mesh painted through `camera`, per segment as [`spline_segments`] (None off the mesh)
+    /// Where a 3D path's curve lands on the mesh painted through `camera`, per segment as [`texturecraft_paint::spline_segments`] (None off the mesh)
     pub fn path_surface(&self, points: &[Vec3], closed: bool, camera: OrbitCamera, viewport: Vec2) -> Vec<Vec<Option<Vec3>>> {
+        self.path_surface_with_corners(points, &[], closed, camera, viewport)
+    }
+
+    /// [`Session::path_surface`] for a curve with corner points (`corners` as [`PathState::corners`])
+    pub fn path_surface_with_corners(&self, points: &[Vec3], corners: &[bool], closed: bool, camera: OrbitCamera, viewport: Vec2) -> Vec<Vec<Option<Vec3>>> {
         let aspect = viewport.x.max(1.0) / viewport.y.max(1.0);
         let Some(screen) = points.iter().map(|p| camera.project(*p, aspect).map(|n| to_pixels(n.truncate(), viewport))).collect::<Option<Vec<_>>>() else {
             return Vec::new();
         };
 
         let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &camera, viewport };
-        spline_segments(&screen, closed, SURFACE_STEP_PX)
+        spline_segments_with_corners(&screen, corners, closed, SURFACE_STEP_PX)
             .into_iter()
             .zip(&screen)
             .map(|(samples, first)| std::iter::once(*first).chain(samples).map(|q| pick(&ctx, q).map(|hit| hit.pos)).collect())
@@ -890,7 +1007,7 @@ impl Session {
 
         let (camera, viewport) = paint_view(shape, &read_paint(shape).ok()?);
         let path = state_of(shape);
-        Some(self.path_surface(&path.points, path.closed, camera, viewport))
+        Some(self.path_surface_with_corners(&path.points, &path.corners, path.closed, camera, viewport))
     }
 
     /// Paint the Path tool's curve with the current brush (or fill it when closed and filled)
@@ -898,14 +1015,15 @@ impl Session {
     fn paint_path(&mut self, viewport: Vec2) -> Result<Value> {
         let (uv, closed) = (self.tool.path.uv, self.tool.path.closed);
         let fill = closed && self.tool.path.fill;
-        let pts: Vec<Vec2> = self.path_view_points(viewport).into_iter().flatten().collect();
+        let (pts, corners): (Vec<Vec2>, Vec<bool>) =
+            self.path_view_points(viewport).into_iter().enumerate().filter_map(|(i, p)| Some((p?, self.tool.path.is_corner(i)))).unzip();
         if pts.is_empty() {
             return Err(EngineError::Other("the path has no points: click the surface to add some".into()));
         }
         if fill && pts.len() < 3 {
             return Err(EngineError::Other("a filled path needs at least three points".into()));
         }
-        let curve = spline(&pts, closed, if uv { STEP_UV } else { STEP_PX });
+        let curve = spline_with_corners(&pts, &corners, closed, if uv { STEP_UV } else { STEP_PX });
         Ok(if fill {
             json!({ "filledTiles": self.lasso_fill(curve, uv, viewport)? })
         } else if uv {

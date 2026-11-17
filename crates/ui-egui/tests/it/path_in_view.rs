@@ -202,3 +202,59 @@ fn clicking_the_curve_inserts_a_point_and_backspace_removes_the_selected_one() {
     assert_eq!(path(&h).points, before);
     assert!(!path_sublayers(&h).is_empty(), "the path is still there");
 }
+
+/// A primary click with Shift held, in two frames like `click`
+fn shift_click(h: &mut AppHarness<'_>, at: Pos2) {
+    for pressed in [true, false] {
+        let input = h.input_mut();
+        input.modifiers = Modifiers::SHIFT;
+        input.events.push(Event::PointerMoved(at));
+        input.events.push(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::SHIFT });
+        h.step();
+    }
+    h.run_steps(2);
+}
+
+#[test]
+fn shift_click_places_a_corner_point_in_one_undo_step() {
+    let mut h = harness();
+    click(&mut h, A);
+    shift_click(&mut h, B);
+    click(&mut h, C);
+    assert_eq!(h.state().session.tool.path.points.len(), 3);
+    assert_eq!(h.state().session.tool.path.corner_flags(), vec![false, true, false]);
+
+    // Shift+click on the curve inserts a corner there
+    shift_click(&mut h, A.lerp(B, 0.5));
+    assert_eq!(h.state().session.tool.path.points.len(), 4);
+    assert_eq!(h.state().session.tool.path.corner_flags(), vec![false, true, true, false]);
+
+    // Undo takes the inserted corner back, as a single step
+    h.state_mut().session.undo().unwrap();
+    assert_eq!(h.state().session.tool.path.corner_flags(), vec![false, true, false]);
+}
+
+#[test]
+fn corner_button_toggles_the_selected_point_and_is_off_without_one() {
+    let mut h = harness();
+    let button = "Corner point (Shift+click places one)";
+    for at in [A, B, C] {
+        click(&mut h, at);
+    }
+    // The last placed point is selected
+    h.get_all_by_label(button).next().unwrap().scroll_to_me();
+    h.run_steps(30);
+    assert!(!h.get_all_by_label(button).next().unwrap().accesskit_node().is_disabled());
+    h.get_all_by_label(button).next().unwrap().click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.tool.path.corner_flags(), vec![false, false, true]);
+
+    h.get_all_by_label(button).next().unwrap().click();
+    h.run_steps(2);
+    assert!(h.state().session.tool.path.corner_flags().is_empty());
+
+    // With no point selected the button is disabled
+    h.state_mut().session.tool.path.selected = None;
+    h.run_steps(2);
+    assert!(h.get_all_by_label(button).next().unwrap().accesskit_node().is_disabled());
+}
