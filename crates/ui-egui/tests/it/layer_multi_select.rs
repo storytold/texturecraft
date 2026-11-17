@@ -131,11 +131,12 @@ fn ctrl_a_over_the_layers_panel_selects_every_layer_including_collapsed_folders(
     h.run_steps(1);
     h.key_press_modifiers(Modifiers::COMMAND, Key::A);
     h.run_steps(3);
-    let mut all = h.state().session.selected_layers();
-    all.sort();
-    let mut expected = vec![a, b, c, d, folder];
-    expected.sort();
-    assert_eq!(all, expected, "the folder and the layers hidden in it are selected");
+    let session = &h.state().session;
+    let every_row = texturecraft_engine::layer_selection::stack_rows(&session.doc.project, 0, false);
+    for layer in [a, b, c, d, folder] {
+        assert!(session.is_layer_selected(layer), "layer {} is selected", layer.0);
+    }
+    assert_eq!(session.selected_layers().len(), every_row.len(), "every row of the set is selected, the collapsed folder's layers too");
     assert_eq!(h.state().session.selected_layer(), Some(d), "the active layer stays");
 }
 

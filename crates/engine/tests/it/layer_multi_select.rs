@@ -238,13 +238,16 @@ fn select_all_takes_every_layer_of_the_set_with_folder_contents() {
     click(&mut s, c, "plain");
     let depth = s.history_labels().len();
     let r = execute(&mut s, "layer.select", &json!({"all": true})).unwrap();
-    assert_eq!(selected(&s), ["Folder 1", "B", "A", "D", "C"]);
-    assert_eq!(r["layers"].as_array().unwrap().len(), 5);
+    // The set also holds the project's own first layer at the bottom
+    assert_eq!(selected(&s)[..5], ["Folder 1", "B", "A", "D", "C"]);
+    let every_row = stack_rows(&s.doc.project, 0, false);
+    assert_eq!(s.selected_layers(), every_row, "every row of the set, folder contents included");
+    assert_eq!(r["layers"].as_array().unwrap().len(), every_row.len());
     assert_eq!(s.selected_layer(), Some(c), "the active layer stays");
     assert_eq!(s.history_labels().len(), depth, "selecting is no undo step");
     assert!(s.is_layer_selected(a) && s.is_layer_selected(d));
 
-    // With nothing selected the top row becomes the active layer
+    // The active layer stays when it is picked again
     execute(&mut s, "layer.select", &json!({"layer": d.0})).unwrap();
     execute(&mut s, "layer.select", &json!({"all": true})).unwrap();
     assert_eq!(s.selected_layer(), Some(d), "the active layer stays when it is picked again");
