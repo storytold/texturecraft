@@ -36,7 +36,8 @@ const MAX_STEM: usize = 200;
 pub const MAX_PRESET_NAME: usize = 64;
 
 /// File name template variables with what they become (see [`list_outputs`]).
-pub const FILE_TOKENS: [(&str, &str); 6] = [
+pub const FILE_TOKENS: [(&str, &str); 7] = [
+    ("$projectFile", "Saved project file stem (or project name when unsaved)"),
     ("$mesh", "Mesh file name"),
     ("$textureSet", "Texture set name"),
     ("$project", "Project name"),
@@ -495,9 +496,11 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
         let clamps = is_color(map) && !format.is_float() && matches!(space, ColorSpace::AcesCg | ColorSpace::Aces2065);
         // One file per UV tile: names without `$udim` get it appended.
         let template = if tiles.iter().any(Option::is_some) && !map.file.contains("$udim") { format!("{}.$udim", map.file) } else { map.file.clone() };
+        let project_file = if project.project_file.is_empty() { &project.name } else { &project.project_file };
         for &tile in &tiles {
             let stem = template
                 .replace("$udim", &tile.unwrap_or(1001).to_string())
+                .replace("$projectFile", project_file)
                 .replace("$project", &project.name)
                 .replace("$mesh", mesh_name)
                 .replace("$textureSet", &set.name)
@@ -507,6 +510,7 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
             let token_stem = tile.map(|_| {
                 let t = template
                     .replace("$udim", "UDIMTOKEN")
+                    .replace("$projectFile", project_file)
                     .replace("$project", &project.name)
                     .replace("$mesh", mesh_name)
                     .replace("$textureSet", &set.name)
