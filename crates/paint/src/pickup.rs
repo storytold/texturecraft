@@ -13,7 +13,6 @@ use texturecraft_texel::{TILE_AREA, TileImage, from_u16, to_u16};
 
 use crate::commit::{dec, enc};
 
-
 /// How a pickup stroke finds the values it deposits.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PickupMode {

@@ -136,3 +136,23 @@ fn clone_works_on_a_folder_mask() {
 
     assert!(mask_at(&session, folder, [0.75, 0.5]) > 0.95, "a folder mask clones too");
 }
+
+#[test]
+fn clone_from_the_layer_reads_the_mask_on_a_folder_mask_and_a_paint_layer_mask() {
+    for group in [true, false] {
+        let mut session = Session::new_project("mask", primitives::plane(2.0, 4), "builtin:plane", None, SIZE).unwrap();
+        session.update();
+        let command = if group { "layer.add.group" } else { "layer.add.paint" };
+        let layer = execute(&mut session, command, &json!({})).unwrap()["layer"].as_u64().unwrap();
+        execute(&mut session, "mask.add.black", &json!({"layer": layer})).unwrap();
+        execute(&mut session, "layer.select", &json!({"layer": layer, "target": "mask"})).unwrap();
+        execute(&mut session, "tool.brush", &json!({"size": 10, "hardness": 100, "spacing": 10, "cloneSource": "layer"})).unwrap();
+        paint_white_blob(&mut session, [0.25, 0.5]);
+
+        execute(&mut session, "tool.clone", &serde_json::Value::Null).unwrap();
+        execute(&mut session, "tool.cloneSource", &json!({"uv": [0.25, 0.5]})).unwrap();
+        execute(&mut session, "tool.strokeUv", &json!({"points": [[0.75, 0.5], [0.75, 0.5]]})).unwrap();
+
+        assert!(mask_at(&session, layer, [0.75, 0.5]) > 0.95, "group {group}");
+    }
+}
