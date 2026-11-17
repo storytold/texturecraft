@@ -120,3 +120,40 @@ fn deeply_nested_effect_visibility_is_reachable_in_a_narrow_panel() {
     let content = &h.state().session.doc.project.layers[&layer].content_effects;
     assert!(!content.iter().find(|effect| effect.name == "Effect A").unwrap().visible, "the compact eye toggles the effect instead of missing the panel");
 }
+
+const LONG_NAME: &str = "Weathered painted steel plate with scratched edges";
+
+/// The app in a 1280 x 800 window with one layer named `LONG_NAME`.
+fn narrow_harness() -> Harness<'static, TextureCraftApp> {
+    let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
+    let layer = id(execute(&mut session, "layer.add.fill", &json!({"color": "#336699"})).unwrap(), "layer");
+    execute(&mut session, "layer.rename", &json!({"layer": layer, "name": LONG_NAME})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.prefs.language = "en".into();
+    h.run_steps(4);
+    h
+}
+
+#[test]
+fn layer_toolbar_stays_on_one_row_in_a_1280_by_800_window() {
+    let h = narrow_harness();
+    let wand = h.get_by_label(egui_phosphor::regular::MAGIC_WAND).rect();
+    let buttons = ["Add paint layer", "Add fill layer", "Add folder"].map(|label| h.get_by_label(label).rect());
+    let remove = h.query_all_by_label_contains("Remove layer").next().expect("the remove button").rect();
+    for rect in buttons.into_iter().chain([remove]) {
+        assert!((rect.center().y - wand.center().y).abs() < 1.0, "the toolbar wrapped: {rect:?} against {wand:?}");
+    }
+    let row = h.get_by_label(LONG_NAME).rect();
+    assert!(remove.right() <= row.right() + 1.0, "the last button stays inside the panel: {remove:?} against {row:?}");
+    assert!(row.width() >= 220.0, "the Layers column is not squeezed: {row:?}");
+}
+
+#[test]
+fn a_layer_name_cut_short_shows_in_full_on_hover() {
+    let mut h = narrow_harness();
+    let row = h.get_by_label(LONG_NAME).rect();
+    assert_eq!(h.query_all_by_label_contains(LONG_NAME).count(), 1, "no tooltip before hovering");
+    h.hover_at(egui::pos2(row.left() + 125.0, row.center().y));
+    h.run_steps(30);
+    assert_eq!(h.query_all_by_label_contains(LONG_NAME).count(), 2, "the tooltip carries the full name");
+}

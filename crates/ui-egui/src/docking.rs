@@ -139,7 +139,8 @@ pub fn default_workspace() -> Workspace {
 
     // The Assets split keeps four tiles visible at the reference window width
     const ASSETS_SPLIT_RATIO: f32 = 0.16;
-    const VIEWPORT_SPLIT_RATIO: f32 = 0.80;
+    // The right column keeps the Layers toolbar on one row and layer names readable at 1280 px
+    const VIEWPORT_SPLIT_RATIO: f32 = 0.78;
     const TEXTURE_SET_SPLIT_RATIO: f32 = 0.125;
     const LAYERS_SPLIT_RATIO: f32 = 0.57;
 

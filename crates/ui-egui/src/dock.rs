@@ -148,7 +148,10 @@ pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
         ui.spacing_mut().button_padding.x = 4.0;
         ui.spacing_mut().item_spacing.x = 4.0;
         let chans = app.session.doc.project.texture_set(app.session.ts()).map(|t| t.channel_list()).unwrap_or_default();
-        egui::ComboBox::from_id_salt("layer_channel").width(86.0).selected_text(tr(app.ui.layer_channel.label())).show_ui(ui, |ui| {
+        // The channel box takes what the six buttons leave, so the toolbar stays on one row in a narrow column
+        let buttons = 6.0 * (ICON_BUTTON_SIZE + 4.0) + 4.0 * 2.0;
+        let channel_width = (ui.available_width() - buttons).clamp(CHANNEL_BOX_MIN_WIDTH, CHANNEL_BOX_WIDTH);
+        egui::ComboBox::from_id_salt("layer_channel").width(channel_width).selected_text(tr(app.ui.layer_channel.label())).show_ui(ui, |ui| {
             for c in chans {
                 ui.selectable_value(&mut app.ui.layer_channel, c, tr(c.label()));
             }
@@ -272,6 +275,9 @@ fn row_shade(tokens: &Tokens, index: usize) -> Color32 {
 const RIGHT_COLUMN: f32 = 58.0;
 /// Indent per folder level, and per level of the effect tree.
 const INDENT: f32 = 14.0;
+/// Width of the Layers toolbar's channel box when there is room, and the least it shrinks to.
+const CHANNEL_BOX_WIDTH: f32 = 86.0;
+const CHANNEL_BOX_MIN_WIDTH: f32 = 40.0;
 /// Edge of the small icon buttons in the properties panel.
 const ICON_BUTTON_SIZE: f32 = 22.0;
 /// Height of a blend mode menu or opacity field in a stack row, and the rounding of its hover fill.
@@ -639,6 +645,12 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
             (None, 1) => format!("{kind} · {}", tr("1 effect")),
             (None, count) => format!("{kind} · {}", trf("{count} effects", &[("count", &count)])),
         };
+
+        // A name or subtitle cut short by a narrow panel is shown in full on hover
+        let cut = |text: &str, size: f32| painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), tokens.text).size().x > name_rect.width();
+        if cut(&layer.name, LAYER_NAME_FONT_SIZE) || cut(&subtitle, LAYER_SUBTITLE_FONT_SIZE) {
+            row.clone().on_hover_text(format!("{}\n{subtitle}", layer.name));
+        }
         let subtitle = elided(&painter, subtitle, LAYER_SUBTITLE_FONT_SIZE, tokens.text_dim, name_rect.width());
         painter.galley(pos2(name_rect.left(), rect.center().y + NAME_LINE_GAP), subtitle, tokens.text_dim);
     }
