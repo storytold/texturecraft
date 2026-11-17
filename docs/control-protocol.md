@@ -19,6 +19,14 @@ index}` reorders an effect within its stack (0 = bottom) and `effect.duplicate {
 one just above itself. `effect.copy {effect?}` and `effect.cut {effect?}` put an effect on the
 layer clipboard, and `effect.paste {layer?, target?}` adds it to another layer's content or mask.
 
+`mask.export {layer?, path}` writes the layer's evaluated mask as a 16-bit grayscale PNG at the
+texture set's resolution: black where the mesh does not cover the texture, with the orientation
+of the exported textures (top row first). A UV-tiled set writes one file per tile, each at its
+tile's size, with the tile number before the extension (`mask.1001.png`, `mask.1002.png`). The
+result is `{files}`. A layer without an enabled mask is an error. The layer menu's Export mask to
+file runs it; Copy mask to clipboard puts the same mask on the system clipboard as an 8-bit
+grayscale image (the whole tile atlas for a UV-tiled set).
+
 `effect.set {effect, filter: "blur", radius: 5}` replaces a filter in place, preserving its
 stack position, blend, opacity and visibility. Replacement filters start from defaults plus
 the supplied parameters; naming the current filter instead edits it without resetting omitted

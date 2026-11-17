@@ -1107,6 +1107,34 @@ fn geometry_mask_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     });
 }
 
+/// Ask for a file and write `layer`'s evaluated mask there as a 16-bit grayscale PNG (one file per
+/// UV tile for a tiled set).
+#[cfg(not(target_arch = "wasm32"))]
+fn export_mask_file(app: &mut TextureCraftApp, layer: &Layer) {
+    use crate::file_dialogs::{Bound, FileDialog};
+    let lid = layer.id.0;
+    let name = format!("{}_mask.png", texturecraft_engine::formats::export::sanitize_file_stem(&layer.name));
+    app.ask_file(FileDialog::save().filter(tr("PNG image"), &["png"]).file_name(name), Bound::Project, move |app, paths| {
+        let Some(path) = paths.first() else { return };
+        let Some(done) = app.run("mask.export", json!({"layer": lid, "path": path.display().to_string()})) else { return };
+        let files = done.get("files").and_then(Value::as_array).map(|files| files.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "));
+        app.toast(trf("Saved {path}", &[("path", &files.unwrap_or_default())]), false);
+    });
+}
+
+/// Put the evaluated mask of layer `id` on the system clipboard as an 8-bit grayscale image (the
+/// whole texture set; a UV-tiled set copies its tile atlas).
+fn copy_mask(app: &mut TextureCraftApp, ctx: &egui::Context, id: texturecraft_engine::core::LayerId) {
+    match app.session.mask_bitmaps(id, false) {
+        Ok(bitmaps) => {
+            let Some(bitmap) = bitmaps.first() else { return };
+            ctx.copy_image(egui::ColorImage::from_gray([bitmap.width as usize, bitmap.height as usize], &bitmap.gray8()));
+            app.toast(tr("Mask copied to the clipboard"), false);
+        }
+        Err(e) => app.toast(e.to_string(), true),
+    }
+}
+
 fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     let tk = Tokens::get(ui.ctx());
     ui.set_min_width(230.0);
@@ -1126,6 +1154,8 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     // An instance edits its source mask until it gets its own
     let project = &app.session.doc.project;
     let has_mask = project.layers.get(&project.mask_owner(layer.id)).is_some_and(|l| l.mask.is_some());
+    // A switched-off mask has no values to export
+    let mask_on = project.layers.get(&project.mask_owner(layer.id)).is_some_and(|l| l.mask.as_ref().is_some_and(|m| m.enabled));
     run(app, ui, tr("Add white mask"), "mask.add.white", json!({"layer": lid}), layer.mask.is_none());
     run(app, ui, tr("Add black mask"), "mask.add.black", json!({"layer": lid}), layer.mask.is_none());
     run(app, ui, tr("Add mask with color selection"), "mask.add.colorSelection", json!({"layer": lid}), true);
@@ -1135,6 +1165,15 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     run(app, ui, tr("Invert mask"), "mask.invert", json!({"layer": lid}), has_mask);
     run(app, ui, tr("Clear mask"), "mask.clear", json!({"layer": lid}), has_mask);
     run(app, ui, tr("Remove mask"), "mask.remove", json!({"layer": lid}), has_mask);
+    #[cfg(not(target_arch = "wasm32"))]
+    if ui.add_enabled(mask_on, egui::Button::new(tr("Export mask to file..."))).clicked() {
+        export_mask_file(app, layer);
+        ui.close();
+    }
+    if ui.add_enabled(mask_on, egui::Button::new(tr("Copy mask to clipboard"))).clicked() {
+        copy_mask(app, ui.ctx(), layer.id);
+        ui.close();
+    }
     geometry_mask_menu(app, ui, layer);
     ui.separator();
     run(app, ui, tr("Flatten layer"), "layer.flatten", json!({"layer": lid}), !layer.is_group());

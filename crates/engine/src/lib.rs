@@ -26,6 +26,7 @@ pub mod layer_cmds;
 pub mod layer_ops;
 pub mod link_cmds;
 pub mod mask_cmds;
+pub mod mask_export;
 mod mask_preview_pixel;
 pub mod material_lib;
 mod material_preview_pixel;

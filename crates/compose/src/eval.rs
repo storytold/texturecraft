@@ -2376,9 +2376,10 @@ pub fn pad_tiles(out: &mut Composite, dmap: &DilationMap, tiles: &[(u32, u32)]) 
     written
 }
 
-/// The layer mask as a square grayscale image, using nearest texels and black outside the mesh
+/// The layer mask over the whole texture set as `0..=1` values, row by row from the top (the
+/// orientation of the exported maps), `gbuf.width × gbuf.height` of them; black outside the mesh
 /// Returns None without an enabled mask
-pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
+pub fn mask_texels(inputs: &Inputs, id: LayerId) -> Option<Vec<f32>> {
     let mask = layer_mask(inputs.project, id).filter(|mask| mask.enabled)?;
     let channels = inputs.project.texture_set(inputs.ts).map(|set| set.channel_list()).unwrap_or_default();
     let (width, height) = (inputs.gbuf.width, inputs.gbuf.height);
@@ -2388,30 +2389,48 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
     prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
 
     let fields = neighbourhood_fields(inputs, &channels, &coordinates);
-    let tiles: HashMap<(u32, u32), Vec<u8>> = coordinates
+    let tiles: HashMap<(u32, u32), Vec<f32>> = coordinates
         .par_iter()
         .map(|&tile| {
-            let mut values = vec![0u8; TILE_AREA];
+            let mut values = vec![0.0f32; TILE_AREA];
             for (offset, value) in mask_tile(inputs, id, mask, &channels, &fields, tile, 0..TILE_AREA) {
                 if let Some(destination) = values.get_mut(offset) {
-                    *destination = (value * 255.0 + 0.5) as u8;
+                    *destination = value;
                 }
             }
             (tile, values)
         })
         .collect();
 
+    let mut output = vec![0.0f32; width as usize * height as usize];
+    for y in 0..height {
+        for x in 0..width {
+            if let Some(tile) = tiles.get(&(x / TILE, y / TILE))
+                && let Some(value) = tile.get(((y % TILE) * TILE + x % TILE) as usize)
+                && let Some(destination) = output.get_mut((y * width + x) as usize)
+            {
+                *destination = *value;
+            }
+        }
+    }
+    Some(output)
+}
+
+/// The layer mask as a square grayscale image, using nearest texels and black outside the mesh
+/// Returns None without an enabled mask
+pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
+    let texels = mask_texels(inputs, id)?;
+    let (width, height) = (inputs.gbuf.width, inputs.gbuf.height);
     let size = size.max(1);
     let mut output = vec![0u8; (size * size) as usize];
     for y in 0..size {
         for x in 0..size {
             let sample_x = (u64::from(x) * u64::from(width) / u64::from(size)) as u32;
             let sample_y = (u64::from(y) * u64::from(height) / u64::from(size)) as u32;
-            if let Some(tile) = tiles.get(&(sample_x / TILE, sample_y / TILE))
-                && let Some(value) = tile.get(((sample_y % TILE) * TILE + sample_x % TILE) as usize)
+            if let Some(value) = texels.get(sample_y as usize * width as usize + sample_x as usize)
                 && let Some(destination) = output.get_mut((y * size + x) as usize)
             {
-                *destination = *value;
+                *destination = (value * 255.0 + 0.5) as u8;
             }
         }
     }
