@@ -810,5 +810,16 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
     execute(&mut s, "layer.blend", &json!({"layer": layer, "channel": "metallic", "enabled": false})).unwrap();
     execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"metallic": {"opacity": 0.1}}})).unwrap();
     assert!(!read(&s).contains_key(&Channel::Metallic));
-    assert!(execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"nope": {}}})).is_err());
+    let stable = read(&s);
+    for bad in [
+        json!({"layer": layer}),
+        json!({"layer": layer, "channels": {"nope": {}}}),
+        json!({"layer": layer, "channels": {"baseColor": {"mode": "Multiply"}, "nope": {}}}),
+        json!({"layer": layer, "channels": {"baseColor": {"mode": "???"}}}),
+    ] {
+        assert!(execute(&mut s, "layer.blending.set", &bad).is_err(), "{bad}");
+        assert_eq!(read(&s), stable, "an error changes nothing");
+    }
+    execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"baseColor": {"opacity": 2.0}, "roughness": {"opacity": -1.0}}})).unwrap();
+    assert_eq!((read(&s)[&Channel::BaseColor].opacity, read(&s)[&Channel::Roughness].opacity), (1.0, 0.0), "opacity is clamped");
 }

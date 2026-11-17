@@ -88,9 +88,25 @@ fn copy_from_one_layer_and_paste_into_another() {
 fn paste_is_disabled_until_something_is_copied() {
     let mut h = harness();
     let layer = first_layer(&h);
-    set_distinct(&mut h, layer);
-    let before = blending(&h, layer);
-    menu_item(&mut h, layer, "Paste channel blending settings");
-    assert_eq!(blending(&h, layer), before, "nothing was copied, nothing pasted");
+    let name = h.state().session.doc.project.layers[&layer].name.clone();
+    h.get_by_label(&name).click_secondary();
+    h.run_steps(3);
+    h.get_all_by_label("Blending options").last().unwrap().click();
+    h.run_steps(3);
+    assert!(h.get_all_by_label("Paste channel blending settings").last().unwrap().accesskit_node().is_disabled(), "nothing copied yet");
     assert!(h.state().ui.blend_clipboard.is_none());
+}
+
+#[test]
+fn paste_keeps_a_disabled_channel_disabled() {
+    let mut h = harness();
+    let a = first_layer(&h);
+    set_distinct(&mut h, a);
+    let b = LayerId(texturecraft_engine::execute(&mut h.state_mut().session, "layer.add.paint", &json!({"name": "Other"})).unwrap()["layer"].as_u64().unwrap());
+    texturecraft_engine::execute(&mut h.state_mut().session, "layer.blend", &json!({"layer": b.0, "channel": "roughness", "enabled": false})).unwrap();
+    h.run_steps(3);
+    menu_item(&mut h, a, "Copy channel blending settings");
+    menu_item(&mut h, b, "Paste channel blending settings");
+    assert!(!blending(&h, b).iter().any(|(c, _)| *c == Channel::Roughness));
+    assert_eq!(blending(&h, b).iter().find(|(c, _)| *c == Channel::BaseColor).unwrap().1.mode, BlendMode::Multiply);
 }

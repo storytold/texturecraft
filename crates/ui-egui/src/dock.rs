@@ -1129,7 +1129,6 @@ fn blending_options_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) 
                 if opacity {
                     params["opacity"] = json!(shown.opacity);
                 }
-                app.run("layer.select", json!({"layer": lid}));
                 app.run("layer.blend", params);
                 ui.close();
             }
@@ -1146,7 +1145,6 @@ fn blending_options_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) 
             if let Some(saved) = app.ui.blend_clipboard.clone() {
                 let channels: serde_json::Map<String, Value> =
                     saved.iter().map(|(c, b)| (c.id().to_string(), json!({"mode": format!("{:?}", b.mode), "opacity": b.opacity}))).collect();
-                app.run("layer.select", json!({"layer": lid}));
                 app.run("layer.blending.set", json!({"layer": lid, "channels": channels}));
             }
             ui.close();
