@@ -96,6 +96,7 @@ fn shift_during_a_ctrl_drag_changes_the_brush_in_fine_steps() {
     let mut h = app(texturecraft_ui_egui::state::ViewLayout::Only3D);
     let c = h.state().viewport_rect.center();
     let before = h.state().session.tool.brush.clone();
+    let history = h.state().session.history_labels().len();
     // Right drag up: harder; left drag up: turned. Once with Ctrl, once with Ctrl+Shift.
     drag(&mut h, PointerButton::Secondary, c, vec2(0.0, -40.0), Modifiers::COMMAND);
     drag(&mut h, PointerButton::Primary, c, vec2(0.0, -40.0), Modifiers::COMMAND);
@@ -105,6 +106,7 @@ fn shift_during_a_ctrl_drag_changes_the_brush_in_fine_steps() {
     drag(&mut h, PointerButton::Secondary, c, vec2(0.0, -40.0), Modifiers::COMMAND | Modifiers::SHIFT);
     drag(&mut h, PointerButton::Primary, c, vec2(0.0, -40.0), Modifiers::COMMAND | Modifiers::SHIFT);
     let fine = h.state().session.tool.brush.clone();
+    assert_eq!(h.state().session.history_labels().len(), history, "nothing painted");
     let (coarse_hardness, fine_hardness) = (coarse.hardness - before.hardness, fine.hardness - before.hardness);
     assert!(coarse_hardness > 0.05 && fine_hardness > 0.0, "{coarse_hardness} {fine_hardness}");
     assert!((fine_hardness * 10.0 - coarse_hardness).abs() < 0.01, "hardness {coarse_hardness} vs {fine_hardness}");

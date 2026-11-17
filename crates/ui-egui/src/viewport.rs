@@ -583,7 +583,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     if response.hovered() {
         let scroll = wheel_scroll(ui, shift);
         if scroll != 0.0 {
-            if shift && app.ui.mode == crate::state::Mode::Painting {
+            if shift && wheel_sizes_brush(app) {
                 scale_brush_by_wheel(app, scroll);
             } else {
                 app.session.camera.zoom(scroll * WHEEL_ZOOM_PER_POINT);
@@ -1613,12 +1613,15 @@ fn wheel_scroll(ui: &Ui, shift: bool) -> f32 {
     })
 }
 
-/// Shift+wheel: scale the brush size. A tool that can't act keeps its size: its controls are hidden.
+/// Shift+wheel sizes the brush while a brush tool can act; otherwise the wheel zooms as usual.
+fn wheel_sizes_brush(app: &TextureCraftApp) -> bool {
+    tool_acts(app) && brush_tool(app.session.tool.tool)
+}
+
+/// Shift+wheel: scale the brush size.
 fn scale_brush_by_wheel(app: &mut TextureCraftApp, scroll: f32) {
-    if tool_acts(app) {
-        let brush = &mut app.session.tool.brush;
-        brush.size = (brush.size * (1.0 + scroll * WHEEL_BRUSH_SIZE_PER_POINT)).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
-    }
+    let brush = &mut app.session.tool.brush;
+    brush.size = (brush.size * (1.0 + scroll * WHEEL_BRUSH_SIZE_PER_POINT)).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
 }
 
 /// Ctrl (Cmd on macOS) + drag changes the brush instead of painting: true while it applies (see `adjust_brush`)
@@ -1811,7 +1814,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
     if response.hovered() {
         let scroll = wheel_scroll(ui, shift);
-        if scroll != 0.0 && shift && app.ui.mode == crate::state::Mode::Painting {
+        if scroll != 0.0 && shift && wheel_sizes_brush(app) {
             scale_brush_by_wheel(app, scroll);
         } else if scroll != 0.0 {
             let old_zoom = app.ui.uv_zoom;
