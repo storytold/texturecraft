@@ -116,6 +116,7 @@ fn turn_towards(landing: &Frame, direction: Vec3) -> Option<f32> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
