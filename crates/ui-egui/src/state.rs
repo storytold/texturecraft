@@ -393,6 +393,7 @@ impl UiState {
         self.export = keep.export;
         self.recent = keep.recent;
         self.prefs = keep.prefs;
+        self.nav_buttons = keep.nav_buttons;
         self.keymap = keep.keymap;
         self.rename = None;
 
