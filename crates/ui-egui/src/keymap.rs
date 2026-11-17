@@ -358,6 +358,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
                     (tr("LMB"), tr("Paint with the current tool")),
                     ("[ / ]", tr("Brush size down / up")),
                     (tr("Shift + wheel"), tr("Brush size")),
+                    (tr("Ctrl + wheel"), tr("Brush size (wheel up smaller, down larger)")),
                     (tr("Ctrl + RMB drag"), tr("Brush size (left/right) and hardness (up/down)")),
                     (tr("Ctrl + LMB drag"), tr("Brush flow (left/right) and angle (up/down)")),
                     (tr("Ctrl + Shift + drag"), tr("The same in fine steps, a tenth of the change")),

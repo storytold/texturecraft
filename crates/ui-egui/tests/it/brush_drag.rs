@@ -120,3 +120,19 @@ fn shift_during_a_ctrl_drag_changes_the_brush_in_fine_steps() {
     assert!(coarse_angle.abs() > 5.0 && fine_angle != 0.0, "{coarse_angle} {fine_angle}");
     assert!((fine_angle * 10.0 - coarse_angle).abs() < 0.1, "angle {coarse_angle} vs {fine_angle}");
 }
+
+#[test]
+fn ctrl_wheel_sizes_the_brush_in_both_views_up_smaller_and_does_not_zoom() {
+    for layout in [texturecraft_ui_egui::state::ViewLayout::Only3D, texturecraft_ui_egui::state::ViewLayout::Only2D] {
+        let mut h = app(layout);
+        let c = if layout == texturecraft_ui_egui::state::ViewLayout::Only3D { h.state().viewport_rect.center() } else { egui::pos2(800.0, 480.0) };
+        let (size, distance, zoom) = (h.state().session.tool.brush.size, h.state().session.camera.distance, h.state().ui.uv_zoom);
+        wheel(&mut h, c, 20.0, Modifiers::COMMAND);
+        let smaller = h.state().session.tool.brush.size;
+        assert!(smaller < size, "{layout:?}: wheel up makes it smaller: {size} -> {smaller}");
+        wheel(&mut h, c, -20.0, Modifiers::COMMAND);
+        assert!(h.state().session.tool.brush.size > smaller, "{layout:?}: wheel down makes it larger");
+        assert_eq!(h.state().session.camera.distance, distance, "{layout:?}: no camera zoom");
+        assert_eq!(h.state().ui.uv_zoom, zoom, "{layout:?}: no 2D zoom");
+    }
+}

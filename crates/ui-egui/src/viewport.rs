@@ -581,6 +581,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
 
     if response.hovered() {
+        size_brush_by_ctrl_wheel(app, ui);
         let scroll = wheel_scroll(ui, shift);
         if scroll != 0.0 {
             if shift && wheel_sizes_brush(app) {
@@ -1613,6 +1614,18 @@ fn wheel_scroll(ui: &Ui, shift: bool) -> f32 {
     })
 }
 
+/// egui's wheel travel per unit of `ln(zoom_delta)` for a Ctrl+wheel (its `scroll_zoom_speed` is 1/200)
+const CTRL_WHEEL_POINTS_PER_LN_ZOOM: f32 = 200.0;
+
+/// Ctrl (Cmd on macOS) + wheel sizes the brush like the reference app: wheel up makes it smaller, down larger,
+/// with the same step as Shift+wheel. egui reports it as a zoom gesture, not as a scroll.
+fn size_brush_by_ctrl_wheel(app: &mut TextureCraftApp, ui: &Ui) {
+    let zoom = ui.input(|input| input.zoom_delta());
+    if zoom != 1.0 && zoom.is_finite() && zoom > 0.0 && wheel_sizes_brush(app) {
+        scale_brush_by_wheel(app, -zoom.ln() * CTRL_WHEEL_POINTS_PER_LN_ZOOM);
+    }
+}
+
 /// Shift+wheel sizes the brush while a brush tool can act; otherwise the wheel zooms as usual.
 fn wheel_sizes_brush(app: &TextureCraftApp) -> bool {
     tool_acts(app) && brush_tool(app.session.tool.tool)
@@ -1813,6 +1826,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         app.ui.uv_pan[1] -= delta.y / size.y * 2.0;
     }
     if response.hovered() {
+        size_brush_by_ctrl_wheel(app, ui);
         let scroll = wheel_scroll(ui, shift);
         if scroll != 0.0 && shift && wheel_sizes_brush(app) {
             scale_brush_by_wheel(app, scroll);
