@@ -18,15 +18,7 @@ use crate::{EngineError, Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        cmd!(
-            "mask.smart.apply",
-            "Apply smart mask",
-            [],
-            None,
-            "{name: smart mask id or label, layer?} or {path: .tcmask file, layer?}",
-            has_layer,
-            apply_cmd
-        ),
+        cmd!("mask.smart.apply", "Apply smart mask", [], None, "{name: smart mask id or label, layer?} or {path: .tcmask file, layer?}", has_layer, apply_cmd),
         cmd!(
             "mask.smart.create",
             "Create smart mask",
@@ -226,7 +218,13 @@ impl Session {
             .and_then(|l| l.mask.clone())
             .ok_or_else(|| EngineError::Other("the smart mask file has no mask".into()))?;
         let resources: BTreeMap<String, Arc<Vec<u8>>> = pf.resources.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
-        let src = crate::session::Document { bake_paint: BTreeMap::new(), project: pf.project, pixels: pf.pixels, baked: BTreeMap::new(), resources: BTreeMap::new() };
+        let src = crate::session::Document {
+            bake_paint: BTreeMap::new(),
+            project: pf.project,
+            pixels: pf.pixels,
+            baked: BTreeMap::new(),
+            resources: BTreeMap::new(),
+        };
         let label = src.project.texture_sets.first().map(|t| t.name.clone()).unwrap_or_default();
         self.edit(&format!("Apply smart mask {label}"), |s| {
             let (ts, _, _) = s.doc.project.locate(layer).ok_or_else(|| EngineError::Other("layer not in a stack".into()))?;

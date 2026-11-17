@@ -396,7 +396,8 @@ fn scan_library(app: &mut TextureCraftApp) {
     }
 
     let saved_asset = |path: &std::path::PathBuf| {
-        path.extension().is_some_and(|extension| extension == "tcmat" || extension == MCMAT_EXT || extension == texturecraft_engine::smart_masks::SMART_MASK_EXT)
+        path.extension()
+            .is_some_and(|extension| extension == "tcmat" || extension == MCMAT_EXT || extension == texturecraft_engine::smart_masks::SMART_MASK_EXT)
     };
     let mut files: Vec<std::path::PathBuf> =
         std::fs::read_dir(crate::library_dir()).map(|dir| dir.flatten().map(|entry| entry.path()).filter(saved_asset).collect()).unwrap_or_default();

@@ -18,7 +18,9 @@ fn layer(s: &mut Session) -> LayerId {
 /// A mask with a generator, a filter, an image fill and painted pixels. Returns the layer and the image's name.
 fn multi_effect_mask(s: &mut Session) -> (LayerId, String) {
     let mut png = Vec::new();
-    image::RgbaImage::from_fn(8, 8, |x, y| image::Rgba([(x * 30) as u8, (y * 30) as u8, 90, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    image::RgbaImage::from_fn(8, 8, |x, y| image::Rgba([(x * 30) as u8, (y * 30) as u8, 90, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
     let name = s.import_resource_bytes("stencil.png", png).unwrap();
 
     let id = layer(s);
@@ -164,7 +166,10 @@ fn effects_reading_an_anchor_of_the_mask_follow_it() {
     let mask = s.doc.project.layer_mut(id).unwrap().mask.as_mut().unwrap();
     for effect in &mut mask.effects {
         if effect.id.0 == fill {
-            effect.kind = EffectKind::Fill { source: Source::Anchor { anchor: LayerId(anchor), channel: texturecraft_engine::core::Channel::Height }, projection: Default::default() };
+            effect.kind = EffectKind::Fill {
+                source: Source::Anchor { anchor: LayerId(anchor), channel: texturecraft_engine::core::Channel::Height },
+                projection: Default::default(),
+            };
         }
     }
     let bytes = s.smart_mask_bytes(id, "Anchored").unwrap();

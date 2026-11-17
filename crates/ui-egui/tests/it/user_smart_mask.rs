@@ -60,7 +60,9 @@ fn create_smart_mask_is_off_for_a_layer_without_a_mask() {
 fn a_saved_smart_mask_is_listed_with_the_smart_masks_and_applies_to_the_selected_layer() {
     let mut saved = texturecraft_engine::sample_session(256, 64).unwrap();
     let source = add_layer(&mut saved, "Source", true);
-    let file = std::env::temp_dir().join(format!("tc-ui-smart-mask-{}.tcmask", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tc-ui-smart-mask-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("Stencil.tcmask");
     std::fs::write(&file, saved.smart_mask_bytes(source, "Stencil").unwrap()).unwrap();
 
     let mut harness = harness(|_| {});
@@ -76,7 +78,7 @@ fn a_saved_smart_mask_is_listed_with_the_smart_masks_and_applies_to_the_selected
     harness.run_steps(3);
     harness.get_by_label_contains("Stencil").click();
     harness.run_steps(3);
-    std::fs::remove_file(&file).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
 
     assert_ne!(before, 2, "the layer did not already have the two effects");
     assert_eq!(mask_effect_count(&harness, target), 2, "the click replaces the selected layer's mask with the saved one");
