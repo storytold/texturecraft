@@ -71,6 +71,19 @@ impl Mesh {
         self.positions.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), p| (lo.min(*p), hi.max(*p)))
     }
 
+    /// Axis-aligned bounds of the triangles drawn with `material` (None when none are).
+    pub fn bounds_of_material(&self, material: usize) -> Option<(Vec3, Vec3)> {
+        let mut bounds: Option<(Vec3, Vec3)> = None;
+        for triangle in self.triangles_of(material) {
+            let Some(corners) = self.tri(triangle) else { continue };
+            for corner in corners {
+                let Some(position) = self.positions.get(corner) else { continue };
+                bounds = Some(bounds.map_or((*position, *position), |(lo, hi)| (lo.min(*position), hi.max(*position))));
+            }
+        }
+        bounds
+    }
+
     /// Bounding-sphere radius around the bounds center (at least a small epsilon).
     pub fn radius(&self) -> f32 {
         let (lo, hi) = self.bounds();
@@ -478,6 +491,13 @@ mod tests {
         }
         assert_eq!(m.material_of(1), Some(0));
         assert_eq!(m.triangles_of(0).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn bounds_of_a_material_cover_only_its_triangles() {
+        let m = quad();
+        assert_eq!(m.bounds_of_material(0), Some((Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0))));
+        assert_eq!(m.bounds_of_material(1), None);
     }
 
     #[test]

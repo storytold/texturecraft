@@ -11,6 +11,7 @@ mod content_effects;
 mod export_colour_space;
 mod filter_swap;
 mod filters;
+mod frame_selection;
 mod generator_inputs;
 mod high_poly_missed;
 mod instances;

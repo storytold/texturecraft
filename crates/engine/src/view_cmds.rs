@@ -11,7 +11,16 @@ use crate::{Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        cmd!("viewport.frame", "Show entire mesh", ["Viewport"], Some("F"), "{}", always, frame),
+        cmd!(
+            "viewport.frame",
+            "Show entire mesh",
+            ["Viewport"],
+            Some("Alt+F"),
+            "{target?: \"all\" (default: the whole mesh, helper geometry included) | \"selection\" (the active texture set's geometry)} → the camera; the orbit turns around the framed center",
+            always,
+            frame
+        ),
+        cmd!("viewport.frameSelection", "Frame texture set", ["Viewport"], Some("F"), "{} → the camera, framing the active texture set's geometry", always, |s, _| frame_target(s, FrameTarget::Selection)),
         cmd!("viewport.displayMaterial", "Display material", ["Viewport"], Some("M"), "{}", always, |s, _| set_view(s, ViewMode::Material)),
         cmd!("viewport.nextChannel", "Display next channel", ["Viewport"], Some("C"), "{}", always, |s, _| cycle_channel(s, 1)),
         cmd!("viewport.previousChannel", "Display previous channel", ["Viewport"], Some("Shift+C"), "{}", always, |s, _| cycle_channel(s, -1)),
@@ -80,8 +89,29 @@ fn repeat(s: &mut Session, p: &Value, step: fn(&mut Session) -> Result<String>) 
     Ok((last, n))
 }
 
-fn frame(s: &mut Session, _: &Value) -> Result<Value> {
-    let (lo, hi) = s.mesh.bounds();
+#[derive(Clone, Copy)]
+enum FrameTarget {
+    All,
+    Selection,
+}
+
+fn frame(s: &mut Session, p: &Value) -> Result<Value> {
+    let target = match strp(p, "target") {
+        None | Some("all") => FrameTarget::All,
+        Some("selection") => FrameTarget::Selection,
+        Some(other) => return Err(bad("viewport.frame", format!("unknown target `{other}` (all or selection)"))),
+    };
+    frame_target(s, target)
+}
+
+/// Frame the whole mesh, or only the triangles of the active texture set's material (the thing
+/// being painted, without a floor plane or other helper geometry), and orbit around that center.
+fn frame_target(s: &mut Session, target: FrameTarget) -> Result<Value> {
+    let selection = match target {
+        FrameTarget::Selection => s.doc.project.texture_sets.get(s.ts()).and_then(|set| s.mesh.bounds_of_material(set.material)),
+        FrameTarget::All => None,
+    };
+    let (lo, hi) = selection.unwrap_or_else(|| s.mesh.bounds());
     s.camera.frame(lo, hi);
     s.revision = s.revision.wrapping_add(1);
     Ok(camera_json(s))

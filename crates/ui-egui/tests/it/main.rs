@@ -15,6 +15,7 @@ mod file_dialogs;
 mod fill_channel_image;
 mod fill_projection_section;
 mod filter_picker;
+mod frame_selection;
 mod generator_panel;
 mod history_panel;
 mod layer_clipboard;
