@@ -358,7 +358,14 @@ fn state_of(shape: &PathShape) -> PathState {
     let corners = if shape.corners.is_empty() {
         Vec::new()
     } else {
-        shape.points.iter().zip(shape.corners.iter().copied().chain(std::iter::repeat(false))).filter(|(p, _)| p.iter().all(|v| v.is_finite())).take(MAX_PATH_POINTS).map(|(_, c)| c).collect()
+        shape
+            .points
+            .iter()
+            .zip(shape.corners.iter().copied().chain(std::iter::repeat(false)))
+            .filter(|(p, _)| p.iter().all(|v| v.is_finite()))
+            .take(MAX_PATH_POINTS)
+            .map(|(_, c)| c)
+            .collect()
     };
     PathState { points, corners, uv: shape.uv, closed: shape.closed, fill: shape.fill, ..PathState::default() }
 }

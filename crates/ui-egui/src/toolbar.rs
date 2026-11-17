@@ -341,6 +341,7 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let (closed, fill) = (path.closed, path.fill);
     let selected = path.selected.is_some_and(|i| i < path.points.len());
     let has_points = !path.points.is_empty();
+    let corner = path.selected.is_some_and(|i| path.is_corner(i));
     if icon_button(ui, ic::POLYGON, tr("Closed path"), closed, button_size).clicked() {
         app.session.set_path_closed(!closed);
     }
@@ -350,7 +351,6 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
         app.session.set_path_fill(!fill);
     }
 
-    let corner = path.selected.is_some_and(|i| path.is_corner(i));
     if ui.add_enabled_ui(selected, |ui| icon_button(ui, ic::ANGLE, tr("Corner point (Shift+click places one)"), corner, button_size)).inner.clicked() {
         // The command repaints an edited path and is one undo step
         app.run("path.corner", json!({}));

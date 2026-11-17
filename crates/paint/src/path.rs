@@ -32,12 +32,7 @@ pub fn spline_segments_with_corners(points: &[Vec2], corners: &[bool], closed: b
 }
 
 /// Stream samples so a flat curve does not allocate and retain every segment alongside its output
-fn segment_samples<'a>(
-    points: &'a [Vec2],
-    corners: &'a [bool],
-    closed: bool,
-    step: f32,
-) -> impl Iterator<Item = impl Iterator<Item = Vec2> + 'a> + 'a {
+fn segment_samples<'a>(points: &'a [Vec2], corners: &'a [bool], closed: bool, step: f32) -> impl Iterator<Item = impl Iterator<Item = Vec2> + 'a> + 'a {
     let n = points.len();
     let wrap = move |i: isize| if closed { i.rem_euclid(n as isize) } else { i.clamp(0, n as isize - 1) };
     let at = move |i: isize| points.get(wrap(i) as usize).copied().unwrap_or_default();

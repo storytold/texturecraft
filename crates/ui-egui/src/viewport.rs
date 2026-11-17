@@ -1226,7 +1226,10 @@ fn curve_on_screen(
 ) -> ScreenCurve {
     if uv {
         let Some(points) = path.points.iter().map(|p| show(app, *p)).collect::<Option<Vec<_>>>() else { return Vec::new() };
-        return screen_segments(&points, &path.corners, path.closed).into_iter().map(|segment| segment.into_iter().map(|at| Some((at, true))).collect()).collect();
+        return screen_segments(&points, &path.corners, path.closed)
+            .into_iter()
+            .map(|segment| segment.into_iter().map(|at| Some((at, true))).collect())
+            .collect();
     }
     let s = &app.session;
     let surface = stored

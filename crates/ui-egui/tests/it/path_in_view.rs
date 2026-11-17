@@ -205,13 +205,14 @@ fn clicking_the_curve_inserts_a_point_and_backspace_removes_the_selected_one() {
 
 /// A primary click with Shift held, in two frames like `click`
 fn shift_click(h: &mut AppHarness<'_>, at: Pos2) {
+    h.input_mut().events.push(Event::ModifiersChanged(Modifiers::SHIFT));
     for pressed in [true, false] {
-        let input = h.input_mut();
-        input.modifiers = Modifiers::SHIFT;
-        input.events.push(Event::PointerMoved(at));
-        input.events.push(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::SHIFT });
+        let events = &mut h.input_mut().events;
+        events.push(Event::PointerMoved(at));
+        events.push(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::SHIFT });
         h.step();
     }
+    h.input_mut().events.push(Event::ModifiersChanged(Modifiers::NONE));
     h.run_steps(2);
 }
 
