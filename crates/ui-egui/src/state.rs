@@ -235,6 +235,9 @@ pub struct ExportUi {
     /// Output templates tab: the new name while renaming the selected preset.
     #[serde(skip)]
     pub renaming: Option<String>,
+    /// Output templates tab: the question waiting for an answer (delete, or drop an unsaved edit).
+    #[serde(skip)]
+    pub ask: Option<crate::export_templates::Ask>,
 }
 
 impl Default for ExportUi {
@@ -253,6 +256,7 @@ impl Default for ExportUi {
             tab: 0,
             draft: None,
             renaming: None,
+            ask: None,
         }
     }
 }

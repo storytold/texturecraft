@@ -11,6 +11,7 @@ mod color_selection_editor;
 mod curvature_generator;
 mod effect_rows;
 mod effect_sliders;
+mod export_template_guards;
 mod file_dialogs;
 mod fill_channel_image;
 mod fill_projection_section;

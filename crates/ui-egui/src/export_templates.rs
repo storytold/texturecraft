@@ -170,7 +170,9 @@ fn sync_draft(app: &mut TextureCraftApp) {
     }
 }
 
-enum ListAction {
+/// A template list action.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ListAction {
     Select(String),
     New,
     Duplicate,
@@ -178,7 +180,18 @@ enum ListAction {
     Rename(String),
     Remove,
     Import,
+    /// A template read from a file, added and selected.
+    Imported(ExportPreset),
     Export,
+}
+
+/// A question waiting for an answer in the Output templates tab.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Ask {
+    /// Delete this template (its file goes with it).
+    Delete(String),
+    /// Leave the selected template, whose last edit does not validate and is not saved, for this.
+    Leave(ListAction),
 }
 
 enum MapAction {
@@ -214,6 +227,7 @@ pub fn tab(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]) {
     if let Some(a) = list_action {
         apply(app, ui.ctx(), a);
     }
+    ask(app, ui.ctx());
 }
 
 fn preset_list(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]) -> Option<ListAction> {
@@ -278,8 +292,29 @@ fn preset_list(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]
     act
 }
 
+/// The error of the selected template's draft when it does not validate: that edit is not saved.
+fn unfinished(app: &TextureCraftApp) -> Option<String> {
+    app.ui.export.draft.as_ref().and_then(|d| d.validate().err()).map(|e| e.to_string())
+}
+
+/// Run `act`; deleting a template and leaving one with an unfinished edit ask first.
 fn apply(app: &mut TextureCraftApp, ctx: &egui::Context, act: ListAction) {
     app.ui.export.renaming = None;
+    let leaves = match &act {
+        ListAction::Select(name) | ListAction::StartRename(name) => *name != app.ui.export.preset,
+        ListAction::New | ListAction::Duplicate | ListAction::Imported(_) => true,
+        _ => false,
+    };
+    if act == ListAction::Remove {
+        app.ui.export.ask = Some(Ask::Delete(app.ui.export.preset.clone()));
+    } else if leaves && unfinished(app).is_some() {
+        app.ui.export.ask = Some(Ask::Leave(act));
+    } else {
+        perform(app, ctx, act);
+    }
+}
+
+fn perform(app: &mut TextureCraftApp, ctx: &egui::Context, act: ListAction) {
     match act {
         ListAction::Select(name) => app.ui.export.preset = name,
         ListAction::New => {
@@ -297,15 +332,61 @@ fn apply(app: &mut TextureCraftApp, ctx: &egui::Context, act: ListAction) {
             ctx.memory_mut(|m| m.request_focus(egui::Id::unique(RENAME_ID)));
         }
         ListAction::Rename(name) => rename(app, name.trim()),
-        ListAction::Remove => {
-            let name = app.ui.export.preset.clone();
-            if app.run("export.preset.remove", json!({ "name": name })).is_some() {
-                app.ui.export.preset = crate::state::ExportUi::default().preset;
-                app.toast(trf("Deleted template \"{name}\"", &[("name", &name)]), false);
-            }
-        }
+        ListAction::Remove => remove(app, app.ui.export.preset.clone()),
         ListAction::Import => import_file(app, ctx),
+        ListAction::Imported(p) => add_imported(app, &p),
         ListAction::Export => export_file(app),
+    }
+}
+
+fn remove(app: &mut TextureCraftApp, name: String) {
+    if app.run("export.preset.remove", json!({ "name": name })).is_some() {
+        if app.ui.export.preset == name {
+            app.ui.export.preset = crate::state::ExportUi::default().preset;
+        }
+        app.toast(trf("Deleted template \"{name}\"", &[("name", &name)]), false);
+    }
+}
+
+/// The open question, if any: Escape or Cancel keeps things as they are.
+fn ask(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    let Some(question) = app.ui.export.ask.clone() else { return };
+    let mut cancel = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    let mut yes = false;
+    let (title, text, yes_label, no_label) = match &question {
+        Ask::Delete(name) => (
+            tr("Delete template"),
+            trf("Delete the template \"{name}\"? Its file is removed and this cannot be undone.", &[("name", name)]),
+            tr("Delete"),
+            tr("Cancel"),
+        ),
+        Ask::Leave(_) => (
+            tr("Unfinished template edit"),
+            trf(
+                "The last edit of the template \"{name}\" is not saved: {error}. Switching away drops it.",
+                &[("name", &app.ui.export.preset), ("error", &unfinished(app).unwrap_or_default())],
+            ),
+            tr("Discard changes"),
+            tr("Keep editing"),
+        ),
+    };
+    egui::Window::new(title).id(egui::Id::new("export_template_ask")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+        ui.set_max_width(360.0);
+        ui.label(text);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            yes = ui.button(yes_label).clicked();
+            cancel |= ui.button(no_label).clicked();
+        });
+    });
+    if yes {
+        app.ui.export.ask = None;
+        match question {
+            Ask::Delete(name) => remove(app, name),
+            Ask::Leave(act) => perform(app, ctx, act),
+        }
+    } else if cancel {
+        app.ui.export.ask = None;
     }
 }
 
@@ -334,6 +415,14 @@ fn rename(app: &mut TextureCraftApp, name: &str) {
 
 /// Add an imported preset (renamed when its name is taken) and select it.
 pub fn import(app: &mut TextureCraftApp, preset: &ExportPreset) {
+    if unfinished(app).is_some() {
+        app.ui.export.ask = Some(Ask::Leave(ListAction::Imported(preset.clone())));
+    } else {
+        add_imported(app, preset);
+    }
+}
+
+fn add_imported(app: &mut TextureCraftApp, preset: &ExportPreset) {
     if let Some(name) = save_new(app, preset) {
         app.toast(trf("Imported template \"{name}\"", &[("name", &name)]), false);
     }
