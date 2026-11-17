@@ -310,3 +310,43 @@ fn image_drop_menu_snapshots() {
     assert!(matches!(harness.state().session.target, texturecraft_engine::StackTarget::Effect(_)));
     harness.render().unwrap().save(directory.join("image-drop-mask.png")).unwrap();
 }
+
+/// The names of the Ball's top-level layers, bottom to top
+fn ball_stack_names(harness: &Harness<'_, TextureCraftApp>) -> Vec<String> {
+    let project = &harness.state().session.doc.project;
+    project.texture_sets[0].stack.iter().map(|id| project.layer(*id).unwrap().name.clone()).collect()
+}
+
+#[test]
+fn a_material_dropped_on_the_view_becomes_a_fill_layer_at_the_top_whatever_is_selected() {
+    let mut harness = sample_app();
+    let bottom = harness.state().session.doc.project.texture_sets[0].stack[0];
+    texturecraft_engine::execute(&mut harness.state_mut().session, "layer.select", &serde_json::json!({"layer": bottom.0})).unwrap();
+    harness.run_steps(2);
+    let before = ball_stack_names(&harness);
+
+    let ball = point_over(&harness, Some(0));
+    drop_asset(&mut harness, Asset::Material("copper"), ball);
+
+    let after = ball_stack_names(&harness);
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(after.last().map(String::as_str), Some("Copper"), "the new layer is on top: {after:?}");
+    let app = harness.state();
+    let layer = app.session.doc.project.layer(*app.session.doc.project.texture_sets[0].stack.last().unwrap()).unwrap();
+    assert!(matches!(layer.kind, texturecraft_engine::core::LayerKind::Fill(_)));
+    assert!(layer.mask.is_none(), "no mask");
+}
+
+#[test]
+fn a_material_dropped_on_a_layer_row_goes_directly_below_that_row() {
+    let mut harness = sample_app();
+    let before = ball_stack_names(&harness);
+    let row_name = before.last().unwrap().clone();
+    let row = harness.get_by_label(&row_name).rect().center();
+
+    drop_asset(&mut harness, Asset::Material("copper"), row);
+
+    let mut expected = before.clone();
+    expected.insert(before.len() - 1, "Copper".into());
+    assert_eq!(ball_stack_names(&harness), expected, "below the dropped-on row, which stays on top");
+}

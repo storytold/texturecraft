@@ -112,11 +112,12 @@ pub struct ShelfDrag {
     pub label: String,
 }
 
-/// Apply `asset` the way a shelf click does: a material above the selection, a smart mask on
-/// the selected layer, a filter on the selection (its mask when the mask is selected), an alpha
+/// Apply `asset` the way a shelf click does: a simple material becomes the brush's material (no
+/// layer), a smart material goes above the selection, a smart mask on the selected layer, a filter on the selection (its mask when the mask is selected), an alpha
 /// on the brush, a texture as an image fill.
 pub fn apply(app: &mut TextureCraftApp, asset: &Asset) {
     let (cmd, params) = match asset {
+        Asset::Material(id) if texturecraft_engine::materials::brush_values(id).is_some() => ("tool.material", json!({"material": id})),
         Asset::Material(id) => ("material.apply", json!({"material": id})),
         Asset::SmartMask(id) => ("mask.smart.apply", json!({"name": id})),
         Asset::Filter(id) => {
@@ -135,6 +136,16 @@ pub fn apply(app: &mut TextureCraftApp, asset: &Asset) {
         Asset::Texture(name) => ("layer.add.image", json!({"name": name})),
     };
     app.run(cmd, params);
+}
+
+/// Apply `asset` the way a drop on a view does: a material becomes a new fill layer (a smart
+/// material a folder) at the top of the stack; everything else as a click
+fn apply_dropped(app: &mut TextureCraftApp, asset: &Asset) {
+    match asset {
+        Asset::Material(id) => app.run("material.apply", json!({"material": id, "top": true})),
+        Asset::Library(path) => app.run("material.load", json!({"path": path, "top": true})),
+        _ => return apply(app, asset),
+    };
 }
 
 /// The selected layer's name when it is a paint layer with nothing painted (in itself or in its
@@ -222,10 +233,10 @@ pub fn drop_target(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response
             let Some(ts) = set_under_pointer(app, ui, response) else { return };
 
             if app.run("textureSet.select", json!({"ts": ts})).is_some() {
-                apply(app, asset);
+                apply_dropped(app, asset);
             }
         }
-        (asset, _) => apply(app, asset),
+        (asset, _) => apply_dropped(app, asset),
     }
 }
 

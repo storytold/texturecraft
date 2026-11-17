@@ -681,15 +681,18 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         row.dnd_set_drag_payload(layer.id.0);
     }
 
-    // Drops: a layer or a shelf material lands above this row (inside a folder on its middle); a shelf smart mask replaces the mask
+    // Drops: a layer lands above this row (inside a folder on its middle); a shelf material directly below it (inside a folder on its middle); a shelf smart mask replaces the mask
     let inside = layer.is_group()
         && ui.input(|input| input.pointer.hover_pos()).is_some_and(|pointer| (pointer.y - rect.center().y).abs() < row_height * FOLDER_DROP_ZONE);
     let shelf = row.dnd_hover_payload::<ShelfDrag>().map(|drag| drag.asset.clone());
     let moving = row.dnd_hover_payload::<u64>().is_some_and(|dragged| *dragged != layer.id.0);
     let drop_stroke = Stroke::new(DROP_LINE_WIDTH, tokens.accent);
-    if moving || shelf.as_ref().is_some_and(Asset::is_material) {
+    let shelf_material = shelf.as_ref().is_some_and(Asset::is_material);
+    if moving || shelf_material {
         if inside {
             painter.rect_stroke(rect, THUMBNAIL_ROUNDING, drop_stroke, egui::StrokeKind::Inside);
+        } else if shelf_material {
+            painter.line_segment([rect.left_bottom(), rect.right_bottom()], drop_stroke);
         } else {
             painter.line_segment([rect.left_top(), rect.right_top()], drop_stroke);
         }
@@ -705,10 +708,10 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
     }
     match dnd_release::<ShelfDrag>(&row).map(|drag| drag.asset.clone()) {
         Some(Asset::Material(material)) => {
-            app.run("material.apply", json!({"material": material, "above": layer.id.0, "inside": inside}));
+            app.run("material.apply", shelf_drop_place(json!({"material": material}), layer.id, inside));
         }
         Some(Asset::Library(path)) => {
-            app.run("material.load", json!({"path": path, "above": layer.id.0, "inside": inside}));
+            app.run("material.load", shelf_drop_place(json!({"path": path}), layer.id, inside));
         }
         Some(Asset::SmartMask(smart_mask)) => {
             app.run("mask.smart.apply", json!({"name": smart_mask, "layer": layer.id.0}));
@@ -720,6 +723,15 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         Some(Asset::Alpha(_) | Asset::Texture(_)) | None => {}
     }
     row.context_menu(|ui| layer_context_menu(app, ui, layer));
+}
+
+/// `params` of a shelf material dropped on the row of `layer`: inside a folder when dropped on its middle, else directly below the row
+fn shelf_drop_place(mut params: serde_json::Value, layer: LayerId, inside: bool) -> serde_json::Value {
+    params[if inside { "above" } else { "below" }] = json!(layer.0);
+    if inside {
+        params["inside"] = json!(true);
+    }
+    params
 }
 
 /// The border of a content or mask thumbnail: the accent while it is the layer's target.

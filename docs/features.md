@@ -64,8 +64,10 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   mud, snow, bone, moss, plastics, fabric, linen, wool, leather, ceramic, rust, cork, paper), **21 smart
   materials** (rusted iron, worn paint, oxidized copper, bronze statue, weathered wood, mossy
   brick and stone, sun-faded paint…) and **24 smart masks**, all procedural, so they work at any
-  resolution. Drag them from the tabbed, searchable shelf onto the layer stack or straight onto
-  the model.
+  resolution. Drag them from the tabbed, searchable shelf onto the layer stack (below the row you
+  drop on) or straight onto the model (a new fill layer on top). A click on a simple material sets
+  the brush's material (colour, metallic, roughness, height) so the next stroke paints it; a smart
+  material, which is several layers, still adds them on a click.
 - **Your own library:** right-click a layer or folder, choose *Create smart material*, and it
   appears under *My smart materials*, pixels and images included.
 - **MaterialCraft materials:** *File › Import material*, a drop on the window, or MaterialCraft's

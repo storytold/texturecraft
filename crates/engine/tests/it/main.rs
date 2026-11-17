@@ -6,6 +6,7 @@ mod bake_checks;
 mod bake_resolution;
 mod bake_settings;
 mod bake_tiles;
+mod brush_material;
 mod color_selection;
 mod content_effects;
 mod export_colour_space;

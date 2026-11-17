@@ -27,7 +27,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add smart material",
             [],
             None,
-            "{material: id or label, above?: layer id, inside?: bool, index?: n} — above the selection by default; `above` (+ `inside` for a folder) or `index` in the top-level stack (0 = bottom) place it",
+            "{material: id or label, above?: layer id, inside?: bool, below?: layer id, top?: true, index?: n} — above the selection by default; `above` (+ `inside` for a folder), `below`, `top` or `index` in the top-level stack (0 = bottom) place it",
             always,
             material
         ),

@@ -30,6 +30,7 @@ mod polygon_fill;
 mod project_config;
 mod properties_popup;
 mod rail;
+mod shelf_click;
 mod shelf_drop;
 mod shelf_hover_preview;
 mod shelf_panel;

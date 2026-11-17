@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Tool material",
             [],
             None,
-            "{channel, color?|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1}",
+            "{channel, color?|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1} or {material: id or label of a simple material (see material.list, smart: false)} — the brush paints that material's values (colour, metallic, roughness, height…) in the channels that are on; no layer is added, smart materials are refused (add them with material.apply)",
             always,
             material
         ),
@@ -286,6 +286,16 @@ pub(crate) fn brush_json(session: &Session) -> Value {
 }
 
 fn material(s: &mut Session, p: &Value) -> Result<Value> {
+    if let Some(id) = strp(p, "material") {
+        let values = crate::materials::brush_values(id)
+            .ok_or_else(|| bad("tool.material", format!("`{id}` is not a simple material (a brush paints plain values; add smart materials with material.apply)")))?;
+        for (channel, value) in values {
+            // A normal map is painted flat
+            if channel.kind() != texturecraft_core::ChannelKind::NormalMap {
+                s.tool.values.insert(channel, value);
+            }
+        }
+    }
     let channel = channel_param("tool.material", p, "channel")?;
     let color = color_param("tool.material", p, "color")?;
     let value = color_param("tool.material", p, "value")?;

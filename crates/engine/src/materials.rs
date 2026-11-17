@@ -715,6 +715,32 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
     }
 }
 
+/// The brush values of simple material `id`: one value per channel it sets, in the order of its
+/// sources. A pattern counts as the middle between its two values. `None` for smart materials
+/// (several layers, or a masked layer) and for unknown ids: a brush paints plain values, so those
+/// stay layers.
+pub fn brush_values(id: &str) -> Option<Vec<(Channel, [f32; 3])>> {
+    let m = find(id).filter(|m| !m.smart)?;
+    let mut scratch = Project::new("", "");
+    let layers = build(&mut Builder { p: &mut scratch, channels: Channel::LOBES.to_vec() }, m.id).ok()?;
+    let [layer] = layers.as_slice() else { return None };
+    let LayerKind::Fill(fill) = &layer.kind else { return None };
+    if layer.mask.is_some() {
+        return None;
+    }
+    let mean = |low: &[f32; 3], high: &[f32; 3]| std::array::from_fn(|i| (low[i] + high[i]) * 0.5);
+    Some(
+        fill.sources
+            .iter()
+            .filter_map(|(channel, source)| match source {
+                Source::Uniform(value) => Some((*channel, *value)),
+                Source::Procedural { low, high, .. } => Some((*channel, mean(low, high))),
+                Source::Image { .. } | Source::Anchor { .. } => None,
+            })
+            .collect(),
+    )
+}
+
 /// Where [`apply_at`] puts a material.
 #[derive(Clone, Copy, Debug)]
 pub enum Place {
@@ -724,6 +750,10 @@ pub enum Place {
     Above(LayerId, bool),
     /// At this index of the top-level stack (0 = bottom).
     Index(usize),
+    /// Directly below a layer, in the same stack or folder (a shelf drop on a layer row).
+    Below(LayerId),
+    /// At the top of the top-level stack (a shelf drop on the 3D or 2D view).
+    Top,
 }
 
 /// Add material `id` above the selection: a single fill layer, or a folder for multi-layer
@@ -770,10 +800,12 @@ pub fn apply_at(s: &mut Session, id: &str, place: Place) -> Result<LayerId> {
 impl Place {
     /// From `above` (+ `inside`) or `index` params; the selection by default.
     pub(crate) fn from_params(p: &serde_json::Value) -> Place {
-        match (crate::commands::u64p(p, "above"), crate::commands::u64p(p, "index")) {
-            (Some(above), _) => Place::Above(LayerId(above), crate::commands::boolp(p, "inside").unwrap_or(false)),
-            (None, Some(i)) => Place::Index(usize::try_from(i).unwrap_or(usize::MAX)),
-            (None, None) => Place::Selection,
+        match (crate::commands::u64p(p, "above"), crate::commands::u64p(p, "below"), crate::commands::u64p(p, "index")) {
+            (Some(above), _, _) => Place::Above(LayerId(above), crate::commands::boolp(p, "inside").unwrap_or(false)),
+            (None, Some(below), _) => Place::Below(LayerId(below)),
+            (None, None, Some(i)) => Place::Index(usize::try_from(i).unwrap_or(usize::MAX)),
+            (None, None, None) if crate::commands::boolp(p, "top") == Some(true) => Place::Top,
+            (None, None, None) => Place::Selection,
         }
     }
 
@@ -786,6 +818,13 @@ impl Place {
                 s.doc.project.move_above(top, None, false)?;
                 s.doc.project.move_layer(top, i)?;
             }
+            Place::Below(target) => {
+                s.doc.project.move_above(top, Some(target), false)?;
+                if let Some((_, _, index)) = s.doc.project.locate(top) {
+                    s.doc.project.move_layer(top, index.saturating_sub(1))?;
+                }
+            }
+            Place::Top => s.doc.project.move_above(top, None, false)?,
         }
         Ok(())
     }
