@@ -38,7 +38,15 @@ pub fn specs() -> Vec<CommandSpec> {
             select
         ),
         cmd!("layer.rename", "Rename layer", [], None, "{layer?, name}", has_layer, rename),
-        cmd!("layer.visible", "Toggle layer visibility", [], None, "{layer? | layers?: [id], visible?} — default: every selected layer; with `layers`, `layer` is the one the others follow", has_layer, visible),
+        cmd!(
+            "layer.visible",
+            "Toggle layer visibility",
+            [],
+            None,
+            "{layer? | layers?: [id], visible?} — default: every selected layer; with `layers`, `layer` is the one the others follow",
+            has_layer,
+            visible
+        ),
         cmd!(
             "layer.move",
             "Move layer",
@@ -269,7 +277,12 @@ fn visible(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = batch_param(s, "layer.visible", p, false)?;
     // Without `visible`, every layer takes the opposite of the lead's: `layer` when it is one of
     // them (the row whose eye was clicked), else the active one, else the top one
-    let lead = u64p(p, "layer").map(LayerId).filter(|lead| ids.contains(lead)).or(s.selected_layer().filter(|active| ids.contains(active))).or(ids.first().copied()).ok_or_else(|| bad("layer.visible", "no layer given"))?;
+    let lead = u64p(p, "layer")
+        .map(LayerId)
+        .filter(|lead| ids.contains(lead))
+        .or(s.selected_layer().filter(|active| ids.contains(active)))
+        .or(ids.first().copied())
+        .ok_or_else(|| bad("layer.visible", "no layer given"))?;
     let v = s.edit("Layer visibility", |s| {
         let v = boolp(p, "visible").unwrap_or(!s.doc.project.layer(lead)?.visible);
         for id in &ids {
