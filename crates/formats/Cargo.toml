@@ -18,6 +18,7 @@ craft-mesh = { workspace = true }
 craft-mcmat = { workspace = true }
 craft-tcraft = { workspace = true }
 craft-zip = { workspace = true }
+craft-zip-usdz = { workspace = true }
 texturecraft-core = { workspace = true }
 texturecraft-texel = { workspace = true }
 texturecraft-geom = { workspace = true }

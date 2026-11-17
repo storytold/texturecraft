@@ -27,6 +27,7 @@ mod path_in_view;
 mod path_list;
 mod pen_pressure;
 mod polygon_fill;
+mod project_config;
 mod properties_popup;
 mod rail;
 mod shelf_drop;

@@ -234,7 +234,6 @@ pub fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     let filter = app.ui.shelf_filter.to_lowercase();
     scan_library(app);
-    scan_brushes(app);
     let all = ShelfEntry::all(app);
     let paths = crate::shelf_folders::with_every_library(crate::shelf_folders::paths(&all));
 
@@ -267,6 +266,9 @@ pub fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
 
     let tab = app.ui.shelf_tab;
     let shown_tab = TABS.get(tab).map(|(shown, _, _)| *shown);
+    let show_user_brushes = crate::shelf_tabs::shows(tab, Tab::Brushes)
+        && folder.len() <= 2
+        && folder.iter().zip([crate::shelf_entry::USER, "Brushes"]).all(|(selected, part)| selected == part);
     let mut entries: Vec<ShelfEntry> = matching.into_iter().filter(|entry| crate::shelf_tabs::shows(tab, entry.tab())).collect();
     entries.sort_by_cached_key(|entry| entry.label().to_lowercase());
 
@@ -286,14 +288,15 @@ pub fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
 
         // Saved smart materials are files in the user's library, without folders of their own
         let saved_materials = in_user_library && shown_tab.is_none_or(|shown| shown == Tab::Smart);
-        grid(app, ui, &ctx, &entries, grid_rect.height(), saved_materials, &filter);
+        grid(app, ui, &entries, grid_rect.height(), saved_materials, show_user_brushes, &filter);
     });
     ui.scope_builder(egui::UiBuilder::new().max_rect(toolbar_rect), |ui| crate::shelf_toolbar::show(app, ui));
     drag_preview(&ctx);
 }
 
-/// The tiles of `entries` in a scroll area `height` high, then the saved smart materials when `saved_materials`
-fn grid(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, entries: &[ShelfEntry], height: f32, saved_materials: bool, filter: &str) {
+/// The tiles of `entries` in a scroll area `height` high, then user assets when selected
+fn grid(app: &mut TextureCraftApp, ui: &mut Ui, entries: &[ShelfEntry], height: f32, saved_materials: bool, show_user_brushes: bool, filter: &str) {
+    let ctx = ui.ctx().clone();
     let view = app.ui.shelf_view;
     let selected: Option<(String, String)> = ctx.data(|data| data.get_temp(egui::Id::unique(SELECTED_TILE)));
     egui::ScrollArea::vertical()
@@ -302,15 +305,20 @@ fn grid(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, entries: &[
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .max_height(height)
         .show(ui, |ui| {
-            tiles(ui, |ui| {
-                for entry in entries {
-                    let is_selected = selected.as_ref().is_some_and(|(kind, id)| entry.identity() == (kind.as_str(), id.as_str()));
-                    entry_tile(app, ui, ctx, entry, view, is_selected);
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                tiles(ui, |ui| {
+                    for entry in entries {
+                        let is_selected = selected.as_ref().is_some_and(|(kind, id)| entry.identity() == (kind.as_str(), id.as_str()));
+                        entry_tile(app, ui, &ctx, entry, view, is_selected);
+                    }
+                });
+                if show_user_brushes {
+                    user_brushes(app, ui, filter);
+                }
+                if saved_materials {
+                    library(app, ui, filter);
                 }
             });
-            if saved_materials {
-                library(app, ui, filter);
-            }
         });
 }
 
@@ -440,25 +448,6 @@ fn library(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str) {
 #[cfg(target_arch = "wasm32")]
 fn library(_: &mut TextureCraftApp, _: &mut Ui, _: &str) {}
 
-/// Read the user's saved brush presets (desktop brushes folder) unless they are already listed
-#[cfg(not(target_arch = "wasm32"))]
-fn scan_brushes(app: &mut TextureCraftApp) {
-    use texturecraft_engine::brush_preset_cmds::BRUSH_EXT;
-
-    if app.brushes.is_some() {
-        return;
-    }
-
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(crate::user_dir("brushes"))
-        .map(|dir| dir.flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|extension| extension == BRUSH_EXT)).collect())
-        .unwrap_or_default();
-    files.sort();
-    app.brushes = Some(files);
-}
-
-#[cfg(target_arch = "wasm32")]
-fn scan_brushes(_: &mut TextureCraftApp) {}
-
 /// The tile of `entry`, outlined when `selected`: a click applies it, an image resource has a context menu
 fn entry_tile(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, entry: &ShelfEntry, view: ShelfView, selected: bool) {
     // An image removed this frame has nothing to show
@@ -476,7 +465,7 @@ fn entry_tile(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, entry
         &mut app.thumbs,
         texture.as_ref(),
         |thumbs| match entry {
-            ShelfEntry::SavedBrush(path) => Some(thumbs.saved_brush_preview(path, &session.images)),
+            ShelfEntry::SavedBrush { path: Some(path), .. } => Some(thumbs.saved_brush_preview(path, &session.images)),
             _ => entry.preview(session),
         },
         entry.label(),
@@ -632,6 +621,83 @@ fn hover_preview(ui: &mut Ui, small: Option<&egui::TextureHandle>, big: Option<&
         ui.add_space(BIG_PREVIEW_LABEL_GAP);
         ui.label(label);
     });
+}
+
+/// Manage the user brush library through engine commands
+pub(crate) fn user_brushes(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str) {
+    let names: Vec<String> = app.session.brush_presets.list.iter().map(|preset| preset.name.clone()).filter(|name| matches(filter, &[name])).collect();
+    if !filter.is_empty() && names.is_empty() {
+        return;
+    }
+
+    header(ui, tr("My brushes"));
+    let rename_id = ui.make_persistent_id("brush_preset_rename");
+    let mut renaming: Option<(String, String)> = ui.data_mut(|data| data.get_temp(rename_id));
+
+    for name in names {
+        ui.horizontal(|ui| {
+            if renaming.as_ref().is_some_and(|(old, _)| *old == name) {
+                let Some((old_name, new_name)) = renaming.as_mut() else { return };
+
+                let edit = ui.add(egui::TextEdit::singleline(new_name).desired_width(120.0));
+                let (confirmed, cancelled) =
+                    (edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)), ui.input(|input| input.key_pressed(egui::Key::Escape)));
+                if !edit.has_focus() && !confirmed && !cancelled {
+                    edit.request_focus();
+                }
+
+                if confirmed {
+                    // A failed rename is reported by the command; the row goes back to its name either way
+                    app.run("brush.preset.rename", json!({"name": old_name, "to": new_name}));
+                }
+                if confirmed || cancelled {
+                    renaming = None;
+                }
+
+                return;
+            }
+
+            let use_button =
+                ui.add(egui::Button::selectable(false, format!("{}  {name}", ic::PAINT_BRUSH_BROAD))).on_hover_text(tr("Use this brush (with its size)"));
+            if use_button.clicked() {
+                app.run("brush.preset.apply", json!({"preset": name}));
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(ic::TRASH).on_hover_text(tr("Delete this brush")).clicked() {
+                    app.run("brush.preset.delete", json!({"name": name}));
+                }
+                if ui.small_button(ic::ARROWS_CLOCKWISE).on_hover_text(tr("Replace with the current brush")).clicked() {
+                    app.run("brush.preset.store", json!({"name": name, "overwrite": true}));
+                }
+                if ui.small_button(ic::PENCIL_SIMPLE).on_hover_text(tr("Rename this brush")).clicked() {
+                    renaming = Some((name.clone(), name.clone()));
+                }
+            });
+        });
+    }
+
+    ui.data_mut(|data| match renaming {
+        Some(rename) => {
+            data.insert_temp(rename_id, rename);
+        }
+        None => {
+            data.remove_temp::<(String, String)>(rename_id);
+        }
+    });
+
+    ui.horizontal(|ui| {
+        let name_id = ui.make_persistent_id("brush_preset_name");
+        let mut new_name: String = ui.data_mut(|data| data.get_temp(name_id)).unwrap_or_default();
+        ui.add(egui::TextEdit::singleline(&mut new_name).hint_text(tr("Brush name")).desired_width(110.0));
+        if ui.add_enabled(!new_name.trim().is_empty(), egui::Button::new(tr("Save current brush"))).clicked()
+            && app.run("brush.preset.store", json!({"name": new_name})).is_some()
+        {
+            new_name.clear();
+        }
+        ui.data_mut(|data| data.insert_temp(name_id, new_name));
+    });
+    ui.add_space(6.0);
 }
 
 #[cfg(test)]

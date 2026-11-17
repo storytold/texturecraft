@@ -10,8 +10,6 @@
 mod bake_job;
 pub mod bake_mode;
 mod bake_scene;
-#[cfg(not(target_arch = "wasm32"))]
-mod brush_preset_save;
 mod color_selection_editor;
 pub mod control;
 mod decal_drop;
@@ -40,10 +38,13 @@ mod orb_shape;
 pub mod parity;
 mod path_hit;
 mod path_surface_cache;
+pub mod pbr_import;
 mod preview_image;
 mod preview_request;
 mod preview_worker;
 pub mod profile;
+#[cfg(not(target_arch = "wasm32"))]
+mod project_config;
 pub mod properties_popup;
 mod rail_popup;
 pub mod render_mode;
@@ -138,6 +139,8 @@ pub struct TextureCraftApp {
     /// Texture sets the GPU could not hold, and the text of the one sticky toast naming them.
     pub(crate) gpu_memory: (Vec<String>, Option<String>),
     pub bake: Option<BakeJob>,
+    /// The Import PBR textures dialog while it is open.
+    pub pbr_import: Option<pbr_import::PbrDialog>,
     pub resize: Option<ResizeJob>,
     pub link_cooks: Vec<LinkCook>,
     pub thumbs: thumbs::Thumbs,
@@ -148,8 +151,6 @@ pub struct TextureCraftApp {
     pub fps: f32,
     /// User smart materials found in the library folder (refreshed on demand).
     pub library: Option<Vec<std::path::PathBuf>>,
-    /// User brush presets found in the brushes folder (refreshed on demand).
-    pub brushes: Option<Vec<std::path::PathBuf>>,
     /// Rendering mode's path tracer.
     pub render: render_mode::RenderView,
     /// Smoothed CPU time spent building the UI per frame (ms).
@@ -228,6 +229,7 @@ impl TextureCraftApp {
             toasts: Vec::new(),
             gpu_memory: (Vec::new(), None),
             bake: None,
+            pbr_import: None,
             resize: None,
             link_cooks: Vec::new(),
             thumbs: thumbs::Thumbs::default(),
@@ -237,7 +239,6 @@ impl TextureCraftApp {
             ui_ms: 0.0,
             profiler: profile::Profiler::default(),
             library: None,
-            brushes: None,
             render: render_mode::RenderView::default(),
             last_paint_point: None,
             last_paint_uv: None,
@@ -280,6 +281,11 @@ impl TextureCraftApp {
 
             let skipped = app.session.load_templates(user_dir("templates"));
             app.session.log.extend(skipped.into_iter().map(|warning| format!("Project template skipped: {warning}")));
+
+            // Load presets before control commands can access the session
+            for warning in app.session.load_brush_presets(user_dir("brushes")) {
+                app.toast(warning, true);
+            }
         }
 
         app
@@ -292,15 +298,25 @@ impl TextureCraftApp {
         // Going to a saved camera glides there; the control channel and CLI jump straight away
         let glide_from = (id.starts_with("camera.select") || id.starts_with("camera.bookmark")).then_some(self.session.camera);
         match texturecraft_engine::execute(&mut self.session, id, &params) {
-            Ok(v) => {
-                if let Some(from) = glide_from.filter(|f| *f != self.session.camera) {
+            Ok(value) => {
+                if matches!(id, "brush.preset.store" | "brush.preset.rename" | "brush.preset.delete") {
+                    self.thumbs.forget_saved_files();
+                }
+
+                // A pending dialog must not import its old source into the replacement project
+                if matches!(id, "file.open" | "file.close" | "project.new" | "project.sample") {
+                    self.pbr_import = None;
+                }
+
+                if let Some(from) = glide_from.filter(|camera| *camera != self.session.camera) {
                     self.camera_glide = Some(CameraGlide { from, to: self.session.camera, start: self.last_time });
                     self.session.camera = from;
                 }
-                Some(v)
+
+                Some(value)
             }
-            Err(e) => {
-                self.toast(e.to_string(), true);
+            Err(error) => {
+                self.toast(error.to_string(), true);
                 None
             }
         }
@@ -688,13 +704,27 @@ impl eframe::App for TextureCraftApp {
         self.run_file_dialog_answers();
         web_files::poll(self);
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        for f in &dropped {
-            web_files::dropped(self, ctx, f);
+
+        // A folder, a zip or several PBR maps dropped together open the PBR import dialog
+        #[cfg(not(target_arch = "wasm32"))]
+        let consumed = if !dropped.is_empty() {
+            let paths: Vec<std::path::PathBuf> = dropped.iter().map(|f| f.path().to_path_buf()).collect();
+            pbr_import::dropped(self, &paths)
+        } else {
+            Vec::new()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let consumed: Vec<usize> = Vec::new();
+        for (index, file) in dropped.iter().enumerate() {
+            if consumed.binary_search(&index).is_err() {
+                web_files::dropped(self, ctx, file);
+            }
         }
         self.poll_bake(ctx);
         self.poll_resize(ctx);
         self.poll_link_cooks(ctx);
         self.thumbs.sync_images(&self.session.images, self.session.revision);
+
         // The library shelf rescans when the window comes back (MaterialCraft may have sent a material)
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if focused && !self.focused {
@@ -718,6 +748,7 @@ impl eframe::App for TextureCraftApp {
         updates_ui::tick(self, ctx);
         self.bindings.sync(&self.ui.keymap, craft_keymap::egui::platform(ctx));
         menus::shortcuts(self, ctx);
+
         // The Path tool's curve repaints (a preview while placed) as its points, brush or material change
         if let Err(e) = self.session.path_live() {
             self.session.cancel_path();
@@ -726,7 +757,8 @@ impl eframe::App for TextureCraftApp {
         profile::drive(self, ctx);
         self.toasts.retain(|t| t.until > now);
         self.profiler.logic_ms = (now_ms() - t0) as f32;
-        // Last, so it sees every close request this frame's work made.
+
+        // Last, so it sees every close request this frame's work made
         windows::close_request(self, ctx);
     }
 

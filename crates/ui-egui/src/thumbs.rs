@@ -267,13 +267,35 @@ impl Thumbs {
 
     /// A saved brush preset's stroke along an S curve; None while it renders, empty when the file is unreadable
     pub fn saved_brush(&mut self, ctx: &egui::Context, path: &Path, images: &ImageStore) -> Option<TextureHandle> {
+        self.saved_brush_with_settings(ctx, path, None, images)
+    }
+
+    /// Render a preset held only in this session through the saved-brush cache
+    pub fn session_brush(&mut self, ctx: &egui::Context, name: &str, brush: &BrushSettings, images: &ImageStore) -> Option<TextureHandle> {
+        let path = crate::shelf_preview::session_brush_path(name);
+        self.saved_brush_with_settings(ctx, &path, Some(brush), images)
+    }
+
+    /// Seed in-memory settings only when a thumbnail can use the frame budget
+    fn saved_brush_with_settings(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        initial_settings: Option<&BrushSettings>,
+        images: &ImageStore,
+    ) -> Option<TextureHandle> {
         let key = format!("saved-brush:{}", path.display());
         let cached_preview = self.saved_brush_previews.contains_key(path).then(|| self.saved_brush_preview(path, images));
         if let Some(texture) = self.shelf.get(&key) {
             return Some(texture.clone());
         }
+
         if !self.spend_budget(ctx, 1) {
             return None;
+        }
+
+        if let Some(settings) = initial_settings {
+            self.saved_brush_previews.entry(path.to_path_buf()).or_insert_with(|| (Some(settings.clone()), None, 0));
         }
 
         let preview = cached_preview.unwrap_or_else(|| self.saved_brush_preview(path, images));
@@ -463,6 +485,31 @@ mod tests {
 
         thumbs.forget_saved_files();
         assert!(matches!(thumbs.saved_brush_preview(&path, &images), ShelfPreview::SavedBrush { settings: None, .. }), "refresh reads the file again");
+    }
+
+    #[test]
+    fn session_brush_preview_uses_memory_and_releases_it_on_refresh() {
+        let context = egui::Context::default();
+        let mut thumbs = Thumbs::default();
+        let brush = BrushSettings { size: 0.07, ..BrushSettings::default() };
+        let path = crate::shelf_preview::session_brush_path("Session brush");
+
+        assert!(thumbs.session_brush(&context, "Session brush", &brush, &ImageStore::new()).is_some());
+        assert!(matches!(thumbs.saved_brush_previews.get(&path), Some((Some(settings), _, _)) if settings.size == brush.size));
+
+        thumbs.forget_saved_files();
+        assert!(thumbs.saved_brush_previews.is_empty());
+    }
+
+    #[test]
+    fn session_brush_waits_for_thumbnail_budget_before_cloning_settings() {
+        let context = egui::Context::default();
+        let mut thumbs = Thumbs::default();
+        thumbs.budget = (context.cumulative_pass_nr(), PER_FRAME);
+
+        assert!(thumbs.session_brush(&context, "First deferred", &BrushSettings::default(), &ImageStore::new()).is_none());
+        assert!(thumbs.session_brush(&context, "Second deferred", &BrushSettings::default(), &ImageStore::new()).is_none());
+        assert!(thumbs.saved_brush_previews.is_empty());
     }
 
     #[test]

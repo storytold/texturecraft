@@ -3,10 +3,12 @@
 use egui::{RichText, Ui};
 use egui_phosphor::regular as ic;
 use serde_json::{Value, json};
-use texturecraft_engine::core::{BakedMap, CurvatureDetail, CurvatureMode, Generator, GeneratorKind, LayerId, OutputResolution, ResolutionMode, Source};
+use texturecraft_engine::core::{
+    BakedMap, CurvatureDetail, CurvatureMode, Generator, GeneratorKind, LayerId, MicroDetail, OutputResolution, ResolutionMode, Source,
+};
 
 use crate::TextureCraftApp;
-use crate::dock::{anchor_label, anchors_below, image_drop, image_menu, mesh_map_color};
+use crate::dock::{anchor_entries, anchor_label, anchors_below, effect_anchors_below, image_drop, image_menu, mesh_map_color};
 use crate::i18n::{baked_map_label, tr, trf};
 use crate::theme::{Tokens, caption};
 use crate::widgets::{combo, section, slider_edit};
@@ -47,6 +49,9 @@ pub(crate) fn generator_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer
         if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear) {
             curvature_detail_properties(app, ui, id, generator.detail.as_ref());
         }
+        if !matches!(generator.kind, GeneratorKind::ThinAreas | GeneratorKind::Position | GeneratorKind::Direction) {
+            micro_detail_properties(app, ui, id, generator.micro, layer);
+        }
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(tr("Restore defaults")).clicked() {
@@ -66,6 +71,34 @@ pub(crate) fn generator_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer
         ui.label(
             RichText::new(format!("{} {}", ic::WARNING, tr("Bake mesh maps (F8) for curvature, AO and thickness based generators."))).color(tokens.warning),
         );
+    }
+}
+
+/// The painted height anchor and its influence on this generator
+fn micro_detail_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, micro: Option<MicroDetail>, layer: LayerId) {
+    let tokens = Tokens::get(ui.ctx());
+    ui.label(caption(tr("Micro detail")))
+        .on_hover_text(tr("Painted height from an anchor point below: raised areas read as edges, recessed ones as cavities."));
+    let anchors = effect_anchors_below(app, layer, LayerId(id));
+    let current = match micro {
+        Some(detail) => anchors.iter().find(|(anchor, _)| *anchor == detail.anchor).map_or_else(|| tr("missing").to_string(), |(_, label)| label.clone()),
+        None => tr("None").to_string(),
+    };
+    combo(ui, tr("Anchor point"), current, |ui| {
+        if ui.selectable_label(micro.is_none(), tr("None")).clicked() {
+            app.run("effect.set", json!({"effect": id, "microAnchor": null}));
+        }
+        if let Some(anchor) = anchor_entries(ui, &anchors, micro.map(|detail| detail.anchor)) {
+            app.run("effect.set", json!({"effect": id, "microAnchor": anchor.0}));
+        }
+    });
+    if let Some(detail) = micro {
+        let mut amount = detail.amount;
+        if let Some(merge) = slider_edit(ui, tr("Amount"), &mut amount, 0.0..=1.0, 2) {
+            app.run("effect.set", json!({"effect": id, "microAmount": amount, "merge": merge}));
+        }
+    } else if anchors.is_empty() {
+        ui.label(RichText::new(tr("Add an anchor point to a layer below to use its height as micro detail.")).color(tokens.text_dim));
     }
 }
 
@@ -251,6 +284,7 @@ fn defaults_of(id: u64, kind: GeneratorKind) -> Value {
         "resolution": format!("{:?}", defaults.resolution.mode),
         "customResolution": defaults.resolution.custom,
         "resolutionFactor": defaults.resolution.factor,
+        "microAnchor": null,
     });
     if let Some(detail) = defaults.detail {
         params["mode"] = json!(format!("{:?}", detail.mode));

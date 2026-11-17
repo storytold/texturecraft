@@ -13,7 +13,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   and angle.
   **67 procedural brush alphas** in their own shelf tab, or any imported image as the alpha.
   **18 brush presets** (basic, wear and grunge, details) in the shelf's Brushes tab set the
-  stroke and keep the size; save your own brushes there too.
+  stroke and keep the size. The Brush section's **Brush presets** popover (and the shelf) also keeps
+  your own: save the current brush, click to use it, rename, replace or delete it.
 - **Tools:** paint, eraser, **projection** with image stencils (hold S to move, turn and scale the
   stencil), polygon fill (triangle, UV island or the whole mesh), **path** and **lasso fill**, a
   **particle brush**, **smudge**, **clone** (V + click sets the source), material picker, Shift+click
@@ -42,7 +43,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   blur, directional and slope blur, sharpen, high pass, bevel, glow, warp, directional warp,
   mosaic and four material finishes), fills and paint. **Levels** shows a histogram of what it
   reads (the mask below it, or a content channel you pick) with its input range marked.
-  **Anchor points** record the stack at a layer so masks and fills higher up can react to it.
+  **Anchor points** record the stack at a layer (or, inside a mask, the mask value at that point)
+  so masks, fills and generators higher up can react to it; a generator can take an anchor's
+  painted height as **micro detail**. Double-click an effect to rename it.
 - **Masks** with a white or black background and a stack of effects: painted strokes, fills,
   **mesh-map generators** (edge wear, dirt, thin areas, curvature, AO, position and direction
   gradients, all with world-space noise), filters, ID color selection and compare. Alt+click a
@@ -82,6 +85,10 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   and images and a loose USD layer's textures are read from its folder and kept in the project.
   Reimport a changed mesh and your painted strokes stay on the surface. The
   `file.changeMesh` command (trusted local command API and the control channel) moves the project onto a different mesh file and keeps its layers.
+  **Edit › Project Configuration...** (desktop) does the same from the 3D MESH section: *Select...* picks the
+  file, *Reimport mesh* is ticked for you (or tick it alone to read the same file again), OK applies. *Import settings* decides whether painted
+  strokes follow the surface (on by default), and PROJECT SETTINGS sets the project's normal map format and
+  lists its UV tiles (read only; Texture Set Settings changes them).
 - **UDIM / UV tiles:** detected on import or switched on later, with a resolution per tile (blurs,
   other filters and height-to-normal slopes keep their size in UV space at any tile resolution)
   and one texture per tile on export (`$udim`).

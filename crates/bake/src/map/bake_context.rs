@@ -232,7 +232,8 @@ impl<'a> BakeContext<'a> {
         for (&map, output) in maps.iter().zip(outputs.iter_mut()) {
             *output = match map {
                 BakedMap::AmbientOcclusion => [traced.ao; 3],
-                BakedMap::BentNormal => pack(traced.bent.unwrap_or(surface.nrm)),
+                // In the low poly's tangent frame (OpenGL green), like the normal map
+                BakedMap::BentNormal => tangent_normal(low_surface, traced.bent.unwrap_or(surface.nrm)),
                 BakedMap::Thickness => [traced.thickness; 3],
                 BakedMap::Curvature if self.curvature_method == CurvatureMethod::NormalMap => [0.5; 3],
                 BakedMap::Curvature => [traced.curvature; 3],

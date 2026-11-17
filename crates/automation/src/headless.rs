@@ -71,7 +71,23 @@ fn join(dir: &str, name: &str) -> String {
 
 impl Headless {
     pub fn new(session: Session, fs: Filesystem) -> Headless {
-        // Bakes run here (CLI, MCP) cast their rays on the GPU when there is one.
+        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
+        let brush_dir = std::path::Path::new(&home).join("Documents").join("TextureCraft").join("brushes");
+        Self::new_with_brush_dir(session, fs, brush_dir)
+    }
+
+    fn new_with_brush_dir(mut session: Session, fs: Filesystem, brush_dir: std::path::PathBuf) -> Headless {
+        if matches!(fs, Filesystem::TrustedLocal) && session.brush_presets.dir.is_none() {
+            let warnings = session.load_brush_presets(brush_dir);
+            session.log.extend(warnings.into_iter().map(|warning| format!("Brush preset skipped: {warning}")));
+        } else if !matches!(fs, Filesystem::TrustedLocal) {
+            session.brush_presets.dir = None;
+            for preset in &mut session.brush_presets.list {
+                preset.file = None;
+            }
+        }
+
+        // CLI and MCP bakes use GPU rays when available
         texturecraft_engine::bake::install_gpu_tracer(std::sync::Arc::new(texturecraft_render::gpu_bake::GpuBaker::new()));
         Headless { session, fs, gpu: None }
     }
@@ -124,10 +140,9 @@ impl Headless {
         }
     }
 
-    /// Replace the session, keeping the viewport size scripted strokes use.
-    fn replace(&mut self, mut next: Session) -> Value {
-        next.viewport = self.session.viewport;
-        self.session = next;
+    /// Replace the project, keeping the viewport size and user libraries.
+    fn replace(&mut self, next: Session) -> Value {
+        self.session.switch_to(next);
         self.inspect()
     }
 
@@ -375,4 +390,67 @@ pub fn batch_reply(results: Vec<Value>, failed: Option<(usize, &str, String)>) -
         "results": results,
         "failed": failed.map(|(index, id, error)| json!({ "index": index, "id": id, "error": error })),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_headless_session_loads_saved_brushes() {
+        let brush_dir = std::env::temp_dir().join(format!("tc-headless-brush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&brush_dir);
+
+        let mut first_client = Headless::new_with_brush_dir(Headless::default_session().unwrap(), Filesystem::TrustedLocal, brush_dir.clone());
+        first_client.command_run("brush.preset.store", json!({"name": "Ink"})).unwrap();
+        let mut restarted_client = Headless::new_with_brush_dir(Headless::default_session().unwrap(), Filesystem::TrustedLocal, brush_dir.clone());
+
+        let listed = restarted_client.command_run("brush.preset.list", Value::Null).unwrap();
+        assert!(listed.as_array().unwrap().iter().any(|item| item["label"] == "Ink"));
+        restarted_client.command_run("brush.preset.apply", json!({"preset": "Ink"})).unwrap();
+        let _ = std::fs::remove_dir_all(&brush_dir);
+    }
+
+    #[test]
+    fn headless_project_switch_keeps_saved_brushes() {
+        let brush_dir = std::env::temp_dir().join(format!("tc-headless-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&brush_dir);
+
+        let mut client = Headless::new_with_brush_dir(Headless::default_session().unwrap(), Filesystem::TrustedLocal, brush_dir.clone());
+        client.command_run("brush.preset.store", json!({"name": "Ink"})).unwrap();
+        client.replace(Headless::default_session().unwrap());
+
+        let listed = client.command_run("brush.preset.list", Value::Null).unwrap();
+        assert!(listed.as_array().unwrap().iter().any(|item| item["label"] == "Ink"));
+        let _ = std::fs::remove_dir_all(&brush_dir);
+    }
+
+    #[test]
+    fn untrusted_headless_keeps_brushes_in_memory_only() {
+        let brush_dir = std::env::temp_dir().join(format!("tc-headless-denied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&brush_dir);
+        let mut trusted_client = Headless::new_with_brush_dir(Headless::default_session().unwrap(), Filesystem::TrustedLocal, brush_dir.clone());
+        trusted_client.command_run("brush.preset.store", json!({"name": "Ink"})).unwrap();
+
+        let mut untrusted_client = Headless::new_with_brush_dir(Headless::default_session().unwrap(), Filesystem::Denied, brush_dir.clone());
+
+        assert!(untrusted_client.session.brush_presets.dir.is_none());
+        assert!(untrusted_client.session.brush_presets.list.is_empty());
+        let listed = untrusted_client.command_run("brush.preset.list", Value::Null).unwrap();
+        assert!(!listed.as_array().unwrap().iter().any(|item| item["label"] == "Ink"));
+        untrusted_client.command_run("brush.preset.store", json!({"name": "Session only"})).unwrap();
+        assert!(untrusted_client.session.brush_presets.find("Session only").is_some());
+        assert!(!brush_dir.join("Session_only.tcbrush").exists());
+
+        let mut preloaded_session = Headless::default_session().unwrap();
+        preloaded_session.load_brush_presets(brush_dir.clone());
+        let mut preloaded_client = Headless::new_with_brush_dir(preloaded_session, Filesystem::Denied, brush_dir.clone());
+        assert!(preloaded_client.session.brush_presets.dir.is_none());
+        assert!(preloaded_client.session.brush_presets.list.iter().all(|preset| preset.file.is_none()));
+        preloaded_client.command_run("brush.preset.store", json!({"name": "Still private"})).unwrap();
+        assert!(!brush_dir.join("Still_private.tcbrush").exists());
+        preloaded_client.command_run("brush.preset.delete", json!({"name": "Ink"})).unwrap();
+        assert!(brush_dir.join("Ink.tcbrush").exists());
+        let _ = std::fs::remove_dir_all(&brush_dir);
+    }
 }

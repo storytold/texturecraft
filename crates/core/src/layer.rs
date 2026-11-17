@@ -9,12 +9,14 @@ use crate::{BakedMap, BlendMode, Channel, ChannelKind, lum};
 mod curvature_detail;
 mod curvature_mode;
 mod generator_global;
+mod micro_detail;
 mod output_resolution;
 mod resolution_mode;
 
 pub use curvature_detail::CurvatureDetail;
 pub use curvature_mode::CurvatureMode;
 pub use generator_global::GeneratorGlobal;
+pub use micro_detail::MicroDetail;
 pub use output_resolution::OutputResolution;
 pub use resolution_mode::ResolutionMode;
 
@@ -578,6 +580,9 @@ pub struct Generator {
     /// What an input reads instead of its mesh map (an image, a uniform value or an anchor); inputs not listed read their mesh map.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<BakedMap, Source>,
+    /// Painted height read from an anchor point below, added as micro detail (None: baked maps only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro: Option<MicroDetail>,
 }
 
 impl Generator {
@@ -615,6 +620,7 @@ impl Generator {
             global: GeneratorGlobal::default(),
             resolution: OutputResolution::default(),
             inputs: BTreeMap::new(),
+            micro: None,
         }
     }
 
@@ -1027,8 +1033,10 @@ pub enum EffectKind {
     /// Content only: a material fill (one source per channel; channels without a source are
     /// left as they are).
     Material(Fill),
-    /// Content only: records the composited stack right after its layer (that layer and
-    /// everything below) so masks and fills above can read it ([`Source::Anchor`]).
+    /// Records the stack at its place so masks, fills and generators above can read it
+    /// ([`Source::Anchor`]). In a content stack it records the composited stack right after its
+    /// layer (that layer and everything below); in a mask, the mask value at that point (every
+    /// channel reads that gray).
     Anchor,
 }
 
@@ -1074,9 +1082,9 @@ impl EffectKind {
     /// both (`None`).
     pub fn content_only(&self) -> Option<bool> {
         match self {
-            EffectKind::Material(_) | EffectKind::Anchor => Some(true),
+            EffectKind::Material(_) => Some(true),
             EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection { .. } | EffectKind::Compare { .. } => Some(false),
-            EffectKind::Paint | EffectKind::Path(_) | EffectKind::Levels(_) | EffectKind::Filter(_) => None,
+            EffectKind::Paint | EffectKind::Path(_) | EffectKind::Levels(_) | EffectKind::Filter(_) | EffectKind::Anchor => None,
         }
     }
 
@@ -1090,7 +1098,7 @@ impl EffectKind {
         match self {
             EffectKind::Fill { source, .. } => source.anchor().is_some(),
             EffectKind::Material(fill) => fill.sources.values().any(|source| source.anchor().is_some()),
-            EffectKind::Generator(generator) => generator.inputs.values().any(|source| source.anchor().is_some()),
+            EffectKind::Generator(generator) => generator.micro.is_some() || generator.inputs.values().any(|source| source.anchor().is_some()),
             _ => false,
         }
     }
@@ -1103,13 +1111,19 @@ impl EffectKind {
             EffectKind::Generator(generator) => generator.inputs.values().collect(),
             _ => Vec::new(),
         };
-        sources
+        let mut anchors: Vec<_> = sources
             .into_iter()
             .filter_map(|source| match source {
                 Source::Anchor { anchor, channel } => Some((*anchor, *channel)),
                 _ => None,
             })
-            .collect()
+            .collect();
+        if let EffectKind::Generator(generator) = self
+            && let Some(micro) = generator.micro
+        {
+            anchors.push((micro.anchor, Channel::Height));
+        }
+        anchors
     }
 
     /// The image resources this effect's sources read (a fill, material or generator input).
@@ -1284,17 +1298,25 @@ mod tests {
 
     #[test]
     fn effect_targets_and_anchor_reads() {
-        assert_eq!(EffectKind::Anchor.content_only(), Some(true));
+        assert_eq!(EffectKind::Anchor.content_only(), None, "anchors go on content and masks");
         assert_eq!(EffectKind::Generator(Generator::new(GeneratorKind::Dirt)).content_only(), Some(false));
         assert_eq!(EffectKind::Filter(Filter::Invert).content_only(), None);
-        let mut l = Layer::new(LayerId(1), "l", LayerKind::Paint, &[Channel::BaseColor]);
-        assert!(!l.reads_anchor());
+        let mut fill_layer = Layer::new(LayerId(1), "l", LayerKind::Paint, &[Channel::BaseColor]);
+        assert!(!fill_layer.reads_anchor());
         let source = Source::Anchor { anchor: LayerId(9), channel: Channel::Height };
-        l.mask = Some(Mask {
+        fill_layer.mask = Some(Mask {
             effects: vec![Effect::new(LayerId(2), EffectKind::Fill { source, projection: Projection::default() })],
             ..Mask::new(MaskBackground::Black)
         });
-        assert!(l.reads_anchor());
+        assert!(fill_layer.reads_anchor());
+
+        // A generator with micro detail reads its anchor too
+        let mut generator_layer = Layer::new(LayerId(3), "g", LayerKind::Paint, &[Channel::BaseColor]);
+        let mut generator = Generator::new(GeneratorKind::Dirt);
+        generator.micro = Some(MicroDetail { anchor: LayerId(9), amount: 0.5 });
+        assert_eq!(EffectKind::Generator(generator.clone()).anchors_read(), [(LayerId(9), Channel::Height)]);
+        generator_layer.mask = Some(Mask { effects: vec![Effect::new(LayerId(4), EffectKind::Generator(generator))], ..Mask::new(MaskBackground::Black) });
+        assert!(generator_layer.reads_anchor());
     }
 
     #[test]

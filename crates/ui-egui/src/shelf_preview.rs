@@ -52,6 +52,12 @@ impl ShelfPreview {
         ShelfPreview::SavedBrush { path: path.to_path_buf(), settings, image }
     }
 
+    /// Preview a brush saved only in the current session
+    pub fn session_brush(name: &str, brush: &BrushSettings, images: &ImageStore) -> Self {
+        let image = brush.alpha_image.as_ref().and_then(|image_name| images.get(image_name)).cloned();
+        ShelfPreview::SavedBrush { path: session_brush_path(name), settings: Some(brush.clone()), image }
+    }
+
     /// Smart materials preview on the orb, plain materials on a sphere
     pub fn material(id: &'static str) -> ShelfPreview {
         match materials::find(id) {
@@ -91,12 +97,18 @@ impl ShelfPreview {
                 if settings.alpha_image.is_some() && image.is_none() {
                     return None;
                 }
+
                 Some(stroke_preview(settings, size, image.as_deref()))
             }
             ShelfPreview::Image(_, image) => Some(image_preview(image, size)),
             ShelfPreview::Environment(name) => Some(environment_image(name, size)),
         }
     }
+}
+
+/// A cache key for a preset without a file
+pub(crate) fn session_brush_path(name: &str) -> PathBuf {
+    PathBuf::from(format!("memory:{name}"))
 }
 
 /// A saved brush preset's settings; None when the file can't be read (or in the browser, which has no files)
@@ -110,7 +122,11 @@ pub(crate) fn read_saved_brush(path: &std::path::Path) -> Option<BrushSettings> 
         return None;
     }
 
-    serde_json::from_slice::<BrushSettings>(&bytes).ok().map(|settings| settings.sanitized())
+    serde_json::from_slice::<texturecraft_engine::brush_preset_cmds::UserBrush>(&bytes)
+        .map(|preset| preset.brush)
+        .or_else(|_| serde_json::from_slice::<BrushSettings>(&bytes))
+        .ok()
+        .map(|settings| settings.sanitized())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -126,6 +142,22 @@ mod tests {
     use texturecraft_engine::paint::presets::PRESETS;
 
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn named_brush_files_render_their_saved_settings() {
+        use texturecraft_engine::brush_preset_cmds::UserBrush;
+
+        let path = std::env::temp_dir().join(format!("tc-named-preview-{}.tcbrush", std::process::id()));
+        let mut brush = BrushSettings::default();
+        brush.size = 0.07;
+        let preset = UserBrush { name: "Ink".into(), brush: brush.clone(), channels: None, file: None };
+        std::fs::write(&path, serde_json::to_vec(&preset).unwrap()).unwrap();
+
+        let loaded = read_saved_brush(&path).unwrap();
+        assert_eq!(loaded.size, brush.size);
+        let _ = std::fs::remove_file(path);
+    }
 
     /// The hover preview's size at 100 % scale
     const BIG_PX: usize = 256;

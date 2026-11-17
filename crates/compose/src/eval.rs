@@ -11,8 +11,8 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use texturecraft_core::{
     BakedMap, BlendMode, BlockScales, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Fill, Filter, Generator,
-    GeneratorKind, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source, TextureSet, TileGrid, blend1,
-    blend3, lum, mix3, per_unit,
+    GeneratorKind, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, MicroDetail, NormalFormat, Project, Projection, Source, TextureSet, TileGrid,
+    blend1, blend3, lum, mix3, per_unit,
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer};
@@ -205,6 +205,8 @@ enum Content<'a> {
 }
 
 struct EffectPlan<'a> {
+    /// The effect id (an anchor point records under it).
+    id: LayerId,
     kind: &'a EffectKind,
     blend: BlendMode,
     opacity: f32,
@@ -212,6 +214,8 @@ struct EffectPlan<'a> {
     preview: bool,
     /// The curvature detail sizes a generator with detail reads.
     curvature_sizes: Option<Arc<CurvatureSizes>>,
+    /// A filtered mask stage retained because an anchor above it records that stage.
+    filtered_mask: Option<&'a Field>,
 }
 
 struct MaskPlan<'a> {
@@ -231,6 +235,8 @@ pub struct Field {
     h: u32,
     comps: usize,
     data: Vec<f32>,
+    /// Intermediate mask stages needed by anchors, owned by this drawn layer's final field.
+    anchor_stages: Vec<(LayerId, Field)>,
 }
 
 impl Field {
@@ -318,6 +324,22 @@ fn neighbourhood_filters(effects: &[Effect], res: u32) -> impl Iterator<Item = (
             Some((index, texels(*radius), Op::Slope { scale: *scale, seed: *seed }))
         }
         _ => None,
+    })
+}
+
+/// Whether any mask or content effect in a texture set reads neighbouring texels. Includes
+/// filters, blurred generators and reduced-resolution generators. Hidden layers and disabled
+/// masks count too, so partial invalidation remains conservative.
+pub fn stack_reads_neighbours(project: &Project, texture_set_index: usize) -> bool {
+    const NEIGHBOUR_PROBE_RESOLUTION: u32 = 2048;
+
+    let Some(set) = project.texture_sets.get(texture_set_index) else {
+        return false;
+    };
+
+    project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)).any(|layer| {
+        neighbourhood(&layer.content_effects, NEIGHBOUR_PROBE_RESOLUTION).is_some()
+            || layer.mask.as_ref().is_some_and(|mask| neighbourhood(&mask.effects, NEIGHBOUR_PROBE_RESOLUTION).is_some())
     })
 }
 
@@ -498,7 +520,7 @@ fn blur_rows(data: &mut [i64], w: usize, r: usize) {
 fn box_line(src: &[i64], dst: &mut [i64], r: usize) {
     let n = (2 * r + 1) as i64;
 
-    // Rounded division of a window sum
+    // Rounded division of a window sum.
     let avg = |acc: i64| (2 * acc + n).div_euclid(2 * n);
     let mut acc: i64 = src.iter().take(r + 1).sum();
     for (i, d) in dst.iter_mut().enumerate() {
@@ -597,13 +619,31 @@ fn field(inp: &Inputs, channels: &[Channel], below: &Fields, id: LayerId, job: J
     }
 
     let mut previous: Option<(usize, Field)> = None;
+    let mut anchor_stages = Vec::new();
     for (&filter, &margin) in filters.iter().zip(&margins) {
         let region = region_around(inp, tiles, margin)?;
         let start = previous.as_ref().map(|(index, field)| (*index, field));
         let filtered = filter_region(inp, channels, below, id, job, effects, filter, region, start)?;
+
+        // Preserve only stages with anchors before the next filter overwrites their value
+        if let Some((previous_index, previous_field)) = previous.take()
+            && matches!(job, Job::Mask(_))
+        {
+            let mut visible = effects.iter().filter(|effect| effect.visible).skip(previous_index);
+            let previous_effect = visible.next();
+            let records_anchor = visible.take(filter.0 - previous_index - 1).any(|effect| matches!(effect.kind, EffectKind::Anchor));
+            if records_anchor && let Some(previous_effect) = previous_effect {
+                anchor_stages.push((previous_effect.id, previous_field));
+            }
+        }
+
         previous = Some((filter.0, filtered));
     }
-    previous.map(|(_, field)| field)
+
+    previous.map(|(_, mut field)| {
+        field.anchor_stages = anchor_stages;
+        field
+    })
 }
 
 /// The tile-aligned texel region `(x0, y0, w, h)` around `tiles` plus `margin` tiles, clipped to the set.
@@ -744,6 +784,7 @@ fn filter_region(
             let texture_set = inputs.project.texture_set(inputs.ts).map_or(inputs.tile_res(), |set| set.resolution);
             return generator_region(generator, blend, opacity, &stack_values, &cover, (region_x, region_y, width, height), (tile_resolution, texture_set));
         }
+
         let scaled_radius = neighbourhood_filters(effects, tile_resolution)
             .find(|filter| filter.0 == index)
             .map_or(radius_texels, |filter| filter.1.round().clamp(1.0, radius_texels as f32) as u32);
@@ -769,6 +810,7 @@ fn filter_region(
                     let result = match op {
                         Op::Blur(Some(amount)) => original + amount * (original - blurred),
                         Op::HighPass if component < 3 => original - blurred + middle * coverage,
+
                         // Away from 0 by at most the value itself: 0 at the edge, full inside
                         Op::Bevel if component < 3 => original.signum() * original.abs().min((2.0 * blurred * original.signum() - original.abs()).max(0.0)),
                         Op::Glow(amount) if component < 3 => original + amount * blurred,
@@ -809,7 +851,7 @@ fn filter_region(
     }
 
     unpremultiply(&mut result, field_components);
-    Some(Field { x0: region_x, y0: region_y, w: width, h: height, comps: field_components, data: result })
+    Some(Field { x0: region_x, y0: region_y, w: width, h: height, comps: field_components, data: result, anchor_stages: Vec::new() })
 }
 
 /// The mask over a region after a generator at its own resolution and blur: `stack` is (stack below, generator ramp) per texel, sizes in texels per side.
@@ -1035,12 +1077,14 @@ fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tile_x: u32, tile_y
                 _ => None,
             };
             EffectPlan {
+                id: effect.id,
                 kind: &effect.kind,
                 blend: effect.blend,
                 opacity: effect.opacity,
                 data: if effect.kind.painted() { tile_of(inp, image, tile_x, tile_y, channel) } else { None },
                 preview: previews(inp, target),
                 curvature_sizes,
+                filtered_mask: None,
             }
         })
         .collect()
@@ -1073,9 +1117,15 @@ fn mask_plan<'a>(inp: &Inputs<'a>, id: LayerId, mask: &'a Mask, tx: u32, ty: u32
     if !mask.enabled {
         return None;
     }
+
     let background = if mask.background == MaskBackground::White { 1.0 } else { 0.0 };
-    let effects = effect_plans(inp, &mask.effects, tx, ty, None);
-    let start = fields.and_then(|f| f.get(&FieldKey::Mask(id))).and_then(|field| neighbourhood(&mask.effects, inp.gbuf.width).map(|(k, _, _)| (k, field)));
+    let mut effects = effect_plans(inp, &mask.effects, tx, ty, None);
+    let filtered = fields.and_then(|fields| fields.get(&FieldKey::Mask(id)));
+    for effect in &mut effects {
+        effect.filtered_mask = filtered.and_then(|field| field.anchor_stages.iter().find(|(id, _)| *id == effect.id).map(|(_, field)| field));
+    }
+
+    let start = filtered.and_then(|field| neighbourhood(&mask.effects, inp.gbuf.width).map(|(index, _, _)| (index, field)));
     Some(MaskPlan { background, effects, start })
 }
 
@@ -1100,11 +1150,13 @@ fn plan_node<'a>(
     kids: bool,
 ) -> Option<Node<'a>> {
     let own: &'a Layer = inp.project.layers.get(&id)?;
-    // Instances draw their source's content (a missing source draws nothing).
+
+    // Instances draw their source's content (a missing source draws nothing)
     let layer: &'a Layer = inp.project.content_layer(id)?;
     if !own.visible {
         return None;
     }
+
     let paint = matches!(layer.kind, LayerKind::Paint);
     let fx = !layer.is_group() && layer.content_effects.iter().any(|e| e.visible);
     let fx_start = if fx { neighbourhood(&layer.content_effects, inp.gbuf.width).map(|n| n.0) } else { None };
@@ -1115,6 +1167,7 @@ fn plan_node<'a>(
             if b.mode == BlendMode::Disable || b.opacity <= 0.0 {
                 return None;
             }
+
             let data = if paint { tile_of(inp, inp.pixels.layer(layer.id, *c), tx, ty, Some(*c)) } else { None };
             let effects = if fx { effect_plans(inp, &layer.content_effects, tx, ty, Some(*c)) } else { Vec::new() };
             let start = fx_start.zip(fields.and_then(|f| f.get(&FieldKey::Content(id, *c))));
@@ -1125,23 +1178,31 @@ fn plan_node<'a>(
         LayerKind::Paint => Content::Paint { preview: previews(inp, PaintTarget::Layer(layer.id)) },
         LayerKind::Fill(f) => Content::Fill(f),
         LayerKind::Group { children, .. } => Content::Group(if kids { plan(inp, children, channels, tx, ty, depth + 1, fields) } else { Vec::new() }),
-        // `content_layer` already followed instance links.
+
+        // `content_layer` already followed instance links
         LayerKind::Instance { .. } => return None,
     };
-    // A paint layer with nothing painted (and not being painted) or added by its content
-    // effects contributes nothing.
+    let mask = layer_mask(inp.project, id).and_then(|m| mask_plan(inp, id, m, tx, ty, fields));
+
+    // Anchors in the mask record even where the layer draws nothing
+    let mask_anchor = mask.as_ref().is_some_and(|m| m.effects.iter().any(|e| matches!(e.kind, EffectKind::Anchor)));
+
+    // An empty paint layer still matters if its mask records an anchor
     if let Content::Paint { preview: false } = content
         && chans.iter().all(|c| c.data.is_none() && c.effects.is_empty())
+        && !mask_anchor
     {
         return None;
     }
-    if chans.is_empty() {
+
+    if chans.is_empty() && !mask_anchor {
         return None;
     }
-    let mask = layer_mask(inp.project, id).and_then(|m| mask_plan(inp, id, m, tx, ty, fields));
+
     let anchors = if fx { anchor_cuts(&layer.content_effects) } else { Vec::new() };
-    let has_anchor = !anchors.is_empty() || matches!(&content, Content::Group(nodes) if nodes.iter().any(|n| n.has_anchor));
-    // The geometry mask is the layer's own (an instance in another set has other parts).
+    let has_anchor = !anchors.is_empty() || mask_anchor || matches!(&content, Content::Group(nodes) if nodes.iter().any(|n| n.has_anchor));
+
+    // The geometry mask is the layer's own (an instance in another set has other parts)
     let parts = own.geometry_mask.as_ref().map(|names| inp.mesh.submeshes.iter().map(|s| names.contains(&s.name)).collect());
     Some(Node { id, content, chans, mask, anchors, has_anchor, height_mask: layer.height_mask, parts })
 }
@@ -1379,33 +1440,39 @@ impl<'a, 'b> Texel<'a, 'b> {
                 let rgb = [sum[0], sum[1], sum[2]];
                 match kind {
                     ChannelKind::Color if image.srgb => rgb.map(texturecraft_texel::srgb_to_linear),
+
                     // Normal channels are OpenGL (+Y up the image): a DirectX image's green flips
                     ChannelKind::NormalMap if *normal_format == NormalFormat::DirectX => [rgb[0], 1.0 - rgb[1], rgb[2]],
                     ChannelKind::Color | ChannelKind::NormalMap => rgb,
+
                     // A one-value channel or mask reads the image's gray, so a color image works as a mask
                     ChannelKind::Scalar => [lum(rgb); 3],
                     ChannelKind::Signed => [lum(rgb) * 2.0 - 1.0; 3],
                 }
             }
-            Source::Anchor { anchor, channel } => {
-                // An anchor not evaluated yet (above this layer, hidden) reads the channel default
-                let anchored = self.anchors.iter().rev().find(|(id, _)| id == anchor).and_then(|(_, values)| values.get(channel.index()).copied());
-                let value = anchored.unwrap_or_else(|| channel.default_value());
-                let gray = matches!(channel.kind(), ChannelKind::Color | ChannelKind::NormalMap) && matches!(kind, ChannelKind::Scalar | ChannelKind::Signed);
-                if gray { [lum(value); 3] } else { value }
-            }
+            Source::Anchor { anchor, channel } => self.anchor_value(*anchor, *channel, kind),
         }
     }
 
-    /// The generator's ramp at this texel, before its global blur, balance, contrast and invert.
+    /// The value anchor point `anchor` recorded for `channel`, read as `kind` (colors read as gray
+    /// where a scalar is needed). An anchor not evaluated yet (above this layer, hidden) reads the
+    /// channel default.
+    fn anchor_value(&self, anchor: LayerId, channel: Channel, kind: ChannelKind) -> [f32; 3] {
+        let value = self.anchors.iter().rev().find(|(id, _)| *id == anchor).and_then(|(_, channels)| channels.get(channel.index()).copied());
+        let value = value.unwrap_or_else(|| channel.default_value());
+        let needs_gray = matches!(channel.kind(), ChannelKind::Color | ChannelKind::NormalMap) && matches!(kind, ChannelKind::Scalar | ChannelKind::Signed);
+        if needs_gray { [lum(value); 3] } else { value }
+    }
+
     fn generator_ramp(&mut self, generator: &Generator, curvature_sizes: Option<&CurvatureSizes>) -> f32 {
         let coords = self.coords();
+        let micro = generator.micro.map_or(0.0, |micro| self.micro_detail(generator.kind, micro));
         let signal = match (generator.kind, &generator.detail) {
             (GeneratorKind::Curvature | GeneratorKind::EdgeWear, Some(detail)) => {
                 // Detail sizes are blurred copies of the mesh map, so a replaced curvature input reads at its own size only
                 let sizes = if generator.inputs.contains_key(&BakedMap::Curvature) { None } else { curvature_sizes };
                 let curvature = self.generator_input(generator, BakedMap::Curvature);
-                self.curvature_detail(detail, sizes, curvature)
+                self.curvature_detail(detail, sizes, curvature, micro)
             }
             (GeneratorKind::EdgeWear, None) => (self.generator_input(generator, BakedMap::Curvature).unwrap_or(0.5) - 0.5) * 2.0,
             (GeneratorKind::Curvature, None) => self.generator_input(generator, BakedMap::Curvature).unwrap_or(0.5),
@@ -1415,6 +1482,8 @@ impl<'a, 'b> Texel<'a, 'b> {
             (GeneratorKind::Position, _) => coords.pos.dot(Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
             (GeneratorKind::Direction, _) => coords.nrm.dot(Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
         };
+        let signal =
+            if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear) && generator.detail.is_some() { signal } else { signal + micro };
         let signal = if generator.noise_amount > 0.0 {
             let noise = world_noise(coords.pos, generator.noise_scale, generator.seed);
             if let (GeneratorKind::Curvature | GeneratorKind::EdgeWear, Some(detail)) = (generator.kind, &generator.detail) {
@@ -1435,6 +1504,22 @@ impl<'a, 'b> Texel<'a, 'b> {
         ramp * ramp * (3.0 - 2.0 * ramp)
     }
 
+    /// How a generator's micro detail moves its signal at this texel: the anchor's height (0 where
+    /// the anchor is not evaluated yet) as an edge where raised and a cavity where recessed.
+    fn micro_detail(&self, kind: GeneratorKind, micro: MicroDetail) -> f32 {
+        let height = self.anchor_value(micro.anchor, Channel::Height, ChannelKind::Signed)[0];
+        let amount = if micro.amount.is_finite() { micro.amount.clamp(0.0, 1.0) } else { 0.0 };
+        let response = height.clamp(-1.0, 1.0) * amount;
+        match kind {
+            GeneratorKind::Curvature | GeneratorKind::EdgeWear => response,
+
+            // Dirt gathers in dents; dents are occluded
+            GeneratorKind::Dirt => -response,
+            GeneratorKind::AmbientOcclusion => response,
+            GeneratorKind::ThinAreas | GeneratorKind::Position | GeneratorKind::Direction => 0.0,
+        }
+    }
+
     /// The generator's value at this texel: its ramp finished by balance, contrast, invert and offset (its blur and resolution need neighbours: see [`generator_region`]).
     fn generator(&mut self, generator: &Generator, curvature_sizes: Option<&CurvatureSizes>) -> f32 {
         let ramp = self.generator_ramp(generator, curvature_sizes);
@@ -1450,15 +1535,19 @@ impl<'a, 'b> Texel<'a, 'b> {
     }
 
     /// The curvature of `detail`'s mode at this texel from `curvature` (None: nothing to read), with its blurred detail sizes when given.
-    fn curvature_detail(&self, detail: &CurvatureDetail, curvature_sizes: Option<&CurvatureSizes>, curvature: Option<f32>) -> f32 {
-        let combine = |edges: f32, cavities: f32| match detail.mode {
-            CurvatureMode::Edges => edges,
-            CurvatureMode::Cavities => cavities,
-            CurvatureMode::Both => 1.0 - (1.0 - edges) * (1.0 - cavities),
-            CurvatureMode::Raw => 0.5 + 0.5 * (edges - cavities),
+    fn curvature_detail(&self, detail: &CurvatureDetail, curvature_sizes: Option<&CurvatureSizes>, curvature: Option<f32>, micro: f32) -> f32 {
+        let combine = |edges: f32, cavities: f32| {
+            let edges = 1.0 - (1.0 - edges) * (1.0 - micro.max(0.0));
+            let cavities = 1.0 - (1.0 - cavities) * (1.0 + micro.min(0.0));
+            match detail.mode {
+                CurvatureMode::Edges => edges,
+                CurvatureMode::Cavities => cavities,
+                CurvatureMode::Both => 1.0 - (1.0 - edges) * (1.0 - cavities),
+                CurvatureMode::Raw => 0.5 + 0.5 * (edges - cavities),
+            }
         };
 
-        // Without curvature to read the texel is flat: no edges or cavities
+        // Without baked curvature, only painted micro height supplies edges or cavities
         let Some(curvature) = curvature else { return combine(0.0, 0.0) };
 
         let working_size = (self.res, self.inp.gbuf.height);
@@ -1493,11 +1582,28 @@ impl<'a, 'b> Texel<'a, 'b> {
             skip = filtered_index + 1;
         }
 
-        for effect in plan.effects.iter().skip(skip) {
+        // Replay the prefix to record anchors skipped by the precomputed filter
+        if let Some(last) = plan.effects.iter().take(skip).rposition(|e| matches!(e.kind, EffectKind::Anchor)) {
+            self.mask_effects(plan, plan.background, 0, last + 1);
+        }
+        self.mask_effects(plan, value, skip, plan.effects.len())
+    }
+
+    /// Mask effects `from..to` of `plan` over `value`, recording the anchors among them.
+    fn mask_effects(&mut self, plan: &MaskPlan, mut value: f32, from: usize, to: usize) -> f32 {
+        // Avoid amplifying rounding error when unpremultiplying faint paint
+        const MIN_PAINT_COVERAGE: f32 = 1e-5;
+
+        for effect in plan.effects.iter().take(to).skip(from) {
+            if let Some(filtered) = effect.filtered_mask.and_then(|field| field.get(self.x, self.y)).and_then(|texel| texel.first()) {
+                value = *filtered;
+                continue;
+            }
+
             let opacity = effect.opacity.clamp(0.0, 1.0);
             match effect.kind {
                 EffectKind::Paint | EffectKind::Path(_) => {
-                    let (mut painted, mut cov) = match effect.data.as_deref() {
+                    let (mut painted, mut coverage) = match effect.data.as_deref() {
                         Some(data) => (from_u16(data.get(self.o * 2).copied().unwrap_or(0)), from_u16(data.get(self.o * 2 + 1).copied().unwrap_or(0))),
                         None => (0.0, 0.0),
                     };
@@ -1507,15 +1613,15 @@ impl<'a, 'b> Texel<'a, 'b> {
                         let stroke = (self.stroke * preview.opacity).clamp(0.0, 1.0);
                         if preview.erase {
                             painted *= 1.0 - stroke;
-                            cov *= 1.0 - stroke;
+                            coverage *= 1.0 - stroke;
                         } else {
                             painted = preview.mask_value * stroke + painted * (1.0 - stroke);
-                            cov = stroke + cov * (1.0 - stroke);
+                            coverage = stroke + coverage * (1.0 - stroke);
                         }
                     }
-                    if cov > 0.0 {
-                        let layer_value = painted / cov.max(1e-5);
-                        value += (blend1(effect.blend, value, layer_value) - value) * cov * opacity;
+                    if coverage > 0.0 {
+                        let layer_value = painted / coverage.max(MIN_PAINT_COVERAGE);
+                        value += (blend1(effect.blend, value, layer_value) - value) * coverage * opacity;
                     }
                 }
                 EffectKind::Fill { source, projection } => {
@@ -1547,8 +1653,12 @@ impl<'a, 'b> Texel<'a, 'b> {
                     let result = if pass { 1.0 } else { 0.0 };
                     value += (result - value) * opacity;
                 }
+
+                // Every channel of a mask anchor reads the mask's gray
+                EffectKind::Anchor => self.anchors.push((effect.id, [[value.clamp(0.0, 1.0); 3]; NCH])),
+
                 // Content-only effects
-                EffectKind::Material(_) | EffectKind::Anchor => {}
+                EffectKind::Material(_) => {}
             }
         }
         value.clamp(0.0, 1.0)
@@ -2018,7 +2128,7 @@ fn composite_block(
     let level_count = split.map_or(0, <[Level]>::len);
     let defaults: Acc = Channel::ALL.map(Channel::default_value);
 
-    // Tiles split into bands of rows, so a handful of tiles still keeps every thread busy
+    // Tiles split into bands of rows, so a handful of tiles still keeps every thread busy.
     let bands = TILE / BAND;
     let tasks: Vec<((u32, u32), u32)> = tiles.iter().flat_map(|t| (0..bands).map(move |b| (*t, b))).collect();
     let mut results: Vec<BandResult> = tasks
@@ -2070,11 +2180,11 @@ fn composite_block(
                         any = true;
                         let mut texel = Texel::new(inp, x, y, tile_offset, stroke_at(preview_tile, tile_offset));
 
-                        // Reuse one anchor buffer per band
+                        // Reuse one anchor buffer per band.
                         texel.anchors = std::mem::take(&mut anchors);
                         match &levels {
                             Some(levels) => {
-                                // The texel's stream starts with the stack at each level
+                                // The texel's stream starts with the stack at each level.
                                 let start = match &mut tape {
                                     Tape::Record(t) => {
                                         t.resize(t.len() + slots, 0.0);
@@ -2115,7 +2225,7 @@ fn composite_block(
         })
         .collect();
 
-    // Join the bands of each tile (in parallel; uncovered tiles are freed)
+    // Join the bands of each tile (in parallel; uncovered tiles are freed).
     let joined: Vec<Joined> = results
         .par_chunks(bands as usize)
         .map(|parts| {
@@ -2142,7 +2252,7 @@ fn composite_block(
             }
         }
 
-        // Tiles without covered texels cost nothing to composite: not worth caching
+        // Tiles without covered texels cost nothing to composite: not worth caching.
         if any && let Some(bands) = parts.iter_mut().map(|p| p.1.take()).collect::<Option<Vec<Band>>>() {
             records.push(((tx, ty), bands));
         }
@@ -2606,49 +2716,71 @@ mod tests {
 
     #[test]
     fn retained_filter_buffers_release_after_the_last_tile() {
-        let mut fixture = fixture();
-        const RESOLUTION: u32 = 128;
-        fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, RESOLUTION, RESOLUTION);
-        fixture.project.texture_sets[0] = TextureSet::new("Plane", 0, RESOLUTION);
-        let layer = fill_layer(&mut fixture.project, [0.4; 3], 0.5);
-        let mut mask = Mask::new(MaskBackground::White);
-        mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0 })));
-        fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+        for resolution in [128, 512] {
+            for record_anchors in [false, true] {
+                let mut fixture = fixture();
+                fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, resolution, resolution);
+                fixture.project.texture_sets[0] = TextureSet::new("Plane", 0, resolution);
+                for color in [0.4, 0.2] {
+                    let layer = fill_layer(&mut fixture.project, [color; 3], 0.5);
+                    let mut mask = Mask::new(MaskBackground::White);
+                    for radius in [8.0, 4.0, 2.0] {
+                        mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius })));
+                        if record_anchors && radius != 2.0 {
+                            mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Anchor));
+                        }
+                    }
+                    fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+                }
 
-        let second_layer = fill_layer(&mut fixture.project, [0.2; 3], 0.7);
-        let mut second_mask = Mask::new(MaskBackground::White);
-        second_mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 4.0 })));
-        fixture.project.layer_mut(second_layer).unwrap().mask = Some(second_mask);
+                let images = ImageStore::default();
+                let input = Inputs {
+                    project: &fixture.project,
+                    ts: 0,
+                    mesh: &fixture.mesh,
+                    gbuf: &fixture.gbuf,
+                    pixels: &fixture.pixels,
+                    baked: &fixture.baked,
+                    block_scales: fixture.project.texture_sets[0].block_scales(),
+                    preview: None,
+                    images: &images,
+                    bounds: fixture.mesh.bounds(),
+                };
+                let mut output = Composite::new(&fixture.project.texture_sets[0].channel_list(), resolution);
+                let mut cache = BelowCache::default();
+                cache.ahead = all_tiles(resolution, resolution).into_iter().skip(1).collect();
 
-        let images = ImageStore::default();
-        let input = Inputs {
-            project: &fixture.project,
-            ts: 0,
-            mesh: &fixture.mesh,
-            gbuf: &fixture.gbuf,
-            pixels: &fixture.pixels,
-            baked: &fixture.baked,
-            block_scales: fixture.project.texture_sets[0].block_scales(),
-            preview: None,
-            images: &images,
-            bounds: fixture.mesh.bounds(),
-        };
-        let mut output = Composite::new(&fixture.project.texture_sets[0].channel_list(), RESOLUTION);
-        let mut cache = BelowCache::default();
-        cache.ahead = vec![(1, 0), (0, 1), (1, 1)];
+                composite_tiles_cached(&input, &mut output, &[(0, 0)], Some(&mut cache));
+                let retained = cache.held.as_ref().expect("filter fields should be retained while tiles follow");
+                let fields = || retained.fields.values().flat_map(|field| std::iter::once(field).chain(field.anchor_stages.iter().map(|(_, stage)| stage)));
+                let field_bytes: usize = fields().map(|field| field.data.capacity() * std::mem::size_of::<f32>()).sum();
+                let field_count = fields().count();
+                let stage_index_bytes: usize =
+                    retained.fields.values().map(|field| field.anchor_stages.capacity() * std::mem::size_of::<(LayerId, Field)>()).sum();
+                let weak_fields = Arc::downgrade(&retained.fields);
+                let expected_fields = if record_anchors { 6 } else { 2 };
+                assert_eq!(field_count, expected_fields, "only filter stages needed by anchors remain beside the final mask fields");
+                assert_eq!(field_bytes, expected_fields * resolution as usize * resolution as usize * std::mem::size_of::<f32>());
+                println!(
+                    "resolution: {resolution}, mask layers: 2, anchors: {record_anchors}, fields: {field_count}, buffer capacity: {field_bytes} bytes, stage-index capacity: {stage_index_bytes} bytes"
+                );
 
-        composite_tiles_cached(&input, &mut output, &[(0, 0)], Some(&mut cache));
-        let retained = cache.held.as_ref().expect("filter fields should be retained while tiles follow");
-        let field_bytes: usize = retained.fields.values().map(|field| field.data.capacity() * std::mem::size_of::<f32>()).sum();
-        let field_count = retained.fields.len();
-        let weak_fields = Arc::downgrade(&retained.fields);
-        assert_eq!(field_count, 2);
-        assert!(field_bytes > 0);
-        println!("retained fields: {field_count}, buffer capacity: {field_bytes} bytes");
+                cache.ahead.clear();
+                composite_tiles_cached(&input, &mut output, &[(1, 0)], Some(&mut cache));
+                assert!(weak_fields.upgrade().is_none(), "the last tile must release retained field buffers");
 
-        cache.ahead.clear();
-        composite_tiles_cached(&input, &mut output, &[(1, 0)], Some(&mut cache));
-        assert!(weak_fields.upgrade().is_none(), "the last tile must release retained field buffers");
+                cache.ahead = all_tiles(resolution, resolution).into_iter().skip(1).collect();
+                composite_tiles_cached(&input, &mut output, &[(0, 0)], Some(&mut cache));
+                let weak_fields = Arc::downgrade(&cache.held.as_ref().unwrap().fields);
+                cache.clear();
+                assert!(weak_fields.upgrade().is_none(), "invalidating the cache releases intermediate anchor stages too");
+
+                composite_tiles_cached(&input, &mut output, &[(0, 0)], Some(&mut cache));
+                let weak_fields = Arc::downgrade(&cache.held.as_ref().unwrap().fields);
+                drop(cache);
+                assert!(weak_fields.upgrade().is_none(), "dropping the cache releases a cancelled run's fields");
+            }
+        }
     }
 
     #[test]
@@ -3079,6 +3211,22 @@ mod tests {
     }
 
     #[test]
+    fn stack_reads_neighbours_sees_blurs_in_masks_and_content() {
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [1.0; 3], 1.0);
+        assert!(!stack_reads_neighbours(&f.project, 0));
+        let mut mask = Mask::new(MaskBackground::White);
+        let eid = f.project.alloc_id();
+        mask.effects.push(Effect::new(eid, EffectKind::Filter(Filter::Blur { radius: 8.0 })));
+        f.project.layer_mut(id).unwrap().mask = Some(mask);
+        assert!(stack_reads_neighbours(&f.project, 0));
+        f.project.layer_mut(id).unwrap().mask = None;
+        assert!(!stack_reads_neighbours(&f.project, 0));
+        content_fx(&mut f, id, EffectKind::Filter(Filter::Mosaic { size: 8.0 }));
+        assert!(stack_reads_neighbours(&f.project, 0));
+    }
+
+    #[test]
     fn blur_filter_softens_mask_edges() {
         let mut f = fixture();
         let id = fill_layer(&mut f.project, [1.0, 1.0, 1.0], 1.0);
@@ -3369,6 +3517,151 @@ soft {soft:?}"
         // An anchor above its reader is not evaluated yet: it reads the channel default (0).
         f.project.move_layer(low, 1).unwrap();
         assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.5; 3]));
+    }
+
+    /// A white fill layer on top whose mask reads `anchor` (any channel: a mask anchor is gray).
+    fn anchor_reader(fixture: &mut Fixture, anchor: LayerId) -> LayerId {
+        let top = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let source = Source::Anchor { anchor, channel: Channel::Roughness };
+        mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Fill { source, projection: Projection::default() }));
+        fixture.project.layer_mut(top).unwrap().mask = Some(mask);
+        top
+    }
+
+    #[test]
+    fn mask_anchors_record_the_mask_value_at_their_place() {
+        let mut fixture = fixture();
+        let low = fill_layer(&mut fixture.project, [0.0; 3], 0.5);
+        let (gray, anchor, full) = (fixture.project.alloc_id(), fixture.project.alloc_id(), fixture.project.alloc_id());
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(gray, EffectKind::Fill { source: Source::Uniform([0.4; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(anchor, EffectKind::Anchor));
+        mask.effects.push(Effect::new(full, EffectKind::Fill { source: Source::Uniform([1.0; 3]), projection: Projection::default() }));
+        fixture.project.layer_mut(low).unwrap().mask = Some(mask.clone());
+        anchor_reader(&mut fixture, anchor);
+
+        // The low layer shows fully (black), the top one at the 0.4 the anchor recorded
+        assert!(close(run(&fixture, None).value(Channel::BaseColor, 5, 5), [0.4; 3]));
+
+        // Under a blur precomputed over the region the anchor still records its own place
+        mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 })));
+        fixture.project.layer_mut(low).unwrap().mask = Some(mask.clone());
+        let color = run(&fixture, None).value(Channel::BaseColor, 5, 5);
+        assert!(close(color, [0.4; 3]), "{color:?}");
+
+        // An empty paint layer still records its mask anchor for the layer above
+        fixture.project.layer_mut(low).unwrap().kind = LayerKind::Paint;
+        let color = run(&fixture, None).value(Channel::BaseColor, 5, 5);
+        assert!(close(color, [0.7; 3]), "{color:?}");
+    }
+
+    #[test]
+    fn mask_anchor_between_filters_keeps_the_filtered_value() {
+        let mut fixture = fixture();
+        fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, 128, 128);
+        fixture.project.texture_sets[0].resolution = 128;
+        let lower = fill_layer(&mut fixture.project, [0.0; 3], 1.0);
+        let anchor = fixture.project.alloc_id();
+        let mut mask = Mask::new(MaskBackground::Black);
+        let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] };
+        mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Fill { source: checker, projection: Projection::default() }));
+        mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 64.0 })));
+        mask.effects.push(Effect::new(anchor, EffectKind::Anchor));
+        fixture.project.layer_mut(lower).unwrap().mask = Some(mask.clone());
+        let reader = anchor_reader(&mut fixture, anchor);
+        let texels: Vec<_> = (0..128).map(|x| (x, 63)).collect();
+        let expected = assert_sparse_mask_matches_image(&fixture, reader, &texels).unwrap();
+        assert!(expected.iter().any(|value| *value > 0.1 && *value < 0.9), "the anchor records a softened checker");
+
+        mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 128.0 })));
+        fixture.project.layer_mut(lower).unwrap().mask = Some(mask);
+        let actual = assert_sparse_mask_matches_image(&fixture, reader, &texels).unwrap();
+
+        assert_eq!(actual, expected, "a filter above the anchor must not change its recorded value");
+    }
+
+    #[test]
+    fn generator_micro_detail_follows_the_anchor_height() {
+        let mut fixture = fixture();
+        let low = fixture.project.alloc_id();
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::Height, Source::Uniform([0.5; 3]));
+        fixture.project.insert_layer(0, Layer::new(low, "Bumps", LayerKind::Fill(fill), &[Channel::Height]), None, false).unwrap();
+        let anchor = content_fx(&mut fixture, low, EffectKind::Anchor);
+        let top = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+        let mut generator = Generator { level: 0.5, softness: 0.5, noise_amount: 0.0, detail: None, ..Generator::new(GeneratorKind::Curvature) };
+        let with = |fixture: &mut Fixture, generator: &Generator| {
+            let mut mask = Mask::new(MaskBackground::Black);
+            mask.effects.push(Effect::new(LayerId(900), EffectKind::Generator(generator.clone())));
+            fixture.project.layer_mut(top).unwrap().mask = Some(mask);
+            run(fixture, None).value(Channel::BaseColor, 5, 5)[0]
+        };
+
+        // No curvature map: flat mid gray, so the mask is 0.5 and the base color 0.75
+        let flat = with(&mut fixture, &generator);
+        assert!((flat - 0.75).abs() < 0.02, "{flat}");
+
+        // Raised height reads as an edge
+        generator.micro = Some(MicroDetail { anchor, amount: 1.0 });
+        assert!(with(&mut fixture, &generator) > flat + 0.2);
+
+        // Recessed height reads as a cavity; dirt gathers there
+        if let LayerKind::Fill(fill) = &mut fixture.project.layer_mut(low).unwrap().kind {
+            fill.sources.insert(Channel::Height, Source::Uniform([-0.5; 3]));
+        }
+        assert!(with(&mut fixture, &generator) < flat - 0.2);
+        let dirt =
+            Generator { level: 0.5, softness: 0.5, noise_amount: 0.0, micro: Some(MicroDetail { anchor, amount: 1.0 }), ..Generator::new(GeneratorKind::Dirt) };
+        let plain = Generator { micro: None, ..dirt.clone() };
+        assert!(with(&mut fixture, &dirt) > with(&mut fixture, &plain) + 0.2);
+
+        // A hostile amount does nothing
+        generator.micro = Some(MicroDetail { anchor, amount: f32::NAN });
+        assert!((with(&mut fixture, &generator) - flat).abs() < 0.02);
+    }
+
+    #[test]
+    fn curvature_modes_classify_raised_and_recessed_micro_height() {
+        let mut fixture = fixture();
+        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64]))].into() };
+        let lower = fixture.project.alloc_id();
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::Height, Source::Uniform([0.5; 3]));
+        fixture.project.insert_layer(0, Layer::new(lower, "Bumps", LayerKind::Fill(fill), &[Channel::Height]), None, false).unwrap();
+        let anchor = content_fx(&mut fixture, lower, EffectKind::Anchor);
+        let top = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+
+        for kind in [GeneratorKind::Curvature, GeneratorKind::EdgeWear] {
+            for (height, mode, responds) in [
+                (0.5, CurvatureMode::Edges, true),
+                (-0.5, CurvatureMode::Edges, false),
+                (0.5, CurvatureMode::Cavities, false),
+                (-0.5, CurvatureMode::Cavities, true),
+                (0.5, CurvatureMode::Both, true),
+                (-0.5, CurvatureMode::Both, true),
+            ] {
+                if let LayerKind::Fill(fill) = &mut fixture.project.layer_mut(lower).unwrap().kind {
+                    fill.sources.insert(Channel::Height, Source::Uniform([height; 3]));
+                }
+                let detail = CurvatureDetail { mode, weights: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] };
+                let generator = Generator {
+                    level: 0.5,
+                    softness: 0.5,
+                    noise_amount: 0.0,
+                    detail: Some(detail),
+                    micro: Some(MicroDetail { anchor, amount: 1.0 }),
+                    ..Generator::new(kind)
+                };
+                let mut mask = Mask::new(MaskBackground::Black);
+                mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(generator)));
+                fixture.project.layer_mut(top).unwrap().mask = Some(mask);
+
+                let value = run(&fixture, None).value(Channel::BaseColor, 5, 5)[0];
+                let expected = if responds { 0.75 } else { 0.5 };
+                assert!((value - expected).abs() < 0.02, "{kind:?} {mode:?} height {height}: {value}");
+            }
+        }
     }
 
     #[test]

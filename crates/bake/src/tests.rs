@@ -3,7 +3,7 @@ use texturecraft_geom::{BaseColor, Bvh};
 
 use texturecraft_core::{
     AmbientOcclusionSettings, BakeAntialiasing, BakeResolution, BakeSettings, BentNormalSettings, CageSettings, CommonBakeSettings, CurvatureSettings,
-    PositionSettings,
+    MeshCurvatureSettings, PositionSettings,
 };
 
 use std::sync::atomic::Ordering::Relaxed;
@@ -13,6 +13,9 @@ use texturecraft_geom::glam::{Vec2, Vec3, Vec4};
 use texturecraft_geom::primitives;
 
 use super::*;
+
+#[path = "test/bent_normal_space.rs"]
+mod bent_normal_space;
 
 #[path = "test/cage_shell.rs"]
 mod cage_shell;
@@ -243,12 +246,67 @@ fn a_rounded_bevel_reads_the_same_at_any_map_size() {
         v.sort_by(f32::total_cmp);
         v.get(v.len() / 2).copied().unwrap_or(0.5)
     };
-    let (coarse, fine) = (peak(512), peak(1024));
-    assert!(coarse > 0.58, "bevel at 512: {coarse}");
-    assert!((coarse - fine).abs() < 0.1, "512: {coarse}, 1024: {fine}");
+    let (coarse, reference, fine) = (peak(512), peak(1024), peak(2048));
+    assert!(reference > 0.525, "bevel at 1024: {reference}");
+    // A texel-sized ring read this bevel 0.04 brighter at 512 and 0.02 darker at 2048
+    assert!((coarse - reference).abs() < 0.005 && (fine - reference).abs() < 0.005, "512: {coarse}, 1024: {reference}, 2048: {fine}");
 }
 
-fn check_box_curvature(m: &Mesh, edge: f32) {
+/// Median curvature on the sample crate's four upright body bevels, away from the top and bottom bevels
+fn crate_body_bevel(resolution: u32) -> f32 {
+    let mesh = primitives::crate_scene();
+    let mut parameters = settings(resolution, &[BakedMap::Curvature]);
+    parameters.maps.curvature.parameters.mesh.auto_tonemapping = MeshCurvatureSettings::default().auto_tonemapping;
+    let curvature = covered_values(&mesh, &run(&mesh, &parameters).unwrap(), BakedMap::Curvature);
+    let mut bevel: Vec<f32> =
+        curvature.iter().filter(|(p, _)| p.x.abs() > 1.1 && p.z.abs() > 0.7 && (0.3..1.3).contains(&p.y)).map(|(_, value)| *value).collect();
+    assert!(!bevel.is_empty());
+    bevel.sort_by(f32::total_cmp);
+    bevel.get(bevel.len() / 2).copied().unwrap_or(0.5)
+}
+
+#[test]
+fn the_sample_crate_bevels_read_the_same_at_512_1024_and_2048() {
+    let (coarse, reference, fine) = (crate_body_bevel(512), crate_body_bevel(1024), crate_body_bevel(2048));
+    // The smooth-shading ring is sized on the mesh (0.521 at 1024); a texel-sized ring read 0.531 at 512, 0.516 at 1024 and 0.508 at 2048
+    assert!((0.5196..0.5234).contains(&reference), "1024: {reference}");
+    assert!((coarse - reference).abs() < 0.002 && (fine - reference).abs() < 0.002, "512: {coarse}, 1024: {reference}, 2048: {fine}");
+}
+
+/// Median curvature of the sphere texels whose height `|y|` lies in `band`
+fn sphere_band(curvature: &[(Vec3, f32)], band: std::ops::Range<f32>) -> f32 {
+    median(curvature.iter().filter(|(p, _)| band.contains(&p.y.abs())).map(|(_, value)| *value).collect())
+}
+
+#[test]
+fn a_sphere_reads_the_same_wherever_its_uv_texels_are_larger_or_smaller() {
+    let full = primitives::sphere(1.0, 64, 32);
+    let mut half = full.clone();
+    half.uvs.iter_mut().for_each(|uv| *uv *= 0.5);
+    let mut parameters = settings(128, &[BakedMap::Curvature]);
+    // A narrow manual range, so the sphere's gentle curvature reads well above mid-grey
+    parameters.maps.curvature.parameters.mesh.value_min = -0.05;
+    parameters.maps.curvature.parameters.mesh.value_max = 0.05;
+    let bake = |m: &Mesh| covered_values(m, &run(m, &parameters).unwrap(), BakedMap::Curvature);
+    let (full, half) = (bake(&full), bake(&half));
+    let (equator, pole) = (sphere_band(&full, 0.0..0.3), sphere_band(&full, 0.8..0.95));
+    let (half_equator, half_pole) = (sphere_band(&half, 0.0..0.3), sphere_band(&half, 0.8..0.95));
+    assert!(equator > 0.55, "equator {equator}");
+    // A ring sized in texels read the poles, where the texels are a third smaller, darker, and the half-size island brighter
+    assert!((pole - equator).abs() < 0.01, "equator {equator}, near the poles {pole}");
+    assert!(
+        (half_equator - equator).abs() < 0.01 && (half_pole - pole).abs() < 0.01,
+        "full-size island {equator} and {pole}, half-size island {half_equator} and {half_pole}"
+    );
+}
+
+fn median(mut values: Vec<f32>) -> f32 {
+    values.sort_by(f32::total_cmp);
+    values.get(values.len() / 2).copied().unwrap_or(0.5)
+}
+
+/// Edges brighter than the faces, faces flat; `darkest_edge` also bounds every edge texel (hard edges)
+fn check_box_curvature(m: &Mesh, edge: f32, darkest_edge: Option<f32>) {
     let s = {
         let mut base = settings(128, &[BakedMap::Curvature]);
         base.common = CommonBakeSettings { dilation: 4, ..base.common };
@@ -259,19 +317,24 @@ fn check_box_curvature(m: &Mesh, edge: f32) {
     let edges: Vec<f32> = c.iter().filter(|(p, _)| near(*p, edge) >= 2).map(|v| v.1).collect();
     let faces: Vec<f32> = c.iter().filter(|(p, _)| near(*p, 0.5) == 1).map(|v| v.1).collect();
     assert!(!edges.is_empty() && !faces.is_empty());
-    let min_edge = edges.iter().copied().fold(1.0, f32::min);
-    assert!(min_edge > 0.55, "edge min {min_edge}");
+    let (edge_median, face_median) = (median(edges.clone()), median(faces.clone()));
+    assert!(edge_median > face_median + 0.01, "edge median {edge_median}, face median {face_median}");
+    if let Some(darkest_edge) = darkest_edge {
+        let min_edge = edges.iter().copied().fold(1.0, f32::min);
+        assert!(min_edge > darkest_edge, "edge min {min_edge}");
+    }
     assert!(faces.iter().all(|v| (0.45..=0.55).contains(v)), "face {:?}", faces.iter().copied().fold((1.0f32, 0.0f32), |(a, b), v| (a.min(v), b.max(v))));
 }
 
 #[test]
 fn rounded_box_bevels_are_convex() {
-    check_box_curvature(&primitives::rounded_box(Vec3::ONE, 0.15), 0.9);
+    // A smooth bevel reads as it does at 1024 px: a little above flat, not as bright as a hard edge
+    check_box_curvature(&primitives::rounded_box(Vec3::ONE, 0.15), 0.9, None);
 }
 
 #[test]
 fn cube_edges_are_convex() {
-    check_box_curvature(&primitives::cube(2.0), 0.97);
+    check_box_curvature(&primitives::cube(2.0), 0.97, Some(0.55));
 }
 
 #[test]
@@ -570,11 +633,18 @@ fn a_high_poly_box_has_bright_edges_and_flat_faces() {
         base.common = CommonBakeSettings { dilation: 4, ..base.common };
         base
     };
-    for (m, edge) in [(primitives::cube(2.0), 0.97), (primitives::rounded_box(Vec3::ONE, 0.15), 0.9)] {
+    // A hard edge is bright; a smooth bevel reads as it does at 1024 px, a little above the flat faces
+    for (m, edge, hard) in [(primitives::cube(2.0), 0.97, true), (primitives::rounded_box(Vec3::ONE, 0.15), 0.9, false)] {
         let c = covered_values(&m, &transfer(&m, &m, None, &s).unwrap(), BakedMap::Curvature);
         let near = |p: Vec3, t: f32| p.abs().to_array().iter().filter(|c| **c > t).count();
-        let brightest = c.iter().filter(|(p, _)| near(*p, edge) >= 2).map(|v| v.1).fold(0.0, f32::max);
-        assert!(brightest > 0.55, "edge {brightest}");
+        let edges: Vec<f32> = c.iter().filter(|(p, _)| near(*p, edge) >= 2).map(|v| v.1).collect();
+        if hard {
+            let brightest = edges.iter().copied().fold(0.0, f32::max);
+            assert!(brightest > 0.55, "edge {brightest}");
+        } else {
+            let (edge_median, face_median) = (median(edges), median(c.iter().filter(|(p, _)| near(*p, 0.5) == 1).map(|v| v.1).collect()));
+            assert!(edge_median > face_median + 0.008, "edge median {edge_median}, face median {face_median}");
+        }
         assert!(c.iter().filter(|(p, _)| near(*p, 0.5) == 1).all(|v| (0.45..=0.55).contains(&v.1)), "faces");
     }
 }
@@ -588,13 +658,21 @@ fn default_curvature_brightens_box_edges_and_never_darkens_them() {
     // A box has no concave texel, whether it is baked from itself or from a beveled high poly
     let low = primitives::cube(2.0);
     let high = primitives::rounded_box(Vec3::ONE, 0.15);
-    let bakes = [("itself", run(&low, &bake_settings).unwrap()), ("a beveled high poly", transfer(&low, &high, None, &bake_settings).unwrap())];
-    for (source, bake_output) in bakes {
+    // The hard edges stay bright; the smooth bevel reads as it does at 1024 px, a little above the flat faces
+    let bakes = [("itself", run(&low, &bake_settings).unwrap(), true), ("a beveled high poly", transfer(&low, &high, None, &bake_settings).unwrap(), false)];
+    for (source, bake_output, hard) in bakes {
         let curvature = covered_values(&low, &bake_output, BakedMap::Curvature);
         let darkest = curvature.iter().map(|(_, value)| *value).fold(1.0, f32::min);
         let brightest = curvature.iter().map(|(_, value)| *value).fold(0.0, f32::max);
         assert!(darkest > 0.45, "baked from {source}, darkest {darkest}");
-        assert!(brightest > 0.6, "baked from {source}, brightest {brightest}");
+        if hard {
+            assert!(brightest > 0.6, "baked from {source}, brightest {brightest}");
+        } else {
+            let near = |p: Vec3, t: f32| p.abs().to_array().iter().filter(|c| **c > t).count();
+            let edge_median = median(curvature.iter().filter(|(p, _)| near(*p, 0.9) >= 2).map(|v| v.1).collect());
+            let face_median = median(curvature.iter().filter(|(p, _)| near(*p, 0.5) == 1).map(|v| v.1).collect());
+            assert!(edge_median > face_median + 0.008, "baked from {source}, edge median {edge_median}, face median {face_median}");
+        }
     }
 }
 
@@ -693,7 +771,7 @@ fn bent_normals_point_away_from_occluders() {
     let mean_x = |v: &[&[f32]]| mean(v.iter().map(|b| b[0] * 2.0 - 1.0));
     assert!(mean_x(&near) < -0.15, "near the wall the bent normal leans away from it: {}", mean_x(&near));
     assert!(mean_x(&near) < mean_x(&far), "{} vs {}", mean_x(&near), mean_x(&far));
-    assert!(near.iter().all(|b| b[1] > 0.6), "still points up");
+    assert!(near.iter().all(|b| b[2] > 0.6), "still points up: along the surface normal, tangent-space z");
     let ao_near = mean(ao.iter().filter(|(p, _)| p.x > 0.6).map(|v| v.1));
     assert!(ao_near < mean(ao.iter().filter(|(p, _)| p.x < -0.6).map(|v| v.1)));
 }

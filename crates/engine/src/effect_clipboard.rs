@@ -82,6 +82,7 @@ fn paste(session: &mut Session, params: &Value) -> Result<Value> {
         Some(only) if only != content && asked => {
             return Err(bad(CMD, format!("{} effects go on the {}", effect.kind.name(), if only { "layer content" } else { "mask" })));
         }
+
         Some(only) => only,
         None => content,
     };

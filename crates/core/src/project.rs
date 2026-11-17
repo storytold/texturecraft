@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CoreError, Effect, Layer, LayerId, LayerKind, Result};
 
-pub const FORMAT_VERSION: u32 = 2;
+/// Project file format. 3: bent normal maps are in tangent space (older files hold world-space ones).
+pub const FORMAT_VERSION: u32 = 3;
+
+/// First format whose baked bent normal maps are in tangent space
+pub const TANGENT_BENT_NORMAL_VERSION: u32 = 3;
 
 /// Maximum group nesting (also bounds recursion over hostile project files)
 pub const MAX_DEPTH: usize = 16;
