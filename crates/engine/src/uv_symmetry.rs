@@ -41,9 +41,9 @@ impl<'a> UvMirror<'a> {
     pub(crate) fn add_copies(&self, stamp: &UvStamp, out: &mut Vec<UvStamp>) {
         let Some(frame) = self.frame_at(stamp.center) else { return };
 
-        // The stamp's x axis (turned by its angle) on the surface; v grows down, so its y axis points against V
+        // The stamp's x axis (turned by its angle, y up on screen) on the surface; v grows down, so an angle turns towards -V
         let (sin, cos) = stamp.angle.to_radians().sin_cos();
-        let x_axis = frame.along_u * cos + frame.along_v * sin;
+        let x_axis = frame.along_u * cos - frame.along_v * sin;
         let reach = stamp.radius * frame.scale;
         for map in &self.maps {
             let target = self.origin + *map * (frame.pos - self.origin);
@@ -102,7 +102,7 @@ impl<'a> UvMirror<'a> {
 
 /// The angle (radians) a stamp's x axis needs in the UV frame of `landing` to point along `direction` on the surface
 fn turn_towards(landing: &Frame, direction: Vec3) -> Option<f32> {
-    // Least squares for direction = along_u * cos + along_v * sin
+    // Least squares for direction = along_u * cos - along_v * sin, with (cos, -sin) the unknowns
     let (uu, uv, vv) = (landing.along_u.dot(landing.along_u), landing.along_u.dot(landing.along_v), landing.along_v.dot(landing.along_v));
     let (u_dot, v_dot) = (landing.along_u.dot(direction), landing.along_v.dot(direction));
     let det = uu * vv - uv * uv;
@@ -110,6 +110,33 @@ fn turn_towards(landing: &Frame, direction: Vec3) -> Option<f32> {
         return None;
     }
 
-    let (cos, sin) = ((u_dot * vv - v_dot * uv) / det, (v_dot * uu - u_dot * uv) / det);
+    let (cos, minus_sin) = ((u_dot * vv - v_dot * uv) / det, (v_dot * uu - u_dot * uv) / det);
+    let sin = -minus_sin;
     (cos != 0.0 || sin != 0.0).then(|| sin.atan2(cos)).filter(|angle| angle.is_finite())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_quarter_turn_copy_turns_the_dab_angle_the_same_way() {
+        // A square in the XY plane: U along +X, V down along -Y
+        let positions = vec![Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::new(-1.0, 1.0, 0.0)];
+        let uvs = vec![Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 0.0)];
+        let mesh = Mesh::from_parts(positions, None, uvs, vec![0, 1, 2, 0, 2, 3], "square").unwrap();
+        let (bvh, gbuf) = (Bvh::new(&mesh), UvGBuffer::new(&mesh, 0, 64, 64));
+        let symmetry = Symmetry { radial: 4, axis: 2, ..Symmetry::default() };
+        let mirror = UvMirror::new(&symmetry, Vec3::ZERO, &mesh, &bvh, &gbuf, 0).unwrap();
+
+        // The dab at world (0.5, 0) points 30 degrees up from +X
+        let stamp = UvStamp { center: Vec2::new(0.75, 0.5), radius: 0.05, angle: 30.0, flow: 1.0, hardness: 1.0, seed: 0 };
+        let mut copies = Vec::new();
+        mirror.add_copies(&stamp, &mut copies);
+
+        assert_eq!(copies.len(), 3);
+        // A quarter turn about +Z puts the copy at world (0, 0.5), pointing 120 degrees from +X
+        let quarter = copies.iter().find(|copy| (copy.center - Vec2::new(0.5, 0.25)).length() < 0.01).unwrap();
+        assert!((quarter.angle - 120.0).abs() < 0.1, "angle {}", quarter.angle);
+    }
 }
