@@ -105,9 +105,14 @@ pub fn trf(template: &str, args: &[(&str, &dyn Display)]) -> String {
 /// smart mask name in it ("Paint on Rust") is matched to its engine template, which is translated
 /// and filled in again; any other label is translated as it is.
 pub fn tr_history(label: &str) -> String {
+    tr_history_with(label, |text| tr(text).to_string())
+}
+
+/// [`tr_history`] with its own lookup `translate`
+fn tr_history_with(label: &str, translate: impl Fn(&str) -> String) -> String {
     match history_template(label) {
-        Some((template, name, value)) => trf(template, &[(name, &value)]),
-        None => tr(label).to_string(),
+        Some((template, name, value)) => craft_i18n::fmt(&translate(template), &[(name, value)]),
+        None => translate(label),
     }
 }
 
@@ -313,8 +318,6 @@ mod tests",
 
     #[test]
     fn history_labels_are_matched_to_their_templates() {
-        let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_language("en");
         assert_eq!(history_template("Paint on Rust"), Some(("Paint on {layer}", "layer", "Rust")));
         assert_eq!(history_template("Paint on Paint mask of x"), Some(("Paint on {layer}", "layer", "Paint mask of x")));
         assert_eq!(history_template("Paint mask of Paint on x"), Some(("Paint mask of {layer}", "layer", "Paint on x")));
@@ -322,14 +325,25 @@ mod tests",
         assert_eq!(history_template("Edit path 2"), Some(("Edit path {n}", "n", "2")));
         assert_eq!(history_template("Apply smart mask Dirt"), Some(("Apply smart mask {name}", "name", "Dirt")));
         assert_eq!(history_template("Rename layer"), None);
-        assert_eq!(tr_history("Paint on Rust"), "Paint on Rust");
-        assert_eq!(tr_history("Paint mask of Paint on Rust"), "Paint mask of Paint on Rust");
-        assert_eq!(tr_history("Edit path 2"), "Edit path 2");
-        assert_eq!(tr_history("Rename layer"), "Rename layer");
-        set_language("de");
-        assert_eq!(tr_history("Remove layer"), "Ebene entfernen");
-        assert_eq!(tr_history("Unknown step"), "Unknown step");
-        set_language("en");
+    }
+
+    /// The template is translated and the layer name filled in; other labels are translated whole
+    #[test]
+    fn history_labels_with_a_layer_name_are_translated_through_their_template() {
+        let translate = |text: &str| {
+            match text {
+                "Paint on {layer}" => "Auf {layer} malen",
+                "Paint mask of {layer}" => "Maske von {layer} malen",
+                "Remove layer" => "Ebene entfernen",
+                other => other,
+            }
+            .to_string()
+        };
+        assert_eq!(tr_history_with("Paint on Rust", translate), "Auf Rust malen");
+        assert_eq!(tr_history_with("Paint mask of Paint on x", translate), "Maske von Paint on x malen");
+        assert_eq!(tr_history_with("Remove layer", translate), "Ebene entfernen");
+        assert_eq!(tr_history_with("Clone on Rust", translate), "Clone on Rust");
+        assert_eq!(tr_history_with("Paint on {layer}", translate), "Auf {layer} malen");
     }
 
     const UNTRANSLATED: &[&str] = &["RGB", "RGBA"];

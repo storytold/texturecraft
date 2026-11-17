@@ -162,7 +162,7 @@ pub(crate) fn mask(p: &mut Project, id: &str, invert: bool) -> Result<Mask> {
 /// Replace layer `layer`'s mask with smart mask `name` (one undo step).
 pub fn apply(s: &mut Session, layer: LayerId, name: &str) -> Result<()> {
     let sm = find(name).ok_or_else(|| EngineError::Other(format!("unknown smart mask `{name}`")))?;
-    s.edit(&crate::session::history_label(crate::session::APPLY_SMART_MASK_TEMPLATE, &sm.label), |s| {
+    s.edit(&crate::session::history_label(crate::session::APPLY_SMART_MASK_TEMPLATE, sm.label), |s| {
         let m = mask(&mut s.doc.project, sm.id, false)?;
         let old = s.doc.project.layer_mut(layer)?.mask.replace(m);
         for e in old.map(|m| m.effects).unwrap_or_default() {

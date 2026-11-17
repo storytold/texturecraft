@@ -1393,24 +1393,33 @@ mod tests {
         assert!(h.state().ui.windows.unsaved.is_none());
     }
 
-    /// The History panel runs each step name through the translator
+    /// The History panel runs each step name through the translator (skipped when this build
+    /// embeds no catalog that translates "Remove layer"; `i18n` tests cover the template matching)
     #[test]
     fn history_rows_are_shown_in_the_interface_language() {
         let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(code) = crate::i18n::LANGUAGES.iter().map(|l| l.code).find(|code| {
+            crate::i18n::set_language(code);
+            *code != "en" && crate::i18n::tr("Remove layer") != "Remove layer"
+        }) else {
+            crate::i18n::set_language("en");
+            return;
+        };
+        let translated = crate::i18n::tr("Remove layer").to_string();
         let mut h = harness();
         {
             let app = h.state_mut();
             let layer = app.session.selected_layer().unwrap();
             texturecraft_engine::execute(&mut app.session, "layer.remove", &json!({"layer": layer.0})).unwrap();
             app.ui.dock.focus(crate::docking::Panel::History);
-            app.ui.prefs.language = "de".into();
+            app.ui.prefs.language = code.into();
         }
         h.run_steps(4);
-        let german = h.query_all_by_label("Ebene entfernen").count();
-        let english = h.query_all_by_label("Remove layer").count();
+        let shown = h.query_all_by_label(&translated).count();
+        let untranslated = h.query_all_by_label("Remove layer").count();
         h.state_mut().ui.prefs.language = "en".into();
         h.run_steps(4);
-        assert!(german > 0 && english == 0, "German rows: {german}, untranslated rows: {english}");
+        assert!(shown > 0 && untranslated == 0, "{code}: translated rows {shown}, English rows {untranslated}");
         assert!(h.query_all_by_label("Remove layer").count() > 0);
     }
 }

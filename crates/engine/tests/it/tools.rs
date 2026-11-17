@@ -329,7 +329,8 @@ fn strokes_are_named_by_tool_and_layer() {
     assert_eq!(last_label(&s), "Clone on Rust");
 
     execute(&mut s, "tool.smudge", &Value::Null).unwrap();
-    dab(&mut s, 200.0, 200.0);
+    execute(&mut s, "tool.brush", &json!({"size": 10, "smudgeStrength": 100, "spacing": 5})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[150, 200], [200, 200], [250, 200]]})).unwrap();
     assert_eq!(last_label(&s), "Smudge on Rust");
 
     execute(&mut s, "tool.eraser", &Value::Null).unwrap();

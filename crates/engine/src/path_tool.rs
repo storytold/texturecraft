@@ -399,7 +399,8 @@ impl Session {
 
         let shape = self.path_shape(self.camera, viewport);
         let editing = self.tool.path.editing;
-        let label = editing.map_or(NEW_PATH_LABEL.to_string(), |(_, i)| crate::session::history_label(crate::session::EDIT_PATH_TEMPLATE, &(i + 1).to_string()));
+        let label =
+            editing.map_or(NEW_PATH_LABEL.to_string(), |(_, i)| crate::session::history_label(crate::session::EDIT_PATH_TEMPLATE, &(i + 1).to_string()));
         let report = self.edit_merging(&label, editing.is_some() && self.tool.path.edited, |session| {
             let (effect_id, index) = match editing {
                 Some(at) => at,
@@ -457,12 +458,16 @@ impl Session {
                 if self.path_draft.is_some() {
                     self.cancel_path();
                 } else {
-                    self.edit_merging(&crate::session::history_label(crate::session::EDIT_PATH_TEMPLATE, &(index + 1).to_string()), self.tool.path.edited, |session| {
-                        if let Some(Effect { kind: EffectKind::Path(paths), .. }) = session.doc.project.effect_mut(effect) {
-                            paths.remove(index);
-                        }
-                        session.render_paths(effect, index)
-                    })?;
+                    self.edit_merging(
+                        &crate::session::history_label(crate::session::EDIT_PATH_TEMPLATE, &(index + 1).to_string()),
+                        self.tool.path.edited,
+                        |session| {
+                            if let Some(Effect { kind: EffectKind::Path(paths), .. }) = session.doc.project.effect_mut(effect) {
+                                paths.remove(index);
+                            }
+                            session.render_paths(effect, index)
+                        },
+                    )?;
                     self.cancel_path();
                 }
                 return Ok(true);
