@@ -24,6 +24,46 @@ pub struct CommandSpec {
     pub run: Run,
 }
 
+impl CommandSpec {
+    /// Whether a keyboard shortcut can run this command: it acts with no parameters at all, or
+    /// every parameter in its first `params` form is optional (`name?`). A command with a required
+    /// parameter (a path, a name, a texture set) cannot be run from a key, and neither can the
+    /// commands that only return data (lists, inspections) or that offer several alternative
+    /// parameter forms.
+    pub fn bindable(&self) -> bool {
+        const QUERIES: [&str; 5] = ["project.inspect", "tool.state", "text.fonts", "camera.get", "edit.history"];
+        !(self.id.ends_with(".list") || QUERIES.contains(&self.id) || self.params.contains('\u{2192}')) && params_all_optional(self.params)
+    }
+}
+
+/// Whether the first `{...}` group of a `params` text has only optional entries.
+fn params_all_optional(params: &str) -> bool {
+    let Some(body) = params.trim_start().strip_prefix('{') else { return false };
+    let Some(end) = body.find('}') else { return false };
+    // `{a?} | {b}`: other forms exist, and the first one alone may not do anything.
+    if body[end + 1..].trim_start().starts_with('|') {
+        return false;
+    }
+    let (mut depth, mut start) = (0i32, 0);
+    let mut entries = Vec::new();
+    for (i, c) in body[..end].char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                entries.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(&body[start..end]);
+    entries.iter().filter(|entry| !entry.trim().is_empty()).all(|entry| {
+        // `index? | name?`: every alternative must be optional.
+        entry.split(" | ").all(|alternative| alternative.trim().split([':', ' ', '(']).next().is_some_and(|key| key.ends_with('?')))
+    })
+}
+
 pub(crate) fn always(_: &Session) -> std::result::Result<(), String> {
     Ok(())
 }
@@ -233,6 +273,30 @@ pub(crate) fn color_of(v: &Value) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_commands_a_key_can_run_are_bindable() {
+        let bindable = |id: &str| find(id).unwrap_or_else(|| panic!("{id} is gone")).bindable();
+        for id in ["layer.add.paint", "layer.add.fill", "layer.add.group", "mask.invert", "mask.clear", "layer.visible", "effect.add.paint", "file.save", "tool.paint", "camera.add"] {
+            assert!(bindable(id), "{id} needs no parameters");
+        }
+        for id in ["file.saveCopy", "textureSet.select", "layer.rename", "tool.select", "layer.select", "viewport.focusAt", "tool.stroke", "mask.smart.apply", "bake.skew.set", "textureSet.resolution", "effect.move"] {
+            assert!(!bindable(id), "{id} needs a parameter");
+        }
+        for id in ["layer.move", "layer.list", "project.inspect", "edit.history", "export.presets", "tool.state"] {
+            assert!(!bindable(id), "{id} is a query or has several forms");
+        }
+    }
+
+    #[test]
+    fn params_texts_are_read_by_their_required_entries() {
+        for ok in ["{}", "{layer?}", "{enabled?: bool} \u{2014} toggles when omitted", "{index? | name? | all?: true}", "{effect?: the selected effect}"] {
+            assert!(params_all_optional(ok), "{ok}");
+        }
+        for no in ["{path}", "{layer?, name}", "{x, y (viewport pixels), viewport?: [w, h]}", "{a?} | {b}", "{ts?, value?: 0..1 | path: image}", "no braces"] {
+            assert!(!params_all_optional(no), "{no}");
+        }
+    }
 
     #[test]
     fn color_param_accepts_valid_forms() {

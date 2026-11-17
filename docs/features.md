@@ -153,7 +153,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   (Settings › Interface › Start window).
 - A **data folder** of your choice for autosaves, smart materials, presets, templates and UI
   layouts, on any drive (Settings › Folders; `Documents/TextureCraft` by default).
-- A **shortcut editor** with conflict detection, and every shortcut shown in its tooltip.
+- A **shortcut editor** with conflict detection, listing every menu item and every command a key can run (commands that need a path, name or similar are left out), and every shortcut shown in its tooltip.
 - A **History** panel: click any step to go back to it, or forward again to an undone one.
 - **10 languages:** English, French, German, Spanish, Portuguese, Italian, Japanese, Chinese,
   Korean and Arabic, switchable live.

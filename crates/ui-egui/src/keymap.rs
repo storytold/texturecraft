@@ -1,4 +1,4 @@
-//! Keyboard shortcuts: every menu item and every command with a default shortcut, the user's
+//! Keyboard shortcuts: every menu item and every command a key can run, the user's
 //! overrides (`UiState::keymap`, id → "Ctrl+Shift+E" or "" for unbound), conflict detection and
 //! the shortcut editor window (Edit ▸ Settings ▸ Keyboard, Help ▸ Shortcuts list).
 
@@ -26,7 +26,21 @@ pub struct Binding {
     pub default: Option<&'static str>,
 }
 
-/// Every bindable item: the menu catalog, then commands with a default shortcut.
+/// The menu a command without a menu entry is listed under, from its id.
+fn group_of(id: &str) -> &'static str {
+    match id.split('.').next().unwrap_or("") {
+        "layer" | "mask" | "effect" | "material" | "textureSet" => "Layers",
+        "tool" | "brush" | "alpha" | "text" => "Tools",
+        "camera" | "viewport" => "Viewport",
+        "file" | "project" | "export" | "resource" => "File",
+        "edit" => "Edit",
+        "bake" => "Mode",
+        _ => "Commands",
+    }
+}
+
+/// Every bindable item: the menu catalog, then every command that has a default shortcut or that
+/// a key can run (see [`texturecraft_engine::CommandSpec::bindable`]).
 pub fn bindings() -> &'static [Binding] {
     static ALL: std::sync::OnceLock<Vec<Binding>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
@@ -36,9 +50,9 @@ pub fn bindings() -> &'static [Binding] {
                 v.push(Binding { id: i.id, group: i.menu, label: i.label, default: i.shortcut });
             }
         }
-        for c in texturecraft_engine::command_specs().iter().filter(|c| c.shortcut.is_some()) {
+        for c in texturecraft_engine::command_specs().iter().filter(|c| c.shortcut.is_some() || c.bindable()) {
             if !v.iter().any(|b| b.id == c.id) {
-                v.push(Binding { id: c.id, group: c.menu.first().copied().unwrap_or("Commands"), label: c.label, default: c.shortcut });
+                v.push(Binding { id: c.id, group: c.menu.first().copied().unwrap_or_else(|| group_of(c.id)), label: c.label, default: c.shortcut });
             }
         }
         v
@@ -544,6 +558,58 @@ mod tests {
         let cmd = Modifiers { mac_cmd: true, command: true, ..Modifiers::NONE };
         assert_eq!(resolved.command_of(&press(Key::S, cmd)).as_deref(), Some("file.save"));
         assert_eq!(resolved.command_of(&press(Key::S, Modifiers::CTRL)), None, "the Control key is another key");
+    }
+
+    #[test]
+    fn commands_without_a_default_key_are_listed_unbound_and_filtered_by_their_parameters() {
+        for id in ["layer.add.fill", "layer.add.paint", "layer.add.group", "mask.invert", "layer.visible"] {
+            let b = binding(id);
+            assert!(b.default.is_none() && shortcut(&Keymap::new(), b).is_none(), "{id} is listed without a key");
+        }
+        assert_eq!(binding("mask.invert").group, "Layers");
+        for id in ["textureSet.select", "layer.rename", "file.saveCopy", "tool.select", "layer.list", "project.inspect"] {
+            assert!(bindings().iter().all(|b| b.id != id), "{id} cannot run from a key");
+        }
+        let ids: Vec<_> = bindings().iter().map(|b| b.id).collect();
+        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), unique.len(), "every id is listed once");
+    }
+
+    #[test]
+    fn every_listed_item_is_implemented() {
+        for b in bindings() {
+            assert!(crate::menus::implemented(b.id), "{} is listed but nothing runs it", b.id);
+        }
+    }
+
+    #[test]
+    fn a_command_without_a_default_key_can_be_bound_unbound_and_conflicts() {
+        let (invert, save) = (binding("mask.invert"), binding("file.save"));
+        let mut keymap = Keymap::new();
+        rebind(&mut keymap, invert, "Ctrl+Alt+I");
+        assert_eq!(shortcut_of(&keymap, "mask.invert"), Some("Ctrl+Alt+I"));
+        let resolved = bindings_for(&keymap);
+        assert_eq!(resolved.command_of(&press(Key::I, Modifiers::COMMAND | Modifiers::ALT)).as_deref(), Some("mask.invert"));
+        assert!(resolved.conflict(invert).is_none());
+        // Taking the key of a default shortcut is a conflict, on both items.
+        rebind(&mut keymap, invert, "Ctrl+S");
+        let resolved = bindings_for(&keymap);
+        assert_eq!(resolved.conflict(invert).map(|b| b.id), Some("file.save"));
+        assert_eq!(resolved.conflict(save).map(|b| b.id), Some("mask.invert"));
+        // Unbinding drops the override of an item that has no default.
+        rebind(&mut keymap, invert, "");
+        assert_eq!(shortcut_of(&keymap, "mask.invert"), None);
+        assert!(bindings_for(&keymap).conflict(save).is_none());
+    }
+
+    #[test]
+    fn a_saved_keymap_from_before_every_command_was_bindable_still_loads() {
+        let old: Keymap = serde_json::from_str(r#"{"file.save":"F5","edit.undo":"","ui.layout.3d":"Ctrl+Shift+H"}"#).unwrap();
+        let resolved = bindings_for(&old);
+        assert_eq!(resolved.command_of(&press(Key::F5, Modifiers::NONE)).as_deref(), Some("file.save"));
+        assert_eq!(resolved.command_of(&press(Key::Z, Modifiers::COMMAND)), None);
+        assert_eq!(shortcut_of(&old, "ui.layout.3d"), Some("Ctrl+Shift+H"));
+        assert_eq!(shortcut_of(&old, "mask.invert"), None);
     }
 
     #[test]
