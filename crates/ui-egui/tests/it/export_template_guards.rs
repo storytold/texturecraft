@@ -108,6 +108,8 @@ fn unfinished_edit_asks_before_selecting_another_template_and_keep_editing_stays
     let library = Library::new("keep-editing");
     let mut h = harness(&library);
     break_draft(&mut h);
+    h.get_by_label_contains("Beta tpl").scroll_to_me();
+    h.run_steps(12);
     h.get_by_label_contains("Beta tpl").click();
     h.run_steps(3);
     assert_eq!(selected(&h), "Alpha tpl", "the selection waits for the answer");
@@ -123,6 +125,8 @@ fn unfinished_edit_discard_switches_to_the_other_template() {
     let library = Library::new("discard");
     let mut h = harness(&library);
     break_draft(&mut h);
+    h.get_by_label_contains("Beta tpl").scroll_to_me();
+    h.run_steps(12);
     h.get_by_label_contains("Beta tpl").click();
     h.run_steps(3);
     h.get_by_label("Discard changes").click();
@@ -158,6 +162,8 @@ fn a_saved_edit_switches_without_asking() {
     assert!(draft.validate().is_ok());
     h.state_mut().run("export.preset.save", json!({ "preset": draft })).unwrap();
     h.run_steps(3);
+    h.get_by_label_contains("Beta tpl").scroll_to_me();
+    h.run_steps(12);
     h.get_by_label_contains("Beta tpl").click();
     h.run_steps(3);
     assert!(h.state().ui.export.ask.is_none(), "nothing to ask: the edit is saved");

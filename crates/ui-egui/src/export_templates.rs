@@ -365,7 +365,7 @@ pub(crate) fn ask(app: &mut TextureCraftApp, ctx: &egui::Context) {
         app.ui.export.ask = None;
         return;
     }
-    let mut cancel = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    let mut cancel = false;
     let mut yes = false;
     let (title, text, yes_label, no_label) = match &question {
         Ask::Delete(name) => (
@@ -384,15 +384,20 @@ pub(crate) fn ask(app: &mut TextureCraftApp, ctx: &egui::Context) {
             tr("Keep editing"),
         ),
     };
-    egui::Window::new(title).id(egui::Id::new("export_template_ask")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
-        ui.set_max_width(360.0);
-        ui.label(text);
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            yes = ui.button(yes_label).clicked();
-            cancel |= ui.button(no_label).clicked();
+    egui::Window::new(title)
+        .id(egui::Id::new("export_template_ask"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.set_max_width(360.0);
+            ui.label(text);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                yes = ui.button(yes_label).clicked();
+                cancel |= ui.button(no_label).clicked();
+            });
         });
-    });
     if yes {
         app.ui.export.ask = None;
         match question {

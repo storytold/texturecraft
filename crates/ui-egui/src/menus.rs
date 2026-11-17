@@ -381,7 +381,10 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
             app.session.tool.brush.size = (app.session.tool.brush.size * scale).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
         }
 
-        if app.ui.windows.project_config.is_some() {
+        if app.ui.export.ask.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
+            // The Output templates question: Escape answers it with the safe choice
+            app.ui.export.ask = None;
+        } else if app.ui.windows.project_config.is_some() {
             // Its keys are Escape (close) and Enter (OK); a stroke in progress isn't touched
             #[cfg(not(target_arch = "wasm32"))]
             crate::project_config::keys_in(app, input, nothing_focused, popup_open);
