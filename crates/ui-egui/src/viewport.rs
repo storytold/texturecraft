@@ -506,7 +506,7 @@ fn mask_view_badge(app: &TextureCraftApp, ui: &Ui, rect: Rect) {
     let ViewMode::Mask(layer) = app.session.view else { return };
     let tk = Tokens::get(ui.ctx());
     let name = app.session.doc.project.layers.get(&layer).map(|layer| layer.name.as_str()).unwrap_or_default();
-    let text = trf("MASK: {layer} (M: back to the material)", &[("layer", name)]);
+    let text = trf("MASK: {layer}", &[("layer", name)]);
     ui.painter_at(rect).text(
         pos2(rect.left() + MASK_BADGE_INSET, rect.bottom() - MASK_BADGE_RAISE),
         egui::Align2::LEFT_BOTTOM,
