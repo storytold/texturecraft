@@ -1070,7 +1070,15 @@ fn export_sets(app: &mut TextureCraftApp) -> bool {
         match app.run("file.exportTextures", p) {
             Some(r) => {
                 written += r.get("files").and_then(|f| f.as_array()).map(Vec::len).unwrap_or(0);
-                warnings.extend(r.get("warnings").and_then(|w| w.as_array()).into_iter().flatten().filter_map(|w| w.as_str()).filter(|w| w.starts_with("MaterialX:")).map(str::to_owned));
+                warnings.extend(
+                    r.get("warnings")
+                        .and_then(|w| w.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|w| w.as_str())
+                        .filter(|w| w.starts_with("MaterialX:"))
+                        .map(str::to_owned),
+                );
             }
             None => return false,
         }
