@@ -505,7 +505,8 @@ impl Session {
         // JSON round trips can change float representation without changing the paint settings
         read_paint(stored).is_ok_and(|paint| {
             let current = self.path_shape(paint.camera, Vec2::from_array(stored.viewport));
-            let stored_corners = if stored.corners.iter().any(|c| *c) { stored.corners.clone() } else { Vec::new() };
+            // Normalised like the current flags: a short, long or all-smooth stored list must not count as a change
+            let stored_corners = state_of(stored).corner_flags();
             (&current.points, &current.corners, current.uv, current.closed, current.fill)
                 == (&stored.points, &stored_corners, stored.uv, stored.closed, stored.fill)
                 && read_paint(&current).is_ok_and(|current_paint| current_paint == paint)
