@@ -15,7 +15,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "viewport.frame",
             "Show entire mesh",
             ["Viewport"],
-            Some("Alt+F"),
+            Some("F"),
             "{target?: \"all\" (default: the whole mesh, helper geometry included) | \"selection\" (the active texture set's geometry)} → the camera; the orbit turns around the framed center",
             always,
             frame
@@ -24,7 +24,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "viewport.frameSelection",
             "Frame texture set",
             ["Viewport"],
-            Some("F"),
+            Some("Shift+F"),
             "{} → the camera, framing the active texture set's geometry",
             always,
             |s, _| frame_target(s, FrameTarget::Selection)

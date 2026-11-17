@@ -381,10 +381,10 @@ of a second.
 ## Framing the view
 
 `viewport.frame {target?: "all" | "selection"}` points the camera at the bounding box of the whole mesh
-(`"all"`, the default, Alt+F) or of the active texture set's geometry only (`"selection"`), keeping the
+(`"all"`, the default, F) or of the active texture set's geometry only (`"selection"`), keeping the
 current angles. The orbit pivot (`camera.get` `target`) is the framed center, so `camera.orbit` and the
 Alt+drag orbit turn around the object being painted even with a floor plane or other helper geometry in
-the mesh. `viewport.frameSelection` (F) is the same as `target: "selection"`; a set with no triangles
+the mesh. `viewport.frameSelection` (Shift+F) is the same as `target: "selection"`; a set with no triangles
 frames the whole mesh. Both return the camera like `camera.get`.
 
 ## MaterialCraft materials

@@ -1,4 +1,4 @@
-//! Frame texture set (F) and Show entire mesh (Alt+F): a floor plane must not decide the camera
+//! Frame texture set (Shift+F) and Show entire mesh (F): a floor plane must not decide the camera
 
 use serde_json::{Value, json};
 use texturecraft_engine::geom::glam::Vec3;

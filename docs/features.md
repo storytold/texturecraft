@@ -136,8 +136,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   traced on the GPU
   (compute shaders, about 25× the CPU tracer, desktop and WebGPU) or on the CPU.
 - View any channel, any baked mesh map, or a UV checker; Alt+drag to orbit, middle-drag to pan,
-  wheel to zoom, F to frame the active texture set (a floor plane or other helper geometry stays
-  out of the view and the orbit pivot), Alt+F to show the entire mesh, M / C / B to cycle views.
+  wheel to zoom, F to show the entire mesh, Shift+F to frame the active texture set (a floor plane or
+  other helper geometry stays out of the view and the orbit pivot), M / C / B to cycle views.
 - **3D and UV wireframes** that show the mesh's own polygons: quads and n-gons from OBJ, FBX,
   COLLADA, USD, Alembic and PLY files keep their edges, without the triangulation's diagonals.
 

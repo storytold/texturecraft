@@ -1,4 +1,4 @@
-//! F frames the active texture set, Alt+F the whole mesh; a floor plane must not decide the view
+//! Shift+F frames the active texture set, F the whole mesh; a floor plane must not decide the view
 
 use egui::{Event, Key, Modifiers};
 use egui_kittest::Harness;
@@ -21,16 +21,16 @@ fn press(h: &mut Harness<'_, TextureCraftApp>, key: Key, modifiers: Modifiers) {
 }
 
 #[test]
-fn f_frames_the_painted_object_and_alt_f_the_whole_scene() {
+fn shift_f_frames_the_painted_object_and_f_the_whole_scene() {
     let mut h = harness();
     let whole = h.state().session.camera;
 
-    press(&mut h, Key::F, Modifiers::NONE);
+    press(&mut h, Key::F, Modifiers::SHIFT);
     let framed = h.state().session.camera;
     assert!((framed.target - texturecraft_engine::geom::glam::Vec3::new(0.5, 0.5, 0.0)).length() < 1e-4, "{:?}", framed.target);
     assert!(framed.distance < whole.distance * 0.05, "{} vs {}", framed.distance, whole.distance);
 
-    press(&mut h, Key::F, Modifiers::ALT);
+    press(&mut h, Key::F, Modifiers::NONE);
     let back = h.state().session.camera;
     assert!((back.target - whole.target).length() < 1e-4 && (back.distance - whole.distance).abs() < 1e-3, "{back:?} vs {whole:?}");
 }
