@@ -1,6 +1,6 @@
 //! Symmetry around a moved plane or axis, driven through engine commands the way agents paint
 
-use serde_json::json;
+use serde_json::{Value, json};
 use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::glam::{Vec2, Vec3, Vec4};
 use texturecraft_engine::geom::{Mesh, primitives};
@@ -280,4 +280,45 @@ fn disabling_symmetry_paints_only_the_source_and_keeps_the_settings() {
         assert!(red_at(&session, copy), "enabling symmetry restores its copies");
         assert_eq!(session.tool.brush.symmetry, settings);
     }
+}
+
+/// Base color of the composite at the surface point under world `point`
+fn color_at(session: &Session, point: Vec3) -> [f32; 3] {
+    let hit = session.pick(screen(session, point), session.viewport).unwrap();
+    session.caches[0].composite.value(Channel::BaseColor, (hit.uv.x * TEXTURE_SIZE) as u32, (hit.uv.y * TEXTURE_SIZE) as u32)
+}
+
+/// A red dab at `x` (and its mirror image with symmetry on), then a smudge stroke from `x` along `step` pixels per sample. Returns the strokes' surface points
+fn smudge_a_red_dab(session: &mut Session, symmetry: bool, x: f32, step: f32) -> (Vec3, Vec3) {
+    execute(session, "tool.brush", &json!({"size": 12, "hardness": 90, "symmetryX": symmetry})).unwrap();
+    execute(session, "tool.stroke", &json!({"points": [[x, 200.0]]})).unwrap();
+    session.update();
+    let (dragged_to, mirrored_to) = (surface(session, x + 35.0 * step, 200.0), surface(session, 400.0 - x - 35.0 * step, 200.0));
+    execute(session, "tool.smudge", &Value::Null).unwrap();
+    execute(session, "tool.brush", &json!({"size": 10, "smudgeStrength": 100, "spacing": 5})).unwrap();
+    let points: Vec<[f32; 2]> = (0..=40).map(|i| [x + i as f32 * step, 200.0]).collect();
+    execute(session, "tool.stroke", &json!({"points": points})).unwrap();
+    session.update();
+    (dragged_to, mirrored_to)
+}
+
+#[test]
+fn smudge_drags_the_mirrored_spot_equally() {
+    let mut session = session(primitives::cube(2.0));
+    let (right, left) = smudge_a_red_dab(&mut session, true, 240.0, 1.0);
+    assert!(right.x > 0.0 && left.x < 0.0 && (right.x + left.x).abs() < 1e-3, "{right:?} {left:?}");
+    let (on_source, on_copy) = (color_at(&session, right), color_at(&session, left));
+    assert!(on_source[0] - on_source[1] > 0.2, "the stroke drags red along +X: {on_source:?}");
+    for channel in 0..3 {
+        assert!((on_source[channel] - on_copy[channel]).abs() < 0.1, "the copy drags the same on -X: {on_source:?} vs {on_copy:?}");
+    }
+}
+
+#[test]
+fn smudge_without_symmetry_leaves_the_mirrored_spot_alone() {
+    let mut session = session(primitives::cube(2.0));
+    let (right, left) = smudge_a_red_dab(&mut session, false, 240.0, 1.0);
+    let (on_source, on_far_side) = (color_at(&session, right), color_at(&session, left));
+    assert!(on_source[0] - on_source[1] > 0.2, "the stroke drags red along +X: {on_source:?}");
+    assert!(on_far_side[0] - on_far_side[1] < 0.05, "nothing on the mirrored spot: {on_far_side:?}");
 }

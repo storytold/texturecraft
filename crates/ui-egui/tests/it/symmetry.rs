@@ -317,3 +317,14 @@ fn ctrl_drag_on_a_symmetry_handle_only_adjusts_the_brush() {
     assert_eq!(after.symmetry, before.symmetry, "adjusting the brush must not also move symmetry");
     assert_eq!(harness.state().session.history_labels(), history);
 }
+
+#[test]
+fn the_smudge_tool_offers_the_symmetry_toggle() {
+    let mut harness = app_harness();
+    harness.state_mut().session.tool.tool = Tool::Smudge;
+    harness.run_steps(2);
+
+    harness.get_by_label("Symmetry").click();
+    harness.run_steps(2);
+    assert_eq!(brush(&mut harness)["symmetry"], json!([true, false, false]), "the toggle mirrors the smudge on X");
+}

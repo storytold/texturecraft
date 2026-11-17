@@ -201,12 +201,7 @@ impl Session {
             return Err(EngineError::Other(msg.into()));
         }
         let depth = (!uv_mode).then(|| self.eye_depth(viewport));
-        let mut brush = self.tool.brush.clone();
-        if tool == Tool::Smudge {
-            // shortcut: smudge drags one stamp trail; mirrored trails would need one pickup each.
-            brush.symmetry = Default::default();
-        }
-        let stroke = Stroke::new(&brush, &self.mesh);
+        let stroke = Stroke::new(&self.tool.brush, &self.mesh);
         let mut canvas = StrokeCanvas::new(size.0, size.1);
         if !quick_mask {
             canvas.limit = self.stroke_limit(ts, size);
@@ -220,10 +215,15 @@ impl Session {
                 }
                 m => m,
             };
-            canvas.pickup = Some(match &layer_source {
+            let mut pickup = match &layer_source {
                 Some(flat) => Pickup::from_layer(mode, flat, size, cache.gbuf.clone(), values.keys().copied()),
                 None => Pickup::new(mode, cache.composite.clone(), cache.gbuf.clone(), values.keys().copied()),
-            });
+            };
+            if tool == Tool::Smudge && stroke.settings.symmetry.any() {
+                // Every mirrored copy of a smudge drags its own trail.
+                pickup.isolate_copies();
+            }
+            canvas.pickup = Some(pickup);
             if tool == Tool::Clone
                 && let Some(src) = self.tool.clone_source.as_mut()
             {

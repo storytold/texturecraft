@@ -11,6 +11,7 @@ use texturecraft_texel::{TILE, TileImage, from_u16, to_u16};
 
 use crate::brush::Shape;
 use crate::pickup::Pickup;
+use crate::stamp_source::StampSource;
 use crate::stroke::Stamp;
 use crate::visibility::EyeDepth;
 
@@ -52,7 +53,7 @@ impl StrokeCanvas {
     /// Blend the gathered stamp texels (stamp center `center` in texels) into the stroke: the
     /// quick mask scales them, then the pickup deposits its values or the alpha accumulates
     /// ("over": `m = a + m·(1 − a)`).
-    fn add_stamp(&mut self, center: [f32; 2]) {
+    fn add_stamp(&mut self, center: [f32; 2], source: Option<StampSource>) {
         let mut texels = std::mem::take(&mut self.texels);
         if let Some((mask, invert)) = &self.limit {
             for t in &mut texels {
@@ -61,7 +62,7 @@ impl StrokeCanvas {
             }
         }
         let painted = match &mut self.pickup {
-            Some(p) => p.stamp(&mut self.alpha, &texels, center),
+            Some(p) => p.stamp(&mut self.alpha, &texels, center, source),
             None => {
                 for &(x, y, a) in &texels {
                     let m = from_u16(self.alpha.get(x, y)[0]);
@@ -216,7 +217,7 @@ pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp
             canvas.texels.extend(texels);
         }
 
-        canvas.add_stamp(center.0);
+        canvas.add_stamp(center.0, stamp.source);
     }
 }
 
@@ -338,7 +339,7 @@ pub fn fill_coverage(canvas: &mut StrokeCanvas, gbuf: &UvGBuffer, coverage: impl
             (a > 0.0).then_some(((i as u32) % w, (i as u32) / w, a))
         })
         .collect();
-    canvas.add_stamp([0.0; 2]);
+    canvas.add_stamp([0.0; 2], None);
 }
 
 #[cfg(test)]
@@ -820,6 +821,6 @@ pub fn rasterize_uv(canvas: &mut StrokeCanvas, gbuf: &UvGBuffer, shape: Shape, s
                 }
             }
         }
-        canvas.add_stamp([cx, cy]);
+        canvas.add_stamp([cx, cy], None);
     }
 }

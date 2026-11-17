@@ -26,7 +26,7 @@ const DEFAULT_RADIAL_COUNT: u8 = 6;
 
 /// Whether `tool` paints symmetry copies
 pub(crate) fn applies_to(tool: Tool) -> bool {
-    matches!(tool, Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Clone | Tool::Path)
+    matches!(tool, Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Smudge | Tool::Clone | Tool::Path)
 }
 
 /// Whether the 3D view shows symmetry now: not while the active tool can't act on the selection
