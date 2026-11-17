@@ -156,3 +156,29 @@ fn the_directx_warning_comes_once_and_only_with_a_normal_map() {
     let r = export(&mut s, &dir, OPENPBR, true);
     assert!(!r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("DirectX")), "{r}");
 }
+
+#[test]
+fn the_export_plan_lists_the_materials_the_export_writes() {
+    let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+    let plan = |s: &mut Session, preset: &str, mtlx: Option<bool>| {
+        let mut p = json!({"preset": preset, "ts": "all"});
+        if let Some(on) = mtlx {
+            p["materialX"] = json!(on);
+        }
+        let v = execute(s, "export.plan", &p).unwrap();
+        v.as_array().unwrap().iter().map(|f| (f["file"].as_str().unwrap().to_string(), f["format"].as_str().unwrap().to_string())).collect::<Vec<_>>()
+    };
+    let dir = temp("plan");
+    let written: Vec<String> = files(&export(&mut s, &dir, OPENPBR, true))
+        .iter()
+        .filter(|f| f.ends_with(".mtlx"))
+        .map(|f| f.rsplit(['/', '\\']).next().unwrap().to_string())
+        .collect();
+    assert_eq!(written.len(), s.set_count());
+    let listed: Vec<String> = plan(&mut s, OPENPBR, Some(true)).into_iter().filter(|(_, fmt)| fmt == "mtlx").map(|(f, _)| f).collect();
+    assert_eq!(listed, written);
+    assert!(!plan(&mut s, OPENPBR, None).iter().any(|(f, _)| f.ends_with(".mtlx")));
+    assert!(!plan(&mut s, OPENPBR, Some(false)).iter().any(|(f, _)| f.ends_with(".mtlx")));
+    // A template with no OpenPBR maps writes no material, so it lists none.
+    assert!(!plan(&mut s, "Document channels + Normal + AO", Some(true)).iter().any(|(f, _)| f.ends_with(".mtlx")));
+}

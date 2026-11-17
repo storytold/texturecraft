@@ -69,7 +69,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "List export outputs",
             [],
             None,
-            "{preset?: name or preset object, ts?, format?, bitDepth?, size?, colorSpace?} → [{ts, map, file, format, bitDepth, warnings}]",
+            "{preset?: name or preset object, ts?, format?, bitDepth?, size?, colorSpace?, materialX?: bool (also list the .mtlx files file.exportTextures writes; their map and bitDepth are null)} → [{ts, map, file, format, bitDepth, warnings}]",
             always,
             plan
         ),
@@ -322,10 +322,17 @@ fn sets_param(s: &Session, p: &Value, cmd: &str) -> Result<Vec<usize>> {
 fn plan(s: &mut Session, p: &Value) -> Result<Value> {
     let opts = export_options(s, p, "export.plan")?;
     let mesh_name = stem_of(s.doc.project.mesh.trim_start_matches("builtin:"));
+    let sets = sets_param(s, p, "export.plan")?;
     let mut names = Vec::new();
-    for ts in sets_param(s, p, "export.plan")? {
+    for &ts in &sets {
         for f in texturecraft_formats::list_outputs(&s.doc.project, ts, &mesh_name, &opts).map_err(fe)? {
             names.push(json!({"ts": ts, "map": f.map, "file": f.name, "format": f.format.extension(), "bitDepth": f.bit_depth, "warnings": f.warnings}));
+        }
+    }
+    if p.get("materialX").and_then(Value::as_bool).unwrap_or(false) {
+        let mut warnings = Vec::new();
+        for (ts, file, _) in materialx_documents(s, &sets, &opts, &mut warnings)? {
+            names.push(json!({"ts": ts, "map": null, "file": file, "format": "mtlx", "bitDepth": null, "warnings": []}));
         }
     }
     Ok(json!(names))
@@ -527,12 +534,12 @@ fn export_textures(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "files": written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(), "warnings": warnings }))
 }
 
-/// One `<mesh>_<set>.mtlx` per texture set, next to the textures `opts` just wrote: the
+/// One `<mesh>_<set>.mtlx` per texture set, next to the textures `opts` writes: the
 /// OpenPBR inputs those textures feed (see `texturecraft_formats::materialx`). UDIM sets name
 /// their files with the `<UDIM>` token. Sets with no recognised map, or whose name gives the
-/// same file name as an earlier set's, are skipped with a warning.
-#[cfg(not(target_arch = "wasm32"))]
-fn write_materialx(s: &Session, sets: &[usize], opts: &ExportOptions, dir: &std::path::Path, warnings: &mut Vec<String>) -> Result<Vec<std::path::PathBuf>> {
+/// same file name as an earlier set's, are skipped with a warning. Returns `(set, file name,
+/// document)` for each material that is written.
+fn materialx_documents(s: &Session, sets: &[usize], opts: &ExportOptions, warnings: &mut Vec<String>) -> Result<Vec<(usize, String, String)>> {
     use texturecraft_formats::materialx::{self, Texture};
     let mesh_name = stem_of(s.doc.project.mesh.trim_start_matches("builtin:"));
     if opts.color_space == Some(texturecraft_texel::ColorSpace::Aces2065) {
@@ -567,13 +574,22 @@ fn write_materialx(s: &Session, sets: &[usize], opts: &ExportOptions, dir: &std:
             ));
             continue;
         }
-        let path = dir.join(format!("{stem}.mtlx"));
-        texturecraft_formats::write_atomic(&path, materialx::write(&format!("{mesh_name}_{}", set.name), &textures, None).as_bytes()).map_err(fe)?;
-        out.push(path);
+        out.push((ts, format!("{stem}.mtlx"), materialx::write(&format!("{mesh_name}_{}", set.name), &textures, None)));
     }
     // The normalmap node only exists in a material that has a normal map.
     if normal_map_written && opts.normal_format == Some(NormalFormat::DirectX) {
         warnings.push("MaterialX: the normalmap node reads OpenGL (+Y) normals; this export wrote DirectX normals, so flip the green channel".into());
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_materialx(s: &Session, sets: &[usize], opts: &ExportOptions, dir: &std::path::Path, warnings: &mut Vec<String>) -> Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    for (_, name, document) in materialx_documents(s, sets, opts, warnings)? {
+        let path = dir.join(name);
+        texturecraft_formats::write_atomic(&path, document.as_bytes()).map_err(fe)?;
+        out.push(path);
     }
     Ok(out)
 }

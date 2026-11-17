@@ -1062,14 +1062,22 @@ fn export_selection(app: &TextureCraftApp) -> Vec<usize> {
 #[cfg(not(target_arch = "wasm32"))]
 fn export_sets(app: &mut TextureCraftApp) -> bool {
     let mut written = 0usize;
+    let mut warnings: Vec<String> = Vec::new();
     for ts in export_selection(app) {
         let mut p = export_params(app);
         p["dir"] = json!(app.ui.export.dir);
         p["ts"] = json!(ts);
         match app.run("file.exportTextures", p) {
-            Some(r) => written += r.get("files").and_then(|f| f.as_array()).map(Vec::len).unwrap_or(0),
+            Some(r) => {
+                written += r.get("files").and_then(|f| f.as_array()).map(Vec::len).unwrap_or(0);
+                warnings.extend(r.get("warnings").and_then(|w| w.as_array()).into_iter().flatten().filter_map(|w| w.as_str()).filter(|w| w.starts_with("MaterialX:")).map(str::to_owned));
+            }
             None => return false,
         }
+    }
+    // A MaterialX file that could not be written (wrong template, clashing names) must not pass silently.
+    for w in warnings {
+        app.toast(w, true);
     }
     app.toast(trf("Exported {n} textures to {folder}", &[("n", &written), ("folder", &app.ui.export.dir)]), false);
     true
@@ -1083,7 +1091,7 @@ fn export_sets(app: &mut TextureCraftApp) -> bool {
     true
 }
 
-pub(crate) fn export_params(app: &TextureCraftApp) -> serde_json::Value {
+pub fn export_params(app: &TextureCraftApp) -> serde_json::Value {
     let e = &app.ui.export;
     let mut p = json!({"preset": e.preset, "padding": e.padding, "dilation": e.dilation});
     if !e.format.is_empty() {
@@ -1100,6 +1108,9 @@ pub(crate) fn export_params(app: &TextureCraftApp) -> serde_json::Value {
     }
     if !e.color_space.is_empty() {
         p["colorSpace"] = json!(e.color_space);
+    }
+    if e.material_x {
+        p["materialX"] = json!(true);
     }
     p
 }
@@ -1211,6 +1222,14 @@ fn export_settings_tab(app: &mut TextureCraftApp, ui: &mut Ui, presets: &[textur
             }
         });
         ui.end_row();
+        // The browser downloads a zip of textures and has no MaterialX writer.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            ui.label(tr("MaterialX"));
+            ui.checkbox(&mut app.ui.export.material_x, tr("Also write a MaterialX file (.mtlx) per texture set"))
+                .on_hover_text(tr("Needs the \"OpenPBR (separate maps)\" output template"));
+            ui.end_row();
+        }
     });
 }
 
