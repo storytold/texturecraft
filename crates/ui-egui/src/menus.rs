@@ -362,6 +362,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     // Escape closes a dropdown before Properties, the rail popup, color picking or the stroke
     let popup_open = egui::Popup::is_any_open(ctx);
 
+    let no_widget_focused = ctx.memory(|memory| memory.focused().is_none());
     #[cfg(not(target_arch = "wasm32"))]
     let nothing_focused = ctx.memory(|memory| memory.focused().is_none());
     let commands_to_invoke = ctx.input_mut(|input| {
@@ -386,7 +387,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         if app.ui.windows.confirm_reset_ui {
             // Escape keeps everything, Enter resets (unless a button has the keyboard)
             if !popup_open {
-                crate::windows::reset_ui_keys(app, input, ctx.memory(|memory| memory.focused().is_none()));
+                crate::windows::reset_ui_keys(app, input, no_widget_focused);
             }
         } else if app.ui.windows.project_config.is_some() {
             // Its keys are Escape (close) and Enter (OK); a stroke in progress isn't touched

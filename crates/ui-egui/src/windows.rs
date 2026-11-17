@@ -54,9 +54,12 @@ fn reset_ui(app: &mut TextureCraftApp, ctx: &egui::Context) {
     dialog("reset_ui", tr("Reset UI"), &mut open).show(ctx, |ui| {
         ui.label(tr("Reset the panels, view layout, zoom and every other view setting to their defaults? Settings and shortcuts stay. To reset only the panels, use Reset panel layout."));
         ui.add_space(8.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            reset = ui.add(primary_button(ui, tr("Reset"))).clicked();
-            cancel = ui.button(tr("Cancel")).clicked();
+        // One row keeps the window to its contents; a bare right-to-left layout fills the screen height
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                reset = ui.add(primary_button(ui, tr("Reset"))).clicked();
+                cancel = ui.button(tr("Cancel")).clicked();
+            });
         });
     });
 
