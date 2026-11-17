@@ -243,9 +243,11 @@ fn read_bytes(_file: &Path) -> std::io::Result<Vec<u8>> {
     Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "UI settings use browser storage"))
 }
 
-/// Whether both docks were read rather than replaced by a default
+/// Whether every dock, the two in use and those of the named layouts, was read rather than replaced by a default
 fn fully_read(ui: &UiState) -> bool {
-    !ui.dock.replaced_unreadable() && !ui.inactive_mode_dock.replaced_unreadable()
+    !ui.dock.replaced_unreadable()
+        && !ui.inactive_mode_dock.replaced_unreadable()
+        && ui.named_layouts.iter().all(|layout| !layout.painting.replaced_unreadable() && !layout.baking.replaced_unreadable())
 }
 
 /// The `n`th copy name of an unreadable state: `<stem>.unreadable.<extension>`, then `<stem>.unreadable-N.<extension>`
@@ -407,6 +409,39 @@ pub(crate) mod tests {
             assert_ne!(std::fs::read_to_string(&file).unwrap(), *text, "the next save replaces it once kept");
         }
         std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_named_layout_keeps_a_copy_of_the_state_before_the_next_save() {
+        let folder = test_folder("unreadable-named");
+        let file = folder.join("ui.json");
+        let mut ui = UiState { dock: moved_panels(), ..UiState::default() };
+        assert!(ui.save_named_layout("mine"));
+        let mut storage = MemoryStorage::default();
+        UiStateStore::new(Some(file.clone())).save(&ui, &mut storage);
+        let saved = std::fs::read_to_string(&file).unwrap();
+
+        // The last "Assets" belongs to the saved layout; the docks in use come first
+        let at = saved.rfind("\"Assets\"").expect("the named layout holds Assets");
+        let broken = format!("{}\"Bogus\"{}", &saved[..at], &saved[at + "\"Assets\"".len()..]);
+        std::fs::write(&file, &broken).unwrap();
+
+        let mut store = UiStateStore::new(Some(file.clone()));
+        let loaded = store.load(Some(&storage)).expect("the state loads");
+        assert_eq!(loaded.dock, ui.dock, "the docks in use were readable");
+        assert!(!fully_read(&loaded), "the damaged named layout counts as unread");
+
+        store.save(&loaded, &mut storage);
+        assert_eq!(std::fs::read_to_string(folder.join(unreadable_name("ui", 1, "json"))).unwrap(), broken);
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn valid_named_layouts_and_none_at_all_count_as_read() {
+        let mut ui = UiState::default();
+        assert!(fully_read(&ui));
+        ui.save_named_layout("mine");
+        assert!(fully_read(&restart(&ui)));
     }
 
     #[test]

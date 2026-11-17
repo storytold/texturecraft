@@ -125,6 +125,33 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         LayoutDialog::Manage { renaming, deleting } => manage_dialog(app, ctx, &mut open, renaming, deleting),
     };
     app.ui.layout_dialog = if open { next } else { None };
+
+    // The next Save or rename focuses its field again
+    ctx.data_mut(|data| {
+        if !matches!(app.ui.layout_dialog, Some(LayoutDialog::Save(_))) {
+            data.remove_temp::<String>(egui::Id::unique(SAVE_FOCUS));
+        }
+        if !matches!(app.ui.layout_dialog, Some(LayoutDialog::Manage { renaming: Some(_), .. })) {
+            data.remove_temp::<String>(egui::Id::unique(RENAME_FOCUS));
+        }
+    });
+}
+
+/// How much of the window height the list of saved layouts may take
+const LIST_SCREEN_FRACTION: f32 = 0.5;
+
+/// Memory keys of the text fields that were already focused for the current edit
+const SAVE_FOCUS: &str = "named_layout_save_focused";
+const RENAME_FOCUS: &str = "named_layout_rename_focused";
+
+/// Give `edit` the keyboard once per edit (`what` names it), when it starts. Asking every frame
+/// would take the focus back from the buttons after Tab.
+fn focus_once(ui: &egui::Ui, edit: &egui::Response, key: &'static str, what: String) {
+    let id = egui::Id::unique(key);
+    if ui.data(|data| data.get_temp::<String>(id)).as_deref() != Some(what.as_str()) {
+        edit.request_focus();
+        ui.data_mut(|data| data.insert_temp(id, what));
+    }
 }
 
 fn save_dialog(app: &mut TextureCraftApp, ctx: &egui::Context, open: &mut bool, mut name: String) -> Option<LayoutDialog> {
@@ -132,9 +159,7 @@ fn save_dialog(app: &mut TextureCraftApp, ctx: &egui::Context, open: &mut bool, 
     dialog("save_layout", tr("Save layout"), open).show(ctx, |ui| {
         ui.label(tr("Name of the layout"));
         let edit = ui.add(egui::TextEdit::singleline(&mut name).desired_width(240.0));
-        if !edit.has_focus() && !edit.lost_focus() {
-            edit.request_focus();
-        }
+        focus_once(ui, &edit, SAVE_FOCUS, String::new());
         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -214,42 +239,44 @@ fn manage_dialog(
         if app.ui.named_layouts.is_empty() {
             ui.label(caption(tr("No saved layouts")));
         }
-        for name in app.ui.named_layouts.iter().map(|layout| layout.name.clone()).collect::<Vec<_>>() {
-            ui.horizontal(|ui| match renaming.clone().filter(|(from, _)| *from == name) {
-                Some((from, mut to)) => {
-                    let edit = ui.add(egui::TextEdit::singleline(&mut to).desired_width(180.0));
-                    if !edit.has_focus() && !edit.lost_focus() {
-                        edit.request_focus();
-                    }
-                    let taken = app.ui.named_layouts.iter().any(|layout| layout.name == to.trim() && layout.name != from);
-                    let valid = !to.trim().is_empty() && !taken;
-                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let mut keep = true;
-                    if ui.add_enabled(valid, egui::Button::new(tr("Rename"))).clicked() || (enter && valid) {
-                        let _ = app.ui.rename_named_layout(&from, &to);
-                        keep = false;
-                    }
-                    if ui.button(tr("Cancel")).clicked() {
-                        keep = false;
-                    }
-                    if taken {
-                        ui.label(caption(tr("That name is taken")));
-                    }
-                    renaming = keep.then_some((from, to));
-                }
-                None => {
-                    ui.label(&name);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(tr("Delete")).clicked() {
-                            deleting = Some(name.clone());
+        // Many layouts scroll; Close stays below the list
+        let list_height = ui.ctx().content_rect().height() * LIST_SCREEN_FRACTION;
+        egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, true]).show(ui, |ui| {
+            for name in app.ui.named_layouts.iter().map(|layout| layout.name.clone()).collect::<Vec<_>>() {
+                ui.horizontal(|ui| match renaming.clone().filter(|(from, _)| *from == name) {
+                    Some((from, mut to)) => {
+                        let edit = ui.add(egui::TextEdit::singleline(&mut to).desired_width(180.0));
+                        focus_once(ui, &edit, RENAME_FOCUS, from.clone());
+                        let taken = app.ui.named_layouts.iter().any(|layout| layout.name == to.trim() && layout.name != from);
+                        let valid = !to.trim().is_empty() && !taken;
+                        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let mut keep = true;
+                        if ui.add_enabled(valid, egui::Button::new(tr("Rename"))).clicked() || (enter && valid) {
+                            let _ = app.ui.rename_named_layout(&from, &to);
+                            keep = false;
                         }
-                        if ui.button(tr("Rename")).clicked() {
-                            renaming = Some((name.clone(), name.clone()));
+                        if ui.button(tr("Cancel")).clicked() {
+                            keep = false;
                         }
-                    });
-                }
-            });
-        }
+                        if taken {
+                            ui.label(caption(tr("That name is taken")));
+                        }
+                        renaming = keep.then_some((from, to));
+                    }
+                    None => {
+                        ui.label(&name);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(tr("Delete")).clicked() {
+                                deleting = Some(name.clone());
+                            }
+                            if ui.button(tr("Rename")).clicked() {
+                                renaming = Some((name.clone(), name.clone()));
+                            }
+                        });
+                    }
+                });
+            }
+        });
         ui.add_space(8.0);
         if ui.button(tr("Close")).clicked() {
             finished = true;

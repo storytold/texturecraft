@@ -148,3 +148,50 @@ fn the_control_channel_switches_to_a_layout_by_name_and_rejects_unknown_names() 
     }
     assert!(harness.state().ui.dock.is_open(Panel::Assets), "an unknown name changes nothing");
 }
+
+#[test]
+fn tab_moves_from_the_save_field_to_the_buttons_and_stays_there() {
+    let mut harness = app();
+    layouts_menu(&mut harness, "Save current layout as...");
+    dialog_input(&harness).type_text("Mine");
+    harness.run_steps(2);
+    harness.key_press(egui::Key::Tab);
+    harness.run_steps(30);
+    assert!(harness.get_by_role_and_label(Role::Button, "Save").is_focused(), "the field did not take the focus back");
+}
+
+#[test]
+fn tab_moves_from_the_rename_field_to_the_buttons_and_stays_there() {
+    let mut harness = app();
+    save_as(&mut harness, "First");
+    layouts_menu(&mut harness, "Manage layouts...");
+    harness.get_by_role_and_label(Role::Button, "Rename").click();
+    harness.run_steps(2);
+    dialog_input(&harness).type_text("2");
+    harness.run_steps(2);
+    harness.key_press(egui::Key::Tab);
+    harness.run_steps(30);
+    assert!(harness.get_by_role_and_label(Role::Button, "Rename").is_focused(), "the field did not take the focus back");
+}
+
+#[test]
+fn a_second_save_dialog_focuses_its_field_again() {
+    let mut harness = app();
+    save_as(&mut harness, "First");
+    layouts_menu(&mut harness, "Save current layout as...");
+    harness.run_steps(3);
+    assert!(dialog_input(&harness).is_focused(), "the field is ready for typing");
+}
+
+#[test]
+fn a_long_list_of_layouts_scrolls_and_keeps_close_on_screen() {
+    let mut harness = app();
+    for n in 0..60 {
+        harness.state_mut().ui.save_named_layout(&format!("Layout {n}"));
+    }
+    layouts_menu(&mut harness, "Manage layouts...");
+    harness.run_steps(3);
+    let screen = harness.ctx.content_rect();
+    let close = harness.get_by_role_and_label(Role::Button, "Close").rect();
+    assert!(screen.contains_rect(close), "Close is inside the window: {close:?} in {screen:?}");
+}
