@@ -1,7 +1,7 @@
 //! UI state (serde, so the control channel can read and drive it).
 
 use serde::{Deserialize, Serialize};
-use texturecraft_engine::core::{BakedMap, Channel, NormalFormat};
+use texturecraft_engine::core::{BakedMap, Channel, ChannelBlend, NormalFormat};
 
 use crate::docking::Dock;
 use crate::keymap::Keymap;
@@ -277,6 +277,9 @@ const BAKE_LAYOUT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
+    /// Layer menu ▸ Blending options ▸ Copy: each channel's blend mode and opacity of the copied layer.
+    #[serde(skip)]
+    pub blend_clipboard: Option<Vec<(Channel, ChannelBlend)>>,
     pub mode: Mode,
     pub layout: ViewLayout,
     /// The 3D view's share of the viewport width in the split layout
@@ -413,6 +416,7 @@ impl Default for UiState {
             uv_zoom: 1.0,
             uv_pan: [0.0, 0.0],
             layer_channel: Channel::BaseColor,
+            blend_clipboard: None,
             shelf_filter: String::new(),
             shelf_tab: 0,
             shelf_path: Vec::new(),

@@ -6,7 +6,7 @@ use egui_phosphor::regular as ic;
 use serde_json::{Value, json};
 use texturecraft_engine::compose::ThumbTarget;
 use texturecraft_engine::core::{
-    BakedMap, BlendMode, Channel, Decal, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind, LinkParam, MaterialLink, ProceduralKind, Projection,
+    BakedMap, BlendMode, Channel, ChannelBlend, Decal, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind, LinkParam, MaterialLink, ProceduralKind, Projection,
     Source,
 };
 use texturecraft_engine::filter_lib::scalar_params;
@@ -1107,6 +1107,53 @@ fn geometry_mask_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     });
 }
 
+/// Layer menu ▸ Blending options: the displayed channel's mode and/or opacity for every channel of the layer, and copy / paste of all channels' blending.
+fn blending_options_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
+    let lid = layer.id.0;
+    let project = &app.session.doc.project;
+    let content = project.content_layer(layer.id).unwrap_or(layer);
+    let shown = content.blend(app.ui.layer_channel);
+    let copied: Vec<(Channel, ChannelBlend)> = content.channels.iter().map(|(c, b)| (*c, *b)).collect();
+    let can_paste = app.ui.blend_clipboard.is_some() && !content.channels.is_empty();
+    ui.menu_button(tr("Blending options"), |ui| {
+        let apply = |app: &mut TextureCraftApp, ui: &mut Ui, label: &str, mode: bool, opacity: bool| {
+            let Some(shown) = shown else {
+                ui.add_enabled(false, egui::Button::new(label));
+                return;
+            };
+            if ui.button(label).clicked() {
+                let mut params = json!({"layer": lid, "channel": "all"});
+                if mode {
+                    params["mode"] = json!(format!("{:?}", shown.mode));
+                }
+                if opacity {
+                    params["opacity"] = json!(shown.opacity);
+                }
+                app.run("layer.select", json!({"layer": lid}));
+                app.run("layer.blend", params);
+                ui.close();
+            }
+        };
+        apply(app, ui, tr("Apply blending mode to all channels"), true, false);
+        apply(app, ui, tr("Apply opacity to all channels"), false, true);
+        apply(app, ui, tr("Apply both to all channels"), true, true);
+        ui.separator();
+        if ui.button(tr("Copy channel blending settings")).clicked() {
+            app.ui.blend_clipboard = Some(copied);
+            ui.close();
+        }
+        if ui.add_enabled(can_paste, egui::Button::new(tr("Paste channel blending settings"))).clicked() {
+            if let Some(saved) = app.ui.blend_clipboard.clone() {
+                let channels: serde_json::Map<String, Value> =
+                    saved.iter().map(|(c, b)| (c.id().to_string(), json!({"mode": format!("{:?}", b.mode), "opacity": b.opacity}))).collect();
+                app.run("layer.select", json!({"layer": lid}));
+                app.run("layer.blending.set", json!({"layer": lid, "channels": channels}));
+            }
+            ui.close();
+        }
+    });
+}
+
 fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     let tk = Tokens::get(ui.ctx());
     ui.set_min_width(230.0);
@@ -1162,6 +1209,7 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     run(app, ui, tr("Copy to all texture sets"), "layer.instantiateAll", json!({"layer": lid, "copy": true}), app.session.set_count() > 1);
     run(app, ui, tr("Remove layer(s)"), "layer.remove", json!({"layer": lid}), true);
     run(app, ui, tr("Group layer(s)"), "layer.group", json!({"layer": lid}), true);
+    blending_options_menu(app, ui, layer);
     ui.separator();
     ui.horizontal(|ui| {
         let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());

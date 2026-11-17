@@ -17,6 +17,7 @@ mod fill_projection_section;
 mod filter_picker;
 mod generator_panel;
 mod history_panel;
+mod layer_blending_options;
 mod layer_clipboard;
 mod layer_rename;
 mod layers_panel;

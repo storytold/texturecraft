@@ -23,6 +23,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("layer.move", "Move layer", [], None, "{layer?, index?} | {layer?, above?: id|null, inside?: bool} | {layer?, delta: ±n}", has_layer, move_layer),
         cmd!("layer.blend", "Set channel blending", [], None, "{layer?, channel?: id|all, mode?, opacity?: 0..1, enabled?}", has_layer, blend),
         cmd!(
+            "layer.blending.set",
+            "Set blending of several channels",
+            [],
+            None,
+            "{layer?, channels: {<channel id>: {mode?, opacity?: 0..1}}} (only channels the layer has enabled; one undo step)",
+            has_layer,
+            blending_set
+        ),
+        cmd!(
             "layer.fill.set",
             "Set fill source",
             [],
@@ -265,6 +274,35 @@ fn blend(s: &mut Session, p: &Value) -> Result<Value> {
                 None => {}
             }
             if let Some(b) = l.channels.get_mut(&c) {
+                if let Some(m) = mode {
+                    b.mode = m;
+                }
+                if let Some(o) = opacity {
+                    b.opacity = o;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(Value::Null)
+}
+
+/// `layer.blending.set`: each listed channel gets its own mode and opacity in one undo step. Channels the layer
+/// has disabled stay disabled, and channels not listed stay as they are.
+fn blending_set(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = content_param(s, "layer.blending.set", p)?;
+    let listed = p.get("channels").and_then(Value::as_object).ok_or_else(|| bad("layer.blending.set", "`channels` is required"))?;
+    let mut edits: Vec<(Channel, Option<BlendMode>, Option<f32>)> = Vec::new();
+    for (key, value) in listed {
+        let channel = Channel::parse(key).ok_or_else(|| bad("layer.blending.set", format!("unknown channel `{key}`")))?;
+        let mode = blend_param("layer.blending.set", value, "mode")?;
+        let opacity = f32p(value, "opacity").map(|o| o.clamp(0.0, 1.0));
+        edits.push((channel, mode, opacity));
+    }
+    s.edit("Layer blending", |s| {
+        let l = s.doc.project.layer_mut(id)?;
+        for (channel, mode, opacity) in edits {
+            if let Some(b) = l.channels.get_mut(&channel) {
                 if let Some(m) = mode {
                     b.mode = m;
                 }

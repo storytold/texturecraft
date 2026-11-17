@@ -791,3 +791,24 @@ fn unparseable_color_param_returns_error() {
     let err = execute(&mut s, "tool.click", &json!({"uv": [0.2, 0.8, 0.4]})).unwrap_err();
     assert_eq!(err.to_string(), "`tool.click`: a 2D view point needs `uv` as [u, v]");
 }
+
+#[test]
+fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
+    let mut s = session();
+    let layer = execute(&mut s, "layer.add.paint", &json!({})).unwrap()["layer"].as_u64().unwrap();
+    let read = |s: &Session| s.doc.project.layers[&texturecraft_engine::core::LayerId(layer)].channels.clone();
+    let before = read(&s);
+    execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"baseColor": {"mode": "Multiply", "opacity": 0.25}, "roughness": {"opacity": 0.5}}})).unwrap();
+    let after = read(&s);
+    assert_eq!((after[&Channel::BaseColor].mode.label(), after[&Channel::BaseColor].opacity), ("Multiply", 0.25));
+    assert_eq!((after[&Channel::Roughness].mode, after[&Channel::Roughness].opacity), (before[&Channel::Roughness].mode, 0.5));
+    assert_eq!(after[&Channel::Metallic], before[&Channel::Metallic], "channels not listed stay as they were");
+    // A channel the layer has disabled stays disabled
+    execute(&mut s, "layer.blend", &json!({"layer": layer, "channel": "metallic", "enabled": false})).unwrap();
+    execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"metallic": {"opacity": 0.1}}})).unwrap();
+    assert!(!read(&s).contains_key(&Channel::Metallic));
+    assert!(execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"nope": {}}})).is_err());
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(read(&s), after, "each call was one undo step");
+}
