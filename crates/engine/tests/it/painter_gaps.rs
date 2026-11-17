@@ -244,6 +244,11 @@ fn decals_keep_the_image_aspect_and_flip_their_image() {
     assert_eq!(size(&mut s).1, [false, true], "the other flip stays");
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     assert_eq!(size(&mut s).1, [true, true]);
+
+    // A new image in the same call sets the aspect: a tall one (1:2)
+    let tall = s.import_resource_bytes("tall.png", png(4, 8, |_, _| [255, 0, 0, 255])).unwrap();
+    execute(&mut s, "layer.decal.set", &json!({"image": tall, "size": 0.4, "keepProportions": true})).unwrap();
+    assert_eq!(size(&mut s).0, [0.2, 0.4]);
 }
 
 #[test]

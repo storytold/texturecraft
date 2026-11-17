@@ -174,8 +174,10 @@ fn decal_of(s: &Session, cmd: &str, id: LayerId, effect: Option<LayerId>) -> Res
 }
 
 /// Width over height of the image the decal of fill layer `id` (or of mask fill effect `effect`) shows
-fn image_aspect(s: &Session, id: LayerId, effect: Option<LayerId>) -> Option<f32> {
+/// (`new`: the image a call replaces it with, which then counts instead)
+fn image_aspect(s: &Session, id: LayerId, effect: Option<LayerId>, new: Option<&str>) -> Option<f32> {
     let name = match effect {
+        _ if new.is_some() => new?.to_string(),
         Some(effect) => match &s.doc.project.effect(effect)?.1.kind {
             EffectKind::Fill { source: Source::Image { name, .. }, .. } => name.clone(),
             _ => return None,
@@ -222,7 +224,7 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
     }
     let keep = boolp(params, "keepProportions") == Some(true);
     let ratio = decal.size[0] / decal.size[1].max(1e-6);
-    let aspect = if keep { image_aspect(session, layer_id, effect).unwrap_or(ratio) } else { ratio };
+    let aspect = if keep { image_aspect(session, layer_id, effect, strp(params, "image")).unwrap_or(ratio) } else { ratio };
     if let Some(mut size) = size_param(params, aspect, mesh_diagonal).or_else(|| keep.then_some(decal.size)) {
         // A height sets the width through `aspect`; a pair or the current size sets the height from the width
         if keep && params.get("size").is_none_or(Value::is_array) {
