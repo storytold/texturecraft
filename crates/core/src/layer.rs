@@ -192,6 +192,14 @@ pub struct Decal {
     pub offset: [f32; 2],
     /// How far in front of and behind the frame the decal reaches (world units).
     pub depth: f32,
+    /// Mirror the image inside the frame: left to right (`[0]`), top to bottom (`[1]`). Old projects have neither.
+    #[serde(default, skip_serializing_if = "not_flipped")]
+    pub flip: [bool; 2],
+}
+
+/// Serde helper: a decal that mirrors nothing saves without the field
+fn not_flipped(flip: &[bool; 2]) -> bool {
+    !flip[0] && !flip[1]
 }
 
 impl Default for Projection {
@@ -1334,6 +1342,19 @@ mod tests {
         assert!(hm.apply(0.5, 0.1) > 0.5 && hm.apply(0.5, -0.1) < 0.5);
         assert!(HeightMask { offset: 0.5, ..hm }.apply(0.5, 0.0) > 0.5);
         assert_eq!(hm.apply(0.5, f32::NAN), 0.5);
+    }
+
+    #[test]
+    fn old_decals_load_unflipped_and_save_unchanged() {
+        let old = r#"{"center":[0.0,0.0,0.0],"normal":[0.0,0.0,1.0],"up":[0.0,1.0,0.0],"size":[1.0,2.0],"rotation":0.0,"offset":[0.0,0.0],"depth":0.5}"#;
+        let decal: Decal = serde_json::from_str(old).unwrap();
+        assert_eq!(decal.flip, [false, false]);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&serde_json::to_string(&decal).unwrap()).unwrap(), serde_json::from_str::<serde_json::Value>(old).unwrap());
+
+        let flipped = Decal { flip: [true, false], ..decal };
+        let saved = serde_json::to_string(&flipped).unwrap();
+        assert!(saved.contains(r#""flip":[true,false]"#), "{saved}");
+        assert_eq!(serde_json::from_str::<Decal>(&saved).unwrap(), flipped);
     }
 
     #[test]

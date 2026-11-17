@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use texturecraft_core::{Channel, Decal, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source};
 use texturecraft_geom::glam::{Vec2, Vec3};
 
-use crate::commands::{CommandSpec, always, bad, channel_param, f32p, has_layer, layer_param, strp, u64p, vec3};
+use crate::commands::{CommandSpec, always, bad, boolp, channel_param, f32p, has_layer, layer_param, strp, u64p, vec3};
 use crate::tool_cmds::viewport_of;
 use crate::{Result, Session, StackTarget, cmd};
 
@@ -16,7 +16,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add decal",
             [],
             None,
-            "{image: resource name, channel?: a channel id (default baseColor) | \"mask\" (a new fill layer masked by the image's gray), x?, y?: viewport pixels (default: the view center; a point on another texture set selects it), viewport?: [w,h] | position?: [x,y,z], normal?: [x,y,z] (on the selected texture set), up?: [x,y,z] (the image's up; default the view's up, or the view direction when that is along the normal), size?: height | [w,h] (world units; default a quarter of the mesh), rotation?: degrees, depth?, name?} → {layer, decal, maskEffect: the mask fill effect holding the image with channel \"mask\", else null} — a fill layer projecting the image from a frame placed on the surface; seen from the front, the image reads the right way round",
+            "{image: resource name, channel?: a channel id (default baseColor) | \"mask\" (a new fill layer masked by the image's gray), x?, y?: viewport pixels (default: the view center; a point on another texture set selects it), viewport?: [w,h] | position?: [x,y,z], normal?: [x,y,z] (on the selected texture set), up?: [x,y,z] (the image's up; default the view's up, or the view direction when that is along the normal), size?: height | [w,h] (world units; default a quarter of the mesh), keepProportions?: true makes the height follow the width by the image's aspect, flipU?, flipV?: mirror the image left to right / top to bottom inside the frame, rotation?: degrees, depth?, name?} → {layer, decal, maskEffect: the mask fill effect holding the image with channel \"mask\", else null} — a fill layer projecting the image from a frame placed on the surface; seen from the front, the image reads the right way round",
             always,
             add
         ),
@@ -25,7 +25,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit decal",
             [],
             None,
-            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z], size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
+            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z], size?: height | [w,h], keepProportions?: true keeps the image's aspect (the current ratio without an image): a height sets the width, a [w,h] pair or no size sets the height from the width, flipU?, flipV?: mirror the image left to right / top to bottom inside the frame, rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
             has_layer,
             set
         ),
@@ -112,7 +112,10 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 
     let mesh_diagonal = mesh_size(s);
     let default_height = mesh_diagonal * DEFAULT_HEIGHT;
-    let size = size_param(p, aspect, mesh_diagonal).unwrap_or([default_height * aspect, default_height]);
+    let mut size = size_param(p, aspect, mesh_diagonal).unwrap_or([default_height * aspect, default_height]);
+    if boolp(p, "keepProportions") == Some(true) && p.get("size").is_some_and(Value::is_array) {
+        size[1] = (size[0] / aspect).clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE);
+    }
     let decal = Decal {
         center: center.to_array(),
         normal: normal.to_array(),
@@ -120,6 +123,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         size,
         rotation: f32p(p, "rotation").unwrap_or(0.0).rem_euclid(360.0),
         offset: [0.0; 2],
+        flip: [boolp(p, "flipU").unwrap_or(false), boolp(p, "flipV").unwrap_or(false)],
         // By default it reaches half its larger side into the surface
         depth: f32p(p, "depth").map_or(size[0].max(size[1]) * 0.5, |depth| depth.clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE)),
     };
@@ -169,6 +173,25 @@ fn decal_of(s: &Session, cmd: &str, id: LayerId, effect: Option<LayerId>) -> Res
     }
 }
 
+/// Width over height of the image the decal of fill layer `id` (or of mask fill effect `effect`) shows
+fn image_aspect(s: &Session, id: LayerId, effect: Option<LayerId>) -> Option<f32> {
+    let name = match effect {
+        Some(effect) => match &s.doc.project.effect(effect)?.1.kind {
+            EffectKind::Fill { source: Source::Image { name, .. }, .. } => name.clone(),
+            _ => return None,
+        },
+        None => match &s.doc.project.layer(id).ok()?.kind {
+            LayerKind::Fill(fill) => fill.sources.values().find_map(|source| match source {
+                Source::Image { name, .. } => Some(name.clone()),
+                _ => None,
+            })?,
+            _ => return None,
+        },
+    };
+    let image = s.images.get(&name)?;
+    Some(image.width as f32 / image.height.max(1) as f32)
+}
+
 fn set(session: &mut Session, params: &Value) -> Result<Value> {
     let command = "layer.decal.set";
     let effect = u64p(params, "effect").map(LayerId);
@@ -197,8 +220,21 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
     if params.get("up").is_some() {
         decal.up = decal_up(session, command, params, Vec3::from(decal.normal))?.to_array();
     }
-    if let Some(size) = size_param(params, decal.size[0] / decal.size[1].max(1e-6), mesh_diagonal) {
+    let keep = boolp(params, "keepProportions") == Some(true);
+    let ratio = decal.size[0] / decal.size[1].max(1e-6);
+    let aspect = if keep { image_aspect(session, layer_id, effect).unwrap_or(ratio) } else { ratio };
+    if let Some(mut size) = size_param(params, aspect, mesh_diagonal).or_else(|| keep.then_some(decal.size)) {
+        // A height sets the width through `aspect`; a pair or the current size sets the height from the width
+        if keep && params.get("size").is_none_or(Value::is_array) {
+            size[1] = (size[0] / aspect).clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE);
+        }
         decal.size = size;
+    }
+    if let Some(flip) = boolp(params, "flipU") {
+        decal.flip[0] = flip;
+    }
+    if let Some(flip) = boolp(params, "flipV") {
+        decal.flip[1] = flip;
     }
     if let Some(rotation) = f32p(params, "rotation") {
         decal.rotation = rotation.rem_euclid(360.0);

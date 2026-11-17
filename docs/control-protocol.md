@@ -378,6 +378,18 @@ is at), `camera.select {index? | name?}` restores one, `camera.rename {index? | 
 go to the first nine. Commands jump straight to the view; the desktop UI glides there over about a third
 of a second.
 
+## Decals
+
+`layer.add.decal {image, ...}` places an image as a decal and `layer.decal.set {layer? | effect?, ...}` edits
+one (`command.list` shows every param). Three of them keep the image's look:
+
+- `keepProportions: true` keeps the image's aspect (the decal's current ratio when it shows no image). A
+  height (`size: 0.2`) sets the width; a `[w, h]` pair or no `size` sets the height from the width. It acts
+  in that call only and is not saved: the desktop Properties panel's "Keep proportions" box (on for every
+  decal) sends it with each Width or Height edit.
+- `flipU` / `flipV`: mirror the image left to right / top to bottom inside the frame. They are saved with
+  the decal (`flip: [u, v]`, left out while both are false, so older projects load and save unchanged).
+
 ## MaterialCraft materials
 
 A `.mcmat` portable material (MaterialCraft's format, read here by `formats::mcmat`; the manifest is

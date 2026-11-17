@@ -2524,11 +2524,27 @@ fn decal_editor(app: &mut TextureCraftApp, ui: &mut Ui, d: &Decal, layer: LayerI
         (tr("Depth"), diag * 0.005..=diag),
     ];
     let mut edit = None;
-    for ((label, range), x) in rows.into_iter().zip(v.iter_mut()) {
-        edit = edit.or(slider_edit(ui, label, x, range, 3));
+    for (row, ((label, range), x)) in rows.into_iter().zip(v.iter_mut()).enumerate() {
+        edit = edit.or(slider_edit(ui, label, x, range, 3).map(|merge| (row, merge)));
     }
-    if let Some(merge) = edit {
-        app.run("layer.decal.set", json!({"layer": layer.0, "size": [v[0], v[1]], "rotation": v[2], "offset": [v[3], v[4]], "depth": v[5], "merge": merge}));
+    // The lock is a setting of the editor, not of the decal: every decal starts locked
+    let keep_id = egui::Id::new(("decal_keep_proportions", layer));
+    let mut keep = ui.ctx().data(|data| data.get_temp::<bool>(keep_id)).unwrap_or(true);
+    if ui.checkbox(&mut keep, tr("Keep proportions")).on_hover_text(tr("Width and height follow each other by the image's aspect")).changed() {
+        ui.ctx().data_mut(|data| data.insert_temp(keep_id, keep));
+        if keep {
+            app.run("layer.decal.set", json!({"layer": layer.0, "keepProportions": true}));
+        }
+    }
+    let mut flip = d.flip;
+    let flipped = ui.horizontal(|ui| ui.checkbox(&mut flip[0], tr("Flip U")).changed() | ui.checkbox(&mut flip[1], tr("Flip V")).changed()).inner;
+    if flipped {
+        app.run("layer.decal.set", json!({"layer": layer.0, "flipU": flip[0], "flipV": flip[1]}));
+    }
+    if let Some((row, merge)) = edit {
+        // Locked: the edited side sets the other (a height sets the width, anything else the height)
+        let size = if keep && row == 1 { json!(v[1]) } else { json!([v[0], v[1]]) };
+        app.run("layer.decal.set", json!({"layer": layer.0, "size": size, "keepProportions": keep && row < 2, "rotation": v[2], "offset": [v[3], v[4]], "depth": v[5], "merge": merge}));
     }
     ui.label(
         RichText::new(tr("The image's alpha cuts the decal's shape; faces turned away and surfaces beyond its depth stay clear."))

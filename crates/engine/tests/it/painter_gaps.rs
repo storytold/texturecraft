@@ -205,6 +205,48 @@ fn decals_project_an_image_from_a_frame_placed_on_the_surface() {
 }
 
 #[test]
+fn decals_keep_the_image_aspect_and_flip_their_image() {
+    let mut s = session();
+    // Twice as wide as tall, left half red and right half blue
+    let name = s.import_resource_bytes("wide.png", png(8, 4, |x, _| if x < 4 { [255, 0, 0, 255] } else { [0, 0, 255, 255] })).unwrap();
+    let r = execute(&mut s, "layer.add.decal", &json!({"image": name, "x": 200, "y": 200, "size": 0.5})).unwrap();
+    let layer = id(r.clone(), "layer");
+    assert_eq!(r["decal"]["size"], json!([1.0, 0.5]), "a new decal follows its image");
+    assert!(r["decal"].get("flip").is_none(), "nothing flipped saves nothing extra");
+    let size = |s: &mut Session| {
+        let LayerKind::Fill(f) = &s.doc.project.layer(layer).unwrap().kind else { panic!("a fill layer") };
+        let Projection::Decal(d) = &f.projection else { panic!("a decal") };
+        (d.size, d.flip)
+    };
+
+    // A pair of sides is taken as given, unless the proportions are kept: then the width wins
+    execute(&mut s, "layer.decal.set", &json!({"size": [0.6, 0.6]})).unwrap();
+    assert_eq!(size(&mut s).0, [0.6, 0.6]);
+    execute(&mut s, "layer.decal.set", &json!({"size": [0.8, 0.8], "keepProportions": true})).unwrap();
+    assert_eq!(size(&mut s).0, [0.8, 0.4], "the width sets the height by the image's aspect");
+    execute(&mut s, "layer.decal.set", &json!({"size": 0.2, "keepProportions": true})).unwrap();
+    assert_eq!(size(&mut s).0, [0.4, 0.2], "a height sets the width");
+    execute(&mut s, "layer.decal.set", &json!({"size": [0.6, 0.6]})).unwrap();
+    execute(&mut s, "layer.decal.set", &json!({"keepProportions": true})).unwrap();
+    assert_eq!(size(&mut s).0, [0.6, 0.3], "turning the lock on fits the height to the width");
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(size(&mut s).0, [0.6, 0.6], "one undo step");
+
+    // Flip U and V each on their own, kept by later edits, undone one step at a time
+    execute(&mut s, "layer.decal.set", &json!({"size": [1.0, 0.5]})).unwrap();
+    assert!(red(at(&mut s, Channel::BaseColor, 190.0, 200.0)) && !red(at(&mut s, Channel::BaseColor, 210.0, 200.0)));
+    let r = execute(&mut s, "layer.decal.set", &json!({"flipU": true})).unwrap();
+    assert_eq!(r["decal"]["flip"], json!([true, false]));
+    assert!(!red(at(&mut s, Channel::BaseColor, 190.0, 200.0)) && red(at(&mut s, Channel::BaseColor, 210.0, 200.0)), "Flip U mirrors the image in its frame");
+    execute(&mut s, "layer.decal.set", &json!({"flipV": true, "rotation": 10})).unwrap();
+    assert_eq!(size(&mut s).1, [true, true]);
+    execute(&mut s, "layer.decal.set", &json!({"flipU": false})).unwrap();
+    assert_eq!(size(&mut s).1, [false, true], "the other flip stays");
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(size(&mut s).1, [true, true]);
+}
+
+#[test]
 fn a_decal_takes_its_up_from_the_params_or_a_rule_that_never_degenerates() {
     let mut s = session();
     let name = s.import_resource_bytes("logo.png", png(8, 4, |x, _| if x < 4 { [255, 0, 0, 255] } else { [0, 0, 255, 255] })).unwrap();

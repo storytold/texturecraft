@@ -3676,6 +3676,7 @@ soft {soft:?}"
             rotation: 0.0,
             offset: [0.0; 2],
             depth: 0.5,
+            flip: [false; 2],
         };
         let id = f.project.alloc_id();
         let mut fill = Fill { projection: Projection::Decal(d), ..Fill::default() };
@@ -3705,6 +3706,57 @@ soft {soft:?}"
         assert!(close(out.value(Channel::BaseColor, 2, 2), [0.5; 3]), "outside the frame");
         let half = composite(0.5);
         assert!(close(half.value(Channel::BaseColor, 32, 32), [0.75, 0.25, 0.25]), "the image alpha shapes the decal");
+    }
+
+    #[test]
+    fn flipping_a_decal_mirrors_its_image_inside_the_frame() {
+        let mut f = fixture();
+        let s = f.gbuf.surface(&f.mesh, 32 * 64 + 32).unwrap();
+        // The frame's center sits a quarter of its width to the right of the texel, so the texel reads the image's left half
+        let d = texturecraft_core::Decal {
+            center: s.pos.to_array(),
+            normal: s.nrm.to_array(),
+            up: s.nrm.any_orthonormal_vector().to_array(),
+            size: [1.0, 1.0],
+            rotation: 0.0,
+            offset: [0.25, 0.0],
+            depth: 0.5,
+            flip: [false; 2],
+        };
+        let id = f.project.alloc_id();
+        let mut fill = Fill { projection: Projection::Decal(d), ..Fill::default() };
+        fill.sources.insert(Channel::BaseColor, Source::image("decal"));
+        f.project.insert_layer(0, Layer::new(id, "Decal", LayerKind::Fill(fill), &[Channel::BaseColor]), None, false).unwrap();
+
+        // Left half red, right half blue
+        let img = crate::store::ImageRes { width: 2, height: 1, rgba: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]], srgb: false };
+        let images: ImageStore = [("decal".to_string(), std::sync::Arc::new(img))].into_iter().collect();
+        let texel = |f: &Fixture, flip: [bool; 2]| {
+            let mut project = f.project.clone();
+            if let Ok(layer) = project.layer_mut(id)
+                && let LayerKind::Fill(fill) = &mut layer.kind
+            {
+                fill.projection = Projection::Decal(texturecraft_core::Decal { flip, ..d });
+            }
+            let inp = Inputs {
+                project: &project,
+                ts: 0,
+                mesh: &f.mesh,
+                gbuf: &f.gbuf,
+                pixels: &f.pixels,
+                baked: &f.baked,
+                block_scales: project.texture_sets[0].block_scales(),
+                preview: None,
+                images: &images,
+                bounds: f.mesh.bounds(),
+            };
+            let mut out = Composite::new(&project.texture_sets[0].channel_list(), 64);
+            composite_tiles(&inp, &mut out, &all_tiles(64, 64));
+            out.value(Channel::BaseColor, 32, 32)
+        };
+        assert!(close(texel(&f, [false, false]), [1.0, 0.0, 0.0]), "the left half shows red");
+        assert!(close(texel(&f, [true, false]), [0.0, 0.0, 1.0]), "Flip U shows the right half there");
+        assert!(close(texel(&f, [false, true]), [1.0, 0.0, 0.0]), "Flip V leaves the left half");
     }
 
     #[test]

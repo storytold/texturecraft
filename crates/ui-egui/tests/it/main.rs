@@ -9,6 +9,7 @@ mod close_unsaved;
 mod color_picker;
 mod color_selection_editor;
 mod curvature_generator;
+mod decal_proportions;
 mod effect_rows;
 mod effect_sliders;
 mod file_dialogs;
