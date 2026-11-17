@@ -1,7 +1,7 @@
 //! The decal editor's Mirror across and Flip controls set the decal's mirrored copy
 
-use egui_kittest::Harness;
 use egui::accesskit::Role;
+use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use serde_json::json;
 use texturecraft_engine::core::{DecalFlip, LayerKind, Projection};
@@ -49,7 +49,7 @@ fn symmetry_of(harness: &Harness<'_, TextureCraftApp>, layer: u64) -> Option<(u8
 
 /// Opens the combo showing `current` and picks `choice` in its menu
 fn pick(harness: &mut Harness<'_, TextureCraftApp>, current: &str, choice: &str) {
-    harness.get_by_role_and_label(Role::ComboBox, current).click();
+    harness.get_all_by_role(Role::ComboBox).find(|combo| combo.value().as_deref() == Some(current)).expect("the combo").click();
     harness.run_steps(SETTLE_FRAMES);
     harness.get_all_by_label(choice).last().expect("the menu entry").click();
     harness.run_steps(SETTLE_FRAMES);

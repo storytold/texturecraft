@@ -2,7 +2,9 @@
 //! (a decal fill with a planar projection), as a fill layer with a decal projection.
 
 use serde_json::{Value, json};
-use texturecraft_core::{Channel, Decal, DecalFlip, DecalSymmetry, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source};
+use texturecraft_core::{
+    Channel, Decal, DecalFlip, DecalSymmetry, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source,
+};
 use texturecraft_geom::glam::{Vec2, Vec3};
 
 use crate::commands::{CommandSpec, always, bad, channel_param, f32p, has_layer, layer_param, strp, u64p, vec3};

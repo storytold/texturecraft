@@ -3764,7 +3764,16 @@ soft {soft:?}"
 
     /// A 1 by 1 decal on the cube's +X face (the image's right runs toward -Z, its up toward +Y)
     fn cube_decal(center: [f32; 3], size: f32, symmetry: Option<texturecraft_core::DecalSymmetry>) -> texturecraft_core::Decal {
-        texturecraft_core::Decal { center, normal: [1.0, 0.0, 0.0], up: [0.0, 1.0, 0.0], size: [size; 2], rotation: 0.0, offset: [0.0; 2], depth: 0.5, symmetry }
+        texturecraft_core::Decal {
+            center,
+            normal: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            size: [size; 2],
+            rotation: 0.0,
+            offset: [0.0; 2],
+            depth: 0.5,
+            symmetry,
+        }
     }
 
     /// What the decal of `size` centered at (cy, cz) on the +X face gives the point (y, z) of
@@ -3809,13 +3818,7 @@ soft {soft:?}"
         }
 
         // No symmetry: the -X face stays bare
-        let bare = cube_decal_texels(cube_decal([1.0, at.0, at.1], 1.0, None), |p, n| {
-            if n.x > 0.99 {
-                face_expect(p.y, p.z, at, 1.0)
-            } else {
-                Some(None)
-            }
-        });
+        let bare = cube_decal_texels(cube_decal([1.0, at.0, at.1], 1.0, None), |p, n| if n.x > 0.99 { face_expect(p.y, p.z, at, 1.0) } else { Some(None) });
         assert!(bare > 800);
 
         // Mirrored across Z, the copy sits on the same face on the other side of the Z = 0 plane
@@ -3840,13 +3843,13 @@ soft {soft:?}"
         use texturecraft_core::{DecalFlip, DecalSymmetry};
         let symmetry = Some(DecalSymmetry { axis: 0, flip: DecalFlip::None });
         for at in [(0.5, 0.3), (-0.4, -0.5)] {
-            let checked = cube_decal_texels(cube_decal([1.0, at.0, at.1], 0.4, symmetry), |p, n| {
-                if n.x.abs() > 0.99 {
-                    face_expect(p.y, p.z, at, 0.4)
-                } else {
-                    Some(None)
-                }
-            });
+            let checked =
+                cube_decal_texels(
+                    cube_decal([1.0, at.0, at.1], 0.4, symmetry),
+                    |p, n| {
+                        if n.x.abs() > 0.99 { face_expect(p.y, p.z, at, 0.4) } else { Some(None) }
+                    },
+                );
             assert!(checked > 800, "{at:?}");
         }
     }
