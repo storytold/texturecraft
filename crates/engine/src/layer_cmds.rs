@@ -31,6 +31,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_layer,
             fill_set
         ),
+        cmd!("layer.fill.copyChannel", "Copy channel settings", [], None, "{layer? | effect?: content fill effect id, from, to}", has_layer, fill_copy_channel),
         cmd!(
             "layer.fill.projection",
             "Set fill projection",
@@ -458,6 +459,47 @@ fn floats<const N: usize>(p: &Value, key: &str, lo: f32, hi: f32) -> Option<[f32
         }
         v => one(v).map(|f| [f; N]),
     }
+}
+
+/// Copy the source of fill channel `from` onto channel `to` of the same fill layer or
+/// fill effect, enabling `to` when it was off.
+fn fill_copy_channel(s: &mut Session, p: &Value) -> Result<Value> {
+    let target = fill_target(s, p, "layer.fill.copyChannel")?;
+    let from = channel_param("layer.fill.copyChannel", p, "from")?.ok_or_else(|| bad("layer.fill.copyChannel", "`from` is required"))?;
+    let to = channel_param("layer.fill.copyChannel", p, "to")?.ok_or_else(|| bad("layer.fill.copyChannel", "`to` is required"))?;
+    if from == to {
+        return Err(bad("layer.fill.copyChannel", "cannot copy a channel onto itself"));
+    }
+
+    s.edit("Copy channel settings", |s| {
+        match target {
+            FillTarget::Effect(_) => {
+                let fill = fill_mut(s, target)?;
+                let source = fill.sources.get(&from).cloned().ok_or_else(|| bad("layer.fill.copyChannel", "the channel has no source to copy"))?;
+                fill.sources.insert(to, source);
+                Ok(())
+            }
+            FillTarget::Layer(id) => {
+                let layer = s.doc.project.layer_mut(id)?;
+                if !layer.channels.contains_key(&from) {
+                    return Err(bad("layer.fill.copyChannel", "the channel has no source to copy"));
+                }
+                let source = match &layer.kind {
+                    // An enabled channel without an explicit source shows its default uniform.
+                    LayerKind::Fill(fill) => fill.source(from),
+                    _ => return Err(EngineError::Other("not a fill layer".into())),
+                };
+                let layer = s.doc.project.layer_mut(id)?;
+                match &mut layer.kind {
+                    LayerKind::Fill(fill) => fill.sources.insert(to, source),
+                    _ => return Err(EngineError::Other("not a fill layer".into())),
+                };
+                layer.channels.entry(to).or_default();
+                Ok(())
+            }
+        }
+    })?;
+    Ok(Value::Null)
 }
 
 fn fill_projection(s: &mut Session, p: &Value) -> Result<Value> {

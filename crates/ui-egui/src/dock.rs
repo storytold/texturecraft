@@ -2572,6 +2572,20 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                             app.run("layer.fill.set", set(json!({"anchor": a.0})));
                             ui.close();
                         }
+                        ui.separator();
+                        ui.menu_button(tr("Copy settings to"), |ui| {
+                            let channels =
+                                app.session.doc.project.texture_set(app.session.ts()).map(|set| set.channel_list()).unwrap_or_default();
+                            for other in channels {
+                                if other == c {
+                                    continue;
+                                }
+                                if ui.button(tr(other.label())).clicked() {
+                                    app.run("layer.fill.copyChannel", with(base, json!({"from": c.id(), "to": other.id()})));
+                                    ui.close();
+                                }
+                            }
+                        });
                     })
                     .response
                     .on_hover_text(tr("Channel source: uniform value, procedural, image or anchor"));
