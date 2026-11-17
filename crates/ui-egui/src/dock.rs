@@ -151,7 +151,7 @@ pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
         // The channel box takes what the six buttons leave, so the toolbar stays on one row in a narrow column
         let buttons = 6.0 * (ICON_BUTTON_SIZE + 4.0) + 4.0 * 2.0;
         let channel_width = (ui.available_width() - buttons).clamp(CHANNEL_BOX_MIN_WIDTH, CHANNEL_BOX_WIDTH);
-        egui::ComboBox::from_id_salt("layer_channel").width(channel_width).selected_text(tr(app.ui.layer_channel.label())).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("layer_channel").width(channel_width).truncate().selected_text(tr(app.ui.layer_channel.label())).show_ui(ui, |ui| {
             for c in chans {
                 ui.selectable_value(&mut app.ui.layer_channel, c, tr(c.label()));
             }
