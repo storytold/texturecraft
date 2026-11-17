@@ -7,7 +7,8 @@
 //! - `session.inspect`: project, texture sets, layer stack, tool, camera, display, history.
 //! - `ui.inspect`: the UI state (panels, windows, mode, layout, viewport rect, who draws the title bar).
 //! - `ui.menu.list`: the menu catalog with ids, shortcuts and whether each is live.
-//! - `ui.menu.invoke {id}`: behave like a menu click (may open a window); `ui.resetUi` resets at once, without the menu's question.
+//! - `ui.menu.invoke {id}`: behave like a menu click (may open a window; `ui.resetUi` asks first).
+//! - `ui.reset`: reset the panels and every view setting at once, without the question the menu asks.
 //! - `ui.set {...}`: merge fields into the UI state (e.g. `{"layout":"Only3D"}`).
 //! - `viewport.screenshot {view?: "3d"|"2d"}`: PNG of a viewport, base64.
 //! - `ui.screenshot`: PNG of the whole window (replies after the next frame).
@@ -166,12 +167,12 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
             if !crate::menus::implemented(id) {
                 return err(format!("menu item `{id}` is not implemented"));
             }
-            // A script cannot answer the question the menu item asks first
-            if id == "ui.resetUi" {
-                app.ui.adopt_layout(crate::UiState::default());
-            } else {
-                crate::menus::invoke(app, ctx, id);
-            }
+            crate::menus::invoke(app, ctx, id);
+            ok(Value::Null)
+        }
+        // What Window > Reset UI does after its question is answered Reset
+        "ui.reset" => {
+            app.ui.adopt_layout(crate::UiState::default());
             ok(Value::Null)
         }
         "ui.set" => {

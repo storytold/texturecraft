@@ -368,6 +368,11 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let commands_to_invoke = ctx.input_mut(|input| {
         // egui's label selection copies on these events at the end of the frame
         let copies: Vec<_> = input.events.iter().filter(|event| matches!(event, egui::Event::Copy | egui::Event::Cut)).cloned().collect();
+        // Escape and Enter answer the Reset UI question first, even when a shortcut binds them
+        let confirming_reset = app.ui.windows.confirm_reset_ui;
+        if confirming_reset && !popup_open {
+            crate::windows::reset_ui_keys(app, input, no_widget_focused);
+        }
         let commands = app.bindings.dispatch(input);
         for copy in copies {
             if !input.events.contains(&copy) {
@@ -384,11 +389,8 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
             app.session.tool.brush.size = (app.session.tool.brush.size * scale).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
         }
 
-        if app.ui.windows.confirm_reset_ui {
-            // Escape keeps everything, Enter resets (unless a button has the keyboard)
-            if !popup_open {
-                crate::windows::reset_ui_keys(app, input, no_widget_focused);
-            }
+        if confirming_reset {
+            // Its keys were handled before the shortcuts ran
         } else if app.ui.windows.project_config.is_some() {
             // Its keys are Escape (close) and Enter (OK); a stroke in progress isn't touched
             #[cfg(not(target_arch = "wasm32"))]
