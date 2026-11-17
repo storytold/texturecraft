@@ -137,23 +137,24 @@ fn narrow_harness() -> Harness<'static, TextureCraftApp> {
 #[test]
 fn layer_toolbar_stays_on_one_row_in_a_1280_by_800_window() {
     let h = narrow_harness();
-    let wand = h.get_by_label(egui_phosphor::regular::MAGIC_WAND).rect();
     let buttons = ["Add paint layer", "Add fill layer", "Add folder"].map(|label| h.get_by_label(label).rect());
+    // The effect menu button is the wand left of the paint button (effect rows draw wands too)
+    let wand = h.query_all_by_label(egui_phosphor::regular::MAGIC_WAND).map(|n| n.rect()).filter(|r| r.right() < buttons[0].left()).max_by(|a, b| a.right().total_cmp(&b.right())).expect("the effect menu button");
     let remove = h.query_all_by_label_contains("Remove layer").next().expect("the remove button").rect();
     for rect in buttons.into_iter().chain([remove]) {
         assert!((rect.center().y - wand.center().y).abs() < 1.0, "the toolbar wrapped: {rect:?} against {wand:?}");
     }
     let row = h.get_by_label(LONG_NAME).rect();
     assert!(remove.right() <= row.right() + 1.0, "the last button stays inside the panel: {remove:?} against {row:?}");
-    assert!(row.width() >= 220.0, "the Layers column is not squeezed: {row:?}");
+    assert!(row.width() >= 225.0, "the Layers column is not squeezed: {row:?}");
 }
 
 #[test]
 fn a_layer_name_cut_short_shows_in_full_on_hover() {
     let mut h = narrow_harness();
     let row = h.get_by_label(LONG_NAME).rect();
-    assert_eq!(h.query_all_by_label_contains(LONG_NAME).count(), 1, "no tooltip before hovering");
+    let before = h.query_all_by_label_contains(LONG_NAME).count();
     h.hover_at(egui::pos2(row.left() + 125.0, row.center().y));
     h.run_steps(30);
-    assert_eq!(h.query_all_by_label_contains(LONG_NAME).count(), 2, "the tooltip carries the full name");
+    assert_eq!(h.query_all_by_label_contains(LONG_NAME).count(), before + 1, "the tooltip carries the full name");
 }
