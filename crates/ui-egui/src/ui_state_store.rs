@@ -678,4 +678,52 @@ pub(crate) mod tests {
         store.save(&loaded, &mut storage);
         assert_eq!(storage.values["ui.unreadable.json"], original);
     }
+
+    #[test]
+    fn tool_settings_survive_a_restart() {
+        let mut tool = texturecraft_engine::ToolState::default();
+        tool.brush.size = 0.31;
+        tool.brush.hardness = 0.9;
+        tool.brush.symmetry.z = true;
+        tool.smudge_strength = 0.8;
+        tool.clone_from = texturecraft_engine::CloneFrom::Layer;
+        tool.path.fill = true;
+        let ui = UiState { tool_settings: texturecraft_engine::ToolSettings::of(&tool), ..UiState::default() };
+
+        let restarted = restart(&ui);
+
+        assert_eq!(restarted.tool_settings, ui.tool_settings);
+        let mut next = texturecraft_engine::ToolState::default();
+        restarted.tool_settings.apply(&mut next);
+        assert_eq!((next.brush.size, next.brush.hardness, next.smudge_strength), (0.31, 0.9, 0.8));
+        assert!(next.brush.symmetry.z && next.path.fill);
+        assert_eq!(next.clone_from, texturecraft_engine::CloneFrom::Layer);
+    }
+
+    #[test]
+    fn a_state_saved_before_tool_settings_existed_loads_with_the_defaults() {
+        let mut saved = serde_json::to_value(UiState::default()).unwrap();
+        saved.as_object_mut().unwrap().remove("tool_settings").expect("the saved state has tool settings");
+        let mut storage = MemoryStorage::default();
+        storage.values.insert(STORAGE_KEY.into(), saved.to_string());
+        let mut store = UiStateStore::default();
+
+        let loaded = store.load(Some(&storage)).expect("the old state loads");
+
+        assert_eq!(loaded.tool_settings, texturecraft_engine::ToolSettings::default());
+        // Nothing was unreadable, so nothing is kept beside the state on the next save
+        assert!(store.unreadable.is_none());
+    }
+
+    #[test]
+    fn the_app_starts_with_the_saved_tool_settings() {
+        let mut tool = texturecraft_engine::ToolState::default();
+        tool.brush.size = 0.31;
+        let ui = UiState { tool_settings: texturecraft_engine::ToolSettings::of(&tool), ..UiState::default() };
+        let mut session = texturecraft_engine::sample_session(128, 64).unwrap();
+
+        crate::start_ui(Some(restart(&ui)), &mut session);
+
+        assert_eq!(session.tool.brush.size, 0.31);
+    }
 }

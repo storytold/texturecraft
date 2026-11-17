@@ -203,9 +203,24 @@ pub struct TextureCraftApp {
     pub(crate) bindings: keymap::Bindings,
 }
 
+/// The UI state to start with: the saved one, whose tool settings go to `session`, else the defaults in the OS language
+pub(crate) fn start_ui(saved: Option<UiState>, session: &mut Session) -> UiState {
+    match saved {
+        Some(ui) => {
+            ui.tool_settings.apply(&mut session.tool);
+            ui
+        }
+        None => {
+            let mut ui = UiState::default();
+            ui.prefs.language = i18n::os_language().into();
+            ui
+        }
+    }
+}
+
 impl TextureCraftApp {
     /// The app around `session`, with the saved UI state (or defaults in the OS language) and the GPU viewport.
-    pub fn new(cc: &eframe::CreationContext<'_>, session: Session) -> TextureCraftApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, mut session: Session) -> TextureCraftApp {
         theme::install(&cc.egui_ctx);
 
         // Bakes cast their rays on a GPU device of their own (created on the first bake)
@@ -215,11 +230,7 @@ impl TextureCraftApp {
 
         // The first run speaks the OS (or browser) language
         let mut ui_store = ui_state_store::UiStateStore::new(ui_state_store::FILE.get().cloned());
-        let ui = ui_store.load(cc.storage).unwrap_or_else(|| {
-            let mut ui = UiState::default();
-            ui.prefs.language = i18n::os_language().into();
-            ui
-        });
+        let ui = start_ui(ui_store.load(cc.storage), &mut session);
         let next_autosave = ui.prefs.autosave_minutes as f64 * 60.0;
         ui.prefs.apply_resource_limits();
 
@@ -673,6 +684,7 @@ impl eframe::App for TextureCraftApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.ui.tool_settings = texturecraft_engine::ToolSettings::of(&self.session.tool);
         self.ui_store.save(&self.ui, storage);
         self.report_ui_storage_warning();
         export_templates::save_library(self, storage);

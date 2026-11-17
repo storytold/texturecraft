@@ -345,7 +345,9 @@ fn swap_mask_value(session: &mut Session, _: &Value) -> Result<Value> {
 
 fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
     if boolp(params, "clear") == Some(true) {
-        session.tool.stencil = None;
+        if let Some(cleared) = session.tool.stencil.take() {
+            session.tool.stencil_look = cleared.look();
+        }
         return Ok(Value::Null);
     }
 
@@ -355,7 +357,7 @@ fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
         }
 
         let previous_stencil = session.tool.stencil.take();
-        let mut stencil_state = crate::session::StencilState::new(name);
+        let mut stencil_state = crate::session::StencilState::with_look(name, session.tool.stencil_look);
         if let Some(previous_stencil) = previous_stencil {
             stencil_state = crate::session::StencilState { image: name.to_string(), ..previous_stencil };
         }

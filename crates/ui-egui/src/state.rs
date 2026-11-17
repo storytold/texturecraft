@@ -350,6 +350,9 @@ pub struct UiState {
     /// How the 3D view shows symmetry
     #[serde(default)]
     pub symmetry: crate::symmetry::SymmetryDisplay,
+    /// The brush, symmetry and other tool settings of the last session, which the next one starts with
+    #[serde(default)]
+    pub tool_settings: texturecraft_engine::ToolSettings,
     /// The Baking Visualization panel's settings, under a key of their own since the reference defaults: older saved ones start over
     #[serde(default, rename = "baking_visualization")]
     pub bake_visualization: crate::bake_mode::BakeVisualizationToggles,
@@ -386,6 +389,7 @@ impl UiState {
         self.recent = keep.recent;
         self.prefs = keep.prefs;
         self.keymap = keep.keymap;
+        self.tool_settings = keep.tool_settings;
         self.rename = None;
 
         // The shelf's search, type and folder are one query, and saved searches are the user's own
@@ -432,6 +436,7 @@ impl Default for UiState {
             keymap: Keymap::new(),
             bake_paint_brush: crate::bake_mode::BakePaintBrush::default(),
             symmetry: crate::symmetry::SymmetryDisplay::default(),
+            tool_settings: Default::default(),
             bake_visualization: crate::bake_mode::BakeVisualizationToggles::default(),
         }
     }

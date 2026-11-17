@@ -58,6 +58,7 @@ pub mod text_cmds;
 pub mod thumbs;
 mod tool_availability;
 pub mod tool_cmds;
+pub mod tool_settings;
 mod triangle_partition;
 mod uv_stroke_state;
 pub mod uv_tile_cmds;
@@ -70,8 +71,9 @@ pub use fill_hit_test::FillHitTest;
 pub use fill_mode::FillMode;
 pub use path_tool::PathState;
 pub use project_cmds::sample_session;
-pub use session::{CloneFrom, CloneSource, Document, Session, SetCache, StackTarget, StencilState, Tool, ToolState, ViewMode};
+pub use session::{CloneFrom, CloneSource, Document, Session, SetCache, StackTarget, StencilLook, StencilState, Tool, ToolState, ViewMode};
 pub use set_cmds::{ResizeOutput, ResizeTask};
+pub use tool_settings::ToolSettings;
 
 pub use texturecraft_compose as compose;
 pub use texturecraft_core as core;

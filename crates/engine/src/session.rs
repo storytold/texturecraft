@@ -180,9 +180,34 @@ pub struct StencilState {
     pub opacity: f32,
 }
 
+/// How a stencil sits on screen, without the image (which is a project resource).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StencilLook {
+    pub center: [f32; 2],
+    pub scale: f32,
+    pub rotation: f32,
+    pub tile: bool,
+    pub opacity: f32,
+}
+
+impl Default for StencilLook {
+    fn default() -> Self {
+        StencilLook { center: [0.0, 0.0], scale: 0.8, rotation: 0.0, tile: false, opacity: 0.5 }
+    }
+}
+
 impl StencilState {
     pub fn new(image: &str) -> StencilState {
-        StencilState { image: image.to_string(), center: [0.0, 0.0], scale: 0.8, rotation: 0.0, tile: false, opacity: 0.5 }
+        StencilState::with_look(image, StencilLook::default())
+    }
+
+    /// A stencil of `image` placed as `look` says.
+    pub fn with_look(image: &str, look: StencilLook) -> StencilState {
+        StencilState { image: image.to_string(), center: look.center, scale: look.scale, rotation: look.rotation, tile: look.tile, opacity: look.opacity }
+    }
+
+    pub fn look(&self) -> StencilLook {
+        StencilLook { center: self.center, scale: self.scale, rotation: self.rotation, tile: self.tile, opacity: self.opacity }
     }
 
     /// Placement for a viewport aspect (width / height): center, half extents in NDC, radians.
@@ -213,6 +238,10 @@ pub struct ToolState {
     /// Stencil used by the Projection tool.
     #[serde(default)]
     pub stencil: Option<StencilState>,
+    /// Placement the next stencil starts with: the last stencil's, kept when the stencil is
+    /// cleared or the project changes (its image belongs to the project, the placement does not).
+    #[serde(default)]
+    pub stencil_look: StencilLook,
     /// Smudge tool: how much of the picked-up values each stamp deposits (0..1).
     #[serde(default = "default_smudge_strength")]
     pub smudge_strength: f32,
@@ -267,6 +296,7 @@ impl Default for ToolState {
             fill_hit_test: Default::default(),
             fill_visible_only: default_fill_visible_only(),
             stencil: None,
+            stencil_look: StencilLook::default(),
             smudge_strength: default_smudge_strength(),
             clone_source: None,
             clone_from: CloneFrom::Composite,
@@ -431,8 +461,8 @@ impl Session {
         })
     }
 
-    /// Replace this session with `next` (another project), keeping the viewport size and the
-    /// user's export presets and project templates.
+    /// Replace this session with `next` (another project), keeping the viewport size, the
+    /// user's export presets and project templates and the tool settings.
     pub fn switch_to(&mut self, mut next: Session) {
         // Invalidate caches even when both projects were loaded with the same revision
         next.revision = self.revision.wrapping_add(1);
@@ -440,6 +470,7 @@ impl Session {
         next.viewport = self.viewport;
         next.export_presets = std::mem::take(&mut self.export_presets);
         next.templates = std::mem::take(&mut self.templates);
+        crate::tool_settings::ToolSettings::of(&self.tool).apply(&mut next.tool);
         *self = next;
     }
 
