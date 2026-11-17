@@ -9,7 +9,16 @@ use texturecraft_ui_egui::TextureCraftApp;
 
 const TEMPLATE: &str = "Packed test";
 
-fn harness() -> (Harness<'static, TextureCraftApp>, std::path::PathBuf) {
+/// A temporary library folder removed when the test ends, also when it fails.
+struct Library(std::path::PathBuf);
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+fn harness() -> (Harness<'static, TextureCraftApp>, Library) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
@@ -18,7 +27,7 @@ fn harness() -> (Harness<'static, TextureCraftApp>, std::path::PathBuf) {
     std::fs::create_dir_all(&dir).unwrap();
     h.state_mut().session.load_export_presets(dir.clone());
     h.run_steps(4);
-    (h, dir)
+    (h, Library(dir))
 }
 
 fn template() -> ExportPreset {
@@ -37,7 +46,7 @@ fn template() -> ExportPreset {
 
 #[test]
 fn invert_toggle_changes_the_saved_template() {
-    let (mut h, dir) = harness();
+    let (mut h, _library) = harness();
     let app = h.state_mut();
     app.run("export.preset.save", json!({ "preset": serde_json::to_value(template()).unwrap() })).expect("save template");
     app.ui.export.preset = TEMPLATE.into();
@@ -55,5 +64,4 @@ fn invert_toggle_changes_the_saved_template() {
     h.get_all_by_label("Invert").nth(1).unwrap().click();
     h.run_steps(4);
     assert!(saved(&h).is_empty(), "a second click turns it off");
-    std::fs::remove_dir_all(dir).ok();
 }

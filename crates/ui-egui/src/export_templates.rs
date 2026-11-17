@@ -155,8 +155,6 @@ fn drop_input(map: &mut MapSpec, dest: Dest, input: &SourceRef) {
     for (d, s) in &mut map.channels {
         if *d == dest || (fill_rgb && is_rgb(*d)) {
             *s = with_component(input, slot_component(*d));
-            // A new source starts un-inverted.
-            map.inverted.retain(|x| x != d);
         }
     }
 }
@@ -715,5 +713,25 @@ mod tests {
         }
         assert!(same_source(&ch(Channel::Normal, 2), &ch(Channel::Normal, 0)));
         assert!(!same_source(&SourceRef::Constant(0.0), &SourceRef::Constant(1.0)));
+    }
+
+    #[test]
+    fn inversion_follows_its_source_through_layouts_and_drops() {
+        let mut map = new_map(Layout::Rgb);
+        map.inverted = vec![Dest::R];
+        set_layout(&mut map, Layout::Gray);
+        assert_eq!(map.inverted, vec![Dest::L], "the colour source keeps its inversion on L");
+        set_layout(&mut map, Layout::Rgb);
+        assert_eq!(map.inverted, vec![Dest::R, Dest::G, Dest::B], "and spreads it over R, G, B");
+        set_layout(&mut map, Layout::Rgba);
+        assert_eq!(map.inverted, vec![Dest::R, Dest::G, Dest::B], "alpha stays un-inverted");
+        map.inverted = vec![Dest::G];
+        set_layout(&mut map, Layout::GrayAlpha);
+        assert!(map.inverted.is_empty(), "channels that leave take their inversion with them");
+        let mut map = new_map(Layout::Rgb);
+        map.inverted = vec![Dest::B];
+        drop_input(&mut map, Dest::B, &ch(Channel::Metallic, 0));
+        assert_eq!(map.inverted, vec![Dest::B], "a dropped map keeps the channel's toggle, like picking from the list");
+        ExportPreset { name: "t".into(), maps: vec![map] }.validate().unwrap();
     }
 }

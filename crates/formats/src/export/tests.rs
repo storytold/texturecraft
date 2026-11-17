@@ -809,3 +809,29 @@ fn validation_rejects_inverting_a_channel_the_map_lacks() {
     bad.maps[0].inverted = vec![Dest::R, Dest::R];
     assert!(bad.validate().is_err());
 }
+
+#[test]
+fn inverting_a_colour_channel_inverts_the_linear_value_before_encoding() {
+    let fx = Fx::new(&default_channels());
+    let base = |inverted: Vec<Dest>, size: Option<u32>| {
+        let map = MapSpec {
+            file: "col".into(),
+            format: FileFormat::Png,
+            bit_depth: 8,
+            channels: [Dest::R, Dest::G, Dest::B].into_iter().zip(0u8..).map(|(d, k)| (d, SourceRef::Channel { channel: Channel::BaseColor, component: k })).collect(),
+            inverted,
+        };
+        let mut opts = ExportOptions::new(ExportPreset { name: "c".into(), maps: vec![map] });
+        opts.size = size;
+        decode(find(&fx.render(&opts), "col")).to_rgb8()
+    };
+    let (plain, inv) = (base(Vec::new(), None), base(vec![Dest::R], None));
+    // Texel (9, 9): linear red 9/63, written as sRGB.
+    let want = linear_to_srgb(1.0 - 9.0 / 63.0) * 255.0;
+    assert!((inv.get_pixel(9, 9)[0] as f32 - want).abs() <= 1.0, "{} vs {want}", inv.get_pixel(9, 9)[0]);
+    assert_eq!(inv.get_pixel(9, 9)[1..], plain.get_pixel(9, 9)[1..], "G and B stay");
+    // A size override goes through the resize path: the left-most texels are 1 - 0 -> white red.
+    let half = base(vec![Dest::R], Some(RES / 2));
+    assert_eq!(half.width(), RES / 2);
+    assert!(half.get_pixel(0, 5)[0] >= 250, "{}", half.get_pixel(0, 5)[0]);
+}
