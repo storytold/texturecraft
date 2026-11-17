@@ -107,6 +107,10 @@ fn renaming_an_effect_row_undoes_redoes_and_survives_save_and_reopen() {
 
     let file = temp_file("rename");
     save_to(&mut h, &file);
+
+    // Change the open project, so the reopen has to bring the saved name back
+    h.state_mut().run("effect.set", json!({"effect": effect, "name": "Unsaved name"}));
+    h.state_mut().session.modified = false;
     reopen(&mut h, &file);
     assert_eq!(effect_name(&h, effect), "Pitted rust", "the reopened project keeps the name");
     let layer = h.state().session.doc.project.effect(LayerId(effect)).unwrap().0;
@@ -221,6 +225,27 @@ fn a_fill_on_a_higher_layer_reads_a_mask_anchor_added_in_the_interface() {
     // Save and reopen keep the link and the result
     let file = temp_file("anchor");
     save_to(&mut h, &file);
+
+    // Unlink the fill in the open project, so the reopen has to bring the saved link back
+    let fill = h
+        .state()
+        .session
+        .doc
+        .project
+        .layer(LayerId(high))
+        .unwrap()
+        .mask
+        .as_ref()
+        .unwrap()
+        .effects
+        .iter()
+        .find(|e| matches!(e.kind, EffectKind::Fill { .. }))
+        .unwrap()
+        .id
+        .0;
+    h.state_mut().run("effect.set", json!({"effect": fill, "value": 1.0}));
+    assert!(matches!(reader_source(&h, high), Source::Uniform(_)));
+    h.state_mut().session.modified = false;
     reopen(&mut h, &file);
     assert_eq!(mask_anchor_of(&h, low), Some(anchor), "the anchor point is still in the mask");
     let Source::Anchor { anchor: read, .. } = reader_source(&h, high) else { panic!("the reopened fill reads an anchor") };
