@@ -113,7 +113,8 @@ fn the_clone_source_is_forgotten_when_another_texture_set_becomes_active() {
     execute(&mut s, "tool.clone", &Value::Null).unwrap();
     execute(&mut s, "tool.cloneSource", &json!({"uv": [0.3, 0.6]})).unwrap();
     // Selecting the active set again keeps it
-    execute(&mut s, "textureSet.select", &json!({"ts": s.ts()})).unwrap();
+    let active = s.ts();
+    execute(&mut s, "textureSet.select", &json!({"ts": active})).unwrap();
     assert!(s.tool.clone_source.is_some());
     execute(&mut s, "textureSet.select", &json!({"ts": 1})).unwrap();
     assert!(s.tool.clone_source.is_none(), "a point of set 0 means nothing in set 1");
