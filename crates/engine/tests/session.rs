@@ -798,7 +798,12 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
     let layer = execute(&mut s, "layer.add.paint", &json!({})).unwrap()["layer"].as_u64().unwrap();
     let read = |s: &Session| s.doc.project.layers[&texturecraft_engine::core::LayerId(layer)].channels.clone();
     let before = read(&s);
-    execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"baseColor": {"mode": "Multiply", "opacity": 0.25}, "roughness": {"opacity": 0.5}}})).unwrap();
+    execute(
+        &mut s,
+        "layer.blending.set",
+        &json!({"layer": layer, "channels": {"baseColor": {"mode": "Multiply", "opacity": 0.25}, "roughness": {"opacity": 0.5}}}),
+    )
+    .unwrap();
     let after = read(&s);
     assert_eq!((after[&Channel::BaseColor].mode, after[&Channel::BaseColor].opacity), (texturecraft_engine::core::BlendMode::Multiply, 0.25));
     assert_eq!((after[&Channel::Roughness].mode, after[&Channel::Roughness].opacity), (before[&Channel::Roughness].mode, 0.5));

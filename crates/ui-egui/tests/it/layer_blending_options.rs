@@ -1,7 +1,7 @@
 //! Layer menu ▸ Blending options: apply the displayed channel's blending to all channels, copy and paste it between layers.
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use serde_json::json;
 use texturecraft_engine::core::{BlendMode, Channel, ChannelBlend, LayerId};
 use texturecraft_ui_egui::TextureCraftApp;
