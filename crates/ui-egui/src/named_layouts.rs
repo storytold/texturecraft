@@ -99,29 +99,19 @@ impl UiState {
     }
 }
 
-/// The Layouts submenu at the end of the Window menu
-pub(crate) fn menu(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
-    ui.menu_button(tr("Layouts"), |ui| {
-        if ui.button(tr("Save current layout as...")).clicked() {
-            app.ui.layout_dialog = Some(LayoutDialog::Save(String::new()));
-            ui.close();
-        }
-        if ui.add_enabled(!app.ui.named_layouts.is_empty(), egui::Button::new(tr("Manage layouts..."))).clicked() {
-            app.ui.layout_dialog = Some(LayoutDialog::Manage { renaming: None, deleting: None });
-            ui.close();
-        }
-        if app.ui.named_layouts.is_empty() {
-            return;
-        }
+/// One entry per saved layout, under the catalog's items of the Layouts submenu
+pub(crate) fn entries(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    if app.ui.named_layouts.is_empty() {
+        return;
+    }
 
-        ui.separator();
-        for name in app.ui.named_layouts.iter().map(|layout| layout.name.clone()).collect::<Vec<_>>() {
-            if ui.button(&name).clicked() {
-                app.ui.apply_named_layout(&name);
-                ui.close();
-            }
+    ui.separator();
+    for name in app.ui.named_layouts.iter().map(|layout| layout.name.clone()).collect::<Vec<_>>() {
+        if ui.button(&name).clicked() {
+            app.ui.apply_named_layout(&name);
+            ui.close();
         }
-    });
+    }
 }
 
 /// The save, overwrite and manage dialogs

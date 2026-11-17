@@ -7,7 +7,8 @@
 //! - `session.inspect`: project, texture sets, layer stack, tool, camera, display, history.
 //! - `ui.inspect`: the UI state (panels, windows, mode, layout, viewport rect, who draws the title bar).
 //! - `ui.menu.list`: the menu catalog with ids, shortcuts and whether each is live.
-//! - `ui.menu.invoke {id}`: behave like a menu click (may open a window).
+//! - `ui.menu.invoke {id}`: behave like a menu click (may open a window). `{id: "ui.layout.apply", name}`
+//!   switches to the saved panel layout `name` (an error when there is none).
 //! - `ui.set {...}`: merge fields into the UI state (e.g. `{"layout":"Only3D"}`).
 //! - `viewport.screenshot {view?: "3d"|"2d"}`: PNG of a viewport, base64.
 //! - `ui.screenshot`: PNG of the whole window (replies after the next frame).
@@ -163,6 +164,10 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
         )),
         "ui.menu.invoke" => {
             let Some(id) = p.get("id").and_then(Value::as_str) else { return err("`id` is required") };
+            if id == "ui.layout.apply" {
+                let Some(name) = p.get("name").and_then(Value::as_str) else { return err("`name` is required") };
+                return if app.ui.apply_named_layout(name) { ok(Value::Null) } else { err(format!("no saved layout named `{name}`")) };
+            }
             if !crate::menus::implemented(id) {
                 return err(format!("menu item `{id}` is not implemented"));
             }

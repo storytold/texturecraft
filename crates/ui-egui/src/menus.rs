@@ -78,6 +78,8 @@ pub const CATALOG: &[Item] = &[
     sub("Window", "Views", "Texture Set Settings", "ui.view.textureSetSettings", None),
     sub("Window", "Save UI Layout", "Save current layout...", "ui.layout.save", None),
     it("Window", "Load UI Layout", "ui.layout.load", None),
+    sub("Window", "Layouts", "Save current layout as...", "ui.layout.saveAs", None),
+    sub("Window", "Layouts", "Manage layouts...", "ui.layout.manage", None),
     it("Window", "Hide UI", "ui.hideUi", Some("Tab")),
     it("Window", "Reset UI", "ui.resetUi", None),
     it("Viewport", "Display material", "viewport.displayMaterial", Some("M")),
@@ -121,6 +123,10 @@ pub fn enabled(app: &TextureCraftApp, id: &str) -> bool {
 
     if app.ui.mode != Mode::Painting && (id.starts_with("tool.") || id.starts_with("viewport.quickMask")) {
         return false;
+    }
+
+    if id == "ui.layout.manage" {
+        return !app.ui.named_layouts.is_empty();
     }
 
     if is_ui(id) {
@@ -180,6 +186,8 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         "ui.resetUi" => app.ui.adopt_layout(crate::UiState::default()),
         "ui.layout.save" => crate::windows::layout_file(app, true),
         "ui.layout.load" => crate::windows::layout_file(app, false),
+        "ui.layout.saveAs" => app.ui.layout_dialog = Some(crate::named_layouts::LayoutDialog::Save(String::new())),
+        "ui.layout.manage" => app.ui.layout_dialog = Some(crate::named_layouts::LayoutDialog::Manage { renaming: None, deleting: None }),
         "ui.uvChecker" => {
             app.run("viewport.view", json!({"mode": "uvChecker"}));
         }
@@ -224,6 +232,9 @@ pub fn menu_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                             for x in items.iter().filter(|x| x.sub == Some(s)) {
                                 menu_item(app, &ctx, ui, x);
                             }
+                            if s == "Layouts" {
+                                crate::named_layouts::entries(app, ui);
+                            }
                         });
                         continue;
                     }
@@ -232,9 +243,6 @@ pub fn menu_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                         continue;
                     }
                     menu_item(app, &ctx, ui, item);
-                }
-                if top == "Window" {
-                    crate::named_layouts::menu(app, ui);
                 }
             });
         }

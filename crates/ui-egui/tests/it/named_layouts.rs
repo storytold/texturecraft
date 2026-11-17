@@ -102,3 +102,49 @@ fn a_layout_is_renamed_and_deleted_from_the_manage_dialog() {
     harness.run_steps(3);
     assert!(harness.state().ui.named_layouts.is_empty());
 }
+
+fn invoke(harness: &mut Harness<'_, TextureCraftApp>, params: serde_json::Value) -> serde_json::Value {
+    let context = harness.ctx.clone();
+    texturecraft_ui_egui::control::handle(harness.state_mut(), &context, "ui.menu.invoke", &params)
+}
+
+#[test]
+fn the_layout_items_are_in_the_menu_catalog_and_open_their_dialogs() {
+    use texturecraft_ui_egui::menus::CATALOG;
+    use texturecraft_ui_egui::named_layouts::LayoutDialog;
+
+    for id in ["ui.layout.saveAs", "ui.layout.manage"] {
+        assert!(CATALOG.iter().any(|item| item.id == id && item.menu == "Window" && item.sub == Some("Layouts")), "{id}");
+    }
+    let mut harness = app();
+    assert!(!texturecraft_ui_egui::menus::enabled(harness.state(), "ui.layout.manage"), "nothing to manage yet");
+
+    assert_eq!(invoke(&mut harness, serde_json::json!({"id": "ui.layout.saveAs"}))["ok"], true);
+    assert!(matches!(harness.state().ui.layout_dialog, Some(LayoutDialog::Save(_))));
+
+    harness.state_mut().ui.save_named_layout("A");
+    harness.state_mut().ui.layout_dialog = None;
+    assert_eq!(invoke(&mut harness, serde_json::json!({"id": "ui.layout.manage"}))["ok"], true);
+    assert!(matches!(harness.state().ui.layout_dialog, Some(LayoutDialog::Manage { .. })));
+}
+
+#[test]
+fn the_control_channel_switches_to_a_layout_by_name_and_rejects_unknown_names() {
+    let mut harness = app();
+    harness.state_mut().ui.dock.close(Panel::Assets);
+    harness.state_mut().ui.save_named_layout("No shelf");
+    harness.state_mut().ui.dock.focus(Panel::Assets);
+    harness.state_mut().ui.uv_zoom = 2.0;
+
+    let reply = invoke(&mut harness, serde_json::json!({"id": "ui.layout.apply", "name": "No shelf"}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert!(!harness.state().ui.dock.is_open(Panel::Assets));
+    assert_eq!(harness.state().ui.uv_zoom, 2.0);
+
+    harness.state_mut().ui.dock.focus(Panel::Assets);
+    for params in [serde_json::json!({"id": "ui.layout.apply", "name": "Nope"}), serde_json::json!({"id": "ui.layout.apply"})] {
+        let reply = invoke(&mut harness, params);
+        assert_eq!(reply["ok"], false, "{reply}");
+    }
+    assert!(harness.state().ui.dock.is_open(Panel::Assets), "an unknown name changes nothing");
+}
