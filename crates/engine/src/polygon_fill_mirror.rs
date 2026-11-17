@@ -177,6 +177,8 @@ mod tests {
         let history = session.history_labels().len();
 
         session.polygon_fill_uv(uv_of(1.8, 0.2)).unwrap();
+        session.update();
+        assert_eq!(filled_quads(&session), [true, true, false, false], "the fill and its copy show");
         assert_eq!(session.history_labels().len(), history + 1, "one step for the fill and its copy");
         session.undo().unwrap();
         session.update();
@@ -215,5 +217,24 @@ mod tests {
 
         // The flat mesh lies in the mirror plane z = 0: each triangle maps onto itself looking the other way
         assert_eq!(session.polygon_fill_uv(uv_of(1.8, 0.2)).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_radial_copy_turns_the_fill_around_the_axis() {
+        let mut session = mirrored_session(FillMode::UvIsland);
+
+        // Half a turn around Z through the mesh centre (0, 0.5) sends the quad onto the quad on the left
+        session.tool.brush.symmetry = texturecraft_paint::Symmetry { x: false, radial: 2, axis: 2, ..Default::default() };
+        assert_eq!(session.polygon_fill_uv(uv_of(1.8, 0.2)).unwrap(), 4, "the turned copy lands on the left quad");
+        session.update();
+        assert_eq!(filled_quads(&session), [true, true, false, false]);
+    }
+
+    #[test]
+    fn a_radial_copy_with_the_axis_moved_away_lands_on_no_face() {
+        let mut session = mirrored_session(FillMode::UvIsland);
+
+        session.tool.brush.symmetry = texturecraft_paint::Symmetry { x: false, radial: 2, axis: 2, offset: [0.0, 5.0, 0.0], ..Default::default() };
+        assert_eq!(session.polygon_fill_uv(uv_of(1.8, 0.2)).unwrap(), 2, "the turned copy is far above the mesh");
     }
 }
