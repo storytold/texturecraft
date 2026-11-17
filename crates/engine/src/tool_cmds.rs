@@ -286,19 +286,21 @@ pub(crate) fn brush_json(session: &Session) -> Value {
 }
 
 fn material(s: &mut Session, p: &Value) -> Result<Value> {
-    if let Some(id) = strp(p, "material") {
-        let values = crate::materials::brush_values(id)
-            .ok_or_else(|| bad("tool.material", format!("`{id}` is not a simple material (a brush paints plain values; add smart materials with material.apply)")))?;
-        for (channel, value) in values {
-            // A normal map is painted flat
-            if channel.kind() != texturecraft_core::ChannelKind::NormalMap {
-                s.tool.values.insert(channel, value);
-            }
-        }
-    }
     let channel = channel_param("tool.material", p, "channel")?;
     let color = color_param("tool.material", p, "color")?;
     let value = color_param("tool.material", p, "value")?;
+    if let Some(id) = strp(p, "material") {
+        let values = crate::materials::brush_values(id)
+            .ok_or_else(|| bad("tool.material", format!("`{id}` is not a simple material (a brush paints plain values; add smart materials with material.apply)")))?;
+        // A channel the material does not set goes back to its default, so no value of the previous brush material stays; a normal map is painted flat
+        for channel in Channel::ALL {
+            if channel.kind() == texturecraft_core::ChannelKind::NormalMap {
+                continue;
+            }
+            let value = values.iter().find(|(set, _)| *set == channel).map_or(channel.default_value(), |(_, value)| *value);
+            s.tool.values.insert(channel, value);
+        }
+    }
     if let Some(v) = f32p(p, "maskValue") {
         s.tool.mask_value = v.clamp(0.0, 1.0);
     }

@@ -791,7 +791,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     add_callback(app, ui, rect, frame, sync);
     polygon_fill_box_overlay(ui, rect, fill_box);
 
-    // Shelf drops: a material goes above the selection of the set under the pointer, an image opens the decal menu there, an alpha goes on the brush
+    // Shelf drops: a material goes on top of the stack of the set under the pointer, an image opens the decal menu there, an alpha goes on the brush
     crate::shelf::drop_target(app, ui, &response, crate::shelf::DropZone::View3d);
 
     // Brush cursor; while a Ctrl+drag changes the brush it stays where the drag began

@@ -57,6 +57,17 @@ fn a_material_set_on_the_brush_adds_no_layer_and_no_history() {
 }
 
 #[test]
+fn a_material_without_height_resets_the_height_of_the_previous_one() {
+    let mut s = session();
+    execute(&mut s, "tool.material", &json!({"material": "copper_hammered"})).unwrap();
+    assert!(s.tool.values[&Channel::Height][0] < 0.0);
+
+    execute(&mut s, "tool.material", &json!({"material": "copper"})).unwrap();
+
+    assert_eq!(s.tool.values[&Channel::Height], Channel::Height.default_value());
+}
+
+#[test]
 fn a_smart_material_or_an_unknown_one_cannot_be_the_brush_material() {
     let mut s = session();
     let before = s.tool.values.clone();
