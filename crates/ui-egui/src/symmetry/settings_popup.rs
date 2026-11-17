@@ -16,9 +16,6 @@ const LABEL_WIDTH: f32 = 64.0;
 
 const AXIS_NAMES: [&str; 3] = ["X", "Y", "Z"];
 
-/// Width of each axis' Center button
-const CENTER_BUTTON_WIDTH: f32 = 56.0;
-
 /// Space between the mirror section and the radial toggle
 const SECTIONS_GAP: f32 = 4.0;
 
@@ -81,18 +78,20 @@ pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     let movable = movable_axes(symmetry);
     section(ui, "symmetry_axis_position", tr("Axis position"), true, |ui| {
         for (axis, name) in AXIS_NAMES.into_iter().enumerate() {
-            ui.add_enabled_ui(movable[axis], |ui| {
-                ui.horizontal(|ui| {
-                    let width = ui.available_width() - CENTER_BUTTON_WIDTH - ui.spacing().item_spacing.x;
-                    ui.allocate_ui_with_layout(vec2(width, ui.spacing().interact_size.y), Layout::left_to_right(Align::Center), |ui| {
-                        slider(ui, name, &mut symmetry.offset[axis], -half_extent[axis]..=half_extent[axis], 2)
-                    });
-                    if ui.add_sized([CENTER_BUTTON_WIDTH, ui.spacing().interact_size.y], egui::Button::new(tr("Center"))).clicked() {
+            ui.add_enabled_ui(movable[axis], |ui| slider(ui, name, &mut symmetry.offset[axis], -half_extent[axis]..=half_extent[axis], 2));
+        }
+        // One button per axis: the plane goes back to the middle of the model
+        ui.horizontal(|ui| {
+            let cell = vec2(ui.available_width() / AXIS_NAMES.len() as f32, ui.spacing().interact_size.y);
+            for (axis, name) in AXIS_NAMES.into_iter().enumerate() {
+                ui.allocate_ui_with_layout(cell, Layout::left_to_right(Align::Center), |ui| {
+                    let label = format!("{} {name}", tr("Center"));
+                    if ui.add_enabled(movable[axis], egui::Button::new(label)).clicked() {
                         symmetry.offset[axis] = 0.0;
                     }
                 });
-            });
-        }
+            }
+        });
         let picking = app.picking_symmetry_plane;
         if ui.add_enabled(movable.contains(&true), egui::Button::new(tr("Pick point")).selected(picking)).clicked() {
             app.picking_symmetry_plane = !picking;

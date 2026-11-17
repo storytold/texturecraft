@@ -15,8 +15,8 @@ use egui_phosphor::regular as ic;
 use texturecraft_engine::Tool;
 use texturecraft_engine::paint::Symmetry;
 
-pub use symmetry_display::SymmetryDisplay;
 pub(crate) use plane_pick::input as plane_pick_input;
+pub use symmetry_display::SymmetryDisplay;
 pub(crate) use view_overlay::{manipulator_hovered, manipulator_input, overlay, scene_overlay};
 
 use crate::TextureCraftApp;

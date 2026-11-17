@@ -346,12 +346,11 @@ fn the_center_button_puts_one_plane_back_in_the_middle_of_the_model() {
     harness.run_steps(2);
     let history = harness.state().session.history_labels();
 
-    // One button per axis, in the order X, Y, Z
-    harness.get_all_by_label("Center").nth(1).unwrap().click();
+    harness.get_by_label("Center Y").click();
     harness.run_steps(2);
 
     assert_eq!(harness.state().session.tool.brush.symmetry.offset, [0.1, 0.0, 0.0], "only the Y plane moved to the middle");
-    harness.get_all_by_label("Center").next().unwrap().click();
+    harness.get_by_label("Center X").click();
     harness.run_steps(2);
     assert_eq!(harness.state().session.tool.brush.symmetry.offset, [0.0; 3]);
     assert_eq!(harness.state().session.history_labels(), history);
