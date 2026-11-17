@@ -1,4 +1,4 @@
-//! A click on a simple shelf material sets the brush's material and adds no layer; a smart material still adds its layers
+//! A click on a simple shelf material sets the brush's material and adds no layer; a click on a smart material changes nothing
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -42,15 +42,16 @@ fn a_click_on_a_simple_material_sets_the_brush_material_and_adds_no_layer() {
 }
 
 #[test]
-fn a_click_on_a_smart_material_still_adds_its_layers() {
+fn a_click_on_a_smart_material_adds_no_layer_and_leaves_the_brush() {
     let label = find("iron_rusted").unwrap().label;
     let mut harness = shelf(SMART_TYPE, label);
-    let (stacks, values) = (stack_sizes(&harness), harness.state().session.tool.values.clone());
+    let (stacks, history, tool) = (stack_sizes(&harness), harness.state().session.history_labels(), harness.state().session.tool.clone());
 
     harness.get_all_by_label(label).next().unwrap().click();
     harness.run_steps(3);
 
     let app = harness.state();
-    assert_eq!(stack_sizes(&harness).iter().sum::<usize>(), stacks.iter().sum::<usize>() + 1, "one folder");
-    assert_eq!(app.session.tool.values, values, "the brush is untouched");
+    assert_eq!(stack_sizes(&harness), stacks, "no layer");
+    assert_eq!(app.session.history_labels(), history, "no history entry");
+    assert_eq!(serde_json::to_value(&app.session.tool).unwrap(), serde_json::to_value(&tool).unwrap(), "the brush is untouched");
 }

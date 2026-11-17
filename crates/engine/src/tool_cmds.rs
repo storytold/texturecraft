@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Tool material",
             [],
             None,
-            "{channel, color?|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1} or {material: id or label of a simple material (see material.list, smart: false)} — the brush paints that material's values (colour, metallic, roughness, height…) in the channels that are on; no layer is added, smart materials are refused (add them with material.apply)",
+            "{channel, color?|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1} or {material: id or label of a simple material (see material.list, smart: false)} — the brush paints that material's pattern (colour, metallic, roughness, height…, fixed to the surface, its size following the brush size) in the channels that are on; no layer is added, smart materials are refused (add them with material.apply)",
             always,
             material
         ),
@@ -280,7 +280,7 @@ pub(crate) fn brush_json(session: &Session) -> Value {
         "backfaceCulling": settings.backface_culling, "symmetry": [settings.symmetry.x, settings.symmetry.y, settings.symmetry.z],
         "radialSymmetry": { "copies": settings.symmetry.radial, "axis": (["x", "y", "z"].get(settings.symmetry.axis as usize)) },
         "symmetryOffset": settings.symmetry.offset, "symmetryOn": settings.symmetry.enabled, "symmetryAngleSpan": settings.symmetry.angle_span,
-        "smudgeStrength": session.tool.smudge_strength * 100.0, "particles": settings.particles,
+        "material": session.tool.material, "smudgeStrength": session.tool.smudge_strength * 100.0, "particles": settings.particles,
         "cloneSource": if session.tool.clone_from == CloneFrom::Layer { "layer" } else { "composite" },
     })
 }
@@ -301,6 +301,7 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
             let value = values.iter().find(|(set, _)| *set == channel).map_or(channel.default_value(), |(_, value)| *value);
             s.tool.values.insert(channel, value);
         }
+        s.tool.material = Some(crate::materials::find(id).map_or_else(|| id.to_string(), |m| m.id.to_string()));
     }
     if let Some(v) = f32p(p, "maskValue") {
         s.tool.mask_value = v.clamp(0.0, 1.0);
@@ -310,6 +311,7 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
             let v = if c == Channel::Height { v.map(|x| x.clamp(-1.0, 1.0)) } else { v.map(|x| x.clamp(0.0, 1.0)) };
             s.tool.values.insert(c, v);
             s.tool.enabled.insert(c);
+            s.tool.material = None;
         }
         match boolp(p, "enabled") {
             Some(true) => {
@@ -326,6 +328,7 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.revision = s.revision.wrapping_add(1);
     Ok(json!({
+        "material": s.tool.material,
         "values": s.tool.values.iter().map(|(c, v)| (c.id().to_string(), json!(v))).collect::<serde_json::Map<_, _>>(),
         "enabled": s.tool.enabled.iter().map(|c| c.id()).collect::<Vec<_>>(),
         "maskValue": s.tool.mask_value,

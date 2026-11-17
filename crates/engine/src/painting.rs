@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use texturecraft_compose::PaintTarget;
-use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground};
+use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, Source};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_paint::{
     CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask, pick,
@@ -14,6 +14,12 @@ use texturecraft_paint::{
 use crate::session::{ActiveStroke, CloneFrom, Session, StackTarget, Tool};
 use crate::uv_stroke_state::UvStrokeState;
 use crate::{EngineError, Result};
+
+/// The brush size (as in `BrushSettings::size`) at which a brush material's pattern has its natural size; a smaller brush makes the pattern smaller in proportion
+pub const BRUSH_PATTERN_SIZE: f32 = 0.1;
+
+/// Brush size floor for the pattern scale
+const MIN_PATTERN_BRUSH_SIZE: f32 = 0.0005;
 
 /// Shortest distance between 2D view stamps, so a stamp with no radius (a pen at zero pressure) can't stall a stroke.
 const MIN_UV_STAMP_STEP: f32 = 1e-5;
@@ -133,6 +139,34 @@ impl Session {
         Ok(PaintTarget::Mask(eid))
     }
 
+    /// The pattern of the brush's material (`tool.material`) as a pickup over the texture, for the
+    /// channels in `values`: the material's fill, evaluated with the compose fill code tri-planar
+    /// in world space, so it stays fixed to the surface and continuous across stamps and strokes.
+    /// Its size follows the brush size ([`BRUSH_PATTERN_SIZE`] is the natural size). Channels the
+    /// material lacks carry the tool's value. None without a brush material.
+    fn brush_pattern(&mut self, values: &BTreeMap<Channel, [f32; 3]>, size: (u32, u32)) -> Option<Pickup> {
+        let id = self.tool.material.clone()?;
+        let mut sources = crate::materials::brush_sources(&id)?;
+        sources.retain(|(channel, _)| values.contains_key(channel));
+        for (channel, value) in values {
+            if !sources.iter().any(|(set, _)| set == channel) {
+                sources.push((*channel, Source::Uniform(*value)));
+            }
+        }
+        let ts = self.ts();
+        self.update();
+        let gbuf = self.caches.get(ts)?.gbuf.clone();
+        let next_id = self.doc.project.next_id;
+        let layer_id = self.doc.project.alloc_id();
+        let scale = BRUSH_PATTERN_SIZE / self.tool.brush.size.max(MIN_PATTERN_BRUSH_SIZE);
+        let layer = crate::materials::brush_fill(layer_id, sources, scale);
+        self.doc.project.insert_layer(ts, layer, None, false).ok()?;
+        let flat = self.flatten(ts, layer_id);
+        let _ = self.doc.project.remove_layer(layer_id);
+        self.doc.project.next_id = next_id;
+        Some(Pickup::from_layer(PickupMode::Clone { offset: [0; 2] }, &flat?, size, gbuf, values.keys().copied()))
+    }
+
     fn stroke_values(&self, target: PaintTarget) -> BTreeMap<Channel, [f32; 3]> {
         let ts = self.ts();
         let Ok(set) = self.doc.project.texture_set(ts) else { return BTreeMap::new() };
@@ -229,6 +263,9 @@ impl Session {
             {
                 src.offset.get_or_insert(offset);
             }
+        }
+        if canvas.pickup.is_none() && tool == Tool::Paint && matches!(target, Some(PaintTarget::Layer(_))) {
+            canvas.pickup = self.brush_pattern(&values, size);
         }
         let label = if quick_mask {
             "Quick mask stroke"
@@ -566,6 +603,7 @@ impl Session {
         for channel in cache.composite.channels.keys() {
             let value = cache.composite.value(*channel, x, y);
             self.tool.values.insert(*channel, value);
+            self.tool.material = None;
             picked.insert(*channel, value);
         }
         Ok(picked)

@@ -113,12 +113,13 @@ pub struct ShelfDrag {
 }
 
 /// Apply `asset` the way a shelf click does: a simple material becomes the brush's material (no
-/// layer), a smart material goes above the selection, a smart mask on the selected layer, a filter on the selection (its mask when the mask is selected), an alpha
+/// layer), a smart material does nothing (its tile is highlighted), a smart mask on the selected layer, a filter on the selection (its mask when the mask is selected), an alpha
 /// on the brush, a texture as an image fill.
 pub fn apply(app: &mut TextureCraftApp, asset: &Asset) {
     let (cmd, params) = match asset {
         Asset::Material(id) if texturecraft_engine::materials::brush_values(id).is_some() => ("tool.material", json!({"material": id})),
-        Asset::Material(id) => ("material.apply", json!({"material": id})),
+        // A smart material (several layers) is no brush material: a click only highlights its tile, dragging adds the layers
+        Asset::Material(_) | Asset::Library(_) => return,
         Asset::SmartMask(id) => ("mask.smart.apply", json!({"name": id})),
         Asset::Filter(id) => {
             let content = crate::dock::targets_content(app);
@@ -132,7 +133,6 @@ pub fn apply(app: &mut TextureCraftApp, asset: &Asset) {
             return;
         }
         Asset::Alpha(id) => ("tool.brush", json!({"alpha": {"library": id}})),
-        Asset::Library(path) => ("material.load", json!({"path": path})),
         Asset::Texture(name) => ("layer.add.image", json!({"name": name})),
     };
     app.run(cmd, params);

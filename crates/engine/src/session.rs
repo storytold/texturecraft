@@ -201,6 +201,10 @@ pub struct ToolState {
     /// Material painted per channel (linear values) and whether each channel is painted.
     pub values: BTreeMap<Channel, [f32; 3]>,
     pub enabled: BTreeSet<Channel>,
+    /// The simple material (shelf id) the brush paints the pattern of, with `values` as its plain
+    /// stand-in; `None` for plain values (any edit of a value clears it).
+    #[serde(default)]
+    pub material: Option<String>,
     /// Gray painted into masks.
     pub mask_value: f32,
     pub fill_mode: FillMode,
@@ -262,6 +266,7 @@ impl Default for ToolState {
             brush: BrushSettings::default(),
             values,
             enabled: [Channel::BaseColor, Channel::Metallic, Channel::Roughness, Channel::Height, Channel::Normal].into_iter().collect(),
+            material: None,
             mask_value: 1.0,
             fill_mode: FillMode::Triangle,
             fill_hit_test: Default::default(),

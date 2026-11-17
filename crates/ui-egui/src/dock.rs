@@ -2133,6 +2133,7 @@ fn material_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
                     ui.label(tr(channel.label()));
                     if color_swatch(ui, &format!("tool_{}", channel.id()), &mut value, ui.available_width() - 4.0) {
                         app.session.tool.values.insert(channel, value);
+                        app.session.tool.material = None;
                     }
                 });
             }
@@ -2142,11 +2143,13 @@ fn material_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
             ChannelKind::Signed => {
                 if slider(ui, tr(channel.label()), &mut value[0], -1.0..=1.0, 2).changed() {
                     app.session.tool.values.insert(channel, [value[0]; 3]);
+                    app.session.tool.material = None;
                 }
             }
             ChannelKind::Scalar => {
                 if slider(ui, tr(channel.label()), &mut value[0], 0.0..=1.0, 2).changed() {
                     app.session.tool.values.insert(channel, [value[0]; 3]);
+                    app.session.tool.material = None;
                 }
             }
         }

@@ -17,10 +17,6 @@ fn session() -> Session {
     s
 }
 
-fn value_of(material: &str, channel: Channel) -> [f32; 3] {
-    brush_values(material).unwrap().into_iter().find(|(c, _)| *c == channel).map(|(_, v)| v).unwrap()
-}
-
 fn stack(s: &Session) -> Vec<LayerId> {
     s.doc.project.texture_set(0).unwrap().stack.clone()
 }
@@ -78,25 +74,96 @@ fn a_smart_material_or_an_unknown_one_cannot_be_the_brush_material() {
     assert_eq!(s.tool.values, before);
 }
 
-#[test]
-fn a_stroke_after_picking_a_material_paints_its_values_in_the_enabled_channels() {
-    let mut s = session();
-    execute(&mut s, "tool.material", &json!({"material": "copper"})).unwrap();
-    execute(&mut s, "tool.material", &json!({"channel": "metallic", "enabled": false})).unwrap();
-    execute(&mut s, "tool.brush", &json!({"size": 20, "hardness": 100})).unwrap();
-    execute(&mut s, "tool.stroke", &json!({"points": [[180, 200], [220, 200]]})).unwrap();
+/// Texel of the sphere point under screen position `(x, y)`
+fn texel(s: &Session, x: f32, y: f32) -> (u32, u32) {
+    let hit = s.pick(Vec2::new(x, y), s.viewport).unwrap();
+    ((hit.uv.x * 256.0) as u32, (hit.uv.y * 256.0) as u32)
+}
 
-    let hit = s.pick(Vec2::new(200.0, 200.0), s.viewport).unwrap();
-    let (x, y) = ((hit.uv.x * 256.0) as u32, (hit.uv.y * 256.0) as u32);
-    let composite = &s.caches[0].composite;
-    let (colour, rough, metal) =
-        (composite.value(Channel::BaseColor, x, y), composite.value(Channel::Roughness, x, y), composite.value(Channel::Metallic, x, y));
-    let (want_colour, want_rough) = (value_of("copper", Channel::BaseColor), value_of("copper", Channel::Roughness));
-    for i in 0..3 {
-        assert!((colour[i] - want_colour[i]).abs() < 0.02, "{colour:?} vs {want_colour:?}");
+/// A session with `material` as the brush material, brush `size` (0..100), the stroke along y = 200 over `xs`
+fn painted(material: &str, size: u32, xs: [f32; 2]) -> Session {
+    let mut s = session();
+    paint(&mut s, material, size, xs);
+    s
+}
+
+fn paint(s: &mut Session, material: &str, size: u32, xs: [f32; 2]) {
+    execute(s, "tool.material", &json!({"material": material})).unwrap();
+    execute(s, "tool.brush", &json!({"size": size, "hardness": 100})).unwrap();
+    execute(s, "tool.stroke", &json!({"points": [[xs[0], 200], [xs[1], 200]]})).unwrap();
+    s.update();
+}
+
+/// What a fill layer of `material` (projection scale `scale`) shows over the sphere
+fn fill_of(material: &str, scale: f32) -> Session {
+    let mut s = session();
+    let layer = LayerId(execute(&mut s, "material.apply", &json!({"material": material})).unwrap()["layer"].as_u64().unwrap());
+    execute(&mut s, "layer.fill.projection", &json!({"layer": layer.0, "projection": "triplanar", "scale": scale})).unwrap();
+    s.update();
+    s
+}
+
+fn at(s: &Session, channel: Channel, (x, y): (u32, u32)) -> f32 {
+    s.caches[0].composite.value(channel, x, y)[0]
+}
+
+#[test]
+fn a_stroke_after_picking_a_material_paints_its_pattern_like_a_fill_of_it() {
+    // Brush size 40 is the pattern's natural size: the same as a fill layer with the material
+    let (stroke, fill) = (painted("cobblestone", 40, [150.0, 250.0]), fill_of("cobblestone", 1.0));
+    let samples: Vec<f32> = (0..24).map(|i| 170.0 + 3.0 * i as f32).collect();
+
+    let mut colours = Vec::new();
+    for x in samples {
+        let texel = texel(&stroke, x, 200.0);
+        for channel in [Channel::BaseColor, Channel::Roughness, Channel::Height] {
+            let (painted, expected) = (at(&stroke, channel, texel), at(&fill, channel, texel));
+            assert!((painted - expected).abs() < 0.02, "{channel:?} at x = {x}: {painted} vs {expected}");
+        }
+        colours.push(at(&stroke, Channel::BaseColor, texel));
     }
-    assert!((rough[0] - want_rough[0]).abs() < 0.02, "{rough:?} vs {want_rough:?}");
-    assert!(metal[0] < 0.5, "the metallic channel was off: {metal:?}");
+    let (low, high) = colours.iter().fold((f32::MAX, f32::MIN), |(low, high), v| (low.min(*v), high.max(*v)));
+    assert!(high - low > 0.05, "the colour varies along the stroke: {colours:?}");
+}
+
+#[test]
+fn overlapping_strokes_agree_where_they_overlap() {
+    let mut s = painted("cobblestone", 40, [150.0, 215.0]);
+    let samples: Vec<(u32, u32)> = (0..8).map(|i| texel(&s, 190.0 + 3.0 * i as f32, 200.0)).collect();
+    let first: Vec<f32> = samples.iter().map(|t| at(&s, Channel::BaseColor, *t)).collect();
+
+    paint(&mut s, "cobblestone", 40, [185.0, 250.0]);
+
+    for (i, t) in samples.iter().enumerate() {
+        assert!((at(&s, Channel::BaseColor, *t) - first[i]).abs() < 0.005, "sample {i}");
+    }
+}
+
+#[test]
+fn the_pattern_follows_the_brush_size() {
+    // A quarter of the natural brush size is a pattern four times as fine
+    let (stroke, fill) = (painted("cobblestone", 10, [194.0, 206.0]), fill_of("cobblestone", 4.0));
+    let natural = fill_of("cobblestone", 1.0);
+    let (mut fine, mut coarse) = (0.0_f32, 0.0_f32);
+    for x in [197.0, 199.0, 201.0, 203.0] {
+        let texel = texel(&stroke, x, 200.0);
+        let painted = at(&stroke, Channel::BaseColor, texel);
+        fine = fine.max((painted - at(&fill, Channel::BaseColor, texel)).abs());
+        coarse = coarse.max((painted - at(&natural, Channel::BaseColor, texel)).abs());
+    }
+    assert!(fine < 0.02, "matches the pattern at 4x: {fine}");
+    assert!(coarse > 0.02, "differs from the natural size: {coarse}");
+}
+
+#[test]
+fn editing_a_brush_value_ends_the_pattern() {
+    let mut s = session();
+    execute(&mut s, "tool.material", &json!({"material": "cobblestone"})).unwrap();
+    assert_eq!(s.tool.material.as_deref(), Some("cobblestone"));
+
+    execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [1.0, 0.0, 0.0]})).unwrap();
+
+    assert_eq!(s.tool.material, None);
 }
 
 /// Add copper with `place` params (above, below, top, index)

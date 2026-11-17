@@ -715,11 +715,10 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
     }
 }
 
-/// The brush values of simple material `id`: one value per channel it sets, in the order of its
-/// sources. A pattern counts as the middle between its two values. `None` for smart materials
-/// (several layers, or a masked layer) and for unknown ids: a brush paints plain values, so those
-/// stay layers.
-pub fn brush_values(id: &str) -> Option<Vec<(Channel, [f32; 3])>> {
+/// The channel sources of simple material `id`: its single, unmasked fill layer. `None` for smart
+/// materials (several layers, or a masked layer) and for unknown ids: a brush paints one fill's
+/// sources, so those stay layers.
+pub fn brush_sources(id: &str) -> Option<Vec<(Channel, Source)>> {
     let m = find(id).filter(|m| !m.smart)?;
     let mut scratch = Project::new("", "");
     let layers = build(&mut Builder { p: &mut scratch, channels: Channel::LOBES.to_vec() }, m.id).ok()?;
@@ -728,17 +727,32 @@ pub fn brush_values(id: &str) -> Option<Vec<(Channel, [f32; 3])>> {
     if layer.mask.is_some() {
         return None;
     }
+    Some(fill.sources.iter().map(|(channel, source)| (*channel, source.clone())).collect())
+}
+
+/// The brush's plain values for simple material `id`, one per channel it sets (what the tool's
+/// material shows): a pattern counts as the middle between its two values. `None` as
+/// [`brush_sources`].
+pub fn brush_values(id: &str) -> Option<Vec<(Channel, [f32; 3])>> {
     let mean = |low: &[f32; 3], high: &[f32; 3]| std::array::from_fn(|i| (low[i] + high[i]) * 0.5);
     Some(
-        fill.sources
-            .iter()
+        brush_sources(id)?
+            .into_iter()
             .filter_map(|(channel, source)| match source {
-                Source::Uniform(value) => Some((*channel, *value)),
-                Source::Procedural { low, high, .. } => Some((*channel, mean(low, high))),
+                Source::Uniform(value) => Some((channel, value)),
+                Source::Procedural { low, high, .. } => Some((channel, mean(&low, &high))),
                 Source::Image { .. } | Source::Anchor { .. } => None,
             })
             .collect(),
     )
+}
+
+/// The fill a brush material paints through, as a layer: `sources` projected tri-planar at
+/// `scale` (the same fill evaluation a layer with that material uses).
+pub(crate) fn brush_fill(id: LayerId, sources: Vec<(Channel, Source)>, scale: f32) -> Layer {
+    let channels: Vec<Channel> = sources.iter().map(|(channel, _)| *channel).collect();
+    let projection = Projection::Triplanar { scale, sharpness: 8.0, offset: [0.0; 3] };
+    Layer::new(id, "Brush material", LayerKind::Fill(Fill { sources: sources.into_iter().collect(), projection, link: None }), &channels)
 }
 
 /// Where [`apply_at`] puts a material.
