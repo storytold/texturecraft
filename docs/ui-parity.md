@@ -42,8 +42,13 @@ stable review references, not a complete inventory of the reference interface.
 UI-02 and UI-07 were findings at the assessed `62b2b13` revision and are no longer missing in
 the integrated source. Effect rows now have a Rename action and editor, and anchors can record
 intermediate mask values for higher layers. Engine and compositor regressions cover mask-anchor
-consumption. The original UI task audit did not exercise these new controls; a live UI rename,
-undo and save/reopen task remains to be repeated on the integrated build.
+consumption. The original UI task audit did not exercise these new controls. They are now covered
+by interface tests (`crates/ui-egui/tests/it/rename_anchor.rs`): renaming an effect row from its
+context menu, Undo and Redo of the rename, Escape, and Save as and Open keeping the name; adding an
+anchor point to a mask from the Add effect menu, picking it as the Source of a fill in a higher
+layer's mask, the resulting composite matching the engine-only result, and Save as and Open keeping
+the link. These run in the headless test harness; a live run in the native app on the integrated
+build is still not done.
 
 The relevant implementations are [layer rows, menus and fill/brush editors](../crates/ui-egui/src/dock.rs),
 [generator properties](../crates/ui-egui/src/generator_panel.rs),
