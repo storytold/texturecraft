@@ -385,7 +385,7 @@ pub(crate) fn ask(app: &mut TextureCraftApp, ctx: &egui::Context) {
         ),
     };
     egui::Window::new(title)
-        .id(egui::Id::new("export_template_ask"))
+        .id(egui::Id::unique("export_template_ask"))
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
