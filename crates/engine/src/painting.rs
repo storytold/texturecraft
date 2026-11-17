@@ -13,6 +13,7 @@ use texturecraft_paint::{
 
 use crate::session::{ActiveStroke, CloneFrom, Session, StackTarget, Tool};
 use crate::uv_stroke_state::UvStrokeState;
+use crate::uv_symmetry::UvMirror;
 use crate::{EngineError, Result};
 
 /// Shortest distance between 2D view stamps, so a stamp with no radius (a pen at zero pressure) can't stall a stroke.
@@ -360,6 +361,12 @@ impl Session {
         };
         let length = segment.length();
         let shape = Self::shape(&self.images, settings);
+
+        // The copies of each dab: the Clone tool's pickup offset is fixed, so it paints none
+        let material = self.doc.project.texture_sets.get(active.ts).map(|t| t.material).unwrap_or(0);
+        let mirror = (self.tool.tool != Tool::Clone)
+            .then(|| UvMirror::new(&settings.symmetry, active.stroke.center(), &self.mesh, &self.bvh, &cache.gbuf, material))
+            .flatten();
         let mut batch = Vec::new();
         let mut stamped = 0;
         while distance <= length && stamped < MAX_UV_STAMPS_PER_SAMPLE {
@@ -373,6 +380,13 @@ impl Session {
             }
 
             stamped += batch.len();
+            if let Some(mirror) = &mirror {
+                for index in 0..batch.len() {
+                    if let Some(stamp) = batch.get(index).copied() {
+                        mirror.add_copies(&stamp, &mut batch);
+                    }
+                }
+            }
             texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, &batch);
         }
 

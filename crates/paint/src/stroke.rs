@@ -265,6 +265,11 @@ impl Stroke {
         copies
     }
 
+    /// The center of the mesh the stroke paints, which the symmetry planes are measured from
+    pub fn center(&self) -> Vec3 {
+        self.center
+    }
+
     pub fn last_hit(&self) -> Option<SurfaceHit> {
         self.last
     }

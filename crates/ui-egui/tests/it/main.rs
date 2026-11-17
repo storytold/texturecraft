@@ -42,3 +42,4 @@ mod tool_availability;
 mod toolbar;
 
 mod symmetry;
+mod symmetry_2d;
