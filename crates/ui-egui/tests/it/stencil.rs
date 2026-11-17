@@ -1,5 +1,5 @@
 //! The Projection tool's stencil: an Assets image dropped on its slot, position fields and a reset in the tool panel,
-//! S + Shift + left-drag to move it, and the 2D view saying that projection paints in the 3D view
+//! S + Shift + left-drag to turn it in snapped steps, and the 2D view saying that projection paints in the 3D view
 
 use egui::accesskit::Role;
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, vec2};
@@ -121,7 +121,7 @@ fn the_position_fields_move_the_stencil_and_reset_puts_it_back() {
 }
 
 #[test]
-fn s_shift_left_drag_moves_the_stencil_without_painting() {
+fn s_shift_left_drag_turns_the_stencil_in_snapped_steps_without_painting() {
     let (mut harness, name) = projection_app();
     texturecraft_engine::execute(&mut harness.state_mut().session, "tool.stencil", &json!({"image": name})).unwrap();
     harness.run_steps(2);
@@ -129,18 +129,19 @@ fn s_shift_left_drag_moves_the_stencil_without_painting() {
     let before = harness.state().session.tool.stencil.clone().unwrap();
     let steps = history(&harness);
 
-    drag_holding(&mut harness, &[Key::S], Modifiers::SHIFT, from, vec2(80.0, -40.0));
+    drag_holding(&mut harness, &[Key::S], Modifiers::SHIFT, from, vec2(100.0, -40.0));
 
-    let moved = harness.state().session.tool.stencil.clone().unwrap();
-    assert!(moved.center[0] > before.center[0] && moved.center[1] > before.center[1], "{:?} -> {:?}", before.center, moved.center);
-    assert_eq!(moved.rotation, before.rotation, "a move does not turn it");
+    let turned = harness.state().session.tool.stencil.clone().unwrap();
+    assert_ne!(turned.rotation, before.rotation, "it turned");
+    assert_eq!(turned.rotation % 15.0, 0.0, "a snapped turn lands on a multiple of 15 degrees: {}", turned.rotation);
+    assert_eq!(turned.center, before.center, "a turn does not move it");
     assert_eq!(history(&harness), steps, "nothing painted");
 
-    // Without Shift the left-drag still turns it, and still does not paint
-    drag_holding(&mut harness, &[Key::S], Modifiers::NONE, from, vec2(80.0, 0.0));
-    let turned = harness.state().session.tool.stencil.clone().unwrap();
-    assert_ne!(turned.rotation, moved.rotation);
-    assert_eq!(turned.center, moved.center);
+    // Without Shift the left-drag turns it freely, and still does not paint
+    drag_holding(&mut harness, &[Key::S], Modifiers::NONE, from, vec2(30.0, 0.0));
+    let free = harness.state().session.tool.stencil.clone().unwrap();
+    assert_ne!(free.rotation % 15.0, 0.0, "a free turn is not snapped: {}", free.rotation);
+    assert_eq!(free.center, turned.center);
     assert_eq!(history(&harness), steps);
 }
 

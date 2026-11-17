@@ -534,6 +534,9 @@ const WHEEL_BRUSH_SIZE_PER_POINT: f32 = 0.002;
 /// Stencil turn per point of an S+left drag (degrees)
 const STENCIL_DEGREES_PER_POINT: f32 = 0.4;
 
+/// Step of an S+Shift+left drag's turn (degrees)
+const STENCIL_SNAP_DEGREES: f32 = 15.0;
+
 /// Stencil scale change per point of an S+right drag, as a fraction of the scale
 const STENCIL_SCALE_PER_POINT: f32 = 0.005;
 
@@ -613,16 +616,28 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         }
     }
 
-    // Stencil: S + left drag turns it, S + Shift + left drag or S + middle drag moves it, S + right drag scales it
+    let raw_id = ui.scope_id().with("stencil_snap_raw");
+    if !(s_held && shift && response.dragged_by(PointerButton::Primary)) {
+        ui.data_mut(|data| data.remove::<f32>(raw_id));
+    }
+
+    // Stencil: S + left drag turns it (with Shift in snapped steps), S + right drag scales it, S + middle drag moves it
     if s_held
         && stencil_moves
         && let Some(stencil) = app.session.tool.stencil.as_mut()
     {
-        if response.dragged_by(PointerButton::Primary) && !shift {
-            stencil.rotation = (stencil.rotation + delta.x * STENCIL_DEGREES_PER_POINT).rem_euclid(360.0);
+        if response.dragged_by(PointerButton::Primary) {
+            if shift {
+                // The unsnapped angle is kept so slow drags still reach the next step
+                let raw: f32 = ui.data(|data| data.get_temp(raw_id)).unwrap_or(stencil.rotation) + delta.x * STENCIL_DEGREES_PER_POINT;
+                ui.data_mut(|data| data.insert_temp(raw_id, raw));
+                stencil.rotation = ((raw / STENCIL_SNAP_DEGREES).round() * STENCIL_SNAP_DEGREES).rem_euclid(360.0);
+            } else {
+                stencil.rotation = (stencil.rotation + delta.x * STENCIL_DEGREES_PER_POINT).rem_euclid(360.0);
+            }
         } else if response.dragged_by(PointerButton::Secondary) {
             stencil.scale = (stencil.scale * (1.0 + delta.x * STENCIL_SCALE_PER_POINT)).clamp(MIN_STENCIL_SCALE, MAX_STENCIL_SCALE);
-        } else if response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Primary) {
+        } else if response.dragged_by(PointerButton::Middle) {
             stencil.center[0] += delta.x / size.x * 2.0;
             stencil.center[1] -= delta.y / size.y * 2.0;
         }
