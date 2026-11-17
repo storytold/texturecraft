@@ -420,6 +420,23 @@ fn view_header_rect(rect: Rect) -> Option<Rect> {
     })
 }
 
+/// Where the solo notice sits from a view's top-left corner, and its text size
+const SOLO_NOTICE_OFFSET: egui::Vec2 = vec2(12.0, 12.0);
+const SOLO_NOTICE_TEXT_SIZE: f32 = 12.0;
+
+/// While a layer is soloed, a line in the view's corner says so: the view does not show the whole stack
+fn solo_notice(app: &TextureCraftApp, ui: &Ui, rect: Rect) {
+    let Some(solo) = app.session.solo else { return };
+    let Some(layer) = app.session.doc.project.layers.get(&solo.layer) else { return };
+    let text = if solo.ignore_mask {
+        trf("Solo: {layer} (mask ignored)", &[("layer", &layer.name)])
+    } else {
+        trf("Solo: {layer}", &[("layer", &layer.name)])
+    };
+    let tokens = Tokens::get(ui.ctx());
+    ui.painter_at(rect).text(rect.left_top() + SOLO_NOTICE_OFFSET, egui::Align2::LEFT_TOP, text, egui::FontId::proportional(SOLO_NOTICE_TEXT_SIZE), tokens.warning);
+}
+
 /// The camera and view pickers at the top of a view, left out when the view is too narrow to hold them
 fn view_header(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, id: &str) {
     let Some(header) = view_header_rect(rect) else { return };
@@ -845,6 +862,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     if app.ui.mode == crate::state::Mode::Baking {
         crate::bake_mode::bake_visualization_panel(app, ui, rect);
     }
+    solo_notice(app, ui, rect);
     view_header(app, ui, rect, "v3d");
     axis_gizmo(ui, rect, app, false);
 }
@@ -1969,6 +1987,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         brush_cursor_2d(&painter, cursor_center, radius_points, app.session.tool.brush.hardness);
     }
     brush_readout(app, ui, &response, adjusting);
+    solo_notice(app, ui, rect);
     view_header(app, ui, rect, "v2d");
     axis_gizmo(ui, rect, app, true);
     let name = app.session.doc.project.texture_sets.get(texture_set_index).map(|texture_set| texture_set.name.clone()).unwrap_or_default();

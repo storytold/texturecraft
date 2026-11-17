@@ -343,6 +343,8 @@ pub struct Session {
     pub target: StackTarget,
     pub camera: OrbitCamera,
     pub view: ViewMode,
+    /// The layer shown alone in the viewport (not saved, not in the history; see [`crate::solo`]).
+    pub solo: Option<crate::Solo>,
     /// The live bake preview while the app bakes (see [`crate::bake_preview`]).
     pub bake_preview: Option<crate::bake_preview::BakePreview>,
     /// Viewport size (pixels) used by scripted strokes.
@@ -410,6 +412,7 @@ impl Session {
             target: StackTarget::Content,
             camera,
             view: ViewMode::Material,
+            solo: None,
             bake_preview: None,
             viewport: Vec2::new(1280.0, 800.0),
             stroke: None,
@@ -847,6 +850,11 @@ impl Session {
             })
         });
 
+        // A soloed layer's view of the project; a removed layer ends the solo
+        if self.solo.is_some_and(|solo| self.doc.project.locate(solo.layer).is_none()) {
+            self.set_solo(None);
+        }
+        let solo_view = if self.pending_tiles() > 0 { self.solo_view() } else { None };
         let active = self.ts();
         let order = std::iter::once(active).chain((0..self.caches.len()).filter(|ts| *ts != active));
         let mut changed = false;
@@ -877,7 +885,7 @@ impl Session {
 
                 let empty = BakedMaps::default();
                 let inputs = texturecraft_compose::Inputs {
-                    project: &self.doc.project,
+                    project: solo_view.as_ref().unwrap_or(&self.doc.project),
                     ts,
                     mesh: &self.mesh,
                     gbuf: &cache.gbuf,

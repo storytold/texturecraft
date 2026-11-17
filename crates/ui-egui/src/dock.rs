@@ -465,6 +465,7 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         row_shade(&tokens, index)
     };
     painter.rect_filled(rect, 0.0, background);
+    let solo = app.session.solo.filter(|solo| solo.layer == layer.id);
     let (indent, thumbnail_size) = layer_thumbnail_layout(rect.width(), depth, layer.is_group(), preferred_size);
 
     // Folder contents hang off lines down the left without crossing compact row controls
@@ -485,19 +486,40 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         painter.rect_filled(Rect::from_min_size(rect.min + vec2(SELECTED_EDGE_WIDTH, 0.0), vec2(TAG_WIDTH, row_height)), 0.0, *tag);
     }
 
+    // A soloed layer: an outline round the row and a lit eye
+    if solo.is_some() {
+        painter.rect_stroke(rect.shrink(SOLO_OUTLINE_WIDTH * 0.5), 0.0, Stroke::new(SOLO_OUTLINE_WIDTH, tokens.warning), egui::StrokeKind::Inside);
+    }
+
     // The eye
     let content_left = rect.left() + ROW_LEFT_PADDING + indent;
     let eye = Rect::from_center_size(pos2(content_left + EYE_SIZE * 0.5, rect.center().y), vec2(LAYER_EYE_SIZE, LAYER_EYE_SIZE));
-    let eye_response = ui.interact(eye, ui.scope_id().with(("eye", layer.id.0)), Sense::click()).on_hover_text(tr("Show or hide the layer"));
+    let eye_response = ui
+        .interact(eye, ui.scope_id().with(("eye", layer.id.0)), Sense::click())
+        .on_hover_ui(|ui| {
+            ui.label(tr("Show or hide the layer"));
+            ui.label(tr("Alt+click: show only this layer. Alt+Shift+click: without its mask."));
+        });
     painter.text(
         eye.center(),
         egui::Align2::CENTER_CENTER,
-        if layer.visible { ic::EYE } else { ic::EYE_SLASH },
+        if layer.visible || solo.is_some() { ic::EYE } else { ic::EYE_SLASH },
         egui::FontId::proportional(LAYER_EYE_FONT_SIZE),
-        if layer.visible { tokens.text } else { tokens.text_dim },
+        if solo.is_some() {
+            tokens.warning
+        } else if layer.visible {
+            tokens.text
+        } else {
+            tokens.text_dim
+        },
     );
     if eye_response.clicked() {
-        app.run("layer.visible", json!({"layer": layer.id.0}));
+        let modifiers = ui.input(|input| input.modifiers);
+        if modifiers.alt {
+            toggle_solo(app, layer.id, modifiers.shift);
+        } else {
+            app.run("layer.visible", json!({"layer": layer.id.0}));
+        }
     }
 
     // A folder's caret
@@ -1107,6 +1129,32 @@ fn geometry_mask_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     });
 }
 
+/// Width of the outline round a soloed layer's row
+const SOLO_OUTLINE_WIDTH: f32 = 2.0;
+
+/// Show `layer` alone (its mask ignored with `ignore_mask`), or end the solo when it is the one shown.
+fn toggle_solo(app: &mut TextureCraftApp, layer: texturecraft_engine::core::LayerId, ignore_mask: bool) {
+    if app.session.solo.is_some_and(|solo| solo.layer == layer) {
+        app.run("view.solo", json!({"layer": null}));
+    } else {
+        app.run("view.solo", json!({"layer": layer.0, "ignoreMask": ignore_mask}));
+    }
+}
+
+/// The context menu's solo entries: a view-only preview, so they never select the layer or edit the document.
+fn solo_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: texturecraft_engine::core::LayerId) {
+    let solo = app.session.solo.filter(|solo| solo.layer == layer);
+    if ui.add(egui::Button::new(tr("Solo layer")).selected(solo.is_some())).clicked() {
+        toggle_solo(app, layer, false);
+        ui.close();
+    }
+    let ignoring = solo.is_some_and(|solo| solo.ignore_mask);
+    if ui.add(egui::Button::new(tr("Solo layer without its mask")).selected(ignoring)).clicked() {
+        app.run("view.solo", json!({"layer": layer.0, "ignoreMask": !ignoring}));
+        ui.close();
+    }
+}
+
 fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     let tk = Tokens::get(ui.ctx());
     ui.set_min_width(230.0);
@@ -1136,6 +1184,8 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     run(app, ui, tr("Clear mask"), "mask.clear", json!({"layer": lid}), has_mask);
     run(app, ui, tr("Remove mask"), "mask.remove", json!({"layer": lid}), has_mask);
     geometry_mask_menu(app, ui, layer);
+    ui.separator();
+    solo_menu(app, ui, layer.id);
     ui.separator();
     run(app, ui, tr("Flatten layer"), "layer.flatten", json!({"layer": lid}), !layer.is_group());
     #[cfg(not(target_arch = "wasm32"))]

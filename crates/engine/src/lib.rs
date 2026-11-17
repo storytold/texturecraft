@@ -53,6 +53,7 @@ pub mod resource_cmds;
 pub mod session;
 pub mod set_cmds;
 pub mod smart_masks;
+mod solo;
 pub mod template_cmds;
 pub mod text_cmds;
 pub mod thumbs;
@@ -70,6 +71,7 @@ pub use fill_hit_test::FillHitTest;
 pub use fill_mode::FillMode;
 pub use path_tool::PathState;
 pub use project_cmds::sample_session;
+pub use solo::Solo;
 pub use session::{CloneFrom, CloneSource, Document, Session, SetCache, StackTarget, StencilState, Tool, ToolState, ViewMode};
 pub use set_cmds::{ResizeOutput, ResizeTask};
 

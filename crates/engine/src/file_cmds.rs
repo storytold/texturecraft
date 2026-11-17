@@ -236,6 +236,11 @@ impl Session {
 
     /// Render every export file for texture sets `sets` (in memory; works on the web).
     pub fn export_files(&mut self, sets: &[usize], opts: &ExportOptions) -> Result<Vec<ExportedFile>> {
+        // A solo is only a view: the files hold the whole stack
+        self.without_solo(|session| session.export_files_of_stack(sets, opts))
+    }
+
+    fn export_files_of_stack(&mut self, sets: &[usize], opts: &ExportOptions) -> Result<Vec<ExportedFile>> {
         self.update();
         let mesh_name = stem_of(self.doc.project.mesh.trim_start_matches("builtin:"));
         let mut out = Vec::new();

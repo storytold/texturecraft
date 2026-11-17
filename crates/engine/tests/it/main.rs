@@ -26,6 +26,7 @@ mod perf;
 mod polygon_fill;
 mod project_recovery;
 mod sample;
+mod solo;
 mod thumbs;
 mod tool_availability;
 mod tools;

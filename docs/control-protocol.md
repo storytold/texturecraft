@@ -66,6 +66,14 @@ if output size changes, or neutral values when no previous map exists. A running
 tile selection captured when its worker started. Sets with no checked tiles are skipped; their
 geometry still contributes to occlusion when baking other tiles.
 
+`view.solo {layer?, ignoreMask?}` shows one layer alone in the viewport, as if the other layers
+of its texture set were hidden (`layer` defaults to the selected layer, `layer: null` ends the
+solo; `ignoreMask: true` draws the layer, and the folders around it, at full coverage; other
+texture sets are unchanged). It changes only the view: nothing enters the undo history, the
+project file or an export (`file.exportTextures` and the CLI export the whole stack, then the solo comes
+back), and removing the soloed layer ends it. `session.inspect` reports it as `solo`
+(`{layer, ignoreMask}` or `null`).
+
 ## Control channel (desktop app)
 
 ```sh

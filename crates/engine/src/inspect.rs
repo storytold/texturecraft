@@ -197,6 +197,7 @@ pub fn session(s: &Session) -> Value {
         "layers": stack(s, ts),
         "tool": { "tool": s.tool.tool.id(), "brush": crate::tool_cmds::brush_json(s) },
         "view": s.view.label(),
+        "solo": s.solo.map(|solo| json!({ "layer": solo.layer.0, "ignoreMask": solo.ignore_mask })),
         "bakePreview": crate::bake_preview::preview_json(s),
         "camera": crate::view_cmds::camera_json(s),
         "display": s.doc.project.display,

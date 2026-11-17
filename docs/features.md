@@ -35,7 +35,10 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   Normal map detail), per-channel opacity, visibility, color tags, drag-and-drop reordering,
   duplicate, group, flatten, cut, copy and paste across texture sets, and **geometry masks** that
   show a layer only on the mesh parts you pick (right-click a layer, or click parts with the
-  **Geometry mask** tool, 8).
+  **Geometry mask** tool, 8). **Solo layer** (right-click a layer, or Alt+click its eye) shows
+  one layer alone in the 3D and 2D views, optionally without its mask (Alt+Shift+click, or
+  **Solo layer without its mask**), to judge a material hidden behind a mask. It is only a view:
+  the document, the undo history, saving, exporting and baking never see it.
 - **Filters and content effects** on any layer or mask: **31 filters** (HSL, levels,
   contrast/luminosity, color balance, gradient map, posterize, clamp, histogram scan, range and
   shift, invert, threshold, grayscale, replace color, edge detect, normal invert, baked lighting,

@@ -16,6 +16,7 @@ pub mod eval;
 mod held_fields;
 mod image_identity;
 pub mod pattern;
+pub mod solo;
 pub mod store;
 pub mod thumb;
 
@@ -25,5 +26,6 @@ pub use eval::{
     BLOCK, Composite, Inputs, PaintTarget, Stencil, StrokePreview, all_tiles, composite_tiles, composite_tiles_cached, covered_tiles, effect_histogram,
     flatten_layer, mask_at, mask_image, pad_tiles, stack_reads_neighbours,
 };
+pub use solo::solo_project;
 pub use store::{BakedMaps, ImageRes, ImageStore, PixelStore};
 pub use thumb::{THUMB_TEXELS, ThumbImage, ThumbTarget};

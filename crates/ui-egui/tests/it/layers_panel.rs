@@ -120,3 +120,66 @@ fn deeply_nested_effect_visibility_is_reachable_in_a_narrow_panel() {
     let content = &h.state().session.doc.project.layers[&layer].content_effects;
     assert!(!content.iter().find(|effect| effect.name == "Effect A").unwrap().visible, "the compact eye toggles the effect instead of missing the panel");
 }
+
+fn right_click(h: &mut Harness<'_, TextureCraftApp>, at: egui::Pos2) {
+    h.hover_at(at);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE });
+    }
+    h.run_steps(3);
+}
+
+/// Click the eye of the top-level row `name` with `modifiers` held (the eye sits in the first 20 points after the 7-point edge).
+fn click_eye(h: &mut Harness<'_, TextureCraftApp>, name: &str, modifiers: egui::Modifiers) {
+    let row = h.get_by_label(name).rect();
+    h.event(egui::Event::ModifiersChanged(modifiers));
+    click(h, egui::pos2(row.left() + 17.0, row.center().y));
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run_steps(2);
+}
+
+#[test]
+fn the_context_menu_solos_a_layer_without_touching_the_document() {
+    let (mut h, layer) = harness();
+    let (project, history, modified) = (h.state().session.doc.project.clone(), h.state().session.history_labels(), h.state().session.modified);
+    let row = h.get_by_label("Masked fill").rect();
+    right_click(&mut h, row.center());
+    h.get_by_label("Solo layer").click();
+    h.run_steps(3);
+    assert_eq!(h.state().session.solo, Some(texturecraft_engine::Solo { layer, ignore_mask: false }));
+    assert_eq!(h.state().session.doc.project, project, "soloing is not an edit");
+    assert_eq!((h.state().session.history_labels(), h.state().session.modified), (history.clone(), modified));
+
+    // The entry is lit while the layer is soloed; clicking it again ends the solo
+    right_click(&mut h, row.center());
+    h.get_by_label("Solo layer").click();
+    h.run_steps(3);
+    assert_eq!(h.state().session.solo, None);
+
+    right_click(&mut h, row.center());
+    h.get_by_label("Solo layer without its mask").click();
+    h.run_steps(3);
+    assert_eq!(h.state().session.solo, Some(texturecraft_engine::Solo { layer, ignore_mask: true }));
+    right_click(&mut h, row.center());
+    h.get_by_label("Solo layer without its mask").click();
+    h.run_steps(3);
+    assert_eq!(h.state().session.solo, Some(texturecraft_engine::Solo { layer, ignore_mask: false }), "the second entry only switches the mask back on");
+    assert_eq!((h.state().session.doc.project.clone(), h.state().session.history_labels()), (project, history));
+}
+
+#[test]
+fn alt_click_on_the_eye_solos_and_a_plain_click_still_hides() {
+    let (mut h, layer) = harness();
+    click_eye(&mut h, "Masked fill", egui::Modifiers::ALT);
+    assert_eq!(h.state().session.solo, Some(texturecraft_engine::Solo { layer, ignore_mask: false }));
+    assert!(h.state().session.doc.project.layers[&layer].visible, "Alt+click does not touch the layer's own eye");
+    click_eye(&mut h, "Masked fill", egui::Modifiers::ALT);
+    assert_eq!(h.state().session.solo, None, "Alt+click on the soloed layer ends the solo");
+    click_eye(&mut h, "Masked fill", egui::Modifiers::ALT | egui::Modifiers::SHIFT);
+    assert_eq!(h.state().session.solo, Some(texturecraft_engine::Solo { layer, ignore_mask: true }), "Alt+Shift also ignores the mask");
+    click_eye(&mut h, "Masked fill", egui::Modifiers::ALT);
+    assert_eq!(h.state().session.solo, None);
+    click_eye(&mut h, "Masked fill", egui::Modifiers::NONE);
+    assert!(!h.state().session.doc.project.layers[&layer].visible, "a plain click hides the layer as before");
+    assert_eq!(h.state().session.solo, None);
+}
