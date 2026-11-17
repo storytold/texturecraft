@@ -42,8 +42,7 @@ impl Session {
 
                 // A face on the same side: a thin shell's other face lies at the same point but looks the other way
                 let faces_alike = |triangle: u32| {
-                    groups.index_of(triangle).is_some()
-                        && corners(triangle).is_some_and(|[a, b, c]| (b - a).cross(c - a).dot(target_normal) > 0.0)
+                    groups.index_of(triangle).is_some() && corners(triangle).is_some_and(|[a, b, c]| (b - a).cross(c - a).dot(target_normal) > 0.0)
                 };
                 if let Some(hit) = self.bvh.nearest(target, tolerance, &faces_alike) {
                     result.extend(groups.group(hit.tri).unwrap_or_default().iter().copied());
