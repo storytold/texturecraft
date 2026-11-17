@@ -30,6 +30,13 @@ fn harness() -> (Harness<'static, TextureCraftApp>, Library) {
     (h, Library(dir))
 }
 
+/// The channel toggles of the open dialog (the dialog sits left of the properties panel, which has its own Invert controls)
+fn toggles<'h>(h: &'h Harness<'_, TextureCraftApp>) -> Vec<egui_kittest::Node<'h>> {
+    h.get_all_by_label("Invert").filter(|n| n.rect().max.x < DIALOG_RIGHT_EDGE).collect()
+}
+
+const DIALOG_RIGHT_EDGE: f32 = 1200.0;
+
 fn template() -> ExportPreset {
     let ch = |channel| SourceRef::Channel { channel, component: 0 };
     ExportPreset {
@@ -57,11 +64,11 @@ fn invert_toggle_changes_the_saved_template() {
     let saved = |h: &Harness<'_, TextureCraftApp>| h.state().session.export_preset(TEMPLATE).unwrap().maps[0].inverted.clone();
     assert!(saved(&h).is_empty());
     // One Invert toggle per channel: R, G, B
-    assert_eq!(h.get_all_by_label("Invert").count(), 3);
-    h.get_all_by_label("Invert").nth(1).unwrap().click();
+    assert_eq!(toggles(&h).len(), 3);
+    toggles(&h)[1].click();
     h.run_steps(4);
     assert_eq!(saved(&h), vec![Dest::G], "the second channel (G) is inverted");
-    h.get_all_by_label("Invert").nth(1).unwrap().click();
+    toggles(&h)[1].click();
     h.run_steps(4);
     assert!(saved(&h).is_empty(), "a second click turns it off");
 }

@@ -773,15 +773,15 @@ fn inverted_channels_write_one_minus_the_source() {
         assert!((plain[0] - 16384).abs() <= tol && plain[3] == 65535, "depth {depth}: un-inverted {plain:?}");
     }
     // Gray maps and float files too.
-    let mut gray = gray_map("g", SourceRef::Channel { channel: Channel::Metallic, component: 0 });
-    gray.inverted = vec![Dest::L];
-    let files = fx.render(&ExportOptions::new(ExportPreset { name: "inv".into(), maps: vec![gray.clone()] }));
-    assert_eq!(decode(find(&files, "g.png")).to_luma8().get_pixel(4, 4)[0], 64, "1 - metallic 0.75");
-    gray.format = FileFormat::Exr;
-    gray.bit_depth = 32;
+    let gray = gray_map("g", SourceRef::Channel { channel: Channel::Metallic, component: 0 });
+    let gray = MapSpec { inverted: vec![Dest::L], ..gray };
     let files = fx.render(&ExportOptions::new(ExportPreset { name: "inv".into(), maps: vec![gray] }));
-    let v = decode(find(&files, "g.exr")).to_rgb32f().get_pixel(4, 4)[0];
-    assert!((v - 0.25).abs() < 1e-3, "{v}");
+    assert_eq!(decode(find(&files, "g.png")).to_luma8().get_pixel(4, 4)[0], 64, "1 - metallic 0.75");
+    let mut float = invert_map(32, vec![Dest::B]);
+    float.format = FileFormat::Exr;
+    let files = fx.render(&ExportOptions::new(ExportPreset { name: "inv".into(), maps: vec![float] }));
+    let v = decode(find(&files, "packed.exr")).to_rgba32f().get_pixel(4, 4).0;
+    assert!((v[2] - 0.25).abs() < 1e-3 && (v[0] - 0.25).abs() < 1e-3, "metallic 0.75 inverted, roughness 0.25 not: {v:?}");
 }
 
 #[test]
@@ -818,7 +818,11 @@ fn inverting_a_colour_channel_inverts_the_linear_value_before_encoding() {
             file: "col".into(),
             format: FileFormat::Png,
             bit_depth: 8,
-            channels: [Dest::R, Dest::G, Dest::B].into_iter().zip(0u8..).map(|(d, k)| (d, SourceRef::Channel { channel: Channel::BaseColor, component: k })).collect(),
+            channels: [Dest::R, Dest::G, Dest::B]
+                .into_iter()
+                .zip(0u8..)
+                .map(|(d, k)| (d, SourceRef::Channel { channel: Channel::BaseColor, component: k }))
+                .collect(),
             inverted,
         };
         let mut opts = ExportOptions::new(ExportPreset { name: "c".into(), maps: vec![map] });
@@ -829,7 +833,7 @@ fn inverting_a_colour_channel_inverts_the_linear_value_before_encoding() {
     // Texel (9, 9): linear red 9/63, written as sRGB.
     let want = linear_to_srgb(1.0 - 9.0 / 63.0) * 255.0;
     assert!((inv.get_pixel(9, 9)[0] as f32 - want).abs() <= 1.0, "{} vs {want}", inv.get_pixel(9, 9)[0]);
-    assert_eq!(inv.get_pixel(9, 9)[1..], plain.get_pixel(9, 9)[1..], "G and B stay");
+    assert_eq!(inv.get_pixel(9, 9).0[1..], plain.get_pixel(9, 9).0[1..], "G and B stay");
     // A size override goes through the resize path: the left-most texels are 1 - 0 -> white red.
     let half = base(vec![Dest::R], Some(RES / 2));
     assert_eq!(half.width(), RES / 2);

@@ -23,7 +23,15 @@ pub struct UserPresets {
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("export.presets", "Export presets", [], None, "{} → [{name, maps, builtin}]", always, list),
-        cmd!("export.preset.get", "Get an export preset", [], None, "{name} → {name, maps: [{file, format, bit_depth, channels, inverted?: [dest, ...]}]}", always, get),
+        cmd!(
+            "export.preset.get",
+            "Get an export preset",
+            [],
+            None,
+            "{name} → {name, maps: [{file, format, bit_depth, channels, inverted?: [dest, ...]}]}",
+            always,
+            get
+        ),
         cmd!(
             "export.preset.save",
             "Save a user export preset",
