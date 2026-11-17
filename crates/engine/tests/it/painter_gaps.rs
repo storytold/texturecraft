@@ -3,7 +3,7 @@
 //! maps from images and fill projection transforms, through engine commands.
 
 use serde_json::{Value, json};
-use texturecraft_engine::core::{Channel, EffectKind, Filter, LayerId, LayerKind, Projection};
+use texturecraft_engine::core::{Channel, Decal, EffectKind, Filter, LayerId, LayerKind, Projection, Source};
 use texturecraft_engine::geom::NO_TRI;
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
@@ -202,6 +202,55 @@ fn decals_project_an_image_from_a_frame_placed_on_the_surface() {
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     assert!(!red(at(&mut s, Channel::BaseColor, 170.0, 180.0)));
+}
+
+/// The decal of mask fill effect `effect`
+fn effect_decal(s: &Session, effect: LayerId) -> Decal {
+    let EffectKind::Fill { projection: Projection::Decal(decal), .. } = &s.doc.project.effect(effect).unwrap().1.kind else { panic!("a decal fill effect") };
+    *decal
+}
+
+#[test]
+fn a_mask_fill_effects_decal_is_edited_like_a_layer_decal() {
+    let mut s = session();
+    let name = s.import_resource_bytes("logo.png", png(8, 8, |_, _| [255, 255, 255, 255])).unwrap();
+    let added = execute(&mut s, "layer.add.decal", &json!({"image": name, "channel": "mask", "x": 200, "y": 200, "size": 0.5})).unwrap();
+    let (layer, effect) = (id(added.clone(), "layer"), id(added, "maskEffect"));
+    let layer_decal = id(execute(&mut s, "layer.add.decal", &json!({"image": name, "x": 200, "y": 200, "size": 0.5})).unwrap(), "layer");
+    let before = effect_decal(&s, effect);
+    let steps = s.history_labels().len();
+
+    // Only the effect id (the selected layer is the other decal)
+    let r = execute(&mut s, "layer.decal.set", &json!({"effect": effect.0, "size": [0.3, 0.2], "offset": [0.1, -0.05], "rotation": 30, "depth": 0.2})).unwrap();
+    assert_eq!(r["layer"], json!(layer.0), "the owning layer is reported");
+    let after = effect_decal(&s, effect);
+    assert_eq!((after.size, after.offset, after.rotation), ([0.3, 0.2], [0.1, -0.05], 30.0));
+    assert_eq!(after.center, before.center, "the other fields stay");
+    assert_eq!(s.history_labels().len(), steps + 1, "one undo step per edit");
+
+    // Re-placing with a click
+    execute(&mut s, "layer.decal.set", &json!({"effect": effect.0, "layer": layer.0, "x": 170, "y": 180})).unwrap();
+    assert_eq!(effect_decal(&s, effect).offset, [0.0, 0.0]);
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(effect_decal(&s, effect), before, "undo restores the effect's decal");
+
+    // The layer decal is untouched by all of it
+    let LayerKind::Fill(f) = &s.doc.project.layer(layer_decal).unwrap().kind else { panic!("a fill layer") };
+    assert!(matches!(&f.projection, Projection::Decal(d) if d.size[1] == 0.5 && d.rotation == 0.0));
+
+    // Errors: unknown effect, an effect that is not a decal, an effect of another layer
+    assert!(execute(&mut s, "layer.decal.set", &json!({"effect": 999_999, "size": 1})).is_err());
+    let levels = id(execute(&mut s, "effect.add.filter", &json!({"layer": layer.0, "filter": "levels"})).unwrap(), "effect");
+    assert!(execute(&mut s, "layer.decal.set", &json!({"effect": levels.0, "size": 1})).is_err());
+    assert!(execute(&mut s, "layer.decal.set", &json!({"effect": effect.0, "layer": layer_decal.0, "size": 1})).is_err());
+    assert_eq!(effect_decal(&s, effect), before);
+
+    // A new image replaces the effect's source, not a layer channel
+    let other = s.import_resource_bytes("other.png", png(4, 4, |_, _| [0, 0, 0, 255])).unwrap();
+    execute(&mut s, "layer.decal.set", &json!({"effect": effect.0, "image": other})).unwrap();
+    assert!(matches!(&s.doc.project.effect(effect).unwrap().1.kind, EffectKind::Fill { source: Source::Image { name, .. }, .. } if *name == other));
 }
 
 #[test]

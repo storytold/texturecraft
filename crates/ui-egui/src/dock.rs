@@ -2373,7 +2373,7 @@ const FILL_CHANNELS_GAP: f32 = 4.0;
 fn fill_editor(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Value, enabled_channels: &[Channel], reader: LayerId) {
     let salt = base.to_string();
     if let Projection::Decal(decal) = &fill.projection {
-        decal_editor(app, ui, decal, reader);
+        decal_editor(app, ui, decal, base, reader);
     } else {
         projection_editor(app, ui, &fill.projection, "layer.fill.projection", base, &salt);
     }
@@ -2503,14 +2503,17 @@ fn axis_combo(ui: &mut Ui, axis: u8) -> Option<u8> {
     picked
 }
 
-/// A decal's frame: place it with a click in the 3D view, then size, turn and shift it.
-fn decal_editor(app: &mut TextureCraftApp, ui: &mut Ui, d: &Decal, layer: LayerId) {
+/// A decal's frame: place it with a click in the 3D view, then size, turn and shift it. `base` is the
+/// `{layer}` or `{effect}` holding it (a mask fill effect's decal edits like a layer's); `layer` is the reader.
+fn decal_editor(app: &mut TextureCraftApp, ui: &mut Ui, d: &Decal, base: &Value, layer: LayerId) {
+    // What a placing click or the stack selection names: the effect when the decal is a mask effect's
+    let holder = base.get("effect").and_then(Value::as_u64).map_or(layer, LayerId);
     let tk = Tokens::get(ui.ctx());
     ui.label(caption(tr("Decal")));
-    let placing = app.placing_decal == Some(layer);
+    let placing = app.placing_decal == Some(holder);
     let label = format!("{} {}", ic::CROSSHAIR, if placing { tr("Click the mesh to place the decal") } else { tr("Place on the surface") });
     if ui.selectable_label(placing, label).on_hover_text(tr("The next click in the 3D view moves the decal there")).clicked() {
-        app.placing_decal = if placing { None } else { Some(layer) };
+        app.placing_decal = if placing { None } else { Some(holder) };
     }
     let (lo, hi) = app.session.mesh.bounds();
     let diag = (hi - lo).length().max(1e-3);
@@ -2528,7 +2531,7 @@ fn decal_editor(app: &mut TextureCraftApp, ui: &mut Ui, d: &Decal, layer: LayerI
         edit = edit.or(slider_edit(ui, label, x, range, 3));
     }
     if let Some(merge) = edit {
-        app.run("layer.decal.set", json!({"layer": layer.0, "size": [v[0], v[1]], "rotation": v[2], "offset": [v[3], v[4]], "depth": v[5], "merge": merge}));
+        app.run("layer.decal.set", with(base, json!({"size": [v[0], v[1]], "rotation": v[2], "offset": [v[3], v[4]], "depth": v[5], "merge": merge})));
     }
     ui.label(
         RichText::new(tr("The image's alpha cuts the decal's shape; faces turned away and surfaces beyond its depth stay clear."))
@@ -2712,7 +2715,11 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
                     ui.label(RichText::new(tr("Colors read as gray. Add a levels or blur effect above to shape the result.")).color(tokens.text_dim));
                 }
                 Source::Image { .. } => {
-                    projection_editor(app, ui, projection, "effect.set", &json!({"effect": id}), &format!("maskfill{id}"));
+                    if let Projection::Decal(decal) = projection {
+                        decal_editor(app, ui, decal, &json!({"effect": id}), layer.id);
+                    } else {
+                        projection_editor(app, ui, projection, "effect.set", &json!({"effect": id}), &format!("maskfill{id}"));
+                    }
                 }
                 _ => {}
             }

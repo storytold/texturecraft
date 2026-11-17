@@ -658,7 +658,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
 
     // Decal placement: a click moves the decal being placed there, unless it dismisses a waiting image drop's menu
     let placing = app.placing_decal.filter(|_| app.ui.mode == crate::state::Mode::Painting);
-    if let Some(layer) = placing {
+    if let Some(target) = placing {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         if !alt
             && !rail_popup
@@ -667,7 +667,10 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             && let Some(pointer) = response.interact_pointer_pos()
         {
             let (at, viewport) = (local(pointer), app.session.viewport);
-            app.run("layer.decal.set", json!({"layer": layer.0, "x": at.x, "y": at.y, "viewport": [viewport.x, viewport.y]}));
+            let mut params = json!({"x": at.x, "y": at.y, "viewport": [viewport.x, viewport.y]});
+            // The id is a decal layer's or a mask fill effect's
+            params[if app.session.doc.project.effect(target).is_some() { "effect" } else { "layer" }] = json!(target.0);
+            app.run("layer.decal.set", params);
             app.placing_decal = None;
         }
     }
@@ -923,9 +926,10 @@ struct DecalFrame {
 }
 
 impl DecalFrame {
-    fn of(app: &TextureCraftApp, rect: Rect) -> Option<DecalFrame> {
+    /// The selected decal: its layer (the mask's owner for an effect), the mask fill effect holding it when placed as a mask, and the decal
+    fn selected(app: &TextureCraftApp) -> Option<(LayerId, Option<LayerId>, Decal)> {
+        use texturecraft_engine::core::{Decal, LayerId};
         use texturecraft_engine::StackTarget;
-        use texturecraft_engine::compose::pattern::{decal_axes, decal_corners};
         use texturecraft_engine::core::{EffectKind, Fill, LayerKind, Projection};
 
         if app.ui.mode != crate::state::Mode::Painting {
@@ -934,12 +938,12 @@ impl DecalFrame {
 
         let layers = &app.session.doc.project;
         let selected = app.session.selected_layer()?;
-        let (layer, effect, decal) = match app.session.target {
+        match app.session.target {
             StackTarget::Content => {
                 let layer = layers.content_layer(selected)?;
                 let LayerKind::Fill(Fill { projection: Projection::Decal(decal), .. }) = &layer.kind else { return None };
 
-                (layer.id, None, decal)
+                Some((layer.id, None, *decal))
             }
             StackTarget::Effect(effect) => {
                 // Only the selected layer's effective mask may supply a decal frame, including an instance's inherited mask
@@ -948,10 +952,17 @@ impl DecalFrame {
                 let mask_effect = mask.effects.iter().find(|candidate| candidate.id == effect)?;
                 let EffectKind::Fill { projection: Projection::Decal(decal), .. } = &mask_effect.kind else { return None };
 
-                (owner, Some(effect), decal)
+                Some((owner, Some(effect), *decal))
             }
-            StackTarget::Mask => return None,
-        };
+            StackTarget::Mask => None,
+        }
+    }
+
+    fn of(app: &TextureCraftApp, rect: Rect) -> Option<DecalFrame> {
+        use texturecraft_engine::compose::pattern::{decal_axes, decal_corners};
+
+        let (layer, effect, decal) = Self::selected(app)?;
+        let decal = &decal;
         let [top_left, top_right, bottom_right, bottom_left] = decal_corners(decal)?.map(|corner| project(app, rect, corner));
         let corners = [top_left?, top_right?, bottom_right?, bottom_left?];
         let center = project(app, rect, decal_axes(decal)?.0)?;
@@ -1039,12 +1050,9 @@ fn decal_overlay(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) {
     }
 
     let tk = Tokens::get(ui.ctx());
-    use texturecraft_engine::core::{Fill, LayerKind, Projection};
-    let p = &app.session.doc.project;
-    let sel = app.session.selected_layer().and_then(|id| p.content_layer(id));
-    let is_decal = matches!(sel.map(|l| &l.kind), Some(LayerKind::Fill(Fill { projection: Projection::Decal(_), .. })));
-    // Placing follows the selection: another layer selected stops it.
-    if app.placing_decal.is_some() && app.placing_decal != sel.map(|l| l.id).filter(|_| is_decal) {
+    // Placing follows the selection: another layer or effect selected stops it.
+    let selected_decal = DecalFrame::selected(app).map(|(layer, effect, _)| effect.unwrap_or(layer));
+    if app.placing_decal.is_some() && app.placing_decal != selected_decal {
         app.placing_decal = None;
     }
     let painter = ui.painter_at(rect);

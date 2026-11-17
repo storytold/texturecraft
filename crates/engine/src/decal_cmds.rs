@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use texturecraft_core::{Channel, Decal, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source};
 use texturecraft_geom::glam::{Vec2, Vec3};
 
-use crate::commands::{CommandSpec, always, bad, channel_param, f32p, has_layer, layer_param, strp, u64p, vec3};
+use crate::commands::{CommandSpec, always, bad, channel_param, f32p, layer_param, strp, u64p, vec3};
 use crate::tool_cmds::viewport_of;
 use crate::{Result, Session, StackTarget, cmd};
 
@@ -26,7 +26,7 @@ pub fn specs() -> Vec<CommandSpec> {
             [],
             None,
             "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z], size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
-            has_layer,
+            always,
             set
         ),
     ]
