@@ -399,7 +399,7 @@ impl Session {
 
         let shape = self.path_shape(self.camera, viewport);
         let editing = self.tool.path.editing;
-        let label = editing.map_or(NEW_PATH_LABEL.to_string(), |(_, i)| format!("Edit path {}", i + 1));
+        let label = editing.map_or(NEW_PATH_LABEL.to_string(), |(_, i)| crate::session::history_label(crate::session::EDIT_PATH_TEMPLATE, &(i + 1).to_string()));
         let report = self.edit_merging(&label, editing.is_some() && self.tool.path.edited, |session| {
             let (effect_id, index) = match editing {
                 Some(at) => at,
@@ -457,7 +457,7 @@ impl Session {
                 if self.path_draft.is_some() {
                     self.cancel_path();
                 } else {
-                    self.edit_merging(&format!("Edit path {}", index + 1), self.tool.path.edited, |session| {
+                    self.edit_merging(&crate::session::history_label(crate::session::EDIT_PATH_TEMPLATE, &(index + 1).to_string()), self.tool.path.edited, |session| {
                         if let Some(Effect { kind: EffectKind::Path(paths), .. }) = session.doc.project.effect_mut(effect) {
                             paths.remove(index);
                         }
@@ -488,7 +488,7 @@ impl Session {
             None => {
                 // The path's own repaint keeps its point changes undoable, unlike other steps
                 let steps = std::mem::take(&mut self.path_steps);
-                self.push_step(&format!("Edit path {}", index + 1), before, self.tool.path.edited);
+                self.push_step(&crate::session::history_label(crate::session::EDIT_PATH_TEMPLATE, &(index + 1).to_string()), before, self.tool.path.edited);
                 self.path_steps = steps;
                 self.tool.path.edited = true;
             }

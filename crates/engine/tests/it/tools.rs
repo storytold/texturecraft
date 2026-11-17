@@ -273,7 +273,8 @@ fn stroke_after_undoing_mask_is_paint_stroke() {
     s.update();
 
     let undone = execute(&mut s, "edit.undo", &Value::Null).unwrap();
-    assert_eq!(undone["undone"], "Paint stroke", "the stroke after undoing the mask was recorded as {}", undone["undone"]);
+    let layer = s.doc.project.layer(s.selected_layer().unwrap()).unwrap().name.clone();
+    assert_eq!(undone["undone"], format!("Paint on {layer}"), "the stroke after undoing the mask was recorded as {}", undone["undone"]);
     execute(&mut s, "edit.redo", &Value::Null).unwrap();
     s.update();
 
@@ -300,5 +301,59 @@ fn undoing_after_painting_on_instance_source_mask_keeps_mask_target() {
 
     execute(&mut s, "tool.stroke", &json!({"points": [[180, 180], [210, 200]]})).unwrap();
     let undone = execute(&mut s, "edit.undo", &Value::Null).unwrap();
-    assert_eq!(undone["undone"], "Mask stroke");
+    let layer = s.doc.project.layer(s.selected_layer().unwrap()).unwrap().name.clone();
+    assert_eq!(undone["undone"], format!("Paint mask of {layer}"));
+}
+
+/// The name of the selected layer
+fn selected_name(s: &Session) -> String {
+    s.doc.project.layer(s.selected_layer().unwrap()).unwrap().name.clone()
+}
+
+/// The label of the newest history step
+fn last_label(s: &Session) -> String {
+    s.history_labels().pop().unwrap()
+}
+
+#[test]
+fn strokes_are_named_by_tool_and_layer() {
+    let mut s = session();
+    execute(&mut s, "layer.rename", &json!({"name": "Rust"})).unwrap();
+    paint_red(&mut s, 20.0);
+    dab(&mut s, 160.0, 200.0);
+    assert_eq!(last_label(&s), "Paint on Rust");
+
+    execute(&mut s, "tool.clone", &Value::Null).unwrap();
+    execute(&mut s, "tool.cloneSource", &json!({"x": 160, "y": 200})).unwrap();
+    dab(&mut s, 240.0, 200.0);
+    assert_eq!(last_label(&s), "Clone on Rust");
+
+    execute(&mut s, "tool.smudge", &Value::Null).unwrap();
+    dab(&mut s, 200.0, 200.0);
+    assert_eq!(last_label(&s), "Smudge on Rust");
+
+    execute(&mut s, "tool.eraser", &Value::Null).unwrap();
+    dab(&mut s, 160.0, 200.0);
+    assert_eq!(last_label(&s), "Erase on Rust");
+
+    // Another layer gives another name
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    execute(&mut s, "layer.rename", &json!({"name": "Dust"})).unwrap();
+    execute(&mut s, "tool.paint", &Value::Null).unwrap();
+    dab(&mut s, 160.0, 200.0);
+    assert_eq!(last_label(&s), format!("Paint on {}", selected_name(&s)));
+    assert_eq!(selected_name(&s), "Dust");
+}
+
+#[test]
+fn the_label_template_of_every_tool_is_listed_for_translation() {
+    use texturecraft_engine::{HISTORY_TEMPLATES, Tool, history_label, stroke_template};
+    for tool in Tool::ALL {
+        for on_mask in [false, true] {
+            let template = stroke_template(tool, on_mask);
+            assert!(HISTORY_TEMPLATES.contains(&template), "{template} is not in HISTORY_TEMPLATES");
+            assert!(history_label(template, "Rust").contains("Rust"));
+        }
+    }
+    assert_eq!(history_label("Paint on {layer}", "A {b}"), "Paint on A {b}");
 }

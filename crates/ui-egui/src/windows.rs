@@ -12,7 +12,7 @@ use crate::TextureCraftApp;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::file_dialogs::{Bound, FileDialog};
 use crate::i18n::LANGUAGES;
-use crate::i18n::{tr, trf};
+use crate::i18n::{tr, tr_history, trf};
 use crate::new_project_advanced::COMBO_WIDTH;
 use crate::state::Mode;
 use crate::theme::{Accent, Brightness, Tokens, caption};
@@ -364,8 +364,8 @@ pub(crate) fn history(app: &mut TextureCraftApp, ui: &mut Ui) {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let done_count = done.len() as i64;
                 let rows = std::iter::once(RichText::new(tr("Project opened")).color(tokens.text_dim))
-                    .chain(done.iter().map(RichText::new))
-                    .chain(undone.iter().map(|label| RichText::new(trf("{action} (undone)", &[("action", label)])).color(tokens.text_dim)));
+                    .chain(done.iter().map(|label| RichText::new(tr_history(label))))
+                    .chain(undone.iter().map(|label| RichText::new(trf("{action} (undone)", &[("action", &tr_history(label))])).color(tokens.text_dim)));
                 for (row, text) in rows.enumerate() {
                     // Each row is the state after that many steps
                     let steps = done_count - row as i64;
@@ -1391,5 +1391,26 @@ mod tests {
         h.get_by_label("Cancel").click();
         h.run_steps(2);
         assert!(h.state().ui.windows.unsaved.is_none());
+    }
+
+    /// The History panel runs each step name through the translator
+    #[test]
+    fn history_rows_are_shown_in_the_interface_language() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut h = harness();
+        {
+            let app = h.state_mut();
+            let layer = app.session.selected_layer().unwrap();
+            texturecraft_engine::execute(&mut app.session, "layer.remove", &json!({"layer": layer.0})).unwrap();
+            app.ui.dock.focus(crate::docking::Panel::History);
+            app.ui.prefs.language = "de".into();
+        }
+        h.run_steps(4);
+        let german = h.query_all_by_label("Ebene entfernen").count();
+        let english = h.query_all_by_label("Remove layer").count();
+        h.state_mut().ui.prefs.language = "en".into();
+        h.run_steps(4);
+        assert!(german > 0 && english == 0, "German rows: {german}, untranslated rows: {english}");
+        assert!(h.query_all_by_label("Remove layer").count() > 0);
     }
 }

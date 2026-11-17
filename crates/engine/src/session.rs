@@ -315,6 +315,52 @@ pub(crate) struct ActiveStroke {
 /// A stroke visibility buffer and what it was rendered for: camera, size, mesh id.
 pub(crate) type DepthCache = (OrbitCamera, (u32, u32), u64, Arc<EyeDepth>);
 
+/// History labels that name a layer, a path number or a smart mask: the UI translates the
+/// template and fills the value in (the control channel and `edit.history` keep the English label).
+/// `{layer}` is a layer name, `{n}` a path number, `{name}` a smart mask name.
+pub const HISTORY_TEMPLATES: &[&str] = &[
+    "Paint on {layer}",
+    "Erase on {layer}",
+    "Clone on {layer}",
+    "Smudge on {layer}",
+    "Projection on {layer}",
+    "Path on {layer}",
+    "Paint mask of {layer}",
+    "Erase mask of {layer}",
+    "Projection mask of {layer}",
+    "Path mask of {layer}",
+    EDIT_PATH_TEMPLATE,
+    APPLY_SMART_MASK_TEMPLATE,
+];
+
+pub(crate) const EDIT_PATH_TEMPLATE: &str = "Edit path {n}";
+pub(crate) const APPLY_SMART_MASK_TEMPLATE: &str = "Apply smart mask {name}";
+pub(crate) const QUICK_MASK_STROKE_LABEL: &str = "Quick mask stroke";
+
+/// `template` with its one `{...}` placeholder replaced by `value`
+pub fn history_label(template: &str, value: &str) -> String {
+    match (template.find('{'), template.find('}')) {
+        (Some(open), Some(close)) if open < close => format!("{}{}{}", &template[..open], value, &template[close + 1..]),
+        _ => template.to_string(),
+    }
+}
+
+/// The history template of a stroke by `tool`, on a layer or (`on_mask`) on its mask
+pub fn stroke_template(tool: Tool, on_mask: bool) -> &'static str {
+    match (tool, on_mask) {
+        (Tool::Eraser, false) => "Erase on {layer}",
+        (Tool::Eraser, true) => "Erase mask of {layer}",
+        (Tool::Clone, _) => "Clone on {layer}",
+        (Tool::Smudge, _) => "Smudge on {layer}",
+        (Tool::Projection, false) => "Projection on {layer}",
+        (Tool::Projection, true) => "Projection mask of {layer}",
+        (Tool::Path, false) => "Path on {layer}",
+        (Tool::Path, true) => "Path mask of {layer}",
+        (_, false) => "Paint on {layer}",
+        (_, true) => "Paint mask of {layer}",
+    }
+}
+
 pub struct Session {
     pub doc: Document,
     pub mesh: Arc<Mesh>,

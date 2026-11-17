@@ -11,7 +11,7 @@ use texturecraft_paint::{
     rasterize,
 };
 
-use crate::session::{ActiveStroke, CloneFrom, Session, StackTarget, Tool};
+use crate::session::{ActiveStroke, CloneFrom, QUICK_MASK_STROKE_LABEL, Session, StackTarget, Tool, history_label, stroke_template};
 use crate::uv_stroke_state::UvStrokeState;
 use crate::{EngineError, Result};
 
@@ -231,13 +231,10 @@ impl Session {
             }
         }
         let label = if quick_mask {
-            "Quick mask stroke"
-        } else if erase {
-            "Eraser stroke"
-        } else if matches!(target, Some(PaintTarget::Mask(_))) {
-            "Mask stroke"
+            QUICK_MASK_STROKE_LABEL.to_string()
         } else {
-            "Paint stroke"
+            let on_mask = matches!(target, Some(PaintTarget::Mask(_)));
+            history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
         self.stroke = Some(ActiveStroke {
             ts,
@@ -252,10 +249,18 @@ impl Session {
             erase,
             stencil,
             before,
-            label: label.to_string(),
+            label,
             staging: Staging::default(),
         });
         Ok(())
+    }
+
+    /// The name of the layer a stroke paints on (the owner layer when an effect is selected)
+    fn stroke_layer_name(&self) -> String {
+        let p = &self.doc.project;
+        let Some(id) = self.selected_layer() else { return String::new() };
+        let owner = p.effect(id).map_or(id, |(owner, _)| owner);
+        p.layer(owner).map(|l| l.name.clone()).unwrap_or_default()
     }
 
     /// Clone / smudge pickup for the current tool, with the clone offset (source minus

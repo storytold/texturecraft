@@ -29,7 +29,8 @@ must be added separately with `effect.add.filter`. A successful replacement is o
 a rejected replacement changes nothing.
 
 `edit.undo {steps?}` and `edit.redo {steps?}` go back or forward several steps at once (as far
-as the history reaches); `edit.history` lists the steps done and the undone ones, next first.
+as the history reaches); `edit.history` lists the steps done and the undone ones, next first. Step names are English; a stroke is named by tool and layer (`Paint on Rust`,
+`Clone on Rust`, `Erase mask of Rust`).
 Any command takes `merge: true` to fold its edit into the previous undo step when that step has
 the same label: a drag that applies a value on every frame stays one step.
 

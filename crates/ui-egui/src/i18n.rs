@@ -101,6 +101,25 @@ pub fn trf(template: &str, args: &[(&str, &dyn Display)]) -> String {
     craft_i18n::fmt(tr(template), &args)
 }
 
+/// An undo step's label in the current language. A label with a layer name, path number or
+/// smart mask name in it ("Paint on Rust") is matched to its engine template, which is translated
+/// and filled in again; any other label is translated as it is.
+pub fn tr_history(label: &str) -> String {
+    let matched = texturecraft_engine::HISTORY_TEMPLATES
+        .iter()
+        .filter_map(|template| {
+            let (open, close) = (template.find('{')?, template.find('}')?);
+            let (prefix, suffix) = (&template[..open], &template[close + 1..]);
+            let value = label.strip_prefix(prefix)?.strip_suffix(suffix)?;
+            Some((prefix.len(), *template, &template[open + 1..close], value))
+        })
+        .max_by_key(|(prefix_length, ..)| *prefix_length);
+    match matched {
+        Some((_, template, name, value)) => trf(template, &[(name, &value)]),
+        None => tr(label).to_string(),
+    }
+}
+
 /// The supported language for a locale such as "de-AT", "pt_BR.UTF-8" or "zh-Hant-TW" ("en" when
 /// none matches). Chinese locales get Simplified Chinese; Portuguese ones get Brazilian Portuguese.
 pub fn language_for_locale(locale: &str) -> &'static str {
@@ -174,6 +193,7 @@ mod tests {
         keys.extend(BlendMode::all().map(|mode| mode.label()));
         keys.extend(texturecraft_engine::formats::export::VirtualMap::ALL.iter().map(|map| map.label()));
         keys.extend(texturecraft_engine::Tool::ALL.iter().map(|tool| tool.label()));
+        keys.extend(texturecraft_engine::HISTORY_TEMPLATES);
         keys.extend(ProceduralKind::ALL.iter().map(|kind| kind.label()));
         keys.extend(GeneratorKind::ALL.iter().map(|kind| kind.label()));
         keys.extend(texturecraft_engine::paint::BrushAlpha::ALL.iter().map(|alpha| alpha.label()));
@@ -283,6 +303,20 @@ mod tests",
             let stale: Vec<_> = rows.keys().filter(|key| !used.contains(key.as_str())).collect();
             eprintln!("{locale}: missing {} {missing:?}; unused/shared {} {stale:?}", missing.len(), stale.len());
         }
+    }
+
+    #[test]
+    fn history_labels_are_matched_to_their_templates() {
+        let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_language("en");
+        assert_eq!(tr_history("Paint on Rust"), "Paint on Rust");
+        assert_eq!(tr_history("Paint mask of Paint on Rust"), "Paint mask of Paint on Rust");
+        assert_eq!(tr_history("Edit path 2"), "Edit path 2");
+        assert_eq!(tr_history("Rename layer"), "Rename layer");
+        set_language("de");
+        assert_eq!(tr_history("Remove layer"), "Ebene entfernen");
+        assert_eq!(tr_history("Unknown step"), "Unknown step");
+        set_language("en");
     }
 
     const UNTRANSLATED: &[&str] = &["RGB", "RGBA"];
