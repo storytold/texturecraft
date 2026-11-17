@@ -1349,7 +1349,10 @@ mod tests {
         let old = r#"{"center":[0.0,0.0,0.0],"normal":[0.0,0.0,1.0],"up":[0.0,1.0,0.0],"size":[1.0,2.0],"rotation":0.0,"offset":[0.0,0.0],"depth":0.5}"#;
         let decal: Decal = serde_json::from_str(old).unwrap();
         assert_eq!(decal.flip, [false, false]);
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&serde_json::to_string(&decal).unwrap()).unwrap(), serde_json::from_str::<serde_json::Value>(old).unwrap());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&serde_json::to_string(&decal).unwrap()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(old).unwrap()
+        );
 
         let flipped = Decal { flip: [true, false], ..decal };
         let saved = serde_json::to_string(&flipped).unwrap();

@@ -2528,7 +2528,7 @@ fn decal_editor(app: &mut TextureCraftApp, ui: &mut Ui, d: &Decal, layer: LayerI
         edit = edit.or(slider_edit(ui, label, x, range, 3).map(|merge| (row, merge)));
     }
     // The lock is a setting of the editor, not of the decal: every decal starts locked
-    let keep_id = egui::Id::new(("decal_keep_proportions", layer));
+    let keep_id = ui.scope_id().with(("decal_keep_proportions", layer.0));
     let mut keep = ui.ctx().data(|data| data.get_temp::<bool>(keep_id)).unwrap_or(true);
     if ui.checkbox(&mut keep, tr("Keep proportions")).on_hover_text(tr("Width and height follow each other by the image's aspect")).changed() {
         ui.ctx().data_mut(|data| data.insert_temp(keep_id, keep));
