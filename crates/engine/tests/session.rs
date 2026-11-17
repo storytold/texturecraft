@@ -429,6 +429,13 @@ fn projection_tool_paints_the_stencil_colors() {
     // Without a stencil the tool explains what's missing.
     assert!(execute(&mut s, "tool.stroke", &json!({"points": [[150, 200]]})).is_err());
     execute(&mut s, "tool.stencil", &json!({"image": name, "scale": 1.0, "tile": true})).unwrap();
+    // A reset puts back the placement only
+    let mut moved = s.tool.stencil.clone().unwrap();
+    moved.center = [0.4, -0.2];
+    moved.rotation = 30.0;
+    moved.opacity = 0.9;
+    moved.reset_placement();
+    assert_eq!((moved.center, moved.scale, moved.rotation, moved.opacity, moved.tile), ([0.0, 0.0], 0.8, 0.0, 0.9, true));
     execute(&mut s, "tool.brush", &json!({"size": 6, "hardness": 90})).unwrap();
     for x in [150.0f32, 250.0] {
         execute(&mut s, "tool.stroke", &json!({"points": [[x, 200.0]]})).unwrap();

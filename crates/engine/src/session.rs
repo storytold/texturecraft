@@ -185,6 +185,14 @@ impl StencilState {
         StencilState { image: image.to_string(), center: [0.0, 0.0], scale: 0.8, rotation: 0.0, tile: false, opacity: 0.5 }
     }
 
+    /// Back to the placement a new stencil starts with (center, scale and rotation); the image, tiling and opacity stay.
+    pub fn reset_placement(&mut self) {
+        let start = StencilState::new(&self.image);
+        self.center = start.center;
+        self.scale = start.scale;
+        self.rotation = start.rotation;
+    }
+
     /// Placement for a viewport aspect (width / height): center, half extents in NDC, radians.
     pub fn placement(&self, image_aspect: f32, viewport_aspect: f32) -> ([f32; 2], [f32; 2], f32) {
         let hy = self.scale.max(0.01);

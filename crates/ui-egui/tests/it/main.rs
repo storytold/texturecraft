@@ -41,4 +41,5 @@ mod start_window;
 mod tool_availability;
 mod toolbar;
 
+mod stencil;
 mod symmetry;

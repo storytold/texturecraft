@@ -1638,12 +1638,15 @@ fn tool_properties(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
 }
 
+/// How far the Position sliders move the stencil's center from the middle of the view (NDC; -1..1 is the view)
+const STENCIL_POSITION_RANGE: f32 = 2.0;
+
 fn stencil_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     let tk = Tokens::get(ui.ctx());
     ui.label(caption(tr("Stencil")));
     let names: Vec<String> = app.session.doc.resources.keys().cloned().collect();
     let current = app.session.tool.stencil.as_ref().map(|s| s.image.clone()).unwrap_or_else(|| tr("None").into());
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt("stencil_img").width(170.0).selected_text(current.clone()).show_ui(ui, |ui| {
             if ui.selectable_label(app.session.tool.stencil.is_none(), tr("None")).clicked() {
                 app.run("tool.stencil", json!({"clear": true}));
@@ -1656,6 +1659,11 @@ fn stencil_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         });
         import_button(app, ui);
     });
+    // An image from the Assets panel dropped on the row becomes the stencil
+    let row_response = row.response.interact(Sense::hover()).on_hover_text(tr("Drop an image from the Assets panel here to use it as the stencil"));
+    if let Some(name) = image_drop(ui, &row_response) {
+        app.run("tool.stencil", json!({"image": name}));
+    }
     if names.is_empty() {
         ui.label(RichText::new(tr("Import an image (File > Import resources) to project it onto the mesh.")).color(tk.text_dim));
         return;
@@ -1663,9 +1671,15 @@ fn stencil_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     if let Some(st) = app.session.tool.stencil.as_mut() {
         slider(ui, tr("Scale"), &mut st.scale, 0.05..=4.0, 2);
         slider(ui, tr("Rotation"), &mut st.rotation, 0.0..=360.0, 0);
+        slider(ui, tr("Position X"), &mut st.center[0], -STENCIL_POSITION_RANGE..=STENCIL_POSITION_RANGE, 2);
+        slider(ui, tr("Position Y"), &mut st.center[1], -STENCIL_POSITION_RANGE..=STENCIL_POSITION_RANGE, 2);
+        if ui.button(tr("Reset stencil")).on_hover_text(tr("Put the stencil back in the middle of the view at its starting size and rotation")).clicked() {
+            st.reset_placement();
+        }
         slider(ui, tr("Overlay opacity"), &mut st.opacity, 0.0..=1.0, 2);
         ui.checkbox(&mut st.tile, tr("Tile"));
         ui.label(RichText::new(tr("Hold S: left-drag rotates, right-drag scales, middle-drag moves the stencil.")).size(10.5).color(tk.text_dim));
+        ui.label(RichText::new(tr("Hold S and Shift: left-drag moves the stencil.")).size(10.5).color(tk.text_dim));
     }
 }
 

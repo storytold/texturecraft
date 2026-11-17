@@ -613,16 +613,16 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         }
     }
 
-    // Stencil: S + left drag turns it, S + right drag scales it, S + middle drag moves it
+    // Stencil: S + left drag turns it, S + Shift + left drag or S + middle drag moves it, S + right drag scales it
     if s_held
         && stencil_moves
         && let Some(stencil) = app.session.tool.stencil.as_mut()
     {
-        if response.dragged_by(PointerButton::Primary) {
+        if response.dragged_by(PointerButton::Primary) && !shift {
             stencil.rotation = (stencil.rotation + delta.x * STENCIL_DEGREES_PER_POINT).rem_euclid(360.0);
         } else if response.dragged_by(PointerButton::Secondary) {
             stencil.scale = (stencil.scale * (1.0 + delta.x * STENCIL_SCALE_PER_POINT)).clamp(MIN_STENCIL_SCALE, MAX_STENCIL_SCALE);
-        } else if response.dragged_by(PointerButton::Middle) {
+        } else if response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Primary) {
             stencil.center[0] += delta.x / size.x * 2.0;
             stencil.center[1] -= delta.y / size.y * 2.0;
         }
@@ -1586,6 +1586,11 @@ fn tool_acts(app: &TextureCraftApp) -> bool {
     app.ui.mode == crate::state::Mode::Painting && app.session.tool_usable(app.session.tool.tool)
 }
 
+/// Whether the 2D view says that the equipped Projection tool paints in the 3D view only (the quick mask is painted like with a brush)
+fn projection_hint_shown(app: &TextureCraftApp) -> bool {
+    tool_acts(app) && app.session.tool.tool == Tool::Projection && !app.session.quick_mask.editing
+}
+
 /// Both views must close gestures even when the selection disables their input handlers.
 fn finish_unavailable_tool_gestures(app: &mut TextureCraftApp, pending_2d_endpoint: Option<crate::uv_paint_point::UvPaintPoint>) {
     if !tool_acts(app) {
@@ -1855,8 +1860,10 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         }
     }
 
-    // Painting in UV space
+    // Painting in UV space; the Projection tool only paints in the 3D view, with or without a stencil
+    let projection_hint = projection_hint_shown(app);
     let painting = tool_acts(app)
+        && !projection_hint
         && app.properties_popup.is_none()
         && !crate::rail_popup::blocks_paint_input(app, ui.ctx())
         && !alt
@@ -1895,6 +1902,15 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     add_callback(app, ui, rect, frame, sync);
     polygon_fill_box_overlay(ui, rect, fill_box);
     crate::shelf::drop_target(app, ui, &response, crate::shelf::DropZone::View2d);
+    if projection_hint {
+        ui.painter_at(rect).text(
+            rect.left_top() + QUICK_MASK_NOTICE_OFFSET,
+            egui::Align2::LEFT_TOP,
+            tr("Projection paints in the 3D view"),
+            egui::FontId::proportional(QUICK_MASK_NOTICE_TEXT_SIZE),
+            QUICK_MASK_NOTICE_COLOR,
+        );
+    }
 
     // The UV tile outlines (numbered for UDIM sets) and the path being edited
     let painter = ui.painter_at(rect);
