@@ -102,8 +102,8 @@ pub(crate) fn show(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, view: NavView
 
     // Their own layer above the view, so a press on a button never reaches the view's own painting or camera handling
     Area::new(area_id).order(Order::Middle).fixed_pos(strip.min).constrain_to(rect).show(ui.ctx(), |ui| {
-        // The whole column owns a press, so one landing in a gap or the margin never reaches the view
-        ui.allocate_rect(strip, Sense::click_and_drag());
+        // The whole column and a gap-wide border own a press, so one landing between buttons never reaches the view
+        ui.allocate_rect(strip.expand(BUTTON_GAP), Sense::click_and_drag());
         for &button in view.buttons() {
             let Some(button_rect) = button_rect(rect, view, button) else { continue };
             let response = ui.interact(button_rect, Id::new((area_id, button)), Sense::click_and_drag());
