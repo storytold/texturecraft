@@ -78,6 +78,21 @@ fn smudge_drags_color_along_the_stroke() {
 }
 
 #[test]
+fn smudge_leaves_a_channel_alone_that_the_material_has_off() {
+    let mut s = session();
+    paint_red(&mut s, 12.0);
+    dab(&mut s, 170.0, 200.0);
+    let before = color_at(&s, 205.0, 200.0);
+    execute(&mut s, "tool.material", &json!({"channel": "baseColor", "enabled": false})).unwrap();
+    execute(&mut s, "tool.smudge", &Value::Null).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 10, "smudgeStrength": 100, "spacing": 5})).unwrap();
+    let pts: Vec<[f32; 2]> = (0..=40).map(|i| [170.0 + i as f32, 200.0]).collect();
+    execute(&mut s, "tool.stroke", &json!({"points": pts})).unwrap();
+    let after = color_at(&s, 205.0, 200.0);
+    assert!((after[0] - before[0]).abs() < 0.02 && (after[1] - before[1]).abs() < 0.02, "base color not dragged: {before:?} -> {after:?}");
+}
+
+#[test]
 fn image_alpha_shapes_the_stamp() {
     let mut s = session();
     let mut png = Vec::new();
