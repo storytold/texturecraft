@@ -13,8 +13,10 @@
 //! | Sheen     | sRGB8    | sheen color       |                |                   | sheen weight      |
 //! | Extra     | RGBA8    | coat normal x     | coat normal y  | transmission      | tile scale        |
 //!
-//! Extra packs the coat normal's x and y as `128 + 127 × n` (the default normal is exactly 0;
-//! z is rebuilt in the shader). Its alpha is the [`Composite::block_scales`] of the texel's UV
+//! Normals are signed: Normal packs the tangent-space normal's x, y and z, and Extra the coat
+//! normal's x and y, as `128 + 127 × n` (see [`snorm8`]), which the shaders read back as
+//! `(byte − 128) / 127`. The flat normal packs exactly (128, 128, 255); the coat's z is rebuilt in
+//! the shader. Extra's alpha is the [`Composite::block_scales`] of the texel's UV
 //! tile as `32 × log2(1 / scale)` (0 for a tile filling its block): the shader turns height
 //! slopes down by it.
 //!
@@ -93,6 +95,22 @@ fn u8_of(v: u16) -> u8 {
     (v >> 8) as u8
 }
 
+/// A packed normal component (`0..1` holding `2v − 1`) as a signed byte around 128:
+/// `round(128 + 127 (2v − 1))`. The viewport and GPU path-tracer shaders decode it as
+/// `(byte − 128) / 127`, so the flat normal packs exactly and every component reads back within
+/// half a step (`0.5 / 127`). NaN packs as 0.
+pub fn snorm8(v: f32) -> u8 {
+    (128.0 + 127.0 * (v * 2.0 - 1.0)).round().clamp(0.0, 255.0) as u8
+}
+
+/// [`snorm8`] of a 16-bit channel value (`v / 65535`) in integer arithmetic:
+/// `round(1 + 254 v / 65535)`, the same byte without three float roundings per texel, which
+/// doubled the cost of packing a painted normal tile.
+pub fn snorm8_u16(v: u16) -> u8 {
+    // 254 × 65535 + 32767 fits in u32, and the quotient is at most 254
+    ((254 * u32::from(v) + 32767) / 65535 + 1) as u8
+}
+
 /// Tile bytes (`TILE × TILE`, row-major) for `kind`, using channel defaults for absent source tiles.
 pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u32, ty: u32) -> Vec<u8> {
     let bytes_per_texel = kind.bytes_per_texel();
@@ -141,14 +159,11 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
         DisplayKind::Extra => {
             let (n, transmission) = (get(Channel::CoatNormal), scalar8(Channel::Transmission));
 
-            // Signed 8-bit around 128 so the flat normal packs exactly
-            let pack_signed_normal = |v: u16| (128.0 + 127.0 * (v as f32 / 65535.0 * 2.0 - 1.0)).round().clamp(0.0, 255.0) as u8;
-
             // A TILE never straddles two atlas blocks
             let scale = (-32.0 * composite.block_scales.at(tx * TILE, ty * TILE).log2()).round().clamp(0.0, 255.0) as u8;
             for (i, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 for (k, d) in pixel.iter_mut().take(2).enumerate() {
-                    *d = n.and_then(|t| t.get(i * 3 + k)).map_or(128, |v| pack_signed_normal(*v));
+                    *d = n.and_then(|t| t.get(i * 3 + k)).map_or(128, |v| snorm8_u16(*v));
                 }
                 pixel[2] = transmission(i);
                 pixel[3] = scale;
@@ -177,26 +192,24 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
         }
         DisplayKind::Normal => {
             let (n, sheen_roughness) = (get(Channel::Normal), scalar8(Channel::SheenRoughness));
-            for i in 0..TILE_AREA {
-                let pixel = &mut out[i * 4..i * 4 + 4];
-
+            for (i, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 // The baked normal is the base the painted normal details sit on (as in export)
                 let (x, y) = (tx * TILE + (i as u32 % TILE), ty * TILE + (i as u32 / TILE));
                 let base = baked.sample_working(BakedMap::Normal, x, y, (resolution, composite.height), &composite.block_scales);
                 match (n, base) {
                     (Some(t), None) => {
                         for (k, d) in pixel.iter_mut().take(3).enumerate() {
-                            *d = u8_of(t.get(i * 3 + k).copied().unwrap_or(0));
+                            *d = snorm8_u16(t.get(i * 3 + k).copied().unwrap_or(0));
                         }
                     }
                     (detail, Some(base)) => {
-                        let detail = detail.map_or([0.5, 0.5, 1.0], |t| [0, 1, 2].map(|k| t.get(i * 3 + k).map_or(0.0, |v| *v as f32 / 65535.0)));
-                        let v = texturecraft_core::blend::rnm(base, detail);
-                        for (d, v) in pixel.iter_mut().zip(v) {
-                            *d = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        let painted = |t: &[u16]| [0, 1, 2].map(|k| t.get(i * 3 + k).map_or(0.0, |v| texturecraft_texel::from_u16(*v)));
+                        let shown = texturecraft_core::blend::rnm(base, detail.map_or([0.5, 0.5, 1.0], painted));
+                        for (d, v) in pixel.iter_mut().zip(shown) {
+                            *d = snorm8(v);
                         }
                     }
-                    (None, None) => pixel[..3].copy_from_slice(&[128, 128, 255]),
+                    (None, None) => pixel[..3].copy_from_slice(&[snorm8(0.5), snorm8(0.5), snorm8(1.0)]),
                 }
                 pixel[3] = sheen_roughness(i);
             }
@@ -270,7 +283,7 @@ mod tests {
         let tilted = [0.8f32, 0.5, 0.9];
         let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(tilted.repeat(64 * 64)))].into_iter().collect() };
         let shown = |comp: &Composite| tile_bytes(comp, &baked, DisplayKind::Normal, 0, 0)[..3].to_vec();
-        let pack = |v: [f32; 3]| v.map(|x| (x * 255.0 + 0.5) as u8).to_vec();
+        let pack = |v: [f32; 3]| v.map(snorm8).to_vec();
         // No normal channel: the baked normal as it is.
         assert_eq!(shown(&Composite::new(&[], 64)), pack(tilted));
         // A flat painted normal leaves it; a painted detail is re-oriented onto it.
@@ -279,6 +292,81 @@ mod tests {
         assert!(shown(&comp).iter().zip(pack(tilted)).all(|(a, b)| (*a as i32 - b as i32).abs() <= 1), "{:?}", shown(&comp));
         comp.channels.get_mut(&Channel::Normal).unwrap().set(0, 0, &[to_u16(0.5), to_u16(0.8), to_u16(0.9)]);
         assert_eq!(shown(&comp), pack(texturecraft_core::blend::rnm(tilted, [0.5, 0.8, 0.9])));
+    }
+
+    /// The shaders' `snorm8` (`crates/render/src/shaders/mesh.wgsl`, and the same rule in
+    /// `trace.wgsl`): `(byte − 128) / 127`, clamped to −1..1.
+    fn shader_snorm8(byte: u8) -> f32 {
+        ((f32::from(byte) - 128.0) / 127.0).clamp(-1.0, 1.0)
+    }
+
+    /// Unit normals tilted 0–80° from +z at every 30° of azimuth, so every component takes
+    /// both signs and values near ±1.
+    fn tilted_normals() -> Vec<[f32; 3]> {
+        (0..=8u8)
+            .flat_map(|tilt| (0..12u8).map(move |azimuth| (f32::from(tilt) * 10f32.to_radians(), f32::from(azimuth) * 30f32.to_radians())))
+            .map(|(tilt, azimuth)| [tilt.sin() * azimuth.cos(), tilt.sin() * azimuth.sin(), tilt.cos()])
+            .collect()
+    }
+
+    /// Each of `normals`, decoded as the shader does from the first `components` bytes of its
+    /// texel in `bytes`, must be within half an 8-bit step per component and, for whole normals,
+    /// within the angle that error allows.
+    fn assert_decodes(label: &str, normals: &[[f32; 3]], bytes: &[u8], components: usize) {
+        // Half a step, plus the 16-bit channel's own rounding
+        let step = 0.5 / 127.0 + 2.0 / 65535.0;
+        for (i, n) in normals.iter().enumerate() {
+            let texel = bytes.get(i * 4..i * 4 + components).unwrap();
+            let decoded: Vec<f32> = texel.iter().map(|b| shader_snorm8(*b)).collect();
+            for (k, (got, want)) in decoded.iter().zip(n).enumerate() {
+                assert!((got - want).abs() <= step, "{label}: normal {n:?} component {k} decodes as {got}, not {want} (bytes {texel:?})");
+            }
+            if components == 3 {
+                let length = decoded.iter().map(|d| d * d).sum::<f32>().sqrt();
+                let cos = decoded.iter().zip(n).map(|(d, n)| d * n).sum::<f32>() / length;
+                let degrees = cos.clamp(-1.0, 1.0).acos().to_degrees();
+                // |error| ≤ √3 · step, so the direction turns by at most asin of that: 0.39°
+                assert!(degrees <= (3f32.sqrt() * step).asin().to_degrees(), "{label}: normal {n:?} decodes {degrees}° off");
+            }
+        }
+    }
+
+    /// The integer packing of every 16-bit value is the float packing exactly rounded (f32 can
+    /// round a value a hair under one half up, so it may differ by one there).
+    #[test]
+    fn snorm8_u16_is_snorm8_of_the_channel_value() {
+        for v in 0..=u16::MAX {
+            let exact = 1.0 + 254.0 * f64::from(v) / 65535.0;
+            assert_eq!(f64::from(snorm8_u16(v)), exact.round(), "{v}");
+            assert!(snorm8_u16(v).abs_diff(snorm8(texturecraft_texel::from_u16(v))) <= 1, "{v}");
+        }
+        assert_eq!((snorm8_u16(0), snorm8_u16(32768), snorm8_u16(u16::MAX)), (1, 128, 255));
+    }
+
+    #[test]
+    fn tilted_normals_round_trip_through_the_display_bytes() {
+        let normals = tilted_normals();
+        let packed: Vec<[f32; 3]> = normals.iter().map(|n| n.map(|v| v * 0.5 + 0.5)).collect();
+        let place = |i: usize| ((i % 64) as u32, (i / 64) as u32);
+
+        // Painted only: the composite's 16-bit normal channel
+        let mut comp = Composite::new(&[Channel::Normal, Channel::CoatNormal], 64);
+        for (i, p) in packed.iter().enumerate() {
+            let (x, y) = place(i);
+            for c in [Channel::Normal, Channel::CoatNormal] {
+                comp.channels.get_mut(&c).unwrap().set(x, y, &p.map(to_u16));
+            }
+        }
+        assert_decodes("painted", &normals, &tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Normal, 0, 0), 3);
+        assert_decodes("coat", &normals, &tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Extra, 0, 0), 2);
+
+        // Baked, under no painted normal
+        let mut data = vec![0.5f32; 64 * 64 * 3];
+        for (dst, p) in data.as_chunks_mut::<3>().0.iter_mut().zip(&packed) {
+            dst.copy_from_slice(p);
+        }
+        let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(data))].into_iter().collect() };
+        assert_decodes("baked", &normals, &tile_bytes(&Composite::new(&[], 64), &baked, DisplayKind::Normal, 0, 0), 3);
     }
 
     #[test]
