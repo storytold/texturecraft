@@ -378,7 +378,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
 /// The mouse gestures and hold keys of the viewports, as (gesture, what it does) rows for the
 /// shortcut window. The hold keys come from the constants the viewport reads, so a rebound hold key
-/// is named from the same constant. The rows cover every gesture the 3D and 2D views handle.
+/// is named from the same constant. Brush Ctrl+drag and Ctrl+wheel rows come with their own PRs.
 pub fn fixed_gestures() -> Vec<(String, String)> {
     let stencil = crate::viewport::STENCIL_KEY.name();
     let clone = crate::viewport::CLONE_SOURCE_KEY.name();
