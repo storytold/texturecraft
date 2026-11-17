@@ -25,6 +25,9 @@ pub fn solo_project(project: &Project, layer: LayerId, ignore_mask: bool) -> Opt
     // What stays drawn: those, and a soloed folder's contents
     let mut kept: BTreeSet<LayerId> = shown.iter().copied().collect();
     contents(project, &[layer], &mut kept, 0);
+
+    // A soloed instance draws its source's contents, which must stay visible too
+    kept.extend(project.render_tree(&[layer]));
     let mut every = BTreeSet::new();
     contents(project, &set.stack, &mut every, 0);
 
@@ -142,6 +145,16 @@ mod tests {
         let view = solo_project(&p, instance, true).unwrap();
         assert!(!view.layers[&instance].mask.as_ref().unwrap().enabled);
         assert!(view.layers[&source].mask.as_ref().unwrap().enabled, "the source keeps its mask");
+    }
+
+    #[test]
+    fn a_soloed_instance_of_a_folder_keeps_the_folders_contents_drawn() {
+        let mut p = project();
+        let folder = add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false }, None, false);
+        let inner = add(&mut p, 0, LayerKind::Paint, Some(folder), true);
+        let instance = add(&mut p, 0, LayerKind::Instance { source: folder }, None, false);
+        let view = solo_project(&p, instance, false).unwrap();
+        assert!(view.layers[&instance].visible && view.layers[&folder].visible && view.layers[&inner].visible);
     }
 
     #[test]
