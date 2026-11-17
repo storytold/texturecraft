@@ -750,9 +750,10 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             // Shift+click paints a straight line from where the last stroke ended
             let line_from = if shift { app.last_paint_point } else { None };
             if let Some(pointer) = response.interact_pointer_pos() {
-                crate::inactive_set_hint::hint_on_stroke_start(app, local(pointer));
-                match app.session.begin_stroke(line_from.unwrap_or(local(pointer)), app.session.viewport, pressure) {
+                let start = line_from.unwrap_or(local(pointer));
+                match app.session.begin_stroke(start, app.session.viewport, pressure) {
                     Ok(_) => {
+                        crate::inactive_set_hint::hint_on_stroke_start(app, start);
                         if line_from.is_some() {
                             app.session.continue_stroke(local(pointer), pressure);
                         }
