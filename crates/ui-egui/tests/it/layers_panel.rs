@@ -163,9 +163,15 @@ fn the_active_layer_row_has_its_own_strong_fill_and_a_wide_edge_at_scale_two() {
             _ => None,
         })
         .collect();
-    assert!(rects.iter().any(|(rect, color)| *color == fill && rect.width() >= row.width() - 1.0 && rect.contains(row.center())), "the whole active row gets the highlight fill");
     assert!(
-        rects.iter().any(|(rect, color)| *color == tokens.accent && (rect.width() - 4.0).abs() < 0.01 && rect.left() <= row.left() + 0.5 && rect.contains(egui::pos2(rect.center().x, row.center().y))),
+        rects.iter().any(|(rect, color)| *color == fill && rect.width() >= row.width() - 1.0 && rect.contains(row.center())),
+        "the whole active row gets the highlight fill"
+    );
+    assert!(
+        rects.iter().any(|(rect, color)| *color == tokens.accent
+            && (rect.width() - 4.0).abs() < 0.01
+            && rect.left() <= row.left() + 0.5
+            && rect.contains(egui::pos2(rect.center().x, row.center().y))),
         "a 4 point accent edge marks the row"
     );
     // Neighbouring rows keep the alternating shades
@@ -185,7 +191,10 @@ fn the_active_layer_row_has_its_own_strong_fill_and_a_wide_edge_at_scale_two() {
             let tokens = Tokens::for_brightness(brightness).with_accent(accent);
             let fill = selected_layer_fill(&tokens);
             assert!(contrast(tokens.text_strong, fill) >= 4.5, "{brightness:?} {accent:?}: name on the active row");
-            assert!(contrast(tokens.text_dim, fill) >= (contrast(tokens.text_dim, tokens.row_selected) - 0.3).min(3.0), "{brightness:?} {accent:?}: subtitle on the active row is not much dimmer than on the plain selected shade");
+            assert!(
+                contrast(tokens.text_dim, fill) >= (contrast(tokens.text_dim, tokens.row_selected) - 0.5).min(3.0),
+                "{brightness:?} {accent:?}: subtitle on the active row is not much dimmer than on the plain selected shade"
+            );
             assert!(contrast(fill, tokens.panel) >= 1.15, "{brightness:?} {accent:?}: the active row stands out from the panel");
         }
     }

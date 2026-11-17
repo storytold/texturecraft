@@ -299,7 +299,7 @@ const SELECTED_EDGE_WIDTH: f32 = 3.0;
 /// The same edge on a layer row, wide enough to read on a dense display.
 const SELECTED_LAYER_EDGE_WIDTH: f32 = 4.0;
 /// How far the active layer's fill moves from the plain selected shade to the accent tint.
-const SELECTED_LAYER_TINT: f32 = 0.4;
+const SELECTED_LAYER_TINT: f32 = 0.3;
 /// The chip behind a visible layer's eye: its inset from the eye's hit area and its rounding.
 const EYE_CHIP_INSET: f32 = 1.0;
 const EYE_CHIP_ROUNDING: f32 = 4.0;
@@ -577,7 +577,13 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
             let white = mask.background == texturecraft_engine::core::MaskBackground::White;
             painter.rect_filled(mask_rect, THUMBNAIL_ROUNDING, Color32::from_gray(if white { WHITE_MASK_GRAY } else { BLACK_MASK_GRAY }));
             if !mask.effects.is_empty() {
-                painter.text(mask_rect.center(), egui::Align2::CENTER_CENTER, ic::MAGIC_WAND, egui::FontId::proportional(LAYER_WAND_FONT_SIZE), tokens.text_dim);
+                painter.text(
+                    mask_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    ic::MAGIC_WAND,
+                    egui::FontId::proportional(LAYER_WAND_FONT_SIZE),
+                    tokens.text_dim,
+                );
             }
         }
         painter.rect_stroke(mask_rect, THUMBNAIL_ROUNDING, target_stroke(&tokens, mask_target), egui::StrokeKind::Outside);
