@@ -244,7 +244,7 @@ impl Staging {
     /// the same arguments will write.
     pub fn stage_mask(&mut self, pixels: &PixelStore, effect: LayerId, value: f32, src: &CommitSource) {
         let value = [value.clamp(0.0, 1.0)];
-        let b = Blend { kind: ChannelKind::Scalar, value: &value, stencil_color: false, carried: mask_carried(&src) };
+        let b = Blend { kind: ChannelKind::Scalar, value: &value, stencil_color: false, carried: mask_carried(src) };
         self.images.entry(None).or_default().stage(pixels.masks.get(&effect), 2, &b, src);
     }
 
