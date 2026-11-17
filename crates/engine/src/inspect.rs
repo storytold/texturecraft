@@ -71,7 +71,18 @@ fn effect_json(session: &Session, effect: &Effect, content: bool) -> Value {
 
 /// A generator's settings: global adjustments, then its resolution, replaced inputs and curvature detail when it has them.
 fn generator_json(generator: &Generator) -> Value {
-    let mut out = json!({ "type": format!("{:?}", generator.kind), "level": generator.level, "softness": generator.softness, "noise": generator.noise_amount, "offset": generator.offset, "invert": generator.invert, "blur": generator.global.blur, "balance": generator.global.balance, "contrast": generator.global.contrast });
+    let mut out = json!({
+        "type": format!("{:?}", generator.kind),
+        "level": generator.level,
+        "softness": generator.softness,
+        "noise": generator.noise_amount,
+        "offset": generator.offset,
+        "direction": generator.direction,
+        "invert": generator.invert,
+        "blur": generator.global.blur,
+        "balance": generator.global.balance,
+        "contrast": generator.global.contrast,
+    });
     if !generator.resolution.is_default() {
         out["resolution"] =
             json!({ "mode": format!("{:?}", generator.resolution.mode), "custom": generator.resolution.custom, "factor": generator.resolution.factor });
