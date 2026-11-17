@@ -280,7 +280,9 @@ impl Bvh {
         (tt > 0.0).then_some((tt, u, v))
     }
 
-    fn traverse(&self, o: Vec3, d: Vec3, mut tmax: f32, any: bool, filter: &dyn Fn(u32) -> bool) -> Option<Hit> {
+    /// `FILTER` keeps the triangle test out of the unfiltered closest and occlusion paths, which
+    /// are almost every bake ray. A function pointer there blocked the triangle test from inlining.
+    fn traverse<const FILTER: bool>(&self, o: Vec3, d: Vec3, mut tmax: f32, any: bool, filter: impl Fn(u32) -> bool) -> Option<Hit> {
         let root = self.nodes.first().filter(|_| !self.tris.is_empty())?;
         let (oa, inv) = (Vec3A::from(o), Vec3A::ONE / Vec3A::from(d));
         let mut best = None;
@@ -293,9 +295,11 @@ impl Bvh {
                 let (f, c) = (n.first as usize, n.count as usize);
                 for i in f..(f + c).min(self.tris.len()) {
                     let (Some(tri), Some(&orig)) = (self.tris.get(i), self.order.get(i)) else { continue };
+                    if FILTER && !filter(orig) {
+                        continue;
+                    }
                     if let Some((t, u, v)) = Self::hit_tri(tri, o, d)
                         && t < tmax
-                        && filter(orig)
                     {
                         tmax = t;
                         best = Some(Hit { t, tri: orig, u, v });
@@ -329,17 +333,17 @@ impl Bvh {
 
     /// Closest hit along `o + t·d` for `t` in (0, tmax).
     pub fn closest(&self, o: Vec3, d: Vec3, tmax: f32) -> Option<Hit> {
-        self.traverse(o, d, tmax, false, &|_| true)
+        self.traverse::<false>(o, d, tmax, false, |_| false)
     }
 
     /// Closest hit on triangles accepted by `filter` (original triangle index).
-    pub fn closest_filtered(&self, o: Vec3, d: Vec3, tmax: f32, filter: &dyn Fn(u32) -> bool) -> Option<Hit> {
-        self.traverse(o, d, tmax, false, filter)
+    pub fn closest_filtered(&self, o: Vec3, d: Vec3, tmax: f32, filter: impl Fn(u32) -> bool) -> Option<Hit> {
+        self.traverse::<true>(o, d, tmax, false, filter)
     }
 
-    /// Whether anything is hit before `tmax` (occlusion rays).
+    /// Whether anything is hit before `tmax` (occlusion rays). Returns at the first hit.
     pub fn occluded(&self, o: Vec3, d: Vec3, tmax: f32) -> bool {
-        self.traverse(o, d, tmax, true, &|_| true).is_some()
+        self.traverse::<false>(o, d, tmax, true, |_| false).is_some()
     }
 
     /// The point nearest to `p` within `max_dist` on a triangle accepted by `filter` (original
@@ -671,7 +675,7 @@ mod tests {
         assert!(!bvh.occluded(origin, Vec3::NEG_Z, 5.0));
 
         // Median partitions preserve original triangle IDs
-        let hit = bvh.closest_filtered(Vec3::new(0.0, 0.0, 10.0), Vec3::NEG_Z, 100.0, &|t| t == 500).unwrap();
+        let hit = bvh.closest_filtered(Vec3::new(0.0, 0.0, 10.0), Vec3::NEG_Z, 100.0, |t| t == 500).unwrap();
         assert_eq!(hit.tri, 500);
         assert_eq!(hit.t, 10.0);
     }
