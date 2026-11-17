@@ -36,7 +36,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Brush settings",
             [],
             None,
-            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
+            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, alphaSizeX?: 5..100 and alphaSizeY?: 5..100 (percent of the stamp the alpha fills), alphaRoundness?: 0..100 (Round alpha only: 100 circle, 0 square), alphaContrast?: 1..8, alphaInvert?, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
             always,
             brush
         ),
@@ -199,6 +199,19 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
         (settings.alpha_image, settings.alpha_library) = (None, Some(alpha.id.clone()));
     }
 
+    let alpha_params = &mut settings.alpha_params;
+    for (key, slot) in [("alphaSizeX", &mut alpha_params.size_x), ("alphaSizeY", &mut alpha_params.size_y), ("alphaRoundness", &mut alpha_params.roundness)] {
+        if let Some(value) = percent(key) {
+            *slot = value;
+        }
+    }
+    if let Some(value) = f32p(params, "alphaContrast") {
+        alpha_params.contrast = value;
+    }
+    if let Some(value) = boolp(params, "alphaInvert") {
+        alpha_params.invert = value;
+    }
+
     if let Some(value) = boolp(params, "backfaceCulling") {
         settings.backface_culling = value;
     }
@@ -277,6 +290,8 @@ pub(crate) fn brush_json(session: &Session) -> Value {
             (None, Some(id)) => json!({ "library": id }),
             (None, None) => json!(settings.alpha.label()),
         },
+        "alphaSizeX": settings.alpha_params.size_x * 100.0, "alphaSizeY": settings.alpha_params.size_y * 100.0,
+        "alphaRoundness": settings.alpha_params.roundness * 100.0, "alphaContrast": settings.alpha_params.contrast, "alphaInvert": settings.alpha_params.invert,
         "backfaceCulling": settings.backface_culling, "symmetry": [settings.symmetry.x, settings.symmetry.y, settings.symmetry.z],
         "radialSymmetry": { "copies": settings.symmetry.radial, "axis": (["x", "y", "z"].get(settings.symmetry.axis as usize)) },
         "symmetryOffset": settings.symmetry.offset, "symmetryOn": settings.symmetry.enabled, "symmetryAngleSpan": settings.symmetry.angle_span,

@@ -10,6 +10,7 @@ use texturecraft_engine::core::{
     Source,
 };
 use texturecraft_engine::filter_lib::scalar_params;
+use texturecraft_engine::paint::alpha_params::MAX_ALPHA_CONTRAST;
 use texturecraft_engine::paint::{BrushAlpha, BrushSettings, alphas};
 use texturecraft_engine::{CloneFrom, StackTarget, Tool};
 
@@ -1856,7 +1857,7 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         (brush.size, brush.min_size, brush.screen_space) = size_fields(&defaults);
     }
 
-    let flow_fields = |settings: &BrushSettings| (settings.flow, settings.opacity, settings.spacing, settings.hardness);
+    let flow_fields = |settings: &BrushSettings| (settings.flow, settings.opacity, settings.spacing);
     if section_with_reset(ui, "sec_flow", tr("Flow and opacity"), true, flow_fields(brush) == flow_fields(&defaults), |ui| {
         let mut flow_percent = brush.flow * 100.0;
         if slider(ui, tr("Flow"), &mut flow_percent, 0.0..=100.0, 0).changed() {
@@ -1872,13 +1873,8 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         if slider(ui, tr("Spacing"), &mut spacing_percent, 1.0..=1000.0, 0).changed() {
             brush.spacing = spacing_percent / 100.0;
         }
-
-        let mut hardness_percent = brush.hardness * 100.0;
-        if slider(ui, tr("Hardness"), &mut hardness_percent, 0.0..=99.9, 0).changed() {
-            brush.hardness = hardness_percent / 100.0;
-        }
     }) {
-        (brush.flow, brush.opacity, brush.spacing, brush.hardness) = flow_fields(&defaults);
+        (brush.flow, brush.opacity, brush.spacing) = flow_fields(&defaults);
     }
 
     let angle_fields = |settings: &BrushSettings| (settings.angle, settings.follow_path);
@@ -2018,7 +2014,36 @@ fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
     ui.label(RichText::new(tr("More in Assets > Alphas: click one, or drag it here")).size(10.0).color(tk.text_dim));
     crate::shelf::drop_target(app, ui, &zone.response, crate::shelf::DropZone::Brush);
+    section(ui, "sec_alpha_params", tr("Parameters"), true, |ui| alpha_parameters(&mut app.session.tool.brush, ui));
     section(ui, "sec_text", tr("Text"), true, |ui| text_section(app, ui));
+}
+
+/// Hardness and the parameters every alpha shares, with a button that puts them back
+fn alpha_parameters(brush: &mut BrushSettings, ui: &mut Ui) {
+    let defaults = BrushSettings::default();
+    let percent_slider = |ui: &mut Ui, label: &str, value: &mut f32, min: f32, max: f32| {
+        let mut percent = *value * 100.0;
+        if slider(ui, label, &mut percent, min..=max, 0).changed() {
+            *value = percent / 100.0;
+        }
+    };
+
+    percent_slider(ui, tr("Hardness"), &mut brush.hardness, 0.0, 99.9);
+    let params = &mut brush.alpha_params;
+    percent_slider(ui, tr("Size X"), &mut params.size_x, 5.0, 100.0);
+    percent_slider(ui, tr("Size Y"), &mut params.size_y, 5.0, 100.0);
+
+    // Only the procedural Round shape has a roundness
+    let round = brush.alpha == BrushAlpha::Round && brush.alpha_image.is_none() && brush.alpha_library.is_none();
+    ui.add_enabled_ui(round, |ui| percent_slider(ui, tr("Roundness"), &mut brush.alpha_params.roundness, 0.0, 100.0));
+    slider(ui, tr("Contrast"), &mut brush.alpha_params.contrast, 1.0..=MAX_ALPHA_CONTRAST, 2);
+    ui.checkbox(&mut brush.alpha_params.invert, tr("Invert"));
+
+    let at_defaults = brush.hardness == defaults.hardness && brush.alpha_params == defaults.alpha_params;
+    if ui.add_enabled(!at_defaults, egui::Button::new(tr("Restore defaults"))).clicked() {
+        (brush.hardness, brush.alpha_params) = (defaults.hardness, defaults.alpha_params);
+    }
+    *brush = brush.sanitized();
 }
 
 /// Text drawn in a font, as the brush alpha or a decal (`resource.text`).

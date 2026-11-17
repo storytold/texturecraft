@@ -166,7 +166,7 @@ pub fn stroke_preview(brush: &BrushSettings, size_px: usize, image: Option<&Imag
 
     let library = brush.alpha_library.as_deref().and_then(alphas::find).map(alphas::LibraryAlpha::image);
     let radius = size_px as f32 * STROKE_RADIUS_FRACTION;
-    let shape = Shape { alpha: brush.alpha, image, library, level: 0 }.at_radius(radius);
+    let shape = Shape { alpha: brush.alpha, image, library, params: brush.alpha_params, level: 0 }.at_radius(radius);
 
     // The horizontal inset and vertical wave keep the S curve inside the swatch
     let curve = |t: f32| {

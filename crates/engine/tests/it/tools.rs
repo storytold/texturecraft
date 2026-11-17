@@ -302,3 +302,31 @@ fn undoing_after_painting_on_instance_source_mask_keeps_mask_target() {
     let undone = execute(&mut s, "edit.undo", &Value::Null).unwrap();
     assert_eq!(undone["undone"], "Mask stroke");
 }
+
+/// Texels of base color red along a viewport row
+fn red_width(s: &Session, y: f32) -> usize {
+    (100..300).filter(|x| s.pick(Vec2::new(*x as f32, y), s.viewport).is_some() && red(color_at(s, *x as f32, y))).count()
+}
+
+#[test]
+fn brush_alpha_parameters_are_set_read_back_and_narrow_the_stamp() {
+    let mut s = session();
+    paint_red(&mut s, 30.0);
+    dab(&mut s, 200.0, 200.0);
+    let full = red_width(&s, 200.0);
+    assert!(full > 20, "{full}");
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(red_width(&s, 200.0), 0);
+
+    let brush = execute(&mut s, "tool.brush", &json!({"alphaSizeX": 50, "alphaRoundness": 0, "alphaContrast": 2.5, "alphaInvert": false})).unwrap();
+    assert_eq!((brush["alphaSizeX"].as_f64(), brush["alphaSizeY"].as_f64(), brush["alphaRoundness"].as_f64()), (Some(50.0), Some(100.0), Some(0.0)));
+    assert_eq!((brush["alphaContrast"].as_f64(), brush["alphaInvert"].as_bool()), (Some(2.5), Some(false)));
+    execute(&mut s, "tool.brush", &json!({"alphaRoundness": 100, "alphaContrast": 1})).unwrap();
+    dab(&mut s, 200.0, 200.0);
+    let narrow = red_width(&s, 200.0);
+    assert!(narrow > 5 && narrow * 10 < full * 7, "half the stamp width: {narrow} of {full}");
+
+    // Out-of-range values are clamped, not rejected
+    let brush = execute(&mut s, "tool.brush", &json!({"alphaSizeX": 0, "alphaContrast": 99})).unwrap();
+    assert_eq!((brush["alphaSizeX"].as_f64(), brush["alphaContrast"].as_f64()), (Some(5.0), Some(8.0)));
+}

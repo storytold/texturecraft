@@ -106,7 +106,7 @@ built-in `udim_plane`, a uniform fill and a tile-1002 resolution override.
 - The 2D paint cursor was visible, and direct 2D painting worked. This does not reproduce the older
   cursor/painting reports on this setup.
 - Brush size/hardness and flow/angle gestures have a visible hint. Hardness is present under
-  Flow and opacity; Angle has its own section. Their absence must not be inferred from the initial
+  Alpha > Parameters; Angle has its own section. Their absence must not be inferred from the initial
   scrolled position. The broader precision/shortcut concerns in
   [#545](https://github.com/storytold/texturecraft/issues/545) still need an input-device task test.
 - The shelf displayed four columns at the larger size, with type controls and search. Do not

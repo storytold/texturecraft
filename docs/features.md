@@ -11,7 +11,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   tablets; on Linux, macOS and desktop browsers a pen works as a mouse for now).
   Ctrl+drag in a view sets them on the fly: right-drag the size and hardness, left-drag the flow
   and angle.
-  **67 procedural brush alphas** in their own shelf tab, or any imported image as the alpha.
+  **67 procedural brush alphas** in their own shelf tab, or any imported image as the alpha. Every alpha has Parameters (Properties › Alpha): hardness, size X and Y,
+  roundness for the Round shape, contrast and invert, with Restore defaults.
   **18 brush presets** (basic, wear and grunge, details) in the shelf's Brushes tab set the
   stroke and keep the size; save your own brushes there too.
 - **Tools:** paint, eraser, **projection** with image stencils (hold S to move, turn and scale the

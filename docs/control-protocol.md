@@ -33,6 +33,13 @@ as the history reaches); `edit.history` lists the steps done and the undone ones
 Any command takes `merge: true` to fold its edit into the previous undo step when that step has
 the same label: a drag that applies a value on every frame stays one step.
 
+`tool.brush` takes the alpha's shared parameters next to `alpha`: `alphaSizeX` and `alphaSizeY`
+(5..100, percent of the stamp the alpha fills, default 100), `alphaRoundness` (0..100, only for the
+procedural Round alpha: 100 is a circle, 0 a square), `alphaContrast` (1..8, 1 leaves the values
+alone) and `alphaInvert` (swaps paint and no paint inside the stamp square). They apply to
+procedural, library and imported alphas alike and are returned by `tool.brush` with the other
+values. The alpha's rotation is the brush `angle`.
+
 Bake mode applies edits in Common Settings and Mesh Map Settings to every texture set. Each
 set keeps its own enabled mesh-map checkboxes and Include in Bake flag. Edits update only the
 changed fields; Restore Defaults resets the whole parameter section across all sets.

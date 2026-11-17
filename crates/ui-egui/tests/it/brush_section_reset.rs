@@ -23,7 +23,7 @@ const SECTIONS: [(&str, &str, bool, SectionReset); 7] = [
         (brush.size, brush.min_size, brush.screen_space) = (defaults.size, defaults.min_size, defaults.screen_space)
     }),
     ("Flow and opacity", "Stroke opacity", true, |brush, defaults| {
-        (brush.flow, brush.opacity, brush.spacing, brush.hardness) = (defaults.flow, defaults.opacity, defaults.spacing, defaults.hardness)
+        (brush.flow, brush.opacity, brush.spacing) = (defaults.flow, defaults.opacity, defaults.spacing)
     }),
     ("Angle", "Follow path", false, |brush, defaults| (brush.angle, brush.follow_path) = (defaults.angle, defaults.follow_path)),
     ("Jitters", "Size jitter", false, |brush, defaults| {

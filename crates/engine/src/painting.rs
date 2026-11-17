@@ -284,6 +284,7 @@ impl Session {
             alpha: b.alpha,
             image: b.alpha_image.as_ref().and_then(|n| images.get(n)).map(|i| &**i),
             library: b.alpha_library.as_deref().and_then(texturecraft_paint::alphas::find).map(|a| a.image()),
+            params: b.alpha_params,
             level: 0,
         }
     }
