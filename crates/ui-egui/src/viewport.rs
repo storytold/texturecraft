@@ -699,7 +699,16 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && touch.is_none()
         && !DecalDrop::blocks_input(ui.ctx())
         && decal_input(app, ui, &response, rect);
-    let plane_pick = !popup && !decal_drag && touch.is_none() && crate::symmetry::plane_pick_input(app, ui, &response, rect);
+    let plane_pick = !popup
+        && !s_held
+        && !v_held
+        && !focus_pick
+        && placing.is_none()
+        && !picking_id_color
+        && touch.is_none()
+        && !DecalDrop::blocks_input(ui.ctx())
+        && !decal_drag
+        && crate::symmetry::plane_pick_input(app, ui, &response, rect);
     let symmetry_drag = !alt
         && !plane_pick
         && !adjusting
@@ -1866,6 +1875,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !adjusting
         && !v_held
         && !picking_id_color
+        && !app.picking_symmetry_plane
         && !DecalDrop::blocks_input(ui.ctx());
     let mut fill_box = None;
     if painting && path_tool {

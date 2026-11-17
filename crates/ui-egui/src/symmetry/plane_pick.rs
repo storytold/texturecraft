@@ -33,6 +33,12 @@ pub(crate) fn input(app: &mut TextureCraftApp, ui: &Ui, response: &Response, rec
         return false;
     }
 
+    // Picking is only for the Painting mode (the settings popup lives there)
+    if app.ui.mode != crate::state::Mode::Painting {
+        app.picking_symmetry_plane = false;
+        return false;
+    }
+
     if !movable_axes(&app.session.tool.brush.symmetry).contains(&true) {
         app.picking_symmetry_plane = false;
         return false;
