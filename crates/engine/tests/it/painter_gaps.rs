@@ -626,3 +626,12 @@ fn directx_normal_images_flip_green() {
     let old: texturecraft_engine::core::Source = serde_json::from_value(json!({"Image": {"name": "n"}})).unwrap();
     assert_eq!(old, texturecraft_engine::core::Source::image("n"));
 }
+
+#[test]
+fn layer_list_rejects_an_unknown_texture_set() {
+    let mut s = session();
+
+    assert!(execute(&mut s, "layer.list", &json!({"ts": 99})).is_err(), "an unknown set is an error, not a null stack");
+    let stack = execute(&mut s, "layer.list", &json!({"ts": 0})).unwrap();
+    assert!(stack.as_array().is_some_and(|layers| !layers.is_empty()), "the real stack still lists: {stack}");
+}
