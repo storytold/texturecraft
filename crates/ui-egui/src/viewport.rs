@@ -551,7 +551,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     app.viewport_rect = rect;
     let size = rect.size();
     app.session.viewport = Vec2::new(size.x.max(MIN_CAMERA_VIEWPORT), size.y.max(MIN_CAMERA_VIEWPORT));
-    let (alt, shift) = ui.input(|input| (input.modifiers.alt, input.modifiers.shift));
+    let (alt, shift, snap) = ui.input(|input| (input.modifiers.alt, input.modifiers.shift, input.modifiers.shift && input.modifiers.command));
     let local = |pointer: egui::Pos2| Vec2::new(pointer.x - rect.left(), pointer.y - rect.top());
     let adjusting = brush_drag(app, ui, &response);
     let navigating = !adjusting && (alt || ui.input(|input| input.pointer.middle_down() || input.pointer.secondary_down()));
@@ -747,9 +747,10 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     } else if painting {
         let pressure = pen_pressure(ui);
         if response.drag_started_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary) {
-            // Shift+click paints a straight line from where the last stroke ended
+            // Shift+click paints a straight line from where the last stroke ended; Ctrl+Shift snaps its angle
             let line_from = if shift { app.last_paint_point } else { None };
             if let Some(pointer) = response.interact_pointer_pos() {
+                let pointer = snapped_end(line_from.filter(|_| snap).map(|from| pos2(rect.left() + from.x, rect.top() + from.y)), pointer);
                 match app.session.begin_stroke(line_from.unwrap_or(local(pointer)), app.session.viewport, pressure) {
                     Ok(_) => {
                         if line_from.is_some() {
@@ -817,12 +818,13 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             clone_marker(app, ui, rect, source);
         }
 
-        // Shift: preview the straight line Shift+click paints from the last stroke
+        // Shift: preview the straight line Shift+click paints from the last stroke (snapped with Ctrl)
         if shift
             && !path_tool
             && let Some(from) = app.last_paint_point
         {
-            rubber_band(ui, rect, &[pos2(rect.left() + from.x, rect.top() + from.y), hover_pos]);
+            let from = pos2(rect.left() + from.x, rect.top() + from.y);
+            rubber_band(ui, rect, &[from, snapped_end(snap.then_some(from), hover_pos)]);
         }
     }
 
@@ -1610,12 +1612,22 @@ fn brush_tool(t: Tool) -> bool {
 
 /// Ctrl (Cmd on macOS) + drag changes the brush instead of painting: true while it applies (see `adjust_brush`)
 fn brush_drag(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response) -> bool {
-    let held = tool_acts(app) && brush_tool(app.session.tool.tool) && !app.session.stroke_active() && ui.input(|input| input.modifiers.command);
+    // Ctrl+Shift with the left button is the snapped straight line, not a brush change
+    let right_drag = response.dragged_by(PointerButton::Secondary);
+    let held = tool_acts(app)
+        && brush_tool(app.session.tool.tool)
+        && !app.session.stroke_active()
+        && ui.input(|input| input.modifiers.command && (!input.modifiers.shift || right_drag));
     if held && let Some(right) = brush_drag_button(response) {
         adjust_brush(&mut app.session.tool.brush, right, ui.input(|input| input.pointer.delta()));
     }
 
     held
+}
+
+/// Where a straight line to `pointer` ends: turned to a multiple of 15 degrees about `from` when it is set (Ctrl+Shift), else at `pointer`
+fn snapped_end(from: Option<Pos2>, pointer: Pos2) -> Pos2 {
+    from.map_or(pointer, |from| crate::line_snap::snap_line_end(from, pointer, crate::line_snap::LINE_SNAP_STEP_DEGREES))
 }
 
 /// The button of a drag on `resp`: Some(true) right, Some(false) left.
@@ -1783,7 +1795,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     let tokens = Tokens::get(ui.ctx());
     let response = ui.interact(rect, ui.scope_id().with("view2d"), Sense::click_and_drag());
     let size = rect.size();
-    let (alt, shift) = ui.input(|input| (input.modifiers.alt, input.modifiers.shift));
+    let (alt, shift, snap) = ui.input(|input| (input.modifiers.alt, input.modifiers.shift, input.modifiers.shift && input.modifiers.command));
     let adjusting = brush_drag(app, ui, &response);
 
     // Pan with a middle drag or Alt+left drag, zoom with the wheel about the cursor
@@ -1876,7 +1888,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             |session, corner, opposite| session.drag_polygon_fill_box_uv(to_uv(corner), to_uv(opposite)),
         );
     } else if painting {
-        paint_2d_input(app, ui, &response, shift, &to_uv);
+        paint_2d_input(app, ui, &response, (shift, snap), &to_uv, &to_screen);
     }
     if response.double_clicked() && !(painting && path_tool) {
         app.ui.uv_zoom = 1.0;
@@ -1927,7 +1939,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         path_overlay(app, ui, rect, &response, true, show);
     }
 
-    // Shift: preview the straight line Shift+click paints from the last stroke
+    // Shift: preview the straight line Shift+click paints from the last stroke (snapped with Ctrl)
     if painting
         && shift
         && !path_tool
@@ -1935,7 +1947,8 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && let Some(from) = app.last_paint_uv.and_then(|point| point.uv_for(&app.session))
         && let Some(hover) = response.hover_pos()
     {
-        rubber_band(ui, rect, &[to_screen(from.x, from.y), hover]);
+        let from = to_screen(from.x, from.y);
+        rubber_band(ui, rect, &[from, snapped_end(snap.then_some(from), hover)]);
     }
 
     if app.ui.mode == crate::state::Mode::Baking {
@@ -2001,8 +2014,16 @@ fn brush_cursor_2d(painter: &egui::Painter, center: egui::Pos2, radius_points: f
     painter.circle_filled(center, 1.5, Color32::WHITE);
 }
 
-/// Paint in the 2D view: a press starts a stroke, a drag continues it, Shift+click draws a line from the last stroke.
-fn paint_2d_input(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response, shift: bool, to_uv: &dyn Fn(egui::Pos2) -> Vec2) {
+/// Paint in the 2D view: a press starts a stroke, a drag continues it, Shift+click draws a line from the last stroke
+/// (`(shift, snap)`: Ctrl+Shift turns the line to a multiple of 15 degrees on screen).
+fn paint_2d_input(
+    app: &mut TextureCraftApp,
+    ui: &Ui,
+    response: &egui::Response,
+    (shift, snap): (bool, bool),
+    to_uv: &dyn Fn(egui::Pos2) -> Vec2,
+    to_screen: &dyn Fn(f32, f32) -> egui::Pos2,
+) {
     let pressure = pen_pressure(ui);
 
     // Where the stroke under way is; it becomes the line start only when the stroke finishes
@@ -2011,7 +2032,8 @@ fn paint_2d_input(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response,
     if response.drag_started_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary) {
         let line_start = app.last_paint_uv.filter(|_| shift).and_then(|point| point.uv_for(&app.session));
         if let Some(pointer) = response.interact_pointer_pos() {
-            let uv = to_uv(pointer);
+            let from = line_start.filter(|_| snap).map(|start| to_screen(start.x, start.y));
+            let uv = to_uv(snapped_end(from, pointer));
             match app.session.begin_stroke_uv(line_start.unwrap_or(uv), pressure) {
                 Ok(()) => {
                     if line_start.is_some() {

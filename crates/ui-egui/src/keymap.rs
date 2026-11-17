@@ -356,6 +356,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
                     (tr("MMB drag / Alt + MMB"), tr("Pan")),
                     (tr("Wheel / Alt + RMB drag"), tr("Zoom")),
                     (tr("LMB"), tr("Paint with the current tool")),
+                    (tr("Ctrl + Shift + LMB"), tr("Draw snapped straight lines")),
                     ("[ / ]", tr("Brush size down / up")),
                     (tr("Shift + wheel"), tr("Brush size")),
                     ("Esc", tr("Cancel the stroke")),

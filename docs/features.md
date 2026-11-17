@@ -17,7 +17,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **Tools:** paint, eraser, **projection** with image stencils (hold S to move, turn and scale the
   stencil), polygon fill (triangle, UV island or the whole mesh), **path** and **lasso fill**, a
   **particle brush**, **smudge**, **clone** (V + click sets the source), material picker, Shift+click
-  straight lines, and painting directly in the **2D UV view**.
+  straight lines (Ctrl+Shift+click snaps them to 15 degree steps), and painting directly in the **2D UV view**.
 - **Geometry decals:** drop an image on the surface, then move, scale and turn its frame; it stays
   an editable fill layer.
 - **Text** in any installed font (or the built-in ones), shaped for every script with kerning and

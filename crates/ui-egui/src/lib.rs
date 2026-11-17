@@ -32,6 +32,7 @@ pub mod layer_panel;
 mod levels_editor;
 mod levels_handle;
 mod levels_properties;
+mod line_snap;
 mod mask_preview_image;
 mod material_preview_image;
 pub mod menus;
