@@ -84,3 +84,16 @@ fn reset_ui_escape_keeps_everything_and_enter_resets() {
     assert!(h.state().ui.dock.is_open(Panel::Assets));
     assert_eq!(h.state().ui.layout, ViewLayout::Split);
 }
+
+#[test]
+fn the_control_command_resets_without_asking() {
+    let mut h = changed_app();
+    let ctx = h.ctx.clone();
+    let reply = texturecraft_ui_egui::control::handle(h.state_mut(), &ctx, "ui.menu.invoke", &serde_json::json!({"id": "ui.resetUi"}));
+    h.run_steps(2);
+    assert!(reply.get("error").is_none(), "{reply}");
+    let ui = &h.state().ui;
+    assert!(!ui.windows.confirm_reset_ui, "no question for a script");
+    assert!(ui.dock.is_open(Panel::Assets));
+    assert_eq!((ui.layout, ui.uv_zoom, ui.wireframe_3d, ui.mode), (ViewLayout::Split, 1.0, false, Mode::Painting));
+}
