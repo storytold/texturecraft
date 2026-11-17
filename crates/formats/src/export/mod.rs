@@ -75,8 +75,9 @@ pub enum FileFormat {
     Webp,
     Exr,
     Hdr,
-    /// DirectDraw Surface: 8 bits per channel, uncompressed or BC1/BC3/BC4/BC5, optionally with
-    /// mipmaps ([`DdsExport`]).
+    /// DirectDraw Surface: uncompressed (8 or 16 bits per channel) or BC1/BC3/BC4/BC5, optionally
+    /// with mipmaps ([`DdsExport`]). At 16 bits BC4 and BC5 are encoded from the 16-bit values and
+    /// uncompressed files keep 16 bits per channel; BC1 and BC3 are 8-bit either way.
     Dds,
 }
 
@@ -119,7 +120,7 @@ impl FileFormat {
     /// Bit depths this format is written with (16 and 32 are half and full float for EXR).
     pub fn bit_depths(self) -> &'static [u8] {
         match self {
-            FileFormat::Png | FileFormat::Tiff => &[8, 16],
+            FileFormat::Png | FileFormat::Tiff | FileFormat::Dds => &[8, 16],
             FileFormat::Exr => &[16, 32],
             FileFormat::Hdr => &[32],
             _ => &[8],
@@ -145,7 +146,7 @@ pub enum DdsCompression {
     /// grayscale maps BC4, the other colour maps BC1.
     #[default]
     Auto,
-    /// 8 bits per channel, lossless.
+    /// Uncompressed and lossless: 8 or 16 bits per channel, as the bit depth says.
     None,
     /// BC1 (DXT1), 4 bits per pixel; alpha is only on or off.
     Bc1,
@@ -525,16 +526,19 @@ fn is_color(map: &MapSpec) -> bool {
 /// drops Z. A map that packs a normal component next to other data is not one, nor is one without
 /// its X and Y in red and green, nor a world-space normal, whose Z can point below the horizon.
 fn is_normal(map: &MapSpec) -> bool {
+    // The component of a normal source: X, Y and Z must sit in R, G and B, or BC5 would keep the
+    // wrong component or drop a different one than Z.
+    let in_place = |d: &Dest, component: u8| matches!((d, component), (Dest::R, 0) | (Dest::G, 1) | (Dest::B, 2));
     [Dest::R, Dest::G].iter().all(|wanted| map.channels.iter().any(|(d, s)| d == wanted && !matches!(s, SourceRef::Constant(_))))
         && map.channels.iter().all(|(d, s)| {
             *d == Dest::A
                 || (*d == Dest::B && matches!(s, SourceRef::Constant(_)))
-                || matches!(
-                    s,
-                    SourceRef::Channel { channel: Channel::Normal, .. }
-                        | SourceRef::Virtual { map: VirtualMap::NormalOpenGl | VirtualMap::NormalDirectX | VirtualMap::HeightNormal, .. }
-                        | SourceRef::Baked { map: BakedMap::Normal | BakedMap::BentNormal, .. }
-                )
+                || match s {
+                    SourceRef::Channel { channel: Channel::Normal, component }
+                    | SourceRef::Virtual { map: VirtualMap::NormalOpenGl | VirtualMap::NormalDirectX | VirtualMap::HeightNormal, component }
+                    | SourceRef::Baked { map: BakedMap::Normal | BakedMap::BentNormal, component } => in_place(d, *component),
+                    _ => false,
+                }
         })
 }
 
@@ -970,10 +974,23 @@ fn encode(
         (FileFormat::Tiff, 2) => (remap(&encoded, 2, &[0, 0, 0, 1]), 4),
         _ => (encoded, n),
     };
-    // DDS holds 8 bits per channel only (the closest depth `FileFormat::depth` picks).
+    // DDS at 8 or 16 bits per channel (the closest depth `FileFormat::depth` picks). BC1 to BC3
+    // are 8-bit blocks at both depths; BC4, BC5 and uncompressed files keep 16 bits.
     if format == FileFormat::Dds {
-        let bytes: Vec<u8> = encoded.iter().map(|v| (v * 255.0 + 0.5) as u8).collect();
-        return write_dds(bytes, size, n, dds, warnings).map_err(|e| failed(&e));
+        let to8 = |v: &f32| (v * 255.0 + 0.5) as u8;
+        if dds.compression == craft_dds::DdsCompression::Bc1
+            && matches!(n, 2 | 4)
+            && encoded.chunks_exact(n).any(|px| px.last().is_some_and(|a| !matches!(to8(a), 0 | 255)))
+        {
+            warnings.push("BC1 keeps alpha only fully on or off; use BC3 to keep partial transparency".into());
+        }
+        return if depth == 16 {
+            let words: Vec<u16> = encoded.iter().map(|v| (v * 65535.0 + 0.5) as u16).collect();
+            write_dds(words, size, n, 65535, dds, craft_dds::encode16)
+        } else {
+            write_dds(encoded.iter().map(to8).collect(), size, n, 255, dds, craft_dds::encode)
+        }
+        .map_err(|e| failed(&e));
     }
     use image::ExtendedColorType as C;
     let (bytes, color) = if depth == 16 {
@@ -1044,15 +1061,20 @@ fn write_image(format: FileFormat, bytes: &[u8], (w, h): (u32, u32), color: imag
     Ok(out.into_inner())
 }
 
-/// A DDS texture of 8-bit `bytes` (`n` = 1 L, 2 LA, 3 RGB, 4 RGBA), through craft-dds. Block
-/// compressions take the layout [`craft_dds::DdsCompression::layout`] names: BC1 and BC3 RGBA
-/// (gray spread to red, green and blue, opaque without alpha), BC4 gray, BC5 RGB.
-fn write_dds(
-    bytes: Vec<u8>,
+/// craft-dds' `encode` (8 bits) or `encode16`.
+type DdsEncoder<T> = fn(u32, u32, craft_dds::Layout, &[T], craft_dds::DdsOptions) -> std::result::Result<Vec<u8>, craft_dds::DdsError>;
+
+/// A DDS texture of `pixels` (`n` = 1 L, 2 LA, 3 RGB, 4 RGBA; `opaque` is full alpha), through
+/// craft-dds' `encode` (8 bits) or `encode16`. Block compressions take the layout
+/// [`craft_dds::DdsCompression::layout`] names: BC1 and BC3 RGBA (gray spread to red, green and
+/// blue, opaque without alpha), BC4 gray, BC5 RGB.
+fn write_dds<T: Copy>(
+    pixels: Vec<T>,
     (w, h): (u32, u32),
     n: usize,
+    opaque: T,
     dds: craft_dds::DdsOptions,
-    warnings: &mut Vec<String>,
+    encode: DdsEncoder<T>,
 ) -> std::result::Result<Vec<u8>, craft_dds::DdsError> {
     use craft_dds::Layout;
     let given = match n {
@@ -1061,23 +1083,17 @@ fn write_dds(
         3 => Layout::Rgb,
         _ => Layout::Rgba,
     };
-    if dds.compression == craft_dds::DdsCompression::Bc1
-        && matches!(n, 2 | 4)
-        && bytes.chunks_exact(n).any(|px| px.last().is_some_and(|a| *a != 0 && *a != 255))
-    {
-        warnings.push("BC1 keeps alpha only fully on or off; use BC3 to keep partial transparency".into());
-    }
     let layout = dds.compression.layout().unwrap_or(given);
     let pixels = match (given, layout) {
-        (from, to) if from == to => bytes,
-        (Layout::Gray, Layout::Rgba) => bytes.iter().flat_map(|&g| [g, g, g, 255]).collect(),
-        (Layout::GrayA, Layout::Rgba) => bytes.as_chunks::<2>().0.iter().flat_map(|&[g, a]| [g, g, g, a]).collect(),
-        (Layout::Rgb, Layout::Rgba) => bytes.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect(),
+        (from, to) if from == to => pixels,
+        (Layout::Gray, Layout::Rgba) => pixels.iter().flat_map(|&g| [g, g, g, opaque]).collect(),
+        (Layout::GrayA, Layout::Rgba) => pixels.as_chunks::<2>().0.iter().flat_map(|&[g, a]| [g, g, g, a]).collect(),
+        (Layout::Rgb, Layout::Rgba) => pixels.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, opaque]).collect(),
         // `DdsCompression::resolve` picks BC4 for gray and BC5 for RGB only; craft-dds refuses
         // any other pairing with an error.
-        _ => bytes,
+        _ => pixels,
     };
-    craft_dds::encode(w, h, layout, &pixels, dds)
+    encode(w, h, layout, &pixels, dds)
 }
 
 /// OpenEXR with Y / YA / RGB / RGBA channels, half or full float, ZIP compression.

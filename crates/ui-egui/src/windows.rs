@@ -1245,7 +1245,7 @@ fn export_settings_tab(app: &mut TextureCraftApp, ui: &mut Ui, presets: &[textur
                         }
                     })
                     .response
-                    .on_hover_text(tr("Automatic: normal maps BC5, maps with alpha BC3, grayscale maps BC4, the others BC1. DDS files are 8-bit."));
+                    .on_hover_text(tr("Automatic: normal maps BC5, maps with alpha BC3, grayscale maps BC4, the others BC1. At 16 bits BC4, BC5 and uncompressed files keep 16 bits."));
                 ui.checkbox(&mut app.ui.export.dds_mipmaps, tr("Generate mipmaps"));
             });
             ui.end_row();

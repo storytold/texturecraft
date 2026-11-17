@@ -29,7 +29,7 @@ USAGE:
       Bake mesh maps for every texture set (a project is saved in place without -o).
   texturecraft-cli export <input> <dir> [--preset <name>] [--format <ext>] [--padding <mode>] [--size <px>]
                    [--dds-compression auto|none|bc1|bc3] [--dds-mipmaps]
-      Export textures (default preset: Document channels + Normal + AO). DDS files are 8-bit;
+      Export textures (default preset: Document channels + Normal + AO). DDS files follow the template's bit depth (8 or 16);
       auto compression writes normal maps as BC5, maps with alpha as BC3, grayscale maps as BC4
       and the others as BC1.
   texturecraft-cli render <input> <out.png> [--size <W>x<H>] [--view 3d|2d] [--camera <name>] [--yaw <deg>]

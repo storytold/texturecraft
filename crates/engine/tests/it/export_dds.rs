@@ -62,14 +62,14 @@ fn dds_export_picks_a_compression_per_map_and_takes_the_options() {
 }
 
 #[test]
-fn the_plan_lists_8_bit_dds_files_and_bad_options_are_errors() {
+fn the_plan_lists_dds_files_at_8_or_16_bits_and_bad_options_are_errors() {
     let mut s = session();
-    // 16 and 32 bits are not in DDS: written at 8, like JPEG, TGA and BMP.
-    for depth in [8, 16, 32] {
+    // DDS has 8 and 16 bits; 32 is written at 16.
+    for (depth, written) in [(8, 8), (16, 16), (32, 16)] {
         let plan = execute(&mut s, "export.plan", &json!({ "preset": "glTF PBR Metal Roughness", "format": "dds", "bitDepth": depth })).unwrap();
         let files = plan.as_array().unwrap();
         assert!(!files.is_empty());
-        assert!(files.iter().all(|f| f["format"] == "dds" && f["bitDepth"] == 8 && f["file"].as_str().unwrap().ends_with(".dds")), "{plan}");
+        assert!(files.iter().all(|f| f["format"] == "dds" && f["bitDepth"] == written && f["file"].as_str().unwrap().ends_with(".dds")), "{plan}");
     }
     for bad in [json!("bc2"), json!("bc7"), json!(""), json!(3), json!(true)] {
         assert!(execute(&mut s, "export.plan", &json!({ "format": "dds", "ddsCompression": bad })).is_err(), "{bad}");

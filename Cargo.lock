@@ -767,7 +767,7 @@ dependencies = [
 [[package]]
 name = "craft-dds"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=28e1b05e3ca70d64595acb404fb3ba64d99e6441#28e1b05e3ca70d64595acb404fb3ba64d99e6441"
+source = "git+https://github.com/storytold/craft-libs?rev=0e116906d050000a4d85e1279ccd62b9e220bbb3#0e116906d050000a4d85e1279ccd62b9e220bbb3"
 
 [[package]]
 name = "craft-dialogs"

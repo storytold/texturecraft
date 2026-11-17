@@ -926,6 +926,9 @@ fn only_a_normal_with_its_x_and_y_in_red_and_green_is_bc5() {
     assert!(is_normal(&spec(&[bent("R", 0), bent("G", 1), bent("B", 2)].join(","))), "a tangent-space bent normal keeps a positive Z");
     assert!(!is_normal(&spec(&gl("B", 2))), "a normal's Z alone in blue would be dropped by BC5");
     assert!(!is_normal(&spec(&[gl("G", 1), gl("B", 2)].join(","))), "no X in red");
+    assert!(!is_normal(&spec(&[gl("R", 0), gl("G", 0), gl("B", 1)].join(","))), "Y in blue would be dropped by BC5");
+    assert!(!is_normal(&spec(&[gl("R", 0), gl("G", 0)].join(","))), "X twice, no Y");
+    assert!(is_normal(&spec(&[gl("R", 0), gl("G", 1)].join(","))), "X and Y alone");
     assert!(!is_normal(&spec(&[world("R", 0), world("G", 1), world("B", 2)].join(","))), "world-space Z can be negative");
 }
 
@@ -939,7 +942,9 @@ fn explicit_dds_compressions_ignore_the_map_kind() {
             assert_eq!(decode(&f).dimensions(), (RES, RES));
         }
     }
-    for f in fx.render(&dds_opts(&preset, DdsCompression::None, false)) {
+    // The preset's 16-bit maps are written with the DX10 header (a FourCC); at 8 bits there is none.
+    let opts = ExportOptions { bit_depth_override: Some(8), ..dds_opts(&preset, DdsCompression::None, false) };
+    for f in fx.render(&opts) {
         assert_eq!(le32(&f.bytes, 80) & DDPF_FOURCC, 0, "{}: uncompressed", f.name);
     }
 }
@@ -965,16 +970,89 @@ fn dds_mipmaps_add_the_whole_chain_below_the_same_top_level() {
 }
 
 #[test]
-fn dds_is_written_at_8_bits_whatever_depth_is_asked() {
+fn dds_follows_the_bit_depth_up_to_16_bits() {
     let fx = Fx::new(&default_channels());
     let preset = builtin_preset("glTF PBR Metal Roughness").unwrap();
     let eight = fx.render(&dds_opts(&preset, DdsCompression::None, false));
+    assert!(list_outputs(&fx.project, 0, "sphere", &dds_opts(&preset, DdsCompression::None, false)).unwrap().iter().all(|p| p.bit_depth == 8));
+    assert!(eight.iter().all(|f| dxgi(&f.bytes).is_none()), "8 bits: the legacy header");
+    // 16 and 32 bits ask for 16: uncompressed files are R16G16B16A16_UNORM (DXGI 11).
     for depth in [16u8, 32] {
         let opts = ExportOptions { bit_depth_override: Some(depth), ..dds_opts(&preset, DdsCompression::None, false) };
-        assert!(list_outputs(&fx.project, 0, "sphere", &opts).unwrap().iter().all(|p| p.format == FileFormat::Dds && p.bit_depth == 8));
-        assert_eq!(fx.render(&opts), eight, "a {depth}-bit request writes the same 8-bit files");
+        assert!(list_outputs(&fx.project, 0, "sphere", &opts).unwrap().iter().all(|p| p.format == FileFormat::Dds && p.bit_depth == 16));
+        for f in fx.render(&opts) {
+            assert_eq!(dxgi(&f.bytes), Some(11), "{depth}-bit request, {}", f.name);
+        }
     }
+    assert_eq!(FileFormat::Dds.bit_depths(), [8, 16]);
     assert_eq!(FileFormat::from_extension(".DDS"), Some(FileFormat::Dds));
+}
+
+/// A smooth ramp over a small range: coarse in 8 bits (about 15 levels across the image), fine in 16.
+fn ramp(v: usize, count: usize) -> f32 {
+    0.40 + 0.06 * v as f32 / (count - 1) as f32
+}
+
+fn mean_error(got: &[u16], want: &[u16]) -> f64 {
+    got.iter().zip(want).map(|(g, w)| g.abs_diff(*w) as f64).sum::<f64>() / got.len() as f64
+}
+
+/// Encodes `n`-component `data` as DDS at `depth` and reads it back at 16 bits.
+fn dds_round_trip(data: &[f32], n: usize, depth: u8, compression: craft_dds::DdsCompression) -> Vec<u16> {
+    let dds = DdsOptions { compression, mipmaps: false };
+    let bytes = encode(FileFormat::Dds, depth, (64, 64), n, data, &vec![false; n], None, dds, &mut Vec::new()).unwrap();
+    craft_dds::Texture::parse(&bytes).unwrap().decode16().unwrap()
+}
+
+#[test]
+fn a_16_bit_normal_exported_to_bc5_has_less_error_than_the_8_bit_path() {
+    let data: Vec<f32> = (0..64 * 64).flat_map(|i| [ramp(i % 64, 64), ramp(i / 64, 64), 0.9]).collect();
+    // X and Y of every texel at 16 bits, and the decoded BC5 (red, green, blue 0).
+    let want: Vec<u16> = data.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1]]).map(|v| (v * 65535.0 + 0.5) as u16).collect();
+    let xy = |d: Vec<u16>| d.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1]]).collect::<Vec<_>>();
+    let eight = mean_error(&xy(dds_round_trip(&data, 3, 8, craft_dds::DdsCompression::Bc5)), &want);
+    let sixteen = mean_error(&xy(dds_round_trip(&data, 3, 16, craft_dds::DdsCompression::Bc5)), &want);
+    assert!(sixteen * 3.0 < eight, "BC5 mean error in 16-bit units: {sixteen} from 16-bit data, {eight} from 8-bit data");
+}
+
+#[test]
+fn a_16_bit_height_exported_to_bc4_has_less_error_than_the_8_bit_path() {
+    let data: Vec<f32> = (0..64 * 64).map(|i| ramp(i % 64 + i / 64, 127)).collect();
+    let want: Vec<u16> = data.iter().map(|v| (v * 65535.0 + 0.5) as u16).collect();
+    let eight = mean_error(&dds_round_trip(&data, 1, 8, craft_dds::DdsCompression::Bc4), &want);
+    let sixteen = mean_error(&dds_round_trip(&data, 1, 16, craft_dds::DdsCompression::Bc4), &want);
+    assert!(sixteen * 3.0 < eight, "BC4 mean error in 16-bit units: {sixteen} from 16-bit data, {eight} from 8-bit data");
+}
+
+#[test]
+fn a_16_bit_dds_normal_map_of_a_texture_set_is_closer_to_the_16_bit_png_than_the_8_bit_one() {
+    let mut fx = Fx::new(&default_channels());
+    fx.set_all(Channel::Normal, |x, y| [0.5 + 0.05 * x as f32 / 63.0, 0.5 + 0.05 * y as f32 / 63.0, 1.0]);
+    let preset = builtin_preset("glTF PBR Metal Roughness").unwrap();
+    let png = fx.render(&ExportOptions { format_override: Some(FileFormat::Png), bit_depth_override: Some(16), ..ExportOptions::new(preset.clone()) });
+    let reference: Vec<u16> = decode(find(&png, "_Normal.")).to_rgb16().as_raw().as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1]]).collect();
+    let error = |depth| {
+        let opts = ExportOptions { bit_depth_override: Some(depth), ..dds_opts(&preset, DdsCompression::Auto, false) };
+        let files = fx.render(&opts);
+        let f = find(&files, "_Normal.");
+        assert_eq!(dxgi(&f.bytes), Some(83), "BC5");
+        let got: Vec<u16> = craft_dds::Texture::parse(&f.bytes).unwrap().decode16().unwrap().as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1]]).collect();
+        mean_error(&got, &reference)
+    };
+    let (eight, sixteen) = (error(8), error(16));
+    assert!(sixteen * 3.0 < eight, "{sixteen} at 16 bits, {eight} at 8 bits");
+}
+
+#[test]
+fn uncompressed_dds_at_16_bits_reads_back_exactly() {
+    for n in 1..=4usize {
+        let data: Vec<f32> = (0..64 * 64 * n).map(|i| ramp(i / n % 64 + i % n * 7, 90)).collect();
+        let want: Vec<u16> = data.iter().map(|v| (v * 65535.0 + 0.5) as u16).collect();
+        let got = dds_round_trip(&data, n, 16, craft_dds::DdsCompression::None);
+        // RGB comes back as RGBA with full alpha.
+        let got: Vec<u16> = if n == 3 { got.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect() } else { got };
+        assert_eq!(got, want, "{n} components");
+    }
 }
 
 #[test]
@@ -990,7 +1068,7 @@ fn a_preset_with_dds_maps_round_trips_and_exports_dds() {
     let files = fx.render(&opts);
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["Body_Set_albedo.dds", "Body_Set_rough.png"]);
-    assert_eq!(list_outputs(&fx.project, 0, "sphere", &opts).unwrap().first().map(|p| p.bit_depth), Some(8));
+    assert_eq!(list_outputs(&fx.project, 0, "sphere", &opts).unwrap().first().map(|p| p.bit_depth), Some(16), "the template's 16 bits");
     assert_eq!(&files[0].bytes[84..88], b"DXT1", "automatic: colour without alpha is BC1");
     // The options themselves survive a serde round trip, and old option JSON without them loads.
     let with = ExportOptions { dds: DdsExport { compression: DdsCompression::Bc3, mipmaps: true }, ..opts.clone() };
