@@ -59,24 +59,33 @@ pub(crate) fn images_used(project: &Project, id: LayerId, out: &mut Vec<String>,
     }
 }
 
+/// An empty document with one texture set shaped like `src_set` (size, tiles, channels): what a saved library file holds.
+pub(crate) fn one_set_document(src_set: &TextureSet, name: &str) -> Document {
+    let mut project = Project::new(name, "builtin:none");
+    let mut set = TextureSet::new(name, 0, src_set.resolution);
+    set.uv_tiles = src_set.uv_tiles.clone();
+    set.tile_resolutions = src_set.tile_resolutions.clone();
+    set.channels = src_set.channels.clone();
+    project.texture_sets.push(set);
+    Document { bake_paint: BTreeMap::new(), project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() }
+}
+
 impl Session {
     /// Serialize layer `id` (with children, pixels and images) as a smart material file.
     pub fn smart_material_bytes(&self, id: LayerId, name: &str) -> Result<Vec<u8>> {
         let (ts, _, _) = self.doc.project.locate(id).ok_or_else(|| EngineError::Other("layer not in a stack".into()))?;
-        let src_set = self.doc.project.texture_set(ts)?;
-        let mut project = Project::new(name, "builtin:none");
-        let mut set = TextureSet::new(name, 0, src_set.resolution);
-        set.uv_tiles = src_set.uv_tiles.clone();
-        set.tile_resolutions = src_set.tile_resolutions.clone();
-        set.channels = src_set.channels.clone();
-        project.texture_sets.push(set);
-        let mut mini = Document { bake_paint: BTreeMap::new(), project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() };
+        let mut mini = one_set_document(self.doc.project.texture_set(ts)?, name);
         let new = crate::layer_ops::copy_tree(&self.doc, id, &mut mini, 0, None, false, 0)?;
         if let Ok(l) = mini.project.layer_mut(new) {
             l.name = name.to_string();
         }
+        self.file_bytes(mini, new)
+    }
+
+    /// The smart material file holding `mini` (a document from [`one_set_document`]) and the images layer `root` of it uses.
+    pub(crate) fn file_bytes(&self, mini: Document, root: LayerId) -> Result<Vec<u8>> {
         let mut used = Vec::new();
-        images_used(&mini.project, new, &mut used, 0);
+        images_used(&mini.project, root, &mut used, 0);
         let resources = used.iter().filter_map(|n| self.doc.resources.get(n).map(|b| (n.clone(), b.as_ref().clone()))).collect();
         let pf = texturecraft_formats::ProjectFile {
             project: mini.project,

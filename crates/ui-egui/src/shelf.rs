@@ -87,6 +87,8 @@ pub(crate) const TABS: [(Tab, &str, &str); 8] = [
 pub enum Asset {
     Material(&'static str),
     SmartMask(&'static str),
+    /// A smart mask file the user saved
+    SavedMask(String),
     Filter(&'static str),
     Alpha(&'static str),
     Library(String),
@@ -119,6 +121,7 @@ pub fn apply(app: &mut TextureCraftApp, asset: &Asset) {
     let (cmd, params) = match asset {
         Asset::Material(id) => ("material.apply", json!({"material": id})),
         Asset::SmartMask(id) => ("mask.smart.apply", json!({"name": id})),
+        Asset::SavedMask(path) => ("mask.smart.apply", json!({"path": path})),
         Asset::Filter(id) => {
             let content = crate::dock::targets_content(app);
             if app.run("effect.add.filter", json!({"filter": id, "target": if content { "content" } else { "mask" }})).is_some()
@@ -193,7 +196,7 @@ pub fn drop_target(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response
         Asset::Alpha(_) => true,
         Asset::Material(_) | Asset::Library(_) => zone != DropZone::Brush,
         Asset::Texture(_) => zone == DropZone::View3d,
-        Asset::SmartMask(_) | Asset::Filter(_) => false,
+        Asset::SmartMask(_) | Asset::SavedMask(_) | Asset::Filter(_) => false,
     };
     let onto_set = |asset: &Asset| zone == DropZone::View3d && asset.goes_onto_set();
     if response.dnd_hover_payload::<ShelfDrag>().is_some_and(|drag| accepts(&drag) && !onto_set(&drag.asset)) {
@@ -252,12 +255,15 @@ pub fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
 
     // Saved smart materials list under the grid rather than as tiles, so they count apart
     let in_user_library = folder.len() <= 1 && folder.first().is_none_or(|library| library == crate::shelf_entry::USER);
-    let saved_materials_matching = saved_materials_matching(app, &filter);
-    if in_user_library && let Some(smart) = TABS.iter().position(|(tab, _, _)| *tab == Tab::Smart).and_then(|smart| counts.get_mut(smart)) {
-        *smart += saved_materials_matching;
-    }
-    if saved_materials_matching > 0 && crate::shelf_tabs::shows(picked_tab, Tab::Smart) {
-        applicable.push(vec![crate::shelf_entry::USER.to_string()]);
+    let saved_materials_matching = saved_matching(app, &filter, false);
+    let saved_masks_matching = saved_matching(app, &filter, true);
+    for (tab, saved) in [(Tab::Smart, saved_materials_matching), (Tab::Masks, saved_masks_matching)] {
+        if in_user_library && let Some(count) = TABS.iter().position(|(shown, _, _)| *shown == tab).and_then(|position| counts.get_mut(position)) {
+            *count += saved;
+        }
+        if saved > 0 && crate::shelf_tabs::shows(picked_tab, tab) {
+            applicable.push(vec![crate::shelf_entry::USER.to_string()]);
+        }
     }
 
     crate::shelf_folders::breadcrumb(app, ui, &paths);
@@ -286,14 +292,15 @@ pub fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
 
         // Saved smart materials are files in the user's library, without folders of their own
         let saved_materials = in_user_library && shown_tab.is_none_or(|shown| shown == Tab::Smart);
-        grid(app, ui, &ctx, &entries, grid_rect.height(), saved_materials, &filter);
+        let saved_masks = in_user_library && shown_tab.is_none_or(|shown| shown == Tab::Masks);
+        grid(app, ui, &ctx, &entries, grid_rect.height(), [saved_materials, saved_masks], &filter);
     });
     ui.scope_builder(egui::UiBuilder::new().max_rect(toolbar_rect), |ui| crate::shelf_toolbar::show(app, ui));
     drag_preview(&ctx);
 }
 
-/// The tiles of `entries` in a scroll area `height` high, then the saved smart materials when `saved_materials`
-fn grid(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, entries: &[ShelfEntry], height: f32, saved_materials: bool, filter: &str) {
+/// The tiles of `entries` in a scroll area `height` high, then the saved smart materials and the saved smart masks when `saved` says so
+fn grid(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, entries: &[ShelfEntry], height: f32, saved: [bool; 2], filter: &str) {
     let view = app.ui.shelf_view;
     let selected: Option<(String, String)> = ctx.data(|data| data.get_temp(egui::Id::unique(SELECTED_TILE)));
     egui::ScrollArea::vertical()
@@ -308,15 +315,22 @@ fn grid(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, entries: &[
                     entry_tile(app, ui, ctx, entry, view, is_selected);
                 }
             });
-            if saved_materials {
-                library(app, ui, filter);
+            for (shown, masks) in saved.into_iter().zip([false, true]) {
+                if shown {
+                    library(app, ui, filter, masks);
+                }
             }
         });
 }
 
-/// How many of the user's saved smart materials match `filter` (none until the library is read)
-fn saved_materials_matching(app: &TextureCraftApp, filter: &str) -> usize {
-    app.library.iter().flatten().filter(|path| matches(filter, &[saved_material_name(path)])).count()
+/// Whether a library file is a saved smart mask (not a smart material)
+fn is_saved_mask(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|extension| extension == texturecraft_engine::smart_masks::SMART_MASK_EXT)
+}
+
+/// How many of the user's saved smart masks (`masks`) or smart materials match `filter` (none until the library is read)
+fn saved_matching(app: &TextureCraftApp, filter: &str, masks: bool) -> usize {
+    app.library.iter().flatten().filter(|path| is_saved_mask(path) == masks && matches(filter, &[saved_material_name(path)])).count()
 }
 
 /// The search field: a live filter on names (and categories) with a clear button while it has text
@@ -381,9 +395,11 @@ fn scan_library(app: &mut TextureCraftApp) {
         return;
     }
 
-    let saved_material = |path: &std::path::PathBuf| path.extension().is_some_and(|extension| extension == "tcmat" || extension == MCMAT_EXT);
+    let saved_asset = |path: &std::path::PathBuf| {
+        path.extension().is_some_and(|extension| extension == "tcmat" || extension == MCMAT_EXT || extension == texturecraft_engine::smart_masks::SMART_MASK_EXT)
+    };
     let mut files: Vec<std::path::PathBuf> =
-        std::fs::read_dir(crate::library_dir()).map(|dir| dir.flatten().map(|entry| entry.path()).filter(saved_material).collect()).unwrap_or_default();
+        std::fs::read_dir(crate::library_dir()).map(|dir| dir.flatten().map(|entry| entry.path()).filter(saved_asset).collect()).unwrap_or_default();
     files.sort();
     app.library = Some(files);
 }
@@ -398,34 +414,44 @@ fn saved_material_name(path: &std::path::Path) -> &str {
 
 /// The user's saved smart materials matching `filter`, as rows under the grid
 #[cfg(not(target_arch = "wasm32"))]
-fn library(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str) {
+fn library(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str, masks: bool) {
     let tokens = Tokens::get(ui.ctx());
-    let files = app.library.clone().unwrap_or_default();
+    let files: Vec<_> = app.library.clone().unwrap_or_default().into_iter().filter(|path| is_saved_mask(path) == masks).collect();
     let shown: Vec<_> = files.iter().filter(|path| matches(filter, &[saved_material_name(path)])).collect();
     if !filter.is_empty() && shown.is_empty() {
         return;
     }
 
     ui.horizontal(|ui| {
-        header(ui, tr("My smart materials"));
+        header(ui, if masks { tr("My smart masks") } else { tr("My smart materials") });
         if ui.small_button(ic::ARROW_CLOCKWISE).on_hover_text(tr("Rescan the library folder")).clicked() {
             app.library = None;
         }
     });
     if files.is_empty() {
-        ui.label(RichText::new(tr("Right-click a layer > Create smart material")).size(HINT_SIZE).color(tokens.text_dim));
+        let hint = if masks { tr("Right-click a layer > Create smart mask") } else { tr("Right-click a layer > Create smart material") };
+        ui.label(RichText::new(hint).size(HINT_SIZE).color(tokens.text_dim));
     }
 
     for path in shown {
-        let (label, asset) = (saved_material_name(path).to_string(), Asset::Library(path.display().to_string()));
+        let (label, location) = (saved_material_name(path).to_string(), path.display().to_string());
+        let asset = if masks { Asset::SavedMask(location) } else { Asset::Library(location) };
 
         // MaterialCraft materials (sent from MaterialCraft) show a graph
-        let glyph = if path.extension().is_some_and(|extension| extension == MCMAT_EXT) { ic::GRAPH } else { ic::SPHERE };
+        let glyph = if masks {
+            ic::CIRCLE_HALF
+        } else if path.extension().is_some_and(|extension| extension == MCMAT_EXT) {
+            ic::GRAPH
+        } else {
+            ic::SPHERE
+        };
         let response = ui.add(egui::Button::selectable(false, format!("{glyph}  {label}")).sense(Sense::click_and_drag())).on_hover_ui(|ui| {
-            ui.label(crate::i18n::trf(
-                "{file}: add above the selected layer (or drag it into the layer stack or onto the viewport)",
-                &[("file", &path.display())],
-            ));
+            let hover = if masks {
+                "{file}: replace the selected layer's mask (or drag it onto a layer in the stack)"
+            } else {
+                "{file}: add above the selected layer (or drag it into the layer stack or onto the viewport)"
+            };
+            ui.label(crate::i18n::trf(hover, &[("file", &path.display())]));
         });
         if response.drag_started() {
             response.dnd_set_drag_payload(ShelfDrag { asset: asset.clone(), label });
@@ -438,7 +464,7 @@ fn library(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str) {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn library(_: &mut TextureCraftApp, _: &mut Ui, _: &str) {}
+fn library(_: &mut TextureCraftApp, _: &mut Ui, _: &str, _: bool) {}
 
 /// Read the user's saved brush presets (desktop brushes folder) unless they are already listed
 #[cfg(not(target_arch = "wasm32"))]

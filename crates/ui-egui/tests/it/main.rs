@@ -40,5 +40,6 @@ mod split_divider;
 mod start_window;
 mod tool_availability;
 mod toolbar;
+mod user_smart_mask;
 
 mod symmetry;

@@ -369,6 +369,23 @@ Maps are found by file name, case-insensitively, from the last known word in the
 In the app: File › Import PBR texture folder... or drop a folder, a `.zip` or several map files on the
 window. The dialog shows the maps found, lets you pick between candidates, set the normal convention and
 projection, and keep the material in the library (shelf › Materials).
+## Smart masks
+
+`mask.smart.list` lists the built-in smart masks and `mask.smart.apply {name, layer?}` replaces a
+layer's mask with one. A user smart mask is a layer's mask saved as a `.tcmask` file (the `.tcraft`
+container holding one layer with the mask): all effects with their parameters, painted pixels and the
+images they read.
+
+| Command | Params |
+|---|---|
+| `mask.smart.create` | `{layer?, path, name?}`: save the layer's mask (an instance without its own mask saves its source's) to `path` (`.tcmask` is appended if missing, folders are made); `name` defaults to the layer's name. Returns `{path}` |
+| `mask.smart.apply` | `{path, layer?}`: replace the layer's mask with the one in a `.tcmask` file (one undo step; images it needs are added to the project, painted pixels are fitted to the texture set) |
+
+In the app: right-click a layer > *Create smart mask* saves into the library folder next to the smart
+materials (never over an earlier file), and the shelf lists it under *My smart masks* (Smart masks tab,
+*Your assets*): click it or drop it on a layer. Like `material.save`, both forms with `path` are not
+available through `command_run` on the MCP server, which rejects host paths.
+
 ## Camera bookmarks
 
 Saved cameras (`Project.cameras`, stored in the `.tcraft` file) are the camera bookmarks.

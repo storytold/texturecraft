@@ -30,6 +30,7 @@ mod thumbs;
 mod tool_availability;
 mod tools;
 mod udim;
+mod user_smart_mask;
 mod uv_strokes;
 
 mod symmetry;

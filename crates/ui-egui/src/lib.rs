@@ -63,6 +63,8 @@ pub mod shelf_preview;
 mod shelf_tabs;
 mod shelf_toolbar;
 pub mod shelf_view;
+#[cfg(not(target_arch = "wasm32"))]
+mod smart_mask_menu;
 mod soft_box;
 pub mod state;
 pub mod symmetry;

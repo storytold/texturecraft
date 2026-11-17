@@ -67,7 +67,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   resolution. Drag them from the tabbed, searchable shelf onto the layer stack or straight onto
   the model.
 - **Your own library:** right-click a layer or folder, choose *Create smart material*, and it
-  appears under *My smart materials*, pixels and images included.
+  appears under *My smart materials*, pixels and images included. *Create smart mask* in the same
+  menu saves just the layer's mask (all its effects, painted pixels and images); it appears under
+  *My smart masks* and applies to any layer like a built-in smart mask.
 - **MaterialCraft materials:** *File › Import material*, a drop on the window, or MaterialCraft's
   *File › Send to TextureCraft* (it lands under *My smart materials*) adds a `.mcmat` portable
   material, or a `.mcraft` package, as a fill layer. Its exposed graph inputs (numbers, vectors,

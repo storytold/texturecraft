@@ -693,7 +693,7 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         } else {
             painter.line_segment([rect.left_top(), rect.right_top()], drop_stroke);
         }
-    } else if matches!(shelf, Some(Asset::SmartMask(_))) {
+    } else if matches!(shelf, Some(Asset::SmartMask(_) | Asset::SavedMask(_))) {
         painter.rect_stroke(mask_rect.expand(HIGHLIGHT_OUTSET), THUMBNAIL_ROUNDING, drop_stroke, egui::StrokeKind::Outside);
     } else if matches!(shelf, Some(Asset::Filter(_))) && !layer.is_group() {
         painter.rect_stroke(rect, THUMBNAIL_ROUNDING, drop_stroke, egui::StrokeKind::Inside);
@@ -712,6 +712,9 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         }
         Some(Asset::SmartMask(smart_mask)) => {
             app.run("mask.smart.apply", json!({"name": smart_mask, "layer": layer.id.0}));
+        }
+        Some(Asset::SavedMask(path)) => {
+            app.run("mask.smart.apply", json!({"path": path, "layer": layer.id.0}));
         }
         Some(Asset::Filter(filter)) => {
             app.run("layer.select", json!({"layer": layer.id.0}));
@@ -1146,6 +1149,11 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
             app.toast(trf("Smart material saved to {path}", &[("path", &p)]), false);
             app.library = None;
         }
+        ui.close();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if ui.add_enabled(has_mask, egui::Button::new(tr("Create smart mask"))).clicked() {
+        crate::smart_mask_menu::save(app, layer, &crate::library_dir());
         ui.close();
     }
     ui.separator();

@@ -1,10 +1,15 @@
 //! Smart masks: procedural mask presets (generators and patterns driven by the baked mesh maps)
 //! that replace a layer's mask in one step. Smart materials build their masks from the same
-//! presets.
+//! presets. A user smart mask is a layer's mask saved to a `.tcmask` file (the `.tcraft`
+//! container holding one layer that carries the mask) and applied back like a preset.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 use texturecraft_core::{
-    BlendMode, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, Mask, MaskBackground, Procedural, ProceduralKind, Project, Projection, Source,
+    BlendMode, Effect, EffectKind, Filter, Generator, GeneratorKind, Layer, LayerId, LayerKind, Mask, MaskBackground, Procedural, ProceduralKind, Project,
+    Projection, Source,
 };
 
 use crate::commands::{CommandSpec, always, bad, has_layer, layer_param, strp};
@@ -13,11 +18,37 @@ use crate::{EngineError, Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        cmd!("mask.smart.apply", "Apply smart mask", [], None, "{name: smart mask id or label, layer?}", has_layer, apply_cmd),
+        cmd!(
+            "mask.smart.apply",
+            "Apply smart mask",
+            [],
+            None,
+            "{name: smart mask id or label, layer?} or {path: .tcmask file, layer?}",
+            has_layer,
+            apply_cmd
+        ),
+        cmd!(
+            "mask.smart.create",
+            "Create smart mask",
+            [],
+            None,
+            "{layer?, path: .tcmask file, name?} — saves the layer's mask (all effects, parameters, painted pixels and images) as a user smart mask",
+            has_mask,
+            create_cmd
+        ),
         cmd!("mask.smart.list", "List smart masks", [], None, "{}", always, |_, _| Ok(json!(
             SMART_MASKS.iter().map(|m| json!({"id": m.id, "label": m.label})).collect::<Vec<_>>()
         ))),
     ]
+}
+
+/// Smart mask file extension.
+pub const SMART_MASK_EXT: &str = "tcmask";
+
+fn has_mask(s: &Session) -> std::result::Result<(), String> {
+    let layer = s.selected_layer().ok_or("no layer selected")?;
+    let owner = s.doc.project.mask_owner(layer);
+    if s.doc.project.layer(owner).is_ok_and(|l| l.mask.is_some()) { Ok(()) } else { Err("the layer has no mask".into()) }
 }
 
 pub struct SmartMask {
@@ -173,11 +204,108 @@ pub fn apply(s: &mut Session, layer: LayerId, name: &str) -> Result<()> {
     })
 }
 
+impl Session {
+    /// Serialize layer `layer`'s mask (an instance without its own mask has its source's) as a user smart mask file named `name`.
+    pub fn smart_mask_bytes(&self, layer: LayerId, name: &str) -> Result<Vec<u8>> {
+        let owner = self.doc.project.mask_owner(layer);
+        let mask = self.doc.project.layer(owner)?.mask.clone().ok_or_else(|| EngineError::Other("the layer has no mask".into()))?;
+        let (ts, _, _) = self.doc.project.locate(owner).ok_or_else(|| EngineError::Other("layer not in a stack".into()))?;
+        let set = self.doc.project.texture_set(ts)?;
+        let mut mini = crate::material_lib::one_set_document(set, name);
+        let id = mini.project.alloc_id();
+        let mut holder = Layer::new(id, name, LayerKind::Paint, &set.channel_list());
+        // The mask comes back switched on whatever state it was saved in
+        holder.mask = Some(Mask { enabled: true, ..copy_mask(&self.doc, &mask, &mut mini, set.size()) });
+        mini.project.insert_layer(0, holder, None, false)?;
+        self.file_bytes(mini, id)
+    }
+
+    /// Replace layer `layer`'s mask with the one in a user smart mask file (one undo step).
+    pub fn apply_smart_mask_bytes(&mut self, layer: LayerId, bytes: &[u8]) -> Result<()> {
+        let pf = texturecraft_formats::load_project_bytes(bytes).map_err(|e| EngineError::Other(e.to_string()))?;
+        let mask = pf
+            .project
+            .texture_sets
+            .first()
+            .and_then(|t| t.stack.last().copied())
+            .and_then(|root| pf.project.layers.get(&root))
+            .and_then(|l| l.mask.clone())
+            .ok_or_else(|| EngineError::Other("the smart mask file has no mask".into()))?;
+        let resources: BTreeMap<String, Arc<Vec<u8>>> = pf.resources.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        let src = crate::session::Document { bake_paint: BTreeMap::new(), project: pf.project, pixels: pf.pixels, baked: BTreeMap::new(), resources: BTreeMap::new() };
+        let label = src.project.texture_sets.first().map(|t| t.name.clone()).unwrap_or_default();
+        self.edit(&format!("Apply smart mask {label}"), |s| {
+            let (ts, _, _) = s.doc.project.locate(layer).ok_or_else(|| EngineError::Other("layer not in a stack".into()))?;
+            let size = s.doc.project.texture_set(ts)?.size();
+            for (k, v) in &resources {
+                s.doc.resources.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            let new = copy_mask(&src, &mask, &mut s.doc, size);
+            let old = s.doc.project.layer_mut(layer)?.mask.replace(new);
+            for e in old.map(|m| m.effects).unwrap_or_default() {
+                s.doc.pixels.masks.remove(&e.id);
+            }
+            s.target = StackTarget::Mask;
+            Ok(())
+        })?;
+        self.sync_images();
+        Ok(())
+    }
+}
+
+/// `mask` of document `src` with fresh effect ids from `dst`, its painted pixels moved to `dst` at `size`.
+fn copy_mask(src: &crate::session::Document, mask: &Mask, dst: &mut crate::session::Document, size: (u32, u32)) -> Mask {
+    let mut copy = mask.clone();
+    for e in &mut copy.effects {
+        let old = e.id;
+        e.id = dst.project.alloc_id();
+        if let Some(img) = src.pixels.masks.get(&old) {
+            dst.pixels.masks.insert(e.id, crate::layer_ops::fit(img, size, &[0, 0]));
+        }
+    }
+    copy
+}
+
 fn apply_cmd(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = strp(p, "name").ok_or_else(|| bad("mask.smart.apply", "`name` is required"))?;
     let layer = layer_param(s, "mask.smart.apply", p)?;
-    apply(s, layer, name)?;
+    if let Some(path) = strp(p, "path") {
+        apply_file(s, layer, path)?;
+    } else {
+        let name = strp(p, "name").ok_or_else(|| bad("mask.smart.apply", "`name` or `path` is required"))?;
+        apply(s, layer, name)?;
+    }
     Ok(json!({ "layer": layer.0 }))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_file(s: &mut Session, layer: LayerId, path: &str) -> Result<()> {
+    let bytes = std::fs::read(path).map_err(|e| bad("mask.smart.apply", format!("cannot read {path}: {e}")))?;
+    s.apply_smart_mask_bytes(layer, &bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn apply_file(_: &mut Session, _: LayerId, _: &str) -> Result<()> {
+    Err(EngineError::Other("file paths are not available in the browser".into()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn create_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let layer = layer_param(s, "mask.smart.create", p)?;
+    let path = strp(p, "path").ok_or_else(|| bad("mask.smart.create", "`path` is required"))?;
+    let name = strp(p, "name").map(str::to_string).unwrap_or_else(|| s.doc.project.layer(layer).map(|l| l.name.clone()).unwrap_or_default());
+    let bytes = s.smart_mask_bytes(layer, &name)?;
+    let path = if path.ends_with(&format!(".{SMART_MASK_EXT}")) { path.to_string() } else { format!("{path}.{SMART_MASK_EXT}") };
+    if let Some(dir) = std::path::Path::new(&path).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| bad("mask.smart.create", format!("cannot create {}: {e}", dir.display())))?;
+    }
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| bad("mask.smart.create", format!("cannot write {path}: {e}")))?;
+    Ok(json!({ "path": path }))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn create_cmd(_: &mut Session, _: &Value) -> Result<Value> {
+    Err(EngineError::Other("file paths are not available in the browser".into()))
 }
 
 #[cfg(test)]
