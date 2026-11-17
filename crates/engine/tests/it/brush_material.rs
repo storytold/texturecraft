@@ -89,7 +89,8 @@ fn a_stroke_after_picking_a_material_paints_its_values_in_the_enabled_channels()
     let hit = s.pick(Vec2::new(200.0, 200.0), s.viewport).unwrap();
     let (x, y) = ((hit.uv.x * 256.0) as u32, (hit.uv.y * 256.0) as u32);
     let composite = &s.caches[0].composite;
-    let (colour, rough, metal) = (composite.value(Channel::BaseColor, x, y), composite.value(Channel::Roughness, x, y), composite.value(Channel::Metallic, x, y));
+    let (colour, rough, metal) =
+        (composite.value(Channel::BaseColor, x, y), composite.value(Channel::Roughness, x, y), composite.value(Channel::Metallic, x, y));
     let (want_colour, want_rough) = (value_of("copper", Channel::BaseColor), value_of("copper", Channel::Roughness));
     for i in 0..3 {
         assert!((colour[i] - want_colour[i]).abs() < 0.02, "{colour:?} vs {want_colour:?}");

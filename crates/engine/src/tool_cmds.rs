@@ -290,8 +290,9 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
     let color = color_param("tool.material", p, "color")?;
     let value = color_param("tool.material", p, "value")?;
     if let Some(id) = strp(p, "material") {
-        let values = crate::materials::brush_values(id)
-            .ok_or_else(|| bad("tool.material", format!("`{id}` is not a simple material (a brush paints plain values; add smart materials with material.apply)")))?;
+        let values = crate::materials::brush_values(id).ok_or_else(|| {
+            bad("tool.material", format!("`{id}` is not a simple material (a brush paints plain values; add smart materials with material.apply)"))
+        })?;
         // A channel the material does not set goes back to its default, so no value of the previous brush material stays; a normal map is painted flat
         for channel in Channel::ALL {
             if channel.kind() == texturecraft_core::ChannelKind::NormalMap {

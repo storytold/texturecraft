@@ -142,10 +142,14 @@ pub fn apply(app: &mut TextureCraftApp, asset: &Asset) {
 /// material a folder) at the top of the stack; everything else as a click
 fn apply_dropped(app: &mut TextureCraftApp, asset: &Asset) {
     match asset {
-        Asset::Material(id) => app.run("material.apply", json!({"material": id, "top": true})),
-        Asset::Library(path) => app.run("material.load", json!({"path": path, "top": true})),
-        _ => return apply(app, asset),
-    };
+        Asset::Material(id) => {
+            app.run("material.apply", json!({"material": id, "top": true}));
+        }
+        Asset::Library(path) => {
+            app.run("material.load", json!({"path": path, "top": true}));
+        }
+        _ => apply(app, asset),
+    }
 }
 
 /// The selected layer's name when it is a paint layer with nothing painted (in itself or in its
