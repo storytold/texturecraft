@@ -1,4 +1,4 @@
-//! The Alpha tab's Parameters group: hardness and the parameters every alpha shares, with Restore defaults
+//! The Alpha tab's Parameters group: hardness and the parameters every alpha shares, with the Parameters reset
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -26,11 +26,23 @@ fn app_with_brush(brush: BrushSettings) -> Harness<'static, TextureCraftApp> {
 }
 
 fn restore_defaults<'tree>(harness: &'tree Harness<'_, TextureCraftApp>) -> egui_kittest::Node<'tree> {
-    harness.get_by_role_and_label(egui::Role::Button, "Restore defaults")
+    harness.get_by_role_and_label(egui::Role::Button, "Parameters: Reset to defaults")
 }
 
 fn invert_checkbox<'tree>(harness: &'tree Harness<'_, TextureCraftApp>) -> Option<egui_kittest::Node<'tree>> {
     harness.query_all_by_role_and_label(egui::Role::CheckBox, "Invert").next()
+}
+
+/// Scrolls the checkbox into view and clicks it
+fn click_invert(harness: &mut Harness<'_, TextureCraftApp>) {
+    if let Some(node) = invert_checkbox(harness) {
+        node.scroll_to_me();
+    }
+    harness.run_steps(SETTLE_FRAMES);
+    if let Some(node) = invert_checkbox(harness) {
+        node.click();
+    }
+    harness.run_steps(SETTLE_FRAMES);
 }
 
 fn show_group(harness: &mut Harness<'_, TextureCraftApp>) {
@@ -70,18 +82,12 @@ fn the_invert_checkbox_sets_the_brush_parameter() {
     show_group(&mut harness);
     assert!(restore_defaults(&harness).accesskit_node().is_disabled(), "at the defaults there is nothing to restore");
 
-    if let Some(node) = invert_checkbox(&harness) {
-        node.click();
-    }
-    harness.run_steps(SETTLE_FRAMES);
+    click_invert(&mut harness);
 
     assert!(harness.state().session.tool.brush.alpha_params.invert);
     assert!(!restore_defaults(&harness).accesskit_node().is_disabled());
 
-    if let Some(node) = invert_checkbox(&harness) {
-        node.click();
-    }
-    harness.run_steps(SETTLE_FRAMES);
+    click_invert(&mut harness);
     assert_eq!(harness.state().session.tool.brush, BrushSettings::default());
 }
 

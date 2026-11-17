@@ -2014,13 +2014,15 @@ fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
     ui.label(RichText::new(tr("More in Assets > Alphas: click one, or drag it here")).size(10.0).color(tk.text_dim));
     crate::shelf::drop_target(app, ui, &zone.response, crate::shelf::DropZone::Brush);
-    section(ui, "sec_alpha_params", tr("Parameters"), true, |ui| alpha_parameters(&mut app.session.tool.brush, ui));
+    alpha_parameters(&mut app.session.tool.brush, ui);
     section(ui, "sec_text", tr("Text"), true, |ui| text_section(app, ui));
 }
 
-/// Hardness and the parameters every alpha shares, with a button that puts them back
+/// Hardness and the parameters every alpha shares, under a header whose reset puts them back
 fn alpha_parameters(brush: &mut BrushSettings, ui: &mut Ui) {
     let defaults = BrushSettings::default();
+    let at_defaults = brush.hardness == defaults.hardness && brush.alpha_params == defaults.alpha_params;
+    let round = brush.alpha == BrushAlpha::Round && brush.alpha_image.is_none() && brush.alpha_library.is_none();
     let percent_slider = |ui: &mut Ui, label: &str, value: &mut f32, min: f32, max: f32| {
         let mut percent = *value * 100.0;
         if slider(ui, label, &mut percent, min..=max, 0).changed() {
@@ -2028,19 +2030,17 @@ fn alpha_parameters(brush: &mut BrushSettings, ui: &mut Ui) {
         }
     };
 
-    percent_slider(ui, tr("Hardness"), &mut brush.hardness, 0.0, 99.9);
-    let params = &mut brush.alpha_params;
-    percent_slider(ui, tr("Size X"), &mut params.size_x, 5.0, 100.0);
-    percent_slider(ui, tr("Size Y"), &mut params.size_y, 5.0, 100.0);
+    let reset = section_with_reset(ui, "sec_alpha_params", tr("Parameters"), true, at_defaults, |ui| {
+        percent_slider(ui, tr("Hardness"), &mut brush.hardness, 0.0, 99.9);
+        percent_slider(ui, tr("Size X"), &mut brush.alpha_params.size_x, 5.0, 100.0);
+        percent_slider(ui, tr("Size Y"), &mut brush.alpha_params.size_y, 5.0, 100.0);
 
-    // Only the procedural Round shape has a roundness
-    let round = brush.alpha == BrushAlpha::Round && brush.alpha_image.is_none() && brush.alpha_library.is_none();
-    ui.add_enabled_ui(round, |ui| percent_slider(ui, tr("Roundness"), &mut brush.alpha_params.roundness, 0.0, 100.0));
-    slider(ui, tr("Contrast"), &mut brush.alpha_params.contrast, 1.0..=MAX_ALPHA_CONTRAST, 2);
-    ui.checkbox(&mut brush.alpha_params.invert, tr("Invert"));
-
-    let at_defaults = brush.hardness == defaults.hardness && brush.alpha_params == defaults.alpha_params;
-    if ui.add_enabled(!at_defaults, egui::Button::new(tr("Restore defaults"))).clicked() {
+        // Only the procedural Round shape has a roundness
+        ui.add_enabled_ui(round, |ui| percent_slider(ui, tr("Roundness"), &mut brush.alpha_params.roundness, 0.0, 100.0));
+        slider(ui, tr("Contrast"), &mut brush.alpha_params.contrast, 1.0..=MAX_ALPHA_CONTRAST, 2);
+        ui.checkbox(&mut brush.alpha_params.invert, tr("Invert"));
+    });
+    if reset {
         (brush.hardness, brush.alpha_params) = (defaults.hardness, defaults.alpha_params);
     }
     *brush = brush.sanitized();

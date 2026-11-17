@@ -1670,34 +1670,63 @@ fn adjust_brush(brush: &mut texturecraft_engine::paint::BrushSettings, right: bo
     }
 }
 
-pub(crate) fn brush_cursor(app: &TextureCraftApp, ui: &Ui, rect: Rect, position: Vec3, normal: Vec3, radius: f32) {
-    const CIRCLE_SEGMENTS: usize = 48;
+/// Segments of the brush outline and hardness ring
+const CURSOR_OUTLINE_SEGMENTS: usize = 48;
 
-    let tangent = normal.any_orthonormal_vector();
+/// The roundness the cursor shows: only the procedural Round alpha has one
+fn cursor_roundness(brush: &texturecraft_engine::paint::BrushSettings) -> f32 {
+    let round = brush.alpha == texturecraft_engine::paint::BrushAlpha::Round && brush.alpha_image.is_none() && brush.alpha_library.is_none();
+    if round { brush.alpha_params.roundness } else { 1.0 }
+}
+
+/// Whether the outline is a plain circle (equal sizes, full roundness), drawn as one
+fn cursor_is_circle(brush: &texturecraft_engine::paint::BrushSettings) -> bool {
+    brush.alpha_params.size_x == brush.alpha_params.size_y && cursor_roundness(brush) >= 1.0
+}
+
+/// The stamp's outline scaled by `scale` (the hardness ring's share of the radius), as points around the
+/// stamp center in a y-up frame in units of the stamp radius: the alpha's extent (Size X and Y), the
+/// squarer corners of a Round alpha with low roundness, then turned by the brush angle.
+fn cursor_outline(brush: &texturecraft_engine::paint::BrushSettings, scale: f32) -> Vec<Vec2> {
+    let params = brush.alpha_params;
+    let roundness = cursor_roundness(brush);
+    let (sin, cos) = brush.angle.to_radians().sin_cos();
+    (0..=CURSOR_OUTLINE_SEGMENTS)
+        .map(|segment| {
+            let angle = segment as f32 / CURSOR_OUTLINE_SEGMENTS as f32 * std::f32::consts::TAU;
+            let direction = Vec2::new(angle.cos(), angle.sin());
+
+            // Distance of the unit direction in the Round alpha's metric: between the square's and the circle's
+            let square = direction.x.abs().max(direction.y.abs());
+            let reach = 1.0 / (square + (1.0 - square) * roundness);
+            let point = direction * reach * scale * Vec2::new(params.size_x, params.size_y);
+            Vec2::new(point.x * cos - point.y * sin, point.x * sin + point.y * cos)
+        })
+        .collect()
+}
+
+pub(crate) fn brush_cursor(app: &TextureCraftApp, ui: &Ui, rect: Rect, position: Vec3, normal: Vec3, radius: f32) {
+    let brush = &app.session.tool.brush;
+
+    // The stamp's frame as the stroke builds it: the camera's up direction seen along the surface
+    let forward = app.session.camera.forward();
+    let camera_up = forward.cross(Vec3::Y).try_normalize().unwrap_or(Vec3::X).cross(forward);
+    let up = (camera_up - normal * normal.dot(camera_up)).try_normalize().unwrap_or_else(|| normal.any_orthonormal_vector());
+    let tangent = up.cross(normal).try_normalize().unwrap_or_else(|| normal.any_orthonormal_vector());
     let bitangent = normal.cross(tangent);
     let to_screen = |point: Vec3| project(app, rect, point);
-    let mut outline = Vec::with_capacity(CIRCLE_SEGMENTS + 1);
-    for segment in 0..=CIRCLE_SEGMENTS {
-        let angle = segment as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
-        if let Some(screen) = to_screen(position + (tangent * angle.cos() + bitangent * angle.sin()) * radius) {
-            outline.push(screen);
-        }
-    }
+    let ring = |scale: f32| -> Vec<Pos2> {
+        cursor_outline(brush, scale).into_iter().filter_map(|local| to_screen(position + (tangent * local.x + bitangent * local.y) * radius)).collect()
+    };
+    let outline = ring(1.0);
 
     let painter = ui.painter_at(rect);
     painter.add(egui::Shape::line(outline.clone(), Stroke::new(2.5, Color32::from_black_alpha(140))));
     painter.add(egui::Shape::line(outline, Stroke::new(1.2, Color32::from_white_alpha(230))));
 
-    let hardness = app.session.tool.brush.hardness;
+    let hardness = brush.hardness;
     if hardness > 0.05 {
-        let mut inner = Vec::new();
-        for segment in 0..=CIRCLE_SEGMENTS {
-            let angle = segment as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
-            if let Some(screen) = to_screen(position + (tangent * angle.cos() + bitangent * angle.sin()) * radius * hardness) {
-                inner.push(screen);
-            }
-        }
-        painter.add(egui::Shape::dashed_line(&inner, Stroke::new(1.0, Color32::from_white_alpha(120)), 3.0, 3.0));
+        painter.add(egui::Shape::dashed_line(&ring(hardness), Stroke::new(1.0, Color32::from_white_alpha(120)), 3.0, 3.0));
     }
 
     if let Some(center) = to_screen(position) {
@@ -1966,7 +1995,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         if pointer_in_view {
             ui.ctx().set_cursor_icon(egui::CursorIcon::None);
         }
-        brush_cursor_2d(&painter, cursor_center, radius_points, app.session.tool.brush.hardness);
+        brush_cursor_2d(&painter, cursor_center, radius_points, &app.session.tool.brush);
     }
     brush_readout(app, ui, &response, adjusting);
     view_header(app, ui, rect, "v2d");
@@ -1979,24 +2008,23 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
 /// Smallest visible 2D brush outline, in points
 const BRUSH_CURSOR_MIN_RADIUS_POINTS: f32 = 1.5;
 
-/// Hardness ring segments, balancing smoothness and per-frame shape work
-const BRUSH_CURSOR_RING_SEGMENTS: usize = 48;
-
 /// Smaller hardness rings overlap the center dot
 const BRUSH_CURSOR_MIN_RING_HARDNESS: f32 = 0.05;
 
 /// The brush outline and hardness ring around `center`, with `radius_points` in screen points
-fn brush_cursor_2d(painter: &egui::Painter, center: egui::Pos2, radius_points: f32, hardness: f32) {
-    painter.circle_stroke(center, radius_points, Stroke::new(2.5, Color32::from_black_alpha(140)));
-    painter.circle_stroke(center, radius_points, Stroke::new(1.2, Color32::from_white_alpha(230)));
-    if hardness > BRUSH_CURSOR_MIN_RING_HARDNESS {
-        let inner_ring: Vec<egui::Pos2> = (0..=BRUSH_CURSOR_RING_SEGMENTS)
-            .map(|point_index| {
-                let angle = point_index as f32 / BRUSH_CURSOR_RING_SEGMENTS as f32 * std::f32::consts::TAU;
-                center + vec2(angle.cos(), angle.sin()) * radius_points * hardness
-            })
-            .collect();
-        painter.add(egui::Shape::dashed_line(&inner_ring, Stroke::new(1.0, Color32::from_white_alpha(120)), 3.0, 3.0));
+fn brush_cursor_2d(painter: &egui::Painter, center: egui::Pos2, radius_points: f32, brush: &texturecraft_engine::paint::BrushSettings) {
+    let ring = |scale: f32| -> Vec<Pos2> { cursor_outline(brush, scale).into_iter().map(|local| center + vec2(local.x, -local.y) * radius_points).collect() };
+    if cursor_is_circle(brush) {
+        let radius = radius_points * brush.alpha_params.size_x;
+        painter.circle_stroke(center, radius, Stroke::new(2.5, Color32::from_black_alpha(140)));
+        painter.circle_stroke(center, radius, Stroke::new(1.2, Color32::from_white_alpha(230)));
+    } else {
+        let outline = ring(1.0);
+        painter.add(egui::Shape::line(outline.clone(), Stroke::new(2.5, Color32::from_black_alpha(140))));
+        painter.add(egui::Shape::line(outline, Stroke::new(1.2, Color32::from_white_alpha(230))));
+    }
+    if brush.hardness > BRUSH_CURSOR_MIN_RING_HARDNESS {
+        painter.add(egui::Shape::dashed_line(&ring(brush.hardness), Stroke::new(1.0, Color32::from_white_alpha(120)), 3.0, 3.0));
     }
     painter.circle_filled(center, 1.5, Color32::WHITE);
 }
@@ -2103,6 +2131,34 @@ fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, t
 #[cfg(test)]
 mod tests {
     use super::*;
+    use texturecraft_engine::paint::{AlphaParams, BrushAlpha, BrushSettings};
+
+    fn extent(points: &[Vec2]) -> Vec2 {
+        let (low, high) = points.iter().fold((Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)), |(low, high), point| (low.min(*point), high.max(*point)));
+        high - low
+    }
+
+    #[test]
+    fn the_cursor_outline_follows_size_roundness_and_angle() {
+        let plain = cursor_outline(&BrushSettings::default(), 1.0);
+        assert!(extent(&plain).abs_diff_eq(Vec2::splat(2.0), 1e-3), "a circle at the defaults: {:?}", extent(&plain));
+        assert!(plain.iter().all(|point| (point.length() - 1.0).abs() < 1e-3));
+
+        let params = AlphaParams { size_x: 0.5, size_y: 0.25, ..AlphaParams::default() };
+        let narrow = BrushSettings { alpha_params: params, ..BrushSettings::default() };
+        assert!(extent(&cursor_outline(&narrow, 1.0)).abs_diff_eq(Vec2::new(1.0, 0.5), 1e-3));
+        assert!(extent(&cursor_outline(&narrow, 0.5)).abs_diff_eq(Vec2::new(0.5, 0.25), 1e-3), "the hardness ring scales with it");
+
+        let turned = BrushSettings { angle: 90.0, ..narrow.clone() };
+        assert!(extent(&cursor_outline(&turned, 1.0)).abs_diff_eq(Vec2::new(0.5, 1.0), 1e-3), "the brush angle turns the extent");
+
+        let square = BrushSettings { alpha_params: AlphaParams { roundness: 0.0, ..AlphaParams::default() }, ..BrushSettings::default() };
+        let corner = cursor_outline(&square, 1.0).into_iter().map(Vec2::length).fold(0.0, f32::max);
+        assert!((corner - 2f32.sqrt()).abs() < 0.05, "roundness 0 reaches the corners: {corner}");
+
+        let star = BrushSettings { alpha: BrushAlpha::Star, ..square };
+        assert!(cursor_outline(&star, 1.0).iter().all(|point| (point.length() - 1.0).abs() < 1e-3), "only the Round alpha has a roundness");
+    }
 
     #[test]
     fn unavailable_tools_finish_strokes_and_box_fills() {
