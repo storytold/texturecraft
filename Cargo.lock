@@ -960,7 +960,7 @@ dependencies = [
 [[package]]
 name = "craft-zip"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=6128eabbfb98e5fe486fa7ee4413724e2a4ca908#6128eabbfb98e5fe486fa7ee4413724e2a4ca908"
+source = "git+https://github.com/storytold/craft-libs?rev=5631e99fe126cffb74c673eb458db04299f2bb9b#5631e99fe126cffb74c673eb458db04299f2bb9b"
 dependencies = [
  "flate2",
  "thiserror 2.0.21",
@@ -4484,7 +4484,7 @@ dependencies = [
  "craft-mesh",
  "craft-tcraft",
  "craft-usd",
- "craft-zip 0.1.0 (git+https://github.com/storytold/craft-libs?rev=6128eabbfb98e5fe486fa7ee4413724e2a4ca908)",
+ "craft-zip 0.1.0 (git+https://github.com/storytold/craft-libs?rev=5631e99fe126cffb74c673eb458db04299f2bb9b)",
  "craft-zip 0.1.0 (git+https://github.com/storytold/craft-libs?rev=c376774f15ae7cd3b06a7ac664f01a8645af4b83)",
  "exr",
  "flate2",
