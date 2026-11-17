@@ -1719,7 +1719,7 @@ fn smudge_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.add_space(4.0);
     ui.label(tr("Channels dragged"));
     material_channel_chips(app, ui);
-    ui.label(RichText::new(tr("These are the brush's material channels, the same ones Paint writes and the Material tab shows.")).size(10.5).color(tk.text_dim));
+    ui.label(RichText::new(tr("These are the brush's material channels, the same ones Paint writes and the Material tab shows. A channel the selected layer does not have is skipped.")).size(10.5).color(tk.text_dim));
 }
 
 fn path_section(app: &mut TextureCraftApp, ui: &mut Ui) {
