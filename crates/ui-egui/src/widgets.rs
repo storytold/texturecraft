@@ -441,28 +441,39 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
         }
     });
     let mut hex_buf = ui.data(|d| d.get_temp::<String>(id.with("hex"))).unwrap_or_else(|| format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]));
+    let mut hex_edited = ui.data(|d| d.get_temp::<bool>(id.with("hex_edited"))).unwrap_or(false);
     ui.horizontal(|ui| {
         let hex_label = ui.label(crate::i18n::tr("Hex"));
         let resp = ui.add(egui::TextEdit::singleline(&mut hex_buf).char_limit(32).desired_width(120.0)).labelled_by(hex_label.id);
+        if resp.changed() {
+            hex_edited = true;
+        }
         let enter = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let lost_focus = resp.lost_focus();
         let parsed = parse_hex_color(&hex_buf);
         let is_six = is_six_digit_hex(&hex_buf);
 
-        if ((resp.changed() && is_six) || enter || lost_focus)
+        if ((resp.changed() && is_six) || enter || (lost_focus && hex_edited))
             && let Some(parsed_color) = parsed
         {
-            srgb = parsed_color;
-            typed = true;
+            if parsed_color != srgb {
+                srgb = parsed_color;
+                typed = true;
+            }
+            hex_edited = false;
         }
 
         if !resp.has_focus() {
             hex_buf = format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]);
+            hex_edited = false;
         } else if parsed.is_none() && !hex_buf.trim().is_empty() && hex_buf.trim() != "#" {
             ui.painter().rect_stroke(resp.rect, 2.0, egui::Stroke::new(1.0, tk.warning), egui::StrokeKind::Outside);
             let _ = resp.on_hover_text(crate::i18n::tr("Invalid color format (use #RRGGBB, #RGB or R, G, B)"));
         }
-        ui.data_mut(|d| d.insert_temp(id.with("hex"), hex_buf.clone()));
+        ui.data_mut(|d| {
+            d.insert_temp(id.with("hex"), hex_buf.clone());
+            d.insert_temp(id.with("hex_edited"), hex_edited);
+        });
         if icon_button(ui, egui_phosphor::regular::COPY, crate::i18n::tr("Copy Hex code"), false, 20.0).clicked() {
             ui.copy_text(format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]));
         }

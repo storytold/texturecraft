@@ -123,6 +123,26 @@ fn hex_intermediate_typing_does_not_commit_partial_colors() {
 }
 
 #[test]
+fn focus_loss_without_editing_does_not_overwrite_color_changes() {
+    let mut h = open_picker([1.0, 0.0, 0.0]);
+    let hex_field = h.get_all_by_role(Role::TextInput).next().unwrap();
+    hex_field.focus();
+    h.run_steps(2);
+
+    // Modify color externally while field is focused
+    *h.state_mut() = [0.0, 1.0, 0.0];
+    h.run_steps(1);
+
+    // Click outside or lose focus without editing hex_buf
+    let square = h.get_by_role(Role::Canvas);
+    square.click();
+    h.run_steps(3);
+
+    let [r, g, b] = *h.state();
+    assert!(g > 0.9 && r < 0.05, "unmodified hex buffer on focus loss must not overwrite external color change: {:?}", h.state());
+}
+
+#[test]
 fn parse_hex_color_supports_hex_formats_and_rgb_strings() {
     use texturecraft_ui_egui::widgets::parse_hex_color;
 
