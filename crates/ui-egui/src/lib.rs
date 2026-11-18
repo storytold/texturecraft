@@ -845,7 +845,7 @@ impl eframe::App for TextureCraftApp {
         #[cfg(not(target_arch = "wasm32"))]
         self.autosave(now);
         i18n::set_language(&self.ui.prefs.language);
-        let dir = craft_ui::direction::resolve(&self.ui.prefs.language, craft_ui::direction::Setting::Language);
+        let dir = craft_ui::direction::resolve(i18n::current().code, craft_ui::direction::Setting::Language);
         craft_ui::direction::apply(ctx, dir);
         let width = if ctx.content_rect().width() > 0.0 { ctx.content_rect().width() } else { crate::docking::DEFAULT_WINDOW_WIDTH };
         self.ui.sync_dock_direction(dir == craft_ui::direction::Direction::Rtl, width);

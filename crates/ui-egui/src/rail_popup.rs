@@ -167,10 +167,10 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
     let tokens = Tokens::get(ctx);
     let frame = egui::Frame::popup(&ctx.global_style()).fill(tokens.panel).stroke(egui::Stroke::new(1.0, tokens.accent));
-    let (top_right, width) = placement(ctx, strip, icon);
+    let (pos, width, pivot) = placement(ctx, strip, icon, app.ui.docks_rtl);
     let mut closed = false;
     let mut dragged_from = None;
-    egui::Area::new(area_id()).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_TOP).fixed_pos(top_right).show(ctx, |ui| {
+    egui::Area::new(area_id()).order(egui::Order::Foreground).pivot(pivot).fixed_pos(pos).show(ctx, |ui| {
         frame.show(ui, |ui| {
             ui.set_width(width - frame.total_margin().sum().x);
             let title_top = ui.cursor().top();
@@ -194,12 +194,18 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     }
 }
 
-/// The popup's top right corner, beside the rail and level with its icon, and its width (egui keeps the area on screen)
-fn placement(ctx: &egui::Context, strip: Rect, icon: Rect) -> (Pos2, f32) {
-    let right = strip.left() - RAIL_GAP;
+/// The popup's anchor corner, beside the rail and level with its icon, its width, and pivot (egui keeps the area on screen)
+fn placement(ctx: &egui::Context, strip: Rect, icon: Rect, rtl: bool) -> (Pos2, f32, egui::Align2) {
     let viewport = ctx.data(|data| data.get_temp::<Rect>(viewport_id()));
-    let width = viewport.map_or(POPUP_MIN_WIDTH, |viewport| right - (viewport.right() - VIEWPORT_OVERHANG)).max(POPUP_MIN_WIDTH);
-    (Pos2::new(right, icon.top()), width)
+    if rtl {
+        let left = strip.right() + RAIL_GAP;
+        let width = viewport.map_or(POPUP_MIN_WIDTH, |vp| (vp.left() + VIEWPORT_OVERHANG) - left).max(POPUP_MIN_WIDTH);
+        (Pos2::new(left, icon.top()), width, egui::Align2::LEFT_TOP)
+    } else {
+        let right = strip.left() - RAIL_GAP;
+        let width = viewport.map_or(POPUP_MIN_WIDTH, |vp| right - (vp.right() - VIEWPORT_OVERHANG)).max(POPUP_MIN_WIDTH);
+        (Pos2::new(right, icon.top()), width, egui::Align2::RIGHT_TOP)
+    }
 }
 
 /// A press outside the popup and the rail, unless in one of the popup's own dropdowns
@@ -238,4 +244,24 @@ fn title_row(ui: &mut Ui, tokens: &Tokens, panel: Panel) -> (bool, Option<Rect>)
     let title = Rect::from_min_max(row.min, egui::pos2(close.rect.left(), row.bottom()));
     let drag = ui.interact(title, ui.scope_id().with("rail_popup_title"), Sense::drag()).on_hover_cursor(egui::CursorIcon::Grab);
     (close.clicked(), drag.drag_started().then_some(title))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placement_in_rtl_positions_to_the_right_of_left_strip() {
+        let ctx = egui::Context::default();
+        let strip = Rect::from_min_max(Pos2::new(0.0, 30.0), Pos2::new(40.0, 900.0));
+        let icon = Rect::from_min_max(Pos2::new(4.0, 100.0), Pos2::new(36.0, 132.0));
+        let viewport = Rect::from_min_max(Pos2::new(400.0, 30.0), Pos2::new(1200.0, 900.0));
+        remember_viewport(&ctx, viewport);
+
+        let (pos, width, pivot) = placement(&ctx, strip, icon, true);
+        assert_eq!(pivot, egui::Align2::LEFT_TOP, "RTL popup must pivot LEFT_TOP");
+        assert_eq!(pos.x, strip.right() + RAIL_GAP, "RTL popup must start at strip.right() + RAIL_GAP");
+        assert_eq!(pos.y, icon.top());
+        assert!(width >= POPUP_MIN_WIDTH);
+    }
 }
