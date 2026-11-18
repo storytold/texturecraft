@@ -87,6 +87,7 @@ fn view_params(view: ViewMode) -> Value {
         ViewMode::Channel(channel) => json!({"mode": channel.id()}),
         ViewMode::MeshMap(map) => json!({"mode": format!("map:{}", map.id())}),
         ViewMode::UvChecker => json!({"mode": "uvChecker"}),
+        ViewMode::NormalHeightMesh => json!({"mode": "normalHeightMesh"}),
         ViewMode::Mask(layer) => json!({"mode": "mask", "layer": layer.0}),
     }
 }

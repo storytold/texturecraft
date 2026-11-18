@@ -24,6 +24,33 @@ pub fn specs() -> Vec<CommandSpec> {
             has_layer,
             add_color_mask
         ),
+        cmd!(
+            "mask.add.bitmap",
+            "Add bitmap mask",
+            ["Layers", "Mask"],
+            None,
+            "{layer?, image: image resource name (resource.list)} — a mask drawn by that image",
+            has_layer,
+            add_bitmap_mask
+        ),
+        cmd!(
+            "mask.copy",
+            "Copy mask",
+            ["Layers", "Mask"],
+            Some("Ctrl+Alt+C"),
+            "{layer?} — the layer's mask (an instance's source's unless it has its own), painted pixels included",
+            has_layer,
+            copy_mask
+        ),
+        cmd!(
+            "mask.paste",
+            "Paste into mask",
+            ["Layers", "Mask"],
+            Some("Ctrl+Alt+V"),
+            "{layer?} — the copied mask replaces the layer's mask, resampled to its texture set",
+            can_paste_mask,
+            paste_mask
+        ),
         cmd!("mask.toggle", "Toggle mask", ["Layers", "Mask"], None, "{layer?, enabled?}", has_layer, toggle),
         cmd!("mask.invertBackground", "Invert mask background", ["Layers", "Mask"], None, "{layer?}", has_layer, invert_background),
         cmd!("mask.invert", "Invert mask", ["Layers", "Mask"], None, "{layer?}", has_layer, invert),
@@ -135,6 +162,76 @@ fn add_mask(s: &mut Session, p: &Value, bg: MaskBackground) -> Result<Value> {
         }
         l.mask = Some(Mask::new(bg));
         s.target = StackTarget::Mask;
+        Ok(())
+    })?;
+    Ok(Value::Null)
+}
+
+fn add_bitmap_mask(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = strp(p, "image").ok_or_else(|| bad("mask.add.bitmap", "`image` (an image resource name) is required"))?;
+    let source = image_source(s, "mask.add.bitmap", name)?;
+    let eid = with_mask(s, p, "mask.add.bitmap", "Add bitmap mask", |s, id| {
+        let eid = s.doc.project.alloc_id();
+        let l = s.doc.project.layer_mut(id)?;
+        if l.mask.is_some() {
+            return Err(EngineError::Other(format!("\"{}\" already has a mask", l.name)));
+        }
+        let mut mask = Mask::new(MaskBackground::Black);
+        let mut fill = Effect::new(eid, EffectKind::Fill { source, projection: Default::default() });
+        fill.name = name.to_string();
+        mask.effects.push(fill);
+        l.mask = Some(mask);
+        s.target = StackTarget::Effect(eid);
+        Ok(eid)
+    })?;
+    Ok(json!({ "effect": eid.0 }))
+}
+
+fn can_paste_mask(s: &Session) -> std::result::Result<(), String> {
+    let Some((doc, id)) = &s.mask_clipboard else { return Err("no mask copied (mask.copy)".into()) };
+    if !doc.project.layers.get(id).is_some_and(|l| l.mask.is_some()) {
+        return Err("the copied mask is gone".into());
+    }
+    s.selected_layer().map(|_| ()).ok_or_else(|| "no layer selected".into())
+}
+
+fn copy_mask(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = layer_param(s, "mask.copy", p)?;
+    let owner = s.doc.project.mask_owner(id);
+    if s.doc.project.layer(owner)?.mask.is_none() {
+        return Err(bad("mask.copy", "the layer has no mask"));
+    }
+    s.mask_clipboard = Some((s.doc.clone(), owner));
+    Ok(json!({ "copied": owner.0 }))
+}
+
+fn paste_mask(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "mask.paste";
+    let (src, from) = s.mask_clipboard.clone().ok_or_else(|| bad(CMD, "no mask copied (mask.copy)"))?;
+    let mut mask = src.project.layers.get(&from).and_then(|l| l.mask.clone()).ok_or_else(|| bad(CMD, "the copied mask is gone"))?;
+    let id = layer_param(s, CMD, p)?;
+    let owner = s.doc.project.mask_owner(id);
+    for effect in &mask.effects {
+        for (anchor, channel) in effect.kind.anchors_read() {
+            anchor_source(s, CMD, owner, anchor, channel)?;
+        }
+    }
+    s.edit("Paste into mask", |s| {
+        let (ts, _, _) = s.doc.project.locate(owner).ok_or_else(|| bad(CMD, "the layer is not in a stack"))?;
+        let size = s.doc.project.texture_set(ts)?.size();
+        let old = s.doc.project.layer_mut(owner)?.mask.take();
+        for effect in old.iter().flat_map(|m| m.effects.iter()) {
+            s.doc.pixels.masks.remove(&effect.id);
+        }
+        for effect in &mut mask.effects {
+            let copied = effect.id;
+            effect.id = s.doc.project.alloc_id();
+            if let Some(image) = src.pixels.masks.get(&copied) {
+                s.doc.pixels.masks.insert(effect.id, crate::layer_ops::fit(image, size, &[0, 0]));
+            }
+        }
+        s.doc.project.layer_mut(owner)?.mask = Some(mask);
+        s.target = StackTarget::Content;
         Ok(())
     })?;
     Ok(Value::Null)

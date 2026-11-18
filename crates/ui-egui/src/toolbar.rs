@@ -76,8 +76,8 @@ pub fn paint_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 
 /// Width of `view_buttons`, so the bar knows when to move them into the scrolling strip
 fn view_buttons_width(button_size: f32, spacing: f32) -> f32 {
-    // Two icons, two dropdowns, one separator and the four gaps between them
-    2.0 * button_size + 2.0 * icon_dropdown_button_width(button_size) + BAR_SEPARATOR_WIDTH + 4.0 * spacing
+    // Four icons, three dropdowns, two separators and the eight gaps between them
+    4.0 * button_size + 3.0 * icon_dropdown_button_width(button_size) + 2.0 * BAR_SEPARATOR_WIDTH + 8.0 * spacing
 }
 
 /// View buttons in a right-to-left layout: the layout, then the camera type, then the screenshot and UV checker
@@ -97,13 +97,41 @@ fn view_buttons(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
         if icon_button(ui, ic::CAMERA, tr("Screenshot of the viewport"), false, button_size).clicked() {
             app.toast(tr("Use the control channel or `texturecraft-cli render` for screenshots"), false);
         }
+        hide_excluded_button(app, ui, button_size);
     });
     ui.add(egui::Separator::default().spacing(BAR_SEPARATOR_WIDTH));
-    ui.add_enabled_ui(project_open, |ui| projection_dropdown(app, ui));
+    ui.add_enabled_ui(project_open, |ui| {
+        rotation_dropdown(app, ui);
+        projection_dropdown(app, ui);
+    });
     layout_dropdown(app, ui);
+    ui.add(egui::Separator::default().spacing(BAR_SEPARATOR_WIDTH));
+    pause_button(app, ui, button_size);
 }
 
-/// The 3D/2D, 3D-only and 2D-only layouts, showing the current one's icon
+/// Pause Engine Computation: works without a project, and shows the paused state
+fn pause_button(app: &mut TextureCraftApp, ui: &mut egui::Ui, button_size: f32) {
+    let tooltip = tip(
+        &app.ui.keymap,
+        tr("Pause Engine Computation \u{2014} When the engine is paused, textures are not computed or updated in the layer stack or the viewport."),
+        "viewport.pauseEngine",
+    );
+    if icon_button(ui, ic::PAUSE, &tooltip, app.session.paused, button_size).clicked() {
+        crate::menus::invoke(app, &ui.ctx().clone(), "viewport.pauseEngine");
+    }
+}
+
+/// Hide the parts the selected layer's geometry mask excludes and paint through them (Alt+H)
+fn hide_excluded_button(app: &mut TextureCraftApp, ui: &mut egui::Ui, button_size: f32) {
+    let on = app.session.hide_excluded;
+    let tooltip =
+        tip(&app.ui.keymap, tr("Hides geometry excluded in the geometry mask. While enabled, brush strokes paint through geometry."), "viewport.hideExcluded");
+    if icon_button(ui, ic::EYE_SLASH, &tooltip, on, button_size).clicked() {
+        app.run("viewport.hideExcluded", json!({}));
+    }
+}
+
+/// The 3D/2D, 3D-only and 2D-only layouts and the swap, showing the current one's icon
 fn layout_dropdown(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     const LAYOUTS: [(ViewLayout, &str, &str, &str); 3] = [
         (ViewLayout::Split, ic::SQUARE_SPLIT_HORIZONTAL, "3D/2D views", "ui.layout.split"),
@@ -119,6 +147,9 @@ fn layout_dropdown(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
             if dropdown_row(ui, icon, tr(label), shortcut_of(&app.ui.keymap, command), app.ui.layout == layout) {
                 chosen = Some(command);
             }
+        }
+        if dropdown_row(ui, ic::ARROWS_LEFT_RIGHT, tr("Swap 3D/2D"), shortcut_of(&app.ui.keymap, "ui.layout.swap"), false) {
+            chosen = Some("ui.layout.swap");
         }
     });
 
@@ -143,6 +174,28 @@ fn projection_dropdown(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 
     if let Some(choice) = chosen.filter(|choice| *choice != ortho) {
         app.run("camera.set", json!({"ortho": choice}));
+    }
+}
+
+/// Constrained (horizon stays level) or free (trackball) camera rotation
+fn rotation_dropdown(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    let modes = [
+        (false, ic::ARROWS_HORIZONTAL, "Constrained rotation", "camera.rotation.constrained"),
+        (true, ic::ARROWS_CLOCKWISE, "Free rotation", "camera.rotation.free"),
+    ];
+    let free = app.session.camera.free;
+    let (_, icon, label, _) = modes.iter().find(|(choice, ..)| *choice == free).unwrap_or(&modes[0]);
+    let mut chosen = None;
+    icon_dropdown(ui, "view_rotation", icon, tr(label), |ui| {
+        for (choice, icon, label, command) in modes {
+            if dropdown_row(ui, icon, tr(label), shortcut_of(&app.ui.keymap, command), free == choice) {
+                chosen = Some(command);
+            }
+        }
+    });
+
+    if let Some(command) = chosen {
+        crate::menus::invoke(app, &ui.ctx().clone(), command);
     }
 }
 
@@ -352,6 +405,7 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let (closed, fill) = (path.closed, path.fill);
     let selected = path.selected.is_some_and(|i| i < path.points.len());
     let has_points = !path.points.is_empty();
+    let can_reverse = path.points.len() >= 2;
     let corner = path.selected.is_some_and(|i| path.is_corner(i));
     if icon_button(ui, ic::POLYGON, tr("Closed path"), closed, button_size).clicked() {
         app.session.set_path_closed(!closed);
@@ -369,6 +423,11 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 
     if ui.add_enabled_ui(selected, |ui| icon_button(ui, ic::BACKSPACE, tr("Remove point"), false, button_size)).inner.clicked() {
         app.session.remove_selected_path_point();
+    }
+
+    if ui.add_enabled_ui(can_reverse, |ui| icon_button(ui, ic::ARROWS_LEFT_RIGHT, tr("Reverse path direction"), false, button_size)).inner.clicked() {
+        // The command repaints an edited path and is one undo step
+        app.run("path.reverse", json!({}));
     }
 
     if ui.add_enabled_ui(has_points, |ui| icon_button(ui, ic::CHECK, tr("Apply"), false, button_size)).inner.clicked() {
@@ -476,16 +535,13 @@ const RAIL_ICON_GAP: f32 = 4.0;
 /// Padding inside the rail's card around its icons, as the tool shelf's
 const RAIL_CARD_PADDING: egui::Margin = egui::Margin::symmetric(3, 6);
 
-/// The icon rail: Export, then the rail panels that are not in the dock, each opening its popup
+/// The icon rail: the rail panels that are not in the dock (Export first), each opening its popup
 pub fn rail(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let tokens = Tokens::get(ui.ctx());
     egui::Panel::right("rail").resizable(false).exact_size(RAIL_WIDTH).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
         card(ui, &tokens, egui::Margin { left: 0, right: GUTTER, top: GUTTER, bottom: GUTTER }, RAIL_CARD_PADDING, |ui| {
             ui.spacing_mut().item_spacing.y = RAIL_ICON_GAP;
             crate::rail_popup::begin_rail(ui.ctx(), ui.max_rect());
-            if icon_button(ui, ic::EXPORT, &tip(&app.ui.keymap, tr("Export textures"), "ui.export"), app.ui.windows.export, RAIL_ICON_SIZE).clicked() {
-                app.ui.windows.export = !app.ui.windows.export;
-            }
 
             // A panel in the dock, docked or floating, leaves the rail until it is closed there
             for (panel, icon, id) in crate::rail_popup::RAIL_PANELS {

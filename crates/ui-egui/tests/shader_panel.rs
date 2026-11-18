@@ -23,7 +23,7 @@ fn shader_settings_leave_the_height_strength_to_the_texture_set_settings() {
     harness.state_mut().ui.dock.focus(Panel::Shader);
     harness.run_steps(STARTUP_FRAMES);
 
-    assert!(harness.query_by_label("AO intensity").is_some(), "the Shader Settings panel is shown");
+    assert!(harness.query_by_label("AO Intensity").is_some(), "the Shader Settings panel is shown");
     // Texture Set Settings, the slider's other home, sits behind Layers in the default layout, so any match is in Shader Settings
     assert!(!harness.state().ui.dock.is_visible(Panel::TextureSetSettings), "Texture Set Settings is behind Layers");
     assert!(harness.query_by_label("Height to normal strength").is_none());

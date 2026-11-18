@@ -857,3 +857,39 @@ fn tile_generator_gradient_map_snapshot() {
     assert!(harness.query_by_label_contains("Add color").is_some());
     save(&mut harness, &output_dir, "tile-generator-gradient-map");
 }
+
+/// Edit > Settings: the General page, then the Shortcuts and Libraries pages
+#[test]
+#[ignore]
+fn settings_pages_snapshot() {
+    use texturecraft_ui_egui::settings_window::SettingsPage;
+
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session = texturecraft_engine::sample_session(128, 32).unwrap();
+    let mut harness =
+        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    harness.state_mut().ui.prefs.language = "en".into();
+    harness.state_mut().ui.windows.settings = true;
+    save(&mut harness, &output_dir, "settings-general");
+
+    // The rest of the General page, a page height further down each time
+    let page = harness.get_by_label("INTERFACE OPTIONS").rect().center() + egui::vec2(150.0, 100.0);
+    for part in 2..=4 {
+        harness.hover_at(page);
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -480.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+        });
+        save(&mut harness, &output_dir, &format!("settings-general-{part}"));
+    }
+    for (page, name) in [(SettingsPage::Shortcuts, "settings-shortcuts"), (SettingsPage::Libraries, "settings-libraries")] {
+        if let Some(draft) = harness.state_mut().ui.windows.settings_draft.as_mut() {
+            draft.page = page;
+        }
+        save(&mut harness, &output_dir, name);
+    }
+}

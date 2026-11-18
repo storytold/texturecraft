@@ -830,3 +830,65 @@ fn paths_saved_without_corner_flags_load_smooth() {
     assert!(!s.path_live().unwrap(), "a loaded smooth path matches what is stored");
     assert_eq!(s.doc.pixels.layers, pixels.layers);
 }
+
+/// Reversing swaps the points and their corner flags together and the selection follows its point; it is not a change for fewer than two points
+#[test]
+fn reversing_a_path_state_swaps_points_flags_and_selection() {
+    let mut s = session(wall());
+    let pts = [[0.1, 0.2], [0.3, 0.8], [0.5, 0.4], [0.9, 0.5]];
+    execute(&mut s, "tool.path", &json!({"uvPoints": pts, "corners": [false, true, false, false]})).unwrap();
+    s.select_path_point(1);
+    assert!(s.reverse_path());
+    let got: Vec<[f32; 2]> = s.tool.path.points.iter().map(|p| [p.x, p.y]).collect();
+    assert_eq!(got, vec![[0.9, 0.5], [0.5, 0.4], [0.3, 0.8], [0.1, 0.2]]);
+    assert_eq!(s.tool.path.corner_flags(), vec![false, false, true, false]);
+    assert_eq!(s.tool.path.selected, Some(2));
+    assert!(s.tool.path.is_corner(2), "the selected point is still the corner");
+
+    // One undo step brings the old order back
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.tool.path.points[0], Vec3::new(0.1, 0.2, 0.0));
+    assert_eq!(s.tool.path.corner_flags(), vec![false, true, false, false]);
+
+    // A smooth path stays smooth; one point or none cannot be reversed
+    execute(&mut s, "tool.path", &json!({"uvPoints": pts, "clear": true})).unwrap();
+    execute(&mut s, "path.reverse", &json!({})).unwrap();
+    assert!(s.tool.path.corners.is_empty());
+    execute(&mut s, "tool.path", &json!({"uvPoints": [[0.5, 0.5]], "clear": true})).unwrap();
+    assert!(execute(&mut s, "path.reverse", &json!({})).is_err());
+    assert!(!s.reverse_path());
+}
+
+/// A stored path being edited reverses in one undo step and repaints from the other end (a star brush that follows the path points the other way)
+#[test]
+fn reversing_a_stored_path_repaints_from_the_other_end_in_one_undo_step() {
+    let mut s = session(wall());
+    execute(&mut s, "tool.brush", &json!({"size": 20, "alpha": "Star", "followPath": true, "spacing": 200})).unwrap();
+    let report =
+        execute(&mut s, "tool.path", &json!({"uvPoints": [[0.2, 0.3], [0.5, 0.7], [0.8, 0.3]], "corners": [false, true, false], "commit": true})).unwrap();
+    let effect = texturecraft_engine::core::LayerId(report["committed"]["effect"].as_u64().unwrap());
+    execute(&mut s, "path.edit", &json!({"effect": effect.0, "index": 0})).unwrap();
+    let forward = s.doc.pixels.clone();
+    let stored = s.paths(effect).unwrap()[0].clone();
+    let history = s.history_labels().len();
+
+    execute(&mut s, "path.reverse", &json!({})).unwrap();
+    let reversed = s.paths(effect).unwrap()[0].clone();
+    let mut expected: Vec<[f32; 3]> = stored.points.clone();
+    expected.reverse();
+    assert_eq!(reversed.points, expected);
+    assert_eq!(reversed.corners, vec![false, true, false]);
+    assert_ne!(s.doc.pixels.layers, forward.layers, "the stamps run the other way");
+    let reversed_pixels = s.doc.pixels.clone();
+    assert_eq!(s.history_labels().len(), history + 1);
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.paths(effect).unwrap()[0].points, stored.points);
+    assert_eq!(s.doc.pixels.layers, forward.layers);
+    execute(&mut s, "edit.redo", &Value::Null).unwrap();
+    assert_eq!(s.doc.pixels.layers, reversed_pixels.layers);
+
+    // Reversing again returns the original paint
+    execute(&mut s, "path.reverse", &json!({})).unwrap();
+    assert_eq!(s.doc.pixels.layers, forward.layers);
+}

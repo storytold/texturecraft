@@ -26,7 +26,9 @@ pub mod text;
 pub mod visibility;
 
 pub use alpha_params::AlphaParams;
-pub use brush::{Alignment, BrushAlpha, BrushSettings, FULL_TURN_DEGREES, MAX_RADIAL_COPIES, Particles, Shape, Symmetry, image_alpha};
+pub use brush::{
+    Alignment, BrushAlpha, BrushSettings, FULL_TURN_DEGREES, JitterAxis, JitterDistribution, MAX_RADIAL_COPIES, Particles, Shape, Symmetry, image_alpha,
+};
 pub use commit::{CommitSource, Staging, TexelFn, commit_coverage, commit_layer, commit_mask};
 pub use path::{Lasso, spline, spline_segments, spline_segments_with_corners, spline_with_corners};
 pub use pickup::{Pickup, PickupMode};

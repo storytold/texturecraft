@@ -35,10 +35,43 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("viewport.previousChannel", "Display previous channel", ["Viewport"], Some("Shift+C"), "{}", always, |s, _| cycle_channel(s, -1)),
         cmd!("viewport.nextMeshMap", "Display next mesh map", ["Viewport"], Some("B"), "{}", always, |s, _| cycle_map(s, 1)),
         cmd!("viewport.previousMeshMap", "Display previous mesh map", ["Viewport"], Some("Shift+B"), "{}", always, |s, _| cycle_map(s, -1)),
-        cmd!("viewport.view", "Set view mode", [], None, "{mode: material|uvChecker|mask|<channel id>|map:<mesh map id>, layer? (for mask)}", always, view),
-        cmd!("camera.set", "Set camera", [], None, "{yaw?, pitch? (degrees), distance?, fov?, target?: [x,y,z], ortho?}", always, camera_set),
+        cmd!(
+            "viewport.pauseEngine",
+            "Pause Engine Computation",
+            ["Viewport"],
+            Some("Shift+Escape"),
+            "{paused?: bool (toggles when absent)} → {paused, pendingTiles}; while paused, edits change the document and history but no texture is composited or shown; export and mask export still composite what they need",
+            always,
+            pause_engine
+        ),
+        cmd!(
+            "viewport.view",
+            "Set view mode",
+            [],
+            None,
+            "{mode: material|uvChecker|normalHeightMesh (the normal the shading uses: mesh normal, Height channel slope and Normal channel; 2D view: the tangent-space normal)|mask|<channel id>|map:<mesh map id>, layer? (for mask)}",
+            always,
+            view
+        ),
+        cmd!(
+            "camera.set",
+            "Set camera",
+            [],
+            None,
+            "{yaw?, pitch? (degrees), distance?, fov?, target?: [x,y,z], ortho?, rotation?: constrained|free (a free camera also rolls and turns over)}",
+            always,
+            camera_set
+        ),
         cmd!("camera.get", "Get camera", [], None, "{}", always, |s, _| Ok(camera_json(s))),
-        cmd!("camera.orbit", "Orbit camera", [], None, "{dx?, dy? (degrees)}", always, orbit),
+        cmd!(
+            "camera.orbit",
+            "Orbit camera",
+            [],
+            None,
+            "{dx?, dy? (degrees)} (turns the camera about the target; a free camera about its own axes)",
+            always,
+            orbit
+        ),
         cmd!(
             "display.set",
             "Display settings",
@@ -133,6 +166,12 @@ fn set_view(s: &mut Session, v: ViewMode) -> Result<Value> {
     Ok(json!({ "view": v.label() }))
 }
 
+fn pause_engine(s: &mut Session, p: &Value) -> Result<Value> {
+    s.paused = boolp(p, "paused").unwrap_or(!s.paused);
+    s.revision = s.revision.wrapping_add(1);
+    Ok(json!({ "paused": s.paused, "pendingTiles": s.pending_tiles() }))
+}
+
 fn cycle_channel(s: &mut Session, d: i64) -> Result<Value> {
     let chans = s.doc.project.texture_set(s.ts()).map(|t| t.channel_list()).unwrap_or_default();
     if chans.is_empty() {
@@ -173,6 +212,7 @@ fn view(s: &mut Session, p: &Value) -> Result<Value> {
     let v = match m {
         "material" => ViewMode::Material,
         "uvChecker" | "uv" | "checker" => ViewMode::UvChecker,
+        "normalHeightMesh" => ViewMode::NormalHeightMesh,
         "mask" => {
             let id = crate::commands::layer_param(s, "viewport.view", p)?;
             if s.doc.project.layer(id)?.mask.is_none() {
@@ -193,16 +233,23 @@ pub(crate) fn camera_json(s: &Session) -> Value {
     json!({
         "yaw": c.yaw.to_degrees(), "pitch": c.pitch.to_degrees(), "distance": c.distance, "fov": c.fov,
         "target": c.target.to_array(), "eye": c.eye().to_array(), "ortho": c.ortho,
+        "rotation": if c.free { "free" } else { "constrained" },
     })
 }
 
 fn camera_set(s: &mut Session, p: &Value) -> Result<Value> {
     let c = &mut s.camera;
-    if let Some(v) = f32p(p, "yaw") {
-        c.yaw = v.to_radians();
+    match strp(p, "rotation") {
+        Some("free") => c.set_free(true),
+        Some("constrained") => c.set_free(false),
+        Some(o) => return Err(bad("camera.set", format!("unknown rotation `{o}`: constrained or free"))),
+        None => {}
     }
-    if let Some(v) = f32p(p, "pitch") {
-        c.pitch = v.clamp(-89.0, 89.0).to_radians();
+    if f32p(p, "yaw").is_some() || f32p(p, "pitch").is_some() {
+        // A free camera is put level at the angles
+        let yaw = f32p(p, "yaw").map_or(c.yaw, f32::to_radians);
+        let pitch = f32p(p, "pitch").map_or(c.pitch, |v| v.clamp(-89.0, 89.0).to_radians());
+        c.set_angles(yaw, pitch);
     }
     if let Some(v) = f32p(p, "distance") {
         c.distance = v.clamp(c.scene_radius * 0.05, c.scene_radius * 200.0);

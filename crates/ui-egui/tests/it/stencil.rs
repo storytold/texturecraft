@@ -6,7 +6,7 @@ use egui::{Event, Key, Modifiers, PointerButton, Pos2, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{Queryable, by};
 use serde_json::json;
-use texturecraft_engine::Tool;
+use texturecraft_engine::{StencilTiling, Tool};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::shelf::{Asset, ShelfDrag};
 use texturecraft_ui_egui::state::ViewLayout;
@@ -100,7 +100,7 @@ fn the_position_fields_move_the_stencil_and_reset_puts_it_back() {
     texturecraft_engine::execute(
         &mut harness.state_mut().session,
         "tool.stencil",
-        &json!({"image": name, "center": [0.5, -0.25], "scale": 2.0, "rotation": 90.0, "opacity": 0.3, "tile": true}),
+        &json!({"image": name, "center": [0.5, -0.25], "scale": 2.0, "rotation": 90.0, "opacity": 0.3, "tiling": "vertical"}),
     )
     .unwrap();
     harness.run_steps(3);
@@ -117,7 +117,7 @@ fn the_position_fields_move_the_stencil_and_reset_puts_it_back() {
     harness.run_steps(3);
     let reset = harness.state().session.tool.stencil.clone().unwrap();
     assert_eq!((reset.center, reset.scale, reset.rotation), ([0.0, 0.0], 0.8, 0.0));
-    assert_eq!((reset.image.as_str(), reset.opacity, reset.tile), (name.as_str(), 0.3, true), "image, opacity and tiling stay");
+    assert_eq!((reset.image.as_str(), reset.opacity, reset.tiling), (name.as_str(), 0.3, StencilTiling::Vertical), "image, opacity and tiling stay");
 }
 
 #[test]
@@ -171,4 +171,39 @@ fn the_2d_view_says_projection_paints_in_3d_and_paints_nothing() {
     assert!(!shows_text(&harness, "Projection paints in the 3D view"));
     drag_holding(&mut harness, &[], Modifiers::NONE, from, vec2(60.0, 0.0));
     assert!(history(&harness) > steps, "the paint tool paints there");
+}
+
+/// Total vertices of the meshes drawn this frame
+fn mesh_vertices(harness: &Harness<'_, TextureCraftApp>) -> usize {
+    harness.output().shapes.iter().map(|shape| if let egui::Shape::Mesh(mesh) = &shape.shape { mesh.vertices.len() } else { 0 }).sum()
+}
+
+#[test]
+fn the_tiling_mode_combo_replaces_the_tile_checkbox_and_the_overlay_repeats_along_it() {
+    let (mut harness, name) = projection_app();
+    texturecraft_engine::execute(&mut harness.state_mut().session, "tool.stencil", &json!({"image": name})).unwrap();
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Tile").is_none(), "the checkbox is gone");
+
+    harness.get_by_label("Tiling mode").scroll_to_me();
+    harness.run_steps(3);
+    let mut counts = Vec::new();
+    let mut current = "No Tiling";
+    for (label, mode) in [
+        ("Horizontal Tiling", StencilTiling::Horizontal),
+        ("Vertical Tiling", StencilTiling::Vertical),
+        ("H and V Tiling", StencilTiling::Both),
+        ("No Tiling", StencilTiling::None),
+    ] {
+        harness.get_all_by_role(Role::ComboBox).find(|node| node.value().as_deref() == Some(current)).unwrap().click();
+        harness.run_steps(2);
+        harness.get_by_label(label).click();
+        harness.run_steps(4);
+        current = label;
+        assert_eq!(harness.state().session.tool.stencil.as_ref().unwrap().tiling, mode, "{label}");
+        counts.push(mesh_vertices(&harness));
+    }
+    let [horizontal, vertical, both, none] = counts[..] else { unreachable!() };
+    assert!(horizontal > none && vertical > none, "one axis adds copies: {horizontal} {vertical} over {none}");
+    assert!(both > horizontal && both > vertical, "both axes add the most: {both}");
 }

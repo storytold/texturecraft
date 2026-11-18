@@ -253,6 +253,7 @@ fn render_view(l: &Layer) -> Layer {
     let mut l = l.clone();
     l.name.clear();
     l.color_tag = None;
+    l.locked = false;
     if let LayerKind::Group { collapsed, .. } = &mut l.kind {
         *collapsed = false;
     }

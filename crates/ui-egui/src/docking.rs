@@ -38,14 +38,16 @@ pub enum Panel {
     Shader,
     History,
     Log,
+    Export,
 }
 
 /// Window ▸ Views items and the panels they show or hide.
-pub const VIEWS: [(&str, Panel); 12] = [
+pub const VIEWS: [(&str, Panel); 13] = [
     ("ui.view.assets", Panel::Assets),
     ("ui.view.bakeMaps", Panel::MeshMapSettings),
     ("ui.view.bakeSettings", Panel::CommonSettings),
     ("ui.view.display", Panel::Display),
+    ("ui.view.export", Panel::Export),
     ("ui.view.history", Panel::History),
     ("ui.view.layers", Panel::Layers),
     ("ui.view.log", Panel::Log),
@@ -70,7 +72,7 @@ impl Panel {
         }
     }
 
-    pub const ALL: [Panel; 13] = [
+    pub const ALL: [Panel; 14] = [
         Panel::Viewport,
         Panel::Assets,
         Panel::MeshMapSettings,
@@ -84,6 +86,7 @@ impl Panel {
         Panel::Shader,
         Panel::History,
         Panel::Log,
+        Panel::Export,
     ];
 
     pub fn name(self) -> &'static str {
@@ -101,6 +104,7 @@ impl Panel {
             Panel::Shader => "Shader Settings",
             Panel::History => "History",
             Panel::Log => "Log",
+            Panel::Export => "Export",
         }
     }
 
@@ -111,6 +115,7 @@ impl Panel {
             Panel::Shader => 1.0,
             Panel::History => 2.0,
             Panel::Log => 3.0,
+            Panel::Export => 4.0,
             _ => return None,
         };
         Some([960.0, 90.0 + 50.0 * slot, 300.0, 380.0])
@@ -481,7 +486,7 @@ const PANEL_BODY_MARGIN: Margin = Margin::symmetric(8, 4);
 /// The body of every panel except the viewport, in the dock or on the rail
 pub(crate) fn panel_body(app: &mut TextureCraftApp, ui: &mut Ui, panel: Panel) {
     // No project open: the library and the log work, the other panels about a project stay empty
-    let works_empty = matches!(panel, Panel::Assets | Panel::Log | Panel::Layers | Panel::TextureSetList | Panel::Properties);
+    let works_empty = matches!(panel, Panel::Assets | Panel::Log | Panel::Layers | Panel::TextureSetList | Panel::Properties | Panel::Export);
     if !app.session.project_open && !works_empty {
         return;
     }
@@ -497,11 +502,12 @@ pub(crate) fn panel_body(app: &mut TextureCraftApp, ui: &mut Ui, panel: Panel) {
         Panel::TextureSetSettings => crate::dock::texture_set_settings(app, ui),
         Panel::Properties => crate::dock::properties(app, ui),
 
-        // Display and Shader Settings scroll here, as tall as their contents; History and Log scroll their own lists
-        Panel::Display => egui::ScrollArea::vertical().id_salt("dock-display").auto_shrink([false, true]).show(ui, |ui| crate::windows::display(app, ui)).inner,
-        Panel::Shader => egui::ScrollArea::vertical().id_salt("dock-shader").auto_shrink([false, true]).show(ui, |ui| crate::windows::shader(app, ui)).inner,
+        // Display and Shader Settings scroll one page under their section tabs; History and Log scroll their own lists
+        Panel::Display => crate::display_settings::body(app, ui),
+        Panel::Shader => crate::shader_settings::body(app, ui),
         Panel::History => crate::windows::history(app, ui),
-        Panel::Log => crate::windows::log(app, ui),
+        Panel::Log => crate::log_panel::body(app, ui),
+        Panel::Export => crate::export_panel::body(app, ui),
         Panel::Viewport => {}
     });
 }
@@ -542,6 +548,34 @@ impl DockContent<Panel> for Panels<'_> {
     fn floating_size(&self, _panel: &Panel) -> Option<egui::Vec2> {
         Some(vec2(300.0, 380.0))
     }
+
+    fn group_header_width(&self, panels: &[Panel], active: &Panel, floating: bool, _strip_width: f32) -> f32 {
+        if redocks(panels, active, floating) { DOCK_BUTTON_SIZE + DOCK_BUTTON_MARGIN } else { 0.0 }
+    }
+
+    /// A rail panel floating on its own carries the Dock button that sends it back to the rail
+    fn group_header(&mut self, ui: &mut Ui, panels: &[Panel], active: &Panel, floating: bool) {
+        if !redocks(panels, active, floating) {
+            return;
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if crate::widgets::icon_button(ui, egui_phosphor::regular::ARROW_SQUARE_IN, tr("Dock"), false, DOCK_BUTTON_SIZE).clicked() {
+                self.app.ui.dock.close(*active);
+            }
+        });
+    }
+}
+
+/// Size of the Dock button in a floating rail panel's tab strip
+const DOCK_BUTTON_SIZE: f32 = 22.0;
+
+/// Room right of the Dock button, so it clears the strip's end
+const DOCK_BUTTON_MARGIN: f32 = 6.0;
+
+/// Whether a floating window holds one rail panel alone: its Dock button closes it back onto the rail
+fn redocks(panels: &[Panel], active: &Panel, floating: bool) -> bool {
+    floating && panels.len() == 1 && crate::rail_popup::is_rail_panel(*active)
 }
 
 #[cfg(test)]
@@ -602,6 +636,18 @@ mod tests {
             let dock: Dock = serde_json::from_str(text).unwrap();
             assert_eq!(dock, Dock::default(), "{text}");
         }
+    }
+
+    #[test]
+    fn a_layout_saved_before_the_export_panel_still_loads() {
+        let mut saved = serde_json::to_value(default_workspace()).unwrap();
+        let hidden = saved["hidden"].as_array_mut().unwrap();
+        hidden.retain(|entry| entry[0] != "Export");
+        assert!(!saved.to_string().contains("\"Export\""));
+
+        let dock = Dock::from_value(saved);
+        assert!(!dock.replaced_unreadable(), "the saved layout is kept");
+        assert!(dock.workspace().hidden.iter().any(|(panel, _)| *panel == Panel::Export), "Export joins it, closed");
     }
 
     #[test]

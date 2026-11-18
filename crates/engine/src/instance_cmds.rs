@@ -23,7 +23,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "layer.pasteInstance",
             "Paste as instance",
             ["Layers"],
-            None,
+            Some("Ctrl+Shift+V"),
             "{} — an instance of the copied layer above the selection",
             can_paste_instance,
             paste_instance

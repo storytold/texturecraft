@@ -18,6 +18,7 @@ effect's input), so an agent can pick its input range from the data. `effect.mov
 index}` reorders an effect within its stack (0 = bottom) and `effect.duplicate {effect}` copies
 one just above itself. `effect.copy {effect?}` and `effect.cut {effect?}` put an effect on the
 layer clipboard, and `effect.paste {layer?, target?}` adds it to another layer's content or mask.
+`layer.pasteInstance {}` pastes a copied layer as an instance (default key Ctrl+Shift+V, rebindable).
 `layer.select {layers: [id], layer?}` selects several layers of one texture set at once (`layer`
 is the active one), and `{layer, range: true}` / `{layer, toggle: true}` do what Shift+click and
 Ctrl+click do in the Layers panel. `layer.select {all: true}` (Ctrl+A with the pointer over the
@@ -39,6 +40,30 @@ tile's size, with the tile number before the extension (`mask.1001.png`, `mask.1
 result is `{files}`. A layer without an enabled mask is an error. The layer menu's Export mask to
 file runs it; Copy mask to clipboard puts the same mask on the system clipboard as an 8-bit
 grayscale image (the whole tile atlas for a UV-tiled set).
+
+`mask.add.bitmap {layer?, image}` adds a mask drawn by an image resource (a black mask with one fill
+effect reading it); it refuses a layer that has a mask and an image that is not imported. `mask.copy
+{layer?}` keeps the layer's mask (an instance's source's unless it has its own) on a mask clipboard,
+separate from the layer clipboard; `mask.paste {layer?}` replaces the layer's mask with a copy of it
+(own effect ids, painted pixels resampled to the layer's texture set). Their default keys are
+Ctrl+Alt+C and Ctrl+Alt+V. `layer.flattenAll {layer?}` flattens the layer, or an instance's source,
+and every instance of it in one undo step, each rendered from the document as it is before the
+step; it returns `{layers}`.
+
+`layer.lock {layer?, locked?}` locks a layer against painting (no `locked` toggles it) and returns
+`{locked}`. A stroke or a fill on a locked layer's content or mask, or on the mask or content of an
+instance whose source is locked, fails with an error and changes nothing; every other edit still
+works, and the quick mask is not part of the layer. The flag is saved with the project, is one undo
+step, and shows as `locked` in `project.inspect`. `mask.gammaCorrected {layer?, enabled?}` (the
+layer menu's Gamma corrected alpha/mask) marks the mask's grey values as sRGB encoded: they are
+converted to linear when the mask is applied. It is saved with the project, is one undo step and
+shows as `maskGammaCorrected` in `project.inspect`. `layer.exportChannels {layer?, path, format?}`
+(the layer menu's Export channels to files) writes the layer alone, with the other layers of its
+texture set hidden and its mask applied, as one image per channel it holds. The files are
+`<name>_<channel>.<ext>` (`wall_baseColor.png`) beside `path`, the format follows the extension of
+`path` (png, tga, tif, bmp, webp, exr, hdr, jpg) or `format`, and a UV-tiled set writes one file per
+tile with the tile number before the extension. The result is `{files, warnings}`. The document
+and the viewport are not changed.
 
 `effect.set {effect, filter: "blur", radius: 5}` replaces a filter in place, preserving its
 stack position, blend, opacity and visibility. Replacement filters start from defaults plus
@@ -74,6 +99,21 @@ alone) and `alphaInvert` (swaps paint and no paint inside the stamp square). The
 procedural, library and imported alphas alike and are returned by `tool.brush` with the other
 values. The alpha's rotation is the brush `angle`.
 
+Position jitter (`jitterPosition`) takes two more keys: `jitterAxis` (`both`, the default, offsets
+across and along the stamp; `single` offsets only across it) and `jitterDistribution` (`uniform`,
+the default, spreads offsets evenly over the range; `gaussian` clusters them near the centre).
+
+`tool.symmetry`, `tool.lazyMouse`, `tool.resumeStroke` and `tool.ignoreStencil` each take
+`{enabled?: bool}` and toggle when it is omitted; they answer the default keys L, D, A and N and
+return `{enabled}` (`tool.lazyMouse` also `lazy`). Symmetry only flips the toolbar switch, its
+settings stay. Lazy mouse off sets the distance to 0 and remembers it (20 px the first time).
+Resume previous stroke makes the next stroke a straight line from where the last one ended in the
+3D and 2D views, as Shift+click does. Ignore stencil lets the Projection tool paint its plain
+brush, with or without a stencil image. `tool.stencil {hideWhilePainting}` (default `true`) hides
+the stencil image and outline in the 3D view while a stroke is painted; it needs no image. None
+of these is a history step. `tool.state` returns `lazy_distance`, `resume_stroke`,
+`ignore_stencil` and `hide_stencil_while_painting`.
+
 Bake mode applies edits in Common Settings and Mesh Map Settings to every texture set. Each
 set keeps its own enabled mesh-map checkboxes and Include in Bake flag. Edits update only the
 changed fields; Restore Defaults resets the whole parameter section across all sets.
@@ -85,6 +125,22 @@ values returned in the command's `model` result; omitted fields retain each set'
 before the edit is applied as one undo step. `model` still replaces the complete settings;
 when combined, `patch` follows `model`, then the flat command parameters apply. Omitting `ts`
 still targets the active set for scripts that need individual control.
+
+`textureSet.next` and `textureSet.previous` make the next or previous texture set active (the
+last wraps to the first) and return `{ts}`; they are in the Viewport menu and take keys from
+Settings > Shortcuts, with no default key. `textureSet.rename {ts?, name}` renames a set, and
+`textureSet.resolution {resolution, all: true}` sizes every set (one undo step per set).
+
+Bake presets are saved settings in the UI state (Mesh Map Bakers > Presets). Loading one is
+`bake.settings {ts: <index>, model: <the preset's settings>, preserveEnabled: true}`; Apply to All
+Texture Sets is the same with `ts: "all"` and the active set's `model`. Both are one undo step.
+When a bake started in the app ends, a toast gives the maps baked, the time and the failed sets, and
+the session log gets `Bake finished: N maps in T` and `Bake of texture set N failed: <error>`.
+
+`textureSet.channel.format {ts?, channel, format}` sets a channel's storage format (`sRGB8`, `RGB8`,
+`RGB16`, `RGB16F`, `RGB32F` for colour and normal channels; `L8`, `L16`, `L16F`, `L32F` for grey
+ones) and, going to fewer bits, rounds the channel's painted layer data (8 bit: 256 steps) in one
+undo step. A format of the other family, or a channel the set lacks, is an error.
 
 The bake texture-set list shows visibility eyes and expandable UV tile rows. Visibility affects
 the viewport independently of bake inclusion. Its resolution menus edit the texture-set size
@@ -155,11 +211,12 @@ keeps its state in a throwaway file.
 | `session.inspect` | | project, mesh, texture sets, layer stack, tool, camera, display, history |
 | `ui.inspect` | | UI state, viewport rect, fps, bake progress (`baking`, 0..1), the running bake's stage (`bakeStatus`, e.g. "Baking Ambient Occlusion (2/4)") and live preview (`bakePreview`, see *Live bake preview*), toasts, `titleBar` (who draws the title bar this run: `app`, `integrated` on macOS, or `system`) |
 | `ui.menu.list` | | the menu catalog: `{menu, submenu, label, id, shortcut, implemented, enabled}` |
-| `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a panel layout saved under Window > Layouts (panels only; mode, zoom and wireframes stay) and errors when no layout has that name |
+| `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question; `file.exportMesh` opens the Mesh Export Options prompt, whose Export asks for the file; `ui.view.export` opens the right bar's Export panel). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a panel layout saved under Window > Layouts (panels only; mode, zoom and wireframes stay) and errors when no layout has that name. `{"id": "ui.layout.swap"}` swaps the 3D and 2D views of the split layout (F4) |
+| `ui.menu.invoke` ids `ui.help.releaseNotes`, `ui.help.exportLog` | `{id}` | Help > Release notes... opens the releases page in the browser; Help > Export log... asks where to save the log as a text file (a save dialog, like the menu click) |
 | `ui.reset` | | resets the panels, view layout, zoom and every other view setting at once, without the question the Reset UI menu item asks; settings and shortcuts stay |
 | `ui.bake.start` | `{ts?: index \| [indices]}` (default: the sets ticked in Bake mode) | Opens Bake mode and bakes in the background like the Bake button: the 3D view shows the maps landing on the model as they finish (see *Live bake preview*). → the `bake.preview` state. Errors when a bake is already running |
 | `ui.bake.cancel` | | Stops the running bake; the set being baked keeps the maps it had, sets already finished stay applied, and the previous view mode comes back |
-| `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History` and `Log`; `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds) | `null` |
+| `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History`, `Log` and `Export` (a floating window holding one right-bar panel is that panel undocked); `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds), `log_channel` the Log panel's tab (`General` or `Assets`) | `null` |
 | `viewport.screenshot` | `{view?: "3d" \| "2d"}` | `{width, height, png}` (PNG, base64) |
 | `ui.screenshot` | | `{width, height, png}` of the whole window, after the next frame |
 | `ui.resize` | `{width, height}` | Sets the window's inner size in points (640–7680), leaving maximized state; for recordings and screenshots at a fixed size |
@@ -240,6 +297,13 @@ of `prefs.reserved_cores` and `prefs.save_ram_percent` for saving.
 Settings bounds the reserved-core input to the available logical CPU count and shows the estimated
 save budget in GiB beside the RAM percentage. The readout refreshes once a second from currently
 available RAM; a save calculates its budget when it starts.
+
+Other preferences set through `ui.set {"prefs": {...}}`: `language` (`""` follows the system
+language), `work_threads` (worker threads for painting, baking and export; 0 uses every logical
+CPU; read at startup), `rotation_speed` (default 2), `zoom_speed` and `wheel_speed` (default 1,
+each from 0.1 to 10) with `zoom_inverse` and `wheel_inverse`, `gpu_raytracing` (false keeps bake
+rays on the CPU) and `libraries` (added library locations as `{"name", "path"}`; the shelf lists
+the saved smart materials and masks in each folder).
 
 ## MCP server
 
@@ -491,14 +555,43 @@ Alt+drag orbit turn around the object being painted even with a floor plane or o
 the mesh. `viewport.frameSelection` (Shift+F) is the same as `target: "selection"`; a set with no triangles
 frames the whole mesh. Both return the camera like `camera.get`.
 
+## Pause Engine Computation
+
+`viewport.pauseEngine {paused?: bool}` (Shift+Esc, also the top bar button) sets or, without `paused`, toggles the pause and returns `{paused, pendingTiles}`. While paused, edits change the document and history, but the app composites no tiles and uploads no viewport textures; the changed tiles stay pending. Unpausing composites everything changed in the meantime. Export, mask export and clone/smudge pickup composite what they need even while paused, so their results are up to date. Saving writes the document, which does not depend on the textures. The command works without a project. The pause is not part of the project file.
+
+## Hide excluded geometry
+
+`viewport.hideExcluded {enabled?: bool}` (Alt+H; toggles when `enabled` is omitted) hides the mesh parts the
+selected layer's geometry mask leaves out (`layer.set {geometryMask}`), so the 3D view and the key-light shadow
+no longer draw them, and picking (`tool.click`, strokes, the brush cursor) skips them, so a stroke paints the
+parts behind. The result is `{enabled, excludedParts}`. It is a view setting: not saved, not in the undo
+history, and a layer with no geometry mask hides nothing. The same toggle is the eye-slash button in the top
+bar, enabled with a project open.
+
 ## Camera views and projection
 
 `camera.view {view}` looks at the mesh from one side (`front` from +Z, `back`, `left` from -X,
 `right`, `top` and `bottom` at the orbit's ±89° pitch limit) and frames it; the projection stays.
 `camera.view.front` … `camera.view.bottom` do the same without params (Viewport menu, no default
-shortcut, bindable in Settings ▸ Keyboard). `camera.perspective` (F5) and `camera.orthographic` (F6)
+shortcut, bindable in Settings ▸ Shortcuts). `camera.perspective` (F5) and `camera.orthographic` (F6)
 change only the projection; position and rotation stay. None of them is an undo step. In the 3D
 view, Alt+Shift+left drag orbits in 90° steps.
+
+`camera.rotation {mode: constrained|free}` (or `camera.rotation.constrained` / `camera.rotation.free`,
+Viewport menu and the rotation dropdown of the top bar) picks the orbit: constrained (the default) keeps
+the horizon level and stops at the poles; free is a trackball that turns the camera about its own axes,
+so the model can be turned over and rolled. `camera.get` shows it as `rotation`; `camera.set` takes
+`rotation` too. Switching keeps the direction of view; going back to constrained drops the roll. Saved
+cameras, fixed views and `camera.set` yaw/pitch put a free camera level. `camera.snapRotate {yaw?, pitch?}`
+(whole 90° steps; the angles first go to the nearest step) is the command behind the Alt+Shift+left drag
+("Camera snap rotate"); `camera.snapRotate.left|right|up|down` are its menu forms. `camera.next` and
+`camera.previous` go to the next or previous saved camera (wrapping; from a view that is no saved
+camera, the first or the last). The commands have no default keys and are bindable in Settings ▸ Keyboard.
+None is an undo step.
+
+`viewport.view {mode: "normalHeightMesh"}` is the combined "Normal+height+mesh" view: the surface normal
+the shading uses (mesh normal, Height channel slope and Normal channel), unlit; the 2D view shows its
+tangent-space form.
 
 ## MaterialCraft materials
 

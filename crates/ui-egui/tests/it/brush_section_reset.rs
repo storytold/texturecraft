@@ -2,7 +2,7 @@
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
-use texturecraft_engine::paint::{Alignment, BrushAlpha, BrushSettings, Particles, Symmetry};
+use texturecraft_engine::paint::{Alignment, BrushAlpha, BrushSettings, JitterAxis, JitterDistribution, Particles, Symmetry};
 use texturecraft_ui_egui::TextureCraftApp;
 
 /// The default window; Properties shows only the top of the brush there, so lower headers are scrolled to
@@ -27,8 +27,8 @@ const SECTIONS: [(&str, &str, bool, SectionReset); 7] = [
     }),
     ("Angle", "Follow path", false, |brush, defaults| (brush.angle, brush.follow_path) = (defaults.angle, defaults.follow_path)),
     ("Jitters", "Size jitter", false, |brush, defaults| {
-        (brush.jitter_size, brush.jitter_angle, brush.jitter_flow, brush.jitter_position) =
-            (defaults.jitter_size, defaults.jitter_angle, defaults.jitter_flow, defaults.jitter_position)
+        (brush.jitter_size, brush.jitter_angle, brush.jitter_flow, brush.jitter_position, brush.jitter_axis, brush.jitter_distribution) =
+            (defaults.jitter_size, defaults.jitter_angle, defaults.jitter_flow, defaults.jitter_position, defaults.jitter_axis, defaults.jitter_distribution)
     }),
     ("Alignment and culling", "Backface culling", false, |brush, defaults| {
         (brush.alignment, brush.backface_culling, brush.angle_fade, brush.depth) =
@@ -54,6 +54,8 @@ fn changed_brush() -> BrushSettings {
         jitter_angle: 0.4,
         jitter_flow: 0.3,
         jitter_position: 1.0,
+        jitter_axis: JitterAxis::Single,
+        jitter_distribution: JitterDistribution::Gaussian,
         alignment: Alignment::Camera,
         backface_culling: false,
         angle_fade: (30.0, 60.0),
@@ -292,4 +294,28 @@ fn overflowing_contents_do_not_push_resets_outside_the_panel() {
 
         assert_eq!(*harness.state(), 1, "overflowing contents must not block the reset");
     }
+}
+
+#[test]
+fn jitters_section_offers_position_axis_and_distribution() {
+    let mut harness = app_with_brush(BrushSettings::default());
+    click_header(&mut harness, "Jitters");
+
+    for label in ["Position Jitter Axis", "Distribution"] {
+        assert!(harness.query_all_by_label(label).next().is_some(), "no {label} control");
+    }
+
+    // Each combo shows its current choice; opening it lists the others
+    for (current, choice) in [("Both", "Single"), ("Uniform", "Gaussian")] {
+        let combo = harness.get_all_by_role(egui::Role::ComboBox).find(|node| node.value().as_deref() == Some(current)).expect("the combo");
+        combo.scroll_to_me();
+        harness.run_steps(SETTLE_FRAMES);
+        harness.get_all_by_role(egui::Role::ComboBox).find(|node| node.value().as_deref() == Some(current)).expect("the combo").click();
+        harness.run_steps(SETTLE_FRAMES);
+        harness.get_by_label(choice).click();
+        harness.run_steps(SETTLE_FRAMES);
+    }
+
+    let brush = &harness.state().session.tool.brush;
+    assert_eq!((brush.jitter_axis, brush.jitter_distribution), (JitterAxis::Single, JitterDistribution::Gaussian));
 }

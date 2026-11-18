@@ -3,7 +3,7 @@
 use serde_json::json;
 use texturecraft_engine::geom::glam::Vec3;
 use texturecraft_engine::paint::BrushAlpha;
-use texturecraft_engine::{CloneFrom, CloneSource, Session, ToolSettings, execute, sample_session};
+use texturecraft_engine::{CloneFrom, CloneSource, Session, StencilState, StencilTiling, ToolSettings, execute, sample_session};
 
 fn another_project() -> Session {
     sample_session(128, 64).unwrap()
@@ -70,7 +70,7 @@ fn what_belongs_to_the_old_project_is_reset() {
     let before_size = session.tool.brush.size;
     let image = import_image(&mut session, "stamp.png");
     execute(&mut session, "tool.brush", &json!({"alpha": {"image": image.clone()}})).unwrap();
-    execute(&mut session, "tool.stencil", &json!({"image": image, "scale": 2.0, "rotation": 30, "tile": true, "opacity": 0.9})).unwrap();
+    execute(&mut session, "tool.stencil", &json!({"image": image, "scale": 2.0, "rotation": 30, "tiling": "horizontal", "opacity": 0.9})).unwrap();
     session.tool.clone_source = Some(CloneSource { uv: [0.3, 0.4], offset: Some([0.1, 0.1]) });
     session.tool.path.push(Vec3::new(1.0, 2.0, 3.0), false);
 
@@ -90,14 +90,14 @@ fn what_belongs_to_the_old_project_is_reset() {
 fn the_stencil_placement_carries_over_to_the_next_stencil() {
     let mut session = another_project();
     let image = import_image(&mut session, "stamp.png");
-    execute(&mut session, "tool.stencil", &json!({"image": image, "scale": 2.0, "rotation": 30, "tile": true, "opacity": 0.9})).unwrap();
+    execute(&mut session, "tool.stencil", &json!({"image": image, "scale": 2.0, "rotation": 30, "tiling": "horizontal", "opacity": 0.9})).unwrap();
 
     session.switch_to(another_project());
     let image = import_image(&mut session, "other.png");
     execute(&mut session, "tool.stencil", &json!({"image": image})).unwrap();
 
     let stencil = session.tool.stencil.as_ref().unwrap();
-    assert_eq!((stencil.scale, stencil.rotation, stencil.tile, stencil.opacity), (2.0, 30.0, true, 0.9));
+    assert_eq!((stencil.scale, stencil.rotation, stencil.tiling, stencil.opacity), (2.0, 30.0, StencilTiling::Horizontal, 0.9));
 }
 
 #[test]
@@ -147,4 +147,38 @@ fn restored_stencil_and_smudge_settings_use_the_tool_limits() {
     assert_eq!(session.tool.smudge_strength, 1.0);
     let look = session.tool.stencil_look;
     assert_eq!((look.center, look.scale, look.opacity, look.rotation), ([-4.0, 4.0], 0.01, 0.0, 345.0));
+}
+
+#[test]
+fn the_stencil_takes_the_four_tiling_modes_and_the_old_switch() {
+    let mut session = another_project();
+    let image = import_image(&mut session, "stamp.png");
+    execute(&mut session, "tool.stencil", &json!({"image": image})).unwrap();
+    assert_eq!(session.tool.stencil.as_ref().unwrap().tiling, StencilTiling::None, "a new stencil does not repeat");
+    for (mode, expected) in
+        [("horizontal", StencilTiling::Horizontal), ("vertical", StencilTiling::Vertical), ("both", StencilTiling::Both), ("none", StencilTiling::None)]
+    {
+        let shown = execute(&mut session, "tool.stencil", &json!({"tiling": mode})).unwrap();
+        assert_eq!(session.tool.stencil.as_ref().unwrap().tiling, expected);
+        assert_eq!(shown["tiling"], mode);
+    }
+    // The old on/off switch: on repeats in both directions
+    execute(&mut session, "tool.stencil", &json!({"tile": true})).unwrap();
+    assert_eq!(session.tool.stencil.as_ref().unwrap().tiling, StencilTiling::Both);
+    execute(&mut session, "tool.stencil", &json!({"tile": false})).unwrap();
+    assert_eq!(session.tool.stencil.as_ref().unwrap().tiling, StencilTiling::None);
+    assert!(execute(&mut session, "tool.stencil", &json!({"tiling": "diagonal"})).is_err());
+}
+
+#[test]
+fn a_stencil_saved_with_the_old_tile_switch_loads_as_both_directions() {
+    let old: StencilState =
+        serde_json::from_value(json!({"image": "logo.png", "center": [0.0, 0.0], "scale": 0.8, "rotation": 0.0, "tile": true, "opacity": 0.5})).unwrap();
+    assert_eq!(old.tiling, StencilTiling::Both);
+    let off: StencilState =
+        serde_json::from_value(json!({"image": "logo.png", "center": [0.0, 0.0], "scale": 0.8, "rotation": 0.0, "tile": false, "opacity": 0.5})).unwrap();
+    assert_eq!(off.tiling, StencilTiling::None);
+    let saved = serde_json::to_value(&old).unwrap();
+    assert_eq!(saved["tiling"], "both");
+    assert_eq!(serde_json::from_value::<StencilState>(saved).unwrap(), old);
 }

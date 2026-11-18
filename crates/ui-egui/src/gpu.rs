@@ -176,7 +176,7 @@ impl GpuLink {
     /// Compositing progress (0..1) while tiles wait to be composited.
     pub fn composite_progress(&self, s: &Session) -> Option<f32> {
         let pending = s.pending_tiles();
-        (pending > 0 && self.composite_total > 0).then(|| 1.0 - pending as f32 / self.composite_total as f32)
+        (!s.paused && pending > 0 && self.composite_total > 0).then(|| 1.0 - pending as f32 / self.composite_total as f32)
     }
 
     /// Collect everything the GPU needs this frame, running the compositor first: `bake` is what bake mode's 3D view draws besides the low poly, `spent_ms` the time this frame already took
@@ -186,7 +186,9 @@ impl GpuLink {
         let time_left_ms = |queued: usize| FRAME_BUDGET_MS - spent_ms - (crate::now_ms() - start_ms) - queued as f64 * UPLOAD_MS_PER_TILE;
         let pending = session.pending_tiles();
         self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
-        session.update_for(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms);
+        if !session.paused {
+            session.update_for(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms);
+        }
 
         let mut out = SceneSync::default();
         if self.lost.swap(false, Ordering::AcqRel) {
@@ -233,7 +235,8 @@ impl GpuLink {
             }
         }
 
-        for texture_set in 0..session.caches.len() {
+        // Paused: nothing reaches the viewport; the tiles wait in their upload queue
+        for texture_set in 0..if session.paused { 0 } else { session.caches.len() } {
             let tiles = session.take_uploads(texture_set);
             if tiles.is_empty() {
                 continue;
@@ -555,6 +558,37 @@ mod tests {
         let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
         assert_eq!(out.aux.len(), 1, "re-enabling the mask uploads its values again");
         assert!(out.aux[0].2.chunks(4).any(|pixel| pixel != MASK_VIEW_BLANK));
+    }
+
+    #[test]
+    fn a_paused_engine_composites_and_uploads_nothing_until_it_is_resumed() {
+        let mut gpu = link();
+        let mut s = session(false);
+        gpu.sync(&mut s, None, None, 0, 0.0);
+        while s.pending_tiles() > 0 {
+            gpu.sync(&mut s, None, None, 0, 0.0);
+        }
+
+        s.paused = true;
+        execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+        let waiting = s.pending_tiles();
+        assert!(waiting > 0, "the edit marked tiles dirty");
+        let out = gpu.sync(&mut s, None, None, 0, 0.0);
+        assert!(out.tiles.is_empty(), "no texture reaches the viewport while paused");
+        drop(out);
+        assert_eq!(s.pending_tiles(), waiting, "nothing was composited");
+        assert!(gpu.composite_progress(&s).is_none());
+
+        s.paused = false;
+        let mut uploaded = 0;
+        for _ in 0..200 {
+            uploaded += gpu.sync(&mut s, None, None, 0, 0.0).tiles.len();
+            if s.pending_tiles() == 0 {
+                break;
+            }
+        }
+        assert_eq!(s.pending_tiles(), 0, "resuming composites what changed");
+        assert!(uploaded > 0, "and shows it");
     }
 
     fn kinds(out: &SceneSync) -> BTreeSet<DisplayKind> {

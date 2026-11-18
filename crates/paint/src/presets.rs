@@ -35,6 +35,8 @@ pub fn with_stroke_of(brush: &BrushSettings, from: &BrushSettings) -> BrushSetti
         jitter_angle: from.jitter_angle,
         jitter_flow: from.jitter_flow,
         jitter_position: from.jitter_position,
+        jitter_axis: from.jitter_axis,
+        jitter_distribution: from.jitter_distribution,
         alpha: from.alpha,
         alpha_image: from.alpha_image.clone(),
         alpha_library: from.alpha_library.clone(),

@@ -59,8 +59,16 @@ fn setup() -> Option<(Headless, Frame)> {
     let mut cam = OrbitCamera { yaw: 0.6, pitch: 0.25, ..OrbitCamera::default() };
     let (lo, hi) = mesh.bounds();
     cam.frame(lo, hi);
-    let frame =
-        Frame { view_id: 1, size: [480, 360], kind: ViewKind::Scene, camera: cam, shade: Shade::default(), visible: vec![true, true], overlay: Vec::new() };
+    let frame = Frame {
+        view_id: 1,
+        size: [480, 360],
+        kind: ViewKind::Scene,
+        camera: cam,
+        shade: Shade::default(),
+        visible: vec![true, true],
+        hidden_parts: Vec::new(),
+        overlay: Vec::new(),
+    };
     Some((h, frame))
 }
 
@@ -110,6 +118,17 @@ fn exposure_brightens_the_material_but_not_data_views() {
     // Default base color 188 (sRGB) shows unchanged in the channel view.
     let [r, ..] = a.at(240, 140);
     assert!(r.abs_diff(188) <= 1, "base color channel shows the raw value, got {r}");
+}
+
+#[test]
+fn the_combined_normal_view_shows_the_shading_normal_unlit() {
+    let Some((mut h, frame)) = setup() else { return };
+    let base = render(&mut h, &frame, "normal_view_material");
+    let combined = shaded(&frame, |s| s.view_mode = 4);
+    let a = render(&mut h, &combined, "normal_height_mesh");
+    let b = render(&mut h, &shaded(&combined, |s| s.exposure_ev = 2.0), "normal_height_mesh_ev2");
+    assert_ne!(a.px, base.px, "the view differs from the lit material");
+    assert_eq!(a.px, b.px, "a data view ignores exposure");
 }
 
 #[test]

@@ -18,6 +18,42 @@ pub enum Alignment {
     Camera,
 }
 
+/// Which axes position jitter moves a stamp along.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum JitterAxis {
+    /// Across and along the stamp (the original behaviour).
+    #[default]
+    Both,
+    /// Only across the stamp (its tangent axis).
+    Single,
+}
+
+/// How position jitter spreads its offsets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum JitterDistribution {
+    /// Every offset in the range is equally likely (the original behaviour).
+    #[default]
+    Uniform,
+    /// Offsets cluster near the centre (bell curve, clamped to the range).
+    Gaussian,
+}
+
+/// Standard deviation of the Gaussian jitter as a fraction of the full range
+const GAUSSIAN_SIGMA: f32 = 0.4;
+
+impl JitterDistribution {
+    /// An offset in -1..=1 from two uniform numbers in 0..=1.
+    pub fn sample(self, u1: f32, u2: f32) -> f32 {
+        match self {
+            JitterDistribution::Uniform => u1 * 2.0 - 1.0,
+            JitterDistribution::Gaussian => {
+                let radius = (-2.0 * u1.max(f32::MIN_POSITIVE).ln()).sqrt();
+                (radius * (std::f32::consts::TAU * u2).cos() * GAUSSIAN_SIGMA).clamp(-1.0, 1.0)
+            }
+        }
+    }
+}
+
 /// The stamp shape (multiplied by the hardness falloff).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BrushAlpha {
@@ -317,6 +353,12 @@ pub struct BrushSettings {
     pub jitter_flow: f32,
     /// Position jitter as a fraction of the radius.
     pub jitter_position: f32,
+    /// Axes the position jitter moves along.
+    #[serde(default)]
+    pub jitter_axis: JitterAxis,
+    /// Spread of the position jitter.
+    #[serde(default)]
+    pub jitter_distribution: JitterDistribution,
     pub alpha: BrushAlpha,
     /// Image resource used as the stamp shape instead of `alpha` (grayscale, rotated with the stamp).
     #[serde(default)]
@@ -356,6 +398,8 @@ impl Default for BrushSettings {
             jitter_angle: 0.0,
             jitter_flow: 0.0,
             jitter_position: 0.0,
+            jitter_axis: JitterAxis::default(),
+            jitter_distribution: JitterDistribution::default(),
             alpha: BrushAlpha::Round,
             alpha_image: None,
             alpha_library: None,

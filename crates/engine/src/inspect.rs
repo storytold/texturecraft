@@ -120,6 +120,12 @@ fn layer_json(s: &Session, l: &Layer, depth: usize) -> Value {
         "channels": channels,
         "colorTag": l.color_tag,
     });
+    if l.locked {
+        v["locked"] = json!(true);
+    }
+    if l.mask.as_ref().is_some_and(|mask| mask.gamma_corrected) {
+        v["maskGammaCorrected"] = json!(true);
+    }
     if let LayerKind::Fill(f) = &l.kind {
         v["fill"] = fill_json(f);
     }

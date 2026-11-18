@@ -90,7 +90,7 @@ fn arrows_and_wheel_scroll_without_changing_the_brush() {
 
 #[test]
 fn shorter_tools_and_wider_windows_remove_the_arrows() {
-    let mut harness = toolbar_harness(700.0, Tool::Path);
+    let mut harness = toolbar_harness(820.0, Tool::Path);
     harness.get_by_label("Scroll right").click();
     harness.run_steps(30);
     harness.state_mut().session.tool.tool = Tool::PolygonFill;

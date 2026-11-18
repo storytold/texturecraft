@@ -5,7 +5,7 @@ use texturecraft_geom::glam::{Mat3, Quat, Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, surface_at};
 use texturecraft_texel::noise::pcg3d;
 
-use crate::brush::{Alignment, BrushSettings};
+use crate::brush::{Alignment, BrushSettings, JitterAxis};
 use crate::stamp_source::StampSource;
 
 /// Scene access for picking.
@@ -44,6 +44,9 @@ const JITTER_SIZE: u32 = 2;
 const JITTER_ACROSS: u32 = 3;
 const JITTER_ALONG: u32 = 4;
 const JITTER_FLOW: u32 = 5;
+/// Second numbers the Gaussian distribution needs for the two position axes
+const JITTER_ACROSS_GAUSS: u32 = 6;
+const JITTER_ALONG_GAUSS: u32 = 7;
 
 /// Full angle jitter turns a stamp this far either way (degrees)
 const HALF_TURN_DEGREES: f32 = 180.0;
@@ -209,7 +212,12 @@ impl Stroke {
         let tangent = turn * unturned_tangent;
         let bitangent = normal.cross(tangent);
         let jittered_radius = radius * (1.0 + jitter(JITTER_SIZE, settings.jitter_size)).max(MIN_JITTERED_SIZE);
-        let offset = (tangent * jitter(JITTER_ACROSS, 1.0) + bitangent * jitter(JITTER_ALONG, 1.0)) * settings.jitter_position * radius;
+        let across = settings.jitter_distribution.sample(rand01(seed, JITTER_ACROSS), rand01(seed, JITTER_ACROSS_GAUSS));
+        let along = match settings.jitter_axis {
+            JitterAxis::Both => settings.jitter_distribution.sample(rand01(seed, JITTER_ALONG), rand01(seed, JITTER_ALONG_GAUSS)),
+            JitterAxis::Single => 0.0,
+        };
+        let offset = (tangent * across + bitangent * along) * settings.jitter_position * radius;
         let flow = (settings.flow * (1.0 - jitter(JITTER_FLOW, settings.jitter_flow).abs())).clamp(0.0, 1.0);
 
         Stamp {
@@ -278,6 +286,7 @@ impl Stroke {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::brush::JitterDistribution;
     use texturecraft_geom::primitives;
 
     fn ctx_parts() -> (Mesh, Bvh, OrbitCamera) {
@@ -412,5 +421,58 @@ mod tests {
         st.symmetry = crate::brush::Symmetry { radial: 200, axis: 9, ..st.symmetry };
         let clean = st.sanitized().symmetry;
         assert_eq!((clean.radial, clean.axis), (32, 2));
+    }
+
+    /// Stamps of one horizontal stroke for a brush with the given position jitter
+    fn jitter_stamps(jitter_position: f32, axis: JitterAxis, distribution: JitterDistribution) -> Vec<Stamp> {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let settings = BrushSettings { spacing: 0.05, jitter_position, jitter_axis: axis, jitter_distribution: distribution, ..BrushSettings::default() };
+        let mut stroke = Stroke::new(&settings, &m);
+        (0..=400).flat_map(|i| stroke.add(&ctx, Vec2::new(100.0 + i as f32 * 0.5, 200.0), 1.0)).collect()
+    }
+
+    /// Stamp offsets from where the same stroke without jitter puts them, in radii: (across, along)
+    fn jitter_offsets(axis: JitterAxis, distribution: JitterDistribution) -> Vec<(f32, f32)> {
+        let plain = jitter_stamps(0.0, axis, distribution);
+        let jittered = jitter_stamps(1.0, axis, distribution);
+        assert_eq!(plain.len(), jittered.len());
+        assert!(plain.len() > 50);
+        plain
+            .iter()
+            .zip(&jittered)
+            .map(|(plain, jittered)| {
+                let delta = jittered.center - plain.center;
+                (delta.dot(jittered.tangent) / jittered.radius, delta.dot(jittered.bitangent) / jittered.radius)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_axis_jitter_moves_only_across() {
+        let both = jitter_offsets(JitterAxis::Both, JitterDistribution::Uniform);
+        assert!(both.iter().any(|o| o.1.abs() > 0.2), "both axes move along the stamp too");
+
+        let single = jitter_offsets(JitterAxis::Single, JitterDistribution::Uniform);
+        assert!(single.iter().any(|o| o.0.abs() > 0.2));
+        assert!(single.iter().all(|o| o.1.abs() < 0.05), "single keeps the along offset at zero");
+    }
+
+    #[test]
+    fn gaussian_jitter_clusters_near_the_centre() {
+        let share_near_centre = |distribution| {
+            let offsets = jitter_offsets(JitterAxis::Both, distribution);
+            assert!(offsets.iter().all(|o| o.0.abs() < 1.3 && o.1.abs() < 1.3));
+            offsets.iter().filter(|o| o.0.abs() < 0.25).count() as f32 / offsets.len() as f32
+        };
+        let uniform = share_near_centre(JitterDistribution::Uniform);
+        let gaussian = share_near_centre(JitterDistribution::Gaussian);
+        assert!(gaussian > uniform + 0.15, "gaussian {gaussian} vs uniform {uniform}");
+    }
+
+    #[test]
+    fn default_jitter_is_both_axes_uniform() {
+        let settings = BrushSettings::default();
+        assert_eq!((settings.jitter_axis, settings.jitter_distribution), (JitterAxis::Both, JitterDistribution::Uniform));
     }
 }

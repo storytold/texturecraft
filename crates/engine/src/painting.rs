@@ -48,6 +48,10 @@ impl Session {
     }
 
     pub fn pick(&self, screen: Vec2, viewport: Vec2) -> Option<SurfaceHit> {
+        let excluded = self.excluded_ranges();
+        if !excluded.is_empty() {
+            return self.pick_skipping_excluded(screen, viewport, &excluded);
+        }
         let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &self.camera, viewport };
         pick(&ctx, screen)
     }
@@ -66,10 +70,18 @@ impl Session {
     /// when painting a mask. Must run inside the stroke's history snapshot.
     fn paint_target(&mut self) -> Result<PaintTarget> {
         let id = self.selected_layer().ok_or_else(|| EngineError::Other("select a layer to paint on".into()))?;
+        if let Some(locked) = self.locked_error(id) {
+            return Err(locked);
+        }
 
         // Painting an instance paints its source unless its own mask overrides the mask
         let p = &self.doc.project;
         let id = if self.target == StackTarget::Mask { p.mask_owner(id) } else { p.content_layer(id).map_or(id, |l| l.id) };
+
+        // An instance paints its source: a locked source refuses too
+        if let Some(locked) = self.locked_error(id) {
+            return Err(locked);
+        }
         match self.target {
             StackTarget::Content => {
                 let l = self.doc.project.layer(id)?;
@@ -250,10 +262,12 @@ impl Session {
             Some(PaintTarget::Mask(effect)) if pickup.is_some() => self.doc.project.effect(effect).map(|(owner, _)| owner),
             _ => None,
         };
-        let stencil = if tool == Tool::Projection && !quick_mask { self.capture_stencil(viewport) } else { None };
+        // N: the Projection tool paints its plain brush, as if no stencil were set
+        let uses_stencil = tool == Tool::Projection && !quick_mask && !self.tool.ignore_stencil;
+        let stencil = if uses_stencil { self.capture_stencil(viewport) } else { None };
         let problem = if !erase && values.is_empty() && matches!(target, Some(PaintTarget::Layer(_))) {
             Some("no channel enabled to paint: enable channels in the tool's material")
-        } else if tool == Tool::Projection && !quick_mask && stencil.is_none() && !uv_mode {
+        } else if uses_stencil && stencil.is_none() && !uv_mode {
             Some("the Projection tool needs a stencil: pick an image in the tool properties (tool.stencil)")
         } else {
             None
@@ -263,7 +277,14 @@ impl Session {
             return Err(EngineError::Other(msg.into()));
         }
 
-        let depth = (!uv_mode).then(|| self.eye_depth(viewport));
+        let through = if uv_mode { None } else { self.paint_through_geometry() };
+        let depth = match &through {
+            Some(geometry) => {
+                let size = ((viewport.x / 2.0).max(64.0) as u32, (viewport.y / 2.0).max(64.0) as u32);
+                Some(std::sync::Arc::new(EyeDepth::render(&geometry.0, &self.camera, size.0, size.1)))
+            }
+            None => (!uv_mode).then(|| self.eye_depth(viewport)),
+        };
         let stroke = Stroke::new(&self.tool.brush, &self.mesh);
         let mut canvas = StrokeCanvas::new(size.0, size.1);
         if !quick_mask {
@@ -328,6 +349,7 @@ impl Session {
             stroke,
             canvas,
             depth,
+            through,
             uv: uv_mode.then(UvStrokeState::default),
             camera: self.camera,
             viewport,
@@ -390,7 +412,15 @@ impl Session {
         let image = self.images.get(&st.image)?.clone();
         let aspect = viewport.x.max(1.0) / viewport.y.max(1.0);
         let (center, half, rotation) = st.placement(image.width as f32 / image.height.max(1) as f32, aspect);
-        Some(texturecraft_compose::Stencil { image, view_proj: self.camera.view_proj(aspect), center, half, rotation, tile: st.tile })
+        Some(texturecraft_compose::Stencil {
+            image,
+            view_proj: self.camera.view_proj(aspect),
+            center,
+            half,
+            rotation,
+            tile_x: st.tiling.horizontal(),
+            tile_y: st.tiling.vertical(),
+        })
     }
 
     /// Painting is paused while a bake preview shows the baked maps instead of the material.
@@ -497,15 +527,16 @@ impl Session {
         let Some(st) = self.stroke.as_mut() else { return false };
         let Some(cache) = self.caches.get_mut(st.ts) else { return false };
         let material = self.doc.project.texture_sets.get(st.ts).map(|t| t.material).unwrap_or(0);
-        let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &st.camera, viewport: st.viewport };
+        let (mesh, bvh) = st.through.as_deref().map_or((&*self.mesh, &*self.bvh), |(mesh, bvh)| (mesh, bvh));
+        let ctx = PickCtx { mesh, bvh, camera: &st.camera, viewport: st.viewport };
         let stamps = st.stroke.add(&ctx, screen, pressure);
         let hit = st.stroke.last_hit().is_some();
         if stamps.is_empty() {
             return hit;
         }
         let rctx = RasterCtx {
-            mesh: &self.mesh,
-            bvh: &self.bvh,
+            mesh,
+            bvh,
             gbuf: &cache.gbuf,
             material,
             depth: st.depth.as_deref(),

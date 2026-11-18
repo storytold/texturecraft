@@ -115,6 +115,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::instance_cmds::specs());
         v.extend(crate::mask_cmds::specs());
         v.extend(crate::mask_export::specs());
+        v.extend(crate::layer_channels::specs());
         v.extend(crate::color_selection_cmds::specs());
         v.extend(crate::effect_clipboard::specs());
         v.extend(crate::tool_cmds::specs());
@@ -124,6 +125,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::solo::specs());
         v.extend(crate::camera_cmds::specs());
         v.extend(crate::quick_mask::specs());
+        v.extend(crate::hide_excluded::specs());
         v.extend(crate::set_cmds::specs());
         v.extend(crate::meshmap_cmds::specs());
         v.extend(crate::meshmap_import_cmds::specs());

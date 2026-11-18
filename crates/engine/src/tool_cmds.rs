@@ -4,7 +4,7 @@
 use serde_json::{Value, json};
 use texturecraft_core::Channel;
 use texturecraft_geom::glam::Vec2;
-use texturecraft_paint::{Alignment, BrushAlpha, MAX_RADIAL_COPIES, alphas};
+use texturecraft_paint::{Alignment, BrushAlpha, JitterAxis, JitterDistribution, MAX_RADIAL_COPIES, alphas};
 
 use crate::commands::{CommandSpec, always, bad, boolp, channel_param, color_of, color_param, f32p, strp, vec3};
 use crate::fill_hit_test::FillHitTest;
@@ -36,7 +36,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Brush settings",
             [],
             None,
-            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, alphaSizeX?: 5..100 and alphaSizeY?: 5..100 (percent of the stamp the alpha fills), alphaRoundness?: 0..100 (Round alpha only: 100 circle, 0 square), alphaContrast?: 1..8, alphaInvert?, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), cloneAligned? (default true: the first stroke fixes the offset to the source for the following strokes; false: every stroke starts sampling at the source point), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
+            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, jitterAxis?: both|single, jitterDistribution?: uniform|gaussian, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, alphaSizeX?: 5..100 and alphaSizeY?: 5..100 (percent of the stamp the alpha fills), alphaRoundness?: 0..100 (Round alpha only: 100 circle, 0 square), alphaContrast?: 1..8, alphaInvert?, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), cloneAligned? (default true: the first stroke fixes the offset to the source for the following strokes; false: every stroke starts sampling at the source point), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
             always,
             brush
         ),
@@ -63,11 +63,47 @@ pub fn specs() -> Vec<CommandSpec> {
             swap_mask_value
         ),
         cmd!(
+            "tool.symmetry",
+            "Symmetry",
+            ["Tools"],
+            Some("L"),
+            "{enabled?: bool} — the toolbar's symmetry toggle (toggles when omitted); the symmetry settings stay",
+            always,
+            |s, p| toggle(s, p, |t| &mut t.brush.symmetry.enabled, "enabled")
+        ),
+        cmd!(
+            "tool.lazyMouse",
+            "Lazy mouse",
+            ["Tools"],
+            Some("D"),
+            "{enabled?: bool} — toggles when omitted; on uses the last lazy distance (20 px at first), off keeps it for the next time",
+            always,
+            lazy_mouse
+        ),
+        cmd!(
+            "tool.resumeStroke",
+            "Resume previous stroke",
+            ["Tools"],
+            Some("A"),
+            "{enabled?: bool} — toggles when omitted; while on, a new stroke is drawn as a straight line from where the previous one ended (as Shift+click does)",
+            always,
+            |s, p| toggle(s, p, |t| &mut t.resume_stroke, "enabled")
+        ),
+        cmd!(
+            "tool.ignoreStencil",
+            "Ignore stencil",
+            ["Tools"],
+            Some("N"),
+            "{enabled?: bool} — toggles when omitted; while on, the Projection tool paints its plain brush without the stencil image",
+            always,
+            |s, p| toggle(s, p, |t| &mut t.ignore_stencil, "enabled")
+        ),
+        cmd!(
             "tool.stencil",
             "Projection stencil",
             [],
             None,
-            "{image?: resource name, center?: [x,y] NDC, scale?: 0.01..10, rotation?: degrees, tile?, opacity?, clear?: bool}",
+            "{image?: resource name, center?: [x,y] NDC, scale?: 0.01..10, rotation?: degrees, tiling?: none|horizontal|vertical|both (repeat along the stencil's X, Y or both; `tile`: true/false still works, true is both), opacity?, hideWhilePainting?: bool (default true: the 3D view hides the stencil image and outline while a stroke is painted), clear?: bool}",
             always,
             stencil
         ),
@@ -111,6 +147,29 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!("tool.state", "Tool state", [], None, "{}", always, |s, _| Ok(serde_json::to_value(&s.tool).unwrap_or(Value::Null))),
     ]
+}
+
+/// Set a switch of the tool state to `enabled`, or flip it when the param is missing
+fn toggle(session: &mut Session, params: &Value, switch: fn(&mut crate::session::ToolState) -> &mut bool, key: &str) -> Result<Value> {
+    let slot = switch(&mut session.tool);
+    *slot = boolp(params, key).unwrap_or(!*slot);
+    let enabled = *slot;
+    session.revision = session.revision.wrapping_add(1);
+    Ok(json!({ "enabled": enabled }))
+}
+
+/// Lazy mouse on or off. Off sets the distance to 0 and remembers it, on brings it back.
+fn lazy_mouse(session: &mut Session, params: &Value) -> Result<Value> {
+    let tool = &mut session.tool;
+    let on = boolp(params, "enabled").unwrap_or(tool.brush.lazy <= 0.0);
+    if on && tool.brush.lazy <= 0.0 {
+        tool.brush.lazy = if tool.lazy_distance > 0.0 { tool.lazy_distance } else { crate::session::default_lazy_distance() };
+    } else if !on && tool.brush.lazy > 0.0 {
+        tool.lazy_distance = tool.brush.lazy;
+        tool.brush.lazy = 0.0;
+    }
+    session.revision = session.revision.wrapping_add(1);
+    Ok(json!({ "enabled": session.tool.brush.lazy > 0.0, "lazy": session.tool.brush.lazy }))
 }
 
 pub(crate) fn set_tool(session: &mut Session, tool: Tool) -> Result<Value> {
@@ -179,6 +238,20 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
     }
     if let Some(value) = f32p(params, "jitterPosition") {
         settings.jitter_position = value / 100.0;
+    }
+    if let Some(axis) = strp(params, "jitterAxis") {
+        settings.jitter_axis = match axis {
+            "both" => JitterAxis::Both,
+            "single" => JitterAxis::Single,
+            other => return Err(bad("tool.brush", format!("unknown jitterAxis `{other}` (both|single)"))),
+        };
+    }
+    if let Some(distribution) = strp(params, "jitterDistribution") {
+        settings.jitter_distribution = match distribution {
+            "uniform" => JitterDistribution::Uniform,
+            "gaussian" => JitterDistribution::Gaussian,
+            other => return Err(bad("tool.brush", format!("unknown jitterDistribution `{other}` (uniform|gaussian)"))),
+        };
     }
 
     let alpha = params.get("alpha");
@@ -389,6 +462,15 @@ fn swap_mask_value(session: &mut Session, _: &Value) -> Result<Value> {
 }
 
 fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
+    // The display switch works with or without an image
+    if let Some(hide) = boolp(params, "hideWhilePainting") {
+        session.tool.hide_stencil_while_painting = hide;
+        session.revision = session.revision.wrapping_add(1);
+        if params.as_object().is_some_and(|object| object.len() == 1) {
+            return Ok(json!({ "hideWhilePainting": hide }));
+        }
+    }
+
     if boolp(params, "clear") == Some(true) {
         if let Some(cleared) = session.tool.stencil.take() {
             session.tool.stencil_look = cleared.look();
@@ -420,8 +502,9 @@ fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
     if let Some(rotation) = f32p(params, "rotation") {
         stencil_state.rotation = rotation.rem_euclid(360.0);
     }
-    if let Some(tile) = boolp(params, "tile") {
-        stencil_state.tile = tile;
+    if let Some(value) = params.get("tiling").or_else(|| params.get("tile")) {
+        stencil_state.tiling =
+            crate::session::StencilTiling::from_value(value).ok_or_else(|| bad("tool.stencil", "`tiling` must be none, horizontal, vertical or both"))?;
     }
     if let Some(opacity) = f32p(params, "opacity") {
         stencil_state.opacity = opacity.clamp(0.0, 1.0);

@@ -27,6 +27,16 @@ fn invoke(h: &mut Harness<'_, TextureCraftApp>, id: &str) {
     texturecraft_ui_egui::menus::invoke(h.state_mut(), &ctx, id);
 }
 
+/// The file dialog behind a menu item; Export Mesh's comes after its options prompt, whose Export asks for it this way
+fn ask_file_of(h: &mut Harness<'_, TextureCraftApp>, id: &str) {
+    if id == "file.exportMesh" {
+        let ctx = h.ctx.clone();
+        assert!(texturecraft_ui_egui::windows::file_action(h.state_mut(), &ctx, id));
+    } else {
+        invoke(h, id);
+    }
+}
+
 /// A path in a new temporary folder.
 fn temp_file(test: &str, name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("texturecraft-file-dialogs-{test}-{}", std::process::id()));
@@ -147,7 +157,7 @@ fn answered_after_the_project_changed(ask: impl FnOnce(&mut Harness<'_, TextureC
 fn every_project_dialog_does_nothing_for_a_replaced_project() {
     let file = temp_file("replaced-actions", "chosen.obj");
     for id in ["material.load", "resource.import", "file.importMaterialX", "file.exportMesh", "file.reimportMesh"] {
-        let h = answered_after_the_project_changed(|h| invoke(h, id), &file);
+        let h = answered_after_the_project_changed(|h| ask_file_of(h, id), &file);
         assert!(h.state().toasts.iter().any(|t| t.error && t.text.starts_with(PROJECT_CHANGED)), "{id}");
         assert!(!file.exists(), "{id} wrote nothing");
     }

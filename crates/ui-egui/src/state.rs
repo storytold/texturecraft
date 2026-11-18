@@ -79,9 +79,15 @@ pub struct Windows {
     /// Browser File › Export Mesh: the download format choice.
     #[serde(default)]
     pub export_mesh: bool,
+    /// File › Export Mesh: the Mesh Export Options prompt before the file choice
+    #[serde(skip)]
+    pub mesh_export_options: bool,
     /// Edit > Project Configuration: what is chosen so far, applied by OK.
     #[serde(skip)]
     pub project_config: Option<ProjectConfig>,
+    /// Edit > Settings: the page and the settings edited so far, applied by OK.
+    #[serde(skip)]
+    pub settings_draft: Option<crate::settings_window::SettingsDraft>,
     /// What waits on the unsaved-changes dialog: save, don't save or cancel.
     #[serde(skip)]
     pub unsaved: Option<Unsaved>,
@@ -111,7 +117,7 @@ pub struct Prefs {
     pub ui_scale: f32,
     /// Minutes between autosaves of a modified project (0: off; desktop).
     pub autosave_minutes: u32,
-    /// UI language code (`i18n::LANGUAGES`).
+    /// UI language code (`i18n::LANGUAGES`), or `i18n::SYSTEM_LANGUAGE` to follow the system.
     pub language: String,
     /// Viewport texture resolution: 0 full, 1 half, 2 quarter of each texture set's size (lighter
     /// on GPU memory and uploads for 4K and 8K sets; painting and export keep full resolution).
@@ -132,7 +138,35 @@ pub struct Prefs {
     pub project_open_limit_gib: u32,
     /// Percent of the free RAM a project save may hold at once (desktop; 1 to 100).
     pub save_ram_percent: u8,
+    /// Worker threads for painting, baking and export (desktop; 0: one per logical CPU). Read at
+    /// startup, before the first parallel job.
+    pub work_threads: u32,
+    /// 3D view orbit speed; [`DEFAULT_ROTATION_SPEED`] is the built-in speed.
+    pub rotation_speed: f32,
+    /// 3D view drag zoom speed (1 is the built-in speed) and whether it runs the other way.
+    pub zoom_speed: f32,
+    pub zoom_inverse: bool,
+    /// 3D view mouse wheel zoom speed (1 is the built-in speed) and whether it runs the other way.
+    pub wheel_speed: f32,
+    pub wheel_inverse: bool,
+    /// Bakes cast their rays on the GPU when one is available (else on the CPU).
+    pub gpu_raytracing: bool,
+    /// Library locations the user added (Settings > Libraries), after the built-in ones.
+    pub libraries: Vec<LibraryLocation>,
 }
+
+/// A folder the user added as a library: its name and path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LibraryLocation {
+    pub name: String,
+    pub path: String,
+}
+
+/// The orbit speed the built-in navigation runs at.
+pub const DEFAULT_ROTATION_SPEED: f32 = 2.0;
+/// The range of the camera speed sliders.
+pub const CAMERA_SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.1..=10.0;
 
 impl Default for Prefs {
     fn default() -> Self {
@@ -148,8 +182,21 @@ impl Default for Prefs {
             reserved_cores: 1,
             project_open_limit_gib: texturecraft_engine::formats::DEFAULT_PROJECT_OPEN_LIMIT_GIB,
             save_ram_percent: 50,
+            work_threads: 0,
+            rotation_speed: DEFAULT_ROTATION_SPEED,
+            zoom_speed: 1.0,
+            zoom_inverse: false,
+            wheel_speed: 1.0,
+            wheel_inverse: false,
+            gpu_raytracing: true,
+            libraries: Vec::new(),
         }
     }
+}
+
+/// `value` as a camera speed: inside the sliders' range, the default for a value that is not a number.
+fn camera_speed(value: f32, default: f32) -> f32 {
+    if value.is_finite() { value.clamp(*CAMERA_SPEED_RANGE.start(), *CAMERA_SPEED_RANGE.end()) } else { default }
 }
 
 impl Prefs {
@@ -158,6 +205,34 @@ impl Prefs {
         texturecraft_engine::formats::set_project_open_limit_gib(self.project_open_limit_gib);
         #[cfg(not(target_arch = "wasm32"))]
         texturecraft_engine::formats::set_save_resources(self.reserved_cores as usize, self.save_ram_percent);
+        texturecraft_engine::bake::set_gpu_raytracing(self.gpu_raytracing);
+    }
+
+    /// Size the shared worker pool to `work_threads` (0 keeps one thread per logical CPU). Only
+    /// the first call of a process can do this, before any parallel work: true when it did.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_work_threads(&self) -> bool {
+        if self.work_threads == 0 {
+            return false;
+        }
+        rayon::ThreadPoolBuilder::new().num_threads(self.work_threads as usize).build_global().is_ok()
+    }
+
+    /// The 3D view's orbit per dragged point, relative to the built-in speed.
+    pub fn orbit_scale(&self) -> f32 {
+        camera_speed(self.rotation_speed, DEFAULT_ROTATION_SPEED) / DEFAULT_ROTATION_SPEED
+    }
+
+    /// The 3D view's drag zoom relative to the built-in speed; negative when inverted.
+    pub fn drag_zoom_scale(&self) -> f32 {
+        let speed = camera_speed(self.zoom_speed, 1.0);
+        if self.zoom_inverse { -speed } else { speed }
+    }
+
+    /// The 3D view's wheel zoom relative to the built-in speed; negative when inverted.
+    pub fn wheel_zoom_scale(&self) -> f32 {
+        let speed = camera_speed(self.wheel_speed, 1.0);
+        if self.wheel_inverse { -speed } else { speed }
     }
 }
 
@@ -301,6 +376,9 @@ pub struct UiState {
     pub blend_clipboard: Option<Vec<(Channel, ChannelBlend)>>,
     pub mode: Mode,
     pub layout: ViewLayout,
+    /// The split layout shows the 2D view on the left and the 3D view on the right
+    #[serde(default)]
+    pub swap_views: bool,
     /// The 3D view's share of the viewport width in the split layout
     #[serde(default = "default_split_ratio")]
     pub split_ratio: f32,
@@ -351,6 +429,9 @@ pub struct UiState {
     pub text: TextUi,
     /// Layer being renamed and the edit buffer.
     pub rename: Option<(u64, String)>,
+    /// Texture set being renamed in the Texture Sets list and the edit buffer.
+    #[serde(skip)]
+    pub set_rename: Option<(usize, String)>,
     pub new_project: NewProject,
     /// Show the UV wireframe in the 2D view.
     pub uv_wireframe: bool,
@@ -387,9 +468,18 @@ pub struct UiState {
     /// Panel arrangements saved under a name (Window > Layouts), in the order they were saved
     #[serde(default)]
     pub named_layouts: Vec<crate::named_layouts::NamedLayout>,
+    /// Bake settings saved under a name (Mesh Map Bakers > Presets), in the order they were saved
+    #[serde(default)]
+    pub bake_presets: Vec<crate::bake_presets::BakePreset>,
+    /// The name typed in the bake presets menu
+    #[serde(skip)]
+    pub bake_preset_name: String,
     /// The save, replace or manage dialog of the named layouts
     #[serde(skip)]
     pub layout_dialog: Option<crate::named_layouts::LayoutDialog>,
+    /// The Log panel's shown channel tab
+    #[serde(default)]
+    pub log_channel: crate::log_panel::LogChannel,
 }
 
 impl UiState {
@@ -435,8 +525,10 @@ impl UiState {
         self.keymap = keep.keymap;
         self.tool_settings = keep.tool_settings;
         self.named_layouts = keep.named_layouts;
+        self.bake_presets = keep.bake_presets;
         self.layout_dialog = None;
         self.rename = None;
+        self.set_rename = None;
 
         // The shelf's search, type and folder are one query, and saved searches are the user's own
         self.shelf_filter = keep.shelf_filter;
@@ -451,6 +543,7 @@ impl Default for UiState {
         UiState {
             mode: Mode::Painting,
             layout: ViewLayout::Split,
+            swap_views: false,
             split_ratio: default_split_ratio(),
             dock: Dock::default(),
             rail_panel: None,
@@ -474,6 +567,7 @@ impl Default for UiState {
             props_tab: PropsTab::Brush,
             text: TextUi::default(),
             rename: None,
+            set_rename: None,
             new_project: NewProject::default(),
             uv_wireframe: true,
             wireframe_3d: false,
@@ -488,7 +582,10 @@ impl Default for UiState {
             tool_settings: Default::default(),
             bake_visualization: crate::bake_mode::BakeVisualizationToggles::default(),
             named_layouts: Vec::new(),
+            bake_presets: Vec::new(),
+            bake_preset_name: String::new(),
             layout_dialog: None,
+            log_channel: crate::log_panel::LogChannel::default(),
         }
     }
 }
@@ -496,6 +593,40 @@ impl Default for UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_speeds_scale_the_built_in_navigation_and_inverse_flips_it() {
+        let mut prefs = Prefs::default();
+        assert_eq!((prefs.orbit_scale(), prefs.drag_zoom_scale(), prefs.wheel_zoom_scale()), (1.0, 1.0, 1.0), "the defaults keep the built-in speeds");
+
+        prefs.rotation_speed = 4.0;
+        prefs.zoom_speed = 0.5;
+        prefs.zoom_inverse = true;
+        prefs.wheel_inverse = true;
+        assert_eq!((prefs.orbit_scale(), prefs.drag_zoom_scale(), prefs.wheel_zoom_scale()), (2.0, -0.5, -1.0));
+
+        // Values from an edited settings file stay usable
+        prefs.rotation_speed = f32::NAN;
+        prefs.wheel_speed = 1e9;
+        assert_eq!(prefs.orbit_scale(), 1.0);
+        assert_eq!(prefs.wheel_zoom_scale(), -*CAMERA_SPEED_RANGE.end());
+    }
+
+    #[test]
+    fn settings_saved_before_the_new_options_load_their_defaults() {
+        let prefs: Prefs = serde_json::from_str(r#"{"autosave_minutes": 5}"#).unwrap();
+        assert_eq!(prefs.autosave_minutes, 5);
+        assert_eq!((prefs.rotation_speed, prefs.zoom_speed, prefs.wheel_speed), (2.0, 1.0, 1.0));
+        assert!(prefs.gpu_raytracing && !prefs.zoom_inverse && !prefs.wheel_inverse);
+        assert_eq!(prefs.work_threads, 0);
+        assert!(prefs.libraries.is_empty());
+    }
+
+    #[test]
+    fn the_first_run_follows_the_system_language() {
+        let mut session = texturecraft_engine::Session::closed().unwrap();
+        assert_eq!(crate::start_ui(None, &mut session).prefs.language, crate::i18n::SYSTEM_LANGUAGE);
+    }
 
     #[test]
     fn adopting_a_layout_keeps_recent_files_export_settings_and_shortcuts() {

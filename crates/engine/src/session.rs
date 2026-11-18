@@ -14,7 +14,7 @@ use texturecraft_paint::{BrushSettings, EyeDepth, Stroke, StrokeCanvas};
 use texturecraft_texel::DilationMap;
 
 use crate::fill_mode::FillMode;
-pub use crate::stencil_look::StencilLook;
+pub use crate::stencil_look::{StencilLook, StencilTiling};
 use crate::{EngineError, Result};
 
 /// Padding (texels) applied to composites for display.
@@ -150,7 +150,13 @@ pub enum ViewMode {
     UvChecker,
     /// One layer's mask, in grayscale (Alt+click a mask).
     Mask(LayerId),
+    /// The surface normal the shading uses, unlit: the mesh normal turned by the Height
+    /// channel's slope and the Normal channel ("Normal+height+mesh").
+    NormalHeightMesh,
 }
+
+/// The view picker's entry for [`ViewMode::NormalHeightMesh`]
+pub const NORMAL_HEIGHT_MESH_LABEL: &str = "Normal+height+mesh";
 
 impl ViewMode {
     pub fn label(&self) -> String {
@@ -160,6 +166,7 @@ impl ViewMode {
             ViewMode::MeshMap(m) => m.id().into(),
             ViewMode::UvChecker => "UV checker".into(),
             ViewMode::Mask(_) => "Layer mask".into(),
+            ViewMode::NormalHeightMesh => NORMAL_HEIGHT_MESH_LABEL.into(),
         }
     }
 }
@@ -175,8 +182,9 @@ pub struct StencilState {
     pub scale: f32,
     /// Rotation in degrees.
     pub rotation: f32,
-    /// Repeat the image across the screen.
-    pub tile: bool,
+    /// Which directions repeat the image across the screen (old projects saved an on/off switch: on is both).
+    #[serde(alias = "tile")]
+    pub tiling: StencilTiling,
     /// Overlay opacity in the viewport (display only).
     pub opacity: f32,
 }
@@ -188,11 +196,11 @@ impl StencilState {
 
     /// A stencil of `image` placed as `look` says.
     pub fn with_look(image: &str, look: StencilLook) -> StencilState {
-        StencilState { image: image.to_string(), center: look.center, scale: look.scale, rotation: look.rotation, tile: look.tile, opacity: look.opacity }
+        StencilState { image: image.to_string(), center: look.center, scale: look.scale, rotation: look.rotation, tiling: look.tiling, opacity: look.opacity }
     }
 
     pub fn look(&self) -> StencilLook {
-        StencilLook { center: self.center, scale: self.scale, rotation: self.rotation, tile: self.tile, opacity: self.opacity }
+        StencilLook { center: self.center, scale: self.scale, rotation: self.rotation, tiling: self.tiling, opacity: self.opacity }
     }
 
     /// Back to the placement a new stencil starts with (center, scale and rotation); the image, tiling and opacity stay.
@@ -256,6 +264,27 @@ pub struct ToolState {
     /// The Path tool's curve being edited.
     #[serde(default)]
     pub path: crate::path_tool::PathState,
+    /// The lazy mouse distance the toggle (`tool.lazyMouse`) switches back to, in screen pixels
+    #[serde(default = "default_lazy_distance")]
+    pub lazy_distance: f32,
+    /// A new stroke continues from where the previous one ended (`tool.resumeStroke`)
+    #[serde(default)]
+    pub resume_stroke: bool,
+    /// The Projection tool paints without its stencil image (`tool.ignoreStencil`)
+    #[serde(default)]
+    pub ignore_stencil: bool,
+    /// The stencil image and outline are not drawn in the 3D view while a stroke is being painted
+    #[serde(default = "default_hide_stencil")]
+    pub hide_stencil_while_painting: bool,
+}
+
+/// The lazy mouse distance the toggle starts with when none was set yet (screen pixels)
+pub(crate) fn default_lazy_distance() -> f32 {
+    20.0
+}
+
+pub(crate) fn default_hide_stencil() -> bool {
+    true
 }
 
 pub(crate) fn default_smudge_strength() -> f32 {
@@ -309,6 +338,10 @@ impl Default for ToolState {
             clone_aligned: true,
             clone_from: CloneFrom::Composite,
             path: Default::default(),
+            lazy_distance: default_lazy_distance(),
+            resume_stroke: false,
+            ignore_stencil: false,
+            hide_stencil_while_painting: default_hide_stencil(),
         };
         t.values.insert(Channel::BaseColor, [0.8, 0.8, 0.8]);
         t.values.insert(Channel::Roughness, [0.3; 3]);
@@ -335,6 +368,8 @@ pub(crate) struct ActiveStroke {
     pub canvas: StrokeCanvas,
     /// Camera visibility for 3D strokes (None for strokes in the 2D view).
     pub depth: Option<Arc<EyeDepth>>,
+    /// The mesh and BVH without the parts the geometry mask excludes, while they are hidden.
+    pub through: Option<Arc<(Mesh, Bvh)>>,
     /// 2D view strokes: where the stroke is between samples.
     pub uv: Option<crate::uv_stroke_state::UvStrokeState>,
     pub camera: OrbitCamera,
@@ -416,6 +451,9 @@ pub struct Session {
     /// Set by [`crate::execute`] from a command's `merge` param: its edits continue the previous
     /// undo step with the same label (a slider drag is one step however many values it applies).
     pub(crate) merge_edits: bool,
+    /// Pause Engine Computation: the UI skips its per-frame compositing and texture uploads, so edits only
+    /// mark tiles dirty. [`Session::update`] (export, mask bitmaps, pickup) still composites what it needs.
+    pub paused: bool,
     pub tool: ToolState,
     pub active_set: usize,
     /// Selected layer per texture set.
@@ -435,10 +473,15 @@ pub struct Session {
     pub(crate) stroke: Option<ActiveStroke>,
     /// Layer clipboard: a document snapshot and the copied layer (or effect).
     pub clipboard: Option<(Document, LayerId)>,
+    /// Mask clipboard (`mask.copy`): a document snapshot and the layer whose mask was copied.
+    pub mask_clipboard: Option<(Document, LayerId)>,
     /// Decoded image resources (rebuilt from `doc.resources` by `Session::sync_images`).
     pub images: texturecraft_compose::ImageStore,
     /// Temporary texel mask limiting paint strokes (not saved, not in the history).
     pub quick_mask: crate::quick_mask::QuickMask,
+    /// Hide/ignore excluded geometry: the parts the selected layer's geometry mask leaves out are
+    /// not drawn, and picking and strokes skip them (not saved).
+    pub hide_excluded: bool,
     /// A path sublayer is being repainted from its paths (the only way to paint into one).
     pub(crate) painting_paths: bool,
     /// Pixels of the paths below the one being edited, so live edits skip repainting them.
@@ -497,6 +540,7 @@ impl Session {
             undo: Vec::new(),
             redo: Vec::new(),
             merge_edits: false,
+            paused: false,
             tool: ToolState::default(),
             active_set: 0,
             selected,
@@ -509,8 +553,10 @@ impl Session {
             viewport: Vec2::new(1280.0, 800.0),
             stroke: None,
             clipboard: None,
+            mask_clipboard: None,
             images: Default::default(),
             quick_mask: Default::default(),
+            hide_excluded: false,
             painting_paths: false,
             path_cache: None,
             path_draft: None,

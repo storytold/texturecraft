@@ -2,7 +2,7 @@
 //! these keys as clipboard events, not key presses, so the tests send those events.
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::core::LayerId;
 use texturecraft_ui_egui::TextureCraftApp;
 
@@ -94,4 +94,58 @@ fn layer_shortcuts_act_on_a_selected_effect() {
     h.key_press(egui::Key::Delete);
     h.run_steps(3);
     assert_eq!(effects(&h), Some(2), "Delete removes the effect, not its layer");
+}
+
+fn instances_of(h: &Harness<'_, TextureCraftApp>, source: LayerId) -> usize {
+    h.state().session.doc.project.layers.values().filter(|l| l.instance_source() == Some(source)).count()
+}
+
+/// Ctrl+Shift+V pastes the copied layer as an instance, and is greyed with nothing copied.
+#[test]
+fn ctrl_shift_v_pastes_an_instance() {
+    let (mut h, layer) = harness();
+    let before = count(&h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::V);
+    h.run_steps(3);
+    assert_eq!(count(&h), before, "nothing is copied, so the key does nothing");
+    assert!(!texturecraft_ui_egui::menus::enabled(h.state(), "layer.pasteInstance"));
+    h.event(egui::Event::Copy);
+    h.run_steps(3);
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::V);
+    h.run_steps(3);
+    assert_eq!(count(&h), before + 1, "one new layer");
+    assert_eq!(instances_of(&h, layer), 1, "and it is an instance of the copied layer");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(3);
+    assert_eq!(count(&h), before, "undo removes the instance");
+}
+
+/// The layer menu names the key and greys the item until a layer is copied; the key can be rebound.
+#[test]
+fn the_layer_menu_shows_the_paste_instance_key() {
+    let (mut h, layer) = harness();
+    let name = h.state().session.doc.project.layers[&layer].name.clone();
+    h.get_by_label(&name).click_secondary();
+    h.run_steps(3);
+    let item = h.get_by_label("Paste as instance Ctrl+Shift+V");
+    assert!(item.accesskit_node().is_disabled(), "nothing copied yet");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    h.event(egui::Event::Copy);
+    h.run_steps(3);
+    h.get_by_label(&name).click_secondary();
+    h.run_steps(3);
+    assert!(!h.get_by_label("Paste as instance Ctrl+Shift+V").accesskit_node().is_disabled(), "a copied layer enables it");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+
+    let before = count(&h);
+    h.state_mut().ui.keymap.insert("layer.pasteInstance".into(), "Ctrl+Alt+V".into());
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::V);
+    h.run_steps(3);
+    assert_eq!(count(&h), before, "the old key is free after rebinding");
+    h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::ALT, egui::Key::V);
+    h.run_steps(3);
+    assert_eq!(instances_of(&h, layer), 1, "the new key pastes the instance");
 }

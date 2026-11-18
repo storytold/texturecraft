@@ -1,6 +1,6 @@
 //! Keyboard shortcuts: every menu item and every command a key can run, the user's
 //! overrides (`UiState::keymap`, id → "Ctrl+Shift+E" or "" for unbound), conflict detection and
-//! the shortcut editor window (Edit ▸ Settings ▸ Keyboard, Help ▸ Shortcuts list).
+//! the shortcut editor window (Help ▸ Shortcuts list) and the Edit ▸ Settings ▸ Shortcuts page.
 
 use std::collections::BTreeMap;
 
@@ -261,10 +261,75 @@ pub fn captured(mods: Modifiers, key: Key) -> bool {
 }
 
 const CAPTURE: &str = "keymap_capture";
+/// The binding Settings > Shortcuts waits a key combination for.
+const SETTINGS_CAPTURE: &str = "settings_keymap_capture";
 
 /// Whether the editor is waiting for a key combination (global shortcuts pause meanwhile).
 pub fn capturing(ctx: &egui::Context) -> bool {
-    ctx.data(|d| d.get_temp::<usize>(Id::unique(CAPTURE))).is_some()
+    ctx.data(|d| d.get_temp::<usize>(Id::unique(CAPTURE)).is_some() || d.get_temp::<usize>(Id::unique(SETTINGS_CAPTURE)).is_some())
+}
+
+/// Settings > Shortcuts stops waiting for a key combination (another page, OK or Cancel).
+pub(crate) fn stop_settings_capture(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<usize>(Id::unique(SETTINGS_CAPTURE)));
+}
+
+/// Settings > Shortcuts: one row per bindable item with its name, its shortcut in `keymap` and
+/// a pencil that waits for the new key combination (Esc cancels). `recorder` reads the pressed
+/// keys as the app's shortcuts do; `edited` follows `keymap` to show shared shortcuts.
+pub(crate) fn actions_page(ui: &mut egui::Ui, keymap: &mut Keymap, recorder: &Bindings, edited: &mut Bindings) {
+    let ctx = ui.ctx().clone();
+    let tk = Tokens::get(&ctx);
+    let capture_id = Id::unique(SETTINGS_CAPTURE);
+    let mut capture: Option<usize> = ctx.data(|d| d.get_temp(capture_id));
+    if let (Some(i), Some(sc)) = (capture, pressed(&ctx, recorder)) {
+        if (sc.logical_key != Key::Escape || !sc.modifiers.is_none())
+            && let Some(b) = bindings().get(i)
+        {
+            rebind(keymap, b, &format_shortcut(&sc));
+        }
+        capture = None;
+    }
+    edited.sync(keymap, craft_keymap::egui::platform(&ctx));
+
+    let cell = |ui: &mut egui::Ui, width: f32, add: &mut dyn FnMut(&mut egui::Ui)| {
+        ui.allocate_ui_with_layout(vec2(width, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_width(width);
+            add(ui);
+        });
+    };
+    for (i, b) in bindings().iter().enumerate() {
+        let waiting = capture == Some(i);
+        ui.horizontal(|ui| {
+            cell(ui, 330.0, &mut |ui| {
+                ui.add(egui::Label::new(tr(b.label)).truncate()).on_hover_text(tr(b.group));
+            });
+            cell(ui, 150.0, &mut |ui| {
+                if waiting {
+                    ui.label(RichText::new(tr("Press a key...")).color(tk.accent));
+                } else {
+                    ui.label(shortcut(keymap, b).unwrap_or(""));
+                }
+                if let Some(other) = edited.conflict(b) {
+                    ui.label(RichText::new(ic::WARNING).color(tk.danger))
+                        .on_hover_text(trf("Also bound to {item} ({menu})", &[("item", &tr(other.label)), ("menu", &tr(other.group))]));
+                }
+            });
+            let edit = trf("Edit the shortcut of {item}", &[("item", &tr(b.label))]);
+            if icon_button(ui, ic::PENCIL_SIMPLE, &edit, waiting, 20.0).clicked() {
+                capture = if waiting { None } else { Some(i) };
+            }
+        });
+    }
+
+    ctx.data_mut(|d| match capture {
+        Some(i) => {
+            d.insert_temp(capture_id, i);
+        }
+        None => {
+            d.remove::<usize>(capture_id);
+        }
+    });
 }
 
 /// The first key press this frame as a shortcut.
@@ -406,6 +471,7 @@ pub fn fixed_gestures() -> Vec<(String, String)> {
     let keyed = |template: &str| trf(template, &[("key", &stencil)]);
     vec![
         (tr("Alt + LMB drag").into(), tr("Orbit").into()),
+        (tr("Alt + Shift + LMB drag").into(), tr("Camera snap rotate").into()),
         (tr("RMB drag").into(), tr("Orbit (3D view)").into()),
         (tr("MMB drag / Alt + MMB").into(), tr("Pan").into()),
         (tr("Wheel / Alt + RMB drag").into(), tr("Zoom").into()),

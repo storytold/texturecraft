@@ -68,6 +68,7 @@ pub const CATALOG: &[Item] = &[
     sub("Window", "Views", "Assets", "ui.view.assets", None),
     sub("Window", "Views", "Common Settings", "ui.view.bakeSettings", None),
     sub("Window", "Views", "Display Settings", "ui.view.display", None),
+    sub("Window", "Views", "Export", "ui.view.export", None),
     sub("Window", "Views", "History", "ui.view.history", None),
     sub("Window", "Views", "Layers", "ui.view.layers", None),
     sub("Window", "Views", "Log", "ui.view.log", None),
@@ -108,12 +109,19 @@ pub const CATALOG: &[Item] = &[
     it("Viewport", "3D/2D views", "ui.layout.split", Some("F1")),
     it("Viewport", "3D view only", "ui.layout.3d", Some("F2")),
     it("Viewport", "2D view only", "ui.layout.2d", Some("F3")),
+    it("Viewport", "Swap 3D/2D", "ui.layout.swap", Some("F4")),
     sep("Viewport"),
     it("Viewport", "Navigation buttons", "ui.navButtons", None),
     sep("Viewport"),
     it("Viewport", "Enable quick mask", "viewport.quickMask", Some("Y")),
     it("Viewport", "Edit quick mask", "viewport.quickMask.edit", Some("U")),
     it("Viewport", "Invert quick mask", "viewport.quickMask.invert", Some("Ctrl+Shift+I")),
+    sep("Viewport"),
+    it("Viewport", "Next texture set", "textureSet.next", None),
+    it("Viewport", "Previous texture set", "textureSet.previous", None),
+    sep("Viewport"),
+    it("Viewport", "Pause Engine Computation", "viewport.pauseEngine", Some("Shift+Escape")),
+    it("Help", "Release notes...", "ui.help.releaseNotes", None),
     it("Help", "Documentation...", "ui.help.docs", None),
     it("Help", "Shortcuts list...", "ui.help.shortcuts", None),
     sep("Help"),
@@ -121,6 +129,7 @@ pub const CATALOG: &[Item] = &[
     it("Help", "ArtCraft website...", "ui.help.website", None),
     it("Help", "Report a bug...", "ui.help.bug", None),
     it("Help", "Show log...", "ui.view.log", None),
+    it("Help", "Export log...", "ui.help.exportLog", None),
     sep("Help"),
     #[cfg(not(target_arch = "wasm32"))]
     it("Help", "Check for Updates...", "ui.help.checkForUpdates", None),
@@ -193,6 +202,9 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
     match id {
         "ui.newProject" => app.ui.windows.new_project = true,
         "ui.export" => app.ui.windows.export = true,
+
+        // The mesh export options come first; their Export leads to the file choice
+        "file.exportMesh" => app.ui.windows.mesh_export_options = true,
         "ui.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         #[cfg(not(target_arch = "wasm32"))]
         "ui.projectConfig" => crate::project_config::open(app),
@@ -218,6 +230,7 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         "ui.layout.split" => app.ui.layout = ViewLayout::Split,
         "ui.layout.3d" => app.ui.layout = ViewLayout::Only3D,
         "ui.layout.2d" => app.ui.layout = ViewLayout::Only2D,
+        "ui.layout.swap" => app.ui.swap_views = !app.ui.swap_views,
         "ui.help.shortcuts" => app.ui.windows.shortcuts = true,
         "ui.about" => app.ui.windows.about = true,
         #[cfg(not(target_arch = "wasm32"))]
@@ -225,6 +238,8 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         "ui.help.discord" => ctx.open_url(egui::OpenUrl::new_tab("https://discord.gg/artcraft")),
         "ui.help.website" => ctx.open_url(egui::OpenUrl::new_tab("https://getartcraft.com/apps/texturecraft")),
         "ui.help.docs" => ctx.open_url(egui::OpenUrl::new_tab("https://github.com/storytold/texturecraft#readme")),
+        "ui.help.releaseNotes" => ctx.open_url(egui::OpenUrl::new_tab("https://github.com/storytold/texturecraft/releases")),
+        "ui.help.exportLog" => crate::windows::export_log(app),
         "ui.help.bug" => ctx.open_url(egui::OpenUrl::new_tab("https://github.com/storytold/texturecraft/issues")),
         _ => {
             if crate::windows::file_action(app, ctx, id) {

@@ -227,3 +227,51 @@ fn dragging_the_divider_keeps_the_uv_texture_size_and_offset_on_screen() {
         assert!((0.1..=40.0).contains(&stopped_zoom), "zoom {zoom} stopped at {stopped_zoom}");
     }
 }
+
+/// Press F4, the default key of Swap 3D/2D
+fn press_f4(harness: &mut Harness<'_, TextureCraftApp>) {
+    harness.event(Event::Key { key: egui::Key::F4, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+    harness.run_steps(3);
+    harness.event(Event::Key { key: egui::Key::F4, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE });
+    harness.run_steps(2);
+}
+
+#[test]
+fn f4_swaps_the_views_and_both_still_work_and_the_state_is_saved() {
+    let mut harness = split_app();
+    let rect_3d = harness.state().viewport_rect;
+    let y = rect_3d.center().y;
+    assert!(!harness.state().ui.swap_views);
+
+    press_f4(&mut harness);
+    assert!(harness.state().ui.swap_views, "F4 swaps");
+    let swapped_3d = harness.state().viewport_rect;
+    assert!(swapped_3d.left() > rect_3d.center().x, "3D is on the right now: {swapped_3d:?}");
+
+    // 2D is on the left: a drag there paints, a right-drag in 3D orbits
+    let (tiles, angles) = (painted_tiles(&harness), camera_angles(&harness));
+    let left_x = rect_3d.left() + 200.0;
+    drag(&mut harness, PointerButton::Primary, pos2(left_x, y), pos2(left_x, y + 40.0));
+    assert!(painted_tiles(&harness) > tiles, "the 2D view on the left paints");
+    let right_x = swapped_3d.center().x;
+    drag(&mut harness, PointerButton::Secondary, pos2(right_x, y), pos2(right_x - 120.0, y));
+    assert_ne!(camera_angles(&harness), angles, "the 3D view on the right orbits");
+
+    // The divider drags on the swapped sides and the 3D view's share follows
+    let divider = swapped_3d.left() - 1.0;
+    drag(&mut harness, PointerButton::Primary, pos2(divider, y), pos2(divider + 100.0, y));
+    assert!((harness.state().viewport_rect.left() - 1.0 - (divider + 100.0)).abs() < 0.5, "the divider follows the pointer");
+    assert!(harness.state().ui.split_ratio < 0.5, "the 3D view got narrower");
+
+    // Saved with the UI state, and F4 swaps back
+    let mut ui_state = harness.state().ui.clone();
+    let json = serde_json::to_string(&ui_state).unwrap();
+    ui_state = serde_json::from_str(&json).unwrap();
+    assert!(ui_state.swap_views);
+    press_f4(&mut harness);
+    assert!(!harness.state().ui.swap_views);
+    assert!(
+        harness.state().viewport_rect.right() < rect_3d.right() + 400.0 && harness.state().viewport_rect.left() == rect_3d.left(),
+        "3D is back on the left"
+    );
+}

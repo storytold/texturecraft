@@ -323,3 +323,30 @@ fn corner_button_toggles_the_selected_point_and_is_off_without_one() {
     h.run_steps(2);
     assert!(h.get_all_by_label(button).next().unwrap().accesskit_node().is_disabled());
 }
+
+#[test]
+fn reverse_button_reverses_the_path_and_needs_two_points() {
+    let mut h = harness();
+    let button = "Reverse path direction";
+    click(&mut h, A);
+    h.run_steps(2);
+    h.get_all_by_label(button).next().unwrap().scroll_to_me();
+    h.run_steps(30);
+    assert!(h.get_all_by_label(button).next().unwrap().accesskit_node().is_disabled(), "one point cannot be reversed");
+
+    shift_click(&mut h, B);
+    click(&mut h, C);
+    let first = h.state().session.tool.path.points[0];
+    let last = h.state().session.tool.path.points[2];
+    assert!(!h.get_all_by_label(button).next().unwrap().accesskit_node().is_disabled());
+    h.get_all_by_label(button).next().unwrap().click();
+    h.run_steps(2);
+    let path = &h.state().session.tool.path;
+    assert_eq!((path.points[0], path.points[2]), (last, first));
+    assert_eq!(path.corner_flags(), vec![false, true, false]);
+    assert_eq!(path.selected, Some(0), "the last placed point is now first");
+
+    // One undo step restores the order
+    h.state_mut().session.undo().unwrap();
+    assert_eq!(h.state().session.tool.path.points[0], first);
+}

@@ -72,8 +72,12 @@ pub(crate) fn baked_map_label(map: texturecraft_engine::core::BakedMap) -> &'sta
     }
 }
 
-/// Switch the UI language (unknown codes fall back to English).
+/// The saved language that follows the operating system's (Settings > Language > Default (System Language)).
+pub const SYSTEM_LANGUAGE: &str = "";
+
+/// Switch the UI language ([`SYSTEM_LANGUAGE`] follows the system; unknown codes fall back to English).
 pub fn set_language(code: &str) {
+    let code = if code == SYSTEM_LANGUAGE { system_language() } else { code };
     CURRENT.store(LANGUAGES.iter().position(|l| l.code.eq_ignore_ascii_case(code) && available(l.code)).unwrap_or(0), Ordering::Relaxed);
 }
 
@@ -149,6 +153,12 @@ pub fn os_language() -> &'static str {
     #[cfg(target_arch = "wasm32")]
     let locale = web_sys::window().and_then(|w| w.navigator().language());
     locale.map_or("en", |l| language_for_locale(&l))
+}
+
+/// [`os_language`] read once: the language is applied every frame.
+fn system_language() -> &'static str {
+    static SYSTEM: OnceLock<&'static str> = OnceLock::new();
+    SYSTEM.get_or_init(os_language)
 }
 
 /// Tests that switch the global UI language, or draw the UI under it, run one at a time.
@@ -277,6 +287,17 @@ mod tests",
                 out.push(s);
             }
         }
+    }
+
+    #[test]
+    fn the_system_language_setting_speaks_the_operating_system_language() {
+        let _language = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_language(SYSTEM_LANGUAGE);
+        let shown = current().code;
+        set_language("en");
+
+        let expected = if available(os_language()) { os_language() } else { "en" };
+        assert_eq!(shown, expected);
     }
 
     #[test]

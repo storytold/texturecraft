@@ -34,7 +34,11 @@ fn app() -> Harness<'static, TextureCraftApp> {
         .click();
     harness.run_steps(SETTLE_FRAMES);
     assert!(harness.query_by_label(SWITCH).is_none(), "the section starts folded");
-    harness.get_by_label(SECTION).click();
+    // The section's header, not the page's Post effects tab (a small icon) above it, scrolled into the page first
+    let widest = |a: &egui_kittest::Node<'_>, b: &egui_kittest::Node<'_>| a.rect().width().total_cmp(&b.rect().width());
+    harness.get_all_by_label(SECTION).max_by(widest).unwrap().scroll_to_me();
+    harness.run_steps(SETTLE_FRAMES);
+    harness.get_all_by_label(SECTION).max_by(widest).unwrap().click();
     harness.run_steps(SETTLE_FRAMES * 3);
     harness.hover_at(egui::pos2(5.0, 5.0));
     harness.run_steps(SETTLE_FRAMES);

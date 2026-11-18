@@ -14,6 +14,8 @@ use crate::{Result, Session, cmd};
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("textureSet.select", "Select texture set", [], None, "{ts}", always, select),
+        cmd!("textureSet.next", "Next texture set", [], None, "{}", always, |s, _| step(s, true)),
+        cmd!("textureSet.previous", "Previous texture set", [], None, "{}", always, |s, _| step(s, false)),
         cmd!("textureSet.list", "List texture sets", [], None, "{}", always, |s, _| Ok(crate::inspect::texture_sets(s))),
         cmd!(
             "textureSet.inspect",
@@ -24,9 +26,26 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             |s, p| Ok(crate::inspect::texture_set(s, ts_param(s, p, "textureSet.inspect")?))
         ),
-        cmd!("textureSet.resolution", "Texture set size", [], None, "{ts?, resolution: 128..8192 (power of two)}", always, resolution),
+        cmd!(
+            "textureSet.resolution",
+            "Texture set size",
+            [],
+            None,
+            "{ts?, resolution: 128..8192 (power of two), all?: true (every texture set, one undo step each)}",
+            always,
+            resolution
+        ),
         cmd!("textureSet.channel.add", "Add channel", [], None, "{ts?, channel}", always, |s, p| channel(s, p, true)),
         cmd!("textureSet.channel.remove", "Remove channel", [], None, "{ts?, channel}", always, |s, p| channel(s, p, false)),
+        cmd!(
+            "textureSet.channel.format",
+            "Change channel format",
+            [],
+            None,
+            "{ts?, channel, format: sRGB8|RGB8|RGB16|RGB16F|RGB32F for colour and normal channels, L8|L16|L16F|L32F for grey ones} — converts the channel's layer data (8 bit rounds it to 256 steps); one undo step",
+            always,
+            channel_format
+        ),
         cmd!("textureSet.visible", "Toggle texture set visibility", [], None, "{ts?, visible?}", always, visible),
         cmd!(
             "textureSet.visibility",
@@ -83,6 +102,17 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "ts": ts }))
 }
 
+/// Make the next (or previous) texture set the active one; the last wraps to the first.
+fn step(s: &mut Session, forward: bool) -> Result<Value> {
+    let count = s.set_count();
+    if count == 0 {
+        return Err(bad("textureSet.next", "no texture sets"));
+    }
+    let ts = if forward { (s.ts() + 1) % count } else { (s.ts() + count - 1) % count };
+    select_set(s, ts)?;
+    Ok(json!({ "ts": ts }))
+}
+
 /// Make texture set `ts` the active one, on its content stack
 pub(crate) fn select_set(s: &mut Session, ts: usize) -> Result<()> {
     s.cancel_stroke();
@@ -102,6 +132,19 @@ pub(crate) fn select_set(s: &mut Session, ts: usize) -> Result<()> {
 }
 
 fn resolution(s: &mut Session, p: &Value) -> Result<Value> {
+    if boolp(p, "all") == Some(true) {
+        let r = u64p(p, "resolution").ok_or_else(|| bad("textureSet.resolution", "`resolution` is required"))?;
+        let r = u32::try_from(r).unwrap_or(0);
+        check_resolution(r)?;
+        for ts in 0..s.set_count() {
+            if s.doc.project.texture_set(ts)?.resolution != r {
+                let task = s.resize_task(ts, r)?;
+                let out = task.run(&texturecraft_bake::Progress::new())?;
+                s.apply_resize(out)?;
+            }
+        }
+        return Ok(json!({ "resolution": r }));
+    }
     let ts = ts_param(s, p, "textureSet.resolution")?;
     let r = u64p(p, "resolution").ok_or_else(|| bad("textureSet.resolution", "`resolution` is required"))?;
     let task = s.resize_task(ts, u32::try_from(r).unwrap_or(0))?;
@@ -213,6 +256,39 @@ fn channel(s: &mut Session, p: &Value, add: bool) -> Result<Value> {
     Ok(Value::Null)
 }
 
+fn channel_format(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "textureSet.channel.format";
+    let ts = ts_param(s, p, cmd)?;
+    let c = channel_param(cmd, p, "channel")?.ok_or_else(|| bad(cmd, "`channel` is required"))?;
+    let name = strp(p, "format").ok_or_else(|| bad(cmd, "`format` is required"))?;
+    let format = ChannelFormat::parse(name).ok_or_else(|| bad(cmd, format!("unknown format `{name}`")))?;
+    if !ChannelFormat::options_for(c).contains(&format) {
+        return Err(bad(cmd, format!("{} can't be stored as {}", c.label(), format.label())));
+    }
+    let old = s
+        .doc
+        .project
+        .texture_set(ts)?
+        .channels
+        .iter()
+        .find(|(x, _)| *x == c)
+        .map(|(_, f)| *f)
+        .ok_or_else(|| bad(cmd, format!("the set has no {} channel", c.label())))?;
+    if old == format {
+        return Ok(json!({ "format": format.label() }));
+    }
+    s.edit("Change channel format", |s| {
+        if format.bits() < old.bits() {
+            crate::layer_ops::quantize_set_channel(&mut s.doc, ts, c, format.bits());
+        }
+        if let Some(slot) = s.doc.project.texture_set_mut(ts)?.channels.iter_mut().find(|(x, _)| *x == c) {
+            slot.1 = format;
+        }
+        Ok(())
+    })?;
+    Ok(json!({ "format": format.label() }))
+}
+
 /// Add channel `c` to texture set `ts` (no-op when present) and enable it on the set's layers.
 /// Call inside [`Session::edit`].
 pub(crate) fn add_channel(s: &mut Session, ts: usize, c: Channel) -> Result<()> {
@@ -309,5 +385,31 @@ mod tests {
         assert_eq!(run(json!({"mode": "invert"})).unwrap(), json!([false, true]));
         assert_eq!(run(json!({"mode": "showAll"})).unwrap(), json!([true, true]));
         assert!(run(json!({"mode": "sideways"})).is_err() && run(json!({"mode": "solo", "ts": 9})).is_err());
+    }
+
+    fn ball() -> Session {
+        Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap()
+    }
+
+    #[test]
+    fn next_and_previous_step_through_the_sets_and_wrap() {
+        let mut s = ball();
+        assert_eq!(s.ts(), 0);
+        assert_eq!(crate::execute(&mut s, "textureSet.next", &Value::Null).unwrap()["ts"], 1);
+        assert_eq!(crate::execute(&mut s, "textureSet.next", &Value::Null).unwrap()["ts"], 0, "the last set wraps to the first");
+        assert_eq!(crate::execute(&mut s, "textureSet.previous", &Value::Null).unwrap()["ts"], 1, "the first set wraps to the last");
+        assert_eq!(s.ts(), 1);
+        assert_eq!(crate::execute(&mut s, "textureSet.previous", &Value::Null).unwrap()["ts"], 0);
+    }
+
+    #[test]
+    fn resolution_all_sizes_every_set() {
+        let mut s = ball();
+        crate::execute(&mut s, "textureSet.resolution", &json!({"ts": 1, "resolution": 256})).unwrap();
+        assert_ne!(s.doc.project.texture_sets[0].resolution, s.doc.project.texture_sets[1].resolution);
+        crate::execute(&mut s, "textureSet.resolution", &json!({"resolution": 512, "all": true})).unwrap();
+        assert!(s.doc.project.texture_sets.iter().all(|t| t.resolution == 512));
+        assert!(crate::execute(&mut s, "textureSet.resolution", &json!({"resolution": 300, "all": true})).is_err());
+        assert!(s.doc.project.texture_sets.iter().all(|t| t.resolution == 512), "a bad size changes nothing");
     }
 }

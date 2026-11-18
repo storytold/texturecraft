@@ -473,6 +473,11 @@ fn shade_mesh(i: VOut, front: bool) -> Shaded {
         return unlit(raw_out(aux.rgb));
     }
 
+    if (mode == 4) {
+        // The normal the shading uses (mesh, height slope and normal channel), as a world-space normal
+        return unlit(raw_out(n * 0.5 + 0.5));
+    }
+
     if (mode == 3) {
         let c = floor(uv * UV_CHECKER_CELLS);
         let chk = (c.x + c.y) - 2.0 * floor((c.x + c.y) * 0.5);
@@ -668,6 +673,21 @@ fn fs_uv(i: VOut) -> @location(0) vec4<f32> {
 
     if (mode == 2) {
         return raw_out(textureSample(t_aux, samp, i.uv).rgb);
+    }
+
+    if (mode == 4) {
+        // The tangent-space normal the shading uses: the height slope turned by the normal channel
+        let dims = vec2<f32>(textureDimensions(t_height));
+        let ts = 1.0 / dims;
+        let hl = textureSample(t_height, samp, i.uv - vec2<f32>(ts.x, 0.0)).r;
+        let hr = textureSample(t_height, samp, i.uv + vec2<f32>(ts.x, 0.0)).r;
+        let hu = textureSample(t_height, samp, i.uv - vec2<f32>(0.0, ts.y)).r;
+        let hd = textureSample(t_height, samp, i.uv + vec2<f32>(0.0, ts.y)).r;
+        let k = g.mode.z * dims.x / 16.0 * tile_scale(i.uv);
+        let n_height = normalize(vec3<f32>(-(hr - hl) * 0.5 * k, (hd - hu) * 0.5 * k, 1.0));
+        var n_detail = clamp(textureSample(t_nrm, samp, i.uv).rgb, vec3<f32>(-1.0), vec3<f32>(1.0));
+        n_detail.y *= g.mode.w;
+        return raw_out(rnm(n_height, normalize(n_detail)) * 0.5 + 0.5);
     }
 
     if (mode == 3) {

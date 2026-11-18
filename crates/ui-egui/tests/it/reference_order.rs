@@ -38,9 +38,9 @@ fn every_menu_lists_its_items_in_the_reference_order() {
         "File: New project... | Open... | - | Open sample project... | - | Close | - | Save | Save as... | More save options > Save a copy... | Remove unused resources... | - | Import resources... | Import MaterialX material... | Import PBR texture folder... | Import material... | Export Textures... | Export Mesh... | - | Quit",
         "Edit: Undo | Redo | Project Configuration... | Reimport mesh | Settings...",
         "Mode: Bake Mesh Maps | Painting | Rendering (path traced)",
-        "Window: Views > Assets | Views > Common Settings | Views > Display Settings | Views > History | Views > Layers | Views > Log | Views > Mesh Map Bakers | Views > Mesh Map Settings | Views > Properties | Views > Shader Settings | Views > Texture Sets | Views > Texture Set Settings | - | Save UI Layout > Save current layout... | Load UI Layout | Layouts > Save current layout as... | Layouts > Manage layouts... | - | Hide UI | Reset panel layout | Reset UI",
-        "Viewport: Display material | Display next channel | Display previous channel | Display next mesh map | Display previous mesh map | UV checker | - | Frame texture set | Show entire mesh | Front view | Back view | Left view | Right view | Top view | Bottom view | - | Perspective | Orthographic | - | 3D/2D views | 3D view only | 2D view only | - | Navigation buttons | - | Enable quick mask | Edit quick mask | Invert quick mask",
-        "Help: Documentation... | Shortcuts list... | - | Join the community (Discord)... | ArtCraft website... | Report a bug... | Show log... | - | Check for Updates... | About TextureCraft...",
+        "Window: Views > Assets | Views > Common Settings | Views > Display Settings | Views > Export | Views > History | Views > Layers | Views > Log | Views > Mesh Map Bakers | Views > Mesh Map Settings | Views > Properties | Views > Shader Settings | Views > Texture Sets | Views > Texture Set Settings | - | Save UI Layout > Save current layout... | Load UI Layout | Layouts > Save current layout as... | Layouts > Manage layouts... | - | Hide UI | Reset panel layout | Reset UI",
+        "Viewport: Display material | Display next channel | Display previous channel | Display next mesh map | Display previous mesh map | UV checker | - | Frame texture set | Show entire mesh | Front view | Back view | Left view | Right view | Top view | Bottom view | - | Perspective | Orthographic | - | 3D/2D views | 3D view only | 2D view only | Swap 3D/2D | - | Navigation buttons | - | Enable quick mask | Edit quick mask | Invert quick mask | - | Next texture set | Previous texture set | - | Pause Engine Computation",
+        "Help: Release notes... | Documentation... | Shortcuts list... | - | Join the community (Discord)... | ArtCraft website... | Report a bug... | Show log... | Export log... | - | Check for Updates... | About TextureCraft...",
     ];
     let actual: Vec<String> = menus::TOP
         .iter()
@@ -76,7 +76,7 @@ fn the_tool_shelf_keeps_the_reference_order() {
 fn the_right_bar_keeps_the_reference_order() {
     let harness = harness(texturecraft_engine::sample_session(256, 64).unwrap());
     let bar = buttons_in(&harness, 1562.0..1600.0);
-    let order = ["Export textures", "Log", "Display Settings", "Shader Settings", "History"];
+    let order = ["Export", "Log", "Display Settings", "Shader Settings", "History"];
     let row_positions: Vec<f32> = order.iter().map(|name| named(&bar, name).unwrap_or_else(|| panic!("{name} on the bar: {bar:?}")).0).collect();
 
     assert!(row_positions.windows(2).all(|pair| pair[0] < pair[1]), "{row_positions:?}");
@@ -90,7 +90,7 @@ fn the_blank_screen_enables_what_the_reference_enables() {
         assert!(named(&shelf, name).unwrap().2, "{name} should be disabled with no project");
     }
     let bar = buttons_in(&harness, 1562.0..1600.0);
-    for name in ["Export textures", "Log", "Display Settings", "Shader Settings", "History"] {
+    for name in ["Export", "Log", "Display Settings", "Shader Settings", "History"] {
         assert!(!named(&bar, name).unwrap().2, "{name} on the right bar stays enabled");
     }
 
@@ -150,6 +150,7 @@ fn the_blank_screen_menus_match_the_measured_enabled_states() {
         "ui.view.textureSetList",
         "ui.view.textureSetSettings",
         "ui.view.display",
+        "ui.view.export",
         "ui.view.history",
         "ui.view.log",
         "ui.view.shader",

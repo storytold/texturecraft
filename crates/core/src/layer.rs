@@ -75,6 +75,9 @@ pub struct Layer {
     /// Geometry mask: the mesh parts (submesh names) the layer shows on; None shows it on all.
     #[serde(default)]
     pub geometry_mask: Option<Vec<String>>,
+    /// Locked against painting: strokes and fills on the layer (content or mask) are refused.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 /// Mask with height: partial mask values follow the layer's own height, so a transition
@@ -146,6 +149,7 @@ impl Layer {
             color_tag: None,
             height_mask: HeightMask::default(),
             geometry_mask: None,
+            locked: false,
         }
     }
 
@@ -547,11 +551,15 @@ pub struct Mask {
     pub background: MaskBackground,
     /// Effects bottom → top. Paint effects hold bitmap data keyed by their id.
     pub effects: Vec<Effect>,
+    /// The mask's grey values are gamma encoded (sRGB): they are converted to linear when the
+    /// mask is applied. Off reads them as they are.
+    #[serde(default)]
+    pub gamma_corrected: bool,
 }
 
 impl Mask {
     pub fn new(background: MaskBackground) -> Mask {
-        Mask { enabled: true, background, effects: Vec::new() }
+        Mask { enabled: true, background, effects: Vec::new(), gamma_corrected: false }
     }
 }
 

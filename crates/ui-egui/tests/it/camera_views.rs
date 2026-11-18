@@ -273,3 +273,75 @@ fn the_wheel_during_a_glide_is_not_overwritten_by_it() {
     };
     assert!(end_distance(100.0) != end_distance(0.0), "the wheel zoom stays");
 }
+
+#[test]
+fn the_rotation_dropdown_switches_to_free_rotation_and_alt_drag_turns_the_model_over() {
+    let mut h = harness();
+    assert!(!h.state().session.camera.free);
+    h.get_by_label("Constrained rotation").click();
+    h.run_steps(2);
+    h.get_by_label_contains("Free rotation").click();
+    h.run_steps(2);
+    assert!(h.state().session.camera.free, "the dropdown picks free rotation");
+
+    // A long vertical drag goes over the pole: the horizon is no longer level
+    let center = h.state().viewport_rect.center();
+    drag(&mut h, center, vec2(0.0, 300.0), Modifiers::ALT);
+    let camera = h.state().session.camera;
+    assert!(camera.up().y < 0.0, "the model is turned over: {}", camera.up());
+}
+
+#[test]
+fn constrained_rotation_keeps_the_horizon_on_the_same_drag() {
+    let mut h = harness();
+    let center = h.state().viewport_rect.center();
+    drag(&mut h, center, vec2(0.0, 300.0), Modifiers::ALT);
+    let camera = h.state().session.camera;
+    assert!(camera.up().y == 1.0 && camera.pitch <= 89f32.to_radians() + 1e-6);
+}
+
+#[test]
+fn snap_rotate_and_next_camera_are_bindable_and_a_bound_key_runs_them() {
+    let ids = ["camera.snapRotate.right", "camera.next", "camera.previous", "camera.rotation.free", "camera.rotation.constrained"];
+    for id in ids {
+        assert!(texturecraft_ui_egui::keymap::bindings().iter().any(|binding| binding.id == id), "{id} can be bound");
+    }
+    let mut h = harness();
+    h.state_mut().run("camera.set", json!({"yaw": 0, "pitch": 0}));
+    h.state_mut().ui.keymap.insert("camera.snapRotate.right".into(), "F12".into());
+    h.run_steps(2);
+    press(&mut h, Key::F12);
+    h.run_steps(30);
+    let camera = h.state().session.camera;
+    assert!((camera.yaw - FRAC_PI_2).abs() < 1e-3, "one step to the right: {}", camera.yaw);
+}
+
+#[test]
+fn next_and_previous_camera_commands_move_between_saved_cameras() {
+    let mut h = harness();
+    for (name, yaw) in [("A", 20), ("B", 50)] {
+        h.state_mut().run("camera.set", json!({"yaw": yaw}));
+        h.state_mut().run("camera.add", json!({"name": name}));
+    }
+    h.state_mut().run("camera.select", json!({}));
+    h.run_steps(2);
+    h.state_mut().run("camera.next", json!({}));
+    h.run_steps(30);
+    assert!((h.state().session.camera.yaw.to_degrees() - 20.0).abs() < 0.5);
+    h.state_mut().run("camera.next", json!({}));
+    h.run_steps(30);
+    assert!((h.state().session.camera.yaw.to_degrees() - 50.0).abs() < 0.5);
+    h.state_mut().run("camera.previous", json!({}));
+    h.run_steps(30);
+    assert!((h.state().session.camera.yaw.to_degrees() - 20.0).abs() < 0.5);
+}
+
+#[test]
+fn the_view_picker_offers_the_combined_normal_view() {
+    let mut h = harness();
+    h.get_all_by_role(egui::Role::ComboBox).find(|node| node.value().as_deref() == Some("Material")).expect("the view picker").click();
+    h.run_steps(2);
+    h.get_by_label("Normal+height+mesh").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::NormalHeightMesh);
+}

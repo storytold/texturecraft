@@ -54,6 +54,52 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("camera.view.bottom", "Bottom view", ["Viewport"], None, "{}", always, |s, _| fixed_view(s, "bottom")),
         cmd!("camera.perspective", "Perspective", ["Viewport"], Some("F5"), "{}", always, |s, _| projection(s, false)),
         cmd!("camera.orthographic", "Orthographic", ["Viewport"], Some("F6"), "{}", always, |s, _| projection(s, true)),
+        cmd!(
+            "camera.rotation",
+            "Camera rotation",
+            [],
+            None,
+            "{mode: constrained|free} → the camera (constrained keeps the horizon level; free turns the camera about its own axes, so the model can be turned over)",
+            always,
+            |s, p| match strp(p, "mode") {
+                Some("constrained") => rotation(s, false),
+                Some("free") => rotation(s, true),
+                _ => Err(bad("camera.rotation", "`mode` is constrained or free")),
+            }
+        ),
+        cmd!("camera.rotation.free", "Free rotation", ["Viewport"], None, "{}", always, |s, _| rotation(s, true)),
+        cmd!("camera.rotation.constrained", "Constrained rotation", ["Viewport"], None, "{}", always, |s, _| rotation(s, false)),
+        cmd!(
+            "camera.snapRotate",
+            "Camera snap rotate",
+            [],
+            None,
+            "{yaw?, pitch? (whole 90° steps, default 0)} → the camera, turned in steps around the model: the angles first go to the nearest step. The pitch stops at the orbit's ±89° limit. The viewport's gesture for it is Alt+Shift+left drag",
+            always,
+            |s, p| snap_rotate(s, f32p(p, "yaw").unwrap_or(0.0), f32p(p, "pitch").unwrap_or(0.0))
+        ),
+        cmd!("camera.snapRotate.left", "Camera snap rotate left", ["Viewport"], None, "{}", always, |s, _| snap_rotate(s, -1.0, 0.0)),
+        cmd!("camera.snapRotate.right", "Camera snap rotate right", ["Viewport"], None, "{}", always, |s, _| snap_rotate(s, 1.0, 0.0)),
+        cmd!("camera.snapRotate.up", "Camera snap rotate up", ["Viewport"], None, "{}", always, |s, _| snap_rotate(s, 0.0, 1.0)),
+        cmd!("camera.snapRotate.down", "Camera snap rotate down", ["Viewport"], None, "{}", always, |s, _| snap_rotate(s, 0.0, -1.0)),
+        cmd!(
+            "camera.next",
+            "Next camera",
+            ["Viewport"],
+            None,
+            "{} → the camera: the next saved camera (after the last, the first; from a view that is no saved camera, the first)",
+            has_cameras,
+            |s, _| step_camera(s, 1)
+        ),
+        cmd!(
+            "camera.previous",
+            "Previous camera",
+            ["Viewport"],
+            None,
+            "{} → the camera: the previous saved camera (before the first, the last; from a view that is no saved camera, the last)",
+            has_cameras,
+            |s, _| step_camera(s, -1)
+        ),
         cmd!("viewport.focusAt", "Focus depth of field here", [], None, "{x, y (viewport pixels), viewport?: [w, h]}", always, focus_at),
     ]
 }
@@ -80,6 +126,9 @@ fn apply(view: &mut OrbitCamera, c: &Camera) {
     view.distance = ok(c.distance).map_or(view.distance, |d| d.clamp(r * 0.05, r * 200.0));
     view.fov = ok(c.fov).map_or(view.fov, |f| f.clamp(5.0, 150.0));
     view.ortho = c.ortho;
+
+    // A free camera looks level through the saved view
+    view.set_angles(view.yaw, view.pitch);
 }
 
 /// The saved camera the view is at, if any.
@@ -175,9 +224,44 @@ fn fixed_view(s: &mut Session, name: &str) -> Result<Value> {
 
     let current = if s.camera.yaw.is_finite() { s.camera.yaw } else { 0.0 };
     let turn = std::f32::consts::TAU;
-    s.camera.yaw = current + (yaw.to_radians() - current + turn * 0.5).rem_euclid(turn) - turn * 0.5;
-    s.camera.pitch = pitch.to_radians();
+    let yaw = current + (yaw.to_radians() - current + turn * 0.5).rem_euclid(turn) - turn * 0.5;
+    s.camera.set_angles(yaw, pitch.to_radians());
     crate::execute(s, "viewport.frame", &Value::Null)
+}
+
+/// Constrained or free rotation; the direction of view stays.
+fn rotation(s: &mut Session, free: bool) -> Result<Value> {
+    s.camera.set_free(free);
+    s.revision = s.revision.wrapping_add(1);
+    Ok(crate::view_cmds::camera_json(s))
+}
+
+/// Turn the camera `yaw` and `pitch` steps of 90° around the model. Angles between steps go to
+/// the nearest one first, so repeated calls walk the steps.
+fn snap_rotate(s: &mut Session, yaw: f32, pitch: f32) -> Result<Value> {
+    let step = std::f32::consts::FRAC_PI_2;
+    let limit = 89f32.to_radians();
+    let c = &mut s.camera;
+    let next_yaw = ((c.yaw / step).round() + yaw.round()) * step;
+    let next_pitch = (((c.pitch / step).round() + pitch.round()) * step).clamp(-limit, limit);
+    c.set_angles(next_yaw, next_pitch);
+    s.revision = s.revision.wrapping_add(1);
+    Ok(crate::view_cmds::camera_json(s))
+}
+
+/// The next (`d` = 1) or previous (`d` = -1) saved camera, wrapping round. From a view that is
+/// no saved camera, next goes to the first and previous to the last.
+fn step_camera(s: &mut Session, d: i64) -> Result<Value> {
+    let saved = s.doc.project.cameras.len() as i64;
+    if saved == 0 {
+        return Err(bad("camera.next", "the project has no saved cameras"));
+    }
+    let to = match current(s) {
+        Some(i) => (i as i64 + d).rem_euclid(saved),
+        None if d > 0 => 0,
+        None => saved - 1,
+    };
+    select(s, &json!({ "index": to }))
 }
 
 /// Switch to a perspective or orthographic projection; position and rotation stay.
@@ -380,5 +464,90 @@ mod tests {
         assert!((d - (s.camera.distance - 1.0)).abs() < 0.05, "{d} vs {}", s.camera.distance);
         assert_eq!(s.doc.project.display.dof.focus_distance, d);
         assert!(execute(&mut s, "viewport.focusAt", &json!({"x": 1, "y": 1})).is_err(), "nothing under the corner");
+    }
+
+    #[test]
+    fn free_rotation_turns_the_model_over_and_constrained_stops_at_the_pole() {
+        let mut s = session();
+        let undo_before = execute(&mut s, "edit.history", &Value::Null).unwrap();
+        assert_eq!(execute(&mut s, "camera.get", &Value::Null).unwrap()["rotation"], "constrained");
+        execute(&mut s, "camera.orbit", &json!({"dy": 170})).unwrap();
+        assert!(s.camera.up().y > 0.99 && s.camera.pitch <= 89f32.to_radians() + 1e-6, "constrained keeps the horizon");
+
+        execute(&mut s, "camera.set", &json!({"yaw": 0, "pitch": 0})).unwrap();
+        assert_eq!(execute(&mut s, "camera.rotation", &json!({"mode": "free"})).unwrap()["rotation"], "free");
+        let eye = s.camera.eye();
+        execute(&mut s, "camera.orbit", &json!({"dy": 170})).unwrap();
+        assert!(s.camera.up().y < -0.9, "the model is turned over: {}", s.camera.up());
+        assert!((s.camera.eye() - eye).length() > 1.0);
+
+        // Back to constrained: level again, still looking from the same side
+        execute(&mut s, "camera.rotation.constrained", &Value::Null).unwrap();
+        assert!(!s.camera.free && s.camera.up().y == 1.0);
+        assert!(execute(&mut s, "camera.rotation", &json!({"mode": "spin"})).is_err());
+        assert_eq!(execute(&mut s, "edit.history", &Value::Null).unwrap(), undo_before, "the view is not an undo step");
+    }
+
+    #[test]
+    fn a_free_camera_is_put_level_by_fixed_views_and_set_angles() {
+        let mut s = session();
+        execute(&mut s, "camera.rotation.free", &Value::Null).unwrap();
+        execute(&mut s, "camera.orbit", &json!({"dx": 30, "dy": 120})).unwrap();
+        execute(&mut s, "camera.view.front", &Value::Null).unwrap();
+        let looking_from = (s.camera.eye() - s.camera.target).normalize();
+        assert!(looking_from.z > 0.999 && s.camera.up().y > 0.999, "front view, level: {looking_from}");
+    }
+
+    #[test]
+    fn snap_rotate_walks_the_90_degree_steps() {
+        let mut s = session();
+        execute(&mut s, "camera.set", &json!({"yaw": 10, "pitch": 5})).unwrap();
+        execute(&mut s, "camera.snapRotate", &json!({"yaw": 1})).unwrap();
+        assert!((s.camera.yaw.to_degrees() - 90.0).abs() < 1e-3 && s.camera.pitch.abs() < 1e-6, "nearest step, then one step");
+        execute(&mut s, "camera.snapRotate.right", &Value::Null).unwrap();
+        assert!((s.camera.yaw.to_degrees() - 180.0).abs() < 1e-3);
+        execute(&mut s, "camera.snapRotate.left", &Value::Null).unwrap();
+        assert!((s.camera.yaw.to_degrees() - 90.0).abs() < 1e-3);
+        execute(&mut s, "camera.snapRotate.up", &Value::Null).unwrap();
+        execute(&mut s, "camera.snapRotate.up", &Value::Null).unwrap();
+        assert!((s.camera.pitch.to_degrees() - 89.0).abs() < 1e-3, "the pitch stops at the orbit limit");
+        execute(&mut s, "camera.snapRotate.down", &Value::Null).unwrap();
+        assert!(s.camera.pitch.abs() < 1e-6, "the limit counts as the top step");
+    }
+
+    #[test]
+    fn next_and_previous_camera_walk_the_saved_cameras_and_wrap() {
+        let mut s = session();
+        assert!(execute(&mut s, "camera.next", &Value::Null).is_err(), "no saved cameras: nothing to go to");
+        for (name, yaw) in [("A", 20), ("B", 40), ("C", 60)] {
+            execute(&mut s, "camera.set", &json!({"yaw": yaw})).unwrap();
+            execute(&mut s, "camera.add", &json!({"name": name})).unwrap();
+        }
+        execute(&mut s, "camera.orbit", &json!({"dx": 5})).unwrap();
+        let current = |s: &mut Session| execute(s, "camera.list", &Value::Null).unwrap()["current"].clone();
+        assert_eq!(current(&mut s), Value::Null);
+        for want in [0, 1, 2] {
+            execute(&mut s, "camera.next", &Value::Null).unwrap();
+            assert_eq!(current(&mut s), want);
+        }
+        execute(&mut s, "camera.next", &Value::Null).unwrap();
+        assert_eq!(current(&mut s), 0, "after the last one: the first");
+        execute(&mut s, "camera.previous", &Value::Null).unwrap();
+        assert_eq!(current(&mut s), 2, "before the first one: the last");
+        execute(&mut s, "camera.previous", &Value::Null).unwrap();
+        assert_eq!(current(&mut s), 1);
+        execute(&mut s, "camera.orbit", &json!({"dx": 5})).unwrap();
+        execute(&mut s, "camera.previous", &Value::Null).unwrap();
+        assert_eq!(current(&mut s), 2, "from a view that is no saved camera, previous goes to the last");
+    }
+
+    #[test]
+    fn the_combined_normal_view_is_a_view_mode() {
+        let mut s = session();
+        execute(&mut s, "viewport.view", &json!({"mode": "normalHeightMesh"})).unwrap();
+        assert_eq!(s.view, crate::ViewMode::NormalHeightMesh);
+        assert_eq!(s.view.label(), "Normal+height+mesh");
+        execute(&mut s, "viewport.view", &json!({"mode": "material"})).unwrap();
+        assert_eq!(s.view, crate::ViewMode::Material);
     }
 }

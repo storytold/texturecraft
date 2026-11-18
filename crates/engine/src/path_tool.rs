@@ -105,6 +105,15 @@ impl PathState {
         true
     }
 
+    /// Reverse the direction of the curve: the points and their corner flags swap ends together, and the selection follows its point
+    pub fn reverse(&mut self) {
+        let flags = self.corner_flags();
+        self.points.reverse();
+        self.corners = flags.into_iter().rev().collect();
+        let last = self.points.len().saturating_sub(1);
+        self.selected = self.selected.filter(|i| *i < self.points.len()).map(|i| last - i);
+    }
+
     /// Insert a control point before point `at` (on the segment ending there) and select it; None when it can't
     pub fn insert(&mut self, at: usize, point: Vec3) -> Option<usize> {
         if at > self.points.len() || self.points.len() >= MAX_PATH_POINTS {
@@ -193,6 +202,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{index?: point (default: the selected point), corner?: bool (default: toggle)} — makes a control point of the Path tool's curve a corner (the curve turns sharply there) or smooth again; one undo step per change, repainting the edited path at once",
             always,
             path_corner
+        ),
+        cmd!(
+            "path.reverse",
+            "Reverse path direction",
+            ["Tools"],
+            None,
+            "{} — reverses the direction of the Path tool's curve (points and corner flags together), so brush angle and stamp order run from the other end; one undo step, repainting the edited path at once",
+            always,
+            path_reverse
         ),
         cmd!(
             "path.edit",
@@ -312,6 +330,19 @@ fn path_corner(s: &mut Session, p: &Value) -> Result<Value> {
         s.update();
     }
     Ok(json!({ "index": index, "corner": s.tool.path.is_corner(index) }))
+}
+
+/// Reverse the curve's direction as one undoable point edit
+fn path_reverse(s: &mut Session, _p: &Value) -> Result<Value> {
+    if s.tool.path.points.len() < 2 {
+        return Err(bad("path.reverse", "the Path tool's curve needs at least two points"));
+    }
+    s.reverse_path();
+    s.revision = s.revision.wrapping_add(1);
+    if s.path_live()? {
+        s.update();
+    }
+    Ok(json!({ "points": s.tool.path.points.len() }))
 }
 
 /// The `effect` and `index` params naming a stored path, with the path.
@@ -732,6 +763,17 @@ impl Session {
         let at = self.insert_path_point(index, point)?;
         self.tool.path.set_corner(at, true);
         Some(at)
+    }
+
+    /// Reverse the curve's direction with point undo; false when there are fewer than two points
+    pub fn reverse_path(&mut self) -> bool {
+        if self.tool.path.points.len() < 2 {
+            return false;
+        }
+
+        self.path_checkpoint();
+        self.tool.path.reverse();
+        true
     }
 
     /// Change whether the path loops back to its first point, with point undo

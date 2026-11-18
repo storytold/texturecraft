@@ -4,10 +4,11 @@
 use egui::{Color32, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use egui_phosphor::regular as ic;
 use serde_json::{Value, json};
+use texturecraft_engine::StencilTiling;
 use texturecraft_engine::compose::ThumbTarget;
 use texturecraft_engine::core::{
-    BakedMap, BlendMode, Channel, ChannelBlend, ChannelKind, Decal, DecalFlip, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind, LinkParam,
-    MaterialLink, Projection, Source,
+    BakedMap, BlendMode, Channel, ChannelBlend, ChannelFormat, ChannelKind, Decal, DecalFlip, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind,
+    LinkParam, MaterialLink, Projection, Source,
 };
 use texturecraft_engine::filter_lib::scalar_params;
 use texturecraft_engine::paint::alpha_params::MAX_ALPHA_CONTRAST;
@@ -85,6 +86,7 @@ pub(crate) fn texture_set_list(app: &mut TextureCraftApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().id_salt("ts_scroll").show(ui, |ui| {
         for (i, (name, size, visible)) in sets.into_iter().enumerate() {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListBoxOption, true, i == active, &name));
             let p = ui.painter();
             let bg = if i == active {
                 tk.row_selected
@@ -117,10 +119,24 @@ pub(crate) fn texture_set_list(app: &mut TextureCraftApp, ui: &mut Ui) {
                 right = x - 8.0;
             }
             let color = if i == active { tk.text_strong } else { tk.text };
-            let g = elided(p, name, 12.0, color, right - rect.left() - 26.0);
-            p.galley(pos2(rect.left() + 26.0, cy - g.size().y * 0.5), g, color);
-            if eye_resp.clicked() {
+            let name_rect = Rect::from_min_max(pos2(rect.left() + 26.0, rect.top() + 1.0), pos2((right - 4.0).max(rect.left() + 60.0), rect.bottom() - 1.0));
+            let renaming = app.ui.set_rename.as_ref().is_some_and(|(ts, _)| *ts == i);
+            if renaming {
+                set_rename_editor(app, ui, name_rect, i, &name);
+            } else {
+                let g = elided(ui.painter(), name.clone(), 12.0, color, right - rect.left() - 26.0);
+                ui.painter().galley(pos2(rect.left() + 26.0, cy - g.size().y * 0.5), g, color);
+            }
+            if !renaming {
+                resp.context_menu(|ui| set_row_menu(app, ui, i, &name, visible));
+            }
+            if renaming {
+                // The editor owns the clicks of the row
+            } else if eye_resp.clicked() {
                 app.run("textureSet.visible", json!({"ts": i}));
+            } else if resp.double_clicked() {
+                app.run("textureSet.select", json!({"ts": i}));
+                app.ui.set_rename = Some((i, name.clone()));
             } else if resp.clicked() {
                 app.run("textureSet.select", json!({"ts": i}));
             }
@@ -128,8 +144,90 @@ pub(crate) fn texture_set_list(app: &mut TextureCraftApp, ui: &mut Ui) {
     });
 }
 
+/// Sizes the Texture Sets list offers (the same as Texture Set Settings)
+const SET_SIZES: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
+
+/// The right-click menu of a list row.
+fn set_row_menu(app: &mut TextureCraftApp, ui: &mut Ui, ts: usize, name: &str, visible: bool) {
+    if ui.button(tr("Rename")).clicked() {
+        app.run("textureSet.select", json!({"ts": ts}));
+        app.ui.set_rename = Some((ts, name.to_string()));
+        ui.close();
+    }
+    if ui.button(if visible { tr("Hide") } else { tr("Show") }).clicked() {
+        app.run("textureSet.visible", json!({"ts": ts}));
+        ui.close();
+    }
+    if ui.button(tr("Show only this set")).clicked() {
+        app.run("textureSet.visibility", json!({"mode": "solo", "ts": ts}));
+        ui.close();
+    }
+    ui.separator();
+    let current = app.session.doc.project.texture_sets.get(ts).map(|t| t.resolution);
+    ui.menu_button(tr("Size"), |ui| {
+        for r in SET_SIZES {
+            if ui.selectable_label(Some(r) == current, format!("{r}")).clicked() {
+                app.start_resize(ts, r);
+                ui.close();
+            }
+        }
+    });
+    ui.menu_button(tr("Same size for all sets"), |ui| {
+        for r in SET_SIZES {
+            if ui.selectable_label(app.session.doc.project.texture_sets.iter().all(|t| t.resolution == r), format!("{r}")).clicked() {
+                app.start_resize_all(r);
+                ui.close();
+            }
+        }
+    });
+}
+
+/// The name editor of texture set `ts` in `rect`: Enter or a click elsewhere renames, Escape cancels.
+fn set_rename_editor(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, ts: usize, name: &str) {
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    let Some((_, buffer)) = app.ui.set_rename.as_mut() else { return };
+
+    // Escape reaches us instead of just unfocusing the field, so it can cancel
+    let filter = egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, escape: true, ..Default::default() };
+    let response = child.add(egui::TextEdit::singleline(buffer).desired_width(rect.width()).event_filter(filter));
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        app.ui.set_rename = None;
+    } else if response.lost_focus() {
+        let new_name = buffer.trim().to_string();
+        app.ui.set_rename = None;
+        if !new_name.is_empty() && new_name != name {
+            app.run("textureSet.rename", json!({"ts": ts, "name": new_name}));
+        }
+    } else if !response.has_focus() {
+        // Only until the field has focus (see the layer rename editor)
+        response.request_focus();
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Layers
+
+/// "Add bitmap mask": a submenu listing the image resources; the one picked draws the new mask.
+fn bitmap_mask_menu(app: &mut TextureCraftApp, ui: &mut Ui, row: Option<u64>, enabled: bool) {
+    let mut names: Vec<String> = app.session.images.keys().cloned().collect();
+    names.sort();
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.menu_button(tr("Add bitmap mask"), |ui| {
+            if names.is_empty() {
+                ui.add_enabled(false, egui::Label::new(tr("No image resources: import one first")));
+            }
+            for name in names {
+                if ui.button(&name).clicked() {
+                    if let Some(layer) = row {
+                        app.run("layer.select", json!({ "layer": layer }));
+                    }
+                    app.run("mask.add.bitmap", json!({ "image": name }));
+                    ui.close();
+                }
+            }
+        });
+    });
+}
 
 /// The add-mask commands, for the selected layer or (`row`) the layer whose mask slot was clicked.
 fn add_mask_menu(app: &mut TextureCraftApp, ui: &mut Ui, row: Option<u64>) {
@@ -145,6 +243,7 @@ fn add_mask_menu(app: &mut TextureCraftApp, ui: &mut Ui, row: Option<u64>) {
             ui.close();
         }
     }
+    bitmap_mask_menu(app, ui, row, enabled);
 }
 
 pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
@@ -731,6 +830,22 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
 
     // Name (or rename editor) with the quieter subtitle under it
     let (name_rect, show_blend) = layer_name_layout(rect, x);
+    // A locked layer shows a lock at the right end of the name; a click unlocks it
+    let mut name_rect = name_rect;
+    if layer.locked && name_rect.width() >= MIN_NAME_WIDTH + LOCK_ICON_SIZE {
+        let lock = Rect::from_center_size(
+            pos2(name_rect.right() - LOCK_ICON_SIZE * 0.5, rect.center().y - NAME_LINE_GAP - LOCK_ICON_SIZE * 0.5),
+            vec2(LOCK_ICON_SIZE, LOCK_ICON_SIZE),
+        );
+        name_rect.set_right(name_rect.right() - LOCK_ICON_SIZE);
+        let lock_response =
+            ui.interact(lock, ui.scope_id().with(("lock", layer.id.0)), Sense::click()).on_hover_text(tr("Locked against painting: click to unlock"));
+        lock_response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tr("Unlock layer")));
+        painter.text(lock.center(), egui::Align2::CENTER_CENTER, ic::LOCK_SIMPLE, egui::FontId::proportional(LOCK_ICON_SIZE), tokens.text_dim);
+        if lock_response.clicked() {
+            app.run("layer.lock", json!({"layer": layer.id.0, "locked": false}));
+        }
+    }
     let show_name = name_rect.width() >= MIN_NAME_WIDTH;
     if !show_name {
         row.clone().on_hover_text(&layer.name);
@@ -1294,6 +1409,25 @@ fn export_mask_file(app: &mut TextureCraftApp, layer: &Layer) {
     });
 }
 
+/// Ask for a file name and write `layer`'s channels there, one image per channel (`<name>_<channel>.<ext>`).
+#[cfg(not(target_arch = "wasm32"))]
+fn export_channels_files(app: &mut TextureCraftApp, layer: &Layer) {
+    use crate::file_dialogs::{Bound, FileDialog};
+    let lid = layer.id.0;
+    let set = app.session.doc.project.locate(layer.id).and_then(|(ts, _, _)| app.session.doc.project.texture_sets.get(ts).map(|set| set.name.clone()));
+    let name = format!("{}.png", texturecraft_engine::formats::export::sanitize_file_stem(&format!("{}_{}", set.unwrap_or_default(), layer.name)));
+    app.ask_file(
+        FileDialog::save().filter(tr("Image"), &["png", "tga", "tif", "bmp", "webp", "exr", "hdr", "jpg"]).file_name(name),
+        Bound::Project,
+        move |app, paths| {
+            let Some(path) = paths.first() else { return };
+            let Some(done) = app.run("layer.exportChannels", json!({"layer": lid, "path": path.display().to_string()})) else { return };
+            let count = done.get("files").and_then(Value::as_array).map_or(0, Vec::len);
+            app.toast(trf("Saved {count} channel images", &[("count", &count)]), false);
+        },
+    );
+}
+
 /// Put the evaluated mask of layer `id` on the system clipboard as an 8-bit grayscale image (the
 /// whole texture set; a UV-tiled set copies its tile atlas).
 fn copy_mask(app: &mut TextureCraftApp, ctx: &egui::Context, id: texturecraft_engine::core::LayerId) {
@@ -1306,6 +1440,9 @@ fn copy_mask(app: &mut TextureCraftApp, ctx: &egui::Context, id: texturecraft_en
         Err(e) => app.toast(e.to_string(), true),
     }
 }
+
+/// Size of the lock icon on a locked layer's row
+const LOCK_ICON_SIZE: f32 = 14.0;
 
 /// Width of the outline round a soloed layer's row
 const SOLO_OUTLINE_WIDTH: f32 = 2.0;
@@ -1411,8 +1548,10 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
 
     // A switched-off mask has no values to export
     let mask_on = project.layers.get(&project.mask_owner(layer.id)).is_some_and(|l| l.mask.as_ref().is_some_and(|m| m.enabled));
+    let gamma = project.layers.get(&project.mask_owner(layer.id)).and_then(|l| l.mask.as_ref()).is_some_and(|m| m.gamma_corrected);
     run(app, ui, tr("Add white mask"), "mask.add.white", json!({"layer": lid}), layer.mask.is_none());
     run(app, ui, tr("Add black mask"), "mask.add.black", json!({"layer": lid}), layer.mask.is_none());
+    bitmap_mask_menu(app, ui, Some(lid), layer.mask.is_none());
     run(app, ui, tr("Add mask with color selection"), "mask.add.colorSelection", json!({"layer": lid}), true);
     ui.separator();
     run(app, ui, tr("Toggle mask"), "mask.toggle", json!({"layer": lid}), has_mask);
@@ -1420,6 +1559,9 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     run(app, ui, tr("Invert mask"), "mask.invert", json!({"layer": lid}), has_mask);
     run(app, ui, tr("Clear mask"), "mask.clear", json!({"layer": lid}), has_mask);
     run(app, ui, tr("Remove mask"), "mask.remove", json!({"layer": lid}), has_mask);
+    run(app, ui, tr("Copy mask"), "mask.copy", json!({"layer": lid}), has_mask);
+    let paste_mask = crate::menus::enabled(app, "mask.paste");
+    run(app, ui, tr("Paste into mask"), "mask.paste", json!({"layer": lid}), paste_mask);
     #[cfg(not(target_arch = "wasm32"))]
     if ui.add_enabled(mask_on, egui::Button::new(tr("Export mask to file..."))).clicked() {
         export_mask_file(app, layer);
@@ -1429,11 +1571,34 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
         copy_mask(app, ui.ctx(), layer.id);
         ui.close();
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if ui.button(tr("Export channels to files")).clicked() {
+        export_channels_files(app, layer);
+        ui.close();
+    }
+    if ui.add_enabled(has_mask, egui::Button::new(tr("Gamma corrected alpha/mask")).selected(gamma)).clicked() {
+        app.run("layer.select", json!({"layer": lid}));
+        app.run("mask.gammaCorrected", json!({"layer": lid}));
+        ui.close();
+    }
+    if ui.add(egui::Button::new(tr("Lock layer")).selected(layer.locked)).clicked() {
+        app.run("layer.lock", json!({"layer": lid}));
+        ui.close();
+    }
     geometry_mask_menu(app, ui, layer);
     ui.separator();
     solo_menu(app, ui, layer.id);
     ui.separator();
     run(app, ui, tr("Flatten layer"), "layer.flatten", json!({"layer": lid}), !layer.is_group());
+    let has_instances = app.session.doc.project.layers.values().any(|other| other.instance_source() == Some(layer.id));
+    run(
+        app,
+        ui,
+        tr("Flatten all instances"),
+        "layer.flattenAll",
+        json!({"layer": lid}),
+        !layer.is_group() && (has_instances || layer.instance_source().is_some()),
+    );
     #[cfg(not(target_arch = "wasm32"))]
     if ui.button(tr("Create smart material")).clicked() {
         let file = crate::library_dir().join(format!("{}.tcmat", texturecraft_engine::formats::sanitize_resource_name(&layer.name)));
@@ -1507,6 +1672,11 @@ pub(crate) fn texture_set_settings(app: &mut TextureCraftApp, ui: &mut Ui) {
                 }
             });
             ui.end_row();
+            ui.label("");
+            if ui.button(tr("Same size for all sets")).clicked() {
+                app.start_resize_all(set.resolution);
+            }
+            ui.end_row();
             ui.label(tr("UV tiles (UDIM)"));
             let mut tiled = !set.uv_tiles.is_empty();
             if ui.checkbox(&mut tiled, "").changed() {
@@ -1551,7 +1721,13 @@ pub(crate) fn texture_set_settings(app: &mut TextureCraftApp, ui: &mut Ui) {
                     if *c != Channel::BaseColor && icon_button(ui, ic::X, tr("Remove channel"), false, 18.0).clicked() {
                         app.run("textureSet.channel.remove", json!({"ts": ts, "channel": c.id()}));
                     }
-                    ui.label(RichText::new(f.label()).color(tk.text_dim));
+                    egui::ComboBox::from_id_salt(("ts_channel_format", c.id())).width(84.0).selected_text(f.label()).show_ui(ui, |ui| {
+                        for option in ChannelFormat::options_for(*c) {
+                            if ui.selectable_label(option == *f, option.label()).clicked() && option != *f {
+                                app.run("textureSet.channel.format", json!({"ts": ts, "channel": c.id(), "format": option.label()}));
+                            }
+                        }
+                    });
                 });
             });
         }
@@ -1981,6 +2157,8 @@ fn stencil_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     if let Some(name) = image_drop(ui, &row_response) {
         app.run("tool.stencil", json!({"image": name}));
     }
+    ui.checkbox(&mut app.session.tool.hide_stencil_while_painting, tr("Hide stencil when painting"))
+        .on_hover_text(tr("Hide the stencil image and its outline while a stroke is being painted"));
     if names.is_empty() {
         ui.label(RichText::new(tr("Import an image (File > Import resources) to project it onto the mesh.")).color(tk.text_dim));
         return;
@@ -1995,7 +2173,18 @@ fn stencil_section(app: &mut TextureCraftApp, ui: &mut Ui) {
             st.reset_placement();
         }
         slider(ui, tr("Overlay opacity"), &mut st.opacity, 0.0..=1.0, 2);
-        ui.checkbox(&mut st.tile, tr("Tile"));
+        let tilings = [
+            (StencilTiling::None, tr("No Tiling")),
+            (StencilTiling::Horizontal, tr("Horizontal Tiling")),
+            (StencilTiling::Vertical, tr("Vertical Tiling")),
+            (StencilTiling::Both, tr("H and V Tiling")),
+        ];
+        let shown = tilings.iter().find(|(mode, _)| *mode == st.tiling).map_or("", |(_, label)| label);
+        combo(ui, tr("Tiling mode"), shown, |ui| {
+            for (mode, label) in tilings {
+                ui.selectable_value(&mut st.tiling, mode, label);
+            }
+        });
         ui.label(
             RichText::new(tr("S + left-drag rotates (with Shift in 15° steps), S + right-drag scales, S + middle-drag moves; or use Position X / Y."))
                 .size(10.5)
@@ -2267,7 +2456,9 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         (brush.angle, brush.follow_path) = angle_fields(&defaults);
     }
 
-    let jitter_fields = |settings: &BrushSettings| (settings.jitter_size, settings.jitter_angle, settings.jitter_flow, settings.jitter_position);
+    let jitter_fields = |settings: &BrushSettings| {
+        (settings.jitter_size, settings.jitter_angle, settings.jitter_flow, settings.jitter_position, settings.jitter_axis, settings.jitter_distribution)
+    };
     if section_with_reset(ui, "sec_jitter", tr("Jitters"), false, jitter_fields(brush) == jitter_fields(&defaults), |ui| {
         let jitters = [(tr("Size jitter"), &mut brush.jitter_size), (tr("Angle jitter"), &mut brush.jitter_angle), (tr("Flow jitter"), &mut brush.jitter_flow)];
         for (label, jitter) in jitters {
@@ -2281,8 +2472,26 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         if slider(ui, tr("Position jitter"), &mut position_jitter_percent, 0.0..=400.0, 0).changed() {
             brush.jitter_position = position_jitter_percent / 100.0;
         }
+
+        use texturecraft_engine::paint::{JitterAxis, JitterDistribution};
+        let axes = [(JitterAxis::Both, tr("Both")), (JitterAxis::Single, tr("Single"))];
+        let shown = axes.iter().find(|(axis, _)| *axis == brush.jitter_axis).map_or("", |(_, label)| label);
+        combo(ui, tr("Position Jitter Axis"), shown, |ui| {
+            for (axis, label) in axes {
+                ui.selectable_value(&mut brush.jitter_axis, axis, label);
+            }
+        });
+
+        let distributions = [(JitterDistribution::Gaussian, tr("Gaussian")), (JitterDistribution::Uniform, tr("Uniform"))];
+        let shown = distributions.iter().find(|(distribution, _)| *distribution == brush.jitter_distribution).map_or("", |(_, label)| label);
+        combo(ui, tr("Distribution"), shown, |ui| {
+            for (distribution, label) in distributions {
+                ui.selectable_value(&mut brush.jitter_distribution, distribution, label);
+            }
+        });
     }) {
-        (brush.jitter_size, brush.jitter_angle, brush.jitter_flow, brush.jitter_position) = jitter_fields(&defaults);
+        (brush.jitter_size, brush.jitter_angle, brush.jitter_flow, brush.jitter_position, brush.jitter_axis, brush.jitter_distribution) =
+            jitter_fields(&defaults);
     }
 
     let alignment_fields = |settings: &BrushSettings| (settings.alignment, settings.backface_culling, settings.angle_fade, settings.depth);

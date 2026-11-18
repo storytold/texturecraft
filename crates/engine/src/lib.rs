@@ -23,6 +23,7 @@ pub mod filter_lib;
 mod frame_target;
 pub mod inspect;
 pub mod instance_cmds;
+pub mod layer_channels;
 pub mod layer_cmds;
 pub mod layer_ops;
 pub mod layer_selection;
@@ -49,6 +50,7 @@ mod polygon_fill_drag;
 mod polygon_fill_mirror;
 mod stencil_look;
 // Mesh reimport reads files on native targets only
+pub mod hide_excluded;
 #[cfg(not(target_arch = "wasm32"))]
 mod preserve;
 pub mod preset_cmds;
@@ -81,8 +83,8 @@ pub use fill_mode::FillMode;
 pub use path_tool::PathState;
 pub use project_cmds::sample_session;
 pub use session::{
-    CloneFrom, CloneSource, Document, HISTORY_TEMPLATES, Session, SetCache, StackTarget, StencilLook, StencilState, Tool, ToolState, ViewMode, history_label,
-    stroke_template,
+    CloneFrom, CloneSource, Document, HISTORY_TEMPLATES, NORMAL_HEIGHT_MESH_LABEL, Session, SetCache, StackTarget, StencilLook, StencilState, StencilTiling,
+    Tool, ToolState, ViewMode, history_label, stroke_template,
 };
 pub use set_cmds::{ResizeOutput, ResizeTask};
 pub use solo::Solo;

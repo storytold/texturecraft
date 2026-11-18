@@ -266,6 +266,43 @@ impl ChannelFormat {
             ChannelFormat::Rgb32F => "RGB32F",
         }
     }
+
+    pub const ALL: [ChannelFormat; 9] = [
+        ChannelFormat::Srgb8,
+        ChannelFormat::L8,
+        ChannelFormat::Rgb8,
+        ChannelFormat::L16,
+        ChannelFormat::Rgb16,
+        ChannelFormat::L16F,
+        ChannelFormat::Rgb16F,
+        ChannelFormat::L32F,
+        ChannelFormat::Rgb32F,
+    ];
+
+    /// Bits per component: 8, 16 or 32.
+    pub fn bits(self) -> u32 {
+        match self {
+            ChannelFormat::Srgb8 | ChannelFormat::L8 | ChannelFormat::Rgb8 => 8,
+            ChannelFormat::L16 | ChannelFormat::Rgb16 | ChannelFormat::L16F | ChannelFormat::Rgb16F => 16,
+            ChannelFormat::L32F | ChannelFormat::Rgb32F => 32,
+        }
+    }
+
+    /// True for the single-component (grey) formats.
+    pub fn is_grey(self) -> bool {
+        matches!(self, ChannelFormat::L8 | ChannelFormat::L16 | ChannelFormat::L16F | ChannelFormat::L32F)
+    }
+
+    /// The formats channel `c` can be stored in: grey for scalar and height channels, colour for colour and normal channels.
+    pub fn options_for(c: Channel) -> Vec<ChannelFormat> {
+        let grey = matches!(c.kind(), ChannelKind::Scalar | ChannelKind::Signed);
+        ChannelFormat::ALL.into_iter().filter(|f| f.is_grey() == grey).collect()
+    }
+
+    /// Parse a label (case-insensitive).
+    pub fn parse(s: &str) -> Option<ChannelFormat> {
+        ChannelFormat::ALL.into_iter().find(|f| f.label().eq_ignore_ascii_case(s.trim()))
+    }
 }
 
 #[cfg(test)]

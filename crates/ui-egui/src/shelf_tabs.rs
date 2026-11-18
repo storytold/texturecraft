@@ -72,7 +72,7 @@ fn collapsed(ui: &mut Ui, picked: &mut usize, counts: &[usize], size: f32) {
             }
         }
 
-        ui.add_enabled(false, egui::Button::selectable(false, tr(FONTS))).on_disabled_hover_text(tr(crate::shelf_panes::NOT_AVAILABLE));
+        ui.add_enabled(false, egui::Button::selectable(false, tr(FONTS))).on_disabled_hover_text(tr(crate::unavailable::NOT_AVAILABLE));
         ui.separator();
 
         if ui.button(tr(SHOW_ALL)).clicked() {

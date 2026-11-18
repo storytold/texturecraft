@@ -459,7 +459,7 @@ fn projection_tool_paints_the_stencil_colors() {
     execute(&mut s, "tool.projection", &Value::Null).unwrap();
     // Without a stencil the tool explains what's missing.
     assert!(execute(&mut s, "tool.stroke", &json!({"points": [[150, 200]]})).is_err());
-    execute(&mut s, "tool.stencil", &json!({"image": name, "scale": 1.0, "tile": true})).unwrap();
+    execute(&mut s, "tool.stencil", &json!({"image": name, "scale": 1.0, "tiling": "both"})).unwrap();
     execute(&mut s, "tool.brush", &json!({"size": 6, "hardness": 90})).unwrap();
     for x in [150.0f32, 250.0] {
         execute(&mut s, "tool.stroke", &json!({"points": [[x, 200.0]]})).unwrap();
@@ -830,9 +830,12 @@ fn resetting_a_stencil_puts_back_its_placement_only() {
     stencil.scale = 2.0;
     stencil.rotation = 30.0;
     stencil.opacity = 0.9;
-    stencil.tile = true;
+    stencil.tiling = texturecraft_engine::StencilTiling::Both;
     stencil.reset_placement();
-    assert_eq!((stencil.center, stencil.scale, stencil.rotation, stencil.opacity, stencil.tile), ([0.0, 0.0], 0.8, 0.0, 0.9, true));
+    assert_eq!(
+        (stencil.center, stencil.scale, stencil.rotation, stencil.opacity, stencil.tiling),
+        ([0.0, 0.0], 0.8, 0.0, 0.9, texturecraft_engine::StencilTiling::Both)
+    );
 }
 
 #[test]
@@ -871,4 +874,25 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
     }
     execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"baseColor": {"opacity": 2.0}, "roughness": {"opacity": -1.0}}})).unwrap();
     assert_eq!((read(&s)[&Channel::BaseColor].opacity, read(&s)[&Channel::Roughness].opacity), (1.0, 0.0), "opacity is clamped");
+}
+
+#[test]
+fn brush_jitter_axis_and_distribution_are_set_and_old_brushes_load() {
+    use texturecraft_engine::paint::{BrushSettings, JitterAxis, JitterDistribution};
+
+    let mut s = texturecraft_engine::sample_session(128, 32).unwrap();
+    assert_eq!((s.tool.brush.jitter_axis, s.tool.brush.jitter_distribution), (JitterAxis::Both, JitterDistribution::Uniform));
+
+    execute(&mut s, "tool.brush", &json!({"jitterAxis": "single", "jitterDistribution": "gaussian"})).unwrap();
+    assert_eq!((s.tool.brush.jitter_axis, s.tool.brush.jitter_distribution), (JitterAxis::Single, JitterDistribution::Gaussian));
+
+    assert!(execute(&mut s, "tool.brush", &json!({"jitterAxis": "diagonal"})).is_err());
+    assert!(execute(&mut s, "tool.brush", &json!({"jitterDistribution": "triangle"})).is_err());
+
+    // A brush saved before the two fields existed keeps today's behaviour
+    let mut saved = serde_json::to_value(BrushSettings::default()).unwrap();
+    saved.as_object_mut().unwrap().remove("jitter_axis");
+    saved.as_object_mut().unwrap().remove("jitter_distribution");
+    let old: BrushSettings = serde_json::from_value(saved).unwrap();
+    assert_eq!(old, BrushSettings::default());
 }

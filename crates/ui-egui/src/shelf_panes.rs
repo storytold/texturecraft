@@ -10,14 +10,13 @@ use crate::i18n::{n_, tr};
 use crate::saved_search::SavedSearch;
 use crate::shelf::TABS;
 use crate::theme::Tokens;
+use crate::unavailable::NOT_AVAILABLE;
 use crate::widgets::icon_button;
 
 const COLUMN_FRACTION: f32 = 0.45;
 const COLUMN_MIN_WIDTH_POINTS: f32 = 110.0;
 const SPLITTER_HEIGHT_POINTS: f32 = 6.0;
 const PANE_MIN_HEIGHT_POINTS: f32 = 40.0;
-/// The hint on rows whose function TextureCraft lacks
-pub(crate) const NOT_AVAILABLE: &str = n_("Not available yet");
 /// The reference's built-in saved searches after "All", shown greyed until they work
 const BUILT_IN_SEARCHES: [&str; 3] = [n_("Favorites"), n_("3D Assets"), n_("Flattened layers")];
 /// The reference's font libraries after the asset libraries, shown greyed until they work

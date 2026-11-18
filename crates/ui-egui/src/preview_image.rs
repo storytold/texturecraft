@@ -203,8 +203,13 @@ pub fn stroke_preview(brush: &BrushSettings, size_px: usize, image: Option<&Imag
         let tangent = if brush.follow_path { (curve(t).1 - p.1).atan2(curve(t).0 - p.0) } else { 0.0 };
         let angle = brush.angle.to_radians() + tangent + brush.jitter_angle * std::f32::consts::TAU * jitter_sample(i, 2);
         let (cx, cy) = (
-            p.0 + brush.jitter_position * radius * (jitter_sample(i, 3) * 2.0 - 1.0),
-            p.1 + brush.jitter_position * radius * (jitter_sample(i, 4) * 2.0 - 1.0),
+            p.0 + brush.jitter_position * radius * brush.jitter_distribution.sample(jitter_sample(i, 3), jitter_sample(i, 6)),
+            match brush.jitter_axis {
+                texturecraft_engine::paint::JitterAxis::Both => {
+                    p.1 + brush.jitter_position * radius * brush.jitter_distribution.sample(jitter_sample(i, 4), jitter_sample(i, 7))
+                }
+                texturecraft_engine::paint::JitterAxis::Single => p.1,
+            },
         );
         let flow = brush.flow * (1.0 - brush.jitter_flow * jitter_sample(i, 5));
         let (sin, cos) = angle.sin_cos();

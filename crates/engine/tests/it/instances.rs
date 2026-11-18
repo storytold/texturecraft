@@ -276,3 +276,12 @@ fn budgeted_updates_spread_work_and_end_identical() {
     assert!(s.caches[0].composite == full, "chunked compositing gives the same pixels");
     assert!(s.memory().composites > 0);
 }
+
+#[test]
+fn paste_as_instance_has_the_default_key_ctrl_shift_v_alone() {
+    let specs = texturecraft_engine::command_specs();
+    let spec = specs.iter().find(|c| c.id == "layer.pasteInstance").unwrap();
+    assert_eq!(spec.shortcut, Some("Ctrl+Shift+V"));
+    let clashes: Vec<_> = specs.iter().filter(|c| c.shortcut == Some("Ctrl+Shift+V") && c.id != spec.id).map(|c| c.id).collect();
+    assert!(clashes.is_empty(), "{clashes:?} share the key");
+}

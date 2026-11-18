@@ -4,6 +4,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use serde_json::json;
 use texturecraft_engine::Session;
+use texturecraft_ui_egui::file_dialogs::Answer;
 use texturecraft_ui_egui::{TextureCraftApp, menus};
 
 fn harness(session: Session) -> Harness<'static, TextureCraftApp> {
@@ -11,6 +12,9 @@ fn harness(session: Session) -> Harness<'static, TextureCraftApp> {
 
     // The exact-text checks below need English, whatever the OS language is
     harness.state_mut().ui.prefs.language = "en".into();
+
+    // Menu items that ask for a file (Save UI layout, ...) are answered with Cancel instead of opening a native dialog
+    harness.state_mut().file_dialogs.set_override(Some(Box::new(|_| Answer::Cancelled)));
     harness.run_steps(4);
     harness
 }

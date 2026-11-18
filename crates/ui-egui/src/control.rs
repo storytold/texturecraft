@@ -120,6 +120,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                     // The Export dialog cannot operate after Close
                     if id == "file.close" {
                         app.ui.windows.export = false;
+                        app.ui.windows.mesh_export_options = false;
                     }
 
                     // A command that moved the camera takes over from a glide in progress; a projection switch joins it

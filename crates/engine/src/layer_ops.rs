@@ -24,6 +24,15 @@ pub fn specs() -> Vec<CommandSpec> {
             flatten
         ),
         cmd!(
+            "layer.flattenAll",
+            "Flatten all instances",
+            ["Layers"],
+            None,
+            "{layer?} — flatten the layer (or an instance's source) and every instance of it in one step → {layers}",
+            has_layer,
+            flatten_all
+        ),
+        cmd!(
             "layer.instantiateAll",
             "Instantiate across texture sets",
             ["Layers"],
@@ -158,8 +167,17 @@ fn to_all_sets(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "layers": made }))
 }
 
-fn flatten(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, "layer.flatten", p)?;
+/// Everything `layer.flatten` needs about one layer, read before anything is edited
+struct Flattened {
+    id: LayerId,
+    ts: usize,
+    size: (u32, u32),
+    layer: texturecraft_core::Layer,
+    content: texturecraft_core::Layer,
+    tiles: Vec<texturecraft_compose::eval::FlatTile>,
+}
+
+fn prepare_flatten(s: &mut Session, id: LayerId) -> Result<Flattened> {
     let (ts, _, _) = s.doc.project.locate(id).ok_or_else(|| EngineError::Other("layer not in a stack".into()))?;
     let layer = s.doc.project.layer(id)?.clone();
     // An instance flattens what it draws into a plain layer of its own.
@@ -169,29 +187,55 @@ fn flatten(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.update();
     let size = s.caches.get(ts).ok_or_else(|| EngineError::Other("texture set not ready".into()))?.size;
-    let flat = s.flatten(ts, id).ok_or_else(|| EngineError::Other("nothing to flatten".into()))?;
-    s.edit("Flatten layer", |s| {
-        for c in Channel::ALL {
-            s.doc.pixels.layers.remove(&(id, c));
-        }
-        let effects: Vec<LayerId> = layer.mask.iter().flat_map(|m| m.effects.iter()).chain(layer.content_effects.iter()).map(|e| e.id).collect();
-        s.doc.pixels.masks.retain(|e, _| !effects.contains(e));
-        s.doc.pixels.layers.retain(|(e, _), _| !effects.contains(e));
-        for (c, (tx, ty), data) in flat {
-            let img = s.doc.pixels.layer_mut(id, c, size);
-            img.set_tile(tx, ty, Some(std::sync::Arc::new(data)));
-        }
-        let channels = s.doc.project.texture_set(ts)?.channel_list();
-        let l = s.doc.project.layer_mut(id)?;
-        l.kind = LayerKind::Paint;
-        l.mask = None;
-        l.content_effects.clear();
-        l.height_mask = Default::default();
-        l.channels = content.channels.into_iter().filter(|(c, _)| channels.contains(c)).collect();
-        s.target = StackTarget::Content;
-        Ok(())
-    })?;
+    let tiles = s.flatten(ts, id).ok_or_else(|| EngineError::Other("nothing to flatten".into()))?;
+    Ok(Flattened { id, ts, size, layer, content, tiles })
+}
+
+fn apply_flatten(s: &mut Session, flat: Flattened) -> Result<()> {
+    let Flattened { id, ts, size, layer, content, tiles } = flat;
+    for c in Channel::ALL {
+        s.doc.pixels.layers.remove(&(id, c));
+    }
+    let effects: Vec<LayerId> = layer.mask.iter().flat_map(|m| m.effects.iter()).chain(layer.content_effects.iter()).map(|e| e.id).collect();
+    s.doc.pixels.masks.retain(|e, _| !effects.contains(e));
+    s.doc.pixels.layers.retain(|(e, _), _| !effects.contains(e));
+    for (c, (tx, ty), data) in tiles {
+        let img = s.doc.pixels.layer_mut(id, c, size);
+        img.set_tile(tx, ty, Some(std::sync::Arc::new(data)));
+    }
+    let channels = s.doc.project.texture_set(ts)?.channel_list();
+    let l = s.doc.project.layer_mut(id)?;
+    l.kind = LayerKind::Paint;
+    l.mask = None;
+    l.content_effects.clear();
+    l.height_mask = Default::default();
+    l.channels = content.channels.into_iter().filter(|(c, _)| channels.contains(c)).collect();
+    s.target = StackTarget::Content;
+    Ok(())
+}
+
+fn flatten(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = layer_param(s, "layer.flatten", p)?;
+    let flat = prepare_flatten(s, id)?;
+    s.edit("Flatten layer", |s| apply_flatten(s, flat))?;
     Ok(json!({ "layer": id.0 }))
+}
+
+/// Flatten a layer and every instance of it as one undo step. All of them are rendered from the
+/// document as it is now, so flattening the source does not change what the instances draw.
+fn flatten_all(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = layer_param(s, "layer.flattenAll", p)?;
+    let source = s.doc.project.content_layer(id).map(|l| l.id).ok_or_else(|| EngineError::Other("the instance's source is missing".into()))?;
+    let mut ids: Vec<LayerId> = s.doc.project.layers.values().filter(|l| l.instance_source() == Some(source)).map(|l| l.id).collect();
+    ids.sort_by_key(|l| l.0);
+    ids.retain(|l| s.doc.project.locate(*l).is_some());
+    ids.push(source);
+    let mut flats = Vec::new();
+    for layer in &ids {
+        flats.push(prepare_flatten(s, *layer)?);
+    }
+    s.edit("Flatten all instances", |s| flats.into_iter().try_for_each(|flat| apply_flatten(s, flat)))?;
+    Ok(json!({ "layers": ids.iter().map(|l| l.0).collect::<Vec<_>>() }))
 }
 
 impl Session {
@@ -206,6 +250,38 @@ impl Session {
 /// Resample every painted image of texture set `ts` to `size` (after a size change).
 pub(crate) fn resample_set(doc: &mut Document, ts: usize, size: (u32, u32)) {
     map_set_images(doc, ts, |img, empty| fit(img, size, empty));
+}
+
+/// Round the colour components of every painted image of channel `c` in texture set `ts` to `bits` bits (8: 256 steps), as storing the channel in an 8 bit format does. The last component (paint coverage) is kept.
+pub(crate) fn quantize_set_channel(doc: &mut Document, ts: usize, c: Channel, bits: u32) {
+    if bits >= 16 {
+        return;
+    }
+    let ids: Vec<LayerId> = doc.project.walk(ts).into_iter().map(|(id, _)| id).collect();
+    let effect_ids: Vec<LayerId> = ids
+        .iter()
+        .filter_map(|id| doc.project.layers.get(id))
+        .flat_map(|l| l.mask.iter().flat_map(|m| m.effects.iter()).chain(l.content_effects.iter()).map(|e| e.id))
+        .collect();
+    let max = ((1u32 << bits) - 1) as f32;
+    let round = |v: u16| ((f32::from(v) / 65535.0 * max).round() / max * 65535.0).round() as u16;
+    for ((id, ch), img) in doc.pixels.layers.iter_mut() {
+        if *ch != c || !(ids.contains(id) || effect_ids.contains(id)) {
+            continue;
+        }
+        let comps = img.comps();
+        let fill = vec![0u16; comps];
+        let coords: Vec<(u32, u32)> = img.allocated().collect();
+        for (tx, ty) in coords {
+            if let Some(tile) = img.tile_mut(tx, ty, &fill) {
+                for texel in tile.chunks_exact_mut(comps) {
+                    for v in texel.iter_mut().take(comps - 1) {
+                        *v = round(*v);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Replace every painted image of texture set `ts` (layers, content and mask paint effects) by

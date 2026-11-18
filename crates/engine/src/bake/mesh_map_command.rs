@@ -5,6 +5,7 @@
 use super::model_patch;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use texturecraft_core::BakePaintTarget;
 
@@ -65,11 +66,24 @@ pub(super) fn specs() -> Vec<CommandSpec> {
 type MeshFile = (String, Vec<u8>);
 
 static GPU_TRACER: OnceLock<Arc<dyn Tracer>> = OnceLock::new();
+/// Whether bakes may use the installed GPU tracer (Settings > Enable GPU raytracing).
+static GPU_RAYTRACING: AtomicBool = AtomicBool::new(true);
 
 /// Cast bake rays with `tracer` (the apps install the render crate's GPU baker at start-up);
 /// the first call wins.
 pub fn install_gpu_tracer(tracer: Arc<dyn Tracer>) {
     let _ = GPU_TRACER.set(tracer);
+}
+
+/// Let bakes cast their rays on the installed GPU tracer (`true`, the default) or keep them on
+/// the CPU (`false`). Applies to bakes started afterwards.
+pub fn set_gpu_raytracing(enabled: bool) {
+    GPU_RAYTRACING.store(enabled, Ordering::Relaxed);
+}
+
+/// The tracer a bake starting now uses: the installed one while GPU raytracing is on, else none (the CPU)
+fn chosen_tracer(installed: Option<&Arc<dyn Tracer>>, enabled: bool) -> Option<Arc<dyn Tracer>> {
+    installed.filter(|_| enabled).cloned()
 }
 
 /// A mesh file name made unique among `taken` (and safe as a project file entry).
@@ -125,7 +139,7 @@ impl Session {
         let excluded_tiles: Vec<_> = set.uv_tiles.iter().filter(|tile| set.bake_excluded_tiles.contains(tile)).filter_map(|tile| grid?.block(*tile)).collect();
         let previous_maps = if excluded_tiles.is_empty() { Default::default() } else { self.doc.baked.get(&texture_set).cloned().unwrap_or_default() };
 
-        let tracer = GPU_TRACER.get().cloned();
+        let tracer = chosen_tracer(GPU_TRACER.get(), GPU_RAYTRACING.load(Ordering::Relaxed));
         Ok(BakeTask {
             low_base_color,
             ts: texture_set,
@@ -722,4 +736,33 @@ fn bake_run(session: &mut Session, params: &Value) -> Result<Value> {
     }
     session.update();
     Ok(json!({ "baked": sets, "tracer": tracers }))
+}
+
+#[cfg(test)]
+mod gpu_raytracing_tests {
+    use super::*;
+
+    struct NamedTracer;
+
+    impl Tracer for NamedTracer {
+        fn name(&self) -> String {
+            "gpu".into()
+        }
+
+        fn scene<'a>(
+            &'a self,
+            _: &[texturecraft_bake::tracing::TraceMesh<'a>],
+        ) -> std::result::Result<Box<dyn texturecraft_bake::tracing::RayScene + 'a>, texturecraft_bake::BakeError> {
+            Err(texturecraft_bake::BakeError::Tracer("test tracer".into()))
+        }
+    }
+
+    #[test]
+    fn bakes_use_the_installed_gpu_tracer_only_while_gpu_raytracing_is_on() {
+        let installed: Arc<dyn Tracer> = Arc::new(NamedTracer);
+
+        assert_eq!(chosen_tracer(Some(&installed), true).map(|tracer| tracer.name()), Some("gpu".to_string()));
+        assert!(chosen_tracer(Some(&installed), false).is_none(), "off keeps the rays on the CPU");
+        assert!(chosen_tracer(None, true).is_none(), "no installed tracer bakes on the CPU");
+    }
 }

@@ -300,6 +300,8 @@ pub struct Frame {
     pub shade: Shade,
     /// Visibility per texture set.
     pub visible: Vec<bool>,
+    /// Per mesh part (submesh): hidden because the selected layer's geometry mask excludes it. Empty: none.
+    pub hidden_parts: Vec<bool>,
     /// See-through quads in the 3D view, hidden behind the mesh
     pub overlay: Vec<OverlayQuad>,
 }
@@ -527,6 +529,8 @@ struct ShadowMap {
     /// parameters' bits and, when on, the content revision), visible sets.
     key: Option<(u64, [u32; 3], [u32; 4], u64)>,
     visible: Vec<bool>,
+    /// The mesh parts left out of the key-light shadow
+    hidden: Vec<bool>,
     vp: Mat4,
     buf: wgpu::Buffer,
     bg: wgpu::BindGroup,
@@ -1169,6 +1173,7 @@ impl Renderer {
             size: 1,
             key: None,
             visible: Vec::new(),
+            hidden: Vec::new(),
             vp: Mat4::IDENTITY,
             bg: device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("tc_shadow"),
@@ -1888,7 +1893,18 @@ impl Renderer {
         visible: &'a [bool],
         only: Option<usize>,
     ) -> impl Iterator<Item = (std::ops::Range<u32>, &'a SetGpu)> + 'a {
-        drawable_ranges(ranges, &self.material_sets, visible, only).filter_map(|(range, ts)| Some((range, self.sets.get(ts)?)))
+        self.drawable_without(ranges, visible, &[], only)
+    }
+
+    /// [`Renderer::drawable`] leaving out the ranges whose position in `ranges` is true in `hidden`.
+    fn drawable_without<'a>(
+        &'a self,
+        ranges: &'a [(u32, u32, usize)],
+        visible: &'a [bool],
+        hidden: &'a [bool],
+        only: Option<usize>,
+    ) -> impl Iterator<Item = (std::ops::Range<u32>, &'a SetGpu)> + 'a {
+        drawable_ranges(ranges, &self.material_sets, visible, hidden, only).filter_map(|(range, ts)| Some((range, self.sets.get(ts)?)))
     }
 
     /// Keep the key-light shadow map current; returns its view-projection. `light` points to
@@ -1907,6 +1923,7 @@ impl Renderer {
         light: Vec3,
         disp: [f32; 4],
         visible: &[bool],
+        hidden: &[bool],
     ) -> Option<Mat4> {
         let l = light.try_normalize()?;
         let (id, center, radius) = self.mesh.as_ref().map(|m| (m.id, m.center, m.radius))?;
@@ -1920,7 +1937,7 @@ impl Renderer {
         }
         let displacing = disp[0] > 0.5;
         let key = (id, l.to_array().map(f32::to_bits), disp.map(f32::to_bits), if displacing { self.content_rev } else { 0 });
-        if self.shadow.key == Some(key) && self.shadow.visible == visible {
+        if self.shadow.key == Some(key) && self.shadow.visible == visible && self.shadow.hidden == hidden {
             return Some(self.shadow.vp);
         }
         // An orthographic light frustum around the mesh's bounding sphere.
@@ -1948,7 +1965,7 @@ impl Renderer {
             let geo = m.dense.as_ref().filter(|_| displacing).unwrap_or(&m.geo);
             pass.set_vertex_buffer(0, geo.vb.slice(..));
             pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&geo.draws, visible, None) {
+            for (range, set) in self.drawable_without(&geo.draws, visible, hidden, None) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
@@ -1956,6 +1973,7 @@ impl Renderer {
         drop(pass);
         self.shadow.key = Some(key);
         self.shadow.visible = visible.to_vec();
+        self.shadow.hidden = hidden.to_vec();
         self.shadow.vp = vp;
         Some(vp)
     }
@@ -2016,7 +2034,11 @@ impl Renderer {
             None => [0.0; 4],
         };
         let shadow_disp = [disp[0], disp[1] * s.height_strength, disp[2], 0.0];
-        let shadow_vp = if !data && s.shadows && lw > 0.0 { self.update_shadow(device, queue, encoder, light, shadow_disp, &frame.visible) } else { None };
+        let shadow_vp = if !data && s.shadows && lw > 0.0 {
+            self.update_shadow(device, queue, encoder, light, shadow_disp, &frame.visible, &frame.hidden_parts)
+        } else {
+            None
+        };
         let radius = self.mesh.as_ref().map_or(1.0, |m| m.radius);
 
         // Perspective background rays prevent flat color in orthographic views
@@ -2147,7 +2169,7 @@ impl Renderer {
         let geo = self.geometry(m, frame);
         pass.set_vertex_buffer(0, geo.vb.slice(..));
         pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-        for (range, set) in self.drawable(&geo.draws, &frame.visible, None) {
+        for (range, set) in self.drawable_without(&geo.draws, &frame.visible, &frame.hidden_parts, None) {
             pass.set_bind_group(1, &set.bind_group, &[]);
             pass.draw_indexed(range, 0, 0..1);
         }
@@ -2281,13 +2303,16 @@ impl Renderer {
             (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, uv_set, 1),
             (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
         ];
-        for (pipeline, vertices, indices, ranges, only_set, instances) in passes {
+        for (pass_index, (pipeline, vertices, indices, ranges, only_set, instances)) in passes.into_iter().enumerate() {
             let Some(pipeline) = pipeline else { continue };
+
+            // Only the mesh pass (the first) has draws per part
+            let hidden: &[bool] = if pass_index == 0 { &frame.hidden_parts } else { &[] };
 
             pass.set_pipeline(pipeline);
             pass.set_vertex_buffer(0, vertices.slice(..));
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(ranges, &frame.visible, only_set) {
+            for (range, set) in self.drawable_without(ranges, &frame.visible, hidden, only_set) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..instances);
             }
@@ -2417,9 +2442,14 @@ fn drawable_ranges<'a>(
     ranges: &'a [(u32, u32, usize)],
     material_sets: &'a [Option<usize>],
     visible: &'a [bool],
+    hidden: &'a [bool],
     only: Option<usize>,
 ) -> impl Iterator<Item = (std::ops::Range<u32>, usize)> + 'a {
-    ranges.iter().filter_map(move |&(start, count, material)| {
+    ranges.iter().enumerate().filter_map(move |(index, &(start, count, material))| {
+        if hidden.get(index).copied().unwrap_or(false) {
+            return None;
+        }
+
         let ts = material_sets.get(material).copied().flatten()?;
         if only.is_some_and(|o| o != ts) || !visible.get(ts).copied().unwrap_or(true) {
             return None;
@@ -2600,10 +2630,22 @@ mod tests {
     fn the_highlight_draws_only_the_highlighted_sets_edges() {
         let line_draws = [(0, 4, 0), (4, 6, 1), (10, 2, 2)];
         let material_sets = [Some(0), Some(1), Some(2)];
-        let highlighted = |visible: &[bool]| drawable_ranges(&line_draws, &material_sets, visible, Some(1)).collect::<Vec<_>>();
+        let highlighted = |visible: &[bool]| drawable_ranges(&line_draws, &material_sets, visible, &[], Some(1)).collect::<Vec<_>>();
 
         assert_eq!(highlighted(&[true; 3]), vec![(4..10, 1)]);
         assert_eq!(highlighted(&[true, false, true]), vec![], "a hidden set shows no highlight");
+    }
+
+    #[test]
+    fn parts_the_mask_excludes_are_left_out_of_the_draws() {
+        // Two parts of one material, then a part of another
+        let draws = [(0, 3, 0), (3, 3, 0), (6, 3, 1)];
+        let material_sets = [Some(0), Some(1)];
+        let drawn = |hidden: &[bool]| drawable_ranges(&draws, &material_sets, &[true; 2], hidden, None).map(|(range, _)| range).collect::<Vec<_>>();
+
+        assert_eq!(drawn(&[]), vec![0..3, 3..6, 6..9]);
+        assert_eq!(drawn(&[true, false, false]), vec![3..6, 6..9], "the first part is hidden, its twin stays");
+        assert_eq!(drawn(&[false, true]), vec![0..3, 6..9], "a short list hides only what it names");
     }
 
     #[test]

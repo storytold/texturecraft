@@ -5,7 +5,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 ## Paint in 3D
 
 - **Brushes** with size, flow, stroke opacity, spacing, hardness, angle and follow path; size,
-  angle, flow and position jitter; tangent or camera alignment, angle fade, backface culling, lazy
+  angle, flow and position jitter (on both axes or only across the stamp, uniform or Gaussian); tangent or camera alignment, angle fade, backface culling, lazy
   mouse, X/Y/Z mirror and radial symmetry (copies paint the far side too, and in the 2D view they land where the 3D
   copies would) and pen pressure in the 3D and 2D views (Windows Ink pens, and pens that send touch events in the browser, such as on
   tablets; on Linux, macOS and desktop browsers a pen works as a mouse for now).
@@ -17,10 +17,14 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   stroke and keep the size. The Brush section's **Brush presets** popover (and the shelf) also keeps
   your own: save the current brush, click to use it, rename, replace or delete it.
 - **Tools:** paint, eraser, **projection** with image stencils (hold S to move, turn and scale the
-  stencil), polygon fill (triangle, UV island or the whole mesh), **path** (Shift+click places a corner point for hard edges) and **lasso fill**, a
+  stencil; a Tiling mode of No Tiling, Horizontal, Vertical or H and V repeats it along its own X, Y or both axes), polygon fill (triangle, UV island or the whole mesh), **path** (Shift+click places a corner point for hard edges; "Reverse path direction" turns the curve around in one undo step, also for a stored path being edited, and is a bindable command, `path.reverse`) and **lasso fill**, a
   **particle brush**, **smudge**, **clone** (V + click sets the source, marked in the 3D and 2D views;
   an Aligned option keeps or restarts the offset per stroke), material picker, Shift+click straight
   lines (Ctrl+Shift+click snaps them to 15 degree steps), and painting directly in the **2D UV view**.
+  Default keys switch painting options on and off, and each can be rebound: **L** symmetry, **D** lazy mouse
+  (back to its last distance), **A** resume previous stroke (a new stroke is a straight line from where the last one
+  ended, as with Shift+click), **N** ignore stencil (the Projection tool paints its plain brush), and **X** inverts the mask value.
+  The Projection tool's **Hide stencil when painting** option (on by default) hides the stencil image and its outline while a stroke is painted.
   Brush, symmetry and the other tool settings stay when you open another project and when you
   restart the app.
 - **Geometry decals:** drop an image on the surface, then move, scale and turn its frame, keep the image's proportions
@@ -31,15 +35,20 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   tool's base color (Properties › Alpha › Text).
 - **Quick mask** (Y): paint a temporary mask (U to edit, Ctrl+Shift+I to invert) that protects
   everything outside it while you paint.
+- **Hide excluded geometry** (Alt+H, top bar): hides the mesh parts the selected layer's geometry mask
+  leaves out; strokes and picking skip them, so the brush paints the parts behind.
 - **Every channel at once:** base color, metallic, roughness, height, normal, emissive, opacity,
   ambient occlusion and specular level, plus clear coat, sheen, anisotropy, subsurface scattering
   and transmission, each toggled per stroke in the brush's material properties.
 
 ## Layers, masks and smart materials
 
+- **Masks from the layer menu**: **Add bitmap mask** (pick one of the imported images), **Copy mask** (Ctrl+Alt+C) and **Paste into mask** (Ctrl+Alt+V) move a mask, painted pixels included, to another layer. Both keys can be rebound.
+- **Layer menu**: **Gamma corrected alpha/mask** (a checkable mask item, saved with the project) reads the mask's grey values as sRGB encoded, **Export channels to files** writes a layer's channels as one image per channel, and **Lock layer** blocks paint strokes and fills on the layer and its mask; a locked layer shows a lock icon on its row, and a click on it unlocks.
 - **Paint, fill, folder and instance layers** with **32 blend modes per channel** (Normal through
   Normal map detail), per-channel opacity, visibility, color tags, drag-and-drop reordering,
-  duplicate, group, flatten, cut, copy and paste across texture sets, and **geometry masks** that
+  duplicate, group, flatten (**Flatten all instances** flattens a layer and every instance of it in one undo step), cut, copy and paste across texture sets (Ctrl+Shift+V pastes a copied
+  layer as an instance; the key can be rebound), and **geometry masks** that
   show a layer only on the mesh parts you pick (right-click a layer, or click parts with the
   **Geometry mask** tool, 8). **Solo layer** (right-click a layer, or Alt+click its eye) shows
   one layer alone in the 3D and 2D views, optionally without its mask (Alt+Shift+click, or
@@ -117,7 +126,13 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   and one texture per tile on export (`$udim`).
 - **Texture sets** from 128 to 8192 px per material, resampled when you change them, with 21
   channel types to add or remove. Show, hide or invert them all at once, or **focus** on the
-  active one. The project's **normal map format** (OpenGL or DirectX, in Texture Set Settings)
+  active one. Rename a set by double-click in the Texture Sets list or from its right-click
+  menu, which also hides, isolates and resizes it; **Same size for all sets** (that menu and
+  Texture Set Settings) resizes every set at once. Next and previous texture set are bindable
+  commands (Viewport menu, no default keys). Each channel row in Texture Set Settings has a **storage format** menu (sRGB8, RGB8,
+  RGB16, RGB16F, RGB32F for colour and normal channels; L8, L16, L16F, L32F for grey ones); picking
+  an 8 bit format rounds the channel's painted layer data to 256 steps, one undo step
+  (`textureSet.channel.format`). The project's **normal map format** (OpenGL or DirectX, in Texture Set Settings)
   says how a normal map image set as a mesh map is read, and is the default for export.
 - **Projects** are a single `.tcraft` file: the mesh, every layer (sparse and lossless), baked maps
   and imported images. **Project templates** start new work from a saved setup. Closing the app,
@@ -134,6 +149,12 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   edited): drop one from the Assets panel on a slot of the Texture Set Settings, or pick it from
   the slot's menu. A UV-tiled set takes one image per tile, named with its tile number
   (`ao.1001.png`, `ao.1002.png`…): drop or pick any one of them.
+- **Bake presets:** Mesh Map Bakers > Presets saves the active texture set's bake settings under a
+  name, loads one back into the active set (its Include in Bake choice stays) and deletes it.
+  Presets are kept between sessions. **Apply to All Texture Sets** copies the active set's settings,
+  including its map list, to every set. When a bake ends, a toast names the maps baked, the time
+  and the failed sets (an error toast that points to the Log if any); the Log gets the same line
+  and one line per failed set.
 - **Live bake preview:** while the app bakes, each mesh map shows on the model as soon as it is
   finished; the bake bar follows the newest map, pins a finished one or shows the material.
 - **Export presets** for glTF PBR Metal Roughness, Unreal Engine (packed), Unity HDRP (mask map),
@@ -143,6 +164,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   override and OpenGL or DirectX normals.
 - **Output template editor:** build your own presets with per-channel packing, converted maps and per-channel inversion,
   and share them as JSON.
+- **Export panel** on the right bar: *Export Mesh...* asks for the mesh export options, then for
+  the file; *Export Textures...* opens the Export textures window (Settings, Output templates and
+  List of exports, *Include all*, *Save settings* and the number of textures the export writes).
 - **Mesh export** to OBJ with an MTL material library and its maps (PBR extension keys for
   roughness, metallic, normal and coat; UV-tiled sets keep their UDIM UVs and export their maps
   through Export textures), textured GLB (with clear coat and sheen) and USD (with clear coat).
@@ -159,10 +183,14 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   light, environment importance sampling, displaced geometry, a denoiser and one-click PNG save,
   traced on the GPU
   (compute shaders, about 25× the CPU tracer, desktop and WebGPU) or on the CPU.
+- Pause Engine Computation (Shift+Esc, top bar right group) stops compositing and viewport texture updates while you set up
+  several edits on a heavy stack; unpausing recomputes what changed, and export always uses up-to-date textures.
 - View any channel, any baked mesh map, or a UV checker; Alt+drag to orbit (Alt+Shift+drag in 90°
   steps), middle-drag to pan, wheel to zoom, F to show the entire mesh, Shift+F to frame the active
   texture set (a floor plane or other helper geometry stays out of the view and the orbit pivot),
-  M / C / B to cycle views. Orbit, pan and zoom buttons in the corner of each view do the same with a
+  M / C / B to cycle views. Choose **free (trackball) or constrained rotation** in the top bar (free
+  turns the model over; commands for stepped turns and for the next / previous saved camera can be
+  bound in Settings), and the **Normal+height+mesh** view in the view picker. Orbit, pan and zoom buttons in the corner of each view do the same with a
   plain drag, so a pen and tablet can navigate without a keyboard or wheel (Viewport menu ▸
   Navigation buttons hides them).
 - **Perspective (F5) or orthographic (F6)** projection, and **front, back, left, right, top and
@@ -172,18 +200,31 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 
 ## Interface
 
+- **Swap 3D/2D** (F4, Viewport menu and the layout dropdown, rebindable) puts the 2D view on the left and the 3D view on the right in the split layout. Painting, the divider and the views' headers work on both sides, and the choice is kept with the UI state.
 - A modern look in **four brightness levels** (dark, medium dark, medium light and light) with
-  **seven accent colors**, set in Settings › Interface.
+  **seven accent colors**, set in Settings › General › Appearance.
 - **Its own title bar** with the app icon, menus and window buttons on Windows (and on Linux
   desktops that leave the frame to the app, such as GNOME), the macOS traffic lights over the same
-  strip, and Settings › Interface › System title bar for the system's frame instead.
+  strip, and Settings › General › Appearance › System title bar for the system's frame instead.
 - **Dockable, tabbed and floating panels**, saved layouts, and panels that reopen where you closed
-  them.
+  them. The right bar's panels (Export, Log, Display Settings, Shader Settings, History) pop out
+  beside it; *Undock* makes one a floating window, and its *Dock* button puts it back on the bar.
+- **Display and Shader Settings** are one scrolling page each: their section tabs jump to a
+  section, and scrolling highlights the tab of the section in view.
+- A **Log** panel with a *General* and an *Assets* tab: asset messages (resources that do not
+  decode, skipped templates and presets, PBR folder and MaterialX import warnings) go under Assets.
 - **No project at launch**: empty views, panels and toolbars until you create or open one (File ›
   New project, Open, Recent projects, Open sample project); File › Close returns to that state.
 - A **data folder** of your choice for autosaves, smart materials, presets, templates and UI
-  layouts, on any drive (Settings › Folders; `Documents/TextureCraft` by default).
+  layouts, on any drive (Settings › General › Folders; `Documents/TextureCraft` by default).
+- A **Settings window** (Edit › Settings) with General, Shortcuts and Libraries pages; changes
+  apply on OK and Cancel drops them. General holds the language (or the system's), the 3D view's
+  rotation, zoom and wheel speeds with inverse directions, GPU or CPU bake rays, resource limits
+  (worker threads, cores kept for the UI, RAM while saving, project size on open) and the autosave
+  interval. Shortcuts rebinds any command. Libraries adds or removes folders whose saved smart
+  materials and masks the shelf lists.
 - A **shortcut editor** with conflict detection, listing every menu item and every command a key can run (commands that need a path, name or similar are left out), and every shortcut shown in its tooltip.
+- **Help menu:** Release notes... opens the project's releases page in the browser; Export log... saves the whole log (every channel, one line each with time and level) to a text file chosen in a save dialog.
 - A **History** panel: click any step to go back to it, or forward again to an undone one.
 - **10 languages:** English, French, German, Spanish, Portuguese, Italian, Japanese, Chinese,
   Korean and Arabic, switchable live.

@@ -33,7 +33,7 @@ const SETTLE_FRAMES: usize = 3;
 
 // A setting only Shader Settings shows, and one only Display Settings shows
 const SHADER_SETTING: &str = "Index of refraction";
-const DISPLAY_SETTING: &str = "Environment opacity";
+const DISPLAY_SETTING: &str = "Environment Opacity";
 
 fn app() -> Harness<'static, TextureCraftApp> {
     app_of_size(WINDOW_SIZE)
@@ -96,11 +96,11 @@ fn popup_close_button(harness: &Harness<'_, TextureCraftApp>) -> Option<egui::Re
         .map(|button| button.rect())
 }
 
-/// The title of the popup open on the panel named `name`: that name, level with the popup's Close button
+/// The title of the popup open on the panel named `name`: that name in capitals, level with the popup's Close button
 fn open_popup_title(harness: &Harness<'_, TextureCraftApp>, name: &str) -> Option<egui::Rect> {
     let close = popup_close_button(harness)?;
     harness
-        .get_all_by_label(name)
+        .get_all_by_label(&name.to_uppercase())
         .map(|node| node.rect())
         .find(|title| title.right() < close.left() && (close.top()..=close.bottom()).contains(&title.center().y))
 }
@@ -160,7 +160,8 @@ fn the_close_button_a_press_outside_and_escape_close_it() {
     assert!(popup_closed(&harness), "Close");
 
     click_rail(&mut harness, "Log");
-    harness.get_by_label("Assets").click();
+    // The Assets panel's tab, left of the viewport and clear of the popup (the Log has an Assets tab too)
+    harness.get_all_by_label("Assets").min_by(|a, b| a.rect().left().total_cmp(&b.rect().left())).unwrap().click();
     harness.run_steps(SETTLE_FRAMES);
 
     assert!(popup_closed(&harness), "a press outside");
@@ -288,11 +289,11 @@ fn opening_the_window_menu_closes_the_rail_popup() {
 fn escape_closes_a_dropdown_before_its_rail_popup() {
     let mut harness = app();
     click_rail(&mut harness, "Display Settings");
-    let environment_row = harness.get_by_label("Environment map").rect();
+    let environment_row = harness.get_by_label("Environment Map").rect();
     harness
-        .get_all_by_role(Role::ComboBox)
-        .find(|combo| (combo.rect().center().y - environment_row.center().y).abs() < 1.0)
-        .expect("the environment dropdown")
+        .get_all_by_role(Role::Button)
+        .find(|button| button.rect().left() > environment_row.right() && (button.rect().center().y - environment_row.center().y).abs() < 2.0)
+        .expect("the Environment Map button")
         .click();
     harness.run_steps(SETTLE_FRAMES);
 

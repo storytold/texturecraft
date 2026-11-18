@@ -222,6 +222,9 @@ fn main() {
         let _ = ui_state_store::FILE.set(file.clone());
     }
     let prefs = saved_prefs(ui_file.as_deref(), persistence_path.as_deref());
+
+    // The worker pool's size can only be set before its first job
+    prefs.apply_work_threads();
     prefs.apply_resource_limits();
     let session = initial_session(&args);
     let title_bar = TitleBar::decide(prefs.system_title_bar);

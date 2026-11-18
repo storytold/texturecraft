@@ -20,6 +20,9 @@ pub struct ToolSettings {
     pub clone_aligned: bool,
     pub path_closed: bool,
     pub path_fill: bool,
+    /// Settings saved before the switch existed keep its default (on)
+    #[serde(default = "crate::session::default_hide_stencil")]
+    pub hide_stencil_while_painting: bool,
 }
 
 fn aligned_by_default() -> bool {
@@ -45,6 +48,7 @@ impl ToolSettings {
             clone_aligned: tool.clone_aligned,
             path_closed: tool.path.closed,
             path_fill: tool.path.fill,
+            hide_stencil_while_painting: tool.hide_stencil_while_painting,
         }
     }
 
@@ -61,5 +65,6 @@ impl ToolSettings {
         tool.clone_aligned = self.clone_aligned;
         tool.path.closed = self.path_closed;
         tool.path.fill = self.path_fill;
+        tool.hide_stencil_while_painting = self.hide_stencil_while_painting;
     }
 }

@@ -11,12 +11,16 @@ mod angle_dial;
 mod ask;
 mod bake_job;
 pub mod bake_mode;
+pub mod bake_presets;
+mod bake_report;
 mod bake_scene;
 mod color_selection_editor;
 pub mod control;
 mod decal_drop;
+mod display_settings;
 pub mod dock;
 pub mod docking;
+mod export_panel;
 pub mod export_templates;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod file_dialogs;
@@ -39,9 +43,11 @@ mod levels_handle;
 mod levels_properties;
 mod line_snap;
 mod list_action;
+pub mod log_panel;
 mod mask_preview_image;
 mod material_preview_image;
 pub mod menus;
+mod mesh_export_options;
 mod name_error;
 mod named_layout;
 pub mod named_layouts;
@@ -75,6 +81,9 @@ mod resource_picker_tile;
 mod running_bake;
 pub mod saved_search;
 mod screen_color_pick;
+mod section_page;
+pub mod settings_window;
+pub mod shader_settings;
 pub mod shelf;
 mod shelf_entry;
 mod shelf_folders;
@@ -95,6 +104,7 @@ mod tile_edits;
 pub mod titlebar;
 pub mod toolbar;
 pub mod ui_state_store;
+pub mod unavailable;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod updates_ui;
 pub mod uv_paint_point;
@@ -167,9 +177,13 @@ pub struct TextureCraftApp {
     /// Texture sets the GPU could not hold, and the text of the one sticky toast naming them.
     pub(crate) gpu_memory: (Vec<String>, Option<String>),
     pub bake: Option<BakeJob>,
+    /// What the bake running now has done so far, for the summary when it ends
+    pub bake_report: bake_report::BakeReport,
     /// The Import PBR textures dialog while it is open.
     pub pbr_import: Option<pbr_import::PbrDialog>,
     pub resize: Option<ResizeJob>,
+    /// Sets still waiting for "same size for all sets" (set index, size), next one last.
+    resize_queue: Vec<(usize, u32)>,
     pub link_cooks: Vec<LinkCook>,
     pub thumbs: thumbs::Thumbs,
     /// The Layers panel's thumbnails and folded groups.
@@ -227,6 +241,8 @@ pub struct TextureCraftApp {
     pub(crate) prompt_saved: bool,
     /// The resolved keymap and its key dispatcher.
     pub(crate) bindings: keymap::Bindings,
+    /// The shortcuts Settings > Shortcuts edits, resolved to show shared shortcuts.
+    pub(crate) settings_bindings: keymap::Bindings,
 }
 
 /// The UI state to start with: the saved one, whose tool settings go to `session`, else the defaults in the OS language
@@ -238,7 +254,7 @@ pub(crate) fn start_ui(saved: Option<UiState>, session: &mut Session) -> UiState
         }
         None => {
             let mut ui = UiState::default();
-            ui.prefs.language = i18n::os_language().into();
+            ui.prefs.language = i18n::SYSTEM_LANGUAGE.into();
             ui
         }
     }
@@ -277,8 +293,10 @@ impl TextureCraftApp {
             toasts: Vec::new(),
             gpu_memory: (Vec::new(), None),
             bake: None,
+            bake_report: Default::default(),
             pbr_import: None,
             resize: None,
+            resize_queue: Vec::new(),
             link_cooks: Vec::new(),
             thumbs: thumbs::Thumbs::default(),
             layer_panel: layer_panel::LayerPanel::default(),
@@ -311,7 +329,13 @@ impl TextureCraftApp {
             #[cfg(not(target_arch = "wasm32"))]
             prompt_saved: false,
             bindings: keymap::Bindings::default(),
+            settings_bindings: keymap::Bindings::default(),
         };
+        // The test harness has no window: its file dialogs answer Cancelled, never on the desktop
+        #[cfg(not(target_arch = "wasm32"))]
+        if cc.winit_window().is_none() {
+            app.file_dialogs.without_window();
+        }
         app.ui.rename = None;
         app.ui.windows.new_project = false;
         i18n::set_language(&app.ui.prefs.language);
@@ -345,7 +369,9 @@ impl TextureCraftApp {
         self.ui.prefs.apply_resource_limits();
 
         // Going to a saved camera or a fixed view glides there; the control channel and CLI jump straight away
-        let glides = id.starts_with("camera.select") || id.starts_with("camera.bookmark") || id.starts_with("camera.view");
+        let glides = ["camera.select", "camera.bookmark", "camera.view", "camera.next", "camera.previous", "camera.snapRotate"]
+            .iter()
+            .any(|prefix| id.starts_with(prefix));
         let before = self.session.camera;
         let glide_from = glides.then_some(before);
         match texturecraft_engine::execute(&mut self.session, id, &params) {
@@ -358,6 +384,7 @@ impl TextureCraftApp {
                 if matches!(id, "file.open" | "file.new" | "file.close" | "project.new" | "project.sample") {
                     self.pbr_import = None;
                     self.resize = None;
+                    self.resize_queue.clear();
                     self.layer_panel = Default::default();
                 }
 
@@ -365,6 +392,7 @@ impl TextureCraftApp {
                 if id == "file.close" {
                     self.ui.mode = state::Mode::Painting;
                     self.ui.windows.export = false;
+                    self.ui.windows.mesh_export_options = false;
                 }
 
                 match glide_from {
@@ -435,6 +463,7 @@ impl TextureCraftApp {
         }
 
         let total = sets.len();
+        self.bake_report = bake_report::BakeReport::started(self.last_time);
         self.bake = Some(BakeJob { queue: sets, current: None, total, mesh_id: self.session.mesh_id });
     }
 
@@ -528,19 +557,24 @@ impl TextureCraftApp {
             match running.receiver.try_recv() {
                 Ok(Ok(output)) => {
                     job.current = None;
-                    if let Err(error) = self.session.apply_streamed_bake(set_index, output) {
-                        self.toast(error.to_string(), true);
+                    let maps = output.maps.len();
+                    match self.session.apply_streamed_bake(set_index, output) {
+                        Ok(()) => self.bake_report.maps += maps,
+                        Err(error) => self.bake_failed(set_index, &error.to_string()),
                     }
                 }
                 Ok(Err(error)) => {
+                    // The worker's error ends the whole bake; the maps of the sets before it stay
+                    self.bake_failed(set_index, &error.to_string());
                     self.cancel_bake();
-                    self.toast(error.to_string(), true);
+                    self.finish_bake_report();
                     return;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.bake_failed(set_index, i18n::tr("The bake worker stopped"));
                     self.cancel_bake();
-                    self.toast(i18n::tr("The bake worker stopped"), true);
+                    self.finish_bake_report();
                     return;
                 }
             }
@@ -551,7 +585,7 @@ impl TextureCraftApp {
         if job.queue.is_empty() {
             self.bake = None;
             self.session.bake_preview_end();
-            self.toast(i18n::tr("Mesh maps baked"), false);
+            self.finish_bake_report();
             return;
         }
 
@@ -576,8 +610,21 @@ impl TextureCraftApp {
                     job.current = Some(RunningBake { set_index, progress, receiver, maps, maps_done, maps_total });
                 }
             }
-            Err(error) => self.toast(error.to_string(), true),
+            Err(error) => self.bake_failed(set_index, &error.to_string()),
         }
+    }
+
+    /// Note a texture set whose bake failed: one Log line, counted in the summary
+    fn bake_failed(&mut self, set_index: usize, error: &str) {
+        self.session.log.push(format!("Bake of texture set {set_index} failed: {error}"));
+        self.bake_report.failed.push(set_index);
+    }
+
+    /// The toast that ends a bake (maps baked, time, failures) and its line in the Log
+    fn finish_bake_report(&mut self) {
+        let (text, line, failed) = self.bake_report.summary(self.last_time);
+        self.session.log.push(line);
+        self.toast(text, failed);
     }
 
     /// Cancel the active worker, discard queued sets and restore the view. The current set's
@@ -610,6 +657,26 @@ impl TextureCraftApp {
         }
     }
 
+    /// Give every texture set size `resolution`: the sets resize one after the other on the
+    /// worker, each as its own undo step.
+    pub fn start_resize_all(&mut self, resolution: u32) {
+        if self.resize.is_some() {
+            return;
+        }
+        self.resize_queue =
+            self.session.doc.project.texture_sets.iter().enumerate().filter(|(_, t)| t.resolution != resolution).map(|(i, _)| (i, resolution)).rev().collect();
+        self.start_next_resize();
+    }
+
+    fn start_next_resize(&mut self) {
+        if let Some((ts, resolution)) = self.resize_queue.pop() {
+            self.start_resize(ts, resolution);
+            if self.resize.is_none() {
+                self.resize_queue.clear();
+            }
+        }
+    }
+
     /// Apply a finished resize (after any stroke in progress ends).
     fn poll_resize(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.resize else { return };
@@ -617,6 +684,7 @@ impl TextureCraftApp {
         // Nothing to resize without a project (a result that arrives after Close is dropped)
         if !self.session.project_open {
             self.resize = None;
+            self.resize_queue.clear();
             return;
         }
 
@@ -632,7 +700,10 @@ impl TextureCraftApp {
         };
         self.resize = None;
         if let Err(e) = result.and_then(|out| self.session.apply_resize(out)) {
+            self.resize_queue.clear();
             self.toast(e.to_string(), true);
+        } else {
+            self.start_next_resize();
         }
     }
 
@@ -733,8 +804,8 @@ impl TextureCraftApp {
 /// Whether command `id` puts the camera at a place it names (a view, a saved camera, explicit values or
 /// framing), so a glide toward an earlier destination must not go on even when the camera is already there
 fn sets_camera(id: &str) -> bool {
-    matches!(id, "camera.set" | "camera.orbit" | "camera.select")
-        || ["camera.view.", "camera.bookmark", "viewport.frame"].iter().any(|prefix| id.starts_with(prefix))
+    matches!(id, "camera.set" | "camera.orbit" | "camera.select" | "camera.next" | "camera.previous")
+        || ["camera.view.", "camera.bookmark", "camera.snapRotate", "camera.rotation", "viewport.frame"].iter().any(|prefix| id.starts_with(prefix))
 }
 
 /// A smooth move of the viewport camera (see [`TextureCraftApp::run`]).
@@ -757,6 +828,7 @@ impl TextureCraftApp {
         let mut c = b;
         c.target = a.target.lerp(b.target, e);
         c.yaw = mix(a.yaw, b.yaw);
+        c.orient = a.orient.slerp(b.orient, e);
         c.pitch = mix(a.pitch, b.pitch);
         c.distance = mix(a.distance, b.distance);
         c.fov = mix(a.fov, b.fov);
@@ -924,10 +996,16 @@ pub fn data_folder(pref: &str) -> std::path::PathBuf {
     std::path::Path::new(&home).join("Documents").join("TextureCraft")
 }
 
+/// The data folder in use (Settings › Folders › Data folder).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn data_dir() -> std::path::PathBuf {
+    DATA_FOLDER.get().cloned().unwrap_or_else(|| data_folder(""))
+}
+
 /// `<sub>` in the data folder in use (Settings › Folders › Data folder).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn user_dir(sub: &str) -> std::path::PathBuf {
-    DATA_FOLDER.get().cloned().unwrap_or_else(|| data_folder("")).join(sub)
+    data_dir().join(sub)
 }
 
 /// Folder holding the user's smart materials.

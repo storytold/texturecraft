@@ -424,7 +424,7 @@ pub(crate) fn categories<T>(items: &[T], category: impl Fn(&T) -> &'static str) 
     out
 }
 
-/// Read the user's saved smart materials (desktop library folder) unless they are already listed
+/// Read the user's saved smart materials (desktop library folder and the added library locations) unless they are already listed
 #[cfg(not(target_arch = "wasm32"))]
 fn scan_library(app: &mut TextureCraftApp) {
     if app.library.is_some() {
@@ -435,9 +435,16 @@ fn scan_library(app: &mut TextureCraftApp) {
         path.extension()
             .is_some_and(|extension| extension == "tcmat" || extension == MCMAT_EXT || extension == texturecraft_engine::smart_masks::SMART_MASK_EXT)
     };
-    let mut files: Vec<std::path::PathBuf> =
-        std::fs::read_dir(crate::library_dir()).map(|dir| dir.flatten().map(|entry| entry.path()).filter(saved_asset).collect()).unwrap_or_default();
+    // The library folder, then each location added in Settings > Libraries
+    let added = app.ui.prefs.libraries.iter().map(|location| std::path::PathBuf::from(location.path.trim()));
+    let mut files: Vec<std::path::PathBuf> = std::iter::once(crate::library_dir())
+        .chain(added.filter(|path| path.is_absolute()))
+        .flat_map(|folder| {
+            std::fs::read_dir(folder).map(|dir| dir.flatten().map(|entry| entry.path()).filter(saved_asset).collect::<Vec<_>>()).unwrap_or_default()
+        })
+        .collect();
     files.sort();
+    files.dedup();
     app.library = Some(files);
 }
 
@@ -775,5 +782,26 @@ mod tests {
         assert_eq!(galley.rows.len(), 1);
         assert!(galley.size().x <= width);
         assert_eq!(galley.rows[0].glyphs.last().map(|glyph| glyph.chr), Some('…'));
+    }
+
+    /// Saved smart materials in a location added in Settings > Libraries are listed with the library folder's
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_shelf_lists_saved_materials_of_added_library_locations() {
+        let dir = std::env::temp_dir().join(format!("tc-shelf-added-library-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("Rusty Plate.tcmat");
+        std::fs::write(&saved, b"").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"").unwrap();
+        let session = texturecraft_engine::Session::closed().unwrap();
+        let mut app = TextureCraftApp::new(&eframe::CreationContext::_new_kittest(egui::Context::default()), session);
+        app.ui.prefs.libraries.push(crate::state::LibraryLocation { name: "plates".into(), path: dir.display().to_string() });
+
+        scan_library(&mut app);
+        let listed = app.library.clone().unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(listed.contains(&saved), "{listed:?}");
+        assert!(!listed.iter().any(|path| path.extension().is_some_and(|extension| extension == "txt")), "only saved assets are listed");
     }
 }
