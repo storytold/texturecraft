@@ -1237,17 +1237,20 @@ pub fn export(app: &mut TextureCraftApp, ctx: &egui::Context) {
             ui.vertical(|ui| {
                 ui.set_width(180.0);
                 ui.label(RichText::new(tr("Texture sets")).strong());
-                for i in 0..app.session.set_count() {
-                    let name = app.session.doc.project.texture_sets.get(i).map(|t| t.name.clone()).unwrap_or_default();
-                    let mut on = !app.ui.export.skip.contains(&i);
-                    if ui.checkbox(&mut on, name).changed() {
-                        if on {
-                            app.ui.export.skip.retain(|x| *x != i);
-                        } else {
-                            app.ui.export.skip.push(i);
+                // Scrolls so a mesh with many texture sets cannot push the dialog off screen
+                egui::ScrollArea::vertical().id_salt("exp_sets").auto_shrink([false; 2]).show(ui, |ui| {
+                    for i in 0..app.session.set_count() {
+                        let name = app.session.doc.project.texture_sets.get(i).map(|t| t.name.clone()).unwrap_or_default();
+                        let mut on = !app.ui.export.skip.contains(&i);
+                        if ui.checkbox(&mut on, name).changed() {
+                            if on {
+                                app.ui.export.skip.retain(|x| *x != i);
+                            } else {
+                                app.ui.export.skip.push(i);
+                            }
                         }
                     }
-                }
+                });
             });
             ui.separator();
             ui.vertical(|ui| match app.ui.export.tab {
@@ -1328,6 +1331,25 @@ mod tests {
         ask_save_project(app, "file.saveAs");
         h.run_steps(3);
         assert_eq!(h.state().ui.windows.unsaved, Some(Unsaved::Quit), "the prompt still waits for an answer");
+    }
+
+    #[test]
+    fn the_export_dialog_stays_on_screen_with_many_texture_sets() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut h = harness();
+        let app = h.state_mut();
+        for i in 0..80 {
+            app.session.doc.project.texture_sets.push(texturecraft_engine::core::TextureSet::new(format!("Set {i}"), 0, 64));
+        }
+        app.ui.windows.export = true;
+        h.run_steps(3);
+        for label in ["Reset all", "Cancel"] {
+            let node = h.get_by_label(label);
+            let Some(bounds) = node.accesskit_node().bounding_box() else {
+                panic!("{label} has no bounds");
+            };
+            assert!(bounds.y1 <= 960.0, "{label} is below the bottom of the screen at y = {}", bounds.y1);
+        }
     }
 
     #[test]
