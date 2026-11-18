@@ -134,7 +134,7 @@ fn is_ui(id: &str) -> bool {
 
 /// Shell items that act on the open project: greyed while none is open
 fn ui_needs_project(id: &str) -> bool {
-    matches!(id, "ui.export" | "ui.projectConfig" | "ui.uvChecker" | "ui.mode.bake" | "ui.mode.paint" | "ui.mode.render")
+    matches!(id, "ui.export" | "ui.exportMesh" | "ui.projectConfig" | "ui.uvChecker" | "ui.mode.bake" | "ui.mode.paint" | "ui.mode.render")
 }
 
 /// Whether an item can run now

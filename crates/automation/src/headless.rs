@@ -148,7 +148,7 @@ impl Headless {
     fn exists(&self, path: &str) -> bool {
         match &self.fs {
             Filesystem::Denied => false,
-            Filesystem::TrustedLocal => Path::new(path).exists(),
+            Filesystem::TrustedLocal => std::fs::symlink_metadata(path).is_ok(),
             Filesystem::Workspace(w) => w.exists(path),
         }
     }

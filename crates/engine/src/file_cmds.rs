@@ -60,7 +60,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Mesh...",
             ["File"],
             None,
-            "{path: .obj, .glb, .usda, .usdc or .usdz file, format?: obj|glb|gltf|usda|usdc|usdz (default: from the extension, else obj), overwrite?: bool (required when the rewritten destination already exists); obj writes its .mtl and textures, usda/usdc their textures, next to the file} → {path, textures?}",
+            "{path: .obj, .glb, .usda, .usdc or .usdz file, format?: obj|glb|gltf|usda|usdc|usdz (default: from the extension, else obj; .gltf/.glft and format gltf write a .glb, replacing that suffix), overwrite?: bool (required when the rewritten destination already exists); obj writes its .mtl and textures, usda/usdc their textures, next to the file} → {path, textures?}",
             always,
             export_mesh
         ),
@@ -608,7 +608,7 @@ fn export_mesh(s: &mut Session, p: &Value) -> Result<Value> {
     let path = native::path_param(p, "path", "file.exportMesh")?;
     let out = s.mesh_export(path, strp(p, "format"))?;
     let overwrite = crate::commands::boolp(p, "overwrite").unwrap_or(false);
-    if out.path != path && std::path::Path::new(&out.path).exists() && !overwrite {
+    if out.path != path && std::fs::symlink_metadata(&out.path).is_ok() && !overwrite {
         return Err(bad("file.exportMesh", format!("{} already exists", out.path)));
     }
     let write = |path: &str, bytes: &[u8]| std::fs::write(path, bytes).map_err(|e| bad("file.exportMesh", format!("cannot write {path}: {e}")));
@@ -644,7 +644,8 @@ impl MeshExport {
 
 impl Session {
     /// The working mesh as a file for `path`, in `format` (obj, glb, gltf, usda, usdc, usdz;
-    /// default: from the extension, else OBJ). The extension is appended when it doesn't match.
+    /// default: from the extension, else OBJ). `.gltf` and `.glft`, and format `gltf`, write a `.glb`
+    /// by replacing that suffix; otherwise the format extension is appended when it doesn't match.
     pub fn mesh_export(&mut self, path: &str, format: Option<&str>) -> Result<MeshExport> {
         let ext = match format {
             Some("gltf" | "glft") => "glb".to_string(),
@@ -761,7 +762,11 @@ f 1/1 2/2 3/3
     #[test]
     fn export_mesh_writes_obj_by_default_and_textured_glb() {
         let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
-        let dir = std::env::temp_dir().join(format!("tc_export_mesh_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "tc_export_mesh_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let base = dir.join("ball").display().to_string();
         let obj = crate::execute(&mut s, "file.exportMesh", &json!({ "path": base })).unwrap();

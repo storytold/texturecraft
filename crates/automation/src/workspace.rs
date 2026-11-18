@@ -76,11 +76,12 @@ impl AuthorizedWorkspace {
         root.create_dir_all(&rel).map_err(|e| file_error("create", path, e))
     }
 
-    /// Returns true if a file or directory exists below the write root.
+    /// Returns true if a file, directory, or symlink exists below the write root.
+    /// The lookup does not follow symbolic links, so a dangling symlink counts as occupied.
     pub fn exists(&self, path: &str) -> bool {
         let Ok(rel) = relative_path(path) else { return false };
         let Some(root) = self.write.as_ref() else { return false };
-        root.metadata(&rel).is_ok()
+        root.symlink_metadata(&rel).is_ok()
     }
 }
 

@@ -261,6 +261,7 @@ impl TextureCraftApp {
         // No window opens by itself with no project (a saved layout may have left Export open)
         if !session.project_open {
             ui.windows.export = false;
+            ui.windows.export_mesh = false;
         }
 
         let next_autosave = ui.prefs.autosave_minutes as f64 * 60.0;
@@ -365,6 +366,9 @@ impl TextureCraftApp {
                 if id == "file.close" {
                     self.ui.mode = state::Mode::Painting;
                     self.ui.windows.export = false;
+                }
+                if matches!(id, "file.close" | "file.open" | "file.new" | "project.new" | "project.sample") {
+                    self.ui.windows.export_mesh = false;
                 }
 
                 match glide_from {
