@@ -68,9 +68,8 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
 }
 
 pub(crate) fn encode_png(w: u32, h: u32, rgba: Vec<u8>) -> Option<(u32, u32, Vec<u8>)> {
-    let img = image::RgbaImage::from_raw(w, h, rgba)?;
-    let mut png = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    let img = craft_image_codecs::Image::from_u8(w, h, craft_image_codecs::ChannelLayout::Rgba, rgba).ok()?;
+    let png = craft_image_codecs::encode(&img, craft_image_codecs::Format::Png, &Default::default()).ok()?;
     Some((w, h, png))
 }
 
@@ -250,4 +249,19 @@ pub fn screenshot(app: &TextureCraftApp, view: u64) -> Option<(u32, u32, Vec<u8>
     let gpu = renderer.callback_resources.get::<crate::gpu::GpuState>()?;
     let (w, h, rgba) = gpu.renderer.read_view(&rs.device, &rs.queue, view)?;
     encode_png(w, h, rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_rgba_buffer_to_png() {
+        let (w, h, png) = encode_png(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
+        assert_eq!((w, h), (2, 1));
+        let decoded = craft_image_codecs::decode(&png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+        assert_eq!(decoded.to_rgba8(), vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert!(encode_png(2, 1, vec![0; 3]).is_none());
+    }
 }

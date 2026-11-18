@@ -25,6 +25,7 @@ texturecraft-compose = { workspace = true }
 image = { workspace = true }
 png = "0.18"
 bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
+craft-image-codecs = { workspace = true }
 gltf = { workspace = true }
 flate2 = { workspace = true }
 lz4_flex = { workspace = true }

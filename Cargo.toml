@@ -42,6 +42,7 @@ skrifa = { version = "0.44", default-features = false, features = ["std"] }
 epaint_default_fonts = "0.37"
 log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "tiff", "exr", "hdr", "bmp", "webp"] }
+craft-image-codecs = { git = "https://github.com/storytold/craft-libs", rev = "b130ac1fa44f923c3024884ab8ceb5ccdb88f15f" }
 half = "2"
 exr = { version = "1.73", default-features = false }
 eframe = { version = "0.37", default-features = false }

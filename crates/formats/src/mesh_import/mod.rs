@@ -357,23 +357,31 @@ pub fn import_high_poly_bytes(file_name: &str, bytes: &[u8]) -> Result<HighPolyM
 /// Decode a base color texture to RGBA8, at most [`BASE_COLOR_SIDE`] per side, charging its
 /// texels to `budget`.
 fn decode_base_color(bytes: &[u8], budget: &mut u64) -> Result<(u32, u32, Vec<[u8; 4]>)> {
-    let bad = |e: image::ImageError| FormatError::Malformed { kind: "image", msg: e.to_string() };
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| bad(e.into()))?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(crate::MAX_IMAGE_SIZE);
-    limits.max_image_height = Some(crate::MAX_IMAGE_SIZE);
-    reader.limits(limits);
-    let img = crate::guard("image", || reader.decode().map_err(bad))?;
-    let img =
-        if img.width().max(img.height()) > BASE_COLOR_SIDE { img.resize(BASE_COLOR_SIDE, BASE_COLOR_SIDE, image::imageops::FilterType::Triangle) } else { img };
-    let rgba = img.into_rgba8();
-    let (w, h) = rgba.dimensions();
+    let bad = |e: craft_image_codecs::CodecError| FormatError::Malformed { kind: "image", msg: e.to_string() };
+    let mut opts = craft_image_codecs::DecodeOptions::default();
+    opts.limits.max_width = crate::MAX_IMAGE_SIZE;
+    opts.limits.max_height = crate::MAX_IMAGE_SIZE;
+    let img = crate::guard("image", || craft_image_codecs::decode_with(bytes, &opts).map_err(bad))?;
+    let (w, h, rgba) = if img.width().max(img.height()) > BASE_COLOR_SIDE {
+        let mut dyn_img = image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8())
+                .ok_or_else(|| FormatError::Malformed { kind: "image", msg: "invalid RGBA buffer".into() })?,
+        );
+        dyn_img = dyn_img.resize(BASE_COLOR_SIDE, BASE_COLOR_SIDE, image::imageops::FilterType::Triangle);
+        let rgba = dyn_img.into_rgba8();
+        let (w, h) = rgba.dimensions();
+        (w, h, rgba.pixels().map(|p| p.0).collect::<Vec<[u8; 4]>>())
+    } else {
+        let rgba = img.to_rgba8();
+        let pixels = rgba.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect::<Vec<[u8; 4]>>();
+        (img.width(), img.height(), pixels)
+    };
     let texels = u64::from(w) * u64::from(h);
     if texels > *budget {
         return Err(FormatError::TooLarge(format!("the base color textures exceed {} megatexels", BASE_COLOR_TEXELS >> 20)));
     }
     *budget -= texels;
-    Ok((w, h, rgba.pixels().map(|p| p.0).collect()))
+    Ok((w, h, rgba))
 }
 
 fn read(file_name: &str, bytes: &[u8]) -> Result<RawMesh> {
@@ -570,5 +578,23 @@ fn report(mesh: &Mesh, uvs_generated: bool, mut warnings: Vec<String>) -> MeshRe
         overlap_ratio,
         zero_area_uv_triangles: zero_area,
         warnings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_base_color_resizes_oversized_and_rejects_corrupt_bytes() {
+        let mut budget = BASE_COLOR_TEXELS;
+        assert!(decode_base_color(b"not an image", &mut budget).is_err());
+
+        let side = BASE_COLOR_SIDE + 2;
+        let img = craft_image_codecs::Image::from_u8(side, 2, craft_image_codecs::ChannelLayout::Rgba, vec![128; (side * 2 * 4) as usize]).unwrap();
+        let png = craft_image_codecs::encode(&img, craft_image_codecs::Format::Png, &Default::default()).unwrap();
+        let (w, h, pixels) = decode_base_color(&png, &mut budget).unwrap();
+        assert!(w <= BASE_COLOR_SIDE && h <= BASE_COLOR_SIDE);
+        assert_eq!(pixels.len(), (w * h) as usize);
     }
 }

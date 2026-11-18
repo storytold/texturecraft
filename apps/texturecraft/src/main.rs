@@ -119,9 +119,8 @@ fn initial_session(args: &Args) -> Session {
 }
 
 fn icon() -> Option<egui::IconData> {
-    let img = image::load_from_memory(ICON_PNG).ok()?.into_rgba8();
-    let (w, h) = img.dimensions();
-    Some(egui::IconData { rgba: img.into_raw(), width: w, height: h })
+    let img = craft_image_codecs::decode(ICON_PNG).ok()?;
+    Some(egui::IconData { rgba: img.to_rgba8(), width: img.width(), height: img.height() })
 }
 
 /// Windows shows a window's big icon (`ICON_BIG`) in the taskbar and Alt+Tab; eframe sets only the
@@ -323,6 +322,13 @@ mod tests {
     fn only_a_run_without_a_control_port_checks_for_updates_at_start() {
         assert!(checks_for_updates_at_start(None));
         assert!(!checks_for_updates_at_start(Some(9000)));
+    }
+
+    #[test]
+    fn bundled_app_icon_decodes_to_rgba() {
+        let icon = icon().unwrap();
+        assert!(icon.width > 0 && icon.height > 0);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
     }
 
     #[test]

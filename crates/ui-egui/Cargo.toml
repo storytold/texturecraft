@@ -25,6 +25,7 @@ rayon = { workspace = true }
 log = { workspace = true }
 base64 = "0.22"
 image = { workspace = true }
+craft-image-codecs = { workspace = true }
 zip = { workspace = true }
 
 # The OS UI language for the first run (MIT OR Apache-2.0; the browser asks `navigator.language`).
@@ -60,3 +61,4 @@ egui_kittest = { version = "0.37", features = ["wgpu", "eframe"] }
 # Fallible setup of the exact GPU device used by rendering regression tests.
 pollster = "0.4"
 image = { workspace = true }
+craft-image-codecs = { workspace = true }

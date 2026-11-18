@@ -143,10 +143,10 @@ fn paint_icon(ui: &mut Ui) {
         Some(t) => t,
         None => {
             // Decoded once per size; a PNG that doesn't decode leaves the space empty.
-            let t = image::load_from_memory(png).ok().map(|img| {
-                let img = img.into_rgba8();
+            let t = craft_image_codecs::decode(png).ok().map(|img| {
                 let size = [img.width() as usize, img.height() as usize];
-                ui.ctx().load_texture("app_icon", egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR)
+                let rgba = img.to_rgba8();
+                ui.ctx().load_texture("app_icon", egui::ColorImage::from_rgba_unmultiplied(size, &rgba), egui::TextureOptions::LINEAR)
             });
             ui.data_mut(|d| d.insert_temp(id, t.clone()));
             t
