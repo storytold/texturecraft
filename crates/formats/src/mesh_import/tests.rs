@@ -610,3 +610,22 @@ fn ply_face_element_before_vertex_element() {
     let bad = format!("{head}3 0 1 5\n0 0 0\n1 0 0\n0 1 0\n");
     assert!(import_mesh_bytes("a.ply", bad.as_bytes()).is_err());
 }
+
+#[test]
+fn group_index_preserves_order_and_reuses_nonadjacent_material_parts() {
+    let mut raw = super::RawMesh::default();
+    for i in 0..1000 {
+        raw.group("shared", &i.to_string()).extend_from_slice(&[0, 1, 2]);
+    }
+    for i in (0..1000).rev() {
+        raw.group("shared", &i.to_string()).extend_from_slice(&[3, 4, 5]);
+    }
+    raw.group("other", "0").extend_from_slice(&[6, 7, 8]);
+    assert_eq!(raw.groups.len(), 1001);
+    for (i, (material, part, indices)) in raw.groups.iter().take(1000).enumerate() {
+        assert_eq!(material, "shared");
+        assert_eq!(part, &i.to_string());
+        assert_eq!(indices, &[0, 1, 2, 3, 4, 5]);
+    }
+    assert_eq!(raw.groups[1000], ("other".into(), "0".into(), vec![6, 7, 8]));
+}

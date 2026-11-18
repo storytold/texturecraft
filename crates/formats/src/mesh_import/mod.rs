@@ -130,6 +130,9 @@ pub(crate) struct RawMesh {
     pub colors: Option<Vec<Vec4>>,
     /// Triangles (vertex indices) per (material, part name); an empty part is unnamed.
     pub groups: Vec<(String, String, Vec<u32>)>,
+    // Build-time index; group names are restored only after polygon collection ends
+    // Nested maps allow borrowed lookups without allocating keys for every polygon
+    group_index: HashMap<String, HashMap<String, usize>>,
     pub warnings: Vec<String>,
     pub cameras: Vec<RawCamera>,
     /// Materials whose base color is not plain white (glTF).
@@ -148,11 +151,13 @@ pub(crate) struct RawBaseColor {
 impl RawMesh {
     /// Triangle list of `material` in `part`, created on first use.
     pub fn group(&mut self, material: &str, part: &str) -> &mut Vec<u32> {
-        let i = match self.groups.iter().position(|(m, p, _)| m == material && p == part) {
+        let i = match self.group_index.get(material).and_then(|parts| parts.get(part)).copied() {
             Some(i) => i,
             None => {
-                self.groups.push((material.to_string(), part.to_string(), Vec::new()));
-                self.groups.len() - 1
+                let i = self.groups.len();
+                self.groups.push((material.to_owned(), part.to_owned(), Vec::new()));
+                self.group_index.entry(material.to_owned()).or_default().insert(part.to_owned(), i);
+                i
             }
         };
         &mut self.groups[i].2
