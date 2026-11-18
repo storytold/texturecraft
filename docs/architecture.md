@@ -96,9 +96,11 @@ construction and content, mask and stage rendering on a ten-layer 4096 set. Run
 ## Undo
 
 `Session::edit` snapshots the `Document` (project + pixels + baked maps + resources) before a
-change and restores it if the change fails. Pixel data is copy-on-write (`Arc` tiles), so a
-snapshot costs one reference-count bump per allocated tile, and an undo step only keeps the tiles
-that actually changed.
+change and restores it if the change fails. Pixel images are copy-on-write at two levels: an
+image's tile table and each 64×64 tile are `Arc`-shared, so cloning an image costs one
+reference-count bump. Unchanged tables and tiles stay shared across undo steps; the
+first write to a cloned image copies its table. Mutable access to an existing shared tile also
+copies that tile's texels.
 
 ## Rendering
 
@@ -121,10 +123,10 @@ on the CPU by `render::displace` from the composited height.
 
 A fill can carry a `MaterialLink` (`core::layer`): a MaterialCraft graph whose cooked maps are the
 fill's image sources. `engine::link_cmds` imports `.mcmat` files (`formats::mcmat`), keeps the
-`.mcraft` package as a resource, and re-cooks by running `materialcraft-cli` with the link's
+`.mcraft` or `.sbs` source as a resource, and re-cooks its named graph by running `materialcraft-cli` with the link's
 values, the texture set's resolution and its baked mesh maps (`LinkJob::run`, on a worker thread
 in the UI). Every cook stores its maps under fresh resource names, so undo, redo and the decoded
-image cache never disagree. The apps share the file format and the command line, never code.
+image cache never disagree. The apps share the `craft-mcmat` format library and the command line; neither depends on the other app.
 
 ## Commands and automation
 

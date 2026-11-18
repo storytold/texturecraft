@@ -128,7 +128,7 @@ fn paste(s: &mut Session, _: &Value) -> Result<Value> {
         let sel = s.selected_layer();
         let inside = sel.and_then(|l| s.doc.project.layer(l).ok()).is_some_and(|l| l.is_group());
         let new = copy_tree(&src, id, &mut s.doc, ts, sel, inside, 0)?;
-        s.selected.insert(ts, new);
+        s.select_one(ts, new);
         s.target = StackTarget::Content;
         Ok(new)
     })?;
@@ -147,8 +147,8 @@ fn to_all_sets(s: &mut Session, p: &Value) -> Result<Value> {
             let new = if copy {
                 copy_tree(&src, id, &mut s.doc, ts, None, false, 0)?
             } else {
-                // On top of the set: clear its selection first.
-                s.selected.remove(&ts);
+                // On top of the set: clear its selection first
+                s.select_none(ts);
                 crate::instance_cmds::make_instance(s, id, ts)?
             };
             made.push(new.0);

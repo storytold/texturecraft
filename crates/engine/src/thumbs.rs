@@ -293,7 +293,14 @@ impl ThumbService {
         self.tick = self.tick.wrapping_add(1);
         let fresh = self.cache.get(&target).is_some_and(|entry| entry.generation == self.generation);
         let checked = self.checked(session);
-        if !fresh && checked && self.snapshot.is_some() && !self.in_flight.contains(&(self.generation, target)) && !self.queue.contains(&target) {
+
+        // A target the document no longer has would render for nothing, again each frame
+        if !fresh
+            && checked
+            && !self.in_flight.contains(&(self.generation, target))
+            && !self.queue.contains(&target)
+            && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.has(target))
+        {
             self.queue.push_back(target);
         }
 
@@ -473,6 +480,19 @@ mod tests {
         }
 
         eprintln!("20 unchanged snapshot comparisons, 4K normal + AO (256 MiB): {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn a_target_the_document_lacks_is_not_rendered() {
+        let session = test_session().unwrap();
+        let removed_anchor = ThumbTarget::Stage { effect: texturecraft_core::LayerId(u64::MAX), channel: Channel::Height };
+        let (mut service, jobs, _results) = held_worker();
+        service.begin_frame(&session, 0.0);
+
+        assert!(service.get(&session, removed_anchor).image.is_none());
+
+        assert!(!service.poll(&session), "nothing is rendered, so no frame is asked for");
+        assert!(jobs.try_recv().is_err());
     }
 
     #[test]

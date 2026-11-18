@@ -5,6 +5,7 @@ use egui_kittest::Harness;
 use serde_json::json;
 use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::glam::Vec2;
+use texturecraft_engine::{StackTarget, core::LayerId};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::state::ViewLayout;
 
@@ -177,6 +178,42 @@ fn a_line_does_not_start_from_a_point_on_another_texture_set() {
 #[test]
 fn a_stroke_cancelled_with_escape_leaves_the_line_start_where_it_was() {
     assert_shift_click_draws_a_line(|harness| cancelled_drag(harness, CANCELLED_DRAG_FROM, CANCELLED_DRAG_TO));
+}
+
+#[test]
+fn a_forced_2d_completion_moves_the_next_line_start() {
+    let mut harness = uv_view_app();
+    click(&mut harness, FIRST_CLICK, false);
+
+    harness.hover_at(CANCELLED_DRAG_FROM);
+    harness.run_steps(1);
+    harness.event(Event::PointerButton { pos: CANCELLED_DRAG_FROM, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    harness.run_steps(1);
+    harness.hover_at(CANCELLED_DRAG_TO);
+    harness.run_steps(2);
+    assert!(harness.state().session.stroke_active(), "the 2D drag is still active");
+
+    harness.state_mut().session.target = StackTarget::Effect(LayerId(u64::MAX));
+    harness.run_steps(1);
+    assert!(!harness.state().session.stroke_active(), "the unavailable tool finishes the drag");
+    harness.state_mut().session.target = StackTarget::Content;
+    harness.event(Event::PointerButton { pos: CANCELLED_DRAG_TO, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    harness.run_steps(2);
+
+    let (before_line, width) = alpha(&harness);
+    click(&mut harness, SECOND_CLICK, true);
+    let (after_line, _) = alpha(&harness);
+    let line = added(&before_line, &after_line);
+
+    let dab_centre = |point| {
+        let mut reference = uv_view_app();
+        let (blank, width) = alpha(&reference);
+        click(&mut reference, point, false);
+        let (painted, _) = alpha(&reference);
+        centre(&added(&blank, &painted), width)
+    };
+    let expected_middle = (dab_centre(CANCELLED_DRAG_TO) + dab_centre(SECOND_CLICK)) * 0.5;
+    assert!(painted_at(&line, width, expected_middle), "Shift+click starts at the forced completion endpoint");
 }
 
 #[test]

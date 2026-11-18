@@ -3,7 +3,7 @@
 
 use std::io::Write as _;
 
-use texturecraft_geom::glam::{Vec2, Vec3};
+use texturecraft_geom::glam::{Vec2, Vec3, Vec4};
 
 use super::tests::hammer;
 use super::*;
@@ -295,6 +295,33 @@ fn fbx_binary_32_and_64_bit_compressed_or_not() {
         let im = import_mesh_bytes("scene.fbx", &bytes).unwrap_or_else(|e| panic!("{version} {compress}: {e}"));
         check_fbx_scene(&im.mesh, false);
         check_fbx_camera(&im);
+    }
+}
+
+/// [`scene`] with a per-polygon-vertex color layer: corner `i` gets `(i/8, 1 - i/8, 0.25, 1)`.
+fn colored_scene() -> Vec<N> {
+    let mut nodes = scene(false);
+    let objects = nodes.iter_mut().find(|node| node.name == "Objects").unwrap();
+    let geometry = objects.children.iter_mut().find(|node| node.name == "Geometry").unwrap();
+    let colors: Vec<f64> = (0..7).flat_map(|i| [i as f64 / 8.0, 1.0 - i as f64 / 8.0, 0.25, 1.0]).collect();
+    geometry.children.push(layer(
+        "LayerElementColor",
+        "ByPolygonVertex",
+        "IndexToDirect",
+        vec![n("Colors", vec![P::Doubles(colors)], vec![]), n("ColorIndex", vec![P::Ints((0..7).collect())], vec![])],
+    ));
+    nodes
+}
+
+#[test]
+fn fbx_vertex_colors_reach_the_mesh_and_high_polys() {
+    let nodes = colored_scene();
+    let expected: Vec<Vec4> = (0..7).map(|i| Vec4::new(i as f32 / 8.0, 1.0 - i as f32 / 8.0, 0.25, 1.0)).collect();
+    for (label, bytes) in [("binary", binary_fbx(&nodes, 7400, false)), ("ascii", ascii_fbx(&nodes).into_bytes())] {
+        let imported = import_mesh_bytes("colors.fbx", &bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(imported.mesh.colors, expected, "{label}: the color layer reaches the mesh");
+        let high = import_high_poly_bytes("colors.fbx", &bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(high.mesh.colors, expected, "{label}: and the high poly used for ID bakes");
     }
 }
 
@@ -794,6 +821,24 @@ fn dae_polylist_z_up_units_and_node_transforms() {
     let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
     assert_eq!(cam.name, "Overview");
     assert!(!cam.ortho && near(cam.fov, 30.0) && near(cam.yaw, 0.0) && near(cam.pitch, 0.0), "{cam:?}");
+}
+
+#[test]
+fn dae_attribute_and_text_entities_are_decoded() {
+    let dae = DAE
+        .replace(r#"<node id="other">"#, r#"<node id="other" name="Tom &amp; Jerry &lt;&quot;&apos;&#65;&#x42;">"#)
+        .replace(r#"name="Red""#, r#"name="R&amp;D""#)
+        .replace(r#"<geometry id="quad""#, r#"<geometry id="q&amp;d""#)
+        .replace(r##"url="#quad""##, r##"url="#q&#38;d""##)
+        .replace("<yfov>30</yfov>", "<yfov>3&#48;</yfov>");
+    let r = import_mesh_bytes("scene.dae", dae.as_bytes()).unwrap();
+    let m = &r.mesh;
+    let parts: Vec<&str> = m.submeshes.iter().map(|s| s.name.as_str()).collect();
+    assert!(parts.contains(&"Tom & Jerry <\"'AB"), "{parts:?}");
+    assert_eq!(m.materials, vec!["R&D".to_string(), "Blue".to_string()]);
+    assert_eq!(m.triangle_count(), 2 + 1 + 2);
+    let [cam] = r.cameras.as_slice() else { panic!("{:?}", r.cameras) };
+    assert!((cam.fov - 30.0).abs() < 1e-3, "{cam:?}");
 }
 
 #[test]

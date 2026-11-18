@@ -13,9 +13,11 @@ pub fn generate(dir: Option<&Path>, required: bool) -> Result<String, String> {
         source.push_str("];\n");
         return Ok(source);
     };
+
     if !dir.is_absolute() {
         return Err("CRAFT_I18N_DIR must be an absolute path".into());
     }
+
     let locales = dir.join("locales");
     let entries = std::fs::read_dir(&locales).map_err(|e| format!("{}: {e}", locales.display()))?;
     println!("cargo::rerun-if-changed={}", locales.display());
@@ -26,23 +28,26 @@ pub fn generate(dir: Option<&Path>, required: bool) -> Result<String, String> {
             paths.push(entry.path());
         }
     }
+
     paths.sort();
     let mut count = 0;
     let mut catalogs = Vec::new();
     for path in paths {
-        // Watch directories too: adding/removing an app catalog must rebuild the embedding.
+        // Watch directories so adding or removing an app catalog rebuilds the embedding
         println!("cargo::rerun-if-changed={}", path.display());
         let app = path.join("texturecraft.tsv");
         if !app.is_file() {
             continue;
         }
+
         let locale = path.file_name().and_then(|n| n.to_str()).ok_or("non-UTF-8 locale")?;
         let common = path.join("common.tsv");
         let embed = |file: &Path| -> Result<(String, &'static str), String> {
             let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
             let name = file.to_str().ok_or("non-UTF-8 catalog path")?;
             println!("cargo::rerun-if-changed={name}");
-            // The shared runtime requires static inputs; this short-lived build process owns them.
+
+            // The shared runtime needs static inputs for this short-lived build process
             Ok((format!("include_str!({name:?})"), Box::leak(text.into_boxed_str())))
         };
         let (shared, shared_text) = if common.is_file() { embed(&common)? } else { ("\"\"".into(), "") };
@@ -55,12 +60,14 @@ pub fn generate(dir: Option<&Path>, required: bool) -> Result<String, String> {
     if required && count == 0 {
         return Err("no TextureCraft translation catalogs found".into());
     }
-    // Reject the same rows the runtime would skip, before required builds can ship English fallbacks.
+
+    // Reject rows the runtime would skip before required builds can ship English fallbacks
     let (runtime, mut problems) = craft_i18n::I18n::new(Box::leak(catalogs.into_boxed_slice()), &[]);
     problems.extend(runtime.check_all());
     if !problems.is_empty() {
         return Err(format!("invalid translation catalogs in {}: {}", locales.display(), problems.join("; ")));
     }
+
     source.push_str("];\n");
     Ok(source)
 }
@@ -83,6 +90,7 @@ pub fn embed() {
             "pub static CRAFT_I18N: &craft_i18n::Embedded = &[];\n".into()
         }
     };
+
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join("craft_i18n.rs");
     if let Err(error) = std::fs::write(&out, source) {
         println!("cargo::error=writing {}: {error}", out.display());

@@ -125,8 +125,7 @@ fn store(curvature: &Arc<Vec<f32>>, key: CacheKey, scales: &BlockScales, sizes: 
         sizes
     };
 
-    // Keep distinct layouts: thumbnails and the viewport alternate on the same bake.
-    // Replacing only this variant prevents them from repeatedly rebuilding each other.
+    // Keep layout variants so thumbnails and the viewport reuse their own levels
     cache.retain(|entry| entry.0.strong_count() > 0 && !is_entry_for(entry, curvature, key, scales));
     let sizes = Arc::new(sizes);
     cache.push((Arc::downgrade(curvature), key, scales.clone(), sizes.clone()));
@@ -410,7 +409,7 @@ mod tests {
         }
     }
 
-    // Cache lifecycle tests must not evict each other's entries in parallel.
+    // Cache lifecycle tests must not evict each other's entries in parallel
     static CACHE_TESTS: Mutex<()> = Mutex::new(());
 
     #[test]

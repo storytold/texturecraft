@@ -1,10 +1,15 @@
 //! Smart masks: procedural mask presets (generators and patterns driven by the baked mesh maps)
 //! that replace a layer's mask in one step. Smart materials build their masks from the same
-//! presets.
+//! presets. A user smart mask is a layer's mask saved to a `.tcmask` file (the `.tcraft`
+//! container holding one layer that carries the mask) and applied back like a preset.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 use texturecraft_core::{
-    BlendMode, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, Mask, MaskBackground, Procedural, ProceduralKind, Project, Projection, Source,
+    BlendMode, Effect, EffectKind, Filter, Generator, GeneratorKind, Layer, LayerId, LayerKind, Mask, MaskBackground, Procedural, ProceduralKind, Project,
+    Projection, Source,
 };
 
 use crate::commands::{CommandSpec, always, bad, has_layer, layer_param, strp};
@@ -13,12 +18,24 @@ use crate::{EngineError, Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        cmd!("mask.smart.apply", "Apply smart mask", [], None, "{name: smart mask id or label, layer?}", has_layer, apply_cmd),
+        cmd!("mask.smart.apply", "Apply smart mask", [], None, "{name: smart mask id or label, layer?} or {path: .tcmask file, layer?}", has_layer, apply_cmd),
+        cmd!(
+            "mask.smart.create",
+            "Create smart mask",
+            [],
+            None,
+            "{layer?, path: .tcmask file, name?} — saves the layer's mask (all effects, parameters, painted pixels and images) as a user smart mask",
+            has_layer,
+            create_cmd
+        ),
         cmd!("mask.smart.list", "List smart masks", [], None, "{}", always, |_, _| Ok(json!(
             SMART_MASKS.iter().map(|m| json!({"id": m.id, "label": m.label})).collect::<Vec<_>>()
         ))),
     ]
 }
+
+/// Smart mask file extension.
+pub const SMART_MASK_EXT: &str = "tcmask";
 
 pub struct SmartMask {
     pub id: &'static str,
@@ -72,10 +89,10 @@ pub(crate) fn directional(kind: GeneratorKind, direction: [f32; 3], level: f32, 
     EffectKind::Generator(Generator { level, softness, noise_amount: noise, direction, invert, detail: None, ..Generator::new(kind) })
 }
 
-/// A triplanar grayscale pattern fill.
+/// A triplanar grayscale pattern fill
 pub(crate) fn pattern(kind: ProceduralKind, scale: f32, seed: u32, contrast: f32) -> EffectKind {
     EffectKind::Fill {
-        source: Source::Procedural { pattern: Procedural { kind, scale, seed, contrast, balance: 0.0, invert: false }, low: [0.0; 3], high: [1.0; 3] },
+        source: Source::Procedural { pattern: Procedural { scale, seed, contrast, ..Procedural::new(kind) }, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() },
         projection: Projection::Triplanar { scale: 1.0, sharpness: 8.0, offset: [0.0; 3] },
     }
 }
@@ -162,7 +179,7 @@ pub(crate) fn mask(p: &mut Project, id: &str, invert: bool) -> Result<Mask> {
 /// Replace layer `layer`'s mask with smart mask `name` (one undo step).
 pub fn apply(s: &mut Session, layer: LayerId, name: &str) -> Result<()> {
     let sm = find(name).ok_or_else(|| EngineError::Other(format!("unknown smart mask `{name}`")))?;
-    s.edit(&format!("Apply smart mask {}", sm.label), |s| {
+    s.edit(&crate::session::history_label(crate::session::APPLY_SMART_MASK_TEMPLATE, sm.label), |s| {
         let m = mask(&mut s.doc.project, sm.id, false)?;
         let old = s.doc.project.layer_mut(layer)?.mask.replace(m);
         for e in old.map(|m| m.effects).unwrap_or_default() {
@@ -173,11 +190,160 @@ pub fn apply(s: &mut Session, layer: LayerId, name: &str) -> Result<()> {
     })
 }
 
+impl Session {
+    /// Serialize layer `layer`'s mask (an instance without its own mask has its source's) as a user smart mask file named `name`.
+    pub fn smart_mask_bytes(&self, layer: LayerId, name: &str) -> Result<Vec<u8>> {
+        let owner = self.doc.project.mask_owner(layer);
+        let mask = self.doc.project.layer(owner)?.mask.clone().ok_or_else(|| EngineError::Other("the layer has no mask".into()))?;
+        let (ts, _, _) = self.doc.project.locate(owner).ok_or_else(|| EngineError::Other("layer not in a stack".into()))?;
+        let set = self.doc.project.texture_set(ts)?;
+        let mut mini = crate::material_lib::one_set_document(set, name);
+        let id = mini.project.alloc_id();
+        let mut holder = Layer::new(id, name, LayerKind::Paint, &set.channel_list());
+
+        // The mask comes back switched on whatever state it was saved in
+        holder.mask = Some(Mask { enabled: true, ..copy_mask(&self.doc, &mask, &mut mini, set.size())? });
+        mini.project.insert_layer(0, holder, None, false)?;
+        self.file_bytes(mini, id)
+    }
+
+    /// Replace layer `layer`'s mask with the one in a user smart mask file (one undo step).
+    pub fn apply_smart_mask_bytes(&mut self, layer: LayerId, bytes: &[u8]) -> Result<()> {
+        let pf = texturecraft_formats::load_project_bytes(bytes).map_err(|e| EngineError::Other(e.to_string()))?;
+        self.apply_smart_mask_file(layer, pf)
+    }
+
+    fn apply_smart_mask_file(&mut self, layer: LayerId, pf: texturecraft_formats::ProjectFile) -> Result<()> {
+        let mask = pf
+            .project
+            .texture_sets
+            .first()
+            .and_then(|t| t.stack.last().copied())
+            .and_then(|root| pf.project.layers.get(&root))
+            .and_then(|l| l.mask.clone())
+            .ok_or_else(|| EngineError::Other("the smart mask file has no mask".into()))?;
+        let resources: BTreeMap<String, Arc<Vec<u8>>> = pf.resources.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        let src = crate::session::Document {
+            bake_paint: BTreeMap::new(),
+            project: pf.project,
+            pixels: pf.pixels,
+            baked: BTreeMap::new(),
+            resources: BTreeMap::new(),
+        };
+        let label = src.project.texture_sets.first().map(|t| t.name.clone()).unwrap_or_default();
+        self.edit(&format!("Apply smart mask {label}"), |s| {
+            let (ts, _, _) = s.doc.project.locate(layer).ok_or_else(|| EngineError::Other("layer not in a stack".into()))?;
+            let size = s.doc.project.texture_set(ts)?.size();
+
+            // An image whose name the project already uses for other bytes comes in under a new name
+            let mut renames = BTreeMap::new();
+            for (name, bytes) in &resources {
+                let mut taken = name.clone();
+                let mut number = 2;
+                while s.doc.resources.get(&taken).is_some_and(|have| have != bytes) {
+                    let (stem, ext) = name.rsplit_once('.').map_or((name.as_str(), String::new()), |(stem, ext)| (stem, format!(".{ext}")));
+                    taken = format!("{stem}_{number}{ext}");
+                    number += 1;
+                }
+                s.doc.resources.entry(taken.clone()).or_insert_with(|| bytes.clone());
+                if taken != *name {
+                    renames.insert(name.clone(), taken);
+                }
+            }
+            let mut new = copy_mask(&src, &mask, &mut s.doc, size)?;
+            for source in new.effects.iter_mut().flat_map(|effect| sources_mut(&mut effect.kind)) {
+                if let Source::Image { name, .. } = source
+                    && let Some(renamed) = renames.get(name.as_str())
+                {
+                    *name = renamed.clone();
+                }
+            }
+            let old = s.doc.project.layer_mut(layer)?.mask.replace(new);
+            for e in old.map(|m| m.effects).unwrap_or_default() {
+                s.doc.pixels.masks.remove(&e.id);
+            }
+            s.target = StackTarget::Mask;
+            Ok(())
+        })?;
+        self.sync_images();
+        Ok(())
+    }
+}
+
+/// The sources an effect reads.
+fn sources_mut(kind: &mut EffectKind) -> Vec<&mut Source> {
+    match kind {
+        EffectKind::Fill { source, .. } => vec![source],
+        EffectKind::Material(fill) => fill.sources.values_mut().collect(),
+        EffectKind::Generator(generator) => generator.inputs.values_mut().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `mask` of document `src` with fresh effect ids from `dst` (anchor sources follow), its painted pixels moved to `dst` at `size`.
+fn copy_mask(src: &crate::session::Document, mask: &Mask, dst: &mut crate::session::Document, size: (u32, u32)) -> Result<Mask> {
+    let mut copy = mask.clone();
+    let mut moved = BTreeMap::new();
+    for e in &mut copy.effects {
+        let old = e.id;
+        e.id = dst.project.alloc_id();
+        if matches!(e.kind, EffectKind::Anchor) {
+            moved.insert(old, e.id);
+        }
+        if let Some(img) = src.pixels.masks.get(&old) {
+            dst.pixels.masks.insert(e.id, crate::layer_ops::fit(img, size, &[0, 0]));
+        }
+    }
+
+    // Sources that read an anchor effect of this mask follow it to its new id
+    for source in copy.effects.iter_mut().flat_map(|effect| sources_mut(&mut effect.kind)) {
+        if let Source::Anchor { anchor, .. } = source {
+            *anchor = *moved.get(anchor).ok_or_else(|| EngineError::Other(format!("smart mask refers to anchor {} outside this mask", anchor.0)))?;
+        }
+    }
+    Ok(copy)
+}
+
 fn apply_cmd(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = strp(p, "name").ok_or_else(|| bad("mask.smart.apply", "`name` is required"))?;
     let layer = layer_param(s, "mask.smart.apply", p)?;
-    apply(s, layer, name)?;
+    if let Some(path) = strp(p, "path") {
+        apply_file(s, layer, path)?;
+    } else {
+        let name = strp(p, "name").ok_or_else(|| bad("mask.smart.apply", "`name` or `path` is required"))?;
+        apply(s, layer, name)?;
+    }
     Ok(json!({ "layer": layer.0 }))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_file(s: &mut Session, layer: LayerId, path: &str) -> Result<()> {
+    let file = texturecraft_formats::load_project(std::path::Path::new(path)).map_err(|e| bad("mask.smart.apply", format!("cannot read {path}: {e}")))?;
+    s.apply_smart_mask_file(layer, file)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn apply_file(_: &mut Session, _: LayerId, _: &str) -> Result<()> {
+    Err(EngineError::Other("file paths are not available in the browser".into()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn create_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let layer = layer_param(s, "mask.smart.create", p)?;
+    let path = strp(p, "path").ok_or_else(|| bad("mask.smart.create", "`path` is required"))?;
+    let name = strp(p, "name").map(str::to_string).unwrap_or_else(|| s.doc.project.layer(layer).map(|l| l.name.clone()).unwrap_or_default());
+    let bytes = s.smart_mask_bytes(layer, &name)?;
+    let path = if path.ends_with(&format!(".{SMART_MASK_EXT}")) { path.to_string() } else { format!("{path}.{SMART_MASK_EXT}") };
+    if let Some(dir) = std::path::Path::new(&path).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| bad("mask.smart.create", format!("cannot create {}: {e}", dir.display())))?;
+    }
+
+    texturecraft_formats::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| bad("mask.smart.create", format!("cannot write {path}: {e}")))?;
+    Ok(json!({ "path": path }))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn create_cmd(_: &mut Session, _: &Value) -> Result<Value> {
+    Err(EngineError::Other("file paths are not available in the browser".into()))
 }
 
 #[cfg(test)]

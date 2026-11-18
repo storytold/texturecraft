@@ -6,7 +6,6 @@
 //! UsdUVTexture shaders. Meters, Y up.
 
 use std::fmt::Write as _;
-use std::io::Write as _;
 
 use texturecraft_core::{Channel, NormalFormat};
 use texturecraft_geom::Mesh;
@@ -73,7 +72,7 @@ pub fn usd_export_options() -> ExportOptions {
                 "ClearcoatRoughness" => gray(ch(Channel::CoatRoughness, 0)),
                 _ => gray(ch(Channel::Opacity, 0)),
             };
-            MapSpec { file: stem.into(), format: FileFormat::Png, bit_depth: 8, channels }
+            MapSpec { file: stem.into(), format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new() }
         })
         .collect();
     super::png8_options(ExportPreset { name: "USD preview surface".into(), maps }, NormalFormat::OpenGl)
@@ -344,14 +343,12 @@ pub(crate) fn material_maps(mesh: &Mesh, stem: &str, textures: &[Vec<ExportedFil
 
 /// A usdz package: the layer first, every entry stored uncompressed at a 64-byte aligned offset.
 pub(crate) fn usdz(layer_name: &str, layer: &[u8], files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).with_alignment(64);
-    let err = |e: zip::result::ZipError| FormatError::Invalid(format!("usdz package: {e}"));
+    let mut zip = craft_zip_usdz::Writer::new();
+    let err = |e| FormatError::Invalid(format!("usdz package: {e}"));
     for (name, bytes) in std::iter::once((layer_name, layer)).chain(files.iter().map(|(n, b)| (n.as_str(), b.as_slice()))) {
-        zip.start_file(name, opts).map_err(err)?;
-        zip.write_all(bytes)?;
+        zip.add_stored_aligned(name, bytes, 64).map_err(err)?;
     }
-    Ok(zip.finish().map_err(err)?.into_inner())
+    zip.finish().map_err(err)
 }
 
 /// Text of a value as usda writes it.
@@ -438,4 +435,42 @@ pub(crate) fn usda(layer: &UsdLayer) -> String {
     );
     usda_prim(&mut s, &layer.root, 0);
     s
+}
+
+#[cfg(test)]
+mod aligned_package_tests {
+    use super::*;
+    use std::io::{Cursor, Read, Write};
+
+    #[test]
+    fn shared_usdz_keeps_layer_first_and_exact_archive_bytes() {
+        let files = vec![("textures/color.png".to_owned(), vec![0, 1, 255]), ("empty".to_owned(), Vec::new())];
+        let bytes = usdz("scene.usdc", b"PXR-USDC", &files).unwrap();
+        let mut previous = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).with_alignment(64);
+        for (name, data) in std::iter::once(("scene.usdc", b"PXR-USDC".as_slice())).chain(files.iter().map(|(n, b)| (n.as_str(), b.as_slice()))) {
+            previous.start_file(name, opts).unwrap();
+            previous.write_all(data).unwrap();
+        }
+        assert_eq!(bytes, previous.finish().unwrap().into_inner());
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(archive.len(), 3);
+        for (i, (name, data)) in
+            std::iter::once(("scene.usdc", b"PXR-USDC".as_slice())).chain(files.iter().map(|(n, b)| (n.as_str(), b.as_slice()))).enumerate()
+        {
+            let mut entry = archive.by_index(i).unwrap();
+            assert_eq!(entry.name().unwrap(), name);
+            assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+            assert_eq!(entry.data_start().unwrap() % 64, 0);
+            let mut actual = Vec::new();
+            entry.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, data);
+        }
+    }
+
+    #[test]
+    fn shared_usdz_rejects_duplicate_layer_name() {
+        let err = usdz("scene.usdc", b"PXR-USDC", &[("scene.usdc".to_owned(), Vec::new())]).unwrap_err();
+        assert!(matches!(err, FormatError::Invalid(ref why) if why.starts_with("usdz package:")));
+    }
 }

@@ -80,6 +80,23 @@ pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
         for (axis, name) in AXIS_NAMES.into_iter().enumerate() {
             ui.add_enabled_ui(movable[axis], |ui| slider(ui, name, &mut symmetry.offset[axis], -half_extent[axis]..=half_extent[axis], 2));
         }
+
+        // One button per axis: the plane goes back to the middle of the model
+        ui.horizontal(|ui| {
+            let cell = vec2(ui.available_width() / AXIS_NAMES.len() as f32, ui.spacing().interact_size.y);
+            for (axis, name) in AXIS_NAMES.into_iter().enumerate() {
+                ui.allocate_ui_with_layout(cell, Layout::left_to_right(Align::Center), |ui| {
+                    let label = format!("{} {name}", tr("Center"));
+                    if ui.add_enabled(movable[axis], egui::Button::new(label)).clicked() {
+                        symmetry.offset[axis] = 0.0;
+                    }
+                });
+            }
+        });
+        let picking = app.picking_symmetry_plane;
+        if ui.add_enabled(movable.contains(&true), egui::Button::new(tr("Pick point")).selected(picking)).clicked() {
+            app.picking_symmetry_plane = !picking;
+        }
     });
 
     section(ui, "symmetry_display", tr("Display"), true, |ui| {

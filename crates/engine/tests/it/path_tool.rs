@@ -709,3 +709,124 @@ fn removing_the_final_stored_point_removes_the_path_and_undo_restores_it() {
     assert_eq!(session.doc.project, before.project);
     assert_eq!(session.doc.pixels.layers, before.pixels.layers);
 }
+
+const SQUARE_UV: [[f32; 2]; 4] = [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]];
+
+/// A closed path of corner points runs straight along its edges; the smooth one bulges past them
+#[test]
+fn corner_points_make_a_path_with_straight_edges() {
+    let mut s = session(wall());
+    execute(&mut s, "tool.path", &json!({"uvPoints": SQUARE_UV, "closed": true, "commit": true})).unwrap();
+    assert!(red_uv(&s, 0.5, 0.125), "a smooth closed path bulges outside the square's edge");
+    assert!(!red_uv(&s, 0.5, 0.2));
+
+    let mut s = session(wall());
+    execute(&mut s, "tool.path", &json!({"uvPoints": SQUARE_UV, "corners": [true, true, true, true], "closed": true, "commit": true})).unwrap();
+    assert!(red_uv(&s, 0.5, 0.2) && red_uv(&s, 0.8, 0.5) && red_uv(&s, 0.5, 0.8) && red_uv(&s, 0.2, 0.5), "the edges are straight");
+    assert!(!red_uv(&s, 0.5, 0.125) && !red_uv(&s, 0.875, 0.5), "no bulge past the edges");
+
+    // The fill of a corner path is the quadrilateral too
+    let mut s = session(wall());
+    execute(&mut s, "tool.path", &json!({"uvPoints": SQUARE_UV, "corners": [true, true, true, true], "closed": true, "fill": true, "commit": true})).unwrap();
+    assert!(red_uv(&s, 0.5, 0.21) && !red_uv(&s, 0.5, 0.15));
+
+    assert!(execute(&mut s, "tool.path", &json!({"corners": [true, 3]})).is_err());
+}
+
+#[test]
+fn invalid_corner_flags_leave_the_current_curve_unchanged() {
+    let mut session = session(wall());
+    execute(&mut session, "tool.path", &json!({"uvPoints": [[0.2, 0.2], [0.5, 0.8], [0.8, 0.2]], "corners": [true, false, true]})).unwrap();
+    let before = session.tool.path.clone();
+
+    assert!(execute(&mut session, "tool.path", &json!({"uvPoints": SQUARE_UV, "corners": [true, 3]})).is_err());
+    assert_eq!(session.tool.path, before, "malformed flags leave the curve intact");
+
+    assert!(execute(&mut session, "tool.path", &json!({"corners": [true, true, true, true]})).is_err());
+    assert_eq!(session.tool.path, before, "extra flags cannot outlive their points");
+}
+
+/// Toggling a corner repaints the edited path, is one undo step that also restores the pixels, and is saved with the project
+#[test]
+fn toggling_a_corner_is_one_undo_step_and_is_saved() {
+    let mut s = session(wall());
+    let report = execute(&mut s, "tool.path", &json!({"uvPoints": [[0.2, 0.2], [0.5, 0.8], [0.8, 0.2]], "commit": true})).unwrap();
+    let effect = texturecraft_engine::core::LayerId(report["committed"]["effect"].as_u64().unwrap());
+    execute(&mut s, "path.edit", &json!({"effect": effect.0, "index": 0})).unwrap();
+    let smooth_pixels = s.doc.pixels.clone();
+    let history = s.history_labels().len();
+    assert!(s.paths(effect).unwrap()[0].corners.is_empty());
+    assert!(execute(&mut s, "path.corner", &json!({"index": 3})).is_err(), "no such point");
+    assert!(execute(&mut s, "path.corner", &json!({})).is_err(), "no point selected");
+
+    let report = execute(&mut s, "path.corner", &json!({"index": 1})).unwrap();
+    assert_eq!(report["corner"], true);
+    assert_eq!(s.paths(effect).unwrap()[0].corners, vec![false, true, false]);
+    assert_ne!(s.doc.pixels.layers, smooth_pixels.layers, "the sharp turn repaints the path");
+    let corner_pixels = s.doc.pixels.clone();
+    assert_eq!(s.history_labels().len(), history + 1);
+
+    // Saved: the flags survive a project round trip
+    let saved = serde_json::to_string(&s.doc.project).unwrap();
+    let loaded: texturecraft_engine::core::Project = serde_json::from_str(&saved).unwrap();
+    s.doc.project = loaded;
+    assert_eq!(s.paths(effect).unwrap()[0].corners, vec![false, true, false]);
+
+    // One undo returns to the smooth curve and its pixels, one redo to the corner
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert!(s.tool.path.corners.is_empty() && !s.tool.path.is_corner(1));
+    assert!(s.paths(effect).unwrap()[0].corners.is_empty());
+    assert_eq!(s.doc.pixels.layers, smooth_pixels.layers);
+    execute(&mut s, "edit.redo", &Value::Null).unwrap();
+    assert_eq!(s.paths(effect).unwrap()[0].corners, vec![false, true, false]);
+    assert_eq!(s.doc.pixels.layers, corner_pixels.layers);
+
+    // The selected point toggles back to smooth; the stored flags are empty again
+    s.select_path_point(1);
+    let report = execute(&mut s, "path.corner", &json!({})).unwrap();
+    assert_eq!(report["corner"], false);
+    assert!(s.paths(effect).unwrap()[0].corners.is_empty(), "an all-smooth path is stored like an old one");
+    assert_eq!(s.doc.pixels.layers, smooth_pixels.layers);
+}
+
+/// Inserting and removing points keeps the corner flags on their points
+#[test]
+fn corner_flags_follow_their_points_when_points_are_inserted_or_removed() {
+    let mut s = session(wall());
+    execute(&mut s, "tool.path", &json!({"uvPoints": [[0.2, 0.2], [0.5, 0.8], [0.8, 0.2]], "corners": [false, true, false]})).unwrap();
+    s.insert_path_corner(1, Vec3::new(0.35, 0.5, 0.0)).unwrap();
+    assert_eq!(s.tool.path.corner_flags(), vec![false, true, true, false]);
+    s.insert_path_point(0, Vec3::new(0.1, 0.1, 0.0)).unwrap();
+    assert_eq!(s.tool.path.corner_flags(), vec![false, false, true, true, false]);
+    s.select_path_point(2);
+    s.remove_selected_path_point();
+    assert_eq!(s.tool.path.corner_flags(), vec![false, false, true, false]);
+    s.append_path_point(Vec3::new(0.9, 0.9, 0.0), true).unwrap();
+    assert_eq!(s.tool.path.corner_flags(), vec![false, false, true, false, false]);
+    assert!(s.toggle_selected_path_corner(), "the appended point is selected");
+    assert_eq!(s.tool.path.corner_flags(), vec![false, false, true, false, true]);
+
+    // Undo steps through each change with its flags
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.tool.path.corner_flags(), vec![false, false, true, false, false]);
+}
+
+/// A path saved before corner points existed has no `corners` key: it loads smooth and unchanged
+#[test]
+fn paths_saved_without_corner_flags_load_smooth() {
+    let mut s = session(wall());
+    let report = execute(&mut s, "tool.path", &json!({"uvPoints": [[0.2, 0.2], [0.5, 0.8], [0.8, 0.2]], "commit": true})).unwrap();
+    let effect = texturecraft_engine::core::LayerId(report["committed"]["effect"].as_u64().unwrap());
+    let stored = s.paths(effect).unwrap()[0].clone();
+    let mut json = serde_json::to_value(&stored).unwrap();
+    assert!(json.get("corners").is_none(), "a smooth path writes the same JSON as before");
+    json.as_object_mut().unwrap().remove("corners");
+    let old: texturecraft_engine::core::PathShape = serde_json::from_value(json).unwrap();
+    assert_eq!(old, stored);
+
+    let pixels = s.doc.pixels.clone();
+    execute(&mut s, "path.edit", &json!({"effect": effect.0, "index": 0})).unwrap();
+    assert!(s.tool.path.corners.is_empty());
+    assert!(!s.path_live().unwrap(), "a loaded smooth path matches what is stored");
+    assert_eq!(s.doc.pixels.layers, pixels.layers);
+}

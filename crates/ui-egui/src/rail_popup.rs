@@ -12,11 +12,11 @@ use crate::widgets::icon_button;
 
 /// The rail's panels, top to bottom, with their icons and Window ▸ Views ids
 pub(crate) const RAIL_PANELS: [(Panel, &str, &str); 5] = [
-    (Panel::TextureSetSettings, ic::STACK, "ui.view.textureSetSettings"),
+    (Panel::Log, ic::FILE_TEXT, "ui.view.log"),
     (Panel::Display, ic::MONITOR, "ui.view.display"),
     (Panel::Shader, ic::SLIDERS_HORIZONTAL, "ui.view.shader"),
     (Panel::History, ic::CLOCK_COUNTER_CLOCKWISE, "ui.view.history"),
-    (Panel::Log, ic::FILE_TEXT, "ui.view.log"),
+    (Panel::TextureSetSettings, ic::STACK, "ui.view.textureSetSettings"),
 ];
 
 /// The popup reaches this far into the viewport, so it covers the panels between the viewport and the rail
@@ -102,6 +102,7 @@ pub(crate) fn toggle(app: &mut TextureCraftApp, panel: Panel) {
 }
 
 /// Open `panel` from the rail: in its popup, or where it is in the dock (bake mode has no rail)
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn open(app: &mut TextureCraftApp, panel: Panel) {
     if app.ui.mode == Mode::Baking || app.ui.dock.is_open(panel) {
         app.ui.dock.focus(panel);

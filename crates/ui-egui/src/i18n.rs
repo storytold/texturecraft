@@ -101,6 +101,36 @@ pub fn trf(template: &str, args: &[(&str, &dyn Display)]) -> String {
     craft_i18n::fmt(tr(template), &args)
 }
 
+/// An undo step's label in the current language. A label with a layer name, path number or
+/// smart mask name in it ("Paint on Rust") is matched to its engine template, which is translated
+/// and filled in again; any other label is translated as it is.
+pub fn tr_history(label: &str) -> String {
+    tr_history_with(label, |text| tr(text).to_string())
+}
+
+/// [`tr_history`] with its own lookup `translate`
+fn tr_history_with(label: &str, translate: impl Fn(&str) -> String) -> String {
+    match history_template(label) {
+        Some((template, name, value)) => craft_i18n::fmt(&translate(template), &[(name, value)]),
+        None => translate(label),
+    }
+}
+
+/// The engine template a history label was made from, its placeholder name and the value in it.
+/// The template with the longest fixed start wins.
+fn history_template(label: &str) -> Option<(&'static str, &'static str, &str)> {
+    texturecraft_engine::HISTORY_TEMPLATES
+        .iter()
+        .filter_map(|template| {
+            let (open, close) = (template.find('{')?, template.find('}')?);
+            let (prefix, suffix) = (&template[..open], &template[close + 1..]);
+            let value = label.strip_prefix(prefix)?.strip_suffix(suffix)?;
+            Some((prefix.len(), *template, &template[open + 1..close], value))
+        })
+        .max_by_key(|(prefix_length, ..)| *prefix_length)
+        .map(|(_, template, name, value)| (template, name, value))
+}
+
 /// The supported language for a locale such as "de-AT", "pt_BR.UTF-8" or "zh-Hant-TW" ("en" when
 /// none matches). Chinese locales get Simplified Chinese; Portuguese ones get Brazilian Portuguese.
 pub fn language_for_locale(locale: &str) -> &'static str {
@@ -156,37 +186,46 @@ mod tests {
     /// The labels of the menu catalog, panels, shortcuts, shelf tabs and engine enums that are
     /// translated where they are shown.
     fn catalog_keys() -> Vec<&'static str> {
-        use texturecraft_engine::core::{BlendMode, Channel, EffectKind, GeneratorKind, ProceduralKind};
+        use texturecraft_engine::core::{
+            BlendMode, Channel, EffectKind, GeneratorKind, ProceduralKind, TileBlending, TileInputDistribution, TileShape, TileSizeMode, TileSymmetry,
+        };
         use texturecraft_engine::filter_lib::{FILTERS, build, scalar_params};
-        let mut k: Vec<&'static str> = Vec::new();
-        k.extend(crate::menus::TOP);
-        for i in crate::menus::CATALOG.iter().filter(|i| i.label != "-") {
-            k.push(i.label);
-            k.extend(i.sub);
+        let mut keys: Vec<&'static str> = Vec::new();
+        keys.extend(crate::menus::TOP);
+        for item in crate::menus::CATALOG.iter().filter(|item| item.label != "-") {
+            keys.push(item.label);
+            keys.extend(item.sub);
         }
-        k.extend(crate::docking::VIEWS.iter().map(|(_, p)| p.name()));
-        for b in crate::keymap::bindings() {
-            k.push(b.label);
-            k.push(b.group);
+        keys.extend(crate::docking::VIEWS.iter().map(|(_, panel)| panel.name()));
+        for binding in crate::keymap::bindings() {
+            keys.push(binding.label);
+            keys.push(binding.group);
         }
-        k.extend(crate::shelf::TABS.iter().map(|t| t.2));
-        k.extend(Channel::ALL.iter().flat_map(|c| [c.label(), c.short()]));
-        k.extend(BlendMode::all().map(|m| m.label()));
-        k.extend(texturecraft_engine::formats::export::VirtualMap::ALL.iter().map(|m| m.label()));
-        k.extend(texturecraft_engine::Tool::ALL.iter().map(|t| t.label()));
-        k.extend(ProceduralKind::ALL.iter().map(|p| p.label()));
-        k.extend(GeneratorKind::ALL.iter().map(|g| g.label()));
-        k.extend(texturecraft_engine::paint::BrushAlpha::ALL.iter().map(|a| a.label()));
-        k.extend(texturecraft_engine::geom::primitives::BUILTINS.iter().map(|(_, l)| *l));
-        for f in FILTERS {
-            k.extend([f.label, f.group]);
-            if let Ok(EffectKind::Filter(x)) = build(f.id, &serde_json::Value::Null) {
-                k.push(x.label());
-                k.extend(scalar_params(&x).into_iter().map(|p| p.1));
+        keys.extend(crate::shelf::TABS.iter().map(|tab| tab.2));
+        keys.extend(Channel::ALL.iter().flat_map(|channel| [channel.label(), channel.short()]));
+        keys.extend(BlendMode::all().map(|mode| mode.label()));
+        keys.extend(texturecraft_engine::formats::export::VirtualMap::ALL.iter().map(|map| map.label()));
+        keys.extend(texturecraft_engine::Tool::ALL.iter().map(|tool| tool.label()));
+        keys.extend(texturecraft_engine::HISTORY_TEMPLATES);
+        keys.extend(ProceduralKind::ALL.iter().map(|kind| kind.label()));
+        keys.extend(GeneratorKind::ALL.iter().map(|kind| kind.label()));
+        keys.extend(TileShape::ALL.iter().map(|shape| shape.label()));
+        keys.extend(TileSizeMode::ALL.iter().map(|mode| mode.label()));
+        keys.extend(TileInputDistribution::ALL.iter().map(|distribution| distribution.label()));
+        keys.extend(TileSymmetry::ALL.iter().map(|symmetry| symmetry.label()));
+        keys.extend(TileBlending::ALL.iter().map(|blending| blending.label()));
+        keys.extend(texturecraft_engine::paint::BrushAlpha::ALL.iter().map(|alpha| alpha.label()));
+        keys.extend(texturecraft_engine::geom::primitives::BUILTINS.iter().map(|(_, label)| *label));
+        for filter in FILTERS {
+            keys.extend([filter.label, filter.group]);
+            if let Ok(EffectKind::Filter(effect)) = build(filter.id, &serde_json::Value::Null) {
+                keys.push(effect.label());
+                keys.extend(scalar_params(&effect).into_iter().map(|parameter| parameter.1));
             }
         }
-        // Effect, view and camera names the engine gives.
-        k.extend([
+
+        // Include effect, view and camera names supplied by the engine
+        keys.extend([
             "Paint",
             "Path",
             "Fill",
@@ -199,8 +238,8 @@ mod tests {
             texturecraft_engine::camera_cmds::DEFAULT_CAMERA,
             crate::dock::SOLO_HINT,
         ]);
-        k.retain(|s| !s.is_empty() && !UNTRANSLATED.contains(s));
-        k
+        keys.retain(|key| !key.is_empty() && !UNTRANSLATED.contains(key));
+        keys
     }
 
     /// String literals passed straight to `tr(` or `trf(` in `src`.
@@ -254,7 +293,8 @@ mod tests",
         for &(locale, common, app) in CRAFT_I18N {
             let Some(lang) = I18N.from_code(locale) else { continue };
             let missing: Vec<_> = keys.iter().filter(|key| I18N.get(lang, "", key).is_none()).collect();
-            // Decode TSV escapes for comparison with the literal source strings.
+
+            // Decode TSV escapes to compare with literal source strings
             let mut rows = HashMap::new();
             for text in [common, app] {
                 for line in text.lines().filter(|l| !l.starts_with('#')) {
@@ -281,6 +321,36 @@ mod tests",
             let stale: Vec<_> = rows.keys().filter(|key| !used.contains(key.as_str())).collect();
             eprintln!("{locale}: missing {} {missing:?}; unused/shared {} {stale:?}", missing.len(), stale.len());
         }
+    }
+
+    #[test]
+    fn history_labels_are_matched_to_their_templates() {
+        assert_eq!(history_template("Paint on Rust"), Some(("Paint on {layer}", "layer", "Rust")));
+        assert_eq!(history_template("Paint on Paint mask of x"), Some(("Paint on {layer}", "layer", "Paint mask of x")));
+        assert_eq!(history_template("Paint mask of Paint on x"), Some(("Paint mask of {layer}", "layer", "Paint on x")));
+        assert_eq!(history_template("Erase mask of Rust"), Some(("Erase mask of {layer}", "layer", "Rust")));
+        assert_eq!(history_template("Edit path 2"), Some(("Edit path {n}", "n", "2")));
+        assert_eq!(history_template("Apply smart mask Dirt"), Some(("Apply smart mask {name}", "name", "Dirt")));
+        assert_eq!(history_template("Rename layer"), None);
+    }
+
+    /// The template is translated and the layer name filled in; other labels are translated whole
+    #[test]
+    fn history_labels_with_a_layer_name_are_translated_through_their_template() {
+        let translate = |text: &str| {
+            match text {
+                "Paint on {layer}" => "Auf {layer} malen",
+                "Paint mask of {layer}" => "Maske von {layer} malen",
+                "Remove layer" => "Ebene entfernen",
+                other => other,
+            }
+            .to_string()
+        };
+        assert_eq!(tr_history_with("Paint on Rust", translate), "Auf Rust malen");
+        assert_eq!(tr_history_with("Paint mask of Paint on x", translate), "Maske von Paint on x malen");
+        assert_eq!(tr_history_with("Remove layer", translate), "Ebene entfernen");
+        assert_eq!(tr_history_with("Clone on Rust", translate), "Clone on Rust");
+        assert_eq!(tr_history_with("Paint on {layer}", translate), "Auf {layer} malen");
     }
 
     const UNTRANSLATED: &[&str] = &["RGB", "RGBA"];
@@ -335,17 +405,18 @@ mod tests",
         let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let keys = keys();
         set_language("ja");
-        let t = std::time::Instant::now();
-        let mut n = 0usize;
+        let started = std::time::Instant::now();
+        let mut total_chars = 0usize;
         for _ in 0..100 {
-            for k in &keys {
-                n += tr(k).len();
+            for key in &keys {
+                total_chars += tr(key).len();
             }
         }
-        let per = t.elapsed().as_secs_f64() * 1e9 / (100 * keys.len()) as f64;
+        let ns_per_lookup = started.elapsed().as_secs_f64() * 1e9 / (100 * keys.len()) as f64;
         set_language("en");
-        assert!(n > 0);
-        // A frame looks up a few hundred strings: well under a microsecond each.
-        assert!(per < 1000.0, "{per:.0} ns per lookup");
+        assert!(total_chars > 0);
+
+        // A frame looks up a few hundred strings, each expected below one microsecond
+        assert!(ns_per_lookup < 1000.0, "{ns_per_lookup:.0} ns per lookup");
     }
 }

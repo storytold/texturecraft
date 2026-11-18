@@ -15,6 +15,9 @@ const MIN_VERSION: (u8, u8, u8) = (0, 4, 0);
 const MAX_SECTIONS: usize = 64;
 /// Items in one table or array.
 const MAX_ITEMS: usize = 1 << 28;
+/// Entries in the PATHS table. The declared count is tiny in the file but each entry is a
+/// materialised path, so it needs its own ceiling as well as the decoded-byte budget.
+const MAX_PATHS: usize = 4_000_000;
 
 /// Spec types.
 const SPEC_ATTRIBUTE: i64 = 1;
@@ -242,58 +245,73 @@ impl<'a> Crate<'a> {
 
     /// Paths are stored as a pre-order tree: element token (negative for properties) and a
     /// jump per node (-2 leaf, -1 child only, 0 sibling only, >0 child and sibling at +jump).
-    fn read_paths(&mut self, mut s: Cur, budget: &mut Budget) -> Result<()> {
-        let total = s.count(0)?;
-        let n = s.count(0)?;
-        let index = s.ints(n, 4, budget)?;
-        let elements = s.ints(n, 4, budget)?;
-        let jumps = s.ints(n, 4, budget)?;
-        budget.take(total.saturating_mul(64))?;
-        self.paths = vec![None; total];
-        let mut work: Vec<(usize, Option<usize>)> = vec![(0, None)];
-        let mut steps = 0usize;
-        let bad = || malformed(KIND, "corrupt path table");
-        while let Some((mut i, mut parent)) = work.pop() {
+    fn read_paths(&mut self, mut section: Cur, budget: &mut Budget) -> Result<()> {
+        let path_count = section.count(0)?;
+        let encoded_count = section.count(0)?;
+        let path_indices = section.ints(encoded_count, 4, budget)?;
+        let elements = section.ints(encoded_count, 4, budget)?;
+        let jumps = section.ints(encoded_count, 4, budget)?;
+        if path_count > MAX_PATHS {
+            return Err(FormatError::TooLarge(format!("the USD path table has {path_count} entries (limit {MAX_PATHS})")));
+        }
+
+        // Charge slot storage before allocating the table
+        budget.take(path_count.saturating_mul(std::mem::size_of::<Option<PathEl>>()))?;
+        self.paths = vec![None; path_count];
+        let mut pending_branches: Vec<(usize, Option<usize>)> = vec![(0, None)];
+        let mut visited_count = 0usize;
+        let path_error = || malformed(KIND, "corrupt path table");
+        while let Some((mut cursor_index, mut parent)) = pending_branches.pop() {
             loop {
-                steps += 1;
-                if steps > n {
-                    return Err(bad());
+                visited_count += 1;
+                if visited_count > encoded_count {
+                    return Err(path_error());
                 }
-                let this = i;
-                i += 1;
-                let at = index.get(this).map(|v| *v as u32 as usize).filter(|p| *p < total).ok_or_else(bad)?;
-                let el = match parent {
+
+                let node_index = cursor_index;
+                cursor_index += 1;
+                let path_index =
+                    path_indices.get(node_index).map(|v| *v as u32 as usize).filter(|parent_index| *parent_index < path_count).ok_or_else(path_error)?;
+                let path_element = match parent {
                     None => PathEl { text: "/".into(), parent: None, name: String::new(), prop: false },
-                    Some(p) => {
-                        let e = *elements.get(this).ok_or_else(bad)?;
-                        let name = self.token(e.unsigned_abs())?.to_string();
-                        let base = self.paths.get(p).and_then(Option::as_ref).map(|b| b.text.as_str()).ok_or_else(bad)?;
-                        let text = match (e < 0, base) {
-                            (true, _) => format!("{base}.{name}"),
-                            (false, _) if name.starts_with('{') => format!("{base}{name}"),
+                    Some(parent_index) => {
+                        let element_token = *elements.get(node_index).ok_or_else(path_error)?;
+                        let name = self.token(element_token.unsigned_abs())?;
+                        let parent_path = self.paths.get(parent_index).and_then(Option::as_ref).map(|b| b.text.as_str()).ok_or_else(path_error)?;
+                        let separator_bytes = usize::from(element_token < 0 || (!name.starts_with('{') && parent_path != "/"));
+                        let text_bytes = parent_path.len().saturating_add(name.len()).saturating_add(separator_bytes);
+
+                        // Charge both retained strings before allocating either one
+                        budget.take(text_bytes.saturating_add(name.len()))?;
+                        let name = name.to_string();
+                        let text = match (element_token < 0, parent_path) {
+                            (true, _) => format!("{parent_path}.{name}"),
+                            (false, _) if name.starts_with('{') => format!("{parent_path}{name}"),
                             (false, "/") => format!("/{name}"),
-                            (false, _) => format!("{base}/{name}"),
+                            (false, _) => format!("{parent_path}/{name}"),
                         };
-                        budget.take(text.len())?;
-                        PathEl { text, parent: Some(p), name, prop: e < 0 }
+                        PathEl { text, parent: Some(parent_index), name, prop: element_token < 0 }
                     }
                 };
-                if let Some(slot) = self.paths.get_mut(at) {
-                    *slot = Some(el);
+
+                if let Some(slot) = self.paths.get_mut(path_index) {
+                    *slot = Some(path_element);
                 }
-                let jump = *jumps.get(this).ok_or_else(bad)?;
+
+                let jump = *jumps.get(node_index).ok_or_else(path_error)?;
                 let (child, sibling) = (jump > 0 || jump == -1, jump >= 0);
                 if child {
                     if sibling {
-                        work.push((this.checked_add(usize::try_from(jump).map_err(|_| bad())?).ok_or_else(bad)?, parent));
+                        pending_branches.push((node_index.checked_add(usize::try_from(jump).map_err(|_| path_error())?).ok_or_else(path_error)?, parent));
                     }
-                    parent = Some(at);
+                    parent = Some(path_index);
                 }
                 if !child && !sibling {
                     break;
                 }
             }
         }
+
         Ok(())
     }
 
@@ -642,9 +660,45 @@ mod tests {
     }
 
     fn compressed_ints(out: &mut Vec<u8>, v: &[i64]) {
-        let comp = codec::compress(&codec::encode_ints(v, 4));
+        let comp = codec::compress(&codec::encode_ints(v, 4).unwrap()).unwrap();
         out.extend_from_slice(&(comp.len() as u64).to_le_bytes());
         out.extend_from_slice(&comp);
+    }
+
+    #[test]
+    fn repeated_path_names_count_toward_the_decode_budget() {
+        let name = "long_name_reused";
+        let mut section = Vec::new();
+        section.extend_from_slice(&3u64.to_le_bytes());
+        section.extend_from_slice(&3u64.to_le_bytes());
+        compressed_ints(&mut section, &[0, 1, 2]);
+        compressed_ints(&mut section, &[0, 0, 0]);
+        compressed_ints(&mut section, &[-1, 0, -2]);
+        let mut crate_data = crate_over(&section, (0, 8, 0));
+        crate_data.tokens.push(name.into());
+
+        let decoded_arrays_bytes = 3 * 3 * std::mem::size_of::<i64>();
+        let path_slots_bytes = 3 * std::mem::size_of::<Option<PathEl>>();
+        let path_text_bytes = 2 * (1 + name.len());
+        let one_name_budget = decoded_arrays_bytes + path_slots_bytes + path_text_bytes + name.len();
+        let mut insufficient_budget = Budget(one_name_budget);
+
+        let rejected = crate_data.read_paths(Cur { b: &section, pos: 0 }, &mut insufficient_budget);
+
+        assert!(matches!(rejected, Err(FormatError::TooLarge(_))), "two path names cannot fit a one-name budget");
+        drop(crate_data);
+
+        let mut complete_budget = Budget(one_name_budget + name.len());
+        let mut crate_data = crate_over(&section, (0, 8, 0));
+        crate_data.tokens.push(name.into());
+        crate_data.read_paths(Cur { b: &section, pos: 0 }, &mut complete_budget).unwrap();
+
+        assert_eq!(complete_budget.0, 0);
+        assert_eq!(crate_data.path(1).unwrap().text, format!("/{name}"));
+        assert_eq!(crate_data.path(2).unwrap().text, format!("/{name}"));
+        let retained_name_bytes: usize = crate_data.paths.iter().filter_map(Option::as_ref).map(|path| path.name.capacity()).sum();
+        assert!(retained_name_bytes >= 2 * name.len());
+        println!("retained names: 2, buffer capacity: {retained_name_bytes} bytes");
     }
 
     #[test]
@@ -667,7 +721,7 @@ mod tests {
         compressed_ints(&mut b, &idx);
         let i64_at = b.len() as u64;
         b.extend_from_slice(&(n as u64).to_le_bytes());
-        let comp = codec::compress(&codec::encode_ints(&(0..n as i64).map(|i| i << 33).collect::<Vec<_>>(), 8));
+        let comp = codec::compress(&codec::encode_ints(&(0..n as i64).map(|i| i << 33).collect::<Vec<_>>(), 8).unwrap()).unwrap();
         b.extend_from_slice(&(comp.len() as u64).to_le_bytes());
         b.extend_from_slice(&comp);
         let c = crate_over(&b, (0, 8, 0));

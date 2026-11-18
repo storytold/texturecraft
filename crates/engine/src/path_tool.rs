@@ -12,10 +12,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use texturecraft_compose::{PaintTarget, PixelStore};
-use texturecraft_core::{Channel, Effect, EffectKind, LayerId, Mask, MaskBackground, PathShape};
+use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, PathShape};
 use texturecraft_geom::glam::{Mat3, Vec2, Vec3};
 use texturecraft_geom::{OrbitCamera, surface_at};
-use texturecraft_paint::{BrushSettings, Lasso, PickCtx, fill_coverage, pick, spline, spline_segments};
+use texturecraft_paint::{BrushSettings, Lasso, PickCtx, fill_coverage, pick, spline_segments_with_corners, spline_with_corners};
 use texturecraft_texel::TileImage;
 
 use crate::commands::{CommandSpec, always, bad, boolp, has_layer, u64p};
@@ -47,6 +47,10 @@ const RAY_HIT_RELATIVE_TOLERANCE: f32 = 0.001;
 pub struct PathState {
     /// Control points: surface positions (3D view) or texture coordinates with z = 0 (2D view)
     pub points: Vec<Vec3>,
+    /// Per control point: the curve turns sharply there (a corner). Empty or shorter than `points` means smooth;
+    /// read it through [`PathState::is_corner`] and [`PathState::corner_flags`]
+    #[serde(default)]
+    pub corners: Vec<bool>,
     /// The points are texture coordinates (placed in the 2D view)
     pub uv: bool,
     /// The curve loops back to its first point
@@ -69,11 +73,36 @@ impl PathState {
     pub fn push(&mut self, point: Vec3, uv: bool) {
         if uv != self.uv {
             self.points.clear();
+            self.corners.clear();
             self.uv = uv;
         }
         if self.points.len() < MAX_PATH_POINTS {
             self.points.push(point);
+            if !self.corners.is_empty() {
+                self.corners.resize(self.points.len(), false);
+            }
         }
+    }
+
+    /// Does the curve turn sharply at point `i`?
+    pub fn is_corner(&self, i: usize) -> bool {
+        self.corners.get(i).copied().unwrap_or(false)
+    }
+
+    /// One flag per point for the curve and storage: empty when no point is a corner, so smooth paths look like old ones
+    pub fn corner_flags(&self) -> Vec<bool> {
+        if self.points.iter().enumerate().any(|(i, _)| self.is_corner(i)) { (0..self.points.len()).map(|i| self.is_corner(i)).collect() } else { Vec::new() }
+    }
+
+    /// Make point `i` a corner or smooth; false when there is no such point or it already is
+    pub fn set_corner(&mut self, i: usize, corner: bool) -> bool {
+        if i >= self.points.len() || self.is_corner(i) == corner {
+            return false;
+        }
+
+        self.corners.resize(self.points.len(), false);
+        self.corners[i] = corner;
+        true
     }
 
     /// Insert a control point before point `at` (on the segment ending there) and select it; None when it can't
@@ -83,18 +112,23 @@ impl PathState {
         }
 
         self.points.insert(at, point);
+        if !self.corners.is_empty() {
+            self.corners.resize(self.points.len() - 1, false);
+            self.corners.insert(at, false);
+        }
         self.selected = Some(at);
         self.selected
     }
 
     /// The same curve (points, open or closed, filled, view) as `other`
     fn same_curve(&self, other: &PathState) -> bool {
-        (&self.points, self.closed, self.fill, self.uv) == (&other.points, other.closed, other.fill, other.uv)
+        (&self.points, self.corner_flags(), self.closed, self.fill, self.uv) == (&other.points, other.corner_flags(), other.closed, other.fill, other.uv)
     }
 
     /// Empty the tool for the next path: no points, open, nothing selected or edited
     pub fn clear(&mut self) {
         self.points.clear();
+        self.corners.clear();
         self.closed = false;
         self.selected = None;
         self.editing = None;
@@ -106,6 +140,10 @@ impl PathState {
         let at = self.selected.take().filter(|i| *i < self.points.len()).or(self.points.len().checked_sub(1));
         if let Some(i) = at {
             self.points.remove(i);
+            if !self.corners.is_empty() {
+                self.corners.resize(self.points.len() + 1, false);
+                self.corners.remove(i);
+            }
         }
         if self.closed && self.points.len() < 3 {
             self.closed = false;
@@ -116,10 +154,10 @@ impl PathState {
 /// A path sublayer's pixels after painting its first paths (`below`), with the mesh and
 /// texture size they were painted for.
 #[derive(Clone)]
-// shortcut: the key doesn't cover image resources a path's brush alpha reads; replacing one
-// leaves cached paths with the old alpha until a path below the edited one changes.
 pub(crate) struct PathCache {
-    eid: LayerId,
+    pub(crate) eid: LayerId,
+    // Alpha image resources are not part of this cache key
+    // Replacing an alpha takes effect when a cached path changes
     key: (u64, Option<(u32, u32)>),
     below: Vec<PathShape>,
     mask: Option<texturecraft_texel::TileImage>,
@@ -143,9 +181,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Path",
             ["Tools"],
             Some("7"),
-            "{points?: [[x,y],...] viewport pixels on the mesh | uvPoints?: [[u,v],...], viewport?: [w,h], closed?, fill?, commit?: bool, clear?: bool} — selects the Path tool and edits its curve; commit adds the path to the selected path sublayer (or a new one), painted with the current brush or filled when closed and filled. While a stored path is edited (path.edit), changes repaint it at once",
+            "{points?: [[x,y],...] viewport pixels on the mesh | uvPoints?: [[u,v],...], corners?: [bool,...] up to one per point (true: the curve turns sharply there; missing entries are smooth; applies to supplied points or the current curve), viewport?: [w,h], closed?, fill?, commit?: bool, clear?: bool} — selects the Path tool and edits its curve; commit adds the path to the selected path sublayer (or a new one), painted with the current brush or filled when closed and filled. While a stored path is edited (path.edit), changes repaint it at once",
             always,
             path
+        ),
+        cmd!(
+            "path.corner",
+            "Toggle path corner",
+            ["Tools"],
+            None,
+            "{index?: point (default: the selected point), corner?: bool (default: toggle)} — makes a control point of the Path tool's curve a corner (the curve turns sharply there) or smooth again; one undo step per change, repainting the edited path at once",
+            always,
+            path_corner
         ),
         cmd!(
             "path.edit",
@@ -171,34 +218,59 @@ pub fn specs() -> Vec<CommandSpec> {
 /// Set the curve from command parameters, then preview or commit it in the supplied viewport
 fn path(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "tool.path";
+    let viewport = viewport_of(s, p);
+    let clear = boolp(p, "clear") == Some(true);
+
+    let placed = match (points_param(CMD, p, "points")?, points_param(CMD, p, "uvPoints")?) {
+        (Some(pixels), _) => {
+            if pixels.len() > MAX_PATH_POINTS {
+                return Err(bad(CMD, format!("at most {MAX_PATH_POINTS} control points")));
+            }
+
+            Some((
+                pixels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, pixel)| s.pick(*pixel, viewport).map(|hit| hit.pos).ok_or_else(|| bad(CMD, format!("point {i} misses the mesh"))))
+                    .collect::<Result<Vec<_>>>()?,
+                false,
+            ))
+        }
+        (None, Some(uvs)) => {
+            if uvs.len() > MAX_PATH_POINTS {
+                return Err(bad(CMD, format!("at most {MAX_PATH_POINTS} control points")));
+            }
+
+            Some((uvs.iter().map(|uv| uv.clamp(Vec2::ZERO, Vec2::ONE).extend(0.0)).collect(), true))
+        }
+        (None, None) => None,
+    };
+    let point_count = placed.as_ref().map_or(if clear { 0 } else { s.tool.path.points.len() }, |(points, _)| points.len());
+    let corners = match p.get("corners") {
+        Some(value) => {
+            let flags = value.as_array().ok_or_else(|| bad(CMD, "`corners` must be an array of booleans"))?;
+            if flags.len() > point_count || flags.len() > MAX_PATH_POINTS {
+                return Err(bad(CMD, "`corners` has more flags than control points"));
+            }
+
+            Some(flags.iter().map(Value::as_bool).collect::<Option<Vec<_>>>().ok_or_else(|| bad(CMD, "`corners` must be an array of booleans"))?)
+        }
+        None => None,
+    };
+
     if s.tool.tool != Tool::Path {
         set_tool(s, Tool::Path)?;
     }
-
-    let viewport = viewport_of(s, p);
-    if boolp(p, "clear") == Some(true) {
+    if clear {
         s.cancel_path();
     }
-
-    let placed = match (points_param(CMD, p, "points")?, points_param(CMD, p, "uvPoints")?) {
-        (Some(pixels), _) => Some((
-            pixels
-                .iter()
-                .enumerate()
-                .map(|(i, pixel)| s.pick(*pixel, viewport).map(|hit| hit.pos).ok_or_else(|| bad(CMD, format!("point {i} misses the mesh"))))
-                .collect::<Result<Vec<_>>>()?,
-            false,
-        )),
-        (None, Some(uvs)) => Some((uvs.iter().map(|uv| uv.clamp(Vec2::ZERO, Vec2::ONE).extend(0.0)).collect(), true)),
-        (None, None) => None,
-    };
     if let Some((points, uv)) = placed {
-        if points.len() > MAX_PATH_POINTS {
-            return Err(bad(CMD, format!("at most {MAX_PATH_POINTS} control points")));
-        }
-
         s.tool.path.points = points;
+        s.tool.path.corners.clear();
         s.tool.path.uv = uv;
+    }
+    if let Some(flags) = corners {
+        s.tool.path.corners = flags;
     }
     if let Some(v) = boolp(p, "closed") {
         s.tool.path.closed = v;
@@ -222,6 +294,24 @@ fn path(s: &mut Session, p: &Value) -> Result<Value> {
     let path = &s.tool.path;
     let editing = path.editing.map(|(e, i)| json!({ "effect": e.0, "index": i }));
     Ok(json!({ "points": path.points.len(), "uv": path.uv, "closed": path.closed, "fill": path.fill, "editing": editing, "committed": committed }))
+}
+
+/// Make a control point a corner or smooth (a toggle by default) as one undoable point edit
+fn path_corner(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "path.corner";
+    let path = &s.tool.path;
+    let index = match u64p(p, "index") {
+        Some(i) => usize::try_from(i).ok().filter(|i| *i < path.points.len()),
+        None => path.selected.filter(|i| *i < path.points.len()),
+    }
+    .ok_or_else(|| bad(CMD, "no such point: pass `index` or select a point of the Path tool's curve"))?;
+    let corner = boolp(p, "corner").unwrap_or(!path.is_corner(index));
+    s.set_path_point_corner(index, corner);
+    s.revision = s.revision.wrapping_add(1);
+    if s.path_live()? {
+        s.update();
+    }
+    Ok(json!({ "index": index, "corner": s.tool.path.is_corner(index) }))
 }
 
 /// The `effect` and `index` params naming a stored path, with the path.
@@ -282,7 +372,21 @@ fn read_paint(shape: &PathShape) -> Result<PathPaint> {
 /// The Path tool state showing a stored path (finite points only, at most [`MAX_PATH_POINTS`])
 fn state_of(shape: &PathShape) -> PathState {
     let points = shape.points.iter().filter(|p| p.iter().all(|v| v.is_finite())).take(MAX_PATH_POINTS).map(|p| Vec3::from_array(*p)).collect();
-    PathState { points, uv: shape.uv, closed: shape.closed, fill: shape.fill, ..PathState::default() }
+
+    // Points dropped as unreadable shift the later flags with them
+    let corners = if shape.corners.is_empty() {
+        Vec::new()
+    } else {
+        shape
+            .points
+            .iter()
+            .zip(shape.corners.iter().copied().chain(std::iter::repeat(false)))
+            .filter(|(p, _)| p.iter().all(|v| v.is_finite()))
+            .take(MAX_PATH_POINTS)
+            .map(|(_, c)| c)
+            .collect()
+    };
+    PathState { points, corners, uv: shape.uv, closed: shape.closed, fill: shape.fill, ..PathState::default() }
 }
 
 /// Tiles (x, y) where sublayer `eid`'s pixels differ between `before` and `after` (copy-on-write: an unchanged tile is the same allocation)
@@ -358,6 +462,7 @@ impl Session {
         let paint = PathPaint { brush: t.brush.clone(), values: t.values.clone(), enabled: t.enabled.clone(), mask_value: t.mask_value, camera };
         PathShape {
             points: path.points.iter().map(|p| p.to_array()).collect(),
+            corners: path.corner_flags(),
             uv: path.uv,
             closed: path.closed,
             fill: path.fill,
@@ -368,6 +473,10 @@ impl Session {
 
     /// Store the Path tool's curve (new, or the path being edited) and repaint its sublayer as one undo step, then clear the tool
     pub fn commit_path(&mut self, viewport: Vec2) -> Result<Value> {
+        if self.quick_mask.editing {
+            return Err(EngineError::Other("paths can't edit the quick mask: stop editing it first".into()));
+        }
+
         if let Some((effect, index)) = self.tool.path.editing
             && self.paths(effect).and_then(|paths| paths.get(index)).is_some_and(|stored| self.same_as_stored(stored))
         {
@@ -395,21 +504,22 @@ impl Session {
 
         let shape = self.path_shape(self.camera, viewport);
         let editing = self.tool.path.editing;
-        let label = editing.map_or(NEW_PATH_LABEL.to_string(), |(_, i)| format!("Edit path {}", i + 1));
-        let out = self.edit_merging(&label, editing.is_some() && self.tool.path.edited, |s| {
-            let (eid, index) = match editing {
+        let label =
+            editing.map_or(NEW_PATH_LABEL.to_string(), |(_, i)| crate::session::history_label(crate::session::EDIT_PATH_TEMPLATE, &(i + 1).to_string()));
+        let report = self.edit_merging(&label, editing.is_some() && self.tool.path.edited, |session| {
+            let (effect_id, index) = match editing {
                 Some(at) => at,
-                None => (s.path_effect()?, usize::MAX),
+                None => (session.path_effect()?, usize::MAX),
             };
-            s.put_path(eid, index, shape)
+            session.put_path(effect_id, index, shape)
         })?;
 
-        if let Some(eid) = out.get("effect").and_then(Value::as_u64) {
-            self.target = StackTarget::Effect(LayerId(eid));
+        if let Some(effect_id) = report.get("effect").and_then(Value::as_u64) {
+            self.target = StackTarget::Effect(LayerId(effect_id));
         }
         self.tool.path.clear();
 
-        Ok(out)
+        Ok(report)
     }
 
     /// Repaint the edited path (one merged undo step) or a new path's preview (no step) when its points, brush or material changed; called every frame
@@ -422,16 +532,24 @@ impl Session {
         // JSON round trips can change float representation without changing the paint settings
         read_paint(stored).is_ok_and(|paint| {
             let current = self.path_shape(paint.camera, Vec2::from_array(stored.viewport));
-            (&current.points, current.uv, current.closed, current.fill) == (&stored.points, stored.uv, stored.closed, stored.fill)
+
+            // Normalised like the current flags: a short, long or all-smooth stored list must not count as a change
+            let stored_corners = state_of(stored).corner_flags();
+            (&current.points, &current.corners, current.uv, current.closed, current.fill)
+                == (&stored.points, &stored_corners, stored.uv, stored.closed, stored.fill)
                 && read_paint(&current).is_ok_and(|current_paint| current_paint == paint)
         })
     }
 
     /// Preview a command's points in its supplied viewport, or the UI's current viewport
     fn path_live_in_view(&mut self, viewport: Vec2) -> Result<bool> {
+        if self.quick_mask.editing {
+            return Ok(false);
+        }
+
         let stored = match self.tool.path.editing {
-            Some((eid, index)) => match self.paths(eid).and_then(|v| v.get(index)).cloned() {
-                Some(shape) => Some((eid, index, shape)),
+            Some((effect_id, index)) => match self.paths(effect_id).and_then(|paths| paths.get(index)).cloned() {
+                Some(shape) => Some((effect_id, index, shape)),
                 None => {
                     self.stop_path_edit();
                     return Ok(false);
@@ -449,16 +567,21 @@ impl Session {
                 if self.path_draft.is_some() {
                     self.cancel_path();
                 } else {
-                    self.edit_merging(&format!("Edit path {}", index + 1), self.tool.path.edited, |session| {
-                        if let Some(Effect { kind: EffectKind::Path(paths), .. }) = session.doc.project.effect_mut(effect) {
-                            paths.remove(index);
-                        }
-                        session.render_paths(effect, index)
-                    })?;
+                    self.edit_merging(
+                        &crate::session::history_label(crate::session::EDIT_PATH_TEMPLATE, &(index + 1).to_string()),
+                        self.tool.path.edited,
+                        |session| {
+                            if let Some(Effect { kind: EffectKind::Path(paths), .. }) = session.doc.project.effect_mut(effect) {
+                                paths.remove(index);
+                            }
+                            session.render_paths(effect, index)
+                        },
+                    )?;
                     self.cancel_path();
                 }
                 return Ok(true);
             }
+
             return Ok(false);
         }
 
@@ -480,7 +603,7 @@ impl Session {
             None => {
                 // The path's own repaint keeps its point changes undoable, unlike other steps
                 let steps = std::mem::take(&mut self.path_steps);
-                self.push_step(&format!("Edit path {}", index + 1), before, self.tool.path.edited);
+                self.push_step(&crate::session::history_label(crate::session::EDIT_PATH_TEMPLATE, &(index + 1).to_string()), before, self.tool.path.edited);
                 self.path_steps = steps;
                 self.tool.path.edited = true;
             }
@@ -580,6 +703,37 @@ impl Session {
         self.tool.path.remove_selected();
     }
 
+    /// Make a point a corner or smooth again, with point undo; false when nothing changed
+    pub fn set_path_point_corner(&mut self, index: usize, corner: bool) -> bool {
+        if index >= self.tool.path.points.len() || self.tool.path.is_corner(index) == corner {
+            return false;
+        }
+
+        self.path_checkpoint();
+        self.tool.path.set_corner(index, corner)
+    }
+
+    /// Switch the selected point between corner and smooth, with point undo; false without a selected point
+    pub fn toggle_selected_path_corner(&mut self) -> bool {
+        let Some(i) = self.tool.path.selected.filter(|i| *i < self.tool.path.points.len()) else { return false };
+        let corner = !self.tool.path.is_corner(i);
+        self.set_path_point_corner(i, corner)
+    }
+
+    /// Append a point that is a corner, selecting it; as [`Session::append_path_point`]
+    pub fn append_path_corner(&mut self, point: Vec3, uv: bool) -> Option<usize> {
+        let at = self.append_path_point(point, uv)?;
+        self.tool.path.set_corner(at, true);
+        Some(at)
+    }
+
+    /// Insert a point that is a corner, selecting it; as [`Session::insert_path_point`]
+    pub fn insert_path_corner(&mut self, index: usize, point: Vec3) -> Option<usize> {
+        let at = self.insert_path_point(index, point)?;
+        self.tool.path.set_corner(at, true);
+        Some(at)
+    }
+
     /// Change whether the path loops back to its first point, with point undo
     pub fn set_path_closed(&mut self, closed: bool) {
         if self.tool.path.closed != closed {
@@ -661,6 +815,11 @@ impl Session {
         let from = if back { &self.path_steps.0 } else { &self.path_steps.1 };
         let Some((index, state)) = from.iter().enumerate().rfind(|(_, state)| !state.same_curve(&self.tool.path)) else { return Ok(false) };
 
+        // Returning false here would let undo/redo consume document history instead.
+        if self.quick_mask.editing {
+            return Err(EngineError::Other("paths can't edit the quick mask: stop editing it first".into()));
+        }
+
         let path = &mut self.tool.path;
         let previous = std::mem::replace(path, PathState { editing: path.editing, edited: path.edited, ..state.clone() });
         if let Err(error) = self.path_live() {
@@ -706,33 +865,40 @@ impl Session {
         self.path_steps = Default::default();
     }
 
-    /// The selected path sublayer, or a new one on the selected layer's content or mask
-    /// (whichever is selected).
+    /// The selected path sublayer, or a new one on the selected paint layer's content or mask
     fn path_effect(&mut self) -> Result<LayerId> {
-        let id = self.selected_layer().ok_or_else(|| EngineError::Other("select a layer to add the path to".into()))?;
-        let p = &self.doc.project;
+        if self.quick_mask.editing {
+            return Err(EngineError::Other("paths can't edit the quick mask: stop editing it first".into()));
+        }
+
+        let selected = self.selected_layer().ok_or_else(|| EngineError::Other("select a layer to add the path to".into()))?;
+        let project = &self.doc.project;
         let mask = match self.target {
-            StackTarget::Effect(e) => match p.effect(e) {
-                Some((_, x)) if matches!(x.kind, EffectKind::Path(_)) => return Ok(e),
-                Some((owner, _)) => !p.layer(owner)?.content_effects.iter().any(|x| x.id == e),
+            StackTarget::Effect(effect) => match project.effect(effect) {
+                // Paths saved in a fill layer before paths there were removed stay editable
+                Some((_, found)) if matches!(found.kind, EffectKind::Path(_)) => return Ok(effect),
+                Some((owner, _)) => !project.layer(owner)?.content_effects.iter().any(|candidate| candidate.id == effect),
                 None => false,
             },
             StackTarget::Mask => true,
             StackTarget::Content => false,
         };
-        // An instance's content and (unless it has its own) mask belong to its source.
-        let owner = if mask { p.mask_owner(id) } else { p.content_layer(id).map_or(id, |l| l.id) };
-        let eid = self.doc.project.alloc_id();
-        let l = self.doc.project.layer_mut(owner)?;
-        let e = Effect::new(eid, EffectKind::Path(Vec::new()));
+
+        // An instance's content and (unless it has its own) mask belong to its source
+        let owner = if mask { project.mask_owner(selected) } else { project.content_layer(selected).map_or(selected, |layer| layer.id) };
+        let path_id = self.doc.project.alloc_id();
+        let layer = self.doc.project.layer_mut(owner)?;
+        let path = Effect::new(path_id, EffectKind::Path(Vec::new()));
         if mask {
-            l.mask.get_or_insert_with(|| Mask::new(MaskBackground::Black)).effects.push(e);
-        } else if l.is_group() {
-            return Err(EngineError::Other(format!("\"{}\" is a folder: add the path to a layer or a mask", l.name)));
+            layer.mask.get_or_insert_with(|| Mask::new(MaskBackground::Black)).effects.push(path);
+        } else if layer.is_group() {
+            return Err(EngineError::Other(format!("\"{}\" is a folder: add the path to a layer or a mask", layer.name)));
+        } else if matches!(layer.kind, LayerKind::Paint) {
+            layer.content_effects.push(path);
         } else {
-            l.content_effects.push(e);
+            return Err(EngineError::Other(format!("\"{}\" is not a paint layer: add the path to a paint layer or a mask", layer.name)));
         }
-        Ok(eid)
+        Ok(path_id)
     }
 
     /// [`Session::put_path`] recompositing only the tiles it changed, with no undo step: returns the paint report and the document before
@@ -803,8 +969,9 @@ impl Session {
             }
             _ => 0,
         };
-        // Each path goes through the regular stroke and fill code with its own settings; their
-        // own history entries are dropped (the caller records one step).
+
+        // Regular stroke and fill code paints each path with its own settings
+        // Discard its history entries because the caller records one undo step
         let saved = (self.tool.clone(), self.camera, self.target, self.quick_mask.editing);
         let history = (std::mem::take(&mut self.undo), std::mem::take(&mut self.redo));
         self.target = StackTarget::Effect(eid);
@@ -846,15 +1013,20 @@ impl Session {
         self.paint_path(viewport)
     }
 
-    /// Where a 3D path's curve lands on the mesh painted through `camera`, per segment as [`spline_segments`] (None off the mesh)
+    /// Where a 3D path's curve lands on the mesh painted through `camera`, per segment as [`texturecraft_paint::spline_segments`] (None off the mesh)
     pub fn path_surface(&self, points: &[Vec3], closed: bool, camera: OrbitCamera, viewport: Vec2) -> Vec<Vec<Option<Vec3>>> {
+        self.path_surface_with_corners(points, &[], closed, camera, viewport)
+    }
+
+    /// [`Session::path_surface`] for a curve with corner points (`corners` as [`PathState::corners`])
+    pub fn path_surface_with_corners(&self, points: &[Vec3], corners: &[bool], closed: bool, camera: OrbitCamera, viewport: Vec2) -> Vec<Vec<Option<Vec3>>> {
         let aspect = viewport.x.max(1.0) / viewport.y.max(1.0);
         let Some(screen) = points.iter().map(|p| camera.project(*p, aspect).map(|n| to_pixels(n.truncate(), viewport))).collect::<Option<Vec<_>>>() else {
             return Vec::new();
         };
 
         let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &camera, viewport };
-        spline_segments(&screen, closed, SURFACE_STEP_PX)
+        spline_segments_with_corners(&screen, corners, closed, SURFACE_STEP_PX)
             .into_iter()
             .zip(&screen)
             .map(|(samples, first)| std::iter::once(*first).chain(samples).map(|q| pick(&ctx, q).map(|hit| hit.pos)).collect())
@@ -870,7 +1042,7 @@ impl Session {
 
         let (camera, viewport) = paint_view(shape, &read_paint(shape).ok()?);
         let path = state_of(shape);
-        Some(self.path_surface(&path.points, path.closed, camera, viewport))
+        Some(self.path_surface_with_corners(&path.points, &path.corners, path.closed, camera, viewport))
     }
 
     /// Paint the Path tool's curve with the current brush (or fill it when closed and filled)
@@ -878,14 +1050,17 @@ impl Session {
     fn paint_path(&mut self, viewport: Vec2) -> Result<Value> {
         let (uv, closed) = (self.tool.path.uv, self.tool.path.closed);
         let fill = closed && self.tool.path.fill;
-        let pts: Vec<Vec2> = self.path_view_points(viewport).into_iter().flatten().collect();
+        let (pts, corners): (Vec<Vec2>, Vec<bool>) =
+            self.path_view_points(viewport).into_iter().enumerate().filter_map(|(i, p)| Some((p?, self.tool.path.is_corner(i)))).unzip();
         if pts.is_empty() {
             return Err(EngineError::Other("the path has no points: click the surface to add some".into()));
         }
+
         if fill && pts.len() < 3 {
             return Err(EngineError::Other("a filled path needs at least three points".into()));
         }
-        let curve = spline(&pts, closed, if uv { STEP_UV } else { STEP_PX });
+
+        let curve = spline_with_corners(&pts, &corners, closed, if uv { STEP_UV } else { STEP_PX });
         Ok(if fill {
             json!({ "filledTiles": self.lasso_fill(curve, uv, viewport)? })
         } else if uv {
@@ -1012,7 +1187,8 @@ mod tests {
             eid = r["committed"]["effect"].as_u64().unwrap();
         }
         let eid = texturecraft_core::LayerId(eid);
-        // Live edits of the middle path reuse the bottom path's pixels.
+
+        // Live edits of the middle path reuse the bottom path's pixels
         execute(&mut s, "path.edit", &json!({"effect": eid.0, "index": 1})).unwrap();
         for v in [0.4, 0.45] {
             execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, v], [0.5, v], [0.9, v]]})).unwrap();
@@ -1025,6 +1201,32 @@ mod tests {
         s.render_paths(eid, 0).unwrap();
         assert_eq!(cached, pixels(&s, eid), "same pixels as painting every path");
         assert!(!cached.is_empty());
+
+        execute(&mut s, "path.edit", &json!({"effect": eid.0, "index": 1})).unwrap();
+        execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, 0.35], [0.9, 0.4]]})).unwrap();
+        let cached_tiles = s.path_cache.as_ref().map_or(0, |cache| cache.layers.iter().map(|(_, image)| image.allocated_count()).sum::<usize>());
+        assert!(cached_tiles > 0);
+
+        execute(&mut s, "effect.remove", &json!({"effect": eid.0})).unwrap();
+        let remaining_tiles = s.path_cache.as_ref().map_or(0, |cache| cache.layers.iter().map(|(_, image)| image.allocated_count()).sum::<usize>());
+        assert_eq!(remaining_tiles, 0);
+        assert!(s.path_cache.is_none(), "deleting the path effect releases its cached tiles");
+    }
+
+    #[test]
+    fn failed_edit_releases_cached_path_tiles() {
+        let mut session = Session::new_project("t", texturecraft_geom::primitives::sphere(1.0, 12, 6), "builtin:test", None, 128).unwrap();
+        let mut image = TileImage::new(64, 64, 1);
+        let tile = Arc::new(vec![1u16; texturecraft_texel::TILE_AREA]);
+        let retained = Arc::downgrade(&tile);
+        image.set_tile(0, 0, Some(tile));
+        session.path_cache = Some(PathCache { eid: LayerId(0), key: (0, None), below: Vec::new(), mask: Some(image), layers: Vec::new() });
+
+        let result: Result<()> = session.edit("Rejected edit", |_| Err(EngineError::Other("rejected".into())));
+
+        assert!(result.is_err());
+        assert!(session.path_cache.is_none());
+        assert!(retained.upgrade().is_none(), "the discarded document cannot retain the cache's tile");
     }
 
     #[test]
@@ -1069,6 +1271,29 @@ mod tests {
         assert_eq!(changed_tiles(&before, &before.clone(), effect), BTreeSet::new());
         assert_eq!(changed_tiles(&before, &after, effect), BTreeSet::from([(0, 0), (1, 0), (2, 1)]));
         assert_eq!(changed_tiles(&before, &after, LayerId(8)), BTreeSet::new());
+    }
+
+    #[test]
+    fn quick_mask_preserves_pending_path_undo_and_redo() {
+        let mut session = Session::new_project("t", texturecraft_geom::primitives::plane(1.0, 1), "builtin:test", None, 128).unwrap();
+        execute(&mut session, "tool.path", &json!({"uvPoints": [[0.2, 0.5], [0.8, 0.5]]})).unwrap();
+        session.path_checkpoint();
+        session.tool.path.points[0].y = 0.3;
+        session.path_live().unwrap();
+        for back in [true, false] {
+            let curve = session.tool.path.clone();
+            let steps = (session.path_steps.0.len(), session.path_steps.1.len());
+            let history = (session.history_labels(), session.redo_labels());
+            let pixels = session.doc.pixels.clone();
+            session.quick_mask.editing = true;
+            assert!(if back { session.undo() } else { session.redo() }.is_err());
+            assert!(curve.same_curve(&session.tool.path));
+            assert_eq!(steps, (session.path_steps.0.len(), session.path_steps.1.len()));
+            assert_eq!(history, (session.history_labels(), session.redo_labels()));
+            assert_eq!(format!("{:?}", pixels), format!("{:?}", session.doc.pixels));
+            session.quick_mask.editing = false;
+            if back { session.undo() } else { session.redo() }.unwrap();
+        }
     }
 
     #[test]

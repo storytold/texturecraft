@@ -28,9 +28,9 @@ fn parse(bytes: &[u8]) -> Result<(gltf::Document, Option<Vec<u8>>)> {
     let (json, blob) = if bytes.starts_with(b"glTF") {
         let mut glb = gltf::Glb::from_slice(bytes).map_err(|e| malformed(KIND, e))?;
         let blob = glb.bin.take().map(std::borrow::Cow::into_owned);
-        (glb.json.into_owned(), blob)
+        (glb.json, blob)
     } else {
-        (bytes.to_vec(), None)
+        (std::borrow::Cow::Borrowed(bytes), None)
     };
     let mut value: serde_json::Value = serde_json::from_slice(&json).map_err(|e| malformed(KIND, e))?;
     if let Some(scenes) = value.get_mut("scenes").and_then(serde_json::Value::as_array_mut) {
@@ -40,8 +40,8 @@ fn parse(bytes: &[u8]) -> Result<(gltf::Document, Option<Vec<u8>>)> {
             }
         }
     }
-    let json = serde_json::to_vec(&value).map_err(|e| malformed(KIND, e))?;
-    let root = gltf::json::Root::from_slice(&json).map_err(|e| malformed(KIND, e))?;
+    // Consume the DOM directly rather than serialising it back to a second full-size buffer.
+    let root: gltf::json::Root = serde_json::from_value(value).map_err(|e| malformed(KIND, e))?;
     let document = gltf::Document::from_json(root).map_err(|e| malformed(KIND, e))?;
     Ok((document, blob))
 }
@@ -292,21 +292,23 @@ fn check_buffer_uris(doc: &gltf::Document) -> Result<()> {
 }
 
 pub(crate) fn percent_decode(s: &str) -> Option<String> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        let hex = |k: usize| b.get(k).and_then(|h| (*h as char).to_digit(16));
-        match (c, hex(i + 1), hex(i + 2)) {
-            (b'%', Some(h), Some(l)) => {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
+    craft_mesh::gltf::uri_decode_strict(s)
+}
+
+#[cfg(test)]
+mod uri_decode_tests {
+    use super::percent_decode;
+
+    #[test]
+    fn strict_shared_uri_decoder_preserves_reference_policy() {
+        assert_eq!(percent_decode("texture%20é%2B.png"), Some("texture é+.png".into()));
+        assert_eq!(percent_decode("a+b%GG%2"), Some("a+b%GG%2".into()));
+        assert_eq!(percent_decode("%252e%252e"), Some("%2e%2e".into()));
+        // Decoding does not replace the external-reference confinement checks.
+        assert_eq!(percent_decode("%2e%2e%2fsecret"), Some("../secret".into()));
+        assert_eq!(percent_decode("%00"), Some("\0".into()));
+        for uri in ["%FF", "%C0%AF", "%ED%A0%80", "%E2%82"] {
+            assert_eq!(percent_decode(uri), None, "{uri}");
         }
     }
-    String::from_utf8(out).ok()
 }

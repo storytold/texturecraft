@@ -13,14 +13,18 @@ impl LoadBudget {
         self.limit_bytes - self.used_bytes
     }
 
+    pub(super) fn exceeded_message(&self) -> String {
+        format!(
+            "project file decompresses to more than {} bytes ({:.2} GiB); increase Max project size on open in Settings > Project to open larger files",
+            self.limit_bytes,
+            self.limit_bytes as f64 / (1u64 << 30) as f64,
+        )
+    }
+
     /// Reserve bytes before retaining decoded data so entries share one allocation budget.
     pub(super) fn take(&mut self, bytes: u64) -> Result<(), String> {
         if bytes > self.remaining() {
-            return Err(format!(
-                "project file decompresses to more than {} bytes ({:.2} GiB); increase Max project size on open in Settings > Project to open larger files",
-                self.limit_bytes,
-                self.limit_bytes as f64 / (1u64 << 30) as f64,
-            ));
+            return Err(self.exceeded_message());
         }
 
         self.used_bytes += bytes;

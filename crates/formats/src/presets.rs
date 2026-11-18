@@ -19,7 +19,7 @@ pub(crate) fn virt(map: VirtualMap, component: u8) -> SourceRef {
 
 /// `$mesh_$textureSet_<suffix>` PNG.
 fn map(suffix: &str, bit_depth: u8, channels: Vec<(Dest, SourceRef)>) -> MapSpec {
-    MapSpec { file: format!("$mesh_$textureSet_{suffix}"), format: FileFormat::Png, bit_depth, channels }
+    MapSpec { file: format!("$mesh_$textureSet_{suffix}"), format: FileFormat::Png, bit_depth, channels, inverted: Vec::new() }
 }
 
 pub(crate) fn rgb(f: impl Fn(u8) -> SourceRef) -> Vec<(Dest, SourceRef)> {
@@ -68,7 +68,7 @@ pub(crate) const GLTF_SHEEN: &str = "Sheen";
 /// glTF metallic-roughness maps (8-bit PNG), plus the clear coat and sheen extension maps where
 /// the texture set has those channels; `file` turns a stem above into a file template.
 pub(crate) fn gltf_pbr_maps(file: impl Fn(&str) -> String) -> Vec<MapSpec> {
-    let spec = |stem: &str, channels| MapSpec { file: file(stem), format: FileFormat::Png, bit_depth: 8, channels };
+    let spec = |stem: &str, channels| MapSpec { file: file(stem), format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new() };
     let mut sheen = rgb(|k| virt(VirtualMap::SheenTint, k));
     sheen.push((Dest::A, ch(Channel::SheenRoughness, 0)));
     vec![

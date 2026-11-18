@@ -36,7 +36,7 @@ fn coords(n: Vec3) -> Coords {
 fn source(s: &Source, proj: &Projection, c: &Coords) -> Option<[f32; 3]> {
     match s {
         Source::Uniform(v) => Some(*v),
-        Source::Procedural { pattern, low, high } => {
+        Source::Procedural { pattern, low, high, .. } => {
             let t = procedural(pattern, proj, c);
             Some([0, 1, 2].map(|k| low[k] + (high[k] - low[k]) * t))
         }
@@ -110,7 +110,8 @@ pub fn filter(id: &str, size: usize) -> Option<Vec<Option<Sample>>> {
     let gbuf = texturecraft_geom::UvGBuffer::new(&mesh, 0, res, res);
     let mut p = Project::new("preview", "");
     p.texture_sets.push(TextureSet::new("preview", 0, res));
-    let procedural = |kind, scale, low: [f32; 3], high: [f32; 3]| Source::Procedural { pattern: Procedural { scale, ..Procedural::new(kind) }, low, high };
+    let procedural =
+        |kind, scale, low: [f32; 3], high: [f32; 3]| Source::Procedural { pattern: Procedural { scale, ..Procedural::new(kind) }, low, high, ramp: Vec::new() };
     let mut fill = Fill::default();
     fill.sources.insert(Channel::BaseColor, procedural(ProceduralKind::Clouds, 2.0, [0.05, 0.2, 0.55], [0.95, 0.55, 0.1]));
     fill.sources.insert(Channel::Roughness, procedural(ProceduralKind::Checker, 4.0, [0.25; 3], [0.7; 3]));

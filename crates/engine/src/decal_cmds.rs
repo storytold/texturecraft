@@ -2,10 +2,12 @@
 //! (a decal fill with a planar projection), as a fill layer with a decal projection.
 
 use serde_json::{Value, json};
-use texturecraft_core::{Channel, Decal, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source};
-use texturecraft_geom::glam::{Vec2, Vec3};
+use texturecraft_core::{
+    Channel, Decal, DecalFlip, DecalSymmetry, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source,
+};
+use texturecraft_geom::glam::{Quat, Vec2, Vec3};
 
-use crate::commands::{CommandSpec, always, bad, channel_param, f32p, has_layer, layer_param, strp, u64p, vec3};
+use crate::commands::{CommandSpec, always, bad, boolp, channel_param, f32p, layer_param, strp, u64p, vec3};
 use crate::tool_cmds::viewport_of;
 use crate::{Result, Session, StackTarget, cmd};
 
@@ -16,7 +18,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add decal",
             [],
             None,
-            "{image: resource name, channel?: a channel id (default baseColor) | \"mask\" (a new fill layer masked by the image's gray), x?, y?: viewport pixels (default: the view center; a point on another texture set selects it), viewport?: [w,h] | position?: [x,y,z], normal?: [x,y,z] (on the selected texture set), up?: [x,y,z] (the image's up; default the view's up, or the view direction when that is along the normal), size?: height | [w,h] (world units; default a quarter of the mesh), rotation?: degrees, depth?, name?} → {layer, decal, maskEffect: the mask fill effect holding the image with channel \"mask\", else null} — a fill layer projecting the image from a frame placed on the surface; seen from the front, the image reads the right way round",
+            "{image: resource name, channel?: a channel id (default baseColor) | \"mask\" (a new fill layer masked by the image's gray), x?, y?: viewport pixels (default: the view center; a point on another texture set selects it), viewport?: [w,h] | position?: [x,y,z], normal?: [x,y,z] (on the selected texture set), up?: [x,y,z] (the image's up; default the view's up, or the view direction when that is along the normal), size?: height | [w,h] (world units; default a quarter of the mesh), keepProportions?: true makes the height follow the width by the image's aspect, flipU?, flipV?: mirror the image left to right / top to bottom inside the frame, rotation?: degrees, depth?, symmetry?: x|y|z|off (also place a mirrored copy across the mesh center, perpendicular to that axis; it follows this decal), symmetryFlip?: none|u|v (flip the copy's image on top of the reflection), symmetryOffset?: world units from the mesh center along the axis to the mirror plane (default 0, within the mesh), name?} → {layer, decal, maskEffect: the mask fill effect holding the image with channel \"mask\", else null} — a fill layer projecting the image from a frame placed on the surface; seen from the front, the image reads the right way round",
             always,
             add
         ),
@@ -25,8 +27,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit decal",
             [],
             None,
-            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z], size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
-            has_layer,
+            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z] (default: the decal's up carried along when it moves onto a surface facing another way), size?: height | [w,h], keepProportions?: true keeps the image's aspect (the current ratio without an image): a height sets the width, a [w,h] pair or no size sets the height from the width, flipU?, flipV?: mirror the image left to right / top to bottom inside the frame, rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, symmetry?: x|y|z|off, symmetryFlip?: none|u|v, symmetryOffset? (the mirrored copy; the flip and offset alone keep the axis), image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
+            always,
             set
         ),
     ]
@@ -91,6 +93,56 @@ fn decal_up(s: &Session, cmd: &str, p: &Value, normal: Vec3) -> Result<Vec3> {
     Ok(if up.normalize_or_zero().cross(normal).length_squared() > 1e-4 { up } else { to_world.transform_vector3(Vec3::NEG_Z) })
 }
 
+/// The mirrored copy asked for by `symmetry` (x, y, z or off) and `symmetryFlip` (none, u or v),
+/// starting from `current` for what the params leave out
+fn symmetry_param(cmd: &str, p: &Value, current: Option<DecalSymmetry>, bounds: (Vec3, Vec3)) -> Result<Option<DecalSymmetry>> {
+    let axis = match strp(p, "symmetry").map(str::to_ascii_lowercase).as_deref() {
+        None => current.map(|symmetry| symmetry.axis.min(2)),
+        Some("off" | "none") => None,
+        Some("x") => Some(0),
+        Some("y") => Some(1),
+        Some("z") => Some(2),
+        Some(other) => return Err(bad(cmd, format!("unknown symmetry `{other}` (x, y, z or off)"))),
+    };
+
+    let flip = match strp(p, "symmetryFlip").map(str::to_ascii_lowercase).as_deref() {
+        None => current.map_or(DecalFlip::None, |symmetry| symmetry.flip),
+        Some("none" | "off") => DecalFlip::None,
+        Some("u") => DecalFlip::U,
+        Some("v") => DecalFlip::V,
+        Some(other) => return Err(bad(cmd, format!("unknown symmetryFlip `{other}` (none, u or v)"))),
+    };
+
+    // The plane stays within the mesh, as the brush symmetry's offset does
+    let (lo, hi) = bounds;
+    let half_extent = (hi - lo) * 0.5;
+    let offset = match (f32p(p, "symmetryOffset"), current) {
+        (Some(offset), _) if !offset.is_finite() => return Err(bad(cmd, "`symmetryOffset` must be a number")),
+        (Some(offset), _) => offset,
+        (None, Some(symmetry)) => symmetry.offset,
+        (None, None) => 0.0,
+    };
+
+    Ok(axis.map(|axis| {
+        let limit = half_extent[usize::from(axis)];
+        DecalSymmetry { axis, flip, offset: offset.clamp(-limit, limit) }
+    }))
+}
+
+/// The up of a decal moved from a surface facing `from.0` (up `from.1`) onto one facing `to`: the
+/// old up turned by the smallest rotation that takes the old normal to the new one (parallel
+/// transport), so it follows the surface smoothly and never degenerates. A surface turned
+/// exactly away has no smallest rotation: the camera rule of a new decal decides there.
+fn carried_up(s: &Session, from: (Vec3, Vec3), to: Vec3) -> Vec3 {
+    let (old_normal, old_up) = from;
+    let (Some(old_normal), Some(new_normal)) = (old_normal.try_normalize(), to.try_normalize()) else { return old_up };
+    if old_normal.dot(new_normal) < -0.9999 {
+        return decal_up(s, "", &Value::Null, new_normal).unwrap_or(old_up);
+    }
+
+    Quat::from_rotation_arc(old_normal, new_normal) * old_up
+}
+
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "layer.add.decal";
     let image = strp(p, "image").ok_or_else(|| bad(cmd, "`image` is required"))?.to_string();
@@ -112,7 +164,10 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 
     let mesh_diagonal = mesh_size(s);
     let default_height = mesh_diagonal * DEFAULT_HEIGHT;
-    let size = size_param(p, aspect, mesh_diagonal).unwrap_or([default_height * aspect, default_height]);
+    let mut size = size_param(p, aspect, mesh_diagonal).unwrap_or([default_height * aspect, default_height]);
+    if boolp(p, "keepProportions") == Some(true) && p.get("size").is_some_and(Value::is_array) {
+        size[1] = (size[0] / aspect).clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE);
+    }
     let decal = Decal {
         center: center.to_array(),
         normal: normal.to_array(),
@@ -120,8 +175,11 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         size,
         rotation: f32p(p, "rotation").unwrap_or(0.0).rem_euclid(360.0),
         offset: [0.0; 2],
+        flip: [boolp(p, "flipU").unwrap_or(false), boolp(p, "flipV").unwrap_or(false)],
+
         // By default it reaches half its larger side into the surface
         depth: f32p(p, "depth").map_or(size[0].max(size[1]) * 0.5, |depth| depth.clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE)),
+        symmetry: symmetry_param(cmd, p, None, s.mesh.bounds())?,
     };
 
     // A decal dropped on another texture set goes there and selects it, as a dropped material does
@@ -169,6 +227,27 @@ fn decal_of(s: &Session, cmd: &str, id: LayerId, effect: Option<LayerId>) -> Res
     }
 }
 
+/// Width over height of the image the decal of fill layer `id` (or of mask fill effect `effect`) shows
+/// (`new`: the image a call replaces it with, which then counts instead)
+fn image_aspect(s: &Session, id: LayerId, effect: Option<LayerId>, new: Option<&str>) -> Option<f32> {
+    let name = match effect {
+        _ if new.is_some() => new?.to_string(),
+        Some(effect) => match &s.doc.project.effect(effect)?.1.kind {
+            EffectKind::Fill { source: Source::Image { name, .. }, .. } => name.clone(),
+            _ => return None,
+        },
+        None => match &s.doc.project.layer(id).ok()?.kind {
+            LayerKind::Fill(fill) => fill.sources.values().find_map(|source| match source {
+                Source::Image { name, .. } => Some(name.clone()),
+                _ => None,
+            })?,
+            _ => return None,
+        },
+    };
+    let image = s.images.get(&name)?;
+    Some(image.width as f32 / image.height.max(1) as f32)
+}
+
 fn set(session: &mut Session, params: &Value) -> Result<Value> {
     let command = "layer.decal.set";
     let effect = u64p(params, "effect").map(LayerId);
@@ -192,13 +271,31 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
             return Err(bad(command, "that surface belongs to another texture set"));
         }
 
+        // Carry up so a stale axis cannot lie in or flip on the new surface
+        let previous = (Vec3::from(decal.normal), Vec3::from(decal.up));
         (decal.center, decal.normal, decal.offset) = (center.to_array(), normal.to_array(), [0.0; 2]);
+        if params.get("up").is_none() {
+            decal.up = carried_up(session, previous, normal).to_array();
+        }
     }
     if params.get("up").is_some() {
         decal.up = decal_up(session, command, params, Vec3::from(decal.normal))?.to_array();
     }
-    if let Some(size) = size_param(params, decal.size[0] / decal.size[1].max(1e-6), mesh_diagonal) {
+    let keep = boolp(params, "keepProportions") == Some(true);
+    let ratio = decal.size[0] / decal.size[1].max(1e-6);
+    let aspect = if keep { image_aspect(session, layer_id, effect, strp(params, "image")).unwrap_or(ratio) } else { ratio };
+    if let Some(mut size) = size_param(params, aspect, mesh_diagonal).or_else(|| keep.then_some(decal.size)) {
+        // A height sets the width through `aspect`; a pair or the current size sets the height from the width
+        if keep && params.get("size").is_none_or(Value::is_array) {
+            size[1] = (size[0] / aspect).clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE);
+        }
         decal.size = size;
+    }
+    if let Some(flip) = boolp(params, "flipU") {
+        decal.flip[0] = flip;
+    }
+    if let Some(flip) = boolp(params, "flipV") {
+        decal.flip[1] = flip;
     }
     if let Some(rotation) = f32p(params, "rotation") {
         decal.rotation = rotation.rem_euclid(360.0);
@@ -212,6 +309,7 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
     if let Some(depth) = f32p(params, "depth") {
         decal.depth = depth.clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE);
     }
+    decal.symmetry = symmetry_param(command, params, decal.symmetry, session.mesh.bounds())?;
 
     let image = strp(params, "image").map(str::to_string);
     if let Some(name) = &image

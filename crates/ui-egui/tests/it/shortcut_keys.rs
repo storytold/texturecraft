@@ -104,3 +104,26 @@ fn a_pasted_image_counts_as_the_paste_shortcut() {
     h.run_steps(3);
     assert!(h.state().session.doc.project.layers.len() > before, "the paste ran layer.paste");
 }
+
+#[test]
+fn a_command_without_a_default_key_runs_from_the_key_it_is_bound_to() {
+    let mut h = harness();
+    let before = h.state().session.doc.project.layers.len();
+    h.event(press(Key::F7, Modifiers::NONE, false));
+    h.run_steps(2);
+    assert_eq!(h.state().session.doc.project.layers.len(), before, "F7 is free");
+    h.state_mut().ui.keymap.insert("layer.add.fill".into(), "F7".into());
+    h.run_steps(2);
+    h.event(press(Key::F7, Modifiers::NONE, false));
+    h.run_steps(2);
+    assert_eq!(h.state().session.doc.project.layers.len(), before + 1, "F7 added a fill layer");
+}
+
+#[test]
+fn the_shortcut_editor_lists_a_command_without_a_key_and_hides_one_that_needs_a_parameter() {
+    let mut h = harness();
+    h.state_mut().ui.windows.shortcuts = true;
+    h.run_steps(4);
+    assert!(h.query_by_label("Toggle layer visibility").is_some(), "Toggle layer visibility is listed");
+    assert!(h.query_by_label("Select texture set").is_none(), "Select texture set needs a texture set");
+}

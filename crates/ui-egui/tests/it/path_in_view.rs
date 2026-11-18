@@ -165,6 +165,7 @@ fn clicking_the_2d_view_preserves_a_stored_3d_path_being_edited() {
     click(&mut harness, view_2d_center);
 
     assert_eq!(harness.state().session.tool.path, path);
+    assert!(harness.state().toasts.iter().any(|t| t.text == "Finish or cancel the path first; it is in the 3D view"), "the click says why it was ignored");
     assert_eq!(harness.state().session.doc.project, before.project);
     assert_eq!(harness.state().session.doc.pixels.layers, before.pixels.layers);
     assert_eq!(harness.state().session.history_labels(), history);
@@ -201,4 +202,124 @@ fn clicking_the_curve_inserts_a_point_and_backspace_removes_the_selected_one() {
     undo(&mut h);
     assert_eq!(path(&h).points, before);
     assert!(!path_sublayers(&h).is_empty(), "the path is still there");
+}
+
+/// A split view over a sphere with the Path tool, plus the centres of the 3D and the 2D view
+fn split_harness() -> (AppHarness<'static>, Pos2, Pos2) {
+    let mut session =
+        texturecraft_engine::Session::new_project("t", texturecraft_engine::geom::primitives::sphere(1.0, 24, 12), "builtin:test", None, 128).unwrap();
+    session.camera.yaw = 0.0;
+    session.camera.pitch = 0.0;
+    session.update();
+    execute(&mut session, "layer.add.paint", &serde_json::Value::Null).unwrap();
+    execute(&mut session, "tool.select", &json!({"tool": "path"})).unwrap();
+    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.layout = ViewLayout::Split;
+    harness.run_steps(4);
+    let view_3d = harness.state().viewport_rect;
+    let center_3d = view_3d.center();
+    let center_2d = pos2(view_3d.right() + view_3d.width() * 0.5, view_3d.center().y);
+    (harness, center_3d, center_2d)
+}
+
+#[test]
+fn clicking_the_2d_view_keeps_points_placed_in_3d_and_says_why() {
+    let (mut h, center_3d, center_2d) = split_harness();
+    click(&mut h, center_3d);
+    click(&mut h, center_3d + egui::vec2(40.0, 0.0));
+    let path = h.state().session.tool.path.clone();
+    assert_eq!((path.points.len(), path.uv), (2, false));
+    assert!(h.state().toasts.is_empty());
+
+    click(&mut h, center_2d);
+
+    assert_eq!(h.state().session.tool.path, path, "the placed points stay");
+    assert!(h.state().toasts.iter().any(|t| t.text == "Finish or cancel the path first; it is in the 3D view"));
+
+    // Placing in the same view still works afterwards
+    click(&mut h, center_3d + egui::vec2(0.0, 40.0));
+    assert_eq!(h.state().session.tool.path.points.len(), 3);
+}
+
+#[test]
+fn clicking_the_3d_view_keeps_points_placed_in_2d_and_says_why() {
+    let (mut h, center_3d, center_2d) = split_harness();
+    click(&mut h, center_2d);
+    click(&mut h, center_2d + egui::vec2(40.0, 0.0));
+    let path = h.state().session.tool.path.clone();
+    assert_eq!((path.points.len(), path.uv), (2, true));
+
+    click(&mut h, center_3d);
+
+    assert_eq!(h.state().session.tool.path, path, "the placed points stay");
+    assert!(h.state().toasts.iter().any(|t| t.text == "Finish or cancel the path first; it is in the 2D view"));
+}
+
+#[test]
+fn an_empty_path_can_start_in_either_view() {
+    let (mut h, center_3d, center_2d) = split_harness();
+    click(&mut h, center_3d);
+    assert_eq!((h.state().session.tool.path.points.len(), h.state().session.tool.path.uv), (1, false));
+    h.state_mut().session.cancel_path();
+    click(&mut h, center_2d);
+    assert_eq!((h.state().session.tool.path.points.len(), h.state().session.tool.path.uv), (1, true));
+    assert!(h.state().toasts.is_empty());
+}
+
+/// A primary click with Shift held, in two frames like `click`
+fn shift_click(h: &mut AppHarness<'_>, at: Pos2) {
+    h.input_mut().events.push(Event::ModifiersChanged(Modifiers::SHIFT));
+    for pressed in [true, false] {
+        let events = &mut h.input_mut().events;
+        events.push(Event::PointerMoved(at));
+        events.push(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::SHIFT });
+        h.step();
+    }
+    h.input_mut().events.push(Event::ModifiersChanged(Modifiers::NONE));
+    h.run_steps(2);
+}
+
+#[test]
+fn shift_click_places_a_corner_point_in_one_undo_step() {
+    let mut h = harness();
+    click(&mut h, A);
+    shift_click(&mut h, B);
+    click(&mut h, C);
+    assert_eq!(h.state().session.tool.path.points.len(), 3);
+    assert_eq!(h.state().session.tool.path.corner_flags(), vec![false, true, false]);
+
+    // Shift+click on the curve inserts a corner there
+    shift_click(&mut h, A.lerp(B, 0.5));
+    assert_eq!(h.state().session.tool.path.points.len(), 4);
+    assert_eq!(h.state().session.tool.path.corner_flags(), vec![false, true, true, false]);
+
+    // Undo takes the inserted corner back, as a single step
+    h.state_mut().session.undo().unwrap();
+    assert_eq!(h.state().session.tool.path.corner_flags(), vec![false, true, false]);
+}
+
+#[test]
+fn corner_button_toggles_the_selected_point_and_is_off_without_one() {
+    let mut h = harness();
+    let button = "Corner point (Shift+click places one)";
+    for at in [A, B, C] {
+        click(&mut h, at);
+    }
+
+    // The last placed point is selected
+    h.get_all_by_label(button).next().unwrap().scroll_to_me();
+    h.run_steps(30);
+    assert!(!h.get_all_by_label(button).next().unwrap().accesskit_node().is_disabled());
+    h.get_all_by_label(button).next().unwrap().click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.tool.path.corner_flags(), vec![false, false, true]);
+
+    h.get_all_by_label(button).next().unwrap().click();
+    h.run_steps(2);
+    assert!(h.state().session.tool.path.corner_flags().is_empty());
+
+    // With no point selected the button is disabled
+    h.state_mut().session.tool.path.selected = None;
+    h.run_steps(2);
+    assert!(h.get_all_by_label(button).next().unwrap().accesskit_node().is_disabled());
 }

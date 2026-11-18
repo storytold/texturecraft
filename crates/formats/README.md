@@ -78,7 +78,7 @@ pub fn preset_from_json(json: &str) -> Result<ExportPreset>;
 pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
 ```
 
-- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)> }`
+- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)>, inverted: Vec<Dest> }`
   (serde JSON, so presets can be user files).
 - `Dest`: `R G B A` or `L` (gray; `L` + `A` = gray + alpha).
 - `SourceRef`: `Channel { channel, component }` (`Normal` = the **final** normal in the export
@@ -151,6 +151,10 @@ Project format version 2 stores baked maps in uniform UV tile blocks, independen
 tile-resolution overrides. Older projects load their stored bake pixels as-is, without converting
 the old layout; their appearance may change until rebaked. Painted layers and cage/skew correction
 maps retain their working atlas layout.
+
+Project format version 3 stores baked bent normal maps in tangent space (OpenGL green, like the
+normal map). Version 2 and older files held them in world space: loading drops those maps, keeps
+the bake settings and warns that the Bent Normals map needs a re-bake.
 
 Loading runs `Project::validate`, refuses a newer `format_version` (`FormatError::NewerVersion`),
 checks every tile against its texture set's resolution and component count, rejects repeated or

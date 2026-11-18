@@ -6,20 +6,26 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 
 - **Brushes** with size, flow, stroke opacity, spacing, hardness, angle and follow path; size,
   angle, flow and position jitter; tangent or camera alignment, angle fade, backface culling, lazy
-  mouse, X/Y/Z mirror and radial symmetry (copies paint the far side too) and pen pressure in the
-  3D and 2D views (Windows Ink pens, and pens that send touch events in the browser, such as on
+  mouse, X/Y/Z mirror and radial symmetry (copies paint the far side too, and in the 2D view they land where the 3D
+  copies would) and pen pressure in the 3D and 2D views (Windows Ink pens, and pens that send touch events in the browser, such as on
   tablets; on Linux, macOS and desktop browsers a pen works as a mouse for now).
   Ctrl+drag in a view sets them on the fly: right-drag the size and hardness, left-drag the flow
   and angle.
-  **67 procedural brush alphas** in their own shelf tab, or any imported image as the alpha.
+  **67 procedural brush alphas** in their own shelf tab, or any imported image as the alpha. Every alpha has Parameters (Properties › Alpha): hardness, size X and Y,
+  roundness for the Round shape, contrast and invert, with Restore defaults.
   **18 brush presets** (basic, wear and grunge, details) in the shelf's Brushes tab set the
-  stroke and keep the size; save your own brushes there too.
+  stroke and keep the size. The Brush section's **Brush presets** popover (and the shelf) also keeps
+  your own: save the current brush, click to use it, rename, replace or delete it.
 - **Tools:** paint, eraser, **projection** with image stencils (hold S to move, turn and scale the
-  stencil), polygon fill (triangle, UV island or the whole mesh), **path** and **lasso fill**, a
-  **particle brush**, **smudge**, **clone** (V + click sets the source), color picker, Shift+click
-  straight lines, and painting directly in the **2D UV view**.
-- **Geometry decals:** drop an image on the surface, then move, scale and turn its frame; it stays
-  an editable fill layer.
+  stencil), polygon fill (triangle, UV island or the whole mesh), **path** (Shift+click places a corner point for hard edges) and **lasso fill**, a
+  **particle brush**, **smudge**, **clone** (V + click sets the source, marked in the 3D and 2D views;
+  an Aligned option keeps or restarts the offset per stroke), material picker, Shift+click straight
+  lines (Ctrl+Shift+click snaps them to 15 degree steps), and painting directly in the **2D UV view**.
+  Brush, symmetry and the other tool settings stay when you open another project and when you
+  restart the app.
+- **Geometry decals:** drop an image on the surface, then move, scale and turn its frame, keep the image's proportions
+  while sizing it or flip it; it stays an editable fill layer. Mirror across X, Y or Z (optionally flipping the copy's image in U or V)
+  to place a copy on the opposite side of the mesh (move the mirror plane with Axis position); it follows the decal.
 - **Text** in any installed font (or the built-in ones), shaped for every script with kerning and
   ligatures, one or more lines: stamp it with the brush as its alpha, or place it as a decal in the
   tool's base color (Properties › Alpha › Text).
@@ -35,14 +41,25 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   Normal map detail), per-channel opacity, visibility, color tags, drag-and-drop reordering,
   duplicate, group, flatten, cut, copy and paste across texture sets, and **geometry masks** that
   show a layer only on the mesh parts you pick (right-click a layer, or click parts with the
-  **Geometry mask** tool, 8).
+  **Geometry mask** tool, 8). **Solo layer** (right-click a layer, or Alt+click its eye) shows
+  one layer alone in the 3D and 2D views, optionally without its mask (Alt+Shift+click, or
+  **Solo layer without its mask**), to judge a material hidden behind a mask. It is only a view:
+  the document, the undo history, saving, exporting and baking never see it.
+- **Several layers at once:** Shift+click a layer to select the rows from the last clicked one,
+  Ctrl+click (Cmd+click on macOS) to add or take out one layer, Ctrl+A (Cmd+A) with the pointer
+  over the Layers panel to select every shown row (folder rows and the layers of open folders).
+  The eye of a row always acts on that layer only. Delete, the trash button, duplicate
+  (Ctrl+D), group (Ctrl+G: the new folder takes the place and folder of the topmost selected layer; copies go in one block above it), the row menu and drag-and-drop then act on every selected layer, each
+  as one undo step.
 - **Filters and content effects** on any layer or mask: **31 filters** (HSL, levels,
   contrast/luminosity, color balance, gradient map, posterize, clamp, histogram scan, range and
   shift, invert, threshold, grayscale, replace color, edge detect, normal invert, baked lighting,
   blur, directional and slope blur, sharpen, high pass, bevel, glow, warp, directional warp,
   mosaic and four material finishes), fills and paint. **Levels** shows a histogram of what it
   reads (the mask below it, or a content channel you pick) with its input range marked.
-  **Anchor points** record the stack at a layer so masks and fills higher up can react to it.
+  **Anchor points** record the stack at a layer (or, inside a mask, the mask value at that point)
+  so masks, fills and generators higher up can react to it; a generator can take an anchor's
+  painted height as **micro detail**. Double-click an effect to rename it.
 - **Masks** with a white or black background and a stack of effects: painted strokes, fills,
   **mesh-map generators** (edge wear, dirt, thin areas, curvature, AO, position and direction
   gradients, all with world-space noise), filters, ID color selection and compare. Alt+click a
@@ -56,16 +73,25 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   and offset, and the cylindrical axis in the fill's properties. Each channel takes its own image (a normal, roughness or height map, say): pick it in the channel's
   source menu, which also imports one, or drop it from the Assets panel onto the channel. A
   normal map image made for DirectX (Y down) is marked with **DirectX normal map** under it.
+  A color channel's procedural or anchor point takes a **gradient map** (*Gradient Map* in the
+  channel's source menu): up to 16 color stops, dark to light, color the pattern, or recolor
+  the stack below by its lightness, without touching the other channels. The **Gradient map**
+  filter does the same for a whole layer's content.
   Alt+click a material channel (of a fill or the brush) to keep that channel alone.
 - **72 materials** (metals from measured reflectance, car paint, brushed anisotropic steel,
   velvet, skin, wax, glass, ice, woods, bamboo, bark, stone, cobblestone, gravel, plaster, sand,
   mud, snow, bone, moss, plastics, fabric, linen, wool, leather, ceramic, rust, cork, paper), **21 smart
   materials** (rusted iron, worn paint, oxidized copper, bronze statue, weathered wood, mossy
   brick and stone, sun-faded paint…) and **24 smart masks**, all procedural, so they work at any
-  resolution. Drag them from the tabbed, searchable shelf onto the layer stack or straight onto
-  the model.
+  resolution. Drag them from the tabbed, searchable shelf onto the layer stack (below the row you
+  drop on) or straight onto the model (a new fill layer on top). A click on a simple material makes it
+  the brush's material: the next stroke paints its pattern (colour, metallic, roughness, height),
+  fixed to the surface and sized with the brush. A click on a smart material, which is several
+  layers, only highlights it; drag it to add its layers.
 - **Your own library:** right-click a layer or folder, choose *Create smart material*, and it
-  appears under *My smart materials*, pixels and images included.
+  appears under *My smart materials*, pixels and images included. *Create smart mask* in the same
+  menu saves just the layer's mask (all its effects, painted pixels and images); it appears under
+  *My smart masks* and applies to any layer like a built-in smart mask.
 - **MaterialCraft materials:** *File › Import material*, a drop on the window, or MaterialCraft's
   *File › Send to TextureCraft* (it lands under *My smart materials*) adds a `.mcmat` portable
   material, or a `.mcraft` package, as a fill layer. Its exposed graph inputs (numbers, vectors,
@@ -80,7 +106,12 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **Open** glTF/GLB, FBX (binary and ASCII), COLLADA, **USD** (usda, usdc, usdz), **Alembic**,
   OBJ, PLY and STL, or a built-in mesh; UVs are generated when a mesh has none. A `.gltf`'s buffers
   and images and a loose USD layer's textures are read from its folder and kept in the project.
-  Reimport a changed mesh and your painted strokes stay on the surface.
+  Reimport a changed mesh and your painted strokes stay on the surface. The
+  `file.changeMesh` command (trusted local command API and the control channel) moves the project onto a different mesh file and keeps its layers.
+  **Edit › Project Configuration...** (desktop) does the same from the 3D MESH section: *Select...* picks the
+  file, *Reimport mesh* is ticked for you (or tick it alone to read the same file again), OK applies. *Import settings* decides whether painted
+  strokes follow the surface (on by default), and PROJECT SETTINGS sets the project's normal map format and
+  lists its UV tiles (read only; Texture Set Settings changes them).
 - **UDIM / UV tiles:** detected on import or switched on later, with a resolution per tile (blurs,
   other filters and height-to-normal slopes keep their size in UV space at any tile resolution)
   and one texture per tile on export (`$udim`).
@@ -110,7 +141,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   anisotropy, transmission and subsurface maps), separate maps, mesh maps and document channels, in
   PNG, JPEG, TGA, TIFF, BMP, WEBP, EXR or HDR at 8, 16 or 32 bits, with UV padding, size
   override and OpenGL or DirectX normals.
-- **Output template editor:** build your own presets with per-channel packing and converted maps,
+- **Output template editor:** build your own presets with per-channel packing, converted maps and per-channel inversion,
   and share them as JSON.
 - **Mesh export** to OBJ with an MTL material library and its maps (PBR extension keys for
   roughness, metallic, normal and coat; UV-tiled sets keep their UDIM UVs and export their maps
@@ -128,8 +159,14 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   light, environment importance sampling, displaced geometry, a denoiser and one-click PNG save,
   traced on the GPU
   (compute shaders, about 25× the CPU tracer, desktop and WebGPU) or on the CPU.
-- View any channel, any baked mesh map, or a UV checker; Alt+drag to orbit, middle-drag to pan,
-  wheel to zoom, F to frame, M / C / B to cycle views.
+- View any channel, any baked mesh map, or a UV checker; Alt+drag to orbit (Alt+Shift+drag in 90°
+  steps), middle-drag to pan, wheel to zoom, F to show the entire mesh, Shift+F to frame the active
+  texture set (a floor plane or other helper geometry stays out of the view and the orbit pivot),
+  M / C / B to cycle views. Orbit, pan and zoom buttons in the corner of each view do the same with a
+  plain drag, so a pen and tablet can navigate without a keyboard or wheel (Viewport menu ▸
+  Navigation buttons hides them).
+- **Perspective (F5) or orthographic (F6)** projection, and **front, back, left, right, top and
+  bottom views** that frame the mesh (Viewport menu; bind your own keys in Settings).
 - **3D and UV wireframes** that show the mesh's own polygons: quads and n-gons from OBJ, FBX,
   COLLADA, USD, Alembic and PLY files keep their edges, without the triangulation's diagonals.
 
@@ -142,11 +179,11 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   strip, and Settings › Interface › System title bar for the system's frame instead.
 - **Dockable, tabbed and floating panels**, saved layouts, and panels that reopen where you closed
   them.
-- A **start window** at launch: a new project, a project file, a recent project or the sample
-  (Settings › Interface › Start window).
+- **No project at launch**: empty views, panels and toolbars until you create or open one (File ›
+  New project, Open, Recent projects, Open sample project); File › Close returns to that state.
 - A **data folder** of your choice for autosaves, smart materials, presets, templates and UI
   layouts, on any drive (Settings › Folders; `Documents/TextureCraft` by default).
-- A **shortcut editor** with conflict detection, and every shortcut shown in its tooltip.
+- A **shortcut editor** with conflict detection, listing every menu item and every command a key can run (commands that need a path, name or similar are left out), and every shortcut shown in its tooltip.
 - A **History** panel: click any step to go back to it, or forward again to an undone one.
 - **10 languages:** English, French, German, Spanish, Portuguese, Italian, Japanese, Chinese,
   Korean and Arabic, switchable live.

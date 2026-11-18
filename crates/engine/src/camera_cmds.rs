@@ -37,6 +37,23 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("camera.bookmark7", "Go to camera 7", ["Viewport"], Some("Ctrl+7"), "{}", always, |s, _| bookmark(s, 6)),
         cmd!("camera.bookmark8", "Go to camera 8", ["Viewport"], Some("Ctrl+8"), "{}", always, |s, _| bookmark(s, 7)),
         cmd!("camera.bookmark9", "Go to camera 9", ["Viewport"], Some("Ctrl+9"), "{}", always, |s, _| bookmark(s, 8)),
+        cmd!(
+            "camera.view",
+            "Fixed view",
+            [],
+            None,
+            "{view: front|back|left|right|top|bottom} → the camera (looks at the mesh from that side and frames it; the projection stays)",
+            always,
+            |s, p| fixed_view(s, strp(p, "view").ok_or_else(|| bad("camera.view", "`view` is required"))?)
+        ),
+        cmd!("camera.view.front", "Front view", ["Viewport"], None, "{}", always, |s, _| fixed_view(s, "front")),
+        cmd!("camera.view.back", "Back view", ["Viewport"], None, "{}", always, |s, _| fixed_view(s, "back")),
+        cmd!("camera.view.left", "Left view", ["Viewport"], None, "{}", always, |s, _| fixed_view(s, "left")),
+        cmd!("camera.view.right", "Right view", ["Viewport"], None, "{}", always, |s, _| fixed_view(s, "right")),
+        cmd!("camera.view.top", "Top view", ["Viewport"], None, "{}", always, |s, _| fixed_view(s, "top")),
+        cmd!("camera.view.bottom", "Bottom view", ["Viewport"], None, "{}", always, |s, _| fixed_view(s, "bottom")),
+        cmd!("camera.perspective", "Perspective", ["Viewport"], Some("F5"), "{}", always, |s, _| projection(s, false)),
+        cmd!("camera.orthographic", "Orthographic", ["Viewport"], Some("F6"), "{}", always, |s, _| projection(s, true)),
         cmd!("viewport.focusAt", "Focus depth of field here", [], None, "{x, y (viewport pixels), viewport?: [w, h]}", always, focus_at),
     ]
 }
@@ -128,15 +145,44 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
     if u64p(p, "index").is_none() && strp(p, "name").is_none_or(|n| n == DEFAULT_CAMERA) {
-        // The default camera: fov and projection from the display settings, framing the mesh.
+        // The default camera: fov and projection from the display settings, framing the mesh
         s.camera.fov = s.doc.project.display.fov;
         s.camera.ortho = false;
         return crate::execute(s, "viewport.frame", &Value::Null);
     }
+
     let i = which(s, "camera.select", p)?;
     if let Some(c) = s.doc.project.cameras.get(i).cloned() {
+        // A saved view is clamped against the whole mesh, not against a part framed with F
+        s.camera.scene_radius = s.mesh.radius();
         apply(&mut s.camera, &c);
     }
+    s.revision = s.revision.wrapping_add(1);
+    Ok(crate::view_cmds::camera_json(s))
+}
+
+/// The fixed views: name, yaw and pitch in degrees. Yaw 0 puts the eye on +Z (the front), yaw 90
+/// on +X (the right side); top and bottom stop at the orbit's ±89° pitch limit.
+pub const VIEWS: [(&str, f32, f32); 6] =
+    [("front", 0.0, 0.0), ("back", 180.0, 0.0), ("left", -90.0, 0.0), ("right", 90.0, 0.0), ("top", 0.0, 89.0), ("bottom", 0.0, -89.0)];
+
+/// Look at the mesh from fixed view `name` and frame it, keeping the projection. The yaw is the
+/// one nearest the current yaw, so the desktop UI's glide takes the short way round.
+fn fixed_view(s: &mut Session, name: &str) -> Result<Value> {
+    let Some(&(_, yaw, pitch)) = VIEWS.iter().find(|(view, ..)| *view == name) else {
+        return Err(bad("camera.view", format!("unknown view `{name}`: one of front, back, left, right, top, bottom")));
+    };
+
+    let current = if s.camera.yaw.is_finite() { s.camera.yaw } else { 0.0 };
+    let turn = std::f32::consts::TAU;
+    s.camera.yaw = current + (yaw.to_radians() - current + turn * 0.5).rem_euclid(turn) - turn * 0.5;
+    s.camera.pitch = pitch.to_radians();
+    crate::execute(s, "viewport.frame", &Value::Null)
+}
+
+/// Switch to a perspective or orthographic projection; position and rotation stay.
+fn projection(s: &mut Session, ortho: bool) -> Result<Value> {
+    s.camera.ortho = ortho;
     s.revision = s.revision.wrapping_add(1);
     Ok(crate::view_cmds::camera_json(s))
 }
@@ -236,6 +282,73 @@ mod tests {
         let ids: Vec<_> = crate::command_specs().iter().filter(|c| c.id.starts_with("camera.bookmark")).collect();
         assert_eq!(ids.len(), 9);
         assert!(ids.iter().all(|c| c.shortcut.is_some()));
+    }
+
+    #[test]
+    fn fixed_views_look_from_their_side_frame_the_mesh_and_keep_the_projection() {
+        let mut s = session();
+        execute(&mut s, "camera.set", &json!({"yaw": 37, "pitch": 21, "distance": 9, "target": [0.4, -0.3, 0.2]})).unwrap();
+        let (lo, hi) = s.mesh.bounds();
+        let mut framed = s.camera;
+        framed.frame(lo, hi);
+        let sides = [("front", Vec3::Z), ("back", Vec3::NEG_Z), ("left", Vec3::NEG_X), ("right", Vec3::X), ("top", Vec3::Y), ("bottom", Vec3::NEG_Y)];
+        for ortho in [false, true] {
+            execute(&mut s, "camera.set", &json!({"ortho": ortho})).unwrap();
+            for (view, side) in sides {
+                // Through the parameterized command and through the menu command alike
+                let menu_id = format!("camera.view.{view}");
+                for (id, params) in [("camera.view", json!({"view": view})), (menu_id.as_str(), Value::Null)] {
+                    execute(&mut s, "camera.orbit", &json!({"dx": 123, "dy": 17})).unwrap();
+                    let back = execute(&mut s, id, &params).unwrap();
+                    let looking_from = (s.camera.eye() - s.camera.target).normalize();
+                    assert!(looking_from.dot(side) > 0.999, "{id} {view}: the eye is on the {side} side, not at {looking_from}");
+                    assert_eq!(s.camera.ortho, ortho, "{id} {view} keeps the projection");
+                    assert!((s.camera.target - framed.target).length() < 1e-5, "{view} centres the mesh");
+                    assert!((s.camera.distance - framed.distance).abs() < 1e-4, "{view} frames the mesh");
+                    assert_eq!(back["ortho"], ortho);
+                }
+            }
+        }
+
+        // Orbit still works from a fixed view, and a view is not an undo step
+        let steps = s.history_labels().len();
+        execute(&mut s, "camera.view.top", &Value::Null).unwrap();
+        assert!((s.camera.pitch - 89f32.to_radians()).abs() < 1e-6, "top stops at the orbit limit");
+        execute(&mut s, "camera.orbit", &json!({"dx": 30, "dy": -40})).unwrap();
+        assert!((s.camera.pitch - 49f32.to_radians()).abs() < 1e-5 && s.camera.yaw.to_degrees().rem_euclid(360.0) > 1.0);
+        assert_eq!(s.history_labels().len(), steps);
+    }
+
+    #[test]
+    fn fixed_views_take_the_nearest_turn_and_reject_unknown_views() {
+        let mut s = session();
+        execute(&mut s, "camera.set", &json!({"yaw": 715})).unwrap();
+        execute(&mut s, "camera.view", &json!({"view": "front"})).unwrap();
+        assert!((s.camera.yaw - 720f32.to_radians()).abs() < 1e-4, "two whole turns, not a spin back to 0: {}", s.camera.yaw.to_degrees());
+        let before = s.camera;
+        assert!(execute(&mut s, "camera.view", &json!({"view": "sideways"})).is_err());
+        assert!(execute(&mut s, "camera.view", &json!({})).is_err(), "`view` is required");
+        assert!(execute(&mut s, "camera.view", &json!({"view": 3})).is_err());
+        assert_eq!(s.camera, before, "a rejected view leaves the camera");
+        let menu: Vec<_> = crate::command_specs().iter().filter(|c| c.id.starts_with("camera.view.")).collect();
+        assert_eq!(menu.len(), 6);
+        assert!(menu.iter().all(|c| c.shortcut.is_none() && c.menu == ["Viewport"]), "no default keys: users bind their own");
+    }
+
+    #[test]
+    fn perspective_and_orthographic_change_only_the_projection() {
+        let mut s = session();
+        execute(&mut s, "camera.set", &json!({"yaw": 30, "pitch": 10, "distance": 4})).unwrap();
+        let before = s.camera;
+        let r = execute(&mut s, "camera.orthographic", &Value::Null).unwrap();
+        assert!(s.camera.ortho && r["ortho"] == true);
+        assert_eq!(OrbitCamera { ortho: false, ..s.camera }, before, "position and rotation stay");
+        execute(&mut s, "camera.orthographic", &Value::Null).unwrap();
+        assert!(s.camera.ortho, "a second press keeps it orthographic: two actions, not a toggle");
+        execute(&mut s, "camera.perspective", &Value::Null).unwrap();
+        assert_eq!(s.camera, before);
+        let key = |id: &str| crate::find(id).and_then(|c| c.shortcut);
+        assert_eq!((key("camera.perspective"), key("camera.orthographic")), (Some("F5"), Some("F6")));
     }
 
     #[test]

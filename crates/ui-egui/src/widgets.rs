@@ -29,15 +29,16 @@ pub fn slider_edit(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::R
     slider_inner(ui, label, value, range, decimals).1
 }
 
-fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, decimals: usize) -> (Response, Option<bool>) {
+/// The row above a slider's track, `label` and `value` as a field to type in: the field's id, and `Some(false)` on the frame a typed value replaces `value`
+pub(crate) fn value_header(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, decimals: usize) -> (egui::Id, Option<bool>) {
+    const MIN_VALUE_WIDTH: f32 = 44.0;
     let tokens = Tokens::get(ui.ctx());
     let (minimum, maximum) = (*range.start(), *range.end());
-    let width = ui.available_width();
     let font = egui::TextStyle::Body.resolve(ui.style());
     let value_width = [minimum, maximum]
         .into_iter()
         .map(|bound| ui.painter().layout_no_wrap(format!("{bound:.decimals$}"), font.clone(), tokens.text).size().x)
-        .fold(44.0, f32::max);
+        .fold(MIN_VALUE_WIDTH, f32::max);
     let mut edit = None;
     let field = ui
         .horizontal(|ui| {
@@ -45,6 +46,7 @@ fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::Rang
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let id = ui.next_auto_id();
                 let shown = format!("{value:.decimals$}");
+
                 // Keep unfinished input while the document value is re-read each frame
                 let mut text = ui.data(|data| data.get_temp::<String>(id)).unwrap_or_else(|| shown.clone());
                 let response = ui.add(
@@ -59,6 +61,7 @@ fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::Rang
                     ui.data_mut(|data| data.insert_temp(id, text.clone()));
                 } else {
                     ui.data_mut(|data| data.remove_temp::<String>(id));
+
                     // Escape can lose focus before the app consumes the key
                     let escape =
                         ui.input(|input| input.raw.events.iter().any(|event| matches!(event, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })));
@@ -78,7 +81,18 @@ fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::Rang
             .inner
         })
         .inner;
-    let (rect, mut response) = ui.allocate_exact_size(vec2(width, 14.0), Sense::click_and_drag());
+    (field, edit)
+}
+
+fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, decimals: usize) -> (Response, Option<bool>) {
+    const TRACK_HEIGHT: f32 = 14.0;
+    const TRACK_INSET: f32 = 5.0;
+    const TRACK_WIDTH: f32 = 2.0;
+    const KNOB_RADIUS: f32 = 4.5;
+    let (minimum, maximum) = (*range.start(), *range.end());
+    let width = ui.available_width();
+    let (field, mut edit) = value_header(ui, label, value, range, decimals);
+    let (rect, mut response) = ui.allocate_exact_size(vec2(width, TRACK_HEIGHT), Sense::click_and_drag());
     if response.is_pointer_button_down_on() {
         ui.data_mut(|data| data.remove_temp::<String>(field));
         ui.memory_mut(|memory| memory.surrender_focus(field));
@@ -89,11 +103,12 @@ fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::Rang
     if (response.dragged() || response.clicked())
         && let Some(pointer) = response.interact_pointer_pos()
     {
-        let fraction = ((pointer.x - rect.left() - 5.0) / (rect.width() - 10.0).max(1.0)).clamp(0.0, 1.0);
+        let fraction = ((pointer.x - rect.left() - TRACK_INSET) / (rect.width() - TRACK_INSET * 2.0).max(1.0)).clamp(0.0, 1.0);
         let next = minimum + (maximum - minimum) * fraction;
         if (next - *value).abs() > f32::EPSILON {
             *value = next;
             response.mark_changed();
+
             // Later frames of one drag share its undo step
             edit = Some(ui.data_mut(|data| std::mem::replace(data.get_temp_mut_or_default::<bool>(response.id), true)));
         }
@@ -103,7 +118,7 @@ fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::Rang
     }
 
     let fraction = if maximum > minimum { ((*value - minimum) / (maximum - minimum)).clamp(0.0, 1.0) } else { 0.0 };
-    track(ui, &response, rect.left() + 5.0..=rect.right() - 5.0, rect.center().y, fraction, 2.0, 4.5);
+    track(ui, &response, rect.left() + TRACK_INSET..=rect.right() - TRACK_INSET, rect.center().y, fraction, TRACK_WIDTH, KNOB_RADIUS);
     (response, edit)
 }
 
@@ -367,6 +382,7 @@ pub fn chip(ui: &mut Ui, text: &str, on: bool) -> Response {
     let galley = ui.painter().layout_no_wrap(text.into(), egui::FontId::proportional(11.0), tk.text);
     let size = vec2(galley.size().x + 14.0, 20.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, text));
     let p = ui.painter();
     let fill = if on {
         tk.tool_active

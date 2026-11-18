@@ -166,8 +166,9 @@ fn rgb(c: [f32; 3]) -> Source {
     Source::Uniform(c)
 }
 
+/// A pattern between colors `low` and `high` (short: the material catalog calls it on almost every line)
 fn pat(kind: ProceduralKind, scale: f32, seed: u32, contrast: f32, low: [f32; 3], high: [f32; 3]) -> Source {
-    Source::Procedural { pattern: Procedural { kind, scale, seed, contrast, balance: 0.0, invert: false }, low, high }
+    Source::Procedural { pattern: Procedural { scale, seed, contrast, ..Procedural::new(kind) }, low, high, ramp: Vec::new() }
 }
 
 /// A scalar pattern between `lo` and `hi`.
@@ -241,7 +242,8 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
     use ProceduralKind as P;
     let m = find(id).ok_or_else(|| EngineError::Other(format!("unknown material `{id}`")))?;
     let one = |b: &mut Builder, s: Sources| -> Result<Vec<Layer>> { Ok(vec![b.fill(m.label, s)]) };
-    // A simple metal: subtle cloudy tone and roughness variation around the table values.
+
+    // A simple metal: subtle cloudy tone and roughness variation around the table values
     let plain_metal = |b: &mut Builder, rough: Source| {
         let lo = m.base.map(|v| v * 0.94);
         one(b, metal(pat(P::Clouds, 3.0, 5, 1.0, lo, m.base), rough))
@@ -253,9 +255,11 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
         "steel" | "steel_dark" | "iron" | "copper" | "brass" | "bronze" | "gold_polished" | "silver" | "aluminium" | "chrome" | "nickel" | "platinum"
         | "cobalt" => plain_metal(b, clouds_rough(7)),
         "steel_stainless" | "aluminium_brushed" | "titanium" => plain_metal(b, gray(P::Brushed, 3.0, 3, r * 0.75, r * 1.25)),
-        // Zinc plate: large crystalline spangles.
+
+        // Zinc plate: large crystalline spangles
         "zinc" => one(b, metal(pat(P::Voronoi, 6.0, 21, 1.0, m.base.map(|v| v * 0.8), m.base), gray(P::Voronoi, 6.0, 21, r * 1.5, r * 0.6))),
-        // Brushing lines run along X; the highlights stretch across them (a quarter turn).
+
+        // Brushing lines run along X; the highlights stretch across them (a quarter turn)
         "steel_brushed_aniso" => one(
             b,
             plus(
@@ -274,7 +278,8 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
                 height(gray(P::Hammered, 6.0, 1, -0.04, 0.0)),
             ),
         ),
-        // Iron oxide is a dielectric: rough, pitted, blotchy orange-brown.
+
+        // Iron oxide is a dielectric: rough, pitted, blotchy orange-brown
         "rust" => one(
             b,
             plus(
@@ -292,14 +297,17 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
         "sandstone" => {
             one(b, plus(dielectric(pat(P::Noise, 4.0, 13, 1.0, [0.42, 0.3, 0.18], [0.6, 0.45, 0.28]), u(0.9)), height(gray(P::Perlin, 6.0, 13, -0.01, 0.0))))
         }
-        // Stone chips in a pale binder, polished flat.
+
+        // Stone chips in a pale binder, polished flat
         "terrazzo" => one(b, dielectric(pat(P::Voronoi, 18.0, 9, 1.0, [0.55, 0.55, 0.53], [0.85, 0.84, 0.8]), gray(P::Voronoi, 18.0, 9, 0.34, 0.26))),
-        // Fine grains in soft wind ripples.
+
+        // Fine grains in soft wind ripples
         "sand" => one(
             b,
             plus(dielectric(pat(P::Noise, 12.0, 27, 1.0, [0.42, 0.32, 0.19], [0.6, 0.48, 0.31]), u(0.95)), height(gray(P::Perlin, 4.0, 27, -0.012, 0.0))),
         ),
-        // Glossy wet patches over rougher, drier mud.
+
+        // Glossy wet patches over rougher, drier mud
         "mud" => one(
             b,
             plus(
@@ -307,7 +315,8 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
                 height(gray(P::Clouds, 3.0, 29, -0.03, 0.0)),
             ),
         ),
-        // Rounded stones with deep joints between them.
+
+        // Rounded stones with deep joints between them
         "cobblestone" => one(
             b,
             plus(
@@ -315,7 +324,8 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
                 height(gray(P::Cells, 6.0, 37, 0.0, -0.05)),
             ),
         ),
-        // Small loose stones of mixed tones.
+
+        // Small loose stones of mixed tones
         "gravel" => one(
             b,
             plus(
@@ -323,7 +333,8 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
                 height(gray(P::Cells, 30.0, 39, -0.03, 0.0)),
             ),
         ),
-        // Troweled wall: soft patches and a fine sandy tooth.
+
+        // Troweled wall: soft patches and a fine sandy tooth
         "plaster" => one(
             b,
             plus(
@@ -331,7 +342,8 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
                 height(gray(P::Clouds, 2.0, 41, -0.008, 0.0)),
             ),
         ),
-        // Low cushions of tiny leaves.
+
+        // Low cushions of tiny leaves
         "moss" => one(
             b,
             plus(
@@ -347,6 +359,7 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
             plus(dielectric(pat(P::Clouds, 8.0, 19, 1.0, [0.78, 0.77, 0.73], [0.86, 0.85, 0.81]), u(0.92)), height(gray(P::Noise, 1.0, 19, -0.002, 0.0))),
         ),
         "galvanized" => one(b, metal(pat(P::Voronoi, 10.0, 4, 1.0, [0.6, 0.62, 0.63], [0.78, 0.8, 0.81]), gray(P::Voronoi, 10.0, 4, 0.5, 0.28))),
+
         // ---- Woods (grain along X, rings across Y) ---------------------------------------------
         "wood" => one(
             b,
@@ -374,12 +387,14 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
             ),
         ),
         "plywood" => one(b, dielectric(pat(P::Wood, 1.2, 15, 0.6, [0.42, 0.27, 0.13], [0.66, 0.47, 0.27]), gray(P::Wood, 1.2, 15, 0.8, 0.7))),
-        // Dark, deep furrows between gray-brown ridges.
+
+        // Dark, deep furrows between gray-brown ridges
         "bark" => one(
             b,
             plus(dielectric(pat(P::Streaks, 8.0, 25, 1.4, [0.13, 0.105, 0.08], [0.03, 0.022, 0.015]), u(0.9)), height(gray(P::Streaks, 8.0, 25, 0.0, -0.06))),
         ),
-        // Pale, fine and even grain.
+
+        // Pale, fine and even grain
         "wood_maple" => one(
             b,
             plus(
@@ -387,7 +402,8 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
                 height(gray(P::Wood, 3.0, 31, -0.006, 0.0)),
             ),
         ),
-        // Reddish heartwood with a satin finish.
+
+        // Reddish heartwood with a satin finish
         "wood_cherry" => one(
             b,
             plus(
@@ -395,7 +411,8 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
                 height(gray(P::Wood, 2.2, 33, -0.008, 0.0)),
             ),
         ),
-        // Long straight fibres with a few raised ridges.
+
+        // Long straight fibres with a few raised ridges
         "bamboo" => one(
             b,
             plus(
@@ -410,6 +427,7 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
                 height(gray(P::Wood, 2.0, 7, -0.015, 0.0)),
             ),
         ),
+
         // ---- Stone, masonry, earth ----------------------------------------------------------
         "concrete" => one(
             b,
@@ -446,11 +464,13 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
             b,
             plus(dielectric(pat(P::Clouds, 5.0, 2, 1.0, [0.4, 0.15, 0.07], [0.5, 0.21, 0.11]), clouds_rough(2)), height(gray(P::Noise, 0.8, 3, -0.005, 0.005))),
         ),
+
         // ---- Plastics, rubber, composites ---------------------------------------------------
         "plastic_glossy" | "plastic_matte" | "ceramic" => one(b, dielectric(rgb(m.base), clouds_rough(9))),
         "plastic_textured" => one(b, plus(dielectric(rgb(m.base), gray(P::Leather, 40.0, 5, 0.66, 0.5)), height(gray(P::Leather, 40.0, 5, -0.01, 0.0)))),
         "rubber" => one(b, dielectric(pat(P::Noise, 0.5, 3, 1.0, [0.025; 3], [0.035; 3]), gray(P::Noise, 0.5, 3, 0.84, 0.94))),
-        // Twill-woven tows under a clear coat: the warp catches the light, the weft stays dark.
+
+        // Twill-woven tows under a clear coat: the warp catches the light, the weft stays dark
         "carbon_fiber" => one(
             b,
             plus(
@@ -458,19 +478,23 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
                 [(CoatWeight, u(1.0)), (CoatRoughness, u(r * 0.2)), (Height, gray(P::Twill, 12.0, 1, 0.0, 0.002))],
             ),
         ),
+
         // ---- Fabric and leather -------------------------------------------------------------
         "fabric" => {
             one(b, plus(dielectric(pat(P::Weave, 18.0, 2, 1.0, [0.27, 0.29, 0.34], [0.6, 0.62, 0.7]), u(r)), height(gray(P::Weave, 18.0, 2, -0.01, 0.0))))
         }
-        // Indigo twill: diagonal ribs.
+
+        // Indigo twill: diagonal ribs
         "denim" => {
             one(b, plus(dielectric(pat(P::Twill, 22.0, 5, 1.0, [0.015, 0.025, 0.07], [0.15, 0.2, 0.38]), u(r)), height(gray(P::Twill, 22.0, 5, -0.01, 0.0))))
         }
-        // Coarse, slubby plain weave.
+
+        // Coarse, slubby plain weave
         "linen" => {
             one(b, plus(dielectric(pat(P::Weave, 30.0, 45, 1.0, [0.58, 0.52, 0.42], [0.8, 0.74, 0.62]), u(r)), height(gray(P::Weave, 30.0, 45, -0.006, 0.0))))
         }
-        // Fuzzy knit: no visible threads, a soft sheen at grazing angles.
+
+        // Fuzzy knit: no visible threads, a soft sheen at grazing angles
         "wool" => one(
             b,
             plus(
@@ -495,11 +519,12 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
         "velvet" => one(
             b,
             plus(
-                // A pile, not a weave: soft crushed patches under a bright sheen.
+                // A pile, not a weave: soft crushed patches under a bright sheen
                 dielectric(pat(P::Clouds, 3.0, 3, 1.0, [0.06, 0.006, 0.045], m.base), u(r)),
                 [(SheenWeight, u(1.0)), (SheenColor, rgb([0.95, 0.55, 0.85])), (SheenRoughness, u(0.35)), (Height, gray(P::Noise, 1.0, 3, -0.002, 0.0))],
             ),
         ),
+
         // ---- Coated and translucent ---------------------------------------------------------
         "car_paint" => one(
             b,
@@ -516,14 +541,17 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
             ),
         ),
         "wax" => one(b, plus(dielectric(pat(P::Clouds, 2.0, 11, 1.0, [0.74, 0.66, 0.5], m.base), clouds_rough(11)), [(ScatterWeight, u(1.0))])),
+
         // ---- Glass (the Transmission channel; the base color tints the light going through) ----
         "glass" => one(b, plus(dielectric(rgb(m.base), u(r)), [(Transmission, u(1.0))])),
-        // Clear with cloudy patches of trapped air.
+
+        // Clear with cloudy patches of trapped air
         "ice" => one(
             b,
             plus(dielectric(pat(P::Clouds, 4.0, 31, 1.0, m.base, [0.84, 0.88, 0.9]), clouds_rough(31)), [(Transmission, gray(P::Clouds, 4.0, 31, 0.9, 0.5))]),
         ),
-        // Bright, rough and slightly translucent.
+
+        // Bright, rough and slightly translucent
         "snow" => one(
             b,
             plus(
@@ -531,7 +559,8 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
                 [(ScatterWeight, u(0.5)), (Height, gray(P::Perlin, 3.0, 33, -0.02, 0.0))],
             ),
         ),
-        // Porous, ivory to tan, with a little light under the surface.
+
+        // Porous, ivory to tan, with a little light under the surface
         "bone" => one(
             b,
             plus(
@@ -540,6 +569,7 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
             ),
         ),
         "glass_frosted" => one(b, plus(dielectric(rgb(m.base), gray(P::Noise, 1.0, 2, 0.4, 0.5)), [(Transmission, u(1.0))])),
+
         // ---- Smart materials ----------------------------------------------------------------
         "steel_painted_worn" => {
             let mut v = build(b, "steel")?;
@@ -715,6 +745,47 @@ pub(crate) fn build(b: &mut Builder, id: &str) -> Result<Vec<Layer>> {
     }
 }
 
+/// The channel sources of simple material `id`: its single, unmasked fill layer. `None` for smart
+/// materials (several layers, or a masked layer) and for unknown ids: a brush paints one fill's
+/// sources, so those stay layers.
+pub fn brush_sources(id: &str) -> Option<Vec<(Channel, Source)>> {
+    let m = find(id).filter(|m| !m.smart)?;
+    let mut scratch = Project::new("", "");
+    let layers = build(&mut Builder { p: &mut scratch, channels: Channel::LOBES.to_vec() }, m.id).ok()?;
+    let [layer] = layers.as_slice() else { return None };
+    let LayerKind::Fill(fill) = &layer.kind else { return None };
+    if layer.mask.is_some() {
+        return None;
+    }
+
+    Some(fill.sources.iter().map(|(channel, source)| (*channel, source.clone())).collect())
+}
+
+/// The brush's plain values for simple material `id`, one per channel it sets (what the tool's
+/// material shows): a pattern counts as the middle between its two values. `None` as
+/// [`brush_sources`].
+pub fn brush_values(id: &str) -> Option<Vec<(Channel, [f32; 3])>> {
+    let mean = |low: &[f32; 3], high: &[f32; 3]| std::array::from_fn(|i| (low[i] + high[i]) * 0.5);
+    Some(
+        brush_sources(id)?
+            .into_iter()
+            .filter_map(|(channel, source)| match source {
+                Source::Uniform(value) => Some((channel, value)),
+                Source::Procedural { low, high, .. } => Some((channel, mean(&low, &high))),
+                Source::Image { .. } | Source::Anchor { .. } => None,
+            })
+            .collect(),
+    )
+}
+
+/// The fill a brush material paints through, as a layer: `sources` projected tri-planar at
+/// `scale` (the same fill evaluation a layer with that material uses).
+pub(crate) fn brush_fill(id: LayerId, sources: Vec<(Channel, Source)>, scale: f32) -> Layer {
+    let channels: Vec<Channel> = sources.iter().map(|(channel, _)| *channel).collect();
+    let projection = Projection::Triplanar { scale, sharpness: 8.0, offset: [0.0; 3] };
+    Layer::new(id, "Brush material", LayerKind::Fill(Fill { sources: sources.into_iter().collect(), projection, link: None }), &channels)
+}
+
 /// Where [`apply_at`] puts a material.
 #[derive(Clone, Copy, Debug)]
 pub enum Place {
@@ -724,6 +795,10 @@ pub enum Place {
     Above(LayerId, bool),
     /// At this index of the top-level stack (0 = bottom).
     Index(usize),
+    /// Directly below a layer, in the same stack or folder (a shelf drop on a layer row).
+    Below(LayerId),
+    /// At the top of the top-level stack (a shelf drop on the 3D or 2D view).
+    Top,
 }
 
 /// Add material `id` above the selection: a single fill layer, or a folder for multi-layer
@@ -739,7 +814,8 @@ pub fn apply_at(s: &mut Session, id: &str, place: Place) -> Result<LayerId> {
     s.edit(&label, |s| {
         let ts = s.ts();
         let mut channels = s.doc.project.texture_set(ts)?.channel_list();
-        // Lobe channels the material uses join the texture set (other channels it lacks are skipped).
+
+        // Lobe channels the material uses join the texture set (other channels it lacks are skipped)
         let missing: Vec<Channel> = Channel::LOBES.into_iter().filter(|c| !channels.contains(c)).collect();
         let layers = build(&mut Builder { p: &mut s.doc.project, channels: [channels.clone(), missing.clone()].concat() }, m.id)?;
         for c in missing.into_iter().filter(|c| layers.iter().any(|l| l.channels.contains_key(c))) {
@@ -759,7 +835,7 @@ pub fn apply_at(s: &mut Session, id: &str, place: Place) -> Result<LayerId> {
             for l in layers {
                 s.doc.project.insert_layer(ts, l, Some(gid), true)?;
             }
-            s.selected.insert(ts, gid);
+            s.select_one(ts, gid);
             gid
         };
         place.apply(s, top)?;
@@ -770,10 +846,12 @@ pub fn apply_at(s: &mut Session, id: &str, place: Place) -> Result<LayerId> {
 impl Place {
     /// From `above` (+ `inside`) or `index` params; the selection by default.
     pub(crate) fn from_params(p: &serde_json::Value) -> Place {
-        match (crate::commands::u64p(p, "above"), crate::commands::u64p(p, "index")) {
-            (Some(above), _) => Place::Above(LayerId(above), crate::commands::boolp(p, "inside").unwrap_or(false)),
-            (None, Some(i)) => Place::Index(usize::try_from(i).unwrap_or(usize::MAX)),
-            (None, None) => Place::Selection,
+        match (crate::commands::u64p(p, "above"), crate::commands::u64p(p, "below"), crate::commands::u64p(p, "index")) {
+            (Some(above), _, _) => Place::Above(LayerId(above), crate::commands::boolp(p, "inside").unwrap_or(false)),
+            (None, Some(below), _) => Place::Below(LayerId(below)),
+            (None, None, Some(i)) => Place::Index(usize::try_from(i).unwrap_or(usize::MAX)),
+            (None, None, None) if crate::commands::boolp(p, "top") == Some(true) => Place::Top,
+            (None, None, None) => Place::Selection,
         }
     }
 
@@ -786,6 +864,13 @@ impl Place {
                 s.doc.project.move_above(top, None, false)?;
                 s.doc.project.move_layer(top, i)?;
             }
+            Place::Below(target) => {
+                s.doc.project.move_above(top, Some(target), false)?;
+                if let Some((_, _, index)) = s.doc.project.locate(top) {
+                    s.doc.project.move_layer(top, index.saturating_sub(1))?;
+                }
+            }
+            Place::Top => s.doc.project.move_above(top, None, false)?,
         }
         Ok(())
     }

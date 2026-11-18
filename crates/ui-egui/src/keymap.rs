@@ -1,4 +1,4 @@
-//! Keyboard shortcuts: every menu item and every command with a default shortcut, the user's
+//! Keyboard shortcuts: every menu item and every command a key can run, the user's
 //! overrides (`UiState::keymap`, id → "Ctrl+Shift+E" or "" for unbound), conflict detection and
 //! the shortcut editor window (Edit ▸ Settings ▸ Keyboard, Help ▸ Shortcuts list).
 
@@ -26,7 +26,21 @@ pub struct Binding {
     pub default: Option<&'static str>,
 }
 
-/// Every bindable item: the menu catalog, then commands with a default shortcut.
+/// The menu a command without a menu entry is listed under, from its id.
+fn group_of(id: &str) -> &'static str {
+    match id.split('.').next().unwrap_or("") {
+        "layer" | "mask" | "effect" | "material" | "textureSet" => "Layers",
+        "tool" | "brush" | "alpha" | "text" => "Tools",
+        "camera" | "viewport" => "Viewport",
+        "file" | "project" | "export" | "resource" => "File",
+        "edit" => "Edit",
+        "bake" => "Mode",
+        _ => "Commands",
+    }
+}
+
+/// Every bindable item: the menu catalog, then every command that has a default shortcut or that
+/// a key can run (see [`texturecraft_engine::CommandSpec::bindable`]).
 pub fn bindings() -> &'static [Binding] {
     static ALL: std::sync::OnceLock<Vec<Binding>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
@@ -36,9 +50,9 @@ pub fn bindings() -> &'static [Binding] {
                 v.push(Binding { id: i.id, group: i.menu, label: i.label, default: i.shortcut });
             }
         }
-        for c in texturecraft_engine::command_specs().iter().filter(|c| c.shortcut.is_some()) {
+        for c in texturecraft_engine::command_specs().iter().filter(|c| c.shortcut.is_some() || c.bindable()) {
             if !v.iter().any(|b| b.id == c.id) {
-                v.push(Binding { id: c.id, group: c.menu.first().copied().unwrap_or("Commands"), label: c.label, default: c.shortcut });
+                v.push(Binding { id: c.id, group: c.menu.first().copied().unwrap_or_else(|| group_of(c.id)), label: c.label, default: c.shortcut });
             }
         }
         v
@@ -270,6 +284,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if !app.ui.windows.shortcuts {
         return;
     }
+
     let capture_id = Id::unique(CAPTURE);
     let filter_id = Id::unique("keymap_filter");
     let mut capture: Option<usize> = ctx.data(|d| d.get_temp(capture_id));
@@ -312,6 +327,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
                     {
                         continue;
                     }
+
                     ui.horizontal(|ui| {
                         ui.label(tr(b.label));
                         ui.label(RichText::new(tr(b.group)).size(10.5).color(tk.text_dim));
@@ -350,21 +366,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
         });
         ui.add_space(4.0);
         section(ui, "keymap_nav", tr("Viewport and brush (fixed)"), false, |ui| {
-            egui::Grid::new("keymap_fixed").striped(true).show(ui, |ui| {
-                for (k, v) in [
-                    (tr("Alt + LMB drag"), tr("Orbit")),
-                    (tr("MMB drag / Alt + MMB"), tr("Pan")),
-                    (tr("Wheel / Alt + RMB drag"), tr("Zoom")),
-                    (tr("LMB"), tr("Paint with the current tool")),
-                    ("[ / ]", tr("Brush size down / up")),
-                    (tr("Shift + wheel"), tr("Brush size")),
-                    ("Esc", tr("Cancel the stroke")),
-                ] {
-                    ui.label(RichText::new(k).strong());
-                    ui.label(v);
-                    ui.end_row();
-                }
-            });
+            fixed_gestures_grid(ui);
         });
     });
     app.ui.windows.shortcuts = open;
@@ -384,6 +386,53 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
     });
 }
 
+/// The fixed gestures as a two-column grid (the "Viewport and brush" section of the shortcut window)
+pub fn fixed_gestures_grid(ui: &mut egui::Ui) {
+    egui::Grid::new("keymap_fixed").striped(true).show(ui, |ui| {
+        for (k, v) in fixed_gestures() {
+            ui.label(RichText::new(k).strong());
+            ui.label(v);
+            ui.end_row();
+        }
+    });
+}
+
+/// The mouse gestures and hold keys of the viewports, as (gesture, what it does) rows for the
+/// shortcut window. The hold keys come from the constants the viewport reads, so a rebound hold key
+/// is named from the same constant.
+pub fn fixed_gestures() -> Vec<(String, String)> {
+    let stencil = crate::viewport::STENCIL_KEY.name();
+    let clone = crate::viewport::CLONE_SOURCE_KEY.name();
+    let keyed = |template: &str| trf(template, &[("key", &stencil)]);
+    vec![
+        (tr("Alt + LMB drag").into(), tr("Orbit").into()),
+        (tr("RMB drag").into(), tr("Orbit (3D view)").into()),
+        (tr("MMB drag / Alt + MMB").into(), tr("Pan").into()),
+        (tr("Wheel / Alt + RMB drag").into(), tr("Zoom").into()),
+        (tr("Shift + RMB drag").into(), tr("Turn the environment light (3D view)").into()),
+        (tr("LMB").into(), tr("Paint with the current tool").into()),
+        (tr("Shift + LMB").into(), tr("Paint a straight line from where the last stroke ended").into()),
+        (tr("Ctrl + Shift + LMB").into(), tr("Draw snapped straight lines").into()),
+        ("[ / ]".into(), tr("Brush size down / up").into()),
+        (tr("Shift + wheel").into(), tr("Brush size").into()),
+        (tr("Ctrl + wheel").into(), tr("Brush size (wheel up smaller, down larger)").into()),
+        (tr("Ctrl + RMB drag").into(), tr("Brush size (left/right) and hardness (up/down)").into()),
+        (tr("Ctrl + LMB drag").into(), tr("Brush flow (left/right) and angle (up/down)").into()),
+        (tr("Ctrl + Shift + RMB drag").into(), tr("Brush size and hardness in fine steps").into()),
+        (keyed("{key} + LMB drag"), tr("Projection: rotate the stencil").into()),
+        (keyed("{key} + RMB drag"), tr("Projection: scale the stencil").into()),
+        (keyed("{key} + MMB drag"), tr("Projection: move the stencil").into()),
+        (trf("{key} + LMB", &[("key", &clone)]), tr("Clone: pick the point to copy from").into()),
+        (tr("Click (Path tool)").into(), tr("Path: add a point; on the curve it inserts one").into()),
+        (tr("LMB drag on a point (Path tool)").into(), tr("Path: move the point").into()),
+        (tr("Click the first point (Path tool)").into(), tr("Path: close it (needs 3 points)").into()),
+        ("Enter".into(), tr("Path: apply it with the brush").into()),
+        ("Backspace".into(), tr("Path: remove the selected or last point").into()),
+        ("Esc".into(), tr("Cancel the stroke").into()),
+        (tr("Esc (Path tool)").into(), tr("Path: cancel it").into()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +447,29 @@ mod tests {
         assert!(captured(Modifiers::NONE, Key::F8) && captured(Modifiers::ALT, Key::W));
         assert!(!captured(ctrl, Key::C) && !captured(ctrl, Key::V) && !captured(ctrl, Key::X), "clipboard keys reach the browser");
         assert!(!captured(Modifiers::NONE, Key::M) && !captured(Modifiers::NONE, Key::F), "plain keys need no capture");
+    }
+
+    #[test]
+    fn gesture_rows_name_the_hold_keys_and_cover_every_gesture() {
+        let rows = fixed_gestures();
+        let has = |gesture: &str, what: &str| rows.iter().any(|(g, w)| g == gesture && w.contains(what));
+        let (s, v) = (crate::viewport::STENCIL_KEY.name(), crate::viewport::CLONE_SOURCE_KEY.name());
+        assert!(has(&format!("{s} + LMB drag"), "rotate") && has(&format!("{s} + RMB drag"), "scale") && has(&format!("{s} + MMB drag"), "move"));
+        assert!(has(&format!("{v} + LMB"), "Clone"));
+        for (gesture, what) in [
+            ("Shift + LMB", "straight line"),
+            ("Shift + RMB drag", "environment light"),
+            ("Enter", "apply"),
+            ("Backspace", "remove"),
+            ("Esc (Path tool)", "cancel"),
+            ("Click the first point (Path tool)", "close"),
+            ("LMB drag on a point (Path tool)", "move"),
+            ("Click (Path tool)", "add a point"),
+        ] {
+            assert!(has(gesture, what), "no row {gesture} / {what}");
+        }
+        let mut seen = std::collections::HashSet::new();
+        assert!(rows.iter().all(|(g, w)| seen.insert((g.clone(), w.clone()))), "duplicate row");
     }
 
     #[test]
@@ -529,10 +601,12 @@ mod tests {
     #[test]
     fn a_stored_shortcut_replaces_the_default_and_an_empty_one_unbinds() {
         let mut keymap = Keymap::new();
-        keymap.insert("file.save".into(), "F5".into());
+
+        // F7 is bound to nothing else, so the stored shortcut alone decides (F5 is Perspective)
+        keymap.insert("file.save".into(), "F7".into());
         keymap.insert("edit.undo".into(), String::new());
         let resolved = bindings_for(&keymap);
-        assert_eq!(resolved.command_of(&press(Key::F5, Modifiers::NONE)).as_deref(), Some("file.save"));
+        assert_eq!(resolved.command_of(&press(Key::F7, Modifiers::NONE)).as_deref(), Some("file.save"));
         assert_eq!(resolved.command_of(&press(Key::S, Modifiers::COMMAND)), None);
         assert_eq!(resolved.command_of(&press(Key::Z, Modifiers::COMMAND)), None);
     }
@@ -544,6 +618,60 @@ mod tests {
         let cmd = Modifiers { mac_cmd: true, command: true, ..Modifiers::NONE };
         assert_eq!(resolved.command_of(&press(Key::S, cmd)).as_deref(), Some("file.save"));
         assert_eq!(resolved.command_of(&press(Key::S, Modifiers::CTRL)), None, "the Control key is another key");
+    }
+
+    #[test]
+    fn commands_without_a_default_key_are_listed_unbound_and_filtered_by_their_parameters() {
+        for id in ["layer.add.fill", "layer.add.paint", "layer.add.group", "mask.invert", "layer.visible"] {
+            let b = binding(id);
+            assert!(b.default.is_none() && shortcut(&Keymap::new(), b).is_none(), "{id} is listed without a key");
+        }
+        assert_eq!(binding("mask.invert").group, "Layers");
+        for id in ["textureSet.select", "layer.rename", "tool.select", "layer.list", "project.inspect"] {
+            assert!(bindings().iter().all(|b| b.id != id), "{id} cannot run from a key");
+        }
+        let ids: Vec<_> = bindings().iter().map(|b| b.id).collect();
+        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), unique.len(), "every id is listed once");
+    }
+
+    #[test]
+    fn every_listed_item_is_implemented() {
+        for b in bindings() {
+            assert!(crate::menus::implemented(b.id), "{} is listed but nothing runs it", b.id);
+        }
+    }
+
+    #[test]
+    fn a_command_without_a_default_key_can_be_bound_unbound_and_conflicts() {
+        let (invert, save) = (binding("mask.invert"), binding("file.save"));
+        let mut keymap = Keymap::new();
+        rebind(&mut keymap, invert, "Ctrl+Alt+I");
+        assert_eq!(shortcut_of(&keymap, "mask.invert"), Some("Ctrl+Alt+I"));
+        let resolved = bindings_for(&keymap);
+        assert_eq!(resolved.command_of(&press(Key::I, Modifiers::COMMAND | Modifiers::ALT)).as_deref(), Some("mask.invert"));
+        assert!(resolved.conflict(invert).is_none());
+
+        // Taking the key of a default shortcut is a conflict, on both items
+        rebind(&mut keymap, invert, "Ctrl+S");
+        let resolved = bindings_for(&keymap);
+        assert_eq!(resolved.conflict(invert).map(|b| b.id), Some("file.save"));
+        assert_eq!(resolved.conflict(save).map(|b| b.id), Some("mask.invert"));
+
+        // Unbinding drops the override of an item that has no default
+        rebind(&mut keymap, invert, "");
+        assert_eq!(shortcut_of(&keymap, "mask.invert"), None);
+        assert!(bindings_for(&keymap).conflict(save).is_none());
+    }
+
+    #[test]
+    fn a_saved_keymap_from_before_every_command_was_bindable_still_loads() {
+        let old: Keymap = serde_json::from_str(r#"{"file.save":"F5","edit.undo":"","ui.layout.3d":"Ctrl+Shift+H"}"#).unwrap();
+        let resolved = bindings_for(&old);
+        assert_eq!(resolved.command_of(&press(Key::F5, Modifiers::NONE)).as_deref(), Some("file.save"));
+        assert_eq!(resolved.command_of(&press(Key::Z, Modifiers::COMMAND)), None);
+        assert_eq!(shortcut_of(&old, "ui.layout.3d"), Some("Ctrl+Shift+H"));
+        assert_eq!(shortcut_of(&old, "mask.invert"), None);
     }
 
     #[test]

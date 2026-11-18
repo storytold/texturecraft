@@ -40,18 +40,37 @@ pub struct LayerPanel {
     service: ThumbService,
     textures: HashMap<ThumbTarget, (u64, TextureHandle, u64)>,
     frame: u64,
+    /// Whether this frame's pictures are begun and not yet finished by [`LayerPanel::end`]
+    pictures_begun: bool,
     /// Folded effect groups: (layer, true for the mask's). A view setting; the document is not touched.
     pub(crate) folded: HashSet<(u64, bool)>,
 }
 
+/// How soon to look again for pictures still rendering (milliseconds)
+const POLL_INTERVAL_MS: u64 = 40;
+
 impl LayerPanel {
     /// Start drawing the panel for this frame.
     pub(crate) fn begin(&mut self, session: &Session, now: f64) {
-        self.frame += 1;
-        self.service.begin_frame(session, now);
+        self.begin_pictures(session, now);
 
         // Deleted layer IDs must not accumulate in panel state
         self.folded.retain(|(layer, _)| session.doc.project.layers.contains_key(&texturecraft_engine::core::LayerId(*layer)));
+    }
+
+    /// Advance the picture frame once, whether the panel or a picture outside it asks first
+    fn begin_pictures(&mut self, session: &Session, now: f64) {
+        if !self.pictures_begun {
+            self.pictures_begun = true;
+            self.frame += 1;
+            self.service.begin_frame(session, now);
+        }
+    }
+
+    /// The texture of `target` for a picture outside the panel (a fill source slot, a source picker's anchor points), which renders while the panel is hidden too
+    pub(crate) fn texture_outside(&mut self, ctx: &Context, session: &Session, target: ThumbTarget) -> Option<TextureId> {
+        self.begin_pictures(session, ctx.input(|input| input.time));
+        self.texture(ctx, session, target)
     }
 
     /// The texture of `target`, queuing its render (call only for rows that are on screen).
@@ -72,10 +91,14 @@ impl LayerPanel {
         Some(id)
     }
 
-    /// Finish the frame: collect pictures and ask for another frame while work is outstanding.
+    /// Finish the frame once everything shown has asked for its pictures: collect them, start the missing ones and ask for another frame while work is outstanding
     pub(crate) fn end(&mut self, ctx: &Context, session: &Session) {
+        if !std::mem::take(&mut self.pictures_begun) {
+            return;
+        }
+
         if self.service.poll(session) {
-            ctx.request_repaint_after(Duration::from_millis(40));
+            ctx.request_repaint_after(Duration::from_millis(POLL_INTERVAL_MS));
         }
         if self.textures.len() > CACHE_ENTRIES * 2 {
             let frame = self.frame;
@@ -111,6 +134,57 @@ mod tests {
     }
 
     #[test]
+    fn a_picture_outside_the_panel_renders_while_the_panel_is_hidden() {
+        // Long enough for the render worker on a busy machine
+        const ATTEMPTS: usize = 500;
+        const WAIT: Duration = Duration::from_millis(10);
+        let session = Session::new_project("thumb", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        let target = ThumbTarget::Content { layer: session.selected_layer().unwrap(), channel: Channel::BaseColor };
+        let context = Context::default();
+        let mut panel = LayerPanel::default();
+
+        // The panel never begins a frame: only the outside picture asks
+        let picture = (0..ATTEMPTS).find_map(|_| {
+            let picture = panel.texture_outside(&context, &session, target);
+            panel.end(&context, &session);
+            if picture.is_none() {
+                std::thread::sleep(WAIT);
+            }
+            picture
+        });
+
+        assert!(picture.is_some(), "the picture renders without the Layers panel");
+    }
+
+    #[test]
+    fn outside_pictures_release_old_textures_while_the_panel_is_hidden() {
+        let session = Session::new_project("thumb", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        let context = Context::default();
+        let initial_textures = context.tex_manager().read().num_allocated();
+        let mut panel = LayerPanel::default();
+
+        // Outside pictures begin frames even when the Layers panel never does
+        let missing = ThumbTarget::Content { layer: LayerId(u64::MAX), channel: Channel::BaseColor };
+        panel.texture_outside(&context, &session, missing);
+        for index in 0..CACHE_ENTRIES * 2 + 1 {
+            let target = ThumbTarget::Content { layer: LayerId(index as u64), channel: Channel::BaseColor };
+            let image = egui::ColorImage::filled([64, 64], egui::Color32::WHITE);
+            let texture = context.load_texture("layer-thumb", image, TextureOptions::LINEAR);
+            panel.textures.insert(target, (1, texture, panel.frame));
+        }
+        assert_eq!(context.tex_manager().read().num_allocated(), initial_textures + CACHE_ENTRIES * 2 + 1);
+        panel.end(&context, &session);
+
+        for _ in 0..2 {
+            panel.texture_outside(&context, &session, missing);
+            panel.end(&context, &session);
+        }
+
+        assert_eq!(panel.textures.len(), 0, "old outside pictures should leave the GPU cache");
+        assert_eq!(context.tex_manager().read().num_allocated(), initial_textures);
+    }
+
+    #[test]
     fn evicted_and_dropped_thumbnail_handles_release_textures() {
         let session = Session::new_project("thumb", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
         let context = Context::default();
@@ -128,7 +202,9 @@ mod tests {
             panel.textures.insert(target, (1, texture, panel.frame));
         }
         let kept = evicted.pop().unwrap();
+        panel.end(&context, &session);
         panel.begin(&session, 1.0);
+        panel.end(&context, &session);
         panel.begin(&session, 2.0);
         panel.textures.values_mut().find(|(_, texture, _)| texture.id() == kept).unwrap().2 = panel.frame;
         panel.end(&context, &session);

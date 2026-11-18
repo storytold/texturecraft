@@ -2,11 +2,15 @@
 //! per-channel blending and fill sources.
 
 use serde_json::{Value, json};
-use texturecraft_core::{BlendMode, Channel, ChannelBlend, EffectKind, Fill, Layer, LayerId, LayerKind, Procedural, ProceduralKind, Projection, Source};
+use texturecraft_core::{
+    BlendMode, Channel, ChannelBlend, ChannelKind, EffectKind, Fill, Layer, LayerId, LayerKind, NormalFormat, Procedural, ProceduralKind, Project, Projection,
+    Source,
+};
 
 use crate::commands::{
     CommandSpec, always, bad, blend_param, boolp, channel_param, color_param, content_param, f32p, has_layer, layer_param, normal_format_param, strp, u64p,
 };
+use crate::layer_selection::{batch_param, ids_json};
 use crate::{EngineError, Result, Session, cmd, session::StackTarget};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -14,20 +18,77 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("layer.add.paint", "Add paint layer", ["Layers"], None, "{name?}", always, add_paint),
         cmd!("layer.add.fill", "Add fill layer", ["Layers"], None, "{name?, color?, roughness?, metallic?}", always, add_fill),
         cmd!("layer.add.group", "Add folder", ["Layers"], None, "{name?}", always, add_group),
-        cmd!("layer.remove", "Remove layer(s)", ["Layers"], Some("Delete"), "{layer?}", has_layer, remove),
-        cmd!("layer.duplicate", "Duplicate layer(s)", ["Layers"], Some("Ctrl+D"), "{layer?}", has_layer, duplicate),
-        cmd!("layer.group", "Group layer(s)", ["Layers"], Some("Ctrl+G"), "{layer?}", has_layer, group),
-        cmd!("layer.select", "Select layer", [], None, "{layer, target?: content|mask|<effect id>}", always, select),
+        cmd!(
+            "layer.remove",
+            "Remove layer(s)",
+            ["Layers"],
+            Some("Delete"),
+            "{layer?, layers?: [id] (wins over `layer`)} — default: every selected layer",
+            has_layer,
+            remove
+        ),
+        cmd!(
+            "layer.duplicate",
+            "Duplicate layer(s)",
+            ["Layers"],
+            Some("Ctrl+D"),
+            "{layer?, layers?: [id] (wins over `layer`)} — default: every selected layer",
+            has_layer,
+            duplicate
+        ),
+        cmd!(
+            "layer.group",
+            "Group layer(s)",
+            ["Layers"],
+            Some("Ctrl+G"),
+            "{layer?, layers?: [id] (wins over `layer`)} — default: every selected layer",
+            has_layer,
+            group
+        ),
+        cmd!(
+            "layer.select",
+            "Select layer",
+            [],
+            None,
+            "{layer, target?: content|mask|<effect id>} | {layer, toggle: true} (Ctrl+click: add or take out one layer) | {layer, range: true} (Shift+click: the rows from the last clicked layer) | {all: true} (Ctrl+A: every shown row of the active texture set, folder rows and the layers of open folders included) | {layers: [id], layer?} (select several; `layer` is the active one)",
+            always,
+            select
+        ),
         cmd!("layer.rename", "Rename layer", [], None, "{layer?, name}", has_layer, rename),
-        cmd!("layer.visible", "Toggle layer visibility", [], None, "{layer?, visible?}", has_layer, visible),
-        cmd!("layer.move", "Move layer", [], None, "{layer?, index?} | {layer?, above?: id|null, inside?: bool} | {layer?, delta: ±n}", has_layer, move_layer),
+        cmd!(
+            "layer.visible",
+            "Toggle layer visibility",
+            [],
+            None,
+            "{layer?, layers?: [id], visible?} — default: every selected layer; with `layers`, `layer` is the one the others follow",
+            has_layer,
+            visible
+        ),
+        cmd!(
+            "layer.move",
+            "Move layer",
+            [],
+            None,
+            "{layer? | layers?: [id], index?} | {layer? | layers?: [id], above?: id|null, inside?: bool} | {layer?, delta: ±n}",
+            has_layer,
+            move_layer
+        ),
         cmd!("layer.blend", "Set channel blending", [], None, "{layer?, channel?: id|all, mode?, opacity?: 0..1, enabled?}", has_layer, blend),
+        cmd!(
+            "layer.blending.set",
+            "Set blending of several channels",
+            [],
+            None,
+            "{layer?, channels: {<channel id>: {mode?, opacity?: 0..1}}} (only channels the layer has enabled; one undo step)",
+            has_layer,
+            blending_set
+        ),
         cmd!(
             "layer.fill.set",
             "Set fill source",
             [],
             None,
-            "{layer? | effect?: content fill effect id, channel, color?|value?|procedural?: kind, scale?, seed?, contrast?, balance?, invert?, low?, high?|image?, normalFormat?: openGl|directX (the image's normal map convention; alone, it changes the channel's image)|anchor?: anchor effect id, anchorChannel?, enabled?, solo?: true (this channel on, every other one off)}",
+            "{layer? | effect?: content fill effect id, channel, color?|value?|procedural?: kind, scale?, seed?, contrast?, balance?, invert?, low?, high?, resolution?: auto|textureSet|uvTile|custom, customResolution?, resolutionFactor?: -3..3, tile?: {Tile Generator settings in camelCase, as project.inspect shows them}, tileDefaults?: true (alone, they edit the channel's pattern)|image?, normalFormat?: openGl|directX (the image's normal map convention; alone, it changes the channel's image)|anchor?: anchor effect id, anchorChannel?, colors?: gradient map of a color channel's procedural or anchor, 1 to 16 colors dark to light ([r, g, b] linear or \"#rrggbb\"; [] removes it; absent keeps it; alone, it changes the channel's source)|gradientMap?: true (turns the color stops on from the channel's current procedural or anchor: a procedural's low, their midpoint and high; an anchor's black, gray and white; stops already there stay), enabled?, solo?: true (this channel on, every other one off)}",
             has_layer,
             fill_set
         ),
@@ -51,7 +112,7 @@ pub(crate) fn insert_selected(s: &mut Session, layer: Layer) -> Result<LayerId> 
     let sel = s.selected_layer();
     let inside = sel.and_then(|id| s.doc.project.layer(id).ok()).is_some_and(|l| l.is_group());
     let id = s.doc.project.insert_layer(ts, layer, sel, inside)?;
-    s.selected.insert(ts, id);
+    s.select_one(ts, id);
     s.target = StackTarget::Content;
     Ok(id)
 }
@@ -110,45 +171,66 @@ fn add_group(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, "layer.remove", p)?;
+    let ids = batch_param(s, "layer.remove", p, true)?;
     let before = s.doc.clone();
     let removed = s.edit("Remove layer", |s| {
-        let (ts, parent, i) = s.doc.project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
-        let removed = s.doc.project.remove_layer(id)?;
-        // Instances of what was removed keep their look as independent layers.
+        let mut removed = Vec::new();
+
+        // Top row first, so the layer under the lowest removed one is never removed after it is chosen
+        for id in &ids {
+            let (ts, parent, i) = s.doc.project.locate(*id).ok_or(EngineError::Other("layer not in a stack".into()))?;
+            removed.extend(s.doc.project.remove_layer(*id)?);
+
+            // Select the layer below (or above) the removed one
+            let list = match parent {
+                Some(g) => s.doc.project.layer(g).map(|l| l.children().to_vec()).unwrap_or_default(),
+                None => s.doc.project.texture_set(ts).map(|t| t.stack.clone()).unwrap_or_default(),
+            };
+            let next = list.get(i.saturating_sub(1)).or(list.first()).copied().or(parent);
+            match next {
+                Some(n) => s.select_one(ts, n),
+                None => s.select_none(ts),
+            }
+        }
+
+        // Instances of what was removed keep their look as independent layers
         crate::instance_cmds::detach_orphans(s, &before)?;
-        // Select the layer below (or above) the removed one.
-        let list = match parent {
-            Some(g) => s.doc.project.layer(g).map(|l| l.children().to_vec()).unwrap_or_default(),
-            None => s.doc.project.texture_set(ts).map(|t| t.stack.clone()).unwrap_or_default(),
-        };
-        let next = list.get(i.saturating_sub(1)).or(list.first()).copied().or(parent);
-        match next {
-            Some(n) => s.selected.insert(ts, n),
-            None => s.selected.remove(&ts),
-        };
         Ok(removed)
     })?;
     Ok(json!({ "removed": removed.iter().map(|l| l.0).collect::<Vec<_>>() }))
 }
 
 fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, "layer.duplicate", p)?;
-    let (ts, _, _) = s.doc.project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
+    let ids = batch_param(s, "layer.duplicate", p, true)?;
+    let first = ids.first().copied().ok_or_else(|| bad("layer.duplicate", "no layer to duplicate"))?;
+    let (ts, _, _) = s.doc.project.locate(first).ok_or(EngineError::Other("layer not in a stack".into()))?;
     let src = s.doc.clone();
-    let new = s.edit("Duplicate layer", |s| {
-        let new = crate::layer_ops::copy_tree(&src, id, &mut s.doc, ts, Some(id), false, 0)?;
-        let name = format!("{} copy", src.project.layer(id)?.name);
-        s.doc.project.layer_mut(new)?.name = name;
-        Ok(new)
+    let copies = s.edit("Duplicate layer", |s| {
+        // Insert copies in order above the topmost selected layer, at its folder level
+        let mut copies = Vec::new();
+        let mut above = first;
+        for id in ids.iter().rev() {
+            let new = crate::layer_ops::copy_tree(&src, *id, &mut s.doc, ts, Some(above), false, 0)?;
+            let name = format!("{} copy", src.project.layer(*id)?.name);
+            s.doc.project.layer_mut(new)?.name = name;
+            copies.insert(0, new);
+            above = new;
+        }
+        Ok(copies)
     })?;
-    s.selected.insert(ts, new);
-    Ok(json!({ "layer": new.0 }))
+
+    // The copies are selected; the active layer's copy stays the active one
+    let active =
+        s.selected.get(&ts).and_then(|active| ids.iter().position(|id| id == active)).and_then(|i| copies.get(i)).or(copies.first()).copied().unwrap_or(first);
+    s.select_several(ts, active, active, copies.clone());
+    Ok(json!({ "layer": active.0, "layers": ids_json(&copies) }))
 }
 
 fn group(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, "layer.group", p)?;
+    let ids = batch_param(s, "layer.group", p, true)?;
     let g = s.edit("Group layers", |s| {
+        // The folder takes the top layer's place and parent; the others follow it in, in stack order
+        let id = ids.first().copied().ok_or_else(|| bad("layer.group", "no layer to group"))?;
         let (ts, _, _) = s.doc.project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
         let gid = s.doc.project.alloc_id();
         let name = s.doc.project.next_layer_name(ts, "Folder");
@@ -158,29 +240,51 @@ fn group(s: &mut Session, p: &Value) -> Result<Value> {
             b.mode = BlendMode::Passthrough;
         }
         s.doc.project.insert_layer(ts, gl, Some(id), false)?;
-        s.doc.project.move_above(id, Some(gid), true)?;
-        s.selected.insert(ts, gid);
+        move_stacked(&mut s.doc.project, &ids, Some(gid), true)?;
+        s.select_one(ts, gid);
         Ok(gid)
     })?;
     Ok(json!({ "layer": g.0 }))
 }
 
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
+    if boolp(p, "all") == Some(true) {
+        return crate::layer_selection::select_all(s);
+    }
+
+    if p.get("layers").is_some() {
+        return crate::layer_selection::select_list(s, p);
+    }
+
     let id = layer_param(s, "layer.select", p)?;
     let (ts, _, _) = s.doc.project.locate(id).ok_or_else(|| bad("layer.select", "layer not in a stack"))?;
 
     // Paths paint into the active set
     if ts != s.ts() {
         s.finish_path()?;
+
+        // The clone source is a point of the set it was picked in
+        s.tool.clone_source = None;
+    }
+
+    // Shift+click and Ctrl/Cmd+click select several layers, each on its content
+    let range = boolp(p, "range") == Some(true);
+    if range || boolp(p, "toggle") == Some(true) {
+        s.active_set = ts;
+        let active = crate::layer_selection::extend(s, ts, id, range);
+        s.target = StackTarget::Content;
+        s.revision = s.revision.wrapping_add(1);
+        return Ok(json!({ "layer": active.map(|active| active.0), "textureSet": ts, "layers": ids_json(&s.selected_layers()) }));
     }
 
     s.active_set = ts;
-    s.selected.insert(ts, id);
+    s.select_one(ts, id);
     s.target = match p.get("target") {
         Some(Value::String(t)) if t == "mask" => {
             if s.doc.project.layer(s.doc.project.mask_owner(id))?.mask.is_none() {
                 return Err(bad("layer.select", "the layer has no mask"));
             }
+
             StackTarget::Mask
         }
         Some(Value::String(t)) if t == "content" => StackTarget::Content,
@@ -192,7 +296,7 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
     };
 
     s.revision = s.revision.wrapping_add(1);
-    Ok(json!({ "layer": id.0, "textureSet": ts }))
+    Ok(json!({ "layer": id.0, "textureSet": ts, "layers": [id.0] }))
 }
 
 fn rename(s: &mut Session, p: &Value) -> Result<Value> {
@@ -209,33 +313,105 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn visible(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, "layer.visible", p)?;
+    let ids = batch_param(s, "layer.visible", p, false)?;
+
+    // Use the clicked layer as lead, then the active or top layer if absent
+    let lead = u64p(p, "layer")
+        .map(LayerId)
+        .filter(|lead| ids.contains(lead))
+        .or(s.selected_layer().filter(|active| ids.contains(active)))
+        .or(ids.first().copied())
+        .ok_or_else(|| bad("layer.visible", "no layer given"))?;
     let v = s.edit("Layer visibility", |s| {
-        let l = s.doc.project.layer_mut(id)?;
-        l.visible = boolp(p, "visible").unwrap_or(!l.visible);
-        Ok(l.visible)
+        let v = boolp(p, "visible").unwrap_or(!s.doc.project.layer(lead)?.visible);
+        for id in &ids {
+            s.doc.project.layer_mut(*id)?.visible = v;
+        }
+        Ok(v)
     })?;
     Ok(json!({ "visible": v }))
 }
 
+/// Move `ids` (top row first) above `target` (inside it when `inside`), keeping their order:
+/// the lowest goes first and each next one above it.
+fn move_stacked(project: &mut Project, ids: &[LayerId], target: Option<LayerId>, inside: bool) -> Result<()> {
+    let (mut target, mut inside) = (target, inside);
+    for id in ids.iter().rev() {
+        project.move_above(*id, target, inside)?;
+        (target, inside) = (Some(*id), false);
+    }
+    Ok(())
+}
+
+/// The positions of the moved layers determine whether a reorder needs an undo step.
+fn apply_move(s: &mut Session, ids: &[LayerId], change: impl FnOnce(&mut Project) -> Result<()>) -> Result<Value> {
+    s.edit_if_changed("Move layer", s.merge_edits, |s| {
+        let project = &mut s.doc.project;
+        let previous: Vec<_> = ids.iter().map(|id| project.locate(*id)).collect();
+        change(project)?;
+        let changed = ids.iter().map(|id| project.locate(*id)).ne(previous);
+        Ok((Value::Null, changed))
+    })
+}
+
+/// `layer.move {layers, index | above}`: the listed layers move together, keeping their order.
+fn move_layers(s: &mut Session, p: &Value) -> Result<Value> {
+    let ids = batch_param(s, "layer.move", p, true)?;
+    if let Some(i) = u64p(p, "index") {
+        // The lowest one goes to `index` of the texture set's stack, the others right above it in their order
+        let to = usize::try_from(i).unwrap_or(usize::MAX);
+        apply_move(s, &ids, |project| {
+            let mut below = None;
+            for id in ids.iter().rev() {
+                match below {
+                    None => {
+                        project.move_above(*id, None, false)?;
+                        project.move_layer(*id, to)?;
+                    }
+                    Some(below) => project.move_above(*id, Some(below), false)?,
+                }
+                below = Some(*id);
+            }
+            Ok(())
+        })
+    } else if p.get("above").is_some() {
+        let above = u64p(p, "above").map(LayerId);
+        if above.is_some_and(|above| ids.contains(&above)) {
+            return Err(bad("layer.move", "`above` is one of the moved layers"));
+        }
+
+        let inside = boolp(p, "inside").unwrap_or(false);
+        apply_move(s, &ids, |project| move_stacked(project, &ids, above, inside))
+    } else {
+        Err(bad("layer.move", "give `index` or `above` with `layers`"))
+    }
+}
+
 fn move_layer(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("layers").is_some() {
+        return move_layers(s, p);
+    }
+
     let id = layer_param(s, "layer.move", p)?;
-    s.edit("Move layer", |s| {
+    apply_move(s, &[id], |project| {
         if let Some(d) = p.get("delta").and_then(Value::as_i64) {
-            let (_, _, i) = s.doc.project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
-            let to = (i as i64 + d).max(0) as usize;
-            s.doc.project.move_layer(id, to)?;
+            let (_, _, i) = project.locate(id).ok_or(EngineError::Other("layer not in a stack".into()))?;
+
+            // Saturate hostile deltas before the sibling-list clamp
+            let distance = usize::try_from(d.unsigned_abs()).unwrap_or(usize::MAX);
+            let to = if d < 0 { i.saturating_sub(distance) } else { i.saturating_add(distance) };
+            project.move_layer(id, to)?;
         } else if let Some(i) = u64p(p, "index") {
-            s.doc.project.move_layer(id, usize::try_from(i).unwrap_or(usize::MAX))?;
+            project.move_layer(id, usize::try_from(i).unwrap_or(usize::MAX))?;
         } else if p.get("above").is_some() {
             let above = u64p(p, "above").map(LayerId);
-            s.doc.project.move_above(id, above, boolp(p, "inside").unwrap_or(false))?;
+            project.move_above(id, above, boolp(p, "inside").unwrap_or(false))?;
         } else {
             return Err(bad("layer.move", "give `delta`, `index` or `above`"));
         }
+
         Ok(())
-    })?;
-    Ok(Value::Null)
+    })
 }
 
 fn blend(s: &mut Session, p: &Value) -> Result<Value> {
@@ -265,6 +441,35 @@ fn blend(s: &mut Session, p: &Value) -> Result<Value> {
                 None => {}
             }
             if let Some(b) = l.channels.get_mut(&c) {
+                if let Some(m) = mode {
+                    b.mode = m;
+                }
+                if let Some(o) = opacity {
+                    b.opacity = o;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(Value::Null)
+}
+
+/// `layer.blending.set`: each listed channel gets its own mode and opacity in one undo step. Channels the layer
+/// has disabled stay disabled, and channels not listed stay as they are.
+fn blending_set(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = content_param(s, "layer.blending.set", p)?;
+    let listed = p.get("channels").and_then(Value::as_object).ok_or_else(|| bad("layer.blending.set", "`channels` is required"))?;
+    let mut edits: Vec<(Channel, Option<BlendMode>, Option<f32>)> = Vec::new();
+    for (key, value) in listed {
+        let channel = Channel::parse(key).ok_or_else(|| bad("layer.blending.set", format!("unknown channel `{key}`")))?;
+        let mode = blend_param("layer.blending.set", value, "mode")?;
+        let opacity = f32p(value, "opacity").map(|o| o.clamp(0.0, 1.0));
+        edits.push((channel, mode, opacity));
+    }
+    s.edit("Layer blending", |s| {
+        let l = s.doc.project.layer_mut(id)?;
+        for (channel, mode, opacity) in edits {
+            if let Some(b) = l.channels.get_mut(&channel) {
                 if let Some(m) = mode {
                     b.mode = m;
                 }
@@ -309,95 +514,213 @@ fn fill_mut(s: &mut Session, target: FillTarget) -> Result<&mut Fill> {
     }
 }
 
-fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
-    let target = fill_target(s, p, "layer.fill.set")?;
-    let ch = channel_param("layer.fill.set", p, "channel")?.ok_or_else(|| bad("layer.fill.set", "`channel` is required"))?;
-    // `solo`: this channel on, every other one off.
-    let solo = boolp(p, "solo") == Some(true);
-    let enabled = if solo { Some(true) } else { boolp(p, "enabled") };
-    let normal_format = normal_format_param("layer.fill.set", p)?;
-    let low = color_param("layer.fill.set", p, "low")?.unwrap_or([0.0; 3]);
-    let high = color_param("layer.fill.set", p, "high")?.unwrap_or([1.0; 3]);
-    let color = color_param("layer.fill.set", p, "color")?;
-    let value = color_param("layer.fill.set", p, "value")?;
-    let source = if let Some(kind) = strp(p, "procedural") {
-        let kind = ProceduralKind::parse(kind).ok_or_else(|| bad("layer.fill.set", format!("unknown procedural `{kind}`")))?;
-        let mut pr = Procedural::new(kind);
-        if let Some(v) = f32p(p, "scale") {
-            pr.scale = v.clamp(0.001, 1000.0);
-        }
-        if let Some(v) = u64p(p, "seed") {
-            pr.seed = v as u32;
-        }
-        if let Some(v) = f32p(p, "contrast") {
-            pr.contrast = v.clamp(0.0, 20.0);
-        }
-        if let Some(v) = f32p(p, "balance") {
-            pr.balance = v.clamp(-1.0, 1.0);
-        }
-        pr.invert = boolp(p, "invert").unwrap_or(false);
-        Some(Source::Procedural { pattern: pr, low, high })
-    } else if let Some(c) = color.or(value) {
-        Some(Source::Uniform(c))
-    } else if let Some(name) = strp(p, "image") {
-        Some(Source::Image { name: name.to_string(), normal_format: normal_format.unwrap_or_default() })
-    } else if let Some(a) = u64p(p, "anchor") {
-        let reader = match target {
-            FillTarget::Layer(id) => Some(id),
-            FillTarget::Effect(e) => s.doc.project.effect(e).map(|(owner, _)| owner),
-        };
-        let reader = reader.ok_or_else(|| bad("layer.fill.set", "the fill is not in a layer"))?;
-        let anchor_channel = channel_param("layer.fill.set", p, "anchorChannel")?.unwrap_or(ch);
-        Some(crate::mask_cmds::anchor_source(s, "layer.fill.set", reader, LayerId(a), anchor_channel)?)
-    } else if enabled.is_some() || normal_format.is_some() {
-        None
-    } else {
-        return Err(bad("layer.fill.set", "give `color`, `value`, `procedural`, `image`, `anchor`, `normalFormat`, `enabled` or `solo`"));
-    };
-    if normal_format.is_some() && source.as_ref().is_some_and(|src| !matches!(src, Source::Image { .. })) {
-        return Err(bad("layer.fill.set", "`normalFormat` goes with `image` or alone"));
+fn fill_set(session: &mut Session, params: &Value) -> Result<Value> {
+    const CMD: &str = "layer.fill.set";
+    let target = fill_target(session, params, CMD)?;
+    let channel = channel_param(CMD, params, "channel")?.ok_or_else(|| bad(CMD, "`channel` is required"))?;
+
+    // `solo`: this channel on, every other one off
+    let solo = boolp(params, "solo") == Some(true);
+    let enabled = if solo { Some(true) } else { boolp(params, "enabled") };
+    let normal_format = normal_format_param(CMD, params)?;
+    let colors = ramp_param(params, channel)?;
+    let init_ramp = boolp(params, "gradientMap") == Some(true);
+    if init_ramp && colors.is_some() {
+        return Err(bad(CMD, "give `gradientMap` or `colors`, not both"));
     }
-    // A format-only edit leaves the channel on or off.
+
+    let source = fill_source_from(session, params, (target, channel), normal_format)?;
+    if source.is_none() && enabled.is_none() && normal_format.is_none() && colors.is_none() && !init_ramp {
+        return Err(bad(
+            CMD,
+            "give `color`, `value`, `procedural`, `image`, `anchor`, pattern settings (`tile`, `resolution`…), `colors`, `gradientMap`, `normalFormat`, `enabled` or `solo`",
+        ));
+    }
+
+    if normal_format.is_some() && source.as_ref().is_some_and(|source| !matches!(source, Source::Image { .. })) {
+        return Err(bad(CMD, "`normalFormat` goes with `image` or alone"));
+    }
+
+    // Changing only the normal format or gradient stops leaves the layer channel on or off
     let touches_channel = source.is_some() || enabled.is_some();
-    s.edit("Set fill", |s| {
-        let f = fill_mut(s, target)?;
-        // `normalFormat` alone: the convention of the channel's image.
-        if let (None, Some(nf)) = (&source, normal_format) {
-            match f.sources.get_mut(&ch) {
-                Some(Source::Image { normal_format, .. }) => *normal_format = nf,
-                _ => return Err(bad("layer.fill.set", "`normalFormat` needs an image on the channel")),
+    session.edit("Set fill", |session| {
+        let fill = fill_mut(session, target)?;
+
+        // `normalFormat` alone: the convention of the channel's image
+        if let (None, Some(format)) = (&source, normal_format) {
+            match fill.sources.get_mut(&channel) {
+                Some(Source::Image { normal_format, .. }) => *normal_format = format,
+                _ => return Err(bad(CMD, "`normalFormat` needs an image on the channel")),
             }
         }
+
+        let current = fill.sources.get(&channel);
+        let colors = if init_ramp { initial_ramp(channel, source.as_ref(), current)? } else { colors };
+        let source = with_ramp(channel, current, source, colors)?;
+
         match target {
-            // A fill effect's channel is on while it has a source.
+            // A fill effect's channel is on while it has a source
             FillTarget::Effect(_) if enabled == Some(false) => {
-                f.sources.remove(&ch);
+                fill.sources.remove(&channel);
             }
+
+            // Removing stops (`colors: []`) from a channel the fill does not have adds nothing
+            FillTarget::Effect(_) if source.is_none() && enabled != Some(true) && current.is_none() => {}
             FillTarget::Effect(_) => {
-                let src = source.unwrap_or_else(|| f.source(ch));
-                f.sources.insert(ch, src);
+                let source = source.unwrap_or_else(|| fill.source(channel));
+                fill.sources.insert(channel, source);
                 if solo {
-                    f.sources.retain(|c, _| *c == ch);
+                    fill.sources.retain(|kept, _| *kept == channel);
                 }
             }
             FillTarget::Layer(id) => {
-                if let Some(src) = source {
-                    f.sources.insert(ch, src);
+                if let Some(source) = source {
+                    fill.sources.insert(channel, source);
                 }
-                let l = s.doc.project.layer_mut(id)?;
+                let layer = session.doc.project.layer_mut(id)?;
                 if enabled == Some(false) {
-                    l.channels.remove(&ch);
+                    layer.channels.remove(&channel);
                 } else if touches_channel {
-                    l.channels.entry(ch).or_default();
+                    layer.channels.entry(channel).or_default();
                 }
                 if solo {
-                    l.channels.retain(|c, _| *c == ch);
+                    layer.channels.retain(|kept, _| *kept == channel);
                 }
             }
         }
         Ok(())
     })?;
     Ok(Value::Null)
+}
+
+/// The source `params` give fill channel `channel` of `target`, or None when they only switch it or set its image's normal format
+fn fill_source_from(
+    session: &mut Session,
+    params: &Value,
+    (target, channel): (FillTarget, Channel),
+    normal_format: Option<NormalFormat>,
+) -> Result<Option<Source>> {
+    const CMD: &str = "layer.fill.set";
+    let low = color_param(CMD, params, "low")?.unwrap_or([0.0; 3]);
+    let high = color_param(CMD, params, "high")?.unwrap_or([1.0; 3]);
+    let uniform = color_param(CMD, params, "color")?.or(color_param(CMD, params, "value")?);
+
+    if let Some(name) = strp(params, "procedural") {
+        let kind = ProceduralKind::parse(name).ok_or_else(|| bad(CMD, format!("unknown procedural `{name}`")))?;
+        let mut pattern = Procedural::new(kind);
+        crate::procedural_params::pattern_basics_from(params, &mut pattern);
+
+        // A pattern of the same kind keeps its resolution and Tile Generator settings
+        let current = fill_mut(session, target)?.sources.get(&channel);
+        if let Some(Source::Procedural { pattern: current, .. }) = current
+            && current.kind == kind
+        {
+            pattern.resolution = current.resolution;
+            pattern.tile = current.tile.clone();
+        }
+
+        crate::procedural_params::pattern_settings_from(CMD, params, &mut pattern)?;
+        return Ok(Some(Source::Procedural { pattern, low, high, ramp: Vec::new() }));
+    }
+
+    if let Some(color) = uniform {
+        return Ok(Some(Source::Uniform(color)));
+    }
+
+    if let Some(name) = strp(params, "image") {
+        return Ok(Some(Source::Image { name: name.to_string(), normal_format: normal_format.unwrap_or_default() }));
+    }
+
+    if let Some(anchor) = u64p(params, "anchor") {
+        let reader = match target {
+            FillTarget::Layer(id) => Some(id),
+            FillTarget::Effect(effect) => session.doc.project.effect(effect).map(|(owner, _)| owner),
+        };
+        let reader = reader.ok_or_else(|| bad(CMD, "the fill is not in a layer"))?;
+        let anchor_channel = channel_param(CMD, params, "anchorChannel")?.unwrap_or(channel);
+        return Ok(Some(crate::mask_cmds::anchor_source(session, CMD, reader, LayerId(anchor), anchor_channel)?));
+    }
+
+    if !crate::procedural_params::has_pattern_settings(params) {
+        return Ok(None);
+    }
+
+    // Pattern settings alone edit the channel's current pattern
+    let Some(Source::Procedural { pattern, low, high, .. }) = fill_mut(session, target)?.sources.get(&channel) else {
+        return Err(bad(CMD, "the channel has no pattern: give `procedural` with its settings"));
+    };
+
+    let mut pattern = pattern.clone();
+    crate::procedural_params::pattern_basics_from(params, &mut pattern);
+    crate::procedural_params::pattern_settings_from(CMD, params, &mut pattern)?;
+
+    Ok(Some(Source::Procedural { pattern, low: *low, high: *high, ramp: Vec::new() }))
+}
+
+/// The gradient map stops from `colors` (None when absent, empty to remove).
+fn ramp_param(params: &Value, channel: Channel) -> Result<Option<Vec<[f32; 3]>>> {
+    const MAX_GRADIENT_STOPS: usize = 16;
+    let Some(list) = params.get("colors").filter(|value| !value.is_null()) else { return Ok(None) };
+
+    let invalid = || bad("layer.fill.set", "`colors` must be up to 16 colors ([r, g, b] linear or \"#rrggbb\")");
+    let list = list.as_array().filter(|list| list.len() <= MAX_GRADIENT_STOPS).ok_or_else(invalid)?;
+    let colors: Vec<_> = list
+        .iter()
+        .map(|color| crate::commands::color_of(color).map(|rgb| rgb.map(|component| component.clamp(0.0, 1.0))).ok_or_else(invalid))
+        .collect::<Result<_>>()?;
+
+    if !colors.is_empty() && channel.kind() != ChannelKind::Color {
+        return Err(bad("layer.fill.set", "`colors` (a gradient map) goes on a color channel"));
+    }
+
+    Ok(Some(colors))
+}
+
+/// The stops `gradientMap: true` turns on for channel `ch`: those the source already has, else a
+/// procedural's low, midpoint and high (so its look holds) or an anchor's black, gray and white.
+/// `source` is the one the call sets, else the channel's `current` one.
+fn initial_ramp(channel: Channel, source: Option<&Source>, current: Option<&Source>) -> Result<Option<Vec<[f32; 3]>>> {
+    if channel.kind() != ChannelKind::Color {
+        return Err(bad("layer.fill.set", "`gradientMap` goes on a color channel"));
+    }
+
+    if let Some(kept) = current.map(Source::ramp).filter(|r| !r.is_empty()) {
+        return Ok(Some(kept.to_vec()));
+    }
+
+    match source.or(current) {
+        Some(Source::Procedural { low, high, .. }) => Ok(Some(vec![*low, std::array::from_fn(|k| (low[k] + high[k]) * 0.5), *high])),
+        Some(Source::Anchor { .. }) => Ok(Some(vec![[0.0; 3], [0.5; 3], [1.0; 3]])),
+        _ => Err(bad("layer.fill.set", "`gradientMap` needs a procedural or an anchor on the channel")),
+    }
+}
+
+/// `source` (or, for `colors` alone, the channel's `current` source) with its gradient map stops:
+/// `colors` when given, else those of `current`, so picking another pattern or anchor keeps them.
+/// Only color channels keep stops, so a source copied onto another channel loses them; removing
+/// stops (`colors: []`) where there are none changes nothing.
+fn with_ramp(channel: Channel, current: Option<&Source>, source: Option<Source>, colors: Option<Vec<[f32; 3]>>) -> Result<Option<Source>> {
+    let adds = colors.as_ref().is_some_and(|colors| !colors.is_empty());
+    let needs = || bad("layer.fill.set", "`colors` needs a procedural or an anchor on the channel");
+    let mut source = match (source, current) {
+        (Some(source), _) => source,
+        (None, Some(current)) if colors.is_some() => current.clone(),
+        _ if adds => return Err(needs()),
+        _ => return Ok(None),
+    };
+
+    match &mut source {
+        Source::Procedural { ramp, .. } | Source::Anchor { ramp, .. } => {
+            *ramp = colors.unwrap_or_else(|| match current {
+                Some(current) if channel.kind() == ChannelKind::Color => current.ramp().to_vec(),
+                _ => Vec::new(),
+            });
+        }
+        _ if adds => return Err(needs()),
+        _ => {}
+    }
+
+    Ok(Some(source))
 }
 
 /// The projection `p` asks for. Fields it does not give keep their values from `current` when

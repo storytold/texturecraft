@@ -2,16 +2,25 @@
 //! Keep feature tests in their own modules; the standalone session.rs target remains available.
 
 mod bake;
+mod bake_checks;
 mod bake_resolution;
 mod bake_settings;
 mod bake_tiles;
+mod brush_material;
+mod closed_session;
 mod color_selection;
 mod content_effects;
 mod export_colour_space;
 mod filter_swap;
 mod filters;
+mod frame_selection;
+mod generator_inputs;
+mod gradient_map;
 mod high_poly_missed;
 mod instances;
+mod layer_multi_select;
+mod mask_clone_smudge;
+mod mask_export;
 mod materialcraft_link;
 mod materialx;
 mod materialx_import;
@@ -19,13 +28,19 @@ mod meshmap_import;
 mod painter_gaps;
 mod path_perf;
 mod path_tool;
+mod pbr_import;
 mod perf;
 mod polygon_fill;
 mod project_recovery;
 mod sample;
+mod solo;
 mod thumbs;
+mod tile_generator;
+mod tool_availability;
+mod tool_settings;
 mod tools;
 mod udim;
+mod user_smart_mask;
 mod uv_strokes;
 
 mod symmetry;

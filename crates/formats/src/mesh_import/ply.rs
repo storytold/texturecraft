@@ -10,40 +10,20 @@ const KIND: &str = "PLY";
 /// Longest polygon accepted (a list count above this is treated as corruption).
 const MAX_FACE_VERTICES: usize = 4096;
 
-#[derive(Clone, Copy, PartialEq)]
-enum Ty {
-    I8,
-    U8,
-    I16,
-    U16,
-    I32,
-    U32,
-    F32,
-    F64,
-}
+use craft_mesh::ply::{Encoding as SharedEncoding, Header, Rows, Scalar as Ty};
 
-impl Ty {
-    fn parse(s: &str) -> Option<Ty> {
-        Some(match s {
-            "char" | "int8" => Ty::I8,
-            "uchar" | "uint8" => Ty::U8,
-            "short" | "int16" => Ty::I16,
-            "ushort" | "uint16" => Ty::U16,
-            "int" | "int32" => Ty::I32,
-            "uint" | "uint32" => Ty::U32,
-            "float" | "float32" => Ty::F32,
-            "double" | "float64" => Ty::F64,
-            _ => return None,
-        })
-    }
-    fn size(self) -> usize {
-        match self {
-            Ty::I8 | Ty::U8 => 1,
-            Ty::I16 | Ty::U16 => 2,
-            Ty::I32 | Ty::U32 | Ty::F32 => 4,
-            Ty::F64 => 8,
-        }
-    }
+fn parse_type(s: &str) -> Option<Ty> {
+    Some(match s {
+        "char" | "int8" => Ty::I8,
+        "uchar" | "uint8" => Ty::U8,
+        "short" | "int16" => Ty::I16,
+        "ushort" | "uint16" => Ty::U16,
+        "int" | "int32" => Ty::I32,
+        "uint" | "uint32" => Ty::U32,
+        "float" | "float32" => Ty::F32,
+        "double" | "float64" => Ty::F64,
+        _ => return None,
+    })
 }
 
 struct Property {
@@ -66,60 +46,36 @@ enum Encoding {
     Be,
 }
 
-/// Reads scalars from the body in either encoding.
-struct Body<'a> {
-    data: &'a [u8],
-    pos: usize,
-    enc: Encoding,
-}
-
-impl Body<'_> {
-    fn next_token(&mut self) -> Option<&str> {
-        let rest = self.data.get(self.pos..)?;
-        let start = rest.iter().position(|b| !b.is_ascii_whitespace())?;
-        let len = rest.get(start..)?.iter().position(|b| b.is_ascii_whitespace()).unwrap_or(rest.len() - start);
-        self.pos += start + len;
-        std::str::from_utf8(rest.get(start..start + len)?).ok()
-    }
-
-    fn read(&mut self, ty: Ty) -> Result<f64> {
-        if self.enc == Encoding::Ascii {
-            let tok = self.next_token().ok_or_else(|| malformed(KIND, "unexpected end of data"))?;
-            return tok.parse::<f64>().map_err(|_| malformed(KIND, format!("bad number \"{tok}\"")));
-        }
-        let n = ty.size();
-        let bytes = self.data.get(self.pos..self.pos + n).ok_or_else(|| malformed(KIND, "unexpected end of data"))?;
-        self.pos += n;
-        let mut b = [0u8; 8];
-        b.get_mut(..n).unwrap_or_default().copy_from_slice(bytes);
-        if self.enc == Encoding::Be {
-            b.get_mut(..n).unwrap_or_default().reverse();
-        }
-        Ok(match ty {
-            Ty::I8 => b[0] as i8 as f64,
-            Ty::U8 => b[0] as f64,
-            Ty::I16 => i16::from_le_bytes([b[0], b[1]]) as f64,
-            Ty::U16 => u16::from_le_bytes([b[0], b[1]]) as f64,
-            Ty::I32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
-            Ty::U32 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
-            Ty::F32 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
-            Ty::F64 => f64::from_le_bytes(b),
-        })
-    }
-
-    fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.pos)
-    }
-}
-
 pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
     let (elements, enc, body_start) = header(bytes)?;
-    let mut body = Body { data: bytes.get(body_start..).unwrap_or_default(), pos: 0, enc };
+    // Keep the strict app header grammar and mesh policy; delegate only wire scalars.
+    let encoding = match enc {
+        Encoding::Ascii => SharedEncoding::Ascii,
+        Encoding::Le => SharedEncoding::Little,
+        Encoding::Be => SharedEncoding::Big,
+    };
+    let shared_header = Header { encoding, elements: Vec::new(), body: body_start, comments: Vec::new() };
+    let mut body = Rows::new(&shared_header, bytes);
     let mut raw = RawMesh::default();
     let (mut normals, mut uvs, mut colors) = (Vec::new(), Vec::new(), Vec::new());
     // Elements may appear in any order, so take the vertex count from the header.
     let nverts: usize = elements.iter().filter(|e| e.name == "vertex").map(|e| e.count).fold(0, usize::saturating_add);
+    // The shared ASCII reader counts the delimiter after a value as read; the previous reader
+    // left it in the remaining bytes. Only an element without properties can notice the difference.
+    let ascii_slack = usize::from(enc == Encoding::Ascii);
     for el in &elements {
+        // An element without properties reads nothing, so its rows are skipped. Its count stays
+        // bounded by the bytes left, as the previous reader counted them.
+        if el.props.is_empty() {
+            if el.count > body.remaining().saturating_add(ascii_slack) {
+                return Err(malformed(KIND, format!("element \"{}\" claims {} items but the file is too short", el.name, el.count)));
+            }
+            // A vertex element still needs positions, as below.
+            if el.name == "vertex" {
+                return Err(malformed(KIND, "vertices have no x, y, z"));
+            }
+            continue;
+        }
         // Every item takes at least one byte, so the count can never exceed what is left.
         if el.count > body.remaining() {
             return Err(malformed(KIND, format!("element \"{}\" claims {} items but the file is too short", el.name, el.count)));
@@ -149,17 +105,17 @@ pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
                 match p.list {
                     None => {
                         if let Some(v) = vals.get_mut(k) {
-                            *v = body.read(p.ty)?;
+                            *v = body.value(p.ty).map_err(|e| malformed(KIND, e.to_string()))?;
                         }
                     }
                     Some(ct) => {
-                        let len = body.read(ct)?;
+                        let len = body.value(ct).map_err(|e| malformed(KIND, e.to_string()))?;
                         if !(0.0..=MAX_FACE_VERTICES as f64).contains(&len) {
                             return Err(malformed(KIND, format!("bad list length {len}")));
                         }
                         poly.clear();
                         for _ in 0..len as usize {
-                            let v = body.read(p.ty)?;
+                            let v = body.value(p.ty).map_err(|e| malformed(KIND, e.to_string()))?;
                             if face_list == Some(k) {
                                 if !(0.0..nverts as f64).contains(&v) {
                                     return Err(malformed(KIND, format!("face index {v} out of range")));
@@ -240,13 +196,13 @@ fn header(bytes: &[u8]) -> Result<(Vec<Element>, Encoding, usize)> {
             }
             ["property", "list", ct, ty, name] => {
                 let el = elements.last_mut().ok_or_else(|| malformed(KIND, "property before element"))?;
-                let (ct, ty) = (Ty::parse(ct), Ty::parse(ty));
+                let (ct, ty) = (parse_type(ct), parse_type(ty));
                 let (Some(ct), Some(ty)) = (ct, ty) else { return Err(malformed(KIND, format!("bad list types in \"{line}\""))) };
                 el.props.push(Property { name: name.to_string(), ty, list: Some(ct) });
             }
             ["property", ty, name] => {
                 let el = elements.last_mut().ok_or_else(|| malformed(KIND, "property before element"))?;
-                let ty = Ty::parse(ty).ok_or_else(|| malformed(KIND, format!("bad property type {ty}")))?;
+                let ty = parse_type(ty).ok_or_else(|| malformed(KIND, format!("bad property type {ty}")))?;
                 el.props.push(Property { name: name.to_string(), ty, list: None });
             }
             ["ply"] | [] | ["comment", ..] | ["obj_info", ..] => {}
@@ -255,4 +211,53 @@ fn header(bytes: &[u8]) -> Result<(Vec<Element>, Encoding, usize)> {
     }
     let enc = enc.ok_or_else(|| malformed(KIND, "header has no format line"))?;
     Ok((elements, enc, pos))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod shared_rows_tests {
+    use super::*;
+
+    #[test]
+    fn trailing_propertyless_element_after_a_newline_still_opens() {
+        let bytes = b"ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nelement edge 1\nend_header\n0 0 0\n";
+        assert_eq!(read(bytes).unwrap().positions, vec![Vec3::new(0.0, 0.0, 0.0)]);
+        let huge = b"ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nelement edge 3\nend_header\n0 0 0\n";
+        assert!(read(huge).is_err());
+    }
+
+    #[test]
+    fn propertyless_vertex_element_is_still_rejected() {
+        let bytes = b"ply\nformat ascii 1.0\nelement vertex 1\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n3 0 0 0\n";
+        let Err(e) = read(bytes) else { panic!("a vertex element without x, y, z must not open") };
+        let err = e.to_string();
+        assert!(err.contains("vertices have no x, y, z"), "{err}");
+    }
+
+    #[test]
+    fn binary_scalar_endianness_matches_ascii() {
+        for (format, big) in [("binary_little_endian", false), ("binary_big_endian", true)] {
+            let mut bytes =
+                format!("ply\nformat {format} 1.0\nelement vertex 1\nproperty short x\nproperty float y\nproperty double z\nend_header\n").into_bytes();
+            bytes.extend(if big { (-123i16).to_be_bytes() } else { (-123i16).to_le_bytes() });
+            bytes.extend(if big { 1.25f32.to_be_bytes() } else { 1.25f32.to_le_bytes() });
+            bytes.extend(if big { (-2.5f64).to_be_bytes() } else { (-2.5f64).to_le_bytes() });
+            assert_eq!(read(&bytes).unwrap().positions, vec![Vec3::new(-123.0, 1.25, -2.5)]);
+            bytes.pop();
+            assert!(read(&bytes).is_err());
+        }
+        let ascii = b"ply\nformat ascii 1.0\nelement vertex 1\nproperty short x\nproperty float y\nproperty double z\nend_header\n -123 \t1.25\r\n -2.5  ";
+        assert_eq!(read(ascii).unwrap().positions, vec![Vec3::new(-123.0, 1.25, -2.5)]);
+    }
+
+    #[test]
+    fn strict_header_and_invalid_face_policy_remain_local() {
+        for extra in ["unknown directive\n", "property nonsense x\n"] {
+            let bytes = format!("ply\nformat ascii 1.0\nelement vertex 1\n{extra}end_header\n0");
+            assert!(read(bytes.as_bytes()).is_err());
+        }
+        assert!(read(b"ply\nformat ascii 1.0\ncomment \xff\nend_header\n").is_err());
+        let bytes = b"ply\nformat ascii 1.0\nelement face 1\nproperty list uchar int vertex_indices\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n3 0 0 1\n0 0 0\n";
+        assert!(read(bytes).is_err()); // Do not turn a bad face into a warning/skip.
+    }
 }

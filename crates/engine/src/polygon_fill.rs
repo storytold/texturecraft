@@ -104,6 +104,10 @@ impl Session {
 
         drag.last_box = Some((low, high));
         let selected = self.box_selection(low, high);
+        let selected = match self.polygon_fill_drag.as_ref() {
+            Some(drag) => self.with_symmetry_copies(&drag.fill_groups, selected),
+            None => selected,
+        };
         self.show_box_fill(selected)
     }
 
@@ -178,11 +182,12 @@ impl Session {
         }
     }
 
-    /// Fill the fill-mode group holding `triangle` (one undo step)
+    /// Fill the fill-mode group holding `triangle` and its symmetry copies (one undo step)
     fn fill_group_of(&mut self, triangle: u32) -> Result<usize> {
         let ts = self.ts();
         let groups = self.fill_partition(self.fill_material()?);
         let triangles: BTreeSet<u32> = groups.group(triangle).unwrap_or_default().iter().copied().collect();
+        let triangles = self.with_symmetry_copies(&groups, triangles);
 
         let (gbuf, mut canvas) = self.fill_canvas(ts)?;
         fill_triangles(&mut canvas, &gbuf, &triangles);

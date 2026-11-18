@@ -20,20 +20,22 @@ const REST: f32 = 0.1;
 /// Real time the worker gets to render
 const WORKER_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Open the Materials tab and find two labels unique to shelf tiles
+/// Open the Materials tab and find the first two labels (the grid is sorted by name) unique to shelf tiles
 fn materials_shelf(step_seconds: f32, pixels_per_point: f32) -> (Harness<'static, TextureCraftApp>, Vec<&'static SmartMaterial>) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder()
+    let mut harness = Harness::builder()
         .with_size(egui::vec2(1600.0, 960.0))
         .with_step_dt(step_seconds)
         .with_pixels_per_point(pixels_per_point)
         .build_eframe(|cc| TextureCraftApp::new(cc, session));
-    h.state_mut().ui.shelf_tab = MATERIALS_TAB;
-    h.run_steps(4);
+    harness.state_mut().ui.shelf_tab = MATERIALS_TAB;
+    harness.run_steps(4);
 
-    let unique: Vec<_> = MATERIALS.iter().filter(|m| !m.smart && h.query_all_by_label(m.label).count() == 1).take(2).collect();
+    let mut plain: Vec<_> = MATERIALS.iter().filter(|material| !material.smart).collect();
+    plain.sort_by_key(|material| material.label.to_lowercase());
+    let unique: Vec<_> = plain.into_iter().filter(|material| harness.query_all_by_label(material.label).count() == 1).take(2).collect();
     assert_eq!(unique.len(), 2, "two materials with unique names");
-    (h, unique)
+    (harness, unique)
 }
 
 /// Largest drawn texture in pixels, excluding fonts and images below `min_width` points
@@ -155,6 +157,15 @@ fn high_dpi_smart_material_hover_stays_within_the_renderer_limit() {
     check_high_dpi_orb_hover(1, "Steel Painted Worn");
 }
 
+// Coverage instrumentation makes the 512px software-rendered preview substantially slower.
+fn high_dpi_worker_timeout() -> Duration {
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() || std::env::var("RUSTFLAGS").is_ok_and(|f| f.contains("instrument-coverage")) {
+        Duration::from_secs(600)
+    } else {
+        WORKER_TIMEOUT
+    }
+}
+
 fn check_high_dpi_orb_hover(shelf_tab: usize, label: &str) {
     use texturecraft_engine::orb_preview::MAX_PREVIEW_SIZE_PX;
 
@@ -166,7 +177,7 @@ fn check_high_dpi_orb_hover(shelf_tab: usize, label: &str) {
 
     let expected = Some([MAX_PREVIEW_SIZE_PX; 2]);
     let started = Instant::now();
-    while largest_drawn_texture(&harness, BIG_PREVIEW_SIZE) != expected && started.elapsed() < WORKER_TIMEOUT {
+    while largest_drawn_texture(&harness, BIG_PREVIEW_SIZE) != expected && started.elapsed() < high_dpi_worker_timeout() {
         harness.run_steps(1);
         std::thread::sleep(Duration::from_millis(20));
     }

@@ -21,9 +21,14 @@ fn session() -> Session {
 
 /// A `.mcmat` as MaterialCraft writes it: uniform maps, one float input `wear` cooked at `wear`.
 fn mcmat(roughness: f32, wear: f32) -> Vec<u8> {
+    mcmat_version(roughness, wear, 1)
+}
+
+fn mcmat_version(roughness: f32, wear: f32, version: u32) -> Vec<u8> {
+    let source = if version == 2 { "source.sbs" } else { "source.mcraft" };
     let gray = |v: f32| mesh_map_png(4, 1, &[v; 16]).unwrap();
     let manifest = json!({
-        "format": "craft-material", "version": 1, "name": "Brick wall", "graph": "Brick_wall", "size": [4, 4],
+        "format": "craft-material", "version": version, "name": "Brick wall", "graph": "Brick_wall", "size": [4, 4],
         "maps": [
             {"usage": "baseColor", "file": "maps/baseColor.png", "colorSpace": "srgb"},
             {"usage": "roughness", "file": "maps/roughness.png", "colorSpace": "linear"},
@@ -42,7 +47,7 @@ fn mcmat(roughness: f32, wear: f32) -> Vec<u8> {
             {"identifier": "bentNormal", "kind": "color"}
         ],
         "presets": [{"name": "Worn", "values": {"wear": {"t": "float", "v": 1.0}, "note": {"t": "text", "v": "x"}}}],
-        "source": "source.mcraft"
+        "source": source
     });
     let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let o = zip::write::SimpleFileOptions::default();
@@ -51,7 +56,7 @@ fn mcmat(roughness: f32, wear: f32) -> Vec<u8> {
         ("maps/baseColor.png", mesh_map_png(4, 3, &[0.5; 48]).unwrap()),
         ("maps/roughness.png", gray(roughness)),
         ("maps/ambientOcclusion.png", gray(1.0)),
-        ("source.mcraft", b"package bytes".to_vec()),
+        (source, b"package bytes".to_vec()),
     ] {
         z.start_file(name, o).unwrap();
         z.write_all(&bytes).unwrap();
@@ -82,6 +87,24 @@ fn map_name(s: &Session, id: LayerId, c: Channel) -> String {
 }
 
 #[test]
+fn version_two_preserves_the_sbs_source_for_future_cooks() {
+    let mut session = session();
+    let id = session.add_linked_material_bytes_at(&mcmat_version(0.25, 0.5, 2), Place::Selection).unwrap();
+    let linked = link(&session, id);
+    assert!(linked.package.ends_with(".sbs"));
+    let job = session.link_job(id, &serde_json::Map::new()).unwrap();
+    assert_eq!(job.source_ext, "sbs");
+    assert_eq!(job.graph.as_deref(), Some("Brick_wall"));
+    assert_eq!(job.package.as_slice(), b"package bytes");
+    let base = std::env::temp_dir().join(format!("texturecraft-sbs-source-{}", std::process::id()));
+    let saved = execute(&mut session, "material.link.saveSource", &json!({"layer": id.0, "path": base.to_str().unwrap()})).unwrap();
+    let path = saved["path"].as_str().unwrap();
+    assert!(path.ends_with(".sbs"));
+    assert_eq!(std::fs::read(path).unwrap(), b"package bytes");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn imports_as_a_linked_fill_with_its_maps() {
     let mut s = session();
     let id = s.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
@@ -108,47 +131,55 @@ fn imports_as_a_linked_fill_with_its_maps() {
 /// An image marked DirectX keeps the mark when a re-cook replaces it.
 #[test]
 fn recooks_keep_the_normal_format_of_a_map() {
-    let mut s = session();
-    let id = s.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
-    execute(&mut s, "layer.fill.set", &json!({"layer": id.0, "channel": "roughness", "normalFormat": "directX"})).unwrap();
-    s.apply_link_cook(id, &mcmat(0.75, 0.5), false).unwrap();
-    let LayerKind::Fill(fill) = &s.doc.project.layer(id).unwrap().kind else { panic!("a fill") };
+    let mut session = session();
+    let id = session.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
+    execute(&mut session, "layer.fill.set", &json!({"layer": id.0, "channel": "roughness", "normalFormat": "directX"})).unwrap();
+
+    session.apply_link_cook(id, &mcmat(0.75, 0.5), false).unwrap();
+
+    let LayerKind::Fill(fill) = &session.doc.project.layer(id).unwrap().kind else { panic!("a fill") };
+
     assert!(matches!(fill.sources.get(&Channel::Roughness), Some(Source::Image { normal_format: NormalFormat::DirectX, .. })));
 }
 
 #[test]
 fn parameters_are_checked_stored_and_recooked_in_one_undo_step() {
-    let mut s = session();
-    let id = s.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
-    let set = |s: &mut Session, p: Value| execute(s, "material.link.set", &p);
-    assert!(set(&mut s, json!({"id": "nope", "value": 1, "cook": false})).is_err());
-    assert!(set(&mut s, json!({"id": "wear", "value": "soft", "cook": false})).is_err());
-    assert!(set(&mut s, json!({"id": "wear", "value": f64::NAN, "cook": false})).is_err());
-    set(&mut s, json!({"id": "tint", "value": "#ff0000", "cook": false})).unwrap();
-    assert_eq!(link(&s, id).params[1].value, json!({"t": "color", "v": [1.0, 0.0, 0.0, 1.0]}));
-    set(&mut s, json!({"id": "wear", "value": 0.9, "cook": false})).unwrap();
-    assert_eq!(link(&s, id).params[0].value, json!({"t": "float", "v": 0.9}));
+    let mut session = session();
+    let id = session.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
+    let set = |session: &mut Session, params: Value| execute(session, "material.link.set", &params);
 
-    // The job carries every value and the texture set's resolution.
-    let job = s.link_job(id, &serde_json::Map::new()).unwrap();
+    assert!(set(&mut session, json!({"id": "nope", "value": 1, "cook": false})).is_err());
+    assert!(set(&mut session, json!({"id": "wear", "value": "soft", "cook": false})).is_err());
+    assert!(set(&mut session, json!({"id": "wear", "value": f64::NAN, "cook": false})).is_err());
+    set(&mut session, json!({"id": "tint", "value": "#ff0000", "cook": false})).unwrap();
+    assert_eq!(link(&session, id).params[1].value, json!({"t": "color", "v": [1.0, 0.0, 0.0, 1.0]}));
+    set(&mut session, json!({"id": "wear", "value": 0.9, "cook": false})).unwrap();
+    assert_eq!(link(&session, id).params[0].value, json!({"t": "float", "v": 0.9}));
+
+    // Cooks follow the texture set resolution
+    let job = session.link_job(id, &serde_json::Map::new()).unwrap();
+
     assert_eq!(job.size, 128);
     assert_eq!(job.values["wear"], json!({"t": "float", "v": 0.9}));
 
-    // What the job cooked (here: built by hand) replaces the maps, merged into the edit.
-    let old = map_name(&s, id, Channel::Roughness);
-    s.apply_link_cook(id, &mcmat(0.75, 0.9), true).unwrap();
-    assert!((roughness(&mut s) - 0.75).abs() < 2e-3);
-    assert!(!s.doc.resources.contains_key(&old), "old maps are dropped");
-    execute(&mut s, "edit.undo", &Value::Null).unwrap();
-    assert!((roughness(&mut s) - 0.25).abs() < 2e-3, "undo restores the earlier maps");
-    assert_eq!(link(&s, id).params[0].value, json!({"t": "float", "v": 0.5}));
-    execute(&mut s, "edit.redo", &Value::Null).unwrap();
-    assert!((roughness(&mut s) - 0.75).abs() < 2e-3);
+    // Merge the cooked maps into the parameter edit
+    let old = map_name(&session, id, Channel::Roughness);
+    session.apply_link_cook(id, &mcmat(0.75, 0.9), true).unwrap();
 
-    // Presets skip inputs the painter can't set; unknown presets are errors.
-    assert!(execute(&mut s, "material.link.preset", &json!({"name": "Nope", "cook": false})).is_err());
-    execute(&mut s, "material.link.preset", &json!({"name": "Worn", "cook": false})).unwrap();
-    assert_eq!(link(&s, id).params[0].value, json!({"t": "float", "v": 1.0}));
+    assert!((roughness(&mut session) - 0.75).abs() < 2e-3);
+    assert!(!session.doc.resources.contains_key(&old), "old maps are dropped");
+
+    execute(&mut session, "edit.undo", &Value::Null).unwrap();
+    assert!((roughness(&mut session) - 0.25).abs() < 2e-3, "undo restores the earlier maps");
+    assert_eq!(link(&session, id).params[0].value, json!({"t": "float", "v": 0.5}));
+
+    execute(&mut session, "edit.redo", &Value::Null).unwrap();
+    assert!((roughness(&mut session) - 0.75).abs() < 2e-3);
+
+    // Presets skip unsupported inputs and reject unknown names
+    assert!(execute(&mut session, "material.link.preset", &json!({"name": "Nope", "cook": false})).is_err());
+    execute(&mut session, "material.link.preset", &json!({"name": "Worn", "cook": false})).unwrap();
+    assert_eq!(link(&session, id).params[0].value, json!({"t": "float", "v": 1.0}));
 }
 
 #[test]
@@ -191,7 +222,7 @@ fn cooks_through_materialcraft_cli_when_available() {
     let dir = std::env::temp_dir().join(format!("tc-mc-link-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let pkg = dir.join("bricks.mcraft");
-    let ok = std::process::Command::new(&cli).args(["new", "bricks"]).arg(&pkg).args(["--size", "64"]).status().unwrap();
+    let ok = std::process::Command::new(&cli).args(["new", "pbr"]).arg(&pkg).args(["--size", "64"]).status().unwrap();
     assert!(ok.success());
     let exposed = dir.join("exposed.mcraft");
     let ok = std::process::Command::new(&cli)
@@ -209,9 +240,24 @@ fn cooks_through_materialcraft_cli_when_available() {
     assert_eq!(link(&s, id).size, 128, "cooked at the texture set's resolution");
     assert!(link(&s, id).params.iter().any(|p| p.id == "wear"));
     execute(&mut s, "material.link.set", &json!({"layer": id.0, "id": "wear", "value": 0.8})).unwrap();
-    assert_eq!(link(&s, id).params.iter().find(|p| p.id == "wear").unwrap().value, json!({"t": "float", "v": 0.8}));
-    let out = dir.join("back.mcraft");
+    let wear = link(&s, id).params.iter().find(|p| p.id == "wear").unwrap().value["v"].as_f64().unwrap();
+    assert!((wear - 0.8).abs() < 1e-6);
+    let out = dir.join("back.sbs");
     execute(&mut s, "material.link.saveSource", &json!({"layer": id.0, "path": out.to_str().unwrap()})).unwrap();
     assert!(std::fs::metadata(&out).unwrap().len() > 0);
+
+    // The portable material can name a graph other than the first in the embedded source.
+    let multi = dir.join("multi.mcraft");
+    let ok = std::process::Command::new(&cli).arg("run").arg(&exposed).arg("graph.duplicate").arg("{}").arg("-o").arg(&multi).status().unwrap();
+    assert!(ok.success());
+    let portable = dir.join("second.mcmat");
+    let params = json!({"graph": 1, "size": 64, "path": portable.to_str().unwrap()});
+    let ok = std::process::Command::new(&cli).arg("run").arg(&multi).arg("file.exportMaterial").arg(params.to_string()).status().unwrap();
+    assert!(ok.success());
+    let second = s.add_linked_material_bytes_at(&std::fs::read(&portable).unwrap(), Place::Selection).unwrap();
+    let expected_graph = link(&s, second).graph;
+    let job = s.link_job(second, &serde_json::Map::new()).unwrap();
+    let result = texturecraft_engine::formats::mcmat::read_mcmat(&job.run().unwrap()).unwrap();
+    assert_eq!(result.manifest.graph, expected_graph);
     let _ = std::fs::remove_dir_all(&dir);
 }

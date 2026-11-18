@@ -12,6 +12,7 @@ rust-version = "1.95"
 repository = "https://github.com/storytold/texturecraft"
 
 [workspace.dependencies]
+craft-usd = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "f7655fb3ea59d6b21681700c0ff880823f5bb709" }
 # internal
 texturecraft-core = { path = "crates/core" }
 texturecraft-texel = { path = "crates/texel" }
@@ -49,7 +50,6 @@ wgpu = "30"
 rfd = "0.17"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names", "KHR_materials_emissive_strength"] }
-tobj = { version = "4", default-features = false }
 flate2 = "1"
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 quick-xml = "0.41"
@@ -66,20 +66,27 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 # Shared Craft egui components (widget palette, icon buttons, panel docking): storytold/craft-libs,
 # MIT OR Apache-2.0, pinned to one rev.
 # Shared catalog lookup, pinned with the other Craft libraries.
-craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
-craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["serde"] }
+craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585" }
+craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585", features = ["serde"] }
+craft-materialx = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585" }
+craft-tcraft = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
+# Isolated aligned writer; existing archive readers retain their pin and behavior.
+craft-zip-usdz = { package = "craft-zip", git = "https://github.com/storytold/craft-libs", rev = "5631e99fe126cffb74c673eb458db04299f2bb9b" }
+craft-zip = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
+craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "70e562aa88436b6b79a997215b4fa4f6a6b1838a", default-features = false, features = ["stl", "ply", "fbx", "obj", "gltf"] }
+craft-mcmat = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
 # Who draws the window frame, and the app-drawn strip as the title bar (crates/ui-egui/src/titlebar.rs).
-craft-window = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["egui"] }
+craft-window = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585", features = ["egui"] }
 # Release checks, the update prompt and the update helper (crates/ui-egui/src/updates_ui.rs).
-craft-update = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["egui"] }
+craft-update = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585", features = ["egui"] }
 # File dialogs that never block the frame (crates/ui-egui/src/file_dialogs.rs).
-craft-dialogs = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+craft-dialogs = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585" }
 # Shortcut chords, lookup and dispatch (crates/ui-egui/src/keymap.rs).
-craft-keymap = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["egui"] }
+craft-keymap = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585", features = ["egui"] }
 # Quitting the macOS way instead of closing the window (crates/ui-egui/src/windows.rs).
-craft-quit = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["egui"] }
+craft-quit = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585", features = ["egui"] }
 # The macOS app menu whose Quit asks about unsaved changes (apps/texturecraft/src/main.rs).
-craft-menu = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+craft-menu = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585" }
 
 # egui 0.37 and winit: the suite's forks (storytold/egui, storytold/winit), as craft-libs pins them.
 [patch.crates-io]

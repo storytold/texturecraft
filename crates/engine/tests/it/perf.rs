@@ -4,55 +4,71 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use serde_json::{Value, json};
-use texturecraft_engine::compose::{DisplayKind, tile_bytes};
+use texturecraft_engine::compose::{DisplayKind, kinds_for, tile_bytes};
+use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
+use texturecraft_engine::texel::TILE;
 use texturecraft_engine::{Session, execute};
 
-/// A ~10 layer stack: procedural fills, generators, a blurred mask, a folder and painted layers.
-fn stack(res: u32) -> Session {
-    let mut s = Session::new_project("perf", primitives::sphere(1.0, 64, 32), "builtin:sphere", None, res).unwrap();
-    s.viewport = Vec2::new(800.0, 800.0);
-    let run = |s: &mut Session, id: &str, p: Value| execute(s, id, &p).unwrap();
-    run(&mut s, "layer.add.fill", json!({"color": [0.6, 0.5, 0.4], "roughness": 0.6}));
-    run(&mut s, "layer.fill.set", json!({"channel": "baseColor", "procedural": "clouds", "low": [0.2, 0.2, 0.2], "high": [0.8, 0.7, 0.6]}));
-    run(&mut s, "layer.fill.set", json!({"channel": "height", "procedural": "cells", "low": [-0.2, -0.2, -0.2], "high": [0.2, 0.2, 0.2]}));
-    run(&mut s, "layer.add.fill", json!({"color": [0.1, 0.3, 0.6]}));
-    run(&mut s, "layer.fill.set", json!({"channel": "roughness", "procedural": "grunge"}));
-    run(&mut s, "mask.add.black", Value::Null);
-    run(&mut s, "effect.add.generator", json!({"generator": "position", "level": 0.5}));
-    run(&mut s, "effect.add.filter", json!({"filter": "blur", "radius": 8}));
-    run(&mut s, "layer.add.fill", json!({"roughness": 0.3}));
-    run(&mut s, "layer.fill.set", json!({"channel": "baseColor", "procedural": "wood"}));
-    run(&mut s, "layer.fill.projection", json!({"projection": "triplanar", "scale": 2}));
-    run(&mut s, "mask.add.black", Value::Null);
-    run(&mut s, "effect.add.fill", json!({"procedural": "scratches", "scale": 6}));
-    run(&mut s, "layer.add.fill", json!({"color": [0.2, 0.2, 0.2], "metallic": 1.0}));
-    run(&mut s, "mask.add.black", Value::Null);
-    run(&mut s, "effect.add.generator", json!({"generator": "dirt"}));
-    run(&mut s, "layer.add.fill", json!({"roughness": 0.8}));
-    run(&mut s, "layer.fill.set", json!({"channel": "roughness", "procedural": "marble"}));
-    run(&mut s, "layer.add.group", Value::Null);
-    run(&mut s, "layer.add.fill", json!({"color": [0.9, 0.9, 0.2]}));
-    run(&mut s, "mask.add.black", Value::Null);
-    run(&mut s, "effect.add.generator", json!({"generator": "direction"}));
-    run(&mut s, "effect.add.levels", json!({"inLow": 0.3, "inHigh": 0.7}));
-    let top = s.doc.project.texture_sets[0].stack.last().copied().unwrap();
-    run(&mut s, "layer.select", json!({"layer": top.0}));
-    run(&mut s, "layer.add.paint", Value::Null);
-    run(&mut s, "tool.brush", json!({"size": 6, "hardness": 80}));
-    run(&mut s, "tool.stroke", json!({"points": [[200, 300], [600, 500]]}));
-    run(&mut s, "layer.add.paint", Value::Null);
-    s.update();
-    s
+// Exercise procedural fills, generators, a blurred mask, a folder and painted layers
+fn stack(resolution: u32) -> Session {
+    let mut session = Session::new_project("perf", primitives::sphere(1.0, 64, 32), "builtin:sphere", None, resolution).unwrap();
+    session.viewport = Vec2::new(800.0, 800.0);
+
+    let run = |session: &mut Session, id: &str, params: Value| execute(session, id, &params).unwrap();
+    run(&mut session, "layer.add.fill", json!({"color": [0.6, 0.5, 0.4], "roughness": 0.6}));
+    run(&mut session, "layer.fill.set", json!({"channel": "baseColor", "procedural": "clouds", "low": [0.2, 0.2, 0.2], "high": [0.8, 0.7, 0.6]}));
+    run(&mut session, "layer.fill.set", json!({"channel": "height", "procedural": "cells", "low": [-0.2, -0.2, -0.2], "high": [0.2, 0.2, 0.2]}));
+    run(&mut session, "layer.add.fill", json!({"color": [0.1, 0.3, 0.6]}));
+    run(&mut session, "layer.fill.set", json!({"channel": "roughness", "procedural": "grunge"}));
+    run(&mut session, "mask.add.black", Value::Null);
+    run(&mut session, "effect.add.generator", json!({"generator": "position", "level": 0.5}));
+    run(&mut session, "effect.add.filter", json!({"filter": "blur", "radius": 8}));
+    run(&mut session, "layer.add.fill", json!({"roughness": 0.3}));
+    run(&mut session, "layer.fill.set", json!({"channel": "baseColor", "procedural": "wood"}));
+    run(&mut session, "layer.fill.projection", json!({"projection": "triplanar", "scale": 2}));
+    run(&mut session, "mask.add.black", Value::Null);
+    run(&mut session, "effect.add.fill", json!({"procedural": "scratches", "scale": 6}));
+    run(&mut session, "layer.add.fill", json!({"color": [0.2, 0.2, 0.2], "metallic": 1.0}));
+    run(&mut session, "mask.add.black", Value::Null);
+    run(&mut session, "effect.add.generator", json!({"generator": "dirt"}));
+    run(&mut session, "layer.add.fill", json!({"roughness": 0.8}));
+    run(&mut session, "layer.fill.set", json!({"channel": "roughness", "procedural": "marble"}));
+    run(&mut session, "layer.add.group", Value::Null);
+    run(&mut session, "layer.add.fill", json!({"color": [0.9, 0.9, 0.2]}));
+    run(&mut session, "mask.add.black", Value::Null);
+    run(&mut session, "effect.add.generator", json!({"generator": "direction"}));
+    run(&mut session, "effect.add.levels", json!({"inLow": 0.3, "inHigh": 0.7}));
+
+    let top_layer = session.doc.project.texture_sets[0].stack.last().copied().unwrap();
+    run(&mut session, "layer.select", json!({"layer": top_layer.0}));
+    run(&mut session, "layer.add.paint", Value::Null);
+    run(&mut session, "tool.brush", json!({"size": 6, "hardness": 80}));
+    run(&mut session, "tool.stroke", json!({"points": [[200, 300], [600, 500]]}));
+    run(&mut session, "layer.add.paint", Value::Null);
+
+    session.update();
+    session
 }
 
-fn upload_bytes(s: &mut Session) -> usize {
-    let tiles = s.take_uploads(0);
-    let baked = s.baked(0).cloned().unwrap_or_default();
-    let comp = &s.caches[0].composite;
-    // As the UI does it (in parallel).
-    tiles.par_iter().flat_map_iter(|&(tx, ty)| DisplayKind::ALL.map(|k| tile_bytes(comp, &baked, k, tx, ty).len())).sum()
+/// Convert dirty tiles for a new set and report bytes for selected and all display kinds.
+/// Previously sent kinds can add conversion work when a set keeps its GPU textures.
+fn upload_bytes(session: &mut Session) -> (usize, usize) {
+    let tiles = session.take_uploads(0);
+    let empty = Default::default();
+    let baked = session.doc.baked.get(&0).unwrap_or(&empty);
+    let composite = &session.caches[0].composite;
+    let channels: Vec<Channel> = composite.channels.keys().copied().collect();
+    let kinds: Vec<DisplayKind> = kinds_for(&channels).collect();
+    let selected_bytes = tiles
+        .par_iter()
+        .flat_map_iter(|&(tile_x, tile_y)| kinds.iter().map(move |&kind| (kind, tile_x, tile_y)))
+        .map(|(kind, tile_x, tile_y)| tile_bytes(composite, baked, kind, tile_x, tile_y).len())
+        .sum();
+    let all_bytes_per_tile: usize = DisplayKind::ALL.iter().map(|kind| kind.bytes_per_texel() * (TILE * TILE) as usize).sum();
+
+    (selected_bytes, tiles.len() * all_bytes_per_tile)
 }
 
 fn mb(b: usize) -> f64 {
@@ -68,8 +84,8 @@ fn bench(res: u32) {
     s.update();
     println!("[{res}²] full recomposite (Session::update) {:.2?}", t.elapsed());
     let t = Instant::now();
-    let up = upload_bytes(&mut s);
-    println!("[{res}²] full display tile conversion {:.2?} ({:.0} MB)", t.elapsed(), mb(up));
+    let (up, all) = upload_bytes(&mut s);
+    println!("[{res}²] full display tile conversion {:.2?} ({:.0} MB needed kinds; {:.0} MB all kinds)", t.elapsed(), mb(up), mb(all));
 
     // The UI's budgeted update: a full recomposite spread over frames.
     s.caches[0].invalidate_all();
@@ -313,10 +329,108 @@ fn bench_8k_stroke_end() {
             s.update();
             let after = t.elapsed();
             let t = Instant::now();
-            let up = upload_bytes(&mut s);
-            println!("[8k] size {size}: end_stroke {end:.2?}, update {after:.2?} ({tiles} tiles), display {:.2?} ({:.1} MB)", t.elapsed(), mb(up));
+            let (up, all) = upload_bytes(&mut s);
+            println!(
+                "[8k] size {size}: end_stroke {end:.2?}, update {after:.2?} ({tiles} tiles), display {:.2?} ({:.1} MB needed kinds; {:.1} MB all kinds)",
+                t.elapsed(),
+                mb(up),
+                mb(all)
+            );
         }
     }
+}
+
+// Benchmark document clones and 100 undo-producing strokes
+#[test]
+#[ignore]
+fn bench_history() {
+    let resolution = 4096;
+    let setup_started = Instant::now();
+    let mut session = stack(resolution);
+    for _ in 0..20 {
+        execute(&mut session, "layer.add.paint", &Value::Null).unwrap();
+        execute(&mut session, "tool.stroke", &json!({"points": [[200, 300], [260, 320]]})).unwrap();
+    }
+    println!("[{resolution}²] history setup {:.2?}", setup_started.elapsed());
+
+    let clone_started = Instant::now();
+    for _ in 0..100 {
+        drop(std::hint::black_box(session.doc.clone()));
+    }
+    println!("[{resolution}²] document clone {:.2?} average over 100", clone_started.elapsed() / 100);
+
+    let initial_history_depth = session.history_labels().len();
+    let strokes_started = Instant::now();
+    for stroke_index in 0..100 {
+        // Keep strokes on the framed sphere within the 800-pixel viewport
+        let row_y = 300 + (stroke_index % 20) * 10;
+        execute(&mut session, "tool.stroke", &json!({"points": [[300, row_y], [360, row_y + 20]]})).unwrap();
+    }
+    let stroke_duration = strokes_started.elapsed();
+
+    assert_eq!(session.history_labels().len(), initial_history_depth + 100, "every stroke paints the mesh and makes an undo step");
+    println!("[{resolution}²] 100 strokes {stroke_duration:.2?} ({:.2?} per stroke)", stroke_duration / 100);
+
+    let memory = session.memory();
+    println!(
+        "[{resolution}²] memory: layer pixels {:.1} MB, composites {:.1} MB, hot-layer cache {:.1} MB",
+        mb(memory.pixels),
+        mb(memory.composites),
+        mb(memory.cache)
+    );
+}
+
+/// Drain the pending tiles with `Session::update`, returning how long that took.
+fn settle(s: &mut Session) -> Duration {
+    let t = Instant::now();
+    while s.pending_tiles() > 0 {
+        s.update();
+    }
+    t.elapsed()
+}
+
+/// Undo and redo of one small stroke: the tiles left pending and the time to recomposite them.
+/// `blur` keeps the stack's blurred mask (a neighbourhood filter forces a full recomposite).
+fn bench_undo_at(res: u32, blur: bool) {
+    use texturecraft_engine::core::{EffectKind, Filter};
+    let t = Instant::now();
+    let mut s = stack(res);
+    if !blur {
+        let blurs: Vec<_> = s
+            .doc
+            .project
+            .layers
+            .values()
+            .filter_map(|l| l.mask.as_ref())
+            .flat_map(|m| m.effects.iter())
+            .filter(|e| matches!(e.kind, EffectKind::Filter(Filter::Blur { .. })))
+            .map(|e| e.id.0)
+            .collect();
+        for id in blurs {
+            execute(&mut s, "effect.remove", &json!({"effect": id})).unwrap();
+        }
+    }
+    s.update();
+    let label = if blur { "blur mask kept" } else { "no neighbourhood filters" };
+    println!("[{res}², {label}] setup {:.2?} ({} covered tiles)", t.elapsed(), s.caches[0].covered_tiles.len());
+    // Seed the layer image before measuring partial undo
+    execute(&mut s, "tool.stroke", &json!({"points": [[500, 500], [520, 510]]})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[300, 300], [330, 310]]})).unwrap();
+    s.update();
+    for (name, cmd) in [("undo", "edit.undo"), ("redo", "edit.redo")] {
+        execute(&mut s, cmd, &Value::Null).unwrap();
+        let pending = s.pending_tiles();
+        println!("[{res}², {label}] {name}: {pending} tiles pending, settled in {:.2?}", settle(&mut s));
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_undo() {
+    // The 8192 setup takes many minutes under load
+    let res = 4096;
+    bench_undo_at(res, true);
+    bench_undo_at(res, false);
 }
 
 #[test]
@@ -396,4 +510,44 @@ fn bench_layer_thumbs_4k() {
         eprintln!("  {kind:8} {n:3} × avg {:.2} ms, max {:.2} ms", sum.as_secs_f64() * 1e3 / n as f64, max.as_secs_f64() * 1e3);
     }
     eprintln!("  every target once: {:.1} ms ({} pictures)", total.as_secs_f64() * 1e3, targets.len());
+}
+
+/// A full recomposite in one call against the same one spread over frames, as the UI runs it, with and without a blurred mask
+/// in the stack: neighbourhood filters are what a frame slice pays for apart from its own tiles.
+#[test]
+#[ignore]
+fn bench_sliced_filters_4k() {
+    for blur in [false, true] {
+        let mut session = Session::new_project("sliced", primitives::sphere(1.0, 64, 32), "builtin:sphere", None, 4096).unwrap();
+        session.viewport = Vec2::new(800.0, 800.0);
+        let run = |session: &mut Session, id: &str, params: Value| execute(session, id, &params).unwrap();
+        run(&mut session, "layer.add.fill", json!({"color": [0.6, 0.5, 0.4], "roughness": 0.6}));
+        run(&mut session, "layer.add.fill", json!({"color": [0.1, 0.3, 0.6]}));
+        run(&mut session, "mask.add.black", Value::Null);
+        run(&mut session, "effect.add.generator", json!({"generator": "position", "level": 0.5}));
+        if blur {
+            run(&mut session, "effect.add.filter", json!({"filter": "blur", "radius": 8}));
+        }
+
+        session.update();
+
+        session.caches[0].invalidate_all();
+        let started = Instant::now();
+        session.update();
+        let direct = started.elapsed();
+
+        session.caches[0].invalidate_all();
+        let clock = Instant::now();
+        let elapsed_ms = || clock.elapsed().as_secs_f64() * 1000.0;
+        let (mut frames, mut longest_frame) = (0, Duration::ZERO);
+        while session.pending_tiles() > 0 {
+            let started = Instant::now();
+            session.update_for(30.0, elapsed_ms);
+            longest_frame = longest_frame.max(started.elapsed());
+            frames += 1;
+        }
+
+        let label = if blur { "blurred mask" } else { "no filter" };
+        println!("[sliced 4096², {label}] one call {direct:.2?}; in 30 ms slices {frames} frames, worst {longest_frame:.2?}, total {:.2?}", clock.elapsed());
+    }
 }

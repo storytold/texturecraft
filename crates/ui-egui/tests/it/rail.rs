@@ -226,9 +226,8 @@ fn window_views_open_the_rail_panels_popup() {
     assert!(popup_shows(&harness, "Shader Settings"));
     assert!(!harness.state().ui.dock.is_open(Panel::Shader));
 
-    // Project configuration opens Display Settings, in its popup too
-    texturecraft_ui_egui::menus::invoke(harness.state_mut(), &ctx, "ui.projectConfig");
-    harness.run_steps(SETTLE_FRAMES);
+    // Display Settings still opens from its rail icon
+    click_rail(&mut harness, "Display Settings");
 
     assert!(popup_shows(&harness, "Display Settings"));
 }

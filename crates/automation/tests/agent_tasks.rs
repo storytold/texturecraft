@@ -445,7 +445,8 @@ async fn mesh_files_export_bake_and_reimport_in_the_workspace() {
     let cage = tool(&c, "bake_mesh_add", json!({"path": "out/cube.glb", "cage": true})).await;
     assert_eq!(cage["meshes"]["cage"]["name"], "cube.glb", "{cage}");
     assert_eq!(inspect(&c).await["bakeMeshes"]["highPoly"][0]["name"], "cube.usdz");
-    // A built-in mesh has no file to re-read; a file does.
+
+    // A built-in mesh has no file to re-read; a file does
     assert!(tool_err(&c, "mesh_reimport", json!({})).await.contains("built-in"));
     tool(&c, "mesh_reimport", json!({"path": "out/cube.glb", "preserveStrokes": true})).await;
     assert_eq!(inspect(&c).await["mesh"]["source"], "mesh.glb");

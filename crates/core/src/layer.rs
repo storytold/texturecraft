@@ -4,13 +4,37 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BlendMode, Channel, ChannelKind, lum};
+use crate::{BakedMap, BlendMode, Channel, ChannelKind, lum};
 
 mod curvature_detail;
 mod curvature_mode;
+mod decal_flip;
+mod decal_symmetry;
+mod generator_global;
+mod micro_detail;
+mod output_resolution;
+mod resolution_mode;
+mod tile_blending;
+mod tile_generator;
+mod tile_input_distribution;
+mod tile_shape;
+mod tile_size_mode;
+mod tile_symmetry;
 
 pub use curvature_detail::CurvatureDetail;
 pub use curvature_mode::CurvatureMode;
+pub use decal_flip::DecalFlip;
+pub use decal_symmetry::DecalSymmetry;
+pub use generator_global::GeneratorGlobal;
+pub use micro_detail::MicroDetail;
+pub use output_resolution::OutputResolution;
+pub use resolution_mode::ResolutionMode;
+pub use tile_blending::TileBlending;
+pub use tile_generator::TileGenerator;
+pub use tile_input_distribution::TileInputDistribution;
+pub use tile_shape::TileShape;
+pub use tile_size_mode::TileSizeMode;
+pub use tile_symmetry::TileSymmetry;
 
 /// Id of a layer or effect (one id space per project).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -184,6 +208,18 @@ pub struct Decal {
     pub offset: [f32; 2],
     /// How far in front of and behind the frame the decal reaches (world units).
     pub depth: f32,
+    /// A mirrored copy of the decal on the other side of the mesh (None: no copy). The copy
+    /// follows this frame, so moving, scaling or turning the decal moves it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symmetry: Option<DecalSymmetry>,
+    /// Mirror the image inside the frame: left to right (`[0]`), top to bottom (`[1]`). Old projects have neither.
+    #[serde(default, skip_serializing_if = "not_flipped")]
+    pub flip: [bool; 2],
+}
+
+/// Serde helper: a decal that mirrors nothing saves without the field
+fn not_flipped(flip: &[bool; 2]) -> bool {
+    !flip[0] && !flip[1]
 }
 
 impl Default for Projection {
@@ -254,10 +290,12 @@ pub enum ProceduralKind {
     Pores,
     /// Sharp-edged paint chips.
     Chips,
+    /// Shapes laid out in a grid of tiles, with the settings in [`Procedural::tile`]
+    TileGenerator,
 }
 
 impl ProceduralKind {
-    pub const ALL: [ProceduralKind; 23] = [
+    pub const ALL: [ProceduralKind; 24] = [
         ProceduralKind::Clouds,
         ProceduralKind::Perlin,
         ProceduralKind::Noise,
@@ -281,6 +319,7 @@ impl ProceduralKind {
         ProceduralKind::Smudges,
         ProceduralKind::Pores,
         ProceduralKind::Chips,
+        ProceduralKind::TileGenerator,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -307,6 +346,7 @@ impl ProceduralKind {
             ProceduralKind::Smudges => "Fingerprints",
             ProceduralKind::Pores => "Pores",
             ProceduralKind::Chips => "Paint chips",
+            ProceduralKind::TileGenerator => "Tile Generator",
         }
     }
     pub fn parse(s: &str) -> Option<ProceduralKind> {
@@ -327,11 +367,34 @@ pub struct Procedural {
     /// Shifts the pattern brighter (+) or darker (−).
     pub balance: f32,
     pub invert: bool,
+    /// The Tile Generator's settings; `None` for other kinds (and reads as the defaults); loaded in range, as drawing trusts them
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "tile_in_range")]
+    pub tile: Option<Box<TileGenerator>>,
+    /// The resolution the pattern is computed at before it is sampled onto the texture set
+    #[serde(default, skip_serializing_if = "OutputResolution::is_default")]
+    pub resolution: OutputResolution,
+}
+
+/// Saved Tile Generator settings brought into range (a saved project is hostile input)
+fn tile_in_range<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Box<TileGenerator>>, D::Error> {
+    let saved: Option<Box<TileGenerator>> = Deserialize::deserialize(deserializer)?;
+    Ok(saved.map(|tile| Box::new(tile.clamped())))
 }
 
 impl Procedural {
+    /// The scales a command accepts (repeats per projection unit)
+    pub const MIN_SCALE: f32 = 0.001;
+    pub const MAX_SCALE: f32 = 1000.0;
+    /// The strongest contrast a command accepts, and the furthest balance either way
+    pub const MAX_CONTRAST: f32 = 20.0;
+    pub const MAX_BALANCE: f32 = 1.0;
+
     pub fn new(kind: ProceduralKind) -> Procedural {
-        Procedural { kind, scale: 4.0, seed: 1, contrast: 1.0, balance: 0.0, invert: false }
+        let tile = (kind == ProceduralKind::TileGenerator).then(Box::default);
+
+        // The Tile Generator lays its whole grid over one projection unit, as its tile counts set its frequency
+        let scale = if tile.is_some() { 1.0 } else { 4.0 };
+        Procedural { kind, scale, seed: 1, contrast: 1.0, balance: 0.0, invert: false, tile, resolution: OutputResolution::default() }
     }
 }
 
@@ -340,8 +403,15 @@ impl Procedural {
 pub enum Source {
     /// A constant value (linear RGB for colors; `[v, v, v]` for scalars).
     Uniform([f32; 3]),
-    /// A procedural pattern mixing two values.
-    Procedural { pattern: Procedural, low: [f32; 3], high: [f32; 3] },
+    /// A procedural pattern mixing two values, or on a color channel colored by `ramp` when it
+    /// has stops (a gradient map: dark to light through evenly spaced linear RGB colors).
+    Procedural {
+        pattern: Procedural,
+        low: [f32; 3],
+        high: [f32; 3],
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ramp: Vec<[f32; 3]>,
+    },
     /// An imported image resource, by name. `normal_format` is the convention of a normal map
     /// image (DirectX images have their green flipped where a normal channel samples them).
     Image {
@@ -350,8 +420,14 @@ pub enum Source {
         normal_format: crate::NormalFormat,
     },
     /// The stack value recorded by an anchor point effect (`anchor` is the effect id) for
-    /// `channel`; colors read as gray where a scalar is needed.
-    Anchor { anchor: LayerId, channel: Channel },
+    /// `channel`; colors read as gray where a scalar is needed. On a color channel a `ramp` with
+    /// stops recolors the value by its lightness (a gradient map).
+    Anchor {
+        anchor: LayerId,
+        channel: Channel,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ramp: Vec<[f32; 3]>,
+    },
 }
 
 impl Source {
@@ -362,6 +438,23 @@ impl Source {
     /// Image resource `name` (an OpenGL normal map where a normal channel samples it).
     pub fn image(name: impl Into<String>) -> Source {
         Source::Image { name: name.into(), normal_format: crate::NormalFormat::OpenGl }
+    }
+
+    /// The image resources this source reads: its image, or the images of a Tile Generator pattern
+    pub fn images(&self) -> Vec<&str> {
+        match self {
+            Source::Image { name, .. } => vec![name.as_str()],
+            Source::Procedural { pattern, .. } => pattern.tile.iter().flat_map(|tile| tile.images()).collect(),
+            Source::Uniform(_) | Source::Anchor { .. } => Vec::new(),
+        }
+    }
+
+    /// The gradient map stops of a procedural or anchor source (empty: none).
+    pub fn ramp(&self) -> &[[f32; 3]] {
+        match self {
+            Source::Procedural { ramp, .. } | Source::Anchor { ramp, .. } => ramp,
+            _ => &[],
+        }
     }
 
     /// The anchor point this source reads, if any.
@@ -526,6 +619,17 @@ impl GeneratorKind {
             GeneratorKind::Direction => "Light / direction",
         }
     }
+
+    /// The mesh maps this kind reads, each an input that an image, a uniform value or an anchor can replace.
+    pub fn inputs(self) -> &'static [BakedMap] {
+        match self {
+            GeneratorKind::EdgeWear | GeneratorKind::Curvature => &[BakedMap::Curvature],
+            GeneratorKind::Dirt | GeneratorKind::AmbientOcclusion => &[BakedMap::AmbientOcclusion],
+            GeneratorKind::ThinAreas => &[BakedMap::Thickness],
+            GeneratorKind::Position | GeneratorKind::Direction => &[],
+        }
+    }
+
     pub fn parse(s: &str) -> Option<GeneratorKind> {
         let norm = |x: &str| x.to_ascii_lowercase().replace([' ', '_', '-', ':'], "");
         GeneratorKind::ALL.into_iter().find(|k| norm(&format!("{k:?}")) == norm(s) || norm(k.label()) == norm(s))
@@ -552,9 +656,28 @@ pub struct Generator {
     /// Mode and detail sizes of `Curvature` / `EdgeWear` generators (None: the curvature map as baked, as before detail sizes existed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<CurvatureDetail>,
+    /// Blur, balance and contrast of the finished value (neutral for generators saved before they existed).
+    #[serde(default, skip_serializing_if = "GeneratorGlobal::is_neutral")]
+    pub global: GeneratorGlobal,
+    /// The resolution the generator is computed at (the texture set's for generators saved before it existed).
+    #[serde(default, skip_serializing_if = "OutputResolution::is_default")]
+    pub resolution: OutputResolution,
+    /// What an input reads instead of its mesh map (an image, a uniform value or an anchor); inputs not listed read their mesh map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<BakedMap, Source>,
+    /// Painted height read from an anchor point below, added as micro detail (None: baked maps only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro: Option<MicroDetail>,
 }
 
 impl Generator {
+    /// The softest a ramp gets, so its threshold never divides by zero.
+    pub const MIN_SOFTNESS: f32 = 1e-3;
+    /// The most noise a generator mixes in, and the range of its noise scale.
+    pub const MAX_NOISE_AMOUNT: f32 = 2.0;
+    pub const MIN_NOISE_SCALE: f32 = 0.01;
+    pub const MAX_NOISE_SCALE: f32 = 1000.0;
+
     pub fn new(kind: GeneratorKind) -> Generator {
         let (level, softness, noise_amount) = match kind {
             GeneratorKind::EdgeWear => (0.5, 0.25, 0.3),
@@ -568,7 +691,22 @@ impl Generator {
             GeneratorKind::EdgeWear => Some(CurvatureDetail { mode: CurvatureMode::Edges, weights: CurvatureDetail::EDGE_WEIGHTS }),
             _ => None,
         };
-        Generator { kind, level, softness, noise_amount, noise_scale: 8.0, seed: 7, offset: 0.0, direction: [0.0, 1.0, 0.0], invert: false, detail }
+        Generator {
+            kind,
+            level,
+            softness,
+            noise_amount,
+            noise_scale: 8.0,
+            seed: 7,
+            offset: 0.0,
+            direction: [0.0, 1.0, 0.0],
+            invert: false,
+            detail,
+            global: GeneratorGlobal::default(),
+            resolution: OutputResolution::default(),
+            inputs: BTreeMap::new(),
+            micro: None,
+        }
     }
 
     /// The mask value for a (noise-broken) signal `s`: the smooth threshold at `level` over
@@ -980,8 +1118,10 @@ pub enum EffectKind {
     /// Content only: a material fill (one source per channel; channels without a source are
     /// left as they are).
     Material(Fill),
-    /// Content only: records the composited stack right after its layer (that layer and
-    /// everything below) so masks and fills above can read it ([`Source::Anchor`]).
+    /// Records the stack at its place so masks, fills and generators above can read it
+    /// ([`Source::Anchor`]). In a content stack it records the composited stack right after its
+    /// layer (that layer and everything below); in a mask, the mask value at that point (every
+    /// channel reads that gray).
     Anchor,
 }
 
@@ -990,6 +1130,10 @@ pub enum EffectKind {
 pub struct PathShape {
     /// Surface positions (3D view) or texture coordinates with z = 0 (2D view).
     pub points: Vec<[f32; 3]>,
+    /// Per point: the curve turns sharply there instead of passing smoothly through. Empty (and absent from old
+    /// projects) when every point is smooth; a missing entry is smooth too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub corners: Vec<bool>,
     pub uv: bool,
     pub closed: bool,
     /// A closed path fills its interior instead of stroking the curve.
@@ -1027,9 +1171,9 @@ impl EffectKind {
     /// both (`None`).
     pub fn content_only(&self) -> Option<bool> {
         match self {
-            EffectKind::Material(_) | EffectKind::Anchor => Some(true),
+            EffectKind::Material(_) => Some(true),
             EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection { .. } | EffectKind::Compare { .. } => Some(false),
-            EffectKind::Paint | EffectKind::Path(_) | EffectKind::Levels(_) | EffectKind::Filter(_) => None,
+            EffectKind::Paint | EffectKind::Path(_) | EffectKind::Levels(_) | EffectKind::Filter(_) | EffectKind::Anchor => None,
         }
     }
 
@@ -1038,13 +1182,48 @@ impl EffectKind {
         matches!(self, EffectKind::Paint | EffectKind::Path(_))
     }
 
-    /// Anchor points read by this effect's sources.
+    /// Whether a source of this effect (a fill, a material or a generator input) reads an anchor point.
     fn reads_anchor(&self) -> bool {
         match self {
             EffectKind::Fill { source, .. } => source.anchor().is_some(),
-            EffectKind::Material(f) => f.sources.values().any(|s| s.anchor().is_some()),
+            EffectKind::Material(fill) => fill.sources.values().any(|source| source.anchor().is_some()),
+            EffectKind::Generator(generator) => generator.micro.is_some() || generator.inputs.values().any(|source| source.anchor().is_some()),
             _ => false,
         }
+    }
+
+    /// The anchor points this effect's sources read, with the channel each reads.
+    pub fn anchors_read(&self) -> Vec<(LayerId, Channel)> {
+        let sources: Vec<&Source> = match self {
+            EffectKind::Fill { source, .. } => vec![source],
+            EffectKind::Material(fill) => fill.sources.values().collect(),
+            EffectKind::Generator(generator) => generator.inputs.values().collect(),
+            _ => Vec::new(),
+        };
+        let mut anchors: Vec<_> = sources
+            .into_iter()
+            .filter_map(|source| match source {
+                Source::Anchor { anchor, channel, .. } => Some((*anchor, *channel)),
+                _ => None,
+            })
+            .collect();
+        if let EffectKind::Generator(generator) = self
+            && let Some(micro) = generator.micro
+        {
+            anchors.push((micro.anchor, Channel::Height));
+        }
+        anchors
+    }
+
+    /// The image resources this effect's sources read (a fill, its patterns, a material or a generator input)
+    pub fn images_read(&self) -> impl Iterator<Item = &str> {
+        let sources: Vec<&Source> = match self {
+            EffectKind::Fill { source, .. } => vec![source],
+            EffectKind::Material(fill) => fill.sources.values().collect(),
+            EffectKind::Generator(generator) => generator.inputs.values().collect(),
+            _ => Vec::new(),
+        };
+        sources.into_iter().flat_map(Source::images)
     }
 }
 
@@ -1071,7 +1250,7 @@ pub struct Effect {
 
 impl Effect {
     pub fn new(id: LayerId, kind: EffectKind) -> Effect {
-        // Generators and fills that build a mask usually add on top of the background.
+        // Generators and fills that build a mask usually add on top of the background
         Effect { id, name: kind.name().to_string(), visible: true, kind, blend: BlendMode::Normal, opacity: 1.0 }
     }
 }
@@ -1079,6 +1258,36 @@ impl Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_decal_saved_without_symmetry_loads_unchanged_and_saves_without_it() {
+        let old = r#"{"center":[0.0,0.0,1.0],"normal":[0.0,0.0,1.0],"up":[0.0,1.0,0.0],"size":[1.0,1.0],"rotation":0.0,"offset":[0.0,0.0],"depth":0.5}"#;
+        let decal: Decal = serde_json::from_str(old).unwrap();
+        assert_eq!(decal.symmetry, None);
+        assert_eq!(serde_json::to_string(&decal).unwrap(), old.replace(' ', ""), "nothing new is written for a decal without a copy");
+
+        let mirrored = Decal { symmetry: Some(DecalSymmetry { axis: 2, flip: DecalFlip::V, offset: 0.0 }), ..decal };
+        let json = serde_json::to_string(&mirrored).unwrap();
+        assert!(json.contains(r#""symmetry":{"axis":2,"flip":"v"}"#), "{json}");
+        assert_eq!(serde_json::from_str::<Decal>(&json).unwrap(), mirrored);
+        let without_flip = json.replace(r#","flip":"v""#, "");
+        assert_eq!(serde_json::from_str::<Decal>(&without_flip).unwrap().symmetry, Some(DecalSymmetry { axis: 2, flip: DecalFlip::None, offset: 0.0 }));
+
+        // The plane's offset is written only when it is not zero
+        let moved = Decal { symmetry: Some(DecalSymmetry { axis: 1, flip: DecalFlip::None, offset: -0.25 }), ..decal };
+        let json = serde_json::to_string(&moved).unwrap();
+        assert!(json.contains(r#""offset":-0.25}"#), "{json}");
+        assert_eq!(serde_json::from_str::<Decal>(&json).unwrap(), moved);
+    }
+
+    #[test]
+    fn material_effect_images_are_reported_as_used() {
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::BaseColor, Source::image("material.png"));
+        let effect = EffectKind::Material(fill);
+
+        assert_eq!(effect.images_read().collect::<Vec<_>>(), vec!["material.png"]);
+    }
 
     #[test]
     fn generator_offset_shifts_the_mask_value() {
@@ -1105,6 +1314,42 @@ mod tests {
     }
 
     #[test]
+    fn patterns_saved_before_tile_settings_keep_their_form() {
+        let saved = serde_json::json!({"kind": "Clouds", "scale": 4.0, "seed": 1, "contrast": 1.0, "balance": 0.0, "invert": false});
+
+        let loaded: Procedural = serde_json::from_value(saved.clone()).unwrap();
+
+        assert_eq!(loaded, Procedural::new(ProceduralKind::Clouds));
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), saved, "a pattern at its defaults saves as before");
+
+        let tile = serde_json::to_value(Procedural::new(ProceduralKind::TileGenerator)).unwrap();
+
+        assert!(
+            tile.get("tile").is_some() && tile.get("resolution").is_none(),
+            "only the Tile Generator carries tile settings, and a default resolution is not saved"
+        );
+    }
+
+    #[test]
+    fn tile_settings_saved_with_missing_or_hostile_values_load_in_range() {
+        let tile = serde_json::json!({"amount": [0, 4000], "specific": 7.0, "quarter_turns": 6, "inputs": ["a", "b", "c", "d", "e", "f", "g"]});
+        let saved = serde_json::json!({"kind": "TileGenerator", "scale": 1.0, "seed": 1, "contrast": 1.0, "balance": 0.0, "invert": false, "tile": tile});
+
+        let loaded: Procedural = serde_json::from_value(saved).unwrap();
+        let tile = loaded.tile.unwrap();
+
+        assert_eq!(tile.amount, [1, 64]);
+        assert_eq!(tile.specific, 1.0);
+        assert_eq!(tile.quarter_turns, 2);
+        assert_eq!(tile.inputs.len(), TileGenerator::MAX_INPUTS);
+        assert_eq!(tile.middle_size, TileGenerator::default().middle_size, "a missing setting reads its default");
+
+        let not_finite = TileGenerator { scale: f32::NAN, rotation: f32::INFINITY, ..TileGenerator::default() }.clamped();
+
+        assert_eq!((not_finite.scale, not_finite.rotation), (1.0, 0.0));
+    }
+
+    #[test]
     fn curvature_generators_saved_before_detail_sizes_load_without_them() {
         let mut saved = serde_json::to_value(Generator::new(GeneratorKind::Curvature)).unwrap();
         assert!(saved.get("detail").is_some(), "new curvature generators have detail sizes");
@@ -1113,6 +1358,22 @@ mod tests {
         let loaded: Generator = serde_json::from_value(saved).unwrap();
         assert_eq!(loaded.detail, None);
         assert_eq!(Generator::new(GeneratorKind::Dirt).detail, None, "only curvature and edge wear generators have detail sizes");
+    }
+
+    #[test]
+    fn generators_saved_before_the_new_settings_load_and_save_unchanged() {
+        let saved = serde_json::to_value(Generator::new(GeneratorKind::Dirt)).unwrap();
+        for field in ["global", "resolution", "inputs"] {
+            assert!(saved.get(field).is_none(), "a default `{field}` is not written, so saved files stay as they were");
+        }
+
+        let loaded: Generator = serde_json::from_value(saved).unwrap();
+        assert!(loaded.global.is_neutral());
+
+        let mut blurred = Generator::new(GeneratorKind::Dirt);
+        blurred.global.blur = 0.5;
+        let round_trip: Generator = serde_json::from_value(serde_json::to_value(&blurred).unwrap()).unwrap();
+        assert_eq!(round_trip, blurred);
     }
 
     #[test]
@@ -1179,18 +1440,49 @@ mod tests {
     }
 
     #[test]
+    fn gradient_map_stops_round_trip_and_sources_without_them_save_as_before() {
+        let ramp = vec![[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let procedural = |ramp: Vec<[f32; 3]>| Source::Procedural { pattern: Procedural::new(ProceduralKind::Clouds), low: [0.25; 3], high: [0.75; 3], ramp };
+        let anchor = |ramp: Vec<[f32; 3]>| Source::Anchor { anchor: LayerId(7), channel: Channel::BaseColor, ramp };
+        for source in [procedural(ramp.clone()), anchor(ramp.clone())] {
+            let json = serde_json::to_value(&source).unwrap();
+            assert!(json.to_string().contains("\"ramp\""), "{json}");
+            assert_eq!(serde_json::from_value::<Source>(json).unwrap(), source);
+            assert_eq!(source.ramp(), ramp.as_slice());
+        }
+
+        // Empty ramps preserve older projects' JSON shape
+        let old_procedural = serde_json::json!({"Procedural": {"pattern": serde_json::to_value(Procedural::new(ProceduralKind::Clouds)).unwrap(), "low": [0.25, 0.25, 0.25], "high": [0.75, 0.75, 0.75]}});
+        let old_anchor = serde_json::json!({"Anchor": {"anchor": 7, "channel": "BaseColor"}});
+        for (old, source) in [(old_procedural, procedural(Vec::new())), (old_anchor, anchor(Vec::new()))] {
+            assert_eq!(serde_json::to_value(&source).unwrap(), old);
+            assert_eq!(serde_json::from_value::<Source>(old).unwrap(), source);
+            assert!(source.ramp().is_empty());
+        }
+        assert!(Source::Uniform([0.5; 3]).ramp().is_empty());
+    }
+
+    #[test]
     fn effect_targets_and_anchor_reads() {
-        assert_eq!(EffectKind::Anchor.content_only(), Some(true));
+        assert_eq!(EffectKind::Anchor.content_only(), None, "anchors go on content and masks");
         assert_eq!(EffectKind::Generator(Generator::new(GeneratorKind::Dirt)).content_only(), Some(false));
         assert_eq!(EffectKind::Filter(Filter::Invert).content_only(), None);
-        let mut l = Layer::new(LayerId(1), "l", LayerKind::Paint, &[Channel::BaseColor]);
-        assert!(!l.reads_anchor());
-        let source = Source::Anchor { anchor: LayerId(9), channel: Channel::Height };
-        l.mask = Some(Mask {
+        let mut fill_layer = Layer::new(LayerId(1), "l", LayerKind::Paint, &[Channel::BaseColor]);
+        assert!(!fill_layer.reads_anchor());
+        let source = Source::Anchor { anchor: LayerId(9), channel: Channel::Height, ramp: Vec::new() };
+        fill_layer.mask = Some(Mask {
             effects: vec![Effect::new(LayerId(2), EffectKind::Fill { source, projection: Projection::default() })],
             ..Mask::new(MaskBackground::Black)
         });
-        assert!(l.reads_anchor());
+        assert!(fill_layer.reads_anchor());
+
+        // A generator with micro detail reads its anchor too
+        let mut generator_layer = Layer::new(LayerId(3), "g", LayerKind::Paint, &[Channel::BaseColor]);
+        let mut generator = Generator::new(GeneratorKind::Dirt);
+        generator.micro = Some(MicroDetail { anchor: LayerId(9), amount: 0.5 });
+        assert_eq!(EffectKind::Generator(generator.clone()).anchors_read(), [(LayerId(9), Channel::Height)]);
+        generator_layer.mask = Some(Mask { effects: vec![Effect::new(LayerId(4), EffectKind::Generator(generator))], ..Mask::new(MaskBackground::Black) });
+        assert!(generator_layer.reads_anchor());
     }
 
     #[test]
@@ -1208,6 +1500,22 @@ mod tests {
         assert!(hm.apply(0.5, 0.1) > 0.5 && hm.apply(0.5, -0.1) < 0.5);
         assert!(HeightMask { offset: 0.5, ..hm }.apply(0.5, 0.0) > 0.5);
         assert_eq!(hm.apply(0.5, f32::NAN), 0.5);
+    }
+
+    #[test]
+    fn old_decals_load_unflipped_and_save_unchanged() {
+        let old = r#"{"center":[0.0,0.0,0.0],"normal":[0.0,0.0,1.0],"up":[0.0,1.0,0.0],"size":[1.0,2.0],"rotation":0.0,"offset":[0.0,0.0],"depth":0.5}"#;
+        let decal: Decal = serde_json::from_str(old).unwrap();
+        assert_eq!(decal.flip, [false, false]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&serde_json::to_string(&decal).unwrap()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(old).unwrap()
+        );
+
+        let flipped = Decal { flip: [true, false], ..decal };
+        let saved = serde_json::to_string(&flipped).unwrap();
+        assert!(saved.contains(r#""flip":[true,false]"#), "{saved}");
+        assert_eq!(serde_json::from_str::<Decal>(&saved).unwrap(), flipped);
     }
 
     #[test]
