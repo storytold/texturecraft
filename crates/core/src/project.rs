@@ -294,6 +294,9 @@ pub struct DisplaySettings {
     /// Displacement: the viewport moves the surface by the height channel (a finer copy of the
     /// mesh, same depth as height-to-normal). Painting still follows the base surface.
     pub displacement: bool,
+    /// Displacement height scale factor (multiplies displacement depth, default 1.0).
+    #[serde(default = "one")]
+    pub displacement_scale: f32,
     /// Subsurface scattering (where the Scattering weight channel is painted): linear color of
     /// the light that travels under the surface; each channel scales how far it travels.
     pub scatter_color: [f32; 3],
@@ -381,6 +384,7 @@ impl Default for DisplaySettings {
             spec_gloss: false,
             parallax: false,
             displacement: false,
+            displacement_scale: 1.0,
             scatter_color: [1.0, 0.4, 0.25],
             scatter_radius: 0.1,
             ior: 1.5,
