@@ -54,7 +54,7 @@ pub const CATALOG: &[Item] = &[
     it("File", "Import PBR texture folder...", "file.importPbrFolder", None),
     it("File", "Import material...", "material.load", None),
     it("File", "Export Textures...", "ui.export", Some("Ctrl+Shift+E")),
-    it("File", "Export Mesh...", "file.exportMesh", None),
+    it("File", "Export Mesh...", "ui.exportMesh", None),
     sep("File"),
     it("File", "Quit", "ui.quit", Some("Ctrl+Q")),
     it("Edit", "Undo", "edit.undo", Some("Ctrl+Z")),
@@ -134,7 +134,7 @@ fn is_ui(id: &str) -> bool {
 
 /// Shell items that act on the open project: greyed while none is open
 fn ui_needs_project(id: &str) -> bool {
-    matches!(id, "ui.export" | "ui.projectConfig" | "ui.uvChecker" | "ui.mode.bake" | "ui.mode.paint" | "ui.mode.render")
+    matches!(id, "ui.export" | "ui.exportMesh" | "ui.projectConfig" | "ui.uvChecker" | "ui.mode.bake" | "ui.mode.paint" | "ui.mode.render")
 }
 
 /// Whether an item can run now
@@ -193,6 +193,7 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
     match id {
         "ui.newProject" => app.ui.windows.new_project = true,
         "ui.export" => app.ui.windows.export = true,
+        "ui.exportMesh" => app.ui.windows.export_mesh = true,
         "ui.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         #[cfg(not(target_arch = "wasm32"))]
         "ui.projectConfig" => crate::project_config::open(app),
