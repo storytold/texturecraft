@@ -178,6 +178,16 @@ fn composited_chunks_restart_the_gpu_render_only_when_displaced() {
     assert_ne!(gpu_scene_key(&session), displaced, "displaced geometry follows the heights");
 }
 
+#[test]
+fn displacement_scale_restarts_the_gpu_render_when_displaced() {
+    let mut session = session();
+    session.doc.project.display.displacement = true;
+    let initial = gpu_scene_key(&session);
+
+    session.doc.project.display.displacement_scale = 2.0;
+    assert_ne!(gpu_scene_key(&session), initial, "changing displacement scale must restart GPU render");
+}
+
 /// Loading lasts until the composited tiles are uploaded too (the GPU render reads them).
 #[test]
 fn textures_load_until_their_tiles_are_uploaded() {

@@ -275,7 +275,7 @@ fn trace_scene(app: &TextureCraftApp) -> TraceScene {
     // Only displaced geometry depends on the composites (their heights)
     let revisions: Vec<u64> = if display.displacement { session.caches.iter().map(|cache| cache.revision).collect() } else { Vec::new() };
     let strengths: Vec<f32> = sets.iter().map(|set| set.height_strength).collect();
-    let key = format!("{}|{revisions:?}|{strengths:?}|{}", session.mesh_id, display.displacement);
+    let key = format!("{}|{revisions:?}|{strengths:?}|{}|{}", session.mesh_id, display.displacement, display.displacement_scale);
     let mut cached = app.render.geometry.lock().unwrap_or_else(PoisonError::into_inner);
     let (mesh, bvh) = match cached.as_ref() {
         Some((cached_key, mesh, bvh)) if *cached_key == key => (mesh.clone(), bvh.clone()),

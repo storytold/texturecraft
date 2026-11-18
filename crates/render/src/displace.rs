@@ -15,7 +15,7 @@ use crate::trace::TraceSet;
 /// The geometry the path tracers trace for `display`: displaced when the display displaces and a
 /// set has height to displace by, else `mesh` and `bvh` as they are.
 pub fn trace_geometry(mesh: &Arc<Mesh>, bvh: &Arc<Bvh>, sets: &[TraceSet], display: &DisplaySettings) -> (Arc<Mesh>, Arc<Bvh>) {
-    match display.displacement.then(|| displaced(mesh, sets)).flatten() {
+    match display.displacement.then(|| displaced(mesh, sets, display.displacement_scale)).flatten() {
         Some(m) => {
             let bvh = Arc::new(Bvh::new(&m));
             (Arc::new(m), bvh)
@@ -26,7 +26,7 @@ pub fn trace_geometry(mesh: &Arc<Mesh>, bvh: &Arc<Bvh>, sets: &[TraceSet], displ
 
 /// `mesh` subdivided like the viewport's dense copy and displaced by the height of the set over
 /// each material (None when no set has height and a height strength).
-pub fn displaced(mesh: &Mesh, sets: &[TraceSet]) -> Option<Mesh> {
+pub fn displaced(mesh: &Mesh, sets: &[TraceSet], scale: f32) -> Option<Mesh> {
     if !sets.iter().any(|s| s.height_strength != 0.0 && s.composite.channels.contains_key(&Channel::Height)) {
         return None;
     }
@@ -55,7 +55,7 @@ pub fn displaced(mesh: &Mesh, sets: &[TraceSet]) -> Option<Mesh> {
         let p = Vec3::from(v.pos);
         let Some((set, h)) = sets.iter().zip(&heights).find(|(s, _)| s.material == m) else { return p };
         let n = Vec3::from(v.nrm).normalize_or_zero();
-        p + n * (h.as_ref().map_or(0.0, |h| h.sample(Vec2::from(v.uv))) * set.height_strength * world_per_uv / 16.0)
+        p + n * (h.as_ref().map_or(0.0, |h| h.sample(Vec2::from(v.uv))) * set.height_strength * world_per_uv / 16.0 * scale.max(0.0))
     };
     let positions: Vec<Vec3> = dense.iter().zip(&material).map(|(v, m)| lift(v, *m)).collect();
     let names = |m: usize| mesh.submeshes.iter().find(|s| s.material == m).map(|s| s.name.clone()).unwrap_or_default();
@@ -147,15 +147,18 @@ mod tests {
     #[test]
     fn uniform_height_lifts_the_dense_plane_along_its_normal() {
         let plane = primitives::plane(2.0, 1);
-        assert!(displaced(&plane, &[set(0.5, 0.0)]).is_none(), "no strength, nothing to displace");
-        assert!(displaced(&plane, &[]).is_none());
-        let m = displaced(&plane, &[set(0.5, 2.0)]).unwrap();
+        assert!(displaced(&plane, &[set(0.5, 0.0)], 1.0).is_none(), "no strength, nothing to displace");
+        assert!(displaced(&plane, &[], 1.0).is_none());
+        let m = displaced(&plane, &[set(0.5, 2.0)], 1.0).unwrap();
         assert!(m.triangle_count() > plane.triangle_count());
         assert_eq!((m.positions.len(), m.uvs.len(), m.normals.len()), (m.tangents.len(), m.positions.len(), m.positions.len()));
         // world per UV is 2 (a 2 × 2 plane over the UV square): 0.5 × 2 × 2 / 16.
         let n = plane.normals[0];
         let lift = m.positions.iter().map(|p| p.dot(n)).collect::<Vec<f32>>();
         assert!(lift.iter().all(|d| (d - 0.125).abs() < 1e-3), "{:?}", &lift[..4]);
+        let m2 = displaced(&plane, &[set(0.5, 2.0)], 2.0).unwrap();
+        let lift2 = m2.positions.iter().map(|p| p.dot(n)).collect::<Vec<f32>>();
+        assert!(lift2.iter().all(|d| (d - 0.25).abs() < 1e-3), "{:?}", &lift2[..4]);
         let off = DisplaySettings::default();
         let (mesh, bvh) = (Arc::new(plane), Arc::new(Bvh::new(&primitives::plane(2.0, 1))));
         assert!(Arc::ptr_eq(&trace_geometry(&mesh, &bvh, &[set(0.5, 2.0)], &off).0, &mesh), "off unless the display displaces");

@@ -294,6 +294,9 @@ pub struct DisplaySettings {
     /// Displacement: the viewport moves the surface by the height channel (a finer copy of the
     /// mesh, same depth as height-to-normal). Painting still follows the base surface.
     pub displacement: bool,
+    /// Displacement height scale factor (multiplies displacement depth, default 1.0).
+    #[serde(default = "one")]
+    pub displacement_scale: f32,
     /// Subsurface scattering (where the Scattering weight channel is painted): linear color of
     /// the light that travels under the surface; each channel scales how far it travels.
     pub scatter_color: [f32; 3],
@@ -381,6 +384,7 @@ impl Default for DisplaySettings {
             spec_gloss: false,
             parallax: false,
             displacement: false,
+            displacement_scale: 1.0,
             scatter_color: [1.0, 0.4, 0.25],
             scatter_radius: 0.1,
             ior: 1.5,
@@ -898,5 +902,25 @@ mod tests {
         let mut q = project();
         q.format_version = FORMAT_VERSION + 1;
         assert!(q.validate().is_err());
+    }
+
+    #[test]
+    fn display_settings_displacement_scale_serialization() {
+        let d = DisplaySettings::default();
+        assert_eq!(d.displacement_scale, 1.0);
+        let json = serde_json::to_string(&d).unwrap();
+        let back: DisplaySettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.displacement_scale, 1.0);
+
+        let mut val: serde_json::Value = serde_json::to_value(&d).unwrap();
+        val.as_object_mut().unwrap().remove("displacement_scale");
+        let def: DisplaySettings = serde_json::from_value(val).unwrap();
+        assert_eq!(def.displacement_scale, 1.0);
+
+        let mut custom = d;
+        custom.displacement_scale = 4.5;
+        let custom_json = serde_json::to_string(&custom).unwrap();
+        let custom_back: DisplaySettings = serde_json::from_str(&custom_json).unwrap();
+        assert_eq!(custom_back.displacement_scale, 4.5);
     }
 }

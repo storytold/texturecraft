@@ -377,9 +377,13 @@ pub(crate) fn shader(app: &mut TextureCraftApp, ui: &mut Ui) {
 
     ui.checkbox(&mut display.parallax, tr("Parallax occlusion (height channel)"))
         .on_hover_text(tr("Offsets the textures by the height channel, at the height to normal strength"));
-    ui.checkbox(&mut display.displacement, tr("Displacement (height channel)")).on_hover_text(tr(
-        "Moves the surface by the height channel on a finer copy of the mesh, at the height to normal strength (viewport only: painting follows the base surface)",
-    ));
+    ui.checkbox(&mut display.displacement, tr("Displacement (height channel)")).on_hover_text(
+        tr("Moves the surface by the height channel on a finer copy of the mesh, at the height to normal strength (viewport only: painting follows the base surface)"),
+    );
+    if display.displacement {
+        slider(ui, tr("Displacement scale"), &mut display.displacement_scale, 0.0..=10.0, 2)
+            .on_hover_text(tr("Scale factor for displacement height depth (0 to 10)"));
+    }
     slider(ui, tr("AO intensity"), &mut display.ao_intensity, 0.0..=1.0, 2);
     ui.add_space(6.0);
 
