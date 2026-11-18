@@ -346,6 +346,9 @@ pub struct UiState {
     /// The panel open against the icon rail, if any; not saved, so the app starts with the rail closed
     #[serde(skip)]
     pub rail_panel: Option<crate::docking::Panel>,
+    /// Whether the dock layout has been mirrored for a right-to-left interface.
+    #[serde(default)]
+    pub docks_rtl: bool,
     #[serde(default = "Dock::for_baking")]
     pub(crate) inactive_mode_dock: Dock,
     #[serde(default)]
@@ -460,6 +463,16 @@ impl UiState {
         self.rail_panel = None;
     }
 
+    /// Mirror the active and inactive docks when the language reading direction changes.
+    pub fn sync_dock_direction(&mut self, rtl: bool, width: f32) {
+        if self.docks_rtl != rtl {
+            self.dock.mirror(width);
+            self.inactive_mode_dock.mirror(width);
+            self.docks_rtl = rtl;
+        }
+    }
+    }
+
     /// Take `layout`'s panels, windows and view settings, keeping this state's dialogs, settings, files and shelf query
     pub fn adopt_layout(&mut self, layout: UiState) {
         let keep = std::mem::replace(self, layout);
@@ -499,6 +512,7 @@ impl Default for UiState {
             split_ratio: default_split_ratio(),
             dock: Dock::default(),
             rail_panel: None,
+            docks_rtl: false,
             inactive_mode_dock: Dock::for_baking(),
             dock_is_baking: false,
             bake_layout_version: BAKE_LAYOUT_VERSION,
@@ -657,6 +671,27 @@ mod tests {
         obj.remove("keymap");
         obj.insert("show_shelf".into(), serde_json::json!(false));
         let ui: UiState = serde_json::from_value(v).unwrap();
+        assert_eq!(ui.dock, Dock::default());
+    }
+
+
+    #[test]
+    fn docks_follow_the_interface_direction() {
+        let mut ui = UiState::default();
+        assert!(!ui.docks_rtl);
+        ui.sync_dock_direction(true, 1600.0);
+        assert!(ui.docks_rtl);
+        let rtl_dock = ui.dock.clone();
+        // Idempotent: calling again with true does nothing
+        ui.sync_dock_direction(true, 1600.0);
+        assert_eq!(ui.dock, rtl_dock);
+        // Survives serde
+        let json = serde_json::to_string(&ui).unwrap();
+        let restored: UiState = serde_json::from_str(&json).unwrap();
+        assert!(restored.docks_rtl);
+        // Switching back to LTR
+        ui.sync_dock_direction(false, 1600.0);
+        assert!(!ui.docks_rtl);
         assert_eq!(ui.dock, Dock::default());
     }
 }
