@@ -7,9 +7,7 @@ pub(crate) mod usd;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use serde_json::{Map, Value, json};
 use texturecraft_core::{Channel, NormalFormat};
-use texturecraft_geom::glam::Vec3;
 use texturecraft_geom::{Mesh, SubMesh};
 
 use crate::export::sanitize_file_stem;
@@ -20,7 +18,8 @@ pub use usd::{NamedFiles, UsdExport, UsdFormat, usd_bytes, usd_export_options};
 
 /// The mesh as OBJ text (UV v flipped back to OBJ's bottom-up convention).
 pub fn obj_bytes(mesh: &Mesh, name: &str) -> Vec<u8> {
-    obj_text(mesh, name, None).into_bytes()
+    let scene = to_craft_scene(mesh, &token(name), mesh.materials.iter().map(|m| craft_mesh::Material::plain(token(m), [1.0; 4])).collect(), Vec::new());
+    craft_mesh::obj::write(&scene, None, &craft_mesh::Limits::default()).unwrap_or_default().into_bytes()
 }
 
 /// The mesh as OBJ with a material library: the OBJ (naming `<stem>.mtl`, `stem` being the
@@ -62,54 +61,45 @@ pub fn obj_with_mtl(mesh: &Mesh, name: &str, stem: &str, textures: &[Vec<Exporte
         }
     }
     files.insert(0, (format!("{stem}.mtl"), mtl.into_bytes()));
-    (obj_text(mesh, name, Some(&format!("{stem}.mtl"))).into_bytes(), files)
+    let scene = to_craft_scene(mesh, &token(name), mesh.materials.iter().map(|m| craft_mesh::Material::plain(token(m), [1.0; 4])).collect(), Vec::new());
+    let obj = craft_mesh::obj::write(&scene, Some(&format!("{stem}.mtl")), &craft_mesh::Limits::default()).unwrap_or_default();
+    (obj.into_bytes(), files)
 }
 
-fn obj_text(mesh: &Mesh, name: &str, mtllib: Option<&str>) -> String {
-    let mut text = String::with_capacity(mesh.positions.len() * 96 + mesh.indices.len() * 12);
-    let _ = writeln!(text, "# {}, exported by TextureCraft", token(name));
-    if let Some(lib) = mtllib {
-        let _ = writeln!(text, "mtllib {lib}");
-    }
-    let _ = writeln!(text, "o {}", token(name));
-    for p in &mesh.positions {
-        let _ = writeln!(text, "v {} {} {}", p.x, p.y, p.z);
-    }
-
-    let uvs = mesh.uvs.len() == mesh.positions.len();
-    let normals = mesh.normals.len() == mesh.positions.len();
-    if uvs {
-        for t in &mesh.uvs {
-            let _ = writeln!(text, "vt {} {}", t.x, 1.0 - t.y);
+fn to_craft_scene(mesh: &Mesh, name: &str, materials: Vec<craft_mesh::Material>, images: Vec<craft_mesh::Image>) -> craft_mesh::Scene {
+    let n = mesh.positions.len();
+    let has_uv = mesh.uvs.len() == n;
+    let has_normal = mesh.normals.len() == n;
+    let mut parts_out = Vec::new();
+    for sm in parts(mesh, name) {
+        let tris = mesh.indices.get(sm.start as usize..(sm.start as usize).saturating_add(sm.count as usize)).unwrap_or_default();
+        let tris = tris.get(..tris.len() / 3 * 3).unwrap_or_default();
+        if tris.is_empty() {
+            continue;
         }
+        let corners = tris
+            .iter()
+            .copied()
+            .map(|i| craft_mesh::Corner { position: i, uv: if has_uv { i } else { craft_mesh::NONE }, normal: if has_normal { i } else { craft_mesh::NONE } })
+            .collect();
+        parts_out.push(craft_mesh::Part {
+            name: token(&sm.name),
+            material: (sm.material < materials.len()).then_some(sm.material),
+            corners,
+            ..craft_mesh::Part::default()
+        });
     }
-    if normals {
-        for n in &mesh.normals {
-            let _ = writeln!(text, "vn {} {} {}", n.x, n.y, n.z);
-        }
-    }
-
-    let materials = unique_ids(&mesh.materials, token);
-    for part in &parts(mesh, name) {
-        let material = materials.get(part.material).map_or("default", String::as_str);
-        let _ = writeln!(text, "g {}\nusemtl {material}", token(&part.name));
-        let (a, b) = (part.start as usize, part.start as usize + part.count as usize);
-        for triangle in mesh.indices.get(a..b).unwrap_or_default().as_chunks::<3>().0 {
-            text.push('f');
-            for i in triangle {
-                let i = i + 1;
-                let _ = match (uvs, normals) {
-                    (true, true) => write!(text, " {i}/{i}/{i}"),
-                    (true, false) => write!(text, " {i}/{i}"),
-                    (false, true) => write!(text, " {i}//{i}"),
-                    (false, false) => write!(text, " {i}"),
-                };
-            }
-            text.push('\n');
-        }
-    }
-
-    text
+    let cm = craft_mesh::Mesh {
+        name: name.into(),
+        positions: mesh.positions.iter().map(|p| p.to_array().map(f64::from)).collect(),
+        normals: if has_normal { mesh.normals.iter().map(|v| v.to_array().map(f64::from)).collect() } else { Vec::new() },
+        uv_sets: if has_uv { vec![mesh.uvs.iter().map(|t| t.to_array()).collect()] } else { Vec::new() },
+        parts: parts_out,
+        ..craft_mesh::Mesh::default()
+    };
+    let mut scene = craft_mesh::Scene::from_meshes(vec![cm], materials);
+    scene.images = images;
+    scene
 }
 
 /// `id` of each material name, made unique with `_2`, `_3`… where two would be the same, also
@@ -199,174 +189,69 @@ fn png_has_alpha(png: &[u8]) -> bool {
     matches!(png.get(25), Some(4 | 6))
 }
 
-/// The binary chunk and the JSON arrays that index into it.
-#[derive(Default)]
-struct GlbBuilder {
-    bin: Vec<u8>,
-    views: Vec<Value>,
-    accessors: Vec<Value>,
-    images: Vec<Value>,
-    textures: Vec<Value>,
-    /// Material extensions used (`extensionsUsed`).
-    extensions: BTreeSet<String>,
-}
-
-const KHR_CLEARCOAT: &str = "KHR_materials_clearcoat";
-const KHR_SHEEN: &str = "KHR_materials_sheen";
-
-impl GlbBuilder {
-    fn view(&mut self, bytes: &[u8], target: Option<u32>) -> usize {
-        while !self.bin.len().is_multiple_of(4) {
-            self.bin.push(0);
-        }
-        let mut v = json!({ "buffer": 0, "byteOffset": self.bin.len(), "byteLength": bytes.len() });
-        if let Some(t) = target {
-            v["target"] = t.into();
-        }
-        self.bin.extend_from_slice(bytes);
-        self.views.push(v);
-        self.views.len() - 1
-    }
-
-    fn accessor(&mut self, values: impl Iterator<Item = [u8; 4]>, target: u32, component: u32, kind: &str, count: usize) -> Value {
-        let bytes: Vec<u8> = values.flatten().collect();
-        let view = self.view(&bytes, Some(target));
-        self.accessors.push(json!({ "bufferView": view, "componentType": component, "count": count, "type": kind }));
-        Value::from(self.accessors.len() - 1)
-    }
-
-    /// A float vertex attribute of `kind` (VEC2 / VEC3) over `n` vertices.
-    fn attribute(&mut self, values: impl Iterator<Item = f32>, kind: &str, n: usize) -> Value {
-        self.accessor(values.map(f32::to_le_bytes), 34962, 5126, kind, n)
-    }
-
-    /// `{"index": n}` of a new texture holding `png`.
-    fn texture(&mut self, png: &[u8]) -> Value {
-        let view = self.view(png, None);
-        self.images.push(json!({ "bufferView": view, "mimeType": "image/png" }));
-        self.textures.push(json!({ "source": self.images.len() - 1, "sampler": 0 }));
-        json!({ "index": self.textures.len() - 1 })
-    }
-
-    fn material(&mut self, name: &str, t: &GlbTextures) -> Value {
-        let (mut m, mut pbr) = (Map::new(), Map::new());
-        m.insert("name".into(), name.into());
-        if let Some(png) = &t.base_color {
-            pbr.insert("baseColorTexture".into(), self.texture(png));
-            if png_has_alpha(png) {
-                m.insert("alphaMode".into(), "BLEND".into());
-            }
-        }
-        match &t.orm {
-            Some(png) => {
-                let tex = self.texture(png);
-                pbr.insert("metallicRoughnessTexture".into(), tex.clone());
-                m.insert("occlusionTexture".into(), tex);
-            }
-            None => {
-                pbr.insert("metallicFactor".into(), 0.0.into());
-            }
-        }
-        if let Some(png) = &t.normal {
-            m.insert("normalTexture".into(), self.texture(png));
-        }
-        if let Some(png) = &t.emissive {
-            m.insert("emissiveTexture".into(), self.texture(png));
-            m.insert("emissiveFactor".into(), json!([1.0, 1.0, 1.0]));
-        }
-        m.insert("pbrMetallicRoughness".into(), pbr.into());
-        let mut ext = Map::new();
-        if let Some(png) = &t.clearcoat {
-            let tex = self.texture(png);
-            let coat = json!({ "clearcoatFactor": 1.0, "clearcoatTexture": tex, "clearcoatRoughnessFactor": 1.0, "clearcoatRoughnessTexture": tex });
-            ext.insert(KHR_CLEARCOAT.into(), coat);
-        }
-        if let Some(png) = &t.sheen {
-            let tex = self.texture(png);
-            let mut sheen = json!({ "sheenColorFactor": [1.0, 1.0, 1.0], "sheenColorTexture": tex });
-            if png_has_alpha(png) {
-                sheen["sheenRoughnessFactor"] = 1.0.into();
-                sheen["sheenRoughnessTexture"] = tex;
-            } else {
-                sheen["sheenRoughnessFactor"] = Channel::SheenRoughness.default_value()[0].into();
-            }
-            ext.insert(KHR_SHEEN.into(), sheen);
-        }
-        if !ext.is_empty() {
-            self.extensions.extend(ext.keys().cloned());
-            m.insert("extensions".into(), ext.into());
-        }
-        m.into()
-    }
-}
-
 /// The mesh as binary glTF (GLB) named `name`, with `textures[i]` on material `i` (materials
 /// without an entry get a plain one). Vertex data is written as is: the mesh already follows
 /// glTF's conventions.
 pub fn glb_bytes(mesh: &Mesh, name: &str, textures: &[GlbTextures]) -> Result<Vec<u8>> {
-    let n = mesh.positions.len();
-    if n == 0 || mesh.indices.len() < 3 {
+    if mesh.positions.is_empty() || mesh.indices.len() < 3 {
         return Err(FormatError::Invalid("the mesh is empty".into()));
     }
-    let mut g = GlbBuilder::default();
-    let vec3s = |v: &[Vec3]| v.iter().flat_map(|p| p.to_array()).collect::<Vec<f32>>();
-    let mut attributes = Map::new();
-    let position = g.attribute(vec3s(&mesh.positions).into_iter(), "VEC3", n);
-    let (lo, hi) = mesh.bounds();
-    if let Some(a) = g.accessors.last_mut() {
-        a["min"] = json!(lo.to_array());
-        a["max"] = json!(hi.to_array());
-    }
-    attributes.insert("POSITION".into(), position);
-    if mesh.normals.len() == n {
-        attributes.insert("NORMAL".into(), g.attribute(vec3s(&mesh.normals).into_iter(), "VEC3", n));
-    }
-    if mesh.uvs.len() == n {
-        attributes.insert("TEXCOORD_0".into(), g.attribute(mesh.uvs.iter().flat_map(|t| t.to_array()), "VEC2", n));
-    }
-    let mut primitives = Vec::new();
-    for sm in parts(mesh, name) {
-        let tris = mesh.indices.get(sm.start as usize..(sm.start as usize).saturating_add(sm.count as usize)).unwrap_or_default();
-        let tris = tris.get(..tris.len() / 3 * 3).unwrap_or_default();
-        if tris.is_empty() {
-            continue;
-        }
-        let indices = g.accessor(tris.iter().map(|i| i.to_le_bytes()), 34963, 5125, "SCALAR", tris.len());
-        let mut p = json!({ "attributes": attributes, "indices": indices });
-        if sm.material < mesh.materials.len() {
-            p["material"] = sm.material.into();
-        }
-        primitives.push(p);
-    }
     let none = GlbTextures::default();
-    let materials: Vec<Value> = mesh.materials.iter().enumerate().map(|(i, m)| g.material(m, textures.get(i).unwrap_or(&none))).collect();
-    let mut doc = json!({
-        "asset": { "version": "2.0", "generator": "TextureCraft" },
-        "scene": 0,
-        "scenes": [{ "nodes": [0] }],
-        "nodes": [{ "mesh": 0, "name": name }],
-        "meshes": [{ "name": name, "primitives": primitives }],
-        "buffers": [{ "byteLength": g.bin.len() }],
-        "bufferViews": g.views,
-        "accessors": g.accessors,
-    });
-    if !g.textures.is_empty() {
-        doc["samplers"] = json!([{ "magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497 }]);
-    }
-    if !g.extensions.is_empty() {
-        doc["extensionsUsed"] = json!(g.extensions);
-    }
-    // glTF forbids empty arrays.
-    for (key, list) in [("materials", materials), ("images", g.images), ("textures", g.textures)] {
-        if !list.is_empty() {
-            doc[key] = list.into();
-        }
-    }
-    let js = serde_json::to_vec(&doc).map_err(|e| FormatError::Invalid(format!("glTF JSON: {e}")))?;
-    craft_mesh::gltf::glb_container(&js, &g.bin).map_err(|e| match e {
-        craft_mesh::Error::TooLarge(s) => FormatError::TooLarge(s),
-        other => FormatError::Invalid(other.to_string()),
-    })
+    let mut images = Vec::new();
+    let mut push_img = |png: &[u8]| {
+        let image = images.len();
+        images.push(craft_mesh::Image { mime_type: Some("image/png".into()), data: Some(png.to_vec()), ..craft_mesh::Image::default() });
+        craft_mesh::TextureRef { image, ..craft_mesh::TextureRef::default() }
+    };
+    let materials: Vec<craft_mesh::Material> = mesh
+        .materials
+        .iter()
+        .enumerate()
+        .map(|(i, mat_name)| {
+            let t = textures.get(i).unwrap_or(&none);
+            let mut m = craft_mesh::Material { name: mat_name.clone(), metallic: 0.0, roughness: 1.0, ..craft_mesh::Material::default() };
+            if let Some(png) = &t.base_color {
+                m.base_color_texture = Some(push_img(png));
+                if png_has_alpha(png) {
+                    m.alpha_mode = craft_mesh::AlphaMode::Blend;
+                }
+            }
+            if let Some(png) = &t.orm {
+                let tex = push_img(png);
+                m.metallic_roughness_texture = Some(tex);
+                m.occlusion_texture = Some(tex);
+                m.metallic = 1.0;
+            }
+            if let Some(png) = &t.normal {
+                m.normal_texture = Some(push_img(png));
+            }
+            if let Some(png) = &t.emissive {
+                m.emissive_texture = Some(push_img(png));
+                m.emissive = [1.0; 3];
+            }
+            if let Some(png) = &t.clearcoat {
+                let tex = push_img(png);
+                m.clearcoat = 1.0;
+                m.clearcoat_roughness = 1.0;
+                m.clearcoat_texture = Some(tex);
+                m.clearcoat_roughness_texture = Some(tex);
+            }
+            if let Some(png) = &t.sheen {
+                let tex = push_img(png);
+                m.sheen_color = [1.0; 3];
+                m.sheen_color_texture = Some(tex);
+                if png_has_alpha(png) {
+                    m.sheen_roughness = 1.0;
+                    m.sheen_roughness_texture = Some(tex);
+                } else {
+                    m.sheen_roughness = Channel::SheenRoughness.default_value()[0];
+                }
+            }
+            m
+        })
+        .collect();
+    let scene = to_craft_scene(mesh, name, materials, images);
+    craft_mesh::gltf::write_glb(&scene, &craft_mesh::Limits::default()).map_err(|e| FormatError::Invalid(e.to_string()))
 }
 
 /// OBJ names end at whitespace.
@@ -439,6 +324,9 @@ mod tests {
 
     #[test]
     fn glb_writes_clearcoat_and_sheen_extensions() {
+        use serde_json::{Value, json};
+        const KHR_CLEARCOAT: &str = "KHR_materials_clearcoat";
+        const KHR_SHEEN: &str = "KHR_materials_sheen";
         let png = |color: image::ColorType| {
             let mut out = std::io::Cursor::new(Vec::new());
             image::write_buffer_with_format(&mut out, &vec![200u8; 4 * color.channel_count() as usize], 2, 2, color, image::ImageFormat::Png).unwrap();

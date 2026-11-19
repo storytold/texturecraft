@@ -1468,40 +1468,32 @@ fn write_raster(image: &CodecImage, format: CodecFormat) -> std::result::Result<
     craft_image_codecs::encode(image, format, &options)
 }
 
-/// OpenEXR with Y / YA / RGB / RGBA channels, half or full float, ZIP compression.
-fn write_exr((w, h): (u32, u32), n: usize, data: &[f32], half: bool, space: Option<ColorSpace>) -> exr::error::Result<Vec<u8>> {
-    use exr::prelude::*;
-    let names: &[&str] = match n {
-        1 => &["Y"],
-        2 => &["Y", "A"],
-        3 => &["R", "G", "B"],
-        _ => &["R", "G", "B", "A"],
+/// OpenEXR with Y / YA / RGB / RGBA channels, half or full float, ZIP16 compression.
+fn write_exr(
+    (w, h): (u32, u32),
+    n: usize,
+    data: &[f32],
+    half: bool,
+    space: Option<ColorSpace>,
+) -> std::result::Result<Vec<u8>, craft_image_codecs::CodecError> {
+    let layout = match n {
+        1 => craft_image_codecs::ChannelLayout::Gray,
+        2 => craft_image_codecs::ChannelLayout::GrayA,
+        3 => craft_image_codecs::ChannelLayout::Rgb,
+        _ => craft_image_codecs::ChannelLayout::Rgba,
     };
-    let channels: SmallVec<[AnyChannel<FlatSamples>; 4]> = names
-        .iter()
-        .enumerate()
-        .map(|(k, name)| {
-            let plane = data.iter().skip(k).step_by(n.max(1));
-            let samples = if half { FlatSamples::F16(plane.map(|v| f16::from_f32(*v)).collect()) } else { FlatSamples::F32(plane.copied().collect()) };
-            AnyChannel::new(*name, samples)
-        })
-        .collect();
-    let layer = Layer::new((w as usize, h as usize), LayerAttributes::default(), Encoding::SMALL_LOSSLESS, AnyChannels::sort(channels));
-    let mut out = Cursor::new(Vec::new());
-    let mut image = Image::from_layer(layer);
-
-    // Store primaries and white point in the OpenEXR attribute
-    if let Some(space) = space {
-        let [r, g, b, white] = space.chromaticities().map(|xy| Vec2(xy[0] as f32, xy[1] as f32));
-        image.attributes.chromaticities = Some(exr::meta::attribute::Chromaticities { red: r, green: g, blue: b, white });
-    }
-    let writer = image.write();
-
-    // The web build has no worker threads
-    #[cfg(target_arch = "wasm32")]
-    let writer = writer.non_parallel();
-    writer.to_buffered(&mut out)?;
-    Ok(out.into_inner())
+    let img = if half {
+        let samples: Vec<half::f16> = data.iter().map(|v| half::f16::from_f32(*v)).collect();
+        craft_image_codecs::Image::from_f16(w, h, layout, &samples)?
+    } else {
+        craft_image_codecs::Image::from_f32(w, h, layout, data)?
+    };
+    let opts = craft_image_codecs::EncodeOptions {
+        exr_compression: craft_image_codecs::ExrCompression::Zip16,
+        exr_chromaticities: space.map(|s| s.chromaticities().map(|xy| [xy[0] as f32, xy[1] as f32])),
+        ..Default::default()
+    };
+    craft_image_codecs::encode(&img, craft_image_codecs::Format::Exr, &opts)
 }
 
 /// Leave out each file named like an earlier one of `files` (ignoring case, as Windows and macOS
