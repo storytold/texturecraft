@@ -1472,6 +1472,13 @@ impl Renderer {
     /// Upload one 64×64 tile of a display texture (bytes from `compose::tile_bytes`).
     #[allow(clippy::too_many_arguments)]
     pub fn upload_tile(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, kind: DisplayKind, tile_x: u32, tile_y: u32, bytes: &[u8]) {
+        self.upload_display_tile(device, queue, texture_set, kind, tile_x, tile_y, bytes, 0);
+    }
+
+    /// Upload a tile already sampled at the UI's display shift. The adapter's dimension
+    /// limit may require another reduction for this particular set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_display_tile(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, kind: DisplayKind, tile_x: u32, tile_y: u32, bytes: &[u8], source_shift: u32) {
         let Some(set) = self.sets.get_mut(texture_set) else { return };
         let Some(kind_index) = DisplayKind::ALL.iter().position(|k| *k == kind) else { return };
         let (Some(texture), Some(texel)) = (set.tex.get(kind_index), self.default_texels.get(kind_index)) else { return };
@@ -1479,7 +1486,12 @@ impl Renderer {
 
         // Reject overflowing coordinates before a GPU origin can wrap to another tile
         let (Some(x), Some(y)) = (tile_x.checked_mul(TILE), tile_y.checked_mul(TILE)) else { return };
-        if x >= set.size.0 || y >= set.size.1 || bytes.len() < (TILE * TILE * bytes_per_texel) as usize {
+        let shift = set.shift.min(TILE.ilog2());
+        if source_shift > shift {
+            return;
+        }
+        let source_side = TILE >> source_shift;
+        if x >= set.size.0 || y >= set.size.1 || bytes.len() < (source_side * source_side * bytes_per_texel) as usize {
             return;
         }
 
@@ -1508,13 +1520,13 @@ impl Renderer {
         let validation_scope = pending.is_some().then(|| device.push_error_scope(wgpu::ErrorFilter::Validation));
 
         // Downscaled sets take every `step`-th texel of the tile
-        let (step, tile_extent) = (1usize << set.shift.min(6), TILE >> set.shift.min(6));
+        let (step, tile_extent) = (1usize << (shift - source_shift), TILE >> shift);
         let downscaled_bytes: Vec<u8>;
         let upload_bytes = if step == 1 {
             bytes
         } else {
             let texel = |row: usize, column: usize| {
-                bytes.get((row * TILE as usize + column) * bytes_per_texel as usize..).unwrap_or_default().iter().take(bytes_per_texel as usize)
+                bytes.get((row * source_side as usize + column) * bytes_per_texel as usize..).unwrap_or_default().iter().take(bytes_per_texel as usize)
             };
             downscaled_bytes =
                 (0..tile_extent as usize).flat_map(|row| (0..tile_extent as usize).flat_map(move |column| texel(row * step, column * step))).copied().collect();

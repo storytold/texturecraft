@@ -112,8 +112,28 @@ fn u8_of(v: u16) -> u8 {
 
 /// Tile bytes (`TILE × TILE`, row-major) for `kind`, using channel defaults for absent source tiles.
 pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u32, ty: u32) -> Vec<u8> {
+    encode_tile(composite, baked, kind, tx, ty, 0)
+}
+
+/// Pack only the samples the viewport uses at a reduced display resolution.
+pub fn display_tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u32, ty: u32, shift: u32) -> Vec<u8> {
+    if shift == 0 {
+        return tile_bytes(composite, baked, kind, tx, ty);
+    }
+    encode_tile(composite, baked, kind, tx, ty, shift.min(TILE.ilog2()))
+}
+
+// Specialize the full-resolution entry point so its hot loops retain contiguous indexing.
+#[inline(always)]
+fn encode_tile(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u32, ty: u32, shift: u32) -> Vec<u8> {
     let bytes_per_texel = kind.bytes_per_texel();
-    let mut out = vec![0u8; TILE_AREA * bytes_per_texel];
+    let area = TILE_AREA >> (2 * shift);
+    let mut out = vec![0u8; area * bytes_per_texel];
+    // Downscaling uses the top-left sample at each stride, matching the viewport upload.
+    let source = |offset: usize| {
+        let side = TILE as usize >> shift;
+        ((offset / side) * TILE as usize + offset % side) << shift
+    };
     let srgb = srgb_lut();
     let get = |c: Channel| composite.channels.get(&c).and_then(|img| img.tile(tx, ty));
     let resolution = composite.resolution;
@@ -135,8 +155,9 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
             let (src, alpha) = (get(c), scalar8(alpha));
             let d = c.default_value().map(|v| (texturecraft_texel::linear_to_srgb(v) * 255.0 + 0.5) as u8);
 
-            for i in 0..TILE_AREA {
-                let pixel = &mut out[i * 4..i * 4 + 4];
+            for offset in 0..area {
+                let i = source(offset);
+                let pixel = &mut out[offset * 4..offset * 4 + 4];
                 match src {
                     Some(s) => {
                         for k in 0..3 {
@@ -151,7 +172,8 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
         DisplayKind::Lobes => {
             let lanes = [Channel::CoatWeight, Channel::CoatRoughness, Channel::AnisotropyLevel, Channel::AnisotropyAngle].map(scalar8);
 
-            for (i, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            for (offset, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let i = source(offset);
                 for (d, lane) in pixel.iter_mut().zip(&lanes) {
                     *d = lane(i);
                 }
@@ -165,7 +187,8 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
 
             // A TILE never straddles two atlas blocks
             let scale = (-32.0 * composite.block_scales.at(tx * TILE, ty * TILE).log2()).round().clamp(0.0, 255.0) as u8;
-            for (i, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            for (offset, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let i = source(offset);
                 for (k, d) in pixel.iter_mut().take(2).enumerate() {
                     *d = n.and_then(|t| t.get(i * 3 + k)).map_or(128, |v| pack_signed_normal(*v));
                 }
@@ -181,14 +204,15 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
             let (r, r_default) =
                 if gloss { (get(Channel::Glossiness), default16(Channel::Glossiness)) } else { (get(Channel::Roughness), default16(Channel::Roughness)) };
 
-            for i in 0..TILE_AREA {
+            for offset in 0..area {
+                let i = source(offset);
                 let (x, y) = (tx * TILE + (i as u32 % TILE), ty * TILE + (i as u32 / TILE));
                 let baked_ao = baked
                     .sample_working(BakedMap::AmbientOcclusion, x, y, (resolution, composite.height), &composite.block_scales)
                     .map_or(1.0, |value| value[0]);
                 let ch_ao = ao.and_then(|a| a.get(i)).map(|v| *v as f32 / 65535.0).unwrap_or(1.0);
 
-                let pixel = &mut out[i * 4..i * 4 + 4];
+                let pixel = &mut out[offset * 4..offset * 4 + 4];
                 pixel[0] = ((baked_ao * ch_ao).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 let v = r.and_then(|t| t.get(i).copied()).unwrap_or(r_default);
                 pixel[1] = u8_of(if gloss { 65535 - v } else { v });
@@ -201,7 +225,8 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
             let sheen_default = Channel::SheenRoughness.default_value()[0];
             let has_baked_normal = baked.maps.contains_key(&BakedMap::Normal);
 
-            for (i, pixel) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            for (offset, pixel) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                let i = source(offset);
                 // Baked normals form the base for painted detail, matching export
                 let (x, y) = (tx * TILE + (i as u32 % TILE), ty * TILE + (i as u32 / TILE));
                 let baked_sample =
@@ -227,11 +252,12 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
             let (h, spec) = (get(Channel::Height), get(Channel::Specular));
             let spec_default = Channel::Specular.default_value();
 
-            for i in 0..TILE_AREA {
+            for offset in 0..area {
+                let i = source(offset);
                 let v = h.and_then(|t| t.get(i)).map(|v| texturecraft_texel::from_u16_signed(*v)).unwrap_or(0.0);
                 let f0 = |k: usize| spec.and_then(|t| t.get(i * 3 + k)).map(|v| *v as f32 / 65535.0).unwrap_or(spec_default[k]);
                 for (k, c) in [v, f0(0), f0(1), f0(2)].into_iter().enumerate() {
-                    out[i * 8 + k * 2..i * 8 + k * 2 + 2].copy_from_slice(&half::f16::from_f32(c).to_le_bytes());
+                    out[offset * 8 + k * 2..offset * 8 + k * 2 + 2].copy_from_slice(&half::f16::from_f32(c).to_le_bytes());
                 }
             }
         }

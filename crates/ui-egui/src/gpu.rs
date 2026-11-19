@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use rayon::prelude::*;
 use texturecraft_engine::Session;
-use texturecraft_engine::compose::{DisplayKind, ImageRes, kinds_for, tile_bytes};
+use texturecraft_engine::compose::{DisplayKind, ImageRes, display_tile_bytes, kinds_for};
 use texturecraft_engine::core::{BakedMap, Channel};
 use texturecraft_engine::geom::Mesh;
 use texturecraft_render::{BakeVisualization, CageGeometry, Frame, Renderer, wgpu};
@@ -39,6 +39,8 @@ pub struct SceneSync {
     pub sets: Option<(Vec<SetLayout>, usize, u32)>,
     /// The environment name and, for `resource:<name>`, its decoded image.
     pub env: Option<(String, Option<Arc<ImageRes>>)>,
+    /// Reduction applied when preparing each display tile.
+    pub tile_shift: u32,
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
     pub aux: Vec<(usize, u32, Vec<u8>)>,
     /// Bake mode's high poly (`None` removes it) and the id it is sent under
@@ -188,7 +190,7 @@ impl GpuLink {
         self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
         session.update_for(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms);
 
-        let mut out = SceneSync::default();
+        let mut out = SceneSync { tile_shift: shift.min(texturecraft_engine::texel::TILE.ilog2()), ..Default::default() };
         if self.lost.swap(false, Ordering::AcqRel) {
             self.mesh_id = 0;
             self.sets.clear();
@@ -255,7 +257,7 @@ impl GpuLink {
                     let bytes: Vec<_> = chunk
                         .par_iter()
                         .flat_map_iter(|&(tile_x, tile_y)| kinds.iter().map(move |&kind| (kind, tile_x, tile_y)))
-                        .map(|(kind, tile_x, tile_y)| (texture_set, kind, tile_x, tile_y, tile_bytes(composite, baked, kind, tile_x, tile_y)))
+                        .map(|(kind, tile_x, tile_y)| (texture_set, kind, tile_x, tile_y, display_tile_bytes(composite, baked, kind, tile_x, tile_y, out.tile_shift)))
                         .collect();
                     queued += bytes.len();
                     out.tiles.extend(bytes);
@@ -408,7 +410,7 @@ impl CallbackTrait for ViewCallback {
                 reset = gpu.renderer.set_texture_sets(device, queue, sets, *material_count);
             }
             for (texture_set, kind, tile_x, tile_y, bytes) in &sync.tiles {
-                gpu.renderer.upload_tile(device, queue, *texture_set, *kind, *tile_x, *tile_y, bytes);
+                gpu.renderer.upload_display_tile(device, queue, *texture_set, *kind, *tile_x, *tile_y, bytes, sync.tile_shift);
             }
             record_recreated_uploads(&mut gpu.recreated.lock().unwrap_or_else(PoisonError::into_inner), &reset, &sync);
             if !reset.is_empty() {

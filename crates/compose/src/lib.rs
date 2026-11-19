@@ -28,7 +28,7 @@ mod tile_random_stream;
 mod timber;
 
 pub use below::{BelowCache, StackKey};
-pub use display::{DisplayKind, kinds_for, tile_bytes};
+pub use display::{DisplayKind, display_tile_bytes, kinds_for, tile_bytes};
 pub use eval::{
     BLOCK, Composite, Inputs, MASK_CHANNEL, PaintTarget, Stencil, StrokePreview, all_tiles, composite_tiles, composite_tiles_cached, covered_tiles,
     effect_histogram, flatten_layer, mask_at, mask_image, mask_texels, mask_values, pad_tiles, stack_reads_neighbours,
