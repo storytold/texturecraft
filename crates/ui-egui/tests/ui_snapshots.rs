@@ -786,6 +786,61 @@ fn i18n_snapshots() {
     texturecraft_ui_egui::i18n::set_language("en");
 }
 
+/// Saved materials keep their previews and activation in every shelf layout
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore]
+fn user_smart_material_shelf_snapshot() {
+    use texturecraft_engine::{Session, materials};
+    use texturecraft_ui_egui::shelf_view::ShelfView;
+
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let mut source = Session::new_project("Source", texturecraft_engine::geom::primitives::cube(2.0), "builtin:cube", None, 128).unwrap();
+    let group = materials::apply(&mut source, "steel_painted_worn").unwrap();
+    // The fixture lives in its own temporary folder, so a file already in the output folder is never replaced or deleted
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let fixture_dir = Fixture(std::env::temp_dir().join(format!("tc_user_material_snapshot_{}", std::process::id())));
+    std::fs::create_dir_all(&fixture_dir.0).unwrap();
+    let file = fixture_dir.0.join("User preview.tcmat");
+    std::fs::write(&file, source.smart_material_bytes(group, "User preview").unwrap()).unwrap();
+    let session = Session::new_project("Saved material previews", texturecraft_engine::geom::primitives::cube(2.0), "builtin:cube", None, 128).unwrap();
+    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
+    harness.state_mut().ui.shelf_tab = 1;
+    harness.state_mut().ui.shelf_filter = "User preview".into();
+    harness.state_mut().library = Some(vec![file.clone()]);
+    let context = harness.ctx.clone();
+    let started = std::time::Instant::now();
+    loop {
+        harness.run_steps(1);
+        if harness.state_mut().thumbs.user_material(&context, &file).is_some() {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "saved material thumbnail did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for (view, name) in [(ShelfView::Small, "small"), (ShelfView::Medium, "medium"), (ShelfView::Large, "large"), (ShelfView::List, "list")] {
+        harness.state_mut().ui.shelf_view = view;
+        save(&mut harness, &output_dir, &format!("user-material-{name}"));
+        let tile = harness.get_by_role_and_label(egui::Role::Button, "User preview");
+        let heading = harness.get_by_label("My smart materials");
+        assert!(tile.rect().top() >= heading.rect().bottom(), "the preview belongs below the heading in {name} view");
+        if view == ShelfView::List {
+            assert!(tile.rect().width() > 150.0, "a list row uses the panel width");
+        }
+        let before = harness.state().session.doc.project.layers.len();
+        harness.get_by_role_and_label(egui::Role::Button, "User preview").click();
+        harness.run_steps(3);
+        assert!(harness.state().session.doc.project.layers.len() > before, "the saved material applies in {name} view");
+    }
+}
+
 /// The merged effect panel selects an image and exposes its projection controls
 #[test]
 #[ignore]
