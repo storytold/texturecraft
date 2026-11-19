@@ -90,7 +90,7 @@ impl TextureCraftApp {
             }
 
             if let Place::Above(target, _) | Place::Below(target) = job.place
-                && !self.session.doc.project.locate(target).is_some_and(|(set, _, _)| set == job.set)
+                && self.session.doc.project.locate(target).is_none_or(|(set, _, _)| set != job.set)
             {
                 self.toast("Material import canceled because the target layer changed", true);
                 continue;
