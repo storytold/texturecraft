@@ -78,7 +78,7 @@ impl UserBrushes {
         match std::fs::symlink_metadata(&path) {
             Ok(_)
                 if old_file != Some(path.as_path())
-                    && !old_file.is_some_and(|old| old.canonicalize().ok().zip(path.canonicalize().ok()).is_some_and(|(old, new)| old == new)) =>
+                    && old_file.is_none_or(|old| old.canonicalize().ok().zip(path.canonicalize().ok()).is_none_or(|(old, new)| old != new)) =>
             {
                 return Err(format!("{} already exists", path.display()));
             }
