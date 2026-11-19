@@ -373,7 +373,7 @@ fn decode_base_color(bytes: &[u8], budget: &mut u64) -> Result<(u32, u32, Vec<[u
         (w, h, rgba.pixels().map(|p| p.0).collect::<Vec<[u8; 4]>>())
     } else {
         let rgba = img.to_rgba8();
-        let pixels = rgba.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect::<Vec<[u8; 4]>>();
+        let pixels = rgba.as_chunks::<4>().0.to_vec();
         (img.width(), img.height(), pixels)
     };
     let texels = u64::from(w) * u64::from(h);
