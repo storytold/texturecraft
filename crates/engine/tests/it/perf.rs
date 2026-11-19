@@ -551,3 +551,61 @@ fn bench_sliced_filters_4k() {
         println!("[sliced 4096², {label}] one call {direct:.2?}; in 30 ms slices {frames} frames, worst {longest_frame:.2?}, total {:.2?}", clock.elapsed());
     }
 }
+
+/// Input to CPU display tiles ready for upload (excludes GPU submission and presentation).
+#[test]
+#[ignore]
+fn bench_filtered_mask_edits() {
+    let resolution = 1024;
+    let mut s = Session::new_project("filtered edits", primitives::plane(1.0, 1), "builtin:plane", None, resolution).unwrap();
+    let run = |s: &mut Session, command, params: Value| execute(s, command, &params).unwrap();
+    let layer = run(&mut s, "layer.add.fill", json!({"color": [1.0, 1.0, 1.0]}))["layer"].clone();
+    run(&mut s, "mask.add.black", Value::Null);
+    let paint = run(&mut s, "effect.add.paint", json!({"target": "mask"}))["effect"].clone();
+    run(&mut s, "effect.add.filter", json!({"target": "mask", "filter": "blur", "radius": 8}));
+    run(&mut s, "layer.select", json!({"layer": layer, "target": paint}));
+    run(&mut s, "tool.brush", json!({"size": 0.6, "hardness": 100}));
+    s.begin_stroke_uv(Vec2::splat(0.1), 1.0).unwrap();
+    s.end_stroke().unwrap();
+    s.update();
+    s.take_uploads(0);
+
+    let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+    for i in 0..35 {
+        let uv = Vec2::new((124.5 + (i % 7) as f32 * 128.0) / resolution as f32, (160.5 + (i / 7) as f32 * 128.0) / resolution as f32);
+        for (phase, times) in samples.iter_mut().enumerate() {
+            let start = Instant::now();
+            match phase {
+                0 => s.begin_stroke_uv(uv, 1.0).unwrap(),
+                1 => { s.undo().unwrap(); }
+                _ => { s.redo().unwrap(); }
+            }
+            let pending = s.pending_tiles();
+            s.update();
+            let tiles = s.take_uploads(0);
+            let cache = &s.caches[0];
+            let channels: Vec<_> = cache.composite.channels.keys().copied().collect();
+            let fallback = Default::default();
+            let baked = s.doc.baked.get(&0).unwrap_or(&fallback);
+            tiles.par_iter().for_each(|&(x, y)| {
+                for kind in kinds_for(&channels) {
+                    std::hint::black_box(tile_bytes(&cache.composite, baked, kind, x, y));
+                }
+            });
+            if i >= 3 {
+                times.push((start.elapsed(), pending));
+            }
+            if phase == 0 {
+                s.end_stroke().unwrap();
+                s.update();
+                s.take_uploads(0);
+            }
+        }
+    }
+    for (phase, mut times) in ["preview", "undo", "redo"].into_iter().zip(samples) {
+        times.sort_unstable();
+        let p50 = times[times.len().div_ceil(2) - 1];
+        let p95 = times[(times.len() * 95).div_ceil(100) - 1];
+        println!("{phase}: {} samples, CPU display ready P50 {:.2?}, P95 {:.2?}, {} pending tiles at median", times.len(), p50.0, p95.0, p50.1);
+    }
+}
