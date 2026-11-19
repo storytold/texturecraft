@@ -872,3 +872,23 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
     execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"baseColor": {"opacity": 2.0}, "roughness": {"opacity": -1.0}}})).unwrap();
     assert_eq!((read(&s)[&Channel::BaseColor].opacity, read(&s)[&Channel::Roughness].opacity), (1.0, 0.0), "opacity is clamped");
 }
+
+#[test]
+fn uniform_uv_sets_do_not_materialize_padding_until_explicitly_read() {
+    use texturecraft_engine::{geom::primitives, texel::DilationMap};
+    for uv_scale in [1.0, 0.0, 0.5] {
+        let mut mesh = primitives::plane(1.0, 1);
+        for uv in &mut mesh.uvs {
+            *uv *= uv_scale;
+        }
+        let mut session = Session::new_project("padding", mesh, "builtin:plane", None, 128).unwrap();
+        session.update();
+        let before = session.memory().total();
+        let coverage = session.caches[0].gbuf.coverage_mask();
+        let oracle = DilationMap::in_blocks(&coverage, 128, 128, Some(texturecraft_engine::session::DISPLAY_PADDING), 128);
+        assert_eq!(session.caches[0].dilation.src, oracle.src);
+        let added = session.memory().total() - before;
+        let expected = if uv_scale == 0.5 { 0 } else { 128 * 128 * size_of::<u32>() };
+        assert_eq!(added, expected, "dense padding allocation for UV scale {uv_scale}");
+    }
+}
