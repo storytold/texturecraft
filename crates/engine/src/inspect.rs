@@ -207,7 +207,7 @@ pub fn session(session: &Session) -> Value {
     json!({
         "projectOpen": session.project_open,
         "project": session.doc.project.name,
-        "mesh": { "source": session.doc.project.mesh, "triangles": session.mesh.triangle_count(), "vertices": session.mesh.vertex_count(), "materials": session.mesh.materials },
+        "mesh": { "source": session.doc.project.mesh, "triangles": session.mesh.triangle_count(), "vertices": session.mesh.vertex_count(), "materials": session.mesh.materials, "frame": session.mesh_frame, "frames": session.mesh_frames },
         "path": session.path,
         "modified": session.modified,
         "textureSets": texture_sets(session),
