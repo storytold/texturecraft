@@ -361,12 +361,30 @@ fn decode_base_color(bytes: &[u8], budget: &mut u64) -> Result<(u32, u32, Vec<[u
     let mut opts = craft_image_codecs::DecodeOptions::default();
     opts.limits.max_width = crate::MAX_IMAGE_SIZE;
     opts.limits.max_height = crate::MAX_IMAGE_SIZE;
+    // Mesh UVs refer to stored pixels, not an EXIF-adjusted photograph.
+    opts.keep_orientation = true;
+    // Preserve the prior ImageReader allocation limit; this is not a total RSS cap.
+    opts.limits.max_alloc = 512 << 20;
     let img = crate::guard("image", || craft_image_codecs::decode_with(bytes, &opts).map_err(bad))?;
     let (w, h, rgba) = if img.width().max(img.height()) > BASE_COLOR_SIDE {
-        let mut dyn_img = image::DynamicImage::ImageRgba8(
-            image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8())
-                .ok_or_else(|| FormatError::Malformed { kind: "image", msg: "invalid RGBA buffer".into() })?,
-        );
+        use craft_image_codecs::{ChannelLayout, SampleType};
+        let invalid = || FormatError::Malformed { kind: "image", msg: "invalid RGBA buffer".into() };
+        // Keep native precision through filtering. Converting HDR to u8 first clips highlights.
+        // Bound expanded RGBA storage before conversion as well as the decoder's native output.
+        let mut dyn_img = match img.sample_type() {
+            SampleType::F16 | SampleType::F32 => {
+                let rgba = img.to_rgba_f32(&opts.limits).map_err(bad)?;
+                image::DynamicImage::ImageRgba32F(image::Rgba32FImage::from_raw(img.width(), img.height(), rgba).ok_or_else(invalid)?)
+            }
+            SampleType::U16 => {
+                opts.limits.check(img.width(), img.height(), ChannelLayout::Rgba, SampleType::U16).map_err(bad)?;
+                image::DynamicImage::ImageRgba16(image::ImageBuffer::from_raw(img.width(), img.height(), img.to_rgba16()).ok_or_else(invalid)?)
+            }
+            SampleType::U8 => {
+                opts.limits.check(img.width(), img.height(), ChannelLayout::Rgba, SampleType::U8).map_err(bad)?;
+                image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8()).ok_or_else(invalid)?)
+            }
+        };
         dyn_img = dyn_img.resize(BASE_COLOR_SIDE, BASE_COLOR_SIDE, image::imageops::FilterType::Triangle);
         let rgba = dyn_img.into_rgba8();
         let (w, h) = rgba.dimensions();

@@ -682,3 +682,35 @@ fn decode_base_color_resizes_oversized_and_rejects_corrupt_bytes() {
     assert!(w <= BASE_COLOR_SIDE && h <= BASE_COLOR_SIDE);
     assert_eq!(pixels.len(), (w * h) as usize);
 }
+
+#[test]
+fn base_color_keeps_stored_jpeg_orientation_for_mesh_uvs() {
+    let pixels = image::RgbImage::from_fn(4, 2, |x, _| if x < 2 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) });
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100).encode_image(&pixels).unwrap();
+    // Synthetic TIFF Orientation=6 inside EXIF APP1, not an external image fixture.
+    let exif = b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+    let mut tagged = jpeg[..2].to_vec();
+    tagged.extend_from_slice(&[0xff, 0xe1]);
+    tagged.extend_from_slice(&u16::try_from(exif.len() + 2).unwrap().to_be_bytes());
+    tagged.extend_from_slice(exif);
+    tagged.extend_from_slice(&jpeg[2..]);
+    let expected = image::load_from_memory(&tagged).unwrap().into_rgba8();
+    let mut budget = BASE_COLOR_TEXELS;
+    let (w, h, actual) = decode_base_color(&tagged, &mut budget).unwrap();
+    assert_eq!((w, h), (4, 2));
+    assert_eq!(actual, expected.pixels().map(|p| p.0).collect::<Vec<_>>());
+}
+
+#[test]
+fn base_color_filters_hdr_before_clamping_to_eight_bits() {
+    let h = BASE_COLOR_SIDE * 2;
+    let samples: Vec<_> = (0..h).map(|y| image::Rgb([if y % 2 == 0 { 4.0 } else { 0.0 }; 3])).collect();
+    let mut hdr = Vec::new();
+    image::codecs::hdr::HdrEncoder::new(&mut hdr).encode(&samples, 1, h as usize).unwrap();
+    let expected = image::load_from_memory(&hdr).unwrap().resize(BASE_COLOR_SIDE, BASE_COLOR_SIDE, image::imageops::FilterType::Triangle).into_rgba8();
+    let mut budget = BASE_COLOR_TEXELS;
+    let (w, h, actual) = decode_base_color(&hdr, &mut budget).unwrap();
+    assert_eq!((w, h), expected.dimensions());
+    assert_eq!(actual, expected.pixels().map(|p| p.0).collect::<Vec<_>>());
+}
