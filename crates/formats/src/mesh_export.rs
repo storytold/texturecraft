@@ -3,7 +3,6 @@
 //! material with its textures embedded) and USD (usda / usdc / usdz, see [`usd`]).
 
 pub(crate) mod usd;
-mod usdc;
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;

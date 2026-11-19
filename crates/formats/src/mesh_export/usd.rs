@@ -5,8 +5,7 @@
 //! roughness, metallic, normal, emissive, opacity, clear coat and its roughness) are
 //! UsdUVTexture shaders. Meters, Y up.
 
-use std::fmt::Write as _;
-
+use craft_usd::scene::{SceneError, UsdAttr, UsdLayer, UsdPrim, UsdValue, write_usda, write_usdc};
 use texturecraft_core::{Channel, NormalFormat};
 use texturecraft_geom::Mesh;
 
@@ -78,72 +77,14 @@ pub fn usd_export_options() -> ExportOptions {
     super::png8_options(ExportPreset { name: "USD preview surface".into(), maps }, NormalFormat::OpenGl)
 }
 
-/// A value written to a layer.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum UsdValue {
-    Token(String),
-    Str(String),
-    Int(i32),
-    Double(f64),
-    Asset(String),
-    Float4([f32; 4]),
-    Ints(Vec<i32>),
-    Vec2fs(Vec<[f32; 2]>),
-    Vec3fs(Vec<[f32; 3]>),
-    /// A relationship target or attribute connection (absolute path).
-    Target(String),
-}
-
-/// An attribute (or, with type `rel`, a relationship).
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct UsdAttr {
-    pub name: String,
-    pub type_name: &'static str,
-    pub uniform: bool,
-    pub value: Option<UsdValue>,
-    /// Connection source of an attribute (`name.connect`).
-    pub connect: Option<String>,
-    pub interpolation: Option<&'static str>,
-}
-
-impl UsdAttr {
-    fn new(name: &str, type_name: &'static str, value: Option<UsdValue>) -> UsdAttr {
-        UsdAttr { name: name.into(), type_name, uniform: false, value, connect: None, interpolation: None }
+/// Map a `craft-usd` scene error into [`FormatError`].
+fn map_scene_err(e: SceneError) -> FormatError {
+    match e {
+        SceneError::Malformed(m) => FormatError::Invalid(m),
+        SceneError::TooLarge(m) => FormatError::TooLarge(m),
+        SceneError::Unsupported(m) => FormatError::Unsupported(m),
+        SceneError::Invalid(m) => FormatError::Invalid(m),
     }
-
-    fn uniform(mut self) -> UsdAttr {
-        self.uniform = true;
-        self
-    }
-
-    fn rel(name: &str, target: String) -> UsdAttr {
-        UsdAttr::new(name, "rel", Some(UsdValue::Target(target)))
-    }
-
-    fn connected(name: &str, type_name: &'static str, source: String) -> UsdAttr {
-        UsdAttr { connect: Some(source), ..UsdAttr::new(name, type_name, None) }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct UsdPrim {
-    pub name: String,
-    pub type_name: &'static str,
-    /// Applies MaterialBindingAPI (the prim has a `material:binding`).
-    pub binding_api: bool,
-    pub attrs: Vec<UsdAttr>,
-    pub children: Vec<UsdPrim>,
-}
-
-impl UsdPrim {
-    fn new(name: &str, type_name: &'static str) -> UsdPrim {
-        UsdPrim { name: name.into(), type_name, binding_api: false, attrs: Vec::new(), children: Vec::new() }
-    }
-}
-
-/// A layer: its root prim (the default prim), in meters, Y up.
-pub(crate) struct UsdLayer {
-    pub root: UsdPrim,
 }
 
 /// A valid, unique prim name for `s`.
@@ -193,10 +134,7 @@ fn scene(mesh: &Mesh, name: &str, files: &[Vec<(usize, String)>]) -> Result<UsdL
         }
     }
 
-    let vertex = |mut a: UsdAttr| {
-        a.interpolation = Some("vertex");
-        a
-    };
+    let vertex = |a: UsdAttr| a.with_interpolation("vertex");
     geometry.attrs = vec![
         UsdAttr::new("extent", "float3[]", Some(UsdValue::Vec3fs(vec![lo.to_array(), hi.to_array()]))),
         UsdAttr::new("faceVertexCounts", "int[]", Some(UsdValue::Ints(vec![3; indices.len() / 3]))),
@@ -245,7 +183,9 @@ fn scene(mesh: &Mesh, name: &str, files: &[Vec<(usize, String)>]) -> Result<UsdL
         root.children.push(materials);
     }
 
-    Ok(UsdLayer { root })
+    let mut layer = UsdLayer::new(root);
+    layer.doc = Some("Exported by TextureCraft".into());
+    Ok(layer)
 }
 
 /// A UsdPreviewSurface material at `path` whose slot inputs read `files` (slot, file name).
@@ -301,9 +241,9 @@ pub fn usd_bytes(mesh: &Mesh, name: &str, textures: &[Vec<ExportedFile>], format
     let (names, files) = material_maps(mesh, &stem, textures);
     let layer = scene(mesh, name, &names)?;
     Ok(match format {
-        UsdFormat::Usda => UsdExport { bytes: usda(&layer).into_bytes(), textures: files },
-        UsdFormat::Usdc => UsdExport { bytes: super::usdc::write(&layer)?, textures: files },
-        UsdFormat::Usdz => UsdExport { bytes: usdz(&format!("{stem}.usdc"), &super::usdc::write(&layer)?, &files)?, textures: Vec::new() },
+        UsdFormat::Usda => UsdExport { bytes: write_usda(&layer).into_bytes(), textures: files },
+        UsdFormat::Usdc => UsdExport { bytes: write_usdc(&layer).map_err(map_scene_err)?, textures: files },
+        UsdFormat::Usdz => UsdExport { bytes: usdz(&format!("{stem}.usdc"), &write_usdc(&layer).map_err(map_scene_err)?, &files)?, textures: Vec::new() },
     })
 }
 
@@ -349,92 +289,6 @@ pub(crate) fn usdz(layer_name: &str, layer: &[u8], files: &[(String, Vec<u8>)]) 
         zip.add_stored_aligned(name, bytes, 64).map_err(err)?;
     }
     zip.finish().map_err(err)
-}
-
-/// Text of a value as usda writes it.
-fn usda_value(s: &mut String, v: &UsdValue) {
-    let tuple = |s: &mut String, c: &[f32]| {
-        s.push('(');
-        for (i, x) in c.iter().enumerate() {
-            let _ = write!(s, "{}{x}", if i > 0 { ", " } else { "" });
-        }
-        s.push(')');
-    };
-    let list = |s: &mut String, n: usize, item: &mut dyn FnMut(&mut String, usize)| {
-        s.push('[');
-        for i in 0..n {
-            if i > 0 {
-                s.push_str(", ");
-            }
-            item(s, i);
-        }
-        s.push(']');
-    };
-    match v {
-        UsdValue::Token(t) | UsdValue::Str(t) => {
-            let _ = write!(s, "\"{t}\"");
-        }
-        UsdValue::Int(i) => {
-            let _ = write!(s, "{i}");
-        }
-        UsdValue::Double(d) => {
-            let _ = write!(s, "{d}");
-        }
-        UsdValue::Asset(a) => {
-            let _ = write!(s, "@{a}@");
-        }
-        UsdValue::Target(p) => {
-            let _ = write!(s, "<{p}>");
-        }
-        UsdValue::Float4(c) => tuple(s, c),
-        UsdValue::Ints(v) => list(s, v.len(), &mut |s, i| {
-            let _ = write!(s, "{}", v.get(i).copied().unwrap_or_default());
-        }),
-        UsdValue::Vec2fs(v) => list(s, v.len(), &mut |s, i| tuple(s, v.get(i).map_or(&[][..], |x| &x[..]))),
-        UsdValue::Vec3fs(v) => list(s, v.len(), &mut |s, i| tuple(s, v.get(i).map_or(&[][..], |x| &x[..]))),
-    }
-}
-
-fn usda_prim(s: &mut String, p: &UsdPrim, depth: usize) {
-    let pad = "    ".repeat(depth);
-    let _ = write!(s, "\n{pad}def {} \"{}\"", p.type_name, p.name);
-    if p.binding_api {
-        let _ = write!(s, " (\n{pad}    prepend apiSchemas = [\"MaterialBindingAPI\"]\n{pad})");
-    }
-    let _ = writeln!(s, "\n{pad}{{");
-    for a in &p.attrs {
-        s.push_str(&pad);
-        s.push_str("    ");
-        if a.type_name == "rel" {
-            let _ = write!(s, "rel {}", a.name);
-        } else {
-            let _ = write!(s, "{}{} {}", if a.uniform { "uniform " } else { "" }, a.type_name, a.name);
-        }
-        if let Some(c) = &a.connect {
-            let _ = write!(s, ".connect = <{c}>");
-        } else if let Some(v) = &a.value {
-            s.push_str(" = ");
-            usda_value(s, v);
-        }
-        if let Some(i) = a.interpolation {
-            let _ = write!(s, " (\n{pad}        interpolation = \"{i}\"\n{pad}    )");
-        }
-        s.push('\n');
-    }
-    for c in &p.children {
-        usda_prim(s, c, depth + 1);
-    }
-    let _ = writeln!(s, "{pad}}}");
-}
-
-/// The layer as `.usda` text.
-pub(crate) fn usda(layer: &UsdLayer) -> String {
-    let mut s = format!(
-        "#usda 1.0\n(\n    defaultPrim = \"{}\"\n    doc = \"Exported by TextureCraft\"\n    metersPerUnit = 1\n    upAxis = \"Y\"\n)\n",
-        layer.root.name
-    );
-    usda_prim(&mut s, &layer.root, 0);
-    s
 }
 
 #[cfg(test)]
