@@ -604,6 +604,38 @@ mod tests {
     }
 
     #[test]
+    fn smaller_viewport_packs_only_the_samples_the_renderer_will_use() {
+        use texturecraft_engine::{compose::{Composite, tile_bytes}, texel::TILE};
+        let mut gpu = link();
+        let mut s = session(false);
+        s.update();
+        let cache = &mut s.caches[0];
+        cache.composite = Composite::new(&Channel::ALL, 128);
+        for img in cache.composite.channels.values_mut() {
+            let comps = img.comps();
+            for y in 0..TILE {
+                for x in 0..TILE {
+                    let v = ((x + y * TILE) * 13) as u16;
+                    img.set(TILE + x, y, &[v, v / 2, u16::MAX - v][..comps]);
+                }
+            }
+        }
+        for shift in 0..=TILE.ilog2() {
+            s.caches[0].upload = [(1, 0)].into();
+            let scene = gpu.sync(&mut s, None, None, shift, 0.0);
+            assert_eq!(scene.tiles.len(), DisplayKind::ALL.len());
+            for (_, kind, x, y, bytes) in &scene.tiles {
+                let full = tile_bytes(&s.caches[0].composite, &Default::default(), *kind, *x, *y);
+                let step = 1usize << shift;
+                let stride = kind.bytes_per_texel();
+                let rows = full.chunks_exact(TILE as usize * stride).step_by(step);
+                let expected: Vec<_> = rows.flat_map(|row| row.chunks_exact(stride).step_by(step).flatten().copied()).collect();
+                assert!(bytes == &expected, "{kind:?} at shift {shift}");
+            }
+        }
+    }
+
+    #[test]
     fn removed_texture_sets_release_kind_records() {
         let mut gpu = link();
         for texture_set in 0..64 {

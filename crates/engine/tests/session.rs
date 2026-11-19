@@ -875,7 +875,7 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
 
 #[test]
 fn uniform_uv_sets_do_not_materialize_padding_until_explicitly_read() {
-    use texturecraft_engine::{geom::primitives, texel::DilationMap};
+    use texturecraft_engine::{solo::Solo, texel::DilationMap};
     for uv_scale in [1.0, 0.0, 0.5] {
         let mut mesh = primitives::plane(1.0, 1);
         for uv in &mut mesh.uvs {
@@ -883,6 +883,11 @@ fn uniform_uv_sets_do_not_materialize_padding_until_explicitly_read() {
         }
         let mut session = Session::new_project("padding", mesh, "builtin:plane", None, 128).unwrap();
         session.update();
+        let layer = session.selected_layer().unwrap();
+        session.set_solo(Some(Solo { layer, ignore_mask: false }));
+        session.update();
+        let options = texturecraft_engine::file_cmds::export_options(&session, &json!({"format": "png"}), "test").unwrap();
+        session.export_files(&[0], &options).unwrap();
         let before = session.memory().total();
         let coverage = session.caches[0].gbuf.coverage_mask();
         let oracle = DilationMap::in_blocks(&coverage, 128, 128, Some(texturecraft_engine::session::DISPLAY_PADDING), 128);
