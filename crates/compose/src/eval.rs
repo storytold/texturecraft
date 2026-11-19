@@ -356,8 +356,8 @@ pub fn stack_reads_neighbours(project: &Project, texture_set_index: usize) -> bo
 }
 
 /// Conservative output halo in tiles for an edit to painted pixels. Without anchors each
-/// filtered field reads its own effect stack. An anchor can feed another field at a mapped
-/// position, so only whole-set invalidation is safe in that case.
+/// filtered field reads its own effect stack. Linked filtered fields use whole-set
+/// invalidation until their combined dependency range is known.
 pub fn painted_tile_margin(project: &Project, ts: usize, target: Option<PaintTarget>) -> Option<u32> {
     let set = project.texture_sets.get(ts)?;
     let (width, height) = set.size();
@@ -369,7 +369,7 @@ pub fn painted_tile_margin(project: &Project, ts: usize, target: Option<PaintTar
     let mut max_reach = 0;
     for layer in project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)) {
         if layer.reads_anchor() {
-            return None;
+            return (!stack_reads_neighbours(project, ts)).then_some(0);
         }
         if owner.is_some_and(|id| id != layer.id) {
             continue;

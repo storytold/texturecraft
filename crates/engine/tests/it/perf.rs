@@ -390,7 +390,7 @@ fn settle(s: &mut Session) -> Duration {
 }
 
 /// Undo and redo of one small stroke: the tiles left pending and the time to recomposite them.
-/// `blur` keeps the stack's blurred mask (a neighbourhood filter forces a full recomposite).
+/// `blur` keeps the stack's blurred mask to exercise neighbourhood invalidation.
 fn bench_undo_at(res: u32, blur: bool) {
     use texturecraft_engine::core::{EffectKind, Filter};
     let t = Instant::now();
@@ -577,8 +577,12 @@ fn bench_filtered_mask_edits() {
             let start = Instant::now();
             match phase {
                 0 => s.begin_stroke_uv(uv, 1.0).unwrap(),
-                1 => { s.undo().unwrap(); }
-                _ => { s.redo().unwrap(); }
+                1 => {
+                    s.undo().unwrap();
+                }
+                _ => {
+                    s.redo().unwrap();
+                }
             }
             let pending = s.pending_tiles();
             s.update();

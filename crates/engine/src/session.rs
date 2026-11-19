@@ -4,9 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use texturecraft_compose::{
-    BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles, pad_tiles,
-};
+use texturecraft_compose::{BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles, pad_tiles};
 use texturecraft_core::{Channel, Layer, LayerId, LayerKind, Project, TextureSet};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, UvGBuffer};
@@ -105,6 +103,9 @@ impl SetCache {
         let (width, height) = self.size;
         let queue = queue(self);
         match margin {
+            Some(0) if target.is_none() => {
+                queue.extend(tiles.iter().copied().filter(|&(x, y)| covered.binary_search_by_key(&(y, x), |&(tx, ty)| (ty, tx)).is_ok()));
+            }
             Some(0) => queue.extend(tiles.iter().copied()),
             Some(radius) => {
                 let (last_x, last_y) = (width.saturating_sub(1) / TILE, height.saturating_sub(1) / TILE);
@@ -120,9 +121,7 @@ impl SetCache {
                 // Coalesce expensive, overlapping halos without scanning distant atlas tiles.
                 let diameter = (radius as usize).saturating_mul(2).saturating_add(1);
                 if diameter.saturating_mul(diameter).saturating_mul(tiles.len()) >= covered.len() {
-                    let bounds = tiles.iter().fold(((last_x, last_y), (0, 0)), |((l, t), (r, b)), &(x, y)| {
-                        ((l.min(x), t.min(y)), (r.max(x), b.max(y)))
-                    });
+                    let bounds = tiles.iter().fold(((last_x, last_y), (0, 0)), |((l, t), (r, b)), &(x, y)| ((l.min(x), t.min(y)), (r.max(x), b.max(y))));
                     add_rect(bounds.0, bounds.1);
                 } else {
                     for &tile in tiles {
@@ -873,7 +872,7 @@ impl Session {
         for (i, ts) in sets.iter().enumerate() {
             match self.caches.get_mut(i) {
                 Some(c) if c.size == ts.size() => {
-                    c.paint_margin.take();
+                    c.paint_margin = None;
                     let (want, scales) = (ts.channel_list(), ts.block_scales());
                     if c.composite.channels.keys().copied().collect::<Vec<_>>() != want || c.composite.block_scales != scales {
                         c.composite = Composite { block_scales: scales, ..Composite::with_size(&want, c.size.0, c.size.1) };
@@ -1139,13 +1138,7 @@ impl Session {
         self.mark_tiles(ts, target, tiles, true);
     }
 
-    fn mark_tiles(
-        &mut self,
-        ts: usize,
-        target: Option<PaintTarget>,
-        tiles: impl IntoIterator<Item = (u32, u32)>,
-        committed: bool,
-    ) {
+    fn mark_tiles(&mut self, ts: usize, target: Option<PaintTarget>, tiles: impl IntoIterator<Item = (u32, u32)>, committed: bool) {
         let size = self.caches.get(ts).map(|c| c.size);
         let Some(target) = target else { return };
         let sets = self.doc.project.sets_drawing(self.paint_owner(target));
