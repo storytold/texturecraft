@@ -927,7 +927,7 @@ fn encode(
         FileFormat::Tiff => craft_image_codecs::Format::Tiff,
         FileFormat::Bmp => craft_image_codecs::Format::Bmp,
         FileFormat::Webp => craft_image_codecs::Format::WebP,
-        FileFormat::Exr | FileFormat::Hdr => unreachable!(),
+        FileFormat::Exr | FileFormat::Hdr => return Err(failed(&"unexpected float raster format")),
     };
     craft_image_codecs::encode(&img, fmt, &opts).map_err(|e| failed(&e))
 }
