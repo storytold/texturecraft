@@ -48,7 +48,7 @@ impl Fx {
     }
 
     fn input(&self) -> ExportInput<'_> {
-        ExportInput { project: &self.project, ts: 0, composite: &self.comp, baked: &self.baked, coverage: &self.coverage, mesh_name: "sphere" }
+        ExportInput { project: &self.project, ts: 0, composite: &self.comp, baked: &self.baked, coverage: &self.coverage, mesh_name: "sphere", project_file: None }
     }
 
     fn render(&self, opts: &ExportOptions) -> Vec<ExportedFile> {
@@ -256,7 +256,7 @@ fn templates_are_sanitized_and_collisions_suffixed() {
         ],
     };
     let opts = ExportOptions::new(preset);
-    let planned = list_outputs(&fx.project, 0, "sphere", &opts).unwrap();
+    let planned = list_outputs(&fx.project, 0, "sphere", &opts, None).unwrap();
     let names: Vec<&str> = planned.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(
         names,
@@ -356,14 +356,14 @@ fn list_outputs_matches_render_and_presets_round_trip() {
         preset.validate().unwrap();
         assert_eq!(preset_from_json(&preset_to_json(&preset).unwrap()).unwrap(), preset);
         let opts = ExportOptions::new(preset.clone());
-        let planned: Vec<String> = list_outputs(&fx.project, 0, "sphere", &opts).unwrap().into_iter().map(|p| p.name).collect();
+        let planned: Vec<String> = list_outputs(&fx.project, 0, "sphere", &opts, None).unwrap().into_iter().map(|p| p.name).collect();
         let rendered: Vec<String> = fx.render(&opts).into_iter().map(|f| f.name).collect();
         assert_eq!(planned, rendered, "{}", preset.name);
     }
     assert!(builtin_preset("unity hdrp (mask map)").is_some());
     // OpenPBR writes the lobe maps a set has, and skips the rest.
     let openpbr = ExportOptions::new(builtin_preset("OpenPBR (separate maps)").unwrap());
-    let names = |fx: &Fx| list_outputs(&fx.project, 0, "m", &openpbr).unwrap().into_iter().map(|p| p.name).collect::<Vec<String>>();
+    let names = |fx: &Fx| list_outputs(&fx.project, 0, "m", &openpbr, None).unwrap().into_iter().map(|p| p.name).collect::<Vec<String>>();
     let plain = names(&fx);
     assert!(plain.iter().any(|n| n.ends_with("_base_color.png")) && !plain.iter().any(|n| n.contains("coat_")), "{plain:?}");
     let mut lobes = default_channels();
@@ -378,7 +378,7 @@ fn list_outputs_matches_render_and_presets_round_trip() {
     assert!(preset_from_json(mixed).is_err());
     let ok = r#"{"name":"x","maps":[{"file":"a","format":"Tga","bit_depth":8,"channels":[["L",{"Channel":{"channel":"Metallic"}}]]}]}"#;
     assert!(preset_from_json(ok).is_ok());
-    assert!(list_outputs(&fx.project, 5, "m", &ExportOptions::new(builtin_presets().remove(0))).is_err());
+    assert!(list_outputs(&fx.project, 5, "m", &ExportOptions::new(builtin_presets().remove(0)), None).is_err());
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -476,7 +476,7 @@ fn converted_maps_invert_and_derive_normals() {
     // Converted maps only exist when their source channel does
     let fx = Fx::new(&default_channels());
     let only = ExportPreset { name: "c".into(), maps: vec![gray_map("rough", virt(VirtualMap::Roughness)), rgb("hn", VirtualMap::HeightNormal)] };
-    let names: Vec<String> = list_outputs(&fx.project, 0, "m", &ExportOptions::new(only)).unwrap().into_iter().map(|p| p.name).collect();
+    let names: Vec<String> = list_outputs(&fx.project, 0, "m", &ExportOptions::new(only), None).unwrap().into_iter().map(|p| p.name).collect();
     assert_eq!(names, ["hn.png"], "the default set has height but no glossiness");
 }
 
@@ -499,7 +499,7 @@ fn uv_tiles_export_one_file_per_tile_without_padding_across() {
             }
         }
     }
-    let input = ExportInput { project: &project, ts: 0, composite: &comp, baked: &BakedMaps::default(), coverage: &coverage, mesh_name: "udim_plane" };
+    let input = ExportInput { project: &project, ts: 0, composite: &comp, baked: &BakedMaps::default(), coverage: &coverage, mesh_name: "udim_plane", project_file: None };
     let preset = ExportPreset {
         name: "t".into(),
         maps: vec![MapSpec {
@@ -544,7 +544,7 @@ fn the_udim_name_is_the_file_name_with_its_tile_number_as_placeholder() {
     let udim_names = |file: String| {
         let channels = vec![(Dest::R, SourceRef::Channel { channel: Channel::BaseColor, component: 0 })];
         let preset = ExportPreset { name: "t".into(), maps: vec![MapSpec { file, format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new() }] };
-        list_outputs(&project, 0, "m", &ExportOptions::new(preset)).unwrap().into_iter().map(|f| f.udim_name).collect::<Vec<_>>()
+        list_outputs(&project, 0, "m", &ExportOptions::new(preset), None).unwrap().into_iter().map(|f| f.udim_name).collect::<Vec<_>>()
     };
     let placeholder = Some("Body_<UDIM>.png".to_string());
     assert_eq!(udim_names("$textureSet_$udim".into()), [placeholder.clone(), placeholder]);
@@ -650,7 +650,7 @@ fn colour_space_names_the_files_and_warns_when_integer_files_clamp() {
     };
     let plan = |space: Option<ColorSpace>, format: Option<FileFormat>| {
         let opts = ExportOptions { color_space: space, format_override: format, ..ExportOptions::new(named.clone()) };
-        list_outputs(&fx.project, 0, "sphere", &opts).unwrap().remove(0)
+        list_outputs(&fx.project, 0, "sphere", &opts, None).unwrap().remove(0)
     };
     assert!(plan(None, None).name.ends_with("_sRGB.png") && plan(None, Some(FileFormat::Exr)).name.ends_with("_linear.exr"), "defaults keep their names");
     assert!(plan(Some(ColorSpace::LinearRec709), None).name.ends_with("_linear.png"));
@@ -663,7 +663,7 @@ fn colour_space_names_the_files_and_warns_when_integer_files_clamp() {
     // The planned names are the rendered names
     let opts = ExportOptions { color_space: Some(ColorSpace::Aces2065), ..ExportOptions::new(named) };
     let names: Vec<String> = fx.render(&opts).into_iter().map(|f| f.name).collect();
-    assert_eq!(names, list_outputs(&fx.project, 0, "sphere", &opts).unwrap().into_iter().map(|p| p.name).collect::<Vec<_>>());
+    assert_eq!(names, list_outputs(&fx.project, 0, "sphere", &opts, None).unwrap().into_iter().map(|p| p.name).collect::<Vec<_>>());
     assert!(names[0].ends_with("_ACES2065-1.png"), "{names:?}");
 }
 
@@ -853,4 +853,22 @@ fn inverting_a_colour_channel_inverts_the_linear_value_before_encoding() {
     let half = base(vec![Dest::R], Some(RES / 2));
     assert_eq!(half.width(), RES / 2);
     assert!(half.get_pixel(0, 5)[0] >= 250, "{}", half.get_pixel(0, 5)[0]);
+}
+
+#[test]
+fn project_file_token_resolves_saved_stem_or_falls_back_to_project_name() {
+    let fx = Fx::new(&default_channels());
+    let preset = ExportPreset {
+        name: "TestProjectFile".into(),
+        maps: vec![gray_map("$projectFile_$project_$channel", SourceRef::Channel { channel: Channel::BaseColor, component: 0 })],
+    };
+    let opts = ExportOptions::new(preset);
+
+    // Unsaved: None falls back to $project ("My Project")
+    let planned = list_outputs(&fx.project, 0, "sphere", &opts, None).unwrap();
+    assert_eq!(planned[0].name, "My_Project_My_Project_baseColor.png");
+
+    // Saved: uses provided project_file stem
+    let planned2 = list_outputs(&fx.project, 0, "sphere", &opts, Some("hero_asset_v02")).unwrap();
+    assert_eq!(planned2[0].name, "hero_asset_v02_My_Project_baseColor.png");
 }

@@ -492,4 +492,35 @@ mod tests {
         assert!(brush_dir.join("Ink.tcbrush").exists());
         let _ = std::fs::remove_dir_all(&brush_dir);
     }
+
+    #[test]
+    fn headless_open_and_export_resolves_project_file_token() {
+        let dir = std::env::temp_dir().join(format!("tc-headless-exp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("hero_prop.{PROJECT_EXT}"));
+
+        let mut h = Headless::new(Headless::default_session().unwrap(), Filesystem::TrustedLocal);
+        h.save(Some(file.to_str().unwrap())).unwrap();
+
+        let mut opened = Headless::new(Headless::default_session().unwrap(), Filesystem::TrustedLocal);
+        opened.open(file.to_str().unwrap()).unwrap();
+        let out_dir = dir.join("out");
+        let res = opened.export(&json!({
+            "dir": out_dir.to_str().unwrap(),
+            "preset": {
+                "name": "test",
+                "maps": [{
+                    "file": "$projectFile_$channel",
+                    "format": "png",
+                    "bit_depth": 8,
+                    "channels": [["R", {"Channel": {"channel": "BaseColor", "component": 0}}]]
+                }]
+            }
+        })).unwrap();
+        let files = res["files"].as_array().unwrap();
+        assert!(files.iter().any(|f| f.as_str().unwrap().contains("hero_prop_baseColor.png")), "files: {files:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

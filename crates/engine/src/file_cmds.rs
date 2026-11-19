@@ -255,6 +255,7 @@ impl Session {
         }
 
         let mesh_name = stem_of(self.doc.project.mesh.trim_start_matches("builtin:"));
+        let project_file = self.path.as_deref().map(stem_of);
         let mut out = Vec::new();
         let empty = Default::default();
         for &ts in sets {
@@ -268,6 +269,7 @@ impl Session {
                 baked: self.doc.baked.get(&ts).unwrap_or(&empty),
                 coverage: &coverage,
                 mesh_name: &mesh_name,
+                project_file: project_file.as_deref(),
             };
             out.extend(texturecraft_formats::render_maps(&input, opts).map_err(fe)?);
         }
@@ -356,9 +358,10 @@ fn set_index(s: &Session, v: &Value, cmd: &str) -> Result<usize> {
 fn plan(s: &mut Session, p: &Value) -> Result<Value> {
     let opts = export_options(s, p, "export.plan")?;
     let mesh_name = stem_of(s.doc.project.mesh.trim_start_matches("builtin:"));
+    let project_file = s.path.as_deref().map(stem_of);
     let mut names = Vec::new();
     for ts in sets_param(s, p, "export.plan")? {
-        for f in texturecraft_formats::list_outputs(&s.doc.project, ts, &mesh_name, &opts).map_err(fe)? {
+        for f in texturecraft_formats::list_outputs(&s.doc.project, ts, &mesh_name, &opts, project_file.as_deref()).map_err(fe)? {
             names.push(json!({"ts": ts, "map": f.map, "file": f.name, "format": f.format.extension(), "bitDepth": f.bit_depth, "warnings": f.warnings}));
         }
     }
@@ -578,6 +581,7 @@ fn export_textures(s: &mut Session, p: &Value) -> Result<Value> {
 fn write_materialx(s: &Session, sets: &[usize], opts: &ExportOptions, dir: &std::path::Path, warnings: &mut Vec<String>) -> Result<Vec<std::path::PathBuf>> {
     use texturecraft_formats::materialx::{self, Texture};
     let mesh_name = stem_of(s.doc.project.mesh.trim_start_matches("builtin:"));
+    let project_file = s.path.as_deref().map(stem_of);
     if opts.color_space == Some(texturecraft_texel::ColorSpace::Aces2065) {
         warnings.push("MaterialX: version 1.39 has no ACES2065-1 colour space; the colour maps are tagged lin_ap0_scene, its name in later versions, which older readers may not know".into());
     }
@@ -587,7 +591,7 @@ fn write_materialx(s: &Session, sets: &[usize], opts: &ExportOptions, dir: &std:
     for &ts in sets {
         let set = s.doc.project.texture_set(ts).map_err(|e| EngineError::Other(e.to_string()))?;
         let mut textures: Vec<Texture> = Vec::new();
-        for f in texturecraft_formats::list_outputs(&s.doc.project, ts, &mesh_name, opts).map_err(fe)? {
+        for f in texturecraft_formats::list_outputs(&s.doc.project, ts, &mesh_name, opts, project_file.as_deref()).map_err(fe)? {
             let Some(input) = opts.preset.maps.get(f.map).and_then(|m| materialx::input_of_template(&m.file)) else { continue };
 
             // The first tile stands for all of them: its number is written as <UDIM>
@@ -992,6 +996,65 @@ f 1/1 2/2 3/3
         old.project.mesh_file.clear();
         let mut old = Session::from_project_bytes(&texturecraft_formats::save_project_bytes(&old).unwrap()).unwrap();
         assert_eq!(parts(&mut old), json!(["mesh"]));
+    }
+
+    #[test]
+    fn failed_save_as_preserves_session_path_and_project_file_token() {
+        let dir = std::env::temp_dir().join(format!("tc_failed_save_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let valid_file = dir.join(format!("initial_project.{PROJECT_EXT}"));
+        let valid_path = valid_file.display().to_string();
+
+        let mut s = Session::new_project("InitialProject", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        native::save_to(&mut s, &valid_path, true).unwrap();
+        assert_eq!(s.path.as_deref(), Some(valid_path.as_str()));
+
+        // Attempt to save to an unwritable non-existent path
+        let invalid_path = dir.join("missing_dir").join("sub").join(format!("fail.{PROJECT_EXT}")).display().to_string();
+        let err = native::save_to(&mut s, &invalid_path, true);
+        assert!(err.is_err(), "saving to non-existent directory must fail");
+
+        // Session path remains unchanged after failed save
+        assert_eq!(s.path.as_deref(), Some(valid_path.as_str()), "session path must remain unchanged after failed save");
+
+        // export.plan resolves $projectFile using initial_project
+        let plan = plan(&mut s, &json!({"preset": {"name": "test", "maps": [{"file": "$projectFile_$project", "format": "Png", "bit_depth": 8, "channels": [["R", {"Channel": {"channel": "BaseColor", "component": 0}}]]}]}})).unwrap();
+        let file_name = plan.as_array().unwrap()[0]["file"].as_str().unwrap();
+        assert_eq!(file_name, "initial_project_InitialProject.png");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_and_save_as_preserves_project_file_token_for_export() {
+        let dir = std::env::temp_dir().join(format!("tc_undo_save_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ear_path = dir.join(format!("ear_mask.{PROJECT_EXT}")).display().to_string();
+        let face_path = dir.join(format!("face_mask.{PROJECT_EXT}")).display().to_string();
+
+        let mut s = Session::new_project("MaskProject", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        native::save_to(&mut s, &ear_path, true).unwrap();
+        assert_eq!(s.path.as_deref(), Some(ear_path.as_str()));
+
+        // Add a layer
+        crate::execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+
+        // Save As face_mask
+        native::save_to(&mut s, &face_path, true).unwrap();
+        assert_eq!(s.path.as_deref(), Some(face_path.as_str()));
+
+        // Undo the layer addition
+        crate::execute(&mut s, "edit.undo", &Value::Null).unwrap();
+
+        // Session path must remain face_path after undo
+        assert_eq!(s.path.as_deref(), Some(face_path.as_str()));
+
+        // export.plan must resolve $projectFile to face_mask
+        let plan = plan(&mut s, &json!({"preset": {"name": "test", "maps": [{"file": "$projectFile_$project", "format": "Png", "bit_depth": 8, "channels": [["R", {"Channel": {"channel": "BaseColor", "component": 0}}]]}]}})).unwrap();
+        let file_name = plan.as_array().unwrap()[0]["file"].as_str().unwrap();
+        assert_eq!(file_name, "face_mask_MaskProject.png");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

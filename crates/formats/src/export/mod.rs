@@ -36,7 +36,8 @@ const MAX_STEM: usize = 200;
 pub const MAX_PRESET_NAME: usize = 64;
 
 /// File name template variables with what they become (see [`list_outputs`]).
-pub const FILE_TOKENS: [(&str, &str); 6] = [
+pub const FILE_TOKENS: [(&str, &str); 7] = [
+    ("$projectFile", "Saved project file stem (or project name when unsaved)"),
     ("$mesh", "Mesh file name"),
     ("$textureSet", "Texture set name"),
     ("$project", "Project name"),
@@ -377,6 +378,7 @@ pub struct ExportInput<'a> {
     pub baked: &'a BakedMaps,
     pub coverage: &'a [bool],
     pub mesh_name: &'a str,
+    pub project_file: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -484,7 +486,13 @@ pub fn sanitize_file_stem(s: &str) -> String {
 
 /// The files `opts` produces for texture set `ts`, without rendering (for the export dialog).
 /// Template variables: [`FILE_TOKENS`].
-pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &ExportOptions) -> Result<Vec<PlannedFile>> {
+pub fn list_outputs(
+    project: &Project,
+    ts: usize,
+    mesh_name: &str,
+    opts: &ExportOptions,
+    project_file: Option<&str>,
+) -> Result<Vec<PlannedFile>> {
     opts.preset.validate()?;
     let set = project.texture_set(ts)?;
     if let Some(s) = opts.size
@@ -496,6 +504,7 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
     let mut used = BTreeSet::new();
     let mut out = Vec::new();
     let tiles: Vec<Option<u32>> = if set.uv_tiles.is_empty() || opts.atlas { vec![None] } else { set.uv_tiles.iter().copied().map(Some).collect() };
+    let project_file = project_file.filter(|s| !s.is_empty()).unwrap_or(&project.name);
     for (i, map) in opts.preset.maps.iter().enumerate() {
         if !map.channels.iter().any(|(_, s)| source_present(set, s)) {
             continue;
@@ -518,6 +527,7 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
         for &tile in &tiles {
             let stem = template
                 .replace("$udim", &tile.unwrap_or(1001).to_string())
+                .replace("$projectFile", project_file)
                 .replace("$project", &project.name)
                 .replace("$mesh", mesh_name)
                 .replace("$textureSet", &set.name)
@@ -528,6 +538,7 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
             let token_stem = tile.map(|_| {
                 let t = template
                     .replace("$udim", "UDIMTOKEN")
+                    .replace("$projectFile", project_file)
                     .replace("$project", &project.name)
                     .replace("$mesh", mesh_name)
                     .replace("$textureSet", &set.name)
@@ -717,7 +728,7 @@ impl Sampler<'_> {
 
 /// Render every file of `opts` for `input`'s texture set.
 pub fn render_maps(input: &ExportInput, opts: &ExportOptions) -> Result<Vec<ExportedFile>> {
-    let planned = list_outputs(input.project, input.ts, input.mesh_name, opts)?;
+    let planned = list_outputs(input.project, input.ts, input.mesh_name, opts, input.project_file)?;
     let set = input.project.texture_set(input.ts)?;
     let (res, height) = (input.composite.resolution, input.composite.height);
     let grid = set.tile_grid();

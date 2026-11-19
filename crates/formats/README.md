@@ -69,7 +69,7 @@ ORM as occlusion + metallic-roughness; OpenGL normal; emissive only when not bla
 ### Texture export (`export`, `presets`)
 
 ```rust
-pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &ExportOptions) -> Result<Vec<PlannedFile>>;
+pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &ExportOptions, project_file: Option<&str>) -> Result<Vec<PlannedFile>>;
 pub fn render_maps(input: &ExportInput, opts: &ExportOptions) -> Result<Vec<ExportedFile>>;
 pub fn write_files(files: &[ExportedFile], dir: &Path) -> Result<Vec<PathBuf>>;   // native, atomic
 pub fn builtin_presets() -> Vec<ExportPreset>;
