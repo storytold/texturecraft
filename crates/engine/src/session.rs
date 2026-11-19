@@ -55,7 +55,7 @@ pub struct SetCache {
     /// Tiles per composite chunk that fit the last frame's budget (0: not measured yet).
     pub chunk: usize,
     /// Invalidated when the document stack is synchronized.
-    paint_margin: std::sync::OnceLock<Option<u32>>,
+    paint_margin: Option<(Option<PaintTarget>, Option<u32>)>,
 }
 
 impl SetCache {
@@ -78,7 +78,7 @@ impl SetCache {
             revision: 0,
             below: BelowCache::default(),
             chunk: 0,
-            paint_margin: Default::default(),
+            paint_margin: None,
         }
     }
 
@@ -86,32 +86,47 @@ impl SetCache {
         &mut self,
         project: &Project,
         ts: usize,
+        target: Option<PaintTarget>,
         tiles: &[(u32, u32)],
         queue: impl FnOnce(&mut Self) -> &mut BTreeSet<(u32, u32)>,
     ) {
         if tiles.is_empty() {
             return;
         }
-        let margin = *self.paint_margin.get_or_init(|| texturecraft_compose::eval::painted_tile_margin(project, ts));
+        let margin = match self.paint_margin {
+            Some((cached, margin)) if cached == target => margin,
+            _ => {
+                let margin = texturecraft_compose::eval::painted_tile_margin(project, ts, target);
+                self.paint_margin = Some((target, margin));
+                margin
+            }
+        };
         let covered = Arc::clone(&self.covered_tiles);
         let (width, height) = self.size;
         let queue = queue(self);
         match margin {
             Some(0) => queue.extend(tiles.iter().copied()),
             Some(radius) => {
-                let diameter = (radius as usize).saturating_mul(2).saturating_add(1);
-                if diameter.saturating_mul(diameter).saturating_mul(tiles.len()) >= covered.len() {
-                    queue.extend(covered.iter().copied());
-                    return;
-                }
                 let (last_x, last_y) = (width.saturating_sub(1) / TILE, height.saturating_sub(1) / TILE);
-                for &(x, y) in tiles {
-                    let left = x.saturating_sub(radius);
-                    let right = x.saturating_add(radius).min(last_x);
-                    for row in y.saturating_sub(radius)..=y.saturating_add(radius).min(last_y) {
+                let mut add_rect = |(left, top): (u32, u32), (right, bottom): (u32, u32)| {
+                    let left = left.saturating_sub(radius);
+                    let right = right.saturating_add(radius).min(last_x);
+                    for row in top.saturating_sub(radius)..=bottom.saturating_add(radius).min(last_y) {
                         // Covered tiles are sorted by row, then column.
                         let start = covered.partition_point(|&(tx, ty)| (ty, tx) < (row, left));
                         queue.extend(covered[start..].iter().take_while(|&&(tx, ty)| ty == row && tx <= right).copied());
+                    }
+                };
+                // Coalesce expensive, overlapping halos without scanning distant atlas tiles.
+                let diameter = (radius as usize).saturating_mul(2).saturating_add(1);
+                if diameter.saturating_mul(diameter).saturating_mul(tiles.len()) >= covered.len() {
+                    let bounds = tiles.iter().fold(((last_x, last_y), (0, 0)), |((l, t), (r, b)), &(x, y)| {
+                        ((l.min(x), t.min(y)), (r.max(x), b.max(y)))
+                    });
+                    add_rect(bounds.0, bounds.1);
+                } else {
+                    for &tile in tiles {
+                        add_rect(tile, tile);
                     }
                 }
             }
@@ -815,7 +830,7 @@ impl Session {
             match before.as_ref().zip(after.as_ref()).and_then(|(before, after)| before.changed_tiles(after)) {
                 Some(changed_tiles) => {
                     let tiles: Vec<_> = changed_tiles.into_iter().collect();
-                    cache.queue_painted(&self.doc.project, texture_set_index, &tiles, |c| &mut c.dirty);
+                    cache.queue_painted(&self.doc.project, texture_set_index, None, &tiles, |c| &mut c.dirty);
                 }
                 None => cache.invalidate_all(),
             }
@@ -1132,14 +1147,15 @@ impl Session {
         committed: bool,
     ) {
         let size = self.caches.get(ts).map(|c| c.size);
-        let sets = target.map(|t| self.doc.project.sets_drawing(self.paint_owner(t))).unwrap_or_default();
+        let Some(target) = target else { return };
+        let sets = self.doc.project.sets_drawing(self.paint_owner(target));
         let tiles: Vec<(u32, u32)> = tiles.into_iter().collect();
         for (i, c) in self.caches.iter_mut().enumerate() {
             if i != ts && !sets.contains(&i) {
                 continue;
             }
             if Some(c.size) == size {
-                c.queue_painted(&self.doc.project, i, &tiles, |c| if committed { &mut c.settle } else { &mut c.dirty });
+                c.queue_painted(&self.doc.project, i, Some(target), &tiles, |c| if committed { &mut c.settle } else { &mut c.dirty });
             } else if committed {
                 // Resampled instances first see the stroke when its source pixels are committed.
                 c.invalidate_all();

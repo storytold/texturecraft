@@ -358,16 +358,27 @@ pub fn stack_reads_neighbours(project: &Project, texture_set_index: usize) -> bo
 /// Conservative output halo in tiles for an edit to painted pixels. Without anchors each
 /// filtered field reads its own effect stack. An anchor can feed another field at a mapped
 /// position, so only whole-set invalidation is safe in that case.
-pub fn painted_tile_margin(project: &Project, ts: usize) -> Option<u32> {
+pub fn painted_tile_margin(project: &Project, ts: usize, target: Option<PaintTarget>) -> Option<u32> {
     let set = project.texture_sets.get(ts)?;
     let (width, height) = set.size();
     let resolution = set.block_resolution();
+    let owner = target.map(|target| {
+        let (PaintTarget::Layer(id) | PaintTarget::Mask(id)) = target;
+        project.effect(id).map_or(id, |(owner, _)| owner)
+    });
     let mut max_reach = 0;
     for layer in project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)) {
         if layer.reads_anchor() {
             return None;
         }
-        for effects in std::iter::once(&layer.content_effects).chain(layer.mask.iter().map(|mask| &mask.effects)) {
+        if owner.is_some_and(|id| id != layer.id) {
+            continue;
+        }
+        let masks = layer.mask.iter().map(|mask| (true, &mask.effects));
+        for (mask, effects) in std::iter::once((false, &layer.content_effects)).chain(masks) {
+            if target.is_some_and(|t| matches!(t, PaintTarget::Mask(_)) != mask) {
+                continue;
+            }
             let reach = neighbourhood_filters(effects, resolution)
                 .map(|(_, radius, op)| filter_extent(radius, op, width.max(height)).1)
                 .fold(0u32, u32::saturating_add);

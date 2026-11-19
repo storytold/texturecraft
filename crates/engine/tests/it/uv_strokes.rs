@@ -119,20 +119,24 @@ fn blurred_mask_session() -> Session {
 
 #[test]
 fn filtered_stroke_refreshes_the_neighbour_on_preview_cancel_commit_and_history() {
-    use texturecraft_engine::compose::{BelowCache, Composite};
+    use texturecraft_engine::compose::Composite;
     fn compare_full(s: &mut Session, phase: &str) -> Composite {
         s.update();
         let incremental = s.caches[0].composite.clone();
         let cache = &mut s.caches[0];
-        cache.below = BelowCache::default();
+        let warm = std::mem::take(&mut cache.below);
         cache.below.budget = 0;
         cache.invalidate_all();
         s.update();
+        s.caches[0].below = warm;
         assert!(s.caches[0].composite == incremental, "{phase}: incremental output differs from a full evaluation");
         incremental
     }
 
     let mut s = blurred_mask_session();
+    s.begin_stroke_uv([0.8, 0.8].into(), 1.0).unwrap();
+    s.end_stroke().unwrap();
+    s.update();
     let baseline = s.caches[0].composite.clone();
     let uv = [60.5 / RESOLUTION as f32, 32.5 / RESOLUTION as f32].into();
     s.begin_stroke_uv(uv, 1.0).unwrap();
@@ -145,7 +149,9 @@ fn filtered_stroke_refreshes_the_neighbour_on_preview_cancel_commit_and_history(
     s.end_stroke().unwrap();
     let committed = compare_full(&mut s, "commit");
     s.undo().unwrap();
+    assert!(!s.caches[0].dirty.contains(&(3, 3)), "undo leaves distant tiles alone");
     assert!(compare_full(&mut s, "undo") == baseline);
     s.redo().unwrap();
+    assert!(!s.caches[0].dirty.contains(&(3, 3)), "redo leaves distant tiles alone");
     assert!(compare_full(&mut s, "redo") == committed);
 }
