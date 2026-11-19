@@ -103,3 +103,49 @@ fn decreasing_pressure_does_not_stamp_behind_a_turn() {
     assert!(red_at(&session, 0.33, 0.55), "the new segment is painted");
     assert!(!red_at(&session, 0.33, 0.45), "a smaller step must not stamp behind the turn");
 }
+
+/// A black mask on a white fill, with a paint effect below its blur.
+fn blurred_mask_session() -> Session {
+    let mut s = Session::new_project("mask cache", primitives::plane(1.0, 1), "builtin:plane", None, RESOLUTION).unwrap();
+    let layer = execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap()["layer"].clone();
+    execute(&mut s, "mask.add.black", &json!({})).unwrap();
+    let paint = execute(&mut s, "effect.add.paint", &json!({"target": "mask"})).unwrap()["effect"].clone();
+    execute(&mut s, "effect.add.filter", &json!({"target": "mask", "filter": "blur", "radius": 32})).unwrap();
+    execute(&mut s, "layer.select", &json!({"layer": layer, "target": paint})).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 2.0, "hardness": 100})).unwrap();
+    s.update();
+    s
+}
+
+#[test]
+fn filtered_stroke_refreshes_the_neighbour_on_preview_cancel_commit_and_history() {
+    use texturecraft_engine::compose::{BelowCache, Composite};
+    fn compare_full(s: &mut Session, phase: &str) -> Composite {
+        s.update();
+        let incremental = s.caches[0].composite.clone();
+        let cache = &mut s.caches[0];
+        cache.below = BelowCache::default();
+        cache.below.budget = 0;
+        cache.invalidate_all();
+        s.update();
+        assert!(s.caches[0].composite == incremental, "{phase}: incremental output differs from a full evaluation");
+        incremental
+    }
+
+    let mut s = blurred_mask_session();
+    let baseline = s.caches[0].composite.clone();
+    let uv = [60.5 / RESOLUTION as f32, 32.5 / RESOLUTION as f32].into();
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    assert_eq!(s.stroke_tiles(), 1, "the brush itself stays inside one tile");
+    let live = compare_full(&mut s, "live");
+    assert_ne!(live.value(Channel::BaseColor, 64, 32), baseline.value(Channel::BaseColor, 64, 32));
+    s.cancel_stroke();
+    assert!(compare_full(&mut s, "cancel") == baseline);
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    s.end_stroke().unwrap();
+    let committed = compare_full(&mut s, "commit");
+    s.undo().unwrap();
+    assert!(compare_full(&mut s, "undo") == baseline);
+    s.redo().unwrap();
+    assert!(compare_full(&mut s, "redo") == committed);
+}

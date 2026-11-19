@@ -355,6 +355,28 @@ pub fn stack_reads_neighbours(project: &Project, texture_set_index: usize) -> bo
     })
 }
 
+/// Conservative output halo in tiles for an edit to painted pixels. Without anchors each
+/// filtered field reads its own effect stack. An anchor can feed another field at a mapped
+/// position, so only whole-set invalidation is safe in that case.
+pub fn painted_tile_margin(project: &Project, ts: usize) -> Option<u32> {
+    let set = project.texture_sets.get(ts)?;
+    let (width, height) = set.size();
+    let resolution = set.block_resolution();
+    let mut max_reach = 0;
+    for layer in project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)) {
+        if layer.reads_anchor() {
+            return None;
+        }
+        for effects in std::iter::once(&layer.content_effects).chain(layer.mask.iter().map(|mask| &mask.effects)) {
+            let reach = neighbourhood_filters(effects, resolution)
+                .map(|(_, radius, op)| filter_extent(radius, op, width.max(height)).1)
+                .fold(0u32, u32::saturating_add);
+            max_reach = max_reach.max(reach);
+        }
+    }
+    Some(max_reach.div_ceil(TILE))
+}
+
 /// Unit texel-space vector of `angle` degrees. Texel rows run down: positive angles turn
 /// counterclockwise on screen.
 fn direction(angle: f32) -> [f32; 2] {
