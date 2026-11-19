@@ -149,7 +149,7 @@ fn i32s(v: &[i32]) -> Vec<u8> {
 
 /// A unit quad (two faces of a split square, in face sets "left" / "right") under an Xform
 /// translated by (1, 2, 3) and scaled by 2, plus an un-set triangle mesh under the root.
-fn sample_file(with_tri: bool) -> Vec<u8> {
+pub(super) fn sample_file(with_tri: bool) -> Vec<u8> {
     let mut a = Abc { w: Writer::new() };
     // Points of a 2×1 strip in the XY plane, faces wound clockwise seen from +Z (Alembic).
     let p = f32s(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0, 0.0]);
@@ -266,7 +266,7 @@ fn half_float_values_preserve_special_values() {
     let mut a = Abc { w: Writer::new() };
     let raw: Vec<u8> = [0xc000u16, 0x0001, 0x7c00, 0x7e00].iter().flat_map(|x| x.to_le_bytes()).collect();
     let p = a.array("values", "", 9, 1, &raw);
-    let property = Prop { name: p.name.into(), meta: p.meta, kind: PropKind::Array, pod: 9, extent: 1, group: p.group };
+    let property = Prop { name: p.name.into(), meta: p.meta, kind: PropKind::Array, pod: 9, extent: 1, at: p.group };
     let mut ogawa = Ogawa { b: &a.w.b, budget: MAX_DECODED_BYTES, indexed_meta: Vec::new() };
     let values = ogawa.values(&property).unwrap();
     assert_eq!(values[0], -2.0);
@@ -278,7 +278,7 @@ fn half_float_values_preserve_special_values() {
 #[test]
 fn hdf5_and_garbage_are_clear_errors() {
     let e = read(b"\x89HDF\r\n\x1a\n rest of an hdf5 file").err().unwrap().to_string();
-    assert!(e.contains("HDF5") && e.contains("Ogawa"), "{e}");
+    assert!(e.contains("HDF5"), "{e}");
     assert!(read(b"not alembic at all").is_err());
     assert!(read(b"").is_err());
 }

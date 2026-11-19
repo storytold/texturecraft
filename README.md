@@ -203,7 +203,7 @@ from our code against public documentation.
 - hardware ray tracing in Rendering mode;
 - pen tilt, and pen pressure on Linux, macOS and desktop browsers (the windowing layer doesn't
   report them yet);
-- Alembic files in the older HDF5 container, and Alembic animation (the first sample is read);
+- Alembic animation (the first sample is read);
 - a native-speaker review of the translations;
 - the first signed release on every platform.
 
