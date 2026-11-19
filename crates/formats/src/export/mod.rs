@@ -1493,7 +1493,7 @@ fn write_exr(
         exr_chromaticities: space.map(|s| s.chromaticities().map(|xy| [xy[0] as f32, xy[1] as f32])),
         ..Default::default()
     };
-    craft_image_codecs::encode(&img, craft_image_codecs::Format::Exr, &opts)
+    craft_image_codecs::encode(&img, craft_image_codecs::Format::OpenExr, &opts)
 }
 
 /// Leave out each file named like an earlier one of `files` (ignoring case, as Windows and macOS
