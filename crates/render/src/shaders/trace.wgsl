@@ -209,13 +209,18 @@ fn occluded(o: vec3<f32>, d: vec3<f32>) -> bool {
 
 // ---- Materials ----
 
-// Texel of `uv` (nearest, wrapped) in kind `k` of layer `layer`, offset by (dx, dy).
+// Texel of `uv` (nearest, wrapped or clamped) in kind `k` of layer `layer`, offset by (dx, dy).
 fn texel(layer: u32, k: u32, uv: vec2<f32>, dx: i32, dy: i32) -> vec2<i32> {
     let info = P.sets[layer];
-    let small = ((u32(info.z) >> k) & 1u) == 1u;
+    let flags = u32(info.z);
+    let small = ((flags >> k) & 1u) == 1u;
+    let tiled = ((flags >> 16u) & 1u) == 1u;
     let dims = select(max(vec2<i32>(info.xy), vec2<i32>(1)), vec2<i32>(1), small);
     let x = i32(floor(uv.x * f32(dims.x))) + dx;
     let y = i32(floor(uv.y * f32(dims.y))) + dy;
+    if tiled {
+        return vec2<i32>(clamp(x, 0, dims.x - 1), clamp(y, 0, dims.y - 1));
+    }
     return vec2<i32>(((x % dims.x) + dims.x) % dims.x, ((y % dims.y) + dims.y) % dims.y);
 }
 

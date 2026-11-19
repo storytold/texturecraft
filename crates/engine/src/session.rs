@@ -1303,3 +1303,26 @@ fn tiled_mesh(source: &Arc<Mesh>, project: &Project) -> Arc<Mesh> {
     }
     Arc::new(mesh)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use texturecraft_geom::primitives;
+
+    #[test]
+    fn project_new_with_uv_tiles_off_preserves_classic_single_tile_for_offset_mesh() {
+        let mut mesh = primitives::plane(2.0, 2);
+        for uv in &mut mesh.uvs {
+            uv.x += 1.0;
+        }
+
+        // Default automatic mode: offset UVs land in UDIM 1002, creating a tiled set
+        let auto_session = Session::new_project_tiled("auto", mesh.clone(), "test:plane", None, 128, None).unwrap();
+        assert_eq!(auto_session.doc.project.texture_sets[0].uv_tiles, vec![1002]);
+        assert!(!auto_session.doc.project.texture_sets[0].uv_tiles.is_empty());
+
+        // UV tiles = Off: disables UDIM detection and preserves a classic single-tile set
+        let classic_session = Session::new_project_tiled("classic", mesh, "test:plane", None, 128, Some(false)).unwrap();
+        assert!(classic_session.doc.project.texture_sets[0].uv_tiles.is_empty());
+    }
+}

@@ -36,6 +36,7 @@ pub struct TraceSet {
     pub material: usize,
     pub composite: Composite,
     pub height_strength: f32,
+    pub tiled: bool,
 }
 
 /// Everything a pass reads (cheap to clone: shared or copy-on-write data).
@@ -553,7 +554,11 @@ fn surface(scene: &TraceScene, tri: u32, u: f32, v: f32, o: Vec3, d: Vec3, t: f3
     // The composite texel at offset (dx, dy) from the hit.
     let texel = |s: &TraceSet, dx: i32, dy: i32| {
         let (w, h) = (s.composite.resolution.max(1) as i32, s.composite.height.max(1) as i32);
-        (((uv.x * w as f32).floor() as i32 + dx).rem_euclid(w) as u32, ((uv.y * h as f32).floor() as i32 + dy).rem_euclid(h) as u32)
+        if s.tiled {
+            (((uv.x * w as f32).floor() as i32 + dx).clamp(0, w - 1) as u32, ((uv.y * h as f32).floor() as i32 + dy).clamp(0, h - 1) as u32)
+        } else {
+            (((uv.x * w as f32).floor() as i32 + dx).rem_euclid(w) as u32, ((uv.y * h as f32).floor() as i32 + dy).rem_euclid(h) as u32)
+        }
     };
     let ch = |c: Channel, dx: i32, dy: i32| -> [f32; 3] {
         let Some(s) = set else { return c.default_value() };
@@ -1181,7 +1186,7 @@ mod tests {
                 }
             }
         }
-        TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0 }], env, 0.0)
+        TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0, tiled: false }], env, 0.0)
     }
 
     /// Mean radiance of parallel rays over the whole disc of the sphere (grazing hits included)

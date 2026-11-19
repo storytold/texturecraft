@@ -268,7 +268,12 @@ fn trace_scene(app: &TextureCraftApp) -> TraceScene {
         .texture_sets
         .iter()
         .zip(&session.caches)
-        .map(|(set, cache)| TraceSet { material: set.material, composite: cache.composite.clone(), height_strength: set.atlas_height_strength() })
+        .map(|(set, cache)| TraceSet {
+            material: set.material,
+            composite: cache.composite.clone(),
+            height_strength: set.atlas_height_strength(),
+            tiled: !set.uv_tiles.is_empty(),
+        })
         .collect();
     let env_image = display.environment_resource().and_then(|n| session.images.get(n));
 

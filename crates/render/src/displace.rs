@@ -81,6 +81,7 @@ struct Heights {
     w: usize,
     h: usize,
     data: Vec<f32>,
+    tiled: bool,
 }
 
 impl Heights {
@@ -104,13 +105,17 @@ impl Heights {
                 data.push(sum / (k * k) as f32);
             }
         }
-        Some(Heights { w: w as usize, h: h as usize, data })
+        Some(Heights { w: w as usize, h: h as usize, data, tiled: s.tiled })
     }
 
-    /// Bilinear at `uv`, clamped at the edges (the viewport's height sampler).
+    /// Bilinear at `uv`, clamped for UV-tiled sets and repeated across UV tile edges for classic offset sets (matching the viewport's height sampler).
     fn sample(&self, uv: Vec2) -> f32 {
         let at = |x: isize, y: isize| {
-            let (x, y) = (x.clamp(0, self.w as isize - 1) as usize, y.clamp(0, self.h as isize - 1) as usize);
+            let (x, y) = if self.tiled {
+                (x.clamp(0, self.w as isize - 1) as usize, y.clamp(0, self.h as isize - 1) as usize)
+            } else {
+                (x.rem_euclid(self.w as isize) as usize, y.rem_euclid(self.h as isize) as usize)
+            };
             self.data.get(y * self.w + x).copied().unwrap_or(0.0)
         };
         let (fx, fy) = (uv.x * self.w as f32 - 0.5, uv.y * self.h as f32 - 0.5);
@@ -141,7 +146,7 @@ mod tests {
                 img.tile_mut(x, y, &[texturecraft_texel::to_u16_signed(height)]);
             }
         }
-        TraceSet { material: 0, composite, height_strength: strength }
+        TraceSet { material: 0, composite, height_strength: strength, tiled: false }
     }
 
     #[test]
@@ -161,5 +166,34 @@ mod tests {
         assert!(Arc::ptr_eq(&trace_geometry(&mesh, &bvh, &[set(0.5, 2.0)], &off).0, &mesh), "off unless the display displaces");
         let on = DisplaySettings { displacement: true, ..DisplaySettings::default() };
         assert!(!Arc::ptr_eq(&trace_geometry(&mesh, &bvh, &[set(0.5, 2.0)], &on).0, &mesh));
+    }
+
+    #[test]
+    fn sample_repeats_across_offset_uvs() {
+        let heights = Heights { w: 4, h: 4, data: (0..16).map(|v| v as f32 / 15.0).collect(), tiled: false };
+        let val_origin = heights.sample(Vec2::new(0.25, 0.25));
+        let val_offset = heights.sample(Vec2::new(1.25, 2.25));
+        let val_neg_offset = heights.sample(Vec2::new(-0.75, -0.75));
+        assert!((val_origin - val_offset).abs() < 1e-6);
+        assert!((val_origin - val_neg_offset).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sample_clamps_tiled_sets_and_repeats_classic_sets() {
+        let mut data = vec![0.0f32; 16];
+        for y in 0..4 {
+            data[y * 4] = 1.0;
+        }
+        let tiled = Heights { w: 4, h: 4, data: data.clone(), tiled: true };
+        let classic = Heights { w: 4, h: 4, data, tiled: false };
+
+        let tiled_edge = tiled.sample(Vec2::new(0.0, 0.5));
+        assert!((tiled_edge - 1.0).abs() < 1e-5, "tiled should clamp without bleeding opposite column: {tiled_edge}");
+
+        let classic_edge = classic.sample(Vec2::new(0.0, 0.5));
+        assert!((classic_edge - 0.5).abs() < 1e-5, "classic should repeat and blend opposite column: {classic_edge}");
+
+        let offset = classic.sample(Vec2::new(1.0, 0.5));
+        assert!((offset - classic_edge).abs() < 1e-5);
     }
 }
