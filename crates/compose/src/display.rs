@@ -132,7 +132,8 @@ fn encode_tile(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: 
     // Downscaling uses the top-left sample at each stride, matching the viewport upload.
     let source = |offset: usize| {
         let side = TILE as usize >> shift;
-        ((offset / side) * TILE as usize + offset % side) << shift
+        let row = offset >> (TILE.ilog2() - shift);
+        (row * TILE as usize + (offset & (side - 1))) << shift
     };
     let srgb = srgb_lut();
     let get = |c: Channel| composite.channels.get(&c).and_then(|img| img.tile(tx, ty));

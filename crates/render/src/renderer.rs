@@ -1478,7 +1478,17 @@ impl Renderer {
     /// Upload a tile already sampled at the UI's display shift. The adapter's dimension
     /// limit may require another reduction for this particular set.
     #[allow(clippy::too_many_arguments)]
-    pub fn upload_display_tile(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, kind: DisplayKind, tile_x: u32, tile_y: u32, bytes: &[u8], source_shift: u32) {
+    pub fn upload_display_tile(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture_set: usize,
+        kind: DisplayKind,
+        tile_x: u32,
+        tile_y: u32,
+        bytes: &[u8],
+        source_shift: u32,
+    ) {
         let Some(set) = self.sets.get_mut(texture_set) else { return };
         let Some(kind_index) = DisplayKind::ALL.iter().position(|k| *k == kind) else { return };
         let (Some(texture), Some(texel)) = (set.tex.get(kind_index), self.default_texels.get(kind_index)) else { return };

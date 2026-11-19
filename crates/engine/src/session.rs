@@ -1211,10 +1211,16 @@ impl Session {
     /// hot-layer caches, UV geometry and display padding.
     pub fn memory(&self) -> Memory {
         let composites = self.caches.iter().flat_map(|c| c.composite.channels.values()).map(texturecraft_texel::TileImage::bytes).sum();
-        let geometry = self.caches.iter().map(|c| {
-            c.gbuf.tri.capacity() * size_of::<u32>() + c.gbuf.bary.capacity() * size_of::<[f32; 2]>()
-                + c.covered_tiles.capacity() * size_of::<(u32, u32)>() + c.dilation.bytes()
-        }).sum();
+        let geometry = self
+            .caches
+            .iter()
+            .map(|c| {
+                c.gbuf.tri.capacity() * size_of::<u32>()
+                    + c.gbuf.bary.capacity() * size_of::<[f32; 2]>()
+                    + c.covered_tiles.capacity() * size_of::<(u32, u32)>()
+                    + c.dilation.bytes()
+            })
+            .sum();
         Memory { pixels: self.doc.pixels.bytes(), composites, cache: self.caches.iter().map(|c| c.below.bytes()).sum(), geometry }
     }
 }

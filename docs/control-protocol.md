@@ -158,7 +158,7 @@ keeps its state in a throwaway file.
 | `ping` | | `"pong"` |
 | `command.run` | `{id, params?}` | the command's JSON result |
 | `command.list` | `{filter?}` | `[{id, label, menu, shortcut, params, enabled}]` |
-| `session.inspect` | | project, mesh, texture sets, layer stack, tool, camera, display, history |
+| `session.inspect` | | project, mesh, texture sets, layer stack, tool, camera, display, history, `memoryBytes` (paint, composites, band cache and UV geometry), `geometryBytes` (UV lookup, covered tiles and materialized display padding) |
 | `ui.inspect` | | UI state, viewport rect, fps, bake progress (`baking`, 0..1), the running bake's stage (`bakeStatus`, e.g. "Baking Ambient Occlusion (2/4)") and live preview (`bakePreview`, see *Live bake preview*), toasts, `titleBar` (who draws the title bar this run: `app`, `integrated` on macOS, or `system`) |
 | `ui.menu.list` | | the menu catalog: `{menu, submenu, label, id, shortcut, implemented, enabled}` |
 | `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question; `file.exportMesh` opens the Mesh Export Options prompt, whose Export asks for the file; `ui.view.export` opens the right bar's Export panel). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a panel layout saved under Window > Layouts (panels only; mode, zoom and wireframes stay) and errors when no layout has that name. `{"id": "ui.layout.swap"}` swaps the 3D and 2D views of the split layout (F4) |

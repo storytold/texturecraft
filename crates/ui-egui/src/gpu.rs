@@ -257,7 +257,9 @@ impl GpuLink {
                     let bytes: Vec<_> = chunk
                         .par_iter()
                         .flat_map_iter(|&(tile_x, tile_y)| kinds.iter().map(move |&kind| (kind, tile_x, tile_y)))
-                        .map(|(kind, tile_x, tile_y)| (texture_set, kind, tile_x, tile_y, display_tile_bytes(composite, baked, kind, tile_x, tile_y, out.tile_shift)))
+                        .map(|(kind, tile_x, tile_y)| {
+                            (texture_set, kind, tile_x, tile_y, display_tile_bytes(composite, baked, kind, tile_x, tile_y, out.tile_shift))
+                        })
                         .collect();
                     queued += bytes.len();
                     out.tiles.extend(bytes);
@@ -605,7 +607,10 @@ mod tests {
 
     #[test]
     fn smaller_viewport_packs_only_the_samples_the_renderer_will_use() {
-        use texturecraft_engine::{compose::{Composite, tile_bytes}, texel::TILE};
+        use texturecraft_engine::{
+            compose::{Composite, tile_bytes},
+            texel::TILE,
+        };
         let mut gpu = link();
         let mut s = session(false);
         s.update();

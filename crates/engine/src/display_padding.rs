@@ -21,7 +21,13 @@ pub struct DisplayPadding {
 impl DisplayPadding {
     pub(crate) fn new(gbuf: &UvGBuffer, has_coverage: bool, block: u32) -> Self {
         let size = (gbuf.width, gbuf.height);
-        let uniform = if !has_coverage { Some(false) } else if !gbuf.tri.contains(&NO_TRI) { Some(true) } else { None };
+        let uniform = if !has_coverage {
+            Some(false)
+        } else if !gbuf.tri.contains(&NO_TRI) {
+            Some(true)
+        } else {
+            None
+        };
         let dense = if uniform.is_none() {
             Arc::new(DilationMap::in_blocks(&gbuf.coverage_mask(), size.0, size.1, Some(DISPLAY_PADDING), block)).into()
         } else {

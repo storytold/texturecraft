@@ -875,7 +875,7 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
 
 #[test]
 fn uniform_uv_sets_do_not_materialize_padding_until_explicitly_read() {
-    use texturecraft_engine::{solo::Solo, texel::DilationMap};
+    use texturecraft_engine::{Solo, texel::DilationMap};
     for uv_scale in [1.0, 0.0, 0.5] {
         let mut mesh = primitives::plane(1.0, 1);
         for uv in &mut mesh.uvs {
