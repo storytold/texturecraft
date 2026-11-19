@@ -669,3 +669,16 @@ fn group_index_preserves_order_and_reuses_nonadjacent_material_parts() {
     }
     assert_eq!(raw.groups[1000], ("other".into(), "0".into(), vec![6, 7, 8]));
 }
+
+#[test]
+fn decode_base_color_resizes_oversized_and_rejects_corrupt_bytes() {
+    let mut budget = BASE_COLOR_TEXELS;
+    assert!(decode_base_color(b"not an image", &mut budget).is_err());
+
+    let side = BASE_COLOR_SIDE + 2;
+    let img = craft_image_codecs::Image::from_u8(side, 2, craft_image_codecs::ChannelLayout::Rgba, vec![128; (side * 2 * 4) as usize]).unwrap();
+    let png = craft_image_codecs::encode(&img, craft_image_codecs::Format::Png, &Default::default()).unwrap();
+    let (w, h, pixels) = decode_base_color(&png, &mut budget).unwrap();
+    assert!(w <= BASE_COLOR_SIDE && h <= BASE_COLOR_SIDE);
+    assert_eq!(pixels.len(), (w * h) as usize);
+}
