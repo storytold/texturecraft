@@ -59,6 +59,7 @@ mod procedural_params;
 pub mod project_cmds;
 pub mod quick_mask;
 pub mod resource_cmds;
+mod display_padding;
 pub mod session;
 mod session_log;
 pub mod set_cmds;

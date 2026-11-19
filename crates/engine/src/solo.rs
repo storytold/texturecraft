@@ -70,7 +70,7 @@ impl Session {
     /// Sample document pixels while solo keeps its own composite in the viewport cache.
     pub(crate) fn document_composite(&self, ts: usize, tiles: &[(u32, u32)]) -> Option<std::borrow::Cow<'_, texturecraft_compose::Composite>> {
         use std::borrow::Cow;
-        use texturecraft_compose::{Composite, composite_tiles, pad_tiles};
+        use texturecraft_compose::{Composite, composite_tiles};
 
         let cache = self.caches.get(ts)?;
         if self.solo.is_none() {
@@ -81,7 +81,7 @@ impl Session {
             let set = inputs.project.texture_sets.get(ts)?;
             let mut output = Composite { block_scales: inputs.block_scales.clone(), ..Composite::with_size(&set.channel_list(), cache.size.0, cache.size.1) };
             composite_tiles(inputs, &mut output, tiles);
-            pad_tiles(&mut output, &cache.dilation, tiles);
+            cache.dilation.apply_to_tiles(&mut output, tiles);
             Some(Cow::Owned(output))
         })
     }

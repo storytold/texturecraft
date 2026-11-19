@@ -4,13 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use texturecraft_compose::{BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles, pad_tiles};
+use texturecraft_compose::{BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles};
 use texturecraft_core::{Channel, Layer, LayerId, LayerKind, Project, TextureSet};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, UvGBuffer};
 use texturecraft_paint::{BrushSettings, EyeDepth, Stroke, StrokeCanvas};
-use texturecraft_texel::{DilationMap, TILE};
+use texturecraft_texel::TILE;
 
+pub use crate::display_padding::DisplayPadding;
 use crate::fill_mode::FillMode;
 pub use crate::stencil_look::StencilLook;
 use crate::{EngineError, Result};
@@ -36,7 +37,7 @@ pub struct SetCache {
     /// Texels across and down (`TextureSet::size`).
     pub size: (u32, u32),
     pub gbuf: Arc<UvGBuffer>,
-    pub dilation: Arc<DilationMap>,
+    pub dilation: DisplayPadding,
     pub covered_tiles: Arc<Vec<(u32, u32)>>,
     pub composite: Composite,
     /// Tiles to recomposite.
@@ -61,13 +62,13 @@ impl SetCache {
         let (w, h) = ts.size();
         let gbuf = UvGBuffer::new(mesh, ts.material, w, h);
         // Padding stays inside each UV tile.
-        let dilation = DilationMap::in_blocks(&gbuf.coverage_mask(), w, h, Some(DISPLAY_PADDING), ts.block_resolution());
         let covered = covered_tiles(&gbuf);
+        let dilation = DisplayPadding::new(&gbuf, !covered.is_empty(), ts.block_resolution());
         let all: BTreeSet<(u32, u32)> = texturecraft_compose::all_tiles(w, h).into_iter().collect();
         SetCache {
             size: (w, h),
             gbuf: Arc::new(gbuf),
-            dilation: Arc::new(dilation),
+            dilation,
             covered_tiles: Arc::new(covered),
             composite: Composite { block_scales: ts.block_scales(), ..Composite::with_size(&ts.channel_list(), w, h) },
             dirty: all.clone(),
@@ -1085,7 +1086,7 @@ impl Session {
                 texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
 
                 // The composited tiles and the neighbours their padding reached change
-                let padded = pad_tiles(&mut cache.composite, &cache.dilation, &tiles);
+                let padded = cache.dilation.apply_to_tiles(&mut cache.composite, &tiles);
                 cache.upload.extend(tiles.iter().copied().chain(padded));
                 cache.revision = cache.revision.wrapping_add(1);
                 changed = true;
@@ -1207,10 +1208,14 @@ impl Session {
     }
 
     /// Bytes held by painted layer pixels, the composites of every texture set and their
-    /// hot-layer caches.
+    /// hot-layer caches, UV geometry and display padding.
     pub fn memory(&self) -> Memory {
         let composites = self.caches.iter().flat_map(|c| c.composite.channels.values()).map(texturecraft_texel::TileImage::bytes).sum();
-        Memory { pixels: self.doc.pixels.bytes(), composites, cache: self.caches.iter().map(|c| c.below.bytes()).sum() }
+        let geometry = self.caches.iter().map(|c| {
+            c.gbuf.tri.capacity() * size_of::<u32>() + c.gbuf.bary.capacity() * size_of::<[f32; 2]>()
+                + c.covered_tiles.capacity() * size_of::<(u32, u32)>() + c.dilation.bytes()
+        }).sum();
+        Memory { pixels: self.doc.pixels.bytes(), composites, cache: self.caches.iter().map(|c| c.below.bytes()).sum(), geometry }
     }
 }
 
@@ -1220,11 +1225,12 @@ pub struct Memory {
     pub pixels: usize,
     pub composites: usize,
     pub cache: usize,
+    pub geometry: usize,
 }
 
 impl Memory {
     pub fn total(self) -> usize {
-        self.pixels + self.composites + self.cache
+        self.pixels.saturating_add(self.composites).saturating_add(self.cache).saturating_add(self.geometry)
     }
 }
 
