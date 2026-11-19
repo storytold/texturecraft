@@ -93,6 +93,7 @@ struct SceneConst {
     sigma: Vec3,
     rotation: f32,
     heights: Vec<f32>,
+    tiled: Vec<bool>,
     ior: f32,
     /// Focus depth (0: the orbit target) and lens radius in world units (0: pinhole).
     lens: [f32; 2],
@@ -412,6 +413,7 @@ impl GpuTracer {
             sigma: scene.scatter_sigma,
             rotation: scene.env_rotation,
             heights: scene.sets.iter().map(|s| s.height_strength).collect(),
+            tiled: scene.sets.iter().map(|s| s.tiled).collect(),
             ior: scene.ior,
             lens: scene.lens.map_or([0.0; 2], |[focus, aperture]| [focus, aperture.max(0.0) * scene.radius]),
         });
@@ -608,7 +610,8 @@ impl GpuTracer {
         };
         let mut sets = [[0.0f32; 4]; 256];
         for (i, (slot, m)) in sets.iter_mut().zip(&mat.info).enumerate() {
-            *slot = [m[0], m[1], m[2], sc.heights.get(i).copied().unwrap_or(0.0)];
+            let tiled = sc.tiled.get(i).copied().unwrap_or(false);
+            *slot = [m[0], m[1], (m[2] as u32 | if tiled { 1 << 16 } else { 0 }) as f32, sc.heights.get(i).copied().unwrap_or(0.0)];
         }
         let mut bytes = bytemuck::bytes_of(&head).to_vec();
         bytes.extend_from_slice(bytemuck::cast_slice(&sets));
