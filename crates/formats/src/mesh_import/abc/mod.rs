@@ -22,8 +22,10 @@ const OGAWA_MAGIC: &[u8] = b"Ogawa";
 const HDF5_MAGIC: &[u8] = b"\x89HDF\r\n\x1a\n";
 /// Set on a child reference that points at a data block (clear: a group).
 const DATA_BIT: u64 = 1 << 63;
-/// Deepest object nesting followed.
-const MAX_DEPTH: usize = 64;
+/// Deepest object nesting followed: bounds the walk's recursion (stack) on hostile or
+/// self-referencing files. Real scenes go deeper than 64 (rigs, long transform chains), so this
+/// leaves ample room while each level stays a small stack frame.
+const MAX_DEPTH: usize = 256;
 /// Budget for decoded numbers (held as f64) and parsed header bytes: bounds memory and the work
 /// a file whose groups are shared many times over can cause.
 const MAX_DECODED_BYTES: usize = 1 << 31;
