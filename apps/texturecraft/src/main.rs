@@ -232,7 +232,7 @@ fn main() {
         viewport = viewport.with_icon(i);
     }
     let viewport = title_bar.viewport(viewport);
-    let mut options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, persistence_path, ..Default::default() };
+    let mut options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, persistence_path, persist_window: true, ..Default::default() };
     if let Err(e) = gpu::configure(&mut options, args.gpu, args.power_pref) {
         fatal(&e.to_string(), true);
         std::process::exit(2);
@@ -387,5 +387,14 @@ mod tests {
         std::fs::remove_file(&json_path).unwrap();
         std::fs::remove_file(&ron_path).unwrap();
         assert_eq!(saved_prefs(Some(&json_path), Some(&ron_path)), texturecraft_ui_egui::state::Prefs::default());
+    }
+
+    #[test]
+    fn native_options_persist_window_is_enabled() {
+        let prefs = texturecraft_ui_egui::state::Prefs::default();
+        let title_bar = TitleBar::decide(prefs.system_title_bar);
+        let viewport = title_bar.viewport(egui::ViewportBuilder::default());
+        let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, persistence_path: None, persist_window: true, ..Default::default() };
+        assert!(options.persist_window, "eframe window persistence must be enabled");
     }
 }
