@@ -77,7 +77,14 @@ pub(crate) fn use_images(s: &mut Session, cmd: &str, ts: usize, map: BakedMap, i
     let entry = s.doc.baked.entry(ts).or_default();
     entry.resolution = width;
     entry.maps.insert(map, Arc::new(data));
-    s.doc.project.texture_set_mut(ts)?.baked.insert(map);
+    let set = s.doc.project.texture_set_mut(ts)?;
+    set.baked.insert(map);
+    let imported_set = if set.uv_tiles.is_empty() {
+        [FIRST_TILE].into_iter().collect()
+    } else {
+        images.keys().copied().collect()
+    };
+    set.imported_tiles.insert(map, imported_set);
     Ok(width)
 }
 
@@ -164,7 +171,9 @@ fn clear(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(b) = s.doc.baked.get_mut(&ts) {
             b.maps.remove(&map);
         }
-        s.doc.project.texture_set_mut(ts)?.baked.remove(&map);
+        let set = s.doc.project.texture_set_mut(ts)?;
+        set.baked.remove(&map);
+        set.imported_tiles.remove(&map);
         Ok(())
     })?;
     Ok(Value::Null)

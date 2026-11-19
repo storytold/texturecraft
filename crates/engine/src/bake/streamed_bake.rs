@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use texturecraft_core::BakedMap;
@@ -11,4 +11,6 @@ pub struct StreamedBake {
     pub height: u32,
     pub maps: BTreeMap<BakedMap, Arc<Vec<f32>>>,
     pub tracer: String,
+    pub baked_maps: Vec<BakedMap>,
+    pub baked_tiles: BTreeSet<u32>,
 }

@@ -139,6 +139,13 @@ impl Session {
         let excluded_tiles: Vec<_> = set.uv_tiles.iter().filter(|tile| set.bake_excluded_tiles.contains(tile)).filter_map(|tile| grid?.block(*tile)).collect();
         let previous_maps = if excluded_tiles.is_empty() { Default::default() } else { self.doc.baked.get(&texture_set).cloned().unwrap_or_default() };
 
+        let baked_tiles: std::collections::BTreeSet<u32> = if set.uv_tiles.is_empty() {
+            [crate::meshmap_cmds::FIRST_TILE].into_iter().collect()
+        } else {
+            set.uv_tiles.iter().copied().filter(|t| !set.bake_excluded_tiles.contains(t)).collect()
+        };
+        let baked_maps: Vec<BakedMap> = set.bake.maps.enabled().collect();
+
         let tracer = chosen_tracer(GPU_TRACER.get(), GPU_RAYTRACING.load(Ordering::Relaxed));
         Ok(BakeTask {
             low_base_color,
@@ -155,6 +162,8 @@ impl Session {
             excluded_tiles,
             previous_maps,
             tracer,
+            baked_maps,
+            baked_tiles,
         })
     }
 
@@ -226,25 +235,74 @@ impl Session {
     /// preview that showed them holds the same ones)
     pub fn apply_streamed_bake(&mut self, texture_set: usize, output: StreamedBake) -> Result<()> {
         let tracer = output.tracer.clone();
-        self.edit("Bake mesh maps", |session| session.store_bake_maps(texture_set, output.resolution, output.height, output.maps))?;
+        self.edit("Bake mesh maps", |session| {
+            session.store_bake_maps(
+                texture_set,
+                output.resolution,
+                output.height,
+                output.maps,
+                Some(&output.baked_maps),
+                Some(&output.baked_tiles),
+            )
+        })?;
         self.log.push(format!("Baked texture set {texture_set} ({tracer})"));
         Ok(())
     }
 
     fn store_bake(&mut self, texture_set: usize, output: BakeOutput) -> Result<()> {
         let maps = output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(pixels))).collect();
-        self.store_bake_maps(texture_set, output.resolution, output.height, maps)
+        self.store_bake_maps(texture_set, output.resolution, output.height, maps, None, None)
     }
 
-    fn store_bake_maps(&mut self, texture_set: usize, resolution: u32, height: u32, maps: std::collections::BTreeMap<BakedMap, Arc<Vec<f32>>>) -> Result<()> {
+    pub(crate) fn store_bake_maps(
+        &mut self,
+        texture_set: usize,
+        resolution: u32,
+        height: u32,
+        maps: std::collections::BTreeMap<BakedMap, Arc<Vec<f32>>>,
+        baked_maps: Option<&[BakedMap]>,
+        baked_tiles: Option<&std::collections::BTreeSet<u32>>,
+    ) -> Result<()> {
         let entry = self.doc.baked.entry(texture_set).or_default();
         if entry.resolution != resolution || entry.maps.keys().any(|map| entry.height(*map) != height) {
             entry.maps.clear();
+            if let Ok(set) = self.doc.project.texture_set_mut(texture_set) {
+                set.imported_tiles.clear();
+            }
         }
 
         entry.resolution = resolution;
         entry.maps.extend(maps);
-        self.doc.project.texture_set_mut(texture_set)?.baked = entry.maps.keys().copied().collect();
+        let set = self.doc.project.texture_set_mut(texture_set)?;
+        set.baked = entry.maps.keys().copied().collect();
+
+        let actual_baked_maps: Vec<BakedMap> = match baked_maps {
+            Some(m) => m.to_vec(),
+            None => set.bake.maps.enabled().collect(),
+        };
+        let actual_baked_tiles: std::collections::BTreeSet<u32> = match baked_tiles {
+            Some(t) => t.clone(),
+            None => {
+                if set.uv_tiles.is_empty() {
+                    [crate::meshmap_cmds::FIRST_TILE].into_iter().collect()
+                } else {
+                    set.uv_tiles.iter().copied().filter(|t| !set.bake_excluded_tiles.contains(t)).collect()
+                }
+            }
+        };
+
+        for m in actual_baked_maps {
+            if entry.maps.contains_key(&m) {
+                if let Some(imported) = set.imported_tiles.get_mut(&m) {
+                    for tile in &actual_baked_tiles {
+                        imported.remove(tile);
+                    }
+                    if imported.is_empty() {
+                        set.imported_tiles.remove(&m);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

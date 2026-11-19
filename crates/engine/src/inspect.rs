@@ -196,6 +196,7 @@ pub fn texture_set(session: &Session, index: usize) -> Value {
         "layers": session.doc.project.walk(index).len(),
         "parts": crate::set_cmds::parts(session, index),
         "baked": crate::project_cmds::baked_json(session.doc.baked.get(&index)),
+        "importedTiles": &texture_set.imported_tiles,
         "visible": texture_set.visible,
         "active": index == session.ts(),
     })
