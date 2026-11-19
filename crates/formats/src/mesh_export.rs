@@ -363,21 +363,11 @@ pub fn glb_bytes(mesh: &Mesh, name: &str, textures: &[GlbTextures]) -> Result<Ve
             doc[key] = list.into();
         }
     }
-    let mut js = serde_json::to_vec(&doc).map_err(|e| FormatError::Invalid(format!("glTF JSON: {e}")))?;
-    while !js.len().is_multiple_of(4) {
-        js.push(b' ');
-    }
-    let mut bin = g.bin;
-    while !bin.len().is_multiple_of(4) {
-        bin.push(0);
-    }
-    let total = 12 + 8 + js.len() + 8 + bin.len();
-    let len32 = |v: usize| u32::try_from(v).map(u32::to_le_bytes).map_err(|_| FormatError::TooLarge(format!("the GLB would be {total} bytes (limit 4 GiB)")));
-    let mut out = Vec::with_capacity(total);
-    for chunk in [&b"glTF"[..], &2u32.to_le_bytes(), &len32(total)?, &len32(js.len())?, b"JSON", &js, &len32(bin.len())?, b"BIN\0", &bin] {
-        out.extend_from_slice(chunk);
-    }
-    Ok(out)
+    let js = serde_json::to_vec(&doc).map_err(|e| FormatError::Invalid(format!("glTF JSON: {e}")))?;
+    craft_mesh::gltf::glb_container(&js, &g.bin).map_err(|e| match e {
+        craft_mesh::Error::TooLarge(s) => FormatError::TooLarge(s),
+        other => FormatError::Invalid(other.to_string()),
+    })
 }
 
 /// OBJ names end at whitespace.

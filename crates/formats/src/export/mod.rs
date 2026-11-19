@@ -884,8 +884,8 @@ fn encode(
                 warnings.push("HDR has no alpha channel; alpha was dropped".into());
             }
             let rgb = remap(data, n, if n <= 2 { &[0, 0, 0] } else { &[0, 1, 2] });
-            let bytes: Vec<u8> = rgb.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            return write_image(format, &bytes, size, image::ExtendedColorType::Rgb32F, None).map_err(|e| failed(&e));
+            let img = craft_image_codecs::Image::from_f32(size.0, size.1, craft_image_codecs::ChannelLayout::Rgb, &rgb).map_err(|e| failed(&e))?;
+            return craft_image_codecs::encode(&img, craft_image_codecs::Format::Hdr, &Default::default()).map_err(|e| failed(&e));
         }
         _ => {}
     }
@@ -901,72 +901,40 @@ fn encode(
         (FileFormat::Tiff, 2) => (remap(&encoded, 2, &[0, 0, 0, 1]), 4),
         _ => (encoded, n),
     };
-    use image::ExtendedColorType as C;
-    let (bytes, color) = if depth == 16 {
-        let b: Vec<u8> = encoded.iter().flat_map(|v| ((v * 65535.0 + 0.5) as u16).to_ne_bytes()).collect();
-        (b, [C::L16, C::La16, C::Rgb16, C::Rgba16].get(n.wrapping_sub(1)).copied().unwrap_or(C::Rgba16))
-    } else {
-        let b: Vec<u8> = encoded.iter().map(|v| (v * 255.0 + 0.5) as u8).collect();
-        (b, [C::L8, C::La8, C::Rgb8, C::Rgba8].get(n.wrapping_sub(1)).copied().unwrap_or(C::Rgba8))
+    let layout = match n {
+        1 => craft_image_codecs::ChannelLayout::Gray,
+        2 => craft_image_codecs::ChannelLayout::GrayA,
+        3 => craft_image_codecs::ChannelLayout::Rgb,
+        _ => craft_image_codecs::ChannelLayout::Rgba,
     };
-    let icc = embed.and_then(crate::icc::profile);
-    write_image(format, &bytes, size, color, icc).map_err(|e| failed(&e))
+    let mut img = if depth == 16 {
+        let samples: Vec<u16> = encoded.iter().map(|v| (v * 65535.0 + 0.5) as u16).collect();
+        craft_image_codecs::Image::from_u16(size.0, size.1, layout, &samples).map_err(|e| failed(&e))?
+    } else {
+        let samples: Vec<u8> = encoded.iter().map(|v| (v * 255.0 + 0.5) as u8).collect();
+        craft_image_codecs::Image::from_u8(size.0, size.1, layout, samples).map_err(|e| failed(&e))?
+    };
+    img.icc = embed.and_then(crate::icc::profile);
+    let mut opts = craft_image_codecs::EncodeOptions::default();
+    opts.jpeg_quality = JPEG_QUALITY;
+    opts.webp_lossless = true;
+    opts.embed_icc = img.icc.is_some();
+    opts.embed_metadata = false;
+    let fmt = match format {
+        FileFormat::Png => craft_image_codecs::Format::Png,
+        FileFormat::Jpeg => craft_image_codecs::Format::Jpeg,
+        FileFormat::Tga => craft_image_codecs::Format::Tga,
+        FileFormat::Tiff => craft_image_codecs::Format::Tiff,
+        FileFormat::Bmp => craft_image_codecs::Format::Bmp,
+        FileFormat::Webp => craft_image_codecs::Format::WebP,
+        FileFormat::Exr | FileFormat::Hdr => unreachable!(),
+    };
+    craft_image_codecs::encode(&img, fmt, &opts).map_err(|e| failed(&e))
 }
 
 /// Pick components `pick` from every texel of an `n`-component image.
 fn remap(data: &[f32], n: usize, pick: &[usize]) -> Vec<f32> {
     data.chunks_exact(n.max(1)).flat_map(|px| pick.iter().map(|k| px.get(*k).copied().unwrap_or(0.0))).collect()
-}
-
-/// Encode `bytes` as `format`, with `icc` (an ICC profile) embedded where the format has a place for one.
-fn write_image(format: FileFormat, bytes: &[u8], (w, h): (u32, u32), color: image::ExtendedColorType, icc: Option<Vec<u8>>) -> image::ImageResult<Vec<u8>> {
-    use image::ImageEncoder;
-    let mut out = Cursor::new(Vec::new());
-
-    // `set_icc_profile` says no (an error to ignore) for an encoder without a place for it
-    let fmt = match format {
-        FileFormat::Jpeg => {
-            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
-            if let Some(p) = icc {
-                let _ = enc.set_icc_profile(p);
-            }
-            enc.write_image(bytes, w, h, color)?;
-            return Ok(out.into_inner());
-        }
-        FileFormat::Png if icc.is_some() => {
-            let mut enc = image::codecs::png::PngEncoder::new(&mut out);
-            if let Some(p) = icc {
-                let _ = enc.set_icc_profile(p);
-            }
-            enc.write_image(bytes, w, h, color)?;
-            return Ok(out.into_inner());
-        }
-        FileFormat::Tiff if icc.is_some() => {
-            let mut enc = image::codecs::tiff::TiffEncoder::new(&mut out);
-            if let Some(p) = icc {
-                let _ = enc.set_icc_profile(p);
-            }
-            enc.write_image(bytes, w, h, color)?;
-            return Ok(out.into_inner());
-        }
-        FileFormat::Webp if icc.is_some() => {
-            let mut enc = image::codecs::webp::WebPEncoder::new_lossless(&mut out);
-            if let Some(p) = icc {
-                let _ = enc.set_icc_profile(p);
-            }
-            enc.write_image(bytes, w, h, color)?;
-            return Ok(out.into_inner());
-        }
-        FileFormat::Png => image::ImageFormat::Png,
-        FileFormat::Tga => image::ImageFormat::Tga,
-        FileFormat::Tiff => image::ImageFormat::Tiff,
-        FileFormat::Bmp => image::ImageFormat::Bmp,
-        FileFormat::Webp => image::ImageFormat::WebP,
-        FileFormat::Hdr => image::ImageFormat::Hdr,
-        FileFormat::Exr => image::ImageFormat::OpenExr,
-    };
-    image::write_buffer_with_format(&mut out, bytes, w, h, color, fmt)?;
-    Ok(out.into_inner())
 }
 
 /// OpenEXR with Y / YA / RGB / RGBA channels, half or full float, ZIP compression.

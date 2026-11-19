@@ -89,9 +89,9 @@ pub fn mesh_map_png_working_bytes(width_px: u32, components: usize) -> u64 {
 /// Encode a mesh map directly into its destination using one row of quantized samples.
 pub fn write_mesh_map_png(output: impl Write, width_px: u32, components: usize, data: &[f32]) -> Result<()> {
     let invalid_size = || FormatError::Invalid(format!("mesh map of {} values, {width_px} wide, {components} components", data.len()));
-    let color = match components {
-        1 => png::ColorType::Grayscale,
-        3 => png::ColorType::Rgb,
+    let layout = match components {
+        1 => craft_image_codecs::ChannelLayout::Gray,
+        3 => craft_image_codecs::ChannelLayout::Rgb,
         _ => return Err(invalid_size()),
     };
     let samples_per_row = (width_px as usize).checked_mul(components).filter(|&count| count != 0).ok_or_else(invalid_size)?;
@@ -100,30 +100,28 @@ pub fn write_mesh_map_png(output: impl Write, width_px: u32, components: usize, 
     }
 
     let height_px = u32::try_from(data.len() / samples_per_row).map_err(|_| invalid_size())?;
-    let row_bytes = samples_per_row.checked_mul(std::mem::size_of::<u16>()).ok_or_else(invalid_size)?;
     let mut scanline = Vec::new();
-    scanline.try_reserve_exact(row_bytes).map_err(|error| FormatError::TooLarge(error.to_string()))?;
+    scanline.try_reserve_exact(samples_per_row).map_err(|error| FormatError::TooLarge(error.to_string()))?;
 
-    let encoding_error = |error: png::EncodingError| FormatError::Invalid(error.to_string());
-    let mut encoder = png::Encoder::new(output, width_px, height_px);
-    encoder.set_color(color);
-    encoder.set_depth(png::BitDepth::Sixteen);
+    let mut opts = craft_image_codecs::EncodeOptions::default();
+    opts.png_compression = craft_image_codecs::PngCompression::Fast;
+    opts.embed_icc = false;
+    opts.embed_metadata = false;
 
-    // The file exists only while the companion reads the input
-    encoder.set_compression(png::Compression::Fast);
-    let mut writer = encoder.write_header().map_err(encoding_error)?;
-    {
-        let mut stream = writer.stream_writer().map_err(encoding_error)?;
-        for row in data.chunks_exact(samples_per_row) {
-            scanline.clear();
-            scanline.extend(row.iter().flat_map(|value| ((value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16).to_be_bytes()));
-            stream.write_all(&scanline)?;
-        }
-
-        stream.finish().map_err(encoding_error)?;
+    let codec_err = |error: craft_image_codecs::CodecError| FormatError::Invalid(error.to_string());
+    let mut rows = data.chunks_exact(samples_per_row);
+    let first_row = rows.next().ok_or_else(invalid_size)?;
+    scanline.extend(first_row.iter().map(|value| (value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16));
+    let first_band = craft_image_codecs::Image::from_u16(width_px, 1, layout, &scanline).map_err(codec_err)?;
+    let mut writer = craft_image_codecs::PngRows::new(output, &first_band, height_px, &opts).map_err(codec_err)?;
+    writer.push(&first_band).map_err(codec_err)?;
+    for row in rows {
+        scanline.clear();
+        scanline.extend(row.iter().map(|value| (value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16));
+        let band = craft_image_codecs::Image::from_u16(width_px, 1, layout, &scanline).map_err(codec_err)?;
+        writer.push(&band).map_err(codec_err)?;
     }
-
-    writer.finish().map_err(encoding_error)
+    writer.finish().map_err(codec_err)
 }
 
 #[cfg(test)]
