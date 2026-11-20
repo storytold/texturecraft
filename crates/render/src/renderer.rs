@@ -410,6 +410,7 @@ impl Tex {
 struct SetGpu {
     /// Texels across and down (a UV-tiled set's whole atlas).
     size: (u32, u32),
+    material: usize,
     /// Display textures hold the set at `size >> shift`: halved until they fit the device.
     shift: u32,
     /// The display textures in [`DisplayKind::ALL`] order, then the aux (mesh map) texture.
@@ -425,6 +426,8 @@ struct SetGpu {
     /// Full-size textures the browser's WebGPU has not yet confirmed: tiles go into them while
     /// the placeholder stays bound (see [`Renderer::resolve_pending`]).
     pending: Vec<Option<PendingTex>>,
+    /// The overview we are waiting to bind, and detail tiles to apply over it.
+    pending_seed: Option<PendingDisplaySeed>,
 }
 
 /// A full-size texture waiting for WebGPU's verdict on its allocation.
@@ -433,6 +436,31 @@ struct PendingTex {
     /// `None` for success, else what went wrong. (A mutex: the renderer is shared with the
     /// paint callback, so it must be `Sync`.)
     answer: std::sync::Mutex<std::sync::mpsc::Receiver<Option<String>>>,
+}
+
+struct PendingDisplaySeed {
+    textures: Vec<Tex>,
+    answer: std::sync::Mutex<std::sync::mpsc::Receiver<Option<String>>>,
+    tiles: Vec<SeedTile>,
+}
+
+struct SeedTile {
+    kind: DisplayKind,
+    x: u32,
+    y: u32,
+    bytes: Vec<u8>,
+    shift: u32,
+}
+
+/// Replace the material's textures while leaving its aux view in place.
+fn install_display_seed(set: &mut SetGpu, textures: Vec<Tex>, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler) {
+    for (i, texture) in textures.into_iter().enumerate() {
+        set.mips_dirty[i] = if texture.mips > 1 { MipsDirty::All } else { MipsDirty::Clean };
+        set.tex[i] = texture;
+        set.pending[i] = None;
+        set.failed[i] = false;
+    }
+    set.bind_group = set_bind_group(device, layout, sampler, &set.tex);
 }
 
 /// Swap `tex` in for slot `slot` of `set` (bound at once; its mips are rebuilt).
@@ -1358,6 +1386,12 @@ impl Renderer {
         if self.mesh.as_ref().is_some_and(|m| m.id == id) {
             return;
         }
+        // A replacement mesh may reuse the same display dimensions. Its textures must
+        // not be replaced by a late overview from the previous mesh.
+        for set in &mut self.sets {
+            set.pending_seed = None;
+            set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
+        }
         if let Some(compositor) = &mut self.compositor {
             compositor.release_unused_surfaces();
         }
@@ -1510,10 +1544,10 @@ impl Renderer {
             compositor.retain_texture_sets(sets.len());
         }
         let max = device.limits().max_texture_dimension_2d.max(1);
-        for (i, &(size, _)) in sets.iter().enumerate() {
+        for (i, &(size, material)) in sets.iter().enumerate() {
             // Downscale sets that exceed the device's texture dimension limit
             let shift = (0..31).find(|s| size.0.max(size.1) >> s <= max).unwrap_or(0).max(self.display_shift);
-            if self.sets.get(i).is_some_and(|s| s.size == size && s.shift == shift) {
+            if self.sets.get(i).is_some_and(|s| s.size == size && s.shift == shift && s.material == material) {
                 continue;
             }
 
@@ -1523,8 +1557,17 @@ impl Renderer {
             tex.push(neutral_tex(device, queue, (1, 1), wgpu::TextureFormat::Rgba8Unorm, 1, &AUX_NEUTRAL));
             let bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &tex);
             let n = tex.len();
-            let gpu =
-                SetGpu { size, shift, tex, bind_group, mips_dirty: vec![MipsDirty::All; n], failed: vec![false; n], pending: (0..n).map(|_| None).collect() };
+            let gpu = SetGpu {
+                size,
+                material,
+                shift,
+                tex,
+                bind_group,
+                mips_dirty: vec![MipsDirty::All; n],
+                failed: vec![false; n],
+                pending: (0..n).map(|_| None).collect(),
+                pending_seed: None,
+            };
             if i < self.sets.len() {
                 self.sets[i] = gpu;
             } else {
@@ -1577,6 +1620,7 @@ impl Renderer {
                 textures
             })?;
             let set = &mut self.sets[ts];
+            set.pending_seed = None;
             for (i, texture) in textures.into_iter().enumerate() {
                 set.tex[i] = texture;
                 set.pending[i] = None;
@@ -1633,6 +1677,7 @@ impl Renderer {
             }
             set.tex = textures;
             set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
+            set.pending_seed = None;
             set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
             self.content_rev += 1;
         }
@@ -1647,10 +1692,15 @@ impl Renderer {
         if size.0 == 0 || size.1 == 0 || size.0.max(size.1) > 256 || size.0 > target.0 || size.1 > target.1 {
             return;
         }
+        if maps.is_empty() {
+            // A clear is a scene change, not an optional overview. Bind the same
+            // neutral placeholders used to initialise a set.
+            self.replace_display_seed(device, queue, ts, None);
+            return;
+        }
         for (kind, _) in maps {
             self.ensure_mip_pipeline(device, display_format(*kind));
         }
-        let Some(set) = self.sets.get_mut(ts) else { return };
         let textures = checked(device, "material overview", || {
             DisplayKind::ALL
                 .iter()
@@ -1675,17 +1725,29 @@ impl Renderer {
                 })
                 .collect::<Vec<_>>()
         });
-        // The overview is optional. If allocation fails or validation is asynchronous,
-        // detailed uploads continue through the ordinary renderer.
-        if let Checked::Done(Ok(textures)) = textures {
-            for (i, texture) in textures.into_iter().enumerate() {
-                set.mips_dirty[i] = if texture.mips > 1 { MipsDirty::All } else { MipsDirty::Clean };
-                set.tex[i] = texture;
-                set.pending[i] = None;
+        self.replace_display_seed(device, queue, ts, Some(textures));
+    }
+
+    fn replace_display_seed(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, textures: Option<Checked<Vec<Tex>>>) {
+        let Some(set) = self.sets.get_mut(ts) else { return };
+        let pending = match textures {
+            Some(Checked::Later(textures, answer)) => Some(PendingDisplaySeed { textures, answer: std::sync::Mutex::new(answer), tiles: Vec::new() }),
+            Some(Checked::Done(Ok(textures))) => {
+                set.pending_seed = None;
+                install_display_seed(set, textures, device, &self.set_bgl, &self.sampler);
+                self.content_rev += 1;
+                return;
             }
-            set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
-            self.content_rev += 1;
-        }
+            Some(Checked::Done(Err(_))) | None => None,
+        };
+        let neutral = DisplayKind::ALL
+            .iter()
+            .zip(&self.default_texels)
+            .map(|(&kind, neutral)| neutral_tex(device, queue, (1, 1), display_format(kind), 1, neutral))
+            .collect();
+        install_display_seed(set, neutral, device, &self.set_bgl, &self.sampler);
+        set.pending_seed = pending;
+        self.content_rev += 1;
     }
 
     /// Upload one 64×64 tile of a display texture (bytes from `compose::tile_bytes`).
@@ -1720,7 +1782,14 @@ impl Renderer {
             return;
         }
         let source_side = TILE >> source_shift;
-        if x >= set.size.0 || y >= set.size.1 || bytes.len() < (source_side * source_side * bytes_per_texel) as usize {
+        let bytes_needed = (source_side * source_side * bytes_per_texel) as usize;
+        if x >= set.size.0 || y >= set.size.1 || bytes.len() < bytes_needed {
+            return;
+        }
+        if let Some(seed) = &mut set.pending_seed {
+            // Detail uploads may start in the same frame as the overview. Replay them
+            // after acceptance so they overwrite only their own part of the overview.
+            seed.tiles.push(SeedTile { kind, x: tile_x, y: tile_y, bytes: bytes[..bytes_needed].to_vec(), shift: source_shift });
             return;
         }
 
@@ -1858,16 +1927,18 @@ impl Renderer {
         std::mem::take(&mut self.memory_failures)
     }
 
-    /// Whether a full-size texture still waits for WebGPU's verdict: keep drawing frames, since
-    /// [`Renderer::prepare`] installs it (or reports the failure) once the answer is in.
+    /// Whether a texture still waits for WebGPU's verdict: keep drawing frames until
+    /// [`Renderer::prepare`] can apply the result.
     pub fn awaiting_gpu(&self) -> bool {
-        self.sets.iter().any(|s| s.pending.iter().any(Option::is_some))
+        self.sets.iter().any(|s| s.pending_seed.is_some() || s.pending.iter().any(Option::is_some))
     }
 
     /// Install the pending full-size textures WebGPU accepted; drop the ones it rejected (their
     /// placeholder stays and the failure is reported).
-    fn resolve_pending(&mut self, device: &wgpu::Device) {
-        for (ts, set) in self.sets.iter_mut().enumerate() {
+    fn resolve_pending(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        for ts in 0..self.sets.len() {
+            self.resolve_display_seed(device, queue, ts);
+            let set = &mut self.sets[ts];
             for slot in 0..set.pending.len() {
                 let poll = |p: &PendingTex| p.answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_recv();
                 let verdict = match set.pending.get(slot).and_then(Option::as_ref).map(poll) {
@@ -1889,6 +1960,24 @@ impl Renderer {
                     }
                 }
             }
+        }
+    }
+
+    fn resolve_display_seed(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize) {
+        let set = &mut self.sets[ts];
+        let Some(seed) = set.pending_seed.as_ref() else { return };
+        let verdict = seed.answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_recv();
+        if matches!(verdict, Err(std::sync::mpsc::TryRecvError::Empty)) {
+            return;
+        }
+        let Some(seed) = set.pending_seed.take() else { return };
+        if matches!(verdict, Ok(None)) {
+            install_display_seed(set, seed.textures, device, &self.set_bgl, &self.sampler);
+            self.content_rev += 1;
+        }
+        // On rejection, the seed is optional and the tiles still refine the neutral set.
+        for tile in seed.tiles {
+            self.upload_display_tile(device, queue, ts, tile.kind, tile.x, tile.y, &tile.bytes, tile.shift);
         }
     }
 
@@ -2232,7 +2321,7 @@ impl Renderer {
     /// `shade.taa` that repeats the previous one adds a jittered sample to the average instead,
     /// and renders nothing once [`TAA_SAMPLES`] are in.
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, frame: &Frame) {
-        self.resolve_pending(device);
+        self.resolve_pending(device, queue);
         self.generate_mips(device, encoder);
         let rev = self.content_rev;
         let sample = match self.views.get(&frame.view_id) {
@@ -2828,7 +2917,7 @@ mod tests {
 
     fn prepare(h: &mut Headless) {
         let mut enc = h.device.create_command_encoder(&Default::default());
-        h.renderer.resolve_pending(&h.device);
+        h.renderer.resolve_pending(&h.device, &h.queue);
         h.renderer.generate_mips(&h.device, &mut enc);
         h.queue.submit([enc.finish()]);
     }
@@ -2868,6 +2957,77 @@ mod tests {
         prepare(&mut h);
         assert_eq!(base_width(&h), 1);
         assert!(!h.renderer.awaiting_gpu());
+    }
+
+    fn pending_overview(h: &mut Headless) -> std::sync::mpsc::Sender<Option<String>> {
+        let maps = [(DisplayKind::BaseColor, [255, 0, 0, 255].repeat(64 * 64))];
+        h.renderer.seed_display(&h.device, &h.queue, 0, (64, 64), &maps);
+        let textures = h.renderer.sets[0].tex[..DisplayKind::ALL.len()].to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.renderer.replace_display_seed(&h.device, &h.queue, 0, Some(Checked::Later(textures, rx)));
+        tx
+    }
+
+    fn base_pixel(h: &Headless, x: usize, y: usize) -> [u8; 4] {
+        let texture = h.renderer.display_textures()[0][0];
+        let (width, _, bytes) = crate::readback::Readback::blocking_level(&h.device, &h.queue, texture, 0).unwrap();
+        let offset = (y * width as usize + x) * 4;
+        bytes[offset..offset + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn late_overview_keeps_detail_tiles_over_the_coarse_background() {
+        let Ok(mut h) = Headless::new() else { return };
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((256, 256), 0)], 1);
+        let tx = pending_overview(&mut h);
+        let kind = DisplayKind::BaseColor;
+        let neutral = kind.default_texel();
+        let green = [0, 255, 0, 255];
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 0, 0, &neutral.repeat(64 * 64));
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 1, 0, &green.repeat(64 * 64));
+        prepare(&mut h);
+        assert!(h.renderer.awaiting_gpu());
+        assert_eq!(base_width(&h), 1, "the overview stays unbound until approved");
+
+        tx.send(None).unwrap();
+        prepare(&mut h);
+        assert!(!h.renderer.awaiting_gpu());
+        assert_eq!(base_pixel(&h, 32, 32).as_slice(), neutral.as_slice(), "even a neutral tile replaces coarse color");
+        assert_eq!(base_pixel(&h, 96, 32), green, "the color uploaded while waiting is preserved");
+        assert_eq!(base_pixel(&h, 160, 32), [255, 0, 0, 255], "untouched tiles still show the overview");
+    }
+
+    #[test]
+    fn rejected_overview_still_applies_detail_tiles() {
+        let Ok(mut h) = Headless::new() else { return };
+        let kind = DisplayKind::BaseColor;
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((256, 256), 0)], 1);
+        let tx = pending_overview(&mut h);
+        let green = [0, 255, 0, 255];
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 1, 0, &green.repeat(64 * 64));
+        tx.send(Some("overview allocation rejected".into())).unwrap();
+        prepare(&mut h);
+        assert_eq!(base_pixel(&h, 96, 32), green);
+        assert_eq!(base_pixel(&h, 160, 32).as_slice(), kind.default_texel().as_slice());
+    }
+
+    #[test]
+    fn clearing_an_overview_discards_old_tiles_even_at_the_same_size() {
+        let Ok(mut h) = Headless::new() else { return };
+        let kind = DisplayKind::BaseColor;
+        let layout = [((256, 256), 0)];
+        h.renderer.set_texture_sets(&h.device, &h.queue, &layout, 1);
+        let tx = pending_overview(&mut h);
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 1, 0, &[255, 0, 0, 255].repeat(64 * 64));
+        assert!(h.renderer.set_texture_sets(&h.device, &h.queue, &layout, 1).is_empty());
+        // This is the explicit clear used before submitting details for the new view.
+        h.renderer.seed_display(&h.device, &h.queue, 0, (1, 1), &[]);
+        assert!(tx.send(None).is_err(), "the old overview can no longer be accepted");
+        let green = [0, 255, 0, 255];
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 0, 0, &green.repeat(64 * 64));
+        prepare(&mut h);
+        assert_eq!(base_pixel(&h, 32, 32), green);
+        assert_eq!(base_pixel(&h, 96, 32).as_slice(), kind.default_texel().as_slice());
     }
 
     #[test]
