@@ -267,21 +267,15 @@ impl GpuLink {
             }
             let empty = Default::default();
             let baked = session.doc.baked.get(&texture_set).unwrap_or(&empty);
-            let composite = &cache.composite;
-            let channels: Vec<Channel> = composite.channels.keys().copied().collect();
+            let channels: Vec<Channel> = cache.composite.channels.keys().copied().collect();
             let sent = self.sent.entry(texture_set).or_default();
             let kinds: Vec<DisplayKind> =
                 DisplayKind::ALL.into_iter().filter(|kind| sent.contains(kind) || kinds_for(&channels).any(|needed| needed == *kind)).collect();
             sent.extend(kinds.iter().copied());
 
             while !cache.upload.is_empty() {
-                let chunk: Vec<_> = if cache.upload.len() <= chunk_size {
-                    std::mem::take(&mut cache.upload).into_iter().collect()
-                } else {
-                    let mut tiles = if texture_set == active { demand.take(&mut cache.upload, chunk_size) } else { Vec::new() };
-                    tiles.extend((tiles.len()..chunk_size).filter_map(|_| cache.upload.pop_first()));
-                    tiles
-                };
+                let chunk = cache.take_upload_batch(chunk_size, if texture_set == active { demand } else { Default::default() });
+                let composite = &cache.composite;
                 let bytes: Vec<_> = chunk
                     .par_iter()
                     .flat_map_iter(|&(x, y)| kinds.iter().map(move |&kind| (kind, x, y)))
@@ -676,6 +670,15 @@ pub(crate) mod tests {
         s.begin_stroke_uv(brush, 1.0).unwrap();
         let out = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
         assert_eq!(out.tiles.first().map(|t| (t.2, t.3)), Some((15, 5)));
+        s.end_stroke().unwrap();
+        s.update();
+        s.caches[0].upload.extend(texturecraft_engine::compose::all_tiles(1024, 1024));
+        let tap = Vec2::splat(0.96875);
+        s.begin_stroke_uv(tap, 1.0).unwrap();
+        s.end_stroke().unwrap();
+        let out = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
+        assert_eq!(out.tiles.first().map(|t| (t.2, t.3)), Some((15, 15)), "a tap released in one frame must still reach the first upload");
+        assert!(!s.tile_demand(None).focused(), "the released dab's priority ends after its upload");
     }
 
     #[test]

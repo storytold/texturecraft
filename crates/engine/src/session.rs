@@ -47,6 +47,8 @@ pub struct SetCache {
     pub settle: BTreeSet<(u32, u32)>,
     /// Tiles whose display textures must be re-uploaded.
     pub upload: BTreeSet<(u32, u32)>,
+    /// A dab released before its first display upload.
+    pub(crate) finished_dab: Option<(u32, u32)>,
     /// Bumps on every composite change (thumbnails, exports, caches).
     pub revision: u64,
     /// Everything but the layer being edited, per tile (repaints evaluate only that layer).
@@ -74,11 +76,27 @@ impl SetCache {
             dirty: all.clone(),
             settle: BTreeSet::new(),
             upload: all,
+            finished_dab: None,
             revision: 0,
             below: BelowCache::default(),
             chunk: 0,
             paint_margin: None,
         }
+    }
+
+    /// Drain one upload slice, giving the brush and visible UVs first use of it.
+    pub fn take_upload_batch(&mut self, limit: usize, demand: crate::TileDemand) -> Vec<(u32, u32)> {
+        let tiles = if self.upload.len() <= limit {
+            std::mem::take(&mut self.upload).into_iter().collect()
+        } else {
+            let mut tiles = demand.take(&mut self.upload, limit);
+            tiles.extend((tiles.len()..limit).filter_map(|_| self.upload.pop_first()));
+            tiles
+        };
+        if self.finished_dab.is_some_and(|t| !self.upload.contains(&t) && !self.dirty.contains(&t)) {
+            self.finished_dab = None;
+        }
+        tiles
     }
 
     fn queue_painted(
@@ -879,6 +897,7 @@ impl Session {
             match self.caches.get_mut(i) {
                 Some(c) if c.size == ts.size() => {
                     c.paint_margin = None;
+                    c.finished_dab = None;
                     let (want, scales) = (ts.channel_list(), ts.block_scales());
                     if c.composite.channels.keys().copied().collect::<Vec<_>>() != want || c.composite.block_scales != scales {
                         c.composite = Composite { block_scales: scales, ..Composite::with_size(&want, c.size.0, c.size.1) };
@@ -1213,7 +1232,7 @@ impl Session {
 
     /// Drain tiles needing upload for texture set `ts`.
     pub fn take_uploads(&mut self, ts: usize) -> Vec<(u32, u32)> {
-        self.caches.get_mut(ts).map(|c| std::mem::take(&mut c.upload).into_iter().collect()).unwrap_or_default()
+        self.caches.get_mut(ts).map(|c| c.take_upload_batch(usize::MAX, crate::TileDemand::default())).unwrap_or_default()
     }
 
     /// `f` on the compositor inputs of texture set `ts` (without a live stroke; None for a set

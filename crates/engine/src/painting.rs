@@ -546,6 +546,7 @@ impl Session {
 
     /// Commit the active stroke (one undo step).
     pub fn end_stroke(&mut self) -> Result<()> {
+        let brush_tile = self.tile_demand(None).brush;
         let Some(mut st) = self.stroke.take() else { return Ok(()) };
         let size = (st.canvas.alpha.width(), st.canvas.alpha.height());
         if st.canvas.dirty.is_empty() {
@@ -581,6 +582,9 @@ impl Session {
         // The live preview already shows the committed result: the stroke's tiles recomposite
         // from the committed pixels at low priority, without holding up this frame.
         self.mark_settle(st.ts, st.target, st.canvas.dirty.iter().copied());
+        if let Some(cache) = self.caches.get_mut(st.ts) {
+            cache.finished_dab = brush_tile.filter(|tile| st.canvas.dirty.contains(tile) && (cache.dirty.contains(tile) || cache.upload.contains(tile)));
+        }
         Ok(())
     }
 

@@ -11,7 +11,7 @@ type Tile = (u32, u32);
 /// A hint for the active texture set. Only the CPU and upload work order changes.
 #[derive(Clone, Copy, Default)]
 pub struct TileDemand {
-    brush: Option<Tile>,
+    pub(crate) brush: Option<Tile>,
     visible: Option<(Tile, Tile)>,
 }
 
@@ -49,6 +49,7 @@ impl Session {
             // A view of the entire atlas benefits from the usual block ordering.
             (bounds != ((0, 0), ((w - 1) / TILE, (h - 1) / TILE))).then_some(bounds)
         });
+        let brush = if self.stroke.is_some() { brush } else { cache.finished_dab };
         TileDemand { brush, visible }
     }
 }
@@ -61,7 +62,7 @@ impl TileDemand {
 
     /// Remove wanted, pending tiles, up to the caller's slice. When all fit, the caller
     /// can drain the queue directly. A stationary view does not duplicate queue entries.
-    pub fn take(self, pending: &mut BTreeSet<Tile>, limit: usize) -> Vec<Tile> {
+    pub(crate) fn take(self, pending: &mut BTreeSet<Tile>, limit: usize) -> Vec<Tile> {
         let mut tiles = Vec::new();
         if limit == 0 || pending.len() <= limit {
             return tiles;
