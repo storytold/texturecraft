@@ -719,7 +719,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "GPU benchmark"]
     fn bench_brush_upload_latency() {
-        use texturecraft_render::{Headless, Shade, ViewKind};
+        use texturecraft_render::{Shade, ViewKind, headless::Headless};
         let mut s = Session::new_project("latency", primitives::plane(1.0, 1), "builtin:plane", None, 1024).unwrap();
         execute(&mut s, "tool.brush", &json!({"size": 3, "hardness": 100})).unwrap();
         let mut gpu = link();
@@ -728,9 +728,13 @@ pub(crate) mod tests {
         h.renderer.set_texture_sets(&h.device, &h.queue, &[((1024, 1024), 0)], 1);
         let uv = Vec2::new(15.5, 5.5) / 16.0;
         let frame = Frame {
-            view_id: 2, size: [256, 256],
+            view_id: 2,
+            size: [256, 256],
             kind: ViewKind::Uv { ts: 0, zoom: 2.0 / 0.92, pan: [(1.0 - 2.0 * uv.x) * 2.0, (2.0 * uv.y - 1.0) * 2.0] },
-            camera: s.camera, shade: Shade {view_mode: 1, channel: 0, ..Default::default()}, visible: vec![true], overlay: vec![],
+            camera: s.camera,
+            shade: Shade { view_mode: 1, channel: 0, ..Default::default() },
+            visible: vec![true],
+            overlay: vec![],
         };
         let mut draw = |s: &mut Session| {
             let scene = gpu.sync(s, None, None, 0, FRAME_BUDGET_MS);
@@ -742,7 +746,9 @@ pub(crate) mod tests {
             [pixels[offset], pixels[offset + 1]]
         };
         s.update();
-        while !s.caches[0].upload.is_empty() { draw(&mut s); }
+        while !s.caches[0].upload.is_empty() {
+            draw(&mut s);
+        }
         let all = texturecraft_engine::compose::all_tiles(1024, 1024);
         for backlog in [false, true] {
             let mut elapsed = Vec::new();
@@ -760,7 +766,9 @@ pub(crate) mod tests {
                 loop {
                     let [r, g] = draw(&mut s);
                     count += 1;
-                    if (red && r.saturating_sub(g) > 64) || (!red && g.saturating_sub(r) > 64) { break; }
+                    if (red && r.saturating_sub(g) > 64) || (!red && g.saturating_sub(r) > 64) {
+                        break;
+                    }
                     assert!(count < 6, "brush pixel must change, got {r}, {g} at pass {pass}");
                 }
                 if pass >= 4 {
@@ -769,7 +777,9 @@ pub(crate) mod tests {
                 }
                 s.end_stroke().unwrap();
                 s.update();
-                while !s.caches[0].upload.is_empty() { draw(&mut s); }
+                while !s.caches[0].upload.is_empty() {
+                    draw(&mut s);
+                }
             }
             elapsed.sort_unstable();
             frames.sort_unstable();
