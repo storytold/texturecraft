@@ -1045,7 +1045,11 @@ impl Session {
             // budget. The active material always gets first use of that budget.
             let allowance = self.caches.get(active).map_or(0, |c| c.below.limit());
             // Instances in other sets can have live bands of their own.
-            let spare = self.caches.iter().enumerate().filter(|(ts, _)| *ts != previous)
+            let spare = self
+                .caches
+                .iter()
+                .enumerate()
+                .filter(|(ts, _)| *ts != previous)
                 .fold(allowance, |remaining, (_, cache)| remaining.saturating_sub(cache.below.bytes()));
             if let Some(cache) = self.caches.get_mut(previous)
                 && cache.below.bytes() > spare

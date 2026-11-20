@@ -189,7 +189,15 @@ impl GpuLink {
         self.sync_view(session, aux_map, bake, shift, spent_ms, None)
     }
 
-    pub(crate) fn sync_view(&mut self, session: &mut Session, aux_map: Option<AuxView>, bake: Option<BakeVisualization>, shift: u32, spent_ms: f64, visible_uv: Option<[Vec2; 2]>) -> SceneSync {
+    pub(crate) fn sync_view(
+        &mut self,
+        session: &mut Session,
+        aux_map: Option<AuxView>,
+        bake: Option<BakeVisualization>,
+        shift: u32,
+        spent_ms: f64,
+        visible_uv: Option<[Vec2; 2]>,
+    ) -> SceneSync {
         let start_ms = crate::now_ms();
         let mut queued = 0usize;
         let time_left_ms = |queued: usize| FRAME_BUDGET_MS - spent_ms - (crate::now_ms() - start_ms) - queued as f64 * UPLOAD_MS_PER_TILE;
@@ -705,47 +713,67 @@ pub(crate) mod tests {
         }
     }
 
-    /// From pointer input to the first prepared upload containing the dab, on a warm
-    /// material and behind a full display refresh. Frames are driven without vsync.
+    /// Input to the first rendered pixel of the new color. Readback synchronizes every
+    /// offscreen frame; window-system presentation and monitor latency are excluded.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    #[ignore = "benchmark"]
+    #[ignore = "GPU benchmark"]
     fn bench_brush_upload_latency() {
+        use texturecraft_render::{Headless, Shade, ViewKind};
         let mut s = Session::new_project("latency", primitives::plane(1.0, 1), "builtin:plane", None, 1024).unwrap();
-        execute(&mut s, "tool.brush", &json!({"size": 0.6, "hardness": 100})).unwrap();
+        execute(&mut s, "tool.brush", &json!({"size": 3, "hardness": 100})).unwrap();
         let mut gpu = link();
+        let mut h = Headless::new().unwrap();
+        h.renderer.set_mesh(&h.device, &h.queue, &s.mesh, s.mesh_id);
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((1024, 1024), 0)], 1);
+        let uv = Vec2::new(15.5, 5.5) / 16.0;
+        let frame = Frame {
+            view_id: 2, size: [256, 256],
+            kind: ViewKind::Uv { ts: 0, zoom: 2.0 / 0.92, pan: [(1.0 - 2.0 * uv.x) * 2.0, (2.0 * uv.y - 1.0) * 2.0] },
+            camera: s.camera, shade: Shade {view_mode: 1, channel: 0, ..Default::default()}, visible: vec![true], overlay: vec![],
+        };
+        let mut draw = |s: &mut Session| {
+            let scene = gpu.sync(s, None, None, 0, FRAME_BUDGET_MS);
+            for (ts, kind, x, y, data) in &scene.tiles {
+                h.renderer.upload_display_tile(&h.device, &h.queue, *ts, *kind, *x, *y, data, scene.tile_shift);
+            }
+            let (width, height, pixels) = h.render(&frame).unwrap();
+            let offset = ((height / 2 * width + width / 2) * 4) as usize;
+            [pixels[offset], pixels[offset + 1]]
+        };
         s.update();
+        while !s.caches[0].upload.is_empty() { draw(&mut s); }
         let all = texturecraft_engine::compose::all_tiles(1024, 1024);
         for backlog in [false, true] {
             let mut elapsed = Vec::new();
             let mut frames = Vec::new();
-            for pass in 0..35 {
-                s.take_uploads(0);
+            for pass in 0..36 {
+                let red = pass % 2 == 0;
+                let color = if red { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+                execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": color})).unwrap();
                 if backlog {
                     s.caches[0].upload.extend(all.iter().copied());
                 }
-                let tile = (15, 4 + pass % 8);
-                let uv = Vec2::new(tile.0 as f32 + 0.5, tile.1 as f32 + 0.5) / 16.0;
                 let start = std::time::Instant::now();
                 s.begin_stroke_uv(uv, 1.0).unwrap();
                 let mut count = 0;
                 loop {
-                    let scene = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
+                    let [r, g] = draw(&mut s);
                     count += 1;
-                    if scene.tiles.iter().any(|t| t.1 == DisplayKind::BaseColor && (t.2, t.3) == tile) {
-                        break;
-                    }
-                    assert!(count <= 5, "pending brush upload must make progress");
+                    if (red && r.saturating_sub(g) > 64) || (!red && g.saturating_sub(r) > 64) { break; }
+                    assert!(count < 6, "brush pixel must change, got {r}, {g} at pass {pass}");
                 }
-                if pass >= 3 {
+                if pass >= 4 {
                     elapsed.push(start.elapsed());
                     frames.push(count);
                 }
-                s.cancel_stroke();
+                s.end_stroke().unwrap();
                 s.update();
+                while !s.caches[0].upload.is_empty() { draw(&mut s); }
             }
             elapsed.sort_unstable();
             frames.sort_unstable();
-            println!("backlog={backlog}, 32 dabs: upload ready in {} syncs at median; P50 {:.2?}, P95 {:.2?}", frames[15], elapsed[15], elapsed[30]);
+            println!("backlog={backlog}, 32 dabs: {} frames at median, input to GPU readback P50 {:.2?}, P95 {:.2?}", frames[15], elapsed[15], elapsed[30]);
         }
     }
 

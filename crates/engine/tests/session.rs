@@ -958,7 +958,10 @@ fn switching_materials_reuses_idle_bands_within_the_active_budget() {
     s.update();
     let bytes = s.caches[0].below.bytes();
     assert!(bytes > 0);
-    let select = |s: &mut Session, ts| { execute(s, "textureSet.select", &json!({"ts": ts})).unwrap(); s.update(); };
+    let select = |s: &mut Session, ts| {
+        execute(s, "textureSet.select", &json!({"ts": ts})).unwrap();
+        s.update();
+    };
     select(&mut s, 1);
     assert_eq!(s.caches[0].below.bytes(), bytes);
     select(&mut s, 0);

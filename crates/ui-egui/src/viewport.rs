@@ -429,10 +429,16 @@ impl PendingSync {
         let Some((painter, slot, mut callback)) = self.first else { return };
         let Some(gpu) = app.gpu.as_mut() else { return };
         let start = crate::now_ms();
-        let visible_uv = self.uv_size.zip(app.session.caches.get(app.session.ts())).map(|(size, cache)| {
-            visible_uv_bounds(size, cache.size, app.ui.uv_zoom, app.ui.uv_pan)
-        });
-        let scene = gpu.sync_view(&mut app.session, aux, callback.frame.shade.bake, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms), visible_uv);
+        let visible_uv =
+            self.uv_size.zip(app.session.caches.get(app.session.ts())).map(|(size, cache)| visible_uv_bounds(size, cache.size, app.ui.uv_zoom, app.ui.uv_pan));
+        let scene = gpu.sync_view(
+            &mut app.session,
+            aux,
+            callback.frame.shade.bake,
+            u32::from(app.ui.prefs.viewport_texture.min(2)),
+            f64::from(app.profiler.logic_ms),
+            visible_uv,
+        );
         let reports = gpu.take_reports();
         if app.session.pending_tiles() > 0 || app.session.caches.iter().any(|cache| !cache.upload.is_empty()) || gpu.bake_busy() {
             ui.ctx().request_repaint();
@@ -2570,8 +2576,13 @@ mod tests {
         app.profiler.logic_ms = 100.0;
         app.session.update();
         let frame = Frame {
-            view_id: VIEW_3D, size: [256, 256], kind: ViewKind::Scene, camera: app.session.camera,
-            shade: Shade::default(), visible: vec![true], overlay: Vec::new(),
+            view_id: VIEW_3D,
+            size: [256, 256],
+            kind: ViewKind::Scene,
+            camera: app.session.camera,
+            shade: Shade::default(),
+            visible: vec![true],
+            overlay: Vec::new(),
         };
         let output = ctx.run_ui(Default::default(), |ui| {
             let mut sync = PendingSync { uv_size: Some([256, 256]), ..Default::default() };
@@ -2584,10 +2595,14 @@ mod tests {
             assert!(!app.session.caches[0].upload.contains(&(15, 15)), "second view's dab must be in this frame");
             assert!(!app.session.caches[0].upload.is_empty());
         });
-        let callback_positions: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
-            egui::Shape::Callback(callback) => Some(callback.rect.left()),
-            _ => None,
-        }).collect();
+        let callback_positions: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Callback(callback) => Some(callback.rect.left()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(callback_positions, [0.0, 256.0], "the scene update precedes the second GPU draw");
         output.drop_without_applying_deltas();
     }
