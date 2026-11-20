@@ -2584,6 +2584,11 @@ mod tests {
             assert!(!app.session.caches[0].upload.contains(&(15, 15)), "second view's dab must be in this frame");
             assert!(!app.session.caches[0].upload.is_empty());
         });
+        let callback_positions: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Callback(callback) => Some(callback.rect.left()),
+            _ => None,
+        }).collect();
+        assert_eq!(callback_positions, [0.0, 256.0], "the scene update precedes the second GPU draw");
         output.drop_without_applying_deltas();
     }
 

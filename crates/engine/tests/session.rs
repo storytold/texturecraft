@@ -949,7 +949,10 @@ fn a_budgeted_slice_composites_the_brush_then_the_visible_uv_before_the_backlog(
 
 #[test]
 fn switching_materials_reuses_idle_bands_within_the_active_budget() {
-    let mut s = Session::new_project("bands", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+    let mut s = Session::new_project("bands", primitives::crate_scene(), "builtin:crate", None, 128).unwrap();
+    let source = s.selected[&1];
+    execute(&mut s, "layer.instance", &json!({"layer":source.0, "ts":2})).unwrap();
+    execute(&mut s, "textureSet.select", &json!({"ts":0})).unwrap();
     execute(&mut s, "layer.add.fill", &json!({"color":[0.1,0.3,0.7]})).unwrap();
     execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
     s.update();
@@ -960,8 +963,12 @@ fn switching_materials_reuses_idle_bands_within_the_active_budget() {
     assert_eq!(s.caches[0].below.bytes(), bytes);
     select(&mut s, 0);
     assert_eq!(s.caches[0].below.bytes(), bytes);
-    s.caches[1].below.budget = bytes - 1;
+    // The parked set alone would fit. A third set drawing an instance of
+    // material one's selected layer also earns bands from this pass.
+    s.caches[1].below.budget = bytes + s.caches[1].below.bytes();
+    s.caches[2].invalidate_all();
     select(&mut s, 1);
+    assert!(s.caches[2].below.bytes() > 0);
     assert_eq!(s.caches[0].below.bytes(), 0);
     select(&mut s, 0);
     s.caches[0].invalidate_all();
