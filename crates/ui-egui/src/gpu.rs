@@ -257,7 +257,8 @@ impl GpuLink {
             let composite = &cache.composite;
             let channels: Vec<Channel> = composite.channels.keys().copied().collect();
             let sent = self.sent.entry(texture_set).or_default();
-            let kinds: Vec<DisplayKind> = DisplayKind::ALL.into_iter().filter(|kind| sent.contains(kind) || kinds_for(&channels).any(|needed| needed == *kind)).collect();
+            let kinds: Vec<DisplayKind> =
+                DisplayKind::ALL.into_iter().filter(|kind| sent.contains(kind) || kinds_for(&channels).any(|needed| needed == *kind)).collect();
             sent.extend(kinds.iter().copied());
 
             while !cache.upload.is_empty() {
@@ -266,7 +267,8 @@ impl GpuLink {
                 } else {
                     (0..chunk_size).filter_map(|_| cache.upload.pop_first()).collect()
                 };
-                let bytes: Vec<_> = chunk.par_iter()
+                let bytes: Vec<_> = chunk
+                    .par_iter()
                     .flat_map_iter(|&(x, y)| kinds.iter().map(move |&kind| (kind, x, y)))
                     .map(|(kind, x, y)| (texture_set, kind, x, y, display_tile_bytes(composite, baked, kind, x, y, out.tile_shift)))
                     .collect();
@@ -517,7 +519,7 @@ mod tests {
             sent: HashMap::new(),
             adapter: String::new(),
             composite_total: 0,
-        upload_cursor: None,
+            upload_cursor: None,
             bake_scene: BakeSceneLink::default(),
         }
     }
