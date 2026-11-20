@@ -11,6 +11,7 @@ use texturecraft_engine::Session;
 use texturecraft_engine::compose::{DisplayKind, ImageRes, display_tile_bytes, kinds_for};
 use texturecraft_engine::core::{BakedMap, Channel};
 use texturecraft_engine::geom::{Mesh, glam::Vec2};
+use texturecraft_engine::session::ReleasedDab;
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_engine::{
     brush_device,
@@ -72,6 +73,7 @@ pub struct SceneSync {
     trace_composite: Option<(f64, Arc<AtomicBool>)>,
     pub(crate) compositor_changed: bool,
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
+    released_dabs: Vec<ReleasedDab>,
     pub aux: Vec<(usize, u32, Vec<u8>)>,
     /// One image buffer per resolution, with all texture sets that need it.
     pub image_aux: BTreeMap<u32, (Vec<usize>, Vec<u8>)>,
@@ -110,6 +112,9 @@ impl SceneSync {
         }
         for (texture_set, kind, tile_x, tile_y, bytes) in &self.tiles {
             renderer.upload_display_tile(device, queue, *texture_set, *kind, *tile_x, *tile_y, bytes, self.tile_shift);
+        }
+        for dab in &self.released_dabs {
+            dab.acknowledge_upload();
         }
         (reset, errors)
     }
@@ -691,6 +696,9 @@ impl GpuLink {
 
             while !cache.upload.is_empty() {
                 let chunk = cache.take_upload_batch(chunk_size, if texture_set == active { demand } else { Default::default() });
+                if !kinds.is_empty() {
+                    out.released_dabs.extend(cache.released_dab_in(&chunk));
+                }
                 let composite = &cache.composite;
                 let bytes: Vec<_> = chunk
                     .par_iter()
@@ -1228,7 +1236,24 @@ pub(crate) mod tests {
         s.end_stroke().unwrap();
         let out = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
         assert_eq!(out.tiles.first().map(|t| (t.2, t.3)), Some((15, 15)), "a tap released in one frame must still reach the first upload");
-        assert!(!s.tile_demand(None).focused(), "the released dab's priority ends after its upload");
+        let frame = Frame {
+            view_id: 0,
+            size: [64, 64],
+            kind: texturecraft_render::ViewKind::Scene,
+            camera: s.camera,
+            shade: Default::default(),
+            visible: vec![true],
+            overlay: Vec::new(),
+        };
+        drop(ViewCallback { frame, sync: Mutex::new(Some(out)), rect: egui::Rect::ZERO, lost: gpu.lost.clone() });
+        let replay = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
+        assert_eq!(replay.tiles.first().map(|t| (t.2, t.3)), Some((15, 15)), "a dropped callback must preserve the dab's priority");
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(mut gpu) = texturecraft_render::headless::Headless::new() {
+            let (_, errors) = replay.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty());
+            assert!(!s.tile_demand(None).focused(), "a consumed callback clears the released dab's priority");
+        }
     }
 
     #[test]

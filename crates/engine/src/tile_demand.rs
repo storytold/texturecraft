@@ -49,7 +49,7 @@ impl Session {
             // A view of the entire atlas benefits from the usual block ordering.
             (bounds != ((0, 0), ((w - 1) / TILE, (h - 1) / TILE))).then_some(bounds)
         });
-        let brush = if self.stroke.is_some() { brush } else { cache.finished_dab };
+        let brush = if self.stroke.is_some() { brush } else { cache.finished_dab.as_ref().and_then(crate::session::ReleasedDab::pending_tile) };
         TileDemand { brush, visible }
     }
 }

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use texturecraft_compose::{BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles};
@@ -32,6 +33,27 @@ pub struct Document {
     pub resources: BTreeMap<String, Arc<Vec<u8>>>,
 }
 
+/// A released dab keeps priority until its display upload is sent.
+#[derive(Clone)]
+pub struct ReleasedDab {
+    tile: (u32, u32),
+    uploaded: Arc<AtomicBool>,
+}
+
+impl ReleasedDab {
+    pub(crate) fn new(tile: (u32, u32)) -> Self {
+        Self { tile, uploaded: Arc::default() }
+    }
+
+    pub(crate) fn pending_tile(&self) -> Option<(u32, u32)> {
+        (!self.uploaded.load(Ordering::Acquire)).then_some(self.tile)
+    }
+
+    pub fn acknowledge_upload(&self) {
+        self.uploaded.store(true, Ordering::Release);
+    }
+}
+
 /// Derived per-texture-set data (rebuilt when the mesh or resolution changes).
 pub struct SetCache {
     /// Texels across and down (`TextureSet::size`).
@@ -48,7 +70,7 @@ pub struct SetCache {
     /// Tiles whose display textures must be re-uploaded.
     pub upload: BTreeSet<(u32, u32)>,
     /// A dab released before its first display upload.
-    pub(crate) finished_dab: Option<(u32, u32)>,
+    pub(crate) finished_dab: Option<ReleasedDab>,
     /// Bumps on every composite change (thumbnails, exports, caches).
     pub revision: u64,
     /// Changes when this set's material inputs change, independently of CPU display work.
@@ -98,17 +120,19 @@ impl SetCache {
 
     /// Drain one upload slice, giving the brush and visible UVs first use of it.
     pub fn take_upload_batch(&mut self, limit: usize, demand: crate::TileDemand) -> Vec<(u32, u32)> {
-        let tiles = if self.upload.len() <= limit {
+        if self.upload.len() <= limit {
             std::mem::take(&mut self.upload).into_iter().collect()
         } else {
             let mut tiles = demand.take(&mut self.upload, limit);
             tiles.extend((tiles.len()..limit).filter_map(|_| self.upload.pop_first()));
             tiles
-        };
-        if self.finished_dab.is_some_and(|t| !self.upload.contains(&t) && !self.dirty.contains(&t)) {
-            self.finished_dab = None;
         }
-        tiles
+    }
+
+    /// Carry this receipt with the scene so a lost render callback leaves the dab pending.
+    pub fn released_dab_in(&self, tiles: &[(u32, u32)]) -> Option<ReleasedDab> {
+        let dab = self.finished_dab.as_ref()?;
+        tiles.contains(&dab.pending_tile()?).then(|| dab.clone())
     }
 
     fn queue_painted(
@@ -1291,7 +1315,12 @@ impl Session {
 
     /// Drain tiles needing upload for texture set `ts`.
     pub fn take_uploads(&mut self, ts: usize) -> Vec<(u32, u32)> {
-        self.caches.get_mut(ts).map(|c| c.take_upload_batch(usize::MAX, crate::TileDemand::default())).unwrap_or_default()
+        let Some(cache) = self.caches.get_mut(ts) else { return Vec::new() };
+        let tiles = cache.take_upload_batch(usize::MAX, crate::TileDemand::default());
+        if let Some(dab) = cache.released_dab_in(&tiles) {
+            dab.acknowledge_upload();
+        }
+        tiles
     }
 
     /// `f` on the compositor inputs of texture set `ts` (without a live stroke; None for a set

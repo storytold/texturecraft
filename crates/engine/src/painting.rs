@@ -13,7 +13,7 @@ use texturecraft_paint::{
 
 use crate::brush_device::DeviceStrokePreview;
 use crate::session::{
-    ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
+    ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, ReleasedDab, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
 };
 use crate::uv_stroke_state::UvStrokeState;
 use crate::uv_symmetry::UvMirror;
@@ -791,7 +791,8 @@ impl Session {
         if let Some(cache) = self.caches.get_mut(st.ts) {
             self.display_stroke_end =
                 Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision, revision: cache.material_revision, tiles: st.display_tiles });
-            cache.finished_dab = brush_tile.filter(|tile| st.canvas.dirty.contains(tile) && (cache.dirty.contains(tile) || cache.upload.contains(tile)));
+            cache.finished_dab =
+                brush_tile.filter(|tile| st.canvas.dirty.contains(tile) && (cache.dirty.contains(tile) || cache.upload.contains(tile))).map(ReleasedDab::new);
         }
         Ok(())
     }
