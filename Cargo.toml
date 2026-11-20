@@ -12,7 +12,7 @@ rust-version = "1.95"
 repository = "https://github.com/storytold/texturecraft"
 
 [workspace.dependencies]
-craft-usd = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "847e34fda11c44f58141fcb86647dc41d613f872" }
+craft-usd = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "5161fcc90e0d886152003041bf51ad3f2e85c506" }
 # internal
 texturecraft-core = { path = "crates/core" }
 texturecraft-texel = { path = "crates/texel" }

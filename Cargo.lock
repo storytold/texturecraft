@@ -1034,7 +1034,7 @@ dependencies = [
 [[package]]
 name = "craft-usd"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=847e34fda11c44f58141fcb86647dc41d613f872#847e34fda11c44f58141fcb86647dc41d613f872"
+source = "git+https://github.com/storytold/craft-libs?rev=5161fcc90e0d886152003041bf51ad3f2e85c506#5161fcc90e0d886152003041bf51ad3f2e85c506"
 dependencies = [
  "half",
  "lz4_flex",
