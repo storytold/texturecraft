@@ -185,12 +185,14 @@ pub struct GpuReports {
 
 /// Most distinct uncaptured GPU errors kept until the UI shows them.
 const MAX_GPU_ERRORS: usize = 8;
+const GPU_COMPOSITE_ERROR: &str = n_("GPU compositing reported a device error. See the app log for details.");
 
 #[derive(Default)]
 struct SetCompositor {
     current: Option<CompositeKey>,
     stroke: Option<u64>,
     rejected: Option<(CompositeKey, &'static str)>,
+    failed_key: Option<CompositeKey>,
     failed: Arc<AtomicBool>,
     reason: &'static str,
     neutral: bool,
@@ -203,23 +205,28 @@ impl SetCompositor {
     }
 
     fn plan(&mut self, session: &Session, ts: usize, shift: u32, global_reason: &'static str) -> Result<Option<CompositeProgram>, &'static str> {
+        let cache = &session.caches[ts];
+        let key = CompositeKey { mesh: session.mesh_id, revision: cache.material_revision, size: cache.size, shift };
+        if self.failed.load(Ordering::Acquire) {
+            self.failed_key = self.current;
+            self.failed = Arc::default();
+            self.stroke = None;
+        }
         if !global_reason.is_empty() {
             return Err(global_reason);
         }
-        if self.failed.load(Ordering::Acquire) {
-            return Err(n_("GPU compositing reported a device error. See the app log for details."));
+        if self.failed_key == Some(key) {
+            return Err(GPU_COMPOSITE_ERROR);
         }
         let stroke = session.pending_display_stroke(ts);
         if session.stroke_texture_set() == Some(ts) && stroke.is_none() {
             return Err(n_("This painting tool uses CPU compositing."));
         }
 
-        let cache = &session.caches[ts];
         let padding = cache.dilation.mixed_coverage();
         if !cache.dilation.fully_covered() && padding.is_none() {
             return Err(n_("The texture set has no covered UV texels."));
         }
-        let key = CompositeKey { mesh: session.mesh_id, revision: cache.material_revision, size: cache.size, shift };
         let stroke_id = stroke.map(|(id, _)| id);
         let current = self.current == Some(key);
         let unchanged_stroke = self.stroke == stroke_id;
@@ -285,6 +292,9 @@ impl SetCompositor {
             return Err(reason);
         }
         self.neutral = program.is_neutral();
+        if !current {
+            self.failed = Arc::default();
+        }
         self.current = Some(key);
         self.stroke = stroke_id;
         Ok(Some(program))
@@ -456,9 +466,8 @@ impl GpuLink {
     pub(crate) fn compositor_status(&self) -> (&'static str, &'static str) {
         let cpu = self.compositors.iter().find(|set| !set.uses_gpu());
         let uses_gpu = self.compositors.iter().any(|set| set.uses_gpu() && !set.neutral);
-        let reason = cpu.map_or(n_("Waiting for the first material update"), |set| {
-            if set.failed.load(Ordering::Acquire) { n_("GPU compositing reported a device error. See the app log for details.") } else { set.reason }
-        });
+        let reason =
+            cpu.map_or(n_("Waiting for the first material update"), |set| if set.failed.load(Ordering::Acquire) { GPU_COMPOSITE_ERROR } else { set.reason });
         match (uses_gpu, cpu) {
             (true, None) => (n_("Layers: GPU"), n_("The graphics card composes the material.")),
             (true, Some(_)) => (n_("Layers: GPU + CPU"), reason),
@@ -1700,6 +1709,26 @@ pub(crate) mod tests {
         assert!(link.display_pending(&s) || !cpu.tiles.is_empty());
         link.prefer_gpu_layers = true;
         assert!(!link.sync(&mut s, None, None, 0, 0.0).composites.is_empty());
+    }
+
+    #[test]
+    fn gpu_compositing_retries_after_editing_a_failed_material() {
+        let mut session = procedural_stack(128);
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        let first = link.sync(&mut session, None, None, 0, 0.0);
+        let failed = first.composites[0].2.clone();
+        failed.store(true, Ordering::Release);
+        for _ in 0..2 {
+            assert!(link.sync(&mut session, None, None, 0, 0.0).composites.is_empty());
+            assert_eq!(link.compositor_status(), ("Layers: CPU", GPU_COMPOSITE_ERROR));
+        }
+
+        execute(&mut session, "layer.add.fill", &json!({"color": [0.45, 0.15, 0.35]})).unwrap();
+        let updated = link.sync(&mut session, None, None, 0, 0.0);
+        assert!(!updated.composites.is_empty(), "editing the failed material gives the GPU a fresh attempt");
+        failed.store(true, Ordering::Release);
+        assert_eq!(link.compositor_status().0, "Layers: GPU", "a stale completion cannot reject the updated material");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
