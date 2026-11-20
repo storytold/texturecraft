@@ -705,6 +705,50 @@ mod tests {
         }
     }
 
+    /// From pointer input to the first prepared upload containing the dab, on a warm
+    /// material and behind a full display refresh. Frames are driven without vsync.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_brush_upload_latency() {
+        let mut s = Session::new_project("latency", primitives::plane(1.0, 1), "builtin:plane", None, 1024).unwrap();
+        execute(&mut s, "tool.brush", &json!({"size": 0.6, "hardness": 100})).unwrap();
+        let mut gpu = link();
+        s.update();
+        let all = texturecraft_engine::compose::all_tiles(1024, 1024);
+        for backlog in [false, true] {
+            let mut elapsed = Vec::new();
+            let mut frames = Vec::new();
+            for pass in 0..35 {
+                s.take_uploads(0);
+                if backlog {
+                    s.caches[0].upload.extend(all.iter().copied());
+                }
+                let tile = (15, 4 + pass % 8);
+                let uv = Vec2::new(tile.0 as f32 + 0.5, tile.1 as f32 + 0.5) / 16.0;
+                let start = std::time::Instant::now();
+                s.begin_stroke_uv(uv, 1.0).unwrap();
+                let mut count = 0;
+                loop {
+                    let scene = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
+                    count += 1;
+                    if scene.tiles.iter().any(|t| t.1 == DisplayKind::BaseColor && (t.2, t.3) == tile) {
+                        break;
+                    }
+                    assert!(count <= 5, "pending brush upload must make progress");
+                }
+                if pass >= 3 {
+                    elapsed.push(start.elapsed());
+                    frames.push(count);
+                }
+                s.cancel_stroke();
+                s.update();
+            }
+            elapsed.sort_unstable();
+            frames.sort_unstable();
+            println!("backlog={backlog}, 32 dabs: upload ready in {} syncs at median; P50 {:.2?}, P95 {:.2?}", frames[15], elapsed[15], elapsed[30]);
+        }
+    }
+
     /// Time the UI's actual tile packing, excluding GPU submission and presentation.
     #[test]
     #[ignore = "benchmark"]

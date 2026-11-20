@@ -932,6 +932,19 @@ fn a_budgeted_slice_composites_the_brush_then_the_visible_uv_before_the_backlog(
     s.update();
     let result = s.caches[0].composite.clone();
     assert_eq!(result, full(&mut s));
+
+    // A 3D stroke supplies the atlas UV from its existing surface hit.
+    let screen = Vec2::splat(128.0);
+    let viewport = Vec2::splat(256.0);
+    let hit = s.pick(screen, viewport).unwrap();
+    let tile = ((hit.uv.x * 512.0) as u32 / 64, (hit.uv.y * 512.0) as u32 / 64);
+    assert_ne!(tile, (0, 0));
+    assert!(s.begin_stroke(screen, viewport, 1.0).unwrap());
+    s.caches[0].invalidate_all();
+    s.take_uploads(0);
+    s.caches[0].chunk = 1;
+    s.update_for_view(0.0, || 0.0, s.tile_demand(None));
+    assert_eq!(s.take_uploads(0), [tile]);
 }
 
 #[test]
