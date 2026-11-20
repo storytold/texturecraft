@@ -46,6 +46,8 @@ struct Dab {
     normal: [f32; 4],
     tangent: [f32; 4],
     bitangent: [f32; 4],
+    seed: u32,
+    padding: [u32; 3],
 }
 
 struct Visibility {
@@ -55,7 +57,9 @@ struct Visibility {
 }
 
 pub(crate) struct BrushPipeline {
-    pipeline: wgpu::ComputePipeline,
+    shader: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    pipelines: BTreeMap<u32, wgpu::ComputePipeline>,
     rays: Option<(Weak<Bvh>, wgpu::Buffer, wgpu::Buffer)>,
     depth: Option<(Weak<EyeDepth>, wgpu::TextureView)>,
 }
@@ -88,17 +92,35 @@ impl BrushPipeline {
         });
         let layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("tc_brush"), bind_group_layouts: &[Some(&inputs)], immediate_size: 0 });
-        let source = concat!(include_str!("shaders/rays.wgsl"), "\n", include_str!("shaders/brush.wgsl"));
+        let source = concat!(include_str!("shaders/rays.wgsl"), "\n", include_str!("shaders/noise.wgsl"), "\n", include_str!("shaders/brush.wgsl"));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc_brush"), source: wgpu::ShaderSource::Wgsl(source.into()) });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("tc_brush"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("brush"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        Self { pipeline, rays: None, depth: None }
+        Self { shader, layout, pipelines: BTreeMap::new(), rays: None, depth: None }
+    }
+
+    fn pipeline(&mut self, device: &wgpu::Device, alpha: BrushAlpha) -> wgpu::ComputePipeline {
+        // Specialize by shape so the simple brushes keep their smaller GPU kernels.
+        let alpha_kind = match alpha {
+            BrushAlpha::Round => 0,
+            BrushAlpha::Square => 1,
+            BrushAlpha::Spray => 2,
+            BrushAlpha::Grunge => 3,
+            BrushAlpha::Cloud => 4,
+            BrushAlpha::Star => 5,
+            BrushAlpha::Streaks => 6,
+        };
+        self.pipelines
+            .entry(alpha_kind)
+            .or_insert_with(|| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("tc_brush"),
+                    layout: Some(&self.layout),
+                    module: &self.shader,
+                    entry_point: Some("brush"),
+                    compilation_options: wgpu::PipelineCompilationOptions { constants: &[("alpha_kind", f64::from(alpha_kind))], ..Default::default() },
+                    cache: None,
+                })
+            })
+            .clone()
     }
 
     fn visibility(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, input: &BrushInput) -> Result<Visibility, String> {
@@ -149,6 +171,7 @@ impl BrushPipeline {
         let center = (lo + hi) * 0.5;
         let radius = (hi - lo).length().mul_add(0.5, 0.0).max(1e-4);
         let settings = &input.settings;
+        let pipeline = self.pipeline(device, settings.alpha);
         let mut params = Parameters {
             camera: Mat4::IDENTITY.to_cols_array_2d(),
             eye: [0.0; 4],
@@ -156,7 +179,7 @@ impl BrushPipeline {
             mesh: center.extend(radius).to_array(),
             ortho: [0.0; 4],
             shape: [settings.alpha_params.size_x, settings.alpha_params.size_y, settings.alpha_params.roundness, settings.alpha_params.contrast],
-            flags: [0, u32::from(settings.backface_culling), u32::from(settings.alpha == BrushAlpha::Square), u32::from(settings.alpha_params.invert)],
+            flags: [0, u32::from(settings.backface_culling), u32::from(settings.alpha_params.invert), 0],
         };
         if let Some(depth) = &input.depth {
             params.camera = depth.view_proj.to_cols_array_2d();
@@ -167,18 +190,7 @@ impl BrushPipeline {
                 params.ortho = to_eye.extend(1.0).to_array();
             }
         }
-        Ok(GpuBrushStroke {
-            input,
-            pipeline: self.pipeline.clone(),
-            device: device.clone(),
-            queue: queue.clone(),
-            surface,
-            visibility,
-            alpha,
-            view,
-            params,
-            scratch: None,
-        })
+        Ok(GpuBrushStroke { input, pipeline, device: device.clone(), queue: queue.clone(), surface, visibility, alpha, view, params, scratch: None })
     }
 }
 
@@ -215,6 +227,8 @@ impl GpuBrushStroke {
                 normal: stamp.normal.extend(stamp.depth).to_array(),
                 tangent: stamp.tangent.extend(stamp.flow).to_array(),
                 bitangent: stamp.bitangent.extend(stamp.hardness).to_array(),
+                seed: stamp.seed,
+                padding: [0; 3],
             });
             let extent = Vec3::splat(stamp.radius * stamp.depth.max(1.0) * 1.42);
             let mut touched = Tiles::new();
@@ -250,6 +264,8 @@ impl GpuBrushStroke {
                 normal: [0.0; 4],
                 tangent: [cos, sin, 0.0, stamp.flow],
                 bitangent: [0.0, 0.0, 0.0, stamp.hardness],
+                seed: stamp.seed,
+                padding: [0; 3],
             });
             let reach = Vec2::splat(radius * 1.42);
             let mut touched = Tiles::new();
@@ -453,7 +469,82 @@ fn buffer_copy(buffer: &wgpu::Buffer, slot: usize) -> wgpu::TexelCopyBufferInfo<
 mod tests {
     use super::*;
     use crate::headless::Headless;
-    use texturecraft_geom::OrbitCamera;
+    use texturecraft_geom::{OrbitCamera, primitives};
+    use texturecraft_paint::{RasterCtx, Shape, StrokeCanvas, rasterize, rasterize_uv};
+
+    #[test]
+    fn procedural_alphas_keep_their_seeded_patterns_in_both_views() {
+        let Ok(mut gpu) = Headless::new() else { return };
+        let size = 128;
+        let mesh = Arc::new(primitives::plane(1.0, 4));
+        let bvh = Arc::new(Bvh::new(&mesh));
+        let uv = Arc::new(UvGBuffer::new(&mesh, 0, size, size));
+        for alpha in [BrushAlpha::Spray, BrushAlpha::Grunge, BrushAlpha::Cloud, BrushAlpha::Star, BrushAlpha::Streaks] {
+            for (seed, invert) in [(19, false), (37, true)] {
+                let mut settings = BrushSettings { alpha, backface_culling: false, ..Default::default() };
+                settings.alpha_params.size_x = 0.75;
+                settings.alpha_params.size_y = 0.9;
+                settings.alpha_params.contrast = 1.3;
+                settings.alpha_params.invert = invert;
+                let shape = Shape { alpha, image: None, library: None, params: settings.alpha_params, level: 0 };
+                let input = || BrushInput { mesh: mesh.clone(), bvh: bvh.clone(), uv: uv.clone(), material: 0, depth: None, settings: settings.clone() };
+
+                let uv_dab = UvStamp { center: Vec2::splat(0.48), radius: 0.29, angle: 35.0, flow: 0.8, hardness: 0.6, seed, source: None };
+                let mut cpu = StrokeCanvas::new(size, size);
+                rasterize_uv(&mut cpu, &uv, shape, &[uv_dab]);
+                let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input()).unwrap();
+                let tiles = stroke.append_uv(&[uv_dab]).unwrap();
+                let actual = stroke.read_alpha(&tiles).unwrap();
+                assert_alpha_pattern(&cpu.alpha, &actual, alpha, "2D");
+
+                let world_dab = Stamp {
+                    center: Vec3::new(-0.03, 0.0, 0.02),
+                    normal: Vec3::Y,
+                    tangent: Vec3::X,
+                    bitangent: Vec3::Z,
+                    radius: 0.29,
+                    flow: 0.8,
+                    hardness: 0.6,
+                    depth: 1.0,
+                    seed,
+                    source: None,
+                };
+                let context = RasterCtx {
+                    mesh: &mesh,
+                    bvh: &bvh,
+                    gbuf: &uv,
+                    material: 0,
+                    depth: None,
+                    eye: Vec3::Y,
+                    backface_culling: false,
+                    angle_fade: settings.angle_fade,
+                    shape,
+                };
+                let mut cpu = StrokeCanvas::new(size, size);
+                rasterize(&mut cpu, &context, &[world_dab]);
+                let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input()).unwrap();
+                let tiles = stroke.append_world(&[world_dab]).unwrap();
+                let actual = stroke.read_alpha(&tiles).unwrap();
+                assert_alpha_pattern(&cpu.alpha, &actual, alpha, "3D");
+            }
+        }
+    }
+
+    fn assert_alpha_pattern(cpu: &TileImage, gpu: &TileImage, alpha: BrushAlpha, view: &str) {
+        let (mut covered, mut differing) = (0, 0);
+        for y in 0..cpu.height() {
+            for x in 0..cpu.width() {
+                let expected = cpu.get(x, y)[0];
+                let observed = gpu.get(x, y)[0];
+                covered += usize::from(expected != 0 || observed != 0);
+                differing += usize::from(expected.abs_diff(observed) > 128);
+            }
+        }
+        assert!(covered > 0, "{alpha:?} must stamp in {view}");
+        // Barycentric quantization and different floating-point math can move a few texels
+        // across a shape edge or the spray threshold.
+        assert!(differing * 100 <= covered, "{alpha:?} in {view}: {differing}/{covered} alpha values differ");
+    }
 
     #[test]
     fn world_stroke_paints_both_sides_of_a_uv_seam() {

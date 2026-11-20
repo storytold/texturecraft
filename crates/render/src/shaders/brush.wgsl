@@ -5,7 +5,7 @@ struct Params {
     mesh: vec4<f32>, // center and radius of the normalized UV surface
     ortho: vec4<f32>, // orthographic ray direction and enable
     shape: vec4<f32>, // alpha extents, roundness, contrast
-    flags: vec4<u32>, // UV mode, culling, square, invert
+    flags: vec4<u32>, // UV mode, culling, invert
 }
 struct Vertex {
     position: vec4<f32>,
@@ -16,7 +16,10 @@ struct Dab {
     normal: vec4<f32>,
     tangent: vec4<f32>,
     bitangent: vec4<f32>,
+    seed: u32,
 }
+// Corresponds to the BrushAlpha mapping in BrushPipeline::pipeline.
+override alpha_kind: u32 = 0u;
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(3) var uv_surface: texture_2d<u32>;
 @group(0) @binding(4) var<storage, read> vertices: array<Vertex>;
@@ -83,13 +86,50 @@ fn visible(point: vec3<f32>, geometric: vec3<f32>, direction: vec3<f32>, facing:
     return test.y && ray_visible(point, geometric, direction);
 }
 
-fn stamp_shape(local: vec2<f32>, hardness: f32) -> f32 {
-    let p = local / params.shape.xy;
-    let square = max(abs(p.x), abs(p.y));
-    let radius = select(mix(square, length(p), params.shape.z), square, params.flags.z != 0u);
-    let value = 1.0 - smoothstep(min(hardness, 0.999), 1.0, radius);
+fn falloff(radius: f32, hardness: f32) -> f32 {
+    return 1.0 - smoothstep(min(hardness, 0.999), 1.0, radius);
+}
+
+fn procedural_alpha(p: vec2<f32>, hardness: f32, seed: u32) -> f32 {
+    let radius = length(p);
+    switch alpha_kind {
+        case 0u: { return falloff(mix(max(abs(p.x), abs(p.y)), radius, params.shape.z), hardness); }
+        case 1u: { return falloff(max(abs(p.x), abs(p.y)), hardness); }
+        case 5u: {
+            if radius == 0.0 { return 1.0; }
+            let k = abs(cos(atan2(p.y, p.x) * 5.0 / 2.0));
+            return falloff(radius / (0.45 + 0.55 * k * k), hardness);
+        }
+        default: {}
+    }
+
+    let fall = falloff(radius, hardness);
+    if fall == 0.0 { return 0.0; }
+    let seed_position = f32(seed);
+    switch alpha_kind {
+        case 2u: {
+            let n = noise(vec3(p * 14.0, seed_position * 0.37), seed, false);
+            return select(0.0, fall, n > 0.72);
+        }
+        case 3u: {
+            let n = fbm(vec3(p.x * 2.5 + seed_position * 0.13, p.y * 2.5, 0.5), 5u, seed, true);
+            return fall * clamp((n - 0.42) * 5.0, 0.0, 1.0);
+        }
+        case 4u: {
+            return fall * fbm(vec3(p * 1.8, seed_position * 0.21), 4u, seed, false);
+        }
+        case 6u: {
+            let n = noise(vec3(p.x * 0.8, p.y * 18.0, seed_position * 0.7), seed, false);
+            return fall * clamp((n - 0.35) * 3.0, 0.0, 1.0);
+        }
+        default: { return fall; }
+    }
+}
+
+fn stamp_shape(local: vec2<f32>, hardness: f32, seed: u32) -> f32 {
+    let value = procedural_alpha(local / params.shape.xy, hardness, seed);
     let graded = clamp((value - 0.5) * params.shape.w + 0.5, 0.0, 1.0);
-    if params.flags.w == 0u { return graded; }
+    if params.flags.z == 0u { return graded; }
     return select(0.0, 1.0 - graded, all(abs(local) <= vec2(1.0)));
 }
 
@@ -142,7 +182,7 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32) -> u32 {
                 fade = f * f * (3.0 - 2.0 * f);
             }
         }
-        let opacity = stamp_shape(local, dab.bitangent.w) * dab.tangent.w * fade;
+        let opacity = stamp_shape(local, dab.bitangent.w, dab.seed) * dab.tangent.w * fade;
         if opacity <= 0.0 { continue; }
         if !uv_mode && !tested_visibility {
             if !visible(point, geometric, direction, facing) { return coverage; }

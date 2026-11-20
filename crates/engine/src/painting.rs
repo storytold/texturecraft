@@ -334,7 +334,6 @@ impl Session {
             && !settings.symmetry.any()
             && settings.alpha_image.is_none()
             && settings.alpha_library.is_none()
-            && matches!(settings.alpha, texturecraft_paint::BrushAlpha::Round | texturecraft_paint::BrushAlpha::Square)
             && values.keys().all(|channel| {
                 matches!(
                     channel,
