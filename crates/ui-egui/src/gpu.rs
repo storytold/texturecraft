@@ -746,7 +746,7 @@ pub(crate) mod tests {
         let all = texturecraft_engine::compose::all_tiles(1024, 1024);
         let mut gpu = link();
         // The zoomed square spans four by four tiles at the lower right of the atlas.
-        let bounds = crate::viewport::visible_uv_bounds([512, 512], (1024, 1024), 4.0 / 0.92, [-3.0, 3.0]);
+        let bounds = crate::viewport::visible_uv_bounds([512, 512], (1024, 1024), 4.0 / 0.92, [-3.0, 3.0], 0.0);
         let out = gpu.sync_view(&mut s, None, None, 0, FRAME_BUDGET_MS, Some(bounds));
         let coords: BTreeSet<_> = out.tiles.iter().map(|t| (t.2, t.3)).collect();
         for x in 12..16 {
@@ -824,7 +824,7 @@ pub(crate) mod tests {
         let frame = Frame {
             view_id: 2,
             size: [256, 256],
-            kind: ViewKind::Uv { ts: 0, zoom: 2.0 / 0.92, pan: [(1.0 - 2.0 * uv.x) * 2.0, (2.0 * uv.y - 1.0) * 2.0] },
+            kind: ViewKind::Uv { ts: 0, zoom: 2.0 / 0.92, pan: [(1.0 - 2.0 * uv.x) * 2.0, (2.0 * uv.y - 1.0) * 2.0], rotation: 0.0 },
             camera: s.camera,
             shade: Shade { view_mode: 1, channel: 0, ..Default::default() },
             visible: vec![true],

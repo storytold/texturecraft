@@ -1242,7 +1242,7 @@ fn prepacked_viewport_tiles_match_full_tiles_after_device_downscaling() {
     let Some((mut h, frame)) = setup() else { return };
     h.renderer.set_display_shift(2);
     h.renderer.set_texture_sets(&h.device, &h.queue, &[((80, 96), 0)], 2);
-    let mut uv = Frame { kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0, 0.0] }, ..frame };
+    let mut uv = Frame { kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 }, ..frame };
     uv.shade.view_mode = 1;
     uv.shade.channel = 0;
     let neutral = render(&mut h, &uv, "before_packed_tiles");

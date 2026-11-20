@@ -448,8 +448,10 @@ impl PendingSync {
         let Some((painter, slot, mut callback)) = self.first else { return };
         let Some(gpu) = app.gpu.as_mut() else { return };
         let start = crate::now_ms();
-        let visible_uv =
-            self.uv_size.zip(app.session.caches.get(app.session.ts())).map(|(size, cache)| visible_uv_bounds(size, cache.size, app.ui.uv_zoom, app.ui.uv_pan));
+        let visible_uv = self
+            .uv_size
+            .zip(app.session.caches.get(app.session.ts()))
+            .map(|(size, cache)| visible_uv_bounds(size, cache.size, app.ui.uv_zoom, app.ui.uv_pan, app.ui.uv_rotation));
         let scene = gpu.sync_view(
             &mut app.session,
             aux,
@@ -469,13 +471,13 @@ impl PendingSync {
     }
 }
 
-/// Invert the UV view transform used by the renderer for the two viewport corners.
-pub(crate) fn visible_uv_bounds(frame_size: [u32; 2], atlas: (u32, u32), zoom: f32, pan: [f32; 2]) -> [Vec2; 2] {
-    let aspect = frame_size[0].max(1) as f32 / frame_size[1].max(1) as f32;
-    let scale = Vec2::from_array(texturecraft_render::uv_view_scale(aspect, zoom, atlas));
-    let center = (Vec2::ONE + Vec2::new(-pan[0], pan[1]) / scale) * 0.5;
-    let extent = Vec2::splat(0.5) / scale;
-    [center - extent, center + extent]
+/// Atlas-aligned bounds of the four corners of the displayed, possibly rotated UV view.
+pub(crate) fn visible_uv_bounds(frame_size: [u32; 2], atlas: (u32, u32), zoom: f32, pan: [f32; 2], rotation: f32) -> [Vec2; 2] {
+    let size = egui::vec2(frame_size[0].max(1) as f32, frame_size[1].max(1) as f32);
+    let rect = Rect::from_min_size(Pos2::ZERO, size);
+    let view = crate::uv_view_map::UvViewMap { rect, scale: texturecraft_render::uv_view_scale(size.x / size.y, zoom, atlas), pan, rotation };
+    let corners = [rect.left_top(), rect.right_top(), rect.left_bottom(), rect.right_bottom()].map(|p| view.to_uv(p));
+    corners.into_iter().fold([corners[0]; 2], |[lo, hi], uv| [lo.min(uv), hi.max(uv)])
 }
 
 /// A view's render size in pixels, rounded as egui rounds the rect it draws the frame into, so the frame is never stretched
@@ -2746,6 +2748,16 @@ mod tests {
     use texturecraft_engine::paint::{AlphaParams, BrushAlpha, BrushSettings};
 
     #[test]
+    fn quarter_turn_swaps_the_visible_uv_extents_of_a_wide_view() {
+        let bounds = |rotation| visible_uv_bounds([800, 400], (1024, 1024), 4.0, [0.0; 2], rotation);
+        let [a, b] = bounds(0.0);
+        let [c, d] = bounds(std::f32::consts::FRAC_PI_2);
+        let size = b - a;
+        assert!(size.x > size.y);
+        assert!((d - c).abs_diff_eq(Vec2::new(size.y, size.x), 1e-5));
+    }
+
+    #[test]
     fn split_view_uploads_the_second_views_brush_before_either_draw() {
         let ctx = egui::Context::default();
         let session = Session::new_project("split", texturecraft_engine::geom::primitives::plane(1.0, 1), "builtin:plane", None, 1024).unwrap();
@@ -2767,7 +2779,7 @@ mod tests {
             let rect = Rect::from_min_size(Pos2::ZERO, vec2(256.0, 256.0));
             add_callback(&mut app, ui, rect, frame.clone(), &mut sync);
             app.session.begin_stroke_uv(Vec2::splat(0.96875), 1.0).unwrap();
-            let uv_frame = Frame { view_id: VIEW_2D, kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0; 2] }, ..frame.clone() };
+            let uv_frame = Frame { view_id: VIEW_2D, kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0; 2], rotation: 0.0 }, ..frame.clone() };
             add_callback(&mut app, ui, rect.translate(vec2(256.0, 0.0)), uv_frame, &mut sync);
             sync.finish(&mut app, ui, None);
             assert!(!app.session.caches[0].upload.contains(&(15, 15)), "second view's dab must be in this frame");
