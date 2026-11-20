@@ -21,7 +21,7 @@ fn limits() -> craft_mesh::Limits {
         max_materials: super::MAX_VERTICES,
         max_nodes: 1_000_000,
         max_depth: 64,
-        max_data_bytes: 1 << 31,
+        max_data_bytes: super::MAX_MESH_FILE_BYTES as usize,
         max_extras: 100_000,
     }
 }
@@ -53,7 +53,7 @@ fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
     while let Some((id, parent, depth)) = stack.pop() {
         visits += 1;
         if visits > lim.max_nodes || depth > lim.max_depth {
-            return Err(malformed(KIND, "objects are nested too deeply or shared too often"));
+            return Err(FormatError::TooLarge("Alembic objects are nested too deeply or shared too often".into()));
         }
         let node = scene.nodes.get(id).ok_or_else(|| malformed(KIND, "node index out of range"))?;
         let world = parent * to_mat(node.transform);

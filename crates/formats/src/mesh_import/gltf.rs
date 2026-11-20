@@ -23,8 +23,12 @@ fn limits() -> craft_mesh::Limits {
     craft_mesh::Limits {
         max_vertices: super::MAX_VERTICES,
         max_triangles: texturecraft_geom::MAX_TRIANGLES,
+        max_meshes: super::MAX_VERTICES,
+        max_parts: super::MAX_VERTICES,
+        max_materials: super::MAX_VERTICES,
         max_depth: MAX_DEPTH,
         max_nodes: MAX_NODE_VISITS,
+        max_data_bytes: super::MAX_MESH_FILE_BYTES as usize,
         ..craft_mesh::Limits::default()
     }
 }
