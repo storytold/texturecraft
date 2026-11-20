@@ -7,6 +7,7 @@ struct Operation {
     uv: vec4<f32>,
     balance: vec4<f32>,
     effects: vec4<u32>,
+    procedural: vec4<u32>,
 }
 
 struct Params {
@@ -41,6 +42,12 @@ struct Surface {
     normal: vec3<f32>,
 }
 
+fn edge(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
+    let ab = b - a;
+    let ap = p - a;
+    return ab.x * ap.y - ab.y * ap.x;
+}
+
 fn surface_at(pixel: vec2<u32>) -> Surface {
     if (params.coverage.w & 1u) == 0u || any(pixel >= params.source.xy) {
         return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0));
@@ -49,11 +56,22 @@ fn surface_at(pixel: vec2<u32>) -> Surface {
     if hit.x == 0xffffffffu {
         return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0));
     }
-    let weight = unpack2x16unorm(hit.y);
-    let w = max(0.0, 1.0 - weight.x - weight.y);
     let a = surface_vertices[hit.x * 3u];
     let b = surface_vertices[hit.x * 3u + 1u];
     let c = surface_vertices[hit.x * 3u + 2u];
+    // Reconstruct the working position from the original UVs. Packed barycentrics can
+    // cross a hard procedural cell boundary at high frequencies.
+    let size = vec2<f32>(params.source.xy);
+    let uv_a = vec2(a.position.w, a.normal.w) * size;
+    let uv_b = vec2(b.position.w, b.normal.w) * size;
+    let uv_c = vec2(c.position.w, c.normal.w) * size;
+    let center = vec2<f32>(pixel) + 0.5;
+    let area = edge(uv_a, uv_b, uv_c);
+    var weight = unpack2x16unorm(hit.y);
+    if abs(area) >= 1e-12 {
+        weight = vec2(edge(uv_c, uv_a, center), edge(uv_a, uv_b, center)) * (1.0 / area);
+    }
+    let w = 1.0 - weight.x - weight.y;
     let position = a.position.xyz * w + b.position.xyz * weight.x + c.position.xyz * weight.y;
     let normal = a.normal.xyz * w + b.normal.xyz * weight.x + c.normal.xyz * weight.y;
     return Surface(position, select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12));
@@ -228,29 +246,83 @@ fn pattern(kind: u32, p: vec3<f32>, seed: u32) -> f32 {
     }
 }
 
+fn raw_procedural(layer: Operation, p: vec3<f32>) -> f32 {
+    return pattern(layer.ids.y, p, layer.ids.z);
+}
+
+fn sample_procedural(layer: Operation, p: vec3<f32>) -> f32 {
+    if layer.procedural.x == 0u {
+        return raw_procedural(layer, p);
+    }
+    let cells = f32(layer.procedural.x) / layer.uv.z;
+    let grid = p.xy * cells - 0.5;
+    let base = floor(grid) + 0.5;
+    let t = fract(grid);
+    let a = raw_procedural(layer, vec3(base / cells, p.z));
+    let b = raw_procedural(layer, vec3((base + vec2(1.0, 0.0)) / cells, p.z));
+    let c = raw_procedural(layer, vec3((base + vec2(0.0, 1.0)) / cells, p.z));
+    let d = raw_procedural(layer, vec3((base + vec2(1.0)) / cells, p.z));
+    return mix(mix(a, b, t.x), mix(c, d, t.x), t.y);
+}
+
+fn paint_ramp_color(word: u32) -> vec3<f32> {
+    return bitcast<vec3<f32>>(vec3(srgb[word], srgb[word + 1u], srgb[word + 2u]));
+}
+
+fn azimuth(y: f32, x: f32) -> f32 {
+    if x == 0.0 && y == 0.0 { return 0.5; }
+    return atan2(y, x) / 6.283185307 + 0.5;
+}
+
 fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
     if layer.ids.y == 0u {
         return layer.low.rgb;
     }
-    let rotation = layer.projection.xy;
-    let rotated = vec2(uv.x * rotation.x - uv.y * rotation.y, uv.x * rotation.y + uv.y * rotation.x);
-    let projected = (rotated * layer.projection.zw + layer.uv.xy) * layer.uv.z;
+    let mode = layer.procedural.w;
+    let p = surface.position * layer.projection.w + layer.projection.xyz;
     var n = 0.0;
-    if layer.balance.w > 0.0 {
-        let p = surface.position * layer.projection.w + layer.projection.xyz;
+    if mode == 1u {
         let weighted = pow(abs(surface.normal), vec3(layer.balance.w));
         let weights = weighted / max(weighted.x + weighted.y + weighted.z, 1e-6);
         let minimum = 1.0 / (131072.0 * max(layer.uv.w, 1.0));
         let retained = select(vec3(0.0), weights, weights >= vec3(minimum));
         let w = select(retained, weights, all(retained == vec3(0.0)));
-        if w.x > 0.0 { n += w.x * pattern(layer.ids.y, vec3(p.zy, 0.0), layer.ids.z); }
-        if w.y > 0.0 { n += w.y * pattern(layer.ids.y, vec3(p.xz, 0.0), layer.ids.z); }
-        if w.z > 0.0 { n += w.z * pattern(layer.ids.y, vec3(p.xy, 0.0), layer.ids.z); }
+        if w.x > 0.0 { n += w.x * sample_procedural(layer, vec3(p.zy, 0.0)); }
+        if w.y > 0.0 { n += w.y * sample_procedural(layer, vec3(p.xz, 0.0)); }
+        if w.z > 0.0 { n += w.z * sample_procedural(layer, vec3(p.xy, 0.0)); }
     } else {
-        n = pattern(layer.ids.y, vec3(projected, 0.0), layer.ids.z);
+        var q = vec2(0.0);
+        switch mode {
+            case 2u: { q = p.zy; }
+            case 3u: { q = p.xz; }
+            case 4u: { q = p.xy; }
+            case 5u: {
+                var d = vec3(0.0, 1.0, 0.0);
+                if dot(surface.position, surface.position) > 0.0 { d = normalize(surface.position); }
+                q = vec2(azimuth(d.z, d.x) * 4.0, acos(clamp(d.y, -1.0, 1.0)) * (2.0 / 3.141592654)) * layer.projection.w;
+            }
+            case 6u, 7u, 8u: {
+                let pos = surface.position;
+                let axis = select(select(pos.xyz, pos.yxz, mode == 6u), pos.xzy, mode == 8u);
+                q = vec2(azimuth(axis.z, axis.x) * 4.0, axis.y) * layer.projection.w;
+            }
+            default: {
+                let rotation = layer.projection.xy;
+                let rotated = vec2(uv.x * rotation.x - uv.y * rotation.y, uv.x * rotation.y + uv.y * rotation.x);
+                q = (rotated * layer.projection.zw + layer.uv.xy) * layer.uv.z;
+            }
+        }
+        n = sample_procedural(layer, vec3(q, 0.0));
     }
     let shaped = clamp((n - 0.5) * layer.uv.w + 0.5 + layer.balance.x, 0.0, 1.0);
     let t = select(shaped, 1.0 - shaped, layer.ids.w != 0u);
+    if layer.procedural.z > 0u {
+        let last = layer.procedural.z - 1u;
+        let pos = t * f32(last);
+        let index = min(u32(pos), last);
+        let offset = layer.procedural.y;
+        return mix(paint_ramp_color(offset + index * 3u), paint_ramp_color(offset + min(index + 1u, last) * 3u), pos - f32(index));
+    }
     return layer.low.rgb + (layer.high.rgb - layer.low.rgb) * t;
 }
 

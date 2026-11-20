@@ -5,10 +5,11 @@ use std::sync::{Arc, Weak};
 
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
+use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, MaskBackground, ProceduralKind, Project,
-    Projection, Source,
+    BakedMap, BlendMode, Channel, ChannelKind, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, MaskBackground, ProceduralKind,
+    Project, Projection, Source,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
@@ -19,6 +20,7 @@ use wgpu::util::DeviceExt;
 const MAX_LAYERS: usize = 128;
 const MAX_EFFECTS: usize = 256;
 const MAX_PAINT_WORDS: usize = (64 << 20) / size_of::<u32>();
+const LOOKUP_WORDS: u32 = 4096;
 const NO_PAINT_IMAGE: u32 = u32::MAX;
 // Extended procedural sources follow the filter and generator opcodes.
 const FIRST_GENERATOR: u32 = 40;
@@ -61,6 +63,13 @@ struct Operation {
     balance: [f32; 4],
     // Offsets and counts of the mask and content effects.
     effects: [u32; 4],
+    // Sampling resolution, color-ramp offset and count, projection selector.
+    procedural: [u32; 4],
+}
+
+struct ProceduralInputs {
+    resolution: u32,
+    ramp_words: Vec<u32>,
 }
 
 /// Inclusive origin and exclusive end of a material update, in document texels.
@@ -108,6 +117,7 @@ pub struct CompositeProgram {
     operations: Vec<Operation>,
     layer_count: u32,
     paint: Vec<TileImage>,
+    ramp_words: Vec<u32>,
     brush_alpha: Option<wgpu::TextureView>,
     pub(crate) region: Option<CompositeRegion>,
     coverage: Option<(Arc<UvGBuffer>, u32)>,
@@ -180,6 +190,7 @@ impl CompositeProgram {
         let mut operations = Vec::new();
         let mut paint = Vec::new();
         let mut effects = Vec::new();
+        let mut procedural = ProceduralInputs { resolution: set.resolution, ramp_words: Vec::new() };
         let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (id, 0)).collect();
         while let Some((id, depth)) = layers.pop() {
             let layer = project.layers.get(&id).ok_or("A layer is missing from the material.")?;
@@ -209,9 +220,8 @@ impl CompositeProgram {
             if let Some(mask) = mask {
                 for effect in mask.effects.iter().filter(|e| e.visible) {
                     let mut op = match &effect.kind {
-                        EffectKind::Fill { source, projection } => {
-                            source_operation(Some(source), projection, [0.0; 3]).ok_or("A mask fill source or projection uses CPU compositing.")?
-                        }
+                        EffectKind::Fill { source, projection } => source_operation(Some(source), projection, [0.0; 3], ChannelKind::Scalar, &mut procedural)
+                            .ok_or("A mask fill source or projection uses CPU compositing.")?,
                         EffectKind::Paint | EffectKind::Path(_) => {
                             let Some(image) = pixels.masks.get(&effect.id).filter(|im| im.allocated_count() > 0) else { continue };
                             if (image.width(), image.height()) != set.size() || image.comps() != 2 {
@@ -307,7 +317,8 @@ impl CompositeProgram {
                     });
                     Operation { ids: [slot, 10, image_index, (channel.components() + 1) as u32], ..Operation::zeroed() }
                 } else {
-                    fill.and_then(|fill| source_operation(source, &fill.projection, default)).ok_or("A fill source or projection uses CPU compositing.")?
+                    fill.and_then(|fill| source_operation(source, &fill.projection, default, channel.kind(), &mut procedural))
+                        .ok_or("A fill source or projection uses CPU compositing.")?
                 };
                 if let Some(([r, g, b], opacity)) = brush_value {
                     op.projection[3] = 1.0;
@@ -333,11 +344,12 @@ impl CompositeProgram {
         let writes_normal = changes_channel(7, Normal.default_value());
         let layer_count = operations.len() as u32;
         operations.extend(effects);
-        let needs_surface = operations.iter().any(|op| op.balance[3] > 0.0 || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]));
+        let needs_surface = operations.iter().any(|op| op.procedural[3] != 0 || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]));
         Ok(Self {
             operations,
             layer_count,
             paint,
+            ramp_words: procedural.ramp_words,
             brush_alpha: brush.map(|brush| brush.alpha),
             region,
             coverage: None,
@@ -387,15 +399,21 @@ fn blend_code(mode: BlendMode) -> u32 {
     }
 }
 
-fn source_operation(source: Option<&Source>, projection: &Projection, default: [f32; 3]) -> Option<Operation> {
+fn source_operation(
+    source: Option<&Source>,
+    projection: &Projection,
+    default: [f32; 3],
+    channel: ChannelKind,
+    inputs: &mut ProceduralInputs,
+) -> Option<Operation> {
+    if matches!(projection, Projection::Decal(_)) {
+        return None;
+    }
     let mut op = Operation::zeroed();
     match source {
         None => op.low[..3].copy_from_slice(&default),
         Some(Source::Uniform(value)) => op.low[..3].copy_from_slice(value),
         Some(Source::Procedural { pattern, low, high, ramp }) => {
-            if pattern.resolution.can_reduce() || !ramp.is_empty() {
-                return None;
-            }
             let kind = match pattern.kind {
                 ProceduralKind::Clouds => 1,
                 ProceduralKind::Perlin => 2,
@@ -428,6 +446,15 @@ fn source_operation(source: Option<&Source>, projection: &Projection, default: [
             op.uv[2] = pattern.scale.max(1e-4);
             op.uv[3] = pattern.contrast.max(0.0);
             op.balance[0] = pattern.balance;
+            op.procedural[0] = pattern_pixels(pattern, inputs.resolution, inputs.resolution).unwrap_or(0);
+            if channel == ChannelKind::Color && !ramp.is_empty() {
+                if ramp.iter().flatten().any(|value| !value.is_finite()) {
+                    return None;
+                }
+                op.procedural[1] = LOOKUP_WORDS.checked_add(u32::try_from(inputs.ramp_words.len()).ok()?)?;
+                op.procedural[2] = u32::try_from(ramp.len()).ok()?;
+                inputs.ramp_words.extend(ramp.iter().flatten().map(|value| value.to_bits()));
+            }
             match projection {
                 Projection::Uv { scale, rotation, offset } => {
                     let (sin, cos) = rotation.to_radians().sin_cos();
@@ -437,15 +464,33 @@ fn source_operation(source: Option<&Source>, projection: &Projection, default: [
                         return None;
                     }
                 }
-                Projection::Triplanar { scale, sharpness, offset } => {
+                Projection::Triplanar { scale, offset, .. } | Projection::Planar { scale, offset, .. } => {
                     let frequency = *scale * op.uv[2];
                     if offset.iter().any(|o| frequency.abs() + o.abs() > 32_768.0) {
                         return None;
                     }
                     op.projection = [offset[0], offset[1], offset[2], frequency];
-                    op.balance[3] = sharpness.max(1.0);
+                    if let Projection::Planar { axis, .. } = projection {
+                        op.procedural[3] = 2 + u32::from((*axis).min(2));
+                    } else if let Projection::Triplanar { sharpness, .. } = projection {
+                        op.procedural[3] = 1;
+                        op.balance[3] = sharpness.max(1.0);
+                    }
                 }
-                _ => return None,
+                Projection::Spherical { scale } | Projection::Cylindrical { scale, .. } => {
+                    let frequency = *scale * op.uv[2];
+                    if frequency.abs() * 4.0 > 32_768.0 {
+                        return None;
+                    }
+                    op.projection[3] = frequency;
+                    op.procedural[3] = match projection {
+                        Projection::Cylindrical { axis: 0, .. } => 6,
+                        Projection::Cylindrical { axis: 2, .. } => 8,
+                        Projection::Cylindrical { .. } => 7,
+                        _ => 5,
+                    };
+                }
+                Projection::Decal(_) => return None,
             }
         }
         _ => return None,
@@ -665,7 +710,8 @@ impl GpuCompositor {
                 let index = index as usize;
                 let pos = (mesh.positions.get(index).copied().unwrap_or_default() - center) / radius;
                 let normal = mesh.normals.get(index).copied().unwrap_or(Vec3::Y);
-                [pos.extend(0.0).to_array(), normal.extend(0.0).to_array()]
+                let uv = mesh.uvs.get(index).copied().unwrap_or_default();
+                [pos.extend(uv.x).to_array(), normal.extend(uv.y).to_array()]
             })
             .collect();
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -829,6 +875,21 @@ impl GpuCompositor {
         });
         let layout = self.pipeline.get_bind_group_layout(0);
         let limits = device.limits();
+        let lookup_upload = if program.ramp_words.is_empty() {
+            None
+        } else {
+            let size = (LOOKUP_WORDS as u64 + program.ramp_words.len() as u64) * 4;
+            if size > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
+                return Err("Procedural ramp data exceeds the adapter's storage-buffer limit".into());
+            }
+            let words: Vec<_> = texturecraft_texel::srgb_lut().iter().copied().map(u32::from).chain(program.ramp_words.iter().copied()).collect();
+            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tc_composite_color_parameters"),
+                contents: bytemuck::cast_slice(&words),
+                usage: wgpu::BufferUsages::STORAGE,
+            }))
+        };
+        let lookup = lookup_upload.as_ref().unwrap_or(&self.lookup);
         let max_words = MAX_PAINT_WORDS.min((limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / 4) as usize);
         let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
         let windows = paint_windows(program, region, source_size, shift, radius, max_words)?;
@@ -893,7 +954,7 @@ impl GpuCompositor {
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: self.lookup.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: lookup.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
@@ -972,13 +1033,14 @@ fn paint_windows(
 mod procedural_tests {
     use super::*;
     use crate::{headless::Headless, readback::Readback};
-    use texturecraft_compose::pattern::{Coords, procedural};
-    use texturecraft_core::{Fill, Layer, Mask, Procedural, TextureSet};
+    use texturecraft_compose::PatternContext;
+    use texturecraft_compose::pattern::{Coords, procedural_in};
+    use texturecraft_core::{Fill, Layer, Mask, OutputResolution, Procedural, TextureSet};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{srgb_lut, to_u16};
 
     #[test]
-    fn material_patterns_match_cpu_as_uv_fills_and_triplanar_masks() {
+    fn material_patterns_match_cpu_as_fills_and_masks() {
         use ProceduralKind::*;
         const SIZE: u32 = 128;
         let mesh = Arc::new(primitives::plane(1.0, 1));
@@ -988,41 +1050,60 @@ mod procedural_tests {
         if let Some(gpu) = &mut gpu {
             gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
         }
-        for kind in [Checker, Stripes, Bricks, Tiles, Weave, Twill, Leather, Hammered, Brushed, Voronoi, Smudges] {
-            let pattern = Procedural { scale: 9.7, seed: 73, contrast: 1.1, balance: -0.03, invert: true, ..Procedural::new(kind) };
-            for in_mask in [false, true] {
-                let projection = if in_mask {
-                    Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43] }
-                } else {
-                    Projection::Uv { scale: [1.15, 0.76], rotation: 13.0, offset: [-0.51, 0.12] }
-                };
-                let source = Source::Procedural { pattern: pattern.clone(), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
-                let mut project = Project::new("Procedural material", "builtin:plane");
-                project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
-                let fill = Fill {
-                    sources: BTreeMap::from([(Channel::BaseColor, if in_mask { Source::Uniform([0.9; 3]) } else { source.clone() })]),
-                    projection: projection.clone(),
-                    ..Fill::default()
-                };
-                let mut layer = Layer::new(project.alloc_id(), "Procedural fill", LayerKind::Fill(fill), &[Channel::BaseColor]);
-                if in_mask {
-                    let mut mask = Mask::new(MaskBackground::Black);
-                    mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone() }));
-                    layer.mask = Some(mask);
-                }
-                project.insert_layer(0, layer, None, false).unwrap();
-                let mut program = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap();
-                if let Some(gpu) = &mut gpu {
-                    program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
-                    gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
-                    let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][0]).unwrap();
-                    for index in (0..rgba.len() / 4).step_by(37) {
-                        let surface = gbuf.surface(&mesh, index).unwrap();
-                        let coords = Coords { uv: surface.uv, pos: (surface.pos - (lo + hi) * 0.5) / ((hi - lo).length() * 0.5), nrm: surface.nrm };
-                        let value = procedural(&pattern, &projection, &coords);
-                        let linear = if in_mask { 0.5 + (0.9 - 0.5) * value } else { value };
-                        let expected = srgb_lut()[usize::from(to_u16(linear) >> 4)];
-                        assert!(rgba[index * 4].abs_diff(expected) <= 3, "{kind:?}, mask={in_mask}, texel {index}");
+        let uv = Projection::Uv { scale: [1.15, 0.76], rotation: 13.0, offset: [-0.51, 0.12] };
+        let triplanar = Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43] };
+        let cases = ProceduralKind::ALL
+            .iter()
+            .copied()
+            .map(|kind| Procedural { scale: 9.7, seed: 73, contrast: 1.1, balance: -0.03, invert: true, ..Procedural::new(kind) })
+            .flat_map(|pattern| [(pattern.clone(), uv.clone(), false, Vec::new()), (pattern, triplanar.clone(), true, Vec::new())]);
+        let ramp = vec![[0.01, 0.42, 0.13], [0.73, 0.05, 0.38], [0.4, 0.71, 0.85]];
+        let reduced_pattern =
+            Procedural { scale: 3.2, seed: 11, resolution: OutputResolution { factor: -2, ..OutputResolution::default() }, ..Procedural::new(Clouds) };
+        let reduced = [
+            uv.clone(),
+            triplanar.clone(),
+            Projection::Planar { scale: 0.8, axis: 1, offset: [0.03, 0.0, 0.34] },
+            Projection::Spherical { scale: 0.9 },
+            Projection::Cylindrical { scale: 0.7, axis: 2 },
+        ]
+        .into_iter()
+        .flat_map(|projection| [(reduced_pattern.clone(), projection.clone(), false, ramp.clone()), (reduced_pattern.clone(), projection, true, ramp.clone())]);
+        for (pattern, projection, in_mask, ramp) in cases.chain(reduced) {
+            let kind = pattern.kind;
+            let context = PatternContext { pixels: pattern_pixels(&pattern, SIZE, SIZE), images: None };
+            let source = Source::Procedural { pattern: pattern.clone(), low: [0.0; 3], high: [1.0; 3], ramp: ramp.clone() };
+            let mut project = Project::new("Procedural material", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+            let fill = Fill {
+                sources: BTreeMap::from([(Channel::BaseColor, if in_mask { Source::Uniform([0.9; 3]) } else { source.clone() })]),
+                projection: projection.clone(),
+                ..Fill::default()
+            };
+            let mut layer = Layer::new(project.alloc_id(), "Procedural fill", LayerKind::Fill(fill), &[Channel::BaseColor]);
+            if in_mask {
+                let mut mask = Mask::new(MaskBackground::Black);
+                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone() }));
+                layer.mask = Some(mask);
+            }
+            project.insert_layer(0, layer, None, false).unwrap();
+            let mut program = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap();
+            if let Some(gpu) = &mut gpu {
+                program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+                gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+                let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][0]).unwrap();
+                for index in (0..rgba.len() / 4).step_by(37) {
+                    let surface = gbuf.surface(&mesh, index).unwrap();
+                    let coords = Coords { uv: surface.uv, pos: (surface.pos - (lo + hi) * 0.5) / ((hi - lo).length() * 0.5), nrm: surface.nrm };
+                    let value = procedural_in(&pattern, &projection, &coords, &context);
+                    let linear = if in_mask { [0.5 + (0.9 - 0.5) * value; 3] } else { texturecraft_core::gradient(&ramp, value).unwrap_or([value; 3]) };
+                    let expected = linear.map(|linear| srgb_lut()[usize::from(to_u16(linear) >> 4)]);
+                    for (channel, expected) in expected.into_iter().enumerate() {
+                        let actual = rgba[index * 4 + channel];
+                        assert!(
+                            actual.abs_diff(expected) <= 3,
+                            "{kind:?}, {projection:?}, mask={in_mask}, texel {index}, channel {channel}, expected {expected} got {actual}"
+                        );
                     }
                 }
             }
@@ -1047,6 +1128,7 @@ mod paint_window_tests {
             operations: Vec::new(),
             layer_count: 0,
             paint: vec![paint],
+            ramp_words: Vec::new(),
             brush_alpha: None,
             region: None,
             coverage: None,
