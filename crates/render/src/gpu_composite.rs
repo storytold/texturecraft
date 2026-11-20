@@ -18,8 +18,6 @@ use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePattern
 use crate::paint_window::TileWindow;
 use wgpu::util::DeviceExt;
 
-const MAX_LAYERS: usize = 128;
-const MAX_EFFECTS: usize = 256;
 const MAX_PAINT_WORDS: usize = (64 << 20) / size_of::<u32>();
 const LOOKUP_WORDS: u32 = 4096;
 const NO_PAINT_IMAGE: u32 = u32::MAX;
@@ -233,6 +231,7 @@ impl CompositeProgram {
         let mut tile_patterns = TilePatterns::default();
         let mut effects = Vec::new();
         let mut procedural = ProceduralInputs { resolution: set.resolution, ramp_words: Vec::new() };
+        let mut non_default = [false; Channel::ALL.len()];
         let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (id, 0)).collect();
         while let Some((id, depth)) = layers.pop() {
             let layer = project.layers.get(&id).ok_or("A layer is missing from the material.")?;
@@ -296,9 +295,6 @@ impl CompositeProgram {
                 effects.push(point_effect(effect).ok_or("A layer effect uses CPU compositing.")?);
             }
             let content_count = effects.len() as u32 - content_start;
-            if effects.len() > MAX_EFFECTS {
-                return Err("The number of effects exceeds the GPU compositor limit.");
-            }
             let fill = match &layer.kind {
                 LayerKind::Fill(fill) => Some(fill),
                 LayerKind::Paint => None,
@@ -336,6 +332,19 @@ impl CompositeProgram {
                 let default = channel.default_value();
                 let source = fill.and_then(|fill| fill.sources.get(&channel));
                 let slot = channel_slot(channel);
+                // Adding a channel to the set also adds it to the earlier layers. Skip
+                // their neutral values until the accumulator can contain something else.
+                // After a real contribution, neutral fills can still reset the channel.
+                if !non_default[slot as usize]
+                    && painted.is_none()
+                    && brush_value.is_none()
+                    && content_count == 0
+                    && matches!(blend.mode, BlendMode::Normal | BlendMode::Passthrough | BlendMode::Replace)
+                    && source.is_none_or(|source| matches!(source, Source::Uniform(value) if *value == default))
+                {
+                    continue;
+                }
+                non_default[slot as usize] = true;
                 let mut op = if fill.is_none() {
                     let image_index = painted.map_or(NO_PAINT_IMAGE, |image| {
                         let image_index = paint.len() as u32;
@@ -357,9 +366,6 @@ impl CompositeProgram {
                 op.balance[1] = mask_background;
                 op.balance[2] = blend_code(blend.mode) as f32;
                 op.effects = [mask_start, mask_count, content_start, content_count];
-                if operations.len() == MAX_LAYERS {
-                    return Err("The number of layer channels exceeds the GPU compositor limit.");
-                }
                 operations.push(op);
             }
         }
@@ -989,13 +995,16 @@ impl GpuCompositor {
         };
         let tile_images = tile_images.as_ref().unwrap_or(&self.default_tile_images);
         let empty_operation = Operation::zeroed();
+        let limits = device.limits();
+        if (operations.len() * size_of::<Operation>()) as u64 > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
+            return Err("The layer program exceeds the adapter's storage-buffer limit".into());
+        }
         let ops = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tc_composite_operations"),
             contents: if operations.is_empty() { bytemuck::bytes_of(&empty_operation) } else { bytemuck::cast_slice(operations.as_ref()) },
             usage: wgpu::BufferUsages::STORAGE,
         });
         let layout = self.pipeline.get_bind_group_layout(0);
-        let limits = device.limits();
         let max_words = MAX_PAINT_WORDS.min((limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / 4) as usize);
         let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
         let windows = paint_windows(program, region, source_size, shift, radius, max_words)?;

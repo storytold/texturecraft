@@ -1503,6 +1503,12 @@ pub(crate) mod tests {
         let mut rejected = Vec::new();
         for material in texturecraft_engine::materials::MATERIALS {
             let mut session = Session::new_project("Material shelf", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+            if material.id == "moss" {
+                // Adding sheen must keep an existing stack on the GPU.
+                for _ in 0..32 {
+                    execute(&mut session, "layer.add.fill", &json!({"color": [0.12, 0.19, 0.06]})).unwrap();
+                }
+            }
             execute(&mut session, "material.apply", &json!({"material": material.id})).unwrap();
             let mut link = link();
             link.gpu_composite_enabled = true;
