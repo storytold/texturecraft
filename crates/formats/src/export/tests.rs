@@ -1,3 +1,5 @@
+use std::io::Cursor;
+
 use image::{DynamicImage, GenericImageView, ImageFormat};
 use texturecraft_core::{ChannelFormat, Project, TextureSet};
 use texturecraft_texel::{to_u16, to_u16_signed};
