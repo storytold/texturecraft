@@ -10,6 +10,7 @@
 
 pub mod bake;
 pub mod bake_preview;
+pub mod brush_device;
 pub mod brush_preset_cmds;
 pub mod camera_cmds;
 pub mod color_selection_cmds;

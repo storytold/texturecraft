@@ -32,6 +32,9 @@ struct SurfaceVertex {
 }
 @group(0) @binding(7) var<storage, read> surface_vertices: array<SurfaceVertex>;
 @group(0) @binding(8) var bake_maps: texture_2d_array<f32>;
+@group(0) @binding(9) var brush_alpha: texture_2d<u32>;
+
+const NO_PAINT_IMAGE = 0xffffffffu;
 
 struct Surface {
     position: vec3<f32>,
@@ -232,19 +235,24 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
     return layer.low.rgb + (layer.high.rgb - layer.low.rgb) * t;
 }
 
-fn painted(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
+fn stored_paint(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
+    // An empty signed texel stores zero as 32768.
+    let empty = vec4(vec3(select(0.0, 1.0 / 65535.0, layer.ids.x == 6u)), 0.0);
+    if layer.ids.z == NO_PAINT_IMAGE {
+        return empty;
+    }
     let atlas_tile = pixel / 64u;
     if any(atlas_tile < params.paint_window.xy) {
-        return vec4(0.0);
+        return empty;
     }
     let tile = atlas_tile - params.paint_window.xy;
     if any(tile >= params.paint_window.zw) {
-        return vec4(0.0);
+        return empty;
     }
     let local = pixel % 64u;
     let offset = paint[paint[layer.ids.z] + tile.y * params.paint_window.z + tile.x];
     if offset == 0u {
-        return vec4(0.0);
+        return empty;
     }
     let rgba = layer.ids.w == 4u;
     let texel = offset + (local.y * 64u + local.x) * (layer.ids.w / 2u);
@@ -257,13 +265,33 @@ fn painted(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
         rgb.z = f32(second & 65535u) / 65535.0;
         coverage = f32(second >> 16u) / 65535.0;
     }
-    if coverage == 0.0 {
-        return vec4(0.0);
-    }
     if layer.ids.x == 6u {
         rgb = rgb * 2.0 - 1.0;
     }
-    return vec4(rgb / coverage, coverage);
+    return vec4(rgb, coverage);
+}
+
+fn painted(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
+    var stored = stored_paint(layer, pixel);
+    if layer.projection.w == 1.0 {
+        let m = f32(textureLoad(brush_alpha, vec2<i32>(pixel), 0).x) / 65535.0 * layer.uv.w;
+        if m > 0.0 {
+            // Match the paint commit's premultiplied over and 16-bit channel encoding.
+            let pigment = select(layer.uv.xxx, layer.uv.xyz, layer.ids.w == 4u);
+            let remaining = 1.0 - m;
+            let premul = pigment * m + stored.rgb * remaining;
+            let signed = layer.ids.x == 6u;
+            let encode = select(premul, premul * 0.5 + 0.5, signed);
+            let quantized = floor(clamp(encode, vec3(0.0), vec3(1.0)) * 65535.0 + 0.5) / 65535.0;
+            let rgb = select(quantized, quantized * 2.0 - 1.0, signed);
+            let coverage = f32(to_u16(m + stored.a * remaining)) / 65535.0;
+            stored = vec4(rgb, coverage);
+        }
+    }
+    if stored.a == 0.0 {
+        return vec4(0.0);
+    }
+    return vec4(stored.rgb / stored.a, stored.a);
 }
 
 fn shift_unit(x: f32, amount: f32) -> f32 {

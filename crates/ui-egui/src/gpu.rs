@@ -11,8 +11,19 @@ use texturecraft_engine::Session;
 use texturecraft_engine::compose::{DisplayKind, ImageRes, display_tile_bytes, kinds_for};
 use texturecraft_engine::core::{BakedMap, Channel};
 use texturecraft_engine::geom::{Mesh, glam::Vec2};
+#[cfg(not(target_arch = "wasm32"))]
+use texturecraft_engine::{
+    brush_device,
+    paint::{Stamp, UvStamp},
+    texel::TileImage,
+};
 use texturecraft_render::gpu_composite::{CompositeProgram, CompositeRegion};
 use texturecraft_render::{BakeVisualization, CageGeometry, Frame, Renderer, wgpu};
+#[cfg(not(target_arch = "wasm32"))]
+use texturecraft_render::{
+    gpu_brush::{BrushInput, GpuBrushStroke},
+    gpu_composite::LiveBrush,
+};
 
 use crate::bake_scene::{BakeSceneLink, CageUpload};
 use crate::i18n::n_;
@@ -114,6 +125,54 @@ pub struct GpuState {
     pub ctx: egui::Context,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+struct BrushDevice(egui_wgpu::RenderState);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl brush_device::BrushDevice for BrushDevice {
+    fn start(&self, surface: brush_device::BrushSurface) -> Result<Box<dyn brush_device::DeviceStroke>, String> {
+        let mut renderer = self.0.renderer.write();
+        let gpu = renderer.callback_resources.get_mut::<GpuState>().ok_or("GPU renderer unavailable")?;
+        DeviceStroke::start(&mut gpu.renderer, &self.0.device, &self.0.queue, surface)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct DeviceStroke(GpuBrushStroke);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DeviceStroke {
+    fn start(
+        renderer: &mut Renderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface: brush_device::BrushSurface,
+    ) -> Result<Box<dyn brush_device::DeviceStroke>, String> {
+        let brush_device::BrushSurface { mesh, bvh, uv, material, depth, settings } = surface;
+        let stroke = renderer.start_gpu_brush(device, queue, BrushInput { mesh, bvh, uv, material, depth, settings })?;
+        Ok(Box::new(Self(stroke)))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl brush_device::DeviceStroke for DeviceStroke {
+    fn append_world(&mut self, stamps: &[Stamp]) -> Result<brush_device::BrushTiles, String> {
+        self.0.append_world(stamps)
+    }
+
+    fn append_uv(&mut self, stamps: &[UvStamp]) -> Result<brush_device::BrushTiles, String> {
+        self.0.append_uv(stamps)
+    }
+
+    fn read_alpha(&self, tiles: &brush_device::BrushTiles) -> Result<TileImage, String> {
+        self.0.read_alpha(tiles)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        &self.0
+    }
+}
+
 /// Problems the GPU side hands to the UI, which shows them as toasts.
 #[derive(Default)]
 pub struct GpuReports {
@@ -195,7 +254,19 @@ impl SetCompositor {
         }
         let preview = session.display_stroke_pixels(ts, region.map(|r| r.expanded(texturecraft_engine::texel::TILE).bounds()));
         let pixels = preview.as_ref().unwrap_or(&session.doc.pixels);
-        let mut program = match CompositeProgram::try_compile_region(&session.doc.project, pixels, ts, region) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let program = {
+            let brush = if let Some(brush) = session.device_stroke().filter(|brush| brush.ts == ts) {
+                let coverage = brush.stroke.as_any().downcast_ref::<GpuBrushStroke>().ok_or(n_("This painting tool uses CPU compositing."))?;
+                Some(LiveBrush { layer: brush.layer, values: brush.values.clone(), opacity: brush.opacity, alpha: coverage.view() })
+            } else {
+                None
+            };
+            CompositeProgram::try_compile_with_brush(&session.doc.project, pixels, ts, region, brush)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let program = CompositeProgram::try_compile_region(&session.doc.project, pixels, ts, region);
+        let mut program = match program {
             Ok(program) => program,
             Err(reason) => {
                 if stroke_id.is_none() {
@@ -252,6 +323,8 @@ pub struct GpuLink {
     pending_overviews: BTreeSet<usize>,
     active_overviews: BTreeSet<usize>,
     gpu_composite_enabled: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    brush_device: Option<Arc<dyn brush_device::BrushDevice>>,
     pub(crate) prefer_gpu_layers: bool,
     pub(crate) material_start_preview: bool,
     compositors: Vec<SetCompositor>,
@@ -317,6 +390,8 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
             && info.device_type != wgpu::DeviceType::Cpu
             && info.backend != wgpu::Backend::Gl
             && std::env::var("TEXTURECRAFT_GPU_COMPOSITE").as_deref() != Ok("0"),
+        #[cfg(not(target_arch = "wasm32"))]
+        brush_device: Some(Arc::new(BrushDevice(rs.clone()))),
         prefer_gpu_layers: true,
         material_start_preview: true,
         compositors: Vec::new(),
@@ -331,6 +406,18 @@ impl GpuLink {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn supports_gpu_resize(&self) -> bool {
         self.gpu_composite_enabled
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn brush_device(&self, session: &Session) -> Option<brush_device::BrushBackend> {
+        let ts = session.ts();
+        let state = self.compositors.get(ts)?;
+        let cache = session.caches.get(ts)?;
+        let key = CompositeKey { mesh: session.mesh_id, revision: cache.material_revision, size: cache.size, shift: self.shift };
+        if !self.gpu_composite_enabled || !state.uses_gpu() || state.current != Some(key) {
+            return None;
+        }
+        Some(brush_device::BrushBackend { device: self.brush_device.clone()?, surface: Arc::downgrade(&cache.gbuf) })
     }
 
     /// What the GPU side reported since the last call (see [`GpuReports`]).
@@ -405,6 +492,10 @@ impl GpuLink {
                     ""
                 }
                 Err(reason) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if session.stroke_texture_set() == Some(ts) {
+                        session.materialize_device_stroke(Some(reason));
+                    }
                     state.stroke = None;
                     if state.current.take().is_some() {
                         session.caches[ts].queue_ready_uploads();
@@ -927,6 +1018,8 @@ pub(crate) mod tests {
             pending_overviews: BTreeSet::new(),
             active_overviews: BTreeSet::new(),
             gpu_composite_enabled: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            brush_device: None,
             prefer_gpu_layers: true,
             material_start_preview: true,
             compositors: Vec::new(),
@@ -1607,6 +1700,76 @@ pub(crate) mod tests {
         assert!(link.display_pending(&s) || !cpu.tiles.is_empty());
         link.prefer_gpu_layers = true;
         assert!(!link.sync(&mut s, None, None, 0, 0.0).composites.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn gpu_brush_previews_empty_layer_and_survives_switch_to_cpu() {
+        use texturecraft_render::{headless::Headless, readback::Readback};
+
+        struct HeadlessBrush(Mutex<Headless>);
+        impl brush_device::BrushDevice for HeadlessBrush {
+            fn start(&self, surface: brush_device::BrushSurface) -> Result<Box<dyn brush_device::DeviceStroke>, String> {
+                let Headless { renderer, device, queue, .. } = &mut *self.0.lock().unwrap();
+                DeviceStroke::start(renderer, device, queue, surface)
+            }
+        }
+
+        let Ok(gpu) = Headless::new() else { return };
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let mut s = Session::new_project("GPU brush", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        let layer = s.selected_layer().unwrap();
+        execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [1.0, 0.0, 0.0]})).unwrap();
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+
+        let display_at_center = |scene: SceneSync| -> Vec<u8> {
+            let Headless { renderer, device, queue, .. } = &mut *brush.0.lock().unwrap();
+            let (_, errors) = scene.apply_display(renderer, device, queue);
+            assert!(errors.is_empty(), "{errors:?}");
+            let (w, h, rgba) = Readback::blocking(device, queue, renderer.display_textures()[0][0]).unwrap();
+            let center = ((h / 2 * w + w / 2) * 4) as usize;
+            rgba[center..center + 4].to_vec()
+        };
+        let neutral = display_at_center(link.sync(&mut s, None, None, 0, 0.0));
+
+        s.brush_device = link.brush_device(&s);
+        s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+        assert!(s.device_stroke().is_some());
+        assert!(s.display_stroke_pixels(0, None).is_none());
+        assert!(s.doc.pixels.layer(layer, Channel::BaseColor).is_none());
+        let frame = link.sync(&mut s, None, None, 0, 0.0);
+        assert!(!frame.composites.is_empty());
+        assert!(frame.tiles.is_empty());
+        let painted = display_at_center(frame);
+        assert_ne!(painted, neutral);
+
+        s.cancel_stroke();
+        assert_eq!(display_at_center(link.sync(&mut s, None, None, 0, 0.0)), neutral);
+        s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+        assert!(s.device_stroke().is_some());
+        link.prefer_gpu_layers = false;
+        let fallback = link.sync(&mut s, None, None, 0, 0.0);
+        assert!(fallback.composites.is_empty());
+        assert!(s.device_stroke().is_none());
+        let cpu_preview = s.display_stroke_pixels(0, None).unwrap();
+        let pixel = cpu_preview.layer(layer, Channel::BaseColor).unwrap().get(64, 64);
+        assert!(pixel[0] > 0 && pixel.last().copied().unwrap() > 0);
+        s.end_stroke().unwrap();
+        assert_eq!(s.doc.pixels.layer(layer, Channel::BaseColor).unwrap().get(64, 64), pixel);
+        link.prefer_gpu_layers = true;
+        assert_eq!(display_at_center(link.sync(&mut s, None, None, 0, 0.0)), painted);
+        s.undo().unwrap();
+        assert!(s.doc.pixels.layer(layer, Channel::BaseColor).is_none());
+        assert_eq!(display_at_center(link.sync(&mut s, None, None, 0, 0.0)), neutral);
+        s.brush_device = link.brush_device(&s);
+        s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+        assert!(s.device_stroke().is_some());
+        assert_eq!(display_at_center(link.sync(&mut s, None, None, 0, 0.0)), painted);
+        s.end_stroke().unwrap();
+        assert_eq!(s.doc.pixels.layer(layer, Channel::BaseColor).unwrap().get(64, 64), pixel);
+        assert_eq!(display_at_center(link.sync(&mut s, None, None, 0, 0.0)), painted);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

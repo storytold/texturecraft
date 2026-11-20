@@ -11,6 +11,7 @@ use texturecraft_paint::{
     rasterize,
 };
 
+use crate::brush_device::DeviceStrokePreview;
 use crate::session::{
     ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
 };
@@ -324,6 +325,60 @@ impl Session {
             let on_mask = matches!(target, Some(PaintTarget::Mask(_)));
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
+        let settings = &stroke.settings;
+        let device = if tool == Tool::Paint
+            && let Some(PaintTarget::Layer(layer)) = target
+            && canvas.pickup.is_none()
+            && canvas.limit.is_none()
+            && stencil.is_none()
+            && !settings.symmetry.any()
+            && settings.alpha_image.is_none()
+            && settings.alpha_library.is_none()
+            && matches!(settings.alpha, texturecraft_paint::BrushAlpha::Round | texturecraft_paint::BrushAlpha::Square)
+            && values.keys().all(|channel| {
+                matches!(
+                    channel,
+                    Channel::BaseColor
+                        | Channel::Opacity
+                        | Channel::AmbientOcclusion
+                        | Channel::Roughness
+                        | Channel::Metallic
+                        | Channel::SpecularLevel
+                        | Channel::Height
+                        | Channel::Normal
+                )
+            })
+            && let Some(backend) = &self.brush_device
+            && let Some(cache) = self.caches.get(ts)
+            && backend.surface.ptr_eq(&std::sync::Arc::downgrade(&cache.gbuf))
+            && self
+                .doc
+                .project
+                .sets_drawing(self.paint_owner(PaintTarget::Layer(layer)))
+                .into_iter()
+                .all(|other| other == ts || self.caches.get(other).is_none_or(|other| other.size != size))
+        {
+            let surface = crate::brush_device::BrushSurface {
+                mesh: self.mesh.clone(),
+                bvh: self.bvh.clone(),
+                uv: cache.gbuf.clone(),
+                material: self.doc.project.texture_set(ts)?.material,
+                depth: depth.clone(),
+                settings: settings.clone(),
+            };
+            match backend.device.start(surface) {
+                Ok(device) => Some(device),
+                Err(error) => {
+                    self.log.performance(format!("GPU brush could not start: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if device.is_some() {
+            self.log.performance("Brush: GPU (stroke coverage and live paint)");
+        }
         self.stroke = Some(ActiveStroke {
             display_id: next_mesh_id(),
             display_tiles: BTreeSet::new(),
@@ -341,6 +396,8 @@ impl Session {
             before,
             label,
             staging: Staging::default(),
+            device,
+            device_uv_stamps: Vec::new(),
         });
         Ok(())
     }
@@ -487,7 +544,25 @@ impl Session {
                     }
                 }
             }
-            texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, &batch);
+            if let Some(device) = &mut active.device {
+                active.device_uv_stamps.extend(&batch);
+                match device.append_uv(&batch) {
+                    Ok(tiles) => {
+                        active.display_tiles.extend(&tiles);
+                        active.canvas.dirty.extend(tiles);
+                    }
+                    Err(error) => {
+                        active.device = None;
+                        active.display_tiles.append(&mut active.canvas.dirty);
+                        self.log.performance(format!("GPU brush switched to CPU: {error}"));
+                        for stamps in std::mem::take(&mut active.device_uv_stamps).chunks(UV_STAMP_BATCH) {
+                            texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, stamps);
+                        }
+                    }
+                }
+            } else {
+                texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, &batch);
+            }
         }
 
         // At most one step, so a segment cut off at the stamp limit can't push the next one's stamps backwards
@@ -518,7 +593,23 @@ impl Session {
             angle_fade: st.stroke.settings.angle_fade,
             shape: Self::shape(&self.images, &st.stroke.settings),
         };
-        rasterize(&mut st.canvas, &rctx, &stamps);
+        if let Some(device) = &mut st.device {
+            match device.append_world(&stamps) {
+                Ok(tiles) => {
+                    st.display_tiles.extend(&tiles);
+                    st.canvas.dirty.extend(tiles);
+                    return hit;
+                }
+                Err(error) => {
+                    st.device = None;
+                    st.display_tiles.append(&mut st.canvas.dirty);
+                    self.log.performance(format!("GPU brush switched to CPU: {error}"));
+                    rasterize(&mut st.canvas, &rctx, &st.stroke.stamps);
+                }
+            }
+        } else {
+            rasterize(&mut st.canvas, &rctx, &stamps);
+        }
         self.stroke_painted();
         hit
     }
@@ -553,6 +644,56 @@ impl Session {
         self.stroke.as_ref().map(|stroke| stroke.ts)
     }
 
+    /// The live material compositor uses the device's coverage directly while the stroke is active.
+    pub fn device_stroke(&self) -> Option<DeviceStrokePreview<'_>> {
+        let stroke = self.stroke.as_ref()?;
+        let Some(PaintTarget::Layer(layer)) = stroke.target else { return None };
+        Some(DeviceStrokePreview { ts: stroke.ts, layer, values: &stroke.values, opacity: stroke.stroke.settings.opacity, stroke: stroke.device.as_deref()? })
+    }
+
+    /// Finish the GPU coverage when committing or switching to a CPU-only preview.
+    pub fn materialize_device_stroke(&mut self, preview_fallback: Option<&str>) {
+        let Some(stroke) = self.stroke.as_mut() else { return };
+        let Some(device) = stroke.device.take() else { return };
+        match device.read_alpha(&stroke.canvas.dirty) {
+            Ok(alpha) => {
+                stroke.canvas.dirty = alpha.allocated().collect();
+                stroke.canvas.alpha = alpha;
+            }
+            Err(error) => {
+                stroke.display_tiles.append(&mut stroke.canvas.dirty);
+                self.log.performance(format!("GPU stroke readback failed, replaying stroke on CPU: {error}"));
+                let Some(cache) = self.caches.get(stroke.ts) else { return };
+                let shape = Self::shape(&self.images, &stroke.stroke.settings);
+                if stroke.uv.is_some() {
+                    for stamps in stroke.device_uv_stamps.chunks(UV_STAMP_BATCH) {
+                        texturecraft_paint::rasterize_uv(&mut stroke.canvas, &cache.gbuf, shape, stamps);
+                    }
+                } else {
+                    let context = RasterCtx {
+                        mesh: &self.mesh,
+                        bvh: &self.bvh,
+                        gbuf: &cache.gbuf,
+                        material: self.doc.project.texture_sets.get(stroke.ts).map_or(0, |set| set.material),
+                        depth: stroke.depth.as_deref(),
+                        eye: stroke.camera.eye(),
+                        backface_culling: stroke.stroke.settings.backface_culling,
+                        angle_fade: stroke.stroke.settings.angle_fade,
+                        shape,
+                    };
+                    rasterize(&mut stroke.canvas, &context, &stroke.stroke.stamps);
+                }
+            }
+        }
+        stroke.device_uv_stamps.clear();
+        stroke.display_tiles.extend(&stroke.canvas.dirty);
+        stroke.canvas.recent.extend(&stroke.canvas.dirty);
+        if let Some(reason) = preview_fallback {
+            self.log.performance(format!("Brush: CPU ({reason})"));
+            self.stroke_painted();
+        }
+    }
+
     /// Identity and tiles of a supported live stroke since the display last drew it.
     pub fn pending_display_stroke(&self, ts: usize) -> Option<(u64, &BTreeSet<(u32, u32)>)> {
         let stroke = self.stroke.as_ref()?;
@@ -565,6 +706,9 @@ impl Session {
     pub fn display_stroke_pixels(&self, ts: usize, texel_bounds: Option<([u32; 2], [u32; 2])>) -> Option<texturecraft_compose::PixelStore> {
         self.pending_display_stroke(ts)?;
         let stroke = self.stroke.as_ref()?;
+        if stroke.device.is_some() {
+            return None;
+        }
         let tiles_in_bounds;
         let touched = if let Some((min, max)) = texel_bounds {
             use texturecraft_texel::TILE;
@@ -607,6 +751,7 @@ impl Session {
 
     /// Commit the active stroke (one undo step).
     pub fn end_stroke(&mut self) -> Result<()> {
+        self.materialize_device_stroke(None);
         let brush_tile = self.tile_demand(None).brush;
         let Some(mut st) = self.stroke.take() else { return Ok(()) };
         let size = (st.canvas.alpha.width(), st.canvas.alpha.height());
@@ -691,6 +836,7 @@ impl Session {
         for q in points.iter().skip(1) {
             self.continue_stroke_uv(*q, 1.0);
         }
+        self.materialize_device_stroke(None);
         let tiles = self.stroke_tiles();
         self.end_stroke()?;
         Ok(tiles)

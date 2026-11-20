@@ -1022,6 +1022,23 @@ impl eframe::App for TextureCraftApp {
         }
         self.step_camera_glide(ctx);
         self.ui.prefs.apply_resource_limits();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let material_view = !matches!(
+                self.session.view,
+                texturecraft_engine::ViewMode::MeshMap(_) | texturecraft_engine::ViewMode::Mask(_) | texturecraft_engine::ViewMode::Image
+            );
+            self.session.brush_device = if self.ui.prefs.gpu_compositing
+                && self.ui.mode == state::Mode::Painting
+                && material_view
+                && self.session.solo.is_none()
+                && !self.session.quick_mask.editing
+            {
+                self.gpu.as_ref().and_then(|gpu| gpu.brush_device(&self.session))
+            } else {
+                None
+            };
+        }
         control::poll(self, ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.run_file_dialog_answers();

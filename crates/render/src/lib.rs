@@ -20,6 +20,8 @@ mod cage_gpu;
 pub mod displace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_bake;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gpu_brush;
 pub mod gpu_composite;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_resize;

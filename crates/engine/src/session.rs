@@ -453,6 +453,8 @@ pub(crate) struct ActiveStroke {
     pub label: String,
     /// The commit's destination tiles, copied as the stroke reaches them.
     pub staging: texturecraft_paint::Staging,
+    pub device: Option<Box<dyn crate::brush_device::DeviceStroke>>,
+    pub device_uv_stamps: Vec<texturecraft_paint::UvStamp>,
 }
 
 /// A stroke visibility buffer and what it was rendered for: camera, size, mesh id.
@@ -501,6 +503,7 @@ pub fn stroke_template(tool: Tool, on_mask: bool) -> &'static str {
 }
 
 pub struct Session {
+    pub brush_device: Option<crate::brush_device::BrushBackend>,
     pub doc: Document,
     pub mesh: Arc<Mesh>,
     /// Unique per loaded mesh and UV layout (GPU caches compare it).
@@ -602,6 +605,7 @@ impl Session {
         let selected = doc.project.texture_sets.iter().enumerate().filter_map(|(index, texture_set)| texture_set.stack.last().map(|id| (index, *id))).collect();
 
         Ok(Session {
+            brush_device: None,
             doc,
             mesh_id: next_mesh_id(),
             project_id: next_mesh_id(),

@@ -625,6 +625,8 @@ pub struct Renderer {
     dof_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     compositor: Option<GpuCompositor>,
+    #[cfg(not(target_arch = "wasm32"))]
+    brush: Option<crate::gpu_brush::BrushPipeline>,
     mip_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     util_module: wgpu::ShaderModule,
     sampler: wgpu::Sampler,
@@ -1273,6 +1275,8 @@ impl Renderer {
             accum_pipeline,
             mip_pipelines: HashMap::new(),
             compositor: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            brush: None,
             util_module,
             sampler,
             env_sampler,
@@ -1353,6 +1357,13 @@ impl Renderer {
     pub fn set_mesh(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh, id: u64) {
         if self.mesh.as_ref().is_some_and(|m| m.id == id) {
             return;
+        }
+        if let Some(compositor) = &mut self.compositor {
+            compositor.release_unused_surfaces();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(brush) = &mut self.brush {
+            brush.clear_visibility();
         }
 
         let verts = subdivide::vertices(mesh);
@@ -1528,6 +1539,27 @@ impl Renderer {
             }
         }
         reset
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_gpu_brush(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: crate::gpu_brush::BrushInput,
+    ) -> Result<crate::gpu_brush::GpuBrushStroke, String> {
+        if !GpuCompositor::supports(device) {
+            return Err("adapter limits do not support the GPU brush".into());
+        }
+        let (compositor, brush, stroke) = crate::gpu_trace::scoped(device, "GPU brush startup", || {
+            let mut compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
+            let mut brush = self.brush.take().unwrap_or_else(|| crate::gpu_brush::BrushPipeline::new(device));
+            let stroke = compositor.uv_surface(device, queue, &input.mesh, &input.uv).and_then(|surface| brush.begin(device, queue, input, surface));
+            (compositor, brush, stroke)
+        })?;
+        self.compositor = Some(compositor);
+        self.brush = Some(brush);
+        stroke
     }
 
     /// Paint a supported UV layer stack into the same display textures used by the viewport.

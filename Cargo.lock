@@ -4774,6 +4774,7 @@ dependencies = [
  "texturecraft-compose",
  "texturecraft-core",
  "texturecraft-geom",
+ "texturecraft-paint",
  "texturecraft-texel",
  "wasm-bindgen-futures",
  "wgpu",
