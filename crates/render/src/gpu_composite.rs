@@ -1,12 +1,15 @@
 //! Compile the viewport's supported UV fills to a small GPU layer program.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
-use texturecraft_compose::PixelStore;
-use texturecraft_core::{BlendMode, Channel, Effect, EffectKind, Filter, LayerKind, MaskBackground, ProceduralKind, Project, Projection, Source};
-use texturecraft_geom::{NO_TRI, UvGBuffer};
+use texturecraft_compose::{BakedMaps, PixelStore};
+use texturecraft_core::{
+    BakedMap, BlendMode, Channel, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerKind, MaskBackground, ProceduralKind, Project, Projection, Source,
+};
+use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TILE_AREA, TileImage};
 use wgpu::util::DeviceExt;
 
@@ -15,6 +18,26 @@ const MAX_EFFECTS: usize = 256;
 const MAX_PAINT_WORDS: usize = (64 << 20) / size_of::<u32>();
 pub(crate) const ROWS: u32 = 64;
 const WORKGROUP: u32 = 8;
+const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
+
+#[derive(Debug)]
+struct BakedInputs {
+    width: u32,
+    height: u32,
+    maps: [Option<Arc<Vec<f32>>>; BAKE_MAPS.len()],
+}
+
+impl BakedInputs {
+    fn new(baked: &BakedMaps) -> Result<Option<Self>, &'static str> {
+        let maps = BAKE_MAPS.map(|map| baked.maps.get(&map).filter(|data| !data.is_empty()).cloned());
+        let Some(index) = maps.iter().position(Option::is_some) else { return Ok(None) };
+        let height = baked.height(BAKE_MAPS[index]);
+        if height == 0 || baked.resolution == 0 || BAKE_MAPS.iter().zip(&maps).any(|(&map, data)| data.is_some() && baked.height(map) != height) {
+            return Err("The baked maps have different layouts and use CPU compositing.");
+        }
+        Ok(Some(Self { width: baked.resolution, height, maps }))
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -77,6 +100,9 @@ pub struct CompositeProgram {
     paint: Vec<u32>,
     pub(crate) region: Option<CompositeRegion>,
     coverage: Option<(Arc<UvGBuffer>, u32)>,
+    surface: Option<(Arc<Mesh>, Arc<UvGBuffer>)>,
+    needs_surface: bool,
+    baked: Option<BakedInputs>,
     pub(crate) writes_height: bool,
     pub(crate) writes_normal: bool,
 }
@@ -87,12 +113,22 @@ impl CompositeProgram {
     }
 
     pub fn is_neutral(&self) -> bool {
-        self.layer_count == 0
+        self.layer_count == 0 && self.baked.as_ref().is_none_or(|baked| baked.maps[0].is_none() && baked.maps[1].is_none())
     }
 
     /// Let the shader sample the nearest covered UV texel for island padding.
     pub fn set_coverage(&mut self, coverage: Arc<UvGBuffer>, radius: u32) {
         self.coverage = Some((coverage, radius.min(15)));
+    }
+
+    /// Mesh-space projections and generators share the viewport's surface and bake inputs.
+    pub fn set_surface_inputs(&mut self, mesh: &Arc<Mesh>, gbuf: &Arc<UvGBuffer>, baked: Option<&BakedMaps>) -> Result<(), &'static str> {
+        if self.needs_surface {
+            self.surface = Some((mesh.clone(), gbuf.clone()));
+        }
+        self.baked = baked.map(BakedInputs::new).transpose()?.flatten();
+        self.writes_normal |= self.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some());
+        Ok(())
     }
 
     /// A flat stack of sparse paint, solid and UV procedural fills, masks and point effects.
@@ -118,8 +154,9 @@ impl CompositeProgram {
         let mut operations = Vec::new();
         let mut paint = vec![0];
         let mut effects = Vec::new();
-        for id in &set.stack {
-            let layer = project.layers.get(id).ok_or("A layer is missing from the material.")?;
+        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (id, 0)).collect();
+        while let Some((id, depth)) = layers.pop() {
+            let layer = project.layers.get(&id).ok_or("A layer is missing from the material.")?;
             if !layer.visible {
                 continue;
             }
@@ -127,6 +164,20 @@ impl CompositeProgram {
                 return Err("A geometry or height mask uses CPU compositing.");
             }
             let mask = layer.mask.as_ref().filter(|m| m.enabled);
+            if let LayerKind::Group { children, .. } = &layer.kind {
+                if depth >= texturecraft_core::project::MAX_DEPTH
+                    || mask.is_some()
+                    || !layer.content_effects.is_empty()
+                    || set
+                        .channels
+                        .iter()
+                        .any(|&(channel, _)| layer.blend(channel).is_none_or(|blend| blend.mode != BlendMode::Passthrough || blend.opacity != 1.0))
+                {
+                    return Err("A masked or modified group uses CPU compositing.");
+                }
+                layers.extend(children.iter().rev().map(|&child| (child, depth + 1)));
+                continue;
+            }
             let mask_start = effects.len() as u32;
             let mask_background = mask.map_or(1.0, |m| if m.background == MaskBackground::White { 1.0 } else { 0.0 });
             if let Some(mask) = mask {
@@ -144,6 +195,7 @@ impl CompositeProgram {
                                 pack_paint(&mut paint, image, region.map(|r| r.expanded(TILE))).ok_or("The painted material exceeds the GPU upload budget.")?;
                             Operation { ids: [0, 10, offset, 2], ..Operation::zeroed() }
                         }
+                        EffectKind::Generator(generator) => generator_operation(generator).ok_or("A mask generator uses CPU compositing.")?,
                         _ => point_effect(effect).ok_or("A mask effect uses CPU compositing.")?,
                     };
                     if !effect.opacity.is_finite() {
@@ -187,7 +239,7 @@ impl CompositeProgram {
                     return Err("A layer has an invalid opacity.");
                 }
                 let painted = if fill.is_none() {
-                    let Some(image) = pixels.layer(*id, channel).filter(|img| img.allocated_count() > 0) else { continue };
+                    let Some(image) = pixels.layer(id, channel).filter(|img| img.allocated_count() > 0) else { continue };
                     if (image.width(), image.height()) != set.size() || image.comps() != channel.components() + 1 {
                         return Err("A paint layer has a layout that uses CPU compositing.");
                     }
@@ -242,7 +294,8 @@ impl CompositeProgram {
         let writes_normal = changes_channel(7, Normal.default_value());
         let layer_count = operations.len() as u32;
         operations.extend(effects);
-        Ok(Self { operations, layer_count, paint, region, coverage: None, writes_height, writes_normal })
+        let needs_surface = operations.iter().any(|op| op.balance[3] > 0.0 || op.ids[1] >= 40);
+        Ok(Self { operations, layer_count, paint, region, coverage: None, surface: None, needs_surface, baked: None, writes_height, writes_normal })
     }
 }
 
@@ -292,7 +345,6 @@ fn source_operation(source: Option<&Source>, projection: &Projection, default: [
             if pattern.resolution.can_reduce() || !ramp.is_empty() {
                 return None;
             }
-            let Projection::Uv { scale, rotation, offset } = projection else { return None };
             let kind = match pattern.kind {
                 ProceduralKind::Clouds => 1,
                 ProceduralKind::Perlin => 2,
@@ -303,22 +355,69 @@ fn source_operation(source: Option<&Source>, projection: &Projection, default: [
                 ProceduralKind::Wood => 7,
                 ProceduralKind::Marble => 8,
                 ProceduralKind::Gradient => 9,
+                ProceduralKind::Pores => 11,
+                ProceduralKind::Chips => 12,
+                ProceduralKind::Streaks => 13,
                 _ => return None,
             };
-            let (sin, cos) = rotation.to_radians().sin_cos();
             op.ids = [0, kind, pattern.seed, u32::from(pattern.invert)];
             op.low[..3].copy_from_slice(low);
             op.high[..3].copy_from_slice(high);
-            op.projection = [cos, sin, scale[0], scale[1]];
-            op.uv = [offset[0], offset[1], pattern.scale.max(1e-4), pattern.contrast.max(0.0)];
+            op.uv[2] = pattern.scale.max(1e-4);
+            op.uv[3] = pattern.contrast.max(0.0);
             op.balance[0] = pattern.balance;
-            if scale.iter().zip(offset).any(|(s, o)| (s.abs() * 2.0 + o.abs()) * op.uv[2] > 32_768.0) {
-                return None;
+            match projection {
+                Projection::Uv { scale, rotation, offset } => {
+                    let (sin, cos) = rotation.to_radians().sin_cos();
+                    op.projection = [cos, sin, scale[0], scale[1]];
+                    op.uv[..2].copy_from_slice(offset);
+                    if scale.iter().zip(offset).any(|(s, o)| (s.abs() * 2.0 + o.abs()) * op.uv[2] > 32_768.0) {
+                        return None;
+                    }
+                }
+                Projection::Triplanar { scale, sharpness, offset } => {
+                    let frequency = *scale * op.uv[2];
+                    if offset.iter().any(|o| frequency.abs() + o.abs() > 32_768.0) {
+                        return None;
+                    }
+                    op.projection = [offset[0], offset[1], offset[2], frequency];
+                    op.balance[3] = sharpness.max(1.0);
+                }
+                _ => return None,
             }
         }
         _ => return None,
     }
     op.low.iter().chain(&op.high).chain(&op.projection).chain(&op.uv).chain(&op.balance).all(|v| v.is_finite()).then_some(op)
+}
+
+fn generator_operation(generator: &Generator) -> Option<Operation> {
+    if generator.detail.is_some()
+        || generator.micro.is_some()
+        || !generator.inputs.is_empty()
+        || generator.resolution.can_reduce()
+        || !generator.global.is_neutral()
+    {
+        return None;
+    }
+    let kind = match generator.kind {
+        GeneratorKind::EdgeWear => 40,
+        GeneratorKind::Dirt => 41,
+        GeneratorKind::ThinAreas => 42,
+        GeneratorKind::Curvature => 43,
+        GeneratorKind::AmbientOcclusion => 44,
+        GeneratorKind::Position => 45,
+        GeneratorKind::Direction => 46,
+    };
+    let direction = Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y);
+    let op = Operation {
+        ids: [0, kind, generator.seed, u32::from(generator.invert)],
+        low: [generator.level, generator.softness.max(Generator::MIN_SOFTNESS), generator.noise_amount, 0.0],
+        high: [direction.x, direction.y, direction.z, 0.0],
+        projection: [generator.noise_scale.max(1e-3), generator.offset, 0.0, 0.0],
+        ..Operation::zeroed()
+    };
+    op.low.iter().chain(&op.projection).all(|x| x.is_finite()).then_some(op)
 }
 
 fn point_effect(effect: &Effect) -> Option<Operation> {
@@ -383,17 +482,60 @@ fn coverage_word(triangles: &[u32]) -> u32 {
     triangles.iter().enumerate().fold(0, |word, (bit, &triangle)| word | (u32::from(triangle != NO_TRI) << bit))
 }
 
+fn input_texture(device: &wgpu::Device, label: &str, size: (u32, u32), layers: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: layers },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn bake_view(texture: &wgpu::Texture) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
+}
+
+fn write_input(queue: &wgpu::Queue, texture: &wgpu::Texture, size: (u32, u32), row_layer: (u32, u32), bytes: &[u8]) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { origin: wgpu::Origin3d { x: 0, y: row_layer.0, z: row_layer.1 }, ..texture.as_image_copy() },
+        bytes,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.0 * 8), rows_per_image: None },
+        wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+    );
+}
+
+struct SurfaceCache {
+    gbuf: Weak<UvGBuffer>,
+    view: wgpu::TextureView,
+    vertices: wgpu::Buffer,
+}
+
+struct BakeCache {
+    size: (u32, u32),
+    maps: [Option<Weak<Vec<f32>>>; BAKE_MAPS.len()],
+    view: wgpu::TextureView,
+}
+
 pub(crate) struct GpuCompositor {
     pipeline: wgpu::ComputePipeline,
     lookup: wgpu::Buffer,
     uniform_coverage: wgpu::Buffer,
     coverage: Vec<(Weak<UvGBuffer>, wgpu::Buffer)>,
+    surfaces: Vec<SurfaceCache>,
+    baked: BTreeMap<usize, BakeCache>,
+    default_surface: wgpu::TextureView,
+    default_vertices: wgpu::Buffer,
+    default_baked: wgpu::TextureView,
 }
 
 impl GpuCompositor {
     pub(crate) fn supports(device: &wgpu::Device) -> bool {
         let limits = device.limits();
-        limits.max_storage_buffers_per_shader_stage >= 5
+        limits.max_storage_buffers_per_shader_stage >= 6
             && limits.max_compute_invocations_per_workgroup >= WORKGROUP * WORKGROUP
             && limits.max_compute_workgroup_size_x >= WORKGROUP
             && limits.max_compute_workgroup_size_y >= WORKGROUP
@@ -423,7 +565,128 @@ impl GpuCompositor {
             contents: &[0; 4],
             usage: wgpu::BufferUsages::STORAGE,
         });
-        Self { pipeline, lookup, uniform_coverage, coverage: Vec::new() }
+        let default_surface = input_texture(device, "tc_composite_empty_surface", (1, 1), 1, wgpu::TextureFormat::Rg32Uint).create_view(&Default::default());
+        let default_vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tc_composite_empty_vertices"),
+            contents: &[0; 32],
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let default_baked = bake_view(&input_texture(device, "tc_composite_empty_bakes", (1, 1), 2, wgpu::TextureFormat::Rgba16Float));
+        Self {
+            pipeline,
+            lookup,
+            uniform_coverage,
+            coverage: Vec::new(),
+            surfaces: Vec::new(),
+            baked: BTreeMap::new(),
+            default_surface,
+            default_vertices,
+            default_baked,
+        }
+    }
+
+    fn surface_inputs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, program: &CompositeProgram) -> Result<(wgpu::TextureView, wgpu::Buffer), String> {
+        let Some((mesh, gbuf)) = &program.surface else {
+            if program.needs_surface {
+                return Err("Missing UV surface inputs for GPU layer composition".into());
+            }
+            return Ok((self.default_surface.clone(), self.default_vertices.clone()));
+        };
+        self.surfaces.retain(|cache| cache.gbuf.strong_count() != 0);
+        let key = Arc::downgrade(gbuf);
+        if let Some(cache) = self.surfaces.iter().find(|cache| cache.gbuf.ptr_eq(&key)) {
+            return Ok((cache.view.clone(), cache.vertices.clone()));
+        }
+        let limits = device.limits();
+        let vertex_bytes = mesh.indices.len() as u64 * 32;
+        if gbuf.width.max(gbuf.height) > limits.max_texture_dimension_2d || vertex_bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
+            return Err("UV surface data exceeds the GPU limits".into());
+        }
+        let (lo, hi) = mesh.bounds();
+        let center = (lo + hi) * 0.5;
+        let radius = ((hi - lo).length() * 0.5).max(1e-4);
+        let vertex_data: Vec<[[f32; 4]; 2]> = mesh
+            .indices
+            .iter()
+            .map(|&index| {
+                let index = index as usize;
+                let pos = (mesh.positions.get(index).copied().unwrap_or_default() - center) / radius;
+                let normal = mesh.normals.get(index).copied().unwrap_or(Vec3::Y);
+                [pos.extend(0.0).to_array(), normal.extend(0.0).to_array()]
+            })
+            .collect();
+        let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tc_composite_surface_vertices"),
+            contents: bytemuck::cast_slice(&vertex_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let texture = input_texture(device, "tc_composite_uv_surface", (gbuf.width, gbuf.height), 1, wgpu::TextureFormat::Rg32Uint);
+        let stride = (gbuf.width * ROWS) as usize;
+        for (band, (tri, bary)) in gbuf.tri.chunks(stride).zip(gbuf.bary.chunks(stride)).enumerate() {
+            let pixels: Vec<[u32; 2]> = tri
+                .par_iter()
+                .zip(bary)
+                .map(|(&tri, &[u, v])| {
+                    let pack = |x: f32| u32::from(texturecraft_texel::to_u16(x));
+                    [tri, pack(u) | (pack(v) << 16)]
+                })
+                .collect();
+            write_input(queue, &texture, (gbuf.width, tri.len() as u32 / gbuf.width), (band as u32 * ROWS, 0), bytemuck::cast_slice(&pixels));
+        }
+        let view = texture.create_view(&Default::default());
+        self.surfaces.push(SurfaceCache { gbuf: key, view: view.clone(), vertices: vertices.clone() });
+        Ok((view, vertices))
+    }
+
+    pub(crate) fn retain_texture_sets(&mut self, count: usize) {
+        self.baked.retain(|&ts, _| ts < count);
+    }
+
+    fn baked_input(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, baked: Option<&BakedInputs>) -> Result<wgpu::TextureView, String> {
+        let Some(baked) = baked else {
+            self.baked.remove(&ts);
+            return Ok(self.default_baked.clone());
+        };
+        let size = (baked.width, baked.height);
+        let refs = baked.maps.each_ref().map(|map| map.as_ref().map(Arc::downgrade));
+        if let Some(cache) = self.baked.get(&ts).filter(|cache| {
+            size == cache.size
+                && refs.iter().zip(&cache.maps).all(|(a, b)| match (a, b) {
+                    (Some(a), Some(b)) => a.ptr_eq(b),
+                    (None, None) => true,
+                    _ => false,
+                })
+        }) {
+            return Ok(cache.view.clone());
+        }
+        if size.0.max(size.1) > device.limits().max_texture_dimension_2d {
+            return Err("Baked maps exceed the GPU texture dimensions".into());
+        }
+        self.baked.remove(&ts);
+        let texture = input_texture(device, "tc_composite_bakes", size, 2, wgpu::TextureFormat::Rgba16Float);
+        let value = |map: usize, i: usize, fallback: f32| baked.maps[map].as_ref().and_then(|data| data.get(i).copied()).unwrap_or(fallback);
+        for top in (0..size.1).step_by(ROWS as usize) {
+            let end = (top + ROWS).min(size.1);
+            let indices = top as usize * size.0 as usize..end as usize * size.0 as usize;
+            let scalars: Vec<[u16; 4]> = indices
+                .clone()
+                .into_par_iter()
+                .map(|i| [value(0, i, 1.0), value(2, i, 0.5), value(3, i, 1.0), 0.0].map(|v| half::f16::from_f32(v).to_bits()))
+                .collect();
+            write_input(queue, &texture, (size.0, end - top), (top, 0), bytemuck::cast_slice(&scalars));
+            let normals: Vec<[u16; 4]> = indices
+                .into_par_iter()
+                .map(|i| {
+                    let n = [value(1, i * 3, 0.5), value(1, i * 3 + 1, 0.5), value(1, i * 3 + 2, 1.0)];
+                    let valid = n.iter().all(|v| (0.0..=1.0).contains(v));
+                    [n[0], n[1], n[2], if valid { 1.0 } else { 0.0 }].map(|v| half::f16::from_f32(v).to_bits())
+                })
+                .collect();
+            write_input(queue, &texture, (size.0, end - top), (top, 1), bytemuck::cast_slice(&normals));
+        }
+        let view = bake_view(&texture);
+        self.baked.insert(ts, BakeCache { size, maps: refs, view: view.clone() });
+        Ok(view)
     }
 
     fn coverage_buffer(&mut self, device: &wgpu::Device, map: Option<&Arc<UvGBuffer>>) -> Result<wgpu::Buffer, String> {
@@ -466,15 +729,18 @@ impl GpuCompositor {
     /// Indexed/SRGB and floating-point maps use the same formats as the CPU uploader.
     pub(crate) fn encode(
         &mut self,
-        device: &wgpu::Device,
+        gpu: (&wgpu::Device, &wgpu::Queue),
         encoder: &mut wgpu::CommandEncoder,
         program: &CompositeProgram,
-        source_size: (u32, u32),
-        shift: u32,
+        target: (usize, (u32, u32), u32),
         textures: [&wgpu::Texture; 4],
     ) -> Result<(), String> {
+        let (device, queue) = gpu;
+        let (ts, source_size, shift) = target;
         let extent = (textures[0].width(), textures[0].height());
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
+        let (surface, vertices) = self.surface_inputs(device, queue, program)?;
+        let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
         let region = program.region.map(|r| r.viewport(shift, extent)).unwrap_or(CompositeRegion { min: [0; 2], max: [extent.0, extent.1] });
         let [left, start_y] = region.min;
         let width = region.max[0].saturating_sub(left);
@@ -499,9 +765,10 @@ impl GpuCompositor {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let empty_operation = Operation::zeroed();
         let ops = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tc_composite_operations"),
-            contents: bytemuck::cast_slice(&program.operations),
+            contents: if program.operations.is_empty() { bytemuck::bytes_of(&empty_operation) } else { bytemuck::cast_slice(&program.operations) },
             usage: wgpu::BufferUsages::STORAGE,
         });
         let paint = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -530,7 +797,9 @@ impl GpuCompositor {
                 u32::from(program.coverage.is_some()),
                 source_size.0.div_ceil(32),
                 program.coverage.as_ref().map_or(0, |(_, radius)| *radius),
-                0,
+                u32::from(program.surface.is_some())
+                    | (u32::from(program.baked.is_some()) << 1)
+                    | (u32::from(program.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some())) << 2),
             ];
             let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("tc_composite_band"),
@@ -547,6 +816,9 @@ impl GpuCompositor {
                     wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&surface) },
+                    wgpu::BindGroupEntry { binding: 7, resource: vertices.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
                 ],
             });
             {

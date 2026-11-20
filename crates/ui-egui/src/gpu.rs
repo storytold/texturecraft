@@ -154,9 +154,6 @@ impl SetCompositor {
         if session.stroke_texture_set() == Some(ts) && stroke.is_none() {
             return Err(n_("This painting tool uses CPU compositing."));
         }
-        if session.doc.baked.get(&ts).is_some_and(|maps| maps.maps.contains_key(&BakedMap::AmbientOcclusion) || maps.maps.contains_key(&BakedMap::Normal)) {
-            return Err(n_("This material uses baked normal or ambient occlusion maps."));
-        }
 
         let cache = &session.caches[ts];
         let padding = cache.dilation.mixed_coverage();
@@ -209,6 +206,12 @@ impl SetCompositor {
         };
         if let Some(padding) = padding {
             program.set_coverage(padding, texturecraft_engine::session::DISPLAY_PADDING);
+        }
+        if let Err(reason) = program.set_surface_inputs(&session.mesh, &cache.gbuf, session.doc.baked.get(&ts)) {
+            if stroke_id.is_none() {
+                self.rejected = Some((key, reason));
+            }
+            return Err(reason);
         }
         self.neutral = program.is_neutral();
         self.current = Some(key);
@@ -1165,7 +1168,9 @@ pub(crate) mod tests {
         let update = link.sync(&mut session, None, None, 0, FRAME_BUDGET_MS);
         assert!(update.overview.is_none());
         assert!(!update.tiles.is_empty());
-        assert!(session.pending_tiles() > 0);
+        // The CPU may already have computed every tile, but the upload budget still
+        // leaves part of the material for a later frame.
+        assert!(link.display_pending(&session));
 
         link.material_start_preview = true;
         execute(&mut session, "textureSet.resolution", &json!({"resolution":2048})).unwrap();
@@ -1357,6 +1362,95 @@ pub(crate) mod tests {
         assert!(scene.tiles.iter().all(|(ts, ..)| *ts == 1));
         assert_eq!(session.caches[0].revision, before, "GPU sets skip desktop CPU composition");
         assert!(session.log.iter().any(|entry| entry.message.contains("Layers: CPU for texture set 2")));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn built_in_sample_composes_both_smart_materials_on_gpu_after_open_and_resize() {
+        use texturecraft_render::{headless::Headless, readback::Readback};
+
+        let mut session = Session::closed().unwrap();
+        execute(&mut session, "project.sample", &json!({})).unwrap();
+        assert_eq!(session.caches.len(), 2);
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.material_start_preview = false;
+        let mut headless = Headless::new().ok();
+        let opened = std::time::Instant::now();
+        for (size, sets) in [(2048, &[0, 1][..]), (4096, &[0][..])] {
+            let started = std::time::Instant::now();
+            if size == 4096 {
+                execute(&mut session, "textureSet.resolution", &json!({"ts":0,"resolution":size})).unwrap();
+            }
+            let update = link.sync(&mut session, None, None, 0, 0.0);
+            let planned: Vec<_> = update.composites.iter().map(|(ts, _, _)| *ts).collect();
+            assert_eq!(planned, sets, "{}", link.compositor_status().1);
+            assert!(update.tiles.is_empty());
+            assert_eq!(link.compositor_status().0, "Layers: GPU");
+            if let Some(gpu) = &mut headless {
+                let (reset, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+                assert!(errors.is_empty(), "{errors:?}");
+                record_recreated_uploads(&mut link.recreated.lock().unwrap(), &reset, &update);
+                gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                let textures = gpu.renderer.display_textures();
+                assert_eq!(textures[0][0].width(), size);
+                assert_eq!(textures[0][2].width(), size, "baked normals reach the GPU display");
+                assert_eq!(textures[1][0].width(), 2048);
+                println!("{size}: {:?} on {}", started.elapsed(), gpu.adapter_name);
+            }
+            assert!(!link.display_pending(&session));
+        }
+        if let Some(gpu) = &mut headless {
+            for ts in 0..2 {
+                let (width, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[ts][0]).unwrap();
+                let cache = &session.caches[ts];
+                assert_eq!(width, cache.gbuf.width);
+                let mut samples =
+                    cache.gbuf.tri.iter().enumerate().step_by(101).filter(|(_, tri)| **tri != texturecraft_engine::geom::NO_TRI).map(|(i, _)| rgba[i * 4]);
+                let first = samples.next().unwrap();
+                assert!(samples.any(|red| red != first), "visible smart-material variation in set {ts}");
+                execute(&mut session, "textureSet.resolution", &json!({"ts":ts,"resolution":128})).unwrap();
+            }
+
+            // Compare a few baked and generated sample pixels at 128².
+            let update = link.sync(&mut session, None, None, 0, 0.0);
+            let (_, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{errors:?}");
+            session.update();
+            for ts in 0..2 {
+                let cache = &session.caches[ts];
+                let indices: Vec<_> = cache
+                    .gbuf
+                    .tri
+                    .iter()
+                    .enumerate()
+                    .step_by(101)
+                    .filter_map(|(index, &tri)| (tri != texturecraft_engine::geom::NO_TRI).then_some(index))
+                    .collect();
+                let tiles = [(0, 0), (0, 1), (1, 0), (1, 1)];
+                for (map, kind) in DisplayKind::ALL.into_iter().take(3).enumerate() {
+                    let (width, _, bytes) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[ts][map]).unwrap();
+                    assert_eq!(width, 128);
+                    let cpu: BTreeMap<_, _> =
+                        tiles.into_iter().map(|(x, y)| ((x, y), display_tile_bytes(&cache.composite, session.baked(ts).unwrap(), kind, x, y, 0))).collect();
+                    let stride = kind.bytes_per_texel();
+                    let compare = |i: usize| {
+                        let (x, y) = (i % 128, i / 128);
+                        let local = (y % 64 * 64 + x % 64) * stride;
+                        let cpu = &cpu[&((x / 64) as u32, (y / 64) as u32)][local..local + stride];
+                        let gpu = &bytes[i * stride..(i + 1) * stride];
+                        match kind {
+                            DisplayKind::Normal => u16::from_le_bytes([cpu[4], cpu[5]]).abs_diff(u16::from_le_bytes([gpu[4], gpu[5]])) <= 2,
+                            DisplayKind::Orm => cpu[0].abs_diff(gpu[0]) <= 1,
+                            _ => cpu[..3].iter().zip(gpu).all(|(a, b)| a.abs_diff(*b) <= 8),
+                        }
+                    };
+                    let agreeing = indices.iter().filter(|&&i| compare(i)).count();
+                    assert!(agreeing * 20 >= indices.len() * 19, "{kind:?}, set {ts}: {agreeing}/{} covered samples agree", indices.len());
+                }
+            }
+        }
+        println!("sample compositing checks completed in {:?}", opened.elapsed());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

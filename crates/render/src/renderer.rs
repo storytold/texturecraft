@@ -1495,6 +1495,9 @@ impl Renderer {
         let mut reset = Vec::new();
         self.content_rev += 1;
         self.sets.truncate(sets.len());
+        if let Some(compositor) = &mut self.compositor {
+            compositor.retain_texture_sets(sets.len());
+        }
         let max = device.limits().max_texture_dimension_2d.max(1);
         for (i, &(size, _)) in sets.iter().enumerate() {
             // Downscale sets that exceed the device's texture dimension limit
@@ -1578,7 +1581,13 @@ impl Renderer {
                 .collect();
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite") });
             if let (Some(base), Some(orm), Some(height), Some(normal)) = (maps.first(), maps.get(1), maps.get(3), maps.get(2)) {
-                compositor.encode(device, &mut encoder, program, set.size, set.shift, [&base.texture, &orm.texture, &height.texture, &normal.texture])?;
+                compositor.encode(
+                    (device, queue),
+                    &mut encoder,
+                    program,
+                    (ts, set.size, set.shift),
+                    [&base.texture, &orm.texture, &height.texture, &normal.texture],
+                )?;
             }
             queue.submit([encoder.finish()]);
             maps.extend(set.tex.last().cloned());

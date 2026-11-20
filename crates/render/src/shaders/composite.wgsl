@@ -24,6 +24,43 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> output: array<u32>;
 @group(0) @binding(4) var<storage, read> paint: array<u32>;
 @group(0) @binding(5) var<storage, read> uv_coverage: array<u32>;
+@group(0) @binding(6) var surface_uv: texture_2d<u32>;
+struct SurfaceVertex {
+    position: vec4<f32>,
+    normal: vec4<f32>,
+}
+@group(0) @binding(7) var<storage, read> surface_vertices: array<SurfaceVertex>;
+@group(0) @binding(8) var bake_maps: texture_2d_array<f32>;
+
+struct Surface {
+    position: vec3<f32>,
+    normal: vec3<f32>,
+}
+
+fn surface_at(pixel: vec2<u32>) -> Surface {
+    if (params.coverage.w & 1u) == 0u || any(pixel >= params.source.xy) {
+        return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0));
+    }
+    let hit = textureLoad(surface_uv, vec2<i32>(pixel), 0).xy;
+    if hit.x == 0xffffffffu {
+        return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0));
+    }
+    let weight = unpack2x16unorm(hit.y);
+    let w = max(0.0, 1.0 - weight.x - weight.y);
+    let a = surface_vertices[hit.x * 3u];
+    let b = surface_vertices[hit.x * 3u + 1u];
+    let c = surface_vertices[hit.x * 3u + 2u];
+    let position = a.position.xyz * w + b.position.xyz * weight.x + c.position.xyz * weight.y;
+    let normal = a.normal.xyz * w + b.normal.xyz * weight.x + c.normal.xyz * weight.y;
+    return Surface(position, select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12));
+}
+
+fn baked_at(pixel: vec2<u32>, layer: i32) -> vec4<f32> {
+    let size = textureDimensions(bake_maps);
+    let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
+    let sample_pixel = min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
+    return textureLoad(bake_maps, vec2<i32>(sample_pixel), layer, 0);
+}
 
 fn pcg3d(cell: vec3<u32>) -> vec3<u32> {
     var v = cell * 1664525u + 1013904223u;
@@ -106,6 +143,21 @@ fn cells(p: vec3<f32>, seed: u32) -> f32 {
     return sqrt(nearest);
 }
 
+fn cell_value(cell: vec3<i32>, seed: u32) -> f32 {
+    return f32(hash(cell, seed * 0x9e3779b9u).x) / 4294967296.0;
+}
+
+fn drip(p: vec3<f32>, x: f32, salt: i32, seed: u32) -> f32 {
+    let cx = x * 6.0;
+    let column = i32(floor(cx));
+    let width = 0.08 + 0.25 * cell_value(vec3(column, 0, salt), seed);
+    let across = 1.0 - smoothstep(width * 0.3, width, abs(fract(cx) - 0.5 - (cell_value(vec3(column, 1, salt), seed) - 0.5) * 0.5));
+    let yy = p.y * (0.35 + 0.4 * cell_value(vec3(column, 2, salt), seed)) + cell_value(vec3(column, 3, salt), seed) * 7.0;
+    let t = fract(yy);
+    let on = cell_value(vec3(column, i32(floor(yy)), 3 + salt), seed) > 0.5;
+    return select(0.0, across * pow(t, 1.6) * (1.0 - smoothstep(0.9, 1.0, t)), on);
+}
+
 fn pattern(kind: u32, p: vec3<f32>, seed: u32) -> f32 {
     switch kind {
         case 1u: { return fbm(p, 6u, seed, false); }
@@ -136,18 +188,44 @@ fn pattern(kind: u32, p: vec3<f32>, seed: u32) -> f32 {
             let cloud = fbm(p * 2.0, 3u, seed ^ 0x19u, false);
             return clamp(veins * 0.85 + cloud * 0.15, 0.0, 1.0);
         }
+        case 11u: {
+            let first = cells(p, seed);
+            let second = cells(p * 2.7 + 13.0, seed ^ 0x6bu);
+            return min(smoothstep(0.08, 0.16, first), smoothstep(0.06, 0.12, second));
+        }
+        case 12u: {
+            let first = cells(p * 2.0, seed ^ 0x45u);
+            return smoothstep(0.55, 0.58, fbm(p, 5u, seed, true) + (first - 0.5) * 0.25);
+        }
+        case 13u: {
+            let fine = noise(p * vec3(37.0, 1.3, 1.0), seed ^ 0x2bu, false);
+            return clamp(max(drip(p, p.x, 0, seed), drip(p, p.x + 0.37, 1, seed) * 0.8) * (0.6 + 0.4 * fine), 0.0, 1.0);
+        }
         default: { return fract(p.x); }
     }
 }
 
-fn value(layer: Operation, uv: vec2<f32>) -> vec3<f32> {
+fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
     if layer.ids.y == 0u {
         return layer.low.rgb;
     }
     let rotation = layer.projection.xy;
     let rotated = vec2(uv.x * rotation.x - uv.y * rotation.y, uv.x * rotation.y + uv.y * rotation.x);
     let projected = (rotated * layer.projection.zw + layer.uv.xy) * layer.uv.z;
-    let n = pattern(layer.ids.y, vec3(projected, 0.0), layer.ids.z);
+    var n = 0.0;
+    if layer.balance.w > 0.0 {
+        let p = surface.position * layer.projection.w + layer.projection.xyz;
+        let weighted = pow(abs(surface.normal), vec3(layer.balance.w));
+        let weights = weighted / max(weighted.x + weighted.y + weighted.z, 1e-6);
+        let minimum = 1.0 / (131072.0 * max(layer.uv.w, 1.0));
+        let retained = select(vec3(0.0), weights, weights >= vec3(minimum));
+        let w = select(retained, weights, all(retained == vec3(0.0)));
+        if w.x > 0.0 { n += w.x * pattern(layer.ids.y, vec3(p.zy, 0.0), layer.ids.z); }
+        if w.y > 0.0 { n += w.y * pattern(layer.ids.y, vec3(p.xz, 0.0), layer.ids.z); }
+        if w.z > 0.0 { n += w.z * pattern(layer.ids.y, vec3(p.xy, 0.0), layer.ids.z); }
+    } else {
+        n = pattern(layer.ids.y, vec3(projected, 0.0), layer.ids.z);
+    }
     let shaped = clamp((n - 0.5) * layer.uv.w + 0.5 + layer.balance.x, 0.0, 1.0);
     let t = select(shaped, 1.0 - shaped, layer.ids.w != 0u);
     return layer.low.rgb + (layer.high.rgb - layer.low.rgb) * t;
@@ -362,7 +440,26 @@ fn blend_rgb(mode: u32, a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
     }
 }
 
-fn layer_mask(layer: Operation, pixel: vec2<u32>, uv: vec2<f32>) -> f32 {
+fn generator(effect: Operation, surface: Surface, baked: vec3<f32>) -> f32 {
+    var signal = 0.0;
+    switch effect.ids.y {
+        case 40u: { signal = (baked.y - 0.5) * 2.0; }
+        case 41u: { signal = 1.0 - baked.x; }
+        case 42u: { signal = 1.0 - baked.z; }
+        case 43u: { signal = baked.y; }
+        case 44u: { signal = baked.x; }
+        case 45u: { signal = dot(surface.position, effect.high.xyz) * 0.5 + 0.5; }
+        default: { signal = dot(surface.normal, effect.high.xyz) * 0.5 + 0.5; }
+    }
+    if effect.low.z > 0.0 {
+        signal += (fbm(surface.position * effect.projection.x, 4u, effect.ids.z, true) - 0.5) * effect.low.z;
+    }
+    let threshold = 1.0 - clamp(effect.low.x, 0.0, 1.0);
+    let value = smoothstep(threshold - effect.low.y, threshold + effect.low.y, signal);
+    return clamp(select(value, 1.0 - value, effect.ids.w != 0u) + effect.projection.y, 0.0, 1.0);
+}
+
+fn layer_mask(layer: Operation, pixel: vec2<u32>, uv: vec2<f32>, surface: Surface, baked: vec3<f32>) -> f32 {
     var mask = layer.balance.y;
     for (var i = 0u; i < layer.effects.y; i++) {
         let e = layers[params.program.x + layer.effects.x + i];
@@ -372,8 +469,10 @@ fn layer_mask(layer: Operation, pixel: vec2<u32>, uv: vec2<f32>) -> f32 {
             let sampled = painted(e, pixel);
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.w;
-        } else if e.ids.y < 10u {
-            result = blend_scalar(u32(e.balance.z), mask, value(e, uv).x);
+        } else if e.ids.y < 20u {
+            result = blend_scalar(u32(e.balance.z), mask, value(e, uv, surface).x);
+        } else if e.ids.y >= 40u {
+            result = blend_scalar(u32(e.balance.z), mask, generator(e, surface, baked));
         } else {
             result = scalar_filter(e, mask);
         }
@@ -448,26 +547,51 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let display_pixel = vec2(id.x + params.program.w, id.y + params.band.z);
-    var pixel = display_pixel * params.source.z;
+    let sample_pixel = display_pixel * params.source.z;
+    var pixel = sample_pixel;
     if params.coverage.x != 0u {
         pixel = padded_source(pixel);
     }
     let covered = all(pixel < params.source.xy);
     let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
+    let surface = surface_at(pixel);
+    var mask_bakes = vec3(1.0, 0.5, 1.0);
+    var display_ao = 1.0;
+    if (params.coverage.w & 2u) != 0u {
+        let display_bake = baked_at(sample_pixel, 0);
+        display_ao = display_bake.x;
+        if covered {
+            mask_bakes = display_bake.xyz;
+            if any(pixel != sample_pixel) { mask_bakes = baked_at(pixel, 0).xyz; }
+        }
+    }
     var base = vec3(0.5);
     var normal = vec3(0.5, 0.5, 1.0);
     var scalars = array<f32, 6>(1.0, 1.0, 0.5, 0.0, 0.5, 0.0);
+    var last_mask = 0xffffffffu;
+    var mask_value = 1.0;
     for (var i = 0u; covered && i < params.program.x; i++) {
         let layer = layers[i];
         var source: vec3<f32>;
         let mode = u32(layer.balance.z);
         var weight = layer.low.w;
+        if layer.effects.y == 0u {
+            weight *= layer.balance.y;
+        } else {
+            if last_mask != layer.effects.x {
+                last_mask = layer.effects.x;
+                mask_value = layer_mask(layer, pixel, uv, surface, mask_bakes);
+            }
+            weight *= mask_value;
+        }
+        if weight <= 0.0 { continue; }
         if layer.ids.y == 10u {
             let sampled = painted(layer, pixel);
             source = sampled.rgb;
             weight *= select(sampled.a, 1.0, mode == 2u && sampled.a > 0.0);
+            if weight <= 0.0 { continue; }
         } else {
-            source = value(layer, uv);
+            source = value(layer, uv, surface);
         }
         let destination = layer.ids.x;
         for (var step = 0u; step < layer.effects.w; step++) {
@@ -475,7 +599,6 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
             let filtered = effect_color(effect, source, destination);
             source += (filtered - source) * effect.low.w;
         }
-        weight *= layer_mask(layer, pixel, uv);
         if destination == 0u {
             base += (blend_rgb(mode, base, source) - base) * weight;
         } else if destination == 7u {
@@ -490,7 +613,8 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         | (srgb[to_u16(base.y) >> 4u] << 8u)
         | (srgb[to_u16(base.z) >> 4u] << 16u)
         | ((to_u16(scalars[0]) >> 8u) << 24u);
-    output[index + params.band.w] = u32(f32(to_u16(scalars[1])) / 65535.0 * 255.0 + 0.5)
+    let ao = clamp(display_ao * f32(to_u16(scalars[1])) / 65535.0, 0.0, 1.0);
+    output[index + params.band.w] = u32(ao * 255.0 + 0.5)
         | ((to_u16(scalars[2]) >> 8u) << 8u)
         | ((to_u16(scalars[3]) >> 8u) << 16u)
         | ((to_u16(scalars[4]) >> 8u) << 24u);
@@ -501,7 +625,12 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         output[height_index + 1u] = pack2x16float(vec2(0.04));
     }
     if params.program.z != 0u {
-        let packed = vec3<f32>(vec3<u32>(to_u16(normal.r), to_u16(normal.g), to_u16(normal.b))) * (2.0 / 65535.0) - 1.0;
+        var detail = vec3<f32>(vec3<u32>(to_u16(normal.r), to_u16(normal.g), to_u16(normal.b))) / 65535.0;
+        if (params.coverage.w & 4u) != 0u {
+            let baked_normal = baked_at(sample_pixel, 1);
+            if baked_normal.a > 0.0 { detail = rnm(baked_normal.rgb, detail); }
+        }
+        let packed = detail * 2.0 - 1.0;
         let normal_index = 2u * (index + 2u * params.band.w);
         output[normal_index] = pack2x16float(packed.xy);
         output[normal_index + 1u] = pack2x16float(vec2(packed.z, 0.5));

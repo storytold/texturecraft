@@ -91,7 +91,9 @@ pub fn sample_session(resolution: u32, bake_resolution: u32) -> Result<Session> 
 }
 
 fn sample(s: &mut Session, _: &Value) -> Result<Value> {
-    let next = sample_session(2048, 1024)?;
+    let started = chrono::Utc::now();
+    let mut next = sample_session(2048, 1024)?;
+    next.log.performance(format!("Sample project setup and mesh-map baking completed in {} ms", (chrono::Utc::now() - started).num_milliseconds()));
     s.switch_to(next);
     Ok(crate::inspect::session(s))
 }
