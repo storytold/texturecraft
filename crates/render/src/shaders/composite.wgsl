@@ -248,6 +248,9 @@ fn pattern(kind: u32, p: vec3<f32>, seed: u32) -> f32 {
 }
 
 fn raw_procedural(layer: Operation, p: vec3<f32>) -> f32 {
+    if layer.ids.y == 80u {
+        return tile_generator(u32(layer.high.w), p.xy);
+    }
     return pattern(layer.ids.y, p, layer.ids.z);
 }
 
@@ -274,7 +277,6 @@ fn azimuth(y: f32, x: f32) -> f32 {
     if x == 0.0 && y == 0.0 { return 0.5; }
     return atan2(y, x) / 6.283185307 + 0.5;
 }
-
 fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
     if layer.ids.y == 0u {
         return layer.low.rgb;

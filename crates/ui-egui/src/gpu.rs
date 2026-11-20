@@ -296,6 +296,7 @@ impl SetCompositor {
             }
             return Err(reason);
         }
+        program.set_tile_images(&session.images);
         self.neutral = program.is_neutral();
         if !current {
             self.failed = Arc::default();

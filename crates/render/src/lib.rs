@@ -25,6 +25,7 @@ pub mod gpu_brush;
 pub mod gpu_composite;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_resize;
+mod gpu_tile_pattern;
 pub mod gpu_trace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod headless;

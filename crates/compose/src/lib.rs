@@ -37,3 +37,4 @@ pub use pattern_context::PatternContext;
 pub use solo::solo_project;
 pub use store::{BakedMaps, ImageRes, ImageStore, PixelStore};
 pub use thumb::{THUMB_TEXELS, ThumbImage, ThumbTarget};
+pub use tile_pattern::{TileLayout, prepare_tile_layout};

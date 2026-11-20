@@ -1,12 +1,12 @@
 //! Compile the viewport's supported UV fills to a small GPU layer program.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
+use std::{borrow::Cow, collections::BTreeMap};
 
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
-use texturecraft_compose::{BakedMaps, DisplayKind, PixelStore};
+use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
     BakedMap, BlendMode, Channel, ChannelKind, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, MaskBackground, ProceduralKind,
     Project, Projection, Source,
@@ -14,6 +14,7 @@ use texturecraft_core::{
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
+use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
 use crate::paint_window::TileWindow;
 use wgpu::util::DeviceExt;
 
@@ -118,6 +119,7 @@ pub struct CompositeProgram {
     layer_count: u32,
     paint: Vec<TileImage>,
     ramp_words: Vec<u32>,
+    tile_patterns: TilePatterns,
     brush_alpha: Option<wgpu::TextureView>,
     pub(crate) region: Option<CompositeRegion>,
     coverage: Option<(Arc<UvGBuffer>, u32)>,
@@ -174,6 +176,11 @@ impl CompositeProgram {
         self.coverage = Some((coverage, radius.min(15)));
     }
 
+    /// Bind the authored images named by Tile Generator sources in this program.
+    pub fn set_tile_images(&mut self, images: &ImageStore) {
+        self.tile_patterns.set_images(images);
+    }
+
     /// Mesh-space projections and generators share the viewport's surface and bake inputs.
     pub fn set_surface_inputs(&mut self, mesh: &Arc<Mesh>, gbuf: &Arc<UvGBuffer>, baked: Option<&BakedMaps>) -> Result<(), &'static str> {
         if self.needs_surface {
@@ -223,6 +230,7 @@ impl CompositeProgram {
         }
         let mut operations = Vec::new();
         let mut paint = Vec::new();
+        let mut tile_patterns = TilePatterns::default();
         let mut effects = Vec::new();
         let mut procedural = ProceduralInputs { resolution: set.resolution, ramp_words: Vec::new() };
         let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (id, 0)).collect();
@@ -270,6 +278,9 @@ impl CompositeProgram {
                     };
                     if !effect.opacity.is_finite() {
                         return Err("A mask effect has an invalid opacity.");
+                    }
+                    if let EffectKind::Fill { source, .. } = &effect.kind {
+                        bind_tile_source(&mut op, Some(source), &mut tile_patterns);
                     }
                     op.low[3] = effect.opacity.clamp(0.0, 1.0);
                     op.balance[2] = blend_code(effect.blend) as f32;
@@ -340,6 +351,7 @@ impl CompositeProgram {
                     op.projection[3] = 1.0;
                     op.uv = [r, g, b, opacity];
                 }
+                bind_tile_source(&mut op, source, &mut tile_patterns);
                 op.ids[0] = slot;
                 op.low[3] = blend.opacity.min(1.0);
                 op.balance[1] = mask_background;
@@ -369,6 +381,7 @@ impl CompositeProgram {
             layer_count,
             paint,
             ramp_words: procedural.ramp_words,
+            tile_patterns,
             brush_alpha: brush.map(|brush| brush.alpha),
             region,
             coverage: None,
@@ -415,6 +428,15 @@ fn blend_code(mode: BlendMode) -> u32 {
         NormalMapCombine => 27,
         NormalMapDetail => 28,
         NormalMapInverseDetail => 29,
+    }
+}
+
+fn bind_tile_source(op: &mut Operation, source: Option<&Source>, patterns: &mut TilePatterns) {
+    if op.ids[1] == TILE_GENERATOR_OPCODE
+        && let Some(Source::Procedural { pattern, .. }) = source
+    {
+        let settings = pattern.tile.as_deref().cloned().unwrap_or_default();
+        op.high[3] = patterns.register(settings, pattern.seed) as f32;
     }
 }
 
@@ -476,7 +498,7 @@ fn source_operation(
                 ProceduralKind::SlubSilk => 76,
                 ProceduralKind::StripFlooring => 77,
                 ProceduralKind::KnottyWood => 78,
-                _ => return None,
+                ProceduralKind::TileGenerator => TILE_GENERATOR_OPCODE,
             };
             op.ids = [0, kind, pattern.seed, u32::from(pattern.invert)];
             op.low[..3].copy_from_slice(low);
@@ -650,6 +672,8 @@ pub(crate) struct GpuCompositor {
     default_vertices: wgpu::Buffer,
     default_baked: wgpu::TextureView,
     default_brush_alpha: wgpu::TextureView,
+    default_tile_images: wgpu::TextureView,
+    tile_images: BTreeMap<usize, TileImageAtlas>,
     paint_upload: Option<wgpu::Buffer>,
 }
 
@@ -657,7 +681,7 @@ impl GpuCompositor {
     pub(crate) fn supports(device: &wgpu::Device) -> bool {
         let limits = device.limits();
         limits.max_storage_buffers_per_shader_stage >= 6
-            && limits.max_sampled_textures_per_shader_stage >= 3
+            && limits.max_sampled_textures_per_shader_stage >= 4
             && limits.max_compute_invocations_per_workgroup >= WORKGROUP * WORKGROUP
             && limits.max_compute_workgroup_size_x >= WORKGROUP
             && limits.max_compute_workgroup_size_y >= WORKGROUP
@@ -667,8 +691,16 @@ impl GpuCompositor {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tc_gpu_composite"),
             source: wgpu::ShaderSource::Wgsl(
-                concat!(include_str!("shaders/noise.wgsl"), "\n", include_str!("shaders/procedural_extra.wgsl"), "\n", include_str!("shaders/composite.wgsl"))
-                    .into(),
+                concat!(
+                    include_str!("shaders/noise.wgsl"),
+                    "\n",
+                    include_str!("shaders/procedural_extra.wgsl"),
+                    "\n",
+                    include_str!("shaders/tile_generator.wgsl"),
+                    "\n",
+                    include_str!("shaders/composite.wgsl")
+                )
+                .into(),
             ),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -710,6 +742,8 @@ impl GpuCompositor {
             default_vertices,
             default_baked,
             default_brush_alpha,
+            default_tile_images: TileImageAtlas::empty_view(device),
+            tile_images: BTreeMap::new(),
             paint_upload: None,
         }
     }
@@ -781,9 +815,11 @@ impl GpuCompositor {
     pub(crate) fn retain_texture_sets(&mut self, count: usize) {
         self.release_unused_surfaces();
         self.baked.retain(|&ts, _| ts < count);
+        self.tile_images.retain(|&ts, _| ts < count);
     }
 
     pub(crate) fn release_unused_surfaces(&mut self) {
+        self.tile_images.retain(|_, atlas| atlas.is_live());
         self.surfaces.retain(|cache| cache.gbuf.strong_count() != 0);
     }
 
@@ -870,6 +906,19 @@ impl GpuCompositor {
         Ok(buffer)
     }
 
+    fn tile_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, patterns: &TilePatterns) -> Result<Option<&TileImageAtlas>, String> {
+        let inputs: Vec<_> = patterns.image_sources().collect();
+        if inputs.is_empty() {
+            self.tile_images.remove(&ts);
+            return Ok(None);
+        }
+        if self.tile_images.get(&ts).is_none_or(|atlas| !atlas.matches(&inputs)) {
+            let atlas = TileImageAtlas::new(device, queue, &inputs)?;
+            self.tile_images.insert(ts, atlas);
+        }
+        Ok(self.tile_images.get(&ts))
+    }
+
     /// Compose bands into reusable GPU scratch space, then copy them into display textures.
     /// Indexed/SRGB and floating-point maps use the same formats as the CPU uploader.
     pub(crate) fn compose(
@@ -912,29 +961,41 @@ impl GpuCompositor {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let atlas = self.tile_atlas(device, queue, ts, &program.tile_patterns)?;
+        let tile_images = atlas.map(|atlas| atlas.view.clone());
+        let (operations, lookup) = if program.tile_patterns.is_empty() && program.ramp_words.is_empty() {
+            (Cow::Borrowed(program.operations.as_slice()), self.lookup.clone())
+        } else {
+            let mut words = texturecraft_texel::srgb_lut().map(u32::from).to_vec();
+            words.extend(&program.ramp_words);
+            let offsets = program.tile_patterns.append_words(&mut words, atlas);
+            let limits = device.limits();
+            // The operation stores the offset as an exactly represented float.
+            if (!offsets.is_empty() && words.len() >= 1 << 24) || (words.len() * 4) as u64 > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size)
+            {
+                return Err("Procedural settings exceed the GPU parameter buffer limit.".into());
+            }
+            let mut operations = program.operations.clone();
+            for op in operations.iter_mut().filter(|op| op.ids[1] == TILE_GENERATOR_OPCODE) {
+                let index = op.high[3] as usize;
+                op.high[3] = *offsets.get(index).ok_or("A Tile Generator operation has no settings.")? as f32;
+            }
+            let lookup = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tc_composite_tile_patterns"),
+                contents: bytemuck::cast_slice(&words),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            (Cow::Owned(operations), lookup)
+        };
+        let tile_images = tile_images.as_ref().unwrap_or(&self.default_tile_images);
         let empty_operation = Operation::zeroed();
         let ops = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tc_composite_operations"),
-            contents: if program.operations.is_empty() { bytemuck::bytes_of(&empty_operation) } else { bytemuck::cast_slice(&program.operations) },
+            contents: if operations.is_empty() { bytemuck::bytes_of(&empty_operation) } else { bytemuck::cast_slice(operations.as_ref()) },
             usage: wgpu::BufferUsages::STORAGE,
         });
         let layout = self.pipeline.get_bind_group_layout(0);
         let limits = device.limits();
-        let lookup_upload = if program.ramp_words.is_empty() {
-            None
-        } else {
-            let size = (LOOKUP_WORDS as u64 + program.ramp_words.len() as u64) * 4;
-            if size > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
-                return Err("Procedural ramp data exceeds the adapter's storage-buffer limit".into());
-            }
-            let words: Vec<_> = texturecraft_texel::srgb_lut().iter().copied().map(u32::from).chain(program.ramp_words.iter().copied()).collect();
-            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("tc_composite_color_parameters"),
-                contents: bytemuck::cast_slice(&words),
-                usage: wgpu::BufferUsages::STORAGE,
-            }))
-        };
-        let lookup = lookup_upload.as_ref().unwrap_or(&self.lookup);
         let max_words = MAX_PAINT_WORDS.min((limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / 4) as usize);
         let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
         let windows = paint_windows(program, region, source_size, shift, radius, max_words)?;
@@ -1007,6 +1068,7 @@ impl GpuCompositor {
                         wgpu::BindGroupEntry { binding: 7, resource: vertices.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
                         wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(brush_alpha) },
+                        wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(tile_images) },
                     ],
                 });
                 {
@@ -1151,6 +1213,108 @@ mod procedural_tests {
             }
         }
     }
+    #[test]
+    fn tile_generator_matches_cpu_with_shaped_and_authored_tiles() {
+        use texturecraft_compose::{ImageRes, ImageStore, PatternContext, pattern::procedural_in};
+        use texturecraft_core::{TileBlending, TileGenerator, TileInputDistribution, TileShape, TileSizeMode};
+
+        const SIZE: u32 = 128;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let (lo, hi) = mesh.bounds();
+        let image = |rgba| Arc::new(ImageRes { width: 2, height: 2, rgba, srgb: false });
+        let images = ImageStore::from([
+            ("tile".into(), image(vec![[1.0, 0.0, 0.0, 1.0], [1.0; 4], [0.0; 4], [0.4; 4]])),
+            ("another".into(), image(vec![[0.3; 4], [0.6; 4], [0.2; 4], [0.9; 4]])),
+            ("background".into(), image(vec![[0.1; 4], [0.2; 4], [0.4; 4], [0.3; 4]])),
+        ]);
+        let context = PatternContext { images: Some(&images), ..Default::default() };
+        let mut gpu = Headless::new().ok();
+        if let Some(gpu) = &mut gpu {
+            gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        }
+        for (index, shape) in TileShape::ALL.into_iter().enumerate() {
+            let in_mask = index % 2 != 0;
+            let projection = if in_mask {
+                Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43] }
+            } else {
+                Projection::Uv { scale: [1.15, 0.76], rotation: 13.0, offset: [-0.51, 0.12] }
+            };
+            let tile = TileGenerator {
+                shape,
+                amount: [5, 3],
+                shape_angle: 13.0,
+                shape_scale: 0.93,
+                shape_size: [0.81, 0.93],
+                shape_tiling: (index % 2 + 1) as u32,
+                shape_diagonal: index % 3 == 0,
+                inputs: vec!["tile".into(), "absent".into(), "another".into()],
+                background_image: Some("background".into()),
+                input_distribution: [TileInputDistribution::ByNumber, TileInputDistribution::Random][index % 2],
+                size_mode: TileSizeMode::ALL[index % TileSizeMode::ALL.len()],
+                middle_size: [0.42, 0.6],
+                interstice: [0.11, 0.32],
+                size_pixel: [429.0, 700.0],
+                size_absolute: [0.3, 0.39],
+                size_random: [0.12, 0.31],
+                position_random: [0.14, 0.38],
+                global_offset: [0.1, 0.35],
+                scale: 1.3,
+                scale_random: 0.37,
+                offset: 0.31,
+                offset_random: 0.4,
+                vertical_offset: index % 3 != 0,
+                quarter_turns: 1,
+                quarter_turn_random: 0.4,
+                quincunx_flip: true,
+                symmetry_random: 0.76,
+                rotation: 13.0,
+                rotation_random: 0.29,
+                luminance_by_scale: true,
+                luminance_random: 0.13,
+                color: 0.87,
+                opacity: 0.93,
+                reverse_order: index % 2 != 0,
+                random_mask: 0.13,
+                blending: TileBlending::ALL[index % TileBlending::ALL.len()],
+                position: 0.56,
+                contrast: 0.15,
+                ..Default::default()
+            };
+            let pattern = Procedural { tile: Some(Box::new(tile)), seed: 73, ..Procedural::new(ProceduralKind::TileGenerator) };
+            let source = Source::Procedural { pattern: pattern.clone(), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
+            let mut project = Project::new("Tile Generator", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+            let fill = Fill {
+                sources: BTreeMap::from([(Channel::BaseColor, if in_mask { Source::Uniform([0.9; 3]) } else { source.clone() })]),
+                projection: projection.clone(),
+                ..Fill::default()
+            };
+            let mut layer = Layer::new(project.alloc_id(), "Tile Generator", LayerKind::Fill(fill), &[Channel::BaseColor]);
+            if in_mask {
+                let mut mask = Mask::new(MaskBackground::Black);
+                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone() }));
+                layer.mask = Some(mask);
+            }
+            project.insert_layer(0, layer, None, false).unwrap();
+            let mut program = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap();
+            program.set_tile_images(&images);
+            if let Some(gpu) = &mut gpu {
+                program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+                gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+                let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][0]).unwrap();
+                for index in (0..rgba.len() / 4).step_by(37) {
+                    let surface = gbuf.surface(&mesh, index).unwrap();
+                    let coords = Coords { uv: surface.uv, pos: (surface.pos - (lo + hi) * 0.5) / ((hi - lo).length() * 0.5), nrm: surface.nrm };
+                    let value = procedural_in(&pattern, &projection, &coords, &context);
+                    let linear = if in_mask { 0.5 + (0.9 - 0.5) * value } else { value };
+                    let expected = srgb_lut()[usize::from(to_u16(linear) >> 4)];
+                    let actual = rgba[index * 4];
+                    assert!(actual.abs_diff(expected) <= 3, "{shape:?}, mask={in_mask}, texel {index}: {actual} instead of {expected}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1171,6 +1335,7 @@ mod paint_window_tests {
             layer_count: 0,
             paint: vec![paint],
             ramp_words: Vec::new(),
+            tile_patterns: TilePatterns::default(),
             brush_alpha: None,
             region: None,
             coverage: None,
