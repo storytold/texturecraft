@@ -239,8 +239,15 @@ impl GpuLink {
         }
 
         let count = session.caches.len();
-        let first = self.upload_cursor.take().filter(|&set| set < count && out.mesh.is_none()).unwrap_or_else(|| session.ts());
-        'uploads: for texture_set in (first..count).chain(0..first.min(count)) {
+        let active = session.ts();
+        let first = self.upload_cursor.take().filter(|&set| set < count && out.mesh.is_none()).unwrap_or(active);
+        let rotation = (first..count).chain(0..first.min(count));
+        // While painting, share the first chunk with the next waiting set. An overloaded
+        // frame still submits at most one chunk in total, independent of material count.
+        let boost = session.stroke_active() && active != first && session.caches.get(active).is_some_and(|c| !c.upload.is_empty());
+        let mut chunk_size = if boost { UPLOAD_CHUNK / 2 } else { UPLOAD_CHUNK };
+        let order = boost.then_some((active, true)).into_iter().chain(rotation.map(|set| (set, false)));
+        'uploads: for (texture_set, boosted) in order {
             let cache = &mut session.caches[texture_set];
             if cache.upload.is_empty() {
                 continue;
@@ -254,10 +261,10 @@ impl GpuLink {
             sent.extend(kinds.iter().copied());
 
             while !cache.upload.is_empty() {
-                let chunk: Vec<_> = if cache.upload.len() <= UPLOAD_CHUNK {
+                let chunk: Vec<_> = if cache.upload.len() <= chunk_size {
                     std::mem::take(&mut cache.upload).into_iter().collect()
                 } else {
-                    (0..UPLOAD_CHUNK).filter_map(|_| cache.upload.pop_first()).collect()
+                    (0..chunk_size).filter_map(|_| cache.upload.pop_first()).collect()
                 };
                 let bytes: Vec<_> = chunk.par_iter()
                     .flat_map_iter(|&(x, y)| kinds.iter().map(move |&kind| (kind, x, y)))
@@ -265,6 +272,10 @@ impl GpuLink {
                     .collect();
                 queued += bytes.len();
                 out.tiles.extend(bytes);
+                if boosted {
+                    break;
+                }
+                chunk_size = UPLOAD_CHUNK;
                 if time_left_ms(queued) < MIN_SLICE_MS {
                     self.upload_cursor = Some((texture_set + 1) % count);
                     break 'uploads;
@@ -616,7 +627,13 @@ mod tests {
             assert!(!scene.tiles.is_empty());
             assert!(scene.tiles.iter().all(|tile| tile.0 == expected));
             assert!(s.caches[expected].upload.is_empty());
+            if expected == 1 {
+                s.caches[1].upload.insert((0, 0));
+            }
         }
+        assert!(!s.caches[1].upload.is_empty());
+        let scene = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
+        assert!(scene.tiles.iter().all(|tile| tile.0 == 1));
         assert!(s.caches.iter().all(|cache| cache.upload.is_empty()));
     }
 
