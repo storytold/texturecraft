@@ -104,6 +104,8 @@ pub struct GpuLink {
     pub adapter: String,
     /// Most tiles waiting to be composited since compositing last caught up (progress).
     composite_total: usize,
+    /// Next set to serve when the last frame exhausted the shared upload budget.
+    upload_cursor: Option<usize>,
     bake_scene: BakeSceneLink,
 }
 
@@ -160,6 +162,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         sent: HashMap::new(),
         adapter: format!("{} ({:?})", info.name, info.backend),
         composite_total: 0,
+        upload_cursor: None,
         bake_scene: BakeSceneLink::default(),
     }
 }
@@ -235,42 +238,37 @@ impl GpuLink {
             }
         }
 
-        for texture_set in 0..session.caches.len() {
-            let tiles = session.take_uploads(texture_set);
-            if tiles.is_empty() {
+        let count = session.caches.len();
+        let first = self.upload_cursor.take().filter(|&set| set < count && out.mesh.is_none()).unwrap_or_else(|| session.ts());
+        'uploads: for texture_set in (first..count).chain(0..first.min(count)) {
+            let cache = &mut session.caches[texture_set];
+            if cache.upload.is_empty() {
                 continue;
             }
+            let empty = Default::default();
+            let baked = session.doc.baked.get(&texture_set).unwrap_or(&empty);
+            let composite = &cache.composite;
+            let channels: Vec<Channel> = composite.channels.keys().copied().collect();
+            let sent = self.sent.entry(texture_set).or_default();
+            let kinds: Vec<DisplayKind> = DisplayKind::ALL.into_iter().filter(|kind| sent.contains(kind) || kinds_for(&channels).any(|needed| needed == *kind)).collect();
+            sent.extend(kinds.iter().copied());
 
-            let mut done = 0;
-            if let Some(cache) = session.caches.get(texture_set) {
-                let empty = Default::default();
-                let baked = session.doc.baked.get(&texture_set).unwrap_or(&empty);
-                let composite = &cache.composite;
-                let channels: Vec<Channel> = composite.channels.keys().copied().collect();
-                let sent = self.sent.entry(texture_set).or_default();
-                let kinds: Vec<DisplayKind> =
-                    DisplayKind::ALL.into_iter().filter(|kind| sent.contains(kind) || kinds_for(&channels).any(|needed| needed == *kind)).collect();
-                sent.extend(kinds.iter().copied());
-
-                // In chunks while the frame has time (at least one chunk); the rest waits
-                for chunk in tiles.chunks(UPLOAD_CHUNK) {
-                    let bytes: Vec<_> = chunk
-                        .par_iter()
-                        .flat_map_iter(|&(tile_x, tile_y)| kinds.iter().map(move |&kind| (kind, tile_x, tile_y)))
-                        .map(|(kind, tile_x, tile_y)| {
-                            (texture_set, kind, tile_x, tile_y, display_tile_bytes(composite, baked, kind, tile_x, tile_y, out.tile_shift))
-                        })
-                        .collect();
-                    queued += bytes.len();
-                    out.tiles.extend(bytes);
-                    done += chunk.len();
-                    if time_left_ms(queued) < MIN_SLICE_MS {
-                        break;
-                    }
+            while !cache.upload.is_empty() {
+                let chunk: Vec<_> = if cache.upload.len() <= UPLOAD_CHUNK {
+                    std::mem::take(&mut cache.upload).into_iter().collect()
+                } else {
+                    (0..UPLOAD_CHUNK).filter_map(|_| cache.upload.pop_first()).collect()
+                };
+                let bytes: Vec<_> = chunk.par_iter()
+                    .flat_map_iter(|&(x, y)| kinds.iter().map(move |&kind| (kind, x, y)))
+                    .map(|(kind, x, y)| (texture_set, kind, x, y, display_tile_bytes(composite, baked, kind, x, y, out.tile_shift)))
+                    .collect();
+                queued += bytes.len();
+                out.tiles.extend(bytes);
+                if time_left_ms(queued) < MIN_SLICE_MS {
+                    self.upload_cursor = Some((texture_set + 1) % count);
+                    break 'uploads;
                 }
-            }
-            if let (Some(rest), Some(cache)) = (tiles.get(done..), session.caches.get_mut(texture_set)) {
-                cache.upload.extend(rest.iter().copied());
             }
         }
 
@@ -508,6 +506,7 @@ mod tests {
             sent: HashMap::new(),
             adapter: String::new(),
             composite_total: 0,
+        upload_cursor: None,
             bake_scene: BakeSceneLink::default(),
         }
     }
@@ -603,6 +602,22 @@ mod tests {
         let out = gpu.sync(&mut plain, None, None, 0, 0.0);
         assert!(!out.tiles.is_empty());
         assert!(!kinds(&out).contains(&DisplayKind::Emissive), "nothing to overwrite in a neutral texture");
+    }
+
+    #[test]
+    fn an_over_budget_frame_services_one_set_and_the_next_frame_services_the_other() {
+        let mut gpu = link();
+        let mut s = Session::new_project("uploads", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        s.update();
+        assert_eq!(s.caches.len(), 2);
+        s.active_set = 1;
+        for expected in [1, 0] {
+            let scene = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
+            assert!(!scene.tiles.is_empty());
+            assert!(scene.tiles.iter().all(|tile| tile.0 == expected));
+            assert!(s.caches[expected].upload.is_empty());
+        }
+        assert!(s.caches.iter().all(|cache| cache.upload.is_empty()));
     }
 
     #[test]

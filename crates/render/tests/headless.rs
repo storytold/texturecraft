@@ -1088,7 +1088,6 @@ fn signed_half_float_normal_tiles_change_shading() {
 
 #[test]
 fn prepacked_viewport_tiles_match_full_tiles_after_device_downscaling() {
-    use texturecraft_compose::DisplayKind;
     let Some((mut h, frame)) = setup() else { return };
     h.renderer.set_display_shift(2);
     h.renderer.set_texture_sets(&h.device, &h.queue, &[((80, 96), 0)], 2);
@@ -1097,7 +1096,8 @@ fn prepacked_viewport_tiles_match_full_tiles_after_device_downscaling() {
     uv.shade.channel = 0;
     let neutral = render(&mut h, &uv, "before_packed_tiles");
     let full: Vec<u8> = (0..64u8).flat_map(|y| (0..64u8).flat_map(move |x| [4 * x, 4 * y, 244, 255])).collect();
-    let packed: Vec<_> = full.chunks_exact(64 * 4).step_by(2).flat_map(|row| row.chunks_exact(4).step_by(2).flatten().copied()).collect();
+    let packed: Vec<_> =
+        full.as_chunks::<{ 64 * 4 }>().0.iter().step_by(2).flat_map(|row| row.as_chunks::<4>().0.iter().step_by(2).flatten().copied()).collect();
     for y in 0..2 {
         for x in 0..2 {
             h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, x, y, &full);
