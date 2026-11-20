@@ -417,7 +417,18 @@ pub enum StackTarget {
     Effect(LayerId),
 }
 
+/// Work left in the viewport after a stroke committed or was cancelled.
+pub(crate) struct DisplayStrokeEnd {
+    pub id: u64,
+    pub ts: usize,
+    pub previous_revision: u64,
+    pub revision: u64,
+    pub tiles: BTreeSet<(u32, u32)>,
+}
+
 pub(crate) struct ActiveStroke {
+    pub display_id: u64,
+    pub display_tiles: BTreeSet<(u32, u32)>,
     pub ts: usize,
     /// None: the stroke edits the quick mask.
     pub target: Option<PaintTarget>,
@@ -529,6 +540,7 @@ pub struct Session {
     /// Viewport size (pixels) used by scripted strokes.
     pub viewport: Vec2,
     pub(crate) stroke: Option<ActiveStroke>,
+    pub(crate) display_stroke_end: Option<DisplayStrokeEnd>,
     /// Layer clipboard: a document snapshot and the copied layer (or effect).
     pub clipboard: Option<(Document, LayerId)>,
     /// Decoded image resources (rebuilt from `doc.resources` by `Session::sync_images`).
@@ -613,6 +625,7 @@ impl Session {
             bake_preview: None,
             viewport: Vec2::new(1280.0, 800.0),
             stroke: None,
+            display_stroke_end: None,
             clipboard: None,
             images: Default::default(),
             quick_mask: Default::default(),
@@ -1476,7 +1489,7 @@ pub(crate) fn uv_layout(t: &TextureSet) -> (usize, Vec<(u32, f32)>) {
     (t.material, t.uv_tiles.iter().map(|u| (*u, t.tile_scale(*u))).collect())
 }
 
-fn next_mesh_id() -> u64 {
+pub(crate) fn next_mesh_id() -> u64 {
     static NEXT_MESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT_MESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

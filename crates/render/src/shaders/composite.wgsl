@@ -15,6 +15,7 @@ struct Params {
     // Source width, source height, display sampling step, height map enabled.
     source: vec4<u32>,
     program: vec4<u32>,
+    coverage: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -22,6 +23,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read> srgb: array<u32>;
 @group(0) @binding(3) var<storage, read_write> output: array<u32>;
 @group(0) @binding(4) var<storage, read> paint: array<u32>;
+@group(0) @binding(5) var<storage, read> island_padding: array<u32>;
 
 fn pcg3d(cell: vec3<u32>) -> vec3<u32> {
     var v = cell * 1664525u + 1013904223u;
@@ -389,12 +391,23 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= params.band.x || id.y >= params.band.y {
         return;
     }
-    let pixel = vec2(id.x, id.y + params.band.z) * params.source.z;
+    let display_pixel = vec2(id.x + params.program.w, id.y + params.band.z);
+    var pixel = display_pixel * params.source.z;
+    var covered = true;
+    if params.coverage.x != 0u {
+        let i = display_pixel.y * params.coverage.y + display_pixel.x;
+        let packed = (island_padding[i / 2u] >> ((i % 2u) * 16u)) & 65535u;
+        covered = packed != 65535u;
+        if covered {
+            let offset = vec2<i32>(i32(packed & 63u) - 31, i32(packed >> 6u) - 31);
+            pixel = vec2<u32>(vec2<i32>(pixel) + offset);
+        }
+    }
     let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
     var base = vec3(0.5);
     var normal = vec3(0.5, 0.5, 1.0);
     var scalars = array<f32, 6>(1.0, 1.0, 0.5, 0.0, 0.5, 0.0);
-    for (var i = 0u; i < params.program.x; i++) {
+    for (var i = 0u; covered && i < params.program.x; i++) {
         let layer = layers[i];
         var source: vec3<f32>;
         let mode = u32(layer.balance.z);

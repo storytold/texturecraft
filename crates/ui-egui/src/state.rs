@@ -153,6 +153,8 @@ pub struct Prefs {
     pub viewport_texture: u8,
     /// Prefer GPU layer compositing in the material viewport where available.
     pub gpu_compositing: bool,
+    /// Show a coarse view of the whole material before its detailed CPU tiles arrive.
+    pub material_start_preview: bool,
     /// Interface brightness (the views keep their own background).
     pub brightness: crate::theme::Brightness,
     /// The colour of what is on, chosen or focused.
@@ -202,6 +204,7 @@ impl Default for Prefs {
             language: "en".into(),
             viewport_texture: 0,
             gpu_compositing: true,
+            material_start_preview: true,
             brightness: crate::theme::Brightness::default(),
             accent: crate::theme::Accent::default(),
             system_title_bar: false,

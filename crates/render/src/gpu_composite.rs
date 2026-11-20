@@ -1,9 +1,12 @@
 //! Compile the viewport's supported UV fills to a small GPU layer program.
 
+use std::sync::{Arc, Weak};
+
 use bytemuck::{Pod, Zeroable};
+use rayon::prelude::*;
 use texturecraft_compose::PixelStore;
 use texturecraft_core::{BlendMode, Channel, Effect, EffectKind, Filter, LayerKind, MaskBackground, ProceduralKind, Project, Projection, Source};
-use texturecraft_texel::{TILE, TILE_AREA, TileImage};
+use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage};
 use wgpu::util::DeviceExt;
 
 const MAX_LAYERS: usize = 128;
@@ -29,11 +32,50 @@ struct Operation {
     effects: [u32; 4],
 }
 
+/// Inclusive origin and exclusive end of a material update, in document texels.
+#[derive(Clone, Copy, Debug)]
+pub struct CompositeRegion {
+    pub(crate) min: [u32; 2],
+    pub(crate) max: [u32; 2],
+}
+
+impl CompositeRegion {
+    pub fn from_tiles(tiles: impl IntoIterator<Item = (u32, u32)>) -> Option<Self> {
+        let mut tiles = tiles.into_iter();
+        let (x, y) = tiles.next()?;
+        let mut region = Self { min: [x * TILE, y * TILE], max: [(x + 1) * TILE, (y + 1) * TILE] };
+        for (x, y) in tiles {
+            region.min = [region.min[0].min(x * TILE), region.min[1].min(y * TILE)];
+            region.max = [region.max[0].max((x + 1) * TILE), region.max[1].max((y + 1) * TILE)];
+        }
+        Some(region)
+    }
+
+    fn includes_tile(self, x: u32, y: u32) -> bool {
+        let (x, y) = (x * TILE, y * TILE);
+        x >= self.min[0] && x < self.max[0] && y >= self.min[1] && y < self.max[1]
+    }
+
+    pub fn expanded(self, texels: u32) -> Self {
+        Self { min: self.min.map(|x| x.saturating_sub(texels)), max: self.max.map(|x| x.saturating_add(texels)) }
+    }
+
+    pub fn bounds(self) -> ([u32; 2], [u32; 2]) {
+        (self.min, self.max)
+    }
+
+    pub(crate) fn viewport(self, shift: u32, size: (u32, u32)) -> Self {
+        Self { min: [self.min[0] >> shift, self.min[1] >> shift], max: [(self.max[0] >> shift).min(size.0), (self.max[1] >> shift).min(size.1)] }
+    }
+}
+
 #[derive(Debug)]
 pub struct CompositeProgram {
     operations: Vec<Operation>,
     layer_count: u32,
     paint: Vec<u32>,
+    pub(crate) region: Option<CompositeRegion>,
+    pub(crate) coverage: Option<Arc<DilationMap>>,
     pub(crate) writes_height: bool,
     pub(crate) writes_normal: bool,
 }
@@ -43,9 +85,18 @@ impl CompositeProgram {
         (self.paint.len() * size_of::<u32>()) as u64
     }
 
+    /// Let the shader sample the nearest covered UV texel for island padding.
+    pub fn set_coverage(&mut self, coverage: Option<Arc<DilationMap>>) {
+        self.coverage = coverage;
+    }
+
     /// A flat stack of sparse paint, solid and UV procedural fills, masks and point effects.
     /// Disabled layers need no work. Stacks outside this evaluator's domain use the CPU.
     pub fn compile(project: &Project, pixels: &PixelStore, ts: usize) -> Option<Self> {
+        Self::compile_region(project, pixels, ts, None)
+    }
+
+    pub fn compile_region(project: &Project, pixels: &PixelStore, ts: usize, region: Option<CompositeRegion>) -> Option<Self> {
         use Channel::*;
         let set = project.texture_sets.get(ts)?;
         if !set.uv_tiles.is_empty() || set.has_channel(Glossiness) {
@@ -74,7 +125,7 @@ impl CompositeProgram {
                             if (image.width(), image.height()) != set.size() || image.comps() != 2 {
                                 return None;
                             }
-                            Operation { ids: [0, 10, pack_paint(&mut paint, image)?, 2], ..Operation::zeroed() }
+                            Operation { ids: [0, 10, pack_paint(&mut paint, image, region.map(|r| r.expanded(TILE)))?, 2], ..Operation::zeroed() }
                         }
                         _ => point_effect(effect)?,
                     };
@@ -148,7 +199,7 @@ impl CompositeProgram {
                     _ => return None,
                 };
                 let mut op = if let Some(image) = painted {
-                    Operation { ids: [slot, 10, pack_paint(&mut paint, image)?, image.comps() as u32], ..Operation::zeroed() }
+                    Operation { ids: [slot, 10, pack_paint(&mut paint, image, region.map(|r| r.expanded(TILE)))?, image.comps() as u32], ..Operation::zeroed() }
                 } else {
                     source_operation(source, &fill?.projection, default)?
                 };
@@ -175,7 +226,7 @@ impl CompositeProgram {
         let writes_normal = changes_channel(7, Normal.default_value());
         let layer_count = operations.len() as u32;
         operations.extend(effects);
-        Some(Self { operations, layer_count, paint, writes_height, writes_normal })
+        Some(Self { operations, layer_count, paint, region, coverage: None, writes_height, writes_normal })
     }
 }
 
@@ -288,15 +339,18 @@ fn point_effect(effect: &Effect) -> Option<Operation> {
 
 /// An index for each document tile followed by the texels of allocated tiles. Two u16
 /// components fit in each word. A missing tile leaves the accumulated material untouched.
-fn pack_paint(dst: &mut Vec<u32>, image: &TileImage) -> Option<u32> {
+fn pack_paint(dst: &mut Vec<u32>, image: &TileImage, region: Option<CompositeRegion>) -> Option<u32> {
     let table = dst.len();
     let count = image.tiles_x() as usize * image.tiles_y() as usize;
     let words_per_tile = TILE_AREA * image.comps() / 2;
-    if table.checked_add(count)?.checked_add(image.allocated_count().checked_mul(words_per_tile)?)? > MAX_PAINT_WORDS {
+    if table.checked_add(count)? > MAX_PAINT_WORDS {
         return None;
     }
     dst.resize(table + count, 0);
-    for (x, y) in image.allocated() {
+    for (x, y) in image.allocated().filter(|&(x, y)| region.is_none_or(|r| r.includes_tile(x, y))) {
+        if dst.len().checked_add(words_per_tile)? > MAX_PAINT_WORDS {
+            return None;
+        }
         let texels = image.tile(x, y)?;
         let (pairs, remainder) = texels.as_chunks::<2>();
         if pairs.len() != words_per_tile || !remainder.is_empty() {
@@ -312,12 +366,14 @@ fn pack_paint(dst: &mut Vec<u32>, image: &TileImage) -> Option<u32> {
 pub(crate) struct GpuCompositor {
     pipeline: wgpu::ComputePipeline,
     lookup: wgpu::Buffer,
+    uniform_coverage: wgpu::Buffer,
+    coverage: Option<(Weak<DilationMap>, u32, wgpu::Buffer)>,
 }
 
 impl GpuCompositor {
     pub(crate) fn supports(device: &wgpu::Device) -> bool {
         let limits = device.limits();
-        limits.max_storage_buffers_per_shader_stage >= 4
+        limits.max_storage_buffers_per_shader_stage >= 5
             && limits.max_compute_invocations_per_workgroup >= WORKGROUP * WORKGROUP
             && limits.max_compute_workgroup_size_x >= WORKGROUP
             && limits.max_compute_workgroup_size_y >= WORKGROUP
@@ -342,22 +398,77 @@ impl GpuCompositor {
             contents: bytemuck::cast_slice(&values),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        Self { pipeline, lookup }
+        let uniform_coverage = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tc_composite_uniform_coverage"),
+            contents: &[0; 4],
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        Self { pipeline, lookup, uniform_coverage, coverage: None }
+    }
+
+    fn coverage_buffer(&mut self, device: &wgpu::Device, map: Option<&Arc<DilationMap>>, shift: u32, size: (u32, u32)) -> Result<wgpu::Buffer, String> {
+        let Some(map) = map else { return Ok(self.uniform_coverage.clone()) };
+        let key = Arc::downgrade(map);
+        if let Some((cached, last_shift, buffer)) = &self.coverage
+            && key.ptr_eq(cached)
+            && shift == *last_shift
+        {
+            return Ok(buffer.clone());
+        }
+        let (w, h) = (size.0 as usize, size.1 as usize);
+        let count = (w * h).div_ceil(2);
+        let limits = device.limits();
+        if (count * 4) as u64 > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
+            return Err("UV padding data exceeds the adapter's storage-buffer limit".into());
+        }
+        let sample = |i: usize| -> Option<u32> {
+            if i >= w * h {
+                return Some(0xffff);
+            }
+            let (x, y) = (((i % w) as u32) << shift, ((i / w) as u32) << shift);
+            let Some((sx, sy)) = map.source(x, y) else { return Some(0xffff) };
+            let (dx, dy) = (sx as i32 - x as i32, sy as i32 - y as i32);
+            if !(-31..=31).contains(&dx) || !(-31..=31).contains(&dy) {
+                return None;
+            }
+            Some(((dx + 31) as u32) | (((dy + 31) as u32) << 6))
+        };
+        // Store two offset pairs per word. The source atlas already owns its exact, dense
+        // padding map. A reduced viewport only uploads offsets for the texels it will sample.
+        let words: Vec<u32> = (0..count)
+            .into_par_iter()
+            .map(|i| Some(sample(2 * i)? | (sample(2 * i + 1)? << 16)))
+            .collect::<Option<_>>()
+            .ok_or("UV padding exceeds the shader's offset range")?;
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tc_composite_coverage"),
+            contents: bytemuck::cast_slice(&words),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        self.coverage = Some((key, shift, buffer.clone()));
+        Ok(buffer)
     }
 
     /// Compose bands into reusable GPU scratch space, then copy them into display textures.
     /// Indexed/SRGB and floating-point maps use the same formats as the CPU uploader.
     pub(crate) fn encode(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         program: &CompositeProgram,
         source_size: (u32, u32),
         shift: u32,
         textures: [&wgpu::Texture; 4],
-    ) {
-        let width = textures[0].width();
-        let height = textures[0].height();
+    ) -> Result<(), String> {
+        let extent = (textures[0].width(), textures[0].height());
+        let coverage = self.coverage_buffer(device, program.coverage.as_ref(), shift, extent)?;
+        let region = program.region.map(|r| r.viewport(shift, extent)).unwrap_or(CompositeRegion { min: [0; 2], max: [extent.0, extent.1] });
+        let [left, start_y] = region.min;
+        let width = region.max[0].saturating_sub(left);
+        let height = region.max[1].saturating_sub(start_y);
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
         let bands = height.div_ceil(ROWS);
         let pitch = width.next_multiple_of(64);
         let area = pitch * ROWS;
@@ -393,7 +504,7 @@ impl GpuCompositor {
             let values = [
                 width,
                 rows,
-                top,
+                top + start_y,
                 area,
                 source_size.0,
                 source_size.1,
@@ -402,6 +513,10 @@ impl GpuCompositor {
                 program.layer_count,
                 pitch,
                 u32::from(program.writes_normal),
+                left,
+                u32::from(program.coverage.is_some()),
+                extent.0,
+                0,
                 0,
             ];
             let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -418,6 +533,7 @@ impl GpuCompositor {
                     wgpu::BindGroupEntry { binding: 2, resource: self.lookup.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
                 ],
             });
             {
@@ -436,10 +552,11 @@ impl GpuCompositor {
                         buffer: &scratch,
                         layout: wgpu::TexelCopyBufferLayout { offset: stride * offset, bytes_per_row: Some(pitch * bytes_per_texel), rows_per_image: None },
                     },
-                    wgpu::TexelCopyTextureInfo { origin: wgpu::Origin3d { x: 0, y: top, z: 0 }, ..texture.as_image_copy() },
+                    wgpu::TexelCopyTextureInfo { origin: wgpu::Origin3d { x: left, y: start_y + top, z: 0 }, ..texture.as_image_copy() },
                     wgpu::Extent3d { width, height: rows, depth_or_array_layers: 1 },
                 );
             }
         }
+        Ok(())
     }
 }

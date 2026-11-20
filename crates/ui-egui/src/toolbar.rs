@@ -551,6 +551,11 @@ pub fn status_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                     ui.label(RichText::new(&msg.message).size(11.0).color(tk.text_dim));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(gpu) = app.gpu.as_ref().filter(|_| app.session.project_open) {
+                        let (label, reason) = gpu.compositor_status();
+                        ui.label(RichText::new(tr(label)).size(11.0).color(tk.text_dim)).on_hover_text(tr(reason));
+                        ui.separator();
+                    }
                     let gpu = app.gpu.as_ref().map(|g| g.adapter.as_str()).unwrap_or(tr("no GPU"));
                     ui.label(
                         RichText::new(trf("Version: {version} ({gpu})", &[("version", &texturecraft_engine::VERSION), ("gpu", &gpu)]))

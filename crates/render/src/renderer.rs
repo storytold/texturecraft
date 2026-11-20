@@ -1537,7 +1537,7 @@ impl Renderer {
         }
 
         let (compositor, textures) = crate::gpu_trace::scoped(device, "viewport GPU composite", || {
-            let compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
+            let mut compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
             let mut maps: Vec<_> = DisplayKind::ALL
                 .iter()
                 .zip(&self.default_texels)
@@ -1549,26 +1549,37 @@ impl Renderer {
                     let extent = if composed { size } else { (1, 1) };
                     if extent == (old.texture.width(), old.texture.height()) {
                         old.clone()
-                    } else if composed {
+                    } else if composed && program.region.is_none() {
                         Tex::new(device, "tc_composite", extent.0, extent.1, display_format(kind), mip_count(extent.0.max(extent.1)))
                     } else {
-                        neutral_tex(device, queue, extent, display_format(kind), 1, neutral)
+                        neutral_tex(device, queue, extent, display_format(kind), mip_count(extent.0.max(extent.1)), neutral)
                     }
                 })
                 .collect();
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite") });
             if let (Some(base), Some(orm), Some(height), Some(normal)) = (maps.first(), maps.get(1), maps.get(3), maps.get(2)) {
-                compositor.encode(device, &mut encoder, program, set.size, set.shift, [&base.texture, &orm.texture, &height.texture, &normal.texture]);
+                compositor.encode(device, &mut encoder, program, set.size, set.shift, [&base.texture, &orm.texture, &height.texture, &normal.texture])?;
             }
             queue.submit([encoder.finish()]);
             maps.extend(set.tex.last().cloned());
-            (compositor, maps)
-        })?;
+            Ok::<_, String>((compositor, maps))
+        })??;
         self.compositor = Some(compositor);
         if let Some(set) = self.sets.get_mut(ts) {
+            let region = program.region.map(|r| r.viewport(set.shift, size));
+            for ((mips, old), new) in set.mips_dirty.iter_mut().zip(&set.tex).zip(&textures).take(DisplayKind::ALL.len()) {
+                if let Some(region) = region
+                    && old.texture == new.texture
+                {
+                    if new.mips > 1 {
+                        mips.add(region.min[0], region.min[1], region.max[0], region.max[1]);
+                    }
+                } else {
+                    *mips = MipsDirty::All;
+                }
+            }
             set.tex = textures;
             set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
-            set.mips_dirty.iter_mut().take(DisplayKind::ALL.len()).for_each(|mips| *mips = MipsDirty::All);
             set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
             self.content_rev += 1;
         }

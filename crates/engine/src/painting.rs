@@ -11,7 +11,9 @@ use texturecraft_paint::{
     rasterize,
 };
 
-use crate::session::{ActiveStroke, CloneFrom, QUICK_MASK_STROKE_LABEL, Session, StackTarget, Tool, history_label, stroke_template};
+use crate::session::{
+    ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
+};
 use crate::uv_stroke_state::UvStrokeState;
 use crate::uv_symmetry::UvMirror;
 use crate::{EngineError, Result};
@@ -323,6 +325,8 @@ impl Session {
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
         self.stroke = Some(ActiveStroke {
+            display_id: next_mesh_id(),
+            display_tiles: BTreeSet::new(),
             ts,
             target,
             stroke,
@@ -537,11 +541,63 @@ impl Session {
             PaintTarget::Mask(eid) => staging.stage_mask(pixels, eid, mask_value, &src),
         });
         st.staging = staging;
+        st.display_tiles.extend(recent.iter().copied());
         self.mark_painted(ts, target, recent);
     }
 
     pub fn stroke_active(&self) -> bool {
         self.stroke.is_some()
+    }
+
+    /// Identity and tiles of a supported live stroke since the display last drew it.
+    pub fn pending_display_stroke(&self, ts: usize) -> Option<(u64, &BTreeSet<(u32, u32)>)> {
+        let stroke = self.stroke.as_ref()?;
+        (stroke.ts == ts && stroke.target.is_some() && stroke.stencil.is_none() && stroke.canvas.pickup.is_none())
+            .then_some((stroke.display_id, &stroke.display_tiles))
+    }
+
+    /// Copy-on-write material pixels for display. The staged blends are the same tiles the
+    /// completed stroke will install. The live viewport does not change the document or Undo.
+    pub fn display_stroke_pixels(&self, ts: usize, texel_bounds: Option<([u32; 2], [u32; 2])>) -> Option<texturecraft_compose::PixelStore> {
+        self.pending_display_stroke(ts)?;
+        let stroke = self.stroke.as_ref()?;
+        let tiles_in_bounds;
+        let touched = if let Some((min, max)) = texel_bounds {
+            use texturecraft_texel::TILE;
+            tiles_in_bounds = stroke
+                .canvas
+                .dirty
+                .iter()
+                .copied()
+                .filter(|&(x, y)| {
+                    let (x, y) = (x * TILE, y * TILE);
+                    x >= min[0] && x < max[0] && y >= min[1] && y < max[1]
+                })
+                .collect();
+            &tiles_in_bounds
+        } else {
+            &stroke.canvas.dirty
+        };
+        let size = (stroke.canvas.alpha.width(), stroke.canvas.alpha.height());
+        let mut pixels = self.doc.pixels.clone();
+        let mut staging = stroke.staging.snapshot(touched);
+        with_commit_source(stroke, None, &self.mesh, touched, |source| match stroke.target {
+            Some(PaintTarget::Layer(id)) => commit_layer(&mut pixels, id, size, &stroke.values, source, &mut staging),
+            Some(PaintTarget::Mask(id)) => commit_mask(&mut pixels, id, size, self.tool.mask_value, source, &mut staging),
+            None => {}
+        });
+        Some(pixels)
+    }
+
+    pub fn clear_display_stroke_tiles(&mut self) {
+        if let Some(stroke) = self.stroke.as_mut() {
+            stroke.display_tiles.clear();
+        }
+    }
+
+    pub fn finished_display_stroke(&self, ts: usize, id: u64, previous_revision: u64) -> Option<&BTreeSet<(u32, u32)>> {
+        let end = self.display_stroke_end.as_ref()?;
+        (end.ts == ts && end.id == id && end.previous_revision == previous_revision && end.revision == self.revision).then_some(&end.tiles)
     }
 
     /// Commit the active stroke (one undo step).
@@ -578,7 +634,9 @@ impl Session {
         }
         self.redo.clear();
         self.modified = true;
+        let previous_revision = self.revision;
         self.revision = self.revision.wrapping_add(1);
+        self.display_stroke_end = Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision, revision: self.revision, tiles: st.display_tiles });
         // The live preview already shows the committed result: the stroke's tiles recomposite
         // from the committed pixels at low priority, without holding up this frame.
         self.mark_settle(st.ts, st.target, st.canvas.dirty.iter().copied());
@@ -596,6 +654,8 @@ impl Session {
                 self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
             }
             self.doc = st.before;
+            self.display_stroke_end =
+                Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision: self.revision, revision: self.revision, tiles: st.canvas.dirty });
         }
     }
 

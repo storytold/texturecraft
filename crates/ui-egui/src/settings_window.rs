@@ -368,6 +368,12 @@ fn general(
             .on_hover_text(tr("GPU uses the CPU on unsupported devices or layer stacks. CPU forces software composition."));
     });
 
+    row(ui, tr("Low-resolution material preview"), |ui, label| {
+        ui.checkbox(&mut p.material_start_preview, "")
+            .labelled_by(label)
+            .on_hover_text(tr("Show a quick preview when opening or resizing a texture set. Turn off to see the finished tiles as they arrive."));
+    });
+
     ui.horizontal(|ui| {
         ui.add_space(12.0);
         ui.add_enabled_ui(false, |ui| {

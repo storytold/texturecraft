@@ -145,7 +145,7 @@ impl BlendKey {
 }
 
 /// One destination tile prepared while the stroke is drawn.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct StagedTile {
     /// The layer tile it was copied from (None: the layer had no tile there).
     from: Option<TileData>,
@@ -246,6 +246,19 @@ impl Staging {
         let value = [value.clamp(0.0, 1.0)];
         let b = Blend { kind: ChannelKind::Scalar, value: &value, stencil_color: false, carried: src.carried_mask };
         self.images.entry(None).or_default().stage(pixels.masks.get(&effect), 2, &b, src);
+    }
+
+    /// Copy only the destination tiles the live viewport is about to show.
+    pub fn snapshot(&self, tiles: &BTreeSet<(u32, u32)>) -> Self {
+        let images = self
+            .images
+            .iter()
+            .map(|(channel, image)| {
+                let tiles = tiles.iter().filter_map(|tile| image.tiles.get(tile).map(|data| (*tile, data.clone()))).collect();
+                (*channel, StagedImage { key: image.key.clone(), tiles })
+            })
+            .collect();
+        Self { images }
     }
 
     fn take(&mut self, key: Option<Channel>) -> Option<StagedImage> {

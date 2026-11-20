@@ -453,6 +453,7 @@ impl PendingSync {
             .zip(app.session.caches.get(app.session.ts()))
             .map(|(size, cache)| visible_uv_bounds(size, cache.size, app.ui.uv_zoom, app.ui.uv_pan, app.ui.uv_rotation));
         gpu.prefer_gpu_layers = app.ui.prefs.gpu_compositing;
+        gpu.material_start_preview = app.ui.prefs.material_start_preview;
         let scene = gpu.sync_view(
             &mut app.session,
             aux,

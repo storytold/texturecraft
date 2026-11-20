@@ -45,6 +45,11 @@ impl DisplayPadding {
         self.uniform == Some(true)
     }
 
+    /// Share existing island padding without constructing a dense map for uniform coverage.
+    pub fn existing_sources(&self) -> Option<Arc<DilationMap>> {
+        if self.uniform.is_none() { self.dense.get().cloned() } else { None }
+    }
+
     pub(crate) fn bytes(&self) -> usize {
         self.dense.get().map_or(0, |map| map.src.capacity() * size_of::<u32>())
     }
