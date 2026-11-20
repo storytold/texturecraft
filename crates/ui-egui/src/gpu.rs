@@ -57,7 +57,7 @@ pub struct SceneSync {
     pub tile_shift: u32,
     pub overview: Option<(usize, texturecraft_engine::MaterialOverview)>,
     cleared_overviews: Vec<usize>,
-    composite: Option<(CompositeProgram, Arc<AtomicBool>)>,
+    composites: Vec<(usize, CompositeProgram, Arc<AtomicBool>)>,
     trace_composite: Option<(f64, Arc<AtomicBool>)>,
     pub(crate) compositor_changed: bool,
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
@@ -77,7 +77,7 @@ pub struct SceneSync {
 }
 
 impl SceneSync {
-    fn apply_display(&self, renderer: &mut Renderer, device: &wgpu::Device, queue: &wgpu::Queue) -> (Vec<usize>, Option<String>) {
+    fn apply_display(&self, renderer: &mut Renderer, device: &wgpu::Device, queue: &wgpu::Queue) -> (Vec<usize>, Vec<(usize, String)>) {
         let mut reset = Vec::new();
         if let Some((sets, material_count, shift)) = &self.sets {
             renderer.set_display_shift(*shift);
@@ -87,19 +87,20 @@ impl SceneSync {
             renderer.seed_display(device, queue, ts, (1, 1), &[]);
             reset.push(ts);
         }
-        let error = self.composite.as_ref().and_then(|(program, failed)| {
-            let error = renderer.composite_on_gpu(device, queue, 0, program).err()?;
-            log::warn!("Using CPU composition after a GPU error: {error}");
-            failed.store(true, Ordering::Release);
-            Some(error)
-        });
+        let mut errors = Vec::new();
+        for (ts, program, failed) in &self.composites {
+            if let Err(error) = renderer.composite_on_gpu(device, queue, *ts, program) {
+                failed.store(true, Ordering::Release);
+                errors.push((*ts, error));
+            }
+        }
         if let Some((ts, overview)) = &self.overview {
             renderer.seed_display(device, queue, *ts, overview.size, &overview.maps);
         }
         for (texture_set, kind, tile_x, tile_y, bytes) in &self.tiles {
             renderer.upload_display_tile(device, queue, *texture_set, *kind, *tile_x, *tile_y, bytes, self.tile_shift);
         }
-        (reset, error)
+        (reset, errors)
     }
 }
 
@@ -125,6 +126,96 @@ pub struct GpuReports {
 
 /// Most distinct uncaptured GPU errors kept until the UI shows them.
 const MAX_GPU_ERRORS: usize = 8;
+
+#[derive(Default)]
+struct SetCompositor {
+    current: Option<CompositeKey>,
+    stroke: Option<u64>,
+    rejected: Option<(CompositeKey, &'static str)>,
+    failed: Arc<AtomicBool>,
+    reason: &'static str,
+    neutral: bool,
+    logged_status: Option<(&'static str, &'static str)>,
+}
+
+impl SetCompositor {
+    fn uses_gpu(&self) -> bool {
+        self.current.is_some() && !self.failed.load(Ordering::Acquire)
+    }
+
+    fn plan(&mut self, session: &Session, ts: usize, shift: u32, global_reason: &'static str) -> Result<Option<CompositeProgram>, &'static str> {
+        if !global_reason.is_empty() {
+            return Err(global_reason);
+        }
+        if self.failed.load(Ordering::Acquire) {
+            return Err(n_("GPU compositing reported a device error. See the app log for details."));
+        }
+        let stroke = session.pending_display_stroke(ts);
+        if session.stroke_texture_set() == Some(ts) && stroke.is_none() {
+            return Err(n_("This painting tool uses CPU compositing."));
+        }
+        if session.doc.baked.get(&ts).is_some_and(|maps| maps.maps.contains_key(&BakedMap::AmbientOcclusion) || maps.maps.contains_key(&BakedMap::Normal)) {
+            return Err(n_("This material uses baked normal or ambient occlusion maps."));
+        }
+
+        let cache = &session.caches[ts];
+        let padding = cache.dilation.mixed_coverage();
+        if !cache.dilation.fully_covered() && padding.is_none() {
+            return Err(n_("The texture set has no covered UV texels."));
+        }
+        let key = CompositeKey { mesh: session.mesh_id, revision: cache.material_revision, size: cache.size, shift };
+        let stroke_id = stroke.map(|(id, _)| id);
+        let current = self.current == Some(key);
+        let unchanged_stroke = self.stroke == stroke_id;
+        if current && unchanged_stroke && stroke.is_none_or(|(_, tiles)| tiles.is_empty()) {
+            return Ok(None);
+        }
+        if stroke.is_none()
+            && let Some((_, reason)) = self.rejected.filter(|(rejected, _)| *rejected == key)
+        {
+            return Err(reason);
+        }
+        let changed_tiles = if current
+            && (unchanged_stroke || self.stroke.is_none())
+            && let Some((_, tiles)) = stroke
+        {
+            Some(tiles)
+        } else if stroke.is_none()
+            && let Some(previous_id) = self.stroke
+            && let Some(previous) = self.current.filter(|old| old.mesh == key.mesh && old.size == key.size && old.shift == key.shift)
+        {
+            session.finished_display_stroke(ts, previous_id, previous.revision)
+        } else {
+            None
+        };
+        let region = changed_tiles
+            .and_then(|tiles| CompositeRegion::from_tiles(tiles.iter().copied()))
+            .map(|r| if padding.is_some() { r.expanded(texturecraft_engine::texel::TILE) } else { r });
+        if changed_tiles.is_some() && region.is_none() {
+            self.current = Some(key);
+            self.stroke = stroke_id;
+            return Ok(None);
+        }
+        let preview = session.display_stroke_pixels(ts, region.map(|r| r.expanded(texturecraft_engine::texel::TILE).bounds()));
+        let pixels = preview.as_ref().unwrap_or(&session.doc.pixels);
+        let mut program = match CompositeProgram::try_compile_region(&session.doc.project, pixels, ts, region) {
+            Ok(program) => program,
+            Err(reason) => {
+                if stroke_id.is_none() {
+                    self.rejected = Some((key, reason));
+                }
+                return Err(reason);
+            }
+        };
+        if let Some(padding) = padding {
+            program.set_coverage(padding, texturecraft_engine::session::DISPLAY_PADDING);
+        }
+        self.neutral = program.is_neutral();
+        self.current = Some(key);
+        self.stroke = stroke_id;
+        Ok(Some(program))
+    }
+}
 
 /// UI-side bookkeeping of what the GPU already has.
 pub struct GpuLink {
@@ -160,13 +251,8 @@ pub struct GpuLink {
     gpu_composite_enabled: bool,
     pub(crate) prefer_gpu_layers: bool,
     pub(crate) material_start_preview: bool,
-    cpu_reason: &'static str,
-    gpu_composite_current: Option<CompositeKey>,
-    gpu_display_stroke: Option<u64>,
-    gpu_composite_rejected: Option<(CompositeKey, &'static str)>,
-    gpu_composite_failed: Arc<AtomicBool>,
+    compositors: Vec<SetCompositor>,
     gpu_composite_in_flight: Arc<AtomicBool>,
-    logged_compositor: Option<(u64, &'static str, &'static str)>,
     cpu_composite_started: Option<f64>,
     cpu_padding_pending: bool,
     bake_scene: BakeSceneLink,
@@ -230,13 +316,8 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
             && std::env::var("TEXTURECRAFT_GPU_COMPOSITE").as_deref() != Ok("0"),
         prefer_gpu_layers: true,
         material_start_preview: true,
-        cpu_reason: n_("Waiting for the first material update"),
-        gpu_composite_current: None,
-        gpu_display_stroke: None,
-        gpu_composite_rejected: None,
-        gpu_composite_failed: Arc::default(),
+        compositors: Vec::new(),
         gpu_composite_in_flight: Arc::default(),
-        logged_compositor: None,
         cpu_composite_started: None,
         cpu_padding_pending: false,
         bake_scene: BakeSceneLink::default(),
@@ -254,15 +335,19 @@ impl GpuLink {
         self.bake_scene.busy()
     }
 
+    fn cpu_sets<'a>(&'a self, session: &'a Session) -> impl Iterator<Item = &'a texturecraft_engine::session::SetCache> {
+        session.caches.iter().enumerate().filter_map(|(ts, cache)| {
+            let gpu_current = self.prefer_gpu_layers
+                && self.compositors.get(ts).is_some_and(|state| {
+                    state.uses_gpu() && state.current.is_some_and(|key| key.mesh == session.mesh_id && key.revision == cache.material_revision)
+                });
+            (!gpu_current).then_some(cache)
+        })
+    }
+
     /// CPU display work can stay deferred while the current detail textures are GPU-resident.
-    pub(crate) fn display_pending(&self, s: &Session) -> bool {
-        if self.prefer_gpu_layers
-            && self.gpu_composite_current.is_some_and(|key| key.mesh == s.mesh_id && key.revision == s.revision)
-            && !self.gpu_composite_failed.load(Ordering::Acquire)
-        {
-            return false;
-        }
-        s.pending_tiles() > 0 || s.caches.iter().any(|cache| !cache.upload.is_empty())
+    pub(crate) fn display_pending(&self, session: &Session) -> bool {
+        self.cpu_sets(session).any(|cache| !cache.dirty.is_empty() || !cache.settle.is_empty() || !cache.upload.is_empty())
     }
 
     pub(crate) fn gpu_composite_pending(&self) -> bool {
@@ -274,128 +359,83 @@ impl GpuLink {
     }
 
     pub(crate) fn compositor_status(&self) -> (&'static str, &'static str) {
-        if self.gpu_composite_failed.load(Ordering::Acquire) {
-            return (n_("Layers: CPU"), n_("GPU compositing reported a device error. See the app log for details."));
-        }
-        if self.gpu_composite_current.is_some() {
-            (n_("Layers: GPU"), n_("The graphics card composes this material."))
-        } else {
-            (n_("Layers: CPU"), self.cpu_reason)
-        }
-    }
-
-    fn log_compositor(&mut self, session: &mut Session, out: &mut SceneSync, gpu: bool, started: f64) {
-        let (label, reason) = self.compositor_status();
-        let state = (session.mesh_id, label, reason);
-        if self.logged_compositor == Some(state) && out.sets.is_none() {
-            return;
-        }
-        self.logged_compositor = Some(state);
-        out.compositor_changed = true;
-        let (w, h) = session.caches.get(session.ts()).map_or((0, 0), |cache| cache.size);
-        session.log.performance(format!("{label} at {w}×{h}: {reason}"));
-        if gpu {
-            self.cpu_composite_started = None;
-            if out.composite.is_some() {
-                self.gpu_composite_in_flight = Arc::new(AtomicBool::new(true));
-                out.trace_composite = Some((started, self.gpu_composite_in_flight.clone()));
-            }
-        } else if !cfg!(target_arch = "wasm32") {
-            self.cpu_composite_started = Some(started);
+        let cpu = self.compositors.iter().find(|set| !set.uses_gpu());
+        let uses_gpu = self.compositors.iter().any(|set| set.uses_gpu() && !set.neutral);
+        let reason = cpu.map_or(n_("Waiting for the first material update"), |set| {
+            if set.failed.load(Ordering::Acquire) { n_("GPU compositing reported a device error. See the app log for details.") } else { set.reason }
+        });
+        match (uses_gpu, cpu) {
+            (true, None) => (n_("Layers: GPU"), n_("The graphics card composes the material.")),
+            (true, Some(_)) => (n_("Layers: GPU + CPU"), reason),
+            (false, None) if !self.compositors.is_empty() => (n_("Layers: idle"), n_("No layers need compositing.")),
+            (false, _) => (n_("Layers: CPU"), reason),
         }
     }
 
-    fn plan_gpu_composite(&mut self, session: &mut Session, shift: u32, interactive: bool, out: &mut SceneSync) -> bool {
-        self.cpu_reason = if !self.prefer_gpu_layers {
+    fn plan_gpu_composites(&mut self, session: &mut Session, shift: u32, interactive: bool, out: &mut SceneSync, started: f64) {
+        let global_reason = if !self.prefer_gpu_layers {
             n_("CPU is selected for layer compositing in Settings.")
         } else if !self.gpu_composite_enabled {
             n_("GPU compositing is unavailable on this device.")
         } else if interactive || session.solo.is_some() {
             n_("The active view uses CPU compositing.")
-        } else if session.stroke_active() && session.pending_display_stroke(0).is_none() {
-            n_("This painting tool uses CPU compositing.")
-        } else if session.caches.len() != 1 {
-            n_("GPU compositing currently supports a single texture set.")
-        } else if session.doc.baked.get(&0).is_some_and(|maps| maps.maps.contains_key(&BakedMap::AmbientOcclusion) || maps.maps.contains_key(&BakedMap::Normal))
-        {
-            n_("This material uses baked normal or ambient occlusion maps.")
         } else {
             ""
         };
-        if !self.cpu_reason.is_empty() || self.gpu_composite_failed.load(Ordering::Acquire) {
-            return false;
-        }
-        let Some(cache) = session.caches.first() else { return false };
-        let padding = cache.dilation.mixed_coverage();
-        if !cache.dilation.fully_covered() && padding.is_none() {
-            self.cpu_reason = n_("The texture set has no covered UV texels.");
-            return false;
-        }
-
-        let key = CompositeKey { mesh: session.mesh_id, revision: session.revision, size: cache.size, shift };
-        let stroke = session.pending_display_stroke(0);
-        let stroke_id = stroke.map(|(id, _)| id);
-        let current = self.gpu_composite_current == Some(key);
-        let unchanged_stroke = self.gpu_display_stroke == stroke_id;
-        if current && unchanged_stroke && stroke.is_none_or(|(_, tiles)| tiles.is_empty()) {
-            return true;
-        }
-        if stroke.is_none()
-            && let Some((_, reason)) = self.gpu_composite_rejected.filter(|(rejected, _)| *rejected == key)
-        {
-            self.cpu_reason = reason;
-            return false;
-        }
-        let changed_tiles = if current
-            && (unchanged_stroke || self.gpu_display_stroke.is_none())
-            && let Some((_, tiles)) = stroke
-        {
-            Some(tiles)
-        } else if stroke.is_none()
-            && let Some(previous_id) = self.gpu_display_stroke
-            && let Some(previous) = self.gpu_composite_current.filter(|old| old.mesh == key.mesh && old.size == key.size && old.shift == key.shift)
-        {
-            session.finished_display_stroke(0, previous_id, previous.revision)
-        } else {
-            None
-        };
-        let region = changed_tiles
-            .and_then(|tiles| CompositeRegion::from_tiles(tiles.iter().copied()))
-            .map(|r| if padding.is_some() { r.expanded(texturecraft_engine::texel::TILE) } else { r });
-        if changed_tiles.is_some() && region.is_none() {
-            self.gpu_composite_current = Some(key);
-            self.gpu_display_stroke = stroke_id;
-            return true;
-        }
-        let preview = session.display_stroke_pixels(0, region.map(|r| r.expanded(texturecraft_engine::texel::TILE).bounds()));
-        let pixels = preview.as_ref().unwrap_or(&session.doc.pixels);
-        let mut program = match CompositeProgram::try_compile_region(&session.doc.project, pixels, 0, region) {
-            Ok(program) => program,
-            Err(reason) => {
-                self.cpu_reason = reason;
-                if stroke_id.is_none() {
-                    self.gpu_composite_rejected = Some((key, reason));
+        let mut submitted_stroke = false;
+        let mut cpu_changed = false;
+        for (ts, state) in self.compositors.iter_mut().enumerate() {
+            let reason = match state.plan(session, ts, shift, global_reason) {
+                Ok(program) => {
+                    if let Some(program) = program {
+                        out.composites.push((ts, program, state.failed.clone()));
+                        submitted_stroke |= session.pending_display_stroke(ts).is_some();
+                        self.sent.entry(ts).or_default().extend(DisplayKind::ALL);
+                    }
+                    self.pending_overviews.remove(&ts);
+                    self.active_overviews.remove(&ts);
+                    ""
                 }
-                return false;
+                Err(reason) => {
+                    state.stroke = None;
+                    if state.current.take().is_some() {
+                        session.caches[ts].queue_ready_uploads();
+                    }
+                    reason
+                }
+            };
+            state.reason = reason;
+            let (backend, detail) = if !reason.is_empty() {
+                ("CPU", reason)
+            } else if state.neutral {
+                ("idle", "no layers need compositing")
+            } else {
+                ("GPU", "layer compositor")
+            };
+            if state.logged_status != Some((backend, detail)) {
+                state.logged_status = Some((backend, detail));
+                out.compositor_changed = true;
+                let (w, h) = session.caches[ts].size;
+                session.log.performance(format!("Layers: {backend} for texture set {} at {w}×{h}: {detail}", ts + 1));
+                cpu_changed |= !reason.is_empty();
             }
-        };
-        if let Some(padding) = padding {
-            program.set_coverage(padding, texturecraft_engine::session::DISPLAY_PADDING);
         }
-        out.composite = Some((program, self.gpu_composite_failed.clone()));
-        self.gpu_composite_current = Some(key);
-        self.gpu_display_stroke = stroke_id;
-        session.clear_display_stroke_tiles();
-        self.pending_overviews.remove(&0);
-        self.active_overviews.remove(&0);
-        self.sent.entry(0).or_default().extend(DisplayKind::ALL);
-        true
+        if submitted_stroke {
+            session.clear_display_stroke_tiles();
+        }
+        if out.compositor_changed && out.composites.iter().any(|(_, program, _)| !program.is_neutral()) {
+            self.gpu_composite_in_flight = Arc::new(AtomicBool::new(true));
+            out.trace_composite = Some((started, self.gpu_composite_in_flight.clone()));
+        }
+        if cpu_changed && !cfg!(target_arch = "wasm32") {
+            self.cpu_composite_started = Some(started);
+        }
     }
 
-    /// Compositing progress (0..1) while tiles wait to be composited.
-    pub fn composite_progress(&self, s: &Session) -> Option<f32> {
-        let pending = if self.gpu_composite_current.is_some() { 0 } else { s.pending_tiles() };
-        (pending > 0 && self.composite_total > 0).then(|| 1.0 - pending as f32 / self.composite_total as f32)
+    /// Compositing progress (0..1) while CPU tiles wait to be composited.
+    pub fn composite_progress(&self, session: &Session) -> Option<f32> {
+        let pending = self.cpu_sets(session).map(|cache| cache.dirty.len() + cache.settle.len()).sum::<usize>();
+        (pending > 0 && self.composite_total > 0).then(|| (1.0 - pending as f32 / self.composite_total as f32).clamp(0.0, 1.0))
     }
 
     /// Collect everything the GPU needs this frame, running the compositor first: `bake` is what bake mode's 3D view draws besides the low poly, `spent_ms` the time this frame already took
@@ -415,8 +455,6 @@ impl GpuLink {
         let start_ms = crate::now_ms();
         let mut queued = 0usize;
         let time_left_ms = |queued: usize| FRAME_BUDGET_MS - spent_ms - (crate::now_ms() - start_ms) - queued as f64 * UPLOAD_MS_PER_TILE;
-        let pending = session.pending_tiles();
-        self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
         let demand = session.tile_demand(visible_uv);
 
         let mut out = SceneSync { mesh_id: session.mesh_id, tile_shift: shift.min(texturecraft_engine::texel::TILE.ilog2()), ..Default::default() };
@@ -437,12 +475,11 @@ impl GpuLink {
         let sets: Vec<SetLayout> = session.doc.project.texture_sets.iter().map(|texture_set| (texture_set.size(), texture_set.material)).collect();
         let resend = self.reset.swap(false, Ordering::AcqRel);
         if resend || sets != self.sets || shift != self.shift || out.mesh.is_some() {
-            self.gpu_composite_current = None;
-            self.gpu_display_stroke = None;
-            self.gpu_composite_failed = Arc::default();
+            self.compositors.resize_with(sets.len(), SetCompositor::default);
             self.pending_overviews.retain(|&ts| ts < sets.len());
             for (ts, layout) in sets.iter().enumerate() {
                 if resend || out.mesh.is_some() || self.shift != shift || self.sets.get(ts) != Some(layout) {
+                    self.compositors[ts] = SetCompositor::default();
                     let Some(cache) = session.caches.get_mut(ts) else { continue };
                     // The renderer may recreate these textures. Dirty tiles will enter the
                     // upload queue after composition; sending them now sends blank pixels.
@@ -489,29 +526,23 @@ impl GpuLink {
 
         self.cpu_padding_pending = false;
         let interactive = aux_map.is_some() || bake.is_some();
-        if self.plan_gpu_composite(session, shift, interactive, &mut out) {
-            self.log_compositor(session, &mut out, true, start_ms);
-            return out;
-        }
-        self.gpu_display_stroke = None;
-        if self.gpu_composite_current.take().is_some()
-            && let Some(cache) = session.caches.first_mut()
-        {
-            cache.queue_ready_uploads();
-        }
-        self.log_compositor(session, &mut out, false, start_ms);
+        self.plan_gpu_composites(session, shift, interactive, &mut out, start_ms);
+        let pending = self.cpu_sets(session).map(|cache| cache.dirty.len() + cache.settle.len()).sum::<usize>();
+        self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
+        let uses_cpu = |ts: usize| !self.compositors.get(ts).is_some_and(SetCompositor::uses_gpu);
 
         let count = session.caches.len();
         let active = session.ts();
         #[cfg(not(target_arch = "wasm32"))]
         {
             // Start at most one dense map at a time, with the active material first.
-            let (before, from_active) = session.caches.split_at_mut(active.min(count));
-            self.cpu_padding_pending = from_active
-                .iter_mut()
-                .chain(before)
-                .filter(|cache| cache.size.0.max(cache.size.1) > 1024 && (!cache.dirty.is_empty() || !cache.settle.is_empty()))
-                .any(|cache| !cache.dilation.prepare_on_worker());
+            let first = active.min(count);
+            let (before, from_active) = session.caches.split_at_mut(first);
+            self.cpu_padding_pending = (first..count)
+                .zip(from_active)
+                .chain((0..first).zip(before))
+                .filter(|(ts, cache)| uses_cpu(*ts) && cache.size.0.max(cache.size.1) > 1024 && (!cache.dirty.is_empty() || !cache.settle.is_empty()))
+                .any(|(_, cache)| !cache.dilation.prepare_on_worker());
         }
         // At most one small full-atlas evaluation per frame, active material first.
         let next_overview = if self.pending_overviews.remove(&active) { Some(active) } else { self.pending_overviews.pop_first() };
@@ -524,17 +555,20 @@ impl GpuLink {
             self.active_overviews.insert(ts);
             out.overview = Some((ts, overview));
         }
-        if !self.cpu_padding_pending && (out.overview.is_none() || demand.has_brush()) {
-            session.update_for_view(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms, demand);
+        if pending > 0 && !self.cpu_padding_pending && (out.overview.is_none() || demand.has_brush()) {
+            session.update_for_view_where(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms, demand, uses_cpu);
         }
         let first = self.upload_cursor.take().filter(|&set| set < count && out.mesh.is_none()).unwrap_or(active);
         let rotation = (first..count).chain(0..first.min(count));
         // While painting, share the first chunk with the next waiting set. An overloaded
         // frame still submits at most one chunk in total, independent of material count.
-        let boost = (session.stroke_active() || demand.focused()) && active != first && session.caches.get(active).is_some_and(|c| !c.upload.is_empty());
+        let boost = uses_cpu(active)
+            && (session.stroke_active() || demand.focused())
+            && active != first
+            && session.caches.get(active).is_some_and(|c| !c.upload.is_empty());
         let mut chunk_size = if boost { UPLOAD_CHUNK / 2 } else { UPLOAD_CHUNK };
         let order = boost.then_some((active, true)).into_iter().chain(rotation.map(|set| (set, false)));
-        'uploads: for (texture_set, boosted) in order {
+        'uploads: for (texture_set, boosted) in order.filter(|(ts, _)| uses_cpu(*ts)) {
             let cache = &mut session.caches[texture_set];
             if cache.upload.is_empty() || self.pending_overviews.contains(&texture_set) {
                 continue;
@@ -689,6 +723,14 @@ fn record_recreated_uploads(recreated: &mut BTreeMap<usize, BTreeSet<DisplayKind
         return;
     }
 
+    for (ts, _, failed) in &sync.composites {
+        if !failed.load(Ordering::Acquire)
+            && let Some(kinds) = recreated.get_mut(ts)
+        {
+            kinds.extend(DisplayKind::ALL);
+        }
+    }
+
     if let Some((ts, overview)) = &sync.overview
         && let Some(kinds) = recreated.get_mut(ts)
     {
@@ -746,26 +788,35 @@ impl CallbackTrait for ViewCallback {
             if let Some((mesh, id)) = &sync.mesh {
                 gpu.renderer.set_mesh(device, queue, mesh, *id);
             }
-            let (reset, composite_error) = sync.apply_display(&mut gpu.renderer, device, queue);
-            if let Some(error) = composite_error {
-                if let Some((_, pending)) = &sync.trace_composite {
+            let (reset, errors) = sync.apply_display(&mut gpu.renderer, device, queue);
+            let submitted = sync.composites.len() > errors.len();
+            if !errors.is_empty() {
+                let mut reports = gpu.reports.lock().unwrap_or_else(PoisonError::into_inner);
+                reports
+                    .performance
+                    .extend(errors.into_iter().map(|(ts, error)| (sync.mesh_id, format!("GPU layer submission failed for texture set {}: {error}", ts + 1))));
+                drop(reports);
+                gpu.ctx.request_repaint();
+            }
+            if let Some((started, pending)) = &sync.trace_composite {
+                if submitted {
+                    let (started, pending, mesh) = (*started, pending.clone(), sync.mesh_id);
+                    let cpu_ms = crate::now_ms() - started;
+                    let (reports, ctx) = (gpu.reports.clone(), gpu.ctx.clone());
+                    queue.on_submitted_work_done(move || {
+                        let elapsed = crate::now_ms() - started;
+                        reports.lock().unwrap_or_else(PoisonError::into_inner).performance.push((
+                            mesh,
+                            format!(
+                                "GPU layer work completed in {elapsed:.0} ms since viewport update started (CPU preparation and submission {cpu_ms:.0} ms)"
+                            ),
+                        ));
+                        pending.store(false, Ordering::Release);
+                        ctx.request_repaint();
+                    });
+                } else {
                     pending.store(false, Ordering::Release);
                 }
-                gpu.reports.lock().unwrap_or_else(PoisonError::into_inner).performance.push((sync.mesh_id, format!("GPU layer submission failed: {error}")));
-                gpu.ctx.request_repaint();
-            } else if let Some((started, pending)) = &sync.trace_composite {
-                let (started, pending, mesh) = (*started, pending.clone(), sync.mesh_id);
-                let cpu_ms = crate::now_ms() - started;
-                let (reports, ctx) = (gpu.reports.clone(), gpu.ctx.clone());
-                queue.on_submitted_work_done(move || {
-                    let elapsed = crate::now_ms() - started;
-                    reports.lock().unwrap_or_else(PoisonError::into_inner).performance.push((
-                        mesh,
-                        format!("GPU layer work completed in {elapsed:.0} ms since viewport update started (CPU preparation and submission {cpu_ms:.0} ms)"),
-                    ));
-                    pending.store(false, Ordering::Release);
-                    ctx.request_repaint();
-                });
             }
             record_recreated_uploads(&mut gpu.recreated.lock().unwrap_or_else(PoisonError::into_inner), &reset, &sync);
             for (texture_set, size, bytes) in &sync.aux {
@@ -870,13 +921,8 @@ pub(crate) mod tests {
             gpu_composite_enabled: false,
             prefer_gpu_layers: true,
             material_start_preview: true,
-            cpu_reason: n_("Waiting for the first material update"),
-            gpu_composite_current: None,
-            gpu_display_stroke: None,
-            gpu_composite_rejected: None,
-            gpu_composite_failed: Arc::default(),
+            compositors: Vec::new(),
             gpu_composite_in_flight: Arc::default(),
-            logged_compositor: None,
             cpu_composite_started: None,
             cpu_padding_pending: false,
             bake_scene: BakeSceneLink::default(),
@@ -1227,9 +1273,9 @@ pub(crate) mod tests {
         let mut link = link();
         link.gpu_composite_enabled = true;
         let scene = link.sync(&mut session, None, None, 0, 0.0);
-        assert!(scene.composite.is_some());
+        assert!(!scene.composites.is_empty());
         scene.apply_display(&mut headless.renderer, &headless.device, &headless.queue);
-        assert!(!link.gpu_composite_failed.load(Ordering::Acquire));
+        assert!(!link.compositors[0].failed.load(Ordering::Acquire));
         assert_eq!(link.compositor_status().0, "Layers: GPU");
         let (width, _, image) = Readback::blocking(&headless.device, &headless.queue, headless.renderer.display_textures()[0][0]).unwrap();
         let samples = |x: u32, y: u32| {
@@ -1248,10 +1294,69 @@ pub(crate) mod tests {
 
         execute(&mut session, "effect.add.filter", &json!({"target":"content", "filter":"blur", "radius":8})).unwrap();
         let scene = link.sync(&mut session, None, None, 0, 0.0);
-        assert!(scene.composite.is_none());
+        assert!(scene.composites.is_empty());
         assert_eq!(link.compositor_status().0, "Layers: CPU");
         assert!(session.log.iter().any(|entry| entry.message.contains("A layer effect uses CPU compositing.")));
         assert!(session.memory().geometry > geometry_bytes, "only the CPU path allocates the dense padding map");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn project_open_and_4k_resize_compose_multiple_sets_on_gpu() {
+        use texturecraft_render::{headless::Headless, readback::Readback};
+
+        let Ok(mut headless) = Headless::new() else { return };
+        let mut original = Session::new_project("multi-material", primitives::material_ball(), "builtin:material_ball", None, 2048).unwrap();
+        assert_eq!(original.caches.len(), 2);
+        for (ts, color) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]].into_iter().enumerate() {
+            execute(&mut original, "textureSet.select", &json!({"ts":ts})).unwrap();
+            execute(&mut original, "layer.add.fill", &json!({"color":color})).unwrap();
+        }
+        let mut session = Session::from_project_bytes(&original.to_project_bytes().unwrap()).unwrap();
+        drop(original);
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.material_start_preview = false;
+
+        for size in [2048, 4096] {
+            if size == 4096 {
+                execute(&mut session, "textureSet.resolution", &json!({"ts":0,"resolution":size})).unwrap();
+            }
+            let scene = link.sync(&mut session, None, None, 0, 0.0);
+            let expected: &[usize] = if size == 2048 { &[0, 1] } else { &[0] };
+            assert_eq!(scene.composites.iter().map(|(ts, _, _)| *ts).collect::<Vec<_>>(), expected);
+            assert!(scene.tiles.is_empty());
+            assert!(scene.overview.is_none());
+            let (recreated, errors) = scene.apply_display(&mut headless.renderer, &headless.device, &headless.queue);
+            assert!(errors.is_empty(), "{errors:?}");
+            record_recreated_uploads(&mut link.recreated.lock().unwrap(), &recreated, &scene);
+            headless.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            let textures = headless.renderer.display_textures();
+            assert_eq!(textures[0][0].width(), size);
+            assert_eq!(textures[1][0].width(), 2048);
+            assert_eq!(link.compositor_status().0, "Layers: GPU");
+            assert!(!link.display_pending(&session));
+        }
+
+        for (ts, color) in [[255, 0, 0, 255], [0, 255, 0, 255]].into_iter().enumerate() {
+            let (width, _, rgba) = Readback::blocking(&headless.device, &headless.queue, headless.renderer.display_textures()[ts][0]).unwrap();
+            let cache = &session.caches[ts];
+            assert_eq!(width, cache.gbuf.width);
+            let covered = cache.gbuf.tri.iter().position(|&tri| tri != texturecraft_engine::geom::NO_TRI).unwrap();
+            assert_eq!(&rgba[covered * 4..covered * 4 + 4], &color);
+        }
+        execute(&mut session, "textureSet.select", &json!({"ts":1})).unwrap();
+        assert!(link.sync(&mut session, None, None, 0, 0.0).composites.is_empty(), "selection retains all uploaded materials");
+        execute(&mut session, "effect.add.filter", &json!({"target":"content","filter":"blur","radius":8})).unwrap();
+        let _ = session.caches[1].dilation.source(0, 0);
+        let before = session.caches[0].revision;
+        let scene = link.sync(&mut session, None, None, 0, 0.0);
+        assert_eq!(link.compositor_status().0, "Layers: GPU + CPU");
+        assert!(scene.composites.is_empty());
+        assert!(!scene.tiles.is_empty());
+        assert!(scene.tiles.iter().all(|(ts, ..)| *ts == 1));
+        assert_eq!(session.caches[0].revision, before, "GPU sets skip desktop CPU composition");
+        assert!(session.log.iter().any(|entry| entry.message.contains("Layers: CPU for texture set 2")));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1280,12 +1385,12 @@ pub(crate) mod tests {
         let mut link = link();
         link.gpu_composite_enabled = true;
         let scene = link.sync(&mut s, None, None, 0, 0.0);
-        assert!(scene.composite.is_some());
+        assert!(!scene.composites.is_empty());
         assert!(scene.tiles.is_empty());
         scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
-        assert!(!link.gpu_composite_failed.load(Ordering::Acquire), "the compute pass ran");
+        assert!(!link.compositors[0].failed.load(Ordering::Acquire), "the compute pass ran");
         assert!(!link.display_pending(&s));
-        assert!(link.sync(&mut s, None, None, 0, 0.0).composite.is_none(), "idle frames reuse the material");
+        assert!(link.sync(&mut s, None, None, 0, 0.0).composites.is_empty(), "idle frames reuse the material");
 
         let textures = gpu.renderer.display_textures();
         let (width, height, image) = Readback::blocking(&gpu.device, &gpu.queue, textures[0][0]).unwrap();
@@ -1300,14 +1405,14 @@ pub(crate) mod tests {
         let before_dab = image[dab_pixel..dab_pixel + 4].to_vec();
         s.begin_stroke_uv(dab, 1.0).unwrap();
         let scene = link.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
-        assert!(scene.composite.is_some());
+        assert!(!scene.composites.is_empty());
         assert!(scene.tiles.is_empty(), "live layer compositing stays on the GPU");
         scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
-        assert!(!link.gpu_composite_failed.load(Ordering::Acquire));
+        assert!(!link.compositors[0].failed.load(Ordering::Acquire));
         let (_, _, live) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][0]).unwrap();
         assert_ne!(&live[dab_pixel..dab_pixel + 4], before_dab);
         assert_eq!(&live[pixel..pixel + 4], &[255, 0, 0, 255], "the regional dispatch leaves distant texels alone");
-        assert!(link.sync(&mut s, None, None, 0, FRAME_BUDGET_MS).composite.is_none(), "an unchanged stroke does not redispatch");
+        assert!(link.sync(&mut s, None, None, 0, FRAME_BUDGET_MS).composites.is_empty(), "an unchanged stroke does not redispatch");
         s.cancel_stroke();
         let restored = link.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
         restored.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
@@ -1319,7 +1424,7 @@ pub(crate) mod tests {
         for _ in 0..8 {
             let scene = link.sync(&mut s, None, None, 0, 0.0);
             scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
-            if scene.composite.is_some() {
+            if !scene.composites.is_empty() {
                 resumed = true;
                 break;
             }
@@ -1328,10 +1433,10 @@ pub(crate) mod tests {
 
         link.prefer_gpu_layers = false;
         let cpu = link.sync(&mut s, None, None, 0, 0.0);
-        assert!(cpu.composite.is_none());
+        assert!(cpu.composites.is_empty());
         assert!(link.display_pending(&s) || !cpu.tiles.is_empty());
         link.prefer_gpu_layers = true;
-        assert!(link.sync(&mut s, None, None, 0, 0.0).composite.is_some());
+        assert!(!link.sync(&mut s, None, None, 0, 0.0).composites.is_empty());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

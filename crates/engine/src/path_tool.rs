@@ -918,7 +918,7 @@ impl Session {
         if set == Some(self.ts()) {
             // Content or mask, the sublayer's owner decides which sets redraw
             let tiles = changed_tiles(&before.pixels, &self.doc.pixels, eid);
-            self.mark_painted(self.ts(), Some(PaintTarget::Layer(eid)), tiles);
+            self.mark_painted(self.ts(), Some(PaintTarget::Layer(eid)), tiles, true);
         } else {
             self.invalidate_changed(&before);
         }

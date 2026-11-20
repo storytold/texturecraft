@@ -86,6 +86,10 @@ impl CompositeProgram {
         (self.paint.len() * size_of::<u32>()) as u64
     }
 
+    pub fn is_neutral(&self) -> bool {
+        self.layer_count == 0
+    }
+
     /// Let the shader sample the nearest covered UV texel for island padding.
     pub fn set_coverage(&mut self, coverage: Arc<UvGBuffer>, radius: u32) {
         self.coverage = Some((coverage, radius.min(15)));
@@ -228,9 +232,6 @@ impl CompositeProgram {
                 }
                 operations.push(op);
             }
-        }
-        if operations.is_empty() {
-            return Err("The layer stack has no visible material inputs.");
         }
         let changes_channel = |slot, default: [f32; 3]| {
             operations
@@ -386,7 +387,7 @@ pub(crate) struct GpuCompositor {
     pipeline: wgpu::ComputePipeline,
     lookup: wgpu::Buffer,
     uniform_coverage: wgpu::Buffer,
-    coverage: Option<(Weak<UvGBuffer>, wgpu::Buffer)>,
+    coverage: Vec<(Weak<UvGBuffer>, wgpu::Buffer)>,
 }
 
 impl GpuCompositor {
@@ -422,15 +423,14 @@ impl GpuCompositor {
             contents: &[0; 4],
             usage: wgpu::BufferUsages::STORAGE,
         });
-        Self { pipeline, lookup, uniform_coverage, coverage: None }
+        Self { pipeline, lookup, uniform_coverage, coverage: Vec::new() }
     }
 
     fn coverage_buffer(&mut self, device: &wgpu::Device, map: Option<&Arc<UvGBuffer>>) -> Result<wgpu::Buffer, String> {
         let Some(map) = map else { return Ok(self.uniform_coverage.clone()) };
         let key = Arc::downgrade(map);
-        if let Some((cached, buffer)) = &self.coverage
-            && key.ptr_eq(cached)
-        {
+        self.coverage.retain(|(cached, _)| cached.strong_count() != 0);
+        if let Some((_, buffer)) = self.coverage.iter().find(|(cached, _)| key.ptr_eq(cached)) {
             return Ok(buffer.clone());
         }
         let width = map.width as usize;
@@ -458,7 +458,7 @@ impl GpuCompositor {
             contents: bytemuck::cast_slice(&words),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        self.coverage = Some((key, buffer.clone()));
+        self.coverage.push((key, buffer.clone()));
         Ok(buffer)
     }
 

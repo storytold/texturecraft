@@ -1531,6 +1531,26 @@ impl Renderer {
     /// Scratch holds one band. The final maps stay on the adapter for shading and mip generation.
     pub fn composite_on_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<(), String> {
         let set = self.sets.get(ts).ok_or("texture set does not exist")?;
+        if program.is_neutral() {
+            let textures = crate::gpu_trace::scoped(device, "empty GPU material", || {
+                let textures = DisplayKind::ALL
+                    .iter()
+                    .zip(&self.default_texels)
+                    .map(|(&kind, neutral)| neutral_tex(device, queue, (1, 1), display_format(kind), 1, neutral))
+                    .collect::<Vec<_>>();
+                queue.submit([]);
+                textures
+            })?;
+            let set = &mut self.sets[ts];
+            for (i, texture) in textures.into_iter().enumerate() {
+                set.tex[i] = texture;
+                set.pending[i] = None;
+                set.mips_dirty[i] = MipsDirty::Clean;
+            }
+            set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
+            self.content_rev += 1;
+            return Ok(());
+        }
         let size = display_dims(set.size, set.shift);
         if cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) || program.paint_bytes() > device.limits().max_storage_buffer_binding_size {
             return Err("GPU composition is unavailable on this device or for this layout".into());

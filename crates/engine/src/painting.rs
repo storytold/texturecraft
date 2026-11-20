@@ -542,11 +542,15 @@ impl Session {
         });
         st.staging = staging;
         st.display_tiles.extend(recent.iter().copied());
-        self.mark_painted(ts, target, recent);
+        self.mark_painted(ts, target, recent, false);
     }
 
     pub fn stroke_active(&self) -> bool {
         self.stroke.is_some()
+    }
+
+    pub fn stroke_texture_set(&self) -> Option<usize> {
+        self.stroke.as_ref().map(|stroke| stroke.ts)
     }
 
     /// Identity and tiles of a supported live stroke since the display last drew it.
@@ -597,7 +601,8 @@ impl Session {
 
     pub fn finished_display_stroke(&self, ts: usize, id: u64, previous_revision: u64) -> Option<&BTreeSet<(u32, u32)>> {
         let end = self.display_stroke_end.as_ref()?;
-        (end.ts == ts && end.id == id && end.previous_revision == previous_revision && end.revision == self.revision).then_some(&end.tiles)
+        let revision = self.caches.get(ts)?.material_revision;
+        (end.ts == ts && end.id == id && end.previous_revision == previous_revision && end.revision == revision).then_some(&end.tiles)
     }
 
     /// Commit the active stroke (one undo step).
@@ -634,13 +639,14 @@ impl Session {
         }
         self.redo.clear();
         self.modified = true;
-        let previous_revision = self.revision;
         self.revision = self.revision.wrapping_add(1);
-        self.display_stroke_end = Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision, revision: self.revision, tiles: st.display_tiles });
+        let previous_revision = self.caches.get(st.ts).map_or(0, |cache| cache.material_revision);
         // The live preview already shows the committed result: the stroke's tiles recomposite
         // from the committed pixels at low priority, without holding up this frame.
         self.mark_settle(st.ts, st.target, st.canvas.dirty.iter().copied());
         if let Some(cache) = self.caches.get_mut(st.ts) {
+            self.display_stroke_end =
+                Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision, revision: cache.material_revision, tiles: st.display_tiles });
             cache.finished_dab = brush_tile.filter(|tile| st.canvas.dirty.contains(tile) && (cache.dirty.contains(tile) || cache.upload.contains(tile)));
         }
         Ok(())
@@ -649,13 +655,16 @@ impl Session {
     /// Abandon the active stroke (Esc).
     pub fn cancel_stroke(&mut self) {
         if let Some(st) = self.stroke.take() {
-            self.mark_painted(st.ts, st.target, st.canvas.dirty.iter().copied());
+            self.mark_painted(st.ts, st.target, st.canvas.dirty.iter().copied(), false);
             if st.target.is_none() {
                 self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
             }
             self.doc = st.before;
-            self.display_stroke_end =
-                Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision: self.revision, revision: self.revision, tiles: st.canvas.dirty });
+            if let Some(cache) = self.caches.get(st.ts) {
+                let revision = cache.material_revision;
+                self.display_stroke_end =
+                    Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision: revision, revision, tiles: st.canvas.dirty });
+            }
         }
     }
 

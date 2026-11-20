@@ -51,6 +51,8 @@ pub struct SetCache {
     pub(crate) finished_dab: Option<(u32, u32)>,
     /// Bumps on every composite change (thumbnails, exports, caches).
     pub revision: u64,
+    /// Changes when this set's material inputs change, independently of CPU display work.
+    pub material_revision: u64,
     /// Everything but the layer being edited, per tile (repaints evaluate only that layer).
     pub below: BelowCache,
     /// Tiles per composite chunk that fit the last frame's budget (0: not measured yet).
@@ -78,6 +80,7 @@ impl SetCache {
             upload: BTreeSet::new(),
             finished_dab: None,
             revision: 0,
+            material_revision: 0,
             below: BelowCache::default(),
             chunk: 0,
             paint_margin: None,
@@ -159,6 +162,7 @@ impl SetCache {
     }
 
     pub fn invalidate_all(&mut self) {
+        self.material_revision = self.material_revision.wrapping_add(1);
         self.dirty.extend(self.covered_tiles.iter().copied());
     }
 }
@@ -891,6 +895,7 @@ impl Session {
 
             match before.as_ref().zip(after.as_ref()).and_then(|(before, after)| before.changed_paint(after)) {
                 Some(changes) => {
+                    cache.material_revision = cache.material_revision.wrapping_add(1);
                     for (target, changed) in changes {
                         let tiles: Vec<_> =
                             changed.into_iter().filter(|&(x, y)| cache.covered_tiles.binary_search_by_key(&(y, x), |&(tx, ty)| (ty, tx)).is_ok()).collect();
@@ -1085,6 +1090,11 @@ impl Session {
 
     /// Budgeted display update with the same tile demand used by the viewport uploader.
     pub fn update_for_view(&mut self, budget_ms: f64, clock: impl Fn() -> f64, demand: crate::TileDemand) -> bool {
+        self.update_for_view_where(budget_ms, clock, demand, |_| true)
+    }
+
+    /// Maintain CPU display caches for the sets the viewport is composing on the CPU.
+    pub fn update_for_view_where(&mut self, budget_ms: f64, clock: impl Fn() -> f64, demand: crate::TileDemand, include: impl Fn(usize) -> bool) -> bool {
         let active = self.ts();
         if active != self.cache_active {
             // A third material replaces the previously parked one, even when the
@@ -1100,7 +1110,7 @@ impl Session {
             }
             self.cache_active = active;
         }
-        let changed = self.update_tiles(budget_ms, clock, active, demand);
+        let changed = self.update_tiles(budget_ms, clock, active, demand, include);
         if let Some(previous) = self.cache_previous.filter(|&ts| self.caches.get(ts).is_some_and(|c| !c.below.is_empty())) {
             // Retaining an idle material spends only the remainder of the normal band
             // budget. The active material always gets first use of that budget.
@@ -1121,7 +1131,7 @@ impl Session {
         changed
     }
 
-    fn update_tiles(&mut self, budget_ms: f64, clock: impl Fn() -> f64, active: usize, demand: crate::TileDemand) -> bool {
+    fn update_tiles(&mut self, budget_ms: f64, clock: impl Fn() -> f64, active: usize, demand: crate::TileDemand, include: impl Fn(usize) -> bool) -> bool {
         let start = clock();
         let initial_chunk_size = if budget_ms.is_finite() { rayon::current_num_threads().clamp(1, CHUNK) } else { CHUNK };
 
@@ -1149,7 +1159,7 @@ impl Session {
         let solo_view = if self.pending_tiles() > 0 { self.solo_view() } else { None };
         let order = std::iter::once(active).chain((0..self.caches.len()).filter(|ts| *ts != active));
         let mut changed = false;
-        for ts in order {
+        for ts in order.filter(|&ts| include(ts)) {
             let Some(cache) = self.caches.get_mut(ts) else { continue };
             if Some(ts) == self.cache_previous && cache.dirty.is_empty() && cache.settle.is_empty() && !cache.below.is_empty() {
                 continue;
@@ -1244,17 +1254,17 @@ impl Session {
 
     /// Mark `tiles` of texture set `ts` dirty after painting `target`, and the same tiles of
     /// other sets of that size drawing it through an instance.
-    pub(crate) fn mark_painted(&mut self, ts: usize, target: Option<PaintTarget>, tiles: impl IntoIterator<Item = (u32, u32)>) {
-        self.mark_tiles(ts, target, tiles, false);
+    pub(crate) fn mark_painted(&mut self, ts: usize, target: Option<PaintTarget>, tiles: impl IntoIterator<Item = (u32, u32)>, changed_document: bool) {
+        self.mark_tiles(ts, target, tiles, false, changed_document);
     }
 
     /// [`Session::mark_painted`] for the tiles of a committed stroke: they settle at low
     /// priority (see [`SetCache::settle`]).
     pub(crate) fn mark_settle(&mut self, ts: usize, target: Option<PaintTarget>, tiles: impl IntoIterator<Item = (u32, u32)>) {
-        self.mark_tiles(ts, target, tiles, true);
+        self.mark_tiles(ts, target, tiles, true, true);
     }
 
-    fn mark_tiles(&mut self, ts: usize, target: Option<PaintTarget>, tiles: impl IntoIterator<Item = (u32, u32)>, committed: bool) {
+    fn mark_tiles(&mut self, ts: usize, target: Option<PaintTarget>, tiles: impl IntoIterator<Item = (u32, u32)>, settle: bool, changed_document: bool) {
         let size = self.caches.get(ts).map(|c| c.size);
         let Some(target) = target else { return };
         let sets = self.doc.project.sets_drawing(self.paint_owner(target));
@@ -1264,8 +1274,11 @@ impl Session {
                 continue;
             }
             if Some(c.size) == size {
-                c.queue_painted(&self.doc.project, i, target, &tiles, |c| if committed { &mut c.settle } else { &mut c.dirty });
-            } else if committed {
+                if changed_document {
+                    c.material_revision = c.material_revision.wrapping_add(1);
+                }
+                c.queue_painted(&self.doc.project, i, target, &tiles, |c| if settle { &mut c.settle } else { &mut c.dirty });
+            } else if settle {
                 // Resampled instances first see the stroke when its source pixels are committed.
                 c.invalidate_all();
             }
