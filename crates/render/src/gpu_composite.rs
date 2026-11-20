@@ -569,7 +569,7 @@ impl GpuCompositor {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tc_gpu_composite"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/composite.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(concat!(include_str!("shaders/noise.wgsl"), "\n", include_str!("shaders/composite.wgsl")).into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tc_gpu_composite"),
