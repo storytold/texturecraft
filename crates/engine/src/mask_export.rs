@@ -86,7 +86,7 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
         texturecraft_formats::write_atomic(&file, &bitmap.to_png16()?).map_err(|e| bad("mask.export", format!("cannot write {}: {e}", file.display())))?;
         files.push(file.display().to_string());
     }
-    s.log.push(format!("Exported the mask to {}", files.join(", ")));
+    s.log.info("MapExporter", format!("Exported the mask to {}", files.join(", ")));
     Ok(json!({ "files": files }))
 }
 

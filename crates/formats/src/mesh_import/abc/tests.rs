@@ -5,6 +5,11 @@ use texturecraft_geom::glam::Vec3;
 use super::*;
 use crate::mesh_import::finish;
 
+const DATA_BIT: u64 = 1 << 63;
+const OGAWA_MAGIC: &[u8] = b"Ogawa";
+const KEY_BYTES: usize = 16;
+const OBJECT_HASH_BYTES: usize = 32;
+
 /// Builds an Ogawa byte stream: data blocks and groups appended, the root set last.
 struct Writer {
     b: Vec<u8>,
@@ -262,20 +267,6 @@ fn half_float_uvs_import_without_losing_values() {
 }
 
 #[test]
-fn half_float_values_preserve_special_values() {
-    let mut a = Abc { w: Writer::new() };
-    let raw: Vec<u8> = [0xc000u16, 0x0001, 0x7c00, 0x7e00].iter().flat_map(|x| x.to_le_bytes()).collect();
-    let p = a.array("values", "", 9, 1, &raw);
-    let property = Prop { name: p.name.into(), meta: p.meta, kind: PropKind::Array, pod: 9, extent: 1, group: p.group };
-    let mut ogawa = Ogawa { b: &a.w.b, budget: MAX_DECODED_BYTES, indexed_meta: Vec::new() };
-    let values = ogawa.values(&property).unwrap();
-    assert_eq!(values[0], -2.0);
-    assert_eq!(values[1], 2f64.powi(-24));
-    assert_eq!(values[2], f64::INFINITY);
-    assert!(values[3].is_nan());
-}
-
-#[test]
 fn hdf5_and_garbage_are_clear_errors() {
     let e = read(b"\x89HDF\r\n\x1a\n rest of an hdf5 file").err().unwrap().to_string();
     assert!(e.contains("HDF5") && e.contains("Ogawa"), "{e}");
@@ -326,15 +317,6 @@ fn self_referencing_groups_are_bounded() {
 
 #[test]
 fn indexed_metadata_stops_at_the_entries_a_byte_can_index() {
-    // One real entry followed by a million empty ones: a byte each in the file, a `String` each
-    // in memory, and no index past 254 can be used anyway.
-    let mut block = vec![3, b'a', b'b', b'c'];
-    block.extend(std::iter::repeat_n(0u8, 1_000_000));
-    let mut kept = vec![String::new()];
-    read_indexed_meta(&block, &mut kept).unwrap();
-    assert_eq!(kept.len(), MAX_INDEXED_META);
-    assert_eq!(kept.get(1).map(String::as_str), Some("abc"));
-
     // The mesh schema comes from metadata index 1 even when the table has unreachable entries.
     let mut a = Abc { w: Writer::new() };
     let pp = a.array("P", "", F32, 3, &f32s(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0]));

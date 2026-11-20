@@ -84,8 +84,9 @@ fn renders_the_material_ball() {
     let Some((mut h, frame)) = setup() else { return };
     let img = render(&mut h, &frame, "headless_ball");
     assert_ne!(img.at(240, 140), img.at(5, 5), "mesh should differ from background");
-    // UV view of set 0.
-    let uv = Frame { view_id: 2, kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0, 0.0] }, ..frame.clone() };
+
+    // UV view of set 0
+    let uv = Frame { view_id: 2, kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 }, ..frame.clone() };
     let uv_img = render(&mut h, &uv, "headless_uv");
     assert_eq!(uv_img.px.len(), img.px.len());
     let wire = render(&mut h, &shaded(&uv, |s| s.wireframe = true), "headless_uv_wire");
@@ -107,9 +108,145 @@ fn exposure_brightens_the_material_but_not_data_views() {
     let a = render(&mut h, &ch, "channel_base_color");
     let b = render(&mut h, &shaded(&ch, |s| s.exposure_ev = 2.0), "channel_base_color_ev2");
     assert_eq!(a.px, b.px, "data views ignore exposure");
-    // Default base color 188 (sRGB) shows unchanged in the channel view.
+
+    // Default base color 188 (sRGB) shows unchanged in the channel view
     let [r, ..] = a.at(240, 140);
     assert!(r.abs_diff(188) <= 1, "base color channel shows the raw value, got {r}");
+}
+
+/// A lit single-channel view shades the channel on a neutral material: the ball shows light and shadow
+/// sides and follows exposure, where the flat view shows one value everywhere.
+#[test]
+fn a_lit_channel_view_is_shaded_and_the_flat_one_is_not() {
+    let Some((mut h, frame)) = setup() else { return };
+    let flat = shaded(&frame, |s| {
+        s.view_mode = 1;
+        s.channel = 0;
+    });
+    let lit = shaded(&flat, |s| s.solo_lit = true);
+    let flat_img = render(&mut h, &flat, "solo_flat");
+    let lit_img = render(&mut h, &lit, "solo_lit");
+    assert_ne!(flat_img.px, lit_img.px, "the lit view differs from the flat one");
+    assert_eq!(flat_img.at(240, 140), flat_img.at(260, 150), "the flat view shows one value");
+    let shades: std::collections::BTreeSet<u8> = (100..260).step_by(8).map(|x| lit_img.at(x, 180)[0]).collect();
+    assert!(shades.len() > 4, "the lit ball shows light and shadow sides ({shades:?})");
+    let bright = render(&mut h, &shaded(&lit, |s| s.exposure_ev = 1.0), "solo_lit_ev1");
+    assert!(bright.mean(200, 100, 280, 180) > lit_img.mean(200, 100, 280, 180) + 5.0, "a lit channel view follows exposure");
+
+    // Channels past Height have no lit form: they stay flat
+    let emissive = shaded(&flat, |s| s.channel = 5);
+    let a = render(&mut h, &emissive, "solo_emissive_flat");
+    let b = render(&mut h, &shaded(&emissive, |s| s.solo_lit = true), "solo_emissive_lit_switch");
+    assert_eq!(a.px, b.px, "the emissive channel stays flat");
+
+    // The 2D view shows the texture itself either way
+    let uv = Frame { view_id: 2, kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 }, ..flat.clone() };
+    let flat_uv = render(&mut h, &uv, "solo_uv_flat");
+    let lit_uv = render(&mut h, &shaded(&uv, |s| s.solo_lit = true), "solo_uv_lit");
+    assert_eq!(flat_uv.px, lit_uv.px, "the 2D view is not shaded");
+}
+
+/// At Environment Opacity 0 the view shows the plain background of Settings > General: #242425 by
+/// default, a gradient when the top and the bottom color differ.
+#[test]
+fn the_plain_background_follows_the_chosen_colors() {
+    let Some((mut h, frame)) = setup() else { return };
+    let plain = render(&mut h, &frame, "background_default");
+    for (x, y) in [(5, 5), (474, 5), (5, 354), (474, 354)] {
+        let [r, g, b] = plain.at(x, y);
+        assert!(
+            r.abs_diff(0x24) <= 1 && g.abs_diff(0x24) <= 1 && b.abs_diff(0x25) <= 1,
+            "the default background is #242425, got {r:02x}{g:02x}{b:02x} at ({x}, {y})"
+        );
+    }
+
+    let gradient = render(&mut h, &shaded(&frame, |s| s.background = [[0.5, 0.0, 0.0], [0.0, 0.0, 0.5]]), "background_gradient");
+    let (top, bottom) = (gradient.at(5, 5), gradient.at(5, 354));
+    assert!(top[0] > 100 && top[2] < 40, "the top shows the top color: {top:?}");
+    assert!(bottom[2] > 100 && bottom[0] < 40, "the bottom shows the bottom color: {bottom:?}");
+
+    // The 2D view shows the same plain background
+    let uv = Frame { view_id: 2, kind: ViewKind::Uv { ts: 0, zoom: 0.3, pan: [0.0, 0.0], rotation: 0.0 }, ..frame.clone() };
+    let uv_gradient = render(&mut h, &shaded(&uv, |s| s.background = [[0.5, 0.0, 0.0], [0.0, 0.0, 0.5]]), "background_uv_gradient");
+    let (top, bottom) = (uv_gradient.at(5, 5), uv_gradient.at(5, 354));
+    assert!(top[0] > 100 && bottom[2] > 100, "the 2D view follows the colors: {top:?} {bottom:?}");
+
+    let environment = render(&mut h, &shaded(&frame, |s| s.env_opacity = 1.0), "background_environment");
+    assert_ne!(environment.at(5, 5), plain.at(5, 5), "the environment replaces the plain color at Opacity 100");
+}
+
+/// Sum of the luma over the whole view: shadows take light away, so a darker shadow lowers it.
+fn total_luma(img: &Img) -> f32 {
+    img.mean(0, 0, 480, 360) * 480.0 * 360.0
+}
+
+/// Shadows opacity 0 leaves the key light unshadowed, 100 blocks it as before and values between
+/// give shadows in between; the computation mode changes the shadow map's resolution.
+#[test]
+fn shadow_opacity_and_computation_mode() {
+    let Some((mut h, frame)) = setup() else { return };
+    let lit = shaded(&frame, |s| s.light = LIGHT);
+    let off = render(&mut h, &lit, "shadow_opacity_off");
+    let opacity = |h: &mut Headless, value: f32, name: &str| {
+        render(
+            h,
+            &shaded(&lit, |s| {
+                s.shadows = true;
+                s.shadow_opacity = value;
+            }),
+            name,
+        )
+    };
+    let none = opacity(&mut h, 0.0, "shadow_opacity_0");
+    let half = opacity(&mut h, 0.5, "shadow_opacity_50");
+    let full = opacity(&mut h, 1.0, "shadow_opacity_100");
+    assert_same(&off, &none, "opacity 0 leaves the key light unshadowed");
+    let (l_off, l_half, l_full) = (total_luma(&off), total_luma(&half), total_luma(&full));
+    assert!(l_full < l_half - 1000.0 && l_half < l_off - 1000.0, "the shadows deepen with opacity ({l_off} > {l_half} > {l_full})");
+
+    let size = |h: &mut Headless, edge: u32, name: &str| {
+        render(
+            h,
+            &shaded(&lit, |s| {
+                s.shadows = true;
+                s.shadow_size = edge;
+            }),
+            name,
+        )
+    };
+    let light = size(&mut h, 512, "shadow_size_512");
+    let fine = size(&mut h, 4096, "shadow_size_4096");
+    assert_ne!(light.px, fine.px, "the computation mode changes the shadow edges");
+    assert!(total_luma(&light) < total_luma(&off) - 1000.0 && total_luma(&fine) < total_luma(&off) - 1000.0, "both still shadow the pedestal");
+}
+
+/// Environment Alignment: Camera keeps the lighting the same while the camera orbits (the ball looks the same from
+/// every side); World lets it change.
+#[test]
+fn the_environment_follows_the_camera_when_aligned_to_it() {
+    let Some((mut h, frame)) = setup() else { return };
+    let mut at_yaw = |yaw: f32, camera_aligned: bool, name: &str| {
+        let mut f = shaded(&frame, |s| s.env_camera = camera_aligned);
+        f.camera.set_angles(yaw, f.camera.pitch);
+        render(&mut h, &f, name)
+    };
+
+    // The mean difference of the ball's pixels between two views
+    let difference = |a: &Img, b: &Img| {
+        let mut sum = 0.0;
+        for y in 100..180 {
+            for x in 200..280 {
+                sum += (a.luma(x, y) - b.luma(x, y)).abs();
+            }
+        }
+        sum / (80.0 * 80.0)
+    };
+    let (world_a, world_b) = (at_yaw(0.0, false, "align_world_a"), at_yaw(1.8, false, "align_world_b"));
+    let (camera_a, camera_b) = (at_yaw(0.0, true, "align_camera_a"), at_yaw(1.8, true, "align_camera_b"));
+    assert_same(&world_a, &camera_a, "the two alignments agree looking along the world's Z axis");
+    let (world, camera) = (difference(&world_a, &world_b), difference(&camera_a, &camera_b));
+    assert!(world > 2.0, "World: the lighting changes while orbiting ({world})");
+    assert!(camera < world / 3.0, "Camera: the lighting stays with the view ({camera} against {world})");
 }
 
 #[test]
@@ -439,7 +576,7 @@ fn bake_visualization_draws_the_high_poly_and_the_cage() {
         seams.px,
         "the seams' color reaches the shader"
     );
-    let uv = Frame { view_id: 2, kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0, 0.0] }, ..frame.clone() };
+    let uv = Frame { view_id: 2, kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 }, ..frame.clone() };
     let uv_plain = render(&mut h, &shaded(&uv, |s| s.bake = Some(bake)), "bake_missing_seams_uv_off");
     let uv_seams = render(&mut h, &shaded(&uv, |s| s.bake = Some(BakeVisualization { missing_seams: green_seams, ..bake })), "bake_missing_seams_uv");
     assert_ne!(uv_seams.px, uv_plain.px, "the seams show in the 2D view too");
@@ -646,6 +783,20 @@ fn specular_glossiness_takes_f0_from_the_specular_color() {
     let sg = render(&mut h, &shaded(&frame, |s| s.spec_gloss = true), "shader_spec_gloss_gold");
     assert!(warmth(&sg) > warmth(&mr) + 10.0, "a gold F0 tints the reflections ({} vs {})", warmth(&sg), warmth(&mr));
     assert!(sg.mean(200, 100, 280, 180) > 20.0);
+}
+
+#[test]
+fn a_lit_metallic_view_ignores_the_specular_channel() {
+    let Some((mut h, frame)) = setup() else { return };
+    let lit = shaded(&frame, |s| {
+        s.view_mode = 1;
+        s.channel = 1;
+        s.solo_lit = true;
+    });
+    upload_height(&mut h, |_, _| [0.0, 1.0, 0.6, 0.1]);
+    let off = render(&mut h, &lit, "solo_lit_metallic_gold_specular");
+    let on = render(&mut h, &shaded(&lit, |s| s.spec_gloss = true), "solo_lit_metallic_gold_spec_gloss");
+    assert_eq!(off.px, on.px, "spec/gloss does not turn the neutral lit material into the specular colour");
 }
 
 #[test]

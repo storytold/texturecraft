@@ -1,53 +1,71 @@
-use chrono::Utc;
+use std::ops::Deref;
 
+use crate::log::DEFAULT_SOURCE;
 use crate::{LogEntry, LogLevel};
 
-/// The current session's log in occurrence order.
-#[derive(Debug, Default)]
-pub struct SessionLog {
-    entries: Vec<LogEntry>,
-}
+/// The current session's log in occurrence order
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionLog(Vec<LogEntry>);
 
 impl SessionLog {
-    pub fn push(&mut self, message: String) {
-        self.record(LogLevel::Info, message);
-    }
-
-    pub fn error(&mut self, message: String) {
-        self.record(LogLevel::Error, message);
-    }
-
-    pub fn warn(&mut self, message: String) {
-        self.record(LogLevel::Warning, message);
-    }
-
-    pub fn extend_warnings(&mut self, messages: impl IntoIterator<Item = String>) {
-        for message in messages {
-            self.warn(message);
-        }
+    pub fn new() -> SessionLog {
+        SessionLog(Vec::new())
     }
 
     pub fn entries(&self) -> &[LogEntry] {
-        &self.entries
+        &self.0
     }
 
-    pub fn last(&self) -> Option<&String> {
-        self.entries.last().map(|entry| &entry.message)
+    /// An info entry without a source of its own
+    pub fn push(&mut self, message: String) {
+        self.0.push(LogEntry::new(LogLevel::Info, DEFAULT_SOURCE, message));
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &String> {
-        self.entries.iter().map(|entry| &entry.message)
+    pub fn info(&mut self, source: &str, message: impl Into<String>) {
+        self.0.push(LogEntry::new(LogLevel::Info, source, message));
     }
 
-    fn record(&mut self, level: LogLevel, message: String) {
-        self.entries.push(LogEntry { time: Utc::now(), level, message });
+    pub fn warn(&mut self, source: &str, message: impl Into<String>) {
+        self.0.push(LogEntry::new(LogLevel::Warning, source, message));
+    }
+
+    pub fn error(&mut self, source: &str, message: impl Into<String>) {
+        self.0.push(LogEntry::new(LogLevel::Error, source, message));
+    }
+
+    /// Several warnings of one source
+    pub fn warnings(&mut self, source: &str, messages: impl IntoIterator<Item = String>) {
+        for message in messages {
+            self.warn(source, message);
+        }
+    }
+
+    /// Append the entries of another store
+    pub fn append(&mut self, other: SessionLog) {
+        self.0.extend(other.0);
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Drop the entries for which `keep` is false
+    pub fn retain(&mut self, keep: impl FnMut(&LogEntry) -> bool) {
+        self.0.retain(keep);
     }
 }
 
-impl Extend<String> for SessionLog {
-    fn extend<T: IntoIterator<Item = String>>(&mut self, messages: T) {
-        for message in messages {
-            self.push(message);
-        }
+impl Deref for SessionLog {
+    type Target = [LogEntry];
+    fn deref(&self) -> &[LogEntry] {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a SessionLog {
+    type Item = &'a LogEntry;
+    type IntoIter = std::slice::Iter<'a, LogEntry>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
     }
 }

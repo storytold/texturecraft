@@ -120,7 +120,7 @@ fn pick_mode_shows_the_id_map_and_a_click_on_the_mesh_adds_its_color() {
 #[test]
 fn without_an_id_map_picking_is_off_and_a_warning_says_why() {
     let (mut harness, _) = app_with_color_selection(false);
-    let warning = format!("{} Bake an ID map (F8) to pick colors from the mesh.", egui_phosphor::regular::WARNING);
+    let warning = format!("{} Bake an ID map (Ctrl+Shift+B) to pick colors from the mesh.", egui_phosphor::regular::WARNING);
     assert!(harness.query_by_label(&warning).is_some());
 
     harness.get_by_label(&pick_color_label()).click();
@@ -242,6 +242,27 @@ fn deselection_cancels_picking_and_preserves_a_view_chosen_meanwhile() {
     assert!(harness.state().picking_id_color.is_none());
     assert_eq!(harness.state().session.view, ViewMode::UvChecker);
     assert_eq!(colors(&harness, effect), vec![FIRST, SECOND, THIRD]);
+}
+
+#[test]
+fn removing_an_image_during_id_picking_falls_back_to_material() {
+    let (mut harness, _) = app_with_color_selection(true);
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgba8(1, 1).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let session = &mut harness.state_mut().session;
+    let name = session.import_resource_bytes("preview.png", png.into_inner()).unwrap();
+    execute(session, "viewport.view", &json!({"mode": "image", "image": name})).unwrap();
+    harness.get_by_label(&pick_color_label()).click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().session.view, ViewMode::MeshMap(BakedMap::Id));
+    assert!(harness.state().picking_id_color.is_some());
+
+    let app = harness.state_mut();
+    execute(&mut app.session, "resource.remove", &json!({"name": name})).unwrap();
+    texturecraft_ui_egui::id_color_pick::IdColorPick::end(app);
+
+    assert_eq!(app.session.view, ViewMode::Material);
+    assert!(app.picking_id_color.is_none());
 }
 
 #[test]

@@ -3,10 +3,10 @@
 use egui::{RichText, Ui};
 use egui_phosphor::regular as ic;
 use serde_json::json;
+use texturecraft_engine::ViewMode;
 use texturecraft_engine::camera_cmds::DEFAULT_CAMERA;
 use texturecraft_engine::core::ToneMapping;
-use texturecraft_engine::core::project::{DisplaySettings, ENV_RESOURCE_PREFIX};
-use texturecraft_render::ibl::ENVIRONMENTS;
+use texturecraft_engine::core::project::{DisplaySettings, EnvAlignment, ShadowMode};
 
 use crate::TextureCraftApp;
 use crate::i18n::tr;
@@ -16,15 +16,16 @@ use crate::unavailable;
 use crate::widgets::{combo, icon_button, section_with_reset, slider};
 
 /// The page's sections, in the reference's tab order
-pub(crate) const SECTIONS: [PageSection; 4] = [
+pub(crate) const SECTIONS: [PageSection; 5] = [
     PageSection { icon: ic::MOUNTAINS, title: "Environment settings" },
     PageSection { icon: ic::VIDEO_CAMERA, title: "Camera settings" },
     PageSection { icon: ic::FUNCTION, title: "Post effects" },
-    PageSection { icon: ic::CHECKERBOARD, title: "Viewer settings" },
+    PageSection { icon: ic::CUBE, title: "Render settings" },
+    PageSection { icon: ic::CHECKERBOARD, title: "Visualization settings" },
 ];
 
-/// What the reference's shadow opacity slider shows; TextureCraft's shadows have no opacity yet
-const SHADOWS_OPACITY_SHOWN: f32 = 90.0;
+/// What the greyed wireframe color button shows: the 3D wireframe's gray; the color is not settable yet
+const WIREFRAME_COLOR_SHOWN: [u8; 3] = [89, 89, 89];
 
 /// Indent of the rows under a sub-heading (Environment, Shadows)
 const ROW_INDENT: f32 = 12.0;
@@ -42,7 +43,8 @@ pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
         0 => import_hdr = environment(app, ui, &mut display),
         1 => camera(app, ui, &mut display),
         2 => post_effects(ui, &mut display),
-        _ => viewer(app, ui, &mut display),
+        3 => render_settings(ui, &mut display),
+        _ => visualization(app, ui, &mut display),
     });
 
     if display != app.session.doc.project.display {
@@ -80,54 +82,54 @@ fn indented(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     });
 }
 
-/// Environment and Shadows; true when Import HDR was picked
-fn environment(app: &TextureCraftApp, ui: &mut Ui, display: &mut DisplaySettings) -> bool {
-    let mut import_hdr = false;
-    sub_heading(ui, tr("Environment"));
-    indented(ui, |ui| {
-        import_hdr = environment_map(app, ui, display);
-        unavailable::checkbox(ui, false, tr("Override environment map color space"));
-        unavailable::greyed(ui, |ui| egui::ComboBox::from_id_salt("env_color_space").width(ui.available_width()).selected_text(tr("Auto")).show_ui(ui, |_| {}));
-        slider(ui, tr("Environment Opacity"), &mut display.env_opacity, 0.0..=1.0, 2);
-        slider(ui, tr("Environment Exposure (EV)"), &mut display.env_exposure, -5.0..=5.0, 2);
-        slider(ui, tr("Environment Blur"), &mut display.env_blur, 0.0..=1.0, 2);
-        slider(ui, tr("Environment Rotation"), &mut display.env_rotation, 0.0..=360.0, 0);
-        unavailable::combo(ui, tr("Environment Alignment"), tr("World"));
-    });
-
-    sub_heading(ui, tr("Shadows"));
-    indented(ui, |ui| {
-        ui.checkbox(&mut display.shadows, tr("Shadows")).on_hover_text(tr("Key light (shadow-casting light, direct only)"));
-        unavailable::combo(ui, tr("Computation mode"), tr("Lightweight"));
-        unavailable::slider(ui, tr("Shadows opacity"), SHADOWS_OPACITY_SHOWN, 0.0..=100.0, 0);
-    });
-    import_hdr
+/// A percentage slider over a value kept as a fraction (0..1)
+fn percent_slider(ui: &mut Ui, label: &str, fraction: &mut f32) {
+    let mut percent = *fraction * 100.0;
+    if slider(ui, label, &mut percent, 0.0..=100.0, 0).changed() {
+        *fraction = (percent / 100.0).clamp(0.0, 1.0);
+    }
 }
 
-/// The Environment Map button and its list: the built-in environments, the project's HDR images and Import HDR; true when Import HDR was picked
-fn environment_map(app: &TextureCraftApp, ui: &mut Ui, display: &mut DisplaySettings) -> bool {
-    let mut hdrs: Vec<&String> = app.session.images.iter().filter(|(_, image)| !image.srgb).map(|(name, _)| name).collect();
-    hdrs.sort();
-    let shown = display.environment_resource().unwrap_or(&display.environment).to_string();
-    let mut import_hdr = false;
-    ui.horizontal(|ui| {
-        ui.label(tr("Environment Map"));
-        let button = ui.add_sized([ui.available_width(), ui.spacing().interact_size.y], egui::Button::new(shown).truncate());
-        egui::Popup::menu(&button).id(ui.make_persistent_id("environment_map_list")).show(|ui| {
-            for environment in ENVIRONMENTS {
-                ui.selectable_value(&mut display.environment, environment.to_string(), environment);
-            }
-            ui.separator();
-            for name in hdrs {
-                ui.selectable_value(&mut display.environment, format!("{ENV_RESOURCE_PREFIX}{name}"), name.as_str());
-            }
-            import_hdr = ui
-                .selectable_label(false, format!("{} {}", ic::FILE_ARROW_UP, tr("Import HDR...")))
-                .on_hover_text(tr("Use an equirectangular .hdr or .exr image as the environment"))
-                .clicked();
+/// Environment and Shadows, greyed while a mesh map shows (it ignores lighting); true when Import HDR was picked
+fn environment(app: &mut TextureCraftApp, ui: &mut Ui, display: &mut DisplaySettings) -> bool {
+    let mesh_map_shown = matches!(app.session.view, ViewMode::MeshMap(_));
+    ui.add_enabled_ui(!mesh_map_shown, |ui| {
+        let mut import_hdr = false;
+        sub_heading(ui, tr("Environment"));
+        indented(ui, |ui| {
+            import_hdr = crate::environment_picker::show(app, ui, display);
+            unavailable::checkbox(ui, false, tr("Override environment map color space"));
+            unavailable::greyed(ui, |ui| {
+                egui::ComboBox::from_id_salt("env_color_space").width(ui.available_width()).selected_text(tr("Auto")).show_ui(ui, |_| {})
+            });
+            percent_slider(ui, tr("Environment Opacity"), &mut display.env_opacity);
+            slider(ui, tr("Environment Exposure (EV)"), &mut display.env_exposure, -10.0..=10.0, 2);
+            percent_slider(ui, tr("Environment Blur"), &mut display.env_blur);
+            slider(ui, tr("Environment Rotation"), &mut display.env_rotation, 0.0..=360.0, 0);
+            combo(ui, tr("Environment Alignment"), tr(display.env_alignment.label()), |ui| {
+                for alignment in EnvAlignment::ALL {
+                    ui.selectable_value(&mut display.env_alignment, alignment, tr(alignment.label()));
+                }
+            });
         });
-    });
-    import_hdr
+
+        sub_heading(ui, tr("Cast shadows"));
+        indented(ui, |ui| {
+            ui.checkbox(&mut display.shadows, tr("Cast shadows")).on_hover_text(tr("Key light (shadow-casting light, direct only)"));
+
+            // The shadow settings work only while shadows are on
+            ui.add_enabled_ui(display.shadows, |ui| {
+                combo(ui, tr("Computation mode"), tr(display.shadow_mode.label()), |ui| {
+                    for mode in ShadowMode::ALL {
+                        ui.selectable_value(&mut display.shadow_mode, mode, tr(mode.label()));
+                    }
+                });
+                percent_slider(ui, tr("Shadows opacity"), &mut display.shadow_opacity);
+            });
+        });
+        import_hdr
+    })
+    .inner
 }
 
 /// The camera preset and its restore, the lens, the saved cameras and depth of field
@@ -253,11 +255,27 @@ fn post_effects(ui: &mut Ui, display: &mut DisplaySettings) {
     }
 }
 
-/// The wireframes and temporal anti-aliasing
-fn viewer(app: &mut TextureCraftApp, ui: &mut Ui, display: &mut DisplaySettings) {
-    ui.checkbox(&mut app.ui.wireframe_3d, tr("Show wireframe in the 3D view"));
-    ui.checkbox(&mut app.ui.uv_wireframe, tr("Show UV wireframe in the 2D view"));
+/// Temporal anti-aliasing
+fn render_settings(ui: &mut Ui, display: &mut DisplaySettings) {
     ui.checkbox(&mut display.taa, tr("Temporal anti-aliasing (refines the 3D view while it is still)"));
+}
+
+/// The mesh wireframe and the single-channel views
+fn visualization(app: &mut TextureCraftApp, ui: &mut Ui, display: &mut DisplaySettings) {
+    sub_heading(ui, tr("Mesh wireframe"));
+    indented(ui, |ui| {
+        // One switch for the mesh edges in the 3D view and the UV edges in the 2D view
+        ui.checkbox(&mut app.ui.mesh_wireframe, tr("Show mesh wireframe"));
+        unavailable::greyed(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(tr("Wireframe color"));
+                let mut color = WIREFRAME_COLOR_SHOWN;
+                ui.color_edit_button_srgb(&mut color);
+            })
+        });
+        slider(ui, tr("Wireframe opacity"), &mut app.ui.wireframe_opacity, 0.0..=100.0, 0);
+    });
+    ui.checkbox(&mut display.solo_unlit, tr("Display solo view without lighting (unlit)"));
 }
 
 #[cfg(test)]

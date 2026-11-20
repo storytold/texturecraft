@@ -59,7 +59,8 @@ pub(crate) fn generator_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer
     }
     if !app.session.doc.baked.contains_key(&app.session.ts()) {
         ui.label(
-            RichText::new(format!("{} {}", ic::WARNING, tr("Bake mesh maps (F8) for curvature, AO and thickness based generators."))).color(tokens.warning),
+            RichText::new(format!("{} {}", ic::WARNING, tr("Bake mesh maps (Ctrl+Shift+B) for curvature, AO and thickness based generators.")))
+                .color(tokens.warning),
         );
     }
 }

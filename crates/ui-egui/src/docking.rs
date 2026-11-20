@@ -39,10 +39,12 @@ pub enum Panel {
     History,
     Log,
     Export,
+    /// The path tracer's settings (Window ▸ Views ▸ Renderer Settings, Rendering mode only)
+    Renderer,
 }
 
 /// Window ▸ Views items and the panels they show or hide.
-pub const VIEWS: [(&str, Panel); 13] = [
+pub const VIEWS: [(&str, Panel); 14] = [
     ("ui.view.assets", Panel::Assets),
     ("ui.view.bakeMaps", Panel::MeshMapSettings),
     ("ui.view.bakeSettings", Panel::CommonSettings),
@@ -53,6 +55,7 @@ pub const VIEWS: [(&str, Panel); 13] = [
     ("ui.view.log", Panel::Log),
     ("ui.view.meshMapBakers", Panel::MeshMapBakers),
     ("ui.view.properties", Panel::Properties),
+    ("ui.view.renderer", Panel::Renderer),
     ("ui.view.shader", Panel::Shader),
     ("ui.view.textureSetList", Panel::TextureSetList),
     ("ui.view.textureSetSettings", Panel::TextureSetSettings),
@@ -64,15 +67,23 @@ pub fn view_panel(id: &str) -> Option<Panel> {
 }
 
 impl Panel {
+    /// Whether Window ▸ Views offers the panel in `mode`, as measured on the reference app: Baking
+    /// has its own panels and lacks Assets, Export, Layers, Properties, Renderer Settings, Shader
+    /// Settings and Texture Set Settings; Rendering keeps only Display Settings, Log, Renderer
+    /// Settings, Shader Settings and the texture set list.
     pub(crate) fn available_in(self, mode: crate::state::Mode) -> bool {
+        use crate::state::Mode;
         match self {
-            Self::MeshMapSettings | Self::CommonSettings | Self::MeshMapBakers => mode == crate::state::Mode::Baking,
-            Self::Assets | Self::Layers | Self::Properties | Self::TextureSetSettings => mode != crate::state::Mode::Baking,
-            _ => true,
+            Self::MeshMapSettings | Self::CommonSettings | Self::MeshMapBakers => mode == Mode::Baking,
+            Self::Assets | Self::Layers | Self::Properties | Self::TextureSetSettings | Self::Export => mode == Mode::Painting,
+            Self::History => mode != Mode::Rendering,
+            Self::Shader => mode != Mode::Baking,
+            Self::Renderer => mode == Mode::Rendering,
+            Self::Viewport | Self::TextureSetList | Self::Display | Self::Log => true,
         }
     }
 
-    pub const ALL: [Panel; 14] = [
+    pub const ALL: [Panel; 15] = [
         Panel::Viewport,
         Panel::Assets,
         Panel::MeshMapSettings,
@@ -87,6 +98,7 @@ impl Panel {
         Panel::History,
         Panel::Log,
         Panel::Export,
+        Panel::Renderer,
     ];
 
     pub fn name(self) -> &'static str {
@@ -105,6 +117,7 @@ impl Panel {
             Panel::History => "History",
             Panel::Log => "Log",
             Panel::Export => "Export",
+            Panel::Renderer => "Renderer Settings",
         }
     }
 
@@ -116,6 +129,7 @@ impl Panel {
             Panel::History => 2.0,
             Panel::Log => 3.0,
             Panel::Export => 4.0,
+            Panel::Renderer => 5.0,
             _ => return None,
         };
         Some([960.0, 90.0 + 50.0 * slot, 300.0, 380.0])
@@ -437,8 +451,11 @@ pub(crate) fn input_blocked(app: &TextureCraftApp, context: &egui::Context) -> b
 
 /// Draw the dock (viewport and panels) into `ui`.
 pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
+    // Rendering keeps disabled panels visible because it shares the painting dock
+    let dock_mode = if app.ui.mode == crate::state::Mode::Rendering { crate::state::Mode::Painting } else { app.ui.mode };
     for panel in Panel::ALL {
-        if !panel.available_in(app.ui.mode) && app.ui.dock.is_open(panel) {
+        let kept = panel.available_in(dock_mode) || (panel == Panel::Renderer && app.ui.mode == crate::state::Mode::Rendering);
+        if !kept && app.ui.dock.is_open(panel) {
             app.ui.dock.close(panel);
         }
     }
@@ -508,6 +525,7 @@ pub(crate) fn panel_body(app: &mut TextureCraftApp, ui: &mut Ui, panel: Panel) {
         Panel::History => crate::windows::history(app, ui),
         Panel::Log => crate::log_panel::body(app, ui),
         Panel::Export => crate::export_panel::body(app, ui),
+        Panel::Renderer => crate::render_mode::settings_body(app, ui),
         Panel::Viewport => {}
     });
 }

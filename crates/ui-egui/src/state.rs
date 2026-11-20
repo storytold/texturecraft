@@ -20,6 +20,19 @@ pub use library_location::LibraryLocation;
 pub use project_config::ProjectConfig;
 pub use resource_usage::ResourceUsage;
 
+mod console_line;
+mod export_job;
+mod export_set_plan;
+mod file_type;
+mod map_export;
+mod set_export;
+pub use console_line::ConsoleLine;
+pub use export_job::ExportJob;
+pub use export_set_plan::ExportSetPlan;
+pub use file_type::FileType;
+pub use map_export::MapExport;
+pub use set_export::SetExport;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Mode {
     #[default]
@@ -96,6 +109,9 @@ pub struct Windows {
     /// Edit > Settings: the page and the settings edited so far, applied by OK.
     #[serde(skip)]
     pub settings_draft: Option<crate::settings_window::SettingsDraft>,
+    /// The page Edit > Settings was on when it closed; the window opens there again.
+    #[serde(skip)]
+    pub settings_page: crate::settings_window::SettingsPage,
     /// File > Import resources: the files added so far, imported by Import.
     #[serde(skip)]
     pub import_resources: Option<ImportResources>,
@@ -135,7 +151,7 @@ pub struct Prefs {
     /// Viewport texture resolution: 0 full, 1 half, 2 quarter of each texture set's size (lighter
     /// on GPU memory and uploads for 4K and 8K sets; painting and export keep full resolution).
     pub viewport_texture: u8,
-    /// Interface brightness (the views keep their studio slate).
+    /// Interface brightness (the views keep their own background).
     pub brightness: crate::theme::Brightness,
     /// The colour of what is on, chosen or focused.
     pub accent: crate::theme::Accent,
@@ -166,6 +182,9 @@ pub struct Prefs {
     pub gpu_raytracing: bool,
     /// Library locations the user added (Settings > Libraries), after the built-in ones.
     pub libraries: Vec<LibraryLocation>,
+    /// The plain background of the 3D and 2D views at Environment Opacity 0 (Settings > General >
+    /// Background color): the color at the top and at the bottom, linear RGB.
+    pub background: [[f32; 3]; 2],
 }
 
 /// The orbit speed the built-in navigation runs at.
@@ -195,6 +214,7 @@ impl Default for Prefs {
             wheel_inverse: false,
             gpu_raytracing: true,
             libraries: Vec::new(),
+            background: texturecraft_render::DEFAULT_BACKGROUND,
         }
     }
 }
@@ -312,6 +332,9 @@ impl Default for NewProject {
     }
 }
 
+/// `ExportUi::size` for "Maximum size for all Texture Sets".
+pub const SIZE_OF_LARGEST_SET: u32 = u32::MAX;
+
 /// The export dialog's settings (remembered between sessions).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExportUi {
@@ -321,10 +344,13 @@ pub struct ExportUi {
     pub format: String,
     /// Bit depth override (0 = the preset's).
     pub bit_depth: u8,
-    /// none | dilation | dilationDefault | infinite
+    /// Dither the 8-bit files of the file type override.
+    #[serde(default)]
+    pub dithering: bool,
+    /// none | dilation | dilationDefault | diffusion | infinite
     pub padding: String,
     pub dilation: u32,
-    /// Output size override (0 = each texture set's size).
+    /// Output size override (0 = each texture set's size, [`SIZE_OF_LARGEST_SET`] = the largest set's).
     pub size: u32,
     /// "" (project), openGl or directX.
     pub normal_format: String,
@@ -333,35 +359,81 @@ pub struct ExportUi {
     pub color_space: String,
     /// Texture sets excluded from export.
     pub skip: Vec<usize>,
+    /// Per texture set (by index) overrides of the settings above.
+    #[serde(default)]
+    pub sets: std::collections::BTreeMap<usize, SetExport>,
+    /// Whose `skip` and `sets` these are: the project name, then its texture set names in order.
+    /// Another project drops them; texture sets that moved take theirs along, removed ones lose them.
+    #[serde(default)]
+    pub owner: Vec<String>,
+    /// The session's project id `owner` was taken in (None after a restart: the name decides).
+    #[serde(skip)]
+    pub owner_id: Option<u64>,
     pub tab: u8,
+    /// SETTINGS tab: the texture set whose page shows (None: Global settings).
+    #[serde(skip)]
+    pub page: Option<usize>,
     /// Output templates tab: the selected user preset being edited (saved whenever it is valid).
     #[serde(skip)]
     pub draft: Option<texturecraft_engine::formats::ExportPreset>,
+    /// Output templates tab: for each map of `draft`, its index in the saved template (None: added
+    /// since), so the texture set overrides of a map follow it when the draft is saved.
+    #[serde(skip)]
+    pub draft_maps: Vec<Option<usize>>,
+    /// Output templates tab: the saved template `draft_maps` counts from.
+    #[serde(skip)]
+    pub draft_base: Option<texturecraft_engine::formats::ExportPreset>,
     /// Output templates tab: the new name while renaming the selected preset.
     #[serde(skip)]
     pub renaming: Option<String>,
+    /// Output templates tab: F2 asked to rename the selected preset.
+    #[serde(skip)]
+    pub rename_key: bool,
     /// Output templates tab: the question waiting for an answer (delete, or drop an unsaved edit).
     #[serde(skip)]
     pub ask: Option<crate::export_templates::Ask>,
+    /// The settings when the window opened: Cancel goes back to them.
+    #[serde(skip)]
+    pub opened_with: Option<Box<ExportUi>>,
+    /// The export running in the window.
+    #[serde(skip)]
+    pub job: Option<ExportJob>,
+    /// LIST OF EXPORTS: the console's lines and whether it is hidden.
+    #[serde(skip)]
+    pub console: Vec<ConsoleLine>,
+    #[serde(skip)]
+    pub console_hidden: bool,
 }
 
 impl Default for ExportUi {
     fn default() -> Self {
         ExportUi {
             dir: default_export_dir(),
-            preset: "Document channels + Normal + AO".into(),
+            preset: texturecraft_engine::formats::DEFAULT_PRESET.into(),
             format: String::new(),
             bit_depth: 0,
+            dithering: false,
             padding: "infinite".into(),
             dilation: 16,
             size: 0,
             normal_format: String::new(),
             color_space: String::new(),
             skip: Vec::new(),
+            sets: Default::default(),
+            owner: Vec::new(),
+            owner_id: None,
             tab: 0,
+            page: None,
             draft: None,
+            draft_maps: Vec::new(),
+            draft_base: None,
             renaming: None,
+            rename_key: false,
             ask: None,
+            opened_with: None,
+            job: None,
+            console: Vec::new(),
+            console_hidden: false,
         }
     }
 }
@@ -392,6 +464,11 @@ fn deserialize_shelf_panes_split<'de, D: serde::Deserializer<'de>>(deserializer:
 
     // A finite JSON number can overflow f32 and prevent the next settings save
     Ok(if share.is_finite() { share } else { default_shelf_panes_split() })
+}
+
+/// "Wireframe opacity" until changed: 40 of 100, as in the reference app
+fn default_wireframe_opacity() -> f32 {
+    40.0
 }
 
 /// Settings that start on, for saved states that predate them
@@ -425,6 +502,12 @@ pub struct UiState {
     pub(crate) inactive_mode_dock: Dock,
     #[serde(default)]
     pub(crate) dock_is_baking: bool,
+    /// Window ▸ Toolbars ▸ Docks: the right bar of panel icons
+    #[serde(default = "default_true")]
+    pub toolbar_docks: bool,
+    /// Window ▸ Toolbars ▸ Tools: the tool buttons on the left
+    #[serde(default = "default_true")]
+    pub toolbar_tools: bool,
     /// The bake layout version the bake dock was saved with; 0 before versions existed.
     #[serde(default)]
     pub(crate) bake_layout_version: u32,
@@ -436,6 +519,9 @@ pub struct UiState {
     pub windows: Windows,
     pub uv_zoom: f32,
     pub uv_pan: [f32; 2],
+    /// The 2D view's turn, counter-clockwise on screen in radians (Alt+left drag)
+    #[serde(default)]
+    pub uv_rotation: f32,
     /// Channel whose blending the layer rows show.
     pub layer_channel: Channel,
     pub shelf_filter: String,
@@ -463,11 +549,15 @@ pub struct UiState {
     /// Layer being renamed and the edit buffer.
     pub rename: Option<(u64, String)>,
     pub new_project: NewProject,
-    /// Show the UV wireframe in the 2D view.
-    pub uv_wireframe: bool,
-    /// Show the mesh wireframe over the 3D view.
-    #[serde(default)]
-    pub wireframe_3d: bool,
+    /// Show mesh wireframe: the mesh's edges over the 3D view and its UV edges in the 2D view (off by default)
+    #[serde(default, alias = "wireframe_3d")]
+    pub mesh_wireframe: bool,
+    /// Wireframe opacity, 0 to 100
+    #[serde(default = "default_wireframe_opacity")]
+    pub wireframe_opacity: f32,
+    /// The 2D view of a UV tile project shows the UDIM numbers and the hover label (the button left of the view mode)
+    #[serde(default = "default_true")]
+    pub uv_tile_info: bool,
     /// Show the orbit, pan and zoom buttons in the corner of the 3D and 2D views (Viewport menu)
     #[serde(default = "default_true")]
     pub nav_buttons: bool,
@@ -510,6 +600,18 @@ pub struct UiState {
     /// The Log panel's shown channel tab
     #[serde(default)]
     pub log_channel: crate::log_panel::LogChannel,
+    /// The project template the last New project was created from (name or label)
+    #[serde(default)]
+    pub last_template: String,
+    /// The selected Log lines (indices into the session log); not saved
+    #[serde(skip)]
+    pub log_selection: std::collections::BTreeSet<usize>,
+    /// The Log line a Shift+click extends from
+    #[serde(skip)]
+    pub log_anchor: Option<usize>,
+    /// Identity of the log that owns the selected rows.
+    #[serde(skip)]
+    pub log_id: u64,
 }
 
 impl UiState {
@@ -559,6 +661,7 @@ impl UiState {
 
         self.export = keep.export;
         self.recent = keep.recent;
+        self.last_template = keep.last_template;
         self.prefs = keep.prefs;
         self.nav_buttons = keep.nav_buttons;
         self.keymap = keep.keymap;
@@ -587,12 +690,15 @@ impl Default for UiState {
             rail_panel: None,
             inactive_mode_dock: Dock::for_baking(),
             dock_is_baking: false,
+            toolbar_docks: true,
+            toolbar_tools: true,
             bake_layout_version: BAKE_LAYOUT_VERSION,
             selected_baked_map: None,
             hide_ui: false,
             windows: Windows::default(),
             uv_zoom: 1.0,
             uv_pan: [0.0, 0.0],
+            uv_rotation: 0.0,
             layer_channel: Channel::BaseColor,
             blend_clipboard: None,
             shelf_filter: String::new(),
@@ -606,8 +712,9 @@ impl Default for UiState {
             text: TextUi::default(),
             rename: None,
             new_project: NewProject::default(),
-            uv_wireframe: true,
-            wireframe_3d: false,
+            mesh_wireframe: false,
+            wireframe_opacity: default_wireframe_opacity(),
+            uv_tile_info: true,
             nav_buttons: true,
             render: RenderUi::default(),
             prefs: Prefs::default(),
@@ -623,6 +730,10 @@ impl Default for UiState {
             bake_preset_name: String::new(),
             layout_dialog: None,
             log_channel: crate::log_panel::LogChannel::default(),
+            last_template: String::new(),
+            log_selection: Default::default(),
+            log_anchor: None,
+            log_id: 0,
         }
     }
 }
@@ -691,7 +802,7 @@ mod tests {
             ui.inactive_mode_dock.close(crate::docking::Panel::Log);
             ui.layout = ViewLayout::Only3D;
             ui.uv_zoom = 3.0;
-            ui.wireframe_3d = true;
+            ui.mesh_wireframe = true;
             ui.recent = vec!["a.tcraft".into()];
 
             ui.reset_panel_layout();
@@ -699,9 +810,27 @@ mod tests {
             let mut fresh = UiState { mode, ..UiState::default() };
             fresh.sync_mode_dock();
             assert_eq!((&ui.dock, &ui.inactive_mode_dock), (&fresh.dock, &fresh.inactive_mode_dock), "baking: {baking}");
-            assert_eq!((ui.layout, ui.uv_zoom, ui.wireframe_3d, ui.mode), (ViewLayout::Only3D, 3.0, true, mode));
+            assert_eq!((ui.layout, ui.uv_zoom, ui.mesh_wireframe, ui.mode), (ViewLayout::Only3D, 3.0, true, mode));
             assert_eq!(ui.recent, vec!["a.tcraft".to_string()]);
         }
+    }
+
+    #[test]
+    fn a_saved_state_with_the_old_3d_wireframe_switch_keeps_it_as_the_one_mesh_wireframe_switch() {
+        let mut saved = serde_json::to_value(UiState::default()).unwrap();
+        let fields = saved.as_object_mut().unwrap();
+        assert_eq!((fields.remove("mesh_wireframe"), fields.remove("wireframe_opacity")), (Some(false.into()), Some(40.0.into())));
+        fields.insert("wireframe_3d".into(), true.into());
+        fields.insert("uv_wireframe".into(), true.into());
+
+        let loaded: UiState = serde_json::from_value(saved).unwrap();
+        assert!(loaded.mesh_wireframe);
+        assert_eq!(loaded.wireframe_opacity, 40.0);
+        assert!(loaded.uv_tile_info);
+
+        let fresh = UiState::default();
+        assert!(!fresh.mesh_wireframe, "off by default, the UV wireframe too");
+        assert_eq!(fresh.wireframe_opacity, 40.0);
     }
 
     #[test]

@@ -26,6 +26,7 @@ image = { workspace = true }
 png = "0.18"
 bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
 craft-image-codecs = { workspace = true }
+craft-psd = { git = "https://github.com/storytold/craft-libs", rev = "b130ac1fa44f923c3024884ab8ceb5ccdb88f15f" }
 gltf = { workspace = true }
 flate2 = { workspace = true }
 lz4_flex = { workspace = true }

@@ -45,7 +45,9 @@ pub const CATALOG: &[Item] = &[
     sep("File"),
     it("File", "Save", "file.save", Some("Ctrl+S")),
     it("File", "Save as...", "file.saveAs", Some("Ctrl+Shift+S")),
-    sub("File", "More save options", "Save a copy...", "file.saveCopy", None),
+    sub("File", "More save options", "Save as template...", "ui.saveAsTemplate", None),
+    sub("File", "More save options", "Save and reduce file size", "ui.saveReduced", None),
+    sub("File", "More save options", "Save as copy...", "file.saveCopy", None),
     it("File", "Remove unused resources...", "file.removeUnused", None),
     sep("File"),
     it("File", "Import resources...", "resource.import", None),
@@ -62,7 +64,7 @@ pub const CATALOG: &[Item] = &[
     it("Edit", "Project Configuration...", "ui.projectConfig", None),
     it("Edit", "Reimport mesh", "file.reimportMesh", Some("Ctrl+Shift+R")),
     it("Edit", "Settings...", "ui.settings", None),
-    it("Mode", "Bake Mesh Maps", "ui.mode.bake", Some("F8")),
+    it("Mode", "Bake Mesh Maps", "ui.mode.bake", Some("Ctrl+Shift+B")),
     it("Mode", "Painting", "ui.mode.paint", Some("F9")),
     it("Mode", "Rendering (path traced)", "ui.mode.render", Some("F10")),
     sub("Window", "Views", "Assets", "ui.view.assets", None),
@@ -75,11 +77,19 @@ pub const CATALOG: &[Item] = &[
     sub("Window", "Views", "Mesh Map Bakers", "ui.view.meshMapBakers", None),
     sub("Window", "Views", "Mesh Map Settings", "ui.view.bakeMaps", None),
     sub("Window", "Views", "Properties", "ui.view.properties", None),
+    sub("Window", "Views", "Python Console", "ui.view.pythonConsole", None),
+    sub("Window", "Views", "Renderer Settings", "ui.view.renderer", None),
     sub("Window", "Views", "Shader Settings", "ui.view.shader", None),
+    sub("Window", "Views", "Online assets", "ui.view.onlineAssets", None),
     sub("Window", "Views", "Texture Sets", "ui.view.textureSetList", None),
     sub("Window", "Views", "Texture Set Settings", "ui.view.textureSetSettings", None),
+    sub("Window", "Toolbars", "Docks", "ui.toolbar.docks", None),
+    sub("Window", "Toolbars", "Plugins", "ui.toolbar.plugins", None),
+    sub("Window", "Toolbars", "Tools", "ui.toolbar.tools", None),
     sep("Window"),
-    sub("Window", "Save UI Layout", "Save current layout...", "ui.layout.save", None),
+    sub("Window", "Save UI Layout", "Painting mode", "ui.layout.save.painting", None),
+    sub("Window", "Save UI Layout", "Rendering mode", "ui.layout.save.rendering", None),
+    sub("Window", "Save UI Layout", "Baking mode", "ui.layout.save.baking", None),
     it("Window", "Load UI Layout", "ui.layout.load", None),
     sub("Window", "Layouts", "Save current layout as...", "ui.layout.saveAs", None),
     sub("Window", "Layouts", "Manage layouts...", "ui.layout.manage", None),
@@ -138,11 +148,37 @@ fn is_ui(id: &str) -> bool {
 
 /// Shell items that act on the open project: greyed while none is open
 fn ui_needs_project(id: &str) -> bool {
-    matches!(id, "ui.export" | "ui.projectConfig" | "ui.uvChecker" | "ui.mode.bake" | "ui.mode.paint" | "ui.mode.render")
+    matches!(id, "ui.export" | "ui.projectConfig" | "ui.uvChecker" | "ui.mode.bake" | "ui.mode.paint" | "ui.mode.render" | "ui.saveAsTemplate")
+}
+
+/// Menu items the reference has and TextureCraft has no function for yet: shown greyed with the
+/// hint "Not available yet", never run, and not listed as implemented
+pub const UNAVAILABLE: [&str; 4] = ["ui.saveReduced", "ui.view.pythonConsole", "ui.view.onlineAssets", "ui.toolbar.plugins"];
+
+/// The text of a menu item: the Properties view names the tool, as "Properties - Paint", while a
+/// project is open
+fn item_label(app: &TextureCraftApp, item: &Item) -> String {
+    if item.id == "ui.view.properties" && app.session.project_open {
+        return format!("{} - {}", tr(item.label), tr(app.session.tool.tool.label()));
+    }
+
+    tr(item.label).to_string()
+}
+
+/// The tooltip the reference shows on a menu item
+fn tooltip_of(id: &str) -> Option<&'static str> {
+    match id {
+        "ui.saveAsTemplate" => Some("Save as template"),
+        _ => None,
+    }
 }
 
 /// Whether an item can run now
 pub fn enabled(app: &TextureCraftApp, id: &str) -> bool {
+    if UNAVAILABLE.contains(&id) {
+        return false;
+    }
+
     if let Some(panel) = crate::docking::view_panel(id) {
         return panel.available_in(app.ui.mode);
     }
@@ -174,7 +210,7 @@ pub fn enabled(app: &TextureCraftApp, id: &str) -> bool {
 
 /// Whether an id is implemented at all (parity report).
 pub fn implemented(id: &str) -> bool {
-    is_ui(id) || texturecraft_engine::find(id).is_some()
+    !UNAVAILABLE.contains(&id) && is_ui(id) || texturecraft_engine::find(id).is_some()
 }
 
 /// Invoke a menu item (menus, shortcuts, palette, control channel `ui.menu.invoke`)
@@ -205,6 +241,7 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         "ui.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         #[cfg(not(target_arch = "wasm32"))]
         "ui.projectConfig" => crate::project_config::open(app),
+        "ui.saveAsTemplate" => crate::windows::save_as_template(app),
 
         // The browser cannot change the mesh file, so open Display instead
         #[cfg(target_arch = "wasm32")]
@@ -214,11 +251,20 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         "ui.mode.paint" => app.ui.mode = Mode::Painting,
         "ui.mode.render" => app.ui.mode = Mode::Rendering,
         "ui.hideUi" => app.ui.hide_ui = !app.ui.hide_ui,
+        "ui.wireframe" => app.ui.mesh_wireframe = !app.ui.mesh_wireframe,
         "ui.navButtons" => app.ui.nav_buttons = !app.ui.nav_buttons,
         "ui.resetPanelLayout" => app.ui.reset_panel_layout(),
         "ui.resetUi" => app.ui.windows.confirm_reset_ui = true,
-        "ui.layout.save" => crate::windows::layout_file(app, true),
-        "ui.layout.load" => crate::windows::layout_file(app, false),
+        "ui.layout.save" => {
+            let mode = app.ui.mode;
+            crate::windows::save_layout(app, mode);
+        }
+        "ui.layout.save.painting" => crate::windows::save_layout(app, Mode::Painting),
+        "ui.layout.save.rendering" => crate::windows::save_layout(app, Mode::Rendering),
+        "ui.layout.save.baking" => crate::windows::save_layout(app, Mode::Baking),
+        "ui.layout.load" => crate::windows::load_layout(app),
+        "ui.toolbar.docks" => app.ui.toolbar_docks = !app.ui.toolbar_docks,
+        "ui.toolbar.tools" => app.ui.toolbar_tools = !app.ui.toolbar_tools,
         "ui.layout.saveAs" => app.ui.layout_dialog = Some(crate::named_layouts::LayoutDialog::Save(String::new())),
         "ui.layout.manage" => app.ui.layout_dialog = Some(crate::named_layouts::LayoutDialog::Manage { renaming: None, deleting: None }),
         "ui.uvChecker" => {
@@ -296,25 +342,40 @@ pub fn menu_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     });
 }
 
-fn menu_item(app: &mut TextureCraftApp, ctx: &egui::Context, ui: &mut egui::Ui, item: &Item) {
-    let on = enabled(app, item.id);
-    let mut b = egui::Button::new(tr(item.label));
-    if let Some(sc) = crate::keymap::shortcut_of(&app.ui.keymap, item.id) {
-        b = b.shortcut_text(sc);
-    }
-    let checked = match item.id {
+/// The check mark an item shows: the mode and view items, the toolbars and Hide UI (None: not checkable)
+pub fn checked(app: &TextureCraftApp, id: &str) -> Option<bool> {
+    match id {
         "ui.mode.paint" => Some(app.ui.mode == Mode::Painting),
         "ui.mode.bake" => Some(app.ui.mode == Mode::Baking),
         "ui.mode.render" => Some(app.ui.mode == Mode::Rendering),
         "ui.navButtons" => Some(app.ui.nav_buttons),
+        "ui.hideUi" => Some(app.ui.hide_ui),
+        "ui.toolbar.docks" => Some(app.ui.toolbar_docks),
+        "ui.toolbar.tools" => Some(app.ui.toolbar_tools),
         "camera.perspective" => Some(!app.session.camera.ortho),
         "camera.orthographic" => Some(app.session.camera.ortho),
         id => crate::docking::view_panel(id).map(|p| app.ui.dock.is_open(p)),
-    };
+    }
+}
+
+fn menu_item(app: &mut TextureCraftApp, ctx: &egui::Context, ui: &mut egui::Ui, item: &Item) {
+    let on = enabled(app, item.id);
+    let mut b = egui::Button::new(item_label(app, item));
+    if let Some(sc) = crate::keymap::shortcut_of(&app.ui.keymap, item.id) {
+        b = b.shortcut_text(sc);
+    }
+    let checked = checked(app, item.id);
     if let Some(c) = checked {
         b = b.selected(c);
     }
-    if ui.add_enabled(on, b).clicked() {
+    let mut response = ui.add_enabled(on, b);
+    if let Some(tip) = tooltip_of(item.id) {
+        response = response.on_hover_text(tr(tip));
+    }
+    if UNAVAILABLE.contains(&item.id) {
+        response = response.on_disabled_hover_text(tr(crate::unavailable::NOT_AVAILABLE));
+    }
+    if response.clicked() {
         invoke(app, ctx, item.id);
         ui.close();
     }
@@ -416,14 +477,23 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let no_widget_focused = ctx.memory(|memory| memory.focused().is_none());
     #[cfg(not(target_arch = "wasm32"))]
     let nothing_focused = ctx.memory(|memory| memory.focused().is_none());
+    let log_copies = crate::log_panel::takes_copy(app, ctx);
     let commands_to_invoke = ctx.input_mut(|input| {
         // egui's label selection copies on these events at the end of the frame
         let copies: Vec<_> = input.events.iter().filter(|event| matches!(event, egui::Event::Copy | egui::Event::Cut)).cloned().collect();
+        if log_copies {
+            input.events.retain(|event| !matches!(event, egui::Event::Copy));
+        }
 
         // Escape and Enter answer the Reset UI question first, even when a shortcut binds them
         let confirming_reset = app.ui.windows.confirm_reset_ui;
         if confirming_reset && !popup_open {
             crate::windows::reset_ui_keys(app, input, no_widget_focused);
+        }
+
+        // F2 renames the selected template on Output templates, before its 3D view binding
+        if app.ui.windows.export && app.ui.export.tab == 1 && app.ui.export.ask.is_none() && input.consume_key(Modifiers::NONE, Key::F2) {
+            app.ui.export.rename_key = true;
         }
         let commands = app.bindings.dispatch(input);
         for copy in copies {

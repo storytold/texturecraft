@@ -15,8 +15,8 @@ impl LogChannel {
 
     pub fn name(self) -> &'static str {
         match self {
-            LogChannel::General => "General",
-            LogChannel::Assets => "Assets",
+            LogChannel::General => "GENERAL",
+            LogChannel::Assets => "ASSETS",
         }
     }
 }

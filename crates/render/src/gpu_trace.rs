@@ -51,6 +51,8 @@ struct Head {
 struct PostRaw {
     size: [u32; 4],
     display: [f32; 4],
+    back_top: [f32; 4],
+    back_bottom: [f32; 4],
 }
 
 struct Geometry {
@@ -92,6 +94,7 @@ struct SceneConst {
     eps: f32,
     sigma: Vec3,
     rotation: f32,
+    env_camera: bool,
     heights: Vec<f32>,
     ior: f32,
     /// Focus depth (0: the orbit target) and lens radius in world units (0: pinhole).
@@ -349,6 +352,7 @@ impl GpuTracer {
             if bvh_depth(&nodes).is_none_or(|d| d >= STACK) {
                 return Err("the mesh's BVH is too deep for GPU traversal".into());
             }
+
             let (data, verts) = geometry_data(&scene.mesh, &scene.bvh, &scene.tri_set);
             let (nodes, tris) = data;
             for (what, b) in [("BVH", nodes.len()), ("triangle list", tris.len()), ("vertex list", verts.len())] {
@@ -411,6 +415,7 @@ impl GpuTracer {
             eps: scene.eps,
             sigma: scene.scatter_sigma,
             rotation: scene.env_rotation,
+            env_camera: scene.env_camera,
             heights: scene.sets.iter().map(|s| s.height_strength).collect(),
             ior: scene.ior,
             lens: scene.lens.map_or([0.0; 2], |[focus, aperture]| [focus, aperture.max(0.0) * scene.radius]),
@@ -595,7 +600,7 @@ impl GpuTracer {
         });
         let (w, h) = (acc.width, acc.height);
         let inv_vp = cam.view_proj(w as f32 / h as f32).inverse();
-        let (sin, cos) = sc.rotation.sin_cos();
+        let (sin, cos) = (sc.rotation + if sc.env_camera { crate::renderer::camera_yaw(cam) } else { 0.0 }).sin_cos();
         let head = Head {
             inv_vp: inv_vp.to_cols_array(),
             forward: cam.forward().extend(sc.eps).to_array(),
@@ -637,14 +642,21 @@ impl GpuTracer {
         let disp = [display.exposure, flag(display.aces), display.env_opacity, flag(display.denoise)];
         let mut bytes = vec![0u8; self.post_stride as usize * STEPS.len()];
         for (i, step) in STEPS.iter().enumerate() {
-            let raw = PostRaw { size: [acc.width, acc.height, self.samples, *step], display: disp };
+            let [t, b] = display.background;
+            let raw = PostRaw {
+                size: [acc.width, acc.height, self.samples, *step],
+                display: disp,
+                back_top: [t[0], t[1], t[2], 0.0],
+                back_bottom: [b[0], b[1], b[2], 0.0],
+            };
             if let Some(slot) = bytes.get_mut(i * self.post_stride as usize..).and_then(|s| s.get_mut(..size_of::<PostRaw>())) {
                 slot.copy_from_slice(bytemuck::bytes_of(&raw));
             }
         }
         queue.write_buffer(&self.post, 0, &bytes);
         let post = wgpu::BufferBinding { buffer: &self.post, offset: 0, size: wgpu::BufferSize::new(size_of::<PostRaw>() as u64) };
-        // a: illum[0] → illum[1], b: illum[1] → illum[0].
+
+        // a: illum[0] → illum[1], b: illum[1] → illum[0]
         let group = |src: &wgpu::Buffer, dst: &wgpu::Buffer| {
             let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(post.clone()) }];
             entries.extend(acc.acc.iter().zip(1..).map(|(b, binding)| wgpu::BindGroupEntry { binding, resource: b.as_entire_binding() }));
@@ -663,7 +675,7 @@ impl GpuTracer {
             cpass.dispatch_workgroups(groups.0, groups.1, 1);
         };
         if display.denoise {
-            // The five steps alternate b, a, b, a, b, leaving the result in illum[0].
+            // The five steps alternate b, a, b, a, b, leaving the result in illum[0]
             run(&self.init_pipe, &a, 0);
             for slot in 1..STEPS.len() {
                 run(&self.step_pipe, if slot % 2 == 1 { &b } else { &a }, slot);
@@ -920,8 +932,7 @@ mod tests {
 
     #[test]
     fn white_furnace_on_the_gpu_stays_bounded_and_finite() {
-        // White spheres in a uniform white environment reflect at most what arrives: at half
-        // exposure the environment shows as 0.5 and the spheres between 0.25 and 0.5.
+        // Half exposure puts the white environment at 0.5 and bounds the spheres below it
         use Channel::*;
         let Some((mut h, mut t)) = gpu() else { return };
         let everything = [(CoatWeight, [1.0; 3]), (SheenWeight, [1.0; 3]), (AnisotropyLevel, [1.0; 3]), (ScatterWeight, [1.0; 3])];
@@ -929,7 +940,7 @@ mod tests {
             let values: Vec<_> = WHITE.iter().chain(extra).copied().collect();
             let env = EnvImage { width: 8, height: 4, data: vec![[1.0; 3]; 32] };
             let scene = sphere_scene(&mut h, env, &values);
-            let d = TraceDisplay { exposure: 0.5, aces: false, env_opacity: 1.0, denoise: false };
+            let d = TraceDisplay { exposure: 0.5, aces: false, env_opacity: 1.0, denoise: false, background: crate::DEFAULT_BACKGROUND };
             let (w, _, px) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &TraceSettings { bounces: 8 }, &d, [64, 48], 256).unwrap();
             assert!(accumulation(&h, &t).iter().all(|v| v.iter().all(|c| c.is_finite())), "{name}: no NaN or infinity");
             let at = |x: u32, y: u32| texturecraft_texel::srgb_to_linear(px[((y * w + x) * 4 + 1) as usize] as f32 / 255.0);
@@ -959,7 +970,7 @@ mod tests {
         for (name, values, lens) in [("every lobe", &values[..], None), ("glass under a thin lens", &glass[..], Some([3.2, 0.2]))] {
             let mut scene = sphere_scene(&mut h, crate::ibl::environment("Studio Contrast", 256), values);
             (scene.lens, scene.ior) = (lens, 1.45);
-            let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false };
+            let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false, background: crate::DEFAULT_BACKGROUND };
             let settings = TraceSettings { bounces: 6 };
             let (_, _, gpu) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &settings, &d, [48, 36], 1024).unwrap();
             let mut cpu = Tracer::new(48, 36);
@@ -972,8 +983,7 @@ mod tests {
 
     #[test]
     fn gpu_reads_full_size_channels_beside_placeholders() {
-        // Base color stays at its default (a 1×1 placeholder texture) while roughness varies
-        // across the surface (a full-size texture): the tracer must still read every texel of it.
+        // A 1×1 base-color placeholder must not limit sampling of the full-size roughness map
         use Channel::*;
         let Some((mut h, mut t)) = gpu() else { return };
         let mut composite = Composite::new(&[Roughness, Metallic], 64);
@@ -997,7 +1007,7 @@ mod tests {
         let bvh = Arc::new(Bvh::new(&mesh));
         let env = crate::ibl::environment("Studio Contrast", 256);
         let scene = TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0 }], Arc::new(env), 0.0);
-        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false };
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false, background: crate::DEFAULT_BACKGROUND };
         let settings = TraceSettings { bounces: 4 };
         let (_, _, gpu) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &settings, &d, [48, 36], 1024).unwrap();
         let mut cpu = Tracer::new(48, 36);
@@ -1041,7 +1051,8 @@ mod tests {
         let mut cam = OrbitCamera::default();
         cam.frame(lo, hi);
         let scene = TraceScene::new(mesh.clone(), Arc::new(Bvh::new(&mesh)), Vec::new(), Arc::new(crate::ibl::environment("Studio Soft", 1024)), 0.0);
-        let (settings, d) = (TraceSettings::default(), TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: true });
+        let (settings, d) =
+            (TraceSettings::default(), TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: true, background: crate::DEFAULT_BACKGROUND });
         let run = |t: &mut GpuTracer, n| t.render(&h.device, &h.queue, &h.renderer, &scene, &cam, &settings, &d, [1920, 1080], n).unwrap();
         run(&mut t, 8);
         let t0 = std::time::Instant::now();

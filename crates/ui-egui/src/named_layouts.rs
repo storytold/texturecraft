@@ -288,8 +288,7 @@ mod tests {
         ui.dock.close(Panel::Layers);
         ui.uv_zoom = 3.0;
         ui.uv_pan = [0.25, 0.5];
-        ui.uv_wireframe = false;
-        ui.wireframe_3d = true;
+        ui.mesh_wireframe = true;
         ui.layout = ViewLayout::Only3D;
         ui.split_ratio = 0.2;
         ui.shelf_filter = "rust".into();

@@ -229,7 +229,7 @@ pub fn project_file_name(app: &TextureCraftApp) -> String {
 
 /// Pack exported textures into one zip archive.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn zip_files(files: &[ExportedFile]) -> Result<Vec<u8>, String> {
+fn zip_files(files: Vec<ExportedFile>) -> Result<Vec<u8>, String> {
     use std::io::Write as _;
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
@@ -320,7 +320,7 @@ mod web {
         match app.session.to_project_bytes().map_err(|e| e.to_string()).and_then(|b| download(&name, &b)) {
             Ok(()) => {
                 app.session.modified = false;
-                app.session.log.push(format!("Saved {name}"));
+                app.session.log.info("Project", format!("Saved {name}"));
                 app.toast(trf("Downloaded {name}", &[("name", &name)]), false);
             }
             Err(e) => app.toast(trf("Couldn't save {name}: {error}", &[("name", &name), ("error", &e)]), true),
@@ -334,7 +334,7 @@ mod web {
         let bytes = match ext {
             "glb" => app.session.mesh_glb_bytes(),
             "usdz" => app.session.mesh_usd(texturecraft_engine::formats::UsdFormat::Usdz).map(|u| u.bytes),
-            _ => Ok(app.session.mesh_obj_bytes()),
+            _ => app.session.mesh_obj_bytes(),
         };
         match bytes.map_err(|e| e.to_string()).and_then(|b| download(&name, &b)) {
             Ok(()) => app.toast(trf("Downloaded {name}", &[("name", &name)]), false),
@@ -342,19 +342,27 @@ mod web {
         }
     }
 
-    /// Export texture sets `sets` with `file.exportTextures` params (minus `dir` and `ts`): one
-    /// file downloads as is, several as `<project>_textures.zip`.
-    pub fn export_textures(app: &mut TextureCraftApp, params: &Value, sets: &[usize]) {
-        match export(app, params, sets) {
+    /// Export each texture set with its own `file.exportTextures` params (minus `dir`): one file
+    /// downloads as is, several as `<project>_textures.zip`.
+    pub fn export_textures(app: &mut TextureCraftApp, jobs: &[(usize, Value)]) {
+        match export(app, jobs) {
             Ok(name) => app.toast(trf("Downloaded {name}", &[("name", &name)]), false),
             Err(e) => app.toast(trf("Couldn't export textures: {error}", &[("error", &e)]), true),
         }
     }
 
-    fn export(app: &mut TextureCraftApp, params: &Value, sets: &[usize]) -> Result<String, String> {
-        let opts = texturecraft_engine::file_cmds::export_options(&app.session, params, "file.exportTextures").map_err(|e| e.to_string())?;
-        let files = app.session.export_files(sets, &opts).map_err(|e| e.to_string())?;
-        app.session.log.extend_warnings(files.iter().flat_map(|f| f.warnings.iter().cloned()));
+    fn export(app: &mut TextureCraftApp, jobs: &[(usize, Value)]) -> Result<String, String> {
+        let mut files = Vec::new();
+        for (set_index, params) in jobs {
+            let options = texturecraft_engine::file_cmds::export_options(&app.session, params, "file.exportTextures").map_err(|e| e.to_string())?;
+            files.extend(app.session.export_files(&[*set_index], &options).map_err(|e| e.to_string())?);
+        }
+
+        // Keep one file for each case-insensitive name in the download
+        texturecraft_engine::formats::skip_repeated_names(&mut files);
+        app.session.log.warnings("MapExporter", files.iter().flat_map(|file| file.warnings.iter().cloned()));
+        let file_count = files.len();
+
         let name = match files.as_slice() {
             [] => return Err("the preset produced no files".into()),
             [f] => {
@@ -363,11 +371,12 @@ mod web {
             }
             _ => {
                 let name = format!("{}_textures.zip", sanitize_file_stem(&app.session.doc.project.name));
-                download(&name, &zip_files(&files)?)?;
+                download(&name, &zip_files(files)?)?;
                 name
             }
         };
-        app.session.log.push(format!("Exported {} textures ({name})", files.len()));
+
+        app.session.log.info("MapExporter", format!("Exported {file_count} textures ({name})"));
         Ok(name)
     }
 
@@ -380,19 +389,35 @@ mod web {
         let opts = web_sys::BlobPropertyBag::new();
         opts.set_type(if name.ends_with(".zip") { "application/zip" } else { "application/octet-stream" });
         let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts).map_err(js)?;
+        let anchor: web_sys::HtmlAnchorElement = document.create_element("a").map_err(js)?.dyn_into().map_err(|_| "not an anchor")?;
+        anchor.set_download(name);
+        anchor.style().set_property("display", "none").map_err(js)?;
+        let body = document.body().ok_or("no body")?;
+
         let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js)?;
-        let a: web_sys::HtmlAnchorElement = document.create_element("a").map_err(js)?.dyn_into().map_err(|_| "not an anchor")?;
-        a.set_href(&url);
-        a.set_download(name);
-        a.style().set_property("display", "none").map_err(js)?;
-        document.body().ok_or("no body")?.append_child(&a).map_err(js)?;
-        a.click();
-        a.remove();
-        // Revoke once the click has been dispatched; the download keeps its own reference.
-        let revoke = wasm_bindgen::closure::Closure::once_into_js(move || {
-            web_sys::Url::revoke_object_url(&url).ok();
+        anchor.set_href(&url);
+        if let Err(error) = body.append_with_node_1(&anchor) {
+            let _ = web_sys::Url::revoke_object_url(&url);
+            return Err(js(error));
+        }
+
+        let download_url = url.clone();
+        let revoke = wasm_bindgen::closure::Closure::once(move || {
+            let _ = web_sys::Url::revoke_object_url(&download_url);
         });
-        window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000).map_err(js)?;
+
+        // The download keeps its own reference once the click dispatches
+        const DOWNLOAD_URL_LIFETIME_MS: i32 = 10_000;
+        if let Err(error) = window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.as_ref().unchecked_ref(), DOWNLOAD_URL_LIFETIME_MS) {
+            anchor.remove();
+            let _ = web_sys::Url::revoke_object_url(&url);
+            return Err(js(error));
+        }
+
+        // The timer owns the callback now, so release its Wasm reference slot
+        drop(revoke.into_js_value());
+        anchor.click();
+        anchor.remove();
         Ok(())
     }
 }
@@ -471,7 +496,7 @@ mod tests {
         let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
         let old_project_id = harness.state().session.project_id;
         assert!(harness.state_mut().run("file.close", serde_json::Value::Null).is_some());
-        let cage = harness.state().session.mesh_obj_bytes();
+        let cage = harness.state().session.mesh_obj_bytes().unwrap();
 
         apply_picked(
             harness.state_mut(),
@@ -485,7 +510,7 @@ mod tests {
 
         assert!(harness.state_mut().run("project.new", serde_json::json!({"mesh": "cube", "resolution": 128})).is_some());
         let project_id = harness.state().session.project_id;
-        let mesh = harness.state().session.mesh_obj_bytes();
+        let mesh = harness.state().session.mesh_obj_bytes().unwrap();
 
         apply_picked(
             harness.state_mut(),
@@ -499,14 +524,18 @@ mod tests {
     #[test]
     fn zip_round_trips_every_export_file() {
         let file = |name: &str, bytes: &[u8]| ExportedFile { name: name.into(), bytes: bytes.to_vec(), width: 1, height: 1, warnings: Vec::new() };
-        let files = [file("a_BaseColor.png", b"one"), file("a_Normal.png", &[7u8; 4096])];
-        let bytes = zip_files(&files).unwrap();
+        let normal = [7u8; 4096];
+        let expected = [("a_BaseColor.png", b"one".as_slice()), ("a_Normal.png", normal.as_slice())];
+        let files = expected.iter().map(|(name, bytes)| file(name, bytes)).collect();
+
+        let bytes = zip_files(files).unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
-        assert_eq!(zip.len(), 2);
-        for f in &files {
+
+        assert_eq!(zip.len(), expected.len());
+        for (name, expected_bytes) in expected {
             let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut zip.by_name(&f.name).unwrap(), &mut out).unwrap();
-            assert_eq!(out, f.bytes);
+            std::io::Read::read_to_end(&mut zip.by_name(name).unwrap(), &mut out).unwrap();
+            assert_eq!(out, expected_bytes);
         }
     }
 }

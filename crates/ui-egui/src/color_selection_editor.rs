@@ -32,7 +32,7 @@ pub fn color_selection_properties(app: &mut TextureCraftApp, ui: &mut Ui, effect
     let set_index = app.session.doc.project.locate(effect_owner(app, effect)).map_or(app.session.ts(), |(set_index, _, _)| set_index);
     let has_id_map = app.session.baked(set_index).is_some_and(|baked| baked.maps.contains_key(&BakedMap::Id));
     if !has_id_map {
-        ui.label(RichText::new(format!("{} {}", ic::WARNING, tr("Bake an ID map (F8) to pick colors from the mesh."))).color(tokens.warning));
+        ui.label(RichText::new(format!("{} {}", ic::WARNING, tr("Bake an ID map (Ctrl+Shift+B) to pick colors from the mesh."))).color(tokens.warning));
     }
 
     let picking = app.picking_id_color.filter(|pick| pick.effect == effect);

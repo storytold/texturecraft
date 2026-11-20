@@ -142,7 +142,7 @@ fn the_defaults_match_the_reference() {
     let h = harness();
 
     assert!(h.query_by_label("No file selected").is_some());
-    assert!(h.query_by_value(DEFAULT_TEMPLATE).is_some(), "the default template");
+    assert!(h.query_by_value("Default (OpenPBR)").is_some(), "the default template");
     assert!(h.query_by_value("1024 x 1024").is_some());
     assert!(h.query_by_value("OpenGL").is_some());
     assert!(h.query_by_value("Legacy").is_some());
@@ -369,12 +369,12 @@ fn picking_a_template_sets_its_resolution_and_normal_map_format() {
     h.state_mut().run("project.template.save", serde_json::json!({"name": "Small DirectX"})).unwrap();
     h.run_steps(2);
 
-    h.get_by_value(DEFAULT_TEMPLATE).click();
+    h.get_by_value("Default (OpenPBR)").click();
     h.run_steps(3);
-    h.get_by_label("Small DirectX").click();
+    h.get_by_label("Small DirectX (your_assets)").click();
     h.run_steps(3);
 
-    assert!(h.query_by_value("Small DirectX").is_some());
+    assert!(h.query_by_value("Small DirectX (your_assets)").is_some());
     assert!(h.query_by_value("128 x 128").is_some(), "the template's resolution (the open project's 128 px)");
     assert!(h.query_by_value("DirectX").is_some(), "the template's normal map format");
     assert_eq!(h.state().ui.new_project.resolution, 128);

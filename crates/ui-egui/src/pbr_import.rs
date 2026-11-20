@@ -202,7 +202,7 @@ fn run(app: &mut TextureCraftApp, dialog_state: &PbrDialog) -> bool {
 
     let name = reply.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
     for warning in reply.get("warnings").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
-        app.session.log.warn(format!("PBR {name}: {warning}"));
+        app.session.log.warn(texturecraft_engine::log::LIBRARY_SOURCE, format!("PBR {name}: {warning}"));
     }
 
     app.toast(trf("Imported {name}", &[("name", &name)]), false);

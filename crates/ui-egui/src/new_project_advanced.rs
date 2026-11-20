@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use egui::{RichText, Ui, vec2};
 use serde_json::{Value, json};
 use texturecraft_engine::core::NormalFormat;
+use texturecraft_engine::template_cmds::template_label;
 
 use crate::TextureCraftApp;
 use crate::i18n::{tr, trf};
@@ -49,6 +50,14 @@ pub(crate) fn open(app: &mut TextureCraftApp) {
     let baked_maps = if app.ui.windows.new_project { Vec::new() } else { std::mem::take(&mut app.ui.new_project.baked_maps) };
 
     app.ui.new_project = NewProject { baked_maps, opening_id: next_request_id(), ..NewProject::default() };
+
+    // The list opens on the template the last project was created from
+    if let Some(template) = app.session.template(&app.ui.last_template)
+        && template.name != texturecraft_engine::template_cmds::DEFAULT_TEMPLATE
+    {
+        app.ui.new_project.template = template.name;
+        app.ui.new_project.resolution = template.resolution;
+    }
     app.ui.windows.new_project = true;
 }
 
@@ -111,6 +120,7 @@ pub(crate) fn finish_create(app: &mut TextureCraftApp, opening_id: u64) -> bool 
     }
 
     close(app);
+    app.ui.last_template = app.ui.new_project.template.clone();
     app.ui.mode = Mode::Painting;
     apply_after_create(app);
     true
@@ -185,12 +195,18 @@ fn basic_settings(app: &mut TextureCraftApp, ui: &mut Ui) {
         ask_mesh_file(app, ui.ctx());
     }
 
-    row(ui, tr("Project template"), Some(tr("The channels, resolution, normal map format and display settings a project starts with")), |ui| {
+    row(ui, tr("Project template"), Some(tr("Templates set the starting channels, resolution, normal map format and shader settings.")), |ui| {
         let new_project = &mut app.ui.new_project;
-        egui::ComboBox::from_id_salt("np_template").width(FIELD_WIDTH_POINTS).selected_text(new_project.template.clone()).show_ui(ui, |ui| {
-            let user_templates = app.session.templates.list.iter();
-            for template in texturecraft_engine::template_cmds::builtin_templates().iter().chain(user_templates) {
-                if ui.selectable_label(template.name == new_project.template, &template.name).clicked() {
+        let builtin = texturecraft_engine::template_cmds::builtin_templates();
+        let user_templates = app.session.templates.list.iter();
+        let listed: Vec<_> = builtin.iter().map(|template| (template, true)).chain(user_templates.map(|template| (template, false))).collect();
+        let shown = listed
+            .iter()
+            .find(|(template, _)| template.name == new_project.template)
+            .map_or_else(|| new_project.template.clone(), |(template, builtin)| template_label(&template.name, *builtin));
+        egui::ComboBox::from_id_salt("np_template").width(FIELD_WIDTH_POINTS).selected_text(shown).show_ui(ui, |ui| {
+            for (template, builtin) in listed {
+                if ui.selectable_label(template.name == new_project.template, template_label(&template.name, builtin)).clicked() {
                     new_project.template = template.name.clone();
                     new_project.resolution = template.resolution;
                     new_project.normal_format = None;

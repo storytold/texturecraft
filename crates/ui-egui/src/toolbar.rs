@@ -548,7 +548,7 @@ pub fn status_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                     ui.add(egui::ProgressBar::new(p).desired_width(160.0).desired_height(10.0).text(RichText::new(tr("Compositing")).size(10.0)));
                     ui.ctx().request_repaint();
                 } else if let Some(msg) = app.session.log.last() {
-                    ui.label(RichText::new(msg).size(11.0).color(tk.text_dim));
+                    ui.label(RichText::new(&msg.message).size(11.0).color(tk.text_dim));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let gpu = app.gpu.as_ref().map(|g| g.adapter.as_str()).unwrap_or(tr("no GPU"));

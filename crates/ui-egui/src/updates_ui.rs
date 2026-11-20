@@ -199,13 +199,13 @@ mod tests {
         assert_eq!(h.state().ui.mode, Mode::Painting);
         offer(&mut h);
         assert!(crate::docking::input_blocked(h.state(), &h.ctx), "floating panels stop taking input");
-        h.key_press(egui::Key::F8);
+        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::B);
         h.step();
         assert_eq!(h.state().ui.mode, Mode::Painting, "the prompt holds the keyboard");
         h.get_by_label("LATER").click();
         h.run_steps(2);
         assert!(!crate::docking::input_blocked(h.state(), &h.ctx));
-        h.key_press(egui::Key::F8);
+        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::B);
         h.step();
         assert_eq!(h.state().ui.mode, Mode::Baking, "the key works once the prompt is closed");
     }

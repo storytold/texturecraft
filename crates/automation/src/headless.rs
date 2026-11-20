@@ -79,7 +79,7 @@ impl Headless {
     fn new_with_brush_dir(mut session: Session, fs: Filesystem, brush_dir: std::path::PathBuf) -> Headless {
         if matches!(fs, Filesystem::TrustedLocal) && session.brush_presets.dir.is_none() {
             let warnings = session.load_brush_presets(brush_dir);
-            session.log.extend_warnings(warnings.into_iter().map(|warning| format!("Brush preset skipped: {warning}")));
+            session.log.warnings(texturecraft_engine::log::LIBRARY_SOURCE, warnings.into_iter().map(|warning| format!("Brush preset skipped: {warning}")));
         } else if !matches!(fs, Filesystem::TrustedLocal) {
             session.brush_presets.dir = None;
             for preset in &mut session.brush_presets.list {
@@ -196,7 +196,7 @@ impl Headless {
         let f = self.read_mesh(path)?;
         let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
         let mut next = Session::from_mesh_bytes(&f.name, &f.bytes, resolution.unwrap_or(2048), name.unwrap_or(stem))?;
-        next.log.extend_warnings(f.warnings);
+        next.log.warnings("Importer", f.warnings);
         Ok(self.replace(next))
     }
 
@@ -319,7 +319,7 @@ impl Headless {
         let session = &self.session;
         let kind = match options.view.as_deref().unwrap_or("3d") {
             "3d" => ViewKind::Scene,
-            "2d" | "uv" => ViewKind::Uv { ts: session.ts(), zoom: 1.0, pan: [0.0, 0.0] },
+            "2d" | "uv" => ViewKind::Uv { ts: session.ts(), zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 },
             other => return Err(bad(format!("unknown view `{other}` (3d, 2d or uv)"))),
         };
         let max_side = if self.trusted() { MAX_LOCAL_RENDER_SIDE } else { MAX_PNG_SIDE };
@@ -462,6 +462,25 @@ mod tests {
         let listed = client.command_run("brush.preset.list", Value::Null).unwrap();
         assert!(listed.as_array().unwrap().iter().any(|item| item["label"] == "Ink"));
         let _ = std::fs::remove_dir_all(&brush_dir);
+    }
+
+    #[test]
+    fn export_does_not_let_a_later_texture_set_replace_an_earlier_ones_file() {
+        let dir = std::env::temp_dir().join(format!("tc-headless-same-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let session = texturecraft_engine::sample_session(128, 64).unwrap();
+        let mut client = Headless::new_with_brush_dir(session, Filesystem::TrustedLocal, dir.join("brushes"));
+        let sets = client.session.set_count();
+        assert!(sets >= 2);
+
+        // A template without $textureSet gives every set the same file name
+        let preset =
+            json!({"name": "same", "maps": [{"file": "same", "format": "Png", "bit_depth": 8, "channels": [["L", {"Channel": {"channel": "Roughness"}}]]}]});
+        let r = client.export(&json!({"dir": dir.join("tex").display().to_string(), "preset": preset, "ts": "all"})).unwrap();
+        assert_eq!(r["files"].as_array().unwrap().len(), 1, "only the first set's file is written: {r}");
+        let warned = r["warnings"].as_array().unwrap().iter().filter(|w| w.as_str().unwrap().contains("so it was not written")).count();
+        assert_eq!(warned, sets - 1, "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

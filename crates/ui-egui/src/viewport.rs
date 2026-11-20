@@ -101,6 +101,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         _ if quick_mask_shown(app) => Some(crate::gpu::AuxView::QuickMask),
         ViewMode::MeshMap(map) => Some(crate::gpu::AuxView::MeshMap(map)),
         ViewMode::Mask(id) => Some(crate::gpu::AuxView::Mask(id)),
+        ViewMode::Image => Some(crate::gpu::AuxView::Image),
         _ if mode == crate::state::Mode::Baking && app.ui.bake_visualization.bent_normal_shown() => Some(crate::gpu::AuxView::MeshMap(BakedMap::BentNormal)),
         _ => None,
     };
@@ -237,11 +238,22 @@ fn split_divider_x(app: &mut TextureCraftApp, ui: &Ui, full: Rect) -> f32 {
     divider_x(app.ui.split_ratio)
 }
 
-/// Lowest 2D zoom, for the wheel and the divider (inside the renderer's own limit of 0.05)
-pub(crate) const UV_VIEW_MIN_ZOOM: f32 = 0.1;
+/// Lowest 2D zoom, for the wheel and the divider: a tile of about 2 px, as measured in the reference app
+pub(crate) const UV_VIEW_MIN_ZOOM: f32 = texturecraft_render::UV_VIEW_MIN_ZOOM;
 
-/// Highest 2D zoom, for the wheel and the divider (inside the renderer's own limit of 64)
-pub(crate) const UV_VIEW_MAX_ZOOM: f32 = 40.0;
+/// Highest 2D zoom, for the wheel and the divider: about ×220 of the fit, as measured in the reference app
+pub(crate) const UV_VIEW_MAX_ZOOM: f32 = texturecraft_render::UV_VIEW_MAX_ZOOM;
+
+/// 2D view turn per point of an Alt+left drag (radians): the 3D orbit's speed
+const UV_RADIANS_PER_POINT: f32 = ORBIT_RADIANS_PER_POINT;
+
+/// Step of an Alt+Shift+left drag's turn of the 2D view (radians)
+const UV_SNAP_RADIANS: f32 = std::f32::consts::FRAC_PI_2;
+
+/// Alt+right drag in the 2D view: change of the log zoom per point dragged right and per point dragged down.
+/// Fitted to the reference app's measurements: 100 points right 760 -> 860 px, 100 points up 760 -> 704 px.
+const UV_DRAG_ZOOM_PER_POINT_RIGHT: f32 = 0.001236;
+const UV_DRAG_ZOOM_PER_POINT_DOWN: f32 = 0.00077;
 
 /// UV zoom change per point of mouse wheel, as a fraction of the zoom
 pub(crate) const UV_WHEEL_ZOOM_PER_POINT: f32 = 0.002;
@@ -258,7 +270,7 @@ const UV_TILE_OUTLINE_ALPHA: u8 = 40;
 /// Width of the UV tile outlines, in points
 const UV_TILE_OUTLINE_WIDTH: f32 = 1.0;
 
-/// The texture set name in the 2D view's bottom-right corner: its inset from the corner and its text size, in points
+/// The texture set label in the 2D view's bottom-left corner: its inset from the corner and its text size, in points
 const SET_NAME_INSET: egui::Vec2 = vec2(10.0, 10.0);
 const SET_NAME_TEXT_SIZE: f32 = 11.0;
 
@@ -268,10 +280,6 @@ const BAKE_PAINT_CURSOR_MIN_RADIUS: f32 = 2.0;
 /// The bake brush cursor's outline: width in points and white alpha
 const BAKE_PAINT_CURSOR_STROKE: f32 = 1.0;
 const BAKE_PAINT_CURSOR_ALPHA: u8 = 200;
-
-/// A UDIM tile label: its offset from the tile's top-left corner and its text size, in points
-const UV_TILE_LABEL_OFFSET: egui::Vec2 = vec2(6.0, 4.0);
-const UV_TILE_LABEL_SIZE: f32 = 11.0;
 
 /// The projection stencil's dashed outline: width, white alpha, dash and gap, in points
 const STENCIL_OUTLINE_STROKE: f32 = 1.0;
@@ -331,12 +339,20 @@ const VIEW_MODE_AUX_TEXTURE: u32 = 2;
 const VIEW_MODE_UV_CHECKER: u32 = 3;
 const VIEW_MODE_NORMAL_HEIGHT_MESH: u32 = 4;
 
+/// Whether the views draw the mesh wireframe (the 3D edges and the 2D UV edges follow the one switch)
+fn wireframe_shown(ui: &crate::state::UiState, polygon_fill_tool: bool) -> bool {
+    ui.mesh_wireframe || polygon_fill_tool
+}
+
+/// Opacity of the wireframe polygon fill shows while the Show mesh wireframe switch is off
+const POLYGON_FILL_WIREFRAME_OPACITY: f32 = 0.4;
+
 fn shade(app: &TextureCraftApp) -> Shade {
     let (view_mode, channel) = match app.session.view {
         _ if quick_mask_shown(app) => (VIEW_MODE_AUX_TEXTURE, 0),
         ViewMode::Material => (VIEW_MODE_MATERIAL, 0),
         ViewMode::Channel(selected_channel) => (VIEW_MODE_CHANNEL, selected_channel.index() as u32),
-        ViewMode::MeshMap(_) | ViewMode::Mask(_) => (VIEW_MODE_AUX_TEXTURE, 0),
+        ViewMode::MeshMap(_) | ViewMode::Mask(_) | ViewMode::Image => (VIEW_MODE_AUX_TEXTURE, 0),
         ViewMode::UvChecker => (VIEW_MODE_UV_CHECKER, 0),
         ViewMode::NormalHeightMesh => (VIEW_MODE_NORMAL_HEIGHT_MESH, 0),
     };
@@ -349,8 +365,11 @@ fn shade(app: &TextureCraftApp) -> Shade {
         height_strength,
         view_mode,
         channel,
-        wireframe: app.ui.uv_wireframe || polygon_fill_tool,
-        wireframe_3d: app.ui.wireframe_3d || polygon_fill_tool,
+        wireframe: wireframe_shown(&app.ui, polygon_fill_tool),
+        wireframe_3d: wireframe_shown(&app.ui, polygon_fill_tool),
+        background: app.ui.prefs.background,
+        // Polygon fill's own wireframe keeps its look when the user's opacity hides the switch's wireframe
+        wireframe_opacity: if app.ui.mesh_wireframe { app.ui.wireframe_opacity / 100.0 } else { POLYGON_FILL_WIREFRAME_OPACITY },
         ..Shade::from_project(&app.session.doc.project)
     }
 }
@@ -559,73 +578,37 @@ fn view_header(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, id: &str) {
         });
     }
 
+    // The 2D view of a UV tile project: a checkable button left of the view mode, with no tooltip, that shows or hides the tile numbers and the hover label
+    if id == "v2d" && uv_tile_project(app) {
+        child.spacing_mut().item_spacing.x = UV_TILE_INFO_SPACING;
+        let shown = app.ui.uv_tile_info;
+        let button = crate::widgets::icon_button_without_tooltip(&mut child, egui_phosphor::regular::DOTS_NINE, UV_TILE_INFO_NAME, shown, VIEW_HEADER_HEIGHT);
+        if !shown {
+            // Crossed out while the numbers are hidden
+            let (from, to) = (button.rect.left_bottom() + vec2(5.0, -5.0), button.rect.right_top() + vec2(-5.0, 5.0));
+            child.painter().line_segment([from, to], Stroke::new(1.5, Tokens::get(child.ctx()).text));
+        }
+        if button.clicked() {
+            app.ui.uv_tile_info = !shown;
+        }
+    }
     view_mode_picker(app, &mut child, &format!("{id}_mode"), VIEW_PICKER_WIDTH);
 }
 
-/// The view-mode picker of a view's header and of Display Settings: the material, the channels, the mesh maps and the UV checker
-pub(crate) fn view_mode_picker(app: &mut TextureCraftApp, child: &mut Ui, id_salt: &str, width: f32) {
-    let project_open = app.session.project_open;
+/// The tile info button's name for screen readers: the reference's object name, since it has no text or tooltip
+const UV_TILE_INFO_NAME: &str = "uvtile_info_menu_button";
 
-    // Bake mode lights the project mesh with the neutral material unless the painted one is asked for
-    let baking = app.ui.mode == crate::state::Mode::Baking;
-    let neutral = baking && app.session.view == ViewMode::Material && app.ui.bake_visualization.neutral_shown;
-    let label = match app.session.view {
-        _ if neutral => "Neutral Material".to_owned(),
-        ViewMode::MeshMap(map) => crate::i18n::baked_map_label(map).to_owned(),
-        _ => app.session.view.label(),
-    };
-    let channels = app.session.doc.project.texture_set(app.session.ts()).map(|texture_set| texture_set.channel_list()).unwrap_or_default();
+/// Gap between the header's widgets while the tile info button is in it, so that both pickers and the button fit the header
+const UV_TILE_INFO_SPACING: f32 = 4.0;
 
-    // The picker stays greyed without project maps
-    child.add_enabled_ui(project_open, |child| {
-        egui::ComboBox::from_id_salt(id_salt).width(width).selected_text(tr(&label)).show_ui(child, |ui| {
-            if baking && ui.selectable_label(neutral, tr("Neutral Material")).clicked() {
-                app.ui.bake_visualization.neutral_shown = true;
-                app.run("viewport.view", json!({"mode": "material"}));
-            }
-            if ui.selectable_label(app.session.view == ViewMode::Material && !neutral, tr("Material")).clicked() && project_open {
-                // Keep the bake material choice when switching to Material in Painting mode
-                app.ui.bake_visualization.neutral_shown &= !baking;
-                app.run("viewport.view", json!({"mode": "material"}));
-            }
-
-            // Nothing else to show without a project
-            if !project_open {
-                return;
-            }
-
-            ui.separator();
-            if baking {
-                mesh_map_entries(app, ui);
-                return;
-            }
-
-            for channel in channels {
-                if ui.selectable_label(app.session.view == ViewMode::Channel(channel), tr(channel.label())).clicked() {
-                    app.run("viewport.view", json!({"mode": channel.id()}));
-                }
-            }
-            if ui.selectable_label(app.session.view == ViewMode::NormalHeightMesh, tr(texturecraft_engine::NORMAL_HEIGHT_MESH_LABEL)).clicked() {
-                app.run("viewport.view", json!({"mode": "normalHeightMesh"}));
-            }
-            ui.separator();
-            mesh_map_entries(app, ui);
-            ui.separator();
-            if ui.selectable_label(app.session.view == ViewMode::UvChecker, tr("UV checker")).clicked() {
-                app.run("viewport.view", json!({"mode": "uvChecker"}));
-            }
-        })
-    });
+/// Whether the open project's active texture set is a UV tile set
+pub(crate) fn uv_tile_project(app: &TextureCraftApp) -> bool {
+    app.session.project_open && app.session.doc.project.texture_sets.get(app.session.ts()).is_some_and(|set| set.tile_grid().is_some())
 }
 
-/// The view picker's entries that show one baked mesh map
-fn mesh_map_entries(app: &mut TextureCraftApp, ui: &mut Ui) {
-    for map in BakedMap::ALL {
-        let map_label = trf("Mesh map: {map}", &[("map", &tr(crate::i18n::baked_map_label(map)))]);
-        if ui.selectable_label(app.session.view == ViewMode::MeshMap(map), map_label).clicked() {
-            app.run("viewport.view", json!({"mode": format!("map:{}", map.id())}));
-        }
-    }
+/// The view-mode picker of a view's header and of Display Settings
+pub(crate) fn view_mode_picker(app: &mut TextureCraftApp, child: &mut Ui, id_salt: &str, width: f32) {
+    crate::view_mode_picker::show(app, child, id_salt, width);
 }
 
 /// Height above a view's bottom edge of the "Mask" label, clear of the axis gizmo
@@ -665,17 +648,32 @@ fn mask_view_badge(app: &TextureCraftApp, ui: &Ui, rect: Rect) {
     );
 }
 
-fn axis_gizmo(ui: &Ui, rect: Rect, app: &TextureCraftApp, uv: bool) {
+/// The screen directions of the U axis (right) and the V axis (up) in a 2D view turned `rotation` radians counter-clockwise
+fn uv_axis_directions(rotation: f32) -> (egui::Vec2, egui::Vec2) {
+    let (sin, cos) = rotation.sin_cos();
+    (vec2(cos, -sin), vec2(-sin, -cos))
+}
+
+/// Distance of the 2D view's axis gizmo origin from the view's right and bottom edges: room for the axis letters in any rotation
+const UV_GIZMO_INSET: f32 = 36.0;
+
+fn axis_gizmo(ui: &Ui, rect: Rect, app: &TextureCraftApp, uv_rotation: Option<f32>) {
     let tk = Tokens::get(ui.ctx());
     let o = pos2(rect.left() + 28.0, rect.bottom() - 28.0);
     let p = ui.painter();
-    if uv {
-        p.line_segment([o, o + vec2(16.0, 0.0)], Stroke::new(1.5, Color32::from_rgb(0xd8, 0x4a, 0x3a)));
-        p.line_segment([o, o - vec2(0.0, 16.0)], Stroke::new(1.5, Color32::from_rgb(0x5c, 0xc0, 0x4a)));
-        p.text(o + vec2(20.0, 0.0), egui::Align2::LEFT_CENTER, "U", egui::FontId::proportional(9.0), tk.viewport_text);
-        p.text(o - vec2(0.0, 22.0), egui::Align2::CENTER_CENTER, "V", egui::FontId::proportional(9.0), tk.viewport_text);
+    if let Some(rotation) = uv_rotation {
+        // The 2D view keeps it in the bottom-right corner, the label of the texture set sits bottom left
+        let o = pos2(rect.right() - UV_GIZMO_INSET, rect.bottom() - UV_GIZMO_INSET);
+
+        // The U and V axes turn with the 2D view
+        let (u, v) = uv_axis_directions(rotation);
+        p.line_segment([o, o + u * 16.0], Stroke::new(1.5, Color32::from_rgb(0xd8, 0x4a, 0x3a)));
+        p.line_segment([o, o + v * 16.0], Stroke::new(1.5, Color32::from_rgb(0x5c, 0xc0, 0x4a)));
+        p.text(o + u * 22.0, egui::Align2::CENTER_CENTER, "U", egui::FontId::proportional(9.0), tk.viewport_text);
+        p.text(o + v * 22.0, egui::Align2::CENTER_CENTER, "V", egui::FontId::proportional(9.0), tk.viewport_text);
         return;
     }
+
     let view = app.session.camera.view();
     for (axis, color, name) in [
         (Vec3::X, Color32::from_rgb(0xd8, 0x4a, 0x3a), "X"),
@@ -765,6 +763,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     let (alt, shift, snap) = ui.input(|input| (input.modifiers.alt, input.modifiers.shift, input.modifiers.shift && input.modifiers.command));
     let local = |pointer: egui::Pos2| Vec2::new(pointer.x - rect.left(), pointer.y - rect.top());
     let adjusting = brush_drag(app, ui, &response);
+    let ctrl = ui.input(|input| input.modifiers.ctrl);
     let navigating = !adjusting && (alt || ui.input(|input| input.pointer.middle_down() || input.pointer.secondary_down()));
 
     // Navigation; S + drag moves the projection stencil instead, below
@@ -777,6 +776,10 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     if stencil_drag || adjusting {
         // The stencil or the brush changes instead of the camera
     } else if response.dragged_by(PointerButton::Middle) {
+        app.camera_glide = None;
+        app.session.camera.pan(delta.x / size.y, delta.y / size.y);
+    } else if alt && ctrl && response.dragged_by(PointerButton::Primary) {
+        // Ctrl+Alt+left is "Camera translate (alt.)": it pans like the middle button
         app.camera_glide = None;
         app.session.camera.pan(delta.x / size.y, delta.y / size.y);
     } else if alt && response.dragged_by(PointerButton::Primary) {
@@ -1110,7 +1113,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     solo_notice(app, ui, rect);
     view_header(app, ui, rect, "v3d");
     mask_view_badge(app, ui, rect);
-    axis_gizmo(ui, rect, app, false);
+    axis_gizmo(ui, rect, app, None);
     crate::nav_buttons::show(app, ui, rect, crate::nav_buttons::NavView::Scene);
 }
 
@@ -1818,7 +1821,7 @@ fn polygon_fill_input(
     response: &egui::Response,
     fill_at: impl Fn(&mut Session, Pos2) -> texturecraft_engine::Result<usize>,
     drag_box: impl Fn(&mut Session, Pos2, Pos2) -> texturecraft_engine::Result<usize>,
-) -> Option<Rect> {
+) -> Option<[Pos2; 2]> {
     let origin_id = response.id.with("polygon_fill_box");
     let dragging = response.dragged_by(PointerButton::Primary);
     let released = response.drag_stopped_by(PointerButton::Primary);
@@ -1847,7 +1850,7 @@ fn polygon_fill_input(
             app.session.end_polygon_fill_box();
             (None, None)
         }
-        (Some(origin), Some(pointer)) => (Some(drag_box(&mut app.session, origin, pointer)), Some(Rect::from_two_pos(origin, pointer))),
+        (Some(origin), Some(pointer)) => (Some(drag_box(&mut app.session, origin, pointer)), Some([origin, pointer])),
         _ => (None, None),
     };
 
@@ -1862,11 +1865,22 @@ fn polygon_fill_input(
 const FILL_BOX_TINT: f32 = 0.15;
 
 /// The polygon fill box being dragged, over view `rect`
-fn polygon_fill_box_overlay(ui: &Ui, rect: Rect, fill_box: Option<Rect>) {
-    let Some(fill_box) = fill_box else { return };
+fn polygon_fill_box_overlay(ui: &Ui, rect: Rect, fill_box: Option<[Pos2; 2]>) {
+    let Some([origin, opposite]) = fill_box else { return };
 
     let accent = Tokens::get(ui.ctx()).viewport_accent;
+    let fill_box = Rect::from_two_pos(origin, opposite);
     ui.painter_at(rect).rect(fill_box, 0.0, accent.gamma_multiply(FILL_BOX_TINT), Stroke::new(1.0, accent), egui::StrokeKind::Inside);
+}
+
+/// Outline of the texture-aligned fill bounds projected into the rotated view.
+fn uv_fill_box_corners(view: crate::uv_view_map::UvViewMap, [origin, opposite]: [Pos2; 2]) -> [Pos2; 4] {
+    let origin_uv = view.to_uv(origin);
+    let opposite_uv = view.to_uv(opposite);
+    let low = origin_uv.min(opposite_uv);
+    let high = origin_uv.max(opposite_uv);
+
+    [view.to_screen(low.x, low.y), view.to_screen(high.x, low.y), view.to_screen(high.x, high.y), view.to_screen(low.x, high.y)]
 }
 
 /// V held with the Clone tool in painting mode: clicks set the clone source
@@ -1992,7 +2006,7 @@ fn brush_drag(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response) -> 
     let held = tool_acts(app)
         && brush_tool(app.session.tool.tool)
         && !app.session.stroke_active()
-        && ui.input(|input| input.modifiers.command && (!input.modifiers.shift || input.pointer.secondary_down()));
+        && ui.input(|input| input.modifiers.command && !input.modifiers.alt && (!input.modifiers.shift || input.pointer.secondary_down()));
     if held && let Some(right) = brush_drag_button(response) {
         let (delta, fine) = ui.input(|input| (input.pointer.delta(), input.modifiers.shift));
         adjust_brush(&mut app.session.tool.brush, right, if fine { delta * CTRL_DRAG_FINE_FACTOR } else { delta });
@@ -2198,19 +2212,79 @@ pub fn pen_pressure(ui: &Ui) -> f32 {
     }
 }
 
+/// F: puts the 2D view back to pan 0, zoom 1 and no rotation; in a UV tile set it frames tile 1001 (else the lowest tile)
+fn frame_uv_view_on_request(app: &mut TextureCraftApp, size: egui::Vec2) {
+    if !std::mem::take(&mut app.uv_view_reset) {
+        return;
+    }
+
+    let (zoom, pan) = app.session.doc.project.texture_sets.get(app.session.ts()).map_or((1.0, [0.0, 0.0]), |set| framed_tile_view(set, size));
+    app.ui.uv_zoom = zoom;
+    app.ui.uv_pan = pan;
+    app.ui.uv_rotation = 0.0;
+}
+
+/// The 2D zoom and pan that fit tile 1001 of a UV tile `set` (else its lowest tile) into a view of `size`; zoom 1 and no pan for a set without tiles
+fn framed_tile_view(set: &texturecraft_engine::core::TextureSet, size: egui::Vec2) -> (f32, [f32; 2]) {
+    let Some(grid) = set.tile_grid() else { return (1.0, [0.0, 0.0]) };
+    let tile = if set.uv_tiles.contains(&1001) { 1001 } else { set.uv_tiles.iter().copied().min().unwrap_or(1001) };
+    let Some((block_x, block_y)) = grid.block(tile) else { return (1.0, [0.0, 0.0]) };
+
+    // The tile's square inside its atlas block, and the zoom that lets it fill what the whole atlas fills at zoom 1
+    let tile_scale = set.tile_scale(tile);
+    let zoom = (grid.cols.max(grid.rows) as f32 / tile_scale).clamp(UV_VIEW_MIN_ZOOM, UV_VIEW_MAX_ZOOM);
+    let center = ((block_x as f32 + tile_scale * 0.5) / grid.cols as f32, (block_y as f32 + tile_scale * 0.5) / grid.rows as f32);
+    let [scale_x, scale_y] = texturecraft_render::uv_view_scale(size.x / size.y.max(1.0), zoom, set.size());
+    (zoom, [-(center.0 * 2.0 - 1.0) * scale_x, -(1.0 - center.1 * 2.0) * scale_y])
+}
+
 /// The 2D (UV) view: navigation, painting in texture coordinates and the overlays drawn over the texture.
 fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut PendingSync) {
     let tokens = Tokens::get(ui.ctx());
     let response = ui.interact(rect, ui.scope_id().with("view2d"), Sense::click_and_drag());
     let size = rect.size();
     let (alt, shift, snap) = ui.input(|input| (input.modifiers.alt, input.modifiers.shift, input.modifiers.shift && input.modifiers.command));
+    let ctrl = ui.input(|input| input.modifiers.ctrl);
     let adjusting = brush_drag(app, ui, &response);
+    frame_uv_view_on_request(app, size);
 
-    // Pan with a middle drag or Alt+left drag, zoom with the wheel about the cursor
+    // Middle drag and Ctrl+Alt+left pan without changing the brush
     let delta = ui.input(|input| input.pointer.delta());
-    if response.dragged_by(PointerButton::Middle) || (alt && response.dragged_by(PointerButton::Primary)) {
+    let ctrl_alt_pan = alt && ctrl && response.dragged_by(PointerButton::Primary);
+    if response.dragged_by(PointerButton::Middle) || ctrl_alt_pan {
         app.ui.uv_pan[0] += delta.x / size.x * 2.0;
         app.ui.uv_pan[1] -= delta.y / size.y * 2.0;
+    }
+    let turning = alt && !ctrl && response.dragged_by(PointerButton::Primary);
+    if turning {
+        let radians = -delta.x * UV_RADIANS_PER_POINT * app.ui.prefs.orbit_scale();
+        if shift {
+            // The drag's own turn follows the pointer; the view takes the nearest step
+            let reached = app.uv_rotation_snap.get_or_insert(app.ui.uv_rotation);
+            *reached += radians;
+            let snapped = (*reached / UV_SNAP_RADIANS).round() * UV_SNAP_RADIANS;
+            let step = snapped - app.ui.uv_rotation;
+            let wrapped = (step + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            crate::uv_view_map::turn_about_center(&mut app.ui.uv_rotation, &mut app.ui.uv_pan, size, wrapped);
+        } else {
+            crate::uv_view_map::turn_about_center(&mut app.ui.uv_rotation, &mut app.ui.uv_pan, size, radians);
+        }
+    }
+
+    // The next snapping drag starts again from where the view is
+    if !(turning && shift) {
+        app.uv_rotation_snap = None;
+    }
+    if alt && response.dragged_by(PointerButton::Secondary) {
+        let change = (delta.x * UV_DRAG_ZOOM_PER_POINT_RIGHT + delta.y * UV_DRAG_ZOOM_PER_POINT_DOWN) * app.ui.prefs.drag_zoom_scale();
+        let old_zoom = app.ui.uv_zoom;
+        let new_zoom = (old_zoom * change.exp()).clamp(UV_VIEW_MIN_ZOOM, UV_VIEW_MAX_ZOOM);
+
+        // About the view's centre
+        for axis in 0..2 {
+            app.ui.uv_pan[axis] *= new_zoom / old_zoom;
+        }
+        app.ui.uv_zoom = new_zoom;
     }
     if response.hovered() {
         size_brush_by_ctrl_wheel(app, ui);
@@ -2237,17 +2311,9 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     let texture_set_index = app.session.ts();
     let set = app.session.doc.project.texture_sets.get(texture_set_index);
     let [scale_x, scale_y] = texturecraft_render::uv_view_scale(size.x / size.y.max(1.0), app.ui.uv_zoom, set.map_or((1, 1), |texture_set| texture_set.size()));
-    let pan = app.ui.uv_pan;
-    let to_uv = |pointer: egui::Pos2| {
-        let clip_x = (pointer.x - rect.left()) / size.x * 2.0 - 1.0;
-        let clip_y = 1.0 - (pointer.y - rect.top()) / size.y * 2.0;
-        Vec2::new(((clip_x - pan[0]) / scale_x + 1.0) * 0.5, (1.0 - (clip_y - pan[1]) / scale_y) * 0.5)
-    };
-    let to_screen = |u: f32, v: f32| {
-        let clip_x = (u * 2.0 - 1.0) * scale_x + pan[0];
-        let clip_y = (1.0 - v * 2.0) * scale_y + pan[1];
-        pos2(rect.left() + (clip_x * 0.5 + 0.5) * size.x, rect.top() + (0.5 - clip_y * 0.5) * size.y)
-    };
+    let view_map = crate::uv_view_map::UvViewMap { rect, scale: [scale_x, scale_y], pan: app.ui.uv_pan, rotation: app.ui.uv_rotation };
+    let to_uv = |pointer: egui::Pos2| view_map.to_uv(pointer);
+    let to_screen = |u: f32, v: f32| view_map.to_screen(u, v);
     let show = |_: &TextureCraftApp, point: Vec3| Some(to_screen(point.x, point.y));
     let path_tool = app.session.tool.tool == Tool::Path;
 
@@ -2310,19 +2376,25 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     if response.double_clicked() && !(painting && path_tool) {
         app.ui.uv_zoom = 1.0;
         app.ui.uv_pan = [0.0, 0.0];
+        app.ui.uv_rotation = 0.0;
     }
 
     let frame = Frame {
         view_id: VIEW_2D,
         size: frame_size_in_pixels(ui, rect),
-        kind: ViewKind::Uv { ts: texture_set_index, zoom: app.ui.uv_zoom, pan: app.ui.uv_pan },
+        kind: ViewKind::Uv { ts: texture_set_index, zoom: app.ui.uv_zoom, pan: app.ui.uv_pan, rotation: app.ui.uv_rotation },
         camera: app.session.camera,
         shade: shade(app),
         visible: app.session.doc.project.texture_sets.iter().map(|texture_set| texture_set.visible).collect(),
         overlay: Vec::new(),
     };
     add_callback(app, ui, rect, frame, sync);
-    polygon_fill_box_overlay(ui, rect, fill_box);
+    if let Some(bounds) = fill_box {
+        let accent = tokens.viewport_accent;
+        let corners = uv_fill_box_corners(view_map, bounds);
+        ui.painter_at(rect).add(egui::Shape::convex_polygon(corners.to_vec(), accent.gamma_multiply(FILL_BOX_TINT), Stroke::new(1.0, accent)));
+    }
+
     crate::shelf::drop_target(app, ui, &response, crate::shelf::DropZone::View2d);
     if projection_hint {
         ui.painter_at(rect).text(
@@ -2337,28 +2409,24 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // The UV tile outlines (numbered for UDIM sets) and the path being edited
     let painter = ui.painter_at(rect);
     let set = app.session.doc.project.texture_sets.get(texture_set_index);
-    let outline = |tile: Rect| {
-        painter.rect_stroke(tile, 0.0, Stroke::new(UV_TILE_OUTLINE_WIDTH, Color32::from_white_alpha(UV_TILE_OUTLINE_ALPHA)), egui::StrokeKind::Outside)
+    let outline = |corners: [Pos2; 4]| {
+        painter.add(egui::Shape::closed_line(corners.to_vec(), Stroke::new(UV_TILE_OUTLINE_WIDTH, Color32::from_white_alpha(UV_TILE_OUTLINE_ALPHA))));
     };
-    match set.and_then(|texture_set| Some((texture_set, texture_set.tile_grid()?))) {
+    let quad = |u0: f32, v0: f32, u1: f32, v1: f32| [to_screen(u0, v0), to_screen(u1, v0), to_screen(u1, v1), to_screen(u0, v1)];
+    let tile_grid = set.and_then(|texture_set| Some((texture_set, texture_set.tile_grid()?)));
+    match tile_grid {
         Some((texture_set, grid)) => {
+            // Grid lines over the whole view with the UV axes and the tile numbers, and an outline around each tile the set paints
+            crate::uv_tile_grid::draw(&painter, view_map, texture_set, grid, app.ui.uv_tile_info, tokens.viewport_text);
             for (udim, (block_x, block_y)) in texture_set.uv_tiles.iter().filter_map(|udim| Some((*udim, grid.block(*udim)?))) {
                 // A tile smaller than its block fills the block's top-left corner
                 let (u0, v0) = (block_x as f32 / grid.cols as f32, block_y as f32 / grid.rows as f32);
                 let tile_scale = texture_set.tile_scale(udim);
-                let tile = Rect::from_two_pos(to_screen(u0, v0), to_screen(u0 + tile_scale / grid.cols as f32, v0 + tile_scale / grid.rows as f32));
-                outline(tile);
-                painter.text(
-                    tile.left_top() + UV_TILE_LABEL_OFFSET,
-                    egui::Align2::LEFT_TOP,
-                    udim.to_string(),
-                    egui::FontId::proportional(UV_TILE_LABEL_SIZE),
-                    tokens.viewport_text,
-                );
+                outline(quad(u0, v0, u0 + tile_scale / grid.cols as f32, v0 + tile_scale / grid.rows as f32));
             }
         }
         None => {
-            outline(Rect::from_two_pos(to_screen(0.0, 0.0), to_screen(1.0, 1.0)));
+            outline(quad(0.0, 0.0, 1.0, 1.0));
         }
     }
     if tool_acts(app) && path_tool {
@@ -2386,9 +2454,9 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
 
     if app.ui.mode == crate::state::Mode::Baking {
-        bake_paint_overlay(app, ui, &painter, to_screen(0.0, 1.0), to_screen(1.0, 0.0));
+        bake_paint_overlay(app, ui, &painter, &to_screen);
         if bake_paint_on && let Some(hover) = response.hover_pos() {
-            let radius = (to_screen(app.ui.bake_paint_brush.radius, 0.0).x - to_screen(0.0, 0.0).x).abs().max(BAKE_PAINT_CURSOR_MIN_RADIUS);
+            let radius = (to_screen(app.ui.bake_paint_brush.radius, 0.0) - to_screen(0.0, 0.0)).length().max(BAKE_PAINT_CURSOR_MIN_RADIUS);
             painter.circle_stroke(hover, radius, Stroke::new(BAKE_PAINT_CURSOR_STROKE, Color32::from_white_alpha(BAKE_PAINT_CURSOR_ALPHA)));
         }
     }
@@ -2413,7 +2481,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     {
         // Match the pressure-scaled radius used by continue_stroke_uv
         let radius_points =
-            (to_screen(app.session.tool.brush.uv_stamp_radius(pen_pressure(ui)), 0.0).x - to_screen(0.0, 0.0).x).abs().max(BRUSH_CURSOR_MIN_RADIUS_POINTS);
+            (to_screen(app.session.tool.brush.uv_stamp_radius(pen_pressure(ui)), 0.0) - to_screen(0.0, 0.0)).length().max(BRUSH_CURSOR_MIN_RADIUS_POINTS);
         if pointer_in_view {
             ui.ctx().set_cursor_icon(egui::CursorIcon::None);
         }
@@ -2423,11 +2491,30 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     solo_notice(app, ui, rect);
     view_header(app, ui, rect, "v2d");
     mask_view_badge(app, ui, rect);
-    axis_gizmo(ui, rect, app, true);
+    axis_gizmo(ui, rect, app, Some(app.ui.uv_rotation));
     crate::nav_buttons::show(app, ui, rect, crate::nav_buttons::NavView::Uv);
-    let name = app.session.doc.project.texture_sets.get(texture_set_index).map(|texture_set| texture_set.name.clone()).unwrap_or_default();
-    let name_position = rect.right_bottom() - SET_NAME_INSET;
-    ui.painter().text(name_position, egui::Align2::RIGHT_BOTTOM, name, egui::FontId::proportional(SET_NAME_TEXT_SIZE), tokens.viewport_text);
+    if let Some(label) = hover_label(&app.session, app.ui.uv_tile_info, view_map, response.hover_pos()) {
+        let label_position = rect.left_bottom() + vec2(SET_NAME_INSET.x, -SET_NAME_INSET.y);
+        ui.painter().text(label_position, egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(SET_NAME_TEXT_SIZE), tokens.viewport_text);
+    }
+}
+
+/// The label in the 2D view's bottom-left corner: the texture set and, in a UV tile set with tile info on, the tile under the cursor ("<set> - <tile>").
+/// A set that is not tiled shows its name alone.
+fn hover_label(session: &Session, tile_info: bool, view_map: crate::uv_view_map::UvViewMap, hover: Option<Pos2>) -> Option<String> {
+    let set = session.doc.project.texture_sets.get(session.ts())?;
+    let tile = set.tile_grid().and_then(|grid| crate::uv_tile_grid::tile_under(view_map, set, grid, hover?));
+    hover_label_text(&set.name, set.tile_grid().is_some(), tile_info, tile)
+}
+
+/// [`hover_label`]'s text for a set called `name`: the name alone for a set that is not tiled, nothing in a tiled set with tile info off, else the name and the `tile` under the cursor
+fn hover_label_text(name: &str, tiled: bool, tile_info: bool, tile: Option<u32>) -> Option<String> {
+    match (tiled, tile_info, tile) {
+        (false, ..) => Some(name.to_owned()),
+        (true, false, _) => None,
+        (true, true, Some(tile)) => Some(format!("{name} - {tile}")),
+        (true, true, None) => Some(name.to_owned()),
+    }
 }
 
 /// Smallest visible 2D brush outline, in points
@@ -2532,7 +2619,7 @@ fn bake_paint_input(app: &mut TextureCraftApp, ui: &Ui, resp: &egui::Response, t
 }
 
 /// The skew map as a translucent orange layer over the UV square from `top_left` to `bottom_right`.
-fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, top_left: egui::Pos2, bottom_right: egui::Pos2) {
+fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, to_screen: &dyn Fn(f32, f32) -> egui::Pos2) {
     let Some(k) = app.session.doc.bake_paint.get(&(app.session.ts(), app.ui.bake_paint_brush.target)).filter(|k| k.values.len() > 1) else { return };
     let key = (app.session.revision, std::sync::Arc::as_ptr(k) as usize);
     let id = ui.scope_id().with("bake_paint_overlay_texture");
@@ -2559,12 +2646,103 @@ fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, t
             tex
         }
     };
-    painter.image(tex.id(), Rect::from_two_pos(top_left, bottom_right), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+        mesh.vertices.push(egui::epaint::Vertex { pos: to_screen(u, v), uv: pos2(u, v), color: Color32::WHITE });
+    }
+    mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_hover_label_finds_the_tile_under_the_cursor_in_a_turned_view() {
+        let session = Session::new_project("Tiles", texturecraft_engine::geom::primitives::udim_plane(), "builtin:udim_plane", None, 128).unwrap();
+        let name = session.doc.project.texture_sets[0].name.clone();
+        let size = egui::vec2(800.0, 600.0);
+        let set = &session.doc.project.texture_sets[0];
+        for rotation in [0.0, 0.7, std::f32::consts::FRAC_PI_2] {
+            let scale = texturecraft_render::uv_view_scale(size.x / size.y, 1.0, set.size());
+            let map = crate::uv_view_map::UvViewMap { rect: Rect::from_min_size(Pos2::ZERO, size), scale, pan: [0.1, 0.0], rotation };
+
+            // The atlas is two tiles wide: 1001 is its left half, 1002 its right half
+            let left = map.to_screen(0.25, 0.5);
+            let right = map.to_screen(0.75, 0.5);
+            assert_eq!(hover_label(&session, true, map, Some(left)), Some(format!("{name} - 1001")), "{rotation}");
+            assert_eq!(hover_label(&session, true, map, Some(right)), Some(format!("{name} - 1002")), "{rotation}");
+            assert_eq!(hover_label(&session, false, map, Some(left)), None, "tile info off");
+        }
+    }
+
+    #[test]
+    fn the_axis_gizmo_points_along_the_texture_s_u_and_v_edges_at_any_rotation() {
+        for rotation in [0.0, 0.6, std::f32::consts::FRAC_PI_2, 2.5, 4.0] {
+            let view = crate::uv_view_map::UvViewMap {
+                rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 300.0)),
+                scale: [0.4, 0.6],
+                pan: [0.2, -0.1],
+                rotation,
+            };
+            let (u, v) = uv_axis_directions(rotation);
+            let u_edge = (view.to_screen(1.0, 1.0) - view.to_screen(0.0, 1.0)).normalized();
+            let v_edge = (view.to_screen(0.0, 0.0) - view.to_screen(0.0, 1.0)).normalized();
+            assert!((u - u_edge).length() < 1e-4 && (v - v_edge).length() < 1e-4, "{rotation}: {u:?} {u_edge:?} / {v:?} {v_edge:?}");
+        }
+        let (u, v) = uv_axis_directions(std::f32::consts::FRAC_PI_2);
+        assert!((u - egui::vec2(0.0, -1.0)).length() < 1e-4 && (v - egui::vec2(-1.0, 0.0)).length() < 1e-4, "a counter-clockwise quarter turn: U up, V left");
+    }
+
+    #[test]
+    fn one_switch_turns_the_wireframe_on_in_both_views_and_polygon_fill_shows_it_without_changing_the_switch() {
+        let mut ui = crate::state::UiState::default();
+        assert!(!wireframe_shown(&ui, false), "off by default");
+        assert!(wireframe_shown(&ui, true), "polygon fill shows the polygons it fills");
+        assert!(!ui.mesh_wireframe);
+        ui.mesh_wireframe = true;
+        assert!(wireframe_shown(&ui, false));
+    }
+
+    #[test]
+    fn the_hover_label_names_the_set_and_the_tile_under_the_cursor() {
+        assert_eq!(hover_label_text("UdimMat", true, true, Some(1001)).as_deref(), Some("UdimMat - 1001"));
+        assert_eq!(hover_label_text("UdimMat", true, true, None).as_deref(), Some("UdimMat"), "off the tiles");
+        assert_eq!(hover_label_text("MatCube1", false, true, None).as_deref(), Some("MatCube1"), "a set that is not tiled");
+    }
+
+    #[test]
+    fn tile_info_off_hides_the_label_of_a_tiled_set_only() {
+        assert_eq!(hover_label_text("UdimMat", true, false, Some(1001)), None);
+        assert_eq!(hover_label_text("MatCube1", false, false, None).as_deref(), Some("MatCube1"), "the button only exists in UV tile projects");
+    }
+
+    #[test]
+    fn framing_tile_1001_centers_it_and_fits_it_like_a_single_tile_set() {
+        let mut set = texturecraft_engine::core::TextureSet::new("Tiles", 0, 128);
+        set.uv_tiles = vec![1001, 1002, 1011];
+        let size = egui::vec2(800.0, 600.0);
+        let (zoom, pan) = framed_tile_view(&set, size);
+
+        // Tile 1001 is the lower-left block of a 2 x 2 atlas
+        assert!((zoom - 2.0).abs() < 1e-4, "{zoom}");
+        let [scale_x, scale_y] = texturecraft_render::uv_view_scale(size.x / size.y, zoom, set.size());
+        let view = crate::uv_view_map::UvViewMap { rect: Rect::from_min_size(Pos2::ZERO, size), scale: [scale_x, scale_y], pan, rotation: 0.0 };
+        let center = view.to_screen(0.25, 0.75);
+        assert!((center - view.rect.center()).length() < 1e-2, "{center:?}");
+
+        // The tile fills the view as one tile alone would
+        let single = texturecraft_render::uv_view_scale(size.x / size.y, 1.0, (128, 128));
+        let tile_width = (view.to_screen(0.5, 0.75) - view.to_screen(0.0, 0.75)).length();
+        assert!((tile_width - single[0] * size.x).abs() < 1e-2, "{tile_width}");
+    }
+
+    #[test]
+    fn a_set_without_tiles_frames_the_whole_texture() {
+        let set = texturecraft_engine::core::TextureSet::new("Plain", 0, 128);
+        assert_eq!(framed_tile_view(&set, egui::vec2(800.0, 600.0)), (1.0, [0.0, 0.0]));
+    }
+
     use texturecraft_engine::paint::{AlphaParams, BrushAlpha, BrushSettings};
 
     #[test]

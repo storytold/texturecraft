@@ -12,8 +12,13 @@ use egui_phosphor::regular as ic;
 use crate::TextureCraftApp;
 use crate::i18n::{tr, trf};
 use crate::menus::CATALOG;
-use crate::theme::Tokens;
+use crate::theme::{Tokens, caption};
+use crate::unavailable::NOT_AVAILABLE;
 use crate::widgets::{icon_button, section};
+
+mod shortcut_list_entry;
+
+use shortcut_list_entry::ShortcutListEntry;
 
 pub type Keymap = BTreeMap<String, String>;
 
@@ -25,6 +30,53 @@ pub struct Binding {
     pub label: &'static str,
     pub default: Option<&'static str>,
 }
+
+/// Rows the reference lists whose function TextureCraft does not have yet, as (listed before the
+/// row of this id, action, shortcut). Settings > Shortcuts shows them disabled.
+///
+/// They are not in [`bindings`], so no key runs them, but another item given their key is reported
+/// as sharing it.
+pub static NOT_AVAILABLE_ACTIONS: [(&str, Binding); 2] = [
+    ("file.reimportMesh", Binding { id: "ui.pauseEngine", group: "Commands", label: "Pause Engine Computation", default: Some("Shift+Esc") }),
+    ("viewport.frame", Binding { id: "ui.toggleAnimation", group: "Viewport", label: "Toggle animation", default: Some("Space") }),
+];
+
+/// The shortcut list's first rows, in the reference's order. The `>` and `<` of the reference are
+/// the shifted Period and Comma keys.
+const LISTED_SHORTCUTS: &[ShortcutListEntry] = &[
+    ShortcutListEntry::new("ui.hideUi", "Hide UI", Some("Tab")),
+    ShortcutListEntry::new("edit.undo", "Undo", Some("Ctrl+Z")),
+    ShortcutListEntry::new("edit.redo", "Redo", Some("Ctrl+Y")),
+    ShortcutListEntry::new("file.open", "Open project", Some("Ctrl+O")),
+    ShortcutListEntry::new("file.close", "Close project", Some("Ctrl+F4")),
+    ShortcutListEntry::new("file.save", "Save project", Some("Ctrl+S")),
+    ShortcutListEntry::new("file.saveAs", "Save as project", Some("Ctrl+Shift+S")),
+    ShortcutListEntry::new("ui.newProject", "New project", Some("Ctrl+N")),
+    ShortcutListEntry::new("ui.quit", "Quit application", Some("Ctrl+Q")),
+    ShortcutListEntry::new("ui.export", "Export Textures...", Some("Ctrl+Shift+E")),
+    ShortcutListEntry::new("file.reimportMesh", "Reimport mesh", Some("Ctrl+Shift+R")),
+    ShortcutListEntry::new("ui.mode.bake", "Switch to baking mode", Some("Ctrl+Shift+B")),
+    ShortcutListEntry::new("ui.mode.paint", "Switch to edition mode", Some("F9")),
+    ShortcutListEntry::new("ui.mode.render", "Switch to rendering mode (path traced)", Some("F10")),
+    ShortcutListEntry::new("ui.wireframe", "Show mesh wireframe", None),
+    ShortcutListEntry::new("camera.perspective", "Camera projection: Perspective view", Some("F5")),
+    ShortcutListEntry::new("camera.orthographic", "Camera projection: Orthographic view", Some("F6")),
+    ShortcutListEntry::new("viewport.nextChannel", "Display next channel", Some("C")),
+    ShortcutListEntry::new("viewport.previousChannel", "Display previous channel", Some("Shift+C")),
+    ShortcutListEntry::new("viewport.displayMaterial", "Display material", Some("M")),
+    ShortcutListEntry::new("viewport.nextMeshMap", "Display next mesh map", Some("B")),
+    ShortcutListEntry::new("viewport.previousMeshMap", "Display previous mesh map", Some("Shift+B")),
+    ShortcutListEntry::new("viewport.frame", "Show entire mesh/path", Some("F")),
+    ShortcutListEntry::new("camera.next", "Select next camera", Some("Shift+Period")),
+    ShortcutListEntry::new("camera.previous", "Select previous camera", Some("Shift+Comma")),
+    ShortcutListEntry::new("viewport.quickMask", "Enable quick mask", Some("Y")),
+    ShortcutListEntry::new("viewport.quickMask.edit", "Edit quick mask", Some("U")),
+    ShortcutListEntry::new("viewport.quickMask.invert", "Invert quick mask", Some("Ctrl+Shift+I")),
+    ShortcutListEntry::new("ui.layout.split", "Viewers layout: 3D/2D", Some("F1")),
+    ShortcutListEntry::new("ui.layout.3d", "Viewers layout: 3D only", Some("F2")),
+    ShortcutListEntry::new("ui.layout.2d", "Viewers layout: 2D only", Some("F3")),
+    ShortcutListEntry::new("ui.layout.swap", "Viewers layout: Swap 3D/2D", Some("F4")),
+];
 
 /// The menu a command without a menu entry is listed under, from its id.
 fn group_of(id: &str) -> &'static str {
@@ -45,7 +97,14 @@ pub fn bindings() -> &'static [Binding] {
     static ALL: std::sync::OnceLock<Vec<Binding>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
         let mut v: Vec<Binding> = Vec::new();
-        for i in CATALOG.iter().filter(|i| i.label != "-") {
+        for entry in LISTED_SHORTCUTS {
+            let group = match CATALOG.iter().find(|i| i.id == entry.id) {
+                Some(item) => item.menu,
+                None => texturecraft_engine::command_specs().iter().find(|c| c.id == entry.id).and_then(|c| c.menu.first().copied()).unwrap_or("Viewport"),
+            };
+            v.push(Binding { id: entry.id, group, label: entry.label, default: entry.default });
+        }
+        for i in CATALOG.iter().filter(|i| i.label != "-" && !crate::menus::UNAVAILABLE.contains(&i.id)) {
             if !v.iter().any(|b| b.id == i.id) {
                 v.push(Binding { id: i.id, group: i.menu, label: i.label, default: i.shortcut });
             }
@@ -217,8 +276,14 @@ impl Bindings {
 
     /// Another binding on the same shortcut as `b`.
     fn conflict(&self, b: &Binding) -> Option<&'static Binding> {
-        let clash = self.map.conflicts_with(&CommandRef::new(b.id)).into_iter().find(|c| c.kind == ConflictKind::Clash)?;
-        bindings().iter().find(|x| x.id == clash.b.0.id)
+        let clash = self.map.conflicts_with(&CommandRef::new(b.id)).into_iter().find(|c| c.kind == ConflictKind::Clash);
+        if let Some(clash) = clash {
+            return bindings().iter().find(|x| x.id == clash.b.0.id);
+        }
+
+        // The rows the reference lists and TextureCraft cannot run yet still own their keys
+        let mine = parse(shortcut(&self.stored, b)?)?;
+        NOT_AVAILABLE_ACTIONS.iter().map(|(_, row)| row).find(|row| row.default.and_then(parse) == Some(mine))
     }
 }
 
@@ -274,23 +339,64 @@ pub(crate) fn stop_settings_capture(ctx: &egui::Context) {
     ctx.data_mut(|d| d.remove::<usize>(Id::unique(SETTINGS_CAPTURE)));
 }
 
-/// Settings > Shortcuts: one row per bindable item with its name, its shortcut in `keymap` and
-/// a pencil that waits for the new key combination (Esc cancels). `recorder` reads the pressed
-/// keys as the app's shortcuts do; `edited` follows `keymap` to show shared shortcuts.
+/// The mouse shortcuts of the viewports the reference lists on its Shortcuts page, as (action,
+/// binding). The viewports read these gestures from code, so the rows are shown and not editable.
+pub const MOUSE_SHORTCUTS: [(&str, &str); 9] = [
+    ("Use tool", "Left"),
+    ("Camera rotate", "Alt+Left"),
+    ("Camera snap rotate", "Alt+Shift+Left"),
+    ("Camera translate", "Alt+Middle"),
+    ("Camera translate (alt.)", "Ctrl+Alt+Left"),
+    ("Camera zoom", "Alt+Right"),
+    ("Rotate environment", "Shift+Right"),
+    ("Auto focus", "Ctrl+Middle"),
+    ("Context menu", "Right"),
+];
+
+/// The hold-key modifiers the reference lists on its Shortcuts page, as (action, key); not editable yet.
+pub const MODIFIER_SHORTCUTS: [(&str, &str); 2] = [("Ignore stencil mask", "N"), ("Resume previous stroke", "A")];
+
+/// The reference's shortcut text of `text`: `>` and `<` are the shifted Period and Comma keys.
+pub fn shown(text: &str) -> &str {
+    match text {
+        "Shift+Period" => ">",
+        "Shift+Comma" => "<",
+        other => other,
+    }
+}
+
+/// Whether the shortcuts in `edited` (kept in step with the working copy) have an item that
+/// shares its shortcut with another.
+pub(crate) fn has_conflict(edited: &Bindings) -> bool {
+    bindings().iter().any(|b| edited.conflict(b).is_some())
+}
+
+/// Follow `keymap` with the checker of the Settings window.
+pub(crate) fn follow(edited: &mut Bindings, keymap: &Keymap, ctx: &egui::Context) {
+    edited.sync(keymap, craft_keymap::egui::platform(ctx));
+}
+
+/// Settings > Shortcuts: the sections "Actions", "Mouse shortcuts" and "Modifiers shortcuts" and
+/// "Reset all to default". An action row has its name, its shortcut in `keymap`, a pencil that
+/// waits for the new key combination (Esc cancels, Delete clears the shortcut) and a warning
+/// naming the other action on the same shortcut. `recorder` reads the pressed keys as the app's
+/// shortcuts do; `edited` follows `keymap` to show shared shortcuts.
 pub(crate) fn actions_page(ui: &mut egui::Ui, keymap: &mut Keymap, recorder: &Bindings, edited: &mut Bindings) {
     let ctx = ui.ctx().clone();
     let tk = Tokens::get(&ctx);
     let capture_id = Id::unique(SETTINGS_CAPTURE);
     let mut capture: Option<usize> = ctx.data(|d| d.get_temp(capture_id));
     if let (Some(i), Some(sc)) = (capture, pressed(&ctx, recorder)) {
-        if (sc.logical_key != Key::Escape || !sc.modifiers.is_none())
-            && let Some(b) = bindings().get(i)
-        {
-            rebind(keymap, b, &format_shortcut(&sc));
+        if let Some(b) = bindings().get(i) {
+            if sc.logical_key == Key::Delete && sc.modifiers.is_none() {
+                rebind(keymap, b, "");
+            } else if sc.logical_key != Key::Escape || !sc.modifiers.is_none() {
+                rebind(keymap, b, &format_shortcut(&sc));
+            }
         }
         capture = None;
     }
-    edited.sync(keymap, craft_keymap::egui::platform(&ctx));
+    follow(edited, keymap, &ctx);
 
     let cell = |ui: &mut egui::Ui, width: f32, add: &mut dyn FnMut(&mut egui::Ui)| {
         ui.allocate_ui_with_layout(vec2(width, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -298,21 +404,40 @@ pub(crate) fn actions_page(ui: &mut egui::Ui, keymap: &mut Keymap, recorder: &Bi
             add(ui);
         });
     };
+
+    // A pencil that cannot be used yet
+    let locked_pencil = |ui: &mut egui::Ui, action: &str| {
+        let edit = trf("Edit the shortcut of {item}", &[("item", &tr(action))]);
+        ui.add_enabled_ui(false, |ui| icon_button(ui, ic::PENCIL_SIMPLE, &edit, false, 20.0)).inner.on_disabled_hover_text(tr(NOT_AVAILABLE));
+    };
+    let locked_row = |ui: &mut egui::Ui, action: &str, binding: &str| {
+        ui.horizontal(|ui| {
+            cell(ui, 300.0, &mut |ui| {
+                ui.add(egui::Label::new(tr(action)).truncate());
+            });
+            cell(ui, 130.0, &mut |ui| {
+                ui.label(binding);
+            });
+            locked_pencil(ui, action);
+        });
+    };
+
+    ui.label(caption(tr("Actions")));
+    ui.add_space(4.0);
     for (i, b) in bindings().iter().enumerate() {
+        for (_, row) in NOT_AVAILABLE_ACTIONS.iter().filter(|(before, _)| *before == b.id) {
+            locked_row(ui, row.label, row.default.unwrap_or(""));
+        }
         let waiting = capture == Some(i);
         ui.horizontal(|ui| {
-            cell(ui, 330.0, &mut |ui| {
+            cell(ui, 300.0, &mut |ui| {
                 ui.add(egui::Label::new(tr(b.label)).truncate()).on_hover_text(tr(b.group));
             });
-            cell(ui, 150.0, &mut |ui| {
+            cell(ui, 130.0, &mut |ui| {
                 if waiting {
                     ui.label(RichText::new(tr("Press a key...")).color(tk.accent));
                 } else {
-                    ui.label(shortcut(keymap, b).unwrap_or(""));
-                }
-                if let Some(other) = edited.conflict(b) {
-                    ui.label(RichText::new(ic::WARNING).color(tk.danger))
-                        .on_hover_text(trf("Also bound to {item} ({menu})", &[("item", &tr(other.label)), ("menu", &tr(other.group))]));
+                    ui.label(shown(shortcut(keymap, b).unwrap_or("")));
                 }
             });
             let edit = trf("Edit the shortcut of {item}", &[("item", &tr(b.label))]);
@@ -320,7 +445,31 @@ pub(crate) fn actions_page(ui: &mut egui::Ui, keymap: &mut Keymap, recorder: &Bi
                 ctx.data_mut(|data| data.remove::<usize>(Id::unique(CAPTURE)));
                 capture = if waiting { None } else { Some(i) };
             }
+            if let Some(other) = edited.conflict(b) {
+                ui.label(RichText::new(ic::WARNING).color(tk.danger)).on_hover_text(tr(other.label));
+            }
         });
+    }
+
+    ui.add_space(10.0);
+    ui.label(caption(tr("Mouse shortcuts")));
+    ui.add_space(4.0);
+    for (action, binding) in MOUSE_SHORTCUTS {
+        locked_row(ui, action, binding);
+    }
+
+    ui.add_space(10.0);
+    ui.label(caption(tr("Modifiers shortcuts")));
+    ui.add_space(4.0);
+    for (action, binding) in MODIFIER_SHORTCUTS {
+        locked_row(ui, action, binding);
+    }
+
+    ui.add_space(12.0);
+    if ui.button(tr("Reset all to default")).clicked() {
+        keymap.clear();
+        capture = None;
+        follow(edited, keymap, &ctx);
     }
 
     ctx.data_mut(|d| match capture {
@@ -388,9 +537,26 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
         egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
             egui::Grid::new("keymap_grid").num_columns(3).striped(true).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
                 for (i, b) in bindings().iter().enumerate() {
+                    for (_, row) in NOT_AVAILABLE_ACTIONS.iter().filter(|(before, _)| *before == b.id) {
+                        let key = row.default.unwrap_or("");
+                        if !needle.is_empty() && ![row.label, row.group, tr(row.label), tr(row.group), key].iter().any(|t| t.to_lowercase().contains(&needle)) {
+                            continue;
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label(tr(row.label));
+                            ui.label(RichText::new(tr(row.group)).size(10.5).color(tk.text_dim));
+                        });
+                        let button = egui::Button::new(RichText::new(key).monospace()).min_size(vec2(130.0, 0.0));
+                        ui.add_enabled(false, button).on_disabled_hover_text(tr(NOT_AVAILABLE));
+                        ui.end_row();
+                    }
                     let current = shortcut(&app.ui.keymap, b);
+                    let current_text = current.map(shown);
                     if !needle.is_empty()
-                        && ![b.label, b.group, tr(b.label), tr(b.group), b.id, current.unwrap_or("")].iter().any(|t| t.to_lowercase().contains(&needle))
+                        && ![b.label, b.group, tr(b.label), tr(b.group), b.id, current.unwrap_or(""), current_text.unwrap_or("")]
+                            .iter()
+                            .any(|t| t.to_lowercase().contains(&needle))
                     {
                         continue;
                     }
@@ -400,7 +566,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
                         ui.label(RichText::new(tr(b.group)).size(10.5).color(tk.text_dim));
                     });
                     let waiting = capture == Some(i);
-                    let text = if waiting { tr("Press a key...") } else { current.unwrap_or("-") };
+                    let text = if waiting { tr("Press a key...") } else { current_text.unwrap_or("-") };
                     let key = egui::Button::new(RichText::new(text).monospace()).selected(waiting).min_size(vec2(130.0, 0.0));
                     if ui.add(key).on_hover_text(tr("Click, then press the new shortcut (Esc cancels)")).clicked() {
                         stop_settings_capture(ctx);
@@ -513,7 +679,7 @@ mod tests {
         sync_captured(&keymap);
         let ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
         assert!(captured(ctrl, Key::S) && captured(ctrl, Key::O) && captured(ctrl, Key::D));
-        assert!(captured(Modifiers::NONE, Key::F8) && captured(Modifiers::ALT, Key::W));
+        assert!(captured(Modifiers::NONE, Key::F9) && captured(Modifiers::ALT, Key::W));
         assert!(!captured(ctrl, Key::C) && !captured(ctrl, Key::V) && !captured(ctrl, Key::X), "clipboard keys reach the browser");
         assert!(!captured(Modifiers::NONE, Key::M) && !captured(Modifiers::NONE, Key::F), "plain keys need no capture");
     }

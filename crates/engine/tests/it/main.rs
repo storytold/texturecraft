@@ -11,6 +11,8 @@ mod closed_session;
 mod color_selection;
 mod content_effects;
 mod export_colour_space;
+mod export_file_types;
+mod export_maps;
 mod filter_swap;
 mod filters;
 mod frame_selection;

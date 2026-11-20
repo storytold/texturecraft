@@ -128,7 +128,7 @@ pub struct ResizeOutput {
     doc: Document,
     /// The set's new caches (None when its UV tile layout moved: the session rebuilds them).
     cache: Option<SetCache>,
-    log: Vec<String>,
+    log: crate::log::SessionLog,
     from: (u64, u64),
 }
 
@@ -142,8 +142,9 @@ impl ResizeTask {
         set.resolution = resolution;
         crate::session::check_size(set)?;
         let size = set.size();
-        let mut log = Vec::new();
-        // Tiles of their own resolution keep it, so the others move within their atlas blocks.
+        let mut log = crate::log::SessionLog::new();
+
+        // Tiles of their own resolution keep it, so the others move within their atlas blocks
         if old.tile_resolutions.is_empty() {
             crate::layer_ops::resample_set(&mut doc, ts, size);
         } else {
@@ -194,7 +195,7 @@ impl Session {
             #[cfg(target_arch = "wasm32")]
             drop(old);
         }
-        self.log.extend_warnings(log);
+        self.log.append(log);
         self.push_history("Texture set size", before);
         Ok(json!({ "ts": ts, "resolution": resolution }))
     }

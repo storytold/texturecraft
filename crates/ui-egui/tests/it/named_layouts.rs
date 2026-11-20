@@ -51,7 +51,7 @@ fn a_layout_saved_from_the_menu_comes_back_from_the_menu() {
 
     harness.state_mut().ui.dock.focus(Panel::Assets);
     harness.state_mut().ui.uv_zoom = 4.0;
-    harness.state_mut().ui.wireframe_3d = true;
+    harness.state_mut().ui.mesh_wireframe = true;
     harness.state_mut().ui.mode = Mode::Rendering;
     harness.run_steps(2);
 
@@ -59,7 +59,7 @@ fn a_layout_saved_from_the_menu_comes_back_from_the_menu() {
 
     let ui = &harness.state().ui;
     assert!(!ui.dock.is_open(Panel::Assets), "the saved panels are back");
-    assert_eq!((ui.uv_zoom, ui.wireframe_3d, ui.mode), (4.0, true, Mode::Rendering), "zoom, wireframe and mode stay");
+    assert_eq!((ui.uv_zoom, ui.mesh_wireframe, ui.mode), (4.0, true, Mode::Rendering), "zoom, wireframe and mode stay");
 }
 
 #[test]

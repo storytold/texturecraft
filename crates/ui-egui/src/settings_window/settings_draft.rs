@@ -28,7 +28,7 @@ impl SettingsDraft {
         SettingsDraft {
             #[cfg(not(target_arch = "wasm32"))]
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            page: SettingsPage::General,
+            page: app.ui.windows.settings_page,
             prefs: app.ui.prefs.clone(),
             keymap: app.ui.keymap.clone(),
             keymap_at_open: app.ui.keymap.clone(),

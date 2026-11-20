@@ -22,8 +22,10 @@ mod decal_drop;
 mod display_settings;
 pub mod dock;
 pub mod docking;
+mod environment_picker;
 mod export_panel;
 pub mod export_templates;
+mod export_window;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod file_dialogs;
 mod fill_source_slot;
@@ -74,6 +76,7 @@ pub mod profile;
 mod project_config;
 pub mod project_form;
 pub mod properties_popup;
+mod query_field;
 mod rail_popup;
 pub mod render_mode;
 mod resource_panel;
@@ -113,6 +116,9 @@ pub mod unavailable;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod updates_ui;
 pub mod uv_paint_point;
+mod uv_tile_grid;
+mod uv_view_map;
+mod view_mode_picker;
 pub mod viewport;
 pub mod web_files;
 pub mod widgets;
@@ -189,6 +195,10 @@ pub struct TextureCraftApp {
     camera_glide: Option<CameraGlide>,
     /// Yaw and pitch an Alt+Shift drag has reached before snapping to 90° steps (see `viewport`).
     orbit_snap: Option<(f32, f32)>,
+    /// The 2D view's turn an Alt+Shift drag has reached before snapping to steps (see `viewport`).
+    uv_rotation_snap: Option<f32>,
+    /// Frame the 2D view at its next draw (F): pan, zoom and rotation back, on tile 1001 in a UV tile set
+    uv_view_reset: bool,
     pub ui: UiState,
     /// Where `ui` is saved between runs
     ui_store: ui_state_store::UiStateStore,
@@ -306,6 +316,8 @@ impl TextureCraftApp {
         let mut app = TextureCraftApp {
             camera_glide: None,
             orbit_snap: None,
+            uv_rotation_snap: None,
+            uv_view_reset: false,
             session,
             ui,
             ui_store,
@@ -376,7 +388,9 @@ impl TextureCraftApp {
             }
 
             let skipped = app.session.load_templates(user_dir("templates"));
-            app.session.log.extend_warnings(skipped.into_iter().map(|warning| format!("Project template skipped: {warning}")));
+            app.session
+                .log
+                .warnings(texturecraft_engine::log::LIBRARY_SOURCE, skipped.into_iter().map(|warning| format!("Project template skipped: {warning}")));
 
             // Load presets before control commands can access the session
             for warning in app.session.load_brush_presets(user_dir("brushes")) {
@@ -427,6 +441,11 @@ impl TextureCraftApp {
                     self.layer_panel = Default::default();
                 }
 
+                // Schedule the reset only when Painting or Baking draws a 2D view
+                if id == "viewport.frame" && self.ui.layout != state::ViewLayout::Only3D && self.ui.mode != state::Mode::Rendering {
+                    self.uv_view_reset = true;
+                }
+
                 // The empty state has no baking or rendering to show
                 if id == "file.close" {
                     self.ui.mode = state::Mode::Painting;
@@ -474,7 +493,7 @@ impl TextureCraftApp {
 
     fn report_ui_storage_warning(&mut self) {
         if let Some(warning) = self.ui_store.take_warning() {
-            self.session.log.warn(warning.clone());
+            self.session.log.warn("UI", warning.clone());
             self.toast_sticky(warning);
         }
     }
@@ -702,7 +721,7 @@ impl TextureCraftApp {
 
     /// Note a texture set whose bake failed: one Log line, counted in the summary
     fn bake_failed(&mut self, set_index: usize, error: &str) {
-        self.session.log.error(format!("Bake of texture set {set_index} failed: {error}"));
+        self.session.log.error("Baker", format!("Bake of texture set {set_index} failed: {error}"));
         self.bake_report.failed_set_count += 1;
     }
 
@@ -710,9 +729,9 @@ impl TextureCraftApp {
     fn finish_bake_report(&mut self) {
         let (text, line, failed) = self.bake_report.summary(self.last_time);
         if failed {
-            self.session.log.warn(line);
+            self.session.log.warn("Baker", line);
         } else {
-            self.session.log.push(line);
+            self.session.log.info("Baker", line);
         }
 
         self.toast(text, failed);
@@ -1038,9 +1057,11 @@ impl eframe::App for TextureCraftApp {
             titlebar::show(self, ui);
             banner(self, ui);
             toolbar::status_bar(self, ui);
-            toolbar::tool_shelf(self, ui);
+            if self.ui.toolbar_tools {
+                toolbar::tool_shelf(self, ui);
+            }
             self.ui.sync_mode_dock();
-            if self.ui.mode != state::Mode::Baking {
+            if self.ui.mode != state::Mode::Baking && self.ui.toolbar_docks {
                 toolbar::rail(self, ui);
             }
         }

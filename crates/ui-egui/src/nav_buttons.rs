@@ -17,8 +17,8 @@ const EDGE_MARGIN: f32 = 8.0;
 /// Distance from the view's top edge to the first button: below the row of pickers that sits at the top centre, so the two never overlap
 const TOP_OFFSET: f32 = 40.0;
 
-/// Room kept below the column for the 2D view's texture set name and the view's own corner
-const BOTTOM_ROOM: f32 = 40.0;
+/// Room kept below the column for the 2D view's axis gizmo (bottom right) and the view's own corner
+const BOTTOM_ROOM: f32 = 64.0;
 
 /// Narrowest a view may be and still show the column
 const MIN_VIEW_WIDTH: f32 = BUTTON_SIZE + 2.0 * EDGE_MARGIN + 20.0;

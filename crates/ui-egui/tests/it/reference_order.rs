@@ -35,10 +35,10 @@ fn named<'a>(found: &'a [(f32, String, bool)], name: &str) -> Option<&'a (f32, S
 fn every_menu_lists_its_items_in_the_reference_order() {
     // Items the reference has and TextureCraft lacks are absent; TextureCraft's own sit where they fit
     let expected = [
-        "File: New project... | Open... | - | Open sample project... | - | Close | - | Save | Save as... | More save options > Save a copy... | Remove unused resources... | - | Import resources... | Import MaterialX material... | Import PBR texture folder... | Import material... | Export Textures... | Export Mesh... | - | Quit",
+        "File: New project... | Open... | - | Open sample project... | - | Close | - | Save | Save as... | More save options > Save as template... | More save options > Save and reduce file size | More save options > Save as copy... | Remove unused resources... | - | Import resources... | Import MaterialX material... | Import PBR texture folder... | Import material... | Export Textures... | Export Mesh... | - | Quit",
         "Edit: Undo | Redo | Project Configuration... | Reimport mesh | Settings...",
         "Mode: Bake Mesh Maps | Painting | Rendering (path traced)",
-        "Window: Views > Assets | Views > Common Settings | Views > Display Settings | Views > Export | Views > History | Views > Layers | Views > Log | Views > Mesh Map Bakers | Views > Mesh Map Settings | Views > Properties | Views > Shader Settings | Views > Texture Sets | Views > Texture Set Settings | - | Save UI Layout > Save current layout... | Load UI Layout | Layouts > Save current layout as... | Layouts > Manage layouts... | - | Hide UI | Reset panel layout | Reset UI",
+        "Window: Views > Assets | Views > Common Settings | Views > Display Settings | Views > Export | Views > History | Views > Layers | Views > Log | Views > Mesh Map Bakers | Views > Mesh Map Settings | Views > Properties | Views > Python Console | Views > Renderer Settings | Views > Shader Settings | Views > Online assets | Views > Texture Sets | Views > Texture Set Settings | Toolbars > Docks | Toolbars > Plugins | Toolbars > Tools | - | Save UI Layout > Painting mode | Save UI Layout > Rendering mode | Save UI Layout > Baking mode | Load UI Layout | Layouts > Save current layout as... | Layouts > Manage layouts... | - | Hide UI | Reset panel layout | Reset UI",
         "Viewport: Display material | Display next channel | Display previous channel | Display next mesh map | Display previous mesh map | UV checker | - | Frame texture set | Show entire mesh | Front view | Back view | Left view | Right view | Top view | Bottom view | - | Perspective | Orthographic | - | 3D/2D views | 3D view only | 2D view only | Swap 3D/2D | - | Navigation buttons | - | Enable quick mask | Edit quick mask | Invert quick mask",
         "Help: Release notes... | Documentation... | Shortcuts list... | - | Join the community (Discord)... | ArtCraft website... | Report a bug... | Show log... | Export log... | - | Check for Updates... | About TextureCraft...",
     ];
@@ -156,7 +156,7 @@ fn the_blank_screen_menus_match_the_measured_enabled_states() {
         "ui.view.shader",
         "ui.hideUi",
         "ui.resetUi",
-        "ui.layout.save",
+        "ui.layout.save.painting",
         "ui.layout.load",
         "viewport.frame",
         "ui.help.docs",

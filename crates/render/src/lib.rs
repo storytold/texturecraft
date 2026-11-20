@@ -41,6 +41,6 @@ pub use bake_visualization::BakeVisualization;
 pub use cage_geometry::CageGeometry;
 pub use neutral_material::NeutralMaterial;
 pub use overlay_quad::OverlayQuad;
-pub use renderer::{COLOR_FORMAT, Frame, MSAA, Renderer, Shade, ViewKind, aux_size, uv_view_scale};
+pub use renderer::{COLOR_FORMAT, DEFAULT_BACKGROUND, Frame, MSAA, Renderer, Shade, UV_VIEW_MAX_ZOOM, UV_VIEW_MIN_ZOOM, ViewKind, aux_size, uv_view_scale};
 pub use set_highlight::SetHighlight;
 pub use wgpu;

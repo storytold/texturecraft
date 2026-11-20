@@ -2,10 +2,10 @@
 
 use std::io::Read as _;
 
+use craft_usd::scene::{MAX_DECODED_BYTES, Prop, Val, read_layer};
 use texturecraft_geom::Mesh;
 use texturecraft_geom::glam::{Vec2, Vec3};
 
-use super::codec;
 use crate::mesh_import::tests::hammer;
 use crate::{ExportedFile, UsdFormat, import_high_poly_bytes, import_mesh_bytes, self_contained_mesh, usd_bytes};
 
@@ -347,11 +347,11 @@ fn usda_usdc_and_usdz_round_trip_with_textures() {
     // The primvar reader's varname is a string (usdchecker --arkit refuses a token), in both encodings.
     assert!(text.contains("string inputs:varname = \"st\""), "{text}");
     let usdc = round_trip(&m, UsdFormat::Usdc, "usdc", &textures);
-    let layer = super::usdc::read(&usdc, &mut super::Budget::new()).unwrap();
-    let varnames: Vec<&super::Prop> = layer.prims.iter().filter_map(|p| p.props.get("inputs:varname")).collect();
+    let layer = read_layer(&usdc).unwrap();
+    let varnames: Vec<&Prop> = layer.prims.iter().filter_map(|p| p.props.get("inputs:varname")).collect();
     assert!(!varnames.is_empty());
     for v in varnames {
-        assert_eq!((v.type_name.as_str(), v.value.clone()), ("string", Some(super::Val::Tok(vec!["st".into()]))));
+        assert_eq!((v.type_name.as_str(), v.value.clone()), ("string", Some(Val::Tok(vec!["st".into()]))));
     }
     let usdz = round_trip(&m, UsdFormat::Usdz, "usdz", &textures);
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&usdz)).unwrap();
@@ -407,17 +407,19 @@ fn usd_extension_detects_the_encoding() {
 #[test]
 fn integer_coding_round_trips() {
     let values: Vec<i64> = vec![0, 1, 2, 3, 3, 3, -5, 1000, -70000, i64::from(i32::MAX), i64::from(i32::MIN), 7, 7, 7, 8];
-    for width in [4, 8] {
-        let enc = codec::encode_ints(&values, width).unwrap();
-        assert!(enc.len() <= codec::encoded_ints_len(values.len(), width));
-        assert_eq!(codec::decode_ints(&enc, values.len(), width).unwrap(), values);
-        assert!(codec::decode_ints(&enc[..enc.len() - 1], values.len(), width).is_err());
+    for (w_enum, width) in [(craft_usd::integers::Width::I32, 4), (craft_usd::integers::Width::I64, 8)] {
+        let enc = craft_usd::integers::encode(&values, w_enum, MAX_DECODED_BYTES).unwrap();
+        assert!(enc.len() <= craft_usd::codec::encoded_ints_len(values.len(), width));
+        assert_eq!(craft_usd::integers::decode(&enc, values.len(), w_enum, MAX_DECODED_BYTES).unwrap(), values);
+        assert!(craft_usd::integers::decode(&enc[..enc.len() - 1], values.len(), w_enum, MAX_DECODED_BYTES).is_err());
     }
     let wide = vec![i64::MAX, i64::MIN, 0, 1 << 40];
-    assert_eq!(codec::decode_ints(&codec::encode_ints(&wide, 8).unwrap(), 4, 8).unwrap(), wide);
+    let enc_wide = craft_usd::integers::encode(&wide, craft_usd::integers::Width::I64, MAX_DECODED_BYTES).unwrap();
+    assert_eq!(craft_usd::integers::decode(&enc_wide, 4, craft_usd::integers::Width::I64, MAX_DECODED_BYTES).unwrap(), wide);
     let big: Vec<u8> = (0..5000u32).flat_map(|i| (i % 7).to_le_bytes()).collect();
-    assert_eq!(codec::decompress(&codec::compress(&big).unwrap(), big.len()).unwrap(), big);
-    assert!(codec::decompress(&[0, 0xF0], 10).is_err());
+    let comp = craft_usd::compress::compress(&big, MAX_DECODED_BYTES).unwrap();
+    assert_eq!(craft_usd::decompress(&comp, big.len()).unwrap(), big);
+    assert!(craft_usd::decompress(&[0, 0xF0], 10).is_err());
 }
 
 #[test]
@@ -426,15 +428,14 @@ fn shared_crate_lz4_writer_preserves_bytes() {
         let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         let mut previous = vec![0];
         previous.extend(lz4_flex::block::compress(&data));
-        assert_eq!(codec::compress(&data).unwrap(), previous);
+        assert_eq!(craft_usd::compress::compress(&data, MAX_DECODED_BYTES).unwrap(), previous);
     }
 }
 
 #[test]
-fn shared_integer_decoder_rejects_unsupported_width_and_oversized_output() {
-    assert!(codec::decode_ints(&[], 1, 3).is_err());
-    assert!(codec::decode_ints(&[], super::MAX_DECODED_BYTES / 8 + 1, 8).is_err());
-    assert!(codec::decode_ints(&[], 0, 4).unwrap().is_empty());
+fn shared_integer_decoder_rejects_oversized_output() {
+    assert!(craft_usd::integers::decode(&[], MAX_DECODED_BYTES / 8 + 1, craft_usd::integers::Width::I64, MAX_DECODED_BYTES).is_err());
+    assert!(craft_usd::integers::decode(&[], 0, craft_usd::integers::Width::I32, MAX_DECODED_BYTES).unwrap().is_empty());
 }
 
 #[test]
@@ -446,10 +447,10 @@ fn shared_crate_lz4_retains_chunk_and_budget_policy() {
         frame.extend(block);
     }
     frame.extend(b"old reader ignores this tail");
-    assert_eq!(codec::decompress(&frame, 6).unwrap(), b"abcdef");
-    assert!(codec::decompress(&frame, 5).is_err());
-    assert!(codec::decompress(&[1, 255, 255, 255, 255], 64).is_err());
-    assert!(codec::decompress(&[128], 64).is_err());
+    assert_eq!(craft_usd::decompress(&frame, 6).unwrap(), b"abcdef");
+    assert!(craft_usd::decompress(&frame, 5).is_err());
+    assert!(craft_usd::decompress(&[1, 255, 255, 255, 255], 64).is_err());
+    assert!(craft_usd::decompress(&[128], 64).is_err());
 }
 
 #[test]
@@ -511,8 +512,20 @@ fn loose_layer_textures_are_packaged() {
 }
 
 #[test]
-fn shared_integer_writer_preserves_tie_wire_and_rejects_invalid_width() {
-    assert_eq!(codec::encode_ints(&[1, 3, 4, 6], 4).unwrap(), vec![2, 0, 0, 0, 17, 1, 1]);
-    assert!(codec::encode_ints(&[1], 3).is_err());
-    assert!(codec::encode_ints(&[], 8).unwrap().is_empty());
+fn shared_integer_writer_preserves_tie_wire_and_rejects_oversized_budget() {
+    assert_eq!(craft_usd::integers::encode(&[1, 3, 4, 6], craft_usd::integers::Width::I32, MAX_DECODED_BYTES).unwrap(), vec![2, 0, 0, 0, 17, 1, 1]);
+    assert!(craft_usd::integers::encode(&[1], craft_usd::integers::Width::I32, 16).is_err());
+    assert!(craft_usd::integers::encode(&[], craft_usd::integers::Width::I64, 0).unwrap().is_empty());
+}
+
+/// Keep the final mesh contract of the binary fixture used before the shared USD cutover.
+#[test]
+fn crafted_usdc_references_time_samples_and_inlined_values_reach_mesh() {
+    let bytes = include_bytes!("fixtures/crafted-references.usdc");
+    let m = import_mesh_bytes("crafted.usdc", bytes).unwrap().mesh;
+    assert_eq!(m.triangle_count(), 1, "the class prim itself is not drawn");
+    let (lo, hi) = m.bounds();
+    // Scaled 2× by the inlined matrix, then moved by the first time sample.
+    assert!((lo - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5, "{lo}");
+    assert!((hi - Vec3::new(3.0, 2.0, 0.0)).length() < 1e-5, "{hi}");
 }

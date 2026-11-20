@@ -213,7 +213,7 @@ fn buttons_stay_clear_of_the_pickers_the_gizmo_and_the_split_divider_at_1280_by_
     for button in NavView::Uv.buttons() {
         let at = button_rect(uv_view, NavView::Uv, *button).expect("shown at 1280 x 800");
         assert!(!at.intersects(Rect::from_min_size(egui::pos2(uv_view.center().x - 150.0, uv_view.top() + 8.0), vec2(300.0, 22.0))));
-        assert!(!at.intersects(Rect::from_min_size(egui::pos2(uv_view.right() - 160.0, uv_view.bottom() - 24.0), vec2(160.0, 24.0))), "the texture set name");
+        assert!(!at.intersects(Rect::from_min_size(egui::pos2(uv_view.right() - 72.0, uv_view.bottom() - 72.0), vec2(72.0, 72.0))), "the axis gizmo");
     }
 }
 

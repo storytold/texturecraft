@@ -218,7 +218,7 @@ impl Session {
     pub fn apply_bake(&mut self, texture_set: usize, output: BakeOutput) -> Result<()> {
         let tracer = output.tracer.clone();
         self.edit("Bake mesh maps", |session| session.store_bake(texture_set, output))?;
-        self.log.push(format!("Baked texture set {texture_set} ({tracer})"));
+        self.log.info("Baker", format!("Baked texture set {texture_set} ({tracer})"));
         Ok(())
     }
 
@@ -227,7 +227,7 @@ impl Session {
     pub fn apply_streamed_bake(&mut self, texture_set: usize, output: StreamedBake) -> Result<()> {
         let tracer = output.tracer.clone();
         self.edit("Bake mesh maps", |session| session.store_bake_maps(texture_set, output.resolution, output.height, output.maps))?;
-        self.log.push(format!("Baked texture set {texture_set} ({tracer})"));
+        self.log.info("Baker", format!("Baked texture set {texture_set} ({tracer})"));
         Ok(())
     }
 
@@ -267,7 +267,7 @@ impl Session {
         let taken: Vec<&str> = self.bake_meshes.high.iter().map(|h| h.name.as_str()).collect();
         m.name = unique_name(file_name, &taken);
         let textures = m.base_color.iter().flatten().filter(|c| !c.texels.is_empty()).count();
-        self.log.push(format!("High poly {}: {} triangles, {textures} base color textures", m.name, m.mesh.triangle_count()));
+        self.log.info("Baker", format!("High poly {}: {} triangles, {textures} base color textures", m.name, m.mesh.triangle_count()));
         let name = m.name.clone();
         self.bake_meshes.high.push(m);
         self.bake_meshes.rebuild();
@@ -311,7 +311,7 @@ impl Session {
     /// not fold in. Replies like `bake.highPoly.add` / `bake.cage.set`: `{name, meshes}`.
     pub fn add_bake_mesh(&mut self, f: texturecraft_formats::MeshFile, cage: bool) -> Result<Value> {
         let name = if cage { self.set_cage_bytes(&f.name, f.bytes)? } else { self.add_high_poly_bytes(&f.name, f.bytes)? };
-        self.log.extend_warnings(f.warnings);
+        self.log.warnings("Baker", f.warnings);
         Ok(json!({ "name": name, "meshes": meshes_json(self) }))
     }
 
@@ -320,21 +320,21 @@ impl Session {
         for (name, bytes) in high {
             match parse_mesh(&name, bytes) {
                 Ok(m) => self.bake_meshes.high.push(m),
-                Err(e) => self.log.warn(format!("skipped high poly mesh: {e}")),
+                Err(e) => self.log.warn("Baker", format!("skipped high poly mesh: {e}")),
             }
         }
         self.bake_meshes.rebuild();
         if let Some((name, bytes)) = cage
             && let Err(e) = self.set_cage_bytes(&name, bytes)
         {
-            self.log.warn(format!("skipped cage mesh: {e}"));
+            self.log.warn("Baker", format!("skipped cage mesh: {e}"));
         }
     }
 
     pub(crate) fn load_bake_paint(&mut self, maps: BTreeMap<(usize, BakePaintTarget), texturecraft_formats::BakePaintData>) {
         for (key, data) in maps {
             if key.0 >= self.doc.project.texture_sets.len() {
-                self.log.warn(format!("skipped bake paint map for missing texture set {}", key.0));
+                self.log.warn("Baker", format!("skipped bake paint map for missing texture set {}", key.0));
                 continue;
             }
 
@@ -343,7 +343,7 @@ impl Session {
                 Ok(()) => {
                     self.doc.bake_paint.insert(key, Arc::new(map));
                 }
-                Err(error) => self.log.warn(format!("skipped bake paint map: {error}")),
+                Err(error) => self.log.warn("Baker", format!("skipped bake paint map: {error}")),
             }
         }
     }
@@ -764,7 +764,7 @@ fn bake_run(session: &mut Session, params: &Value) -> Result<Value> {
         Ok(tracers)
     })?;
     for (index, tracer) in sets.iter().zip(&tracers) {
-        session.log.push(format!("Baked texture set {index} ({tracer})"));
+        session.log.info("Baker", format!("Baked texture set {index} ({tracer})"));
     }
     session.update();
     Ok(json!({ "baked": sets, "tracer": tracers }))

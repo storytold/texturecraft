@@ -139,7 +139,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   active one. The project's **normal map format** (OpenGL or DirectX, in Texture Set Settings)
   says how a normal map image set as a mesh map is read, and is the default for export.
 - **Projects** are a single `.tcraft` file: the mesh, every layer (sparse and lossless), baked maps
-  and imported images. **Project templates** start new work from a saved setup. Closing the app,
+  and imported images. **Project templates** start new work from a saved setup. *File › More save options › Save as template...* saves the open project's setup (dialog "Save template", in the user templates folder, no confirmation); New project lists "Default (OpenPBR)", the other built-ins with " (starter_assets)", yours with " (your_assets)", and opens on the template of the last project. *More save options* also has *Save as copy...* and *Save and reduce file size* (greyed, "Not available yet"). Closing the app,
   or opening, starting or closing another project, with unsaved changes asks whether to save them
   first (in the browser too, where Save downloads the project and closing or reloading the tab
   asks before the changes are lost).
@@ -164,13 +164,19 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **Export presets** for glTF PBR Metal Roughness, Unreal Engine (packed), Unity HDRP (mask map),
   Unity Standard, Blender (Principled BSDF), Godot 4 (ORM), OpenPBR (with the coat, fuzz,
   anisotropy, transmission and subsurface maps), separate maps, mesh maps and document channels, in
-  PNG, JPEG, TGA, TIFF, BMP, WEBP, EXR or HDR at 8, 16 or 32 bits, with UV padding, size
-  override and OpenGL or DirectX normals.
+  PNG, JPEG, JNG, PGM, TGA, TIFF, BMP, WEBP, PSD, EXR or HDR at 8 bits (optionally dithered), 16
+  bits or 32-bit float (TIFF, EXR, HDR; 16-bit half float for EXR), with UV padding (dilation,
+  infinite, or dilation + diffusion), size override and OpenGL or DirectX normals.
 - **Output template editor:** build your own presets with per-channel packing, converted maps and per-channel inversion,
-  and share them as JSON.
+  and share them as JSON. Right-click a preset to rename, duplicate or remove it; F2 renames.
 - **Export panel** on the right bar: *Export Mesh...* asks for the mesh export options, then for
   the file; *Export Textures...* opens the Export textures window (Settings, Output templates and
-  List of exports, *Include all*, *Save settings* and the number of textures the export writes).
+  List of exports, *Include all*, *Save settings* and the number of textures the export writes;
+  *Cancel* goes back to the settings the window opened with, *Maximum size for all Texture Sets*
+  exports every set at the largest set's size; a click on a texture set overrides its template,
+  file type, size or padding, and each output map's file type and bit depth, or leaves a map out;
+  Export shows the progress, a console of its steps and the written files, and can be canceled
+  between texture sets).
 - **Mesh export** to OBJ with an MTL material library and its maps (PBR extension keys for
   roughness, metallic, normal and coat; UV-tiled sets keep their UDIM UVs and export their maps
   through Export textures), textured GLB (with clear coat and sheen) and USD (with clear coat).
@@ -190,15 +196,29 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - View any channel, any baked mesh map, or a UV checker; Alt+drag to orbit (Alt+Shift+drag in 90°
   steps), middle-drag to pan, wheel to zoom, F to show the entire mesh, Shift+F to frame the active
   texture set (a floor plane or other helper geometry stays out of the view and the orbit pivot),
-  M / C / B to cycle views. Choose **free (trackball) or constrained rotation** in the top bar (free
+  M / C / B to cycle views (C and Shift+C also visit Normal+height+mesh). The view picker groups
+  the modes under *Lighting*, *Single channel* and *Mesh maps*; *Other...* opens a search of the
+  project's images and shows the chosen one on the mesh and in the 2D view; Display Settings has
+  *Display solo view without lighting (unlit)* (on by default; off shades a channel view). Choose **free (trackball) or constrained rotation** in the top bar (free
   turns the model over; commands for stepped turns and for the next / previous saved camera can be
   bound in Settings), and the **Normal+height+mesh** view in the view picker. Orbit, pan and zoom buttons in the corner of each view do the same with a
   plain drag, so a pen and tablet can navigate without a keyboard or wheel (Viewport menu ▸
   Navigation buttons hides them).
+- **Display Settings** pick the environment from a thumbnail grid (or drop an image on the slot),
+  with opacity and blur in percent, an environment alignment to the world or the camera and a
+  shadow quality and opacity; Settings > General > Background color sets the plain
+  background (top and bottom color) that shows at environment opacity 0.
+- **2D view navigation** uses the camera mouse bindings: Alt+left drag turns the view freely (the U/V gizmo turns with it) and Alt+Shift+left snaps the turn to 90° steps, Alt+right drag zooms, Alt+middle drag and Ctrl+Alt+left drag pan 1:1, the wheel zooms toward the cursor, and F resets pan, zoom and rotation (it frames tile 1001 in a UV tile set). The zoom reaches about ×220 in and about 2 px per tile out. Plain middle drag and a double click (reset) stay as extras.
 - **Perspective (F5) or orthographic (F6)** projection, and **front, back, left, right, top and
   bottom views** that frame the mesh (Viewport menu; bind your own keys in Settings).
 - **3D and UV wireframes** that show the mesh's own polygons: quads and n-gons from OBJ, FBX,
   COLLADA, USD, Alembic and PLY files keep their edges, without the triangulation's diagonals.
+  One **Show mesh wireframe** switch in Display Settings (off by default, with **Wireframe opacity**, 40 to start) draws
+  the edges in the 3D view and the UV edges, in red, in the 2D view.
+- **UV tile grid** in the 2D view of a UV tile (UDIM) project: grid lines over the whole view, a red U and a green V axis
+  line through the UV origin, each tile's number in a small box at its lower-left corner (dimmer for tiles the set does not
+  paint) and a label at the bottom left with the set and the tile under the cursor ("UdimMat - 1001"). A button left of the
+  view mode hides the numbers and the label.
 
 ## Interface
 
@@ -211,10 +231,19 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **Dockable, tabbed and floating panels**, saved layouts, and panels that reopen where you closed
   them. The right bar's panels (Export, Log, Display Settings, Shader Settings, History) pop out
   beside it; *Undock* makes one a floating window, and its *Dock* button puts it back on the bar.
+- **Window menu** as in the reference: Views (with *Renderer Settings*, a small panel for Rendering
+  mode, and *Properties - Paint*, which names the tool), Toolbars (*Docks*, the right bar, and *Tools*, the
+  tool shelf, switch off and on; *Plugins* is greyed), *Save UI Layout* for the Painting, Rendering or
+  Baking mode, *Load UI Layout* ("Select a UI layout file.") and *Hide UI* with its check mark. Views
+  are greyed per mode as measured: Rendering keeps Display Settings, Log, Renderer Settings, Shader
+  Settings and Texture Sets; Baking greys Assets, Export, Layers, Properties, Renderer Settings, Shader
+  Settings and Texture Set Settings. *Python Console* and *Online assets* are greyed ("Not available yet").
 - **Display and Shader Settings** are one scrolling page each: their section tabs jump to a
   section, and scrolling highlights the tab of the section in view.
-- A **Log** panel with a *General* and an *Assets* tab: asset messages (resources that do not
-  decode, skipped templates and presets, PBR folder and MaterialX import warnings) go under Assets.
+- A **Log** panel with a *GENERAL* and an *ASSETS* tab: asset messages (resources that do not
+  decode, skipped templates and presets, PBR folder and MaterialX import warnings) go under ASSETS.
+  Lines read `[Source] message`, coloured by level (info, warning, error), and can be
+  multi-selected; the right-click menu copies them (`Ctrl+C`) or clears them.
 - **No project at launch**: empty views, panels and toolbars until you create or open one (File ›
   New project, Open, Recent projects, Open sample project); File › Close returns to that state.
 - A **data folder** of your choice for autosaves, smart materials, presets, templates and UI
@@ -223,11 +252,12 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   apply on OK and Cancel drops them. General holds the language (or the system's), the 3D view's
   rotation, zoom and wheel speeds with inverse directions, GPU or CPU bake rays, resource limits
   (worker threads, cores kept for the UI, RAM while saving, project size on open) and the autosave
-  interval. Shortcuts lists the actions that can be bound to keys. Libraries adds or removes folders whose saved smart
+  interval. Shortcuts rebinds any command in the sections Actions, Mouse shortcuts and Modifiers shortcuts (Delete clears a binding, a shared shortcut warns and keeps OK disabled, Reset all to default restores every key); the window reopens on the page it was closed on. Libraries adds or removes folders whose saved smart
   materials and masks the shelf lists.
+- The **shortcut list** (Settings › Shortcuts and Help › Shortcuts list) names the actions as the reference does and starts with its default keys (Switch to baking mode Ctrl+Shift+B, Select next and previous camera `>` and `<`, Viewers layout F1 to F4); Show mesh wireframe is a bindable command.
 - A **shortcut editor** with conflict detection, listing every menu item and every command a key can run (commands that need a path, name or similar are left out), and every shortcut shown in its tooltip.
 - **Help menu:** Release notes... opens the project's releases page. Export log... writes every
-  channel to a text file with each entry's recorded UTC time and severity. The desktop app asks
+  channel to a text file with each entry's recorded UTC time, severity and source. The desktop app asks
   for a destination, and the browser downloads the file.
 - A **History** panel: click any step to go back to it, or forward again to an undone one.
 - **10 languages:** English, French, German, Spanish, Portuguese, Italian, Japanese, Chinese,

@@ -1,5 +1,7 @@
 //! Decoding imported image resources (fills, alphas, stencils).
 
+use craft_image_codecs::{ChannelLayout, EncodeOptions, Format, Image, PngCompression, SampleType};
+
 use crate::{FormatError, MAX_IMAGE_SIZE, MAX_RESOURCE_TEXELS, Result};
 
 /// A decoded image: RGBA as 0..1 floats in the file's own encoding (8/16-bit files stay
@@ -77,32 +79,38 @@ fn decode_image_with_limits(bytes: &[u8], max_texels: u64, limits: image::Limits
 /// PNG bytes of an `rgb` (sRGB) image whose alpha is `coverage` (`width × height`, top row first):
 /// drawn text as an image resource.
 pub fn coverage_png(width: u32, height: u32, coverage: &[u8], rgb: [u8; 3]) -> Result<Vec<u8>> {
-    let rgba: Vec<u8> = coverage.iter().flat_map(|a| [rgb[0], rgb[1], rgb[2], *a]).collect();
-    let image = image::RgbaImage::from_raw(width, height, rgba)
+    // Resource callers may supply a larger coverage buffer. Encode just the given extent.
+    let coverage = usize::try_from(u64::from(width) * u64::from(height))
+        .ok()
+        .and_then(|count| coverage.get(..count))
         .ok_or_else(|| FormatError::Invalid(format!("{} coverage values for {width}x{height}", coverage.len())))?;
-    let mut png = Vec::new();
-    image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| FormatError::Invalid(e.to_string()))?;
-    Ok(png)
+    let bytes = coverage.len().checked_mul(4).ok_or_else(|| FormatError::Invalid(format!("RGBA buffer does not fit {width}x{height}")))?;
+    let mut rgba = Vec::new();
+    rgba.try_reserve_exact(bytes).map_err(|error| FormatError::Invalid(error.to_string()))?;
+    rgba.extend(coverage.iter().flat_map(|&alpha| [rgb[0], rgb[1], rgb[2], alpha]));
+    let image = Image::from_u8(width, height, ChannelLayout::Rgba, rgba).map_err(|error| FormatError::Invalid(error.to_string()))?;
+    encode_resource_png(&image)
 }
 
 /// 16-bit single-channel PNG bytes of `values` (0..1, `width × height`, top row first): one map
 /// split out of a packed image, or an inverted one.
 pub fn gray16_png(width: u32, height: u32, values: impl Iterator<Item = f32>) -> Result<Vec<u8>> {
-    let image = gray16_image(width, height, values)?;
-
-    encode_gray16(&image)
+    encode_resource_png(&gray16_image(width, height, values)?)
 }
 
 /// A single-channel PNG and its decoded pixels, quantized identically to a saved/reloaded image.
 pub fn gray16_resource(width: u32, height: u32, values: impl Iterator<Item = f32>) -> Result<(Vec<u8>, DecodedImage)> {
     let image = gray16_image(width, height, values)?;
-    let png = encode_gray16(&image)?;
+    let png = encode_resource_png(&image)?;
     let rgba = image
-        .pixels()
-        .map(|pixel| {
+        .data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|bytes| {
             // Match image's integer-to-float expansion so reload is bit-identical
             const GRAY16_TO_FLOAT: f32 = 1.0 / u16::MAX as f32;
-            let value = f32::from(pixel.0[0]) * GRAY16_TO_FLOAT;
+            let value = f32::from(u16::from_ne_bytes(*bytes)) * GRAY16_TO_FLOAT;
             [value, value, value, 1.0]
         })
         .collect();
@@ -110,28 +118,28 @@ pub fn gray16_resource(width: u32, height: u32, values: impl Iterator<Item = f32
     Ok((png, DecodedImage { width, height, rgba, srgb: true }))
 }
 
-fn encode_gray16(image: &image::ImageBuffer<image::Luma<u16>, Vec<u16>>) -> Result<Vec<u8>> {
-    let mut png = Vec::new();
-    image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|error| FormatError::Invalid(error.to_string()))?;
-
-    Ok(png)
+fn encode_resource_png(image: &Image) -> Result<Vec<u8>> {
+    let options = EncodeOptions { png_compression: PngCompression::Fast, ..EncodeOptions::default() };
+    craft_image_codecs::encode(image, Format::Png, &options).map_err(|error| FormatError::Invalid(error.to_string()))
 }
 
-fn gray16_image(width: u32, height: u32, values: impl Iterator<Item = f32>) -> Result<image::ImageBuffer<image::Luma<u16>, Vec<u16>>> {
+fn gray16_image(width: u32, height: u32, values: impl Iterator<Item = f32>) -> Result<Image> {
     let texels = u64::from(width) * u64::from(height);
     if width == 0 || height == 0 || width > MAX_IMAGE_SIZE || height > MAX_IMAGE_SIZE || texels > MAX_RESOURCE_TEXELS {
         return Err(FormatError::TooLarge(format!("image is {width}x{height} (limit {MAX_RESOURCE_TEXELS} texels)")));
     }
 
     let expected = usize::try_from(texels).map_err(|_| FormatError::TooLarge(format!("image is {width}x{height}")))?;
-    let data: Vec<u16> = values.take(expected + 1).map(|v| if v.is_finite() { (v.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16 } else { 0 }).collect();
-    if data.len() != expected {
-        return Err(FormatError::Invalid(format!("pixel count does not match {width}x{height}")));
-    }
-
-    let image = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(width, height, data)
-        .ok_or_else(|| FormatError::Invalid(format!("pixel count does not match {width}x{height}")))?;
-    Ok(image)
+    // Build the shared image's native-endian buffer directly to avoid a second copy of the samples.
+    let data = values
+        .take(expected + 1)
+        .flat_map(|value| {
+            let sample = if value.is_finite() { (value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16 } else { 0 };
+            sample.to_ne_bytes()
+        })
+        .collect();
+    Image::from_raw(width, height, ChannelLayout::Gray, SampleType::U16, data)
+        .map_err(|_| FormatError::Invalid(format!("pixel count does not match {width}x{height}")))
 }
 
 #[cfg(test)]
@@ -156,6 +164,49 @@ mod tests {
 
         assert_eq!(text.rgba, vec![[1.0, 1.0, 1.0, 0.0], [1.0; 4]]);
         assert!(coverage_png(2, 2, &[0], [255; 3]).is_err());
+    }
+
+    #[test]
+    fn coverage_png_preserves_rgba8_samples_and_ignores_excess_coverage() {
+        let coverage = [0, 17, 128, 255, 231];
+        let png = coverage_png(2, 2, &coverage, [19, 83, 207]).unwrap();
+        let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+
+        assert_eq!(decoded.color(), image::ColorType::Rgba8);
+        let rgba = decoded.as_rgba8().unwrap();
+        assert_eq!(rgba.dimensions(), (2, 2));
+        assert_eq!(rgba.as_raw(), &[19, 83, 207, 0, 19, 83, 207, 17, 19, 83, 207, 128, 19, 83, 207, 255]);
+        assert!(matches!(coverage_png(2, 2, &coverage[..3], [19, 83, 207]), Err(FormatError::Invalid(_))));
+    }
+
+    #[test]
+    fn gray16_png_preserves_asymmetric_samples_in_row_order() {
+        let samples = [0x0001u16, 0x0100, 0x1234, 0xabcd, 0xff00, 0xffff];
+        let values = samples.into_iter().map(|value| f32::from(value) / f32::from(u16::MAX));
+        let png = gray16_png(3, 2, values).unwrap();
+        let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+
+        assert_eq!(decoded.color(), image::ColorType::L16);
+        let gray = decoded.as_luma16().unwrap();
+        assert_eq!(gray.dimensions(), (3, 2));
+        assert_eq!(gray.as_raw(), &samples);
+    }
+
+    #[test]
+    fn coverage_png_preserves_samples_above_four_mebibytes() {
+        let (width, height) = (1024u32, 1025u32);
+        let coverage: Vec<u8> = (0..width * height).map(|index| ((index * 37 + index / width) % 256) as u8).collect();
+        // Exercise the shared encoder's parallel path, selected by raw image byte count.
+        assert!(coverage.len() * 4 > 4 << 20);
+        let png = coverage_png(width, height, &coverage, [23, 97, 211]).unwrap();
+        let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+
+        assert_eq!(decoded.color(), image::ColorType::Rgba8);
+        let rgba = decoded.as_rgba8().unwrap();
+        assert_eq!(rgba.dimensions(), (width, height));
+        for (index, (pixel, alpha)) in rgba.pixels().zip(&coverage).enumerate() {
+            assert_eq!(pixel.0, [23, 97, 211, *alpha], "pixel {index}");
+        }
     }
 
     #[test]

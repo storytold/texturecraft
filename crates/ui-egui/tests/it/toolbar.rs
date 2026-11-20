@@ -46,7 +46,7 @@ fn narrow_toolbars_keep_scroll_arrows_and_mode_buttons_separate() {
             harness.run_steps(4);
             let left = harness.get_by_label("Scroll left").rect();
             let right = harness.get_by_label("Scroll right").rect();
-            let bake = harness.get_by_label("Bake Mesh Maps (F8)").rect();
+            let bake = harness.get_by_label("Bake Mesh Maps (Ctrl+Shift+B)").rect();
             let (_, clip) = size_label(&harness);
             for button in [left, right, bake] {
                 assert_eq!(button.size(), egui::Vec2::splat(button_size));
@@ -135,8 +135,10 @@ fn compact_view_buttons_can_be_scrolled_into_view_and_clicked() {
 #[test]
 fn mode_buttons_keep_their_order_and_dispatch_commands() {
     let mut harness = toolbar_harness(700.0, Tool::Paint);
-    for (label, mode) in [("Bake Mesh Maps (F8)", Mode::Baking), ("Rendering (path traced) (F10)", Mode::Rendering), ("Painting (F9)", Mode::Painting)] {
-        let bake = harness.get_by_label("Bake Mesh Maps (F8)").rect();
+    for (label, mode) in
+        [("Bake Mesh Maps (Ctrl+Shift+B)", Mode::Baking), ("Rendering (path traced) (F10)", Mode::Rendering), ("Painting (F9)", Mode::Painting)]
+    {
+        let bake = harness.get_by_label("Bake Mesh Maps (Ctrl+Shift+B)").rect();
         let paint = harness.get_by_label("Painting (F9)").rect();
         let render = harness.get_by_label("Rendering (path traced) (F10)").rect();
         assert!(bake.right() < paint.left() && paint.right() < render.left());

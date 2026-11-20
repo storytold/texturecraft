@@ -93,7 +93,7 @@ async fn step(progress: f32, status: &str) {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
-/// The app's shortcuts (Ctrl+S, Ctrl+O, Ctrl+D, F8…) would also trigger the browser's own
+/// The app's shortcuts (Ctrl+S, Ctrl+O, Ctrl+D, F5…) would also trigger the browser's own
 /// actions; take them first. Copy, cut and paste stay with the browser, which turns them into
 /// the clipboard events egui reads. Shortcuts the browser reserves (Ctrl+N, Ctrl+T, Ctrl+W)
 /// never reach the page.
