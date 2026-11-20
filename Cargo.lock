@@ -933,10 +933,10 @@ dependencies = [
 [[package]]
 name = "craft-mesh"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=809a72ec8fb41a76fd5e7e45a69f2797a606f406#809a72ec8fb41a76fd5e7e45a69f2797a606f406"
+source = "git+https://github.com/storytold/craft-libs?rev=5415dfe589609c469300c46f070b8b4fb36a1e77#5415dfe589609c469300c46f070b8b4fb36a1e77"
 dependencies = [
- "craft-xml 0.1.0 (git+https://github.com/storytold/craft-libs?rev=809a72ec8fb41a76fd5e7e45a69f2797a606f406)",
- "craft-zip 0.1.0 (git+https://github.com/storytold/craft-libs?rev=809a72ec8fb41a76fd5e7e45a69f2797a606f406)",
+ "craft-xml 0.1.0 (git+https://github.com/storytold/craft-libs?rev=5415dfe589609c469300c46f070b8b4fb36a1e77)",
+ "craft-zip 0.1.0 (git+https://github.com/storytold/craft-libs?rev=5415dfe589609c469300c46f070b8b4fb36a1e77)",
  "miniz_oxide 0.9.1",
  "serde_json",
 ]
@@ -1065,11 +1065,21 @@ dependencies = [
 [[package]]
 name = "craft-xml"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=809a72ec8fb41a76fd5e7e45a69f2797a606f406#809a72ec8fb41a76fd5e7e45a69f2797a606f406"
+source = "git+https://github.com/storytold/craft-libs?rev=5415dfe589609c469300c46f070b8b4fb36a1e77#5415dfe589609c469300c46f070b8b4fb36a1e77"
 dependencies = [
  "quick-xml 0.41.0",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "craft-zip"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=5415dfe589609c469300c46f070b8b4fb36a1e77#5415dfe589609c469300c46f070b8b4fb36a1e77"
+dependencies = [
+ "flate2",
+ "thiserror 2.0.21",
+ "zip",
 ]
 
 [[package]]
@@ -1086,16 +1096,6 @@ dependencies = [
 name = "craft-zip"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=7a7a18cb40ac4cd5fca29c0dc224ac5178d40a89#7a7a18cb40ac4cd5fca29c0dc224ac5178d40a89"
-dependencies = [
- "flate2",
- "thiserror 2.0.21",
- "zip",
-]
-
-[[package]]
-name = "craft-zip"
-version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=809a72ec8fb41a76fd5e7e45a69f2797a606f406#809a72ec8fb41a76fd5e7e45a69f2797a606f406"
 dependencies = [
  "flate2",
  "thiserror 2.0.21",
