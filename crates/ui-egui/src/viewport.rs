@@ -104,7 +104,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         _ if mode == crate::state::Mode::Baking && app.ui.bake_visualization.bent_normal_shown() => Some(crate::gpu::AuxView::MeshMap(BakedMap::BentNormal)),
         _ => None,
     };
-    let mut sync = PendingSync { aux: Some(aux_view), uv_size: None };
+    let mut sync = PendingSync::default();
     let full = ui.available_rect_before_wrap();
     path_keys(app, ui);
 
@@ -139,6 +139,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         }
     }
 
+    sync.finish(app, ui, aux_view);
     crate::properties_popup::show(app, ui.ctx());
 
     if mode == crate::state::Mode::Rendering {
@@ -415,11 +416,32 @@ const MAX_NAMED_SETS: usize = 5;
 /// Characters of a set name in that notice (long names are cut, with "...").
 const MAX_NAME_CHARS: usize = 32;
 
-/// This frame's scene sync (compositing and GPU uploads), run by the first view drawn, after
-/// that view handled its input: a stroke shows in the frame it is painted, not the next.
+/// Reserve the first callback's draw position so both views can handle input before
+/// we build the one scene update that must precede either view's GPU draw.
+#[derive(Default)]
 pub struct PendingSync {
-    aux: Option<Option<crate::gpu::AuxView>>,
+    first: Option<(egui::Painter, egui::layers::ShapeIdx, ViewCallback)>,
     uv_size: Option<[u32; 2]>,
+}
+
+impl PendingSync {
+    fn finish(self, app: &mut TextureCraftApp, ui: &Ui, aux: Option<crate::gpu::AuxView>) {
+        let Some((painter, slot, mut callback)) = self.first else { return };
+        let Some(gpu) = app.gpu.as_mut() else { return };
+        let start = crate::now_ms();
+        let visible_uv = self.uv_size.zip(app.session.caches.get(app.session.ts())).map(|(size, cache)| {
+            visible_uv_bounds(size, cache.size, app.ui.uv_zoom, app.ui.uv_pan)
+        });
+        let scene = gpu.sync_view(&mut app.session, aux, callback.frame.shade.bake, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms), visible_uv);
+        let reports = gpu.take_reports();
+        if app.session.pending_tiles() > 0 || app.session.caches.iter().any(|cache| !cache.upload.is_empty()) || gpu.bake_busy() {
+            ui.ctx().request_repaint();
+        }
+        app.profiler.sync_ms += (crate::now_ms() - start) as f32;
+        gpu_report_toasts(app, reports);
+        callback.sync = Mutex::new(Some(scene));
+        painter.set(slot, eframe::egui_wgpu::Callback::new_paint_callback(callback.rect, callback));
+    }
 }
 
 /// Invert the UV view transform used by the renderer for the two viewport corners.
@@ -442,26 +464,6 @@ fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, mut frame: Frame
     let tokens = Tokens::get(ui.ctx());
     let bake = bake_visualization(app);
     frame.shade.bake = bake;
-    let scene = match (sync.aux.take(), app.gpu.as_mut()) {
-        (Some(aux), Some(gpu_link)) => {
-            let sync_start_ms = crate::now_ms();
-            let visible_uv = sync.uv_size.zip(app.session.caches.get(app.session.ts())).map(|(size, cache)| {
-                visible_uv_bounds(size, cache.size, app.ui.uv_zoom, app.ui.uv_pan)
-            });
-            let scene = gpu_link.sync_view(&mut app.session, aux, bake, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms), visible_uv);
-            let reports = gpu_link.take_reports();
-            app.profiler.sync_ms += (crate::now_ms() - sync_start_ms) as f32;
-            gpu_report_toasts(app, reports);
-
-            // Display tiles left for later frames (the frame budget ran out), or the bake visualization still being worked out
-            if app.session.caches.iter().any(|cache| !cache.upload.is_empty()) || app.gpu.as_ref().is_some_and(crate::gpu::GpuLink::bake_busy) {
-                ui.ctx().request_repaint();
-            }
-            Some(scene)
-        }
-        _ => None,
-    };
-
     let Some(gpu) = &app.gpu else {
         ui.painter().text(
             rect.center(),
@@ -473,8 +475,14 @@ fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, mut frame: Frame
         return;
     };
 
-    let callback = ViewCallback { frame, sync: Mutex::new(scene), rect, lost: gpu.lost.clone() };
-    ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, callback));
+    let callback = ViewCallback { frame, sync: Mutex::new(None), rect, lost: gpu.lost.clone() };
+    if sync.first.is_none() {
+        let painter = ui.painter().clone();
+        let slot = painter.add(egui::Shape::Noop);
+        sync.first = Some((painter, slot, callback));
+    } else {
+        ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, callback));
+    }
 }
 
 /// Text size of the notice a view shows without a GPU renderer
@@ -2552,6 +2560,32 @@ fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, t
 mod tests {
     use super::*;
     use texturecraft_engine::paint::{AlphaParams, BrushAlpha, BrushSettings};
+
+    #[test]
+    fn split_view_uploads_the_second_views_brush_before_either_draw() {
+        let ctx = egui::Context::default();
+        let session = Session::new_project("split", texturecraft_engine::geom::primitives::plane(1.0, 1), "builtin:plane", None, 1024).unwrap();
+        let mut app = TextureCraftApp::new(&eframe::CreationContext::_new_kittest(ctx.clone()), session);
+        app.gpu = Some(crate::gpu::tests::link());
+        app.profiler.logic_ms = 100.0;
+        app.session.update();
+        let frame = Frame {
+            view_id: VIEW_3D, size: [256, 256], kind: ViewKind::Scene, camera: app.session.camera,
+            shade: Shade::default(), visible: vec![true], overlay: Vec::new(),
+        };
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let mut sync = PendingSync { uv_size: Some([256, 256]), ..Default::default() };
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(256.0, 256.0));
+            add_callback(&mut app, ui, rect, frame.clone(), &mut sync);
+            app.session.begin_stroke_uv(Vec2::splat(0.96875), 1.0).unwrap();
+            let uv_frame = Frame { view_id: VIEW_2D, kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0; 2] }, ..frame.clone() };
+            add_callback(&mut app, ui, rect.translate(vec2(256.0, 0.0)), uv_frame, &mut sync);
+            sync.finish(&mut app, ui, None);
+            assert!(!app.session.caches[0].upload.contains(&(15, 15)), "second view's dab must be in this frame");
+            assert!(!app.session.caches[0].upload.is_empty());
+        });
+        output.drop_without_applying_deltas();
+    }
 
     fn extent(points: &[Vec2]) -> Vec2 {
         let (low, high) = points.iter().fold((Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)), |(low, high), point| (low.min(*point), high.max(*point)));

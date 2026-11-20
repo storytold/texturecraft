@@ -1040,10 +1040,13 @@ impl Session {
             self.cache_active = active;
         }
         let changed = self.update_tiles(budget_ms, clock, active, demand);
-        if let Some(previous) = self.cache_previous {
+        if let Some(previous) = self.cache_previous.filter(|&ts| self.caches.get(ts).is_some_and(|c| !c.below.is_empty())) {
             // Retaining an idle material spends only the remainder of the normal band
             // budget. The active material always gets first use of that budget.
-            let spare = self.caches.get(active).map_or(0, |c| c.below.limit().saturating_sub(c.below.bytes()));
+            let allowance = self.caches.get(active).map_or(0, |c| c.below.limit());
+            // Instances in other sets can have live bands of their own.
+            let spare = self.caches.iter().enumerate().filter(|(ts, _)| *ts != previous)
+                .fold(allowance, |remaining, (_, cache)| remaining.saturating_sub(cache.below.bytes()));
             if let Some(cache) = self.caches.get_mut(previous)
                 && cache.below.bytes() > spare
             {

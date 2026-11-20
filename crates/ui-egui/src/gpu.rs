@@ -506,13 +506,13 @@ impl CallbackTrait for ViewCallback {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use texturecraft_engine::execute;
     use texturecraft_engine::geom::primitives;
 
-    fn link() -> GpuLink {
+    pub(crate) fn link() -> GpuLink {
         GpuLink {
             reset: Arc::default(),
             recreated: Arc::default(),
