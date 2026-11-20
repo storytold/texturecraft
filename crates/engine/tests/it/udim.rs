@@ -119,7 +119,8 @@ fn projects_round_trip_and_meshes_export_their_own_uvs() {
     assert!((max_u - 2.0).abs() < 1e-4, "{max_u}");
     // With its MTL: the same UVs, and no maps for the UV-tiled set (one image cannot hold them).
     let (with_mtl, files) = s.mesh_obj_with_mtl("plane").unwrap();
-    assert!(String::from_utf8(with_mtl).unwrap().ends_with(obj.split_once("\no ").unwrap().1));
+    let body = obj.strip_prefix("o ").or_else(|| obj.split_once("\no ").map(|(_, rest)| rest)).unwrap();
+    assert!(String::from_utf8(with_mtl).unwrap().ends_with(body));
     assert_eq!(files.len(), 1, "the MTL alone");
 }
 
