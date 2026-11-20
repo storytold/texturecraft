@@ -136,6 +136,7 @@ impl ResizeTask {
     /// Resample the set's painted pixels (bilinear; strokes are not replayed) and build its
     /// caches. Progress goes from 0 to 1.
     pub fn run(self, progress: &texturecraft_bake::Progress) -> Result<ResizeOutput> {
+        let start = chrono::Utc::now();
         let ResizeTask { ts, resolution, mut doc, mesh, from } = self;
         let set = doc.project.texture_set_mut(ts)?;
         let old = set.clone();
@@ -151,9 +152,18 @@ impl ResizeTask {
             crate::uv_tile_cmds::relayout(&mut doc, ts, &old, &mut log)?;
         }
         progress.done.store(3_000, std::sync::atomic::Ordering::Relaxed);
+        let resampled = chrono::Utc::now();
         let set = doc.project.texture_set(ts)?;
         let cache = (crate::session::uv_layout(&old) == crate::session::uv_layout(set)).then(|| SetCache::new(&mesh, set));
         progress.done.store(10_000, std::sync::atomic::Ordering::Relaxed);
+        log.performance(format!(
+            "CPU resize of texture set {} from {} to {}: paint resampling {} ms, UV cache {}",
+            ts + 1,
+            old.resolution,
+            resolution,
+            (resampled - start).num_milliseconds(),
+            if cache.is_some() { format!("{} ms", (chrono::Utc::now() - resampled).num_milliseconds()) } else { "rebuilt on apply".into() }
+        ));
         Ok(ResizeOutput { ts, resolution, doc, cache, log, from })
     }
 }

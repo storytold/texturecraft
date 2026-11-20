@@ -23,7 +23,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read> srgb: array<u32>;
 @group(0) @binding(3) var<storage, read_write> output: array<u32>;
 @group(0) @binding(4) var<storage, read> paint: array<u32>;
-@group(0) @binding(5) var<storage, read> island_padding: array<u32>;
+@group(0) @binding(5) var<storage, read> uv_coverage: array<u32>;
 
 fn pcg3d(cell: vec3<u32>) -> vec3<u32> {
     var v = cell * 1664525u + 1013904223u;
@@ -386,6 +386,62 @@ fn to_u16(v: f32) -> u32 {
     return u32(clamp(v, 0.0, 1.0) * 65535.0 + 0.5);
 }
 
+// Find a covered source within the padding radius. The CPU padding's breadth-first
+// search breaks equal Chebyshev distances in row-major source order.
+fn padded_source(pixel: vec2<u32>) -> vec2<u32> {
+    let pitch = params.coverage.y;
+    let radius = params.coverage.z;
+    let current = uv_coverage[pixel.y * pitch + pixel.x / 32u];
+    if (current & (1u << (pixel.x % 32u))) != 0u {
+        return pixel;
+    }
+
+    let left = pixel.x - min(pixel.x, radius);
+    let right = min(pixel.x + radius, params.source.x - 1u);
+    let start_word = left / 32u;
+    let start_bit = left % 32u;
+    let center = pixel.x - left;
+    let column_mask = (1u << (right - left + 1u)) - 1u;
+    let lower_columns = (1u << (center + 1u)) - 1u;
+    let top = pixel.y - min(pixel.y, radius);
+    let bottom = min(pixel.y + radius, params.source.y - 1u);
+    var best = params.source.xy;
+    var distance = radius + 1u;
+
+    for (var row = top; row <= bottom; row++) {
+        let dy = max(row, pixel.y) - min(row, pixel.y);
+        if dy >= distance {
+            continue;
+        }
+        let index = row * pitch + start_word;
+        var bits = uv_coverage[index] >> start_bit;
+        if right / 32u != start_word {
+            bits |= uv_coverage[index + 1u] << (32u - start_bit);
+        }
+        bits &= column_mask;
+        if bits == 0u {
+            continue;
+        }
+
+        let lower = bits & lower_columns;
+        let upper = bits & (0xffffffffu << center);
+        var dx = radius + 1u;
+        if lower != 0u {
+            dx = center - firstLeadingBit(lower);
+        }
+        if upper != 0u {
+            dx = min(dx, firstTrailingBit(upper) - center);
+        }
+        let candidate = max(dx, dy);
+        if candidate < distance {
+            distance = candidate;
+            let first = center - min(center, distance);
+            best = vec2(left + firstTrailingBit(bits & (0xffffffffu << first)), row);
+        }
+    }
+    return best;
+}
+
 @compute @workgroup_size(8, 8)
 fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= params.band.x || id.y >= params.band.y {
@@ -393,16 +449,10 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let display_pixel = vec2(id.x + params.program.w, id.y + params.band.z);
     var pixel = display_pixel * params.source.z;
-    var covered = true;
     if params.coverage.x != 0u {
-        let i = display_pixel.y * params.coverage.y + display_pixel.x;
-        let packed = (island_padding[i / 2u] >> ((i % 2u) * 16u)) & 65535u;
-        covered = packed != 65535u;
-        if covered {
-            let offset = vec2<i32>(i32(packed & 63u) - 31, i32(packed >> 6u) - 31);
-            pixel = vec2<u32>(vec2<i32>(pixel) + offset);
-        }
+        pixel = padded_source(pixel);
     }
+    let covered = all(pixel < params.source.xy);
     let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
     var base = vec3(0.5);
     var normal = vec3(0.5, 0.5, 1.0);

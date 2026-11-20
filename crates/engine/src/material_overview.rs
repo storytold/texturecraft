@@ -1,4 +1,6 @@
 //! A bounded, disposable material image for a viewport with a cold composite.
+use std::sync::Arc;
+
 use texturecraft_compose::{BakedMaps, Composite, DisplayKind, Inputs, all_tiles, composite_tiles, kinds_for, tile_bytes};
 use texturecraft_core::Channel;
 use texturecraft_geom::UvGBuffer;
@@ -37,7 +39,7 @@ impl Session {
         });
         let (tri, bary) =
             positions.map(|i| (source.tri.get(i).copied().unwrap_or(texturecraft_geom::NO_TRI), source.bary.get(i).copied().unwrap_or_default())).unzip();
-        let gbuf = UvGBuffer { width, height, tri, bary, overlaps: 0 };
+        let gbuf = Arc::new(UvGBuffer { width, height, tri, bary, overlaps: 0 });
         let empty = BakedMaps::default();
         let baked = self.doc.baked.get(&ts).unwrap_or(&empty);
         let channels = set.channel_list();

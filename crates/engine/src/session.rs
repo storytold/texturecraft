@@ -62,14 +62,14 @@ pub struct SetCache {
 impl SetCache {
     pub(crate) fn new(mesh: &Mesh, ts: &TextureSet) -> SetCache {
         let (w, h) = ts.size();
-        let gbuf = UvGBuffer::new(mesh, ts.material, w, h);
+        let gbuf = Arc::new(UvGBuffer::new(mesh, ts.material, w, h));
         // Padding stays inside each UV tile.
         let covered = covered_tiles(&gbuf);
         let dilation = DisplayPadding::new(&gbuf, !covered.is_empty(), ts.block_resolution());
         let all: BTreeSet<(u32, u32)> = texturecraft_compose::all_tiles(w, h).into_iter().collect();
         SetCache {
             size: (w, h),
-            gbuf: Arc::new(gbuf),
+            gbuf,
             dilation,
             covered_tiles: Arc::new(covered),
             composite: Composite { block_scales: ts.block_scales(), ..Composite::with_size(&ts.channel_list(), w, h) },

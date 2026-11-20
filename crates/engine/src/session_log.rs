@@ -7,6 +7,14 @@ use crate::{LogEntry, LogLevel};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionLog(Vec<LogEntry>);
 
+#[cfg(not(target_arch = "wasm32"))]
+static PERFORMANCE_LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn set_performance_log_path(path: std::path::PathBuf) {
+    let _ = PERFORMANCE_LOG.set(path);
+}
+
 impl SessionLog {
     pub fn new() -> SessionLog {
         SessionLog(Vec::new())
@@ -23,6 +31,22 @@ impl SessionLog {
 
     pub fn info(&mut self, source: &str, message: impl Into<String>) {
         self.0.push(LogEntry::new(LogLevel::Info, source, message));
+    }
+
+    /// Keep timings in the session log and, on desktop, in the local diagnostic log.
+    pub fn performance(&mut self, message: impl Into<String>) {
+        let entry = LogEntry::new(LogLevel::Info, "Performance", message);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = PERFORMANCE_LOG.get() {
+            use std::io::Write as _;
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "[{}] {}", entry.time.to_rfc3339(), entry.message);
+            }
+        }
+        self.0.push(entry);
     }
 
     pub fn warn(&mut self, source: &str, message: impl Into<String>) {
@@ -43,6 +67,11 @@ impl SessionLog {
     /// Append the entries of another store
     pub fn append(&mut self, other: SessionLog) {
         self.0.extend(other.0);
+    }
+
+    pub(crate) fn prepend(&mut self, mut earlier: SessionLog) {
+        earlier.0.append(&mut self.0);
+        self.0 = earlier.0;
     }
 
     pub fn clear(&mut self) {

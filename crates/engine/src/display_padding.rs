@@ -12,14 +12,18 @@ use crate::session::DISPLAY_PADDING;
 
 /// The viewport's padding map. Reading the dense map explicitly also works for uniform UVs.
 pub struct DisplayPadding {
-    dense: OnceLock<Arc<DilationMap>>,
+    dense: Arc<OnceLock<Arc<DilationMap>>>,
     size: (u32, u32),
+    mixed: Option<Arc<UvGBuffer>>,
+    block: u32,
+    #[cfg(not(target_arch = "wasm32"))]
+    worker_started: bool,
     /// All texels covered or all uncovered. Mixed coverage needs the ordinary dilation map.
     uniform: Option<bool>,
 }
 
 impl DisplayPadding {
-    pub(crate) fn new(gbuf: &UvGBuffer, has_coverage: bool, block: u32) -> Self {
+    pub(crate) fn new(gbuf: &Arc<UvGBuffer>, has_coverage: bool, block: u32) -> Self {
         let size = (gbuf.width, gbuf.height);
         let uniform = if !has_coverage {
             Some(false)
@@ -28,12 +32,16 @@ impl DisplayPadding {
         } else {
             None
         };
-        let dense = if uniform.is_none() {
-            Arc::new(DilationMap::in_blocks(&gbuf.coverage_mask(), size.0, size.1, Some(DISPLAY_PADDING), block)).into()
-        } else {
-            OnceLock::new()
-        };
-        Self { dense, size, uniform }
+        let mixed = uniform.is_none().then(|| Arc::clone(gbuf));
+        Self {
+            dense: Arc::default(),
+            size,
+            mixed,
+            block,
+            #[cfg(not(target_arch = "wasm32"))]
+            worker_started: false,
+            uniform,
+        }
     }
 
     pub(crate) fn apply_to_tiles(&self, output: &mut Composite, tiles: &[(u32, u32)]) -> BTreeSet<(u32, u32)> {
@@ -45,9 +53,29 @@ impl DisplayPadding {
         self.uniform == Some(true)
     }
 
-    /// Share existing island padding without constructing a dense map for uniform coverage.
-    pub fn existing_sources(&self) -> Option<Arc<DilationMap>> {
-        if self.uniform.is_none() { self.dense.get().cloned() } else { None }
+    /// Share the UV coverage so GPU display can calculate padding without the CPU map.
+    pub fn mixed_coverage(&self) -> Option<Arc<UvGBuffer>> {
+        self.mixed.clone()
+    }
+
+    /// Start the dense CPU fallback on a worker so the viewport can keep drawing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_on_worker(&mut self) -> bool {
+        let Some(gbuf) = self.mixed.as_ref() else { return true };
+        if self.dense.get().is_some() {
+            return true;
+        }
+        if !self.worker_started {
+            let (gbuf, dense, block) = (gbuf.clone(), self.dense.clone(), self.block);
+            self.worker_started = std::thread::Builder::new()
+                .name("texturecraft-padding".into())
+                .spawn(move || {
+                    dense.get_or_init(|| mixed_sources(&gbuf, block));
+                })
+                .is_ok();
+        }
+        // If creating a thread failed, let the caller prepare the map synchronously.
+        !self.worker_started
     }
 
     pub(crate) fn bytes(&self) -> usize {
@@ -61,9 +89,16 @@ impl Deref for DisplayPadding {
     fn deref(&self) -> &Self::Target {
         self.dense.get_or_init(|| {
             let (width, height) = self.size;
+            if let Some(gbuf) = &self.mixed {
+                return mixed_sources(gbuf, self.block);
+            }
             let n = width as usize * height as usize;
             let src = if self.uniform == Some(true) { (0..n as u32).collect() } else { vec![texturecraft_texel::dilate::NONE; n] };
             Arc::new(DilationMap { width, height, src })
         })
     }
+}
+
+fn mixed_sources(gbuf: &UvGBuffer, block: u32) -> Arc<DilationMap> {
+    Arc::new(DilationMap::in_blocks(&gbuf.coverage_mask(), gbuf.width, gbuf.height, Some(DISPLAY_PADDING), block))
 }

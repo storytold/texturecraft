@@ -384,6 +384,11 @@ fn drop_highlight(app: &TextureCraftApp, ui: &Ui, response: &egui::Response) -> 
 
 /// Show what the GPU side reported (each message once while its toast is up).
 fn gpu_report_toasts(app: &mut TextureCraftApp, reports: crate::gpu::GpuReports) {
+    for (mesh, message) in reports.performance {
+        if app.session.mesh_id == mesh {
+            app.session.log.performance(message);
+        }
+    }
     let names: Vec<String> = reports.memory.iter().filter_map(|ts| app.session.doc.project.texture_sets.get(*ts).map(|t| t.name.clone())).collect();
     if !names.is_empty() {
         // One sticky notice for every set the GPU could not hold (they are not retried, so the
@@ -463,7 +468,7 @@ impl PendingSync {
             visible_uv,
         );
         let reports = gpu.take_reports();
-        if gpu.display_pending(&app.session) || gpu.bake_busy() {
+        if scene.compositor_changed || gpu.display_pending(&app.session) || gpu.gpu_composite_pending() || gpu.bake_busy() {
             ui.ctx().request_repaint();
         }
         app.profiler.sync_ms += (crate::now_ms() - start) as f32;

@@ -6,7 +6,8 @@ use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
 use texturecraft_compose::PixelStore;
 use texturecraft_core::{BlendMode, Channel, Effect, EffectKind, Filter, LayerKind, MaskBackground, ProceduralKind, Project, Projection, Source};
-use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage};
+use texturecraft_geom::{NO_TRI, UvGBuffer};
+use texturecraft_texel::{TILE, TILE_AREA, TileImage};
 use wgpu::util::DeviceExt;
 
 const MAX_LAYERS: usize = 128;
@@ -75,7 +76,7 @@ pub struct CompositeProgram {
     layer_count: u32,
     paint: Vec<u32>,
     pub(crate) region: Option<CompositeRegion>,
-    pub(crate) coverage: Option<Arc<DilationMap>>,
+    coverage: Option<(Arc<UvGBuffer>, u32)>,
     pub(crate) writes_height: bool,
     pub(crate) writes_normal: bool,
 }
@@ -86,8 +87,8 @@ impl CompositeProgram {
     }
 
     /// Let the shader sample the nearest covered UV texel for island padding.
-    pub fn set_coverage(&mut self, coverage: Option<Arc<DilationMap>>) {
-        self.coverage = coverage;
+    pub fn set_coverage(&mut self, coverage: Arc<UvGBuffer>, radius: u32) {
+        self.coverage = Some((coverage, radius.min(15)));
     }
 
     /// A flat stack of sparse paint, solid and UV procedural fills, masks and point effects.
@@ -97,21 +98,29 @@ impl CompositeProgram {
     }
 
     pub fn compile_region(project: &Project, pixels: &PixelStore, ts: usize, region: Option<CompositeRegion>) -> Option<Self> {
+        Self::try_compile_region(project, pixels, ts, region).ok()
+    }
+
+    /// Also provide the reason the viewport must select its CPU compositor.
+    pub fn try_compile_region(project: &Project, pixels: &PixelStore, ts: usize, region: Option<CompositeRegion>) -> Result<Self, &'static str> {
         use Channel::*;
-        let set = project.texture_sets.get(ts)?;
-        if !set.uv_tiles.is_empty() || set.has_channel(Glossiness) {
-            return None;
+        let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
+        if !set.uv_tiles.is_empty() {
+            return Err("UDIM texture sets use CPU compositing.");
+        }
+        if set.has_channel(Glossiness) {
+            return Err("The Glossiness channel uses CPU compositing.");
         }
         let mut operations = Vec::new();
         let mut paint = vec![0];
         let mut effects = Vec::new();
         for id in &set.stack {
-            let layer = project.layers.get(id)?;
+            let layer = project.layers.get(id).ok_or("A layer is missing from the material.")?;
             if !layer.visible {
                 continue;
             }
             if layer.geometry_mask.is_some() || layer.height_mask.enabled {
-                return None;
+                return Err("A geometry or height mask uses CPU compositing.");
             }
             let mask = layer.mask.as_ref().filter(|m| m.enabled);
             let mask_start = effects.len() as u32;
@@ -119,18 +128,22 @@ impl CompositeProgram {
             if let Some(mask) = mask {
                 for effect in mask.effects.iter().filter(|e| e.visible) {
                     let mut op = match &effect.kind {
-                        EffectKind::Fill { source, projection } => source_operation(Some(source), projection, [0.0; 3])?,
+                        EffectKind::Fill { source, projection } => {
+                            source_operation(Some(source), projection, [0.0; 3]).ok_or("A mask fill source or projection uses CPU compositing.")?
+                        }
                         EffectKind::Paint | EffectKind::Path(_) => {
                             let Some(image) = pixels.masks.get(&effect.id).filter(|im| im.allocated_count() > 0) else { continue };
                             if (image.width(), image.height()) != set.size() || image.comps() != 2 {
-                                return None;
+                                return Err("A painted mask has a layout that uses CPU compositing.");
                             }
-                            Operation { ids: [0, 10, pack_paint(&mut paint, image, region.map(|r| r.expanded(TILE)))?, 2], ..Operation::zeroed() }
+                            let offset =
+                                pack_paint(&mut paint, image, region.map(|r| r.expanded(TILE))).ok_or("The painted material exceeds the GPU upload budget.")?;
+                            Operation { ids: [0, 10, offset, 2], ..Operation::zeroed() }
                         }
-                        _ => point_effect(effect)?,
+                        _ => point_effect(effect).ok_or("A mask effect uses CPU compositing.")?,
                     };
                     if !effect.opacity.is_finite() {
-                        return None;
+                        return Err("A mask effect has an invalid opacity.");
                     }
                     op.low[3] = effect.opacity.clamp(0.0, 1.0);
                     op.balance[2] = blend_code(effect.blend) as f32;
@@ -143,22 +156,22 @@ impl CompositeProgram {
                 continue;
             }
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
-                effects.push(point_effect(effect)?);
+                effects.push(point_effect(effect).ok_or("A layer effect uses CPU compositing.")?);
             }
             let content_count = effects.len() as u32 - content_start;
             if effects.len() > MAX_EFFECTS {
-                return None;
+                return Err("The number of effects exceeds the GPU compositor limit.");
             }
             let fill = match &layer.kind {
                 LayerKind::Fill(fill) => Some(fill),
                 LayerKind::Paint => None,
-                _ => return None,
+                _ => return Err("A group or another layer type uses CPU compositing."),
             };
             if fill.is_some_and(|fill| {
                 matches!(fill.projection, Projection::Decal(_))
                     || fill.sources.values().any(|source| !matches!(source, Source::Uniform(_) | Source::Procedural { .. }))
             }) {
-                return None;
+                return Err("An image source or decal uses CPU compositing.");
             }
 
             for &(channel, _) in &set.channels {
@@ -167,12 +180,12 @@ impl CompositeProgram {
                     continue;
                 }
                 if !blend.opacity.is_finite() {
-                    return None;
+                    return Err("A layer has an invalid opacity.");
                 }
                 let painted = if fill.is_none() {
                     let Some(image) = pixels.layer(*id, channel).filter(|img| img.allocated_count() > 0) else { continue };
                     if (image.width(), image.height()) != set.size() || image.comps() != channel.components() + 1 {
-                        return None;
+                        return Err("A paint layer has a layout that uses CPU compositing.");
                     }
                     Some(image)
                 } else {
@@ -196,12 +209,14 @@ impl CompositeProgram {
                     {
                         continue;
                     }
-                    _ => return None,
+                    _ => return Err("A channel in the layer stack uses CPU compositing."),
                 };
                 let mut op = if let Some(image) = painted {
-                    Operation { ids: [slot, 10, pack_paint(&mut paint, image, region.map(|r| r.expanded(TILE)))?, image.comps() as u32], ..Operation::zeroed() }
+                    let offset =
+                        pack_paint(&mut paint, image, region.map(|r| r.expanded(TILE))).ok_or("The painted material exceeds the GPU upload budget.")?;
+                    Operation { ids: [slot, 10, offset, image.comps() as u32], ..Operation::zeroed() }
                 } else {
-                    source_operation(source, &fill?.projection, default)?
+                    fill.and_then(|fill| source_operation(source, &fill.projection, default)).ok_or("A fill source or projection uses CPU compositing.")?
                 };
                 op.ids[0] = slot;
                 op.low[3] = blend.opacity.min(1.0);
@@ -209,13 +224,13 @@ impl CompositeProgram {
                 op.balance[2] = blend_code(blend.mode) as f32;
                 op.effects = [mask_start, mask_count, content_start, content_count];
                 if operations.len() == MAX_LAYERS {
-                    return None;
+                    return Err("The number of layer channels exceeds the GPU compositor limit.");
                 }
                 operations.push(op);
             }
         }
         if operations.is_empty() {
-            return None;
+            return Err("The layer stack has no visible material inputs.");
         }
         let changes_channel = |slot, default: [f32; 3]| {
             operations
@@ -226,7 +241,7 @@ impl CompositeProgram {
         let writes_normal = changes_channel(7, Normal.default_value());
         let layer_count = operations.len() as u32;
         operations.extend(effects);
-        Some(Self { operations, layer_count, paint, region, coverage: None, writes_height, writes_normal })
+        Ok(Self { operations, layer_count, paint, region, coverage: None, writes_height, writes_normal })
     }
 }
 
@@ -363,11 +378,15 @@ fn pack_paint(dst: &mut Vec<u32>, image: &TileImage, region: Option<CompositeReg
     Some(table as u32)
 }
 
+fn coverage_word(triangles: &[u32]) -> u32 {
+    triangles.iter().enumerate().fold(0, |word, (bit, &triangle)| word | (u32::from(triangle != NO_TRI) << bit))
+}
+
 pub(crate) struct GpuCompositor {
     pipeline: wgpu::ComputePipeline,
     lookup: wgpu::Buffer,
     uniform_coverage: wgpu::Buffer,
-    coverage: Option<(Weak<DilationMap>, u32, wgpu::Buffer)>,
+    coverage: Option<(Weak<UvGBuffer>, wgpu::Buffer)>,
 }
 
 impl GpuCompositor {
@@ -406,46 +425,40 @@ impl GpuCompositor {
         Self { pipeline, lookup, uniform_coverage, coverage: None }
     }
 
-    fn coverage_buffer(&mut self, device: &wgpu::Device, map: Option<&Arc<DilationMap>>, shift: u32, size: (u32, u32)) -> Result<wgpu::Buffer, String> {
+    fn coverage_buffer(&mut self, device: &wgpu::Device, map: Option<&Arc<UvGBuffer>>) -> Result<wgpu::Buffer, String> {
         let Some(map) = map else { return Ok(self.uniform_coverage.clone()) };
         let key = Arc::downgrade(map);
-        if let Some((cached, last_shift, buffer)) = &self.coverage
+        if let Some((cached, buffer)) = &self.coverage
             && key.ptr_eq(cached)
-            && shift == *last_shift
         {
             return Ok(buffer.clone());
         }
-        let (w, h) = (size.0 as usize, size.1 as usize);
-        let count = (w * h).div_ceil(2);
+        let width = map.width as usize;
+        let words_per_row = width.div_ceil(32);
+        let count = words_per_row * map.height as usize;
         let limits = device.limits();
         if (count * 4) as u64 > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
             return Err("UV padding data exceeds the adapter's storage-buffer limit".into());
         }
-        let sample = |i: usize| -> Option<u32> {
-            if i >= w * h {
-                return Some(0xffff);
-            }
-            let (x, y) = (((i % w) as u32) << shift, ((i / w) as u32) << shift);
-            let Some((sx, sy)) = map.source(x, y) else { return Some(0xffff) };
-            let (dx, dy) = (sx as i32 - x as i32, sy as i32 - y as i32);
-            if !(-31..=31).contains(&dx) || !(-31..=31).contains(&dy) {
-                return None;
-            }
-            Some(((dx + 31) as u32) | (((dy + 31) as u32) << 6))
+        // Each word packs 32 coverage samples. The same buffer serves every display resolution.
+        let words: Vec<u32> = if width.is_multiple_of(32) {
+            map.tri.par_chunks(32).map(coverage_word).collect()
+        } else {
+            (0..count)
+                .into_par_iter()
+                .map(|i| {
+                    let row = i / words_per_row * width;
+                    let start = row + i % words_per_row * 32;
+                    coverage_word(&map.tri[start..(start + 32).min(row + width)])
+                })
+                .collect()
         };
-        // Store two offset pairs per word. The source atlas already owns its exact, dense
-        // padding map. A reduced viewport only uploads offsets for the texels it will sample.
-        let words: Vec<u32> = (0..count)
-            .into_par_iter()
-            .map(|i| Some(sample(2 * i)? | (sample(2 * i + 1)? << 16)))
-            .collect::<Option<_>>()
-            .ok_or("UV padding exceeds the shader's offset range")?;
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tc_composite_coverage"),
             contents: bytemuck::cast_slice(&words),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        self.coverage = Some((key, shift, buffer.clone()));
+        self.coverage = Some((key, buffer.clone()));
         Ok(buffer)
     }
 
@@ -461,7 +474,7 @@ impl GpuCompositor {
         textures: [&wgpu::Texture; 4],
     ) -> Result<(), String> {
         let extent = (textures[0].width(), textures[0].height());
-        let coverage = self.coverage_buffer(device, program.coverage.as_ref(), shift, extent)?;
+        let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let region = program.region.map(|r| r.viewport(shift, extent)).unwrap_or(CompositeRegion { min: [0; 2], max: [extent.0, extent.1] });
         let [left, start_y] = region.min;
         let width = region.max[0].saturating_sub(left);
@@ -515,8 +528,8 @@ impl GpuCompositor {
                 u32::from(program.writes_normal),
                 left,
                 u32::from(program.coverage.is_some()),
-                extent.0,
-                0,
+                source_size.0.div_ceil(32),
+                program.coverage.as_ref().map_or(0, |(_, radius)| *radius),
                 0,
             ];
             let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

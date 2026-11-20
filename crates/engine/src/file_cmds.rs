@@ -192,11 +192,17 @@ impl Session {
 
     /// Open a `.tcraft` project from bytes.
     pub fn from_project_bytes(bytes: &[u8]) -> Result<Session> {
+        let start = chrono::Utc::now();
         let pf = texturecraft_formats::load_project_bytes(bytes).map_err(fe)?;
-        Session::from_project_file(pf)
+        let mut log = crate::SessionLog::new();
+        log.performance(format!("CPU project archive decoded in {} ms", (chrono::Utc::now() - start).num_milliseconds()));
+        let mut session = Session::from_project_file(pf)?;
+        session.log.prepend(log);
+        Ok(session)
     }
 
     pub fn from_project_file(pf: ProjectFile) -> Result<Session> {
+        let start = chrono::Utc::now();
         let mesh = match (&pf.mesh, pf.project.mesh.strip_prefix("builtin:")) {
             (_, Some(id)) => primitives::builtin(id).ok_or_else(|| EngineError::Other(format!("unknown built-in mesh `{id}`")))?,
             (Some((ext, bytes)), None) => read_stored_mesh(&pf.project, ext, bytes)?.mesh,
@@ -206,13 +212,22 @@ impl Session {
         check_materials(&pf.project, &mesh)?;
         let source = pf.mesh.clone();
         let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
+        let mesh_time = chrono::Utc::now();
         let mut s =
             Session::new(Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources }, mesh, source)?;
 
+        let cache_time = chrono::Utc::now();
         s.sync_images();
         s.load_bake_meshes(pf.high_poly, pf.cage);
         s.load_bake_paint(pf.bake_paint);
         s.log.warnings("Project", pf.warnings);
+        s.log.performance(format!(
+            "CPU project setup: mesh {} ms, UV and mesh indexes {} ms, resources {} ms ({} texture sets)",
+            (mesh_time - start).num_milliseconds(),
+            (cache_time - mesh_time).num_milliseconds(),
+            (chrono::Utc::now() - cache_time).num_milliseconds(),
+            s.caches.len()
+        ));
 
         Ok(s)
     }
@@ -469,8 +484,12 @@ mod native {
     pub fn open_path(path: &str) -> Result<Session> {
         let p = Path::new(path);
         if ext_of(path) == PROJECT_EXT {
+            let start = chrono::Utc::now();
             let pf = texturecraft_formats::load_project(p).map_err(fe)?;
+            let mut log = crate::SessionLog::new();
+            log.performance(format!("CPU project archive read and decoded in {} ms", (chrono::Utc::now() - start).num_milliseconds()));
             let mut s = Session::from_project_file(pf)?;
+            s.log.prepend(log);
             s.path = Some(path.to_string());
             s.modified = false;
             Ok(s)
