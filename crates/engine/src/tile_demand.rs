@@ -55,6 +55,11 @@ impl Session {
 }
 
 impl TileDemand {
+    /// A live brush or a released dab still waiting to be displayed.
+    pub fn has_brush(self) -> bool {
+        self.brush.is_some()
+    }
+
     /// Whether the active set has a brush point or a proper subset of visible tiles.
     pub fn focused(self) -> bool {
         self.brush.is_some() || self.visible.is_some()

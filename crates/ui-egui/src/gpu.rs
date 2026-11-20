@@ -43,6 +43,7 @@ pub struct SceneSync {
     pub env: Option<(String, Option<Arc<ImageRes>>)>,
     /// Reduction applied when preparing each display tile.
     pub tile_shift: u32,
+    pub overview: Option<(usize, texturecraft_engine::MaterialOverview)>,
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
     pub aux: Vec<(usize, u32, Vec<u8>)>,
     /// One image buffer per resolution, with all texture sets that need it.
@@ -59,11 +60,26 @@ pub struct SceneSync {
     pub missing_seams: Option<(u64, MissingSeamEdges)>,
 }
 
+impl SceneSync {
+    fn apply_display(&self, renderer: &mut Renderer, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<usize> {
+        let mut reset = Vec::new();
+        if let Some((sets, material_count, shift)) = &self.sets {
+            renderer.set_display_shift(*shift);
+            reset = renderer.set_texture_sets(device, queue, sets, *material_count);
+        }
+        if let Some((ts, overview)) = &self.overview {
+            renderer.seed_display(device, queue, *ts, overview.size, &overview.maps);
+        }
+        for (texture_set, kind, tile_x, tile_y, bytes) in &self.tiles {
+            renderer.upload_display_tile(device, queue, *texture_set, *kind, *tile_x, *tile_y, bytes, self.tile_shift);
+        }
+        reset
+    }
+}
+
 /// Lives in egui's callback resources.
 pub struct GpuState {
     pub renderer: Renderer,
-    /// Raised when texture-set textures were recreated: the UI must upload every tile again.
-    pub reset: Arc<AtomicBool>,
     /// Recreated sets and the display kinds uploaded since recreation, for [`GpuLink`].
     pub recreated: Arc<Mutex<BTreeMap<usize, BTreeSet<DisplayKind>>>>,
     pub reports: Arc<Mutex<GpuReports>>,
@@ -112,6 +128,7 @@ pub struct GpuLink {
     composite_total: usize,
     /// Next set to serve when the last frame exhausted the shared upload budget.
     upload_cursor: Option<usize>,
+    pending_overviews: BTreeSet<usize>,
     bake_scene: BakeSceneLink,
 }
 
@@ -148,13 +165,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         wake.request_repaint();
     }));
     let renderer = Renderer::new(&rs.device, &rs.queue, rs.target_format);
-    rs.renderer.write().callback_resources.insert(GpuState {
-        renderer,
-        reset: reset.clone(),
-        recreated: recreated.clone(),
-        reports: reports.clone(),
-        ctx: ctx.clone(),
-    });
+    rs.renderer.write().callback_resources.insert(GpuState { renderer, recreated: recreated.clone(), reports: reports.clone(), ctx: ctx.clone() });
     let info = rs.adapter.get_info();
     GpuLink {
         reset,
@@ -171,6 +182,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         adapter: format!("{} ({:?})", info.name, info.backend),
         composite_total: 0,
         upload_cursor: None,
+        pending_overviews: BTreeSet::new(),
         bake_scene: BakeSceneLink::default(),
     }
 }
@@ -212,7 +224,6 @@ impl GpuLink {
         let pending = session.pending_tiles();
         self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
         let demand = session.tile_demand(visible_uv);
-        session.update_for_view(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms, demand);
 
         let mut out = SceneSync { tile_shift: shift.min(texturecraft_engine::texel::TILE.ilog2()), ..Default::default() };
         if self.lost.swap(false, Ordering::AcqRel) {
@@ -230,7 +241,21 @@ impl GpuLink {
         }
 
         let sets: Vec<SetLayout> = session.doc.project.texture_sets.iter().map(|texture_set| (texture_set.size(), texture_set.material)).collect();
-        if sets != self.sets || shift != self.shift || out.mesh.is_some() {
+        let resend = self.reset.swap(false, Ordering::AcqRel);
+        if resend || sets != self.sets || shift != self.shift || out.mesh.is_some() {
+            self.pending_overviews.retain(|&ts| ts < sets.len());
+            for (ts, layout) in sets.iter().enumerate() {
+                if resend || out.mesh.is_some() || self.shift != shift || self.sets.get(ts) != Some(layout) {
+                    let Some(cache) = session.caches.get_mut(ts) else { continue };
+                    // The renderer may recreate these textures. Dirty tiles will enter the
+                    // upload queue after composition; sending them now sends blank pixels.
+                    cache.queue_ready_uploads();
+                    self.pending_overviews.remove(&ts);
+                    if cache.dirty.len() >= UPLOAD_CHUNK {
+                        self.pending_overviews.insert(ts);
+                    }
+                }
+            }
             // Retained GPU sets need their prior kinds to overwrite stale textures
             self.sent.retain(|&texture_set, _| texture_set < sets.len());
 
@@ -249,12 +274,6 @@ impl GpuLink {
             out.env = Some((display.environment.clone(), image.cloned()));
         }
 
-        if self.reset.swap(false, Ordering::AcqRel) {
-            for cache in &mut session.caches {
-                cache.upload.extend(texturecraft_engine::compose::all_tiles(cache.size.0, cache.size.1));
-            }
-            self.aux.clear();
-        }
         for (texture_set, kinds) in std::mem::take(&mut *self.recreated.lock().unwrap_or_else(PoisonError::into_inner)) {
             if texture_set < self.sets.len() {
                 self.sent.insert(texture_set, kinds);
@@ -263,6 +282,19 @@ impl GpuLink {
 
         let count = session.caches.len();
         let active = session.ts();
+        // At most one small full-atlas evaluation per frame, active material first.
+        let next_overview = if self.pending_overviews.remove(&active) { Some(active) } else { self.pending_overviews.pop_first() };
+        if let Some(ts) = next_overview
+            && !(ts == active && demand.has_brush())
+            && !session.caches[ts].dirty.is_empty()
+            && let Some(overview) = session.material_overview(ts, 128)
+        {
+            self.sent.entry(ts).or_default().extend(overview.maps.iter().map(|(kind, _)| *kind));
+            out.overview = Some((ts, overview));
+        }
+        if out.overview.is_none() || demand.has_brush() {
+            session.update_for_view(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms, demand);
+        }
         let first = self.upload_cursor.take().filter(|&set| set < count && out.mesh.is_none()).unwrap_or(active);
         let rotation = (first..count).chain(0..first.min(count));
         // While painting, share the first chunk with the next waiting set. An overloaded
@@ -272,7 +304,7 @@ impl GpuLink {
         let order = boost.then_some((active, true)).into_iter().chain(rotation.map(|set| (set, false)));
         'uploads: for (texture_set, boosted) in order {
             let cache = &mut session.caches[texture_set];
-            if cache.upload.is_empty() {
+            if cache.upload.is_empty() || self.pending_overviews.contains(&texture_set) {
                 continue;
             }
             let empty = Default::default();
@@ -418,6 +450,11 @@ fn record_recreated_uploads(recreated: &mut BTreeMap<usize, BTreeSet<DisplayKind
         return;
     }
 
+    if let Some((ts, overview)) = &sync.overview
+        && let Some(kinds) = recreated.get_mut(ts)
+    {
+        kinds.extend(overview.maps.iter().map(|(kind, _)| *kind));
+    }
     for (texture_set, kind, _, _, _) in &sync.tiles {
         if let Some(kinds) = recreated.get_mut(texture_set) {
             kinds.insert(*kind);
@@ -467,18 +504,8 @@ impl CallbackTrait for ViewCallback {
             if let Some((mesh, id)) = &sync.mesh {
                 gpu.renderer.set_mesh(device, queue, mesh, *id);
             }
-            let mut reset = Vec::new();
-            if let Some((sets, material_count, shift)) = &sync.sets {
-                gpu.renderer.set_display_shift(*shift);
-                reset = gpu.renderer.set_texture_sets(device, queue, sets, *material_count);
-            }
-            for (texture_set, kind, tile_x, tile_y, bytes) in &sync.tiles {
-                gpu.renderer.upload_display_tile(device, queue, *texture_set, *kind, *tile_x, *tile_y, bytes, sync.tile_shift);
-            }
+            let reset = sync.apply_display(&mut gpu.renderer, device, queue);
             record_recreated_uploads(&mut gpu.recreated.lock().unwrap_or_else(PoisonError::into_inner), &reset, &sync);
-            if !reset.is_empty() {
-                gpu.reset.store(true, Ordering::Release);
-            }
             for (texture_set, size, bytes) in &sync.aux {
                 gpu.renderer.upload_aux(device, queue, *texture_set, *size, bytes);
             }
@@ -576,6 +603,7 @@ pub(crate) mod tests {
             adapter: String::new(),
             composite_total: 0,
             upload_cursor: None,
+            pending_overviews: BTreeSet::new(),
             bake_scene: BakeSceneLink::default(),
         }
     }
@@ -795,7 +823,8 @@ pub(crate) mod tests {
         for shift in 0..=TILE.ilog2() {
             s.caches[0].upload = [(1, 0)].into();
             let scene = gpu.sync(&mut s, None, None, shift, 0.0);
-            assert_eq!(scene.tiles.len(), DisplayKind::ALL.len());
+            // Changing the display scale recreates the set, including the other ready tiles.
+            assert_eq!(scene.tiles.iter().filter(|(_, _, x, y, _)| (*x, *y) == (1, 0)).count(), DisplayKind::ALL.len());
             for (_, kind, x, y, bytes) in &scene.tiles {
                 let full = tile_bytes(&s.caches[0].composite, &Default::default(), *kind, *x, *y);
                 let step = 1usize << shift;
@@ -804,6 +833,59 @@ pub(crate) mod tests {
                 let expected: Vec<_> = rows.flat_map(|row| row.chunks_exact(stride).step_by(step).flatten().copied()).collect();
                 assert!(bytes == &expected, "{kind:?} at shift {shift}");
             }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn opening_and_resizing_show_the_whole_material_before_detail_arrives() {
+        use texturecraft_render::{Shade, ViewKind, headless::Headless};
+        let mut source = Session::new_project("overview", primitives::plane(1.0, 1), "builtin:plane", None, 1024).unwrap();
+        execute(&mut source, "layer.add.fill", &json!({"color":[1.0, 0.0, 0.0]})).unwrap();
+        let mut s = Session::from_project_bytes(&source.to_project_bytes().unwrap()).unwrap();
+        let mut gpu = link();
+        let Ok(mut h) = Headless::new() else { return };
+        let frame = Frame {
+            view_id: 2,
+            size: [128, 128],
+            kind: ViewKind::Uv { ts: 0, zoom: 1.0 / 0.92, pan: [0.0; 2], rotation: 0.0 },
+            camera: s.camera,
+            shade: Shade { view_mode: 1, channel: 0, ..Default::default() },
+            visible: vec![true],
+            overlay: vec![],
+        };
+        for size in [1024, 2048] {
+            if size != 1024 {
+                execute(&mut s, "textureSet.resolution", &json!({"resolution":size})).unwrap();
+            }
+            let mut frames = 0;
+            loop {
+                let scene = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
+                if let Some((mesh, id)) = &scene.mesh {
+                    h.renderer.set_mesh(&h.device, &h.queue, mesh, *id);
+                }
+                let reset = scene.apply_display(&mut h.renderer, &h.device, &h.queue);
+                record_recreated_uploads(&mut gpu.recreated.lock().unwrap(), &reset, &scene);
+                frames += 1;
+                let ready = s.pending_tiles() == 0 && s.caches[0].upload.is_empty();
+                if frames <= 2 || ready {
+                    let (w, height, rgba) = h.render(&frame).unwrap();
+                    for fy in [0.1, 0.5, 0.9] {
+                        for fx in [0.1, 0.5, 0.9] {
+                            let i = ((((height as f32 * fy) as u32) * w + (w as f32 * fx) as u32) * 4) as usize;
+                            assert!(rgba[i] > rgba[i + 1].saturating_add(64), "missing material on frame {frames} at {fx}, {fy}");
+                        }
+                    }
+                    if frames == 1 {
+                        assert!(!ready, "read back before the detailed tiles are ready");
+                    }
+                }
+                if ready {
+                    break;
+                }
+                assert!(frames < 2048);
+            }
+            println!("{size}: whole material visible on first rendered frame, detail finished after {frames} syncs");
         }
     }
 

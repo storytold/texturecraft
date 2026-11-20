@@ -35,6 +35,8 @@ pub mod mask_cmds;
 pub mod mask_export;
 mod mask_preview_pixel;
 pub mod material_lib;
+mod material_overview;
+pub use material_overview::MaterialOverview;
 mod material_preview_pixel;
 pub mod materials;
 pub mod materialx_cmds;

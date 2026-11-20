@@ -1523,6 +1523,55 @@ impl Renderer {
         reset
     }
 
+    /// Present a bounded image of the entire material until the detailed tiles arrive.
+    /// Retire old project textures even when the next project has the same dimensions.
+    pub fn seed_display(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, size: (u32, u32), maps: &[(DisplayKind, Vec<u8>)]) {
+        let Some(set) = self.sets.get(ts) else { return };
+        let target = display_dims(set.size, set.shift);
+        if size.0 == 0 || size.1 == 0 || size.0.max(size.1) > 256 || size.0 > target.0 || size.1 > target.1 {
+            return;
+        }
+        for (kind, _) in maps {
+            self.ensure_mip_pipeline(device, display_format(*kind));
+        }
+        let Some(set) = self.sets.get_mut(ts) else { return };
+        let textures = checked(device, "material overview", || {
+            DisplayKind::ALL
+                .iter()
+                .zip(&self.default_texels)
+                .map(|(&kind, neutral)| {
+                    let stride = kind.bytes_per_texel();
+                    let pixels = maps
+                        .iter()
+                        .find(|(k, _)| *k == kind)
+                        .map(|(_, v)| v.as_slice())
+                        .filter(|v| v.len() == size.0 as usize * size.1 as usize * stride && !v.chunks_exact(stride).all(|p| p == neutral));
+                    let (w, h) = if pixels.is_some() { size } else { (1, 1) };
+                    let levels = if (w, h) == target { mip_count(w.max(h)) } else { 1 };
+                    let tex = Tex::new(device, "tc_overview", w, h, display_format(kind), levels);
+                    queue.write_texture(
+                        tex.texture.as_image_copy(),
+                        pixels.unwrap_or(neutral),
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * stride as u32), rows_per_image: None },
+                        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    );
+                    tex
+                })
+                .collect::<Vec<_>>()
+        });
+        // The overview is optional. If allocation fails or validation is asynchronous,
+        // detailed uploads continue through the ordinary renderer.
+        if let Checked::Done(Ok(textures)) = textures {
+            for (i, texture) in textures.into_iter().enumerate() {
+                set.mips_dirty[i] = if texture.mips > 1 { MipsDirty::All } else { MipsDirty::Clean };
+                set.tex[i] = texture;
+                set.pending[i] = None;
+            }
+            set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
+            self.content_rev += 1;
+        }
+    }
+
     /// Upload one 64×64 tile of a display texture (bytes from `compose::tile_bytes`).
     #[allow(clippy::too_many_arguments)]
     pub fn upload_tile(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, kind: DisplayKind, tile_x: u32, tile_y: u32, bytes: &[u8]) {
@@ -1562,14 +1611,34 @@ impl Renderer {
         let display_size = display_dims(set.size, set.shift);
         let allocation_pending = set.pending.get(kind_index).is_some_and(Option::is_some);
         if !allocation_pending && (texture.texture.width() < display_size.0 || texture.texture.height() < display_size.1) {
-            // A neutral tile needs no full-size texture allocation
-            if set.failed.get(kind_index).copied().unwrap_or(true) || bytes.chunks_exact(texel.len()).all(|px| px == texel.as_slice()) {
+            // A neutral tile can still replace non-neutral pixels from the overview.
+            let has_overview = texture.texture.width() > 1 || texture.texture.height() > 1;
+            if set.failed.get(kind_index).copied().unwrap_or(true) || (!has_overview && bytes.chunks_exact(texel.len()).all(|px| px == texel.as_slice())) {
                 return;
             }
 
             let allocation_label = format!("texture set {} ({kind:?}, {}×{})", texture_set + 1, display_size.0, display_size.1);
             let full_texture = checked(device, &allocation_label, || {
-                neutral_tex(device, queue, display_size, display_format(kind), mip_count(display_size.0.max(display_size.1)), texel)
+                let format = display_format(kind);
+                let mips = mip_count(display_size.0.max(display_size.1));
+                if has_overview && let Some(pipe) = self.mip_pipelines.get(&format) {
+                    let full = Tex::new(device, "tc_set", display_size.0, display_size.1, format, mips);
+                    let dst = full.texture.create_view(&wgpu::TextureViewDescriptor { mip_level_count: Some(1), ..Default::default() });
+                    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("tc_overview_enlarge"),
+                        layout: &self.mip_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&texture.view) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                        ],
+                    });
+                    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                    mip_pass(&mut encoder, "tc_overview_enlarge", &dst, pipe, &group, None);
+                    queue.submit([encoder.finish()]);
+                    full
+                } else {
+                    neutral_tex(device, queue, display_size, format, mips, texel)
+                }
             });
             if !grow(set, texture_set, kind_index, full_texture, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
                 return;
@@ -2775,6 +2844,28 @@ mod tests {
 
         assert_eq!(headless.renderer.content_rev, revision);
         assert_eq!(headless.renderer.display_textures()[0][0].width(), 1);
+    }
+
+    #[test]
+    fn a_neutral_detail_tile_replaces_only_its_part_of_the_material_overview() {
+        let Ok(mut h) = Headless::new() else { return };
+        let kind = DisplayKind::BaseColor;
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let mut preview = red.repeat(64 * 32);
+        preview.extend(blue.repeat(64 * 32));
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((256, 256), 0)], 1);
+        h.renderer.seed_display(&h.device, &h.queue, 0, (64, 64), &[(kind, preview)]);
+        let neutral = kind.default_texel();
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 0, 0, &neutral.repeat(64 * 64));
+        let index = DisplayKind::ALL.iter().position(|k| *k == kind).unwrap();
+        let tex = h.renderer.display_textures()[0][index];
+        let (w, height, pixels) = crate::readback::Readback::blocking_level(&h.device, &h.queue, tex, 0).unwrap();
+        assert_eq!((w, height), (256, 256));
+        let pixel = |x: usize, y: usize| &pixels[(y * 256 + x) * 4..(y * 256 + x + 1) * 4];
+        assert_eq!(pixel(32, 32), neutral);
+        assert_eq!(pixel(128, 32), red);
+        assert_eq!(pixel(128, 224), blue);
     }
 
     /// Every mip level below 0 of the `kind` texture of set 0.

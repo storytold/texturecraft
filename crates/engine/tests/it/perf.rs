@@ -613,3 +613,76 @@ fn bench_filtered_mask_edits() {
         println!("{phase}: {} samples, CPU display ready P50 {:.2?}, P95 {:.2?}, {} pending tiles at median", times.len(), p50.0, p95.0, p50.1);
     }
 }
+
+/// First whole-material image after opening a saved project or resizing its texture set.
+/// Compare overview sizes without warming the full-resolution layer cache.
+#[test]
+#[ignore = "material overview benchmark"]
+fn bench_open_resize_overview() {
+    let source = stack(1024).to_project_bytes().unwrap();
+    let started = Instant::now();
+    let mut session = Session::from_project_bytes(&source).unwrap();
+    println!("open 1K document and build UV cache: {:?}", started.elapsed());
+    for size in [1024, 4096] {
+        if size != 1024 {
+            let started = Instant::now();
+            execute(&mut session, "textureSet.resolution", &json!({"resolution":size})).unwrap();
+            println!("resize to {size} and build UV cache: {:?}", started.elapsed());
+        }
+        let pending = session.pending_tiles();
+        for edge in [128, 256, 256, 128] {
+            let started = Instant::now();
+            let preview = session.material_overview(0, edge).unwrap();
+            println!("{size} -> {edge} whole atlas: {:?}, {} bytes", started.elapsed(), preview.maps.iter().map(|(_, bytes)| bytes.len()).sum::<usize>());
+            assert_eq!(pending, session.pending_tiles());
+        }
+        let started = Instant::now();
+        session.update();
+        println!("{size} full-resolution CPU composite: {:?}", started.elapsed());
+    }
+}
+
+/// Batch the same 64px storage tiles into larger square CPU jobs for a cold 1K composite.
+/// Each run reads the same layer stack, with no cross-job filter lookahead or GPU work.
+#[test]
+#[ignore = "compositing work size benchmark"]
+fn bench_cold_work_regions() {
+    use texturecraft_engine::compose::{BakedMaps, BelowCache, Composite, Inputs, composite_tiles_cached};
+    let session = stack(1024);
+    let cache = &session.caches[0];
+    let set = &session.doc.project.texture_sets[0];
+    let empty = BakedMaps::default();
+    let inputs = Inputs {
+        project: &session.doc.project,
+        ts: 0,
+        mesh: &session.mesh,
+        gbuf: &cache.gbuf,
+        pixels: &session.doc.pixels,
+        baked: session.doc.baked.get(&0).unwrap_or(&empty),
+        block_scales: set.block_scales(),
+        preview: None,
+        images: &session.images,
+        bounds: session.mesh.bounds(),
+    };
+    let mut reference = None;
+    for edge in [64, 128, 256, 256, 128, 64] {
+        let mut composite = Composite::new(&set.channel_list(), 1024);
+        let mut cache = BelowCache::default();
+        cache.set_hot(session.selected_layer());
+        cache.pass = (1024 / TILE).pow(2) as usize;
+        let started = Instant::now();
+        for y in (0..1024).step_by(edge) {
+            for x in (0..1024).step_by(edge) {
+                let x_tiles = x / TILE..(x + edge as u32) / TILE;
+                let tiles: Vec<_> = (y / TILE..(y + edge as u32) / TILE).flat_map(|ty| x_tiles.clone().map(move |tx| (tx, ty))).collect();
+                composite_tiles_cached(&inputs, &mut composite, &tiles, Some(&mut cache));
+            }
+        }
+        println!("{edge}x{edge} work regions: {:?}", started.elapsed());
+        if let Some(expected) = &reference {
+            assert!(expected == &composite, "batch size changed the resulting pixels");
+        } else {
+            reference = Some(composite);
+        }
+    }
+}

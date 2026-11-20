@@ -73,14 +73,23 @@ impl SetCache {
             dilation,
             covered_tiles: Arc::new(covered),
             composite: Composite { block_scales: ts.block_scales(), ..Composite::with_size(&ts.channel_list(), w, h) },
-            dirty: all.clone(),
+            dirty: all,
             settle: BTreeSet::new(),
-            upload: all,
+            upload: BTreeSet::new(),
             finished_dab: None,
             revision: 0,
             below: BelowCache::default(),
             chunk: 0,
             paint_margin: None,
+        }
+    }
+
+    /// Replay a lost or recreated GPU texture. Tiles still awaiting composition will be
+    /// queued with their finished pixels by update_tiles.
+    pub fn queue_ready_uploads(&mut self) {
+        let (cols, rows) = (self.size.0.div_ceil(TILE), self.size.1.div_ceil(TILE));
+        if self.dirty.len() < cols as usize * rows as usize {
+            self.upload.extend((0..cols).flat_map(|x| (0..rows).map(move |y| (x, y))).filter(|t| !self.dirty.contains(t)));
         }
     }
 
