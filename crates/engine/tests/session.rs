@@ -911,3 +911,47 @@ fn uniform_uv_sets_do_not_materialize_padding_until_explicitly_read() {
         assert_eq!(added, expected, "dense padding allocation for UV scale {uv_scale}");
     }
 }
+
+#[test]
+fn a_budgeted_slice_composites_the_brush_then_the_visible_uv_before_the_backlog() {
+    use texturecraft_engine::geom::glam::Vec2;
+    let mut s = Session::new_project("demand", primitives::plane(1.0, 1), "builtin:plane", None, 512).unwrap();
+    execute(&mut s, "tool.material", &json!({"channel":"baseColor","color":[1.0,0.0,0.0]})).unwrap();
+    let uv = Vec2::splat(0.9375);
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    let visible = [Vec2::new(0.5, 0.75), Vec2::new(0.625, 0.875)];
+    s.take_uploads(0);
+    s.caches[0].chunk = 1;
+    s.update_for_view(0.0, || 0.0, s.tile_demand(Some(visible)));
+    assert_eq!(s.take_uploads(0), [(7, 7)]);
+    let value = s.caches[0].composite.value(Channel::BaseColor, 480, 480);
+    assert!(value[0] > value[1]);
+    s.end_stroke().unwrap();
+    s.update_for_view(0.0, || 0.0, s.tile_demand(Some(visible)));
+    assert_eq!(s.take_uploads(0), [(4, 6)]);
+    s.update();
+    let result = s.caches[0].composite.clone();
+    assert_eq!(result, full(&mut s));
+}
+
+#[test]
+fn switching_materials_reuses_idle_bands_within_the_active_budget() {
+    let mut s = Session::new_project("bands", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+    execute(&mut s, "layer.add.fill", &json!({"color":[0.1,0.3,0.7]})).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    s.update();
+    let bytes = s.caches[0].below.bytes();
+    assert!(bytes > 0);
+    let select = |s: &mut Session, ts| { execute(s, "textureSet.select", &json!({"ts": ts})).unwrap(); s.update(); };
+    select(&mut s, 1);
+    assert_eq!(s.caches[0].below.bytes(), bytes);
+    select(&mut s, 0);
+    assert_eq!(s.caches[0].below.bytes(), bytes);
+    s.caches[1].below.budget = bytes - 1;
+    select(&mut s, 1);
+    assert_eq!(s.caches[0].below.bytes(), 0);
+    select(&mut s, 0);
+    s.caches[0].invalidate_all();
+    s.update();
+    assert_eq!(s.caches[0].composite.clone(), full(&mut s));
+}

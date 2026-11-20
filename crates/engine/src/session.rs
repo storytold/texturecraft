@@ -477,6 +477,9 @@ pub struct Session {
     pub(crate) merge_edits: bool,
     pub tool: ToolState,
     pub active_set: usize,
+    /// Last material composited as active and the previous one whose bands may still be warm.
+    cache_active: usize,
+    cache_previous: Option<usize>,
     /// Selected layer per texture set.
     pub selected: BTreeMap<usize, LayerId>,
     /// Layers selected together with the selected one (Shift+click, Ctrl+click), per texture set.
@@ -559,6 +562,8 @@ impl Session {
             merge_edits: false,
             tool: ToolState::default(),
             active_set: 0,
+            cache_active: 0,
+            cache_previous: None,
             selected,
             multi: BTreeMap::new(),
             target: StackTarget::Content,
@@ -1014,6 +1019,41 @@ impl Session {
     /// goes first; settling tiles (see [`SetCache::settle`]) get at most [`SETTLE_BUDGET_MS`]
     /// of a finite budget, after the dirty ones.
     pub fn update_for(&mut self, budget_ms: f64, clock: impl Fn() -> f64) -> bool {
+        self.update_for_view(budget_ms, clock, crate::TileDemand::default())
+    }
+
+    /// Budgeted display update with the same tile demand used by the viewport uploader.
+    pub fn update_for_view(&mut self, budget_ms: f64, clock: impl Fn() -> f64, demand: crate::TileDemand) -> bool {
+        let active = self.ts();
+        if active != self.cache_active {
+            // A third material replaces the previously parked one, even when the
+            // interactive slice ends before the compositor visits that texture set.
+            if let Some(displaced) = self.cache_previous.filter(|&ts| ts != active)
+                && let Some(cache) = self.caches.get_mut(displaced)
+            {
+                cache.below.clear();
+            }
+            self.cache_previous = Some(self.cache_active);
+            if let Some(cache) = self.caches.get_mut(self.cache_active) {
+                cache.below.finish_pass();
+            }
+            self.cache_active = active;
+        }
+        let changed = self.update_tiles(budget_ms, clock, active, demand);
+        if let Some(previous) = self.cache_previous {
+            // Retaining an idle material spends only the remainder of the normal band
+            // budget. The active material always gets first use of that budget.
+            let spare = self.caches.get(active).map_or(0, |c| c.below.limit().saturating_sub(c.below.bytes()));
+            if let Some(cache) = self.caches.get_mut(previous)
+                && cache.below.bytes() > spare
+            {
+                cache.below.clear();
+            }
+        }
+        changed
+    }
+
+    fn update_tiles(&mut self, budget_ms: f64, clock: impl Fn() -> f64, active: usize, demand: crate::TileDemand) -> bool {
         let start = clock();
         let initial_chunk_size = if budget_ms.is_finite() { rayon::current_num_threads().clamp(1, CHUNK) } else { CHUNK };
 
@@ -1039,11 +1079,13 @@ impl Session {
             self.set_solo(None);
         }
         let solo_view = if self.pending_tiles() > 0 { self.solo_view() } else { None };
-        let active = self.ts();
         let order = std::iter::once(active).chain((0..self.caches.len()).filter(|ts| *ts != active));
         let mut changed = false;
         for ts in order {
             let Some(cache) = self.caches.get_mut(ts) else { continue };
+            if Some(ts) == self.cache_previous && cache.dirty.is_empty() && cache.settle.is_empty() && !cache.below.is_empty() {
+                continue;
+            }
             cache.below.set_hot(hot);
             cache.below.pass = cache.dirty.len() + cache.settle.len();
 
@@ -1062,7 +1104,12 @@ impl Session {
                     cache.dirty.extend(next_chunk(&mut cache.settle, chunk.min(initial_chunk_size)));
                 }
                 let chunk_started = clock();
-                let tiles = next_chunk(&mut cache.dirty, chunk);
+                let mut tiles = if ts == active && budget_ms.is_finite() { demand.take(&mut cache.dirty, chunk) } else { Vec::new() };
+                if tiles.is_empty() {
+                    tiles = next_chunk(&mut cache.dirty, chunk);
+                } else if tiles.len() < chunk {
+                    tiles.extend(next_chunk(&mut cache.dirty, chunk - tiles.len()));
+                }
                 for tile in &tiles {
                     cache.settle.remove(tile);
                 }

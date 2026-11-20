@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use texturecraft_engine::Session;
 use texturecraft_engine::compose::{DisplayKind, ImageRes, display_tile_bytes, kinds_for};
 use texturecraft_engine::core::{BakedMap, Channel};
-use texturecraft_engine::geom::Mesh;
+use texturecraft_engine::geom::{Mesh, glam::Vec2};
 use texturecraft_render::{BakeVisualization, CageGeometry, Frame, Renderer, wgpu};
 
 use crate::bake_scene::{BakeSceneLink, CageUpload};
@@ -186,12 +186,17 @@ impl GpuLink {
 
     /// Collect everything the GPU needs this frame, running the compositor first: `bake` is what bake mode's 3D view draws besides the low poly, `spent_ms` the time this frame already took
     pub fn sync(&mut self, session: &mut Session, aux_map: Option<AuxView>, bake: Option<BakeVisualization>, shift: u32, spent_ms: f64) -> SceneSync {
+        self.sync_view(session, aux_map, bake, shift, spent_ms, None)
+    }
+
+    pub(crate) fn sync_view(&mut self, session: &mut Session, aux_map: Option<AuxView>, bake: Option<BakeVisualization>, shift: u32, spent_ms: f64, visible_uv: Option<[Vec2; 2]>) -> SceneSync {
         let start_ms = crate::now_ms();
         let mut queued = 0usize;
         let time_left_ms = |queued: usize| FRAME_BUDGET_MS - spent_ms - (crate::now_ms() - start_ms) - queued as f64 * UPLOAD_MS_PER_TILE;
         let pending = session.pending_tiles();
         self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
-        session.update_for(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms);
+        let demand = session.tile_demand(visible_uv);
+        session.update_for_view(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms, demand);
 
         let mut out = SceneSync { tile_shift: shift.min(texturecraft_engine::texel::TILE.ilog2()), ..Default::default() };
         if self.lost.swap(false, Ordering::AcqRel) {
@@ -244,7 +249,7 @@ impl GpuLink {
         let rotation = (first..count).chain(0..first.min(count));
         // While painting, share the first chunk with the next waiting set. An overloaded
         // frame still submits at most one chunk in total, independent of material count.
-        let boost = session.stroke_active() && active != first && session.caches.get(active).is_some_and(|c| !c.upload.is_empty());
+        let boost = (session.stroke_active() || demand.focused()) && active != first && session.caches.get(active).is_some_and(|c| !c.upload.is_empty());
         let mut chunk_size = if boost { UPLOAD_CHUNK / 2 } else { UPLOAD_CHUNK };
         let order = boost.then_some((active, true)).into_iter().chain(rotation.map(|set| (set, false)));
         'uploads: for (texture_set, boosted) in order {
@@ -265,7 +270,9 @@ impl GpuLink {
                 let chunk: Vec<_> = if cache.upload.len() <= chunk_size {
                     std::mem::take(&mut cache.upload).into_iter().collect()
                 } else {
-                    (0..chunk_size).filter_map(|_| cache.upload.pop_first()).collect()
+                    let mut tiles = if texture_set == active { demand.take(&mut cache.upload, chunk_size) } else { Vec::new() };
+                    tiles.extend((tiles.len()..chunk_size).filter_map(|_| cache.upload.pop_first()));
+                    tiles
                 };
                 let bytes: Vec<_> = chunk
                     .par_iter()
@@ -637,6 +644,30 @@ mod tests {
         let scene = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
         assert!(scene.tiles.iter().all(|tile| tile.0 == 1));
         assert!(s.caches.iter().all(|cache| cache.upload.is_empty()));
+    }
+
+    #[test]
+    fn zoomed_view_and_brush_reach_the_first_upload_chunk() {
+        let mut s = Session::new_project("view", primitives::plane(1.0, 1), "builtin:plane", None, 1024).unwrap();
+        s.update();
+        let all = texturecraft_engine::compose::all_tiles(1024, 1024);
+        let mut gpu = link();
+        // The zoomed square spans four by four tiles at the lower right of the atlas.
+        let bounds = crate::viewport::visible_uv_bounds([512, 512], (1024, 1024), 4.0 / 0.92, [-3.0, 3.0]);
+        let out = gpu.sync_view(&mut s, None, None, 0, FRAME_BUDGET_MS, Some(bounds));
+        let coords: BTreeSet<_> = out.tiles.iter().map(|t| (t.2, t.3)).collect();
+        for x in 12..16 {
+            for y in 12..16 {
+                assert!(coords.contains(&(x, y)), "missing visible tile ({x}, {y})");
+            }
+        }
+        assert_eq!(coords.len(), UPLOAD_CHUNK);
+        assert_eq!(coords.len() + s.caches[0].upload.len(), all.len());
+        s.caches[0].upload.extend(all);
+        let brush = Vec2::new(0.96875, 0.34375);
+        s.begin_stroke_uv(brush, 1.0).unwrap();
+        let out = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
+        assert_eq!(out.tiles.first().map(|t| (t.2, t.3)), Some((15, 5)));
     }
 
     #[test]

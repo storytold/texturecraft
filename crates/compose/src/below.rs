@@ -294,6 +294,12 @@ impl BelowCache {
         self.held = None;
     }
 
+    /// A parked material can reuse its bands later. Look-ahead fields belong to the old pass.
+    pub fn finish_pass(&mut self) {
+        self.held = None;
+        self.ahead.clear();
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }

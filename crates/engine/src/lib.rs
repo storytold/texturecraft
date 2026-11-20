@@ -69,6 +69,8 @@ pub mod template_cmds;
 pub mod text_cmds;
 pub mod thumbs;
 mod tool_availability;
+mod tile_demand;
+pub use tile_demand::TileDemand;
 pub mod tool_cmds;
 pub mod tool_settings;
 mod triangle_partition;

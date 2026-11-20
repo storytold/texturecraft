@@ -104,7 +104,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         _ if mode == crate::state::Mode::Baking && app.ui.bake_visualization.bent_normal_shown() => Some(crate::gpu::AuxView::MeshMap(BakedMap::BentNormal)),
         _ => None,
     };
-    let mut sync = PendingSync(Some(aux_view));
+    let mut sync = PendingSync { aux: Some(aux_view), uv_size: None };
     let full = ui.available_rect_before_wrap();
     path_keys(app, ui);
 
@@ -112,7 +112,10 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
     let layout = if mode == crate::state::Mode::Painting || bake_painting { app.ui.layout } else { ViewLayout::Only3D };
     match layout {
         ViewLayout::Only3D => view_3d(app, ui, full, &mut sync),
-        ViewLayout::Only2D => view_2d(app, ui, full, &mut sync),
+        ViewLayout::Only2D => {
+            sync.uv_size = Some(frame_size_in_pixels(ui, full));
+            view_2d(app, ui, full, &mut sync);
+        }
         ViewLayout::Split => {
             // The 2D view's edges sit on whole pixels, so rounding can't nudge a texture its zoom keeps at one size
             let pixels_per_point = ui.ctx().pixels_per_point();
@@ -123,6 +126,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
             let (rect_3d, rect_2d) = if app.ui.swap_views { (right, left) } else { (left, right) };
 
             // Each view draws only on its side, so overlays such as the texture set name stay out of a narrow neighbour
+            sync.uv_size = Some(frame_size_in_pixels(ui, rect_2d));
             let clip = ui.clip_rect();
             ui.set_clip_rect(rect_3d.intersect(clip));
             view_3d(app, ui, rect_3d, &mut sync);
@@ -413,7 +417,19 @@ const MAX_NAME_CHARS: usize = 32;
 
 /// This frame's scene sync (compositing and GPU uploads), run by the first view drawn, after
 /// that view handled its input: a stroke shows in the frame it is painted, not the next.
-pub struct PendingSync(Option<Option<crate::gpu::AuxView>>);
+pub struct PendingSync {
+    aux: Option<Option<crate::gpu::AuxView>>,
+    uv_size: Option<[u32; 2]>,
+}
+
+/// Invert the UV view transform used by the renderer for the two viewport corners.
+pub(crate) fn visible_uv_bounds(frame_size: [u32; 2], atlas: (u32, u32), zoom: f32, pan: [f32; 2]) -> [Vec2; 2] {
+    let aspect = frame_size[0].max(1) as f32 / frame_size[1].max(1) as f32;
+    let scale = Vec2::from_array(texturecraft_render::uv_view_scale(aspect, zoom, atlas));
+    let center = (Vec2::ONE + Vec2::new(-pan[0], pan[1]) / scale) * 0.5;
+    let extent = Vec2::splat(0.5) / scale;
+    [center - extent, center + extent]
+}
 
 /// A view's render size in pixels, rounded as egui rounds the rect it draws the frame into, so the frame is never stretched
 fn frame_size_in_pixels(ui: &Ui, rect: Rect) -> [u32; 2] {
@@ -426,10 +442,13 @@ fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, mut frame: Frame
     let tokens = Tokens::get(ui.ctx());
     let bake = bake_visualization(app);
     frame.shade.bake = bake;
-    let scene = match (sync.0.take(), app.gpu.as_mut()) {
+    let scene = match (sync.aux.take(), app.gpu.as_mut()) {
         (Some(aux), Some(gpu_link)) => {
             let sync_start_ms = crate::now_ms();
-            let scene = gpu_link.sync(&mut app.session, aux, bake, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms));
+            let visible_uv = sync.uv_size.zip(app.session.caches.get(app.session.ts())).map(|(size, cache)| {
+                visible_uv_bounds(size, cache.size, app.ui.uv_zoom, app.ui.uv_pan)
+            });
+            let scene = gpu_link.sync_view(&mut app.session, aux, bake, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms), visible_uv);
             let reports = gpu_link.take_reports();
             app.profiler.sync_ms += (crate::now_ms() - sync_start_ms) as f32;
             gpu_report_toasts(app, reports);
