@@ -652,7 +652,21 @@ fn undo_keeps_a_stroke_local_when_a_different_layer_has_a_blur() {
     execute(&mut s, "tool.stroke", &json!({"points": [[150, 160], [170, 170]]})).unwrap();
     s.update();
     let stroke = |s: &mut Session| drop(execute(s, "tool.stroke", &json!({"points": [[150, 200], [190, 210]]})).unwrap());
-    check_undo_redo(&mut s, stroke, Some(64));
+    let mut plain = painted_set();
+    stroke(&mut plain);
+    stroke(&mut s);
+    plain.update();
+    s.update();
+    for command in ["edit.undo", "edit.redo"] {
+        execute(&mut plain, command, &Value::Null).unwrap();
+        execute(&mut s, command, &Value::Null).unwrap();
+        assert!(!plain.caches[0].dirty.is_empty());
+        assert_eq!(s.caches[0].dirty, plain.caches[0].dirty, "{command}: the unrelated blur adds no tiles");
+        plain.update();
+        s.update();
+        let incremental = s.caches[0].composite.clone();
+        assert_eq!(incremental, full(&mut s));
+    }
 }
 
 #[test]

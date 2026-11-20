@@ -200,14 +200,17 @@ impl StackKey {
                 && left_image.height() == right_image.height()
                 && left_image.comps() == right_image.comps();
 
-            // Image tiles are composite tiles only when the grids coincide
-            if !same_shape || (left_image.width(), left_image.height()) != size {
+            if !same_shape {
                 return None;
             }
             if left_image.same_tiles(right_image) {
                 continue;
             }
 
+            // Unchanged resampled instances do not constrain the grid of another target.
+            if (left_image.width(), left_image.height()) != size {
+                return None;
+            }
             let target = if left_channel.is_some() { PaintTarget::Layer(*left_id) } else { PaintTarget::Mask(*left_id) };
             for tile_y in 0..left_image.tiles_y() {
                 for tile_x in 0..left_image.tiles_x() {
