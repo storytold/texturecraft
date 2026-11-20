@@ -60,6 +60,9 @@ pub struct TextureSet {
     /// Mesh maps that have been baked (pixels live with the engine / project file).
     #[serde(default)]
     pub baked: BTreeSet<BakedMap>,
+    /// Mesh map tiles imported from resources rather than baked internally: map -> set of UDIM numbers (or 1001 for classic single-tile sets).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub imported_tiles: BTreeMap<BakedMap, BTreeSet<u32>>,
     #[serde(default = "yes")]
     pub visible: bool,
     /// UDIM numbers of the UV tiles this set paints, ascending (UV tiles mode);
@@ -162,6 +165,7 @@ impl TextureSet {
             height_strength: 1.0,
             bake: BakeSettings::default(),
             baked: BTreeSet::new(),
+            imported_tiles: BTreeMap::new(),
             visible: true,
             uv_tiles: Vec::new(),
             bake_excluded_tiles: BTreeSet::new(),

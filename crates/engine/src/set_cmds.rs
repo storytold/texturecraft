@@ -1,7 +1,7 @@
 //! Texture set commands (Texture Set List / Texture Set Settings).
 
 use serde_json::{Value, json};
-use texturecraft_core::{Channel, ChannelBlend, ChannelFormat};
+use texturecraft_core::{BakedMap, Channel, ChannelBlend, ChannelFormat};
 
 use std::sync::Arc;
 
@@ -281,8 +281,42 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
     let ts = ts_param(s, p, "textureSet.settings")?;
     let nf = normal_format_param("textureSet.settings", p)?;
     s.edit("Texture set settings", |s| {
-        if let Some(n) = nf {
+        if let Some(n) = nf
+            && s.doc.project.normal_format != n
+        {
             s.doc.project.normal_format = n;
+            for (ts, texture_set) in s.doc.project.texture_sets.iter().enumerate() {
+                if let Some(imported_tiles) = texture_set.imported_tiles.get(&BakedMap::Normal).filter(|tiles| !tiles.is_empty())
+                    && let Some(baked) = s.doc.baked.get_mut(&ts)
+                {
+                    let size = (baked.resolution, baked.height(BakedMap::Normal));
+                    if let Some(normal_map) = baked.maps.get_mut(&BakedMap::Normal) {
+                        let mut flipped = (**normal_map).clone();
+                        if let Some(grid) = texture_set.tile_grid() {
+                            let tile_width = size.0 / grid.cols.max(1);
+                            let tile_height = size.1 / grid.rows.max(1);
+                            for &tile in imported_tiles {
+                                if let Some((col, row)) = grid.block(tile) {
+                                    for y in row * tile_height..(row + 1) * tile_height {
+                                        let first = (y as usize * size.0 as usize + col as usize * tile_width as usize) * 3;
+                                        let last = first + tile_width as usize * 3;
+                                        if let Some(row_pixels) = flipped.get_mut(first..last) {
+                                            for pixel in row_pixels.as_chunks_mut::<3>().0 {
+                                                pixel[1] = 1.0 - pixel[1];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            for pixel in flipped.as_chunks_mut::<3>().0 {
+                                pixel[1] = 1.0 - pixel[1];
+                            }
+                        }
+                        *normal_map = Arc::new(flipped);
+                    }
+                }
+            }
         }
         let set = s.doc.project.texture_set_mut(ts)?;
         if let Some(d) = strp(p, "description") {
@@ -299,6 +333,176 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_changing_normal_format_flips_imported_normal_mesh_map_not_baked() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        // Texture set 0 has an imported normal map with green = 0.2
+        let entry0 = s.doc.baked.entry(0).or_default();
+        entry0.resolution = 1;
+        entry0.maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.2, 1.0]));
+        let set0 = s.doc.project.texture_set_mut(0).unwrap();
+        set0.baked.insert(BakedMap::Normal);
+        set0.imported_tiles.insert(BakedMap::Normal, [1001].into_iter().collect());
+
+        // Texture set 1 has an internally baked normal map stored through store_bake_maps
+        let mut baked_maps = std::collections::BTreeMap::new();
+        baked_maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.3, 1.0]));
+        s.store_bake_maps(1, 1, 1, baked_maps, None, None).unwrap();
+        assert!(!s.doc.project.texture_set(1).unwrap().imported_tiles.contains_key(&BakedMap::Normal));
+
+        crate::execute(&mut s, "textureSet.settings", &json!({"normalFormat": "directX"})).unwrap();
+        assert_eq!(s.doc.project.normal_format, texturecraft_core::NormalFormat::DirectX);
+        let green_imported = s.doc.baked[&0].maps[&BakedMap::Normal][1];
+        assert!((green_imported - 0.8).abs() < 1e-4, "imported normal green should flip to 0.8: {green_imported}");
+        let green_baked = s.doc.baked[&1].maps[&BakedMap::Normal][1];
+        assert!((green_baked - 0.3).abs() < 1e-4, "internally baked normal should remain unchanged: {green_baked}");
+
+        // Now simulate importing onto set 1, verifying imported_tiles is set, then rebaking via store_bake_maps clears imported flag
+        s.doc.project.texture_set_mut(1).unwrap().imported_tiles.insert(BakedMap::Normal, [1001].into_iter().collect());
+        let mut rebake_maps = std::collections::BTreeMap::new();
+        rebake_maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.3, 1.0]));
+        s.store_bake_maps(1, 1, 1, rebake_maps, None, None).unwrap();
+        assert!(!s.doc.project.texture_set(1).unwrap().imported_tiles.contains_key(&BakedMap::Normal), "rebaking must clear imported flag");
+
+        crate::execute(&mut s, "textureSet.settings", &json!({"normalFormat": "openGl"})).unwrap();
+        assert_eq!(s.doc.project.normal_format, texturecraft_core::NormalFormat::OpenGl);
+        let green_imported_back = s.doc.baked[&0].maps[&BakedMap::Normal][1];
+        assert!((green_imported_back - 0.2).abs() < 1e-4, "imported normal green should flip back to 0.2: {green_imported_back}");
+        let green_baked_still = s.doc.baked[&1].maps[&BakedMap::Normal][1];
+        assert!((green_baked_still - 0.3).abs() < 1e-4, "internally baked normal should still remain unchanged: {green_baked_still}");
+    }
+
+    #[test]
+    fn baking_other_maps_preserves_imported_normal_provenance() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        let entry0 = s.doc.baked.entry(0).or_default();
+        entry0.resolution = 1;
+        entry0.maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.2, 1.0]));
+        let set0 = s.doc.project.texture_set_mut(0).unwrap();
+        set0.baked.insert(BakedMap::Normal);
+        set0.imported_tiles.insert(BakedMap::Normal, [1001].into_iter().collect());
+        set0.bake.maps.select([BakedMap::AmbientOcclusion]);
+
+        // Bake only AmbientOcclusion
+        let mut ao_bake = std::collections::BTreeMap::new();
+        ao_bake.insert(BakedMap::AmbientOcclusion, Arc::new(vec![1.0]));
+        s.store_bake_maps(0, 1, 1, ao_bake, Some(&[BakedMap::AmbientOcclusion]), None).unwrap();
+        assert!(s.doc.project.texture_set(0).unwrap().imported_tiles.contains_key(&BakedMap::Normal), "baking only AO must preserve imported Normal provenance");
+
+        crate::execute(&mut s, "textureSet.settings", &json!({"normalFormat": "directX"})).unwrap();
+        let green = s.doc.baked[&0].maps[&BakedMap::Normal][1];
+        assert!((green - 0.8).abs() < 1e-4, "imported normal green should flip to 0.8 after baking other maps: {green}");
+    }
+
+    #[test]
+    fn excluded_tiles_without_bake_flips_all_imported_tiles() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        let set = s.doc.project.texture_set_mut(0).unwrap();
+        set.uv_tiles = vec![1001, 1002];
+        set.baked.insert(BakedMap::Normal);
+        set.imported_tiles.insert(BakedMap::Normal, [1001, 1002].into_iter().collect());
+
+        // Exclude tile 1002 via real bake.tile.set command
+        crate::execute(&mut s, "bake.tile.set", &json!({"tile": 1002, "enabled": false})).unwrap();
+        assert!(s.doc.project.texture_sets[0].bake_excluded_tiles.contains(&1002));
+
+        // 2x1 atlas: pixel 0 is tile 1001 (green = 0.2), pixel 1 is tile 1002 (green = 0.2)
+        let entry = s.doc.baked.entry(0).or_default();
+        entry.resolution = 2;
+        entry.maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.2, 1.0, 0.5, 0.2, 1.0]));
+
+        // Switch to DirectX without baking: both imported tiles must flip
+        crate::execute(&mut s, "textureSet.settings", &json!({"normalFormat": "directX"})).unwrap();
+        let pixels = &s.doc.baked[&0].maps[&BakedMap::Normal];
+        assert!((pixels[1] - 0.8).abs() < 1e-4, "imported tile 1001 must flip to 0.8: {}", pixels[1]);
+        assert!((pixels[4] - 0.8).abs() < 1e-4, "imported tile 1002 must flip to 0.8: {}", pixels[4]);
+    }
+
+    #[test]
+    fn exclusions_changed_after_partial_bake_preserves_per_tile_provenance() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        let set = s.doc.project.texture_set_mut(0).unwrap();
+        set.uv_tiles = vec![1001, 1002];
+        set.baked.insert(BakedMap::Normal);
+        set.imported_tiles.insert(BakedMap::Normal, [1001, 1002].into_iter().collect());
+
+        // Atlas of 2 tiles: 1001 (baked, col 0) has green = 0.3, 1002 (excluded, imported, col 1) has green = 0.2
+        let entry = s.doc.baked.entry(0).or_default();
+        entry.resolution = 2;
+        entry.maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.3, 1.0, 0.5, 0.2, 1.0]));
+
+        // Partial bake where 1002 is excluded: store_bake_maps prunes only 1001 from imported_tiles
+        let mut maps = std::collections::BTreeMap::new();
+        maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.3, 1.0, 0.5, 0.2, 1.0]));
+        let baked_tiles: std::collections::BTreeSet<u32> = [1001].into_iter().collect();
+        s.store_bake_maps(0, 2, 1, maps, Some(&[BakedMap::Normal]), Some(&baked_tiles)).unwrap();
+
+        assert_eq!(s.doc.project.texture_sets[0].imported_tiles.get(&BakedMap::Normal).unwrap(), &[1002].into_iter().collect::<std::collections::BTreeSet<_>>());
+
+        // Now exclusions change after the bake (e.g. 1002 re-enabled or 1001 excluded) without rebaking
+        crate::execute(&mut s, "bake.tile.set", &json!({"tile": 1002, "enabled": true})).unwrap();
+        crate::execute(&mut s, "bake.tile.set", &json!({"tile": 1001, "enabled": false})).unwrap();
+
+        // Switch to DirectX: only the unbaked tile 1002 flips, freshly baked tile 1001 stays unchanged
+        crate::execute(&mut s, "textureSet.settings", &json!({"normalFormat": "directX"})).unwrap();
+        let pixels = &s.doc.baked[&0].maps[&BakedMap::Normal];
+        assert!((pixels[1] - 0.3).abs() < 1e-4, "baked tile 1001 must not flip: {}", pixels[1]);
+        assert!((pixels[4] - 0.8).abs() < 1e-4, "imported tile 1002 must flip to 0.8: {}", pixels[4]);
+    }
+
+    #[test]
+    fn mid_bake_selection_change_uses_task_snapshot() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        let set = s.doc.project.texture_set_mut(0).unwrap();
+        set.baked.insert(BakedMap::Normal);
+        set.imported_tiles.insert(BakedMap::Normal, [1001].into_iter().collect());
+        set.bake.maps.select([BakedMap::Normal]);
+
+        // Create streamed bake with task snapshot where Normal was enabled
+        let mut maps = std::collections::BTreeMap::new();
+        maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.3, 1.0]));
+        let streamed = crate::bake::StreamedBake {
+            resolution: 1,
+            height: 1,
+            maps,
+            tracer: "cpu".into(),
+            baked_maps: vec![BakedMap::Normal],
+            baked_tiles: [1001].into_iter().collect(),
+        };
+
+        // Mid-bake: user changes settings to deselect Normal
+        s.doc.project.texture_set_mut(0).unwrap().bake.maps.select([BakedMap::AmbientOcclusion]);
+
+        // Applying the streamed bake must use the task snapshot and clear imported provenance for Normal
+        s.apply_streamed_bake(0, streamed).unwrap();
+        assert!(!s.doc.project.texture_sets[0].imported_tiles.contains_key(&BakedMap::Normal), "task snapshot must clear imported Normal even if deselected mid-bake");
+    }
+
+    #[test]
+    fn undo_and_save_load_preserves_imported_tiles() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        let entry = s.doc.baked.entry(0).or_default();
+        entry.resolution = 1;
+        entry.maps.insert(BakedMap::Normal, Arc::new(vec![0.5, 0.2, 1.0]));
+        let set = s.doc.project.texture_set_mut(0).unwrap();
+        set.baked.insert(BakedMap::Normal);
+        set.imported_tiles.insert(BakedMap::Normal, [1001].into_iter().collect());
+
+        // Switch to DirectX
+        crate::execute(&mut s, "textureSet.settings", &json!({"normalFormat": "directX"})).unwrap();
+        assert!((s.doc.baked[&0].maps[&BakedMap::Normal][1] - 0.8).abs() < 1e-4);
+
+        // Save to bytes and reload
+        let bytes = s.to_project_bytes().unwrap();
+        let reloaded = Session::from_project_bytes(&bytes).unwrap();
+        assert_eq!(reloaded.doc.project.texture_sets[0].imported_tiles, s.doc.project.texture_sets[0].imported_tiles);
+
+        // Undo flips back to 0.2 and restores OpenGl
+        s.undo().unwrap();
+        assert_eq!(s.doc.project.normal_format, texturecraft_core::NormalFormat::OpenGl);
+        assert!((s.doc.baked[&0].maps[&BakedMap::Normal][1] - 0.2).abs() < 1e-4);
+    }
 
     #[test]
     fn visibility_shows_hides_inverts_and_solos() {

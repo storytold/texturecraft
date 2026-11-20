@@ -26,6 +26,10 @@ pub struct BakeTask {
     pub previous_maps: BakedMaps,
     /// The GPU ray tracer, if installed and not turned off (`bake.run {cpu: true}`).
     pub tracer: Option<Arc<dyn Tracer>>,
+    /// Maps selected when this task was created.
+    pub baked_maps: Vec<BakedMap>,
+    /// UDIM tiles baked by this task (non-excluded tiles).
+    pub baked_tiles: std::collections::BTreeSet<u32>,
 }
 
 impl BakeTask {
@@ -66,7 +70,14 @@ impl BakeTask {
                     // A resized partial bake also returns unchecked maps that must survive application
                     let mut retained: std::collections::BTreeMap<_, _> = output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(pixels))).collect();
                     retained.insert(map, data);
-                    combined = Some(StreamedBake { resolution: output.resolution, height: output.height, maps: retained, tracer: output.tracer });
+                    combined = Some(StreamedBake {
+                        resolution: output.resolution,
+                        height: output.height,
+                        maps: retained,
+                        tracer: output.tracer,
+                        baked_maps: self.baked_maps.clone(),
+                        baked_tiles: self.baked_tiles.clone(),
+                    });
                 }
             }
         }
@@ -80,6 +91,8 @@ impl BakeTask {
                     height: output.height,
                     maps: output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(pixels))).collect(),
                     tracer: output.tracer,
+                    baked_maps: self.baked_maps.clone(),
+                    baked_tiles: self.baked_tiles.clone(),
                 })
             }
         }
