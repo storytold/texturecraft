@@ -314,8 +314,8 @@ fn luminance(c: vec3<f32>) -> f32 { return dot(c, vec3(0.3, 0.59, 0.11)); }
 fn maximum(c: vec3<f32>) -> f32 { return max(c.x, max(c.y, c.z)); }
 fn minimum(c: vec3<f32>) -> f32 { return min(c.x, min(c.y, c.z)); }
 
-fn with_luminance(color: vec3<f32>, target: f32) -> vec3<f32> {
-    var c = color + target - luminance(color);
+fn with_luminance(color: vec3<f32>, luminance_goal: f32) -> vec3<f32> {
+    var c = color + luminance_goal - luminance(color);
     let l = luminance(c);
     let lo = minimum(c);
     let hi = maximum(c);
@@ -438,7 +438,7 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         output[height_index + 1u] = pack2x16float(vec2(0.04));
     }
     if params.program.z != 0u {
-        let packed = vec3<f32>(to_u16(normal.r), to_u16(normal.g), to_u16(normal.b)) * (2.0 / 65535.0) - 1.0;
+        let packed = vec3<f32>(vec3<u32>(to_u16(normal.r), to_u16(normal.g), to_u16(normal.b))) * (2.0 / 65535.0) - 1.0;
         let normal_index = 2u * (index + 2u * params.band.w);
         output[normal_index] = pack2x16float(packed.xy);
         output[normal_index + 1u] = pack2x16float(vec2(packed.z, 0.5));
