@@ -1500,6 +1500,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn every_builtin_material_uses_gpu_layers() {
+        let mut gpu = texturecraft_render::headless::Headless::new().ok();
         let mut rejected = Vec::new();
         for material in texturecraft_engine::materials::MATERIALS {
             let mut session = Session::new_project("Material shelf", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
@@ -1516,7 +1517,14 @@ pub(crate) mod tests {
             let (status, reason) = link.compositor_status();
             if status != "Layers: GPU" || update.composites.len() != 1 || !update.tiles.is_empty() {
                 rejected.push(format!("{}: {status} ({reason})", material.id));
+            } else if let Some(gpu) = &mut gpu {
+                let (_, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+                rejected.extend(errors.into_iter().map(|(_, error)| format!("{}: {error}", material.id)));
+                gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
             }
+        }
+        if let Some(gpu) = &gpu {
+            println!("Checked {} built-in materials on {}", texturecraft_engine::materials::MATERIALS.len(), gpu.adapter_name);
         }
         assert!(rejected.is_empty(), "built-in materials fell back to CPU: {rejected:#?}");
     }
