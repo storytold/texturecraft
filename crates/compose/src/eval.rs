@@ -31,7 +31,7 @@ const NCH: usize = Channel::ALL.len();
 type Acc = [[f32; 3]; NCH];
 
 /// What a live stroke paints into.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PaintTarget {
     /// A paint layer's channels.
     Layer(LayerId),
@@ -358,31 +358,25 @@ pub fn stack_reads_neighbours(project: &Project, texture_set_index: usize) -> bo
 /// Conservative output halo in tiles for an edit to painted pixels. Without anchors each
 /// filtered field reads its own effect stack. Linked filtered fields use whole-set
 /// invalidation until their combined dependency range is known.
-pub fn painted_tile_margin(project: &Project, ts: usize, target: Option<PaintTarget>) -> Option<u32> {
+pub fn painted_tile_margin(project: &Project, ts: usize, target: PaintTarget) -> Option<u32> {
     let set = project.texture_sets.get(ts)?;
     let (width, height) = set.size();
     let resolution = set.block_resolution();
-    let owner = target.map(|target| {
-        let (PaintTarget::Layer(id) | PaintTarget::Mask(id)) = target;
-        project.effect(id).map_or(id, |(owner, _)| owner)
-    });
+    let (PaintTarget::Layer(id) | PaintTarget::Mask(id)) = target;
+    let owner = project.effect(id).map_or(id, |(owner, _)| owner);
     let mut max_reach = 0;
     for layer in project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)) {
         if layer.reads_anchor() {
             return (!stack_reads_neighbours(project, ts)).then_some(0);
         }
-        if owner.is_some_and(|id| id != layer.id) {
-            continue;
-        }
-        let masks = layer.mask.iter().map(|mask| (true, &mask.effects));
-        for (mask, effects) in std::iter::once((false, &layer.content_effects)).chain(masks) {
-            if target.is_some_and(|t| matches!(t, PaintTarget::Mask(_)) != mask) {
-                continue;
-            }
-            let reach = neighbourhood_filters(effects, resolution)
+        if owner == layer.id {
+            let effects = match target {
+                PaintTarget::Layer(_) => layer.content_effects.as_slice(),
+                PaintTarget::Mask(_) => layer.mask.as_ref().map_or(&[][..], |mask| mask.effects.as_slice()),
+            };
+            max_reach = neighbourhood_filters(effects, resolution)
                 .map(|(_, radius, op)| filter_extent(radius, op, width.max(height)).1)
                 .fold(0u32, u32::saturating_add);
-            max_reach = max_reach.max(reach);
         }
     }
     Some(max_reach.div_ceil(TILE))

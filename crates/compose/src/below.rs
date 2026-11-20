@@ -6,7 +6,7 @@
 //! everything the cached part reads; any change to it empties the cache, so results are always
 //! identical to a full evaluation.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use texturecraft_core::project::MAX_DEPTH;
@@ -179,6 +179,11 @@ impl StackKey {
     /// changed (same set, roots, layers, baked maps and images; the same images by id, channel
     /// and size). None when anything else differs: the caller recomposites everything.
     pub fn changed_tiles(&self, other: &StackKey) -> Option<BTreeSet<(u32, u32)>> {
+        self.changed_paint(other).map(|targets| targets.into_values().flatten().collect())
+    }
+
+    /// Changed source tiles grouped by the paint target whose filter stack reads them.
+    pub fn changed_paint(&self, other: &StackKey) -> Option<BTreeMap<PaintTarget, BTreeSet<(u32, u32)>>> {
         if self.set != other.set || self.roots != other.roots || self.layers != other.layers || self.baked != other.baked || self.images != other.images {
             return None;
         }
@@ -186,7 +191,7 @@ impl StackKey {
             return None;
         }
         let size = self.set.size();
-        let mut changed = BTreeSet::new();
+        let mut changed = BTreeMap::new();
         for ((left_id, left_channel, left_image), (right_id, right_channel, right_image)) in self.pixels.iter().zip(&other.pixels) {
             let (left_image, right_image) = (&left_image.0, &right_image.0);
             let same_shape = left_id == right_id
@@ -203,6 +208,7 @@ impl StackKey {
                 continue;
             }
 
+            let target = if left_channel.is_some() { PaintTarget::Layer(*left_id) } else { PaintTarget::Mask(*left_id) };
             for tile_y in 0..left_image.tiles_y() {
                 for tile_x in 0..left_image.tiles_x() {
                     let equal = match (left_image.tile_handle(tile_x, tile_y), right_image.tile_handle(tile_x, tile_y)) {
@@ -211,7 +217,7 @@ impl StackKey {
                         _ => false,
                     };
                     if !equal {
-                        changed.insert((tile_x, tile_y));
+                        changed.entry(target).or_insert_with(BTreeSet::new).insert((tile_x, tile_y));
                     }
                 }
             }

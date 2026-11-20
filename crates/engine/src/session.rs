@@ -54,7 +54,7 @@ pub struct SetCache {
     /// Tiles per composite chunk that fit the last frame's budget (0: not measured yet).
     pub chunk: usize,
     /// Invalidated when the document stack is synchronized.
-    paint_margin: Option<(Option<PaintTarget>, Option<u32>)>,
+    paint_margin: Option<(PaintTarget, Option<u32>)>,
 }
 
 impl SetCache {
@@ -85,7 +85,7 @@ impl SetCache {
         &mut self,
         project: &Project,
         ts: usize,
-        target: Option<PaintTarget>,
+        target: PaintTarget,
         tiles: &[(u32, u32)],
         queue: impl FnOnce(&mut Self) -> &mut BTreeSet<(u32, u32)>,
     ) {
@@ -104,9 +104,6 @@ impl SetCache {
         let (width, height) = self.size;
         let queue = queue(self);
         match margin {
-            Some(0) if target.is_none() => {
-                queue.extend(tiles.iter().copied().filter(|&(x, y)| covered.binary_search_by_key(&(y, x), |&(tx, ty)| (ty, tx)).is_ok()));
-            }
             Some(0) => queue.extend(tiles.iter().copied()),
             Some(radius) => {
                 let (last_x, last_y) = (width.saturating_sub(1) / TILE, height.saturating_sub(1) / TILE);
@@ -827,10 +824,12 @@ impl Session {
                 continue;
             }
 
-            match before.as_ref().zip(after.as_ref()).and_then(|(before, after)| before.changed_tiles(after)) {
-                Some(changed_tiles) => {
-                    let tiles: Vec<_> = changed_tiles.into_iter().collect();
-                    cache.queue_painted(&self.doc.project, texture_set_index, None, &tiles, |c| &mut c.dirty);
+            match before.as_ref().zip(after.as_ref()).and_then(|(before, after)| before.changed_paint(after)) {
+                Some(changes) => {
+                    for (target, changed) in changes {
+                        let tiles: Vec<_> = changed.into_iter().filter(|&(x, y)| cache.covered_tiles.binary_search_by_key(&(y,x), |&(tx,ty)| (ty,tx)).is_ok()).collect();
+                        cache.queue_painted(&self.doc.project, texture_set_index, target, &tiles, |c| &mut c.dirty);
+                    }
                 }
                 None => cache.invalidate_all(),
             }
@@ -1149,7 +1148,7 @@ impl Session {
                 continue;
             }
             if Some(c.size) == size {
-                c.queue_painted(&self.doc.project, i, Some(target), &tiles, |c| if committed { &mut c.settle } else { &mut c.dirty });
+                c.queue_painted(&self.doc.project, i, target, &tiles, |c| if committed { &mut c.settle } else { &mut c.dirty });
             } else if committed {
                 // Resampled instances first see the stroke when its source pixels are committed.
                 c.invalidate_all();

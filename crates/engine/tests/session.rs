@@ -640,7 +640,7 @@ fn undo_recomposites_only_changed_tiles() {
 }
 
 #[test]
-fn undo_with_a_blur_above_recomposites_everything() {
+fn undo_keeps_a_stroke_local_when_a_different_layer_has_a_blur() {
     use texturecraft_engine::geom::glam::Vec2;
     let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 2048).unwrap();
     s.viewport = Vec2::new(400.0, 400.0);
@@ -652,7 +652,7 @@ fn undo_with_a_blur_above_recomposites_everything() {
     execute(&mut s, "tool.stroke", &json!({"points": [[150, 160], [170, 170]]})).unwrap();
     s.update();
     let stroke = |s: &mut Session| drop(execute(s, "tool.stroke", &json!({"points": [[150, 200], [190, 210]]})).unwrap());
-    check_undo_redo(&mut s, stroke, None);
+    check_undo_redo(&mut s, stroke, Some(64));
 }
 
 #[test]
