@@ -438,6 +438,25 @@ fn source_operation(
                 ProceduralKind::Brushed => 56,
                 ProceduralKind::Voronoi => 57,
                 ProceduralKind::Smudges => 58,
+                ProceduralKind::HexagonTiles => 60,
+                ProceduralKind::WaveScales => 61,
+                ProceduralKind::HerringbonePlanks => 62,
+                ProceduralKind::HalftoneDots => 63,
+                ProceduralKind::DiamondBrocade => 64,
+                ProceduralKind::TruchetArcs => 65,
+                ProceduralKind::SmoothFur => 66,
+                ProceduralKind::MackerelSky => 67,
+                ProceduralKind::Billow => 68,
+                ProceduralKind::ReptileScales => 69,
+                ProceduralKind::Bark => 70,
+                ProceduralKind::Flesh => 71,
+                ProceduralKind::Camouflage => 72,
+                ProceduralKind::Knit => 73,
+                ProceduralKind::BasketWeave => 74,
+                ProceduralKind::GooseEye => 75,
+                ProceduralKind::SlubSilk => 76,
+                ProceduralKind::StripFlooring => 77,
+                ProceduralKind::KnottyWood => 78,
                 _ => return None,
             };
             op.ids = [0, kind, pattern.seed, u32::from(pattern.invert)];
@@ -628,7 +647,10 @@ impl GpuCompositor {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tc_gpu_composite"),
-            source: wgpu::ShaderSource::Wgsl(concat!(include_str!("shaders/noise.wgsl"), "\n", include_str!("shaders/composite.wgsl")).into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(include_str!("shaders/noise.wgsl"), "\n", include_str!("shaders/procedural_extra.wgsl"), "\n", include_str!("shaders/composite.wgsl"))
+                    .into(),
+            ),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tc_gpu_composite"),

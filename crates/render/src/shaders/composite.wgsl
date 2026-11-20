@@ -242,7 +242,7 @@ fn pattern(kind: u32, p: vec3<f32>, seed: u32) -> f32 {
             let smudge = clamp((fbm(p * 1.7, 4u, seed ^ 0x33u, false) - 0.55) * 3.0, 0.0, 1.0);
             return clamp(print * ridges * 0.9 + smudge * 0.4, 0.0, 1.0);
         }
-        default: { return fract(p.x); }
+        default: { return periodic_pattern(kind, p, seed); }
     }
 }
 
