@@ -151,6 +151,8 @@ pub struct Prefs {
     /// Viewport texture resolution: 0 full, 1 half, 2 quarter of each texture set's size (lighter
     /// on GPU memory and uploads for 4K and 8K sets; painting and export keep full resolution).
     pub viewport_texture: u8,
+    /// Prefer GPU layer compositing in the material viewport where available.
+    pub gpu_compositing: bool,
     /// Interface brightness (the views keep their own background).
     pub brightness: crate::theme::Brightness,
     /// The colour of what is on, chosen or focused.
@@ -199,6 +201,7 @@ impl Default for Prefs {
             autosave_minutes: 10,
             language: "en".into(),
             viewport_texture: 0,
+            gpu_compositing: true,
             brightness: crate::theme::Brightness::default(),
             accent: crate::theme::Accent::default(),
             system_title_bar: false,

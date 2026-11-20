@@ -40,6 +40,11 @@ impl DisplayPadding {
         if self.uniform.is_some() { BTreeSet::new() } else { pad_tiles(output, self, tiles) }
     }
 
+    /// Whether every texel has a surface sample and the display needs no padding.
+    pub fn fully_covered(&self) -> bool {
+        self.uniform == Some(true)
+    }
+
     pub(crate) fn bytes(&self) -> usize {
         self.dense.get().map_or(0, |map| map.src.capacity() * size_of::<u32>())
     }

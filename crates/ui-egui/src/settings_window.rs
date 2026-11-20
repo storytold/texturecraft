@@ -492,6 +492,19 @@ fn general(
         ));
     });
 
+    row(ui, tr("Viewport compositing"), |ui, label| {
+        egui::ComboBox::from_id_salt("viewport_compositor")
+            .width(CONTROL_WIDTH)
+            .selected_text(if p.gpu_compositing { tr("GPU (Automatic)") } else { tr("CPU") })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut p.gpu_compositing, true, tr("GPU (Automatic)"));
+                ui.selectable_value(&mut p.gpu_compositing, false, tr("CPU"));
+            })
+            .response
+            .labelled_by(label)
+            .on_hover_text(tr("GPU uses the CPU on unsupported devices or layer stacks. CPU forces software composition."));
+    });
+
     section(ui, n_("RESOURCES"));
     #[cfg(not(target_arch = "wasm32"))]
     {

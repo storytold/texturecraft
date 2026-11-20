@@ -452,6 +452,7 @@ impl PendingSync {
             .uv_size
             .zip(app.session.caches.get(app.session.ts()))
             .map(|(size, cache)| visible_uv_bounds(size, cache.size, app.ui.uv_zoom, app.ui.uv_pan, app.ui.uv_rotation));
+        gpu.prefer_gpu_layers = app.ui.prefs.gpu_compositing;
         let scene = gpu.sync_view(
             &mut app.session,
             aux,
@@ -461,7 +462,7 @@ impl PendingSync {
             visible_uv,
         );
         let reports = gpu.take_reports();
-        if app.session.pending_tiles() > 0 || app.session.caches.iter().any(|cache| !cache.upload.is_empty()) || gpu.bake_busy() {
+        if gpu.display_pending(&app.session) || gpu.bake_busy() {
             ui.ctx().request_repaint();
         }
         app.profiler.sync_ms += (crate::now_ms() - start) as f32;

@@ -20,6 +20,7 @@ mod cage_gpu;
 pub mod displace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_bake;
+pub mod gpu_composite;
 pub mod gpu_trace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod headless;

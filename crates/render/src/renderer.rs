@@ -33,6 +33,7 @@ use texturecraft_texel::TILE;
 use crate::bake_visualization::BakeVisualization;
 use crate::cage_geometry::CageGeometry;
 use crate::cage_gpu::CageGpu;
+use crate::gpu_composite::{CompositeProgram, GpuCompositor};
 use crate::gpu_trace::{Checked, checked};
 use crate::high_poly_gpu::HighPolyGpu;
 use crate::ibl;
@@ -346,6 +347,7 @@ pub struct Frame {
     pub overlay: Vec<OverlayQuad>,
 }
 
+#[derive(Clone)]
 struct Tex {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -622,6 +624,7 @@ pub struct Renderer {
     dof_gather_pipeline: wgpu::RenderPipeline,
     dof_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
+    compositor: Option<GpuCompositor>,
     mip_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     util_module: wgpu::ShaderModule,
     sampler: wgpu::Sampler,
@@ -1269,6 +1272,7 @@ impl Renderer {
             shadow_pipeline,
             accum_pipeline,
             mip_pipelines: HashMap::new(),
+            compositor: None,
             util_module,
             sampler,
             env_sampler,
@@ -1521,6 +1525,54 @@ impl Renderer {
             }
         }
         reset
+    }
+
+    /// Paint a supported UV layer stack into the same display textures used by the viewport.
+    /// Scratch holds one band. The final maps stay on the adapter for shading and mip generation.
+    pub fn composite_on_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<(), String> {
+        let set = self.sets.get(ts).ok_or("texture set does not exist")?;
+        let size = display_dims(set.size, set.shift);
+        if cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) || program.paint_bytes() > device.limits().max_storage_buffer_binding_size {
+            return Err("GPU composition is unavailable on this device or for this layout".into());
+        }
+
+        let (compositor, textures) = crate::gpu_trace::scoped(device, "viewport GPU composite", || {
+            let compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
+            let mut maps: Vec<_> = DisplayKind::ALL
+                .iter()
+                .zip(&self.default_texels)
+                .zip(&set.tex)
+                .map(|((&kind, neutral), old)| {
+                    let composed = matches!(kind, DisplayKind::BaseColor | DisplayKind::Orm)
+                        || (kind == DisplayKind::Height && program.writes_height)
+                        || (kind == DisplayKind::Normal && program.writes_normal);
+                    let extent = if composed { size } else { (1, 1) };
+                    if extent == (old.texture.width(), old.texture.height()) {
+                        old.clone()
+                    } else if composed {
+                        Tex::new(device, "tc_composite", extent.0, extent.1, display_format(kind), mip_count(extent.0.max(extent.1)))
+                    } else {
+                        neutral_tex(device, queue, extent, display_format(kind), 1, neutral)
+                    }
+                })
+                .collect();
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite") });
+            if let (Some(base), Some(orm), Some(height), Some(normal)) = (maps.first(), maps.get(1), maps.get(3), maps.get(2)) {
+                compositor.encode(device, &mut encoder, program, set.size, set.shift, [&base.texture, &orm.texture, &height.texture, &normal.texture]);
+            }
+            queue.submit([encoder.finish()]);
+            maps.extend(set.tex.last().cloned());
+            (compositor, maps)
+        })?;
+        self.compositor = Some(compositor);
+        if let Some(set) = self.sets.get_mut(ts) {
+            set.tex = textures;
+            set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
+            set.mips_dirty.iter_mut().take(DisplayKind::ALL.len()).for_each(|mips| *mips = MipsDirty::All);
+            set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
+            self.content_rev += 1;
+        }
+        Ok(())
     }
 
     /// Present a bounded image of the entire material until the detailed tiles arrive.
