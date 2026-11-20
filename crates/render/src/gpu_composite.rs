@@ -941,7 +941,6 @@ impl GpuCompositor {
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
-        let brush_alpha = program.brush_alpha.as_ref().unwrap_or(&self.default_brush_alpha);
         let region = program.region.map(|r| r.viewport(shift, extent)).unwrap_or(CompositeRegion { min: [0; 2], max: [extent.0, extent.1] });
         let width = region.max[0].saturating_sub(region.min[0]);
         let height = region.max[1].saturating_sub(region.min[1]);
@@ -994,6 +993,7 @@ impl GpuCompositor {
             (Cow::Owned(operations), lookup)
         };
         let tile_images = tile_images.as_ref().unwrap_or(&self.default_tile_images);
+        let brush_alpha = program.brush_alpha.as_ref().unwrap_or(&self.default_brush_alpha);
         let empty_operation = Operation::zeroed();
         let limits = device.limits();
         if (operations.len() * size_of::<Operation>()) as u64 > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
