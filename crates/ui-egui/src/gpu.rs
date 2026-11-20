@@ -328,6 +328,11 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
 }
 
 impl GpuLink {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn supports_gpu_resize(&self) -> bool {
+        self.gpu_composite_enabled
+    }
+
     /// What the GPU side reported since the last call (see [`GpuReports`]).
     pub fn take_reports(&self) -> GpuReports {
         std::mem::take(&mut *self.reports.lock().unwrap_or_else(PoisonError::into_inner))
@@ -1451,6 +1456,77 @@ pub(crate) mod tests {
             }
         }
         println!("sample compositing checks completed in {:?}", opened.elapsed());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "dense native 8K GPU regression; run on an adapter with sufficient VRAM"]
+    fn painted_sample_resizes_and_composites_at_4k_and_8k_on_gpu() {
+        use texturecraft_engine::{
+            bake::Progress,
+            texel::{TILE, TILE_AREA},
+        };
+        use texturecraft_render::{headless::Headless, readback::Readback};
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        let name = gpu.adapter_name.to_lowercase();
+        if name.contains("llvmpipe") || name.contains("lavapipe") || name.contains("warp") || gpu.device.limits().max_texture_dimension_2d < 8192 {
+            return;
+        }
+        let mut session = Session::closed().unwrap();
+        execute(&mut session, "project.sample", &json!({})).unwrap();
+        let layer = *session.doc.project.texture_sets[0].stack.last().unwrap();
+        let paint = session.doc.pixels.layer_mut(layer, Channel::BaseColor, (2048, 2048));
+        let red = Arc::new([65535, 0, 0, 65535].repeat(TILE_AREA));
+        let blue = Arc::new([0, 0, 65535, 65535].repeat(TILE_AREA));
+        for y in 0..paint.tiles_y() {
+            for x in 0..paint.tiles_x() {
+                paint.set_tile(x, y, Some(if y < paint.tiles_y() / 2 { red.clone() } else { blue.clone() }));
+            }
+        }
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.material_start_preview = false;
+        let initial = link.sync(&mut session, None, None, 0, 0.0);
+        let (reset, errors) = initial.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+        assert!(errors.is_empty(), "{errors:?}");
+        record_recreated_uploads(&mut link.recreated.lock().unwrap(), &reset, &initial);
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+
+        for size in [4096, 8192] {
+            let started = std::time::Instant::now();
+            let task = session.resize_task(0, size).unwrap();
+            let out = crate::resize_on_gpu(task, &Progress::new(), &gpu.device, &gpu.queue).unwrap();
+            session.apply_resize(out).unwrap();
+            let resize = started.elapsed();
+            assert!(session.log.iter().any(|entry| entry.message.contains(&format!("to {size}:")) && entry.message.contains("GPU 1 images")));
+            let paint = session.doc.pixels.layer(layer, Channel::BaseColor).unwrap();
+            assert!(paint.bytes() > 64 << 20);
+            assert_eq!(paint.get(size / 2, size / 4), [65535, 0, 0, 65535]);
+            assert_eq!(paint.get(size / 2, size * 3 / 4), [0, 0, 65535, 65535]);
+
+            use std::time::Instant;
+            let started = Instant::now();
+            let update = link.sync(&mut session, None, None, 0, 0.0);
+            assert_eq!(update.composites.iter().map(|(ts, ..)| *ts).collect::<Vec<_>>(), [0], "{}", link.compositor_status().1);
+            assert!(update.tiles.is_empty());
+            let (reset, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{errors:?}");
+            record_recreated_uploads(&mut link.recreated.lock().unwrap(), &reset, &update);
+            gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            let compose = started.elapsed();
+            assert_eq!(link.compositor_status().0, "Layers: GPU");
+            assert!(!link.display_pending(&session));
+            let (width, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][0]).unwrap();
+            assert_eq!(width, size);
+            let cache = &session.caches[0];
+            for (rows, color) in [(size / 5..size / 3, [255, 0, 0, 255]), (size * 2 / 3..size * 4 / 5, [0, 0, 255, 255])] {
+                let index =
+                    rows.flat_map(|y| y * size..(y + 1) * size).find(|&i| cache.gbuf.tri[i as usize] != texturecraft_engine::geom::NO_TRI).unwrap() as usize;
+                assert_eq!(&rgba[index * 4..index * 4 + 4], &color);
+            }
+            println!("painted {size} on {}: resize {resize:?}, GPU composite {compose:?} (document tile edge {TILE})", gpu.adapter_name);
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -10,7 +10,9 @@ use texturecraft_core::{
     BakedMap, BlendMode, Channel, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerKind, MaskBackground, ProceduralKind, Project, Projection, Source,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
-use texturecraft_texel::{TILE, TILE_AREA, TileImage};
+use texturecraft_texel::{TILE, TileImage};
+
+use crate::paint_window::TileWindow;
 use wgpu::util::DeviceExt;
 
 const MAX_LAYERS: usize = 128;
@@ -75,11 +77,6 @@ impl CompositeRegion {
         Some(region)
     }
 
-    fn includes_tile(self, x: u32, y: u32) -> bool {
-        let (x, y) = (x * TILE, y * TILE);
-        x >= self.min[0] && x < self.max[0] && y >= self.min[1] && y < self.max[1]
-    }
-
     pub fn expanded(self, texels: u32) -> Self {
         Self { min: self.min.map(|x| x.saturating_sub(texels)), max: self.max.map(|x| x.saturating_add(texels)) }
     }
@@ -97,7 +94,7 @@ impl CompositeRegion {
 pub struct CompositeProgram {
     operations: Vec<Operation>,
     layer_count: u32,
-    paint: Vec<u32>,
+    paint: Vec<TileImage>,
     pub(crate) region: Option<CompositeRegion>,
     coverage: Option<(Arc<UvGBuffer>, u32)>,
     surface: Option<(Arc<Mesh>, Arc<UvGBuffer>)>,
@@ -108,10 +105,6 @@ pub struct CompositeProgram {
 }
 
 impl CompositeProgram {
-    pub(crate) fn paint_bytes(&self) -> u64 {
-        (self.paint.len() * size_of::<u32>()) as u64
-    }
-
     pub fn is_neutral(&self) -> bool {
         self.layer_count == 0 && self.baked.as_ref().is_none_or(|baked| baked.maps[0].is_none() && baked.maps[1].is_none())
     }
@@ -152,7 +145,7 @@ impl CompositeProgram {
             return Err("The Glossiness channel uses CPU compositing.");
         }
         let mut operations = Vec::new();
-        let mut paint = vec![0];
+        let mut paint = Vec::new();
         let mut effects = Vec::new();
         let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (id, 0)).collect();
         while let Some((id, depth)) = layers.pop() {
@@ -191,9 +184,9 @@ impl CompositeProgram {
                             if (image.width(), image.height()) != set.size() || image.comps() != 2 {
                                 return Err("A painted mask has a layout that uses CPU compositing.");
                             }
-                            let offset =
-                                pack_paint(&mut paint, image, region.map(|r| r.expanded(TILE))).ok_or("The painted material exceeds the GPU upload budget.")?;
-                            Operation { ids: [0, 10, offset, 2], ..Operation::zeroed() }
+                            let image_index = paint.len() as u32;
+                            paint.push(image.clone());
+                            Operation { ids: [0, 10, image_index, 2], ..Operation::zeroed() }
                         }
                         EffectKind::Generator(generator) => generator_operation(generator).ok_or("A mask generator uses CPU compositing.")?,
                         _ => point_effect(effect).ok_or("A mask effect uses CPU compositing.")?,
@@ -268,9 +261,9 @@ impl CompositeProgram {
                     _ => return Err("A channel in the layer stack uses CPU compositing."),
                 };
                 let mut op = if let Some(image) = painted {
-                    let offset =
-                        pack_paint(&mut paint, image, region.map(|r| r.expanded(TILE))).ok_or("The painted material exceeds the GPU upload budget.")?;
-                    Operation { ids: [slot, 10, offset, image.comps() as u32], ..Operation::zeroed() }
+                    let image_index = paint.len() as u32;
+                    paint.push(image.clone());
+                    Operation { ids: [slot, 10, image_index, image.comps() as u32], ..Operation::zeroed() }
                 } else {
                     fill.and_then(|fill| source_operation(source, &fill.projection, default)).ok_or("A fill source or projection uses CPU compositing.")?
                 };
@@ -452,32 +445,6 @@ fn point_effect(effect: &Effect) -> Option<Operation> {
     })
 }
 
-/// An index for each document tile followed by the texels of allocated tiles. Two u16
-/// components fit in each word. A missing tile leaves the accumulated material untouched.
-fn pack_paint(dst: &mut Vec<u32>, image: &TileImage, region: Option<CompositeRegion>) -> Option<u32> {
-    let table = dst.len();
-    let count = image.tiles_x() as usize * image.tiles_y() as usize;
-    let words_per_tile = TILE_AREA * image.comps() / 2;
-    if table.checked_add(count)? > MAX_PAINT_WORDS {
-        return None;
-    }
-    dst.resize(table + count, 0);
-    for (x, y) in image.allocated().filter(|&(x, y)| region.is_none_or(|r| r.includes_tile(x, y))) {
-        if dst.len().checked_add(words_per_tile)? > MAX_PAINT_WORDS {
-            return None;
-        }
-        let texels = image.tile(x, y)?;
-        let (pairs, remainder) = texels.as_chunks::<2>();
-        if pairs.len() != words_per_tile || !remainder.is_empty() {
-            return None;
-        }
-        let offset = dst.len() as u32;
-        dst[table + (y * image.tiles_x() + x) as usize] = offset;
-        dst.extend(pairs.iter().map(|&[a, b]| u32::from(a) | (u32::from(b) << 16)));
-    }
-    Some(table as u32)
-}
-
 fn coverage_word(triangles: &[u32]) -> u32 {
     triangles.iter().enumerate().fold(0, |word, (bit, &triangle)| word | (u32::from(triangle != NO_TRI) << bit))
 }
@@ -530,6 +497,7 @@ pub(crate) struct GpuCompositor {
     default_surface: wgpu::TextureView,
     default_vertices: wgpu::Buffer,
     default_baked: wgpu::TextureView,
+    paint_upload: Option<wgpu::Buffer>,
 }
 
 impl GpuCompositor {
@@ -582,6 +550,7 @@ impl GpuCompositor {
             default_surface,
             default_vertices,
             default_baked,
+            paint_upload: None,
         }
     }
 
@@ -727,10 +696,9 @@ impl GpuCompositor {
 
     /// Compose bands into reusable GPU scratch space, then copy them into display textures.
     /// Indexed/SRGB and floating-point maps use the same formats as the CPU uploader.
-    pub(crate) fn encode(
+    pub(crate) fn compose(
         &mut self,
         gpu: (&wgpu::Device, &wgpu::Queue),
-        encoder: &mut wgpu::CommandEncoder,
         program: &CompositeProgram,
         target: (usize, (u32, u32), u32),
         textures: [&wgpu::Texture; 4],
@@ -742,13 +710,11 @@ impl GpuCompositor {
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
         let region = program.region.map(|r| r.viewport(shift, extent)).unwrap_or(CompositeRegion { min: [0; 2], max: [extent.0, extent.1] });
-        let [left, start_y] = region.min;
-        let width = region.max[0].saturating_sub(left);
-        let height = region.max[1].saturating_sub(start_y);
+        let width = region.max[0].saturating_sub(region.min[0]);
+        let height = region.max[1].saturating_sub(region.min[1]);
         if width == 0 || height == 0 {
             return Ok(());
         }
-        let bands = height.div_ceil(ROWS);
         let pitch = width.next_multiple_of(64);
         let area = pitch * ROWS;
         let stride = u64::from(area) * 4;
@@ -771,77 +737,197 @@ impl GpuCompositor {
             contents: if program.operations.is_empty() { bytemuck::bytes_of(&empty_operation) } else { bytemuck::cast_slice(&program.operations) },
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let paint = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tc_composite_paint"),
-            contents: bytemuck::cast_slice(&program.paint),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
         let layout = self.pipeline.get_bind_group_layout(0);
-        for band in 0..bands {
-            let top = band * ROWS;
-            let rows = ROWS.min(height - top);
-            debug_assert_eq!(TILE, 64);
-            let values = [
-                width,
-                rows,
-                top + start_y,
-                area,
-                source_size.0,
-                source_size.1,
-                1 << shift,
-                u32::from(program.writes_height),
-                program.layer_count,
-                pitch,
-                u32::from(program.writes_normal),
-                left,
-                u32::from(program.coverage.is_some()),
-                source_size.0.div_ceil(32),
-                program.coverage.as_ref().map_or(0, |(_, radius)| *radius),
-                u32::from(program.surface.is_some())
-                    | (u32::from(program.baked.is_some()) << 1)
-                    | (u32::from(program.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some())) << 2),
-            ];
-            let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("tc_composite_band"),
-                contents: bytemuck::cast_slice(&values),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tc_composite_band"),
-                layout: &layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.lookup.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&surface) },
-                    wgpu::BindGroupEntry { binding: 7, resource: vertices.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
-                ],
-            });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tc_composite"), timestamp_writes: None });
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &bindings, &[]);
-                pass.dispatch_workgroups(width.div_ceil(WORKGROUP), rows.div_ceil(WORKGROUP), 1);
+        let limits = device.limits();
+        let max_words = MAX_PAINT_WORDS.min((limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / 4) as usize);
+        let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
+        let windows = paint_windows(program, region, source_size, shift, radius, max_words)?;
+        let mut packed = Vec::new();
+        let mut pending_bytes = 0;
+        let mut last_submission = None;
+        for (chunk, window, words) in windows {
+            let bytes = (words * 4) as u64;
+            window.pack(&program.paint, words, &mut packed);
+            if pending_bytes + bytes > (max_words * 4) as u64 {
+                device.poll(wgpu::PollType::Wait { submission_index: last_submission.take(), timeout: None }).map_err(|e| e.to_string())?;
+                pending_bytes = 0;
             }
-            let copies = [(0, 4, true), (1, 4, true), (2, 8, program.writes_height), (4, 8, program.writes_normal)];
-            for (texture, (offset, bytes_per_texel, needed)) in textures.into_iter().zip(copies) {
-                if !needed {
-                    continue;
+            let upload_size = bytes.next_power_of_two().min((max_words * 4) as u64);
+            if self.paint_upload.as_ref().is_none_or(|buffer| buffer.size() < bytes) {
+                self.paint_upload = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("tc_composite_paint"),
+                    size: upload_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            let paint = self.paint_upload.as_ref().ok_or("paint upload buffer is missing")?;
+            queue.write_buffer(paint, 0, bytemuck::cast_slice(&packed));
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite") });
+            let width = chunk.max[0] - chunk.min[0];
+            let left = chunk.min[0];
+            for top in (chunk.min[1]..chunk.max[1]).step_by(ROWS as usize) {
+                let rows = ROWS.min(chunk.max[1] - top);
+                let values = [
+                    width,
+                    rows,
+                    top,
+                    area,
+                    source_size.0,
+                    source_size.1,
+                    1 << shift,
+                    u32::from(program.writes_height),
+                    program.layer_count,
+                    pitch,
+                    u32::from(program.writes_normal),
+                    left,
+                    u32::from(program.coverage.is_some()),
+                    source_size.0.div_ceil(32),
+                    radius,
+                    u32::from(program.surface.is_some())
+                        | (u32::from(program.baked.is_some()) << 1)
+                        | (u32::from(program.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some())) << 2),
+                    window.origin[0],
+                    window.origin[1],
+                    window.size[0],
+                    window.size[1],
+                ];
+                let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tc_composite_band"),
+                    contents: bytemuck::cast_slice(&values),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("tc_composite_band"),
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: self.lookup.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&surface) },
+                        wgpu::BindGroupEntry { binding: 7, resource: vertices.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
+                    ],
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tc_composite"), timestamp_writes: None });
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &bindings, &[]);
+                    pass.dispatch_workgroups(width.div_ceil(WORKGROUP), rows.div_ceil(WORKGROUP), 1);
                 }
-                encoder.copy_buffer_to_texture(
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &scratch,
-                        layout: wgpu::TexelCopyBufferLayout { offset: stride * offset, bytes_per_row: Some(pitch * bytes_per_texel), rows_per_image: None },
-                    },
-                    wgpu::TexelCopyTextureInfo { origin: wgpu::Origin3d { x: left, y: start_y + top, z: 0 }, ..texture.as_image_copy() },
-                    wgpu::Extent3d { width, height: rows, depth_or_array_layers: 1 },
-                );
+                let copies = [(0, 4, true), (1, 4, true), (2, 8, program.writes_height), (4, 8, program.writes_normal)];
+                for (texture, (offset, bytes_per_texel, needed)) in textures.into_iter().zip(copies) {
+                    if !needed {
+                        continue;
+                    }
+                    encoder.copy_buffer_to_texture(
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &scratch,
+                            layout: wgpu::TexelCopyBufferLayout { offset: stride * offset, bytes_per_row: Some(pitch * bytes_per_texel), rows_per_image: None },
+                        },
+                        wgpu::TexelCopyTextureInfo { origin: wgpu::Origin3d { x: left, y: top, z: 0 }, ..texture.as_image_copy() },
+                        wgpu::Extent3d { width, height: rows, depth_or_array_layers: 1 },
+                    );
+                }
             }
+            last_submission = Some(queue.submit([encoder.finish()]));
+            pending_bytes += bytes;
         }
         Ok(())
+    }
+}
+
+/// Split only when the paint for this viewport window exceeds the device budget. Include a
+/// source halo because the UV padding shader can choose a texel from an adjoining window.
+fn paint_windows(
+    program: &CompositeProgram,
+    region: CompositeRegion,
+    size: (u32, u32),
+    shift: u32,
+    radius: u32,
+    limit: usize,
+) -> Result<Vec<(CompositeRegion, TileWindow, usize)>, String> {
+    let mut work = vec![region];
+    let mut windows = Vec::new();
+    while let Some(chunk) = work.pop() {
+        let source = CompositeRegion { min: chunk.min.map(|p| p << shift), max: chunk.max.map(|p| p << shift) }.expanded(radius);
+        let window = TileWindow::covering(source.min, source.max, [size.0, size.1]);
+        if let Some(words) = window.words(&program.paint, limit) {
+            windows.push((chunk, window, words));
+            continue;
+        }
+        let width = chunk.max[0] - chunk.min[0];
+        let height = chunk.max[1] - chunk.min[1];
+        let axis = usize::from(height >= width);
+        let length = chunk.max[axis] - chunk.min[axis];
+        if length < 2 {
+            return Err("Paint inputs for one GPU texel exceed the adapter's upload budget".into());
+        }
+        let mut first = chunk;
+        let mut second = chunk;
+        let middle = chunk.min[axis] + length / 2;
+        first.max[axis] = middle;
+        second.min[axis] = middle;
+        work.push(second);
+        work.push(first);
+    }
+    Ok(windows)
+}
+
+#[cfg(test)]
+mod paint_window_tests {
+    use super::*;
+
+    #[test]
+    fn a_small_paint_budget_splits_the_output_without_losing_padding_sources() {
+        let mut paint = TileImage::new(256, 256, 4);
+        let pixels = Arc::new(vec![65535; 64 * 64 * 4]);
+        for y in 0..4 {
+            for x in 0..4 {
+                paint.set_tile(x, y, Some(pixels.clone()));
+            }
+        }
+        let program = CompositeProgram {
+            operations: Vec::new(),
+            layer_count: 0,
+            paint: vec![paint],
+            region: None,
+            coverage: None,
+            surface: None,
+            needs_surface: false,
+            baked: None,
+            writes_height: false,
+            writes_normal: false,
+        };
+        let region = CompositeRegion { min: [0, 0], max: [128, 128] };
+        let limit = 6 * 64 * 64 * 2 + 32;
+        let windows = paint_windows(&program, region, (256, 256), 1, 8, limit).unwrap();
+        assert!(windows.len() > 1);
+        let mut coverage = vec![0; 128 * 128];
+        for (chunk, window, words) in windows {
+            assert!(words <= limit);
+            let mut packed = Vec::new();
+            window.pack(&program.paint, words, &mut packed);
+            assert_eq!(packed.len(), words);
+            for y in chunk.min[1]..chunk.max[1] {
+                for x in chunk.min[0]..chunk.max[0] {
+                    coverage[(y * 128 + x) as usize] += 1;
+                    for sy in [y.saturating_mul(2).saturating_sub(8), (2 * y + 8).min(255)] {
+                        for sx in [x.saturating_mul(2).saturating_sub(8), (2 * x + 8).min(255)] {
+                            let origin = window.origin;
+                            assert!(sx / 64 >= origin[0] && sy / 64 >= origin[1]);
+                            let (tx, ty) = (sx / 64 - origin[0], sy / 64 - origin[1]);
+                            assert!(tx < window.size[0] && ty < window.size[1]);
+                            let slot = (ty * window.size[0] + tx) as usize;
+                            assert_ne!(packed[packed[0] as usize + slot], 0);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(coverage.into_iter().all(|count| count == 1));
     }
 }

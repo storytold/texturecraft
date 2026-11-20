@@ -16,6 +16,7 @@ struct Params {
     source: vec4<u32>,
     program: vec4<u32>,
     coverage: vec4<u32>,
+    paint_window: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -232,9 +233,16 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
 }
 
 fn painted(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
-    let tile = pixel / 64u;
+    let atlas_tile = pixel / 64u;
+    if any(atlas_tile < params.paint_window.xy) {
+        return vec4(0.0);
+    }
+    let tile = atlas_tile - params.paint_window.xy;
+    if any(tile >= params.paint_window.zw) {
+        return vec4(0.0);
+    }
     let local = pixel % 64u;
-    let offset = paint[layer.ids.z + tile.y * (params.source.x / 64u) + tile.x];
+    let offset = paint[paint[layer.ids.z] + tile.y * params.paint_window.z + tile.x];
     if offset == 0u {
         return vec4(0.0);
     }

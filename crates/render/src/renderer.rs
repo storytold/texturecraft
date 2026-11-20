@@ -1555,7 +1555,7 @@ impl Renderer {
             return Ok(());
         }
         let size = display_dims(set.size, set.shift);
-        if cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) || program.paint_bytes() > device.limits().max_storage_buffer_binding_size {
+        if cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
             return Err("GPU composition is unavailable on this device or for this layout".into());
         }
 
@@ -1579,17 +1579,9 @@ impl Renderer {
                     }
                 })
                 .collect();
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite") });
             if let (Some(base), Some(orm), Some(height), Some(normal)) = (maps.first(), maps.get(1), maps.get(3), maps.get(2)) {
-                compositor.encode(
-                    (device, queue),
-                    &mut encoder,
-                    program,
-                    (ts, set.size, set.shift),
-                    [&base.texture, &orm.texture, &height.texture, &normal.texture],
-                )?;
+                compositor.compose((device, queue), program, (ts, set.size, set.shift), [&base.texture, &orm.texture, &height.texture, &normal.texture])?;
             }
-            queue.submit([encoder.finish()]);
             maps.extend(set.tex.last().cloned());
             Ok::<_, String>((compositor, maps))
         })??;

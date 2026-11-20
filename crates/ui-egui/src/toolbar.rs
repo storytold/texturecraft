@@ -551,7 +551,7 @@ pub fn status_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                     }
                 } else if let Some(job) = &app.resize {
                     let bar = egui::ProgressBar::new(job.progress.fraction()).desired_width(160.0).desired_height(10.0);
-                    ui.add(bar.animate(true).text(RichText::new(tr("CPU resizing")).size(10.0)));
+                    ui.add(bar.animate(true).text(RichText::new(tr("Resizing textures")).size(10.0)));
                 } else if app.gpu.as_ref().is_some_and(|gpu| gpu.cpu_padding_pending()) {
                     ui.add(egui::Spinner::new().size(10.0));
                     ui.label(RichText::new(tr("CPU preparing UV padding")).size(11.0));
