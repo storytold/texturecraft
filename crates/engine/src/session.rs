@@ -827,7 +827,8 @@ impl Session {
             match before.as_ref().zip(after.as_ref()).and_then(|(before, after)| before.changed_paint(after)) {
                 Some(changes) => {
                     for (target, changed) in changes {
-                        let tiles: Vec<_> = changed.into_iter().filter(|&(x, y)| cache.covered_tiles.binary_search_by_key(&(y,x), |&(tx,ty)| (ty,tx)).is_ok()).collect();
+                        let tiles: Vec<_> =
+                            changed.into_iter().filter(|&(x, y)| cache.covered_tiles.binary_search_by_key(&(y, x), |&(tx, ty)| (ty, tx)).is_ok()).collect();
                         cache.queue_painted(&self.doc.project, texture_set_index, target, &tiles, |c| &mut c.dirty);
                     }
                 }
