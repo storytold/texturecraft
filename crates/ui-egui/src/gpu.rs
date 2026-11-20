@@ -1555,9 +1555,9 @@ pub(crate) mod tests {
                 assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(*b) <= 2), "{material}: {actual:?} vs {expected:?}");
             }
             if material == "moss" {
-                assert!(bytes.chunks_exact(4).any(|p| p[3] > 0), "Moss has visible sheen");
+                assert!(bytes.as_chunks::<4>().0.iter().any(|p| p[3] > 0), "Moss has visible sheen");
             } else {
-                assert!(bytes.chunks_exact(4).any(|p| p != &bytes[..4]), "Leather has visible procedural grain");
+                assert!(bytes.as_chunks::<4>().0.iter().any(|p| p != &bytes[..4]), "Leather has visible procedural grain");
             }
         }
     }
