@@ -294,50 +294,58 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
     }
 }
 
-/// The menus, then the mode label at the right of `ui` (the strip `titlebar::show` lays out).
+/// Eguis MenuBar forces an LTR layout inside its own scope; restore the active
+/// app direction for actual menu buttons without changing the popup machinery.
+fn in_app_menu_layout(hebrew: bool) -> egui::Layout {
+    if hebrew { egui::Layout::right_to_left(egui::Align::Center) } else { egui::Layout::left_to_right(egui::Align::Center) }
+}
+
+/// The menus, then the mode label at the opposite end of `ui` (the strip `titlebar::show` lays out).
 pub fn menu_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let tk = Tokens::get(ui.ctx());
+    let hebrew = crate::i18n::current().code == "he";
     egui::MenuBar::new().ui(ui, |ui| {
-        let ctx = ui.ctx().clone();
-        for top in TOP {
-            ui.menu_button(tr(top), |ui| {
-                ui.set_min_width(220.0);
-                let mut current_sub: Option<&str> = None;
-                let items: Vec<Item> = CATALOG.iter().filter(|i| i.menu == top).copied().collect();
-                for item in &items {
-                    if let Some(s) = item.sub {
-                        if current_sub == Some(s) {
+        ui.with_layout(in_app_menu_layout(hebrew), |ui| {
+            let ctx = ui.ctx().clone();
+            for top in TOP {
+                ui.menu_button(tr(top), |ui| {
+                    ui.set_min_width(220.0);
+                    let mut current_sub: Option<&str> = None;
+                    let items: Vec<Item> = CATALOG.iter().filter(|i| i.menu == top).copied().collect();
+                    for item in &items {
+                        if let Some(s) = item.sub {
+                            if current_sub == Some(s) {
+                                continue;
+                            }
+                            current_sub = Some(s);
+                            ui.menu_button(tr(s), |ui| {
+                                for x in items.iter().filter(|x| x.sub == Some(s)) {
+                                    menu_item(app, &ctx, ui, x);
+                                }
+                                if s == "Layouts" {
+                                    crate::named_layouts::entries(app, ui);
+                                }
+                            });
                             continue;
                         }
-
-                        current_sub = Some(s);
-                        ui.menu_button(tr(s), |ui| {
-                            for x in items.iter().filter(|x| x.sub == Some(s)) {
-                                menu_item(app, &ctx, ui, x);
-                            }
-                            if s == "Layouts" {
-                                crate::named_layouts::entries(app, ui);
-                            }
-                        });
-                        continue;
+                        if item.label == "-" {
+                            ui.separator();
+                            continue;
+                        }
+                        menu_item(app, &ctx, ui, item);
                     }
-
-                    if item.label == "-" {
-                        ui.separator();
-                        continue;
-                    }
-
-                    menu_item(app, &ctx, ui, item);
-                }
+                });
+            }
+            // Mirror only the mode-label anchoring, keeping the menus at the other edge.
+            let opposite = if hebrew { egui::Layout::left_to_right(egui::Align::Center) } else { egui::Layout::right_to_left(egui::Align::Center) };
+            ui.with_layout(opposite, |ui| {
+                let mode = match app.ui.mode {
+                    Mode::Painting => tr("Painting"),
+                    Mode::Baking => tr("Baking"),
+                    Mode::Rendering => tr("Rendering"),
+                };
+                ui.label(egui::RichText::new(mode).size(11.0).color(tk.text_dim));
             });
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mode = match app.ui.mode {
-                Mode::Painting => tr("Painting"),
-                Mode::Baking => tr("Baking"),
-                Mode::Rendering => tr("Rendering"),
-            };
-            ui.label(egui::RichText::new(mode).size(11.0).color(tk.text_dim));
         });
     });
 }
@@ -568,4 +576,31 @@ fn clipboard_key(event: &egui::Event, held: Modifiers) -> Option<egui::Event> {
 /// Shift alone is held: a clipboard event that came from Shift+Delete or Shift+Insert.
 fn shift_only(held: Modifiers) -> bool {
     held.shift && !(held.command || held.ctrl || held.mac_cmd || held.alt)
+}
+
+#[cfg(test)]
+mod hebrew_menu_layout_tests {
+    use super::*;
+
+    #[test]
+    fn app_direction_overrides_menu_bar_internal_ltr() {
+        for (hebrew, rtl) in [(true, true), (false, false)] {
+            let ctx = egui::Context::default();
+            let mut positions = None;
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 120.0))), ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::MenuBar::new().ui(ui, |ui| {
+                        ui.with_layout(in_app_menu_layout(hebrew), |ui| {
+                            let first = ui.allocate_exact_size(egui::vec2(30.0, 18.0), egui::Sense::hover()).0;
+                            let second = ui.allocate_exact_size(egui::vec2(30.0, 18.0), egui::Sense::hover()).0;
+                            positions = Some((first.center().x, second.center().x));
+                        });
+                    });
+                });
+            });
+            let (first, second) = positions.expect("menu controls must be allocated");
+            assert_eq!(first > second, rtl, "incorrect menu order for hebrew={hebrew}");
+        }
+    }
 }

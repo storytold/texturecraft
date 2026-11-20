@@ -104,6 +104,11 @@ pub fn height(ui: &Ui) -> f32 {
     (ui.text_style_height(&egui::TextStyle::Body) + 14.0).clamp(28.0, 32.0)
 }
 
+/// Keep the app's content direction separate from the physical OS caption controls.
+fn in_app_strip_layout(language: &str) -> egui::Layout {
+    if language == "he" { egui::Layout::right_to_left(Align::Center) } else { egui::Layout::left_to_right(Align::Center) }
+}
+
 /// The strip: menus between the app icon and the mode label, the window buttons at the ends the
 /// layout names, and as the title bar its empty space moving the window.
 pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
@@ -122,7 +127,15 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
         let ends = |n: usize| n as f32 * BUTTON_WIDTH;
         let inset = if bar == TitleBar::Integrated { TRAFFIC_LIGHTS } else { ends(left.len()) + PAD };
         let content = Rect::from_min_max(pos2(rect.left() + inset, rect.top()), pos2(rect.right() - ends(right.len()) - PAD, rect.bottom()));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(content).layout(egui::Layout::left_to_right(Align::Center)), |ui| {
+        // Mirror the in-app strip for Hebrew, not the OS-managed caption buttons.
+        // The Hebrew language picker and font fallback are tracked separately in #496.
+        let language = crate::i18n::current().code;
+        let hebrew = language == "he";
+        let direction = in_app_strip_layout(language);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(content).layout(direction), |ui| {
+            if hebrew {
+                ui.style_mut().right_to_left = true;
+            }
             paint_icon(ui);
             crate::menus::menu_bar(app, ui);
         });
@@ -306,6 +319,26 @@ pub fn sync_native(bar: &TitleBar, ui: &Ui, frame: &eframe::Frame, movable: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hebrew_in_app_strip_places_the_first_control_on_the_right() {
+        for (language, rtl) in [("he", true), ("en", false), ("ar", false), ("de", false)] {
+            let ctx = egui::Context::default();
+            let mut positions = None;
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 120.0))), ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.allocate_ui_with_layout(vec2(400.0, 28.0), in_app_strip_layout(language), |ui| {
+                        let first = ui.allocate_exact_size(vec2(30.0, 18.0), Sense::hover()).0;
+                        let second = ui.allocate_exact_size(vec2(30.0, 18.0), Sense::hover()).0;
+                        positions = Some((first.center().x, second.center().x));
+                    });
+                });
+            });
+            let (first, second) = positions.expect("the strip must allocate both controls");
+            assert_eq!(first > second, rtl, "wrong order for {language}");
+        }
+    }
 
     #[test]
     fn the_override_wins_then_the_setting_then_the_platform() {
