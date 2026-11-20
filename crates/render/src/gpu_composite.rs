@@ -6,7 +6,7 @@ use std::sync::{Arc, Weak};
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
-use texturecraft_compose::{BakedMaps, PixelStore};
+use texturecraft_compose::{BakedMaps, DisplayKind, PixelStore};
 use texturecraft_core::{
     BakedMap, BlendMode, Channel, ChannelKind, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, MaskBackground, ProceduralKind,
     Project, Projection, Source,
@@ -124,13 +124,49 @@ pub struct CompositeProgram {
     surface: Option<(Arc<Mesh>, Arc<UvGBuffer>)>,
     needs_surface: bool,
     baked: Option<BakedInputs>,
-    pub(crate) writes_height: bool,
-    pub(crate) writes_normal: bool,
+    display_outputs: u32,
+    glossiness: bool,
+}
+
+fn display_bit(kind: DisplayKind) -> u32 {
+    1 << kind as u32
+}
+
+// Destination slots match the channel groups consumed by composite.wgsl.
+fn channel_slot(channel: Channel) -> u32 {
+    use Channel::*;
+    match channel {
+        BaseColor => 0,
+        Opacity => 1,
+        AmbientOcclusion => 2,
+        Roughness => 3,
+        Metallic => 4,
+        SpecularLevel => 5,
+        Height => 6,
+        Normal => 7,
+        SheenColor => 8,
+        Specular => 9,
+        Emissive => 10,
+        CoatNormal => 11,
+        SheenWeight => 12,
+        SheenRoughness => 13,
+        ScatterWeight => 14,
+        CoatWeight => 15,
+        CoatRoughness => 16,
+        AnisotropyLevel => 17,
+        AnisotropyAngle => 18,
+        Transmission => 19,
+        Glossiness => 20,
+    }
 }
 
 impl CompositeProgram {
     pub fn is_neutral(&self) -> bool {
-        self.layer_count == 0 && self.baked.as_ref().is_none_or(|baked| baked.maps[0].is_none() && baked.maps[1].is_none())
+        !self.glossiness && self.layer_count == 0 && self.baked.as_ref().is_none_or(|baked| baked.maps[0].is_none() && baked.maps[1].is_none())
+    }
+
+    pub(crate) fn writes_display(&self, kind: DisplayKind) -> bool {
+        self.display_outputs & display_bit(kind) != 0
     }
 
     /// Let the shader sample the nearest covered UV texel for island padding.
@@ -144,7 +180,9 @@ impl CompositeProgram {
             self.surface = Some((mesh.clone(), gbuf.clone()));
         }
         self.baked = baked.map(BakedInputs::new).transpose()?.flatten();
-        self.writes_normal |= self.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some());
+        if self.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some()) {
+            self.display_outputs |= display_bit(DisplayKind::Normal);
+        }
         Ok(())
     }
 
@@ -170,13 +208,9 @@ impl CompositeProgram {
         region: Option<CompositeRegion>,
         brush: Option<LiveBrush>,
     ) -> Result<Self, &'static str> {
-        use Channel::*;
         let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
         if !set.uv_tiles.is_empty() {
             return Err("UDIM texture sets use CPU compositing.");
-        }
-        if set.has_channel(Glossiness) {
-            return Err("The Glossiness channel uses CPU compositing.");
         }
         if let Some(brush) = &brush {
             let alpha = brush.alpha.texture();
@@ -290,25 +324,7 @@ impl CompositeProgram {
                 };
                 let default = channel.default_value();
                 let source = fill.and_then(|fill| fill.sources.get(&channel));
-                let slot = match channel {
-                    BaseColor => 0,
-                    Opacity => 1,
-                    AmbientOcclusion => 2,
-                    Roughness => 3,
-                    Metallic => 4,
-                    SpecularLevel => 5,
-                    Height => 6,
-                    Normal => 7,
-                    _ if painted.is_none()
-                        && brush_value.is_none()
-                        && (channel == Normal || channel == CoatNormal || content_count == 0)
-                        && matches!(blend.mode, BlendMode::Normal | BlendMode::Passthrough | BlendMode::Replace)
-                        && (source.is_none() || matches!(source, Some(Source::Uniform(value)) if *value == default)) =>
-                    {
-                        continue;
-                    }
-                    _ => return Err("A channel in the layer stack uses CPU compositing."),
-                };
+                let slot = channel_slot(channel);
                 let mut op = if fill.is_none() {
                     let image_index = painted.map_or(NO_PAINT_IMAGE, |image| {
                         let image_index = paint.len() as u32;
@@ -335,13 +351,16 @@ impl CompositeProgram {
                 operations.push(op);
             }
         }
-        let changes_channel = |slot, default: [f32; 3]| {
-            operations
+        let mut display_outputs = display_bit(DisplayKind::BaseColor) | display_bit(DisplayKind::Orm);
+        for channel in Channel::ALL {
+            let slot = channel_slot(channel);
+            if operations
                 .iter()
-                .any(|op| op.ids[0] == slot && (op.ids[1] != 0 || op.low[..3] != default || (slot != 7 && op.effects[3] != 0) || op.balance[2] != 0.0))
-        };
-        let writes_height = changes_channel(6, Height.default_value());
-        let writes_normal = changes_channel(7, Normal.default_value());
+                .any(|op| op.ids[0] == slot && (op.ids[1] != 0 || op.low[..3] != channel.default_value() || op.effects[3] != 0 || op.balance[2] != 0.0))
+            {
+                display_outputs |= display_bit(DisplayKind::of_channel(channel));
+            }
+        }
         let layer_count = operations.len() as u32;
         operations.extend(effects);
         let needs_surface = operations.iter().any(|op| op.procedural[3] != 0 || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]));
@@ -356,8 +375,8 @@ impl CompositeProgram {
             surface: None,
             needs_surface,
             baked: None,
-            writes_height,
-            writes_normal,
+            display_outputs,
+            glossiness: set.has_channel(Channel::Glossiness),
         })
     }
 }
@@ -858,11 +877,12 @@ impl GpuCompositor {
         gpu: (&wgpu::Device, &wgpu::Queue),
         program: &CompositeProgram,
         target: (usize, (u32, u32), u32),
-        textures: [&wgpu::Texture; 4],
+        textures: [&wgpu::Texture; DisplayKind::ALL.len()],
     ) -> Result<(), String> {
         let (device, queue) = gpu;
         let (ts, source_size, shift) = target;
-        let extent = (textures[0].width(), textures[0].height());
+        let base = textures[0];
+        let extent = (base.width(), base.height());
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
@@ -876,16 +896,19 @@ impl GpuCompositor {
         let pitch = width.next_multiple_of(64);
         let area = pitch * ROWS;
         let stride = u64::from(area) * 4;
+        let mut words_per_pixel = 0;
+        let copies = DisplayKind::ALL.map(|kind| {
+            if !program.writes_display(kind) {
+                return None;
+            }
+            let bytes_per_texel = kind.bytes_per_texel() as u32;
+            let offset = words_per_pixel;
+            words_per_pixel += u64::from(bytes_per_texel / 4);
+            Some((offset, bytes_per_texel))
+        });
         let scratch = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tc_composite_scratch"),
-            size: stride
-                * if program.writes_normal {
-                    6
-                } else if program.writes_height {
-                    4
-                } else {
-                    2
-                },
+            size: stride * words_per_pixel,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -949,10 +972,10 @@ impl GpuCompositor {
                     source_size.0,
                     source_size.1,
                     1 << shift,
-                    u32::from(program.writes_height),
+                    u32::from(program.glossiness),
                     program.layer_count,
                     pitch,
-                    u32::from(program.writes_normal),
+                    program.display_outputs,
                     left,
                     u32::from(program.coverage.is_some()),
                     source_size.0.div_ceil(32),
@@ -992,11 +1015,8 @@ impl GpuCompositor {
                     pass.set_bind_group(0, &bindings, &[]);
                     pass.dispatch_workgroups(width.div_ceil(WORKGROUP), rows.div_ceil(WORKGROUP), 1);
                 }
-                let copies = [(0, 4, true), (1, 4, true), (2, 8, program.writes_height), (4, 8, program.writes_normal)];
-                for (texture, (offset, bytes_per_texel, needed)) in textures.into_iter().zip(copies) {
-                    if !needed {
-                        continue;
-                    }
+                for (texture, copy) in textures.into_iter().zip(copies) {
+                    let Some((offset, bytes_per_texel)) = copy else { continue };
                     encoder.copy_buffer_to_texture(
                         wgpu::TexelCopyBufferInfo {
                             buffer: &scratch,
@@ -1157,8 +1177,8 @@ mod paint_window_tests {
             surface: None,
             needs_surface: false,
             baked: None,
-            writes_height: false,
-            writes_normal: false,
+            display_outputs: 0,
+            glossiness: false,
         };
         let region = CompositeRegion { min: [0, 0], max: [128, 128] };
         let limit = 6 * 64 * 64 * 2 + 32;

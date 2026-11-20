@@ -13,8 +13,9 @@ struct Operation {
 struct Params {
     // Width, row count, top row, reserved texels per map.
     band: vec4<u32>,
-    // Source width, source height, display sampling step, height map enabled.
+    // Source width, source height, display sampling step, glossiness workflow.
     source: vec4<u32>,
+    // Layer count, scratch row pitch, DisplayKind output bits, left column.
     program: vec4<u32>,
     coverage: vec4<u32>,
     paint_window: vec4<u32>,
@@ -456,10 +457,10 @@ fn scalar_filter(op: Operation, x: f32) -> f32 {
 }
 
 fn effect_color(op: Operation, c: vec3<f32>, channel: u32) -> vec3<f32> {
-    if channel == 7u {
+    if channel == 7u || channel == 11u {
         return select(c, vec3(c.x, 1.0 - c.y, c.z), op.ids.y == 30u);
     }
-    if channel == 0u {
+    if channel == 0u || (channel >= 8u && channel <= 10u) {
         if op.ids.y == 29u { return vec3(dot(c, vec3(0.3, 0.59, 0.11))); }
         if op.ids.y == 31u { return hsl_adjust(c, op.low.xyz); }
         return vec3(scalar_filter(op, c.r), scalar_filter(op, c.g), scalar_filter(op, c.b));
@@ -614,6 +615,29 @@ fn to_u16(v: f32) -> u32 {
     return u32(clamp(v, 0.0, 1.0) * 65535.0 + 0.5);
 }
 
+fn quantized_color(color: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(vec3<u32>(to_u16(color.r), to_u16(color.g), to_u16(color.b))) / 65535.0;
+}
+
+fn pack_srgb(color: vec3<f32>, alpha: f32) -> u32 {
+    return srgb[to_u16(color.r) >> 4u]
+        | (srgb[to_u16(color.g) >> 4u] << 8u)
+        | (srgb[to_u16(color.b) >> 4u] << 16u)
+        | ((to_u16(alpha) >> 8u) << 24u);
+}
+
+fn writes_display(kind: u32) -> bool {
+    return (params.program.z & (1u << kind)) != 0u;
+}
+
+fn display_index(kind: u32, index: u32) -> u32 {
+    // Normal (2) and Height (3) use two words per pixel. The remaining display
+    // outputs use one. The Rust band layout omits all inactive outputs.
+    let earlier = params.program.z & ((1u << kind) - 1u);
+    let offset = countOneBits(earlier) + countOneBits(earlier & 12u);
+    return offset * params.band.w + select(index, 2u * index, kind == 2u || kind == 3u);
+}
+
 // Find a covered source within the padding radius. The CPU padding's breadth-first
 // search breaks equal Chebyshev distances in row-major source order.
 fn padded_source(pixel: vec2<u32>) -> vec2<u32> {
@@ -697,6 +721,9 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     var base = vec3(0.5);
     var normal = vec3(0.5, 0.5, 1.0);
     var scalars = array<f32, 6>(1.0, 1.0, 0.5, 0.0, 0.5, 0.0);
+    // Grouped by the destination slots assigned by Rust.
+    var lobe_colors = array<vec3<f32>, 4>(vec3(1.0), vec3(0.04), vec3(0.0), vec3(0.5, 0.5, 1.0));
+    var lobe_values = array<f32, 9>(0.0, 0.5, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.5);
     var last_mask = 0xffffffffu;
     var mask_value = 1.0;
     for (var i = 0u; covered && i < params.program.x; i++) {
@@ -732,36 +759,61 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
             base += (blend_rgb(mode, base, source) - base) * weight;
         } else if destination == 7u {
             normal += (blend_rgb(mode, normal, source) - normal) * weight;
+        } else if destination >= 12u {
+            let slot = destination - 12u;
+            let old = lobe_values[slot];
+            lobe_values[slot] = lerp(old, blend_scalar(mode, old, source.x), weight);
+        } else if destination >= 8u {
+            let slot = destination - 8u;
+            let old = lobe_colors[slot];
+            lobe_colors[slot] = mix(old, blend_rgb(mode, old, source), weight);
         } else {
             let old = scalars[destination - 1u];
             scalars[destination - 1u] = lerp(old, blend_scalar(mode, old, source.x), weight);
         }
     }
     let index = id.y * params.program.y + id.x;
-    output[index] = srgb[to_u16(base.x) >> 4u]
-        | (srgb[to_u16(base.y) >> 4u] << 8u)
-        | (srgb[to_u16(base.z) >> 4u] << 16u)
-        | ((to_u16(scalars[0]) >> 8u) << 24u);
+    output[index] = pack_srgb(base, scalars[0]);
     let ao = clamp(display_ao * f32(to_u16(scalars[1])) / 65535.0, 0.0, 1.0);
+    let roughness = select(to_u16(scalars[2]) >> 8u, 255u - (to_u16(lobe_values[8]) >> 8u), params.source.w != 0u);
     output[index + params.band.w] = u32(ao * 255.0 + 0.5)
-        | ((to_u16(scalars[2]) >> 8u) << 8u)
+        | (roughness << 8u)
         | ((to_u16(scalars[3]) >> 8u) << 16u)
         | ((to_u16(scalars[4]) >> 8u) << 24u);
-    if params.source.w != 0u {
-        let height = f32(to_u16(scalars[5] * 0.5 + 0.5)) * (2.0 / 65535.0) - 1.0;
-        let height_index = 2u * (index + params.band.w);
-        output[height_index] = pack2x16float(vec2(height, 0.04));
-        output[height_index + 1u] = pack2x16float(vec2(0.04));
-    }
-    if params.program.z != 0u {
-        var detail = vec3<f32>(vec3<u32>(to_u16(normal.r), to_u16(normal.g), to_u16(normal.b))) / 65535.0;
+    if writes_display(2u) {
+        var detail = quantized_color(normal);
         if (params.coverage.w & 4u) != 0u {
             let baked_normal = baked_at(sample_pixel, 1);
             if baked_normal.a > 0.0 { detail = rnm(baked_normal.rgb, detail); }
         }
         let packed = detail * 2.0 - 1.0;
-        let normal_index = 2u * (index + 2u * params.band.w);
+        let normal_index = display_index(2u, index);
         output[normal_index] = pack2x16float(packed.xy);
-        output[normal_index + 1u] = pack2x16float(vec2(packed.z, 0.5));
+        output[normal_index + 1u] = pack2x16float(vec2(packed.z, f32(to_u16(lobe_values[1])) / 65535.0));
+    }
+    if writes_display(3u) {
+        let height = f32(to_u16(scalars[5] * 0.5 + 0.5)) * (2.0 / 65535.0) - 1.0;
+        let f0 = quantized_color(lobe_colors[1]);
+        let height_index = display_index(3u, index);
+        output[height_index] = pack2x16float(vec2(height, f0.r));
+        output[height_index + 1u] = pack2x16float(f0.gb);
+    }
+    if writes_display(4u) {
+        output[display_index(4u, index)] = pack_srgb(lobe_colors[2], lobe_values[2]);
+    }
+    if writes_display(5u) {
+        output[display_index(5u, index)] = (to_u16(lobe_values[3]) >> 8u)
+            | ((to_u16(lobe_values[4]) >> 8u) << 8u)
+            | ((to_u16(lobe_values[5]) >> 8u) << 16u)
+            | ((to_u16(lobe_values[6]) >> 8u) << 24u);
+    }
+    if writes_display(6u) {
+        output[display_index(6u, index)] = pack_srgb(lobe_colors[0], lobe_values[0]);
+    }
+    if writes_display(7u) {
+        // The GPU compositor uses one full-resolution UV block, so tile scale is zero.
+        let signed_xy = quantized_color(lobe_colors[3]).xy * 2.0 - 1.0;
+        let packed = vec2<u32>(clamp(128.0 + 127.0 * signed_xy, vec2(0.0), vec2(255.0)) + 0.5);
+        output[display_index(7u, index)] = packed.x | (packed.y << 8u) | ((to_u16(lobe_values[7]) >> 8u) << 16u);
     }
 }

@@ -1642,9 +1642,7 @@ impl Renderer {
                 .zip(&self.default_texels)
                 .zip(&set.tex)
                 .map(|((&kind, neutral), old)| {
-                    let composed = matches!(kind, DisplayKind::BaseColor | DisplayKind::Orm)
-                        || (kind == DisplayKind::Height && program.writes_height)
-                        || (kind == DisplayKind::Normal && program.writes_normal);
+                    let composed = program.writes_display(kind);
                     let extent = if composed { size } else { (1, 1) };
                     if extent == (old.texture.width(), old.texture.height()) {
                         old.clone()
@@ -1655,9 +1653,8 @@ impl Renderer {
                     }
                 })
                 .collect();
-            if let (Some(base), Some(orm), Some(height), Some(normal)) = (maps.first(), maps.get(1), maps.get(3), maps.get(2)) {
-                compositor.compose((device, queue), program, (ts, set.size, set.shift), [&base.texture, &orm.texture, &height.texture, &normal.texture])?;
-            }
+            let targets: &[Tex; DisplayKind::ALL.len()] = maps.as_slice().try_into().map_err(|_| "The GPU display textures are missing.")?;
+            compositor.compose((device, queue), program, (ts, set.size, set.shift), targets.each_ref().map(|target| &target.texture))?;
             maps.extend(set.tex.last().cloned());
             Ok::<_, String>((compositor, maps))
         })??;

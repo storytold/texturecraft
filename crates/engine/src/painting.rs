@@ -334,19 +334,6 @@ impl Session {
             && !settings.symmetry.any()
             && settings.alpha_image.is_none()
             && settings.alpha_library.is_none()
-            && values.keys().all(|channel| {
-                matches!(
-                    channel,
-                    Channel::BaseColor
-                        | Channel::Opacity
-                        | Channel::AmbientOcclusion
-                        | Channel::Roughness
-                        | Channel::Metallic
-                        | Channel::SpecularLevel
-                        | Channel::Height
-                        | Channel::Normal
-                )
-            })
             && let Some(backend) = &self.brush_device
             && let Some(cache) = self.caches.get(ts)
             && backend.surface.ptr_eq(&std::sync::Arc::downgrade(&cache.gbuf))

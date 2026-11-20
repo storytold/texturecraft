@@ -1498,6 +1498,107 @@ pub(crate) mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
+    fn every_builtin_material_uses_gpu_layers() {
+        let mut rejected = Vec::new();
+        for material in texturecraft_engine::materials::MATERIALS {
+            let mut session = Session::new_project("Material shelf", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+            execute(&mut session, "material.apply", &json!({"material": material.id})).unwrap();
+            let mut link = link();
+            link.gpu_composite_enabled = true;
+            let update = link.sync(&mut session, None, None, 0, 0.0);
+            let (status, reason) = link.compositor_status();
+            if status != "Layers: GPU" || update.composites.len() != 1 || !update.tiles.is_empty() {
+                rejected.push(format!("{}: {status} ({reason})", material.id));
+            }
+        }
+        assert!(rejected.is_empty(), "built-in materials fell back to CPU: {rejected:#?}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn moss_and_leather_display_procedurals_and_sheen_on_gpu() {
+        use texturecraft_render::{headless::Headless, readback::Readback};
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        for (material, kind) in [("moss", DisplayKind::Sheen), ("leather", DisplayKind::BaseColor)] {
+            let mut session = Session::new_project("Material shelf", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+            execute(&mut session, "material.apply", &json!({"material": material})).unwrap();
+            let mut link = link();
+            link.gpu_composite_enabled = true;
+            let update = link.sync(&mut session, None, None, 0, 0.0);
+            assert_eq!(link.compositor_status().0, "Layers: GPU", "{material}: {}", link.compositor_status().1);
+            let (_, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{material}: {errors:?}");
+            session.update();
+
+            let (width, height, bytes) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][kind as usize]).unwrap();
+            assert_eq!((width, height), (128, 128), "{material}: full-resolution material texture");
+            let cpu = display_tile_bytes(&session.caches[0].composite, &Default::default(), kind, 0, 0, 0);
+            for (x, y) in [(9, 7), (12, 21), (33, 55), (47, 15)] {
+                let actual = &bytes[(y * width as usize + x) * 4..][..4];
+                let expected = &cpu[(y * 64 + x) * 4..][..4];
+                assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(*b) <= 2), "{material}: {actual:?} vs {expected:?}");
+            }
+            if material == "moss" {
+                assert!(bytes.chunks_exact(4).any(|p| p[3] > 0), "Moss has visible sheen");
+            } else {
+                assert!(bytes.chunks_exact(4).any(|p| p != &bytes[..4]), "Leather has visible procedural grain");
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn gpu_layers_pack_the_extended_material_channels() {
+        use texturecraft_render::{headless::Headless, readback::Readback};
+
+        let mut session = Session::new_project("Material channels", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        execute(&mut session, "layer.add.fill", &json!({})).unwrap();
+        for (channel, color) in [
+            (Channel::Specular, [0.05, 0.20, 0.65]),
+            (Channel::Glossiness, [0.24; 3]),
+            (Channel::Emissive, [0.12, 0.28, 0.67]),
+            (Channel::ScatterWeight, [0.47; 3]),
+            (Channel::CoatWeight, [0.72; 3]),
+            (Channel::CoatRoughness, [0.36; 3]),
+            (Channel::AnisotropyLevel, [0.64; 3]),
+            (Channel::AnisotropyAngle, [0.81; 3]),
+            (Channel::SheenColor, [0.11, 0.25, 0.39]),
+            (Channel::SheenWeight, [0.44; 3]),
+            (Channel::SheenRoughness, [0.17; 3]),
+            (Channel::CoatNormal, [0.25, 0.75, 0.85]),
+            (Channel::Transmission, [0.57; 3]),
+        ] {
+            execute(&mut session, "textureSet.channel.add", &json!({"channel": channel.id()})).unwrap();
+            execute(&mut session, "layer.fill.set", &json!({"channel": channel.id(), "color": color})).unwrap();
+        }
+
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        let update = link.sync(&mut session, None, None, 0, 0.0);
+        assert_eq!(link.compositor_status().0, "Layers: GPU", "{}", link.compositor_status().1);
+        let Ok(mut gpu) = Headless::new() else { return };
+        let (_, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+        assert!(errors.is_empty(), "{errors:?}");
+        session.update();
+        let textures = gpu.renderer.display_textures();
+        for kind in DisplayKind::ALL {
+            if kind == DisplayKind::BaseColor {
+                continue;
+            }
+            let (width, height, actual) = Readback::blocking(&gpu.device, &gpu.queue, textures[0][kind as usize]).unwrap();
+            assert_eq!((width, height), (128, 128), "{kind:?}");
+            let expected = display_tile_bytes(&session.caches[0].composite, &Default::default(), kind, 0, 0, 0);
+            let stride = kind.bytes_per_texel();
+            let (x, y) = (9, 15);
+            let actual = &actual[(y * width as usize + x) * stride..][..stride];
+            let expected = &expected[(y * 64 + x) * stride..][..stride];
+            assert_eq!(actual, expected, "{kind:?}");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
     fn built_in_sample_composes_both_smart_materials_on_gpu_after_open_and_resize() {
         use texturecraft_render::{headless::Headless, readback::Readback};
 
