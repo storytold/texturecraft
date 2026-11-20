@@ -23,7 +23,9 @@ impl Drop for Scratch {
 }
 
 fn temp(tag: &str) -> Scratch {
-    let dir = std::env::temp_dir().join(format!("tc_mtlx_{tag}_{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("tc_mtlx_{tag}_{}_{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     Scratch(dir)
 }
