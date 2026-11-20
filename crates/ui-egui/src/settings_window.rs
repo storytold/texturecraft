@@ -355,6 +355,19 @@ fn general(
     });
 
     section(ui, n_("LAYER STACK OPTIONS"));
+    row(ui, tr("Layer compositing"), |ui, label| {
+        egui::ComboBox::from_id_salt("layer_compositor")
+            .width(CONTROL_WIDTH)
+            .selected_text(if p.gpu_compositing { tr("GPU (Automatic)") } else { tr("CPU") })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut p.gpu_compositing, true, tr("GPU (Automatic)"));
+                ui.selectable_value(&mut p.gpu_compositing, false, tr("CPU"));
+            })
+            .response
+            .labelled_by(label)
+            .on_hover_text(tr("GPU uses the CPU on unsupported devices or layer stacks. CPU forces software composition."));
+    });
+
     ui.horizontal(|ui| {
         ui.add_space(12.0);
         ui.add_enabled_ui(false, |ui| {
@@ -490,19 +503,6 @@ fn general(
         .on_hover_text(tr(
             "Size of the textures the viewport shows: lower uses less GPU memory with large texture sets. Painting and export keep full resolution.",
         ));
-    });
-
-    row(ui, tr("Viewport compositing"), |ui, label| {
-        egui::ComboBox::from_id_salt("viewport_compositor")
-            .width(CONTROL_WIDTH)
-            .selected_text(if p.gpu_compositing { tr("GPU (Automatic)") } else { tr("CPU") })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut p.gpu_compositing, true, tr("GPU (Automatic)"));
-                ui.selectable_value(&mut p.gpu_compositing, false, tr("CPU"));
-            })
-            .response
-            .labelled_by(label)
-            .on_hover_text(tr("GPU uses the CPU on unsupported devices or layer stacks. CPU forces software composition."));
     });
 
     section(ui, n_("RESOURCES"));
