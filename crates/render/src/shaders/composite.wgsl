@@ -66,21 +66,40 @@ fn baked_at(pixel: vec2<u32>, layer: i32) -> vec4<f32> {
     return textureLoad(bake_maps, vec2<i32>(sample_pixel), layer, 0);
 }
 
-fn cells(p: vec3<f32>, seed: u32) -> f32 {
+// The nearest squared distance can be clipped to one when no feature ID is needed.
+fn cellular(p: vec3<f32>, seed: u32, details: bool) -> vec3<f32> {
     let cell = vec3<i32>(floor(p));
     let local = fract(p);
-    var nearest = 1.0;
+    var nearest = select(1.0, 4.0, details);
+    var second = 1.0;
+    var feature_id = 0u;
     for (var z = -1; z <= 1; z++) {
         for (var y = -1; y <= 1; y++) {
             for (var x = -1; x <= 1; x++) {
                 let shift = vec3(x, y, z);
-                let feature = vec3<f32>(hash(cell + shift, seed * 0xc2b2ae35u)) / 4294967296.0;
+                let bits = hash(cell + shift, seed * 0xc2b2ae35u);
+                let feature = vec3<f32>(bits) / 4294967296.0;
                 let delta = vec3<f32>(shift) + feature - local;
-                nearest = min(nearest, dot(delta, delta));
+                let distance = dot(delta, delta);
+                if details {
+                    if distance < nearest {
+                        second = nearest;
+                        nearest = distance;
+                        feature_id = bits.x ^ bits.y;
+                    } else {
+                        second = min(second, distance);
+                    }
+                } else {
+                    nearest = min(nearest, distance);
+                }
             }
         }
     }
-    return sqrt(nearest);
+    return vec3(sqrt(min(1.0, nearest)), sqrt(min(1.0, second)), f32(feature_id) / 4294967296.0);
+}
+
+fn cells(p: vec3<f32>, seed: u32) -> f32 {
+    return cellular(p, seed, false).x;
 }
 
 fn cell_value(cell: vec3<i32>, seed: u32) -> f32 {
@@ -96,6 +115,20 @@ fn drip(p: vec3<f32>, x: f32, salt: i32, seed: u32) -> f32 {
     let t = fract(yy);
     let on = cell_value(vec3(column, i32(floor(yy)), 3 + salt), seed) > 0.5;
     return select(0.0, across * pow(t, 1.6) * (1.0 - smoothstep(0.9, 1.0, t)), on);
+}
+
+fn woven(p: vec3<f32>, seed: u32, twill: bool) -> f32 {
+    let point = p.xy * 2.0;
+    let cell = vec2<i32>(floor(point));
+    let local = fract(point);
+    let period = select(2, 4, twill);
+    let warp_on_top = ((cell.x + cell.y) & (period - 1)) < period / 2;
+    let thread_uv = select(local, local.yx, warp_on_top);
+    let pi = 3.141592653589793;
+    let thread = sqrt(max(0.0, sin(pi * thread_uv.x))) * (0.8 + 0.2 * sin(pi * thread_uv.y));
+    let tone = select(1.0, 0.55, twill && !warp_on_top);
+    let fiber = noise(p * vec3(40.0, 40.0, 1.0), seed, false);
+    return clamp(thread * tone * (0.88 + 0.12 * fiber), 0.0, 1.0);
 }
 
 fn pattern(kind: u32, p: vec3<f32>, seed: u32) -> f32 {
@@ -140,6 +173,56 @@ fn pattern(kind: u32, p: vec3<f32>, seed: u32) -> f32 {
         case 13u: {
             let fine = noise(p * vec3(37.0, 1.3, 1.0), seed ^ 0x2bu, false);
             return clamp(max(drip(p, p.x, 0, seed), drip(p, p.x + 0.37, 1, seed) * 0.8) * (0.6 + 0.4 * fine), 0.0, 1.0);
+        }
+        case 48u: {
+            let cell = vec3<i32>(floor(p));
+            return select(0.0, 1.0, ((cell.x + cell.y + cell.z) & 1) == 0);
+        }
+        case 49u: { return select(0.0, 1.0, fract(p.x) < 0.5); }
+        case 50u: {
+            let row = i32(floor(p.y * 2.0));
+            let x = p.x + select(0.0, 0.5, (row & 1) == 1);
+            let local = fract(vec2(x, p.y * 2.0));
+            let d = min(min(local.x, 1.0 - local.x), min(local.y, 1.0 - local.y) * 0.5);
+            let tone = cell_value(vec3(i32(floor(x)), row, 0), seed) * 0.6 + noise(p * 9.0, seed, false) * 0.4;
+            return smoothstep(0.02, 0.045, d) * (0.85 + 0.15 * tone);
+        }
+        case 51u: {
+            let cell = vec2<i32>(floor(p.xy));
+            let local = fract(p.xy);
+            let d = min(min(local.x, 1.0 - local.x), min(local.y, 1.0 - local.y));
+            return smoothstep(0.015, 0.035, d) * (0.9 + 0.1 * cell_value(vec3(cell, 0), seed));
+        }
+        case 52u: { return woven(p, seed, false); }
+        case 53u: { return woven(p, seed, true); }
+        case 54u: {
+            let w = noise(p * 0.7, seed ^ 0x2du, true) - 0.5;
+            let features = cellular(p + vec3(w * 0.4, -w * 0.4, 0.0), seed, true);
+            let crease = smoothstep(0.0, 0.16, features.y - features.x);
+            let pebble = 1.0 - features.x * 0.5;
+            let fine = noise(p * 7.0, seed ^ 0x13u, false);
+            return clamp(crease * pebble * (0.85 + 0.15 * fine), 0.0, 1.0);
+        }
+        case 55u: {
+            let first = min(cells(p, seed) * 1.25, 1.0);
+            let second = min(cells(p * 2.3 + 5.1, seed ^ 0x5au) * 1.25, 1.0);
+            return clamp(first * first * 0.75 + second * second * 0.25, 0.0, 1.0);
+        }
+        case 56u: {
+            let a = noise(p * vec3(1.5, 60.0, 1.0), seed, false);
+            let b = noise(p * vec3(0.4, 18.0, 1.0), seed ^ 0x77u, false);
+            return clamp(a * 0.6 + b * 0.4, 0.0, 1.0);
+        }
+        case 57u: { return cellular(p, seed, true).z; }
+        case 58u: {
+            let w = noise(p * 1.3, seed ^ 0x61u, true) - 0.5;
+            let q = p * vec3(1.15, 0.85, 1.0) + vec3(w * 0.3, w * 0.3, 0.0);
+            let features = cellular(q, seed, true);
+            let tone = features.z;
+            let print = select(0.0, 1.0 - smoothstep(0.18 + 0.1 * tone, 0.3 + 0.12 * tone, features.x), tone > 0.4);
+            let ridges = 0.5 + 0.5 * sin(features.x * 190.0 + w * 12.0);
+            let smudge = clamp((fbm(p * 1.7, 4u, seed ^ 0x33u, false) - 0.55) * 3.0, 0.0, 1.0);
+            return clamp(print * ridges * 0.9 + smudge * 0.4, 0.0, 1.0);
         }
         default: { return fract(p.x); }
     }
@@ -441,7 +524,7 @@ fn layer_mask(layer: Operation, pixel: vec2<u32>, uv: vec2<f32>, surface: Surfac
             let sampled = painted(e, pixel);
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.w;
-        } else if e.ids.y < 20u {
+        } else if e.ids.y < 20u || e.ids.y >= 48u {
             result = blend_scalar(u32(e.balance.z), mask, value(e, uv, surface).x);
         } else if e.ids.y >= 40u {
             result = blend_scalar(u32(e.balance.z), mask, generator(e, surface, baked));

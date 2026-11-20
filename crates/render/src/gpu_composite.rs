@@ -20,6 +20,9 @@ const MAX_LAYERS: usize = 128;
 const MAX_EFFECTS: usize = 256;
 const MAX_PAINT_WORDS: usize = (64 << 20) / size_of::<u32>();
 const NO_PAINT_IMAGE: u32 = u32::MAX;
+// Extended procedural sources follow the filter and generator opcodes.
+const FIRST_GENERATOR: u32 = 40;
+const FIRST_EXTENDED_PATTERN: u32 = 48;
 pub(crate) const ROWS: u32 = 64;
 const WORKGROUP: u32 = 8;
 const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
@@ -330,7 +333,7 @@ impl CompositeProgram {
         let writes_normal = changes_channel(7, Normal.default_value());
         let layer_count = operations.len() as u32;
         operations.extend(effects);
-        let needs_surface = operations.iter().any(|op| op.balance[3] > 0.0 || op.ids[1] >= 40);
+        let needs_surface = operations.iter().any(|op| op.balance[3] > 0.0 || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]));
         Ok(Self {
             operations,
             layer_count,
@@ -406,6 +409,17 @@ fn source_operation(source: Option<&Source>, projection: &Projection, default: [
                 ProceduralKind::Pores => 11,
                 ProceduralKind::Chips => 12,
                 ProceduralKind::Streaks => 13,
+                ProceduralKind::Checker => 48,
+                ProceduralKind::Stripes => 49,
+                ProceduralKind::Bricks => 50,
+                ProceduralKind::Tiles => 51,
+                ProceduralKind::Weave => 52,
+                ProceduralKind::Twill => 53,
+                ProceduralKind::Leather => 54,
+                ProceduralKind::Hammered => 55,
+                ProceduralKind::Brushed => 56,
+                ProceduralKind::Voronoi => 57,
+                ProceduralKind::Smudges => 58,
                 _ => return None,
             };
             op.ids = [0, kind, pattern.seed, u32::from(pattern.invert)];
@@ -952,6 +966,68 @@ fn paint_windows(
         work.push(first);
     }
     Ok(windows)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod procedural_tests {
+    use super::*;
+    use crate::{headless::Headless, readback::Readback};
+    use texturecraft_compose::pattern::{Coords, procedural};
+    use texturecraft_core::{Fill, Layer, Mask, Procedural, TextureSet};
+    use texturecraft_geom::primitives;
+    use texturecraft_texel::{srgb_lut, to_u16};
+
+    #[test]
+    fn material_patterns_match_cpu_as_uv_fills_and_triplanar_masks() {
+        use ProceduralKind::*;
+        const SIZE: u32 = 128;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let (lo, hi) = mesh.bounds();
+        let mut gpu = Headless::new().ok();
+        if let Some(gpu) = &mut gpu {
+            gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        }
+        for kind in [Checker, Stripes, Bricks, Tiles, Weave, Twill, Leather, Hammered, Brushed, Voronoi, Smudges] {
+            let pattern = Procedural { scale: 9.7, seed: 73, contrast: 1.1, balance: -0.03, invert: true, ..Procedural::new(kind) };
+            for in_mask in [false, true] {
+                let projection = if in_mask {
+                    Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43] }
+                } else {
+                    Projection::Uv { scale: [1.15, 0.76], rotation: 13.0, offset: [-0.51, 0.12] }
+                };
+                let source = Source::Procedural { pattern: pattern.clone(), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
+                let mut project = Project::new("Procedural material", "builtin:plane");
+                project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+                let fill = Fill {
+                    sources: BTreeMap::from([(Channel::BaseColor, if in_mask { Source::Uniform([0.9; 3]) } else { source.clone() })]),
+                    projection: projection.clone(),
+                    ..Fill::default()
+                };
+                let mut layer = Layer::new(project.alloc_id(), "Procedural fill", LayerKind::Fill(fill), &[Channel::BaseColor]);
+                if in_mask {
+                    let mut mask = Mask::new(MaskBackground::Black);
+                    mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone() }));
+                    layer.mask = Some(mask);
+                }
+                project.insert_layer(0, layer, None, false).unwrap();
+                let mut program = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap();
+                if let Some(gpu) = &mut gpu {
+                    program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+                    gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+                    let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][0]).unwrap();
+                    for index in (0..rgba.len() / 4).step_by(37) {
+                        let surface = gbuf.surface(&mesh, index).unwrap();
+                        let coords = Coords { uv: surface.uv, pos: (surface.pos - (lo + hi) * 0.5) / ((hi - lo).length() * 0.5), nrm: surface.nrm };
+                        let value = procedural(&pattern, &projection, &coords);
+                        let linear = if in_mask { 0.5 + (0.9 - 0.5) * value } else { value };
+                        let expected = srgb_lut()[usize::from(to_u16(linear) >> 4)];
+                        assert!(rgba[index * 4].abs_diff(expected) <= 3, "{kind:?}, mask={in_mask}, texel {index}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
