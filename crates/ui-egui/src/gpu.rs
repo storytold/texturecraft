@@ -674,6 +674,32 @@ mod tests {
         }
     }
 
+    /// Time the UI's actual tile packing, excluding GPU submission and presentation.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_viewport_upload_preparation() {
+        let mut gpu = link();
+        let mut s = session(true);
+        s.update();
+        for shift in [0, 1, 2] {
+            let mut times = Vec::new();
+            let mut payload = 0;
+            for pass in 0..105 {
+                s.caches[0].upload = [(0, 0), (1, 0), (0, 1), (1, 1)].into();
+                let start = std::time::Instant::now();
+                let scene = gpu.sync(&mut s, None, None, shift, 0.0);
+                let elapsed = start.elapsed();
+                payload = scene.tiles.iter().map(|tile| tile.4.len()).sum::<usize>();
+                std::hint::black_box(scene);
+                if pass >= 5 {
+                    times.push(elapsed);
+                }
+            }
+            times.sort_unstable();
+            println!("display shift {shift}: {payload} staging bytes, 100 frames, packing P50 {:.2?} P95 {:.2?}", times[49], times[94]);
+        }
+    }
+
     #[test]
     fn removed_texture_sets_release_kind_records() {
         let mut gpu = link();
