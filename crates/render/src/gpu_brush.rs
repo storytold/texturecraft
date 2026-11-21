@@ -1,9 +1,10 @@
-//! GPU coverage for an ordinary brush stroke. Only its final alpha returns to the document.
+//! GPU brush coverage and projection. Only finished stroke tiles return to the document.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
 use bytemuck::{Pod, Zeroable};
+use texturecraft_compose::{ImageRes, Stencil};
 use texturecraft_geom::{
     Bvh, Mesh, UvGBuffer,
     glam::{Mat4, Vec2},
@@ -12,11 +13,16 @@ use texturecraft_paint::{BrushAlpha, BrushSettings, EyeDepth, Stamp, UvStamp};
 use texturecraft_texel::{TILE, TileImage};
 use wgpu::util::DeviceExt;
 
+use crate::gpu_stencil::{self, GpuStencil};
+
 type Tiles = BTreeSet<(u32, u32)>;
 type TileDabs = BTreeMap<(u32, u32), Vec<u32>>;
+type ProjectedTiles = BTreeMap<(u32, u32), Vec<[f32; 4]>>;
 const ROW_BYTES: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 const TILE_BYTES: u64 = (ROW_BYTES * TILE) as u64;
 const CHUNK: usize = 256;
+const PROJECTION_TILE_BYTES: u64 = (TILE * TILE) as u64 * size_of::<[f32; 4]>() as u64;
+const PROJECTION_READBACK_TILES: usize = 64;
 
 pub struct BrushInput {
     pub mesh: Arc<Mesh>,
@@ -25,6 +31,7 @@ pub struct BrushInput {
     pub material: usize,
     pub depth: Option<Arc<EyeDepth>>,
     pub settings: BrushSettings,
+    pub stencil: Option<Stencil>,
 }
 
 #[repr(C)]
@@ -62,12 +69,15 @@ pub(crate) struct BrushPipeline {
     pipelines: BTreeMap<u32, wgpu::ComputePipeline>,
     rays: Option<(Weak<Bvh>, wgpu::Buffer, wgpu::Buffer)>,
     depth: Option<(Weak<EyeDepth>, wgpu::TextureView)>,
+    stencil_image: Option<(Weak<ImageRes>, wgpu::TextureView)>,
+    projection_readback: Option<wgpu::ComputePipeline>,
 }
 
 impl BrushPipeline {
     pub(crate) fn clear_visibility(&mut self) {
         self.rays = None;
         self.depth = None;
+        self.stencil_image = None;
     }
 
     pub fn new(device: &wgpu::Device) -> Self {
@@ -94,7 +104,7 @@ impl BrushPipeline {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("tc_brush"), bind_group_layouts: &[Some(&inputs)], immediate_size: 0 });
         let source = concat!(include_str!("shaders/rays.wgsl"), "\n", include_str!("shaders/noise.wgsl"), "\n", include_str!("shaders/brush.wgsl"));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc_brush"), source: wgpu::ShaderSource::Wgsl(source.into()) });
-        Self { shader, layout, pipelines: BTreeMap::new(), rays: None, depth: None }
+        Self { shader, layout, pipelines: BTreeMap::new(), rays: None, depth: None, stencil_image: None, projection_readback: None }
     }
 
     fn pipeline(&mut self, device: &wgpu::Device, alpha: BrushAlpha) -> wgpu::ComputePipeline {
@@ -170,6 +180,19 @@ impl BrushPipeline {
         let (lo, hi) = input.mesh.bounds();
         let center = (lo + hi) * 0.5;
         let radius = (hi - lo).length().mul_add(0.5, 0.0).max(1e-4);
+        self.stencil_image.take_if(|(source, _)| source.strong_count() == 0);
+        let projection = if let Some(stencil) = &input.stencil {
+            let key = Arc::downgrade(&stencil.image);
+            if self.stencil_image.as_ref().is_none_or(|(previous, _)| !previous.ptr_eq(&key)) {
+                self.stencil_image = Some((key, gpu_stencil::upload_image(device, queue, &stencil.image)?));
+            }
+            let (_, image) = self.stencil_image.as_ref().ok_or("projection image missing")?;
+            let stencil = GpuStencil::new(device, image.clone(), stencil, center, radius);
+            let readback = self.projection_readback.get_or_insert_with(|| gpu_stencil::readback_pipeline(device)).clone();
+            Some((stencil, readback))
+        } else {
+            None
+        };
         let settings = &input.settings;
         let pipeline = self.pipeline(device, settings.alpha);
         let mut params = Parameters {
@@ -190,7 +213,19 @@ impl BrushPipeline {
                 params.ortho = to_eye.extend(1.0).to_array();
             }
         }
-        Ok(GpuBrushStroke { input, pipeline, device: device.clone(), queue: queue.clone(), surface, visibility, alpha, view, params, scratch: None })
+        Ok(GpuBrushStroke {
+            input,
+            pipeline,
+            device: device.clone(),
+            queue: queue.clone(),
+            surface,
+            visibility,
+            alpha,
+            view,
+            params,
+            scratch: None,
+            projection,
+        })
     }
 }
 
@@ -205,11 +240,16 @@ pub struct GpuBrushStroke {
     view: wgpu::TextureView,
     params: Parameters,
     scratch: Option<wgpu::Buffer>,
+    projection: Option<(GpuStencil, wgpu::ComputePipeline)>,
 }
 
 impl GpuBrushStroke {
     pub fn view(&self) -> wgpu::TextureView {
         self.view.clone()
+    }
+
+    pub fn stencil(&self) -> Option<GpuStencil> {
+        self.projection.as_ref().map(|(stencil, _)| stencil.clone())
     }
 
     pub fn append_world(&mut self, stamps: &[Stamp]) -> Result<Tiles, String> {
@@ -380,6 +420,80 @@ impl GpuBrushStroke {
         }
         Ok(alpha)
     }
+    /// Read the projected linear RGB and image alpha of the touched tiles.
+    /// The stroke's geometric coverage remains in the separate alpha map.
+    pub fn read_projection(&self, tiles: &Tiles) -> Result<ProjectedTiles, String> {
+        let Some((stencil, pipeline)) = &self.projection else { return Err("The stroke has no GPU projection.".into()) };
+        if tiles.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let (device, queue) = (&self.device, &self.queue);
+        let limits = device.limits();
+        let tiles_per_batch = PROJECTION_READBACK_TILES
+            .min((limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / PROJECTION_TILE_BYTES) as usize)
+            .min(limits.max_compute_workgroups_per_dimension as usize);
+        if tiles_per_batch == 0 {
+            return Err("The GPU projection readback exceeds the adapter's buffer limits.".into());
+        }
+        let coords: Vec<_> = tiles.iter().copied().collect();
+        if coords.iter().any(|&(x, y)| x >= self.input.uv.width / TILE || y >= self.input.uv.height / TILE) {
+            return Err("A GPU projection tile is outside the texture set.".into());
+        }
+        let bytes = tiles.len().min(tiles_per_batch) as u64 * PROJECTION_TILE_BYTES;
+        let (output, read) = crate::gpu_trace::scoped(device, "GPU projection readback buffers", || {
+            (
+                buffer(device, "tc_projected_tiles", bytes, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+                buffer(device, "tc_read_projected_tiles", bytes, wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ),
+            )
+        })?;
+        let layout = pipeline.get_bind_group_layout(0);
+        let mut samples = BTreeMap::new();
+        for chunk in coords.chunks(tiles_per_batch) {
+            let bytes = chunk.len() as u64 * PROJECTION_TILE_BYTES;
+            let origins: Vec<_> = chunk.iter().map(|&(x, y)| [x * TILE, y * TILE]).collect();
+            let submitted = crate::gpu_trace::scoped(device, "GPU projection readback", || {
+                let tile_origins = storage(device, "tc_projected_tile_origins", &origins);
+                let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("tc_projected_tiles"),
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.surface.0) },
+                        wgpu::BindGroupEntry { binding: 2, resource: self.surface.1.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&stencil.image) },
+                        wgpu::BindGroupEntry { binding: 4, resource: stencil.uniforms.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: tile_origins.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: output.as_entire_binding() },
+                    ],
+                });
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_read_projected_tiles") });
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &bindings, &[]);
+                    pass.dispatch_workgroups(TILE / 8, TILE / 8, chunk.len() as u32);
+                }
+                encoder.copy_buffer_to_buffer(&output, 0, &read, 0, Some(bytes));
+                queue.submit([encoder.finish()])
+            })?;
+            let slice = read.slice(..bytes);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+            device.poll(wgpu::PollType::Wait { submission_index: Some(submitted), timeout: None }).map_err(|e| e.to_string())?;
+            receiver.recv().map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+            {
+                let mapping = slice.get_mapped_range().map_err(|e| e.to_string())?;
+                let rgba: &[[f32; 4]] = bytemuck::try_cast_slice(&mapping).map_err(|e| e.to_string())?;
+                for (&tile, texels) in chunk.iter().zip(rgba.chunks_exact((TILE * TILE) as usize)) {
+                    samples.insert(tile, texels.to_vec());
+                }
+            }
+            read.unmap();
+        }
+        Ok(samples)
+    }
 }
 
 // Clip the triangle to the dab's enclosing volume before binning its projected texels.
@@ -473,6 +587,71 @@ mod tests {
     use texturecraft_paint::{RasterCtx, Shape, StrokeCanvas, rasterize, rasterize_uv};
 
     #[test]
+    fn gpu_projection_readback_matches_screen_stencil_sampling() {
+        use texturecraft_geom::glam::Vec4;
+
+        let Ok(mut gpu) = crate::headless::Headless::new() else { return };
+        const SIZE: u32 = 128;
+        let mesh = Arc::new(texturecraft_geom::primitives::plane(1.0, 1));
+        let uv = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let bvh = Arc::new(Bvh::new(&mesh));
+        for (tile, srgb) in [(false, true), (true, false)] {
+            let stencil = Stencil {
+                image: Arc::new(ImageRes {
+                    width: 2,
+                    height: 2,
+                    rgba: vec![[0.3, 0.2, 0.1, 0.0], [0.0, 0.8, 1.4, 0.4], [0.9, 0.6, 0.1, 0.8], [0.04, 0.3, 0.5, 1.0]],
+                    srgb,
+                }),
+                view_proj: Mat4::from_cols(Vec4::X, Vec4::Z, Vec4::Y, Vec4::W),
+                center: [0.08, -0.025],
+                half: [0.18, 0.23],
+                rotation: 0.37,
+                tile,
+            };
+            let input = BrushInput {
+                mesh: mesh.clone(),
+                bvh: bvh.clone(),
+                uv: uv.clone(),
+                material: 0,
+                depth: None,
+                settings: BrushSettings::default(),
+                stencil: Some(stencil.clone()),
+            };
+            let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
+            let dab = UvStamp { center: Vec2::splat(0.5), radius: 0.41, angle: 0.0, flow: 0.8, hardness: 0.7, seed: 5, source: None };
+            let tiles = stroke.append_uv(&[dab]).unwrap();
+            let coverage = stroke.read_alpha(&tiles).unwrap();
+            let projected = stroke.read_projection(&tiles).unwrap();
+            assert_eq!(projected.keys().copied().collect::<Tiles>(), tiles);
+            let mut skipped = 0;
+            let mut sampled = 0;
+            let mut clipped = 0;
+            for ((tx, ty), samples) in projected {
+                for (i, gpu) in samples.into_iter().enumerate() {
+                    let x = tx * TILE + (i as u32 % TILE);
+                    let y = ty * TILE + (i as u32 / TILE);
+                    if coverage.get(x, y)[0] == 0 {
+                        assert_eq!(gpu, [0.0; 4]);
+                        skipped += 1;
+                        continue;
+                    }
+                    let cpu = uv.surface(&mesh, (y * SIZE + x) as usize).and_then(|surface| stencil.sample_world(surface.pos));
+                    if let Some(([r, g, b], alpha)) = cpu.filter(|&(_, alpha)| alpha > 0.0) {
+                        assert!(gpu.iter().zip([r, g, b, alpha]).all(|(gpu, cpu)| (gpu - cpu).abs() <= 1e-5), "{x}, {y}: {gpu:?} vs {cpu:?}");
+                        sampled += 1;
+                    } else {
+                        assert_eq!(gpu, [0.0; 4], "{x}, {y}: projected outside the image");
+                        clipped += 1;
+                    }
+                }
+            }
+            assert!(sampled > 0 && skipped > 0);
+            assert!(tile || clipped > 0);
+        }
+    }
+
+    #[test]
     fn procedural_alphas_keep_their_seeded_patterns_in_both_views() {
         let Ok(mut gpu) = Headless::new() else { return };
         let size = 128;
@@ -487,7 +666,8 @@ mod tests {
                 settings.alpha_params.contrast = 1.3;
                 settings.alpha_params.invert = invert;
                 let shape = Shape { alpha, image: None, library: None, params: settings.alpha_params, level: 0 };
-                let input = || BrushInput { mesh: mesh.clone(), bvh: bvh.clone(), uv: uv.clone(), material: 0, depth: None, settings: settings.clone() };
+                let input =
+                    || BrushInput { mesh: mesh.clone(), bvh: bvh.clone(), uv: uv.clone(), material: 0, depth: None, settings: settings.clone(), stencil: None };
 
                 let uv_dab = UvStamp { center: Vec2::splat(0.48), radius: 0.29, angle: 35.0, flow: 0.8, hardness: 0.6, seed, source: None };
                 let mut cpu = StrokeCanvas::new(size, size);
@@ -566,7 +746,7 @@ mod tests {
         let mut cpu = StrokeCanvas::new(size, size);
         rasterize(&mut cpu, &context, dabs);
 
-        let input = BrushInput { mesh, bvh, uv, material: 0, depth, settings };
+        let input = BrushInput { mesh, bvh, uv, material: 0, depth, settings, stencil: None };
         let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
         let tiles = stroke.append_world(dabs).unwrap();
         (cpu.alpha, stroke.read_alpha(&tiles).unwrap())
@@ -662,6 +842,7 @@ mod tests {
             mesh,
             material: 0,
             settings: BrushSettings::default(),
+            stencil: None,
         };
         let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
         let dab = Stamp {
