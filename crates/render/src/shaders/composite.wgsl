@@ -23,6 +23,7 @@ struct Params {
     // Layer count, scratch row pitch, DisplayKind output bits, left column.
     program: vec4<u32>,
     coverage: vec4<u32>,
+    // Origin and size in tiles, or a sentinel in x for per-image windows.
     paint_window: vec4<u32>,
     // Source origin and size of the neighborhood fields.
     filter_region: vec4<u32>,
@@ -397,40 +398,65 @@ fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
     return vec4(value(layer, decal.xy, surface), decal.z);
 }
 
-fn stored_paint(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
-    // An empty signed texel stores zero as 32768.
-    let empty = vec4(vec3(select(0.0, 1.0 / 65535.0, layer.ids.x == 6u)), 0.0);
-    if layer.ids.z == NO_PAINT_IMAGE {
-        return empty;
-    }
+fn stored_sample(layer: Operation, table: u32, origin: vec2<u32>, size: vec2<u32>, pixel: vec2<u32>, empty: vec4<f32>) -> vec4<f32> {
     let atlas_tile = pixel / 64u;
-    if any(atlas_tile < params.paint_window.xy) {
+    if any(atlas_tile < origin) {
         return empty;
     }
-    let tile = atlas_tile - params.paint_window.xy;
-    if any(tile >= params.paint_window.zw) {
+    let tile = atlas_tile - origin;
+    if any(tile >= size) {
         return empty;
     }
     let local = pixel % 64u;
-    let offset = paint[paint[layer.ids.z] + tile.y * params.paint_window.z + tile.x];
+    let offset = paint[table + tile.y * size.x + tile.x];
     if offset == 0u {
         return empty;
     }
-    let rgba = layer.ids.w == 4u;
     let texel = offset + (local.y * 64u + local.x) * (layer.ids.w / 2u);
     let first = paint[texel];
-    var coverage = f32(first >> 16u) / 65535.0;
-    var rgb = vec3(f32(first & 65535u) / 65535.0);
-    if rgba {
+    if layer.ids.w == 4u {
         let second = paint[texel + 1u];
-        rgb.y = f32(first >> 16u) / 65535.0;
-        rgb.z = f32(second & 65535u) / 65535.0;
-        coverage = f32(second >> 16u) / 65535.0;
+        return vec4<f32>(vec4(first & 65535u, first >> 16u, second & 65535u, second >> 16u));
     }
-    if layer.ids.x == 6u {
-        rgb = rgb * 2.0 - 1.0;
+    return vec4(vec3(f32(first & 65535u)), f32(first >> 16u));
+}
+
+fn resampled_sample(layer: Operation, image: u32, pixel: vec2<u32>, empty: vec4<f32>) -> vec4<f32> {
+    let texels = vec2(paint[image], paint[image + 1u]);
+    let origin = vec2(paint[image + 2u], paint[image + 3u]);
+    let window = vec2(paint[image + 4u], paint[image + 5u]);
+    let table = image + 6u;
+    if all(texels == params.source.xy) {
+        return stored_sample(layer, table, origin, window, pixel, empty);
     }
-    return vec4(rgb, coverage);
+    let pos = max((vec2<f32>(pixel) + 0.5) * vec2<f32>(texels) / vec2<f32>(params.source.xy) - 0.5, vec2(0.0));
+    let base = vec2<u32>(pos);
+    let weights = fract(pos);
+    let last = texels - 1u;
+    let a = stored_sample(layer, table, origin, window, min(base, last), empty);
+    let b = stored_sample(layer, table, origin, window, min(base + vec2(1u, 0u), last), empty);
+    let c = stored_sample(layer, table, origin, window, min(base + vec2(0u, 1u), last), empty);
+    let d = stored_sample(layer, table, origin, window, min(base + 1u, last), empty);
+    let top = a * (1.0 - weights.x) + b * weights.x;
+    let bottom = c * (1.0 - weights.x) + d * weights.x;
+    return min(floor(top * (1.0 - weights.y) + bottom * weights.y + 0.5), vec4(65535.0));
+}
+
+fn stored_paint(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
+    let signed = layer.ids.x == 6u;
+    // An empty signed texel holds the rounded 16-bit encoding of signed zero.
+    let empty = vec4(vec3(select(0.0, 32768.0, signed)), 0.0);
+    var raw = empty;
+    if layer.ids.z != NO_PAINT_IMAGE {
+        let image = paint[layer.ids.z];
+        if params.paint_window.x == 0xffffffffu {
+            raw = resampled_sample(layer, image, pixel, empty);
+        } else {
+            raw = stored_sample(layer, image, params.paint_window.xy, params.paint_window.zw, pixel, empty);
+        }
+    }
+    let p = raw / 65535.0;
+    return vec4(select(p.rgb, p.rgb * 2.0 - 1.0, signed), p.a);
 }
 
 struct ProjectedBrush {

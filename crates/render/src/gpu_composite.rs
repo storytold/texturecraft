@@ -19,7 +19,7 @@ use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialIma
 use crate::gpu_neighbourhood::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
 use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
-use crate::paint_window::TileWindow;
+use crate::paint_window::CompositePaintWindow;
 use wgpu::util::DeviceExt;
 
 #[path = "gpu_composite_groups.rs"]
@@ -93,6 +93,22 @@ struct GeometryMasks {
     parts: Vec<Vec<String>>,
     words: Vec<u32>,
     stride: usize,
+}
+
+#[derive(Default)]
+struct PaintInputs {
+    images: Vec<TileImage>,
+    indices: BTreeMap<(LayerId, Option<Channel>), u32>,
+}
+
+impl PaintInputs {
+    fn register(&mut self, id: LayerId, channel: Option<Channel>, image: &TileImage) -> u32 {
+        *self.indices.entry((id, channel)).or_insert_with(|| {
+            let index = self.images.len() as u32;
+            self.images.push(image.clone());
+            index
+        })
+    }
 }
 
 impl GeometryMasks {
@@ -503,7 +519,7 @@ impl CompositeProgram {
             brush.validate(set.size())?;
         }
         let mut operations: Vec<Operation> = Vec::new();
-        let mut paint = Vec::new();
+        let mut paint = PaintInputs::default();
         let mut tile_patterns = TilePatterns::default();
         let mut effects = Vec::new();
         let mut procedural = ProceduralInputs::new(set.resolution);
@@ -525,12 +541,13 @@ impl CompositeProgram {
                     continue;
                 }
             };
-            let layer = project.layers.get(&id).ok_or("A layer is missing from the material.")?;
-            if !layer.visible {
+            let own = project.layers.get(&id).ok_or("A layer is missing from the material.")?;
+            if !own.visible {
                 continue;
             }
-            let geometry_mask = geometry.register(inherited_geometry, layer.geometry_mask.as_deref());
-            let mask = layer.mask.as_ref().filter(|m| m.enabled);
+            let Some(layer) = project.content_layer(id) else { continue };
+            let geometry_mask = geometry.register(inherited_geometry, own.geometry_mask.as_deref());
+            let mask = project.layers.get(&project.mask_owner(id)).and_then(|owner| owner.mask.as_ref()).filter(|m| m.enabled);
             if let LayerKind::Group { children, .. } = &layer.kind {
                 if depth >= texturecraft_core::project::MAX_DEPTH || children.is_empty() {
                     continue;
@@ -558,7 +575,7 @@ impl CompositeProgram {
                     continue;
                 }
                 let begin = effects.len() as u32;
-                let background = compile_mask(mask, pixels, set.size(), brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
+                let background = compile_mask(mask, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
                 let count = effects.len() as u32 - begin;
                 if count == 0 && background == 0.0 {
                     continue;
@@ -594,7 +611,7 @@ impl CompositeProgram {
                 continue;
             }
             let mask_start = effects.len() as u32;
-            let mask_background = compile_mask(mask, pixels, set.size(), brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
+            let mask_background = compile_mask(mask, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
             let shared_content = effects.len() as u32;
             let mask_count = shared_content - mask_start;
             if mask_background == 0.0 && mask_count == 0 {
@@ -644,7 +661,7 @@ impl CompositeProgram {
                     return Err("A layer has an invalid opacity.");
                 }
                 let (painted, brush_value) = if fill.is_none() {
-                    (sparse_channel(pixels, id, channel, set.size())?, brush.as_ref().and_then(|brush| brush.value_for_layer(id, channel)))
+                    (sparse_channel(pixels, layer.id, channel)?, brush.as_ref().and_then(|brush| brush.value_for_layer(layer.id, channel)))
                 } else {
                     (None, None)
                 };
@@ -653,9 +670,7 @@ impl CompositeProgram {
                 for &(effect, template) in &templates {
                     let op = if let Some(op) = template {
                         op
-                    } else if let Some(op) =
-                        content_deposit(effect, channel, pixels, set.size(), brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))?
-                    {
+                    } else if let Some(op) = content_deposit(effect, channel, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))? {
                         adds_coverage = true;
                         op
                     } else {
@@ -687,7 +702,7 @@ impl CompositeProgram {
                 }
                 non_default[slot as usize] = true;
                 let mut op = if fill.is_none() {
-                    content_paint(channel, painted, brush_value, stencil_pigment, &mut paint)
+                    content_paint(layer.id, channel, painted, brush_value, stencil_pigment, &mut paint)
                 } else {
                     fill.and_then(|fill| source_operation(source, &fill.projection, default, channel.kind(), &mut procedural))
                         .ok_or("A fill source or projection uses CPU compositing.")?
@@ -739,7 +754,7 @@ impl CompositeProgram {
             filters,
             groups,
             geometry,
-            paint,
+            paint: paint.images,
             ramp_words: procedural.ramp_words,
             curvature_sizes: procedural.curvature_sizes,
             tile_patterns,
@@ -776,10 +791,10 @@ impl CompositeProgram {
             brush.validate(set.size())?;
         }
         let mut operations = vec![Operation::zeroed()];
-        let mut paint = Vec::new();
+        let mut paint = PaintInputs::default();
         let mut procedural = ProceduralInputs::new(set.resolution);
         let mut tile_patterns = TilePatterns::default();
-        let background = compile_mask(Some(mask), pixels, set.size(), brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
+        let background = compile_mask(Some(mask), pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
         operations[0].effects[1] = operations.len() as u32 - 1;
         operations[0].balance[1] = background;
         let filters = FilterPlan::compile(&mut operations, 1, &procedural);
@@ -793,7 +808,7 @@ impl CompositeProgram {
             filters,
             groups: GroupPlan::default(),
             geometry: GeometryMasks::default(),
-            paint,
+            paint: paint.images,
             ramp_words: procedural.ramp_words,
             curvature_sizes: procedural.curvature_sizes,
             tile_patterns,
@@ -817,26 +832,23 @@ fn needs_surface(operations: &[Operation]) -> bool {
     operations.iter().any(|op| op.procedural[3] != 0 || op.ids[1] == BAKED_LIGHTING_OPCODE || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]))
 }
 
-fn sparse_channel(pixels: &PixelStore, id: LayerId, channel: Channel, size: (u32, u32)) -> Result<Option<&TileImage>, &'static str> {
+fn sparse_channel(pixels: &PixelStore, id: LayerId, channel: Channel) -> Result<Option<&TileImage>, &'static str> {
     let image = pixels.layer(id, channel).filter(|image| image.allocated_count() > 0);
-    if image.is_some_and(|image| (image.width(), image.height()) != size || image.comps() != channel.components() + 1) {
+    if image.is_some_and(|image| image.comps() != channel.components() + 1) {
         return Err("A paint layer has a layout that uses CPU compositing.");
     }
     Ok(image)
 }
 
 fn content_paint(
+    id: LayerId,
     channel: Channel,
     image: Option<&TileImage>,
     brush_value: Option<([f32; 3], f32)>,
     stencil_pigment: bool,
-    paint: &mut Vec<TileImage>,
+    paint: &mut PaintInputs,
 ) -> Operation {
-    let image_index = image.map_or(NO_PAINT_IMAGE, |image| {
-        let index = paint.len() as u32;
-        paint.push(image.clone());
-        index
-    });
+    let image_index = image.map_or(NO_PAINT_IMAGE, |image| paint.register(id, Some(channel), image));
     let mut op = Operation { ids: [channel_slot(channel), 10, image_index, (channel.components() + 1) as u32], ..Operation::zeroed() };
     if let Some(([r, g, b], opacity)) = brush_value {
         op.projection[3] = if stencil_pigment && channel == Channel::BaseColor { 2.0 } else { 1.0 };
@@ -863,9 +875,8 @@ fn content_deposit(
     effect: &Effect,
     channel: Channel,
     pixels: &PixelStore,
-    size: (u32, u32),
     brush: Option<&LiveBrush>,
-    (paint, procedural, tile_patterns): (&mut Vec<TileImage>, &mut ProceduralInputs, &mut TilePatterns),
+    (paint, procedural, tile_patterns): (&mut PaintInputs, &mut ProceduralInputs, &mut TilePatterns),
 ) -> Result<Option<Operation>, &'static str> {
     if !effect.opacity.is_finite() {
         return Err("A content effect has an invalid opacity.");
@@ -884,12 +895,12 @@ fn content_deposit(
         op.ids[0] = channel_slot(channel);
         op
     } else {
-        let image = sparse_channel(pixels, effect.id, channel, size)?;
+        let image = sparse_channel(pixels, effect.id, channel)?;
         let value = brush.and_then(|brush| brush.value_for_layer(effect.id, channel));
         if image.is_none() && value.is_none() {
             return Ok(None);
         }
-        content_paint(channel, image, value, brush.is_some_and(|brush| brush.stencil.is_some()), paint)
+        content_paint(effect.id, channel, image, value, brush.is_some_and(|brush| brush.stencil.is_some()), paint)
     };
     op.low[3] = effect.opacity.min(1.0);
     op.balance[2] = blend_code(effect.blend) as f32;
@@ -899,9 +910,8 @@ fn content_deposit(
 fn compile_mask(
     mask: Option<&Mask>,
     pixels: &PixelStore,
-    size: (u32, u32),
     brush: Option<&LiveBrush>,
-    (paint, procedural, tile_patterns): (&mut Vec<TileImage>, &mut ProceduralInputs, &mut TilePatterns),
+    (paint, procedural, tile_patterns): (&mut PaintInputs, &mut ProceduralInputs, &mut TilePatterns),
     effects: &mut Vec<Operation>,
 ) -> Result<f32, &'static str> {
     let Some(mask) = mask else { return Ok(1.0) };
@@ -926,14 +936,10 @@ fn compile_mask(
                 if image.is_none() && live.is_none() {
                     continue;
                 }
-                if image.is_some_and(|image| (image.width(), image.height()) != size || image.comps() != 2) {
+                if image.is_some_and(|image| image.comps() != 2) {
                     return Err("A painted mask has a layout that uses CPU compositing.");
                 }
-                let image_index = image.map_or(NO_PAINT_IMAGE, |image| {
-                    let index = paint.len() as u32;
-                    paint.push(image.clone());
-                    index
-                });
+                let image_index = image.map_or(NO_PAINT_IMAGE, |image| paint.register(effect.id, None, image));
                 let mut op = Operation { ids: [0, 10, image_index, 2], ..Operation::zeroed() };
                 if let Some((value, opacity)) = live {
                     op.projection[3] = 1.0;
@@ -1924,6 +1930,7 @@ impl GpuCompositor {
         for (chunk, window, words) in windows {
             let bytes = (words * 4) as u64;
             window.pack(&program.paint, words, &mut packed);
+            let [paint_x, paint_y, paint_columns, paint_rows] = window.params();
             if pending_bytes + bytes > (max_words * 4) as u64 {
                 device.poll(wgpu::PollType::Wait { submission_index: last_submission.take(), timeout: None }).map_err(|e| e.to_string())?;
                 pending_bytes = 0;
@@ -1977,10 +1984,10 @@ impl GpuCompositor {
                         | (u32::from(program.baked.is_some()) << 1)
                         | (u32::from(program.brush_stencil.is_some()) << 2)
                         | (u32::from(!program.geometry.words.is_empty()) << 3),
-                    window.origin[0],
-                    window.origin[1],
-                    window.size[0],
-                    window.size[1],
+                    paint_x,
+                    paint_y,
+                    paint_columns,
+                    paint_rows,
                     field_rect[0],
                     field_rect[1],
                     field_rect[2],
@@ -2126,12 +2133,12 @@ fn paint_windows(
     shift: u32,
     radius: u32,
     limit: usize,
-) -> Result<Vec<(CompositeRegion, TileWindow, usize)>, String> {
+) -> Result<Vec<(CompositeRegion, CompositePaintWindow, usize)>, String> {
     let mut work = vec![region];
     let mut windows = Vec::new();
     while let Some(chunk) = work.pop() {
         let source = CompositeRegion { min: chunk.min.map(|p| p << shift), max: chunk.max.map(|p| p << shift) }.expanded(radius);
-        let window = TileWindow::covering(source.min, source.max, [size.0, size.1]);
+        let window = CompositePaintWindow::covering(source.min, source.max, [size.0, size.1], &program.paint);
         if let Some(words) = window.words(&program.paint, limit) {
             windows.push((chunk, window, words));
             continue;
@@ -2605,6 +2612,118 @@ mod procedural_tests {
             assert_eq!(rgba.len(), expected.len() * 4);
             for (&expected, &[r, g, b, a]) in expected.iter().zip(rgba.as_chunks::<4>().0) {
                 assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255, "{filter:?} mask: GPU {r} vs CPU {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn linked_paint_resamples_the_source_and_uses_the_instance_mask_override() {
+        use texturecraft_compose::eval::{Composite, Inputs, all_tiles, composite_tiles, mask_image};
+        use texturecraft_compose::tile_bytes;
+        use texturecraft_texel::to_u16_signed;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SOURCE: u32 = 128;
+        const SIZE: u32 = 256;
+        let channels = [Channel::BaseColor, Channel::Height];
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let mut project = Project::new("Linked paint", "builtin:plane");
+        project.texture_sets.extend([TextureSet::new("Source", 0, SOURCE), TextureSet::new("Instance", 1, SIZE)]);
+        let source = project.alloc_id();
+        let source_mask = project.alloc_id();
+        let owner = project.alloc_id();
+        let override_mask = project.alloc_id();
+        let mut layer = Layer::new(source, "Source layer", LayerKind::Paint, &channels);
+        layer.visible = false;
+        layer.geometry_mask = Some(Vec::new());
+        let mut inherited = Mask::new(MaskBackground::Black);
+        inherited.effects.push(Effect::new(source_mask, EffectKind::Paint));
+        layer.mask = Some(inherited);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let instance = Layer::new(owner, "Linked layer", LayerKind::Instance { source }, &[]);
+        project.insert_layer(1, instance, None, false).unwrap();
+
+        let mut pixels = PixelStore::default();
+        for y in 55..74 {
+            for x in 59..69 {
+                pixels.layer_mut(source, Channel::BaseColor, (SOURCE, SOURCE)).set(x, y, &[38_000, 3_000, 2_000, 45_000]);
+                pixels.layer_mut(source, Channel::Height, (SOURCE, SOURCE)).set(x, y, &[to_u16_signed(-0.36), 45_000]);
+                if x < 64 {
+                    pixels.mask_mut(source_mask, (SOURCE, SOURCE)).set(x, y, &[51_000, 62_000]);
+                }
+            }
+        }
+        for y in 114..144 {
+            for x in 117..125 {
+                pixels.mask_mut(override_mask, (SIZE, SIZE)).set(x, y, &[0, 65_535]);
+            }
+        }
+        let mut own = Mask::new(MaskBackground::White);
+        own.effects.push(Effect::new(override_mask, EffectKind::Paint));
+        let mut disabled = own.clone();
+        disabled.enabled = false;
+
+        let baked = BakedMaps::default();
+        let images = ImageStore::default();
+        let tiles = all_tiles(SIZE, SIZE);
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SOURCE, SOURCE), 0), ((SIZE, SIZE), 1)], 2);
+        for (case, mask) in [None, Some(own), Some(disabled)].into_iter().enumerate() {
+            project.layer_mut(owner).unwrap().mask = mask;
+            let inputs = Inputs {
+                project: &project,
+                ts: 1,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked: &baked,
+                block_scales: project.texture_sets[1].block_scales(),
+                preview: None,
+                images: &images,
+                bounds: mesh.bounds(),
+            };
+            let mut oracle = Composite::new(&channels, SIZE);
+            composite_tiles(&inputs, &mut oracle, &tiles);
+            let mut program = CompositeProgram::try_compile_region(&project, &pixels, 1, None).unwrap();
+            program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 1, &program).unwrap();
+            for kind in [DisplayKind::BaseColor, DisplayKind::Height] {
+                let texture = gpu.renderer.display_textures()[1][kind as usize];
+                let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+                let bytes = kind.bytes_per_texel();
+                for &(x, y) in &tiles {
+                    let expected = tile_bytes(&oracle, &baked, kind, x, y);
+                    for (row, expected) in expected.chunks_exact(TILE as usize * bytes).enumerate() {
+                        let offset = ((y * TILE + row as u32) * SIZE + x * TILE) as usize * bytes;
+                        let actual = &actual[offset..offset + expected.len()];
+                        if bytes == 8 {
+                            for (actual, expected) in actual.as_chunks::<2>().0.iter().zip(expected.as_chunks::<2>().0) {
+                                let actual = half::f16::from_le_bytes(*actual).to_f32();
+                                let expected = half::f16::from_le_bytes(*expected).to_f32();
+                                assert!((actual - expected).abs() < 0.001, "linked height case {case}: GPU {actual} vs CPU {expected}");
+                            }
+                        } else {
+                            assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(*b) <= 1), "linked base color case {case} tile ({x}, {y}) row {row}");
+                        }
+                    }
+                }
+                if kind == DisplayKind::BaseColor {
+                    let red = |x, y| actual[((y * SIZE + x) * 4) as usize];
+                    assert_eq!(red(122, 128).cmp(&red(134, 128)), [std::cmp::Ordering::Greater, std::cmp::Ordering::Less, std::cmp::Ordering::Equal][case]);
+                }
+            }
+            let mask = CompositeProgram::try_compile_mask_preview(&project, &pixels, 1, owner, None, None);
+            if let Some(expected) = mask_image(&inputs, owner, SIZE) {
+                let mut mask = mask.unwrap();
+                mask.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+                gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 1, &mask).unwrap();
+                let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.aux_texture(1).unwrap()).unwrap();
+                assert_eq!(actual.len(), expected.len() * 4);
+                for (expected, &[r, g, b, a]) in expected.into_iter().zip(actual.as_chunks::<4>().0) {
+                    assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255, "linked mask case {case}");
+                }
+            } else {
+                assert!(mask.is_err());
             }
         }
     }
@@ -3394,6 +3513,7 @@ mod paint_window_tests {
         let mut coverage = vec![0; 128 * 128];
         for (chunk, window, words) in windows {
             assert!(words <= limit);
+            let [origin_x, origin_y, columns, rows] = window.params();
             let mut packed = Vec::new();
             window.pack(&program.paint, words, &mut packed);
             assert_eq!(packed.len(), words);
@@ -3402,11 +3522,10 @@ mod paint_window_tests {
                     coverage[(y * 128 + x) as usize] += 1;
                     for sy in [y.saturating_mul(2).saturating_sub(8), (2 * y + 8).min(255)] {
                         for sx in [x.saturating_mul(2).saturating_sub(8), (2 * x + 8).min(255)] {
-                            let origin = window.origin;
-                            assert!(sx / 64 >= origin[0] && sy / 64 >= origin[1]);
-                            let (tx, ty) = (sx / 64 - origin[0], sy / 64 - origin[1]);
-                            assert!(tx < window.size[0] && ty < window.size[1]);
-                            let slot = (ty * window.size[0] + tx) as usize;
+                            assert!(sx / 64 >= origin_x && sy / 64 >= origin_y);
+                            let (tx, ty) = (sx / 64 - origin_x, sy / 64 - origin_y);
+                            assert!(tx < columns && ty < rows);
+                            let slot = (ty * columns + tx) as usize;
                             assert_ne!(packed[packed[0] as usize + slot], 0);
                         }
                     }
