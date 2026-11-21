@@ -369,9 +369,9 @@ fn general(
     });
 
     row(ui, tr("Low-resolution material preview"), |ui, label| {
-        ui.checkbox(&mut p.material_start_preview, "")
-            .labelled_by(label)
-            .on_hover_text(tr("Show a quick preview when opening or resizing a texture set. Turn off to see the finished tiles as they arrive."));
+        ui.checkbox(&mut p.material_start_preview, "").labelled_by(label).on_hover_text(tr(
+            "Show a quick preview while the CPU composes a texture set after opening or resizing. Turn off to see the finished tiles as they arrive.",
+        ));
     });
 
     ui.horizontal(|ui| {

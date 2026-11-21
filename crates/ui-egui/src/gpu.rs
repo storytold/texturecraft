@@ -2,19 +2,20 @@
 //! layout, dirty tiles, environment) and the egui paint callback that renders and blits a view.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use rayon::prelude::*;
 use texturecraft_engine::Session;
 use texturecraft_engine::compose::{DisplayKind, ImageRes, display_tile_bytes, kinds_for};
-use texturecraft_engine::core::{BakedMap, Channel};
+use texturecraft_engine::core::{BakedMap, Channel, LayerId};
 use texturecraft_engine::geom::{Mesh, glam::Vec2};
 use texturecraft_engine::session::ReleasedDab;
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_engine::{
-    brush_device,
+    StackTarget, ViewMode, brush_device,
+    compose::PaintTarget,
     paint::{Stamp, UvStamp},
     texel::TileImage,
 };
@@ -23,7 +24,7 @@ use texturecraft_render::{BakeVisualization, CageGeometry, Frame, Renderer, wgpu
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_render::{
     gpu_brush::{BrushInput, GpuBrushStroke},
-    gpu_composite::LiveBrush,
+    gpu_composite::{LiveBrush, LiveBrushTarget},
 };
 
 use crate::bake_scene::{BakeSceneLink, CageUpload};
@@ -33,7 +34,7 @@ use crate::i18n::n_;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AuxView {
     MeshMap(BakedMap),
-    Mask(texturecraft_engine::core::LayerId),
+    Mask(LayerId),
     /// The quick mask being edited, over the base color.
     QuickMask,
     /// The project image of the view picker's "Other..." (`Session::view_image`)
@@ -70,7 +71,7 @@ pub struct SceneSync {
     pub overview: Option<(usize, texturecraft_engine::MaterialOverview)>,
     cleared_overviews: Vec<usize>,
     composites: Vec<(usize, CompositeProgram, Arc<AtomicBool>)>,
-    trace_composite: Option<(f64, Arc<AtomicBool>)>,
+    composite_work: Option<CompositeWork>,
     pub(crate) compositor_changed: bool,
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
     released_dabs: Vec<ReleasedDab>,
@@ -87,6 +88,18 @@ pub struct SceneSync {
     pub bake_cage_count: Option<usize>,
     /// The low poly's hard edges without a UV seam per material, for mesh id
     pub missing_seams: Option<(u64, MissingSeamEdges)>,
+}
+
+/// Counts a frame's queued composite until submission completes or the frame is dropped.
+struct CompositeWork {
+    in_flight: Arc<AtomicUsize>,
+    started: Option<f64>,
+}
+
+impl Drop for CompositeWork {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl SceneSync {
@@ -209,8 +222,15 @@ impl SetCompositor {
         self.current.is_some() && !self.failed.load(Ordering::Acquire)
     }
 
-    fn plan(&mut self, session: &Session, ts: usize, shift: u32, global_reason: &'static str) -> Result<Option<CompositeProgram>, &'static str> {
-        let cache = &session.caches[ts];
+    fn plan(
+        &mut self,
+        session: &Session,
+        ts: usize,
+        shift: u32,
+        global_reason: &'static str,
+        mask: Option<LayerId>,
+    ) -> Result<Option<CompositeProgram>, &'static str> {
+        let cache = session.caches.get(ts).ok_or(n_("The texture set is missing."))?;
         let key = CompositeKey { mesh: session.mesh_id, revision: cache.material_revision, size: cache.size, shift };
         if self.failed.load(Ordering::Acquire) {
             self.failed_key = self.current;
@@ -223,13 +243,14 @@ impl SetCompositor {
         if self.failed_key == Some(key) {
             return Err(GPU_COMPOSITE_ERROR);
         }
-        let stroke = session.pending_display_stroke(ts);
-        if session.stroke_texture_set() == Some(ts) && stroke.is_none() {
+        let edits_view = mask.is_none_or(|id| session.stroke_mask_owner() == Some(session.doc.project.mask_owner(id)));
+        let stroke = session.pending_display_stroke(ts).filter(|_| edits_view);
+        if edits_view && session.stroke_texture_set() == Some(ts) && stroke.is_none() {
             return Err(n_("This painting tool uses CPU compositing."));
         }
 
-        let padding = cache.dilation.mixed_coverage();
-        if !cache.dilation.fully_covered() && padding.is_none() {
+        let padding = mask.is_none().then(|| cache.dilation.mixed_coverage()).flatten();
+        if mask.is_none() && !cache.dilation.fully_covered() && padding.is_none() {
             return Err(n_("The texture set has no covered UV texels."));
         }
         let stroke_id = stroke.map(|(id, _)| id);
@@ -264,20 +285,25 @@ impl SetCompositor {
             self.stroke = stroke_id;
             return Ok(None);
         }
-        let preview = session.display_stroke_pixels(ts, region.map(|r| r.expanded(texturecraft_engine::texel::TILE).bounds()));
+        let preview = stroke.and_then(|_| session.display_stroke_pixels(ts, region.map(|r| r.expanded(texturecraft_engine::texel::TILE).bounds())));
         let pixels = preview.as_ref().unwrap_or(&session.doc.pixels);
         #[cfg(not(target_arch = "wasm32"))]
-        let program = {
-            let brush = if let Some(brush) = session.device_stroke().filter(|brush| brush.ts == ts) {
-                let coverage = brush.stroke.as_any().downcast_ref::<GpuBrushStroke>().ok_or(n_("This painting tool uses CPU compositing."))?;
-                Some(LiveBrush { layer: brush.layer, values: brush.values.clone(), opacity: brush.opacity, alpha: coverage.view() })
-            } else {
-                None
+        let brush = if let Some(brush) = session.device_stroke().filter(|brush| brush.ts == ts && stroke.is_some()) {
+            let coverage = brush.stroke.as_any().downcast_ref::<GpuBrushStroke>().ok_or(n_("This painting tool uses CPU compositing."))?;
+            let target = match brush.target {
+                PaintTarget::Layer(layer) => LiveBrushTarget::Layer { layer, values: brush.values.clone() },
+                PaintTarget::Mask(effect) => LiveBrushTarget::Mask { effect, value: brush.mask_value },
             };
-            CompositeProgram::try_compile_with_brush(&session.doc.project, pixels, ts, region, brush)
+            Some(LiveBrush { target, opacity: brush.opacity, alpha: coverage.view() })
+        } else {
+            None
         };
         #[cfg(target_arch = "wasm32")]
-        let program = CompositeProgram::try_compile_region(&session.doc.project, pixels, ts, region);
+        let brush = None;
+        let program = match mask {
+            Some(owner) => CompositeProgram::try_compile_mask_preview(&session.doc.project, pixels, ts, owner, region, brush),
+            None => CompositeProgram::try_compile_with_brush(&session.doc.project, pixels, ts, region, brush),
+        };
         let mut program = match program {
             Ok(program) => program,
             Err(reason) => {
@@ -305,6 +331,12 @@ impl SetCompositor {
         self.stroke = stroke_id;
         Ok(Some(program))
     }
+}
+
+struct MaskPreview {
+    ts: usize,
+    layer: LayerId,
+    compositor: SetCompositor,
 }
 
 /// UI-side bookkeeping of what the GPU already has.
@@ -344,7 +376,8 @@ pub struct GpuLink {
     pub(crate) prefer_gpu_layers: bool,
     pub(crate) material_start_preview: bool,
     compositors: Vec<SetCompositor>,
-    gpu_composite_in_flight: Arc<AtomicBool>,
+    mask_preview: Option<MaskPreview>,
+    gpu_composite_in_flight: Arc<AtomicUsize>,
     cpu_composite_started: Option<f64>,
     cpu_padding_pending: bool,
     bake_scene: BakeSceneLink,
@@ -411,6 +444,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         prefer_gpu_layers: true,
         material_start_preview: true,
         compositors: Vec::new(),
+        mask_preview: None,
         gpu_composite_in_flight: Arc::default(),
         cpu_composite_started: None,
         cpu_padding_pending: false,
@@ -427,7 +461,25 @@ impl GpuLink {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn brush_device(&self, session: &Session) -> Option<brush_device::BrushBackend> {
         let ts = session.ts();
-        let state = self.compositors.get(ts)?;
+        let state = match session.view {
+            ViewMode::Mask(layer) => {
+                let preview = self.mask_preview.as_ref().filter(|preview| preview.ts == ts && preview.layer == layer)?;
+                let project = &session.doc.project;
+                let owner = project.mask_owner(layer);
+                let mask_selected = match session.target {
+                    StackTarget::Mask => session.selected_layer().is_some_and(|selected| project.mask_owner(selected) == owner),
+                    StackTarget::Effect(effect) => {
+                        project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).is_some_and(|mask| mask.effects.iter().any(|entry| entry.id == effect))
+                    }
+                    StackTarget::Content => false,
+                };
+                if !mask_selected {
+                    return None;
+                }
+                &preview.compositor
+            }
+            _ => self.compositors.get(ts)?,
+        };
         let cache = session.caches.get(ts)?;
         let key = CompositeKey { mesh: session.mesh_id, revision: cache.material_revision, size: cache.size, shift: self.shift };
         if !self.gpu_composite_enabled || !state.uses_gpu() || state.current != Some(key) {
@@ -447,12 +499,13 @@ impl GpuLink {
     }
 
     fn cpu_sets<'a>(&'a self, session: &'a Session) -> impl Iterator<Item = &'a texturecraft_engine::session::SetCache> {
+        let gpu_mask = self.mask_preview.as_ref().is_some_and(|preview| preview.compositor.uses_gpu());
         session.caches.iter().enumerate().filter_map(|(ts, cache)| {
             let gpu_current = self.prefer_gpu_layers
                 && self.compositors.get(ts).is_some_and(|state| {
                     state.uses_gpu() && state.current.is_some_and(|key| key.mesh == session.mesh_id && key.revision == cache.material_revision)
                 });
-            (!gpu_current).then_some(cache)
+            (!gpu_mask && !gpu_current).then_some(cache)
         })
     }
 
@@ -462,7 +515,7 @@ impl GpuLink {
     }
 
     pub(crate) fn gpu_composite_pending(&self) -> bool {
-        self.gpu_composite_in_flight.load(Ordering::Acquire)
+        self.gpu_composite_in_flight.load(Ordering::Acquire) > 0
     }
 
     pub(crate) fn cpu_padding_pending(&self) -> bool {
@@ -470,6 +523,14 @@ impl GpuLink {
     }
 
     pub(crate) fn compositor_status(&self) -> (&'static str, &'static str) {
+        if let Some(preview) = &self.mask_preview {
+            let compositor = &preview.compositor;
+            if compositor.uses_gpu() {
+                return (n_("Mask: GPU"), n_("The graphics card composes the displayed mask."));
+            }
+            let reason = if compositor.failed.load(Ordering::Acquire) { GPU_COMPOSITE_ERROR } else { compositor.reason };
+            return (n_("Mask: CPU"), reason);
+        }
         let cpu = self.compositors.iter().find(|set| !set.uses_gpu());
         let uses_gpu = self.compositors.iter().any(|set| set.uses_gpu() && !set.neutral);
         let reason =
@@ -482,20 +543,24 @@ impl GpuLink {
         }
     }
 
-    fn plan_gpu_composites(&mut self, session: &mut Session, shift: u32, interactive: bool, out: &mut SceneSync, started: f64) {
-        let global_reason = if !self.prefer_gpu_layers {
+    fn gpu_composite_reason(&self, interactive: bool) -> &'static str {
+        if !self.prefer_gpu_layers {
             n_("CPU is selected for layer compositing in Settings.")
         } else if !self.gpu_composite_enabled {
             n_("GPU compositing is unavailable on this device.")
-        } else if interactive || session.solo.is_some() {
+        } else if interactive {
             n_("The active view uses CPU compositing.")
         } else {
             ""
-        };
+        }
+    }
+
+    fn plan_gpu_composites(&mut self, session: &mut Session, shift: u32, interactive: bool, out: &mut SceneSync, started: f64) {
+        let global_reason = self.gpu_composite_reason(interactive || session.solo.is_some());
         let mut submitted_stroke = false;
         let mut cpu_changed = false;
         for (ts, state) in self.compositors.iter_mut().enumerate() {
-            let reason = match state.plan(session, ts, shift, global_reason) {
+            let reason = match state.plan(session, ts, shift, global_reason, None) {
                 Ok(program) => {
                     if let Some(program) = program {
                         out.composites.push((ts, program, state.failed.clone()));
@@ -537,13 +602,66 @@ impl GpuLink {
         if submitted_stroke {
             session.clear_display_stroke_tiles();
         }
-        if out.compositor_changed && out.composites.iter().any(|(_, program, _)| !program.is_neutral()) {
-            self.gpu_composite_in_flight = Arc::new(AtomicBool::new(true));
-            out.trace_composite = Some((started, self.gpu_composite_in_flight.clone()));
-        }
         if cpu_changed && !cfg!(target_arch = "wasm32") {
             self.cpu_composite_started = Some(started);
         }
+    }
+
+    fn plan_gpu_mask(&mut self, session: &mut Session, aux_map: Option<AuxView>, shift: u32, baking: bool, out: &mut SceneSync) -> bool {
+        let Some(AuxView::Mask(layer)) = aux_map else {
+            out.compositor_changed |= self.mask_preview.take().is_some();
+            return false;
+        };
+        let Some((ts, _, _)) = session.doc.project.locate(layer) else {
+            self.mask_preview = None;
+            return false;
+        };
+        if self.mask_preview.as_ref().is_none_or(|preview| preview.ts != ts || preview.layer != layer) {
+            self.mask_preview = Some(MaskPreview { ts, layer, compositor: SetCompositor::default() });
+            out.compositor_changed = true;
+        }
+        let global_reason = self.gpu_composite_reason(baking);
+        let state = &mut self.mask_preview.as_mut().unwrap().compositor;
+        let reason = match state.plan(session, ts, shift, global_reason, Some(layer)) {
+            Ok(program) => {
+                if let Some(program) = program {
+                    out.composites.push((ts, program, state.failed.clone()));
+                    if session.stroke_mask_owner() == Some(session.doc.project.mask_owner(layer)) {
+                        session.clear_display_stroke_tiles();
+                    }
+                    // Aux now holds GPU pixels instead of the prior CPU upload.
+                    self.aux.remove(&ts);
+                }
+                // A material view that is re-opened mid-stroke must rebuild from the
+                // complete coverage, since this view acknowledged the recent tiles.
+                for (ts, material) in self.compositors.iter_mut().enumerate() {
+                    if material.stroke.is_some() || session.stroke_texture_set() == Some(ts) {
+                        if material.current.take().is_some() {
+                            session.caches[ts].queue_ready_uploads();
+                        }
+                        material.stroke = None;
+                    }
+                }
+                ""
+            }
+            Err(reason) => {
+                state.current = None;
+                state.stroke = None;
+                reason
+            }
+        };
+        state.reason = reason;
+        let backend = if reason.is_empty() { ("GPU", "mask compositor") } else { ("CPU", reason) };
+        if state.logged_status != Some(backend) {
+            state.logged_status = Some(backend);
+            out.compositor_changed = true;
+            let (backend, detail) = backend;
+            if let Some(cache) = session.caches.get(ts) {
+                let (w, h) = cache.size;
+                session.log.performance(format!("Mask: {backend} for texture set {} at {w}×{h}: {detail}", ts + 1));
+            }
+        }
+        reason.is_empty()
     }
 
     /// Compositing progress (0..1) while CPU tiles wait to be composited.
@@ -609,6 +727,7 @@ impl GpuLink {
 
             // Recreated sets start with blank aux textures: resend the shown view
             self.aux.clear();
+            self.mask_preview = None;
 
             out.sets = Some((sets.clone(), session.mesh.materials.len().max(1), shift));
             self.sets = sets;
@@ -640,26 +759,47 @@ impl GpuLink {
 
         self.cpu_padding_pending = false;
         let interactive = aux_map.is_some() || bake.is_some();
-        self.plan_gpu_composites(session, shift, interactive, &mut out, start_ms);
+        let gpu_mask = self.plan_gpu_mask(session, aux_map, shift, bake.is_some(), &mut out);
+        if !gpu_mask {
+            self.plan_gpu_composites(session, shift, interactive, &mut out, start_ms);
+        }
+        if out.composites.iter().any(|(_, program, _)| !program.is_neutral()) {
+            self.gpu_composite_in_flight.fetch_add(1, Ordering::AcqRel);
+            out.composite_work = Some(CompositeWork { in_flight: self.gpu_composite_in_flight.clone(), started: out.compositor_changed.then_some(start_ms) });
+        }
         let pending = self.cpu_sets(session).map(|cache| cache.dirty.len() + cache.settle.len()).sum::<usize>();
         self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
-        let uses_cpu = |ts: usize| !self.compositors.get(ts).is_some_and(SetCompositor::uses_gpu);
+        let uses_cpu = |ts: usize| !gpu_mask && !self.compositors.get(ts).is_some_and(SetCompositor::uses_gpu);
 
         let count = session.caches.len();
         let active = session.ts();
+        let padding_pending = BTreeSet::<usize>::new();
         #[cfg(not(target_arch = "wasm32"))]
-        {
+        let padding_pending = {
+            let mut not_ready = padding_pending;
             // Start at most one dense map at a time, with the active material first.
             let first = active.min(count);
             let (before, from_active) = session.caches.split_at_mut(first);
-            self.cpu_padding_pending = (first..count)
+            let candidates = (first..count)
                 .zip(from_active)
                 .chain((0..first).zip(before))
-                .filter(|(ts, cache)| uses_cpu(*ts) && cache.size.0.max(cache.size.1) > 1024 && (!cache.dirty.is_empty() || !cache.settle.is_empty()))
-                .any(|(_, cache)| !cache.dilation.prepare_on_worker());
-        }
+                .filter(|(ts, cache)| uses_cpu(*ts) && cache.size.0.max(cache.size.1) > 1024 && (!cache.dirty.is_empty() || !cache.settle.is_empty()));
+            for (ts, cache) in candidates {
+                if !cache.dilation.is_ready() && (!not_ready.is_empty() || !cache.dilation.prepare_on_worker()) {
+                    not_ready.insert(ts);
+                }
+            }
+            self.cpu_padding_pending = !not_ready.is_empty();
+            not_ready
+        };
         // At most one small full-atlas evaluation per frame, active material first.
-        let next_overview = if self.pending_overviews.remove(&active) { Some(active) } else { self.pending_overviews.pop_first() };
+        let next_overview = if gpu_mask {
+            None
+        } else if self.pending_overviews.remove(&active) {
+            Some(active)
+        } else {
+            self.pending_overviews.pop_first()
+        };
         if let Some(ts) = next_overview
             && !(ts == active && demand.has_brush())
             && !session.caches[ts].dirty.is_empty()
@@ -669,8 +809,10 @@ impl GpuLink {
             self.active_overviews.insert(ts);
             out.overview = Some((ts, overview));
         }
-        if pending > 0 && !self.cpu_padding_pending && (out.overview.is_none() || demand.has_brush()) {
-            session.update_for_view_where(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms, demand, uses_cpu);
+        if pending > 0 && (out.overview.is_none() || demand.has_brush()) {
+            session.update_for_view_where(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms, demand, |ts| {
+                uses_cpu(ts) && !padding_pending.contains(&ts)
+            });
         }
         let first = self.upload_cursor.take().filter(|&set| set < count && out.mesh.is_none()).unwrap_or(active);
         let rotation = (first..count).chain(0..first.min(count));
@@ -720,7 +862,8 @@ impl GpuLink {
         }
 
         self.active_overviews.retain(|&ts| session.caches.get(ts).is_some_and(|c| !c.dirty.is_empty() || !c.upload.is_empty()));
-        if !self.display_pending(session)
+        if !gpu_mask
+            && !self.display_pending(session)
             && let Some(started) = self.cpu_composite_started.take()
         {
             session.log.performance(format!("CPU layer composition and display tile preparation completed in {:.0} ms", crate::now_ms() - started));
@@ -757,7 +900,7 @@ impl GpuLink {
                 }
             }
             Some(AuxView::Mask(id)) => {
-                if let Some((texture_set, _, _)) = session.doc.project.locate(id) {
+                if !gpu_mask && let Some((texture_set, _, _)) = session.doc.project.locate(id) {
                     let key = (format!("mask{}", id.0), session.revision);
                     if self.aux.get(&texture_set) != Some(&key) && !session.stroke_active() {
                         let resolution =
@@ -840,8 +983,9 @@ fn record_recreated_uploads(recreated: &mut BTreeMap<usize, BTreeSet<DisplayKind
         return;
     }
 
-    for (ts, _, failed) in &sync.composites {
-        if !failed.load(Ordering::Acquire)
+    for (ts, program, failed) in &sync.composites {
+        if !program.is_mask_preview()
+            && !failed.load(Ordering::Acquire)
             && let Some(kinds) = recreated.get_mut(ts)
         {
             kinds.extend(DisplayKind::ALL);
@@ -878,10 +1022,7 @@ pub struct ViewCallback {
 
 impl Drop for ViewCallback {
     fn drop(&mut self) {
-        if let Some(sync) = self.sync.get_mut().unwrap_or_else(PoisonError::into_inner) {
-            if let Some((_, pending)) = &sync.trace_composite {
-                pending.store(false, Ordering::Release);
-            }
+        if self.sync.get_mut().unwrap_or_else(PoisonError::into_inner).is_some() {
             self.lost.store(true, Ordering::Release);
         }
     }
@@ -898,7 +1039,7 @@ impl CallbackTrait for ViewCallback {
     ) -> Vec<wgpu::CommandBuffer> {
         let Some(gpu) = resources.get_mut::<GpuState>() else { return Vec::new() };
         let sync = self.sync.lock().unwrap_or_else(PoisonError::into_inner).take();
-        if let Some(sync) = sync {
+        if let Some(mut sync) = sync {
             if let Some((env, image)) = &sync.env {
                 gpu.renderer.set_environment(device, queue, env, image.as_deref());
             }
@@ -906,7 +1047,7 @@ impl CallbackTrait for ViewCallback {
                 gpu.renderer.set_mesh(device, queue, mesh, *id);
             }
             let (reset, errors) = sync.apply_display(&mut gpu.renderer, device, queue);
-            let submitted = sync.composites.len() > errors.len();
+            let submitted = sync.composites.iter().any(|(_, program, failed)| !program.is_neutral() && !failed.load(Ordering::Acquire));
             if !errors.is_empty() {
                 let mut reports = gpu.reports.lock().unwrap_or_else(PoisonError::into_inner);
                 reports
@@ -915,12 +1056,11 @@ impl CallbackTrait for ViewCallback {
                 drop(reports);
                 gpu.ctx.request_repaint();
             }
-            if let Some((started, pending)) = &sync.trace_composite {
-                if submitted {
-                    let (started, pending, mesh) = (*started, pending.clone(), sync.mesh_id);
-                    let cpu_ms = crate::now_ms() - started;
-                    let (reports, ctx) = (gpu.reports.clone(), gpu.ctx.clone());
-                    queue.on_submitted_work_done(move || {
+            if submitted && let Some(work) = sync.composite_work.take() {
+                let trace = work.started.map(|started| (started, crate::now_ms() - started, gpu.reports.clone()));
+                let (mesh, ctx) = (sync.mesh_id, gpu.ctx.clone());
+                queue.on_submitted_work_done(move || {
+                    if let Some((started, cpu_ms, reports)) = trace {
                         let elapsed = crate::now_ms() - started;
                         reports.lock().unwrap_or_else(PoisonError::into_inner).performance.push((
                             mesh,
@@ -928,12 +1068,10 @@ impl CallbackTrait for ViewCallback {
                                 "GPU layer work completed in {elapsed:.0} ms since viewport update started (CPU preparation and submission {cpu_ms:.0} ms)"
                             ),
                         ));
-                        pending.store(false, Ordering::Release);
-                        ctx.request_repaint();
-                    });
-                } else {
-                    pending.store(false, Ordering::Release);
-                }
+                    }
+                    drop(work);
+                    ctx.request_repaint();
+                });
             }
             record_recreated_uploads(&mut gpu.recreated.lock().unwrap_or_else(PoisonError::into_inner), &reset, &sync);
             for (texture_set, size, bytes) in &sync.aux {
@@ -1016,6 +1154,19 @@ pub(crate) mod tests {
     use serde_json::json;
     use texturecraft_engine::execute;
     use texturecraft_engine::geom::primitives;
+    #[cfg(not(target_arch = "wasm32"))]
+    use texturecraft_render::headless::Headless;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    struct HeadlessBrush(Mutex<Headless>);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl brush_device::BrushDevice for HeadlessBrush {
+        fn start(&self, surface: brush_device::BrushSurface) -> Result<Box<dyn brush_device::DeviceStroke>, String> {
+            let Headless { renderer, device, queue, .. } = &mut *self.0.lock().unwrap();
+            DeviceStroke::start(renderer, device, queue, surface)
+        }
+    }
 
     pub(crate) fn link() -> GpuLink {
         GpuLink {
@@ -1041,6 +1192,7 @@ pub(crate) mod tests {
             prefer_gpu_layers: true,
             material_start_preview: true,
             compositors: Vec::new(),
+            mask_preview: None,
             gpu_composite_in_flight: Arc::default(),
             cpu_composite_started: None,
             cpu_padding_pending: false,
@@ -1852,6 +2004,7 @@ pub(crate) mod tests {
         assert!(!link.sync(&mut s, None, None, 0, 0.0).composites.is_empty());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_compositing_retries_after_editing_a_failed_material() {
         let mut session = procedural_stack(128);
@@ -1875,15 +2028,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_brush_previews_empty_layer_and_survives_switch_to_cpu() {
-        use texturecraft_render::{headless::Headless, readback::Readback};
-
-        struct HeadlessBrush(Mutex<Headless>);
-        impl brush_device::BrushDevice for HeadlessBrush {
-            fn start(&self, surface: brush_device::BrushSurface) -> Result<Box<dyn brush_device::DeviceStroke>, String> {
-                let Headless { renderer, device, queue, .. } = &mut *self.0.lock().unwrap();
-                DeviceStroke::start(renderer, device, queue, surface)
-            }
-        }
+        use texturecraft_render::readback::Readback;
 
         let Ok(gpu) = Headless::new() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
@@ -1940,6 +2085,121 @@ pub(crate) mod tests {
         s.end_stroke().unwrap();
         assert_eq!(s.doc.pixels.layer(layer, Channel::BaseColor).unwrap().get(64, 64), pixel);
         assert_eq!(display_at_center(link.sync(&mut s, None, None, 0, 0.0)), painted);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_center(gpu: &Headless, texture: &wgpu::Texture) -> [u8; 4] {
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GPU mask test pixel"),
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: texture.width() / 2, y: texture.height() / 2, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout::default() },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let (send, receive) = std::sync::mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |mapped| send.send(mapped).unwrap());
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receive.recv().unwrap().unwrap();
+        let pixel = buffer.slice(..).get_mapped_range().unwrap();
+        pixel[..4].try_into().unwrap()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn check_gpu_mask_stroke(size: u32, gpu: Headless) {
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let mut s = Session::new_project("GPU mask", primitives::plane(1.0, 1), "builtin:plane", None, size).unwrap();
+        execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+        let layer = s.selected_layer().unwrap();
+        execute(&mut s, "mask.add.black", &json!({})).unwrap();
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+
+        let display = |scene: SceneSync, mask_view: bool, dispatch: bool| {
+            assert_eq!(scene.composites.len(), usize::from(dispatch), "unexpected GPU program count");
+            if let Some((_, program, _)) = scene.composites.first() {
+                assert_eq!(program.is_mask_preview(), mask_view);
+            }
+            assert!(scene.tiles.is_empty() && scene.aux.is_empty(), "the active set does not upload CPU pixels");
+            let gpu = &mut *brush.0.lock().unwrap();
+            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{size}²: {errors:?}");
+            let texture = if mask_view { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
+            read_center(gpu, texture)
+        };
+
+        let mut original_material = None;
+        for mask_view in [false, true] {
+            let aux = mask_view.then_some(AuxView::Mask(layer));
+            s.view = if mask_view { ViewMode::Mask(layer) } else { ViewMode::Material };
+            let initial = display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, true);
+            if mask_view {
+                assert_eq!(initial, [0, 0, 0, 255]);
+            } else {
+                original_material = Some(initial);
+            }
+
+            s.brush_device = link.brush_device(&s);
+            s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+            assert!(s.device_stroke().is_some(), "{size}², mask view {mask_view}");
+            let painted = display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, true);
+            assert_ne!(painted, initial);
+            assert!(s.doc.pixels.masks.is_empty(), "live GPU painting keeps the document untouched");
+            assert!(link.sync(&mut s, aux, None, 0, 0.0).composites.is_empty(), "stationary brush does not redispatch");
+
+            s.tool.mask_value = 0.35;
+            let gray = display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, true);
+            assert_ne!(gray, painted, "a gray-value change updates existing coverage");
+            assert_ne!(gray, initial);
+            s.cancel_stroke();
+            assert_eq!(display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, true), initial);
+
+            s.brush_device = link.brush_device(&s);
+            s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+            assert!(s.device_stroke().is_some());
+            assert_eq!(display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, true), gray);
+            s.end_stroke().unwrap();
+            let committed = s.doc.pixels.masks.values().next().expect("a paint effect must persist the stroke").get(size / 2, size / 2);
+            assert!(committed[0] > 0 && committed[1] > 0);
+            let final_pixel = display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, false);
+            assert!(final_pixel.iter().zip(gray).all(|(a, b)| a.abs_diff(b) <= 1), "{final_pixel:?} vs {gray:?}");
+            if mask_view {
+                // The material display must still compose when leaving the independent mask view.
+                s.view = ViewMode::Material;
+                assert_ne!(Some(display(link.sync(&mut s, None, None, 0, 0.0), false, true)), original_material);
+            } else {
+                s.undo().unwrap();
+                assert!(s.doc.pixels.masks.is_empty());
+            }
+            s.tool.mask_value = 1.0;
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn gpu_mask_brush_previews_commits_and_cancels_in_both_views() {
+        let Ok(gpu) = Headless::new() else { return };
+        check_gpu_mask_stroke(128, gpu);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "native 4K/8K GPU regression; requires an adapter with sufficient VRAM"]
+    fn smoke_gpu_mask_brush_at_4k_and_8k() {
+        for size in [4096, 8192] {
+            check_gpu_mask_stroke(size, Headless::new().unwrap());
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
