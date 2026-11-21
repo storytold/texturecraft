@@ -69,6 +69,16 @@ pub struct Stamp {
     pub source: Option<StampSource>,
 }
 
+impl Stamp {
+    /// World-space half-extents of the volume tested by the stamp rasterizers.
+    pub fn world_extent(&self) -> Vec3 {
+        // Project the tangent-plane disk of radius sqrt(2) and the normal slab onto each world axis.
+        let squared = self.tangent * self.tangent + self.bitangent * self.bitangent;
+        let planar = Vec3::new(squared.x.sqrt(), squared.y.sqrt(), squared.z.sqrt());
+        (planar * 1.42 + self.normal.abs() * self.depth) * self.radius
+    }
+}
+
 /// An in-progress stroke.
 #[derive(Clone, Debug)]
 pub struct Stroke {

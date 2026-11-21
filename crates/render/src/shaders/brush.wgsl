@@ -133,6 +133,23 @@ fn stamp_shape(local: vec2<f32>, hardness: f32, seed: u32) -> f32 {
     return select(0.0, 1.0 - graded, all(abs(local) <= vec2(1.0)));
 }
 
+fn edge(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
+    let ab = b - a;
+    let ap = p - a;
+    return ab.x * ap.y - ab.y * ap.x;
+}
+
+struct BrushView {
+    geometric: vec3<f32>,
+    direction: vec3<f32>,
+    facing: f32,
+}
+
+fn brush_view(point: vec3<f32>, geometric: vec3<f32>, normal: vec3<f32>) -> BrushView {
+    let direction = select(unit(params.eye.xyz - point, normal), params.ortho.xyz, params.ortho.w != 0.0);
+    return BrushView(select(normal, geometric, dot(geometric, geometric) > 0.0), direction, dot(normal, direction));
+}
+
 fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32) -> u32 {
     var coverage = textureLoad(alpha_in, vec2<i32>(pixel), 0).x;
     let hit = textureLoad(uv_surface, vec2<i32>(pixel), 0).xy;
@@ -140,29 +157,49 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32) -> u32 {
 
     let uv_mode = params.flags.x != 0u;
     var point = vec3(0.0);
-    var normal = vec3(0.0, 1.0, 0.0);
-    var geometric = normal;
-    var direction = normal;
-    var facing = 1.0;
+    var normal = vec3(0.0);
+    var geometric = vec3(0.0);
+    var view = BrushView(vec3(0.0), vec3(0.0), 1.0);
+    var has_normal = false;
     if !uv_mode {
         let xy = unpack2x16unorm(hit.y);
-        let z = max(0.0, 1.0 - xy.x - xy.y);
+        var weights = vec3(max(0.0, 1.0 - xy.x - xy.y), xy);
         let v = hit.x * 3u;
         let a = vertices[v];
         let b = vertices[v + 1u];
         let c = vertices[v + 2u];
-        point = (a.position.xyz * z + b.position.xyz * xy.x + c.position.xyz * xy.y) * params.mesh.w + params.mesh.xyz;
-        normal = unit(a.normal.xyz * z + b.normal.xyz * xy.x + c.normal.xyz * xy.y, normal);
-        geometric = unit(cross(b.position.xyz - a.position.xyz, c.position.xyz - a.position.xyz), normal);
-        direction = select(unit(params.eye.xyz - point, normal), params.ortho.xyz, params.ortho.w != 0.0);
-        facing = dot(normal, direction);
-        if params.flags.y != 0u && facing <= 0.0 { return coverage; }
+        var interpolated = a.normal.xyz * weights.x + b.normal.xyz * weights.y + c.normal.xyz * weights.z;
+        // Packed barycentrics can leave a residual normal where the vertex normals cancel.
+        // Recover the full weights near cancellation before deciding whether a dab normal is needed.
+        let packed_error = 4.0 / 65535.0;
+        if dot(interpolated, interpolated) <= packed_error * packed_error {
+            let size = vec2<f32>(textureDimensions(uv_surface));
+            let uv_a = vec2(a.position.w, a.normal.w) * size;
+            let uv_b = vec2(b.position.w, b.normal.w) * size;
+            let uv_c = vec2(c.position.w, c.normal.w) * size;
+            let center = vec2<f32>(pixel) + 0.5;
+            let area = edge(uv_a, uv_b, uv_c);
+            if abs(area) >= 1e-12 {
+                let full = vec2(edge(uv_c, uv_a, center), edge(uv_a, uv_b, center)) * (1.0 / area);
+                weights = vec3(1.0 - full.x - full.y, full);
+                interpolated = a.normal.xyz * weights.x + b.normal.xyz * weights.y + c.normal.xyz * weights.z;
+            }
+        }
+        point = (a.position.xyz * weights.x + b.position.xyz * weights.y + c.position.xyz * weights.z) * params.mesh.w + params.mesh.xyz;
+        normal = unit(interpolated, vec3(0.0));
+        geometric = unit(cross(b.position.xyz - a.position.xyz, c.position.xyz - a.position.xyz), vec3(0.0));
+        has_normal = dot(normal, normal) > 0.0;
+        if has_normal {
+            view = brush_view(point, geometric, normal);
+            if params.flags.y != 0u && view.facing <= 0.0 { return coverage; }
+        }
     }
     var tested_visibility = false;
     for (var i = 0u; i < count; i++) {
         let dab = dabs[tiles[first + i]];
         var local = vec2(0.0);
         var fade = 1.0;
+        var dab_view = view;
         if uv_mode {
             let reach = dab.center.w * 1.42;
             let p = vec2<f32>(pixel);
@@ -174,19 +211,28 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32) -> u32 {
         } else {
             let offset = point - dab.center.xyz;
             local = vec2(dot(offset, dab.tangent.xyz), dot(offset, dab.bitangent.xyz)) / dab.center.w;
-            if dot(local, local) > 2.0 || abs(dot(offset, dab.normal.xyz)) > dab.center.w * dab.normal.w || dot(normal, dab.normal.xyz) <= 0.0 {
+            if dot(local, local) > 2.0 || abs(dot(offset, dab.normal.xyz)) > dab.center.w * dab.normal.w {
                 continue;
             }
+            if has_normal {
+                if dot(normal, dab.normal.xyz) <= 0.0 { continue; }
+            } else {
+                dab_view = brush_view(point, geometric, dab.normal.xyz);
+                if params.flags.y != 0u && dab_view.facing <= 0.0 { continue; }
+            }
             if params.flags.y != 0u {
-                let f = clamp((facing - params.view_scale.y) / max(1e-6, params.view_scale.z - params.view_scale.y), 0.0, 1.0);
+                let f = clamp((dab_view.facing - params.view_scale.y) / max(1e-6, params.view_scale.z - params.view_scale.y), 0.0, 1.0);
                 fade = f * f * (3.0 - 2.0 * f);
             }
         }
         let opacity = stamp_shape(local, dab.bitangent.w, dab.seed) * dab.tangent.w * fade;
         if opacity <= 0.0 { continue; }
         if !uv_mode && !tested_visibility {
-            if !visible(point, geometric, direction, facing) { return coverage; }
-            tested_visibility = true;
+            if !visible(point, dab_view.geometric, dab_view.direction, dab_view.facing) {
+                if has_normal { return coverage; }
+                continue;
+            }
+            tested_visibility = has_normal;
         }
         let old = f32(coverage) / 65535.0;
         coverage = u32(clamp(opacity + old * (1.0 - opacity), 0.0, 1.0) * 65535.0 + 0.5);

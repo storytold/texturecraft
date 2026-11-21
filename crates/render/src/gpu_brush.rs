@@ -230,7 +230,7 @@ impl GpuBrushStroke {
                 seed: stamp.seed,
                 padding: [0; 3],
             });
-            let extent = Vec3::splat(stamp.radius * stamp.depth.max(1.0) * 1.42);
+            let extent = stamp.world_extent();
             let mut touched = Tiles::new();
             input.bvh.query_box(stamp.center - extent, stamp.center + extent, |triangle| {
                 if input.mesh.material_of(triangle as usize) == Some(input.material)
@@ -544,6 +544,99 @@ mod tests {
         // Barycentric quantization and different floating-point math can move a few texels
         // across a shape edge or the spray threshold.
         assert!(differing * 100 <= covered, "{alpha:?} in {view}: {differing}/{covered} alpha values differ");
+    }
+
+    fn world_brush_coverage(gpu: &mut Headless, mesh: Mesh, settings: BrushSettings, camera: Option<OrbitCamera>, dabs: &[Stamp]) -> (TileImage, TileImage) {
+        let size = 128;
+        let mesh = Arc::new(mesh);
+        let bvh = Arc::new(Bvh::new(&mesh));
+        let uv = Arc::new(UvGBuffer::new(&mesh, 0, size, size));
+        let depth = camera.map(|camera| Arc::new(EyeDepth::render(&mesh, &camera, size, size)));
+        let context = RasterCtx {
+            mesh: &mesh,
+            bvh: &bvh,
+            gbuf: &uv,
+            material: 0,
+            depth: depth.as_deref(),
+            eye: depth.as_ref().map_or(Vec3::ZERO, |depth| depth.eye),
+            backface_culling: settings.backface_culling,
+            angle_fade: settings.angle_fade,
+            shape: Shape { alpha: settings.alpha, image: None, library: None, params: settings.alpha_params, level: 0 },
+        };
+        let mut cpu = StrokeCanvas::new(size, size);
+        rasterize(&mut cpu, &context, dabs);
+
+        let input = BrushInput { mesh, bvh, uv, material: 0, depth, settings };
+        let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
+        let tiles = stroke.append_world(dabs).unwrap();
+        (cpu.alpha, stroke.read_alpha(&tiles).unwrap())
+    }
+
+    #[test]
+    fn tilted_world_dab_coverage_is_independent_of_uv_tile_placement() {
+        let Ok(mut gpu) = Headless::new() else { return };
+        let one_over_sqrt3 = 1.0 / 3.0_f32.sqrt();
+        let one_over_sqrt6 = 1.0 / 6.0_f32.sqrt();
+        let dab = Stamp {
+            center: Vec3::ZERO,
+            normal: Vec3::new(one_over_sqrt3, 2.0 * one_over_sqrt6, 0.0),
+            tangent: Vec3::new(one_over_sqrt3, -one_over_sqrt6, std::f32::consts::FRAC_1_SQRT_2),
+            bitangent: Vec3::new(one_over_sqrt3, -one_over_sqrt6, -std::f32::consts::FRAC_1_SQRT_2),
+            radius: 1.0,
+            flow: 1.0,
+            hardness: 0.98,
+            depth: 1.0,
+            seed: 0,
+            source: None,
+        };
+        // The second island fits in the rotated dab, but lies outside the old 1.42-radius world box.
+        let positions =
+            [Vec3::ZERO, Vec3::X * 1.6].into_iter().flat_map(|center| [center, center + Vec3::X * 0.01, center + Vec3::Y * 0.01]).collect::<Vec<_>>();
+        for far_island_x in [24, 88] {
+            let uvs = [8.0, far_island_x as f32]
+                .into_iter()
+                .flat_map(|x| [Vec2::new(x, 8.0), Vec2::new(x + 8.0, 8.0), Vec2::new(x, 16.0)].map(|uv| uv / 128.0))
+                .collect();
+            let mesh = Mesh::from_parts(positions.clone(), Some(vec![dab.normal; 6]), uvs, vec![0, 1, 2, 3, 4, 5], "Tilted islands").unwrap();
+            let settings = BrushSettings { alpha: BrushAlpha::Square, backface_culling: false, ..Default::default() };
+            let (cpu, actual) = world_brush_coverage(&mut gpu, mesh, settings, None, &[dab]);
+            let expected = cpu.get(far_island_x + 2, 10)[0];
+            assert!(expected > 0, "the dab reaches the far island at UV x={far_island_x}");
+            assert_eq!(actual.get(far_island_x + 2, 10)[0], expected, "GPU coverage at UV x={far_island_x}");
+        }
+    }
+
+    #[test]
+    fn cancelled_surface_normal_uses_each_dabs_normal() {
+        let Ok(mut gpu) = Headless::new() else { return };
+        let mesh = Mesh::from_parts(
+            vec![Vec3::new(-0.25, -0.25, 0.0), Vec3::new(0.75, -0.25, 0.0), Vec3::new(-0.25, 0.75, 0.0)],
+            Some(vec![Vec3::Z, Vec3::NEG_Z, Vec3::NEG_Z]),
+            [Vec2::new(16.5, 16.5), Vec2::new(80.5, 16.5), Vec2::new(16.5, 80.5)].map(|uv| uv / 128.0).to_vec(),
+            vec![0, 1, 2],
+            "Opposing normals",
+        )
+        .unwrap();
+        let front = Stamp {
+            center: Vec3::ZERO,
+            normal: Vec3::Z,
+            tangent: Vec3::X,
+            bitangent: Vec3::Y,
+            radius: 1.0,
+            flow: 0.5,
+            hardness: 0.9,
+            depth: 1.0,
+            seed: 0,
+            source: None,
+        };
+        let back = Stamp { normal: Vec3::NEG_Z, bitangent: Vec3::NEG_Y, ..front };
+        let settings = BrushSettings { backface_culling: true, ..Default::default() };
+        let camera = OrbitCamera { pitch: 0.0, ..OrbitCamera::default() };
+        let (cpu, actual) = world_brush_coverage(&mut gpu, mesh, settings, Some(camera), &[back, front]);
+        // Exact weights (1/2, 1/4, 1/4) cancel here. Only the front-facing dab should paint.
+        let expected = cpu.get(32, 32)[0];
+        assert!(expected > 0 && expected < u16::MAX);
+        assert_eq!(actual.get(32, 32)[0], expected);
     }
 
     #[test]
