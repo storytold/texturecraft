@@ -268,7 +268,14 @@ fn sample_procedural(layer: Operation, p: vec3<f32>) -> f32 {
     for (var i = 0u; i < select(1u, 4u, reduced); i++) {
         let offset = vec2<f32>(vec2(i % 2u, i / 2u));
         let point = select(p.xy, (base + offset) / cells, reduced);
-        values[i] = raw_procedural(layer, vec3(point, p.z));
+        let value = raw_procedural(layer, vec3(point, p.z));
+        // Keeping the write at constant indices also lets FXC keep this loop rolled.
+        switch i {
+            case 0u: { values.x = value; }
+            case 1u: { values.y = value; }
+            case 2u: { values.z = value; }
+            default: { values.w = value; }
+        }
     }
     let t = fract(grid);
     return select(values.x, mix(mix(values.x, values.y, t.x), mix(values.z, values.w, t.x), t.y), reduced);

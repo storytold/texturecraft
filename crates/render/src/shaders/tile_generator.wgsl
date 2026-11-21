@@ -25,8 +25,7 @@ fn tile_pair(word: u32) -> vec2<f32> {
 }
 
 fn tile_mod(n: i32, d: i32) -> i32 {
-    let r = n % d;
-    return select(r, r + d, r < 0);
+    return wrap_coordinate(n, d);
 }
 
 fn tile_image_texel(origin: vec2<i32>, layer: i32, size: vec2<i32>, pixel: vec2<i32>) -> f32 {
