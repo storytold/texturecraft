@@ -156,3 +156,46 @@ fn a_ctrl_right_drag_out_of_the_2d_view_keeps_its_outline_at_the_anchor() {
     harness.event(Event::ModifiersChanged(egui::Modifiers::NONE));
     harness.run_steps(2);
 }
+
+#[test]
+fn the_3d_view_header_restores_default_cursor_and_ignores_strokes() {
+    let session = texturecraft_engine::sample_session(256, 64).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.layout = ViewLayout::Only3D;
+    // Zoom in so the mesh geometry expands directly beneath the view header
+    h.state_mut().session.camera.distance = 0.6;
+    h.run_steps(4);
+
+    let v_rect = h.state().viewport_rect;
+    let header_pos = egui::pos2(v_rect.center().x, v_rect.min.y + 12.0);
+    let local_pt = glam::Vec2::new(header_pos.x - v_rect.min.x, header_pos.y - v_rect.min.y);
+    let viewport_dim = glam::Vec2::new(v_rect.width(), v_rect.height());
+    assert!(h.state().session.pick(local_pt, viewport_dim).is_some(), "mesh geometry is under the header position");
+
+    h.hover_at(header_pos);
+    h.run_steps(3);
+    assert_ne!(cursor(&h), CursorIcon::None, "over 3D view header the default arrow cursor is restored");
+
+    // Clicking the header does not begin painting
+    let history_before = h.state().session.history_labels().len();
+    h.event(Event::PointerButton { pos: header_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.run_steps(2);
+    h.event(Event::PointerButton { pos: header_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(2);
+    assert_eq!(h.state().session.history_labels().len(), history_before, "clicking header does not paint");
+
+    // Dragging from inside the 3D view into the header finishes or carries stroke without header handling
+    let mesh_pos = v_rect.center();
+    h.hover_at(mesh_pos);
+    h.run_steps(2);
+    h.event(Event::PointerButton { pos: mesh_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.run_steps(2);
+    h.hover_at(mesh_pos + egui::vec2(15.0, 0.0));
+    h.run_steps(2);
+    h.hover_at(header_pos);
+    h.run_steps(2);
+    h.event(Event::PointerButton { pos: header_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(2);
+    assert_eq!(h.state().session.history_labels().len(), history_before + 1, "stroke released over header completes and commits to history");
+    assert!(!h.state().session.stroke_active(), "stroke is not left active after releasing over header");
+}
