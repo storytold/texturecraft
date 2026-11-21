@@ -1801,6 +1801,10 @@ impl GpuCompositor {
                     0,
                     0,
                     0,
+                    0,
+                    0,
+                    field_rect[2],
+                    field_rect[3],
                 ];
                 let bindings = |values: &[u32]| {
                     let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1842,15 +1846,34 @@ impl GpuCompositor {
                     let fields = program.filters.stages.len() as u32;
                     let field_words = field_rect[2] * field_rect[3] * FIELD_WORDS;
                     let offset = |slot| field_base + slot * field_words;
+                    let (source_width, source_rows) =
+                        if tile_work == 0 { (field_rect[2], field_rect[3]) } else { composite_band_size(field_rect[2], tile_work) };
                     for (output, stage) in program.filters.stages.iter().enumerate() {
                         let mut source = values;
-                        source[25..].copy_from_slice(&[fields, stage.layer, stage.preceding]);
-                        let source_bindings = bindings(&source);
-                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tc_spatial_source"), timestamp_writes: None });
-                        pass.set_pipeline(prepare);
-                        pass.set_bind_group(0, &source_bindings, &[]);
-                        pass.dispatch_workgroups(field_rect[2].div_ceil(WORKGROUP), field_rect[3].div_ceil(WORKGROUP), 1);
-                        drop(pass);
+                        source[25..28].copy_from_slice(&[fields, stage.layer, stage.preceding]);
+                        for y in (0..field_rect[3]).step_by(source_rows as usize) {
+                            for x in (0..field_rect[2]).step_by(source_width as usize) {
+                                let columns = source_width.min(field_rect[2] - x);
+                                let rows = source_rows.min(field_rect[3] - y);
+                                let work_here = u64::from(columns).saturating_mul(u64::from(rows)).saturating_mul(tile_work);
+                                if work > 0 && work.saturating_add(work_here) > submit_budget {
+                                    let previous = std::mem::replace(&mut encoder, make_encoder());
+                                    last_submission = Some(match bounds.take() {
+                                        Some(written) => submit(previous, written, submitted),
+                                        None => queue.submit([previous.finish()]),
+                                    });
+                                    work = 0;
+                                }
+                                source[28..32].copy_from_slice(&[x, y, columns, rows]);
+                                let source_bindings = bindings(&source);
+                                let mut pass =
+                                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tc_spatial_source"), timestamp_writes: None });
+                                pass.set_pipeline(prepare);
+                                pass.set_bind_group(0, &source_bindings, &[]);
+                                pass.dispatch_workgroups(columns.div_ceil(WORKGROUP), rows.div_ceil(WORKGROUP), 1);
+                                work = work.saturating_add(work_here);
+                            }
+                        }
                         let region = NeighbourhoodRegion {
                             rect: field_rect,
                             original: offset(fields),

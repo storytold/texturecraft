@@ -29,6 +29,7 @@ struct Params {
     // Field word offset, destination slot, layer index, first excluded effect.
     // The high bit of the last word selects the mask stack.
     filter_stage: vec4<u32>,
+    filter_chunk: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -939,10 +940,11 @@ fn uv_texel_covered(pixel: vec2<u32>) -> bool {
 
 @compute @workgroup_size(8, 8)
 fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
-    if any(id.xy >= params.filter_region.zw) {
+    if any(id.xy >= params.filter_chunk.zw) {
         return;
     }
-    let pixel = params.filter_region.xy + id.xy;
+    let local = params.filter_chunk.xy + id.xy;
+    let pixel = params.filter_region.xy + local;
     var prepared = vec4(0.0);
     var geometric_weight = 0.0;
     var covered = all(pixel < params.source.xy);
@@ -974,7 +976,7 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         geometric_weight = 1.0;
     }
-    let start = field_word(params.filter_stage.y, id.xy);
+    let start = field_word(params.filter_stage.y, local);
     let words = bitcast<vec4<u32>>(prepared);
     output[start] = words.x;
     output[start + 1u] = words.y;
