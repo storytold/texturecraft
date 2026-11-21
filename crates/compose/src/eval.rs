@@ -23,6 +23,7 @@ use crate::curvature_sizes::CurvatureSizes;
 use crate::held_fields::HeldFields;
 use crate::pattern::{Coords, decal_uv_symmetric, image_samples, pattern_pixels, procedural_in, world_noise};
 use crate::pattern_context::PatternContext;
+use crate::seam::SeamLinks;
 use crate::store::{BakedMaps, ImageStore, PixelStore, decode};
 
 const NCH: usize = Channel::ALL.len();
@@ -383,7 +384,17 @@ fn texel_noise(x: f32, y: f32, d: [f32; 2], res: u32, scale: f32, seed: u32) -> 
 /// `cover`: bilinear samples weighted by coverage, so uncovered texels don't bleed in.
 /// Positions are absolute texel coordinates, so a texel's result does not depend on the region.
 #[allow(clippy::too_many_arguments)]
-fn gather(op: Op, orig: &[f32], cover: &[f32], comps: usize, (x0, y0, w, h): (u32, u32, u32, u32), r: f32, res: u32, opacity: f32) -> Vec<f32> {
+fn gather(
+    op: Op,
+    orig: &[f32],
+    cover: &[f32],
+    comps: usize,
+    (x0, y0, w, h): (u32, u32, u32, u32),
+    r: f32,
+    res: u32,
+    opacity: f32,
+    links: Option<&SeamLinks>,
+) -> Vec<f32> {
     let mut data = orig.to_vec();
     let (wu, hu) = (w as usize, h as usize);
     // Bilinear sample at absolute texel position (fx, fy) into `acc` (components, then weight).
@@ -417,9 +428,22 @@ fn gather(op: Op, orig: &[f32], cover: &[f32], comps: usize, (x0, y0, w, h): (u3
             let step = r / n as f32;
             match op {
                 Op::Line(d) => {
-                    for s in -n..=n {
-                        let t = s as f32 * step;
-                        sample(x + d[0] * t, y + d[1] * t, &mut acc);
+                    let mut behind = [[0.0f32; 2]; LINE_SAMPLES as usize];
+                    let mut walk = links.map(|l| l.walker([x, y], [-d[0], -d[1]]));
+                    for (k, slot) in behind.iter_mut().enumerate().take(n as usize) {
+                        let t = (k + 1) as f32 * step;
+                        *slot = walk.as_mut().map_or([x - d[0] * t, y - d[1] * t], |w| w.advance(t));
+                    }
+                    for k in (0..n as usize).rev() {
+                        let [px, py] = behind[k];
+                        sample(px, py, &mut acc);
+                    }
+                    sample(x, y, &mut acc);
+                    let mut walk = links.map(|l| l.walker([x, y], d));
+                    for k in 1..=n {
+                        let t = k as f32 * step;
+                        let [px, py] = walk.as_mut().map_or([x + d[0] * t, y + d[1] * t], |w| w.advance(t));
+                        sample(px, py, &mut acc);
                     }
                 }
                 Op::Warp { scale, seed, dir } => {
@@ -427,9 +451,21 @@ fn gather(op: Op, orig: &[f32], cover: &[f32], comps: usize, (x0, y0, w, h): (u3
                     match dir {
                         Some(d) => {
                             let t = off(0);
-                            sample(x + d[0] * t, y + d[1] * t, &mut acc);
+                            let [px, py] = match links {
+                                Some(l) => l.walker([x, y], [d[0] * t.signum(), d[1] * t.signum()]).advance(t.abs()),
+                                None => [x + d[0] * t, y + d[1] * t],
+                            };
+                            sample(px, py, &mut acc);
                         }
-                        None => sample(x + off(0), y + off(0x5BD1_E995), &mut acc),
+                        None => {
+                            let (ox, oy) = (off(0), off(0x5BD1_E995));
+                            let len = ox.hypot(oy);
+                            let [px, py] = match links {
+                                Some(l) if len > 0.0 => l.walker([x, y], [ox / len, oy / len]).advance(len),
+                                _ => [x + ox, y + oy],
+                            };
+                            sample(px, py, &mut acc);
+                        }
                     }
                 }
                 Op::Edge => {
@@ -458,9 +494,11 @@ fn gather(op: Op, orig: &[f32], cover: &[f32], comps: usize, (x0, y0, w, h): (u3
                     let hgt = |dx: f32, dy: f32| texel_noise(x, y, [dx, dy], res, scale, seed);
                     // Downhill; a flat spot keeps its value.
                     let d = Vec2::new(hgt(-e, 0.0) - hgt(e, 0.0), hgt(0.0, -e) - hgt(0.0, e)).try_normalize().unwrap_or(Vec2::ZERO);
+                    let mut walk = links.map(|l| l.walker([x, y], [d.x, d.y]));
                     for s in 0..=n {
                         let t = s as f32 * step;
-                        sample(x + d.x * t, y + d.y * t, &mut acc);
+                        let [px, py] = walk.as_mut().map_or([x + d.x * t, y + d.y * t], |w| w.advance(t));
+                        sample(px, py, &mut acc);
                     }
                 }
                 Op::Mosaic => {
@@ -801,7 +839,18 @@ fn filter_region(
             .find(|filter| filter.0 == index)
             .map_or(radius_texels, |filter| filter.1.round().clamp(1.0, radius_texels as f32) as u32);
         if !is_box_blur(op) {
-            return gather(op, &stack_values, &cover, components, (region_x, region_y, width, height), scaled_radius as f32, tile_resolution, opacity);
+            let seam_links = (scale == 1.0 && inputs.tile_grid().is_none()).then(|| crate::seam::links_for(inputs.mesh, inputs.gbuf)).flatten();
+            return gather(
+                op,
+                &stack_values,
+                &cover,
+                components,
+                (region_x, region_y, width, height),
+                scaled_radius as f32,
+                tile_resolution,
+                opacity,
+                seam_links.as_deref(),
+            );
         }
 
         // Weighted so uncovered texels don't bleed in
@@ -4270,5 +4319,102 @@ soft {soft:?}"
             assert!(near(*m, texturecraft_core::gradient(&RAMP, t[0]).unwrap()), "{t:?} -> {m:?}");
             assert!((rough[0] - mix3(low, high, t[0])[0]).abs() < 1e-3, "roughness ignores the stops: {rough:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::gather;
+    use crate::seam::{SeamLinks, links_for};
+    use texturecraft_geom::glam::{Vec2, Vec3};
+    use texturecraft_geom::{Mesh, UvGBuffer};
+
+    const RES: u32 = 64;
+
+    fn two_islands() -> Mesh {
+        let quad = |x: f32| [Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 0.0, 0.0), Vec3::new(x + 1.0, 1.0, 0.0), Vec3::new(x, 1.0, 0.0)];
+        let uv = |u0: f32, u1: f32| [Vec2::new(u0, 0.0), Vec2::new(u1, 0.0), Vec2::new(u1, 1.0), Vec2::new(u0, 1.0)];
+        let positions: Vec<Vec3> = quad(0.0).into_iter().chain(quad(1.0)).collect();
+        let uvs: Vec<Vec2> = uv(0.0, 0.4).into_iter().chain(uv(0.6, 1.0)).collect();
+        Mesh::from_parts(positions, None, uvs, vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7], "m").unwrap()
+    }
+
+    fn one_island() -> Mesh {
+        let positions = vec![Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::Y];
+        let uvs = vec![Vec2::new(0.1, 0.1), Vec2::new(0.9, 0.1), Vec2::new(0.9, 0.9), Vec2::new(0.1, 0.9)];
+        Mesh::from_parts(positions, None, uvs, vec![0, 1, 2, 0, 2, 3], "m").unwrap()
+    }
+
+    fn field(gbuf: &UvGBuffer) -> (Vec<f32>, Vec<f32>) {
+        let mut values = vec![0.0; (RES * RES) as usize];
+        let mut cover = vec![0.0; (RES * RES) as usize];
+        for (i, tri) in gbuf.tri.iter().enumerate() {
+            if *tri == texturecraft_geom::NO_TRI {
+                continue;
+            }
+            let u = ((i as u32 % RES) as f32 + 0.5) / RES as f32;
+            values[i] = if u < 0.5 { u / 0.4 } else { 1.0 + (u - 0.6) / 0.4 } / 2.0;
+            cover[i] = 1.0;
+        }
+        (values, cover)
+    }
+
+    fn run(op: super::Op, values: &[f32], cover: &[f32], links: Option<&SeamLinks>) -> Vec<f32> {
+        gather(op, values, cover, 1, (0, 0, RES, RES), 8.0, RES, 1.0, links)
+    }
+
+    #[test]
+    fn a_directional_blur_continues_across_a_uv_seam() {
+        let mesh = two_islands();
+        let gbuf = UvGBuffer::new(&mesh, 0, RES, RES);
+        let (values, cover) = field(&gbuf);
+        let links = SeamLinks::build(&mesh, &gbuf);
+        assert!(!links.is_empty());
+        let row = 32 * RES as usize;
+        let op = super::Op::Line([1.0, 0.0]);
+        let linked = run(op, &values, &cover, Some(&links));
+        let plain = run(op, &values, &cover, None);
+        for x in [25usize, 38] {
+            let expected = values[row + x];
+            assert!((linked[row + x] - expected).abs() < 2e-3, "linked {} vs {expected} at {x}", linked[row + x]);
+        }
+        assert!((plain[row + 25] - values[row + 25]).abs() > 1e-2, "unlinked blur is biased at the seam");
+        assert!((linked[row + 38] - linked[row + 25] - (values[row + 38] - values[row + 25])).abs() < 2e-3);
+    }
+
+    #[test]
+    fn a_slope_blur_continues_across_a_uv_seam() {
+        let mesh = two_islands();
+        let gbuf = UvGBuffer::new(&mesh, 0, RES, RES);
+        let (values, cover) = field(&gbuf);
+        let links = SeamLinks::build(&mesh, &gbuf);
+        let op = super::Op::Slope { scale: 3.0, seed: 5 };
+        let linked = run(op, &values, &cover, Some(&links));
+        let plain = run(op, &values, &cover, None);
+        let far = 32 * RES as usize + 5;
+        assert_eq!(linked[far], plain[far]);
+        assert!(linked.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn a_mesh_without_seams_filters_as_before() {
+        let mesh = one_island();
+        let gbuf = UvGBuffer::new(&mesh, 0, RES, RES);
+        assert!(SeamLinks::build(&mesh, &gbuf).is_empty());
+        assert!(links_for(&mesh, &gbuf).is_none());
+        let (values, cover) = field(&gbuf);
+        for op in [super::Op::Line([0.6, 0.8]), super::Op::Slope { scale: 3.0, seed: 5 }, super::Op::Warp { scale: 3.0, seed: 1, dir: None }] {
+            assert_eq!(run(op, &values, &cover, links_for(&mesh, &gbuf).as_deref()), run(op, &values, &cover, None));
+        }
+    }
+
+    #[test]
+    fn links_are_cached_per_mesh_and_resolution() {
+        let mesh = two_islands();
+        let gbuf = UvGBuffer::new(&mesh, 0, RES, RES);
+        let first = links_for(&mesh, &gbuf).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &links_for(&mesh, &gbuf).unwrap()));
+        let other = UvGBuffer::new(&mesh, 0, RES * 2, RES * 2);
+        assert!(!std::sync::Arc::ptr_eq(&first, &links_for(&mesh, &other).unwrap()));
     }
 }

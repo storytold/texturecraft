@@ -20,6 +20,7 @@ mod image_identity;
 mod organic;
 pub mod pattern;
 mod pattern_context;
+mod seam;
 pub mod solo;
 pub mod store;
 pub mod thumb;
