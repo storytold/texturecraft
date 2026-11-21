@@ -377,11 +377,23 @@ fn sharpen(values: Vec3, sharpness: f32) -> Vec3 {
 /// step layers are stored at. With sharp blends most texels need one plane, not three.
 const TRIPLANAR_SKIP: f32 = 1.0 / 131_072.0;
 
+/// Triplanar blend weights for a normal, summing to 1. The normal is divided by its largest
+/// component before sharpening, so the biggest weight is exactly 1 and the sum cannot underflow at
+/// high sharpness. Zero or non-finite normals give all-zero weights.
+fn blend_weights(nrm: Vec3, sharpness: f32) -> Vec3 {
+    let magnitudes = nrm.abs();
+    let largest = magnitudes.max_element();
+    if !(magnitudes.is_finite() && largest > 0.0) {
+        return Vec3::ZERO;
+    }
+    let weights = sharpen(magnitudes / largest, sharpness);
+    weights / (weights.x + weights.y + weights.z)
+}
+
 /// Normalized triplanar blend weights (YZ, XZ, XY planes) for normal `nrm`; planes too light
 /// to change a 0..1 value scaled by `gain` afterwards weigh 0 (see [`TRIPLANAR_SKIP`]).
 fn triplanar_weights(nrm: Vec3, sharpness: f32, gain: f32) -> Vec3 {
-    let weights = sharpen(nrm.abs(), sharpness);
-    let weights = weights / (weights.x + weights.y + weights.z).max(1e-6);
+    let weights = blend_weights(nrm, sharpness);
     let skip_threshold = TRIPLANAR_SKIP / gain.max(1.0);
     let retained = Vec3::select(weights.cmplt(Vec3::splat(skip_threshold)), Vec3::ZERO, weights);
 
@@ -506,8 +518,7 @@ pub fn image_samples(projection: &Projection, coords: &Coords) -> [(Vec2, f32); 
             let p = coords.pos * *scale + Vec3::from(*offset);
 
             // Float images can exceed 1, so even a tiny plane weight can carry visible detail
-            let weights = coords.nrm.abs().powf(sharpness.max(1.0));
-            let weights = weights / (weights.x + weights.y + weights.z).max(1e-6);
+            let weights = blend_weights(coords.nrm, *sharpness);
             [(Vec2::new(p.z, -p.y), weights.x), (Vec2::new(p.x, p.z), weights.y), (Vec2::new(p.x, -p.y), weights.z)]
         }
         Projection::Planar { scale, axis, offset } => {
@@ -852,6 +863,31 @@ mod tests {
                     // Allow coordinate rounding on steep joint edges
                     assert!((here - there).abs() < 2e-3, "{kind:?}: {here} at {p}, {there} at {}", p + shift);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn triplanar_weights_stay_normalized_at_high_sharpness() {
+        let pr = Procedural::new(ProceduralKind::Checker);
+        let normals = [Vec3::ONE.normalize(), Vec3::new(1.0, 1.0, 0.9).normalize(), Vec3::new(-0.9, 1.0, -1.0).normalize()];
+        for nrm in normals {
+            for sharpness in [26.0, 27.0, 28.0, 30.0, 47.0, 64.0] {
+                let proj = Projection::Triplanar { scale: 1.0, sharpness, offset: [0.0; 3] };
+                let c = Coords { uv: Vec2::ZERO, pos: Vec3::ZERO, nrm };
+                let sum: f32 = image_samples(&proj, &c).iter().map(|(_, w)| w * 1.0).sum();
+                assert!((sum - 1.0).abs() < 1e-4, "{nrm} at {sharpness}: weights sum to {sum}");
+                let v = procedural(&pr, &proj, &c);
+                assert!((v - 1.0).abs() < 1e-4, "{nrm} at {sharpness}: checker is {v}");
+            }
+        }
+        // Degenerate normals stay finite.
+        for nrm in [Vec3::ZERO, Vec3::NAN, Vec3::INFINITY, Vec3::new(f32::INFINITY, 1.0, 0.0), Vec3::new(f32::NAN, 1.0, 0.0)] {
+            for sharpness in [1.0, 64.0] {
+                let proj = Projection::Triplanar { scale: 1.0, sharpness, offset: [0.0; 3] };
+                let c = Coords { uv: Vec2::ZERO, pos: Vec3::ZERO, nrm };
+                assert!(image_samples(&proj, &c).iter().all(|(_, w)| w.is_finite()), "{nrm}");
+                assert!(procedural(&pr, &proj, &c).is_finite(), "{nrm}");
             }
         }
     }
