@@ -621,7 +621,8 @@ impl GpuLink {
             out.compositor_changed = true;
         }
         let global_reason = self.gpu_composite_reason(baking);
-        let state = &mut self.mask_preview.as_mut().unwrap().compositor;
+        let Some(preview) = self.mask_preview.as_mut() else { return false };
+        let state = &mut preview.compositor;
         let reason = match state.plan(session, ts, shift, global_reason, Some(layer)) {
             Ok(program) => {
                 if let Some(program) = program {

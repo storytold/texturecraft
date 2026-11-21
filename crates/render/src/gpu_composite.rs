@@ -741,7 +741,11 @@ fn encode_baked_normal(normal: [f32; 3]) -> u32 {
         return 0;
     }
     // An even scale preserves the flat normal's exact 0.5 components.
-    let [x, y, z] = normal.map(|value| (value * 1022.0 + 0.5) as u32);
+    let [x, y, mut z] = normal.map(|value| (value * 1022.0 + 0.5) as u32);
+    // A positive Z must survive quantization: zero makes RNM degenerate.
+    if normal[2] > 0.0 {
+        z = z.max(1);
+    }
     x | (y << 10) | (z << 20) | (1 << 30)
 }
 
