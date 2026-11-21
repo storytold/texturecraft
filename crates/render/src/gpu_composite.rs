@@ -928,6 +928,8 @@ struct BakeCache {
 pub(crate) struct GpuCompositor {
     pipeline: wgpu::ComputePipeline,
     shader: wgpu::ShaderModule,
+    bindings: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
     filter_gpu: Option<(wgpu::ComputePipeline, NeighbourhoodGpu)>,
     lookup: wgpu::Buffer,
     uniform_coverage: wgpu::Buffer,
@@ -957,6 +959,38 @@ impl GpuCompositor {
     }
 
     pub(crate) fn new(device: &wgpu::Device) -> Self {
+        let binding = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
+        let buffer = |ty| wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None };
+        let uniform = buffer(wgpu::BufferBindingType::Uniform);
+        let read = buffer(wgpu::BufferBindingType::Storage { read_only: true });
+        let write = buffer(wgpu::BufferBindingType::Storage { read_only: false });
+        let texture = |sample_type, view_dimension| wgpu::BindingType::Texture { sample_type, view_dimension, multisampled: false };
+        let uint = texture(wgpu::TextureSampleType::Uint, wgpu::TextureViewDimension::D2);
+        let array = texture(wgpu::TextureSampleType::Uint, wgpu::TextureViewDimension::D2Array);
+        let float = texture(wgpu::TextureSampleType::Float { filterable: false }, wgpu::TextureViewDimension::D2);
+        let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tc_gpu_composite_bindings"),
+            entries: &[
+                binding(0, uniform),
+                binding(1, read),
+                binding(2, read),
+                binding(3, write),
+                binding(4, read),
+                binding(5, read),
+                binding(6, uint),
+                binding(7, read),
+                binding(8, uint),
+                binding(9, uint),
+                binding(10, array),
+                binding(11, float),
+                binding(12, uniform),
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tc_gpu_composite_layout"),
+            bind_group_layouts: &[Some(&bindings)],
+            immediate_size: 0,
+        });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tc_gpu_composite"),
             source: wgpu::ShaderSource::Wgsl(
@@ -976,7 +1010,7 @@ impl GpuCompositor {
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tc_gpu_composite"),
-            layout: None,
+            layout: Some(&pipeline_layout),
             module: &module,
             entry_point: Some("compose"),
             compilation_options: Default::default(),
@@ -1005,6 +1039,8 @@ impl GpuCompositor {
         Self {
             pipeline,
             shader: module,
+            bindings,
+            pipeline_layout,
             filter_gpu: None,
             lookup,
             uniform_coverage,
@@ -1228,7 +1264,6 @@ impl GpuCompositor {
         let scratch_limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
         let (mut band_width, mut band_rows) = composite_band_size(width, tile_work);
         let filtered = !program.filters.stages.is_empty();
-        let layout = self.pipeline.get_bind_group_layout(0);
         if filtered {
             if limits.max_compute_workgroup_size_x < 64 {
                 return Err("The GPU cannot run the neighbourhood filter workgroups.".into());
@@ -1237,14 +1272,9 @@ impl GpuCompositor {
                 band_rows = height.min(256);
             }
             self.filter_gpu.get_or_insert_with(|| {
-                let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("tc_spatial_source"),
-                    bind_group_layouts: &[Some(&layout)],
-                    immediate_size: 0,
-                });
                 let prepare = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("tc_spatial_source"),
-                    layout: Some(&pipeline_layout),
+                    layout: Some(&self.pipeline_layout),
                     module: &self.shader,
                     entry_point: Some("prepare_filter"),
                     compilation_options: Default::default(),
@@ -1272,6 +1302,7 @@ impl GpuCompositor {
         };
         let display_words = |width: u32, rows: u32| u64::from(width.next_multiple_of(64) * rows) * words_per_pixel;
         let required = |width, rows| (display_words(width, rows) + program.filters.words(field_area(width, rows))) * 4;
+        let filter_work: u64 = program.filters.stages.iter().map(|stage| stage.filter.work_per_texel()).sum();
         // A filtered band includes its source halo. Split its output while preserving all of that input.
         while required(band_width, band_rows) > scratch_limit {
             if band_width == 1 && band_rows == 1 {
@@ -1373,8 +1404,7 @@ impl GpuCompositor {
                 let width = band_width.min(chunk.max[0] - left);
                 let rows = band_rows.min(chunk.max[1] - top);
                 let source_work = u64::from(width).saturating_mul(u64::from(rows)).saturating_mul(tile_work);
-                let filter_passes: u64 = program.filters.stages.iter().map(|stage| if stage.filter.uses_box() { 8 } else { 2 }).sum();
-                let band_work = source_work.saturating_add(field_area(width, rows).saturating_mul(filter_passes));
+                let band_work = source_work.saturating_add(field_area(width, rows).saturating_mul(filter_work));
                 if let Some(written) = bounds.take_if(|_| work.saturating_add(band_work) > submit_budget) {
                     let previous = std::mem::replace(&mut encoder, make_encoder());
                     submit(previous, written, submitted);
@@ -1420,7 +1450,7 @@ impl GpuCompositor {
                     });
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("tc_composite_band"),
-                        layout: &layout,
+                        layout: &self.bindings,
                         entries: &[
                             wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
                             wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },

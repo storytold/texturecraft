@@ -318,7 +318,16 @@ impl SetCompositor {
             self.stroke = stroke_id;
             return Ok(None);
         }
-        let preview = stroke.and_then(|_| session.display_stroke_pixels(ts, region.map(|r| r.expanded(texturecraft_engine::texel::TILE).bounds())));
+        let preview = stroke.and_then(|_| {
+            // A GPU neighbourhood stage can read earlier, still uncommitted CPU dabs well
+            // outside the changed output. Keep all sparse stroke tiles available in that case.
+            let bounds = if session.device_stroke().is_none() && texturecraft_engine::compose::stack_reads_neighbours(&session.doc.project, ts) {
+                None
+            } else {
+                region.map(|r| r.expanded(texturecraft_engine::texel::TILE).bounds())
+            };
+            session.display_stroke_pixels(ts, bounds)
+        });
         let pixels = preview.as_ref().unwrap_or(&session.doc.pixels);
         #[cfg(not(target_arch = "wasm32"))]
         let brush = if let Some(brush) = session.device_stroke().filter(|brush| brush.ts == ts && stroke.is_some()) {

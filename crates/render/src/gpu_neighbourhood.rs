@@ -107,6 +107,18 @@ impl NeighbourhoodFilter {
     pub(crate) fn uses_box(self) -> bool {
         matches!(self.kind, Kind::Blur | Kind::Sharpen | Kind::HighPass | Kind::Bevel | Kind::Glow)
     }
+
+    pub(crate) fn work_per_texel(self) -> u64 {
+        let samples = u64::from(self.radius.min(24));
+        match self.kind {
+            Kind::DirectionalBlur => 1 + 4 * (2 * samples + 1),
+            Kind::SlopeBlur => 5 + 4 * (samples + 1),
+            Kind::Edge => 17,
+            Kind::Warp | Kind::DirectionalWarp => 9,
+            Kind::Mosaic => 5,
+            _ => 8,
+        }
+    }
 }
 
 /// Source-pixel region [left, top, width, height], with disjoint field offsets in u32 words.
