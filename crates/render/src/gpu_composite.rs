@@ -205,7 +205,8 @@ impl CompositeProgram {
         self.operations.iter().filter(|op| op.ids[1] == TILE_GENERATOR_OPCODE).try_fold(0u64, |work, op| {
             let tile_work = self.tile_patterns.work_per_sample(op.high[3] as usize).ok_or("A Tile Generator operation has no settings.")?;
             let planes = if op.procedural[3] == 1 { 3 } else { 1 };
-            Ok(work.saturating_add(tile_work.saturating_mul(planes)))
+            let samples = if op.procedural[0] == 0 { 1 } else { 4 };
+            Ok(work.saturating_add(tile_work.saturating_mul(planes * samples)))
         })
     }
 
@@ -1328,14 +1329,33 @@ mod procedural_tests {
         let normal = TileGenerator { amount: [64, 64], ..TileGenerator::default() };
         let overlapping = TileGenerator { size_mode: TileSizeMode::Absolute, size_absolute: [1.0; 2], ..normal.clone() };
         let normal = patterns.register(normal, 0);
-        let overlapping = patterns.register(overlapping, 0);
+        let overlapping_index = patterns.register(overlapping.clone(), 0);
         let regular_work = patterns.work_per_sample(normal).unwrap();
-        let overlapping_work = patterns.work_per_sample(overlapping).unwrap();
+        let overlapping_work = patterns.work_per_sample(overlapping_index).unwrap();
 
         assert_eq!(composite_band_size(8192, regular_work), (8192, ROWS));
         let (width, rows) = composite_band_size(8192, overlapping_work);
         assert!(width < 8192 && rows < ROWS);
         assert!(u64::from(width) * u64::from(rows) * overlapping_work <= MAX_TILE_WORK_PER_BAND);
+
+        let mut project = Project::new("Tile Generator budget", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, 8192));
+        let pattern = Procedural {
+            resolution: OutputResolution { factor: -1, ..Default::default() },
+            tile: Some(Box::new(overlapping)),
+            seed: 0,
+            ..Procedural::new(ProceduralKind::TileGenerator)
+        };
+        let source = Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
+        let fill = Fill {
+            sources: BTreeMap::from([(Channel::BaseColor, source)]),
+            projection: Projection::Triplanar { scale: 1.0, sharpness: 6.0, offset: [0.0; 3] },
+            ..Default::default()
+        };
+        let layer = Layer::new(project.alloc_id(), "Overlapping tiles", LayerKind::Fill(fill), &[Channel::BaseColor]);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let program = CompositeProgram::compile(&project, &PixelStore::default(), 0).unwrap();
+        assert_eq!(program.tile_work_per_pixel().unwrap(), overlapping_work * 12, "the three planes each need four samples");
     }
 
     #[test]
