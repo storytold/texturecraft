@@ -30,6 +30,7 @@ fn sample() -> Sample {
     let pf = ProjectFile {
         project: p,
         pixels,
+        stroke_replay: None,
         baked: [(0, baked)].into(),
         mesh: Some(("glb".into(), vec![1, 2, 3, 4, 5])),
         high_poly: vec![("b_high.obj".into(), vec![7; 9]), ("a_high.ply".into(), vec![6])],

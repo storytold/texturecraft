@@ -1,6 +1,6 @@
 //! Sparse, copy-on-write tiled images of `u16` components.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// Tile edge in texels.
 pub const TILE: u32 = 64;
@@ -9,6 +9,10 @@ pub const TILE_AREA: usize = (TILE * TILE) as usize;
 
 /// A tile's texel data: `TILE_AREA × comps` interleaved components.
 pub type TileData = Arc<Vec<u16>>;
+
+/// Identity of a sparse image's current tile table, without retaining its pixels.
+#[derive(Clone, Debug)]
+pub struct TileIdentity(Weak<Vec<Option<TileData>>>);
 
 /// An image split into 64×64 tiles; unallocated tiles read as zero. Cloning shares the tile table
 /// and every tile, so a snapshot costs one reference-count bump; the first write after a clone
@@ -154,6 +158,15 @@ impl TileImage {
     /// even if the caller leaves the texels unchanged.
     pub fn same_tiles(&self, other: &TileImage) -> bool {
         Arc::ptr_eq(&self.tiles, &other.tiles)
+    }
+
+    /// Identity of the current raster. Editing any tile invalidates previously issued identities.
+    pub fn identity(&self) -> TileIdentity {
+        TileIdentity(Arc::downgrade(&self.tiles))
+    }
+
+    pub fn matches_identity(&self, identity: &TileIdentity) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.tiles), identity.0.as_ptr())
     }
 
     /// Drop tiles whose every texel is zero.

@@ -227,6 +227,7 @@ impl Session {
             bake_paint: BTreeMap::new(),
             project: pf.project,
             pixels: pf.pixels,
+            stroke_replays: Default::default(),
             baked: BTreeMap::new(),
             resources: BTreeMap::new(),
         };

@@ -133,7 +133,7 @@ pub struct ResizeOutput {
 }
 
 impl ResizeTask {
-    /// Resample the set's painted pixels (bilinear; strokes are not replayed) and build its
+    /// Repaint recorded strokes at the new size, resample the other images, and build the set's
     /// caches. Progress goes from 0 to 1.
     pub fn run(self, progress: &texturecraft_bake::Progress) -> Result<ResizeOutput> {
         self.run_with_resampler(progress, |_, _, _| None)
@@ -158,6 +158,12 @@ impl ResizeTask {
         let mut gpu_images = 0;
         let mut fallback = None;
         let cancelled = || progress.cancel.load(std::sync::atomic::Ordering::Relaxed);
+        let replay = if old.resolution != resolution && old.uv_tiles.is_empty() && old.tile_resolutions.is_empty() {
+            doc.stroke_replays.prepare_resize(&doc.project, &doc.pixels, ts)
+        } else {
+            Default::default()
+        };
+        replay.remove_rasters(&mut doc.pixels);
 
         // Tiles of their own resolution keep it, so the others move within their atlas blocks
         if old.tile_resolutions.is_empty() {
@@ -192,6 +198,18 @@ impl ResizeTask {
         let resampled = chrono::Utc::now();
         let set = doc.project.texture_set(ts)?;
         let cache = (crate::session::uv_layout(&old) == crate::session::uv_layout(set)).then(|| SetCache::new(&mesh, set));
+        let cache_built = chrono::Utc::now();
+        if let Some(cache) = &cache {
+            let replayed = replay.run(&mut doc.pixels, &mut doc.stroke_replays, &cache.gbuf, progress)?;
+            if replayed > 0 {
+                log.performance(format!("Replayed {replayed} recorded paint strokes in {} ms", (chrono::Utc::now() - cache_built).num_milliseconds()));
+            }
+        } else if !replay.is_empty() {
+            return Err(crate::EngineError::Other("The new texture layout cannot replay these paint strokes".into()));
+        }
+        if cancelled() {
+            return Err(crate::EngineError::Other("Texture set resize was cancelled".into()));
+        }
         progress.done.store(10_000, std::sync::atomic::Ordering::Relaxed);
         if let Some(reason) = fallback {
             log.performance(format!("GPU paint resize used CPU fallback: {reason}"));
@@ -204,7 +222,7 @@ impl ResizeTask {
             (resampled - start).num_milliseconds(),
             gpu_images,
             gpu_ms,
-            if cache.is_some() { format!("{} ms", (chrono::Utc::now() - resampled).num_milliseconds()) } else { "rebuilt on apply".into() }
+            if cache.is_some() { format!("{} ms", (cache_built - resampled).num_milliseconds()) } else { "rebuilt on apply".into() }
         ));
         Ok(ResizeOutput { ts, resolution, doc, cache, log, from })
     }

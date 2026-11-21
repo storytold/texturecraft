@@ -64,7 +64,14 @@ pub(crate) fn one_set_document(src_set: &TextureSet, name: &str) -> Document {
     set.tile_resolutions = src_set.tile_resolutions.clone();
     set.channels = src_set.channels.clone();
     project.texture_sets.push(set);
-    Document { bake_paint: BTreeMap::new(), project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() }
+    Document {
+        bake_paint: BTreeMap::new(),
+        project,
+        pixels: PixelStore::default(),
+        stroke_replays: Default::default(),
+        baked: BTreeMap::new(),
+        resources: BTreeMap::new(),
+    }
 }
 
 impl Session {
@@ -89,6 +96,7 @@ impl Session {
         let snapshot = texturecraft_formats::ProjectFile {
             project: mini.project,
             pixels: mini.pixels,
+            stroke_replay: None,
             baked: BTreeMap::new(),
             mesh: None,
             high_poly: Vec::new(),
@@ -124,7 +132,14 @@ impl Session {
             .and_then(|t| t.stack.last().copied())
             .ok_or_else(|| EngineError::Other("the smart material file has no layer".into()))?;
         let resources: BTreeMap<String, Arc<Vec<u8>>> = project_file.resources.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
-        let source = Document { bake_paint: BTreeMap::new(), project: project_file.project, pixels: project_file.pixels, baked: BTreeMap::new(), resources };
+        let source = Document {
+            bake_paint: BTreeMap::new(),
+            project: project_file.project,
+            pixels: project_file.pixels,
+            stroke_replays: Default::default(),
+            baked: BTreeMap::new(),
+            resources,
+        };
         let id = self.edit("Add smart material", |s| {
             for (name, bytes) in &source.resources {
                 s.doc.resources.entry(name.clone()).or_insert_with(|| Arc::clone(bytes));

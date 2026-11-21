@@ -27,6 +27,7 @@ pub const MAX_HISTORY: usize = 200;
 pub struct Document {
     pub project: Project,
     pub pixels: PixelStore,
+    pub(crate) stroke_replays: crate::stroke_replay::StrokeReplays,
     pub baked: BTreeMap<usize, BakedMaps>,
     pub bake_paint: BTreeMap<(usize, texturecraft_core::BakePaintTarget), Arc<texturecraft_bake::BakePaintMap>>,
     /// Imported image resources by name: original file bytes.
@@ -485,6 +486,7 @@ pub(crate) struct ActiveStroke {
     pub staging: texturecraft_paint::Staging,
     pub device: Option<Box<dyn crate::brush_device::DeviceStroke>>,
     pub device_uv_stamps: Vec<texturecraft_paint::UvStamp>,
+    pub(crate) replay_uv_samples: Option<Vec<crate::stroke_replay::UvSample>>,
 }
 
 /// History labels that name a layer, a path number or a smart mask: the UI translates the
@@ -743,7 +745,14 @@ impl Session {
             project.texture_sets.push(ts);
         }
         let mut s = Session::new(
-            Document { bake_paint: BTreeMap::new(), project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() },
+            Document {
+                bake_paint: BTreeMap::new(),
+                project,
+                pixels: PixelStore::default(),
+                stroke_replays: Default::default(),
+                baked: BTreeMap::new(),
+                resources: BTreeMap::new(),
+            },
             mesh,
             mesh_source,
         )?;
@@ -824,8 +833,15 @@ impl Session {
 
     /// A change from `before`: a new undo step `label`, or with `merge` part of the previous one when it has the same label
     fn record(&mut self, label: &str, before: Document, merge: bool) {
+        if self.doc.stroke_replays.discard_stale(&self.doc.project, &self.doc.pixels) {
+            self.note_raster_paint();
+        }
         self.invalidate_changed(&before);
         self.push_step(label, before, merge);
+    }
+
+    pub(crate) fn note_raster_paint(&mut self) {
+        self.log.warn("Paint", "This edit uses raster paint. Affected paint will be resampled when the texture resolution changes.");
     }
 
     /// [`Session::record`] for a change whose tiles the caller already marked for recompositing

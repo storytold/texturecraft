@@ -18,6 +18,7 @@ use crate::brush_device::{BrushTiles, DeviceStroke, DeviceStrokePreview, Project
 use crate::session::{
     ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, ReleasedDab, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
 };
+use crate::stroke_replay::{StrokeReplays, UvPaint, record_sample};
 use crate::uv_stroke_state::{UV_STAMP_BATCH, UvStrokeState};
 use crate::uv_symmetry::UvMirror;
 use crate::{EngineError, Result};
@@ -376,6 +377,15 @@ impl Session {
         let settings = &stroke.settings;
         let image_alpha = settings.alpha_image.as_ref().and_then(|name| self.images.get(name)).cloned();
         let library_alpha = if image_alpha.is_none() { settings.library_alpha_image() } else { None };
+        let replay_uv_samples = (uv_mode
+            && matches!(tool, Tool::Paint | Tool::Eraser)
+            && stencil.is_none()
+            && canvas.limit.is_none()
+            && canvas.pickup.is_none()
+            && !settings.symmetry.any()
+            && settings.alpha_image.is_none()
+            && target.is_some_and(|target| StrokeReplays::can_record(&self.doc.project, target, ts)))
+        .then(Vec::new);
         let gpu_tool = tool == Tool::Paint || (quick_mask && erase) || (tool == Tool::Projection && !uv_mode && stencil.is_some());
         let device = if gpu_tool
             && canvas.pickup.is_none()
@@ -438,6 +448,7 @@ impl Session {
             staging: Staging::default(),
             device,
             device_uv_stamps: Vec::new(),
+            replay_uv_samples,
         });
         Ok(())
     }
@@ -526,6 +537,7 @@ impl Session {
         let Some(active) = self.stroke.as_mut() else { return };
         let Some(progress) = active.uv.as_mut() else { return };
         let Some(cache) = self.caches.get_mut(active.ts) else { return };
+        record_sample(&mut active.replay_uv_samples, uv, pressure);
 
         let settings = &active.stroke.settings;
         let shape = Shape::new(settings.alpha, active.image_alpha.as_deref(), active.library_alpha.as_deref(), settings.alpha_params);
@@ -819,6 +831,16 @@ impl Session {
             }
         } else {
             commit(&st.canvas.dirty, None);
+        }
+        let operation = st.replay_uv_samples.take().map(|samples| UvPaint {
+            settings: st.stroke.settings.clone(),
+            samples,
+            values: st.values.clone(),
+            mask_value,
+            erase: st.erase,
+        });
+        if self.doc.stroke_replays.commit(target, operation, &st.before.pixels, &self.doc.pixels) {
+            self.note_raster_paint();
         }
         if matches!(target, PaintTarget::Mask(_)) && st.displayed_mask_value != mask_value {
             st.display_tiles.extend(&st.canvas.dirty);

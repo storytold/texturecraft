@@ -51,6 +51,8 @@ const BIN_VERSION: u32 = 1;
 #[cfg(test)]
 const BIN_HEADER_BYTES: usize = 24;
 const MAX_JSON: u64 = 256 << 20;
+const MAX_STROKE_REPLAY: u64 = 32 << 20;
+const STROKE_REPLAY_ENTRY: &str = "paint_strokes.json";
 const MAX_THUMBNAIL: u64 = 64 << 20;
 const MAX_RESOURCE: u64 = 512 << 20;
 const MAX_ENTRIES: usize = 100_000;
@@ -61,13 +63,17 @@ const MAX_TEXELS: u64 = 1 << 28;
 
 mod bake_paint_data;
 mod recovery;
+mod stroke_replay_data;
 pub use bake_paint_data::BakePaintData;
+pub use stroke_replay_data::StrokeReplayData;
 
 /// Everything a project file holds.
 #[derive(Clone, Debug)]
 pub struct ProjectFile<Resource = Vec<u8>> {
     pub project: Project,
     pub pixels: PixelStore,
+    /// Optional paint operations. Raster pixels are still saved for compatible readers.
+    pub stroke_replay: Option<StrokeReplayData>,
     /// Baked mesh maps per texture set index.
     pub baked: BTreeMap<usize, BakedMaps>,
     /// Original mesh file: (extension, bytes).
@@ -192,6 +198,14 @@ fn entries(pf: &ProjectFile<impl Borrow<Vec<u8>>>) -> Result<Vec<Entry<'_>>> {
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let json = serde_json::to_vec_pretty(&pf.project).map_err(|e| FormatError::Invalid(e.to_string()))?;
     let mut out = vec![Entry { name: "project.json".into(), options: deflate, weight: json.len() as u64, body: Box::new(move |w| w.write_all(&json)) }];
+    if let Some(replay) = &pf.stroke_replay {
+        let bytes = replay.bytes()?;
+        let weight = bytes.len() as u64;
+        if weight > MAX_STROKE_REPLAY {
+            return Err(FormatError::Invalid("paint stroke archive data exceeds the supported size".into()));
+        }
+        out.push(Entry { name: STROKE_REPLAY_ENTRY.into(), options: deflate, weight, body: Box::new(move |w| w.write_all(&bytes)) });
+    }
     if let Some((ext, bytes)) = &pf.mesh {
         out.push(Entry {
             name: format!("mesh.{}", sanitize_ext(ext)),
@@ -408,6 +422,7 @@ fn load_archive<R: Read + Seek>(mut zip: ZipArchive<R>, mut budget: LoadBudget) 
 
     let mut pf = ProjectFile {
         pixels: PixelStore::default(),
+        stroke_replay: None,
         baked: BTreeMap::new(),
         mesh: None,
         high_poly: Vec::new(),
@@ -428,6 +443,12 @@ fn load_archive<R: Read + Seek>(mut zip: ZipArchive<R>, mut budget: LoadBudget) 
         // Unrecognized entries from newer minor revisions may be skipped
         if name == "thumbnail.png" {
             pf.thumbnail = Some(read_all(&mut f, MAX_THUMBNAIL, &mut budget, &name)?);
+        } else if name == STROKE_REPLAY_ENTRY {
+            if declared_bytes > MAX_STROKE_REPLAY {
+                pf.warnings.push("Paint stroke data exceeds the supported size. The project's raster paint is available.".into());
+            } else {
+                pf.stroke_replay = Some(StrokeReplayData::loaded(read_all(&mut f, MAX_STROKE_REPLAY, &mut budget, &name)?));
+            }
         } else if let Some(res_name) = name.strip_prefix("resources/") {
             if res_name.is_empty() || sanitize_resource_name(res_name) != res_name {
                 return Err(malformed(KIND, format!("bad resource name {name}")));

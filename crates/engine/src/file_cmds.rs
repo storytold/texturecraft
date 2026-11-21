@@ -213,9 +213,14 @@ impl Session {
         check_materials(&pf.project, &mesh)?;
         let source = pf.mesh.clone();
         let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
+        let (stroke_replays, ignored_replays) =
+            pf.stroke_replay.as_ref().map(|data| crate::stroke_replay::StrokeReplays::load(data, &pf.project, &pf.pixels)).unwrap_or_default();
         let mesh_time = Instant::now();
-        let mut s =
-            Session::new(Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources }, mesh, source)?;
+        let mut s = Session::new(
+            Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, stroke_replays, baked: pf.baked, resources },
+            mesh,
+            source,
+        )?;
 
         let cache_time = Instant::now();
         s.sync_images();
@@ -229,6 +234,9 @@ impl Session {
             s.caches.len()
         ));
         s.log.warnings("Project", pf.warnings);
+        if ignored_replays {
+            s.log.warn("Project", "Some saved stroke operations could not be restored. The affected paint is available as raster pixels.");
+        }
 
         Ok(s)
     }
@@ -262,9 +270,11 @@ impl Session {
         pixels.masks.retain(|id, img| size_of(*id) == Some((img.width(), img.height())));
 
         let (high_poly, cage) = self.saved_bake_meshes();
+        let stroke_replay = self.doc.stroke_replays.archive(&self.doc.project, &pixels);
         ProjectFile {
             project: self.doc.project.clone(),
             pixels,
+            stroke_replay,
             baked: self.doc.baked.clone(),
             mesh: self.mesh_source.clone(),
             high_poly,
