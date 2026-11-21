@@ -34,6 +34,7 @@ use crate::bake_visualization::BakeVisualization;
 use crate::cage_geometry::CageGeometry;
 use crate::cage_gpu::CageGpu;
 use crate::gpu_composite::{CompositeProgram, CompositeRegion, GpuCompositor};
+use crate::gpu_quick_mask::{QuickMaskAlpha, QuickMaskGpu, QuickMaskOverlay};
 use crate::gpu_trace::{Checked, checked};
 use crate::high_poly_gpu::HighPolyGpu;
 use crate::ibl;
@@ -653,6 +654,7 @@ pub struct Renderer {
     dof_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     compositor: Option<GpuCompositor>,
+    quick_mask: Option<QuickMaskGpu>,
     #[cfg(not(target_arch = "wasm32"))]
     brush: Option<crate::gpu_brush::BrushPipeline>,
     mip_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
@@ -1303,6 +1305,7 @@ impl Renderer {
             accum_pipeline,
             mip_pipelines: HashMap::new(),
             compositor: None,
+            quick_mask: None,
             #[cfg(not(target_arch = "wasm32"))]
             brush: None,
             util_module,
@@ -1386,6 +1389,7 @@ impl Renderer {
         if self.mesh.as_ref().is_some_and(|m| m.id == id) {
             return;
         }
+        self.quick_mask = None;
         // A replacement mesh may reuse the same display dimensions. Its textures must
         // not be replaced by a late overview from the previous mesh.
         for set in &mut self.sets {
@@ -1541,6 +1545,9 @@ impl Renderer {
         let mut reset = Vec::new();
         self.content_rev += 1;
         self.sets.truncate(sets.len());
+        if let Some(quick_mask) = &mut self.quick_mask {
+            quick_mask.retain_texture_sets(sets.len());
+        }
         if let Some(compositor) = &mut self.compositor {
             compositor.retain_texture_sets(sets.len());
         }
@@ -1971,6 +1978,48 @@ impl Renderer {
         if let Some(d) = set.mips_dirty.get_mut(kind_index) {
             d.add(origin_x, origin_y, origin_x + w, origin_y + h);
         }
+    }
+
+    /// Draw the red Quick Mask overlay from the material texture already on the device.
+    pub fn draw_quick_mask(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, overlay: &QuickMaskOverlay) -> Result<(), String> {
+        let set = self.sets.get(ts).ok_or("texture set does not exist")?;
+        let matches_set = |mask: &texturecraft_texel::TileImage| (mask.width(), mask.height()) == set.size && mask.comps() == 1;
+        if !matches_set(&overlay.mask)
+            || overlay.stroke.as_ref().is_some_and(|(alpha, ..)| match alpha {
+                QuickMaskAlpha::Gpu(view) => {
+                    let texture = view.texture();
+                    (texture.width(), texture.height()) != set.size || texture.format() != wgpu::TextureFormat::R16Uint
+                }
+                QuickMaskAlpha::Cpu(mask) => !matches_set(mask),
+            })
+        {
+            return Err("The Quick Mask coverage does not match the texture set.".into());
+        }
+        let size = aux_size(set.size);
+        let slot = DisplayKind::ALL.len();
+        let old = set.tex.get(slot).ok_or("The GPU aux texture is missing.")?;
+        let reused = (old.texture.width(), old.texture.height()) == (size, size);
+        let (gpu, tex) = crate::gpu_trace::scoped(device, "GPU Quick Mask overlay", || {
+            let mut gpu = self.quick_mask.take().unwrap_or_else(|| QuickMaskGpu::new(device));
+            let aux = if reused { old.clone() } else { Tex::new(device, "tc_quick_mask", size, size, wgpu::TextureFormat::Rgba8Unorm, mip_count(size)) };
+            let view = aux.texture.create_view(&wgpu::TextureViewDescriptor { mip_level_count: Some(1), ..Default::default() });
+            let bindings = gpu.bindings((device, queue), ts, size, &set.tex[DisplayKind::BaseColor as usize].view, overlay);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_quick_mask") });
+            fullscreen(&mut encoder, "tc_quick_mask", &view, CLEAR, &gpu.pipeline, &bindings);
+            queue.submit([encoder.finish()]);
+            (gpu, aux)
+        })?;
+        self.quick_mask = Some(gpu);
+        let set = &mut self.sets[ts];
+        set.pending[slot] = None;
+        set.failed[slot] = false;
+        if reused {
+            set.mips_dirty[slot] = MipsDirty::All;
+        } else {
+            install(set, slot, tex, device, &self.set_bgl, &self.sampler);
+        }
+        self.content_rev += 1;
+        Ok(())
     }
 
     /// Upload the aux (mesh map / debug) texture of a set: RGBA8, `size × size` with `size` from

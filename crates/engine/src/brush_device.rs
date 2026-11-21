@@ -29,6 +29,7 @@ pub struct BrushSurface {
     pub depth: Option<Arc<EyeDepth>>,
     pub settings: BrushSettings,
     pub stencil: Option<Stencil>,
+    pub limit: Option<(TileImage, bool)>,
 }
 
 pub struct DeviceStrokePreview<'a> {

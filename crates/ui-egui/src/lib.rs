@@ -1024,13 +1024,9 @@ impl eframe::App for TextureCraftApp {
         self.ui.prefs.apply_resource_limits();
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let paint_view = !matches!(self.session.view, texturecraft_engine::ViewMode::MeshMap(_) | texturecraft_engine::ViewMode::Image);
-            self.session.brush_device = if self.ui.prefs.gpu_compositing
-                && self.ui.mode == state::Mode::Painting
-                && paint_view
-                && self.session.solo.is_none()
-                && !self.session.quick_mask.editing
-            {
+            let paint_view = self.session.quick_mask.editing
+                || !matches!(self.session.view, texturecraft_engine::ViewMode::MeshMap(_) | texturecraft_engine::ViewMode::Image);
+            self.session.brush_device = if self.ui.prefs.gpu_compositing && self.ui.mode == state::Mode::Painting && paint_view && self.session.solo.is_none() {
                 self.gpu.as_ref().and_then(|gpu| gpu.brush_device(&self.session))
             } else {
                 None

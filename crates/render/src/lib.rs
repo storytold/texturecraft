@@ -23,6 +23,7 @@ pub mod gpu_bake;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_brush;
 pub mod gpu_composite;
+pub mod gpu_quick_mask;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_resize;
 pub mod gpu_stencil;

@@ -330,24 +330,22 @@ impl Session {
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
         let settings = &stroke.settings;
-        let gpu_tool = tool == Tool::Paint || (tool == Tool::Projection && !uv_mode && stencil.is_some());
+        let gpu_tool = tool == Tool::Paint || (quick_mask && erase) || (tool == Tool::Projection && !uv_mode && stencil.is_some());
         let device = if gpu_tool
-            && let Some(target) = target
             && canvas.pickup.is_none()
-            && canvas.limit.is_none()
             && !settings.symmetry.any()
             && settings.alpha_image.is_none()
             && settings.alpha_library.is_none()
             && let Some(backend) = &self.brush_device
             && let Some(cache) = self.caches.get(ts)
             && backend.surface.ptr_eq(&std::sync::Arc::downgrade(&cache.gbuf))
-            && self
-                .doc
-                .project
-                .sets_drawing(self.paint_owner(target))
-                .into_iter()
-                .all(|other| other == ts || self.caches.get(other).is_none_or(|other| other.size != size))
-        {
+            && target.is_none_or(|target| {
+                self.doc
+                    .project
+                    .sets_drawing(self.paint_owner(target))
+                    .into_iter()
+                    .all(|other| other == ts || self.caches.get(other).is_none_or(|other| other.size != size))
+            }) {
             let surface = crate::brush_device::BrushSurface {
                 mesh: self.mesh.clone(),
                 bvh: self.bvh.clone(),
@@ -356,6 +354,7 @@ impl Session {
                 depth: depth.clone(),
                 settings: settings.clone(),
                 stencil: stencil.clone(),
+                limit: canvas.limit.clone(),
             };
             match backend.device.start(surface) {
                 Ok(device) => Some(device),
@@ -591,6 +590,9 @@ impl Session {
                 Ok(tiles) => {
                     st.display_tiles.extend(&tiles);
                     st.canvas.dirty.extend(tiles);
+                    if st.target.is_none() {
+                        self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
+                    }
                     return hit;
                 }
                 Err(error) => {

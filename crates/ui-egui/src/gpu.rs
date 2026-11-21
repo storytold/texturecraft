@@ -27,6 +27,8 @@ use texturecraft_render::{
     gpu_composite::{LiveBrush, LiveBrushTarget},
 };
 
+use texturecraft_render::gpu_quick_mask::{QuickMaskAlpha, QuickMaskOverlay};
+
 use crate::bake_scene::{BakeSceneLink, CageUpload};
 use crate::i18n::n_;
 
@@ -77,6 +79,8 @@ pub struct SceneSync {
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
     released_dabs: Vec<ReleasedDab>,
     pub aux: Vec<(usize, u32, Vec<u8>)>,
+    quick_masks: Vec<(usize, QuickMaskOverlay)>,
+    quick_mask_failed: Option<Arc<AtomicBool>>,
     /// One image buffer per resolution, with all texture sets that need it.
     pub image_aux: BTreeMap<u32, (Vec<usize>, Vec<u8>)>,
     /// Bake mode's high poly (`None` removes it) and the id it is sent under
@@ -130,6 +134,15 @@ impl SceneSync {
         for (texture_set, kind, tile_x, tile_y, bytes) in &self.tiles {
             renderer.upload_display_tile(device, queue, *texture_set, *kind, *tile_x, *tile_y, bytes, self.tile_shift);
         }
+        for (ts, overlay) in &self.quick_masks {
+            if let Err(err) = renderer.draw_quick_mask(device, queue, *ts, overlay) {
+                if let Some(failed) = &self.quick_mask_failed {
+                    failed.store(true, Ordering::Release);
+                }
+                errors.push((*ts, err));
+                break;
+            }
+        }
         for dab in &self.released_dabs {
             dab.acknowledge_upload();
         }
@@ -170,8 +183,8 @@ impl DeviceStroke {
         queue: &wgpu::Queue,
         surface: brush_device::BrushSurface,
     ) -> Result<Box<dyn brush_device::DeviceStroke>, String> {
-        let brush_device::BrushSurface { mesh, bvh, uv, material, depth, settings, stencil } = surface;
-        let stroke = renderer.start_gpu_brush(device, queue, BrushInput { mesh, bvh, uv, material, depth, settings, stencil })?;
+        let brush_device::BrushSurface { mesh, bvh, uv, material, depth, settings, stencil, limit } = surface;
+        let stroke = renderer.start_gpu_brush(device, queue, BrushInput { mesh, bvh, uv, material, depth, settings, stencil, limit })?;
         Ok(Box::new(Self(stroke)))
     }
 }
@@ -251,7 +264,7 @@ impl SetCompositor {
         if self.failed_key == Some(key) {
             return Err(GPU_COMPOSITE_ERROR);
         }
-        let edits_view = mask.is_none_or(|id| session.stroke_mask_owner() == Some(session.doc.project.mask_owner(id)));
+        let edits_view = !session.quick_mask.editing && mask.is_none_or(|id| session.stroke_mask_owner() == Some(session.doc.project.mask_owner(id)));
         let stroke = session.pending_display_stroke(ts).filter(|_| edits_view);
         if edits_view && session.stroke_texture_set() == Some(ts) && stroke.is_none() {
             return Err(n_("This painting tool uses CPU compositing."));
@@ -385,6 +398,7 @@ pub struct GpuLink {
     pub(crate) material_start_preview: bool,
     compositors: Vec<SetCompositor>,
     mask_preview: Option<MaskPreview>,
+    quick_mask_failed: Arc<AtomicBool>,
     gpu_composite_in_flight: Arc<AtomicUsize>,
     cpu_composite_started: Option<f64>,
     cpu_padding_pending: bool,
@@ -453,6 +467,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         material_start_preview: true,
         compositors: Vec::new(),
         mask_preview: None,
+        quick_mask_failed: Arc::default(),
         gpu_composite_in_flight: Arc::default(),
         cpu_composite_started: None,
         cpu_padding_pending: false,
@@ -469,6 +484,14 @@ impl GpuLink {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn brush_device(&self, session: &Session) -> Option<brush_device::BrushBackend> {
         let ts = session.ts();
+        if !self.gpu_composite_enabled || !self.prefer_gpu_layers {
+            return None;
+        }
+        let cache = session.caches.get(ts)?;
+        let backend = || Some(brush_device::BrushBackend { device: self.brush_device.clone()?, surface: Arc::downgrade(&cache.gbuf) });
+        if session.quick_mask.editing {
+            return (!self.quick_mask_failed.load(Ordering::Acquire)).then(backend).flatten();
+        }
         let state = match session.view {
             ViewMode::Mask(layer) => {
                 let preview = self.mask_preview.as_ref().filter(|preview| preview.ts == ts && preview.layer == layer)?;
@@ -488,12 +511,11 @@ impl GpuLink {
             }
             _ => self.compositors.get(ts)?,
         };
-        let cache = session.caches.get(ts)?;
         let key = CompositeKey { mesh: session.mesh_id, revision: cache.material_revision, size: cache.size, shift: self.shift };
-        if !self.gpu_composite_enabled || !state.uses_gpu() || state.current != Some(key) {
+        if !state.uses_gpu() || state.current != Some(key) {
             return None;
         }
-        Some(brush_device::BrushBackend { device: self.brush_device.clone()?, surface: Arc::downgrade(&cache.gbuf) })
+        backend()
     }
 
     /// What the GPU side reported since the last call (see [`GpuReports`]).
@@ -737,6 +759,7 @@ impl GpuLink {
             // Recreated sets start with blank aux textures: resend the shown view
             self.aux.clear();
             self.mask_preview = None;
+            self.quick_mask_failed = Arc::default();
 
             out.sets = Some((sets.clone(), session.mesh.materials.len().max(1), shift));
             self.sets = sets;
@@ -767,7 +790,16 @@ impl GpuLink {
         }
 
         self.cpu_padding_pending = false;
-        let interactive = aux_map.is_some() || bake.is_some();
+        if aux_map != Some(AuxView::QuickMask) && self.quick_mask_failed.load(Ordering::Acquire) {
+            self.quick_mask_failed = Arc::default();
+        }
+        let gpu_quick_mask = aux_map == Some(AuxView::QuickMask)
+            && bake.is_none()
+            && !cfg!(target_arch = "wasm32")
+            && self.prefer_gpu_layers
+            && self.gpu_composite_enabled
+            && !self.quick_mask_failed.load(Ordering::Acquire);
+        let interactive = (aux_map.is_some() && !gpu_quick_mask) || bake.is_some();
         let gpu_mask = self.plan_gpu_mask(session, aux_map, shift, bake.is_some(), &mut out);
         if !gpu_mask {
             self.plan_gpu_composites(session, shift, interactive, &mut out, start_ms);
@@ -965,14 +997,29 @@ impl GpuLink {
                 for texture_set in 0..session.caches.len() {
                     let Some(cache) = session.caches.get(texture_set) else { continue };
 
-                    let key = (format!("quickmask{}", session.quick_mask.revision), cache.revision);
+                    let key = (format!("quickmask{gpu_quick_mask}:{}:{}", session.quick_mask.revision, cache.material_revision), cache.revision);
                     if self.aux.get(&texture_set) == Some(&key) {
                         continue;
                     }
 
-                    let resolution = texturecraft_render::aux_size(cache.size);
-                    if let Some(rgba) = session.quick_mask_rgba(texture_set, resolution) {
-                        out.aux.push((texture_set, resolution, rgba));
+                    if gpu_quick_mask {
+                        let stroke = session.quick_mask_stroke(texture_set).map(|stroke| {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if let Some(device) = stroke.device.and_then(|stroke| stroke.as_any().downcast_ref::<GpuBrushStroke>()) {
+                                return (QuickMaskAlpha::Gpu(device.view()), stroke.opacity, stroke.erase);
+                            }
+                            (QuickMaskAlpha::Cpu(stroke.alpha.clone()), stroke.opacity, stroke.erase)
+                        });
+                        out.quick_masks.push((
+                            texture_set,
+                            QuickMaskOverlay { mask: session.quick_mask_image(texture_set, cache.size), inverted: session.quick_mask.inverted, stroke },
+                        ));
+                        out.quick_mask_failed = Some(self.quick_mask_failed.clone());
+                    } else {
+                        let resolution = texturecraft_render::aux_size(cache.size);
+                        if let Some(rgba) = session.quick_mask_rgba(texture_set, resolution) {
+                            out.aux.push((texture_set, resolution, rgba));
+                        }
                     }
                     self.aux.insert(texture_set, key);
                 }
@@ -1205,6 +1252,7 @@ pub(crate) mod tests {
             material_start_preview: true,
             compositors: Vec::new(),
             mask_preview: None,
+            quick_mask_failed: Arc::default(),
             gpu_composite_in_flight: Arc::default(),
             cpu_composite_started: None,
             cpu_padding_pending: false,
@@ -2211,6 +2259,132 @@ pub(crate) mod tests {
     fn smoke_gpu_mask_brush_at_4k_and_8k() {
         for size in [4096, 8192] {
             check_gpu_mask_stroke(size, Headless::new().unwrap());
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn check_gpu_quick_mask(size: u32, gpu: Headless, cpu_fallback: bool) {
+        use texturecraft_engine::texel::from_u16;
+
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let mut s = Session::new_project("GPU Quick Mask", primitives::plane(1.0, 1), "builtin:plane", None, size).unwrap();
+        execute(&mut s, "layer.add.fill", &json!({"color": [0.0, 0.5, 0.0]})).unwrap();
+        execute(&mut s, "layer.add.paint", &json!({})).unwrap();
+        let layer = s.selected_layer().unwrap();
+        execute(&mut s, "mask.add.white", &json!({})).unwrap();
+        execute(&mut s, "tool.brush", &json!({"size": 15, "hardness": 100, "opacity": 100, "flow": 100})).unwrap();
+        execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.0, 0.0, 1.0]})).unwrap();
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+        let center = Vec2::splat(0.5);
+        let outside = Vec2::new(0.8, 0.5);
+        let aux = Some(AuxView::QuickMask);
+        let display = |scene: SceneSync, inspect_aux: bool| {
+            let gpu = &mut *brush.0.lock().unwrap();
+            if let Some((mesh, id)) = &scene.mesh {
+                gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
+            }
+            let (reset, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{size}²: {errors:?}");
+            let _ = reset;
+            for (ts, size, bytes) in &scene.aux {
+                gpu.renderer.upload_aux(&gpu.device, &gpu.queue, *ts, *size, bytes);
+            }
+            let tex = if inspect_aux { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
+            [center, outside].map(|uv| {
+                let p = (uv * tex.width() as f32).as_uvec2();
+                read_pixel(gpu, tex, p.x, p.y)
+            })
+        };
+        let base = display(link.sync(&mut s, None, None, 0, 0.0), false);
+        s.view = ViewMode::Mask(layer);
+        let layer_mask = display(link.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0), true);
+        assert_eq!(layer_mask[0], [255; 4]);
+
+        execute(&mut s, "viewport.quickMask", &json!({"enabled": true})).unwrap();
+        execute(&mut s, "viewport.quickMask.edit", &json!({"editing": true})).unwrap();
+        let overlay = link.sync(&mut s, aux, None, 0, 0.0);
+        assert_eq!(link.compositor_status().0, "Layers: GPU");
+        assert_eq!(overlay.quick_masks.len(), 1);
+        assert!(overlay.tiles.is_empty() && overlay.aux.is_empty());
+        let blocked = display(overlay, true);
+        assert!(blocked[0][0] > base[0][0] && blocked[0][1] < base[0][1]);
+        let edit = |s: &mut Session, link: &mut GpuLink, tool: &str| {
+            execute(s, tool, &json!({})).unwrap();
+            s.brush_device = link.brush_device(s);
+            s.begin_stroke_uv(center, 1.0).unwrap();
+            assert!(s.quick_mask_stroke(0).is_some_and(|stroke| stroke.device.is_some()));
+            let scene = link.sync(s, aux, None, 0, 0.0);
+            assert!(scene.composites.is_empty() && scene.tiles.is_empty() && scene.aux.is_empty());
+            let preview = display(scene, true);
+            s.end_stroke().unwrap();
+            assert!(s.doc.pixels.layer(layer, Channel::BaseColor).is_none());
+            let committed = display(link.sync(s, aux, None, 0, 0.0), true);
+            assert_eq!(preview, committed);
+            committed
+        };
+        let clear = edit(&mut s, &mut link, "tool.paint");
+        assert!(clear[0].into_iter().zip(base[0]).all(|(a, b)| a.abs_diff(b) <= 1));
+        assert_eq!(clear[1], blocked[1]);
+        assert_eq!(edit(&mut s, &mut link, "tool.eraser"), blocked);
+        assert_eq!(edit(&mut s, &mut link, "tool.paint"), clear);
+        execute(&mut s, "viewport.quickMask.invert", &json!({})).unwrap();
+        let inverted = display(link.sync(&mut s, aux, None, 0, 0.0), true);
+        assert_eq!(inverted, [blocked[0], clear[0]]);
+
+        if cpu_fallback {
+            link.prefer_gpu_layers = false;
+            assert!(link.brush_device(&s).is_none());
+            let scene = link.sync(&mut s, aux, None, 0, 0.0);
+            assert!(scene.quick_masks.is_empty() && !scene.aux.is_empty());
+            assert_eq!(link.compositor_status().0, "Layers: CPU");
+            display(scene, true);
+            link.prefer_gpu_layers = true;
+            assert_eq!(display(link.sync(&mut s, aux, None, 0, 0.0), true), inverted);
+            assert_eq!(link.compositor_status().0, "Layers: GPU");
+        }
+
+        execute(&mut s, "viewport.quickMask.edit", &json!({"editing": false})).unwrap();
+        assert_eq!(s.view, ViewMode::Mask(layer));
+        assert_eq!(display(link.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0), true), layer_mask);
+        s.view = ViewMode::Material;
+        s.target = StackTarget::Content;
+        display(link.sync(&mut s, None, None, 0, 0.0), false);
+        let paint = |s: &mut Session, link: &mut GpuLink, uv| {
+            s.brush_device = link.brush_device(s);
+            s.begin_stroke_uv(uv, 1.0).unwrap();
+            assert!(s.device_stroke().is_some());
+            let scene = link.sync(s, None, None, 0, 0.0);
+            assert!(scene.tiles.is_empty());
+            let pixels = display(scene, false);
+            s.end_stroke().unwrap();
+            let _ = display(link.sync(s, None, None, 0, 0.0), false);
+            pixels
+        };
+        assert_eq!(paint(&mut s, &mut link, center)[0], base[0], "inverted Quick Mask blocks the painted center");
+        let painted = paint(&mut s, &mut link, outside);
+        assert!(painted[1][2] > painted[1][1], "inverted Quick Mask allows painting outside");
+        execute(&mut s, "viewport.quickMask", &json!({"enabled": false})).unwrap();
+        let unlimited = paint(&mut s, &mut link, center);
+        assert!(unlimited[0][2] > unlimited[0][1]);
+        let center = s.doc.pixels.layer(layer, Channel::BaseColor).unwrap().get(size / 2, size / 2);
+        assert!(from_u16(center[3]) > 0.9);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn quick_mask_edits_and_limits_gpu_strokes_without_switching_material_to_cpu() {
+        let Ok(gpu) = Headless::new() else { return };
+        check_gpu_quick_mask(128, gpu, true);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "native 4K/8K GPU regression; requires an adapter with sufficient VRAM"]
+    fn smoke_gpu_quick_mask_at_4k_and_8k() {
+        for size in [4096, 8192] {
+            check_gpu_quick_mask(size, Headless::new().unwrap(), false);
         }
     }
 

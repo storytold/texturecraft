@@ -32,6 +32,7 @@ pub struct BrushInput {
     pub depth: Option<Arc<EyeDepth>>,
     pub settings: BrushSettings,
     pub stencil: Option<Stencil>,
+    pub limit: Option<(TileImage, bool)>,
 }
 
 #[repr(C)]
@@ -174,6 +175,9 @@ impl BrushPipeline {
         if size.into_iter().any(|edge| !edge.is_multiple_of(TILE) || edge > device.limits().max_texture_dimension_2d) {
             return Err("unsupported GPU brush texture size".into());
         }
+        if input.limit.as_ref().is_some_and(|(mask, _)| [mask.width(), mask.height()] != size || mask.comps() != 1) {
+            return Err("The quick mask does not match the GPU brush texture size.".into());
+        }
         let visibility = self.visibility(device, queue, &input)?;
         let alpha = texture(device, size, wgpu::TextureFormat::R16Uint);
         let view = alpha.create_view(&Default::default());
@@ -203,7 +207,12 @@ impl BrushPipeline {
             mesh: center.extend(radius).to_array(),
             ortho: [0.0; 4],
             shape: [settings.alpha_params.size_x, settings.alpha_params.size_y, settings.alpha_params.roundness, settings.alpha_params.contrast],
-            flags: [0, u32::from(settings.backface_culling), u32::from(settings.alpha_params.invert), 0],
+            flags: [
+                0,
+                u32::from(settings.backface_culling),
+                u32::from(settings.alpha_params.invert),
+                input.limit.as_ref().map_or(0, |(_, invert)| 1 + u32::from(*invert)),
+            ],
         };
         if let Some(depth) = &input.depth {
             params.camera = depth.view_proj.to_cols_array_2d();
@@ -341,12 +350,18 @@ impl GpuBrushStroke {
             let scratch = self.scratch.as_ref().ok_or("brush scratch buffer missing")?;
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_brush") });
             for chunk in coordinates.chunks(CHUNK) {
-                // Each tile has a four-word header followed by indices into the shared dab buffer.
-                let mut cells = vec![0; chunk.len() * 4];
+                // Origins, dab offsets/counts and optional quick-mask offsets.
+                let mut cells = vec![0; chunk.len() * 5];
                 for (tile, (&(x, y), indices)) in chunk.iter().copied().enumerate() {
                     let first = cells.len() as u32;
-                    cells[tile * 4..tile * 4 + 4].copy_from_slice(&[x * TILE, y * TILE, first, indices.len() as u32]);
                     cells.extend(indices);
+                    let mask = self.input.limit.as_ref().and_then(|(mask, _)| mask.tile(x, y));
+                    let limit = mask.map_or(0, |mask| {
+                        let offset = cells.len() as u32;
+                        cells.extend(mask.as_chunks::<2>().0.iter().map(|&[lo, hi]| u32::from(lo) | (u32::from(hi) << 16)));
+                        offset
+                    });
+                    cells[tile * 5..tile * 5 + 5].copy_from_slice(&[x * TILE, y * TILE, first, indices.len() as u32, limit]);
                 }
                 let cells = storage(device, "tc_brush_tiles", &cells);
                 let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -618,6 +633,7 @@ mod tests {
                 depth: None,
                 settings: BrushSettings::default(),
                 stencil: Some(stencil.clone()),
+                limit: None,
             };
             let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
             let dab = UvStamp { center: Vec2::splat(0.5), radius: 0.41, angle: 0.0, flow: 0.8, hardness: 0.7, seed: 5, source: None };
@@ -667,8 +683,16 @@ mod tests {
                 settings.alpha_params.contrast = 1.3;
                 settings.alpha_params.invert = invert;
                 let shape = Shape { alpha, image: None, library: None, params: settings.alpha_params, level: 0 };
-                let input =
-                    || BrushInput { mesh: mesh.clone(), bvh: bvh.clone(), uv: uv.clone(), material: 0, depth: None, settings: settings.clone(), stencil: None };
+                let input = || BrushInput {
+                    mesh: mesh.clone(),
+                    bvh: bvh.clone(),
+                    uv: uv.clone(),
+                    material: 0,
+                    depth: None,
+                    settings: settings.clone(),
+                    stencil: None,
+                    limit: None,
+                };
 
                 let uv_dab = UvStamp { center: Vec2::splat(0.48), radius: 0.29, angle: 35.0, flow: 0.8, hardness: 0.6, seed, source: None };
                 let mut cpu = StrokeCanvas::new(size, size);
@@ -747,7 +771,7 @@ mod tests {
         let mut cpu = StrokeCanvas::new(size, size);
         rasterize(&mut cpu, &context, dabs);
 
-        let input = BrushInput { mesh, bvh, uv, material: 0, depth, settings, stencil: None };
+        let input = BrushInput { mesh, bvh, uv, material: 0, depth, settings, stencil: None, limit: None };
         let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
         let tiles = stroke.append_world(dabs).unwrap();
         (cpu.alpha, stroke.read_alpha(&tiles).unwrap())
@@ -844,6 +868,7 @@ mod tests {
             material: 0,
             settings: BrushSettings::default(),
             stencil: None,
+            limit: None,
         };
         let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
         let dab = Stamp {

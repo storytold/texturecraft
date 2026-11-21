@@ -5,7 +5,7 @@ struct Params {
     mesh: vec4<f32>, // center and radius of the normalized UV surface
     ortho: vec4<f32>, // orthographic ray direction and enable
     shape: vec4<f32>, // alpha extents, roundness, contrast
-    flags: vec4<u32>, // UV mode, culling, invert
+    flags: vec4<u32>, // UV mode, culling, invert brush tip, quick-mask mode
 }
 struct Vertex {
     position: vec4<f32>,
@@ -150,8 +150,21 @@ fn brush_view(point: vec3<f32>, geometric: vec3<f32>, normal: vec3<f32>) -> Brus
     return BrushView(select(normal, geometric, dot(geometric, geometric) > 0.0), direction, dot(normal, direction));
 }
 
-fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32) -> u32 {
+fn quick_limit(pixel: vec2<u32>, offset: u32) -> f32 {
+    if params.flags.w == 0u { return 1.0; }
+    var coverage = 0.0;
+    if offset != 0u {
+        let local = pixel % 64u;
+        let index = local.y * 64u + local.x;
+        coverage = f32((tiles[offset + index / 2u] >> (index % 2u * 16u)) & 65535u) / 65535.0;
+    }
+    return select(coverage, 1.0 - coverage, params.flags.w == 2u);
+}
+
+fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32, mask: u32) -> u32 {
     var coverage = textureLoad(alpha_in, vec2<i32>(pixel), 0).x;
+    let limit = quick_limit(pixel, mask);
+    if limit == 0.0 { return coverage; }
     let hit = textureLoad(uv_surface, vec2<i32>(pixel), 0).xy;
     if hit.x == NONE { return coverage; }
 
@@ -225,7 +238,7 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32) -> u32 {
                 fade = f * f * (3.0 - 2.0 * f);
             }
         }
-        let opacity = stamp_shape(local, dab.bitangent.w, dab.seed) * dab.tangent.w * fade;
+        let opacity = stamp_shape(local, dab.bitangent.w, dab.seed) * dab.tangent.w * fade * limit;
         if opacity <= 0.0 { continue; }
         if !uv_mode && !tested_visibility {
             if !visible(point, dab_view.geometric, dab_view.direction, dab_view.facing) {
@@ -242,11 +255,12 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32) -> u32 {
 
 @compute @workgroup_size(8, 8)
 fn brush(@builtin(global_invocation_id) id: vec3<u32>) {
-    let header = id.z * 4u;
+    let header = id.z * 5u;
     let origin = vec2(tiles[header], tiles[header + 1u]) + vec2(id.x * 2u, id.y);
     let first = tiles[header + 2u];
     let count = tiles[header + 3u];
-    let a = stroke_alpha(origin, first, count);
-    let b = stroke_alpha(origin + vec2(1u, 0u), first, count);
+    let mask = tiles[header + 4u];
+    let a = stroke_alpha(origin, first, count, mask);
+    let b = stroke_alpha(origin + vec2(1u, 0u), first, count, mask);
     alpha_out[id.z * 4096u + id.y * 64u + id.x] = a | (b << 16u);
 }
