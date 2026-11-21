@@ -1829,7 +1829,7 @@ impl GpuCompositor {
                 let padded: &[[f32; 4]] = bytemuck::cast_slice(&tail_row);
                 write_input(queue, &texture, (width, 1), (top + rows as u32, 0), padded);
             }
-            pending += source.len() * size_of::<f32>();
+            pending += std::mem::size_of_val(source);
             if pending >= MAX_ID_UPLOAD_BYTES {
                 let submission = queue.submit([]);
                 #[cfg(not(target_arch = "wasm32"))]
@@ -1952,10 +1952,10 @@ impl GpuCompositor {
         let key = Arc::downgrade(gbuf);
         let map = Arc::downgrade(map);
         let size = [baked.width, baked.height];
-        if let Some(cache) = curvature.cache.get(&ts).filter(|cache| cache.gbuf.ptr_eq(&key) && cache.map.ptr_eq(&map) && cache.size == size) {
-            if needed.iter().zip(cache.needed).all(|(&required, present)| !required || present) {
-                return Ok(Some(cache.levels.clone()));
-            }
+        if let Some(cache) = curvature.cache.get(&ts).filter(|cache| cache.gbuf.ptr_eq(&key) && cache.map.ptr_eq(&map) && cache.size == size)
+            && needed.iter().zip(cache.needed).all(|(&required, present)| !required || present)
+        {
+            return Ok(Some(cache.levels.clone()));
         }
         let coverage = (gbuf.covered_count() != gbuf.tri.len()).then(|| self.coverage_buffer(device, Some(gbuf))).transpose()?;
         let curvature = self.curvature.as_mut().ok_or("The GPU curvature adapter is unavailable.")?;
@@ -2772,7 +2772,7 @@ mod procedural_tests {
             let (_, _, full) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
             for (tx, ty) in tiles {
                 let expected = tile_bytes(&oracle, &baked, DisplayKind::BaseColor, tx, ty);
-                for (y, row) in expected.chunks_exact((TILE * 4) as usize).enumerate() {
+                for (y, row) in expected.as_chunks::<{ (TILE * 4) as usize }>().0.iter().enumerate() {
                     let start = ((ty * TILE + y as u32) * SIZE * 4 + tx * TILE * 4) as usize;
                     let actual = &full[start..start + row.len()];
                     for (x, (gpu, cpu)) in actual.as_chunks::<4>().0.iter().zip(row.as_chunks::<4>().0).enumerate() {
