@@ -71,6 +71,10 @@ impl QuickMaskGpu {
         Self { pipeline, empty: coverage_texture(device, 1).create_view(&Default::default()), coverage: BTreeMap::new() }
     }
 
+    pub(crate) fn clear_coverage(&mut self) {
+        self.coverage.clear();
+    }
+
     pub(crate) fn retain_texture_sets(&mut self, count: usize) {
         self.coverage.retain(|&ts, _| ts < count);
     }

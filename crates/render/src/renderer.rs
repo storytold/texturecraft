@@ -1980,6 +1980,13 @@ impl Renderer {
         }
     }
 
+    /// Release uploaded Quick Mask coverage when the overlay is no longer using the GPU.
+    pub fn release_quick_mask_inputs(&mut self) {
+        if let Some(quick_mask) = &mut self.quick_mask {
+            quick_mask.clear_coverage();
+        }
+    }
+
     /// Draw the red Quick Mask overlay from the material texture already on the device.
     pub fn draw_quick_mask(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, overlay: &QuickMaskOverlay) -> Result<(), String> {
         let set = self.sets.get(ts).ok_or("texture set does not exist")?;
