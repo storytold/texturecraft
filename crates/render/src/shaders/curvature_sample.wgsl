@@ -4,6 +4,9 @@ struct CurvatureLayout {
     bake_size: vec4<u32>,
 }
 
+@group(0) @binding(13) var curvature_levels: texture_2d<u32>;
+@group(0) @binding(14) var<uniform> curvature_layout: CurvatureLayout;
+
 fn curvature_sample(image: texture_2d<u32>, mapping: CurvatureLayout, baked_pixel: vec2<u32>, level: u32) -> f32 {
     let desc = mapping.levels[level];
     if desc.z == 0u { return 0.0; }
@@ -19,4 +22,8 @@ fn curvature_sample(image: texture_2d<u32>, mapping: CurvatureLayout, baked_pixe
     let top = a + (b - a) * blend.x;
     let bottom = c + (d - c) * blend.x;
     return (top + (bottom - top) * blend.y) / 65534.0;
+}
+
+fn curvature_level_at(pixel: vec2<u32>, level: u32) -> f32 {
+    return curvature_sample(curvature_levels, curvature_layout, pixel, level);
 }

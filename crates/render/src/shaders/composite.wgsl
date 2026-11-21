@@ -94,11 +94,14 @@ fn surface_at(pixel: vec2<u32>) -> Surface {
     return Surface(position, select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12), true);
 }
 
-fn baked_at(pixel: vec2<u32>) -> vec4<u32> {
+fn bake_pixel_at(pixel: vec2<u32>) -> vec2<u32> {
     let size = textureDimensions(bake_maps);
     let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
-    let sample_pixel = min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
-    return textureLoad(bake_maps, vec2<i32>(sample_pixel), 0);
+    return min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
+}
+
+fn baked_at(pixel: vec2<u32>) -> vec4<u32> {
+    return textureLoad(bake_maps, vec2<i32>(bake_pixel_at(pixel)), 0);
 }
 
 fn unpack_baked_normal(packed: u32) -> vec3<f32> {
@@ -709,6 +712,33 @@ fn blend_rgb(mode: u32, a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
     }
 }
 
+fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u32) -> f32 {
+    let bake_pixel = bake_pixel_at(pixel);
+    let offset = u32(effect.uv.x);
+    var edges = 0.0;
+    var cavities = 0.0;
+    for (var i = 0u; i < 7u; i++) {
+        let weight = bitcast<f32>(srgb[offset + i]);
+        if weight == 0.0 { continue; }
+        var response = (finest - 0.5) * 2.0;
+        if i > 0u {
+            let size = f32(1u << (i - 1u));
+            response = 0.0;
+            if effect.effects.w == 0u {
+                response = curvature_level_at(bake_pixel, i - 1u) * (2.8284271247461903 * size);
+            }
+        }
+        edges = 1.0 - (1.0 - edges) * (1.0 - weight * clamp(response, 0.0, 1.0));
+        cavities = 1.0 - (1.0 - cavities) * (1.0 - weight * clamp(-response, 0.0, 1.0));
+    }
+    switch mode {
+        case 1u: { return edges; }
+        case 2u: { return cavities; }
+        case 3u: { return 1.0 - (1.0 - edges) * (1.0 - cavities); }
+        default: { return 0.5 + 0.5 * (edges - cavities); }
+    }
+}
+
 fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
     let surface = texel.surface;
     var baked = texel.baked;
@@ -722,6 +752,7 @@ fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
             default: {}
         }
     }
+    let detail = u32(effect.uv.y);
     var signal = 0.0;
     switch effect.ids.y {
         case 40u: { signal = (baked.y - 0.5) * 2.0; }
@@ -732,11 +763,21 @@ fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
         case 45u: { signal = dot(surface.position, effect.high.xyz) * 0.5 + 0.5; }
         default: { signal = dot(surface.normal, effect.high.xyz) * 0.5 + 0.5; }
     }
+    if detail != 0u {
+        signal = generator_curvature(effect, texel.pixel, baked.y, detail);
+    }
     if effect.low.z > 0.0 {
-        signal += (fbm(surface.position * effect.projection.x, 4u, effect.ids.z, true) - 0.5) * effect.low.z;
+        let noise = fbm(surface.position * effect.projection.x, 4u, effect.ids.z, true);
+        if detail != 0u {
+            let neutral = select(0.0, 0.5, detail == 4u);
+            signal = neutral + (signal - neutral) * max(0.0, 1.0 - noise * effect.low.z);
+        } else {
+            signal += (noise - 0.5) * effect.low.z;
+        }
     }
     let threshold = 1.0 - clamp(effect.low.x, 0.0, 1.0);
-    return smoothstep(threshold - effect.low.y, threshold + effect.low.y, signal);
+    let ramp = clamp((signal - (threshold - effect.low.y)) / (2.0 * effect.low.y), 0.0, 1.0);
+    return ramp * ramp * (3.0 - 2.0 * ramp);
 }
 
 fn finish_generator(effect: Operation, ramp: f32) -> f32 {

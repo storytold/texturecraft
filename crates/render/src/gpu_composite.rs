@@ -8,12 +8,13 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, CompareOp, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground,
-    NormalFormat, ProceduralKind, Project, Projection, Source,
+    BakedMap, BlendMode, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId,
+    LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Source,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
+use crate::gpu_curvature::{CurvatureGpu, CurvatureInput, CurvatureLevels};
 use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages};
 use crate::gpu_neighbourhood::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
@@ -69,7 +70,7 @@ struct Operation {
     high: [f32; 4],
     // UV rotation and scale, or the pigment source in W for live paint (1: brush, 2: stencil).
     projection: [f32; 4],
-    // UV offset XY, procedural scale and contrast, or live-brush values and opacity.
+    // UV offset XY, procedural scale and contrast, live-brush values and opacity, or curvature weights and mode in XY.
     uv: [f32; 4],
     balance: [f32; 4],
     // Offsets and counts of the mask and content effects.
@@ -153,6 +154,7 @@ impl GeometryMasks {
 struct ProceduralInputs {
     resolution: u32,
     ramp_words: Vec<u32>,
+    curvature_sizes: [bool; CurvatureDetail::BLURRED_SIZES],
     filters: Vec<(Filter, f32)>,
     materials: MaterialImages,
     generator_stages: Vec<(Option<NeighbourhoodFilter>, u32)>,
@@ -164,6 +166,7 @@ impl ProceduralInputs {
         Self {
             resolution,
             ramp_words: Vec::new(),
+            curvature_sizes: [false; CurvatureDetail::BLURRED_SIZES],
             filters: Vec::new(),
             materials: MaterialImages::default(),
             generator_stages: Vec::new(),
@@ -179,6 +182,24 @@ impl ProceduralInputs {
         let count = u32::try_from(colors.len()).ok()?;
         self.ramp_words.extend(colors.iter().flatten().map(|value| value.to_bits()));
         Some([offset, count])
+    }
+
+    fn pack_curvature(&mut self, detail: &CurvatureDetail, derive_levels: bool) -> Option<[f32; 2]> {
+        let offset = LOOKUP_WORDS.checked_add(u32::try_from(self.ramp_words.len()).ok()?)?;
+        if offset >= 1 << 24 || detail.weights.iter().any(|weight| !weight.is_finite()) {
+            return None;
+        }
+        self.ramp_words.extend(detail.weights.map(|weight| weight.clamp(0.0, 1.0).to_bits()));
+        for (size, needed) in self.curvature_sizes.iter_mut().zip(detail.blurred_sizes_in_use()) {
+            *size |= derive_levels && needed;
+        }
+        let mode = match detail.mode {
+            CurvatureMode::Edges => 1.0,
+            CurvatureMode::Cavities => 2.0,
+            CurvatureMode::Both => 3.0,
+            CurvatureMode::Raw => 4.0,
+        };
+        Some([offset as f32, mode])
     }
 }
 
@@ -340,6 +361,7 @@ pub struct CompositeProgram {
     geometry: GeometryMasks,
     paint: Vec<TileImage>,
     ramp_words: Vec<u32>,
+    curvature_sizes: [bool; CurvatureDetail::BLURRED_SIZES],
     tile_patterns: TilePatterns,
     material_images: MaterialImages,
     brush_alpha: Option<wgpu::TextureView>,
@@ -630,6 +652,7 @@ impl CompositeProgram {
             geometry,
             paint,
             ramp_words: procedural.ramp_words,
+            curvature_sizes: procedural.curvature_sizes,
             tile_patterns,
             material_images: procedural.materials,
             brush_alpha,
@@ -682,6 +705,7 @@ impl CompositeProgram {
             geometry: GeometryMasks::default(),
             paint,
             ramp_words: procedural.ramp_words,
+            curvature_sizes: procedural.curvature_sizes,
             tile_patterns,
             material_images: procedural.materials,
             brush_alpha,
@@ -980,7 +1004,7 @@ fn source_operation(
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
-    if generator.detail.is_some() || generator.micro.is_some() {
+    if generator.micro.is_some() {
         return None;
     }
     let kind = match generator.kind {
@@ -1015,6 +1039,11 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
     if let (Some(_), _) | (None, 2..) = (blur, cell) {
         inputs.generator_stages.push((blur, cell));
         op.spatial[1] = inputs.generator_stages.len() as u32;
+    }
+    if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear)
+        && let Some(detail) = &generator.detail
+    {
+        op.uv[..2].copy_from_slice(&inputs.pack_curvature(detail, op.effects[3] == 0)?);
     }
     op.low.iter().chain(&op.projection).all(|x| x.is_finite()).then_some(op)
 }
@@ -1129,6 +1158,20 @@ struct BakeCache {
     view: wgpu::TextureView,
 }
 
+struct CurvatureCache {
+    gbuf: Weak<UvGBuffer>,
+    map: Weak<Vec<f32>>,
+    size: [u32; 2],
+    needed: [bool; CurvatureDetail::BLURRED_SIZES],
+    levels: CurvatureLevels,
+}
+
+struct CurvatureResources {
+    gpu: Option<CurvatureGpu>,
+    empty: CurvatureLevels,
+    cache: BTreeMap<usize, CurvatureCache>,
+}
+
 pub(crate) struct GpuCompositor {
     pipeline: wgpu::ComputePipeline,
     shader: wgpu::ShaderModule,
@@ -1140,6 +1183,7 @@ pub(crate) struct GpuCompositor {
     coverage: Vec<(Weak<UvGBuffer>, wgpu::Buffer)>,
     surfaces: Vec<SurfaceCache>,
     baked: BTreeMap<usize, BakeCache>,
+    curvature: Option<CurvatureResources>,
     default_surface: wgpu::TextureView,
     default_vertices: wgpu::Buffer,
     default_baked: wgpu::TextureView,
@@ -1172,48 +1216,53 @@ impl GpuCompositor {
         let uint = texture(wgpu::TextureSampleType::Uint, wgpu::TextureViewDimension::D2);
         let array = texture(wgpu::TextureSampleType::Uint, wgpu::TextureViewDimension::D2Array);
         let float = texture(wgpu::TextureSampleType::Float { filterable: false }, wgpu::TextureViewDimension::D2);
-        let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("tc_gpu_composite_bindings"),
-            entries: &[
-                binding(0, uniform),
-                binding(1, read),
-                binding(2, read),
-                binding(3, write),
-                binding(4, read),
-                binding(5, read),
-                binding(6, uint),
-                binding(7, read),
-                binding(8, uint),
-                binding(9, uint),
-                binding(10, array),
-                binding(11, float),
-                binding(12, uniform),
-            ],
-        });
+        let limits = device.limits();
+        let supports_curvature = limits.max_sampled_textures_per_shader_stage >= 6
+            && limits.max_uniform_buffers_per_shader_stage >= 3
+            && limits.max_bindings_per_bind_group >= 15
+            && limits.max_storage_textures_per_shader_stage >= 1
+            && limits.max_compute_workgroup_size_x >= 64;
+        let mut entries = vec![
+            binding(0, uniform),
+            binding(1, read),
+            binding(2, read),
+            binding(3, write),
+            binding(4, read),
+            binding(5, read),
+            binding(6, uint),
+            binding(7, read),
+            binding(8, uint),
+            binding(9, uint),
+            binding(10, array),
+            binding(11, float),
+            binding(12, uniform),
+        ];
+        if supports_curvature {
+            entries.extend([binding(13, uint), binding(14, uniform)]);
+        }
+        let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("tc_gpu_composite_bindings"), entries: &entries });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tc_gpu_composite_layout"),
             bind_group_layouts: &[Some(&bindings)],
             immediate_size: 0,
         });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tc_gpu_composite"),
-            source: wgpu::ShaderSource::Wgsl(
-                concat!(
-                    include_str!("shaders/noise.wgsl"),
-                    "\n",
-                    include_str!("shaders/procedural_extra.wgsl"),
-                    "\n",
-                    include_str!("shaders/tile_generator.wgsl"),
-                    "\n",
-                    include_str!("shaders/material_image.wgsl"),
-                    "\n",
-                    include_str!("shaders/stencil_projection.wgsl"),
-                    "\n",
-                    include_str!("shaders/composite.wgsl")
-                )
-                .into(),
-            ),
-        });
+        let curvature_shader = if supports_curvature {
+            include_str!("shaders/curvature_sample.wgsl")
+        } else {
+            "fn curvature_level_at(pixel: vec2<u32>, level: u32) -> f32 { return 0.0; }"
+        };
+        let source = [
+            include_str!("shaders/noise.wgsl"),
+            include_str!("shaders/procedural_extra.wgsl"),
+            include_str!("shaders/tile_generator.wgsl"),
+            include_str!("shaders/material_image.wgsl"),
+            include_str!("shaders/stencil_projection.wgsl"),
+            curvature_shader,
+            include_str!("shaders/composite.wgsl"),
+        ]
+        .join("\n");
+        let module =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc_gpu_composite"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("tc_gpu_composite"),
             layout: Some(&pipeline_layout),
@@ -1253,6 +1302,7 @@ impl GpuCompositor {
             coverage: Vec::new(),
             surfaces: Vec::new(),
             baked: BTreeMap::new(),
+            curvature: supports_curvature.then(|| CurvatureResources { gpu: None, empty: CurvatureLevels::empty(device), cache: BTreeMap::new() }),
             default_surface,
             default_vertices,
             default_baked,
@@ -1354,20 +1404,32 @@ impl GpuCompositor {
     pub(crate) fn retain_texture_sets(&mut self, count: usize) {
         self.release_unused_surfaces();
         self.baked.retain(|&ts, _| ts < count);
+        if let Some(curvature) = &mut self.curvature {
+            curvature.cache.retain(|&ts, _| ts < count);
+        }
         self.tile_images.retain(|&ts, _| ts < count);
     }
 
     pub(crate) fn release_unused_surfaces(&mut self) {
         self.tile_images.retain(|_, atlas| atlas.is_live());
         self.surfaces.retain(|cache| cache.gbuf.strong_count() != 0);
+        if let Some(curvature) = &mut self.curvature {
+            curvature.cache.retain(|_, cache| cache.map.strong_count() != 0 && cache.gbuf.strong_count() != 0);
+        }
     }
 
     pub(crate) fn clear_baked_inputs(&mut self) {
         self.baked.clear();
+        if let Some(curvature) = &mut self.curvature {
+            curvature.cache.clear();
+        }
     }
 
     pub(crate) fn release_inputs(&mut self, ts: usize) {
         self.baked.remove(&ts);
+        if let Some(curvature) = &mut self.curvature {
+            curvature.cache.remove(&ts);
+        }
         self.tile_images.remove(&ts);
     }
 
@@ -1453,6 +1515,50 @@ impl GpuCompositor {
         Ok(buffer)
     }
 
+    fn curvature_inputs(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ts: usize,
+        program: &CompositeProgram,
+        baked_view: &wgpu::TextureView,
+    ) -> Result<Option<CurvatureLevels>, String> {
+        let source = program.baked.as_ref().and_then(|baked| baked.maps[2].as_ref().map(|map| (baked, map)));
+        let Some((baked, map)) = source else {
+            return Ok(self.curvature.as_mut().map(|curvature| {
+                curvature.cache.remove(&ts);
+                curvature.empty.clone()
+            }));
+        };
+        let needed = program.curvature_sizes;
+        if !needed.contains(&true) {
+            return Ok(self.curvature.as_ref().map(|curvature| curvature.empty.clone()));
+        }
+        let Some(curvature) = &self.curvature else {
+            return Err("Curvature detail sizes exceed the GPU adapter's binding or dispatch limits.".into());
+        };
+        let (_, gbuf) = program.surface.as_ref().ok_or("Curvature detail is missing its UV coverage.")?;
+        let key = Arc::downgrade(gbuf);
+        let map = Arc::downgrade(map);
+        let size = [baked.width, baked.height];
+        if let Some(cache) = curvature.cache.get(&ts).filter(|cache| cache.gbuf.ptr_eq(&key) && cache.map.ptr_eq(&map) && cache.size == size) {
+            if needed.iter().zip(cache.needed).all(|(&required, present)| !required || present) {
+                return Ok(Some(cache.levels.clone()));
+            }
+        }
+        let coverage = (gbuf.covered_count() != gbuf.tri.len()).then(|| self.coverage_buffer(device, Some(gbuf))).transpose()?;
+        let curvature = self.curvature.as_mut().ok_or("The GPU curvature adapter is unavailable.")?;
+        curvature.cache.remove(&ts);
+        let gpu = curvature.gpu.get_or_insert_with(|| CurvatureGpu::new(device));
+        let levels = gpu.build(
+            device,
+            queue,
+            CurvatureInput { baked: baked_view, bake_size: size, coverage: coverage.as_ref(), working_size: [gbuf.width, gbuf.height], needed },
+        )?;
+        curvature.cache.insert(ts, CurvatureCache { gbuf: key, map, size, needed, levels: levels.clone() });
+        Ok(Some(levels))
+    }
+
     fn tile_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<Option<&TileImageAtlas>, String> {
         let gray: Vec<_> = program.tile_patterns.image_sources().collect();
         let color: Vec<_> = program.material_images.sources().collect();
@@ -1517,6 +1623,7 @@ impl GpuCompositor {
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
+        let curvature = self.curvature_inputs(device, queue, ts, program, &baked)?;
         let mut words_per_pixel = 0;
         let copies = DisplayKind::ALL.map(|kind| {
             if !program.writes_display(kind) {
@@ -1701,24 +1808,34 @@ impl GpuCompositor {
                         contents: bytemuck::cast_slice(values),
                         usage: wgpu::BufferUsages::UNIFORM,
                     });
+                    let entries = [
+                        wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: lookup.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&surface) },
+                        wgpu::BindGroupEntry { binding: 7, resource: vertices.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
+                        wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(brush_alpha) },
+                        wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(tile_images) },
+                        wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&brush_stencil.image) },
+                        wgpu::BindGroupEntry { binding: 12, resource: brush_stencil.uniforms.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 13,
+                            resource: wgpu::BindingResource::TextureView(curvature.as_ref().map_or(&baked, |levels| &levels.image)),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 14,
+                            resource: curvature.as_ref().map_or_else(|| lookup.as_entire_binding(), |levels| levels.layout.as_entire_binding()),
+                        },
+                    ];
+                    let count = if curvature.is_some() { entries.len() } else { 13 };
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("tc_composite_band"),
                         layout: &self.bindings,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: lookup.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&surface) },
-                            wgpu::BindGroupEntry { binding: 7, resource: vertices.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
-                            wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(brush_alpha) },
-                            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(tile_images) },
-                            wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&brush_stencil.image) },
-                            wgpu::BindGroupEntry { binding: 12, resource: brush_stencil.uniforms.as_entire_binding() },
-                        ],
+                        entries: &entries[..count],
                     })
                 };
                 if filtered && let Some((prepare, kernels)) = &self.filter_gpu {
@@ -2383,6 +2500,92 @@ mod procedural_tests {
     }
 
     #[test]
+    fn curvature_detail_modes_match_cpu_with_scaled_uv_coverage_and_missing_bake() {
+        use texturecraft_compose::eval::{Inputs, mask_image};
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = 64;
+        const BAKE_SIZE: u32 = 256;
+        let mut mesh = primitives::plane(1.0, 1);
+        for uv in &mut mesh.uvs {
+            *uv = *uv * 0.75 + texturecraft_geom::glam::Vec2::splat(0.125);
+        }
+        let mesh = Arc::new(mesh);
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let curvature = (0..BAKE_SIZE * BAKE_SIZE)
+            .map(|i| {
+                let x = i % BAKE_SIZE;
+                let y = i / BAKE_SIZE;
+                if !(32..224).contains(&x) || !(32..224).contains(&y) {
+                    1.0
+                } else {
+                    let phase = (x as f32 - 128.0) * 0.065 + y as f32 * 0.017;
+                    0.5 + 0.03 * phase.sin()
+                }
+            })
+            .collect();
+        let baked = BakedMaps { resolution: BAKE_SIZE, maps: BTreeMap::from([(BakedMap::Curvature, Arc::new(curvature))]) };
+        let absent = BakedMaps::default();
+        let pixels = PixelStore::default();
+        let images = ImageStore::default();
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        // Changing the mode or generator shares the blurred bake. Removing the bake
+        // at the end must go back to neutral curvature even after these cached reads.
+        for bake in [&baked, &absent] {
+            for kind in [GeneratorKind::Curvature, GeneratorKind::EdgeWear] {
+                let mut mode_checks = Vec::new();
+                for mode in CurvatureMode::ALL {
+                    let mut project = Project::new("Curvature details", "builtin:plane");
+                    project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+                    let owner = project.alloc_id();
+                    let mut layer = Layer::new(owner, "Curvature mask", LayerKind::Fill(Fill::default()), &[Channel::BaseColor]);
+                    let mut mask = Mask::new(MaskBackground::Black);
+                    let generator = Generator {
+                        detail: Some(CurvatureDetail { mode, weights: [0.16, 0.03, 0.16, 0.1, 0.28, 0.36, 0.46] }),
+                        level: 0.74,
+                        softness: 0.4,
+                        noise_amount: 0.43,
+                        noise_scale: 0.85,
+                        seed: 27,
+                        ..Generator::new(kind)
+                    };
+                    mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
+                    layer.mask = Some(mask);
+                    project.insert_layer(0, layer, None, false).unwrap();
+                    let mut program = CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).unwrap();
+                    let inputs = Inputs {
+                        project: &project,
+                        ts: 0,
+                        mesh: &mesh,
+                        gbuf: &gbuf,
+                        pixels: &pixels,
+                        baked: bake,
+                        block_scales: project.texture_sets[0].block_scales(),
+                        preview: None,
+                        images: &images,
+                        bounds: mesh.bounds(),
+                    };
+                    let expected = mask_image(&inputs, owner, SIZE).unwrap();
+                    program.set_surface_inputs(&mesh, &gbuf, Some(bake)).unwrap();
+                    gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+                    let texture = gpu.renderer.aux_texture(0).unwrap();
+                    let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+                    assert_eq!(rgba.len(), expected.len() * 4);
+                    for (index, (&cpu, texel)) in expected.iter().zip(rgba.as_chunks::<4>().0).enumerate() {
+                        assert!(texel[0].abs_diff(cpu) <= 2, "{kind:?} {mode:?} curvature at {index}, bake {}: GPU {}, CPU {cpu}", bake.resolution, texel[0]);
+                    }
+                    if bake.resolution == BAKE_SIZE {
+                        mode_checks.push(expected);
+                    }
+                }
+                for (index, mode) in mode_checks.iter().enumerate() {
+                    assert!(mode_checks[..index].iter().all(|prior| prior != mode));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn steep_baked_normal_keeps_its_direction_with_painted_detail() {
         let Ok(mut gpu) = Headless::new() else { return };
         const SIZE: u32 = 64;
@@ -2724,6 +2927,7 @@ mod paint_window_tests {
             layer_count: 0,
             paint: vec![paint],
             ramp_words: Vec::new(),
+            curvature_sizes: [false; CurvatureDetail::BLURRED_SIZES],
             tile_patterns: TilePatterns::default(),
             material_images: MaterialImages::default(),
             brush_alpha: None,
