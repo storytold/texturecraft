@@ -1764,6 +1764,116 @@ pub(crate) mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn submit_library_preview(link: &mut GpuLink, session: &mut Session, gpu: &mut Headless, aux: Option<AuxView>) -> Result<(), String> {
+        let ts = session.ts();
+        let update = link.sync(session, aux, None, 0, 0.0);
+        let mask = matches!(aux, Some(AuxView::Mask(_)));
+        let expected_status = if mask { "Mask: GPU" } else { "Layers: GPU" };
+        let (status, reason) = link.compositor_status();
+        let uses_expected_route = status == expected_status
+            && update.composites.iter().any(|(set, program, _)| *set == ts && program.is_mask_preview() == mask && !program.is_neutral())
+            && update.tiles.is_empty()
+            && update.aux.iter().all(|(set, ..)| *set != ts);
+        if let Some((mesh, id)) = &update.mesh {
+            gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
+        }
+        let (_, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+        for (ts, size, pixels) in update.aux {
+            gpu.renderer.upload_aux(&gpu.device, &gpu.queue, ts, size, &pixels);
+        }
+        if !errors.is_empty() {
+            Err(format!("{errors:?}"))
+        } else if !uses_expected_route {
+            Err(format!("{status} ({reason}); expected a non-neutral {expected_status} update"))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn builtin_library_and_default_generators_render_on_gpu_on_the_baked_sample() {
+        use texturecraft_engine::{core::GeneratorKind, materials::MATERIALS, smart_masks::SMART_MASKS};
+        use texturecraft_render::readback::Readback;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = 256;
+        let mut session = texturecraft_engine::sample_session(SIZE, SIZE).unwrap();
+        execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 0.0, 1.0], "roughness": 0.123})).unwrap();
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        submit_library_preview(&mut link, &mut session, &mut gpu, None).unwrap();
+
+        let material_pixels = |gpu: &Headless| {
+            [DisplayKind::BaseColor, DisplayKind::Orm].map(|kind| {
+                let (w, h, pixels) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][kind as usize]).unwrap();
+                assert_eq!((w, h), (SIZE, SIZE));
+                pixels
+            })
+        };
+        let baseline = material_pixels(&gpu);
+        let mut failures = Vec::new();
+        for material in MATERIALS {
+            execute(&mut session, "material.apply", &json!({"material": material.id})).unwrap();
+            match submit_library_preview(&mut link, &mut session, &mut gpu, None) {
+                Ok(()) if material_pixels(&gpu) != baseline => {}
+                Ok(()) => failures.push(format!("{} did not change the displayed material", material.id)),
+                Err(reason) => failures.push(format!("{}: {reason}", material.id)),
+            }
+            session.undo().unwrap();
+        }
+
+        // The pedestal has edges, cavities and differently oriented faces.
+        session.active_set = 1;
+        execute(&mut session, "material.apply", &json!({"material": "gold_polished"})).unwrap();
+        let layer = session.selected_layer().unwrap();
+        let mut check_mask = |session: &mut Session, name: &str| {
+            session.view = ViewMode::Material;
+            if let Err(reason) = submit_library_preview(&mut link, session, &mut gpu, None) {
+                failures.push(format!("{name} on the material: {reason}"));
+            }
+
+            session.view = ViewMode::Mask(layer);
+            if let Err(reason) = submit_library_preview(&mut link, session, &mut gpu, Some(AuxView::Mask(layer))) {
+                failures.push(format!("{name} in the mask view: {reason}"));
+                return;
+            }
+            let texture = gpu.renderer.aux_texture(session.ts()).unwrap();
+            let (w, h, rgba) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+            assert_eq!((w, h), (SIZE, SIZE), "{name}");
+            let actual = rgba.as_chunks::<4>().0;
+            if actual.iter().any(|[r, g, b, a]| r != g || r != b || *a != 255) {
+                failures.push(format!("{name}: mask texture is not opaque grayscale"));
+            }
+            let expected = session.mask_view_rgba(layer, SIZE).unwrap();
+            if expected.as_chunks::<4>().0.iter().any(|p| p[0] > 8)
+                && !actual.iter().zip(expected.as_chunks::<4>().0).any(|(gpu, cpu)| gpu[0] > 0 && cpu[0] > 8)
+            {
+                failures.push(format!("{name}: mask has no visible GPU coverage at the CPU witness pixels"));
+            }
+        };
+        for mask in SMART_MASKS {
+            execute(&mut session, "mask.smart.apply", &json!({"name": mask.id, "layer": layer.0})).unwrap();
+            check_mask(&mut session, mask.id);
+        }
+        for generator in GeneratorKind::ALL {
+            execute(&mut session, "mask.remove", &json!({"layer": layer.0})).unwrap();
+            execute(&mut session, "mask.add.black", &json!({"layer": layer.0})).unwrap();
+            let name = format!("{generator:?}");
+            execute(&mut session, "effect.add.generator", &json!({"target": "mask", "layer": layer.0, "generator": name})).unwrap();
+            check_mask(&mut session, &name);
+        }
+        println!(
+            "Checked {} materials, {} smart masks and {} default generators on {}",
+            MATERIALS.len(),
+            SMART_MASKS.len(),
+            GeneratorKind::ALL.len(),
+            gpu.adapter_name
+        );
+        assert!(failures.is_empty(), "GPU library sweep errors: {failures:#?}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn moss_and_leather_display_procedurals_and_sheen_on_gpu() {
         use texturecraft_render::{headless::Headless, readback::Readback};
