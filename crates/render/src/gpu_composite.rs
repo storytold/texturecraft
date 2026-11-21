@@ -8,12 +8,13 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, ProceduralKind,
-    Project, Projection, Source,
+    BakedMap, BlendMode, Channel, ChannelKind, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat,
+    ProceduralKind, Project, Projection, Source,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
+use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages};
 use crate::gpu_neighbourhood::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
 use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
@@ -81,11 +82,12 @@ struct ProceduralInputs {
     resolution: u32,
     ramp_words: Vec<u32>,
     filters: Vec<(Filter, f32)>,
+    materials: MaterialImages,
 }
 
 impl ProceduralInputs {
     fn new(resolution: u32) -> Self {
-        Self { resolution, ramp_words: Vec::new(), filters: Vec::new() }
+        Self { resolution, ramp_words: Vec::new(), filters: Vec::new(), materials: MaterialImages::default() }
     }
 
     fn pack_gradient(&mut self, colors: &[[f32; 3]]) -> Option<[u32; 2]> {
@@ -238,6 +240,7 @@ pub struct CompositeProgram {
     paint: Vec<TileImage>,
     ramp_words: Vec<u32>,
     tile_patterns: TilePatterns,
+    material_images: MaterialImages,
     brush_alpha: Option<wgpu::TextureView>,
     brush_stencil: Option<GpuStencil>,
     pub(crate) region: Option<CompositeRegion>,
@@ -312,9 +315,10 @@ impl CompositeProgram {
         self.coverage = Some((coverage, if self.mask_preview { 0 } else { radius.min(15) }));
     }
 
-    /// Bind the authored images named by Tile Generator sources in this program.
+    /// Resolve named images used by authored fills, decals and Tile Generators.
     pub fn set_tile_images(&mut self, images: &ImageStore) {
         self.tile_patterns.set_images(images);
+        self.material_images.set_images(images);
     }
 
     /// Mesh-space projections and generators share the viewport's surface and bake inputs.
@@ -408,12 +412,10 @@ impl CompositeProgram {
                 LayerKind::Paint => None,
                 _ => return Err("A group or another layer type uses CPU compositing."),
             };
-            if fill.is_some_and(|fill| {
-                matches!(fill.projection, Projection::Decal(_))
-                    || fill.sources.values().any(|source| !matches!(source, Source::Uniform(_) | Source::Procedural { .. }))
-            }) {
-                return Err("An image source or decal uses CPU compositing.");
-            }
+            let decal = fill.and_then(|fill| match fill.projection {
+                Projection::Decal(frame) => Some(procedural.materials.register_decal(frame, fill.sources.values())),
+                _ => None,
+            });
 
             let live_brush = brush.as_ref().and_then(|brush| match &brush.target {
                 LiveBrushTarget::Layer { layer, values } if fill.is_none() && *layer == id => Some((values, brush.opacity.clamp(0.0, 1.0))),
@@ -467,6 +469,9 @@ impl CompositeProgram {
                     fill.and_then(|fill| source_operation(source, &fill.projection, default, channel.kind(), &mut procedural))
                         .ok_or("A fill source or projection uses CPU compositing.")?
                 };
+                if let Some(decal) = decal {
+                    op.uv[0] = decal as f32;
+                }
                 if let Some(([r, g, b], opacity)) = brush_value {
                     op.projection[3] = if stencil_pigment && channel == Channel::BaseColor { 2.0 } else { 1.0 };
                     op.uv = [r, g, b, opacity];
@@ -503,6 +508,7 @@ impl CompositeProgram {
             paint,
             ramp_words: procedural.ramp_words,
             tile_patterns,
+            material_images: procedural.materials,
             brush_alpha,
             brush_stencil,
             region,
@@ -552,6 +558,7 @@ impl CompositeProgram {
             paint,
             ramp_words: procedural.ramp_words,
             tile_patterns,
+            material_images: procedural.materials,
             brush_alpha,
             brush_stencil,
             region,
@@ -582,8 +589,14 @@ fn compile_mask(
     let Some(mask) = mask else { return Ok(1.0) };
     for effect in mask.effects.iter().filter(|e| e.visible) {
         let mut op = match &effect.kind {
-            EffectKind::Fill { source, projection } => source_operation(Some(source), projection, [0.0; 3], ChannelKind::Scalar, procedural)
-                .ok_or("A mask fill source or projection uses CPU compositing.")?,
+            EffectKind::Fill { source, projection } => {
+                let mut operation = source_operation(Some(source), projection, [0.0; 3], ChannelKind::Scalar, procedural)
+                    .ok_or("A mask fill source or projection uses CPU compositing.")?;
+                if let Projection::Decal(frame) = projection {
+                    operation.uv[0] = procedural.materials.register_decal(*frame, std::iter::once(source)) as f32;
+                }
+                operation
+            }
             EffectKind::Paint | EffectKind::Path(_) => {
                 let live = brush.and_then(|brush| match &brush.target {
                     LiveBrushTarget::Mask { effect: id, value } if *id == effect.id && matches!(effect.kind, EffectKind::Paint) => {
@@ -680,13 +693,54 @@ fn source_operation(
     channel: ChannelKind,
     inputs: &mut ProceduralInputs,
 ) -> Option<Operation> {
-    if matches!(projection, Projection::Decal(_)) {
-        return None;
-    }
     let mut op = Operation::zeroed();
     match source {
         None => op.low[..3].copy_from_slice(&default),
         Some(Source::Uniform(value)) => op.low[..3].copy_from_slice(value),
+        Some(Source::Image { name, normal_format }) => {
+            let kind = match channel {
+                ChannelKind::Color => 0,
+                ChannelKind::Scalar => 1,
+                ChannelKind::Signed => 2,
+                ChannelKind::NormalMap => {
+                    if *normal_format == NormalFormat::DirectX {
+                        4
+                    } else {
+                        3
+                    }
+                }
+            };
+            op.ids = [0, IMAGE_SOURCE_OPCODE, inputs.materials.register_image(name), kind];
+            match projection {
+                Projection::Uv { scale, rotation, offset } => {
+                    let (sin, cos) = rotation.to_radians().sin_cos();
+                    op.projection = [cos, sin, scale[0], scale[1]];
+                    op.uv[..2].copy_from_slice(offset);
+                }
+                Projection::Triplanar { scale, sharpness, offset } => {
+                    op.projection = [offset[0], offset[1], offset[2], *scale];
+                    op.procedural[3] = 1;
+                    op.balance[3] = sharpness.max(1.0);
+                }
+                Projection::Planar { scale, axis, offset } => {
+                    op.projection = [offset[0], offset[1], offset[2], *scale];
+                    op.procedural[3] = 2 + u32::from((*axis).min(2));
+                }
+                Projection::Spherical { scale } => {
+                    op.projection[3] = *scale;
+                    op.procedural[3] = 5;
+                }
+                Projection::Cylindrical { scale, axis } => {
+                    op.projection[3] = *scale;
+                    op.procedural[3] = match axis {
+                        0 => 6,
+                        2 => 8,
+                        _ => 7,
+                    };
+                }
+                Projection::Decal(_) => {}
+            }
+        }
         Some(Source::Procedural { pattern, low, high, ramp }) => {
             let kind = match pattern.kind {
                 ProceduralKind::Clouds => 1,
@@ -778,10 +832,13 @@ fn source_operation(
                         _ => 5,
                     };
                 }
-                Projection::Decal(_) => return None,
+                Projection::Decal(_) => {}
             }
         }
         _ => return None,
+    }
+    if matches!(projection, Projection::Decal(_)) {
+        op.procedural[3] = DECAL_PROJECTION;
     }
     op.low.iter().chain(&op.high).chain(&op.projection).chain(&op.uv).chain(&op.balance).all(|v| v.is_finite()).then_some(op)
 }
@@ -1000,6 +1057,8 @@ impl GpuCompositor {
                     include_str!("shaders/procedural_extra.wgsl"),
                     "\n",
                     include_str!("shaders/tile_generator.wgsl"),
+                    "\n",
+                    include_str!("shaders/material_image.wgsl"),
                     "\n",
                     include_str!("shaders/stencil_projection.wgsl"),
                     "\n",
@@ -1224,14 +1283,16 @@ impl GpuCompositor {
         Ok(buffer)
     }
 
-    fn tile_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, patterns: &TilePatterns) -> Result<Option<&TileImageAtlas>, String> {
-        let inputs: Vec<_> = patterns.image_sources().collect();
-        if inputs.is_empty() {
+    fn tile_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<Option<&TileImageAtlas>, String> {
+        let gray: Vec<_> = program.tile_patterns.image_sources().collect();
+        let color: Vec<_> = program.material_images.sources().collect();
+        if gray.is_empty() && color.is_empty() {
             self.tile_images.remove(&ts);
             return Ok(None);
         }
-        if self.tile_images.get(&ts).is_none_or(|atlas| !atlas.matches(&inputs)) {
-            let atlas = TileImageAtlas::new(device, queue, &inputs)?;
+        if self.tile_images.get(&ts).is_none_or(|atlas| !atlas.matches(&gray, &color)) {
+            self.tile_images.remove(&ts);
+            let atlas = TileImageAtlas::new(device, queue, &gray, &color)?;
             self.tile_images.insert(ts, atlas);
         }
         Ok(self.tile_images.get(&ts))
@@ -1325,17 +1386,20 @@ impl GpuCompositor {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let atlas = self.tile_atlas(device, queue, ts, &program.tile_patterns)?;
+        let atlas = self.tile_atlas(device, queue, ts, program)?;
         let tile_images = atlas.map(|atlas| atlas.view.clone());
-        let (operations, lookup) = if program.tile_patterns.is_empty() && program.ramp_words.is_empty() {
+        let (operations, lookup) = if program.tile_patterns.is_empty() && program.ramp_words.is_empty() && program.material_images.is_empty() {
             (Cow::Borrowed(program.operations.as_slice()), self.lookup.clone())
         } else {
             let mut words = texturecraft_texel::srgb_lut().map(u32::from).to_vec();
             words.extend(&program.ramp_words);
             let offsets = program.tile_patterns.append_words(&mut words, atlas);
+            let mesh = program.surface.as_ref().map(|(mesh, _)| mesh.as_ref());
+            let (images, decals) = program.material_images.append_words(&mut words, atlas, mesh);
             let limits = device.limits();
             // The operation stores the offset as an exactly represented float.
-            if (!offsets.is_empty() && words.len() >= 1 << 24) || (words.len() * 4) as u64 > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size)
+            if ((!offsets.is_empty() || !decals.is_empty()) && words.len() >= 1 << 24)
+                || (words.len() * 4) as u64 > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size)
             {
                 return Err("Procedural settings exceed the GPU parameter buffer limit.".into());
             }
@@ -1343,6 +1407,14 @@ impl GpuCompositor {
             for op in operations.iter_mut().filter(|op| op.ids[1] == TILE_GENERATOR_OPCODE) {
                 let index = op.high[3] as usize;
                 op.high[3] = *offsets.get(index).ok_or("A Tile Generator operation has no settings.")? as f32;
+            }
+            for op in &mut operations {
+                if op.ids[1] == IMAGE_SOURCE_OPCODE {
+                    op.ids[2] = *images.get(op.ids[2] as usize).ok_or("An image source has no binding.")?;
+                }
+                if op.procedural[3] == DECAL_PROJECTION {
+                    op.uv[0] = *decals.get(op.uv[0] as usize).ok_or("A decal has no frame.")? as f32;
+                }
             }
             let lookup = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("tc_composite_tile_patterns"),
@@ -2132,6 +2204,125 @@ mod procedural_tests {
             }
         }
     }
+
+    #[test]
+    fn authored_material_images_match_cpu_projections_and_decal_coverage() {
+        use texturecraft_compose::{
+            BakedMaps, ImageRes,
+            display::tile_bytes,
+            eval::{Composite, Inputs, composite_tiles, mask_image},
+        };
+        use texturecraft_core::{Decal, DecalFlip, DecalSymmetry};
+
+        const SIZE: u32 = TILE;
+        let Ok(mut gpu) = Headless::new() else { return };
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        let mut mesh = primitives::plane(1.0, 1);
+        mesh.normals.fill(Vec3::new(0.3, 0.9, -0.2).normalize());
+        let mesh = Arc::new(mesh);
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let image = |rgba, srgb| Arc::new(ImageRes { width: 2, height: 2, rgba, srgb });
+        let bytes = [[18, 206, 44, 17], [191, 51, 20, 237], [44, 12, 99, 0], [213, 221, 40, 110]].map(|pixel| pixel.map(|v| v as f32 / 255.0));
+        let shorts = [[15324, 60403, 21177, 65535], [33499, 2177, 5828, 0], [21643, 8005, 11999, 9001], [57132, 39801, 6021, 32777]]
+            .map(|pixel| pixel.map(|v| v as f32 / 65535.0));
+        let floats = [[0.1321, 0.223, 0.13, 1.0], [1.34, 0.11, 0.15, 0.7], [-0.051, 0.41, 0.622, 0.12], [0.09, 0.221, 0.94, 0.0]];
+        let images = ImageStore::from([
+            ("color".into(), image(bytes.to_vec(), true)),
+            ("normal".into(), image(shorts.to_vec(), true)),
+            ("float".into(), image(floats.to_vec(), false)),
+        ]);
+        let decal = Decal {
+            center: [0.26, -0.06, 0.06],
+            normal: [0.0, 1.0, 0.0],
+            up: [0.0, 0.0, 1.0],
+            size: [0.51, 0.71],
+            rotation: 12.0,
+            offset: [0.018, 0.021],
+            depth: 0.073,
+            symmetry: Some(DecalSymmetry { axis: 0, flip: DecalFlip::V, offset: 0.014 }),
+            flip: [true, false],
+        };
+        let projections = [
+            Projection::Uv { scale: [1.21, -0.78], rotation: 39.0, offset: [-0.54, 0.16] },
+            Projection::Triplanar { scale: 0.63, sharpness: 2.1, offset: [0.14, -0.27, 0.31] },
+            Projection::Planar { scale: 1.4, axis: 0, offset: [0.04, 0.23, 0.18] },
+            Projection::Planar { scale: 0.9, axis: 1, offset: [-0.18, -0.34, 1.03] },
+            Projection::Planar { scale: 1.1, axis: 2, offset: [0.65, -0.26, -0.31] },
+            Projection::Spherical { scale: 1.09 },
+            Projection::Cylindrical { scale: 1.21, axis: 0 },
+            Projection::Cylindrical { scale: 2.19, axis: 1 },
+            Projection::Cylindrical { scale: 0.87, axis: 2 },
+            Projection::Decal(decal),
+        ];
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal];
+        for projection in projections {
+            let mut project = Project::new("Image source parity", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+            let fill = Fill {
+                sources: BTreeMap::from([
+                    (Channel::BaseColor, Source::image("color")),
+                    (Channel::Roughness, Source::image("float")),
+                    (Channel::Height, Source::image("float")),
+                    (Channel::Normal, Source::Image { name: "normal".into(), normal_format: NormalFormat::DirectX }),
+                ]),
+                projection: projection.clone(),
+                ..Fill::default()
+            };
+            let owner = project.alloc_id();
+            let mut layer = Layer::new(owner, "Material images", LayerKind::Fill(fill), &channels);
+            let mut mask = Mask::new(MaskBackground::Black);
+            let mask_source = Source::image("normal");
+            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: mask_source, projection: projection.clone() }));
+            layer.mask = Some(mask);
+            project.insert_layer(0, layer, None, false).unwrap();
+            let pixels = PixelStore::default();
+            let baked = BakedMaps::default();
+            let inputs = Inputs {
+                project: &project,
+                ts: 0,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked: &baked,
+                block_scales: project.texture_sets[0].block_scales(),
+                preview: None,
+                images: &images,
+                bounds: mesh.bounds(),
+            };
+            let mut cpu = Composite::new(&channels, SIZE);
+            composite_tiles(&inputs, &mut cpu, &[(0, 0)]);
+            let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+            program.set_tile_images(&images);
+            program.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+            for kind in [DisplayKind::BaseColor, DisplayKind::Orm, DisplayKind::Height, DisplayKind::Normal] {
+                let expected = tile_bytes(&cpu, &baked, kind, 0, 0);
+                let texture = gpu.renderer.display_textures()[0][kind as usize];
+                let (_, _, actual) = Readback::blocking_level(&gpu.device, &gpu.queue, texture, 0).unwrap();
+                assert_eq!(actual.len(), expected.len());
+                if kind.bytes_per_texel() == 8 {
+                    for (actual, expected) in actual.as_chunks::<2>().0.iter().zip(expected.as_chunks::<2>().0) {
+                        let actual = half::f16::from_le_bytes(*actual).to_f32();
+                        let expected = half::f16::from_le_bytes(*expected).to_f32();
+                        assert!((actual - expected).abs() <= 0.003, "{projection:?} {kind:?}: GPU {actual} vs CPU {expected}");
+                    }
+                } else {
+                    assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2), "{projection:?} {kind:?}");
+                }
+            }
+            let expected = mask_image(&inputs, owner, SIZE).unwrap();
+            let mut mask = CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).unwrap();
+            mask.set_tile_images(&images);
+            mask.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &mask).unwrap();
+            let texture = gpu.renderer.aux_texture(0).unwrap();
+            let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+            assert_eq!(actual.len(), expected.len() * 4);
+            for (expected, &[r, g, b, a]) in expected.into_iter().zip(actual.as_chunks::<4>().0) {
+                assert!(r.abs_diff(expected) <= 2 && r == g && r == b && a == 255, "{projection:?} mask: GPU {r} vs CPU {expected}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2154,6 +2345,7 @@ mod paint_window_tests {
             paint: vec![paint],
             ramp_words: Vec::new(),
             tile_patterns: TilePatterns::default(),
+            material_images: MaterialImages::default(),
             brush_alpha: None,
             brush_stencil: None,
             region: None,

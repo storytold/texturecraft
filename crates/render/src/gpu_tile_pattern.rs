@@ -1,6 +1,7 @@
 //! Settings and authored images for the GPU Tile Generator. Placement and random draws
 //! are constant per cell. The shader evaluates shapes and blends at each material texel.
 
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 use texturecraft_compose::{ImageRes, ImageStore, TileLayout, prepare_tile_layout};
@@ -12,6 +13,8 @@ const NO_IMAGE: u32 = u32::MAX;
 const IMAGE_ROWS: usize = 64;
 // Put a bound on packing overhead as well as authored pixels.
 const MAX_ATLAS_BYTES: u64 = 256 << 20;
+const MAX_COLOR_ATLAS_BYTES: u64 = 1 << 30;
+const MAX_PENDING_UPLOAD_BYTES: u64 = 64 << 20;
 
 #[derive(Debug, Default)]
 pub(crate) struct TilePatterns {
@@ -167,15 +170,61 @@ struct ImageRegion {
     size: [u32; 2],
 }
 
+#[derive(Clone, Copy)]
+enum RgbaEncoding {
+    Bytes = 1,
+    Shorts = 2,
+    Floats = 4,
+}
+
+impl RgbaEncoding {
+    fn for_image(image: &ImageRes) -> Self {
+        let exact = |v: f32, scale: f32| {
+            let integer = (v * scale).round();
+            integer >= 0.0 && integer <= scale && (v == integer / scale || v == integer * (1.0 / scale))
+        };
+        if image.rgba.par_iter().all(|pixel| pixel.iter().all(|&v| exact(v, 255.0))) {
+            Self::Bytes
+        } else if image.rgba.par_iter().all(|pixel| pixel.iter().all(|&v| exact(v, 65535.0))) {
+            Self::Shorts
+        } else {
+            Self::Floats
+        }
+    }
+
+    fn word(self, [r, g, b, a]: [f32; 4], lane: usize) -> u32 {
+        match self {
+            Self::Bytes => {
+                let byte = |v: f32| (v * 255.0).round() as u8;
+                u32::from_le_bytes([byte(r), byte(g), byte(b), byte(a)])
+            }
+            Self::Shorts => {
+                let short = |v: f32| (v * 65535.0).round() as u32;
+                let [low, high] = if lane == 0 { [r, g] } else { [b, a] };
+                short(low) | (short(high) << 16)
+            }
+            Self::Floats => [r, g, b, a][lane].to_bits(),
+        }
+    }
+}
+
+struct RgbaRegion {
+    encoding: RgbaEncoding,
+    planes: Vec<ImageRegion>,
+}
+
 pub(crate) struct TileImageAtlas {
     images: Vec<Weak<ImageRes>>,
     regions: Vec<ImageRegion>,
+    color: Vec<RgbaRegion>,
     pub(crate) view: wgpu::TextureView,
 }
 
 impl TileImageAtlas {
-    pub(crate) fn matches(&self, images: &[&Arc<ImageRes>]) -> bool {
-        self.images.len() == images.len() && self.images.iter().zip(images).all(|(old, new)| old.ptr_eq(&Arc::downgrade(new)))
+    pub(crate) fn matches(&self, gray: &[&Arc<ImageRes>], color: &[&Arc<ImageRes>]) -> bool {
+        self.regions.len() == gray.len()
+            && self.color.len() == color.len()
+            && self.images.iter().zip(gray.iter().chain(color)).all(|(old, new)| old.ptr_eq(&Arc::downgrade(new)))
     }
 
     pub(crate) fn is_live(&self) -> bool {
@@ -186,12 +235,34 @@ impl TileImageAtlas {
         atlas_texture(device, 1, 1, 2).create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
     }
 
-    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, images: &[&Arc<ImageRes>]) -> Result<Self, String> {
+    pub(crate) fn append_rgba(&self, words: &mut Vec<u32>, color_index: usize, srgb: bool) -> u32 {
+        let region = &self.color[color_index];
+        let offset = words.len() as u32;
+        let [width, height] = region.planes[0].size;
+        let flags = region.encoding as u32 | (u32::from(srgb) << 8);
+        words.extend([width, height, flags]);
+        for plane in &region.planes {
+            words.extend(plane.origin);
+        }
+        offset
+    }
+
+    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, gray: &[&Arc<ImageRes>], color: &[&Arc<ImageRes>]) -> Result<Self, String> {
         let limits = device.limits();
-        let (extent, regions) = arrange_images(images, limits.max_texture_dimension_2d, limits.max_texture_array_layers, device.adapter_info().backend)?;
+        let encodings: Vec<_> = color.iter().map(|image| RgbaEncoding::for_image(image)).collect();
+        let size = |image: &Arc<ImageRes>| [image.width.max(1), image.height.max(1)];
+        let sizes: Vec<_> = gray
+            .iter()
+            .map(|image| size(image))
+            .chain(color.iter().zip(&encodings).flat_map(|(image, &encoding)| std::iter::repeat_n(size(image), encoding as usize)))
+            .collect();
+        let budget = if color.is_empty() { MAX_ATLAS_BYTES } else { MAX_COLOR_ATLAS_BYTES };
+        let (extent, regions) =
+            arrange_images(&sizes, limits.max_texture_dimension_2d, limits.max_texture_array_layers, device.adapter_info().backend, budget)?;
         let texture = atlas_texture(device, extent[0], extent[1], extent[2]);
         let mut pixels = Vec::new();
-        for (&image, region) in images.iter().zip(&regions) {
+        let mut pending = 0;
+        let mut upload = |image: &ImageRes, region: &ImageRegion, encoding: Option<(RgbaEncoding, usize)>| -> Result<(), String> {
             let [width, height] = region.size;
             for top in (0..height).step_by(IMAGE_ROWS) {
                 let rows = (height - top).min(IMAGE_ROWS as u32);
@@ -199,8 +270,11 @@ impl TileImageAtlas {
                 let n = rows as usize * width as usize;
                 pixels.clear();
                 pixels.extend((first..first + n).map(|index| {
-                    let [r, g, b, _] = image.rgba.get(index).copied().unwrap_or_default();
-                    ((r + g + b) / 3.0).to_bits()
+                    let sample = image.rgba.get(index).copied().unwrap_or_default();
+                    match encoding {
+                        Some((encoding, lane)) => encoding.word(sample, lane),
+                        None => ((sample[0] + sample[1] + sample[2]) / 3.0).to_bits(),
+                    }
                 }));
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -211,20 +285,40 @@ impl TileImageAtlas {
                     wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: None },
                     wgpu::Extent3d { width, height: rows, depth_or_array_layers: 1 },
                 );
+                pending += u64::from(width) * u64::from(rows) * 4;
+                if pending >= MAX_PENDING_UPLOAD_BYTES {
+                    let submission = queue.submit([]);
+                    device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }).map_err(|error| error.to_string())?;
+                    pending = 0;
+                }
             }
+            Ok(())
+        };
+        let (gray_regions, mut color_regions) = regions.split_at(gray.len());
+        for (image, region) in gray.iter().zip(gray_regions) {
+            upload(image, region, None)?;
+        }
+        let mut color_layout = Vec::new();
+        for (image, encoding) in color.iter().zip(encodings) {
+            let (planes, remaining) = color_regions.split_at(encoding as usize);
+            color_regions = remaining;
+            for (lane, plane) in planes.iter().enumerate() {
+                upload(image, plane, Some((encoding, lane)))?;
+            }
+            color_layout.push(RgbaRegion { encoding, planes: planes.to_vec() });
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
-        Ok(Self { images: images.iter().map(|image| Arc::downgrade(image)).collect(), regions, view })
+        Ok(Self { images: gray.iter().chain(color).map(|image| Arc::downgrade(image)).collect(), regions: gray_regions.to_vec(), color: color_layout, view })
     }
 }
 
-fn arrange_images(images: &[&Arc<ImageRes>], side_limit: u32, layer_limit: u32, backend: wgpu::Backend) -> Result<([u32; 3], Vec<ImageRegion>), String> {
-    let mut order: Vec<_> = images.iter().enumerate().map(|(i, image)| (i, image.width.max(1), image.height.max(1))).collect();
+fn arrange_images(images: &[[u32; 2]], side_limit: u32, layer_limit: u32, backend: wgpu::Backend, budget: u64) -> Result<([u32; 3], Vec<ImageRegion>), String> {
+    let mut order: Vec<_> = images.iter().enumerate().map(|(i, &[w, h])| (i, w, h)).collect();
     order.sort_by_key(|&(_, _, height)| std::cmp::Reverse(height));
     let widest = order.iter().map(|&(_, width, _)| width).max().unwrap_or(1);
     let tallest = order.first().map_or(1, |&(_, _, height)| height);
     if widest.max(tallest) > side_limit {
-        return Err("A Tile Generator image exceeds the GPU texture dimension limit.".into());
+        return Err("An authored image exceeds the GPU texture dimension limit.".into());
     }
     let area: u64 = order.iter().map(|&(_, width, height)| u64::from(width) * u64::from(height)).sum();
     let width = (area as f64).sqrt().ceil().min(f64::from(side_limit)) as u32;
@@ -245,7 +339,7 @@ fn arrange_images(images: &[&Arc<ImageRes>], side_limit: u32, layer_limit: u32, 
             row_height = 0;
         }
         if layer >= layer_limit {
-            return Err("The Tile Generator image atlas exceeds the GPU array limit.".into());
+            return Err("The authored image atlas exceeds the GPU array limit.".into());
         }
         regions[index] = ImageRegion { origin: [x, y, layer], size: [w, h] };
         x += w;
@@ -259,13 +353,13 @@ fn arrange_images(images: &[&Arc<ImageRes>], side_limit: u32, layer_limit: u32, 
     if backend == wgpu::Backend::Gl && (layers == 1 || (used_w == used_h && layers.is_multiple_of(6))) {
         layers += 1;
         if layers > layer_limit {
-            return Err("The Tile Generator image atlas exceeds the GPU array limit.".into());
+            return Err("The authored image atlas exceeds the GPU array limit.".into());
         }
     }
     let extent = [used_w, used_h, layers];
     let bytes = extent.into_iter().map(u64::from).product::<u64>() * size_of::<u32>() as u64;
-    if bytes > MAX_ATLAS_BYTES {
-        return Err("The Tile Generator image atlas exceeds the GPU memory budget.".into());
+    if bytes > budget {
+        return Err("The authored image atlas exceeds the GPU memory budget.".into());
     }
     Ok((extent, regions))
 }
@@ -289,21 +383,20 @@ mod tests {
 
     #[test]
     fn image_atlas_counts_unoccupied_space_in_every_array_slice() {
-        let input = |side| Arc::new(ImageRes { width: side, height: side, rgba: Vec::new(), srgb: false });
-        let large = input(8192);
-        let small = input(16);
-        let (extent, _) = arrange_images(&[&large], 8192, 16, wgpu::Backend::Vulkan).unwrap();
+        let large = [8192; 2];
+        let small = [16; 2];
+        let (extent, _) = arrange_images(&[large], 8192, 16, wgpu::Backend::Vulkan, MAX_ATLAS_BYTES).unwrap();
         assert_eq!(extent, [8192, 8192, 1]);
-        let error = arrange_images(&[&large, &small], 8192, 16, wgpu::Backend::Vulkan).err();
+        let error = arrange_images(&[large, small], 8192, 16, wgpu::Backend::Vulkan, MAX_ATLAS_BYTES).err();
         assert!(error.is_some_and(|error| error.contains("memory budget")));
     }
 
     #[test]
     fn gl_image_atlas_uses_a_2d_array_target() {
-        let image = Arc::new(ImageRes { width: 4, height: 4, rgba: Vec::new(), srgb: false });
-        let (extent, _) = arrange_images(&[&image], 4, 16, wgpu::Backend::Gl).unwrap();
+        let image = [4; 2];
+        let (extent, _) = arrange_images(&[image], 4, 16, wgpu::Backend::Gl, MAX_ATLAS_BYTES).unwrap();
         assert_eq!(extent, [4, 4, 2]);
-        let (extent, _) = arrange_images(&[&image; 6], 4, 16, wgpu::Backend::Gl).unwrap();
+        let (extent, _) = arrange_images(&[image; 6], 4, 16, wgpu::Backend::Gl, MAX_ATLAS_BYTES).unwrap();
         assert_eq!(extent, [4, 4, 7]);
     }
 }
