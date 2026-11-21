@@ -1121,8 +1121,35 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     if covered && (params.coverage.w & GEOMETRY_MASKS) != 0u {
         triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
     }
+    var group_depth = 0u;
     for (var i = 0u; covered && i < params.program.x; i++) {
         let layer = layers[i];
+        if composite_groups {
+            if layer.ids.y == BEGIN_GROUP {
+                var mask = 0.0;
+                if geometry_allows(layer.constraints.x, triangle) {
+                    mask = mask_with_height(layer, texel, layer_mask(layer, texel, layer.effects.y));
+                }
+                if mask <= 0.0 {
+                    // The instruction stores the first operation after its END_GROUP.
+                    i = layer.ids.w - 1u;
+                    continue;
+                }
+                save_group_parent(group_depth, index, mask, MaterialValues(base, normal, scalars, lobe_colors, lobe_values));
+                group_depth += 1u;
+                continue;
+            }
+            if layer.ids.y == END_GROUP {
+                group_depth -= 1u;
+                let mixed = mix_group_parent(group_depth, index, layer.ids.z, MaterialValues(base, normal, scalars, lobe_colors, lobe_values));
+                base = mixed.base;
+                normal = mixed.normal;
+                scalars = mixed.scalars;
+                lobe_colors = mixed.lobe_colors;
+                lobe_values = mixed.lobe_values;
+                continue;
+            }
+        }
         if !geometry_allows(layer.constraints.x, triangle) { continue; }
         let mode = u32(layer.balance.z);
         var weight = layer.low.w;

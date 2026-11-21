@@ -22,6 +22,10 @@ use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePattern
 use crate::paint_window::TileWindow;
 use wgpu::util::DeviceExt;
 
+#[path = "gpu_composite_groups.rs"]
+mod groups;
+use groups::{BEGIN_GROUP, END_GROUP, GroupPlan, StackWork};
+
 const MAX_PAINT_WORDS: usize = (64 << 20) / size_of::<u32>();
 const LOOKUP_WORDS: u32 = 4096;
 const NO_PAINT_IMAGE: u32 = u32::MAX;
@@ -358,6 +362,7 @@ pub struct CompositeProgram {
     operations: Vec<Operation>,
     layer_count: u32,
     filters: FilterPlan,
+    groups: GroupPlan,
     geometry: GeometryMasks,
     paint: Vec<TileImage>,
     ramp_words: Vec<u32>,
@@ -489,16 +494,29 @@ impl CompositeProgram {
         if let Some(brush) = &brush {
             brush.validate(set.size())?;
         }
-        let mut operations = Vec::new();
+        let mut operations: Vec<Operation> = Vec::new();
         let mut paint = Vec::new();
         let mut tile_patterns = TilePatterns::default();
         let mut effects = Vec::new();
         let mut procedural = ProceduralInputs::new(set.resolution);
         let mut geometry = GeometryMasks::default();
+        let mut groups = GroupPlan::default();
+        let mut group_depth = 0;
         let mut non_default = [false; Channel::ALL.len()];
         let stencil_pigment = brush.as_ref().is_some_and(|brush| brush.stencil.is_some());
-        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (id, 0, 0)).collect();
-        while let Some((id, depth, inherited_geometry)) = layers.pop() {
+        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| StackWork::Layer(id, 0, 0)).collect();
+        while let Some(work) = layers.pop() {
+            let (id, depth, inherited_geometry) = match work {
+                StackWork::Layer(id, depth, geometry) => (id, depth, geometry),
+                StackWork::EndGroup(start) => {
+                    let end = operations.len() as u32 + 1;
+                    let weights = operations[start].ids[2];
+                    operations[start].ids[3] = end;
+                    operations.push(Operation { ids: [0, END_GROUP, weights, 0], ..Operation::zeroed() });
+                    group_depth -= 1;
+                    continue;
+                }
+            };
             let layer = project.layers.get(&id).ok_or("A layer is missing from the material.")?;
             if !layer.visible {
                 continue;
@@ -506,17 +524,65 @@ impl CompositeProgram {
             let geometry_mask = geometry.register(inherited_geometry, layer.geometry_mask.as_deref());
             let mask = layer.mask.as_ref().filter(|m| m.enabled);
             if let LayerKind::Group { children, .. } = &layer.kind {
-                if depth >= texturecraft_core::project::MAX_DEPTH
-                    || mask.is_some()
-                    || !layer.content_effects.is_empty()
-                    || set
-                        .channels
-                        .iter()
-                        .any(|&(channel, _)| layer.blend(channel).is_none_or(|blend| blend.mode != BlendMode::Passthrough || blend.opacity != 1.0))
-                {
-                    return Err("A masked or modified group uses CPU compositing.");
+                if depth >= texturecraft_core::project::MAX_DEPTH || children.is_empty() {
+                    continue;
                 }
-                layers.extend(children.iter().rev().map(|&child| (child, depth + 1, geometry_mask)));
+                // A full-weight group sees the incoming stack and returns it exactly
+                // as its children changed it. Keep such groups on the flat shader.
+                if mask.is_none()
+                    && set.channels.iter().all(|&(channel, _)| {
+                        layer.blend(channel).is_some_and(|blend| blend.mode != BlendMode::Disable && blend.opacity.is_finite() && blend.opacity >= 1.0)
+                    })
+                {
+                    layers.extend(children.iter().rev().map(|&child| StackWork::Layer(child, depth + 1, geometry_mask)));
+                    continue;
+                }
+                let mut weights = [0.0f32; Channel::ALL.len()];
+                for &(channel, _) in &set.channels {
+                    if let Some(blend) = layer.blend(channel).filter(|blend| blend.mode != BlendMode::Disable) {
+                        if !blend.opacity.is_finite() {
+                            return Err("A group has an invalid opacity.");
+                        }
+                        weights[channel_slot(channel) as usize] = blend.opacity.clamp(0.0, 1.0);
+                    }
+                }
+                if weights.iter().all(|&opacity| opacity == 0.0) {
+                    continue;
+                }
+                let begin = effects.len() as u32;
+                let background = compile_mask(mask, pixels, set.size(), brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
+                let count = effects.len() as u32 - begin;
+                if count == 0 && background == 0.0 {
+                    continue;
+                }
+                let height = layer.height_mask;
+                let height_params = if height.enabled && count != 0 {
+                    if !height.contrast.is_finite() || !height.offset.is_finite() {
+                        return Err("A group's height mask has invalid parameters.");
+                    }
+                    [height.contrast.to_bits(), height.offset.to_bits()]
+                } else {
+                    [0; 2]
+                };
+                let weight_offset = u32::try_from(procedural.ramp_words.len())
+                    .ok()
+                    .and_then(|len| LOOKUP_WORDS.checked_add(len))
+                    .ok_or("The GPU group settings are too large.")?;
+                procedural.ramp_words.extend(weights.map(f32::to_bits));
+                let open = operations.len();
+                let mut op = Operation {
+                    ids: [0, BEGIN_GROUP, weight_offset, 0],
+                    effects: [begin, count, 0, 0],
+                    constraints: [geometry_mask, 0, height_params[0], height_params[1]],
+                    ..Operation::zeroed()
+                };
+                op.balance[1] = background;
+                operations.push(op);
+                group_depth += 1;
+                groups.depth = groups.depth.max(group_depth);
+                layers.push(StackWork::EndGroup(open));
+                // The group tests its geometry before entering. Children still apply their own masks.
+                layers.extend(children.iter().rev().map(|&child| StackWork::Layer(child, depth + 1, 0)));
                 continue;
             }
             let mask_start = effects.len() as u32;
@@ -628,13 +694,15 @@ impl CompositeProgram {
         let mut display_outputs = display_bit(DisplayKind::BaseColor) | display_bit(DisplayKind::Orm);
         for channel in Channel::ALL {
             let slot = channel_slot(channel);
-            if operations
-                .iter()
-                .any(|op| op.ids[0] == slot && (op.ids[1] != 0 || op.low[..3] != channel.default_value() || op.effects[3] != 0 || op.balance[2] != 0.0))
-            {
+            if operations.iter().any(|op| {
+                !groups::is_group(op)
+                    && op.ids[0] == slot
+                    && (op.ids[1] != 0 || op.low[..3] != channel.default_value() || op.effects[3] != 0 || op.balance[2] != 0.0)
+            }) {
                 display_outputs |= display_bit(DisplayKind::of_channel(channel));
             }
         }
+        groups.finish(&operations);
         let layer_count = operations.len() as u32;
         if !operations.iter().any(|op| op.constraints[0] != 0) {
             geometry.parts.clear();
@@ -649,6 +717,7 @@ impl CompositeProgram {
             operations,
             layer_count,
             filters,
+            groups,
             geometry,
             paint,
             ramp_words: procedural.ramp_words,
@@ -702,6 +771,7 @@ impl CompositeProgram {
             operations,
             layer_count: 1,
             filters,
+            groups: GroupPlan::default(),
             geometry: GeometryMasks::default(),
             paint,
             ramp_words: procedural.ramp_words,
@@ -1174,6 +1244,7 @@ struct CurvatureResources {
 
 pub(crate) struct GpuCompositor {
     pipeline: wgpu::ComputePipeline,
+    group_pipeline: Option<wgpu::ComputePipeline>,
     shader: wgpu::ShaderModule,
     bindings: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
@@ -1258,6 +1329,7 @@ impl GpuCompositor {
             include_str!("shaders/material_image.wgsl"),
             include_str!("shaders/stencil_projection.wgsl"),
             curvature_shader,
+            include_str!("shaders/composite_groups.wgsl"),
             include_str!("shaders/composite.wgsl"),
         ]
         .join("\n");
@@ -1293,6 +1365,7 @@ impl GpuCompositor {
             input_texture(device, "tc_composite_empty_brush_alpha", (1, 1), 1, wgpu::TextureFormat::R16Uint).create_view(&Default::default());
         Self {
             pipeline,
+            group_pipeline: None,
             shader: module,
             bindings,
             pipeline_layout,
@@ -1594,7 +1667,20 @@ impl GpuCompositor {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        let tile_work = program.tile_work_per_pixel()?;
+        let tile_work = program.tile_work_per_pixel()?.saturating_add(program.groups.work_per_pixel());
+        let grouped = program.groups.depth != 0;
+        if grouped {
+            self.group_pipeline.get_or_insert_with(|| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("tc_gpu_composite_groups"),
+                    layout: Some(&self.pipeline_layout),
+                    module: &self.shader,
+                    entry_point: Some("compose"),
+                    compilation_options: wgpu::PipelineCompilationOptions { constants: &[("composite_groups", 1.0)], ..Default::default() },
+                    cache: None,
+                })
+            });
+        }
         let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
         let halo = radius.saturating_add(program.filters.reach);
         let limits = device.limits();
@@ -1638,14 +1724,16 @@ impl GpuCompositor {
             let side = |pixels: u32, limit: u32| (pixels << shift).saturating_add(halo.saturating_mul(2)).min(limit);
             u64::from(side(width, source_size.0)) * u64::from(side(rows, source_size.1))
         };
-        let display_words = |width: u32, rows: u32| u64::from(width.next_multiple_of(64) * rows) * words_per_pixel;
-        let required = |width, rows| (display_words(width, rows) + program.filters.words(field_area(width, rows))) * 4;
+        let band_area = |width: u32, rows: u32| u64::from(width.next_multiple_of(64) * rows);
+        let display_words = |width, rows| band_area(width, rows) * words_per_pixel;
+        let group_start = |width, rows| display_words(width, rows) + program.filters.words(field_area(width, rows));
+        let required = |width, rows| (group_start(width, rows) + program.groups.words(band_area(width, rows))) * 4;
         let filter_work: u64 =
             program.filters.stages.iter().map(|stage| stage.filter.map_or(1, NeighbourhoodFilter::work_per_texel) + if stage.cell > 1 { 6 } else { 0 }).sum();
-        // A filtered band includes its source halo. Split its output while preserving all of that input.
+        // A filtered band includes its source halo. Folder snapshots use only its output area.
         while required(band_width, band_rows) > scratch_limit {
             if band_width == 1 && band_rows == 1 {
-                return Err("Filter inputs for one GPU texel exceed the adapter's working memory limit.".into());
+                return Err("Composite inputs for one GPU texel exceed the adapter's working memory limit.".into());
             }
             if band_width >= band_rows {
                 band_width = band_width.div_ceil(2);
@@ -1654,10 +1742,11 @@ impl GpuCompositor {
             }
         }
         let pitch = band_width.next_multiple_of(64);
-        let submit_budget = if filtered || band_width < width || band_rows < ROWS { MAX_TILE_WORK_PER_SUBMISSION } else { u64::MAX };
+        let submit_budget = if grouped || filtered || band_width < width || band_rows < ROWS { MAX_TILE_WORK_PER_SUBMISSION } else { u64::MAX };
         let area = pitch * band_rows;
         let stride = u64::from(area) * 4;
         let field_base = (display_words(band_width, band_rows)) as u32;
+        let group_base = group_start(band_width, band_rows) as u32;
         let scratch = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tc_composite_scratch"),
             size: required(band_width, band_rows),
@@ -1798,9 +1887,9 @@ impl GpuCompositor {
                     field_rect[2],
                     field_rect[3],
                     field_base,
-                    0,
-                    0,
-                    0,
+                    group_base,
+                    program.groups.words_per_level,
+                    program.groups.channels,
                     0,
                     0,
                     field_rect[2],
@@ -1892,7 +1981,8 @@ impl GpuCompositor {
                 let bindings = bindings(&values);
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tc_composite"), timestamp_writes: None });
-                    pass.set_pipeline(&self.pipeline);
+                    let pipeline = self.group_pipeline.as_ref().filter(|_| grouped).unwrap_or(&self.pipeline);
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &bindings, &[]);
                     pass.dispatch_workgroups(width.div_ceil(WORKGROUP), rows.div_ceil(WORKGROUP), 1);
                 }
@@ -2406,6 +2496,109 @@ mod procedural_tests {
             assert_eq!(expected[shared], expected[layer_only]);
             assert_eq!(expected[uncovered], 0);
         }
+    }
+
+    #[test]
+    fn nested_group_masks_blend_children_over_the_incoming_material() {
+        use texturecraft_compose::display::tile_bytes;
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles};
+        use texturecraft_core::HeightMask;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = TILE;
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Normal, Channel::Height];
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let mut project = Project::new("Nested material folders", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let below = project.alloc_id();
+        let below_sources = BTreeMap::from([
+            (Channel::BaseColor, Source::Uniform([0.28, 0.47, 0.63])),
+            (Channel::Roughness, Source::Uniform([0.26; 3])),
+            (Channel::Height, Source::Uniform([0.32; 3])),
+        ]);
+        let fill = |id, name, sources| Layer::new(id, name, LayerKind::Fill(Fill { sources, ..Fill::default() }), &channels);
+        project.insert_layer(0, fill(below, "Under the folders", below_sources), None, false).unwrap();
+
+        let outer = project.alloc_id();
+        let inner = project.alloc_id();
+        let group = |id, name| Layer::new(id, name, LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        let mut folder = group(outer, "Masked folder");
+        for blend in folder.channels.values_mut() {
+            // The CPU uses the group's channel opacity with the completed inner
+            // stack. Modes other than Disable do not blend it a second time.
+            blend.mode = BlendMode::Screen;
+            blend.opacity = 0.68;
+        }
+        folder.channels.get_mut(&Channel::Roughness).unwrap().mode = BlendMode::Disable;
+        folder.height_mask = HeightMask { enabled: true, contrast: 0.4, offset: 0.1 };
+        folder.geometry_mask = Some(vec![mesh.submeshes[0].name.clone()]);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let position = Generator { direction: [1.0, 0.0, 0.0], softness: 0.18, ..Generator::new(GeneratorKind::Position) };
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(position)));
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 })));
+        folder.mask = Some(mask);
+        project.insert_layer(0, folder, None, false).unwrap();
+
+        let mut folder = group(inner, "Translucent inner folder");
+        for blend in folder.channels.values_mut() {
+            blend.mode = BlendMode::Passthrough;
+            blend.opacity = 0.54;
+        }
+        project.insert_layer(0, folder, Some(outer), true).unwrap();
+
+        let child = project.alloc_id();
+        let child_sources = BTreeMap::from([
+            (Channel::BaseColor, Source::Uniform([0.35, 0.72, 0.48])),
+            (Channel::Roughness, Source::Uniform([0.84; 3])),
+            (Channel::Normal, Source::Uniform([0.66, 0.5, 0.97])),
+            (Channel::Height, Source::Uniform([-0.52; 3])),
+        ]);
+        let mut child = fill(child, "Multiply over the material below", child_sources);
+        child.channels.get_mut(&Channel::BaseColor).unwrap().mode = BlendMode::Multiply;
+        project.insert_layer(0, child, Some(inner), true).unwrap();
+
+        let pixels = PixelStore::default();
+        let baked = BakedMaps::default();
+        let images = ImageStore::default();
+        let inputs = Inputs {
+            project: &project,
+            ts: 0,
+            mesh: &mesh,
+            gbuf: &gbuf,
+            pixels: &pixels,
+            baked: &baked,
+            block_scales: project.texture_sets[0].block_scales(),
+            preview: None,
+            images: &images,
+            bounds: mesh.bounds(),
+        };
+        let mut oracle = Composite::new(&channels, SIZE);
+        composite_tiles(&inputs, &mut oracle, &[(0, 0)]);
+        let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+        assert_eq!(program.groups.depth, 2);
+        program.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        for kind in [DisplayKind::BaseColor, DisplayKind::Orm, DisplayKind::Normal, DisplayKind::Height] {
+            let expected = tile_bytes(&oracle, &baked, kind, 0, 0);
+            let texture = gpu.renderer.display_textures()[0][kind as usize];
+            let (_, _, actual) = Readback::blocking_level(&gpu.device, &gpu.queue, texture, 0).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            if kind.bytes_per_texel() == 8 {
+                for (a, b) in actual.as_chunks::<2>().0.iter().zip(expected.as_chunks::<2>().0) {
+                    let a = half::f16::from_le_bytes(*a).to_f32();
+                    let b = half::f16::from_le_bytes(*b).to_f32();
+                    assert!((a - b).abs() <= 0.001, "{kind:?} GPU {a}, CPU {b}");
+                }
+            } else {
+                for (index, (a, b)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(a.abs_diff(*b) <= 1, "{kind:?} at byte {index}: GPU {a}, CPU {b}");
+                }
+            }
+        }
+        assert!(oracle.value(Channel::BaseColor, SIZE - 2, SIZE / 2)[0] < oracle.value(Channel::BaseColor, 1, SIZE / 2)[0]);
+        assert!((oracle.value(Channel::Roughness, SIZE - 2, SIZE / 2)[0] - 0.26).abs() < 1e-4);
     }
 
     #[test]
@@ -2945,6 +3138,7 @@ mod paint_window_tests {
         }
         let program = CompositeProgram {
             filters: FilterPlan::default(),
+            groups: GroupPlan::default(),
             geometry: GeometryMasks::default(),
             operations: Vec::new(),
             layer_count: 0,
