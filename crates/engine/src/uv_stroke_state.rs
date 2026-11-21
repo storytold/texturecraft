@@ -12,6 +12,19 @@ pub(crate) const UV_STAMP_BATCH: usize = 4096;
 /// Cover a UV diagonal at the minimum step without letting hostile coordinates stall painting.
 const MAX_UV_STAMPS_PER_SAMPLE: usize = 150_000;
 
+fn stamp_step(settings: &BrushSettings, radius: f32) -> f32 {
+    (settings.spacing * 2.0 * radius).max(MIN_UV_STAMP_STEP)
+}
+
+/// An upper bound for this sample, allowing the first dab to start anywhere within one step.
+pub(crate) fn dab_upper_bound(settings: &BrushSettings, previous: Option<Vec2>, uv: Vec2, radius: f32) -> u64 {
+    previous.map_or(1, |previous| {
+        // Sampling adds up to 150,000 f32 steps. Allow for rounding during those additions.
+        let steps = (((uv - previous).length() / stamp_step(settings, radius)) * 1.02).ceil() as u64;
+        steps.saturating_add(1).min(MAX_UV_STAMPS_PER_SAMPLE as u64)
+    })
+}
+
 /// A 2D view stroke's progress: its last point, the distance carried to the next stamp and the stamps so far.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct UvStrokeState {
@@ -28,7 +41,7 @@ impl UvStrokeState {
     /// copies to each batch. Those copies do not affect spacing or the seed of the next dab.
     pub(crate) fn sample(&mut self, settings: &BrushSettings, uv: Vec2, pressure: f32, mut consume: impl FnMut(&mut Vec<UvStamp>)) {
         let radius = settings.uv_stamp_radius(pressure);
-        let step = (settings.spacing * 2.0 * radius).max(MIN_UV_STAMP_STEP);
+        let step = stamp_step(settings, radius);
         let angle = match self.last {
             Some(previous) if settings.follow_path && uv != previous => settings.angle + (previous.y - uv.y).atan2(uv.x - previous.x).to_degrees() - 90.0,
             _ => settings.angle,

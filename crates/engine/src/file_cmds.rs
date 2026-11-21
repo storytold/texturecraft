@@ -660,6 +660,9 @@ impl Session {
         next.modified = true;
         next.project_id = self.project_id;
         let preserved = preserve_strokes.then(|| crate::preserve::preserve_strokes(self, &mut next));
+        if next.doc.stroke_replays.discard_stale(&next.doc.project, &next.doc.pixels) {
+            next.note_raster_paint();
+        }
         self.switch_to(next);
         Ok(preserved.map_or(Value::Null, |n| json!({ "preserved": n })))
     }

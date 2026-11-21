@@ -12,12 +12,18 @@ use texturecraft_geom::{UvGBuffer, glam::Vec2};
 use texturecraft_paint::{BrushSettings, CommitSource, Shape, Staging, StrokeCanvas, commit_layer, commit_mask, rasterize_uv};
 use texturecraft_texel::{TileIdentity, TileImage};
 
-use crate::{EngineError, Result, uv_stroke_state::UvStrokeState};
+use crate::{
+    EngineError, Result,
+    uv_stroke_state::{UvStrokeState, dab_upper_bound},
+};
 
 const MAX_SAMPLES_PER_STROKE: usize = 16_384;
 const MAX_STROKES: usize = 4_096;
 const MAX_SAMPLES: usize = 262_144;
 const ARCHIVE_VERSION: u32 = 1;
+/// Cap work amplified by tiny spacing or very large stamp footprints when resizing from a file.
+const MAX_REPLAY_DABS: u64 = 1 << 20;
+const MAX_REPLAY_TEXEL_VISITS: u64 = 1 << 28;
 
 pub(crate) type UvSample = [f32; 3];
 
@@ -162,15 +168,22 @@ impl StrokeReplays {
         discarded
     }
 
-    pub(crate) fn prepare_resize(&self, project: &Project, pixels: &PixelStore, ts: usize) -> ResizeReplays {
-        let replays = self
-            .0
-            .targets
-            .iter()
-            .filter(|(target, record)| record.describes(**target, pixels) && Self::can_record(project, **target, ts))
-            .map(|(&target, record)| (target, record.operations.clone()))
-            .collect();
-        ResizeReplays(replays)
+    pub(crate) fn prepare_resize(&self, project: &Project, pixels: &PixelStore, ts: usize, size: (u32, u32)) -> ResizeReplays {
+        let mut prepared = ResizeReplays::default();
+        let mut budget = ReplayBudget { dabs: MAX_REPLAY_DABS, texel_visits: MAX_REPLAY_TEXEL_VISITS };
+        for (&target, record) in &self.0.targets {
+            if !Self::can_record(project, target, ts) || !record.describes(target, pixels) {
+                continue;
+            }
+            let mut remaining = budget;
+            if record.operations.iter().all(|operation| remaining.reserve(operation, size)) {
+                budget = remaining;
+                prepared.replay.push((target, record.operations.clone()));
+            } else {
+                prepared.deferred.push(target);
+            }
+        }
+        prepared
     }
 
     fn finish_replay(&mut self, target: PaintTarget, pixels: &PixelStore) {
@@ -181,15 +194,22 @@ impl StrokeReplays {
 }
 
 #[derive(Default)]
-pub(crate) struct ResizeReplays(Vec<(PaintTarget, Arc<Vec<Arc<UvPaint>>>)>);
+pub(crate) struct ResizeReplays {
+    replay: Vec<(PaintTarget, Arc<Vec<Arc<UvPaint>>>)>,
+    deferred: Vec<PaintTarget>,
+}
 
 impl ResizeReplays {
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.replay.is_empty() && self.deferred.is_empty()
+    }
+
+    pub(crate) fn deferred_count(&self) -> usize {
+        self.deferred.len()
     }
 
     pub(crate) fn remove_rasters(&self, pixels: &mut PixelStore) {
-        for (target, _) in &self.0 {
+        for (target, _) in &self.replay {
             match *target {
                 PaintTarget::Layer(id) => {
                     for channel in Channel::ALL {
@@ -204,9 +224,14 @@ impl ResizeReplays {
     }
 
     pub(crate) fn run(self, pixels: &mut PixelStore, replays: &mut StrokeReplays, gbuf: &UvGBuffer, progress: &Progress) -> Result<usize> {
-        let total_operations: usize = self.0.iter().map(|(_, operations)| operations.len()).sum();
+        // Bilinear pixels are an approximation at this size. Retain the original operations
+        // so they can still replay at a size that fits the budget.
+        for target in self.deferred {
+            replays.finish_replay(target, pixels);
+        }
+        let total_operations: usize = self.replay.iter().map(|(_, operations)| operations.len()).sum();
         let mut completed = 0;
-        for (target, operations) in self.0 {
+        for (target, operations) in self.replay {
             for operation in operations.iter() {
                 if progress.cancel.load(Relaxed) {
                     return Err(EngineError::Other("Texture set resize was cancelled".into()));
@@ -218,6 +243,45 @@ impl ResizeReplays {
             replays.finish_replay(target, pixels);
         }
         Ok(completed)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReplayBudget {
+    dabs: u64,
+    texel_visits: u64,
+}
+
+impl ReplayBudget {
+    fn reserve(&mut self, operation: &UvPaint, (width, height): (u32, u32)) -> bool {
+        let size = Vec2::new(width as f32, height as f32);
+        let mut last = None;
+        for &[u, v, pressure] in &operation.samples {
+            let uv = Vec2::new(u, v);
+            let radius = operation.settings.uv_stamp_radius(pressure);
+            let dabs = dab_upper_bound(&operation.settings, last, uv, radius);
+            let extent = Vec2::splat(radius * size.x * 1.42);
+            let previous = last.unwrap_or(uv) * size;
+            let point = uv * size;
+            let low = previous.min(point) - extent;
+            let high = previous.max(point) + extent;
+            let clipped_span = high.min(size) - low.max(Vec2::ZERO);
+            let per_dab = if radius > 0.0 && clipped_span.min_element() > 0.0 {
+                // The rasterizer rounds the low and high edges independently.
+                let footprint = ((extent * 2.0).min(clipped_span) + Vec2::splat(2.0)).min(size).ceil();
+                footprint.x as u64 * footprint.y as u64
+            } else {
+                0
+            };
+            let texels = dabs.saturating_mul(per_dab);
+            if dabs > self.dabs || texels > self.texel_visits {
+                return false;
+            }
+            self.dabs -= dabs;
+            self.texel_visits -= texels;
+            last = Some(uv);
+        }
+        true
     }
 }
 

@@ -159,7 +159,7 @@ impl ResizeTask {
         let mut fallback = None;
         let cancelled = || progress.cancel.load(std::sync::atomic::Ordering::Relaxed);
         let replay = if old.resolution != resolution && old.uv_tiles.is_empty() && old.tile_resolutions.is_empty() {
-            doc.stroke_replays.prepare_resize(&doc.project, &doc.pixels, ts)
+            doc.stroke_replays.prepare_resize(&doc.project, &doc.pixels, ts, size)
         } else {
             Default::default()
         };
@@ -200,7 +200,11 @@ impl ResizeTask {
         let cache = (crate::session::uv_layout(&old) == crate::session::uv_layout(set)).then(|| SetCache::new(&mesh, set));
         let cache_built = chrono::Utc::now();
         if let Some(cache) = &cache {
+            let deferred = replay.deferred_count();
             let replayed = replay.run(&mut doc.pixels, &mut doc.stroke_replays, &cache.gbuf, progress)?;
+            if deferred > 0 {
+                log.warn("Paint", format!("{deferred} paint targets exceeded the resize replay budget. Their raster pixels were resampled and their paint operations were retained."));
+            }
             if replayed > 0 {
                 log.performance(format!("Replayed {replayed} recorded paint strokes in {} ms", (chrono::Utc::now() - cache_built).num_milliseconds()));
             }
