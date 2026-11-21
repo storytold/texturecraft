@@ -36,6 +36,11 @@ const COLOR_SELECTION_OPCODE: u32 = 38;
 const NOOP_EFFECT_OPCODE: u32 = 39;
 const MASK_STAGE: u32 = 1 << 31;
 const GENERATOR_STAGE: u32 = 1 << 30;
+const MATERIAL_ANCHOR_STAGE: u32 = 1 << 29;
+const MASK_ANCHOR_STAGE: u32 = 1 << 28;
+const ANCHOR_SOURCE: u32 = 15;
+const ANCHOR_PUBLISH_MASK: u32 = 16;
+const ANCHOR_PUBLISH_LAYER: u32 = 17;
 // Extended procedural sources follow the filter and generator opcodes.
 const FIRST_GENERATOR: u32 = 40;
 const FIRST_EXTENDED_PATTERN: u32 = 48;
@@ -196,6 +201,35 @@ struct ProceduralInputs {
     materials: MaterialImages,
     generator_stages: Vec<(Option<NeighbourhoodFilter>, u32)>,
     generator_sources: Vec<Operation>,
+    anchors: AnchorInputs,
+}
+
+#[derive(Default)]
+struct AnchorInputs {
+    visible: BTreeMap<LayerId, (u32, bool)>,
+    reads: Vec<(u32, Channel)>,
+    next: u32,
+}
+
+impl AnchorInputs {
+    fn publish(&mut self, id: LayerId, mask: bool) -> u32 {
+        let publish = self.next;
+        self.next += 1;
+        self.visible.insert(id, (publish, mask));
+        publish
+    }
+
+    fn read(&mut self, id: LayerId, channel: Channel) -> (u32, bool) {
+        let Some(&(publish, mask)) = self.visible.get(&id) else { return (0, false) };
+        let channel = if mask { Channel::BaseColor } else { channel };
+        let read = (publish, channel);
+        let index = self.reads.iter().position(|existing| *existing == read).unwrap_or_else(|| {
+            let index = self.reads.len();
+            self.reads.push(read);
+            index
+        });
+        (index as u32 + 1, mask)
+    }
 }
 
 impl ProceduralInputs {
@@ -208,6 +242,7 @@ impl ProceduralInputs {
             materials: MaterialImages::default(),
             generator_stages: Vec::new(),
             generator_sources: Vec::new(),
+            anchors: AnchorInputs::default(),
         }
     }
 
@@ -246,23 +281,30 @@ struct FilterStage {
     preceding: u32,
     filter: Option<NeighbourhoodFilter>,
     cell: u32,
+    anchor: Option<(Channel, u32, u32)>,
 }
 
 #[derive(Debug, Default)]
 struct FilterPlan {
     stages: Vec<FilterStage>,
     reach: u32,
+    anchor_slots: Vec<u32>,
 }
 
 impl FilterPlan {
     fn compile(operations: &mut [Operation], layer_count: u32, inputs: &ProceduralInputs) -> Self {
-        if inputs.filters.is_empty() && inputs.generator_stages.is_empty() {
+        if inputs.filters.is_empty() && inputs.generator_stages.is_empty() && inputs.anchors.reads.is_empty() {
             return Self::default();
         }
         let mut plan = Self::default();
         let (layers, effects) = operations.split_at_mut(layer_count as usize);
         let mut masks = BTreeMap::new();
+        plan.anchor_slots.resize(inputs.anchors.reads.len(), 0);
         for (index, layer) in layers.iter_mut().enumerate() {
+            if layer.ids[1] == ANCHOR_PUBLISH_LAYER {
+                plan.add_anchor(layer.ids[2], index as u32, MATERIAL_ANCHOR_STAGE, &inputs.anchors, Some((layer.effects[0], layer.effects[1])));
+                continue;
+            }
             let [mask, mask_count, content, content_count] = layer.effects;
             let mask_has_fields = mask_count > 0
                 && *masks.entry(mask).or_insert_with(|| {
@@ -274,7 +316,28 @@ impl FilterPlan {
             plan.add_stack(effects, content, content_count, index as u32, false, layer.ids[0] == channel_slot(Channel::Height), inputs);
             layer.spatial[..3].copy_from_slice(&[first as u32, u32::from(first != plan.stages.len()), u32::from(mask_has_fields)]);
         }
+        // Anchors can pass the influence of a painted texel through several different layers.
+        // A full update preserves those dependencies across each expanded field.
+        if !inputs.anchors.reads.is_empty() {
+            plan.reach = plan.stages.iter().fold(0u32, |reach, stage| {
+                reach.saturating_add(stage.filter.map_or(0, NeighbourhoodFilter::reach)).saturating_add(if stage.cell > 1 { stage.cell * 2 } else { 0 })
+            });
+        }
         plan
+    }
+
+    fn add_anchor(&mut self, publication: u32, layer: u32, preceding: u32, inputs: &AnchorInputs, material: Option<(u32, u32)>) {
+        for (read, &(producer, channel)) in inputs.reads.iter().enumerate().filter(|(_, (producer, _))| *producer == publication) {
+            debug_assert_eq!(producer, publication);
+            self.anchor_slots[read] = self.stages.len() as u32 + 1;
+            self.stages.push(FilterStage { layer, preceding, filter: None, cell: 1, anchor: material.map(|(first, cut)| (channel, first, cut)) });
+        }
+    }
+
+    fn bind_anchors(&self, operations: &mut [Operation]) {
+        for operation in operations.iter_mut().filter(|op| op.ids[1] == ANCHOR_SOURCE && op.ids[2] != 0) {
+            operation.ids[2] = self.anchor_slots[operation.ids[2] as usize - 1];
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -282,6 +345,10 @@ impl FilterPlan {
         let first = self.stages.len();
         let mut reach: u32 = 0;
         for (preceding, effect) in effects.iter_mut().skip(start as usize).take(count as usize).enumerate() {
+            if mask && effect.ids[1] == ANCHOR_PUBLISH_MASK {
+                self.add_anchor(effect.ids[2], layer, preceding as u32 | MASK_STAGE | MASK_ANCHOR_STAGE, &inputs.anchors, None);
+                continue;
+            }
             if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&effect.ids[1]) && effect.spatial[1] != 0 {
                 let (filter, cell) = inputs.generator_stages[effect.spatial[1] as usize - 1];
                 effect.spatial[1] = self.stages.len() as u32 + 1;
@@ -289,7 +356,7 @@ impl FilterPlan {
                 if cell > 1 {
                     reach = reach.saturating_add(cell * 2);
                 }
-                self.stages.push(FilterStage { layer, preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE, filter, cell });
+                self.stages.push(FilterStage { layer, preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE, filter, cell, anchor: None });
                 continue;
             }
             if effect.ids[1] != NEIGHBOURHOOD_OPCODE {
@@ -300,14 +367,14 @@ impl FilterPlan {
             let slot = self.stages.len();
             effect.spatial[0] = if mask { slot } else { slot - first } as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1 });
+            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
     }
 
     fn expand(&self, region: Option<CompositeRegion>) -> Option<CompositeRegion> {
-        region.map(|region| region.expanded(self.reach))
+        if self.anchor_slots.is_empty() { region.map(|region| region.expanded(self.reach)) } else { None }
     }
 
     fn words(&self, area: u64) -> u64 {
@@ -317,8 +384,12 @@ impl FilterPlan {
 
 fn bind_generator_sources(operations: &mut Vec<Operation>, sources: &[Operation]) {
     let offset = operations.len() as u32;
-    for op in operations.iter_mut().filter(|op| (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]) && op.effects[3] != 0) {
-        op.effects[3] += offset;
+    for op in operations.iter_mut().filter(|op| (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1])) {
+        for source in &mut op.effects[2..] {
+            if *source != 0 {
+                *source += offset;
+            }
+        }
     }
     operations.extend_from_slice(sources);
 }
@@ -421,6 +492,8 @@ pub struct CompositeProgram {
     display_outputs: u32,
     glossiness: bool,
     mask_preview: bool,
+    mask_layer: u32,
+    mask_layers: BTreeMap<LayerId, u32>,
 }
 
 fn display_bit(kind: DisplayKind) -> u32 {
@@ -545,6 +618,7 @@ impl CompositeProgram {
         let mut geometry = GeometryMasks::default();
         let mut groups = GroupPlan::default();
         let mut group_depth = 0;
+        let mut mask_layers = BTreeMap::new();
         let mut non_default = [false; Channel::ALL.len()];
         let stencil_pigment = brush.as_ref().is_some_and(|brush| brush.stencil.is_some());
         let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| StackWork::Layer(id, 0, 0)).collect();
@@ -633,12 +707,20 @@ impl CompositeProgram {
             let mask_background = compile_mask(mask, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
             let shared_content = effects.len() as u32;
             let mask_count = shared_content - mask_start;
-            if mask_background == 0.0 && mask_count == 0 {
+            let has_content_anchors = layer.content_effects.iter().any(|effect| effect.visible && matches!(effect.kind, EffectKind::Anchor));
+            if mask_background == 0.0 && mask_count == 0 && !has_content_anchors {
                 continue;
             }
+            let mut content_anchors = Vec::new();
+            let mut visible_cut = 0u32;
             let per_channel = layer.content_effects.iter().any(|effect| effect.visible && content_depends_on_channel(effect));
             let mut templates = Vec::new();
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
+                if matches!(effect.kind, EffectKind::Anchor) {
+                    content_anchors.push((effect.id, visible_cut));
+                    continue;
+                }
+                visible_cut += 1;
                 let op = if content_depends_on_channel(effect) {
                     None
                 } else {
@@ -672,6 +754,9 @@ impl CompositeProgram {
             let first_op = operations.len();
             let mut height_op = 0;
             for &(channel, _) in &set.channels {
+                if mask_background == 0.0 && mask_count == 0 {
+                    break;
+                }
                 let Some(blend) = layer.blend(channel) else { continue };
                 if blend.mode == BlendMode::Disable || blend.opacity <= 0.0 {
                     continue;
@@ -744,6 +829,30 @@ impl CompositeProgram {
             for op in &mut operations[first_op..] {
                 op.constraints = [geometry_mask, height_op, height_params[0], height_params[1]];
             }
+            if first_op != operations.len() {
+                mask_layers.insert(id, first_op as u32);
+            } else if mask
+                .as_ref()
+                .is_some_and(|mask| mask.effects.iter().any(|effect| effect.visible && (effect.reads_anchor() || matches!(effect.kind, EffectKind::Anchor))))
+            {
+                // A layer with no display channels can still publish anchors in its mask.
+                mask_layers.insert(id, first_op as u32);
+                operations.push(Operation {
+                    ids: [u32::MAX, ANCHOR_PUBLISH_MASK, 0, 0],
+                    effects: [mask_start, mask_count, 0, 0],
+                    balance: [0.0, mask_background, 0.0, 0.0],
+                    constraints: [geometry_mask, 0, 0, 0],
+                    ..Operation::zeroed()
+                });
+            }
+            for (anchor, cut) in content_anchors {
+                let publication = procedural.anchors.publish(anchor, false);
+                operations.push(Operation {
+                    ids: [u32::MAX, ANCHOR_PUBLISH_LAYER, publication, 0],
+                    effects: [first_op as u32, cut, 0, 0],
+                    ..Operation::zeroed()
+                });
+            }
         }
         let mut display_outputs = display_bit(DisplayKind::BaseColor) | display_bit(DisplayKind::Orm);
         for channel in Channel::ALL {
@@ -764,6 +873,7 @@ impl CompositeProgram {
         operations.extend(effects);
         let filters = FilterPlan::compile(&mut operations, layer_count, &procedural);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
+        filters.bind_anchors(&mut operations);
         let region = filters.expand(region);
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
@@ -789,6 +899,8 @@ impl CompositeProgram {
             display_outputs,
             glossiness: set.has_channel(Channel::Glossiness),
             mask_preview: false,
+            mask_layer: 0,
+            mask_layers,
         })
     }
 
@@ -805,8 +917,16 @@ impl CompositeProgram {
         if !set.uv_tiles.is_empty() {
             return Err("UDIM texture sets use CPU mask preview.");
         }
-        let mask = project.layers.get(&project.mask_owner(owner)).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
+        let owner = project.mask_owner(owner);
+        let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
         let mask = mask.ok_or("The layer has no enabled mask.")?;
+        if mask.effects.iter().any(|effect| effect.visible && effect.reads_anchor()) {
+            let mut program = Self::try_compile_with_brush(project, pixels, ts, region, brush)?;
+            program.mask_layer = *program.mask_layers.get(&owner).ok_or("The mask's GPU anchor stack is missing.")?;
+            program.mask_preview = true;
+            program.display_outputs = display_bit(DisplayKind::BaseColor);
+            return Ok(program);
+        }
         if let Some(brush) = &brush {
             brush.validate(set.size())?;
         }
@@ -819,6 +939,7 @@ impl CompositeProgram {
         operations[0].balance[1] = background;
         let filters = FilterPlan::compile(&mut operations, 1, &procedural);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
+        filters.bind_anchors(&mut operations);
         let region = filters.expand(region);
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
@@ -845,6 +966,8 @@ impl CompositeProgram {
             display_outputs: display_bit(DisplayKind::BaseColor),
             glossiness: false,
             mask_preview: true,
+            mask_layer: 0,
+            mask_layers: BTreeMap::new(),
         })
     }
 }
@@ -976,6 +1099,10 @@ fn compile_mask(
                 }
                 Operation { ids: [0, COLOR_SELECTION_OPCODE, 0, 0], low: [*tolerance, 0.0, 0.0, 0.0], procedural: [0, offset, count, 0], ..Operation::zeroed() }
             }
+            EffectKind::Anchor => {
+                let publication = procedural.anchors.publish(effect.id, true);
+                Operation { ids: [0, ANCHOR_PUBLISH_MASK, publication, 0], ..Operation::zeroed() }
+            }
             EffectKind::Compare { op, value, tolerance } => {
                 if !value.is_finite() || !tolerance.is_finite() {
                     return Err("A mask comparison has invalid parameters.");
@@ -1104,6 +1231,16 @@ fn source_operation(
                 Projection::Decal(_) => {}
             }
         }
+        Some(Source::Anchor { anchor, channel: read_channel, ramp }) => {
+            let (reference, is_mask) = inputs.anchors.read(*anchor, *read_channel);
+            let gray =
+                matches!(read_channel.kind(), ChannelKind::Color | ChannelKind::NormalMap) && matches!(channel, ChannelKind::Scalar | ChannelKind::Signed);
+            op.ids = [0, ANCHOR_SOURCE, reference, u32::from(gray) | (u32::from(read_channel.kind() == ChannelKind::Signed && !is_mask) << 1)];
+            op.low[..3].copy_from_slice(&read_channel.default_value());
+            if channel == ChannelKind::Color && !ramp.is_empty() {
+                op.procedural[1..3].copy_from_slice(&inputs.pack_gradient(ramp)?);
+            }
+        }
         Some(Source::Procedural { pattern, low, high, ramp }) => {
             let kind = match pattern.kind {
                 ProceduralKind::Clouds => 1,
@@ -1198,7 +1335,6 @@ fn source_operation(
                 Projection::Decal(_) => {}
             }
         }
-        _ => return None,
     }
     if matches!(projection, Projection::Decal(_)) {
         op.procedural[3] = DECAL_PROJECTION;
@@ -1207,9 +1343,6 @@ fn source_operation(
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
-    if generator.micro.is_some() {
-        return None;
-    }
     let kind = match generator.kind {
         GeneratorKind::EdgeWear => 40,
         GeneratorKind::Dirt => 41,
@@ -1232,6 +1365,13 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
         bind_tile_source(&mut source_op, Some(source), patterns);
         inputs.generator_sources.push(source_op);
         op.effects[3] = inputs.generator_sources.len() as u32;
+    }
+    if let Some(micro) = generator.micro {
+        let source = Source::Anchor { anchor: micro.anchor, channel: Channel::Height, ramp: Vec::new() };
+        let source = source_operation(Some(&source), &Projection::default(), [0.0; 3], ChannelKind::Signed, inputs)?;
+        inputs.generator_sources.push(source);
+        op.effects[2] = inputs.generator_sources.len() as u32;
+        op.uv[2] = if micro.amount.is_finite() { micro.amount.clamp(0.0, 1.0) } else { 0.0 };
     }
     let resolution = inputs.resolution;
     let cell = generator.resolution.cell(resolution, resolution);
@@ -2117,6 +2257,14 @@ impl GpuCompositor {
                     id_height,
                     0,
                     0,
+                    0,
+                    0,
+                    0,
+                    program.mask_layer,
+                    0,
+                    0,
+                    0,
+                    0,
                 ];
                 let bindings = |values: &[u32]| {
                     let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2167,7 +2315,13 @@ impl GpuCompositor {
                         if tile_work == 0 { (field_rect[2], field_rect[3]) } else { composite_band_size(field_rect[2], tile_work) };
                     for (output, stage) in program.filters.stages.iter().enumerate() {
                         let mut source = values;
-                        source[25..28].copy_from_slice(&[fields, stage.layer, stage.preceding]);
+                        let direct = stage.filter.is_none() && stage.cell == 1;
+                        let slot = if direct { output as u32 } else { fields };
+                        source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
+                        if let Some((channel, first, cut)) = stage.anchor {
+                            source[36..39].copy_from_slice(&[channel_slot(channel), first, cut]);
+                            source[40..43].copy_from_slice(&channel.default_value().map(f32::to_bits));
+                        }
                         for y in (0..field_rect[3]).step_by(source_rows as usize) {
                             for x in (0..field_rect[2]).step_by(source_width as usize) {
                                 let columns = source_width.min(field_rect[2] - x);
@@ -2292,6 +2446,82 @@ mod procedural_tests {
     use texturecraft_core::{Fill, Layer, Mask, OutputResolution, Procedural, TextureSet};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{srgb_lut, to_u16};
+
+    #[test]
+    fn mask_and_content_anchors_match_cpu_in_material_and_mask_views() {
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
+        use texturecraft_compose::tile_bytes;
+        use texturecraft_core::MicroDetail;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = 64;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let mut project = Project::new("Anchor stages", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let channels = [Channel::BaseColor, Channel::Height];
+        let lower = project.alloc_id();
+        let mask_anchor = project.alloc_id();
+        let height_anchor = project.alloc_id();
+        let source = BTreeMap::from([(Channel::Height, Source::Uniform([0.8; 3]))]);
+        let mut layer = Layer::new(lower, "Donor", LayerKind::Fill(Fill { sources: source, ..Fill::default() }), &channels);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.6; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(mask_anchor, EffectKind::Anchor));
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
+        layer.mask = Some(mask);
+        layer.content_effects.push(Effect::new(height_anchor, EffectKind::Anchor));
+        layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
+        project.insert_layer(0, layer, None, false).unwrap();
+
+        let owner = project.alloc_id();
+        let source = BTreeMap::from([(
+            Channel::BaseColor,
+            Source::Anchor { anchor: mask_anchor, channel: Channel::BaseColor, ramp: vec![[0.1, 0.15, 0.3], [0.8, 0.45, 0.2]] },
+        )]);
+        let mut layer = Layer::new(owner, "Reader", LayerKind::Fill(Fill { sources: source, ..Fill::default() }), &channels);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let mut generator = Generator::new(GeneratorKind::AmbientOcclusion);
+        generator.micro = Some(MicroDetail { anchor: height_anchor, amount: 0.8 });
+        generator.inputs.insert(BakedMap::AmbientOcclusion, Source::Anchor { anchor: mask_anchor, channel: Channel::BaseColor, ramp: Vec::new() });
+        generator.global.blur = 0.7;
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+
+        let pixels = PixelStore::default();
+        let baked = BakedMaps::default();
+        let images = ImageStore::default();
+        let inputs = Inputs {
+            project: &project,
+            ts: 0,
+            mesh: &mesh,
+            gbuf: &gbuf,
+            pixels: &pixels,
+            baked: &baked,
+            images: &images,
+            block_scales: project.texture_sets[0].block_scales(),
+            preview: None,
+            bounds: mesh.bounds(),
+        };
+        let mut oracle = Composite::new(&channels, SIZE);
+        composite_tiles(&inputs, &mut oracle, &[(0, 0)]);
+        let expected = tile_bytes(&oracle, &baked, DisplayKind::BaseColor, 0, 0);
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        let texture = gpu.renderer.display_textures()[0][DisplayKind::BaseColor as usize];
+        let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+        assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2));
+
+        let expected = mask_image(&inputs, owner, SIZE).unwrap();
+        let mut program = CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).unwrap();
+        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.aux_texture(0).unwrap()).unwrap();
+        assert!(actual.as_chunks::<4>().0.iter().zip(expected).all(|(pixel, value)| pixel[0].abs_diff(value) <= 2));
+    }
 
     #[test]
     fn generator_global_blur_and_resolution_match_cpu_with_an_image_override() {
@@ -3706,6 +3936,8 @@ mod paint_window_tests {
             display_outputs: 0,
             glossiness: false,
             mask_preview: false,
+            mask_layer: 0,
+            mask_layers: BTreeMap::new(),
         };
         let region = CompositeRegion { min: [0, 0], max: [128, 128] };
         let limit = 6 * 64 * 64 * 2 + 32;

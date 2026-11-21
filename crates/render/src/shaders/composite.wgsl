@@ -33,6 +33,9 @@ struct Params {
     filter_chunk: vec4<u32>,
     // Original ID bake dimensions, both zero when absent.
     id_bake: vec4<u32>,
+    // Channel, start of anchor owner's draws, content cut, mask preview draw.
+    anchor: vec4<u32>,
+    anchor_default: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -324,6 +327,20 @@ fn azimuth(y: f32, x: f32) -> f32 {
     return atan2(y, x) / 6.283185307 + 0.5;
 }
 fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
+    if layer.ids.y == 15u {
+        let pixel = vec2<u32>(uv * vec2<f32>(params.source.xy));
+        var color = layer.low.rgb;
+        if layer.ids.z != 0u {
+            let captured = filter_value(layer.ids.z - 1u, pixel);
+            color = select(color, captured.rgb, captured.a > 0.0);
+        }
+        if layer.procedural.z > 0u {
+            let lightness = luminance(color);
+            let t = select(lightness, lightness * 0.5 + 0.5, (layer.ids.w & 2u) != 0u);
+            return gradient_color(layer, t);
+        }
+        return select(color, vec3(luminance(color)), (layer.ids.w & 1u) != 0u);
+    }
     if layer.ids.y == 0u {
         return layer.low.rgb;
     }
@@ -390,15 +407,16 @@ fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
         return vec4(0.0);
     }
     let alpha_image = srgb[frame + 11u];
+    let sample_uv = select(decal.xy, uv, layer.ids.y == 15u);
     if alpha_image != MISSING_IMAGE {
         let sampled = material_image_at(alpha_image, decal.xy);
         let coverage = decal.z * clamp(sampled.a, 0.0, 1.0);
         if layer.ids.y == IMAGE_SOURCE_OPCODE && layer.ids.z == alpha_image {
             return vec4(decode_image_sample(layer, sampled.rgb), coverage);
         }
-        return vec4(value(layer, decal.xy, surface), coverage);
+        return vec4(value(layer, sample_uv, surface), coverage);
     }
-    return vec4(value(layer, decal.xy, surface), decal.z);
+    return vec4(value(layer, sample_uv, surface), decal.z);
 }
 
 fn stored_sample(layer: Operation, table: u32, origin: vec2<u32>, size: vec2<u32>, pixel: vec2<u32>, empty: vec4<f32>) -> vec4<f32> {
@@ -742,7 +760,7 @@ fn blend_rgb(mode: u32, a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
     }
 }
 
-fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u32) -> f32 {
+fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u32, micro: f32) -> f32 {
     let bake_pixel = bake_pixel_at(pixel);
     let offset = u32(effect.uv.x);
     var edges = 0.0;
@@ -761,6 +779,8 @@ fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u
         edges = 1.0 - (1.0 - edges) * (1.0 - weight * clamp(response, 0.0, 1.0));
         cavities = 1.0 - (1.0 - cavities) * (1.0 - weight * clamp(-response, 0.0, 1.0));
     }
+    edges = 1.0 - (1.0 - edges) * (1.0 - max(micro, 0.0));
+    cavities = 1.0 - (1.0 - cavities) * (1.0 + min(micro, 0.0));
     switch mode {
         case 1u: { return edges; }
         case 2u: { return cavities; }
@@ -783,6 +803,11 @@ fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
         }
     }
     let detail = u32(effect.uv.y);
+    var micro = 0.0;
+    if effect.effects.z != 0u {
+        let height = value(layers[effect.effects.z - 1u], texel.uv, surface).x;
+        micro = clamp(height, -1.0, 1.0) * effect.uv.z;
+    }
     var signal = 0.0;
     switch effect.ids.y {
         case 40u: { signal = (baked.y - 0.5) * 2.0; }
@@ -794,7 +819,13 @@ fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
         default: { signal = dot(surface.normal, effect.high.xyz) * 0.5 + 0.5; }
     }
     if detail != 0u {
-        signal = generator_curvature(effect, texel.pixel, baked.y, detail);
+        signal = generator_curvature(effect, texel.pixel, baked.y, detail, micro);
+    } else {
+        switch effect.ids.y {
+            case 40u, 43u, 44u: { signal += micro; }
+            case 41u: { signal -= micro; }
+            default: {}
+        }
     }
     if effect.low.z > 0.0 {
         let noise = fbm(surface.position * effect.projection.x, 4u, effect.ids.z, true);
@@ -889,6 +920,9 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
     }
     for (var i = skip; i < count; i++) {
         let e = layers[start + i];
+        if e.ids.y == 16u {
+            continue;
+        }
         var weight = e.low.w;
         var result: f32;
         if e.ids.y == 10u {
@@ -1004,6 +1038,31 @@ fn uv_texel_covered(pixel: vec2<u32>) -> bool {
     return (word & (1u << (pixel.x % 32u))) != 0u;
 }
 
+fn capture_material_anchor(texel: LayerTexel, end: u32, triangle: u32) -> vec3<f32> {
+    let channel = params.anchor.x;
+    let color_channel = channel == 0u || (channel >= 7u && channel <= 11u);
+    var result = params.anchor_default.rgb;
+    for (var i = 0u; i < end; i++) {
+        let layer = layers[i];
+        if layer.ids.x != channel || !geometry_allows(layer.constraints.x, triangle) {
+            continue;
+        }
+        let count = select(layer.effects.w, min(layer.effects.w, params.anchor.z), i >= params.anchor.y);
+        let content = layer_content(layer, texel, count);
+        let mask = mask_with_height(layer, texel, layer_mask(layer, texel, layer.effects.y));
+        let mode = u32(layer.balance.z);
+        let weight = layer.low.w * mask * select(content.a, 1.0, mode == 2u && content.a > 0.0);
+        if weight > 0.0 {
+            if color_channel {
+                result = mix(result, blend_rgb(mode, result, content.rgb), weight);
+            } else {
+                result = vec3(lerp(result.x, blend_scalar(mode, result.x, content.x), weight));
+            }
+        }
+    }
+    return result;
+}
+
 @compute @workgroup_size(8, 8)
 fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy >= params.filter_chunk.zw) {
@@ -1030,10 +1089,20 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         let texel = LayerTexel(pixel, uv, surface, baked, projected);
         let layer = layers[params.filter_stage.z];
-        let count = params.filter_stage.w & 0x3fffffffu;
+        let count = params.filter_stage.w & 0x0fffffffu;
         if (params.filter_stage.w & 0x40000000u) != 0u {
             let generator = layers[params.program.x + layer.effects.x + count];
             prepared = vec4(generator_ramp(generator, texel), 0.0, 0.0, 1.0);
+        } else if (params.filter_stage.w & 0x30000000u) != 0u {
+            var triangle = 0xffffffffu;
+            if (params.coverage.w & GEOMETRY_MASKS) != 0u {
+                triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
+            }
+            if (params.filter_stage.w & 0x20000000u) != 0u {
+                prepared = vec4(capture_material_anchor(texel, params.filter_stage.z, triangle), 1.0);
+            } else if geometry_allows(layer.constraints.x, triangle) {
+                prepared = vec4(vec3(layer_mask(layer, texel, count)), 1.0);
+            }
         } else if (params.filter_stage.w & 0x80000000u) != 0u {
             prepared = vec4(layer_mask(layer, texel, count), 0.0, 0.0, 1.0);
         } else {
@@ -1169,7 +1238,7 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     if params.source.w == 2u {
         var gray = 0u;
         if covered {
-            let layer = layers[0];
+            let layer = layers[params.anchor.w];
             gray = u32(layer_mask(layer, texel, layer.effects.y) * 255.0 + 0.5);
         }
         output[index] = (gray * 0x00010101u) | 0xff000000u;
@@ -1216,6 +1285,7 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
                 continue;
             }
         }
+        if layer.ids.x == 0xffffffffu { continue; }
         if !geometry_allows(layer.constraints.x, triangle) { continue; }
         let mode = u32(layer.balance.z);
         var weight = layer.low.w;

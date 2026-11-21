@@ -321,7 +321,12 @@ impl SetCompositor {
         let preview = stroke.and_then(|_| {
             // A GPU neighbourhood stage can read earlier, still uncommitted CPU dabs well
             // outside the changed output. Keep all sparse stroke tiles available in that case.
-            let bounds = if session.device_stroke().is_none() && texturecraft_engine::compose::stack_reads_neighbours(&session.doc.project, ts) {
+            let project = &session.doc.project;
+            let anchors = project
+                .texture_sets
+                .get(ts)
+                .is_some_and(|set| project.render_tree(&set.stack).iter().any(|layer| project.layers.get(layer).is_some_and(|layer| layer.reads_anchor())));
+            let bounds = if session.device_stroke().is_none() && (anchors || texturecraft_engine::compose::stack_reads_neighbours(project, ts)) {
                 None
             } else {
                 region.map(|r| r.expanded(texturecraft_engine::texel::TILE).bounds())
