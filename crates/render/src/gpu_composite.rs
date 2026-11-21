@@ -951,8 +951,9 @@ impl GpuCompositor {
         self.baked.clear();
     }
 
-    pub(crate) fn remove_baked_input(&mut self, ts: usize) {
+    pub(crate) fn release_inputs(&mut self, ts: usize) {
         self.baked.remove(&ts);
+        self.tile_images.remove(&ts);
     }
 
     fn baked_input(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, baked: Option<&BakedInputs>) -> Result<wgpu::TextureView, String> {

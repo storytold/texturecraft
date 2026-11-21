@@ -10,6 +10,8 @@ pub(crate) const TILE_GENERATOR_OPCODE: u32 = 80;
 const NO_IMAGE: u32 = u32::MAX;
 // Keep uploads banded even for an image that fills an entire atlas slice.
 const IMAGE_ROWS: usize = 64;
+// Put a bound on packing overhead as well as authored pixels. An 8K image fits on its own.
+const MAX_ATLAS_BYTES: u64 = 256 << 20;
 
 #[derive(Debug, Default)]
 pub(crate) struct TilePatterns {
@@ -236,7 +238,12 @@ fn arrange_images(images: &[&Arc<ImageRes>], side_limit: u32, layer_limit: u32) 
         used_w = used_w.max(x);
         used_h = used_h.max(y + row_height);
     }
-    Ok(([used_w, used_h, layer + 1], regions))
+    let extent = [used_w, used_h, layer + 1];
+    let bytes = extent.into_iter().map(u64::from).product::<u64>() * size_of::<u32>() as u64;
+    if bytes > MAX_ATLAS_BYTES {
+        return Err("The Tile Generator image atlas exceeds the GPU memory budget.".into());
+    }
+    Ok((extent, regions))
 }
 
 fn atlas_texture(device: &wgpu::Device, width: u32, height: u32, layers: u32) -> wgpu::Texture {
@@ -250,4 +257,20 @@ fn atlas_texture(device: &wgpu::Device, width: u32, height: u32, layers: u32) ->
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_atlas_counts_unoccupied_space_in_every_array_slice() {
+        let input = |side| Arc::new(ImageRes { width: side, height: side, rgba: Vec::new(), srgb: false });
+        let large = input(8192);
+        let small = input(16);
+        let (extent, _) = arrange_images(&[&large], 8192, 16).unwrap();
+        assert_eq!(extent, [8192, 8192, 1]);
+        let error = arrange_images(&[&large, &small], 8192, 16).err();
+        assert!(error.is_some_and(|error| error.contains("memory budget")));
+    }
 }

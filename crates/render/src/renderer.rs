@@ -1606,6 +1606,13 @@ impl Renderer {
         stroke
     }
 
+    /// Drop the inputs a texture set no longer needs for GPU compositing.
+    pub fn release_composite_inputs(&mut self, ts: usize) {
+        if let Some(compositor) = &mut self.compositor {
+            compositor.release_inputs(ts);
+        }
+    }
+
     /// Composite a supported layer stack or standalone mask into the viewport's textures.
     /// Scratch holds one band. The final maps stay on the adapter for shading and mip generation.
     pub fn composite_on_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<(), String> {
@@ -1614,9 +1621,7 @@ impl Renderer {
         }
         let set = self.sets.get(ts).ok_or("texture set does not exist")?;
         if program.is_neutral() {
-            if let Some(compositor) = &mut self.compositor {
-                compositor.remove_baked_input(ts);
-            }
+            self.release_composite_inputs(ts);
             let textures = crate::gpu_trace::scoped(device, "empty GPU material", || {
                 let textures = DisplayKind::ALL
                     .iter()
@@ -1653,7 +1658,8 @@ impl Renderer {
                 .map(|((&kind, neutral), old)| {
                     let composed = program.writes_display(kind);
                     let extent = if composed { size } else { (1, 1) };
-                    if extent == (old.texture.width(), old.texture.height()) {
+                    // At full extent 1×1, even an inactive map's old texel could be painted.
+                    if extent == (old.texture.width(), old.texture.height()) && (composed || size != (1, 1)) {
                         in_place[kind as usize] = composed;
                         old.clone()
                     } else if composed && program.region.is_none() {
