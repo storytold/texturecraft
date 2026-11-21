@@ -66,7 +66,15 @@ impl Session {
     /// The same visible triangles are used for picking, exact occlusion rays and camera depth.
     fn stroke_visibility(&mut self, viewport: Vec2) -> (Arc<Bvh>, Arc<EyeDepth>) {
         let size = ((viewport.x / 2.0).max(64.0) as u32, (viewport.y / 2.0).max(64.0) as u32);
-        let hidden_materials = self.doc.project.texture_sets.iter().filter(|set| !set.visible).map(|set| set.material).collect::<BTreeSet<_>>();
+        let mut hidden_materials = BTreeSet::new();
+        // The viewport uses the last texture set mapped to each mesh material.
+        for set in &self.doc.project.texture_sets {
+            if set.visible {
+                hidden_materials.remove(&set.material);
+            } else {
+                hidden_materials.insert(set.material);
+            }
+        }
         let cached = self.stroke_visibility.as_ref().filter(|scene| scene.mesh_id == self.mesh_id && scene.hidden_materials == hidden_materials);
         if let Some(scene) = cached.filter(|scene| scene.camera == self.camera && scene.size == size) {
             return (scene.bvh.clone(), scene.depth.clone());
@@ -94,14 +102,14 @@ impl Session {
         } else {
             pick_filtered(&ctx, screen, &|triangle| {
                 let material = self.mesh.material_of(triangle as usize).unwrap_or(0);
-                sets.iter().find(|set| set.material == material).is_none_or(|set| set.visible)
+                sets.iter().rfind(|set| set.material == material).is_none_or(|set| set.visible)
             })
         }
     }
 
     /// The texture set that paints mesh material `material` (a [`SurfaceHit::material`])
     pub fn texture_set_of_material(&self, material: usize) -> Option<usize> {
-        self.doc.project.texture_sets.iter().position(|t| t.material == material)
+        self.doc.project.texture_sets.iter().rposition(|t| t.material == material)
     }
 
     /// The texture set of the surface under viewport pixel `screen`

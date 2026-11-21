@@ -1278,7 +1278,7 @@ pub(crate) mod tests {
                 session.brush_device = Some(brush_device::BrushBackend { device: device.clone(), surface: Arc::downgrade(&session.caches[1].gbuf) });
             }
             let layer = session.selected_layer().unwrap();
-            execute(&mut session, "tool.brush", &json!({"size": 10, "hardness": 100, "flow": 100})).unwrap();
+            execute(&mut session, "tool.brush", &json!({"size": 20, "hardness": 100, "flow": 100})).unwrap();
             execute(&mut session, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [1.0, 0.0, 0.0]})).unwrap();
 
             let screen = |session: &Session, x, z| {
