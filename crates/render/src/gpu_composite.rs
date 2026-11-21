@@ -22,6 +22,7 @@ use wgpu::util::DeviceExt;
 const MAX_PAINT_WORDS: usize = (64 << 20) / size_of::<u32>();
 const LOOKUP_WORDS: u32 = 4096;
 const NO_PAINT_IMAGE: u32 = u32::MAX;
+const BAKED_LIGHTING_OPCODE: u32 = 35;
 // Extended procedural sources follow the filter and generator opcodes.
 const FIRST_GENERATOR: u32 = 40;
 const FIRST_EXTENDED_PATTERN: u32 = 48;
@@ -73,6 +74,18 @@ struct Operation {
 struct ProceduralInputs {
     resolution: u32,
     ramp_words: Vec<u32>,
+}
+
+impl ProceduralInputs {
+    fn pack_gradient(&mut self, colors: &[[f32; 3]]) -> Option<[u32; 2]> {
+        if colors.iter().flatten().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let offset = LOOKUP_WORDS.checked_add(u32::try_from(self.ramp_words.len()).ok()?)?;
+        let count = u32::try_from(colors.len()).ok()?;
+        self.ramp_words.extend(colors.iter().flatten().map(|value| value.to_bits()));
+        Some([offset, count])
+    }
 }
 
 /// Inclusive origin and exclusive end of a material update, in document texels.
@@ -311,7 +324,7 @@ impl CompositeProgram {
                 continue;
             }
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
-                effects.push(point_effect(effect).ok_or("A layer effect uses CPU compositing.")?);
+                effects.push(point_effect(effect, &mut procedural).ok_or("A layer effect uses CPU compositing.")?);
             }
             let content_count = effects.len() as u32 - content_start;
             let fill = match &layer.kind {
@@ -473,7 +486,7 @@ impl CompositeProgram {
 }
 
 fn needs_surface(operations: &[Operation]) -> bool {
-    operations.iter().any(|op| op.procedural[3] != 0 || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]))
+    operations.iter().any(|op| op.procedural[3] != 0 || op.ids[1] == BAKED_LIGHTING_OPCODE || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]))
 }
 
 fn compile_mask(
@@ -516,7 +529,8 @@ fn compile_mask(
                 op
             }
             EffectKind::Generator(generator) => generator_operation(generator).ok_or("A mask generator uses CPU compositing.")?,
-            _ => point_effect(effect).ok_or("A mask effect uses CPU compositing.")?,
+            EffectKind::Filter(Filter::BakedLighting { .. }) => continue,
+            _ => point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?,
         };
         if !effect.opacity.is_finite() {
             return Err("A mask effect has an invalid opacity.");
@@ -645,12 +659,7 @@ fn source_operation(
             op.balance[0] = pattern.balance;
             op.procedural[0] = pattern_pixels(pattern, inputs.resolution, inputs.resolution).unwrap_or(0);
             if channel == ChannelKind::Color && !ramp.is_empty() {
-                if ramp.iter().flatten().any(|value| !value.is_finite()) {
-                    return None;
-                }
-                op.procedural[1] = LOOKUP_WORDS.checked_add(u32::try_from(inputs.ramp_words.len()).ok()?)?;
-                op.procedural[2] = u32::try_from(ramp.len()).ok()?;
-                inputs.ramp_words.extend(ramp.iter().flatten().map(|value| value.to_bits()));
+                op.procedural[1..3].copy_from_slice(&inputs.pack_gradient(ramp)?);
             }
             match projection {
                 Projection::Uv { scale, rotation, offset } => {
@@ -724,36 +733,56 @@ fn generator_operation(generator: &Generator) -> Option<Operation> {
     op.low.iter().chain(&op.projection).all(|x| x.is_finite()).then_some(op)
 }
 
-fn point_effect(effect: &Effect) -> Option<Operation> {
+fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operation> {
     use Filter::*;
     if !effect.opacity.is_finite() {
         return None;
     }
-    let (kind, params, out_low, out_high) = match &effect.kind {
-        EffectKind::Levels(levels) => (20, [levels.in_low, levels.in_high, levels.gamma], levels.out_low, levels.out_high),
+    let mut op = Operation::zeroed();
+    let (kind, params) = match &effect.kind {
+        EffectKind::Levels(levels) => {
+            op.high[..2].copy_from_slice(&[levels.out_low, levels.out_high]);
+            (20, [levels.in_low, levels.in_high, levels.gamma])
+        }
         EffectKind::Filter(filter) => match filter {
-            Invert => (21, [0.0; 3], 0.0, 0.0),
-            Threshold { level } => (22, [*level, 0.0, 0.0], 0.0, 0.0),
-            ContrastLuminosity { contrast, luminosity } => (23, [*contrast, *luminosity, 0.0], 0.0, 0.0),
-            Posterize { levels } => (24, [*levels, 0.0, 0.0], 0.0, 0.0),
-            Clamp { min, max } => (25, [min.min(*max), min.max(*max), 0.0], 0.0, 0.0),
-            HistogramScan { position, contrast } => (26, [*position, *contrast, 0.0], 0.0, 0.0),
-            HistogramRange { range, position } => (27, [*range, *position, 0.0], 0.0, 0.0),
-            HistogramShift { offset } => (28, [*offset, 0.0, 0.0], 0.0, 0.0),
-            Grayscale => (29, [0.0; 3], 0.0, 0.0),
-            NormalInvert => (30, [0.0; 3], 0.0, 0.0),
-            Hsl { hue, saturation, lightness } => (31, [*hue, *saturation, *lightness], 0.0, 0.0),
+            Invert => (21, [0.0; 3]),
+            Threshold { level } => (22, [*level, 0.0, 0.0]),
+            ContrastLuminosity { contrast, luminosity } => (23, [*contrast, *luminosity, 0.0]),
+            Posterize { levels } => (24, [*levels, 0.0, 0.0]),
+            Clamp { min, max } => (25, [min.min(*max), min.max(*max), 0.0]),
+            HistogramScan { position, contrast } => (26, [*position, *contrast, 0.0]),
+            HistogramRange { range, position } => (27, [*range, *position, 0.0]),
+            HistogramShift { offset } => (28, [*offset, 0.0, 0.0]),
+            Grayscale => (29, [0.0; 3]),
+            NormalInvert => (30, [0.0; 3]),
+            Hsl { hue, saturation, lightness } => (31, [*hue, *saturation, *lightness]),
+            ColorBalance { shadows, midtones, highlights } => {
+                op.high[..3].copy_from_slice(midtones);
+                op.projection[..3].copy_from_slice(highlights);
+                (32, *shadows)
+            }
+            GradientMap { colors } => {
+                op.procedural[1..3].copy_from_slice(&inputs.pack_gradient(colors)?);
+                (33, [0.0; 3])
+            }
+            ReplaceColor { from, to, tolerance, softness } => {
+                op.high[..3].copy_from_slice(to);
+                op.projection[..2].copy_from_slice(&[tolerance.clamp(0.0, 1.0), softness.clamp(0.0, 1.0)]);
+                (34, *from)
+            }
+            BakedLighting { azimuth, elevation, light, ambient, occlusion } => {
+                let (sa, ca) = azimuth.to_radians().sin_cos();
+                let (se, ce) = elevation.to_radians().sin_cos();
+                op.high[..3].copy_from_slice(&[ce * sa, se, ce * ca]);
+                (BAKED_LIGHTING_OPCODE, [*light, *ambient, occlusion.clamp(0.0, 1.0)])
+            }
             _ => return None,
         },
         _ => return None,
     };
-    let low = [params[0], params[1], params[2], effect.opacity.clamp(0.0, 1.0)];
-    low.iter().chain(&[out_low, out_high]).all(|x| x.is_finite()).then_some(Operation {
-        ids: [0, kind, 0, 0],
-        low,
-        high: [out_low, out_high, 0.0, 0.0],
-        ..Operation::zeroed()
-    })
+    op.ids[1] = kind;
+    op.low = [params[0], params[1], params[2], effect.opacity.clamp(0.0, 1.0)];
+    op.low.iter().chain(&op.high).chain(&op.projection).all(|x| x.is_finite()).then_some(op)
 }
 
 // Three 10-bit components followed by a validity bit.
@@ -1374,6 +1403,103 @@ mod procedural_tests {
         project.insert_layer(0, layer, None, false).unwrap();
         let program = CompositeProgram::compile(&project, &PixelStore::default(), 0).unwrap();
         assert_eq!(program.tile_work_per_pixel().unwrap(), overlapping_work * 12, "the three planes each need four samples");
+    }
+
+    #[test]
+    fn point_filters_match_cpu_for_material_channels_and_mask_preview() {
+        use texturecraft_compose::display::tile_bytes;
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = TILE;
+        let mut mesh = primitives::plane(1.0, 1);
+        for (normal, position) in mesh.normals.iter_mut().zip(&mesh.positions) {
+            if position.x > 0.0 {
+                *normal = Vec3::Z;
+            }
+        }
+        let mesh = Arc::new(mesh);
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let baked = BakedMaps { resolution: 2, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new(vec![0.25, 0.7, 0.9, 0.45]))]) };
+        let images = ImageStore::default();
+        let pixels = PixelStore::default();
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal];
+        let sources = BTreeMap::from([
+            (Channel::BaseColor, Source::Uniform([0.47, 0.3, 0.58])),
+            (Channel::Roughness, Source::Uniform([0.41; 3])),
+            (Channel::Height, Source::Uniform([-0.34; 3])),
+            (Channel::Normal, Source::Uniform([0.37, 0.68, 0.89])),
+        ]);
+        let filters = [
+            Filter::ColorBalance { shadows: [0.27, 0.06, -0.13], midtones: [-0.11, 0.23, 0.09], highlights: [0.08, 0.21, -0.08] },
+            Filter::GradientMap { colors: vec![[0.04, 0.13, 0.7], [0.85, 0.56, 0.22], [0.76, 0.11, 0.34]] },
+            Filter::GradientMap { colors: Vec::new() },
+            Filter::ReplaceColor { from: [0.2, 0.43, 0.72], to: [0.62, 0.35, 0.33], tolerance: 0.09, softness: 0.28 },
+            Filter::BakedLighting { azimuth: 30.0, elevation: 60.0, light: 0.6, ambient: 0.35, occlusion: 0.72 },
+        ];
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        for filter in filters {
+            let mut project = Project::new("Point filters", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+            let owner = project.alloc_id();
+            let fill = Fill { sources: sources.clone(), ..Default::default() };
+            let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
+            let mut effect = Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone()));
+            effect.opacity = 0.77;
+            layer.content_effects.push(effect);
+            let mut mask = Mask::new(MaskBackground::Black);
+            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.36; 3]), projection: Projection::default() }));
+            let mut effect = Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone()));
+            effect.opacity = 0.63;
+            effect.blend = BlendMode::Multiply;
+            mask.effects.push(effect);
+            layer.mask = Some(mask);
+            project.insert_layer(0, layer, None, false).unwrap();
+
+            let inputs = Inputs {
+                project: &project,
+                ts: 0,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked: &baked,
+                block_scales: project.texture_sets[0].block_scales(),
+                preview: None,
+                images: &images,
+                bounds: mesh.bounds(),
+            };
+            let mut oracle = Composite::new(&channels, SIZE);
+            composite_tiles(&inputs, &mut oracle, &[(0, 0)]);
+            let mut material = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+            material.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &material).unwrap();
+            for kind in [DisplayKind::BaseColor, DisplayKind::Orm, DisplayKind::Height, DisplayKind::Normal] {
+                let expected = tile_bytes(&oracle, &baked, kind, 0, 0);
+                let texture = gpu.renderer.display_textures()[0][kind as usize];
+                let (_, _, actual) = Readback::blocking_level(&gpu.device, &gpu.queue, texture, 0).unwrap();
+                assert_eq!(actual.len(), expected.len());
+                if kind.bytes_per_texel() == 8 {
+                    for (actual, expected) in actual.as_chunks::<2>().0.iter().zip(expected.as_chunks::<2>().0) {
+                        let actual = half::f16::from_le_bytes(*actual).to_f32();
+                        let expected = half::f16::from_le_bytes(*expected).to_f32();
+                        assert!((actual - expected).abs() <= 0.001, "{filter:?} {kind:?}: GPU {actual} vs CPU {expected}");
+                    }
+                } else {
+                    assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1), "{filter:?} {kind:?}");
+                }
+            }
+
+            let expected = mask_image(&inputs, owner, SIZE).unwrap();
+            let mut mask = CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).unwrap();
+            mask.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &mask).unwrap();
+            let texture = gpu.renderer.aux_texture(0).unwrap();
+            let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+            assert_eq!(rgba.len(), expected.len() * 4);
+            for (&expected, &[r, g, b, a]) in expected.iter().zip(rgba.as_chunks::<4>().0) {
+                assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255, "{filter:?} mask: GPU {r} vs CPU {expected}");
+            }
+        }
     }
 
     #[test]

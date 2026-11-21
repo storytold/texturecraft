@@ -288,6 +288,16 @@ fn paint_ramp_color(word: u32) -> vec3<f32> {
     return bitcast<vec3<f32>>(vec3(srgb[word], srgb[word + 1u], srgb[word + 2u]));
 }
 
+fn gradient_color(op: Operation, t: f32) -> vec3<f32> {
+    let last = op.procedural.z - 1u;
+    let pos = filter_unit(t) * f32(last);
+    let index = min(u32(pos), last);
+    let offset = op.procedural.y;
+    let first = paint_ramp_color(offset + index * 3u);
+    let second = paint_ramp_color(offset + min(index + 1u, last) * 3u);
+    return first + (second - first) * (pos - f32(index));
+}
+
 fn azimuth(y: f32, x: f32) -> f32 {
     if x == 0.0 && y == 0.0 { return 0.5; }
     return atan2(y, x) / 6.283185307 + 0.5;
@@ -337,11 +347,7 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
     let shaped = clamp((n - 0.5) * layer.uv.w + 0.5 + layer.balance.x, 0.0, 1.0);
     let t = select(shaped, 1.0 - shaped, layer.ids.w != 0u);
     if layer.procedural.z > 0u {
-        let last = layer.procedural.z - 1u;
-        let pos = t * f32(last);
-        let index = min(u32(pos), last);
-        let offset = layer.procedural.y;
-        return mix(paint_ramp_color(offset + index * 3u), paint_ramp_color(offset + min(index + 1u, last) * 3u), pos - f32(index));
+        return gradient_color(layer, t);
     }
     return layer.low.rgb + (layer.high.rgb - layer.low.rgb) * t;
 }
@@ -461,6 +467,31 @@ fn hsl_adjust(rgb: vec3<f32>, args: vec3<f32>) -> vec3<f32> {
     return vec3(hue_to_rgb(p, q, h + 1.0 / 3.0), hue_to_rgb(p, q, h), hue_to_rgb(p, q, h - 1.0 / 3.0));
 }
 
+fn filter_unit(x: f32) -> f32 {
+    return select(0.0, clamp(x, 0.0, 1.0), abs(x) <= 3.402823466e38);
+}
+
+fn color_balance_shift(op: Operation, lightness: f32) -> vec3<f32> {
+    let l = filter_unit(lightness);
+    let s = 1.0 - l;
+    return op.low.xyz * (s * s) + op.high.xyz * (2.0 * l * s) + op.projection.xyz * (l * l);
+}
+
+fn replace_color(op: Operation, c: vec3<f32>) -> vec3<f32> {
+    let d = distance(c, op.low.xyz) / sqrt(3.0);
+    let tolerance = op.projection.x;
+    let softness = op.projection.y;
+    var amount = 0.0;
+    if d <= tolerance {
+        amount = 1.0;
+    } else if d < tolerance + softness {
+        let x = 1.0 - (d - tolerance) / max(softness, 1e-6);
+        amount = x * x * (3.0 - 2.0 * x);
+    }
+    let color = c + (op.high.xyz - op.low.xyz) * amount;
+    return vec3(filter_unit(color.r), filter_unit(color.g), filter_unit(color.b));
+}
+
 fn scalar_filter(op: Operation, x: f32) -> f32 {
     switch op.ids.y {
         case 20u: {
@@ -488,17 +519,42 @@ fn scalar_filter(op: Operation, x: f32) -> f32 {
             return clamp(t, 0.0, 1.0);
         }
         case 31u: { return shift_unit(clamp(x, 0.0, 1.0), op.low.z); }
+        case 32u: {
+            let shift = color_balance_shift(op, x);
+            return filter_unit(x + (shift.x + shift.y + shift.z) / 3.0);
+        }
+        case 33u: {
+            if op.procedural.z > 0u { return luminance(gradient_color(op, x)); }
+            return x;
+        }
         default: { return x; }
     }
 }
 
-fn effect_color(op: Operation, c: vec3<f32>, channel: u32) -> vec3<f32> {
+fn effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> {
+    if op.ids.y == 35u {
+        if channel != 0u { return c; }
+        let facing = max(0.0, dot(surface.normal, op.high.xyz));
+        let ao = select(1.0, clamp(baked_ao, 0.0, 1.0), abs(baked_ao) <= 3.402823466e38);
+        let light = op.low.y * (1.0 + (ao - 1.0) * op.low.z) + op.low.x * facing;
+        let factor = select(1.0, max(0.0, light), abs(light) <= 3.402823466e38);
+        return clamp(c * factor, vec3(0.0), vec3(1.0));
+    }
     if channel == 7u || channel == 11u {
         return select(c, vec3(c.x, 1.0 - c.y, c.z), op.ids.y == 30u);
     }
     if channel == 0u || (channel >= 8u && channel <= 10u) {
         if op.ids.y == 29u { return vec3(dot(c, vec3(0.3, 0.59, 0.11))); }
         if op.ids.y == 31u { return hsl_adjust(c, op.low.xyz); }
+        if op.ids.y == 32u {
+            let color = c + color_balance_shift(op, luminance(c));
+            return vec3(filter_unit(color.r), filter_unit(color.g), filter_unit(color.b));
+        }
+        if op.ids.y == 33u {
+            if op.procedural.z > 0u { return gradient_color(op, luminance(c)); }
+            return c;
+        }
+        if op.ids.y == 34u { return replace_color(op, c); }
         return vec3(scalar_filter(op, c.r), scalar_filter(op, c.g), scalar_filter(op, c.b));
     }
     if channel == 6u {
@@ -804,7 +860,7 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         let destination = layer.ids.x;
         for (var step = 0u; step < layer.effects.w; step++) {
             let effect = layers[params.program.x + layer.effects.z + step];
-            let filtered = effect_color(effect, source, destination);
+            let filtered = effect_color(effect, source, destination, surface, mask_bakes.x);
             source += (filtered - source) * effect.low.w;
         }
         if destination == 0u {
