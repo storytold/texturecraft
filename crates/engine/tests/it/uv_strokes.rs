@@ -118,6 +118,35 @@ fn blurred_mask_session() -> Session {
 }
 
 #[test]
+fn swapping_mask_gray_refreshes_the_last_displayed_dab_and_keeps_its_priority() {
+    let mut session = Session::new_project("Mask stroke", primitives::plane(1.0, 1), "builtin:plane", None, RESOLUTION).unwrap();
+    execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap();
+    execute(&mut session, "mask.add.white", &json!({})).unwrap();
+    session.tool.mask_value = 1.0;
+    session.update();
+    session.take_uploads(0);
+
+    session.begin_stroke_uv([0.5, 0.5].into(), 1.0).unwrap();
+    let (id, tiles) = session.pending_display_stroke(0).unwrap();
+    let tile = session.tile_demand(None).brush.unwrap();
+    assert!(tiles.contains(&tile));
+    session.update();
+    session.take_uploads(0);
+    session.clear_display_stroke_tiles();
+    assert!(session.pending_display_stroke(0).unwrap().1.is_empty());
+
+    execute(&mut session, "tool.swapMaskValue", &json!({})).unwrap();
+    assert!(session.pending_display_stroke(0).unwrap().1.contains(&tile), "a new gray refreshes existing coverage");
+    let revision = session.caches[0].material_revision;
+    session.end_stroke().unwrap();
+
+    assert!(session.finished_display_stroke(0, id, revision).unwrap().contains(&tile), "the commit refreshes the last displayed gray");
+    assert!(session.caches[0].settle.contains(&tile));
+    assert!(session.caches[0].dirty.is_empty() && session.caches[0].upload.is_empty(), "only the settle queue holds the released dab");
+    assert_eq!(session.tile_demand(None).brush, Some(tile));
+}
+
+#[test]
 fn filtered_stroke_refreshes_the_neighbour_on_preview_cancel_commit_and_history() {
     use texturecraft_engine::compose::Composite;
     fn compare_full(s: &mut Session, phase: &str) -> Composite {

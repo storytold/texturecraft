@@ -6,7 +6,8 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use texturecraft_core::{Channel, LayerId};
+use texturecraft_compose::PaintTarget;
+use texturecraft_core::Channel;
 use texturecraft_geom::{Bvh, Mesh, UvGBuffer};
 use texturecraft_paint::{BrushSettings, EyeDepth, Stamp, UvStamp};
 use texturecraft_texel::TileImage;
@@ -29,8 +30,9 @@ pub struct BrushSurface {
 
 pub struct DeviceStrokePreview<'a> {
     pub ts: usize,
-    pub layer: LayerId,
+    pub target: PaintTarget,
     pub values: &'a BTreeMap<Channel, [f32; 3]>,
+    pub mask_value: f32,
     pub opacity: f32,
     pub stroke: &'a dyn DeviceStroke,
 }

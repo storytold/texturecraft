@@ -457,6 +457,8 @@ pub(crate) struct DisplayStrokeEnd {
 pub(crate) struct ActiveStroke {
     pub display_id: u64,
     pub display_tiles: BTreeSet<(u32, u32)>,
+    /// Gray used for the most recently queued display of a mask stroke.
+    pub displayed_mask_value: f32,
     pub ts: usize,
     /// None: the stroke edits the quick mask.
     pub target: Option<PaintTarget>,

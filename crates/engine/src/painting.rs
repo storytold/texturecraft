@@ -327,7 +327,7 @@ impl Session {
         };
         let settings = &stroke.settings;
         let device = if tool == Tool::Paint
-            && let Some(PaintTarget::Layer(layer)) = target
+            && let Some(target) = target
             && canvas.pickup.is_none()
             && canvas.limit.is_none()
             && stencil.is_none()
@@ -340,7 +340,7 @@ impl Session {
             && self
                 .doc
                 .project
-                .sets_drawing(self.paint_owner(PaintTarget::Layer(layer)))
+                .sets_drawing(self.paint_owner(target))
                 .into_iter()
                 .all(|other| other == ts || self.caches.get(other).is_none_or(|other| other.size != size))
         {
@@ -368,6 +368,7 @@ impl Session {
         self.stroke = Some(ActiveStroke {
             display_id: next_mesh_id(),
             display_tiles: BTreeSet::new(),
+            displayed_mask_value: self.tool.mask_value,
             ts,
             target,
             stroke,
@@ -630,11 +631,22 @@ impl Session {
         self.stroke.as_ref().map(|stroke| stroke.ts)
     }
 
+    pub fn stroke_mask_owner(&self) -> Option<LayerId> {
+        let Some(PaintTarget::Mask(effect)) = self.stroke.as_ref()?.target else { return None };
+        self.doc.project.effect(effect).map(|(layer, _)| layer)
+    }
+
     /// The live material compositor uses the device's coverage directly while the stroke is active.
     pub fn device_stroke(&self) -> Option<DeviceStrokePreview<'_>> {
         let stroke = self.stroke.as_ref()?;
-        let Some(PaintTarget::Layer(layer)) = stroke.target else { return None };
-        Some(DeviceStrokePreview { ts: stroke.ts, layer, values: &stroke.values, opacity: stroke.stroke.settings.opacity, stroke: stroke.device.as_deref()? })
+        Some(DeviceStrokePreview {
+            ts: stroke.ts,
+            target: stroke.target?,
+            values: &stroke.values,
+            mask_value: self.tool.mask_value,
+            opacity: stroke.stroke.settings.opacity,
+            stroke: stroke.device.as_deref()?,
+        })
     }
 
     /// Finish the GPU coverage when committing or switching to a CPU-only preview.
@@ -683,8 +695,12 @@ impl Session {
     /// Identity and tiles of a supported live stroke since the display last drew it.
     pub fn pending_display_stroke(&self, ts: usize) -> Option<(u64, &BTreeSet<(u32, u32)>)> {
         let stroke = self.stroke.as_ref()?;
-        (stroke.ts == ts && stroke.target.is_some() && stroke.stencil.is_none() && stroke.canvas.pickup.is_none())
-            .then_some((stroke.display_id, &stroke.display_tiles))
+        let tiles = if matches!(stroke.target, Some(PaintTarget::Mask(_))) && stroke.displayed_mask_value != self.tool.mask_value {
+            &stroke.canvas.dirty
+        } else {
+            &stroke.display_tiles
+        };
+        (stroke.ts == ts && stroke.target.is_some() && stroke.stencil.is_none() && stroke.canvas.pickup.is_none()).then_some((stroke.display_id, tiles))
     }
 
     /// Copy-on-write material pixels for display. The staged blends are the same tiles the
@@ -726,6 +742,7 @@ impl Session {
     pub fn clear_display_stroke_tiles(&mut self) {
         if let Some(stroke) = self.stroke.as_mut() {
             stroke.display_tiles.clear();
+            stroke.displayed_mask_value = self.tool.mask_value;
         }
     }
 
@@ -758,6 +775,9 @@ impl Session {
             Some(PaintTarget::Mask(eid)) => {
                 let pixels = &mut self.doc.pixels;
                 with_commit_source(&st, gbuf.as_deref(), &mesh, &st.canvas.dirty, |src| commit_mask(pixels, eid, size, mask_value, src, &mut staging));
+                if st.displayed_mask_value != mask_value {
+                    st.display_tiles.extend(&st.canvas.dirty);
+                }
             }
             None => {
                 with_commit_source(&st, gbuf.as_deref(), &mesh, &st.canvas.dirty, |src| self.commit_quick_mask(st.ts, size, src));
@@ -778,8 +798,9 @@ impl Session {
         if let Some(cache) = self.caches.get_mut(st.ts) {
             self.display_stroke_end =
                 Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision, revision: cache.material_revision, tiles: st.display_tiles });
-            cache.finished_dab =
-                brush_tile.filter(|tile| st.canvas.dirty.contains(tile) && (cache.dirty.contains(tile) || cache.upload.contains(tile))).map(ReleasedDab::new);
+            cache.finished_dab = brush_tile
+                .filter(|tile| st.canvas.dirty.contains(tile) && (cache.dirty.contains(tile) || cache.upload.contains(tile) || cache.settle.contains(tile)))
+                .map(ReleasedDab::new);
         }
         Ok(())
     }
