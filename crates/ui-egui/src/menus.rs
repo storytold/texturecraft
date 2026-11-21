@@ -331,7 +331,7 @@ pub fn menu_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                 }
             });
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.with_layout(craft_ui::direction::trailing(ui), |ui| {
             let mode = match app.ui.mode {
                 Mode::Painting => tr("Painting"),
                 Mode::Baking => tr("Baking"),

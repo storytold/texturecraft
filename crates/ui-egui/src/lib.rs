@@ -972,7 +972,8 @@ impl eframe::App for TextureCraftApp {
         }
         self.last_time = now;
         let style = (self.ui.prefs.brightness, self.ui.prefs.accent);
-        if self.styled != Some(style) {
+        let theme_changed = self.styled != Some(style);
+        if theme_changed {
             theme::apply(ctx, style.0, style.1);
             self.styled = Some(style);
         }
@@ -1019,6 +1020,12 @@ impl eframe::App for TextureCraftApp {
         #[cfg(not(target_arch = "wasm32"))]
         self.autosave(now);
         i18n::set_language(&self.ui.prefs.language);
+        let dir = craft_ui::direction::resolve(i18n::current().code, craft_ui::direction::Setting::Language);
+        let dir_id = egui::Id::unique("ui_direction");
+        if theme_changed || ctx.data(|d| d.get_temp::<craft_ui::direction::Direction>(dir_id)) != Some(dir) {
+            craft_ui::direction::apply(ctx, dir);
+            ctx.data_mut(|d| d.insert_temp(dir_id, dir));
+        }
         #[cfg(target_arch = "wasm32")]
         {
             keymap::sync_captured(&self.ui.keymap);
