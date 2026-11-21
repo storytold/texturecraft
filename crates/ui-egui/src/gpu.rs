@@ -2291,8 +2291,6 @@ pub(crate) mod tests {
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let mut s = Session::new_project("Mixed Quick Mask", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
         execute(&mut s, "layer.add.fill", &json!({"color": [0.0, 0.5, 0.0]})).unwrap();
-        let layer = s.selected_layer().unwrap();
-        s.doc.project.layer_mut(layer).unwrap().geometry_mask = Some(s.mesh.submeshes.iter().map(|part| part.name.clone()).collect());
         s.update();
         execute(&mut s, "tool.paint", &json!({})).unwrap();
         execute(&mut s, "viewport.quickMask", &json!({"enabled": true})).unwrap();
@@ -2310,6 +2308,13 @@ pub(crate) mod tests {
             assert!(errors.is_empty(), "{errors:?}");
             read_pixel(gpu, gpu.renderer.aux_texture(0).unwrap(), 32, 32)
         };
+        let mut attempted = link.sync(&mut s, aux, None, 0, 0.0);
+        let (_, _, failed) = attempted.composites.pop().expect("material was queued for GPU composition");
+        assert!(attempted.composites.is_empty());
+        failed.store(true, Ordering::Release);
+        display(&attempted);
+        drop(attempted);
+
         let mut first = link.sync(&mut s, aux, None, 0, 0.0);
         assert_eq!(link.compositor_status().0, "Layers: CPU");
         assert!(!first.quick_masks.is_empty());

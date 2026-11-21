@@ -11,6 +11,8 @@ struct Operation {
     // Layer: first content field slot, content and mask field flags. Marker:
     // relative content slot or absolute mask field slot.
     spatial: vec4<u32>,
+    // Geometry lookup offset, Height operation plus one, contrast and offset.
+    constraints: vec4<u32>,
 }
 
 struct Params {
@@ -48,6 +50,7 @@ struct SurfaceVertex {
 
 const NO_PAINT_IMAGE = 0xffffffffu;
 const PROJECTED_BRUSH: u32 = 4u;
+const GEOMETRY_MASKS: u32 = 8u;
 const SPATIAL_FILTER_OPCODE: u32 = 36u;
 
 struct Surface {
@@ -565,6 +568,12 @@ fn scalar_filter(op: Operation, x: f32) -> f32 {
             if op.procedural.z > 0u { return luminance(gradient_color(op, x)); }
             return x;
         }
+        case 37u: {
+            var passes = abs(x - op.low.x) <= op.low.y;
+            if op.ids.z == 0u { passes = x < op.low.x; }
+            if op.ids.z == 2u { passes = x > op.low.x; }
+            return select(0.0, 1.0, passes);
+        }
         default: { return x; }
     }
 }
@@ -864,6 +873,24 @@ fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
     return vec4(color, content.a);
 }
 
+fn geometry_allows(offset: u32, triangle: u32) -> bool {
+    if offset == 0u || triangle == 0xffffffffu { return true; }
+    return (srgb[offset + triangle / 32u] & (1u << (triangle % 32u))) != 0u;
+}
+
+fn mask_with_height(layer: Operation, texel: LayerTexel, mask: f32) -> f32 {
+    let contrast = bitcast<f32>(layer.constraints.z);
+    if contrast == 0.0 || mask <= 0.0 || mask >= 1.0 { return mask; }
+    var height = 0.0;
+    if layer.constraints.y != 0u {
+        let height_op = layers[layer.constraints.y - 1u];
+        height = layer_content(height_op, texel, height_op.effects.w).x;
+    }
+    if !(abs(height) <= 3.402823466e38) { return mask; }
+    let offset = bitcast<f32>(layer.constraints.w);
+    return clamp(mask + contrast * 4.0 * mask * (1.0 - mask) * (height + offset), 0.0, 1.0);
+}
+
 fn uv_texel_covered(pixel: vec2<u32>) -> bool {
     let word = uv_coverage[pixel.y * params.coverage.y + pixel.x / 32u];
     return (word & (1u << (pixel.x % 32u))) != 0u;
@@ -1047,8 +1074,13 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     var lobe_values = array<f32, 9>(0.0, 0.5, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.5);
     var last_mask = 0xffffffffu;
     var mask_value = 1.0;
+    var triangle = 0xffffffffu;
+    if covered && (params.coverage.w & GEOMETRY_MASKS) != 0u {
+        triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
+    }
     for (var i = 0u; covered && i < params.program.x; i++) {
         let layer = layers[i];
+        if !geometry_allows(layer.constraints.x, triangle) { continue; }
         let mode = u32(layer.balance.z);
         var weight = layer.low.w;
         if layer.effects.y == 0u {
@@ -1056,7 +1088,7 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         } else {
             if last_mask != layer.effects.x {
                 last_mask = layer.effects.x;
-                mask_value = layer_mask(layer, texel, layer.effects.y);
+                mask_value = mask_with_height(layer, texel, layer_mask(layer, texel, layer.effects.y));
             }
             weight *= mask_value;
         }

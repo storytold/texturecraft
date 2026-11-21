@@ -8,8 +8,8 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat,
-    ProceduralKind, Project, Projection, Source,
+    BakedMap, BlendMode, Channel, ChannelKind, CompareOp, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground,
+    NormalFormat, ProceduralKind, Project, Projection, Source,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
@@ -26,6 +26,7 @@ const LOOKUP_WORDS: u32 = 4096;
 const NO_PAINT_IMAGE: u32 = u32::MAX;
 const BAKED_LIGHTING_OPCODE: u32 = 35;
 const NEIGHBOURHOOD_OPCODE: u32 = 36;
+const COMPARE_OPCODE: u32 = 37;
 const NOOP_EFFECT_OPCODE: u32 = 39;
 const MASK_STAGE: u32 = 1 << 31;
 const GENERATOR_STAGE: u32 = 1 << 30;
@@ -77,6 +78,76 @@ struct Operation {
     procedural: [u32; 4],
     // First content field, content has fields, mask has fields.
     spatial: [u32; 4],
+    // Geometry mask row (resolved to a lookup offset at upload), height operation plus one,
+    // height-mask contrast and offset encoded as floats.
+    constraints: [u32; 4],
+}
+
+#[derive(Debug, Default)]
+struct GeometryMasks {
+    parts: Vec<Vec<String>>,
+    words: Vec<u32>,
+    stride: usize,
+}
+
+impl GeometryMasks {
+    /// Zero allows every part. A passthrough folder restricts every child to its own allowed parts.
+    fn register(&mut self, inherited: u32, own: Option<&[String]>) -> u32 {
+        let Some(own) = own else { return inherited };
+        let mut names = match inherited.checked_sub(1).and_then(|index| self.parts.get(index as usize)) {
+            Some(parent) => own.iter().filter(|name| parent.binary_search(name).is_ok()).cloned().collect(),
+            None => own.to_vec(),
+        };
+        names.sort_unstable();
+        names.dedup();
+        if let Some(index) = self.parts.iter().position(|mask| *mask == names) {
+            return index as u32 + 1;
+        }
+        self.parts.push(names);
+        self.parts.len() as u32
+    }
+
+    fn resolve(&mut self, mesh: &Mesh) {
+        if self.parts.is_empty() {
+            return;
+        }
+        let triangles = mesh.triangle_count();
+        self.stride = triangles.div_ceil(32).max(1);
+        self.words.clear();
+        self.words.resize(self.parts.len() * self.stride, u32::MAX);
+        let parts = &mesh.submeshes;
+        let ordered = parts.windows(2).all(|pair| pair[0].start.saturating_add(pair[0].count) <= pair[1].start);
+        for (names, row) in self.parts.iter().zip(self.words.chunks_exact_mut(self.stride)) {
+            if ordered {
+                for part in parts.iter().filter(|part| names.binary_search(&part.name).is_err()) {
+                    let first = part.start.div_ceil(3) as usize;
+                    let end = (part.start.saturating_add(part.count).div_ceil(3) as usize).min(triangles);
+                    if first >= end {
+                        continue;
+                    }
+                    for (index, word) in row.iter_mut().enumerate().take(end.div_ceil(32)).skip(first / 32) {
+                        let start_bit = first.saturating_sub(index * 32);
+                        let end_bit = (end - index * 32).min(32);
+                        *word &= !((u32::MAX << start_bit) & (u32::MAX >> (32 - end_bit)));
+                    }
+                }
+            } else {
+                // Match the CPU's lookup even for overlapping or out-of-order submeshes.
+                for triangle in 0..triangles {
+                    let first = triangle as u32 * 3;
+                    let holds = |index: usize| parts.get(index).is_some_and(|part| part.start <= first && first < part.start.saturating_add(part.count));
+                    let part = parts
+                        .partition_point(|part| part.start <= first)
+                        .checked_sub(1)
+                        .filter(|index| holds(*index))
+                        .or_else(|| (0..parts.len()).find(|index| holds(*index)));
+                    if part.and_then(|index| parts.get(index)).is_some_and(|part| names.binary_search(&part.name).is_err()) {
+                        row[triangle / 32] &= !(1 << (triangle % 32));
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct ProceduralInputs {
@@ -266,6 +337,7 @@ pub struct CompositeProgram {
     operations: Vec<Operation>,
     layer_count: u32,
     filters: FilterPlan,
+    geometry: GeometryMasks,
     paint: Vec<TileImage>,
     ramp_words: Vec<u32>,
     tile_patterns: TilePatterns,
@@ -352,10 +424,11 @@ impl CompositeProgram {
 
     /// Mesh-space projections and generators share the viewport's surface and bake inputs.
     pub fn set_surface_inputs(&mut self, mesh: &Arc<Mesh>, gbuf: &Arc<UvGBuffer>, baked: Option<&BakedMaps>) -> Result<(), &'static str> {
-        if self.needs_surface {
+        if self.needs_surface || !self.geometry.parts.is_empty() {
             self.surface = Some((mesh.clone(), gbuf.clone()));
         }
-        if self.mask_preview || (!self.filters.stages.is_empty() && self.coverage.is_none()) {
+        self.geometry.resolve(mesh);
+        if self.mask_preview || ((!self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
             self.set_coverage(gbuf.clone(), 0);
         }
         self.baked = baked.map(BakedInputs::new).transpose()?.flatten();
@@ -399,17 +472,16 @@ impl CompositeProgram {
         let mut tile_patterns = TilePatterns::default();
         let mut effects = Vec::new();
         let mut procedural = ProceduralInputs::new(set.resolution);
+        let mut geometry = GeometryMasks::default();
         let mut non_default = [false; Channel::ALL.len()];
         let stencil_pigment = brush.as_ref().is_some_and(|brush| brush.stencil.is_some());
-        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (id, 0)).collect();
-        while let Some((id, depth)) = layers.pop() {
+        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (id, 0, 0)).collect();
+        while let Some((id, depth, inherited_geometry)) = layers.pop() {
             let layer = project.layers.get(&id).ok_or("A layer is missing from the material.")?;
             if !layer.visible {
                 continue;
             }
-            if layer.geometry_mask.is_some() || layer.height_mask.enabled {
-                return Err("A geometry or height mask uses CPU compositing.");
-            }
+            let geometry_mask = geometry.register(inherited_geometry, layer.geometry_mask.as_deref());
             let mask = layer.mask.as_ref().filter(|m| m.enabled);
             if let LayerKind::Group { children, .. } = &layer.kind {
                 if depth >= texturecraft_core::project::MAX_DEPTH
@@ -422,7 +494,7 @@ impl CompositeProgram {
                 {
                     return Err("A masked or modified group uses CPU compositing.");
                 }
-                layers.extend(children.iter().rev().map(|&child| (child, depth + 1)));
+                layers.extend(children.iter().rev().map(|&child| (child, depth + 1, geometry_mask)));
                 continue;
             }
             let mask_start = effects.len() as u32;
@@ -450,6 +522,17 @@ impl CompositeProgram {
                 LiveBrushTarget::Layer { layer, values } if fill.is_none() && *layer == id => Some((values, brush.opacity.clamp(0.0, 1.0))),
                 _ => None,
             });
+            let height = layer.height_mask;
+            let height_params = if height.enabled && mask_count != 0 {
+                if !height.contrast.is_finite() || !height.offset.is_finite() {
+                    return Err("A layer's height mask has invalid parameters.");
+                }
+                [height.contrast.to_bits(), height.offset.to_bits()]
+            } else {
+                [0; 2]
+            };
+            let first_op = operations.len();
+            let mut height_op = 0;
             for &(channel, _) in &set.channels {
                 let Some(blend) = layer.blend(channel) else { continue };
                 if blend.mode == BlendMode::Disable || blend.opacity <= 0.0 {
@@ -511,7 +594,13 @@ impl CompositeProgram {
                 op.balance[1] = mask_background;
                 op.balance[2] = blend_code(blend.mode) as f32;
                 op.effects = [mask_start, mask_count, content_start, content_count];
+                if height_params[0] != 0 && channel == Channel::Height {
+                    height_op = operations.len() as u32 + 1;
+                }
                 operations.push(op);
+            }
+            for op in &mut operations[first_op..] {
+                op.constraints = [geometry_mask, height_op, height_params[0], height_params[1]];
             }
         }
         let mut display_outputs = display_bit(DisplayKind::BaseColor) | display_bit(DisplayKind::Orm);
@@ -525,6 +614,9 @@ impl CompositeProgram {
             }
         }
         let layer_count = operations.len() as u32;
+        if !operations.iter().any(|op| op.constraints[0] != 0) {
+            geometry.parts.clear();
+        }
         operations.extend(effects);
         let filters = FilterPlan::compile(&mut operations, layer_count, &procedural);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
@@ -535,6 +627,7 @@ impl CompositeProgram {
             operations,
             layer_count,
             filters,
+            geometry,
             paint,
             ramp_words: procedural.ramp_words,
             tile_patterns,
@@ -586,6 +679,7 @@ impl CompositeProgram {
             operations,
             layer_count: 1,
             filters,
+            geometry: GeometryMasks::default(),
             paint,
             ramp_words: procedural.ramp_words,
             tile_patterns,
@@ -655,6 +749,17 @@ fn compile_mask(
                 op
             }
             EffectKind::Generator(generator) => generator_operation(generator, procedural, tile_patterns).ok_or("A mask generator uses CPU compositing.")?,
+            EffectKind::Compare { op, value, tolerance } => {
+                if !value.is_finite() || !tolerance.is_finite() {
+                    return Err("A mask comparison has invalid parameters.");
+                }
+                let compare = match op {
+                    CompareOp::LesserThan => 0,
+                    CompareOp::WithinTolerance => 1,
+                    CompareOp::GreaterThan => 2,
+                };
+                Operation { ids: [0, COMPARE_OPCODE, compare, 0], low: [*value, *tolerance, 0.0, 0.0], ..Operation::zeroed() }
+            }
             EffectKind::Filter(Filter::BakedLighting { .. }) => continue,
             _ => point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?,
         };
@@ -1015,7 +1120,7 @@ fn write_input<T: Pod>(queue: &wgpu::Queue, texture: &wgpu::Texture, size: (u32,
 struct SurfaceCache {
     gbuf: Weak<UvGBuffer>,
     view: wgpu::TextureView,
-    vertices: wgpu::Buffer,
+    vertices: Option<wgpu::Buffer>,
 }
 
 struct BakeCache {
@@ -1161,12 +1266,32 @@ impl GpuCompositor {
 
     fn surface_inputs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, program: &CompositeProgram) -> Result<(wgpu::TextureView, wgpu::Buffer), String> {
         let Some((mesh, gbuf)) = &program.surface else {
-            if program.needs_surface {
+            if program.needs_surface || !program.geometry.parts.is_empty() {
                 return Err("Missing UV surface inputs for GPU layer composition".into());
             }
             return Ok((self.default_surface.clone(), self.default_vertices.clone()));
         };
-        self.uv_surface(device, queue, mesh, gbuf)
+        if program.needs_surface {
+            return self.uv_surface(device, queue, mesh, gbuf);
+        }
+
+        // A geometry-only mask needs triangle IDs but no barycentrics or surface vertices.
+        self.release_unused_surfaces();
+        let key = Arc::downgrade(gbuf);
+        if let Some(cache) = self.surfaces.iter().find(|cache| cache.gbuf.ptr_eq(&key)) {
+            return Ok((cache.view.clone(), self.default_vertices.clone()));
+        }
+        let size = (gbuf.width, gbuf.height);
+        if size.0.max(size.1) > device.limits().max_texture_dimension_2d {
+            return Err("UV triangle data exceeds the GPU limits".into());
+        }
+        let texture = input_texture(device, "tc_composite_uv_triangles", size, 1, wgpu::TextureFormat::R32Uint);
+        for (band, triangles) in gbuf.tri.chunks((size.0 * ROWS) as usize).enumerate() {
+            write_input(queue, &texture, (size.0, triangles.len() as u32 / size.0), (band as u32 * ROWS, 0), triangles);
+        }
+        let view = texture.create_view(&Default::default());
+        self.surfaces.push(SurfaceCache { gbuf: key, view: view.clone(), vertices: None });
+        Ok((view, self.default_vertices.clone()))
     }
 
     pub(crate) fn uv_surface(
@@ -1178,14 +1303,17 @@ impl GpuCompositor {
     ) -> Result<(wgpu::TextureView, wgpu::Buffer), String> {
         self.release_unused_surfaces();
         let key = Arc::downgrade(gbuf);
-        if let Some(cache) = self.surfaces.iter().find(|cache| cache.gbuf.ptr_eq(&key)) {
-            return Ok((cache.view.clone(), cache.vertices.clone()));
+        if let Some((view, vertices)) =
+            self.surfaces.iter().find(|cache| cache.gbuf.ptr_eq(&key)).and_then(|cache| cache.vertices.as_ref().map(|vertices| (&cache.view, vertices)))
+        {
+            return Ok((view.clone(), vertices.clone()));
         }
         let limits = device.limits();
         let vertex_bytes = mesh.indices.len() as u64 * 32;
         if gbuf.width.max(gbuf.height) > limits.max_texture_dimension_2d || vertex_bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
             return Err("UV surface data exceeds the GPU limits".into());
         }
+        self.surfaces.retain(|cache| !cache.gbuf.ptr_eq(&key));
         let (lo, hi) = mesh.bounds();
         let center = (lo + hi) * 0.5;
         let radius = ((hi - lo).length() * 0.5).max(1e-4);
@@ -1219,7 +1347,7 @@ impl GpuCompositor {
             write_input(queue, &texture, (gbuf.width, tri.len() as u32 / gbuf.width), (band as u32 * ROWS, 0), &pixels);
         }
         let view = texture.create_view(&Default::default());
-        self.surfaces.push(SurfaceCache { gbuf: key, view: view.clone(), vertices: vertices.clone() });
+        self.surfaces.push(SurfaceCache { gbuf: key, view: view.clone(), vertices: Some(vertices.clone()) });
         Ok((view, vertices))
     }
 
@@ -1431,41 +1559,49 @@ impl GpuCompositor {
         });
         let atlas = self.tile_atlas(device, queue, ts, program)?;
         let tile_images = atlas.map(|atlas| atlas.view.clone());
-        let (operations, lookup) = if program.tile_patterns.is_empty() && program.ramp_words.is_empty() && program.material_images.is_empty() {
-            (Cow::Borrowed(program.operations.as_slice()), self.lookup.clone())
-        } else {
-            let mut words = texturecraft_texel::srgb_lut().map(u32::from).to_vec();
-            words.extend(&program.ramp_words);
-            let offsets = program.tile_patterns.append_words(&mut words, atlas);
-            let mesh = program.surface.as_ref().map(|(mesh, _)| mesh.as_ref());
-            let (images, decals) = program.material_images.append_words(&mut words, atlas, mesh);
-            let limits = device.limits();
-            // The operation stores the offset as an exactly represented float.
-            if ((!offsets.is_empty() || !decals.is_empty()) && words.len() >= 1 << 24)
-                || (words.len() * 4) as u64 > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size)
-            {
-                return Err("Procedural settings exceed the GPU parameter buffer limit.".into());
-            }
-            let mut operations = program.operations.clone();
-            for op in operations.iter_mut().filter(|op| op.ids[1] == TILE_GENERATOR_OPCODE) {
-                let index = op.high[3] as usize;
-                op.high[3] = *offsets.get(index).ok_or("A Tile Generator operation has no settings.")? as f32;
-            }
-            for op in &mut operations {
-                if op.ids[1] == IMAGE_SOURCE_OPCODE {
-                    op.ids[2] = *images.get(op.ids[2] as usize).ok_or("An image source has no binding.")?;
+        let (operations, lookup) =
+            if program.tile_patterns.is_empty() && program.ramp_words.is_empty() && program.geometry.words.is_empty() && program.material_images.is_empty() {
+                (Cow::Borrowed(program.operations.as_slice()), self.lookup.clone())
+            } else {
+                let mut words = texturecraft_texel::srgb_lut().map(u32::from).to_vec();
+                words.extend(&program.ramp_words);
+                let geometry_start = words.len();
+                words.extend(&program.geometry.words);
+                let offsets = program.tile_patterns.append_words(&mut words, atlas);
+                let mesh = program.surface.as_ref().map(|(mesh, _)| mesh.as_ref());
+                let (images, decals) = program.material_images.append_words(&mut words, atlas, mesh);
+                let limits = device.limits();
+                // The operation stores the offset as an exactly represented float.
+                if ((!offsets.is_empty() || !decals.is_empty()) && words.len() >= 1 << 24)
+                    || (words.len() * 4) as u64 > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size)
+                {
+                    return Err("Procedural settings exceed the GPU parameter buffer limit.".into());
                 }
-                if op.procedural[3] == DECAL_PROJECTION {
-                    op.uv[0] = *decals.get(op.uv[0] as usize).ok_or("A decal has no frame.")? as f32;
+                let mut operations = program.operations.clone();
+                for op in operations.iter_mut().filter(|op| op.constraints[0] != 0) {
+                    let row = (op.constraints[0] - 1) as usize;
+                    op.constraints[0] =
+                        u32::try_from(geometry_start + row * program.geometry.stride).map_err(|_| "The GPU geometry mask offset is too large.")?;
                 }
-            }
-            let lookup = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("tc_composite_tile_patterns"),
-                contents: bytemuck::cast_slice(&words),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-            (Cow::Owned(operations), lookup)
-        };
+                for op in operations.iter_mut().filter(|op| op.ids[1] == TILE_GENERATOR_OPCODE) {
+                    let index = op.high[3] as usize;
+                    op.high[3] = *offsets.get(index).ok_or("A Tile Generator operation has no settings.")? as f32;
+                }
+                for op in &mut operations {
+                    if op.ids[1] == IMAGE_SOURCE_OPCODE {
+                        op.ids[2] = *images.get(op.ids[2] as usize).ok_or("An image source has no binding.")?;
+                    }
+                    if op.procedural[3] == DECAL_PROJECTION {
+                        op.uv[0] = *decals.get(op.uv[0] as usize).ok_or("A decal has no frame.")? as f32;
+                    }
+                }
+                let lookup = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tc_composite_tile_patterns"),
+                    contents: bytemuck::cast_slice(&words),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+                (Cow::Owned(operations), lookup)
+            };
         let tile_images = tile_images.as_ref().unwrap_or(&self.default_tile_images);
         let brush_alpha = program.brush_alpha.as_ref().unwrap_or(&self.default_brush_alpha);
         let brush_stencil = program.brush_stencil.as_ref().unwrap_or(&self.default_brush_stencil);
@@ -1542,7 +1678,10 @@ impl GpuCompositor {
                     u32::from(program.coverage.is_some()),
                     source_size.0.div_ceil(32),
                     radius,
-                    u32::from(program.surface.is_some()) | (u32::from(program.baked.is_some()) << 1) | (u32::from(program.brush_stencil.is_some()) << 2),
+                    u32::from(program.needs_surface)
+                        | (u32::from(program.baked.is_some()) << 1)
+                        | (u32::from(program.brush_stencil.is_some()) << 2)
+                        | (u32::from(!program.geometry.words.is_empty()) << 3),
                     window.origin[0],
                     window.origin[1],
                     window.size[0],
@@ -2012,6 +2151,124 @@ mod procedural_tests {
     }
 
     #[test]
+    fn geometry_and_height_masks_with_compare_match_cpu() {
+        use texturecraft_compose::display::tile_bytes;
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
+        use texturecraft_core::HeightMask;
+        use texturecraft_geom::{SubMesh, glam::Vec2};
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = TILE;
+        let channels = [Channel::BaseColor, Channel::Height];
+        let mut mesh = primitives::plane(1.0, 2);
+        for uv in &mut mesh.uvs {
+            *uv = *uv * 0.75 + Vec2::splat(0.125);
+        }
+        let original = mesh.submeshes[0].clone();
+        mesh.submeshes = [("Shared part", 0, 3), ("Folder only", 3, 3), ("Layer only", 6, original.count - 6)]
+            .into_iter()
+            .map(|(name, start, count)| SubMesh { name: name.into(), start, count, ..original.clone() })
+            .collect();
+        let mesh = Arc::new(mesh);
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let [shared, folder_only, layer_only, uncovered] = [0, 1, 2, NO_TRI].map(|id| gbuf.tri.iter().position(|&tri| tri == id).unwrap());
+
+        let mut project = Project::new("Layer mask constraints", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let folder_id = project.alloc_id();
+        let mut folder = Layer::new(folder_id, "Folder", LayerKind::Group { children: Vec::new(), collapsed: false }, &project.texture_sets[0].channel_list());
+        for blend in folder.channels.values_mut() {
+            blend.mode = BlendMode::Passthrough;
+        }
+        folder.geometry_mask = Some(vec!["Shared part".into(), "Folder only".into()]);
+        project.insert_layer(0, folder, None, false).unwrap();
+
+        let owner = project.alloc_id();
+        let comparison = project.alloc_id();
+        let fill = Fill {
+            sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.8, 0.45, 0.1])), (Channel::Height, Source::Uniform([0.35; 3]))]),
+            ..Default::default()
+        };
+        let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
+        layer.height_mask = HeightMask { enabled: true, contrast: 0.9, offset: 0.1 };
+        layer.geometry_mask = Some(vec!["Shared part".into(), "Layer only".into()]);
+        layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.375; 3]), projection: Projection::default() }));
+        let mut compare = Effect::new(comparison, EffectKind::Compare { op: CompareOp::LesserThan, value: 0.5, tolerance: 0.0 });
+        compare.opacity = 0.5;
+        compare.blend = BlendMode::Multiply;
+        mask.effects.push(compare);
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, Some(folder_id), true).unwrap();
+
+        let pixels = PixelStore::default();
+        let baked = BakedMaps::default();
+        let images = ImageStore::default();
+        let cases = [
+            (CompareOp::LesserThan, 0.5, 0.0, true, true),
+            (CompareOp::LesserThan, 0.375, 0.0, false, true),
+            (CompareOp::GreaterThan, 0.25, 0.0, true, true),
+            (CompareOp::GreaterThan, 0.375, 0.0, false, true),
+            (CompareOp::WithinTolerance, 0.25, 0.125, true, true),
+            (CompareOp::WithinTolerance, 0.25, 0.0625, false, true),
+            (CompareOp::WithinTolerance, 0.25, 0.125, true, false),
+        ];
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        let mut red_with_height = 0;
+        for (op, value, tolerance, passes, height_enabled) in cases {
+            let layer = project.layer_mut(owner).unwrap();
+            layer.channels.get_mut(&Channel::Height).unwrap().mode = if height_enabled { BlendMode::Normal } else { BlendMode::Disable };
+            layer.mask.as_mut().unwrap().effects[1].kind = EffectKind::Compare { op, value, tolerance };
+            let inputs = Inputs {
+                project: &project,
+                ts: 0,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked: &baked,
+                block_scales: project.texture_sets[0].block_scales(),
+                preview: None,
+                images: &images,
+                bounds: mesh.bounds(),
+            };
+            let mut oracle = Composite::new(&channels, SIZE);
+            composite_tiles(&inputs, &mut oracle, &[(0, 0)]);
+            let expected = tile_bytes(&oracle, &baked, DisplayKind::BaseColor, 0, 0);
+            let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+            program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+            let texture = gpu.renderer.display_textures()[0][DisplayKind::BaseColor as usize];
+            let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            assert!(actual.iter().zip(&expected).all(|(a, b)| a.abs_diff(*b) <= 1), "material: {op:?} {value} ± {tolerance}, height {height_enabled}");
+            let red = |index| actual[index * 4];
+            assert_eq!(red(folder_only), red(uncovered));
+            assert_eq!(red(layer_only), red(uncovered));
+            assert!(red(shared) < red(uncovered));
+            if passes && height_enabled {
+                red_with_height = red(shared);
+            }
+            if !height_enabled {
+                assert!(red(shared) < red_with_height, "signed height after Invert reduces the mask's effect on red");
+            }
+
+            let expected = mask_image(&inputs, owner, SIZE).unwrap();
+            let mut mask = CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).unwrap();
+            mask.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &mask).unwrap();
+            let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.aux_texture(0).unwrap()).unwrap();
+            assert_eq!(actual.len(), expected.len() * 4);
+            for (&expected, &[r, g, b, a]) in expected.iter().zip(actual.as_chunks::<4>().0) {
+                assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255, "mask: {op:?} {value} ± {tolerance}");
+            }
+            assert_eq!(expected[shared], if passes { 175 } else { 48 });
+            assert_eq!(expected[shared], expected[layer_only]);
+            assert_eq!(expected[uncovered], 0);
+        }
+    }
+
+    #[test]
     fn baked_lighting_uses_the_covered_padding_source_with_or_without_ao() {
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, pad_tiles};
         use texturecraft_compose::tile_bytes;
@@ -2462,6 +2719,7 @@ mod paint_window_tests {
         }
         let program = CompositeProgram {
             filters: FilterPlan::default(),
+            geometry: GeometryMasks::default(),
             operations: Vec::new(),
             layer_count: 0,
             paint: vec![paint],
