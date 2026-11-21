@@ -143,7 +143,14 @@ fn swapping_mask_gray_refreshes_the_last_displayed_dab_and_keeps_its_priority() 
     assert!(session.finished_display_stroke(0, id, revision).unwrap().contains(&tile), "the commit refreshes the last displayed gray");
     assert!(session.caches[0].settle.contains(&tile));
     assert!(session.caches[0].dirty.is_empty() && session.caches[0].upload.is_empty(), "only the settle queue holds the released dab");
-    assert_eq!(session.tile_demand(None).brush, Some(tile));
+    let demand = session.tile_demand(None);
+    assert_eq!(demand.brush, Some(tile));
+    session.caches[0].dirty.insert((0, 0));
+    session.caches[0].chunk = 1;
+    let clock = std::cell::Cell::new(0.0);
+    session.update_for_view(1.0, || clock.replace(clock.get() + 1.0), demand);
+    assert!(session.caches[0].upload.contains(&tile), "the first slice prepares the released dab");
+    assert!(session.caches[0].dirty.contains(&(0, 0)), "unrelated work waits for the brush");
 }
 
 #[test]

@@ -1191,6 +1191,13 @@ impl Session {
         let mut changed = false;
         for ts in order.filter(|&ts| include(ts)) {
             let Some(cache) = self.caches.get_mut(ts) else { continue };
+            if ts == active
+                && budget_ms.is_finite()
+                && let Some(brush) = demand.brush
+                && cache.settle.remove(&brush)
+            {
+                cache.dirty.insert(brush);
+            }
             if Some(ts) == self.cache_previous && cache.dirty.is_empty() && cache.settle.is_empty() && !cache.below.is_empty() {
                 continue;
             }
