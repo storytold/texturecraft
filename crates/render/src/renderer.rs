@@ -1664,7 +1664,13 @@ impl Renderer {
                 })
                 .collect();
             let targets: &[Tex; DisplayKind::ALL.len()] = maps.as_slice().try_into().map_err(|_| "The GPU display textures are missing.")?;
-            compositor.compose((device, queue), program, (ts, set.size, set.shift, program.region), &targets.each_ref().map(|target| &target.texture))?;
+            compositor.compose(
+                (device, queue),
+                program,
+                (ts, set.size, set.shift, program.region),
+                &targets.each_ref().map(|target| &target.texture),
+                &mut submitted,
+            )?;
             maps.extend(set.tex.last().cloned());
             Ok::<_, String>((compositor, maps))
         })

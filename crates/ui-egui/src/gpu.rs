@@ -2172,7 +2172,7 @@ pub(crate) mod tests {
             s.end_stroke().unwrap();
             let committed = s.doc.pixels.masks.values().next().expect("a paint effect must persist the stroke").get(size / 2, size / 2);
             assert!(committed[0] > 0 && committed[1] > 0);
-            let final_pixel = display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, false);
+            let final_pixel = display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, true);
             assert!(final_pixel.iter().zip(gray).all(|(a, b)| a.abs_diff(b) <= 1), "{final_pixel:?} vs {gray:?}");
             if mask_view {
                 // The material display must still compose when leaving the independent mask view.
