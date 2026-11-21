@@ -1364,7 +1364,6 @@ impl GpuCompositor {
             contents: if operations.is_empty() { bytemuck::bytes_of(&empty_operation) } else { bytemuck::cast_slice(operations.as_ref()) },
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let layout = self.pipeline.get_bind_group_layout(0);
         let max_words = MAX_PAINT_WORDS.min((limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / 4) as usize);
         let windows = paint_windows(program, region, source_size, shift, halo, max_words)?;
         let mut packed = Vec::new();
@@ -1659,8 +1658,11 @@ mod procedural_tests {
                 let expected = tile_bytes(&oracle, &baked, DisplayKind::BaseColor, tx, ty);
                 for (y, row) in expected.chunks_exact((TILE * 4) as usize).enumerate() {
                     let start = ((ty * TILE + y as u32) * SIZE * 4 + tx * TILE * 4) as usize;
-                    let largest = full[start..start + row.len()].iter().zip(row).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
-                    assert!(largest <= 2, "{filter:?} material tile ({tx}, {ty}) row {y}: maximum difference {largest}");
+                    let actual = &full[start..start + row.len()];
+                    for (x, (gpu, cpu)) in actual.as_chunks::<4>().0.iter().zip(row.as_chunks::<4>().0).enumerate() {
+                        let largest = gpu.iter().zip(cpu).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+                        assert!(largest <= 2, "{filter:?} material ({}, {}): GPU {gpu:?}, CPU {cpu:?}", tx * TILE + x as u32, ty * TILE + y as u32);
+                    }
                 }
             }
             program.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
