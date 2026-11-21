@@ -1641,7 +1641,7 @@ impl GpuCompositor {
         let default_brush_alpha =
             input_texture(device, "tc_composite_empty_brush_alpha", (1, 1), 1, wgpu::TextureFormat::R16Uint).create_view(&Default::default());
         Self {
-            pipelines: CompositePipelines::new(supports_curvature),
+            pipelines: CompositePipelines::new(supports_curvature, supports_id),
             bindings,
             pipeline_layout,
             filter_gpu: None,

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::{ANCHOR_SOURCE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, TILE_GENERATOR_OPCODE};
+use super::{ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, TILE_GENERATOR_OPCODE};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Features {
@@ -13,6 +13,7 @@ struct Features {
     spatial: bool,
     anchors: bool,
     material_anchors: bool,
+    color_selection: bool,
 }
 
 impl Features {
@@ -24,6 +25,7 @@ impl Features {
         for op in &program.operations {
             let kind = op.ids[1];
             features.anchors |= kind == ANCHOR_SOURCE;
+            features.color_selection |= kind == COLOR_SELECTION_OPCODE;
             features.patterns |= matches!(kind, 1..=9 | 11..=13 | FIRST_EXTENDED_PATTERN..=TILE_GENERATOR_OPCODE);
             features.tile_generator |= kind == TILE_GENERATOR_OPCODE;
             if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&kind) {
@@ -37,7 +39,7 @@ impl Features {
         features
     }
 
-    fn source(self, supports_curvature: bool) -> String {
+    fn source(self, supports_curvature: bool, supports_id: bool) -> String {
         fn include(enabled: bool, full: &'static str, stub: &'static str) -> &'static str {
             if enabled { full } else { stub }
         }
@@ -95,6 +97,11 @@ impl Features {
                 include_str!("shaders/composite_anchors.wgsl"),
                 "fn capture_material_anchor(texel: LayerTexel, end: u32, triangle: u32) -> vec3<f32> { return params.anchor_default.rgb; }",
             ),
+            include(
+                self.color_selection && supports_id,
+                include_str!("shaders/id_sample.wgsl"),
+                "fn id_color_at(pixel: vec2<u32>) -> vec3<f32> { return vec3(0.0); }",
+            ),
             include_str!("shaders/composite_groups.wgsl"),
             include_str!("shaders/composite.wgsl"),
         ]
@@ -121,12 +128,13 @@ struct Variants {
 
 pub(super) struct CompositePipelines {
     supports_curvature: bool,
+    supports_id: bool,
     variants: BTreeMap<Features, Variants>,
 }
 
 impl CompositePipelines {
-    pub(super) fn new(supports_curvature: bool) -> Self {
-        Self { supports_curvature, variants: BTreeMap::new() }
+    pub(super) fn new(supports_curvature: bool, supports_id: bool) -> Self {
+        Self { supports_curvature, supports_id, variants: BTreeMap::new() }
     }
 
     pub(super) fn get(
@@ -137,10 +145,11 @@ impl CompositePipelines {
     ) -> (wgpu::ComputePipeline, Option<wgpu::ComputePipeline>) {
         let features = Features::of(program);
         let supports_curvature = self.supports_curvature;
+        let supports_id = self.supports_id;
         let variants = self.variants.entry(features).or_insert_with(|| Variants {
             module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tc_gpu_composite"),
-                source: wgpu::ShaderSource::Wgsl(features.source(supports_curvature).into()),
+                source: wgpu::ShaderSource::Wgsl(features.source(supports_curvature, supports_id).into()),
             }),
             render: [None, None],
             prepare: [None, None],
