@@ -487,7 +487,7 @@ impl GpuBrushStroke {
             {
                 let mapping = slice.get_mapped_range().map_err(|e| e.to_string())?;
                 let rgba: &[[f32; 4]] = bytemuck::try_cast_slice(&mapping).map_err(|e| e.to_string())?;
-                for (&tile, texels) in chunk.iter().zip(rgba.chunks_exact((TILE * TILE) as usize)) {
+                for (&tile, texels) in chunk.iter().zip(rgba.as_chunks::<{ texturecraft_texel::TILE_AREA }>().0) {
                     samples.insert(tile, texels.to_vec());
                 }
             }
