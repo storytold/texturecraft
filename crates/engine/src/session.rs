@@ -27,6 +27,7 @@ pub const MAX_HISTORY: usize = 200;
 pub struct Document {
     pub project: Project,
     pub pixels: PixelStore,
+    pub(crate) stroke_replays: crate::stroke_replay::StrokeReplays,
     pub baked: BTreeMap<usize, BakedMaps>,
     pub bake_paint: BTreeMap<(usize, texturecraft_core::BakePaintTarget), Arc<texturecraft_bake::BakePaintMap>>,
     /// Imported image resources by name: original file bytes.
@@ -463,7 +464,11 @@ pub(crate) struct ActiveStroke {
     /// None: the stroke edits the quick mask.
     pub target: Option<PaintTarget>,
     pub stroke: Stroke,
+    pub image_alpha: Option<Arc<texturecraft_compose::ImageRes>>,
+    pub library_alpha: Option<Arc<texturecraft_paint::alphas::AlphaImage>>,
     pub canvas: StrokeCanvas,
+    /// Visible scene captured when a 3D stroke started. UV strokes use the full mesh.
+    pub bvh: Arc<Bvh>,
     /// Camera visibility for 3D strokes (None for strokes in the 2D view).
     pub depth: Option<Arc<EyeDepth>>,
     /// 2D view strokes: where the stroke is between samples.
@@ -481,10 +486,8 @@ pub(crate) struct ActiveStroke {
     pub staging: texturecraft_paint::Staging,
     pub device: Option<Box<dyn crate::brush_device::DeviceStroke>>,
     pub device_uv_stamps: Vec<texturecraft_paint::UvStamp>,
+    pub(crate) replay: Option<crate::stroke_replay::PaintPlacement>,
 }
-
-/// A stroke visibility buffer and what it was rendered for: camera, size, mesh id.
-pub(crate) type DepthCache = (OrbitCamera, (u32, u32), u64, Arc<EyeDepth>);
 
 /// History labels that name a layer, a path number or a smart mask: the UI translates the
 /// template and fills the value in (the control channel and `edit.history` keep the English label).
@@ -600,9 +603,8 @@ pub struct Session {
     pub log: crate::log::SessionLog,
     /// Changes when the session and its log are replaced, including mesh reimport.
     pub log_id: u64,
-    /// The last stroke's camera visibility buffer: reused while the camera, view size and mesh
-    /// are unchanged, so back-to-back dabs start instantly.
-    pub(crate) depth_cache: Option<DepthCache>,
+    /// Reuses the visible geometry and camera depth across 3D strokes.
+    pub(crate) stroke_visibility: Option<crate::painting::StrokeVisibility>,
     /// The polygon fill box being dragged
     pub(crate) polygon_fill_drag: Option<crate::polygon_fill_drag::PolygonFillDrag>,
     /// The user's export presets (kept when another project opens).
@@ -673,7 +675,7 @@ impl Session {
             revision: 1,
             log: crate::log::SessionLog::new(),
             log_id: next_mesh_id(),
-            depth_cache: None,
+            stroke_visibility: None,
             polygon_fill_drag: None,
             export_presets: Default::default(),
             brush_presets: Default::default(),
@@ -743,7 +745,14 @@ impl Session {
             project.texture_sets.push(ts);
         }
         let mut s = Session::new(
-            Document { bake_paint: BTreeMap::new(), project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() },
+            Document {
+                bake_paint: BTreeMap::new(),
+                project,
+                pixels: PixelStore::default(),
+                stroke_replays: Default::default(),
+                baked: BTreeMap::new(),
+                resources: BTreeMap::new(),
+            },
             mesh,
             mesh_source,
         )?;
@@ -825,7 +834,14 @@ impl Session {
     /// A change from `before`: a new undo step `label`, or with `merge` part of the previous one when it has the same label
     fn record(&mut self, label: &str, before: Document, merge: bool) {
         self.invalidate_changed(&before);
+        if self.doc.stroke_replays.discard_stale(&self.doc.project, &self.doc.pixels, &self.mesh) {
+            self.note_raster_paint();
+        }
         self.push_step(label, before, merge);
+    }
+
+    pub(crate) fn note_raster_paint(&mut self) {
+        self.log.warn("Paint", "This edit uses raster paint. Affected paint will be resampled when the texture resolution changes.");
     }
 
     /// [`Session::record`] for a change whose tiles the caller already marked for recompositing
@@ -948,7 +964,7 @@ impl Session {
         }
         self.mesh = tiled_mesh(&self.source, &self.doc.project);
         self.mesh_id = next_mesh_id();
-        self.depth_cache = None;
+        self.stroke_visibility = None;
         for ts in changed {
             if let (Some(c), Some(set)) = (self.caches.get_mut(ts), self.doc.project.texture_sets.get(ts)) {
                 *c = SetCache::new(&self.mesh, set);

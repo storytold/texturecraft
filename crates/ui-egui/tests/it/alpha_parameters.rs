@@ -11,7 +11,7 @@ const STARTUP_FRAMES: usize = 4;
 const SETTLE_FRAMES: usize = 3;
 
 fn changed_params() -> AlphaParams {
-    AlphaParams { size_x: 0.5, size_y: 0.25, roundness: 0.2, contrast: 3.0, invert: true }
+    AlphaParams { size_x: 0.5, size_y: 0.25, rotation: 90.0, roundness: 0.2, contrast: 3.0, invert: true }
 }
 
 /// The app showing the Alpha tab of Properties, with `brush`
@@ -54,7 +54,7 @@ fn show_group(harness: &mut Harness<'_, TextureCraftApp>) {
 fn the_group_shows_hardness_and_every_shared_parameter() {
     let harness = app_with_brush(BrushSettings::default());
 
-    for label in ["Parameters", "Hardness", "Size X", "Size Y", "Roundness", "Contrast"] {
+    for label in ["Parameters", "Hardness", "Size X", "Size Y", "Alpha rotation", "Roundness", "Contrast"] {
         assert!(harness.query_by_label(label).is_some(), "{label} is in the Alpha tab");
     }
     assert!(invert_checkbox(&harness).is_some());

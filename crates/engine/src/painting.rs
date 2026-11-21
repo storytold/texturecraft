@@ -2,13 +2,16 @@
 //! and the material picker. The UI, CLI and agents all go through these.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use texturecraft_compose::PaintTarget;
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, Source};
 use texturecraft_geom::glam::Vec2;
+use texturecraft_geom::{Bvh, Mesh, OrbitCamera};
 use texturecraft_paint::{
     CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask, pick,
-    rasterize,
+    pick_filtered, rasterize,
 };
 use texturecraft_texel::{TILE, TILE_AREA};
 
@@ -16,7 +19,8 @@ use crate::brush_device::{BrushTiles, DeviceStroke, DeviceStrokePreview, Project
 use crate::session::{
     ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, ReleasedDab, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
 };
-use crate::uv_stroke_state::UvStrokeState;
+use crate::stroke_replay::{PaintPlacement, RecordedPaint, StrokeReplays, WorldPaint, record_sample};
+use crate::uv_stroke_state::{UV_STAMP_BATCH, UvStrokeState};
 use crate::uv_symmetry::UvMirror;
 use crate::{EngineError, Result};
 
@@ -26,42 +30,100 @@ pub const BRUSH_PATTERN_SIZE: f32 = 0.1;
 /// Brush size floor for the pattern scale
 const MIN_PATTERN_BRUSH_SIZE: f32 = 0.0005;
 
-/// Shortest distance between 2D view stamps, so a stamp with no radius (a pen at zero pressure) can't stall a stroke.
-const MIN_UV_STAMP_STEP: f32 = 1e-5;
-
-/// 2D view stamps rasterized together, bounding the memory of one batch.
-const UV_STAMP_BATCH: usize = 4096;
-
-/// Covers a UV diagonal at the minimum step (about 142k stamps), including light pen pressure, while bounding hostile coordinates
-const MAX_UV_STAMPS_PER_SAMPLE: usize = 150_000;
-
 /// Limit CPU-side storage for projected color to one readback batch.
 const PROJECTION_READBACK_BATCH: usize = 128;
 
-impl Session {
-    /// Camera visibility for a stroke at `viewport` (cached until the camera, size or mesh change).
-    fn eye_depth(&mut self, viewport: Vec2) -> std::sync::Arc<EyeDepth> {
-        let size = ((viewport.x / 2.0).max(64.0) as u32, (viewport.y / 2.0).max(64.0) as u32);
-        if let Some((cam, sz, mesh, depth)) = &self.depth_cache
-            && *cam == self.camera
-            && *sz == size
-            && *mesh == self.mesh_id
-        {
-            return depth.clone();
+/// The view inputs used to classify occlusion when a world-space brush stroke began.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StrokeView {
+    pub(crate) camera: OrbitCamera,
+    pub(crate) size: (u32, u32),
+    hidden_materials: BTreeSet<usize>,
+}
+
+pub(crate) struct StrokeVisibility {
+    mesh_id: u64,
+    view: StrokeView,
+    bvh: Arc<Bvh>,
+    depth: Arc<EyeDepth>,
+}
+
+/// Material lookup in mesh order, with the same first range taking priority as `Mesh::material_of`.
+fn visible_triangle_mask(mesh: &Mesh, hidden_materials: &BTreeSet<usize>) -> Vec<bool> {
+    let mut shown = vec![!hidden_materials.contains(&0); mesh.triangle_count()];
+    for submesh in mesh.submeshes.iter().rev() {
+        let start = submesh.start.div_ceil(3) as usize;
+        let end = (submesh.start.saturating_add(submesh.count).div_ceil(3) as usize).min(shown.len());
+        if let Some(range) = shown.get_mut(start..end) {
+            range.fill(!hidden_materials.contains(&submesh.material));
         }
-        let depth = std::sync::Arc::new(EyeDepth::render(&self.mesh, &self.camera, size.0, size.1));
-        self.depth_cache = Some((self.camera, size, self.mesh_id, depth.clone()));
-        depth
+    }
+    shown
+}
+
+impl StrokeView {
+    fn capture(camera: OrbitCamera, viewport: Vec2, sets: &[texturecraft_core::TextureSet]) -> Self {
+        let size = ((viewport.x / 2.0).max(64.0) as u32, (viewport.y / 2.0).max(64.0) as u32);
+        let mut hidden_materials = BTreeSet::new();
+        // The viewport uses the last texture set mapped to each mesh material.
+        for set in sets {
+            if set.visible {
+                hidden_materials.remove(&set.material);
+            } else {
+                hidden_materials.insert(set.material);
+            }
+        }
+        Self { camera, size, hidden_materials }
+    }
+
+    /// Identical triangle selection for cursor rays, exact occlusion and camera depth.
+    pub(crate) fn visibility(&self, mesh: &Mesh, full_bvh: &Arc<Bvh>, previous: Option<(&Self, &Arc<Bvh>)>) -> (Arc<Bvh>, EyeDepth) {
+        let (width, height) = self.size;
+        if self.hidden_materials.is_empty() {
+            (full_bvh.clone(), EyeDepth::render(mesh, &self.camera, width, height))
+        } else {
+            let shown = visible_triangle_mask(mesh, &self.hidden_materials);
+            let include = |triangle| shown.get(triangle).copied().unwrap_or(false);
+            let existing = previous.filter(|(view, _)| self.hidden_materials == view.hidden_materials);
+            let bvh = existing.map_or_else(|| Arc::new(Bvh::new_filtered(mesh, include)), |(_, bvh)| bvh.clone());
+            (bvh, EyeDepth::render_filtered(mesh, &self.camera, width, height, include))
+        }
+    }
+
+    pub(crate) fn hidden_count(&self) -> usize {
+        self.hidden_materials.len()
+    }
+}
+
+impl Session {
+    fn stroke_visibility(&mut self, viewport: Vec2) -> (Arc<Bvh>, Arc<EyeDepth>) {
+        let view = StrokeView::capture(self.camera, viewport, &self.doc.project.texture_sets);
+        let cached = self.stroke_visibility.as_ref().filter(|scene| scene.mesh_id == self.mesh_id);
+        if let Some(scene) = cached.filter(|scene| scene.view == view) {
+            return (scene.bvh.clone(), scene.depth.clone());
+        }
+        let (bvh, depth) = view.visibility(&self.mesh, &self.bvh, cached.map(|scene| (&scene.view, &scene.bvh)));
+        let depth = Arc::new(depth);
+        self.stroke_visibility = Some(StrokeVisibility { mesh_id: self.mesh_id, view, bvh: bvh.clone(), depth: depth.clone() });
+        (bvh, depth)
     }
 
     pub fn pick(&self, screen: Vec2, viewport: Vec2) -> Option<SurfaceHit> {
         let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &self.camera, viewport };
-        pick(&ctx, screen)
+        let sets = &self.doc.project.texture_sets;
+        if sets.iter().all(|set| set.visible) {
+            pick(&ctx, screen)
+        } else {
+            pick_filtered(&ctx, screen, &|triangle| {
+                let material = self.mesh.material_of(triangle as usize).unwrap_or(0);
+                sets.iter().rfind(|set| set.material == material).is_none_or(|set| set.visible)
+            })
+        }
     }
 
     /// The texture set that paints mesh material `material` (a [`SurfaceHit::material`])
     pub fn texture_set_of_material(&self, material: usize) -> Option<usize> {
-        self.doc.project.texture_sets.iter().position(|t| t.material == material)
+        self.doc.project.texture_sets.iter().rposition(|t| t.material == material)
     }
 
     /// The texture set of the surface under viewport pixel `screen`
@@ -270,9 +332,14 @@ impl Session {
             return Err(EngineError::Other(msg.into()));
         }
 
-        let depth = (!uv_mode).then(|| self.eye_depth(viewport));
+        let (bvh, depth) = if uv_mode {
+            (self.bvh.clone(), None)
+        } else {
+            let (bvh, depth) = self.stroke_visibility(viewport);
+            (bvh, Some(depth))
+        };
         let stroke = Stroke::new(&self.tool.brush, &self.mesh);
-        let mut canvas = StrokeCanvas::new(size.0, size.1);
+        let mut canvas = StrokeCanvas::new(size.0, size.1).with_stamp_blending(stroke.settings.stamp_blending);
         if !quick_mask {
             canvas.limit = self.stroke_limit(ts, size);
         }
@@ -330,12 +397,29 @@ impl Session {
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
         let settings = &stroke.settings;
+        let image_alpha = settings.alpha_image.as_ref().and_then(|name| self.images.get(name)).cloned();
+        let library_alpha = if image_alpha.is_none() { settings.library_alpha_image() } else { None };
+        let can_record = matches!(tool, Tool::Paint | Tool::Eraser)
+            && stencil.is_none()
+            && canvas.limit.is_none()
+            && canvas.pickup.is_none()
+            && !settings.symmetry.any()
+            && settings.alpha_image.is_none()
+            && target.is_some_and(|target| StrokeReplays::can_record(&self.doc.project, target, ts));
+        let replay = if !can_record {
+            None
+        } else if uv_mode {
+            Some(PaintPlacement::Uv { samples: Vec::new() })
+        } else {
+            self.stroke_visibility
+                .as_ref()
+                .zip(self.doc.project.texture_sets.get(ts))
+                .map(|(scene, set)| PaintPlacement::World { world: WorldPaint { view: scene.view.clone(), dabs: Vec::new(), material: set.material } })
+        };
         let gpu_tool = tool == Tool::Paint || (quick_mask && erase) || (tool == Tool::Projection && !uv_mode && stencil.is_some());
         let device = if gpu_tool
             && canvas.pickup.is_none()
             && !settings.symmetry.any()
-            && settings.alpha_image.is_none()
-            && settings.alpha_library.is_none()
             && let Some(backend) = &self.brush_device
             && let Some(cache) = self.caches.get(ts)
             && backend.surface.ptr_eq(&std::sync::Arc::downgrade(&cache.gbuf))
@@ -348,11 +432,12 @@ impl Session {
             }) {
             let surface = crate::brush_device::BrushSurface {
                 mesh: self.mesh.clone(),
-                bvh: self.bvh.clone(),
+                bvh: bvh.clone(),
                 uv: cache.gbuf.clone(),
                 material: self.doc.project.texture_set(ts)?.material,
                 depth: depth.clone(),
                 settings: settings.clone(),
+                alpha_image: image_alpha.clone(),
                 stencil: stencil.clone(),
                 limit: canvas.limit.clone(),
             };
@@ -377,7 +462,10 @@ impl Session {
             ts,
             target,
             stroke,
+            image_alpha,
+            library_alpha,
             canvas,
+            bvh,
             depth,
             uv: uv_mode.then(UvStrokeState::default),
             camera: self.camera,
@@ -390,6 +478,7 @@ impl Session {
             staging: Staging::default(),
             device,
             device_uv_stamps: Vec::new(),
+            replay,
         });
         Ok(())
     }
@@ -422,18 +511,6 @@ impl Session {
                 Ok(Some((PickupMode::Clone { offset: [0; 2] }, offset)))
             }
             _ => Ok(None),
-        }
-    }
-
-    /// The brush shape: the alpha image when one is set and loaded, else the library alpha when
-    /// one is set, else the procedural alpha.
-    fn shape<'a>(images: &'a texturecraft_compose::ImageStore, b: &texturecraft_paint::BrushSettings) -> Shape<'a> {
-        Shape {
-            alpha: b.alpha,
-            image: b.alpha_image.as_ref().and_then(|n| images.get(n)).map(|i| &**i),
-            library: b.alpha_library.as_deref().and_then(texturecraft_paint::alphas::find).map(|a| a.image()),
-            params: b.alpha_params,
-            level: 0,
         }
     }
 
@@ -490,55 +567,27 @@ impl Session {
         let Some(active) = self.stroke.as_mut() else { return };
         let Some(progress) = active.uv.as_mut() else { return };
         let Some(cache) = self.caches.get_mut(active.ts) else { return };
+        record_sample(&mut active.replay, uv, pressure);
 
         let settings = &active.stroke.settings;
-        let radius = settings.uv_stamp_radius(pressure);
-        let step = (settings.spacing * 2.0 * radius).max(MIN_UV_STAMP_STEP);
-
-        // Follow path: turn the stamp with the stroke direction (y up on screen, v grows down)
-        let angle = match progress.last {
-            Some(previous) if settings.follow_path && uv != previous => settings.angle + (previous.y - uv.y).atan2(uv.x - previous.x).to_degrees() - 90.0,
-            _ => settings.angle,
-        };
-
-        // The first sample is one stamp; a later one stamps every `step` along the segment from the previous
-        let (start, segment, mut distance) = match progress.last.replace(uv) {
-            None => (uv, Vec2::ZERO, 0.0),
-
-            // Pressure can shrink the step below the carry from the preceding sample
-            Some(previous) => (previous, uv - previous, (step - progress.carry).max(0.0)),
-        };
-        let length = segment.length();
-        let shape = Self::shape(&self.images, settings);
+        let shape = Shape::new(settings.alpha, active.image_alpha.as_deref(), active.library_alpha.as_deref(), settings.alpha_params);
 
         // The copies of each dab: the Clone tool's pickup offset is fixed, so it paints none
         let material = self.doc.project.texture_sets.get(active.ts).map(|t| t.material).unwrap_or(0);
         let mirror = (self.tool.tool != Tool::Clone)
             .then(|| UvMirror::new(&settings.symmetry, active.stroke.center(), &self.mesh, &self.bvh, &cache.gbuf, material))
             .flatten();
-        let mut batch = Vec::new();
-        let mut stamped = 0;
-        while distance <= length && stamped < MAX_UV_STAMPS_PER_SAMPLE {
-            let batch_size = UV_STAMP_BATCH.min(MAX_UV_STAMPS_PER_SAMPLE - stamped);
-            batch.clear();
-            while distance <= length && batch.len() < batch_size {
-                let center = start + segment * (distance / length.max(f32::MIN_POSITIVE));
-                let seed = progress.stamps.wrapping_add((stamped + batch.len()) as u32);
-                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow: settings.flow, hardness: settings.hardness, seed, source: None });
-                distance += step;
-            }
-
-            stamped += batch.len();
+        progress.sample(settings, uv, pressure, |batch| {
             if let Some(mirror) = &mirror {
                 for index in 0..batch.len() {
                     if let Some(stamp) = batch.get(index).copied() {
-                        mirror.add_copies(&stamp, &mut batch);
+                        mirror.add_copies(&stamp, batch);
                     }
                 }
             }
             if let Some(device) = &mut active.device {
-                active.device_uv_stamps.extend(&batch);
-                match device.append_uv(&batch) {
+                active.device_uv_stamps.extend(batch.iter().copied());
+                match device.append_uv(batch) {
                     Ok(tiles) => {
                         active.display_tiles.extend(&tiles);
                         active.canvas.dirty.extend(tiles);
@@ -553,13 +602,9 @@ impl Session {
                     }
                 }
             } else {
-                texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, &batch);
+                texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, batch);
             }
-        }
-
-        // At most one step, so a segment cut off at the stamp limit can't push the next one's stamps backwards
-        progress.carry = (length - (distance - step)).min(step);
-        progress.stamps = progress.stamps.wrapping_add(stamped as u32);
+        });
         self.stroke_painted();
     }
 
@@ -568,7 +613,7 @@ impl Session {
         let Some(st) = self.stroke.as_mut() else { return false };
         let Some(cache) = self.caches.get_mut(st.ts) else { return false };
         let material = self.doc.project.texture_sets.get(st.ts).map(|t| t.material).unwrap_or(0);
-        let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &st.camera, viewport: st.viewport };
+        let ctx = PickCtx { mesh: &self.mesh, bvh: &st.bvh, camera: &st.camera, viewport: st.viewport };
         let stamps = st.stroke.add(&ctx, screen, pressure);
         let hit = st.stroke.last_hit().is_some();
         if stamps.is_empty() {
@@ -576,14 +621,14 @@ impl Session {
         }
         let rctx = RasterCtx {
             mesh: &self.mesh,
-            bvh: &self.bvh,
+            bvh: &st.bvh,
             gbuf: &cache.gbuf,
             material,
             depth: st.depth.as_deref(),
             eye: st.camera.eye(),
             backface_culling: st.stroke.settings.backface_culling,
             angle_fade: st.stroke.settings.angle_fade,
-            shape: Self::shape(&self.images, &st.stroke.settings),
+            shape: Shape::new(st.stroke.settings.alpha, st.image_alpha.as_deref(), st.library_alpha.as_deref(), st.stroke.settings.alpha_params),
         };
         if let Some(device) = &mut st.device {
             match device.append_world(&stamps) {
@@ -675,7 +720,8 @@ impl Session {
                 stroke.display_tiles.append(&mut stroke.canvas.dirty);
                 self.log.performance(format!("GPU stroke readback failed, replaying stroke on CPU: {error}"));
                 let cache = self.caches.get(stroke.ts)?;
-                let shape = Self::shape(&self.images, &stroke.stroke.settings);
+                let settings = &stroke.stroke.settings;
+                let shape = Shape::new(settings.alpha, stroke.image_alpha.as_deref(), stroke.library_alpha.as_deref(), settings.alpha_params);
                 if stroke.uv.is_some() {
                     for stamps in stroke.device_uv_stamps.chunks(UV_STAMP_BATCH) {
                         texturecraft_paint::rasterize_uv(&mut stroke.canvas, &cache.gbuf, shape, stamps);
@@ -683,7 +729,7 @@ impl Session {
                 } else {
                     let context = RasterCtx {
                         mesh: &self.mesh,
-                        bvh: &self.bvh,
+                        bvh: &stroke.bvh,
                         gbuf: &cache.gbuf,
                         material: self.doc.project.texture_sets.get(stroke.ts).map_or(0, |set| set.material),
                         depth: stroke.depth.as_deref(),
@@ -815,6 +861,16 @@ impl Session {
             }
         } else {
             commit(&st.canvas.dirty, None);
+        }
+        let operation = st.replay.take().map(|mut placement| {
+            if let PaintPlacement::World { world } = &mut placement {
+                world.dabs = std::mem::take(&mut st.stroke.stamps);
+            }
+            RecordedPaint { settings: st.stroke.settings.clone(), placement, values: st.values.clone(), mask_value, erase: st.erase }
+        });
+        let material = self.doc.project.texture_sets.get(st.ts).map_or(0, |set| set.material);
+        if self.doc.stroke_replays.commit(target, operation, &st.before.pixels, &self.doc.pixels, &self.mesh, material) {
+            self.note_raster_paint();
         }
         if matches!(target, PaintTarget::Mask(_)) && st.displayed_mask_value != mask_value {
             st.display_tiles.extend(&st.canvas.dirty);

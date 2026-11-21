@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use texturecraft_compose::{PaintTarget, Stencil};
+use texturecraft_compose::{ImageRes, PaintTarget, Stencil};
 use texturecraft_core::Channel;
 use texturecraft_geom::{Bvh, Mesh, UvGBuffer};
 use texturecraft_paint::{BrushSettings, EyeDepth, Stamp, UvStamp};
@@ -28,6 +28,7 @@ pub struct BrushSurface {
     pub material: usize,
     pub depth: Option<Arc<EyeDepth>>,
     pub settings: BrushSettings,
+    pub alpha_image: Option<Arc<ImageRes>>,
     pub stencil: Option<Stencil>,
     pub limit: Option<(TileImage, bool)>,
 }

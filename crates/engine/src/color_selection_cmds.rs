@@ -3,7 +3,6 @@
 use serde_json::{Value, json};
 use texturecraft_core::{BakedMap, EffectKind, LayerId};
 use texturecraft_geom::glam::Vec2;
-use texturecraft_geom::surface_at;
 
 use crate::commands::{CommandSpec, bad, f32p, has_layer};
 use crate::mask_cmds::effect_id;
@@ -107,12 +106,11 @@ fn id_color_at(session: &Session, params: &Value, owner: LayerId) -> Result<[f32
                 return Err(bad(CMD, "give `x` and `y` (viewport pixels) or `uv`"));
             };
 
-            let (uv, material) = visible_surface(session, Vec2::new(x, y), viewport_of(session, params))
-                .ok_or_else(|| bad(CMD, "nothing under that point: pick on the mesh"))?;
-            if material != set.material {
+            let hit = session.pick(Vec2::new(x, y), viewport_of(session, params)).ok_or_else(|| bad(CMD, "nothing under that point: pick on the mesh"))?;
+            if hit.material != set.material {
                 return Err(bad(CMD, "that surface belongs to another texture set"));
             }
-            uv
+            hit.uv
         }
     };
 
@@ -123,22 +121,6 @@ fn id_color_at(session: &Session, params: &Value, owner: LayerId) -> Result<[f32
         return Err(bad(CMD, "that point is outside the texture set's UV space"));
     }
     baked.sample_working(BakedMap::Id, texel[0] as u32, texel[1] as u32, size, &set.block_scales()).ok_or_else(|| bad(CMD, "no ID color there"))
-}
-
-/// The UV and mesh material under viewport pixel `screen`; hidden texture sets don't stop the ray
-fn visible_surface(session: &Session, screen: Vec2, viewport: Vec2) -> Option<(Vec2, usize)> {
-    let viewport = viewport.max(Vec2::ONE);
-    let device = Vec2::new(screen.x / viewport.x * 2.0 - 1.0, 1.0 - screen.y / viewport.y * 2.0);
-    let ray = session.camera.ray(device, viewport.x / viewport.y);
-    let sets = &session.doc.project.texture_sets;
-    let visible = |triangle: u32| {
-        let material = session.mesh.material_of(triangle as usize).unwrap_or(0);
-        sets.iter().find(|set| set.material == material).is_none_or(|set| set.visible)
-    };
-
-    let hit = session.bvh.closest_filtered(ray.origin, ray.dir, f32::MAX, &visible)?;
-    let surface = surface_at(&session.mesh, hit.tri, hit.u, hit.v)?;
-    Some((surface.uv, session.mesh.material_of(hit.tri as usize).unwrap_or(0)))
 }
 
 /// A `[u, v]` param of finite numbers

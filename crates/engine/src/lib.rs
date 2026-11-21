@@ -54,6 +54,7 @@ mod polygon_fill;
 mod polygon_fill_drag;
 mod polygon_fill_mirror;
 mod stencil_look;
+mod stroke_replay;
 // Mesh reimport reads files on native targets only
 mod display_padding;
 #[cfg(not(target_arch = "wasm32"))]

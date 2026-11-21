@@ -214,10 +214,16 @@ impl Session {
         let source = pf.mesh.clone();
         let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
         let mesh_time = Instant::now();
-        let mut s =
-            Session::new(Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources }, mesh, source)?;
+        let mut s = Session::new(
+            Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, stroke_replays: Default::default(), baked: pf.baked, resources },
+            mesh,
+            source,
+        )?;
 
         let cache_time = Instant::now();
+        let (stroke_replays, ignored_replays) =
+            pf.stroke_replay.as_ref().map(|data| crate::stroke_replay::StrokeReplays::load(data, &s.doc.project, &s.doc.pixels, &s.mesh)).unwrap_or_default();
+        s.doc.stroke_replays = stroke_replays;
         s.sync_images();
         s.load_bake_meshes(pf.high_poly, pf.cage);
         s.load_bake_paint(pf.bake_paint);
@@ -229,6 +235,9 @@ impl Session {
             s.caches.len()
         ));
         s.log.warnings("Project", pf.warnings);
+        if ignored_replays {
+            s.log.warn("Project", "Some saved stroke operations could not be restored. The affected paint is available as raster pixels.");
+        }
 
         Ok(s)
     }
@@ -262,9 +271,11 @@ impl Session {
         pixels.masks.retain(|id, img| size_of(*id) == Some((img.width(), img.height())));
 
         let (high_poly, cage) = self.saved_bake_meshes();
+        let stroke_replay = self.doc.stroke_replays.archive(&self.doc.project, &pixels, &self.mesh);
         ProjectFile {
             project: self.doc.project.clone(),
             pixels,
+            stroke_replay,
             baked: self.doc.baked.clone(),
             mesh: self.mesh_source.clone(),
             high_poly,
@@ -650,6 +661,9 @@ impl Session {
         next.modified = true;
         next.project_id = self.project_id;
         let preserved = preserve_strokes.then(|| crate::preserve::preserve_strokes(self, &mut next));
+        if next.doc.stroke_replays.discard_stale(&next.doc.project, &next.doc.pixels, &next.mesh) {
+            next.note_raster_paint();
+        }
         self.switch_to(next);
         Ok(preserved.map_or(Value::Null, |n| json!({ "preserved": n })))
     }

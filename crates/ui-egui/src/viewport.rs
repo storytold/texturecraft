@@ -2100,11 +2100,11 @@ fn cursor_is_circle(brush: &texturecraft_engine::paint::BrushSettings) -> bool {
 
 /// The stamp's outline scaled by `scale` (the hardness ring's share of the radius), as points around the
 /// stamp center in a y-up frame in units of the stamp radius: the alpha's extent (Size X and Y), the
-/// squarer corners of a Round alpha with low roundness, then turned by the brush angle.
+/// squarer corners of a Round alpha with low roundness, then turned by the brush and alpha angles.
 fn cursor_outline(brush: &texturecraft_engine::paint::BrushSettings, scale: f32) -> Vec<Vec2> {
     let params = brush.alpha_params;
     let roundness = cursor_roundness(brush);
-    let (sin, cos) = brush.angle.to_radians().sin_cos();
+    let (sin, cos) = (brush.angle + params.rotation).to_radians().sin_cos();
     (0..=CURSOR_OUTLINE_SEGMENTS)
         .map(|segment| {
             let angle = segment as f32 / CURSOR_OUTLINE_SEGMENTS as f32 * std::f32::consts::TAU;

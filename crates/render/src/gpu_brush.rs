@@ -9,7 +9,7 @@ use texturecraft_geom::{
     Bvh, Mesh, UvGBuffer,
     glam::{Mat4, Vec2},
 };
-use texturecraft_paint::{BrushAlpha, BrushSettings, EyeDepth, Stamp, UvStamp};
+use texturecraft_paint::{BrushAlpha, BrushSettings, EyeDepth, Stamp, UvStamp, alphas::AlphaImage};
 use texturecraft_texel::{TILE, TileImage};
 use wgpu::util::DeviceExt;
 
@@ -21,6 +21,8 @@ type ProjectedTiles = BTreeMap<(u32, u32), Vec<[f32; 4]>>;
 const ROW_BYTES: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 const TILE_BYTES: u64 = (ROW_BYTES * TILE) as u64;
 const CHUNK: usize = 256;
+const LIBRARY_ALPHA_KIND: u32 = 7;
+const IMAGE_ALPHA_KIND: u32 = 8;
 const PROJECTION_TILE_BYTES: u64 = (TILE * TILE) as u64 * size_of::<[f32; 4]>() as u64;
 const PROJECTION_READBACK_TILES: usize = 64;
 
@@ -31,6 +33,7 @@ pub struct BrushInput {
     pub material: usize,
     pub depth: Option<Arc<EyeDepth>>,
     pub settings: BrushSettings,
+    pub alpha_image: Option<Arc<ImageRes>>,
     pub stencil: Option<Stencil>,
     pub limit: Option<(TileImage, bool)>,
 }
@@ -44,7 +47,10 @@ struct Parameters {
     mesh: [f32; 4],
     ortho: [f32; 4],
     shape: [f32; 4],
+    alpha_rotation: [f32; 4],
     flags: [u32; 4],
+    stamp_blending: u32,
+    padding: [u32; 3],
 }
 
 #[repr(C)]
@@ -71,6 +77,9 @@ pub(crate) struct BrushPipeline {
     rays: Option<(Weak<Bvh>, wgpu::Buffer, wgpu::Buffer)>,
     depth: Option<(Weak<EyeDepth>, wgpu::TextureView)>,
     stencil_image: Option<(Weak<ImageRes>, wgpu::TextureView)>,
+    library_tip: Option<(Weak<AlphaImage>, wgpu::TextureView)>,
+    image_tip: Option<(Weak<ImageRes>, wgpu::TextureView)>,
+    blank_tip: wgpu::TextureView,
     projection_readback: Option<wgpu::ComputePipeline>,
 }
 
@@ -99,26 +108,30 @@ impl BrushPipeline {
                 storage(7, true),
                 storage(8, true),
                 storage(9, false),
+                texture_entry(10, wgpu::TextureSampleType::Float { filterable: false }),
             ],
         });
         let layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("tc_brush"), bind_group_layouts: &[Some(&inputs)], immediate_size: 0 });
         let source = concat!(include_str!("shaders/rays.wgsl"), "\n", include_str!("shaders/noise.wgsl"), "\n", include_str!("shaders/brush.wgsl"));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc_brush"), source: wgpu::ShaderSource::Wgsl(source.into()) });
-        Self { shader, layout, pipelines: BTreeMap::new(), rays: None, depth: None, stencil_image: None, projection_readback: None }
+        let blank_tip = texture(device, [1, 1], wgpu::TextureFormat::R32Float).create_view(&Default::default());
+        Self {
+            shader,
+            layout,
+            pipelines: BTreeMap::new(),
+            rays: None,
+            depth: None,
+            stencil_image: None,
+            library_tip: None,
+            image_tip: None,
+            blank_tip,
+            projection_readback: None,
+        }
     }
 
-    fn pipeline(&mut self, device: &wgpu::Device, alpha: BrushAlpha) -> wgpu::ComputePipeline {
+    fn pipeline(&mut self, device: &wgpu::Device, alpha_kind: u32) -> wgpu::ComputePipeline {
         // Specialize by shape so the simple brushes keep their smaller GPU kernels.
-        let alpha_kind = match alpha {
-            BrushAlpha::Round => 0,
-            BrushAlpha::Square => 1,
-            BrushAlpha::Spray => 2,
-            BrushAlpha::Grunge => 3,
-            BrushAlpha::Cloud => 4,
-            BrushAlpha::Star => 5,
-            BrushAlpha::Streaks => 6,
-        };
         self.pipelines
             .entry(alpha_kind)
             .or_insert_with(|| {
@@ -132,6 +145,61 @@ impl BrushPipeline {
                 })
             })
             .clone()
+    }
+
+    fn library_tip(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, alpha: &Arc<AlphaImage>) -> wgpu::TextureView {
+        let key = Arc::downgrade(alpha);
+        if let Some((previous, view)) = &self.library_tip
+            && previous.ptr_eq(&key)
+        {
+            return view.clone();
+        }
+        let base = texturecraft_paint::alphas::BASE as u32;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tc_brush_library_tip"),
+            size: extent(base, base),
+            mip_level_count: alpha.levels() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, (side, pixels)) in alpha.mip_pixels().enumerate() {
+            let destination = wgpu::TexelCopyTextureInfo { mip_level: level as u32, ..texture.as_image_copy() };
+            let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(side * size_of::<f32>() as u32), rows_per_image: None };
+            queue.write_texture(destination, bytemuck::cast_slice(pixels), layout, extent(side, side));
+        }
+        let view = texture.create_view(&Default::default());
+        self.library_tip = Some((key, view.clone()));
+        view
+    }
+
+    fn brush_tip(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, input: &BrushInput) -> Result<(wgpu::TextureView, u32), String> {
+        if let Some(image) = &input.alpha_image {
+            let key = Arc::downgrade(image);
+            if let Some((previous, view)) = &self.image_tip
+                && previous.ptr_eq(&key)
+            {
+                return Ok((view.clone(), IMAGE_ALPHA_KIND));
+            }
+            let view = gpu_stencil::upload_image(device, queue, image).map_err(|_| "The brush alpha exceeds the adapter's texture layout limits.")?;
+            self.image_tip = Some((key, view.clone()));
+            return Ok((view, IMAGE_ALPHA_KIND));
+        }
+        if let Some(alpha) = input.settings.library_alpha_image() {
+            return Ok((self.library_tip(device, queue, &alpha), LIBRARY_ALPHA_KIND));
+        }
+        let kind = match input.settings.alpha {
+            BrushAlpha::Round => 0,
+            BrushAlpha::Square => 1,
+            BrushAlpha::Spray => 2,
+            BrushAlpha::Grunge => 3,
+            BrushAlpha::Cloud => 4,
+            BrushAlpha::Star => 5,
+            BrushAlpha::Streaks => 6,
+        };
+        Ok((self.blank_tip.clone(), kind))
     }
 
     fn visibility(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, input: &BrushInput) -> Result<Visibility, String> {
@@ -185,6 +253,8 @@ impl BrushPipeline {
         let center = (lo + hi) * 0.5;
         let radius = (hi - lo).length().mul_add(0.5, 0.0).max(1e-4);
         self.stencil_image.take_if(|(source, _)| source.strong_count() == 0);
+        self.image_tip.take_if(|(source, _)| source.strong_count() == 0);
+        self.library_tip.take_if(|(source, _)| source.strong_count() == 0);
         let projection = if let Some(stencil) = &input.stencil {
             let key = Arc::downgrade(&stencil.image);
             if self.stencil_image.as_ref().is_none_or(|(previous, _)| !previous.ptr_eq(&key)) {
@@ -199,7 +269,9 @@ impl BrushPipeline {
             None
         };
         let settings = &input.settings;
-        let pipeline = self.pipeline(device, settings.alpha);
+        let (tip, kind) = self.brush_tip(device, queue, &input)?;
+        let pipeline = self.pipeline(device, kind);
+        let (sin, cos) = settings.alpha_params.rotation.to_radians().sin_cos();
         let mut params = Parameters {
             camera: Mat4::IDENTITY.to_cols_array_2d(),
             eye: [0.0; 4],
@@ -207,12 +279,15 @@ impl BrushPipeline {
             mesh: center.extend(radius).to_array(),
             ortho: [0.0; 4],
             shape: [settings.alpha_params.size_x, settings.alpha_params.size_y, settings.alpha_params.roundness, settings.alpha_params.contrast],
+            alpha_rotation: [sin, cos, 0.0, 0.0],
             flags: [
                 0,
                 u32::from(settings.backface_culling),
                 u32::from(settings.alpha_params.invert),
                 input.limit.as_ref().map_or(0, |(_, invert)| 1 + u32::from(*invert)),
             ],
+            stamp_blending: settings.stamp_blending as u32,
+            padding: [0; 3],
         };
         if let Some(depth) = &input.depth {
             params.camera = depth.view_proj.to_cols_array_2d();
@@ -232,6 +307,7 @@ impl BrushPipeline {
             visibility,
             alpha,
             view,
+            tip,
             params,
             scratch: None,
             projection,
@@ -248,6 +324,7 @@ pub struct GpuBrushStroke {
     visibility: Visibility,
     alpha: wgpu::Texture,
     view: wgpu::TextureView,
+    tip: wgpu::TextureView,
     params: Parameters,
     scratch: Option<wgpu::Buffer>,
     projection: Option<(GpuStencil, wgpu::ComputePipeline)>,
@@ -378,6 +455,7 @@ impl GpuBrushStroke {
                         wgpu::BindGroupEntry { binding: 7, resource: dabs.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 8, resource: cells.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 9, resource: scratch.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&self.tip) },
                     ],
                 });
                 {
@@ -600,7 +678,7 @@ mod tests {
     use super::*;
     use crate::headless::Headless;
     use texturecraft_geom::{OrbitCamera, glam::Vec3, primitives};
-    use texturecraft_paint::{RasterCtx, Shape, StrokeCanvas, rasterize, rasterize_uv};
+    use texturecraft_paint::{RasterCtx, Shape, StampBlending, StrokeCanvas, rasterize, rasterize_uv};
 
     #[test]
     fn gpu_projection_readback_matches_screen_stencil_sampling() {
@@ -632,6 +710,7 @@ mod tests {
                 material: 0,
                 depth: None,
                 settings: BrushSettings::default(),
+                alpha_image: None,
                 stencil: Some(stencil.clone()),
                 limit: None,
             };
@@ -681,8 +760,9 @@ mod tests {
                 settings.alpha_params.size_x = 0.75;
                 settings.alpha_params.size_y = 0.9;
                 settings.alpha_params.contrast = 1.3;
+                settings.alpha_params.rotation = -27.0;
                 settings.alpha_params.invert = invert;
-                let shape = Shape { alpha, image: None, library: None, params: settings.alpha_params, level: 0 };
+                let shape = Shape::new(alpha, None, None, settings.alpha_params);
                 let input = || BrushInput {
                     mesh: mesh.clone(),
                     bvh: bvh.clone(),
@@ -690,6 +770,7 @@ mod tests {
                     material: 0,
                     depth: None,
                     settings: settings.clone(),
+                    alpha_image: None,
                     stencil: None,
                     limit: None,
                 };
@@ -766,12 +847,12 @@ mod tests {
             eye: depth.as_ref().map_or(Vec3::ZERO, |depth| depth.eye),
             backface_culling: settings.backface_culling,
             angle_fade: settings.angle_fade,
-            shape: Shape { alpha: settings.alpha, image: None, library: None, params: settings.alpha_params, level: 0 },
+            shape: Shape::new(settings.alpha, None, None, settings.alpha_params),
         };
         let mut cpu = StrokeCanvas::new(size, size);
         rasterize(&mut cpu, &context, dabs);
 
-        let input = BrushInput { mesh, bvh, uv, material: 0, depth, settings, stencil: None, limit: None };
+        let input = BrushInput { mesh, bvh, uv, material: 0, depth, settings, alpha_image: None, stencil: None, limit: None };
         let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
         let tiles = stroke.append_world(dabs).unwrap();
         (cpu.alpha, stroke.read_alpha(&tiles).unwrap())
@@ -845,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn world_stroke_paints_both_sides_of_a_uv_seam() {
+    fn world_stroke_stamp_blending_paints_both_sides_of_a_uv_seam() {
         let Ok(mut gpu) = Headless::new() else { return };
         let positions = vec![
             Vec3::new(-1.0, 0.0, -1.0),
@@ -860,17 +941,9 @@ mod tests {
         let uvs = [[0.05, 0.35], [0.65, 0.95]].into_iter().flat_map(|us| [0.1, 0.9].into_iter().flat_map(move |v| us.map(|u| Vec2::new(u, v)))).collect();
         let mesh = Arc::new(Mesh::from_parts(positions, Some(vec![Vec3::Y; 8]), uvs, vec![0, 2, 1, 1, 2, 3, 4, 6, 5, 5, 6, 7], "Seam").unwrap());
         let camera = OrbitCamera { pitch: 1.2, ..OrbitCamera::default() };
-        let input = BrushInput {
-            bvh: Arc::new(Bvh::new(&mesh)),
-            uv: Arc::new(UvGBuffer::new(&mesh, 0, 128, 128)),
-            depth: Some(Arc::new(EyeDepth::render(&mesh, &camera, 128, 128))),
-            mesh,
-            material: 0,
-            settings: BrushSettings::default(),
-            stencil: None,
-            limit: None,
-        };
-        let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
+        let bvh = Arc::new(Bvh::new(&mesh));
+        let uv = Arc::new(UvGBuffer::new(&mesh, 0, 128, 128));
+        let depth = Arc::new(EyeDepth::render(&mesh, &camera, 128, 128));
         let dab = Stamp {
             center: Vec3::ZERO,
             normal: Vec3::Y,
@@ -883,15 +956,37 @@ mod tests {
             seed: 0,
             source: None,
         };
-        let tiles = stroke.append_world(&[dab]).unwrap();
-        let coverage = stroke.read_alpha(&tiles).unwrap();
-        let left = coverage.get(42, 64)[0];
-        let right = coverage.get(85, 64)[0];
-        assert!(left > 0 && right > 0, "both islands receive the same dab");
-        assert_eq!(coverage.get(64, 64)[0], 0, "the gap between islands stays clear");
-        assert_eq!(coverage.get(20, 64)[0], 0, "paint stays near the seam on the surface");
-        stroke.append_world(&[dab]).unwrap();
-        let coverage = stroke.read_alpha(&tiles).unwrap();
-        assert!(coverage.get(42, 64)[0] > left && coverage.get(85, 64)[0] > right, "repeated dabs accumulate on both islands");
+        let pixel_coverage = [StampBlending::Lighten, StampBlending::Normal, StampBlending::Add].map(|stamp_blending| {
+            // Every mode sees the same stamp on each island across separate GPU dispatches.
+            let input = BrushInput {
+                bvh: bvh.clone(),
+                uv: uv.clone(),
+                depth: Some(depth.clone()),
+                mesh: mesh.clone(),
+                material: 0,
+                settings: BrushSettings { stamp_blending, ..BrushSettings::default() },
+                alpha_image: None,
+                stencil: None,
+                limit: None,
+            };
+            let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
+            let tiles = stroke.append_world(&[dab]).unwrap();
+            let first = stroke.read_alpha(&tiles).unwrap();
+            stroke.append_world(&[dab]).unwrap();
+            let second = stroke.read_alpha(&tiles).unwrap();
+            for x in [42, 85] {
+                let single = first.get(x, 64)[0];
+                assert!(single > 0, "both islands receive the same dab");
+                let a = texturecraft_texel::from_u16(single);
+                let expected = texturecraft_texel::to_u16(stamp_blending.accumulate(a, dab.flow));
+                let blended = second.get(x, 64)[0];
+                assert!(blended.abs_diff(expected) <= 1, "GPU {stamp_blending:?}: {blended} differs from {expected}");
+            }
+            assert_eq!(second.get(64, 64)[0], 0, "the gap between islands stays clear");
+            assert_eq!(second.get(20, 64)[0], 0, "paint stays near the seam on the surface");
+            second.get(42, 64)[0]
+        });
+        let [lighten, normal, add] = pixel_coverage;
+        assert!(lighten < normal && normal < add);
     }
 }
