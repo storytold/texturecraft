@@ -35,8 +35,11 @@ struct SurfaceVertex {
 @group(0) @binding(7) var<storage, read> surface_vertices: array<SurfaceVertex>;
 @group(0) @binding(8) var bake_maps: texture_2d<u32>;
 @group(0) @binding(9) var brush_alpha: texture_2d<u32>;
+@group(0) @binding(11) var brush_stencil_image: texture_2d<f32>;
+@group(0) @binding(12) var<uniform> brush_stencil: StencilProjection;
 
 const NO_PAINT_IMAGE = 0xffffffffu;
+const PROJECTED_BRUSH: u32 = 4u;
 
 struct Surface {
     position: vec3<f32>,
@@ -379,13 +382,32 @@ fn stored_paint(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
     return vec4(rgb, coverage);
 }
 
-fn painted(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
+struct ProjectedBrush {
+    rgba: vec4<f32>,
+    coverage: f32,
+}
+
+fn brush_coverage(pixel: vec2<u32>) -> f32 {
+    return f32(textureLoad(brush_alpha, vec2<i32>(pixel), 0).x) / 65535.0;
+}
+
+fn sample_brush_projection(pixel: vec2<u32>, surface: Surface) -> ProjectedBrush {
+    let coverage = brush_coverage(pixel);
+    if coverage <= 0.0 { return ProjectedBrush(vec4(0.0), 0.0); }
+    return ProjectedBrush(stencil_sample(brush_stencil_image, brush_stencil, surface.position), coverage);
+}
+
+fn painted(layer: Operation, pixel: vec2<u32>, projected: ProjectedBrush) -> vec4<f32> {
     var stored = stored_paint(layer, pixel);
-    if layer.projection.w == 1.0 {
-        let m = f32(textureLoad(brush_alpha, vec2<i32>(pixel), 0).x) / 65535.0 * layer.uv.w;
+    if layer.projection.w > 0.0 {
+        var m = projected.coverage * layer.uv.w * projected.rgba.a;
+        if (params.coverage.w & PROJECTED_BRUSH) == 0u {
+            m = brush_coverage(pixel) * layer.uv.w;
+        }
         if m > 0.0 {
             // Match the paint commit's premultiplied over and 16-bit channel encoding.
-            let pigment = select(layer.uv.xxx, layer.uv.xyz, layer.ids.w == 4u);
+            let value = select(layer.uv.xxx, layer.uv.xyz, layer.ids.w == 4u);
+            let pigment = select(value, projected.rgba.rgb, layer.projection.w == 2.0);
             let remaining = 1.0 - m;
             let premul = pigment * m + stored.rgb * remaining;
             let signed = layer.ids.x == 6u;
@@ -603,14 +625,14 @@ fn generator(effect: Operation, surface: Surface, baked: vec3<f32>) -> f32 {
     return clamp(select(value, 1.0 - value, effect.ids.w != 0u) + effect.projection.y, 0.0, 1.0);
 }
 
-fn layer_mask(layer: Operation, pixel: vec2<u32>, uv: vec2<f32>, surface: Surface, baked: vec3<f32>) -> f32 {
+fn layer_mask(layer: Operation, pixel: vec2<u32>, uv: vec2<f32>, surface: Surface, baked: vec3<f32>, projected: ProjectedBrush) -> f32 {
     var mask = layer.balance.y;
     for (var i = 0u; i < layer.effects.y; i++) {
         let e = layers[params.program.x + layer.effects.x + i];
         var weight = e.low.w;
         var result: f32;
         if e.ids.y == 10u {
-            let sampled = painted(e, pixel);
+            let sampled = painted(e, pixel, projected);
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.w;
         } else if e.ids.y < 20u || e.ids.y >= 48u {
@@ -722,6 +744,10 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     let covered = all(pixel < params.source.xy);
     let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
     let surface = surface_at(pixel);
+    var projected = ProjectedBrush(vec4(0.0), 0.0);
+    if covered && (params.coverage.w & PROJECTED_BRUSH) != 0u {
+        projected = sample_brush_projection(pixel, surface);
+    }
     var mask_bakes = vec3(1.0, 0.5, 1.0);
     var display_ao = 1.0;
     var baked_normal = 0u;
@@ -739,7 +765,7 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     if params.source.w == 2u {
         var gray = 0u;
         if covered {
-            gray = u32(layer_mask(layers[0], pixel, uv, surface, mask_bakes) * 255.0 + 0.5);
+            gray = u32(layer_mask(layers[0], pixel, uv, surface, mask_bakes, projected) * 255.0 + 0.5);
         }
         output[index] = (gray * 0x00010101u) | 0xff000000u;
         return;
@@ -762,13 +788,13 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         } else {
             if last_mask != layer.effects.x {
                 last_mask = layer.effects.x;
-                mask_value = layer_mask(layer, pixel, uv, surface, mask_bakes);
+                mask_value = layer_mask(layer, pixel, uv, surface, mask_bakes, projected);
             }
             weight *= mask_value;
         }
         if weight <= 0.0 { continue; }
         if layer.ids.y == 10u {
-            let sampled = painted(layer, pixel);
+            let sampled = painted(layer, pixel, projected);
             source = sampled.rgb;
             weight *= select(sampled.a, 1.0, mode == 2u && sampled.a > 0.0);
             if weight <= 0.0 { continue; }

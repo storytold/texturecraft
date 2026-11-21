@@ -14,6 +14,7 @@ use texturecraft_core::{
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
+use crate::gpu_stencil::GpuStencil;
 use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
 use crate::paint_window::TileWindow;
 use wgpu::util::DeviceExt;
@@ -58,7 +59,7 @@ struct Operation {
     // RGB low and layer weight.
     low: [f32; 4],
     high: [f32; 4],
-    // UV rotation and scale, or the live-brush flag in W for paint.
+    // UV rotation and scale, or the pigment source in W for live paint (1: brush, 2: stencil).
     projection: [f32; 4],
     // UV offset XY, procedural scale and contrast, or live-brush values and opacity.
     uv: [f32; 4],
@@ -115,6 +116,8 @@ pub struct LiveBrush {
     pub target: LiveBrushTarget,
     pub opacity: f32,
     pub alpha: wgpu::TextureView,
+    /// Supplies opacity modulation and Base Color for a projection stroke.
+    pub stencil: Option<GpuStencil>,
 }
 
 pub enum LiveBrushTarget {
@@ -147,6 +150,7 @@ pub struct CompositeProgram {
     ramp_words: Vec<u32>,
     tile_patterns: TilePatterns,
     brush_alpha: Option<wgpu::TextureView>,
+    brush_stencil: Option<GpuStencil>,
     pub(crate) region: Option<CompositeRegion>,
     coverage: Option<(Arc<UvGBuffer>, u32)>,
     surface: Option<(Arc<Mesh>, Arc<UvGBuffer>)>,
@@ -274,6 +278,7 @@ impl CompositeProgram {
         let mut effects = Vec::new();
         let mut procedural = ProceduralInputs { resolution: set.resolution, ramp_words: Vec::new() };
         let mut non_default = [false; Channel::ALL.len()];
+        let stencil_pigment = brush.as_ref().is_some_and(|brush| brush.stencil.is_some());
         let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (id, 0)).collect();
         while let Some((id, depth)) = layers.pop() {
             let layer = project.layers.get(&id).ok_or("A layer is missing from the material.")?;
@@ -374,7 +379,7 @@ impl CompositeProgram {
                         .ok_or("A fill source or projection uses CPU compositing.")?
                 };
                 if let Some(([r, g, b], opacity)) = brush_value {
-                    op.projection[3] = 1.0;
+                    op.projection[3] = if stencil_pigment && channel == Channel::BaseColor { 2.0 } else { 1.0 };
                     op.uv = [r, g, b, opacity];
                 }
                 bind_tile_source(&mut op, source, &mut tile_patterns);
@@ -398,14 +403,16 @@ impl CompositeProgram {
         }
         let layer_count = operations.len() as u32;
         operations.extend(effects);
-        let needs_surface = needs_surface(&operations);
+        let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
+        let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
         Ok(Self {
             operations,
             layer_count,
             paint,
             ramp_words: procedural.ramp_words,
             tile_patterns,
-            brush_alpha: brush.map(|brush| brush.alpha),
+            brush_alpha,
+            brush_stencil,
             region,
             coverage: None,
             surface: None,
@@ -442,14 +449,16 @@ impl CompositeProgram {
         let background = compile_mask(Some(mask), pixels, set.size(), brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
         operations[0].effects[1] = operations.len() as u32 - 1;
         operations[0].balance[1] = background;
-        let needs_surface = needs_surface(&operations);
+        let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
+        let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
         Ok(Self {
             operations,
             layer_count: 1,
             paint,
             ramp_words: procedural.ramp_words,
             tile_patterns,
-            brush_alpha: brush.map(|brush| brush.alpha),
+            brush_alpha,
+            brush_stencil,
             region,
             coverage: None,
             surface: None,
@@ -808,6 +817,7 @@ pub(crate) struct GpuCompositor {
     default_vertices: wgpu::Buffer,
     default_baked: wgpu::TextureView,
     default_brush_alpha: wgpu::TextureView,
+    default_brush_stencil: GpuStencil,
     default_tile_images: wgpu::TextureView,
     tile_images: BTreeMap<usize, TileImageAtlas>,
     paint_upload: Option<wgpu::Buffer>,
@@ -817,7 +827,9 @@ impl GpuCompositor {
     pub(crate) fn supports(device: &wgpu::Device) -> bool {
         let limits = device.limits();
         limits.max_storage_buffers_per_shader_stage >= 6
-            && limits.max_sampled_textures_per_shader_stage >= 4
+            && limits.max_sampled_textures_per_shader_stage >= 5
+            && limits.max_uniform_buffers_per_shader_stage >= 2
+            && limits.max_bindings_per_bind_group >= 13
             && limits.max_compute_invocations_per_workgroup >= WORKGROUP * WORKGROUP
             && limits.max_compute_workgroup_size_x >= WORKGROUP
             && limits.max_compute_workgroup_size_y >= WORKGROUP
@@ -833,6 +845,8 @@ impl GpuCompositor {
                     include_str!("shaders/procedural_extra.wgsl"),
                     "\n",
                     include_str!("shaders/tile_generator.wgsl"),
+                    "\n",
+                    include_str!("shaders/stencil_projection.wgsl"),
                     "\n",
                     include_str!("shaders/composite.wgsl")
                 )
@@ -878,6 +892,7 @@ impl GpuCompositor {
             default_vertices,
             default_baked,
             default_brush_alpha,
+            default_brush_stencil: GpuStencil::empty(device),
             default_tile_images: TileImageAtlas::empty_view(device),
             tile_images: BTreeMap::new(),
             paint_upload: None,
@@ -1136,6 +1151,7 @@ impl GpuCompositor {
         };
         let tile_images = tile_images.as_ref().unwrap_or(&self.default_tile_images);
         let brush_alpha = program.brush_alpha.as_ref().unwrap_or(&self.default_brush_alpha);
+        let brush_stencil = program.brush_stencil.as_ref().unwrap_or(&self.default_brush_stencil);
         let empty_operation = Operation::zeroed();
         let limits = device.limits();
         if (operations.len() * size_of::<Operation>()) as u64 > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
@@ -1208,7 +1224,7 @@ impl GpuCompositor {
                     u32::from(program.coverage.is_some()),
                     source_size.0.div_ceil(32),
                     radius,
-                    u32::from(program.surface.is_some()) | (u32::from(program.baked.is_some()) << 1),
+                    u32::from(program.surface.is_some()) | (u32::from(program.baked.is_some()) << 1) | (u32::from(program.brush_stencil.is_some()) << 2),
                     window.origin[0],
                     window.origin[1],
                     window.size[0],
@@ -1234,6 +1250,8 @@ impl GpuCompositor {
                         wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
                         wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(brush_alpha) },
                         wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(tile_images) },
+                        wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&brush_stencil.image) },
+                        wgpu::BindGroupEntry { binding: 12, resource: brush_stencil.uniforms.as_entire_binding() },
                     ],
                 });
                 {
@@ -1626,6 +1644,7 @@ mod paint_window_tests {
             ramp_words: Vec::new(),
             tile_patterns: TilePatterns::default(),
             brush_alpha: None,
+            brush_stencil: None,
             region: None,
             coverage: None,
             surface: None,
