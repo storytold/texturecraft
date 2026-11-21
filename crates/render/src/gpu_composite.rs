@@ -1323,6 +1323,35 @@ mod procedural_tests {
     }
 
     #[test]
+    fn steep_baked_normal_keeps_its_direction_with_painted_detail() {
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = 64;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let mut project = Project::new("Steep baked normal", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let owner = project.alloc_id();
+        let detail = [0.75, 0.5, 0.9330127];
+        let fill = Fill { sources: BTreeMap::from([(Channel::Normal, Source::Uniform(detail))]), ..Default::default() };
+        let layer = Layer::new(owner, "Surface detail", LayerKind::Fill(fill), &[Channel::Normal]);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let steep = [0.5158094, 0.5, 0.00025];
+        let baked = BakedMaps { resolution: 1, maps: BTreeMap::from([(BakedMap::Normal, Arc::new(steep.to_vec()))]) };
+        let pixels = PixelStore::default();
+        let mut program = CompositeProgram::compile(&project, &pixels, 0).unwrap();
+        program.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        let texture = gpu.renderer.display_textures()[0][DisplayKind::Normal as usize];
+        let (width, _, bytes) = Readback::blocking_level(&gpu.device, &gpu.queue, texture, 0).unwrap();
+        let center = (width * (SIZE / 2) + SIZE / 2) as usize * DisplayKind::Normal.bytes_per_texel();
+        let actual = Vec3::from_array([0, 2, 4].map(|offset| half::f16::from_le_bytes(bytes[center + offset..][..2].try_into().unwrap()).to_f32()));
+        let expected = Vec3::from_array(texturecraft_core::blend::rnm(steep, detail)) * 2.0 - Vec3::ONE;
+        assert!(actual.dot(expected) > 0.99, "GPU {actual} vs CPU {expected}");
+    }
+
+    #[test]
     fn material_patterns_match_cpu_as_fills_and_masks() {
         use ProceduralKind::*;
         const SIZE: u32 = 128;
