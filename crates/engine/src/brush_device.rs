@@ -6,13 +6,15 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use texturecraft_compose::PaintTarget;
+use texturecraft_compose::{PaintTarget, Stencil};
 use texturecraft_core::Channel;
 use texturecraft_geom::{Bvh, Mesh, UvGBuffer};
 use texturecraft_paint::{BrushSettings, EyeDepth, Stamp, UvStamp};
 use texturecraft_texel::TileImage;
 
 pub type BrushTiles = BTreeSet<(u32, u32)>;
+/// Stencil samples by document tile, in row-major linear RGBA.
+pub type ProjectedTiles = BTreeMap<(u32, u32), Vec<[f32; 4]>>;
 
 pub struct BrushBackend {
     pub device: Arc<dyn BrushDevice>,
@@ -26,6 +28,7 @@ pub struct BrushSurface {
     pub material: usize,
     pub depth: Option<Arc<EyeDepth>>,
     pub settings: BrushSettings,
+    pub stencil: Option<Stencil>,
 }
 
 pub struct DeviceStrokePreview<'a> {
@@ -45,5 +48,6 @@ pub trait DeviceStroke: Send + Sync {
     fn append_world(&mut self, stamps: &[Stamp]) -> std::result::Result<BrushTiles, String>;
     fn append_uv(&mut self, stamps: &[UvStamp]) -> std::result::Result<BrushTiles, String>;
     fn read_alpha(&self, tiles: &BrushTiles) -> std::result::Result<TileImage, String>;
+    fn read_projection(&self, tiles: &BrushTiles) -> std::result::Result<ProjectedTiles, String>;
     fn as_any(&self) -> &dyn Any;
 }

@@ -10,8 +10,9 @@ use texturecraft_paint::{
     CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask, pick,
     rasterize,
 };
+use texturecraft_texel::{TILE, TILE_AREA};
 
-use crate::brush_device::DeviceStrokePreview;
+use crate::brush_device::{BrushTiles, DeviceStroke, DeviceStrokePreview, ProjectedTiles};
 use crate::session::{
     ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, ReleasedDab, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
 };
@@ -33,6 +34,9 @@ const UV_STAMP_BATCH: usize = 4096;
 
 /// Covers a UV diagonal at the minimum step (about 142k stamps), including light pen pressure, while bounding hostile coordinates
 const MAX_UV_STAMPS_PER_SAMPLE: usize = 150_000;
+
+/// Limit CPU-side storage for projected color to one readback batch.
+const PROJECTION_READBACK_BATCH: usize = 128;
 
 impl Session {
     /// Camera visibility for a stroke at `viewport` (cached until the camera, size or mesh change).
@@ -326,11 +330,11 @@ impl Session {
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
         let settings = &stroke.settings;
-        let device = if tool == Tool::Paint
+        let gpu_tool = tool == Tool::Paint || (tool == Tool::Projection && !uv_mode && stencil.is_some());
+        let device = if gpu_tool
             && let Some(target) = target
             && canvas.pickup.is_none()
             && canvas.limit.is_none()
-            && stencil.is_none()
             && !settings.symmetry.any()
             && settings.alpha_image.is_none()
             && settings.alpha_library.is_none()
@@ -351,6 +355,7 @@ impl Session {
                 material: self.doc.project.texture_set(ts)?.material,
                 depth: depth.clone(),
                 settings: settings.clone(),
+                stencil: stencil.clone(),
             };
             match backend.device.start(surface) {
                 Ok(device) => Some(device),
@@ -363,7 +368,8 @@ impl Session {
             None
         };
         if device.is_some() {
-            self.log.performance("Brush: GPU (stroke coverage and live paint)");
+            let detail = if stencil.is_some() { "stroke coverage, stencil sampling and live paint" } else { "stroke coverage and live paint" };
+            self.log.performance(format!("Brush: GPU ({detail})"));
         }
         self.stroke = Some(ActiveStroke {
             display_id: next_mesh_id(),
@@ -614,7 +620,7 @@ impl Session {
         let gbuf = self.caches.get(ts).map(|c| c.gbuf.clone());
         let (pixels, mask_value) = (&self.doc.pixels, self.tool.mask_value);
         let mut staging = std::mem::take(&mut st.staging);
-        with_commit_source(st, gbuf.as_deref(), &self.mesh, &recent, |src| match t {
+        with_commit_source(st, gbuf.as_deref(), &self.mesh, &recent, None, |src| match t {
             PaintTarget::Layer(id) => staging.stage_layer(pixels, id, &st.values, &src),
             PaintTarget::Mask(eid) => staging.stage_mask(pixels, eid, mask_value, &src),
         });
@@ -651,17 +657,22 @@ impl Session {
 
     /// Finish the GPU coverage when committing or switching to a CPU-only preview.
     pub fn materialize_device_stroke(&mut self, preview_fallback: Option<&str>) {
-        let Some(stroke) = self.stroke.as_mut() else { return };
-        let Some(device) = stroke.device.take() else { return };
-        match device.read_alpha(&stroke.canvas.dirty) {
+        let _ = self.take_device_stroke(preview_fallback);
+    }
+
+    fn take_device_stroke(&mut self, preview_fallback: Option<&str>) -> Option<Box<dyn DeviceStroke>> {
+        let stroke = self.stroke.as_mut()?;
+        let device = stroke.device.take()?;
+        let valid = match device.read_alpha(&stroke.canvas.dirty) {
             Ok(alpha) => {
                 stroke.canvas.dirty = alpha.allocated().collect();
                 stroke.canvas.alpha = alpha;
+                true
             }
             Err(error) => {
                 stroke.display_tiles.append(&mut stroke.canvas.dirty);
                 self.log.performance(format!("GPU stroke readback failed, replaying stroke on CPU: {error}"));
-                let Some(cache) = self.caches.get(stroke.ts) else { return };
+                let cache = self.caches.get(stroke.ts)?;
                 let shape = Self::shape(&self.images, &stroke.stroke.settings);
                 if stroke.uv.is_some() {
                     for stamps in stroke.device_uv_stamps.chunks(UV_STAMP_BATCH) {
@@ -681,8 +692,9 @@ impl Session {
                     };
                     rasterize(&mut stroke.canvas, &context, &stroke.stroke.stamps);
                 }
+                false
             }
-        }
+        };
         stroke.device_uv_stamps.clear();
         stroke.display_tiles.extend(&stroke.canvas.dirty);
         stroke.canvas.recent.extend(&stroke.canvas.dirty);
@@ -690,6 +702,7 @@ impl Session {
             self.log.performance(format!("Brush: CPU ({reason})"));
             self.stroke_painted();
         }
+        valid.then_some(device)
     }
 
     /// Identity and tiles of a supported live stroke since the display last drew it.
@@ -700,7 +713,8 @@ impl Session {
         } else {
             &stroke.display_tiles
         };
-        (stroke.ts == ts && stroke.target.is_some() && stroke.stencil.is_none() && stroke.canvas.pickup.is_none()).then_some((stroke.display_id, tiles))
+        let can_preview = stroke.stencil.is_none() || stroke.device.is_some();
+        (stroke.ts == ts && stroke.target.is_some() && can_preview && stroke.canvas.pickup.is_none()).then_some((stroke.display_id, tiles))
     }
 
     /// Copy-on-write material pixels for display. The staged blends are the same tiles the
@@ -713,7 +727,6 @@ impl Session {
         }
         let tiles_in_bounds;
         let touched = if let Some((min, max)) = texel_bounds {
-            use texturecraft_texel::TILE;
             tiles_in_bounds = stroke
                 .canvas
                 .dirty
@@ -731,7 +744,7 @@ impl Session {
         let size = (stroke.canvas.alpha.width(), stroke.canvas.alpha.height());
         let mut pixels = self.doc.pixels.clone();
         let mut staging = stroke.staging.snapshot(touched);
-        with_commit_source(stroke, None, &self.mesh, touched, |source| match stroke.target {
+        with_commit_source(stroke, None, &self.mesh, touched, None, |source| match stroke.target {
             Some(PaintTarget::Layer(id)) => commit_layer(&mut pixels, id, size, &stroke.values, source, &mut staging),
             Some(PaintTarget::Mask(id)) => commit_mask(&mut pixels, id, size, self.tool.mask_value, source, &mut staging),
             None => {}
@@ -754,7 +767,7 @@ impl Session {
 
     /// Commit the active stroke (one undo step).
     pub fn end_stroke(&mut self) -> Result<()> {
-        self.materialize_device_stroke(None);
+        let device = self.take_device_stroke(None);
         let brush_tile = self.tile_demand(None).brush;
         let Some(mut st) = self.stroke.take() else { return Ok(()) };
         let size = (st.canvas.alpha.width(), st.canvas.alpha.height());
@@ -767,22 +780,42 @@ impl Session {
         let mesh = self.mesh.clone();
         let mut staging = std::mem::take(&mut st.staging);
         let mask_value = self.tool.mask_value;
-        match st.target {
-            Some(PaintTarget::Layer(id)) => {
-                let pixels = &mut self.doc.pixels;
-                with_commit_source(&st, gbuf.as_deref(), &mesh, &st.canvas.dirty, |src| commit_layer(pixels, id, size, &st.values, src, &mut staging));
+        let Some(target) = st.target else {
+            with_commit_source(&st, gbuf.as_deref(), &mesh, &st.canvas.dirty, None, |src| self.commit_quick_mask(st.ts, size, src));
+            return Ok(());
+        };
+        let pixels = &mut self.doc.pixels;
+        let mut commit = |tiles: &BrushTiles, projection: Option<&ProjectedTiles>| {
+            with_commit_source(&st, gbuf.as_deref(), &mesh, tiles, projection, |src| match target {
+                PaintTarget::Layer(id) => commit_layer(pixels, id, size, &st.values, src, &mut staging),
+                PaintTarget::Mask(eid) => commit_mask(pixels, eid, size, mask_value, src, &mut staging),
+            });
+        };
+        if let Some(device) = device.as_deref().filter(|_| st.stencil.is_some()) {
+            let tiles: Vec<_> = st.canvas.dirty.iter().copied().collect();
+            let mut gpu_readback = Some(device);
+            for batch in tiles.chunks(PROJECTION_READBACK_BATCH) {
+                let tiles: BrushTiles = batch.iter().copied().collect();
+                let projection = gpu_readback.and_then(|device| match device.read_projection(&tiles) {
+                    Ok(samples) if tiles.iter().all(|tile| samples.get(tile).is_some_and(|data| data.len() == TILE_AREA)) => Some(samples),
+                    Ok(_) => {
+                        self.log.performance("GPU stencil readback missed tiles, sampling remaining tiles on CPU");
+                        gpu_readback = None;
+                        None
+                    }
+                    Err(error) => {
+                        self.log.performance(format!("GPU stencil readback failed, sampling remaining tiles on CPU: {error}"));
+                        gpu_readback = None;
+                        None
+                    }
+                });
+                commit(&tiles, projection.as_ref());
             }
-            Some(PaintTarget::Mask(eid)) => {
-                let pixels = &mut self.doc.pixels;
-                with_commit_source(&st, gbuf.as_deref(), &mesh, &st.canvas.dirty, |src| commit_mask(pixels, eid, size, mask_value, src, &mut staging));
-                if st.displayed_mask_value != mask_value {
-                    st.display_tiles.extend(&st.canvas.dirty);
-                }
-            }
-            None => {
-                with_commit_source(&st, gbuf.as_deref(), &mesh, &st.canvas.dirty, |src| self.commit_quick_mask(st.ts, size, src));
-                return Ok(());
-            }
+        } else {
+            commit(&st.canvas.dirty, None);
+        }
+        if matches!(target, PaintTarget::Mask(_)) && st.displayed_mask_value != mask_value {
+            st.display_tiles.extend(&st.canvas.dirty);
         }
         self.undo.push((st.label.clone(), st.before));
         if self.undo.len() > crate::session::MAX_HISTORY {
@@ -953,9 +986,16 @@ fn with_commit_source<R>(
     gbuf: Option<&texturecraft_geom::UvGBuffer>,
     mesh: &texturecraft_geom::Mesh,
     tiles: &BTreeSet<(u32, u32)>,
+    projection: Option<&ProjectedTiles>,
     f: impl FnOnce(CommitSource) -> R,
 ) -> R {
     let stencil_fn = |x: u32, y: u32| -> Option<([f32; 3], f32)> {
+        if let Some(projection) = projection {
+            let tile = projection.get(&(x / TILE, y / TILE))?;
+            let i = ((y % TILE) * TILE + x % TILE) as usize;
+            let &[r, g, b, a] = tile.get(i)?;
+            return Some(([r, g, b], a));
+        }
         let g = gbuf?;
         let p = g.surface(mesh, (y * g.width + x) as usize)?.pos;
         st.stencil.as_ref()?.sample_world(p)
