@@ -13,6 +13,8 @@ const SEARCH_STEP: f32 = 8.0;
 fn sample_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     assert_eq!(harness.state().session.ts(), 0);
     assert_eq!(harness.state().session.tool.tool, Tool::Paint);

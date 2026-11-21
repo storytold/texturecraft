@@ -11,6 +11,8 @@ use memory_storage::MemoryStorage;
 fn saving_the_app_stores_the_current_brush_and_tool_settings() {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(2);
     let tool = &mut harness.state_mut().session.tool;
     tool.brush.size = 0.37;

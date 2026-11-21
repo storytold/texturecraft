@@ -44,6 +44,8 @@ fn color_selection_session(with_id_map: bool) -> (texturecraft_engine::Session, 
 fn app_with_color_selection(with_id_map: bool) -> (Harness<'static, TextureCraftApp>, LayerId) {
     let (session, effect) = color_selection_session(with_id_map);
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     (harness, effect)
 }
@@ -274,6 +276,7 @@ fn color_selection_snapshots_and_quick_mask_pick() {
         app.ui.layout = texturecraft_ui_egui::state::ViewLayout::Only3D;
         app
     });
+    harness.state_mut().ui.prefs.language = "en".into();
     let adapter = harness.state().render_state.as_ref().unwrap().adapter.get_info();
     eprintln!("Offscreen adapter: {adapter:?}");
 

@@ -39,6 +39,8 @@ fn open(mut session: Session, effect: LayerId) -> (Harness<'static, TextureCraft
 
     // Frames of a 60 Hz screen: kittest's default quarter second spreads a double-click past egui's delay
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).with_step_dt(1.0 / 60.0).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     (harness, effect)
 }

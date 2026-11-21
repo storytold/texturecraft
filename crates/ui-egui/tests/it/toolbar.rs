@@ -19,6 +19,10 @@ fn toolbar_harness(width: f32, tool: Tool) -> Harness<'static, TextureCraftApp> 
             theme::apply(context, theme::Brightness::default(), theme::Accent::default());
         })
         .build_ui_state(|ui, app| toolbar::paint_bar(app, ui), app);
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
+    // Only the toolbar is painted, so no frame applies the preference: set the language itself
+    texturecraft_ui_egui::i18n::set_language("en");
     harness.run_steps(4);
     harness
 }
@@ -200,6 +204,9 @@ fn toolbar_window_snapshots() {
     std::fs::create_dir_all(&directory).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
+    // Only the toolbar is painted, so no frame applies the preference: set the language itself
+    texturecraft_ui_egui::i18n::set_language("en");
     harness.state_mut().session.tool.tool = Tool::Path;
     harness.state_mut().session.tool.brush.lazy = 20.0;
     for (width, scale) in [(1600.0, 1.0), (960.0, 1.0), (960.0, 1.5)] {

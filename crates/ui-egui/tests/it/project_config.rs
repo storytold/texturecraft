@@ -815,6 +815,7 @@ fn project_config_snapshots() {
     let mut session = Session::from_mesh_bytes("quad.obj", QUAD.as_bytes(), 128, "quad").unwrap();
     session.doc.project.mesh_path = file.display().to_string();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(6);
     open_window(&mut h);
     h.run_steps(6);

@@ -25,6 +25,8 @@ fn select_nothing(session: &mut Session) {
 fn app_harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     harness
 }
@@ -139,6 +141,7 @@ fn bake_painting_turns_on_the_shelf_paint_tool() {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     session.add_high_poly_bytes("High.obj", b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_vec()).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.mode = Mode::Baking;
     harness.run_steps(4);
     assert!(shelf_button_disabled(&harness, "Paint (1)"), "nothing is being painted yet");
@@ -189,6 +192,7 @@ fn tool_availability_snapshots() {
     std::fs::create_dir_all(&directory).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
     let save = |harness: &mut Harness<'_, TextureCraftApp>, name: &str| {
         for (brightness, suffix) in [(Brightness::MediumDark, "medium"), (Brightness::Dark, "dark"), (Brightness::Light, "light")] {
             harness.state_mut().ui.prefs.brightness = brightness;

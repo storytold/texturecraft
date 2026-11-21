@@ -25,6 +25,8 @@ fn frame(harness: &mut Harness<'_, TextureCraftApp>, pen: Option<(TouchPhase, Op
 fn paint_2d(input: impl FnOnce(&mut Harness<'_, TextureCraftApp>)) -> f64 {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1500.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.layout = ViewLayout::Only2D;
     harness.state_mut().session.tool.brush.min_size = 0.0;
     harness.run_steps(4);

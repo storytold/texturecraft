@@ -23,6 +23,8 @@ fn drag(h: &mut Harness<'_, TextureCraftApp>, button: PointerButton, from: Pos2,
 fn ctrl_drag_changes_the_brush_instead_of_painting_or_orbiting() {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     let c = h.state().viewport_rect.center();
     let (brush, yaw, history) = {
@@ -51,6 +53,7 @@ fn ctrl_drag_changes_the_brush_instead_of_painting_or_orbiting() {
 fn app(layout: texturecraft_ui_egui::state::ViewLayout) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.prefs.language = "en".into();
     h.state_mut().ui.layout = layout;
     h.run_steps(4);
     h

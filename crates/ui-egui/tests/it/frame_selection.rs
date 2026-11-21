@@ -11,6 +11,8 @@ o Floor\nusemtl Floor\nv -100 -1 -100\nv 100 -1 -100\nv 0 -1 100\nvt 0 0\nvt 1 0
 fn harness() -> Harness<'static, TextureCraftApp> {
     let session = Session::from_mesh_bytes("scene.obj", SCENE_OBJ.as_bytes(), 256, "scene").unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     h
 }

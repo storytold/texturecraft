@@ -23,6 +23,8 @@ const SEARCH_REACH: f32 = 300.0;
 fn view_3d_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.layout = ViewLayout::Only3D;
     harness.state_mut().session.tool.tool = Tool::Paint;
     harness.run_steps(4);

@@ -15,6 +15,8 @@ fn path_rows_edit_and_remove_paths() {
     let eid = LayerId(r["committed"]["effect"].as_u64().unwrap());
     execute(&mut session, "tool.path", &json!({"uvPoints": [[0.2, 0.8], [0.8, 0.8]], "commit": true})).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     let editing = |h: &Harness<'_, TextureCraftApp>| h.state().session.tool.path.editing;
     let count = |h: &Harness<'_, TextureCraftApp>| h.state().session.paths(eid).map_or(0, <[_]>::len);

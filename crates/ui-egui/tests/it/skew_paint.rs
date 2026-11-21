@@ -15,6 +15,8 @@ fn harness() -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     session.add_high_poly_bytes("High.obj", b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_vec()).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1500.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    h.state_mut().ui.prefs.language = "en".into();
     h.state_mut().ui.mode = Mode::Baking;
     h.state_mut().ui.layout = ViewLayout::Only2D;
     h.run_steps(4);

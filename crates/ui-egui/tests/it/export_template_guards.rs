@@ -15,6 +15,8 @@ use library::Library;
 fn harness(library: &Library) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     h.state_mut().session.load_export_presets(library.0.clone());
     let base = texturecraft_engine::formats::builtin_presets().remove(0);

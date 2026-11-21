@@ -14,6 +14,8 @@ const CLICK: Pos2 = pos2(700.0, 420.0);
 fn uv_view_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.layout = ViewLayout::Only2D;
     harness.run_steps(4);
     harness

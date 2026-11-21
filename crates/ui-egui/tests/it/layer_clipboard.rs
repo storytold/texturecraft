@@ -10,6 +10,8 @@ use texturecraft_ui_egui::TextureCraftApp;
 fn harness() -> (Harness<'static, TextureCraftApp>, LayerId) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     let layer = h.state().session.selected_layer().unwrap();
     let name = h.state().session.doc.project.layers[&layer].name.clone();
@@ -80,6 +82,7 @@ fn layer_shortcuts_act_on_a_selected_effect() {
     let p = serde_json::json!({"target": "content", "filter": "invert"});
     let effect = id(texturecraft_engine::execute(&mut session, "effect.add.filter", &p).unwrap(), "effect");
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     let effects = |h: &Harness<'_, TextureCraftApp>| h.state().session.doc.project.layers.get(&layer).map(|l| l.content_effects.len());
     h.event(egui::Event::Copy);

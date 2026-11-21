@@ -18,6 +18,8 @@ fn harness() -> Harness<'static, TextureCraftApp> {
     }
 
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.mode = Mode::Baking;
     harness.run_steps(4);
     harness.state_mut().ui.dock.focus(Panel::MeshMapBakers);
@@ -175,6 +177,7 @@ fn a_partial_bake_does_not_count_preserved_unchecked_maps() {
     set.bake.maps.select([BakedMap::Id]);
     set.bake_excluded_tiles.insert(1002);
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.mode = Mode::Baking;
     harness.state_mut().start_bake(vec![0]);
 

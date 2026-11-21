@@ -18,6 +18,8 @@ fn app_with_invert() -> (Harness<'static, TextureCraftApp>, LayerId) {
     session.target = StackTarget::Effect(effect);
 
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     (harness, effect)
 }
@@ -174,6 +176,7 @@ fn filter_picker_snapshots_and_frame_timings() {
         eprintln!("selected graphics adapter: {:?}", cc.wgpu_render_state.as_ref().unwrap().adapter.get_info());
         TextureCraftApp::new(cc, session)
     });
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(20);
     let start = std::time::Instant::now();
     open_picker(&mut harness);

@@ -29,6 +29,7 @@ generator, filter and brush alpha names (**KEYS** strings, counted by the
 | Arabic | `ar` | KEYS (100%) | yes | Arabic glyphs: craft-fonts (Noto Sans Arabic) or system fonts on desktop; egui shapes the text and orders it right to left (panels keep the left-to-right layout) | yes | full | 0 h |
 | French | `fr` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
 | Portuguese (Brazil) | `pt-BR` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
+| Russian | `ru` | KEYS (~99%) | yes | Cyrillic: egui's built-in fonts | yes | full with the craft-i18n `ru/texturecraft.tsv` catalog | 0 h |
 | Indonesian | `id` | 0 | no | Latin | no | none | 3 h |
 | Japanese | `ja` | KEYS (100%) | yes | CJK glyphs: craft-fonts (BIZ UDPGothic) or system fonts on desktop | no | full | 2 h (review) |
 | German | `de` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |

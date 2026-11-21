@@ -11,6 +11,8 @@ use texturecraft_ui_egui::docking::Panel;
 /// Show document history so row clicks exercise the same command dispatch as the application
 fn history_harness(session: Session) -> Harness<'static, TextureCraftApp> {
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.dock.focus(Panel::History);
     harness.run_steps(4);
     harness
@@ -168,6 +170,7 @@ fn clicking_a_history_step_returns_to_it() {
     }
     let done = session.history_labels().len();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.prefs.language = "en".into();
     h.state_mut().ui.dock.focus(Panel::History);
     h.run_steps(4);
     let name = |h: &Harness<'_, TextureCraftApp>| h.state().session.doc.project.layers[&layer].name.clone();

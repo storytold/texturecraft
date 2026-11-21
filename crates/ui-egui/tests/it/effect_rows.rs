@@ -33,6 +33,8 @@ fn dragging_an_effect_row_reorders_its_stack() {
     let (a, b, c) = (add("Effect A"), add("Effect B"), add("Effect C"));
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     let order =
         |harness: &Harness<'_, TextureCraftApp>| harness.state().session.doc.project.layers[&layer].content_effects.iter().map(|e| e.id.0).collect::<Vec<_>>();
@@ -59,6 +61,7 @@ fn an_effect_row_sets_its_blend_mode_and_opacity() {
     let effect = id(execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert", "name": "Effect A"})).unwrap(), "effect");
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     let effect_of = |harness: &Harness<'_, TextureCraftApp>| harness.state().session.doc.project.layers[&layer].content_effects[0].clone();
     assert_eq!(effect, effect_of(&harness).id.0);
@@ -96,6 +99,7 @@ fn an_opacity_drag_starting_without_a_change_is_its_own_undo_step() {
     execute(&mut session, "effect.set", &json!({"effect": effect, "blend": "Multiply"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     let effect_of = |harness: &Harness<'_, TextureCraftApp>| harness.state().session.doc.project.layers[&layer].content_effects[0].clone();
 

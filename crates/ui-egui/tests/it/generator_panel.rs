@@ -23,6 +23,8 @@ fn harness(render: bool) -> (Harness<'static, TextureCraftApp>, LayerId) {
     let builder = Harness::builder().with_size(egui::vec2(1600.0, 2400.0));
     let builder = if render { builder.wgpu() } else { builder };
     let mut harness = builder.build_eframe(|context| TextureCraftApp::new(context, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.dock.close(Panel::Layers);
     harness.state_mut().ui.dock.close(Panel::TextureSetSettings);
     harness.state_mut().ui.dock.focus(Panel::Properties);

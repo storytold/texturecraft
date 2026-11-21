@@ -23,6 +23,8 @@ fn harness() -> (Harness<'static, TextureCraftApp>, LayerId) {
     execute(&mut session, "effect.add.generator", &json!({"generator": "position", "level": 0.5, "name": "Effect M"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     (h, layer)
 }
@@ -140,6 +142,7 @@ fn hidpi_harness() -> (Harness<'static, TextureCraftApp>, LayerId) {
     execute(&mut session, "layer.rename", &json!({"layer": layer.0, "name": "Active one"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1200.0, 800.0)).with_pixels_per_point(2.0).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     (h, layer)
 }

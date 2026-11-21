@@ -20,6 +20,8 @@ fn harness() -> Harness<'static, TextureCraftApp> {
 
     session.view = ViewMode::UvChecker;
     let mut harness = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.mode = Mode::Baking;
     harness.run_steps(3);
     harness

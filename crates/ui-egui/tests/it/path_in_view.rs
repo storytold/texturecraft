@@ -23,6 +23,8 @@ fn harness() -> AppHarness<'static> {
     execute(&mut session, "tool.select", &json!({"tool": "path"})).unwrap();
     // Tall enough that the 2D view's texture square takes A, B and C
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1500.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    h.state_mut().ui.prefs.language = "en".into();
     h.state_mut().ui.layout = ViewLayout::Only2D;
     h.run_steps(4);
     h
@@ -157,6 +159,7 @@ fn clicking_the_2d_view_preserves_a_stored_3d_path_being_edited() {
     let path = session.tool.path.clone();
     let history = session.history_labels();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.layout = ViewLayout::Split;
     harness.run_steps(4);
     let view_3d = harness.state().viewport_rect;
@@ -214,6 +217,7 @@ fn split_harness() -> (AppHarness<'static>, Pos2, Pos2) {
     execute(&mut session, "layer.add.paint", &serde_json::Value::Null).unwrap();
     execute(&mut session, "tool.select", &json!({"tool": "path"})).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.layout = ViewLayout::Split;
     harness.run_steps(4);
     let view_3d = harness.state().viewport_rect;

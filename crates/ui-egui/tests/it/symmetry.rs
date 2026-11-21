@@ -26,6 +26,8 @@ fn app_harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(1024, 256).unwrap();
     let mut harness =
         Harness::builder().with_size(egui::vec2(1760.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().session.tool.tool = Tool::Paint;
     harness.run_steps(4);
     harness

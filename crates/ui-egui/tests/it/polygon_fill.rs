@@ -10,6 +10,8 @@ use texturecraft_ui_egui::TextureCraftApp;
 fn polygon_fill_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().session.tool.tool = Tool::PolygonFill;
     harness.run_steps(4);
     harness
@@ -132,6 +134,7 @@ fn polygon_fill_snapshots() {
     std::fs::create_dir_all(&directory).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(vec2(1600.0, 960.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
     let adapter = harness.state().render_state.as_ref().unwrap().adapter.get_info();
     eprintln!("Offscreen adapter: {} ({:?}), driver {} {}", adapter.name, adapter.backend, adapter.driver, adapter.driver_info);
     harness.state_mut().session.tool.tool = Tool::PolygonFill;

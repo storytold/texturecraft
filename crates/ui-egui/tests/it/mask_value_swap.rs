@@ -10,6 +10,8 @@ fn harness() -> Harness<'static, TextureCraftApp> {
     texturecraft_engine::execute(&mut session, "mask.add.white", &serde_json::Value::Null).unwrap();
     session.target = StackTarget::Mask;
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
 
     harness

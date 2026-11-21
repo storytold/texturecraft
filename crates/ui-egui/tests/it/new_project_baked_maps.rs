@@ -20,6 +20,8 @@ fn harness_for(dir: &Path) -> Harness<'static, TextureCraftApp> {
     std::fs::write(&mesh, TWO_MATERIALS).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    h.state_mut().ui.prefs.language = "en".into();
     h.state_mut().ui.windows.new_project = true;
     h.state_mut().ui.new_project.resolution = 256;
     h.state_mut().ui.new_project.file = Some(mesh.display().to_string());
@@ -134,6 +136,7 @@ fn new_project_baked_maps_snapshots() {
         eprintln!("snapshot adapter: {adapter:?}");
         TextureCraftApp::new(cc, session)
     });
+    h.state_mut().ui.prefs.language = "en".into();
     let dir = TempDir::new("new-project-baked-maps-snapshots");
     let mesh = dir.join("Ball.obj");
     std::fs::write(&mesh, TWO_MATERIALS).unwrap();

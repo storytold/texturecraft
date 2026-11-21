@@ -95,7 +95,7 @@ incomplete validation; they are not measured success rates or speed comparisons.
 | UI/UX fidelity | ~65% | 20 | TBD | Current editing/bake/export UI checked; [gaps](docs/ui-parity.md), ArtCraft UI adoption and revalidation after refactoring remain |
 | File formats / interchange | ~60% | 10 | TBD | Current native save and basic exports exercised; possible `.tcraft`/output-package reworks, unfinished upstream `.mcmat`, `.spp` and consumer validation remain |
 | Hardware (GPU, pen, displays) | ~50% | 8 | TBD | One Windows GPU exercised; pen tilt, pressure across platforms and display coverage remain incomplete |
-| Localization | ~35% | 4 | TBD | Ten picker languages in source; optional shared catalogs/fonts and native-language review need current measurement |
+| Localization | ~35% | 4 | TBD | Eleven picker languages in source; optional shared catalogs/fonts and native-language review need current measurement |
 | Performance | ~40% | 10 | TBD | Dirty-tile/budgeted architecture and benchmark code exist; no matched performance budgets or large-project results from this review |
 | Stability | ~55% | 10 | TBD | Small save/reopen and undo/redo passed; recovery, large projects and long sessions need coverage, including after format/library migrations |
 | Platforms | ~65% | 3 | TBD | Desktop/web build and packaging paths exist; this review ran Windows only |
@@ -158,7 +158,7 @@ exist; older reports must not turn them into fresh missing-feature claims.
 
 ## Languages
 
-The [picker](crates/ui-egui/src/i18n.rs) contains ten languages. Shared catalogs are optional at
+The [picker](crates/ui-egui/src/i18n.rs) contains eleven languages. Shared catalogs are optional at
 build time; missing entries fall back to English, and builds without catalogs offer English only.
 The older [coverage table](docs/localization-parity.md) predates catalog migration, so its “100%”
 rows are not a current measurement. This audit ran an English build without external catalogs.
@@ -170,6 +170,7 @@ rows are not a current measurement. This audit ran an English build without exte
 | Spanish | `es` | Not remeasured | Catalog dependent; native review pending |
 | Hindi | `hi` | No picker entry | Not offered |
 | Arabic | `ar` | Not remeasured | Catalog/font dependent; shaping/layout needs current review |
+| Russian | `ru` | Catalog dependent | Added with the craft-i18n `ru/texturecraft.tsv` catalog; reviewed by a native speaker |
 | French | `fr` | Not remeasured | Catalog dependent; native review pending |
 | Portuguese (Brazil) | `pt-BR` | Not remeasured | Catalog dependent; native review pending |
 | Indonesian | `id` | No picker entry | Not offered |

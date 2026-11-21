@@ -22,6 +22,8 @@ fn selected_generator() -> (Harness<'static, TextureCraftApp>, LayerId) {
         .unwrap();
     texturecraft_engine::execute(&mut session, "layer.select", &json!({"layer": layer.0, "target": effect.0})).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     (harness, effect)
 }
@@ -93,6 +95,7 @@ fn content_levels_pick_the_histogram_channel() {
     texturecraft_engine::execute(&mut session, "layer.add.fill", &json!({"color": [0.5, 0.2, 0.1], "roughness": 0.6})).unwrap();
     texturecraft_engine::execute(&mut session, "effect.add.levels", &json!({"target": "content"})).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     assert_eq!(channel_picker(&harness).value().as_deref(), Some("Base color"), "the layer's first channel");
     channel_picker(&harness).click();

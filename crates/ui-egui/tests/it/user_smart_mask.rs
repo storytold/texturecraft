@@ -16,6 +16,8 @@ fn harness(prepare: impl FnOnce(&mut texturecraft_engine::Session)) -> Harness<'
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     prepare(&mut session);
     let mut harness = Harness::builder().with_size(WINDOW).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    // The labels below are English; a first run would speak the system's language
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     harness
 }
