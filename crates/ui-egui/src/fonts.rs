@@ -36,18 +36,20 @@ const MAX_FONT_BYTES: u64 = 128 << 20;
 pub enum Script {
     Japanese,
     Chinese,
+    TraditionalChinese,
     Korean,
     Arabic,
 }
 
 impl Script {
-    pub const ALL: [Script; 4] = [Script::Japanese, Script::Chinese, Script::Korean, Script::Arabic];
+    pub const ALL: [Script; 5] = [Script::Japanese, Script::Chinese, Script::TraditionalChinese, Script::Korean, Script::Arabic];
 
     /// The script a UI language needs beyond Latin.
     pub fn of_language(code: &str) -> Option<Script> {
         match code {
             "ja" => Some(Script::Japanese),
             "zh-Hans" => Some(Script::Chinese),
+            "zh-Hant" => Some(Script::TraditionalChinese),
             "ko" => Some(Script::Korean),
             "ar" => Some(Script::Arabic),
             _ => None,
@@ -59,6 +61,7 @@ impl Script {
         match self {
             Script::Japanese => "Jpan",
             Script::Chinese => "Hans",
+            Script::TraditionalChinese => "Hant",
             Script::Korean => "Kore",
             Script::Arabic => "Arab",
         }
@@ -74,6 +77,7 @@ impl Script {
             let files: &[&str] = match self {
                 Script::Japanese => &["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"],
                 Script::Chinese => &["msyh.ttc", "simsun.ttc", "simhei.ttf"],
+                Script::TraditionalChinese => &["msjh.ttc", "mingliu.ttc"],
                 Script::Korean => &["malgun.ttf", "gulim.ttc"],
                 Script::Arabic => &["segoeui.ttf", "tahoma.ttf", "arial.ttf"],
             };
@@ -84,6 +88,7 @@ impl Script {
                 Script::Chinese => {
                     &["/System/Library/Fonts/Hiragino Sans GB.ttc", "/System/Library/Fonts/STHeiti Light.ttc", "/System/Library/Fonts/PingFang.ttc"]
                 }
+                Script::TraditionalChinese => &["/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/STHeiti Medium.ttc"],
                 Script::Korean => &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
                 Script::Arabic => &["/System/Library/Fonts/SFArabic.ttf", "/System/Library/Fonts/Supplemental/GeezaPro.ttc"],
             };
@@ -107,6 +112,7 @@ impl Script {
                 Script::Japanese | Script::Arabic => 0,
                 Script::Korean => 1,
                 Script::Chinese => 2,
+                Script::TraditionalChinese => 3,
             };
             for dir in ["/usr/share/fonts/opentype/noto", "/usr/share/fonts/noto-cjk", "/usr/share/fonts/google-noto-cjk", "/usr/local/share/fonts/noto"] {
                 v.push((PathBuf::from(dir).join("NotoSansCJK-Regular.ttc"), face));
@@ -275,6 +281,7 @@ mod tests {
     fn languages_map_to_scripts() {
         assert_eq!(Script::of_language("ja"), Some(Script::Japanese));
         assert_eq!(Script::of_language("zh-Hans"), Some(Script::Chinese));
+        assert_eq!(Script::of_language("zh-Hant"), Some(Script::TraditionalChinese));
         assert_eq!(Script::of_language("ko"), Some(Script::Korean));
         assert_eq!(Script::of_language("ar"), Some(Script::Arabic));
         assert_eq!(Script::of_language("de"), None);
