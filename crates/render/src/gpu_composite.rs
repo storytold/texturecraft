@@ -26,6 +26,9 @@ const FIRST_GENERATOR: u32 = 40;
 const FIRST_EXTENDED_PATTERN: u32 = 48;
 pub(crate) const ROWS: u32 = 64;
 const WORKGROUP: u32 = 8;
+// Typical 8K patterns fit this budget; extreme overlap must use the incremental compositor.
+const MAX_TILE_WORK_PER_UPDATE: u64 = 8 << 30;
+const MAX_TILE_WORK_PER_BAND: u64 = 64 << 20;
 const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
 
 #[derive(Debug)]
@@ -196,6 +199,14 @@ impl CompositeProgram {
 
     pub fn is_mask_preview(&self) -> bool {
         self.mask_preview
+    }
+
+    fn tile_work_per_pixel(&self) -> Result<u64, &'static str> {
+        self.operations.iter().filter(|op| op.ids[1] == TILE_GENERATOR_OPCODE).try_fold(0u64, |work, op| {
+            let tile_work = self.tile_patterns.work_per_sample(op.high[3] as usize).ok_or("A Tile Generator operation has no settings.")?;
+            let planes = if op.procedural[3] == 1 { 3 } else { 1 };
+            Ok(work.saturating_add(tile_work.saturating_mul(planes)))
+        })
     }
 
     pub(crate) fn writes_display(&self, kind: DisplayKind) -> bool {
@@ -1065,17 +1076,18 @@ impl GpuCompositor {
         let (ts, source_size, shift, region) = target;
         let base = textures.first().ok_or("The GPU output textures are missing.")?;
         let extent = (base.width(), base.height());
-        let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
-        let (surface, vertices) = self.surface_inputs(device, queue, program)?;
-        let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
         let region = region.map(|r| r.viewport(shift, extent)).unwrap_or(CompositeRegion { min: [0; 2], max: [extent.0, extent.1] });
         let width = region.max[0].saturating_sub(region.min[0]);
         let height = region.max[1].saturating_sub(region.min[1]);
         if width == 0 || height == 0 {
             return Ok(());
         }
+        let band_rows = composite_band_rows(width, height, program.tile_work_per_pixel()?)?;
+        let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
+        let (surface, vertices) = self.surface_inputs(device, queue, program)?;
+        let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
         let pitch = width.next_multiple_of(64);
-        let area = pitch * ROWS;
+        let area = pitch * band_rows;
         let stride = u64::from(area) * 4;
         let mut words_per_pixel = 0;
         let copies = DisplayKind::ALL.map(|kind| {
@@ -1159,8 +1171,8 @@ impl GpuCompositor {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite") });
             let width = chunk.max[0] - chunk.min[0];
             let left = chunk.min[0];
-            for top in (chunk.min[1]..chunk.max[1]).step_by(ROWS as usize) {
-                let rows = ROWS.min(chunk.max[1] - top);
+            for top in (chunk.min[1]..chunk.max[1]).step_by(band_rows as usize) {
+                let rows = band_rows.min(chunk.max[1] - top);
                 let values = [
                     width,
                     rows,
@@ -1231,6 +1243,14 @@ impl GpuCompositor {
     }
 }
 
+fn composite_band_rows(width: u32, height: u32, tile_work_per_pixel: u64) -> Result<u32, &'static str> {
+    let work_per_row = u64::from(width).saturating_mul(tile_work_per_pixel);
+    if work_per_row.saturating_mul(u64::from(height)) > MAX_TILE_WORK_PER_UPDATE {
+        return Err("Tile Generator overlap exceeds the GPU compositor's interactive work budget.");
+    }
+    Ok((MAX_TILE_WORK_PER_BAND / work_per_row.max(1)).clamp(1, u64::from(ROWS)) as u32)
+}
+
 /// Split only when the paint for this viewport window exceeds the device budget. Include a
 /// source halo because the UV padding shader can choose a texel from an adjoining window.
 fn paint_windows(
@@ -1277,6 +1297,23 @@ mod procedural_tests {
     use texturecraft_core::{Fill, Layer, Mask, OutputResolution, Procedural, TextureSet};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{srgb_lut, to_u16};
+
+    #[test]
+    fn tile_generator_budget_uses_overlap_and_display_region() {
+        use texturecraft_core::{TileGenerator, TileSizeMode};
+
+        let mut patterns = TilePatterns::default();
+        let normal = TileGenerator { amount: [64, 64], ..TileGenerator::default() };
+        let overlapping = TileGenerator { size_mode: TileSizeMode::Absolute, size_absolute: [1.0; 2], ..normal.clone() };
+        let normal = patterns.register(normal, 0);
+        let overlapping = patterns.register(overlapping, 0);
+        let regular_work = patterns.work_per_sample(normal).unwrap();
+        let overlapping_work = patterns.work_per_sample(overlapping).unwrap();
+
+        assert_eq!(composite_band_rows(8192, 8192, regular_work), Ok(ROWS));
+        assert!(composite_band_rows(8192, 8192, overlapping_work).is_err());
+        assert!(composite_band_rows(256, 256, overlapping_work).is_ok_and(|rows| rows < ROWS));
+    }
 
     #[test]
     fn narrow_gpu_generator_ramp_preserves_baked_scalar_precision() {

@@ -24,6 +24,7 @@ struct TilePattern {
     settings: TileGenerator,
     seed: u32,
     layout: TileLayout,
+    work_per_sample: u64,
 }
 
 impl TilePatterns {
@@ -32,13 +33,18 @@ impl TilePatterns {
             return index;
         }
         let layout = prepare_tile_layout(&settings, seed);
+        let work_per_sample = placement_work(&layout);
         let index = self.patterns.len();
-        self.patterns.push(TilePattern { settings, seed, layout });
+        self.patterns.push(TilePattern { settings, seed, layout, work_per_sample });
         index
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.patterns.is_empty()
+    }
+
+    pub(crate) fn work_per_sample(&self, index: usize) -> Option<u64> {
+        self.patterns.get(index).map(|pattern| pattern.work_per_sample)
     }
 
     pub(crate) fn set_images(&mut self, images: &ImageStore) {
@@ -144,6 +150,15 @@ impl TilePatterns {
             })
             .collect()
     }
+}
+
+/// Upper bound on cell visits and periodic copies per sample in tile_generator.wgsl.
+fn placement_work(layout: &TileLayout) -> u64 {
+    let cells = |reach: f32, count: u32| ((reach * 2.0).ceil() + 2.0).min(count as f32) as u64;
+    // The shader checks offsets −3 through 3 on each axis for a wrapped shape.
+    let copies = |radius: f32| ((radius * 2.0).floor() + 1.0).clamp(1.0, 7.0) as u64;
+    let wrapped_copies = layout.placements.iter().flatten().map(|tile| copies(tile.radius.x) * copies(tile.radius.y)).max().unwrap_or(1);
+    cells(layout.reach.x, layout.amount[0]) * cells(layout.reach.y, layout.amount[1]) * wrapped_copies
 }
 
 #[derive(Clone, Copy, Default)]
