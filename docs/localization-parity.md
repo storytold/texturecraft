@@ -33,6 +33,7 @@ generator, filter and brush alpha names (**KEYS** strings, counted by the
 | Japanese | `ja` | KEYS (100%) | yes | CJK glyphs: craft-fonts (BIZ UDPGothic) or system fonts on desktop | no | full | 2 h (review) |
 | German | `de` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
 | Korean | `ko` | KEYS (100%) | yes | Hangul glyphs: system fonts on desktop (craft-fonts has no Korean face yet) | no | full | 2 h (review) |
+| Hebrew | `he` | 0 (catalog pending) | no | Hebrew glyphs: system fonts on desktop (Segoe UI, David, Arial, Tahoma on Windows; SF Hebrew on macOS; Noto Sans Hebrew on Linux); egui orders right to left | no | pending catalog | 4 h |
 | Vietnamese | `vi` | 0 | no | Latin with diacritics | no | none | 3 h |
 | Italian | `it` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
 
@@ -41,7 +42,7 @@ user content (layer, texture set, project names), file format and technical name
 RGB, OpenGL, DirectX), and error details that come from the engine (shown after a translated
 "Couldn't …:" prefix).
 
-## Fonts for Chinese, Japanese, Korean and Arabic
+## Fonts for Chinese, Japanese, Korean, Arabic and Hebrew
 
 egui's built-in fonts have no CJK or Arabic glyphs. `crates/ui-egui/src/fonts.rs` adds fallbacks after the
 app's own fonts (Latin text and row heights keep the default font), loading them only when the
@@ -57,8 +58,11 @@ UI language needs them or the language picker shows every language's own name:
    Windows; Hiragino, PingFang / STHeiti and Apple SD Gothic Neo on macOS; Noto Sans CJK, WenQuanYi,
    Droid Sans Fallback and Nanum Gothic on Linux and FreeBSD. Arabic: Segoe UI / Tahoma / Arial on
    Windows, SF Arabic / Geeza Pro on macOS, Noto Sans Arabic or DejaVu Sans on Linux and FreeBSD.
+   Hebrew: Segoe UI / David / Arial / Tahoma on Windows, SF Hebrew / Arial Hebrew on macOS, Noto Sans Hebrew on Linux and FreeBSD.
+   Hebrew: Segoe UI / David / Arial / Tahoma on Windows, SF Hebrew / Arial Hebrew on macOS, Noto
+   Sans Hebrew or DejaVu Sans on Linux and FreeBSD.
 
-**Web limitation:** a browser page can't read system fonts, so the web build shows CJK text only
+**Web limitation:** a browser page can't read system fonts, so the web build shows CJK, Arabic and Hebrew text only
 with the fonts it embeds: Japanese (and most shared Han characters) and Arabic when built with
 craft-fonts, none without it. A language no available font can draw appears in the picker under its English
 name and can't be selected.
