@@ -21,7 +21,7 @@ image = { workspace = true }
 craft-image-codecs = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
-# The message box for errors that end the app (a Windows release build has no console).
+# The message box for errors that end the app (the Windows app has no console).
 rfd = { workspace = true }
 # Reads the saved System title bar setting before the window opens (eframe's settings format).
 ron = "0.12"

@@ -1,7 +1,7 @@
 //! TextureCraft desktop app.
 //!
 //! Usage: `texturecraft [project.tcraft | mesh.glb] [--control <port>] [--empty] [--version]`
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -291,7 +291,7 @@ fn append_line(file: &std::path::Path, msg: &str) -> bool {
 }
 
 /// An error that ends the app: printed, logged, and (with `dialog`) shown in a message box, since
-/// a Windows release build has no console and would otherwise close without a word.
+/// the Windows desktop app has no console and would otherwise close without a word.
 fn fatal(msg: &str, dialog: bool) {
     eprintln!("texturecraft: {msg}");
     let log = error_log().filter(|f| append_line(f, msg));
