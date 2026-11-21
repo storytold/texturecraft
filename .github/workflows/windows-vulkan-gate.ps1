@@ -21,10 +21,12 @@ $loader = Get-VerifiedArchive `
     'https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/VulkanRT-X64-1.4.363.0-Components.zip' `
     'vulkan.zip' 'A25A927AA8B9F0371048F1861CF88AC3B9BC9B1FB332C42D897C8AB32695769A'
 
-tar.exe -xf $mesa -C $runtime x64/lvp_icd.x86_64.json x64/vulkan_lvp.dll
+# The shared action starts this script from Git Bash, whose tar treats C: as a remote host.
+$tar = Join-Path ([System.Environment]::SystemDirectory) 'tar.exe'
+& $tar -xf $mesa -C $runtime x64/lvp_icd.x86_64.json x64/vulkan_lvp.dll
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $loaderRoot = 'VulkanRT-X64-1.4.363.0-Components/x64'
-tar.exe -xf $loader -C $runtime "$loaderRoot/vulkan-1.dll"
+& $tar -xf $loader -C $runtime "$loaderRoot/vulkan-1.dll"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $env:PATH = "$(Join-Path $runtime $loaderRoot);$env:PATH"
@@ -35,5 +37,6 @@ $env:TC_CI_LAVAPIPE = '1'
 $env:RUST_TEST_THREADS = '2'
 $env:LP_NUM_THREADS = '2'
 
+Write-Host 'Windows CI using Mesa Lavapipe 26.3.0 with Vulkan loader 1.4.363.0'
 cargo xtask ci
 exit $LASTEXITCODE
