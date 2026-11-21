@@ -1503,6 +1503,75 @@ mod procedural_tests {
     }
 
     #[test]
+    fn baked_lighting_uses_the_covered_padding_source_with_or_without_ao() {
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, pad_tiles};
+        use texturecraft_compose::tile_bytes;
+        use texturecraft_geom::glam::Vec2;
+        use texturecraft_texel::DilationMap;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = TILE;
+        const PADDING: u32 = 4;
+        let mut mesh = primitives::plane(1.0, 1);
+        mesh.normals.fill(Vec3::Z);
+        for uv in &mut mesh.uvs {
+            *uv = *uv * 0.5 + Vec2::splat(0.25);
+        }
+        let mesh = Arc::new(mesh);
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let padding = DilationMap::new(&gbuf.coverage_mask(), SIZE, SIZE, Some(PADDING));
+        let gutter = ((SIZE / 2) * SIZE + SIZE / 4 - 1) as usize;
+        assert!(!gbuf.covered(gutter) && padding.source(SIZE / 4 - 1, SIZE / 2).is_some());
+
+        let mut project = Project::new("Padded baked lighting", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let channels = [Channel::BaseColor];
+        let owner = project.alloc_id();
+        let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.8, 0.45, 0.1]))]), ..Default::default() };
+        let mut layer = Layer::new(owner, "Lit surface", LayerKind::Fill(fill), &channels);
+        let filter = Filter::BakedLighting { azimuth: 0.0, elevation: 20.0, light: 0.45, ambient: 0.45, occlusion: 1.0 };
+        layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(filter)));
+        project.insert_layer(0, layer, None, false).unwrap();
+
+        // The gutter is in a different baked AO cell from its covered source.
+        let ao = BakedMaps { resolution: 4, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new([0.05, 0.6, 0.4, 0.2].repeat(4)))]) };
+        let empty = BakedMaps::default();
+        let pixels = PixelStore::default();
+        let images = ImageStore::default();
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        let mut reds = [0; 2];
+        for (i, baked) in [None, Some(&ao)].into_iter().enumerate() {
+            let inputs = Inputs {
+                project: &project,
+                ts: 0,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked: baked.unwrap_or(&empty),
+                block_scales: project.texture_sets[0].block_scales(),
+                preview: None,
+                images: &images,
+                bounds: mesh.bounds(),
+            };
+            let mut oracle = Composite::new(&channels, SIZE);
+            composite_tiles(&inputs, &mut oracle, &[(0, 0)]);
+            pad_tiles(&mut oracle, &padding, &[(0, 0)]);
+            let expected = tile_bytes(&oracle, inputs.baked, DisplayKind::BaseColor, 0, 0);
+
+            let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+            program.set_surface_inputs(&mesh, &gbuf, baked).unwrap();
+            program.set_coverage(gbuf.clone(), PADDING);
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+            let texture = gpu.renderer.display_textures()[0][DisplayKind::BaseColor as usize];
+            let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1), "covered and padded lighting must match the CPU, AO={}", baked.is_some());
+            reds[i] = actual[gutter * 4];
+        }
+        assert!(reds[0] > reds[1], "missing AO leaves the ambient light at full strength in the gutter");
+    }
+
+    #[test]
     fn narrow_gpu_generator_ramp_preserves_baked_scalar_precision() {
         use texturecraft_compose::eval::{Inputs, mask_image};
 
