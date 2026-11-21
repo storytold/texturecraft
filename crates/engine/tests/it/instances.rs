@@ -276,3 +276,149 @@ fn budgeted_updates_spread_work_and_end_identical() {
     assert!(s.caches[0].composite == full, "chunked compositing gives the same pixels");
     assert!(s.memory().composites > 0);
 }
+
+#[test]
+fn visible_tiles_are_processed_before_hidden_tiles() {
+    let mut s = session();
+    let mut visible = texturecraft_engine::session::VisibleTiles::default();
+    visible.refresh(&s, || false);
+    let mut hidden_count = 0;
+    let mut visible_count = 0;
+    for (ts, cache) in s.caches.iter_mut().enumerate() {
+        cache.invalidate_all();
+        cache.chunk = 1;
+        for tile in &cache.dirty {
+            if visible.contains(ts, tile) {
+                visible_count += 1;
+            } else {
+                hidden_count += 1;
+            }
+        }
+    }
+    assert!(visible_count > 0 && hidden_count > 0);
+    for _ in 0..visible_count {
+        for cache in &mut s.caches {
+            cache.chunk = 1;
+        }
+        s.update_with_visible(0.0, || 1.0, Some(&visible));
+    }
+    assert_eq!(s.pending_tiles(), hidden_count);
+    assert!(s.caches.iter().enumerate().all(|(ts, cache)| cache.dirty.iter().all(|tile| !visible.contains(ts, tile))));
+    s.camera.yaw += 1.0;
+    assert!(!visible.view_matches(&s));
+    visible.refresh(&s, || false);
+    assert!(visible.view_matches(&s));
+    s.update_with_visible(f64::INFINITY, || 0.0, Some(&visible));
+    assert_eq!(s.pending_tiles(), 0);
+}
+
+/// A stack whose mask and content both read their neighbours, so reordering tiles could change pixels if it went wrong.
+fn filtered_stack(s: &mut Session) -> Value {
+    execute(s, "textureSet.resolution", &json!({"ts": 0, "resolution": 1024})).unwrap();
+    let layer = execute(s, "layer.add.fill", &Value::Null).unwrap()["layer"].clone();
+    execute(s, "layer.fill.set", &json!({"channel": "baseColor", "procedural": "grunge"})).unwrap();
+    execute(s, "effect.add.filter", &json!({"target": "content", "filter": "blur", "radius": 6})).unwrap();
+    execute(s, "mask.add.black", &Value::Null).unwrap();
+    execute(s, "effect.add.generator", &json!({"generator": "position"})).unwrap();
+    execute(s, "effect.add.filter", &json!({"filter": "blur", "radius": 30})).unwrap();
+    s.update();
+    layer
+}
+
+#[test]
+fn hinted_budgeted_updates_end_identical_to_a_full_update() {
+    // The same edit, once finished by a full update and once by hinted slices that start from the old pixels
+    let edit = |s: &mut Session, layer: &Value| {
+        execute(s, "layer.fill.set", &json!({"layer": layer, "channel": "baseColor", "procedural": "clouds"})).unwrap();
+    };
+    let mut reference = session();
+    let layer = filtered_stack(&mut reference);
+    edit(&mut reference, &layer);
+    reference.update();
+
+    let mut s = session();
+    let layer = filtered_stack(&mut s);
+    edit(&mut s, &layer);
+    assert!(s.pending_tiles() > 0);
+    assert!(s.caches[0].composite != reference.caches[0].composite, "the edit changes the output, so the old pixels are stale");
+
+    let mut hint = texturecraft_engine::session::VisibleTiles::default();
+    let mut calls = 0;
+    while s.pending_tiles() > 0 {
+        hint.refresh(&s, || false);
+        for cache in &mut s.caches {
+            cache.chunk = 3;
+        }
+        // A clock that is always over budget: one small chunk per set per call
+        s.update_with_visible(0.0, || 1.0, Some(&hint));
+        calls += 1;
+        if calls == 3 {
+            s.camera.yaw += 150.0;
+        }
+        assert!(calls < 10_000, "the pass drains");
+    }
+    assert!(calls > 3, "the work was spread over calls and over a camera turn");
+    for (ts, cache) in s.caches.iter().enumerate() {
+        assert!(cache.composite == reference.caches[ts].composite, "texture set {ts}: hinted chunked compositing gives the pixels of a full update");
+    }
+}
+
+#[test]
+fn newly_visible_tiles_go_first_after_a_camera_turn() {
+    let mut s = session();
+    execute(&mut s, "textureSet.resolution", &json!({"ts": 0, "resolution": 1024})).unwrap();
+    let mut hint = texturecraft_engine::session::VisibleTiles::default();
+    hint.refresh(&s, || false);
+    for cache in &mut s.caches {
+        cache.invalidate_all();
+    }
+    // Finish what the first view shows
+    while s.caches.iter().enumerate().any(|(ts, cache)| cache.dirty.iter().any(|tile| hint.contains(ts, tile))) {
+        for cache in &mut s.caches {
+            cache.chunk = 1;
+        }
+        s.update_with_visible(0.0, || 1.0, Some(&hint));
+    }
+    // Turn to the far side and let the sampler finish its passes
+    s.camera.yaw += 180.0;
+    for _ in 0..20 {
+        hint.refresh(&s, || false);
+    }
+    assert!(hint.view_matches(&s));
+    let dirty_in_view = |s: &Session, hint: &texturecraft_engine::session::VisibleTiles| -> usize {
+        s.caches.iter().enumerate().map(|(ts, cache)| cache.dirty.iter().filter(|tile| hint.contains(ts, tile)).count()).sum()
+    };
+    let fresh = dirty_in_view(&s, &hint);
+    let elsewhere = s.pending_tiles() - fresh;
+    assert!(fresh > 0 && elsewhere > 0, "the far side has tiles of its own and others wait");
+    for _ in 0..fresh {
+        for cache in &mut s.caches {
+            cache.chunk = 1;
+        }
+        s.update_with_visible(0.0, || 1.0, Some(&hint));
+    }
+    assert_eq!(dirty_in_view(&s, &hint), 0, "everything the new view shows is composited first");
+    assert_eq!(s.pending_tiles(), elsewhere, "tiles outside the new view were not touched while those waited");
+}
+
+#[test]
+fn hiding_the_front_material_reveals_the_tiles_behind_it() {
+    let mut mesh = primitives::plane(2.0, 1);
+    // Two coincident UV layouts on parallel surfaces, viewed straight from above.
+    let mut back = mesh.clone();
+    for position in &mut back.positions {
+        position.y -= 0.1;
+    }
+    mesh.append(&back);
+    let mut s = Session::new_project("overlap", mesh, "test", None, 128).unwrap();
+    s.camera.pitch = 1.55;
+    s.camera.ortho = true;
+    let mut hint = texturecraft_engine::session::VisibleTiles::default();
+    hint.refresh(&s, || false);
+    assert!(hint.contains(0, &(0, 0)));
+    s.doc.project.texture_sets[0].visible = false;
+    assert!(!hint.view_matches(&s));
+    hint.refresh(&s, || false);
+    assert!(!hint.contains(0, &(0, 0)));
+    assert!(hint.contains(1, &(0, 0)));
+}

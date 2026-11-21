@@ -551,3 +551,49 @@ fn bench_sliced_filters_4k() {
         println!("[sliced 4096², {label}] one call {direct:.2?}; in 30 ms slices {frames} frames, worst {longest_frame:.2?}, total {:.2?}", clock.elapsed());
     }
 }
+
+/// Frame times while the camera orbits during a sliced update, with and without the visible-tile hint. The hint's
+/// sampling runs inside the frame, so it is part of what is measured (release, `--ignored --nocapture`).
+#[test]
+#[ignore]
+fn bench_orbit_during_sliced_update_2k() {
+    for hinted in [false, true] {
+        let mut session = Session::new_project("orbit", primitives::sphere(1.0, 64, 32), "builtin:sphere", None, 2048).unwrap();
+        session.viewport = Vec2::new(800.0, 800.0);
+        let run = |session: &mut Session, id: &str, params: Value| execute(session, id, &params).unwrap();
+        run(&mut session, "layer.add.fill", json!({"color": [0.6, 0.5, 0.4], "roughness": 0.6}));
+        run(&mut session, "layer.add.fill", json!({"color": [0.1, 0.3, 0.6]}));
+        run(&mut session, "mask.add.black", Value::Null);
+        run(&mut session, "effect.add.generator", json!({"generator": "position", "level": 0.5}));
+        run(&mut session, "effect.add.filter", json!({"filter": "blur", "radius": 8}));
+        session.update();
+
+        session.caches[0].invalidate_all();
+        let mut hint = texturecraft_engine::session::VisibleTiles::default();
+        let clock = Instant::now();
+        let elapsed_ms = || clock.elapsed().as_secs_f64() * 1000.0;
+        let mut frames: Vec<Duration> = Vec::new();
+        while session.pending_tiles() > 0 {
+            let started = Instant::now();
+            session.camera.yaw += 1.5;
+            if hinted {
+                let sampling = Instant::now();
+                hint.refresh(&session, || sampling.elapsed().as_secs_f64() > 0.001);
+                session.update_with_visible(30.0, elapsed_ms, Some(&hint));
+            } else {
+                session.update_for(30.0, elapsed_ms);
+            }
+            frames.push(started.elapsed());
+        }
+        let total = clock.elapsed();
+        frames.sort();
+        let p95 = frames[(frames.len() * 95 / 100).min(frames.len() - 1)];
+        let label = if hinted { "with the hint" } else { "without the hint" };
+        println!(
+            "[orbit 2048², {label}] {} frames, median {:.2?}, p95 {p95:.2?}, worst {:.2?}, total {total:.2?}",
+            frames.len(),
+            frames[frames.len() / 2],
+            frames[frames.len() - 1]
+        );
+    }
+}
