@@ -5,6 +5,7 @@ struct Params {
     mesh: vec4<f32>, // center and radius of the normalized UV surface
     ortho: vec4<f32>, // orthographic ray direction and enable
     shape: vec4<f32>, // alpha extents, roundness, contrast
+    alpha_rotation: vec4<f32>, // sine and cosine of the alpha angle
     flags: vec4<u32>, // UV mode, culling, invert brush tip, quick-mask mode
     stamp_blending: u32,
 }
@@ -24,6 +25,8 @@ override alpha_kind: u32 = 0u;
 // Match texturecraft_paint::StampBlending.
 const BLEND_LIGHTEN: u32 = 1u;
 const BLEND_ADD: u32 = 2u;
+const LIBRARY_ALPHA_KIND: u32 = 7u;
+const IMAGE_ALPHA_KIND: u32 = 8u;
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(3) var uv_surface: texture_2d<u32>;
 @group(0) @binding(4) var<storage, read> vertices: array<Vertex>;
@@ -32,6 +35,7 @@ const BLEND_ADD: u32 = 2u;
 @group(0) @binding(7) var<storage, read> dabs: array<Dab>;
 @group(0) @binding(8) var<storage, read> tiles: array<u32>;
 @group(0) @binding(9) var<storage, read_write> alpha_out: array<u32>;
+@group(0) @binding(10) var tip: texture_2d<f32>;
 
 fn accept(i: u32, direction: vec3<f32>) -> bool { return true; }
 
@@ -130,8 +134,60 @@ fn procedural_alpha(p: vec2<f32>, hardness: f32, seed: u32) -> f32 {
     }
 }
 
-fn stamp_shape(local: vec2<f32>, hardness: f32, seed: u32) -> f32 {
-    let value = procedural_alpha(local / params.shape.xy, hardness, seed);
+fn tip_texel(p: vec2<i32>, side: i32, mip: u32) -> f32 {
+    if any(p < vec2(0)) || any(p >= vec2(side)) { return 0.0; }
+    return textureLoad(tip, p, mip).x;
+}
+
+fn library_alpha(local: vec2<f32>, radius: f32) -> f32 {
+    let base = f32(textureDimensions(tip, 0).x);
+    let diameter = radius * 2.0 * min(params.shape.x, params.shape.y);
+    var mip = 0u;
+    if diameter <= base {
+        let requested = floor(log2(base / max(diameter, 1.0)));
+        mip = u32(clamp(requested, 0.0, f32(textureNumLevels(tip) - 1u)));
+    }
+    let side = i32(textureDimensions(tip, mip).x);
+    let p = (local * vec2(0.5, -0.5) + 0.5) * f32(side) - 0.5;
+    if any(p <= vec2(-1.0)) || any(p >= vec2(f32(side))) { return 0.0; }
+    let corner = vec2<i32>(floor(p));
+    let t = fract(p);
+    let top = mix(tip_texel(corner, side, mip), tip_texel(corner + vec2(1, 0), side, mip), t.x);
+    let bottom = mix(tip_texel(corner + vec2(0, 1), side, mip), tip_texel(corner + vec2(1, 1), side, mip), t.x);
+    return mix(top, bottom, t.y);
+}
+
+fn wrapped_tip_texel(pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> {
+    return textureLoad(tip, (pixel + size) % size, 0);
+}
+
+fn image_alpha(local: vec2<f32>) -> f32 {
+    let size = vec2<i32>(textureDimensions(tip, 0));
+    let aspect = f32(size.x) / f32(size.y);
+    let p = local * vec2(max(1.0 / aspect, 1.0), max(aspect, 1.0));
+    if !all(abs(p) <= vec2(1.0)) { return 0.0; }
+    let grid = (p * vec2(0.5, -0.5) + 0.5) * vec2<f32>(size) - 0.5;
+    let at = vec2<i32>(floor(grid));
+    let t = fract(grid);
+    let top = mix(wrapped_tip_texel(at, size), wrapped_tip_texel(at + vec2(1, 0), size), t.x);
+    let bottom = mix(wrapped_tip_texel(at + vec2(0, 1), size), wrapped_tip_texel(at + vec2(1, 1), size), t.x);
+    let rgba = mix(top, bottom, t.y);
+    return clamp(dot(rgba.rgb, vec3(0.2126, 0.7152, 0.0722)) * rgba.a, 0.0, 1.0);
+}
+
+fn stamp_shape(local: vec2<f32>, hardness: f32, seed: u32, radius: f32) -> f32 {
+    let sin_angle = params.alpha_rotation.x;
+    let cos_angle = params.alpha_rotation.y;
+    let rotated = vec2(local.x * cos_angle + local.y * sin_angle, -local.x * sin_angle + local.y * cos_angle);
+    let tip_point = rotated / params.shape.xy;
+    var value = 0.0;
+    if alpha_kind == LIBRARY_ALPHA_KIND {
+        value = library_alpha(tip_point, radius);
+    } else if alpha_kind == IMAGE_ALPHA_KIND {
+        value = image_alpha(tip_point);
+    } else {
+        value = procedural_alpha(tip_point, hardness, seed);
+    }
     let graded = clamp((value - 0.5) * params.shape.w + 0.5, 0.0, 1.0);
     if params.flags.z == 0u { return graded; }
     return select(0.0, 1.0 - graded, all(abs(local) <= vec2(1.0)));
@@ -178,6 +234,7 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32, mask: u32) -> u32 {
     var geometric = vec3(0.0);
     var view = BrushView(vec3(0.0), vec3(0.0), 1.0);
     var has_normal = false;
+    var texels_per_unit = 1.0;
     if !uv_mode {
         let xy = unpack2x16unorm(hit.y);
         var weights = vec3(max(0.0, 1.0 - xy.x - xy.y), xy);
@@ -204,7 +261,17 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32, mask: u32) -> u32 {
         }
         point = (a.position.xyz * weights.x + b.position.xyz * weights.y + c.position.xyz * weights.z) * params.mesh.w + params.mesh.xyz;
         normal = unit(interpolated, vec3(0.0));
-        geometric = unit(cross(b.position.xyz - a.position.xyz, c.position.xyz - a.position.xyz), vec3(0.0));
+        let world_cross = cross(b.position.xyz - a.position.xyz, c.position.xyz - a.position.xyz);
+        geometric = unit(world_cross, vec3(0.0));
+        if alpha_kind == LIBRARY_ALPHA_KIND {
+            let size = vec2<f32>(textureDimensions(uv_surface));
+            let uv_a = vec2(a.position.w, a.normal.w);
+            let uv_b = vec2(b.position.w, b.normal.w);
+            let uv_c = vec2(c.position.w, c.normal.w);
+            let area = abs(edge(uv_a, uv_b, uv_c)) * size.x * size.y;
+            let world_area = length(world_cross) * params.mesh.w * params.mesh.w;
+            texels_per_unit = sqrt(area / world_area);
+        }
         has_normal = dot(normal, normal) > 0.0;
         if has_normal {
             view = brush_view(point, geometric, normal);
@@ -242,7 +309,7 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32, mask: u32) -> u32 {
                 fade = f * f * (3.0 - 2.0 * f);
             }
         }
-        let opacity = stamp_shape(local, dab.bitangent.w, dab.seed) * dab.tangent.w * fade * limit;
+        let opacity = stamp_shape(local, dab.bitangent.w, dab.seed, dab.center.w * texels_per_unit) * dab.tangent.w * fade * limit;
         if opacity <= 0.0 { continue; }
         if !uv_mode && !tested_visibility {
             if !visible(point, dab_view.geometric, dab_view.direction, dab_view.facing) {

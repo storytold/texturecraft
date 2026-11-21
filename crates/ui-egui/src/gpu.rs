@@ -195,8 +195,8 @@ impl DeviceStroke {
         queue: &wgpu::Queue,
         surface: brush_device::BrushSurface,
     ) -> Result<Box<dyn brush_device::DeviceStroke>, String> {
-        let brush_device::BrushSurface { mesh, bvh, uv, material, depth, settings, stencil, limit } = surface;
-        let stroke = renderer.start_gpu_brush(device, queue, BrushInput { mesh, bvh, uv, material, depth, settings, stencil, limit })?;
+        let brush_device::BrushSurface { mesh, bvh, uv, material, depth, settings, alpha_image, stencil, limit } = surface;
+        let stroke = renderer.start_gpu_brush(device, queue, BrushInput { mesh, bvh, uv, material, depth, settings, alpha_image, stencil, limit })?;
         Ok(Box::new(Self(stroke)))
     }
 }

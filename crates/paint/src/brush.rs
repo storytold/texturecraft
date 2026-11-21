@@ -1,12 +1,14 @@
 //! Brush settings and alpha shapes.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use texturecraft_compose::ImageRes;
 use texturecraft_geom::glam::{Mat3, Vec3};
 use texturecraft_texel::noise;
 
 use crate::alpha_params::AlphaParams;
-use crate::alphas::AlphaImage;
+use crate::alphas::{self, AlphaImage, LibraryAlpha, LibraryAlphaParams};
 
 /// How the stamp plane is oriented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -122,20 +124,24 @@ impl BrushAlpha {
 /// is set, else the procedural alpha.
 #[derive(Clone, Copy)]
 pub struct Shape<'a> {
-    pub alpha: BrushAlpha,
-    pub image: Option<&'a ImageRes>,
-    pub library: Option<&'a AlphaImage>,
-    /// Extent, roundness, contrast and invert shared by every kind of alpha
-    pub params: AlphaParams,
-    /// Mip level of `library` to sample (set per stamp by [`Shape::at_radius`]).
-    pub level: usize,
+    alpha: BrushAlpha,
+    image: Option<&'a ImageRes>,
+    library: Option<&'a AlphaImage>,
+    params: AlphaParams,
+    rotation: (f32, f32),
+    level: usize,
 }
 
-impl Shape<'_> {
+impl<'a> Shape<'a> {
+    pub fn new(alpha: BrushAlpha, image: Option<&'a ImageRes>, library: Option<&'a AlphaImage>, params: AlphaParams) -> Self {
+        Self { alpha, image, library, params, rotation: params.rotation.to_radians().sin_cos(), level: 0 }
+    }
+
     /// Shape value at local stamp coordinates (see [`BrushAlpha::sample`]), placed and graded by
     /// the [`AlphaParams`]: the same for image, library and procedural alphas.
     pub fn sample(&self, lx: f32, ly: f32, hardness: f32, seed: u32) -> f32 {
-        let (x, y) = self.params.place(lx, ly);
+        let (sin, cos) = self.rotation;
+        let (x, y) = ((lx * cos + ly * sin) / self.params.size_x, (-lx * sin + ly * cos) / self.params.size_y);
         let value = match (self.image, self.library) {
             (Some(img), _) => image_alpha(img, x, y),
             (None, Some(lib)) => lib.sample(self.level, x, y),
@@ -357,7 +363,10 @@ pub struct BrushSettings {
     /// Built-in library alpha id used as the stamp shape (see [`crate::alphas`]).
     #[serde(default)]
     pub alpha_library: Option<String>,
-    /// Extent, roundness, contrast and invert of whichever alpha is used.
+    /// Generator changes for the selected library alpha. Missing settings are its defaults.
+    #[serde(default, skip_serializing_if = "LibraryAlphaParams::is_empty")]
+    pub alpha_library_params: LibraryAlphaParams,
+    /// Extent, rotation, roundness, contrast and invert of whichever alpha is used.
     #[serde(default)]
     pub alpha_params: AlphaParams,
     /// Only paint surfaces facing the camera.
@@ -393,6 +402,7 @@ impl Default for BrushSettings {
             alpha: BrushAlpha::Round,
             alpha_image: None,
             alpha_library: None,
+            alpha_library_params: LibraryAlphaParams::new(),
             alpha_params: AlphaParams::default(),
             backface_culling: true,
             depth: 1.0,
@@ -404,6 +414,14 @@ impl Default for BrushSettings {
 }
 
 impl BrushSettings {
+    pub fn library_alpha(&self) -> Option<&'static LibraryAlpha> {
+        self.alpha_library.as_deref().and_then(alphas::find)
+    }
+
+    pub fn library_alpha_image(&self) -> Option<Arc<AlphaImage>> {
+        self.library_alpha().map(|alpha| alpha.configured_image(&self.alpha_library_params))
+    }
+
     /// Radius of a 2D (UV) stamp as a fraction of the UV square, for pen `pressure` 0..1: twice the
     /// brush size, shrunk towards `min_size` by a light pen. Painting and the 2D cursor share it.
     pub fn uv_stamp_radius(&self, pressure: f32) -> f32 {
@@ -431,6 +449,7 @@ impl BrushSettings {
             jitter_position: clamp_finite(self.jitter_position, 0.0, 4.0, 0.0),
             depth: clamp_finite(self.depth, 0.05, 4.0, 1.0),
             alpha_params: self.alpha_params.sanitized(),
+            alpha_library_params: self.library_alpha().map(|alpha| alpha.sanitized_parameters(&self.alpha_library_params)).unwrap_or_default(),
             symmetry: Symmetry {
                 radial: self.symmetry.radial.min(MAX_RADIAL_COPIES),
                 axis: self.symmetry.axis.min(LAST_AXIS),
@@ -480,7 +499,7 @@ mod tests {
     fn image_alpha_follows_the_image_and_is_zero_outside() {
         // Left half white, right half black (2×1 image, sampled at texel centers)
         let img = ImageRes { width: 2, height: 1, rgba: vec![[1.0; 4], [0.0, 0.0, 0.0, 1.0]], srgb: true };
-        let shape = Shape { alpha: BrushAlpha::Round, image: Some(&img), library: None, params: AlphaParams::default(), level: 0 };
+        let shape = Shape::new(BrushAlpha::Round, Some(&img), None, AlphaParams::default());
         assert!(shape.sample(-0.5, 0.0, 0.5, 0) > 0.99);
         assert!(shape.sample(0.5, 0.0, 0.5, 0) < 0.01);
         assert_eq!(shape.sample(1.5, 0.0, 0.5, 0), 0.0);
@@ -512,7 +531,7 @@ mod tests {
     }
 
     fn procedural(alpha: BrushAlpha, params: AlphaParams) -> Shape<'static> {
-        Shape { alpha, image: None, library: None, params, level: 0 }
+        Shape::new(alpha, None, None, params)
     }
 
     #[test]
@@ -524,10 +543,10 @@ mod tests {
             srgb: true,
         };
         let library = crate::alphas::library().first().map(|alpha| alpha.image());
-        let kinds = BrushAlpha::ALL.map(|alpha| Shape { alpha, image: None, library: None, params: AlphaParams::default(), level: 0 });
+        let kinds = BrushAlpha::ALL.map(|alpha| Shape::new(alpha, None, None, AlphaParams::default()));
         for shape in kinds.into_iter().chain([
-            Shape { alpha: BrushAlpha::Round, image: Some(&img), library: None, params: AlphaParams::default(), level: 0 },
-            Shape { alpha: BrushAlpha::Round, image: None, library, params: AlphaParams::default(), level: 0 },
+            Shape::new(BrushAlpha::Round, Some(&img), None, AlphaParams::default()),
+            Shape::new(BrushAlpha::Round, None, library, AlphaParams::default()),
         ]) {
             for (x, y) in grid() {
                 let before = match (shape.image, shape.library) {
@@ -558,11 +577,11 @@ mod tests {
     fn sizes_apply_to_image_and_library_alphas_too() {
         let img = ImageRes { width: 1, height: 1, rgba: vec![[1.0; 4]], srgb: true };
         let params = AlphaParams { size_x: 0.5, ..AlphaParams::default() };
-        let image = Shape { alpha: BrushAlpha::Round, image: Some(&img), library: None, params, level: 0 };
+        let image = Shape::new(BrushAlpha::Round, Some(&img), None, params);
         assert_eq!((image.sample(0.4, 0.0, 0.5, 0) > 0.99, image.sample(0.6, 0.0, 0.5, 0)), (true, 0.0));
 
         let library = crate::alphas::find("square").map(|alpha| alpha.image());
-        let shape = |params| Shape { alpha: BrushAlpha::Round, image: None, library, params, level: 0 };
+        let shape = |params| Shape::new(BrushAlpha::Round, None, library, params);
         assert!(shape(AlphaParams::default()).sample(0.7, 0.0, 0.5, 0) > 0.5, "a library square is wide open");
         assert_eq!(shape(params).sample(0.7, 0.0, 0.5, 0), 0.0);
     }
@@ -607,8 +626,8 @@ mod tests {
 
     #[test]
     fn sanitize_clamps_alpha_parameters() {
-        let wild = AlphaParams { size_x: 0.0, size_y: f32::NAN, roundness: 3.0, contrast: -2.0, invert: true };
+        let wild = AlphaParams { size_x: 0.0, size_y: f32::NAN, rotation: f32::NAN, roundness: 3.0, contrast: -2.0, invert: true };
         let clean = BrushSettings { alpha_params: wild, ..BrushSettings::default() }.sanitized().alpha_params;
-        assert_eq!(clean, AlphaParams { size_x: crate::alpha_params::MIN_ALPHA_SIZE, size_y: 1.0, roundness: 1.0, contrast: 1.0, invert: true });
+        assert_eq!(clean, AlphaParams { size_x: crate::alpha_params::MIN_ALPHA_SIZE, size_y: 1.0, rotation: 0.0, roundness: 1.0, contrast: 1.0, invert: true });
     }
 }

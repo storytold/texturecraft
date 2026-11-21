@@ -383,12 +383,12 @@ impl Session {
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
         let settings = &stroke.settings;
+        let image_alpha = settings.alpha_image.as_ref().and_then(|name| self.images.get(name)).cloned();
+        let library_alpha = if image_alpha.is_none() { settings.library_alpha_image() } else { None };
         let gpu_tool = tool == Tool::Paint || (quick_mask && erase) || (tool == Tool::Projection && !uv_mode && stencil.is_some());
         let device = if gpu_tool
             && canvas.pickup.is_none()
             && !settings.symmetry.any()
-            && settings.alpha_image.is_none()
-            && settings.alpha_library.is_none()
             && let Some(backend) = &self.brush_device
             && let Some(cache) = self.caches.get(ts)
             && backend.surface.ptr_eq(&std::sync::Arc::downgrade(&cache.gbuf))
@@ -406,6 +406,7 @@ impl Session {
                 material: self.doc.project.texture_set(ts)?.material,
                 depth: depth.clone(),
                 settings: settings.clone(),
+                alpha_image: image_alpha.clone(),
                 stencil: stencil.clone(),
                 limit: canvas.limit.clone(),
             };
@@ -430,6 +431,8 @@ impl Session {
             ts,
             target,
             stroke,
+            image_alpha,
+            library_alpha,
             canvas,
             bvh,
             depth,
@@ -476,18 +479,6 @@ impl Session {
                 Ok(Some((PickupMode::Clone { offset: [0; 2] }, offset)))
             }
             _ => Ok(None),
-        }
-    }
-
-    /// The brush shape: the alpha image when one is set and loaded, else the library alpha when
-    /// one is set, else the procedural alpha.
-    fn shape<'a>(images: &'a texturecraft_compose::ImageStore, b: &texturecraft_paint::BrushSettings) -> Shape<'a> {
-        Shape {
-            alpha: b.alpha,
-            image: b.alpha_image.as_ref().and_then(|n| images.get(n)).map(|i| &**i),
-            library: b.alpha_library.as_deref().and_then(texturecraft_paint::alphas::find).map(|a| a.image()),
-            params: b.alpha_params,
-            level: 0,
         }
     }
 
@@ -563,7 +554,7 @@ impl Session {
             Some(previous) => (previous, uv - previous, (step - progress.carry).max(0.0)),
         };
         let length = segment.length();
-        let shape = Self::shape(&self.images, settings);
+        let shape = Shape::new(settings.alpha, active.image_alpha.as_deref(), active.library_alpha.as_deref(), settings.alpha_params);
 
         // The copies of each dab: the Clone tool's pickup offset is fixed, so it paints none
         let material = self.doc.project.texture_sets.get(active.ts).map(|t| t.material).unwrap_or(0);
@@ -637,7 +628,7 @@ impl Session {
             eye: st.camera.eye(),
             backface_culling: st.stroke.settings.backface_culling,
             angle_fade: st.stroke.settings.angle_fade,
-            shape: Self::shape(&self.images, &st.stroke.settings),
+            shape: Shape::new(st.stroke.settings.alpha, st.image_alpha.as_deref(), st.library_alpha.as_deref(), st.stroke.settings.alpha_params),
         };
         if let Some(device) = &mut st.device {
             match device.append_world(&stamps) {
@@ -729,7 +720,8 @@ impl Session {
                 stroke.display_tiles.append(&mut stroke.canvas.dirty);
                 self.log.performance(format!("GPU stroke readback failed, replaying stroke on CPU: {error}"));
                 let cache = self.caches.get(stroke.ts)?;
-                let shape = Self::shape(&self.images, &stroke.stroke.settings);
+                let settings = &stroke.stroke.settings;
+                let shape = Shape::new(settings.alpha, stroke.image_alpha.as_deref(), stroke.library_alpha.as_deref(), settings.alpha_params);
                 if stroke.uv.is_some() {
                     for stamps in stroke.device_uv_stamps.chunks(UV_STAMP_BATCH) {
                         texturecraft_paint::rasterize_uv(&mut stroke.canvas, &cache.gbuf, shape, stamps);

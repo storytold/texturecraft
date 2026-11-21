@@ -463,6 +463,8 @@ pub(crate) struct ActiveStroke {
     /// None: the stroke edits the quick mask.
     pub target: Option<PaintTarget>,
     pub stroke: Stroke,
+    pub image_alpha: Option<Arc<texturecraft_compose::ImageRes>>,
+    pub library_alpha: Option<Arc<texturecraft_paint::alphas::AlphaImage>>,
     pub canvas: StrokeCanvas,
     /// Visible scene captured when a 3D stroke started. UV strokes use the full mesh.
     pub bvh: Arc<Bvh>,

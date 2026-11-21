@@ -11,7 +11,7 @@ use texturecraft_engine::core::{
 };
 use texturecraft_engine::filter_lib::scalar_params;
 use texturecraft_engine::paint::alpha_params::MAX_ALPHA_CONTRAST;
-use texturecraft_engine::paint::{BrushAlpha, BrushSettings, StampBlending, alphas};
+use texturecraft_engine::paint::{BrushAlpha, BrushSettings, StampBlending};
 use texturecraft_engine::{CloneFrom, StackTarget, Tool};
 
 use crate::TextureCraftApp;
@@ -2379,7 +2379,8 @@ fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     });
     let brush = &app.session.tool.brush;
     let (current, image, hardness) = (brush.alpha, brush.alpha_image.clone(), brush.hardness);
-    let library = if image.is_none() { brush.alpha_library.as_deref().and_then(alphas::find) } else { None };
+    let library = if image.is_none() { brush.library_alpha() } else { None };
+    let library_params = brush.alpha_library_params.clone();
     let mut pick = None;
     let zone = ui.horizontal_wrapped(|ui| {
         for a in BrushAlpha::ALL {
@@ -2391,7 +2392,7 @@ fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
 
         // The library alpha in use (picked from the shelf's Alphas tab)
         if let Some(a) = library {
-            let tex = app.thumbs.alpha(ui.ctx(), a);
+            let tex = app.thumbs.configured_alpha(ui.ctx(), a, &library_params);
             alpha_tile(ui, true, &a.label, |p, r| {
                 if let Some(t) = tex {
                     p.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
@@ -2418,15 +2419,20 @@ fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
     ui.label(RichText::new(tr("More in Assets > Alphas: click one, or drag it here")).size(10.0).color(tk.text_dim));
     crate::shelf::drop_target(app, ui, &zone.response, crate::shelf::DropZone::Brush);
-    alpha_parameters(&mut app.session.tool.brush, ui);
+    alpha_parameters(app, ui);
     section(ui, "sec_text", tr("Text"), true, |ui| text_section(app, ui));
 }
 
-/// Hardness and the parameters every alpha shares, under a header whose reset puts them back
-fn alpha_parameters(brush: &mut BrushSettings, ui: &mut Ui) {
+/// Hardness, placement and generator controls for the current tip.
+fn alpha_parameters(app: &mut TextureCraftApp, ui: &mut Ui) {
+    let brush = &app.session.tool.brush;
     let defaults = BrushSettings::default();
-    let at_defaults = brush.hardness == defaults.hardness && brush.alpha_params == defaults.alpha_params;
+    let mut hardness = brush.hardness;
+    let mut params = brush.alpha_params;
+    let mut library_changes = serde_json::Map::new();
     let round = brush.alpha == BrushAlpha::Round && brush.alpha_image.is_none() && brush.alpha_library.is_none();
+    let options = brush.library_alpha().filter(|_| brush.alpha_image.is_none()).map(|alpha| alpha.options()).unwrap_or_default();
+    let at_defaults = hardness == defaults.hardness && params == defaults.alpha_params && (options.is_empty() || brush.alpha_library_params.is_empty());
     let percent_slider = |ui: &mut Ui, label: &str, value: &mut f32, min: f32, max: f32| {
         let mut percent = *value * 100.0;
         if slider(ui, label, &mut percent, min..=max, 0).changed() {
@@ -2435,19 +2441,36 @@ fn alpha_parameters(brush: &mut BrushSettings, ui: &mut Ui) {
     };
 
     let reset = section_with_reset(ui, "sec_alpha_params", tr("Parameters"), true, at_defaults, |ui| {
-        percent_slider(ui, tr("Hardness"), &mut brush.hardness, 0.0, 99.9);
-        percent_slider(ui, tr("Size X"), &mut brush.alpha_params.size_x, 5.0, 100.0);
-        percent_slider(ui, tr("Size Y"), &mut brush.alpha_params.size_y, 5.0, 100.0);
-
-        // Only the procedural Round shape has a roundness
-        ui.add_enabled_ui(round, |ui| percent_slider(ui, tr("Roundness"), &mut brush.alpha_params.roundness, 0.0, 100.0));
-        slider(ui, tr("Contrast"), &mut brush.alpha_params.contrast, 1.0..=MAX_ALPHA_CONTRAST, 2);
-        ui.checkbox(&mut brush.alpha_params.invert, tr("Invert"));
+        percent_slider(ui, tr("Hardness"), &mut hardness, 0.0, 99.9);
+        percent_slider(ui, tr("Size X"), &mut params.size_x, 5.0, 100.0);
+        percent_slider(ui, tr("Size Y"), &mut params.size_y, 5.0, 100.0);
+        slider(ui, tr("Alpha rotation"), &mut params.rotation, -360.0..=360.0, 0);
+        ui.add_enabled_ui(round, |ui| percent_slider(ui, tr("Roundness"), &mut params.roundness, 0.0, 100.0));
+        slider(ui, tr("Contrast"), &mut params.contrast, 1.0..=MAX_ALPHA_CONTRAST, 2);
+        ui.checkbox(&mut params.invert, tr("Invert"));
+        for option in options {
+            let mut value = option.value(&brush.alpha_library_params);
+            let decimals = if option.control.whole_number() { 0 } else { 2 };
+            if slider(ui, tr(option.label), &mut value, option.minimum..=option.maximum, decimals).changed() {
+                library_changes.insert(option.control.key().to_owned(), json!(value));
+            }
+        }
     });
     if reset {
-        (brush.hardness, brush.alpha_params) = (defaults.hardness, defaults.alpha_params);
+        (hardness, params) = (defaults.hardness, defaults.alpha_params);
+        library_changes.extend(options.iter().map(|option| (option.control.key().to_owned(), Value::Null)));
     }
-    *brush = brush.sanitized();
+    if hardness != brush.hardness || params != brush.alpha_params || !library_changes.is_empty() {
+        let mut patch = json!({
+            "hardness": hardness * 100.0, "alphaSizeX": params.size_x * 100.0, "alphaSizeY": params.size_y * 100.0,
+            "alphaRotation": params.rotation, "alphaRoundness": params.roundness * 100.0,
+            "alphaContrast": params.contrast, "alphaInvert": params.invert,
+        });
+        if !library_changes.is_empty() {
+            patch["alphaLibraryParams"] = Value::Object(library_changes);
+        }
+        app.run("tool.brush", patch);
+    }
 }
 
 /// Text drawn in a font, as the brush alpha or a decal (`resource.text`).

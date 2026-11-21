@@ -4,7 +4,7 @@ use egui::{Color32, ColorImage};
 use texturecraft_engine::compose::ImageRes;
 use texturecraft_engine::core::ProceduralKind;
 use texturecraft_engine::geom::glam::Vec3;
-use texturecraft_engine::paint::alphas::{self, LibraryAlpha};
+use texturecraft_engine::paint::alphas::{LibraryAlpha, LibraryAlphaParams};
 use texturecraft_engine::paint::{BrushSettings, Shape};
 use texturecraft_engine::preview::{self, Sample};
 use texturecraft_engine::texel::linear_to_srgb;
@@ -130,7 +130,12 @@ pub fn procedural_image(kind: ProceduralKind, size: usize) -> ColorImage {
 
 /// White-on-black `size²` swatch of library alpha `alpha`
 pub fn alpha_image(alpha: &LibraryAlpha, size: usize) -> ColorImage {
-    let pixels = alpha.render(size, ALPHA_SUPERSAMPLE).into_iter().map(|v| Color32::from_gray((v * 255.0 + 0.5) as u8)).collect();
+    library_alpha_image(alpha, &LibraryAlphaParams::new(), size)
+}
+
+/// White-on-black preview of the selected generator settings.
+pub fn library_alpha_image(alpha: &LibraryAlpha, params: &LibraryAlphaParams, size: usize) -> ColorImage {
+    let pixels = alpha.render_configured(size, ALPHA_SUPERSAMPLE, params).into_iter().map(|v| Color32::from_gray((v * 255.0 + 0.5) as u8)).collect();
     ColorImage::new([size, size], pixels)
 }
 
@@ -167,9 +172,9 @@ pub fn stroke_preview(brush: &BrushSettings, size_px: usize, image: Option<&Imag
     const CURVE_HORIZONTAL_SPAN: f32 = 0.7;
     const CURVE_WAVE_AMPLITUDE: f32 = 0.22;
 
-    let library = brush.alpha_library.as_deref().and_then(alphas::find).map(alphas::LibraryAlpha::image);
+    let library = if image.is_none() { brush.library_alpha_image() } else { None };
     let radius = size_px as f32 * STROKE_RADIUS_FRACTION;
-    let shape = Shape { alpha: brush.alpha, image, library, params: brush.alpha_params, level: 0 }.at_radius(radius);
+    let shape = Shape::new(brush.alpha, image, library.as_deref(), brush.alpha_params).at_radius(radius);
 
     // The horizontal inset and vertical wave keep the S curve inside the swatch
     let curve = |t: f32| {

@@ -395,7 +395,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: false,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let stamp = Stamp {
             center: Vec3::new(0.0, 0.03, 0.0),
@@ -440,7 +440,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: true,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let point = Vec3::ZERO;
         let to_eye = (camera.eye() - point).normalize();
@@ -471,7 +471,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: true,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let point = Vec3::new(1.0, 0.0, 0.0);
         let to_eye = (camera.eye() - point).normalize();
@@ -497,7 +497,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: false,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let to_eye = -camera.forward();
         let behind = context.eye + to_eye;
@@ -559,7 +559,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: culling,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let stamp =
             Stamp { center, normal: Vec3::Y, tangent: Vec3::X, bitangent: Vec3::Z, radius, flow: 1.0, hardness: 0.9, depth: 1.0, seed: 0, source: None };
@@ -688,7 +688,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: false,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
 
         // A silhouette normal is perpendicular to the direction from the surface to the eye
@@ -758,7 +758,7 @@ mod tests {
             eye: Vec3::new(0.0, 5.0, 0.0),
             backface_culling: true,
             angle_fade: (70.0, 85.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let stamp = Stamp {
             center: Vec3::ZERO,
