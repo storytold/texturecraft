@@ -2278,15 +2278,12 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn quick_mask_tracks_delayed_base_color_and_keeps_its_brush_on_gpu() {
-        use texturecraft_engine::core::{Effect, EffectKind, Filter};
-
         let Ok(gpu) = Headless::new() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let mut s = Session::new_project("Mixed Quick Mask", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
         execute(&mut s, "layer.add.fill", &json!({"color": [0.0, 0.5, 0.0]})).unwrap();
         let layer = s.selected_layer().unwrap();
-        let blur = Effect::new(s.doc.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 1.0 }));
-        s.doc.project.layer_mut(layer).unwrap().content_effects.push(blur);
+        s.doc.project.layer_mut(layer).unwrap().geometry_mask = Some(s.mesh.submeshes.iter().map(|part| part.name.clone()).collect());
         s.update();
         execute(&mut s, "tool.paint", &json!({})).unwrap();
         execute(&mut s, "viewport.quickMask", &json!({"enabled": true})).unwrap();

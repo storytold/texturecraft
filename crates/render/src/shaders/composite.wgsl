@@ -8,6 +8,9 @@ struct Operation {
     balance: vec4<f32>,
     effects: vec4<u32>,
     procedural: vec4<u32>,
+    // Layer: first content field slot, content and mask field flags. Marker:
+    // relative content slot or absolute mask field slot.
+    spatial: vec4<u32>,
 }
 
 struct Params {
@@ -19,6 +22,11 @@ struct Params {
     program: vec4<u32>,
     coverage: vec4<u32>,
     paint_window: vec4<u32>,
+    // Source origin and size of the neighborhood fields.
+    filter_region: vec4<u32>,
+    // Field word offset, destination slot, layer index, first excluded effect.
+    // The high bit of the last word selects the mask stack.
+    filter_stage: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -40,6 +48,7 @@ struct SurfaceVertex {
 
 const NO_PAINT_IMAGE = 0xffffffffu;
 const PROJECTED_BRUSH: u32 = 4u;
+const SPATIAL_FILTER_OPCODE: u32 = 36u;
 
 struct Surface {
     position: vec3<f32>,
@@ -681,26 +690,152 @@ fn generator(effect: Operation, surface: Surface, baked: vec3<f32>) -> f32 {
     return clamp(select(value, 1.0 - value, effect.ids.w != 0u) + effect.projection.y, 0.0, 1.0);
 }
 
-fn layer_mask(layer: Operation, pixel: vec2<u32>, uv: vec2<f32>, surface: Surface, baked: vec3<f32>, projected: ProjectedBrush) -> f32 {
+// Each scratch texel holds four float components followed by UV coverage.
+fn field_word(slot: u32, local: vec2<u32>) -> u32 {
+    let size = params.filter_region.zw;
+    return params.filter_stage.x + (slot * size.x * size.y + local.y * size.x + local.x) * 5u;
+}
+
+fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> {
+    if any(pixel < params.filter_region.xy) {
+        return vec4(0.0);
+    }
+    let local = pixel - params.filter_region.xy;
+    if any(local >= params.filter_region.zw) {
+        return vec4(0.0);
+    }
+    let start = field_word(slot, local);
+    return bitcast<vec4<f32>>(vec4(output[start], output[start + 1u], output[start + 2u], output[start + 3u]));
+}
+
+struct LayerTexel {
+    pixel: vec2<u32>,
+    uv: vec2<f32>,
+    surface: Surface,
+    baked: vec3<f32>,
+    projected: ProjectedBrush,
+}
+
+// The most recent prepared field already contains all the effects below it.
+fn previous_field(start: u32, count: u32) -> u32 {
+    for (var i = count; i > 0u; i--) {
+        if layers[start + i - 1u].ids.y == SPATIAL_FILTER_OPCODE {
+            return i;
+        }
+    }
+    return 0u;
+}
+
+fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
+    let start = params.program.x + layer.effects.x;
+    var skip = 0u;
     var mask = layer.balance.y;
-    for (var i = 0u; i < layer.effects.y; i++) {
-        let e = layers[params.program.x + layer.effects.x + i];
+    if layer.spatial.z != 0u {
+        skip = previous_field(start, count);
+        if skip != 0u {
+            let field = layers[start + skip - 1u].spatial.x;
+            mask = clamp(filter_value(field, texel.pixel).x, 0.0, 1.0);
+        }
+    }
+    for (var i = skip; i < count; i++) {
+        let e = layers[start + i];
         var weight = e.low.w;
         var result: f32;
         if e.ids.y == 10u {
-            let sampled = painted(e, pixel, projected);
+            let sampled = painted(e, texel.pixel, texel.projected);
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.w;
         } else if e.ids.y < 20u || e.ids.y >= 48u {
-            result = blend_scalar(u32(e.balance.z), mask, value(e, uv, surface).x);
+            result = blend_scalar(u32(e.balance.z), mask, value(e, texel.uv, texel.surface).x);
         } else if e.ids.y >= 40u {
-            result = blend_scalar(u32(e.balance.z), mask, generator(e, surface, baked));
+            result = blend_scalar(u32(e.balance.z), mask, generator(e, texel.surface, texel.baked));
         } else {
             result = scalar_filter(e, mask);
         }
         mask = lerp(mask, result, weight);
     }
     return clamp(mask, 0.0, 1.0);
+}
+
+fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
+    let start = params.program.x + layer.effects.z;
+    var skip = 0u;
+    if layer.spatial.y != 0u {
+        skip = previous_field(start, count);
+    }
+    var content: vec4<f32>;
+    if skip != 0u {
+        let field = layer.spatial.x + layers[start + skip - 1u].spatial.x;
+        let filtered = filter_value(field, texel.pixel);
+        let coverage = clamp(filtered.a, 0.0, 1.0);
+        var color = vec3(0.0);
+        if coverage > 1e-5 {
+            color = filtered.rgb / coverage;
+        }
+        content = vec4(color, coverage);
+    } else if layer.ids.y == 10u {
+        content = painted(layer, texel.pixel, texel.projected);
+    } else {
+        content = vec4(value(layer, texel.uv, texel.surface), 1.0);
+    }
+    if content.a <= 0.0 {
+        return vec4(0.0);
+    }
+    var color = content.rgb;
+    for (var i = skip; i < count; i++) {
+        let effect = layers[start + i];
+        let filtered = effect_color(effect, color, layer.ids.x, texel.surface, texel.baked.x);
+        color += (filtered - color) * effect.low.w;
+    }
+    return vec4(color, content.a);
+}
+
+fn uv_texel_covered(pixel: vec2<u32>) -> bool {
+    let word = uv_coverage[pixel.y * params.coverage.y + pixel.x / 32u];
+    return (word & (1u << (pixel.x % 32u))) != 0u;
+}
+
+@compute @workgroup_size(8, 8)
+fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
+    if any(id.xy >= params.filter_region.zw) {
+        return;
+    }
+    let pixel = params.filter_region.xy + id.xy;
+    var prepared = vec4(0.0);
+    var geometric_weight = 0.0;
+    var covered = all(pixel < params.source.xy);
+    if covered && params.coverage.x != 0u {
+        covered = uv_texel_covered(pixel);
+    }
+    if covered {
+        let surface = surface_at(pixel);
+        let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
+        var projected = ProjectedBrush(vec4(0.0), 0.0);
+        if (params.coverage.w & PROJECTED_BRUSH) != 0u {
+            projected = sample_brush_projection(pixel, surface);
+        }
+        var baked = vec3(1.0, 0.5, 1.0);
+        if (params.coverage.w & 2u) != 0u {
+            baked = bitcast<vec3<f32>>(baked_at(pixel).xyz);
+        }
+        let texel = LayerTexel(pixel, uv, surface, baked, projected);
+        let layer = layers[params.filter_stage.z];
+        let count = params.filter_stage.w & 0x7fffffffu;
+        if (params.filter_stage.w & 0x80000000u) != 0u {
+            prepared = vec4(layer_mask(layer, texel, count), 0.0, 0.0, 1.0);
+        } else {
+            let content = layer_content(layer, texel, count);
+            prepared = vec4(content.rgb * content.a, content.a);
+        }
+        geometric_weight = 1.0;
+    }
+    let start = field_word(params.filter_stage.y, id.xy);
+    let words = bitcast<vec4<u32>>(prepared);
+    output[start] = words.x;
+    output[start + 1u] = words.y;
+    output[start + 2u] = words.z;
+    output[start + 3u] = words.w;
+    output[start + 4u] = bitcast<u32>(geometric_weight);
 }
 
 fn to_u16(v: f32) -> u32 {
@@ -735,8 +870,7 @@ fn display_index(kind: u32, index: u32) -> u32 {
 fn padded_source(pixel: vec2<u32>) -> vec2<u32> {
     let pitch = params.coverage.y;
     let radius = params.coverage.z;
-    let current = uv_coverage[pixel.y * pitch + pixel.x / 32u];
-    if (current & (1u << (pixel.x % 32u))) != 0u {
+    if uv_texel_covered(pixel) {
         return pixel;
     }
 
@@ -818,10 +952,12 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     let index = id.y * params.program.y + id.x;
+    let texel = LayerTexel(pixel, uv, surface, mask_bakes, projected);
     if params.source.w == 2u {
         var gray = 0u;
         if covered {
-            gray = u32(layer_mask(layers[0], pixel, uv, surface, mask_bakes, projected) * 255.0 + 0.5);
+            let layer = layers[0];
+            gray = u32(layer_mask(layer, texel, layer.effects.y) * 255.0 + 0.5);
         }
         output[index] = (gray * 0x00010101u) | 0xff000000u;
         return;
@@ -836,7 +972,6 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     var mask_value = 1.0;
     for (var i = 0u; covered && i < params.program.x; i++) {
         let layer = layers[i];
-        var source: vec3<f32>;
         let mode = u32(layer.balance.z);
         var weight = layer.low.w;
         if layer.effects.y == 0u {
@@ -844,25 +979,16 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         } else {
             if last_mask != layer.effects.x {
                 last_mask = layer.effects.x;
-                mask_value = layer_mask(layer, pixel, uv, surface, mask_bakes, projected);
+                mask_value = layer_mask(layer, texel, layer.effects.y);
             }
             weight *= mask_value;
         }
         if weight <= 0.0 { continue; }
-        if layer.ids.y == 10u {
-            let sampled = painted(layer, pixel, projected);
-            source = sampled.rgb;
-            weight *= select(sampled.a, 1.0, mode == 2u && sampled.a > 0.0);
-            if weight <= 0.0 { continue; }
-        } else {
-            source = value(layer, uv, surface);
-        }
+        let content = layer_content(layer, texel, layer.effects.w);
+        weight *= select(content.a, 1.0, mode == 2u && content.a > 0.0);
+        if weight <= 0.0 { continue; }
+        let source = content.rgb;
         let destination = layer.ids.x;
-        for (var step = 0u; step < layer.effects.w; step++) {
-            let effect = layers[params.program.x + layer.effects.z + step];
-            let filtered = effect_color(effect, source, destination, surface, mask_bakes.x);
-            source += (filtered - source) * effect.low.w;
-        }
         if destination == 0u {
             base += (blend_rgb(mode, base, source) - base) * weight;
         } else if destination == 7u {
