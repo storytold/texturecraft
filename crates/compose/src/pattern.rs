@@ -377,16 +377,23 @@ fn sharpen(values: Vec3, sharpness: f32) -> Vec3 {
 /// step layers are stored at. With sharp blends most texels need one plane, not three.
 const TRIPLANAR_SKIP: f32 = 1.0 / 131_072.0;
 
+/// Scale by the strongest axis before exponentiation so even diagonal normals keep a stable sum.
+fn normalized_triplanar_weights(normal: Vec3, sharpness: f32) -> Vec3 {
+    let normal = normal.abs();
+    let strongest = normal.max_element();
+    if strongest == 0.0 || !normal.is_finite() {
+        return Vec3::ZERO;
+    }
+    let weights = sharpen(normal / strongest, sharpness);
+    weights / weights.element_sum()
+}
+
 /// Normalized triplanar blend weights (YZ, XZ, XY planes) for normal `nrm`; planes too light
 /// to change a 0..1 value scaled by `gain` afterwards weigh 0 (see [`TRIPLANAR_SKIP`]).
 fn triplanar_weights(nrm: Vec3, sharpness: f32, gain: f32) -> Vec3 {
-    let weights = sharpen(nrm.abs(), sharpness);
-    let weights = weights / (weights.x + weights.y + weights.z).max(1e-6);
+    let weights = normalized_triplanar_weights(nrm, sharpness);
     let skip_threshold = TRIPLANAR_SKIP / gain.max(1.0);
-    let retained = Vec3::select(weights.cmplt(Vec3::splat(skip_threshold)), Vec3::ZERO, weights);
-
-    // Preserve the blend if thresholding would discard every plane
-    if retained == Vec3::ZERO { weights } else { retained }
+    Vec3::select(weights.cmplt(Vec3::splat(skip_threshold)), Vec3::ZERO, weights)
 }
 
 fn shape(pattern: &Procedural, value: f32) -> f32 {
@@ -506,8 +513,7 @@ pub fn image_samples(projection: &Projection, coords: &Coords) -> [(Vec2, f32); 
             let p = coords.pos * *scale + Vec3::from(*offset);
 
             // Float images can exceed 1, so even a tiny plane weight can carry visible detail
-            let weights = coords.nrm.abs().powf(sharpness.max(1.0));
-            let weights = weights / (weights.x + weights.y + weights.z).max(1e-6);
+            let weights = normalized_triplanar_weights(coords.nrm, *sharpness);
             [(Vec2::new(p.z, -p.y), weights.x), (Vec2::new(p.x, p.z), weights.y), (Vec2::new(p.x, -p.y), weights.z)]
         }
         Projection::Planar { scale, axis, offset } => {
@@ -722,11 +728,24 @@ mod tests {
         let oblique = triplanar_weights(Vec3::ONE.normalize(), 8.0, 16.0);
         assert!((oblique - Vec3::splat(1.0 / 3.0)).abs().max_element() < 1e-6, "{oblique}");
 
-        // Tiny weights must survive together when their sum exceeds a u16 step
+        // Equal projections keep their full combined weight even at maximum hardness.
         for sharpness in [47.0, 64.0] {
             let diagonal = triplanar_weights(Vec3::ONE.normalize(), sharpness, 1.0);
-            assert!(diagonal.min_element() > 0.0, "sharpness {sharpness}: {diagonal}");
+            assert!((diagonal - Vec3::splat(1.0 / 3.0)).abs().max_element() < 1e-6, "sharpness {sharpness}: {diagonal}");
         }
+    }
+
+    #[test]
+    fn triplanar_image_hardness_sharpens_without_losing_coverage() {
+        let coords = Coords { uv: Vec2::ZERO, pos: Vec3::ZERO, nrm: Vec3::new(1.0, 0.95, 0.9).normalize() };
+        let weights = |sharpness| {
+            let projection = Projection::Triplanar { scale: 1.0, sharpness, offset: [0.0; 3] };
+            image_samples(&projection, &coords).map(|(_, weight)| weight)
+        };
+        let soft = weights(1.0);
+        let hard = weights(64.0);
+        assert!((hard.into_iter().sum::<f32>() - 1.0).abs() < 1e-6, "{hard:?}");
+        assert!(hard[0] > soft[0] && hard[1] < soft[1] && hard[2] < soft[2], "soft {soft:?}, hard {hard:?}");
     }
 
     #[test]
