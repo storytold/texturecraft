@@ -2425,6 +2425,10 @@ mod procedural_tests {
         let mut project = Project::new("Anchor stages", "builtin:plane");
         project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
         let channels = [Channel::BaseColor, Channel::Height];
+        let folder = project.alloc_id();
+        let mut group = Layer::new(folder, "Translucent folder", LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        group.channels.get_mut(&Channel::Height).unwrap().opacity = 0.45;
+        project.insert_layer(0, group, None, false).unwrap();
         let lower = project.alloc_id();
         let mask_anchor = project.alloc_id();
         let height_anchor = project.alloc_id();
@@ -2437,7 +2441,14 @@ mod procedural_tests {
         layer.mask = Some(mask);
         layer.content_effects.push(Effect::new(height_anchor, EffectKind::Anchor));
         layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
-        project.insert_layer(0, layer, None, false).unwrap();
+        project.insert_layer(0, layer, Some(folder), true).unwrap();
+
+        let after_group = project.alloc_id();
+        let after_group_anchor = project.alloc_id();
+        let mut bookmark = Layer::new(after_group, "Mixed height", LayerKind::Fill(Fill::default()), &channels);
+        bookmark.channels.get_mut(&Channel::Height).unwrap().mode = BlendMode::Disable;
+        bookmark.content_effects.push(Effect::new(after_group_anchor, EffectKind::Anchor));
+        project.insert_layer(0, bookmark, None, false).unwrap();
 
         let owner = project.alloc_id();
         let source = BTreeMap::from([(
@@ -2451,6 +2462,15 @@ mod procedural_tests {
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::Anchor { anchor: mask_anchor, channel: Channel::BaseColor, ramp: Vec::new() });
         generator.global.blur = 0.7;
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
+        let mut mix_height = Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill {
+                source: Source::Anchor { anchor: after_group_anchor, channel: Channel::Height, ramp: Vec::new() },
+                projection: Projection::default(),
+            },
+        );
+        mix_height.opacity = 0.3;
+        mask.effects.push(mix_height);
         layer.mask = Some(mask);
         project.insert_layer(0, layer, None, false).unwrap();
 

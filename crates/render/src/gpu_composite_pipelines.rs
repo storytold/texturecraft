@@ -118,7 +118,10 @@ impl Features {
             include(
                 self.content_effects,
                 include_str!("shaders/composite_content_effects.wgsl"),
-                "fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> { return base_content(layer, texel); }",
+                "fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
+                    let content = base_content(layer, texel);
+                    return select(vec4(0.0), content, content.a > 0.0);
+                }",
             ),
             include(
                 self.height_mask,
