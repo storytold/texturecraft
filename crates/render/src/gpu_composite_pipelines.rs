@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::{ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, TILE_GENERATOR_OPCODE};
+use super::{ANCHOR_PUBLISH_LAYER, ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, TILE_GENERATOR_OPCODE};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Features {
@@ -11,6 +11,9 @@ struct Features {
     curvature: bool,
     sampled_generator_inputs: bool,
     spatial: bool,
+    mask_effects: bool,
+    content_effects: bool,
+    height_mask: bool,
     anchors: bool,
     material_anchors: bool,
     color_selection: bool,
@@ -20,6 +23,11 @@ impl Features {
     fn of(program: &CompositeProgram) -> Self {
         let mut features = Self { authored_images: !program.material_images.is_empty(), spatial: !program.filters.stages.is_empty(), ..Self::default() };
         features.material_anchors = program.filters.stages.iter().any(|stage| stage.anchor.is_some());
+        for op in program.operations.iter().take(program.layer_count as usize).filter(|op| op.ids[1] != ANCHOR_PUBLISH_LAYER) {
+            features.mask_effects |= op.effects[1] != 0;
+            features.content_effects |= op.effects[3] != 0;
+            features.height_mask |= op.constraints[2] != 0;
+        }
         // Inspect the compiled operations, including sources referenced by
         // generator overrides and fills in the mask preview.
         for op in &program.operations {
@@ -101,6 +109,21 @@ impl Features {
                 self.color_selection && supports_id,
                 include_str!("shaders/id_sample.wgsl"),
                 "fn id_color_at(pixel: vec2<u32>) -> vec3<f32> { return vec3(0.0); }",
+            ),
+            include(
+                self.mask_effects,
+                include_str!("shaders/composite_mask_effects.wgsl"),
+                "fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 { return layer.balance.y; }",
+            ),
+            include(
+                self.content_effects,
+                include_str!("shaders/composite_content_effects.wgsl"),
+                "fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> { return base_content(layer, texel); }",
+            ),
+            include(
+                self.height_mask,
+                include_str!("shaders/composite_height_mask.wgsl"),
+                "fn mask_with_height(layer: Operation, texel: LayerTexel, mask: f32) -> f32 { return mask; }",
             ),
             include_str!("shaders/composite_groups.wgsl"),
             include_str!("shaders/composite.wgsl"),
