@@ -18,7 +18,7 @@ struct Operation {
 struct Params {
     // Width, row count, top row, reserved texels per map.
     band: vec4<u32>,
-    // Source width, source height, display sampling step, output mode (roughness, glossiness, mask).
+    // Source width, source height, display sampling step, output mode (roughness or glossiness).
     source: vec4<u32>,
     // Layer count, scratch row pitch, DisplayKind output bits, left column.
     program: vec4<u32>,
@@ -436,6 +436,10 @@ fn overlay(a: f32, b: f32) -> f32 {
     return select(1.0 - 2.0 * (1.0 - a) * (1.0 - b), 2.0 * a * b, a < 0.5);
 }
 
+// Most stacks only use the basic modes. Keep the other blend math out
+// of those pipelines, where it would be inlined at every blend site.
+override enable_extended_blend_modes: bool = false;
+
 fn blend_scalar(mode: u32, a: f32, b: f32) -> f32 {
     switch mode {
         case 1u: { return a; }
@@ -445,28 +449,34 @@ fn blend_scalar(mode: u32, a: f32, b: f32) -> f32 {
         case 6u: { return min(a, b); }
         case 7u: { return max(a, b); }
         case 8u: { return a + b; }
-        case 9u: { return a - b; }
-        case 10u: { return b - a; }
-        case 11u: { return abs(a - b); }
-        case 12u: { return a + b - 2.0 * a * b; }
-        case 13u: { return a + 2.0 * b - 1.0; }
-        case 14u: { return overlay(a, b); }
-        case 15u: { return 1.0 - (1.0 - a) * (1.0 - b); }
-        case 16u: { return a + b - 1.0; }
-        case 17u: { return burn(a, b); }
-        case 18u: { return dodge(a, b); }
-        case 19u: {
-            let x = clamp(a, 0.0, 1.0);
-            let y = clamp(b, 0.0, 1.0);
-            if y <= 0.5 { return x - (1.0 - 2.0 * y) * x * (1.0 - x); }
-            let d = select(sqrt(x), ((16.0 * x - 12.0) * x + 4.0) * x, x <= 0.25);
-            return x + (2.0 * y - 1.0) * (d - x);
-        }
-        case 20u: { return overlay(b, a); }
-        case 21u: { return select(dodge(a, 2.0 * (b - 0.5)), burn(a, 2.0 * b), b < 0.5); }
-        case 22u: { return select(max(a, 2.0 * b - 1.0), min(a, 2.0 * b), b < 0.5); }
-        default: { return b; }
+        default: {}
     }
+    if enable_extended_blend_modes {
+        switch mode {
+            case 9u: { return a - b; }
+            case 10u: { return b - a; }
+            case 11u: { return abs(a - b); }
+            case 12u: { return a + b - 2.0 * a * b; }
+            case 13u: { return a + 2.0 * b - 1.0; }
+            case 14u: { return overlay(a, b); }
+            case 15u: { return 1.0 - (1.0 - a) * (1.0 - b); }
+            case 16u: { return a + b - 1.0; }
+            case 17u: { return burn(a, b); }
+            case 18u: { return dodge(a, b); }
+            case 19u: {
+                let x = clamp(a, 0.0, 1.0);
+                let y = clamp(b, 0.0, 1.0);
+                if y <= 0.5 { return x - (1.0 - 2.0 * y) * x * (1.0 - x); }
+                let d = select(sqrt(x), ((16.0 * x - 12.0) * x + 4.0) * x, x <= 0.25);
+                return x + (2.0 * y - 1.0) * (d - x);
+            }
+            case 20u: { return overlay(b, a); }
+            case 21u: { return select(dodge(a, 2.0 * (b - 0.5)), burn(a, 2.0 * b), b < 0.5); }
+            case 22u: { return select(max(a, 2.0 * b - 1.0), min(a, 2.0 * b), b < 0.5); }
+            default: {}
+        }
+    }
+    return b;
 }
 
 fn luminance(c: vec3<f32>) -> f32 { return dot(c, vec3(0.3, 0.59, 0.11)); }
@@ -491,32 +501,35 @@ fn rnm(a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
 }
 
 fn blend_rgb(mode: u32, a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
-    switch mode {
-        case 23u: { return b * luminance(a); }
-        case 24u: {
-            let lo = minimum(a);
-            let width = maximum(a) - lo;
-            var saturated = vec3(0.0);
-            if width > 1e-6 { saturated = (a - lo) * (maximum(b) - minimum(b)) / width; }
-            return with_luminance(saturated, luminance(a));
+    if enable_extended_blend_modes {
+        switch mode {
+            case 23u: { return b * luminance(a); }
+            case 24u: {
+                let lo = minimum(a);
+                let width = maximum(a) - lo;
+                var saturated = vec3(0.0);
+                if width > 1e-6 { saturated = (a - lo) * (maximum(b) - minimum(b)) / width; }
+                return with_luminance(saturated, luminance(a));
+            }
+            case 25u: { return with_luminance(b, luminance(a)); }
+            case 26u: {
+                let max_a = maximum(a);
+                let max_b = maximum(b);
+                if max_a <= 1e-6 { return vec3(max_b); }
+                return a * max_b / max_a;
+            }
+            case 27u: {
+                let p = a * 2.0 - 1.0;
+                let q = b * 2.0 - 1.0;
+                let n = vec3(p.xy + q.xy, p.z * q.z);
+                return n / max(length(n), 1e-6) * 0.5 + 0.5;
+            }
+            case 28u: { return rnm(a,b); }
+            case 29u: { return rnm(b,a); }
+            default: {}
         }
-        case 25u: { return with_luminance(b, luminance(a)); }
-        case 26u: {
-            let max_a = maximum(a);
-            let max_b = maximum(b);
-            if max_a <= 1e-6 { return vec3(max_b); }
-            return a * max_b / max_a;
-        }
-        case 27u: {
-            let p = a * 2.0 - 1.0;
-            let q = b * 2.0 - 1.0;
-            let n = vec3(p.xy + q.xy, p.z * q.z);
-            return n / max(length(n), 1e-6) * 0.5 + 0.5;
-        }
-        case 28u: { return rnm(a,b); }
-        case 29u: { return rnm(b,a); }
-        default: { return vec3(blend_scalar(mode, a.x,b.x), blend_scalar(mode, a.y,b.y), blend_scalar(mode, a.z,b.z)); }
     }
+    return vec3(blend_scalar(mode, a.x, b.x), blend_scalar(mode, a.y, b.y), blend_scalar(mode, a.z, b.z));
 }
 
 struct LayerTexel {
@@ -637,6 +650,9 @@ fn padded_source(pixel: vec2<u32>) -> vec2<u32> {
     return best;
 }
 
+// Keep mask preview evaluation out of the material pipeline.
+override composite_mask_preview: bool = false;
+
 @compute @workgroup_size(8, 8)
 fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= params.band.x || id.y >= params.band.y {
@@ -670,7 +686,7 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let index = id.y * params.program.y + id.x;
     let texel = LayerTexel(pixel, uv, surface, mask_bakes, projected);
-    if params.source.w == 2u {
+    if composite_mask_preview {
         var gray = 0u;
         if covered {
             let layer = layers[params.anchor.w];

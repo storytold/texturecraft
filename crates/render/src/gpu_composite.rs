@@ -2191,7 +2191,7 @@ impl GpuCompositor {
                     source_size.0,
                     source_size.1,
                     1 << shift,
-                    if program.mask_preview { 2 } else { u32::from(program.glossiness) },
+                    u32::from(program.glossiness),
                     program.layer_count,
                     pitch,
                     program.display_outputs,
