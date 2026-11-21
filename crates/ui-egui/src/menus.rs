@@ -449,6 +449,12 @@ fn effect_command<'a>(app: &TextureCraftApp, id: &'a str) -> &'a str {
 
 /// Runs the commands bound to the keys pressed this frame, outside text fields and key capture
 pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    // The picker owns paste events; image pastes must not become layer-paste shortcuts either.
+    if crate::widgets::color_picker_open(ctx)
+        && ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::Paste(_) | egui::Event::PasteImage(_))))
+    {
+        return;
+    }
     if crate::keymap::capturing(ctx) || (ctx.memory(|memory| memory.focused().is_some()) && ctx.egui_wants_keyboard_input()) {
         return;
     }

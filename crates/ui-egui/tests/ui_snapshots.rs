@@ -296,6 +296,26 @@ fn rendering_mode_snapshots() {
 
 #[test]
 #[ignore]
+fn color_picker_snapshots() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session = texturecraft_engine::sample_session(256, 64).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.prefs.language = "en".into();
+    h.run_steps(4);
+    h.get_by_label("Material").click();
+    h.run_steps(3);
+    let label = h.get_by_label("Base color").rect();
+    let swatch = egui::pos2(label.right() + 30.0, label.center().y);
+    h.drag_at(swatch);
+    h.drop_at(swatch);
+    save(&mut h, &output_dir, "color-picker");
+    h.event(egui::Event::Paste("32,128,240".into()));
+    save(&mut h, &output_dir, "color-picker-pasted");
+}
+
+#[test]
+#[ignore]
 fn symmetry_snapshots() {
     let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
 
