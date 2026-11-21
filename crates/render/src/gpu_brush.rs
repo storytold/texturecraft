@@ -6,7 +6,7 @@ use std::sync::{Arc, Weak};
 use bytemuck::{Pod, Zeroable};
 use texturecraft_geom::{
     Bvh, Mesh, UvGBuffer,
-    glam::{Mat4, Vec2, Vec3},
+    glam::{Mat4, Vec2},
 };
 use texturecraft_paint::{BrushAlpha, BrushSettings, EyeDepth, Stamp, UvStamp};
 use texturecraft_texel::{TILE, TileImage};
@@ -469,7 +469,7 @@ fn buffer_copy(buffer: &wgpu::Buffer, slot: usize) -> wgpu::TexelCopyBufferInfo<
 mod tests {
     use super::*;
     use crate::headless::Headless;
-    use texturecraft_geom::{OrbitCamera, primitives};
+    use texturecraft_geom::{OrbitCamera, glam::Vec3, primitives};
     use texturecraft_paint::{RasterCtx, Shape, StrokeCanvas, rasterize, rasterize_uv};
 
     #[test]

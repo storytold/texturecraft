@@ -33,7 +33,7 @@ use texturecraft_texel::TILE;
 use crate::bake_visualization::BakeVisualization;
 use crate::cage_geometry::CageGeometry;
 use crate::cage_gpu::CageGpu;
-use crate::gpu_composite::{CompositeProgram, GpuCompositor};
+use crate::gpu_composite::{CompositeProgram, CompositeRegion, GpuCompositor};
 use crate::gpu_trace::{Checked, checked};
 use crate::high_poly_gpu::HighPolyGpu;
 use crate::ibl;
