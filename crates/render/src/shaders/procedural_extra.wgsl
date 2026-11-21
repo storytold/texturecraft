@@ -4,15 +4,6 @@
 const PATTERN_PI: f32 = 3.141592653589793;
 const PATTERN_TAU: f32 = 6.283185307179586;
 
-fn wrap_coordinate(coordinate: i32, period: i32) -> i32 {
-    // Use unsigned remainder so negative operands are consistent across shader backends.
-    let bits = bitcast<u32>(coordinate);
-    let negative = coordinate < 0;
-    let magnitude = select(bits, 0u - bits, negative);
-    let remainder = i32(magnitude % u32(period));
-    return select(remainder, period - remainder, negative && remainder != 0);
-}
-
 fn wrap_cell(cell: vec2<i32>, period: vec2<i32>) -> vec2<i32> {
     return vec2(wrap_coordinate(cell.x, period.x), wrap_coordinate(cell.y, period.y));
 }

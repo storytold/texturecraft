@@ -24,7 +24,10 @@ use wgpu::util::DeviceExt;
 
 #[path = "gpu_composite_groups.rs"]
 mod groups;
+#[path = "gpu_composite_pipelines.rs"]
+mod pipelines;
 use groups::{BEGIN_GROUP, END_GROUP, GroupPlan, StackWork};
+use pipelines::CompositePipelines;
 
 const MAX_PAINT_WORDS: usize = (64 << 20) / size_of::<u32>();
 const LOOKUP_WORDS: u32 = 4096;
@@ -1539,12 +1542,10 @@ struct CurvatureResources {
 }
 
 pub(crate) struct GpuCompositor {
-    pipeline: wgpu::ComputePipeline,
-    group_pipeline: Option<wgpu::ComputePipeline>,
-    shader: wgpu::ShaderModule,
+    pipelines: CompositePipelines,
     bindings: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
-    filter_gpu: Option<(wgpu::ComputePipeline, NeighbourhoodGpu)>,
+    filter_gpu: Option<NeighbourhoodGpu>,
     lookup: wgpu::Buffer,
     uniform_coverage: wgpu::Buffer,
     coverage: Vec<(Weak<UvGBuffer>, wgpu::Buffer)>,
@@ -1619,35 +1620,6 @@ impl GpuCompositor {
             bind_group_layouts: &[Some(&bindings)],
             immediate_size: 0,
         });
-        let curvature_shader = if supports_curvature {
-            include_str!("shaders/curvature_sample.wgsl")
-        } else {
-            "fn curvature_level_at(pixel: vec2<u32>, level: u32) -> f32 { return 0.0; }"
-        };
-        let id_shader =
-            if supports_id { include_str!("shaders/id_sample.wgsl") } else { "fn id_color_at(pixel: vec2<u32>) -> vec3<f32> { return vec3(0.0); }" };
-        let source = [
-            include_str!("shaders/noise.wgsl"),
-            include_str!("shaders/procedural_extra.wgsl"),
-            include_str!("shaders/tile_generator.wgsl"),
-            include_str!("shaders/material_image.wgsl"),
-            include_str!("shaders/stencil_projection.wgsl"),
-            curvature_shader,
-            include_str!("shaders/composite_groups.wgsl"),
-            id_shader,
-            include_str!("shaders/composite.wgsl"),
-        ]
-        .join("\n");
-        let module =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc_gpu_composite"), source: wgpu::ShaderSource::Wgsl(source.into()) });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("tc_gpu_composite"),
-            layout: Some(&pipeline_layout),
-            module: &module,
-            entry_point: Some("compose"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
         let values = texturecraft_texel::srgb_lut().map(u32::from);
         let lookup = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tc_composite_srgb"),
@@ -1669,9 +1641,7 @@ impl GpuCompositor {
         let default_brush_alpha =
             input_texture(device, "tc_composite_empty_brush_alpha", (1, 1), 1, wgpu::TextureFormat::R16Uint).create_view(&Default::default());
         Self {
-            pipeline,
-            group_pipeline: None,
-            shader: module,
+            pipelines: CompositePipelines::new(supports_curvature),
             bindings,
             pipeline_layout,
             filter_gpu: None,
@@ -2042,18 +2012,6 @@ impl GpuCompositor {
         };
         let tile_work = program.tile_work_per_pixel()?.saturating_add(program.groups.work_per_pixel()).saturating_add(selection_work);
         let grouped = program.groups.depth != 0;
-        if grouped {
-            self.group_pipeline.get_or_insert_with(|| {
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("tc_gpu_composite_groups"),
-                    layout: Some(&self.pipeline_layout),
-                    module: &self.shader,
-                    entry_point: Some("compose"),
-                    compilation_options: wgpu::PipelineCompilationOptions { constants: &[("composite_groups", 1.0)], ..Default::default() },
-                    cache: None,
-                })
-            });
-        }
         let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
         let halo = radius.saturating_add(program.filters.reach);
         let limits = device.limits();
@@ -2067,18 +2025,9 @@ impl GpuCompositor {
             if tile_work == 0 {
                 band_rows = height.min(256);
             }
-            self.filter_gpu.get_or_insert_with(|| {
-                let prepare = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("tc_spatial_source"),
-                    layout: Some(&self.pipeline_layout),
-                    module: &self.shader,
-                    entry_point: Some("prepare_filter"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
-                (prepare, NeighbourhoodGpu::new(device))
-            });
+            self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::new(device));
         }
+        let (pipeline, prepare) = self.pipelines.get(device, &self.pipeline_layout, program);
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
@@ -2324,7 +2273,7 @@ impl GpuCompositor {
                         entries: &entries[..count],
                     })
                 };
-                if filtered && let Some((prepare, kernels)) = &self.filter_gpu {
+                if let (Some(prepare), Some(kernels)) = (&prepare, &self.filter_gpu) {
                     let fields = program.filters.stages.len() as u32;
                     let field_words = field_rect[2] * field_rect[3] * FIELD_WORDS;
                     let offset = |slot| field_base + slot * field_words;
@@ -2380,8 +2329,7 @@ impl GpuCompositor {
                 let bindings = bindings(&values);
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tc_composite"), timestamp_writes: None });
-                    let pipeline = self.group_pipeline.as_ref().filter(|_| grouped).unwrap_or(&self.pipeline);
-                    pass.set_pipeline(pipeline);
+                    pass.set_pipeline(&pipeline);
                     pass.set_bind_group(0, &bindings, &[]);
                     pass.dispatch_workgroups(width.div_ceil(WORKGROUP), rows.div_ceil(WORKGROUP), 1);
                 }

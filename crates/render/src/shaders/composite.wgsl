@@ -52,12 +52,15 @@ struct SurfaceVertex {
 @group(0) @binding(7) var<storage, read> surface_vertices: array<SurfaceVertex>;
 @group(0) @binding(8) var bake_maps: texture_2d<u32>;
 @group(0) @binding(9) var brush_alpha: texture_2d<u32>;
+@group(0) @binding(10) var tile_images: texture_2d_array<u32>;
 @group(0) @binding(11) var brush_stencil_image: texture_2d<f32>;
 @group(0) @binding(12) var<uniform> brush_stencil: StencilProjection;
 
 const NO_PAINT_IMAGE = 0xffffffffu;
 const PROJECTED_BRUSH: u32 = 4u;
 const GEOMETRY_MASKS: u32 = 8u;
+const IMAGE_SOURCE_OPCODE: u32 = 14u;
+const DECAL_PROJECTION: u32 = 9u;
 const SPATIAL_FILTER_OPCODE: u32 = 36u;
 const COLOR_SELECTION_OPCODE: u32 = 38u;
 
@@ -117,197 +120,6 @@ fn unpack_baked_normal(packed: u32) -> vec3<f32> {
     return vec3(components.xy, components.z * components.z);
 }
 
-// The nearest squared distance can be clipped to one when no feature ID is needed.
-fn cellular(p: vec3<f32>, seed: u32, details: bool) -> vec3<f32> {
-    let cell = vec3<i32>(floor(p));
-    let local = fract(p);
-    var nearest = select(1.0, 4.0, details);
-    var second = 1.0;
-    var feature_id = 0u;
-    for (var z = -1; z <= 1; z++) {
-        for (var y = -1; y <= 1; y++) {
-            for (var x = -1; x <= 1; x++) {
-                let shift = vec3(x, y, z);
-                let bits = hash(cell + shift, seed * 0xc2b2ae35u);
-                let feature = vec3<f32>(bits) / 4294967296.0;
-                let delta = vec3<f32>(shift) + feature - local;
-                let distance = dot(delta, delta);
-                if details {
-                    if distance < nearest {
-                        second = nearest;
-                        nearest = distance;
-                        feature_id = bits.x ^ bits.y;
-                    } else {
-                        second = min(second, distance);
-                    }
-                } else {
-                    nearest = min(nearest, distance);
-                }
-            }
-        }
-    }
-    return vec3(sqrt(min(1.0, nearest)), sqrt(min(1.0, second)), f32(feature_id) / 4294967296.0);
-}
-
-fn cells(p: vec3<f32>, seed: u32) -> f32 {
-    return cellular(p, seed, false).x;
-}
-
-fn cell_value(cell: vec3<i32>, seed: u32) -> f32 {
-    return f32(hash(cell, seed * 0x9e3779b9u).x) / 4294967296.0;
-}
-
-fn drip(p: vec3<f32>, x: f32, salt: i32, seed: u32) -> f32 {
-    let cx = x * 6.0;
-    let column = i32(floor(cx));
-    let width = 0.08 + 0.25 * cell_value(vec3(column, 0, salt), seed);
-    let across = 1.0 - smoothstep(width * 0.3, width, abs(fract(cx) - 0.5 - (cell_value(vec3(column, 1, salt), seed) - 0.5) * 0.5));
-    let yy = p.y * (0.35 + 0.4 * cell_value(vec3(column, 2, salt), seed)) + cell_value(vec3(column, 3, salt), seed) * 7.0;
-    let t = fract(yy);
-    let on = cell_value(vec3(column, i32(floor(yy)), 3 + salt), seed) > 0.5;
-    return select(0.0, across * pow(t, 1.6) * (1.0 - smoothstep(0.9, 1.0, t)), on);
-}
-
-fn woven(p: vec3<f32>, seed: u32, twill: bool) -> f32 {
-    let point = p.xy * 2.0;
-    let cell = vec2<i32>(floor(point));
-    let local = fract(point);
-    let period = select(2, 4, twill);
-    let warp_on_top = ((cell.x + cell.y) & (period - 1)) < period / 2;
-    let thread_uv = select(local, local.yx, warp_on_top);
-    let pi = 3.141592653589793;
-    let thread = sqrt(max(0.0, sin(pi * thread_uv.x))) * (0.8 + 0.2 * sin(pi * thread_uv.y));
-    let tone = select(1.0, 0.55, twill && !warp_on_top);
-    let fiber = noise(p * vec3(40.0, 40.0, 1.0), seed, false);
-    return clamp(thread * tone * (0.88 + 0.12 * fiber), 0.0, 1.0);
-}
-
-fn pattern(kind: u32, p: vec3<f32>, seed: u32) -> f32 {
-    switch kind {
-        case 1u: { return fbm(p, 6u, seed, false); }
-        case 2u: { return fbm(p, 4u, seed, true); }
-        case 3u: { return noise(p * 16.0, seed, false); }
-        case 4u: { return cells(p, seed); }
-        case 5u: {
-            let n = fbm(p, 6u, seed, true) * 0.7 + fbm(p * 3.7, 3u, seed ^ 0x55u, false) * 0.3;
-            return clamp((n - 0.45) * 4.0 + 0.5, 0.0, 1.0);
-        }
-        case 6u: {
-            let n = noise(p * vec3(0.15, 6.0, 6.0), seed, true);
-            let line = 1.0 - min(abs(n - 0.5) * 40.0, 1.0);
-            let gate = noise(p * 0.8, seed ^ 0x99u, false);
-            return line * clamp((gate - 0.45) * 4.0, 0.0, 1.0);
-        }
-        case 7u: {
-            let warp = fbm(p * vec3(0.18, 0.6, 1.0), 3u, seed, true);
-            let t = fract((p.y + (warp - 0.5) * 0.9) * 5.0);
-            let ring = 1.0 - smoothstep(0.45, 1.0, t);
-            let fiber = noise(p * vec3(2.0, 40.0, 1.0), seed ^ 0x3cu, false);
-            let tone = fbm(p * vec3(0.6, 3.0, 1.0), 2u, seed ^ 0x71u, false);
-            return clamp(ring * 0.6 + fiber * 0.25 + tone * 0.15, 0.0, 1.0);
-        }
-        case 8u: {
-            let turb = fbm(p, 5u, seed, true);
-            let veins = pow(abs(sin((p.x + p.y * 0.5) * 2.5 + turb * 9.0)), 0.3);
-            let cloud = fbm(p * 2.0, 3u, seed ^ 0x19u, false);
-            return clamp(veins * 0.85 + cloud * 0.15, 0.0, 1.0);
-        }
-        case 11u: {
-            let first = cells(p, seed);
-            let second = cells(p * 2.7 + 13.0, seed ^ 0x6bu);
-            return min(smoothstep(0.08, 0.16, first), smoothstep(0.06, 0.12, second));
-        }
-        case 12u: {
-            let first = cells(p * 2.0, seed ^ 0x45u);
-            return smoothstep(0.55, 0.58, fbm(p, 5u, seed, true) + (first - 0.5) * 0.25);
-        }
-        case 13u: {
-            let fine = noise(p * vec3(37.0, 1.3, 1.0), seed ^ 0x2bu, false);
-            return clamp(max(drip(p, p.x, 0, seed), drip(p, p.x + 0.37, 1, seed) * 0.8) * (0.6 + 0.4 * fine), 0.0, 1.0);
-        }
-        case 48u: {
-            let cell = vec3<i32>(floor(p));
-            return select(0.0, 1.0, ((cell.x + cell.y + cell.z) & 1) == 0);
-        }
-        case 49u: { return select(0.0, 1.0, fract(p.x) < 0.5); }
-        case 50u: {
-            let row = i32(floor(p.y * 2.0));
-            let x = p.x + select(0.0, 0.5, (row & 1) == 1);
-            let local = fract(vec2(x, p.y * 2.0));
-            let d = min(min(local.x, 1.0 - local.x), min(local.y, 1.0 - local.y) * 0.5);
-            let tone = cell_value(vec3(i32(floor(x)), row, 0), seed) * 0.6 + noise(p * 9.0, seed, false) * 0.4;
-            return smoothstep(0.02, 0.045, d) * (0.85 + 0.15 * tone);
-        }
-        case 51u: {
-            let cell = vec2<i32>(floor(p.xy));
-            let local = fract(p.xy);
-            let d = min(min(local.x, 1.0 - local.x), min(local.y, 1.0 - local.y));
-            return smoothstep(0.015, 0.035, d) * (0.9 + 0.1 * cell_value(vec3(cell, 0), seed));
-        }
-        case 52u: { return woven(p, seed, false); }
-        case 53u: { return woven(p, seed, true); }
-        case 54u: {
-            let w = noise(p * 0.7, seed ^ 0x2du, true) - 0.5;
-            let features = cellular(p + vec3(w * 0.4, -w * 0.4, 0.0), seed, true);
-            let crease = smoothstep(0.0, 0.16, features.y - features.x);
-            let pebble = 1.0 - features.x * 0.5;
-            let fine = noise(p * 7.0, seed ^ 0x13u, false);
-            return clamp(crease * pebble * (0.85 + 0.15 * fine), 0.0, 1.0);
-        }
-        case 55u: {
-            let first = min(cells(p, seed) * 1.25, 1.0);
-            let second = min(cells(p * 2.3 + 5.1, seed ^ 0x5au) * 1.25, 1.0);
-            return clamp(first * first * 0.75 + second * second * 0.25, 0.0, 1.0);
-        }
-        case 56u: {
-            let a = noise(p * vec3(1.5, 60.0, 1.0), seed, false);
-            let b = noise(p * vec3(0.4, 18.0, 1.0), seed ^ 0x77u, false);
-            return clamp(a * 0.6 + b * 0.4, 0.0, 1.0);
-        }
-        case 57u: { return cellular(p, seed, true).z; }
-        case 58u: {
-            let w = noise(p * 1.3, seed ^ 0x61u, true) - 0.5;
-            let q = p * vec3(1.15, 0.85, 1.0) + vec3(w * 0.3, w * 0.3, 0.0);
-            let features = cellular(q, seed, true);
-            let tone = features.z;
-            let print = select(0.0, 1.0 - smoothstep(0.18 + 0.1 * tone, 0.3 + 0.12 * tone, features.x), tone > 0.4);
-            let ridges = 0.5 + 0.5 * sin(features.x * 190.0 + w * 12.0);
-            let smudge = clamp((fbm(p * 1.7, 4u, seed ^ 0x33u, false) - 0.55) * 3.0, 0.0, 1.0);
-            return clamp(print * ridges * 0.9 + smudge * 0.4, 0.0, 1.0);
-        }
-        default: { return periodic_pattern(kind, p, seed); }
-    }
-}
-
-fn raw_procedural(layer: Operation, p: vec3<f32>) -> f32 {
-    if layer.ids.y == 80u {
-        return tile_generator(u32(layer.high.w), p.xy);
-    }
-    return pattern(layer.ids.y, p, layer.ids.z);
-}
-
-fn sample_procedural(layer: Operation, p: vec3<f32>) -> f32 {
-    let reduced = layer.procedural.x != 0u;
-    let cells = f32(max(layer.procedural.x, 1u)) / layer.uv.z;
-    let grid = p.xy * cells - 0.5;
-    let base = floor(grid) + 0.5;
-    var values = vec4(0.0);
-    for (var i = 0u; i < select(1u, 4u, reduced); i++) {
-        let offset = vec2<f32>(vec2(i % 2u, i / 2u));
-        let point = select(p.xy, (base + offset) / cells, reduced);
-        let value = raw_procedural(layer, vec3(point, p.z));
-        // Keeping the write at constant indices also lets FXC keep this loop rolled.
-        switch i {
-            case 0u: { values.x = value; }
-            case 1u: { values.y = value; }
-            case 2u: { values.z = value; }
-            default: { values.w = value; }
-        }
-    }
-    let t = fract(grid);
-    return select(values.x, mix(mix(values.x, values.y, t.x), mix(values.z, values.w, t.x), t.y), reduced);
-}
-
 fn paint_ramp_color(word: u32) -> vec3<f32> {
     return bitcast<vec3<f32>>(vec3(srgb[word], srgb[word + 1u], srgb[word + 2u]));
 }
@@ -322,12 +134,21 @@ fn gradient_color(op: Operation, t: f32) -> vec3<f32> {
     return first + (second - first) * (pos - f32(index));
 }
 
+fn wrap_coordinate(coordinate: i32, period: i32) -> i32 {
+    // Use unsigned remainder so negative operands are consistent across shader backends.
+    let bits = bitcast<u32>(coordinate);
+    let negative = coordinate < 0;
+    let magnitude = select(bits, 0u - bits, negative);
+    let remainder = i32(magnitude % u32(period));
+    return select(remainder, period - remainder, negative && remainder != 0);
+}
+
 fn azimuth(y: f32, x: f32) -> f32 {
     if x == 0.0 && y == 0.0 { return 0.5; }
     return atan2(y, x) / 6.283185307 + 0.5;
 }
 fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
-    if layer.ids.y == 15u {
+    if enable_anchor_reads && layer.ids.y == 15u {
         let pixel = vec2<u32>(uv * vec2<f32>(params.source.xy));
         var color = layer.low.rgb;
         if layer.ids.z != 0u {
@@ -344,79 +165,17 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
     if layer.ids.y == 0u {
         return layer.low.rgb;
     }
-    if layer.ids.y == IMAGE_SOURCE_OPCODE {
-        if layer.ids.z == MISSING_IMAGE {
-            return vec3(0.5);
-        }
-        return decode_image_sample(layer, image_projection(layer, uv, surface).rgb);
+    if enable_authored_images && layer.ids.y == IMAGE_SOURCE_OPCODE {
+        return authored_image_value(layer, uv, surface);
     }
-    let mode = layer.procedural.w;
-    let p = surface.position * layer.projection.w + layer.projection.xyz;
-    var points = array<vec2<f32>, 3>(p.zy, p.xz, p.xy);
-    var w = vec3(1.0, 0.0, 0.0);
-    if mode == 1u {
-        let weighted = pow(abs(surface.normal), vec3(layer.balance.w));
-        let weights = weighted / max(weighted.x + weighted.y + weighted.z, 1e-6);
-        let minimum = 1.0 / (131072.0 * max(layer.uv.w, 1.0));
-        let retained = select(vec3(0.0), weights, weights >= vec3(minimum));
-        w = select(retained, weights, all(retained == vec3(0.0)));
-    } else {
-        switch mode {
-            case 2u: {}
-            case 3u: { points[0] = p.xz; }
-            case 4u: { points[0] = p.xy; }
-            case 5u: {
-                var d = vec3(0.0, 1.0, 0.0);
-                if dot(surface.position, surface.position) > 0.0 { d = normalize(surface.position); }
-                points[0] = vec2(azimuth(d.z, d.x) * 4.0, acos(clamp(d.y, -1.0, 1.0)) * (2.0 / 3.141592654)) * layer.projection.w;
-            }
-            case 6u, 7u, 8u: {
-                let pos = surface.position;
-                let axis = select(select(pos.xyz, pos.yxz, mode == 6u), pos.xzy, mode == 8u);
-                points[0] = vec2(azimuth(axis.z, axis.x) * 4.0, axis.y) * layer.projection.w;
-            }
-            case DECAL_PROJECTION: { points[0] = uv * layer.uv.z; }
-            default: {
-                let rotation = layer.projection.xy;
-                let rotated = vec2(uv.x * rotation.x - uv.y * rotation.y, uv.x * rotation.y + uv.y * rotation.x);
-                points[0] = (rotated * layer.projection.zw + layer.uv.xy) * layer.uv.z;
-            }
-        }
-    }
-    var n = 0.0;
-    for (var plane = 0u; plane < select(1u, 3u, mode == 1u); plane++) {
-        if w[plane] > 0.0 {
-            n += w[plane] * sample_procedural(layer, vec3(points[plane], 0.0));
-        }
-    }
-    let shaped = clamp((n - 0.5) * layer.uv.w + 0.5 + layer.balance.x, 0.0, 1.0);
-    let t = select(shaped, 1.0 - shaped, layer.ids.w != 0u);
-    if layer.procedural.z > 0u {
-        return gradient_color(layer, t);
-    }
-    return layer.low.rgb + (layer.high.rgb - layer.low.rgb) * t;
+    return procedural_value(layer, uv, surface);
 }
 
 fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
-    if layer.procedural.w != DECAL_PROJECTION {
+    if !enable_authored_images || layer.procedural.w != DECAL_PROJECTION {
         return vec4(value(layer, uv, surface), 1.0);
     }
-    let frame = u32(layer.uv.x);
-    let decal = project_decal(frame, surface);
-    if decal.z <= 0.0 {
-        return vec4(0.0);
-    }
-    let alpha_image = srgb[frame + 11u];
-    let sample_uv = select(decal.xy, uv, layer.ids.y == 15u);
-    if alpha_image != MISSING_IMAGE {
-        let sampled = material_image_at(alpha_image, decal.xy);
-        let coverage = decal.z * clamp(sampled.a, 0.0, 1.0);
-        if layer.ids.y == IMAGE_SOURCE_OPCODE && layer.ids.z == alpha_image {
-            return vec4(decode_image_sample(layer, sampled.rgb), coverage);
-        }
-        return vec4(value(layer, sample_uv, surface), coverage);
-    }
-    return vec4(value(layer, sample_uv, surface), decal.z);
+    return decal_fill_value(layer, uv, surface);
 }
 
 fn stored_sample(layer: Operation, table: u32, origin: vec2<u32>, size: vec2<u32>, pixel: vec2<u32>, empty: vec4<f32>) -> vec4<f32> {
@@ -760,140 +519,12 @@ fn blend_rgb(mode: u32, a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
     }
 }
 
-fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u32, micro: f32) -> f32 {
-    let bake_pixel = bake_pixel_at(pixel);
-    let offset = u32(effect.uv.x);
-    var edges = 0.0;
-    var cavities = 0.0;
-    for (var i = 0u; i < 7u; i++) {
-        let weight = bitcast<f32>(srgb[offset + i]);
-        if weight == 0.0 { continue; }
-        var response = (finest - 0.5) * 2.0;
-        if i > 0u {
-            let size = f32(1u << (i - 1u));
-            response = 0.0;
-            if effect.effects.w == 0u {
-                response = curvature_level_at(bake_pixel, i - 1u) * (2.8284271247461903 * size);
-            }
-        }
-        edges = 1.0 - (1.0 - edges) * (1.0 - weight * clamp(response, 0.0, 1.0));
-        cavities = 1.0 - (1.0 - cavities) * (1.0 - weight * clamp(-response, 0.0, 1.0));
-    }
-    edges = 1.0 - (1.0 - edges) * (1.0 - max(micro, 0.0));
-    cavities = 1.0 - (1.0 - cavities) * (1.0 + min(micro, 0.0));
-    switch mode {
-        case 1u: { return edges; }
-        case 2u: { return cavities; }
-        case 3u: { return 1.0 - (1.0 - edges) * (1.0 - cavities); }
-        default: { return 0.5 + 0.5 * (edges - cavities); }
-    }
-}
-
-fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
-    let surface = texel.surface;
-    var baked = texel.baked;
-    if effect.effects.w != 0u {
-        let source = layers[effect.effects.w - 1u];
-        let input = fill_value(source, texel.uv, surface).x;
-        switch effect.ids.y {
-            case 40u, 43u: { baked.y = input; }
-            case 41u, 44u: { baked.x = input; }
-            case 42u: { baked.z = input; }
-            default: {}
-        }
-    }
-    let detail = u32(effect.uv.y);
-    var micro = 0.0;
-    if effect.effects.z != 0u {
-        let height = value(layers[effect.effects.z - 1u], texel.uv, surface).x;
-        micro = clamp(height, -1.0, 1.0) * effect.uv.z;
-    }
-    var signal = 0.0;
-    switch effect.ids.y {
-        case 40u: { signal = (baked.y - 0.5) * 2.0; }
-        case 41u: { signal = 1.0 - baked.x; }
-        case 42u: { signal = 1.0 - baked.z; }
-        case 43u: { signal = baked.y; }
-        case 44u: { signal = baked.x; }
-        case 45u: { signal = dot(surface.position, effect.high.xyz) * 0.5 + 0.5; }
-        default: { signal = dot(surface.normal, effect.high.xyz) * 0.5 + 0.5; }
-    }
-    if detail != 0u {
-        signal = generator_curvature(effect, texel.pixel, baked.y, detail, micro);
-    } else {
-        switch effect.ids.y {
-            case 40u, 43u, 44u: { signal += micro; }
-            case 41u: { signal -= micro; }
-            default: {}
-        }
-    }
-    if effect.low.z > 0.0 {
-        let noise = fbm(surface.position * effect.projection.x, 4u, effect.ids.z, true);
-        if detail != 0u {
-            let neutral = select(0.0, 0.5, detail == 4u);
-            signal = neutral + (signal - neutral) * max(0.0, 1.0 - noise * effect.low.z);
-        } else {
-            signal += (noise - 0.5) * effect.low.z;
-        }
-    }
-    let threshold = 1.0 - clamp(effect.low.x, 0.0, 1.0);
-    let ramp = clamp((signal - (threshold - effect.low.y)) / (2.0 * effect.low.y), 0.0, 1.0);
-    return ramp * ramp * (3.0 - 2.0 * ramp);
-}
-
-fn finish_generator(effect: Operation, ramp: f32) -> f32 {
-    var value = ramp;
-    if effect.projection.z != 0.5 || effect.projection.w != 0.0 {
-        let balance = clamp(effect.projection.z, 0.0, 1.0);
-        let low = max(1.0 - 2.0 * balance, 0.0);
-        let high = min(2.0 - 2.0 * balance, 1.0);
-        let middle = (low + high) * 0.5;
-        let keep = 1.0 - clamp(effect.projection.w, 0.0, 1.0);
-        let first = middle - (middle - low) * keep;
-        let last = middle + (high - middle) * keep;
-        if last - first < 1e-6 {
-            value = select(0.0, 1.0, value >= middle);
-        } else {
-            value = clamp((value - first) / (last - first), 0.0, 1.0);
-        }
-    }
-    return clamp(select(value, 1.0 - value, effect.ids.w != 0u) + effect.projection.y, 0.0, 1.0);
-}
-
-// Each scratch texel holds four float components followed by UV coverage.
-fn field_word(slot: u32, local: vec2<u32>) -> u32 {
-    let size = params.filter_region.zw;
-    return params.filter_stage.x + (slot * size.x * size.y + local.y * size.x + local.x) * 5u;
-}
-
-fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> {
-    if any(pixel < params.filter_region.xy) {
-        return vec4(0.0);
-    }
-    let local = pixel - params.filter_region.xy;
-    if any(local >= params.filter_region.zw) {
-        return vec4(0.0);
-    }
-    let start = field_word(slot, local);
-    return bitcast<vec4<f32>>(vec4(output[start], output[start + 1u], output[start + 2u], output[start + 3u]));
-}
-
 struct LayerTexel {
     pixel: vec2<u32>,
     uv: vec2<f32>,
     surface: Surface,
     baked: vec3<f32>,
     projected: ProjectedBrush,
-}
-
-// The most recent prepared field already contains all the effects below it.
-fn previous_field(start: u32, count: u32) -> u32 {
-    for (var i = count; i > 0u; i--) {
-        if layers[start + i - 1u].ids.y == SPATIAL_FILTER_OPCODE {
-            return i;
-        }
-    }
-    return 0u;
 }
 
 fn color_selection(effect: Operation, pixel: vec2<u32>) -> f32 {
@@ -911,7 +542,7 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
     let start = params.program.x + layer.effects.x;
     var skip = 0u;
     var mask = layer.balance.y;
-    if layer.spatial.z != 0u {
+    if enable_spatial_fields && layer.spatial.z != 0u {
         skip = previous_field(start, count);
         if skip != 0u {
             let field = layers[start + skip - 1u].spatial.x;
@@ -933,9 +564,9 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
             let sampled = fill_value(e, texel.uv, texel.surface);
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.a;
-        } else if e.ids.y >= 40u {
+        } else if enable_generators && e.ids.y >= 40u {
             var ramp: f32;
-            if e.spatial.y == 0u {
+            if !enable_spatial_fields || e.spatial.y == 0u {
                 ramp = generator_ramp(e, texel);
             } else {
                 ramp = filter_value(e.spatial.y - 1u, texel.pixel).x;
@@ -978,7 +609,7 @@ fn content_over(content: vec4<f32>, source: vec4<f32>, effect: Operation, channe
 fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
     let start = params.program.x + layer.effects.z;
     var skip = 0u;
-    if layer.spatial.y != 0u {
+    if enable_spatial_fields && layer.spatial.y != 0u {
         skip = previous_field(start, count);
     }
     var content: vec4<f32>;
@@ -1036,107 +667,6 @@ fn mask_with_height(layer: Operation, texel: LayerTexel, mask: f32) -> f32 {
 fn uv_texel_covered(pixel: vec2<u32>) -> bool {
     let word = uv_coverage[pixel.y * params.coverage.y + pixel.x / 32u];
     return (word & (1u << (pixel.x % 32u))) != 0u;
-}
-
-fn capture_material_anchor(texel: LayerTexel, end: u32, triangle: u32) -> vec3<f32> {
-    let channel = params.anchor.x;
-    let color_channel = channel == 0u || (channel >= 7u && channel <= 11u);
-    var result = params.anchor_default.rgb;
-    var parents: array<vec3<f32>, 17>;
-    var group_masks: array<f32, 17>;
-    var depth = 0u;
-    for (var i = 0u; i < end; i++) {
-        let layer = layers[i];
-        if composite_groups && layer.ids.y == BEGIN_GROUP {
-            parents[depth] = result;
-            var group_mask = 0.0;
-            if geometry_allows(layer.constraints.x, triangle) {
-                group_mask = mask_with_height(layer, texel, layer_mask(layer, texel, layer.effects.y));
-            }
-            group_masks[depth] = group_mask;
-            depth += 1u;
-            continue;
-        }
-        if composite_groups && layer.ids.y == END_GROUP {
-            depth -= 1u;
-            let weight = group_masks[depth] * bitcast<f32>(srgb[layer.ids.z + channel]);
-            result = mix(parents[depth], result, weight);
-            continue;
-        }
-        if layer.ids.x != channel || !geometry_allows(layer.constraints.x, triangle) {
-            continue;
-        }
-        let count = select(layer.effects.w, min(layer.effects.w, params.anchor.z), i >= params.anchor.y);
-        let content = layer_content(layer, texel, count);
-        let mask = mask_with_height(layer, texel, layer_mask(layer, texel, layer.effects.y));
-        let mode = u32(layer.balance.z);
-        let weight = layer.low.w * mask * select(content.a, 1.0, mode == 2u && content.a > 0.0);
-        if weight > 0.0 {
-            if color_channel {
-                result = mix(result, blend_rgb(mode, result, content.rgb), weight);
-            } else {
-                result = vec3(lerp(result.x, blend_scalar(mode, result.x, content.x), weight));
-            }
-        }
-    }
-    return result;
-}
-
-@compute @workgroup_size(8, 8)
-fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
-    if any(id.xy >= params.filter_chunk.zw) {
-        return;
-    }
-    let local = params.filter_chunk.xy + id.xy;
-    let pixel = params.filter_region.xy + local;
-    var prepared = vec4(0.0);
-    var geometric_weight = 0.0;
-    var covered = all(pixel < params.source.xy);
-    if covered && params.coverage.x != 0u {
-        covered = uv_texel_covered(pixel);
-    }
-    if covered {
-        let surface = surface_at(pixel);
-        let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
-        var projected = ProjectedBrush(vec4(0.0), 0.0);
-        if (params.coverage.w & PROJECTED_BRUSH) != 0u {
-            projected = sample_brush_projection(pixel, surface);
-        }
-        var baked = vec3(1.0, 0.5, 1.0);
-        if (params.coverage.w & 2u) != 0u {
-            baked = bitcast<vec3<f32>>(baked_at(pixel).xyz);
-        }
-        let texel = LayerTexel(pixel, uv, surface, baked, projected);
-        let layer = layers[params.filter_stage.z];
-        let count = params.filter_stage.w & 0x0fffffffu;
-        if (params.filter_stage.w & 0x40000000u) != 0u {
-            let generator = layers[params.program.x + layer.effects.x + count];
-            prepared = vec4(generator_ramp(generator, texel), 0.0, 0.0, 1.0);
-        } else if (params.filter_stage.w & 0x30000000u) != 0u {
-            var triangle = 0xffffffffu;
-            if (params.coverage.w & GEOMETRY_MASKS) != 0u {
-                triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
-            }
-            if (params.filter_stage.w & 0x20000000u) != 0u {
-                prepared = vec4(capture_material_anchor(texel, params.filter_stage.z, triangle), 1.0);
-            } else if geometry_allows(layer.constraints.x, triangle) {
-                prepared = vec4(vec3(layer_mask(layer, texel, count)), 1.0);
-            }
-        } else if (params.filter_stage.w & 0x80000000u) != 0u {
-            prepared = vec4(layer_mask(layer, texel, count), 0.0, 0.0, 1.0);
-        } else {
-            let content = layer_content(layer, texel, count);
-            prepared = vec4(content.rgb * content.a, content.a);
-        }
-        geometric_weight = 1.0;
-    }
-    let start = field_word(params.filter_stage.y, local);
-    let words = bitcast<vec4<u32>>(prepared);
-    output[start] = words.x;
-    output[start + 1u] = words.y;
-    output[start + 2u] = words.z;
-    output[start + 3u] = words.w;
-    output[start + 4u] = bitcast<u32>(geometric_weight);
 }
 
 fn to_u16(v: f32) -> u32 {

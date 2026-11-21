@@ -1,7 +1,5 @@
 // Authored image and decal descriptors from gpu_image_source.rs. The R32Uint
 // array also holds the Tile Generator's grayscale images.
-const IMAGE_SOURCE_OPCODE: u32 = 14u;
-const DECAL_PROJECTION: u32 = 9u;
 const MISSING_IMAGE: u32 = 0xffffffffu;
 
 fn image_plane_at(plane: u32, pixel: vec2<i32>) -> u32 {
@@ -141,4 +139,30 @@ fn project_decal(frame: u32, surface: Surface) -> vec4<f32> {
         return vec4(flipped, reflected.zw);
     }
     return direct;
+}
+
+fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
+    if layer.ids.z == MISSING_IMAGE {
+        return vec3(0.5);
+    }
+    return decode_image_sample(layer, image_projection(layer, uv, surface).rgb);
+}
+
+fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    let frame = u32(layer.uv.x);
+    let decal = project_decal(frame, surface);
+    if decal.z <= 0.0 {
+        return vec4(0.0);
+    }
+    let alpha_image = srgb[frame + 11u];
+    let sample_uv = select(decal.xy, uv, layer.ids.y == 15u);
+    if alpha_image != MISSING_IMAGE {
+        let sampled = material_image_at(alpha_image, decal.xy);
+        let coverage = decal.z * clamp(sampled.a, 0.0, 1.0);
+        if layer.ids.y == IMAGE_SOURCE_OPCODE && layer.ids.z == alpha_image {
+            return vec4(decode_image_sample(layer, sampled.rgb), coverage);
+        }
+        return vec4(value(layer, sample_uv, surface), coverage);
+    }
+    return vec4(value(layer, sample_uv, surface), decal.z);
 }

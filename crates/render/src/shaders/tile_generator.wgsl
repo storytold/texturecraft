@@ -1,7 +1,5 @@
 // Tile Generator parameters and placements follow gpu_tile_pattern.rs in the packed
 // compositor lookup buffer. Shapes, intersections and overlap blending run per texel.
-@group(0) @binding(10) var tile_images: texture_2d_array<u32>;
-
 const TILE_NO_IMAGE = 0xffffffffu;
 const TILE_EPSILON = 0.000001;
 const TILE_PLACEMENT_WORDS = 11u;
