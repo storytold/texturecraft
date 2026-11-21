@@ -170,8 +170,8 @@ impl DeviceStroke {
         queue: &wgpu::Queue,
         surface: brush_device::BrushSurface,
     ) -> Result<Box<dyn brush_device::DeviceStroke>, String> {
-        let brush_device::BrushSurface { mesh, bvh, uv, material, depth, settings } = surface;
-        let stroke = renderer.start_gpu_brush(device, queue, BrushInput { mesh, bvh, uv, material, depth, settings })?;
+        let brush_device::BrushSurface { mesh, bvh, uv, material, depth, settings, stencil } = surface;
+        let stroke = renderer.start_gpu_brush(device, queue, BrushInput { mesh, bvh, uv, material, depth, settings, stencil })?;
         Ok(Box::new(Self(stroke)))
     }
 }
@@ -188,6 +188,10 @@ impl brush_device::DeviceStroke for DeviceStroke {
 
     fn read_alpha(&self, tiles: &brush_device::BrushTiles) -> Result<TileImage, String> {
         self.0.read_alpha(tiles)
+    }
+
+    fn read_projection(&self, tiles: &brush_device::BrushTiles) -> Result<brush_device::ProjectedTiles, String> {
+        self.0.read_projection(tiles)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -298,7 +302,7 @@ impl SetCompositor {
                 PaintTarget::Layer(layer) => LiveBrushTarget::Layer { layer, values: brush.values.clone() },
                 PaintTarget::Mask(effect) => LiveBrushTarget::Mask { effect, value: brush.mask_value },
             };
-            Some(LiveBrush { target, opacity: brush.opacity, alpha: coverage.view() })
+            Some(LiveBrush { target, opacity: brush.opacity, alpha: coverage.view(), stencil: coverage.stencil() })
         } else {
             None
         };
@@ -2097,20 +2101,20 @@ pub(crate) mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn read_center(gpu: &Headless, texture: &wgpu::Texture) -> [u8; 4] {
+        read_pixel(gpu, texture, texture.width() / 2, texture.height() / 2)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_pixel(gpu: &Headless, texture: &wgpu::Texture, x: u32, y: u32) -> [u8; 4] {
         let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GPU mask test pixel"),
+            label: Some("GPU test pixel"),
             size: 4,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: texture.width() / 2, y: texture.height() / 2, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
+            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout::default() },
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
@@ -2207,6 +2211,162 @@ pub(crate) mod tests {
     fn smoke_gpu_mask_brush_at_4k_and_8k() {
         for size in [4096, 8192] {
             check_gpu_mask_stroke(size, Headless::new().unwrap());
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn projection_session(size: u32, mask_view: bool) -> (Session, LayerId) {
+        let mut session = Session::new_project("GPU projection", primitives::plane(1.0, 1), "builtin:plane", None, size).unwrap();
+        session.camera.set_angles(0.0, 1.45);
+        session.camera.ortho = true;
+        session.camera.distance = 1.8;
+        session.viewport = Vec2::splat(400.0);
+        if mask_view {
+            execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+            execute(&mut session, "mask.add.black", &json!({})).unwrap();
+        }
+        let layer = session.selected_layer().unwrap();
+        if mask_view {
+            session.view = ViewMode::Mask(layer);
+        }
+        // Three authored sRGB bands with distinct colors and alpha, away from sample boundaries.
+        let stencil = image::RgbaImage::from_fn(24, 24, |x, _| {
+            image::Rgba(match x / 8 {
+                0 => [241, 107, 35, 0],
+                1 => [204, 24, 32, 128],
+                _ => [31, 194, 113, 240],
+            })
+        });
+        let mut png = Vec::new();
+        stencil.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let name = session.import_resource_bytes("projection-bands.png", png).unwrap();
+        assert!(session.images[&name].srgb);
+        execute(&mut session, "tool.projection", &json!({})).unwrap();
+        execute(&mut session, "tool.stencil", &json!({"image": name, "scale": 0.48, "rotation": 15, "center": [0.04, -0.02]})).unwrap();
+        execute(&mut session, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.25, 0.8, 1.0], "maskValue": 0.65})).unwrap();
+        execute(&mut session, "tool.brush", &json!({"size": 12, "hardness": 100, "opacity": 83, "spacing": 20})).unwrap();
+        (session, layer)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn check_gpu_projection_stroke(size: u32, gpu: Headless, cpu_oracle: bool) {
+        use texturecraft_engine::texel::TILE;
+
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let screen = [144.0, 200.0, 256.0].map(|x| Vec2::new(x, 200.0));
+        let dab = |session: &mut Session| {
+            assert!(session.begin_stroke(screen[0], session.viewport, 1.0).unwrap());
+            for point in &screen[1..] {
+                assert!(session.continue_stroke(*point, 1.0));
+            }
+        };
+        let texel = |uv: Vec2, extent: u32| {
+            let pixel = (uv * extent as f32).as_uvec2();
+            (pixel.x.min(extent - 1), pixel.y.min(extent - 1))
+        };
+        for mask_view in [false, true] {
+            let (mut session, layer) = projection_session(size, mask_view);
+            let uvs = screen.map(|point| session.pick(point, session.viewport).unwrap().uv);
+            let aux = mask_view.then_some(AuxView::Mask(layer));
+            let mut link = link();
+            link.gpu_composite_enabled = true;
+            link.brush_device = Some(brush.clone());
+            let display = |scene: SceneSync| {
+                assert_eq!(scene.composites.len(), 1);
+                assert_eq!(scene.composites[0].1.is_mask_preview(), mask_view);
+                assert!(scene.tiles.is_empty() && scene.aux.is_empty());
+                let gpu = &mut *brush.0.lock().unwrap();
+                if let Some((mesh, id)) = &scene.mesh {
+                    gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
+                }
+                let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+                assert!(errors.is_empty(), "{size}², mask view {mask_view}: {errors:?}");
+                let texture = if mask_view { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
+                uvs.map(|uv| {
+                    let (x, y) = texel(uv, texture.width());
+                    read_pixel(gpu, texture, x, y)
+                })
+            };
+            let compare_pixels = |actual: [[u8; 4]; 3], expected: [[u8; 4]; 3]| {
+                for (actual, expected) in actual.into_iter().zip(expected) {
+                    assert!(
+                        actual.into_iter().zip(expected).all(|(gpu, cpu)| gpu.abs_diff(cpu) <= 2),
+                        "{size}², mask view {mask_view}: {actual:?} vs {expected:?}"
+                    );
+                }
+            };
+            let baseline = display(link.sync(&mut session, aux, None, 0, 0.0));
+            session.brush_device = link.brush_device(&session);
+            dab(&mut session);
+            assert!(session.device_stroke().is_some(), "{size}², mask view {mask_view}");
+            let live = display(link.sync(&mut session, aux, None, 0, 0.0));
+            assert!(session.doc.pixels.layer(layer, Channel::BaseColor).is_none() && session.doc.pixels.masks.is_empty());
+            assert!(live[0].into_iter().zip(baseline[0]).all(|(live, before)| live.abs_diff(before) <= 1), "transparent stencil pixels do not paint");
+            if mask_view {
+                assert!(live[2][0] > live[1][0] && live[1][0] > live[0][0], "mask coverage follows stencil alpha");
+                assert!(live.into_iter().all(|[r, g, b, _]| r == g && r == b));
+            } else {
+                assert!(live[1][0] > live[1][1] && live[2][1] > live[2][0], "the material takes the stencil's two ink colors");
+            }
+
+            session.cancel_stroke();
+            assert_eq!(display(link.sync(&mut session, aux, None, 0, 0.0)), baseline);
+            session.brush_device = link.brush_device(&session);
+            dab(&mut session);
+            assert!(session.device_stroke().is_some());
+            compare_pixels(display(link.sync(&mut session, aux, None, 0, 0.0)), live);
+            session.end_stroke().unwrap();
+            if mask_view {
+                assert!(session.doc.pixels.masks.values().any(|pixels| pixels.allocated_count() != 0));
+            } else {
+                assert!(session.doc.pixels.layer(layer, Channel::BaseColor).is_some_and(|pixels| pixels.allocated_count() != 0));
+            }
+            let committed = display(link.sync(&mut session, aux, None, 0, 0.0));
+            compare_pixels(committed, live);
+
+            if cpu_oracle {
+                let (mut cpu, layer) = projection_session(size, mask_view);
+                dab(&mut cpu);
+                assert!(cpu.device_stroke().is_none());
+                cpu.end_stroke().unwrap();
+                cpu.update();
+                let expected = if mask_view {
+                    let rgba = cpu.mask_view_rgba(layer, size).unwrap();
+                    uvs.map(|uv| {
+                        let (x, y) = texel(uv, size);
+                        let i = ((y * size + x) * 4) as usize;
+                        rgba[i..i + 4].try_into().unwrap()
+                    })
+                } else {
+                    uvs.map(|uv| {
+                        let (x, y) = texel(uv, size);
+                        let tile = display_tile_bytes(&cpu.caches[0].composite, &Default::default(), DisplayKind::BaseColor, x / TILE, y / TILE, 0);
+                        let i = ((y % TILE * TILE + x % TILE) * 4) as usize;
+                        tile[i..i + 4].try_into().unwrap()
+                    })
+                };
+                compare_pixels(live, expected);
+                compare_pixels(committed, expected);
+            }
+            session.undo().unwrap();
+            assert!(session.doc.pixels.layer(layer, Channel::BaseColor).is_none() && session.doc.pixels.masks.is_empty());
+            assert_eq!(display(link.sync(&mut session, aux, None, 0, 0.0)), baseline);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn gpu_projection_previews_cancels_commits_and_undoes_in_both_views() {
+        let Ok(gpu) = Headless::new() else { return };
+        check_gpu_projection_stroke(128, gpu, true);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "native 4K/8K GPU regression; requires an adapter with sufficient VRAM"]
+    fn smoke_gpu_projection_at_4k_and_8k() {
+        for size in [4096, 8192] {
+            check_gpu_projection_stroke(size, Headless::new().unwrap(), false);
         }
     }
 
