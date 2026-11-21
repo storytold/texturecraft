@@ -184,6 +184,7 @@ impl BrushPipeline {
         let projection = if let Some(stencil) = &input.stencil {
             let key = Arc::downgrade(&stencil.image);
             if self.stencil_image.as_ref().is_none_or(|(previous, _)| !previous.ptr_eq(&key)) {
+                self.stencil_image = None;
                 self.stencil_image = Some((key, gpu_stencil::upload_image(device, queue, &stencil.image)?));
             }
             let (_, image) = self.stencil_image.as_ref().ok_or("projection image missing")?;
