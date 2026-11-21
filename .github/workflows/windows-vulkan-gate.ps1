@@ -22,15 +22,27 @@ $loader = Get-VerifiedArchive `
     'vulkan.zip' 'A25A927AA8B9F0371048F1861CF88AC3B9BC9B1FB332C42D897C8AB32695769A'
 
 # The shared action starts this script from Git Bash, whose tar treats C: as a remote host.
-$tar = Join-Path ([System.Environment]::SystemDirectory) 'tar.exe'
+$system = [System.Environment]::SystemDirectory
+$tar = Join-Path $system 'tar.exe'
 & $tar -xf $mesa -C $runtime x64/lvp_icd.x86_64.json x64/vulkan_lvp.dll
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $loaderRoot = 'VulkanRT-X64-1.4.363.0-Components/x64'
-& $tar -xf $loader -C $runtime "$loaderRoot/vulkan-1.dll"
+& $tar -xf $loader -C $runtime "$loaderRoot/vulkan-1.dll" "$loaderRoot/vulkaninfo.exe"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$env:PATH = "$(Join-Path $runtime $loaderRoot);$env:PATH"
+$loaderBin = Join-Path $runtime $loaderRoot
+$env:PATH = "$loaderBin;$env:PATH"
 $env:VK_DRIVER_FILES = Join-Path $runtime 'x64/lvp_icd.x86_64.json'
+if ($env:RUNNER_ENVIRONMENT -eq 'github-hosted') {
+    # The loader can ignore environment-based driver discovery for elevated processes.
+    $drivers = 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers'
+    New-Item -Path $drivers -Force | Out-Null
+    New-ItemProperty -LiteralPath $drivers -Name $env:VK_DRIVER_FILES -PropertyType DWord -Value 0 -Force | Out-Null
+    $systemLoader = Join-Path $system 'vulkan-1.dll'
+    if (!(Test-Path -LiteralPath $systemLoader)) {
+        Copy-Item -LiteralPath (Join-Path $loaderBin 'vulkan-1.dll') -Destination $systemLoader
+    }
+}
 $env:WGPU_BACKEND = 'vulkan'
 $env:TC_CI_LAVAPIPE = '1'
 # Keep software devices from contending for all runner cores at once.
@@ -38,5 +50,11 @@ $env:RUST_TEST_THREADS = '2'
 $env:LP_NUM_THREADS = '2'
 
 Write-Host 'Windows CI using Mesa Lavapipe 26.3.0 with Vulkan loader 1.4.363.0'
+$summary = & (Join-Path $loaderBin 'vulkaninfo.exe') --summary
+if ($LASTEXITCODE -ne 0 -or !($summary -match 'deviceName\s*=\s*llvmpipe')) {
+    $summary | Write-Host
+    throw 'Vulkan preflight did not find the Lavapipe adapter'
+}
+$summary | Select-String 'deviceType|deviceName|driverInfo' | ForEach-Object { Write-Host $_.Line }
 cargo xtask ci
 exit $LASTEXITCODE
