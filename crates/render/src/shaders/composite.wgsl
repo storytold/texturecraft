@@ -53,6 +53,7 @@ const SPATIAL_FILTER_OPCODE: u32 = 36u;
 struct Surface {
     position: vec3<f32>,
     normal: vec3<f32>,
+    valid: bool,
 }
 
 fn edge(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
@@ -63,11 +64,11 @@ fn edge(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
 
 fn surface_at(pixel: vec2<u32>) -> Surface {
     if (params.coverage.w & 1u) == 0u || any(pixel >= params.source.xy) {
-        return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0));
+        return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false);
     }
     let hit = textureLoad(surface_uv, vec2<i32>(pixel), 0).xy;
     if hit.x == 0xffffffffu {
-        return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0));
+        return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false);
     }
     let a = surface_vertices[hit.x * 3u];
     let b = surface_vertices[hit.x * 3u + 1u];
@@ -87,7 +88,7 @@ fn surface_at(pixel: vec2<u32>) -> Surface {
     let w = 1.0 - weight.x - weight.y;
     let position = a.position.xyz * w + b.position.xyz * weight.x + c.position.xyz * weight.y;
     let normal = a.normal.xyz * w + b.normal.xyz * weight.x + c.normal.xyz * weight.y;
-    return Surface(position, select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12));
+    return Surface(position, select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12), true);
 }
 
 fn baked_at(pixel: vec2<u32>) -> vec4<u32> {
@@ -315,6 +316,12 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
     if layer.ids.y == 0u {
         return layer.low.rgb;
     }
+    if layer.ids.y == IMAGE_SOURCE_OPCODE {
+        if layer.ids.z == MISSING_IMAGE {
+            return vec3(0.5);
+        }
+        return decode_image_sample(layer, image_projection(layer, uv, surface).rgb);
+    }
     let mode = layer.procedural.w;
     let p = surface.position * layer.projection.w + layer.projection.xyz;
     var points = array<vec2<f32>, 3>(p.zy, p.xz, p.xy);
@@ -340,6 +347,7 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
                 let axis = select(select(pos.xyz, pos.yxz, mode == 6u), pos.xzy, mode == 8u);
                 points[0] = vec2(azimuth(axis.z, axis.x) * 4.0, axis.y) * layer.projection.w;
             }
+            case DECAL_PROJECTION: { points[0] = uv * layer.uv.z; }
             default: {
                 let rotation = layer.projection.xy;
                 let rotated = vec2(uv.x * rotation.x - uv.y * rotation.y, uv.x * rotation.y + uv.y * rotation.x);
@@ -359,6 +367,27 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
         return gradient_color(layer, t);
     }
     return layer.low.rgb + (layer.high.rgb - layer.low.rgb) * t;
+}
+
+fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    if layer.procedural.w != DECAL_PROJECTION {
+        return vec4(value(layer, uv, surface), 1.0);
+    }
+    let frame = u32(layer.uv.x);
+    let decal = project_decal(frame, surface);
+    if decal.z <= 0.0 {
+        return vec4(0.0);
+    }
+    let alpha_image = srgb[frame + 11u];
+    if alpha_image != MISSING_IMAGE {
+        let sampled = material_image_at(alpha_image, decal.xy);
+        let coverage = decal.z * clamp(sampled.a, 0.0, 1.0);
+        if layer.ids.y == IMAGE_SOURCE_OPCODE && layer.ids.z == alpha_image {
+            return vec4(decode_image_sample(layer, sampled.rgb), coverage);
+        }
+        return vec4(value(layer, decal.xy, surface), coverage);
+    }
+    return vec4(value(layer, decal.xy, surface), decal.z);
 }
 
 fn stored_paint(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
@@ -746,7 +775,9 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.w;
         } else if e.ids.y < 20u || e.ids.y >= 48u {
-            result = blend_scalar(u32(e.balance.z), mask, value(e, texel.uv, texel.surface).x);
+            let sampled = fill_value(e, texel.uv, texel.surface);
+            result = blend_scalar(u32(e.balance.z), mask, sampled.x);
+            weight *= sampled.a;
         } else if e.ids.y >= 40u {
             result = blend_scalar(u32(e.balance.z), mask, generator(e, texel.surface, texel.baked));
         } else {
@@ -776,7 +807,7 @@ fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
     } else if layer.ids.y == 10u {
         content = painted(layer, texel.pixel, texel.projected);
     } else {
-        content = vec4(value(layer, texel.uv, texel.surface), 1.0);
+        content = fill_value(layer, texel.uv, texel.surface);
     }
     if content.a <= 0.0 {
         return vec4(0.0);
