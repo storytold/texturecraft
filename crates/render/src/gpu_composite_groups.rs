@@ -26,8 +26,8 @@ impl GroupPlan {
         for op in operations {
             if is_group(op) {
                 self.markers += 1;
-            } else {
-                self.channels |= 1 << op.ids[0];
+            } else if let Some(bit) = 1u32.checked_shl(op.ids[0]) {
+                self.channels |= bit;
             }
         }
         // One word for the mask, then compact snapshots of the channels that can change.

@@ -651,7 +651,7 @@ impl CompositeProgram {
             let geometry_mask = geometry.register(inherited_geometry, own.geometry_mask.as_deref());
             let mask = project.layers.get(&project.mask_owner(id)).and_then(|owner| owner.mask.as_ref()).filter(|m| m.enabled);
             if let LayerKind::Group { children, .. } = &layer.kind {
-                if depth >= texturecraft_core::project::MAX_DEPTH || children.is_empty() {
+                if depth > texturecraft_core::project::MAX_DEPTH {
                     continue;
                 }
                 // A full-weight group sees the incoming stack and returns it exactly
@@ -673,15 +673,14 @@ impl CompositeProgram {
                         weights[channel_slot(channel) as usize] = blend.opacity.clamp(0.0, 1.0);
                     }
                 }
-                if weights.iter().all(|&opacity| opacity == 0.0) {
+                if weights.iter().all(|&opacity| opacity == 0.0)
+                    && mask.is_none_or(|mask| !mask.effects.iter().any(|effect| effect.visible && matches!(effect.kind, EffectKind::Anchor)))
+                {
                     continue;
                 }
                 let begin = effects.len() as u32;
                 let background = compile_mask(mask, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
                 let count = effects.len() as u32 - begin;
-                if count == 0 && background == 0.0 {
-                    continue;
-                }
                 let height = layer.height_mask;
                 let height_params = if height.enabled && count != 0 {
                     if !height.contrast.is_finite() || !height.offset.is_finite() {
@@ -705,6 +704,8 @@ impl CompositeProgram {
                 };
                 op.balance[1] = background;
                 operations.push(op);
+                mask_layers.insert(id, open as u32);
+                procedural.anchors.draw_ranges.push(open as u32..open as u32 + 1);
                 group_depth += 1;
                 groups.depth = groups.depth.max(group_depth);
                 layers.push(StackWork::EndGroup(open));
@@ -1254,7 +1255,7 @@ fn source_operation(
             op.ids = [0, ANCHOR_SOURCE, reference, u32::from(gray) | (u32::from(read_channel.kind() == ChannelKind::Signed && !is_mask) << 1)];
             op.low[..3].copy_from_slice(&read_channel.default_value());
             if channel == ChannelKind::Color && !ramp.is_empty() {
-                op.procedural[1..3].copy_from_slice(&inputs.pack_gradient(ramp)?);
+                op.procedural[1..3].copy_from_slice(&inputs.pack_rgb(ramp)?);
             }
         }
         Some(Source::Procedural { pattern, low, high, ramp }) => {
@@ -1311,7 +1312,7 @@ fn source_operation(
             op.balance[0] = pattern.balance;
             op.procedural[0] = pattern_pixels(pattern, inputs.resolution, inputs.resolution).unwrap_or(0);
             if channel == ChannelKind::Color && !ramp.is_empty() {
-                op.procedural[1..3].copy_from_slice(&inputs.pack_gradient(ramp)?);
+                op.procedural[1..3].copy_from_slice(&inputs.pack_rgb(ramp)?);
             }
             match projection {
                 Projection::Uv { scale, rotation, offset } => {
