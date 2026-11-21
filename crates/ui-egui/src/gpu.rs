@@ -777,7 +777,9 @@ impl GpuLink {
         let uses_cpu = |ts: usize| !gpu_mask && !self.compositors.get(ts).is_some_and(SetCompositor::uses_gpu);
 
         let count = session.caches.len();
-        out.cpu_texture_sets.extend((0..count).filter(|&ts| uses_cpu(ts)));
+        if !interactive || !self.prefer_gpu_layers {
+            out.cpu_texture_sets.extend((0..count).filter(|&ts| uses_cpu(ts)));
+        }
         let active = session.ts();
         let padding_pending = BTreeSet::<usize>::new();
         #[cfg(not(target_arch = "wasm32"))]
