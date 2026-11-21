@@ -46,17 +46,24 @@ fn original_at(position: vec2<u32>) -> Texel {
     return texel;
 }
 
+fn round_fixed(value: vec4<f32>) -> vec4<f32> {
+    let whole = floor(value);
+    return whole + select(vec4(0.0), vec4(1.0), value - whole >= vec4(0.5));
+}
+
 fn box_sample(position: vec2<u32>) -> Texel {
     if params.mode.w == 0u { return read_at(params.buffers.y, position); }
     let original = original_at(position);
     let finite = abs(original.value) <= vec4(3.402823466e38);
     let value = select(vec4(0.0), clamp(original.value, vec4(-1e6), vec4(1e6)), finite);
-    return Texel(sign(value) * floor(abs(value) * FIX + 0.5) / FIX, original.coverage);
+    return Texel(sign(value) * round_fixed(abs(value) * FIX) / FIX, original.coverage);
 }
 
 struct BoxSum {
     sum: Texel,
     correction: Texel,
+    nonzero: vec4<i32>,
+    covered: i32,
 }
 
 // Compensated updates keep the sliding sum stable even where only tiny
@@ -65,7 +72,9 @@ fn add_box_sample(acc: BoxSum, texel: Texel, weight: f32) -> BoxSum {
     let rgb = texel.value * weight - acc.correction.value;
     let coverage = texel.coverage * weight - acc.correction.coverage;
     let sum = Texel(acc.sum.value + rgb, acc.sum.coverage + coverage);
-    return BoxSum(sum, Texel((sum.value - acc.sum.value) - rgb, (sum.coverage - acc.sum.coverage) - coverage));
+    let nonzero = acc.nonzero + select(vec4(0), vec4(i32(weight)), texel.value != vec4(0.0));
+    let covered = acc.covered + select(0, i32(weight), texel.coverage != 0.0);
+    return BoxSum(sum, Texel((sum.value - acc.sum.value) - rgb, (sum.coverage - acc.sum.coverage) - coverage), nonzero, covered);
 }
 
 // One running window per line. Its initial sum visits at most the length of
@@ -78,15 +87,17 @@ fn box_blur(@builtin(global_invocation_id) id: vec3<u32>) {
     if line >= size.y { return; }
     let radius = params.mode.x;
     let reciprocal = 1.0 / f32(radius * 2u + 1u);
-    var acc = BoxSum(EMPTY, EMPTY);
+    var acc = BoxSum(EMPTY, EMPTY, vec4(0), 0);
     for (var index = 0u; index < min(radius + 1u, size.x); index++) {
         let point = vec2(index, line);
         acc = add_box_sample(acc, box_sample(select(point, point.yx, vertical)), 1.0);
     }
     for (var index = 0u; index < size.x; index++) {
         let point = vec2(index, line);
-        let value = floor(acc.sum.value * reciprocal * FIX + 0.5) / FIX;
-        let coverage = floor(max(acc.sum.coverage, 0.0) * reciprocal * FIX + 0.5) / FIX;
+        // Preserve exact zeros outside the filter footprint. A residual in alpha
+        // would make sparse Replace blend an otherwise empty texel.
+        let value = select(vec4(0.0), round_fixed(acc.sum.value * reciprocal * FIX) / FIX, acc.nonzero > vec4(0));
+        let coverage = select(0.0, round_fixed(vec4(max(acc.sum.coverage, 0.0) * reciprocal * FIX)).x / FIX, acc.covered > 0);
         write_at(params.buffers.z, select(point, point.yx, vertical), Texel(value, coverage));
         let next = index + radius + 1u;
         if next < size.x {
