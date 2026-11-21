@@ -12,7 +12,7 @@ pub struct Headless {
 impl Headless {
     /// Create a device on the default adapter. Errors when no GPU (or software) adapter exists.
     pub fn new() -> Result<Headless, String> {
-        let instance = wgpu::Instance::default();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).map_err(|e| format!("no GPU adapter: {e}"))?;
         let adapter_name = adapter.get_info().name;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).map_err(|e| format!("no GPU device: {e}"))?;
@@ -26,5 +26,24 @@ impl Headless {
         self.renderer.prepare(&self.device, &self.queue, &mut enc, frame);
         self.queue.submit([enc.finish()]);
         self.renderer.read_view(&self.device, &self.queue, frame.view_id)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::Headless;
+
+    #[test]
+    fn windows_ci_uses_lavapipe() {
+        if std::env::var_os("TC_CI_LAVAPIPE").is_none() {
+            return;
+        }
+        let gpu = Headless::new().expect("the Windows CI Vulkan adapter must be available");
+        let adapter = gpu.device.adapter_info();
+        assert_eq!(adapter.backend, wgpu::Backend::Vulkan, "{adapter:?}");
+        assert_eq!(adapter.device_type, wgpu::DeviceType::Cpu, "{adapter:?}");
+        assert!(adapter.name.starts_with("llvmpipe"), "{adapter:?}");
+        assert!(crate::gpu_composite::GpuCompositor::supports(&gpu.device), "{adapter:?}");
+        eprintln!("Windows CI renderer adapter: {adapter:?}");
     }
 }
