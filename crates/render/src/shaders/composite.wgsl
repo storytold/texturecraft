@@ -31,6 +31,8 @@ struct Params {
     // The high bit of the last word selects the mask stack.
     filter_stage: vec4<u32>,
     filter_chunk: vec4<u32>,
+    // Original ID bake dimensions, both zero when absent.
+    id_bake: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -54,6 +56,7 @@ const NO_PAINT_IMAGE = 0xffffffffu;
 const PROJECTED_BRUSH: u32 = 4u;
 const GEOMETRY_MASKS: u32 = 8u;
 const SPATIAL_FILTER_OPCODE: u32 = 36u;
+const COLOR_SELECTION_OPCODE: u32 = 38u;
 
 struct Surface {
     position: vec3<f32>,
@@ -862,6 +865,17 @@ fn previous_field(start: u32, count: u32) -> u32 {
     return 0u;
 }
 
+fn color_selection(effect: Operation, pixel: vec2<u32>) -> f32 {
+    if params.id_bake.x == 0u || effect.procedural.z == 0u { return 0.0; }
+    let color = id_color_at(pixel);
+    for (var i = 0u; i < effect.procedural.z; i++) {
+        let at = effect.procedural.y + i * 3u;
+        let picked = bitcast<vec3<f32>>(vec3(srgb[at], srgb[at + 1u], srgb[at + 2u]));
+        if all(abs(color - picked) <= vec3(effect.low.x)) { return 1.0; }
+    }
+    return 0.0;
+}
+
 fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
     let start = params.program.x + layer.effects.x;
     var skip = 0u;
@@ -900,6 +914,8 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
                 continue;
             }
             result = blend_scalar(u32(e.balance.z), mask, finish_generator(e, ramp));
+        } else if e.ids.y == COLOR_SELECTION_OPCODE {
+            result = blend_scalar(u32(e.balance.z), mask, color_selection(e, texel.pixel));
         } else {
             result = scalar_filter(e, mask);
         }

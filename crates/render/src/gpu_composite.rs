@@ -32,6 +32,7 @@ const NO_PAINT_IMAGE: u32 = u32::MAX;
 const BAKED_LIGHTING_OPCODE: u32 = 35;
 const NEIGHBOURHOOD_OPCODE: u32 = 36;
 const COMPARE_OPCODE: u32 = 37;
+const COLOR_SELECTION_OPCODE: u32 = 38;
 const NOOP_EFFECT_OPCODE: u32 = 39;
 const MASK_STAGE: u32 = 1 << 31;
 const GENERATOR_STAGE: u32 = 1 << 30;
@@ -44,6 +45,8 @@ const WORKGROUP: u32 = 8;
 const MAX_TILE_WORK_PER_BAND: u64 = 64 << 20;
 const MAX_TILE_WORK_PER_SUBMISSION: u64 = 256 << 20;
 const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
+const MAX_ID_BAKE_BYTES: u64 = 1 << 30;
+const MAX_ID_UPLOAD_BYTES: usize = 64 << 20;
 
 #[derive(Debug)]
 struct BakedInputs {
@@ -61,6 +64,20 @@ impl BakedInputs {
             return Err("The baked maps have different layouts and use CPU compositing.");
         }
         Ok(Some(Self { width: baked.resolution, height, maps }))
+    }
+}
+
+#[derive(Debug)]
+struct IdBake {
+    size: [u32; 2],
+    data: Arc<Vec<f32>>,
+}
+
+impl IdBake {
+    fn new(baked: &BakedMaps) -> Option<Self> {
+        let data = baked.maps.get(&BakedMap::Id)?;
+        let height = baked.height(BakedMap::Id);
+        (height > 0).then(|| Self { size: [baked.resolution.max(1), height], data: data.clone() })
     }
 }
 
@@ -194,7 +211,7 @@ impl ProceduralInputs {
         }
     }
 
-    fn pack_gradient(&mut self, colors: &[[f32; 3]]) -> Option<[u32; 2]> {
+    fn pack_rgb(&mut self, colors: &[[f32; 3]]) -> Option<[u32; 2]> {
         if colors.iter().flatten().any(|value| !value.is_finite()) {
             return None;
         }
@@ -400,6 +417,7 @@ pub struct CompositeProgram {
     surface: Option<(Arc<Mesh>, Arc<UvGBuffer>)>,
     needs_surface: bool,
     baked: Option<BakedInputs>,
+    id_bake: Option<IdBake>,
     display_outputs: u32,
     glossiness: bool,
     mask_preview: bool,
@@ -483,6 +501,7 @@ impl CompositeProgram {
             self.set_coverage(gbuf.clone(), 0);
         }
         self.baked = baked.map(BakedInputs::new).transpose()?.flatten();
+        self.id_bake = baked.filter(|_| self.operations.iter().any(|op| op.ids[1] == COLOR_SELECTION_OPCODE && op.procedural[2] != 0)).and_then(IdBake::new);
         if !self.mask_preview && self.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some()) {
             self.display_outputs |= display_bit(DisplayKind::Normal);
         }
@@ -766,6 +785,7 @@ impl CompositeProgram {
             surface: None,
             needs_surface,
             baked: None,
+            id_bake: None,
             display_outputs,
             glossiness: set.has_channel(Channel::Glossiness),
             mask_preview: false,
@@ -820,6 +840,7 @@ impl CompositeProgram {
             surface: None,
             needs_surface,
             baked: None,
+            id_bake: None,
             // Reuse the first four-byte display slot for linear grayscale.
             display_outputs: display_bit(DisplayKind::BaseColor),
             glossiness: false,
@@ -948,6 +969,13 @@ fn compile_mask(
                 op
             }
             EffectKind::Generator(generator) => generator_operation(generator, procedural, tile_patterns).ok_or("A mask generator uses CPU compositing.")?,
+            EffectKind::ColorSelection { colors, tolerance } => {
+                let [offset, count] = procedural.pack_rgb(colors).ok_or("A color selection has invalid colors.")?;
+                if !tolerance.is_finite() {
+                    return Err("A color selection has invalid tolerance.");
+                }
+                Operation { ids: [0, COLOR_SELECTION_OPCODE, 0, 0], low: [*tolerance, 0.0, 0.0, 0.0], procedural: [0, offset, count, 0], ..Operation::zeroed() }
+            }
             EffectKind::Compare { op, value, tolerance } => {
                 if !value.is_finite() || !tolerance.is_finite() {
                     return Err("A mask comparison has invalid parameters.");
@@ -1252,7 +1280,7 @@ fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operat
                 (32, *shadows)
             }
             GradientMap { colors } => {
-                op.procedural[1..3].copy_from_slice(&inputs.pack_gradient(colors)?);
+                op.procedural[1..3].copy_from_slice(&inputs.pack_rgb(colors)?);
                 (33, [0.0; 3])
             }
             ReplaceColor { from, to, tolerance, softness } => {
@@ -1333,6 +1361,12 @@ struct BakeCache {
     view: wgpu::TextureView,
 }
 
+struct IdBakeCache {
+    size: [u32; 2],
+    data: Weak<Vec<f32>>,
+    view: wgpu::TextureView,
+}
+
 struct CurvatureCache {
     gbuf: Weak<UvGBuffer>,
     map: Weak<Vec<f32>>,
@@ -1359,10 +1393,12 @@ pub(crate) struct GpuCompositor {
     coverage: Vec<(Weak<UvGBuffer>, wgpu::Buffer)>,
     surfaces: Vec<SurfaceCache>,
     baked: BTreeMap<usize, BakeCache>,
+    id_bakes: BTreeMap<usize, IdBakeCache>,
     curvature: Option<CurvatureResources>,
     default_surface: wgpu::TextureView,
     default_vertices: wgpu::Buffer,
     default_baked: wgpu::TextureView,
+    default_id_bake: Option<wgpu::TextureView>,
     default_brush_alpha: wgpu::TextureView,
     default_brush_stencil: GpuStencil,
     default_tile_images: wgpu::TextureView,
@@ -1398,6 +1434,7 @@ impl GpuCompositor {
             && limits.max_bindings_per_bind_group >= 15
             && limits.max_storage_textures_per_shader_stage >= 1
             && limits.max_compute_workgroup_size_x >= 64;
+        let supports_id = limits.max_sampled_textures_per_shader_stage >= 6 + u32::from(supports_curvature) && limits.max_bindings_per_bind_group >= 16;
         let mut entries = vec![
             binding(0, uniform),
             binding(1, read),
@@ -1416,6 +1453,9 @@ impl GpuCompositor {
         if supports_curvature {
             entries.extend([binding(13, uint), binding(14, uniform)]);
         }
+        if supports_id {
+            entries.push(binding(15, uint));
+        }
         let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("tc_gpu_composite_bindings"), entries: &entries });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tc_gpu_composite_layout"),
@@ -1427,6 +1467,8 @@ impl GpuCompositor {
         } else {
             "fn curvature_level_at(pixel: vec2<u32>, level: u32) -> f32 { return 0.0; }"
         };
+        let id_shader =
+            if supports_id { include_str!("shaders/id_sample.wgsl") } else { "fn id_color_at(pixel: vec2<u32>) -> vec3<f32> { return vec3(0.0); }" };
         let source = [
             include_str!("shaders/noise.wgsl"),
             include_str!("shaders/procedural_extra.wgsl"),
@@ -1435,6 +1477,7 @@ impl GpuCompositor {
             include_str!("shaders/stencil_projection.wgsl"),
             curvature_shader,
             include_str!("shaders/composite_groups.wgsl"),
+            id_shader,
             include_str!("shaders/composite.wgsl"),
         ]
         .join("\n");
@@ -1480,10 +1523,13 @@ impl GpuCompositor {
             coverage: Vec::new(),
             surfaces: Vec::new(),
             baked: BTreeMap::new(),
+            id_bakes: BTreeMap::new(),
             curvature: supports_curvature.then(|| CurvatureResources { gpu: None, empty: CurvatureLevels::empty(device), cache: BTreeMap::new() }),
             default_surface,
             default_vertices,
             default_baked,
+            default_id_bake: supports_id
+                .then(|| input_texture(device, "tc_composite_empty_id_bake", (1, 1), 1, wgpu::TextureFormat::Rgba32Uint).create_view(&Default::default())),
             default_brush_alpha,
             default_brush_stencil: GpuStencil::empty(device),
             default_tile_images: TileImageAtlas::empty_view(device),
@@ -1582,6 +1628,7 @@ impl GpuCompositor {
     pub(crate) fn retain_texture_sets(&mut self, count: usize) {
         self.release_unused_surfaces();
         self.baked.retain(|&ts, _| ts < count);
+        self.id_bakes.retain(|&ts, _| ts < count);
         if let Some(curvature) = &mut self.curvature {
             curvature.cache.retain(|&ts, _| ts < count);
         }
@@ -1591,6 +1638,7 @@ impl GpuCompositor {
     pub(crate) fn release_unused_surfaces(&mut self) {
         self.tile_images.retain(|_, atlas| atlas.is_live());
         self.surfaces.retain(|cache| cache.gbuf.strong_count() != 0);
+        self.id_bakes.retain(|_, cache| cache.data.strong_count() != 0);
         if let Some(curvature) = &mut self.curvature {
             curvature.cache.retain(|_, cache| cache.map.strong_count() != 0 && cache.gbuf.strong_count() != 0);
         }
@@ -1598,6 +1646,7 @@ impl GpuCompositor {
 
     pub(crate) fn clear_baked_inputs(&mut self) {
         self.baked.clear();
+        self.id_bakes.clear();
         if let Some(curvature) = &mut self.curvature {
             curvature.cache.clear();
         }
@@ -1605,10 +1654,67 @@ impl GpuCompositor {
 
     pub(crate) fn release_inputs(&mut self, ts: usize) {
         self.baked.remove(&ts);
+        self.id_bakes.remove(&ts);
         if let Some(curvature) = &mut self.curvature {
             curvature.cache.remove(&ts);
         }
         self.tile_images.remove(&ts);
+    }
+
+    fn id_bake_input(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, id_bake: Option<&IdBake>) -> Result<Option<wgpu::TextureView>, String> {
+        let Some(id_bake) = id_bake else {
+            self.id_bakes.remove(&ts);
+            return Ok(self.default_id_bake.clone());
+        };
+        if self.default_id_bake.is_none() {
+            return Err("Color selection exceeds the adapter's sampled-texture limit.".into());
+        }
+        let data = Arc::downgrade(&id_bake.data);
+        if let Some(cache) = self.id_bakes.get(&ts).filter(|cache| cache.size == id_bake.size && cache.data.ptr_eq(&data)) {
+            return Ok(Some(cache.view.clone()));
+        }
+
+        let [width, height] = id_bake.size;
+        // Pack the RGB floats across all four lanes of each GPU texel. This avoids wasting
+        // one word per source texel and allows complete rows to upload directly from the bake.
+        let packed_height = (u64::from(height) * 3).div_ceil(4) as u32;
+        let dimensions = device.limits().max_texture_dimension_2d;
+        if width.max(packed_height) > dimensions || u64::from(width) * u64::from(packed_height) * 16 > MAX_ID_BAKE_BYTES {
+            return Err("The ID map exceeds the adapter's GPU texture budget.".into());
+        }
+        self.id_bakes.remove(&ts);
+        let texture = input_texture(device, "tc_composite_id_bake", (width, packed_height), 1, wgpu::TextureFormat::Rgba32Uint);
+        let row_words = width as usize * 4;
+        let word_count = width as usize * height as usize * 3;
+        let mut tail_row = Vec::new();
+        let mut pending = 0;
+        for (band, source) in id_bake.data[..word_count].chunks(row_words * ROWS as usize).enumerate() {
+            let rows = source.len() / row_words;
+            let top = band as u32 * ROWS;
+            let (full, tail) = source.split_at(rows * row_words);
+            if rows > 0 {
+                let full: &[[f32; 4]] = bytemuck::cast_slice(full);
+                write_input(queue, &texture, (width, rows as u32), (top, 0), full);
+            }
+            if !tail.is_empty() {
+                tail_row.extend_from_slice(tail);
+                tail_row.resize(row_words, 0.0);
+                let padded: &[[f32; 4]] = bytemuck::cast_slice(&tail_row);
+                write_input(queue, &texture, (width, 1), (top + rows as u32, 0), padded);
+            }
+            pending += source.len() * size_of::<f32>();
+            if pending >= MAX_ID_UPLOAD_BYTES {
+                let submission = queue.submit([]);
+                #[cfg(not(target_arch = "wasm32"))]
+                device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }).map_err(|error| error.to_string())?;
+                #[cfg(target_arch = "wasm32")]
+                let _ = submission;
+                pending = 0;
+            }
+        }
+        let view = texture.create_view(&Default::default());
+        self.id_bakes.insert(ts, IdBakeCache { size: id_bake.size, data, view: view.clone() });
+        Ok(Some(view))
     }
 
     fn baked_input(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, baked: Option<&BakedInputs>) -> Result<wgpu::TextureView, String> {
@@ -1772,7 +1878,12 @@ impl GpuCompositor {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        let tile_work = program.tile_work_per_pixel()?.saturating_add(program.groups.work_per_pixel());
+        let selection_work = if program.id_bake.is_some() {
+            program.operations.iter().filter(|op| op.ids[1] == COLOR_SELECTION_OPCODE).map(|op| u64::from(op.procedural[2])).sum()
+        } else {
+            0
+        };
+        let tile_work = program.tile_work_per_pixel()?.saturating_add(program.groups.work_per_pixel()).saturating_add(selection_work);
         let grouped = program.groups.depth != 0;
         if grouped {
             self.group_pipeline.get_or_insert_with(|| {
@@ -1815,6 +1926,8 @@ impl GpuCompositor {
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
         let curvature = self.curvature_inputs(device, queue, ts, program, &baked)?;
+        let id_bake = self.id_bake_input(device, queue, ts, program.id_bake.as_ref())?;
+        let [id_width, id_height] = program.id_bake.as_ref().map_or([0; 2], |id| id.size);
         let mut words_per_pixel = 0;
         let copies = DisplayKind::ALL.map(|kind| {
             if !program.writes_display(kind) {
@@ -2000,6 +2113,10 @@ impl GpuCompositor {
                     0,
                     field_rect[2],
                     field_rect[3],
+                    id_width,
+                    id_height,
+                    0,
+                    0,
                 ];
                 let bindings = |values: &[u32]| {
                     let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2007,7 +2124,7 @@ impl GpuCompositor {
                         contents: bytemuck::cast_slice(values),
                         usage: wgpu::BufferUsages::UNIFORM,
                     });
-                    let entries = [
+                    let mut entries = [
                         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 2, resource: lookup.as_entire_binding() },
@@ -2029,8 +2146,13 @@ impl GpuCompositor {
                             binding: 14,
                             resource: curvature.as_ref().map_or_else(|| lookup.as_entire_binding(), |levels| levels.layout.as_entire_binding()),
                         },
+                        wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(id_bake.as_ref().unwrap_or(&baked)) },
                     ];
-                    let count = if curvature.is_some() { entries.len() } else { 13 };
+                    let mut count = if curvature.is_some() { 15 } else { 13 };
+                    if id_bake.is_some() {
+                        entries.swap(count, 15);
+                        count += 1;
+                    }
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("tc_composite_band"),
                         layout: &self.bindings,
@@ -2613,6 +2735,84 @@ mod procedural_tests {
             for (&expected, &[r, g, b, a]) in expected.iter().zip(rgba.as_chunks::<4>().0) {
                 assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255, "{filter:?} mask: GPU {r} vs CPU {expected}");
             }
+        }
+    }
+
+    #[test]
+    fn color_selection_matches_raw_rgb_in_material_and_mask_views() {
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
+        use texturecraft_compose::tile_bytes;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = TILE;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let mut project = Project::new("ID color selection", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let owner = project.alloc_id();
+        let color = Channel::BaseColor;
+        let fill = Fill { sources: BTreeMap::from([(color, Source::Uniform([0.89, 0.19, 0.04]))]), ..Default::default() };
+        let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &[color]);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.75; 3]), projection: Projection::default() }));
+        let raw = [0.40101, 0.69217, 0.05289];
+        let within = [0.375; 3];
+        let exact = [0.21875, 0.78125, 0.09375];
+        let effect_kind = |tolerance| EffectKind::ColorSelection { colors: vec![raw, within, exact], tolerance };
+        let mut select = Effect::new(project.alloc_id(), effect_kind(1.0 / 64.0));
+        select.blend = BlendMode::Multiply;
+        select.opacity = 0.75;
+        mask.effects.push(select);
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+
+        let colors = [raw, [0.390625; 3], [0.390626, 0.375, 0.375], exact, [0.1, 0.9, 0.2], raw, [0.8, 0.1, 0.9], [0.359375; 3], [0.0; 3]];
+        let make_bake =
+            |colors: [[f32; 3]; 9]| BakedMaps { resolution: 3, maps: BTreeMap::from([(BakedMap::Id, Arc::new(colors.into_iter().flatten().collect()))]) };
+        let bake = make_bake(colors);
+        let mut changed = colors;
+        changed[0] = [0.0; 3];
+        let changed = make_bake(changed);
+        let empty = BakedMaps::default();
+        let pixels = PixelStore::default();
+        let images = ImageStore::default();
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        for (baked, tolerance) in [(&bake, 1.0 / 64.0), (&bake, 0.0), (&changed, 0.0), (&empty, 0.0)] {
+            project.layer_mut(owner).unwrap().mask.as_mut().unwrap().effects[1].kind = effect_kind(tolerance);
+            let inputs = Inputs {
+                project: &project,
+                ts: 0,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked,
+                block_scales: project.texture_sets[0].block_scales(),
+                preview: None,
+                images: &images,
+                bounds: mesh.bounds(),
+            };
+            let mut oracle = Composite::new(&[color], SIZE);
+            composite_tiles(&inputs, &mut oracle, &[(0, 0)]);
+            let expected = tile_bytes(&oracle, baked, DisplayKind::BaseColor, 0, 0);
+            let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+            program.set_surface_inputs(&mesh, &gbuf, Some(baked)).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+            let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][0]).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1));
+
+            let expected = mask_image(&inputs, owner, SIZE).unwrap();
+            let mut mask = CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).unwrap();
+            mask.set_surface_inputs(&mesh, &gbuf, Some(baked)).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &mask).unwrap();
+            let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.aux_texture(0).unwrap()).unwrap();
+            assert_eq!(actual.len(), expected.len() * 4);
+            for (expected, &[r, g, b, a]) in expected.into_iter().zip(actual.as_chunks::<4>().0) {
+                assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255);
+            }
+            let gray = |x: u32, y: u32| actual[((y * SIZE + x) * 4) as usize];
+            assert_eq!(gray(SIZE / 2, SIZE / 6) > gray(5 * SIZE / 6, SIZE / 6), tolerance > 0.0);
+            assert_eq!(gray(SIZE / 6, SIZE / 6) > gray(5 * SIZE / 6, SIZE / 6), std::ptr::eq(baked, &bake));
         }
     }
 
@@ -3502,6 +3702,7 @@ mod paint_window_tests {
             surface: None,
             needs_surface: false,
             baked: None,
+            id_bake: None,
             display_outputs: 0,
             glossiness: false,
             mask_preview: false,
