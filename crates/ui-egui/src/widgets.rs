@@ -440,6 +440,44 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
             ui.copy_text(format!("{}, {}, {}", srgb[0], srgb[1], srgb[2]));
         }
     });
+    let mut hex_buf = ui.data(|d| d.get_temp::<String>(id.with("hex"))).unwrap_or_else(|| format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]));
+    let mut hex_edited = ui.data(|d| d.get_temp::<bool>(id.with("hex_edited"))).unwrap_or(false);
+    ui.horizontal(|ui| {
+        let hex_label = ui.label(crate::i18n::tr("Hex"));
+        let resp = ui.add(egui::TextEdit::singleline(&mut hex_buf).char_limit(32).desired_width(120.0)).labelled_by(hex_label.id);
+        if resp.changed() {
+            hex_edited = true;
+        }
+        let enter = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let lost_focus = resp.lost_focus();
+        let parsed = parse_hex_color(&hex_buf);
+        let is_six = is_six_digit_hex(&hex_buf);
+
+        if ((resp.changed() && is_six) || enter || (lost_focus && hex_edited))
+            && let Some(parsed_color) = parsed
+        {
+            if parsed_color != srgb {
+                srgb = parsed_color;
+                typed = true;
+            }
+            hex_edited = false;
+        }
+
+        if !resp.has_focus() {
+            hex_buf = format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]);
+            hex_edited = false;
+        } else if parsed.is_none() && !hex_buf.trim().is_empty() && hex_buf.trim() != "#" {
+            ui.painter().rect_stroke(resp.rect, 2.0, egui::Stroke::new(1.0, tk.warning), egui::StrokeKind::Outside);
+            let _ = resp.on_hover_text(crate::i18n::tr("Invalid color format (use #RRGGBB, #RGB or R, G, B)"));
+        }
+        ui.data_mut(|d| {
+            d.insert_temp(id.with("hex"), hex_buf.clone());
+            d.insert_temp(id.with("hex_edited"), hex_edited);
+        });
+        if icon_button(ui, egui_phosphor::regular::COPY, crate::i18n::tr("Copy Hex code"), false, 20.0).clicked() {
+            ui.copy_text(format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]));
+        }
+    });
     if typed {
         (h, s, v) = hsv_of(srgb);
     }
@@ -502,4 +540,52 @@ pub fn panel_header(ui: &mut Ui, title: &str, trailing: impl FnOnce(&mut Ui)) {
         ui.label(crate::theme::caption(title));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
     });
+}
+
+/// Whether the string represents a complete 6-digit hex color code (with or without a single leading `#`).
+fn is_six_digit_hex(s: &str) -> bool {
+    let t = s.trim();
+    let t = if let Some(stripped) = t.strip_prefix('#') {
+        if stripped.starts_with('#') {
+            return false;
+        }
+        stripped
+    } else {
+        t
+    };
+    t.len() == 6 && t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Parse a color from a hexadecimal string (e.g. `#ffaa00`, `ffaa00`, `#f80`) or comma-separated sRGB numbers.
+pub fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
+    let t = s.trim();
+    let t = if let Some(stripped) = t.strip_prefix('#') {
+        if stripped.starts_with('#') {
+            return None;
+        }
+        stripped
+    } else {
+        t
+    };
+    if t.len() == 6 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+        let r = u8::from_str_radix(t.get(0..2)?, 16).ok()?;
+        let g = u8::from_str_radix(t.get(2..4)?, 16).ok()?;
+        let b = u8::from_str_radix(t.get(4..6)?, 16).ok()?;
+        return Some([r, g, b]);
+    }
+    if t.len() == 3 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+        let r = u8::from_str_radix(t.get(0..1)?, 16).ok()? * 17;
+        let g = u8::from_str_radix(t.get(1..2)?, 16).ok()? * 17;
+        let b = u8::from_str_radix(t.get(2..3)?, 16).ok()? * 17;
+        return Some([r, g, b]);
+    }
+    let clean = s.trim().trim_start_matches("rgb(").trim_end_matches(')');
+    let parts: Vec<&str> = clean.split([',', ' ', ';']).filter(|p| !p.trim().is_empty()).collect();
+    if parts.len() == 3 {
+        let r: u8 = parts.first()?.trim().parse().ok()?;
+        let g: u8 = parts.get(1)?.trim().parse().ok()?;
+        let b: u8 = parts.get(2)?.trim().parse().ok()?;
+        return Some([r, g, b]);
+    }
+    None
 }
