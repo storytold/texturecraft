@@ -401,6 +401,28 @@ fn moving_a_point_recomposites_only_the_paths_tiles() {
 }
 
 #[test]
+fn moving_a_mask_path_refreshes_the_blur_outside_its_old_tile() {
+    let mut s = session(primitives::plane(1.0, 1));
+    let layer = execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap()["layer"].clone();
+    execute(&mut s, "mask.add.black", &json!({})).unwrap();
+    execute(&mut s, "layer.select", &json!({"layer": layer, "target": "mask"})).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 2.0, "hardness": 100})).unwrap();
+    execute(&mut s, "tool.material", &json!({"maskValue": 1.0})).unwrap();
+    let clear = s.caches[0].composite.value(Channel::BaseColor, 64, 38);
+    let u = 60.5 / RES;
+    let original = json!([[u, 32.5 / RES], [u, 44.5 / RES]]);
+    let result = execute(&mut s, "tool.path", &json!({"uvPoints": original, "commit": true})).unwrap();
+    let effect = result["committed"]["effect"].clone();
+    execute(&mut s, "effect.add.filter", &json!({"target": "mask", "filter": "blur", "radius": 32})).unwrap();
+    s.update();
+    assert_ne!(s.caches[0].composite.value(Channel::BaseColor, 64, 38), clear, "blur crosses the boundary");
+
+    execute(&mut s, "path.edit", &json!({"effect": effect, "index": 0})).unwrap();
+    execute(&mut s, "tool.path", &json!({"uvPoints": [[0.8, 0.8], [0.85, 0.8]]})).unwrap();
+    assert_eq!(s.caches[0].composite.value(Channel::BaseColor, 64, 38), clear, "the halo at the old location clears");
+}
+
+#[test]
 fn another_change_ends_the_point_undo_of_an_edited_path() {
     let mut s = session(primitives::sphere(1.0, 48, 24));
     let r = execute(&mut s, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]], "commit": true})).unwrap();

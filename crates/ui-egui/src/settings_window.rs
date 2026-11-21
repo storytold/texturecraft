@@ -355,6 +355,25 @@ fn general(
     });
 
     section(ui, n_("LAYER STACK OPTIONS"));
+    row(ui, tr("Layer compositing"), |ui, label| {
+        egui::ComboBox::from_id_salt("layer_compositor")
+            .width(CONTROL_WIDTH)
+            .selected_text(if p.gpu_compositing { tr("GPU (Automatic)") } else { tr("CPU") })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut p.gpu_compositing, true, tr("GPU (Automatic)"));
+                ui.selectable_value(&mut p.gpu_compositing, false, tr("CPU"));
+            })
+            .response
+            .labelled_by(label)
+            .on_hover_text(tr("GPU uses the CPU on unsupported devices or layer stacks. CPU forces software composition."));
+    });
+
+    row(ui, tr("Low-resolution material preview"), |ui, label| {
+        ui.checkbox(&mut p.material_start_preview, "").labelled_by(label).on_hover_text(tr(
+            "Show a quick preview while the CPU composes a texture set after opening or resizing. Turn off to see the finished tiles as they arrive.",
+        ));
+    });
+
     ui.horizontal(|ui| {
         ui.add_space(12.0);
         ui.add_enabled_ui(false, |ui| {

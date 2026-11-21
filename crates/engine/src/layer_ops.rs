@@ -203,14 +203,9 @@ impl Session {
     }
 }
 
-/// Resample every painted image of texture set `ts` to `size` (after a size change).
-pub(crate) fn resample_set(doc: &mut Document, ts: usize, size: (u32, u32)) {
-    map_set_images(doc, ts, |img, empty| fit(img, size, empty));
-}
-
 /// Replace every painted image of texture set `ts` (layers, content and mask paint effects) by
 /// `f(image, empty texel)`.
-pub(crate) fn map_set_images(doc: &mut Document, ts: usize, f: impl Fn(&TileImage, &[u16]) -> TileImage) {
+pub(crate) fn map_set_images(doc: &mut Document, ts: usize, mut f: impl FnMut(&TileImage, &[u16]) -> TileImage) {
     let ids: Vec<LayerId> = doc.project.walk(ts).into_iter().map(|(id, _)| id).collect();
     let effect_ids: Vec<LayerId> = ids
         .iter()

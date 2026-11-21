@@ -1236,3 +1236,33 @@ fn signed_half_float_normal_tiles_change_shading() {
     let changed_pixels = flat_pixels.iter().zip(tilted_pixels).filter(|(before, after)| before != after).count();
     assert!(changed_pixels > 100, "the signed normal should change the material highlight: {changed_pixels} pixels");
 }
+
+#[test]
+fn prepacked_viewport_tiles_match_full_tiles_after_device_downscaling() {
+    let Some((mut h, frame)) = setup() else { return };
+    h.renderer.set_display_shift(2);
+    h.renderer.set_texture_sets(&h.device, &h.queue, &[((80, 96), 0)], 2);
+    let mut uv = Frame { kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 }, ..frame };
+    uv.shade.view_mode = 1;
+    uv.shade.channel = 0;
+    let neutral = render(&mut h, &uv, "before_packed_tiles");
+    let full: Vec<u8> = (0..64u8).flat_map(|y| (0..64u8).flat_map(move |x| [4 * x, 4 * y, 244, 255])).collect();
+    let packed: Vec<_> =
+        full.as_chunks::<{ 64 * 4 }>().0.iter().step_by(2).flat_map(|row| row.as_chunks::<4>().0.iter().step_by(2).flatten().copied()).collect();
+    for y in 0..2 {
+        for x in 0..2 {
+            h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, x, y, &full);
+        }
+    }
+    let reference = render(&mut h, &uv, "full_tiles_downscaled");
+    assert_ne!(reference.px, neutral.px);
+    // Recreate the texture so missing writes cannot reuse the reference pixels.
+    h.renderer.set_texture_sets(&h.device, &h.queue, &[], 2);
+    h.renderer.set_texture_sets(&h.device, &h.queue, &[((80, 96), 0)], 2);
+    for y in 0..2 {
+        for x in 0..2 {
+            h.renderer.upload_display_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, x, y, &packed, 1);
+        }
+    }
+    assert_same(&render(&mut h, &uv, "packed_tiles_downscaled"), &reference, "packed tiles and clipped edges");
+}

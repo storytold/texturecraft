@@ -536,6 +536,14 @@ pub fn status_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
         .frame(egui::Frame::NONE.fill(tk.chrome).inner_margin(egui::Margin::symmetric(10, 0)))
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
+                if app.session.project_open {
+                    let (label, reason) = app.gpu.as_ref().map_or((tr("Layers: CPU"), tr("The GPU renderer is unavailable.")), |gpu| {
+                        let (label, reason) = gpu.compositor_status();
+                        (tr(label), tr(reason))
+                    });
+                    ui.label(RichText::new(label).size(11.0)).on_hover_text(reason);
+                    ui.separator();
+                }
                 if let Some(p) = app.bake_progress() {
                     ui.add(egui::ProgressBar::new(p).desired_width(160.0).desired_height(10.0).text(RichText::new(tr("Baking")).size(10.0)));
                     if ui.small_button(tr("Cancel")).clicked() {
@@ -543,10 +551,16 @@ pub fn status_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                     }
                 } else if let Some(job) = &app.resize {
                     let bar = egui::ProgressBar::new(job.progress.fraction()).desired_width(160.0).desired_height(10.0);
-                    ui.add(bar.animate(true).text(RichText::new(tr("Resizing")).size(10.0)));
+                    ui.add(bar.animate(true).text(RichText::new(tr("Resizing textures")).size(10.0)));
+                } else if app.gpu.as_ref().is_some_and(|gpu| gpu.cpu_padding_pending()) {
+                    ui.add(egui::Spinner::new().size(10.0));
+                    ui.label(RichText::new(tr("CPU preparing UV padding")).size(11.0));
                 } else if let Some(p) = app.gpu.as_ref().and_then(|g| g.composite_progress(&app.session)) {
-                    ui.add(egui::ProgressBar::new(p).desired_width(160.0).desired_height(10.0).text(RichText::new(tr("Compositing")).size(10.0)));
+                    ui.add(egui::ProgressBar::new(p).desired_width(160.0).desired_height(10.0).text(RichText::new(tr("CPU compositing")).size(10.0)));
                     ui.ctx().request_repaint();
+                } else if app.gpu.as_ref().is_some_and(|gpu| gpu.gpu_composite_pending()) {
+                    ui.add(egui::Spinner::new().size(10.0));
+                    ui.label(RichText::new(tr("GPU compositing")).size(11.0));
                 } else if let Some(msg) = app.session.log.last() {
                     ui.label(RichText::new(&msg.message).size(11.0).color(tk.text_dim));
                 }

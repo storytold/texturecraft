@@ -94,6 +94,8 @@ fn refresh_draft_preferences(draft: &mut Prefs, previous: &Prefs, current: &Pref
         autosave_minutes,
         language,
         viewport_texture,
+        gpu_compositing,
+        material_start_preview,
         brightness,
         accent,
         system_title_bar,

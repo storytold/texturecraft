@@ -10,6 +10,7 @@
 
 pub mod bake;
 pub mod bake_preview;
+pub mod brush_device;
 pub mod brush_preset_cmds;
 pub mod camera_cmds;
 pub mod color_selection_cmds;
@@ -35,6 +36,8 @@ pub mod mask_cmds;
 pub mod mask_export;
 mod mask_preview_pixel;
 pub mod material_lib;
+mod material_overview;
+pub use material_overview::MaterialOverview;
 mod material_preview_pixel;
 pub mod materials;
 pub mod materialx_cmds;
@@ -52,6 +55,7 @@ mod polygon_fill_drag;
 mod polygon_fill_mirror;
 mod stencil_look;
 // Mesh reimport reads files on native targets only
+mod display_padding;
 #[cfg(not(target_arch = "wasm32"))]
 mod preserve;
 pub mod preset_cmds;
@@ -68,7 +72,9 @@ mod solo;
 pub mod template_cmds;
 pub mod text_cmds;
 pub mod thumbs;
+mod tile_demand;
 mod tool_availability;
+pub use tile_demand::TileDemand;
 pub mod tool_cmds;
 pub mod tool_settings;
 mod triangle_partition;

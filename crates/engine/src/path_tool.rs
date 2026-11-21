@@ -914,11 +914,12 @@ impl Session {
 
         // Paths paint into the active set; a sublayer in another set recomposites in full
         let project = &self.doc.project;
-        let set = project.effect(eid).and_then(|(owner, _)| project.locate(owner)).map(|(ts, _, _)| ts);
-        if set == Some(self.ts()) {
-            // Content or mask, the sublayer's owner decides which sets redraw
+        let owner = project.effect(eid).map(|(owner, _)| owner);
+        if let Some(owner) = owner.filter(|&owner| project.locate(owner).is_some_and(|(ts, _, _)| ts == self.ts())) {
+            let mask = project.layer(owner)?.mask.as_ref().is_some_and(|mask| mask.effects.iter().any(|effect| effect.id == eid));
+            let target = if mask { PaintTarget::Mask(eid) } else { PaintTarget::Layer(eid) };
             let tiles = changed_tiles(&before.pixels, &self.doc.pixels, eid);
-            self.mark_painted(self.ts(), Some(PaintTarget::Layer(eid)), tiles);
+            self.mark_painted(self.ts(), Some(target), tiles, true);
         } else {
             self.invalidate_changed(&before);
         }

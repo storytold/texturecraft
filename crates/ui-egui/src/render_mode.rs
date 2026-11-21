@@ -466,7 +466,7 @@ fn show_gpu(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) -> bool {
     let ctx = ui.ctx().clone();
     let now = ctx.input(|i| i.time);
     let full = (rect.width().max(16.0) as u32, rect.height().max(16.0) as u32);
-    let loading = textures_loading(&app.session);
+    let loading = app.gpu.as_ref().map_or_else(|| textures_loading(&app.session), |gpu| gpu.display_pending(&app.session));
     let moving = app.render.motion.moving(&app.session.camera, now, loading);
     if moving {
         // Come back and restore the full size once the camera has been still, even with no input

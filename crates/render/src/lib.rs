@@ -20,6 +20,17 @@ mod cage_gpu;
 pub mod displace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_bake;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gpu_brush;
+pub mod gpu_composite;
+mod gpu_curvature;
+mod gpu_image_source;
+mod gpu_neighbourhood;
+pub mod gpu_quick_mask;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gpu_resize;
+pub mod gpu_stencil;
+mod gpu_tile_pattern;
 pub mod gpu_trace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod headless;
@@ -30,6 +41,7 @@ mod mips_dirty;
 mod missing_seam_gpu;
 pub mod neutral_material;
 pub mod overlay_quad;
+mod paint_window;
 pub mod readback;
 pub mod renderer;
 pub mod set_highlight;

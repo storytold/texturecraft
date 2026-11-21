@@ -143,6 +143,21 @@ pub fn configure(options: &mut NativeOptions, cli_gpu: Option<String>, cli_power
 
     if let WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup {
         create.power_preference = effective_power;
+        let device_descriptor = create.device_descriptor.clone();
+        create.device_descriptor = Arc::new(move |adapter| {
+            let mut descriptor = device_descriptor(adapter);
+            let available = adapter.limits();
+            let requested = &mut descriptor.required_limits;
+            // Wide 8K filters need a larger source region even when the output band is small.
+            // Negotiating the limit does not allocate a buffer. Each band still sizes its own
+            // working set against the resulting device limit.
+            if requested.max_storage_buffer_binding_size > 0 {
+                let filter_limit = (512 << 20).min(available.max_storage_buffer_binding_size).min(available.max_buffer_size);
+                requested.max_storage_buffer_binding_size = requested.max_storage_buffer_binding_size.max(filter_limit);
+                requested.max_buffer_size = requested.max_buffer_size.max(filter_limit);
+            }
+            descriptor
+        });
 
         let filter = effective_filter.clone();
         create.native_adapter_selector = Some(Arc::new(move |adapters, surface| {

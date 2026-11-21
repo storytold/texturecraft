@@ -218,6 +218,10 @@ fn main() {
     let ui_file =
         persistence_path.as_ref().map(|path| path.with_extension("json")).or_else(|| eframe::storage_dir(APP_NAME).map(|folder| folder.join("ui.json")));
     if let Some(file) = &ui_file {
+        let log = if persistence_path.is_some() { file.with_extension("performance.log") } else { file.with_file_name("performance.log") };
+        texturecraft_engine::log::set_performance_log_path(log);
+    }
+    if let Some(file) = &ui_file {
         let _ = ui_state_store::FILE.set(file.clone());
     }
     let prefs = saved_prefs(ui_file.as_deref(), persistence_path.as_deref());

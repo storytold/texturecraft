@@ -11,6 +11,7 @@ use texturecraft_core::{NormalFormat, PROJECT_EXT};
 use texturecraft_core::{Project, TextureSet};
 use texturecraft_formats::{ExportInput, ExportOptions, ExportedFile, FileFormat, MapOverride, Padding, ProjectFile};
 use texturecraft_geom::{Mesh, primitives};
+use web_time::Instant;
 
 use crate::commands::{CommandSpec, always, bad, normal_format_param, strp, u64p};
 use crate::session::{Document, Session};
@@ -192,11 +193,17 @@ impl Session {
 
     /// Open a `.tcraft` project from bytes.
     pub fn from_project_bytes(bytes: &[u8]) -> Result<Session> {
+        let start = Instant::now();
         let pf = texturecraft_formats::load_project_bytes(bytes).map_err(fe)?;
-        Session::from_project_file(pf)
+        let mut log = crate::SessionLog::new();
+        log.performance(format!("CPU project archive decoded in {} ms", start.elapsed().as_millis()));
+        let mut session = Session::from_project_file(pf)?;
+        session.log.prepend(log);
+        Ok(session)
     }
 
     pub fn from_project_file(pf: ProjectFile) -> Result<Session> {
+        let start = Instant::now();
         let mesh = match (&pf.mesh, pf.project.mesh.strip_prefix("builtin:")) {
             (_, Some(id)) => primitives::builtin(id).ok_or_else(|| EngineError::Other(format!("unknown built-in mesh `{id}`")))?,
             (Some((ext, bytes)), None) => read_stored_mesh(&pf.project, ext, bytes)?.mesh,
@@ -206,12 +213,21 @@ impl Session {
         check_materials(&pf.project, &mesh)?;
         let source = pf.mesh.clone();
         let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
+        let mesh_time = Instant::now();
         let mut s =
             Session::new(Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources }, mesh, source)?;
 
+        let cache_time = Instant::now();
         s.sync_images();
         s.load_bake_meshes(pf.high_poly, pf.cage);
         s.load_bake_paint(pf.bake_paint);
+        s.log.performance(format!(
+            "CPU project setup: mesh {} ms, UV and mesh indexes {} ms, resources {} ms ({} texture sets)",
+            mesh_time.duration_since(start).as_millis(),
+            cache_time.duration_since(mesh_time).as_millis(),
+            cache_time.elapsed().as_millis(),
+            s.caches.len()
+        ));
         s.log.warnings("Project", pf.warnings);
 
         Ok(s)
@@ -469,8 +485,12 @@ mod native {
     pub fn open_path(path: &str) -> Result<Session> {
         let p = Path::new(path);
         if ext_of(path) == PROJECT_EXT {
+            let start = Instant::now();
             let pf = texturecraft_formats::load_project(p).map_err(fe)?;
+            let mut log = crate::SessionLog::new();
+            log.performance(format!("CPU project archive read and decoded in {} ms", start.elapsed().as_millis()));
             let mut s = Session::from_project_file(pf)?;
+            s.log.prepend(log);
             s.path = Some(path.to_string());
             s.modified = false;
             Ok(s)
