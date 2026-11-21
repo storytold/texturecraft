@@ -34,12 +34,15 @@ impl<'a> BakeContext<'a> {
         let (low, high) = Source::of_request(request);
         let ray_frame = RayFrame::new(request, extent)?;
         let (mesh_scale, ray_epsilon) = (extent.scale, extent.ray_epsilon());
+        // A texel's antialiasing subsamples split its rays between them, at least one each
+        let samples_per_axis = settings.common.antialiasing.samples_per_axis();
+        let subsamples = samples_per_axis * samples_per_axis;
         let pass = |map: BakedMap, ray_settings: &RaySettings, kind: RayKind| {
             let half_angle_radians = (ray_settings.spread.clamp(0.0, 180.0) * 0.5).to_radians();
             let units = if ray_settings.relative_to_bounding_box { mesh_scale } else { 1.0 };
             settings.maps.is_enabled(map).then_some(Hemisphere {
                 kind,
-                rays: ray_settings.rays,
+                rays: ray_settings.rays.max(subsamples),
                 dmax: ray_settings.max_distance * units,
                 min_distance: ray_settings.min_distance * units,
                 attenuation: AmbientOcclusionAttenuation::None,
@@ -126,7 +129,9 @@ impl<'a> BakeContext<'a> {
         Some(Transfer { surface, bary: [hit.u, hit.v], t: hit.t, front })
     }
 
-    pub(crate) fn query(&self, transfer: Option<&Transfer>, low_surface: &Surface, seed: u64) -> Query {
+    /// `seed` is the texel's, shared by its subsamples so that their ray subsets interleave into one
+    /// stratified pattern; `(subset, subsets)` picks the subsample's share of it
+    pub(crate) fn query(&self, transfer: Option<&Transfer>, low_surface: &Surface, seed: u64, (subset, subsets): (u32, u32)) -> Query {
         let (source, surface, mesh) = match (&self.high, transfer) {
             (Some(high), Some(transfer_hit)) => (high, &transfer_hit.surface, 1),
             _ => (&self.low, low_surface, 0),
@@ -134,7 +139,7 @@ impl<'a> BakeContext<'a> {
         let seed_hash = splitmix64(seed);
         let rot = [(seed_hash >> 40) as f32 / (1u64 << 24) as f32, ((seed_hash >> 16) & 0xff_ffff) as f32 / (1u64 << 24) as f32];
         let geo = if surface.geo_nrm.dot(surface.nrm) < 0.0 { -surface.geo_nrm } else { surface.geo_nrm };
-        Query { pos: surface.pos, nrm: surface.nrm, geo, rot, key: source.key.get(surface.tri as usize).copied().unwrap_or(ANY), mesh }
+        Query { pos: surface.pos, nrm: surface.nrm, geo, rot, key: source.key.get(surface.tri as usize).copied().unwrap_or(ANY), mesh, subset, subsets }
     }
 
     pub(crate) fn traces_curvature(&self) -> bool {

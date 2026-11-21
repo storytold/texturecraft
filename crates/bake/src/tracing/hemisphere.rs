@@ -6,6 +6,7 @@ use texturecraft_geom::glam::Vec3;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hemisphere {
     pub kind: RayKind,
+    /// Rays per texel: the stratified pattern that a texel's queries share (see `Query::subsets`)
     pub rays: u32,
     /// Maximum ray distance in mesh units
     pub dmax: f32,
@@ -44,13 +45,18 @@ impl Hemisphere {
         (axis, geometric_normal, query.pos + geometric_normal * self.eps)
     }
 
+    /// The query's (value, bent normal). A query that casts one of several subsets of its texel's rays
+    /// returns its open directions' unnormalized sum instead of a bent normal: the texel adds its
+    /// subsets' sums and normalizes once, so its bent normal is the one its whole ray pattern gives.
+    /// If such a query finds all its rays below the surface it has no estimate: NaN, which the
+    /// texel skips just as a whole texel skips its rejected rays.
     pub fn evaluate(&self, mesh: &TraceMesh, query: &Query) -> [f32; 4] {
         let (axis, geometric_normal, origin) = self.frame(query);
         let (tangent, bitangent) = axis.any_orthonormal_pair();
         let key = if self.same_key { query.key } else { ANY };
         let filtered = key != ANY || self.ignore_backface != BackfaceMode::Never;
         let (mut accumulated, mut bent_normal, mut accepted_ray_count) = (0.0f32, Vec3::ZERO, 0u32);
-        for ray_index in 0..self.rays {
+        for ray_index in (query.subset..self.rays).step_by(query.subsets.max(1) as usize) {
             let direction = self.direction((tangent, bitangent, axis), ray_index, query.rot);
             if direction.dot(geometric_normal) <= 0.0 {
                 continue;
@@ -86,10 +92,13 @@ impl Hemisphere {
             }
             accepted_ray_count += 1;
         }
+        if accepted_ray_count == 0 && query.subsets > 1 {
+            return [f32::NAN; 4];
+        }
         match self.kind {
             RayKind::Occlusion => {
                 let ambient_occlusion = if accepted_ray_count == 0 { 1.0 } else { (1.0 - accumulated / accepted_ray_count as f32).clamp(0.0, 1.0) };
-                let bent_normal = bent_normal.try_normalize().unwrap_or(query.nrm);
+                let bent_normal = if query.subsets > 1 { bent_normal } else { bent_normal.try_normalize().unwrap_or(query.nrm) };
                 [ambient_occlusion, bent_normal.x, bent_normal.y, bent_normal.z]
             }
             RayKind::Thickness => [if accepted_ray_count == 0 { self.dmax } else { accumulated / accepted_ray_count as f32 }, 0.0, 0.0, 0.0],
