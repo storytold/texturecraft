@@ -11,7 +11,7 @@ use texturecraft_engine::core::{
 };
 use texturecraft_engine::filter_lib::scalar_params;
 use texturecraft_engine::paint::alpha_params::MAX_ALPHA_CONTRAST;
-use texturecraft_engine::paint::{BrushAlpha, BrushSettings, alphas};
+use texturecraft_engine::paint::{BrushAlpha, BrushSettings, StampBlending, alphas};
 use texturecraft_engine::{CloneFrom, StackTarget, Tool};
 
 use crate::TextureCraftApp;
@@ -2330,6 +2330,30 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
 
     *brush = brush.sanitized();
+    stamp_blending_section(app, ui);
+}
+
+fn stamp_blending_section(app: &mut TextureCraftApp, ui: &mut Ui) {
+    let current = app.session.tool.brush.stamp_blending;
+    let mut selected = current;
+    let at_default = current == StampBlending::default();
+    if section_with_reset(ui, "sec_stamp_blending", tr("Advanced Blending"), false, at_default, |ui| {
+        let label = |mode| match mode {
+            StampBlending::Normal => tr("Normal"),
+            StampBlending::Lighten => tr("Lighten (Maximum)"),
+            StampBlending::Add => tr("Linear dodge (Add)"),
+        };
+        egui::ComboBox::from_label(tr("Stamps Blending")).selected_text(label(current)).show_ui(ui, |ui| {
+            for mode in [StampBlending::Normal, StampBlending::Lighten, StampBlending::Add] {
+                ui.selectable_value(&mut selected, mode, label(mode));
+            }
+        });
+    }) {
+        selected = StampBlending::default();
+    }
+    if selected != current {
+        app.run("tool.brush", json!({"stampBlending": selected}));
+    }
 }
 
 /// One alpha in the picker: a 52×64 tile with the shape drawn by `paint` and a label.

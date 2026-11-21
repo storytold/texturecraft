@@ -18,6 +18,37 @@ pub enum Alignment {
     Camera,
 }
 
+/// How overlapping stamps accumulate coverage within a stroke.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[repr(u32)]
+pub enum StampBlending {
+    #[default]
+    Normal = 0,
+    Lighten = 1,
+    Add = 2,
+}
+
+impl StampBlending {
+    /// Apply the stamp coverage and cap the stroke at full coverage.
+    #[inline]
+    pub fn accumulate(self, previous: f32, stamp: f32) -> f32 {
+        let (previous_weight, stamp_weight) = self.weights(previous, stamp);
+        (stamp_weight + previous_weight).min(1.0)
+    }
+
+    /// Coverage contributions before clamping, also used to blend carried paint values.
+    #[inline]
+    pub(crate) fn weights(self, previous: f32, stamp: f32) -> (f32, f32) {
+        match self {
+            Self::Normal => (previous * (1.0 - stamp), stamp),
+            Self::Lighten if stamp > previous => (0.0, stamp),
+            Self::Lighten => (previous, 0.0),
+            Self::Add => (previous, stamp),
+        }
+    }
+}
+
 /// The stamp shape (multiplied by the hardness falloff).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BrushAlpha {
@@ -300,6 +331,8 @@ pub struct BrushSettings {
     pub flow: f32,
     /// Caps a whole stroke 0..1.
     pub opacity: f32,
+    #[serde(default)]
+    pub stamp_blending: StampBlending,
     /// Distance between stamps as a fraction of the diameter.
     pub spacing: f32,
     /// Start of the edge falloff (0 soft … 1 hard).
@@ -345,6 +378,7 @@ impl Default for BrushSettings {
             min_size: 0.05,
             flow: 1.0,
             opacity: 1.0,
+            stamp_blending: StampBlending::default(),
             spacing: 0.1,
             hardness: 0.5,
             angle: 0.0,

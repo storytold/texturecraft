@@ -6,6 +6,7 @@ struct Params {
     ortho: vec4<f32>, // orthographic ray direction and enable
     shape: vec4<f32>, // alpha extents, roundness, contrast
     flags: vec4<u32>, // UV mode, culling, invert brush tip, quick-mask mode
+    stamp_blending: u32,
 }
 struct Vertex {
     position: vec4<f32>,
@@ -20,6 +21,9 @@ struct Dab {
 }
 // Corresponds to the BrushAlpha mapping in BrushPipeline::pipeline.
 override alpha_kind: u32 = 0u;
+// Match texturecraft_paint::StampBlending.
+const BLEND_LIGHTEN: u32 = 1u;
+const BLEND_ADD: u32 = 2u;
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(3) var uv_surface: texture_2d<u32>;
 @group(0) @binding(4) var<storage, read> vertices: array<Vertex>;
@@ -248,7 +252,13 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32, mask: u32) -> u32 {
             tested_visibility = has_normal;
         }
         let old = f32(coverage) / 65535.0;
-        coverage = u32(clamp(opacity + old * (1.0 - opacity), 0.0, 1.0) * 65535.0 + 0.5);
+        var blended = opacity + old * (1.0 - opacity);
+        switch params.stamp_blending {
+            case BLEND_LIGHTEN: { blended = max(old, opacity); }
+            case BLEND_ADD: { blended = old + opacity; }
+            default: {}
+        }
+        coverage = u32(clamp(blended, 0.0, 1.0) * 65535.0 + 0.5);
     }
     return coverage;
 }

@@ -27,6 +27,7 @@ pub fn with_stroke_of(brush: &BrushSettings, from: &BrushSettings) -> BrushSetti
     BrushSettings {
         flow: from.flow,
         opacity: from.opacity,
+        stamp_blending: from.stamp_blending,
         spacing: from.spacing,
         hardness: from.hardness,
         angle: from.angle,

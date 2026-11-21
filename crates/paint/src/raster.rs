@@ -9,7 +9,7 @@ use texturecraft_geom::glam::Vec3;
 use texturecraft_geom::{Bvh, Mesh, NO_TRI, UvGBuffer};
 use texturecraft_texel::{TILE, TileImage, from_u16, to_u16};
 
-use crate::brush::Shape;
+use crate::brush::{Shape, StampBlending};
 use crate::pickup::Pickup;
 use crate::stamp_source::StampSource;
 use crate::stroke::Stamp;
@@ -28,19 +28,33 @@ pub struct StrokeCanvas {
     pub limit: Option<(TileImage, bool)>,
     /// Clone and smudge: the channel values the stroke carries.
     pub pickup: Option<Pickup>,
+    stamp_blending: StampBlending,
     /// The stamp being added: `(x, y, alpha)` per texel (reused between stamps).
     texels: Vec<(u32, u32, f32)>,
 }
 
 impl StrokeCanvas {
     pub fn new(width: u32, height: u32) -> StrokeCanvas {
-        StrokeCanvas { alpha: TileImage::new(width, height, 1), dirty: BTreeSet::new(), recent: BTreeSet::new(), limit: None, pickup: None, texels: Vec::new() }
+        StrokeCanvas {
+            alpha: TileImage::new(width, height, 1),
+            dirty: BTreeSet::new(),
+            recent: BTreeSet::new(),
+            limit: None,
+            pickup: None,
+            stamp_blending: StampBlending::Normal,
+            texels: Vec::new(),
+        }
+    }
+
+    pub fn with_stamp_blending(mut self, stamp_blending: StampBlending) -> Self {
+        self.stamp_blending = stamp_blending;
+        self
     }
 
     /// Start over when the canvas is not the size of `gbuf`.
     fn fit(&mut self, gbuf: &UvGBuffer) {
         if (self.alpha.width(), self.alpha.height()) != (gbuf.width, gbuf.height) {
-            *self = StrokeCanvas::new(gbuf.width, gbuf.height);
+            *self = StrokeCanvas::new(gbuf.width, gbuf.height).with_stamp_blending(self.stamp_blending);
         }
     }
 
@@ -52,7 +66,7 @@ impl StrokeCanvas {
 
     /// Blend the gathered stamp texels (stamp center `center` in texels) into the stroke: the
     /// quick mask scales them, then the pickup deposits its values or the alpha accumulates
-    /// ("over": `m = a + m·(1 − a)`).
+    /// with the brush's stamp blending mode.
     fn add_stamp(&mut self, center: [f32; 2], source: Option<StampSource>) {
         let mut texels = std::mem::take(&mut self.texels);
         if let Some((mask, invert)) = &self.limit {
@@ -62,11 +76,11 @@ impl StrokeCanvas {
             }
         }
         let painted = match &mut self.pickup {
-            Some(p) => p.stamp(&mut self.alpha, &texels, center, source),
+            Some(p) => p.stamp(&mut self.alpha, &texels, center, source, self.stamp_blending),
             None => {
                 for &(x, y, a) in &texels {
                     let m = from_u16(self.alpha.get(x, y)[0]);
-                    self.alpha.set(x, y, &[to_u16(a + m * (1.0 - a))]);
+                    self.alpha.set(x, y, &[to_u16(self.stamp_blending.accumulate(m, a))]);
                 }
                 true
             }

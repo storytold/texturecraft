@@ -45,6 +45,8 @@ struct Parameters {
     ortho: [f32; 4],
     shape: [f32; 4],
     flags: [u32; 4],
+    stamp_blending: u32,
+    padding: [u32; 3],
 }
 
 #[repr(C)]
@@ -213,6 +215,8 @@ impl BrushPipeline {
                 u32::from(settings.alpha_params.invert),
                 input.limit.as_ref().map_or(0, |(_, invert)| 1 + u32::from(*invert)),
             ],
+            stamp_blending: settings.stamp_blending as u32,
+            padding: [0; 3],
         };
         if let Some(depth) = &input.depth {
             params.camera = depth.view_proj.to_cols_array_2d();
@@ -600,7 +604,7 @@ mod tests {
     use super::*;
     use crate::headless::Headless;
     use texturecraft_geom::{OrbitCamera, glam::Vec3, primitives};
-    use texturecraft_paint::{RasterCtx, Shape, StrokeCanvas, rasterize, rasterize_uv};
+    use texturecraft_paint::{RasterCtx, Shape, StampBlending, StrokeCanvas, rasterize, rasterize_uv};
 
     #[test]
     fn gpu_projection_readback_matches_screen_stencil_sampling() {
@@ -845,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn world_stroke_paints_both_sides_of_a_uv_seam() {
+    fn world_stroke_stamp_blending_paints_both_sides_of_a_uv_seam() {
         let Ok(mut gpu) = Headless::new() else { return };
         let positions = vec![
             Vec3::new(-1.0, 0.0, -1.0),
@@ -860,17 +864,9 @@ mod tests {
         let uvs = [[0.05, 0.35], [0.65, 0.95]].into_iter().flat_map(|us| [0.1, 0.9].into_iter().flat_map(move |v| us.map(|u| Vec2::new(u, v)))).collect();
         let mesh = Arc::new(Mesh::from_parts(positions, Some(vec![Vec3::Y; 8]), uvs, vec![0, 2, 1, 1, 2, 3, 4, 6, 5, 5, 6, 7], "Seam").unwrap());
         let camera = OrbitCamera { pitch: 1.2, ..OrbitCamera::default() };
-        let input = BrushInput {
-            bvh: Arc::new(Bvh::new(&mesh)),
-            uv: Arc::new(UvGBuffer::new(&mesh, 0, 128, 128)),
-            depth: Some(Arc::new(EyeDepth::render(&mesh, &camera, 128, 128))),
-            mesh,
-            material: 0,
-            settings: BrushSettings::default(),
-            stencil: None,
-            limit: None,
-        };
-        let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
+        let bvh = Arc::new(Bvh::new(&mesh));
+        let uv = Arc::new(UvGBuffer::new(&mesh, 0, 128, 128));
+        let depth = Arc::new(EyeDepth::render(&mesh, &camera, 128, 128));
         let dab = Stamp {
             center: Vec3::ZERO,
             normal: Vec3::Y,
@@ -883,15 +879,36 @@ mod tests {
             seed: 0,
             source: None,
         };
-        let tiles = stroke.append_world(&[dab]).unwrap();
-        let coverage = stroke.read_alpha(&tiles).unwrap();
-        let left = coverage.get(42, 64)[0];
-        let right = coverage.get(85, 64)[0];
-        assert!(left > 0 && right > 0, "both islands receive the same dab");
-        assert_eq!(coverage.get(64, 64)[0], 0, "the gap between islands stays clear");
-        assert_eq!(coverage.get(20, 64)[0], 0, "paint stays near the seam on the surface");
-        stroke.append_world(&[dab]).unwrap();
-        let coverage = stroke.read_alpha(&tiles).unwrap();
-        assert!(coverage.get(42, 64)[0] > left && coverage.get(85, 64)[0] > right, "repeated dabs accumulate on both islands");
+        let pixel_coverage = [StampBlending::Lighten, StampBlending::Normal, StampBlending::Add].map(|stamp_blending| {
+            // Every mode sees the same stamp on each island across separate GPU dispatches.
+            let input = BrushInput {
+                bvh: bvh.clone(),
+                uv: uv.clone(),
+                depth: Some(depth.clone()),
+                mesh: mesh.clone(),
+                material: 0,
+                settings: BrushSettings { stamp_blending, ..BrushSettings::default() },
+                stencil: None,
+                limit: None,
+            };
+            let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
+            let tiles = stroke.append_world(&[dab]).unwrap();
+            let first = stroke.read_alpha(&tiles).unwrap();
+            stroke.append_world(&[dab]).unwrap();
+            let second = stroke.read_alpha(&tiles).unwrap();
+            for x in [42, 85] {
+                let single = first.get(x, 64)[0];
+                assert!(single > 0, "both islands receive the same dab");
+                let a = texturecraft_texel::from_u16(single);
+                let expected = texturecraft_texel::to_u16(stamp_blending.accumulate(a, dab.flow));
+                let blended = second.get(x, 64)[0];
+                assert!(blended.abs_diff(expected) <= 1, "GPU {stamp_blending:?}: {blended} differs from {expected}");
+            }
+            assert_eq!(second.get(64, 64)[0], 0, "the gap between islands stays clear");
+            assert_eq!(second.get(20, 64)[0], 0, "paint stays near the seam on the surface");
+            second.get(42, 64)[0]
+        });
+        let [lighten, normal, add] = pixel_coverage;
+        assert!(lighten < normal && normal < add);
     }
 }

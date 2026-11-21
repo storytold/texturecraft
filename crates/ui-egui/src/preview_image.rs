@@ -215,7 +215,7 @@ pub fn stroke_preview(brush: &BrushSettings, size_px: usize, image: Option<&Imag
                 let (dx, dy) = ((x as f32 + 0.5 - cx) / stamp_radius, (cy - y as f32 - 0.5) / stamp_radius);
                 let alpha = shape.sample(dx * cos + dy * sin, -dx * sin + dy * cos, brush.hardness, i) * flow;
                 let coverage = &mut cover[y * size_px + x];
-                *coverage = 1.0 - (1.0 - *coverage) * (1.0 - alpha.clamp(0.0, 1.0));
+                *coverage = brush.stamp_blending.accumulate(*coverage, alpha.clamp(0.0, 1.0));
             }
         }
     }

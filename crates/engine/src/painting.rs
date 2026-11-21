@@ -317,7 +317,7 @@ impl Session {
             (bvh, Some(depth))
         };
         let stroke = Stroke::new(&self.tool.brush, &self.mesh);
-        let mut canvas = StrokeCanvas::new(size.0, size.1);
+        let mut canvas = StrokeCanvas::new(size.0, size.1).with_stamp_blending(stroke.settings.stamp_blending);
         if !quick_mask {
             canvas.limit = self.stroke_limit(ts, size);
         }

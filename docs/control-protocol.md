@@ -87,6 +87,10 @@ alone) and `alphaInvert` (swaps paint and no paint inside the stamp square). The
 procedural, library and imported alphas alike and are returned by `tool.brush` with the other
 values. The alpha's rotation is the brush `angle`.
 
+`tool.brush {stampBlending}` controls coverage where stamps overlap within a stroke.
+`normal` (default) composites each stamp over the existing coverage, `lighten` keeps the strongest
+stamp at each texel, and `add` sums the coverage up to full coverage. Brush presets store this mode.
+
 Bake mode applies edits in Common Settings and Mesh Map Settings to every texture set. Each
 set keeps its own enabled mesh-map checkboxes and Include in Bake flag. Edits update only the
 changed fields; Restore Defaults resets the whole parameter section across all sets.

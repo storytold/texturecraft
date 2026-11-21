@@ -11,8 +11,8 @@ use texturecraft_core::Channel;
 use texturecraft_geom::{NO_TRI, UvGBuffer};
 use texturecraft_texel::{TILE, TILE_AREA, TileImage, from_u16, to_u16};
 
-use crate::StampSource;
 use crate::commit::{dec, enc};
+use crate::{StampBlending, StampSource};
 
 mod lane;
 mod pickup_snapshot;
@@ -193,8 +193,8 @@ impl Pickup {
     /// Smudge with symmetry: every copy of the stamp (told apart by its [`StampSource`]) drags
     /// its own trail. A copy reads the texture as it was when the stroke began plus what it
     /// deposited itself, never what another copy deposited, so copies where they overlap (at the
-    /// mirror plane) do not smear each other. Their deposits still blend into the stroke, later
-    /// copies over earlier ones.
+    /// mirror plane) do not smear each other. Their deposits combine according to the brush's
+    /// stamp blending mode.
     pub fn isolate_copies(&mut self) {
         self.isolated = true;
     }
@@ -202,7 +202,7 @@ impl Pickup {
     /// Blend one stamp's texels `(x, y, alpha)` (stamp center `center` in texels, `source` the
     /// symmetry copy it belongs to, None for the stroke itself) into the stroke `alpha` and the
     /// carried values. False when nothing was deposited: the first smudge stamp only picks up.
-    pub fn stamp(&mut self, alpha: &mut TileImage, texels: &[(u32, u32, f32)], center: [f32; 2], source: Option<StampSource>) -> bool {
+    pub fn stamp(&mut self, alpha: &mut TileImage, texels: &[(u32, u32, f32)], center: [f32; 2], source: Option<StampSource>, blending: StampBlending) -> bool {
         if texels.is_empty() {
             return false;
         }
@@ -264,9 +264,9 @@ impl Pickup {
             self.reads.push((x, y, a));
         }
         if let Some(l) = &mut lane {
-            deposit(&mut l.alpha, &mut l.values, &self.reads, &self.read_values);
+            deposit(&mut l.alpha, &mut l.values, &self.reads, &self.read_values, blending);
         }
-        deposit(alpha, &mut self.values, &self.reads, &self.read_values);
+        deposit(alpha, &mut self.values, &self.reads, &self.read_values, blending);
         let painted = !self.reads.is_empty();
         self.put_back(lane, painted)
     }
@@ -298,18 +298,19 @@ fn covered(gbuf: &UvGBuffer, x: u32, y: u32) -> bool {
 }
 
 /// Blend the texels `reads` `(x, y, alpha)` with their `read_values` (one entry per channel of
-/// `values`, in order) into `alpha` and `values` ("over").
-fn deposit(alpha: &mut TileImage, values: &mut BTreeMap<Channel, TileImage>, reads: &[(u32, u32, f32)], read_values: &[[f32; 3]]) {
+/// `values`, in order) into `alpha` and `values`.
+fn deposit(alpha: &mut TileImage, values: &mut BTreeMap<Channel, TileImage>, reads: &[(u32, u32, f32)], read_values: &[[f32; 3]], blending: StampBlending) {
     let n = values.len();
     for (i, &(x, y, a)) in reads.iter().enumerate() {
         let m = from_u16(alpha.get(x, y)[0]);
-        let m2 = a + m * (1.0 - a);
+        let (previous, stamp) = blending.weights(m, a);
+        let weight = previous + stamp;
         for (k, (c, img)) in values.iter_mut().enumerate() {
             let Some(src) = read_values.get(i * n + k) else { continue };
             let old = get(img, *c, x, y);
-            put(img, *c, x, y, std::array::from_fn(|j| (src[j] * a + old[j] * m * (1.0 - a)) / m2.max(1e-6)));
+            put(img, *c, x, y, std::array::from_fn(|j| (src[j] * stamp + old[j] * previous) / weight.max(1e-6)));
         }
-        alpha.set(x, y, &[to_u16(m2)]);
+        alpha.set(x, y, &[to_u16(weight)]);
     }
 }
 
@@ -387,7 +388,7 @@ mod tests {
             assert!(pickup.loaded.is_empty());
 
             for x in [8, 12, TILE + 8] {
-                assert!(pickup.stamp(&mut alpha, &[(x, 8, 1.0)], [x as f32, 8.0], None));
+                assert!(pickup.stamp(&mut alpha, &[(x, 8, 1.0)], [x as f32, 8.0], None, StampBlending::Normal));
                 let image = &pickup.values[&Channel::Roughness];
                 assert!((from_u16(image.get(x, 8)[0]) - expected).abs() < 1e-4);
                 assert_eq!(pickup.mask_values().is_some(), matches!(target, PaintTarget::Mask(_)));
@@ -403,13 +404,13 @@ mod tests {
         let (c, g) = setup(|x| if x < 32 { 0.9 } else { 0.1 });
         let mut p = Pickup::new(PickupMode::Clone { offset: [-30, 0] }, c, g, [Channel::Roughness]);
         let mut alpha = TileImage::new(TILE, TILE, 1);
-        assert!(p.stamp(&mut alpha, &disc(45, 32, 4), [45.0, 32.0], None));
+        assert!(p.stamp(&mut alpha, &disc(45, 32, 4), [45.0, 32.0], None, StampBlending::Normal));
         let v = get(&p.values[&Channel::Roughness], Channel::Roughness, 45, 32);
         assert!((v[0] - 0.9).abs() < 1e-3, "{v:?}");
         assert!(from_u16(alpha.get(45, 32)[0]) > 0.99);
 
         // Sources outside the image are skipped
-        assert!(!p.stamp(&mut alpha, &disc(5, 5, 2), [5.0, 5.0], None));
+        assert!(!p.stamp(&mut alpha, &disc(5, 5, 2), [5.0, 5.0], None, StampBlending::Normal));
     }
 
     #[test]
@@ -419,7 +420,7 @@ mod tests {
             let mut pickup = Pickup::new(PickupMode::Clone { offset }, composite, gbuf, [Channel::Roughness]);
             let mut alpha = TileImage::new(TILE, TILE, 1);
 
-            let painted = pickup.stamp(&mut alpha, &[(1, 1, 1.0)], [1.0, 1.0], None);
+            let painted = pickup.stamp(&mut alpha, &[(1, 1, 1.0)], [1.0, 1.0], None, StampBlending::Normal);
 
             assert!(!painted);
             assert_eq!(alpha.allocated_count(), 0);
@@ -443,14 +444,14 @@ mod tests {
         let flat = vec![(Channel::Roughness, (0, 0), data)];
         let mut p = Pickup::from_layer(PickupMode::Clone { offset: [-30, 0] }, &flat, (TILE, TILE), g.clone(), [Channel::Roughness]);
         let mut alpha = TileImage::new(TILE, TILE, 1);
-        assert!(p.stamp(&mut alpha, &disc(45, 32, 3), [45.0, 32.0], None));
+        assert!(p.stamp(&mut alpha, &disc(45, 32, 3), [45.0, 32.0], None, StampBlending::Normal));
         let v = get(&p.values[&Channel::Roughness], Channel::Roughness, 45, 32)[0];
         assert!((v - 0.8).abs() < 1e-3, "straight value: {v}");
         assert!((from_u16(alpha.get(45, 32)[0]) - 0.5).abs() < 1e-3, "the layer's coverage scales the stroke");
 
         // Reading the layer's empty right half deposits nothing
         let mut q = Pickup::from_layer(PickupMode::Clone { offset: [30, 0] }, &flat, (TILE, TILE), g, [Channel::Roughness]);
-        assert!(!q.stamp(&mut TileImage::new(TILE, TILE, 1), &disc(20, 32, 3), [20.0, 32.0], None), "the source is the empty half");
+        assert!(!q.stamp(&mut TileImage::new(TILE, TILE, 1), &disc(20, 32, 3), [20.0, 32.0], None, StampBlending::Normal), "the source is the empty half");
     }
 
     #[test]
@@ -458,15 +459,15 @@ mod tests {
         let (c, g) = setup(|x| if x < 20 { 1.0 } else { 0.0 });
         let mut p = Pickup::new(PickupMode::Smudge { strength: 1.0 }, c, g, [Channel::Roughness]);
         let mut alpha = TileImage::new(TILE, TILE, 1);
-        assert!(!p.stamp(&mut alpha, &disc(18, 32, 5), [18.0, 32.0], None), "the first stamp only picks up");
+        assert!(!p.stamp(&mut alpha, &disc(18, 32, 5), [18.0, 32.0], None, StampBlending::Normal), "the first stamp only picks up");
         for cx in 20..30 {
-            p.stamp(&mut alpha, &disc(cx, 32, 5), [cx as f32, 32.0], None);
+            p.stamp(&mut alpha, &disc(cx, 32, 5), [cx as f32, 32.0], None, StampBlending::Normal);
         }
         let v = get(&p.values[&Channel::Roughness], Channel::Roughness, 30, 32)[0];
         assert!(v > 0.5 && from_u16(alpha.get(30, 32)[0]) > 0.99, "white dragged to the right: {v}");
 
         // A jump larger than the stamp deposits nothing
-        assert!(!p.stamp(&mut alpha, &disc(50, 10, 3), [50.0, 10.0], None));
+        assert!(!p.stamp(&mut alpha, &disc(50, 10, 3), [50.0, 10.0], None, StampBlending::Normal));
     }
 
     /// Two copies smudging through the same texels: copy B drags exactly what it would alone.
@@ -488,9 +489,9 @@ mod tests {
             let (xa, xb) = (18.0 + i as f32, 46.0 - i as f32);
             for (pickup, alpha, copies) in [(&mut isolated, &mut alpha_isolated, true), (&mut alone, &mut alpha_alone, false)] {
                 if copies {
-                    pickup.stamp(alpha, &disc(xa as u32, 32, 5), [xa, 32.0], a);
+                    pickup.stamp(alpha, &disc(xa as u32, 32, 5), [xa, 32.0], a, StampBlending::Normal);
                 }
-                pickup.stamp(alpha, &disc(xb as u32, 32, 5), [xb, 32.0], b);
+                pickup.stamp(alpha, &disc(xb as u32, 32, 5), [xb, 32.0], b, StampBlending::Normal);
             }
         }
         let lane_b = isolated.lanes.iter().find(|l| l.source == b).expect("copy B has its lane");
