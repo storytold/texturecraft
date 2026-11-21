@@ -28,6 +28,7 @@ const BAKED_LIGHTING_OPCODE: u32 = 35;
 const NEIGHBOURHOOD_OPCODE: u32 = 36;
 const NOOP_EFFECT_OPCODE: u32 = 39;
 const MASK_STAGE: u32 = 1 << 31;
+const GENERATOR_STAGE: u32 = 1 << 30;
 // Extended procedural sources follow the filter and generator opcodes.
 const FIRST_GENERATOR: u32 = 40;
 const FIRST_EXTENDED_PATTERN: u32 = 48;
@@ -83,11 +84,20 @@ struct ProceduralInputs {
     ramp_words: Vec<u32>,
     filters: Vec<(Filter, f32)>,
     materials: MaterialImages,
+    generator_stages: Vec<(Option<NeighbourhoodFilter>, u32)>,
+    generator_sources: Vec<Operation>,
 }
 
 impl ProceduralInputs {
     fn new(resolution: u32) -> Self {
-        Self { resolution, ramp_words: Vec::new(), filters: Vec::new(), materials: MaterialImages::default() }
+        Self {
+            resolution,
+            ramp_words: Vec::new(),
+            filters: Vec::new(),
+            materials: MaterialImages::default(),
+            generator_stages: Vec::new(),
+            generator_sources: Vec::new(),
+        }
     }
 
     fn pack_gradient(&mut self, colors: &[[f32; 3]]) -> Option<[u32; 2]> {
@@ -105,7 +115,8 @@ impl ProceduralInputs {
 struct FilterStage {
     layer: u32,
     preceding: u32,
-    filter: NeighbourhoodFilter,
+    filter: Option<NeighbourhoodFilter>,
+    cell: u32,
 }
 
 #[derive(Debug, Default)]
@@ -116,7 +127,7 @@ struct FilterPlan {
 
 impl FilterPlan {
     fn compile(operations: &mut [Operation], layer_count: u32, inputs: &ProceduralInputs) -> Self {
-        if inputs.filters.is_empty() {
+        if inputs.filters.is_empty() && inputs.generator_stages.is_empty() {
             return Self::default();
         }
         let mut plan = Self::default();
@@ -142,6 +153,16 @@ impl FilterPlan {
         let first = self.stages.len();
         let mut reach: u32 = 0;
         for (preceding, effect) in effects.iter_mut().skip(start as usize).take(count as usize).enumerate() {
+            if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&effect.ids[1]) && effect.spatial[1] != 0 {
+                let (filter, cell) = inputs.generator_stages[effect.spatial[1] as usize - 1];
+                effect.spatial[1] = self.stages.len() as u32 + 1;
+                reach = reach.saturating_add(filter.map_or(0, NeighbourhoodFilter::reach));
+                if cell > 1 {
+                    reach = reach.saturating_add(cell * 2);
+                }
+                self.stages.push(FilterStage { layer, preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE, filter, cell });
+                continue;
+            }
             if effect.ids[1] != NEIGHBOURHOOD_OPCODE {
                 continue;
             }
@@ -150,7 +171,7 @@ impl FilterPlan {
             let slot = self.stages.len();
             effect.spatial[0] = if mask { slot } else { slot - first } as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
-            self.stages.push(FilterStage { layer, preceding, filter });
+            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1 });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
@@ -163,6 +184,14 @@ impl FilterPlan {
     fn words(&self, area: u64) -> u64 {
         if self.stages.is_empty() { 0 } else { (self.stages.len() as u64 + 3) * u64::from(FIELD_WORDS) * area }
     }
+}
+
+fn bind_generator_sources(operations: &mut Vec<Operation>, sources: &[Operation]) {
+    let offset = operations.len() as u32;
+    for op in operations.iter_mut().filter(|op| (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]) && op.effects[3] != 0) {
+        op.effects[3] += offset;
+    }
+    operations.extend_from_slice(sources);
 }
 
 /// Inclusive origin and exclusive end of a material update, in document texels.
@@ -498,6 +527,7 @@ impl CompositeProgram {
         let layer_count = operations.len() as u32;
         operations.extend(effects);
         let filters = FilterPlan::compile(&mut operations, layer_count, &procedural);
+        bind_generator_sources(&mut operations, &procedural.generator_sources);
         let region = filters.expand(region);
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
@@ -548,6 +578,7 @@ impl CompositeProgram {
         operations[0].effects[1] = operations.len() as u32 - 1;
         operations[0].balance[1] = background;
         let filters = FilterPlan::compile(&mut operations, 1, &procedural);
+        bind_generator_sources(&mut operations, &procedural.generator_sources);
         let region = filters.expand(region);
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
@@ -623,7 +654,7 @@ fn compile_mask(
                 }
                 op
             }
-            EffectKind::Generator(generator) => generator_operation(generator).ok_or("A mask generator uses CPU compositing.")?,
+            EffectKind::Generator(generator) => generator_operation(generator, procedural, tile_patterns).ok_or("A mask generator uses CPU compositing.")?,
             EffectKind::Filter(Filter::BakedLighting { .. }) => continue,
             _ => point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?,
         };
@@ -843,13 +874,8 @@ fn source_operation(
     op.low.iter().chain(&op.high).chain(&op.projection).chain(&op.uv).chain(&op.balance).all(|v| v.is_finite()).then_some(op)
 }
 
-fn generator_operation(generator: &Generator) -> Option<Operation> {
-    if generator.detail.is_some()
-        || generator.micro.is_some()
-        || !generator.inputs.is_empty()
-        || generator.resolution.can_reduce()
-        || !generator.global.is_neutral()
-    {
+fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
+    if generator.detail.is_some() || generator.micro.is_some() {
         return None;
     }
     let kind = match generator.kind {
@@ -862,13 +888,28 @@ fn generator_operation(generator: &Generator) -> Option<Operation> {
         GeneratorKind::Direction => 46,
     };
     let direction = Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y);
-    let op = Operation {
+    let mut op = Operation {
         ids: [0, kind, generator.seed, u32::from(generator.invert)],
         low: [generator.level, generator.softness.max(Generator::MIN_SOFTNESS), generator.noise_amount, 0.0],
         high: [direction.x, direction.y, direction.z, 0.0],
-        projection: [generator.noise_scale.max(1e-3), generator.offset, 0.0, 0.0],
+        projection: [generator.noise_scale.max(1e-3), generator.offset, generator.global.balance, generator.global.contrast],
         ..Operation::zeroed()
     };
+    if let Some(source) = generator.kind.inputs().first().and_then(|map| generator.inputs.get(map)) {
+        let mut source_op = source_operation(Some(source), &Projection::default(), [0.0; 3], ChannelKind::Scalar, inputs)?;
+        bind_tile_source(&mut source_op, Some(source), patterns);
+        inputs.generator_sources.push(source_op);
+        op.effects[3] = inputs.generator_sources.len() as u32;
+    }
+    let resolution = inputs.resolution;
+    let cell = generator.resolution.cell(resolution, resolution);
+    let blur = (generator.global.blur_radius_at(resolution).round() > 0.0)
+        .then(|| Filter::Blur { radius: generator.global.blur_radius() })
+        .and_then(|blur| NeighbourhoodFilter::new(&blur, resolution, resolution, 1.0, false));
+    if let (Some(_), _) | (None, 2..) = (blur, cell) {
+        inputs.generator_stages.push((blur, cell));
+        op.spatial[1] = inputs.generator_stages.len() as u32;
+    }
     op.low.iter().chain(&op.projection).all(|x| x.is_finite()).then_some(op)
 }
 
@@ -1363,7 +1404,8 @@ impl GpuCompositor {
         };
         let display_words = |width: u32, rows: u32| u64::from(width.next_multiple_of(64) * rows) * words_per_pixel;
         let required = |width, rows| (display_words(width, rows) + program.filters.words(field_area(width, rows))) * 4;
-        let filter_work: u64 = program.filters.stages.iter().map(|stage| stage.filter.work_per_texel()).sum();
+        let filter_work: u64 =
+            program.filters.stages.iter().map(|stage| stage.filter.map_or(1, NeighbourhoodFilter::work_per_texel) + if stage.cell > 1 { 6 } else { 0 }).sum();
         // A filtered band includes its source halo. Split its output while preserving all of that input.
         while required(band_width, band_rows) > scratch_limit {
             if band_width == 1 && band_rows == 1 {
@@ -1558,7 +1600,13 @@ impl GpuCompositor {
                             blur: [offset(fields + 1), offset(fields + 2)],
                             output: offset(output as u32),
                         };
-                        kernels.encode(device, &mut encoder, &scratch, region, stage.filter);
+                        if stage.cell > 1 {
+                            let target = if stage.filter.is_some() { region.original } else { region.output };
+                            kernels.encode_cells(device, &mut encoder, &scratch, NeighbourhoodRegion { output: target, ..region }, stage.cell);
+                        }
+                        if let Some(filter) = stage.filter {
+                            kernels.encode(device, &mut encoder, &scratch, region, filter);
+                        }
                     }
                 }
                 let bindings = bindings(&values);
@@ -1646,6 +1694,74 @@ mod procedural_tests {
     use texturecraft_core::{Fill, Layer, Mask, OutputResolution, Procedural, TextureSet};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{srgb_lut, to_u16};
+
+    #[test]
+    fn generator_global_blur_and_resolution_match_cpu_with_an_image_override() {
+        use texturecraft_compose::{
+            ImageRes,
+            eval::{Inputs, mask_image},
+        };
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = 128;
+        let mut mesh = primitives::plane(1.0, 1);
+        for uv in &mut mesh.uvs {
+            *uv = *uv * 0.8 + texturecraft_geom::glam::Vec2::splat(0.1);
+        }
+        let mesh = Arc::new(mesh);
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let mut project = Project::new("Generator ramp", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(Fill::default()), &[Channel::BaseColor]);
+        let mut generator = Generator::new(GeneratorKind::Dirt);
+        generator.noise_amount = 0.0;
+        generator.invert = true;
+        generator.offset = 0.07;
+        generator.global.blur = 0.85;
+        generator.global.balance = 0.58;
+        generator.global.contrast = 0.23;
+        generator.resolution.factor = -3;
+        generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("AO override"));
+        let pixels = PixelStore::default();
+        let baked = BakedMaps::default();
+        let images = ImageStore::from([(
+            "AO override".into(),
+            Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[0.15; 4], [0.7; 4], [0.85; 4], [0.3; 4]], srgb: false }),
+        )]);
+        let mut mask = Mask::new(MaskBackground::White);
+        let mut effect = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
+        effect.blend = BlendMode::Multiply;
+        effect.opacity = 0.83;
+        mask.effects.push(effect);
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 })));
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let inputs = Inputs {
+            project: &project,
+            ts: 0,
+            mesh: &mesh,
+            gbuf: &gbuf,
+            pixels: &pixels,
+            baked: &baked,
+            block_scales: project.texture_sets[0].block_scales(),
+            preview: None,
+            images: &images,
+            bounds: mesh.bounds(),
+        };
+        let expected = mask_image(&inputs, owner, SIZE).unwrap();
+        let mut program = CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).unwrap();
+        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        program.set_tile_images(&images);
+        assert_eq!(program.filters.stages[0].cell, 8);
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        let texture = gpu.renderer.aux_texture(0).unwrap();
+        let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+        for (index, (&expected, pixel)) in expected.iter().zip(actual.as_chunks::<4>().0).enumerate() {
+            assert!(pixel[0].abs_diff(expected) <= 2, "generator mask texel {index}: {} instead of {expected}", pixel[0]);
+        }
+    }
 
     #[test]
     fn neighbourhood_filter_chains_match_cpu_on_paint_and_masks() {

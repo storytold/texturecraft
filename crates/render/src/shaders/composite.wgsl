@@ -700,7 +700,19 @@ fn blend_rgb(mode: u32, a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
     }
 }
 
-fn generator(effect: Operation, surface: Surface, baked: vec3<f32>) -> f32 {
+fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
+    let surface = texel.surface;
+    var baked = texel.baked;
+    if effect.effects.w != 0u {
+        let source = layers[effect.effects.w - 1u];
+        let input = fill_value(source, texel.uv, surface).x;
+        switch effect.ids.y {
+            case 40u, 43u: { baked.y = input; }
+            case 41u, 44u: { baked.x = input; }
+            case 42u: { baked.z = input; }
+            default: {}
+        }
+    }
     var signal = 0.0;
     switch effect.ids.y {
         case 40u: { signal = (baked.y - 0.5) * 2.0; }
@@ -715,7 +727,25 @@ fn generator(effect: Operation, surface: Surface, baked: vec3<f32>) -> f32 {
         signal += (fbm(surface.position * effect.projection.x, 4u, effect.ids.z, true) - 0.5) * effect.low.z;
     }
     let threshold = 1.0 - clamp(effect.low.x, 0.0, 1.0);
-    let value = smoothstep(threshold - effect.low.y, threshold + effect.low.y, signal);
+    return smoothstep(threshold - effect.low.y, threshold + effect.low.y, signal);
+}
+
+fn finish_generator(effect: Operation, ramp: f32) -> f32 {
+    var value = ramp;
+    if effect.projection.z != 0.5 || effect.projection.w != 0.0 {
+        let balance = clamp(effect.projection.z, 0.0, 1.0);
+        let low = max(1.0 - 2.0 * balance, 0.0);
+        let high = min(2.0 - 2.0 * balance, 1.0);
+        let middle = (low + high) * 0.5;
+        let keep = 1.0 - clamp(effect.projection.w, 0.0, 1.0);
+        let first = middle - (middle - low) * keep;
+        let last = middle + (high - middle) * keep;
+        if last - first < 1e-6 {
+            value = select(0.0, 1.0, value >= middle);
+        } else {
+            value = clamp((value - first) / (last - first), 0.0, 1.0);
+        }
+    }
     return clamp(select(value, 1.0 - value, effect.ids.w != 0u) + effect.projection.y, 0.0, 1.0);
 }
 
@@ -779,7 +809,13 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.a;
         } else if e.ids.y >= 40u {
-            result = blend_scalar(u32(e.balance.z), mask, generator(e, texel.surface, texel.baked));
+            var ramp: f32;
+            if e.spatial.y == 0u {
+                ramp = generator_ramp(e, texel);
+            } else {
+                ramp = filter_value(e.spatial.y - 1u, texel.pixel).x;
+            }
+            result = blend_scalar(u32(e.balance.z), mask, finish_generator(e, ramp));
         } else {
             result = scalar_filter(e, mask);
         }
@@ -851,8 +887,11 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         let texel = LayerTexel(pixel, uv, surface, baked, projected);
         let layer = layers[params.filter_stage.z];
-        let count = params.filter_stage.w & 0x7fffffffu;
-        if (params.filter_stage.w & 0x80000000u) != 0u {
+        let count = params.filter_stage.w & 0x3fffffffu;
+        if (params.filter_stage.w & 0x40000000u) != 0u {
+            let generator = layers[params.program.x + layer.effects.x + count];
+            prepared = vec4(generator_ramp(generator, texel), 0.0, 0.0, 1.0);
+        } else if (params.filter_stage.w & 0x80000000u) != 0u {
             prepared = vec4(layer_mask(layer, texel, count), 0.0, 0.0, 1.0);
         } else {
             let content = layer_content(layer, texel, count);

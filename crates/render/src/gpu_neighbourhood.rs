@@ -143,6 +143,8 @@ struct Params {
 pub(crate) struct NeighbourhoodGpu {
     box_blur: wgpu::ComputePipeline,
     apply: wgpu::ComputePipeline,
+    cell_average: wgpu::ComputePipeline,
+    cell_interpolate: wgpu::ComputePipeline,
 }
 
 impl NeighbourhoodGpu {
@@ -161,7 +163,54 @@ impl NeighbourhoodGpu {
                 cache: None,
             })
         };
-        Self { box_blur: pipeline("box_blur"), apply: pipeline("apply_neighbourhood") }
+        Self {
+            box_blur: pipeline("box_blur"),
+            apply: pipeline("apply_neighbourhood"),
+            cell_average: pipeline("average_cells"),
+            cell_interpolate: pipeline("interpolate_cells"),
+        }
+    }
+
+    pub(crate) fn encode_cells(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scratch: &wgpu::Buffer,
+        region: NeighbourhoodRegion,
+        cell: u32,
+    ) {
+        let [left, top, width, height] = region.rect;
+        let cells = [(left + width).div_ceil(cell) - left / cell, (top + height).div_ceil(cell) - top / cell];
+        let params = Params { rect: region.rect, buffers: [region.original, region.blur[0], region.output, 0], mode: [cell, 0, 0, 0], ..Params::zeroed() };
+        Self::run(&self.cell_average, device, encoder, scratch, &params, cells.map(|side| side.div_ceil(APPLY_WORKGROUP)));
+        Self::run(&self.cell_interpolate, device, encoder, scratch, &params, [width.div_ceil(APPLY_WORKGROUP), height.div_ceil(APPLY_WORKGROUP)]);
+    }
+
+    fn run(
+        pipeline: &wgpu::ComputePipeline,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scratch: &wgpu::Buffer,
+        params: &Params,
+        groups: [u32; 2],
+    ) {
+        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tc_neighbourhood_params"),
+            contents: bytemuck::bytes_of(params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tc_neighbourhood_inputs"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: scratch.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bindings, &[]);
+        pass.dispatch_workgroups(groups[0], groups[1], 1);
     }
 
     pub(crate) fn encode(
@@ -184,23 +233,7 @@ impl NeighbourhoodGpu {
                 weights: [filter.opacity, filter.amount, filter.frequency, filter.middle],
                 direction: [filter.direction[0], filter.direction[1], 0.0, 0.0],
             };
-            let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("tc_neighbourhood_params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tc_neighbourhood_inputs"),
-                layout: &pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: scratch.as_entire_binding() },
-                ],
-            });
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bindings, &[]);
-            pass.dispatch_workgroups(groups[0], groups[1], 1);
+            Self::run(pipeline, device, encoder, scratch, &params, groups);
         };
         let mut source = region.original;
         if filter.uses_box() {
