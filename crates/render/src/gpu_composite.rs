@@ -764,11 +764,11 @@ fn input_texture(device: &wgpu::Device, label: &str, size: (u32, u32), layers: u
     })
 }
 
-fn write_input(queue: &wgpu::Queue, texture: &wgpu::Texture, size: (u32, u32), row_layer: (u32, u32), bytes: &[u8]) {
+fn write_input<T: Pod>(queue: &wgpu::Queue, texture: &wgpu::Texture, size: (u32, u32), row_layer: (u32, u32), texels: &[T]) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo { origin: wgpu::Origin3d { x: 0, y: row_layer.0, z: row_layer.1 }, ..texture.as_image_copy() },
-        bytes,
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.0 * 8), rows_per_image: None },
+        bytemuck::cast_slice(texels),
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.0 * size_of::<T>() as u32), rows_per_image: None },
         wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
     );
 }
@@ -929,7 +929,7 @@ impl GpuCompositor {
                     [tri, pack(u) | (pack(v) << 16)]
                 })
                 .collect();
-            write_input(queue, &texture, (gbuf.width, tri.len() as u32 / gbuf.width), (band as u32 * ROWS, 0), bytemuck::cast_slice(&pixels));
+            write_input(queue, &texture, (gbuf.width, tri.len() as u32 / gbuf.width), (band as u32 * ROWS, 0), &pixels);
         }
         let view = texture.create_view(&Default::default());
         self.surfaces.push(SurfaceCache { gbuf: key, view: view.clone(), vertices: vertices.clone() });
@@ -995,7 +995,7 @@ impl GpuCompositor {
                     [value(0, i, 1.0).to_bits(), value(2, i, 0.5).to_bits(), value(3, i, 1.0).to_bits(), normal]
                 })
                 .collect();
-            write_input(queue, &texture, (size.0, end - top), (top, 0), bytemuck::cast_slice(&texels));
+            write_input(queue, &texture, (size.0, end - top), (top, 0), &texels);
         }
         let view = texture.create_view(&Default::default());
         self.baked.insert(ts, BakeCache { size, maps: refs, view: view.clone() });
