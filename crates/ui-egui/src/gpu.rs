@@ -70,6 +70,7 @@ pub struct SceneSync {
     pub tile_shift: u32,
     pub overview: Option<(usize, texturecraft_engine::MaterialOverview)>,
     cleared_overviews: Vec<usize>,
+    cpu_texture_sets: Vec<usize>,
     composites: Vec<(usize, CompositeProgram, Arc<AtomicBool>)>,
     composite_work: Option<CompositeWork>,
     pub(crate) compositor_changed: bool,
@@ -112,6 +113,9 @@ impl SceneSync {
         for &ts in &self.cleared_overviews {
             renderer.seed_display(device, queue, ts, (1, 1), &[]);
             reset.push(ts);
+        }
+        for &ts in &self.cpu_texture_sets {
+            renderer.release_composite_inputs(ts);
         }
         let mut errors = Vec::new();
         for (ts, program, failed) in &self.composites {
@@ -773,6 +777,7 @@ impl GpuLink {
         let uses_cpu = |ts: usize| !gpu_mask && !self.compositors.get(ts).is_some_and(SetCompositor::uses_gpu);
 
         let count = session.caches.len();
+        out.cpu_texture_sets.extend((0..count).filter(|&ts| uses_cpu(ts)));
         let active = session.ts();
         let padding_pending = BTreeSet::<usize>::new();
         #[cfg(not(target_arch = "wasm32"))]
