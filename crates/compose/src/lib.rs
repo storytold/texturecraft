@@ -20,6 +20,7 @@ mod image_identity;
 mod organic;
 pub mod pattern;
 mod pattern_context;
+pub mod patterns;
 pub mod solo;
 pub mod store;
 pub mod thumb;
@@ -34,6 +35,7 @@ pub use eval::{
     effect_histogram, flatten_layer, mask_at, mask_image, mask_texels, mask_values, pad_tiles, stack_reads_neighbours,
 };
 pub use pattern_context::PatternContext;
+pub use patterns::{PATTERN_BUDGET, PatternCache};
 pub use solo::solo_project;
 pub use store::{BakedMaps, ImageRes, ImageStore, PixelStore};
 pub use thumb::{THUMB_TEXELS, ThumbImage, ThumbTarget};
