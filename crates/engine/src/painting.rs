@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use texturecraft_compose::PaintTarget;
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, Source};
 use texturecraft_geom::glam::Vec2;
@@ -18,7 +19,7 @@ use crate::brush_device::{BrushTiles, DeviceStroke, DeviceStrokePreview, Project
 use crate::session::{
     ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, ReleasedDab, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
 };
-use crate::stroke_replay::{StrokeReplays, UvPaint, record_sample};
+use crate::stroke_replay::{PaintPlacement, RecordedPaint, StrokeReplays, WorldPaint, record_sample};
 use crate::uv_stroke_state::{UV_STAMP_BATCH, UvStrokeState};
 use crate::uv_symmetry::UvMirror;
 use crate::{EngineError, Result};
@@ -32,12 +33,18 @@ const MIN_PATTERN_BRUSH_SIZE: f32 = 0.0005;
 /// Limit CPU-side storage for projected color to one readback batch.
 const PROJECTION_READBACK_BATCH: usize = 128;
 
+/// The view inputs used to classify occlusion when a world-space brush stroke began.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StrokeView {
+    pub(crate) camera: OrbitCamera,
+    pub(crate) size: (u32, u32),
+    hidden_materials: BTreeSet<usize>,
+}
+
 pub(crate) struct StrokeVisibility {
     mesh_id: u64,
-    hidden_materials: BTreeSet<usize>,
+    view: StrokeView,
     bvh: Arc<Bvh>,
-    camera: OrbitCamera,
-    size: (u32, u32),
     depth: Arc<EyeDepth>,
 }
 
@@ -54,35 +61,50 @@ fn visible_triangle_mask(mesh: &Mesh, hidden_materials: &BTreeSet<usize>) -> Vec
     shown
 }
 
-impl Session {
-    /// The same visible triangles are used for picking, exact occlusion rays and camera depth.
-    fn stroke_visibility(&mut self, viewport: Vec2) -> (Arc<Bvh>, Arc<EyeDepth>) {
+impl StrokeView {
+    fn capture(camera: OrbitCamera, viewport: Vec2, sets: &[texturecraft_core::TextureSet]) -> Self {
         let size = ((viewport.x / 2.0).max(64.0) as u32, (viewport.y / 2.0).max(64.0) as u32);
         let mut hidden_materials = BTreeSet::new();
         // The viewport uses the last texture set mapped to each mesh material.
-        for set in &self.doc.project.texture_sets {
+        for set in sets {
             if set.visible {
                 hidden_materials.remove(&set.material);
             } else {
                 hidden_materials.insert(set.material);
             }
         }
-        let cached = self.stroke_visibility.as_ref().filter(|scene| scene.mesh_id == self.mesh_id && scene.hidden_materials == hidden_materials);
-        if let Some(scene) = cached.filter(|scene| scene.camera == self.camera && scene.size == size) {
+        Self { camera, size, hidden_materials }
+    }
+
+    /// Identical triangle selection for cursor rays, exact occlusion and camera depth.
+    pub(crate) fn visibility(&self, mesh: &Mesh, full_bvh: &Arc<Bvh>, previous: Option<(&Self, &Arc<Bvh>)>) -> (Arc<Bvh>, EyeDepth) {
+        let (width, height) = self.size;
+        if self.hidden_materials.is_empty() {
+            (full_bvh.clone(), EyeDepth::render(mesh, &self.camera, width, height))
+        } else {
+            let shown = visible_triangle_mask(mesh, &self.hidden_materials);
+            let include = |triangle| shown.get(triangle).copied().unwrap_or(false);
+            let existing = previous.filter(|(view, _)| self.hidden_materials == view.hidden_materials);
+            let bvh = existing.map_or_else(|| Arc::new(Bvh::new_filtered(mesh, include)), |(_, bvh)| bvh.clone());
+            (bvh, EyeDepth::render_filtered(mesh, &self.camera, width, height, include))
+        }
+    }
+
+    pub(crate) fn hidden_count(&self) -> usize {
+        self.hidden_materials.len()
+    }
+}
+
+impl Session {
+    fn stroke_visibility(&mut self, viewport: Vec2) -> (Arc<Bvh>, Arc<EyeDepth>) {
+        let view = StrokeView::capture(self.camera, viewport, &self.doc.project.texture_sets);
+        let cached = self.stroke_visibility.as_ref().filter(|scene| scene.mesh_id == self.mesh_id);
+        if let Some(scene) = cached.filter(|scene| scene.view == view) {
             return (scene.bvh.clone(), scene.depth.clone());
         }
-
-        let (bvh, depth) = if hidden_materials.is_empty() {
-            (self.bvh.clone(), EyeDepth::render(&self.mesh, &self.camera, size.0, size.1))
-        } else {
-            let shown = visible_triangle_mask(&self.mesh, &hidden_materials);
-            let include = |triangle| shown.get(triangle).copied().unwrap_or(false);
-            let bvh = cached.map_or_else(|| Arc::new(Bvh::new_filtered(&self.mesh, include)), |scene| scene.bvh.clone());
-            (bvh, EyeDepth::render_filtered(&self.mesh, &self.camera, size.0, size.1, include))
-        };
+        let (bvh, depth) = view.visibility(&self.mesh, &self.bvh, cached.map(|scene| (&scene.view, &scene.bvh)));
         let depth = Arc::new(depth);
-        self.stroke_visibility =
-            Some(StrokeVisibility { mesh_id: self.mesh_id, hidden_materials, bvh: bvh.clone(), camera: self.camera, size, depth: depth.clone() });
+        self.stroke_visibility = Some(StrokeVisibility { mesh_id: self.mesh_id, view, bvh: bvh.clone(), depth: depth.clone() });
         (bvh, depth)
     }
 
@@ -377,15 +399,23 @@ impl Session {
         let settings = &stroke.settings;
         let image_alpha = settings.alpha_image.as_ref().and_then(|name| self.images.get(name)).cloned();
         let library_alpha = if image_alpha.is_none() { settings.library_alpha_image() } else { None };
-        let replay_uv_samples = (uv_mode
-            && matches!(tool, Tool::Paint | Tool::Eraser)
+        let can_record = matches!(tool, Tool::Paint | Tool::Eraser)
             && stencil.is_none()
             && canvas.limit.is_none()
             && canvas.pickup.is_none()
             && !settings.symmetry.any()
             && settings.alpha_image.is_none()
-            && target.is_some_and(|target| StrokeReplays::can_record(&self.doc.project, target, ts)))
-        .then(Vec::new);
+            && target.is_some_and(|target| StrokeReplays::can_record(&self.doc.project, target, ts));
+        let replay = if !can_record {
+            None
+        } else if uv_mode {
+            Some(PaintPlacement::Uv { samples: Vec::new() })
+        } else {
+            self.stroke_visibility
+                .as_ref()
+                .zip(self.doc.project.texture_sets.get(ts))
+                .map(|(scene, set)| PaintPlacement::World { world: WorldPaint { view: scene.view.clone(), dabs: Vec::new(), material: set.material } })
+        };
         let gpu_tool = tool == Tool::Paint || (quick_mask && erase) || (tool == Tool::Projection && !uv_mode && stencil.is_some());
         let device = if gpu_tool
             && canvas.pickup.is_none()
@@ -448,7 +478,7 @@ impl Session {
             staging: Staging::default(),
             device,
             device_uv_stamps: Vec::new(),
-            replay_uv_samples,
+            replay,
         });
         Ok(())
     }
@@ -537,7 +567,7 @@ impl Session {
         let Some(active) = self.stroke.as_mut() else { return };
         let Some(progress) = active.uv.as_mut() else { return };
         let Some(cache) = self.caches.get_mut(active.ts) else { return };
-        record_sample(&mut active.replay_uv_samples, uv, pressure);
+        record_sample(&mut active.replay, uv, pressure);
 
         let settings = &active.stroke.settings;
         let shape = Shape::new(settings.alpha, active.image_alpha.as_deref(), active.library_alpha.as_deref(), settings.alpha_params);
@@ -832,14 +862,14 @@ impl Session {
         } else {
             commit(&st.canvas.dirty, None);
         }
-        let operation = st.replay_uv_samples.take().map(|samples| UvPaint {
-            settings: st.stroke.settings.clone(),
-            samples,
-            values: st.values.clone(),
-            mask_value,
-            erase: st.erase,
+        let operation = st.replay.take().map(|mut placement| {
+            if let PaintPlacement::World { world } = &mut placement {
+                world.dabs = std::mem::take(&mut st.stroke.stamps);
+            }
+            RecordedPaint { settings: st.stroke.settings.clone(), placement, values: st.values.clone(), mask_value, erase: st.erase }
         });
-        if self.doc.stroke_replays.commit(target, operation, &st.before.pixels, &self.doc.pixels) {
+        let material = self.doc.project.texture_sets.get(st.ts).map_or(0, |set| set.material);
+        if self.doc.stroke_replays.commit(target, operation, &st.before.pixels, &self.doc.pixels, &self.mesh, material) {
             self.note_raster_paint();
         }
         if matches!(target, PaintTarget::Mask(_)) && st.displayed_mask_value != mask_value {

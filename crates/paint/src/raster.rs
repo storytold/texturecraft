@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use rayon::prelude::*;
 
-use texturecraft_geom::glam::Vec3;
+use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, NO_TRI, UvGBuffer};
 use texturecraft_texel::{TILE, TileImage, from_u16, to_u16};
 
@@ -258,10 +258,7 @@ fn scan_triangle(
         .cross(*position_c - *position_a)
         .try_normalize()
         .map(|normal| stamp.source.map_or(normal, |source| source.direction(normal)));
-    let x0 = (uv_a.x.min(uv_b.x).min(uv_c.x) * width as f32).floor().max(0.0) as u32;
-    let x1 = ((uv_a.x.max(uv_b.x).max(uv_c.x) * width as f32).ceil().max(0.0) as u32).min(width);
-    let y0 = (uv_a.y.min(uv_b.y).min(uv_c.y) * height as f32).floor().max(0.0) as u32;
-    let y1 = ((uv_a.y.max(uv_b.y).max(uv_c.y) * height as f32).ceil().max(0.0) as u32).min(height);
+    let (x0, y0, x1, y1) = uv_texel_bounds([*uv_a, *uv_b, *uv_c], (width, height));
 
     // Stamp radius in texels on this triangle: texel area over world area
     let uv_area = (*uv_b - *uv_a).perp_dot(*uv_c - *uv_a).abs() * width as f32 * height as f32;
@@ -328,6 +325,21 @@ fn scan_triangle(
     }
 
     (center.1 < f32::MAX || !texels.is_empty()).then_some((texels, center))
+}
+
+fn uv_texel_bounds([a, b, c]: [Vec2; 3], (width, height): (u32, u32)) -> (u32, u32, u32, u32) {
+    let size = Vec2::new(width as f32, height as f32);
+    let low = (a.min(b).min(c) * size).floor().max(Vec2::ZERO).as_uvec2();
+    let high = (a.max(b).max(c) * size).ceil().max(Vec2::ZERO).min(size).as_uvec2();
+    (low.x, low.y, high.x, high.y)
+}
+
+/// Maximum texels the world brush scans for this candidate triangle.
+pub fn triangle_scan_texels(mesh: &Mesh, triangle: u32, size: (u32, u32)) -> u64 {
+    let Some([a, b, c]) = mesh.tri(triangle as usize) else { return 0 };
+    let (Some(a), Some(b), Some(c)) = (mesh.uvs.get(a), mesh.uvs.get(b), mesh.uvs.get(c)) else { return 0 };
+    let (x0, y0, x1, y1) = uv_texel_bounds([*a, *b, *c], size);
+    u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0))
 }
 
 /// Stroke alpha covering whole triangles (polygon fill): every texel of `tris` gets alpha 1.

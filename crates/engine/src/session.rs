@@ -486,7 +486,7 @@ pub(crate) struct ActiveStroke {
     pub staging: texturecraft_paint::Staging,
     pub device: Option<Box<dyn crate::brush_device::DeviceStroke>>,
     pub device_uv_stamps: Vec<texturecraft_paint::UvStamp>,
-    pub(crate) replay_uv_samples: Option<Vec<crate::stroke_replay::UvSample>>,
+    pub(crate) replay: Option<crate::stroke_replay::PaintPlacement>,
 }
 
 /// History labels that name a layer, a path number or a smart mask: the UI translates the
@@ -833,10 +833,10 @@ impl Session {
 
     /// A change from `before`: a new undo step `label`, or with `merge` part of the previous one when it has the same label
     fn record(&mut self, label: &str, before: Document, merge: bool) {
-        if self.doc.stroke_replays.discard_stale(&self.doc.project, &self.doc.pixels) {
+        self.invalidate_changed(&before);
+        if self.doc.stroke_replays.discard_stale(&self.doc.project, &self.doc.pixels, &self.mesh) {
             self.note_raster_paint();
         }
-        self.invalidate_changed(&before);
         self.push_step(label, before, merge);
     }
 

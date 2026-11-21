@@ -5,10 +5,11 @@ use texturecraft_core::{Channel, ChannelBlend, ChannelFormat};
 
 use std::sync::Arc;
 
-use texturecraft_geom::Mesh;
+use texturecraft_geom::{Bvh, Mesh};
 
 use crate::commands::{CommandSpec, always, bad, boolp, channel_param, f32p, normal_format_param, strp, u64p};
 use crate::session::{Document, SetCache, StackTarget, check_resolution};
+use crate::stroke_replay::ReplayScene;
 use crate::{Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -117,6 +118,7 @@ pub struct ResizeTask {
     resolution: u32,
     doc: Document,
     mesh: Arc<Mesh>,
+    bvh: Arc<Bvh>,
     /// The session's revision and mesh when the task was made: the result applies only to them.
     from: (u64, u64),
 }
@@ -147,22 +149,29 @@ impl ResizeTask {
         mut accelerate: impl FnMut(&texturecraft_texel::TileImage, (u32, u32), &[u16]) -> Option<std::result::Result<texturecraft_texel::TileImage, String>>,
     ) -> Result<ResizeOutput> {
         let start = chrono::Utc::now();
-        let ResizeTask { ts, resolution, mut doc, mesh, from } = self;
+        let ResizeTask { ts, resolution, mut doc, mesh, bvh, from } = self;
         let set = doc.project.texture_set_mut(ts)?;
         let old = set.clone();
         set.resolution = resolution;
         crate::session::check_size(set)?;
         let size = set.size();
+        let scene = ReplayScene { mesh: &mesh, bvh: &bvh, material: set.material };
         let mut log = crate::log::SessionLog::new();
         let mut gpu_ms = 0;
         let mut gpu_images = 0;
         let mut fallback = None;
         let cancelled = || progress.cancel.load(std::sync::atomic::Ordering::Relaxed);
+        if cancelled() {
+            return Err(crate::EngineError::Other("Texture set resize was cancelled".into()));
+        }
         let replay = if old.resolution != resolution && old.uv_tiles.is_empty() && old.tile_resolutions.is_empty() {
-            doc.stroke_replays.prepare_resize(&doc.project, &doc.pixels, ts, size)
+            doc.stroke_replays.prepare_resize(&doc.project, &doc.pixels, ts, size, &scene, progress)
         } else {
             Default::default()
         };
+        if cancelled() {
+            return Err(crate::EngineError::Other("Texture set resize was cancelled".into()));
+        }
         replay.remove_rasters(&mut doc.pixels);
 
         // Tiles of their own resolution keep it, so the others move within their atlas blocks
@@ -201,7 +210,7 @@ impl ResizeTask {
         let cache_built = chrono::Utc::now();
         if let Some(cache) = &cache {
             let deferred = replay.deferred_count();
-            let replayed = replay.run(&mut doc.pixels, &mut doc.stroke_replays, &cache.gbuf, progress)?;
+            let replayed = replay.run(&mut doc.pixels, &mut doc.stroke_replays, &cache.gbuf, &scene, progress)?;
             if deferred > 0 {
                 log.warn("Paint", format!("{deferred} paint targets exceeded the resize replay budget. Their raster pixels were resampled and their paint operations were retained."));
             }
@@ -249,7 +258,7 @@ impl Session {
         let resolution = check_resolution(resolution)?;
         self.doc.project.texture_set(ts)?;
         self.cancel_stroke();
-        Ok(ResizeTask { ts, resolution, doc: self.doc.clone(), mesh: self.mesh.clone(), from: (self.revision, self.mesh_id) })
+        Ok(ResizeTask { ts, resolution, doc: self.doc.clone(), mesh: self.mesh.clone(), bvh: self.bvh.clone(), from: (self.revision, self.mesh_id) })
     }
 
     /// Apply a finished resize as one undo step. When the document changed while it ran, the

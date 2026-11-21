@@ -30,7 +30,7 @@ pub use brush::{Alignment, BrushAlpha, BrushSettings, FULL_TURN_DEGREES, MAX_RAD
 pub use commit::{CommitSource, Staging, TexelFn, commit_coverage, commit_layer, commit_mask};
 pub use path::{Lasso, spline, spline_segments, spline_segments_with_corners, spline_with_corners};
 pub use pickup::{Pickup, PickupMode};
-pub use raster::{RasterCtx, StrokeCanvas, UvStamp, fill_coverage, fill_triangles, rasterize, rasterize_uv};
+pub use raster::{RasterCtx, StrokeCanvas, UvStamp, fill_coverage, fill_triangles, rasterize, rasterize_uv, triangle_scan_texels};
 pub use stamp_source::StampSource;
 pub use stroke::{PickCtx, Stamp, Stroke, SurfaceHit, pick, pick_filtered};
 pub use visibility::{EyeDepth, screen_point};

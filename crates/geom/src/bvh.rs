@@ -401,6 +401,14 @@ impl Bvh {
 
     /// Call `f` with every triangle (original index) whose bounds overlap the box.
     pub fn query_box(&self, lo: Vec3, hi: Vec3, mut f: impl FnMut(u32)) {
+        self.query_box_until(lo, hi, |id| {
+            f(id);
+            true
+        });
+    }
+
+    /// Search triangles overlapping the box. Returns false if the callback stops the search.
+    pub fn query_box_until(&self, lo: Vec3, hi: Vec3, mut f: impl FnMut(u32) -> bool) -> bool {
         let mut stack = vec![0u32];
         while let Some(i) = stack.pop() {
             let Some(n) = self.nodes.get(i as usize) else { continue };
@@ -412,8 +420,8 @@ impl Bvh {
                     let (Some(t), Some(o)) = (self.tris.get(k), self.order.get(k)) else { continue };
                     let tlo = t[0].min(t[1]).min(t[2]);
                     let thi = t[0].max(t[1]).max(t[2]);
-                    if !(thi.cmplt(lo).any() || tlo.cmpgt(hi).any()) {
-                        f(*o);
+                    if !(thi.cmplt(lo).any() || tlo.cmpgt(hi).any()) && !f(*o) {
+                        return false;
                     }
                 }
             } else {
@@ -421,6 +429,7 @@ impl Bvh {
                 stack.push(n.first + 1);
             }
         }
+        true
     }
 }
 

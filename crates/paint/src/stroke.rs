@@ -1,6 +1,7 @@
 //! From pointer samples to stamps: picking, lazy mouse, spacing along the surface, stamp
 //! frames, jitter and symmetry.
 
+use serde::{Deserialize, Serialize};
 use texturecraft_geom::glam::{Mat3, Quat, Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, surface_at};
 use texturecraft_texel::noise::pcg3d;
@@ -57,7 +58,7 @@ const HALF_TURN_DEGREES: f32 = 180.0;
 const MIN_JITTERED_SIZE: f32 = 0.05;
 
 /// One brush dab in world space
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stamp {
     pub center: Vec3,
     pub normal: Vec3,
