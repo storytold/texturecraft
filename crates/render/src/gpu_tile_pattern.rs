@@ -10,7 +10,7 @@ pub(crate) const TILE_GENERATOR_OPCODE: u32 = 80;
 const NO_IMAGE: u32 = u32::MAX;
 // Keep uploads banded even for an image that fills an entire atlas slice.
 const IMAGE_ROWS: usize = 64;
-// Put a bound on packing overhead as well as authored pixels. An 8K image fits on its own.
+// Put a bound on packing overhead as well as authored pixels.
 const MAX_ATLAS_BYTES: u64 = 256 << 20;
 
 #[derive(Debug, Default)]
@@ -183,12 +183,12 @@ impl TileImageAtlas {
     }
 
     pub(crate) fn empty_view(device: &wgpu::Device) -> wgpu::TextureView {
-        atlas_texture(device, 1, 1, 1).create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
+        atlas_texture(device, 1, 1, 2).create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
     }
 
     pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, images: &[&Arc<ImageRes>]) -> Result<Self, String> {
         let limits = device.limits();
-        let (extent, regions) = arrange_images(images, limits.max_texture_dimension_2d, limits.max_texture_array_layers)?;
+        let (extent, regions) = arrange_images(images, limits.max_texture_dimension_2d, limits.max_texture_array_layers, device.adapter_info().backend)?;
         let texture = atlas_texture(device, extent[0], extent[1], extent[2]);
         let mut pixels = Vec::new();
         for (&image, region) in images.iter().zip(&regions) {
@@ -218,7 +218,7 @@ impl TileImageAtlas {
     }
 }
 
-fn arrange_images(images: &[&Arc<ImageRes>], side_limit: u32, layer_limit: u32) -> Result<([u32; 3], Vec<ImageRegion>), String> {
+fn arrange_images(images: &[&Arc<ImageRes>], side_limit: u32, layer_limit: u32, backend: wgpu::Backend) -> Result<([u32; 3], Vec<ImageRegion>), String> {
     let mut order: Vec<_> = images.iter().enumerate().map(|(i, image)| (i, image.width.max(1), image.height.max(1))).collect();
     order.sort_by_key(|&(_, _, height)| std::cmp::Reverse(height));
     let widest = order.iter().map(|&(_, width, _)| width).max().unwrap_or(1);
@@ -253,7 +253,16 @@ fn arrange_images(images: &[&Arc<ImageRes>], side_limit: u32, layer_limit: u32) 
         used_w = used_w.max(x);
         used_h = used_h.max(y + row_height);
     }
-    let extent = [used_w, used_h, layer + 1];
+    let mut layers = layer + 1;
+    // The GL backend derives the texture target from its extent. A view alone
+    // cannot turn a single-layer texture or a cube into a 2D array.
+    if backend == wgpu::Backend::Gl && (layers == 1 || (used_w == used_h && layers.is_multiple_of(6))) {
+        layers += 1;
+        if layers > layer_limit {
+            return Err("The Tile Generator image atlas exceeds the GPU array limit.".into());
+        }
+    }
+    let extent = [used_w, used_h, layers];
     let bytes = extent.into_iter().map(u64::from).product::<u64>() * size_of::<u32>() as u64;
     if bytes > MAX_ATLAS_BYTES {
         return Err("The Tile Generator image atlas exceeds the GPU memory budget.".into());
@@ -283,9 +292,18 @@ mod tests {
         let input = |side| Arc::new(ImageRes { width: side, height: side, rgba: Vec::new(), srgb: false });
         let large = input(8192);
         let small = input(16);
-        let (extent, _) = arrange_images(&[&large], 8192, 16).unwrap();
+        let (extent, _) = arrange_images(&[&large], 8192, 16, wgpu::Backend::Vulkan).unwrap();
         assert_eq!(extent, [8192, 8192, 1]);
-        let error = arrange_images(&[&large, &small], 8192, 16).err();
+        let error = arrange_images(&[&large, &small], 8192, 16, wgpu::Backend::Vulkan).err();
         assert!(error.is_some_and(|error| error.contains("memory budget")));
+    }
+
+    #[test]
+    fn gl_image_atlas_uses_a_2d_array_target() {
+        let image = Arc::new(ImageRes { width: 4, height: 4, rgba: Vec::new(), srgb: false });
+        let (extent, _) = arrange_images(&[&image], 4, 16, wgpu::Backend::Gl).unwrap();
+        assert_eq!(extent, [4, 4, 2]);
+        let (extent, _) = arrange_images(&[&image; 6], 4, 16, wgpu::Backend::Gl).unwrap();
+        assert_eq!(extent, [4, 4, 7]);
     }
 }
