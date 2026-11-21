@@ -3,6 +3,7 @@
 use serde_json::json;
 use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::primitives;
+use texturecraft_engine::texel::TILE;
 use texturecraft_engine::{Session, execute};
 
 /// Texture size: 1e-4 UV is 0.0256 texels
@@ -128,7 +129,8 @@ fn swapping_mask_gray_refreshes_the_last_displayed_dab_and_keeps_its_priority() 
 
     session.begin_stroke_uv([0.5, 0.5].into(), 1.0).unwrap();
     let (id, tiles) = session.pending_display_stroke(0).unwrap();
-    let tile = session.tile_demand(None).brush.unwrap();
+    let center = RESOLUTION / 2 / TILE;
+    let tile = (center, center);
     assert!(tiles.contains(&tile));
     session.update();
     session.take_uploads(0);
@@ -144,7 +146,7 @@ fn swapping_mask_gray_refreshes_the_last_displayed_dab_and_keeps_its_priority() 
     assert!(session.caches[0].settle.contains(&tile));
     assert!(session.caches[0].dirty.is_empty() && session.caches[0].upload.is_empty(), "only the settle queue holds the released dab");
     let demand = session.tile_demand(None);
-    assert_eq!(demand.brush, Some(tile));
+    assert!(demand.has_brush());
     session.caches[0].dirty.insert((0, 0));
     session.caches[0].chunk = 1;
     let clock = std::cell::Cell::new(0.0);

@@ -500,7 +500,7 @@ impl GpuLink {
 
     fn cpu_sets<'a>(&'a self, session: &'a Session) -> impl Iterator<Item = &'a texturecraft_engine::session::SetCache> {
         let gpu_mask = self.mask_preview.as_ref().is_some_and(|preview| preview.compositor.uses_gpu());
-        session.caches.iter().enumerate().filter_map(|(ts, cache)| {
+        session.caches.iter().enumerate().filter_map(move |(ts, cache)| {
             let gpu_current = self.prefer_gpu_layers
                 && self.compositors.get(ts).is_some_and(|state| {
                     state.uses_gpu() && state.current.is_some_and(|key| key.mesh == session.mesh_id && key.revision == cache.material_revision)

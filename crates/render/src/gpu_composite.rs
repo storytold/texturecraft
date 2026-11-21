@@ -735,17 +735,15 @@ fn point_effect(effect: &Effect) -> Option<Operation> {
     })
 }
 
-// Three 10-bit unsigned normalized components, followed by a validity bit.
+// Three 10-bit components followed by a validity bit.
 fn encode_baked_normal(normal: [f32; 3]) -> u32 {
     if !normal.iter().all(|value| (0.0..=1.0).contains(value)) {
         return 0;
     }
     // An even scale preserves the flat normal's exact 0.5 components.
-    let [x, y, mut z] = normal.map(|value| (value * 1022.0 + 0.5) as u32);
-    // A positive Z must survive quantization: zero makes RNM degenerate.
-    if normal[2] > 0.0 {
-        z = z.max(1);
-    }
+    let [x, y, z] = [normal[0], normal[1], normal[2].sqrt()].map(|value| (value * 1022.0 + 0.5) as u32);
+    // Square-root encoding preserves precision near zero, where RNM is most sensitive.
+    let z = z.max(u32::from(normal[2] > 0.0));
     x | (y << 10) | (z << 20) | (1 << 30)
 }
 

@@ -86,7 +86,8 @@ fn baked_at(pixel: vec2<u32>) -> vec4<u32> {
 }
 
 fn unpack_baked_normal(packed: u32) -> vec3<f32> {
-    return vec3<f32>(vec3(packed, packed >> 10u, packed >> 20u) & vec3(1023u)) / 1022.0;
+    let components = vec3<f32>(vec3(packed, packed >> 10u, packed >> 20u) & vec3(1023u)) / 1022.0;
+    return vec3(components.xy, components.z * components.z);
 }
 
 // The nearest squared distance can be clipped to one when no feature ID is needed.
