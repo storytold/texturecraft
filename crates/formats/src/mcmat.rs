@@ -79,11 +79,23 @@ pub fn mesh_map_png(width: u32, components: usize, data: &[f32]) -> Result<Vec<u
     Ok(encoded)
 }
 
-/// Estimated workspace for one quantized row, three encoder rows and the deflate state.
-pub fn mesh_map_png_working_bytes(width_px: u32, components: usize) -> u64 {
+/// Estimated temporary workspace for `write_mesh_map_png` with a file destination.
+pub fn mesh_map_png_working_bytes(width_px: u32, height_px: u32, components: usize) -> u64 {
+    // PngRows in the pinned codec deflates bands of up to 512 KiB filtered bytes,
+    // or one scanline for wider images.
+    const DEFLATE_BAND_BYTES: u64 = 512 << 10;
     const DEFLATE_WORKSPACE_BYTES: u64 = 1 << 20;
 
-    u64::from(width_px).saturating_mul(components as u64).saturating_mul(4 * std::mem::size_of::<u16>() as u64).saturating_add(DEFLATE_WORKSPACE_BYTES)
+    let row_bytes = u64::from(width_px).saturating_mul(components as u64).saturating_mul(std::mem::size_of::<u16>() as u64);
+    let filtered_row_bytes = row_bytes.saturating_add(1);
+    let band_rows = (DEFLATE_BAND_BYTES / filtered_row_bytes).max(1).min(u64::from(height_px));
+    let pending = row_bytes.saturating_mul(band_rows).saturating_mul(2);
+    let filtered = filtered_row_bytes.saturating_mul(band_rows);
+    let deflated = filtered.saturating_add(filtered / 8).saturating_add(1_024);
+    // Include spare row capacity and keep both the deflate output and the
+    // assembled zlib buffer in the estimate. Input floats are already charged.
+    let row_buffers = row_bytes.saturating_mul(8);
+    row_buffers.saturating_add(pending).saturating_add(filtered).saturating_add(deflated.saturating_mul(2)).saturating_add(DEFLATE_WORKSPACE_BYTES)
 }
 
 /// Encode a mesh map directly into its destination using one row of quantized samples.
@@ -128,6 +140,20 @@ pub fn write_mesh_map_png(output: impl Write, width_px: u32, components: usize, 
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn mesh_map_png_budget_covers_live_band_allocations() {
+        // The pinned encoder holds 85 rows for a 1024px RGB16 map. These
+        // three reserves coexist while deflating, even for compressible data.
+        const PENDING_BYTES: u64 = 522_240;
+        const FILTERED_BYTES: u64 = 522_325;
+        const DEFLATE_OUTPUT_BYTES: u64 = 588_639;
+        let unavoidable_workspace = PENDING_BYTES + FILTERED_BYTES + DEFLATE_OUTPUT_BYTES;
+        let estimate = mesh_map_png_working_bytes(1_024, 1_024, 3);
+        assert!(estimate >= unavoidable_workspace, "estimated {estimate} bytes for at least {unavoidable_workspace} bytes of workspace");
+        assert!(mesh_map_png_working_bytes(1_024, 1, 3) < estimate);
+        assert_eq!(mesh_map_png_working_bytes(u32::MAX, u32::MAX, usize::MAX), u64::MAX);
+    }
 
     #[test]
     fn recognizes_v3_and_directs_older_authors_to_republish() {
