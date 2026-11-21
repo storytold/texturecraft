@@ -18,7 +18,7 @@ use crate::brush_device::{BrushTiles, DeviceStroke, DeviceStrokePreview, Project
 use crate::session::{
     ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, ReleasedDab, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
 };
-use crate::uv_stroke_state::UvStrokeState;
+use crate::uv_stroke_state::{UV_STAMP_BATCH, UvStrokeState};
 use crate::uv_symmetry::UvMirror;
 use crate::{EngineError, Result};
 
@@ -27,15 +27,6 @@ pub const BRUSH_PATTERN_SIZE: f32 = 0.1;
 
 /// Brush size floor for the pattern scale
 const MIN_PATTERN_BRUSH_SIZE: f32 = 0.0005;
-
-/// Shortest distance between 2D view stamps, so a stamp with no radius (a pen at zero pressure) can't stall a stroke.
-const MIN_UV_STAMP_STEP: f32 = 1e-5;
-
-/// 2D view stamps rasterized together, bounding the memory of one batch.
-const UV_STAMP_BATCH: usize = 4096;
-
-/// Covers a UV diagonal at the minimum step (about 142k stamps), including light pen pressure, while bounding hostile coordinates
-const MAX_UV_STAMPS_PER_SAMPLE: usize = 150_000;
 
 /// Limit CPU-side storage for projected color to one readback batch.
 const PROJECTION_READBACK_BATCH: usize = 128;
@@ -537,23 +528,6 @@ impl Session {
         let Some(cache) = self.caches.get_mut(active.ts) else { return };
 
         let settings = &active.stroke.settings;
-        let radius = settings.uv_stamp_radius(pressure);
-        let step = (settings.spacing * 2.0 * radius).max(MIN_UV_STAMP_STEP);
-
-        // Follow path: turn the stamp with the stroke direction (y up on screen, v grows down)
-        let angle = match progress.last {
-            Some(previous) if settings.follow_path && uv != previous => settings.angle + (previous.y - uv.y).atan2(uv.x - previous.x).to_degrees() - 90.0,
-            _ => settings.angle,
-        };
-
-        // The first sample is one stamp; a later one stamps every `step` along the segment from the previous
-        let (start, segment, mut distance) = match progress.last.replace(uv) {
-            None => (uv, Vec2::ZERO, 0.0),
-
-            // Pressure can shrink the step below the carry from the preceding sample
-            Some(previous) => (previous, uv - previous, (step - progress.carry).max(0.0)),
-        };
-        let length = segment.length();
         let shape = Shape::new(settings.alpha, active.image_alpha.as_deref(), active.library_alpha.as_deref(), settings.alpha_params);
 
         // The copies of each dab: the Clone tool's pickup offset is fixed, so it paints none
@@ -561,29 +535,17 @@ impl Session {
         let mirror = (self.tool.tool != Tool::Clone)
             .then(|| UvMirror::new(&settings.symmetry, active.stroke.center(), &self.mesh, &self.bvh, &cache.gbuf, material))
             .flatten();
-        let mut batch = Vec::new();
-        let mut stamped = 0;
-        while distance <= length && stamped < MAX_UV_STAMPS_PER_SAMPLE {
-            let batch_size = UV_STAMP_BATCH.min(MAX_UV_STAMPS_PER_SAMPLE - stamped);
-            batch.clear();
-            while distance <= length && batch.len() < batch_size {
-                let center = start + segment * (distance / length.max(f32::MIN_POSITIVE));
-                let seed = progress.stamps.wrapping_add((stamped + batch.len()) as u32);
-                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow: settings.flow, hardness: settings.hardness, seed, source: None });
-                distance += step;
-            }
-
-            stamped += batch.len();
+        progress.sample(settings, uv, pressure, |batch| {
             if let Some(mirror) = &mirror {
                 for index in 0..batch.len() {
                     if let Some(stamp) = batch.get(index).copied() {
-                        mirror.add_copies(&stamp, &mut batch);
+                        mirror.add_copies(&stamp, batch);
                     }
                 }
             }
             if let Some(device) = &mut active.device {
-                active.device_uv_stamps.extend(&batch);
-                match device.append_uv(&batch) {
+                active.device_uv_stamps.extend(batch.iter().copied());
+                match device.append_uv(batch) {
                     Ok(tiles) => {
                         active.display_tiles.extend(&tiles);
                         active.canvas.dirty.extend(tiles);
@@ -598,13 +560,9 @@ impl Session {
                     }
                 }
             } else {
-                texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, &batch);
+                texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, batch);
             }
-        }
-
-        // At most one step, so a segment cut off at the stamp limit can't push the next one's stamps backwards
-        progress.carry = (length - (distance - step)).min(step);
-        progress.stamps = progress.stamps.wrapping_add(stamped as u32);
+        });
         self.stroke_painted();
     }
 
