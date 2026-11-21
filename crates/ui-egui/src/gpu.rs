@@ -1669,11 +1669,23 @@ pub(crate) mod tests {
         assert_eq!(session.memory().geometry, geometry_bytes);
         assert!(session.log.iter().any(|entry| entry.source == "Performance" && entry.message.contains("Layers: GPU")));
 
-        execute(&mut session, "effect.add.filter", &json!({"target":"content", "filter":"blur", "radius":8})).unwrap();
+        execute(&mut session, "effect.add.filter", &json!({"target":"content", "filter":"blur", "radius":32})).unwrap();
+        let scene = link.sync(&mut session, None, None, 0, 0.0);
+        assert_eq!(scene.composites.len(), 1);
+        let (_, errors) = scene.apply_display(&mut headless.renderer, &headless.device, &headless.queue);
+        assert!(errors.is_empty(), "{errors:?}");
+        let (_, _, blurred) = Readback::blocking(&headless.device, &headless.queue, headless.renderer.display_textures()[0][0]).unwrap();
+        let edge = (32 * width as usize + 32) * 4;
+        assert_ne!(blurred[edge..edge + 4], image[edge..edge + 4], "the GPU applied the blur to the padded island");
+        assert_eq!(link.compositor_status().0, "Layers: GPU");
+        assert_eq!(session.memory().geometry, geometry_bytes);
+
+        // A device error still enables the dense padding only on the CPU path.
+        scene.composites[0].2.store(true, Ordering::Release);
         let scene = link.sync(&mut session, None, None, 0, 0.0);
         assert!(scene.composites.is_empty());
         assert_eq!(link.compositor_status().0, "Layers: CPU");
-        assert!(session.log.iter().any(|entry| entry.message.contains("A layer effect uses CPU compositing.")));
+        assert!(session.log.iter().any(|entry| entry.message.contains(GPU_COMPOSITE_ERROR)));
         assert!(session.memory().geometry > geometry_bytes, "only the CPU path allocates the dense padding map");
     }
 
@@ -1725,6 +1737,13 @@ pub(crate) mod tests {
         execute(&mut session, "textureSet.select", &json!({"ts":1})).unwrap();
         assert!(link.sync(&mut session, None, None, 0, 0.0).composites.is_empty(), "selection retains all uploaded materials");
         execute(&mut session, "effect.add.filter", &json!({"target":"content","filter":"blur","radius":8})).unwrap();
+        let scene = link.sync(&mut session, None, None, 0, 0.0);
+        assert_eq!(scene.composites.len(), 1);
+        assert_eq!(scene.composites[0].0, 1, "only the blurred set needs to be recomposited");
+        assert_eq!(link.compositor_status().0, "Layers: GPU");
+
+        // A failed GPU submission for the second set leaves the first on the GPU.
+        scene.composites[0].2.store(true, Ordering::Release);
         let _ = session.caches[1].dilation.source(0, 0);
         let before = session.caches[0].revision;
         let scene = link.sync(&mut session, None, None, 0, 0.0);
