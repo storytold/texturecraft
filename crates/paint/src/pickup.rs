@@ -366,7 +366,13 @@ mod tests {
         let mut project = Project::new("test", "builtin:plane");
         project.texture_sets.push(TextureSet::new("Set", 0, size));
         let id = project.alloc_id();
-        let fill = Fill { sources: [(Channel::Roughness, Source::Uniform([0.25; 3]))].into(), projection: Default::default(), link: None };
+        let fill = Fill {
+            sources: [(Channel::Roughness, Source::Uniform([0.25; 3]))].into(),
+            projection: Default::default(),
+            sampling: Default::default(),
+            link: None,
+            material: None,
+        };
         let mut layer = Layer::new(id, "fill", LayerKind::Fill(fill), &[Channel::Roughness]);
         layer.mask = Some(Mask::new(MaskBackground::White));
         project.insert_layer(0, layer, None, false).unwrap();

@@ -17,6 +17,10 @@ const TRIANGLE: &str = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1
 const FORMAT_HINT: &str = "For the whole project: how normal map images set as mesh maps are read (set them again after a change), and the default for export";
 const TITLE: &str = "Project configuration";
 
+/// The window sits at the middle of the 1600-point-wide screen and is 560 points wide
+const WINDOW_MIDDLE_X: f32 = 800.0;
+const WINDOW_HALF_WIDTH: f32 = 280.0;
+
 fn temp_dir(test: &str) -> TempDir {
     TempDir::new(test)
 }
@@ -178,11 +182,15 @@ fn the_window_follows_the_reference_layout() {
         "Physical size",
         "Working color space",
     ];
-    let top = |label: &str| h.get_all_by_label(label).map(|n| n.rect().top()).fold(f32::INFINITY, f32::min);
+    // Only the window's own rows: a dock panel may show the same text (the fill's Scale switch offers Physical size)
+    let in_window = |node: &egui_kittest::Node<'_>| (node.rect().center().x - WINDOW_MIDDLE_X).abs() <= WINDOW_HALF_WIDTH;
+    let top = |label: &str| h.get_all_by_label(label).filter(in_window).map(|n| n.rect().top()).fold(f32::INFINITY, f32::min);
     for labels in order.windows(2) {
         assert!(top(labels[0]) < top(labels[1]), "{} comes before {}", labels[0], labels[1]);
     }
+
     assert!(h.query_by_label("Custom unit scale").is_none(), "Physical size starts collapsed");
+
     let disabled = |role: Role, label: &str| h.get_by_role_and_label(role, label).accesskit_node().is_disabled();
     for (role, label) in [
         (Role::CheckBox, "Compute tangent space per fragment"),
@@ -199,6 +207,7 @@ fn the_window_follows_the_reference_layout() {
     let center = h.get_by_role_and_label(Role::CheckBox, "Compute tangent space per fragment").rect().center();
     h.hover_at(center);
     h.run_steps(30);
+
     assert!(h.query_by_label("Not available yet").is_some(), "the hint of a setting TextureCraft does not have yet");
 }
 

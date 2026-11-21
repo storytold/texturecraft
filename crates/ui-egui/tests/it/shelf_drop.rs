@@ -249,18 +249,18 @@ fn changing_the_camera_cancels_a_drop_with_stale_view_coordinates() {
 }
 
 #[test]
-fn the_click_that_closes_the_drop_menu_does_not_move_a_decal_being_placed() {
+fn the_click_that_closes_the_drop_menu_paints_nothing_and_adds_no_undo_step() {
     let (mut harness, position) = drop_image(Some(1));
     let distance = |node: &egui_kittest::Node<'_>| node.rect().center().distance(position);
     harness.get_all_by_label("Roughness").min_by(|a, b| distance(a).total_cmp(&distance(b))).unwrap().click();
     harness.run_steps(2);
-    let decal_layer = harness.state().session.selected_layer().unwrap();
-    harness.state_mut().placing_decal = Some(decal_layer);
 
     let image = import_white_image(&mut harness);
     drop_asset(&mut harness, Asset::Texture(image), position);
     harness.run_steps(2);
+
     assert!(menu_open(&harness, position));
+
     let history = harness.state().session.history_labels().len();
 
     // A point on the same set, away from the menu
@@ -281,7 +281,7 @@ fn the_click_that_closes_the_drop_menu_does_not_move_a_decal_being_placed() {
     harness.run_steps(2);
 
     assert!(!menu_open(&harness, position));
-    assert_eq!(harness.state().session.history_labels().len(), history, "the decal wasn't moved");
+    assert_eq!(harness.state().session.history_labels().len(), history, "the closing click painted nothing");
 }
 
 #[test]

@@ -1,0 +1,12 @@
+use texturecraft_core::Fill;
+
+use crate::projector_depth::ProjectorDepth;
+
+/// A fill as a texel samples it: the fill, its projector's depth map when it culls by depth, and whether it covers every texel
+#[derive(Clone, Copy)]
+pub(crate) struct FillPlace<'f> {
+    pub fill: &'f Fill,
+    pub depth: Option<&'f ProjectorDepth>,
+    /// Decided once per tile, so a texel never works its coverage out
+    pub covers_all: bool,
+}

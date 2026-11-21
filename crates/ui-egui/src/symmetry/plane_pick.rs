@@ -83,4 +83,29 @@ mod tests {
 
         assert_eq!(offset, [0.5, 0.25, 3.0], "x is picked minus center, y is untouched, z is clamped to the mesh");
     }
+
+    /// Escape closes an open colour picker first and leaves Pick point armed; the next Escape cancels Pick point
+    #[test]
+    fn escape_closes_an_open_colour_picker_before_it_cancels_pick_point() {
+        use egui_kittest::kittest::Queryable;
+
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut harness, _) = crate::frame_gizmo::tests::fill_app("triplanar");
+        harness.state_mut().session.tool.brush.symmetry.x = true;
+        harness.state_mut().picking_symmetry_plane = true;
+        harness.get_by_role_and_label(egui::Role::Tab, "Material").click();
+        harness.run_steps(25);
+        harness.get_by_role_and_label(egui::Role::Button, "Base color").click();
+        harness.run_steps(2);
+        assert!(crate::color_picker::open_window(&harness.ctx).is_some(), "the picker is open");
+
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(2);
+        assert!(crate::color_picker::open_window(&harness.ctx).is_none(), "Escape closed the picker");
+        assert!(harness.state().picking_symmetry_plane, "and left Pick point armed");
+
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(2);
+        assert!(!harness.state().picking_symmetry_plane, "the next Escape cancels Pick point");
+    }
 }

@@ -41,18 +41,19 @@ fn environment_cache_retains_source_identity_until_replaced() {
     let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut app = egui_kittest::Harness::builder().build_eframe(|context| crate::TextureCraftApp::new(context, session())).into_state();
     app.session.doc.project.display.environment = "resource:environment".into();
-    let source = Arc::new(ImageRes { width: 2, height: 1, rgba: vec![[1.0, 0.0, 0.0, 1.0]; 2], srgb: false });
+    let source = Arc::new(ImageRes::new(2, 1, vec![[1.0, 0.0, 0.0, 1.0]; 2], false));
     let original_source = Arc::downgrade(&source);
     app.session.images.insert("environment".into(), source);
     let first_key = gpu_scene_key(&app.session);
     let first = super::trace_scene(&app).env;
     assert!(Arc::ptr_eq(&first, &super::trace_scene(&app).env), "unchanged images reuse the decoded environment");
 
-    let replacement = Arc::new(ImageRes { width: 2, height: 1, rgba: vec![[0.0, 1.0, 0.0, 1.0]; 2], srgb: false });
+    let replacement = Arc::new(ImageRes::new(2, 1, vec![[0.0, 1.0, 0.0, 1.0]; 2], false));
     app.session.images.insert("environment".into(), replacement.clone());
 
     assert!(original_source.upgrade().is_none(), "replacing the resource releases its decoded pixels immediately");
     assert_ne!(first_key, gpu_scene_key(&app.session), "a new source restarts tracing under the same environment name");
+
     let second = super::trace_scene(&app).env;
     assert!(!Arc::ptr_eq(&first, &second));
     assert_ne!(first.data, second.data, "replacing the image changes the lighting");
@@ -60,6 +61,7 @@ fn environment_cache_retains_source_identity_until_replaced() {
 
     app.session.images.insert("renamed".into(), replacement);
     app.session.doc.project.display.environment = "resource:renamed".into();
+
     assert!(!Arc::ptr_eq(&second, &super::trace_scene(&app).env), "the environment name is also part of the key");
 }
 

@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod add_mask_cmds;
 pub mod bake;
 pub mod bake_preview;
 pub mod brush_preset_cmds;
@@ -15,12 +16,19 @@ pub mod camera_cmds;
 pub mod color_selection_cmds;
 pub mod commands;
 pub mod decal_cmds;
+pub mod effect_blending_cmds;
 pub mod effect_clipboard;
 pub mod file_cmds;
+pub mod fill_alpha;
 pub mod fill_hit_test;
+pub mod fill_material_cmds;
 pub mod fill_mode;
+pub mod fill_reset_cmds;
+pub mod filter_about;
 pub mod filter_lib;
+pub mod folder_cmds;
 mod frame_target;
+pub mod id_mask_view;
 pub mod inspect;
 pub mod instance_cmds;
 pub mod layer_cmds;
@@ -33,6 +41,7 @@ mod log_level;
 mod mask_bitmap;
 pub mod mask_cmds;
 pub mod mask_export;
+mod mask_owner;
 mod mask_preview_pixel;
 pub mod material_lib;
 mod material_preview_pixel;
@@ -65,9 +74,12 @@ mod session_log;
 pub mod set_cmds;
 pub mod smart_masks;
 mod solo;
+mod stylized_lighting_params;
+pub mod swatch_cmds;
 pub mod template_cmds;
 pub mod text_cmds;
 pub mod thumbs;
+mod tile_transform_params;
 mod tool_availability;
 pub mod tool_cmds;
 pub mod tool_settings;
@@ -76,6 +88,7 @@ mod uv_stroke_state;
 mod uv_symmetry;
 pub mod uv_tile_cmds;
 pub mod view_cmds;
+pub mod warp_cmds;
 
 pub use bake::{BakeMesh, BakeMeshes, BakeTask, StreamedBake, StreamedMap};
 pub use bake_preview::{BakePreview, PreviewShow};

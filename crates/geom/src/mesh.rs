@@ -369,6 +369,18 @@ impl Mesh {
             .collect()
     }
 
+    /// Mesh units one UV unit covers on material `m`'s triangles: sqrt(surface area / UV area), None without UV area
+    pub fn uv_density(&self, m: usize) -> Option<f32> {
+        let (mut surface, mut uv_area) = (0.0_f32, 0.0_f32);
+        for [a, b, c] in self.triangles_of(m).filter_map(|t| self.tri(t)) {
+            let (Some(pa), Some(pb), Some(pc)) = (self.positions.get(a), self.positions.get(b), self.positions.get(c)) else { continue };
+            let (Some(ua), Some(ub), Some(uc)) = (self.uvs.get(a), self.uvs.get(b), self.uvs.get(c)) else { continue };
+            surface += (*pb - *pa).cross(*pc - *pa).length() * 0.5;
+            uv_area += (*ub - *ua).perp_dot(*uc - *ua).abs() * 0.5;
+        }
+        (uv_area > f32::EPSILON && surface.is_finite()).then(|| (surface / uv_area).sqrt())
+    }
+
     /// Remap the UVs of material `m`'s triangles with `f`. Vertices they share with other
     /// materials are duplicated first, so the other triangles keep their UVs.
     pub fn map_material_uvs(&mut self, m: usize, f: impl Fn(Vec2) -> Vec2) {
@@ -593,6 +605,16 @@ mod tests {
         let m = quad();
         assert_eq!(m.bounds_of_material(0), Some((Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0))));
         assert_eq!(m.bounds_of_material(1), None);
+    }
+
+    #[test]
+    fn uv_density_is_mesh_units_per_uv_unit() {
+        assert_eq!(quad().uv_density(0), Some(1.0));
+
+        let plane = crate::primitives::plane(3.0, 4).uv_density(0).unwrap();
+
+        assert!((plane - 3.0).abs() < 1e-4, "{plane}");
+        assert_eq!(quad().uv_density(1), None, "no triangles of that material");
     }
 
     #[test]

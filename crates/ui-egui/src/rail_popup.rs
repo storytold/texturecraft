@@ -161,7 +161,9 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     };
 
     let shown = ctx.memory(|memory| memory.area_rect(area_id()));
-    if closed_by_input(ctx, shown, strip) {
+
+    // An eyedropper pick's click on the model hands its colour back to the popup
+    if app.picking_color.is_none() && closed_by_input(ctx, shown, strip) {
         app.ui.rail_panel = None;
         let held = ctx.input(|input| input.pointer.any_down());
         ctx.data_mut(|data| data.insert_temp(area_id().with("closing"), held));
@@ -212,12 +214,13 @@ fn placement(ctx: &egui::Context, strip: Rect, icon: Rect) -> (Pos2, f32) {
     (Pos2::new(right, icon.top()), width)
 }
 
-/// A press outside the popup and the rail, unless in one of the popup's own dropdowns
+/// A press outside the popup and the rail, unless in one of the popup's own dropdowns or its colour picker window
 fn closed_by_input(ctx: &egui::Context, shown: Option<Rect>, strip: Rect) -> bool {
     let pressed_at = ctx.input(|input| input.pointer.press_origin().filter(|_| input.pointer.any_pressed()));
 
-    // A press on the rail is left to its icons, which switch or close the popup themselves
-    let outside = pressed_at.is_some_and(|at| !strip.contains(at) && shown.is_some_and(|rect| !rect.contains(at)));
+    // The rail icons and colour picker handle their own presses
+    let in_picker = |at: Pos2| crate::color_picker::open_window(ctx).is_some_and(|picker| picker.contains(at));
+    let outside = pressed_at.is_some_and(|at| !strip.contains(at) && shown.is_some_and(|rect| !rect.contains(at)) && !in_picker(at));
     outside && !egui::Popup::is_any_open(ctx)
 }
 

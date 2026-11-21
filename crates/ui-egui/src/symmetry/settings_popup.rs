@@ -6,6 +6,7 @@ use texturecraft_engine::paint::{FULL_TURN_DEGREES, MAX_RADIAL_COPIES, Symmetry}
 use super::{DEFAULT_RADIAL_COUNT, movable_axes};
 use crate::TextureCraftApp;
 use crate::i18n::tr;
+use crate::theme::AXIS_NAMES;
 use crate::widgets::{color_swatch, section, slider};
 
 /// The popup's width (points)
@@ -13,8 +14,6 @@ const POPUP_WIDTH: f32 = 340.0;
 
 /// Width of the radial Axis row's label column
 const LABEL_WIDTH: f32 = 64.0;
-
-const AXIS_NAMES: [&str; 3] = ["X", "Y", "Z"];
 
 /// Space between the mirror section and the radial toggle
 const SECTIONS_GAP: f32 = 4.0;

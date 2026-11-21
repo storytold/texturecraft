@@ -2,13 +2,16 @@
 
 use serde_json::{Value, json};
 use texturecraft_core::project::ENVIRONMENTS;
-use texturecraft_core::{BakedMap, Channel, EnvAlignment, ShadowMode, ToneMapping};
+use texturecraft_core::{BakedMap, Channel, EffectKind, EnvAlignment, Filter, Project, ShadowMode, ToneMapping};
 use texturecraft_geom::glam::Vec3;
 
 use crate::commands::{CommandSpec, always, bad, boolp, can_redo, can_undo, color_param, f32p, strp, u64p};
 use crate::frame_target::FrameTarget;
 use crate::session::ViewMode;
 use crate::{Result, Session, cmd};
+
+/// The farthest depth-of-field focus distance, in world units
+const MAX_FOCUS_DISTANCE: f32 = 1e6;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -68,7 +71,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Display settings",
             [],
             None,
-            "{environment?: <built-in>|resource:<image resource>, exposure?, blur?, rotation?, opacity?, toneMapping?: linear|aces, fov?, shadows?, shadowMode? (intensive|average|lightweight: the shadow map resolution), shadowOpacity? (0..1: how dark the shadows are), alignment? (world|camera: what the environment turns with), soloUnlit? (single-channel views flat; off: lit), aoIntensity?, bloom?, vignette?, sharpen?, grain?, postEffects?, taa?, specGloss?, parallax?, displacement? (the viewport moves the surface by the height channel), scatterColor?: [r,g,b] linear or \"#rrggbb\" sRGB, scatterRadius? (0..1 of the mesh radius), ior? (1..3, transmission), dof?: {enabled?, focusDistance? (view depth, world units; 0 = the orbit target), aperture? (lens radius, 0..1 of the mesh radius)}}",
+            "{environment?: <built-in>|resource:<image resource>, exposure?, blur?, rotation?, opacity?, toneMapping?: linear|aces, fov?, shadows?, shadowMode? (intensive|average|lightweight: the shadow map resolution), shadowOpacity? (0..1: how dark the shadows are), alignment? (world|camera: what the environment turns with), soloUnlit? (single-channel views flat; off: lit), aoIntensity?, bloom?, vignette?, sharpen?, grain?, postEffects?, taa?, specGloss?, parallax?, displacement? (the viewport moves the surface by the height channel), scatterColor?: [r,g,b] linear or \"#rrggbb\" sRGB, scatterRadius? (0..1 of the mesh radius), ior? (1..3, transmission), dof?: {enabled?, focusDistance? (view depth, world units; 0 = the orbit target), aperture? (lens radius, 0..1 of the mesh radius)}, projectionGizmos? (the selected fill's projection gizmos show in the 3D view)}",
             always,
             display
         ),
@@ -270,10 +273,10 @@ fn orbit(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn display(s: &mut Session, p: &Value) -> Result<Value> {
-    let tm = match strp(p, "toneMapping") {
+    let tone_mapping = match strp(p, "toneMapping") {
         Some("linear") => Some(ToneMapping::Linear),
         Some("aces") | Some("acesFilmic") => Some(ToneMapping::AcesFilmic),
-        Some(o) => return Err(bad("display.set", format!("unknown tone mapping `{o}`"))),
+        Some(other) => return Err(bad("display.set", format!("unknown tone mapping `{other}`"))),
         None => None,
     };
     let shadow_mode = match strp(p, "shadowMode") {
@@ -284,77 +287,81 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
         Some(id) => Some(EnvAlignment::parse(id).ok_or_else(|| bad("display.set", format!("unknown environment alignment `{id}` (world or camera)")))?),
         None => None,
     };
-    let env = strp(p, "environment").map(str::to_string);
-    if let Some(name) = env.as_deref().and_then(|e| e.strip_prefix(texturecraft_core::project::ENV_RESOURCE_PREFIX))
+    let environment = strp(p, "environment").map(str::to_string);
+    if let Some(name) = environment.as_deref().and_then(|picked| picked.strip_prefix(texturecraft_core::project::ENV_RESOURCE_PREFIX))
         && !s.images.contains_key(name)
     {
         return Err(bad("display.set", format!("no image resource `{name}` (import it with resource.import)")));
     }
 
-    if let Some(e) = env.as_deref().filter(|e| !e.starts_with(texturecraft_core::project::ENV_RESOURCE_PREFIX) && !ENVIRONMENTS.contains(e)) {
-        return Err(bad("display.set", format!("unknown environment `{e}`: one of {}, or resource:<image>", ENVIRONMENTS.join(", "))));
+    if let Some(unknown) =
+        environment.as_deref().filter(|picked| !picked.starts_with(texturecraft_core::project::ENV_RESOURCE_PREFIX) && !ENVIRONMENTS.contains(picked))
+    {
+        return Err(bad("display.set", format!("unknown environment `{unknown}`: one of {}, or resource:<image>", ENVIRONMENTS.join(", "))));
     }
 
     let scatter_color = color_param("display.set", p, "scatterColor")?;
-    let d = &mut s.doc.project.display;
-    if let Some(e) = env {
-        d.environment = e;
+    let (environment_before, rotation_before) = (s.doc.project.display.environment.clone(), s.doc.project.display.env_rotation);
+    let settings = &mut s.doc.project.display;
+    if let Some(picked) = environment {
+        settings.environment = picked;
     }
-    for (k, slot, lo, hi) in [
-        ("exposure", &mut d.env_exposure, -10.0, 10.0),
-        ("blur", &mut d.env_blur, 0.0, 1.0),
-        ("rotation", &mut d.env_rotation, -360.0, 360.0),
-        ("opacity", &mut d.env_opacity, 0.0, 1.0),
-        ("fov", &mut d.fov, 5.0, 150.0),
-        ("aoIntensity", &mut d.ao_intensity, 0.0, 1.0),
-        ("bloom", &mut d.bloom, 0.0, 1.0),
-        ("vignette", &mut d.vignette, 0.0, 1.0),
-        ("sharpen", &mut d.sharpen, 0.0, 1.0),
-        ("grain", &mut d.grain, 0.0, 1.0),
-        ("scatterRadius", &mut d.scatter_radius, 0.0, 1.0),
-        ("ior", &mut d.ior, 1.0, 3.0),
-        ("shadowOpacity", &mut d.shadow_opacity, 0.0, 1.0),
+    for (key, slot, lowest, highest) in [
+        ("exposure", &mut settings.env_exposure, -10.0, 10.0),
+        ("blur", &mut settings.env_blur, 0.0, 1.0),
+        ("rotation", &mut settings.env_rotation, -360.0, 360.0),
+        ("opacity", &mut settings.env_opacity, 0.0, 1.0),
+        ("fov", &mut settings.fov, 5.0, 150.0),
+        ("aoIntensity", &mut settings.ao_intensity, 0.0, 1.0),
+        ("bloom", &mut settings.bloom, 0.0, 1.0),
+        ("vignette", &mut settings.vignette, 0.0, 1.0),
+        ("sharpen", &mut settings.sharpen, 0.0, 1.0),
+        ("grain", &mut settings.grain, 0.0, 1.0),
+        ("scatterRadius", &mut settings.scatter_radius, 0.0, 1.0),
+        ("ior", &mut settings.ior, 1.0, 3.0),
+        ("shadowOpacity", &mut settings.shadow_opacity, 0.0, 1.0),
     ] {
-        if let Some(v) = f32p(p, k) {
-            *slot = v.clamp(lo, hi);
+        if let Some(value) = f32p(p, key) {
+            *slot = value.clamp(lowest, highest);
         }
     }
-    if let Some(t) = tm {
-        d.tone_mapping = t;
+    if let Some(picked) = tone_mapping {
+        settings.tone_mapping = picked;
     }
-    if let Some(c) = scatter_color {
-        d.scatter_color = c.map(|v| v.clamp(0.0, 1.0));
+    if let Some(color) = scatter_color {
+        settings.scatter_color = color.map(|component| component.clamp(0.0, 1.0));
     }
-    if let Some(b) = boolp(p, "shadows") {
-        d.shadows = b;
+    if let Some(on) = boolp(p, "shadows") {
+        settings.shadows = on;
     }
     if let Some(mode) = shadow_mode {
-        d.shadow_mode = mode;
+        settings.shadow_mode = mode;
     }
     if let Some(alignment) = alignment {
-        d.env_alignment = alignment;
+        settings.env_alignment = alignment;
     }
     if let Some(dof) = p.get("dof") {
-        if let Some(b) = boolp(dof, "enabled") {
-            d.dof.enabled = b;
+        if let Some(on) = boolp(dof, "enabled") {
+            settings.dof.enabled = on;
         }
-        if let Some(v) = f32p(dof, "focusDistance") {
-            d.dof.focus_distance = v.clamp(0.0, 1e6);
+        if let Some(distance) = f32p(dof, "focusDistance") {
+            settings.dof.focus_distance = distance.clamp(0.0, MAX_FOCUS_DISTANCE);
         }
-        if let Some(v) = f32p(dof, "aperture") {
-            d.dof.aperture = v.clamp(0.0, 1.0);
+        if let Some(aperture) = f32p(dof, "aperture") {
+            settings.dof.aperture = aperture.clamp(0.0, 1.0);
         }
     }
-    for (k, slot) in [
-        ("postEffects", &mut d.post_effects),
-        ("taa", &mut d.taa),
-        ("specGloss", &mut d.spec_gloss),
-        ("parallax", &mut d.parallax),
-        ("displacement", &mut d.displacement),
-        ("soloUnlit", &mut d.solo_unlit),
+    for (key, slot) in [
+        ("postEffects", &mut settings.post_effects),
+        ("taa", &mut settings.taa),
+        ("specGloss", &mut settings.spec_gloss),
+        ("parallax", &mut settings.parallax),
+        ("displacement", &mut settings.displacement),
+        ("soloUnlit", &mut settings.solo_unlit),
+        ("projectionGizmos", &mut settings.projection_gizmos),
     ] {
-        if let Some(b) = boolp(p, k) {
-            *slot = b;
+        if let Some(on) = boolp(p, key) {
+            *slot = on;
         }
     }
 
@@ -362,8 +369,25 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
     if f32p(p, "fov").is_some() {
         s.camera.fov = s.doc.project.display.fov;
     }
+
+    // Baked Lighting Environment lights with the viewport environment: the layers it lights composite again when that turns or changes
+    let display = &s.doc.project.display;
+    if (display.environment.as_str(), display.env_rotation) != (environment_before.as_str(), rotation_before) && lit_by_environment(&s.doc.project) {
+        for cache in &mut s.caches {
+            cache.invalidate_all();
+        }
+    }
     s.revision = s.revision.wrapping_add(1);
     Ok(serde_json::to_value(&s.doc.project.display).unwrap_or(Value::Null))
+}
+
+/// Whether a layer's content has a Baked Lighting Environment
+fn lit_by_environment(project: &Project) -> bool {
+    project
+        .layers
+        .values()
+        .flat_map(|layer| layer.content_effects.iter())
+        .any(|effect| matches!(effect.kind, EffectKind::Filter(Filter::EnvironmentLighting { .. })))
 }
 
 #[cfg(test)]
@@ -493,10 +517,14 @@ mod tests {
     #[test]
     fn hdr_resources_become_the_environment() {
         let mut s = Session::new_project("t", texturecraft_geom::primitives::sphere(1.0, 16, 8), "builtin:sphere", None, 128).unwrap();
+
         assert!(execute(&mut s, "display.set", &json!({"environment": "resource:sky.hdr"})).is_err(), "unknown resources are rejected");
+
         let e = execute(&mut s, "display.set", &json!({"environment": "nonexistent"})).unwrap_err().to_string();
+
         assert!(e.contains("Studio Soft"), "unknown environments are rejected with the valid names: {e}");
         assert_eq!(s.doc.project.display.environment, "Studio Soft");
+
         execute(&mut s, "display.set", &json!({"environment": "Night"})).unwrap();
         let img = image::Rgb32FImage::from_fn(64, 32, |_, y| image::Rgb([if y < 8 { 40.0 } else { 0.5 }; 3]));
         let mut hdr = Vec::new();
@@ -504,6 +532,7 @@ mod tests {
         let name = s.import_resource_bytes("sky.hdr", hdr).unwrap();
         let res = &s.images[&name];
         assert!(!res.srgb && res.rgba[0][0] > 30.0, "HDR keeps values above 1");
+
         let env = format!("resource:{name}");
         let r = execute(
             &mut s,
@@ -511,12 +540,38 @@ mod tests {
             &json!({"environment": env, "specGloss": true, "parallax": true, "displacement": true, "taa": false, "scatterColor": [2.0, 0.5, 0.25], "scatterRadius": 0.3}),
         )
         .unwrap();
+
         assert_eq!(r["environment"], json!(env));
+
         let d = &s.doc.project.display;
         assert!(d.spec_gloss && d.parallax && d.displacement && !d.taa);
         assert_eq!((d.scatter_color, d.scatter_radius), ([1.0, 0.5, 0.25], 0.3), "scatter settings (clamped)");
         assert_eq!(d.environment_resource(), Some(name.as_str()));
+
         execute(&mut s, "file.removeUnused", &Value::Null).unwrap();
+
         assert!(s.doc.resources.contains_key(&name), "the environment's image counts as used");
+    }
+
+    #[test]
+    fn the_projection_gizmos_hide_per_project_and_old_projects_show_them() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::sphere(1.0, 16, 8), "builtin:sphere", None, 128).unwrap();
+        let shown = serde_json::to_value(&s.doc.project.display).unwrap();
+
+        assert!(s.doc.project.display.projection_gizmos && shown.get("projection_gizmos").is_none(), "shown by default and saved as before: {shown}");
+
+        let hidden = execute(&mut s, "display.set", &json!({"projectionGizmos": false})).unwrap();
+
+        assert!(!s.doc.project.display.projection_gizmos);
+        assert_eq!(hidden["projection_gizmos"], json!(false), "hidden is saved with the project");
+        assert!(s.history_labels().is_empty(), "a view flag is no undo step");
+
+        let reopened: texturecraft_core::project::DisplaySettings = serde_json::from_value(hidden).unwrap();
+
+        assert!(!reopened.projection_gizmos, "a saved project opens with its gizmos hidden");
+
+        let old: texturecraft_core::project::DisplaySettings = serde_json::from_value(shown).unwrap();
+
+        assert!(old.projection_gizmos, "a project saved before the flag shows them");
     }
 }

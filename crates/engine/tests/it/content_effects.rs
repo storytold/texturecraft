@@ -21,51 +21,66 @@ fn center(s: &mut Session, c: Channel) -> [f32; 3] {
     s.caches[0].composite.value(c, (hit.uv.x * 256.0) as u32, (hit.uv.y * 256.0) as u32)
 }
 
-fn close(a: [f32; 3], b: [f32; 3]) -> bool {
-    (0..3).all(|i| (a[i] - b[i]).abs() < 2e-3)
+fn close(color: [f32; 3], expected: [f32; 3]) -> bool {
+    color.iter().zip(expected).all(|(component, wanted)| (component - wanted).abs() < 2e-3)
 }
 
-fn id(v: Value, key: &str) -> u64 {
-    v[key].as_u64().unwrap()
+fn id(reply: Value, key: &str) -> u64 {
+    reply[key].as_u64().unwrap()
 }
 
 #[test]
 fn content_effects_commands_inspect_and_round_trip() {
     let mut s = session();
     let layer = id(execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0], "roughness": 0.2})).unwrap(), "layer");
-    let hsl = id(execute(&mut s, "effect.add.filter", &json!({"target": "content", "filter": "hsl", "hue": 1.0 / 3.0})).unwrap(), "effect");
+    let hsl = id(execute(&mut s, "effect.add.filter", &json!({"target": "content", "filter": "hsl", "mode": "regular", "hue": 1.0 / 3.0})).unwrap(), "effect");
+
     assert!(close(center(&mut s, Channel::BaseColor), [0.0, 1.0, 0.0]), "{:?}", center(&mut s, Channel::BaseColor));
     assert!(s.doc.project.layer(LayerId(layer)).unwrap().mask.is_none(), "content effects don't create a mask");
     assert_eq!(s.target, StackTarget::Effect(LayerId(hsl)));
-    // Mask-only effects refuse the content, unknown targets are errors.
+    // Mask-only effects refuse the content, unknown targets are errors
     assert!(execute(&mut s, "effect.add.generator", &json!({"target": "content"})).is_err());
     assert!(execute(&mut s, "effect.add.filter", &json!({"target": "nope"})).is_err());
+
     execute(&mut s, "effect.set", &json!({"effect": hsl, "hue": 0.0, "lightness": -1.0})).unwrap();
+
     assert!(close(center(&mut s, Channel::BaseColor), [0.0; 3]));
+
     execute(&mut s, "effect.set", &json!({"effect": hsl, "visible": false})).unwrap();
 
-    // A content fill effect, edited through layer.fill.set.
+    // A content fill effect, edited through layer.fill.set
     let fill = id(execute(&mut s, "effect.add.fill", &json!({"target": "content", "roughness": 0.7})).unwrap(), "effect");
+
     assert!(close(center(&mut s, Channel::Roughness), [0.7; 3]));
     assert!(close(center(&mut s, Channel::BaseColor), [1.0, 0.0, 0.0]), "channels without a source stay");
+
     execute(&mut s, "layer.fill.set", &json!({"effect": fill, "channel": "roughness", "value": 0.9})).unwrap();
+
     assert!(close(center(&mut s, Channel::Roughness), [0.9; 3]));
+
     execute(&mut s, "layer.fill.set", &json!({"effect": fill, "channel": "roughness", "enabled": false})).unwrap();
+
     assert!(close(center(&mut s, Channel::Roughness), [0.2; 3]));
     assert!(execute(&mut s, "layer.fill.set", &json!({"effect": hsl, "channel": "roughness", "value": 0.5})).is_err(), "not a fill effect");
 
-    // Inspect shows the content stack; the project survives a save/load round trip.
+    // Inspect shows the content stack; the project survives a save/load round trip
     let inspect = execute(&mut s, "project.inspect", &Value::Null).unwrap();
-    let row = inspect["layers"].as_array().unwrap().iter().find(|l| l["id"] == layer).unwrap().clone();
-    let kinds: Vec<&str> = row["contentEffects"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    let row = inspect["layers"].as_array().unwrap().iter().find(|row| row["id"] == layer).unwrap().clone();
+    let kinds: Vec<&str> = row["contentEffects"].as_array().unwrap().iter().map(|effect| effect["kind"].as_str().unwrap()).collect();
+
     assert_eq!(kinds, ["HSL Perceptive", "Fill"], "{row}");
+
     let back = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
+
     assert_eq!(back.doc.project, s.doc.project);
 
     execute(&mut s, "layer.select", &json!({"layer": layer, "target": fill})).unwrap();
     execute(&mut s, "effect.remove", &json!({"effect": fill})).unwrap();
+
     assert_eq!(s.target, StackTarget::Content);
+
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
+
     assert_eq!(s.doc.project.layer(LayerId(layer)).unwrap().content_effects.len(), 2);
 }
 
@@ -104,18 +119,24 @@ fn anchor_points_in_masks_record_the_mask_for_layers_above() {
     execute(&mut s, "effect.add.fill", &json!({"value": 0.4})).unwrap();
     let anchor = id(execute(&mut s, "effect.add.anchor", &json!({"target": "mask", "name": "Wear"})).unwrap(), "effect");
     let layer = s.doc.project.layer(LayerId(low)).unwrap();
-    assert!(layer.mask.as_ref().unwrap().effects.iter().any(|e| e.id.0 == anchor), "in the mask");
+
+    assert!(layer.mask.as_ref().unwrap().effects.iter().any(|effect| effect.id.0 == anchor), "in the mask");
     assert!(layer.content_effects.is_empty(), "not on the content");
 
     // Without a target (or with no params at all) it still goes on the content, as before
     let content = id(execute(&mut s, "effect.add.anchor", &json!({"layer": low})).unwrap(), "effect");
-    assert!(s.doc.project.layer(LayerId(low)).unwrap().content_effects.iter().any(|e| e.id.0 == content));
+
+    assert!(s.doc.project.layer(LayerId(low)).unwrap().content_effects.iter().any(|effect| effect.id.0 == content));
+
     let bare = id(execute(&mut s, "effect.add.anchor", &Value::Null).unwrap(), "effect");
-    assert!(s.doc.project.layer(LayerId(low)).unwrap().content_effects.iter().any(|e| e.id.0 == bare));
+
+    assert!(s.doc.project.layer(LayerId(low)).unwrap().content_effects.iter().any(|effect| effect.id.0 == bare));
 
     // Folders take anchors in their masks only
     let folder = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
+
     assert!(execute(&mut s, "effect.add.anchor", &json!({"layer": folder})).is_err(), "folder content");
+
     execute(&mut s, "effect.add.anchor", &json!({"layer": folder, "target": "mask"})).unwrap();
 
     execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap();
@@ -180,6 +201,63 @@ fn anchor_effects_added_through_instance_validate_against_source() {
 }
 
 #[test]
+fn mask_anchor_points_feed_layers_above_and_folders_take_them() {
+    let mut s = session();
+    let low = id(execute(&mut s, "layer.add.fill", &json!({"height": 0.5})).unwrap(), "layer");
+    let name = s.doc.project.layer(LayerId(low)).unwrap().name.clone();
+
+    // No target (or null params) still goes on the content, named after the layer
+    let content = id(execute(&mut s, "effect.add.anchor", &Value::Null).unwrap(), "effect");
+
+    assert!(s.doc.project.layer(LayerId(low)).unwrap().content_effects.iter().any(|effect| effect.id.0 == content));
+    assert_eq!(s.doc.project.effect(LayerId(content)).unwrap().1.name, name);
+
+    execute(&mut s, "effect.add.fill", &json!({"layer": low, "target": "mask", "value": 0.4})).unwrap();
+    let anchor = id(execute(&mut s, "effect.add.anchor", &json!({"layer": low, "target": "mask"})).unwrap(), "effect");
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+
+    assert!(s.doc.project.effect(LayerId(anchor)).is_none() && s.doc.project.layer(LayerId(low)).unwrap().mask.is_some(), "one undo step");
+
+    execute(&mut s, "edit.redo", &Value::Null).unwrap();
+    let mask = s.doc.project.layer(LayerId(low)).unwrap().mask.clone().unwrap();
+    let added = mask.effects.iter().find(|effect| effect.id.0 == anchor);
+    assert_eq!(added.map(|effect| effect.name.clone()), Some(format!("{name} mask")));
+    assert!(execute(&mut s, "effect.add.anchor", &json!({"layer": low, "target": "nope"})).is_err());
+
+    // A layer above reads the mask's gray (0.4) in any channel: the same as a uniform 0.4 mask
+    let top = id(execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap(), "layer");
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let reader = id(execute(&mut s, "effect.add.fill", &json!({"anchor": anchor, "anchorChannel": "baseColor"})).unwrap(), "effect");
+    let anchored = center(&mut s, Channel::BaseColor);
+    execute(&mut s, "effect.set", &json!({"effect": reader, "value": 0.4})).unwrap();
+
+    assert!(close(anchored, center(&mut s, Channel::BaseColor)), "{anchored:?}");
+
+    execute(&mut s, "effect.set", &json!({"effect": reader, "anchor": anchor, "anchorChannel": "roughness"})).unwrap();
+
+    assert!(close(anchored, center(&mut s, Channel::BaseColor)), "every channel reads the gray");
+
+    // Inspect lists what reads an anchor point
+    let inspect = execute(&mut s, "project.inspect", &Value::Null).unwrap().to_string();
+
+    assert!(inspect.contains(&format!("\"references\":[{{\"effect\":{reader},\"layer\":{top}}}]")), "{inspect}");
+
+    // Folders take mask anchor points, not content ones
+    let folder = id(execute(&mut s, "layer.add.group", &Value::Null).unwrap(), "layer");
+
+    assert!(execute(&mut s, "effect.add.anchor", &json!({"layer": folder})).is_err(), "a folder has no content stack");
+
+    let folder_anchor = id(execute(&mut s, "effect.add.anchor", &json!({"layer": folder, "target": "mask"})).unwrap(), "effect");
+    let folder_mask = s.doc.project.layer(LayerId(folder)).unwrap().mask.clone().unwrap();
+
+    assert!(folder_mask.effects.iter().any(|effect| effect.id.0 == folder_anchor));
+
+    let back = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
+
+    assert_eq!(back.doc.project, s.doc.project);
+}
+
+#[test]
 fn painting_into_a_content_paint_effect() {
     let mut s = session();
     execute(&mut s, "layer.add.fill", &json!({"roughness": 0.3})).unwrap();
@@ -204,37 +282,52 @@ fn effects_move_within_their_stack_and_duplicate_with_their_pixels() {
     execute(&mut s, "tool.brush", &json!({"size": 20, "hardness": 90})).unwrap();
     execute(&mut s, "tool.stroke", &json!({"points": [[180, 200], [220, 200]]})).unwrap();
     let fill = id(execute(&mut s, "effect.add.fill", &json!({"target": "content", "roughness": 0.2})).unwrap(), "effect");
-    let order = |s: &Session| s.doc.project.layer(LayerId(layer)).unwrap().content_effects.iter().map(|e| e.id.0).collect::<Vec<_>>();
+    let order = |s: &Session| s.doc.project.layer(LayerId(layer)).unwrap().content_effects.iter().map(|effect| effect.id.0).collect::<Vec<_>>();
+
     assert!(close(center(&mut s, Channel::Roughness), [0.2; 3]), "the fill covers the paint");
-    // To the bottom, the paint shows again; an index past the end means the top.
+
+    // To the bottom, the paint shows again; an index past the end means the top
     execute(&mut s, "effect.move", &json!({"effect": fill, "index": 0})).unwrap();
+
     assert_eq!(order(&s), [fill, paint]);
     assert!(center(&mut s, Channel::Roughness)[0] > 0.85, "{:?}", center(&mut s, Channel::Roughness));
+
     execute(&mut s, "effect.move", &json!({"effect": fill, "index": 99})).unwrap();
+
     assert_eq!(order(&s), [paint, fill]);
+
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
+
     assert_eq!(order(&s), [fill, paint]);
     assert!(execute(&mut s, "effect.move", &json!({"effect": fill})).is_err(), "index is required");
     assert!(execute(&mut s, "effect.move", &json!({"effect": 999_999, "index": 0})).is_err());
-    // A duplicate sits just above its original with the painted pixels, and takes the selection.
+
+    // A duplicate sits just above its original with the painted pixels, and takes the selection
     execute(&mut s, "layer.select", &json!({"layer": layer, "target": paint})).unwrap();
     let copy = id(execute(&mut s, "effect.duplicate", &json!({"effect": paint})).unwrap(), "effect");
+
     assert_eq!(order(&s), [fill, paint, copy]);
     assert_eq!(s.target, StackTarget::Effect(LayerId(copy)));
     assert!(s.doc.project.effect(LayerId(copy)).unwrap().1.name.ends_with(" copy"));
-    // Undoing it leaves no missing effect selected, but the stack it was in.
+
+    // Undoing it leaves no missing effect selected, but the stack it was in
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
+
     assert_eq!(s.target, StackTarget::Content);
+
     execute(&mut s, "edit.redo", &Value::Null).unwrap();
     execute(&mut s, "effect.remove", &json!({"effect": paint})).unwrap();
+
     assert!(center(&mut s, Channel::Roughness)[0] > 0.85, "the copy keeps the strokes");
     assert!(execute(&mut s, "effect.duplicate", &json!({"effect": 999_999})).is_err());
-    // Mask effects move within the mask.
+
+    // Mask effects move within the mask
     execute(&mut s, "mask.add.black", &Value::Null).unwrap();
     let a = id(execute(&mut s, "effect.add.fill", &json!({"target": "mask", "value": 0.3})).unwrap(), "effect");
     let b = id(execute(&mut s, "effect.add.levels", &json!({"target": "mask"})).unwrap(), "effect");
     execute(&mut s, "effect.move", &json!({"effect": b, "index": 0})).unwrap();
-    let mask: Vec<u64> = s.doc.project.layer(LayerId(layer)).unwrap().mask.as_ref().unwrap().effects.iter().map(|e| e.id.0).collect();
+    let mask: Vec<u64> = s.doc.project.layer(LayerId(layer)).unwrap().mask.as_ref().unwrap().effects.iter().map(|effect| effect.id.0).collect();
+
     assert_eq!(mask, [b, a]);
 }
 
@@ -246,40 +339,54 @@ fn effects_copy_and_paste_between_layers_and_stacks() {
     execute(&mut s, "tool.material", &json!({"channel": "roughness", "value": 0.9})).unwrap();
     execute(&mut s, "tool.brush", &json!({"size": 20, "hardness": 90})).unwrap();
     execute(&mut s, "tool.stroke", &json!({"points": [[180, 200], [220, 200]]})).unwrap();
+
     assert_eq!(execute(&mut s, "effect.copy", &Value::Null).unwrap(), json!({"copied": paint}), "the selected effect");
     assert!(execute(&mut s, "layer.paste", &Value::Null).is_err(), "the clipboard holds an effect, not a layer");
-    // Onto the content of a fill above that covers the first: its strokes come along.
+
+    // Onto the content of a fill above that covers the first: its strokes come along
     let high = id(execute(&mut s, "layer.add.fill", &json!({"roughness": 0.3})).unwrap(), "layer");
     let pasted = id(execute(&mut s, "effect.paste", &Value::Null).unwrap(), "effect");
+
     assert_eq!(s.target, StackTarget::Effect(LayerId(pasted)));
     assert!(s.doc.pixels.layer(LayerId(pasted), Channel::Roughness).is_some());
+
     execute(&mut s, "effect.remove", &json!({"effect": paint})).unwrap();
+
     assert!(center(&mut s, Channel::Roughness)[0] > 0.85, "{:?}", center(&mut s, Channel::Roughness));
-    // Above the selected effect.
+
+    // Above the selected effect
     let inv = id(execute(&mut s, "effect.add.filter", &json!({"target": "content", "filter": "invert"})).unwrap(), "effect");
     execute(&mut s, "effect.copy", &json!({"effect": inv})).unwrap();
     execute(&mut s, "layer.select", &json!({"layer": high, "target": pasted})).unwrap();
     let again = id(execute(&mut s, "effect.paste", &Value::Null).unwrap(), "effect");
-    let order: Vec<u64> = s.doc.project.layer(LayerId(high)).unwrap().content_effects.iter().map(|e| e.id.0).collect();
+    let order: Vec<u64> = s.doc.project.layer(LayerId(high)).unwrap().content_effects.iter().map(|effect| effect.id.0).collect();
+
     assert_eq!(order, [pasted, again, inv]);
-    // A generator goes on a mask (made for it) even with the content selected; asking for the
-    // content is an error. Cut removes the original.
+
+    // A generator needs a mask even when content is selected
     execute(&mut s, "layer.select", &json!({"layer": high})).unwrap();
     let generator = id(execute(&mut s, "effect.add.generator", &Value::Null).unwrap(), "effect");
     execute(&mut s, "effect.cut", &json!({"effect": generator})).unwrap();
+
     assert!(s.doc.project.effect(LayerId(generator)).is_none());
+
     execute(&mut s, "layer.select", &json!({"layer": low})).unwrap();
+
     assert!(execute(&mut s, "effect.paste", &json!({"target": "content"})).is_err());
+
     execute(&mut s, "effect.paste", &Value::Null).unwrap();
     let mask = &s.doc.project.layer(LayerId(low)).unwrap().mask;
-    assert!(mask.as_ref().is_some_and(|m| m.effects.iter().any(|e| matches!(e.kind, EffectKind::Generator(_)))));
-    // A fill reading an anchor point needs one below its new layer.
+
+    assert!(mask.as_ref().is_some_and(|mask| mask.effects.iter().any(|effect| matches!(effect.kind, EffectKind::Generator(_)))));
+
+    // A fill reading an anchor point needs one below its new layer
     execute(&mut s, "layer.select", &json!({"layer": low})).unwrap();
     let anchor = id(execute(&mut s, "effect.add.anchor", &Value::Null).unwrap(), "effect");
     execute(&mut s, "layer.select", &json!({"layer": high})).unwrap();
     let reader = id(execute(&mut s, "effect.add.fill", &json!({"target": "mask", "anchor": anchor})).unwrap(), "effect");
     execute(&mut s, "effect.copy", &json!({"effect": reader})).unwrap();
     execute(&mut s, "layer.select", &json!({"layer": low})).unwrap();
+
     assert!(execute(&mut s, "effect.paste", &Value::Null).is_err(), "the anchor is on the layer itself");
 }
 
@@ -400,10 +507,12 @@ fn mask_fill_can_use_an_image_source() {
 
     // Adding a fill selects the imported image
     let fill = id(execute(&mut session, "effect.add.fill", &json!({"target": "mask", "image": brick})).unwrap(), "effect");
+
     assert!(matches!(fill_source(&session, fill), Source::Image { name, .. } if *name == brick), "{:?}", fill_source(&session, fill));
 
     // Editing a fill selects a different image
     execute(&mut session, "effect.set", &json!({"effect": fill, "image": wood})).unwrap();
+
     assert!(matches!(fill_source(&session, fill), Source::Image { name, .. } if *name == wood), "{:?}", fill_source(&session, fill));
 
     // Projection edits preserve the image source
@@ -426,5 +535,77 @@ fn mask_fill_can_use_an_image_source() {
 
     // The Source menu's Uniform value action replaces an image source
     execute(&mut session, "effect.set", &json!({"effect": fill, "value": 0.25})).unwrap();
+
     assert!(matches!(fill_source(&session, fill), Source::Uniform(v) if (v[0] - 0.25).abs() < 1e-6), "{:?}", fill_source(&session, fill));
+}
+
+/// A content levels remaps the one channel it affects (Base color when added); levels saved before the choice remap every channel; Clamp stops values past the input handles at the output ends
+#[test]
+fn content_levels_remap_the_channel_they_affect() {
+    let mut s = session();
+    let layer = id(execute(&mut s, "layer.add.fill", &json!({"color": [0.8, 0.8, 0.8], "roughness": 0.8})).unwrap(), "layer");
+    let levels_effect = id(execute(&mut s, "effect.add.levels", &json!({"target": "content", "outHigh": 0.5})).unwrap(), "effect");
+    let inspected = execute(&mut s, "project.inspect", &Value::Null).unwrap().to_string();
+
+    assert!(inspected.contains("\"affects\":\"baseColor\""), "{inspected}");
+    assert!(close(center(&mut s, Channel::BaseColor), [0.4; 3]), "{:?}", center(&mut s, Channel::BaseColor));
+    assert!((center(&mut s, Channel::Roughness)[0] - 0.8).abs() < 1e-3, "roughness is not what it remaps");
+
+    execute(&mut s, "effect.set", &json!({"effect": levels_effect, "affects": "roughness"})).unwrap();
+
+    assert!((center(&mut s, Channel::BaseColor)[0] - 0.8).abs() < 1e-3);
+    assert!((center(&mut s, Channel::Roughness)[0] - 0.4).abs() < 1e-3);
+    assert!(execute(&mut s, "effect.set", &json!({"effect": levels_effect, "affects": "normal"})).is_err(), "levels pass normal maps through");
+    assert!(execute(&mut s, "effect.set", &json!({"effect": levels_effect, "affects": "nope"})).is_err());
+
+    // Levels saved before the choice: every channel
+    if let Some(EffectKind::Levels(levels)) = s.doc.project.effect_mut(LayerId(levels_effect)).map(|effect| &mut effect.kind) {
+        levels.affects = None;
+    }
+    for visible in [false, true] {
+        execute(&mut s, "effect.set", &json!({"effect": levels_effect, "visible": visible})).unwrap();
+    }
+
+    assert!((center(&mut s, Channel::BaseColor)[0] - 0.4).abs() < 1e-3);
+    assert!((center(&mut s, Channel::Roughness)[0] - 0.4).abs() < 1e-3);
+
+    // Past the white input handle: on, it stops at the output end; off, it carries on
+    execute(&mut s, "effect.set", &json!({"effect": levels_effect, "affects": "baseColor", "inHigh": 0.6, "outHigh": 0.6, "clamp": true})).unwrap();
+
+    assert!((center(&mut s, Channel::BaseColor)[0] - 0.6).abs() < 1e-3, "{:?}", center(&mut s, Channel::BaseColor));
+
+    execute(&mut s, "effect.set", &json!({"effect": levels_effect, "clamp": false})).unwrap();
+
+    assert!((center(&mut s, Channel::BaseColor)[0] - 0.8).abs() < 1e-3, "0.8 is a third past 0.6: {:?}", center(&mut s, Channel::BaseColor));
+
+    // A mask's levels remap its one value
+    execute(&mut s, "mask.add.black", &json!({"layer": layer})).unwrap();
+
+    assert!(execute(&mut s, "effect.add.levels", &json!({"target": "mask", "affects": "roughness"})).is_err());
+
+    let mask_levels = id(execute(&mut s, "effect.add.levels", &json!({"target": "mask"})).unwrap(), "effect");
+
+    assert!(execute(&mut s, "effect.set", &json!({"effect": mask_levels, "affects": "roughness"})).is_err());
+}
+
+/// A colour channel's histogram counts each component and the luminance on their own
+#[test]
+fn a_color_histogram_has_its_components_and_luminance() {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+    let levels = id(execute(&mut s, "effect.add.levels", &json!({"target": "content"})).unwrap(), "effect");
+
+    let histogram = execute(&mut s, "effect.histogram", &json!({"effect": levels, "bins": 4})).unwrap();
+    let roughness = execute(&mut s, "effect.histogram", &json!({"effect": levels, "channel": "roughness"})).unwrap();
+
+    let counts = |bins: &Value| bins.as_array().unwrap().iter().map(|count| count.as_u64().unwrap()).collect::<Vec<u64>>();
+    let components: Vec<Vec<u64>> = histogram["components"].as_array().unwrap().iter().map(counts).collect();
+    let [red, green, blue] = &components[..] else { panic!("three components: {components:?}") };
+    let texels = red.last().copied().unwrap();
+
+    assert!(texels > 0);
+    assert_eq!([red, green, blue], [&vec![0, 0, 0, texels], &vec![texels, 0, 0, 0], &vec![texels, 0, 0, 0]]);
+    assert_eq!(counts(&histogram["luminance"]), vec![0, texels, 0, 0], "red's luminance is 0.3");
+    assert_eq!(counts(&histogram["bins"]), vec![2 * texels, 0, 0, texels]);
+    assert!(roughness.get("components").is_none(), "one value has no components");
 }

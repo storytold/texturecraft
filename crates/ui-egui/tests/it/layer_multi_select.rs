@@ -20,8 +20,18 @@ fn harness() -> (Harness<'static, TextureCraftApp>, [LayerId; 4]) {
     (h, rows)
 }
 
+/// Frames for a scroll to bring a row into view (it animates)
+const SCROLL_FRAMES: usize = 25;
+
+/// Scrolls the row `name` into view: six rows overflow the Layers panel
+fn show_row(h: &mut Harness<'_, TextureCraftApp>, name: &str) {
+    h.get_by_label(name).scroll_to_me();
+    h.run_steps(SCROLL_FRAMES);
+}
+
 /// Click the row `name` while `modifiers` are held (pressed before and released after the click).
 fn click(h: &mut Harness<'_, TextureCraftApp>, name: &str, modifiers: Modifiers) {
+    show_row(h, name);
     let at: Pos2 = h.get_by_label(name).rect().center();
     h.event(Event::PointerMoved(at));
     h.event(Event::ModifiersChanged(modifiers));
@@ -161,6 +171,7 @@ fn ctrl_a_leaves_text_fields_and_other_panels_alone() {
 
 /// Right-click the row `name` and choose the menu item whose label starts with `item`.
 fn row_menu(h: &mut Harness<'_, TextureCraftApp>, name: &str, item: &str) {
+    show_row(h, name);
     h.get_by_label(name).click_secondary();
     h.run_steps(3);
     h.get_by(|node| node.label().is_some_and(|label| label.starts_with(item))).click();

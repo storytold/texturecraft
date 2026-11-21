@@ -111,18 +111,24 @@ pub fn command_specs() -> &'static [CommandSpec] {
         let mut v = Vec::new();
         v.extend(crate::view_cmds::edit_specs());
         v.extend(crate::layer_cmds::specs());
+        v.extend(crate::fill_material_cmds::specs());
+        v.extend(crate::fill_reset_cmds::specs());
+        v.extend(crate::folder_cmds::specs());
         v.extend(crate::layer_ops::specs());
         v.extend(crate::instance_cmds::specs());
         v.extend(crate::mask_cmds::specs());
         v.extend(crate::mask_export::specs());
+        v.extend(crate::add_mask_cmds::specs());
         v.extend(crate::color_selection_cmds::specs());
         v.extend(crate::effect_clipboard::specs());
+        v.extend(crate::effect_blending_cmds::specs());
         v.extend(crate::tool_cmds::specs());
         v.extend(crate::brush_preset_cmds::specs());
         v.extend(crate::path_tool::specs());
         v.extend(crate::view_cmds::specs());
         v.extend(crate::solo::specs());
         v.extend(crate::camera_cmds::specs());
+        v.extend(crate::swatch_cmds::specs());
         v.extend(crate::quick_mask::specs());
         v.extend(crate::set_cmds::specs());
         v.extend(crate::meshmap_cmds::specs());
@@ -142,6 +148,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::smart_masks::specs());
         v.extend(crate::filter_lib::specs());
         v.extend(crate::decal_cmds::specs());
+        v.extend(crate::warp_cmds::specs());
         v.extend(crate::text_cmds::specs());
         v
     })

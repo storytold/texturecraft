@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 use texturecraft_engine::core::Channel;
+use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
 use texturecraft_engine::{Session, command_specs, execute};
 
@@ -180,7 +181,29 @@ fn polygon_fill_and_color_picker() {
     execute(&mut s, "tool.click", &json!({"x": 200, "y": 200})).unwrap();
     execute(&mut s, "tool.colorPicker", &Value::Null).unwrap();
     let r = execute(&mut s, "tool.click", &json!({"x": 200, "y": 200})).unwrap();
+
     assert!((r["roughness"][0].as_f64().unwrap() - 0.9).abs() < 0.01, "{r}");
+}
+
+#[test]
+fn color_at_reads_the_surface_without_changing_the_brush() {
+    let mut s = session();
+    execute(&mut s, "tool.material", &json!({"channel": "roughness", "value": 0.9})).unwrap();
+    execute(&mut s, "tool.polygonFill", &Value::Null).unwrap();
+    execute(&mut s, "tool.fillMode", &json!({"mode": "mesh"})).unwrap();
+    execute(&mut s, "tool.click", &json!({"x": 200, "y": 200})).unwrap();
+    execute(&mut s, "tool.material", &json!({"channel": "roughness", "value": 0.2})).unwrap();
+    let viewport = s.viewport;
+
+    let read = s.color_at(Vec2::new(200.0, 200.0), viewport).unwrap();
+
+    let surface = read.get(&Channel::Roughness).unwrap();
+
+    assert!((surface[0] - 0.9).abs() < 0.01, "{surface:?}");
+
+    let brush = s.tool.values.get(&Channel::Roughness).unwrap();
+
+    assert!((brush[0] - 0.2).abs() < 0.01, "the brush keeps its own value: {brush:?}");
 }
 
 #[test]
@@ -234,15 +257,238 @@ fn panic_hunt() {
         if spec.id == "project.sample" {
             continue; // slow (bakes); covered elsewhere
         }
+
         for p in &hostile {
             let mut s = session();
-            // Match the 256px fixture: otherwise empty/irrelevant bake.run params perform
-            // repeated 2048px default bakes. Keep every input, ray count and fresh session.
+            // Match the 256px fixture so empty bake options cannot launch a 2048px bake
             for texture_set in &mut s.doc.project.texture_sets {
                 texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
             }
             let _ = execute(&mut s, spec.id, p);
             s.update();
+        }
+    }
+
+    hunt_filters(&hostile);
+}
+
+/// A 4 × 4 gray PNG, the image the hunted decals project
+fn gray_png() -> Vec<u8> {
+    let mut out = Vec::new();
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([128, 128, 128, 255])).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+    out
+}
+
+/// Frame edits, frame and Fill section resets and Transform filter settings on the fills they act on (a planar, a warp, a decal mask and a Transform filter) meet hostile values without panicking; a refused edit changes nothing and adds no undo step
+#[test]
+fn panic_hunt_frames_and_transforms() {
+    let mut s = session();
+    let image = s.import_resource_bytes("gray.png", gray_png()).unwrap();
+    let planar = execute(&mut s, "layer.add.fill", &Value::Null).unwrap()["layer"].as_u64().unwrap();
+    execute(&mut s, "layer.fill.projection", &json!({"layer": planar, "projection": "planar"})).unwrap();
+    let warp = execute(&mut s, "layer.add.fill", &Value::Null).unwrap()["layer"].as_u64().unwrap();
+    execute(&mut s, "layer.fill.projection", &json!({"layer": warp, "projection": "warp"})).unwrap();
+    let decal = execute(&mut s, "layer.add.decal", &json!({"image": image, "channel": "mask", "position": [0, 0, 1], "normal": [0, 0, 1]})).unwrap();
+    let mask_effect = decal["maskEffect"].as_u64().unwrap();
+    let transform = execute(&mut s, "effect.add.filter", &json!({"filter": "transform", "target": "content"})).unwrap()["effect"].as_u64().unwrap();
+    s.update();
+
+    let hostile_values =
+        [json!(1e30), json!(-1e30), json!(0), json!(null), json!("x"), json!([]), json!([1e30, -1e30]), json!([0, 0, 0]), json!([-1e30, 1e30, 0, 5])];
+    let targets = [json!({"layer": planar}), json!({"layer": warp}), json!({"effect": mask_effect})];
+    let keys = ["frameOffset", "frameRotation", "frameScale", "size", "offset", "depth", "rotation", "up"];
+    for target in &targets {
+        for key in keys {
+            for value in &hostile_values {
+                let mut params = target.clone();
+                params[key] = value.clone();
+                hunt_refused_changes_nothing(&mut s, "layer.decal.set", &params);
+            }
+        }
+    }
+
+    for target in &targets {
+        for command in ["layer.fill.resetFrame", "layer.fill.resetProjection"] {
+            let _ = execute(&mut s, command, target);
+            s.update();
+        }
+    }
+
+    let transform_keys = ["repeatMode", "flipMode", "scaling", "offset", "rotation", "tileSafeRotation"];
+    for key in transform_keys {
+        for value in &hostile_values {
+            let mut params = json!({"effect": transform});
+            params[key] = value.clone();
+            hunt_refused_changes_nothing(&mut s, "effect.set", &params);
+        }
+    }
+}
+
+/// Run `command` with `params` and render; refused, it must leave the project and the undo history as they were
+fn hunt_refused_changes_nothing(s: &mut Session, command: &str, params: &Value) {
+    let (before, steps) = (s.doc.project.clone(), s.history_labels().len());
+    if execute(s, command, params).is_err() {
+        assert!(s.doc.project == before && s.history_labels().len() == steps, "a refused {command} {params} changes nothing");
+    }
+    s.update();
+}
+
+/// The number parameters library filters read, all set at once to one hostile value
+const FILTER_NUMBER_KEYS: &[&str] = &[
+    "radius",
+    "intensity",
+    "amount",
+    "level",
+    "hue",
+    "saturation",
+    "lightness",
+    "contrast",
+    "luminosity",
+    "levels",
+    "min",
+    "max",
+    "position",
+    "range",
+    "offset",
+    "multiply",
+    "scale",
+    "angle",
+    "width",
+    "distance",
+    "smoothing",
+    "size",
+    "spread",
+    "opacity",
+    "blur",
+    "balance",
+    "quality",
+    "sourceBlur",
+    "sourceBalance",
+    "sourceContrast",
+    "sourceTiling",
+    "tolerance",
+    "softness",
+    "light",
+    "ambient",
+    "occlusion",
+    "azimuth",
+    "elevation",
+    "horizontalRotation",
+    "verticalRotation",
+    "exposure",
+    "heightIntensity",
+    "ambientOcclusion",
+    "specularOcclusion",
+    "pixelsAmount",
+    "curveOffset",
+    "curveShape",
+    "maskThreshold",
+    "distanceMapMultiplier",
+    "threshold",
+    "axisXOffset",
+    "axisYOffset",
+    "surfaceSize",
+    "heightDepth",
+    "normalIntensity",
+    "chroma",
+    "luma",
+    "red",
+    "green",
+    "blue",
+    "alpha",
+    "tensorSmoothness",
+    "anisotropy",
+    "sharpness",
+    "smoothness",
+    "rotation",
+    "scaling",
+    "diffuseCavity",
+    "specularAo",
+    "specularCavity",
+    "cavitySmoothness",
+    "edgesIntensity",
+    "edgesSmoothness",
+    "dielectricReflectance",
+    "heightToNormal",
+];
+
+/// The objects library filters read numbers from (Baked Lighting Stylized's two lights)
+const FILTER_LIGHT_KEYS: &[&str] = &["light1", "light2"];
+
+/// Every filter number parameter set to `number`, with seeds, switches and choices at their ends
+fn filter_extreme(number: f64) -> Value {
+    let mut params = json!({"seed": u64::MAX, "wrap": true, "applyToAlpha": true, "invert": true, "directions": 4, "divider": 1000});
+    for key in FILTER_NUMBER_KEYS {
+        params[*key] = json!(number);
+    }
+    for key in FILTER_LIGHT_KEYS {
+        params[*key] = json!({"azimuth": number, "elevation": number, "intensity": number});
+    }
+    params
+}
+
+/// Every library filter added on the content and on a mask with `hostile` and extreme parameters, edited to extremes, and rendered; then swapped to the same way
+fn hunt_filters(hostile: &[Value]) {
+    let extremes: Vec<Value> = [3.0e38, -3.0e38, 0.0].into_iter().map(filter_extreme).collect();
+
+    for def in texturecraft_engine::filter_lib::FILTERS {
+        let mut s = session();
+        execute(&mut s, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1], "roughness": 0.4})).unwrap();
+        for target in ["content", "mask"] {
+            if target == "mask" {
+                execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+            }
+
+            for given in hostile.iter().chain(&extremes) {
+                let mut params = if given.is_object() { given.clone() } else { json!({}) };
+                params["filter"] = json!(def.id);
+                params["target"] = json!(target);
+                let added = execute(&mut s, "effect.add.filter", &params).ok().and_then(|reply| reply["effect"].as_u64());
+                s.update();
+
+                // Extreme values are clamped, not refused, so every filter meets them on the content
+                if target == "content" && extremes.contains(given) {
+                    assert!(added.is_some(), "{} takes extreme values: {params}", def.id);
+                }
+                if let Some(effect) = added {
+                    for edit in &extremes {
+                        let mut edit = edit.clone();
+                        edit["effect"] = json!(effect);
+                        // Each accepted value reaches the compositor before the next edit replaces it
+                        if execute(&mut s, "effect.set", &edit).is_ok() {
+                            s.update();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    hunt_filter_swaps(hostile, &extremes);
+}
+
+/// An empty filter effect on the content and on a mask swapped through `effect.set` to every library filter with each of `hostile` and `extremes`, and rendered
+fn hunt_filter_swaps(hostile: &[Value], extremes: &[Value]) {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1], "roughness": 0.4})).unwrap();
+    for target in ["content", "mask"] {
+        if target == "mask" {
+            execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+        }
+        let added = execute(&mut s, "effect.add.filter", &json!({"filter": "none", "target": target})).unwrap();
+        let effect = added["effect"].as_u64().unwrap();
+
+        for def in texturecraft_engine::filter_lib::FILTERS {
+            for given in hostile.iter().chain(extremes) {
+                let mut params = if given.is_object() { given.clone() } else { json!({}) };
+                params["effect"] = json!(effect);
+                params["filter"] = json!(def.id);
+
+                // Emptied first, so each swap builds the filter anew rather than editing it in place
+                execute(&mut s, "effect.set", &json!({"effect": effect, "filter": "none"})).unwrap();
+                let _ = execute(&mut s, "effect.set", &params);
+                s.update();
+            }
         }
     }
 }
@@ -851,14 +1097,19 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
     assert_eq!((after[&Channel::BaseColor].mode, after[&Channel::BaseColor].opacity), (texturecraft_engine::core::BlendMode::Multiply, 0.25));
     assert_eq!((after[&Channel::Roughness].mode, after[&Channel::Roughness].opacity), (before[&Channel::Roughness].mode, 0.5));
     assert_eq!(after[&Channel::Metallic], before[&Channel::Metallic], "channels not listed stay as they were");
+
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
+
     assert_eq!(read(&s), before, "one undo step restores every listed channel");
+
     execute(&mut s, "edit.redo", &Value::Null).unwrap();
 
     // A channel the layer has disabled stays disabled
     execute(&mut s, "layer.blend", &json!({"layer": layer, "channel": "metallic", "enabled": false})).unwrap();
     execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"metallic": {"opacity": 0.1}}})).unwrap();
+
     assert!(!read(&s).contains_key(&Channel::Metallic));
+
     let stable = read(&s);
     for bad in [
         json!({"layer": layer}),
@@ -870,5 +1121,61 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
         assert_eq!(read(&s), stable, "an error changes nothing");
     }
     execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"baseColor": {"opacity": 2.0}, "roughness": {"opacity": -1.0}}})).unwrap();
+
     assert_eq!((read(&s)[&Channel::BaseColor].opacity, read(&s)[&Channel::Roughness].opacity), (1.0, 0.0), "opacity is clamped");
+}
+
+#[test]
+fn interleaved_sessions_render_depth_from_their_own_mesh() {
+    use texturecraft_engine::geom::{Mesh, glam::Vec3};
+
+    let make_mesh = |front_edge| {
+        let mut positions = vec![
+            Vec3::new(0.0, -1.0, 0.5),
+            Vec3::new(front_edge, -1.0, 0.5),
+            Vec3::new(front_edge, 1.0, 0.5),
+            Vec3::new(0.0, 1.0, 0.5),
+            Vec3::new(-1.0, -1.0, -0.5),
+            Vec3::new(1.0, -1.0, -0.5),
+            Vec3::new(1.0, 1.0, -0.5),
+            Vec3::new(-1.0, 1.0, -0.5),
+        ];
+        // Padding makes the old sampled key miss the front edge
+        positions.resize(200, Vec3::ZERO);
+        let mut uvs = vec![
+            Vec2::new(0.5, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.5, 1.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.5, 0.0),
+            Vec2::new(0.5, 1.0),
+            Vec2::new(0.0, 1.0),
+        ];
+        uvs.resize(positions.len(), Vec2::ZERO);
+        let normals = vec![Vec3::Z; positions.len()];
+        Mesh::from_parts(positions, Some(normals), uvs, vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7], "Two squares").unwrap()
+    };
+
+    let mut covered = Session::new_project("Covered", make_mesh(1.0), "squares", None, 128).unwrap();
+    let mut exposed = Session::new_project("Exposed", make_mesh(0.5), "squares", None, 128).unwrap();
+    let sample_rear_surface = |session: &Session| session.caches[0].composite.value(Channel::BaseColor, 56, 32);
+
+    for session in [&mut covered, &mut exposed] {
+        execute(session, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+        execute(
+            session,
+            "layer.fill.projection",
+            &json!({
+                "projection": "planar", "axis": 2, "depthCulling": true, "depthCullingHardness": 1.0,
+            }),
+        )
+        .unwrap();
+        session.update();
+    }
+
+    let hidden = sample_rear_surface(&covered);
+    let visible = sample_rear_surface(&exposed);
+    assert!((hidden[0] - hidden[1]).abs() < 0.05, "the rear surface is occluded: {hidden:?}");
+    assert!(visible[0] > visible[1] + 0.5, "the rear surface is exposed: {visible:?}");
 }

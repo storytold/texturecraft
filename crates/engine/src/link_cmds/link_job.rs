@@ -21,7 +21,7 @@ pub struct LinkJob {
     pub source_ext: &'static str,
     /// The named graph in a linked material; direct package imports use its default.
     pub graph: Option<String>,
-    /// Pixels across (the texture set's resolution).
+    /// Pixels across: the layer's picked resolution (default: the texture set's)
     pub size: u32,
     /// Every parameter's value, by id, in MaterialCraft's typed form.
     pub values: Map<String, Value>,

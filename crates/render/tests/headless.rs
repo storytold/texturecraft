@@ -762,16 +762,18 @@ fn warmth(img: &Img) -> f32 {
 fn imported_hdr_environment_lights_the_ball() {
     let Some((mut h, frame)) = setup() else { return };
     let base = render(&mut h, &frame, "env_default");
-    // A procedural HDR: a hot orange sky over a dim blue ground (values far above 1).
+    // A procedural HDR: a hot orange sky over a dim blue ground (values far above 1)
     let (w, hh) = (256u32, 128u32);
     let rgba = (0..w * hh).map(|i| if i / w < hh / 2 { [12.0, 4.0, 1.0, 1.0] } else { [0.02, 0.05, 0.2, 1.0] }).collect();
-    let sky = ImageRes { width: w, height: hh, rgba, srgb: false };
+    let sky = ImageRes::new(w, hh, rgba, false);
     h.renderer.set_environment(&h.device, &h.queue, "resource:sky.hdr", Some(&sky));
     let lit = render(&mut h, &frame, "env_hdr_resource");
     assert_ne!(lit.px, base.px, "the imported environment changes the lighting");
     assert!(warmth(&lit) > warmth(&base) + 10.0, "the orange sky tints the ball");
     assert!(lit.mean(200, 100, 280, 180) > 20.0, "lit, finite shading (NaNs would render black)");
+
     h.renderer.set_environment(&h.device, &h.queue, "Studio Soft", None);
+
     assert_eq!(render(&mut h, &frame, "env_default_again").px, base.px, "built-ins come back");
 }
 
@@ -1081,7 +1083,7 @@ fn spot_environment(dir: texturecraft_geom::glam::Vec3) -> ImageRes {
             if d.dot(dir) > 0.5 { [6.0, 6.0, 6.0, 1.0] } else { [0.02, 0.02, 0.02, 1.0] }
         })
         .collect();
-    ImageRes { width: w, height: hh, rgba, srgb: false }
+    ImageRes::new(w, hh, rgba, false)
 }
 
 #[test]

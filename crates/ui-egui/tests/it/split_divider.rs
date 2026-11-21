@@ -1,10 +1,12 @@
 //! The divider between the 3D and 2D views in the split layout resizes them and keeps the pointer from the views
 
-use egui::{Event, Modifiers, PointerButton, Pos2, pos2};
+use egui::{Event, Modifiers, PointerButton, Pos2, Role, pos2};
 use egui_kittest::Harness;
+use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::core::Channel;
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::state::UiState;
+use texturecraft_ui_egui::theme::GUTTER;
 use texturecraft_ui_egui::ui_state_store::UiStateStore;
 
 /// Narrowest a split view may get, as in `viewport.rs`
@@ -37,6 +39,9 @@ impl eframe::Storage for MemoryStorage {
 fn split_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+
+    // The Layers tab is found by its English name, whatever the OS language is
+    harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     harness
 }
@@ -55,6 +60,17 @@ fn drag(harness: &mut Harness<'_, TextureCraftApp>, button: PointerButton, from:
 
     harness.event(Event::PointerButton { pos: to, button, pressed: false, modifiers: Modifiers::NONE });
     harness.run_steps(3);
+}
+
+/// The views' right edge: a gutter left of the right column, whose Layers header starts at the column's left edge
+fn views_right(harness: &Harness<'_, TextureCraftApp>) -> f32 {
+    let column_left = harness
+        .get_all_by_role(Role::Tab)
+        .filter(|tab| tab.accesskit_node().label().is_some_and(|label| label.starts_with("Layers")))
+        .map(|tab| tab.rect().left())
+        .next()
+        .expect("the right column's Layers header");
+    column_left - f32::from(GUTTER)
 }
 
 /// The divider's x position: the 3D view ends 1 point left of it
@@ -111,21 +127,24 @@ fn dragging_the_divider_resizes_the_views_within_their_minimum_width() {
     let mut harness = split_app();
     let views_left = harness.state().viewport_rect.left();
     let start_x = divider_x(&harness);
-    let views_width = (start_x - views_left) * 2.0;
-    let views_right = views_left + views_width;
+    let views_right = views_right(&harness);
+    let views_width = views_right - views_left;
     let y = harness.state().viewport_rect.center().y;
     assert_eq!(harness.state().ui.split_ratio, 0.5);
 
     drag(&mut harness, PointerButton::Primary, pos2(start_x, y), pos2(start_x - 200.0, y));
+
     assert!((divider_x(&harness) - (start_x - 200.0)).abs() < 0.5, "follows the pointer: {}", divider_x(&harness));
     assert!((harness.state().ui.split_ratio - (start_x - 200.0 - views_left) / views_width).abs() < 1e-3);
 
     let x = divider_x(&harness);
     drag(&mut harness, PointerButton::Primary, pos2(x, y), pos2(views_left + 10.0, y));
+
     assert!((divider_x(&harness) - views_left - MIN_VIEW_WIDTH).abs() < 0.5, "clamped on the left: {}", divider_x(&harness));
 
     let x = divider_x(&harness);
     drag(&mut harness, PointerButton::Primary, pos2(x, y), pos2(views_right - 10.0, y));
+
     assert!((views_right - divider_x(&harness) - MIN_VIEW_WIDTH).abs() < 0.5, "clamped on the right: {}", divider_x(&harness));
 }
 
@@ -204,9 +223,8 @@ fn dragging_the_divider_keeps_the_uv_texture_size_and_offset_on_screen() {
         harness.state_mut().ui.uv_pan = [0.2, 0.1];
         harness.run_steps(2);
 
-        // The split starts centred, so the views end as far right of the divider as they start left of it
         let views_left = harness.state().viewport_rect.left();
-        let views_right = views_left + (divider_x(&harness) - views_left) * 2.0;
+        let views_right = views_right(&harness);
         let y = harness.state().viewport_rect.center().y;
         let before = uv_texture_on_screen(&harness, views_right);
 

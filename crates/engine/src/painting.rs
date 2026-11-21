@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use texturecraft_compose::PaintTarget;
+use texturecraft_compose::{MaskGray, PaintTarget};
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, Source};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_paint::{
@@ -189,6 +189,15 @@ impl Session {
         Some(Pickup::from_snapshot(PickupMode::Clone { offset: [0; 2] }, snapshot, self.caches.get(ts)?.gbuf.clone(), values.keys().copied()))
     }
 
+    /// What mask strokes paint: the tool's image while it is loaded, else its gray
+    pub(crate) fn mask_gray(&self) -> MaskGray {
+        let image = self.tool.mask_image.as_ref().and_then(|name| Some((name, self.images.get(name)?)));
+        match image {
+            Some((name, image)) => MaskGray::Image { name: name.clone(), image: image.clone() },
+            None => MaskGray::Value(self.tool.mask_value),
+        }
+    }
+
     fn stroke_values(&self, target: PaintTarget) -> BTreeMap<Channel, [f32; 3]> {
         let ts = self.ts();
         let Ok(set) = self.doc.project.texture_set(ts) else { return BTreeMap::new() };
@@ -332,6 +341,7 @@ impl Session {
             camera: self.camera,
             viewport,
             values,
+            mask_gray: self.mask_gray(),
             erase,
             stencil,
             before,
@@ -525,16 +535,17 @@ impl Session {
         let Some(st) = self.stroke.as_mut() else { return };
         let recent = std::mem::take(&mut st.canvas.recent);
         let (ts, target) = (st.ts, st.target);
-        let Some(t) = target else {
+        let Some(paint_target) = target else {
             self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
             return;
         };
+
         let gbuf = self.caches.get(ts).map(|c| c.gbuf.clone());
-        let (pixels, mask_value) = (&self.doc.pixels, self.tool.mask_value);
+        let pixels = &self.doc.pixels;
         let mut staging = std::mem::take(&mut st.staging);
-        with_commit_source(st, gbuf.as_deref(), &self.mesh, &recent, |src| match t {
+        with_commit_source(st, gbuf.as_deref(), &self.mesh, &recent, |src| match paint_target {
             PaintTarget::Layer(id) => staging.stage_layer(pixels, id, &st.values, &src),
-            PaintTarget::Mask(eid) => staging.stage_mask(pixels, eid, mask_value, &src),
+            PaintTarget::Mask(effect) => staging.stage_mask(pixels, effect, &st.mask_gray, &src),
         });
         st.staging = staging;
         self.mark_painted(ts, target, recent);
@@ -549,14 +560,14 @@ impl Session {
         let Some(mut st) = self.stroke.take() else { return Ok(()) };
         let size = (st.canvas.alpha.width(), st.canvas.alpha.height());
         if st.canvas.dirty.is_empty() {
-            // Nothing painted: drop any mask effect the stroke created.
+            // Nothing painted: drop any mask effect the stroke created
             self.doc = st.before;
             return Ok(());
         }
+
         let gbuf = self.caches.get(st.ts).map(|c| c.gbuf.clone());
         let mesh = self.mesh.clone();
         let mut staging = std::mem::take(&mut st.staging);
-        let mask_value = self.tool.mask_value;
         match st.target {
             Some(PaintTarget::Layer(id)) => {
                 let pixels = &mut self.doc.pixels;
@@ -564,7 +575,7 @@ impl Session {
             }
             Some(PaintTarget::Mask(eid)) => {
                 let pixels = &mut self.doc.pixels;
-                with_commit_source(&st, gbuf.as_deref(), &mesh, &st.canvas.dirty, |src| commit_mask(pixels, eid, size, mask_value, src, &mut staging));
+                with_commit_source(&st, gbuf.as_deref(), &mesh, &st.canvas.dirty, |src| commit_mask(pixels, eid, size, &st.mask_gray, src, &mut staging));
             }
             None => {
                 with_commit_source(&st, gbuf.as_deref(), &mesh, &st.canvas.dirty, |src| self.commit_quick_mask(st.ts, size, src));
@@ -578,8 +589,7 @@ impl Session {
         self.redo.clear();
         self.modified = true;
         self.revision = self.revision.wrapping_add(1);
-        // The live preview already shows the committed result: the stroke's tiles recomposite
-        // from the committed pixels at low priority, without holding up this frame.
+        // Recompute committed tiles at low priority because the live preview already shows them
         self.mark_settle(st.ts, st.target, st.canvas.dirty.iter().copied());
         Ok(())
     }
@@ -658,13 +668,24 @@ impl Session {
         let values = self.stroke_values(target);
         match target {
             PaintTarget::Layer(id) => commit_layer(&mut self.doc.pixels, id, size, &values, source, &mut Staging::default()),
-            PaintTarget::Mask(effect) => commit_mask(&mut self.doc.pixels, effect, size, self.tool.mask_value, source, &mut Staging::default()),
+            PaintTarget::Mask(effect) => {
+                let mask_gray = self.mask_gray();
+                commit_mask(&mut self.doc.pixels, effect, size, &mask_gray, source, &mut Staging::default())
+            }
         }
         Ok(())
     }
 
     /// Material picker: copy the material under the cursor into the tool's paint values
     pub fn color_pick(&mut self, screen: Vec2, viewport: Vec2) -> Result<BTreeMap<Channel, [f32; 3]>> {
+        let picked = self.color_at(screen, viewport)?;
+        self.tool.values.extend(&picked);
+        self.tool.material = None;
+        Ok(picked)
+    }
+
+    /// The composited value of every channel on the surface under `screen`, changing nothing (an eyedropper's read)
+    pub fn color_at(&self, screen: Vec2, viewport: Vec2) -> Result<BTreeMap<Channel, [f32; 3]>> {
         let hit = self.pick(screen, viewport).ok_or_else(|| EngineError::Other("nothing under the cursor".into()))?;
         let texture_set = self.texture_set_of_material(hit.material).unwrap_or(self.ts());
         let cache = self.caches.get(texture_set).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
@@ -674,10 +695,7 @@ impl Session {
 
         let tile = (x / texturecraft_texel::TILE, y / texturecraft_texel::TILE);
         let source = self.document_composite(texture_set, &[tile]).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
-        let picked: BTreeMap<_, _> = source.channels.keys().map(|&channel| (channel, source.value(channel, x, y))).collect();
-        self.tool.values.extend(&picked);
-        self.tool.material = None;
-        Ok(picked)
+        Ok(source.channels.keys().map(|&channel| (channel, source.value(channel, x, y))).collect())
     }
 
     /// The stroke canvas alpha of the active stroke (for overlays and tests).
