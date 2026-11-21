@@ -815,6 +815,13 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
             } else {
                 ramp = filter_value(e.spatial.y - 1u, texel.pixel).x;
             }
+            if e.spatial.z != 0u {
+                // A generator's region is stored as mask values before later effects read it.
+                mask = clamp(mask, 0.0, 1.0);
+                result = blend_scalar(u32(e.balance.z), mask, finish_generator(e, ramp));
+                mask = clamp(lerp(mask, result, weight), 0.0, 1.0);
+                continue;
+            }
             result = blend_scalar(u32(e.balance.z), mask, finish_generator(e, ramp));
         } else {
             result = scalar_filter(e, mask);

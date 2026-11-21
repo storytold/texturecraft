@@ -903,6 +903,7 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
     }
     let resolution = inputs.resolution;
     let cell = generator.resolution.cell(resolution, resolution);
+    op.spatial[2] = u32::from(generator.global.blur > 0.0 || generator.resolution.can_reduce());
     let blur = (generator.global.blur_radius_at(resolution).round() > 0.0)
         .then(|| Filter::Blur { radius: generator.global.blur_radius() })
         .and_then(|blur| NeighbourhoodFilter::new(&blur, resolution, resolution, 1.0, false));
@@ -1729,11 +1730,15 @@ mod procedural_tests {
             "AO override".into(),
             Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[0.15; 4], [0.7; 4], [0.85; 4], [0.3; 4]], srgb: false }),
         )]);
-        let mut mask = Mask::new(MaskBackground::White);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.58; 3]), projection: Projection::default() }));
         let mut effect = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
-        effect.blend = BlendMode::Multiply;
+        effect.blend = BlendMode::LinearDodge;
         effect.opacity = 0.83;
         mask.effects.push(effect);
+        let mut subtract = Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.22; 3]), projection: Projection::default() });
+        subtract.blend = BlendMode::Subtract;
+        mask.effects.push(subtract);
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 })));
         layer.mask = Some(mask);
         project.insert_layer(0, layer, None, false).unwrap();
@@ -1792,12 +1797,13 @@ mod procedural_tests {
             Filter::SlopeBlur { radius: 64.0, scale: 6.0, seed: 11 },
             Filter::Mosaic { size: 64.0 },
         ];
-        for filter in filters {
+        let cases = filters.into_iter().map(|filter| (filter, BlendMode::Normal)).chain([(Filter::Blur { radius: 64.0 }, BlendMode::Replace)]);
+        for (filter, blend) in cases {
             let mut project = Project::new("Neighbourhood filters", "builtin:plane");
             project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
             let owner = project.alloc_id();
             let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, &channels);
-            layer.channels.get_mut(&Channel::BaseColor).unwrap().mode = BlendMode::Replace;
+            layer.channels.get_mut(&Channel::BaseColor).unwrap().mode = blend;
             let mut mask = Mask::new(MaskBackground::Black);
             let mask_paint = project.alloc_id();
             mask.effects.push(Effect::new(mask_paint, EffectKind::Paint));
