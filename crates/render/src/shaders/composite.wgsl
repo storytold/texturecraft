@@ -13,7 +13,7 @@ struct Operation {
 struct Params {
     // Width, row count, top row, reserved texels per map.
     band: vec4<u32>,
-    // Source width, source height, display sampling step, glossiness workflow.
+    // Source width, source height, display sampling step, output mode (roughness, glossiness, mask).
     source: vec4<u32>,
     // Layer count, scratch row pitch, DisplayKind output bits, left column.
     program: vec4<u32>,
@@ -720,6 +720,15 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
             if any(pixel != sample_pixel) { mask_bakes = baked_at(pixel, 0).xyz; }
         }
     }
+    let index = id.y * params.program.y + id.x;
+    if params.source.w == 2u {
+        var gray = 0u;
+        if covered {
+            gray = u32(layer_mask(layers[0], pixel, uv, surface, mask_bakes) * 255.0 + 0.5);
+        }
+        output[index] = (gray * 0x00010101u) | 0xff000000u;
+        return;
+    }
     var base = vec3(0.5);
     var normal = vec3(0.5, 0.5, 1.0);
     var scalars = array<f32, 6>(1.0, 1.0, 0.5, 0.0, 0.5, 0.0);
@@ -774,7 +783,6 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
             scalars[destination - 1u] = lerp(old, blend_scalar(mode, old, source.x), weight);
         }
     }
-    let index = id.y * params.program.y + id.x;
     output[index] = pack_srgb(base, scalars[0]);
     let ao = clamp(display_ao * f32(to_u16(scalars[1])) / 65535.0, 0.0, 1.0);
     let roughness = select(to_u16(scalars[2]) >> 8u, 255u - (to_u16(lobe_values[8]) >> 8u), params.source.w != 0u);

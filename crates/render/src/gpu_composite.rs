@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, MaskBackground, ProceduralKind,
+    BakedMap, BlendMode, Channel, ChannelKind, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, ProceduralKind,
     Project, Projection, Source,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
@@ -103,12 +103,33 @@ impl CompositeRegion {
     }
 }
 
-/// The active stroke's GPU alpha and material values, sampled as part of its paint layer.
+/// The active stroke's GPU alpha, sampled in the corresponding paint layer or mask effect.
 pub struct LiveBrush {
-    pub layer: LayerId,
-    pub values: BTreeMap<Channel, [f32; 3]>,
+    pub target: LiveBrushTarget,
     pub opacity: f32,
     pub alpha: wgpu::TextureView,
+}
+
+pub enum LiveBrushTarget {
+    Layer { layer: LayerId, values: BTreeMap<Channel, [f32; 3]> },
+    Mask { effect: LayerId, value: f32 },
+}
+
+impl LiveBrush {
+    fn validate(&self, size: (u32, u32)) -> Result<(), &'static str> {
+        let alpha = self.alpha.texture();
+        if (alpha.width(), alpha.height()) != size || alpha.format() != wgpu::TextureFormat::R16Uint {
+            return Err("The live brush alpha does not match the texture set.");
+        }
+        let valid = match &self.target {
+            LiveBrushTarget::Layer { values, .. } => values.values().flatten().all(|v| v.is_finite()),
+            LiveBrushTarget::Mask { value, .. } => value.is_finite(),
+        };
+        if !valid || !self.opacity.is_finite() {
+            return Err("The live brush has invalid paint values.");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -126,6 +147,7 @@ pub struct CompositeProgram {
     baked: Option<BakedInputs>,
     display_outputs: u32,
     glossiness: bool,
+    mask_preview: bool,
 }
 
 fn display_bit(kind: DisplayKind) -> u32 {
@@ -162,7 +184,14 @@ fn channel_slot(channel: Channel) -> u32 {
 
 impl CompositeProgram {
     pub fn is_neutral(&self) -> bool {
-        !self.glossiness && self.layer_count == 0 && self.baked.as_ref().is_none_or(|baked| baked.maps[0].is_none() && baked.maps[1].is_none())
+        !self.mask_preview
+            && !self.glossiness
+            && self.layer_count == 0
+            && self.baked.as_ref().is_none_or(|baked| baked.maps[0].is_none() && baked.maps[1].is_none())
+    }
+
+    pub fn is_mask_preview(&self) -> bool {
+        self.mask_preview
     }
 
     pub(crate) fn writes_display(&self, kind: DisplayKind) -> bool {
@@ -171,7 +200,7 @@ impl CompositeProgram {
 
     /// Let the shader sample the nearest covered UV texel for island padding.
     pub fn set_coverage(&mut self, coverage: Arc<UvGBuffer>, radius: u32) {
-        self.coverage = Some((coverage, radius.min(15)));
+        self.coverage = Some((coverage, if self.mask_preview { 0 } else { radius.min(15) }));
     }
 
     /// Bind the authored images named by Tile Generator sources in this program.
@@ -184,8 +213,11 @@ impl CompositeProgram {
         if self.needs_surface {
             self.surface = Some((mesh.clone(), gbuf.clone()));
         }
+        if self.mask_preview {
+            self.set_coverage(gbuf.clone(), 0);
+        }
         self.baked = baked.map(BakedInputs::new).transpose()?.flatten();
-        if self.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some()) {
+        if !self.mask_preview && self.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some()) {
             self.display_outputs |= display_bit(DisplayKind::Normal);
         }
         Ok(())
@@ -218,13 +250,7 @@ impl CompositeProgram {
             return Err("UDIM texture sets use CPU compositing.");
         }
         if let Some(brush) = &brush {
-            let alpha = brush.alpha.texture();
-            if (alpha.width(), alpha.height()) != set.size() || alpha.format() != wgpu::TextureFormat::R16Uint {
-                return Err("The live brush alpha does not match the texture set.");
-            }
-            if !brush.opacity.is_finite() || brush.values.values().flatten().any(|v| !v.is_finite()) {
-                return Err("The live brush has invalid material values.");
-            }
+            brush.validate(set.size())?;
         }
         let mut operations = Vec::new();
         let mut paint = Vec::new();
@@ -257,35 +283,7 @@ impl CompositeProgram {
                 continue;
             }
             let mask_start = effects.len() as u32;
-            let mask_background = mask.map_or(1.0, |m| if m.background == MaskBackground::White { 1.0 } else { 0.0 });
-            if let Some(mask) = mask {
-                for effect in mask.effects.iter().filter(|e| e.visible) {
-                    let mut op = match &effect.kind {
-                        EffectKind::Fill { source, projection } => source_operation(Some(source), projection, [0.0; 3], ChannelKind::Scalar, &mut procedural)
-                            .ok_or("A mask fill source or projection uses CPU compositing.")?,
-                        EffectKind::Paint | EffectKind::Path(_) => {
-                            let Some(image) = pixels.masks.get(&effect.id).filter(|im| im.allocated_count() > 0) else { continue };
-                            if (image.width(), image.height()) != set.size() || image.comps() != 2 {
-                                return Err("A painted mask has a layout that uses CPU compositing.");
-                            }
-                            let image_index = paint.len() as u32;
-                            paint.push(image.clone());
-                            Operation { ids: [0, 10, image_index, 2], ..Operation::zeroed() }
-                        }
-                        EffectKind::Generator(generator) => generator_operation(generator).ok_or("A mask generator uses CPU compositing.")?,
-                        _ => point_effect(effect).ok_or("A mask effect uses CPU compositing.")?,
-                    };
-                    if !effect.opacity.is_finite() {
-                        return Err("A mask effect has an invalid opacity.");
-                    }
-                    if let EffectKind::Fill { source, .. } = &effect.kind {
-                        bind_tile_source(&mut op, Some(source), &mut tile_patterns);
-                    }
-                    op.low[3] = effect.opacity.clamp(0.0, 1.0);
-                    op.balance[2] = blend_code(effect.blend) as f32;
-                    effects.push(op);
-                }
-            }
+            let mask_background = compile_mask(mask, pixels, set.size(), brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
             let content_start = effects.len() as u32;
             let mask_count = content_start - mask_start;
             if mask_background == 0.0 && mask_count == 0 {
@@ -307,7 +305,10 @@ impl CompositeProgram {
                 return Err("An image source or decal uses CPU compositing.");
             }
 
-            let live_brush = brush.as_ref().filter(|brush| fill.is_none() && brush.layer == id);
+            let live_brush = brush.as_ref().and_then(|brush| match &brush.target {
+                LiveBrushTarget::Layer { layer, values } if fill.is_none() && *layer == id => Some((values, brush.opacity.clamp(0.0, 1.0))),
+                _ => None,
+            });
             for &(channel, _) in &set.channels {
                 let Some(blend) = layer.blend(channel) else { continue };
                 if blend.mode == BlendMode::Disable || blend.opacity <= 0.0 {
@@ -316,7 +317,7 @@ impl CompositeProgram {
                 if !blend.opacity.is_finite() {
                     return Err("A layer has an invalid opacity.");
                 }
-                let brush_value = live_brush.and_then(|brush| brush.values.get(&channel).map(|value| (*value, brush.opacity.clamp(0.0, 1.0))));
+                let brush_value = live_brush.and_then(|(values, opacity)| values.get(&channel).map(|value| (*value, opacity)));
                 let painted = if fill.is_none() {
                     let image = pixels.layer(id, channel).filter(|img| img.allocated_count() > 0);
                     if image.is_none() && brush_value.is_none() {
@@ -381,7 +382,7 @@ impl CompositeProgram {
         }
         let layer_count = operations.len() as u32;
         operations.extend(effects);
-        let needs_surface = operations.iter().any(|op| op.procedural[3] != 0 || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]));
+        let needs_surface = needs_surface(&operations);
         Ok(Self {
             operations,
             layer_count,
@@ -396,8 +397,113 @@ impl CompositeProgram {
             baked: None,
             display_outputs,
             glossiness: set.has_channel(Channel::Glossiness),
+            mask_preview: false,
         })
     }
+
+    /// Compose one layer's enabled mask into the standalone grayscale view.
+    pub fn try_compile_mask_preview(
+        project: &Project,
+        pixels: &PixelStore,
+        ts: usize,
+        owner: LayerId,
+        region: Option<CompositeRegion>,
+        brush: Option<LiveBrush>,
+    ) -> Result<Self, &'static str> {
+        let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
+        if !set.uv_tiles.is_empty() {
+            return Err("UDIM texture sets use CPU mask preview.");
+        }
+        let mask = project.layers.get(&project.mask_owner(owner)).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
+        let mask = mask.ok_or("The layer has no enabled mask.")?;
+        if let Some(brush) = &brush {
+            brush.validate(set.size())?;
+        }
+        let mut operations = vec![Operation::zeroed()];
+        let mut paint = Vec::new();
+        let mut procedural = ProceduralInputs { resolution: set.resolution, ramp_words: Vec::new() };
+        let mut tile_patterns = TilePatterns::default();
+        let background = compile_mask(Some(mask), pixels, set.size(), brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
+        operations[0].effects[1] = operations.len() as u32 - 1;
+        operations[0].balance[1] = background;
+        let needs_surface = needs_surface(&operations);
+        Ok(Self {
+            operations,
+            layer_count: 1,
+            paint,
+            ramp_words: procedural.ramp_words,
+            tile_patterns,
+            brush_alpha: brush.map(|brush| brush.alpha),
+            region,
+            coverage: None,
+            surface: None,
+            needs_surface,
+            baked: None,
+            // Reuse the first four-byte display slot for linear grayscale.
+            display_outputs: display_bit(DisplayKind::BaseColor),
+            glossiness: false,
+            mask_preview: true,
+        })
+    }
+}
+
+fn needs_surface(operations: &[Operation]) -> bool {
+    operations.iter().any(|op| op.procedural[3] != 0 || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]))
+}
+
+fn compile_mask(
+    mask: Option<&Mask>,
+    pixels: &PixelStore,
+    size: (u32, u32),
+    brush: Option<&LiveBrush>,
+    (paint, procedural, tile_patterns): (&mut Vec<TileImage>, &mut ProceduralInputs, &mut TilePatterns),
+    effects: &mut Vec<Operation>,
+) -> Result<f32, &'static str> {
+    let Some(mask) = mask else { return Ok(1.0) };
+    for effect in mask.effects.iter().filter(|e| e.visible) {
+        let mut op = match &effect.kind {
+            EffectKind::Fill { source, projection } => source_operation(Some(source), projection, [0.0; 3], ChannelKind::Scalar, procedural)
+                .ok_or("A mask fill source or projection uses CPU compositing.")?,
+            EffectKind::Paint | EffectKind::Path(_) => {
+                let live = brush.and_then(|brush| match &brush.target {
+                    LiveBrushTarget::Mask { effect: id, value } if *id == effect.id && matches!(effect.kind, EffectKind::Paint) => {
+                        Some((value.clamp(0.0, 1.0), brush.opacity.clamp(0.0, 1.0)))
+                    }
+                    _ => None,
+                });
+                let image = pixels.masks.get(&effect.id).filter(|im| im.allocated_count() > 0);
+                if image.is_none() && live.is_none() {
+                    continue;
+                }
+                if image.is_some_and(|image| (image.width(), image.height()) != size || image.comps() != 2) {
+                    return Err("A painted mask has a layout that uses CPU compositing.");
+                }
+                let image_index = image.map_or(NO_PAINT_IMAGE, |image| {
+                    let index = paint.len() as u32;
+                    paint.push(image.clone());
+                    index
+                });
+                let mut op = Operation { ids: [0, 10, image_index, 2], ..Operation::zeroed() };
+                if let Some((value, opacity)) = live {
+                    op.projection[3] = 1.0;
+                    op.uv = [value, value, value, opacity];
+                }
+                op
+            }
+            EffectKind::Generator(generator) => generator_operation(generator).ok_or("A mask generator uses CPU compositing.")?,
+            _ => point_effect(effect).ok_or("A mask effect uses CPU compositing.")?,
+        };
+        if !effect.opacity.is_finite() {
+            return Err("A mask effect has an invalid opacity.");
+        }
+        if let EffectKind::Fill { source, .. } = &effect.kind {
+            bind_tile_source(&mut op, Some(source), tile_patterns);
+        }
+        op.low[3] = effect.opacity.clamp(0.0, 1.0);
+        op.balance[2] = blend_code(effect.blend) as f32;
+        effects.push(op);
+    }
+    Ok(if mask.background == MaskBackground::White { 1.0 } else { 0.0 })
 }
 
 // Bytecode values used by composite.wgsl. Keep these stable if BlendMode is reordered.
@@ -931,17 +1037,17 @@ impl GpuCompositor {
         &mut self,
         gpu: (&wgpu::Device, &wgpu::Queue),
         program: &CompositeProgram,
-        target: (usize, (u32, u32), u32),
-        textures: [&wgpu::Texture; DisplayKind::ALL.len()],
+        target: (usize, (u32, u32), u32, Option<CompositeRegion>),
+        textures: &[&wgpu::Texture],
     ) -> Result<(), String> {
         let (device, queue) = gpu;
-        let (ts, source_size, shift) = target;
-        let base = textures[0];
+        let (ts, source_size, shift, region) = target;
+        let base = textures.first().ok_or("The GPU output textures are missing.")?;
         let extent = (base.width(), base.height());
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
-        let region = program.region.map(|r| r.viewport(shift, extent)).unwrap_or(CompositeRegion { min: [0; 2], max: [extent.0, extent.1] });
+        let region = region.map(|r| r.viewport(shift, extent)).unwrap_or(CompositeRegion { min: [0; 2], max: [extent.0, extent.1] });
         let width = region.max[0].saturating_sub(region.min[0]);
         let height = region.max[1].saturating_sub(region.min[1]);
         if width == 0 || height == 0 {
@@ -1042,7 +1148,7 @@ impl GpuCompositor {
                     source_size.0,
                     source_size.1,
                     1 << shift,
-                    u32::from(program.glossiness),
+                    if program.mask_preview { 2 } else { u32::from(program.glossiness) },
                     program.layer_count,
                     pitch,
                     program.display_outputs,
@@ -1086,7 +1192,7 @@ impl GpuCompositor {
                     pass.set_bind_group(0, &bindings, &[]);
                     pass.dispatch_workgroups(width.div_ceil(WORKGROUP), rows.div_ceil(WORKGROUP), 1);
                 }
-                for (texture, copy) in textures.into_iter().zip(copies) {
+                for (texture, copy) in textures.iter().copied().zip(copies) {
                     let Some((offset, bytes_per_texel)) = copy else { continue };
                     encoder.copy_buffer_to_texture(
                         wgpu::TexelCopyBufferInfo {
@@ -1353,6 +1459,7 @@ mod paint_window_tests {
             baked: None,
             display_outputs: 0,
             glossiness: false,
+            mask_preview: false,
         };
         let region = CompositeRegion { min: [0, 0], max: [128, 128] };
         let limit = 6 * 64 * 64 * 2 + 32;

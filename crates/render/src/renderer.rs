@@ -1605,9 +1605,12 @@ impl Renderer {
         stroke
     }
 
-    /// Paint a supported UV layer stack into the same display textures used by the viewport.
+    /// Composite a supported layer stack or standalone mask into the viewport's textures.
     /// Scratch holds one band. The final maps stay on the adapter for shading and mip generation.
     pub fn composite_on_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<(), String> {
+        if program.is_mask_preview() {
+            return self.composite_mask_preview(device, queue, ts, program);
+        }
         let set = self.sets.get(ts).ok_or("texture set does not exist")?;
         if program.is_neutral() {
             let textures = crate::gpu_trace::scoped(device, "empty GPU material", || {
@@ -1654,7 +1657,7 @@ impl Renderer {
                 })
                 .collect();
             let targets: &[Tex; DisplayKind::ALL.len()] = maps.as_slice().try_into().map_err(|_| "The GPU display textures are missing.")?;
-            compositor.compose((device, queue), program, (ts, set.size, set.shift), targets.each_ref().map(|target| &target.texture))?;
+            compositor.compose((device, queue), program, (ts, set.size, set.shift, program.region), &targets.each_ref().map(|target| &target.texture))?;
             maps.extend(set.tex.last().cloned());
             Ok::<_, String>((compositor, maps))
         })??;
@@ -1678,6 +1681,49 @@ impl Renderer {
             set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
             self.content_rev += 1;
         }
+        Ok(())
+    }
+
+    fn composite_mask_preview(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<(), String> {
+        if cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
+            return Err("GPU mask preview is unavailable on this device".into());
+        }
+        let set = self.sets.get(ts).ok_or("texture set does not exist")?;
+        let slot = DisplayKind::ALL.len();
+        let old = set.tex.get(slot).ok_or("The GPU aux texture is missing.")?;
+        let size = aux_size(set.size);
+        // Classic texture sets use the same power-of-two sampling in both axes.
+        let step = set.size.0 / size;
+        if !step.is_power_of_two() || set.size != (size * step, size * step) {
+            return Err("The mask preview layout uses CPU compositing.".into());
+        }
+        let shift = step.trailing_zeros();
+        let reuse = (old.texture.width(), old.texture.height()) == (size, size);
+        let region = if reuse { program.region } else { None };
+        let (compositor, tex) = crate::gpu_trace::scoped(device, "viewport GPU mask preview", || {
+            let mut compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
+            let tex = if reuse { old.clone() } else { Tex::new(device, "tc_gpu_mask_preview", size, size, wgpu::TextureFormat::Rgba8Unorm, mip_count(size)) };
+            compositor.compose((device, queue), program, (ts, set.size, shift, region), &[&tex.texture])?;
+            Ok::<_, String>((compositor, tex))
+        })??;
+        self.compositor = Some(compositor);
+        let set = &mut self.sets[ts];
+        set.pending[slot] = None;
+        set.failed[slot] = false;
+        if reuse {
+            let dirty = &mut set.mips_dirty[slot];
+            if let Some(region) = region {
+                let region = region.viewport(shift, (size, size));
+                if tex.mips > 1 {
+                    dirty.add(region.min[0], region.min[1], region.max[0], region.max[1]);
+                }
+            } else {
+                *dirty = MipsDirty::All;
+            }
+        } else {
+            install(set, slot, tex, device, &self.set_bgl, &self.sampler);
+        }
+        self.content_rev += 1;
         Ok(())
     }
 
@@ -1980,7 +2026,11 @@ impl Renderer {
 
     /// Size of the aux texture of a set (1 until a mesh map or mask was shown).
     pub fn aux_size(&self, ts: usize) -> Option<u32> {
-        self.sets.get(ts).and_then(|s| s.tex.last()).map(|t| t.texture.width())
+        self.aux_texture(ts).map(wgpu::Texture::width)
+    }
+
+    pub fn aux_texture(&self, ts: usize) -> Option<&wgpu::Texture> {
+        self.sets.get(ts).and_then(|s| s.tex.last()).map(|t| &t.texture)
     }
 
     fn generate_mips(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
