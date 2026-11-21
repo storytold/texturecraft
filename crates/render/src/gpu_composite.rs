@@ -26,9 +26,9 @@ const FIRST_GENERATOR: u32 = 40;
 const FIRST_EXTENDED_PATTERN: u32 = 48;
 pub(crate) const ROWS: u32 = 64;
 const WORKGROUP: u32 = 8;
-// Typical 8K patterns fit this budget; extreme overlap must use the incremental compositor.
-const MAX_TILE_WORK_PER_UPDATE: u64 = 8 << 30;
+// Keep extreme Tile Generator overlap from monopolizing a single dispatch or submission.
 const MAX_TILE_WORK_PER_BAND: u64 = 64 << 20;
+const MAX_TILE_WORK_PER_SUBMISSION: u64 = 256 << 20;
 const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
 
 #[derive(Debug)]
@@ -1082,11 +1082,13 @@ impl GpuCompositor {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        let band_rows = composite_band_rows(width, height, program.tile_work_per_pixel()?)?;
+        let tile_work = program.tile_work_per_pixel()?;
+        let (band_width, band_rows) = composite_band_size(width, tile_work);
+        let submit_budget = if band_width < width || band_rows < ROWS { MAX_TILE_WORK_PER_SUBMISSION } else { u64::MAX };
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
-        let pitch = width.next_multiple_of(64);
+        let pitch = band_width.next_multiple_of(64);
         let area = pitch * band_rows;
         let stride = u64::from(area) * 4;
         let mut words_per_pixel = 0;
@@ -1150,6 +1152,12 @@ impl GpuCompositor {
         let mut packed = Vec::new();
         let mut pending_bytes = 0;
         let mut last_submission = None;
+        let make_encoder = || device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite") });
+        let submit = |encoder: wgpu::CommandEncoder, bounds: CompositeRegion, submitted: &mut Option<CompositeRegion>| {
+            let submission = queue.submit([encoder.finish()]);
+            *submitted = Some(submitted.map_or(bounds, |region| region.union(bounds)));
+            submission
+        };
         for (chunk, window, words) in windows {
             let bytes = (words * 4) as u64;
             window.pack(&program.paint, words, &mut packed);
@@ -1168,11 +1176,21 @@ impl GpuCompositor {
             }
             let paint = self.paint_upload.as_ref().ok_or("paint upload buffer is missing")?;
             queue.write_buffer(paint, 0, bytemuck::cast_slice(&packed));
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite") });
-            let width = chunk.max[0] - chunk.min[0];
-            let left = chunk.min[0];
-            for top in (chunk.min[1]..chunk.max[1]).step_by(band_rows as usize) {
+            let mut encoder = make_encoder();
+            let mut work = 0u64;
+            let mut bounds: Option<CompositeRegion> = None;
+            let bands = (chunk.min[1]..chunk.max[1])
+                .step_by(band_rows as usize)
+                .flat_map(|top| (chunk.min[0]..chunk.max[0]).step_by(band_width as usize).map(move |left| (left, top)));
+            for (left, top) in bands {
+                let width = band_width.min(chunk.max[0] - left);
                 let rows = band_rows.min(chunk.max[1] - top);
+                let band_work = u64::from(width).saturating_mul(u64::from(rows)).saturating_mul(tile_work);
+                if let Some(written) = bounds.take_if(|_| work.saturating_add(band_work) > submit_budget) {
+                    let previous = std::mem::replace(&mut encoder, make_encoder());
+                    submit(previous, written, submitted);
+                    work = 0;
+                }
                 let values = [
                     width,
                     rows,
@@ -1234,21 +1252,25 @@ impl GpuCompositor {
                         wgpu::Extent3d { width, height: rows, depth_or_array_layers: 1 },
                     );
                 }
+                let band = CompositeRegion { min: [left, top], max: [left + width, top + rows] };
+                bounds = Some(bounds.map_or(band, |region| region.union(band)));
+                work = work.saturating_add(band_work);
             }
-            last_submission = Some(queue.submit([encoder.finish()]));
-            *submitted = Some(submitted.map_or(chunk, |region| region.union(chunk)));
+            if let Some(written) = bounds {
+                last_submission = Some(submit(encoder, written, submitted));
+            }
             pending_bytes += bytes;
         }
         Ok(())
     }
 }
 
-fn composite_band_rows(width: u32, height: u32, tile_work_per_pixel: u64) -> Result<u32, &'static str> {
-    let work_per_row = u64::from(width).saturating_mul(tile_work_per_pixel);
-    if work_per_row.saturating_mul(u64::from(height)) > MAX_TILE_WORK_PER_UPDATE {
-        return Err("Tile Generator overlap exceeds the GPU compositor's interactive work budget.");
-    }
-    Ok((MAX_TILE_WORK_PER_BAND / work_per_row.max(1)).clamp(1, u64::from(ROWS)) as u32)
+fn composite_band_size(width: u32, tile_work_per_pixel: u64) -> (u32, u32) {
+    let texels = MAX_TILE_WORK_PER_BAND / tile_work_per_pixel.max(1);
+    // Leave room for a full workgroup of rows when a costly pattern needs narrower bands.
+    let width = width.min((texels / u64::from(WORKGROUP)).max(1) as u32);
+    let rows = (texels / u64::from(width)).clamp(1, u64::from(ROWS)) as u32;
+    (width, rows)
 }
 
 /// Split only when the paint for this viewport window exceeds the device budget. Include a
@@ -1299,7 +1321,7 @@ mod procedural_tests {
     use texturecraft_texel::{srgb_lut, to_u16};
 
     #[test]
-    fn tile_generator_budget_uses_overlap_and_display_region() {
+    fn tile_generator_band_size_budgets_overlapping_work_at_8k() {
         use texturecraft_core::{TileGenerator, TileSizeMode};
 
         let mut patterns = TilePatterns::default();
@@ -1310,9 +1332,10 @@ mod procedural_tests {
         let regular_work = patterns.work_per_sample(normal).unwrap();
         let overlapping_work = patterns.work_per_sample(overlapping).unwrap();
 
-        assert_eq!(composite_band_rows(8192, 8192, regular_work), Ok(ROWS));
-        assert!(composite_band_rows(8192, 8192, overlapping_work).is_err());
-        assert!(composite_band_rows(256, 256, overlapping_work).is_ok_and(|rows| rows < ROWS));
+        assert_eq!(composite_band_size(8192, regular_work), (8192, ROWS));
+        let (width, rows) = composite_band_size(8192, overlapping_work);
+        assert!(width < 8192 && rows < ROWS);
+        assert!(u64::from(width) * u64::from(rows) * overlapping_work <= MAX_TILE_WORK_PER_BAND);
     }
 
     #[test]
