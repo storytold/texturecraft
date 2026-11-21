@@ -220,7 +220,6 @@ impl Session {
         s.sync_images();
         s.load_bake_meshes(pf.high_poly, pf.cage);
         s.load_bake_paint(pf.bake_paint);
-        s.log.warnings("Project", pf.warnings);
         s.log.performance(format!(
             "CPU project setup: mesh {} ms, UV and mesh indexes {} ms, resources {} ms ({} texture sets)",
             (mesh_time - start).num_milliseconds(),
@@ -228,6 +227,7 @@ impl Session {
             (chrono::Utc::now() - cache_time).num_milliseconds(),
             s.caches.len()
         ));
+        s.log.warnings("Project", pf.warnings);
 
         Ok(s)
     }
