@@ -208,6 +208,7 @@ struct ProceduralInputs {
 struct AnchorInputs {
     visible: BTreeMap<LayerId, (u32, bool)>,
     reads: Vec<(u32, Channel)>,
+    draw_ranges: Vec<std::ops::Range<u32>>,
     next: u32,
 }
 
@@ -316,12 +317,20 @@ impl FilterPlan {
             plan.add_stack(effects, content, content_count, index as u32, false, layer.ids[0] == channel_slot(Channel::Height), inputs);
             layer.spatial[..3].copy_from_slice(&[first as u32, u32::from(first != plan.stages.len()), u32::from(mask_has_fields)]);
         }
-        // Anchors can pass the influence of a painted texel through several different layers.
-        // A full update preserves those dependencies across each expanded field.
+        // An anchor can carry a filter's footprint into the next layer. Independent
+        // channels within a layer share a footprint instead of adding to one another.
         if !inputs.anchors.reads.is_empty() {
-            plan.reach = plan.stages.iter().fold(0u32, |reach, stage| {
-                reach.saturating_add(stage.filter.map_or(0, NeighbourhoodFilter::reach)).saturating_add(if stage.cell > 1 { stage.cell * 2 } else { 0 })
+            let mut draw_reach = BTreeMap::<(u32, bool), u32>::new();
+            for stage in &plan.stages {
+                let reach = draw_reach.entry((stage.layer, stage.preceding & MASK_STAGE != 0)).or_default();
+                *reach =
+                    reach.saturating_add(stage.filter.map_or(0, NeighbourhoodFilter::reach)).saturating_add(if stage.cell > 1 { stage.cell * 2 } else { 0 });
+            }
+            let across_layers = inputs.anchors.draw_ranges.iter().fold(0u32, |reach, range| {
+                let layer = draw_reach.range((range.start, false)..(range.end, false)).map(|(_, reach)| *reach).max().unwrap_or(0);
+                reach.saturating_add(layer)
             });
+            plan.reach = plan.reach.max(across_layers);
         }
         plan
     }
@@ -374,7 +383,7 @@ impl FilterPlan {
     }
 
     fn expand(&self, region: Option<CompositeRegion>) -> Option<CompositeRegion> {
-        if self.anchor_slots.is_empty() { region.map(|region| region.expanded(self.reach)) } else { None }
+        region.map(|region| region.expanded(self.reach))
     }
 
     fn words(&self, area: u64) -> u64 {
@@ -831,10 +840,9 @@ impl CompositeProgram {
             }
             if first_op != operations.len() {
                 mask_layers.insert(id, first_op as u32);
-            } else if mask
-                .as_ref()
-                .is_some_and(|mask| mask.effects.iter().any(|effect| effect.visible && (effect.reads_anchor() || matches!(effect.kind, EffectKind::Anchor))))
-            {
+            } else if mask.as_ref().is_some_and(|mask| {
+                mask.effects.iter().any(|effect| effect.visible && (!effect.kind.anchors_read().is_empty() || matches!(effect.kind, EffectKind::Anchor)))
+            }) {
                 // A layer with no display channels can still publish anchors in its mask.
                 mask_layers.insert(id, first_op as u32);
                 operations.push(Operation {
@@ -844,6 +852,14 @@ impl CompositeProgram {
                     constraints: [geometry_mask, 0, 0, 0],
                     ..Operation::zeroed()
                 });
+            }
+            procedural.anchors.draw_ranges.push(first_op as u32..operations.len() as u32);
+            if !content_anchors.is_empty() {
+                let has_channels =
+                    set.channels.iter().any(|&(channel, _)| layer.blend(channel).is_some_and(|blend| blend.mode != BlendMode::Disable && blend.opacity > 0.0));
+                if !has_channels && mask.is_none_or(|mask| !mask.effects.iter().any(|effect| effect.visible && matches!(effect.kind, EffectKind::Anchor))) {
+                    continue;
+                }
             }
             for (anchor, cut) in content_anchors {
                 let publication = procedural.anchors.publish(anchor, false);
@@ -920,7 +936,7 @@ impl CompositeProgram {
         let owner = project.mask_owner(owner);
         let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
         let mask = mask.ok_or("The layer has no enabled mask.")?;
-        if mask.effects.iter().any(|effect| effect.visible && effect.reads_anchor()) {
+        if mask.effects.iter().any(|effect| effect.visible && !effect.kind.anchors_read().is_empty()) {
             let mut program = Self::try_compile_with_brush(project, pixels, ts, region, brush)?;
             program.mask_layer = *program.mask_layers.get(&owner).ok_or("The mask's GPU anchor stack is missing.")?;
             program.mask_preview = true;
