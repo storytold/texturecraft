@@ -2356,6 +2356,39 @@ fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     let brush = &app.session.tool.brush;
     let (current, image, hardness) = (brush.alpha, brush.alpha_image.clone(), brush.hardness);
     let library = if image.is_none() { brush.alpha_library.as_deref().and_then(alphas::find) } else { None };
+
+    // Active alpha shape preview
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), Sense::hover());
+        ui.painter().rect_filled(rect, 4.0, tk.viewport);
+        ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0, tk.separator), egui::StrokeKind::Inside);
+        let inner = rect.shrink(4.0);
+        if let Some(name) = &image {
+            if let Some(img) = app.session.images.get(name) {
+                let tex = app.thumbs.image(ui.ctx(), name, img);
+                ui.painter().image(tex.id(), inner, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+        } else if let Some(a) = library {
+            if let Some(tex) = app.thumbs.alpha(ui.ctx(), a) {
+                ui.painter().image(tex.id(), inner, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+        } else {
+            crate::thumbs::paint_alpha(ui.painter(), inner, current, hardness);
+        }
+        ui.vertical(|ui| {
+            let label = if image.is_some() {
+                image.as_deref().unwrap_or_default().to_string()
+            } else if let Some(a) = library {
+                a.label.clone()
+            } else {
+                tr(current.label())
+            };
+            ui.label(RichText::new(label).strong());
+            ui.label(RichText::new(tr("Active alpha preview")).size(10.0).color(tk.text_dim));
+        });
+    });
+    ui.add_space(4.0);
+
     let mut pick = None;
     let zone = ui.horizontal_wrapped(|ui| {
         for a in BrushAlpha::ALL {
