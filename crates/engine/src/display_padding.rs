@@ -58,13 +58,19 @@ impl DisplayPadding {
         self.mixed.clone()
     }
 
+    /// Whether applying CPU viewport padding can proceed without waiting for the dense map.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn is_ready(&self) -> bool {
+        self.mixed.is_none() || self.dense.get().is_some()
+    }
+
     /// Start the dense CPU fallback on a worker so the viewport can keep drawing.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn prepare_on_worker(&mut self) -> bool {
-        let Some(gbuf) = self.mixed.as_ref() else { return true };
-        if self.dense.get().is_some() {
+        if self.is_ready() {
             return true;
         }
+        let Some(gbuf) = self.mixed.as_ref() else { return true };
         if !self.worker_started {
             let (gbuf, dense, block) = (gbuf.clone(), self.dense.clone(), self.block);
             self.worker_started = std::thread::Builder::new()

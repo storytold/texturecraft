@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use texturecraft_compose::BakedMaps;
 use texturecraft_core::{BakeResolution, CurvatureMethod};
 use texturecraft_geom::primitives;
+use web_time::Instant;
 
 use crate::commands::{CommandSpec, always, bad, boolp, strp, u64p};
 use crate::materials::Place;
@@ -91,9 +92,9 @@ pub fn sample_session(resolution: u32, bake_resolution: u32) -> Result<Session> 
 }
 
 fn sample(s: &mut Session, _: &Value) -> Result<Value> {
-    let started = chrono::Utc::now();
+    let started = Instant::now();
     let mut next = sample_session(2048, 1024)?;
-    next.log.performance(format!("Sample project setup and mesh-map baking completed in {} ms", (chrono::Utc::now() - started).num_milliseconds()));
+    next.log.performance(format!("Sample project setup and mesh-map baking completed in {} ms", started.elapsed().as_millis()));
     s.switch_to(next);
     Ok(crate::inspect::session(s))
 }

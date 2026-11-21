@@ -4694,6 +4694,7 @@ dependencies = [
  "texturecraft-texel",
  "thiserror 2.0.21",
  "tokio",
+ "web-time",
  "zip",
 ]
 
