@@ -30,10 +30,15 @@ pub struct SurfaceHit {
 
 /// Pick the mesh at a viewport pixel (origin top-left).
 pub fn pick(ctx: &PickCtx, screen: Vec2) -> Option<SurfaceHit> {
+    pick_filtered(ctx, screen, &|_| true)
+}
+
+/// Pick the closest triangle accepted by `include` at a viewport pixel (origin top-left).
+pub fn pick_filtered(ctx: &PickCtx, screen: Vec2, include: &dyn Fn(u32) -> bool) -> Option<SurfaceHit> {
     let vp = ctx.viewport.max(Vec2::ONE);
     let ndc = Vec2::new(screen.x / vp.x * 2.0 - 1.0, 1.0 - screen.y / vp.y * 2.0);
     let ray = ctx.camera.ray(ndc, vp.x / vp.y);
-    let hit = ctx.bvh.closest(ray.origin, ray.dir, f32::MAX)?;
+    let hit = ctx.bvh.closest_filtered(ray.origin, ray.dir, f32::MAX, include)?;
     let s = surface_at(ctx.mesh, hit.tri, hit.u, hit.v)?;
     Some(SurfaceHit { pos: s.pos, nrm: s.nrm, tri: hit.tri, uv: s.uv, material: ctx.mesh.material_of(hit.tri as usize).unwrap_or(0), screen })
 }

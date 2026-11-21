@@ -464,6 +464,8 @@ pub(crate) struct ActiveStroke {
     pub target: Option<PaintTarget>,
     pub stroke: Stroke,
     pub canvas: StrokeCanvas,
+    /// Visible scene captured when a 3D stroke started. UV strokes use the full mesh.
+    pub bvh: Arc<Bvh>,
     /// Camera visibility for 3D strokes (None for strokes in the 2D view).
     pub depth: Option<Arc<EyeDepth>>,
     /// 2D view strokes: where the stroke is between samples.
@@ -482,9 +484,6 @@ pub(crate) struct ActiveStroke {
     pub device: Option<Box<dyn crate::brush_device::DeviceStroke>>,
     pub device_uv_stamps: Vec<texturecraft_paint::UvStamp>,
 }
-
-/// A stroke visibility buffer and what it was rendered for: camera, size, mesh id.
-pub(crate) type DepthCache = (OrbitCamera, (u32, u32), u64, Arc<EyeDepth>);
 
 /// History labels that name a layer, a path number or a smart mask: the UI translates the
 /// template and fills the value in (the control channel and `edit.history` keep the English label).
@@ -600,9 +599,8 @@ pub struct Session {
     pub log: crate::log::SessionLog,
     /// Changes when the session and its log are replaced, including mesh reimport.
     pub log_id: u64,
-    /// The last stroke's camera visibility buffer: reused while the camera, view size and mesh
-    /// are unchanged, so back-to-back dabs start instantly.
-    pub(crate) depth_cache: Option<DepthCache>,
+    /// Reuses the visible geometry and camera depth across 3D strokes.
+    pub(crate) stroke_visibility: Option<crate::painting::StrokeVisibility>,
     /// The polygon fill box being dragged
     pub(crate) polygon_fill_drag: Option<crate::polygon_fill_drag::PolygonFillDrag>,
     /// The user's export presets (kept when another project opens).
@@ -673,7 +671,7 @@ impl Session {
             revision: 1,
             log: crate::log::SessionLog::new(),
             log_id: next_mesh_id(),
-            depth_cache: None,
+            stroke_visibility: None,
             polygon_fill_drag: None,
             export_presets: Default::default(),
             brush_presets: Default::default(),
@@ -948,7 +946,7 @@ impl Session {
         }
         self.mesh = tiled_mesh(&self.source, &self.doc.project);
         self.mesh_id = next_mesh_id();
-        self.depth_cache = None;
+        self.stroke_visibility = None;
         for ts in changed {
             if let (Some(c), Some(set)) = (self.caches.get_mut(ts), self.doc.project.texture_sets.get(ts)) {
                 *c = SetCache::new(&self.mesh, set);

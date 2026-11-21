@@ -81,13 +81,29 @@ fn area(lo: Vec3, hi: Vec3) -> f32 {
 
 impl Bvh {
     pub fn new(mesh: &Mesh) -> Bvh {
+        Self::build(mesh, None)
+    }
+
+    /// Build a BVH for only the selected triangles, retaining their original mesh indices.
+    pub fn new_filtered(mesh: &Mesh, include: impl Fn(usize) -> bool) -> Bvh {
+        Self::build(mesh, Some(&include))
+    }
+
+    fn build(mesh: &Mesh, include: Option<&dyn Fn(usize) -> bool>) -> Bvh {
         let triangle_count = mesh.triangle_count();
-        let mut tris = Vec::with_capacity(triangle_count);
+        let mut tris = Vec::with_capacity(if include.is_some() { 0 } else { triangle_count });
+        let mut original_indices = Vec::new();
 
         for triangle in 0..triangle_count {
+            if include.is_some_and(|include| !include(triangle)) {
+                continue;
+            }
             let Some([a, b, c]) = mesh.tri(triangle) else { continue };
             let position = |i: usize| mesh.positions.get(i).copied().unwrap_or(Vec3::ZERO);
             tris.push([position(a), position(b), position(c)]);
+            if include.is_some() {
+                original_indices.push(triangle as u32);
+            }
         }
 
         let mut order: Vec<u32> = (0..tris.len() as u32).collect();
@@ -223,6 +239,11 @@ impl Bvh {
         }
 
         let tris = order.iter().map(|t| tris[*t as usize]).collect();
+        if include.is_some() {
+            for triangle in &mut order {
+                *triangle = original_indices[*triangle as usize];
+            }
+        }
         Bvh { nodes, tris, order }
     }
 

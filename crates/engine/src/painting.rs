@@ -2,13 +2,15 @@
 //! and the material picker. The UI, CLI and agents all go through these.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use texturecraft_compose::PaintTarget;
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, Source};
 use texturecraft_geom::glam::Vec2;
+use texturecraft_geom::{Bvh, Mesh, OrbitCamera};
 use texturecraft_paint::{
     CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask, pick,
-    rasterize,
+    pick_filtered, rasterize,
 };
 use texturecraft_texel::{TILE, TILE_AREA};
 
@@ -38,25 +40,63 @@ const MAX_UV_STAMPS_PER_SAMPLE: usize = 150_000;
 /// Limit CPU-side storage for projected color to one readback batch.
 const PROJECTION_READBACK_BATCH: usize = 128;
 
-impl Session {
-    /// Camera visibility for a stroke at `viewport` (cached until the camera, size or mesh change).
-    fn eye_depth(&mut self, viewport: Vec2) -> std::sync::Arc<EyeDepth> {
-        let size = ((viewport.x / 2.0).max(64.0) as u32, (viewport.y / 2.0).max(64.0) as u32);
-        if let Some((cam, sz, mesh, depth)) = &self.depth_cache
-            && *cam == self.camera
-            && *sz == size
-            && *mesh == self.mesh_id
-        {
-            return depth.clone();
+pub(crate) struct StrokeVisibility {
+    mesh_id: u64,
+    hidden_materials: BTreeSet<usize>,
+    bvh: Arc<Bvh>,
+    camera: OrbitCamera,
+    size: (u32, u32),
+    depth: Arc<EyeDepth>,
+}
+
+/// Material lookup in mesh order, with the same first range taking priority as `Mesh::material_of`.
+fn visible_triangle_mask(mesh: &Mesh, hidden_materials: &BTreeSet<usize>) -> Vec<bool> {
+    let mut shown = vec![!hidden_materials.contains(&0); mesh.triangle_count()];
+    for submesh in mesh.submeshes.iter().rev() {
+        let start = submesh.start.div_ceil(3) as usize;
+        let end = (submesh.start.saturating_add(submesh.count).div_ceil(3) as usize).min(shown.len());
+        if let Some(range) = shown.get_mut(start..end) {
+            range.fill(!hidden_materials.contains(&submesh.material));
         }
-        let depth = std::sync::Arc::new(EyeDepth::render(&self.mesh, &self.camera, size.0, size.1));
-        self.depth_cache = Some((self.camera, size, self.mesh_id, depth.clone()));
-        depth
+    }
+    shown
+}
+
+impl Session {
+    /// The same visible triangles are used for picking, exact occlusion rays and camera depth.
+    fn stroke_visibility(&mut self, viewport: Vec2) -> (Arc<Bvh>, Arc<EyeDepth>) {
+        let size = ((viewport.x / 2.0).max(64.0) as u32, (viewport.y / 2.0).max(64.0) as u32);
+        let hidden_materials = self.doc.project.texture_sets.iter().filter(|set| !set.visible).map(|set| set.material).collect::<BTreeSet<_>>();
+        let cached = self.stroke_visibility.as_ref().filter(|scene| scene.mesh_id == self.mesh_id && scene.hidden_materials == hidden_materials);
+        if let Some(scene) = cached.filter(|scene| scene.camera == self.camera && scene.size == size) {
+            return (scene.bvh.clone(), scene.depth.clone());
+        }
+
+        let (bvh, depth) = if hidden_materials.is_empty() {
+            (self.bvh.clone(), EyeDepth::render(&self.mesh, &self.camera, size.0, size.1))
+        } else {
+            let shown = visible_triangle_mask(&self.mesh, &hidden_materials);
+            let include = |triangle| shown.get(triangle).copied().unwrap_or(false);
+            let bvh = cached.map_or_else(|| Arc::new(Bvh::new_filtered(&self.mesh, include)), |scene| scene.bvh.clone());
+            (bvh, EyeDepth::render_filtered(&self.mesh, &self.camera, size.0, size.1, include))
+        };
+        let depth = Arc::new(depth);
+        self.stroke_visibility =
+            Some(StrokeVisibility { mesh_id: self.mesh_id, hidden_materials, bvh: bvh.clone(), camera: self.camera, size, depth: depth.clone() });
+        (bvh, depth)
     }
 
     pub fn pick(&self, screen: Vec2, viewport: Vec2) -> Option<SurfaceHit> {
         let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &self.camera, viewport };
-        pick(&ctx, screen)
+        let sets = &self.doc.project.texture_sets;
+        if sets.iter().all(|set| set.visible) {
+            pick(&ctx, screen)
+        } else {
+            pick_filtered(&ctx, screen, &|triangle| {
+                let material = self.mesh.material_of(triangle as usize).unwrap_or(0);
+                sets.iter().find(|set| set.material == material).is_none_or(|set| set.visible)
+            })
+        }
     }
 
     /// The texture set that paints mesh material `material` (a [`SurfaceHit::material`])
@@ -270,7 +310,12 @@ impl Session {
             return Err(EngineError::Other(msg.into()));
         }
 
-        let depth = (!uv_mode).then(|| self.eye_depth(viewport));
+        let (bvh, depth) = if uv_mode {
+            (self.bvh.clone(), None)
+        } else {
+            let (bvh, depth) = self.stroke_visibility(viewport);
+            (bvh, Some(depth))
+        };
         let stroke = Stroke::new(&self.tool.brush, &self.mesh);
         let mut canvas = StrokeCanvas::new(size.0, size.1);
         if !quick_mask {
@@ -348,7 +393,7 @@ impl Session {
             }) {
             let surface = crate::brush_device::BrushSurface {
                 mesh: self.mesh.clone(),
-                bvh: self.bvh.clone(),
+                bvh: bvh.clone(),
                 uv: cache.gbuf.clone(),
                 material: self.doc.project.texture_set(ts)?.material,
                 depth: depth.clone(),
@@ -378,6 +423,7 @@ impl Session {
             target,
             stroke,
             canvas,
+            bvh,
             depth,
             uv: uv_mode.then(UvStrokeState::default),
             camera: self.camera,
@@ -568,7 +614,7 @@ impl Session {
         let Some(st) = self.stroke.as_mut() else { return false };
         let Some(cache) = self.caches.get_mut(st.ts) else { return false };
         let material = self.doc.project.texture_sets.get(st.ts).map(|t| t.material).unwrap_or(0);
-        let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &st.camera, viewport: st.viewport };
+        let ctx = PickCtx { mesh: &self.mesh, bvh: &st.bvh, camera: &st.camera, viewport: st.viewport };
         let stamps = st.stroke.add(&ctx, screen, pressure);
         let hit = st.stroke.last_hit().is_some();
         if stamps.is_empty() {
@@ -576,7 +622,7 @@ impl Session {
         }
         let rctx = RasterCtx {
             mesh: &self.mesh,
-            bvh: &self.bvh,
+            bvh: &st.bvh,
             gbuf: &cache.gbuf,
             material,
             depth: st.depth.as_deref(),
@@ -683,7 +729,7 @@ impl Session {
                 } else {
                     let context = RasterCtx {
                         mesh: &self.mesh,
-                        bvh: &self.bvh,
+                        bvh: &stroke.bvh,
                         gbuf: &cache.gbuf,
                         material: self.doc.project.texture_sets.get(stroke.ts).map_or(0, |set| set.material),
                         depth: stroke.depth.as_deref(),

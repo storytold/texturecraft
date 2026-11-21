@@ -1254,6 +1254,69 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn hiding_a_texture_set_lets_the_brush_reach_the_surface_behind_it() {
+        use texturecraft_engine::geom::glam::Vec3;
+
+        let check = |device: Option<Arc<dyn brush_device::BrushDevice>>| {
+            let mut floor = primitives::plane(2.0, 1);
+            floor.materials[0] = "Floor".into();
+            let mut mesh = primitives::plane(1.0, 1);
+            mesh.materials[0] = "Shelf".into();
+            for point in &mut mesh.positions {
+                *point = Vec3::new(point.x - 0.5, 0.15, point.z * 2.0);
+            }
+            mesh.append(&floor);
+
+            let mut session = Session::new_project("Overlap", mesh, "two planes", None, 128).unwrap();
+            session.viewport = Vec2::splat(400.0);
+            session.camera.yaw = 0.0;
+            session.camera.pitch = 85.0_f32.to_radians();
+            execute(&mut session, "textureSet.select", &json!({"ts": 1})).unwrap();
+            if let Some(device) = &device {
+                session.brush_device = Some(brush_device::BrushBackend { device: device.clone(), surface: Arc::downgrade(&session.caches[1].gbuf) });
+            }
+            let layer = session.selected_layer().unwrap();
+            execute(&mut session, "tool.brush", &json!({"size": 10, "hardness": 100, "flow": 100})).unwrap();
+            execute(&mut session, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [1.0, 0.0, 0.0]})).unwrap();
+
+            let screen = |session: &Session, x, z| {
+                let p = session.camera.project(Vec3::new(x, 0.0, z), 1.0).unwrap();
+                Vec2::new(p.x + 1.0, 1.0 - p.y) * (session.viewport * 0.5)
+            };
+            let alpha = |session: &Session, x, z| {
+                let texel = ((Vec2::new(x, z) * 0.5 + Vec2::splat(0.5)) * 128.0).as_uvec2();
+                session.doc.pixels.layer(layer, Channel::BaseColor).map_or(0, |image| image.get(texel.x, texel.y)[3])
+            };
+
+            for (shelf_visible, z) in [(true, -0.55), (false, 0.0), (true, 0.55)] {
+                execute(&mut session, "textureSet.visible", &json!({"ts": 0, "visible": shelf_visible})).unwrap();
+                let under_shelf = screen(&session, -0.65, z);
+                assert_eq!(session.texture_set_at(under_shelf, session.viewport), Some(usize::from(!shelf_visible)));
+                assert!(session.begin_stroke(under_shelf, session.viewport, 1.0).unwrap());
+                assert_eq!(session.device_stroke().is_some(), device.is_some());
+                session.end_stroke().unwrap();
+                assert_eq!(alpha(&session, -0.65, z) > 0, !shelf_visible, "the stroke starts on the floor when the shelf is hidden");
+
+                // The stamp starts on the open floor, but its footprint also reaches under the shelf.
+                let center = screen(&session, 0.03, z);
+                assert!(session.begin_stroke(center, session.viewport, 1.0).unwrap());
+                assert_eq!(session.device_stroke().is_some(), device.is_some());
+                session.end_stroke().unwrap();
+                assert!(alpha(&session, 0.08, z) > 0, "the uncovered part always takes paint");
+                assert_eq!(alpha(&session, -0.08, z) > 0, !shelf_visible, "the shelf only occludes the brush when visible");
+            }
+
+            assert!(session.log.iter().all(|entry| !entry.message.contains("GPU stroke readback failed")));
+        };
+
+        check(None);
+        if let Ok(gpu) = Headless::new() {
+            check(Some(Arc::new(HeadlessBrush(Mutex::new(gpu)))));
+        }
+    }
+
     pub(crate) fn link() -> GpuLink {
         GpuLink {
             reset: Arc::default(),
