@@ -928,7 +928,9 @@ fn a_budgeted_slice_composites_the_brush_then_the_visible_uv_before_the_backlog(
     assert!(value[0] > value[1]);
     s.end_stroke().unwrap();
     s.update_for_view(0.0, || 0.0, s.tile_demand(Some(visible)));
-    assert_eq!(s.take_uploads(0), [(4, 6)]);
+    assert_eq!(s.take_uploads(0), [(7, 7)], "the released dab gets the first slice");
+    s.update_for_view(0.0, || 0.0, s.tile_demand(Some(visible)));
+    assert_eq!(s.take_uploads(0), [(4, 6)], "the visible UV comes first once the dab upload is acknowledged");
     s.update();
     let result = s.caches[0].composite.clone();
     assert_eq!(result, full(&mut s));
