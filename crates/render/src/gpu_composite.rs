@@ -1318,7 +1318,7 @@ mod procedural_tests {
         let texture = gpu.renderer.aux_texture(0).unwrap();
         let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
         assert!(expected.iter().any(|&value| value > 150), "fixture distinguishes f32 from half-rounded 0.5");
-        for (&cpu, texel) in expected.iter().zip(rgba.chunks_exact(4)) {
+        for (&cpu, texel) in expected.iter().zip(rgba.as_chunks::<4>().0) {
             assert!(texel[0].abs_diff(cpu) <= 1, "GPU mask {} differs from CPU {cpu}", texel[0]);
         }
     }
