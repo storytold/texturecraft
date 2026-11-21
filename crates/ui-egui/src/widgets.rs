@@ -421,7 +421,7 @@ pub fn color_swatch(ui: &mut Ui, id: &str, linear: &mut [f32; 3], width: f32) ->
     changed
 }
 
-/// A color picker `width` wide: R, G, B (sRGB 0–255) with a copy button, a saturation/value
+/// A color picker `width` wide: R, G, B (sRGB 0–255) with a copy button, hex input, a saturation/value
 /// square and a hue strip. Returns true when the color changed.
 fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool {
     use egui::ecolor::{hsv_from_rgb, rgb_from_hsv};
@@ -439,6 +439,39 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
         if icon_button(ui, egui_phosphor::regular::COPY, crate::i18n::tr("Copy RGB values"), false, 20.0).clicked() {
             ui.copy_text(format!("{}, {}, {}", srgb[0], srgb[1], srgb[2]));
         }
+
+        // --- NEW: Hex Text Input next to Copy button ---
+        let hex_id = id.with("hex_input");
+        let current_hex = format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]);
+        let mut hex_text = ui.data_mut(|d| d.get_temp::<String>(hex_id).unwrap_or_else(|| current_hex.clone()));
+
+        let hex_resp = ui.add(egui::TextEdit::singleline(&mut hex_text).id(hex_id).desired_width(60.0).hint_text("#RRGGBB"));
+
+        // Keep text synced with R/G/B or square drags when not actively typing
+        if !hex_resp.has_focus() {
+            hex_text = current_hex;
+        }
+
+        // Listener 1: Fires while typing (live-updates color if 6 valid hex digits are typed)
+        if hex_resp.changed()
+            && let Some(parsed) = parse_hex_rgb(&hex_text)
+        {
+            srgb = parsed;
+            typed = true;
+        }
+
+        // Listener 2: Fires when focus is lost (clicking away or pressing Enter)
+        if hex_resp.lost_focus() {
+            if let Some(parsed) = parse_hex_rgb(&hex_text) {
+                srgb = parsed;
+                typed = true;
+            }
+            // Snap display back to clean "#RRGGBB" format
+            hex_text = format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]);
+        }
+
+        ui.data_mut(|d| d.insert_temp(hex_id, hex_text));
+        // --- END NEW ---
     });
     if typed {
         (h, s, v) = hsv_of(srgb);
@@ -472,6 +505,26 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
     let changed = next != *c;
     *c = next;
     changed
+}
+
+/// Parses `#RRGGBB` or `RRGGBB` (and 3-digit shorthand `#RGB`) into `[u8; 3]`
+fn parse_hex_rgb(input: &str) -> Option<[u8; 3]> {
+    let hex = input.trim().strip_prefix('#').unwrap_or(input.trim());
+    match hex.len() {
+        6 | 8 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some([r, g, b])
+        }
+        3 | 4 => {
+            let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+            let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+            let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+            Some([r, g, b])
+        }
+        _ => None,
+    }
 }
 
 /// Fill `rect` with `rgb(x, y)` (sRGB 0..1 over 0..1 across and down), as a shaded mesh.
