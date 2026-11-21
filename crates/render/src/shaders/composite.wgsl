@@ -33,7 +33,7 @@ struct SurfaceVertex {
     normal: vec4<f32>,
 }
 @group(0) @binding(7) var<storage, read> surface_vertices: array<SurfaceVertex>;
-@group(0) @binding(8) var bake_maps: texture_2d_array<f32>;
+@group(0) @binding(8) var bake_maps: texture_2d<u32>;
 @group(0) @binding(9) var brush_alpha: texture_2d<u32>;
 
 const NO_PAINT_IMAGE = 0xffffffffu;
@@ -78,11 +78,15 @@ fn surface_at(pixel: vec2<u32>) -> Surface {
     return Surface(position, select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12));
 }
 
-fn baked_at(pixel: vec2<u32>, layer: i32) -> vec4<f32> {
+fn baked_at(pixel: vec2<u32>) -> vec4<u32> {
     let size = textureDimensions(bake_maps);
     let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
     let sample_pixel = min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
-    return textureLoad(bake_maps, vec2<i32>(sample_pixel), layer, 0);
+    return textureLoad(bake_maps, vec2<i32>(sample_pixel), 0);
+}
+
+fn unpack_baked_normal(packed: u32) -> vec3<f32> {
+    return vec3<f32>(vec3(packed, packed >> 10u, packed >> 20u) & vec3(1023u)) / 1022.0;
 }
 
 // The nearest squared distance can be clipped to one when no feature ID is needed.
@@ -712,12 +716,15 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     let surface = surface_at(pixel);
     var mask_bakes = vec3(1.0, 0.5, 1.0);
     var display_ao = 1.0;
+    var baked_normal = 0u;
     if (params.coverage.w & 2u) != 0u {
-        let display_bake = baked_at(sample_pixel, 0);
-        display_ao = display_bake.x;
+        let display_bake = baked_at(sample_pixel);
+        let scalars = bitcast<vec3<f32>>(display_bake.xyz);
+        display_ao = scalars.x;
+        baked_normal = display_bake.w;
         if covered {
-            mask_bakes = display_bake.xyz;
-            if any(pixel != sample_pixel) { mask_bakes = baked_at(pixel, 0).xyz; }
+            mask_bakes = scalars;
+            if any(pixel != sample_pixel) { mask_bakes = bitcast<vec3<f32>>(baked_at(pixel).xyz); }
         }
     }
     let index = id.y * params.program.y + id.x;
@@ -792,9 +799,8 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         | ((to_u16(scalars[4]) >> 8u) << 24u);
     if writes_display(2u) {
         var detail = quantized_color(normal);
-        if (params.coverage.w & 4u) != 0u {
-            let baked_normal = baked_at(sample_pixel, 1);
-            if baked_normal.a > 0.0 { detail = rnm(baked_normal.rgb, detail); }
+        if (baked_normal & (1u << 30u)) != 0u {
+            detail = rnm(unpack_baked_normal(baked_normal), detail);
         }
         let packed = detail * 2.0 - 1.0;
         let normal_index = display_index(2u, index);

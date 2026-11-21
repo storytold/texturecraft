@@ -90,6 +90,10 @@ impl CompositeRegion {
         Some(region)
     }
 
+    fn union(self, other: Self) -> Self {
+        Self { min: [self.min[0].min(other.min[0]), self.min[1].min(other.min[1])], max: [self.max[0].max(other.max[0]), self.max[1].max(other.max[1])] }
+    }
+
     pub fn expanded(self, texels: u32) -> Self {
         Self { min: self.min.map(|x| x.saturating_sub(texels)), max: self.max.map(|x| x.saturating_add(texels)) }
     }
@@ -731,6 +735,16 @@ fn point_effect(effect: &Effect) -> Option<Operation> {
     })
 }
 
+// Three 10-bit unsigned normalized components, followed by a validity bit.
+fn encode_baked_normal(normal: [f32; 3]) -> u32 {
+    if !normal.iter().all(|value| (0.0..=1.0).contains(value)) {
+        return 0;
+    }
+    // An even scale preserves the flat normal's exact 0.5 components.
+    let [x, y, z] = normal.map(|value| (value * 1022.0 + 0.5) as u32);
+    x | (y << 10) | (z << 20) | (1 << 30)
+}
+
 fn coverage_word(triangles: &[u32]) -> u32 {
     triangles.iter().enumerate().fold(0, |word, (bit, &triangle)| word | (u32::from(triangle != NO_TRI) << bit))
 }
@@ -746,10 +760,6 @@ fn input_texture(device: &wgpu::Device, label: &str, size: (u32, u32), layers: u
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
-}
-
-fn bake_view(texture: &wgpu::Texture) -> wgpu::TextureView {
-    texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
 }
 
 fn write_input(queue: &wgpu::Queue, texture: &wgpu::Texture, size: (u32, u32), row_layer: (u32, u32), bytes: &[u8]) {
@@ -840,7 +850,7 @@ impl GpuCompositor {
             contents: &[0; 32],
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let default_baked = bake_view(&input_texture(device, "tc_composite_empty_bakes", (1, 1), 2, wgpu::TextureFormat::Rgba16Float));
+        let default_baked = input_texture(device, "tc_composite_empty_bakes", (1, 1), 1, wgpu::TextureFormat::Rgba32Uint).create_view(&Default::default());
         let default_brush_alpha =
             input_texture(device, "tc_composite_empty_brush_alpha", (1, 1), 1, wgpu::TextureFormat::R16Uint).create_view(&Default::default());
         Self {
@@ -935,6 +945,14 @@ impl GpuCompositor {
         self.surfaces.retain(|cache| cache.gbuf.strong_count() != 0);
     }
 
+    pub(crate) fn clear_baked_inputs(&mut self) {
+        self.baked.clear();
+    }
+
+    pub(crate) fn remove_baked_input(&mut self, ts: usize) {
+        self.baked.remove(&ts);
+    }
+
     fn baked_input(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, baked: Option<&BakedInputs>) -> Result<wgpu::TextureView, String> {
         let Some(baked) = baked else {
             self.baked.remove(&ts);
@@ -956,28 +974,27 @@ impl GpuCompositor {
             return Err("Baked maps exceed the GPU texture dimensions".into());
         }
         self.baked.remove(&ts);
-        let texture = input_texture(device, "tc_composite_bakes", size, 2, wgpu::TextureFormat::Rgba16Float);
+        // Keep all three scalar inputs at f32 precision for narrow generator ramps. The
+        // normal uses the remaining word, keeping the atlas at 16 bytes per texel.
+        let texture = input_texture(device, "tc_composite_bakes", size, 1, wgpu::TextureFormat::Rgba32Uint);
         let value = |map: usize, i: usize, fallback: f32| baked.maps[map].as_ref().and_then(|data| data.get(i).copied()).unwrap_or(fallback);
         for top in (0..size.1).step_by(ROWS as usize) {
             let end = (top + ROWS).min(size.1);
             let indices = top as usize * size.0 as usize..end as usize * size.0 as usize;
-            let scalars: Vec<[u16; 4]> = indices
-                .clone()
-                .into_par_iter()
-                .map(|i| [value(0, i, 1.0), value(2, i, 0.5), value(3, i, 1.0), 0.0].map(|v| half::f16::from_f32(v).to_bits()))
-                .collect();
-            write_input(queue, &texture, (size.0, end - top), (top, 0), bytemuck::cast_slice(&scalars));
-            let normals: Vec<[u16; 4]> = indices
+            let texels: Vec<[u32; 4]> = indices
                 .into_par_iter()
                 .map(|i| {
-                    let n = [value(1, i * 3, 0.5), value(1, i * 3 + 1, 0.5), value(1, i * 3 + 2, 1.0)];
-                    let valid = n.iter().all(|v| (0.0..=1.0).contains(v));
-                    [n[0], n[1], n[2], if valid { 1.0 } else { 0.0 }].map(|v| half::f16::from_f32(v).to_bits())
+                    let normal = if baked.maps[1].is_some() {
+                        encode_baked_normal([value(1, i * 3, 0.5), value(1, i * 3 + 1, 0.5), value(1, i * 3 + 2, 1.0)])
+                    } else {
+                        0
+                    };
+                    [value(0, i, 1.0).to_bits(), value(2, i, 0.5).to_bits(), value(3, i, 1.0).to_bits(), normal]
                 })
                 .collect();
-            write_input(queue, &texture, (size.0, end - top), (top, 1), bytemuck::cast_slice(&normals));
+            write_input(queue, &texture, (size.0, end - top), (top, 0), bytemuck::cast_slice(&texels));
         }
-        let view = bake_view(&texture);
+        let view = texture.create_view(&Default::default());
         self.baked.insert(ts, BakeCache { size, maps: refs, view: view.clone() });
         Ok(view)
     }
@@ -1039,6 +1056,7 @@ impl GpuCompositor {
         program: &CompositeProgram,
         target: (usize, (u32, u32), u32, Option<CompositeRegion>),
         textures: &[&wgpu::Texture],
+        submitted: &mut Option<CompositeRegion>,
     ) -> Result<(), String> {
         let (device, queue) = gpu;
         let (ts, source_size, shift, region) = target;
@@ -1156,9 +1174,7 @@ impl GpuCompositor {
                     u32::from(program.coverage.is_some()),
                     source_size.0.div_ceil(32),
                     radius,
-                    u32::from(program.surface.is_some())
-                        | (u32::from(program.baked.is_some()) << 1)
-                        | (u32::from(program.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some())) << 2),
+                    u32::from(program.surface.is_some()) | (u32::from(program.baked.is_some()) << 1),
                     window.origin[0],
                     window.origin[1],
                     window.size[0],
@@ -1205,6 +1221,7 @@ impl GpuCompositor {
                 }
             }
             last_submission = Some(queue.submit([encoder.finish()]));
+            *submitted = Some(submitted.map_or(chunk, |region| region.union(chunk)));
             pending_bytes += bytes;
         }
         Ok(())
@@ -1257,6 +1274,51 @@ mod procedural_tests {
     use texturecraft_core::{Fill, Layer, Mask, OutputResolution, Procedural, TextureSet};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{srgb_lut, to_u16};
+
+    #[test]
+    fn narrow_gpu_generator_ramp_preserves_baked_scalar_precision() {
+        use texturecraft_compose::eval::{Inputs, mask_image};
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = 64;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let mut project = Project::new("Narrow mask ramp", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "AO mask", LayerKind::Fill(Fill::default()), &[Channel::BaseColor]);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let generator = Generator { softness: Generator::MIN_SOFTNESS, ..Generator::new(GeneratorKind::AmbientOcclusion) };
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let baked = BakedMaps { resolution: 1, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new(vec![0.5002]))]) };
+        let pixels = PixelStore::default();
+        let inputs = Inputs {
+            project: &project,
+            ts: 0,
+            mesh: &mesh,
+            gbuf: &gbuf,
+            pixels: &pixels,
+            baked: &baked,
+            block_scales: project.texture_sets[0].block_scales(),
+            preview: None,
+            images: &ImageStore::default(),
+            bounds: mesh.bounds(),
+        };
+        let expected = mask_image(&inputs, owner, SIZE).unwrap();
+        let mut program = CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).unwrap();
+        program.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        let texture = gpu.renderer.aux_texture(0).unwrap();
+        let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+        assert!(expected.iter().any(|&value| value > 150), "fixture distinguishes f32 from half-rounded 0.5");
+        for (&cpu, texel) in expected.iter().zip(rgba.chunks_exact(4)) {
+            assert!(texel[0].abs_diff(cpu) <= 1, "GPU mask {} differs from CPU {cpu}", texel[0]);
+        }
+    }
 
     #[test]
     fn material_patterns_match_cpu_as_fills_and_masks() {

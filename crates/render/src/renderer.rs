@@ -1393,6 +1393,7 @@ impl Renderer {
             set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
         }
         if let Some(compositor) = &mut self.compositor {
+            compositor.clear_baked_inputs();
             compositor.release_unused_surfaces();
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -1613,6 +1614,9 @@ impl Renderer {
         }
         let set = self.sets.get(ts).ok_or("texture set does not exist")?;
         if program.is_neutral() {
+            if let Some(compositor) = &mut self.compositor {
+                compositor.remove_baked_input(ts);
+            }
             let textures = crate::gpu_trace::scoped(device, "empty GPU material", || {
                 let textures = DisplayKind::ALL
                     .iter()
@@ -1638,7 +1642,9 @@ impl Renderer {
             return Err("GPU composition is unavailable on this device or for this layout".into());
         }
 
-        let (compositor, textures) = crate::gpu_trace::scoped(device, "viewport GPU composite", || {
+        let mut submitted = None;
+        let mut in_place = [false; DisplayKind::ALL.len()];
+        let result = crate::gpu_trace::scoped(device, "viewport GPU composite", || {
             let mut compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
             let mut maps: Vec<_> = DisplayKind::ALL
                 .iter()
@@ -1648,6 +1654,7 @@ impl Renderer {
                     let composed = program.writes_display(kind);
                     let extent = if composed { size } else { (1, 1) };
                     if extent == (old.texture.width(), old.texture.height()) {
+                        in_place[kind as usize] = composed;
                         old.clone()
                     } else if composed && program.region.is_none() {
                         Tex::new(device, "tc_composite", extent.0, extent.1, display_format(kind), mip_count(extent.0.max(extent.1)))
@@ -1660,7 +1667,16 @@ impl Renderer {
             compositor.compose((device, queue), program, (ts, set.size, set.shift, program.region), &targets.each_ref().map(|target| &target.texture))?;
             maps.extend(set.tex.last().cloned());
             Ok::<_, String>((compositor, maps))
-        })??;
+        })
+        .and_then(|output| output);
+        let (compositor, textures) = match result {
+            Ok(output) => output,
+            Err(error) => {
+                let slots = in_place.into_iter().enumerate().filter_map(|(slot, reused)| reused.then_some(slot));
+                self.invalidate_gpu_writes(ts, submitted, slots);
+                return Err(error);
+            }
+        };
         self.compositor = Some(compositor);
         if let Some(set) = self.sets.get_mut(ts) {
             let region = program.region.map(|r| r.viewport(set.shift, size));
@@ -1700,12 +1716,21 @@ impl Renderer {
         let shift = step.trailing_zeros();
         let reuse = (old.texture.width(), old.texture.height()) == (size, size);
         let region = if reuse { program.region } else { None };
-        let (compositor, tex) = crate::gpu_trace::scoped(device, "viewport GPU mask preview", || {
+        let mut submitted = None;
+        let result = crate::gpu_trace::scoped(device, "viewport GPU mask preview", || {
             let mut compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
             let tex = if reuse { old.clone() } else { Tex::new(device, "tc_gpu_mask_preview", size, size, wgpu::TextureFormat::Rgba8Unorm, mip_count(size)) };
-            compositor.compose((device, queue), program, (ts, set.size, shift, region), &[&tex.texture])?;
+            compositor.compose((device, queue), program, (ts, set.size, shift, region), &[&tex.texture], &mut submitted)?;
             Ok::<_, String>((compositor, tex))
-        })??;
+        })
+        .and_then(|output| output);
+        let (compositor, tex) = match result {
+            Ok(output) => output,
+            Err(error) => {
+                self.invalidate_gpu_writes(ts, submitted, reuse.then_some(slot));
+                return Err(error);
+            }
+        };
         self.compositor = Some(compositor);
         let set = &mut self.sets[ts];
         set.pending[slot] = None;
@@ -1725,6 +1750,22 @@ impl Renderer {
         }
         self.content_rev += 1;
         Ok(())
+    }
+
+    // A later submission can fail after an earlier window wrote the bound texture.
+    fn invalidate_gpu_writes(&mut self, ts: usize, submitted: Option<CompositeRegion>, slots: impl IntoIterator<Item = usize>) {
+        let Some(region) = submitted else { return };
+        let set = &mut self.sets[ts];
+        let mut changed = false;
+        for slot in slots {
+            if set.tex[slot].mips > 1 {
+                set.mips_dirty[slot].add(region.min[0], region.min[1], region.max[0], region.max[1]);
+            }
+            changed = true;
+        }
+        if changed {
+            self.content_rev += 1;
+        }
     }
 
     /// Present a bounded image of the entire material until the detailed tiles arrive.
