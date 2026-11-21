@@ -2316,6 +2316,9 @@ pub(crate) mod tests {
             assert!(session.device_stroke().is_some());
             compare_pixels(display(link.sync(&mut session, aux, None, 0, 0.0)), live);
             session.end_stroke().unwrap();
+            let fallback =
+                session.log.iter().find(|entry| entry.message.starts_with("GPU stencil readback") || entry.message.starts_with("GPU stroke readback failed"));
+            assert!(fallback.is_none(), "projection must commit through GPU readback: {fallback:?}");
             if mask_view {
                 assert!(session.doc.pixels.masks.values().any(|pixels| pixels.allocated_count() != 0));
             } else {
