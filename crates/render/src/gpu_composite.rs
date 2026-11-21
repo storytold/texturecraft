@@ -81,7 +81,7 @@ struct Operation {
     effects: [u32; 4],
     // Sampling resolution, color-ramp offset and count, projection selector.
     procedural: [u32; 4],
-    // First content field, content has fields, mask has fields.
+    // First content field, content has fields, mask has fields, content can add coverage.
     spatial: [u32; 4],
     // Geometry mask row (resolved to a lookup offset at upload), height operation plus one,
     // height-mask contrast and offset encoded as floats.
@@ -239,7 +239,7 @@ impl FilterPlan {
                 });
             let first = plan.stages.len();
             plan.add_stack(effects, content, content_count, index as u32, false, layer.ids[0] == channel_slot(Channel::Height), inputs);
-            layer.spatial = [first as u32, u32::from(first != plan.stages.len()), u32::from(mask_has_fields), 0];
+            layer.spatial[..3].copy_from_slice(&[first as u32, u32::from(first != plan.stages.len()), u32::from(mask_has_fields)]);
         }
         plan
     }
@@ -354,6 +354,14 @@ impl LiveBrush {
             return Err("The live brush has invalid paint values.");
         }
         Ok(())
+    }
+
+    fn value_for_layer(&self, id: LayerId, channel: Channel) -> Option<([f32; 3], f32)> {
+        let LiveBrushTarget::Layer { layer, values } = &self.target else { return None };
+        if *layer != id {
+            return None;
+        }
+        values.get(&channel).map(|&value| (value, self.opacity.clamp(0.0, 1.0)))
     }
 }
 
@@ -587,15 +595,25 @@ impl CompositeProgram {
             }
             let mask_start = effects.len() as u32;
             let mask_background = compile_mask(mask, pixels, set.size(), brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
-            let content_start = effects.len() as u32;
-            let mask_count = content_start - mask_start;
+            let shared_content = effects.len() as u32;
+            let mask_count = shared_content - mask_start;
             if mask_background == 0.0 && mask_count == 0 {
                 continue;
             }
+            let per_channel = layer.content_effects.iter().any(|effect| effect.visible && content_depends_on_channel(effect));
+            let mut templates = Vec::new();
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
-                effects.push(point_effect(effect, &mut procedural).ok_or("A layer effect uses CPU compositing.")?);
+                let op = if content_depends_on_channel(effect) {
+                    None
+                } else {
+                    Some(content_filter(effect, &mut procedural).ok_or("A layer effect uses CPU compositing.")?)
+                };
+                if per_channel {
+                    templates.push((effect, op));
+                } else if let Some(op) = op {
+                    effects.push(op);
+                }
             }
-            let content_count = effects.len() as u32 - content_start;
             let fill = match &layer.kind {
                 LayerKind::Fill(fill) => Some(fill),
                 LayerKind::Paint => None,
@@ -606,10 +624,6 @@ impl CompositeProgram {
                 _ => None,
             });
 
-            let live_brush = brush.as_ref().and_then(|brush| match &brush.target {
-                LiveBrushTarget::Layer { layer, values } if fill.is_none() && *layer == id => Some((values, brush.opacity.clamp(0.0, 1.0))),
-                _ => None,
-            });
             let height = layer.height_mask;
             let height_params = if height.enabled && mask_count != 0 {
                 if !height.contrast.is_finite() || !height.offset.is_finite() {
@@ -629,19 +643,33 @@ impl CompositeProgram {
                 if !blend.opacity.is_finite() {
                     return Err("A layer has an invalid opacity.");
                 }
-                let brush_value = live_brush.and_then(|(values, opacity)| values.get(&channel).map(|value| (*value, opacity)));
-                let painted = if fill.is_none() {
-                    let image = pixels.layer(id, channel).filter(|img| img.allocated_count() > 0);
-                    if image.is_none() && brush_value.is_none() {
-                        continue;
-                    }
-                    if image.is_some_and(|image| (image.width(), image.height()) != set.size() || image.comps() != channel.components() + 1) {
-                        return Err("A paint layer has a layout that uses CPU compositing.");
-                    }
-                    image
+                let (painted, brush_value) = if fill.is_none() {
+                    (sparse_channel(pixels, id, channel, set.size())?, brush.as_ref().and_then(|brush| brush.value_for_layer(id, channel)))
                 } else {
-                    None
+                    (None, None)
                 };
+                let content_start = if per_channel { effects.len() as u32 } else { shared_content };
+                let mut adds_coverage = false;
+                for &(effect, template) in &templates {
+                    let op = if let Some(op) = template {
+                        op
+                    } else if let Some(op) =
+                        content_deposit(effect, channel, pixels, set.size(), brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))?
+                    {
+                        adds_coverage = true;
+                        op
+                    } else {
+                        Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() }
+                    };
+                    effects.push(op);
+                }
+                if fill.is_none() && painted.is_none() && brush_value.is_none() && !adds_coverage {
+                    if per_channel {
+                        effects.truncate(content_start as usize);
+                    }
+                    continue;
+                }
+                let content_count = effects.len() as u32 - content_start;
                 let default = channel.default_value();
                 let source = fill.and_then(|fill| fill.sources.get(&channel));
                 let slot = channel_slot(channel);
@@ -659,12 +687,7 @@ impl CompositeProgram {
                 }
                 non_default[slot as usize] = true;
                 let mut op = if fill.is_none() {
-                    let image_index = painted.map_or(NO_PAINT_IMAGE, |image| {
-                        let image_index = paint.len() as u32;
-                        paint.push(image.clone());
-                        image_index
-                    });
-                    Operation { ids: [slot, 10, image_index, (channel.components() + 1) as u32], ..Operation::zeroed() }
+                    content_paint(channel, painted, brush_value, stencil_pigment, &mut paint)
                 } else {
                     fill.and_then(|fill| source_operation(source, &fill.projection, default, channel.kind(), &mut procedural))
                         .ok_or("A fill source or projection uses CPU compositing.")?
@@ -672,16 +695,13 @@ impl CompositeProgram {
                 if let Some(decal) = decal {
                     op.uv[0] = decal as f32;
                 }
-                if let Some(([r, g, b], opacity)) = brush_value {
-                    op.projection[3] = if stencil_pigment && channel == Channel::BaseColor { 2.0 } else { 1.0 };
-                    op.uv = [r, g, b, opacity];
-                }
                 bind_tile_source(&mut op, source, &mut tile_patterns);
                 op.ids[0] = slot;
                 op.low[3] = blend.opacity.min(1.0);
                 op.balance[1] = mask_background;
                 op.balance[2] = blend_code(blend.mode) as f32;
                 op.effects = [mask_start, mask_count, content_start, content_count];
+                op.spatial[3] = u32::from(adds_coverage);
                 if height_params[0] != 0 && channel == Channel::Height {
                     height_op = operations.len() as u32 + 1;
                 }
@@ -795,6 +815,85 @@ impl CompositeProgram {
 
 fn needs_surface(operations: &[Operation]) -> bool {
     operations.iter().any(|op| op.procedural[3] != 0 || op.ids[1] == BAKED_LIGHTING_OPCODE || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]))
+}
+
+fn sparse_channel(pixels: &PixelStore, id: LayerId, channel: Channel, size: (u32, u32)) -> Result<Option<&TileImage>, &'static str> {
+    let image = pixels.layer(id, channel).filter(|image| image.allocated_count() > 0);
+    if image.is_some_and(|image| (image.width(), image.height()) != size || image.comps() != channel.components() + 1) {
+        return Err("A paint layer has a layout that uses CPU compositing.");
+    }
+    Ok(image)
+}
+
+fn content_paint(
+    channel: Channel,
+    image: Option<&TileImage>,
+    brush_value: Option<([f32; 3], f32)>,
+    stencil_pigment: bool,
+    paint: &mut Vec<TileImage>,
+) -> Operation {
+    let image_index = image.map_or(NO_PAINT_IMAGE, |image| {
+        let index = paint.len() as u32;
+        paint.push(image.clone());
+        index
+    });
+    let mut op = Operation { ids: [channel_slot(channel), 10, image_index, (channel.components() + 1) as u32], ..Operation::zeroed() };
+    if let Some(([r, g, b], opacity)) = brush_value {
+        op.projection[3] = if stencil_pigment && channel == Channel::BaseColor { 2.0 } else { 1.0 };
+        op.uv = [r, g, b, opacity];
+    }
+    op
+}
+
+fn content_depends_on_channel(effect: &Effect) -> bool {
+    matches!(effect.kind, EffectKind::Material(_) | EffectKind::Paint | EffectKind::Path(_))
+}
+
+fn content_filter(effect: &Effect, procedural: &mut ProceduralInputs) -> Option<Operation> {
+    match effect.kind {
+        // A mask-only effect authored in this stack leaves its content alone.
+        EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection { .. } | EffectKind::Compare { .. } => {
+            Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() })
+        }
+        _ => point_effect(effect, procedural),
+    }
+}
+
+fn content_deposit(
+    effect: &Effect,
+    channel: Channel,
+    pixels: &PixelStore,
+    size: (u32, u32),
+    brush: Option<&LiveBrush>,
+    (paint, procedural, tile_patterns): (&mut Vec<TileImage>, &mut ProceduralInputs, &mut TilePatterns),
+) -> Result<Option<Operation>, &'static str> {
+    if !effect.opacity.is_finite() {
+        return Err("A content effect has an invalid opacity.");
+    }
+    if effect.opacity <= 0.0 {
+        return Ok(None);
+    }
+    let mut op = if let EffectKind::Material(fill) = &effect.kind {
+        let Some(source) = fill.sources.get(&channel) else { return Ok(None) };
+        let mut op = source_operation(Some(source), &fill.projection, channel.default_value(), channel.kind(), procedural)
+            .ok_or("A content material source or projection uses CPU compositing.")?;
+        if let Projection::Decal(frame) = fill.projection {
+            op.uv[0] = procedural.materials.register_decal(frame, fill.sources.values()) as f32;
+        }
+        bind_tile_source(&mut op, Some(source), tile_patterns);
+        op.ids[0] = channel_slot(channel);
+        op
+    } else {
+        let image = sparse_channel(pixels, effect.id, channel, size)?;
+        let value = brush.and_then(|brush| brush.value_for_layer(effect.id, channel));
+        if image.is_none() && value.is_none() {
+            return Ok(None);
+        }
+        content_paint(channel, image, value, brush.is_some_and(|brush| brush.stencil.is_some()), paint)
+    };
+    op.low[3] = effect.opacity.min(1.0);
+    op.balance[2] = blend_code(effect.blend) as f32;
+    Ok(Some(op))
 }
 
 fn compile_mask(
@@ -2134,6 +2233,136 @@ mod procedural_tests {
         let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
         for (index, (&expected, pixel)) in expected.iter().zip(actual.as_chunks::<4>().0).enumerate() {
             assert!(pixel[0].abs_diff(expected) <= 2, "generator mask texel {index}: {} instead of {expected}", pixel[0]);
+        }
+    }
+
+    #[test]
+    fn content_material_and_sparse_sublayers_match_cpu_before_and_during_a_stroke() {
+        use texturecraft_compose::{Composite, ImageRes, Inputs, PaintTarget, StrokePreview, composite_tiles, tile_bytes};
+        use texturecraft_core::Decal;
+        use texturecraft_texel::to_u16_signed;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = TILE;
+        let size = (SIZE, SIZE);
+        let channels = [Channel::BaseColor, Channel::Height];
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let mut project = Project::new("Content effects", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "Empty paint layer with content", LayerKind::Paint, &channels);
+        layer.channels.get_mut(&Channel::BaseColor).unwrap().mode = BlendMode::Replace;
+        let material = Fill {
+            sources: BTreeMap::from([(Channel::BaseColor, Source::image("Decal")), (Channel::Height, Source::Uniform([-0.29; 3]))]),
+            projection: Projection::Decal(Decal {
+                center: [-0.14, 0.0, 0.13],
+                normal: [0.0, 1.0, 0.0],
+                up: [0.0, 0.0, 1.0],
+                size: [0.55, 0.63],
+                rotation: 13.0,
+                offset: [0.01, 0.0],
+                depth: 0.08,
+                symmetry: None,
+                flip: [false, true],
+            }),
+            ..Fill::default()
+        };
+        let mut material = Effect::new(project.alloc_id(), EffectKind::Material(material));
+        material.opacity = 0.73;
+        let mut paint = Effect::new(project.alloc_id(), EffectKind::Paint);
+        paint.opacity = 0.78;
+        paint.blend = BlendMode::Screen;
+        let paint_id = paint.id;
+        let blur = Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 96.0 }));
+        let mut path = Effect::new(project.alloc_id(), EffectKind::Path(Vec::new()));
+        path.opacity = 0.48;
+        path.blend = BlendMode::Subtract;
+        let path_id = path.id;
+        layer.content_effects = vec![material, paint, blur, path];
+        project.insert_layer(0, layer, None, false).unwrap();
+
+        let mut pixels = PixelStore::default();
+        let color = pixels.layer_mut(paint_id, Channel::BaseColor, size);
+        for y in 13..42 {
+            for x in 24..47 {
+                color.set(x, y, &[to_u16(0.24), to_u16(0.08), to_u16(0.11), to_u16(0.45)]);
+            }
+        }
+        let height = pixels.layer_mut(path_id, Channel::Height, size);
+        for y in 24..49 {
+            for x in 8..37 {
+                height.set(x, y, &[to_u16_signed(0.3), to_u16(0.63)]);
+            }
+        }
+        let images = ImageStore::from([(
+            "Decal".into(),
+            Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[0.18, 0.26, 0.63, 0.14], [0.36, 0.8, 0.16, 0.82], [0.72; 4], [0.39; 4]], srgb: true }),
+        )]);
+        let alpha = input_texture(&gpu.device, "test content stroke", size, 1, wgpu::TextureFormat::R16Uint);
+        let mut preview = StrokePreview {
+            target: PaintTarget::Layer(paint_id),
+            alpha: TileImage::new(SIZE, SIZE, 1),
+            opacity: 0.8,
+            erase: false,
+            values: BTreeMap::from([(Channel::BaseColor, [0.11, 0.46, 0.22]), (Channel::Height, [0.42; 3])]),
+            mask_value: 1.0,
+            stencil: None,
+            carried: BTreeMap::new(),
+            carried_mask: None,
+        };
+        let mut dense_alpha = vec![0; (SIZE * SIZE) as usize];
+        for y in 29..53 {
+            for x in 36..59 {
+                let value = to_u16(0.62);
+                preview.alpha.set(x, y, &[value]);
+                dense_alpha[(y * SIZE + x) as usize] = value;
+            }
+        }
+        write_input(&gpu.queue, &alpha, size, (0, 0), &dense_alpha);
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[(size, 0)], 1);
+        let baked = BakedMaps::default();
+        for live in [false, true] {
+            let inputs = Inputs {
+                project: &project,
+                ts: 0,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked: &baked,
+                block_scales: project.texture_sets[0].block_scales(),
+                preview: live.then_some(&preview),
+                images: &images,
+                bounds: mesh.bounds(),
+            };
+            let mut cpu = Composite::new(&channels, SIZE);
+            composite_tiles(&inputs, &mut cpu, &[(0, 0)]);
+            let live_brush = live.then(|| LiveBrush {
+                target: LiveBrushTarget::Layer { layer: paint_id, values: preview.values.clone() },
+                opacity: preview.opacity,
+                alpha: alpha.create_view(&Default::default()),
+                stencil: None,
+            });
+            let mut program = CompositeProgram::try_compile_with_brush(&project, &pixels, 0, None, live_brush).unwrap();
+            assert_eq!(program.filters.stages.len(), channels.len());
+            program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+            program.set_tile_images(&images);
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+            for kind in [DisplayKind::BaseColor, DisplayKind::Height] {
+                let expected = tile_bytes(&cpu, &baked, kind, 0, 0);
+                let texture = gpu.renderer.display_textures()[0][kind as usize];
+                let (_, _, actual) = Readback::blocking_level(&gpu.device, &gpu.queue, texture, 0).unwrap();
+                assert_eq!(actual.len(), expected.len());
+                if kind == DisplayKind::Height {
+                    for (actual, expected) in actual.as_chunks::<2>().0.iter().zip(expected.as_chunks::<2>().0) {
+                        let actual = half::f16::from_le_bytes(*actual).to_f32();
+                        let expected = half::f16::from_le_bytes(*expected).to_f32();
+                        assert!((actual - expected).abs() <= 0.003, "stroke={live}: GPU height {actual}, CPU {expected}");
+                    }
+                } else {
+                    assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2), "stroke={live}: GPU color differs from CPU");
+                }
+            }
         }
     }
 
