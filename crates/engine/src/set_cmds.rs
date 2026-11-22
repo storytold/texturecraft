@@ -6,6 +6,7 @@ use texturecraft_core::{Channel, ChannelBlend, ChannelFormat};
 use std::sync::Arc;
 
 use texturecraft_geom::{Bvh, Mesh};
+use web_time::Instant;
 
 use crate::commands::{CommandSpec, always, bad, boolp, channel_param, f32p, normal_format_param, strp, u64p};
 use crate::session::{Document, SetCache, StackTarget, check_resolution};
@@ -148,7 +149,7 @@ impl ResizeTask {
         progress: &texturecraft_bake::Progress,
         mut accelerate: impl FnMut(&texturecraft_texel::TileImage, (u32, u32), &[u16]) -> Option<std::result::Result<texturecraft_texel::TileImage, String>>,
     ) -> Result<ResizeOutput> {
-        let start = chrono::Utc::now();
+        let start = Instant::now();
         let ResizeTask { ts, resolution, mut doc, mesh, bvh, from } = self;
         let set = doc.project.texture_set_mut(ts)?;
         let old = set.clone();
@@ -181,9 +182,9 @@ impl ResizeTask {
                     return image.clone();
                 }
                 if old.uv_tiles.is_empty() && image.allocated_count() > 0 && (image.width(), image.height()) != size {
-                    let submitted = chrono::Utc::now();
+                    let submitted = Instant::now();
                     if let Some(result) = accelerate(image, size, empty) {
-                        gpu_ms += (chrono::Utc::now() - submitted).num_milliseconds();
+                        gpu_ms += submitted.elapsed().as_millis();
                         match result {
                             Ok(resized) => {
                                 gpu_images += 1;
@@ -204,10 +205,10 @@ impl ResizeTask {
             return Err(crate::EngineError::Other("Texture set resize was cancelled".into()));
         }
         progress.done.store(3_000, std::sync::atomic::Ordering::Relaxed);
-        let resampled = chrono::Utc::now();
+        let resampled = Instant::now();
         let set = doc.project.texture_set(ts)?;
         let cache = (crate::session::uv_layout(&old) == crate::session::uv_layout(set)).then(|| SetCache::new(&mesh, set));
-        let cache_built = chrono::Utc::now();
+        let cache_built = Instant::now();
         if let Some(cache) = &cache {
             let deferred = replay.deferred_count();
             let replayed = replay.run(&mut doc.pixels, &mut doc.stroke_replays, &cache.gbuf, &scene, progress)?;
@@ -215,7 +216,7 @@ impl ResizeTask {
                 log.warn("Paint", format!("{deferred} paint targets exceeded the resize replay budget. Their raster pixels were resampled and their paint operations were retained."));
             }
             if replayed > 0 {
-                log.performance(format!("Replayed {replayed} recorded paint strokes in {} ms", (chrono::Utc::now() - cache_built).num_milliseconds()));
+                log.performance(format!("Replayed {replayed} recorded paint strokes in {} ms", cache_built.elapsed().as_millis()));
             }
         } else if !replay.is_empty() {
             return Err(crate::EngineError::Other("The new texture layout cannot replay these paint strokes".into()));
@@ -232,10 +233,10 @@ impl ResizeTask {
             ts + 1,
             old.resolution,
             resolution,
-            (resampled - start).num_milliseconds(),
+            resampled.duration_since(start).as_millis(),
             gpu_images,
             gpu_ms,
-            if cache.is_some() { format!("{} ms", (cache_built - resampled).num_milliseconds()) } else { "rebuilt on apply".into() }
+            if cache.is_some() { format!("{} ms", cache_built.duration_since(resampled).as_millis()) } else { "rebuilt on apply".into() }
         ));
         Ok(ResizeOutput { ts, resolution, doc, cache, log, from })
     }
