@@ -133,8 +133,11 @@ fn modal(ctx: &egui::Context, id: &str, title: &str, add: impl FnOnce(&mut egui:
 
 const WIDTH: f32 = 440.0;
 
-const POINTS: [&str; 4] = [
+const POINTS: [&str; 5] = [
     crate::i18n::n_("This is an early, one-way conversion into a TextureCraft project. The original file is never changed."),
+    crate::i18n::n_(
+        "TextureCraft carries over supported procedural materials and their graphs into the converted project so they can be recalculated when you edit material settings or change the texture resolution.",
+    ),
     crate::i18n::n_("The result will not match the original project 100%; expect differences and issues."),
     crate::i18n::n_("Conversion takes a fairly long time and a fairly large amount of memory."),
     crate::i18n::n_("All of this is expected to improve in future versions."),
