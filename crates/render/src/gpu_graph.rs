@@ -501,7 +501,7 @@ impl GraphAccelerator {
 
 impl Accelerator for GraphAccelerator {
     fn cache_tag(&self) -> &str {
-        "wgpu-graph-v5"
+        "wgpu-graph-v6"
     }
 
     fn pixel(&self, request: PixelRequest<'_>) -> Result<Option<PixelOutput>, String> {
