@@ -4828,11 +4828,11 @@ fn compute_resident_grey(
             let Some((source, steps)) = ins.get("in").and_then(NodeValue::packed_grey).zip(steps) else { return Ok(None) };
             let (_, _, div, alpha) = source.info();
             // At smaller sizes, building a new curve and uploading host pixels can cost more than using the CPU.
-            if alpha != 1.0 || ctx.size * ctx.height < 1024 * 1024 {
+            if ctx.size * ctx.height < 1024 * 1024 {
                 return Ok(None);
             }
-            let Some(curve) = crate::atomic::levels_mid_curve(n, div, steps) else { return Ok(None) };
-            accelerator.resident_grey(ResidentGreyPass::Levels { source, curve, div: steps.div }, &ctx.ec.cancel)
+            let Some((curve, alpha)) = crate::atomic::levels_mid_curve(n, div, alpha, steps) else { return Ok(None) };
+            accelerator.resident_grey(ResidentGreyPass::Levels { source, curve, div: steps.div, alpha }, &ctx.ec.cancel)
         }
         "dir_warp" | "grad_warp" | "box_blur" | "line_blur" | "laplacian_sharpen" if !rolls(n) && ctx.size * ctx.height >= 64 * 1024 => {
             let Some(steps) = steps.filter(|s| matches!(s.fmt, crate::measured::COMPILED_8_BIT | crate::measured::COMPILED_16_BIT)) else { return Ok(None) };

@@ -98,7 +98,7 @@ impl GreyRasterizer {
         let (foreground, background, side, mode, opacity) = match pass {
             ResidentGreyPass::Enlarge { source, side } => (source, None, side, ENLARGE, 0.0),
             ResidentGreyPass::Reduce { source, side } => (source, None, side, REDUCE, 0.0),
-            ResidentGreyPass::Levels { source, curve, div } => return self.render_levels(source, &curve, div, cancel),
+            ResidentGreyPass::Levels { source, curve, div, alpha } => return self.render_levels(source, &curve, div, alpha, cancel),
             ResidentGreyPass::Blend { foreground, background, mode, opacity } => {
                 if !opacity.is_finite() {
                     return Ok(None);
@@ -182,8 +182,8 @@ impl GreyRasterizer {
         Ok(stages.pop().map(|(_, pixels)| ResidentGrey16 { w: side, h: side, div: 65535.0, alpha, pixels }))
     }
 
-    fn render_levels(&self, source: GreyInput<'_>, curve: &[u16], div: f32, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
-        let (w, h, source_div, alpha) = source.info();
+    fn render_levels(&self, source: GreyInput<'_>, curve: &[u16], div: f32, alpha: f32, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+        let (w, h, source_div, _) = source.info();
         let limit = self.device.limits().max_compute_workgroups_per_dimension as usize;
         if cancel.is_cancelled() || w != h || curve.len() != source_div as usize + 1 || w.div_ceil(WORKGROUP as usize) > limit {
             return Ok(None);

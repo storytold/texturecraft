@@ -504,7 +504,7 @@ pub(crate) fn levels_mid_grey(n: &Node, t: crate::tex::GreyIn) -> Option<(crate:
 }
 
 /// Exact output steps for every input step of a packed grey levels node.
-pub(crate) fn levels_mid_curve(n: &Node, div: f32, steps: &crate::tex::Steps) -> Option<Vec<u16>> {
+pub(crate) fn levels_mid_curve(n: &Node, div: f32, alpha: f32, steps: &crate::tex::Steps) -> Option<(Vec<u16>, f32)> {
     let ([r, g, b, a], float) = levels_params(n);
     if !matches!(div, 255.0 | 65535.0)
         || r.map(f32::to_bits) != g.map(f32::to_bits)
@@ -514,10 +514,12 @@ pub(crate) fn levels_mid_curve(n: &Node, div: f32, steps: &crate::tex::Steps) ->
         return None;
     }
     let level = if float { levels_value_unbounded } else { levels_value };
-    if level(1.0, &a) != 1.0 {
+    let alpha = level(alpha, &a);
+    if !crate::tex::grey_alpha_ok(alpha) {
         return None;
     }
-    (0..=div as u16).map(|i| steps.step(level(f32::from(i) / div, &r))).collect()
+    let curve = (0..=div as u16).map(|i| steps.step(level(f32::from(i) / div, &r))).collect::<Option<_>>()?;
+    Some((curve, alpha))
 }
 
 /// A matrix that only flips or swaps the axes.
