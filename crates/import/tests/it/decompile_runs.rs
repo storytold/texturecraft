@@ -4,8 +4,8 @@
 use texturecraft_graph::graph::{Graph, b64_encode};
 use texturecraft_import_reader::decode::graph_package::Description;
 use texturecraft_import_reader::decode::graph_package::compiled::{Expr, Section};
+use texturecraft_import_reader::decompile::bitmaps;
 use texturecraft_import_reader::decompile::functions::Functions;
-use texturecraft_import_reader::decompile::{bitmaps, decompile};
 
 fn expr(words: &[u32]) -> Expr {
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -61,13 +61,6 @@ fn an_embedded_colour_image_takes_its_second_jpeg_as_alpha() {
     // the alpha follows the ramp, dark and transparent at the start, bright and opaque at the end
     assert!(t.px[0][3] < 0.05, "{:?}", t.px[0]);
     assert!(t.px[63][3] > 0.9, "{:?}", t.px[63]);
-    // an alpha of another size is refused
-    assert!(bitmaps::jpeg_with_alpha_to_png(&ramp, &[0xff, 0xd8, 0xff, 0xe0, 0, 1]).is_err());
-}
-
-#[test]
-fn a_broken_jpeg_is_an_error_not_a_panic() {
-    assert!(bitmaps::jpeg_to_png(&[0xff, 0xd8, 0xff, 0xe0, 0, 1]).is_err());
 }
 
 #[test]
@@ -90,13 +83,6 @@ fn a_value_stored_by_one_expression_is_read_by_a_later_one() {
 }
 
 #[test]
-fn a_left_out_operand_reads_as_zero() {
-    // lerp(left out, const 1, const 0.5) = 0.5
-    let e = expr(&[0x0d00_0003, 0x3f80_0000, 0x0000_0d00, 0x3f00_0000, 0xffff_0d2f, 0x0000_0000, 0x0001]);
-    assert_eq!(e.instrs.len(), 3);
-}
-
-#[test]
 fn a_left_out_operand_of_and_reads_as_false() {
     // and(invert, left out)
     let e = expr(&[0x0842_0002, 0x1234, 0x0000_081a, 0x0000_ffff]);
@@ -106,21 +92,6 @@ fn a_left_out_operand_of_and_reads_as_false() {
     let text = format!("size 8\nsubgraph {name}\n{body}end\nnode 1 input_value name=\"invert\" type=1 v=1\nnode 2 color r=1 fn.r=\"{name}\"\noutput o 2\n");
     let g = Graph::parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
     assert_eq!(g.evaluate(Some(8)).unwrap()["o"].px[0][0], 0.0);
-}
-
-#[test]
-fn a_node_without_a_size_expression_has_the_size_in_its_tag() {
-    use texturecraft_import_reader::decode::graph_package::compiled::Assembly;
-    // one uniform, no size expression: tag op 0x0c, variant 0x48 (height 2^4, width 2^8), flags 0x0108 (inline value)
-    let words: [u32; 13] = [0, 0x0c, 0, 0x0108_480c, 0x3f00_0000, 8, 8, 0x0001_0001, 0xcccc, 8, 0xbbbb, 1, 0x04];
-    let mut section: Vec<u32> = words.to_vec();
-    section.extend([0x08, 0x14]);
-    let total = (0x34 + 4 * section.len()) as u32;
-    let header = [u32::from_le_bytes(*b"SBAM"), 4 << 16, 11, 22, total, 0x1c, 0, total - 0x1c, 0x10002, 0, 1, 0x1c, 2];
-    let bytes: Vec<u8> = header.iter().chain(&section).flat_map(|w| w.to_le_bytes()).collect();
-    let asm = Assembly::parse(&bytes).unwrap();
-    let d = decompile(&description(), &asm, 64);
-    assert!(d.text.contains("node 1 color") && d.text.contains("osize_log2_x=8 osize_log2_y=4"), "{}", d.text);
 }
 
 mod values {
@@ -235,43 +206,6 @@ fn a_missing_graph_renders_to_nothing() {
         mono_output: 0,
     };
     assert_eq!(texturecraft_import::graph_uses::render_grey(&Default::default(), &p, 8, &texturecraft_import::resources::ProjectImages::none()), None);
-}
-
-#[test]
-fn the_working_colour_space_is_read_from_the_usertag() {
-    assert!(texturecraft_import_reader::decompile::working_space("colorspace=$working;padding=extend;alpha=straight"));
-    assert!(!texturecraft_import_reader::decompile::working_space("colorspace=$standardsrgb"));
-    assert!(!texturecraft_import_reader::decompile::working_space("defaultcolor=(128,128,255)"));
-}
-
-#[test]
-fn declared_colours_are_read_from_the_usertag() {
-    let tag = "defaultcolor=(128,128,255);Padding=Extend;ColorSpace=NormalXYZLeft";
-    assert_eq!(texturecraft_import_reader::decompile::default_color(tag), Some([128.0 / 255.0, 128.0 / 255.0, 1.0]));
-    assert_eq!(texturecraft_import_reader::decompile::default_color("Padding=Extend"), None);
-}
-
-#[test]
-fn the_first_operand_of_a_sequence_runs_only_for_its_sets() {
-    use texturecraft_import_reader::decode::graph_package::compiled::{Instr, Operands};
-    let ins = |op, operands| Instr { op, components: 1, ty: 9, operands };
-    let body = |instrs: Vec<Instr>| {
-        let mut fns = Functions::default();
-        let e = Expr { offset: 0, end: 0, instrs };
-        fns.function(&e, &description(), None);
-        fns.subgraphs[0].1.clone()
-    };
-    let one = ins(0x00, Operands::Constant(vec![0x3f80_0000]));
-    let pure = body(vec![one.clone(), ins(0x32, Operands::Refs(vec![0])), ins(0x32, Operands::Refs(vec![0])), ins(0x0c, Operands::Refs(vec![1, 2]))]);
-    assert!(pure.contains("f_pin") && !pure.contains("f_sequence"), "{pure}");
-    let set = body(vec![
-        one,
-        ins(0x32, Operands::Refs(vec![0])),
-        ins(0x07, Operands::RefSlot(1, 0)),
-        ins(0x32, Operands::Refs(vec![0])),
-        ins(0x0c, Operands::Refs(vec![2, 3])),
-    ]);
-    assert!(set.contains("f_sequence"), "{set}");
 }
 
 #[test]

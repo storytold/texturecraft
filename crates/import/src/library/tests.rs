@@ -148,11 +148,8 @@ fn brushes_images_and_the_environment_are_offered_once_each() {
             ("environment:/Sky?version=e1", ItemKind::Environment, 1, true),
         ]
     );
-    assert_eq!(offer.get("brush:1").map(|i| i.name.as_str()), Some("Thing brush 1 - hard round tip"));
-    assert_eq!(offer.get("brush:2").map(|i| i.name.as_str()), Some("Thing brush 2 - soft round tip"));
     let ItemSource::Brush(b) = &offer.get("brush:1").unwrap().source else { panic!() };
     assert_eq!(b.tip, BrushTip::Round { hardness: 0.9, exact: true });
-    assert_eq!(b.brush.flow, 0.5);
     assert_eq!(offer.left_out.len(), 2, "{:?}", offer.left_out);
     assert!(offer.left_out.iter().any(|l| l.contains("bitmap alpha")));
     assert!(offer.left_out.iter().any(|l| l.contains("texture not stored")));

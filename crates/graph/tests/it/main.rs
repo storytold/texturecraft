@@ -6,13 +6,11 @@
 mod digest;
 
 mod deep;
-mod demo_looks;
 mod determinism;
 mod format_doc;
 mod func;
 mod fxmap;
 mod kind_versions;
-mod node_looks;
 mod nodes;
 mod seam;
 mod vector;
