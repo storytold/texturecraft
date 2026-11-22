@@ -67,27 +67,61 @@ fn mask_weight(i: u32) -> vec2f {
     return individual_product(v, vec2f(0.2126)) + individual_product(v, vec2f(0.7152)) + individual_product(v, vec2f(0.0722));
 }
 
+fn separable_blend(mode: u32, f: vec2f, b: vec2f) -> vec2f {
+    switch mode {
+        case 1u: { return f + b; }
+        case 2u: { return b - f; }
+        case 3u: { return individual_product(f, b); }
+        case 4u: { return 1.0 - individual_product(1.0 - f, 1.0 - b); }
+        case 5u, 13u: {
+            let pivot = select(b, f, mode == 13u);
+            let dark = individual_product(2.0 * f, b);
+            let light = 1.0 - individual_product(2.0 * (1.0 - f), 1.0 - b);
+            return select(light, dark, pivot < vec2f(0.5));
+        }
+        case 6u: { return max(f, b); }
+        case 7u: { return min(f, b); }
+        case 8u: { return abs(f - b); }
+        case 9u: { return individual_product(individual_product(1.0 - 2.0 * f, b), b) + individual_product(2.0 * f, b); }
+        case 10u: { return select(b / max(1.0 - f, vec2f(0.001)), vec2f(1.0), f >= vec2f(0.999)); }
+        case 11u: { return select(1.0 - (1.0 - b) / max(f, vec2f(0.001)), vec2f(0.0), f <= vec2f(0.001)); }
+        case 12u: { return f + b - 1.0; }
+        case 14u: { return f + b - individual_product(2.0 * f, b); }
+        case 15u: { return select(b / max(f, vec2f(0.001)), b, f <= vec2f(0.001)); }
+        case 16u: { return b + 2.0 * f - 1.0; }
+        case 20u: { return b + (f - 0.5) * 2.0; }
+        case 36u: {
+            let dark = b - individual_product(individual_product(1.0 - 2.0 * f, b), 1.0 - b);
+            let light = b + individual_product(2.0 * f - 1.0, sqrt(b) - b);
+            return select(light, dark, f <= vec2f(0.5));
+        }
+        default: { return f; }
+    }
+}
+
 fn blended(i: u32) -> vec2<f32> {
     let a = front[i];
     let b = back[i];
     let f = vec2(even(a), odd(a));
     let bg = vec2(even(b), odd(b));
-    let opacity = vec2f(bitcast<f32>(params.blend.x));
-    let has_mask = params.blend.z != 0u;
+    var opacity = vec2f(bitcast<f32>(params.blend.x));
+    if params.blend.z != 0u {
+        opacity = individual_product(mask_weight(i), opacity);
+    }
     let mode = params.dimensions.w - 3u; // Blend opcodes follow enlarge, reduce, and levels.
     switch mode {
-        case 0u, 21u: { return bg + (f - bg) * opacity; }
-        case 3u: { return bg + individual_product(individual_product(f, bg) - bg, opacity); }
-        case 6u: { return bg + individual_product(max(f, bg) - bg, opacity); }
-        case 32u, 33u: {
-            if has_mask {
-                let foreground = individual_product(f, individual_product(mask_weight(i), opacity));
-                return bg + select(-foreground, foreground, mode == 32u);
-            }
-            if mode == 32u { return bg + f * opacity; }
-            return bg - f * opacity;
+        case 21u: { return bg + individual_product(f - bg, opacity); }
+        case 32u: { return bg + individual_product(f, opacity); }
+        case 33u: { return bg - individual_product(f, opacity); }
+        case 34u: { return bg + individual_product(2.0 * f - 1.0, opacity); }
+        case 35u: {
+            let divided = select(bg / max(f, vec2f(0.000015)), vec2f(1.0), f == vec2f(0.0));
+            return bg + individual_product(divided - bg, opacity);
         }
-        default: { return bg + (2.0 * f - 1.0) * opacity; }
+        default: {
+            let color = clamp(separable_blend(mode, f, bg), vec2f(0.0), vec2f(1.0));
+            return bg + individual_product(color - bg, opacity);
+        }
     }
 }
 

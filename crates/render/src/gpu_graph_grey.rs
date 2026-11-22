@@ -4,7 +4,7 @@ use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use texturecraft_graph::accelerator::{GreyInput, GreyPass, ResidentGrey16, ResidentGreyPass, ResidentGreyPixels};
+use texturecraft_graph::accelerator::{GreyInput, GreyPass, ResidentGrey16, ResidentGreyPass, ResidentGreyPixels, packed_blend_mode};
 use texturecraft_graph::context::Cancel;
 use texturecraft_graph::tex::Grey16;
 use wgpu::util::DeviceExt;
@@ -95,37 +95,34 @@ impl GreyRasterizer {
     }
 
     pub(crate) fn render_resident(&self, pass: ResidentGreyPass<'_>, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
-        let (foreground, background, mask, side, mode, opacity) = match pass {
-            ResidentGreyPass::Enlarge { source, side } => (source, None, None, side, ENLARGE, 0.0),
-            ResidentGreyPass::Reduce { source, side } => (source, None, None, side, REDUCE, 0.0),
+        let (foreground, background, mask, side, mode, opacity, blend_alpha) = match pass {
+            ResidentGreyPass::Enlarge { source, side } => (source, None, None, side, ENLARGE, 0.0, None),
+            ResidentGreyPass::Reduce { source, side } => (source, None, None, side, REDUCE, 0.0, None),
             ResidentGreyPass::Levels { source, curve, div, alpha } => return self.render_levels(source, &curve, div, alpha, cancel),
-            ResidentGreyPass::Blend { foreground, background, mask, mode, opacity } => {
+            ResidentGreyPass::Blend { foreground, background, mask, mode, opacity, alpha } => {
                 let (side, _) = grey_input_shape(&foreground);
                 if !opacity.is_finite()
-                    || !matches!(mode, 0 | 3 | 6 | 21 | 32..=34)
-                    || mask.as_ref().is_some_and(|mask| !matches!(mode, 32 | 33) || grey_input_shape(mask).0 != side)
+                    || !packed_blend_mode(mode)
+                    || !texturecraft_graph::tex::grey_alpha_ok(alpha)
+                    || mask.as_ref().is_some_and(|mask| grey_input_shape(mask).0 != side)
                 {
                     return Ok(None);
                 }
-                (foreground, Some(background), mask, side, BLEND_OFFSET + mode, opacity)
+                (foreground, Some(background), mask, side, BLEND_OFFSET + mode, opacity, Some(alpha))
             }
         };
         let (source_side, alpha) = grey_input_shape(&foreground);
         if cancel.is_cancelled() || !(2..=8192).contains(&side) || !side.is_power_of_two() || source_side == 0 {
             return Ok(None);
         }
-        let alpha = if let Some(background) = &background {
-            let (background_side, alpha) = grey_input_shape(background);
-            if background_side != side {
+        if let Some(background) = &background {
+            if grey_input_shape(background).0 != side {
                 return Ok(None);
             }
-            alpha
-        } else {
-            if (mode == ENLARGE && source_side >= side) || (mode == REDUCE && source_side <= side) {
-                return Ok(None);
-            }
-            alpha
-        };
+        } else if (mode == ENLARGE && source_side >= side) || (mode == REDUCE && source_side <= side) {
+            return Ok(None);
+        }
+        let alpha = blend_alpha.unwrap_or(alpha);
         let limit = self.device.limits();
         let largest_output_side = if mode == REDUCE { source_side / 2 } else { side };
         if (largest_output_side as u32).div_ceil(WORKGROUP) > limit.max_compute_workgroups_per_dimension {
@@ -470,4 +467,89 @@ fn upload_doubling_rows(queue: &wgpu::Queue, buffer: &wgpu::Buffer, source: &Gre
         source_row = 0;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    };
+
+    use texturecraft_graph::{context::EvalContext, graph::Graph, profile::Profiler, tex::Tex};
+
+    #[derive(Default)]
+    struct Blends(AtomicUsize);
+
+    impl Profiler for Blends {
+        fn enabled(&self) -> bool {
+            false
+        }
+
+        fn span(&self, _: &str) -> Box<dyn std::any::Any + Send> {
+            Box::new(())
+        }
+
+        fn resident_node(&self, _: u32, kind: &str) {
+            if kind == "blend" {
+                self.0.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    #[test]
+    fn imported_masked_blends_keep_binary_alpha_and_match_the_cpu() {
+        let Ok(gpu) = crate::headless::Headless::new() else { return };
+        let nodes = Arc::new(Blends::default());
+        let context = EvalContext {
+            accelerator: Some(Arc::new(crate::gpu_graph::GraphAccelerator::new(&gpu.device, &gpu.queue))),
+            profiler: Some(nodes.clone()),
+            ..Default::default()
+        };
+        let cases = [
+            ("copy", 1, 0.0, 1.0, 0.43, true, true),
+            ("screen", 1, 1.0, 0.0, 0.43, true, true),
+            ("overlay", 1, 1.0, 0.0, 0.43, true, true),
+            ("min", 1, 0.0, 1.0, 0.43, false, true),
+            ("soft_light_compiled", 1, 1.0, 0.0, 0.43, true, true),
+            ("divide_compiled", 1, 0.0, 1.0, 0.43, true, true),
+            ("add_sub_compiled", 1, 1.0, 0.0, 0.43, true, true),
+            ("copy", 2, 1.0, 1.0, 0.43, true, true),
+            ("multiply", 4, 0.0, 1.0, 0.43, true, true),
+            ("switch", 2, 0.0, 0.0, 0.43, true, true),
+            ("switch", 2, 0.0, 1.0, 1.0, false, true),
+            ("switch", 2, 0.0, 1.0, 0.43, true, false),
+        ];
+        for (mode, alpha_mode, foreground_alpha, background_alpha, opacity, masked, accelerated) in cases {
+            let attr = if masked { "mask=@3" } else { "" };
+            let graph = Graph::parse(&format!(
+                "format 3\nsize 256\nmeta compiled \"1\"\nnode 1 input idx=0 gray=1 format=\"u16_compiled\"\n\
+                 node 2 input idx=1 gray=1 format=\"u16_compiled\"\nnode 3 input idx=2 gray=1 format=\"u16_compiled\"\n\
+                 node 4 levels_mid in=@1 out_low_a={foreground_alpha} out_high_a={foreground_alpha} format=\"u16_compiled\"\n\
+                 node 5 levels_mid in=@2 out_low_a={background_alpha} out_high_a={background_alpha} format=\"u16_compiled\"\n\
+                 node 6 transform_matrix in=@4 offset_x=0.0078125 format=\"u16_compiled\"\n\
+                 node 7 blend fg=@6 bg=@5 {attr} mode=\"{mode}\" alpha_mode={alpha_mode} opacity={opacity} format=\"u16_compiled\"\noutput out 7\n"
+            ))
+            .unwrap();
+            let pixels = |frequency: f32| Tex::gray_fn(256, 256, |u, v| 0.5 + 0.5 * (u * frequency).sin() * (v * (frequency + 3.0)).cos());
+            let inputs = [Some(pixels(39.0)), Some(pixels(53.0)), Some(pixels(23.0))];
+            nodes.0.store(0, Relaxed);
+            let cpu = &graph.evaluate_with_inputs(None, &inputs).unwrap()["out"];
+            let gpu = &graph.evaluate_in(&context, None, &inputs).unwrap()["out"];
+            let label = format!("{mode} alpha={alpha_mode} foreground={foreground_alpha} background={background_alpha} masked={masked}");
+            assert_eq!(nodes.0.load(Relaxed), usize::from(accelerated), "{label}");
+            assert_eq!(cpu.px.iter().any(|p| p[3] > 0.0 && p[3] < 1.0), !accelerated, "{label}");
+            let max = cpu
+                .px
+                .iter()
+                .zip(&gpu.px)
+                .map(|(a, b)| {
+                    assert_eq!(a[3], b[3], "{label}");
+                    ((a[0] - b[0]).abs() * 65535.0).round() as u32
+                })
+                .max()
+                .unwrap_or_default();
+            assert!(max <= 1, "{label}: {max} u16 steps");
+        }
+    }
 }

@@ -91,11 +91,34 @@ pub enum PixelImageInput<'a> {
 }
 
 pub enum ResidentGreyPass<'a> {
-    Enlarge { source: GreyInput<'a>, side: usize },
-    Reduce { source: GreyInput<'a>, side: usize },
-    // Full-frame blend that preserves background alpha and can read a matching grayscale mask.
-    Blend { foreground: GreyInput<'a>, background: GreyInput<'a>, mask: Option<GreyInput<'a>>, mode: u32, opacity: f32 },
-    Levels { source: GreyInput<'a>, curve: Vec<u16>, div: f32, alpha: f32 },
+    Enlarge {
+        source: GreyInput<'a>,
+        side: usize,
+    },
+    Reduce {
+        source: GreyInput<'a>,
+        side: usize,
+    },
+    /// Full-frame blend with its constant result alpha resolved by the graph.
+    Blend {
+        foreground: GreyInput<'a>,
+        background: GreyInput<'a>,
+        mask: Option<GreyInput<'a>>,
+        mode: u32,
+        opacity: f32,
+        alpha: f32,
+    },
+    Levels {
+        source: GreyInput<'a>,
+        curve: Vec<u16>,
+        div: f32,
+        alpha: f32,
+    },
+}
+
+/// Full-frame blend modes that operate independently on each color channel.
+pub fn packed_blend_mode(mode: u32) -> bool {
+    matches!(mode, 0..=16 | 20..=21 | 32..=36)
 }
 
 pub struct ResidentFilter<'a> {

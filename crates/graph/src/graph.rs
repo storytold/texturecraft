@@ -2536,7 +2536,7 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     // (for the node log: every input grey)
     let grey_ins = !ins.is_empty() && ins.values().all(|v| !matches!(v, NodeValue::Host(Val::Rgba(_))));
     let resident = if compiled && !resize_inputs {
-        if let Some(held) = forward_identity(n, ins.get("in"), sz, fmt) {
+        if let Some(held) = forward_switch(n, &ins, fmt).or_else(|| forward_identity(n, ins.get("in"), sz, fmt)) {
             if matches!(held, NodeValue::Device(_) | NodeValue::DeviceFloat(_))
                 && let Some(profiler) = &ctx.ec.profiler
             {
@@ -4743,6 +4743,40 @@ fn forward_identity(n: &Node, source: Option<&NodeValue>, size: (usize, usize), 
     .then(|| source.clone())
 }
 
+/// A compiled switch at either endpoint holds exactly the selected input's 16-bit steps.
+fn forward_switch(n: &Node, ins: &BTreeMap<String, NodeValue>, format: u32) -> Option<NodeValue> {
+    if n.kind != "blend"
+        || format != crate::measured::COMPILED_16_BIT
+        || rolls(n)
+        || n.ins.contains_key("mask")
+        || !full_blend_frame(n)
+        || n.nums.get("mode") != Some(&21.0)
+    {
+        return None;
+    }
+    let foreground = ins.get("fg")?;
+    let background = ins.get("bg")?;
+    let (_, _, fg_div, fa) = foreground.packed_grey()?.info();
+    let (_, _, bg_div, ba) = background.packed_grey()?.info();
+    if fg_div != 65535.0 || bg_div != 65535.0 || !crate::tex::grey_alpha_ok(fa) || !crate::tex::grey_alpha_ok(ba) {
+        return None;
+    }
+    let opacity = n.nums.get("opacity").copied().unwrap_or(1.0);
+    let alpha_mode = n.nums.get("alpha_mode").copied().unwrap_or(1.0) as u32;
+    if opacity == 0.0 {
+        Some(background.clone())
+    } else if opacity == 1.0 && (fa == ba || matches!(alpha_mode, 0 | 2..=4)) {
+        Some(foreground.clone())
+    } else {
+        None
+    }
+}
+
+fn full_blend_frame(n: &Node) -> bool {
+    let coord = |name, default| n.nums.get(name).copied().unwrap_or(default);
+    [coord("crop_x0", 0.0), coord("crop_y0", 0.0), coord("crop_x1", 1.0), coord("crop_y1", 1.0)] == [0.0, 0.0, 1.0, 1.0]
+}
+
 fn half_transform<'a>(n: &Node, ctx: &Ctx<'_>, source: Option<&'a NodeValue>) -> Option<HalfTransform<'a>> {
     let source = source?;
     let value = |key, default| n.nums.get(key).copied().unwrap_or(default);
@@ -4924,7 +4958,7 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
         let (mode, opacity) = (value("mode", 0.0) as u32, value("opacity", 1.0));
         let mask = if n.ins.contains_key("mask") {
             let (mask, mask_width) = source("mask")?;
-            if !matches!(mode, 32 | 33) || mask_width != ctx.size {
+            if mask_width != ctx.size {
                 return None;
             }
             Some(mask)
@@ -4932,17 +4966,39 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
             None
         };
         let resident = [Some(foreground), Some(background), mask].into_iter().flatten().any(|source| matches!(source, GreyInput::Device(_)));
-        if (!resident && ctx.size < 4096)
-            || !matches!(mode, 0 | 3 | 6 | 21 | 32..=34)
-            || value("alpha_mode", 1.0) as u32 != 1
+        if (!resident && ctx.size < 2048)
+            || !crate::accelerator::packed_blend_mode(mode)
             || !opacity.is_finite()
             || fg_width != ctx.size
             || bg_width != ctx.size
-            || [value("crop_x0", 0.0), value("crop_y0", 0.0), value("crop_x1", 1.0), value("crop_y1", 1.0)] != [0.0, 0.0, 1.0, 1.0]
+            || !full_blend_frame(n)
         {
             return None;
         }
-        Some(ResidentGreyPass::Blend { foreground, background, mask, mode, opacity })
+        let alpha_mode = value("alpha_mode", 1.0) as u32;
+        let (_, _, _, fa) = foreground.info();
+        let (_, _, _, ba) = background.info();
+        // Keep varying or non-binary alpha in the reference path. A binary foreground can
+        // fold its alpha into the opacity without changing masked weights.
+        let alpha = match alpha_mode {
+            0 | 2..=4 if mode == 21 && fa == ba => ba,
+            0 | 2..=4 if mode == 21 && mask.is_none() => ba + (fa - ba) * opacity,
+            0 | 2..=4 if mode == 21 => return None,
+            0 if fa == ba => ba,
+            0 if mask.is_none() => ba + (fa - ba) * opacity,
+            0 => return None,
+            3 if mode == 0 => return None, // Premultiplied copy blends color separately.
+            2 | 3 if fa == 0.0 || ba == 1.0 && (0.0..=1.0).contains(&opacity) => ba,
+            2 | 3 if ba == 1.0 => return None,
+            2 | 3 if mask.is_none() => fa * opacity,
+            2 | 3 => return None,
+            _ => ba,
+        };
+        if !crate::tex::grey_alpha_ok(alpha) {
+            return None;
+        }
+        let opacity = if matches!(alpha_mode, 0 | 2..=4) && mode != 21 { opacity * fa } else { opacity };
+        Some(ResidentGreyPass::Blend { foreground, background, mask, mode, opacity, alpha })
     }
 }
 
@@ -4960,7 +5016,8 @@ fn compute_gpu_grey_pass(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &C
             mask: None,
             mode: mode @ (3 | 6 | 32..=34),
             opacity,
-        }) => GreyPass::Blend { foreground, background, mode, opacity },
+            alpha,
+        }) if alpha == background.alpha => GreyPass::Blend { foreground, background, mode, opacity },
         _ => return Ok(None),
     };
     let result = accelerator.grey_pass(pass, &ctx.ec.cancel);
