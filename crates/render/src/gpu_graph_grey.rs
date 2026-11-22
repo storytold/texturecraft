@@ -13,6 +13,7 @@ const BAND_BYTES: u64 = 8 << 20;
 const WORKGROUP: u32 = 8;
 const ENLARGE: u32 = 0;
 const REDUCE: u32 = 1;
+const LEVELS: u32 = 2;
 const SHADER: &str = concat!(include_str!("shaders/graph_grey.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
 
 pub(crate) struct GreyRasterizer {
@@ -96,6 +97,7 @@ impl GreyRasterizer {
         let (foreground, background, side, mode, opacity) = match pass {
             ResidentGreyPass::Enlarge { source, side } => (source, None, side, ENLARGE, 0.0),
             ResidentGreyPass::Reduce { source, side } => (source, None, side, REDUCE, 0.0),
+            ResidentGreyPass::Levels { source, curve, div } => return self.render_levels(source, &curve, div, cancel),
             ResidentGreyPass::Blend { foreground, background, mode, opacity } => {
                 if !(32..=34).contains(&mode) || !opacity.is_finite() {
                     return Ok(None);
@@ -158,7 +160,7 @@ impl GreyRasterizer {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("resident graph grayscale") });
             let mut input = (source_side, &front);
             for (size, output) in &stages {
-                let back = back.as_ref().unwrap_or(input.1); // Resizing does not read this binding.
+                let back = &back.as_ref().unwrap_or(input.1).buffer; // Resizing does not read this binding.
                 self.encode_resident(&mut encoder, input, back, (*size, output), mode, opacity);
                 input = (*size, output);
             }
@@ -174,11 +176,35 @@ impl GreyRasterizer {
         Ok(stages.pop().map(|(_, pixels)| ResidentGrey16 { w: side, h: side, div: 65535.0, alpha, pixels }))
     }
 
+    fn render_levels(&self, source: GreyInput<'_>, curve: &[u16], div: f32, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+        let (w, h, source_div, alpha) = source.info();
+        let limit = self.device.limits().max_compute_workgroups_per_dimension as usize;
+        if cancel.is_cancelled() || w != h || curve.len() != source_div as usize + 1 || w.div_ceil(WORKGROUP as usize) > limit {
+            return Ok(None);
+        }
+        self.device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
+        let Some(front) = self.bind_input(source)? else { return Ok(None) };
+        let Some(output) = self.allocate_resident(w, h)? else { return Ok(None) };
+        crate::gpu_trace::scoped(&self.device, "resident graph levels pass", || {
+            let table = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("graph levels lookup table"),
+                contents: bytemuck::cast_slice(curve),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("resident graph levels") });
+            self.encode_resident(&mut encoder, (w, &front), &table, (w, &output), LEVELS, 0.0);
+            self.queue.submit([encoder.finish()]);
+        })?;
+        front.retain_until_completed(&self.queue);
+        output.retain_until_completed(&self.queue);
+        Ok(Some(ResidentGrey16 { w, h, div, alpha, pixels: output }))
+    }
+
     fn encode_resident(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         (source_side, front): (usize, &GreyDevicePixels),
-        back: &GreyDevicePixels,
+        back: &wgpu::Buffer,
         (side, output): (usize, &GreyDevicePixels),
         mode: u32,
         opacity: f32,
@@ -189,7 +215,7 @@ impl GreyRasterizer {
             contents: bytemuck::cast_slice(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let entries = [&uniform, &front.buffer, &back.buffer, &output.buffer]
+        let entries = [&uniform, &front.buffer, back, &output.buffer]
             .into_iter()
             .enumerate()
             .map(|(binding, buffer)| wgpu::BindGroupEntry { binding: binding as u32, resource: buffer.as_entire_binding() })

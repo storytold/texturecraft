@@ -4497,6 +4497,16 @@ fn compute_resident_grey(
             let Some(pass) = grey_pass(n, ctx, steps, |slot| ins.get(slot).and_then(NodeValue::packed_grey)) else { return Ok(None) };
             accelerator.resident_grey(pass, &ctx.ec.cancel)
         }
+        "levels_mid" if !rolls(n) => {
+            let Some((source, steps)) = ins.get("in").and_then(NodeValue::packed_grey).zip(steps) else { return Ok(None) };
+            let (_, _, div, alpha) = source.info();
+            // At smaller sizes, building a new curve and uploading host pixels can cost more than using the CPU.
+            if alpha != 1.0 || ctx.size * ctx.height < 1024 * 1024 {
+                return Ok(None);
+            }
+            let Some(curve) = crate::atomic::levels_mid_curve(n, div, steps) else { return Ok(None) };
+            accelerator.resident_grey(ResidentGreyPass::Levels { source, curve, div: steps.div }, &ctx.ec.cancel)
+        }
         "pixel_processor"
             if steps.is_some_and(|s| s.fmt == crate::measured::COMPILED_16_BIT)
                 && !rolls(n)
@@ -4555,9 +4565,10 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
         {
             return None;
         }
-        if ctx.size >= 4096 && width < ctx.size {
+        let resident = matches!(source, GreyInput::Device(_));
+        if (ctx.size >= 4096 || resident) && width < ctx.size {
             Some(ResidentGreyPass::Enlarge { source, side: ctx.size })
-        } else if matches!(source, GreyInput::Device(_)) && (2..width).contains(&ctx.size) {
+        } else if (resident || width >= 2048) && (2..width).contains(&ctx.size) {
             Some(ResidentGreyPass::Reduce { source, side: ctx.size })
         } else {
             None
@@ -4566,7 +4577,8 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
         let (foreground, fg_width) = source("fg")?;
         let (background, bg_width) = source("bg")?;
         let (mode, opacity) = (value("mode", 0.0) as u32, value("opacity", 1.0));
-        if ctx.size < 4096
+        let resident = [foreground, background].iter().any(|source| matches!(source, GreyInput::Device(_)));
+        if (!resident && ctx.size < 4096)
             || !(32..=34).contains(&mode)
             || value("alpha_mode", 1.0) as u32 != 1
             || !opacity.is_finite()

@@ -100,6 +100,10 @@ fn blended(i: u32) -> vec2<f32> {
     }
 }
 
+fn lookup_level(sample: u32) -> u32 {
+    return (back[sample / 2u] >> ((sample & 1u) * 16u)) & 0xffffu;
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let width = params.dimensions.x / 2u;
@@ -116,6 +120,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             value = halved(gid.x, gid.y);
         }
         words = vec2(rounded_read(value.x), rounded_read(value.y));
+    } else if params.dimensions.w == 2u {
+        let packed = front[i];
+        words = vec2(lookup_level(packed & 0xffffu), lookup_level(packed >> 16u));
     } else {
         words = compiled_16bit(blended(i));
     }

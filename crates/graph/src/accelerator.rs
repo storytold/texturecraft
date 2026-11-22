@@ -61,6 +61,7 @@ pub enum ResidentGreyPass<'a> {
     Enlarge { source: GreyInput<'a>, side: usize },
     Reduce { source: GreyInput<'a>, side: usize },
     Blend { foreground: GreyInput<'a>, background: GreyInput<'a>, mode: u32, opacity: f32 },
+    Levels { source: GreyInput<'a>, curve: Vec<u16>, div: f32 },
 }
 
 pub trait Accelerator: Send + Sync {
