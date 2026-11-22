@@ -31,6 +31,8 @@ mod gpu_graph_filter;
 #[cfg(not(target_arch = "wasm32"))]
 mod gpu_graph_grey;
 #[cfg(not(target_arch = "wasm32"))]
+mod gpu_graph_half;
+#[cfg(not(target_arch = "wasm32"))]
 mod gpu_graph_patterns;
 mod gpu_image_source;
 mod gpu_neighbourhood;

@@ -4,15 +4,22 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use texturecraft_graph::accelerator::{Accelerator, GreyInput, GreyPass, PixelOutput, PixelRequest, ResidentFilter, ResidentGrey16, ResidentGreyPass};
+use texturecraft_graph::accelerator::{
+    Accelerator, GreyInput, GreyPass, HalfTransform, PixelImageInput, PixelOutput, PixelRequest, ResidentFilter, ResidentGrey16, ResidentGreyFloat,
+    ResidentGreyPass,
+};
 use texturecraft_graph::context::Cancel;
 use texturecraft_graph::func::PixelShader;
 use texturecraft_graph::tex::{Grey, Grey16, ImgRef, Tex};
 use wgpu::util::DeviceExt;
 
+use crate::gpu_graph_grey::GreyRasterizer;
+use crate::gpu_graph_half::{HalfDevicePixels, HalfRasterizer};
+
 const PIXEL_COUNT_THRESHOLD: usize = 64 * 1024;
 const MAX_PIPELINES: usize = 64;
 const ROW_BUFFER_BYTES: u64 = 16 << 20;
+const RESIDENT_SCRATCH_BYTES: u64 = 8 << 20;
 const SHADER: &str = include_str!("shaders/graph_pixel.wgsl");
 const COMPILED_GREY: &str = include_str!("shaders/graph_compiled_grey.wgsl");
 
@@ -37,7 +44,8 @@ pub struct GraphAccelerator {
     pixels: Mutex<PixelCache>,
     hashers: [RandomState; 2],
     patterns: OnceLock<Result<crate::gpu_graph_patterns::PatternRasterizer, String>>,
-    grey: OnceLock<Result<crate::gpu_graph_grey::GreyRasterizer, String>>,
+    grey: OnceLock<Result<GreyRasterizer, String>>,
+    half: OnceLock<Result<HalfRasterizer, String>>,
     filters: OnceLock<Result<crate::gpu_graph_filter::FilterRasterizer, String>>,
 }
 
@@ -89,6 +97,7 @@ impl GraphAccelerator {
             patterns: OnceLock::new(),
             grey: OnceLock::new(),
             filters: OnceLock::new(),
+            half: OnceLock::new(),
         }
     }
 
@@ -277,12 +286,21 @@ impl GraphAccelerator {
         Ok(Some(if shader.grey { PixelOutput::Grey(Grey { w, h, px: grey }) } else { PixelOutput::Rgba(Tex { w, h, px: rgba }) }))
     }
 
-    fn grey_rasterizer(&self) -> Option<&crate::gpu_graph_grey::GreyRasterizer> {
+    fn grey_rasterizer(&self) -> Option<&GreyRasterizer> {
         self.grey
             .get_or_init(|| {
-                crate::gpu_graph_grey::GreyRasterizer::new(&self.device, &self.queue).inspect_err(|reason| {
+                GreyRasterizer::new(&self.device, &self.queue).inspect_err(|reason| {
                     log::warn!("{reason}; evaluating grayscale graph passes on CPU");
                 })
+            })
+            .as_ref()
+            .ok()
+    }
+
+    fn half_rasterizer(&self) -> Option<&HalfRasterizer> {
+        self.half
+            .get_or_init(|| {
+                HalfRasterizer::new(&self.device, &self.queue).inspect_err(|reason| log::warn!("{reason}; evaluating half-float transforms on CPU"))
             })
             .as_ref()
             .ok()
@@ -292,65 +310,187 @@ impl GraphAccelerator {
         &self,
         shader: PixelShader,
         images: &[GreyInput<'_>],
-        [w, h]: [usize; 2],
+        size: [usize; 2],
         cancel: &Cancel,
     ) -> Result<Option<ResidentGrey16>, String> {
-        let max = self.device.limits();
-        if w < 2
-            || !w.is_power_of_two()
-            || h == 0
-            || !shader.grey
+        if self.resident_pixel_unsupported(&shader, size, cancel)
             || !shader.images.iter().any(|&i| matches!(images.get(i), Some(GreyInput::Device(_))))
-            || shader.images.len() + 2 > max.max_storage_buffers_per_shader_stage as usize
-            || (shader.uniforms.len() as u64 + 1) * 16 > max.max_storage_buffer_binding_size
-            || (w / 2).div_ceil(8).max(h.div_ceil(8)) > max.max_compute_workgroups_per_dimension as usize
+            || shader.images.len() + 2 > self.device.limits().max_storage_buffers_per_shader_stage as usize
         {
             return Ok(None);
         }
         let Some(rasterizer) = self.grey_rasterizer() else { return Ok(None) };
-        let (device, queue) = (&self.device, &self.queue);
-        device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
+        self.device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
         let mut inputs = Vec::with_capacity(shader.images.len());
         for &binding in &shader.images {
             let Some(&input) = images.get(binding) else { return Ok(None) };
             let Some(bound) = rasterizer.bind_input(input)? else { return Ok(None) };
             inputs.push(bound);
         }
-        let Some(output) = rasterizer.allocate_resident(w, h)? else { return Ok(None) };
+        let bindings = inputs.iter().map(|image| image.buffer.as_entire_binding()).collect::<Vec<_>>();
+        let output = self.dispatch_resident_pixel(rasterizer, &shader, &bindings, None, size, cancel)?;
+        if output.is_some() {
+            for input in &inputs {
+                input.retain_until_completed(&self.queue);
+            }
+        }
+        Ok(output)
+    }
+
+    fn resident_pixel_unsupported(&self, shader: &PixelShader, [w, h]: [usize; 2], cancel: &Cancel) -> bool {
+        let max = self.device.limits();
+        w < 2
+            || !w.is_power_of_two()
+            || h == 0
+            || !shader.grey
+            || (shader.uniforms.len() as u64 + 1) * 16 > max.max_storage_buffer_binding_size
+            || (w / 2).div_ceil(8).max(h.div_ceil(8)) > max.max_compute_workgroups_per_dimension as usize
+            || cancel.is_cancelled()
+    }
+
+    fn evaluate_resident_textured_pixel(
+        &self,
+        shader: PixelShader,
+        images: &[PixelImageInput<'_>],
+        size: [usize; 2],
+        cancel: &Cancel,
+    ) -> Result<Option<ResidentGrey16>, String> {
+        let max = self.device.limits();
+        if self.resident_pixel_unsupported(&shader, size, cancel)
+            || !shader.images.iter().any(|&i| matches!(images.get(i), Some(PixelImageInput::Float(_))))
+            || shader.images.len() > max.max_sampled_textures_per_shader_stage as usize
+        {
+            return Ok(None);
+        }
+        let Some(rasterizer) = self.grey_rasterizer() else { return Ok(None) };
+        let Some(half) = self.half_rasterizer() else { return Ok(None) };
+        self.device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
+        let mut views = Vec::with_capacity(shader.images.len());
+        let mut uploaded = Vec::new();
+        let mut resident = Vec::new();
+        let prepared = crate::gpu_trace::scoped(&self.device, "resident graph pixel textures", || {
+            for &binding in &shader.images {
+                match images.get(binding) {
+                    Some(PixelImageInput::Float(image)) => {
+                        let Some(pixels) = HalfDevicePixels::viewable(image, &self.device) else { return false };
+                        views.push(pixels.view.clone());
+                        resident.push(pixels);
+                    }
+                    Some(PixelImageInput::Host(image)) => {
+                        if image.is_empty() || image.w().max(image.h()) > max.max_texture_dimension_2d as usize {
+                            return false;
+                        }
+                        let bytes_per_pixel = match image {
+                            ImgRef::Grey(texturecraft_graph::tex::GreyIn::Q(_)) => 2,
+                            ImgRef::Grey(_) => 4,
+                            ImgRef::Rgba(_) => 16,
+                        };
+                        let Some(reservation) = rasterizer.reserve((image.w() as u64) * (image.h() as u64) * bytes_per_pixel) else { return false };
+                        views.push(upload(&self.device, &self.queue, *image));
+                        uploaded.push(reservation);
+                    }
+                    None => return false,
+                }
+            }
+            true
+        });
+        let output = prepared.and_then(|prepared| {
+            if !prepared {
+                return Ok(None);
+            }
+            let bindings = views.iter().map(wgpu::BindingResource::TextureView).collect::<Vec<_>>();
+            self.dispatch_resident_pixel(rasterizer, &shader, &bindings, Some(half), size, cancel)
+        });
+        if output.as_ref().is_ok_and(Option::is_some) {
+            for input in resident {
+                input.retain_until_completed(&self.queue);
+            }
+        } else if !uploaded.is_empty() {
+            // Flush the writes even if a later allocation prevented the pixel dispatch.
+            self.queue.submit([]);
+        }
+        if !uploaded.is_empty() {
+            self.queue.on_submitted_work_done(move || drop(uploaded));
+        }
+        output
+    }
+
+    fn dispatch_resident_pixel(
+        &self,
+        rasterizer: &GreyRasterizer,
+        shader: &PixelShader,
+        inputs: &[wgpu::BindingResource<'_>],
+        pack: Option<&HalfRasterizer>,
+        [w, h]: [usize; 2],
+        cancel: &Cancel,
+    ) -> Result<Option<ResidentGrey16>, String> {
         if cancel.is_cancelled() {
             return Ok(None);
         }
-        let Some(pipeline) = self.pipeline(&shader, true) else { return Ok(None) };
-        let mut params = vec![[w as f32, h as f32, 0.0, 0.0]];
-        params.extend(shader.uniforms);
-        crate::gpu_trace::scoped(device, "resident graph pixel processor", || {
-            let parameters = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("resident graph pixel parameters"),
-                contents: bytemuck::cast_slice(&params),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-            let entries = [&parameters, &output.buffer]
-                .into_iter()
-                .chain(inputs.iter().map(|image| &image.buffer))
-                .enumerate()
-                .map(|(binding, buffer)| wgpu::BindGroupEntry { binding: binding as u32, resource: buffer.as_entire_binding() })
-                .collect::<Vec<_>>();
-            let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("resident graph pixel inputs"),
-                layout: &pipeline.get_bind_group_layout(0),
-                entries: &entries,
-            });
+        let Some(output) = rasterizer.allocate_resident(w, h)? else { return Ok(None) };
+        let row_bytes = w as u64 * 4;
+        let rows = if pack.is_some() { h.min((RESIDENT_SCRATCH_BYTES / row_bytes).max(1) as usize) } else { h };
+        let bytes = row_bytes * rows as u64;
+        let scratch_reservation = if pack.is_some() {
+            if w.div_ceil(8) > self.device.limits().max_compute_workgroups_per_dimension as usize {
+                return Ok(None);
+            }
+            let Some(reservation) = rasterizer.reserve(bytes) else { return Ok(None) };
+            Some(reservation)
+        } else {
+            None
+        };
+        // Reuse the single-pixel shader for sampled inputs. Inlining large functions twice
+        // into the paired writer makes cold compilation much slower.
+        let Some(pipeline) = self.pipeline(shader, pack.is_none()) else { return Ok(None) };
+        let (device, queue) = (&self.device, &self.queue);
+        let mut params = vec![[w as f32, h as f32, 0.0, h as f32]];
+        params.extend_from_slice(&shader.uniforms);
+        let submitted = crate::gpu_trace::scoped(device, "resident graph pixel processor", || {
+            let scratch = pack.map(|_| buffer(device, "sampled graph pixel scratch", bytes, wgpu::BufferUsages::STORAGE));
+            let target = scratch.as_ref().unwrap_or(&output.buffer);
             let mut encoder = device.create_command_encoder(&Default::default());
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&pipeline);
-                pass.set_bind_group(0, &binding, &[]);
-                pass.dispatch_workgroups((w as u32 / 2).div_ceil(8), (h as u32).div_ceil(8), 1);
+            let columns = if pack.is_some() { w as u32 } else { w as u32 / 2 };
+            for y in (0..h).step_by(rows) {
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                let band_rows = rows.min(h - y) as u32;
+                params[0] = [w as f32, h as f32, y as f32, band_rows as f32];
+                let parameters = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("resident graph pixel parameters"),
+                    contents: bytemuck::cast_slice(&params),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+                let entries = [parameters.as_entire_binding(), target.as_entire_binding()]
+                    .into_iter()
+                    .chain(inputs.iter().cloned())
+                    .enumerate()
+                    .map(|(binding, resource)| wgpu::BindGroupEntry { binding: binding as u32, resource })
+                    .collect::<Vec<_>>();
+                let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("resident graph pixel inputs"),
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &entries,
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&pipeline);
+                    pass.set_bind_group(0, &binding, &[]);
+                    pass.dispatch_workgroups(columns.div_ceil(8), band_rows.div_ceil(8), 1);
+                }
+                if let Some((pack, scratch)) = pack.zip(scratch.as_ref()) {
+                    pack.pack_result(&mut encoder, &parameters, scratch, &output.buffer, [w as u32, band_rows]);
+                }
             }
             queue.submit([encoder.finish()]);
+            true
         })?;
-        for input in &inputs {
-            input.retain_until_completed(queue);
+        if !submitted {
+            return Ok(None);
+        }
+        if let Some(reservation) = scratch_reservation {
+            queue.on_submitted_work_done(move || drop(reservation));
         }
         output.retain_until_completed(queue);
         Ok(Some(ResidentGrey16 { w, h, div: 65535.0, alpha: 1.0, pixels: output }))
@@ -436,9 +576,25 @@ impl Accelerator for GraphAccelerator {
         let Ok(rasterizer) = rasterizer else { return Ok(None) };
         resident_or_fallback(rasterizer.render(filter, pool, cancel), cancel)
     }
+
+    fn resident_half_transform(&self, pass: HalfTransform<'_>, cancel: &Cancel) -> Result<Option<ResidentGreyFloat>, String> {
+        let Some(grey) = self.grey_rasterizer() else { return Ok(None) };
+        let Some(half) = self.half_rasterizer() else { return Ok(None) };
+        resident_or_fallback(half.render(grey, pass, cancel), cancel)
+    }
+
+    fn resident_textured_pixel(
+        &self,
+        shader: PixelShader,
+        images: &[PixelImageInput<'_>],
+        size: [usize; 2],
+        cancel: &Cancel,
+    ) -> Result<Option<ResidentGrey16>, String> {
+        resident_or_fallback(self.evaluate_resident_textured_pixel(shader, images, size, cancel), cancel)
+    }
 }
 
-fn resident_or_fallback(result: Result<Option<ResidentGrey16>, String>, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+fn resident_or_fallback<T>(result: Result<Option<T>, String>, cancel: &Cancel) -> Result<Option<T>, String> {
     match result {
         Err(reason) if !cancel.is_cancelled() => {
             log::warn!("{reason}; retrying the graph node with bounded transfers");

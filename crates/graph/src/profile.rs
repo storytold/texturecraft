@@ -21,7 +21,7 @@ pub trait Profiler: Send + Sync {
     fn resident_node(&self, id: u32, kind: &str) {
         self.accelerated_node(id, kind);
     }
-    /// Observes packed grayscale pixels fetched for a consumer that needs host pixels.
+    /// Observes resident grayscale pixels fetched for a consumer that needs host pixels.
     fn resident_readback(&self, _id: u32, _bytes: usize) {}
 }
 

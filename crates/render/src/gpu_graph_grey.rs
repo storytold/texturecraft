@@ -46,7 +46,7 @@ impl GreyRasterizer {
         limits.max_buffer_size.min(limits.max_storage_buffer_binding_size)
     }
 
-    fn reserve(&self, bytes: u64) -> Option<Arc<ResidentBytes>> {
+    pub(crate) fn reserve(&self, bytes: u64) -> Option<Arc<ResidentBytes>> {
         let storage = self.resident_storage_limit();
         if bytes > storage {
             return None;
@@ -292,7 +292,7 @@ fn grey_input_shape(input: &GreyInput<'_>) -> (usize, f32) {
 }
 
 #[derive(Debug)]
-struct ResidentBytes {
+pub(crate) struct ResidentBytes {
     total: Arc<AtomicU64>,
     bytes: u64,
 }

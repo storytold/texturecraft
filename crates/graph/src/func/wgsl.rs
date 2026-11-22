@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use super::code::{Code, FLOOR_ENV, NONE};
 use super::{B, FnEnv, Op, Prog, U, Value};
-use crate::accelerator::GreyInput;
+use crate::accelerator::{GreyInput, PixelImageInput};
 use crate::graph::Pin;
 use crate::tex::{GreyIn, ImgRef};
 
@@ -24,14 +24,34 @@ impl Prog {
     }
 
     pub(crate) fn packed_pixel_shader(&self, env: &FnEnv<'_>, images: &[(&str, GreyInput<'_>)]) -> Option<PixelShader> {
-        let code = self.code();
-        // These values are evaluated on the CPU while binding a program. They cannot read GPU images.
-        if self.uses_stats || code.insts.iter().zip(&code.floor).any(|(inst, &floor)| floor <= FLOOR_ENV && matches!(inst.op, Op::SampleColor | Op::SampleGray))
-        {
+        if !self.can_sample_resident_images() {
             return None;
         }
         let images: Vec<_> = images.iter().map(|&(name, image)| (name, SampleImage::Packed(image))).collect();
         self.emit_pixel_shader(env, &images).filter(|shader| shader.grey)
+    }
+
+    pub(crate) fn textured_pixel_shader(&self, env: &FnEnv<'_>, images: &[(&str, PixelImageInput<'_>)]) -> Option<PixelShader> {
+        if !self.can_sample_resident_images() {
+            return None;
+        }
+        let images = images
+            .iter()
+            .map(|&(name, image)| {
+                let sampled = match image {
+                    PixelImageInput::Host(image) => SampleImage::Host(image),
+                    PixelImageInput::Float(_) => SampleImage::Float,
+                };
+                (name, sampled)
+            })
+            .collect::<Vec<_>>();
+        self.emit_pixel_shader(env, &images).filter(|shader| shader.grey)
+    }
+
+    fn can_sample_resident_images(&self) -> bool {
+        let code = self.code();
+        // These values are evaluated on the CPU while binding a program. They cannot read GPU images.
+        !self.uses_stats && !code.insts.iter().zip(&code.floor).any(|(inst, &floor)| floor <= FLOOR_ENV && matches!(inst.op, Op::SampleColor | Op::SampleGray))
     }
 
     fn emit_pixel_shader(&self, env: &FnEnv<'_>, inputs: &[(&str, SampleImage<'_>)]) -> Option<PixelShader> {
@@ -107,16 +127,17 @@ impl Prog {
                 writeln!(shader.source, "{}", packed_sampler(slot, param)).ok()?;
                 continue;
             }
-            let SampleImage::Host(image) = image else { return None };
-            let alpha = if matches!(image, ImgRef::Grey(grey) if grey.alpha() == 1.0) { "1.0" } else { "0.0" };
             let (sample_type, sample) = match image {
-                ImgRef::Grey(GreyIn::Q(grey)) => {
+                SampleImage::Host(ImgRef::Grey(GreyIn::Q(grey))) => {
                     let div = shader.uniforms.len() + 1;
                     shader.uniforms.push([grey.div, 0.0, 0.0, 0.0]);
-                    ("u32", format!("vec4f(vec3f(tc_sample_steps(input_{slot}, uv, mode, parameters[{div}].x)), {alpha})"))
+                    let alpha = grey.alpha;
+                    ("u32", format!("vec4f(vec3f(tc_sample_steps(input_{slot}, uv, mode, parameters[{div}].x)), {alpha:.1})"))
                 }
-                ImgRef::Grey(_) => ("f32", format!("vec4f(vec3f(tc_sample(input_{slot}, uv, mode).x), {alpha})")),
-                ImgRef::Rgba(_) => ("f32", format!("tc_sample(input_{slot}, uv, mode)")),
+                SampleImage::Host(ImgRef::Grey(grey)) => ("f32", format!("vec4f(vec3f(tc_sample(input_{slot}, uv, mode).x), {:.1})", grey.alpha())),
+                SampleImage::Host(ImgRef::Rgba(_)) => ("f32", format!("tc_sample(input_{slot}, uv, mode)")),
+                SampleImage::Float => ("f32", format!("vec4f(vec3f(tc_sample(input_{slot}, uv, mode).x), 1.0)")),
+                SampleImage::Packed(_) => return None,
             };
             writeln!(shader.source, "@group(0) @binding({}) var input_{slot}: texture_2d<{sample_type}>;", slot + 2).ok()?;
             writeln!(shader.source, "fn sample_{slot}(uv: vec2f, mode: u32) -> vec4f {{ return {sample}; }}").ok()?;
@@ -159,6 +180,7 @@ fn uniform_initialiser(code: &Code, root: u32) -> bool {
 enum SampleImage<'a> {
     Host(ImgRef<'a>),
     Packed(GreyInput<'a>),
+    Float,
 }
 
 fn packed_sampler(slot: usize, param: usize) -> String {

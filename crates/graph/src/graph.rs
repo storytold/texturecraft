@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Node graph: text format, validation, subgraphs, packages and evaluation.
-use crate::accelerator::{GreyInput, ResidentGrey16, ResidentGreyPass};
+use crate::accelerator::{GreyInput, GreyTransformInput, HalfTransform, PixelImageInput, ResidentGrey16, ResidentGreyFloat, ResidentGreyPass};
 pub use crate::context::Logging;
 use crate::context::{EvalContext, LiveBytes};
 use crate::expr;
@@ -2212,6 +2212,7 @@ fn hash_graph(g: &Graph, ctx: &Ctx) -> HashMap<u32, u64> {
 enum NodeValue {
     Host(Val),
     Device(Arc<DeviceValue>),
+    DeviceFloat(Arc<DeviceFloatValue>),
 }
 
 struct DeviceValue {
@@ -2219,11 +2220,17 @@ struct DeviceValue {
     host: OnceLock<Arc<crate::tex::Grey16>>,
 }
 
+struct DeviceFloatValue {
+    image: ResidentGreyFloat,
+    host: OnceLock<Arc<crate::tex::Grey>>,
+}
+
 impl NodeValue {
     fn dims(&self) -> (usize, usize) {
         match self {
             Self::Host(image) => image.dims(),
             Self::Device(value) => (value.image.w, value.image.h),
+            Self::DeviceFloat(value) => (value.image.w, value.image.h),
         }
     }
 
@@ -2231,6 +2238,7 @@ impl NodeValue {
         match self {
             Self::Host(image) => image.bytes(),
             Self::Device(value) => value.image.w * value.image.h * 2,
+            Self::DeviceFloat(value) => value.image.w * value.image.h * 4,
         }
     }
 
@@ -2246,6 +2254,7 @@ impl NodeValue {
         let value = match self {
             Self::Host(image) => return Ok(image),
             Self::Device(value) => value,
+            Self::DeviceFloat(value) => return value.materialize(id, ec),
         };
         if let Some(image) = value.host.get() {
             return Ok(Val::Grey16(image.clone()));
@@ -2264,6 +2273,28 @@ impl NodeValue {
         }
         let image = Arc::new(crate::tex::Grey16 { w: *w, h: *h, div: *div, alpha: *alpha, px });
         Ok(Val::Grey16(value.host.get_or_init(|| image).clone()))
+    }
+}
+
+impl DeviceFloatValue {
+    fn materialize(&self, id: u32, ec: &EvalContext) -> Result<Val, Error> {
+        if let Some(image) = self.host.get() {
+            return Ok(Val::Grey(image.clone(), 1.0));
+        }
+        let ResidentGreyFloat { w, h, pixels } = &self.image;
+        let read = pixels.read(&ec.cancel);
+        if ec.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let px = read.map_err(|reason| Error::GpuReadback(id, reason))?;
+        if Some(px.len()) != w.checked_mul(*h) {
+            return Err(Error::GpuReadback(id, "incomplete float grayscale result".into()));
+        }
+        if let Some(profiler) = &ec.profiler {
+            profiler.resident_readback(id, px.len() * 4);
+        }
+        let image = Arc::new(crate::tex::Grey { w: *w, h: *h, px });
+        Ok(Val::Grey(self.host.get_or_init(|| image).clone(), 1.0))
     }
 }
 
@@ -2504,9 +2535,9 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     let format = NodeFormat { code: fmt, read_rounding, steps: div.map(|div| crate::tex::Steps { read_rounding, fmt, div }) };
     // (for the node log: every input grey)
     let grey_ins = !ins.is_empty() && ins.values().all(|v| !matches!(v, NodeValue::Host(Val::Rgba(_))));
-    let resident = if ctx.resident && compiled && !resize_inputs { compute_resident_grey(id, n, &ins, ctx, format.steps.as_ref())? } else { None };
+    let resident = if ctx.resident && compiled && !resize_inputs { compute_resident_image(id, n, &ins, ctx, &format)? } else { None };
     let t = if let Some(image) = resident {
-        NodeValue::Device(Arc::new(DeviceValue { image, host: OnceLock::new() }))
+        image
     } else {
         let mut ins = ins.into_iter().map(|(slot, image)| Ok((slot, image.into_host(id, ctx.ec)?))).collect::<Result<BTreeMap<_, _>, Error>>()?;
         if resize_inputs {
@@ -2541,7 +2572,7 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
             NodeValue::Host(Val::Rgba(_)) => "rgba",
             NodeValue::Host(Val::Grey(..)) => "grey",
             NodeValue::Host(Val::Grey16(_)) => "grey in steps",
-            NodeValue::Device(_) => "grey in GPU memory",
+            NodeValue::Device(_) | NodeValue::DeviceFloat(_) => "grey in GPU memory",
         };
         eprintln!("         node {id} held {form} {}x{}{}; results held {} MB", sz.0, sz.1, if grey_ins { ", grey inputs" } else { "" }, cache.live >> 20);
     }
@@ -4636,6 +4667,107 @@ fn compute_gpu_pattern(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx
             })
         })
         .map_err(|e| Error::BadParam(id, e))
+}
+
+fn compute_resident_image(id: u32, n: &Node, ins: &BTreeMap<String, NodeValue>, ctx: &Ctx<'_>, format: &NodeFormat) -> Result<Option<NodeValue>, Error> {
+    if let Some(accelerator) = &ctx.ec.accelerator {
+        let value = match n.kind.as_str() {
+            "transform_matrix" if format.code == crate::measured::COMPILED_HALF => {
+                if let Some(pass) = half_transform(n, ctx, ins.get("in")) {
+                    accelerator
+                        .resident_half_transform(pass, &ctx.ec.cancel)
+                        .map(|value| value.map(|image| NodeValue::DeviceFloat(Arc::new(DeviceFloatValue { image, host: OnceLock::new() }))))
+                } else {
+                    Ok(None)
+                }
+            }
+            "pixel_processor"
+                if format.code == crate::measured::COMPILED_16_BIT && !rolls(n) && ins.values().any(|v| matches!(v, NodeValue::DeviceFloat(_))) =>
+            {
+                return compute_resident_textured_pixel(id, n, ins, ctx);
+            }
+            _ => Ok(None),
+        };
+        if ctx.ec.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if let Some(value) = value.map_err(|reason| Error::BadParam(id, reason))? {
+            if let Some(profiler) = &ctx.ec.profiler {
+                profiler.resident_node(id, &n.kind);
+            }
+            return Ok(Some(value));
+        }
+    }
+    compute_resident_grey(id, n, ins, ctx, format.steps.as_ref())
+        .map(|value| value.map(|image| NodeValue::Device(Arc::new(DeviceValue { image, host: OnceLock::new() }))))
+}
+
+fn half_transform<'a>(n: &Node, ctx: &Ctx<'_>, source: Option<&'a NodeValue>) -> Option<HalfTransform<'a>> {
+    let source = source?;
+    let value = |key, default| n.nums.get(key).copied().unwrap_or(default);
+    let (w, h) = source.dims();
+    if w != h
+        || ctx.size != ctx.height
+        || !w.is_power_of_two()
+        || !ctx.size.is_power_of_two()
+        || rolls(n)
+        || value("tile_x", 1.0) != 1.0
+        || value("tile_y", 1.0) != 1.0
+        || value("filter", 1.0) != 1.0
+        || value("offset_x", 0.0) != 0.0
+        || value("offset_y", 0.0) != 0.0
+        || crate::atomic::transform_matrix_bg(n) != [0.0; 4]
+        || [value("m00", 1.0), value("m01", 0.0), value("m10", 0.0), value("m11", 1.0)] != [1.0, 0.0, 0.0, 1.0]
+    {
+        return None;
+    }
+    let mip = value("mip", 31.0).round() as u32;
+    // Automatic level 30 skips the successive doubling that level 31 applies when enlarging.
+    if mip >= 30 && mip != 31 && w < ctx.size {
+        return None;
+    }
+    let source = match source {
+        NodeValue::DeviceFloat(value) => GreyTransformInput::Float(&value.image),
+        value => {
+            let source = value.packed_grey()?;
+            let (_, _, div, alpha) = source.info();
+            if div != 65535.0 || alpha != 1.0 || matches!(source, GreyInput::Host(_)) && w.max(ctx.size) < 1024 {
+                return None;
+            }
+            GreyTransformInput::Quantized(source)
+        }
+    };
+    Some(HalfTransform { source, side: ctx.size, mip: (mip < 30).then_some(mip) })
+}
+
+fn compute_resident_textured_pixel(id: u32, n: &Node, ins: &BTreeMap<String, NodeValue>, ctx: &Ctx<'_>) -> Result<Option<NodeValue>, Error> {
+    let (Some(accelerator), Some(name)) = (&ctx.ec.accelerator, n.strs.get("fn")) else { return Ok(None) };
+    let Some(images) = IMAGE_SLOTS
+        .iter()
+        .filter_map(|&slot| {
+            ins.get(slot).map(|value| match value {
+                NodeValue::Host(image) => Some((slot, PixelImageInput::Host(image.img_ref()))),
+                NodeValue::DeviceFloat(value) => Some((slot, PixelImageInput::Float(&value.image))),
+                NodeValue::Device(_) => None,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let prog = crate::func::compile_named(ctx.lib, name).map_err(|e| Error::BadParam(id, e))?;
+    let env = pixel_function_env(n, ctx, &prog);
+    let Some(shader) = prog.textured_pixel_shader(&env, &images) else { return Ok(None) };
+    let sources = images.iter().map(|&(_, image)| image).collect::<Vec<_>>();
+    let output = accelerator.resident_textured_pixel(shader, &sources, [ctx.size, ctx.height], &ctx.ec.cancel);
+    if ctx.ec.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let Some(image) = output.map_err(|reason| Error::BadParam(id, reason))? else { return Ok(None) };
+    if let Some(profiler) = &ctx.ec.profiler {
+        profiler.resident_node(id, &n.kind);
+    }
+    Ok(Some(NodeValue::Device(Arc::new(DeviceValue { image, host: OnceLock::new() }))))
 }
 
 fn compute_resident_grey(

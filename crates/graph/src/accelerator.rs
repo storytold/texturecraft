@@ -4,7 +4,7 @@ use std::{any::Any, fmt::Debug, sync::Arc};
 
 use crate::context::Cancel;
 use crate::func::{FnEnv, PixelShader, Prog};
-use crate::tex::{Grey, Grey16, Tex};
+use crate::tex::{Grey, Grey16, ImgRef, Tex};
 
 pub struct PixelRequest<'a> {
     pub program: &'a Prog,
@@ -55,6 +55,39 @@ impl GreyInput<'_> {
             Self::Device(t) => (t.w, t.h, t.div, t.alpha),
         }
     }
+}
+
+/// Transfers an opaque grayscale float image when a downstream operation needs CPU pixels.
+pub trait ResidentFloatPixels: Debug + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn read(&self, cancel: &Cancel) -> Result<Vec<f32>, String>;
+}
+
+#[derive(Debug)]
+pub struct ResidentGreyFloat {
+    pub w: usize,
+    pub h: usize,
+    pub pixels: Arc<dyn ResidentFloatPixels>,
+}
+
+#[derive(Clone, Copy)]
+pub enum GreyTransformInput<'a> {
+    Quantized(GreyInput<'a>),
+    Float(&'a ResidentGreyFloat),
+}
+
+/// The wrapped bilinear identity transform that builds half-float graph pyramids.
+pub struct HalfTransform<'a> {
+    pub source: GreyTransformInput<'a>,
+    pub side: usize,
+    /// An explicit pyramid level, or automatic resizing when absent.
+    pub mip: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+pub enum PixelImageInput<'a> {
+    Host(ImgRef<'a>),
+    Float(&'a ResidentGreyFloat),
 }
 
 pub enum ResidentGreyPass<'a> {
@@ -111,6 +144,21 @@ pub trait Accelerator: Send + Sync {
 
     /// Execute a spatial filter on packed compiled grayscale graph pixels.
     fn resident_filter(&self, _filter: ResidentFilter<'_>, _cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+        Ok(None)
+    }
+
+    fn resident_half_transform(&self, _pass: HalfTransform<'_>, _cancel: &Cancel) -> Result<Option<ResidentGreyFloat>, String> {
+        Ok(None)
+    }
+
+    /// Writes packed grayscale while sampling resident float images and any remaining host images.
+    fn resident_textured_pixel(
+        &self,
+        _shader: PixelShader,
+        _images: &[PixelImageInput<'_>],
+        _size: [usize; 2],
+        _cancel: &Cancel,
+    ) -> Result<Option<ResidentGrey16>, String> {
         Ok(None)
     }
 }
