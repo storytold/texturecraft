@@ -94,6 +94,7 @@ fn blended(i: u32) -> vec2<f32> {
     let bg = vec2(even(b), odd(b));
     let opacity = bitcast<f32>(params.blend.x);
     switch params.dimensions.w {
+        case 3u: { return bg + (f - bg) * opacity; }
         case 32u: { return bg + f * opacity; }
         case 33u: { return bg - f * opacity; }
         default: { return bg + (2.0 * f - 1.0) * opacity; }

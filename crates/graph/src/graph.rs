@@ -4579,7 +4579,7 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
         let (mode, opacity) = (value("mode", 0.0) as u32, value("opacity", 1.0));
         let resident = [foreground, background].iter().any(|source| matches!(source, GreyInput::Device(_)));
         if (!resident && ctx.size < 4096)
-            || !(32..=34).contains(&mode)
+            || !matches!(mode, 0 | 21 | 32..=34)
             || value("alpha_mode", 1.0) as u32 != 1
             || !opacity.is_finite()
             || n.ins.contains_key("mask")
@@ -4601,7 +4601,7 @@ fn compute_gpu_grey_pass(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &C
         _ => None,
     }) {
         Some(ResidentGreyPass::Enlarge { source: GreyInput::Host(source), side }) => GreyPass::Enlarge { source, side },
-        Some(ResidentGreyPass::Blend { foreground: GreyInput::Host(foreground), background: GreyInput::Host(background), mode, opacity }) => {
+        Some(ResidentGreyPass::Blend { foreground: GreyInput::Host(foreground), background: GreyInput::Host(background), mode: mode @ 32..=34, opacity }) => {
             GreyPass::Blend { foreground, background, mode, opacity }
         }
         _ => return Ok(None),

@@ -14,6 +14,7 @@ const WORKGROUP: u32 = 8;
 const ENLARGE: u32 = 0;
 const REDUCE: u32 = 1;
 const LEVELS: u32 = 2;
+const INTERPOLATE: u32 = 3;
 const SHADER: &str = concat!(include_str!("shaders/graph_grey.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
 
 pub(crate) struct GreyRasterizer {
@@ -99,11 +100,16 @@ impl GreyRasterizer {
             ResidentGreyPass::Reduce { source, side } => (source, None, side, REDUCE, 0.0),
             ResidentGreyPass::Levels { source, curve, div } => return self.render_levels(source, &curve, div, cancel),
             ResidentGreyPass::Blend { foreground, background, mode, opacity } => {
-                if !(32..=34).contains(&mode) || !opacity.is_finite() {
+                if !opacity.is_finite() {
                     return Ok(None);
                 }
+                let operation = match mode {
+                    0 | 21 => INTERPOLATE,
+                    32..=34 => mode,
+                    _ => return Ok(None),
+                };
                 let (side, _) = grey_input_shape(&foreground);
-                (foreground, Some(background), side, mode, opacity)
+                (foreground, Some(background), side, operation, opacity)
             }
         };
         let (source_side, alpha) = grey_input_shape(&foreground);
