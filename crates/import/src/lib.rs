@@ -32,6 +32,7 @@ pub mod import;
 pub mod layers;
 pub mod library;
 pub mod mesh;
+mod native_graphs;
 pub mod options;
 pub mod pixel_spill;
 pub mod polygon_fill;

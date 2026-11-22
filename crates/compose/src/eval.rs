@@ -1271,7 +1271,7 @@ fn graph_region(
     };
     let trace = inp.graphs.cook_trace();
     if let Some(emit) = &trace {
-        emit(format!("Preparing {w}×{h} stack inputs for graph {:?} ({})", graphs::trace_name(&graph.name), own.map_or("mask", Channel::label)));
+        (emit.line)(format!("Preparing {w}×{h} stack inputs for graph {:?} ({})", graphs::trace_name(&graph.name), own.map_or("mask", Channel::label)));
     }
     let comps = if own.is_some() { 4 } else { 1 };
     let anchors: Vec<(LayerId, Channel)> = graph
@@ -1388,7 +1388,7 @@ fn graph_region(
     }
     let use_ = GraphUse { set: inp.ts, id: effect.id, channel: own };
     if let Some(emit) = &trace {
-        emit(format!("Stack inputs ready for graph {:?} ({})", graphs::trace_name(&graph.name), own.map_or("mask", Channel::label)));
+        (emit.line)(format!("Stack inputs ready for graph {:?} ({})", graphs::trace_name(&graph.name), own.map_or("mask", Channel::label)));
     }
     let cooked = inp.graphs.cook_for(use_.clone(), graph, &env, &given);
     // a cook that failed now (none, or the one the use read last) may be found later: not kept for other blocks

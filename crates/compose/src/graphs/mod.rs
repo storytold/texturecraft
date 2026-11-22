@@ -417,8 +417,13 @@ pub struct UseProblem {
     pub reason: String,
 }
 
-/// Listener for cold graph cook and node diagnostics.
-pub type CookTrace = Arc<dyn Fn(String) + Send + Sync>;
+/// Listeners for cold graph cooks and for CPU nodes encountered while a GPU backend is available.
+#[derive(Clone)]
+pub struct CookTrace {
+    pub line: Arc<dyn Fn(String) + Send + Sync>,
+    pub cpu_report: Option<Arc<dyn Fn(GraphCpuReport) + Send + Sync>>,
+}
+pub use profiling::{GraphCpuNode, GraphCpuReport};
 pub use texturecraft_graph::accelerator::Accelerator as GraphAccelerator;
 
 /// Cooked outputs and what is known about them, shared by every snapshot of a document (a cook's key decides its
@@ -1004,7 +1009,7 @@ impl GraphStore {
         }
         if let Some(back) = self.cooks.spilled.get(key) {
             if let Some(emit) = &trace {
-                emit(format!("Graph {name:?}: loaded from project cache ({key})"));
+                (emit.line)(format!("Graph {name:?}: loaded from project cache ({key})"));
             }
             self.cooks.filled.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::new(back));
@@ -1012,7 +1017,7 @@ impl GraphStore {
         let kept = lock(&self.cooks.kept).clone().or_else(|| self.cooks.resize_source.as_ref().and_then(|source| lock(&source.kept).clone()));
         if let Some(found) = kept.as_ref().and_then(|k| k.get(key)).and_then(|bytes| kept::decode(&bytes)) {
             if let Some(emit) = &trace {
-                emit(format!("Graph {name:?}: result cache hit ({key})"));
+                (emit.line)(format!("Graph {name:?}: result cache hit ({key})"));
             }
             self.cooks.kept_found.fetch_add(1, Ordering::Relaxed);
             self.cooks.filled.fetch_add(1, Ordering::Relaxed);
@@ -1020,7 +1025,7 @@ impl GraphStore {
         }
         self.cooks.renders.fetch_add(1, Ordering::Relaxed);
         if let Some(emit) = &trace {
-            emit(format!("Graph {name:?}: preparing {} px cook ({key})", env.side));
+            (emit.line)(format!("Graph {name:?}: preparing {} px cook ({key})", env.side));
         }
         // a share of the render budget for its estimated peak; nested graphs render within their parent's
         let share = if depth == 0 { Some(budget::acquire(budget::estimate(&*self.parsed(&g.key)?, env.side))) } else { None };
@@ -1028,7 +1033,7 @@ impl GraphStore {
         drop(share);
         if let Some(emit) = &trace {
             let status = if cooked.is_ok() { "finished" } else { "stopped" };
-            emit(format!("Graph {name:?}: {status} ({key})"));
+            (emit.line)(format!("Graph {name:?}: {status} ({key})"));
         }
         let (cooked, output_keys) = cooked?;
         // a render stopped part way never gets here: it is an error
@@ -1091,7 +1096,7 @@ impl GraphStore {
         if let Some(emit) = &trace
             && !reused.is_empty()
         {
-            emit(format!("Graph {:?}: reused {} unchanged outputs", trace_name(&g.name), reused.len()));
+            (emit.line)(format!("Graph {:?}: reused {} unchanged outputs", trace_name(&g.name), reused.len()));
         }
         names.retain(|name| !reused.contains_key(*name));
         let linear: BTreeSet<String> =
@@ -1138,8 +1143,9 @@ impl GraphStore {
         let _running = Running::start(&self.cooks.running, done.clone(), nodes, trace_name(&g.name));
         let profiler = trace.map(|emit| {
             let graph = trace_name(&g.name).to_owned();
-            emit(format!("Graph {graph:?}: evaluating {nodes} nodes"));
-            Arc::new(profiling::CookProfiler::new(emit, graph)) as Arc<dyn texturecraft_graph::profile::Profiler>
+            (emit.line)(format!("Graph {graph:?}: evaluating {nodes} nodes"));
+            let profile = profiling::CookProfiler::new(emit, graph, g, side, accelerator.is_some());
+            Arc::new(profile) as Arc<dyn texturecraft_graph::profile::Profiler>
         });
         let ec = EvalContext {
             cancel: self.cooks.cancel.clone(),

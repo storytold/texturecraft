@@ -2533,7 +2533,7 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     let out = out.as_deref();
     // the node's own output size; inputs of another size are resampled to it
     let sz = node_size(n, &ins, ctx);
-    let _node = ctx.ec.profiler.as_ref().and_then(|p| p.node(id, &n.kind, sz));
+    let _node = ctx.ec.profiler.as_ref().and_then(|p| p.node_variant(id, n, sz));
     // (a compiled graph: enlarging keeps the edge instead of wrapping, and an operation that reads its input at positions it
     // works out itself reads the input as it is)
     let compiled = g.meta.contains_key("compiled");

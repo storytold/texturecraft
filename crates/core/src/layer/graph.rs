@@ -95,6 +95,9 @@ pub struct GraphRef {
     /// What the graph is called, for labels.
     #[serde(default)]
     pub name: String,
+    /// The resolved package version of a graph imported from a compiled project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_package: Option<String>,
     /// Parameter values by the graph's parameter name; parameters not listed keep the graph's defaults.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, GraphValue>,
@@ -151,6 +154,7 @@ impl GraphRef {
         GraphRef {
             key: key.into(),
             name: name.into(),
+            source_package: None,
             params: BTreeMap::new(),
             parameter_group: None,
             inputs: BTreeMap::new(),

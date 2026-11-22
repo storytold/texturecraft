@@ -249,7 +249,19 @@ impl ImportProgress {
 
     fn cook_trace(&self) -> Option<CookTrace> {
         let log = Arc::clone(self.live_log.as_ref()?);
-        Some(Arc::new(move |message| log.record(&message)))
+        #[cfg(not(target_arch = "wasm32"))]
+        let cpu_report = {
+            let log = Arc::clone(&log);
+            let warn = std::sync::Once::new();
+            Some(Arc::new(move |report| {
+                if let Err(error) = crate::session_log::write_graph_cpu_report(&report) {
+                    warn.call_once(|| log.record(&format!("Could not write graph CPU diagnostics: {error}")));
+                }
+            }) as Arc<dyn Fn(texturecraft_compose::graphs::GraphCpuReport) + Send + Sync>)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let cpu_report = None;
+        Some(CookTrace { line: Arc::new(move |message| log.record(&message)), cpu_report })
     }
 
     /// The fraction done, 0..1 (never goes back).

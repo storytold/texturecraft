@@ -14,10 +14,15 @@ use texturecraft_import_reader::format_names::PACKAGE_SUFFIX;
 use texturecraft_import_reader::model::{Procedural, ProjectEffect, ProjectSource, ProjectTextureSet};
 use texturecraft_import_reader::project::ProjectFile;
 
+use crate::native_graphs::{NativeGraph, recognize};
 use crate::{Cancel, ImportError};
 
 /// Nominal size of decompiled graphs (they render at the texture set's resolution).
 const NOMINAL: usize = 512;
+
+pub(crate) fn package_version(p: &Procedural) -> Option<&str> {
+    p.url.split_once("?version=").map(|(_, version)| version.trim_end_matches(PACKAGE_SUFFIX))
+}
 
 /// A decompiled graph with its text key.
 #[derive(Debug, Clone)]
@@ -25,6 +30,8 @@ pub struct LibraryGraph {
     pub graph: Arc<Decompiled>,
     /// [`texturecraft_core::text_key`] of its text.
     pub key: String,
+    pub(crate) package_version: Option<String>,
+    pub(crate) native: Option<NativeGraph>,
 }
 
 /// See the module docs.
@@ -35,7 +42,7 @@ pub struct GraphLibrary {
     by_name: BTreeMap<String, LibraryGraph>,
     /// By package version and graph name.
     by_version: BTreeMap<(String, String), LibraryGraph>,
-    by_key: BTreeMap<String, LibraryGraph>,
+    by_key: BTreeMap<String, Arc<Decompiled>>,
     /// Grey renders already made ([`crate::graph_uses::render_grey`]), by cook key, output and side: a brush tip is
     /// rendered once and shared by every brush and stamp using it (a project lays one tip thousands of times).
     grey: std::sync::Mutex<GreyRenders>,
@@ -131,16 +138,23 @@ impl GraphLibrary {
             }
             let Ok(asm) = g.assembly() else { continue };
             let d = decompile(&desc, &asm, NOMINAL);
+            let key = texturecraft_core::text_key(&d.text);
+            let native = recognize(version, &desc.pkg_url, &key, g.compiled_graph);
             let mut names = vec![g.name().to_string()];
             names.extend(package_path.map(str::to_owned));
-            self.insert_as(&names, version, d);
+            self.insert_graph(&names, version, d, key, native);
         }
     }
 
     /// Adds a graph under `names` (keeping graphs already there), and under `version` when it is not empty.
     pub fn insert_as(&mut self, names: &[String], version: &str, d: Decompiled) {
         let key = texturecraft_core::text_key(&d.text);
-        let entry = self.by_key.entry(key.clone()).or_insert_with(|| LibraryGraph { graph: Arc::new(d), key }).clone();
+        self.insert_graph(names, version, d, key, None);
+    }
+
+    fn insert_graph(&mut self, names: &[String], version: &str, d: Decompiled, key: String, native: Option<NativeGraph>) {
+        let graph = self.by_key.entry(key.clone()).or_insert_with(|| Arc::new(d)).clone();
+        let entry = LibraryGraph { graph, key, package_version: (!version.is_empty()).then(|| version.to_owned()), native };
         for name in names {
             if !version.is_empty() {
                 self.by_version.insert((version.to_string(), name.clone()), entry.clone());
@@ -152,13 +166,12 @@ impl GraphLibrary {
     /// The graph a procedural runs: of the package version its URL names, else any of its name.
     pub fn of(&self, p: &Procedural) -> Option<&LibraryGraph> {
         let name = p.name();
-        let version = p.url.split_once("?version=").map(|(_, v)| v.trim_end_matches(PACKAGE_SUFFIX).to_string());
-        version.and_then(|v| self.by_version.get(&(v, name.to_string()))).or_else(|| self.by_name.get(name))
+        package_version(p).and_then(|v| self.by_version.get(&(v.to_owned(), name.to_owned()))).or_else(|| self.by_name.get(name))
     }
 
     /// The text under `key`, if a graph of the library has it.
     pub fn text(&self, key: &str) -> Option<Arc<str>> {
-        self.by_key.get(key).map(|g| g.graph.text.clone())
+        self.by_key.get(key).map(|g| g.text.clone())
     }
 
     /// The grey render kept under `key`, or `render()` kept under it (within [`MAX_GREY_BYTES`]). A render depends only

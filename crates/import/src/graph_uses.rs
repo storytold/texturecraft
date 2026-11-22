@@ -20,12 +20,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use texturecraft_core::{Channel, ChannelKind, EffectKind, Filter, GraphInput, GraphRef, Levels, MAX_GRAPH_NESTING, Projection, Source};
+use texturecraft_core::{Channel, EffectKind, Filter, GraphInput, GraphRef, Levels, MAX_GRAPH_NESTING, Projection, Source};
 use texturecraft_import_reader::blockers::Blocker;
 use texturecraft_import_reader::decompile::Decompiled;
 use texturecraft_import_reader::model::{ChannelMask, FilterEffect, Procedural, ProceduralSource, ProjectChannel, ProjectSource, ReferenceSource, TweakValue};
 
-use crate::graph_library::{GraphLibrary, LibraryGraph, baked_map_for, tweak_value};
+use crate::graph_library::{GraphLibrary, LibraryGraph, baked_map_for, package_version, tweak_value};
 use crate::layers::content::{is_dangling, levels};
 use crate::layers::{Anchors, SetInput};
 use crate::resources::{MeshMapAlias, mesh_map_alias};
@@ -114,6 +114,7 @@ impl Cook<'_, '_> {
     fn recipe(&mut self, p: &Procedural, g: &LibraryGraph, reads: Reads, depth: usize) -> GraphRef {
         let d = &g.graph;
         let mut r = GraphRef::new(g.key.clone(), p.name());
+        r.source_package.clone_from(&g.package_version);
         for t in &p.tweaks {
             match (t.identifier.as_str(), &t.value) {
                 (SEED_INPUT, TweakValue::Int(v)) => r.seed = *v as u32,
@@ -375,29 +376,12 @@ pub fn filter(input: &SetInput, anchors: &Anchors, f: &FilterEffect, channels: O
     }
     r.output = mono_output(p, d);
     r.keep.extend(r.output.clone());
-    if is_standard_scalar_invert(p, &r, channels) {
-        let status = Status::approximated("standard scalar invert converted to TextureCraft's native Invert");
-        return GraphUse { effect: EffectKind::Filter(Filter::Invert), status, graph };
+    if package_version(p) == g.package_version.as_deref()
+        && let Some((filter, note)) = g.native.and_then(|native| native.filter(&r, channels))
+    {
+        return GraphUse { effect: EffectKind::Filter(filter), status: Status::approximated(note), graph };
     }
     GraphUse { effect: EffectKind::Graph { graph: r, projection: Projection::default() }, status: cook.status, graph }
-}
-
-fn is_standard_scalar_invert(p: &Procedural, graph: &GraphRef, channels: Option<&[Channel]>) -> bool {
-    // This packaged graph applies 1 - x to its own scalar stack and passes its coverage through unmodified.
-    const STANDARD_INVERT: &str = "56985cc99137f7944bfdbd8447cb14af";
-    graph.key == STANDARD_INVERT
-        && tweak(p, "invert").is_none_or(|value| value == 1.0)
-        && graph.output.as_deref() == Some("output")
-        && graph.inputs.get(&0) == Some(&GraphInput::StackAlpha { channel: None })
-        && graph.inputs.get(&1) == Some(&GraphInput::Stack { channel: None })
-        && graph.inputs.len() == 2
-        && channels.is_none_or(|channels| {
-            channels.iter().all(|channel| {
-                matches!(channel.kind(), ChannelKind::Scalar | ChannelKind::Signed)
-                    && graph.outputs.get(channel).is_some_and(|output| output == "output")
-                    && graph.output_alphas.get(channel).is_some_and(|output| output == "output_Alpha")
-            })
-        })
 }
 
 /// The grey output of procedural `p`'s graph rendered at `side` with its tweaks (red, row by row), for a brush tip or a

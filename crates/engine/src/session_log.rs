@@ -33,6 +33,33 @@ pub(crate) fn write_performance_log(entry: &LogEntry) {
     let _ = entry;
 }
 
+/// Keep one JSON Lines record per imported graph cook beside the desktop performance log.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn write_graph_cpu_report(report: &texturecraft_compose::graphs::GraphCpuReport) -> std::io::Result<()> {
+    use std::io::Write as _;
+    static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let Some(log) = PERFORMANCE_LOG.get() else { return Ok(()) };
+    let path = if log.file_name().is_some_and(|name| name == "performance.log") {
+        log.with_file_name("spp-graph-cpu.jsonl")
+    } else {
+        log.with_extension("spp-graph-cpu.jsonl")
+    };
+    #[derive(serde::Serialize)]
+    struct Entry<'a> {
+        version: u8,
+        time: String,
+        report: &'a texturecraft_compose::graphs::GraphCpuReport,
+    }
+    let mut line = serde_json::to_vec(&Entry { version: 1, time: chrono::Utc::now().to_rfc3339(), report })?;
+    line.push(b'\n');
+    let _guard = WRITE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(&line)
+}
+
 impl SessionLog {
     pub fn new() -> SessionLog {
         SessionLog(Vec::new())

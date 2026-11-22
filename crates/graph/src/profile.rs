@@ -15,6 +15,10 @@ pub trait Profiler: Send + Sync {
     fn node(&self, _id: u32, _kind: &str, _size: (usize, usize)) -> Option<Box<dyn Any + Send>> {
         None
     }
+    /// Observes a node with its bound settings after parameter expressions have been applied.
+    fn node_variant(&self, id: u32, node: &crate::graph::Node, size: (usize, usize)) -> Option<Box<dyn Any + Send>> {
+        self.node(id, &node.kind, size)
+    }
     /// Observes a result supplied by an accelerator, including one reused from its cache.
     fn accelerated_node(&self, _id: u32, _kind: &str) {}
     /// Observes a result still held on the accelerator and readable by compatible nodes.
