@@ -22,6 +22,7 @@ pub mod fill_hit_test;
 pub mod fill_mode;
 pub mod filter_lib;
 mod frame_target;
+mod graph_param_cmds;
 pub mod import_cmds;
 pub mod import_library_cmds;
 pub mod import_replay;

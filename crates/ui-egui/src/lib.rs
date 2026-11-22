@@ -34,6 +34,7 @@ mod filter_slot;
 pub mod fonts;
 mod generator_panel;
 pub mod gpu;
+mod graph_params;
 mod gray_slider;
 mod grid_tile;
 pub mod i18n;

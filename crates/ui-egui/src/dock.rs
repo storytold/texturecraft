@@ -2864,6 +2864,16 @@ fn fill_editor(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Value
     });
 
     ui.add_space(FILL_CHANNELS_GAP);
+    let mut graphs: Vec<&texturecraft_engine::core::GraphRef> = Vec::new();
+    for channel in channels.iter().filter(|c| enabled_channels.contains(c)) {
+        if let Some(graph) = fill.sources.get(channel).and_then(Source::graph)
+            && !graphs.iter().any(|other| other.shares_parameters_with(graph))
+        {
+            graphs.push(graph);
+            let target = with(base, json!({"channel": channel.id()}));
+            ui.push_id(("graph", channel.id()), |ui| crate::graph_params::show(app, ui, &target, graph));
+        }
+    }
     let anchors = anchors_below(app, reader);
     for channel in channels {
         if enabled_channels.contains(&channel) {
@@ -3269,7 +3279,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
                         projection_editor(app, ui, projection, "effect.set", &json!({"effect": id}), &format!("maskfill{id}"));
                     }
                 }
-                Source::Graph(_) => {} // The source slot already names it.
+                Source::Graph(graph) => crate::graph_params::show(app, ui, &json!({"effect": id}), graph),
             }
             if anchors.is_empty() {
                 ui.label(RichText::new(tr("Add an anchor point to a layer below to use its stack as a mask.")).color(tokens.text_dim));
@@ -3326,6 +3336,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
             }
         }
         EffectKind::Filter(filter) => filter_properties(app, ui, id, filter),
+        EffectKind::Graph { graph, .. } => crate::graph_params::show(app, ui, &json!({"effect": id}), graph),
         EffectKind::ColorSelection { colors, tolerance, .. } => {
             crate::color_selection_editor::color_selection_properties(app, ui, effect_id, colors, *tolerance)
         }

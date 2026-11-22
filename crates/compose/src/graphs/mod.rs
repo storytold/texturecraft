@@ -17,8 +17,10 @@
 pub mod budget;
 pub mod kept;
 pub mod once;
+mod parameters;
 mod profiling;
 pub mod spill;
+pub use parameters::GraphParameter;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -428,6 +430,7 @@ pub struct CookCache {
     problems: Mutex<BTreeMap<GraphUse, UseProblem>>,
     renders: AtomicUsize,
     parsed: Mutex<HashMap<String, Arc<Graph>>>,
+    parameters: Mutex<HashMap<String, Arc<[GraphParameter]>>>,
     kinds: Mutex<HashMap<String, u128>>,
     baked_fingerprints: Mutex<Fingerprints<Texels>>,
     image_fingerprints: Mutex<Fingerprints<ImageRes>>,

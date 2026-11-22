@@ -130,6 +130,17 @@ pub struct GraphRef {
 }
 
 impl GraphRef {
+    /// A material fill may represent one graph instance by a source for each output channel.
+    pub fn shares_parameters_with(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.name == other.name
+            && self.params == other.params
+            && self.inputs == other.inputs
+            && self.keep == other.keep
+            && self.alpha_output == other.alpha_output
+            && self.seed == other.seed
+    }
+
     /// A reference to the graph with text key `key`, everything else at its defaults.
     pub fn new(key: impl Into<String>, name: impl Into<String>) -> GraphRef {
         GraphRef {
