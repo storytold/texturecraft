@@ -17,6 +17,7 @@
 pub mod budget;
 pub mod kept;
 pub mod once;
+mod outputs;
 mod parameters;
 mod profiling;
 pub mod spill;
@@ -430,6 +431,7 @@ pub struct CookCache {
     problems: Mutex<BTreeMap<GraphUse, UseProblem>>,
     renders: AtomicUsize,
     parsed: Mutex<HashMap<String, Arc<PreparedGraph>>>,
+    outputs: Mutex<outputs::OutputCache>,
     parameters: Mutex<HashMap<String, Arc<[GraphParameter]>>>,
     kinds: Mutex<HashMap<String, u128>>,
     baked_fingerprints: Mutex<Fingerprints<Texels>>,
@@ -1021,13 +1023,15 @@ impl GraphStore {
             let status = if cooked.is_ok() { "finished" } else { "stopped" };
             emit(format!("Graph {name:?}: {status} ({key})"));
         }
-        let cooked = cooked?;
+        let (cooked, output_keys) = cooked?;
         // a render stopped part way never gets here: it is an error
         if let Some(k) = &kept {
             k.put(key, &kept::encode(&cooked));
         }
         self.cooks.filled.fetch_add(1, Ordering::Relaxed);
-        Ok(Arc::new(cooked))
+        let cooked = Arc::new(cooked);
+        lock(&self.read_cache().outputs).remember(&cooked, output_keys);
+        Ok(cooked)
     }
 
     /// The cook `use_` reads for `g` (see [`GraphStore::cook`]), remembered as the use's; when there is none now, the one
@@ -1067,7 +1071,7 @@ impl GraphStore {
         depth: usize,
         trace: Option<CookTrace>,
         accelerator: Option<Arc<dyn GraphAccelerator>>,
-    ) -> Result<Cooked, String> {
+    ) -> Result<(Cooked, outputs::OutputKeys), String> {
         let side = env.side;
         let pool = self.pool();
         let plan = self.parsed(&g.key)?;
@@ -1083,6 +1087,21 @@ impl GraphStore {
         if names.is_empty() {
             names.extend(have.first().map(String::as_str));
         }
+        let output_keys = if given.is_empty() { self.output_keys(g, env, &plan, &names, accelerator.as_deref()) } else { Vec::new() };
+        let reused = lock(&self.read_cache().outputs).find(&output_keys);
+        if let Some(emit) = &trace
+            && !reused.is_empty()
+        {
+            emit(format!("Graph {:?}: reused {} unchanged outputs", trace_name(&g.name), reused.len()));
+        }
+        names.retain(|name| !reused.contains_key(*name));
+        let linear: BTreeSet<String> =
+            plan.meta.get("working").map(|w| w.trim_matches('"').split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
+        if names.is_empty() {
+            return Ok((Cooked::new(reused, linear), output_keys));
+        }
+        let inputs = graph.image_inputs(&names);
+        let needed = |id| inputs.as_ref().is_none_or(|inputs| inputs.contains(id));
         let mut images: Vec<Option<Tex>> = Vec::new();
         let mut put = |k: u32, t: Tex| {
             let k = k as usize;
@@ -1093,7 +1112,7 @@ impl GraphStore {
                 *slot = Some(t);
             }
         };
-        for (k, input) in &g.inputs {
+        for (k, input) in g.inputs.iter().filter(|(k, _)| needed(k)) {
             match input {
                 GraphInput::Baked(m) => put(*k, baked_tex(env.baked, *m, side, pool.as_deref())),
                 GraphInput::Constant(c) => put(*k, Tex::solid(side, side, [c[0], c[1], c[2], 1.0])),
@@ -1111,7 +1130,7 @@ impl GraphStore {
                 GraphInput::Nested(_) | GraphInput::Stack { .. } | GraphInput::StackAlpha { .. } | GraphInput::Anchor { .. } => {}
             }
         }
-        for (k, t) in given {
+        for (k, t) in given.iter().filter(|(k, _)| needed(k)) {
             put(*k, t.clone());
         }
         // the render's nodes as they finish, for the store's progress (nothing computed depends on it)
@@ -1133,9 +1152,9 @@ impl GraphStore {
             ..EvalContext::default()
         };
         let outs = evaluate(&graph, &ec, side, images, given, &names)?;
-        let linear: BTreeSet<String> =
-            plan.meta.get("working").map(|w| w.trim_matches('"').split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
-        Ok(Cooked::from_textures(outs, linear))
+        let mut tiles = reused;
+        tiles.extend(outs.into_iter().map(|(name, tex)| (name, quantize(&tex))));
+        Ok((Cooked::new(tiles, linear), output_keys))
     }
 }
 
@@ -1241,7 +1260,11 @@ fn evaluate(
     given: &[(u32, Tex)],
     outputs: &[&str],
 ) -> Result<BTreeMap<String, Tex>, String> {
-    let colour: Vec<u32> = given.iter().filter(|(k, t)| reads_grey(graph, *k) && !t.px.iter().all(|p| p[0] == p[1] && p[1] == p[2])).map(|(k, _)| *k).collect();
+    let colour: Vec<u32> = given
+        .iter()
+        .filter(|(k, t)| images.get(*k as usize).is_some_and(Option::is_some) && reads_grey(graph, *k) && !t.px.iter().all(|p| p[0] == p[1] && p[1] == p[2]))
+        .map(|(k, _)| *k)
+        .collect();
     if colour.is_empty() {
         // (the images handed over: the runtime holds them without a copy)
         return graph.evaluate_owned(ec, side, images, outputs).map_err(|e| e.to_string());

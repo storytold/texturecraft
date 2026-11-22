@@ -762,15 +762,23 @@ pub struct EvalAll {
 pub struct PreparedGraph {
     graph: Graph,
     programs: Mutex<HashMap<String, Result<Arc<crate::func::Prog>, String>>>,
+    dependencies: OnceLock<BTreeMap<String, BTreeSet<String>>>,
 }
 
 impl PreparedGraph {
     pub fn parse(text: &str) -> Result<Self, Error> {
-        Ok(Self { graph: Graph::parse(text)?, programs: Mutex::default() })
+        Ok(Self { graph: Graph::parse(text)?, programs: Mutex::default(), dependencies: OnceLock::new() })
     }
 
     pub fn instance(&self, seed: u32) -> GraphInstance<'_> {
         GraphInstance { plan: self, nodes: BTreeMap::new(), seed }
+    }
+
+    /// Values that can affect this output via a reachable node, function, or pattern.
+    pub fn output_parameters(&self, output: &str) -> Option<&BTreeSet<String>> {
+        self.dependencies
+            .get_or_init(|| self.graph.output_nodes().into_iter().map(|(_, name, root)| (name, output_parameters(&self.graph, root))).collect())
+            .get(output)
     }
 
     fn program(&self, name: &str) -> Result<Arc<crate::func::Prog>, String> {
@@ -781,6 +789,28 @@ impl PreparedGraph {
         self.programs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_owned(), program.clone());
         program
     }
+}
+
+fn output_parameters(graph: &Graph, root: u32) -> BTreeSet<String> {
+    let reachable = reached(graph, &[root]);
+    let mut parameters: BTreeSet<_> = graph.exposed.iter().filter(|p| reachable.contains(&p.node)).map(|p| p.label.clone()).collect();
+    let mut pending: Vec<&Node> = reachable.iter().filter_map(|id| graph.nodes.get(id)).collect();
+    let mut visited = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind.as_str(), "input_value" | "f_graph_input")
+            && let Some(name) = node.strs.get("name")
+        {
+            parameters.insert(name.clone());
+        }
+        for (_, name) in node.strs.iter().filter(|(slot, _)| matches!(slot.as_str(), "fn" | "program" | "graph") || slot.starts_with("fn.")) {
+            if visited.insert(name)
+                && let Some(inner) = graph.subgraphs.get(name)
+            {
+                pending.extend(inner.nodes.values());
+            }
+        }
+    }
+    parameters
 }
 
 impl std::ops::Deref for PreparedGraph {
@@ -804,8 +834,22 @@ impl GraphInstance<'_> {
     }
 
     pub fn work_nodes(&self, outputs: &[&str]) -> usize {
+        self.reachable_nodes(outputs).len()
+    }
+
+    /// External images the selected outputs can read. A computed input index can read any slot.
+    pub fn image_inputs(&self, outputs: &[&str]) -> Option<BTreeSet<u32>> {
+        self.reachable_nodes(outputs)
+            .into_iter()
+            .filter_map(|id| self.nodes.get(&id).or_else(|| self.plan.nodes.get(&id)))
+            .filter(|node| node.kind == "input")
+            .map(|node| (!node.strs.contains_key("fn.idx")).then(|| node.nums.get("idx").copied().unwrap_or(0.0).max(0.0) as u32))
+            .collect()
+    }
+
+    fn reachable_nodes(&self, outputs: &[&str]) -> HashSet<u32> {
         let roots: Vec<_> = self.plan.output_nodes().into_iter().filter(|(_, name, _)| outputs.contains(&name.as_str())).map(|(_, _, id)| id).collect();
-        reached(self.plan, &roots).len()
+        reached(self.plan, &roots)
     }
 
     pub fn bind_number(&mut self, id: u32, slot: &str, value: f32) {
