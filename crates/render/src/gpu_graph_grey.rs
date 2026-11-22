@@ -15,7 +15,8 @@ const ENLARGE: u32 = 0;
 const REDUCE: u32 = 1;
 const LEVELS: u32 = 2;
 const BLEND_OFFSET: u32 = 3;
-const SHADER: &str = concat!(include_str!("shaders/graph_grey.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
+const SHADER: &str =
+    concat!(include_str!("shaders/graph_grey.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"), "\n", include_str!("shaders/graph_blend.wgsl"));
 
 pub(crate) struct GreyRasterizer {
     device: wgpu::Device,
@@ -82,12 +83,19 @@ impl GreyRasterizer {
                 return Ok(GreyDevicePixels::from_resident(image).filter(|pixels| pixels.device == self.device).cloned());
             }
         };
-        let Some(bytes) = packed_bytes(host.w, host.h).filter(|&bytes| bytes / 2 == host.px.len() as u64) else { return Ok(None) };
+        if !packed_bytes(host.w, host.h).is_some_and(|bytes| bytes / 2 == host.px.len() as u64) {
+            return Ok(None);
+        }
+        self.upload_pixels(bytemuck::cast_slice(&host.px))
+    }
+
+    pub(crate) fn upload_pixels(&self, pixels: &[u8]) -> Result<Option<GreyDevicePixels>, String> {
+        let bytes = pixels.len() as u64;
         let Some(reservation) = self.reserve(bytes) else { return Ok(None) };
-        let buffer = crate::gpu_trace::scoped(&self.device, "resident graph grayscale upload", || {
+        let buffer = crate::gpu_trace::scoped(&self.device, "resident graph pixel upload", || {
             self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("resident graph grayscale upload"),
-                contents: bytemuck::cast_slice(&host.px),
+                label: Some("resident graph pixel upload"),
+                contents: pixels,
                 usage: RESIDENT_BUFFER_USAGE,
             })
         })?;
@@ -321,8 +329,16 @@ pub(crate) struct GreyDevicePixels {
 
 impl GreyDevicePixels {
     pub(crate) fn from_resident(image: &ResidentGrey16) -> Option<&Self> {
-        let pixels = image.pixels.as_any().downcast_ref::<Self>()?;
-        (pixels.buffer.size() == packed_bytes(image.w, image.h)?).then_some(pixels)
+        Self::from_pixels(image.pixels.as_ref(), packed_bytes(image.w, image.h)?)
+    }
+
+    pub(crate) fn from_pixels(image: &dyn ResidentGreyPixels, bytes: u64) -> Option<&Self> {
+        let pixels = image.as_any().downcast_ref::<Self>()?;
+        (pixels.buffer.size() == bytes).then_some(pixels)
+    }
+
+    pub(crate) fn belongs_to(&self, device: &wgpu::Device) -> bool {
+        &self.device == device
     }
 
     pub(crate) fn retain_until_completed(&self, queue: &wgpu::Queue) {

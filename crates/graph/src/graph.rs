@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Node graph: text format, validation, subgraphs, packages and evaluation.
-use crate::accelerator::{GreyInput, GreyTransformInput, HalfTransform, PixelImageInput, ResidentGrey16, ResidentGreyFloat, ResidentGreyPass};
+use crate::accelerator::{
+    ColorInput, GreyInput, GreyTransformInput, HalfTransform, PixelImageInput, ResidentColor16, ResidentColorOutput, ResidentColorPass, ResidentGrey16,
+    ResidentGreyFloat, ResidentGreyPass,
+};
 pub use crate::context::Logging;
 use crate::context::{EvalContext, LiveBytes};
 use crate::expr;
@@ -2213,6 +2216,7 @@ enum NodeValue {
     Host(Val),
     Device(Arc<DeviceValue>),
     DeviceFloat(Arc<DeviceFloatValue>),
+    DeviceColor(Arc<DeviceColorValue>),
 }
 
 struct DeviceValue {
@@ -2225,12 +2229,18 @@ struct DeviceFloatValue {
     host: OnceLock<Arc<crate::tex::Grey>>,
 }
 
+struct DeviceColorValue {
+    image: ResidentColor16,
+    host: OnceLock<Val>,
+}
+
 impl NodeValue {
     fn dims(&self) -> (usize, usize) {
         match self {
             Self::Host(image) => image.dims(),
             Self::Device(value) => (value.image.w, value.image.h),
             Self::DeviceFloat(value) => (value.image.w, value.image.h),
+            Self::DeviceColor(value) => (value.image.w, value.image.h),
         }
     }
 
@@ -2239,6 +2249,7 @@ impl NodeValue {
             Self::Host(image) => image.bytes(),
             Self::Device(value) => value.image.w * value.image.h * 2,
             Self::DeviceFloat(value) => value.image.w * value.image.h * 4,
+            Self::DeviceColor(value) => value.image.w * value.image.h * 8,
         }
     }
 
@@ -2250,11 +2261,20 @@ impl NodeValue {
         }
     }
 
+    fn color_input(&self) -> Option<ColorInput<'_>> {
+        match self {
+            Self::Host(Val::Rgba(image)) => Some(ColorInput::Host(image)),
+            Self::DeviceColor(value) => Some(ColorInput::Device(&value.image)),
+            _ => self.packed_grey().map(ColorInput::Grey),
+        }
+    }
+
     fn into_host(self, id: u32, ec: &EvalContext) -> Result<Val, Error> {
         let value = match self {
             Self::Host(image) => return Ok(image),
             Self::Device(value) => value,
             Self::DeviceFloat(value) => return value.materialize(id, ec),
+            Self::DeviceColor(value) => return value.materialize(id, ec),
         };
         if let Some(image) = value.host.get() {
             return Ok(Val::Grey16(image.clone()));
@@ -2295,6 +2315,29 @@ impl DeviceFloatValue {
         }
         let image = Arc::new(crate::tex::Grey { w: *w, h: *h, px });
         Ok(Val::Grey(self.host.get_or_init(|| image).clone(), 1.0))
+    }
+}
+
+impl DeviceColorValue {
+    fn materialize(&self, id: u32, ec: &EvalContext) -> Result<Val, Error> {
+        if let Some(image) = self.host.get() {
+            return Ok(image.clone());
+        }
+        let ResidentColor16 { w, h, pixels, .. } = &self.image;
+        let read = pixels.read(&ec.cancel);
+        if ec.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let pixels = read.map_err(|reason| Error::GpuReadback(id, reason))?;
+        if Some(pixels.len()) != w.checked_mul(*h).and_then(|n| n.checked_mul(4)) {
+            return Err(Error::GpuReadback(id, "incomplete color result".into()));
+        }
+        if let Some(profiler) = &ec.profiler {
+            profiler.resident_readback(id, pixels.len() * 2);
+        }
+        let px = pixels.as_chunks::<4>().0.iter().map(|p| p.map(|channel| f32::from(channel) / 65535.0)).collect();
+        let image = Val::of(Tex { w: *w, h: *h, px }).quantised(65535.0);
+        Ok(self.host.get_or_init(|| image).clone())
     }
 }
 
@@ -2534,10 +2577,10 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     };
     let format = NodeFormat { code: fmt, read_rounding, steps: div.map(|div| crate::tex::Steps { read_rounding, fmt, div }) };
     // (for the node log: every input grey)
-    let grey_ins = !ins.is_empty() && ins.values().all(|v| !matches!(v, NodeValue::Host(Val::Rgba(_))));
+    let grey_ins = !ins.is_empty() && ins.values().all(|v| !matches!(v, NodeValue::Host(Val::Rgba(_)) | NodeValue::DeviceColor(_)));
     let resident = if compiled && (!resize_inputs || samples_warp_map) {
         if let Some(held) = forward_switch(g, n, &ins, ctx, fmt).or_else(|| forward_identity(n, ins.get("in"), sz, fmt)) {
-            if matches!(held, NodeValue::Device(_) | NodeValue::DeviceFloat(_))
+            if matches!(held, NodeValue::Device(_) | NodeValue::DeviceFloat(_) | NodeValue::DeviceColor(_))
                 && let Some(profiler) = &ctx.ec.profiler
             {
                 profiler.resident_node(id, &n.kind);
@@ -2588,6 +2631,7 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
             NodeValue::Host(Val::Grey(..)) => "grey",
             NodeValue::Host(Val::Grey16(_)) => "grey in steps",
             NodeValue::Device(_) | NodeValue::DeviceFloat(_) => "grey in GPU memory",
+            NodeValue::DeviceColor(_) => "color in GPU memory",
         };
         eprintln!("         node {id} held {form} {}x{}{}; results held {} MB", sz.0, sz.1, if grey_ins { ", grey inputs" } else { "" }, cache.live >> 20);
     }
@@ -4695,8 +4739,71 @@ fn compute_resident_image(id: u32, n: &Node, ins: &BTreeMap<String, NodeValue>, 
             return Ok(Some(value));
         }
     }
-    compute_resident_grey(id, n, ins, ctx, format.steps.as_ref())
-        .map(|value| value.map(|image| NodeValue::Device(Arc::new(DeviceValue { image, host: OnceLock::new() }))))
+    if let Some(image) = compute_resident_grey(id, n, ins, ctx, format.steps.as_ref())? {
+        return Ok(Some(NodeValue::Device(Arc::new(DeviceValue { image, host: OnceLock::new() }))));
+    }
+    compute_resident_color(id, n, ins, ctx, format.code)
+}
+
+fn compute_resident_color(id: u32, n: &Node, ins: &BTreeMap<String, NodeValue>, ctx: &Ctx<'_>, format: u32) -> Result<Option<NodeValue>, Error> {
+    let Some(accelerator) = &ctx.ec.accelerator else { return Ok(None) };
+    if format != crate::measured::COMPILED_16_BIT || !matches!(n.kind.as_str(), "blend" | "grayscale_conversion") || rolls(n) {
+        return Ok(None);
+    }
+    let resident = ins.values().any(|v| matches!(v, NodeValue::Device(_) | NodeValue::DeviceColor(_)));
+    let area = ctx.size * ctx.height;
+    if !ctx.size.is_multiple_of(2) || area < if resident { 256 * 1024 } else { 1024 * 1024 } {
+        return Ok(None);
+    }
+    let input = |slot| ins.get(slot).and_then(NodeValue::color_input);
+    let number = |key, default| n.nums.get(key).copied().unwrap_or(default);
+    let binary_alpha = |input| match input {
+        ColorInput::Grey(image) => Some(image.info().3),
+        ColorInput::Device(image) => image.alpha,
+        ColorInput::Host(image) => {
+            let alpha = image.px.first()?.get(3).copied()?;
+            (crate::tex::grey_alpha_ok(alpha) && image.px.iter().all(|p| p[3].to_bits() == alpha.to_bits())).then_some(alpha)
+        }
+    };
+    let pass = if n.kind == "grayscale_conversion" {
+        let Some(source) = input("in") else { return Ok(None) };
+        let weights = [number("r", 0.3), number("g", 0.59), number("b", 0.11), number("a", 0.0)];
+        if !weights.into_iter().all(f32::is_finite) {
+            return Ok(None);
+        }
+        ResidentColorPass::Grayscale { source, weights, alpha: binary_alpha(source) }
+    } else {
+        let (Some(foreground), Some(background)) = (input("fg"), input("bg")) else { return Ok(None) };
+        let mask = if n.ins.contains_key("mask") {
+            let Some(mask) = input("mask") else { return Ok(None) };
+            Some(mask)
+        } else {
+            None
+        };
+        if [Some(foreground), Some(background), mask].into_iter().flatten().all(|source| matches!(source, ColorInput::Grey(_))) {
+            return Ok(None);
+        }
+        let mode = number("mode", 0.0) as u32;
+        let opacity = number("opacity", 1.0);
+        let alpha_mode = number("alpha_mode", 1.0) as u32;
+        if !crate::accelerator::packed_blend_mode(mode) || !full_blend_frame(n) || !opacity.is_finite() {
+            return Ok(None);
+        }
+        let alpha = if !matches!(alpha_mode, 0 | 2 | 3) && (alpha_mode != 4 || mode != 21) { binary_alpha(background) } else { None };
+        ResidentColorPass::Blend { foreground, background, mask, mode, opacity, alpha_mode, alpha }
+    };
+    let result = accelerator.resident_color(pass, &ctx.ec.cancel);
+    if ctx.ec.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let Some(result) = result.map_err(|reason| Error::BadParam(id, reason))? else { return Ok(None) };
+    if let Some(profiler) = &ctx.ec.profiler {
+        profiler.resident_node(id, &n.kind);
+    }
+    Ok(Some(match result {
+        ResidentColorOutput::Grey(image) => NodeValue::Device(Arc::new(DeviceValue { image, host: OnceLock::new() })),
+        ResidentColorOutput::Color(image) => NodeValue::DeviceColor(Arc::new(DeviceColorValue { image, host: OnceLock::new() })),
+    }))
 }
 
 /// A packed image already at the required size and quantization can pass through an identity unchanged.
@@ -4708,6 +4815,7 @@ fn forward_identity(n: &Node, source: Option<&NodeValue>, size: (usize, usize), 
     }
     let same_storage = match source {
         NodeValue::DeviceFloat(_) => format == COMPILED_HALF,
+        NodeValue::DeviceColor(_) => format == COMPILED_16_BIT,
         value => value.packed_grey().is_some_and(|packed| matches!((packed.info().2, format), (65535.0, COMPILED_16_BIT) | (255.0, COMPILED_8_BIT))),
     };
     if matches!(n.kind.as_str(), "dot" | "output") && (format == 0 || same_storage) {
@@ -4819,7 +4927,7 @@ fn compute_resident_textured_pixel(id: u32, n: &Node, ins: &BTreeMap<String, Nod
             ins.get(slot).map(|value| match value {
                 NodeValue::Host(image) => Some((slot, PixelImageInput::Host(image.img_ref()))),
                 NodeValue::DeviceFloat(value) => Some((slot, PixelImageInput::Float(&value.image))),
-                NodeValue::Device(_) => None,
+                NodeValue::Device(_) | NodeValue::DeviceColor(_) => None,
             })
         })
         .collect::<Option<Vec<_>>>()

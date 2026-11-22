@@ -5,8 +5,8 @@ use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use texturecraft_graph::accelerator::{
-    Accelerator, GreyInput, GreyPass, HalfTransform, PixelImageInput, PixelOutput, PixelRequest, ResidentFilter, ResidentGrey16, ResidentGreyFloat,
-    ResidentGreyPass,
+    Accelerator, GreyInput, GreyPass, HalfTransform, PixelImageInput, PixelOutput, PixelRequest, ResidentColorOutput, ResidentColorPass, ResidentFilter,
+    ResidentGrey16, ResidentGreyFloat, ResidentGreyPass,
 };
 use texturecraft_graph::context::Cancel;
 use texturecraft_graph::func::PixelShader;
@@ -46,6 +46,7 @@ pub struct GraphAccelerator {
     patterns: OnceLock<Result<crate::gpu_graph_patterns::PatternRasterizer, String>>,
     grey: OnceLock<Result<GreyRasterizer, String>>,
     half: OnceLock<Result<HalfRasterizer, String>>,
+    color: OnceLock<Result<crate::gpu_graph_color::ColorRasterizer, String>>,
     filters: OnceLock<Result<crate::gpu_graph_filter::FilterRasterizer, String>>,
 }
 
@@ -96,6 +97,7 @@ impl GraphAccelerator {
             hashers: std::array::from_fn(|_| RandomState::new()),
             patterns: OnceLock::new(),
             grey: OnceLock::new(),
+            color: OnceLock::new(),
             filters: OnceLock::new(),
             half: OnceLock::new(),
         }
@@ -563,6 +565,14 @@ impl Accelerator for GraphAccelerator {
     fn resident_grey(&self, pass: ResidentGreyPass<'_>, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
         let Some(rasterizer) = self.grey_rasterizer() else { return Ok(None) };
         resident_or_fallback(rasterizer.render_resident(pass, cancel), cancel)
+    }
+
+    fn resident_color(&self, pass: ResidentColorPass<'_>, cancel: &Cancel) -> Result<Option<ResidentColorOutput>, String> {
+        let Some(pool) = self.grey_rasterizer() else { return Ok(None) };
+        let rasterizer =
+            self.color.get_or_init(|| crate::gpu_graph_color::ColorRasterizer::new(&self.device, &self.queue).inspect_err(|reason| log::warn!("{reason}")));
+        let Ok(rasterizer) = rasterizer else { return Ok(None) };
+        resident_or_fallback(rasterizer.render(pass, pool, cancel), cancel)
     }
 
     fn resident_pixel(&self, shader: PixelShader, images: &[GreyInput<'_>], size: [usize; 2], cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {

@@ -121,6 +121,45 @@ pub fn packed_blend_mode(mode: u32) -> bool {
     matches!(mode, 0..=16 | 20..=21 | 32..=36)
 }
 
+/// Packed RGBA in the compiled graph's unsigned 16-bit steps.
+#[derive(Debug)]
+pub struct ResidentColor16 {
+    pub w: usize,
+    pub h: usize,
+    pub alpha: Option<f32>,
+    pub pixels: Arc<dyn ResidentGreyPixels>,
+}
+
+#[derive(Clone, Copy)]
+pub enum ColorInput<'a> {
+    Grey(GreyInput<'a>),
+    Host(&'a Tex),
+    Device(&'a ResidentColor16),
+}
+
+pub enum ResidentColorPass<'a> {
+    Blend {
+        foreground: ColorInput<'a>,
+        background: ColorInput<'a>,
+        mask: Option<ColorInput<'a>>,
+        mode: u32,
+        opacity: f32,
+        alpha_mode: u32,
+        alpha: Option<f32>,
+    },
+    Grayscale {
+        source: ColorInput<'a>,
+        weights: [f32; 4],
+        /// Known binary alpha allows storage in the packed grayscale path.
+        alpha: Option<f32>,
+    },
+}
+
+pub enum ResidentColorOutput {
+    Grey(ResidentGrey16),
+    Color(ResidentColor16),
+}
+
 pub struct ResidentFilter<'a> {
     pub source: GreyInput<'a>,
     pub size: [usize; 2],
@@ -159,6 +198,10 @@ pub trait Accelerator: Send + Sync {
 
     /// Execute a grayscale operation without fetching its result back to the host.
     fn resident_grey(&self, _pass: ResidentGreyPass<'_>, _cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+        Ok(None)
+    }
+
+    fn resident_color(&self, _pass: ResidentColorPass<'_>, _cancel: &Cancel) -> Result<Option<ResidentColorOutput>, String> {
         Ok(None)
     }
 
