@@ -181,18 +181,11 @@ fn codec_write_error(error: craft_tcraft::Error) -> std::io::Error {
 }
 
 fn write_tiles(w: &mut impl Write, img: &TileImage) -> std::io::Result<()> {
-    // Read lazy tiles into a temporary image so saving does not keep them in memory.
-    let saved;
-    let img = if img.is_loaded() {
-        img
-    } else {
-        saved = img.clone();
-        let count = saved.allocated().count();
-        if count != img.allocated_count() {
-            return Err(std::io::Error::other("could not read the saved paint tiles"));
-        }
-        &saved
-    };
+    let expected = img.allocated_count();
+    let img = img.temporarily_loaded();
+    if img.allocated_count() != expected {
+        return Err(std::io::Error::other("could not read the saved paint tiles"));
+    }
     let layout = craft_tcraft::Layout { width: img.width(), height: img.height(), components: img.comps() };
     let count = u32::try_from(img.allocated_count()).map_err(std::io::Error::other)?;
     let tiles = img.allocated().map(|(x, y)| (x, y, img.tile(x, y).unwrap_or_default()));
@@ -742,9 +735,7 @@ fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mu
     }
 }
 
-/// The cooked graph results a project file holds, read from it one at a time when they are needed. The file is opened
-/// for each read, by its path: a save over it (written beside it and renamed) keeps every cook the project still
-/// reads, under the same entry names. A cook that cannot be read any more is rendered again, the same pixels.
+/// Read cooked graph results on demand from the archive opened by this document, including after a save replaces it.
 #[cfg(not(target_arch = "wasm32"))]
 struct FileCooks {
     origin: Origin,

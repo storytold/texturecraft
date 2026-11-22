@@ -124,6 +124,18 @@ impl TileImage {
         bytes
     }
 
+    /// Borrow the resident image, or read it for one operation without filling the shared cache.
+    pub fn temporarily_loaded(&self) -> std::borrow::Cow<'_, Self> {
+        if self.is_loaded() {
+            std::borrow::Cow::Borrowed(self)
+        } else {
+            let mut image = self.clone();
+            image.tiles = Arc::new(OnceLock::from(self.read()));
+            image.source = None;
+            std::borrow::Cow::Owned(image)
+        }
+    }
+
     /// `f` on every allocated tile (coordinates and texels), in row order, without keeping tiles read for it: an image
     /// not held is read for the call and let go after (what saving does).
     pub fn for_each_tile<E>(&self, mut f: impl FnMut(u32, u32, &[u16]) -> Result<(), E>) -> Result<(), E> {

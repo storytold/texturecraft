@@ -1092,9 +1092,10 @@ fn a_project_opened_from_its_file_reads_cooks_when_they_are_needed() {
     save_project(&path, &back).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert_eq!(*back.graphs.cooked(&key).unwrap(), *pf.graphs.cooked(&key).unwrap(), "still read after the save over the file");
-    // without the file the cook is not there (it is rendered again when it is needed)
+    // A lazy snapshot can still read its original cook after the path is removed.
     std::fs::remove_dir_all(&dir).unwrap();
-    assert!(back.graphs.cooked(&key).is_none());
+    assert_eq!(*back.graphs.cooked(&key).unwrap(), *pf.graphs.cooked(&key).unwrap());
+    assert_eq!(back.graphs.held_bytes(), 0, "reading from the retained file does not pin the cook");
 }
 
 #[test]
