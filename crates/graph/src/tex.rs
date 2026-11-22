@@ -807,46 +807,52 @@ pub(crate) enum GreyOut {
 /// The pixels `pixel(i)` (value, alpha) of a `w` x `h` image, spread over the cores in pieces of rows, as a grey image:
 /// `None` when the alphas are not all 1 or all +0. With `steps`, held in steps when every value is one (else as floats).
 pub(crate) fn fill_grey(w: usize, h: usize, pixel: impl Fn(usize) -> (f32, f32) + Sync, steps: Option<&Steps>) -> Option<GreyOut> {
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    // the alphas met: 1, +0, anything else; a value that is no step
-    let (one, zero, other, off) = (AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false));
-    let seen = |a: f32| match a.to_bits() {
-        ONE_BITS => one.store(true, Relaxed),
-        ZERO_BITS => zero.store(true, Relaxed),
-        _ => other.store(true, Relaxed),
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    const OPAQUE: u8 = 1;
+    const TRANSPARENT: u8 = 2;
+    const OTHER_ALPHA: u8 = 4;
+    const OFF_STEP: u8 = 8;
+    let flags = AtomicU8::new(0);
+    let alpha_flag = |a: f32| match a.to_bits() {
+        ONE_BITS => OPAQUE,
+        ZERO_BITS => TRANSPARENT,
+        _ => OTHER_ALPHA,
     };
-    let alpha = || match (one.load(Relaxed), zero.load(Relaxed), other.load(Relaxed)) {
-        (_, false, false) => Some(1.0),
-        (false, true, false) => Some(0.0),
+    let alpha = || match flags.load(Relaxed) {
+        0 | OPAQUE => Some(1.0),
+        TRANSPARENT => Some(0.0),
         _ => None,
     };
     if let Some(st) = steps {
         let mut px = vec![0u16; w * h];
         par_rows(&mut px, w, |start, chunk| {
+            let mut local = 0;
             for (j, d) in chunk.iter_mut().enumerate() {
                 let (v, a) = pixel(start + j);
-                seen(a);
-                match st.step(v) {
-                    Some(q) => *d = q,
-                    None => {
-                        off.store(true, Relaxed);
-                        return;
-                    }
-                }
+                let Some(q) = st.step(v) else {
+                    flags.fetch_or(OFF_STEP, Relaxed);
+                    return;
+                };
+                *d = q;
+                local |= alpha_flag(a);
             }
+            flags.fetch_or(local, Relaxed);
         });
-        if !off.load(Relaxed) {
+        if flags.load(Relaxed) & OFF_STEP == 0 {
             let a = alpha()?;
             return Some(GreyOut::Q(Grey16 { w, h, px, div: st.div, alpha: a }));
         }
+        flags.store(0, Relaxed);
     }
     let mut px = vec![0.0f32; w * h];
     par_rows(&mut px, w, |start, chunk| {
+        let mut local = 0;
         for (j, d) in chunk.iter_mut().enumerate() {
             let (v, a) = pixel(start + j);
-            seen(a);
             *d = v;
+            local |= alpha_flag(a);
         }
+        flags.fetch_or(local, Relaxed);
     });
     let a = alpha()?;
     Some(GreyOut::F(Grey { w, h, px }, a))
