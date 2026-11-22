@@ -12,20 +12,6 @@ struct Params {
 @group(0) @binding(2) var<storage, read> auxiliary: array<u32>;
 @group(0) @binding(3) var<storage, read_write> output: array<u32>;
 
-fn limit(p: i32, n: i32, wrap: bool) -> u32 {
-    if wrap {
-        // The packed input axes are powers of two
-        return u32(p) & u32(n - 1);
-    }
-    return u32(clamp(p, 0, n - 1));
-}
-
-fn address(p: vec2<i32>, size: vec2<u32>, wraps: vec2<bool>) -> u32 {
-    let x = limit(p.x, i32(size.x), wraps.x);
-    let y = limit(p.y, i32(size.y), wraps.y);
-    return y * size.x + x;
-}
-
 fn unpack_grey(word: u32, i: u32) -> u32 {
     return (word >> ((i & 1u) * 16u)) & 0xffffu;
 }
@@ -117,18 +103,9 @@ fn sampled_slope(uv: vec2<f32>) -> vec2<f32> {
 }
 
 fn stepped_front(uv: vec2<f32>) -> f32 {
-    let size = vec2<f32>(params.source.xy);
-    let half_texel = 0.5 / size;
-    let coords = select(clamp(uv, half_texel, 1.0 - half_texel), uv, params.control.zw != vec2<u32>(0u));
-    let scaled = coords * size;
-    let whole = floor(scaled);
-    let fraction = scaled - whole;
-    // Subtract the half-texel in separate integer units so a large coordinate cannot move a rounding tie
-    let previous = fraction < vec2<f32>(0.5);
-    let base = vec2<i32>(whole) - select(vec2<i32>(0), vec2<i32>(1), previous);
-    let steps = fraction * 256.0;
-    let rounded = floor(steps) + select(vec2<f32>(0.0), vec2<f32>(1.0), fract(steps) >= vec2<f32>(0.5));
-    let weights = (rounded + select(vec2<f32>(-128.0), vec2<f32>(128.0), previous)) / 256.0;
+    let taps = stepped_taps(uv, params.source.xy, params.control.zw != vec2u(0u));
+    let base = taps.base;
+    let weights = taps.weights;
     let a = front_at(base);
     let b = front_at(base + vec2<i32>(1, 0));
     let c = front_at(base + vec2<i32>(0, 1));

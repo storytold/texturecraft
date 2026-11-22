@@ -137,6 +137,15 @@ pub enum ColorInput<'a> {
     Device(&'a ResidentColor16),
 }
 
+/// Parameters shared by the grayscale, color and reference directional warps.
+pub struct DirectionalWarpParams {
+    pub intensity: f32,
+    pub offset: f32,
+    pub direction: [f32; 2],
+    pub aspect: [f32; 2],
+    pub tile: [bool; 2],
+}
+
 pub enum ResidentColorPass<'a> {
     Blend {
         foreground: ColorInput<'a>,
@@ -151,6 +160,12 @@ pub enum ResidentColorPass<'a> {
         source: ColorInput<'a>,
         weights: [f32; 4],
         /// Known binary alpha allows storage in the packed grayscale path.
+        alpha: Option<f32>,
+    },
+    DirectionalWarp {
+        source: ColorInput<'a>,
+        map: GreyInput<'a>,
+        settings: DirectionalWarpParams,
         alpha: Option<f32>,
     },
 }

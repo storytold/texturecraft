@@ -279,15 +279,8 @@ pub(crate) fn resident_filter<'a>(
         }
         "dir_warp" => {
             let map = map.filter(|input| packed(*input))?;
-            let intensity = value("intensity", DIR_WARP_DEFAULT_INTENSITY) / INTENSITY_SPAN;
-            let offset = value("map_offset", 0.0);
-            let (sin, cos) = math::sin_cos(angle * std::f32::consts::TAU);
-            if ![intensity, offset, sin, cos].into_iter().all(f32::is_finite)
-                || aspect.into_iter().any(|axis| intensity.abs() * (1.0 + offset.abs()) * axis.abs() > 8192.0)
-            {
-                return None;
-            }
-            FilterOperation::DirectionalWarp { map, intensity, offset, direction: [cos, sin], aspect }
+            let crate::accelerator::DirectionalWarpParams { intensity, offset, direction, aspect, .. } = resident_directional_warp(n)?;
+            FilterOperation::DirectionalWarp { map, intensity, offset, direction, aspect }
         }
         "grad_warp" => {
             let map = map.filter(|input| packed(*input))?;
@@ -380,17 +373,33 @@ pub(crate) fn line_blur_node<P: Pixel>(id: u32, n: &Node, t: &Image<P>) -> Resul
     })
 }
 
-/// A `dir_warp` node: image `t` of pixels `P` moved along a direction by the luminance of `map`.
-pub(crate) fn dir_warp<P: Pixel, M: crate::tex::Texels>(n: &Node, t: &Image<P>, map: &M) -> Image<P> {
+fn directional_warp_params(n: &Node) -> crate::accelerator::DirectionalWarpParams {
     let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
     let (sn, cs) = math::sin_cos(f("angle", 0.0) * std::f32::consts::TAU);
-    let k = f("intensity", DIR_WARP_DEFAULT_INTENSITY) / INTENSITY_SPAN;
     // the node's pixel aspect scales the move along each axis (measured by fitting the move to the reference renderer's taps:
     // a constant (2, 2) or (0.5, 1), or `2 * 2^min(size.yx - size, 0)`, is the factor; no aspect moves by 1)
-    let (ax, ay) = (f("aspect_x", 1.0), f("aspect_y", 1.0));
-    let (off, tx, ty) = (f("map_offset", 0.0), f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
+    crate::accelerator::DirectionalWarpParams {
+        intensity: f("intensity", DIR_WARP_DEFAULT_INTENSITY) / INTENSITY_SPAN,
+        offset: f("map_offset", 0.0),
+        direction: [cs, sn],
+        aspect: [f("aspect_x", 1.0), f("aspect_y", 1.0)],
+        tile: [f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5],
+    }
+}
+
+pub(crate) fn resident_directional_warp(n: &Node) -> Option<crate::accelerator::DirectionalWarpParams> {
+    let settings = directional_warp_params(n);
+    let crate::accelerator::DirectionalWarpParams { intensity, offset, direction, aspect, .. } = settings;
+    ([intensity, offset].into_iter().chain(direction).all(f32::is_finite)
+        && aspect.into_iter().all(|axis| axis.is_finite() && intensity.abs() * (1.0 + offset.abs()) * axis.abs() <= 8192.0))
+    .then_some(settings)
+}
+
+/// A `dir_warp` node: image `t` of pixels `P` moved along a direction by the luminance of `map`.
+pub(crate) fn dir_warp<P: Pixel, M: crate::tex::Texels>(n: &Node, t: &Image<P>, map: &M) -> Image<P> {
+    let crate::accelerator::DirectionalWarpParams { intensity, offset, direction: [cs, sn], aspect: [ax, ay], tile: [tx, ty] } = directional_warp_params(n);
     Image::from_fn(t.w, t.h, |u, v| {
-        let d = k * (crate::tex::lum(map.sample(u, v).rgba()) - off);
+        let d = intensity * (crate::tex::lum(map.sample(u, v).rgba()) - offset);
         sample_edge_stepped(t, u + d * cs * ax, v + d * sn * ay, tx, ty)
     })
 }

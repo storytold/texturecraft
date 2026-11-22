@@ -16,7 +16,13 @@ const SHORT_LINE: u32 = 3;
 const SHARPEN: u32 = 4;
 const SHEARED_LINE: u32 = 5;
 const AFFINE: u32 = 6;
-const SHADER: &str = concat!(include_str!("shaders/graph_filter.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
+const SHADER: &str = concat!(
+    include_str!("shaders/graph_filter.wgsl"),
+    "\n",
+    include_str!("shaders/graph_compiled_grey.wgsl"),
+    "\n",
+    include_str!("shaders/graph_sampling.wgsl")
+);
 
 pub(crate) struct FilterRasterizer {
     device: wgpu::Device,

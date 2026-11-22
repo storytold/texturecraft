@@ -6,17 +6,30 @@ use wgpu::util::DeviceExt;
 
 use crate::gpu_graph_grey::{GreyDevicePixels, GreyRasterizer};
 
-const SHADER: &str =
-    concat!(include_str!("shaders/graph_color.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"), "\n", include_str!("shaders/graph_blend.wgsl"),);
+const SHADER: &str = concat!(
+    include_str!("shaders/graph_color.wgsl"),
+    "\n",
+    include_str!("shaders/graph_compiled_grey.wgsl"),
+    "\n",
+    include_str!("shaders/graph_blend.wgsl"),
+    "\n",
+    include_str!("shaders/graph_sampling.wgsl"),
+);
+
+const BLEND: u32 = 0;
+const GREY_PACKED: u32 = 1;
+const GREY_ALPHA: u32 = 2;
+const DIRECTIONAL_WARP: u32 = 3;
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
     extent: [u32; 4],
     formats: [u32; 4],
     alphas: [f32; 4],
     weights: [f32; 4],
-    alpha_mode: [u32; 4],
+    control: [u32; 4],
+    warp_direction: [f32; 4],
 }
 
 pub(crate) struct ColorRasterizer {
@@ -54,11 +67,29 @@ impl ColorRasterizer {
     }
 
     pub(crate) fn render(&self, pass: ResidentColorPass<'_>, pool: &GreyRasterizer, cancel: &Cancel) -> Result<Option<ResidentColorOutput>, String> {
-        let (front, back, mask, op, mode, opacity, alpha_mode, weights, alpha) = match pass {
+        let mut params = Params::default();
+        let (front, back, mask, op, alpha) = match pass {
             ResidentColorPass::Blend { foreground, background, mask, mode, opacity, alpha_mode, alpha } => {
-                (foreground, Some(background), mask, 0, mode, opacity, alpha_mode, [0.0; 4], alpha)
+                params.extent[3] = mode;
+                params.alphas[3] = opacity;
+                params.control[0] = alpha_mode;
+                (foreground, Some(background), mask, BLEND, alpha)
             }
-            ResidentColorPass::Grayscale { source, weights, alpha } => (source, None, None, if alpha.is_some() { 1 } else { 2 }, 0, 0.0, 0, weights, alpha),
+            ResidentColorPass::Grayscale { source, weights, alpha } => {
+                params.weights = weights;
+                (source, None, None, if alpha.is_some() { GREY_PACKED } else { GREY_ALPHA }, alpha)
+            }
+            ResidentColorPass::DirectionalWarp { source, map, settings, alpha } => {
+                let (mw, mh, ..) = map.info();
+                if ![mw, mh].into_iter().chain(input_size(source)).all(usize::is_power_of_two) || mw < 2 {
+                    return Ok(None);
+                }
+                let [tile_x, tile_y] = settings.tile.map(u32::from);
+                params.control = [mw as u32, mh as u32, tile_x, tile_y];
+                params.weights = [settings.intensity, settings.offset, settings.aspect[0], settings.aspect[1]];
+                params.warp_direction[..2].copy_from_slice(&settings.direction);
+                (source, Some(ColorInput::Grey(map)), None, DIRECTIONAL_WARP, alpha)
+            }
         };
         let [w, h] = input_size(front);
         if cancel.is_cancelled() || !(2..=8192).contains(&w) || !w.is_multiple_of(2) || !(1..=8192).contains(&h) {
@@ -66,23 +97,20 @@ impl ColorRasterizer {
         }
         let group = [(w as u32 / 2).div_ceil(8), (h as u32).div_ceil(8)];
         let limit = self.device.limits().max_compute_workgroups_per_dimension;
-        if group.into_iter().any(|g| g > limit) || back.into_iter().chain(mask).any(|input| input_size(input) != [w, h]) {
+        if group.into_iter().any(|g| g > limit) || op == BLEND && back.into_iter().chain(mask).any(|input| input_size(input) != [w, h]) {
             return Ok(None);
         }
         let [first, second, third] = [front, back.unwrap_or(front), mask.unwrap_or(front)].map(input_format);
         let (Some((format_f, alpha_f)), Some((format_b, alpha_b)), Some((format_m, alpha_m))) = (first, second, third) else { return Ok(None) };
-        let params = Params {
-            extent: [w as u32, h as u32, op, mode],
-            formats: [format_f, format_b, format_m, u32::from(mask.is_some())],
-            alphas: [alpha_f, alpha_b, alpha_m, opacity],
-            weights,
-            alpha_mode: [alpha_mode, 0, 0, 0],
-        };
+        params.extent[..3].copy_from_slice(&[w as u32, h as u32, op]);
+        params.formats = [format_f, format_b, format_m, u32::from(mask.is_some())];
+        params.alphas[..3].copy_from_slice(&[alpha_f, alpha_b, alpha_m]);
         self.device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
         let Some(front) = self.bind(pool, front, w * h)? else { return Ok(None) };
         let back = match back {
             Some(image) => {
-                let Some(bound) = self.bind(pool, image, w * h)? else { return Ok(None) };
+                let [width, height] = input_size(image);
+                let Some(bound) = self.bind(pool, image, width * height)? else { return Ok(None) };
                 Some(bound)
             }
             None => None,
@@ -94,7 +122,7 @@ impl ColorRasterizer {
             }
             None => None,
         };
-        let Some(output) = pool.allocate_resident(if op == 1 { w } else { w * 4 }, h)? else { return Ok(None) };
+        let Some(output) = pool.allocate_resident(if op == GREY_PACKED { w } else { w * 4 }, h)? else { return Ok(None) };
         if cancel.is_cancelled() {
             return Ok(None);
         }
@@ -124,7 +152,7 @@ impl ColorRasterizer {
             pixels.retain_until_completed(&self.queue);
         }
         Ok(Some(match (op, alpha) {
-            (1, Some(alpha)) => ResidentColorOutput::Grey(ResidentGrey16 { w, h, div: 65535.0, alpha, pixels: output }),
+            (GREY_PACKED, Some(alpha)) => ResidentColorOutput::Grey(ResidentGrey16 { w, h, div: 65535.0, alpha, pixels: output }),
             _ => ResidentColorOutput::Color(ResidentColor16 { w, h, alpha, pixels: output }),
         }))
     }
@@ -222,6 +250,41 @@ mod tests {
             let max =
                 cpu.px.iter().zip(&gpu.px).flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| ((a - b).abs() * 65535.0).round() as u32)).max().unwrap_or_default();
             assert!(max <= 1, "varying alpha={varying_alpha}, {max} u16 steps");
+        }
+    }
+
+    #[test]
+    fn compiled_color_warps_keep_rgba_resident_through_blends() {
+        let Ok(gpu) = crate::headless::Headless::new() else { return };
+        let nodes = Arc::new(Nodes::default());
+        let ctx = EvalContext {
+            accelerator: Some(Arc::new(crate::gpu_graph::GraphAccelerator::new(&gpu.device, &gpu.queue))),
+            profiler: Some(nodes.clone()),
+            ..Default::default()
+        };
+        let source = Tex::from_fn(1024, 1024, |u, v| [u, v, (u * 19.0 + v * 12.0).cos() * 0.5 + 0.5, u * v]);
+        for log2 in [9, 10] {
+            let graph = Graph::parse(&format!(
+                "format 3\nsize 1024\nmeta compiled \"1\"\nnode 1 input idx=0 format=\"u16_compiled\"\n\
+                 node 2 input idx=1 gray=1 osize_log2_x={log2} osize_log2_y={log2} format=\"u16_compiled\"\n\
+                 node 3 dir_warp in=@1 map=@2 angle=-0.25 intensity=26.865005 format=\"u16_compiled\"\n\
+                 node 4 blend fg=@3 bg=@1 mode=\"switch\" opacity=0.5 format=\"u16_compiled\"\n\
+                 node 5 dir_warp in=@4 map=@2 angle=0.123 intensity=5.7 map_offset=0.13 aspect_x=0.75 tile_x=0 format=\"u16_compiled\"\noutput out 5\n",
+            ))
+            .unwrap();
+            let width = 1 << log2;
+            let map = Tex::gray_fn(width, width, |u, v| 0.5 + 0.5 * (u * 37.0).sin() * (v * 11.0).cos());
+            let inputs = [Some(source.clone()), Some(map)];
+            nodes.0.lock().unwrap().clear();
+            let cpu = &graph.evaluate_with_inputs(None, &inputs).unwrap()["out"];
+            let gpu = &graph.evaluate_in(&ctx, None, &inputs).unwrap()["out"];
+            let seen = nodes.0.lock().unwrap();
+            assert_eq!(seen.get("dir_warp"), Some(&2), "map {width}²: {seen:?}");
+            assert_eq!(seen.get("blend"), Some(&1));
+            assert_eq!(seen.get("readback"), Some(&1));
+            let max =
+                cpu.px.iter().zip(&gpu.px).flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| ((a - b).abs() * 65535.0).round() as u32)).max().unwrap_or_default();
+            assert!(max <= 1, "map {width}²: {max} u16 steps");
         }
     }
 }

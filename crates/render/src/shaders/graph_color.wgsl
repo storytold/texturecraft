@@ -2,8 +2,9 @@ struct Params {
     extent: vec4u, // width, height, operation, blend mode
     formats: vec4u, // front, back, mask, mask present
     alphas: vec4f, // packed grayscale alphas, opacity
-    weights: vec4f,
-    alpha_mode: vec4u,
+    weights: vec4f, // grayscale weights or warp intensity, offset and aspect
+    control: vec4u, // blend alpha mode or warp map dimensions and wrapping axes
+    warp_direction: vec4f,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -54,7 +55,7 @@ fn color(i: u32) -> vec4f {
     let fg = pixel(0u, i);
     let bg = pixel(1u, i);
     let mode = params.extent.w;
-    let alpha_mode = params.alpha_mode.x;
+    let alpha_mode = params.control.x;
     var opacity = params.alphas.w;
     if params.formats.w != 0u {
         opacity = mul(weighted(pixel(2u, i), vec4f(0.2126, 0.7152, 0.0722, 0.0)), opacity);
@@ -93,6 +94,57 @@ fn write_color(i: u32, p: vec4f) {
     output[i * 2u + 1u] = packed(compiled_16bit(p.zw));
 }
 
+fn map_at(p: vec2i) -> f32 {
+    return pixel(1u, address(p, params.control.xy, vec2<bool>(true))).r;
+}
+
+fn warp_map(uv: vec2f, i: u32) -> f32 {
+    var value: f32;
+    if all(params.extent.xy == params.control.xy) {
+        value = pixel(1u, i).r;
+    } else {
+        let size = vec2f(params.control.xy);
+        let half_texel = 0.5 / size;
+        let xy = clamp(uv, half_texel, 1.0 - half_texel) * size - 0.5;
+        let base = vec2i(floor(xy));
+        let weight = fract(xy);
+        let a = map_at(base);
+        let b = map_at(base + vec2i(1, 0));
+        let c = map_at(base + vec2i(0, 1));
+        let d = map_at(base + vec2i(1, 1));
+        let top = a + mul(b - a, weight.x);
+        let bottom = c + mul(d - c, weight.x);
+        value = top + mul(bottom - top, weight.y);
+    }
+    return weighted(vec4f(vec3f(value), 0.0), vec4f(0.2126, 0.7152, 0.0722, 0.0));
+}
+
+fn lerp_color(lo: vec4f, hi: vec4f, weight: f32) -> vec4f {
+    let scaled = vec4f(individual_product(hi.xy - lo.xy, vec2f(weight)), individual_product(hi.zw - lo.zw, vec2f(weight)));
+    return lo + scaled;
+}
+
+fn warp_at(p: vec2u) -> vec4f {
+    let size = params.extent.xy;
+    let wraps = params.control.zw != vec2u(0u);
+    let uv = (vec2f(p) + 0.5) / vec2f(size);
+    let distance = mul(params.weights.x, warp_map(uv, p.y * size.x + p.x) - params.weights.y);
+    let direction = individual_product(vec2f(distance), params.warp_direction.xy);
+    let warped = uv + individual_product(direction, params.weights.zw);
+    let taps = stepped_taps(warped, size, wraps);
+    let a = pixel(0u, address(taps.base, size, wraps));
+    let b = pixel(0u, address(taps.base + vec2i(1, 0), size, wraps));
+    let c = pixel(0u, address(taps.base + vec2i(0, 1), size, wraps));
+    let d = pixel(0u, address(taps.base + vec2i(1, 1), size, wraps));
+    return lerp_color(lerp_color(a, b, taps.weights.x), lerp_color(c, d, taps.weights.x), taps.weights.y);
+}
+
+fn write_warp(i: u32, p: vec4f) {
+    // Compiled warps round the sample to the 16-bit read steps before the node's own formatting.
+    output[i * 2u] = packed(vec2u(rounded_read(p.x), rounded_read(p.y)));
+    output[i * 2u + 1u] = packed(vec2u(rounded_read(p.z), rounded_read(p.w)));
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3u) {
     if id.x >= params.extent.x / 2u || id.y >= params.extent.y {
@@ -108,6 +160,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             let first = weighted(pixel(0u, i), params.weights);
             let second = weighted(pixel(0u, i + 1u), params.weights);
             output[i / 2u] = packed(compiled_16bit(vec2f(first, second)));
+        }
+        case 3u: {
+            let p = vec2u(id.x * 2u, id.y);
+            write_warp(i, warp_at(p));
+            write_warp(i + 1u, warp_at(p + vec2u(1u, 0u)));
         }
         default: {
             let a = pixel(0u, i);
