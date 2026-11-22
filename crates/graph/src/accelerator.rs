@@ -64,6 +64,22 @@ pub enum ResidentGreyPass<'a> {
     Levels { source: GreyInput<'a>, curve: Vec<u16>, div: f32 },
 }
 
+pub struct ResidentFilter<'a> {
+    pub source: GreyInput<'a>,
+    pub size: [usize; 2],
+    pub tile: [bool; 2],
+    pub div: f32,
+    pub operation: FilterOperation<'a>,
+}
+
+pub enum FilterOperation<'a> {
+    DirectionalWarp { map: GreyInput<'a>, intensity: f32, offset: f32, direction: [f32; 2], aspect: [f32; 2] },
+    GradientWarp { map: GreyInput<'a>, displacement: [f32; 2] },
+    Box { radius: [f32; 2] },
+    ShortLine { major: usize, slope: f32, radius: f32 },
+    Sharpen { weights: [f32; 2] },
+}
+
 pub trait Accelerator: Send + Sync {
     /// Identifies changes to rendered pixels for the host's result caches.
     fn cache_tag(&self) -> &str;
@@ -89,6 +105,11 @@ pub trait Accelerator: Send + Sync {
 
     /// Execute a grayscale pixel program whose image inputs and output use packed integer samples.
     fn resident_pixel(&self, _shader: PixelShader, _images: &[GreyInput<'_>], _size: [usize; 2], _cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+        Ok(None)
+    }
+
+    /// Execute a spatial filter on packed compiled grayscale graph pixels.
+    fn resident_filter(&self, _filter: ResidentFilter<'_>, _cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
         Ok(None)
     }
 }

@@ -4617,6 +4617,13 @@ fn compute_resident_grey(
             let Some(curve) = crate::atomic::levels_mid_curve(n, div, steps) else { return Ok(None) };
             accelerator.resident_grey(ResidentGreyPass::Levels { source, curve, div: steps.div }, &ctx.ec.cancel)
         }
+        "dir_warp" | "grad_warp" | "box_blur" | "line_blur" | "laplacian_sharpen" if !rolls(n) && ctx.size * ctx.height >= 64 * 1024 => {
+            let Some(steps) = steps.filter(|s| matches!(s.fmt, crate::measured::COMPILED_8_BIT | crate::measured::COMPILED_16_BIT)) else { return Ok(None) };
+            let Some(source) = ins.get("in").and_then(NodeValue::packed_grey) else { return Ok(None) };
+            let map = ins.get("map").and_then(NodeValue::packed_grey);
+            let Some(filter) = crate::atomic::resident_filter(n, [ctx.size, ctx.height], steps.div, source, map) else { return Ok(None) };
+            accelerator.resident_filter(filter, &ctx.ec.cancel)
+        }
         "pixel_processor"
             if steps.is_some_and(|s| s.fmt == crate::measured::COMPILED_16_BIT)
                 && !rolls(n)

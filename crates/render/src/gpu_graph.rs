@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use texturecraft_graph::accelerator::{Accelerator, GreyInput, GreyPass, PixelOutput, PixelRequest, ResidentGrey16, ResidentGreyPass};
+use texturecraft_graph::accelerator::{Accelerator, GreyInput, GreyPass, PixelOutput, PixelRequest, ResidentFilter, ResidentGrey16, ResidentGreyPass};
 use texturecraft_graph::context::Cancel;
 use texturecraft_graph::func::PixelShader;
 use texturecraft_graph::tex::{Grey, Grey16, ImgRef, Tex};
@@ -38,6 +38,7 @@ pub struct GraphAccelerator {
     hashers: [RandomState; 2],
     patterns: OnceLock<Result<crate::gpu_graph_patterns::PatternRasterizer, String>>,
     grey: OnceLock<Result<crate::gpu_graph_grey::GreyRasterizer, String>>,
+    filters: OnceLock<Result<crate::gpu_graph_filter::FilterRasterizer, String>>,
 }
 
 #[derive(Default)]
@@ -87,6 +88,7 @@ impl GraphAccelerator {
             hashers: std::array::from_fn(|_| RandomState::new()),
             patterns: OnceLock::new(),
             grey: OnceLock::new(),
+            filters: OnceLock::new(),
         }
     }
 
@@ -425,6 +427,14 @@ impl Accelerator for GraphAccelerator {
 
     fn resident_pixel(&self, shader: PixelShader, images: &[GreyInput<'_>], size: [usize; 2], cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
         resident_or_fallback(self.evaluate_resident_pixel(shader, images, size, cancel), cancel)
+    }
+
+    fn resident_filter(&self, filter: ResidentFilter<'_>, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+        let Some(pool) = self.grey_rasterizer() else { return Ok(None) };
+        let rasterizer =
+            self.filters.get_or_init(|| crate::gpu_graph_filter::FilterRasterizer::new(&self.device, &self.queue).inspect_err(|reason| log::warn!("{reason}")));
+        let Ok(rasterizer) = rasterizer else { return Ok(None) };
+        resident_or_fallback(rasterizer.render(filter, pool, cancel), cancel)
     }
 }
 

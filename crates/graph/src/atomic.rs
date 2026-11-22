@@ -5,7 +5,7 @@
 
 use crate::graph::{Error, Node, Spec};
 use crate::math;
-use crate::measured::{COMPILED_8_BIT, COMPILED_16_BIT, COMPILED_HALF, FINE_16, FINE_16_TIE_DOWN, INTENSITY_SPAN, STEPS_16, WEIGHT_STEPS};
+use crate::measured::{COMPILED_8_BIT, COMPILED_16_BIT, COMPILED_HALF, FINE_16, FINE_16_TIE_DOWN, INTENSITY_SPAN, STEPS_8, STEPS_16, WEIGHT_STEPS};
 use crate::tex::{Image, Pixel, Tex, get};
 use std::collections::BTreeMap;
 use std::sync::Arc as Rc;
@@ -200,6 +200,104 @@ pub(crate) fn pattern_frame(n: &Node) -> crate::patterns::Frame {
             .contains_key("background_r")
             .then(|| [f("background_r", 0.0), f("background_g", 0.0), f("background_b", 0.0), f("background_a", 1.0)]),
     }
+}
+
+/// The compiled grayscale filter subset that can be evaluated without leaving the GPU.
+pub(crate) fn resident_filter<'a>(
+    n: &Node,
+    size: [usize; 2],
+    div: f32,
+    source: crate::accelerator::GreyInput<'a>,
+    map: Option<crate::accelerator::GreyInput<'a>>,
+) -> Option<crate::accelerator::ResidentFilter<'a>> {
+    use crate::accelerator::{FilterOperation, ResidentFilter};
+
+    let packed = |input: crate::accelerator::GreyInput<'_>| {
+        let (w, h, div, alpha) = input.info();
+        w >= 2 && w.is_power_of_two() && h.is_power_of_two() && [STEPS_8 as f32, STEPS_16 as f32].contains(&div) && crate::tex::grey_alpha_ok(alpha)
+    };
+    if !packed(source) || !size.into_iter().all(usize::is_power_of_two) || size[0] < 2 {
+        return None;
+    }
+    let (w, h, ..) = source.info();
+    if n.kind != "grad_warp" && size != [w, h] {
+        return None;
+    }
+    let value = |name, default| n.nums.get(name).copied().unwrap_or(default);
+    let quantized_blur = matches!(n.nums.get("ofmt").map(|format| format.round() as u32), Some(COMPILED_8_BIT | COMPILED_16_BIT));
+    let tile = [value("tile_x", 1.0) > 0.5, value("tile_y", 1.0) > 0.5];
+    let aspect = [value("aspect_x", 1.0), value("aspect_y", 1.0)];
+    let angle = value("angle", 0.0);
+    if !aspect.into_iter().chain([angle]).all(f32::is_finite) {
+        return None;
+    }
+    let radii = |intensity: f32| [intensity * aspect[0] * w as f32 / INTENSITY_SPAN, intensity * aspect[1] * h as f32 / INTENSITY_SPAN];
+    let operation = match n.kind.as_str() {
+        "laplacian_sharpen" => {
+            let weights = aspect.map(|axis| value("intensity", SHARPEN_DEFAULT_INTENSITY) * axis);
+            if !weights.into_iter().all(f32::is_finite) {
+                return None;
+            }
+            FilterOperation::Sharpen { weights }
+        }
+        "dir_warp" => {
+            let map = map.filter(|input| packed(*input))?;
+            let intensity = value("intensity", DIR_WARP_DEFAULT_INTENSITY) / INTENSITY_SPAN;
+            let offset = value("map_offset", 0.0);
+            let (sin, cos) = math::sin_cos(angle * std::f32::consts::TAU);
+            if ![intensity, offset, sin, cos].into_iter().all(f32::is_finite)
+                || aspect.into_iter().any(|axis| intensity.abs() * (1.0 + offset.abs()) * axis.abs() > 8192.0)
+            {
+                return None;
+            }
+            FilterOperation::DirectionalWarp { map, intensity, offset, direction: [cos, sin], aspect }
+        }
+        "grad_warp" => {
+            let map = map.filter(|input| packed(*input))?;
+            let intensity = value("intensity", GRAD_WARP_DEFAULT_INTENSITY) / INTENSITY_SPAN;
+            let (mw, mh, ..) = map.info();
+            let displacement = aspect.map(|axis| intensity * axis);
+            if displacement.into_iter().zip([mw, mh]).any(|(axis, width)| !axis.is_finite() || axis.abs() * width as f32 > 8192.0) {
+                return None;
+            }
+            FilterOperation::GradientWarp { map, displacement }
+        }
+        "box_blur" if quantized_blur => {
+            let radius = radii(value("intensity", BLUR_DEFAULT_INTENSITY)).map(f32::abs);
+            if radius.into_iter().any(|r| !(0.0..=2.5).contains(&r)) {
+                return None;
+            }
+            FilterOperation::Box { radius }
+        }
+        "line_blur" if quantized_blur => {
+            let [rx, ry] = radii(value("intensity", LINE_BLUR_DEFAULT_INTENSITY));
+            let (sin, cos) = math::sin_cos(angle * std::f32::consts::TAU);
+            if ![rx, ry, sin, cos].into_iter().all(f32::is_finite) {
+                return None;
+            }
+            if sin.abs() < AXIS_SLACK || cos.abs() < AXIS_SLACK {
+                let radius = if sin.abs() < AXIS_SLACK { [rx.abs(), 0.0] } else { [0.0, ry.abs()] };
+                if radius.into_iter().any(|r| r > 2.5) {
+                    return None;
+                }
+                FilterOperation::Box { radius }
+            } else {
+                let (dx, dy) = ((rx - LINE_HALF_PIXEL).max(0.0) * cos, (ry - LINE_HALF_PIXEL).max(0.0) * sin);
+                let longest = dx.abs().max(dy.abs());
+                if longest == 0.0 {
+                    FilterOperation::Box { radius: [0.0; 2] }
+                } else if longest < 1.0 {
+                    let along_y = f64::from(dx.abs()) * h as f64 <= f64::from(dy.abs()) * w as f64 * (1.0 + TIE_SLACK);
+                    let slope = if along_y { dx / dy * h as f32 / w as f32 } else { dy / dx * w as f32 / h as f32 };
+                    FilterOperation::ShortLine { major: usize::from(along_y), slope, radius: LINE_HALF_PIXEL + longest }
+                } else {
+                    return None;
+                }
+            }
+        }
+        _ => return None,
+    };
+    Some(ResidentFilter { source, size, tile, div, operation })
 }
 
 /// A `box_blur` node on an image of pixels `P`.
