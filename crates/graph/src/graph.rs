@@ -4833,12 +4833,17 @@ fn forward_identity(n: &Node, source: Option<&NodeValue>, size: (usize, usize), 
     .then(|| source.clone())
 }
 
-/// A compiled switch at either endpoint holds exactly the selected input's 16-bit steps.
+/// A compiled switch at either endpoint holds exactly the selected input's steps.
 fn forward_switch(g: &Graph, n: &Node, ins: &BTreeMap<String, NodeValue>, ctx: &Ctx<'_>, format: u32) -> Option<NodeValue> {
-    use crate::measured::COMPILED_16_BIT;
-    if n.kind != "blend" || format != COMPILED_16_BIT || rolls(n) || n.ins.contains_key("mask") || !full_blend_frame(n) || n.nums.get("mode") != Some(&21.0) {
+    use crate::measured::{COMPILED_8_BIT, COMPILED_16_BIT, STEPS_8, STEPS_16};
+    if n.kind != "blend" || rolls(n) || n.ins.contains_key("mask") || !full_blend_frame(n) || n.nums.get("mode") != Some(&21.0) {
         return None;
     }
+    let div = match format {
+        COMPILED_8_BIT => STEPS_8 as f32,
+        COMPILED_16_BIT => STEPS_16 as f32,
+        _ => return None,
+    };
     let opacity = n.nums.get("opacity").copied().unwrap_or(1.0);
     if !matches!(opacity, 0.0 | 1.0) {
         return None;
@@ -4846,13 +4851,13 @@ fn forward_switch(g: &Graph, n: &Node, ins: &BTreeMap<String, NodeValue>, ctx: &
     let foreground = ins.get("fg")?;
     let background = ins.get("bg")?;
     let compiled_steps = |slot, image: &NodeValue| match image.packed_grey() {
-        Some(input) => input.info().2 == 65535.0,
-        // RGBA is held as floats. Its producer's format establishes bounded, finite 16-bit steps.
+        Some(input) => input.info().2 == div,
+        // A host color result has the quantization of its producer.
         None => n
             .ins
             .get(slot)
             .and_then(|id| ctx.instance.and_then(|i| i.nodes.get(id)).or_else(|| g.nodes.get(id)))
-            .is_some_and(|source| !source.strs.contains_key("fn.ofmt") && node_format(g, source) == COMPILED_16_BIT),
+            .is_some_and(|source| !source.strs.contains_key("fn.ofmt") && node_format(g, source) == format),
     };
     if !compiled_steps("fg", foreground) || !compiled_steps("bg", background) {
         return None;
