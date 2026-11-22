@@ -176,20 +176,13 @@ fn a_hidden_texture_set_does_not_block_a_pick_behind_it() {
     execute(&mut session, "textureSet.select", &json!({"ts": base})).unwrap();
     let (_, effect) = masked_layer(&mut session, true);
     let pick_at = |session: &mut Session, y: f32| execute(session, "effect.colorSelection.pick", &json!({"effect": effect.0, "x": 200, "y": y}));
-    let ball_in_front = |session: &Session, y: f32| {
-        session.pick(Vec2::new(200.0, y), session.viewport).is_some_and(|hit| session.texture_set_of_material(hit.material) == Some(ball))
-    };
-
-    // Down the middle until a pixel where the hidden ball covers the base: the pick reads the base
+    // Find the foreground ball's pixels while it is visible, then check whether the pick reaches the base behind it.
+    let ball_pixels: Vec<_> = (200..400)
+        .map(|y| y as f32)
+        .filter(|&y| session.pick(Vec2::new(200.0, y), session.viewport).is_some_and(|hit| session.texture_set_of_material(hit.material) == Some(ball)))
+        .collect();
     execute(&mut session, "textureSet.visible", &json!({"ts": ball, "visible": false})).unwrap();
-    let mut covered = None;
-    for y in (200..400).map(|y| y as f32) {
-        if ball_in_front(&session, y) && pick_at(&mut session, y).is_ok() {
-            covered = Some(y);
-            break;
-        }
-    }
-    let y = covered.expect("a pixel where the ball covers the base");
+    let y = ball_pixels.into_iter().find(|&y| pick_at(&mut session, y).is_ok()).expect("a pixel where the ball covers the base");
     assert_eq!(colors(&session, effect).len(), 2);
 
     execute(&mut session, "textureSet.visible", &json!({"ts": ball, "visible": true})).unwrap();
