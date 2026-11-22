@@ -1,5 +1,5 @@
 struct Params {
-    image: vec4<u32>, // width, height, bin columns, first row of this band
+    image: vec4<u32>, // width, height, first output row, first bin row
     mode: vec4<u32>,  // rows in this band, color and grayscale flags, custom frame, background image
     region: vec4<f32>,
     period: vec4<f32>,
@@ -179,7 +179,7 @@ fn raster(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gid.x >= size.x || gid.y >= params.mode.x {
         return;
     }
-    let pixel = vec2(gid.x, gid.y + params.image.w);
+    let pixel = vec2(gid.x, gid.y + params.image.z);
     var p = params.clear;
     if params.mode.w != 0u {
         let bg = image_desc(0u);
@@ -189,7 +189,8 @@ fn raster(@builtin(global_invocation_id) gid: vec3<u32>) {
             p = sample_stepped(bg, (vec2<f32>(pixel) + 0.5) / vec2<f32>(size), true);
         }
     }
-    let bin = pixel.y / 8u * params.image.z + pixel.x / 8u;
+    let columns = (size.x + 7u) / 8u;
+    let bin = (pixel.y / 8u - params.image.w) * columns + pixel.x / 8u;
     for (var i = bins[bin]; i < bins[bin + 1u]; i++) {
         p = stamp_at(p, stamps[bins[i]], vec2<i32>(pixel), vec2<i32>(size));
     }

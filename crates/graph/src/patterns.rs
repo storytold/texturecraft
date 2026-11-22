@@ -159,8 +159,8 @@ pub enum RasterOutput {
     Rgba(Tex),
 }
 
-/// A temporary backend-neutral draw list. Very large lists remain on the streaming CPU path.
-const MAX_RASTER_STAMPS: usize = 1_000_000;
+/// Limits the temporary backend-neutral draw list independently of the GPU's smaller spatial batches.
+const MAX_RASTER_STAMPS: usize = 2_000_000;
 
 struct Raster<'a> {
     background: Option<&'a Tex>,
