@@ -675,6 +675,17 @@ fn unary(op: U, x: &Value) -> Result<Value, String> {
     })
 }
 
+#[inline]
+fn div_large(p: f64, q: f64) -> f64 {
+    if q != 0.0 {
+        p / q
+    } else if p == 0.0 {
+        0.0
+    } else {
+        HUGE.copysign(p)
+    }
+}
+
 fn binary(op: B, x: &Value, y: &Value) -> Result<Value, String> {
     match op {
         B::And | B::Or | B::Xor => {
@@ -708,15 +719,7 @@ fn binary(op: B, x: &Value, y: &Value) -> Result<Value, String> {
         B::Add => map2(&a, &b, both_int, |p, q| p + q),
         B::Sub => map2(&a, &b, both_int, |p, q| p - q),
         B::Mul => map2(&a, &b, both_int, |p, q| p * q),
-        B::DivLarge if !both_int => map2(&a, &b, false, |p, q| {
-            if q != 0.0 {
-                p / q
-            } else if p == 0.0 {
-                0.0
-            } else {
-                HUGE.copysign(p)
-            }
-        }),
+        B::DivLarge if !both_int => map2(&a, &b, false, div_large),
         B::Div | B::DivLarge => map2(&a, &b, both_int, |p, q| {
             if q == 0.0 {
                 0.0

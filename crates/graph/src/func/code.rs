@@ -23,6 +23,7 @@ pub const FLOOR_RUN: u32 = 2;
 pub const FLOOR_PASS: u32 = 3;
 const FLOORS: usize = 4;
 
+#[derive(Clone, Copy)]
 pub struct Inst {
     pub op: Op,
     pub impure: bool,
@@ -34,6 +35,11 @@ pub struct Inst {
     pub y: u32,
 }
 
+pub struct LinearStep {
+    pub register: u32,
+    pub inst: Inst,
+}
+
 /// An `f_input` / `f_graph_input`.
 pub struct InputInfo {
     pub pin: Pin,
@@ -42,8 +48,16 @@ pub struct InputInfo {
     pub arg: u32,
 }
 
+/// The image slot and sampling mode of an image read.
+pub struct SampleInfo {
+    pub slot: String,
+    pub filter: Option<u32>,
+}
+
 pub struct Code {
     pub insts: Vec<Inst>,
+    /// Per-run nodes in demand order for programs which read all their operands in order and never restart a pass.
+    pub linear: Option<Vec<LinearStep>>,
     /// floor of each register, apart from the instructions because it is what is read most
     pub floor: Vec<u32>,
     pub out: u32,
@@ -52,7 +66,7 @@ pub struct Code {
     /// reads of a swizzle: `None` when the mask is not plain (the slow path then reports the problem)
     pub swizzles: Vec<Option<([u8; 4], u8)>>,
     pub seeds: Vec<u32>,
-    pub filters: Vec<Option<u32>>,
+    pub samples: Vec<SampleInfo>,
     pub inputs: Vec<InputInfo>,
     pub passes: Vec<usize>,
     /// the site and draw number `k` of a random number drawn as compiled graphs draw it (see `lcg_rand`); `None` for the plain sequence
@@ -90,13 +104,14 @@ pub fn build(p: &Prog) -> Code {
     }
     let mut c = Code {
         insts: Vec::with_capacity(n),
+        linear: None,
         floor: vec![FLOOR_CONST; n],
         out: alias.get(p.out).copied().unwrap_or(NONE),
         literals: Vec::new(),
         vec_defaults: Vec::new(),
         swizzles: Vec::new(),
         seeds: Vec::new(),
-        filters: Vec::new(),
+        samples: Vec::new(),
         inputs: Vec::new(),
         passes: Vec::new(),
         lcg_draws: Vec::new(),
@@ -185,8 +200,9 @@ pub fn build(p: &Prog) -> Code {
                 c.lcg_draws.push(node.num.contains_key("lcg").then(|| (num("lcg") as i32, num("k") as u32)));
             }
             Op::SampleGray | Op::SampleColor => {
-                inst.x = c.filters.len() as u32;
-                c.filters.push(node.num.get("filter").map(|f| *f as u32));
+                inst.x = c.samples.len() as u32;
+                let slot = if node.name.is_empty() { "in".to_string() } else { node.name.clone() };
+                c.samples.push(SampleInfo { slot, filter: node.num.get("filter").map(|f| *f as u32) });
             }
             Op::Input | Op::GraphInput => {
                 let pin = type_pin(num("type").round() as i32);
@@ -241,6 +257,17 @@ pub fn build(p: &Prog) -> Code {
             };
         }
         c.insts.push(inst);
+    }
+
+    // Branches and calls can leave an operand unread. Random nodes choose different operands
+    // in different modes. Loops can demand an earlier register again in a new pass.
+    if !c.insts.iter().any(|inst| matches!(inst.op, Op::If | Op::Call | Op::Random | Op::Loop)) {
+        let steps = c.insts.iter().zip(&c.floor).enumerate().filter(|(_, (inst, floor))| **floor >= FLOOR_RUN && !matches!(inst.op, Op::Out | Op::Pin));
+        // The compact demand evaluator is faster for short functions. Long pixel processors
+        // amortize the contiguous schedule and benefit from leaving the validity table alone.
+        if steps.clone().take(128).count() == 128 {
+            c.linear = Some(steps.map(|(index, (inst, _))| LinearStep { register: index as u32, inst: *inst }).collect());
+        }
     }
     c
 }
