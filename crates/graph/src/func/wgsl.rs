@@ -4,7 +4,9 @@ use std::fmt::Write;
 
 use super::code::{Code, FLOOR_ENV, NONE};
 use super::{B, FnEnv, Op, Prog, U, Value};
+use crate::accelerator::GreyInput;
 use crate::graph::Pin;
+use crate::tex::{GreyIn, ImgRef};
 
 pub struct PixelShader {
     pub source: String,
@@ -17,6 +19,22 @@ pub struct PixelShader {
 
 impl Prog {
     pub fn pixel_shader(&self, env: &FnEnv<'_>) -> Option<PixelShader> {
+        let images: Vec<_> = env.images.iter().map(|&(name, image)| (name, SampleImage::Host(image))).collect();
+        self.emit_pixel_shader(env, &images)
+    }
+
+    pub(crate) fn packed_pixel_shader(&self, env: &FnEnv<'_>, images: &[(&str, GreyInput<'_>)]) -> Option<PixelShader> {
+        let code = self.code();
+        // These values are evaluated on the CPU while binding a program. They cannot read GPU images.
+        if self.uses_stats || code.insts.iter().zip(&code.floor).any(|(inst, &floor)| floor <= FLOOR_ENV && matches!(inst.op, Op::SampleColor | Op::SampleGray))
+        {
+            return None;
+        }
+        let images: Vec<_> = images.iter().map(|&(name, image)| (name, SampleImage::Packed(image))).collect();
+        self.emit_pixel_shader(env, &images).filter(|shader| shader.grey)
+    }
+
+    fn emit_pixel_shader(&self, env: &FnEnv<'_>, inputs: &[(&str, SampleImage<'_>)]) -> Option<PixelShader> {
         if !self.single {
             return None;
         }
@@ -55,24 +73,30 @@ impl Prog {
                 if matches!(pin, Pin::Int | Pin::Int2 | Pin::Int3 | Pin::Int4 | Pin::Text) {
                     return None;
                 }
-                expression(code, index, &types, env, &mut shader.images, &mut bindings)?
+                expression(code, index, &types, inputs, &mut shader.images, &mut bindings)?
             };
             writeln!(body, "    let r{index} = {expression};").ok()?;
         }
         for (slot, &image) in shader.images.iter().enumerate() {
-            let (_, image) = env.images.get(image)?;
-            let alpha = match image {
-                crate::tex::ImgRef::Grey(grey) if grey.alpha() == 1.0 => "1.0",
-                _ => "0.0",
-            };
+            let (_, image) = *inputs.get(image)?;
+            if let SampleImage::Packed(image) = image {
+                let (w, h, div, alpha) = image.info();
+                let param = shader.uniforms.len() + 1;
+                shader.uniforms.push([w as f32, h as f32, div, alpha]);
+                writeln!(shader.source, "@group(0) @binding({}) var<storage, read> input_{slot}: array<u32>;", slot + 2).ok()?;
+                writeln!(shader.source, "{}", packed_sampler(slot, param)).ok()?;
+                continue;
+            }
+            let SampleImage::Host(image) = image else { return None };
+            let alpha = if matches!(image, ImgRef::Grey(grey) if grey.alpha() == 1.0) { "1.0" } else { "0.0" };
             let (sample_type, sample) = match image {
-                crate::tex::ImgRef::Grey(crate::tex::GreyIn::Q(grey)) => {
+                ImgRef::Grey(GreyIn::Q(grey)) => {
                     let div = shader.uniforms.len() + 1;
                     shader.uniforms.push([grey.div, 0.0, 0.0, 0.0]);
                     ("u32", format!("vec4f(vec3f(tc_sample_steps(input_{slot}, uv, mode, parameters[{div}].x)), {alpha})"))
                 }
-                crate::tex::ImgRef::Grey(_) => ("f32", format!("vec4f(vec3f(tc_sample(input_{slot}, uv, mode).x), {alpha})")),
-                crate::tex::ImgRef::Rgba(_) => ("f32", format!("tc_sample(input_{slot}, uv, mode)")),
+                ImgRef::Grey(_) => ("f32", format!("vec4f(vec3f(tc_sample(input_{slot}, uv, mode).x), {alpha})")),
+                ImgRef::Rgba(_) => ("f32", format!("tc_sample(input_{slot}, uv, mode)")),
             };
             writeln!(shader.source, "@group(0) @binding({}) var input_{slot}: texture_2d<{sample_type}>;", slot + 2).ok()?;
             writeln!(shader.source, "fn sample_{slot}(uv: vec2f, mode: u32) -> vec4f {{ return {sample}; }}").ok()?;
@@ -90,6 +114,37 @@ impl Prog {
         writeln!(shader.source, "fn evaluate_pixel(pos: vec2f) -> {ty} {{\n{body}    return {expression};\n}}").ok()?;
         Some(shader)
     }
+}
+
+#[derive(Clone, Copy)]
+enum SampleImage<'a> {
+    Host(ImgRef<'a>),
+    Packed(GreyInput<'a>),
+}
+
+fn packed_sampler(slot: usize, param: usize) -> String {
+    format!(
+        "fn load_{slot}(p: vec2i, width: i32, div: f32) -> f32 {{
+    let i = u32(p.y * width + p.x);
+    return f32((input_{slot}[i / 2u] >> ((i & 1u) * 16u)) & 0xffffu) / div;
+}}
+fn sample_{slot}(uv: vec2f, mode: u32) -> vec4f {{
+    let p = parameters[{param}];
+    let n = vec2i(p.xy);
+    let position = tc_sample_position(uv);
+    if ((mode & 1u) == 0u) {{
+        return vec4f(vec3f(load_{slot}(tc_nearest(position, n, mode), n.x, p.z)), p.w);
+    }}
+    let sample = tc_bilinear(position, n, mode);
+    let p00 = load_{slot}(sample.a, n.x, p.z);
+    let p10 = load_{slot}(vec2i(sample.b.x, sample.a.y), n.x, p.z);
+    let p01 = load_{slot}(vec2i(sample.a.x, sample.b.y), n.x, p.z);
+    let p11 = load_{slot}(sample.b, n.x, p.z);
+    let top = p00 + (p10 - p00) * sample.t.x;
+    let bottom = p01 + (p11 - p01) * sample.t.x;
+    return vec4f(vec3f(top + (bottom - top) * sample.t.y), p.w);
+}}"
+    )
 }
 
 fn uniform(value: Value) -> Option<[f32; 4]> {
@@ -117,7 +172,7 @@ fn expression(
     code: &Code,
     index: usize,
     pins: &[Option<Pin>],
-    env: &FnEnv<'_>,
+    inputs: &[(&str, SampleImage<'_>)],
     images: &mut Vec<usize>,
     bindings: &mut Vec<(u32, Option<usize>)>,
 ) -> Option<String> {
@@ -182,7 +237,7 @@ fn expression(
             let binding = if let Some((_, binding)) = bindings.iter().find(|(i, _)| *i == instruction.x) {
                 *binding
             } else {
-                let binding = env.images.iter().position(|(name, _)| *name == info.slot).map(|image| {
+                let binding = inputs.iter().position(|(name, _)| *name == info.slot).map(|image| {
                     if let Some(slot) = images.iter().position(|&source| source == image) {
                         slot
                     } else {

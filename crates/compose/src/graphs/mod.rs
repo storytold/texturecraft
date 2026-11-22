@@ -1147,6 +1147,14 @@ impl texturecraft_graph::profile::Profiler for CookProfiler {
         (self.emit)(format!("GPU result for node #{id} {kind} in {:?}", self.graph));
     }
 
+    fn resident_node(&self, id: u32, kind: &str) {
+        (self.emit)(format!("GPU-resident result for node #{id} {kind} in {:?}", self.graph));
+    }
+
+    fn resident_readback(&self, id: u32, bytes: usize) {
+        (self.emit)(format!("GPU graph readback for node #{id} in {:?}: {bytes} bytes", self.graph));
+    }
+
     fn node(&self, id: u32, kind: &str, (width, height): (usize, usize)) -> Option<Box<dyn std::any::Any + Send>> {
         let description = format!("#{id} {kind} ({width}×{height}) in {:?}", self.graph);
         (self.emit)(format!("Node {description}"));

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Node graph: text format, validation, subgraphs, packages and evaluation.
+use crate::accelerator::{GreyInput, ResidentGrey16, ResidentGreyPass};
 pub use crate::context::Logging;
 use crate::context::{EvalContext, LiveBytes};
 use crate::expr;
@@ -13,7 +14,7 @@ use crate::tex::{Grey, Tex, Val, lum};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc as Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug)]
 pub enum Error {
@@ -24,6 +25,7 @@ pub enum Error {
     MissingNode(u32, u32),
     Cycle(u32),
     BadParam(u32, String),
+    GpuReadback(u32, String),
     NoOutputs,
     BadSize(usize),
     Io(String),
@@ -41,6 +43,7 @@ impl fmt::Display for Error {
             Error::MissingNode(id, r) => write!(f, "node {id}: refers to missing node {r}"),
             Error::Cycle(id) => write!(f, "cycle detected at node {id}"),
             Error::BadParam(id, m) => write!(f, "node {id}: {m}"),
+            Error::GpuReadback(id, m) => write!(f, "node {id}: GPU readback failed: {m}"),
             Error::NoOutputs => write!(f, "graph has no outputs"),
             Error::BadSize(s) => write!(f, "invalid resolution {s} (use 1..=8192)"),
             Error::Io(m) => write!(f, "io error: {m}"),
@@ -756,6 +759,7 @@ pub struct EvalAll {
 }
 
 struct Ctx<'a> {
+    resident: bool,
     size: usize,
     /// pixel height (equals `size` for a square graph)
     height: usize,
@@ -1614,6 +1618,18 @@ impl Graph {
     }
 
     fn evaluate_vals(&self, ec: &EvalContext, size: Option<usize>, ext: Vec<Option<Val>>) -> Result<BTreeMap<String, Tex>, Error> {
+        match self.evaluate_outputs(ec, size, &ext, true) {
+            Err(Error::GpuReadback(..)) if !ec.is_cancelled() => {
+                if let Some(done) = &ec.nodes_done {
+                    done.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.evaluate_outputs(ec, size, &ext, false)
+            }
+            result => result,
+        }
+    }
+
+    fn evaluate_outputs(&self, ec: &EvalContext, size: Option<usize>, ext: &[Option<Val>], resident: bool) -> Result<BTreeMap<String, Tex>, Error> {
         self.validate()?;
         let size = size.unwrap_or(self.size);
         if size == 0 || size > 8192 {
@@ -1621,6 +1637,7 @@ impl Graph {
         }
         let gin = crate::func::graph_inputs(self);
         let ctx = Ctx {
+            resident,
             size,
             height: self.height_for(size),
             nominal: self.size,
@@ -1637,8 +1654,8 @@ impl Graph {
         let mut cache = Cache::for_graph(self, &keep, false, &ec.live);
         let mut res = BTreeMap::new();
         for (_, name, id) in &outs {
-            let t = eval_node(self, *id, &ctx, &ext, &mut cache)?;
-            res.insert(name.clone(), t);
+            let t = eval_node(self, *id, &ctx, ext, &mut cache)?;
+            res.insert(name.clone(), (*id, t));
         }
         if ec.logging.memory {
             let (now, peak) = ec.live.get();
@@ -1653,8 +1670,7 @@ impl Graph {
         }
         // hand the textures over without copying when no other output shares them
         cache.map.clear();
-        drop(ext);
-        Ok(res.into_iter().map(|(k, v)| (k, v.into_tex())).collect())
+        res.into_iter().map(|(k, (id, v))| Ok((k, v.into_host(id, ec)?.into_tex()))).collect()
     }
 
     /// The nodes an evaluation of the graph's outputs runs at its own level (what [`EvalContext::nodes_done`] counts
@@ -1681,6 +1697,7 @@ impl Graph {
         self.check_cycles()?;
         let gin = crate::func::graph_inputs(self);
         let ctx = Ctx {
+            resident: false,
             size,
             height: self.height_for(size),
             nominal: self.size,
@@ -1695,7 +1712,7 @@ impl Graph {
         let mut cache = Cache::for_graph(self, &[id], false, &ec.live);
         let t = eval_node(self, id, &ctx, &[], &mut cache)?;
         cache.map.clear();
-        Ok(t.into_tex())
+        Ok(t.into_host(id, ec)?.into_tex())
     }
 
     /// Evaluate every node once (shared cache). Produces thumbnails, per-node errors and
@@ -1745,6 +1762,7 @@ impl Graph {
         }
         let gin = crate::func::graph_inputs(self);
         let ctx = Ctx {
+            resident: false,
             size,
             height: self.height_for(size),
             nominal: self.size,
@@ -1771,7 +1789,7 @@ impl Graph {
         let mut seen = HashSet::new();
         order.retain(|i| seen.insert(*i));
         for id in order {
-            match eval_node(self, id, &ctx, &[], &mut cache) {
+            match eval_node(self, id, &ctx, &[], &mut cache).and_then(|value| value.into_host(id, ec)) {
                 Ok(t) => {
                     if Some(id) == first || keep.contains(&id) {
                         let t = t.tex();
@@ -2040,7 +2058,66 @@ fn hash_graph(g: &Graph, ctx: &Ctx) -> HashMap<u32, u64> {
     memo
 }
 
-fn eval_node(g: &Graph, id: u32, ctx: &Ctx, ext: &[Option<Val>], cache: &mut Cache) -> Result<Val, Error> {
+#[derive(Clone)]
+enum NodeValue {
+    Host(Val),
+    Device(Arc<DeviceValue>),
+}
+
+struct DeviceValue {
+    image: ResidentGrey16,
+    host: OnceLock<Arc<crate::tex::Grey16>>,
+}
+
+impl NodeValue {
+    fn dims(&self) -> (usize, usize) {
+        match self {
+            Self::Host(image) => image.dims(),
+            Self::Device(value) => (value.image.w, value.image.h),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Host(image) => image.bytes(),
+            Self::Device(value) => value.image.w * value.image.h * 2,
+        }
+    }
+
+    fn packed_grey(&self) -> Option<GreyInput<'_>> {
+        match self {
+            Self::Host(Val::Grey16(image)) => Some(GreyInput::Host(image)),
+            Self::Device(value) => Some(GreyInput::Device(&value.image)),
+            _ => None,
+        }
+    }
+
+    fn into_host(self, id: u32, ec: &EvalContext) -> Result<Val, Error> {
+        let value = match self {
+            Self::Host(image) => return Ok(image),
+            Self::Device(value) => value,
+        };
+        if let Some(image) = value.host.get() {
+            return Ok(Val::Grey16(image.clone()));
+        }
+        let ResidentGrey16 { w, h, div, alpha, pixels } = &value.image;
+        let read = pixels.read(&ec.cancel);
+        if ec.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let px = read.map_err(|reason| Error::GpuReadback(id, reason))?;
+        if Some(px.len()) != w.checked_mul(*h) {
+            return Err(Error::GpuReadback(id, "incomplete grayscale result".into()));
+        }
+        if let Some(profiler) = &ec.profiler {
+            profiler.resident_readback(id, px.len() * 2);
+        }
+        let image = Arc::new(crate::tex::Grey16 { w: *w, h: *h, div: *div, alpha: *alpha, px });
+        Ok(Val::Grey16(value.host.get_or_init(|| image).clone()))
+    }
+}
+
+fn eval_node(g: &Graph, id: u32, ctx: &Ctx, ext: &[Option<Val>], cache: &mut Cache) -> Result<NodeValue, Error> {
     eval_node_out(g, id, None, ctx, ext, cache)
 }
 
@@ -2061,7 +2138,7 @@ fn prof(name: &str) -> Option<crate::profile::Span> {
 /// Output size of a node, the Output Size setting: "Relative to input" (default; falls back to the parent size when
 /// nothing is connected), "Relative to parent", or "Absolute" (a power of two). The relative modifier moves the size
 /// up or down in powers of two (-12 .. +12), so a heavy node can run at half or quarter resolution.
-fn node_size(n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx) -> (usize, usize) {
+fn node_size(n: &Node, ins: &BTreeMap<String, NodeValue>, ctx: &Ctx) -> (usize, usize) {
     let get = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
     let mode = get("osize_mode", 0.0).round() as i32;
     let rel = get("osize_rel", 0.0).round().clamp(-12.0, 12.0) as i32;
@@ -2082,7 +2159,7 @@ fn node_size(n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx) -> (usize, usize)
             (w, h)
         }
         1 => (ctx.size, ctx.height),
-        _ => ins.get("in").or_else(|| ins.get("bg")).or_else(|| ins.values().next()).map(Val::dims).unwrap_or((ctx.size, ctx.height)),
+        _ => ins.get("in").or_else(|| ins.get("bg")).or_else(|| ins.values().next()).map(NodeValue::dims).unwrap_or((ctx.size, ctx.height)),
     };
     let shift = |b: usize| -> usize {
         if mode != 2 && rel != 0 {
@@ -2109,12 +2186,12 @@ struct Pending<'g> {
     links: Vec<(String, u32, Option<String>)>,
     /// how many of `links` have been asked for
     next: usize,
-    ins: BTreeMap<String, Val>,
+    ins: BTreeMap<String, NodeValue>,
 }
 
 /// What looking at a node first gives: its result when it is cached, else the node to evaluate.
 enum Start<'g> {
-    Done(Val),
+    Done(NodeValue),
     Todo(Box<Pending<'g>>),
 }
 
@@ -2123,7 +2200,7 @@ enum Start<'g> {
 /// The nodes still waiting for inputs are kept in a list of their own, not on the call stack, so a long chain of
 /// nodes needs no more stack than a short one. They are visited in the order a depth-first walk takes (inputs in slot
 /// order, each before the node reading it), so what is computed, freed and reported is the same as by recursion.
-fn eval_node_out(g: &Graph, id: u32, out: Option<&str>, ctx: &Ctx, ext: &[Option<Val>], cache: &mut Cache) -> Result<Val, Error> {
+fn eval_node_out(g: &Graph, id: u32, out: Option<&str>, ctx: &Ctx, ext: &[Option<Val>], cache: &mut Cache) -> Result<NodeValue, Error> {
     let mut stack: Vec<Box<Pending>> = match start_node(g, id, out, ctx, cache)? {
         Start::Done(t) => return Ok(t),
         Start::Todo(p) => vec![p],
@@ -2204,7 +2281,7 @@ fn start_node<'g>(g: &'g Graph, id: u32, out: Option<&str>, ctx: &Ctx, cache: &m
     if let (Some(p), Some(h)) = (&cache.persist, phash)
         && let Some((t, th, sz)) = p.get(h)
     {
-        let t = Val::Rgba(t);
+        let t = NodeValue::Host(Val::Rgba(t));
         cache.put(key, t.clone());
         if key == id {
             cache.sizes.insert(id, sz);
@@ -2226,8 +2303,8 @@ fn start_node<'g>(g: &'g Graph, id: u32, out: Option<&str>, ctx: &Ctx, cache: &m
 }
 
 /// Computes a node whose inputs are all in, stores the result and frees the inputs nobody else waits for.
-fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mut Cache) -> Result<Val, Error> {
-    let Pending { id, key, out, phash, node, mut ins, .. } = p;
+fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mut Cache) -> Result<NodeValue, Error> {
+    let Pending { id, key, out, phash, node, ins, .. } = p;
     let n: &Node = &node;
     let out = out.as_deref();
     // the node's own output size; inputs of another size are resampled to it
@@ -2237,18 +2314,11 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     // works out itself reads the input as it is)
     let compiled = g.meta.contains_key("compiled");
     let reads_positions = compiled && matches!(n.kind.as_str(), "pixel_processor" | "transform_matrix" | "laplacian_sharpen" | "grad_warp" | "pattern_program");
-    if !reads_positions && ins.values().any(|t| t.dims() != sz) {
-        let _span = prof("node.resize_inputs");
-        for t in ins.values_mut() {
-            if t.dims() != sz {
-                let full = t.tex();
-                *t = Val::of(if compiled { ops::resize_keep_edge(&full, sz.0, sz.1) } else { ops::resize_to(&full, sz.0, sz.1) });
-            }
-        }
-    }
+    let resize_inputs = !reads_positions && ins.values().any(|t| t.dims() != sz);
     let node_ctx;
     let ctx = if sz.0 != ctx.size || sz.1 != ctx.height {
         node_ctx = Ctx {
+            resident: ctx.resident,
             size: sz.0,
             height: sz.1,
             nominal: ctx.nominal,
@@ -2279,11 +2349,95 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
         crate::measured::FORMAT_16_BIT | crate::measured::COMPILED_16_BIT => Some(crate::measured::STEPS_16 as f32),
         _ => None,
     };
-    let steps = div.map(|div| crate::tex::Steps { read_rounding, fmt, div });
-    // a secondary output of a multi-output node runs the same code with the output index set
-    let extra = out.and_then(|o| node_outputs(&n.kind).iter().position(|x| *x == o)).filter(|i| *i > 0);
+    let format = NodeFormat { code: fmt, read_rounding, steps: div.map(|div| crate::tex::Steps { read_rounding, fmt, div }) };
     // (for the node log: every input grey)
-    let grey_ins = !ins.is_empty() && ins.values().all(|v| v.grey_in().is_some());
+    let grey_ins = !ins.is_empty() && ins.values().all(|v| !matches!(v, NodeValue::Host(Val::Rgba(_))));
+    let resident = if ctx.resident && compiled && !resize_inputs { compute_resident_grey(id, n, &ins, ctx, format.steps.as_ref())? } else { None };
+    let t = if let Some(image) = resident {
+        NodeValue::Device(Arc::new(DeviceValue { image, host: OnceLock::new() }))
+    } else {
+        let mut ins = ins.into_iter().map(|(slot, image)| Ok((slot, image.into_host(id, ctx.ec)?))).collect::<Result<BTreeMap<_, _>, Error>>()?;
+        if resize_inputs {
+            let _span = prof("node.resize_inputs");
+            for t in ins.values_mut() {
+                if t.dims() != sz {
+                    let full = t.tex();
+                    *t = Val::of(if compiled { ops::resize_keep_edge(&full, sz.0, sz.1) } else { ops::resize_to(&full, sz.0, sz.1) });
+                }
+            }
+        }
+        NodeValue::Host(compute_host_node(id, n, ins, ctx, ext, out, format)?)
+    };
+    if ctx.ec.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let _span = prof("node.store_and_free");
+    if ctx.depth == 0
+        && let Some(done) = &ctx.ec.nodes_done
+    {
+        done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Results that outlive the evaluation are kept as RGBA in the editor.
+    let full = if cache.persist.is_some() || (key == id && cache.thumbs.is_some()) { Some(t.clone().into_host(id, ctx.ec)?.tex()) } else { None };
+    let t = match (&full, &cache.persist) {
+        (Some(f), Some(_)) => NodeValue::Host(Val::Rgba(f.clone())),
+        _ => t,
+    };
+    cache.put(key, t.clone());
+    if ctx.ec.logging.node_times {
+        let form = match &t {
+            NodeValue::Host(Val::Rgba(_)) => "rgba",
+            NodeValue::Host(Val::Grey(..)) => "grey",
+            NodeValue::Host(Val::Grey16(_)) => "grey in steps",
+            NodeValue::Device(_) => "grey in GPU memory",
+        };
+        eprintln!("         node {id} held {form} {}x{}{}; results held {} MB", sz.0, sz.1, if grey_ins { ", grey inputs" } else { "" }, cache.live >> 20);
+    }
+    if key == id {
+        cache.sizes.insert(id, sz.0);
+    }
+    let thumb = match &full {
+        Some(f) if key == id => thumbnail(f),
+        _ => Vec::new(),
+    };
+    if let (Some(p), Some(h), Some(f)) = (&cache.persist, phash, &full) {
+        p.put(h, f.clone(), thumb.clone(), sz.0);
+    }
+    if key == id
+        && let Some(th) = cache.thumbs.as_mut()
+    {
+        th.insert(id, thumb);
+    }
+    // Free inputs nobody else is waiting for.
+    for (slot, rid) in &n.ins {
+        let k = cache_key(g, *rid, n.in_out.get(slot).map(|s| s.as_str()));
+        if let Some(c) = cache.left.get_mut(&k) {
+            *c = c.saturating_sub(1);
+            if *c == 0 && !cache.keep.contains(&k) {
+                cache.drop_entry(k);
+            }
+        }
+    }
+    Ok(t)
+}
+
+struct NodeFormat {
+    code: u32,
+    read_rounding: bool,
+    steps: Option<crate::tex::Steps>,
+}
+
+fn compute_host_node(
+    id: u32,
+    n: &Node,
+    ins: BTreeMap<String, Val>,
+    ctx: &Ctx,
+    ext: &[Option<Val>],
+    output: Option<&str>,
+    NodeFormat { code: format, read_rounding, steps }: NodeFormat,
+) -> Result<Val, Error> {
+    // A secondary output runs the same node with its output index set.
+    let extra = output.and_then(|name| node_outputs(&n.kind).iter().position(|&slot| slot == name)).filter(|&index| index > 0);
     let t = match n.kind.as_str() {
         "input" => {
             let idx = n.nums.get("idx").copied().unwrap_or(0.0).max(0.0) as usize;
@@ -2299,7 +2453,7 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
                 None => Computed::Rgba(Tex::solid(ctx.size, ctx.height, [0.0, 0.0, 0.0, 1.0])),
             }
         }
-        "subgraph" => Computed::Held(run_sub(id, n, &ins, ctx, out)?),
+        "subgraph" => Computed::Held(run_sub(id, n, &ins, ctx, output)?),
         _ => {
             let t0 = ctx.ec.logging.node_times.then(NodeClock::start);
             let _span = crate::profile::enabled().then(|| crate::profile::span(&format!("node.{}", n.kind)));
@@ -2345,6 +2499,7 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     if ctx.ec.is_cancelled() {
         return Err(Error::Cancelled);
     }
+    let sz = (ctx.size, ctx.height);
     let t = if t.dims() != sz {
         let _span = prof("node.resize_result");
         Computed::Rgba(ops::resize_to(&t.into_tex(), sz.0, sz.1))
@@ -2355,10 +2510,10 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
         // (computed in its format's steps already)
         Computed::Stepped(v) => Val::Grey16(Rc::new(v)),
         // (a held result the node doesn't change is not copied)
-        Computed::Held(v) if fmt == 0 && !read_rounding => v,
+        Computed::Held(v) if format == 0 && !read_rounding => v,
         Computed::Held(Val::Rgba(t)) => {
             let mut t = Rc::try_unwrap(t).unwrap_or_else(|rc| (*rc).clone());
-            finish_format(&mut t, fmt, read_rounding);
+            finish_format(&mut t, format, read_rounding);
             Val::of(t)
         }
         Computed::Held(v) => {
@@ -2367,70 +2522,23 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
                 Some(g) => (g.floats().into_owned(), g.alpha()),
                 None => (Grey::solid(1, 1, 0.0), 1.0),
             };
-            finish_format(&mut t, fmt, read_rounding);
+            finish_format(&mut t, format, read_rounding);
             Val::Grey(Rc::new(t), a)
         }
         Computed::Rgba(mut t) => {
-            finish_format(&mut t, fmt, read_rounding);
+            finish_format(&mut t, format, read_rounding);
             // held grey when it came out grey
             Val::of(t)
         }
         Computed::Grey(mut t, a) => {
-            finish_format(&mut t, fmt, read_rounding);
+            finish_format(&mut t, format, read_rounding);
             Val::Grey(Rc::new(t), a)
         }
     };
-    let t = match div {
-        Some(div) => t.quantised(div),
+    Ok(match steps {
+        Some(steps) => t.quantised(steps.div),
         None => t,
-    };
-    let _span = prof("node.store_and_free");
-    if ctx.depth == 0
-        && let Some(done) = &ctx.ec.nodes_done
-    {
-        done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    // results that outlive the evaluation are kept as RGBA (editor)
-    let full = (cache.persist.is_some() || (key == id && cache.thumbs.is_some())).then(|| t.tex());
-    let t = match (&full, &cache.persist) {
-        (Some(f), Some(_)) => Val::Rgba(f.clone()),
-        _ => t,
-    };
-    cache.put(key, t.clone());
-    if ctx.ec.logging.node_times {
-        let form = match &t {
-            Val::Rgba(_) => "rgba",
-            Val::Grey(..) => "grey",
-            Val::Grey16(_) => "grey in steps",
-        };
-        eprintln!("         node {id} held {form} {}x{}{}; results held {} MB", sz.0, sz.1, if grey_ins { ", grey inputs" } else { "" }, cache.live >> 20);
-    }
-    if key == id {
-        cache.sizes.insert(id, sz.0);
-    }
-    let thumb = match &full {
-        Some(f) if key == id => thumbnail(f),
-        _ => Vec::new(),
-    };
-    if let (Some(p), Some(h), Some(f)) = (&cache.persist, phash, &full) {
-        p.put(h, f.clone(), thumb.clone(), sz.0);
-    }
-    if key == id
-        && let Some(th) = cache.thumbs.as_mut()
-    {
-        th.insert(id, thumb);
-    }
-    // free inputs nobody else is waiting for
-    for (slot, rid) in &n.ins {
-        let k = cache_key(g, *rid, n.in_out.get(slot).map(|s| s.as_str()));
-        if let Some(c) = cache.left.get_mut(&k) {
-            *c = c.saturating_sub(1);
-            if *c == 0 && !cache.keep.contains(&k) {
-                cache.drop_entry(k);
-            }
-        }
-    }
-    Ok(t)
+    })
 }
 
 /// A node's result as computed, before its format and before it is held.
@@ -2484,7 +2592,7 @@ fn expanded(ins: &BTreeMap<String, Val>) -> BTreeMap<String, Rc<Tex>> {
 
 /// Textures of finished nodes, plus what is needed to free them early.
 struct Cache {
-    map: HashMap<u32, Val>,
+    map: HashMap<u32, NodeValue>,
     /// how many not-yet-evaluated links still read each cached entry; an entry is freed when it reaches zero
     left: HashMap<u32, u32>,
     keep: HashSet<u32>,
@@ -2538,7 +2646,7 @@ impl Cache {
         c
     }
 
-    fn put(&mut self, key: u32, t: Val) {
+    fn put(&mut self, key: u32, t: NodeValue) {
         let b = t.bytes();
         if let Some(old) = self.map.insert(key, t) {
             self.live = self.live.saturating_sub(old.bytes());
@@ -2957,6 +3065,25 @@ fn run_function_image(id: u32, n: &Node, fname: &str, ins: &BTreeMap<String, Rc<
     Ok(run_function(id, n, fname, images, ctx, once, None)?.into_tex())
 }
 
+fn pixel_function_env<'a>(n: &Node, ctx: &'a Ctx, prog: &crate::func::Prog) -> crate::func::FnEnv<'a> {
+    let size = [ctx.size as f64, ctx.height as f64];
+    let mut env = crate::func::FnEnv::new(size);
+    // The built-in size is the node's. `$outputsize` refers to the graph.
+    if let Some(graph) = ctx.graph {
+        env.own = Some(size);
+        env.size = graph.map(|side| side as f64);
+    }
+    env.seed = (n.nums.get("seed").copied().unwrap_or(0.0).max(0.0) as u32).wrapping_add(ctx.so);
+    env.graph_inputs = ctx.gin;
+    for (key, value) in &n.nums {
+        if let Some(input) = key.strip_prefix("fa.") {
+            let pin = prog.inputs.iter().find(|i| i.0 == input).map_or(Pin::Float, |i| i.1);
+            env.args.insert(input.to_string(), crate::func::coerce(&crate::func::Value::float(f64::from(*value)), pin));
+        }
+    }
+    env
+}
+
 /// A function run at every pixel ([`run_function_image`]) on the images `images` (by slot). `grey`: a function that gives one
 /// number (or a boolean) at every pixel comes out as a grey image (the same values the RGBA form gives, `[v, v, v, 1]`).
 /// `grey`: `Some` to give a grey result where it is one, computed in the steps given when it can be.
@@ -2969,25 +3096,11 @@ fn run_function(
     once: bool,
     grey: Option<Option<&crate::tex::Steps>>,
 ) -> Result<Computed, Error> {
-    use crate::func::{FnEnv, Value, compile_named};
+    use crate::func::{Value, compile_named};
     let prog = compile_named(ctx.lib, fname).map_err(|e| Error::BadParam(id, e))?;
     let (w, h) = (ctx.size, ctx.height);
-    let mut env = FnEnv::new([w as f64, h as f64]);
-    // on a node of another size `$outputsize` stays the graph's, in the size expression and the function alike; the built-in size is the node's
-    // (measured: 2048 x 16 tables whose curve is set by the size expression, mean 95 to 0.001)
-    if let Some([gw, gh]) = ctx.graph {
-        env.own = Some([w as f64, h as f64]);
-        env.size = [gw as f64, gh as f64];
-    }
-    env.seed = (n.nums.get("seed").copied().unwrap_or(0.0).max(0.0) as u32).wrapping_add(ctx.so);
-    env.graph_inputs = ctx.gin;
+    let mut env = pixel_function_env(n, ctx, &prog);
     env.images = images;
-    for (ak, av) in &n.nums {
-        if let Some(input) = ak.strip_prefix("fa.") {
-            let pin = prog.inputs.iter().find(|i| i.0 == input).map(|i| i.1).unwrap_or(crate::graph::Pin::Float);
-            env.args.insert(input.to_string(), crate::func::coerce(&Value::float(*av as f64), pin));
-        }
-    }
     if prog.uses_stats {
         env = env.with_stats();
     }
@@ -3105,6 +3218,7 @@ fn run_sub(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx, out: Optio
         .ok_or_else(|| Error::BadParam(id, format!("subgraph '{name}' has no output")))?;
     let gin = crate::func::graph_inputs(&sub);
     let c2 = Ctx {
+        resident: ctx.resident,
         size: ctx.size,
         height: ctx.height,
         nominal: ctx.nominal,
@@ -3119,7 +3233,7 @@ fn run_sub(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx, out: Optio
     let mut cache = Cache::for_graph(&sub, &[out_id], false, &ctx.ec.live);
     let t = eval_node(&sub, out_id, &c2, &ext, &mut cache)?;
     cache.map.clear();
-    Ok(t)
+    t.into_host(id, ctx.ec)
 }
 
 fn compute(id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx) -> Result<Tex, Error> {
@@ -4370,23 +4484,65 @@ fn compute_gpu_pattern(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx
         .map_err(|e| Error::BadParam(id, e))
 }
 
+fn compute_resident_grey(
+    id: u32,
+    n: &Node,
+    ins: &BTreeMap<String, NodeValue>,
+    ctx: &Ctx<'_>,
+    steps: Option<&crate::tex::Steps>,
+) -> Result<Option<ResidentGrey16>, Error> {
+    let Some(accelerator) = &ctx.ec.accelerator else { return Ok(None) };
+    let result = match n.kind.as_str() {
+        "transform_matrix" | "blend" => {
+            let Some(pass) = grey_pass(n, ctx, steps, |slot| ins.get(slot).and_then(NodeValue::packed_grey)) else { return Ok(None) };
+            accelerator.resident_grey(pass, &ctx.ec.cancel)
+        }
+        "pixel_processor"
+            if steps.is_some_and(|s| s.fmt == crate::measured::COMPILED_16_BIT)
+                && !rolls(n)
+                && ins.values().any(|value| matches!(value, NodeValue::Device(_))) =>
+        {
+            let Some(name) = n.strs.get("fn") else { return Ok(None) };
+            let Some(images) =
+                IMAGE_SLOTS.iter().filter_map(|&slot| ins.get(slot).map(|value| value.packed_grey().map(|input| (slot, input)))).collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            let prog = crate::func::compile_named(ctx.lib, name).map_err(|e| Error::BadParam(id, e))?;
+            let env = pixel_function_env(n, ctx, &prog);
+            let Some(shader) = prog.packed_pixel_shader(&env, &images) else { return Ok(None) };
+            let sources = images.iter().map(|&(_, input)| input).collect::<Vec<_>>();
+            accelerator.resident_pixel(shader, &sources, [ctx.size, ctx.height], &ctx.ec.cancel)
+        }
+        _ => return Ok(None),
+    };
+    if ctx.ec.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    if result.as_ref().is_ok_and(Option::is_some)
+        && let Some(profiler) = &ctx.ec.profiler
+    {
+        profiler.resident_node(id, &n.kind);
+    }
+    result.map_err(|reason| Error::BadParam(id, reason))
+}
+
 /// The imported 16-bit grayscale pyramids frequently enlarge and blend whole 4K/8K images.
-fn compute_gpu_grey_pass(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>) -> Result<Option<Computed>, Error> {
-    use crate::accelerator::GreyPass;
+fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, input: impl Fn(&str) -> Option<GreyInput<'a>>) -> Option<ResidentGreyPass<'a>> {
     use crate::measured::{COMPILED_16_BIT, STEPS_16};
 
-    let Some(accelerator) = &ctx.ec.accelerator else { return Ok(None) };
     if ctx.size < 4096 || ctx.size != ctx.height || !steps.is_some_and(|s| s.fmt == COMPILED_16_BIT) || rolls(n) {
-        return Ok(None);
+        return None;
     }
     let value = |key, default| n.nums.get(key).copied().unwrap_or(default);
-    let source = |slot| match ins.get(slot) {
-        Some(Val::Grey16(s)) if s.div == STEPS_16 as f32 && s.alpha.to_bits() == 1.0f32.to_bits() && s.w == s.h && s.w.is_power_of_two() => Some(s.as_ref()),
-        _ => None,
+    let source = |slot| {
+        let image = input(slot)?;
+        let (w, h, div, alpha) = image.info();
+        (w == h && w.is_power_of_two() && div == STEPS_16 as f32 && alpha == 1.0).then_some((image, w))
     };
-    let pass = if n.kind == "transform_matrix" {
-        let Some(source) = source("in") else { return Ok(None) };
-        if !(2..ctx.size).contains(&source.w)
+    if n.kind == "transform_matrix" {
+        let (source, width) = source("in")?;
+        if !(2..ctx.size).contains(&width)
             || !ctx.size.is_power_of_two()
             || value("tile_x", 1.0) != 1.0
             || value("tile_y", 1.0) != 1.0
@@ -4397,23 +4553,39 @@ fn compute_gpu_grey_pass(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &C
             || crate::atomic::transform_matrix_bg(n) != [0.0; 4]
             || [value("m00", 1.0), value("m01", 0.0), value("m10", 0.0), value("m11", 1.0)] != [1.0, 0.0, 0.0, 1.0]
         {
-            return Ok(None);
+            return None;
         }
-        GreyPass::Enlarge { source, side: ctx.size }
+        Some(ResidentGreyPass::Enlarge { source, side: ctx.size })
     } else {
-        let (Some(foreground), Some(background)) = (source("fg"), source("bg")) else { return Ok(None) };
+        let (foreground, fg_width) = source("fg")?;
+        let (background, bg_width) = source("bg")?;
         let (mode, opacity) = (value("mode", 0.0) as u32, value("opacity", 1.0));
         if !(32..=34).contains(&mode)
             || value("alpha_mode", 1.0) as u32 != 1
             || !opacity.is_finite()
-            || ins.contains_key("mask")
-            || foreground.w != ctx.size
-            || background.w != ctx.size
+            || n.ins.contains_key("mask")
+            || fg_width != ctx.size
+            || bg_width != ctx.size
             || [value("crop_x0", 0.0), value("crop_y0", 0.0), value("crop_x1", 1.0), value("crop_y1", 1.0)] != [0.0, 0.0, 1.0, 1.0]
         {
-            return Ok(None);
+            return None;
         }
-        GreyPass::Blend { foreground, background, mode, opacity }
+        Some(ResidentGreyPass::Blend { foreground, background, mode, opacity })
+    }
+}
+
+fn compute_gpu_grey_pass(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>) -> Result<Option<Computed>, Error> {
+    use crate::accelerator::GreyPass;
+    let Some(accelerator) = &ctx.ec.accelerator else { return Ok(None) };
+    let pass = match grey_pass(n, ctx, steps, |slot| match ins.get(slot) {
+        Some(Val::Grey16(image)) => Some(GreyInput::Host(image)),
+        _ => None,
+    }) {
+        Some(ResidentGreyPass::Enlarge { source: GreyInput::Host(source), side }) => GreyPass::Enlarge { source, side },
+        Some(ResidentGreyPass::Blend { foreground: GreyInput::Host(foreground), background: GreyInput::Host(background), mode, opacity }) => {
+            GreyPass::Blend { foreground, background, mode, opacity }
+        }
+        _ => return Ok(None),
     };
     let result = accelerator.grey_pass(pass, &ctx.ec.cancel);
     if ctx.ec.is_cancelled() {

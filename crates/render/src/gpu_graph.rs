@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use texturecraft_graph::accelerator::{Accelerator, GreyPass, PixelOutput, PixelRequest};
+use texturecraft_graph::accelerator::{Accelerator, GreyInput, GreyPass, PixelOutput, PixelRequest, ResidentGrey16, ResidentGreyPass};
 use texturecraft_graph::context::Cancel;
 use texturecraft_graph::func::PixelShader;
 use texturecraft_graph::tex::{Grey, Grey16, ImgRef, Tex};
@@ -14,6 +14,21 @@ const PIXEL_COUNT_THRESHOLD: usize = 64 * 1024;
 const MAX_PIPELINES: usize = 64;
 const ROW_BUFFER_BYTES: u64 = 16 << 20;
 const SHADER: &str = include_str!("shaders/graph_pixel.wgsl");
+const COMPILED_GREY: &str = include_str!("shaders/graph_compiled_grey.wgsl");
+
+const PACKED_PIXEL_ENTRY: &str = "
+    @group(0) @binding(1) var<storage, read_write> result: array<u32>;
+    @compute @workgroup_size(8, 8)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+        let size = vec2u(parameters[0].xy);
+        if (id.x >= size.x / 2u || id.y >= size.y) { return; }
+        let uv = (vec2f(f32(id.x * 2u), f32(id.y)) + 0.5) / vec2f(size);
+        let values = vec2f(evaluate_pixel(uv), evaluate_pixel(uv + vec2f(1.0 / f32(size.x), 0.0)));
+        let finite = (bitcast<vec2u>(values) & vec2u(0x7f800000u)) != vec2u(0x7f800000u);
+        let words = compiled_16bit(select(vec2f(0.0), values, finite));
+        result[id.y * (size.x / 2u) + id.x] = words.x | (words.y << 16u);
+    }
+";
 
 pub struct GraphAccelerator {
     device: wgpu::Device,
@@ -104,7 +119,7 @@ impl GraphAccelerator {
         Some(hashes.each_ref().map(Hasher::finish))
     }
 
-    fn pipeline(&self, shader: &PixelShader) -> Option<wgpu::ComputePipeline> {
+    fn pipeline(&self, shader: &PixelShader, packed: bool) -> Option<wgpu::ComputePipeline> {
         let mut cache = self.pipelines.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(value) = cache.values.get(&shader.source) {
             return value.clone();
@@ -114,8 +129,11 @@ impl GraphAccelerator {
         } else {
             ("vec4f", "(bitcast<vec4u>(value) & vec4u(0x7f800000u)) != vec4u(0x7f800000u)")
         };
-        let source = format!(
-            "{SHADER}\n{}\n\
+        let source = if packed {
+            format!("{SHADER}\n{COMPILED_GREY}\n{}\n{PACKED_PIXEL_ENTRY}", shader.source)
+        } else {
+            format!(
+                "{SHADER}\n{}\n\
             @group(0) @binding(1) var<storage, read_write> result: array<{pixel}>;\n\
             @compute @workgroup_size(8, 8)\n\
             fn main(@builtin(global_invocation_id) id: vec3u) {{\n\
@@ -125,8 +143,9 @@ impl GraphAccelerator {
                 let value = evaluate_pixel(uv);\n\
                 result[id.y * dimensions.x + id.x] = select({pixel}(0.0), value, {finite});\n\
             }}",
-            shader.source
-        );
+                shader.source
+            )
+        };
         let pipeline = crate::gpu_trace::scoped(&self.device, "GPU pixel graph pipeline", || {
             let module = self
                 .device
@@ -168,7 +187,7 @@ impl GraphAccelerator {
         if request.cancel.is_cancelled() {
             return Err("GPU pixel graph cancelled".into());
         }
-        let Some(pipeline) = self.pipeline(&shader) else { return Ok(None) };
+        let Some(pipeline) = self.pipeline(&shader, false) else { return Ok(None) };
         let (device, queue) = (&self.device, &self.queue);
         let components = if shader.grey { 1 } else { 4 };
         let row_bytes = u64::from(width) * components * 4;
@@ -255,6 +274,85 @@ impl GraphAccelerator {
         let [w, h] = request.size;
         Ok(Some(if shader.grey { PixelOutput::Grey(Grey { w, h, px: grey }) } else { PixelOutput::Rgba(Tex { w, h, px: rgba }) }))
     }
+
+    fn grey_rasterizer(&self) -> Option<&crate::gpu_graph_grey::GreyRasterizer> {
+        self.grey
+            .get_or_init(|| {
+                crate::gpu_graph_grey::GreyRasterizer::new(&self.device, &self.queue).inspect_err(|reason| {
+                    log::warn!("{reason}; evaluating grayscale graph passes on CPU");
+                })
+            })
+            .as_ref()
+            .ok()
+    }
+
+    fn evaluate_resident_pixel(
+        &self,
+        shader: PixelShader,
+        images: &[GreyInput<'_>],
+        [w, h]: [usize; 2],
+        cancel: &Cancel,
+    ) -> Result<Option<ResidentGrey16>, String> {
+        let max = self.device.limits();
+        if w < 2
+            || !w.is_power_of_two()
+            || h == 0
+            || !shader.grey
+            || !shader.images.iter().any(|&i| matches!(images.get(i), Some(GreyInput::Device(_))))
+            || shader.images.len() + 2 > max.max_storage_buffers_per_shader_stage as usize
+            || (shader.uniforms.len() as u64 + 1) * 16 > max.max_storage_buffer_binding_size
+            || (w / 2).div_ceil(8).max(h.div_ceil(8)) > max.max_compute_workgroups_per_dimension as usize
+        {
+            return Ok(None);
+        }
+        let Some(rasterizer) = self.grey_rasterizer() else { return Ok(None) };
+        let (device, queue) = (&self.device, &self.queue);
+        device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
+        let mut inputs = Vec::with_capacity(shader.images.len());
+        for &binding in &shader.images {
+            let Some(&input) = images.get(binding) else { return Ok(None) };
+            let Some(bound) = rasterizer.bind_input(input)? else { return Ok(None) };
+            inputs.push(bound);
+        }
+        let Some(output) = rasterizer.allocate_resident(w, h)? else { return Ok(None) };
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(pipeline) = self.pipeline(&shader, true) else { return Ok(None) };
+        let mut params = vec![[w as f32, h as f32, 0.0, 0.0]];
+        params.extend(shader.uniforms);
+        crate::gpu_trace::scoped(device, "resident graph pixel processor", || {
+            let parameters = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("resident graph pixel parameters"),
+                contents: bytemuck::cast_slice(&params),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let entries = [&parameters, &output.buffer]
+                .into_iter()
+                .chain(inputs.iter().map(|image| &image.buffer))
+                .enumerate()
+                .map(|(binding, buffer)| wgpu::BindGroupEntry { binding: binding as u32, resource: buffer.as_entire_binding() })
+                .collect::<Vec<_>>();
+            let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("resident graph pixel inputs"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &entries,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &binding, &[]);
+                pass.dispatch_workgroups((w as u32 / 2).div_ceil(8), (h as u32).div_ceil(8), 1);
+            }
+            queue.submit([encoder.finish()]);
+        })?;
+        for input in &inputs {
+            input.retain_until_completed(queue);
+        }
+        output.retain_until_completed(queue);
+        Ok(Some(ResidentGrey16 { w, h, div: 65535.0, alpha: 1.0, pixels: output }))
+    }
 }
 
 impl Accelerator for GraphAccelerator {
@@ -310,14 +408,7 @@ impl Accelerator for GraphAccelerator {
     }
 
     fn grey_pass(&self, pass: GreyPass<'_>, cancel: &Cancel) -> Result<Option<Grey16>, String> {
-        let rasterizer = self.grey.get_or_init(|| match crate::gpu_graph_grey::GreyRasterizer::new(&self.device, &self.queue) {
-            Ok(rasterizer) => Ok(rasterizer),
-            Err(reason) => {
-                log::warn!("{reason}; evaluating grayscale graph passes on CPU");
-                Err(reason)
-            }
-        });
-        let Ok(rasterizer) = rasterizer else { return Ok(None) };
+        let Some(rasterizer) = self.grey_rasterizer() else { return Ok(None) };
         match rasterizer.render(pass, cancel) {
             Err(reason) if !cancel.is_cancelled() => {
                 log::warn!("{reason}; evaluating the grayscale graph pass on CPU");
@@ -325,6 +416,25 @@ impl Accelerator for GraphAccelerator {
             }
             result => result,
         }
+    }
+
+    fn resident_grey(&self, pass: ResidentGreyPass<'_>, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+        let Some(rasterizer) = self.grey_rasterizer() else { return Ok(None) };
+        resident_or_fallback(rasterizer.render_resident(pass, cancel), cancel)
+    }
+
+    fn resident_pixel(&self, shader: PixelShader, images: &[GreyInput<'_>], size: [usize; 2], cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+        resident_or_fallback(self.evaluate_resident_pixel(shader, images, size, cancel), cancel)
+    }
+}
+
+fn resident_or_fallback(result: Result<Option<ResidentGrey16>, String>, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+    match result {
+        Err(reason) if !cancel.is_cancelled() => {
+            log::warn!("{reason}; retrying the graph node with bounded transfers");
+            Ok(None)
+        }
+        result => result,
     }
 }
 

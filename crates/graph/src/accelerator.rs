@@ -1,7 +1,9 @@
 //! Optional host accelerators for whole-image graph operations.
 
+use std::{any::Any, fmt::Debug, sync::Arc};
+
 use crate::context::Cancel;
-use crate::func::{FnEnv, Prog};
+use crate::func::{FnEnv, PixelShader, Prog};
 use crate::tex::{Grey, Grey16, Tex};
 
 pub struct PixelRequest<'a> {
@@ -25,6 +27,41 @@ pub enum GreyPass<'a> {
     Blend { foreground: &'a Grey16, background: &'a Grey16, mode: u32, opacity: f32 },
 }
 
+/// Packed, quantized grayscale pixels owned by an accelerator.
+pub trait ResidentGreyPixels: Debug + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn read(&self, cancel: &Cancel) -> Result<Vec<u16>, String>;
+}
+
+#[derive(Debug)]
+pub struct ResidentGrey16 {
+    pub w: usize,
+    pub h: usize,
+    pub div: f32,
+    pub alpha: f32,
+    pub pixels: Arc<dyn ResidentGreyPixels>,
+}
+
+#[derive(Clone, Copy)]
+pub enum GreyInput<'a> {
+    Host(&'a Grey16),
+    Device(&'a ResidentGrey16),
+}
+
+impl GreyInput<'_> {
+    pub fn info(self) -> (usize, usize, f32, f32) {
+        match self {
+            Self::Host(t) => (t.w, t.h, t.div, t.alpha),
+            Self::Device(t) => (t.w, t.h, t.div, t.alpha),
+        }
+    }
+}
+
+pub enum ResidentGreyPass<'a> {
+    Enlarge { source: GreyInput<'a>, side: usize },
+    Blend { foreground: GreyInput<'a>, background: GreyInput<'a>, mode: u32, opacity: f32 },
+}
+
 pub trait Accelerator: Send + Sync {
     /// Identifies changes to rendered pixels for the host's result caches.
     fn cache_tag(&self) -> &str;
@@ -40,6 +77,16 @@ pub trait Accelerator: Send + Sync {
     }
 
     fn grey_pass(&self, _pass: GreyPass<'_>, _cancel: &Cancel) -> Result<Option<Grey16>, String> {
+        Ok(None)
+    }
+
+    /// Execute a grayscale operation without fetching its result back to the host.
+    fn resident_grey(&self, _pass: ResidentGreyPass<'_>, _cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+        Ok(None)
+    }
+
+    /// Execute a grayscale pixel program whose image inputs and output use packed integer samples.
+    fn resident_pixel(&self, _shader: PixelShader, _images: &[GreyInput<'_>], _size: [usize; 2], _cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
         Ok(None)
     }
 }

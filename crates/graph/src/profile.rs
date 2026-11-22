@@ -17,6 +17,12 @@ pub trait Profiler: Send + Sync {
     }
     /// Observes a result supplied by an accelerator, including one reused from its cache.
     fn accelerated_node(&self, _id: u32, _kind: &str) {}
+    /// Observes a result still held on the accelerator and readable by compatible nodes.
+    fn resident_node(&self, id: u32, kind: &str) {
+        self.accelerated_node(id, kind);
+    }
+    /// Observes packed grayscale pixels fetched for a consumer that needs host pixels.
+    fn resident_readback(&self, _id: u32, _bytes: usize) {}
 }
 
 /// A timed stretch of work: runs from [`span`] until dropped.
