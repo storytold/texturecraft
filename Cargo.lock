@@ -900,7 +900,7 @@ dependencies = [
 [[package]]
 name = "craft-material-graph"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a#7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a"
+source = "git+https://github.com/vangel76/craft-libs?rev=7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a#7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a"
 dependencies = [
  "libm",
  "rayon",
@@ -909,7 +909,7 @@ dependencies = [
 [[package]]
 name = "craft-material-graph-wgpu"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a#7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a"
+source = "git+https://github.com/vangel76/craft-libs?rev=7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a#7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a"
 dependencies = [
  "bytemuck",
  "craft-material-graph",
@@ -998,7 +998,7 @@ dependencies = [
 [[package]]
 name = "craft-spp-reader"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a#7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a"
+source = "git+https://github.com/vangel76/craft-libs?rev=7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a#7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a"
 dependencies = [
  "adler2",
  "crc32fast",
