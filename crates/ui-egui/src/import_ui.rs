@@ -176,15 +176,7 @@ fn notice(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> O
 /// Convert, build the GPU material pipelines and prepare CPU-only materials on the worker.
 fn start(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> ImportUi {
     let (file, path) = (task.file_name(), task.source_path().map(str::to_string));
-    let progress = ImportProgress::with_live_log(&file);
-    #[cfg(not(target_arch = "wasm32"))]
-    let progress = if app.gpu.is_some() {
-        let repaint = ctx.clone();
-        progress.with_preview(move || repaint.request_repaint())
-    } else {
-        progress
-    };
-    let progress = Arc::new(progress);
+    let progress = Arc::new(ImportProgress::with_live_log(&file));
     let worker = progress.clone();
     let prefer_gpu = app.ui.prefs.gpu_compositing && app.gpu.as_ref().is_some_and(crate::gpu::GpuLink::supports_gpu_layers);
     #[cfg(not(target_arch = "wasm32"))]
