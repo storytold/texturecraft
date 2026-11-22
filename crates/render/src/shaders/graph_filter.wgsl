@@ -129,29 +129,43 @@ fn box_edge(p: vec2<i32>, axis: vec2<i32>, inner: i32, outer: i32) -> f32 {
     return f32((((256u - far) * front_units(p + inner * axis) + far * front_units(p + outer * axis)) + 128u) >> 8u);
 }
 
-fn box_pyramid_value(p: vec2<i32>, axis: vec2<i32>, start: i32, width: u32) -> u32 {
-    // At radius <= 12 the biggest aligned block has 16 samples. Its pair rounding matches the compiled format.
+fn box_pair(a: u32, b: u32) -> u32 {
+    let sum = a + b;
+    if params.output.z == 255u {
+        return compiled_8bit_sample(f32(sum) / 131070.0) * 257u;
+    }
+    return (sum + 1u) / 2u;
+}
+
+fn box_small_block(p: vec2<i32>, axis: vec2<i32>, start: i32, width: u32) -> u32 {
     var values: array<u32, 16>;
     for (var i = 0u; i < width; i++) {
         values[i] = front_units(p + (start + i32(i)) * axis);
     }
     for (var count = width >> 1u; count > 0u; count >>= 1u) {
         for (var i = 0u; i < count; i++) {
-            let sum = values[2u * i] + values[2u * i + 1u];
-            if params.output.z == 255u {
-                values[i] = compiled_8bit_sample(f32(sum) / 131070.0) * 257u;
-            } else {
-                values[i] = (sum + 1u) / 2u;
-            }
+            values[i] = box_pair(values[2u * i], values[2u * i + 1u]);
         }
     }
-    return width * values[0];
+    return values[0];
+}
+
+fn box_pyramid_value(p: vec2<i32>, axis: vec2<i32>, start: i32, width: u32) -> u32 {
+    if width <= 16u {
+        return width * box_small_block(p, axis, start, width);
+    }
+    let left = box_pair(box_small_block(p, axis, start, 16u), box_small_block(p, axis, start + 16, 16u));
+    if width == 32u {
+        return width * left;
+    }
+    let right = box_pair(box_small_block(p, axis, start + 32, 16u), box_small_block(p, axis, start + 48, 16u));
+    return width * box_pair(left, right);
 }
 
 fn box_pyramid_sum(p: vec2<i32>, axis: vec2<i32>, start: i32, end: i32, side: i32) -> f32 {
     // Cover the interior with the largest aligned blocks available at each position.
     let origin = p.x * axis.x + p.y * axis.y;
-    let top = 1u << min(4u, firstLeadingBit(u32(2 * side - 1)));
+    let top = 1u << min(6u, firstLeadingBit(u32(2 * side - 1)));
     var sum = 0u;
     var offset = start;
     while offset < end {

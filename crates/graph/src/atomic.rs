@@ -211,9 +211,6 @@ pub(crate) fn resident_filter<'a>(
     map: Option<crate::accelerator::GreyInput<'a>>,
 ) -> Option<crate::accelerator::ResidentFilter<'a>> {
     use crate::accelerator::{FilterOperation, ResidentFilter};
-    // Direct GPU taps cover the default imported blur at up to 8K. Wider filters use the row-integral evaluator.
-    const MAX_GPU_RADIUS: f32 = 12.0;
-
     let packed = |input: crate::accelerator::GreyInput<'_>| {
         let (w, h, div, alpha) = input.info();
         w >= 2 && w.is_power_of_two() && h.is_power_of_two() && [STEPS_8 as f32, STEPS_16 as f32].contains(&div) && crate::tex::grey_alpha_ok(alpha)
@@ -222,6 +219,9 @@ pub(crate) fn resident_filter<'a>(
         return None;
     }
     let (w, h, source_div, _) = source.info();
+    // The packed shader can run the wider curvature filters at 2K. Keep the work
+    // of a direct-tap pass bounded on larger images.
+    let max_radius = if w.saturating_mul(h) <= 2048 * 2048 { 48.0 } else { 12.0 };
     if !matches!(n.kind.as_str(), "grad_warp" | "transform_matrix") && size != [w, h] {
         return None;
     }
@@ -301,7 +301,7 @@ pub(crate) fn resident_filter<'a>(
         }
         "box_blur" if quantized_blur => {
             let radius = radii(value("intensity", BLUR_DEFAULT_INTENSITY)).map(f32::abs);
-            if radius.into_iter().any(|r| !(0.0..=MAX_GPU_RADIUS).contains(&r)) {
+            if radius.into_iter().any(|r| !(0.0..=max_radius).contains(&r)) {
                 return None;
             }
             FilterOperation::Box { radius }
@@ -314,7 +314,7 @@ pub(crate) fn resident_filter<'a>(
             }
             if sin.abs() < AXIS_SLACK || cos.abs() < AXIS_SLACK {
                 let radius = if sin.abs() < AXIS_SLACK { [rx.abs(), 0.0] } else { [0.0, ry.abs()] };
-                if radius.into_iter().any(|r| r > MAX_GPU_RADIUS) {
+                if radius.into_iter().any(|r| r > max_radius) {
                     return None;
                 }
                 FilterOperation::Box { radius }
@@ -330,7 +330,7 @@ pub(crate) fn resident_filter<'a>(
                 } else {
                     let (major, minor, slope, radius, repeat_rows) =
                         if along_y { (h, w, dx / dy, LINE_HALF_PIXEL + dy.abs(), tile[0]) } else { (w, h, dy / dx, LINE_HALF_PIXEL + dx.abs(), tile[1]) };
-                    if radius > MAX_GPU_RADIUS || !slope.is_finite() {
+                    if radius > max_radius || !slope.is_finite() {
                         return None;
                     }
                     let pad = radius.ceil() as usize + 2;

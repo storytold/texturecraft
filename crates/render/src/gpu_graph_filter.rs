@@ -287,6 +287,10 @@ mod tests {
             ("line_blur", 65535, "intensity=10.56 angle=0.1875 tile_x=0 tile_y=0", false),
             ("line_blur", 65535, "intensity=5.28 angle=-0.125 tile_x=0", false),
             ("line_blur", 65535, "intensity=10.56 angle=0.25", false),
+            ("line_blur", 65535, "intensity=26.4 angle=0", false),
+            ("line_blur", 65535, "intensity=47.52 angle=0.25", false),
+            ("line_blur", 65535, "intensity=47.52 angle=0.125", false),
+            ("line_blur", 65535, "intensity=47.52 angle=-0.125", false),
             ("laplacian_sharpen", 255, "intensity=0.4", false),
         ] {
             nodes.resident.store(0, Relaxed);
