@@ -282,8 +282,7 @@ impl SetCompositor {
             return Err(n_("This painting tool uses CPU compositing."));
         }
 
-        let padding = mask.is_none().then(|| cache.dilation.mixed_coverage()).flatten();
-        if mask.is_none() && !cache.dilation.fully_covered() && padding.is_none() {
+        if mask.is_none() && cache.covered_tiles.is_empty() {
             return Err(n_("The texture set has no covered UV texels."));
         }
         let stroke_id = stroke.map(|(id, _)| id);
@@ -310,9 +309,10 @@ impl SetCompositor {
         } else {
             None
         };
+        let pad = mask.is_none() && !cache.dilation.fully_covered();
         let region = changed_tiles
             .and_then(|tiles| CompositeRegion::from_tiles(tiles.iter().copied()))
-            .map(|r| if padding.is_some() { r.expanded(texturecraft_engine::texel::TILE) } else { r });
+            .map(|r| if pad { r.expanded(texturecraft_engine::texel::TILE) } else { r });
         if changed_tiles.is_some() && region.is_none() {
             self.current = Some(key);
             self.stroke = stroke_id;
@@ -360,7 +360,7 @@ impl SetCompositor {
                 return Err(reason);
             }
         };
-        if let Some(padding) = padding {
+        if pad && let Some(padding) = cache.dilation.mixed_coverage() {
             program.set_coverage(padding, texturecraft_engine::session::DISPLAY_PADDING);
         }
         if let Err(reason) = program.set_surface_inputs(&session.mesh, &cache.gbuf, session.doc.baked.get(&ts)) {
@@ -502,9 +502,19 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
 }
 
 impl GpuLink {
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn supports_gpu_resize(&self) -> bool {
+    pub(crate) fn supports_gpu_layers(&self) -> bool {
         self.gpu_composite_enabled
+    }
+
+    /// Leave imported sets with a valid GPU plan for the viewport's first material update.
+    pub(crate) fn plans_import_set(session: &Session, ts: usize) -> bool {
+        let project = &session.doc.project;
+        if session.caches.get(ts).is_none_or(|cache| cache.covered_tiles.is_empty()) {
+            return false;
+        }
+        CompositeProgram::try_compile_region(project, &session.doc.pixels, ts, None)
+            .and_then(|mut program| program.set_baked_inputs(session.doc.baked.get(&ts)))
+            .is_ok()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -720,9 +730,13 @@ impl GpuLink {
         reason.is_empty()
     }
 
+    pub(crate) fn pending_cpu_tiles(&self, session: &Session) -> usize {
+        self.cpu_sets(session).map(|cache| cache.dirty.len() + cache.settle.len()).sum()
+    }
+
     /// Compositing progress (0..1) while CPU tiles wait to be composited.
     pub fn composite_progress(&self, session: &Session) -> Option<f32> {
-        let pending = self.cpu_sets(session).map(|cache| cache.dirty.len() + cache.settle.len()).sum::<usize>();
+        let pending = self.pending_cpu_tiles(session);
         (pending > 0 && self.composite_total > 0).then(|| (1.0 - pending as f32 / self.composite_total as f32).clamp(0.0, 1.0))
     }
 
@@ -2702,7 +2716,7 @@ pub(crate) mod tests {
         let mut png = Vec::new();
         stencil.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         let name = session.import_resource_bytes("projection-bands.png", png).unwrap();
-        assert!(session.images[&name].srgb);
+        assert!(session.images.get(&name).unwrap().srgb);
         execute(&mut session, "tool.projection", &json!({})).unwrap();
         execute(&mut session, "tool.stencil", &json!({"image": name, "scale": 0.48, "rotation": 15, "center": [0.04, -0.02]})).unwrap();
         execute(&mut session, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.25, 0.8, 1.0], "maskValue": 0.65})).unwrap();

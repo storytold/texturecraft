@@ -4,7 +4,9 @@ fn content_over(content: vec4<f32>, source: vec4<f32>, effect: Operation, channe
     var blended = source.rgb;
     if content.a > 0.0 {
         let mode = u32(effect.balance.z);
-        if channel == 0u || (channel >= 7u && channel <= 11u) {
+        if measured_blend {
+            blended = layer_blended_color(mode, content.rgb, source.rgb, channel);
+        } else if group_color_slot(channel) {
             blended = blend_rgb(mode, content.rgb, source.rgb);
         } else {
             blended = vec3(blend_scalar(mode, content.x, source.x));
@@ -43,7 +45,7 @@ fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
             let paint = painted(effect, texel.pixel, texel.projected);
             content = content_over(content, paint, effect, layer.ids.x);
         } else if effect.ids.y < 20u || effect.ids.y >= 48u {
-            let fill = fill_value(effect, texel.uv, texel.surface);
+            let fill = content_fill_value(effect, texel.uv, texel.surface);
             content = content_over(content, fill, effect, layer.ids.x);
         } else if effect.ids.y != 39u {
             let filtered = effect_color(effect, content.rgb, layer.ids.x, texel.surface, texel.baked.x);

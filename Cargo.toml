@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/texel", "crates/geom", "crates/compose", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "apps/texturecraft-web", "xtask"]
+members = ["crates/core", "crates/texel", "crates/geom", "crates/graph", "crates/import-reader", "crates/compose", "crates/import", "crates/import-verify", "crates/result-cache", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "apps/texturecraft-web", "xtask"]
 exclude = ["vendor"]
-default-members = ["crates/core", "crates/texel", "crates/geom", "crates/compose", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "xtask"]
+default-members = ["crates/core", "crates/texel", "crates/geom", "crates/graph", "crates/import-reader", "crates/compose", "crates/import", "crates/import-verify", "crates/result-cache", "crates/bake", "crates/formats", "crates/paint", "crates/engine", "crates/render", "crates/automation", "crates/ui-egui", "apps/texturecraft", "apps/texturecraft-cli", "xtask"]
 
 [workspace.package]
 version = "0.6.1"
@@ -17,6 +17,11 @@ craft-usd = { version = "0.1.0", git = "https://github.com/storytold/craft-libs"
 texturecraft-core = { path = "crates/core" }
 texturecraft-texel = { path = "crates/texel" }
 texturecraft-geom = { path = "crates/geom" }
+texturecraft-import-reader = { path = "crates/import-reader" }
+texturecraft-import = { path = "crates/import" }
+texturecraft-import-verify = { path = "crates/import-verify" }
+texturecraft-result-cache = { path = "crates/result-cache" }
+texturecraft-graph = { path = "crates/graph" }
 texturecraft-bake = { path = "crates/bake" }
 texturecraft-paint = { path = "crates/paint" }
 texturecraft-formats = { path = "crates/formats" }
@@ -61,6 +66,8 @@ rmcp = { version = "3.5", default-features = false, features = ["server", "macro
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "net", "io-util", "time"] }
 schemars = "1"
 base64 = "0.22"
+# Stroke records in project files: a compact, exact binary layout of serde types (no_std, no further crates).
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 cap-std = "4"
 getrandom = "0.3"
 # Opening the control token file without following symlinks, and the effective uid (Unix).

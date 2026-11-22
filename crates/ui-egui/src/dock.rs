@@ -902,7 +902,7 @@ fn content_glyph(p: &egui::Painter, tk: &Tokens, thumb: Rect, layer: &Layer) {
             let c = match f.source(Channel::BaseColor) {
                 Source::Uniform(v) => v,
                 Source::Procedural { low, high, .. } => [(low[0] + high[0]) * 0.5, (low[1] + high[1]) * 0.5, (low[2] + high[2]) * 0.5],
-                Source::Image { .. } | Source::Anchor { .. } => [0.5; 3],
+                Source::Image { .. } | Source::Anchor { .. } | Source::Graph(_) => [0.5; 3],
             };
             crate::thumbs::paint_sphere(p, thumb.center(), thumb.width() * 0.34, c);
         }
@@ -1244,7 +1244,7 @@ fn geometry_tool_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     let ts = app.session.doc.project.locate(layer.id).map_or(app.session.ts(), |(ts, _, _)| ts);
     let parts = texturecraft_engine::set_cmds::parts(&app.session, ts);
     for part in &parts {
-        let on = layer.geometry_mask.as_ref().is_none_or(|m| m.contains(part));
+        let on = layer.geometry_mask.as_ref().is_none_or(|m| m.includes_part(part));
         ui.label(RichText::new(format!("{} {part}", if on { ic::EYE } else { ic::EYE_SLASH })).color(if on { tk.text } else { tk.text_dim }));
     }
     if ui.add_enabled(layer.geometry_mask.is_some(), egui::Button::new(tr("Show on all parts"))).clicked() {
@@ -1261,7 +1261,7 @@ fn geometry_mask_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
         return;
     }
     let lid = layer.id.0;
-    let shown = layer.geometry_mask.clone().unwrap_or_else(|| parts.clone());
+    let shown = layer.geometry_mask.as_ref().and_then(|m| m.parts()).unwrap_or(parts.as_slice());
     ui.menu_button(tr("Geometry mask"), |ui| {
         for part in &parts {
             let mut on = shown.contains(part);
@@ -1546,7 +1546,11 @@ pub(crate) fn texture_set_settings(app: &mut TextureCraftApp, ui: &mut Ui) {
         });
         for (c, f) in &set.channels {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(tr(c.label())).strong());
+                let label = match set.channel_names.get(c) {
+                    Some(name) => format!("{name} ({})", tr(c.label())),
+                    None => tr(c.label()).to_string(),
+                };
+                ui.label(RichText::new(label).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if *c != Channel::BaseColor && icon_button(ui, ic::X, tr("Remove channel"), false, 18.0).clicked() {
                         app.run("textureSet.channel.remove", json!({"ts": ts, "channel": c.id()}));
@@ -2222,7 +2226,7 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.label(RichText::new(tr("Ctrl+Shift+right-drag: size and hardness in fine steps.")).size(HINT_TEXT_SIZE).color(Tokens::get(ui.ctx()).text_dim));
 
     // Each section's reset puts back only the fields it shows
-    let size_fields = |settings: &BrushSettings| (settings.size, settings.min_size, settings.screen_space);
+    let size_fields = |settings: &BrushSettings| (settings.size, settings.min_size, settings.min_flow, settings.screen_space);
     if section_with_reset(ui, "sec_size", tr("Size"), true, size_fields(brush) == size_fields(&defaults), |ui| {
         let mut size_percent = brush.size / MAX_BRUSH_SIZE * 100.0;
         if slider(ui, tr("Size"), &mut size_percent, 0.05..=100.0, 1).changed() {
@@ -2234,9 +2238,14 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
             brush.min_size = min_size_percent / 100.0;
         }
 
+        let mut min_flow_percent = brush.min_flow * 100.0;
+        if slider(ui, tr("Minimum flow (%)"), &mut min_flow_percent, 0.0..=100.0, 0).changed() {
+            brush.min_flow = min_flow_percent / 100.0;
+        }
+
         ui.checkbox(&mut brush.screen_space, tr("Size in screen space"));
     }) {
-        (brush.size, brush.min_size, brush.screen_space) = size_fields(&defaults);
+        (brush.size, brush.min_size, brush.min_flow, brush.screen_space) = size_fields(&defaults);
     }
 
     let flow_fields = |settings: &BrushSettings| (settings.flow, settings.opacity, settings.spacing);
@@ -2576,7 +2585,7 @@ fn material_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
 
         let mut value = app.session.tool.values.get(&channel).copied().unwrap_or(channel.default_value());
         match channel.kind() {
-            ChannelKind::Color => {
+            ChannelKind::Color | ChannelKind::Data => {
                 ui.horizontal(|ui| {
                     ui.label(tr(channel.label()));
                     if color_swatch(ui, &format!("tool_{}", channel.id()), &mut value, ui.available_width() - 4.0) {
@@ -2918,7 +2927,7 @@ fn projection_transform(ui: &mut Ui, projection: &Projection, edit: &mut impl Fn
         Projection::Triplanar { scale, .. } | Projection::Planar { scale, .. } | Projection::Spherical { scale } | Projection::Cylindrical { scale, .. } => {
             *scale
         }
-        Projection::Decal(_) => return,
+        Projection::Decal(_) | Projection::Placed(_) => return,
     };
     if let Some(merge) = slider_edit(ui, tr("Scale / tiling"), &mut scale, FILL_SCALE_RANGE, 2) {
         edit(json!({"scale": scale, "merge": merge}));
@@ -2939,7 +2948,7 @@ fn projection_transform(ui: &mut Ui, projection: &Projection, edit: &mut impl Fn
                 edit(json!({"offset": edited_offset, "merge": merge}));
             }
         }
-        Projection::Spherical { .. } | Projection::Cylindrical { .. } | Projection::Decal(_) => {}
+        Projection::Spherical { .. } | Projection::Cylindrical { .. } | Projection::Decal(_) | Projection::Placed(_) => {}
     }
 }
 
@@ -3082,6 +3091,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
     let default_source = Source::uniform_of(channel);
     let source = fill.sources.get(&channel).unwrap_or(&default_source);
     let is_color = channel.kind() == ChannelKind::Color;
+    let has_components = is_color || channel.kind() == ChannelKind::Data;
     let group = ui.group(|ui| {
         let slot = crate::fill_source_target::FillSourceTarget::Channel { base: base.clone(), channel };
         if is_color {
@@ -3098,7 +3108,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
         }
 
         match source {
-            Source::Uniform(value) if is_color => {
+            Source::Uniform(value) if has_components => {
                 let mut value = *value;
                 if color_swatch(ui, &format!("fill_{salt}_{}", channel.id()), &mut value, ui.available_width() - CHANNEL_SWATCH_MARGIN) {
                     app.run("layer.fill.set", set(json!({"color": value})));
@@ -3118,7 +3128,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
                     salt: format!("{salt}_{}", channel.id()),
                 };
                 crate::pattern_panel::pattern_properties(app, ui, &target, pattern);
-                if is_color && ramp.is_empty() {
+                if has_components && ramp.is_empty() {
                     let (mut low, mut high) = (*low, *high);
                     let mut changed = false;
                     ui.horizontal(|ui| {
@@ -3147,6 +3157,7 @@ fn fill_channel(app: &mut TextureCraftApp, ui: &mut Ui, fill: &Fill, base: &Valu
             Source::Anchor { anchor, channel: anchored, .. } => {
                 ui.label(RichText::new(anchor_label(app, *anchor, *anchored)).color(tokens.text_dim));
             }
+            Source::Graph(_) => {} // The source slot already names it.
         }
 
         if is_color && !source.ramp().is_empty() {
@@ -3258,6 +3269,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
                         projection_editor(app, ui, projection, "effect.set", &json!({"effect": id}), &format!("maskfill{id}"));
                     }
                 }
+                Source::Graph(_) => {} // The source slot already names it.
             }
             if anchors.is_empty() {
                 ui.label(RichText::new(tr("Add an anchor point to a layer below to use its stack as a mask.")).color(tokens.text_dim));
@@ -3314,7 +3326,9 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
             }
         }
         EffectKind::Filter(filter) => filter_properties(app, ui, id, filter),
-        EffectKind::ColorSelection { colors, tolerance } => crate::color_selection_editor::color_selection_properties(app, ui, effect_id, colors, *tolerance),
+        EffectKind::ColorSelection { colors, tolerance, .. } => {
+            crate::color_selection_editor::color_selection_properties(app, ui, effect_id, colors, *tolerance)
+        }
         other => {
             ui.label(RichText::new(tr(other.name())).color(tokens.text_dim));
         }

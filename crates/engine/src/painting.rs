@@ -139,6 +139,11 @@ impl Session {
         // Painting an instance paints its source unless its own mask overrides the mask
         let p = &self.doc.project;
         let id = if self.target == StackTarget::Mask { p.mask_owner(id) } else { p.content_layer(id).map_or(id, |l| l.id) };
+        let owner = match self.target {
+            StackTarget::Effect(e) => p.effect(e).map_or(id, |(owner, _)| owner),
+            _ => id,
+        };
+        crate::lock_cmds::refuse_locked(p, owner)?;
         match self.target {
             StackTarget::Content => {
                 let l = self.doc.project.layer(id)?;
@@ -254,6 +259,7 @@ impl Session {
             pixels: Default::default(),
             baked: self.doc.baked.get(&ts).cloned().unwrap_or_default(),
             images: Default::default(),
+            graphs: Default::default(),
         };
         Some(Pickup::from_snapshot(PickupMode::Clone { offset: [0; 2] }, snapshot, self.caches.get(ts)?.gbuf.clone(), values.keys().copied()))
     }
@@ -364,6 +370,7 @@ impl Session {
                         pixels: self.doc.pixels.clone(),
                         baked: self.doc.baked.get(&ts).cloned().unwrap_or_default(),
                         images: self.images.clone(),
+                        graphs: self.doc.graphs.clone(),
                     };
                     Pickup::from_snapshot(mode, snapshot, cache.gbuf.clone(), [])
                 }
@@ -629,6 +636,8 @@ impl Session {
             backface_culling: st.stroke.settings.backface_culling,
             angle_fade: st.stroke.settings.angle_fade,
             shape: Shape::new(st.stroke.settings.alpha, st.image_alpha.as_deref(), st.library_alpha.as_deref(), st.stroke.settings.alpha_params),
+            facing: texturecraft_paint::Facing::Front,
+            reach: texturecraft_paint::Reach::Plane,
         };
         if let Some(device) = &mut st.device {
             match device.append_world(&stamps) {
@@ -664,7 +673,7 @@ impl Session {
             self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
             return;
         };
-        let gbuf = self.caches.get(ts).map(|c| c.gbuf.clone());
+        let gbuf = self.caches.get(ts).map(|c| c.gbuf().clone());
         let (pixels, mask_value) = (&self.doc.pixels, self.tool.mask_value);
         let mut staging = std::mem::take(&mut st.staging);
         with_commit_source(st, gbuf.as_deref(), &self.mesh, &recent, None, |src| match t {
@@ -737,6 +746,8 @@ impl Session {
                         backface_culling: stroke.stroke.settings.backface_culling,
                         angle_fade: stroke.stroke.settings.angle_fade,
                         shape,
+                        facing: texturecraft_paint::Facing::Front,
+                        reach: texturecraft_paint::Reach::Plane,
                     };
                     rasterize(&mut stroke.canvas, &context, &stroke.stroke.stamps);
                 }
@@ -824,7 +835,7 @@ impl Session {
             self.doc = st.before;
             return Ok(());
         }
-        let gbuf = self.caches.get(st.ts).map(|c| c.gbuf.clone());
+        let gbuf = self.caches.get(st.ts).map(|c| c.gbuf().clone());
         let mesh = self.mesh.clone();
         let mut staging = std::mem::take(&mut st.staging);
         let mask_value = self.tool.mask_value;
@@ -904,6 +915,10 @@ impl Session {
                 self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
             }
             self.doc = st.before;
+            // A paint effect created by the stroke can get the same ID on a different owner.
+            for cache in &mut self.caches {
+                cache.invalidate_paint_margin();
+            }
             if let Some(cache) = self.caches.get(st.ts) {
                 let revision = cache.material_revision;
                 self.display_stroke_end =
@@ -944,7 +959,7 @@ impl Session {
     /// The G-buffer of texture set `ts` and an empty canvas for a one-shot fill, limited by the
     /// quick mask unless the fill edits it.
     pub(crate) fn fill_canvas(&self, ts: usize) -> Result<(std::sync::Arc<texturecraft_geom::UvGBuffer>, StrokeCanvas)> {
-        let gbuf = self.caches.get(ts).map(|c| c.gbuf.clone()).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
+        let gbuf = self.caches.get(ts).map(|c| c.gbuf().clone()).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
         let mut canvas = StrokeCanvas::new(gbuf.width, gbuf.height);
         if !self.quick_mask.editing {
             canvas.limit = self.stroke_limit(ts, (gbuf.width, gbuf.height));
@@ -990,9 +1005,7 @@ impl Session {
         let (width, height) = (cache.size.0 as f32, cache.size.1 as f32);
         let (x, y) = ((hit.uv.x * width).clamp(0.0, width - 1.0) as u32, (hit.uv.y * height).clamp(0.0, height - 1.0) as u32);
 
-        let tile = (x / texturecraft_texel::TILE, y / texturecraft_texel::TILE);
-        let source = self.document_composite(texture_set, &[tile]).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
-        let picked: BTreeMap<_, _> = source.channels.keys().map(|&channel| (channel, source.value(channel, x, y))).collect();
+        let picked = self.document_sample(texture_set, x, y).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
         self.tool.values.extend(&picked);
         self.tool.material = None;
         Ok(picked)

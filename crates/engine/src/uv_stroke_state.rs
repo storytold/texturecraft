@@ -41,6 +41,7 @@ impl UvStrokeState {
     /// copies to each batch. Those copies do not affect spacing or the seed of the next dab.
     pub(crate) fn sample(&mut self, settings: &BrushSettings, uv: Vec2, pressure: f32, mut consume: impl FnMut(&mut Vec<UvStamp>)) {
         let radius = settings.uv_stamp_radius(pressure);
+        let flow = settings.flow * texturecraft_paint::pressure_scale(settings.min_flow, pressure.clamp(0.0, 1.0));
         let step = stamp_step(settings, radius);
         let angle = match self.last {
             Some(previous) if settings.follow_path && uv != previous => settings.angle + (previous.y - uv.y).atan2(uv.x - previous.x).to_degrees() - 90.0,
@@ -60,7 +61,7 @@ impl UvStrokeState {
             while distance <= length && batch.len() < batch_size {
                 let center = start + segment * (distance / length.max(f32::MIN_POSITIVE));
                 let seed = self.stamps.wrapping_add((stamped + batch.len()) as u32);
-                batch.push(UvStamp { center, radius, angle, flow: settings.flow, hardness: settings.hardness, seed, source: None });
+                batch.push(UvStamp { center, radius, angle, flow, hardness: settings.hardness, seed, source: None });
                 distance += step;
             }
             stamped += batch.len();

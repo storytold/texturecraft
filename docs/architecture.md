@@ -12,12 +12,15 @@ L0  core      document model: Project, TextureSet, Layer (paint / fill / group),
 L0  texel     TileImage (sparse copy-on-write 64x64 tiles of u16), DilationMap (UV padding),
               deterministic noise, sRGB transfer
 L0  geom      Mesh (+ MikkTSpace tangents), primitives, SAH BVH, UvGBuffer, OrbitCamera, auto-unwrap
+L0  result-cache  results kept in a folder by key across runs (native use only: the import's graph renders)
 L1  compose   the layer-stack compositor (CPU, per tile, rayon), patterns, display conversion
 L1  bake      AO, curvature, thickness, world normal, position, ID, normal and height bakers
               (rays batched through a Tracer: CPU oracle or the render crate's GPU baker)
 L2  paint     strokes -> stamps, camera visibility, texture-space rasterization, commit
 L2  formats   mesh import (glTF/GLB, OBJ, PLY, STL), texture export presets, .tcraft projects,
               image resources
+L2  import    one-way project import: the reader's model of a file (import-reader, L0) as a
+              Project, with the safety net (composite against the file's stored result)
 L3  engine    Session (document + caches + history + tools), the command registry
 L3  render    wgpu viewport renderer (PBR, IBL, post effects, UV view), headless renders,
               GPU path tracing and GPU mesh-map ray casts (compute)
@@ -131,3 +134,5 @@ enabled predicate, run). The menus, shortcuts, the desktop app's control channel
 (`--control <port>`), the CLI and the MCP server all execute commands by id, so an agent can do
 anything a user can and verify it through `project.inspect`. See
 [`control-protocol.md`](control-protocol.md).
+
+The project import (crates `import-reader`, `import`, `graph`) is described in [`import.md`](import.md).

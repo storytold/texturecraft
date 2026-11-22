@@ -678,7 +678,7 @@ mod tests {
     use super::*;
     use crate::headless::Headless;
     use texturecraft_geom::{OrbitCamera, glam::Vec3, primitives};
-    use texturecraft_paint::{RasterCtx, Shape, StampBlending, StrokeCanvas, rasterize, rasterize_uv};
+    use texturecraft_paint::{Facing, RasterCtx, Reach, Shape, StampBlending, StrokeCanvas, rasterize, rasterize_uv};
 
     #[test]
     fn gpu_projection_readback_matches_screen_stencil_sampling() {
@@ -804,6 +804,8 @@ mod tests {
                     eye: Vec3::Y,
                     backface_culling: false,
                     angle_fade: settings.angle_fade,
+                    facing: Facing::Front,
+                    reach: Reach::Plane,
                     shape,
                 };
                 let mut cpu = StrokeCanvas::new(size, size);
@@ -847,6 +849,8 @@ mod tests {
             eye: depth.as_ref().map_or(Vec3::ZERO, |depth| depth.eye),
             backface_culling: settings.backface_culling,
             angle_fade: settings.angle_fade,
+            facing: Facing::Front,
+            reach: Reach::Plane,
             shape: Shape::new(settings.alpha, None, None, settings.alpha_params),
         };
         let mut cpu = StrokeCanvas::new(size, size);

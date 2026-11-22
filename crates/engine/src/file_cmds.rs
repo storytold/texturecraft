@@ -215,7 +215,16 @@ impl Session {
         let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
         let mesh_time = Instant::now();
         let mut s = Session::new(
-            Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, stroke_replays: Default::default(), baked: pf.baked, resources },
+            Document {
+                bake_paint: Default::default(),
+                project: pf.project,
+                pixels: pf.pixels,
+                stroke_replays: Default::default(),
+                baked: pf.baked,
+                resources,
+                graphs: pf.graphs,
+                strokes: pf.strokes,
+            },
             mesh,
             source,
         )?;
@@ -283,6 +292,8 @@ impl Session {
             bake_paint: self.saved_bake_paint(),
             thumbnail: None,
             resources,
+            graphs: self.doc.graphs.clone(),
+            strokes: self.doc.strokes.clone(),
             warnings: Vec::new(),
         }
     }
@@ -296,14 +307,14 @@ impl Session {
     /// named like one an earlier set exports is left out, with a warning (see
     /// [`texturecraft_formats::skip_repeated_names`]).
     pub fn export_files(&mut self, sets: &[usize], opts: &ExportOptions) -> Result<Vec<ExportedFile>> {
-        if self.solo.is_none() {
-            self.update();
-        }
-
         let mesh_name = stem_of(self.doc.project.mesh.trim_start_matches("builtin:"));
         let mut out = Vec::new();
         let empty = Default::default();
         for &ts in sets {
+            // one set at a time: the others composite when they are exported or shown
+            if self.solo.is_none() {
+                self.update_only(&[ts]);
+            }
             let cache = self.caches.get(ts).ok_or_else(|| EngineError::Other(format!("no texture set {ts}")))?;
             let composite = self.document_composite(ts, &cache.covered_tiles).ok_or_else(|| EngineError::Other(format!("no texture set {ts}")))?;
             let coverage = cache.gbuf.coverage_mask();
@@ -674,10 +685,30 @@ fn export_textures(s: &mut Session, p: &Value) -> Result<Value> {
     let dir = native::path_param(p, "dir", "file.exportTextures")?.to_string();
     let opts = export_options(s, p, "file.exportTextures")?;
     let sets = sets_param(s, p, "file.exportTextures")?;
+    let project = &s.doc.project;
+    let mesh_name = stem_of(project.mesh.trim_start_matches("builtin:"));
+    let planned: BTreeMap<_, _> = texturecraft_formats::export::list_set_outputs(project, &sets, &mesh_name, &opts)
+        .map_err(fe)?
+        .into_iter()
+        .map(|(ts, file)| (file.name, (ts, file.warnings)))
+        .collect();
     std::fs::create_dir_all(&dir).map_err(|e| bad("file.exportTextures", format!("cannot create {dir}: {e}")))?;
-    let files = s.export_files(&sets, &opts)?;
-    let mut warnings: Vec<String> = files.iter().flat_map(|f| f.warnings.iter().cloned()).collect();
-    let mut written = texturecraft_formats::write_files(&files, std::path::Path::new(&dir)).map_err(fe)?;
+    // set by set, each one's files written before the next is composited
+    let (mut warnings, mut written) = (Vec::new(), Vec::new());
+    for &ts in &sets {
+        let mut files = s.export_files(&[ts], &opts)?;
+        files.retain_mut(|file| {
+            let Some((_, planned_warnings)) = planned.get(&file.name).filter(|(owner, _)| *owner == ts) else { return false };
+            for warning in planned_warnings {
+                if !file.warnings.contains(warning) {
+                    file.warnings.push(warning.clone());
+                }
+            }
+            true
+        });
+        warnings.extend(files.iter().flat_map(|f| f.warnings.iter().cloned()));
+        written.extend(texturecraft_formats::write_files(&files, std::path::Path::new(&dir)).map_err(fe)?);
+    }
     if p.get("materialX").and_then(Value::as_bool).unwrap_or(false) {
         written.extend(write_materialx(s, &sets, &opts, std::path::Path::new(&dir), &mut warnings)?);
     }

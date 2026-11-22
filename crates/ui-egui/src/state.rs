@@ -189,6 +189,9 @@ pub struct Prefs {
     /// The plain background of the 3D and 2D views at Environment Opacity 0 (Settings > General >
     /// Background color): the color at the top and at the bottom, linear RGB.
     pub background: [[f32; 3]; 2],
+    /// Percent of the machine's RAM graph renders running at once may take (imports, composites, exports; 1 to
+    /// 100): a render waits while the others leave no room for its estimated peak.
+    pub render_ram_percent: u8,
 }
 
 /// The orbit speed the built-in navigation runs at.
@@ -221,6 +224,7 @@ impl Default for Prefs {
             gpu_raytracing: true,
             libraries: Vec::new(),
             background: texturecraft_render::DEFAULT_BACKGROUND,
+            render_ram_percent: texturecraft_engine::compose::graphs::budget::DEFAULT_PERCENT,
         }
     }
 }
@@ -237,6 +241,13 @@ impl Prefs {
         #[cfg(not(target_arch = "wasm32"))]
         texturecraft_engine::formats::set_save_resources(self.reserved_cores as usize, self.save_ram_percent);
         texturecraft_engine::bake::set_gpu_raytracing(self.gpu_raytracing);
+    }
+
+    /// Set the graph memory budget at startup or when its preference changes.
+    pub fn apply_graph_budget(&self) {
+        use texturecraft_engine::compose::graphs::budget;
+
+        budget::set_limit(Some(budget::limit_for_percent(self.render_ram_percent)));
     }
 
     /// Size the shared worker pool to `work_threads` (0 keeps one thread per logical CPU). Only

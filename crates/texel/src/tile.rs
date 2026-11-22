@@ -1,6 +1,6 @@
 //! Sparse, copy-on-write tiled images of `u16` components.
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 /// Tile edge in texels.
 pub const TILE: u32 = 64;
@@ -10,21 +10,56 @@ pub const TILE_AREA: usize = (TILE * TILE) as usize;
 /// A tile's texel data: `TILE_AREA × comps` interleaved components.
 pub type TileData = Arc<Vec<u16>>;
 
-/// Identity of a sparse image's current tile table, without retaining its pixels.
-#[derive(Clone, Debug)]
-pub struct TileIdentity(Weak<Vec<Option<TileData>>>);
+/// Reads an image's tiles again (from the file it was opened from): `tiles_x × tiles_y` slots, row by row. `None` when
+/// they cannot be read any more.
+type TileSlots = Vec<Option<TileData>>;
+type ReadTiles = dyn Fn() -> Option<TileSlots> + Send + Sync;
+pub type TileSource = Arc<ReadTiles>;
 
-/// An image split into 64×64 tiles; unallocated tiles read as zero. Cloning shares the tile table
-/// and every tile, so a snapshot costs one reference-count bump; the first write after a clone
-/// copies the table (one pointer per tile slot) once.
-#[derive(Clone, Debug, PartialEq)]
+/// Identity of the current pixels without retaining the shared table or lazy source.
+#[derive(Clone, Debug)]
+pub struct TileIdentity(TileOrigin);
+
+#[derive(Clone, Debug)]
+enum TileOrigin {
+    Table(Weak<OnceLock<TileSlots>>),
+    Source(Weak<ReadTiles>),
+}
+
+/// An image split into 64×64 tiles; unallocated tiles read as zero. Cloning shares the
+/// lazy or loaded table. A write detaches the table and the changed tiles.
+///
+/// An image opened from a file can be made with [`TileImage::lazy`]: its tiles are read when first needed, and while it
+/// is unchanged it can let them go ([`TileImage::release`]) and read them again later, the same.
+#[derive(Clone)]
 pub struct TileImage {
     width: u32,
     height: u32,
     comps: usize,
     tiles_x: u32,
     tiles_y: u32,
-    tiles: Arc<Vec<Option<TileData>>>,
+    tiles: Arc<OnceLock<TileSlots>>,
+    /// Where the tiles can be read again, and how many are allocated; dropped at the first change.
+    source: Option<(TileSource, usize)>,
+}
+
+impl std::fmt::Debug for TileImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TileImage")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("comps", &self.comps)
+            .field("loaded", &self.tiles.get().is_some())
+            .field("allocated", &self.allocated_count())
+            .finish()
+    }
+}
+
+/// The same size, components and texels (whether the tiles are read yet or not).
+impl PartialEq for TileImage {
+    fn eq(&self, other: &TileImage) -> bool {
+        (self.width, self.height, self.comps) == (other.width, other.height, other.comps) && (self.same_tiles(other) || self.slots() == other.slots())
+    }
 }
 
 impl TileImage {
@@ -33,8 +68,79 @@ impl TileImage {
         let (width, height) = (width.max(1), height.max(1));
         let tiles_x = width.div_ceil(TILE);
         let tiles_y = height.div_ceil(TILE);
+        let tiles = Arc::new(OnceLock::from(vec![None; (tiles_x * tiles_y) as usize]));
+        TileImage { width, height, comps: comps.clamp(1, 4), tiles_x, tiles_y, tiles, source: None }
+    }
 
-        TileImage { width, height, comps: comps.clamp(1, 4), tiles_x, tiles_y, tiles: Arc::new(vec![None; (tiles_x * tiles_y) as usize]) }
+    /// An image whose `allocated` tiles `source` reads when they are first needed (see the type's docs). Slots of the
+    /// wrong count or tiles of the wrong length read as unallocated.
+    pub fn lazy(width: u32, height: u32, comps: usize, allocated: usize, source: TileSource) -> TileImage {
+        let (width, height) = (width.max(1), height.max(1));
+        TileImage {
+            width,
+            height,
+            comps: comps.clamp(1, 4),
+            tiles_x: width.div_ceil(TILE),
+            tiles_y: height.div_ceil(TILE),
+            tiles: Arc::new(OnceLock::new()),
+            source: Some((source, allocated)),
+        }
+    }
+
+    /// The tiles read now from the source, checked.
+    fn read(&self) -> TileSlots {
+        let n = (self.tiles_x * self.tiles_y) as usize;
+        let len = TILE_AREA * self.comps;
+        match self.source.as_ref().and_then(|(source, _)| source()) {
+            Some(tiles) if tiles.len() == n => tiles.into_iter().map(|t| t.filter(|d| d.len() == len)).collect(),
+            _ => vec![None; n],
+        }
+    }
+
+    fn slots(&self) -> &TileSlots {
+        self.tiles.get_or_init(|| self.read())
+    }
+
+    /// The tiles to change: read first if they are not, and from then on not read again.
+    fn slots_mut(&mut self) -> Option<&mut TileSlots> {
+        self.slots();
+        self.source = None;
+        Arc::make_mut(&mut self.tiles).get_mut()
+    }
+
+    /// Whether the tiles are held (always, but for a lazy image not read yet or let go).
+    pub fn is_loaded(&self) -> bool {
+        self.tiles.get().is_some()
+    }
+
+    /// Lets go of the tiles of an image read from a file and unchanged since; they are read again when next needed.
+    /// Returns the bytes let go.
+    pub fn release(&mut self) -> usize {
+        if self.source.is_none() || self.tiles.get().is_none() {
+            return 0;
+        }
+        let bytes = self.bytes();
+        self.tiles = Arc::new(OnceLock::new());
+        bytes
+    }
+
+    /// `f` on every allocated tile (coordinates and texels), in row order, without keeping tiles read for it: an image
+    /// not held is read for the call and let go after (what saving does).
+    pub fn for_each_tile<E>(&self, mut f: impl FnMut(u32, u32, &[u16]) -> Result<(), E>) -> Result<(), E> {
+        let read;
+        let tiles = match self.tiles.get() {
+            Some(t) => t,
+            None => {
+                read = self.read();
+                &read
+            }
+        };
+        for (i, t) in tiles.iter().enumerate() {
+            if let Some(t) = t {
+                f(i as u32 % self.tiles_x, i as u32 / self.tiles_x, t)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn width(&self) -> u32 {
@@ -58,12 +164,12 @@ impl TileImage {
     }
 
     pub fn tile(&self, tx: u32, ty: u32) -> Option<&[u16]> {
-        self.tile_index(tx, ty).and_then(|i| self.tiles.get(i)).and_then(|t| t.as_deref().map(Vec::as_slice))
+        self.tile_index(tx, ty).and_then(|i| self.slots().get(i)).and_then(|t| t.as_deref().map(Vec::as_slice))
     }
 
     /// The shared tile handle (for undo snapshots and change fingerprints).
     pub fn tile_handle(&self, tx: u32, ty: u32) -> Option<&TileData> {
-        self.tile_index(tx, ty).and_then(|i| self.tiles.get(i)).and_then(Option::as_ref)
+        self.tile_index(tx, ty).and_then(|i| self.slots().get(i)).and_then(Option::as_ref)
     }
 
     /// Replace a tile wholesale (None frees it).
@@ -73,11 +179,11 @@ impl TileImage {
         let Some(i) = self.tile_index(tx, ty) else { return };
 
         // Keep the shared table when freeing an already empty tile
-        if data.is_none() && self.tiles.get(i).is_some_and(Option::is_none) {
+        if data.is_none() && self.slots().get(i).is_some_and(Option::is_none) {
             return;
         }
 
-        if let Some(slot) = Arc::make_mut(&mut self.tiles).get_mut(i) {
+        if let Some(slot) = self.slots_mut().and_then(|tiles| tiles.get_mut(i)) {
             *slot = data;
         }
     }
@@ -88,7 +194,7 @@ impl TileImage {
         let comps = self.comps;
         let i = self.tile_index(tx, ty)?;
 
-        let slot = Arc::make_mut(&mut self.tiles).get_mut(i)?;
+        let slot = self.slots_mut()?.get_mut(i)?;
         let tile = slot.get_or_insert_with(|| {
             let mut data = vec![0u16; TILE_AREA * comps];
             if fill.iter().any(|value| *value != 0) {
@@ -111,11 +217,16 @@ impl TileImage {
 
     /// Allocated tile coordinates.
     pub fn allocated(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.tiles.iter().enumerate().filter(|(_, t)| t.is_some()).map(|(i, _)| (i as u32 % self.tiles_x, i as u32 / self.tiles_x))
+        self.slots().iter().enumerate().filter(|(_, t)| t.is_some()).map(|(i, _)| (i as u32 % self.tiles_x, i as u32 / self.tiles_x))
     }
 
+    /// Allocated tiles (of a lazy image not held, as its file says, without reading it).
     pub fn allocated_count(&self) -> usize {
-        self.tiles.iter().filter(|t| t.is_some()).count()
+        match (self.tiles.get(), &self.source) {
+            (Some(tiles), _) => tiles.iter().filter(|t| t.is_some()).count(),
+            (None, Some((_, allocated))) => *allocated,
+            (None, None) => 0,
+        }
     }
 
     /// Components of the texel at (x, y); zeros when out of range or unallocated.
@@ -149,34 +260,45 @@ impl TileImage {
         }
     }
 
-    /// Bytes held by allocated tiles (memory estimate for the status bar).
+    /// Bytes held by allocated tiles (memory estimate for the status bar; 0 for a lazy image not held).
     pub fn bytes(&self) -> usize {
+        if self.tiles.get().is_none() {
+            return 0;
+        }
         self.allocated_count() * TILE_AREA * self.comps * 2
     }
 
-    /// Whether both images currently share the same tile table. Mutable access can unshare it
-    /// even if the caller leaves the texels unchanged.
+    /// Whether both images share the tile table or the same unchanged file source.
     pub fn same_tiles(&self, other: &TileImage) -> bool {
-        Arc::ptr_eq(&self.tiles, &other.tiles)
+        (self.width, self.height, self.comps) == (other.width, other.height, other.comps)
+            && (Arc::ptr_eq(&self.tiles, &other.tiles) || matches!((&self.source, &other.source), (Some((a, _)), Some((b, _))) if Arc::ptr_eq(a, b)))
     }
 
-    /// Identity of the current raster. Editing any tile invalidates previously issued identities.
+    /// Editing any tile invalidates previously issued identities. Releasing lazy tiles preserves the source identity.
     pub fn identity(&self) -> TileIdentity {
-        TileIdentity(Arc::downgrade(&self.tiles))
+        TileIdentity(match &self.source {
+            Some((source, _)) => TileOrigin::Source(Arc::downgrade(source)),
+            None => TileOrigin::Table(Arc::downgrade(&self.tiles)),
+        })
     }
 
     pub fn matches_identity(&self, identity: &TileIdentity) -> bool {
-        std::ptr::eq(Arc::as_ptr(&self.tiles), identity.0.as_ptr())
+        match (&self.source, &identity.0) {
+            (Some((source, _)), TileOrigin::Source(key)) => Arc::downgrade(source).ptr_eq(key),
+            (None, TileOrigin::Table(key)) => Arc::downgrade(&self.tiles).ptr_eq(key),
+            _ => false,
+        }
     }
 
     /// Drop tiles whose every texel is zero.
     pub fn prune_empty(&mut self) {
         let is_zero_tile = |tile: &Option<TileData>| tile.as_ref().is_some_and(|data| data.iter().all(|value| *value == 0));
-        if !self.tiles.iter().any(is_zero_tile) {
+        if !self.slots().iter().any(is_zero_tile) {
             return;
         }
 
-        for tile in Arc::make_mut(&mut self.tiles) {
+        let Some(tiles) = self.slots_mut() else { return };
+        for tile in tiles {
             if is_zero_tile(tile) {
                 *tile = None;
             }
@@ -511,5 +633,92 @@ mod resample_tests {
         // Destination (234, 41) center (234.5, 41.5) reads (10.75, 20.75): mostly texel (10, 20).
         let v = t[((41 * TILE + (234 - 192)) * 2) as usize];
         assert!(v > 500, "{v}");
+    }
+}
+
+#[cfg(test)]
+mod lazy_tests {
+    use super::*;
+
+    fn sample() -> TileImage {
+        let mut img = TileImage::new(130, 70, 2);
+        img.set(3, 4, &[7, 9]);
+        img.set(129, 69, &[1, 2]);
+        img
+    }
+
+    fn lazy_of(img: &TileImage, reads: &Arc<std::sync::atomic::AtomicUsize>) -> TileImage {
+        let tiles: Vec<Option<TileData>> =
+            (0..img.tiles_y()).flat_map(|ty| (0..img.tiles_x()).map(move |tx| (tx, ty))).map(|(tx, ty)| img.tile_handle(tx, ty).cloned()).collect();
+        let reads = reads.clone();
+        TileImage::lazy(
+            img.width(),
+            img.height(),
+            img.comps(),
+            img.allocated_count(),
+            Arc::new(move || {
+                reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(tiles.clone())
+            }),
+        )
+    }
+
+    #[test]
+    fn a_lazy_image_reads_its_tiles_when_needed_and_again_after_it_lets_them_go() {
+        use std::sync::atomic::Ordering;
+        let full = sample();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut img = lazy_of(&full, &reads);
+        assert!(!img.is_loaded());
+        assert_eq!((img.allocated_count(), img.bytes(), reads.load(Ordering::Relaxed)), (2, 0, 0), "counted without reading");
+        let mut seen = Vec::new();
+        img.for_each_tile::<()>(|tx, ty, t| {
+            seen.push((tx, ty, t.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(!img.is_loaded(), "walking the tiles does not keep them");
+        assert_eq!(img.get(3, 4), [7, 9, 0, 0]);
+        assert!(img.is_loaded() && img.bytes() > 0);
+        assert_eq!(img, full);
+        assert!(img.release() > 0 && !img.is_loaded());
+        assert_eq!(img.get(129, 69), [1, 2, 0, 0]);
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+        img.set(0, 0, &[5, 5]);
+        assert_eq!(img.release(), 0, "a changed image keeps its tiles");
+        assert_eq!(img.get(0, 0), [5, 5, 0, 0]);
+    }
+
+    #[test]
+    fn clones_of_an_unchanged_lazy_image_hold_the_same_tiles_without_reading_them() {
+        let full = sample();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tiles: Vec<Option<Vec<u16>>> =
+            (0..full.tiles_y()).flat_map(|ty| (0..full.tiles_x()).map(move |tx| (tx, ty))).map(|(tx, ty)| full.tile(tx, ty).map(<[u16]>::to_vec)).collect();
+        let counter = reads.clone();
+        // every read a new copy, as reading from the file is
+        let source: TileSource = Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(tiles.iter().map(|t| t.clone().map(Arc::new)).collect())
+        });
+        let img = TileImage::lazy(full.width(), full.height(), full.comps(), full.allocated_count(), source);
+        let before = img.clone();
+        assert_eq!(img.get(3, 4), [7, 9, 0, 0]);
+        assert!(img.same_tiles(&before) && before.same_tiles(&img));
+        assert!(!before.is_loaded(), "compared without reading");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let mut changed = img.clone();
+        changed.set(0, 0, &[5, 5]);
+        assert!(!changed.same_tiles(&img) && !changed.same_tiles(&before));
+        assert!(img.same_tiles(&img.clone()) && !img.same_tiles(&sample()));
+    }
+
+    #[test]
+    fn a_lazy_image_whose_source_fails_reads_empty() {
+        let img = TileImage::lazy(100, 100, 4, 3, Arc::new(|| None));
+        assert_eq!(img.allocated_count(), 3);
+        assert_eq!(img.get(1, 1), [0; 4]);
+        assert_eq!(img.allocated_count(), 0);
     }
 }

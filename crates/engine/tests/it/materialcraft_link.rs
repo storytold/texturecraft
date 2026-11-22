@@ -197,7 +197,10 @@ fn duplicates_keep_their_maps_and_mesh_maps_feed_inputs() {
     assert!(session.doc.resources.contains_key(&shared), "the duplicate still shows the first cook");
 
     let maps = [BakedMap::Curvature, BakedMap::Normal, BakedMap::WorldNormal, BakedMap::AmbientOcclusion, BakedMap::BentNormal];
-    session.doc.baked.insert(0, BakedMaps { resolution: 4, maps: maps.into_iter().map(|map| (map, Arc::new(vec![0.5f32; 16 * map.components()]))).collect() });
+    session
+        .doc
+        .baked
+        .insert(0, BakedMaps { resolution: 4, maps: maps.into_iter().map(|map| (map, Arc::new(vec![0.5f32; 16 * map.components()].into()))).collect() });
     let job = session.link_job(id, &serde_json::Map::new()).unwrap();
     assert_eq!(job.input_identifiers.iter().map(String::as_str).collect::<Vec<_>>(), maps.map(BakedMap::id));
     assert_eq!(maps.map(BakedMap::id), ["curvature", "normal", "worldNormal", "ambientOcclusion", "bentNormal"]);
@@ -275,10 +278,10 @@ fn cooks_through_materialcraft_cli_when_available() {
         std::process::Command::new(&cli).arg("run").arg(&with_input).arg("graph.connect").arg(connect.to_string()).arg("-o").arg(&exposed).status().unwrap();
     assert!(ok.success());
     let mut s = session();
-    s.doc.baked.insert(0, BakedMaps { resolution: 16, maps: [(BakedMap::Curvature, Arc::new(vec![0.35; 256]))].into() });
+    s.doc.baked.insert(0, BakedMaps { resolution: 16, maps: [(BakedMap::Curvature, Arc::new(vec![0.35; 256].into()))].into() });
     let id = s.add_linked_material_bytes_at(&std::fs::read(&exposed).unwrap(), Place::Selection).unwrap();
     assert_eq!(link(&s, id).size, 128, "cooked at the texture set's resolution");
-    let image = &s.images[&map_name(&s, id, Channel::Roughness)];
+    let image = s.images.get(&map_name(&s, id, Channel::Roughness)).unwrap();
     assert_eq!([image.width, image.height], [128, 128]);
     assert!(link(&s, id).params.iter().any(|p| p.id == "wear"));
     assert!((roughness(&mut s) - 0.5).abs() < 0.01);
@@ -325,7 +328,7 @@ fn cooks_through_materialcraft_cli_when_available() {
     let second = LayerId(loaded["layer"].as_u64().unwrap());
     assert_eq!(link(&s, second).graph, expected_graph);
     let second_map = map_name(&s, second, Channel::Roughness);
-    assert!((s.images[&second_map].rgba[0][0] - 0.2).abs() < 0.01);
+    assert!((s.images.get(&second_map).unwrap().rgba[0][0] - 0.2).abs() < 0.01);
     s.update();
     assert!((s.caches[0].composite.value(Channel::Metallic, 64, 64)[0] - 0.35).abs() < 0.01);
     let job = s.link_job(second, &serde_json::Map::new()).unwrap();
@@ -346,7 +349,7 @@ fn installing_a_bake_reuses_its_encoded_map_buffers() {
     let name = map_name(&session, id, Channel::Roughness);
 
     assert!(Arc::ptr_eq(&session.doc.resources[&name], &prepared.bytes));
-    assert!(Arc::ptr_eq(&session.images[&name], &prepared.image));
+    assert!(Arc::ptr_eq(session.images.get(&name).unwrap(), &prepared.image));
 }
 
 #[cfg(target_os = "linux")]
@@ -423,7 +426,7 @@ fn three_8k_maps_respect_budget_and_survive_reopen() {
     assert!(reopened.doc.project.layer(layer).is_ok());
     for channel in [Channel::BaseColor, Channel::Roughness, Channel::Metallic] {
         let name = map_name(&reopened, layer, channel);
-        let image = &reopened.images[&name];
+        let image = reopened.images.get(&name).unwrap();
         assert_eq!([image.width, image.height], [RESOLUTION; 2]);
     }
 }
@@ -436,5 +439,5 @@ fn image_with_material_extension_reopens_as_an_image() {
 
     let reopened = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
 
-    assert_eq!(reopened.images[&name].rgba.len(), 4);
+    assert_eq!(reopened.images.get(&name).unwrap().rgba.len(), 4);
 }

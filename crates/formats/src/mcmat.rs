@@ -1,6 +1,7 @@
 //! Validate a procedural MCMAT and encode caller-supplied mesh maps for MaterialCraft.
 use crate::{FormatError, Result};
 use std::io::Write;
+use texturecraft_compose::Texels;
 
 mod version_marker;
 use version_marker::VersionMarker;
@@ -79,27 +80,43 @@ pub fn mesh_map_png(width: u32, components: usize, data: &[f32]) -> Result<Vec<u
     Ok(encoded)
 }
 
-/// Estimated workspace for one quantized row, three encoder rows and the deflate state.
+/// Estimated workspace for one float row, one quantized row, three encoder rows and the deflate state.
 pub fn mesh_map_png_working_bytes(width_px: u32, components: usize) -> u64 {
     const DEFLATE_WORKSPACE_BYTES: u64 = 1 << 20;
 
-    u64::from(width_px).saturating_mul(components as u64).saturating_mul(4 * std::mem::size_of::<u16>() as u64).saturating_add(DEFLATE_WORKSPACE_BYTES)
+    let bytes_per_sample = (size_of::<f32>() + 4 * size_of::<u16>()) as u64;
+    u64::from(width_px).saturating_mul(components as u64).saturating_mul(bytes_per_sample).saturating_add(DEFLATE_WORKSPACE_BYTES)
 }
 
 /// Encode a mesh map directly into its destination using one row of quantized samples.
 pub fn write_mesh_map_png(output: impl Write, width_px: u32, components: usize, data: &[f32]) -> Result<()> {
-    let invalid_size = || FormatError::Invalid(format!("mesh map of {} values, {width_px} wide, {components} components", data.len()));
+    write_mesh_map_png_rows(output, width_px, components, data.len(), |width, write| data.chunks_exact(width).try_for_each(write))
+}
+
+/// Encode compact or lazy baked texels without retaining an expanded float copy.
+pub fn write_baked_mesh_map_png(output: impl Write, width_px: u32, components: usize, data: &Texels) -> Result<()> {
+    write_mesh_map_png_rows(output, width_px, components, data.len(), |width, write| data.try_for_chunks(width, write))
+}
+
+fn write_mesh_map_png_rows(
+    output: impl Write,
+    width_px: u32,
+    components: usize,
+    sample_count: usize,
+    rows: impl FnOnce(usize, &mut dyn FnMut(&[f32]) -> Result<()>) -> Result<()>,
+) -> Result<()> {
+    let invalid_size = || FormatError::Invalid(format!("mesh map of {sample_count} values, {width_px} wide, {components} components"));
     let layout = match components {
         1 => craft_image_codecs::ChannelLayout::Gray,
         3 => craft_image_codecs::ChannelLayout::Rgb,
         _ => return Err(invalid_size()),
     };
     let samples_per_row = (width_px as usize).checked_mul(components).filter(|&count| count != 0).ok_or_else(invalid_size)?;
-    if data.is_empty() || !data.len().is_multiple_of(samples_per_row) {
+    if sample_count == 0 || !sample_count.is_multiple_of(samples_per_row) {
         return Err(invalid_size());
     }
 
-    let height_px = u32::try_from(data.len() / samples_per_row).map_err(|_| invalid_size())?;
+    let height_px = u32::try_from(sample_count / samples_per_row).map_err(|_| invalid_size())?;
     let mut scanline = Vec::new();
     scanline.try_reserve_exact(samples_per_row).map_err(|error| FormatError::TooLarge(error.to_string()))?;
 
@@ -109,19 +126,18 @@ pub fn write_mesh_map_png(output: impl Write, width_px: u32, components: usize, 
     opts.embed_metadata = false;
 
     let codec_err = |error: craft_image_codecs::CodecError| FormatError::Invalid(error.to_string());
-    let mut rows = data.chunks_exact(samples_per_row);
-    let first_row = rows.next().ok_or_else(invalid_size)?;
-    scanline.extend(first_row.iter().map(|value| (value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16));
-    let first_band = craft_image_codecs::Image::from_u16(width_px, 1, layout, &scanline).map_err(codec_err)?;
-    let mut writer = craft_image_codecs::PngRows::new(output, &first_band, height_px, &opts).map_err(codec_err)?;
-    writer.push(&first_band).map_err(codec_err)?;
-    for row in rows {
+    let mut output = Some(output);
+    let mut writer = None;
+    rows(samples_per_row, &mut |row| {
         scanline.clear();
         scanline.extend(row.iter().map(|value| (value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16));
         let band = craft_image_codecs::Image::from_u16(width_px, 1, layout, &scanline).map_err(codec_err)?;
-        writer.push(&band).map_err(codec_err)?;
-    }
-    writer.finish().map_err(codec_err)
+        if let Some(output) = output.take() {
+            writer = Some(craft_image_codecs::PngRows::new(output, &band, height_px, &opts).map_err(codec_err)?);
+        }
+        writer.as_mut().ok_or_else(invalid_size)?.push(&band).map_err(codec_err)
+    })?;
+    writer.ok_or_else(invalid_size)?.finish().map_err(codec_err)
 }
 
 #[cfg(test)]
@@ -165,5 +181,11 @@ mod tests {
         assert!(mesh_map_png(2, 1, &[0.0; 3]).is_err());
         assert!(mesh_map_png(0, 1, &[]).is_err());
         assert!(mesh_map_png(2, 2, &[0.0; 8]).is_err());
+
+        let source = Texels::lazy(4, std::sync::Arc::new(|| Some([0u16, 16384, 32768, 65535].map(|value| f32::from(value) / 65535.0).to_vec())));
+        let mut from_bake = Vec::new();
+        write_baked_mesh_map_png(&mut from_bake, 2, 1, &source).unwrap();
+        assert_eq!(from_bake, png);
+        assert_eq!(source.bytes(), 0, "encoding does not keep the lazy map loaded");
     }
 }

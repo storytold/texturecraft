@@ -662,6 +662,7 @@ fn bench_cold_work_regions() {
         block_scales: set.block_scales(),
         preview: None,
         images: &session.images,
+        graphs: &session.doc.graphs,
         bounds: session.mesh.bounds(),
     };
     let mut reference = None;

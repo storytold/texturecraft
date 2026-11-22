@@ -346,7 +346,7 @@ mod tests {
     fn the_baked_normal_is_the_base_of_the_shown_normal() {
         // A baked normal tilted to +X at the set resolution
         let tilted = [0.8f32, 0.5, 0.9];
-        let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(tilted.repeat(64 * 64)))].into_iter().collect() };
+        let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(tilted.repeat(64 * 64).into()))].into_iter().collect() };
         let shown = |comp: &Composite| normal_texel(comp, &baked, 0)[..3].to_vec();
         let pack = |v: [f32; 3]| v.map(|x| half::f16::from_f32(x * 2.0 - 1.0).to_f32()).to_vec();
 
@@ -374,7 +374,7 @@ mod tests {
     fn baked_normals_keep_more_than_8_bits_in_the_viewport() {
         // Steps of 1/1024 distinguish texels that an 8-bit texture merges
         let ramp: Vec<f32> = (0..64 * 64).flat_map(|i| [0.5 + (i % 64) as f32 / 1024.0, 0.5, 0.9]).collect();
-        let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(ramp))].into_iter().collect() };
+        let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(ramp.into()))].into_iter().collect() };
         let comp = Composite::new(&[], 64);
 
         let xs: Vec<f32> = (0..8).map(|i| normal_texel(&comp, &baked, i)[0]).collect();
@@ -388,7 +388,7 @@ mod tests {
         let mut pixels = vec![0.5; 64 * 64 * 3];
         pixels[..3].copy_from_slice(&[f32::NAN, 0.5, 1.0]);
         pixels[3..6].copy_from_slice(&[0.5, f32::INFINITY, 1.0]);
-        let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(pixels))].into_iter().collect() };
+        let baked = BakedMaps { resolution: 64, maps: [(BakedMap::Normal, std::sync::Arc::new(pixels.into()))].into_iter().collect() };
         let composite = Composite::new(&[], 64);
 
         assert_eq!(normal_texel(&composite, &baked, 0), [0.0, 0.0, 1.0, 0.5]);

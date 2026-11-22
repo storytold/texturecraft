@@ -224,6 +224,30 @@ fn height_becomes_normal_detail() {
 }
 
 #[test]
+fn measured_height_normal_follows_the_project_rules() {
+    use texturecraft_core::{CompositeRules, HeightNormal};
+    let mut fx = Fx::new(&[Channel::BaseColor, Channel::Height]);
+    // A ramp of 1/160 per texel across.
+    fx.set_all(Channel::Height, |x, _| [x as f32 / 160.0; 3]);
+    fx.project.texture_sets[0].height_strength = 8.0;
+    let tilt = |fx: &Fx| {
+        let mut opts = ExportOptions::new(builtin_preset("Separate maps").unwrap());
+        opts.bit_depth_override = Some(16);
+        let p = decode(find(&fx.render(&opts), "_normal.png")).to_rgb16();
+        let p = p.get_pixel(30, 30);
+        let (nx, nz) = (p[0] as f32 / 65535.0 * 2.0 - 1.0, p[2] as f32 / 65535.0 * 2.0 - 1.0);
+        -nx / nz
+    };
+    let native = tilt(&fx);
+    assert!((native - 8.0 * RES as f32 / 16.0 / 160.0).abs() < 2e-3, "TextureCraft's own: block / 16 per unit: {native}");
+    for filter in [HeightNormal::Sobel, HeightNormal::Backward] {
+        fx.project.rules = CompositeRules::measured(filter);
+        let measured = tilt(&fx);
+        assert!((measured - 8.0 * RES as f32 * 0.01 / 160.0).abs() < 2e-3, "{filter:?}: block / 100 per unit: {measured}");
+    }
+}
+
+#[test]
 fn reoriented_normal_mapping_identities() {
     let d = Vec3::new(0.2, -0.3, 0.9).normalize();
     assert!((rnm(Vec3::Z, d) - d).length() < 1e-5);
@@ -237,7 +261,7 @@ fn ao_mixes_baked_and_channel() {
     channels.push(Channel::AmbientOcclusion);
     let mut fx = Fx::new(&channels);
     fx.set_all(Channel::AmbientOcclusion, |_, _| [0.5; 3]);
-    fx.baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, std::sync::Arc::new(vec![0.5; (RES * RES) as usize]))].into() };
+    fx.baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, std::sync::Arc::new(vec![0.5; (RES * RES) as usize].into()))].into() };
     fx.project.texture_sets[0].baked.insert(BakedMap::AmbientOcclusion);
     let orm = decode(find(&fx.render_preset("glTF PBR Metal Roughness"), "Metallic.png")).to_rgb8();
     assert!((orm.get_pixel(3, 3)[0] as i32 - 64).abs() <= 1);
@@ -255,7 +279,7 @@ fn mesh_maps_write_tangent_normals_with_the_green_of_the_project_format() {
         decode(find(&files, name)).to_rgb16().get_pixel(3, 3)[1] as i32
     };
     let mut fx = Fx::new(&default_channels());
-    let stored = |v: f32| std::sync::Arc::new([0.5, v, 0.5].repeat((RES * RES) as usize));
+    let stored = |v: f32| std::sync::Arc::new([0.5, v, 0.5].repeat((RES * RES) as usize).into());
     fx.baked = BakedMaps { resolution: RES, maps: [(BakedMap::BentNormal, stored(0.25)), (BakedMap::Normal, stored(0.25))].into() };
     fx.project.texture_sets[0].baked.extend([BakedMap::BentNormal, BakedMap::Normal]);
     let opts = ExportOptions::new(builtin_preset("Mesh maps").unwrap());

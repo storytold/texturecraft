@@ -322,11 +322,53 @@ pub fn commit_layer(pixels: &mut PixelStore, layer: LayerId, size: (u32, u32), v
     images.into_par_iter().for_each(|(c, img, staged)| over(img, &layer_blend(c, values, &src), &src, staged));
 }
 
+/// A channel's values per texel: `(x, y)` → (straight value, coverage factor); `None`: nothing there.
+pub type ChannelTexels<'a> = &'a (dyn Fn(u32, u32) -> Option<([f32; 3], f32)> + Sync);
+
+/// Commit a stroke into paint layer `layer`, painting each channel of `channels` with the value its function gives per
+/// texel (its coverage factor scales the stroke there): a brush painting an image or a graph, replayed from an imported
+/// project. The source's own per-texel function is not used; erasing is not this commit's (see [`commit_layer`]).
+pub fn commit_layer_texels(pixels: &mut PixelStore, layer: LayerId, size: (u32, u32), channels: &[(Channel, ChannelTexels)], src: CommitSource) {
+    for (c, _) in channels {
+        pixels.layer_mut(layer, *c, size);
+    }
+    let images: Vec<(&mut TileImage, Channel, ChannelTexels)> = pixels
+        .layers
+        .iter_mut()
+        .filter(|((id, _), _)| *id == layer)
+        .filter_map(|((_, c), img)| channels.iter().find(|(k, _)| k == c).map(|(_, f)| (img, *c, *f)))
+        .collect();
+    images.into_par_iter().for_each(|(img, c, f)| {
+        let per_texel = |x: u32, y: u32| f(x, y).filter(|(v, a)| v.iter().all(|x| x.is_finite()) && a.is_finite()).map(|(v, a)| (v, a.clamp(0.0, 1.0)));
+        let src = CommitSource { per_texel: Some(&per_texel), erase: false, carried: None, ..src };
+        let zero = [0.0f32; 3];
+        let value = zero.get(..c.components()).unwrap_or(&zero);
+        over(img, &Blend { kind: c.kind(), value, stencil_color: true, carried: None }, &src, None);
+    });
+}
+
 /// Commit a stroke into the paint effect `effect` of a mask, painting gray `value`.
 pub fn commit_mask(pixels: &mut PixelStore, effect: LayerId, size: (u32, u32), value: f32, src: CommitSource, staging: &mut Staging) {
     let img = pixels.mask_mut(effect, size);
     let value = [value.clamp(0.0, 1.0)];
     over(img, &Blend { kind: ChannelKind::Scalar, value: &value, stencil_color: false, carried: src.carried_mask }, &src, staging.take(None));
+}
+
+/// Commit a stroke into the paint effect `effect` of a mask, painting the grey `grey(x, y)` gives per texel with its
+/// coverage factor (`None`: nothing there): projection painting replayed from an imported project, whose grey is an
+/// image placed on the view, or a brush painting a graph. The source's own per-texel function is not used.
+pub fn commit_mask_texels(
+    pixels: &mut PixelStore,
+    effect: LayerId,
+    size: (u32, u32),
+    grey: &(dyn Fn(u32, u32) -> Option<(f32, f32)> + Sync),
+    src: CommitSource,
+) {
+    let unit = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+    let per_texel = |x: u32, y: u32| grey(x, y).map(|(g, a)| ([unit(g); 3], unit(a)));
+    let src = CommitSource { per_texel: Some(&per_texel), ..src };
+    let img = pixels.mask_mut(effect, size);
+    over(img, &Blend { kind: ChannelKind::Scalar, value: &[0.0], stencil_color: true, carried: None }, &src, None);
 }
 
 /// Commit a stroke into a coverage-only image (1 component), e.g. the quick mask.
@@ -406,6 +448,29 @@ mod tests {
         assert!((from_u16(cov.get(5, 5)[0]) - 0.5).abs() < 1e-3);
     }
 
+    #[test]
+    fn values_per_texel_paint_each_channel_with_its_own() {
+        let mut px = PixelStore::default();
+        let mut a = TileImage::new(64, 64, 1);
+        a.set(5, 5, &[to_u16(1.0)]);
+        a.set(6, 5, &[to_u16(1.0)]);
+        a.set(7, 5, &[to_u16(0.5)]);
+        let tiles: BTreeSet<(u32, u32)> = [(0, 0)].into_iter().collect();
+        // base colour: red at x 5, green elsewhere, half covered at x 6; height signed; nothing at x 7 for height
+        let color = |x: u32, _y: u32| Some(if x == 5 { ([1.0, 0.0, 0.0], 1.0) } else { ([0.0, 1.0, 0.0], if x == 6 { 0.5 } else { 1.0 }) });
+        let height = |x: u32, _y: u32| (x != 7).then_some(([-0.5; 3], 1.0));
+        let channels: [(Channel, ChannelTexels); 2] = [(Channel::BaseColor, &color), (Channel::Height, &height)];
+        commit_layer_texels(&mut px, LayerId(4), (64, 64), &channels, src(&a, &tiles, 1.0, false));
+        let base = px.layer(LayerId(4), Channel::BaseColor).unwrap();
+        assert!((from_u16(base.get(5, 5)[0]) - 1.0).abs() < 1e-3 && from_u16(base.get(5, 5)[1]) < 1e-3);
+        assert!((from_u16(base.get(6, 5)[1]) - 0.5).abs() < 1e-3 && (from_u16(base.get(6, 5)[3]) - 0.5).abs() < 1e-3, "coverage times the factor");
+        assert!((from_u16(base.get(7, 5)[3]) - 0.5).abs() < 1e-3);
+        let h = px.layer(LayerId(4), Channel::Height).unwrap();
+        assert!((from_u16_signed(h.get(5, 5)[0]) + 0.5).abs() < 1e-3);
+        assert_eq!(h.get(7, 5)[1], 0, "no value: nothing laid");
+        assert!(px.layer(LayerId(4), Channel::Roughness).is_none());
+    }
+
     fn source<'a>(a: &'a TileImage, tiles: &'a BTreeSet<(u32, u32)>, carried: Option<&'a BTreeMap<Channel, TileImage>>, erase: bool) -> CommitSource<'a> {
         CommitSource { carried, ..src(a, tiles, 0.8, erase) }
     }
@@ -470,5 +535,33 @@ mod tests {
         commit_layer(&mut px, LayerId(1), (64, 64), &vals, src(&a, &tiles, 1.0, false), &mut staging);
         commit_mask(&mut px, LayerId(2), (64, 64), 1.0, src(&a, &tiles, 1.0, false), &mut staging);
         assert_eq!((&px.layers, &px.masks), (&expected.layers, &expected.masks));
+    }
+
+    #[test]
+    fn a_mask_commit_can_take_its_grey_per_texel() {
+        let (mut a, tiles) = alpha(1.0);
+        for x in 0..64 {
+            a.set(x, 5, &[to_u16(1.0)]);
+        }
+        let mut px = PixelStore::default();
+        let grey = |x: u32, _y: u32| {
+            if x < 32 {
+                Some((0.25, 1.0))
+            } else if x < 48 {
+                Some((f32::NAN, 1.0))
+            } else if x < 56 {
+                Some((1.0, 0.5))
+            } else {
+                None
+            }
+        };
+        commit_mask_texels(&mut px, LayerId(7), (64, 64), &grey, src(&a, &tiles, 0.5, false));
+        let m = &px.masks[&LayerId(7)];
+        let at = |x: u32| (from_u16(m.get(x, 5)[0]), from_u16(m.get(x, 5)[1]));
+        let (v, c) = at(5);
+        assert!((v - 0.125).abs() < 1e-3 && (c - 0.5).abs() < 1e-3, "grey 0.25 at half opacity, premultiplied: {v} {c}");
+        assert!(at(40).0.abs() < 1e-3 && (at(40).1 - 0.5).abs() < 1e-3, "a grey that is no number paints black");
+        assert!((at(50).0 - 0.25).abs() < 1e-3 && (at(50).1 - 0.25).abs() < 1e-3, "the coverage factor scales the stroke");
+        assert_eq!(at(60), (0.0, 0.0), "no grey, no paint");
     }
 }

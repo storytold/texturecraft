@@ -232,7 +232,13 @@ impl LinkJob {
                     continue;
                 };
 
-                let temporary_bytes = texturecraft_formats::mcmat::mesh_map_png_working_bytes(bakes.resolution, map.components());
+                let unpack_bytes = if matches!(data.as_ref(), texturecraft_compose::Texels::Lazy(_)) && data.bytes() == 0 {
+                    // Reading a cold map may hold the float decode and its compact representation at once.
+                    (data.len() as u64).saturating_mul((size_of::<f32>() + size_of::<u16>()) as u64)
+                } else {
+                    0
+                };
+                let temporary_bytes = texturecraft_formats::mcmat::mesh_map_png_working_bytes(bakes.resolution, map.components()).saturating_add(unpack_bytes);
                 budget.check(temporary_bytes)?;
                 budget.check_available(temporary_bytes)?;
                 if self.canceled.load(Ordering::Relaxed) {
@@ -241,7 +247,7 @@ impl LinkJob {
 
                 let file = dir.join(format!("input{index}.png"));
                 let output = std::fs::File::create(&file).map_err(io)?;
-                texturecraft_formats::mcmat::write_mesh_map_png(output, bakes.resolution, map.components(), data).map_err(io)?;
+                texturecraft_formats::mcmat::write_baked_mesh_map_png(output, bakes.resolution, map.components(), data).map_err(io)?;
                 export.arg("--input").arg(format!("{identifier}={}", file.display()));
             }
         }

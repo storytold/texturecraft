@@ -311,6 +311,7 @@ fn input_slot(app: &mut TextureCraftApp, ui: &mut Ui, (layer, id): (LayerId, u64
         Some(Source::Uniform(_)) => tr("Uniform value").to_string(),
         Some(Source::Anchor { anchor, channel, .. }) => anchor_label(app, *anchor, *channel),
         Some(Source::Procedural { .. }) => tr("Procedural").to_string(),
+        Some(Source::Graph(graph)) => trf("Graph: {name}", &[("name", &graph.name)]),
     };
     let group = ui.group(|ui| {
         ui.horizontal(|ui| {
@@ -386,7 +387,7 @@ fn input_tile(app: &mut TextureCraftApp, ui: &mut Ui, map: BakedMap, source: Opt
         Some(Source::Uniform(value)) => {
             painter.rect_filled(rect, INPUT_TILE_ROUNDING, egui::Color32::from_gray((value[0].clamp(0.0, 1.0) * 255.0).round() as u8));
         }
-        Some(Source::Anchor { .. } | Source::Procedural { .. }) => {
+        Some(Source::Anchor { .. } | Source::Procedural { .. } | Source::Graph(_)) => {
             let glyph = if matches!(source, Some(Source::Anchor { .. })) { ic::ANCHOR } else { ic::MAGIC_WAND };
             painter.rect_filled(rect, INPUT_TILE_ROUNDING, tokens.button);
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(INPUT_TILE_ICON_SIZE), tokens.text_dim);

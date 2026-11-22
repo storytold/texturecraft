@@ -12,9 +12,12 @@ pub mod blend;
 mod block_scales;
 pub mod channel;
 mod env_alignment;
+pub mod import_report;
 pub mod layer;
 pub mod project;
+pub mod rules;
 mod shadow_mode;
+pub mod strokes;
 
 pub use bake::{
     AmbientOcclusionAttenuation, AmbientOcclusionSettings, BackfaceMode, BakeAntialiasing, BakePaintTarget, BakeResolution, BakeSettings, BakedMap,
@@ -25,16 +28,20 @@ pub use bake::{
 };
 pub use blend::{BlendMode, blend1, blend3, lum, mix3};
 pub use channel::{Channel, ChannelFormat, ChannelKind};
+pub use import_report::{Fidelity, ImportReport, LayerReport, LayerRole, ReportEntry, SafetyFlag, SafetyFlagKind};
 pub use layer::{
-    ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, DecalFlip, DecalSymmetry, Effect, EffectKind, Fill, Filter, Generator, GeneratorGlobal,
-    GeneratorKind, HeightMask, Layer, LayerId, LayerKind, Levels, LinkParam, LinkPreset, Mask, MaskBackground, MaterialLink, MicroDetail, OutputResolution,
-    PathShape, Procedural, ProceduralKind, Projection, ResolutionMode, Source, TileBlending, TileGenerator, TileInputDistribution, TileShape, TileSizeMode,
-    TileSymmetry, gradient, hsl_adjust, per_unit,
+    ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, DecalFlip, DecalSymmetry, Effect, EffectKind, FacingFalloff, Falloff, Fill, Filter,
+    Generator, GeneratorGlobal, GeneratorKind, GeometryMask, GraphInput, GraphRef, GraphValue, HeightMask, IMPORT_LOCK_SOURCE, ImagePlacement, Layer, LayerId,
+    LayerKind, Levels, LinkParam, LinkPreset, Lock, LockReason, MAX_GRAPH_NESTING, Mask, MaskBackground, MaterialLink, MicroDetail, OutputResolution,
+    PathShape, PlacedMode, PlacedProjection, Procedural, ProceduralKind, Projection, Repeat, ResolutionMode, Source, StableHash, TileBlending, TileGenerator,
+    TileInputDistribution, TileShape, TileSizeMode, TileSymmetry, Volume, WarpGrid, WarpPoint, gradient, hsl_adjust, is_key, per_unit, text_key,
 };
 pub use project::{
     AoMixing, BlockScales, Camera, DepthOfField, DisplaySettings, EnvAlignment, FORMAT_VERSION, MAX_RESOLUTION, MIN_RESOLUTION, NormalFormat, NormalMixing,
     Project, ShadowMode, TANGENT_BENT_NORMAL_VERSION, TextureSet, TileGrid, ToneMapping, UDIM_RANGE, udim_at,
 };
+pub use rules::{BlendRules, CompositeRules, HeightNormal};
+pub use strokes::{StoredStrokes, StrokeRecord};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum CoreError {

@@ -40,6 +40,7 @@ pub const CATALOG: &[Item] = &[
     it("File", "Open...", "file.open", Some("Ctrl+O")),
     sep("File"),
     it("File", "Open sample project...", "project.sample", None),
+    it("File", "Import project...", "file.importProject", None),
     sep("File"),
     it("File", "Close", "file.close", Some("Ctrl+F4")),
     sep("File"),
@@ -219,6 +220,10 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         return;
     }
 
+    // the import's windows hold the project until the converted one opens
+    if crate::import_ui::active(app) && id != "ui.quit" {
+        return;
+    }
     if matches!(id, "file.open" | "file.close" | "project.sample") && crate::windows::ask_to_save(app, crate::state::Unsaved::Command(id.into())) {
         return;
     }

@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use super::{ANCHOR_PUBLISH_LAYER, ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, TILE_GENERATOR_OPCODE};
+use super::{
+    ANCHOR_PUBLISH_LAYER, ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, PLACED_UV_PROJECTION,
+    TILE_GENERATOR_OPCODE,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Features {
@@ -8,8 +11,10 @@ struct Features {
     extended_patterns: bool,
     tile_generator: bool,
     authored_images: bool,
+    placed_uv: bool,
     mask_preview: bool,
     extended_blend_modes: bool,
+    measured_blend: bool,
     generators: bool,
     curvature: bool,
     sampled_generator_inputs: bool,
@@ -27,6 +32,8 @@ impl Features {
         let mut features = Self {
             authored_images: !program.material_images.is_empty(),
             mask_preview: program.is_mask_preview(),
+            measured_blend: program.measured_blend,
+            extended_blend_modes: program.measured_blend && program.groups.depth != 0,
             spatial: !program.filters.stages.is_empty(),
             ..Self::default()
         };
@@ -41,6 +48,7 @@ impl Features {
         for op in &program.operations {
             let kind = op.ids[1];
             features.extended_blend_modes |= op.balance[2] > 8.0;
+            features.placed_uv |= op.procedural[3] == PLACED_UV_PROJECTION;
             features.anchors |= kind == ANCHOR_SOURCE;
             features.color_selection |= kind == COLOR_SELECTION_OPCODE;
             features.patterns |= matches!(kind, 1..=9 | 11..=13 | FIRST_EXTENDED_PATTERN..=TILE_GENERATOR_OPCODE);
@@ -87,7 +95,9 @@ impl Features {
             include(
                 self.authored_images,
                 include_str!("shaders/material_image.wgsl"),
-                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }",
+                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }
+                 fn authored_image_content(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }
+                 fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>) -> vec4<f32> { return vec4(0.5, 0.5, 0.5, 1.0); }",
             ),
             include_str!("shaders/stencil_projection.wgsl"),
             include(
@@ -144,14 +154,23 @@ impl Features {
                 "fn mask_with_height(layer: Operation, texel: LayerTexel, mask: f32) -> f32 { return mask; }",
             ),
             include_str!("shaders/composite_groups.wgsl"),
+            include(
+                self.measured_blend,
+                include_str!("shaders/composite_measured.wgsl"),
+                "fn empty_channel(channel: u32) -> vec3<f32> { return vec3(0.0); }
+                 fn layer_blended_scalar(mode: u32, a: f32, b: f32, unit: bool) -> f32 { return blend_scalar(mode, a, b); }
+                 fn layer_blended_color(mode: u32, a: vec3<f32>, b: vec3<f32>, channel: u32) -> vec3<f32> { return blend_rgb(mode, a, b); }
+                 fn measured_over(mode: u32, below: vec4<f32>, top: vec4<f32>, strength: f32, channel: u32) -> vec4<f32> { return below; }",
+            ),
             include_str!("shaders/composite.wgsl"),
         ]
         .join("\n")
     }
 
-    fn constants(self, grouped: bool) -> [(&'static str, f64); 8] {
+    fn constants(self, grouped: bool) -> [(&'static str, f64); 10] {
         [
             ("enable_authored_images", f64::from(u8::from(self.authored_images))),
+            ("enable_placed_uv", f64::from(u8::from(self.placed_uv))),
             ("enable_generators", f64::from(u8::from(self.generators))),
             ("enable_curvature_detail", f64::from(u8::from(self.curvature))),
             ("enable_spatial_fields", f64::from(u8::from(self.spatial))),
@@ -159,6 +178,7 @@ impl Features {
             ("composite_groups", f64::from(u8::from(grouped))),
             ("composite_mask_preview", f64::from(u8::from(self.mask_preview))),
             ("enable_extended_blend_modes", f64::from(u8::from(self.extended_blend_modes))),
+            ("measured_blend", f64::from(u8::from(self.measured_blend))),
         ]
     }
 }

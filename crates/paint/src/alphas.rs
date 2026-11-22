@@ -213,6 +213,47 @@ impl AlphaImage {
         AlphaImage { levels }
     }
 
+    /// An alpha from a `width × height` grey image (rows top first, values clamped to 0..1, NaN as 0), stretched over
+    /// the stamp square at [`BASE`] pixels (box-filtered where the image is finer, bilinear where it is coarser), with
+    /// its mip chain. For shapes made outside the library, such as an imported brush's tip; `None` for an empty image
+    /// or a pixel count that does not match.
+    pub fn from_pixels(width: usize, height: usize, px: &[f32]) -> Option<AlphaImage> {
+        if width == 0 || height == 0 || width.checked_mul(height) != Some(px.len()) {
+            return None;
+        }
+        let at = |x: usize, y: usize| px.get(y.min(height - 1) * width + x.min(width - 1)).map_or(0.0, |v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 });
+        let n = BASE;
+        let (sx, sy) = (width as f32 / n as f32, height as f32 / n as f32);
+        let mut out = vec![0.0f32; n * n];
+        out.par_chunks_mut(n).enumerate().for_each(|(y, row)| {
+            for (x, o) in row.iter_mut().enumerate() {
+                let (x0, x1, y0, y1) = (x as f32 * sx, (x + 1) as f32 * sx, y as f32 * sy, (y + 1) as f32 * sy);
+                *o = if sx >= 1.0 || sy >= 1.0 {
+                    // the source pixels this pixel covers
+                    let (ax, ay) = (x0.floor() as usize, y0.floor() as usize);
+                    let (bx, by) = ((x1.ceil() as usize).max(ax + 1), (y1.ceil() as usize).max(ay + 1));
+                    let (mut sum, mut count) = (0.0, 0.0);
+                    for py in ay..by {
+                        for px in ax..bx {
+                            sum += at(px, py);
+                            count += 1.0;
+                        }
+                    }
+                    sum / count
+                } else {
+                    let (fx, fy) = (((x0 + x1) * 0.5 - 0.5).max(0.0), ((y0 + y1) * 0.5 - 0.5).max(0.0));
+                    let (ix, iy) = (fx.floor(), fy.floor());
+                    let (tx, ty) = (fx - ix, fy - iy);
+                    let (ix, iy) = (ix as usize, iy as usize);
+                    let top = at(ix, iy) + (at(ix + 1, iy) - at(ix, iy)) * tx;
+                    let bottom = at(ix, iy + 1) + (at(ix + 1, iy + 1) - at(ix, iy + 1)) * tx;
+                    top + (bottom - top) * ty
+                };
+            }
+        });
+        Some(AlphaImage::new(n, out))
+    }
+
     pub fn levels(&self) -> usize {
         self.levels.len()
     }
@@ -821,6 +862,22 @@ mod tests {
         for l in 0..4 {
             assert!(img.sample(l, 0.0, 0.99) < 0.05, "level {l}");
         }
+    }
+
+    #[test]
+    fn an_alpha_from_pixels_is_stretched_over_the_stamp_and_refuses_bad_sizes() {
+        // left half white, right half black, 4 x 2: stretched over the square
+        let px = [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, f32::NAN];
+        let img = AlphaImage::from_pixels(4, 2, &px).unwrap();
+        assert!(img.levels() > 4);
+        assert!(img.sample(0, -0.5, 0.5) > 0.99 && img.sample(0, -0.5, -0.5) > 0.99);
+        assert!(img.sample(0, 0.5, 0.5) < 0.01 && img.sample(0, 0.5, -0.5) < 0.01, "NaN reads as 0");
+        assert_eq!(img.sample(0, 1.5, 0.0), 0.0);
+        // a finer image is averaged
+        let fine = vec![0.25; 1024 * 1024];
+        assert!((AlphaImage::from_pixels(1024, 1024, &fine).unwrap().sample(0, 0.1, 0.2) - 0.25).abs() < 1e-4);
+        assert!(AlphaImage::from_pixels(0, 2, &[]).is_none());
+        assert!(AlphaImage::from_pixels(3, 3, &px).is_none());
     }
 
     /// Run with `cargo test -p texturecraft-paint --release -- --ignored --nocapture`.

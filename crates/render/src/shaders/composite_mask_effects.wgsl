@@ -18,11 +18,11 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
         var result: f32;
         if e.ids.y == 10u {
             let sampled = painted(e, texel.pixel, texel.projected);
-            result = blend_scalar(u32(e.balance.z), mask, sampled.x);
+            result = layer_blended_scalar(u32(e.balance.z), mask, sampled.x, true);
             weight *= sampled.w;
         } else if e.ids.y < 20u || e.ids.y >= 48u {
             let sampled = fill_value(e, texel.uv, texel.surface);
-            result = blend_scalar(u32(e.balance.z), mask, sampled.x);
+            result = layer_blended_scalar(u32(e.balance.z), mask, sampled.x, true);
             weight *= sampled.a;
         } else if enable_generators && e.ids.y >= 40u {
             var ramp: f32;
@@ -34,13 +34,13 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
             if e.spatial.z != 0u {
                 // A generator's region is stored as mask values before later effects read it.
                 mask = clamp(mask, 0.0, 1.0);
-                result = blend_scalar(u32(e.balance.z), mask, finish_generator(e, ramp));
+                result = layer_blended_scalar(u32(e.balance.z), mask, finish_generator(e, ramp), true);
                 mask = clamp(lerp(mask, result, weight), 0.0, 1.0);
                 continue;
             }
-            result = blend_scalar(u32(e.balance.z), mask, finish_generator(e, ramp));
+            result = layer_blended_scalar(u32(e.balance.z), mask, finish_generator(e, ramp), true);
         } else if e.ids.y == COLOR_SELECTION_OPCODE {
-            result = blend_scalar(u32(e.balance.z), mask, color_selection(e, texel.pixel));
+            result = layer_blended_scalar(u32(e.balance.z), mask, color_selection(e, texel.pixel), true);
         } else {
             result = scalar_filter(e, mask);
         }

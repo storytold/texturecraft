@@ -51,6 +51,13 @@ pub(crate) fn images_used(project: &Project, id: LayerId, out: &mut Vec<String>,
     for effect in layer.mask.iter().flat_map(|mask| mask.effects.iter()).chain(&layer.content_effects) {
         out.extend(effect.kind.images_read().map(str::to_string));
     }
+    // images feeding graph inputs
+    for g in layer.graphs().into_iter().flat_map(|g| g.graphs()) {
+        out.extend(g.inputs.values().filter_map(|i| match i {
+            texturecraft_core::GraphInput::Image(name) => Some(name.clone()),
+            _ => None,
+        }));
+    }
     for child in layer.children() {
         images_used(project, *child, out, depth + 1);
     }
@@ -71,6 +78,8 @@ pub(crate) fn one_set_document(src_set: &TextureSet, name: &str) -> Document {
         stroke_replays: Default::default(),
         baked: BTreeMap::new(),
         resources: BTreeMap::new(),
+        graphs: Default::default(),
+        strokes: BTreeMap::new(),
     }
 }
 
@@ -104,6 +113,8 @@ impl Session {
             bake_paint: BTreeMap::new(),
             thumbnail: None,
             resources,
+            graphs: mini.graphs,
+            strokes: BTreeMap::new(),
             warnings: Vec::new(),
         };
         reservation.save_bytes(&snapshot).map_err(fe)
@@ -139,6 +150,8 @@ impl Session {
             stroke_replays: Default::default(),
             baked: BTreeMap::new(),
             resources,
+            graphs: project_file.graphs,
+            strokes: project_file.strokes,
         };
         let id = self.edit("Add smart material", |s| {
             for (name, bytes) in &source.resources {

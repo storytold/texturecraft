@@ -3,6 +3,8 @@
 override composite_groups: bool = false;
 const BEGIN_GROUP: u32 = 200u;
 const END_GROUP: u32 = 201u;
+const DISPLAY_CHANNELS: u32 = 21u;
+const PASSTHROUGH_GROUP: u32 = 0xffffffffu;
 
 struct MaterialValues {
     base: vec3<f32>,
@@ -10,6 +12,7 @@ struct MaterialValues {
     scalars: array<f32, 6>,
     lobe_colors: array<vec3<f32>, 4>,
     lobe_values: array<f32, 9>,
+    coverage: array<f32, DISPLAY_CHANNELS>,
 }
 
 fn group_word(depth: u32, channel_word: u32, index: u32) -> u32 {
@@ -29,7 +32,22 @@ fn material_value(state: MaterialValues, slot: u32) -> vec3<f32> {
     return vec3(state.scalars[slot - 1u]);
 }
 
-fn save_group_parent(depth: u32, index: u32, mask: f32, parent: MaterialValues) {
+fn set_material_value(state: ptr<function, MaterialValues>, slot: u32, color: vec3<f32>) {
+    if slot == 0u {
+        (*state).base = color;
+    } else if slot == 7u {
+        (*state).normal = color;
+    } else if slot >= 12u {
+        (*state).lobe_values[slot - 12u] = color.x;
+    } else if slot >= 8u {
+        (*state).lobe_colors[slot - 8u] = color;
+    } else {
+        (*state).scalars[slot - 1u] = color.x;
+    }
+}
+
+fn save_group_parent(depth: u32, index: u32, weights: u32, mask: f32, parent: MaterialValues) -> MaterialValues {
+    var inner = parent;
     output[group_word(depth, 0u, index)] = bitcast<u32>(mask);
     var channels = params.filter_stage.w;
     var word = 1u;
@@ -44,7 +62,17 @@ fn save_group_parent(depth: u32, index: u32, mask: f32, parent: MaterialValues) 
             output[group_word(depth, word + 1u, index)] = value.z;
             word += 2u;
         }
+        if measured_blend {
+            output[group_word(depth, word, index)] = bitcast<u32>(parent.coverage[slot]);
+            word += 1u;
+            let mode = srgb[weights + DISPLAY_CHANNELS + slot];
+            if mode != PASSTHROUGH_GROUP && mode != 1u {
+                set_material_value(&inner, slot, empty_channel(slot));
+                inner.coverage[slot] = 0.0;
+            }
+        }
     }
+    return inner;
 }
 
 fn mix_group_parent(depth: u32, index: u32, weights: u32, inner: MaterialValues) -> MaterialValues {
@@ -64,17 +92,26 @@ fn mix_group_parent(depth: u32, index: u32, weights: u32, inner: MaterialValues)
             outer.z = bitcast<f32>(output[group_word(depth, word + 1u, index)]);
             word += 2u;
         }
-        let color = outer + (material_value(inner, slot) - outer) * weight;
-        if slot == 0u {
-            result.base = color;
-        } else if slot == 7u {
-            result.normal = color;
-        } else if slot >= 12u {
-            result.lobe_values[slot - 12u] = color.x;
-        } else if slot >= 8u {
-            result.lobe_colors[slot - 8u] = color;
+        let color = material_value(inner, slot);
+        if measured_blend {
+            let outer_coverage = bitcast<f32>(output[group_word(depth, word, index)]);
+            word += 1u;
+            let outer_values = vec4(outer, outer_coverage);
+            let inner_coverage = inner.coverage[slot];
+            let mode = srgb[weights + DISPLAY_CHANNELS + slot];
+            var mixed = vec4(color, inner_coverage);
+            if mode == PASSTHROUGH_GROUP {
+                mixed = mix(outer_values, mixed, weight);
+            } else {
+                if mode != 2u && inner_coverage > 0.0 {
+                    mixed = vec4((color - empty_channel(slot) * (1.0 - inner_coverage)) / inner_coverage, inner_coverage);
+                }
+                mixed = measured_over(mode, outer_values, mixed, weight, slot);
+            }
+            set_material_value(&result, slot, mixed.rgb);
+            result.coverage[slot] = mixed.a;
         } else {
-            result.scalars[slot - 1u] = color.x;
+            set_material_value(&result, slot, outer + (color - outer) * weight);
         }
     }
     return result;

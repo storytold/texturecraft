@@ -169,7 +169,7 @@ fn a_partial_bake_does_not_count_preserved_unchecked_maps() {
 
     let mesh = primitives::udim_plane();
     let mut session = Session::new_project("Tiles", mesh, "builtin:udim_plane", None, 128).unwrap();
-    session.doc.baked.insert(0, BakedMaps { resolution: 64, maps: [(BakedMap::Normal, Arc::new(vec![0.4; 64 * 32 * 3]))].into() });
+    session.doc.baked.insert(0, BakedMaps { resolution: 64, maps: [(BakedMap::Normal, Arc::new(vec![0.4; 64 * 32 * 3].into()))].into() });
     let set = &mut session.doc.project.texture_sets[0];
     set.bake.common.resolution = BakeResolution::R64;
     set.bake.maps.select([BakedMap::Id]);

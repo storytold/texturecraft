@@ -11,8 +11,9 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use texturecraft_core::{
     BakedMap, BlendMode, BlockScales, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Fill, Filter, Generator,
-    GeneratorKind, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, MicroDetail, NormalFormat, Project, Projection, Source, TextureSet, TileGrid,
-    blend1, blend3, lum, mix3, per_unit,
+    GeneratorKind, GeometryMask, GraphInput, GraphRef, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, MicroDetail, NormalFormat,
+    PlacedProjection, Project, Projection, Source, TextureSet, TileGrid, blend1, blend3, lum, mix3, per_unit,
+    rules::{BlendRules, mix_over},
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer};
@@ -20,15 +21,54 @@ use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage, from_u16, nois
 
 use crate::below::{Band, BelowCache, Level, StackKey};
 use crate::curvature_sizes::CurvatureSizes;
+use crate::field_cache::FieldCache;
+use crate::graphs::{self, Cooked, GraphStore, GraphUse, RenderEnv};
 use crate::held_fields::HeldFields;
-use crate::pattern::{Coords, decal_uv_symmetric, image_samples, pattern_pixels, procedural_in, world_noise};
+use crate::pattern::{Coords, decal_uv_symmetric, image_samples_with_rules, pattern_pixels, procedural_in, world_noise};
 use crate::pattern_context::PatternContext;
+use crate::placed::{self, Taps};
 use crate::store::{BakedMaps, ImageStore, PixelStore, decode};
+use texturecraft_graph::tex::Tex;
 
 const NCH: usize = Channel::ALL.len();
 
-/// Stack values being composited, per channel.
-type Acc = [[f32; 3]; NCH];
+/// Stack values being composited, per channel, with the coverage each holds. Only the measured blend rules
+/// ([`BlendRules::Measured`]) read the coverage: there a layer's mode applies only where something is below, and a
+/// folder that does not pass through composites its children from nothing.
+#[derive(Clone, Copy)]
+struct Acc {
+    v: [[f32; 3]; NCH],
+    cov: [f32; NCH],
+}
+
+impl Acc {
+    /// The channel defaults, covering nothing.
+    fn defaults() -> Acc {
+        Acc { v: Channel::ALL.map(Channel::default_value), cov: [0.0; NCH] }
+    }
+
+    fn get(&self, ch: usize) -> Option<&[f32; 3]> {
+        self.v.get(ch)
+    }
+
+    /// What an anchor point inside a mask records: the mask's value on every channel, fully covered.
+    fn uniform(value: f32) -> Acc {
+        Acc { v: [[value; 3]; NCH], cov: [1.0; NCH] }
+    }
+
+    fn get_mut(&mut self, ch: usize) -> Option<&mut [f32; 3]> {
+        self.v.get_mut(ch)
+    }
+
+    /// What an effect layer's channel `c` starts from ([`starts_from_below`]): the stack's shown value and its
+    /// coverage. None on other channels.
+    fn below(&self, c: &ChanPlan) -> Option<([f32; 3], f32)> {
+        if !c.from_below {
+            return None;
+        }
+        Some((*self.v.get(c.ch)?, self.cov.get(c.ch).copied().unwrap_or(0.0)))
+    }
+}
 
 /// What a live stroke paints into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -110,6 +150,8 @@ pub struct Inputs<'a> {
     pub preview: Option<&'a StrokePreview>,
     /// Imported image resources (fill sources).
     pub images: &'a ImageStore,
+    /// Graph texts and cooked graph outputs (graph sources and effects).
+    pub graphs: &'a GraphStore,
     /// Mesh bounds, for scale-independent procedural coordinates.
     pub bounds: (Vec3, Vec3),
 }
@@ -129,6 +171,20 @@ impl Inputs<'_> {
     /// The current UV tile can occupy only part of its atlas block
     fn tile_res_at(&self, x: u32, y: u32) -> u32 {
         ((self.tile_res() as f32 * self.block_scales.at(x, y)).round() as u32).max(1)
+    }
+
+    /// What graphs of this set are rendered with.
+    fn render_env(&self) -> RenderEnv<'_> {
+        RenderEnv { baked: self.baked, images: self.images, side: RenderEnv::side_for((self.gbuf.width, self.gbuf.height)) }
+    }
+
+    /// The cook graph `g` shows for layer or effect `id` (read for `channel`); None for a graph that reads the stack
+    /// (computed with the neighbourhood fields) or that could not be rendered.
+    fn static_cook(&self, id: LayerId, channel: Option<Channel>, g: &GraphRef) -> Option<Arc<Cooked>> {
+        if g.reads_stack() {
+            return None;
+        }
+        self.graphs.cook_for(GraphUse { set: self.ts, id, channel }, g, &self.render_env(), &[])
     }
 }
 
@@ -208,6 +264,14 @@ struct ChanPlan<'a> {
     /// A content neighbourhood filter precomputed over the region: continue the effects after
     /// effect `.0` starting from the field's value.
     start: Option<(usize, &'a Field)>,
+    /// The cook of a fill's graph source on this channel.
+    graph: Option<Arc<Cooked>>,
+    /// An effect layer's channel ([`starts_from_below`]): its content starts from the stack below it.
+    from_below: bool,
+    /// The project's blend rules.
+    rules: BlendRules,
+    /// The channel stores 0..1 (the measured rules clamp blends to it before the opacity).
+    unit: bool,
 }
 
 enum Content<'a> {
@@ -226,8 +290,10 @@ struct EffectPlan<'a> {
     preview: bool,
     /// The curvature detail sizes a generator with detail reads.
     curvature_sizes: Option<Arc<CurvatureSizes>>,
-    /// A filtered mask stage retained because an anchor above it records that stage.
-    filtered_mask: Option<&'a Field>,
+    /// The cook of a graph effect, or of a fill effect's graph source on the channel planned.
+    graph: Option<Arc<Cooked>>,
+    /// The effect acts on the content channel planned ([`Effect::channels`]); always true in a mask.
+    acts: bool,
 }
 
 struct MaskPlan<'a> {
@@ -246,18 +312,73 @@ pub struct Field {
     w: u32,
     h: u32,
     comps: usize,
-    data: Vec<f32>,
-    /// Intermediate mask stages needed by anchors, owned by this drawn layer's final field.
-    anchor_stages: Vec<(LayerId, Field)>,
+    data: FieldData,
+    /// A mask's anchor points below the filter, each with the mask value it recorded per texel of the region
+    /// (unfiltered): a mask continued from the field records them again.
+    marks: Marks,
+    /// The same whatever tiles are composited, and exact (its graph was cooked): a composite may keep it for every
+    /// block (see [`FieldCache`]).
+    shared: bool,
+}
+
+/// Anchor points inside a mask with one recorded value per texel of a region.
+type Marks = Vec<(LayerId, Vec<f32>)>;
+
+/// A field's values: floats while it is made; once it covers the whole set, 16-bit steps of 0..1 when every value
+/// lies there (see [`Field::compact`]).
+enum FieldData {
+    F32(Vec<f32>),
+    U16(Vec<u16>),
+}
+
+impl FieldData {
+    fn bytes(&self) -> usize {
+        match self {
+            FieldData::F32(d) => d.len() * 4,
+            FieldData::U16(d) => d.len() * 2,
+        }
+    }
 }
 
 impl Field {
-    fn get(&self, x: u32, y: u32) -> Option<&[f32]> {
+    /// Bytes the field holds.
+    pub(crate) fn bytes(&self) -> usize {
+        self.data.bytes() + self.marks.iter().map(|(_, v)| v.len()).sum::<usize>() * std::mem::size_of::<f32>()
+    }
+
+    /// Holds the values as 16-bit steps of 0..1 when every value lies there (a field that covers the whole set, one
+    /// per layer and channel that reads the stack through a graph, is 268 MB at 4096 as floats): half the memory, each
+    /// value within 1/131070 of what it was. A field with any value outside 0..1 stays floats.
+    fn compact(&mut self) {
+        if let FieldData::F32(d) = &self.data
+            && d.iter().all(|v| (0.0..=1.0).contains(v))
+        {
+            self.data = FieldData::U16(d.iter().map(|v| (v * 65535.0).round() as u16).collect());
+        }
+    }
+
+    fn index(&self, x: u32, y: u32) -> Option<usize> {
         if x < self.x0 || y < self.y0 || x >= self.x0 + self.w || y >= self.y0 + self.h {
             return None;
         }
-        let i = ((y - self.y0) * self.w + (x - self.x0)) as usize * self.comps;
-        self.data.get(i..i + self.comps)
+        Some(((y - self.y0) * self.w + (x - self.x0)) as usize)
+    }
+
+    /// The texel's `comps` values (zeros past them).
+    fn get(&self, x: u32, y: u32) -> Option<[f32; 4]> {
+        let i = self.index(x, y)? * self.comps;
+        let mut out = [0.0; 4];
+        match &self.data {
+            FieldData::F32(d) => out.iter_mut().zip(d.get(i..i + self.comps)?).for_each(|(o, v)| *o = *v),
+            FieldData::U16(d) => out.iter_mut().zip(d.get(i..i + self.comps)?).for_each(|(o, v)| *o = f32::from(*v) / 65535.0),
+        }
+        Some(out)
+    }
+
+    /// The mask anchor points recorded below the filter at texel (x, y), with their values.
+    fn marks_at(&self, x: u32, y: u32) -> impl Iterator<Item = (LayerId, f32)> + '_ {
+        let i = self.index(x, y);
+        self.marks.iter().filter_map(move |(id, values)| Some((*id, *values.get(i?)?)))
     }
 }
 
@@ -267,7 +388,7 @@ pub enum FieldKey {
     Content(LayerId, Channel),
 }
 
-pub type Fields = HashMap<FieldKey, Field>;
+pub type Fields = HashMap<FieldKey, Arc<Field>>;
 
 /// How a neighbourhood filter reads around a texel.
 #[derive(Clone, Copy)]
@@ -290,11 +411,13 @@ enum Op {
     Edge,
     /// Average downhill along a noise height field.
     Slope { scale: f32, seed: u32 },
+    /// A graph reading the stack: rendered from the whole texture set ([`graph_region`]).
+    Graph,
 }
 
 /// The last neighbourhood filter of an effect stack (see [`neighbourhood_filters`]).
 fn neighbourhood(effects: &[Effect], res: u32) -> Option<(usize, f32, Op)> {
-    neighbourhood_filters(effects, res).last()
+    neighbourhood_filters(effects, res, None).last()
 }
 
 /// Below this a coverage weight counts as no coverage at all.
@@ -308,35 +431,39 @@ const SHARPEN_RADIUS: f32 = 1.5;
 const MIN_SHARPEN_RADIUS: f32 = 0.75;
 
 /// The neighbourhood filters of an effect stack, bottom → top: index among the visible effects, radius in texels (`res` texels per UV tile across) and what it does.
-fn neighbourhood_filters(effects: &[Effect], res: u32) -> impl Iterator<Item = (usize, f32, Op)> + '_ {
+fn neighbourhood_filters(effects: &[Effect], res: u32, channel: Option<Channel>) -> impl Iterator<Item = (usize, f32, Op)> + '_ {
     let texels = move |size: f32| (size * res as f32 / FILTER_SIZE_RESOLUTION).max(MIN_FILTER_RADIUS);
-    effects.iter().filter(|effect| effect.visible).enumerate().filter_map(move |(index, effect)| match &effect.kind {
-        EffectKind::Filter(Filter::Blur { radius }) if *radius > 0.0 => Some((index, texels(*radius), Op::Blur(None))),
-        EffectKind::Filter(Filter::Sharpen { amount }) => {
-            Some((index, (SHARPEN_RADIUS * res as f32 / FILTER_SIZE_RESOLUTION).max(MIN_SHARPEN_RADIUS), Op::Blur(Some(*amount))))
-        }
-        EffectKind::Filter(Filter::DirectionalBlur { radius, angle }) if *radius > 0.0 => Some((index, texels(*radius), Op::Line(direction(*angle)))),
-        EffectKind::Filter(Filter::Warp { intensity, scale, seed }) if *intensity > 0.0 => {
-            Some((index, texels(*intensity), Op::Warp { scale: *scale, seed: *seed, dir: None }))
-        }
-        EffectKind::Filter(Filter::DirectionalWarp { intensity, angle, scale, seed }) if *intensity > 0.0 => {
-            Some((index, texels(*intensity), Op::Warp { scale: *scale, seed: *seed, dir: Some(direction(*angle)) }))
-        }
-        EffectKind::Filter(Filter::HighPass { radius }) => Some((index, texels(*radius), Op::HighPass)),
-        EffectKind::Filter(Filter::EdgeDetect { width }) => Some((index, texels(*width), Op::Edge)),
-        // Three box passes ramp an edge over about twice their radius
-        EffectKind::Filter(Filter::Bevel { width }) => Some((index, texels(*width * 0.5), Op::Bevel)),
-        EffectKind::Filter(Filter::Glow { radius, amount }) => Some((index, texels(*radius), Op::Glow(*amount))),
-        EffectKind::Filter(Filter::Mosaic { size }) => Some((index, texels(*size), Op::Mosaic)),
-        // Independent of `res`, so every caller agrees on which effects are stages; the reach covers the cells, then the blur around them
-        EffectKind::Generator(generator) if generator.global.blur > 0.0 || generator.resolution.can_reduce() => {
-            Some((index, texels(generator.global.blur_radius()) + generator.resolution.largest_cell(res) as f32, Op::Blur(None)))
-        }
-        EffectKind::Filter(Filter::SlopeBlur { radius, scale, seed }) if *radius > 0.0 => {
-            Some((index, texels(*radius), Op::Slope { scale: *scale, seed: *seed }))
-        }
-        _ => None,
-    })
+    effects.iter().filter(|effect| effect.visible).enumerate().filter(move |(_, effect)| channel.is_none_or(|channel| effect.acts_on(channel))).filter_map(
+        move |(index, effect)| match &effect.kind {
+            EffectKind::Filter(Filter::Blur { radius }) if *radius > 0.0 => Some((index, texels(*radius), Op::Blur(None))),
+            EffectKind::Filter(Filter::Sharpen { amount }) => {
+                Some((index, (SHARPEN_RADIUS * res as f32 / FILTER_SIZE_RESOLUTION).max(MIN_SHARPEN_RADIUS), Op::Blur(Some(*amount))))
+            }
+            EffectKind::Filter(Filter::DirectionalBlur { radius, angle }) if *radius > 0.0 => Some((index, texels(*radius), Op::Line(direction(*angle)))),
+            EffectKind::Filter(Filter::Warp { intensity, scale, seed }) if *intensity > 0.0 => {
+                Some((index, texels(*intensity), Op::Warp { scale: *scale, seed: *seed, dir: None }))
+            }
+            EffectKind::Filter(Filter::DirectionalWarp { intensity, angle, scale, seed }) if *intensity > 0.0 => {
+                Some((index, texels(*intensity), Op::Warp { scale: *scale, seed: *seed, dir: Some(direction(*angle)) }))
+            }
+            EffectKind::Filter(Filter::HighPass { radius }) => Some((index, texels(*radius), Op::HighPass)),
+            EffectKind::Filter(Filter::EdgeDetect { width }) => Some((index, texels(*width), Op::Edge)),
+            // Three box passes ramp an edge over about twice their radius
+            EffectKind::Filter(Filter::Bevel { width }) => Some((index, texels(*width * 0.5), Op::Bevel)),
+            EffectKind::Filter(Filter::Glow { radius, amount }) => Some((index, texels(*radius), Op::Glow(*amount))),
+            EffectKind::Filter(Filter::Mosaic { size }) => Some((index, texels(*size), Op::Mosaic)),
+            // Independent of `res`, so every caller agrees on which effects are stages; the reach covers the cells, then the blur around them
+            EffectKind::Generator(generator) if generator.global.blur > 0.0 || generator.resolution.can_reduce() => {
+                Some((index, texels(generator.global.blur_radius()) + generator.resolution.largest_cell(res) as f32, Op::Blur(None)))
+            }
+            EffectKind::Filter(Filter::SlopeBlur { radius, scale, seed }) if *radius > 0.0 => {
+                Some((index, texels(*radius), Op::Slope { scale: *scale, seed: *seed }))
+            }
+            // reads the whole set: the radius is clamped to the set's longest side
+            EffectKind::Graph { graph, .. } if graph.reads_stack() => Some((index, f32::MAX, Op::Graph)),
+            _ => None,
+        },
+    )
 }
 
 /// Whether any mask or content effect in a texture set reads neighbouring texels. Includes
@@ -374,7 +501,7 @@ pub fn painted_tile_margin(project: &Project, ts: usize, target: PaintTarget) ->
                 PaintTarget::Layer(_) => layer.content_effects.as_slice(),
                 PaintTarget::Mask(_) => layer.mask.as_ref().map_or(&[][..], |mask| mask.effects.as_slice()),
             };
-            max_reach = neighbourhood_filters(effects, resolution)
+            max_reach = neighbourhood_filters(effects, resolution, None)
                 .map(|(_, radius, op)| filter_extent(radius, op, width.max(height)).1)
                 .fold(0u32, u32::saturating_add);
         }
@@ -494,7 +621,7 @@ fn gather(op: Op, orig: &[f32], cover: &[f32], comps: usize, (x0, y0, w, h): (u3
                     let center = |v: f32| ((v / r).floor() + 0.5) * r - 0.5;
                     sample(center(x), center(y), &mut acc);
                 }
-                Op::Blur(_) | Op::HighPass | Op::Bevel | Op::Glow(_) => {}
+                Op::Blur(_) | Op::HighPass | Op::Bevel | Op::Glow(_) | Op::Graph => {}
             }
             if acc[4] > 1e-6
                 && let Some(px) = line.get_mut(col * comps..(col + 1) * comps)
@@ -611,14 +738,44 @@ fn anchor_plan<'a>(inp: &Inputs<'a>, id: LayerId, channels: &[Channel], tx: u32,
     }
 }
 
+/// The whole stack of the set planned for tile (tx, ty), for evaluating what lies below a layer.
+fn stack_plan<'a>(inp: &Inputs<'a>, channels: &[Channel], tx: u32, ty: u32, fields: Option<&'a Fields>) -> Vec<Node<'a>> {
+    match inp.project.texture_set(inp.ts) {
+        Ok(set) => plan(inp, &set.stack, channels, tx, ty, 0, fields),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Whether layer `id` (its own mask, or the content it draws) reads an anchor point.
 pub(crate) fn reads_anchor(p: &Project, id: LayerId) -> bool {
     p.layers.get(&id).is_some_and(Layer::reads_anchor) || p.content_layer(id).is_some_and(Layer::reads_anchor)
 }
 
+/// Whether `l` is an effect layer on `channel`: a paint or fill layer (not a folder) with visible content effects that
+/// blends the channel with `Passthrough`. Its content starts from the stack below it instead of from nothing (its own
+/// paint or fill laid over that), its effects work on that, and the result takes the stack's place by the layer's
+/// strength: a filter on such a layer filters what is below it. Without content effects the result is the same as a
+/// normal blend.
+pub(crate) fn starts_from_below(l: &Layer, channel: Channel) -> bool {
+    !l.is_group() && l.content_effects.iter().any(|e| e.visible) && l.blend(channel).is_some_and(|b| b.mode == BlendMode::Passthrough)
+}
+
 /// The mask layer `id` draws with: its own, or an instance source's.
 fn layer_mask(p: &Project, id: LayerId) -> Option<&Mask> {
     p.layers.get(&p.mask_owner(id))?.mask.as_ref()
+}
+
+/// Whether layer `id` (or, for a folder, a layer inside it) holds an anchor point: a visible one among its content effects,
+/// or one inside its enabled mask.
+fn holds_anchor(p: &Project, id: LayerId, depth: usize) -> bool {
+    if depth > texturecraft_core::project::MAX_DEPTH {
+        return false;
+    }
+    layer_mask(p, id).is_some_and(|m| m.enabled && mask_anchors(m).next().is_some())
+        || p.content_layer(id).is_some_and(|l| {
+            (!l.is_group() && l.content_effects.iter().any(|e| e.visible && matches!(e.kind, EffectKind::Anchor)))
+                || l.children().iter().any(|c| holds_anchor(p, *c, depth + 1))
+        })
 }
 
 /// Layers of `list` in drawing order (bottom → top, folder and instanced folder contents after
@@ -642,13 +799,27 @@ enum Job<'a> {
     Content(Channel),
 }
 
-/// A layer's mask or content channel after every neighbourhood filter of its stack, over `tiles`.
-fn field(inp: &Inputs, channels: &[Channel], below: &Fields, id: LayerId, job: Job, tiles: &[(u32, u32)]) -> Option<Field> {
+/// A layer's mask or content channel after every neighbourhood filter of its stack, over `tiles`. With `cache`, the
+/// filters of a chain holding a graph filter that reads the stack (their regions cover the whole set) are taken from
+/// it or kept in it when they are the same whatever the tiles (see [`FieldCache`]).
+fn field(
+    inp: &Inputs,
+    channels: &[Channel],
+    below: &Fields,
+    id: LayerId,
+    job: Job,
+    tiles: &[(u32, u32)],
+    mut cache: Option<&mut FieldCache>,
+) -> Option<Arc<Field>> {
     let effects = match job {
         Job::Mask(mask) => &mask.effects,
         Job::Content(_) => &inp.project.content_layer(id)?.content_effects,
     };
-    let filters: Vec<(usize, f32, Op)> = neighbourhood_filters(effects, inp.tile_res()).collect();
+    let channel = match job {
+        Job::Mask(_) => None,
+        Job::Content(channel) => Some(channel),
+    };
+    let filters: Vec<(usize, f32, Op)> = neighbourhood_filters(effects, inp.tile_res(), channel).collect();
     let longest_side = inp.gbuf.width.max(inp.gbuf.height);
 
     // Each filter's region also holds what every filter above it reads around the tiles
@@ -657,32 +828,85 @@ fn field(inp: &Inputs, channels: &[Channel], below: &Fields, id: LayerId, job: J
         margins[index] += margins[index + 1];
     }
 
-    let mut previous: Option<(usize, Field)> = None;
-    let mut anchor_stages = Vec::new();
-    for (&filter, &margin) in filters.iter().zip(&margins) {
+    // Only chains holding a graph filter that reads the stack (the others reach a few tiles around the block)
+    let whole_set = filters.iter().any(|f| matches!(f.2, Op::Graph));
+    let cache_slot = match job {
+        Job::Mask(_) => FieldKey::Mask(id),
+        Job::Content(c) => FieldKey::Content(id, c),
+    };
+    // What the fields read: the layer, and every layer drawn before it when it reads the stack below
+    let reads_below = reads_stack_below(inp, id, job);
+    let deps_shared = below.iter().filter(|(k, _)| reads_below || field_layer(k) == id).all(|(_, f)| f.shared);
+    let read = match &cache {
+        Some(_) if whole_set && deps_shared => fields_read(inp, id, reads_below),
+        _ => None,
+    };
+
+    let mut previous: Option<(usize, Arc<Field>)> = None;
+    for (k, (&filter, &margin)) in filters.iter().zip(&margins).enumerate() {
         let region = region_around(inp, tiles, margin)?;
-        let start = previous.as_ref().map(|(index, field)| (*index, field));
-        let filtered = filter_region(inp, channels, below, id, job, effects, filter, region, start)?;
-
-        // Preserve only stages with anchors before the next filter overwrites their value
-        if let Some((previous_index, previous_field)) = previous.take()
-            && matches!(job, Job::Mask(_))
-        {
-            let mut visible = effects.iter().filter(|effect| effect.visible).skip(previous_index);
-            let previous_effect = visible.next();
-            let records_anchor = visible.take(filter.0 - previous_index - 1).any(|effect| matches!(effect.kind, EffectKind::Anchor));
-            if records_anchor && let Some(previous_effect) = previous_effect {
-                anchor_stages.push((previous_effect.id, previous_field));
-            }
+        let start_shared = previous.as_ref().is_none_or(|(_, f)| f.shared);
+        let shareable = region == (0, 0, inp.gbuf.width, inp.gbuf.height) && start_shared;
+        let kept = match (&read, cache.as_deref_mut()) {
+            (Some((roots, tree)), Some(c)) if shareable => c.get(inp, (cache_slot, k), roots, tree),
+            _ => None,
+        };
+        if let Some(kept) = kept {
+            previous = Some((filter.0, kept));
+            continue;
         }
-
+        let start = previous.as_ref().map(|(index, field)| (*index, field.as_ref()));
+        let mut filtered = filter_region(inp, channels, below, id, job, effects, filter, region, start)?;
+        filtered.shared &= shareable && deps_shared;
+        // a chain with a graph reading the stack covers the whole set whatever the block: its fields are held as 16-bit
+        // steps where they can be (the same in every block, cached or not)
+        if whole_set {
+            filtered.compact();
+        }
+        let filtered = Arc::new(filtered);
+        if let (Some((roots, tree)), Some(c)) = (&read, cache.as_deref_mut())
+            && filtered.shared
+        {
+            c.put(inp, (cache_slot, k), roots, tree, &filtered);
+        }
         previous = Some((filter.0, filtered));
     }
 
-    previous.map(|(_, mut field)| {
-        field.anchor_stages = anchor_stages;
-        field
-    })
+    previous.map(|(_, field)| field)
+}
+
+/// The layer a field belongs to.
+fn field_layer(k: &FieldKey) -> LayerId {
+    match k {
+        FieldKey::Mask(id) | FieldKey::Content(id, _) => *id,
+    }
+}
+
+/// Whether a field of layer `id` evaluates the stack below the layer (see [`stack_region`]): an effect layer starts
+/// from it, and anchor readers record anchor points in it. Otherwise it reads only the layer's own fields.
+fn reads_stack_below(inp: &Inputs, id: LayerId, job: Job) -> bool {
+    let effect_layer = match job {
+        Job::Mask(_) => false,
+        Job::Content(_) => inp.project.content_layer(id).is_some_and(|l| Channel::ALL.iter().any(|c| starts_from_below(l, *c))),
+    };
+    effect_layer || reads_anchor(inp.project, id)
+}
+
+/// The layers a field of layer `id` is computed from, drawn as the returned roots arrange them: the layer itself, or
+/// with `below` every layer drawn before it in the set (with their folders) as well. None when `id` is not drawn.
+fn fields_read(inp: &Inputs, id: LayerId, below: bool) -> Option<(Vec<LayerId>, std::collections::BTreeSet<LayerId>)> {
+    let roots = if below {
+        let stack = inp.project.texture_set(inp.ts).ok()?;
+        let mut order = Vec::new();
+        draw_order(inp.project, &stack.stack, 0, &mut order);
+        let at = order.iter().position(|l| *l == id)?;
+        order.truncate(at + 1);
+        order
+    } else {
+        vec![id]
+    };
+    let tree = inp.project.render_tree(&roots);
+    Some((roots, tree))
 }
 
 /// The tile-aligned texel region `(x0, y0, w, h)` around `tiles` plus `margin` tiles, clipped to the set.
@@ -713,46 +937,99 @@ fn is_box_blur(op: Op) -> bool {
 /// The stack up to and including neighbourhood filter `filter` over texel `region`, continued from `start` (the filter below's field) when given.
 #[allow(clippy::too_many_arguments)]
 fn filter_region(
-    inputs: &Inputs,
+    inp: &Inputs,
     channels: &[Channel],
     below: &Fields,
     id: LayerId,
     job: Job,
     effects: &[Effect],
     (index, radius, op): (usize, f32, Op),
-    (region_x, region_y, width, height): (u32, u32, u32, u32),
+    (rx0, ry0, w, h): (u32, u32, u32, u32),
     start: Option<(usize, &Field)>,
 ) -> Option<Field> {
     let filter_effect = effects.iter().filter(|effect| effect.visible).nth(index);
     let opacity = filter_effect.map(|effect| effect.opacity.clamp(0.0, 1.0)).unwrap_or(1.0);
-    let (radius_texels, _) = filter_extent(radius, op, inputs.gbuf.width.max(inputs.gbuf.height));
+    let (radius_texels, _) = filter_extent(radius, op, inp.gbuf.width.max(inp.gbuf.height));
 
     // Generator stages keep their ramp beside the mask stack below
     let generator = match (job, filter_effect.map(|effect| (&effect.kind, effect.blend))) {
         (Job::Mask(_), Some((EffectKind::Generator(generator), blend))) => Some((generator, blend)),
         _ => None,
     };
-    let components = match job {
+    let comps = match job {
         Job::Mask(_) if generator.is_some() => 2,
         Job::Mask(_) => 1,
         Job::Content(_) => 4,
     };
+    if let Op::Graph = op {
+        let effect = filter_effect?;
+        let (mut data, marks, cooked) = graph_region(inp, channels, below, id, job, index, effect, (rx0, ry0, w, h), start)?;
+        unpremultiply(&mut data, comps);
+        return Some(Field { x0: rx0, y0: ry0, w, h, comps, data: FieldData::F32(data), marks, shared: cooked });
+    }
+    let (orig, cover, _, marks) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &[], generator.map(|(g, _)| g));
+    let mut field = filtered_region(inp, effects, (index, radius_texels, op), (rx0, ry0, w, h), opacity, comps, job, orig, cover, generator)?;
+    field.marks = marks;
+    Some(field)
+}
+
+/// A region's stack values, whether each texel was evaluated, the anchor values asked for and the mask's own anchor
+/// points (see [`stack_region`]).
+type StackRegion = (Vec<f32>, Vec<f32>, Vec<Vec<[f32; 3]>>, Marks);
+
+/// One texel of a region: its position, its stack value and the anchor values recorded below it.
+type RegionTexel = (u32, u32, [f32; 4], Vec<[f32; 3]>);
+
+/// The stack of layer `id` up to effect `index` over texel `region` (content premultiplied by coverage), continued from
+/// `start` when given: one value per texel (`comps` per texel: 1 for a mask, 4 for content), whether each texel was
+/// evaluated, and the values of `anchors` (an anchor point and channel each) recorded below the layer.
+#[allow(clippy::too_many_arguments)]
+fn stack_region(
+    inp: &Inputs,
+    channels: &[Channel],
+    below: &Fields,
+    id: LayerId,
+    job: Job,
+    index: usize,
+    (rx0, ry0, w, h): (u32, u32, u32, u32),
+    start: Option<(usize, &Field)>,
+    asked: &[(LayerId, Channel)],
+    generator: Option<&Generator>,
+) -> StackRegion {
+    let comps = match job {
+        Job::Mask(_) if generator.is_some() => 2,
+        Job::Mask(_) => 1,
+        Job::Content(_) => 4,
+    };
+    // A mask's own anchor points are recorded too, for the field to carry them past the filter
+    let own: Vec<LayerId> = match job {
+        Job::Mask(m) => m.effects.iter().filter(|e| e.visible).take(index).filter(|e| matches!(e.kind, EffectKind::Anchor)).map(|e| e.id).collect(),
+        Job::Content(_) => Vec::new(),
+    };
+    let anchors: Vec<(LayerId, Channel)> = asked.iter().copied().chain(own.iter().map(|a| (*a, Channel::Height))).collect();
+    let anchors = anchors.as_slice();
+    // Content reading an anchor point inside the layer's own mask: the mask is evaluated first, recording it
+    let own_mask = match job {
+        Job::Content(_) => layer_mask(inp.project, id).filter(|m| mask_anchors(m).any(|a| asked.iter().any(|(at, _)| *at == a))),
+        Job::Mask(_) => None,
+    };
 
     // Evaluate the stack up to the filter, tile by tile (content premultiplied by coverage)
-    let (region_right, region_bottom) = (region_x + width, region_y + height);
-    let region_tiles: Vec<(u32, u32)> =
-        (region_y / TILE..region_bottom.div_ceil(TILE)).flat_map(|y| (region_x / TILE..region_right.div_ceil(TILE)).map(move |x| (x, y))).collect();
-    let parts: Vec<Vec<(u32, u32, [f32; 4])>> = region_tiles
+    let (rx1, ry1) = (rx0 + w, ry0 + h);
+    let region_tiles: Vec<(u32, u32)> = (ry0 / TILE..ry1.div_ceil(TILE)).flat_map(|y| (rx0 / TILE..rx1.div_ceil(TILE)).map(move |x| (x, y))).collect();
+    let parts: Vec<Vec<RegionTexel>> = region_tiles
         .par_iter()
-        .map(|&(tile_x, tile_y)| {
-            let anchor_nodes = anchor_plan(inputs, id, channels, tile_x, tile_y, Some(below));
-            let preview_tile = inputs.preview.and_then(|preview| preview.alpha.tile(tile_x, tile_y));
+        .map(|&(tx, ty)| {
+            let from_below = matches!(job, Job::Content(c) if inp.project.content_layer(id).is_some_and(|l| starts_from_below(l, c)));
+            let full = if from_below { stack_plan(inp, channels, tx, ty, Some(below)) } else { anchor_plan(inp, id, channels, tx, ty, Some(below)) };
+            let preview_tile = inp.preview.and_then(|preview| preview.alpha.tile(tx, ty));
+            let own_mask = own_mask.and_then(|m| mask_plan(inp, id, m, tx, ty, Some(below)));
             let mut mask = None;
             let mut nodes = Vec::new();
             let mut generator_sizes = None;
             match job {
                 Job::Mask(layer_mask) => {
-                    let Some(mut mask_stack) = mask_plan(inputs, id, layer_mask, tile_x, tile_y, None) else { return Vec::new() };
+                    let Some(mut mask_stack) = mask_plan(inp, id, layer_mask, tx, ty, None) else { return Vec::new() };
 
                     generator_sizes = mask_stack.effects.get(index).and_then(|effect| effect.curvature_sizes.clone());
                     mask_stack.effects.truncate(index);
@@ -760,96 +1037,457 @@ fn filter_region(
                     mask = Some(mask_stack);
                 }
                 Job::Content(channel) => {
-                    nodes = plan(inputs, &[id], &[channel], tile_x, tile_y, 0, Some(below));
-                    if let Some(channel_plan) = nodes.first_mut().and_then(|node| node.chans.first_mut()) {
-                        channel_plan.effects.truncate(index);
-                        channel_plan.start = start;
+                    nodes = plan(inp, &[id], &[channel], tx, ty, 0, Some(below));
+                    if let Some(chan) = nodes.first_mut().and_then(|node| node.chans.first_mut()) {
+                        chan.effects.truncate(index);
+                        chan.start = start;
                     }
                 }
             }
-            tile_texels(inputs.gbuf, tile_x, tile_y)
+            tile_texels(inp.gbuf, tx, ty)
                 .map(|(x, y, offset)| {
-                    let mut texel = Texel::new(inputs, x, y, offset, stroke_at(preview_tile, offset));
-                    if !anchor_nodes.is_empty() {
-                        texel.anchors_below(&anchor_nodes, id);
+                    let mut texel = Texel::new(inp, x, y, offset, stroke_at(preview_tile, offset));
+                    let acc = if full.is_empty() { None } else { Some(texel.anchors_below(&full, id)) };
+                    if let Some(own_mask) = &own_mask {
+                        texel.mask(own_mask);
                     }
-
                     let value = match (&mask, nodes.first()) {
                         (Some(mask_stack), _) => {
-                            let ramp = generator.map_or(0.0, |(generator, _)| texel.generator_ramp(generator, generator_sizes.as_deref()));
+                            let ramp = generator.map_or(0.0, |generator| texel.generator_ramp(generator, generator_sizes.as_deref()));
                             [texel.mask(mask_stack), ramp, 0.0, 0.0]
                         }
-                        (None, Some(node)) => match node.chans.first().and_then(|channel_plan| texel.content(&node.content, channel_plan)) {
-                            Some((color, coverage)) => [color[0] * coverage, color[1] * coverage, color[2] * coverage, coverage],
+                        (None, Some(node)) => match node.chans.first().and_then(|chan| {
+                            let below = acc.and_then(|a| a.below(chan));
+                            texel.content_over(&node.content, chan, usize::MAX, below)
+                        }) {
+                            Some((color, cov)) => [color[0] * cov, color[1] * cov, color[2] * cov, cov],
                             None => [0.0; 4],
                         },
                         (None, None) => [0.0; 4],
                     };
-                    (x, y, value)
+                    let recorded = anchors.iter().map(|(a, c)| texel.anchored(*a, *c)).collect::<Vec<_>>();
+                    (x, y, value, recorded)
                 })
                 .collect()
         })
         .collect();
 
     // Scatter into the region, a row of tiles at a time (the region is tile aligned)
-    let texel_count = (width * height) as usize;
-    let mut stack_values = vec![0.0f32; texel_count * components];
+    let texel_count = (w * h) as usize;
+    let mut orig = vec![0.0f32; texel_count * comps];
     let mut cover = vec![0.0f32; texel_count];
-    let row_tiles = (region_right.div_ceil(TILE) - region_x / TILE).max(1) as usize;
-    let band = (TILE * width) as usize;
-    stack_values.par_chunks_mut(band * components).zip(cover.par_chunks_mut(band)).zip(parts.par_chunks(row_tiles)).for_each(|((stack_values, cover), row)| {
-        for &(x, y, value) in row.iter().flatten() {
-            let texel = (((y - region_y) % TILE) * width + (x - region_x)) as usize;
-            if let (Some(covered), Some(pixel)) = (cover.get_mut(texel), stack_values.get_mut(texel * components..(texel + 1) * components)) {
+    let row_tiles = (rx1.div_ceil(TILE) - rx0 / TILE).max(1) as usize;
+    let band = (TILE * w) as usize;
+    orig.par_chunks_mut(band * comps).zip(cover.par_chunks_mut(band)).zip(parts.par_chunks(row_tiles)).for_each(|((orig, cover), row)| {
+        for (x, y, value, _) in row.iter().flatten() {
+            let texel = (((y - ry0) % TILE) * w + (x - rx0)) as usize;
+            if let (Some(covered), Some(pixel)) = (cover.get_mut(texel), orig.get_mut(texel * comps..(texel + 1) * comps)) {
                 *covered = 1.0;
-                pixel.copy_from_slice(&value[..components]);
+                pixel.copy_from_slice(&value[..comps]);
             }
         }
     });
+    let mut recorded: Vec<Vec<[f32; 3]>> = anchors.iter().map(|(_, c)| vec![c.default_value(); texel_count]).collect();
+    if !anchors.is_empty() {
+        for (x, y, _, values) in parts.iter().flatten() {
+            let texel = ((y - ry0) * w + (x - rx0)) as usize;
+            for (image, v) in recorded.iter_mut().zip(values) {
+                if let Some(slot) = image.get_mut(texel) {
+                    *slot = *v;
+                }
+            }
+        }
+    }
+    let marks =
+        recorded.split_off(asked.len().min(recorded.len())).into_iter().zip(own).map(|(values, a)| (a, values.into_iter().map(|v| v[0]).collect())).collect();
+    (orig, cover, recorded, marks)
+}
 
-    // Release tile scatter data before allocating filter buffers
-    drop(parts);
+/// Whether anchor point `anchor` sits inside a layer's mask (imported projects only).
+fn in_a_mask(p: &Project, anchor: LayerId) -> bool {
+    p.layers.values().any(|l| l.mask.as_ref().is_some_and(|m| m.effects.iter().any(|e| e.id == anchor)))
+}
 
-    // High pass centers on the channel's middle value (0 for signed channels like height)
-    let middle = match job {
+/// The visible anchor points inside a mask.
+fn mask_anchors(m: &Mask) -> impl Iterator<Item = LayerId> + '_ {
+    m.effects.iter().filter(|e| e.visible && matches!(e.kind, EffectKind::Anchor)).map(|e| e.id)
+}
+
+/// Mask `mask` of layer `id` up to effect `index` at the texels of `region` outside the UV islands (those `padding`
+/// sends elsewhere), written into `given`: evaluated at the texel itself, so painted effects add nothing there, with the
+/// surface (position, normal, UV) of the nearest island texel for what fills and generators read.
+#[allow(clippy::too_many_arguments)]
+fn mask_outside(
+    inp: &Inputs,
+    channels: &[Channel],
+    below: &Fields,
+    id: LayerId,
+    mask: &Mask,
+    index: usize,
+    (rx0, ry0, w, h): (u32, u32, u32, u32),
+    start: Option<(usize, &Field)>,
+    padding: &[u32],
+    given: &mut [f32],
+) {
+    let (rx1, ry1) = (rx0 + w, ry0 + h);
+    let region_tiles: Vec<(u32, u32)> = (ry0 / TILE..ry1.div_ceil(TILE)).flat_map(|y| (rx0 / TILE..rx1.div_ceil(TILE)).map(move |x| (x, y))).collect();
+    let (gw, gh) = (inp.gbuf.width, inp.gbuf.height);
+    let values: Vec<(usize, f32)> = region_tiles
+        .par_iter()
+        .flat_map_iter(|&(tx, ty)| {
+            let mut out = Vec::new();
+            let Some(mut plan) = mask_plan(inp, id, mask, tx, ty, None) else { return out };
+            plan.effects.truncate(index);
+            plan.start = start;
+            let full = anchor_plan(inp, id, channels, tx, ty, Some(below));
+            for ly in 0..TILE {
+                for lx in 0..TILE {
+                    let (x, y) = (tx * TILE + lx, ty * TILE + ly);
+                    if x < rx0 || y < ry0 || x >= rx1 || y >= ry1 || x >= gw || y >= gh {
+                        continue;
+                    }
+                    let i = ((y - ry0) * w + (x - rx0)) as usize;
+                    let Some(&src) = padding.get(i) else { continue };
+                    if src == texturecraft_texel::dilate::NONE || src as usize == i {
+                        continue;
+                    }
+                    let (sx, sy) = (rx0 + src % w, ry0 + src / w);
+                    let surface = Texel::new(inp, sx, sy, 0, 0.0).coords();
+                    let mut texel = Texel::new(inp, x, y, (ly * TILE + lx) as usize, 0.0);
+                    texel.coords = Some(surface);
+                    if !full.is_empty() {
+                        texel.anchors_below(&full, id);
+                    }
+                    out.push((i, texel.mask(&plan)));
+                }
+            }
+            out
+        })
+        .collect();
+    for (i, v) in values {
+        if let Some(slot) = given.get_mut(i) {
+            *slot = v;
+        }
+    }
+}
+
+/// For each texel of `region`, the evaluated texel (`evaluated` > 0: on the UV islands) whose value it takes: the nearest
+/// one, never across the borders of a UV-tiled set's blocks. Empty when every texel was evaluated or none was.
+fn outside_padding(inp: &Inputs, evaluated: &[f32], (rx0, ry0, w, h): (u32, u32, u32, u32)) -> Vec<u32> {
+    let covered: Vec<bool> = evaluated.iter().map(|c| *c > 0.0).collect();
+    if covered.iter().all(|c| *c) || !covered.contains(&true) {
+        return Vec::new();
+    }
+    let whole = (rx0, ry0, w, h) == (0, 0, inp.gbuf.width, inp.gbuf.height);
+    let block = match inp.tile_grid() {
+        Some(g) if whole => (w / g.cols.max(1), h / g.rows.max(1)),
+        _ => (0, 0),
+    };
+    DilationMap::in_rectangular_blocks(&covered, w, h, None, block).src
+}
+
+/// `data` (`comps` values per texel) with each texel taking the value of its `padding` source; unchanged without padding.
+fn padded<T: Copy>(data: &[T], comps: usize, padding: &[u32]) -> Vec<T> {
+    if padding.is_empty() {
+        return data.to_vec();
+    }
+    let mut out = data.to_vec();
+    for (i, &src) in padding.iter().enumerate() {
+        if src == texturecraft_texel::dilate::NONE || src as usize == i {
+            continue;
+        }
+        let src = src as usize;
+        if let (Some(from), Some(to)) = (data.get(src * comps..(src + 1) * comps), out.get_mut(i * comps..(i + 1) * comps)) {
+            to.copy_from_slice(from);
+        }
+    }
+    out
+}
+
+/// Where a graph filter's result on a channel covers the layer (its alpha), measured on filters in a fill layer without
+/// height or normal (the reference app's results).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Cover {
+    /// The filter's coverage output for the channel, on any channel (a threshold whose alpha output passes its input's
+    /// alpha through leaves height flat over an empty height).
+    Alpha,
+    /// A colour output's own alpha, on height and normal (a gradient filter passes its input's alpha, the stack's
+    /// coverage, on).
+    OutputAlpha,
+    /// The whole layer, on height and normal, for a grey output of a graph that does not read the stack it runs on
+    /// (a shut-line filter's height leaves −1 over an empty height, whatever is below).
+    Whole,
+    /// What the content below covers: in masks, on the other channels, and on height and normal for a grey output of a
+    /// graph that reads its own stack (a bevel over an empty height leaves height flat).
+    Below,
+}
+
+impl Cover {
+    fn of(g: &GraphRef, channel: Channel, output: Option<&str>) -> Cover {
+        if g.output_alphas.contains_key(&channel) {
+            return Cover::Alpha;
+        }
+        if !matches!(channel.kind(), ChannelKind::Signed | ChannelKind::NormalMap) {
+            return Cover::Below;
+        }
+        if output.is_some_and(|o| g.colour_outputs.contains(o)) {
+            return Cover::OutputAlpha;
+        }
+        // only the filter's own input (no channel named) counts: an input named after the channel it runs on reads that
+        // channel like any other named input (a weathering filter's `height` input over an empty height lays its height
+        // on whole)
+        let own = g.inputs.values().any(|i| matches!(i, GraphInput::Stack { channel: None }));
+        if own { Cover::Below } else { Cover::Whole }
+    }
+}
+
+/// A graph filter (effect `index` of layer `id`, reading the stack) over texel `region`: the stack below it and what
+/// else it reads (other channels, coverage, anchors) given to the graph as images, the graph rendered (or found among
+/// the cooks), and its output laid over the stack with the effect's blending. Content comes back premultiplied (see
+/// [`stack_region`]). A graph that could not be rendered leaves the stack as it is.
+#[allow(clippy::too_many_arguments)]
+fn graph_region(
+    inp: &Inputs,
+    channels: &[Channel],
+    below: &Fields,
+    id: LayerId,
+    job: Job,
+    index: usize,
+    effect: &Effect,
+    (rx0, ry0, w, h): (u32, u32, u32, u32),
+    start: Option<(usize, &Field)>,
+) -> Option<(Vec<f32>, Marks, bool)> {
+    let EffectKind::Graph { graph, .. } = &effect.kind else { return None };
+    let own = match job {
+        Job::Mask(_) => None,
+        Job::Content(c) => Some(c),
+    };
+    let comps = if own.is_some() { 4 } else { 1 };
+    let anchors: Vec<(LayerId, Channel)> = graph
+        .inputs
+        .values()
+        .filter_map(|i| match i {
+            GraphInput::Anchor { anchor, channel, .. } => Some((*anchor, channel.or(own).unwrap_or(Channel::Height))),
+            _ => None,
+        })
+        .collect();
+    let (orig, cover, mut recorded, marks) = stack_region(inp, channels, below, id, job, index, (rx0, ry0, w, h), start, &anchors, None);
+    // the graph reads the stack outside the UV islands too, where the reference app's stack holds values: there it
+    // reads the nearest island texel's, not empty
+    let padding = outside_padding(inp, &cover, (rx0, ry0, w, h));
+    let given_orig = match job {
+        // under the measured rules a mask outside the islands holds what its fills and graphs give there (read at the
+        // nearest island texel's surface), but no paint: strokes and polygon fills cover the islands only, so a filter
+        // finds the edge of a painted mask at the islands' borders
+        Job::Mask(mask) if !padding.is_empty() && inp.project.rules.blend.is_measured() => {
+            let mut given = padded(&orig, comps, &padding);
+            mask_outside(inp, channels, below, id, mask, index, (rx0, ry0, w, h), start, &padding, &mut given);
+            given
+        }
+        _ => padded(&orig, comps, &padding),
+    };
+    for image in &mut recorded {
+        *image = padded(image, 1, &padding);
+    }
+    let env = inp.render_env();
+    let side = env.side;
+    let working = inp.graphs.working_inputs(&graph.key);
+    let n = (w * h) as usize;
+    let at = |data: &[f32], i: usize, k: usize| data.get(i * comps + k).copied().unwrap_or(0.0);
+    // another channel's stack up to the filter, when the graph reads one
+    let mut others: BTreeMap<Channel, Vec<f32>> = BTreeMap::new();
+    for i in graph.inputs.values() {
+        if let GraphInput::Stack { channel: Some(c) } | GraphInput::StackAlpha { channel: Some(c) } = i
+            && Some(*c) != own
+            && own.is_some()
+            && !others.contains_key(c)
+        {
+            let (values, _, _, _) = stack_region(inp, channels, below, id, Job::Content(*c), index, (rx0, ry0, w, h), None, &[], None);
+            others.insert(*c, padded(&values, 4, &padding));
+        }
+    }
+    let to_side = |t: Tex| if (t.w, t.h) == (side, side) { t } else { Tex::from_fn(side, side, |u, v| t.sample(u, v)) };
+    let mut given: Vec<(u32, Tex)> = Vec::new();
+    let mut next_anchor = 0;
+    for (k, input) in &graph.inputs {
+        let linear = working.contains(k);
+        let image = match input {
+            GraphInput::Stack { channel } => {
+                let c = channel.or(own);
+                // the filter's own input (no channel named); an input named after the channel the filter runs on reads the
+                // same stack but as a named input: 0 where nothing is below, opaque
+                let is_own = channel.is_none();
+                let data = if c == own { Some(&given_orig) } else { c.and_then(|c| others.get(&c)) };
+                let Some(data) = data else { continue };
+                let px = (0..n)
+                    .map(|i| match c {
+                        // a mask reads its value
+                        None => {
+                            let m = at(data, i, 0);
+                            [m, m, m, 1.0]
+                        }
+                        Some(c) => {
+                            let cov = at(data, i, 3);
+                            // the filter's own input carries the stack's coverage as its alpha
+                            let alpha = if is_own { cov.clamp(0.0, 1.0) } else { 1.0 };
+                            if cov <= 0.0 {
+                                // nothing below: an input named after another channel reads 0; the filter's own reads the flat
+                                // surface on height and normal
+                                let empty = match c.kind() {
+                                    ChannelKind::Signed if is_own => [0.5; 3],
+                                    ChannelKind::NormalMap if is_own => [0.5, 0.5, 1.0],
+                                    _ => [0.0; 3],
+                                };
+                                [empty[0], empty[1], empty[2], alpha]
+                            } else {
+                                let straight = [at(data, i, 0) / cov, at(data, i, 1) / cov, at(data, i, 2) / cov];
+                                let g = graphs::channel_to_graph(c.kind(), straight, linear);
+                                [g[0], g[1], g[2], alpha]
+                            }
+                        }
+                    })
+                    .collect();
+                Tex { w: w as usize, h: h as usize, px }
+            }
+            GraphInput::StackAlpha { channel } => {
+                let c = channel.or(own);
+                let data = if c == own { Some(&given_orig) } else { c.and_then(|c| others.get(&c)) };
+                let Some(data) = data else { continue };
+                let px = (0..n).map(|i| if c.is_some() { at(data, i, 3) } else { 1.0 }).map(|a| [a, a, a, 1.0]).collect();
+                Tex { w: w as usize, h: h as usize, px }
+            }
+            GraphInput::Anchor { anchor, channel, levels } => {
+                // an anchor point inside a mask holds the mask's grey, whatever the channel
+                let read = if in_a_mask(inp.project, *anchor) { ChannelKind::Scalar } else { channel.or(own).unwrap_or(Channel::Height).kind() };
+                let Some(values) = recorded.get(next_anchor) else { continue };
+                next_anchor += 1;
+                let px = values
+                    .iter()
+                    .map(|v| {
+                        let v = levels.map_or(*v, |l| per_unit(read, *v, |x| l.apply(x)));
+                        let g = graphs::channel_to_graph(read, v, linear);
+                        [g[0], g[1], g[2], 1.0]
+                    })
+                    .collect();
+                Tex { w: w as usize, h: h as usize, px }
+            }
+            _ => continue,
+        };
+        given.push((*k, to_side(image)));
+    }
+    let use_ = GraphUse { set: inp.ts, id: effect.id, channel: own };
+    let cooked = inp.graphs.cook_for(use_.clone(), graph, &env, &given);
+    // a cook that failed now (none, or the one the use read last) may be found later: not kept for other blocks
+    let exact = !inp.graphs.has_problem(&use_);
+    let (Some(cooked), size) = (cooked, (inp.gbuf.width, inp.gbuf.height)) else { return Some((orig, marks, exact)) };
+    let opacity = effect.opacity.clamp(0.0, 1.0);
+    let mut data = orig.clone();
+    match own {
+        None => {
+            let Some(plane) = cooked.output(graph.output.as_deref()) else { return Some((orig, marks, exact)) };
+            for i in 0..n {
+                if cover.get(i).copied().unwrap_or(0.0) <= 0.0 {
+                    continue;
+                }
+                let (x, y) = (rx0 + i as u32 % w, ry0 + i as u32 / w);
+                let m = at(&orig, i, 0);
+                let g = graphs::at_texel(plane, x, y, size)[0];
+                if let Some(slot) = data.get_mut(i) {
+                    *slot = m + (inp.project.rules.blend.blended1(effect.blend, m, g, true) - m) * opacity;
+                }
+            }
+        }
+        Some(c) => {
+            // a filter naming outputs for other channels leaves this one as it is
+            let Some(output) = graph.output_for(c) else { return Some((orig, marks, exact)) };
+            let Some(plane) = cooked.output(output) else { return Some((orig, marks, exact)) };
+            let linear = cooked.is_linear(output);
+            let alpha_plane = graph.output_alphas.get(&c).and_then(|a| cooked.output(Some(a)));
+            let cover_rule = Cover::of(graph, c, output.or_else(|| cooked.outputs.keys().next().map(String::as_str)));
+            for i in 0..n {
+                if cover.get(i).copied().unwrap_or(0.0) <= 0.0 {
+                    continue;
+                }
+                let (x, y) = (rx0 + i as u32 % w, ry0 + i as u32 / w);
+                let cov = at(&orig, i, 3);
+                let v_in = if cov > 0.0 { [at(&orig, i, 0) / cov, at(&orig, i, 1) / cov, at(&orig, i, 2) / cov] } else { [0.0; 3] };
+                let g = graphs::at_texel(plane, x, y, size);
+                let a = match cover_rule {
+                    Cover::Alpha => alpha_plane.map_or(1.0, |p| graphs::at_texel(p, x, y, size)[0].clamp(0.0, 1.0)),
+                    Cover::OutputAlpha => g[3].clamp(0.0, 1.0),
+                    Cover::Whole => 1.0,
+                    Cover::Below => cov,
+                };
+                let p = graphs::graph_to_channel(c.kind(), g, linear);
+                let (v, nc) = over_comps(c.components(), inp.project.rules.blend, stores_unit(inp, c), effect.blend, v_in, cov, p, a * opacity);
+                if let Some(px) = data.get_mut(i * 4..i * 4 + 4) {
+                    px.copy_from_slice(&[v[0] * nc, v[1] * nc, v[2] * nc, nc]);
+                }
+            }
+        }
+    }
+    Some((data, marks, exact))
+}
+
+/// Neighbourhood filter `op` (with its radius in texels) over a region's stack values (see [`stack_region`]).
+#[allow(clippy::too_many_arguments)]
+fn filtered_region(
+    inp: &Inputs,
+    effects: &[Effect],
+    (index, radius_texels, op): (usize, u32, Op),
+    (rx0, ry0, w, h): (u32, u32, u32, u32),
+    opacity: f32,
+    comps: usize,
+    job: Job,
+    orig: Vec<f32>,
+    cover: Vec<f32>,
+    generator: Option<(&Generator, BlendMode)>,
+) -> Option<Field> {
+    // Tiny coverage sums make normalization unstable
+    const MIN_FILTER_WEIGHT: f32 = 1e-6;
+
+    let (rx1, ry1) = (rx0 + w, ry0 + h);
+
+    // High pass centers on the channel's mid value (0 for signed channels like height)
+    let mid = match job {
         Job::Content(channel) if channel.kind() == ChannelKind::Signed => 0.0,
         _ => 0.5,
     };
 
     // A smaller UV tile has fewer texels per UV unit, so its filters reach fewer texels
     let filtered = |scale: f32| -> Vec<f32> {
-        let tile_resolution = ((inputs.tile_res() as f32 * scale).round() as u32).max(1);
+        let res = ((inp.tile_res() as f32 * scale).round() as u32).max(1);
         if let Some((generator, blend)) = generator {
-            let texture_set = inputs.project.texture_set(inputs.ts).map_or(inputs.tile_res(), |set| set.resolution);
-            return generator_region(generator, blend, opacity, &stack_values, &cover, (region_x, region_y, width, height), (tile_resolution, texture_set));
+            let texture_set = inp.project.texture_set(inp.ts).map_or(inp.tile_res(), |set| set.resolution);
+            return generator_region(generator, (blend, inp.project.rules.blend), opacity, &orig, &cover, (rx0, ry0, w, h), (res, texture_set));
         }
 
-        let scaled_radius = neighbourhood_filters(effects, tile_resolution)
+        let scaled_radius = neighbourhood_filters(effects, res, None)
             .find(|filter| filter.0 == index)
             .map_or(radius_texels, |filter| filter.1.round().clamp(1.0, radius_texels as f32) as u32);
         if !is_box_blur(op) {
-            return gather(op, &stack_values, &cover, components, (region_x, region_y, width, height), scaled_radius as f32, tile_resolution, opacity);
+            return gather(op, &orig, &cover, comps, (rx0, ry0, w, h), scaled_radius as f32, res, opacity);
         }
 
         // Weighted so uncovered texels don't bleed in
-        let (columns, rows, blur_radius) = (width as usize, height as usize, scaled_radius as usize);
+        let (width, height, blur_radius) = (w as usize, h as usize, scaled_radius as usize);
         let mut weights = cover.clone();
-        blur(&mut weights, columns, rows, blur_radius);
-        let mut filtered_values = stack_values.clone();
-        for component in 0..components {
-            let mut sums: Vec<f32> = stack_values.par_chunks(components).map(|pixel| pixel.get(component).copied().unwrap_or(0.0)).collect();
-            blur(&mut sums, columns, rows, blur_radius);
-            filtered_values.par_chunks_mut(components).zip(sums.par_iter()).zip(weights.par_iter()).for_each(|((pixel, sum), weight)| {
-                // Content is premultiplied, so the middle value is too (coverage itself is kept)
-                let coverage = if components == 4 { pixel.get(3).copied().unwrap_or(0.0) } else { 1.0 };
-                if *weight > MIN_COVERAGE_WEIGHT
+        blur(&mut weights, width, height, blur_radius);
+        let mut data = orig.clone();
+        for component in 0..comps {
+            let mut sums: Vec<f32> =
+                orig.par_chunks(comps).with_min_len(MIN_PARALLEL_TEXELS).map(|pixel| pixel.get(component).copied().unwrap_or(0.0)).collect();
+            blur(&mut sums, width, height, blur_radius);
+            data.par_chunks_mut(comps).with_min_len(MIN_PARALLEL_TEXELS).zip(sums.par_iter()).zip(weights.par_iter()).for_each(|((pixel, sum), weight)| {
+                // Content is premultiplied, so the mid value is too (coverage itself is kept)
+                let cov = if comps == 4 { pixel.get(3).copied().unwrap_or(0.0) } else { 1.0 };
+                if *weight > MIN_FILTER_WEIGHT
                     && let Some(slot) = pixel.get_mut(component)
                 {
                     let (original, blurred) = (*slot, sum / weight);
                     let result = match op {
                         Op::Blur(Some(amount)) => original + amount * (original - blurred),
-                        Op::HighPass if component < 3 => original - blurred + middle * coverage,
-
+                        Op::HighPass if component < 3 => original - blurred + mid * cov,
                         // Away from 0 by at most the value itself: 0 at the edge, full inside
                         Op::Bevel if component < 3 => original.signum() * original.abs().min((2.0 * blurred * original.signum() - original.abs()).max(0.0)),
                         Op::Glow(amount) if component < 3 => original + amount * blurred,
@@ -860,43 +1498,40 @@ fn filter_region(
                 }
             });
         }
-        filtered_values
+        data
     };
 
     // Each block keeps the result at its tile's scale (blocks are TILE aligned)
-    let scales = inputs.project.texture_set(inputs.ts).map(TextureSet::block_scales).unwrap_or_default();
-    let mut levels: Vec<f32> = (region_y..region_bottom)
-        .step_by(TILE as usize)
-        .flat_map(|y| (region_x..region_right).step_by(TILE as usize).map(move |x| (x, y)))
-        .map(|(x, y)| scales.at(x, y))
-        .collect();
+    let scales = &inp.block_scales;
+    let mut levels: Vec<f32> =
+        (ry0..ry1).step_by(TILE as usize).flat_map(|y| (rx0..rx1).step_by(TILE as usize).map(move |x| (x, y))).map(|(x, y)| scales.at(x, y)).collect();
     levels.sort_by(f32::total_cmp);
     levels.dedup();
     let (first, rest) = levels.split_first().map_or((1.0, &[][..]), |(first, rest)| (*first, rest));
 
     // A generator stage's field is the mask alone
-    let field_components = if generator.is_some() { 1 } else { components };
-    let mut result = filtered(first);
+    let field_components = if generator.is_some() { 1 } else { comps };
+    let mut data = filtered(first);
     for &scale in rest {
-        let rescaled = filtered(scale);
-        let row = width as usize * field_components;
-        result.par_chunks_mut(row).zip(rescaled.par_chunks(row)).enumerate().for_each(|(y, (target_row, source_row))| {
-            for (x, (target, source)) in target_row.chunks_mut(field_components).zip(source_row.chunks(field_components)).enumerate() {
-                if scales.at(region_x + x as u32, region_y + y as u32) == scale {
+        let other = filtered(scale);
+        let row = w as usize * field_components;
+        data.par_chunks_mut(row).zip(other.par_chunks(row)).enumerate().for_each(|(y, (dst, src))| {
+            for (x, (target, source)) in dst.chunks_mut(field_components).zip(src.chunks(field_components)).enumerate() {
+                if scales.at(rx0 + x as u32, ry0 + y as u32) == scale {
                     target.copy_from_slice(source);
                 }
             }
         });
     }
 
-    unpremultiply(&mut result, field_components);
-    Some(Field { x0: region_x, y0: region_y, w: width, h: height, comps: field_components, data: result, anchor_stages: Vec::new() })
+    unpremultiply(&mut data, field_components);
+    Some(Field { x0: rx0, y0: ry0, w, h, comps: field_components, data: FieldData::F32(data), marks: Vec::new(), shared: true })
 }
 
 /// The mask over a region after a generator at its own resolution and blur: `stack` is (stack below, generator ramp) per texel, sizes in texels per side.
 fn generator_region(
     generator: &Generator,
-    blend: BlendMode,
+    (blend, rules): (BlendMode, BlendRules),
     opacity: f32,
     stack: &[f32],
     cover: &[f32],
@@ -932,7 +1567,7 @@ fn generator_region(
         .map(|(texel, ramp)| {
             let below = texel.first().copied().unwrap_or(0.0);
             let generated = finish_generator(generator, *ramp);
-            below + (blend1(blend, below, generated) - below) * opacity
+            below + (rules.blended1(blend, below, generated, true) - below) * opacity
         })
         .collect()
 }
@@ -1027,11 +1662,12 @@ fn unpremultiply(data: &mut [f32], comps: usize) {
 /// (and anchors) below it. Cheap when no layer has a blur or sharpen.
 pub fn neighbourhood_fields(inp: &Inputs, channels: &[Channel], tiles: &[(u32, u32)]) -> Fields {
     let stack = inp.project.texture_set(inp.ts).map(|s| s.stack.as_slice()).unwrap_or_default();
-    fields_of(inp, channels, stack, tiles)
+    fields_of(inp, channels, stack, tiles, None)
 }
 
-/// [`neighbourhood_fields`] of the layers drawn by `list` only.
-fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32, u32)]) -> Fields {
+/// [`neighbourhood_fields`] of the layers drawn by `list` only. `cache` (only for the whole stack: a field of a list
+/// holding part of it reads fewer fields below) keeps the fields that cover the whole set (see [`FieldCache`]).
+fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32, u32)], mut cache: Option<&mut FieldCache>) -> Fields {
     let mut out = Fields::new();
     if tiles.is_empty() || inp.gbuf.width == 0 {
         return out;
@@ -1041,12 +1677,13 @@ fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32
     let mut order = Vec::new();
     draw_order(inp.project, list, 0, &mut order);
     prepare_curvature_sizes(inp, &order);
+    prepare_graphs(inp, channels, &order);
 
     for id in order {
         let Some(layer) = inp.project.content_layer(id) else { continue };
 
         if let Some(mask) = layer_mask(inp.project, id).filter(|mask| mask.enabled && neighbourhood(&mask.effects, working_width).is_some())
-            && let Some(filtered) = field(inp, channels, &out, id, Job::Mask(mask), tiles)
+            && let Some(filtered) = field(inp, channels, &out, id, Job::Mask(mask), tiles, cache.as_deref_mut())
         {
             out.insert(FieldKey::Mask(id), filtered);
         }
@@ -1056,13 +1693,51 @@ fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32
         }
 
         for channel in channels.iter().filter(|channel| layer.channels.contains_key(channel)) {
-            if let Some(filtered) = field(inp, channels, &out, id, Job::Content(*channel), tiles) {
+            if let Some(filtered) = field(inp, channels, &out, id, Job::Content(*channel), tiles, cache.as_deref_mut()) {
                 out.insert(FieldKey::Content(id, *channel), filtered);
             }
         }
     }
 
     out
+}
+
+/// Cook the graphs of `layers` that read nothing of the stack, once, before tiles composite in parallel (the tiles then
+/// find them; renders run on the graph runtime's own pool).
+fn prepare_graphs(inp: &Inputs, channels: &[Channel], layers: &[LayerId]) {
+    for id in layers {
+        let (Some(own), Some(layer)) = (inp.project.layers.get(id), inp.project.content_layer(*id)) else { continue };
+        if !own.visible {
+            continue;
+        }
+        let used: Vec<Channel> = channels.iter().copied().filter(|c| layer.channels.contains_key(c)).collect();
+        if let LayerKind::Fill(f) = &layer.kind {
+            for c in &used {
+                if let Some(g) = f.sources.get(c).and_then(Source::graph) {
+                    inp.static_cook(layer.id, Some(*c), g);
+                }
+            }
+        }
+        if let Some(mask) = layer_mask(inp.project, *id).filter(|m| m.enabled) {
+            for e in mask.effects.iter().filter(|e| e.visible) {
+                for g in e.kind.graphs() {
+                    inp.static_cook(e.id, None, g);
+                }
+            }
+        }
+        for e in layer.content_effects.iter().filter(|e| e.visible) {
+            for c in &used {
+                let g = match &e.kind {
+                    EffectKind::Graph { graph, .. } => Some(graph),
+                    EffectKind::Material(f) => f.sources.get(c).and_then(Source::graph),
+                    _ => None,
+                };
+                if let Some(g) = g {
+                    inp.static_cook(e.id, Some(*c), g);
+                }
+            }
+        }
+    }
 }
 
 /// Build the curvature detail sizes every visible generator of `layers` reads, once, before tiles composite in parallel.
@@ -1096,8 +1771,32 @@ struct Node<'a> {
     /// The node or one of its children records an anchor.
     has_anchor: bool,
     height_mask: HeightMask,
-    /// Geometry mask: whether the layer shows on each mesh submesh (None: everywhere).
-    parts: Option<Vec<bool>>,
+    /// Geometry mask (None: everywhere).
+    geometry: Option<Geometry>,
+}
+
+/// A layer's geometry mask planned for the texture set.
+enum Geometry {
+    /// Whether the layer shows on each mesh submesh.
+    Parts(Vec<bool>),
+    /// Whether the layer shows on each atlas block (`cols` across, `block` texels each), row by row. A set without
+    /// UV tiles is one block, tile 1001.
+    Tiles { cols: u32, rows: u32, block: (u32, u32), allowed: Vec<bool> },
+}
+
+impl Geometry {
+    fn of(inp: &Inputs, mask: &GeometryMask) -> Geometry {
+        match mask {
+            GeometryMask::Parts(names) => Geometry::Parts(inp.mesh.submeshes.iter().map(|s| names.contains(&s.name)).collect()),
+            GeometryMask::UvTiles(tiles) => {
+                let grid = inp.tile_grid();
+                let (cols, rows) = grid.map_or((1, 1), |g| (g.cols.max(1), g.rows.max(1)));
+                let allowed =
+                    (0..rows).flat_map(|by| (0..cols).map(move |bx| (bx, by))).map(|(bx, by)| tiles.contains(&grid.map_or(1001, |g| g.udim(bx, by)))).collect();
+                Geometry::Tiles { cols, rows, block: ((inp.gbuf.width / cols).max(1), (inp.gbuf.height / rows).max(1)), allowed }
+            }
+        }
+    }
 }
 
 /// Plans of the visible effects of a stack: mask effects (`channel` None) or the content
@@ -1115,6 +1814,12 @@ fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tile_x: u32, tile_y
                 EffectKind::Generator(Generator { detail: Some(detail), .. }) => CurvatureSizes::of(inp, &detail.blurred_sizes_in_use()),
                 _ => None,
             };
+            let graph = match &effect.kind {
+                EffectKind::Graph { graph, .. } => inp.static_cook(effect.id, channel, graph),
+                EffectKind::Fill { source: Source::Graph(g), .. } => inp.static_cook(effect.id, None, g),
+                EffectKind::Material(f) => channel.and_then(|c| f.sources.get(&c)).and_then(Source::graph).and_then(|g| inp.static_cook(effect.id, channel, g)),
+                _ => None,
+            };
             EffectPlan {
                 id: effect.id,
                 kind: &effect.kind,
@@ -1123,7 +1828,8 @@ fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tile_x: u32, tile_y
                 data: if effect.kind.painted() { tile_of(inp, image, tile_x, tile_y, channel) } else { None },
                 preview: previews(inp, target),
                 curvature_sizes,
-                filtered_mask: None,
+                graph,
+                acts: channel.is_none_or(|c| effect.acts_on(c)),
             }
         })
         .collect()
@@ -1158,13 +1864,9 @@ fn mask_plan<'a>(inp: &Inputs<'a>, id: LayerId, mask: &'a Mask, tx: u32, ty: u32
     }
 
     let background = if mask.background == MaskBackground::White { 1.0 } else { 0.0 };
-    let mut effects = effect_plans(inp, &mask.effects, tx, ty, None);
-    let filtered = fields.and_then(|fields| fields.get(&FieldKey::Mask(id)));
-    for effect in &mut effects {
-        effect.filtered_mask = filtered.and_then(|field| field.anchor_stages.iter().find(|(id, _)| *id == effect.id).map(|(_, field)| field));
-    }
-
-    let start = filtered.and_then(|field| neighbourhood(&mask.effects, inp.gbuf.width).map(|(index, _, _)| (index, field)));
+    let effects = effect_plans(inp, &mask.effects, tx, ty, None);
+    let start =
+        fields.and_then(|f| f.get(&FieldKey::Mask(id))).and_then(|field| neighbourhood(&mask.effects, inp.gbuf.width).map(|(k, _, _)| (k, field.as_ref())));
     Some(MaskPlan { background, effects, start })
 }
 
@@ -1192,15 +1894,21 @@ fn plan_node<'a>(
 
     // Instances draw their source's content (a missing source draws nothing)
     let layer: &'a Layer = inp.project.content_layer(id)?;
-    if !own.visible {
+    // A layer holding anchor points (in its content or its mask) is always planned, to record them for the layers
+    // reading them; it draws only when visible and blending something. The original evaluates them whatever the
+    // layer's visibility (Trimmsheet: a height fill reads the masks of three hidden layers), and an imported anchor
+    // layer often blends no channel at all (an empty fill holding only the anchor point: MORA, Roads3, 12324).
+    let anchors_only = !own.visible;
+    let holds = holds_anchor(inp.project, id, depth);
+    if anchors_only && !(holds && inp.project.rules.blend.is_measured()) {
         return None;
     }
 
     let paint = matches!(layer.kind, LayerKind::Paint);
     let fx = !layer.is_group() && layer.content_effects.iter().any(|e| e.visible);
-    let fx_start = if fx { neighbourhood(&layer.content_effects, inp.gbuf.width).map(|n| n.0) } else { None };
     let chans = channels
         .iter()
+        .filter(|_| !anchors_only)
         .filter_map(|c| {
             let b = layer.blend(*c)?;
             if b.mode == BlendMode::Disable || b.opacity <= 0.0 {
@@ -1209,8 +1917,27 @@ fn plan_node<'a>(
 
             let data = if paint { tile_of(inp, inp.pixels.layer(layer.id, *c), tx, ty, Some(*c)) } else { None };
             let effects = if fx { effect_plans(inp, &layer.content_effects, tx, ty, Some(*c)) } else { Vec::new() };
-            let start = fx_start.zip(fields.and_then(|f| f.get(&FieldKey::Content(id, *c))));
-            Some(ChanPlan { ch: c.index(), kind: c.kind(), comps: c.components(), blend: b.mode, opacity: b.opacity.clamp(0.0, 1.0), data, effects, start })
+            let start = fields
+                .and_then(|fields| fields.get(&FieldKey::Content(id, *c)))
+                .and_then(|field| neighbourhood_filters(&layer.content_effects, inp.gbuf.width, Some(*c)).last().map(|(index, ..)| (index, field.as_ref())));
+            let graph = match &layer.kind {
+                LayerKind::Fill(f) => f.sources.get(c).and_then(Source::graph).and_then(|g| inp.static_cook(layer.id, Some(*c), g)),
+                _ => None,
+            };
+            Some(ChanPlan {
+                ch: c.index(),
+                kind: c.kind(),
+                comps: c.components(),
+                blend: b.mode,
+                opacity: b.opacity.clamp(0.0, 1.0),
+                data,
+                effects,
+                start,
+                graph,
+                from_below: starts_from_below(layer, *c),
+                rules: inp.project.rules.blend,
+                unit: stores_unit(inp, *c),
+            })
         })
         .collect::<Vec<_>>();
     let content = match &layer.kind {
@@ -1221,29 +1948,24 @@ fn plan_node<'a>(
         // `content_layer` already followed instance links
         LayerKind::Instance { .. } => return None,
     };
-    let mask = layer_mask(inp.project, id).and_then(|m| mask_plan(inp, id, m, tx, ty, fields));
-
-    // Anchors in the mask record even where the layer draws nothing
-    let mask_anchor = mask.as_ref().is_some_and(|m| m.effects.iter().any(|e| matches!(e.kind, EffectKind::Anchor)));
-
-    // An empty paint layer still matters if its mask records an anchor
-    if let Content::Paint { preview: false } = content
+    let anchors = if fx { anchor_cuts(&layer.content_effects) } else { Vec::new() };
+    // A paint layer with nothing painted (and not being painted) or added by its content
+    // effects contributes nothing; a layer blending none of the channels neither (unless it holds anchors, above).
+    if !holds
+        && let Content::Paint { preview: false } = content
         && chans.iter().all(|c| c.data.is_none() && c.effects.is_empty())
-        && !mask_anchor
     {
         return None;
     }
-
-    if chans.is_empty() && !mask_anchor {
+    if chans.is_empty() && !holds {
         return None;
     }
-
-    let anchors = if fx { anchor_cuts(&layer.content_effects) } else { Vec::new() };
+    let mask = layer_mask(inp.project, id).and_then(|m| mask_plan(inp, id, m, tx, ty, fields));
+    let mask_anchor = layer_mask(inp.project, id).is_some_and(|m| m.enabled && mask_anchors(m).next().is_some());
     let has_anchor = !anchors.is_empty() || mask_anchor || matches!(&content, Content::Group(nodes) if nodes.iter().any(|n| n.has_anchor));
-
-    // The geometry mask is the layer's own (an instance in another set has other parts)
-    let parts = own.geometry_mask.as_ref().map(|names| inp.mesh.submeshes.iter().map(|s| names.contains(&s.name)).collect());
-    Some(Node { id, content, chans, mask, anchors, has_anchor, height_mask: layer.height_mask, parts })
+    // The geometry mask is the layer's own (an instance in another set has other parts).
+    let geometry = own.geometry_mask.as_ref().map(|g| Geometry::of(inp, g));
+    Some(Node { id, content, chans, mask, anchors, has_anchor, height_mask: layer.height_mask, geometry })
 }
 
 /// The visible anchor points of a content stack with where they cut it: after their index among
@@ -1283,12 +2005,29 @@ fn blend_chan(c: &ChanPlan, mode: BlendMode, a: [f32; 3], b: [f32; 3]) -> [f32; 
     if c.comps == 3 { blend3(mode, a, b) } else { [blend1(mode, a[0], b[0]); 3] }
 }
 
+/// True if set channel `c` stores 0..1: not a float format, and not the signed height (stored as −1..1, which the
+/// measured clamp to 0..1 would cut in half).
+fn stores_unit(inp: &Inputs, c: Channel) -> bool {
+    use texturecraft_core::ChannelFormat as F;
+    if c.kind() == ChannelKind::Signed {
+        return false;
+    }
+    let format = inp.project.texture_set(inp.ts).ok().and_then(|s| s.channels.iter().find(|(ch, _)| *ch == c).map(|(_, f)| *f));
+    !matches!(format.unwrap_or_else(|| F::default_for(c)), F::L16F | F::Rgb16F | F::L32F | F::Rgb32F)
+}
+
 /// Lay value `p` with weight `a` over a straight value and coverage (premultiplied "over").
 fn over(c: &ChanPlan, mode: BlendMode, v: [f32; 3], cov: f32, p: [f32; 3], a: f32) -> ([f32; 3], f32) {
+    over_comps(c.comps, c.rules, c.unit, mode, v, cov, p, a)
+}
+
+/// [`over`] for a channel of `comps` components under `rules` (`unit`: the channel stores 0..1).
+#[allow(clippy::too_many_arguments)]
+fn over_comps(comps: usize, rules: BlendRules, unit: bool, mode: BlendMode, v: [f32; 3], cov: f32, p: [f32; 3], a: f32) -> ([f32; 3], f32) {
     if a <= 0.0 {
         return (v, cov);
     }
-    let b = if cov > 0.0 { blend_chan(c, mode, v, p) } else { p };
+    let b = if cov > 0.0 { if comps == 3 { rules.blended3(mode, v, p, unit) } else { [rules.blended1(mode, v[0], p[0], unit); 3] } } else { p };
     let nc = a + cov * (1.0 - a);
     (mix3(v, b, a / nc.max(1e-5)), nc)
 }
@@ -1312,6 +2051,8 @@ struct Texel<'a, 'b> {
     anchors: Vec<(LayerId, Acc, bool)>,
     /// Where `eval` takes layer masks and content from.
     tape: Tape<'b>,
+    /// The taps of the placed projection last asked for at this texel, by its address.
+    placed: Option<(usize, Taps)>,
 }
 
 /// What a layer contributes (its mask, its content value and coverage per channel): evaluated
@@ -1344,7 +2085,7 @@ impl<'t> Tape<'t> {
 
 impl<'a, 'b> Texel<'a, 'b> {
     fn new(inp: &'b Inputs<'a>, x: u32, y: u32, o: usize, stroke: f32) -> Self {
-        Texel { inp, x, y, o, res: inp.gbuf.width, coords: None, stroke, stop: None, anchors: Vec::new(), tape: Tape::Off }
+        Texel { inp, x, y, o, res: inp.gbuf.width, coords: None, stroke, stop: None, anchors: Vec::new(), tape: Tape::Off, placed: None }
     }
 
     /// Run `f` with `tape` as this texel's tape.
@@ -1368,7 +2109,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     }
 
     /// [`Texel::content`] through the tape: the coverage (0 where empty), then the value.
-    fn tape_content(&mut self, content: &Content, c: &ChanPlan) -> Option<([f32; 3], f32)> {
+    fn tape_content(&mut self, content: &Content, c: &ChanPlan, below: Option<([f32; 3], f32)>) -> Option<([f32; 3], f32)> {
         if let Tape::Replay(..) = self.tape {
             let cov = self.tape.next();
             // Recorded as 0 where empty.
@@ -1378,7 +2119,7 @@ impl<'a, 'b> Texel<'a, 'b> {
             let v = if c.comps == 3 { [self.tape.next(), self.tape.next(), self.tape.next()] } else { [self.tape.next(); 3] };
             return Some((v, cov));
         }
-        let r = self.content(content, c);
+        let r = self.content_over(content, c, usize::MAX, below);
         if let Tape::Record(t) = &mut self.tape {
             match r {
                 Some((v, cov)) => {
@@ -1447,8 +2188,10 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// How much a fill projected by `proj` covers this texel: 1, or for a decal its frame
     /// coverage times the alpha of its first image source.
     fn cover<'s>(&mut self, mut sources: impl Iterator<Item = &'s Source>, proj: &Projection) -> f32 {
-        if !matches!(proj, Projection::Decal(_)) {
-            return 1.0;
+        match proj {
+            Projection::Decal(_) => {}
+            Projection::Placed(p) => return self.placed_cover(p),
+            _ => return 1.0,
         }
         let (c, _, w) = self.projected(proj);
         let image = sources.find_map(|s| match s {
@@ -1470,9 +2213,202 @@ impl<'a, 'b> Texel<'a, 'b> {
         self.anchors.iter().rev().find(|(id, ..)| *id == anchor).is_some_and(|(_, _, mask)| *mask)
     }
 
-    /// The value `source` gives this texel through `projection`, read as a channel of `kind`
-    fn source(&mut self, source: &Source, projection: &Projection, kind: ChannelKind) -> [f32; 3] {
+    /// Output `output` of a cook sampled through `projection`, as the graph holds it (RGBA); None without it
+    fn graph_sample(&mut self, cooked: Option<&Cooked>, output: Option<&str>, projection: &Projection, unfiltered: bool) -> Option<[f32; 4]> {
+        if let Projection::Placed(p) = projection {
+            return self.placed_graph(cooked?, output, p, unfiltered);
+        }
+        let image = cooked?.output(output)?;
+        // Laid on 1:1: the very texel (the render covers the texture set; interpolated mesh UVs would blur it at island
+        // edges and seams)
+        if matches!(projection, Projection::Uv { scale, rotation, offset } if *scale == [1.0, 1.0] && *rotation == 0.0 && *offset == [0.0, 0.0]) {
+            return Some(graphs::at_texel(image, self.x, self.y, (self.inp.gbuf.width, self.inp.gbuf.height)));
+        }
+        let (coords, projection, _) = self.projected(projection);
+        let footprint = if unfiltered { 0.0 } else { self.footprint(projection) };
+        let cooked = cooked?;
+        let mut sum = [0.0f32; 4];
+        for (uv, weight) in
+            image_samples_with_rules(projection, &coords, self.inp.project.rules.blend.is_measured()).into_iter().filter(|(_, weight)| *weight > 0.0)
+        {
+            let value = cooked.sample_filtered(output, uv.x, uv.y, footprint).unwrap_or_else(|| graphs::sample(image, uv.x, uv.y));
+            for (total, value) in sum.iter_mut().zip(value) {
+                *total += value * weight;
+            }
+        }
+        Some(sum)
+    }
+
+    /// The size of this texel in the image coordinates `projection` reads ([`image_samples_with_rules`]): the UV tiling over the
+    /// texels across a UV tile, or a volume projection's scale times the texel's size in projection space (from its
+    /// triangle's area on the surface and in UV); 0 where it is not known (a texel off the mesh, the other projections).
+    fn footprint(&mut self, projection: &Projection) -> f32 {
+        let volume = match projection {
+            Projection::Uv { scale, .. } => return scale[0].abs().max(scale[1].abs()) / self.inp.tile_res().max(1) as f32,
+            Projection::Triplanar { scale, .. } => *scale,
+            Projection::Planar { scale, .. } => 0.5 * *scale,
+            // placed projections filter per tap (`placed_graph`)
+            _ => return 0.0,
+        };
+        let g = self.inp.gbuf;
+        let Some(&t) = g.tri.get((self.y * g.width + self.x) as usize) else { return 0.0 };
+        let Some([a, b, c]) = self.inp.mesh.tri(t as usize) else { return 0.0 };
+        let m = self.inp.mesh;
+        let (Some(pa), Some(pb), Some(pc), Some(ta), Some(tb), Some(tc)) =
+            (m.positions.get(a), m.positions.get(b), m.positions.get(c), m.uvs.get(a), m.uvs.get(b), m.uvs.get(c))
+        else {
+            return 0.0;
+        };
+        let (lo, hi) = self.inp.bounds;
+        let r = ((hi - lo).length() * 0.5).max(1e-4);
+        let surface = (*pb - *pa).cross(*pc - *pa).length() / (r * r);
+        let uv = (*tb - *ta).perp_dot(*tc - *ta).abs();
+        let len = (surface / uv).sqrt() / g.width.max(1) as f32;
+        let f = volume.abs() * len;
+        if f.is_finite() { f } else { 0.0 }
+    }
+
+    /// Where placed projection `p` samples this texel (computed once per texel and projection).
+    fn placed_taps(&mut self, p: &PlacedProjection) -> Taps {
+        let key = std::ptr::from_ref(p) as usize;
+        if let Some((k, taps)) = self.placed
+            && k == key
+        {
+            return taps;
+        }
+        let taps = placed::taps(p, self.inp.bounds, &self.placed_point());
+        self.placed = Some((key, taps));
+        taps
+    }
+
+    /// What a placed projection needs of this texel: its UVs, surface point and normal, its two axes on the surface.
+    fn placed_point(&mut self) -> placed::Point {
+        let uv = self.coords().uv;
+        let texel_len = 1.0 / self.inp.tile_res().max(1) as f32;
+        let i = (self.y * self.inp.gbuf.width + self.x) as usize;
+        let Some(s) = self.inp.gbuf.surface(self.inp.mesh, i) else {
+            return placed::Point { uv, nrm: Vec3::Y, texel_len, ..placed::Point::default() };
+        };
+        let (axes, world_len) = self.texel_axes().unwrap_or(([Vec3::ZERO; 2], 0.0));
+        placed::Point { uv, pos: s.pos, nrm: s.nrm, axes, world_len, texel_len }
+    }
+
+    /// The world displacement of one texel step along x and along y on this texel's triangle (the surface's
+    /// derivatives over its UVs), and the texel's isotropic size there; None off the mesh or on a degenerate triangle.
+    fn texel_axes(&self) -> Option<([Vec3; 2], f32)> {
+        let g = self.inp.gbuf;
+        let m = self.inp.mesh;
+        let &t = g.tri.get((self.y * g.width + self.x) as usize)?;
+        let [a, b, c] = m.tri(t as usize)?;
+        let (pa, pb, pc) = (*m.positions.get(a)?, *m.positions.get(b)?, *m.positions.get(c)?);
+        let (ta, tb, tc) = (*m.uvs.get(a)?, *m.uvs.get(b)?, *m.uvs.get(c)?);
+        let (e1, e2, d1, d2) = (pb - pa, pc - pa, tb - ta, tc - ta);
+        let det = d1.x * d2.y - d2.x * d1.y;
+        if !det.is_finite() || det.abs() < 1e-14 {
+            return None;
+        }
+        let (w, h) = (g.width.max(1) as f32, g.height.max(1) as f32);
+        let du = (e1 * d2.y - e2 * d1.y) / det;
+        let dv = (e2 * d1.x - e1 * d2.x) / det;
+        let len = (e1.cross(e2).length() / det.abs()).sqrt() / w;
+        let axes = [du / w, dv / h];
+        (axes.iter().all(|a| a.is_finite()) && len.is_finite()).then_some((axes, len))
+    }
+
+    /// How much placed projection `p` covers this texel: its coverage (clip, falloffs) times the share of its taps on
+    /// the image (a tap outside a non-repeating image covers nothing).
+    fn placed_cover(&mut self, p: &PlacedProjection) -> f32 {
+        let taps = self.placed_taps(p);
+        let axes = p.sampling_repeat().axes();
+        let on: f32 = taps.used().iter().filter(|t| placed::covered(t.uv, axes)).map(|t| t.weight).sum();
+        let c = taps.coverage * on;
+        if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 }
+    }
+
+    /// [`Self::placed_cover`] for a placed projection, 1 for the others (a graph laid on through `projection`).
+    fn projection_cover(&mut self, projection: &Projection) -> f32 {
+        match projection {
+            Projection::Placed(p) => self.placed_cover(p),
+            _ => 1.0,
+        }
+    }
+
+    /// The taps of `p` read through `read` (a value at an image coordinate with a footprint, `None` outside), each
+    /// weighted; the taps without a value are left out (their coverage is in [`Self::placed_cover`]).
+    fn placed_read(&mut self, p: &PlacedProjection, mut read: impl FnMut(&placed::Tap) -> Option<[f32; 4]>) -> [f32; 4] {
+        let taps = self.placed_taps(p);
+        let (mut sum, mut total) = ([0.0f32; 4], 0.0f32);
+        for tap in taps.used().iter().filter(|t| t.weight > 0.0) {
+            if let Some(v) = read(tap) {
+                for (s, v) in sum.iter_mut().zip(v) {
+                    *s += v * tap.weight;
+                }
+                total += tap.weight;
+            }
+        }
+        if total > 0.0 { sum.map(|s| s / total) } else { [0.0; 4] }
+    }
+
+    /// Output `output` of a cook through placed projection `p`: each tap prefiltered by its own footprint and probes
+    /// (`unfiltered`: one bilinear read).
+    fn placed_graph(&mut self, cooked: &Cooked, output: Option<&str>, p: &PlacedProjection, unfiltered: bool) -> Option<[f32; 4]> {
+        let image = cooked.output(output)?;
+        let side = image.width().max(image.height());
+        let wrap = p.sampling_repeat().axes();
+        Some(self.placed_read(p, |tap| placed::filtered(tap, side, unfiltered, |uv, footprint| cooked.sample_wrapped(output, uv.x, uv.y, footprint, wrap))))
+    }
+
+    /// An image through placed projection `p` (bilinear per tap).
+    fn placed_image(&mut self, p: &PlacedProjection, image: &crate::store::ImageRes) -> [f32; 4] {
+        let wrap = p.sampling_repeat().axes();
+        self.placed_read(p, |tap| image.sample_wrapped(tap.uv.x, tap.uv.y, wrap))
+    }
+
+    /// The coverage of a fill source: 1, or a graph source's alpha output. A source reading its alpha output itself (a
+    /// material's opacity output on the opacity channel) is laid whole: its value is the coverage, not gated by itself
+    /// (the reference app's cut-out leaves show the material's opacity, not opacity² over the channel's default).
+    fn source_alpha(&mut self, source: Option<&Source>, cooked: Option<&Cooked>, projection: &Projection) -> f32 {
         match source {
+            Some(Source::Graph(graph)) if graph.alpha_output.is_some() && graph.output != graph.alpha_output => self
+                .graph_sample(cooked, graph.alpha_output.as_deref(), projection, graph.unfiltered)
+                .map_or(1.0, |alpha| if alpha[0].is_finite() { alpha[0].clamp(0.0, 1.0) } else { 0.0 }),
+            _ => 1.0,
+        }
+    }
+
+    /// A layer content source's coverage: [`Self::source_alpha`], and an image's own alpha (a fill laid with a
+    /// partly transparent image covers only where the image is opaque; a decal's comes through [`Self::cover`]). Masks
+    /// read images by their value alone.
+    fn content_alpha(&mut self, source: Option<&Source>, cooked: Option<&Cooked>, projection: &Projection) -> f32 {
+        match source {
+            Some(Source::Image { name, .. })
+                if matches!(projection, Projection::Placed(_)) || self.inp.project.rules.blend.is_measured() && !matches!(projection, Projection::Decal(_)) =>
+            {
+                let Some(image) = self.inp.images.get(name) else { return 1.0 };
+                if let Projection::Placed(p) = projection {
+                    let alpha = self.placed_image(p, image)[3];
+                    return if alpha.is_finite() { alpha.clamp(0.0, 1.0) } else { 0.0 };
+                }
+                let (coords, projection, _) = self.projected(projection);
+                let alpha: f32 = image_samples_with_rules(projection, &coords, self.inp.project.rules.blend.is_measured())
+                    .into_iter()
+                    .filter(|(_, weight)| *weight > 0.0)
+                    .map(|(uv, weight)| image.sample(uv.x, uv.y)[3] * weight)
+                    .sum();
+                if alpha.is_finite() { alpha.clamp(0.0, 1.0) } else { 0.0 }
+            }
+            _ => self.source_alpha(source, cooked, projection),
+        }
+    }
+
+    /// The value `source` gives this texel through `projection`, read as a channel of `kind` (`cooked` holds a graph source's outputs)
+    fn source(&mut self, source: &Source, projection: &Projection, kind: ChannelKind, cooked: Option<&Cooked>) -> [f32; 3] {
+        match source {
+            Source::Graph(graph) => match self.graph_sample(cooked, graph.output.as_deref(), projection, graph.unfiltered) {
+                Some(value) => graphs::graph_to_channel(kind, value, cooked.is_some_and(|c| c.is_linear(graph.output.as_deref()))),
+                // Not rendered (the reason is in the graph store's problems)
+                None => [0.5; 3],
+            },
             Source::Uniform(value) => *value,
 
             Source::Anchor { anchor, channel, ramp } if kind == ChannelKind::Color && !ramp.is_empty() => {
@@ -1492,7 +2428,12 @@ impl<'a, 'b> Texel<'a, 'b> {
                 } else {
                     None
                 };
-                let amount = procedural_in(pattern, projection, &coords, &PatternContext { pixels, images: Some(self.inp.images) });
+                let context = PatternContext { pixels, images: Some(self.inp.images) };
+                let amount = if let Projection::Placed(p) = projection {
+                    self.placed_read(p, |tap| Some([procedural_in(pattern, projection, &Coords { uv: tap.uv, ..coords }, &context); 4]))[0]
+                } else {
+                    procedural_in(pattern, projection, &coords, &context)
+                };
 
                 if kind == ChannelKind::Color && !ramp.is_empty() {
                     texturecraft_core::gradient(ramp, amount).unwrap_or_default()
@@ -1503,13 +2444,22 @@ impl<'a, 'b> Texel<'a, 'b> {
             Source::Image { name, normal_format } => {
                 let Some(image) = self.inp.images.get(name) else { return [0.5; 3] };
 
-                let (coords, projection, _) = self.projected(projection);
-                let mut sum = [0.0f32; 4];
-                for (uv, weight) in image_samples(projection, &coords).into_iter().filter(|(_, weight)| *weight > 0.0) {
-                    for (total, value) in sum.iter_mut().zip(image.sample(uv.x, uv.y)) {
-                        *total += value * weight;
+                let sum = match projection {
+                    Projection::Placed(p) => self.placed_image(p, image),
+                    _ => {
+                        let (coords, projection, _) = self.projected(projection);
+                        let mut sum = [0.0f32; 4];
+                        for (uv, weight) in image_samples_with_rules(projection, &coords, self.inp.project.rules.blend.is_measured())
+                            .into_iter()
+                            .filter(|(_, weight)| *weight > 0.0)
+                        {
+                            for (total, value) in sum.iter_mut().zip(image.sample(uv.x, uv.y)) {
+                                *total += value * weight;
+                            }
+                        }
+                        sum
                     }
-                }
+                };
 
                 let rgb = [sum[0], sum[1], sum[2]];
                 match kind {
@@ -1517,8 +2467,7 @@ impl<'a, 'b> Texel<'a, 'b> {
 
                     // Normal channels are OpenGL (+Y up the image): a DirectX image's green flips
                     ChannelKind::NormalMap if *normal_format == NormalFormat::DirectX => [rgb[0], 1.0 - rgb[1], rgb[2]],
-                    ChannelKind::Color | ChannelKind::NormalMap => rgb,
-
+                    ChannelKind::Color | ChannelKind::NormalMap | ChannelKind::Data => rgb,
                     // A one-value channel or mask reads the image's gray, so a color image works as a mask
                     ChannelKind::Scalar => [lum(rgb); 3],
                     ChannelKind::Signed => [lum(rgb) * 2.0 - 1.0; 3],
@@ -1533,7 +2482,8 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// channel default.
     fn anchor_value(&self, anchor: LayerId, channel: Channel, kind: ChannelKind) -> [f32; 3] {
         let value = self.anchored(anchor, channel);
-        let needs_gray = matches!(channel.kind(), ChannelKind::Color | ChannelKind::NormalMap) && matches!(kind, ChannelKind::Scalar | ChannelKind::Signed);
+        let needs_gray = matches!(channel.kind(), ChannelKind::Color | ChannelKind::NormalMap | ChannelKind::Data)
+            && matches!(kind, ChannelKind::Scalar | ChannelKind::Signed);
         if needs_gray { [lum(value); 3] } else { value }
     }
 
@@ -1602,7 +2552,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// Generator input `map` at this texel: what replaces the mesh map in the generator's inputs, else the mesh map (None when not baked).
     fn generator_input(&mut self, generator: &Generator, map: BakedMap) -> Option<f32> {
         match generator.inputs.get(&map) {
-            Some(source) => Some(self.source(source, &Projection::default(), ChannelKind::Scalar)[0]),
+            Some(source) => Some(self.source(source, &Projection::default(), ChannelKind::Scalar, None)[0]),
             None => self.baked(map),
         }
     }
@@ -1649,30 +2599,20 @@ impl<'a, 'b> Texel<'a, 'b> {
         let mut value = plan.background;
         let mut skip = 0;
         if let Some((filtered_index, field)) = plan.start
-            && let Some(filtered) = field.get(self.x, self.y).and_then(|texel| texel.first().copied())
+            && let Some([filtered, ..]) = field.get(self.x, self.y)
         {
             value = filtered;
             skip = filtered_index + 1;
+            for (anchor, recorded) in field.marks_at(self.x, self.y) {
+                self.anchors.push((anchor, Acc::uniform(recorded), true));
+            }
         }
 
-        // Replay the prefix to record anchors skipped by the precomputed filter
-        if let Some(last) = plan.effects.iter().take(skip).rposition(|e| matches!(e.kind, EffectKind::Anchor)) {
-            self.mask_effects(plan, plan.background, 0, last + 1);
-        }
-        self.mask_effects(plan, value, skip, plan.effects.len())
-    }
-
-    /// Mask effects `from..to` of `plan` over `value`, recording the anchors among them.
-    fn mask_effects(&mut self, plan: &MaskPlan, mut value: f32, from: usize, to: usize) -> f32 {
+        let rules = self.inp.project.rules.blend;
         // Avoid amplifying rounding error when unpremultiplying faint paint
         const MIN_PAINT_COVERAGE: f32 = 1e-5;
 
-        for effect in plan.effects.iter().take(to).skip(from) {
-            if let Some(filtered) = effect.filtered_mask.and_then(|field| field.get(self.x, self.y)).and_then(|texel| texel.first()) {
-                value = *filtered;
-                continue;
-            }
-
+        for effect in plan.effects.iter().skip(skip) {
             let opacity = effect.opacity.clamp(0.0, 1.0);
             match effect.kind {
                 EffectKind::Paint | EffectKind::Path(_) => {
@@ -1696,16 +2636,18 @@ impl<'a, 'b> Texel<'a, 'b> {
                     }
                     if coverage > 0.0 {
                         let layer_value = painted / coverage.max(MIN_PAINT_COVERAGE);
-                        value += (blend1(effect.blend, value, layer_value) - value) * coverage * opacity;
+                        value += (rules.blended1(effect.blend, value, layer_value, true) - value) * coverage * opacity;
                     }
                 }
                 EffectKind::Fill { source, projection } => {
-                    let fill = self.source(source, projection, ChannelKind::Scalar)[0];
-                    value += (blend1(effect.blend, value, fill) - value) * opacity * self.cover(std::iter::once(source), projection);
+                    let cooked = effect.graph.as_deref();
+                    let fill = self.source(source, projection, ChannelKind::Scalar, cooked)[0];
+                    let cover = self.cover(std::iter::once(source), projection) * self.source_alpha(Some(source), cooked, projection);
+                    value += (rules.blended1(effect.blend, value, fill, true) - value) * opacity * cover;
                 }
                 EffectKind::Generator(generator) => {
                     let generated = self.generator(generator, effect.curvature_sizes.as_deref());
-                    value += (blend1(effect.blend, value, generated) - value) * opacity;
+                    value += (rules.blended1(effect.blend, value, generated, true) - value) * opacity;
                 }
                 EffectKind::Levels(levels) => value += (levels.apply(value) - value) * opacity,
                 EffectKind::Filter(filter) => {
@@ -1713,11 +2655,11 @@ impl<'a, 'b> Texel<'a, 'b> {
                     let filtered = filter.point(ChannelKind::Scalar, [value; 3]).map_or(value, |gray| gray[0]);
                     value += (filtered - value) * opacity;
                 }
-                EffectKind::ColorSelection { colors, tolerance } => {
-                    let id = self.baked_color(BakedMap::Id);
+                EffectKind::ColorSelection { colors, tolerance, map } => {
+                    let id = self.baked_color(*map);
                     let within = |picked: &[f32; 3], color: [f32; 3]| (0..3).all(|component| (picked[component] - color[component]).abs() <= *tolerance);
                     let selected = if id.is_some_and(|color| colors.iter().any(|picked| within(picked, color))) { 1.0 } else { 0.0 };
-                    value += (blend1(effect.blend, value, selected) - value) * opacity;
+                    value += (rules.blended1(effect.blend, value, selected, true) - value) * opacity;
                 }
                 EffectKind::Compare { op, value: compared, tolerance } => {
                     let pass = match op {
@@ -1728,12 +2670,18 @@ impl<'a, 'b> Texel<'a, 'b> {
                     let result = if pass { 1.0 } else { 0.0 };
                     value += (result - value) * opacity;
                 }
-
-                // Every channel of a mask anchor reads the mask's gray
-                EffectKind::Anchor => self.anchors.push((effect.id, [[value.clamp(0.0, 1.0); 3]; NCH], true)),
-
-                // Content-only effects
-                EffectKind::Material(_) => {}
+                // A graph reading the stack comes precomputed through `MaskPlan::start`; one that could not be rendered
+                // changes nothing
+                EffectKind::Graph { graph, projection } => {
+                    if let Some(v) = self.graph_sample(effect.graph.as_deref(), graph.output.as_deref(), projection, graph.unfiltered) {
+                        let cover = self.projection_cover(projection);
+                        value += (rules.blended1(effect.blend, value, v[0], true) - value) * opacity * cover;
+                    }
+                }
+                // An anchor point inside a mask (imported projects) records the mask so far for fills reading it
+                EffectKind::Anchor => self.anchors.push((effect.id, Acc::uniform(value.clamp(0.0, 1.0)), true)),
+                // Content-only effects; a placeholder passes the mask through unchanged
+                EffectKind::Material(_) | EffectKind::Placeholder { .. } => {}
             }
         }
         value.clamp(0.0, 1.0)
@@ -1751,8 +2699,10 @@ impl<'a, 'b> Texel<'a, 'b> {
             match &n.content {
                 // Masked-out groups still run when they record anchors or hold the stop layer
                 Content::Group(children) if m > 0.0 || n.has_anchor || self.stop.is_some() => {
-                    let mut inner = *acc;
+                    let mut inner = group_start(acc, &n.chans);
                     if self.eval(children, &mut inner) {
+                        // stopped inside: the stack below the stop layer is the folder's inner stack
+                        *acc = inner;
                         return true;
                     }
 
@@ -1763,7 +2713,8 @@ impl<'a, 'b> Texel<'a, 'b> {
                 Content::Fill(_) | Content::Paint { .. } if m > 0.0 => {
                     let before = if n.anchors.iter().any(|a| a.1.is_some()) { Some(*acc) } else { None };
                     for c in &n.chans {
-                        if let Some((v, cov)) = self.tape_content(&n.content, c) {
+                        let below = acc.below(c);
+                        if let Some((v, cov)) = self.tape_content(&n.content, c, below) {
                             apply(acc, c, v, cov, m);
                         }
                     }
@@ -1773,7 +2724,8 @@ impl<'a, 'b> Texel<'a, 'b> {
                         let rec = match (cut, before) {
                             (Some(k), Some(mut b)) => {
                                 for c in &n.chans {
-                                    if let Some((v, cov)) = self.content_to(&n.content, c, *k) {
+                                    let below = b.below(c);
+                                    if let Some((v, cov)) = self.content_over(&n.content, c, *k, below) {
                                         apply(&mut b, c, v, cov, m);
                                     }
                                 }
@@ -1855,7 +2807,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// The mask of node `n` at this texel, combined with the layer's height when it masks with
     /// height.
     fn node_mask(&mut self, n: &Node) -> f32 {
-        if n.parts.as_ref().is_some_and(|p| !self.in_parts(p)) {
+        if n.geometry.as_ref().is_some_and(|g| !self.in_geometry(g)) {
             return 0.0;
         }
         let m = match &n.mask {
@@ -1868,6 +2820,17 @@ impl<'a, 'b> Texel<'a, 'b> {
         let height = Channel::Height.index();
         let h = n.chans.iter().find(|c| c.ch == height).and_then(|c| self.content(&n.content, c)).map_or(0.0, |(v, _)| v[0]);
         n.height_mask.apply(m, h)
+    }
+
+    /// Whether this texel lies in what geometry mask `g` shows.
+    fn in_geometry(&self, g: &Geometry) -> bool {
+        match g {
+            Geometry::Parts(allowed) => self.in_parts(allowed),
+            Geometry::Tiles { cols, rows, block, allowed } => {
+                let (bx, by) = ((self.x / block.0).min(cols.saturating_sub(1)), (self.y / block.1).min(rows.saturating_sub(1)));
+                allowed.get((by * cols + bx) as usize).copied().unwrap_or(true)
+            }
+        }
     }
 
     /// Whether this texel's triangle lies in a submesh `allowed` marks (uncovered texels and
@@ -1888,12 +2851,13 @@ impl<'a, 'b> Texel<'a, 'b> {
 
     /// Record the anchors of the stack below layer `id` (`full` is the planned stack), to
     /// evaluate that layer on its own.
-    fn anchors_below(&mut self, full: &[Node], id: LayerId) {
+    fn anchors_below(&mut self, full: &[Node], id: LayerId) -> Acc {
         self.anchors.clear();
         self.stop = Some(id);
-        let mut acc = Channel::ALL.map(Channel::default_value);
+        let mut acc = Acc::defaults();
         self.eval(full, &mut acc);
         self.stop = None;
+        acc
     }
 
     /// Straight value and coverage of one channel of a paint or fill layer at this texel
@@ -1904,27 +2868,43 @@ impl<'a, 'b> Texel<'a, 'b> {
 
     /// [`Texel::content`] with only the first `end` visible content effects.
     fn content_to(&mut self, content: &Content, c: &ChanPlan, end: usize) -> Option<([f32; 3], f32)> {
+        self.content_over(content, c, end, None)
+    }
+
+    /// [`Texel::content_to`] starting from `below` when given (an effect layer's channel: the stack below it, shown
+    /// value and coverage, with the layer's own paint or fill laid over it before its effects). TextureCraft's own
+    /// rules take the stack as fully covered; the measured rules keep its coverage, so over nothing an effect layer
+    /// filters nothing and adds only its own paint or fill. A precomputed field already holds it.
+    fn content_over(&mut self, content: &Content, c: &ChanPlan, end: usize, below: Option<([f32; 3], f32)>) -> Option<([f32; 3], f32)> {
         let start = c.start.filter(|(k, _)| *k < end);
         let (mut v, mut cov, skip) = match start.and_then(|(k, f)| f.get(self.x, self.y).map(|d| (k, d))) {
-            Some((k, d)) => {
-                let px = |i: usize| d.get(i).copied().unwrap_or(0.0);
-                ([px(0), px(1), px(2)], px(3), k + 1)
-            }
+            Some((k, d)) => ([d[0], d[1], d[2]], d[3], k + 1),
             None => {
                 let (v, cov) = match content {
                     Content::Fill(f) => {
                         let ch = Channel::ALL.get(c.ch).copied()?;
                         // A channel without a source fills with its default (no clone per texel).
+                        let cooked = c.graph.as_deref();
                         let v = match f.sources.get(&ch) {
-                            Some(s) => self.source(s, &f.projection, ch.kind()),
+                            Some(s) => self.source(s, &f.projection, ch.kind(), cooked),
                             None => ch.default_value(),
                         };
-                        (v, self.cover(f.sources.values(), &f.projection))
+                        (v, self.cover(f.sources.values(), &f.projection) * self.content_alpha(f.sources.get(&ch), cooked, &f.projection))
                     }
                     Content::Paint { preview } => self.painted(c.data.as_deref(), c, *preview),
                     Content::Group(_) => return None,
                 };
-                (v, cov, 0)
+                match below {
+                    Some((b, a)) if c.rules.is_measured() => {
+                        let empty = Channel::ALL.get(c.ch).map_or([0.0; 3], |d| d.default_value());
+                        let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
+                        let b = if a > 0.0 { [0, 1, 2].map(|i| (b[i] - empty[i] * (1.0 - a)) / a) } else { empty };
+                        let (v, cov) = over(c, BlendMode::Normal, b, a, v, cov.clamp(0.0, 1.0));
+                        (v, cov, 0)
+                    }
+                    Some((b, _)) => (mix3(b, v, cov.clamp(0.0, 1.0)), 1.0, 0),
+                    None => (v, cov, 0),
+                }
             }
         };
         for e in c.effects.iter().take(end).skip(skip) {
@@ -1991,6 +2971,9 @@ impl<'a, 'b> Texel<'a, 'b> {
 
     /// Apply one content effect to a channel's straight value and coverage.
     fn content_effect(&mut self, e: &EffectPlan, c: &ChanPlan, v: [f32; 3], cov: f32) -> ([f32; 3], f32) {
+        if !e.acts {
+            return (v, cov);
+        }
         let o = e.opacity.clamp(0.0, 1.0);
         match e.kind {
             EffectKind::Paint | EffectKind::Path(_) => {
@@ -1999,8 +2982,9 @@ impl<'a, 'b> Texel<'a, 'b> {
             }
             EffectKind::Material(f) => match Channel::ALL.get(c.ch).and_then(|ch| f.sources.get(ch).map(|s| (*ch, s))) {
                 Some((ch, s)) => {
-                    let p = self.source(s, &f.projection, ch.kind());
-                    let w = o * self.cover(f.sources.values(), &f.projection);
+                    let cooked = e.graph.as_deref();
+                    let p = self.source(s, &f.projection, ch.kind(), cooked);
+                    let w = o * self.cover(f.sources.values(), &f.projection) * self.content_alpha(Some(s), cooked, &f.projection);
                     over(c, e.blend, v, cov, p, w)
                 }
                 None => (v, cov),
@@ -2017,21 +3001,76 @@ impl<'a, 'b> Texel<'a, 'b> {
             },
             // Neighbourhood filters come precomputed through `ChanPlan::start`.
             EffectKind::Filter(f) => (f.point(c.kind, v).map_or(v, |out| mix3(v, out, o)), cov),
-            // Anchors are recorded by `eval`; mask-only effects leave content as it is.
-            EffectKind::Anchor | EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection { .. } | EffectKind::Compare { .. } => {
-                (v, cov)
-            }
+            // A graph reading nothing of the stack laid on like a fill: its output for the channel (a graph reading the
+            // stack comes precomputed through `ChanPlan::start`).
+            EffectKind::Graph { graph, projection } => match Channel::ALL.get(c.ch).and_then(|ch| Some((*ch, graph.output_for(*ch)?))) {
+                Some((ch, output)) => {
+                    let cooked = e.graph.as_deref();
+                    match self.graph_sample(cooked, output, projection, graph.unfiltered) {
+                        Some(g) => {
+                            let p = graphs::graph_to_channel(ch.kind(), g, cooked.is_some_and(|k| k.is_linear(output)));
+                            let alpha = match graph.output_alphas.get(&ch).map(String::as_str).or(graph.alpha_output.as_deref()) {
+                                Some(a) => self.graph_sample(cooked, Some(a), projection, graph.unfiltered).map_or(1.0, |a| a[0].clamp(0.0, 1.0)),
+                                None => 1.0,
+                            };
+                            let cover = self.projection_cover(projection);
+                            over(c, e.blend, v, cov, p, o * alpha * cover)
+                        }
+                        None => (v, cov),
+                    }
+                }
+                None => (v, cov),
+            },
+            // Anchors are recorded by `eval`; mask-only effects and placeholders leave content as it is.
+            EffectKind::Anchor
+            | EffectKind::Fill { .. }
+            | EffectKind::Generator(_)
+            | EffectKind::ColorSelection { .. }
+            | EffectKind::Compare { .. }
+            | EffectKind::Placeholder { .. } => (v, cov),
         }
     }
 }
 
-/// Mix a folder's inner stack into the stack outside it by its opacity and mask `m`.
+/// True if folder channel `c` composites its children on their own: under the measured rules, a folder whose mode is
+/// not passthrough.
+fn isolates(c: &ChanPlan) -> bool {
+    c.rules.is_measured() && c.blend != BlendMode::Passthrough
+}
+
+/// The stack a folder's children start from: the stack below it, except on the channels the folder isolates
+/// ([`isolates`]), which start from nothing.
+fn group_start(acc: &Acc, chans: &[ChanPlan]) -> Acc {
+    let mut inner = *acc;
+    for c in chans.iter().filter(|c| isolates(c)) {
+        if let (Some(slot), Some(cov), Some(d)) = (inner.v.get_mut(c.ch), inner.cov.get_mut(c.ch), Channel::ALL.get(c.ch)) {
+            *slot = d.default_value();
+            *cov = 0.0;
+        }
+    }
+    inner
+}
+
+/// Mix a folder's inner stack into the stack outside it by its opacity and mask `m`: a straight mix, or on the
+/// channels it isolates ([`isolates`]) its own composite laid over with the folder's mode.
 fn mix_group(acc: &mut Acc, inner: &Acc, chans: &[ChanPlan], m: f32) {
     for c in chans {
-        if let (Some(a), Some(b)) = (acc.get(c.ch).copied(), inner.get(c.ch).copied())
-            && let Some(slot) = acc.get_mut(c.ch)
-        {
-            *slot = mix3(a, b, c.opacity * m);
+        let (Some(a), Some(b), Some(&ac), Some(&bc)) = (acc.get(c.ch).copied(), inner.get(c.ch).copied(), acc.cov.get(c.ch), inner.cov.get(c.ch)) else {
+            continue;
+        };
+        let (v, cov) = if isolates(c) {
+            // The folder's composite over nothing at its coverage: straight for the blend, as it shows (over the
+            // channel default) for replace, which lays the whole composite.
+            let empty = Channel::ALL.get(c.ch).map_or([0.0; 3], |d| d.default_value());
+            let top = if c.blend == BlendMode::Replace || bc <= 0.0 { b } else { [0, 1, 2].map(|i| (b[i] - empty[i] * (1.0 - bc)) / bc) };
+            mix_over(c.blend, a, ac, top, bc, c.opacity * m, empty, c.unit, c.comps)
+        } else {
+            let w = c.opacity * m;
+            (mix3(a, b, w), ac + (bc - ac) * w)
+        };
+        if let (Some(slot), Some(slot_cov)) = (acc.v.get_mut(c.ch), acc.cov.get_mut(c.ch)) {
+            *slot = v;
+            *slot_cov = cov;
         }
     }
 }
@@ -2039,6 +3078,22 @@ fn mix_group(acc: &mut Acc, inner: &Acc, chans: &[ChanPlan], m: f32) {
 #[inline]
 fn apply(acc: &mut Acc, c: &ChanPlan, v: [f32; 3], cov: f32, mask: f32) {
     let Some(a) = acc.get(c.ch).copied() else { return };
+    if c.rules.is_measured() {
+        let (Some(&below), Some(empty)) = (acc.cov.get(c.ch), Channel::ALL.get(c.ch).map(|d| d.default_value())) else { return };
+        let (out, out_cov) = if c.from_below {
+            // An effect layer's content is the stack below carried on: it takes the stack's place, value and
+            // coverage, by the layer's strength.
+            let shown = [0, 1, 2].map(|i| v[i] * cov + empty[i] * (1.0 - cov));
+            mix_over(BlendMode::Replace, a, below, shown, cov, c.opacity * mask, empty, c.unit, c.comps)
+        } else {
+            mix_over(c.blend, a, below, v, cov, c.opacity * mask, empty, c.unit, c.comps)
+        };
+        if let (Some(slot), Some(slot_cov)) = (acc.v.get_mut(c.ch), acc.cov.get_mut(c.ch)) {
+            *slot = out;
+            *slot_cov = out_cov;
+        }
+        return;
+    }
     let w = if c.blend == BlendMode::Replace { c.opacity * mask } else { cov * c.opacity * mask };
     let blended = blend_chan(c, c.blend, a, v);
     if let Some(slot) = acc.get_mut(c.ch) {
@@ -2082,6 +3137,14 @@ pub fn composite_tiles_cached(inp: &Inputs, out: &mut Composite, tiles: &[(u32, 
     let key = if retain_fields { StackKey::new(inp.project, inp.pixels, inp.baked, inp.images, inp.ts, &set.stack).map(Arc::new) } else { None };
     let size = (inp.gbuf.width, inp.gbuf.height);
 
+    // Whole-set fields are computed once for every block: kept by the set's cache across composites, or for this
+    // composite only. The stack's key, when built, also tells the cache whether its entries are current.
+    let mut whole_set = match below.as_deref_mut() {
+        Some(b) => std::mem::take(&mut b.fields),
+        None => FieldCache::single(),
+    };
+    whole_set.begin(key.clone());
+
     // Release fields when a stroke or stack change disables retention
     if key.is_none()
         && let Some(cache) = below.as_deref_mut()
@@ -2110,7 +3173,7 @@ pub fn composite_tiles_cached(inp: &Inputs, out: &mut Composite, tiles: &[(u32, 
                 // Filter the current and following tiles as one run
                 let planned_tiles: Vec<(u32, u32)> = block.iter().chain(&ahead).copied().collect();
                 let uncached_planned_tiles: Vec<(u32, u32)> = planned_tiles.iter().copied().filter(uncached).collect();
-                let fields = Arc::new(block_fields(inp, &channels, &set.stack, hot, &uncached_planned_tiles, &planned_tiles));
+                let fields = Arc::new(block_fields(inp, &channels, &set.stack, hot, &uncached_planned_tiles, &planned_tiles, &mut whole_set));
                 let hot_tiles: std::collections::BTreeSet<(u32, u32)> = planned_tiles.iter().copied().collect();
                 let stack_tiles = if hot.is_some() && uncached_planned_tiles.len() < planned_tiles.len() {
                     uncached_planned_tiles.into_iter().collect()
@@ -2122,7 +3185,7 @@ pub fn composite_tiles_cached(inp: &Inputs, out: &mut Composite, tiles: &[(u32, 
                 }
                 fields
             }
-            _ => Arc::new(block_fields(inp, &channels, &set.stack, hot, &fresh, block)),
+            _ => Arc::new(block_fields(inp, &channels, &set.stack, hot, &fresh, block, &mut whole_set)),
         };
 
         let quota = match below.as_deref() {
@@ -2143,9 +3206,13 @@ pub fn composite_tiles_cached(inp: &Inputs, out: &mut Composite, tiles: &[(u32, 
         }
     }
 
-    // Release fields at the end of the pass
-    if let Some(cache) = below.filter(|cache| cache.ahead.is_empty()) {
-        cache.held = None;
+    whole_set.end(inp);
+    if let Some(cache) = below {
+        cache.fields = whole_set;
+        // Release fields at the end of the pass
+        if cache.ahead.is_empty() {
+            cache.held = None;
+        }
     }
 }
 
@@ -2161,15 +3228,24 @@ fn has_neighbourhood(inp: &Inputs, stack: &[LayerId]) -> bool {
 }
 
 /// The neighbourhood fields compositing `tiles` reads: those of every layer of `stack` over the tiles the cache lacks (`fresh`),
-/// and off the path to the `hot` layer only there; the hot layer's over all of `tiles`.
-fn block_fields(inp: &Inputs, channels: &[Channel], stack: &[LayerId], hot: Option<&Level>, fresh: &[(u32, u32)], tiles: &[(u32, u32)]) -> Fields {
+/// and off the path to the `hot` layer only there; the hot layer's over all of `tiles`. Whole-set fields of the stack come
+/// from `whole_set` when it holds them, and are kept in it.
+fn block_fields(
+    inp: &Inputs,
+    channels: &[Channel],
+    stack: &[LayerId],
+    hot: Option<&Level>,
+    fresh: &[(u32, u32)],
+    tiles: &[(u32, u32)],
+    whole_set: &mut FieldCache,
+) -> Fields {
     match hot {
         Some(hot) if fresh.len() < tiles.len() => {
-            let mut fields = fields_of(inp, channels, stack, fresh);
-            fields.extend(fields_of(inp, channels, &[hot.at], tiles));
+            let mut fields = fields_of(inp, channels, stack, fresh, Some(whole_set));
+            fields.extend(fields_of(inp, channels, &[hot.at], tiles, None));
             fields
         }
-        _ => fields_of(inp, channels, stack, tiles),
+        _ => fields_of(inp, channels, stack, tiles, Some(whole_set)),
     }
 }
 
@@ -2203,7 +3279,7 @@ fn composite_block(
     let lanes: Vec<Lane> = channels.iter().map(|c| Lane { ch: c.index(), n: c.components(), signed: c.kind() == ChannelKind::Signed }).collect();
     let stride: usize = lanes.iter().map(|l| l.n).sum();
     let level_count = split.map_or(0, <[Level]>::len);
-    let defaults: Acc = Channel::ALL.map(Channel::default_value);
+    let defaults = Acc::defaults();
 
     // Tiles split into bands of rows, so a handful of tiles still keeps every thread busy.
     let bands = TILE / BAND;
@@ -2729,7 +3805,7 @@ pub fn effect_histogram(inp: &Inputs, effect: LayerId, channel: Channel, bins: u
                 {
                     // As levels reads them (`per_unit`); normal maps pass through levels unchanged.
                     let (vals, signed) = match c.kind {
-                        ChannelKind::Color => (&v[..], false),
+                        ChannelKind::Color | ChannelKind::Data => (&v[..], false),
                         ChannelKind::Scalar => (&v[..1], false),
                         ChannelKind::Signed => (&v[..1], true),
                         ChannelKind::NormalMap => (&v[..0], false),
@@ -2820,7 +3896,9 @@ pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use texturecraft_core::{ChannelBlend, Effect, Layer, OutputResolution, Procedural, ProceduralKind, ResolutionMode, TextureSet};
+    use texturecraft_core::{
+        ChannelBlend, CompositeRules, Effect, HeightNormal, Layer, Levels, OutputResolution, Procedural, ProceduralKind, ResolutionMode, TextureSet,
+    };
     use texturecraft_geom::primitives;
 
     struct Fixture {
@@ -2851,6 +3929,7 @@ mod tests {
             block_scales: f.project.texture_sets[0].block_scales(),
             preview,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: f.mesh.bounds(),
         };
         let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);
@@ -2878,6 +3957,7 @@ mod tests {
             block_scales,
             preview: None,
             images: &images,
+            graphs: GraphStore::empty(),
             bounds: fixture.mesh.bounds(),
         };
 
@@ -2902,6 +3982,375 @@ mod tests {
 
     fn close(a: [f32; 3], b: [f32; 3]) -> bool {
         (0..3).all(|i| (a[i] - b[i]).abs() < 2e-4)
+    }
+
+    fn run_with(f: &Fixture, graphs: &GraphStore) -> Composite {
+        let images = Default::default();
+        let inp = Inputs {
+            project: &f.project,
+            ts: 0,
+            mesh: &f.mesh,
+            gbuf: &f.gbuf,
+            pixels: &f.pixels,
+            baked: &f.baked,
+            block_scales: f.project.texture_sets[0].block_scales(),
+            preview: None,
+            images: &images,
+            graphs,
+            bounds: f.mesh.bounds(),
+        };
+        let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);
+        composite_tiles(&inp, &mut out, &all_tiles(64, 64));
+        out
+    }
+
+    #[test]
+    fn graph_sources_generators_and_filters_composite() {
+        use crate::graphs::tests::{COLOUR, INVERT};
+        let mut graphs = GraphStore::default();
+        let (colour, invert) = (graphs.add_text(COLOUR), graphs.add_text(INVERT));
+        let reading = |output: &str| {
+            let mut g = GraphRef::new(colour.clone(), "colour");
+            g.output = Some(output.into());
+            g.keep = ["colour".to_string(), "grey".to_string()].into();
+            Source::Graph(Box::new(g))
+        };
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.0; 3], 0.0);
+        if let Some(LayerKind::Fill(fill)) = f.project.layers.get_mut(&id).map(|l| &mut l.kind) {
+            fill.sources.insert(Channel::BaseColor, reading("colour"));
+            fill.sources.insert(Channel::Roughness, reading("grey"));
+        }
+        let out = run_with(&f, &graphs);
+        let lin = |v: [f32; 3]| v.map(texturecraft_texel::srgb_to_linear);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), lin([0.25, 0.5, 0.75])), "{:?}", out.value(Channel::BaseColor, 10, 10));
+        assert!(close(out.value(Channel::Roughness, 10, 10), [0.5; 3]));
+        assert_eq!(graphs.renders(), 1, "the channels of one fill share a render");
+
+        // a filter reading the stack below it: the base color inverted in display values
+        let mut filter = GraphRef::new(invert.clone(), "invert");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        let fx = f.project.alloc_id();
+        if let Some(l) = f.project.layers.get_mut(&id) {
+            l.content_effects.push(Effect::new(fx, EffectKind::Graph { graph: filter, projection: Projection::default() }));
+        }
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), lin([0.75, 0.5, 0.25])), "{:?}", out.value(Channel::BaseColor, 10, 10));
+        let renders = graphs.renders();
+        run_with(&f, &graphs);
+        assert_eq!(graphs.renders(), renders, "the same stack below finds the filter's cook");
+
+        // a mask generator from the grey output: half the fill over the defaults
+        let mask_effect = f.project.alloc_id();
+        if let Some(l) = f.project.layers.get_mut(&id) {
+            l.content_effects.clear();
+            let mut g = GraphRef::new(colour.clone(), "colour");
+            g.output = Some("grey".into());
+            let e = Effect::new(mask_effect, EffectKind::Graph { graph: g, projection: Projection::default() });
+            l.mask = Some(Mask { effects: vec![e], ..Mask::new(MaskBackground::Black) });
+        }
+        let out = run_with(&f, &graphs);
+        let r = out.value(Channel::Roughness, 10, 10)[0];
+        assert!((r - (0.5 * 0.5 + 0.5 * Channel::Roughness.default_value()[0])).abs() < 2e-3, "{r}");
+
+        // a graph whose text is missing shows nothing and composites without panicking
+        let mut missing = GraphRef::new(texturecraft_core::text_key("absent"), "absent");
+        missing.inputs.insert(0, GraphInput::Stack { channel: Some(Channel::Height) });
+        if let Some(l) = f.project.layers.get_mut(&id) {
+            l.content_effects.push(Effect::new(LayerId(900), EffectKind::Graph { graph: missing, projection: Projection::default() }));
+        }
+        run_with(&f, &graphs);
+        assert!(graphs.problems().iter().any(|(u, p)| u.id == LayerId(900) && !p.stale));
+    }
+
+    /// A paint layer with nothing painted, blending base colour with `mode`, holding one content effect.
+    fn filter_layer(f: &mut Fixture, mode: BlendMode, kind: EffectKind) -> LayerId {
+        let id = f.project.alloc_id();
+        let mut l = Layer::new(id, "Filter", LayerKind::Paint, &[Channel::BaseColor]);
+        l.channels.insert(Channel::BaseColor, ChannelBlend { mode, opacity: 1.0 });
+        let id = f.project.insert_layer(0, l, None, false).unwrap();
+        content_fx(f, id, kind);
+        id
+    }
+
+    #[test]
+    fn effect_layers_filter_the_stack_below_them() {
+        use crate::graphs::tests::INVERT;
+        let lin = |v: [f32; 3]| v.map(texturecraft_texel::srgb_to_linear);
+        let mut graphs = GraphStore::default();
+        let invert = graphs.add_text(INVERT);
+        let mut filter = GraphRef::new(invert, "invert");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        let graph = EffectKind::Graph { graph: filter, projection: Projection::default() };
+
+        // a normal paint layer filters its own (empty) content: nothing shows
+        let mut f = fixture();
+        fill_layer(&mut f.project, lin([0.25, 0.5, 0.75]), 0.5);
+        let id = filter_layer(&mut f, BlendMode::Normal, graph.clone());
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), lin([0.25, 0.5, 0.75])), "{:?}", out.value(Channel::BaseColor, 10, 10));
+
+        // passthrough: the graph filters the stack below
+        f.project.layer_mut(id).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 });
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), lin([0.75, 0.5, 0.25])), "{:?}", out.value(Channel::BaseColor, 10, 10));
+        assert!(close(out.value(Channel::Roughness, 10, 10), [0.5; 3]), "channels the layer does not blend stay");
+
+        // its strength fades between the stack and the filtered stack; a mask limits it
+        f.project.layer_mut(id).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Passthrough, opacity: 0.5 });
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), mix3(lin([0.25, 0.5, 0.75]), lin([0.75, 0.5, 0.25]), 0.5)));
+        f.project.layer_mut(id).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 });
+        let me = f.project.alloc_id();
+        f.project.layer_mut(id).unwrap().mask = Some(Mask { effects: vec![Effect::new(me, EffectKind::Paint)], ..Mask::new(MaskBackground::Black) });
+        let img = f.pixels.masks.entry(me).or_insert_with(|| TileImage::new(64, 64, 2));
+        for y in 0..64 {
+            for x in 0..32 {
+                img.set(x, y, &[to_u16(1.0), to_u16(1.0)]);
+            }
+        }
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::BaseColor, 10, 10), lin([0.75, 0.5, 0.25])), "{:?}", out.value(Channel::BaseColor, 10, 10));
+        assert!(close(out.value(Channel::BaseColor, 50, 10), lin([0.25, 0.5, 0.75])), "{:?}", out.value(Channel::BaseColor, 50, 10));
+
+        // a per-texel filter on an effect layer works on the stack below too
+        let mut f = fixture();
+        fill_layer(&mut f.project, [1.0, 0.0, 0.0], 0.2);
+        filter_layer(&mut f, BlendMode::Passthrough, EffectKind::Filter(Filter::Invert));
+        let out = run(&f, None);
+        assert!(close(out.value(Channel::BaseColor, 5, 5), [0.0, 1.0, 1.0]), "{:?}", out.value(Channel::BaseColor, 5, 5));
+        assert!(close(out.value(Channel::Roughness, 5, 5), [0.2; 3]));
+    }
+
+    fn run_cached(f: &Fixture, graphs: &GraphStore, below: &mut BelowCache) -> Composite {
+        let images = Default::default();
+        let inp = Inputs {
+            project: &f.project,
+            ts: 0,
+            mesh: &f.mesh,
+            gbuf: &f.gbuf,
+            pixels: &f.pixels,
+            baked: &f.baked,
+            block_scales: f.project.texture_sets[0].block_scales(),
+            preview: None,
+            images: &images,
+            graphs,
+            bounds: f.mesh.bounds(),
+        };
+        let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);
+        composite_tiles_cached(&inp, &mut out, &all_tiles(64, 64), Some(below));
+        out
+    }
+
+    #[test]
+    fn whole_set_fields_are_kept_until_an_edit_below_them() {
+        let mut graphs = GraphStore::default();
+        let blur = graphs.add_text("format 3\nsize 64\nnode 1 input idx=0\nnode 2 box_blur in=@1 intensity=8\noutput out 2\n");
+        let mut filter = GraphRef::new(blur, "blur");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        let mut f = fixture();
+        let below = fill_layer(&mut f.project, [0.25, 0.5, 0.75], 0.5);
+        // a paint layer below the fill's colour: half of it painted, so the blur has an edge to work on
+        let paint = f.project.alloc_id();
+        let l = Layer::new(paint, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+        let paint = f.project.insert_layer(0, l, None, false).unwrap();
+        f.project.texture_sets[0].stack.retain(|id| *id != paint);
+        f.project.texture_sets[0].stack.insert(0, paint);
+        let img = f.pixels.layers.entry((paint, Channel::BaseColor)).or_insert_with(|| TileImage::new(64, 64, 4));
+        for y in 0..64 {
+            for x in 0..32 {
+                img.set(x, y, &[to_u16(1.0), to_u16(0.0), to_u16(0.0), to_u16(1.0)]);
+            }
+        }
+        f.project.layer_mut(below).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Normal, opacity: 0.5 });
+        let id = filter_layer(&mut f, BlendMode::Passthrough, EffectKind::Graph { graph: filter, projection: Projection::default() });
+
+        let mut cache = BelowCache::default();
+        let first = run_cached(&f, &graphs, &mut cache);
+        assert_eq!(first, run_with(&f, &graphs), "the same as without the cache");
+        assert_eq!(cache.fields.len(), 1, "the whole-set field is kept");
+        assert_eq!(cache.fields.reused(), 0);
+
+        // composited again (as the next frame would): taken from the cache
+        assert_eq!(run_cached(&f, &graphs, &mut cache), first);
+        assert_eq!(cache.fields.reused(), 1);
+
+        // an edit above the filter does not touch it
+        let top = fill_layer(&mut f.project, [0.0; 3], 0.0);
+        f.project.layer_mut(top).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Normal, opacity: 0.25 });
+        assert_eq!(run_cached(&f, &graphs, &mut cache), run_with(&f, &graphs));
+        assert_eq!(cache.fields.reused(), 2);
+
+        // edits below it: content, parameters, order, visibility; each one computes the field again
+        let edits: [&dyn Fn(&mut Fixture); 4] = [
+            &|f| f.pixels.layers.get_mut(&(paint, Channel::BaseColor)).unwrap().set(40, 20, &[to_u16(0.0), to_u16(1.0), to_u16(0.0), to_u16(1.0)]),
+            &|f| {
+                f.project
+                    .layer_mut(below)
+                    .unwrap()
+                    .channels
+                    .insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Normal, opacity: 0.8 })
+                    .map(|_| ())
+                    .unwrap()
+            },
+            &|f| {
+                let stack = &mut f.project.texture_sets[0].stack;
+                let (a, b) = (stack.iter().position(|l| *l == paint).unwrap(), stack.iter().position(|l| *l == below).unwrap());
+                stack.swap(a, b);
+            },
+            &|f| f.project.layer_mut(paint).unwrap().visible = false,
+        ];
+        let mut last = run_cached(&f, &graphs, &mut cache);
+        for (n, edit) in edits.iter().enumerate() {
+            edit(&mut f);
+            let reused = cache.fields.reused();
+            let now = run_cached(&f, &graphs, &mut cache);
+            assert_eq!(now, run_with(&f, &graphs), "edit {n}: the same as without the cache");
+            assert_ne!(now, last, "edit {n} changes the result");
+            assert_eq!(cache.fields.reused(), reused, "edit {n}: the field is computed again");
+            assert_eq!(cache.fields.len(), 1, "edit {n}: the stale field is replaced");
+            last = now;
+        }
+
+        // the filter's own parameters too; and deleting it drops the kept field
+        f.project.layer_mut(id).unwrap().content_effects[0].opacity = 0.5;
+        let reused = cache.fields.reused();
+        assert_eq!(run_cached(&f, &graphs, &mut cache), run_with(&f, &graphs));
+        assert_eq!(cache.fields.reused(), reused);
+        f.project.layer_mut(id).unwrap().content_effects.clear();
+        assert_eq!(run_cached(&f, &graphs, &mut cache), run_with(&f, &graphs));
+        assert!(cache.fields.is_empty(), "nothing kept for a filter that is gone");
+    }
+
+    #[test]
+    fn whole_set_fields_over_pixels_read_from_the_file_are_kept_across_frames() {
+        // A project opened from its file holds layer pixels that read their tiles when first needed, each read a new
+        // copy. The key a composite keeps may be taken before the tiles are read: it is the same pixels after.
+        let mut graphs = GraphStore::default();
+        let blur = graphs.add_text("format 3\nsize 64\nnode 1 input idx=0\nnode 2 box_blur in=@1 intensity=8\noutput out 2\n");
+        let mut filter = GraphRef::new(blur, "blur");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        let mut f = fixture();
+        let paint = f.project.alloc_id();
+        let l = Layer::new(paint, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+        let paint = f.project.insert_layer(0, l, None, false).unwrap();
+        let mut painted = TileImage::new(64, 64, 4);
+        for y in 0..64 {
+            for x in 0..32 {
+                painted.set(x, y, &[to_u16(1.0), to_u16(0.0), to_u16(0.0), to_u16(1.0)]);
+            }
+        }
+        let texels: Vec<u16> = painted.tile(0, 0).unwrap().to_vec();
+        let from_file = |texels: Vec<u16>| TileImage::lazy(64, 64, 4, 1, Arc::new(move || Some(vec![Some(Arc::new(texels.clone()))])));
+        f.pixels.layers.insert((paint, Channel::BaseColor), from_file(texels.clone()));
+        // pixels no composite reads (a channel the layer does not draw) are never read at all
+        f.pixels.layers.insert((paint, Channel::Roughness), from_file(texels));
+        filter_layer(&mut f, BlendMode::Passthrough, EffectKind::Graph { graph: filter, projection: Projection::default() });
+
+        let mut cache = BelowCache::default();
+        let first = run_cached(&f, &graphs, &mut cache);
+        assert_eq!(first, run_with(&f, &graphs), "the same as without the cache");
+        assert_eq!(cache.fields.len(), 1);
+        // the frames after: each takes the field from the cache instead of computing it again
+        for frame in 1..4 {
+            assert_eq!(run_cached(&f, &graphs, &mut cache), first);
+            assert_eq!(cache.fields.reused(), frame, "frame {frame}: the field is computed once");
+        }
+        assert!(!f.pixels.layers[&(paint, Channel::Roughness)].is_loaded(), "comparing keys reads no pixels");
+    }
+
+    #[test]
+    fn graph_filters_read_the_stack_padded_outside_the_islands() {
+        let mut graphs = GraphStore::default();
+        let blur = graphs.add_text("format 3\nsize 64\nnode 1 input idx=0\nnode 2 box_blur in=@1 intensity=32\noutput out 2\n");
+        // the plane's UVs squeezed into the left half: the right half of the texture is outside every island
+        let mut f = fixture();
+        f.mesh.uvs.iter_mut().for_each(|uv| uv.x *= 0.5);
+        f.gbuf = UvGBuffer::new(&f.mesh, 0, 64, 64);
+        let id = fill_layer(&mut f.project, [0.6; 3], 0.6);
+        let mut filter = GraphRef::new(blur, "blur");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        content_fx(&mut f, id, EffectKind::Graph { graph: filter, projection: Projection::default() });
+        let out = run_with(&f, &graphs);
+        // next to the island's border the blur reads the island's value beyond it, not empty texels
+        let r = out.value(Channel::Roughness, 30, 20)[0];
+        assert!((r - 0.6).abs() < 2e-3, "{r}");
+    }
+
+    #[test]
+    fn minified_graph_fills_average_unless_unfiltered() {
+        // white on the left half of the image, black on the right
+        let halves = "format 3\nsize 64\nsubgraph c\nmeta kind \"function\"\nnode 2 f_pos\nnode 3 f_swizzle a=@2 mask=\"x\"\nnode 4 f_float v=0.5\nnode 5 f_lt a=@3 b=@4\nnode 1 f_out in=@5\nend\nnode 1 pixel_processor fn=\"c\"\noutput out 1\n";
+        let mut graphs = GraphStore::default();
+        let key = graphs.add_text(halves);
+        let roughness = |unfiltered: bool| {
+            let mut f = fixture();
+            let id = fill_layer(&mut f.project, [0.0; 3], 0.0);
+            let mut g = GraphRef::new(key.clone(), "halves");
+            g.unfiltered = unfiltered;
+            if let Some(LayerKind::Fill(fill)) = f.project.layers.get_mut(&id).map(|l| &mut l.kind) {
+                fill.sources.insert(Channel::Roughness, Source::Graph(Box::new(g)));
+                // the image once per texel, each texel's centre on the black half
+                fill.projection = Projection::Uv { scale: [64.0, 64.0], rotation: 0.0, offset: [0.25, 0.0] };
+            }
+            run_with(&f, &graphs).value(Channel::Roughness, 10, 10)[0]
+        };
+        let filtered = roughness(false);
+        assert!((filtered - 0.5).abs() < 0.02, "a texel spanning the whole image reads its mean: {filtered}");
+        let unfiltered = roughness(true);
+        assert!(unfiltered < 0.02, "bilinear at the texel's centre: {unfiltered}");
+    }
+
+    #[test]
+    fn a_named_stack_input_on_its_own_channel_is_not_the_filters_own_input() {
+        use crate::graphs::tests::INVERT;
+        let mut graphs = GraphStore::default();
+        let invert = graphs.add_text(INVERT);
+        // a layer with nothing on height whose filter writes height, reading the stack's height by name (input 0) or as
+        // its own input (no channel named)
+        let height = |input: GraphInput| {
+            let mut f = fixture();
+            let id = f.project.alloc_id();
+            let mut l = Layer::new(id, "Filter", LayerKind::Paint, &[Channel::Height]);
+            l.channels.insert(Channel::Height, ChannelBlend { mode: BlendMode::LinearDodge, opacity: 1.0 });
+            let id = f.project.insert_layer(0, l, None, false).unwrap();
+            let mut filter = GraphRef::new(invert.clone(), "invert");
+            filter.inputs.insert(0, input);
+            filter.outputs.insert(Channel::Height, "out".into());
+            content_fx(&mut f, id, EffectKind::Graph { graph: filter, projection: Projection::default() });
+            run_with(&f, &graphs).value(Channel::Height, 10, 10)[0]
+        };
+        // named: reads 0 over the empty height (inverted: 1, the top of the signed range) and is laid on whole
+        let named = height(GraphInput::Stack { channel: Some(Channel::Height) });
+        assert!((named - 1.0).abs() < 1e-3, "{named}");
+        // own: reads the flat surface (inverted: flat again)
+        let own = height(GraphInput::Stack { channel: None });
+        assert!(own.abs() < 1e-3, "{own}");
+    }
+
+    #[test]
+    fn effect_layers_in_a_folder_start_from_the_folder_stack() {
+        let mut f = fixture();
+        fill_layer(&mut f.project, [1.0, 0.0, 0.0], 0.2);
+        let gid = f.project.alloc_id();
+        let g = Layer::new(gid, "Folder", LayerKind::Group { children: Vec::new(), collapsed: false }, &[Channel::BaseColor]);
+        let gid = f.project.insert_layer(0, g, None, false).unwrap();
+        let inner = f.project.alloc_id();
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::BaseColor, Source::Uniform([0.0, 0.0, 1.0]));
+        let l = Layer::new(inner, "Blue", LayerKind::Fill(fill), &[Channel::BaseColor]);
+        let inner = f.project.insert_layer(0, l, Some(gid), true).unwrap();
+        let fx = f.project.alloc_id();
+        let mut l = Layer::new(fx, "Filter", LayerKind::Paint, &[Channel::BaseColor]);
+        l.channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 });
+        let fx = f.project.insert_layer(0, l, Some(inner), false).unwrap();
+        content_fx(&mut f, fx, EffectKind::Filter(Filter::Invert));
+        let out = run(&f, None);
+        assert!(
+            close(out.value(Channel::BaseColor, 5, 5), [1.0, 1.0, 0.0]),
+            "the blue fill inside the folder inverted: {:?}",
+            out.value(Channel::BaseColor, 5, 5)
+        );
     }
 
     #[test]
@@ -2934,6 +4383,7 @@ mod tests {
                     block_scales: fixture.project.texture_sets[0].block_scales(),
                     preview: None,
                     images: &images,
+                    graphs: GraphStore::empty(),
                     bounds: fixture.mesh.bounds(),
                 };
                 let mut output = Composite::new(&fixture.project.texture_sets[0].channel_list(), resolution);
@@ -2942,18 +4392,10 @@ mod tests {
 
                 composite_tiles_cached(&input, &mut output, &[(0, 0)], Some(&mut cache));
                 let retained = cache.held.as_ref().expect("filter fields should be retained while tiles follow");
-                let fields = || retained.fields.values().flat_map(|field| std::iter::once(field).chain(field.anchor_stages.iter().map(|(_, stage)| stage)));
-                let field_bytes: usize = fields().map(|field| field.data.capacity() * std::mem::size_of::<f32>()).sum();
-                let field_count = fields().count();
-                let stage_index_bytes: usize =
-                    retained.fields.values().map(|field| field.anchor_stages.capacity() * std::mem::size_of::<(LayerId, Field)>()).sum();
+                let mark_count: usize = retained.fields.values().map(|field| field.marks.len()).sum();
                 let weak_fields = Arc::downgrade(&retained.fields);
-                let expected_fields = if record_anchors { 6 } else { 2 };
-                assert_eq!(field_count, expected_fields, "only filter stages needed by anchors remain beside the final mask fields");
-                assert_eq!(field_bytes, expected_fields * resolution as usize * resolution as usize * std::mem::size_of::<f32>());
-                println!(
-                    "resolution: {resolution}, mask layers: 2, anchors: {record_anchors}, fields: {field_count}, buffer capacity: {field_bytes} bytes, stage-index capacity: {stage_index_bytes} bytes"
-                );
+                assert_eq!(retained.fields.len(), 2);
+                assert_eq!(mark_count, if record_anchors { 4 } else { 0 }, "only values read by mask anchors are retained");
 
                 cache.ahead.clear();
                 composite_tiles_cached(&input, &mut output, &[(1, 0)], Some(&mut cache));
@@ -3073,6 +4515,7 @@ mod tests {
             block_scales: fixture.project.texture_sets[0].block_scales(),
             preview: None,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: fixture.mesh.bounds(),
         };
         let sparse = mask_at(&inputs, layer, texels);
@@ -3147,6 +4590,7 @@ mod tests {
             block_scales: fixture.project.texture_sets[0].block_scales(),
             preview: None,
             images: &images,
+            graphs: GraphStore::empty(),
             bounds: fixture.mesh.bounds(),
         };
         let sampled_texels: Vec<_> = (0..64).flat_map(|y| (0..64).map(move |x| (x * 2, y))).collect();
@@ -3273,7 +4717,7 @@ mod tests {
         fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, 256, 256);
         fixture.project.texture_sets[0].resolution = 256;
         let ridge: Vec<f32> = (0..256 * 256).map(|texel| if texel % 256 == ridge_x { 1.0 } else { 0.5 }).collect();
-        fixture.baked = BakedMaps { resolution: 256, maps: [(BakedMap::Curvature, Arc::new(ridge))].into() };
+        fixture.baked = BakedMaps { resolution: 256, maps: [(BakedMap::Curvature, Arc::new(ridge.into()))].into() };
         let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
         (fixture, layer)
     }
@@ -3294,6 +4738,7 @@ mod tests {
             block_scales: BlockScales::default(),
             preview: None,
             images: &images,
+            graphs: GraphStore::empty(),
             bounds: fixture.mesh.bounds(),
         };
         mask_at(&inputs, layer, &xs.map(|x| (x, 128)).collect::<Vec<_>>()).unwrap()
@@ -3390,8 +4835,8 @@ mod tests {
         let effects = [Effect::new(LayerId(1), EffectKind::Generator(Generator { resolution: custom, ..Generator::new(GeneratorKind::Dirt) }))];
 
         // Tile and whole-set resolutions must select the same generator stage
-        let at_tile: Vec<usize> = neighbourhood_filters(&effects, 1024).map(|stage| stage.0).collect();
-        let at_set_width: Vec<usize> = neighbourhood_filters(&effects, 2048).map(|stage| stage.0).collect();
+        let at_tile: Vec<usize> = neighbourhood_filters(&effects, 1024, None).map(|stage| stage.0).collect();
+        let at_set_width: Vec<usize> = neighbourhood_filters(&effects, 2048, None).map(|stage| stage.0).collect();
         assert_eq!(at_tile, at_set_width);
         assert_eq!(at_tile, [0], "a custom resolution can be coarser than some UV tile, so it is a stage");
     }
@@ -3399,7 +4844,7 @@ mod tests {
     #[test]
     fn a_generator_input_replaced_by_a_value_is_read_instead_of_the_mesh_map() {
         let mut fixture = fixture();
-        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![1.0; 64 * 64]))].into() };
+        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![1.0; 64 * 64].into()))].into() };
         let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
         let value_with = |fixture: &mut Fixture, input: Option<f32>| -> f32 {
             let mut generator = Generator { level: 0.5, softness: 0.1, noise_amount: 0.0, ..Generator::new(GeneratorKind::Dirt) };
@@ -3420,7 +4865,7 @@ mod tests {
     #[test]
     fn curvature_detail_noise_keeps_flat_areas_neutral() {
         let mut fixture = fixture();
-        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64]))].into() };
+        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64].into()))].into() };
         let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
         let texels: Vec<_> = (0..64).map(|x| (x, 32)).collect();
 
@@ -3436,6 +4881,26 @@ mod tests {
                 let expected = if mode == CurvatureMode::Raw { 0.5 } else { 0.0 };
                 assert!(values.iter().all(|value| (value - expected).abs() < 0.001), "{kind:?} {mode:?} paints noise on flat curvature: {values:?}");
             }
+        }
+    }
+
+    #[test]
+    fn color_selection_picks_from_the_baked_map_it_names() {
+        let mut fixture = fixture();
+        // curvature flat (0.5) on the left half, a ridge on the right; the ID map black everywhere
+        let curvature: Vec<f32> = (0..64 * 64).map(|i| if i % 64 < 32 { 0.5 } else { 0.8 }).collect();
+        fixture.baked = BakedMaps {
+            resolution: 64,
+            maps: [(BakedMap::Curvature, Arc::new(curvature.into())), (BakedMap::Id, Arc::new(vec![0.0; 64 * 64 * 3].into()))].into(),
+        };
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let texels = [(8, 32), (48, 32)];
+        for (map, expected) in [(BakedMap::Curvature, [1.0, 0.0]), (BakedMap::Id, [0.0, 0.0])] {
+            let mut mask = Mask::new(MaskBackground::Black);
+            mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::ColorSelection { colors: vec![[0.5; 3]], tolerance: 0.0, map }));
+            fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+            let values = assert_sparse_mask_matches_image(&fixture, layer, &texels).unwrap();
+            assert!(values.iter().zip(expected).all(|(v, e)| (v - e).abs() < 0.001), "{map:?}: {values:?}");
         }
     }
 
@@ -3494,6 +4959,139 @@ soft {soft:?}"
         );
     }
 
+    /// A fill of `values` (channel, value, mode, opacity) at the top of the stack, or of folder `parent`.
+    fn rule_fill(f: &mut Fixture, values: &[(Channel, f32, BlendMode, f32)], parent: Option<LayerId>) -> LayerId {
+        let id = f.project.alloc_id();
+        let mut fill = Fill::default();
+        for (c, v, ..) in values {
+            fill.sources.insert(*c, Source::Uniform([*v; 3]));
+        }
+        let mut l = Layer::new(id, "F", LayerKind::Fill(fill), &[]);
+        for (c, _, mode, opacity) in values {
+            l.channels.insert(*c, ChannelBlend { mode: *mode, opacity: *opacity });
+        }
+        f.project.insert_layer(0, l, parent, parent.is_some()).unwrap()
+    }
+
+    /// Roughness and height at one texel under TextureCraft's own and the measured rules.
+    fn both_rules(f: &mut Fixture) -> [(f32, f32); 2] {
+        let mut out = [(0.0, 0.0); 2];
+        for (slot, rules) in out.iter_mut().zip([CompositeRules::default(), CompositeRules::measured(HeightNormal::Backward)]) {
+            f.project.rules = rules;
+            let c = run(f, None);
+            *slot = (c.value(Channel::Roughness, 10, 10)[0], c.value(Channel::Height, 10, 10)[0]);
+        }
+        f.project.rules = CompositeRules::default();
+        out
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 2e-3
+    }
+
+    #[test]
+    fn measured_rules_lay_a_mode_only_where_something_is_below() {
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.4, BlendMode::Multiply, 1.0)], None);
+        let [native, measured] = both_rules(&mut f);
+        let d = Channel::Roughness.default_value()[0];
+        assert!(near(native.0, d * 0.4), "TextureCraft's own: multiplies the channel default: {native:?}");
+        assert!(near(measured.0, 0.4), "measured: over nothing the fill shows: {measured:?}");
+        // over a full fill both multiply
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.6, BlendMode::Normal, 1.0)], None);
+        rule_fill(&mut f, &[(Channel::Roughness, 0.4, BlendMode::Multiply, 1.0)], None);
+        let [native, measured] = both_rules(&mut f);
+        assert!(near(native.0, 0.24) && near(measured.0, 0.24), "{native:?} {measured:?}");
+    }
+
+    #[test]
+    fn measured_rules_clamp_before_opacity_on_unit_channels_only() {
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.8, BlendMode::Normal, 1.0), (Channel::Height, 0.6, BlendMode::Normal, 1.0)], None);
+        rule_fill(&mut f, &[(Channel::Roughness, 0.7, BlendMode::LinearDodge, 0.5), (Channel::Height, 0.7, BlendMode::LinearDodge, 0.5)], None);
+        let [native, measured] = both_rules(&mut f);
+        assert!(near(native.0, 1.0), "0.8 + 0.35 stored as 1: {native:?}");
+        assert!(near(measured.0, 0.9), "measured: 1.5 clamped to 1, then half way from 0.8: {measured:?}");
+        assert!(near(native.1, 0.95) && near(measured.1, 0.95), "height is a float channel: no clamp {native:?} {measured:?}");
+    }
+
+    #[test]
+    fn measured_rules_composite_folders_on_their_own() {
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.6, BlendMode::Normal, 1.0), (Channel::Height, 0.25, BlendMode::Normal, 1.0)], None);
+        let gid = f.project.alloc_id();
+        let mut g = Layer::new(gid, "G", LayerKind::Group { children: vec![], collapsed: false }, &[]);
+        g.channels.insert(Channel::Roughness, ChannelBlend { mode: BlendMode::Normal, opacity: 1.0 });
+        g.channels.insert(Channel::Height, ChannelBlend { mode: BlendMode::LinearDodge, opacity: 1.0 });
+        let gid = f.project.insert_layer(0, g, None, false).unwrap();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.5, BlendMode::Multiply, 1.0), (Channel::Height, 0.1, BlendMode::Normal, 1.0)], Some(gid));
+        let [native, measured] = both_rules(&mut f);
+        // TextureCraft's own: the children blend straight into the stack below
+        assert!(near(native.0, 0.3) && near(native.1, 0.1), "{native:?}");
+        // measured: the folder's composite (0.5 over nothing; height 0.1) laid normal and added
+        assert!(near(measured.0, 0.5) && near(measured.1, 0.35), "{measured:?}");
+        // a folder passing through behaves alike under both
+        for c in [Channel::Roughness, Channel::Height] {
+            f.project.layer_mut(gid).unwrap().channels.insert(c, ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 });
+        }
+        let [native, measured] = both_rules(&mut f);
+        assert_eq!(native, measured);
+        // at half opacity a folder's composite over nothing mixes by its coverage: 0.5 at half strength over 0.6
+        for (c, mode) in [(Channel::Roughness, BlendMode::Normal), (Channel::Height, BlendMode::LinearDodge)] {
+            f.project.layer_mut(gid).unwrap().channels.insert(c, ChannelBlend { mode, opacity: 0.5 });
+        }
+        let [_, measured] = both_rules(&mut f);
+        assert!(near(measured.0, 0.55) && near(measured.1, 0.3), "{measured:?}");
+    }
+
+    #[test]
+    fn measured_rules_effect_layers_over_nothing_add_nothing() {
+        // the stack: roughness 0.6; on top an isolating folder holding only an effect layer (a point filter, then a
+        // neighbourhood one) that passes roughness through
+        for filter in [Filter::Invert, Filter::Sharpen { amount: 1.0 }] {
+            let mut f = fixture();
+            rule_fill(&mut f, &[(Channel::Roughness, 0.6, BlendMode::Normal, 1.0)], None);
+            let gid = f.project.alloc_id();
+            let mut g = Layer::new(gid, "G", LayerKind::Group { children: vec![], collapsed: false }, &[]);
+            g.channels.insert(Channel::Roughness, ChannelBlend { mode: BlendMode::Normal, opacity: 1.0 });
+            let gid = f.project.insert_layer(0, g, None, false).unwrap();
+            let fx = f.project.alloc_id();
+            let mut l = Layer::new(fx, "Filter", LayerKind::Paint, &[]);
+            l.channels.insert(Channel::Roughness, ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 });
+            let fx = f.project.insert_layer(0, l, Some(gid), true).unwrap();
+            content_fx(&mut f, fx, EffectKind::Filter(filter.clone()));
+            let [native, measured] = both_rules(&mut f);
+            let want = if matches!(filter, Filter::Invert) { 0.4 } else { 0.6 };
+            assert!(near(native.0, want), "TextureCraft's own: the folder passes the filtered stack: {native:?}");
+            assert!(near(measured.0, 0.6), "measured: the folder starts from nothing, the filter adds nothing: {measured:?}");
+
+            // with a fill below it inside the folder the filter works on that fill
+            let inner = rule_fill(&mut f, &[(Channel::Roughness, 0.3, BlendMode::Normal, 1.0)], Some(gid));
+            let LayerKind::Group { children, .. } = &mut f.project.layer_mut(gid).unwrap().kind else { panic!("expected a folder") };
+            children.retain(|c| *c != inner);
+            children.insert(0, inner);
+            let [_, measured] = both_rules(&mut f);
+            let want = if matches!(filter, Filter::Invert) { 0.7 } else { 0.3 };
+            assert!(near(measured.0, want), "{filter:?}: {measured:?}");
+        }
+    }
+
+    #[test]
+    fn measured_formulas_reach_the_composite() {
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.8, BlendMode::Normal, 1.0)], None);
+        rule_fill(&mut f, &[(Channel::Roughness, 0.4, BlendMode::Divide, 1.0)], None);
+        let [native, measured] = both_rules(&mut f);
+        assert!(near(native.0, 1.0) && near(measured.0, 1.0), "both end at 1 (stored): {native:?} {measured:?}");
+        let mut f = fixture();
+        rule_fill(&mut f, &[(Channel::Roughness, 0.25, BlendMode::Normal, 1.0)], None);
+        rule_fill(&mut f, &[(Channel::Roughness, 0.7, BlendMode::SoftLight, 1.0)], None);
+        let [native, measured] = both_rules(&mut f);
+        assert!(near(native.0, blend1(BlendMode::SoftLight, 0.25, 0.7)), "{native:?}");
+        assert!(near(measured.0, 2.0 * 0.25 * 0.3 + 0.5 * 0.4), "{measured:?}");
+    }
+
     #[test]
     fn groups_pass_through_with_opacity() {
         let mut f = fixture();
@@ -3526,6 +5124,21 @@ soft {soft:?}"
         let eid = f.project.alloc_id();
         f.project.layer_mut(id).unwrap().content_effects.push(Effect::new(eid, kind));
         eid
+    }
+
+    #[test]
+    fn content_effects_limited_to_channels_leave_the_others() {
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.2, 0.4, 0.6], 0.2);
+        let fx = content_fx(&mut f, id, EffectKind::Levels(Levels { out_low: 1.0, out_high: 0.0, ..Levels::default() }));
+        let out = run(&f, None);
+        assert!(close(out.value(Channel::Roughness, 5, 5), [0.8; 3]), "on every channel by default");
+        assert!(close(out.value(Channel::BaseColor, 5, 5), [0.8, 0.6, 0.4]));
+        let e = f.project.layer_mut(id).unwrap().content_effects.iter_mut().find(|e| e.id == fx).unwrap();
+        e.channels = vec![Channel::BaseColor];
+        let out = run(&f, None);
+        assert!(close(out.value(Channel::BaseColor, 5, 5), [0.8, 0.6, 0.4]));
+        assert!(close(out.value(Channel::Roughness, 5, 5), [0.2; 3]), "a channel the effect does not list is left as it is");
     }
 
     #[test]
@@ -3711,13 +5324,51 @@ soft {soft:?}"
             (0..64 * 64).filter(|i| close(out.value(Channel::BaseColor, i % 64, i / 64), [1.0, 0.0, 0.0])).count()
         };
         let all = red(&f);
-        f.project.layer_mut(id).unwrap().geometry_mask = Some(vec!["Lid".into()]);
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::Parts(vec!["Lid".into()]));
         let lid = red(&f);
-        f.project.layer_mut(id).unwrap().geometry_mask = Some(vec!["Body".into()]);
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::Parts(vec!["Body".into()]));
         let body = red(&f);
         assert!(lid > 0 && body > 0 && lid + body == all, "{lid} + {body} of {all}");
-        f.project.layer_mut(id).unwrap().geometry_mask = Some(Vec::new());
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::Parts(Vec::new()));
         assert_eq!(red(&f), 0, "no parts: hidden everywhere");
+    }
+
+    #[test]
+    fn geometry_masks_by_uv_tile_show_layers_on_chosen_atlas_blocks_only() {
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [1.0, 0.0, 0.0], 0.2);
+        let red = |f: &Fixture| {
+            let out = run(f, None);
+            (0..64 * 64).filter(|i| close(out.value(Channel::BaseColor, i % 64, i / 64), [1.0, 0.0, 0.0])).map(|i| i % 64).collect::<Vec<_>>()
+        };
+        let all = red(&f).len();
+        assert!(all > 0);
+        // A set without UV tiles is tile 1001.
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::UvTiles(vec![1001]));
+        assert_eq!(red(&f).len(), all);
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::UvTiles(vec![1002]));
+        assert!(red(&f).is_empty(), "tile 1002 is not in a classic set");
+        // Two tiles side by side: the right half of the atlas is tile 1002.
+        f.project.texture_sets[0].uv_tiles = vec![1001, 1002];
+        let right = red(&f);
+        assert!(!right.is_empty() && right.iter().all(|x| *x >= 32), "only the right block");
+        f.project.layer_mut(id).unwrap().geometry_mask = Some(GeometryMask::UvTiles(vec![1001]));
+        assert!(red(&f).iter().all(|x| *x < 32));
+    }
+
+    #[test]
+    fn placeholder_effects_pass_content_and_masks_through() {
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.25, 0.5, 0.75], 0.4);
+        let before = run(&f, None);
+        content_fx(&mut f, id, EffectKind::Placeholder { label: "Filter \"x\"".into(), reason: "not computed".into() });
+        f.project.layer_mut(id).unwrap().mask =
+            Some(Mask { effects: vec![Effect::placeholder(LayerId(900), "Generator \"y\"", "not computed")], ..Mask::new(MaskBackground::White) });
+        let after = run(&f, None);
+        for (x, y) in [(5, 5), (30, 40), (60, 10)] {
+            assert_eq!(before.value(Channel::BaseColor, x, y), after.value(Channel::BaseColor, x, y));
+            assert_eq!(before.value(Channel::Roughness, x, y), after.value(Channel::Roughness, x, y));
+        }
     }
 
     #[test]
@@ -3749,6 +5400,7 @@ soft {soft:?}"
             block_scales: f.project.texture_sets[0].block_scales(),
             preview: None,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: f.mesh.bounds(),
         };
         let flat = flatten_layer(&inp, id, &all_tiles(64, 64)).unwrap();
@@ -3888,7 +5540,7 @@ soft {soft:?}"
     #[test]
     fn curvature_modes_classify_raised_and_recessed_micro_height() {
         let mut fixture = fixture();
-        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64]))].into() };
+        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64].into()))].into() };
         let lower = fixture.project.alloc_id();
         let mut fill = Fill::default();
         fill.sources.insert(Channel::Height, Source::Uniform([0.5; 3]));
@@ -3929,6 +5581,124 @@ soft {soft:?}"
     }
 
     #[test]
+    fn an_anchor_on_a_layer_blending_no_channel_still_records_the_stack() {
+        let mut f = fixture();
+        let low = f.project.alloc_id();
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::Height, Source::Uniform([0.4; 3]));
+        f.project.insert_layer(0, Layer::new(low, "Low", LayerKind::Fill(fill), &[Channel::Height]), None, false).unwrap();
+        // an imported anchor layer: an empty paint layer with no channel, holding only the anchor point
+        let holder = f.project.alloc_id();
+        f.project.insert_layer(0, Layer::new(holder, "Anchor", LayerKind::Paint, &[]), None, false).unwrap();
+        let anchor = content_fx(&mut f, holder, EffectKind::Anchor);
+        let top = fill_layer(&mut f.project, [1.0; 3], 0.5);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let source = Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() };
+        mask.effects.push(Effect::new(f.project.alloc_id(), EffectKind::Fill { source, projection: Projection::default() }));
+        f.project.layer_mut(top).unwrap().mask = Some(mask);
+        // 1.0 over 0.5 by the recorded 0.4 (not the channel default)
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.7; 3]));
+    }
+
+    #[test]
+    fn anchors_inside_masks_record_the_mask_below_them() {
+        let mut f = fixture();
+        fill_layer(&mut f.project, [0.0; 3], 0.0);
+        let low = fill_layer(&mut f.project, [1.0; 3], 0.0);
+        let anchor = f.project.alloc_id();
+        let uniform = |f: &mut Fixture, v: f32| {
+            Effect::new(f.project.alloc_id(), EffectKind::Fill { source: Source::Uniform([v; 3]), projection: Projection::default() })
+        };
+        let read = |f: &mut Fixture| {
+            let source = Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() };
+            Effect::new(f.project.alloc_id(), EffectKind::Fill { source, projection: Projection::default() })
+        };
+        // 0.4, recorded, covered by 0, then read back: 0.4
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects = vec![uniform(&mut f, 0.4), Effect::new(anchor, EffectKind::Anchor), uniform(&mut f, 0.0), read(&mut f)];
+        f.project.layer_mut(low).unwrap().mask = Some(mask.clone());
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.4; 3]));
+        // A neighbourhood filter between the anchor and its reader: the field carries what the anchor recorded
+        let blur = Effect::new(f.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 }));
+        mask.effects.insert(3, blur);
+        f.project.layer_mut(low).unwrap().mask = Some(mask);
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.4; 3]));
+        // A layer above reads it too: 0.5 over 0.4 at 0.4
+        let top = fill_layer(&mut f.project, [0.5; 3], 0.0);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects = vec![read(&mut f)];
+        f.project.layer_mut(top).unwrap().mask = Some(mask);
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.44; 3]));
+    }
+
+    #[test]
+    fn anchors_inside_hidden_layers_masks_still_record() {
+        let mut f = fixture();
+        f.project.rules = CompositeRules::measured(HeightNormal::Native);
+        fill_layer(&mut f.project, [0.0; 3], 0.0);
+        // a hidden layer whose mask records 0.4: it draws nothing, but its anchor is evaluated
+        let hidden = fill_layer(&mut f.project, [1.0; 3], 0.0);
+        let anchor = f.project.alloc_id();
+        let mut mask = Mask::new(MaskBackground::Black);
+        let uniform = Effect::new(f.project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.4; 3]), projection: Projection::default() });
+        mask.effects = vec![uniform, Effect::new(anchor, EffectKind::Anchor)];
+        let l = f.project.layer_mut(hidden).unwrap();
+        l.mask = Some(mask);
+        l.visible = false;
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.0; 3]), "the hidden layer draws nothing");
+        // a layer above reads it: 0.5 at 0.4
+        let top = fill_layer(&mut f.project, [0.5; 3], 0.0);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let source = Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() };
+        mask.effects = vec![Effect::new(f.project.alloc_id(), EffectKind::Fill { source, projection: Projection::default() })];
+        f.project.layer_mut(top).unwrap().mask = Some(mask);
+        assert!(close(run(&f, None).value(Channel::BaseColor, 5, 5), [0.2; 3]));
+    }
+
+    #[test]
+    fn graphs_read_anchors_inside_masks_as_the_masks_grey() {
+        use crate::graphs::tests::INVERT;
+        let mut graphs = GraphStore::default();
+        let invert = graphs.add_text(INVERT);
+        let reader = |anchor: LayerId, channel: Channel| {
+            let mut g = GraphRef::new(invert.clone(), "invert");
+            g.inputs.insert(0, GraphInput::Anchor { anchor, channel: Some(channel), levels: None });
+            EffectKind::Graph { graph: g, projection: Projection::default() }
+        };
+        let uniform = |f: &mut Fixture, v: f32| {
+            Effect::new(f.project.alloc_id(), EffectKind::Fill { source: Source::Uniform([v; 3]), projection: Projection::default() })
+        };
+        // a mask records 0.3 at its anchor; the mask of a layer above runs a graph on it: its grey, not a height
+        let mut f = fixture();
+        fill_layer(&mut f.project, [0.0; 3], 0.0);
+        let low = fill_layer(&mut f.project, [1.0; 3], 0.0);
+        let anchor = f.project.alloc_id();
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects = vec![uniform(&mut f, 0.3), Effect::new(anchor, EffectKind::Anchor)];
+        f.project.layer_mut(low).unwrap().mask = Some(mask);
+        let top = fill_layer(&mut f.project, [1.0; 3], 0.0);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects = vec![Effect::new(f.project.alloc_id(), reader(anchor, Channel::Height))];
+        f.project.layer_mut(top).unwrap().mask = Some(mask);
+        let v = run_with(&f, &graphs).value(Channel::BaseColor, 5, 5)[0];
+        assert!((v - (0.3 * 0.3 + 0.7)).abs() < 2e-3, "1 over 0.3 through the inverted mask 0.7: {v}");
+
+        // content reading an anchor in its own layer's mask: the mask is evaluated first
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.0; 3], 0.0);
+        let anchor = f.project.alloc_id();
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects = vec![uniform(&mut f, 0.3), Effect::new(anchor, EffectKind::Anchor), uniform(&mut f, 1.0)];
+        let fx = f.project.alloc_id();
+        let l = f.project.layer_mut(id).unwrap();
+        l.mask = Some(mask);
+        l.content_effects.push(Effect::new(fx, reader(anchor, Channel::BaseColor)));
+        let v = run_with(&f, &graphs).value(Channel::BaseColor, 5, 5)[0];
+        let want = texturecraft_texel::srgb_to_linear(0.7);
+        assert!((v - want).abs() < 2e-3, "the content is the inverted grey 0.3: {v} (want {want})");
+    }
+
+    #[test]
     fn decal_fills_cover_only_their_frame_and_image_alpha() {
         let mut f = fixture();
         let s = f.gbuf.surface(&f.mesh, 32 * 64 + 32).unwrap();
@@ -3960,6 +5730,7 @@ soft {soft:?}"
                 block_scales: f.project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: crate::GraphStore::empty(),
                 bounds: f.mesh.bounds(),
             };
             let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);
@@ -4006,6 +5777,7 @@ soft {soft:?}"
             block_scales: project.texture_sets[0].block_scales(),
             preview: None,
             images: &images,
+            graphs: GraphStore::empty(),
             bounds: mesh.bounds(),
         };
         let mut out = Composite::new(&project.texture_sets[0].channel_list(), 64);
@@ -4182,6 +5954,7 @@ soft {soft:?}"
                 block_scales: project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: GraphStore::empty(),
                 bounds: f.mesh.bounds(),
             };
             let mut out = Composite::new(&project.texture_sets[0].channel_list(), 64);
@@ -4191,6 +5964,40 @@ soft {soft:?}"
         assert!(close(texel(&f, [false, false]), [1.0, 0.0, 0.0]), "the left half shows red");
         assert!(close(texel(&f, [true, false]), [0.0, 0.0, 1.0]), "Flip U shows the right half there");
         assert!(close(texel(&f, [false, true]), [1.0, 0.0, 0.0]), "Flip V leaves the left half");
+    }
+
+    #[test]
+    fn a_fill_image_covers_by_its_alpha() {
+        let mut f = fixture();
+        f.project.rules = CompositeRules::measured(HeightNormal::Native);
+        fill_layer(&mut f.project, [0.2; 3], 1.0);
+        let id = f.project.alloc_id();
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::BaseColor, Source::image("img"));
+        f.project.insert_layer(0, Layer::new(id, "Image", LayerKind::Fill(fill), &[Channel::BaseColor]), None, false).unwrap();
+        let composite = |alpha: f32| {
+            let img = crate::store::ImageRes { width: 2, height: 2, rgba: vec![[1.0, 0.0, 0.0, alpha]; 4], srgb: false };
+            let images: ImageStore = [("img".to_string(), std::sync::Arc::new(img))].into_iter().collect();
+            let inp = Inputs {
+                project: &f.project,
+                ts: 0,
+                mesh: &f.mesh,
+                gbuf: &f.gbuf,
+                pixels: &f.pixels,
+                baked: &f.baked,
+                block_scales: f.project.texture_sets[0].block_scales(),
+                preview: None,
+                images: &images,
+                graphs: crate::GraphStore::empty(),
+                bounds: f.mesh.bounds(),
+            };
+            let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);
+            composite_tiles(&inp, &mut out, &all_tiles(64, 64));
+            out.value(Channel::BaseColor, 9, 9)
+        };
+        assert!(close(composite(1.0), [1.0, 0.0, 0.0]), "{:?}", composite(1.0));
+        assert!(close(composite(0.0), [0.2; 3]), "a transparent image leaves what is below: {:?}", composite(0.0));
+        assert!(close(composite(0.5), [0.6, 0.1, 0.1]), "{:?}", composite(0.5));
     }
 
     #[test]
@@ -4297,5 +6104,65 @@ soft {soft:?}"
             assert!(near(*m, texturecraft_core::gradient(&RAMP, t[0]).unwrap()), "{t:?} -> {m:?}");
             assert!((rough[0] - mix3(low, high, t[0])[0]).abs() < 1e-3, "roughness ignores the stops: {rough:?}");
         }
+    }
+
+    /// A placed projection on the 2 × 2 plane (the scene unit is 2): `projection` on a fill of roughness `rough`.
+    fn placed_roughness(projection: texturecraft_core::PlacedProjection, source: Source, graphs: &GraphStore, at: (u32, u32)) -> f32 {
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.0; 3], 0.0);
+        if let Some(LayerKind::Fill(fill)) = f.project.layers.get_mut(&id).map(|l| &mut l.kind) {
+            fill.sources.insert(Channel::Roughness, source);
+            fill.projection = Projection::Placed(Box::new(projection));
+        }
+        run_with(&f, graphs).value(Channel::Roughness, at.0, at.1)[0]
+    }
+
+    #[test]
+    fn placed_tri_planar_prefilters_each_texel_unless_unfiltered() {
+        use texturecraft_core::{ImagePlacement, PlacedMode, PlacedProjection, Repeat, Volume};
+        // white on the left half of the image, black on the right
+        let halves = "format 3\nsize 64\nsubgraph c\nmeta kind \"function\"\nnode 2 f_pos\nnode 3 f_swizzle a=@2 mask=\"x\"\nnode 4 f_float v=0.5\nnode 5 f_lt a=@3 b=@4\nnode 1 f_out in=@5\nend\nnode 1 pixel_processor fn=\"c\"\noutput out 1\n";
+        let mut graphs = GraphStore::default();
+        let key = graphs.add_text(halves);
+        let read = |unfiltered: bool| {
+            let mut g = GraphRef::new(key.clone(), "halves");
+            g.unfiltered = unfiltered;
+            // the image once per texel (64 repetitions over the plane), each texel's centre a quarter into the white half
+            let image = ImagePlacement { tiling: [64.0, 64.0], rotation: 0.0, offset: [-0.25 / 64.0, 0.0] };
+            let p = PlacedProjection { mode: PlacedMode::TriPlanar { hardness: 0.5 }, volume: Volume::default(), image, repeat: Repeat::Both };
+            placed_roughness(p, Source::Graph(Box::new(g)), &graphs, (10, 10))
+        };
+        let filtered = read(false);
+        assert!((filtered - 0.5).abs() < 0.03, "a texel spanning the whole image reads its mean: {filtered}");
+        let unfiltered = read(true);
+        assert!(unfiltered > 0.98, "bilinear at the texel's centre: {unfiltered}");
+    }
+
+    #[test]
+    fn placed_projections_cover_only_their_volume_and_image() {
+        use texturecraft_core::{FacingFalloff, Falloff, ImagePlacement, PlacedMode, PlacedProjection, Repeat, Volume};
+        let graphs = GraphStore::default();
+        // a planar volume a quarter of the scene wide (half a unit of the plane's 2), clipped: texel 32 is inside
+        // (x ≈ 0), texel 60 outside (x ≈ 0.9); outside the empty stack's roughness shows
+        let planar = PlacedProjection {
+            mode: PlacedMode::Planar { depth: Falloff::default(), facing: FacingFalloff::default() },
+            volume: Volume { size: [0.25; 3], clip: true, ..Volume::default() },
+            image: ImagePlacement::default(),
+            repeat: Repeat::Both,
+        };
+        let empty = run(&fixture(), None).value(Channel::Roughness, 60, 32)[0];
+        assert!((placed_roughness(planar.clone(), Source::Uniform([0.9; 3]), &graphs, (32, 32)) - 0.9).abs() < 1e-3);
+        assert!((placed_roughness(planar, Source::Uniform([0.9; 3]), &graphs, (60, 32)) - empty).abs() < 1e-3);
+        // a UV image placed twice as large without repeat covers the UV square's first half only
+        let once = PlacedProjection {
+            mode: PlacedMode::Uv { scale: [2.0, 2.0], rotation: 0.0, offset: [0.0, 0.0] },
+            volume: Volume::default(),
+            image: ImagePlacement::default(),
+            repeat: Repeat::None,
+        };
+        assert!((placed_roughness(once.clone(), Source::Uniform([0.9; 3]), &graphs, (10, 10)) - 0.9).abs() < 1e-3);
+        assert!((placed_roughness(once.clone(), Source::Uniform([0.9; 3]), &graphs, (50, 10)) - empty).abs() < 1e-3);
+        let along_u = PlacedProjection { repeat: Repeat::U, ..once };
+        assert!((placed_roughness(along_u, Source::Uniform([0.9; 3]), &graphs, (50, 10)) - 0.9).abs() < 1e-3);
     }
 }

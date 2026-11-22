@@ -18,7 +18,13 @@ impl Session {
     /// Evaluate the ordinary material stack on a small UV grid, sharing its source pixels,
     /// images and bakes. This never enters a paint, undo or export cache.
     pub fn material_overview(&self, ts: usize, max_edge: u32) -> Option<MaterialOverview> {
-        let set = self.doc.project.texture_sets.get(ts)?;
+        let project = self.solo_view();
+        let project = project.as_ref().unwrap_or(&self.doc.project);
+        let set = project.texture_sets.get(ts)?;
+        // A small overview must not replace the graph cooks used by the full-size composite.
+        if project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)).any(|layer| !layer.graphs().is_empty()) {
+            return None;
+        }
         let (w, h) = set.size();
         let limit = max_edge.clamp(TILE, 256);
         let mut step = 1;
@@ -43,10 +49,9 @@ impl Session {
         let empty = BakedMaps::default();
         let baked = self.doc.baked.get(&ts).unwrap_or(&empty);
         let channels = set.channel_list();
-        let project = self.solo_view();
         let scales = set.block_scales().at_reduced_resolution(step);
         let inputs = Inputs {
-            project: project.as_ref().unwrap_or(&self.doc.project),
+            project,
             ts,
             mesh: &self.mesh,
             gbuf: &gbuf,
@@ -55,6 +60,7 @@ impl Session {
             block_scales: scales.clone(),
             preview: None,
             images: &self.images,
+            graphs: texturecraft_compose::GraphStore::empty(),
             bounds: self.mesh.bounds(),
         };
         let mut composite = Composite { block_scales: scales, ..Composite::with_size(&channels, width, height) };

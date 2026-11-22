@@ -11,7 +11,7 @@ use crate::TextureCraftApp;
 use crate::dock::with;
 use crate::fill_source_target::FillSourceTarget;
 use crate::filter_slot::{SLOT_HEIGHT, paint};
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 use crate::resource_picker;
 use crate::resource_picker_anchor::ResourcePickerAnchor;
 use crate::resource_picker_choice::ResourcePickerChoice;
@@ -87,6 +87,7 @@ fn shown(app: &mut TextureCraftApp, ctx: &egui::Context, source: &Source) -> (St
             let name = format!("{} · {}", layer_name(app, *anchor), tr(read_label(app, *anchor, *channel)));
             (name, app.layer_panel.texture_outside(ctx, &app.session, ThumbTarget::Stage { effect: *anchor, channel: *channel }))
         }
+        Source::Graph(graph) => (trf("Graph: {name}", &[("name", &graph.name)]), None),
     }
 }
 
@@ -124,13 +125,13 @@ fn current_key(source: &Source) -> Option<String> {
         Source::Uniform(_) => Some(UNIFORM_KEY.to_string()),
         Source::Procedural { pattern, .. } => Some(format!("{PATTERN_PREFIX}{}", pattern.kind.label())),
         Source::Image { name, .. } => Some(format!("{IMAGE_PREFIX}{name}")),
-        Source::Anchor { .. } => None,
+        Source::Anchor { .. } | Source::Graph(_) => None,
     }
 }
 
 /// The Resources tab: the patterns, the project's images and a uniform value
 fn tiles(app: &mut TextureCraftApp, ctx: &egui::Context) -> Vec<ResourcePickerTile<'static>> {
-    let mut tiles = Vec::with_capacity(ProceduralKind::ALL.len() + app.session.images.len() + 1);
+    let mut tiles = Vec::with_capacity(ProceduralKind::ALL.len() + 1);
     tiles.extend(ProceduralKind::ALL.into_iter().map(|kind| ResourcePickerTile {
         key: format!("{PATTERN_PREFIX}{}", kind.label()),
         label: tr(kind.label()).to_string(),
@@ -141,7 +142,7 @@ fn tiles(app: &mut TextureCraftApp, ctx: &egui::Context) -> Vec<ResourcePickerTi
     }));
 
     let first_image = tiles.len();
-    for (name, image) in &app.session.images {
+    for (name, image) in app.session.images.iter() {
         let preview_name = name.clone();
         let preview_image = image.clone();
         tiles.push(ResourcePickerTile {
@@ -308,7 +309,7 @@ mod tests {
         let LayerKind::Fill(fill) = &app.session.doc.project.layers[&layer].kind else { panic!("a fill layer") };
         assert_eq!(fill.source(Channel::Height), Source::image(first_name));
 
-        app.session.images.clear();
+        app.session.images = Default::default();
         app.thumbs.sync_images(&app.session.images, app.session.revision + 1);
 
         assert_eq!(image_preview_count(&harness.ctx), 0, "removed images release all picker preview textures");

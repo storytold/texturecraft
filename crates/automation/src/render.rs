@@ -12,6 +12,9 @@ use texturecraft_render::gpu_trace::GpuTracer;
 use texturecraft_render::trace::{TraceDisplay, TraceScene, TraceSet, TraceSettings, Tracer};
 use texturecraft_render::{Frame, Shade, ViewKind};
 
+/// Display tiles converted and uploaded between two hand-overs to the device.
+const UPLOAD_CHUNK: usize = 64;
+
 /// A headless GPU device that remembers what it already holds of the session.
 pub struct Gpu {
     h: texturecraft_render::headless::Headless,
@@ -34,7 +37,6 @@ impl Gpu {
 
     /// Bring the GPU up to date with the session (mesh, texture sets, environment, dirty tiles).
     fn sync(&mut self, session: &mut Session) {
-        session.update();
         let headless = &mut self.h;
         let mut reupload = false;
         if self.mesh_id != session.mesh_id {
@@ -59,6 +61,7 @@ impl Gpu {
         }
 
         for set_index in 0..session.caches.len() {
+            session.update_only(&[set_index]);
             let mut tiles = session.take_uploads(set_index);
             let Some(cache) = session.caches.get(set_index) else { continue };
             if reupload {
@@ -69,8 +72,7 @@ impl Gpu {
             let composite = &cache.composite;
 
             // Limit live converted pixels while retaining parallel conversion within each batch
-            const UPLOAD_TILES_PER_BATCH: usize = 64;
-            for batch in tiles.chunks(UPLOAD_TILES_PER_BATCH) {
+            for batch in tiles.chunks(UPLOAD_CHUNK) {
                 let bytes: Vec<_> = batch
                     .par_iter()
                     .flat_map_iter(|&(tile_x, tile_y)| DisplayKind::ALL.into_iter().map(move |kind| (kind, tile_x, tile_y)))
@@ -79,6 +81,7 @@ impl Gpu {
                 for (kind, tile_x, tile_y, pixels) in bytes {
                     headless.renderer.upload_tile(&headless.device, &headless.queue, set_index, kind, tile_x, tile_y, &pixels);
                 }
+                headless.flush();
             }
 
             // The aux texture behind the mesh-map and mask views (rebuilt every render)
@@ -241,7 +244,7 @@ mod tests {
         let mesh = texturecraft_engine::geom::primitives::material_ball();
         let mut s = Session::new_project("t", mesh, "builtin:material_ball", None, 256).unwrap();
         let name = s.import_resource_bytes("sky.hdr", sky_hdr()).unwrap();
-        assert!(s.images[&name].rgba[0][0] > 10.0, "the decoder keeps HDR values");
+        assert!(s.images.get(&name).unwrap().rgba[0][0] > 10.0, "the decoder keeps HDR values");
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;

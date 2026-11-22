@@ -40,6 +40,7 @@ pub mod i18n;
 pub mod id_color_pick;
 #[cfg(not(target_arch = "wasm32"))]
 mod import_resources;
+pub mod import_ui;
 mod inactive_set_hint;
 pub mod keymap;
 pub mod layer_panel;
@@ -220,6 +221,8 @@ pub struct TextureCraftApp {
     /// The Import PBR textures dialog while it is open.
     pub pbr_import: Option<pbr_import::PbrDialog>,
     pub resize: Option<ResizeJob>,
+    /// The project import's windows and the conversion running behind them.
+    pub import: Option<import_ui::ImportUi>,
     pub link_cooks: Vec<LinkCook>,
     #[cfg(not(target_arch = "wasm32"))]
     link_imports: Vec<link_import::LinkImport>,
@@ -319,6 +322,7 @@ impl TextureCraftApp {
 
         let next_autosave = autosave_period_seconds(ui.prefs.autosave_minutes);
         ui.prefs.apply_resource_limits();
+        ui.prefs.apply_graph_budget();
 
         let mut app = TextureCraftApp {
             camera_glide: None,
@@ -336,6 +340,7 @@ impl TextureCraftApp {
             bake_report: Default::default(),
             pbr_import: None,
             resize: None,
+            import: None,
             link_cooks: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             link_imports: Vec::new(),
@@ -439,13 +444,8 @@ impl TextureCraftApp {
                 }
 
                 // Pending work and thumbnail snapshots belong to the old project
-                if matches!(id, "file.open" | "file.new" | "file.close" | "project.new" | "project.sample") {
-                    self.pbr_import = None;
-                    self.resize = None;
-                    #[cfg(not(target_arch = "wasm32"))]
-                    self.link_imports.clear();
-                    self.link_cooks.clear();
-                    self.layer_panel = Default::default();
+                if matches!(id, "file.open" | "file.new" | "file.close" | "file.importProject" | "project.new" | "project.sample") {
+                    self.clear_project_jobs();
                 }
 
                 // Schedule the reset only when Painting or Baking draws a 2D view
@@ -481,6 +481,17 @@ impl TextureCraftApp {
                 None
             }
         }
+    }
+
+    /// Clear work that belongs to the previous project after replacing or closing it.
+    pub(crate) fn clear_project_jobs(&mut self) {
+        self.pbr_import = None;
+        self.resize = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.link_imports.clear();
+        self.link_cooks.clear();
+        self.layer_panel = Default::default();
+        self.camera_glide = None;
     }
 
     /// After command `id` ran without starting a glide (the camera was `before`): a projection switch
@@ -775,7 +786,7 @@ impl TextureCraftApp {
                 let gpu = self
                     .render_state
                     .as_ref()
-                    .filter(|_| self.ui.prefs.gpu_compositing && self.gpu.as_ref().is_some_and(gpu::GpuLink::supports_gpu_resize))
+                    .filter(|_| self.ui.prefs.gpu_compositing && self.gpu.as_ref().is_some_and(gpu::GpuLink::supports_gpu_layers))
                     .map(|state| (state.device.clone(), state.queue.clone()));
                 let rx = spawn_worker("texturecraft-resize", move || {
                     #[cfg(not(target_arch = "wasm32"))]

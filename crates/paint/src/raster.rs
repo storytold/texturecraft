@@ -58,10 +58,44 @@ impl StrokeCanvas {
         }
     }
 
+    /// Multiply the stroke's coverage by `factor(x, y)` (clamped to 0..1) on every texel it touched: a stencil limiting
+    /// the stroke as a whole ([`crate::stencil`]).
+    pub fn scale(&mut self, factor: impl Fn(u32, u32) -> f32 + Sync) {
+        let (width, height) = (self.alpha.width(), self.alpha.height());
+        let alpha = &self.alpha;
+        let scaled: Vec<((u32, u32), Vec<u16>)> = self
+            .dirty
+            .par_iter()
+            .filter_map(|&(tx, ty)| {
+                let mut data = alpha.tile(tx, ty)?.to_vec();
+                for (i, v) in data.iter_mut().enumerate() {
+                    let (x, y) = (tx * TILE + i as u32 % TILE, ty * TILE + i as u32 / TILE);
+                    if *v == 0 || x >= width || y >= height {
+                        continue;
+                    }
+                    let f = factor(x, y);
+                    *v = to_u16(from_u16(*v) * if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 });
+                }
+                Some(((tx, ty), data))
+            })
+            .collect();
+        for ((tx, ty), data) in scaled {
+            self.alpha.set_tile(tx, ty, Some(std::sync::Arc::new(data)));
+        }
+    }
+
     fn touch(&mut self, x: u32, y: u32) {
         let t = (x / TILE, y / TILE);
         self.dirty.insert(t);
         self.recent.insert(t);
+    }
+
+    /// Lays `texels` (`(x, y, alpha)`) as one stamp, "over" what the canvas holds; a canvas not the size of `gbuf`
+    /// starts over first (bands along a path, [`crate::ribbon`]).
+    pub(crate) fn add_texels(&mut self, gbuf: &UvGBuffer, texels: Vec<(u32, u32, f32)>) {
+        self.fit(gbuf);
+        self.texels = texels;
+        self.add_stamp([0.0; 2], None);
     }
 
     /// Blend the gathered stamp texels (stamp center `center` in texels) into the stroke: the
@@ -165,6 +199,62 @@ fn surface_visible(context: &RasterCtx, depth: &EyeDepth, point: Vec3, geometric
     uncertain && ray_reaches_eye(context, depth, allowed_point, geometric_normal, to_eye)
 }
 
+/// Which surfaces in a stamp's volume it reaches, by how far their normal turns from the stamp's.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Facing {
+    /// Surfaces on the stamp's side (TextureCraft's own painting).
+    #[default]
+    Front,
+    /// A smooth fade over the cosine between a texel's normal and the stamp's: everything at `full` and above,
+    /// nothing at `none` and below (`none` < `full`). Off by default; for strokes replayed from an imported project,
+    /// whose brush fades by that angle and not by the view.
+    Fade { full: f32, none: f32 },
+    /// Every surface in the volume, whichever way it faces.
+    Any,
+}
+
+/// How far from a stamp's centre a texel lies, and so which surfaces in its volume it reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Reach {
+    /// The texel's offset laid flat on the stamp's plane, cut off at the stamp's depth (TextureCraft's own painting).
+    #[default]
+    Plane,
+    /// The texel's distance along the surface ([`surface_reach`]): a stamp keeps its size on grazing surfaces and
+    /// wraps over edges, and a surface lying off the stamp's surface (a sheet behind another) fades out the further off
+    /// it lies; the stamp's depth is not used. Off by default; for strokes replayed from an imported project, whose
+    /// dabs reach so (measured).
+    Surface,
+}
+
+/// Reach off the smooth curve: the distance scales by `(1 − x²)` to this power (measured on stacked sheets and a
+/// cylinder).
+const OFF_CURVE_POWER: f32 = -0.85;
+
+/// Least `cos(φ / 2)` the surface distance divides by (a texel turned almost a half turn from the stamp).
+const MIN_HALF_TURN: f32 = 0.05;
+
+/// How far from a stamp's centre a texel lies along the surface, as a share of `radius` (infinite: out of reach).
+/// `offset` goes from the centre to the texel, `center_normal` and `texel_normal` are the unit normals there. On a
+/// smooth surface this is the straight-line distance: `t / cos(φ / 2)`, with `t` the offset's length in the centre's
+/// tangent plane and `φ` the turn between the normals. A surface lying off that curve by `x` radii along the centre's
+/// normal comes nearer the rim the further off it lies: the distance scales by `(1 − x²)^−0.85`, and `x ≥ 1` is out of
+/// reach.
+pub fn surface_reach(offset: Vec3, center_normal: Vec3, texel_normal: Vec3, radius: f32) -> f32 {
+    if radius.is_nan() || radius <= 0.0 {
+        return f32::INFINITY;
+    }
+    let along = offset.dot(center_normal);
+    let flat = (offset - center_normal * along).length();
+    let half = (0.5 * (1.0 + center_normal.dot(texel_normal)).clamp(0.0, 2.0)).sqrt();
+    let sin_half = (1.0 - half * half).max(0.0).sqrt();
+    let curve = if half > 1e-3 { flat * sin_half / half } else { 0.0 };
+    let beyond = ((along.abs() - curve).max(0.0) / radius).min(1.0);
+    if beyond >= 1.0 || beyond.is_nan() {
+        return f32::INFINITY;
+    }
+    flat / half.max(MIN_HALF_TURN) / radius * (1.0 - beyond * beyond).powf(OFF_CURVE_POWER)
+}
+
 /// What the rasterizer reads.
 pub struct RasterCtx<'a> {
     pub mesh: &'a Mesh,
@@ -178,6 +268,10 @@ pub struct RasterCtx<'a> {
     /// Angle fade from/to in degrees.
     pub angle_fade: (f32, f32),
     pub shape: Shape<'a>,
+    /// Which surfaces a stamp reaches by their turn from its normal ([`Facing::Front`] for painting).
+    pub facing: Facing,
+    /// How far a stamp reaches ([`Reach::Plane`] for painting).
+    pub reach: Reach,
 }
 
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
@@ -187,48 +281,74 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 
 /// Accumulate `stamps` into `canvas` ("over": `m = a + m·(1 − a)`).
 pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp]) {
-    // Keep small batches serial to avoid scheduling overhead
-    const PARALLEL_TRIANGLE_THRESHOLD: usize = 16;
-
-    let (width, height) = (context.gbuf.width, context.gbuf.height);
     canvas.fit(context.gbuf);
-    let fade_lo = context.angle_fade.1.to_radians().cos();
-    let fade_hi = context.angle_fade.0.to_radians().cos();
-
-    // The camera scale is shared by every candidate texel in this batch
-    let pixels_per_unit = context.depth.map_or(1.0, |depth| {
-        let ndc_per_unit = depth.view_proj.row(1).truncate().length();
-        (depth.height as f32 * ndc_per_unit).max(f32::EPSILON)
-    });
-
+    let scan = Scan::new(context);
     let mut triangles = Vec::new();
     for stamp in stamps {
-        if stamp.radius.is_nan() || stamp.radius <= 0.0 || !stamp.center.is_finite() {
-            continue;
+        let mut texels = std::mem::take(&mut canvas.texels);
+        let center = scan.stamp(stamp, &mut triangles, &mut texels);
+        canvas.texels = texels;
+        if let Some(center) = center {
+            canvas.add_stamp(center, stamp.source);
         }
+    }
+}
 
-        let extent = stamp.world_extent();
+/// The texels one stamp reaches, `(x, y, alpha)` with its shape, flow and fades: what [`rasterize`] lays for it,
+/// without laying it (for tools that use a stamp's texels themselves, such as replayed smudging).
+pub fn footprint(context: &RasterCtx, stamp: &Stamp) -> Vec<(u32, u32, f32)> {
+    let mut texels = Vec::new();
+    Scan::new(context).stamp(stamp, &mut Vec::new(), &mut texels);
+    texels
+}
+
+/// What every stamp of a batch shares while its texels are found.
+struct Scan<'c, 'a> {
+    context: &'c RasterCtx<'a>,
+    fade_lo: f32,
+    fade_hi: f32,
+    /// The camera's scale, shared by every candidate texel.
+    pixels_per_unit: f32,
+}
+
+impl<'c, 'a> Scan<'c, 'a> {
+    fn new(context: &'c RasterCtx<'a>) -> Scan<'c, 'a> {
+        let pixels_per_unit = context.depth.map_or(1.0, |depth| {
+            let ndc_per_unit = depth.view_proj.row(1).truncate().length();
+            (depth.height as f32 * ndc_per_unit).max(f32::EPSILON)
+        });
+        Scan { context, fade_lo: context.angle_fade.1.to_radians().cos(), fade_hi: context.angle_fade.0.to_radians().cos(), pixels_per_unit }
+    }
+
+    /// Appends the texels `stamp` reaches to `texels` (`triangles`: scratch); the texel centre nearest the stamp's
+    /// centre (the pickup's centre), `None` for a stamp that is no stamp.
+    fn stamp(&self, stamp: &Stamp, triangles: &mut Vec<u32>, texels: &mut Vec<(u32, u32, f32)>) -> Option<[f32; 2]> {
+        let context = self.context;
+        if stamp.radius.is_nan() || stamp.radius <= 0.0 || !stamp.center.is_finite() {
+            return None;
+        }
+        let (width, height) = (context.gbuf.width, context.gbuf.height);
+        let extent = match context.reach {
+            Reach::Plane => stamp.world_extent(),
+            Reach::Surface => Vec3::splat(stamp.radius * stamp.depth.max(1.0) * 1.42),
+        };
         triangles.clear();
         context.bvh.query_box(stamp.center - extent, stamp.center + extent, |triangle| triangles.push(triangle));
 
         // Each texel belongs to one triangle, so large stamps can scan triangles in parallel
-        let scan = |&triangle: &u32| scan_triangle(context, stamp, triangle, width, height, fade_lo, fade_hi, pixels_per_unit);
-        let parts: Vec<TriTexels> = if triangles.len() > PARALLEL_TRIANGLE_THRESHOLD {
-            triangles.par_iter().filter_map(scan).collect()
-        } else {
-            triangles.iter().filter_map(scan).collect()
-        };
+        let scan = |&triangle: &u32| scan_triangle(context, stamp, triangle, width, height, self.fade_lo, self.fade_hi, self.pixels_per_unit);
+        let parts: Vec<TriTexels> =
+            if triangles.len() > 16 { triangles.par_iter().filter_map(scan).collect() } else { triangles.iter().filter_map(scan).collect() };
 
         // The footprint texel nearest the stamp center supplies the pickup's center
         let mut center = ([0.0f32; 2], f32::MAX);
-        for (texels, nearest) in parts {
+        for (found, nearest) in parts {
             if nearest.1 < center.1 {
                 center = nearest;
             }
-            canvas.texels.extend(texels);
+            texels.extend(found);
         }
-
-        canvas.add_stamp(center.0, stamp.source);
+        Some(center.0)
     }
 }
 
@@ -279,14 +399,29 @@ fn scan_triangle(
             let b0 = 1.0 - b1 - b2;
             let position = *position_a * b0 + *position_b * b1 + *position_c * b2;
             let offset = position - stamp.center;
-            let local_x = offset.dot(stamp.tangent) / stamp.radius;
-            let local_y = offset.dot(stamp.bitangent) / stamp.radius;
-            if local_x * local_x + local_y * local_y > 2.0 {
+            let mut local_x = offset.dot(stamp.tangent) / stamp.radius;
+            let mut local_y = offset.dot(stamp.bitangent) / stamp.radius;
+            let flat_squared = local_x * local_x + local_y * local_y;
+            // the surface distance is never shorter than the flat one, so this bound holds for both reaches
+            if flat_squared > 2.0 {
                 continue;
             }
 
-            if offset.dot(stamp.normal).abs() > stamp.radius * stamp.depth {
+            if context.reach == Reach::Plane && offset.dot(stamp.normal).abs() > stamp.radius * stamp.depth {
                 continue;
+            }
+
+            let normal = (*normal_a * b0 + *normal_b * b1 + *normal_c * b2).try_normalize().unwrap_or(stamp.normal);
+            if context.reach == Reach::Surface {
+                // the tip is read at the surface distance, in the offset's direction on the stamp's plane
+                let distance = surface_reach(offset, stamp.normal, normal, stamp.radius);
+                if distance.is_nan() || distance * distance > 2.0 {
+                    continue;
+                }
+                let flat = flat_squared.sqrt();
+                let scale = if flat > 1e-6 { distance / flat } else { 1.0 };
+                local_x *= scale;
+                local_y *= scale;
             }
 
             let distance_squared = offset.length_squared();
@@ -294,8 +429,12 @@ fn scan_triangle(
                 center = ([x as f32 + 0.5, y as f32 + 0.5], distance_squared);
             }
 
-            let normal = (*normal_a * b0 + *normal_b * b1 + *normal_c * b2).try_normalize().unwrap_or(stamp.normal);
-            if normal.dot(stamp.normal) <= 0.0 {
+            let turn = match context.facing {
+                Facing::Front if normal.dot(stamp.normal) <= 0.0 => continue,
+                Facing::Front | Facing::Any => 1.0,
+                Facing::Fade { full, none } => smoothstep(none, full, normal.dot(stamp.normal)),
+            };
+            if turn <= 0.0 {
                 continue;
             }
 
@@ -317,7 +456,7 @@ fn scan_triangle(
             }
 
             let fade = if context.backface_culling { smoothstep(fade_lo, fade_hi, facing) } else { 1.0 };
-            let alpha = shape.sample(local_x, local_y, stamp.hardness, stamp.seed) * stamp.flow * fade;
+            let alpha = shape.sample(local_x, local_y, stamp.hardness, stamp.seed) * stamp.flow * fade * turn;
             if alpha > 0.0 {
                 texels.push((x, y, alpha));
             }
@@ -408,6 +547,8 @@ mod tests {
             backface_culling: false,
             angle_fade: (89.0, 90.0),
             shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
+            facing: Facing::Front,
+            reach: Reach::Plane,
         };
         let stamp = Stamp {
             center: Vec3::new(0.0, 0.03, 0.0),
@@ -453,6 +594,8 @@ mod tests {
             backface_culling: true,
             angle_fade: (89.0, 90.0),
             shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
+            facing: Facing::Front,
+            reach: Reach::Plane,
         };
         let point = Vec3::ZERO;
         let to_eye = (camera.eye() - point).normalize();
@@ -484,6 +627,8 @@ mod tests {
             backface_culling: true,
             angle_fade: (89.0, 90.0),
             shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
+            facing: Facing::Front,
+            reach: Reach::Plane,
         };
         let point = Vec3::new(1.0, 0.0, 0.0);
         let to_eye = (camera.eye() - point).normalize();
@@ -510,6 +655,8 @@ mod tests {
             backface_culling: false,
             angle_fade: (89.0, 90.0),
             shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
+            facing: Facing::Front,
+            reach: Reach::Plane,
         };
         let to_eye = -camera.forward();
         let behind = context.eye + to_eye;
@@ -572,6 +719,8 @@ mod tests {
             backface_culling: culling,
             angle_fade: (89.0, 90.0),
             shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
+            facing: Facing::Front,
+            reach: Reach::Plane,
         };
         let stamp =
             Stamp { center, normal: Vec3::Y, tangent: Vec3::X, bitangent: Vec3::Z, radius, flow: 1.0, hardness: 0.9, depth: 1.0, seed: 0, source: None };
@@ -701,6 +850,8 @@ mod tests {
             backface_culling: false,
             angle_fade: (89.0, 90.0),
             shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
+            facing: Facing::Front,
+            reach: Reach::Plane,
         };
 
         // A silhouette normal is perpendicular to the direction from the surface to the eye
@@ -771,6 +922,8 @@ mod tests {
             backface_culling: true,
             angle_fade: (70.0, 85.0),
             shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
+            facing: Facing::Front,
+            reach: Reach::Plane,
         };
         let stamp = Stamp {
             center: Vec3::ZERO,
@@ -801,6 +954,178 @@ mod tests {
         rasterize(&mut underside, &below, &[stamp]);
 
         assert!(underside.dirty.is_empty());
+
+        // its footprint is what it lays
+        let texels = footprint(&context, &stamp);
+        assert!(!texels.is_empty());
+        assert!(texels.iter().all(|&(x, y, a)| (from_u16(canvas.alpha.get(x, y)[0]) - a.min(1.0)).abs() < 1e-4));
+        let uv = UvStamp { center: texturecraft_geom::glam::Vec2::splat(0.5), radius: 0.125, angle: 0.0, flow: 0.5, hardness: 0.9, seed: 0, source: None };
+        let mut c3 = StrokeCanvas::new(128, 128);
+        rasterize_uv(&mut c3, &uv_buffer, context.shape, &[uv]);
+        let texels = footprint_uv(&uv_buffer, context.shape, &uv);
+        assert!(!texels.is_empty() && texels.iter().all(|&(x, y, a)| (from_u16(c3.alpha.get(x, y)[0]) - a).abs() < 1e-4));
+    }
+
+    #[test]
+    fn facing_fades_or_reaches_surfaces_turned_from_the_stamp() {
+        // a folded strip: the left half faces +Y, the right half turns down to face +X (a wall at x = 0)
+        let mut m = primitives::plane(2.0, 16);
+        for (p, n) in m.positions.iter_mut().zip(m.normals.iter_mut()) {
+            if p.x > 0.0 {
+                *p = Vec3::new(0.0, -p.x, p.z);
+                *n = Vec3::X;
+            }
+        }
+        let bvh = Bvh::new(&m);
+        let g = UvGBuffer::new(&m, 0, 128, 128);
+        let ctx = |facing| RasterCtx {
+            mesh: &m,
+            bvh: &bvh,
+            gbuf: &g,
+            material: 0,
+            depth: None,
+            eye: Vec3::new(1.0, 5.0, 0.0),
+            backface_culling: false,
+            angle_fade: (70.0, 85.0),
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
+            facing,
+            reach: Reach::Plane,
+        };
+        // a stamp on the fold, facing up: the wall turns a quarter from it (cosine 0)
+        let st = Stamp {
+            center: Vec3::new(0.0, 0.0, 0.0),
+            normal: Vec3::Y,
+            tangent: Vec3::X,
+            bitangent: Vec3::Z,
+            radius: 0.6,
+            flow: 1.0,
+            hardness: 0.9,
+            depth: 1.0,
+            seed: 0,
+            source: None,
+        };
+        let wall = |facing| {
+            let mut c = StrokeCanvas::new(128, 128);
+            rasterize(&mut c, &ctx(facing), &[st]);
+            // a wall texel a quarter below the fold (past the triangles whose normals blend across it), and a floor
+            // texel as far the other way
+            (from_u16(c.alpha.get(64 + 16, 64)[0]), from_u16(c.alpha.get(64 - 16, 64)[0]))
+        };
+        let (front, floor) = wall(Facing::Front);
+        assert_eq!(front, 0.0, "a quarter turn is not on the stamp's side");
+        assert!(floor > 0.9);
+        let (half, floor) = wall(Facing::Fade { full: 0.25, none: -0.25 });
+        assert!((half - 0.5).abs() < 0.05 && floor > 0.9, "cosine 0 sits halfway through the fade: {half}");
+        let (none, _) = wall(Facing::Fade { full: 1.0, none: 0.5 });
+        assert_eq!(none, 0.0);
+        assert!(wall(Facing::Any).0 > 0.9);
+    }
+
+    #[test]
+    fn surface_reach_follows_the_measured_rule() {
+        // offset, centre normal, texel normal, radius, expected share (measured on stacked sheets and a cylinder)
+        let z = [0.0, 0.0, 1.0];
+        type Row = ([f32; 3], [f32; 3], [f32; 3], f32, f32);
+        let rows: [Row; 8] = [
+            ([0.05, 0.0, 0.0], z, z, 0.1, 0.5),
+            ([0.05, 0.05, 0.0], z, z, 0.1, std::f32::consts::FRAC_1_SQRT_2),
+            ([0.12, 0.0, 0.0], z, z, 0.1, 1.1999999),
+            ([0.05, 0.0, -0.01], z, [0.38941833, 0.0, 0.921061], 0.1, 0.5101694),
+            ([0.03, 0.0, -0.002], z, [0.19866933, 0.0, 0.9800666], 0.05, 0.6030125),
+            ([0.0, 0.02, -0.03], z, z, 0.1, 0.21669295),
+            ([0.02, 0.0, -0.05], z, z, 0.1, 0.2554041),
+            ([0.0, 0.0, -0.2], z, z, 0.1, f32::INFINITY),
+        ];
+        for (offset, center, texel, radius, expected) in rows {
+            let got = surface_reach(Vec3::from(offset), Vec3::from(center), Vec3::from(texel), radius);
+            let agrees = if expected.is_infinite() { got.is_infinite() } else { (got - expected).abs() < 1e-5 };
+            assert!(agrees, "{offset:?}: got {got}, expected {expected}");
+        }
+    }
+
+    #[test]
+    fn surface_reach_is_the_chord_on_a_curve_and_grows_off_it() {
+        let n = Vec3::Z;
+        assert!((surface_reach(Vec3::new(0.5, 0.0, 0.0), n, n, 1.0) - 0.5).abs() < 1e-6);
+        // a point on a circle of radius 1 a turn `a` from the centre: its distance is the chord, longer than the flat offset
+        let a = 0.6f32;
+        let offset = Vec3::new(a.sin(), 0.0, a.cos() - 1.0);
+        let got = surface_reach(offset, n, Vec3::new(a.sin(), 0.0, a.cos()), 1.0);
+        assert!((got - offset.length()).abs() < 1e-5 && got > a.sin());
+        // straight under the centre stays at the centre; off to the side it nears the rim; too far off is out of reach
+        assert!(surface_reach(Vec3::new(0.0, 0.0, -0.3), n, n, 0.5) < 1e-6);
+        assert!(surface_reach(Vec3::new(0.2, 0.0, -0.3), n, n, 0.5) > 0.4 * 1.4);
+        assert!(surface_reach(Vec3::new(0.1, 0.0, -0.6), n, n, 0.5).is_infinite());
+        // no radius, no reach (and no panic on hostile values)
+        for radius in [0.0, -1.0, f32::NAN] {
+            assert!(surface_reach(Vec3::X, n, n, radius).is_infinite());
+        }
+        let hostile = surface_reach(Vec3::splat(f32::NAN), n, n, 1.0);
+        assert!(hostile.is_nan() || hostile >= 1.0, "a hostile offset reaches nothing");
+    }
+
+    #[test]
+    fn surface_reach_fades_a_sheet_behind_and_plane_reach_does_not() {
+        // two 2 × 2 sheets facing +Y, one `gap` under the other; the top on the left half of the texture, the bottom on the right
+        let radius = 0.4;
+        let gap = 0.5 * radius;
+        let mut m = primitives::plane(2.0, 16);
+        let mut under = m.clone();
+        for uv in &mut m.uvs {
+            uv.x *= 0.5;
+        }
+        for (p, uv) in under.positions.iter_mut().zip(under.uvs.iter_mut()) {
+            p.y = -gap;
+            uv.x = 0.5 + uv.x * 0.5;
+        }
+        under.materials.clear();
+        under.submeshes.clear();
+        m.append(&under);
+        let count = m.indices.len() as u32;
+        if let Some(s) = m.submeshes.first_mut() {
+            s.count = count;
+        }
+        let bvh = Bvh::new(&m);
+        let g = UvGBuffer::new(&m, 0, 256, 128);
+        let st = Stamp {
+            center: Vec3::ZERO,
+            normal: Vec3::Y,
+            tangent: Vec3::X,
+            bitangent: Vec3::Z,
+            radius,
+            flow: 1.0,
+            hardness: 0.5,
+            depth: 1.0,
+            seed: 0,
+            source: None,
+        };
+        let laid = |reach| {
+            let ctx = RasterCtx {
+                mesh: &m,
+                bvh: &bvh,
+                gbuf: &g,
+                material: 0,
+                depth: None,
+                eye: Vec3::new(0.0, 5.0, 0.0),
+                backface_culling: false,
+                angle_fade: (90.0, 90.0),
+                shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
+                facing: Facing::Any,
+                reach,
+            };
+            let mut c = StrokeCanvas::new(256, 128);
+            rasterize(&mut c, &ctx, &[st]);
+            let sum = |x0: u32| (x0..x0 + 128).flat_map(|x| (0..128).map(move |y| (x, y))).map(|(x, y)| from_u16(c.alpha.get(x, y)[0])).sum::<f32>();
+            // the top sheet, the sheet behind, and a texel of the sheet behind about 0.6 radii off the centre (15 texels of 64 per unit)
+            (sum(0), sum(128), from_u16(c.alpha.get(128 + 64, 64 + 15)[0]))
+        };
+        let (top_plane, under_plane, side_plane) = laid(Reach::Plane);
+        let (top_surface, under_surface, side_surface) = laid(Reach::Surface);
+        assert!((top_plane - top_surface).abs() < 1e-3 * top_plane, "the dab's own surface is the same: {top_plane} vs {top_surface}");
+        assert!((under_plane - top_plane).abs() < 0.02 * top_plane, "the plane reach lays the same disc on the sheet behind");
+        assert!(under_surface < 0.8 * under_plane && under_surface > 0.0, "the sheet behind fades: {under_surface} vs {under_plane}");
+        assert!(side_surface < side_plane, "off the centre the sheet behind nears the rim: {side_surface} vs {side_plane}");
+        assert_eq!(Reach::default(), Reach::Plane);
     }
 }
 
@@ -818,37 +1143,98 @@ pub struct UvStamp {
     pub source: Option<StampSource>,
 }
 
+impl UvStamp {
+    /// This stamp as a stamp on the mesh, at the surface under its centre: its texture's x and up as the tip's axes
+    /// (turned by its angle), its radius `world_per_uv` mesh units per unit of texture. For laying a 2D-view stamp
+    /// where only the mesh can say where it goes, such as a symmetry copy. `None` off the texture set.
+    pub fn on_mesh(&self, mesh: &Mesh, gbuf: &UvGBuffer, world_per_uv: f32) -> Option<Stamp> {
+        let (w, h) = (gbuf.width, gbuf.height);
+        let (x, y) = (self.center.x * w as f32, self.center.y * h as f32);
+        if !(x >= 0.0 && y >= 0.0 && x < w as f32 && y < h as f32) {
+            return None;
+        }
+        let i = y as usize * w as usize + x as usize;
+        let surface = gbuf.surface(mesh, i)?;
+        let triangle = *gbuf.tri.get(i)?;
+        let [a, b, c] = mesh.tri(triangle as usize)?;
+        let (pa, pb, pc) = (mesh.positions.get(a)?, mesh.positions.get(b)?, mesh.positions.get(c)?);
+        let (ua, ub, uc) = (mesh.uvs.get(a)?, mesh.uvs.get(b)?, mesh.uvs.get(c)?);
+        // the surface's change along the texture's u and v
+        let (e1, e2, d1, d2) = (*pb - *pa, *pc - *pa, *ub - *ua, *uc - *ua);
+        let det = d1.perp_dot(d2);
+        if det.abs() < f32::MIN_POSITIVE {
+            return None;
+        }
+        let along_u = (e1 * d2.y - e2 * d1.y) / det;
+        let along_v = (e2 * d1.x - e1 * d2.x) / det;
+        let normal = surface.nrm.try_normalize()?;
+        let flat = |v: Vec3| (v - normal * normal.dot(v)).try_normalize();
+        // texel rows run down: the tip's up is against v
+        let (right, up) = (flat(along_u)?, flat(-along_v)?);
+        let (sin, cos) = self.angle.to_radians().sin_cos();
+        let tangent = (right * cos + up * sin).try_normalize()?;
+        let radius = self.radius * world_per_uv;
+        (radius.is_finite() && radius > 0.0).then_some(Stamp {
+            center: surface.pos,
+            normal,
+            tangent,
+            bitangent: normal.cross(tangent),
+            radius,
+            flow: self.flow,
+            hardness: self.hardness,
+            depth: 1.0,
+            seed: self.seed,
+            source: self.source,
+        })
+    }
+}
+
 /// Accumulate UV-space stamps into `canvas` (only texels covered by the texture set).
 pub fn rasterize_uv(canvas: &mut StrokeCanvas, gbuf: &UvGBuffer, shape: Shape, stamps: &[UvStamp]) {
-    let (w, h) = (gbuf.width, gbuf.height);
     canvas.fit(gbuf);
     for s in stamps {
-        if s.radius.is_nan() || s.radius <= 0.0 || !s.center.is_finite() {
-            continue;
+        let mut texels = std::mem::take(&mut canvas.texels);
+        let center = uv_texels(gbuf, shape, s, &mut texels);
+        canvas.texels = texels;
+        if let Some(center) = center {
+            canvas.add_stamp(center, s.source);
         }
+    }
+}
 
-        let (cx, cy, r) = (s.center.x * w as f32, s.center.y * h as f32, s.radius * w as f32);
-        let x0 = (cx - r * 1.42).floor().max(0.0) as u32;
-        let x1 = ((cx + r * 1.42).ceil().max(0.0) as u32).min(w);
-        let y0 = (cy - r * 1.42).floor().max(0.0) as u32;
-        let y1 = ((cy + r * 1.42).ceil().max(0.0) as u32).min(h);
-        let (sn, cs) = s.angle.to_radians().sin_cos();
-        let shape = shape.at_radius(r);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                if gbuf.tri.get((y * w + x) as usize).copied().unwrap_or(NO_TRI) == NO_TRI {
-                    continue;
-                }
+/// The texels one UV-space stamp reaches, `(x, y, alpha)`: what [`rasterize_uv`] lays for it, without laying it.
+pub fn footprint_uv(gbuf: &UvGBuffer, shape: Shape, stamp: &UvStamp) -> Vec<(u32, u32, f32)> {
+    let mut texels = Vec::new();
+    uv_texels(gbuf, shape, stamp, &mut texels);
+    texels
+}
 
-                // Local frame with y up on screen (texel rows grow downward), as in the 3D view
-                let (dx, dy) = ((x as f32 + 0.5 - cx) / r, (cy - y as f32 - 0.5) / r);
-                let (lx, ly) = (dx * cs + dy * sn, -dx * sn + dy * cs);
-                let a = shape.sample(lx, ly, s.hardness, s.seed) * s.flow;
-                if a > 0.0 {
-                    canvas.texels.push((x, y, a));
-                }
+/// Appends the texels `s` reaches to `texels`; its centre in texels, `None` for a stamp that is no stamp.
+fn uv_texels(gbuf: &UvGBuffer, shape: Shape, s: &UvStamp, texels: &mut Vec<(u32, u32, f32)>) -> Option<[f32; 2]> {
+    let (w, h) = (gbuf.width, gbuf.height);
+    if s.radius.is_nan() || s.radius <= 0.0 || !s.center.is_finite() {
+        return None;
+    }
+    let (cx, cy, r) = (s.center.x * w as f32, s.center.y * h as f32, s.radius * w as f32);
+    let x0 = (cx - r * 1.42).floor().max(0.0) as u32;
+    let x1 = ((cx + r * 1.42).ceil().max(0.0) as u32).min(w);
+    let y0 = (cy - r * 1.42).floor().max(0.0) as u32;
+    let y1 = ((cy + r * 1.42).ceil().max(0.0) as u32).min(h);
+    let (sn, cs) = s.angle.to_radians().sin_cos();
+    let shape = shape.at_radius(r);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if gbuf.tri.get((y * w + x) as usize).copied().unwrap_or(NO_TRI) == NO_TRI {
+                continue;
+            }
+            // Local frame with y up on screen (texel rows grow downward), as in the 3D view.
+            let (dx, dy) = ((x as f32 + 0.5 - cx) / r, (cy - y as f32 - 0.5) / r);
+            let (lx, ly) = (dx * cs + dy * sn, -dx * sn + dy * cs);
+            let a = shape.sample(lx, ly, s.hardness, s.seed) * s.flow;
+            if a > 0.0 {
+                texels.push((x, y, a));
             }
         }
-        canvas.add_stamp([cx, cy], s.source);
     }
+    Some([cx, cy])
 }

@@ -7,8 +7,9 @@ fn image_plane_at(plane: u32, pixel: vec2<i32>) -> u32 {
     return textureLoad(tile_images, origin + pixel, i32(srgb[plane + 2u]), 0).x;
 }
 
-fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> {
-    let at = vec2(wrap_coordinate(pixel.x, size.x), wrap_coordinate(pixel.y, size.y));
+fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>, repeat: vec2<bool>) -> vec4<f32> {
+    let wrapped = vec2(wrap_coordinate(pixel.x, size.x), wrap_coordinate(pixel.y, size.y));
+    let at = select(clamp(pixel, vec2(0), size - 1), wrapped, repeat);
     let planes = image + 3u;
     let first = image_plane_at(planes, at);
     switch srgb[image + 2u] & 255u {
@@ -21,7 +22,7 @@ fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f
 }
 
 // Match ImageRes::sample: wrap and bilinearly mix the file's encoded samples.
-fn material_image_at(image: u32, uv: vec2<f32>) -> vec4<f32> {
+fn material_image_at_with_repeat(image: u32, uv: vec2<f32>, repeat: vec2<bool>) -> vec4<f32> {
     let size = vec2<i32>(i32(srgb[image]), i32(srgb[image + 1u]));
     let grid = uv * vec2<f32>(size) - 0.5;
     if !all(abs(grid) <= vec2(3.402823466e38)) {
@@ -34,13 +35,17 @@ fn material_image_at(image: u32, uv: vec2<f32>) -> vec4<f32> {
     }
     let at = vec2<i32>(base_grid);
     let f = grid - floor_grid;
-    let a = material_image_texel(image, at, size);
-    let b = material_image_texel(image, at + vec2(1, 0), size);
-    let c = material_image_texel(image, at + vec2(0, 1), size);
-    let d = material_image_texel(image, at + vec2(1, 1), size);
+    let a = material_image_texel(image, at, size, repeat);
+    let b = material_image_texel(image, at + vec2(1, 0), size, repeat);
+    let c = material_image_texel(image, at + vec2(0, 1), size, repeat);
+    let d = material_image_texel(image, at + vec2(1, 1), size, repeat);
     let top = a + (b - a) * f.x;
     let bottom = c + (d - c) * f.x;
     return top + (bottom - top) * f.y;
+}
+
+fn material_image_at(image: u32, uv: vec2<f32>) -> vec4<f32> {
+    return material_image_at_with_repeat(image, uv, vec2(true));
 }
 
 fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> {
@@ -67,6 +72,15 @@ fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
         let weights = pow(abs(surface.normal), vec3(layer.balance.w));
         let w = weights / max(weights.x + weights.y + weights.z, 1e-6);
         var sampled = vec4(0.0);
+        if measured_blend {
+            let position = surface.position * layer.projection.w;
+            let offset = layer.projection.xyz;
+            let side = select(vec3(1.0), vec3(-1.0), surface.normal < vec3(0.0));
+            if w.x > 0.0 { sampled += w.x * material_image_at(image, vec2(offset.z - position.z * side.x, -p.y)); }
+            if w.y > 0.0 { sampled += w.y * material_image_at(image, vec2(p.x, offset.z + position.z * side.y)); }
+            if w.z > 0.0 { sampled += w.z * material_image_at(image, vec2(offset.x + position.x * side.z, -p.y)); }
+            return sampled;
+        }
         if w.x > 0.0 { sampled += w.x * material_image_at(image, vec2(p.z, -p.y)); }
         if w.y > 0.0 { sampled += w.y * material_image_at(image, p.xz); }
         if w.z > 0.0 { sampled += w.z * material_image_at(image, vec2(p.x, -p.y)); }
@@ -88,11 +102,7 @@ fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
             point = vec2(azimuth(axis.z, axis.x), 0.5 - axis.y * 0.5) * layer.projection.w;
         }
         case DECAL_PROJECTION: {}
-        default: {
-            let rotation = layer.projection.xy;
-            let rotated = vec2(uv.x * rotation.x - uv.y * rotation.y, uv.x * rotation.y + uv.y * rotation.x);
-            point = rotated * layer.projection.zw + layer.uv.xy;
-        }
+        default: { point = transformed_uv(layer, uv); }
     }
     return material_image_at(image, point);
 }
@@ -146,6 +156,24 @@ fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> ve
         return vec3(0.5);
     }
     return decode_image_sample(layer, image_projection(layer, uv, surface).rgb);
+}
+
+fn authored_image_content(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    if layer.ids.z == MISSING_IMAGE {
+        return vec4(vec3(0.5), 1.0);
+    }
+    let sampled = image_projection(layer, uv, surface);
+    let alpha = select(0.0, clamp(sampled.a, 0.0, 1.0), abs(sampled.a) <= 3.402823466e38);
+    return vec4(decode_image_sample(layer, sampled.rgb), alpha);
+}
+
+fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>) -> vec4<f32> {
+    if layer.ids.z == MISSING_IMAGE {
+        return vec4(vec3(0.5), 1.0);
+    }
+    let sampled = material_image_at_with_repeat(layer.ids.z, uv, repeat);
+    let alpha = select(0.0, clamp(sampled.a, 0.0, 1.0), abs(sampled.a) <= 3.402823466e38);
+    return vec4(decode_image_sample(layer, sampled.rgb), alpha);
 }
 
 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {

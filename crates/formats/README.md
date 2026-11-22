@@ -152,6 +152,9 @@ pub fn project_open_limit_gib() -> u32;
 | `pixels/mask_<id>.bin` | painted mask effect |
 | `baked/<ts>_<mapId>.bin` | baked mesh map of texture set `<ts>` |
 | `thumbnail.png` | optional, stored |
+| `graphs/<key>.txt` | text of a graph the layers run (deflated, checked against its key) |
+| `cooked/<key>_<output>.bin` | one output of a stored graph render (pixel tiles) |
+| `cooked/index.json` | the stored renders' outputs and the render each graph use read last |
 
 `.bin`: header `TCTX`, version, width, height, components, tile count (u32 LE each), then per
 allocated 64×64 tile `tx`, `ty` (u32 LE) and the raw `u16` LE components (sparse, lossless).

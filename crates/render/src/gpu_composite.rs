@@ -6,16 +6,16 @@ use std::{borrow::Cow, collections::BTreeMap};
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
-use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
+use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore, Texels};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId,
-    LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Source,
+    BakedMap, BlendMode, Channel, ChannelFormat, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator, GeneratorKind,
+    LayerId, LayerKind, Mask, MaskBackground, NormalFormat, PlacedMode, ProceduralKind, Project, Projection, Source,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
 use crate::gpu_curvature::{CurvatureGpu, CurvatureInput, CurvatureLevels};
-use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages};
+use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages, PLACED_UV_PROJECTION};
 use crate::gpu_neighbourhood::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
 use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
@@ -31,6 +31,8 @@ use pipelines::CompositePipelines;
 
 const MAX_PAINT_WORDS: usize = (64 << 20) / size_of::<u32>();
 const LOOKUP_WORDS: u32 = 4096;
+// The native display shader slots. Imported user channels have no viewport slots.
+const DISPLAY_CHANNELS: usize = 21;
 const NO_PAINT_IMAGE: u32 = u32::MAX;
 const BAKED_LIGHTING_OPCODE: u32 = 35;
 const NEIGHBOURHOOD_OPCODE: u32 = 36;
@@ -60,7 +62,7 @@ const MAX_ID_UPLOAD_BYTES: usize = 64 << 20;
 struct BakedInputs {
     width: u32,
     height: u32,
-    maps: [Option<Arc<Vec<f32>>>; BAKE_MAPS.len()],
+    maps: [Option<Arc<Texels>>; BAKE_MAPS.len()],
 }
 
 impl BakedInputs {
@@ -78,7 +80,7 @@ impl BakedInputs {
 #[derive(Debug)]
 struct IdBake {
     size: [u32; 2],
-    data: Arc<Vec<f32>>,
+    data: Arc<Texels>,
 }
 
 impl IdBake {
@@ -503,6 +505,8 @@ pub struct CompositeProgram {
     id_bake: Option<IdBake>,
     display_outputs: u32,
     glossiness: bool,
+    measured_blend: bool,
+    unit_channels: u32,
     mask_preview: bool,
     mask_layer: u32,
     mask_layers: BTreeMap<LayerId, u32>,
@@ -537,6 +541,14 @@ fn channel_slot(channel: Channel) -> u32 {
         AnisotropyAngle => 18,
         Transmission => 19,
         Glossiness => 20,
+        User0 => 21,
+        User1 => 22,
+        User2 => 23,
+        User3 => 24,
+        User4 => 25,
+        User5 => 26,
+        User6 => 27,
+        User7 => 28,
     }
 }
 
@@ -585,6 +597,11 @@ impl CompositeProgram {
         if self.mask_preview || ((!self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
             self.set_coverage(gbuf.clone(), 0);
         }
+        self.set_baked_inputs(baked)
+    }
+
+    /// Resolve baked maps independently of the viewport's geometry and image inputs.
+    pub fn set_baked_inputs(&mut self, baked: Option<&BakedMaps>) -> Result<(), &'static str> {
         self.baked = baked.map(BakedInputs::new).transpose()?.flatten();
         self.id_bake = baked.filter(|_| self.operations.iter().any(|op| op.ids[1] == COLOR_SELECTION_OPCODE && op.procedural[2] != 0)).and_then(IdBake::new);
         if !self.mask_preview && self.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some()) {
@@ -619,8 +636,28 @@ impl CompositeProgram {
         if !set.uv_tiles.is_empty() {
             return Err("UDIM texture sets use CPU compositing.");
         }
+        if set.channels.iter().any(|(channel, _)| channel.user_index().is_some()) {
+            return Err("User channels use CPU compositing.");
+        }
+        let measured_blend = project.rules.blend.is_measured();
+        let unit_channels = if measured_blend {
+            set.channels
+                .iter()
+                .filter(|(channel, format)| {
+                    channel.kind() != ChannelKind::Signed
+                        && !matches!(format, ChannelFormat::L16F | ChannelFormat::Rgb16F | ChannelFormat::L32F | ChannelFormat::Rgb32F)
+                })
+                .fold(0, |mask, (channel, _)| mask | (1 << channel_slot(*channel)))
+        } else {
+            0
+        };
         if let Some(brush) = &brush {
             brush.validate(set.size())?;
+        }
+        // Imported invisible layers can still publish anchors. Check the tree up front so
+        // visibility cannot silently drop a value needed by a measured stack.
+        if measured_blend && project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)).any(|layer| layer.reads_anchor()) {
+            return Err("Measured anchor reads use CPU compositing.");
         }
         let mut operations: Vec<Operation> = Vec::new();
         let mut paint = PaintInputs::default();
@@ -651,29 +688,47 @@ impl CompositeProgram {
                 continue;
             }
             let Some(layer) = project.content_layer(id) else { continue };
-            let geometry_mask = geometry.register(inherited_geometry, own.geometry_mask.as_deref());
+            if own.geometry_mask.as_ref().is_some_and(|mask| !mask.includes_tile(1001)) {
+                return Err("UV tile restrictions use CPU compositing.");
+            }
+            let geometry_mask = geometry.register(inherited_geometry, own.geometry_mask.as_ref().and_then(|mask| mask.parts()));
             let mask = project.layers.get(&project.mask_owner(id)).and_then(|owner| owner.mask.as_ref()).filter(|m| m.enabled);
             if let LayerKind::Group { children, .. } = &layer.kind {
                 if depth > texturecraft_core::project::MAX_DEPTH {
                     continue;
                 }
                 // A full-weight group sees the incoming stack and returns it exactly
-                // as its children changed it. Keep such groups on the flat shader.
+                // as its children changed it. Keep the geometry restriction at the
+                // group boundary if children publish anchors beyond it.
                 if mask.is_none()
                     && set.channels.iter().all(|&(channel, _)| {
-                        layer.blend(channel).is_some_and(|blend| blend.mode != BlendMode::Disable && blend.opacity.is_finite() && blend.opacity >= 1.0)
+                        layer.blend(channel).is_some_and(|blend| {
+                            (if measured_blend { blend.mode == BlendMode::Passthrough } else { blend.mode != BlendMode::Disable })
+                                && blend.opacity.is_finite()
+                                && blend.opacity >= 1.0
+                        })
                     })
+                    && (geometry_mask == 0 || !groups::children_publish_anchors(project, children, depth + 1))
                 {
                     layers.extend(children.iter().rev().map(|&child| StackWork::Layer(child, depth + 1, geometry_mask)));
                     continue;
                 }
-                let mut weights = [0.0f32; Channel::ALL.len()];
+                let mut weights = [0.0f32; DISPLAY_CHANNELS];
+                let mut modes = [1; DISPLAY_CHANNELS];
                 for &(channel, _) in &set.channels {
                     if let Some(blend) = layer.blend(channel).filter(|blend| blend.mode != BlendMode::Disable) {
                         if !blend.opacity.is_finite() {
                             return Err("A group has an invalid opacity.");
                         }
-                        weights[channel_slot(channel) as usize] = blend.opacity.clamp(0.0, 1.0);
+                        let slot = channel_slot(channel) as usize;
+                        weights[slot] = blend.opacity.clamp(0.0, 1.0);
+                        if measured_blend {
+                            modes[slot] = if blend.mode == BlendMode::Passthrough {
+                                groups::PASSTHROUGH_GROUP
+                            } else {
+                                blend_code(blend.mode).ok_or("The folder blend mode uses CPU compositing.")?
+                            };
+                        }
                     }
                 }
                 if weights.iter().all(|&opacity| opacity == 0.0)
@@ -698,6 +753,9 @@ impl CompositeProgram {
                     .and_then(|len| LOOKUP_WORDS.checked_add(len))
                     .ok_or("The GPU group settings are too large.")?;
                 procedural.ramp_words.extend(weights.map(f32::to_bits));
+                if measured_blend {
+                    procedural.ramp_words.extend(modes);
+                }
                 let open = operations.len();
                 let mut op = Operation {
                     ids: [0, BEGIN_GROUP, weight_offset, 0],
@@ -726,9 +784,17 @@ impl CompositeProgram {
             }
             let mut content_anchors = Vec::new();
             let mut visible_cut = 0u32;
+            if layer.content_effects.iter().any(|effect| effect.visible)
+                && set.channels.iter().any(|(channel, _)| layer.blend(*channel).is_some_and(|blend| blend.mode == BlendMode::Passthrough))
+            {
+                return Err("Effects that read the layer stack beneath them use CPU compositing.");
+            }
             let per_channel = layer.content_effects.iter().any(|effect| effect.visible && content_depends_on_channel(effect));
             let mut templates = Vec::new();
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
+                if !effect.channels.is_empty() {
+                    return Err("Per-channel content effects use CPU compositing.");
+                }
                 if matches!(effect.kind, EffectKind::Anchor) {
                     content_anchors.push((effect.id, visible_cut));
                     continue;
@@ -808,7 +874,8 @@ impl CompositeProgram {
                 // Adding a channel to the set also adds it to the earlier layers. Skip
                 // their neutral values until the accumulator can contain something else.
                 // After a real contribution, neutral fills can still reset the channel.
-                if !non_default[slot as usize]
+                if !measured_blend
+                    && !non_default[slot as usize]
                     && painted.is_none()
                     && brush_value.is_none()
                     && content_count == 0
@@ -831,7 +898,7 @@ impl CompositeProgram {
                 op.ids[0] = slot;
                 op.low[3] = blend.opacity.min(1.0);
                 op.balance[1] = mask_background;
-                op.balance[2] = blend_code(blend.mode) as f32;
+                op.balance[2] = blend_code(blend.mode).ok_or("The layer blend mode uses CPU compositing.")? as f32;
                 op.effects = [mask_start, mask_count, content_start, content_count];
                 op.spatial[3] = u32::from(adds_coverage);
                 if height_params[0] != 0 && channel == Channel::Height {
@@ -885,7 +952,7 @@ impl CompositeProgram {
                 display_outputs |= display_bit(DisplayKind::of_channel(channel));
             }
         }
-        groups.finish(&operations);
+        groups.finish(&operations, measured_blend);
         let layer_count = operations.len() as u32;
         if !operations.iter().any(|op| op.constraints[0] != 0) {
             geometry.parts.clear();
@@ -918,6 +985,8 @@ impl CompositeProgram {
             id_bake: None,
             display_outputs,
             glossiness: set.has_channel(Channel::Glossiness),
+            measured_blend,
+            unit_channels,
             mask_preview: false,
             mask_layer: 0,
             mask_layers,
@@ -937,6 +1006,7 @@ impl CompositeProgram {
         if !set.uv_tiles.is_empty() {
             return Err("UDIM texture sets use CPU mask preview.");
         }
+        let measured_blend = project.rules.blend.is_measured();
         let owner = project.mask_owner(owner);
         let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
         let mask = mask.ok_or("The layer has no enabled mask.")?;
@@ -985,6 +1055,8 @@ impl CompositeProgram {
             // Reuse the first four-byte display slot for linear grayscale.
             display_outputs: display_bit(DisplayKind::BaseColor),
             glossiness: false,
+            measured_blend,
+            unit_channels: 0,
             mask_preview: true,
             mask_layer: 0,
             mask_layers: BTreeMap::new(),
@@ -993,7 +1065,11 @@ impl CompositeProgram {
 }
 
 fn needs_surface(operations: &[Operation]) -> bool {
-    operations.iter().any(|op| op.procedural[3] != 0 || op.ids[1] == BAKED_LIGHTING_OPCODE || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]))
+    operations.iter().any(|op| {
+        (op.procedural[3] != 0 && op.procedural[3] != PLACED_UV_PROJECTION)
+            || op.ids[1] == BAKED_LIGHTING_OPCODE
+            || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1])
+    })
 }
 
 fn sparse_channel(pixels: &PixelStore, id: LayerId, channel: Channel) -> Result<Option<&TileImage>, &'static str> {
@@ -1028,9 +1104,11 @@ fn content_depends_on_channel(effect: &Effect) -> bool {
 fn content_filter(effect: &Effect, procedural: &mut ProceduralInputs) -> Option<Operation> {
     match effect.kind {
         // A mask-only effect authored in this stack leaves its content alone.
-        EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection { .. } | EffectKind::Compare { .. } => {
-            Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() })
-        }
+        EffectKind::Fill { .. }
+        | EffectKind::Generator(_)
+        | EffectKind::ColorSelection { .. }
+        | EffectKind::Compare { .. }
+        | EffectKind::Placeholder { .. } => Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() }),
         _ => point_effect(effect, procedural),
     }
 }
@@ -1067,7 +1145,7 @@ fn content_deposit(
         content_paint(effect.id, channel, image, value, brush.is_some_and(|brush| brush.stencil.is_some()), paint)
     };
     op.low[3] = effect.opacity.min(1.0);
-    op.balance[2] = blend_code(effect.blend) as f32;
+    op.balance[2] = blend_code(effect.blend).ok_or("The effect blend mode uses CPU compositing.")? as f32;
     Ok(Some(op))
 }
 
@@ -1112,13 +1190,14 @@ fn compile_mask(
                 op
             }
             EffectKind::Generator(generator) => generator_operation(generator, procedural, tile_patterns).ok_or("A mask generator uses CPU compositing.")?,
-            EffectKind::ColorSelection { colors, tolerance } => {
+            EffectKind::ColorSelection { colors, tolerance, map: BakedMap::Id } => {
                 let [offset, count] = procedural.pack_rgb(colors).ok_or("A color selection has invalid colors.")?;
                 if !tolerance.is_finite() {
                     return Err("A color selection has invalid tolerance.");
                 }
                 Operation { ids: [0, COLOR_SELECTION_OPCODE, 0, 0], low: [*tolerance, 0.0, 0.0, 0.0], procedural: [0, offset, count, 0], ..Operation::zeroed() }
             }
+            EffectKind::Placeholder { .. } => continue,
             EffectKind::Anchor => {
                 let publication = procedural.anchors.publish(effect.id, true);
                 Operation { ids: [0, ANCHOR_PUBLISH_MASK, publication, 0], ..Operation::zeroed() }
@@ -1144,16 +1223,16 @@ fn compile_mask(
             bind_tile_source(&mut op, Some(source), tile_patterns);
         }
         op.low[3] = effect.opacity.clamp(0.0, 1.0);
-        op.balance[2] = blend_code(effect.blend) as f32;
+        op.balance[2] = blend_code(effect.blend).ok_or("The effect blend mode uses CPU compositing.")? as f32;
         effects.push(op);
     }
     Ok(if mask.background == MaskBackground::White { 1.0 } else { 0.0 })
 }
 
 // Bytecode values used by composite.wgsl. Keep these stable if BlendMode is reordered.
-fn blend_code(mode: BlendMode) -> u32 {
+fn blend_code(mode: BlendMode) -> Option<u32> {
     use BlendMode::*;
-    match mode {
+    Some(match mode {
         Normal | Passthrough => 0,
         Disable => 1,
         Replace => 2,
@@ -1167,7 +1246,8 @@ fn blend_code(mode: BlendMode) -> u32 {
         InverseSubtract => 10,
         Difference => 11,
         Exclusion => 12,
-        SignedAddition | LinearLight => 13,
+        LinearLight => 13,
+        SignedAddition => 30,
         Overlay => 14,
         Screen => 15,
         LinearBurn => 16,
@@ -1184,7 +1264,8 @@ fn blend_code(mode: BlendMode) -> u32 {
         NormalMapCombine => 27,
         NormalMapDetail => 28,
         NormalMapInverseDetail => 29,
-    }
+        Hue | HsvTint | HsvSaturation | HsvColor | HsvValue => return None,
+    })
 }
 
 fn bind_tile_source(op: &mut Operation, source: Option<&Source>, patterns: &mut TilePatterns) {
@@ -1203,6 +1284,15 @@ fn source_operation(
     channel: ChannelKind,
     inputs: &mut ProceduralInputs,
 ) -> Option<Operation> {
+    let placed_uv = match projection {
+        Projection::Placed(placed) => match &placed.mode {
+            PlacedMode::Uv { scale, rotation, offset } if matches!(source, None | Some(Source::Uniform(_) | Source::Image { .. })) => {
+                Some((scale, rotation, offset, placed.sampling_repeat().axes()))
+            }
+            _ => return None,
+        },
+        _ => None,
+    };
     let mut op = Operation::zeroed();
     match source {
         None => op.low[..3].copy_from_slice(&default),
@@ -1212,6 +1302,7 @@ fn source_operation(
                 ChannelKind::Color => 0,
                 ChannelKind::Scalar => 1,
                 ChannelKind::Signed => 2,
+                ChannelKind::Data => return None,
                 ChannelKind::NormalMap => {
                     if *normal_format == NormalFormat::DirectX {
                         4
@@ -1248,10 +1339,13 @@ fn source_operation(
                         _ => 7,
                     };
                 }
-                Projection::Decal(_) => {}
+                Projection::Decal(_) | Projection::Placed(_) => {}
             }
         }
         Some(Source::Anchor { anchor, channel: read_channel, ramp }) => {
+            if read_channel.user_index().is_some() {
+                return None;
+            }
             let (reference, is_mask) = inputs.anchors.read(*anchor, *read_channel);
             let gray =
                 matches!(read_channel.kind(), ChannelKind::Color | ChannelKind::NormalMap) && matches!(channel, ChannelKind::Scalar | ChannelKind::Signed);
@@ -1353,10 +1447,18 @@ fn source_operation(
                     };
                 }
                 Projection::Decal(_) => {}
+                Projection::Placed(_) => return None,
             }
         }
+        Some(Source::Graph(_)) => return None,
     }
-    if matches!(projection, Projection::Decal(_)) {
+    if let Some((scale, rotation, offset, repeat)) = placed_uv {
+        let (sin, cos) = rotation.to_radians().sin_cos();
+        op.projection = [cos, sin, scale[0], scale[1]];
+        op.uv[..2].copy_from_slice(offset);
+        op.procedural[2] = u32::from(repeat[0]) | (u32::from(repeat[1]) << 1);
+        op.procedural[3] = PLACED_UV_PROJECTION;
+    } else if matches!(projection, Projection::Decal(_)) {
         op.procedural[3] = DECAL_PROJECTION;
     }
     op.low.iter().chain(&op.high).chain(&op.projection).chain(&op.uv).chain(&op.balance).all(|v| v.is_finite()).then_some(op)
@@ -1517,19 +1619,19 @@ struct SurfaceCache {
 
 struct BakeCache {
     size: (u32, u32),
-    maps: [Option<Weak<Vec<f32>>>; BAKE_MAPS.len()],
+    maps: [Option<Weak<Texels>>; BAKE_MAPS.len()],
     view: wgpu::TextureView,
 }
 
 struct IdBakeCache {
     size: [u32; 2],
-    data: Weak<Vec<f32>>,
+    data: Weak<Texels>,
     view: wgpu::TextureView,
 }
 
 struct CurvatureCache {
     gbuf: Weak<UvGBuffer>,
-    map: Weak<Vec<f32>>,
+    map: Weak<Texels>,
     size: [u32; 2],
     needed: [bool; CurvatureDetail::BLURRED_SIZES],
     levels: CurvatureLevels,
@@ -1812,12 +1914,14 @@ impl GpuCompositor {
         self.id_bakes.remove(&ts);
         let texture = input_texture(device, "tc_composite_id_bake", (width, packed_height), 1, wgpu::TextureFormat::Rgba32Uint);
         let row_words = width as usize * 4;
-        let word_count = width as usize * height as usize * 3;
+        let mut remaining = width as usize * height as usize * 3;
         let mut tail_row = Vec::new();
         let mut pending = 0;
-        for (band, source) in id_bake.data[..word_count].chunks(row_words * ROWS as usize).enumerate() {
+        let mut top = 0;
+        id_bake.data.try_for_chunks(row_words * ROWS as usize, |source| {
+            let source = &source[..source.len().min(remaining)];
+            remaining -= source.len();
             let rows = source.len() / row_words;
-            let top = band as u32 * ROWS;
             let (full, tail) = source.split_at(rows * row_words);
             if rows > 0 {
                 let full: &[[f32; 4]] = bytemuck::cast_slice(full);
@@ -1838,7 +1942,9 @@ impl GpuCompositor {
                 let _ = submission;
                 pending = 0;
             }
-        }
+            top += rows as u32;
+            Ok::<_, String>(())
+        })?;
         let view = texture.create_view(&Default::default());
         self.id_bakes.insert(ts, IdBakeCache { size: id_bake.size, data, view: view.clone() });
         Ok(Some(view))
@@ -1868,7 +1974,7 @@ impl GpuCompositor {
         // Keep all three scalar inputs at f32 precision for narrow generator ramps. The
         // normal uses the remaining word, keeping the atlas at 16 bytes per texel.
         let texture = input_texture(device, "tc_composite_bakes", size, 1, wgpu::TextureFormat::Rgba32Uint);
-        let value = |map: usize, i: usize, fallback: f32| baked.maps[map].as_ref().and_then(|data| data.get(i).copied()).unwrap_or(fallback);
+        let value = |map: usize, i: usize, fallback: f32| baked.maps[map].as_ref().and_then(|data| data.get(i)).unwrap_or(fallback);
         for top in (0..size.1).step_by(ROWS as usize) {
             let end = (top + ROWS).min(size.1);
             let indices = top as usize * size.0 as usize..end as usize * size.0 as usize;
@@ -2221,7 +2327,7 @@ impl GpuCompositor {
                     field_rect[3],
                     id_width,
                     id_height,
-                    0,
+                    program.unit_channels,
                     0,
                     0,
                     0,
@@ -2485,6 +2591,7 @@ mod procedural_tests {
             pixels: &pixels,
             baked: &baked,
             images: &images,
+            graphs: texturecraft_compose::GraphStore::empty(),
             block_scales: project.texture_sets[0].block_scales(),
             preview: None,
             bounds: mesh.bounds(),
@@ -2506,6 +2613,96 @@ mod procedural_tests {
         gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
         let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.aux_texture(0).unwrap()).unwrap();
         assert!(actual.as_chunks::<4>().0.iter().zip(expected).all(|(pixel, value)| pixel[0].abs_diff(value) <= 2));
+    }
+
+    #[test]
+    fn restricted_passthrough_groups_publish_child_anchors_on_both_parts() {
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles};
+        use texturecraft_compose::tile_bytes;
+        use texturecraft_geom::SubMesh;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        let mut mesh = primitives::plane(1.0, 1);
+        let original = mesh.submeshes[0].clone();
+        mesh.submeshes[0].count = 3;
+        mesh.submeshes.push(SubMesh { name: "Other part".into(), start: 3, count: 3, ..original.clone() });
+        let mesh = Arc::new(mesh);
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, TILE, TILE));
+        let probes = [0, 1].map(|id| gbuf.tri.iter().position(|&tri| tri == id).unwrap());
+
+        let mut project = Project::new("Part-restricted anchors", "builtin:plane");
+        let mut set = TextureSet::new("Plane", 0, TILE);
+        set.channels.push((Channel::Opacity, texturecraft_core::ChannelFormat::default_for(Channel::Opacity)));
+        let channels = set.channel_list();
+        project.texture_sets.push(set);
+        let folder = project.alloc_id();
+        let mut group = Layer::new(folder, "One part", LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        for blend in group.channels.values_mut() {
+            blend.mode = BlendMode::Passthrough;
+        }
+        group.geometry_mask = Some(texturecraft_core::GeometryMask::Parts(vec![original.name]));
+        project.insert_layer(0, group, None, false).unwrap();
+
+        let donor = project.alloc_id();
+        let mask_anchor = project.alloc_id();
+        let content_anchor = project.alloc_id();
+        let material_anchor = project.alloc_id();
+        let mut donor = Layer::new(
+            donor,
+            "Donor",
+            LayerKind::Fill(Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.95; 3]))]), ..Default::default() }),
+            &channels,
+        );
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.8; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(mask_anchor, EffectKind::Anchor));
+        donor.mask = Some(mask);
+        donor.content_effects.push(Effect::new(content_anchor, EffectKind::Anchor));
+        donor.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
+        donor.content_effects.push(Effect::new(material_anchor, EffectKind::Anchor));
+        project.insert_layer(0, donor, Some(folder), true).unwrap();
+
+        let reader = project.alloc_id();
+        let sources = [(Channel::Opacity, mask_anchor), (Channel::Roughness, content_anchor), (Channel::Metallic, material_anchor)]
+            .into_iter()
+            .map(|(target, anchor)| (target, Source::Anchor { anchor, channel: Channel::BaseColor, ramp: Vec::new() }))
+            .collect();
+        project.insert_layer(0, Layer::new(reader, "Reader", LayerKind::Fill(Fill { sources, ..Default::default() }), &channels), None, false).unwrap();
+
+        let pixels = PixelStore::default();
+        let baked = BakedMaps::default();
+        let images = ImageStore::default();
+        let mut cpu = Composite::new(&channels, TILE);
+        composite_tiles(
+            &Inputs {
+                project: &project,
+                ts: 0,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked: &baked,
+                images: &images,
+                graphs: texturecraft_compose::GraphStore::empty(),
+                block_scales: project.texture_sets[0].block_scales(),
+                preview: None,
+                bounds: mesh.bounds(),
+            },
+            &mut cpu,
+            &[(0, 0)],
+        );
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((TILE, TILE), 0)], 1);
+        let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        for kind in [DisplayKind::BaseColor, DisplayKind::Orm] {
+            let expected = tile_bytes(&cpu, &baked, kind, 0, 0);
+            let texture = gpu.renderer.display_textures()[0][kind as usize];
+            let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+            for (part, texel) in probes.into_iter().enumerate() {
+                let (actual, expected) = (&actual[texel * 4..][..4], &expected[texel * 4..][..4]);
+                assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(*b) <= 2), "{kind:?}, part {part}: GPU {actual:?}, CPU {expected:?}");
+            }
+        }
     }
 
     #[test]
@@ -2564,6 +2761,7 @@ mod procedural_tests {
             block_scales: project.texture_sets[0].block_scales(),
             preview: None,
             images: &images,
+            graphs: texturecraft_compose::GraphStore::empty(),
             bounds: mesh.bounds(),
         };
         let expected = mask_image(&inputs, owner, SIZE).unwrap();
@@ -2677,6 +2875,7 @@ mod procedural_tests {
                 block_scales: project.texture_sets[0].block_scales(),
                 preview: live.then_some(&preview),
                 images: &images,
+                graphs: texturecraft_compose::GraphStore::empty(),
                 bounds: mesh.bounds(),
             };
             let mut cpu = Composite::new(&channels, SIZE);
@@ -2780,6 +2979,7 @@ mod procedural_tests {
                 block_scales: project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: texturecraft_compose::GraphStore::empty(),
                 bounds: mesh.bounds(),
             };
             let mut oracle = Composite::new(&channels, SIZE);
@@ -2871,7 +3071,7 @@ mod procedural_tests {
         }
         let mesh = Arc::new(mesh);
         let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
-        let baked = BakedMaps { resolution: 2, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new(vec![0.25, 0.7, 0.9, 0.45]))]) };
+        let baked = BakedMaps { resolution: 2, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new(vec![0.25, 0.7, 0.9, 0.45].into()))]) };
         let images = ImageStore::default();
         let pixels = PixelStore::default();
         let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal];
@@ -2917,6 +3117,7 @@ mod procedural_tests {
                 block_scales: project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: texturecraft_compose::GraphStore::empty(),
                 bounds: mesh.bounds(),
             };
             let mut oracle = Composite::new(&channels, SIZE);
@@ -2973,7 +3174,7 @@ mod procedural_tests {
         let raw = [0.40101, 0.69217, 0.05289];
         let within = [0.375; 3];
         let exact = [0.21875, 0.78125, 0.09375];
-        let effect_kind = |tolerance| EffectKind::ColorSelection { colors: vec![raw, within, exact], tolerance };
+        let effect_kind = |tolerance| EffectKind::ColorSelection { colors: vec![raw, within, exact], tolerance, map: BakedMap::Id };
         let mut select = Effect::new(project.alloc_id(), effect_kind(1.0 / 64.0));
         select.blend = BlendMode::Multiply;
         select.opacity = 0.75;
@@ -2982,8 +3183,10 @@ mod procedural_tests {
         project.insert_layer(0, layer, None, false).unwrap();
 
         let colors = [raw, [0.390625; 3], [0.390626, 0.375, 0.375], exact, [0.1, 0.9, 0.2], raw, [0.8, 0.1, 0.9], [0.359375; 3], [0.0; 3]];
-        let make_bake =
-            |colors: [[f32; 3]; 9]| BakedMaps { resolution: 3, maps: BTreeMap::from([(BakedMap::Id, Arc::new(colors.into_iter().flatten().collect()))]) };
+        let make_bake = |colors: [[f32; 3]; 9]| BakedMaps {
+            resolution: 3,
+            maps: BTreeMap::from([(BakedMap::Id, Arc::new(colors.into_iter().flatten().collect::<Vec<_>>().into()))]),
+        };
         let bake = make_bake(colors);
         let mut changed = colors;
         changed[0] = [0.0; 3];
@@ -3004,6 +3207,7 @@ mod procedural_tests {
                 block_scales: project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: texturecraft_compose::GraphStore::empty(),
                 bounds: mesh.bounds(),
             };
             let mut oracle = Composite::new(&[color], SIZE);
@@ -3051,7 +3255,7 @@ mod procedural_tests {
         let override_mask = project.alloc_id();
         let mut layer = Layer::new(source, "Source layer", LayerKind::Paint, &channels);
         layer.visible = false;
-        layer.geometry_mask = Some(Vec::new());
+        layer.geometry_mask = Some(texturecraft_core::GeometryMask::Parts(Vec::new()));
         let mut inherited = Mask::new(MaskBackground::Black);
         inherited.effects.push(Effect::new(source_mask, EffectKind::Paint));
         layer.mask = Some(inherited);
@@ -3095,6 +3299,7 @@ mod procedural_tests {
                 block_scales: project.texture_sets[1].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: texturecraft_compose::GraphStore::empty(),
                 bounds: mesh.bounds(),
             };
             let mut oracle = Composite::new(&channels, SIZE);
@@ -3173,7 +3378,7 @@ mod procedural_tests {
         for blend in folder.channels.values_mut() {
             blend.mode = BlendMode::Passthrough;
         }
-        folder.geometry_mask = Some(vec!["Shared part".into(), "Folder only".into()]);
+        folder.geometry_mask = Some(texturecraft_core::GeometryMask::Parts(vec!["Shared part".into(), "Folder only".into()]));
         project.insert_layer(0, folder, None, false).unwrap();
 
         let owner = project.alloc_id();
@@ -3184,7 +3389,7 @@ mod procedural_tests {
         };
         let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
         layer.height_mask = HeightMask { enabled: true, contrast: 0.9, offset: 0.1 };
-        layer.geometry_mask = Some(vec!["Shared part".into(), "Layer only".into()]);
+        layer.geometry_mask = Some(texturecraft_core::GeometryMask::Parts(vec!["Shared part".into(), "Layer only".into()]));
         layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
         let mut mask = Mask::new(MaskBackground::Black);
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.375; 3]), projection: Projection::default() }));
@@ -3223,6 +3428,7 @@ mod procedural_tests {
                 block_scales: project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: texturecraft_compose::GraphStore::empty(),
                 bounds: mesh.bounds(),
             };
             let mut oracle = Composite::new(&channels, SIZE);
@@ -3295,7 +3501,7 @@ mod procedural_tests {
         }
         folder.channels.get_mut(&Channel::Roughness).unwrap().mode = BlendMode::Disable;
         folder.height_mask = HeightMask { enabled: true, contrast: 0.4, offset: 0.1 };
-        folder.geometry_mask = Some(vec![mesh.submeshes[0].name.clone()]);
+        folder.geometry_mask = Some(texturecraft_core::GeometryMask::Parts(vec![mesh.submeshes[0].name.clone()]));
         let mut mask = Mask::new(MaskBackground::Black);
         let position = Generator { direction: [1.0, 0.0, 0.0], softness: 0.18, ..Generator::new(GeneratorKind::Position) };
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(position)));
@@ -3334,6 +3540,7 @@ mod procedural_tests {
             block_scales: project.texture_sets[0].block_scales(),
             preview: None,
             images: &images,
+            graphs: texturecraft_compose::GraphStore::empty(),
             bounds: mesh.bounds(),
         };
         let mut oracle = Composite::new(&channels, SIZE);
@@ -3396,7 +3603,7 @@ mod procedural_tests {
         project.insert_layer(0, layer, None, false).unwrap();
 
         // The gutter is in a different baked AO cell from its covered source.
-        let ao = BakedMaps { resolution: 4, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new([0.05, 0.6, 0.4, 0.2].repeat(4)))]) };
+        let ao = BakedMaps { resolution: 4, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new([0.05, 0.6, 0.4, 0.2].repeat(4).into()))]) };
         let empty = BakedMaps::default();
         let pixels = PixelStore::default();
         let images = ImageStore::default();
@@ -3413,6 +3620,7 @@ mod procedural_tests {
                 block_scales: project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: texturecraft_compose::GraphStore::empty(),
                 bounds: mesh.bounds(),
             };
             let mut oracle = Composite::new(&channels, SIZE);
@@ -3450,7 +3658,7 @@ mod procedural_tests {
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
         layer.mask = Some(mask);
         project.insert_layer(0, layer, None, false).unwrap();
-        let baked = BakedMaps { resolution: 1, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new(vec![0.5002]))]) };
+        let baked = BakedMaps { resolution: 1, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new(vec![0.5002].into()))]) };
         let pixels = PixelStore::default();
         let inputs = Inputs {
             project: &project,
@@ -3462,6 +3670,7 @@ mod procedural_tests {
             block_scales: project.texture_sets[0].block_scales(),
             preview: None,
             images: &ImageStore::default(),
+            graphs: texturecraft_compose::GraphStore::empty(),
             bounds: mesh.bounds(),
         };
         let expected = mask_image(&inputs, owner, SIZE).unwrap();
@@ -3491,7 +3700,7 @@ mod procedural_tests {
         }
         let mesh = Arc::new(mesh);
         let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
-        let curvature = (0..BAKE_SIZE * BAKE_SIZE)
+        let curvature: Vec<f32> = (0..BAKE_SIZE * BAKE_SIZE)
             .map(|i| {
                 let x = i % BAKE_SIZE;
                 let y = i / BAKE_SIZE;
@@ -3503,7 +3712,7 @@ mod procedural_tests {
                 }
             })
             .collect();
-        let baked = BakedMaps { resolution: BAKE_SIZE, maps: BTreeMap::from([(BakedMap::Curvature, Arc::new(curvature))]) };
+        let baked = BakedMaps { resolution: BAKE_SIZE, maps: BTreeMap::from([(BakedMap::Curvature, Arc::new(curvature.into()))]) };
         let absent = BakedMaps::default();
         let pixels = PixelStore::default();
         let images = ImageStore::default();
@@ -3542,6 +3751,7 @@ mod procedural_tests {
                         block_scales: project.texture_sets[0].block_scales(),
                         preview: None,
                         images: &images,
+                        graphs: texturecraft_compose::GraphStore::empty(),
                         bounds: mesh.bounds(),
                     };
                     let expected = mask_image(&inputs, owner, SIZE).unwrap();
@@ -3578,7 +3788,7 @@ mod procedural_tests {
         let layer = Layer::new(owner, "Surface detail", LayerKind::Fill(fill), &[Channel::Normal]);
         project.insert_layer(0, layer, None, false).unwrap();
         let steep = [0.5158094, 0.5, 0.00025];
-        let baked = BakedMaps { resolution: 1, maps: BTreeMap::from([(BakedMap::Normal, Arc::new(steep.to_vec()))]) };
+        let baked = BakedMaps { resolution: 1, maps: BTreeMap::from([(BakedMap::Normal, Arc::new(steep.to_vec().into()))]) };
         let pixels = PixelStore::default();
         let mut program = CompositeProgram::compile(&project, &pixels, 0).unwrap();
         program.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
@@ -3848,6 +4058,7 @@ mod procedural_tests {
                 block_scales: project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: texturecraft_compose::GraphStore::empty(),
                 bounds: mesh.bounds(),
             };
             let mut cpu = Composite::new(&channels, SIZE);
@@ -3920,6 +4131,8 @@ mod paint_window_tests {
             id_bake: None,
             display_outputs: 0,
             glossiness: false,
+            measured_blend: false,
+            unit_channels: 0,
             mask_preview: false,
             mask_layer: 0,
             mask_layers: BTreeMap::new(),

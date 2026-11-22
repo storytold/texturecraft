@@ -37,6 +37,7 @@ pub mod headless;
 mod high_poly_gpu;
 pub mod ibl;
 pub mod mesh_maps;
+mod mesh_parts;
 mod mips_dirty;
 mod missing_seam_gpu;
 pub mod neutral_material;

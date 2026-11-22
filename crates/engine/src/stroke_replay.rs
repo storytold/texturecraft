@@ -581,6 +581,8 @@ impl RecordedPaint {
                     backface_culling: self.settings.backface_culling,
                     angle_fade: self.settings.angle_fade,
                     shape,
+                    facing: texturecraft_paint::Facing::Front,
+                    reach: texturecraft_paint::Reach::Plane,
                 };
                 for dab in &world.dabs {
                     if progress.cancel.load(Relaxed) {
@@ -660,15 +662,14 @@ fn fingerprint(image: &TileImage) -> u64 {
     hash.add(u64::from(image.width()));
     hash.add(u64::from(image.height()));
     hash.add(image.comps() as u64);
-    for (x, y) in image.allocated() {
+    let Ok(()) = image.for_each_tile::<std::convert::Infallible>(|x, y, tile| {
         hash.add(u64::from(x));
         hash.add(u64::from(y));
-        if let Some(tile) = image.tile(x, y) {
-            for &value in tile {
-                hash.add(u64::from(value));
-            }
+        for &value in tile {
+            hash.add(u64::from(value));
         }
-    }
+        Ok(())
+    });
     hash.0
 }
 

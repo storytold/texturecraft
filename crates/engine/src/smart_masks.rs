@@ -230,6 +230,8 @@ impl Session {
             stroke_replays: Default::default(),
             baked: BTreeMap::new(),
             resources: BTreeMap::new(),
+            graphs: pf.graphs,
+            strokes: pf.strokes,
         };
         let label = src.project.texture_sets.first().map(|t| t.name.clone()).unwrap_or_default();
         self.edit(&format!("Apply smart mask {label}"), |s| {

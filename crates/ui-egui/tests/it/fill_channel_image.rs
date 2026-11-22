@@ -92,7 +92,7 @@ fn switching_projects_releases_image_previews_with_equal_revisions() {
         assert_eq!(loaded.revision, 1);
         session.switch_to(loaded);
         thumbnails.sync_images(&session.images, session.revision);
-        let image = &session.images[&name];
+        let image = session.images.get(&name).unwrap();
         decoded_images.push(Arc::downgrade(image));
         drop(thumbnails.image(&context, &name, image));
         counts.push(preview_count());

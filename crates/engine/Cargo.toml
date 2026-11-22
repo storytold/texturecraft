@@ -17,6 +17,8 @@ texturecraft-compose = { workspace = true }
 texturecraft-paint = { workspace = true }
 texturecraft-bake = { workspace = true }
 texturecraft-formats = { workspace = true }
+texturecraft-import = { workspace = true }
+texturecraft-import-verify = { workspace = true }
 rayon = { workspace = true }
 epaint_default_fonts = { workspace = true }
 serde = { workspace = true }
@@ -26,6 +28,8 @@ web-time = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tempfile = "3"
+# Graph cooks kept in a folder across imports (file.importProject `resultCache`); the web build has no folder.
+texturecraft-result-cache = { workspace = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
 sysinfo = { workspace = true }
@@ -40,3 +44,12 @@ rustix = { workspace = true }
 [dev-dependencies]
 image = { workspace = true }
 zip = { workspace = true }
+
+[features]
+# Developer tools in examples/ that read local project files. Off by default, so `cargo test` (the CI gate) does
+# not build them; run one with `cargo run -p texturecraft-engine --features dev-tools --example <name> -- ...`.
+dev-tools = []
+
+[[example]]
+name = "import_progress"
+required-features = ["dev-tools"]

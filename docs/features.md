@@ -33,7 +33,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   everything outside it while you paint.
 - **Every channel at once:** base color, metallic, roughness, height, normal, emissive, opacity,
   ambient occlusion and specular level, plus clear coat, sheen, anisotropy, subsurface scattering
-  and transmission, each toggled per stroke in the brush's material properties.
+  and transmission, each toggled per stroke in the brush's material properties. Eight **user
+  channels** hold free linear RGB data (masks or packed maps for other engines), white where
+  nothing covers them, and can be named per texture set.
 
 ## Layers, masks and smart materials
 
@@ -134,7 +136,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **UDIM / UV tiles:** detected on import or switched on later, with a resolution per tile (blurs,
   other filters and height-to-normal slopes keep their size in UV space at any tile resolution)
   and one texture per tile on export (`$udim`).
-- **Texture sets** from 128 to 8192 px per material, resampled when you change them, with 21
+- **Texture sets** from 128 to 8192 px per material, resampled when you change them, with 29
   channel types to add or remove. Show, hide or invert them all at once, or **focus** on the
   active one. The project's **normal map format** (OpenGL or DirectX, in Texture Set Settings)
   says how a normal map image set as a mesh map is read, and is the default for export.

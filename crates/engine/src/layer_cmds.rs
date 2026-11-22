@@ -782,7 +782,8 @@ pub(crate) fn projection_from_fields(params: &Value, command: &str, current: Opt
             *scale = new_scale.map_or(*scale, |axes| axes[0]);
             *axis = new_axis.unwrap_or(*axis);
         }
-        Projection::Decal(_) => {}
+        // placed with the settings an import gave it; picking a projection kind replaces it
+        Projection::Decal(_) | Projection::Placed(_) => {}
     }
 
     Ok(projection)

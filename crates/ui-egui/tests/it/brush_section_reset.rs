@@ -20,7 +20,7 @@ type SectionReset = fn(&mut BrushSettings, &BrushSettings);
 /// Each brush section's title, a label shown only while it is open, whether it starts open, and its reset
 const SECTIONS: [(&str, &str, bool, SectionReset); 7] = [
     ("Size", "Minimum size (%)", true, |brush, defaults| {
-        (brush.size, brush.min_size, brush.screen_space) = (defaults.size, defaults.min_size, defaults.screen_space)
+        (brush.size, brush.min_size, brush.min_flow, brush.screen_space) = (defaults.size, defaults.min_size, defaults.min_flow, defaults.screen_space)
     }),
     ("Flow and opacity", "Stroke opacity", true, |brush, defaults| {
         (brush.flow, brush.opacity, brush.spacing) = (defaults.flow, defaults.opacity, defaults.spacing)
@@ -43,6 +43,7 @@ fn changed_brush() -> BrushSettings {
     BrushSettings {
         size: 0.1,
         min_size: 0.5,
+        min_flow: 0.5,
         screen_space: true,
         flow: 0.5,
         opacity: 0.6,
@@ -172,7 +173,8 @@ fn enter_and_space_on_the_focused_reset_icon_reset_only_its_section() {
 
         let defaults = BrushSettings::default();
         let mut expected = changed_brush();
-        (expected.size, expected.min_size, expected.screen_space) = (defaults.size, defaults.min_size, defaults.screen_space);
+        (expected.size, expected.min_size, expected.min_flow, expected.screen_space) =
+            (defaults.size, defaults.min_size, defaults.min_flow, defaults.screen_space);
         assert_eq!(harness.state().session.tool.brush, expected, "resetting Size with {key:?}");
     }
 }

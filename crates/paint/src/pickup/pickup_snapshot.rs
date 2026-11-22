@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use texturecraft_compose::{BakedMaps, ImageStore, Inputs, PaintTarget, PixelStore};
+use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, Inputs, PaintTarget, PixelStore};
 use texturecraft_core::Project;
 use texturecraft_geom::{Mesh, UvGBuffer};
 
@@ -15,6 +15,7 @@ pub struct PickupSnapshot {
     pub pixels: PixelStore,
     pub baked: BakedMaps,
     pub images: ImageStore,
+    pub graphs: GraphStore,
 }
 
 impl PickupSnapshot {
@@ -30,6 +31,7 @@ impl PickupSnapshot {
             block_scales: set.block_scales(),
             preview: None,
             images: &self.images,
+            graphs: &self.graphs,
             bounds: self.bounds,
         })
     }

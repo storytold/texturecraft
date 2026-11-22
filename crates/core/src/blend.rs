@@ -2,6 +2,10 @@
 //!
 //! `a` is the value below (the stack so far), `b` the layer's value. The compositor mixes the
 //! result back over `a` by `coverage × opacity × mask`.
+//!
+//! Besides the menu's modes there are modes that only imported projects use ([`BlendMode::IMPORTED`]): `Hue`
+//! (W3C) and four colour modes in HSV form as the reference app blends them, measured from its renders. They sit
+//! beside TextureCraft's own `Tint`, `Saturation`, `Color` and `Value`, which keep their formulas.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +44,16 @@ pub enum BlendMode {
     NormalMapCombine,
     NormalMapDetail,
     NormalMapInverseDetail,
+    /// The hue of the layer with the saturation and luminosity below (W3C).
+    Hue,
+    /// HSV form: hue of the layer; saturation and twice the value of what is below.
+    HsvTint,
+    /// HSV form: saturation of the layer; hue and twice the value of what is below.
+    HsvSaturation,
+    /// HSV form: hue and saturation of the layer; twice the value of what is below.
+    HsvColor,
+    /// HSV form: twice the value of the layer; hue and saturation of what is below.
+    HsvValue,
 }
 
 impl BlendMode {
@@ -86,8 +100,17 @@ impl BlendMode {
         None,
     ];
 
+    /// Modes that imported projects use but the blend menu does not offer (yet).
+    pub const IMPORTED: [BlendMode; 5] = [BlendMode::Hue, BlendMode::HsvTint, BlendMode::HsvSaturation, BlendMode::HsvColor, BlendMode::HsvValue];
+
+    /// The menu's modes, in menu order.
     pub fn all() -> impl Iterator<Item = BlendMode> {
         BlendMode::MENU.into_iter().flatten()
+    }
+
+    /// Every mode: the menu's, then [`BlendMode::IMPORTED`].
+    pub fn every() -> impl Iterator<Item = BlendMode> {
+        BlendMode::all().chain(BlendMode::IMPORTED)
     }
 
     pub fn label(self) -> &'static str {
@@ -124,6 +147,11 @@ impl BlendMode {
             BlendMode::NormalMapCombine => "Normal map combine",
             BlendMode::NormalMapDetail => "Normal map detail",
             BlendMode::NormalMapInverseDetail => "Normal map inverse detail",
+            BlendMode::Hue => "Hue",
+            BlendMode::HsvTint => "HSV tint",
+            BlendMode::HsvSaturation => "HSV saturation",
+            BlendMode::HsvColor => "HSV color",
+            BlendMode::HsvValue => "HSV value",
         }
     }
 
@@ -162,6 +190,11 @@ impl BlendMode {
             BlendMode::NormalMapCombine => "NmCb",
             BlendMode::NormalMapDetail => "NmDt",
             BlendMode::NormalMapInverseDetail => "NmID",
+            BlendMode::Hue => "Hue",
+            BlendMode::HsvTint => "HTnt",
+            BlendMode::HsvSaturation => "HSat",
+            BlendMode::HsvColor => "HCol",
+            BlendMode::HsvValue => "HVal",
         }
     }
 
@@ -169,7 +202,7 @@ impl BlendMode {
     pub fn parse(s: &str) -> Option<BlendMode> {
         let norm = |x: &str| x.to_ascii_lowercase().replace([' ', '_', '-', '(', ')'], "");
         let want = norm(s);
-        BlendMode::all().find(|m| norm(m.label()) == want || norm(m.short()) == want || norm(&format!("{m:?}")) == want)
+        BlendMode::every().find(|m| norm(m.label()) == want || norm(m.short()) == want || norm(&format!("{m:?}")) == want)
     }
 
     /// Modes that need all three components at once.
@@ -183,6 +216,11 @@ impl BlendMode {
                 | BlendMode::NormalMapCombine
                 | BlendMode::NormalMapDetail
                 | BlendMode::NormalMapInverseDetail
+                | BlendMode::Hue
+                | BlendMode::HsvTint
+                | BlendMode::HsvSaturation
+                | BlendMode::HsvColor
+                | BlendMode::HsvValue
         )
     }
 }
@@ -263,7 +301,12 @@ pub fn blend1(mode: BlendMode, a: f32, b: f32) -> f32 {
         | BlendMode::Value
         | BlendMode::NormalMapCombine
         | BlendMode::NormalMapDetail
-        | BlendMode::NormalMapInverseDetail => b,
+        | BlendMode::NormalMapInverseDetail
+        | BlendMode::Hue
+        | BlendMode::HsvTint
+        | BlendMode::HsvSaturation
+        | BlendMode::HsvColor
+        | BlendMode::HsvValue => b,
     }
 }
 
@@ -313,6 +356,40 @@ fn pack(n: [f32; 3]) -> [f32; 3] {
     n.map(|v| v / len * 0.5 + 0.5)
 }
 
+/// Hue (0..1), saturation and value of a color.
+fn hsv(c: [f32; 3]) -> [f32; 3] {
+    let [r, g, b] = c;
+    let (mn, mx) = (r.min(g).min(b), r.max(g).max(b));
+    let d = mx - mn;
+    let h = if d <= 0.0 {
+        0.0
+    } else if mx == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if mx == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    [h / 6.0, if mx > 0.0 { d / mx } else { 0.0 }, mx]
+}
+
+/// The color of hue `h` (0..1, wrapping), saturation `s` and value `v`, each component clipped to 0..1.
+fn from_hsv(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let sector = if h.is_finite() { h.rem_euclid(1.0) * 6.0 } else { 0.0 };
+    let c = v * s;
+    let x = c * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match sector as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    [r, g, b].map(|p| if (p + m).is_finite() { (p + m).clamp(0.0, 1.0) } else { 0.0 })
+}
+
 /// Reoriented normal mapping (Barré-Brisebois & Hill): `detail` re-oriented onto `base` (both
 /// packed into 0..1, as is the result).
 pub fn rnm(base: [f32; 3], detail: [f32; 3]) -> [f32; 3] {
@@ -344,6 +421,23 @@ pub fn blend3(mode: BlendMode, a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
         }
         BlendMode::NormalMapDetail => rnm(a, b),
         BlendMode::NormalMapInverseDetail => rnm(b, a),
+        BlendMode::Hue => set_lum(set_sat(b, sat(a)), lum(a)),
+        BlendMode::HsvTint => {
+            let (ha, hb) = (hsv(a), hsv(b));
+            from_hsv(hb[0], ha[1], 2.0 * ha[2])
+        }
+        BlendMode::HsvSaturation => {
+            let (ha, hb) = (hsv(a), hsv(b));
+            from_hsv(ha[0], hb[1], 2.0 * ha[2])
+        }
+        BlendMode::HsvColor => {
+            let (ha, hb) = (hsv(a), hsv(b));
+            from_hsv(hb[0], hb[1], 2.0 * ha[2])
+        }
+        BlendMode::HsvValue => {
+            let (ha, hb) = (hsv(a), hsv(b));
+            from_hsv(ha[0], ha[1], 2.0 * hb[2])
+        }
         _ => [blend1(mode, a[0], b[0]), blend1(mode, a[1], b[1]), blend1(mode, a[2], b[2])],
     }
 }
@@ -400,7 +494,7 @@ mod tests {
         assert!(close(blend1(BlendMode::ColorDodge, 0.0, 1.0), 0.0));
         assert!(close(blend1(BlendMode::ColorDodge, 0.5, 1.0), 1.0));
         assert!(close(blend1(BlendMode::ColorDodge, 0.25, 0.5), 0.5));
-        for m in BlendMode::all() {
+        for m in BlendMode::every() {
             for a in AS {
                 for b in BS {
                     assert!(blend1(m, a, b).is_finite(), "{m:?} {a} {b}");
@@ -427,6 +521,53 @@ mod tests {
                 assert!((out[i] - n[i]).abs() < 1e-4, "{m:?} {out:?} {n:?}");
             }
         }
+    }
+
+    fn close3(a: [f32; 3], b: [f32; 3]) -> bool {
+        (0..3).all(|i| (a[i] - b[i]).abs() < 1e-5)
+    }
+
+    #[test]
+    fn hue_takes_the_layer_hue_and_keeps_saturation_and_luminosity_below() {
+        let a = [0.2, 0.4, 0.6];
+        let out = blend3(BlendMode::Hue, a, [1.0, 0.0, 0.0]);
+        assert!(close(lum(out), lum(a)) && close(sat(out), sat(a)), "{out:?}");
+        assert!(out[0] > out[1] && out[0] > out[2], "red hue: {out:?}");
+        assert!(close3(blend3(BlendMode::Hue, a, [0.5; 3]), [lum(a); 3]), "a gray layer has no hue: gray at the luminosity below");
+    }
+
+    #[test]
+    fn hsv_modes_double_the_value_below_and_clip() {
+        // Below: hsv = (0.5, 0.5, 0.4) (a dark cyan). Layer: pure red, hsv = (0, 1, 1).
+        let (a, b) = ([0.2, 0.4, 0.4], [1.0, 0.0, 0.0]);
+        assert!(close3(hsv(a), [0.5, 0.5, 0.4]));
+        assert!(close3(blend3(BlendMode::HsvTint, a, b), [0.8, 0.4, 0.4]), "red hue, half saturation, value 0.8");
+        assert!(close3(blend3(BlendMode::HsvSaturation, a, b), [0.0, 0.8, 0.8]), "cyan, full saturation, value 0.8");
+        assert!(close3(blend3(BlendMode::HsvColor, a, b), [0.8, 0.0, 0.0]));
+        assert!(
+            close3(blend3(BlendMode::HsvValue, a, b), [1.0, 1.0, 1.0]),
+            "value 2 clips to white at half saturation's base: {:?}",
+            blend3(BlendMode::HsvValue, a, b)
+        );
+        assert!(close3(blend3(BlendMode::HsvValue, a, [0.1, 0.1, 0.1]), [0.1, 0.2, 0.2]), "value 0.2 with the hue and saturation below");
+        assert!(close3(blend3(BlendMode::HsvColor, [0.0; 3], b), [0.0; 3]), "black below stays black");
+        for m in BlendMode::IMPORTED {
+            assert!(m.is_non_separable() && blend1(m, 0.3, 0.7) == 0.7);
+            assert!(blend3(m, [f32::NAN, 2.0, -1.0], [f32::INFINITY, 0.5, f32::NAN]).iter().all(|v| v.is_finite() || m == BlendMode::Hue), "{m:?}");
+        }
+    }
+
+    #[test]
+    fn imported_modes_parse_and_stay_out_of_the_menu() {
+        for m in BlendMode::IMPORTED {
+            assert!(!BlendMode::all().any(|x| x == m), "{m:?} is not in the menu");
+            assert_eq!(BlendMode::parse(m.label()), Some(m));
+            assert_eq!(BlendMode::parse(&format!("{m:?}")), Some(m));
+            let json = serde_json::to_value(m).unwrap();
+            assert_eq!(serde_json::from_value::<BlendMode>(json).unwrap(), m);
+        }
+        assert_eq!(serde_json::to_value(BlendMode::HsvTint).unwrap(), serde_json::json!("HsvTint"));
+        assert_eq!(BlendMode::every().count(), 37);
     }
 
     #[test]

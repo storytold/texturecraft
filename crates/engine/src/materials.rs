@@ -772,7 +772,7 @@ pub fn brush_values(id: &str) -> Option<Vec<(Channel, [f32; 3])>> {
             .filter_map(|(channel, source)| match source {
                 Source::Uniform(value) => Some((channel, value)),
                 Source::Procedural { low, high, .. } => Some((channel, mean(&low, &high))),
-                Source::Image { .. } | Source::Anchor { .. } => None,
+                Source::Image { .. } | Source::Anchor { .. } | Source::Graph(_) => None,
             })
             .collect(),
     )

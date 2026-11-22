@@ -502,7 +502,7 @@ mod tests {
         let mut hdr = Vec::new();
         image::DynamicImage::ImageRgb32F(img).write_to(&mut std::io::Cursor::new(&mut hdr), image::ImageFormat::Hdr).unwrap();
         let name = s.import_resource_bytes("sky.hdr", hdr).unwrap();
-        let res = &s.images[&name];
+        let res = &s.images.get(&name).unwrap();
         assert!(!res.srgb && res.rgba[0][0] > 30.0, "HDR keeps values above 1");
         let env = format!("resource:{name}");
         let r = execute(

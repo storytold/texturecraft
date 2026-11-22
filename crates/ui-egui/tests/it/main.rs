@@ -37,6 +37,7 @@ mod gradient_map_menu;
 mod help_menu_664;
 mod history_panel;
 mod import_resources;
+mod import_windows;
 mod inactive_set_hint;
 mod layer_blending_options;
 mod layer_clipboard;

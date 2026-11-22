@@ -112,6 +112,7 @@ fn refresh_draft_preferences(draft: &mut Prefs, previous: &Prefs, current: &Pref
         gpu_raytracing,
         libraries,
         background,
+        render_ram_percent,
     );
 }
 
@@ -152,10 +153,8 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                     }
 
                     // Work from the old project must not reach its replacement
-                    if matches!(id, "file.open" | "file.new" | "file.close" | "project.new" | "project.sample") {
-                        app.resize = None;
-                        app.pbr_import = None;
-                        app.layer_panel = Default::default();
+                    if matches!(id, "file.open" | "file.new" | "file.close" | "file.importProject" | "project.new" | "project.sample") {
+                        app.clear_project_jobs();
                     }
 
                     // The Export dialog cannot operate after Close
@@ -252,6 +251,33 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
             app.ui.adopt_layout(crate::UiState::default());
             ok(Value::Null)
         }
+        // the project import's windows, as a person drives them: open a file (the notice shows), acknowledge the
+        // notice, read what the windows show
+        // opening a file by its path: not in the web build, which has no file system
+        #[cfg(not(target_arch = "wasm32"))]
+        "ui.import.open" => {
+            let Some(path) = params.get("path").and_then(Value::as_str) else { return err("`path` is required") };
+            crate::windows::open_path(app, path);
+            ok(crate::import_ui::status(app, ctx.input(|i| i.time)))
+        }
+        "ui.import.convert" => {
+            if !crate::import_ui::acknowledge(app, ctx) {
+                return err("no import notice is showing");
+            }
+            ok(crate::import_ui::status(app, ctx.input(|i| i.time)))
+        }
+        "ui.import.status" => {
+            let mut status = crate::import_ui::status(app, ctx.input(|i| i.time));
+            if let Some(o) = status.as_object_mut() {
+                let pending = app.gpu.as_ref().map_or_else(|| app.session.pending_tiles(), |gpu| gpu.pending_cpu_tiles(&app.session));
+                let gpu_pending = app.gpu.as_ref().is_some_and(crate::gpu::GpuLink::gpu_composite_pending);
+                o.insert("pendingTiles".into(), json!(pending));
+                o.insert("gpuPending".into(), json!(gpu_pending));
+                o.insert("project".into(), json!(app.session.project().name));
+                o.insert("uiMs".into(), json!(app.ui_ms));
+            }
+            ok(status)
+        }
         "ui.set" => {
             let mut current_state = serde_json::to_value(&app.ui).unwrap_or(Value::Null);
             if let (Some(object), Some(patch)) = (current_state.as_object_mut(), params.as_object()) {
@@ -263,6 +289,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
             match serde_json::from_value::<crate::UiState>(current_state) {
                 Ok(mut ui) => {
                     let previous_autosave_minutes = app.ui.prefs.autosave_minutes;
+                    let render_ram_changed = ui.prefs.render_ram_percent != app.ui.prefs.render_ram_percent;
                     if ui.prefs.libraries != app.ui.prefs.libraries {
                         app.library = None;
                     }
@@ -288,6 +315,9 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                     app.ui = ui;
                     app.reschedule_autosave_if_changed(previous_autosave_minutes);
                     app.ui.prefs.apply_resource_limits();
+                    if render_ram_changed {
+                        app.ui.prefs.apply_graph_budget();
+                    }
                     ok(Value::Null)
                 }
                 Err(error) => err(format!("invalid UI state: {error}")),

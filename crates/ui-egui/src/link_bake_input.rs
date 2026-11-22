@@ -1,12 +1,15 @@
 use std::sync::{Arc, Weak};
 
-use texturecraft_engine::{compose::BakedMaps, core::BakedMap};
+use texturecraft_engine::{
+    compose::{BakedMaps, Texels},
+    core::BakedMap,
+};
 
 /// The identity of one baked map read by a linked cook.
 pub(super) struct LinkBakeInput {
     map: BakedMap,
     resolution: Option<u32>,
-    pixels: Option<Weak<Vec<f32>>>,
+    pixels: Option<Weak<Texels>>,
 }
 
 impl LinkBakeInput {
@@ -32,7 +35,7 @@ mod tests {
 
     #[test]
     fn replacing_a_baked_input_at_the_same_resolution_invalidates_its_cook() {
-        let earlier = Arc::new(vec![0.25; 4]);
+        let earlier = Arc::new(Texels::from(vec![0.25; 4]));
         let mut baked = BakedMaps { resolution: 2, maps: [(BakedMap::AmbientOcclusion, Arc::clone(&earlier))].into() };
         let ambient_occlusion = LinkBakeInput::capture(BakedMap::AmbientOcclusion, Some(&baked));
         let curvature = LinkBakeInput::capture(BakedMap::Curvature, Some(&baked));
@@ -40,12 +43,12 @@ mod tests {
         assert!(ambient_occlusion.is_current(Some(&baked)));
         assert_eq!(Arc::strong_count(&earlier), 2);
 
-        baked.maps.insert(BakedMap::AmbientOcclusion, Arc::new(vec![0.75; 4]));
+        baked.maps.insert(BakedMap::AmbientOcclusion, Arc::new(Texels::from(vec![0.75; 4])));
 
         assert!(!ambient_occlusion.is_current(Some(&baked)));
         assert!(curvature.is_current(Some(&baked)));
 
-        baked.maps.insert(BakedMap::Curvature, Arc::new(vec![0.5; 4]));
+        baked.maps.insert(BakedMap::Curvature, Arc::new(Texels::from(vec![0.5; 4])));
 
         assert!(!curvature.is_current(Some(&baked)));
     }

@@ -84,6 +84,12 @@ pub(crate) fn copy_tree(src: &Document, id: LayerId, s: &mut Document, ts: usize
             }
         }
     }
+    // the texts of the graphs the layer runs travel with it
+    for key in layer.graphs().into_iter().flat_map(|g| g.text_keys()) {
+        if let Some(text) = src.graphs.texts.get(key) {
+            s.graphs.texts.entry(key.to_string()).or_insert_with(|| text.clone());
+        }
+    }
     let children = layer.children().to_vec();
     if let LayerKind::Group { children: c, .. } = &mut copy.kind {
         c.clear();

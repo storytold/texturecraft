@@ -232,11 +232,17 @@ impl Session {
     }
 
     fn store_bake(&mut self, texture_set: usize, output: BakeOutput) -> Result<()> {
-        let maps = output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(pixels))).collect();
+        let maps = output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(texturecraft_compose::Texels::new(pixels)))).collect();
         self.store_bake_maps(texture_set, output.resolution, output.height, maps)
     }
 
-    fn store_bake_maps(&mut self, texture_set: usize, resolution: u32, height: u32, maps: std::collections::BTreeMap<BakedMap, Arc<Vec<f32>>>) -> Result<()> {
+    fn store_bake_maps(
+        &mut self,
+        texture_set: usize,
+        resolution: u32,
+        height: u32,
+        maps: std::collections::BTreeMap<BakedMap, Arc<texturecraft_compose::Texels>>,
+    ) -> Result<()> {
         let entry = self.doc.baked.entry(texture_set).or_default();
         if entry.resolution != resolution || entry.maps.keys().any(|map| entry.height(*map) != height) {
             entry.maps.clear();

@@ -31,7 +31,7 @@ struct Params {
     // The high bit of the last word selects the mask stack.
     filter_stage: vec4<u32>,
     filter_chunk: vec4<u32>,
-    // Original ID bake dimensions, both zero when absent.
+    // Original ID bake dimensions (zero if absent) and the bit mask of unit channels.
     id_bake: vec4<u32>,
     // Channel, start of anchor owner's draws, content cut, mask preview draw.
     anchor: vec4<u32>,
@@ -61,6 +61,8 @@ const PROJECTED_BRUSH: u32 = 4u;
 const GEOMETRY_MASKS: u32 = 8u;
 const IMAGE_SOURCE_OPCODE: u32 = 14u;
 const DECAL_PROJECTION: u32 = 9u;
+const PLACED_UV_PROJECTION: u32 = 10u;
+override enable_placed_uv: bool = false;
 const SPATIAL_FILTER_OPCODE: u32 = 36u;
 const COLOR_SELECTION_OPCODE: u32 = 38u;
 
@@ -171,11 +173,48 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
     return procedural_value(layer, uv, surface);
 }
 
+fn transformed_uv(layer: Operation, uv: vec2<f32>) -> vec2<f32> {
+    let rotation = layer.projection.xy;
+    let rotated = vec2(uv.x * rotation.x - uv.y * rotation.y, uv.x * rotation.y + uv.y * rotation.x);
+    return rotated * layer.projection.zw + layer.uv.xy;
+}
+
+fn placed_uv_covered(uv: vec2<f32>, repeat: vec2<bool>) -> bool {
+    return all(select(uv >= vec2(0.0), vec2(true), repeat))
+        && all(select(uv <= vec2(1.0), vec2(true), repeat));
+}
+
+fn placed_uv_value(layer: Operation, uv: vec2<f32>, with_alpha: bool) -> vec4<f32> {
+    let point = transformed_uv(layer, uv);
+    let repeat = (vec2(layer.procedural.z) & vec2(1u, 2u)) != vec2(0u);
+    if !placed_uv_covered(point, repeat) {
+        return vec4(0.0);
+    }
+    if enable_authored_images && layer.ids.y == IMAGE_SOURCE_OPCODE {
+        let sample = authored_image_placed(layer, point, repeat);
+        return vec4(sample.rgb, select(1.0, sample.a, with_alpha));
+    }
+    return vec4(layer.low.rgb, 1.0);
+}
+
 fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    if enable_placed_uv && layer.procedural.w == PLACED_UV_PROJECTION {
+        return placed_uv_value(layer, uv, false);
+    }
     if !enable_authored_images || layer.procedural.w != DECAL_PROJECTION {
         return vec4(value(layer, uv, surface), 1.0);
     }
     return decal_fill_value(layer, uv, surface);
+}
+
+fn content_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    if enable_placed_uv && layer.procedural.w == PLACED_UV_PROJECTION {
+        return placed_uv_value(layer, uv, true);
+    }
+    if measured_blend && enable_authored_images && layer.ids.y == IMAGE_SOURCE_OPCODE && layer.procedural.w != DECAL_PROJECTION {
+        return authored_image_content(layer, uv, surface);
+    }
+    return fill_value(layer, uv, surface);
 }
 
 fn stored_sample(layer: Operation, table: u32, origin: vec2<u32>, size: vec2<u32>, pixel: vec2<u32>, empty: vec4<f32>) -> vec4<f32> {
@@ -439,6 +478,7 @@ fn overlay(a: f32, b: f32) -> f32 {
 // Most stacks only use the basic modes. Keep the other blend math out
 // of those pipelines, where it would be inlined at every blend site.
 override enable_extended_blend_modes: bool = false;
+override measured_blend: bool = false;
 
 fn blend_scalar(mode: u32, a: f32, b: f32) -> f32 {
     switch mode {
@@ -457,7 +497,7 @@ fn blend_scalar(mode: u32, a: f32, b: f32) -> f32 {
             case 10u: { return b - a; }
             case 11u: { return abs(a - b); }
             case 12u: { return a + b - 2.0 * a * b; }
-            case 13u: { return a + 2.0 * b - 1.0; }
+            case 13u, 30u: { return a + 2.0 * b - 1.0; }
             case 14u: { return overlay(a, b); }
             case 15u: { return 1.0 - (1.0 - a) * (1.0 - b); }
             case 16u: { return a + b - 1.0; }
@@ -555,7 +595,7 @@ fn base_content(layer: Operation, texel: LayerTexel) -> vec4<f32> {
     if layer.ids.y == 10u {
         return painted(layer, texel.pixel, texel.projected);
     }
-    return fill_value(layer, texel.uv, texel.surface);
+    return content_fill_value(layer, texel.uv, texel.surface);
 }
 
 fn geometry_allows(offset: u32, triangle: u32) -> bool {
@@ -708,6 +748,7 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
     }
     var group_depth = 0u;
+    var coverage: array<f32, DISPLAY_CHANNELS>;
     for (var i = 0u; covered && i < params.program.x; i++) {
         let layer = layers[i];
         if composite_groups {
@@ -721,18 +762,27 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
                     i = layer.ids.w - 1u;
                     continue;
                 }
-                save_group_parent(group_depth, index, mask, MaterialValues(base, normal, scalars, lobe_colors, lobe_values));
+                let inner = save_group_parent(group_depth, index, layer.ids.z, mask, MaterialValues(base, normal, scalars, lobe_colors, lobe_values, coverage));
+                if measured_blend {
+                    base = inner.base;
+                    normal = inner.normal;
+                    scalars = inner.scalars;
+                    lobe_colors = inner.lobe_colors;
+                    lobe_values = inner.lobe_values;
+                    coverage = inner.coverage;
+                }
                 group_depth += 1u;
                 continue;
             }
             if layer.ids.y == END_GROUP {
                 group_depth -= 1u;
-                let mixed = mix_group_parent(group_depth, index, layer.ids.z, MaterialValues(base, normal, scalars, lobe_colors, lobe_values));
+                let mixed = mix_group_parent(group_depth, index, layer.ids.z, MaterialValues(base, normal, scalars, lobe_colors, lobe_values, coverage));
                 base = mixed.base;
                 normal = mixed.normal;
                 scalars = mixed.scalars;
                 lobe_colors = mixed.lobe_colors;
                 lobe_values = mixed.lobe_values;
+                if measured_blend { coverage = mixed.coverage; }
                 continue;
             }
         }
@@ -751,10 +801,28 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         if weight <= 0.0 { continue; }
         let content = layer_content(layer, texel, layer.effects.w);
+        let destination = layer.ids.x;
+        if measured_blend {
+            if content.a <= 0.0 { continue; }
+            let before = material_value(MaterialValues(base, normal, scalars, lobe_colors, lobe_values, coverage), destination);
+            let after = measured_over(mode, vec4(before, coverage[destination]), content, weight, destination);
+            coverage[destination] = after.a;
+            if destination == 0u {
+                base = after.rgb;
+            } else if destination == 7u {
+                normal = after.rgb;
+            } else if destination >= 12u {
+                lobe_values[destination - 12u] = after.x;
+            } else if destination >= 8u {
+                lobe_colors[destination - 8u] = after.rgb;
+            } else {
+                scalars[destination - 1u] = after.x;
+            }
+            continue;
+        }
         weight *= select(content.a, 1.0, mode == 2u && content.a > 0.0);
         if weight <= 0.0 { continue; }
         let source = content.rgb;
-        let destination = layer.ids.x;
         if destination == 0u {
             base += (blend_rgb(mode, base, source) - base) * weight;
         } else if destination == 7u {

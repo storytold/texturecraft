@@ -29,6 +29,7 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     export_mesh(app, ctx);
     crate::pbr_import::window(app, ctx);
     unsaved(app, ctx);
+    crate::import_ui::show(app, ctx);
     reset_ui(app, ctx);
     crate::named_layouts::show(app, ctx);
 }
@@ -153,7 +154,7 @@ fn unsaved(app: &mut TextureCraftApp, ctx: &egui::Context) {
         }
     }
 
-    let discard_after_create = matches!(pending, Unsaved::CreateProject(_)) && save_first == Some(false) && app.session.modified;
+    let discarding = save_first == Some(false) && app.session.modified;
     match save_first {
         Some(true) => {
             // An untitled project is saved from a dialog that answers on a later frame
@@ -175,17 +176,22 @@ fn unsaved(app: &mut TextureCraftApp, ctx: &egui::Context) {
     }
 
     app.ui.windows.unsaved = None;
+    let import_was_active = crate::import_ui::active(app);
     match pending {
         Unsaved::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         Unsaved::Command(id) => crate::menus::invoke(app, ctx, &id),
         Unsaved::CreateProject(opening_id) => {
-            if !crate::new_project_advanced::finish_create(app, opening_id) && discard_after_create {
+            if !crate::new_project_advanced::finish_create(app, opening_id) && discarding {
                 app.session.modified = true;
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
         Unsaved::Open(path) => open_path(app, &path),
         Unsaved::Load(name, bytes) => crate::web_files::load(app, &name, std::sync::Arc::unwrap_or_clone(bytes)),
+    }
+    // Conversion can still be cancelled or fail without replacing the project.
+    if discarding && !import_was_active && crate::import_ui::active(app) {
+        app.session.modified = true;
     }
 }
 
@@ -511,6 +517,15 @@ pub fn file_action(app: &mut TextureCraftApp, _ctx: &egui::Context, id: &str) ->
             crate::import_resources::open(app);
             true
         }
+        "file.importProject" => {
+            let ext = texturecraft_engine::import_cmds::PROJECT_EXT;
+            app.ask_file(FileDialog::open().filter(tr("Project to convert"), &[ext]), Bound::App, |app, paths| {
+                if let Some(p) = paths.first() {
+                    open_path(app, &p.display().to_string());
+                }
+            });
+            true
+        }
         "file.importMaterialX" => {
             app.ask_file(FileDialog::open().filter(tr("MaterialX materials"), &["mtlx"]), Bound::Project, |app, paths| {
                 if let Some(path) = paths.first()
@@ -608,8 +623,13 @@ fn reimport_mesh(app: &mut TextureCraftApp, path: String) {
 /// Open a project or mesh by path (menus, Recent projects, drag and drop).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_path(app: &mut TextureCraftApp, path: &str) {
-    #[cfg(not(target_arch = "wasm32"))]
-    if ask_to_save(app, crate::state::Unsaved::Open(path.into())) {
+    if crate::import_ui::active(app) || ask_to_save(app, crate::state::Unsaved::Open(path.into())) {
+        return;
+    }
+    // a project file of the reference app is converted, behind the import's notice
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if ext == texturecraft_engine::import_cmds::PROJECT_EXT {
+        crate::import_ui::ask(app, texturecraft_engine::import_cmds::ImportTask::path(path));
         return;
     }
     if app.run("file.open", json!({"path": path})).is_some() {
@@ -623,6 +643,7 @@ pub fn open_path(app: &mut TextureCraftApp, path: &str) {
 pub fn file_action(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) -> bool {
     match id {
         "file.open" => crate::web_files::open(ctx),
+        "file.importProject" => crate::web_files::import_project(ctx),
         "file.importResources" | "resource.import" => crate::web_files::import_images(ctx),
         "material.load" => crate::web_files::import_material(ctx),
         "file.save" | "file.saveAs" | "file.saveCopy" => crate::web_files::save_project(app),

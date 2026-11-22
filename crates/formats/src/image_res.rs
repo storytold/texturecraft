@@ -37,25 +37,9 @@ pub fn decode_cooked_image(bytes: &[u8], size: [u32; 2], max_decoder_bytes: u64)
 }
 
 fn decode_image_with_limits(bytes: &[u8], max_texels: u64, limits: image::Limits) -> Result<DecodedImage> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|error| FormatError::Malformed { kind: "image", msg: error.to_string() })?;
-
-    // TGA has no magic signature; its decoder validates the header when no format was recognized
-    let format = reader.format().unwrap_or(image::ImageFormat::Tga);
-    reader.set_format(format);
+    let (format, _, _) = image_head(bytes, max_texels)?;
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
     reader.limits(limits);
-
-    let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
-        .into_dimensions()
-        .map_err(|error| FormatError::Malformed { kind: "image", msg: error.to_string() })?;
-    if width == 0 || height == 0 || width > MAX_IMAGE_SIZE || height > MAX_IMAGE_SIZE {
-        return Err(FormatError::TooLarge(format!("image is {width}x{height} (limit {MAX_IMAGE_SIZE})")));
-    }
-
-    if u64::from(width) * u64::from(height) > max_texels {
-        return Err(FormatError::TooLarge(format!("image is {width}x{height}, more than {max_texels} texels")));
-    }
 
     let image = crate::guard("image", || reader.decode().map_err(|error| FormatError::Malformed { kind: "image", msg: error.to_string() }))?;
     let srgb = !matches!(image, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_));
@@ -74,6 +58,33 @@ fn decode_image_with_limits(bytes: &[u8], max_texels: u64, limits: image::Limits
     };
 
     Ok(DecodedImage { width, height, rgba, srgb })
+}
+
+/// Read a resource's image dimensions without decoding its pixels.
+pub fn probe_image(bytes: &[u8]) -> Result<(u32, u32)> {
+    image_head(bytes, MAX_RESOURCE_TEXELS).map(|(_, width, height)| (width, height))
+}
+
+fn image_head(bytes: &[u8], max_texels: u64) -> Result<(image::ImageFormat, u32, u32)> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| FormatError::Malformed { kind: "image", msg: error.to_string() })?;
+
+    // TGA has no magic signature; its decoder validates the header when no format was recognized
+    let format = reader.format().unwrap_or(image::ImageFormat::Tga);
+
+    let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(|error| FormatError::Malformed { kind: "image", msg: error.to_string() })?;
+    if width == 0 || height == 0 || width > MAX_IMAGE_SIZE || height > MAX_IMAGE_SIZE {
+        return Err(FormatError::TooLarge(format!("image is {width}x{height} (limit {MAX_IMAGE_SIZE})")));
+    }
+
+    if u64::from(width) * u64::from(height) > max_texels {
+        return Err(FormatError::TooLarge(format!("image is {width}x{height}, more than {max_texels} texels")));
+    }
+
+    Ok((format, width, height))
 }
 
 /// PNG bytes of an `rgb` (sRGB) image whose alpha is `coverage` (`width × height`, top row first):
@@ -296,5 +307,7 @@ mod tests {
         header[16] = 24;
 
         assert!(matches!(decode_image(&header), Err(FormatError::TooLarge(_))));
+        // The lazy path probes the header before it keeps an image to decode later: the same budget.
+        assert!(matches!(probe_image(&header), Err(FormatError::TooLarge(_))));
     }
 }

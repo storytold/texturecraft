@@ -1,0 +1,365 @@
+//! Stroke replay: the hand-off between the translator and the brush engine that paints imported strokes.
+//!
+//! The translator (this crate, below the brush engine in the layering) does not rasterise strokes. Where a layer's brush
+//! work or a mask's paint effect can be replayed, it builds a [`ReplayJob`]: the stroke records (pen path, pressure,
+//! camera and projection, symmetry, seed), the brush mapped onto neutral quantities with the measured rules applied
+//! ([`brush`]), the tip ([`tip`]), the values painted per channel and the layer, content effect or mask effect the
+//! pixels belong to. An engine that owns a brush engine implements [`StrokeReplayer`] and hands it to the import through
+//! [`crate::Hooks::replay`]; the import calls it per texture set after the layer stack is built and before the safety
+//! net composites, so the measured scores include the replayed pixels. Without a replayer, strokes stay placeholders
+//! locked with `strokes:<tool>`.
+//!
+//! Paint effects that cannot be replayed (projection painting without an image, smudge or projection painting
+//! along path strokes, brushes painting anchors, tips that are compiled graphs the project does not hold) stay
+//! placeholders with a precise `brush:` or `brush-alpha:` reason. Path strokes (curves on the mesh) are replayed as dabs
+//! walked along the curve ([`ReplayPath`]), or, with a ribbon brush, as a band ([`ReplayRibbon`]). Brushes painting an
+//! image or a compiled graph paint it per texel ([`source`]).
+//! Particle brushes lay the dabs of a small simulation per stroke ([`ReplayParticles`], approximated: [`particles`]).
+
+pub mod brush;
+pub mod particles;
+pub mod record;
+pub mod source;
+pub mod tip;
+
+use std::sync::Arc;
+
+use texturecraft_core::{Channel, LayerId};
+use texturecraft_geom::Mesh;
+use texturecraft_texel::TileImage;
+
+pub use brush::{SourceGraphs, check, step};
+pub use source::{ReplaySource, ReplayTexels};
+
+/// The words every replay note starts with in the import report.
+pub const REPLAYED: &str = "strokes replayed with TextureCraft's brush";
+
+/// How a step lays its strokes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaintMode {
+    /// Lays the step's values "over" what is there.
+    Paint,
+    /// Lowers the coverage of what is there.
+    Erase,
+    /// Moves what the job's earlier steps laid (values and coverage, on the step's channels): each dab draws what lies
+    /// at the previous dab's place over its own.
+    Smudge,
+}
+
+/// How a tip that is not round lies on the surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TipAlignment {
+    /// On the dab's tangent plane, the view's right as its x.
+    Tangent,
+    /// Facing the view.
+    Camera,
+    /// Along the texture's axes.
+    Uv,
+}
+
+/// A step's tip.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayTip {
+    /// The round tip: full inside `hardness` of the radius, then a smoothstep to 0 at the rim (measured on the newer
+    /// round shape; TextureCraft's round alpha is the same curve).
+    Round { hardness: f32 },
+    /// A grey image stretched over the dab's square (rows top first, `width × height` values 0..1).
+    Image { width: u32, height: u32, values: Arc<[f32]> },
+}
+
+/// The brush of a step in neutral quantities.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayBrush {
+    /// Dab radius in the mesh's units (the file's brush size is a diameter there; measured).
+    pub radius: f32,
+    /// Distance between dabs as a share of the diameter.
+    pub spacing: f32,
+    pub flow: f32,
+    /// Lowest share of the size under pressure 0 (`None`: pressure does not change it): linear in the pressure.
+    pub size_pressure: Option<f32>,
+    /// The same for flow.
+    pub flow_pressure: Option<f32>,
+    /// Size and flow jitter, 0..1: a dab's size and flow are `1 − jitter·u`, `u` even in 0..1.
+    pub size_jitter: f32,
+    pub flow_jitter: f32,
+    /// Position jitter in diameters: along both of the view's axes in a direction drawn per dab (`position_both`), or
+    /// across the stroke; its distance drawn from a normal distribution (`position_normal`) or evenly in −1..1.
+    pub position_jitter: f32,
+    pub position_both: bool,
+    pub position_normal: bool,
+    /// The tip's turn, radians, clockwise on the screen; and its jitter, radians either way.
+    pub rotation: f32,
+    pub rotation_jitter: f32,
+    /// The tip also turns with the stroke (its top ahead).
+    pub follow: bool,
+    pub alignment: TipAlignment,
+    /// Culling: texels whose normal turns further than this share of a half turn from the normal at the dab's centre
+    /// are not reached; a smooth fade 0.5 wide in the cosine around it (measured). `None`: no culling.
+    pub culling: Option<f32>,
+    pub tip: ReplayTip,
+    /// A dynamic alpha's stamps: dab `k` of a stroke lays `cycle[(k + start) mod n]` instead of `tip`, `start` 0 or, with
+    /// `cycle_drawn_start`, drawn from the stroke's seed. Empty: every dab lays `tip`.
+    pub cycle: Vec<ReplayTip>,
+    pub cycle_drawn_start: bool,
+    /// A path brush's up direction (mesh space): where the top of a tip that does not follow the path points along a
+    /// path stroke, laid on the surface's tangent plane (Inferred). `None`: the tip lies along the path.
+    pub up: Option<[f32; 3]>,
+}
+
+/// A stencil's grey image.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StencilImage {
+    /// One value everywhere, inside and outside the image.
+    Uniform(f32),
+    /// Rows top first, `width × height` values 0..1; nothing outside it.
+    Image { width: u32, height: u32, values: Arc<[f32]> },
+}
+
+/// The stencil a step's strokes go through: a stroke's coverage times the image at the texel's place on the stroke's
+/// view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayStencil {
+    pub image: StencilImage,
+    /// Column by column, from the view's normalised device coordinates (y up) to the image's (0..1, y up).
+    pub matrix: [f32; 9],
+}
+
+/// Where a stroke was painted.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StrokeSpace {
+    /// The 3D view through the stroke's camera: view and projection matrices, column-major, in the mesh's space.
+    Mesh { view: [f32; 16], projection: [f32; 16] },
+    /// The 2D view: points are texture coordinates (rows down, as the mesh's UVs).
+    Uv,
+}
+
+/// One point of a stroke's path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrokePoint {
+    /// Normalised device coordinates (−1..1, y up) in the 3D view; texture coordinates in the 2D view.
+    pub position: [f32; 2],
+    /// Pen pressure 0..1 (1 for a mouse).
+    pub pressure: f32,
+}
+
+/// One stroke as recorded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayStroke {
+    pub space: StrokeSpace,
+    pub points: Vec<StrokePoint>,
+    pub seed: u32,
+    /// The lazy mouse's string as a share of the view's height (0: off).
+    pub lazy: f32,
+    /// Symmetry: `copies` further copies, each `copy_matrix` (column-major, mesh space) applied once more.
+    pub copies: u32,
+    pub copy_matrix: [f32; 16],
+}
+
+/// One cubic piece of a path stroke: from `points[0]` to `points[3]` through the handles `points[1]`, `points[2]` (the
+/// mesh's space), with the surface normal and the anchors' size (0..1, applied as a pen's pressure) at its two ends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathPiece {
+    pub points: [[f32; 3]; 4],
+    pub normals: [[f32; 3]; 2],
+    pub size: [f32; 2],
+}
+
+/// A path stroke as recorded: a curve on the mesh, no view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayPath {
+    /// The curve's pieces, in order; empty for a path of one anchor.
+    pub pieces: Vec<PathPiece>,
+    /// A path of one anchor: its position, normal and size.
+    pub anchor: Option<([f32; 3], [f32; 3], f32)>,
+    pub seed: u32,
+    /// Symmetry: `copies` further copies, each `copy_matrix` (column-major, mesh space) applied once more.
+    pub copies: u32,
+    pub copy_matrix: [f32; 16],
+}
+
+/// How a ribbon places its tip along a path (measured on flat test paths unless marked).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RibbonTiling {
+    /// Whole copies, each [`ReplayRibbon::copy`] long before fitting, as many as fit best, stretched to fill the path.
+    Repeat,
+    /// One copy stretched over the whole path (Inferred: panels).
+    Whole,
+    /// One copy over the whole path, the tip before `guides[0]` and after `guides[1]` kept [`ReplayRibbon::copy`] long,
+    /// the part between stretched.
+    Caps { guides: [f32; 2] },
+}
+
+/// A ribbon brush: the tip laid along each path as a band, no dabs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReplayRibbon {
+    /// The band's full width, mesh units.
+    pub width: f32,
+    /// One copy's length before fitting: the width times the aspect ratio.
+    pub copy: f32,
+    pub tiling: RibbonTiling,
+    /// How far from the path along the surface's normal the band reaches (Inferred).
+    pub depth: f32,
+}
+
+/// A particle brush: each stroke's dabs come from a simulation of particles spawned along it (TextureCraft's
+/// `particles::simulate` takes these numbers; see there for their meaning). Lengths mesh units, times seconds, angles
+/// radians.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReplayParticles {
+    pub per_point: f32,
+    pub per_length: f32,
+    pub budget: f32,
+    pub speed: f32,
+    pub speed_rand: f32,
+    pub life: f32,
+    pub life_rand: f32,
+    pub gravity: f32,
+    pub friction: f32,
+    pub wander: f32,
+    pub curl: f32,
+    pub fan: f32,
+    pub heading: f32,
+    pub away: bool,
+    pub kink_time: f32,
+    pub kink_angle: f32,
+    pub kink_branches: f32,
+    pub kink_speed: f32,
+    pub stop_speed: f32,
+    pub view_bias: f32,
+    pub spread: f32,
+    pub scatter: f32,
+    pub fade_size: f32,
+    pub fade_size_rand: f32,
+    pub fade_flow: f32,
+    pub fade_flow_rand: f32,
+    pub size: f32,
+    pub flow: f32,
+    pub step: f32,
+    /// `speed` is still in the units of the mesh file the original imported ([`particles::in_file_units`] puts it in the
+    /// stored mesh's before the replay).
+    pub file_units: bool,
+}
+
+/// One paint effect of the file, ready to lay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayStep {
+    pub mode: PaintMode,
+    /// Content targets: value per channel (TextureCraft's linear values) and the channel's own opacity.
+    pub values: Vec<(Channel, [f32; 3], f32)>,
+    /// Content targets painted with an image or a graph instead of a value (a channel is in `values` or here, not
+    /// both), with the channel's own opacity.
+    pub sources: Vec<(Channel, ReplaySource, f32)>,
+    /// Mask targets: the grey value laid.
+    pub mask_value: f32,
+    /// Mask targets painted with a graph's grey output instead of `mask_value`.
+    pub mask_source: Option<ReplaySource>,
+    /// The effect's opacity: each stroke lays `opacity × coverage`.
+    pub opacity: f32,
+    pub brush: ReplayBrush,
+    pub stencil: Option<ReplayStencil>,
+    /// Projection painting (masks): the grey laid at each texel is this image's where the texel lies on the stroke's
+    /// view, in place of `mask_value`.
+    pub projection: Option<ReplayStencil>,
+    /// Projection painting on content: each channel's image of `sources` is read where the texel lies on the stroke's
+    /// view, placed by this matrix (as [`ReplayStencil::matrix`]; nothing outside the image); `values` are laid as they
+    /// are (Inferred: the mask's measured placement, per channel).
+    pub placed: Option<[f32; 9]>,
+    pub strokes: Vec<ReplayStroke>,
+    /// Path strokes, laid after `strokes` (Inferred), each on its own as a stroke is: dabs walked along the curve, or
+    /// with `ribbon` a band.
+    pub paths: Vec<ReplayPath>,
+    pub ribbon: Option<ReplayRibbon>,
+    /// A particle brush: each stroke lays the dabs of its particles instead of its own.
+    pub particles: Option<ReplayParticles>,
+    /// What the step leaves out or approximates, for the report.
+    pub notes: Vec<String>,
+}
+
+/// Whose pixels a job paints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayTarget {
+    /// A paint layer's own pixels, or a content paint effect's (both keyed by their id).
+    Content(LayerId),
+    /// A mask's paint effect: grey value and coverage.
+    Mask(LayerId),
+}
+
+impl ReplayTarget {
+    pub fn id(self) -> LayerId {
+        match self {
+            ReplayTarget::Content(id) | ReplayTarget::Mask(id) => id,
+        }
+    }
+}
+
+/// Paint effects of the file laid in order into one target.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayJob {
+    pub target: ReplayTarget,
+    /// What the job stands for, for the report (the layer's path and the effect).
+    pub label: String,
+    pub steps: Vec<ReplayStep>,
+}
+
+impl ReplayJob {
+    /// Strokes in the job, path strokes included.
+    pub fn strokes(&self) -> usize {
+        self.steps.iter().map(|s| s.strokes.len() + s.paths.len()).sum()
+    }
+
+    /// Every note of its steps, without repeats.
+    pub fn notes(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for n in self.steps.iter().flat_map(|s| &s.notes) {
+            if !out.contains(n) {
+                out.push(n.clone());
+            }
+        }
+        out
+    }
+}
+
+/// What a replayer paints on: the imported mesh (in the file's normalised space, where the stroke cameras look at
+/// it), the texture set's material slot and resolution.
+pub struct ReplayScene<'a> {
+    pub mesh: &'a Mesh,
+    pub material: usize,
+    pub resolution: u32,
+}
+
+/// The pixels a job painted, in the stores' layouts: per channel value and coverage (a paint layer's tiles), or a
+/// mask effect's premultiplied grey and coverage.
+#[derive(Debug, Clone)]
+pub enum ReplayedPixels {
+    Content(Vec<(Channel, TileImage)>),
+    Mask(TileImage),
+}
+
+/// Paints replay jobs. Implemented where a brush engine is available (the engine); the import only calls it.
+pub trait StrokeReplayer: Sync {
+    /// Paints `jobs` on `scene`: one result per job, in order; an error says why a job could not be painted.
+    fn replay(&self, scene: &ReplayScene, jobs: &[ReplayJob]) -> Vec<Result<ReplayedPixels, String>>;
+
+    /// Strokes laid so far by every [`StrokeReplayer::replay`] call (path strokes included, a job's strokes counted
+    /// when it finishes), for a progress display; `None` when the replayer does not count.
+    fn strokes_done(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// The pressure timeline at `time`: linear between keys, held before the first and after the last; 1 without keys.
+pub fn pressure_at(keys: &[texturecraft_import_reader::model::TimelineKey], time: f32) -> f32 {
+    let after = keys.partition_point(|k| k.time <= time);
+    let v = match (after.checked_sub(1).and_then(|i| keys.get(i)), keys.get(after)) {
+        (None, None) => 1.0,
+        (Some(k), None) | (None, Some(k)) => k.value,
+        (Some(a), Some(b)) => {
+            let span = b.time - a.time;
+            if span > 0.0 { a.value + (b.value - a.value) * (time - a.time) / span } else { a.value }
+        }
+    };
+    if v.is_finite() { v.clamp(0.0, 1.0) } else { 1.0 }
+}
+
+#[cfg(test)]
+mod tests;

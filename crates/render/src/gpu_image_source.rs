@@ -10,6 +10,7 @@ use crate::gpu_tile_pattern::TileImageAtlas;
 
 pub(crate) const IMAGE_SOURCE_OPCODE: u32 = 14;
 pub(crate) const DECAL_PROJECTION: u32 = 9;
+pub(crate) const PLACED_UV_PROJECTION: u32 = 10;
 
 #[derive(Debug, Default)]
 pub(crate) struct MaterialImages {

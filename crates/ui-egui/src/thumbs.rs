@@ -492,7 +492,7 @@ mod tests {
         let mut thumbs = Thumbs::default();
         thumbs.budget = (context.cumulative_pass_nr(), PER_FRAME);
 
-        assert!(thumbs.saved_brush(&context, &path, &ImageStore::new()).is_none());
+        assert!(thumbs.saved_brush(&context, &path, &ImageStore::default()).is_none());
         assert!(thumbs.saved_brush_previews.is_empty(), "a deferred thumbnail has not read its file");
 
         std::fs::remove_file(&path).unwrap();
@@ -504,7 +504,7 @@ mod tests {
             std::env::temp_dir().join(format!("texturecraft-brush-preview-{}-{}.tcbrush", std::process::id(), NEXT_FILE.fetch_add(1, Ordering::Relaxed)));
         std::fs::write(&path, serde_json::to_vec(&BrushSettings::default()).unwrap()).unwrap();
         let mut thumbs = Thumbs::default();
-        let images = ImageStore::new();
+        let images = ImageStore::default();
 
         assert!(matches!(thumbs.saved_brush_preview(&path, &images), ShelfPreview::SavedBrush { settings: Some(_), .. }));
         std::fs::remove_file(&path).unwrap();
@@ -524,7 +524,7 @@ mod tests {
         let brush = BrushSettings { size: 0.07, ..BrushSettings::default() };
         let path = crate::shelf_preview::session_brush_path("Session brush");
 
-        assert!(thumbs.session_brush(&context, "Session brush", &brush, &ImageStore::new()).is_some());
+        assert!(thumbs.session_brush(&context, "Session brush", &brush, &ImageStore::default()).is_some());
         assert!(matches!(thumbs.saved_brush_previews.get(&path), Some((Some(settings), _, _)) if settings.size == brush.size));
 
         thumbs.forget_saved_files();
@@ -537,8 +537,8 @@ mod tests {
         let mut thumbs = Thumbs::default();
         thumbs.budget = (context.cumulative_pass_nr(), PER_FRAME);
 
-        assert!(thumbs.session_brush(&context, "First deferred", &BrushSettings::default(), &ImageStore::new()).is_none());
-        assert!(thumbs.session_brush(&context, "Second deferred", &BrushSettings::default(), &ImageStore::new()).is_none());
+        assert!(thumbs.session_brush(&context, "First deferred", &BrushSettings::default(), &ImageStore::default()).is_none());
+        assert!(thumbs.session_brush(&context, "Second deferred", &BrushSettings::default(), &ImageStore::default()).is_none());
         assert!(thumbs.saved_brush_previews.is_empty());
     }
 
@@ -571,7 +571,7 @@ mod tests {
         assert!(other_weak.upgrade().is_some(), "the project still owns its current image");
         eprintln!(
             "saved brush cache after first replacement: 0 of {IMAGE_BYTES} old image bytes retained, {} current image strong owners",
-            Arc::strong_count(&images["alpha.png"])
+            Arc::strong_count(images.get("alpha.png").unwrap())
         );
 
         let replacement = Arc::new(ImageRes { width: IMAGE_SIDE, height: IMAGE_SIDE, rgba: vec![[0.0; 4]; IMAGE_TEXELS], srgb: false });
@@ -602,13 +602,13 @@ mod tests {
     fn removing_resources_releases_their_previews() {
         let context = egui::Context::default();
         let mut thumbs = Thumbs::default();
-        let mut images = ImageStore::new();
+        let mut images = ImageStore::default();
         for index in 0..3 {
             let name = format!("image-{index}");
             images.insert(name, Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[index as f32; 4]; 4], srgb: false }));
         }
 
-        for (name, image) in &images {
+        for (name, image) in images.iter() {
             drop(thumbs.image(&context, name, image));
         }
         let cached_pixel_bytes = |thumbs: &Thumbs| thumbs.images.values().map(|(_, texture)| texture.size()[0] * texture.size()[1] * 4).sum::<usize>();
@@ -626,11 +626,11 @@ mod tests {
         assert!(thumbs.images.contains_key("image-2"));
 
         images.insert("image-3".into(), Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[0.7; 4]; 4], srgb: false }));
-        drop(thumbs.image(&context, "image-3", &images["image-3"]));
+        drop(thumbs.image(&context, "image-3", images.get("image-3").unwrap()));
         thumbs.sync_images(&images, 2);
         assert_eq!(thumbs.images.len(), 2);
 
-        images.clear();
+        images = ImageStore::default();
         thumbs.sync_images(&images, 3);
         eprintln!("cached previews after clearing resources: {}", thumbs.images.len());
         assert!(thumbs.images.is_empty());
