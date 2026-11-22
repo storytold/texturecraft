@@ -136,7 +136,7 @@ pub enum FilterOperation<'a> {
     ShortLine { major: usize, slope: f32, radius: f32 },
     ShearedLine { major: usize, slope: f32, radius: f32 },
     Sharpen { weights: [f32; 2] },
-    WrappedAffine { matrix: [f32; 4], offset: [f32; 2], bilinear: bool, mip_side: Option<usize> },
+    Affine { matrix: [f32; 4], offset: [f32; 2], bilinear: bool, mip_side: Option<usize>, edge_fade: [usize; 2] },
 }
 
 pub trait Accelerator: Send + Sync {

@@ -32,7 +32,7 @@ fn unpack_grey(word: u32, i: u32) -> u32 {
 
 fn decode_grey(value: u32, div: u32) -> f32 {
     if div == 255u {
-        return f32(value) / 255.0;
+        return decode(value * 257u);
     }
     return decode(value);
 }
@@ -54,6 +54,12 @@ fn map_at(p: vec2<i32>, wraps: vec2<bool>) -> f32 {
 
 fn lerp(lo: f32, hi: f32, weight: f32) -> f32 {
     return lo + (hi - lo) * weight;
+}
+
+fn affine_lerp(lo: f32, hi: f32, weight: f32) -> f32 {
+    // Keep the reference's separate product rounding at the 16-bit read boundaries.
+    let product = bitcast<u32>((hi - lo) * weight);
+    return lo + bitcast<f32>(select(product, 0u, product == 0x80000000u));
 }
 
 fn affine_uv(uv: vec2<f32>) -> vec2<f32> {
@@ -123,9 +129,33 @@ fn stepped_front(uv: vec2<f32>) -> f32 {
     let steps = fraction * 256.0;
     let rounded = floor(steps) + select(vec2<f32>(0.0), vec2<f32>(1.0), fract(steps) >= vec2<f32>(0.5));
     let weights = (rounded + select(vec2<f32>(-128.0), vec2<f32>(128.0), previous)) / 256.0;
-    let top = lerp(front_at(base), front_at(base + vec2<i32>(1, 0)), weights.x);
-    let bottom = lerp(front_at(base + vec2<i32>(0, 1)), front_at(base + vec2<i32>(1, 1)), weights.x);
-    return lerp(top, bottom, weights.y);
+    let a = front_at(base);
+    let b = front_at(base + vec2<i32>(1, 0));
+    let c = front_at(base + vec2<i32>(0, 1));
+    let d = front_at(base + vec2<i32>(1, 1));
+    if params.control.x == 6u {
+        return affine_lerp(affine_lerp(a, b, weights.x), affine_lerp(c, d, weights.x), weights.y);
+    }
+    return lerp(lerp(a, b, weights.x), lerp(c, d, weights.x), weights.y);
+}
+
+fn affine_front(uv: vec2<f32>) -> f32 {
+    let wraps = params.control.zw != vec2u(0u);
+    if params.control.y != 0u {
+        let value = stepped_front(uv);
+        if all(wraps) {
+            return value;
+        }
+        let fade = clamp(min(uv, 1.0 - uv) * params.values.zw + 0.5, vec2f(0.0), vec2f(1.0));
+        let coverage = select(fade, vec2f(1.0), wraps);
+        return value * (coverage.x * coverage.y);
+    }
+    let p = vec2i(floor(uv * vec2f(params.source.xy)));
+    let outside = (p < vec2i(0)) | (p >= vec2i(params.source.xy));
+    if any(outside & !wraps) {
+        return 0.0;
+    }
+    return front_at(p);
 }
 
 fn box_edge(p: vec2<i32>, axis: vec2<i32>, inner: i32, outer: i32) -> f32 {
@@ -298,13 +328,7 @@ fn value_at(p: vec2<i32>) -> f32 {
         case 2u: { return box_blur(p); }
         case 3u: { return short_line(p); }
         case 5u: { return sheared_line(p); }
-        case 6u: {
-            let input_uv = affine_uv(uv);
-            if params.control.y != 0u {
-                return stepped_front(input_uv);
-            }
-            return front_at(vec2<i32>(floor(input_uv * vec2<f32>(params.source.xy))));
-        }
+        case 6u: { return affine_front(affine_uv(uv)); }
         default: { return sharpen(p); }
     }
 }

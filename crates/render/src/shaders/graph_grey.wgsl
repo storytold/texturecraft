@@ -1,6 +1,6 @@
 struct Params {
     dimensions: vec4<u32>, // output width, band rows, input width, opcode (0 enlarges, 1 reduces)
-    blend: vec4<u32>,      // opacity bits, whole-image input instead of a stripe with wrap padding, has mask
+    blend: vec4<u32>,      // opacity bits, whole-image input, has mask, reduction input to 16-bit scale
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -46,10 +46,15 @@ fn halved(x: u32, y: u32) -> vec2<f32> {
     let top = vec2(front[i], front[i + 1u]);
     let bottom = vec2(front[i + stride], front[i + stride + 1u]);
     // Accumulate in CPU row order. A packed integer average changes ties because the CPU sums decoded f32 values.
-    var sum = vec2(even(top.x), even(top.y));
-    sum += vec2(odd(top.x), odd(top.y));
-    sum += vec2(even(bottom.x), even(bottom.y));
-    sum += vec2(odd(bottom.x), odd(bottom.y));
+    let scale = params.blend.w;
+    let tl = (top & vec2u(0xffffu)) * scale;
+    let tr = (top >> vec2u(16u)) * scale;
+    let bl = (bottom & vec2u(0xffffu)) * scale;
+    let br = (bottom >> vec2u(16u)) * scale;
+    var sum = vec2(decode(tl.x), decode(tl.y));
+    sum += vec2(decode(tr.x), decode(tr.y));
+    sum += vec2(decode(bl.x), decode(bl.y));
+    sum += vec2(decode(br.x), decode(br.y));
     return sum * 0.25;
 }
 

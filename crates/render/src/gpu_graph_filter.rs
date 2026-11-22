@@ -15,7 +15,7 @@ const BOX: u32 = 2;
 const SHORT_LINE: u32 = 3;
 const SHARPEN: u32 = 4;
 const SHEARED_LINE: u32 = 5;
-const WRAPPED_AFFINE: u32 = 6;
+const AFFINE: u32 = 6;
 const SHADER: &str = concat!(include_str!("shaders/graph_filter.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
 
 pub(crate) struct FilterRasterizer {
@@ -109,16 +109,17 @@ impl FilterRasterizer {
                 params.values = [weights[0], weights[1], 0.0, 0.0];
                 None
             }
-            FilterOperation::WrappedAffine { matrix, offset, bilinear, mip_side } => {
-                params.control[0] = WRAPPED_AFFINE;
+            FilterOperation::Affine { matrix, offset, bilinear, mip_side, edge_fade } => {
+                params.control[0] = AFFINE;
                 params.control[1] = u32::from(bilinear);
                 if let Some(side) = mip_side {
                     let Some(image) = pool.render_resident(ResidentGreyPass::Reduce { source, side }, cancel)? else { return Ok(None) };
                     params.source[0] = side as u32;
                     params.source[1] = side as u32;
+                    params.source[2] = image.div as u32;
                     reduced = Some(image);
                 }
-                params.values = [offset[0], offset[1], 0.0, 0.0];
+                params.values = [offset[0], offset[1], edge_fade[0] as f32, edge_fade[1] as f32];
                 params.direction = matrix;
                 None
             }

@@ -4723,14 +4723,14 @@ fn compute_resident_image(id: u32, n: &Node, ins: &BTreeMap<String, NodeValue>, 
 
 /// A packed image already at the required size and quantization can pass through an identity unchanged.
 fn forward_identity(n: &Node, source: Option<&NodeValue>, size: (usize, usize), format: u32) -> Option<NodeValue> {
-    use crate::measured::{COMPILED_16_BIT, COMPILED_HALF};
+    use crate::measured::{COMPILED_8_BIT, COMPILED_16_BIT, COMPILED_HALF};
     let source = source?;
     if source.dims() != size || rolls(n) {
         return None;
     }
     let same_storage = match source {
         NodeValue::DeviceFloat(_) => format == COMPILED_HALF,
-        value => value.packed_grey().is_some_and(|packed| packed.info().2 == 65535.0 && format == COMPILED_16_BIT),
+        value => value.packed_grey().is_some_and(|packed| matches!((packed.info().2, format), (65535.0, COMPILED_16_BIT) | (255.0, COMPILED_8_BIT))),
     };
     if matches!(n.kind.as_str(), "dot" | "output") && (format == 0 || same_storage) {
         return Some(source.clone());
@@ -4862,11 +4862,17 @@ fn compute_resident_grey(
             if let Some(pass) = grey_pass(n, ctx, steps, |slot| ins.get(slot).and_then(NodeValue::packed_grey)) {
                 accelerator.resident_grey(pass, &ctx.ec.cancel)
             } else if n.kind == "transform_matrix"
-                && let Some(steps) = steps.filter(|s| s.fmt == crate::measured::COMPILED_16_BIT)
+                && let Some(steps) = steps.filter(|s| matches!(s.fmt, crate::measured::COMPILED_8_BIT | crate::measured::COMPILED_16_BIT))
                 && !rolls(n)
                 && let Some(source) = ins.get("in").and_then(NodeValue::packed_grey)
-                && (matches!(source, GreyInput::Device(_)) || ctx.size * ctx.height >= 64 * 1024)
                 && let Some(filter) = crate::atomic::resident_filter(n, [ctx.size, ctx.height], steps.div, source, None)
+                && (matches!(source, GreyInput::Device(_)) || ctx.size * ctx.height >= 64 * 1024 || {
+                    let (w, h, ..) = source.info();
+                    // Reducing a large host image builds its pyramid even for a very small output.
+                    w * h >= 1024 * 1024
+                        && (w > ctx.size || h > ctx.height)
+                        && matches!(filter.operation, crate::accelerator::FilterOperation::Affine { mip_side: Some(_), .. })
+                })
             {
                 accelerator.resident_filter(filter, &ctx.ec.cancel)
             } else {

@@ -100,23 +100,23 @@ impl GreyRasterizer {
             ResidentGreyPass::Reduce { source, side } => (source, None, None, side, REDUCE, 0.0, None),
             ResidentGreyPass::Levels { source, curve, div, alpha } => return self.render_levels(source, &curve, div, alpha, cancel),
             ResidentGreyPass::Blend { foreground, background, mask, mode, opacity, alpha } => {
-                let (side, _) = grey_input_shape(&foreground);
+                let (side, _) = grey_input_shape(&foreground, false);
                 if !opacity.is_finite()
                     || !packed_blend_mode(mode)
                     || !texturecraft_graph::tex::grey_alpha_ok(alpha)
-                    || mask.as_ref().is_some_and(|mask| grey_input_shape(mask).0 != side)
+                    || mask.as_ref().is_some_and(|mask| grey_input_shape(mask, false).0 != side)
                 {
                     return Ok(None);
                 }
                 (foreground, Some(background), mask, side, BLEND_OFFSET + mode, opacity, Some(alpha))
             }
         };
-        let (source_side, alpha) = grey_input_shape(&foreground);
+        let (source_side, alpha) = grey_input_shape(&foreground, mode == REDUCE);
         if cancel.is_cancelled() || !(2..=8192).contains(&side) || !side.is_power_of_two() || source_side == 0 {
             return Ok(None);
         }
         if let Some(background) = &background {
-            if grey_input_shape(background).0 != side {
+            if grey_input_shape(background, false).0 != side {
                 return Ok(None);
             }
         } else if (mode == ENLARGE && source_side >= side) || (mode == REDUCE && source_side <= side) {
@@ -166,11 +166,13 @@ impl GreyRasterizer {
 
         crate::gpu_trace::scoped(&self.device, "resident graph grayscale pass", || {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("resident graph grayscale") });
-            let mut input = (source_side, &front);
+            // The first mip of a compiled 8-bit source averages exact 8-bit reads into 16-bit steps.
+            let source_scale = if mode == REDUCE && foreground.info().2 == 255.0 { 257 } else { 1 };
+            let mut input = (source_side, &front, source_scale);
             for (size, output) in &stages {
                 let back = &back.as_ref().unwrap_or(input.1).buffer; // Resizing does not read this binding.
                 self.encode_resident(&mut encoder, input, (back, mask.as_ref().map(|mask| &mask.buffer)), (*size, output), mode, opacity);
-                input = (*size, output);
+                input = (*size, output, 1);
             }
             self.queue.submit([encoder.finish()]);
         })?;
@@ -203,7 +205,7 @@ impl GreyRasterizer {
                 usage: wgpu::BufferUsages::STORAGE,
             });
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("resident graph levels") });
-            self.encode_resident(&mut encoder, (w, &front), (&table, None), (w, &output), LEVELS, 0.0);
+            self.encode_resident(&mut encoder, (w, &front, 1), (&table, None), (w, &output), LEVELS, 0.0);
             self.queue.submit([encoder.finish()]);
         })?;
         front.retain_until_completed(&self.queue);
@@ -214,13 +216,13 @@ impl GreyRasterizer {
     fn encode_resident(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        (source_side, front): (usize, &GreyDevicePixels),
+        (source_side, front, source_scale): (usize, &GreyDevicePixels, u32),
         (back, mask): (&wgpu::Buffer, Option<&wgpu::Buffer>),
         (side, output): (usize, &GreyDevicePixels),
         mode: u32,
         opacity: f32,
     ) {
-        let params = [side as u32, side as u32, source_side as u32, mode, opacity.to_bits(), 1, u32::from(mask.is_some()), 0];
+        let params = [side as u32, side as u32, source_side as u32, mode, opacity.to_bits(), 1, u32::from(mask.is_some()), source_scale];
         let uniform = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("resident graph grayscale parameters"),
             contents: bytemuck::cast_slice(&params),
@@ -291,9 +293,9 @@ fn packed_bytes(w: usize, h: usize) -> Option<u64> {
     (w as u64).checked_mul(h as u64)?.checked_mul(2)
 }
 
-fn grey_input_shape(input: &GreyInput<'_>) -> (usize, f32) {
+fn grey_input_shape(input: &GreyInput<'_>, accepts_8_bit: bool) -> (usize, f32) {
     let (w, h, div, alpha) = input.info();
-    (if (2..=8192).contains(&w) && w == h && w.is_power_of_two() && div == 65535.0 { w } else { 0 }, alpha)
+    (if (2..=8192).contains(&w) && w == h && w.is_power_of_two() && (div == 65535.0 || accepts_8_bit && div == 255.0) { w } else { 0 }, alpha)
 }
 
 #[derive(Debug)]

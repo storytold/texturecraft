@@ -218,7 +218,7 @@ pub(crate) fn resident_filter<'a>(
     if !packed(source) || !size.into_iter().all(usize::is_power_of_two) || size[0] < 2 {
         return None;
     }
-    let (w, h, source_div, _) = source.info();
+    let (w, h, _, alpha) = source.info();
     // The packed shader can run the wider curvature filters at 2K. Keep the work
     // of a direct-tap pass bounded on larger images.
     let max_radius = if w.saturating_mul(h) <= 2048 * 2048 { 48.0 } else { 12.0 };
@@ -240,11 +240,7 @@ pub(crate) fn resident_filter<'a>(
             let matrix = [value("m00", 1.0), value("m01", 0.0), value("m10", 0.0), value("m11", 1.0)];
             let bilinear = value("filter", 1.0) > 0.5;
             let mip = value("mip", MIP_AUTOMATIC as f32).round() as u32;
-            if source_div != STEPS_16 as f32
-                || tile != [true; 2]
-                || transform_matrix_bg(n) != [0.0; 4]
-                || matrix.into_iter().chain(offset).any(|v| !(-16.0..=16.0).contains(&v))
-            {
+            if transform_matrix_bg(n) != [0.0; 4] || matrix.into_iter().chain(offset).any(|v| !(-16.0..=16.0).contains(&v)) {
                 return None;
             }
             // Leave per-axis resampling and repeated doubling to their specialized paths.
@@ -255,10 +251,8 @@ pub(crate) fn resident_filter<'a>(
                 }
             }
             let [m00, m01, m10, m11] = matrix;
-            let level = transform_mip(
-                mip,
-                [m00 * w as f32 / size[0] as f32, m01 * h as f32 / size[0] as f32, m10 * w as f32 / size[1] as f32, m11 * h as f32 / size[1] as f32],
-            );
+            let scaled = [m00 * w as f32 / size[0] as f32, m01 * h as f32 / size[0] as f32, m10 * w as f32 / size[1] as f32, m11 * h as f32 / size[1] as f32];
+            let level = transform_mip(mip, scaled);
             let mip_side = if level == 0 {
                 None
             } else {
@@ -268,7 +262,13 @@ pub(crate) fn resident_filter<'a>(
                 }
                 Some(side)
             };
-            FilterOperation::WrappedAffine { matrix, offset, bilinear, mip_side }
+            let reduces = math::hypot(scaled[0], scaled[1]).max(math::hypot(scaled[2], scaled[3])) > 1.0;
+            let edge = [mip_side.unwrap_or(w), mip_side.unwrap_or(h)];
+            let edge_fade = if mip < MIP_AUTOMATIC_TOO && level > 0 && reduces { edge } else { [edge[0].max(size[0]), edge[1].max(size[1])] };
+            if alpha != 0.0 && tile != [true; 2] && !affine_covers_image(matrix, offset, size, tile, bilinear.then_some(edge_fade)) {
+                return None;
+            }
+            FilterOperation::Affine { matrix, offset, bilinear, mip_side, edge_fade }
         }
         "laplacian_sharpen" => {
             let weights = aspect.map(|axis| value("intensity", SHARPEN_DEFAULT_INTENSITY) * axis);
@@ -427,6 +427,21 @@ pub(crate) fn grad_warp<P: Pixel, M: crate::tex::Texels>(n: &Node, t: &Image<P>,
 pub(crate) fn transform_matrix_bg(n: &Node) -> [f32; 4] {
     let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
     [f("bg_r", 0.0), f("bg_g", 0.0), f("bg_b", 0.0), f("bg_a", 0.0)]
+}
+
+/// On each non-repeating axis the extreme output centers must have full coverage.
+fn affine_covers_image(matrix: [f32; 4], offset: [f32; 2], size: [usize; 2], tile: [bool; 2], fade: Option<[usize; 2]>) -> bool {
+    let [m00, m01, m10, m11] = matrix;
+    let [x, y] = size.map(|axis| 0.5 / axis as f32);
+    [x, 1.0 - x].into_iter().all(|x| {
+        [y, 1.0 - y].into_iter().all(|y| {
+            let [x, y] = [x - 0.5, y - 0.5];
+            let uv = [m00 * x + m10 * y + 0.5 + offset[0], m01 * x + m11 * y + 0.5 + offset[1]];
+            uv.into_iter().zip(tile).zip(fade.unwrap_or_default()).all(|((coord, repeats), pixels)| {
+                repeats || if fade.is_some() { coord.min(1.0 - coord) * pixels as f32 + 0.5 >= 1.0 } else { (0.0..1.0).contains(&coord) }
+            })
+        })
+    })
 }
 
 /// The alpha a `transform_matrix` gives a grey image of alpha `alpha` (1 or +0), when its result is grey with one alpha
