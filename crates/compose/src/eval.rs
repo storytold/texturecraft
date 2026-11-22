@@ -1740,18 +1740,13 @@ fn prepare_graphs(inp: &Inputs, channels: &[Channel], layers: &[LayerId]) {
     }
 }
 
-/// Cook graph sources for a texture set before planning its viewport composite.
+/// Prepare the independent graph sources for a texture set before planning its viewport composite.
 pub fn prepare_texture_set_graphs(inp: &Inputs) {
     let Ok(set) = inp.project.texture_set(inp.ts) else { return };
     let channels = set.channel_list();
     let mut order = Vec::new();
     draw_order(inp.project, &set.stack, 0, &mut order);
-    let reads_stack = order.iter().copied().any(|id| {
-        inp.project.content_layer(id).is_some_and(|layer| layer.graphs().into_iter().any(GraphRef::reads_stack))
-            || layer_mask(inp.project, id)
-                .filter(|mask| mask.enabled)
-                .is_some_and(|mask| mask.effects.iter().filter(|effect| effect.visible).flat_map(|effect| effect.kind.graphs()).any(GraphRef::reads_stack))
-    });
+    let reads_stack = order.iter().filter_map(|&id| inp.project.content_layer(id)).flat_map(Layer::graphs).any(GraphRef::reads_stack);
     if reads_stack {
         let tiles = all_tiles(inp.gbuf.width, inp.gbuf.height);
         neighbourhood_fields(inp, &channels, &tiles);

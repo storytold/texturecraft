@@ -13,7 +13,7 @@
 //! Differences are in 8-bit steps of the stored encoding (sRGB for colour entries stored sRGB), on the texels of the
 //! mesh only (the rest of the stored result is padding).
 
-use texturecraft_compose::eval::{Composite, Inputs, all_tiles, composite_tiles, prepare_texture_set_graphs};
+use texturecraft_compose::eval::{Composite, Inputs, all_tiles, composite_tiles};
 use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, PixelStore};
 use texturecraft_core::{Channel, Project};
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer};
@@ -98,20 +98,6 @@ pub struct SetScene<'a> {
 
 /// Composites `channels` of the set (its stack as it stands).
 pub fn composite(scene: &SetScene, channels: &[Channel]) -> Option<(Composite, UvGBuffer)> {
-    with_inputs(scene, |inputs| {
-        let (w, h) = (inputs.gbuf.width, inputs.gbuf.height);
-        let mut out = Composite::with_size(channels, w, h);
-        composite_tiles(inputs, &mut out, &all_tiles(w, h));
-        out
-    })
-}
-
-/// Prepare graph outputs and their layer inputs before the viewport composes the material.
-pub fn prepare_graphs(scene: &SetScene) {
-    with_inputs(scene, prepare_texture_set_graphs);
-}
-
-fn with_inputs<T>(scene: &SetScene, prepare: impl FnOnce(&Inputs) -> T) -> Option<(T, UvGBuffer)> {
     let set = scene.project.texture_set(scene.ts).ok()?;
     let (w, h) = set.size();
     let gbuf = UvGBuffer::new(scene.mesh, set.material, w, h);
@@ -128,7 +114,9 @@ fn with_inputs<T>(scene: &SetScene, prepare: impl FnOnce(&Inputs) -> T) -> Optio
         graphs: scene.graphs,
         bounds: scene.mesh.bounds(),
     };
-    Some((prepare(&inp), gbuf))
+    let mut out = Composite::with_size(channels, w, h);
+    composite_tiles(&inp, &mut out, &all_tiles(w, h));
+    Some((out, gbuf))
 }
 
 /// Our composite of `channel` against a stored result image of the same size, on the mesh's texels; `default` is what
