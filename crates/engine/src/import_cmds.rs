@@ -123,15 +123,22 @@ impl Session {
     /// Opens a finished import ([`ImportTask::run`]) as the session's project; the reply is the session with the
     /// import's summary. An import whose progress was cancelled is refused (its graph store renders nothing more).
     pub fn apply_import(&mut self, out: ImportOutput) -> Result<Value> {
+        let summary = self.install_import(out)?;
+        let mut reply = crate::inspect::session(self);
+        if let Some(o) = reply.as_object_mut() {
+            o.insert("import".into(), summary);
+        }
+        Ok(reply)
+    }
+
+    /// Open a converted project and return its import summary. Front ends drawing the view
+    /// can use this without building a complete session inspection.
+    pub fn install_import(&mut self, out: ImportOutput) -> Result<Value> {
         if out.cancel.is_cancelled() {
             return Err(bad(ID, CANCELLED));
         }
         self.switch_to(out.session);
-        let mut reply = crate::inspect::session(self);
-        if let Some(o) = reply.as_object_mut() {
-            o.insert("import".into(), out.summary);
-        }
-        Ok(reply)
+        Ok(out.summary)
     }
 }
 
