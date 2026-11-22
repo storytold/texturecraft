@@ -9,9 +9,7 @@ use texturecraft_ui_egui::state::{LibraryLocation, UiState};
 use texturecraft_ui_egui::unavailable::NOT_AVAILABLE;
 use texturecraft_ui_egui::{TextureCraftApp, menus};
 
-#[path = "../../src/ui_state_store/memory_storage.rs"]
-mod memory_storage;
-use memory_storage::MemoryStorage;
+use crate::memory_storage::MemoryStorage;
 
 /// The section captions of the General page, top to bottom.
 const SECTIONS: [&str; 13] = [

@@ -335,11 +335,15 @@ pub fn import_high_poly_bytes(file_name: &str, bytes: &[u8]) -> Result<HighPolyM
     mesh.tangents = vec![Vec4::new(1.0, 0.0, 0.0, 1.0); n];
     mesh.validate()?;
     let mut budget = BASE_COLOR_TEXELS;
+    let mut color_by_material: HashMap<&str, &RawBaseColor> = HashMap::with_capacity(colors.len());
+    for color in &colors {
+        color_by_material.entry(color.material.as_str()).or_insert(color);
+    }
     let base_color = mesh
         .materials
         .iter()
         .map(|m| {
-            let c = colors.iter().find(|c| c.material == *m)?;
+            let c = color_by_material.get(m.as_str()).copied()?;
             let (width, height, texels) = match c.image.as_deref().map(|b| decode_base_color(b, &mut budget)) {
                 Some(Ok(t)) => t,
                 Some(Err(e)) => {
@@ -431,14 +435,19 @@ fn geometry(raw: RawMesh) -> Result<(Mesh, Vec<String>, Option<Vec<Vec2>>)> {
     check_triangles(0, groups.iter().map(|(_, _, g)| g.len() / 3).sum())?;
 
     let mut mesh = Mesh { positions, ..Mesh::default() };
+    let mut material_ids: HashMap<String, usize> = HashMap::new();
     let mut groups: Vec<(usize, String, Vec<u32>)> = groups
         .into_iter()
         .filter(|(_, _, g)| g.len() >= 3)
         .map(|(material, part, tris)| {
-            let m = mesh.materials.iter().position(|x| *x == material).unwrap_or(mesh.materials.len());
-            if m == mesh.materials.len() {
-                mesh.materials.push(material);
-            }
+            let m = match material_ids.entry(material) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => {
+                    let m = mesh.materials.len();
+                    mesh.materials.push(e.key().clone());
+                    *e.insert(m)
+                }
+            };
             (m, part, tris)
         })
         .collect();

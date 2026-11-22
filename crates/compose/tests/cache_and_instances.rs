@@ -77,7 +77,10 @@ fn heavy_stack(f: &mut Fixture) -> LayerId {
     let l = Layer::new(inner, "inner", fill(&[(Channel::Metallic, procedural(ProceduralKind::Scratches, 0.0, 1.0))]), &Channel::DEFAULT_SET);
     f.project.insert_layer(0, l, Some(group), true).unwrap();
     let mut blurred = Mask::new(MaskBackground::Black);
-    blurred.effects.push(effect(f, EffectKind::Fill { source: procedural(ProceduralKind::Checker, 0.0, 1.0), projection: Projection::default() }));
+    blurred.effects.push(effect(
+        f,
+        EffectKind::Fill { source: procedural(ProceduralKind::Checker, 0.0, 1.0), projection: Projection::default(), sampling: Default::default() },
+    ));
     blurred.effects.push(effect(f, EffectKind::Filter(Filter::Blur { radius: 24.0 })));
     let top = add(f, 0, LayerKind::Paint, Some(blurred));
     let img = f.pixels.layer_mut(top, Channel::BaseColor, (RES, RES));
@@ -203,7 +206,7 @@ fn mask_with_height_follows_the_layer_height() {
     let height = Source::Procedural { pattern: ramp, low: [0.25; 3], high: [-0.25; 3], ramp: Vec::new() };
     let id = add(&mut f, 0, fill(&[(Channel::BaseColor, Source::Uniform([1.0; 3])), (Channel::Height, height)]), None);
     let mut mask = Mask::new(MaskBackground::Black);
-    mask.effects.push(effect(&mut f, EffectKind::Fill { source: Source::Uniform([0.5; 3]), projection: Projection::default() }));
+    mask.effects.push(effect(&mut f, EffectKind::Fill { source: Source::Uniform([0.5; 3]), projection: Projection::default(), sampling: Default::default() }));
     f.project.layer_mut(id).unwrap().mask = Some(mask);
     let plain = reference(&f, 0);
     f.project.layer_mut(id).unwrap().height_mask = HeightMask { enabled: true, contrast: 1.0, offset: 0.0 };
@@ -211,12 +214,14 @@ fn mask_with_height_follows_the_layer_height() {
     let row = TILE * 2;
     let (left, right) = (16, RES - 16);
     let v = |c: &Composite, x| c.value(Channel::BaseColor, x, row)[0];
+
     assert!((v(&plain, left) - 0.75).abs() < 0.01 && (v(&plain, right) - 0.75).abs() < 0.01, "plain mask: 50 % white over gray");
     assert!(v(&hm, left) > 0.84, "high parts show first: {}", v(&hm, left));
     assert!(v(&hm, right) < 0.66, "low parts later: {}", v(&hm, right));
 
     // Without a mask there is nothing to combine
     f.project.layer_mut(id).unwrap().mask.as_mut().unwrap().enabled = false;
+
     assert!((v(&reference(&f, 0), left) - 1.0).abs() < 1e-3);
 }
 
@@ -290,7 +295,10 @@ fn nested_stack(f: &mut Fixture) -> Nested {
     let inner =
         put(f, 0, Some(g1), fill(&[(Channel::Roughness, procedural(ProceduralKind::Grunge, 0.0, 1.0)), (Channel::Metallic, Source::Uniform([0.3; 3]))]), None);
     let mut checker = Mask::new(MaskBackground::Black);
-    checker.effects.push(effect(f, EffectKind::Fill { source: procedural(ProceduralKind::Checker, 0.2, 1.0), projection: Projection::default() }));
+    checker.effects.push(effect(
+        f,
+        EffectKind::Fill { source: procedural(ProceduralKind::Checker, 0.2, 1.0), projection: Projection::default(), sampling: Default::default() },
+    ));
     let g2 = group(f, Some(g1), BlendMode::Passthrough, 1.0, Some(checker));
     let mask = generator_mask(f, GeneratorKind::Direction, Some(16.0));
     put(f, 0, Some(g2), fill(&[(Channel::BaseColor, procedural(ProceduralKind::Scratches, 0.0, 1.0))]), Some(mask));
@@ -412,7 +420,7 @@ fn anchor_readers_fall_back_to_full_evaluation() {
     f.project.layer_mut(n.base).unwrap().content_effects.push(anchor);
 
     // A mask above the hot layer reads the stack below it
-    let reader = effect(&mut f, EffectKind::Fill { source, projection: Projection::default() });
+    let reader = effect(&mut f, EffectKind::Fill { source, projection: Projection::default(), sampling: Default::default() });
     f.project.layer_mut(n.g2_above).unwrap().mask.as_mut().unwrap().effects.push(reader);
     for hot in [n.deep, n.top] {
         assert!(check_cached(&f, 0, hot).is_empty(), "anchors read the stack: nothing cached");
@@ -538,11 +546,13 @@ fn anchors_inside_a_content_stack_record_the_content_up_to_them() {
     f.project.layer_mut(low).unwrap().content_effects.insert(0, blur);
     let blurred = reference(&f, 0);
     assert!((blurred.value(Channel::Roughness, 128, 128)[0] - 0.2).abs() < 2e-3, "a flat height stays flat");
+
     let mut one_by_one = Composite::new(&f.project.texture_sets[0].channel_list(), RES);
     let (images, baked) = (Default::default(), Default::default());
     for t in all_tiles(RES, RES) {
         composite_tiles(&inputs(&f, 0, &images, &baked), &mut one_by_one, &[t]);
     }
+
     assert!(one_by_one == blurred);
 }
 
@@ -556,7 +566,10 @@ fn gathering_filters_composite_identically_in_any_grouping_and_cached() {
         None,
     );
     let mut slope = Mask::new(MaskBackground::Black);
-    slope.effects.push(effect(&mut f, EffectKind::Fill { source: procedural(ProceduralKind::Checker, 0.0, 1.0), projection: Projection::default() }));
+    slope.effects.push(effect(
+        &mut f,
+        EffectKind::Fill { source: procedural(ProceduralKind::Checker, 0.0, 1.0), projection: Projection::default(), sampling: Default::default() },
+    ));
     slope.effects.push(effect(&mut f, EffectKind::Filter(Filter::SlopeBlur { radius: 24.0, scale: 3.0, seed: 1 })));
     let streaks = add(&mut f, 0, fill(&[(Channel::Metallic, procedural(ProceduralKind::Stripes, 0.0, 1.0))]), Some(slope));
     let top = add(&mut f, 0, LayerKind::Paint, None);
@@ -575,7 +588,9 @@ fn gathering_filters_composite_identically_in_any_grouping_and_cached() {
     for t in all_tiles(RES, RES) {
         composite_tiles(&inputs(&f, 0, &images, &baked), &mut one_by_one, &[t]);
     }
+
     assert!(one_by_one == want, "per-tile composites differ from one pass");
+
     for hot in [top, streaks] {
         assert!(!check_cached(&f, 0, hot).is_empty());
     }
@@ -648,6 +663,7 @@ fn kept_filter_fields_are_not_used_after_an_edit_or_under_a_live_stroke() {
     // Keep fields for the remaining tiles
     cache.ahead = rest.to_vec();
     let mut out = run(&fixture, 0, first, Some(&mut cache));
+
     assert!(cache.holds_fields());
 
     // Changing the hot mask must invalidate the retained fields
@@ -656,6 +672,7 @@ fn kept_filter_fields_are_not_used_after_an_edit_or_under_a_live_stroke() {
     let (images, baked) = (Default::default(), Default::default());
     cache.ahead = Vec::new();
     composite_tiles_cached(&inputs(&fixture, 0, &images, &baked), &mut out, &all, Some(&mut cache));
+
     assert!(out == reference(&fixture, 0), "fields kept from before an edit were used after it");
     assert!(!cache.holds_fields());
 
@@ -668,6 +685,7 @@ fn kept_filter_fields_are_not_used_after_an_edit_or_under_a_live_stroke() {
     let mut inp = inputs(&fixture, 0, &images, &baked);
     inp.preview = Some(&preview);
     composite_tiles_cached(&inp, &mut live, rest, Some(&mut cache));
+
     assert!(live == run_with(&fixture, 0, &all, None, Some(&preview)), "a live stroke over a sliced pass differs");
 }
 
@@ -685,7 +703,10 @@ fn tiles_the_cache_drops_during_a_kept_run_are_filtered_again() {
 
     // Pattern detail exposes any missing blur field
     let mut blurred = Mask::new(MaskBackground::Black);
-    blurred.effects.push(effect(&mut fixture, EffectKind::Fill { source: procedural(ProceduralKind::Checker, 0.0, 1.0), projection: Projection::default() }));
+    blurred.effects.push(effect(
+        &mut fixture,
+        EffectKind::Fill { source: procedural(ProceduralKind::Checker, 0.0, 1.0), projection: Projection::default(), sampling: Default::default() },
+    ));
     blurred.effects.push(effect(&mut fixture, EffectKind::Filter(Filter::Blur { radius: 40.0 })));
     add(&mut fixture, 0, fill(&[(Channel::Roughness, procedural(ProceduralKind::Grunge, 0.0, 1.0))]), Some(blurred));
 
@@ -707,7 +728,9 @@ fn tiles_the_cache_drops_during_a_kept_run_are_filtered_again() {
     cache.set_hot(Some(hot));
     let mut out = Composite::new(&channels, SIZE);
     composite_tiles_cached(&inputs(&fixture, 0, &images, &baked), &mut out, bottom, Some(&mut cache));
+
     assert_eq!(cache.len(), bottom.len());
+
     cache.budget = cache.bytes();
 
     // Cache eviction during the run must rebuild missing lower-layer fields
@@ -719,6 +742,7 @@ fn tiles_the_cache_drops_during_a_kept_run_are_filtered_again() {
             assert!(cache.holds_fields());
         }
     }
+
     assert!(above.len() > bottom.len());
     assert!(out == expected, "a tile dropped from the cache was composited with fields that lack the layers off the hot path");
 }
@@ -762,7 +786,7 @@ fn cached_stack_tracks_the_images_a_tile_generator_reads() {
     pattern.tile.get_or_insert_with(Box::default).background_image = Some("plate".into());
     fill.sources.insert(Channel::Roughness, Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() });
 
-    let image_with_value = |value| Arc::new(ImageRes { width: RES, height: RES, rgba: vec![[value; 4]; (RES * RES) as usize], srgb: false });
+    let image_with_value = |value| Arc::new(ImageRes::new(RES, RES, vec![[value; 4]; (RES * RES) as usize], false));
     let mut images = ImageStore::default();
     let baked = Default::default();
     let tiles = all_tiles(RES, RES);
@@ -778,13 +802,17 @@ fn cached_stack_tracks_the_images_a_tile_generator_reads() {
         fixture.pixels.layer_mut(hot_layer, Channel::BaseColor, (RES, RES)).set(5, 5, &[stage.len() as u16, 0, 0, u16::MAX]);
         let input = inputs(&fixture, 0, &images, &baked);
         composite_tiles_cached(&input, &mut output, &tiles[..1], Some(&mut cache));
+
         assert!(!cache.is_empty(), "{stage}: first tile should be cached");
+
         let retained = cache.len() - 1;
         composite_tiles_cached(&input, &mut output, &tiles[1..], Some(&mut cache));
+
         assert_eq!(retained, 0, "{stage}: the layers below are drawn again with the new image");
 
         let mut expected = Composite::new(&fixture.project.texture_sets[0].channel_list(), RES);
         composite_tiles(&input, &mut expected, &tiles);
+
         assert!(output == expected, "{stage}");
     }
 }
@@ -800,7 +828,7 @@ fn cached_stack_tracks_referenced_images_only() {
     let LayerKind::Fill(fill) = &mut fixture.project.layer_mut(bottom_layer).unwrap().kind else { panic!("expected fill") };
 
     fill.sources.insert(Channel::Roughness, Source::Image { name: "used".into(), normal_format: Default::default() });
-    let image_with_value = |value| Arc::new(ImageRes { width: RES, height: RES, rgba: vec![[value; 4]; (RES * RES) as usize], srgb: false });
+    let image_with_value = |value| Arc::new(ImageRes::new(RES, RES, vec![[value; 4]; (RES * RES) as usize], false));
     let mut images = ImageStore::default();
     let baked = Default::default();
     let tiles = all_tiles(RES, RES);
@@ -820,11 +848,14 @@ fn cached_stack_tracks_referenced_images_only() {
                 let replacement = image_with_value(0.4);
                 let replacement_weak = Arc::downgrade(&replacement);
                 images.insert("used".into(), replacement);
+
                 assert!(previous_image.as_ref().is_some_and(|old| old.upgrade().is_none()), "cached key must not retain replaced image pixels");
+
                 previous_image = Some(replacement_weak);
             }
             "remove" => {
                 images.remove("used");
+
                 assert!(previous_image.as_ref().is_some_and(|old| old.upgrade().is_none()), "cached key must not retain removed image pixels");
             }
             "cold" => {}
@@ -836,13 +867,17 @@ fn cached_stack_tracks_referenced_images_only() {
         fixture.pixels.layer_mut(hot_layer, Channel::BaseColor, (RES, RES)).set(5, 5, &[stage.len() as u16, 0, 0, u16::MAX]);
         let input = inputs(&fixture, 0, &images, &baked);
         composite_tiles_cached(&input, &mut output, &tiles[..1], Some(&mut cache));
+
         assert!(!cache.is_empty(), "{stage}: first tile should be cached");
+
         let retained = cache.len() - 1;
         composite_tiles_cached(&input, &mut output, &tiles[1..], Some(&mut cache));
+
         assert_eq!(retained, if stage.starts_with("unused") { tiles.len() - 1 } else { 0 }, "{stage}");
 
         let mut expected = Composite::new(&fixture.project.texture_sets[0].channel_list(), RES);
         composite_tiles(&input, &mut expected, &tiles);
+
         assert!(output == expected, "{stage}");
     }
 }
@@ -860,7 +895,7 @@ fn generator_input_image_changes_invalidate_stack_key() {
     *generator = Generator::new(GeneratorKind::Dirt);
     generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("used"));
 
-    let image = |value| Arc::new(ImageRes { width: RES, height: RES, rgba: vec![[value; 4]; (RES * RES) as usize], srgb: false });
+    let image = |value| Arc::new(ImageRes::new(RES, RES, vec![[value; 4]; (RES * RES) as usize], false));
     let mut images = ImageStore::default();
     images.insert("used".into(), image(0.1));
     let baked = Default::default();
@@ -869,13 +904,16 @@ fn generator_input_image_changes_invalidate_stack_key() {
     let original = key(&images);
 
     images.insert("unrelated".into(), image(0.5));
+
     assert_eq!(key(&images), original, "an unrelated image leaves the key unchanged");
 
     let old_image = Arc::downgrade(&images["used"]);
     images.insert("used".into(), image(0.9));
+
     assert!(old_image.upgrade().is_none(), "the cache must not retain the old image pixels");
     assert!(key(&images) != original, "replacing a generator input must invalidate the cache");
 
     images.remove("used");
+
     assert!(key(&images) != original, "removing a generator input must invalidate the cache");
 }

@@ -432,12 +432,11 @@ fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
 }
 
 /// A `[a, b]` param of two finite numbers.
-fn pair(p: &Value, key: &str) -> Option<[f32; 2]> {
-    let a = p.get(key)?.as_array()?;
-    let [x, y] = a.as_slice() else { return None };
-    let x = x.as_f64()? as f32;
-    let y = y.as_f64()? as f32;
-    (x.is_finite() && y.is_finite()).then_some([x, y])
+pub(crate) fn pair(params: &Value, key: &str) -> Option<[f32; 2]> {
+    let [x, y] = params.get(key)?.as_array()?.as_slice() else { return None };
+    let pair = [x.as_f64()? as f32, y.as_f64()? as f32];
+
+    pair.iter().all(|component| component.is_finite()).then_some(pair)
 }
 
 fn clone_source(s: &mut Session, p: &Value) -> Result<Value> {

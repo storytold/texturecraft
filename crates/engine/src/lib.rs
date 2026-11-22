@@ -20,6 +20,7 @@ pub mod effect_clipboard;
 pub mod file_cmds;
 pub mod fill_hit_test;
 pub mod fill_mode;
+pub mod fill_reset_cmds;
 pub mod filter_lib;
 mod frame_target;
 pub mod inspect;
@@ -82,6 +83,7 @@ mod uv_stroke_state;
 mod uv_symmetry;
 pub mod uv_tile_cmds;
 pub mod view_cmds;
+pub mod warp_cmds;
 
 pub use bake::{BakeMesh, BakeMeshes, BakeTask, StreamedBake, StreamedMap};
 pub use bake_preview::{BakePreview, PreviewShow};

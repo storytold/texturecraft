@@ -68,7 +68,7 @@ fn a_fill_layer_greys_the_paint_tools_and_shows_its_own_properties() {
     assert!(shelf_button_disabled(&harness, "Polygon fill (4)"));
     assert!(!shelf_button_selected(&harness, "Polygon fill (4)"), "the equipped tool doesn't show as selected while greyed");
     assert!(!shelf_button_disabled(&harness, "Geometry mask (8)"));
-    assert!(shows_text(&harness, "Properties - Fill"), "a fill layer shows its fill whatever the tool");
+    assert!(shows_text(&harness, "PROPERTIES - FILL"), "a fill layer shows its fill whatever the tool");
     assert!(!shows_text(&harness, "Size"), "a tool that can't act leaves the top bar");
 }
 

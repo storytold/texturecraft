@@ -101,23 +101,33 @@ fn deeply_nested_effect_visibility_is_reachable_in_a_narrow_panel() {
     use craft_ui::layout::SplitSize;
     use texturecraft_ui_egui::docking::Dock;
 
-    let (mut h, layer) = harness();
+    let (mut harness, layer) = harness();
     for _ in 0..6 {
-        execute(&mut h.state_mut().session, "layer.group", &Value::Null).unwrap();
+        execute(&mut harness.state_mut().session, "layer.group", &Value::Null).unwrap();
     }
-    let mut workspace = h.state().ui.dock.workspace().clone();
+
+    let mut workspace = harness.state().ui.dock.workspace().clone();
     let Some(Node::Split { second, .. }) = workspace.layout.root.as_mut() else { panic!("default columns") };
-    let Node::Split { size, .. } = second.as_mut() else { panic!("viewport and right column") };
+    let Node::Split { size, second: column, .. } = second.as_mut() else { panic!("viewport and right column") };
     *size = SplitSize::Ratio(0.99);
-    h.state_mut().ui.dock = Dock::from_value(serde_json::to_value(workspace).unwrap());
-    h.run_steps(4);
 
-    let row = h.get_by_label("Effect A").rect();
+    // Give Layers enough height to show the nested stack
+    let Node::Split { second: below_sets, .. } = column.as_mut() else { panic!("texture sets and the rest") };
+    let Node::Split { size: layers_share, .. } = below_sets.as_mut() else { panic!("layers and properties") };
+    *layers_share = SplitSize::Ratio(0.9);
+    harness.state_mut().ui.dock = Dock::from_value(serde_json::to_value(workspace).unwrap());
+
+    // Closing Properties lets the column shrink to the Layers minimum
+    harness.state_mut().ui.dock.close(texturecraft_ui_egui::docking::Panel::Properties);
+    harness.run_steps(4);
+
+    let row = harness.get_by_label("Effect A").rect();
     assert!(row.width() < 180.0, "the test must use a compact panel: {row:?}");
-    let indent = (row.width() - 7.0 - 22.0 - 21.6 - 8.0 - 20.0 - 6.0).max(0.0);
-    click(&mut h, egui::pos2(row.left() + 15.0 + indent, row.center().y));
 
-    let content = &h.state().session.doc.project.layers[&layer].content_effects;
+    let indent = (row.width() - 7.0 - 22.0 - 21.6 - 8.0 - 20.0 - 6.0).max(0.0);
+    click(&mut harness, egui::pos2(row.left() + 15.0 + indent, row.center().y));
+
+    let content = &harness.state().session.doc.project.layers[&layer].content_effects;
     assert!(!content.iter().find(|effect| effect.name == "Effect A").unwrap().visible, "the compact eye toggles the effect instead of missing the panel");
 }
 

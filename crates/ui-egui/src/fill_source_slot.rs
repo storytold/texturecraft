@@ -28,7 +28,7 @@ const UNIFORM_TILE_GRAY: f32 = 0.8;
 const UNIFORM_SWATCH_NAME: &str = "swatch:uniform";
 /// One swatch for every frame, so its preview stays cached
 static UNIFORM_SWATCH: LazyLock<Arc<ImageRes>> =
-    LazyLock::new(|| Arc::new(ImageRes { width: 1, height: 1, rgba: vec![[UNIFORM_TILE_GRAY, UNIFORM_TILE_GRAY, UNIFORM_TILE_GRAY, 1.0]], srgb: false }));
+    LazyLock::new(|| Arc::new(ImageRes::new(1, 1, vec![[UNIFORM_TILE_GRAY, UNIFORM_TILE_GRAY, UNIFORM_TILE_GRAY, 1.0]], false)));
 
 /// The slot of `fill`, which reads `source`; `anchors` are the anchor points below its layer and `caption` names what it fills
 pub(crate) fn show(app: &mut TextureCraftApp, ui: &mut Ui, fill: &FillSourceTarget, source: &Source, (anchors, caption): (&[(LayerId, String)], &str)) {
@@ -283,7 +283,7 @@ mod tests {
         for index in 0..IMAGE_COUNT {
             let name = format!("picker-image-{index:03}.png");
             session.doc.resources.insert(name.clone(), Arc::new(vec![0]));
-            session.images.insert(name, Arc::new(ImageRes { width: 64, height: 64, rgba: vec![[0.5; 4]; 64 * 64], srgb: false }));
+            session.images.insert(name, Arc::new(ImageRes::new(64, 64, vec![[0.5; 4]; 64 * 64], false)));
         }
         let mut harness = picker_harness(session, Vec::new());
 
@@ -320,7 +320,7 @@ mod tests {
         let mut session = texturecraft_engine::sample_session(128, 64).unwrap();
         for index in 0..128 {
             let name = format!("picker-{index:03}.png");
-            session.images.insert(name, Arc::new(ImageRes { width: 64, height: 64, rgba: vec![[0.5; 4]; 64 * 64], srgb: false }));
+            session.images.insert(name, Arc::new(ImageRes::new(64, 64, vec![[0.5; 4]; 64 * 64], false)));
         }
         let creation_context = eframe::CreationContext::_new_kittest(egui::Context::default());
         let mut app = TextureCraftApp::new(&creation_context, session);

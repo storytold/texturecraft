@@ -1,6 +1,6 @@
 //! The editing session: document, mesh, per-texture-set caches, history, tool state.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -439,7 +439,7 @@ impl Default for ToolState {
 }
 
 /// What is selected in the layer stack.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum StackTarget {
     #[default]
     Content,
@@ -607,6 +607,8 @@ pub struct Session {
     /// The last stroke's camera visibility buffer: reused while the camera, view size and mesh
     /// are unchanged, so back-to-back dabs start instantly.
     pub(crate) depth_cache: Option<DepthCache>,
+    /// Projection fill depth maps shared by this session's tile batches.
+    projector_depth_cache: texturecraft_compose::ProjectorDepthCache,
     /// The polygon fill box being dragged
     pub(crate) polygon_fill_drag: Option<crate::polygon_fill_drag::PolygonFillDrag>,
     /// The user's export presets (kept when another project opens).
@@ -627,6 +629,7 @@ impl Session {
 
         let source = Arc::new(mesh);
         let mesh = tiled_mesh(&source, &doc.project);
+
         let bvh = Bvh::new(&mesh);
         let mut camera = OrbitCamera { yaw: 0.6, pitch: 0.25, ..OrbitCamera::default() };
         let (bounds_min, bounds_max) = mesh.bounds();
@@ -678,6 +681,7 @@ impl Session {
             log: crate::log::SessionLog::new(),
             log_id: next_mesh_id(),
             depth_cache: None,
+            projector_depth_cache: Default::default(),
             polygon_fill_drag: None,
             export_presets: Default::default(),
             brush_presets: Default::default(),
@@ -950,9 +954,11 @@ impl Session {
         if changed.is_empty() && before.texture_sets.len() == self.doc.project.texture_sets.len() {
             return;
         }
+
         self.mesh = tiled_mesh(&self.source, &self.doc.project);
         self.mesh_id = next_mesh_id();
         self.depth_cache = None;
+        self.projector_depth_cache = Default::default();
         for ts in changed {
             if let (Some(c), Some(set)) = (self.caches.get_mut(ts), self.doc.project.texture_sets.get(ts)) {
                 *c = SetCache::new(&self.mesh, set);
@@ -1192,6 +1198,7 @@ impl Session {
         }
         let solo_view = if self.pending_tiles() > 0 { self.solo_view() } else { None };
         let order = std::iter::once(active).chain((0..self.caches.len()).filter(|ts| *ts != active));
+        let mut mesh_bounds = None;
         let mut changed = false;
         for ts in order.filter(|&ts| include(ts)) {
             let Some(cache) = self.caches.get_mut(ts) else { continue };
@@ -1244,12 +1251,19 @@ impl Session {
                     block_scales: cache.composite.block_scales.clone(),
                     preview,
                     images: &self.images,
-                    bounds: self.mesh.bounds(),
+                    bounds: *mesh_bounds.get_or_insert_with(|| self.mesh.bounds()),
                 };
 
                 // Look ahead so sliced updates filter a run of tiles once
                 cache.below.ahead = if budget_ms.is_finite() { tiles_ahead(&cache.dirty, &tiles) } else { Vec::new() };
-                texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
+                texturecraft_compose::composite_tiles_with_projectors(
+                    &inputs,
+                    &self.mesh,
+                    &mut self.projector_depth_cache,
+                    &mut cache.composite,
+                    &tiles,
+                    Some(&mut cache.below),
+                );
 
                 // The composited tiles and the neighbours their padding reached change
                 let padded = cache.dilation.apply_to_tiles(&mut cache.composite, &tiles);
@@ -1453,7 +1467,7 @@ const CHUNK: usize = 256;
 /// The most a budgeted update spends on settling tiles (what they show is already right).
 pub const SETTLE_BUDGET_MS: f64 = 6.0;
 
-/// Take up to `n` dirty tiles, block by block (16 × 16 tiles) so neighbourhood filters
+/// Take up to `max_tiles` dirty tiles, block by block (16 × 16 tiles) so neighbourhood filters
 /// evaluate compact regions.
 fn next_chunk(dirty: &mut BTreeSet<(u32, u32)>, max_tiles: usize) -> Vec<(u32, u32)> {
     // A zero-sized request cannot select a pivot
@@ -1465,17 +1479,26 @@ fn next_chunk(dirty: &mut BTreeSet<(u32, u32)>, max_tiles: usize) -> Vec<(u32, u
         return std::mem::take(dirty).into_iter().collect();
     }
 
-    let mut tiles: Vec<(u32, u32)> = dirty.iter().copied().collect();
-
-    // Partition by block order so only the requested chunk needs sorting
-    tiles.select_nth_unstable_by_key(max_tiles - 1, |&(x, y)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK, y, x));
-    tiles.truncate(max_tiles);
-    tiles.sort_by_key(|&(x, y)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK, y, x));
-    for tile in &tiles {
-        dirty.remove(tile);
+    // Keep only the earliest block-ordered tiles in this chunk
+    let block_order = |(x, y)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK, y, x);
+    let mut keys = dirty.iter().copied().map(block_order);
+    let mut selected: BinaryHeap<_> = keys.by_ref().take(max_tiles).collect();
+    for key in keys {
+        if let Some(mut latest) = selected.peek_mut()
+            && key < *latest
+        {
+            *latest = key;
+        }
     }
 
-    tiles
+    selected
+        .into_sorted_vec()
+        .into_iter()
+        .map(|(_, _, y, x)| {
+            dirty.remove(&(x, y));
+            (x, y)
+        })
+        .collect()
 }
 
 /// Dirty tiles a neighbourhood filter runs over ahead of the chunk being composited.

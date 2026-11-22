@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn every_tab_renders_a_big_preview() {
-        let image = ImageRes { width: 4, height: 2, rgba: vec![[0.8, 0.4, 0.2, 1.0]; 8], srgb: true };
+        let image = ImageRes::new(4, 2, vec![[0.8, 0.4, 0.2, 1.0]; 8], true);
         let previews = [
             ShelfPreview::Material(MATERIALS[0].id),
             ShelfPreview::Filter(FILTERS[0].id),
@@ -177,6 +177,7 @@ mod tests {
         for preview in previews {
             let key = preview.key();
             let image = preview.image(BIG_PX).unwrap_or_else(|| panic!("{key}"));
+
             assert_eq!(image.size, [BIG_PX, BIG_PX], "{key}");
             assert!(image.pixels.iter().any(|color| color.a() > 0 && color.r().max(color.g()).max(color.b()) > 0), "{key}: something shows");
         }
@@ -201,7 +202,7 @@ mod tests {
     #[test]
     fn saved_brush_preview_uses_its_project_image_alpha() {
         let settings = BrushSettings { alpha_image: Some("alpha.png".into()), ..BrushSettings::default() };
-        let transparent = Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[1.0, 1.0, 1.0, 0.0]; 4], srgb: false });
+        let transparent = Arc::new(ImageRes::new(2, 2, vec![[1.0, 1.0, 1.0, 0.0]; 4], false));
         let preview = ShelfPreview::SavedBrush { path: PathBuf::from("brush.tcbrush"), settings: Some(settings.clone()), image: Some(transparent) };
 
         assert!(preview.image(64).is_some_and(|image| image.pixels.iter().all(|pixel| pixel.r() == 0)));

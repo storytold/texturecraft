@@ -71,7 +71,7 @@ impl DecalDrop {
         });
     }
 
-    /// Show the waiting drop's menu over the 3D view `response`; a pick places the decal, a click elsewhere drops nothing
+    /// Show the waiting drop's menu over the 3D view `response`; a pick places the decal, a click or a drag elsewhere drops nothing
     pub fn show_menu(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response) {
         let id = Self::menu_id();
         let Some(drop) = Self::current(ui.ctx()) else { return };
@@ -110,7 +110,7 @@ impl DecalDrop {
                 });
             });
 
-        if picked.is_some() || shown.is_none_or(|menu| menu.response.should_close()) {
+        if picked.is_some() || shown.is_none_or(|menu| menu.response.should_close()) || crate::popup_drag::drag_outside_popups(ui.ctx()) {
             Self::close(ui.ctx());
         }
 

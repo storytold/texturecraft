@@ -11,6 +11,7 @@ use super::symmetry_intersection::SymmetryIntersection;
 use super::symmetry_manipulator::SymmetryManipulator;
 use super::symmetry_manipulator_arrow::SymmetryManipulatorArrow;
 use crate::TextureCraftApp;
+use crate::theme::{AXIS_COLORS, SHAFT_HALO, SHAFT_HALO_EXTRA_WIDTH, SHAFT_WIDTH};
 
 /// The plane reaches this far past the mesh, as a fraction of its size
 const PLANE_MARGIN: f32 = 0.05;
@@ -29,14 +30,6 @@ const VISIBILITY_TOLERANCE: f32 = 2e-3;
 /// Width of the cut line and radius of the radial axis points (points)
 const INTERSECTION_WIDTH: f32 = 1.5;
 const INTERSECTION_POINT_RADIUS: f32 = 3.0;
-
-/// Manipulator arrows along X, Y and Z (the view-corner axis colors, a little softer)
-const AXIS_COLORS: [Color32; 3] = [Color32::from_rgb(0xd8, 0x60, 0x4f), Color32::from_rgb(0x6c, 0xbc, 0x5a), Color32::from_rgb(0x5a, 0x8c, 0xe0)];
-
-/// Arrow shaft width, its dark halo and the halo's extra width (points at the default size)
-const SHAFT_WIDTH: f32 = 2.2;
-const SHAFT_HALO: Color32 = Color32::from_black_alpha(128);
-const SHAFT_HALO_EXTRA_WIDTH: f32 = 3.0;
 
 /// Faces around a cone
 const CONE_SEGMENTS: usize = 20;
@@ -74,7 +67,7 @@ pub(crate) fn scene_overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect) -> Vec<O
 
     let symmetry = app.session.tool.brush.symmetry;
     let display = app.ui.symmetry;
-    let (lo, hi) = app.session.mesh.bounds();
+    let (lo, hi) = app.viewport_mesh_bounds.get(&app.session.mesh);
     let origin = symmetry.origin((lo + hi) * 0.5);
     let ribbon = Ribbons::new(app, rect);
     let mut quads = Vec::new();
@@ -130,10 +123,10 @@ pub(crate) fn overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, cursor: Option
 
     let symmetry = app.session.tool.brush.symmetry;
     let display = app.ui.symmetry;
-    let (lo, hi) = app.session.mesh.bounds();
+    let (lo, hi) = app.viewport_mesh_bounds.get(&app.session.mesh);
     let origin = symmetry.origin((lo + hi) * 0.5);
 
-    // Bounds scan the mesh's vertices; every cursor copy shares these measurements
+    // Every cursor copy uses the same scale and visibility tolerance
     let diagonal = (hi - lo).length();
     let tolerance = diagonal * VISIBILITY_TOLERANCE;
     let brush_radius = app.session.tool.brush.size * diagonal;
@@ -142,7 +135,7 @@ pub(crate) fn overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, cursor: Option
     let line = Stroke::new(INTERSECTION_WIDTH, color(display.color, u8::MAX));
     let project = |point: Vec3| crate::viewport::project(app, rect, point);
 
-    // The planes' lines are drawn in the scene (see scene_overlay); where the radial axis enters the mesh, from either end, is drawn here
+    // The scene draws plane lines; show where either end of the radial axis enters the mesh
     if display.show_intersection && symmetry.radial_mode() {
         let axis = symmetry.radial_axis();
         let reach = diagonal;
@@ -299,7 +292,7 @@ pub(crate) fn manipulator_input(app: &mut TextureCraftApp, ui: &Ui, response: &R
     };
 
     if let Some(pointer) = response.interact_pointer_pos() {
-        let (lo, hi) = app.session.mesh.bounds();
+        let (lo, hi) = app.viewport_mesh_bounds.get(&app.session.mesh);
         let half_extent = (hi - lo) * 0.5;
         let moved = Vec3::from(drag.start_offset) + manipulator.world_delta(drag.axes, pointer - drag.from);
         let offset = moved.clamp(-half_extent, half_extent).to_array();

@@ -314,6 +314,14 @@ pub struct DisplaySettings {
     pub ior: f32,
     /// Depth of field of the viewport and the path tracer (thin lens).
     pub dof: DepthOfField,
+    /// The selected fill's projection gizmos show in the 3D view (the Projection row's eye)
+    #[serde(skip_serializing_if = "is_shown")]
+    pub projection_gizmos: bool,
+}
+
+/// Whether a view flag is at its default, shown (saved projects then stay as they were)
+fn is_shown(shown: &bool) -> bool {
+    *shown
 }
 
 /// A thin-lens camera's depth of field (Display settings: focus distance and aperture).
@@ -403,6 +411,7 @@ impl Default for DisplaySettings {
             scatter_radius: 0.1,
             ior: 1.5,
             dof: DepthOfField::default(),
+            projection_gizmos: true,
         }
     }
 }
@@ -816,12 +825,13 @@ mod tests {
         let mut top = paint(&mut p, "y");
         let source = Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() };
         top.mask = Some(Mask {
-            effects: vec![Effect::new(p.alloc_id(), EffectKind::Fill { source, projection: Projection::default() })],
+            effects: vec![Effect::new(p.alloc_id(), EffectKind::Fill { source, projection: Projection::default(), sampling: Default::default() })],
             ..Mask::new(MaskBackground::Black)
         });
         p.insert_layer(0, top, Some(id), false).unwrap();
         let json = serde_json::to_string(&p).unwrap();
         let back: Project = serde_json::from_str(&json).unwrap();
+
         assert_eq!(back, p);
         assert_eq!(back.effect(anchor).map(|(owner, _)| owner), Some(id));
 
@@ -831,6 +841,7 @@ mod tests {
             l.as_object_mut().unwrap().remove("content_effects");
         }
         let old: Project = serde_json::from_value(v).unwrap();
+
         assert!(old.layers.values().all(|l| l.content_effects.is_empty()));
     }
 

@@ -4,37 +4,47 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BakedMap, BlendMode, Channel, ChannelKind, lum};
+use crate::{Backface, BakedMap, BlendMode, Channel, ChannelKind, DepthCulling, Projector, ShapeCrop, lum};
 
 mod curvature_detail;
 mod curvature_mode;
 mod decal_flip;
 mod decal_symmetry;
+mod filtering;
 mod generator_global;
 mod micro_detail;
 mod output_resolution;
 mod resolution_mode;
+mod sampling;
+mod scale_mode;
 mod tile_blending;
 mod tile_generator;
 mod tile_input_distribution;
 mod tile_shape;
 mod tile_size_mode;
 mod tile_symmetry;
+mod uv_transform;
+mod uv_wrap;
 
 pub use curvature_detail::CurvatureDetail;
 pub use curvature_mode::CurvatureMode;
 pub use decal_flip::DecalFlip;
 pub use decal_symmetry::DecalSymmetry;
+pub use filtering::Filtering;
 pub use generator_global::GeneratorGlobal;
 pub use micro_detail::MicroDetail;
 pub use output_resolution::OutputResolution;
 pub use resolution_mode::ResolutionMode;
+pub use sampling::Sampling;
+pub use scale_mode::ScaleMode;
 pub use tile_blending::TileBlending;
 pub use tile_generator::TileGenerator;
 pub use tile_input_distribution::TileInputDistribution;
 pub use tile_shape::TileShape;
 pub use tile_size_mode::TileSizeMode;
 pub use tile_symmetry::TileSymmetry;
+pub use uv_transform::UvTransform;
+pub use uv_wrap::UvWrap;
 
 /// Id of a layer or effect (one id space per project).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -98,16 +108,22 @@ impl Default for HeightMask {
 }
 
 impl HeightMask {
-    /// The mask `m` combined with height `h` (see [`HeightMask`]).
-    pub fn apply(&self, m: f32, h: f32) -> f32 {
-        if !self.enabled || !h.is_finite() {
-            return m;
+    /// Combines a mask value with height (see [`HeightMask`]).
+    pub fn apply(&self, mask: f32, height: f32) -> f32 {
+        if !self.enabled || !height.is_finite() {
+            return mask;
         }
-        (m + self.contrast * 4.0 * m * (1.0 - m) * (h + self.offset)).clamp(0.0, 1.0)
+
+        // The height response peaks at the mask midpoint and vanishes at both ends
+        (mask + self.contrast * 4.0 * mask * (1.0 - mask) * (height + self.offset)).clamp(0.0, 1.0)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a fill holds its projection inline; boxing it would cost every fill read an indirection to save a few hundred bytes per paint layer or folder"
+)]
 pub enum LayerKind {
     /// Painted pixels, stored per channel by the engine under the layer id.
     Paint,
@@ -178,20 +194,69 @@ impl Layer {
 pub enum Projection {
     /// Texture coordinates of the mesh.
     Uv { scale: [f32; 2], rotation: f32, offset: [f32; 2] },
+    /// The source stretched once over each UV tile (0..1 in every tile)
+    UvTile,
     /// World-space box projection blended by the normal.
-    Triplanar { scale: f32, sharpness: f32, offset: [f32; 3] },
-    /// World-space planar projection along an axis (0 = X, 1 = Y, 2 = Z).
-    Planar { scale: f32, axis: u8, offset: [f32; 3] },
-    /// Spherical projection around the mesh center.
-    Spherical { scale: f32 },
-    /// Cylindrical projection around an axis.
-    Cylindrical { scale: f32, axis: u8 },
-    /// A geometry decal: the image projected from a frame placed on the surface (outside the
-    /// frame, behind it or beyond its depth the fill does not cover).
-    Decal(Decal),
+    Triplanar {
+        scale: f32,
+        sharpness: f32,
+        offset: [f32; 3],
+        #[serde(default, skip_serializing_if = "UvTransform::is_default")]
+        uv: UvTransform,
+        #[serde(default, skip_serializing_if = "Projector::is_default")]
+        projector: Projector,
+    },
+    /// World-space planar projection along an axis (0 = X, 1 = Y, 2 = Z), or from a frame placed on the surface
+    Planar {
+        scale: f32,
+        axis: u8,
+        offset: [f32; 3],
+        #[serde(default, skip_serializing_if = "UvTransform::is_default")]
+        uv: UvTransform,
+        #[serde(default, skip_serializing_if = "Projector::is_default")]
+        projector: Projector,
+        /// The frame it projects from when placed on the surface (scale, axis and offset then unused)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placed: Option<Decal>,
+    },
+    /// Spherical projection around the mesh center
+    Spherical {
+        scale: f32,
+        #[serde(default, skip_serializing_if = "UvTransform::is_default")]
+        uv: UvTransform,
+        #[serde(default, skip_serializing_if = "is_zero_offset")]
+        offset: [f32; 3],
+        #[serde(default, skip_serializing_if = "Projector::is_default")]
+        projector: Projector,
+    },
+    /// Cylindrical projection around an axis
+    Cylindrical {
+        scale: f32,
+        axis: u8,
+        #[serde(default, skip_serializing_if = "UvTransform::is_default")]
+        uv: UvTransform,
+        #[serde(default, skip_serializing_if = "is_zero_offset")]
+        offset: [f32; 3],
+        #[serde(default, skip_serializing_if = "Projector::is_default")]
+        projector: Projector,
+        /// The arc one repeat of the source spans around the axis (degrees), centred on the front
+        #[serde(default = "full_turn", skip_serializing_if = "is_full_turn")]
+        angle: f32,
+    },
+    /// A planar projection from a frame whose four corners are pulled freely, bending the image to the quad they make
+    Warp {
+        /// The frame it projects from (its depth is unused: `depth` sets the reach)
+        frame: Decal,
+        /// Where the frame's corners sit (top left, top right, bottom right, bottom left), across and up in frame sizes from its centre
+        corners: [[f32; 2]; 4],
+        /// Projection Depth: how far in front of and behind the frame it reaches when cropped to its shape, in lengths of the frame's longer side
+        depth: f32,
+        uv: UvTransform,
+        projector: Projector,
+    },
 }
 
-/// The frame a decal projects from (world space).
+/// The frame a planar projection placed on the surface (a decal) projects from, in world space
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Decal {
     /// The surface point the decal was placed on.
@@ -222,6 +287,21 @@ fn not_flipped(flip: &[bool; 2]) -> bool {
     !flip[0] && !flip[1]
 }
 
+/// Serde default of a cylindrical projection's angle: the whole way round
+fn full_turn() -> f32 {
+    crate::FULL_TURN_DEGREES
+}
+
+/// Whether a cylindrical projection spans the whole way round, as ones saved before the angle did (not saved then)
+fn is_full_turn(angle: &f32) -> bool {
+    *angle == full_turn()
+}
+
+/// Whether a spherical or cylindrical projection sits unshifted, as ones saved before the offset did (not saved then)
+fn is_zero_offset(offset: &[f32; 3]) -> bool {
+    *offset == [0.0; 3]
+}
+
 impl Default for Projection {
     fn default() -> Self {
         Projection::Uv { scale: [1.0, 1.0], rotation: 0.0, offset: [0.0, 0.0] }
@@ -229,14 +309,88 @@ impl Default for Projection {
 }
 
 impl Projection {
+    /// A warp's corners before any is pulled: the frame's own
+    pub const FRAME_CORNERS: [[f32; 2]; 4] = [[-0.5, 0.5], [0.5, 0.5], [0.5, -0.5], [-0.5, -0.5]];
+
+    /// A new warp's Projection Depth
+    pub const WARP_DEPTH: f32 = 0.1;
+
+    /// A new tri-planar projection's blend sharpness
+    pub const TRIPLANAR_SHARPNESS: f32 = 8.0;
+
+    /// The blend sharpness a tri-planar projection takes: an exponent from soft (1) to near hard (64)
+    pub const TRIPLANAR_SHARPNESS_RANGE: std::ops::RangeInclusive<f32> = 1.0..=64.0;
+
+    /// The arc in degrees a cylindrical projection wraps its image round; a zero arc would divide by zero
+    pub const CYLINDER_ANGLE_RANGE: std::ops::RangeInclusive<f32> = 1.0..=crate::FULL_TURN_DEGREES;
+
+    /// A tri-planar projection with a new fill's settings
+    pub fn triplanar() -> Projection {
+        Projection::Triplanar {
+            scale: 1.0,
+            sharpness: Self::TRIPLANAR_SHARPNESS,
+            offset: [0.0; 3],
+            uv: UvTransform::default(),
+            projector: Projector::default(),
+        }
+    }
+
+    /// A warp projection from `frame` with its corners where the frame's are
+    pub fn warp(frame: Decal) -> Projection {
+        Projection::Warp {
+            frame,
+            corners: Projection::FRAME_CORNERS,
+            depth: Projection::WARP_DEPTH,
+            uv: UvTransform::default(),
+            projector: Projector::depth_culled(),
+        }
+    }
+
+    /// A planar projection from `frame` with a decal's look: cropped to its frame, depth and image alpha, off faces turned away
+    pub fn decal(frame: Decal) -> Projection {
+        let projector = Projector { crop: ShapeCrop::Cropped, backface: Backface { on: true, ..Backface::default() }, ..Projector::default() };
+        Projection::Planar { scale: 1.0, axis: 2, offset: [0.0; 3], uv: UvTransform::default(), projector, placed: Some(frame) }
+    }
+
+    /// The depth culling of a planar or warp projection that has it on
+    pub fn depth_culling(&self) -> Option<DepthCulling> {
+        match self {
+            Projection::Planar { projector, .. } | Projection::Warp { projector, .. } => Some(projector.depth).filter(|depth| depth.on),
+            _ => None,
+        }
+    }
+
+    /// Whether the projection works in 3D, so a fill's symmetry can copy it (UV projections cannot)
+    pub fn takes_symmetry(&self) -> bool {
+        !matches!(self, Projection::Uv { .. } | Projection::UvTile)
+    }
+
+    /// The frame on the surface a placed planar projection projects from
+    pub fn placed(&self) -> Option<&Decal> {
+        match self {
+            Projection::Planar { placed, .. } => placed.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The frame on the surface a placed planar or a warp projection projects from
+    pub fn frame(&self) -> Option<&Decal> {
+        match self {
+            Projection::Planar { placed, .. } => placed.as_ref(),
+            Projection::Warp { frame, .. } => Some(frame),
+            _ => None,
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
+            Projection::UvTile => "Fill (Match per UV Tile)",
             Projection::Uv { .. } => "UV projection",
             Projection::Triplanar { .. } => "Tri-planar projection",
             Projection::Planar { .. } => "Planar projection",
             Projection::Spherical { .. } => "Spherical projection",
             Projection::Cylindrical { .. } => "Cylindrical projection",
-            Projection::Decal(_) => "Decal projection",
+            Projection::Warp { .. } => "Warp projection",
         }
     }
 }
@@ -550,7 +704,10 @@ impl Source {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct Fill {
     pub sources: BTreeMap<Channel, Source>,
+    #[serde(serialize_with = "crate::saved_projection::save", deserialize_with = "crate::saved_projection::load")]
     pub projection: Projection,
+    #[serde(default = "Sampling::saved_before", skip_serializing_if = "Sampling::is_saved_before")]
+    pub sampling: Sampling,
     /// Set when the sources are maps cooked from a MaterialCraft material.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<Box<MaterialLink>>,
@@ -1179,7 +1336,10 @@ pub enum EffectKind {
     /// A uniform or procedural grayscale fill.
     Fill {
         source: Source,
+        #[serde(serialize_with = "crate::saved_projection::save", deserialize_with = "crate::saved_projection::load")]
         projection: Projection,
+        #[serde(default = "Sampling::saved_before", skip_serializing_if = "Sampling::is_saved_before")]
+        sampling: Sampling,
     },
     Generator(Generator),
     Levels(Levels),
@@ -1198,10 +1358,7 @@ pub enum EffectKind {
     /// Content only: a material fill (one source per channel; channels without a source are
     /// left as they are).
     Material(Fill),
-    /// Records the stack at its place so masks, fills and generators above can read it
-    /// ([`Source::Anchor`]). In a content stack it records the composited stack right after its
-    /// layer (that layer and everything below); in a mask, the mask value at that point (every
-    /// channel reads that gray).
+    /// Records the stack at its place so masks, fills and generators above can read it ([`Source::Anchor`]): in a content stack the composited stack right after its layer (that layer and everything below), in a mask the mask value there (every channel reads that gray)
     Anchor,
 }
 
@@ -1547,21 +1704,27 @@ mod tests {
         assert_eq!(EffectKind::Anchor.content_only(), None, "anchors go on content and masks");
         assert_eq!(EffectKind::Generator(Generator::new(GeneratorKind::Dirt)).content_only(), Some(false));
         assert_eq!(EffectKind::Filter(Filter::Invert).content_only(), None);
+
         let mut fill_layer = Layer::new(LayerId(1), "l", LayerKind::Paint, &[Channel::BaseColor]);
         assert!(!fill_layer.reads_anchor());
+
         let source = Source::Anchor { anchor: LayerId(9), channel: Channel::Height, ramp: Vec::new() };
         fill_layer.mask = Some(Mask {
-            effects: vec![Effect::new(LayerId(2), EffectKind::Fill { source, projection: Projection::default() })],
+            effects: vec![Effect::new(LayerId(2), EffectKind::Fill { source, projection: Projection::default(), sampling: Default::default() })],
             ..Mask::new(MaskBackground::Black)
         });
+
         assert!(fill_layer.reads_anchor());
 
         // A generator with micro detail reads its anchor too
         let mut generator_layer = Layer::new(LayerId(3), "g", LayerKind::Paint, &[Channel::BaseColor]);
         let mut generator = Generator::new(GeneratorKind::Dirt);
         generator.micro = Some(MicroDetail { anchor: LayerId(9), amount: 0.5 });
+
         assert_eq!(EffectKind::Generator(generator.clone()).anchors_read(), [(LayerId(9), Channel::Height)]);
+
         generator_layer.mask = Some(Mask { effects: vec![Effect::new(LayerId(4), EffectKind::Generator(generator))], ..Mask::new(MaskBackground::Black) });
+
         assert!(generator_layer.reads_anchor());
     }
 
@@ -1602,6 +1765,33 @@ mod tests {
     fn generator_kinds_parse() {
         for kind in GeneratorKind::ALL {
             assert_eq!(GeneratorKind::parse(&format!("{kind:?}")), Some(kind));
+        }
+    }
+
+    #[test]
+    fn fills_and_effects_in_the_shape_older_projects_saved_save_unchanged() {
+        let fills = [
+            r#"{"sources":{"BaseColor":{"Uniform":[0.5,0.5,0.5]}},"projection":{"Uv":{"scale":[1.0,1.0],"rotation":0.0,"offset":[0.0,0.0]}}}"#,
+            r#"{"sources":{},"projection":{"Triplanar":{"scale":1.0,"sharpness":0.5,"offset":[0.0,0.0,0.0]}}}"#,
+            r#"{"sources":{},"projection":{"Planar":{"scale":2.0,"axis":2,"offset":[0.0,1.0,0.0]}}}"#,
+            r#"{"sources":{},"projection":{"Spherical":{"scale":1.0}}}"#,
+            r#"{"sources":{},"projection":{"Cylindrical":{"scale":1.0,"axis":1}}}"#,
+            r#"{"sources":{},"projection":{"Decal":{"center":[0.0,0.0,0.0],"normal":[0.0,0.0,1.0],"up":[0.0,1.0,0.0],"size":[1.0,1.0],"rotation":0.0,"offset":[0.0,0.0],"depth":1.0}}}"#,
+        ];
+        for saved in fills {
+            let loaded: Fill = serde_json::from_str(saved).unwrap();
+
+            assert_eq!(serde_json::to_string(&loaded).unwrap(), saved, "a fill saves as it was saved");
+        }
+
+        let effects = [
+            r#"{"Fill":{"source":{"Uniform":[0.5,0.5,0.5]},"projection":{"Triplanar":{"scale":1.0,"sharpness":0.5,"offset":[0.0,0.0,0.0]}}}}"#,
+            r#"{"Material":{"sources":{},"projection":{"Spherical":{"scale":2.0}}}}"#,
+        ];
+        for saved in effects {
+            let loaded: EffectKind = serde_json::from_str(saved).unwrap();
+
+            assert_eq!(serde_json::to_string(&loaded).unwrap(), saved, "an effect saves as it was saved");
         }
     }
 

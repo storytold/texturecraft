@@ -33,7 +33,7 @@ fn multi_effect_mask(s: &mut Session) -> (LayerId, String) {
     let mask = s.doc.project.layer_mut(id).unwrap().mask.as_mut().unwrap();
     for effect in &mut mask.effects {
         if effect.id.0 == fill {
-            effect.kind = EffectKind::Fill { source: Source::image(&name), projection: Default::default() };
+            effect.kind = EffectKind::Fill { source: Source::image(&name), projection: Default::default(), sampling: Default::default() };
         }
     }
     let size = s.doc.project.texture_set(0).unwrap().resolution;
@@ -169,6 +169,7 @@ fn effects_reading_an_anchor_of_the_mask_follow_it() {
             effect.kind = EffectKind::Fill {
                 source: Source::Anchor { anchor: LayerId(anchor), channel: texturecraft_engine::core::Channel::Height, ramp: Vec::new() },
                 projection: Default::default(),
+                sampling: Default::default(),
             };
         }
     }
@@ -182,6 +183,7 @@ fn effects_reading_an_anchor_of_the_mask_follow_it() {
         EffectKind::Fill { source: Source::Anchor { anchor, .. }, .. } => Some(*anchor),
         _ => None,
     });
+
     assert_eq!(reads, Some(new_anchor), "the fill reads the copied anchor, not the old one");
 }
 
@@ -197,10 +199,11 @@ fn an_external_anchor_cannot_be_saved_or_rebound_in_another_project() {
     for (project, id) in [(&mut file.project, holder), (&mut s.doc.project, source)] {
         let mask = project.layer_mut(id).unwrap().mask.as_mut().unwrap();
         let fill = mask.effects.iter_mut().find(|effect| matches!(effect.kind, EffectKind::Fill { .. })).unwrap();
-        fill.kind = EffectKind::Fill { source: source_ref.clone(), projection: Default::default() };
+        fill.kind = EffectKind::Fill { source: source_ref.clone(), projection: Default::default(), sampling: Default::default() };
     }
 
     assert!(s.smart_mask_bytes(source, "Preset").unwrap_err().to_string().contains("outside this mask"));
+
     let bytes = texturecraft_engine::formats::save_project_bytes(&file).unwrap();
     let before = s.doc.project.clone();
     let history = s.history_labels();

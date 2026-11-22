@@ -2,12 +2,14 @@
 
 use std::io::Read as _;
 
-use craft_usd::scene::{MAX_DECODED_BYTES, Prop, Val, read_layer};
+use craft_usd::scene::{
+    Budget, MAX_DECODED_BYTES, Prop, SceneError, UsdAttr, UsdLayer, UsdPrim, UsdValue, Val, read_layer, read_layer_with_budget, write_usda, write_usdc,
+};
 use texturecraft_geom::Mesh;
-use texturecraft_geom::glam::{Vec2, Vec3};
+use texturecraft_geom::glam::{Vec2, Vec3, Vec4};
 
 use crate::mesh_import::tests::hammer;
-use crate::{ExportedFile, UsdFormat, import_high_poly_bytes, import_mesh_bytes, self_contained_mesh, usd_bytes};
+use crate::{ExportedFile, FormatError, UsdFormat, import_high_poly_bytes, import_mesh_bytes, self_contained_mesh, usd_bytes};
 
 /// Two meshes in a Z-up, centimeter stage: a quad + triangle (`Red`, with a `Blue` subset on
 /// the triangle; faceVarying indexed st and normals) under a translated root, and a triangle
@@ -528,4 +530,258 @@ fn crafted_usdc_references_time_samples_and_inlined_values_reach_mesh() {
     // Scaled 2× by the inlined matrix, then moved by the first time sample.
     assert!((lo - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5, "{lo}");
     assert!((hi - Vec3::new(3.0, 2.0, 0.0)).length() < 1e-5, "{hi}");
+}
+
+#[test]
+fn usda_and_usdc_parity_for_transforms_cameras_visibility_and_warnings() {
+    let mut root = UsdPrim::new("World", "Xform");
+    root.attrs = vec![
+        UsdAttr::new("xformOp:translate", "double3", Some(UsdValue::Vec3fs(vec![[0.0, 0.0, 100.0]]))),
+        UsdAttr::new("xformOp:rotateXYZ", "float3", Some(UsdValue::Vec3fs(vec![[0.0, 0.0, 90.0]]))),
+        UsdAttr::new("xformOp:scale", "float3", Some(UsdValue::Vec3fs(vec![[2.0, 2.0, 2.0]]))),
+        UsdAttr::new(
+            "xformOpOrder",
+            "token[]",
+            Some(UsdValue::Token("xformOp:translate".into())), // overridden below? No: use single-op or multi-prim
+        ),
+    ];
+    // Use individual Xform prims for single-token xformOpOrder (UsdValue has Token, not Tokens).
+    let mut parent = UsdPrim::new("Parent", "Xform");
+    parent.attrs = vec![
+        UsdAttr::new("xformOp:translate", "double3", Some(UsdValue::Vec3fs(vec![[0.0, 0.0, 100.0]]))),
+        UsdAttr::new("xformOpOrder", "token[]", Some(UsdValue::Token("xformOp:translate".into()))),
+    ];
+
+    let mut body = UsdPrim::new("Body", "Mesh");
+    body.binding_api = true;
+    body.attrs = vec![
+        UsdAttr::new("faceVertexCounts", "int[]", Some(UsdValue::Ints(vec![3, 3]))),
+        UsdAttr::new("faceVertexIndices", "int[]", Some(UsdValue::Ints(vec![0, 2, 1, 0, 1, 3]))),
+        UsdAttr::new("holeIndices", "int[]", Some(UsdValue::Ints(vec![1]))),
+        UsdAttr::new("orientation", "token", Some(UsdValue::Token("leftHanded".into()))).uniform(),
+        UsdAttr::new("points", "point3f[]", Some(UsdValue::Vec3fs(vec![[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0, 100.0, 0.0], [100.0, 100.0, 0.0]]))),
+        UsdAttr::new("normals", "normal3f[]", Some(UsdValue::Vec3fs(vec![[0.0, 0.0, 1.0]; 4]))).with_interpolation("vertex"),
+        UsdAttr::new("primvars:st", "texCoord2f[]", Some(UsdValue::Vec2fs(vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]))).with_interpolation("vertex"),
+        UsdAttr::rel("material:binding", "/World/Materials/Red".into()),
+    ];
+
+    let mut invisible = UsdPrim::new("Invisible", "Mesh");
+    invisible.attrs = vec![
+        UsdAttr::new("visibility", "token", Some(UsdValue::Token("invisible".into()))),
+        UsdAttr::new("faceVertexCounts", "int[]", Some(UsdValue::Ints(vec![3]))),
+        UsdAttr::new("faceVertexIndices", "int[]", Some(UsdValue::Ints(vec![0, 1, 2]))),
+        UsdAttr::new("points", "point3f[]", Some(UsdValue::Vec3fs(vec![[0.0, 0.0, 0.0], [50.0, 0.0, 0.0], [0.0, 50.0, 0.0]]))),
+    ];
+
+    let mut guide = UsdPrim::new("Guide", "Mesh");
+    guide.attrs = vec![
+        UsdAttr::new("purpose", "token", Some(UsdValue::Token("guide".into()))).uniform(),
+        UsdAttr::new("faceVertexCounts", "int[]", Some(UsdValue::Ints(vec![3]))),
+        UsdAttr::new("faceVertexIndices", "int[]", Some(UsdValue::Ints(vec![0, 1, 2]))),
+        UsdAttr::new("points", "point3f[]", Some(UsdValue::Vec3fs(vec![[0.0, 0.0, 0.0], [50.0, 0.0, 0.0], [0.0, 50.0, 0.0]]))),
+    ];
+
+    let instancer = UsdPrim::new("Scatter", "PointInstancer");
+
+    let mut cam = UsdPrim::new("Cam", "Camera");
+    cam.attrs = vec![
+        UsdAttr::new("focalLength", "float", Some(UsdValue::Double(35.0))),
+        UsdAttr::new("verticalAperture", "float", Some(UsdValue::Double(20.955))),
+        UsdAttr::new("xformOp:translate", "double3", Some(UsdValue::Vec3fs(vec![[0.0, -500.0, 100.0]]))),
+        UsdAttr::new("xformOpOrder", "token[]", Some(UsdValue::Token("xformOp:translate".into()))),
+    ];
+
+    let mut ortho = UsdPrim::new("Ortho", "Camera");
+    ortho.attrs = vec![
+        UsdAttr::new("projection", "token", Some(UsdValue::Token("orthographic".into()))),
+        UsdAttr::new("verticalAperture", "float", Some(UsdValue::Double(40.0))),
+    ];
+
+    let mut pbr = UsdPrim::new("PBR", "Shader");
+    pbr.attrs = vec![
+        UsdAttr::new("info:id", "token", Some(UsdValue::Token("UsdPreviewSurface".into()))).uniform(),
+        UsdAttr::new("inputs:diffuseColor", "color3f", Some(UsdValue::Vec3fs(vec![[0.8, 0.2, 0.1]]))),
+        UsdAttr::new("outputs:surface", "token", None),
+    ];
+    let mut mat = UsdPrim::new("Red", "Material");
+    mat.attrs.push(UsdAttr::connected("outputs:surface", "token", "/World/Materials/Red/PBR.outputs:surface".into()));
+    mat.children.push(pbr);
+    let mut materials = UsdPrim::new("Materials", "Scope");
+    materials.children.push(mat);
+
+    parent.children = vec![body, invisible, guide, instancer];
+    root.attrs.clear();
+    root.children = vec![parent, cam, ortho, materials];
+
+    let mut layer = UsdLayer::new(root);
+    // The authored unit scale must differ from the importer's fallback.
+    layer.meters_per_unit = 0.02;
+    layer.up_axis = "Z".into();
+
+    let usda = write_usda(&layer).into_bytes();
+    let usdc = write_usdc(&layer).unwrap();
+    let a = import_mesh_bytes("parity.usda", &usda).unwrap();
+    let b = import_mesh_bytes("parity.usdc", &usdc).unwrap();
+    assert_eq!(a.mesh.triangle_count(), 1);
+    assert_eq!(a.mesh.triangle_count(), b.mesh.triangle_count());
+    assert_eq!(a.mesh.materials, b.mesh.materials);
+    assert_eq!(a.mesh.positions, b.mesh.positions);
+    // +100 in stage Z becomes +2 m in Y, and the original Y edge points toward -Z.
+    let expected_bounds = (Vec3::new(0.0, 2.0, -2.0), Vec3::new(2.0, 2.0, 0.0));
+    for (encoding, imported) in [("USDA", &a), ("USDC", &b)] {
+        let (lo, hi) = imported.mesh.bounds();
+        assert!(close(lo, expected_bounds.0) && close(hi, expected_bounds.1), "{encoding} world bounds: {lo}..{hi}");
+    }
+    assert_eq!(a.mesh.normals, b.mesh.normals);
+    assert_eq!(a.mesh.uvs, b.mesh.uvs);
+    assert_eq!(a.mesh.indices, b.mesh.indices);
+    assert_eq!(a.cameras.len(), 2);
+    assert_eq!(a.cameras.len(), b.cameras.len());
+    for (ca, cb) in a.cameras.iter().zip(&b.cameras) {
+        assert_eq!((&ca.name, ca.ortho), (&cb.name, cb.ortho));
+        assert!((ca.fov - cb.fov).abs() < 1e-4 && (ca.distance - cb.distance).abs() < 1e-4);
+    }
+    assert_eq!(a.report.warnings, vec!["PointInstancer prims were skipped"]);
+    assert_eq!(a.report.warnings, b.report.warnings);
+
+    let hp_a = import_high_poly_bytes("parity.usda", &usda).unwrap();
+    let hp_b = import_high_poly_bytes("parity.usdc", &usdc).unwrap();
+    assert_eq!(hp_a.base_color.len(), hp_b.base_color.len());
+    assert_eq!(hp_a.base_color[0].as_ref().map(|c| c.factor), Some(Vec4::new(0.8, 0.2, 0.1, 1.0)));
+    assert_eq!(hp_a.base_color[0].as_ref().map(|c| c.factor), hp_b.base_color[0].as_ref().map(|c| c.factor));
+}
+
+#[test]
+fn usda_payload_sublayers_overlays_and_missing_reference_warnings() {
+    let src = r#"#usda 1.0
+(
+    subLayers = [@./sub.usda@]
+    metersPerUnit = 1
+)
+
+def Xform "PayloadNode" (
+    payload = @./payload.usda@
+)
+{
+}
+
+def Xform "MissingRef" (
+    references = </DoesNotExist>
+)
+{
+}
+
+over "Overlay"
+{
+    def Mesh "Skipped"
+    {
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [(0, 0, 0), (5, 0, 0), (0, 5, 0)]
+    }
+}
+
+def Mesh "Tri"
+{
+    int[] faceVertexCounts = [3]
+    int[] faceVertexIndices = [0, 1, 2]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+}
+"#;
+    let imported = import_mesh_bytes("warnings.usda", src.as_bytes()).unwrap();
+    assert_eq!(imported.mesh.triangle_count(), 1, "overlay prims are not drawn");
+    let warnings = imported.report.warnings.join("\n");
+    assert!(warnings.contains("sublayers are not loaded"), "{warnings}");
+    assert!(warnings.contains("external references and payloads are not loaded"), "{warnings}");
+    assert!(warnings.contains("reference to missing prim /DoesNotExist was skipped"), "{warnings}");
+}
+
+#[test]
+fn usd_decoded_limits_and_budget_enforced_for_text_and_binary() {
+    let mut mesh = UsdPrim::new("M", "Mesh");
+    mesh.attrs = vec![
+        UsdAttr::new("faceVertexCounts", "int[]", Some(UsdValue::Ints(vec![3]))),
+        UsdAttr::new("faceVertexIndices", "int[]", Some(UsdValue::Ints(vec![0, 1, 2]))),
+        UsdAttr::new("points", "point3f[]", Some(UsdValue::Vec3fs(vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))),
+    ];
+    let layer = UsdLayer::new(mesh);
+    let usda = write_usda(&layer).into_bytes();
+    let usdc = write_usdc(&layer).unwrap();
+    for (label, bytes) in [("usda", usda.as_slice()), ("usdc", usdc.as_slice())] {
+        let mut budget = Budget::with_limit(16);
+        assert!(matches!(read_layer_with_budget(bytes, &mut budget), Err(SceneError::TooLarge(_))), "{label}");
+    }
+
+    let mut instanced = String::from("#usda 1.0\n");
+    for i in 0..20 {
+        let next = i + 1;
+        instanced.push_str(&format!(
+            "class Xform \"L{i}\" {{\n    def Xform \"A\" (references = </L{next}>) {{}}\n    def Xform \"B\" (references = </L{next}>) {{}}\n}}\n"
+        ));
+    }
+    instanced.push_str("class Xform \"L20\" {}\ndef Xform \"Root\" (references = </L0>) {}\n");
+    let err = import_mesh_bytes("instanced.usda", instanced.as_bytes()).unwrap_err();
+    assert!(matches!(err, FormatError::TooLarge(_)), "{err:?}");
+}
+
+#[test]
+fn usdz_usda_first_layer_and_nested_texture_round_trip() {
+    let usda = r#"#usda 1.0
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1
+)
+def Xform "Root"
+{
+    def Mesh "Quad" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (0, 1)] (
+            interpolation = "vertex"
+        )
+        rel material:binding = </Root/Mat>
+    }
+    def Material "Mat"
+    {
+        token outputs:surface.connect = </Root/Mat/PBR.outputs:surface>
+        def Shader "PBR"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor.connect = </Root/Mat/Tex.outputs:rgb>
+            token outputs:surface
+        }
+        def Shader "Tex"
+        {
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @./tex/albedo.png@
+            float4 inputs:scale = (0.5, 1, 0.25, 1)
+            float3 outputs:rgb
+        }
+    }
+}
+"#;
+    let albedo = png([200, 10, 10]);
+    let mut writer = craft_zip_usdz::Writer::new();
+    writer.add_stored_aligned("sub/scene.usda", usda.as_bytes(), 64).unwrap();
+    writer.add_stored_aligned("sub/tex/albedo.png", &albedo, 64).unwrap();
+    let pkg = writer.finish().unwrap();
+
+    let imported = import_mesh_bytes("pkg.usdz", &pkg).unwrap();
+    assert_eq!(imported.mesh.triangle_count(), 1);
+    assert_eq!(imported.mesh.materials, ["Mat"]);
+    let hp = import_high_poly_bytes("pkg.usdz", &pkg).unwrap();
+    let mat = hp.base_color[0].as_ref().unwrap();
+    assert_eq!((mat.width, mat.height, mat.texels[0], mat.factor), (2, 2, [200, 10, 10, 255], Vec4::new(0.5, 1.0, 0.25, 1.0)));
+
+    let textures = vec![vec![file("BaseColor.png", albedo)]];
+    let reexported = usd_bytes(&imported.mesh, "Reopened", &textures, UsdFormat::Usdz).unwrap().bytes;
+    let reopened = import_mesh_bytes("reopened.usdz", &reexported).unwrap().mesh;
+    assert_eq!(reopened.triangle_count(), 1);
+    assert_eq!(reopened.materials, ["Mat"]);
+    let hp2 = import_high_poly_bytes("reopened.usdz", &reexported).unwrap();
+    assert_eq!(hp2.base_color[0].as_ref().map(|c| c.texels[0]), Some([200, 10, 10, 255]));
 }

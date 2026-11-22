@@ -1,6 +1,9 @@
 //! Isolated folder evaluation with the original stack available for anchor inputs.
 
-use super::{Channel, ChannelKind, Composite, Inputs, LayerId, Texel, all_tiles, neighbourhood_fields, plan, tile_texels, to_u16, to_u16_signed};
+use super::{
+    Channel, ChannelKind, Composite, EvaluationInputs, Inputs, LayerId, ProjectorDepthCache, Texel, all_tiles, evaluation_fields, plan, tile_texels, to_u16,
+    to_u16_signed,
+};
 
 /// Composite one layer over channel defaults, keeping anchors from the stack below it.
 pub(crate) fn composite_layer(inputs: &Inputs, layer: LayerId, channel: Channel) -> Option<Composite> {
@@ -8,7 +11,9 @@ pub(crate) fn composite_layer(inputs: &Inputs, layer: LayerId, channel: Channel)
     let channels = set.channel_list();
     let (width, height) = (inputs.gbuf.width, inputs.gbuf.height);
     let tiles = all_tiles(width, height);
-    let fields = neighbourhood_fields(inputs, &channels, &tiles);
+    let projectors = ProjectorDepthCache::default();
+    let inputs = &EvaluationInputs::new(inputs, &projectors);
+    let fields = evaluation_fields(inputs, &channels, &tiles);
     let mut composite = Composite::with_size(&[channel], width, height);
     let output = composite.channels.get_mut(&channel)?;
 

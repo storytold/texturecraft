@@ -20,18 +20,29 @@ fn harness() -> (Harness<'static, TextureCraftApp>, [LayerId; 4]) {
     (h, rows)
 }
 
+/// Frames for a scroll to bring a row into view (it animates)
+const SCROLL_FRAMES: usize = 25;
+
+/// Scrolls the row `name` into view: six rows overflow the Layers panel
+fn show_row(harness: &mut Harness<'_, TextureCraftApp>, name: &str) {
+    harness.get_by_label(name).scroll_to_me();
+    harness.run_steps(SCROLL_FRAMES);
+}
+
 /// Click the row `name` while `modifiers` are held (pressed before and released after the click).
-fn click(h: &mut Harness<'_, TextureCraftApp>, name: &str, modifiers: Modifiers) {
-    let at: Pos2 = h.get_by_label(name).rect().center();
-    h.event(Event::PointerMoved(at));
-    h.event(Event::ModifiersChanged(modifiers));
-    h.run_steps(1);
-    h.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers });
-    h.run_steps(1);
-    h.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers });
-    h.run_steps(2);
-    h.event(Event::ModifiersChanged(Modifiers::NONE));
-    h.run_steps(2);
+fn click(harness: &mut Harness<'_, TextureCraftApp>, name: &str, modifiers: Modifiers) {
+    show_row(harness, name);
+    let at: Pos2 = harness.get_by_label(name).rect().center();
+
+    harness.event(Event::PointerMoved(at));
+    harness.event(Event::ModifiersChanged(modifiers));
+    harness.run_steps(1);
+    harness.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers });
+    harness.run_steps(1);
+    harness.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers });
+    harness.run_steps(2);
+    harness.event(Event::ModifiersChanged(Modifiers::NONE));
+    harness.run_steps(2);
 }
 
 fn highlighted(h: &Harness<'_, TextureCraftApp>, name: &str) -> bool {
@@ -160,11 +171,13 @@ fn ctrl_a_leaves_text_fields_and_other_panels_alone() {
 }
 
 /// Right-click the row `name` and choose the menu item whose label starts with `item`.
-fn row_menu(h: &mut Harness<'_, TextureCraftApp>, name: &str, item: &str) {
-    h.get_by_label(name).click_secondary();
-    h.run_steps(3);
-    h.get_by(|node| node.label().is_some_and(|label| label.starts_with(item))).click();
-    h.run_steps(3);
+fn row_menu(harness: &mut Harness<'_, TextureCraftApp>, name: &str, item: &str) {
+    show_row(harness, name);
+
+    harness.get_by_label(name).click_secondary();
+    harness.run_steps(3);
+    harness.get_by(|node| node.label().is_some_and(|label| label.starts_with(item))).click();
+    harness.run_steps(3);
 }
 
 #[test]
