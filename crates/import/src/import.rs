@@ -754,8 +754,7 @@ fn build_set(
             }
         }
     }
-    // the safety net; the composite also cooks every graph of the set once, for every channel, so that the project
-    // opens without rendering them
+    // Prepare the graph results the view needs. The optional comparison also needs a full reference composite.
     let cache_channels: Vec<Channel> = cache.iter().map(|s| s.channel).collect();
     // the stored result's channels as layer pixels, made where a channel is read for the comparison
     let mut kept: BTreeMap<Channel, texturecraft_texel::TileImage> = BTreeMap::new();
@@ -770,16 +769,23 @@ fn build_set(
         progress(at(COOKING.0), step);
         let store: ImageStore = ctx.images.store();
         let scene = SetScene { project, ts, mesh: ctx.mesh, pixels: &out.pixels, baked: &baked, images: &store, graphs: &out.graphs };
-        let mut channels = cache_channels.clone();
-        if cooking {
-            channels.extend(project.texture_set(ts).map(|s| s.channel_list()).unwrap_or_default().into_iter().filter(|c| !cache_channels.contains(c)));
-        }
         // by the graphs cooked (each running render by its nodes), against the distinct graphs the stack runs
         let expected = stack.as_ref().map_or(0, |s| distinct_graphs(&s.layers)) as f32;
         let base = out.graphs.cook_progress();
         let poll = || progress(at(COOKING.0 + COOKING.1 * share(out.graphs.cook_progress() - base, expected)), step);
-        let composite = watching(WATCH_PERIOD, &poll, || safety_net::composite(&scene, &channels));
-        if let Some((composite, gbuf)) = composite.filter(|_| measuring) {
+        let composite = watching(WATCH_PERIOD, &poll, || {
+            if measuring {
+                let mut channels = cache_channels.clone();
+                if cooking {
+                    channels.extend(project.texture_set(ts).map(|s| s.channel_list()).unwrap_or_default().into_iter().filter(|c| !cache_channels.contains(c)));
+                }
+                safety_net::composite(&scene, &channels)
+            } else {
+                safety_net::prepare_graphs(&scene);
+                None
+            }
+        });
+        if let Some((composite, gbuf)) = composite {
             let formats = project.texture_set(ts).map(|s| s.channels.clone()).unwrap_or_default();
             for stored in &cache {
                 let c = &stored.channel;
