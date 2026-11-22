@@ -324,11 +324,13 @@ impl TextureCraftApp {
         texturecraft_engine::bake::install_gpu_tracer(Arc::new(texturecraft_render::gpu_bake::GpuBaker::new()));
         let gpu = cc.wgpu_render_state.as_ref().map(|render_state| gpu::init(render_state, &cc.egui_ctx));
         #[cfg(not(target_arch = "wasm32"))]
-        let graph_accelerator = cc
-            .wgpu_render_state
-            .as_ref()
-            .filter(|_| gpu.as_ref().is_some_and(gpu::GpuLink::supports_gpu_layers))
-            .map(|render_state| Arc::new(texturecraft_render::gpu_graph::GraphAccelerator::new(&render_state.device, &render_state.queue)));
+        let graph_accelerator = cc.wgpu_render_state.as_ref().filter(|_| gpu.as_ref().is_some_and(gpu::GpuLink::supports_gpu_layers)).map(|render_state| {
+            Arc::new(texturecraft_render::gpu_graph::GraphAccelerator::new(
+                &render_state.device,
+                &render_state.queue,
+                texturecraft_engine::compose::graphs::budget::limit,
+            ))
+        });
 
         // The first run speaks the OS (or browser) language
         let mut ui_store = ui_state_store::UiStateStore::new(ui_state_store::FILE.get().cloned());

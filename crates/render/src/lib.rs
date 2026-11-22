@@ -24,18 +24,6 @@ pub mod gpu_bake;
 pub mod gpu_brush;
 pub mod gpu_composite;
 mod gpu_curvature;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod gpu_graph;
-#[cfg(not(target_arch = "wasm32"))]
-mod gpu_graph_color;
-#[cfg(not(target_arch = "wasm32"))]
-mod gpu_graph_filter;
-#[cfg(not(target_arch = "wasm32"))]
-mod gpu_graph_grey;
-#[cfg(not(target_arch = "wasm32"))]
-mod gpu_graph_half;
-#[cfg(not(target_arch = "wasm32"))]
-mod gpu_graph_patterns;
 mod gpu_image_source;
 mod gpu_neighbourhood;
 pub mod gpu_quick_mask;
@@ -64,6 +52,8 @@ pub mod trace;
 pub use bake_overlay::BakeOverlay;
 pub use bake_visualization::BakeVisualization;
 pub use cage_geometry::CageGeometry;
+#[cfg(not(target_arch = "wasm32"))]
+pub use craft_material_graph_wgpu as gpu_graph;
 pub use neutral_material::NeutralMaterial;
 pub use overlay_quad::OverlayQuad;
 pub use renderer::{COLOR_FORMAT, DEFAULT_BACKGROUND, Frame, MSAA, Renderer, Shade, UV_VIEW_MAX_ZOOM, UV_VIEW_MIN_ZOOM, ViewKind, aux_size, uv_view_scale};

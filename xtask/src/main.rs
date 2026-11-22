@@ -113,8 +113,6 @@ const WASM_PACKAGES: &[&str] = &[
     "texturecraft-core",
     "texturecraft-texel",
     "texturecraft-geom",
-    "texturecraft-import-reader",
-    "texturecraft-graph",
     "texturecraft-compose",
     "texturecraft-bake",
     "texturecraft-paint",

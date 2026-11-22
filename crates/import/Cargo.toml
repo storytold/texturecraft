@@ -1,6 +1,6 @@
 [package]
 name = "texturecraft-import"
-description = "Imports projects of the reference app into TextureCraft projects (the translator on top of texturecraft-import-reader)"
+description = "Imports projects of the reference app into TextureCraft projects (the translator on top of craft-spp-reader)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

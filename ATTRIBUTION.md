@@ -52,5 +52,5 @@ Apache-2.0). None of them is derived from another product's presets, shaders, ma
 
 | Path | What | Author | Source | License |
 |---|---|---|---|---|
-| `crates/graph`, and the copy of its PNG encoder in `crates/import-reader/src/png_out/` | The graph runtime (node graph text format, parser, CPU evaluator, image codecs), copied and adapted; see `crates/graph/NOTICE`, which covers both | PiJellyPin and contributors | Derived from [PiJellyPin/MaterialCraft](https://github.com/PiJellyPin/MaterialCraft) (not storytold/materialcraft); copied and adapted, not a dependency | MIT OR Apache-2.0 |
+| Shared SPP reader and material graph runtime in craft-libs | SPP project reading and graph decompilation by xilefenko. The graph runtime is derived from [PiJellyPin/MaterialCraft](https://github.com/PiJellyPin/MaterialCraft). The shared crates retain the original notices. | xilefenko, PiJellyPin and contributors | [Original importer PR #521](https://github.com/storytold/texturecraft/pull/521) | MIT OR Apache-2.0 |
 | `crates/compose/src/placed/warp.rs` (`BezierMesh`) | The Bézier patch evaluation of the warp projection, copied and generalised to 3D control points with derivatives | ArtCraft Team and the PhotoCraft contributors | PhotoCraft, `crates/geom/src/warp.rs` (revision 5f65579) | MIT OR Apache-2.0 |
