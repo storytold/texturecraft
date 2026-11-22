@@ -1,6 +1,6 @@
 struct Params {
     dimensions: vec4<u32>, // output width, band rows, input width, blend opcode or zero for a doubling
-    blend: vec4<u32>,      // opacity bits
+    blend: vec4<u32>,      // opacity bits, whole-image input instead of a stripe with wrap padding
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -33,9 +33,14 @@ fn source(x: u32, y: u32) -> f32 {
 }
 
 fn doubled(x: u32, y: u32) -> vec2<f32> {
-    let main = y / 2u + 1u;
-    let side = select(main - 1u, main + 1u, (y & 1u) != 0u);
     let w = params.dimensions.z;
+    let whole_image = params.blend.y != 0u;
+    let main = y / 2u + select(1u, 0u, whole_image);
+    let side_offset = select(w - 1u, 1u, (y & 1u) != 0u);
+    var side = (main + side_offset) & (w - 1u);
+    if !whole_image {
+        side = select(main - 1u, main + 1u, (y & 1u) != 0u);
+    }
     let left = (x + w - 1u) & (w - 1u);
     let right = (x + 1u) & (w - 1u);
     let main_sample = vec2(source(left, main), source(right, main));

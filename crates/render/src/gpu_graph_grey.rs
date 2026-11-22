@@ -1,8 +1,13 @@
-//! Large compiled grayscale transforms and blends using bounded stripes of packed 16-bit samples.
+//! Packed grayscale graph passes. Whole images can feed later GPU nodes, while bounded stripes support larger jobs.
 
-use texturecraft_graph::accelerator::GreyPass;
+use std::any::Any;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use texturecraft_graph::accelerator::{GreyInput, GreyPass, ResidentGrey16, ResidentGreyPass, ResidentGreyPixels};
 use texturecraft_graph::context::Cancel;
 use texturecraft_graph::tex::Grey16;
+use wgpu::util::DeviceExt;
 
 const BAND_BYTES: u64 = 8 << 20;
 const WORKGROUP: u32 = 8;
@@ -11,6 +16,7 @@ pub(crate) struct GreyRasterizer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    resident_bytes: Arc<AtomicU64>,
 }
 
 impl GreyRasterizer {
@@ -26,7 +32,167 @@ impl GreyRasterizer {
                 cache: None,
             })
         })?;
-        Ok(Self { device: device.clone(), queue: queue.clone(), pipeline })
+        Ok(Self { device: device.clone(), queue: queue.clone(), pipeline, resident_bytes: Arc::default() })
+    }
+
+    fn resident_storage_limit(&self) -> u64 {
+        let limits = self.device.limits();
+        limits.max_buffer_size.min(limits.max_storage_buffer_binding_size)
+    }
+
+    fn reserve(&self, bytes: u64) -> Option<Arc<ResidentBytes>> {
+        let storage = self.resident_storage_limit();
+        if bytes > storage {
+            return None;
+        }
+        let buffers = if self.device.adapter_info().device_type == wgpu::DeviceType::DiscreteGpu { 6 } else { 3 };
+        let cap = (texturecraft_compose::graphs::budget::limit() / 8).min(storage.saturating_mul(buffers));
+        self.resident_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| used.checked_add(bytes).filter(|&used| used <= cap)).ok()?;
+        Some(Arc::new(ResidentBytes { total: self.resident_bytes.clone(), bytes }))
+    }
+
+    pub(crate) fn allocate_resident(&self, w: usize, h: usize) -> Result<Option<Arc<GreyDevicePixels>>, String> {
+        let Some(bytes) = packed_bytes(w, h) else { return Ok(None) };
+        let Some(reservation) = self.reserve(bytes) else { return Ok(None) };
+        let buffer = crate::gpu_trace::scoped(&self.device, "resident graph grayscale buffer", || {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("resident graph grayscale buffer"),
+                size: bytes,
+                usage: RESIDENT_BUFFER_USAGE,
+                mapped_at_creation: false,
+            })
+        })?;
+        Ok(Some(Arc::new(self.resident_pixels(buffer, reservation))))
+    }
+
+    fn resident_pixels(&self, buffer: wgpu::Buffer, reservation: Arc<ResidentBytes>) -> GreyDevicePixels {
+        GreyDevicePixels { device: self.device.clone(), queue: self.queue.clone(), buffer, reservation }
+    }
+
+    fn bind_input(&self, input: GreyInput<'_>) -> Result<Option<GreyDevicePixels>, String> {
+        let host = match input {
+            GreyInput::Host(host) => host,
+            GreyInput::Device(image) => {
+                return Ok(GreyDevicePixels::from_resident(image).filter(|pixels| pixels.device == self.device).cloned());
+            }
+        };
+        let Some(bytes) = packed_bytes(host.w, host.h).filter(|&bytes| bytes / 2 == host.px.len() as u64) else { return Ok(None) };
+        let Some(reservation) = self.reserve(bytes) else { return Ok(None) };
+        let buffer = crate::gpu_trace::scoped(&self.device, "resident graph grayscale upload", || {
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("resident graph grayscale upload"),
+                contents: bytemuck::cast_slice(&host.px),
+                usage: RESIDENT_BUFFER_USAGE,
+            })
+        })?;
+        Ok(Some(self.resident_pixels(buffer, reservation)))
+    }
+
+    pub(crate) fn render_resident(&self, pass: ResidentGreyPass<'_>, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
+        let (foreground, background, side, mode, opacity) = match pass {
+            ResidentGreyPass::Enlarge { source, side } => (source, None, side, 0, 0.0),
+            ResidentGreyPass::Blend { foreground, background, mode, opacity } => {
+                if !(32..=34).contains(&mode) || !opacity.is_finite() {
+                    return Ok(None);
+                }
+                let (side, _) = grey_input_shape(&foreground);
+                (foreground, Some(background), side, mode, opacity)
+            }
+        };
+        let (source_side, alpha) = grey_input_shape(&foreground);
+        if cancel.is_cancelled() || !(4..=8192).contains(&side) || !side.is_power_of_two() || source_side == 0 {
+            return Ok(None);
+        }
+        let alpha = if let Some(background) = &background {
+            let (background_side, alpha) = grey_input_shape(background);
+            if background_side != side {
+                return Ok(None);
+            }
+            alpha
+        } else {
+            if source_side >= side {
+                return Ok(None);
+            }
+            alpha
+        };
+        let limit = self.device.limits();
+        if (side as u32).div_ceil(WORKGROUP) > limit.max_compute_workgroups_per_dimension {
+            return Ok(None);
+        }
+        // Poll without waiting so completed submissions can release reservations before trying to reserve more.
+        self.device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
+        let Some(front) = self.bind_input(foreground)? else { return Ok(None) };
+        let back = match background {
+            Some(image) => {
+                let Some(bound) = self.bind_input(image)? else { return Ok(None) };
+                bound
+            }
+            None => front.clone(), // The doubling kernel does not read this binding.
+        };
+        let mut stages = Vec::new();
+        let mut size = if mode == 0 { source_side * 2 } else { side };
+        loop {
+            let Some(output) = self.allocate_resident(size, size)? else { return Ok(None) };
+            stages.push((size, output));
+            if size == side {
+                break;
+            }
+            size *= 2;
+        }
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+
+        crate::gpu_trace::scoped(&self.device, "resident graph grayscale pass", || {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("resident graph grayscale") });
+            let mut input = (source_side, &front);
+            for (size, output) in &stages {
+                let back = if mode == 0 { input.1 } else { &back };
+                self.encode_resident(&mut encoder, input, back, (*size, output), mode, opacity);
+                input = (*size, output);
+            }
+            self.queue.submit([encoder.finish()]);
+        })?;
+        front.retain_until_completed(&self.queue);
+        if mode != 0 {
+            back.retain_until_completed(&self.queue);
+        }
+        for (_, pixels) in &stages {
+            pixels.retain_until_completed(&self.queue);
+        }
+        Ok(stages.pop().map(|(_, pixels)| ResidentGrey16 { w: side, h: side, div: 65535.0, alpha, pixels }))
+    }
+
+    fn encode_resident(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        (source_side, front): (usize, &GreyDevicePixels),
+        back: &GreyDevicePixels,
+        (side, output): (usize, &GreyDevicePixels),
+        mode: u32,
+        opacity: f32,
+    ) {
+        let params = [side as u32, side as u32, source_side as u32, mode, opacity.to_bits(), 1, 0, 0];
+        let uniform = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("resident graph grayscale parameters"),
+            contents: bytemuck::cast_slice(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let entries = [&uniform, &front.buffer, &back.buffer, &output.buffer]
+            .into_iter()
+            .enumerate()
+            .map(|(binding, buffer)| wgpu::BindGroupEntry { binding: binding as u32, resource: buffer.as_entire_binding() })
+            .collect::<Vec<_>>();
+        let binding = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resident graph grayscale inputs"),
+            layout: &self.pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        let side = side as u32;
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &binding, &[]);
+        pass.dispatch_workgroups((side / 2).div_ceil(WORKGROUP), side.div_ceil(WORKGROUP), 1);
     }
 
     pub(crate) fn render(&self, pass: GreyPass<'_>, cancel: &Cancel) -> Result<Option<Grey16>, String> {
@@ -65,6 +231,107 @@ impl GreyRasterizer {
             }
         }
     }
+}
+
+const RESIDENT_BUFFER_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE.union(wgpu::BufferUsages::COPY_SRC).union(wgpu::BufferUsages::COPY_DST);
+
+fn packed_bytes(w: usize, h: usize) -> Option<u64> {
+    // A row is addressable both as pairs of u16 on the GPU and by byte offset when read back.
+    if w == 0 || h == 0 || !w.is_multiple_of(2) {
+        return None;
+    }
+    (w as u64).checked_mul(h as u64)?.checked_mul(2)
+}
+
+fn grey_input_shape(input: &GreyInput<'_>) -> (usize, f32) {
+    let (w, h, div, alpha) = input.info();
+    (if (2..=8192).contains(&w) && w == h && w.is_power_of_two() && div == 65535.0 { w } else { 0 }, alpha)
+}
+
+#[derive(Debug)]
+struct ResidentBytes {
+    total: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl Drop for ResidentBytes {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// GPU storage for a grayscale node, in row order with two u16 samples per word.
+#[derive(Clone, Debug)]
+pub(crate) struct GreyDevicePixels {
+    pub(crate) buffer: wgpu::Buffer,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    reservation: Arc<ResidentBytes>,
+}
+
+impl GreyDevicePixels {
+    pub(crate) fn from_resident(image: &ResidentGrey16) -> Option<&Self> {
+        let pixels = image.pixels.as_any().downcast_ref::<Self>()?;
+        (pixels.buffer.size() == packed_bytes(image.w, image.h)?).then_some(pixels)
+    }
+
+    pub(crate) fn retain_until_completed(&self, queue: &wgpu::Queue) {
+        let reservation = self.reservation.clone();
+        queue.on_submitted_work_done(move || drop(reservation));
+    }
+}
+
+impl ResidentGreyPixels for GreyDevicePixels {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn read(&self, cancel: &Cancel) -> Result<Vec<u16>, String> {
+        if cancel.is_cancelled() {
+            return Err("GPU grayscale readback was cancelled".into());
+        }
+        let size = self.buffer.size();
+        let band = size.min(BAND_BYTES);
+        let staging = crate::gpu_trace::scoped(&self.device, "resident graph grayscale readback", || {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("resident graph grayscale readback"),
+                size: band,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })?;
+        let mut pixels = Vec::with_capacity((size / 2) as usize);
+        for offset in (0..size).step_by(band as usize) {
+            if cancel.is_cancelled() {
+                return Err("GPU grayscale readback was cancelled".into());
+            }
+            let bytes = (size - offset).min(band);
+            let submission = crate::gpu_trace::scoped(&self.device, "resident graph grayscale copy", || {
+                let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("resident graph grayscale copy") });
+                encoder.copy_buffer_to_buffer(&self.buffer, offset, &staging, 0, bytes);
+                self.queue.submit([encoder.finish()])
+            })?;
+            read_words(&self.device, &staging, bytes, submission, &mut pixels)?;
+        }
+        Ok(pixels)
+    }
+}
+
+fn read_words(device: &wgpu::Device, staging: &wgpu::Buffer, bytes: u64, submission: wgpu::SubmissionIndex, pixels: &mut Vec<u16>) -> Result<(), String> {
+    let slice = staging.slice(..bytes);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }).map_err(|e| e.to_string())?;
+    receiver.recv().map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let copied = (|| {
+        let data = slice.get_mapped_range().map_err(|e| e.to_string())?;
+        pixels.extend_from_slice(bytemuck::try_cast_slice::<u8, u16>(&data).map_err(|e| e.to_string())?);
+        Ok::<(), String>(())
+    })();
+    staging.unmap();
+    copied
 }
 
 struct Bands<'a> {
@@ -131,20 +398,7 @@ impl<'a> Bands<'a> {
             }
             encoder.copy_buffer_to_buffer(&self.result, 0, &self.readback, 0, bytes);
             let submission = queue.submit([encoder.finish()]);
-            let slice = self.readback.slice(..bytes);
-            let (sender, receiver) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
-            device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }).map_err(|e| e.to_string())?;
-            receiver.recv().map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
-            let copied = (|| {
-                let data = slice.get_mapped_range().map_err(|e| e.to_string())?;
-                pixels.extend_from_slice(bytemuck::try_cast_slice::<u8, u16>(&data).map_err(|e| e.to_string())?);
-                Ok::<(), String>(())
-            })();
-            self.readback.unmap();
-            copied?;
+            read_words(device, &self.readback, bytes, submission, &mut pixels)?;
         }
         let alpha = background.map_or(foreground.alpha, |b| b.alpha);
         Ok(Grey16 { w: side, h: side, px: pixels, div: 65535.0, alpha })
