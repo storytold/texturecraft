@@ -804,8 +804,15 @@ fn build_set(
         let expected = stack.as_ref().map_or(0, |s| distinct_graphs(&s.layers)) as f32;
         let base = out.graphs.cook_progress();
         let poll = || progress(at(COOKING.0 + COOKING.1 * share(out.graphs.cook_progress() - base, expected)), step);
-        let composite = watching(WATCH_PERIOD, &poll, || safety_net::composite(&scene, &channels));
-        if let Some((composite, gbuf)) = composite.filter(|_| measuring) {
+        let composite = watching(WATCH_PERIOD, &poll, || {
+            if measuring {
+                safety_net::composite(&scene, &channels)
+            } else {
+                safety_net::prepare_graphs(&scene);
+                None
+            }
+        });
+        if let Some((composite, gbuf)) = composite {
             let formats = project.texture_set(ts).map(|s| s.channels.clone()).unwrap_or_default();
             for stored in &cache {
                 let c = &stored.channel;
