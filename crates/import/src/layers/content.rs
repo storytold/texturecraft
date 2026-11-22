@@ -581,7 +581,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
     /// What one fill writes per channel.
     fn fill_parts(&mut self, fill: &FillEffect) -> FillParts {
         let ch = self.input.channels;
-        let mapped = projection::map(fill);
+        let mapped = projection::map(fill, self.input.geometry.map(|geometry| geometry.mesh));
         let mut parts =
             FillParts { groups: Vec::new(), graphs: Vec::new(), graph_names: Vec::new(), status: BTreeMap::new(), projection: mapped.projection.clone() };
         // per fill source: its channels, each with its own blending

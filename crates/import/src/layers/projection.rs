@@ -20,9 +20,15 @@
 //! the image about its centre, the rotation turns it the other way from TextureCraft's degrees and the offset's v runs
 //! up. The blend shares are `smoothstep(½ + ½·hardness, 1, |n_i| / max|n|)`, normalised (measured on a sphere at
 //! hardness 0, 0.25, 0.5, 0.75 and 1 to 0.002 rms in the shares).
+//!
+//! Warp volume positions refer to the stored scene mesh's normalised coordinates, with a unit of two for the size.
+//! Convert that frame into TextureCraft's bounding-box frame, which can have a different centre and extent.
 
 use texturecraft_core::{FacingFalloff, Falloff, ImagePlacement, PlacedMode, PlacedProjection, Projection, Repeat, Volume, WarpGrid, WarpPoint};
-use texturecraft_geom::glam::Mat3;
+use texturecraft_geom::{
+    Mesh,
+    glam::{Mat3, Vec3},
+};
 use texturecraft_import_reader::model::{FillEffect, FillPlacement, GridDeformation, UvTransform};
 
 use crate::status::Status;
@@ -157,13 +163,25 @@ fn repeat(wrap: Option<u64>) -> Repeat {
     }
 }
 
-pub fn map(fill: &FillEffect) -> MappedProjection {
+pub fn map(fill: &FillEffect, mesh: Option<&Mesh>) -> MappedProjection {
     let identity = Projection::default();
     let uv = fill.uv_transform.filter(|t| !t.is_identity());
     let p = &fill.placement;
     let approx = |what: &str| Status::approximated(what.to_string());
     let placed = |mode: PlacedMode, offset: bool| {
-        Projection::Placed(Box::new(PlacedProjection { mode, volume: volume(p), image: image(uv, offset), repeat: repeat(p.uv_wrap) }))
+        let mut volume = volume(p);
+        if matches!(mode, PlacedMode::Warp { .. })
+            && let Some(mesh) = mesh
+        {
+            let (lo, hi) = mesh.bounds();
+            let centre = (lo + hi) * 0.5;
+            let extent = (hi - lo).max_element().max(1e-6);
+            // `volume` has the file position in half-units. The compositor adds its own
+            // mesh centre and multiplies by the extent, so undo that frame here.
+            volume.offset = ((Vec3::from_array(volume.offset) * 2.0 - centre) / extent).to_array();
+            volume.size = volume.size.map(|size| size * (2.0 / extent));
+        }
+        Projection::Placed(Box::new(PlacedProjection { mode, volume, image: image(uv, offset), repeat: repeat(p.uv_wrap) }))
     };
     let wrap = p.uv_wrap.unwrap_or(WRAP_BOTH);
     let one_axis =
@@ -260,6 +278,10 @@ mod tests {
 
     fn fill(projection: u64, uv: Option<UvTransform>) -> FillEffect {
         FillEffect { header: EffectHeader::default(), sources: Vec::new(), projection, filtering: 2, uv_transform: uv, placement: FillPlacement::default() }
+    }
+
+    fn map(fill: &FillEffect) -> MappedProjection {
+        super::map(fill, None)
     }
 
     fn placed_of(m: &MappedProjection) -> &PlacedProjection {
@@ -430,6 +452,27 @@ mod tests {
         assert!(shapes_coverage(&cyl));
         assert!(matches!(placed_of(&map(&fill(3, None))).mode, PlacedMode::Spherical));
         assert!(!map(&fill(8, None)).status.is_exact());
+    }
+
+    #[test]
+    fn warp_keeps_its_placement_when_the_mesh_bounds_are_asymmetric() {
+        let bounds = (Vec3::new(-0.6, -1.0, -0.4), Vec3::new(0.6, 0.96, 0.4));
+        let mesh = Mesh { positions: vec![bounds.0, bounds.1], ..Mesh::default() };
+        let mut warp = fill(7, None);
+        let origin = Vec3::new(0.03, 0.64, 0.32);
+        warp.placement.position = Some(origin.to_array());
+        warp.placement.size = Some([0.17; 3]);
+        warp.placement.grid = Some(GridDeformation { size: [3, 3], depth: 0.01, vertices: Vec::new() });
+        warp.placement.depth_culling = Some(true);
+
+        let mapped = super::map(&warp, Some(&mesh));
+        let projection = placed_of(&mapped);
+        let at = |pos| placed::taps(projection, bounds, &Point { pos, nrm: Vec3::Z, texel_len: 1.0 / 2048.0, ..Point::default() });
+        let centre = at(origin);
+        assert!(centre.coverage > 0.99);
+        assert!((centre.taps[0].uv - Vec2::splat(0.5)).length() < 1e-5, "{centre:?}");
+        let right = at(origin + Vec3::X * (0.34 * 0.25));
+        assert!((right.taps[0].uv - Vec2::new(0.75, 0.5)).length() < 1e-5, "{right:?}");
     }
 
     #[test]
