@@ -784,6 +784,7 @@ fn duplicate_effect(s: &mut Session, p: &Value) -> Result<Value> {
         let mut e = list.get(i).cloned().ok_or_else(|| bad(CMD, format!("no effect {}", eid.0)))?;
         e.id = new;
         e.name = format!("{} copy", e.name);
+        crate::graph_param_cmds::separate_copied_parameters(&mut e);
         list.insert(i + 1, e);
         // Painted effects keep their pixels (copy-on-write tiles: cheap).
         let px = &mut s.doc.pixels;

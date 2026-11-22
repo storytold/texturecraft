@@ -662,6 +662,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                         let Some((_, blend)) = blends.iter().find(|(b, _)| *b == c) else { continue };
                         if let Source::Graph(g) = &mut source {
                             g.unfiltered = projection::bilinear(fill);
+                            g.parameter_group = Some([self.ids.next(), index as u64]);
                         }
                         let mut status = blend.status();
                         status.and(&mapped.status);

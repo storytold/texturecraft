@@ -58,15 +58,17 @@ impl Target {
         }
     }
 
-    fn change(self, project: &mut Project, name: &str, new: Option<GraphValue>) -> Option<()> {
+    fn change(self, project: &mut Project, reference: &GraphRef, name: &str, new: Option<GraphValue>) -> Option<()> {
         match self {
-            Self::Fill(id, channel) => {
+            Self::Fill(id, _) => {
                 let LayerKind::Fill(fill) = &mut project.layers.get_mut(&id)?.kind else { return None };
-                change_fill(fill, channel, name, new);
+                change_fill(fill, reference, name, new);
             }
-            Self::Material(id, channel) => {
-                let EffectKind::Material(fill) = &mut project.effect_mut(id)?.kind else { return None };
-                change_fill(fill, channel, name, new);
+            Self::Material(id, _) => {
+                for linked in material_effects(project, id, reference)? {
+                    let EffectKind::Material(fill) = &mut project.effect_mut(linked)?.kind else { return None };
+                    change_fill(fill, reference, name, new.clone());
+                }
             }
             Self::Effect(id) => {
                 let graph = match &mut project.effect_mut(id)?.kind {
@@ -81,13 +83,49 @@ impl Target {
     }
 }
 
-fn change_fill(fill: &mut Fill, channel: Channel, name: &str, new: Option<GraphValue>) {
-    let Some(graph) = fill.sources.get(&channel).and_then(Source::graph) else { return };
-    let shared: Vec<_> =
-        fill.sources.iter().filter_map(|(channel, source)| source.graph().filter(|other| graph.shares_parameters_with(other)).map(|_| *channel)).collect();
-    for channel in shared {
-        if let Some(Source::Graph(graph)) = fill.sources.get_mut(&channel) {
+fn change_fill(fill: &mut Fill, reference: &GraphRef, name: &str, new: Option<GraphValue>) {
+    for source in fill.sources.values_mut() {
+        if let Source::Graph(graph) = source
+            && reference.shares_parameters_with(graph)
+        {
             change_value(graph, name, new.clone());
+        }
+    }
+}
+
+fn material_effects(project: &Project, id: LayerId, reference: &GraphRef) -> Option<Vec<LayerId>> {
+    let (owner, effect) = project.effect(id)?;
+    let stack = &project.layers.get(&owner)?.content_effects;
+    let EffectKind::Material(fill) = &effect.kind else { return None };
+    let reads = |other: &Fill| other.sources.values().filter_map(Source::graph).any(|g| reference.shares_parameters_with(g));
+    if reference.parameter_group.is_some() {
+        return Some(stack.iter().filter(|e| matches!(&e.kind, EffectKind::Material(fill) if reads(fill))).map(|e| e.id).collect());
+    }
+
+    let at = stack.iter().position(|e| e.id == id)?;
+    // Older imports identify adjacent parts of a split fill by their name, projection and shared outputs.
+    let other_part = |other: &&texturecraft_core::Effect| {
+        let EffectKind::Material(other_fill) = &other.kind else { return false };
+        project.import.is_some()
+            && other.name == effect.name
+            && other_fill.projection == fill.projection
+            && (other.blend != effect.blend || other.opacity != effect.opacity)
+            && !other_fill.sources.keys().any(|channel| fill.sources.contains_key(channel))
+            && reads(other_fill)
+    };
+    let before = stack.iter().take(at).rev().take_while(other_part);
+    let after = stack.iter().skip(at + 1).take_while(other_part);
+    Some(std::iter::once(id).chain(before.chain(after).map(|e| e.id)).collect())
+}
+
+/// An individual effect copy gets its own parameter group. Whole-layer copies retain links within the new layer.
+pub(crate) fn separate_copied_parameters(effect: &mut texturecraft_core::Effect) {
+    if let EffectKind::Material(fill) = &mut effect.kind {
+        for source in fill.sources.values_mut() {
+            if let Source::Graph(graph) = source {
+                let source = graph.parameter_group.map_or(0, |[_, source]| source);
+                graph.parameter_group = Some([effect.id.0, source]);
+            }
         }
     }
 }
@@ -129,8 +167,9 @@ fn set(session: &mut Session, p: &Value) -> Result<Value> {
     if unchanged {
         return Ok(Value::Null);
     }
+    let reference = graph.clone();
     session.edit("Change graph parameter", |session| {
-        target.change(&mut session.doc.project, name, new).ok_or_else(|| bad(CMD, "the graph is missing"))?;
+        target.change(&mut session.doc.project, &reference, name, new).ok_or_else(|| bad(CMD, "the graph is missing"))?;
         Ok(Value::Null)
     })
 }

@@ -113,7 +113,9 @@ fn paste(session: &mut Session, params: &Value) -> Result<Value> {
             &mut owner_layer.mask.get_or_insert_with(|| Mask::new(background)).effects
         };
         let index = selected.and_then(|selected| stack.iter().position(|effect| effect.id == selected)).map_or(stack.len(), |position| position + 1);
-        stack.insert(index, texturecraft_core::Effect { id: pasted, ..effect.clone() });
+        let mut effect = texturecraft_core::Effect { id: pasted, ..effect.clone() };
+        crate::graph_param_cmds::separate_copied_parameters(&mut effect);
+        stack.insert(index, effect);
 
         // Painted pixels come along, resampled to the set's size (a mask's paint stays a mask's)
         if let Some(image) = copied.pixels.masks.get(&copied_id).filter(|_| !content) {

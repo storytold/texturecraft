@@ -98,6 +98,9 @@ pub struct GraphRef {
     /// Parameter values by the graph's parameter name; parameters not listed keep the graph's defaults.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, GraphValue>,
+    /// Original fill and source within it, for a material split into several effects by channel blend mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_group: Option<[u64; 2]>,
     /// What feeds the image inputs, by input index; inputs not listed read black.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<u32, GraphInput>,
@@ -134,11 +137,13 @@ impl GraphRef {
     pub fn shares_parameters_with(&self, other: &Self) -> bool {
         self.key == other.key
             && self.name == other.name
+            && self.parameter_group == other.parameter_group
             && self.params == other.params
             && self.inputs == other.inputs
             && self.keep == other.keep
             && self.alpha_output == other.alpha_output
             && self.seed == other.seed
+            && self.unfiltered == other.unfiltered
     }
 
     /// A reference to the graph with text key `key`, everything else at its defaults.
@@ -147,6 +152,7 @@ impl GraphRef {
             key: key.into(),
             name: name.into(),
             params: BTreeMap::new(),
+            parameter_group: None,
             inputs: BTreeMap::new(),
             output: None,
             outputs: BTreeMap::new(),
