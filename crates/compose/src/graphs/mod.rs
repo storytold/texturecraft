@@ -491,7 +491,7 @@ fn fingerprint<T>(cache: &Mutex<Fingerprints<T>>, source: &Arc<T>, values: impl 
     digest
 }
 
-fn trace_name(name: &str) -> &str {
+pub(crate) fn trace_name(name: &str) -> &str {
     name.rsplit(['/', '\\']).next().unwrap_or_default()
 }
 
@@ -587,6 +587,10 @@ impl GraphStore {
     /// Report diagnostics from uncached graph renders until the listener is removed.
     pub fn trace_cooks(&self, trace: Option<CookTrace>) {
         *lock(&self.cooks.trace) = trace;
+    }
+
+    pub(crate) fn cook_trace(&self) -> Option<CookTrace> {
+        lock(&self.cooks.trace).clone()
     }
 
     pub fn accelerator(&self) -> Option<Arc<dyn GraphAccelerator>> {
@@ -988,7 +992,7 @@ impl GraphStore {
         if self.cooks.cancel.is_cancelled() {
             return Err("cancelled".to_string());
         }
-        let trace = lock(&self.cooks.trace).clone();
+        let trace = self.cook_trace();
         let name = trace_name(&g.name);
         if let Some(source) = &self.cooks.resize_source {
             let result = source.cooks.get(&key.to_owned()).or_else(|| source.spilled.get(key).map(|result| Ok(Arc::new(result))));

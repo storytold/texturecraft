@@ -460,7 +460,9 @@ fn neighbourhood_filters(effects: &[Effect], res: u32, channel: Option<Channel>)
                 Some((index, texels(*radius), Op::Slope { scale: *scale, seed: *seed }))
             }
             // reads the whole set: the radius is clamped to the set's longest side
-            EffectKind::Graph { graph, .. } if graph.reads_stack() => Some((index, f32::MAX, Op::Graph)),
+            EffectKind::Graph { graph, .. } if graph.reads_stack() && channel.is_none_or(|c| graph.output_for(c).is_some()) => {
+                Some((index, f32::MAX, Op::Graph))
+            }
             _ => None,
         },
     )
@@ -776,6 +778,11 @@ fn holds_anchor(p: &Project, id: LayerId, depth: usize) -> bool {
             (!l.is_group() && l.content_effects.iter().any(|e| e.visible && matches!(e.kind, EffectKind::Anchor)))
                 || l.children().iter().any(|c| holds_anchor(p, *c, depth + 1))
         })
+}
+
+/// Hidden layers still need fields when their anchors can be read by the measured stack.
+fn contributes_fields(project: &Project, id: LayerId) -> bool {
+    project.layers.get(&id).is_some_and(|layer| layer.visible) || project.rules.blend.is_measured() && holds_anchor(project, id, 0)
 }
 
 /// Layers of `list` in drawing order (bottom → top, folder and instanced folder contents after
@@ -1262,6 +1269,10 @@ fn graph_region(
         Job::Mask(_) => None,
         Job::Content(c) => Some(c),
     };
+    let trace = inp.graphs.cook_trace();
+    if let Some(emit) = &trace {
+        emit(format!("Preparing {w}×{h} stack inputs for graph {:?} ({})", graphs::trace_name(&graph.name), own.map_or("mask", Channel::label)));
+    }
     let comps = if own.is_some() { 4 } else { 1 };
     let anchors: Vec<(LayerId, Channel)> = graph
         .inputs
@@ -1376,6 +1387,9 @@ fn graph_region(
         given.push((*k, to_side(image)));
     }
     let use_ = GraphUse { set: inp.ts, id: effect.id, channel: own };
+    if let Some(emit) = &trace {
+        emit(format!("Stack inputs ready for graph {:?} ({})", graphs::trace_name(&graph.name), own.map_or("mask", Channel::label)));
+    }
     let cooked = inp.graphs.cook_for(use_.clone(), graph, &env, &given);
     // a cook that failed now (none, or the one the use read last) may be found later: not kept for other blocks
     let exact = !inp.graphs.has_problem(&use_);
@@ -1680,6 +1694,9 @@ fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32
     prepare_graphs(inp, channels, &order);
 
     for id in order {
+        if !contributes_fields(inp.project, id) {
+            continue;
+        }
         let Some(layer) = inp.project.content_layer(id) else { continue };
 
         if let Some(mask) = layer_mask(inp.project, id).filter(|mask| mask.enabled && neighbourhood(&mask.effects, working_width).is_some())
@@ -1746,7 +1763,12 @@ pub fn prepare_texture_set_graphs(inp: &Inputs) {
     let channels = set.channel_list();
     let mut order = Vec::new();
     draw_order(inp.project, &set.stack, 0, &mut order);
-    let reads_stack = order.iter().filter_map(|&id| inp.project.content_layer(id)).flat_map(Layer::graphs).any(GraphRef::reads_stack);
+    let reads_stack = order
+        .iter()
+        .filter(|&&id| contributes_fields(inp.project, id))
+        .filter_map(|&id| inp.project.content_layer(id))
+        .flat_map(Layer::graphs)
+        .any(GraphRef::reads_stack);
     if reads_stack {
         let tiles = all_tiles(inp.gbuf.width, inp.gbuf.height);
         neighbourhood_fields(inp, &channels, &tiles);
@@ -4017,6 +4039,28 @@ mod tests {
         let mut out = Composite::new(&f.project.texture_sets[0].channel_list(), 64);
         composite_tiles(&inp, &mut out, &all_tiles(64, 64));
         out
+    }
+
+    #[test]
+    fn prepares_only_visible_graph_filter_outputs() {
+        let mut graphs = GraphStore::default();
+        let text = "size 64\nnode 1 input idx=0\nnode 2 invert in=@1\noutput result 2\n";
+        let mut filter = GraphRef::new(graphs.add_text(text), "Invert");
+        filter.inputs.insert(0, GraphInput::Stack { channel: None });
+        filter.outputs.insert(Channel::BaseColor, "result".into());
+
+        let mut f = fixture();
+        let id = fill_layer(&mut f.project, [0.25; 3], 0.3);
+        let effect = content_fx(&mut f, id, EffectKind::Graph { graph: filter, projection: Projection::default() });
+        f.project.layer_mut(id).unwrap().visible = false;
+        run_with(&f, &graphs);
+        assert_eq!(graphs.renders(), 0);
+
+        f.project.layer_mut(id).unwrap().visible = true;
+        let out = run_with(&f, &graphs);
+        assert!(close(out.value(Channel::Roughness, 5, 5), [0.3; 3]));
+        assert!(graphs.use_cook_key(&GraphUse { set: 0, id: effect, channel: Some(Channel::BaseColor) }).is_some());
+        assert!(graphs.use_cook_key(&GraphUse { set: 0, id: effect, channel: Some(Channel::Roughness) }).is_none());
     }
 
     #[test]
