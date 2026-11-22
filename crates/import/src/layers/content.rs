@@ -328,6 +328,9 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
     /// Places a compiled graph's use writing `channels`.
     fn graph_use(&mut self, g: GraphUse, channels: &[Channel], blend: Option<&ResolvedBlend>, visible: bool) {
         let mut e = effect(self.ids.alloc(), "", g.effect, visible);
+        if matches!(e.kind, EffectKind::Filter(_)) {
+            e.channels = channels.to_vec();
+        }
         if let Some(b) = blend {
             e.blend = b.mode();
             e.opacity = b.opacity;
