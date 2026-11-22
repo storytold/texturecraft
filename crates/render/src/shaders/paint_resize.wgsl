@@ -25,8 +25,22 @@ fn source_word(at: vec2<u32>, word: u32) -> u32 {
     return tiles[addr + (local.y * 64u + local.x) * params.format.x + word];
 }
 
-fn channels(word: u32) -> vec2<f32> {
-    return vec2<f32>(f32(word & 65535u), f32(word >> 16u));
+const ONE = 65536u;
+const LOW = ONE - 1u;
+
+fn channels(word: u32) -> vec2<u32> {
+    return vec2(word & LOW, word >> 16u);
+}
+
+// Horizontal intermediates have 16 fractional bits. Split them into high/low words
+// before the vertical blend and round once, as in TileImage::resampled_tile.
+fn bilinear(a: vec2<u32>, b: vec2<u32>, c: vec2<u32>, d: vec2<u32>, w: vec2<u32>) -> vec2<u32> {
+    let top = a * (ONE - w.x) + b * w.x;
+    let bottom = c * (ONE - w.x) + d * w.x;
+    let bits = vec2(16u);
+    let high = (top >> bits) * (ONE - w.y) + (bottom >> bits) * w.y;
+    let low = (top & vec2(LOW)) * (ONE - w.y) + (bottom & vec2(LOW)) * w.y;
+    return (high + (low >> bits) + (ONE / 2u)) >> bits;
 }
 
 @compute @workgroup_size(8, 8)
@@ -39,13 +53,19 @@ fn resize(@builtin(global_invocation_id) id: vec3<u32>) {
         for (var i = 0u; i < params.format.x; i++) { output[offset + i] = 0u; }
         return;
     }
-    let source = max((vec2<f32>(pixel) + 0.5) * vec2<f32>(params.sizes.xy) / vec2<f32>(params.sizes.zw) - 0.5, vec2(0.0));
-    let base = vec2<u32>(source);
-    let w = fract(source);
+    let dest_size = params.sizes.zw;
+    let denominator = 2u * dest_size;
+    let center = max((2u * pixel + 1u) * params.sizes.xy, dest_size) - dest_size;
+    let base = center / denominator;
+    let w = ((center % denominator) * ONE + dest_size) / denominator;
     for (var i = 0u; i < params.format.x; i++) {
-        let top = channels(source_word(base, i)) * (1.0 - w.x) + channels(source_word(base + vec2(1u, 0u), i)) * w.x;
-        let bottom = channels(source_word(base + vec2(0u, 1u), i)) * (1.0 - w.x) + channels(source_word(base + 1u, i)) * w.x;
-        let result = vec2<u32>(min(top * (1.0 - w.y) + bottom * w.y + 0.5, vec2(65535.0)));
+        let result = bilinear(
+            channels(source_word(base, i)),
+            channels(source_word(base + vec2(1u, 0u), i)),
+            channels(source_word(base + vec2(0u, 1u), i)),
+            channels(source_word(base + 1u, i)),
+            w,
+        );
         output[offset + i] = result.x | (result.y << 16u);
     }
 }
