@@ -4531,7 +4531,7 @@ fn compute_resident_grey(
 fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, input: impl Fn(&str) -> Option<GreyInput<'a>>) -> Option<ResidentGreyPass<'a>> {
     use crate::measured::{COMPILED_16_BIT, STEPS_16};
 
-    if ctx.size < 4096 || ctx.size != ctx.height || !steps.is_some_and(|s| s.fmt == COMPILED_16_BIT) || rolls(n) {
+    if ctx.size != ctx.height || !steps.is_some_and(|s| s.fmt == COMPILED_16_BIT) || rolls(n) {
         return None;
     }
     let value = |key, default| n.nums.get(key).copied().unwrap_or(default);
@@ -4542,7 +4542,7 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
     };
     if n.kind == "transform_matrix" {
         let (source, width) = source("in")?;
-        if !(2..ctx.size).contains(&width)
+        if width < 2
             || !ctx.size.is_power_of_two()
             || value("tile_x", 1.0) != 1.0
             || value("tile_y", 1.0) != 1.0
@@ -4555,12 +4555,19 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
         {
             return None;
         }
-        Some(ResidentGreyPass::Enlarge { source, side: ctx.size })
+        if ctx.size >= 4096 && width < ctx.size {
+            Some(ResidentGreyPass::Enlarge { source, side: ctx.size })
+        } else if matches!(source, GreyInput::Device(_)) && (2..width).contains(&ctx.size) {
+            Some(ResidentGreyPass::Reduce { source, side: ctx.size })
+        } else {
+            None
+        }
     } else {
         let (foreground, fg_width) = source("fg")?;
         let (background, bg_width) = source("bg")?;
         let (mode, opacity) = (value("mode", 0.0) as u32, value("opacity", 1.0));
-        if !(32..=34).contains(&mode)
+        if ctx.size < 4096
+            || !(32..=34).contains(&mode)
             || value("alpha_mode", 1.0) as u32 != 1
             || !opacity.is_finite()
             || n.ins.contains_key("mask")
