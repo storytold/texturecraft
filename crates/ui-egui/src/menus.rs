@@ -463,6 +463,16 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         return;
     }
 
+    if crate::import_ui::active(app) {
+        // The import owns the input. Keep the Quit shortcut, leaving the other keys for its
+        // controls and camera instead of dispatching them to the previous project.
+        let quit = ctx.input(|input| app.bindings.dispatch(&mut input.clone()).iter().any(|id| id == "ui.quit"));
+        if quit {
+            invoke(app, ctx, "ui.quit");
+        }
+        return;
+    }
+
     // The dispatcher reads clipboard events as shortcuts; a pasted image also means Ctrl+V
     // Unless bound, Shift+Delete and Shift+Insert become Ctrl+X and Ctrl+V
     ctx.input_mut(|input| {

@@ -159,7 +159,8 @@ struct PreviewProgress {
 pub struct ImportPreview {
     pub mesh: Arc<texturecraft_geom::Mesh>,
     pub mesh_id: u64,
-    pub material: usize,
+    pub materials: Vec<usize>,
+    pub texture_set: usize,
     pub camera: texturecraft_geom::OrbitCamera,
     pub normal_format: texturecraft_core::NormalFormat,
     pub spec_gloss: bool,
@@ -214,7 +215,8 @@ impl ImportProgress {
             *out = Some(ImportPreview {
                 mesh: Arc::new(preview.mesh),
                 mesh_id: crate::session::next_mesh_id(),
-                material: preview.material,
+                materials: preview.materials,
+                texture_set: preview.texture_set,
                 camera,
                 normal_format: preview.normal_format,
                 spec_gloss,

@@ -1180,7 +1180,9 @@ impl eframe::App for TextureCraftApp {
         if import_ui::show_preview(self, ui) {
             windows::unsaved(self, &ctx);
             #[cfg(not(target_arch = "wasm32"))]
-            self.file_dialogs.show_pending(frame);
+            if self.ui.windows.unsaved.is_some() {
+                self.file_dialogs.show_pending(frame);
+            }
             self.finish_ui_frame(started_ms);
             return;
         }
@@ -1218,7 +1220,9 @@ impl eframe::App for TextureCraftApp {
         updates_ui::show(self, &ctx);
         toasts(self, &ctx);
         #[cfg(not(target_arch = "wasm32"))]
-        self.file_dialogs.show_pending(frame);
+        if !import_ui::active(self) || self.ui.windows.unsaved.is_some() {
+            self.file_dialogs.show_pending(frame);
+        }
 
         self.finish_ui_frame(started_ms);
     }

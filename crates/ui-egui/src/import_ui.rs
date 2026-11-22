@@ -272,6 +272,7 @@ fn running(app: &mut TextureCraftApp, ctx: &egui::Context, state: ImportUi, prev
             return match app.session.apply_import(out) {
                 Ok(_) => {
                     app.clear_project_jobs();
+                    app.ui.windows.export = false;
                     if let Some(camera) = camera {
                         app.session.camera = camera;
                     }
@@ -402,7 +403,7 @@ impl PreviewView {
                 spec_gloss: self.source.spec_gloss,
                 ..Shade::default()
             },
-            visible: vec![true],
+            visible: vec![true; self.source.materials.len()],
             overlay: Vec::new(),
         };
         let upload = self.lost.swap(false, Ordering::AcqRel).then(|| crate::gpu::SceneSync::import_preview(&self.source));
@@ -441,4 +442,90 @@ fn failed(ctx: &egui::Context, file: String, step: Step, error: String) -> Optio
         });
     });
     (!close).then_some(ImportUi::Failed { file, step, error })
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use egui::{Event, Modifiers, PointerButton};
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable as _;
+
+    #[test]
+    fn an_import_preview_owns_input_over_the_previous_projects_export_window() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut previous = texturecraft_engine::sample_session(128, 64).unwrap();
+        previous.modified = false;
+        let original_camera = previous.camera;
+        let project_id = previous.project_id;
+        let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, previous));
+        h.state_mut().ui.prefs.language = "en".into();
+        h.state_mut().ui.windows.export = true;
+        h.run_steps(5);
+        assert!(h.query_by_label("Reset all").is_some());
+
+        h.state_mut().file_dialogs.set_override(Some(Box::new(|_| crate::file_dialogs::Answer::Paths(vec!["second.spp".into()]))));
+        let ctx = h.ctx.clone();
+        for abort in [true, false] {
+            assert!(crate::windows::file_action(h.state_mut(), &ctx, "file.importProject"));
+            h.run_steps(4);
+            assert!(matches!(h.state().import, Some(ImportUi::Notice { .. })));
+            assert!(h.query_by_label("Reset all").is_none(), "the previous project's Export window stays behind the import");
+
+            // Simulate the worker publishing the saved view and waiting for the editable result.
+            let progress = Arc::new(ImportProgress::new());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let started = ctx.input(|i| i.time);
+            let app = h.state_mut();
+            let source = ImportPreview {
+                mesh: app.session.mesh.clone(),
+                mesh_id: app.session.mesh_id,
+                materials: app.session.doc.project.texture_sets.iter().map(|set| set.material).collect(),
+                texture_set: 0,
+                camera: original_camera,
+                normal_format: Default::default(),
+                spec_gloss: false,
+                overview: texturecraft_engine::MaterialOverview { size: (64, 64), maps: Vec::new() },
+            };
+            app.import = Some(ImportUi::Running { file: "second.spp".into(), path: None, progress: progress.clone(), rx, started });
+            app.import_presentation = Some(Presentation {
+                origin_project: project_id,
+                preview: Some(PreviewView { source, camera: original_camera, lost: Arc::new(AtomicBool::new(true)) }),
+            });
+            h.run_steps(4);
+
+            let center = h.get_by_role_and_label(egui::Role::Image, "Stored material preview").rect().center();
+            let end = center + egui::vec2(100.0, 20.0);
+            h.hover_at(center);
+            h.run_steps(2);
+            h.event(Event::PointerButton { pos: center, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+            h.run_steps(2);
+            h.hover_at(end);
+            h.run_steps(2);
+            h.event(Event::PointerButton { pos: end, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+            h.run_steps(2);
+            let orbit = h.state().import_presentation.as_ref().unwrap().preview.as_ref().unwrap().camera;
+            assert_ne!(orbit.yaw, original_camera.yaw, "pointer drag orbits the preview after the native picker and Export window");
+            assert_eq!(h.state().session.camera, original_camera, "the previous project's camera is intact");
+
+            if abort {
+                h.get_by_label("Cancel").click();
+                h.run_steps(2);
+                assert!(progress.is_cancelled());
+            }
+            let mut converted = texturecraft_engine::sample_session(128, 64).unwrap();
+            converted.doc.project.name = "Second project".into();
+            tx.send(Ok(ImportOutput::from_session(converted))).unwrap();
+            h.run_steps(4);
+            assert!(h.state().import.is_none());
+            if abort {
+                assert_eq!(h.state().session.project_id, project_id, "Cancel keeps the previous project");
+                assert!(h.query_by_label("Reset all").is_some(), "Cancel returns to the previous project's Export window");
+            } else {
+                assert_eq!(h.state().session.project().name, "Second project");
+                assert_eq!(h.state().session.camera, orbit, "completing the import keeps the angle chosen in the preview");
+                assert!(h.query_by_label("Reset all").is_none(), "the previous project's Export window stays closed");
+            }
+        }
+    }
 }

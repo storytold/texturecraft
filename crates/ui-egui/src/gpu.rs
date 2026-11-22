@@ -115,12 +115,21 @@ impl Drop for CompositeWork {
 impl SceneSync {
     pub(crate) fn import_preview(preview: &texturecraft_engine::import_cmds::ImportPreview) -> Self {
         let mesh_id = preview.mesh_id;
+        let sets = preview
+            .materials
+            .iter()
+            .enumerate()
+            .map(|(set, &material)| {
+                let size = if set == preview.texture_set { preview.overview.size } else { (1, 1) };
+                (size, material)
+            })
+            .collect();
         Self {
             mesh: Some((preview.mesh.clone(), mesh_id)),
             mesh_id,
-            sets: Some((vec![(preview.overview.size, preview.material)], preview.mesh.materials.len().max(1), 0)),
+            sets: Some((sets, preview.mesh.materials.len().max(1), 0)),
             env: Some((texturecraft_engine::core::DisplaySettings::default().environment, None)),
-            overview: Some((0, preview.overview.clone())),
+            overview: Some((preview.texture_set, preview.overview.clone())),
             release_quick_mask: true,
             ..Self::default()
         }

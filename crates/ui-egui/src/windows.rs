@@ -14,6 +14,14 @@ use crate::theme::Tokens;
 use crate::widgets::primary_button;
 
 pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    if crate::import_ui::active(app) {
+        if app.ui.windows.unsaved.is_some() {
+            unsaved(app, ctx);
+        } else {
+            crate::import_ui::show(app, ctx);
+        }
+        return;
+    }
     crate::new_project_advanced::show(app, ctx);
     about(app, ctx);
     crate::settings_window::show(app, ctx);

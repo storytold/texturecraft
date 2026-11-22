@@ -66,7 +66,10 @@ pub struct Imported {
 /// A reduced, view-only material computed from the file's saved texture channels.
 pub struct StoredPreview {
     pub mesh: Mesh,
-    pub material: usize,
+    /// Material slots for all sets, in the same order as the import.
+    pub materials: Vec<usize>,
+    /// The set whose saved channels are ready. The remaining sets use neutral textures.
+    pub texture_set: usize,
     pub camera: Option<texturecraft_core::Camera>,
     pub normal_format: NormalFormat,
     pub composite: Composite,
@@ -289,44 +292,67 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         }
     }
     let count = binding.sets.len();
-    let preview = hooks.preview.filter(|_| count == 1 && !options.translate_only);
-    let mut library = None;
-    if preview.is_none() && options.graphs == crate::GraphMode::Decompile {
-        (hooks.progress)(0.08, Step::ReadingFile);
-        library = graph_library(file, options, hooks, &mut report)?;
+    let sets = || {
+        binding.sets.iter().enumerate().map(|(i, source)| {
+            let span = (0.1 + 0.8 * i as f32 / count as f32, 0.8 / count as f32);
+            let project_set = source.record.scene_uid.filter(|_| source.in_document).and_then(|uid| model.as_ref()?.texture_set(uid));
+            SetContext {
+                file,
+                source,
+                project_set,
+                mesh: &mesh,
+                polygon_starts: &polygon_starts,
+                images: &images,
+                options,
+                syscoord,
+                bake: bake_ini.as_ref(),
+                normalization,
+                cache: &cache_entries,
+                hooks: &*hooks,
+                graphs: None,
+                index: (i + 1, count),
+                span,
+            }
+        })
+    };
+    let mut preview = hooks.preview.filter(|_| !options.translate_only).map(|publish| {
+        let mesh = &mesh;
+        let materials = binding.sets.iter().map(|source| source.slot).collect();
+        let camera = project.cameras.iter().find(|camera| camera.name == crate::cameras::SAVED_VIEW).cloned();
+        let normal_format = project.normal_format;
+        move |texture_set, composite| publish(StoredPreview { mesh: mesh.clone(), materials, texture_set, camera, normal_format, composite })
+    });
+    let mut early = None;
+    if preview.is_some()
+        && let Some(ctx) = sets().find(|ctx| ctx.source.cache_set.is_some() && ctx.project_set.is_none_or(|set| !set.uses_uv_tiles))
+    {
+        let i = ctx.index.0 - 1;
+        let mut stored = read_stored_channels(&ctx, &mut report, true)?;
+        if let Some(composite) = stored.composite.take()
+            && let Some(publish) = preview.take()
+        {
+            publish(i, composite);
+        }
+        early = Some((i, stored));
     }
+    if options.graphs == crate::GraphMode::Decompile {
+        (hooks.progress)(0.08, Step::ReadingFile);
+    }
+    let library = graph_library(file, options, hooks, &mut report)?;
     // the finished sets' layer pixels, out of memory until the import returns
     let mut finished = crate::pixel_spill::PixelSpill::default();
     let mut finished_baked = crate::pixel_spill::BakedSpill::default();
-    for (i, source) in binding.sets.iter().enumerate() {
+    for (i, mut ctx) in sets().enumerate() {
         hooks.check()?;
-        let span = (0.1 + 0.8 * i as f32 / count as f32, 0.8 / count as f32);
-        (hooks.progress)(span.0, Step::ConvertingSet { set: i + 1, of: count });
-        let project_set = source.record.scene_uid.filter(|_| source.in_document).and_then(|uid| model.as_ref()?.texture_set(uid));
-        let mut ctx = SetContext {
-            file,
-            source,
-            project_set,
-            mesh: &mesh,
-            polygon_starts: &polygon_starts,
-            images: &images,
-            options,
-            syscoord,
-            bake: bake_ini.as_ref(),
-            normalization,
-            cache: &cache_entries,
-            hooks: &*hooks,
-            graphs: None,
-            index: (i + 1, count),
-            span,
+        (hooks.progress)(ctx.span.0, Step::ConvertingSet { set: i + 1, of: count });
+        let StoredChannels { cache, resolution, composite } = match early.take_if(|(index, _)| *index == i) {
+            Some((_, stored)) => stored,
+            None => read_stored_channels(&ctx, &mut report, preview.is_some())?,
         };
-        let StoredChannels { cache, resolution, composite } = read_stored_channels(&ctx, &mut report, preview.is_some())?;
-        if let Some(publish) = preview {
-            if let Some(composite) = composite {
-                let camera = project.cameras.iter().find(|camera| camera.name == crate::cameras::SAVED_VIEW).cloned();
-                publish(StoredPreview { mesh: mesh.clone(), material: source.slot, camera, normal_format: project.normal_format, composite });
-            }
-            library = graph_library(file, options, hooks, &mut report)?;
+        if let Some(composite) = composite
+            && let Some(publish) = preview.take()
+        {
+            publish(i, composite);
         }
         ctx.graphs = library.as_ref();
         let summary = build_set(&ctx, &mut project, &mut imported, &mut report, cache, resolution)?;
