@@ -184,6 +184,23 @@ fn polygon_fill_and_color_picker() {
 }
 
 #[test]
+fn color_picker_reads_material_before_cpu_tiles_are_composited() {
+    use texturecraft_engine::geom::glam::Vec2;
+
+    let mut s = session();
+    let cpu_revision = s.caches[0].revision;
+    let center = Vec2::new(200.0, 200.0);
+    assert!(s.color_pick(center, s.viewport).unwrap()[&Channel::BaseColor][1] > 0.4);
+    execute(&mut s, "layer.add.fill", &json!({"color": [0.9, 0.1, 0.05]})).unwrap();
+
+    let picked = s.color_pick(center, s.viewport).unwrap()[&Channel::BaseColor];
+
+    assert!(picked[0] > 0.8 && picked[1] < 0.2, "{picked:?}");
+    assert_eq!(s.tool.values[&Channel::BaseColor], picked);
+    assert_eq!(s.caches[0].revision, cpu_revision, "a pick leaves viewport updates on the chosen backend");
+}
+
+#[test]
 fn polygon_fill_boxes_survive_hostile_params() {
     let hostile = [
         json!({"x0": 1e30, "y0": -1e30, "x1": f64::MAX, "y1": 0, "viewport": [1e9, 1e9]}),
@@ -547,6 +564,47 @@ fn committed_strokes_settle_to_the_full_composite() {
         execute(&mut s, "edit.undo", &Value::Null).unwrap();
     }
     assert_eq!(full(&mut s), original);
+}
+
+#[test]
+fn cancelling_a_mask_stroke_does_not_reuse_its_paint_margin() {
+    use texturecraft_engine::StackTarget;
+    use texturecraft_engine::core::LayerId;
+    use texturecraft_engine::geom::glam::Vec2;
+
+    let mut s = Session::new_project("t", primitives::plane(1.0, 1), "builtin:plane", None, 256).unwrap();
+    execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+    let plain = s.selected_layer().unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+    let blurred = s.selected_layer().unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let filter = execute(&mut s, "effect.add.filter", &json!({"filter": "blur", "radius": 32.0})).unwrap();
+    let filter = LayerId(filter["effect"].as_u64().unwrap());
+    s.tool.brush.size = 0.01;
+    s.tool.mask_value = 1.0;
+    s.update();
+
+    let uv = Vec2::new(58.0 / 256.0, 96.0 / 256.0);
+    execute(&mut s, "layer.select", &json!({"layer": plain.0})).unwrap();
+    s.target = StackTarget::Mask;
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    s.update();
+    s.cancel_stroke();
+    s.update();
+
+    execute(&mut s, "layer.select", &json!({"layer": blurred.0})).unwrap();
+    s.target = StackTarget::Effect(filter);
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    assert_eq!(s.stroke_tiles(), 1, "the brush stays on one side of the tile boundary");
+    s.end_stroke().unwrap();
+    s.update();
+    let incremental = s.caches[0].composite.clone();
+
+    let recomposited = full(&mut s);
+    assert!(recomposited.value(Channel::BaseColor, 64, 96)[0] > 0.5, "the blur reaches the neighbouring tile");
+    assert_eq!(incremental.value(Channel::BaseColor, 64, 96), recomposited.value(Channel::BaseColor, 64, 96));
+    assert!(incremental == recomposited, "the complete cache matches a full recomposite");
 }
 
 /// A resize prepared from a snapshot and applied later matches the command, keeps edits made

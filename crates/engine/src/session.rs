@@ -189,6 +189,10 @@ impl SetCache {
         self.material_revision = self.material_revision.wrapping_add(1);
         self.dirty.extend(self.covered_tiles.iter().copied());
     }
+
+    pub(crate) fn invalidate_paint_margin(&mut self) {
+        self.paint_margin = None;
+    }
 }
 
 /// Active tool.
@@ -973,7 +977,7 @@ impl Session {
         for (i, ts) in sets.iter().enumerate() {
             match self.caches.get_mut(i) {
                 Some(c) if c.size == ts.size() => {
-                    c.paint_margin = None;
+                    c.invalidate_paint_margin();
                     c.finished_dab = None;
                     let (want, scales) = (ts.channel_list(), ts.block_scales());
                     if c.composite.channels.keys().copied().collect::<Vec<_>>() != want || c.composite.block_scales != scales {
