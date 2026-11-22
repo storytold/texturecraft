@@ -40,31 +40,51 @@ impl Prog {
         }
         let code = self.code();
         let count = code.insts.len();
+        let mut frame = self.frame();
+        self.bind(env, &mut frame);
+        let root_index = code.out as usize;
+        let root = code.insts.get(root_index)?;
+        // Some compiled functions initialise locals before the expression that varies per pixel.
+        // Run that initialiser once in the ordinary VM and bind subsequent reads as uniforms.
+        let (out, initialised) = if root.op == Op::Seq && *code.floor.get(root_index)? > FLOOR_ENV {
+            let [initialiser, out, ..] = root.ins;
+            if !uniform_initialiser(code, initialiser) {
+                return None;
+            }
+            self.uniform_value(env, &mut frame, initialiser as usize)?;
+            (out, true)
+        } else {
+            (code.out, false)
+        };
+        let uniform_register = |index: usize| {
+            code.floor.get(index).is_some_and(|&floor| floor <= FLOOR_ENV) || (initialised && code.insts.get(index).is_some_and(|inst| inst.op == Op::Get))
+        };
         let mut need = vec![false; count];
-        let mut todo = vec![code.out];
+        let mut todo = vec![out];
         while let Some(index) = todo.pop() {
             let index = index as usize;
             let visit = need.get_mut(index)?;
-            if std::mem::replace(visit, true) || *code.floor.get(index)? <= FLOOR_ENV {
+            if std::mem::replace(visit, true) || uniform_register(index) {
                 continue;
             }
             todo.extend(code.insts.get(index)?.ins.into_iter().filter(|&i| i != NONE));
         }
 
-        let mut frame = self.frame();
-        self.bind(env, &mut frame);
         let mut shader = PixelShader { source: String::new(), uniforms: Vec::new(), images: Vec::new(), grey: false };
         let mut bindings = Vec::new();
         let mut types = vec![None; count];
-        let result = self.type_of(code.out as usize, &mut types).ok()?;
+        let result = self.type_of(out as usize, &mut types).ok()?;
         let mut body = String::new();
         for (index, &used) in need.iter().enumerate() {
             if !used {
                 continue;
             }
             let pin = self.type_of(index, &mut types).ok()?;
-            let expression = if *code.floor.get(index)? <= FLOOR_ENV {
+            let expression = if uniform_register(index) {
                 let value = self.uniform_value(env, &mut frame, index)?;
+                if code.insts.get(index)?.op == Op::Get && value.pin() != pin {
+                    return None;
+                }
                 let slot = shader.uniforms.len();
                 shader.uniforms.push(uniform(value)?);
                 let read = format!("parameters[{}]", slot + 1);
@@ -101,7 +121,7 @@ impl Prog {
             writeln!(shader.source, "@group(0) @binding({}) var input_{slot}: texture_2d<{sample_type}>;", slot + 2).ok()?;
             writeln!(shader.source, "fn sample_{slot}(uv: vec2f, mode: u32) -> vec4f {{ return {sample}; }}").ok()?;
         }
-        let last = format!("r{}", code.out);
+        let last = format!("r{out}");
         let (ty, expression) = match result {
             Pin::Bool => ("f32", format!("select(0.0, 1.0, {last})")),
             Pin::Float | Pin::Int => ("f32", last),
@@ -114,6 +134,25 @@ impl Prog {
         writeln!(shader.source, "fn evaluate_pixel(pos: vec2f) -> {ty} {{\n{body}    return {expression};\n}}").ok()?;
         Some(shader)
     }
+}
+
+/// The whole prefix has to be independent of the current pixel and leave only local values for the shader body.
+/// The shader expression emitter separately rejects writes and other effects in that body.
+fn uniform_initialiser(code: &Code, root: u32) -> bool {
+    let mut seen = vec![false; code.insts.len()];
+    let mut todo = vec![root];
+    while let Some(index) = todo.pop() {
+        let Some(visited) = seen.get_mut(index as usize) else { return false };
+        if std::mem::replace(visited, true) {
+            continue;
+        }
+        let Some(inst) = code.insts.get(index as usize) else { return false };
+        if matches!(inst.op, Op::Pos | Op::SampleGray | Op::SampleColor | Op::Stat(_) | Op::Random | Op::Loop | Op::Call) {
+            return false;
+        }
+        todo.extend(inst.ins.into_iter().filter(|&i| i != NONE));
+    }
+    true
 }
 
 #[derive(Clone, Copy)]
