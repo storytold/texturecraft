@@ -13,6 +13,8 @@ use std::time::SystemTime;
 const TRIM_EVERY: u64 = 512 << 20;
 /// That share, as a divisor of the limit.
 const TRIM_SHARE: u64 = 16;
+/// Two cache handles can write the same entry while a cancelled import is winding down.
+static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// What this process did with the store.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +39,6 @@ pub struct DiskStore {
     written_bytes: AtomicU64,
     read_bytes: AtomicU64,
     since_trim: AtomicU64,
-    temporaries: AtomicU64,
 }
 
 impl DiskStore {
@@ -53,7 +54,6 @@ impl DiskStore {
             read_bytes: AtomicU64::new(0),
             // the first write looks at the folder: another process may have filled it
             since_trim: AtomicU64::new(TRIM_EVERY),
-            temporaries: AtomicU64::new(0),
         }
     }
 
@@ -113,7 +113,7 @@ impl DiskStore {
         if std::fs::create_dir_all(dir).is_err() {
             return;
         }
-        let unique = self.temporaries.fetch_add(1, Ordering::Relaxed);
+        let unique = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
         let temporary = path.with_extension(format!("{}.{unique}.{TEMPORARY_EXTENSION}", std::process::id()));
         if std::fs::write(&temporary, &stored).is_err() || std::fs::rename(&temporary, &path).is_err() {
             let _ = std::fs::remove_file(&temporary);

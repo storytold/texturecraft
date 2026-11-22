@@ -319,9 +319,13 @@ impl ImportTask {
     }
 
     /// Skip the optional comparison with the stored reference for an interactive open.
-    /// Evaluate the imported graphs before preparing the viewport.
+    /// Reuse completed graph renders across native imports, then prepare the viewport.
     pub fn for_interactive_open(mut self) -> ImportTask {
         self.options.measure &= self.options.original_correction || self.options.original_on_top;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.result_cache.is_none() {
+            self.result_cache = crate::result_cache::ResultCache::for_interactive_open();
+        }
         self
     }
 

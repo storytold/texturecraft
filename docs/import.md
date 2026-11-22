@@ -191,11 +191,11 @@ lays the strokes again from the saved project alone, to the same pixels. Images 
 cannot be laid again); graphs it paints are kept by reference, their texts saved with the project. A record that cannot
 be read stays as its bytes and is saved unchanged; older builds skip the entries.
 
-Across documents, an import can also keep its cooks in a result cache folder (`resultCache`, CLI
-`--result-cache`; native builds only): the graph store looks there by cook key before rendering and puts each
-finished render there (`compose::graphs::kept`, a `KeptCooks` the engine backs with `texturecraft-result-cache`,
-L0: entries checked by key, length and checksum, the folder kept under a limit, least recently used out first).
-A second import of the same project, or of another one using the same graph the same way, reads the render.
+Native interactive imports reuse graph renders from the user's cache directory. The command and CLI can use a chosen
+folder with `resultCache` and `--result-cache`. The graph store looks up each cook by key before rendering and keeps the
+completed result. Entries are checked by key, length and checksum. The default limit is 20 GiB, with least recently used
+entries evicted first. A second import reuses renders when the graph, inputs and resolution match, including across
+projects.
 
 `import.library.list` and `import.library.add` (`engine::import_library_cmds`, over `import::library`) offer what
 a project file brings for the user's asset library (brushes, bitmap alphas, stencils, textures, the environment

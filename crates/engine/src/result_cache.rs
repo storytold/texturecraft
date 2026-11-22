@@ -1,6 +1,7 @@
 //! The import's result cache: graph cooks kept in a folder on disk (`texturecraft-result-cache`) and reused by the
 //! next import that renders the same graph with the same values, inputs and side, whichever project it is in. Off
-//! unless asked for (`file.importProject` `resultCache`, CLI `import --result-cache <dir>`); native builds only.
+//! by default in the command and CLI, which take `resultCache` and `--result-cache` respectively.
+//! Interactive imports use the platform's cache folder on native builds.
 //!
 //! A cook is found by its cook key (`compose::graphs::GraphStore::cook_key`: graph text, parameter values, seed,
 //! outputs, inputs by content, render side and the evaluator versions of the node kinds the graph uses), so a kept
@@ -20,6 +21,13 @@ pub struct ResultCache {
 }
 
 impl ResultCache {
+    /// The native app's bounded cache in the user's cache directory, when available.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn for_interactive_open() -> Option<Self> {
+        let folder = texturecraft_result_cache::Config::default_folder(&|name| std::env::var_os(name))?;
+        Some(Self { folder: folder.into_os_string().into_string().ok()?, limit_gb: None })
+    }
+
     /// From command params `resultCache` (a folder) and `resultCacheGb`; `None` when no folder is given.
     pub fn from_params(id: &str, p: &Value) -> Result<Option<ResultCache>> {
         let Some(folder) = p.get("resultCache").filter(|v| !v.is_null()) else {
