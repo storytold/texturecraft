@@ -1956,7 +1956,30 @@ pub(crate) struct GpuCompositor {
     paint_upload: Option<wgpu::Buffer>,
 }
 
+/// Lets an import worker prepare material pipelines without borrowing the viewport renderer.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct CompositePipelineWarmup {
+    device: wgpu::Device,
+    layout: wgpu::PipelineLayout,
+    pipelines: CompositePipelines,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CompositePipelineWarmup {
+    pub fn prepare(&self, program: &CompositeProgram) -> Result<(), String> {
+        if !program.is_neutral() {
+            self.pipelines.get(&self.device, &self.layout, program)?;
+        }
+        Ok(())
+    }
+}
+
 impl GpuCompositor {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn warmup(&self, device: &wgpu::Device) -> CompositePipelineWarmup {
+        CompositePipelineWarmup { device: device.clone(), layout: self.pipeline_layout.clone(), pipelines: self.pipelines.clone() }
+    }
+
     pub(crate) fn supports(device: &wgpu::Device) -> bool {
         let limits = device.limits();
         limits.max_storage_buffers_per_shader_stage >= 6
@@ -2437,7 +2460,7 @@ impl GpuCompositor {
                 self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::new(device));
             }
             self.pipelines.get(device, &self.pipeline_layout, program)
-        });
+        })?;
         let (coverage, surface, vertices, baked, curvature, id_bake) =
             time_composite(timing.as_deref_mut().map(|t| &mut t.scene_inputs), || -> Result<_, String> {
                 let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;

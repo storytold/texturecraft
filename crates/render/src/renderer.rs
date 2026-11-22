@@ -1724,6 +1724,23 @@ impl Renderer {
         self.composite_on_gpu_timed(device, queue, ts, program, None)
     }
 
+    /// Prepare the shared compositor layout before the import worker builds any shaders.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn composite_pipeline_warmup(&mut self, device: &wgpu::Device) -> Result<crate::gpu_composite::CompositePipelineWarmup, String> {
+        if !GpuCompositor::supports(device) {
+            return Err("GPU composition is unavailable on this adapter.".into());
+        }
+        match &self.compositor {
+            Some(compositor) => Ok(compositor.warmup(device)),
+            None => {
+                let compositor = crate::gpu_trace::scoped(device, "GPU material layout", || GpuCompositor::new(device))?;
+                let warmup = compositor.warmup(device);
+                self.compositor = Some(compositor);
+                Ok(warmup)
+            }
+        }
+    }
+
     /// Composite with optional host-side timings for the main viewport material.
     pub fn composite_on_gpu_timed(
         &mut self,

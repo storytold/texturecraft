@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::{
     ANCHOR_PUBLISH_LAYER, ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, PLACED_UV_PROJECTION,
@@ -195,63 +196,90 @@ impl Features {
     }
 }
 
+#[derive(Clone)]
 struct Variants {
     module: wgpu::ShaderModule,
     render: [Option<wgpu::ComputePipeline>; 2],
     prepare: [Option<wgpu::ComputePipeline>; 2],
 }
 
+#[derive(Clone)]
 pub(super) struct CompositePipelines {
     supports_curvature: bool,
     supports_id: bool,
-    variants: BTreeMap<Features, Variants>,
+    variants: Arc<Mutex<BTreeMap<Features, Variants>>>,
 }
 
 impl CompositePipelines {
     pub(super) fn new(supports_curvature: bool, supports_id: bool) -> Self {
-        Self { supports_curvature, supports_id, variants: BTreeMap::new() }
+        Self { supports_curvature, supports_id, variants: Arc::default() }
     }
 
     pub(super) fn get(
-        &mut self,
+        &self,
         device: &wgpu::Device,
         layout: &wgpu::PipelineLayout,
         program: &CompositeProgram,
-    ) -> (wgpu::ComputePipeline, Option<wgpu::ComputePipeline>) {
+    ) -> Result<(wgpu::ComputePipeline, Option<wgpu::ComputePipeline>), String> {
         let features = Features::of(program);
-        let supports_curvature = self.supports_curvature;
-        let supports_id = self.supports_id;
-        let variants = self.variants.entry(features).or_insert_with(|| Variants {
-            module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("tc_gpu_composite"),
-                source: wgpu::ShaderSource::Wgsl(features.source(supports_curvature, supports_id).into()),
-            }),
-            render: [None, None],
-            prepare: [None, None],
-        });
-        let module = &variants.module;
-        let pipeline = |entry, label, grouped| {
-            #[cfg(not(target_arch = "wasm32"))]
-            let started = std::time::Instant::now();
-            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(label),
-                layout: Some(layout),
-                module,
-                entry_point: Some(entry),
-                compilation_options: wgpu::PipelineCompilationOptions { constants: &features.constants(grouped), ..Default::default() },
-                cache: None,
-            });
-            #[cfg(not(target_arch = "wasm32"))]
-            log::debug!("GPU pipeline {label} compiled in {:.1} ms ({:?})", started.elapsed().as_secs_f64() * 1000.0, device.adapter_info().backend);
-            pipeline
-        };
         let grouped = program.groups.depth != 0;
-        let render = variants.render[usize::from(grouped)].get_or_insert_with(|| pipeline("compose", "tc_gpu_composite", grouped)).clone();
+        let render_index = usize::from(grouped);
         // Only material anchor capture needs to walk the group structure while preparing a source.
-        let grouped_capture = grouped && features.material_anchors;
-        let prepare = features.spatial.then(|| {
-            variants.prepare[usize::from(grouped_capture)].get_or_insert_with(|| pipeline("prepare_filter", "tc_spatial_source", grouped_capture)).clone()
+        let prepare_index = usize::from(grouped && features.material_anchors);
+        let existing = self.variants.lock().unwrap_or_else(PoisonError::into_inner).get(&features).cloned();
+        if let Some(variants) = &existing
+            && let Some(render) = &variants.render[render_index]
+            && (!features.spatial || variants.prepare[prepare_index].is_some())
+        {
+            return Ok((render.clone(), variants.prepare[prepare_index].clone()));
+        }
+        // Driver compilation may take seconds. Keep the cache lock out of this block so the
+        // viewport can use already prepared materials while another variant is built.
+        let variants = crate::gpu_trace::scoped(device, "GPU material pipelines", || {
+            let mut variants = existing.unwrap_or_else(|| Variants {
+                module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("tc_gpu_composite"),
+                    source: wgpu::ShaderSource::Wgsl(features.source(self.supports_curvature, self.supports_id).into()),
+                }),
+                render: [None, None],
+                prepare: [None, None],
+            });
+            let module = &variants.module;
+            let pipeline = |entry, label, grouped| {
+                #[cfg(not(target_arch = "wasm32"))]
+                let started = std::time::Instant::now();
+                let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(layout),
+                    module,
+                    entry_point: Some(entry),
+                    compilation_options: wgpu::PipelineCompilationOptions { constants: &features.constants(grouped), ..Default::default() },
+                    cache: None,
+                });
+                #[cfg(not(target_arch = "wasm32"))]
+                log::debug!("GPU pipeline {label} compiled in {:.1} ms ({:?})", started.elapsed().as_secs_f64() * 1000.0, device.adapter_info().backend);
+                pipeline
+            };
+            variants.render[render_index].get_or_insert_with(|| pipeline("compose", "tc_gpu_composite", grouped));
+            if features.spatial {
+                variants.prepare[prepare_index].get_or_insert_with(|| pipeline("prepare_filter", "tc_spatial_source", prepare_index != 0));
+            }
+            variants
         });
-        (render, prepare)
+        let variants = variants?;
+        let mut cache = self.variants.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = cache.entry(features).or_insert_with(|| variants.clone());
+        for (old, new) in entry.render.iter_mut().zip(variants.render) {
+            if old.is_none() {
+                *old = new;
+            }
+        }
+        for (old, new) in entry.prepare.iter_mut().zip(variants.prepare) {
+            if old.is_none() {
+                *old = new;
+            }
+        }
+        let render = entry.render[render_index].clone().ok_or("The GPU material pipeline is missing.")?;
+        Ok((render, entry.prepare[prepare_index].clone()))
     }
 }

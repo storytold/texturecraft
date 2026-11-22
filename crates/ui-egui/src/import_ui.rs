@@ -173,7 +173,7 @@ fn notice(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> O
     Some(start(app, ctx, task))
 }
 
-/// Convert and prepare CPU-only materials on the worker. The viewport schedules GPU materials as it opens.
+/// Convert, build the GPU material pipelines and prepare CPU-only materials on the worker.
 fn start(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> ImportUi {
     let (file, path) = (task.file_name(), task.source_path().map(str::to_string));
     let progress = ImportProgress::with_live_log(&file);
@@ -187,6 +187,18 @@ fn start(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> Im
     let progress = Arc::new(progress);
     let worker = progress.clone();
     let prefer_gpu = app.ui.prefs.gpu_compositing && app.gpu.as_ref().is_some_and(crate::gpu::GpuLink::supports_gpu_layers);
+    #[cfg(not(target_arch = "wasm32"))]
+    let warmup = app.render_state.as_ref().filter(|_| prefer_gpu).and_then(|state| {
+        let mut render = state.renderer.write();
+        let gpu = render.callback_resources.get_mut::<crate::gpu::GpuState>()?;
+        match gpu.renderer.composite_pipeline_warmup(&state.device) {
+            Ok(warmup) => Some(warmup),
+            Err(error) => {
+                progress.log_detail(format!("GPU pipeline warmup unavailable: {error}"));
+                None
+            }
+        }
+    });
     let task = task.with_graph_accelerator(app.material_graph_accelerator());
     let rx = crate::spawn_worker("texturecraft-import", move || {
         task.for_interactive_open().run_with_view_where(&worker, |session| {
@@ -197,8 +209,26 @@ fn start(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> Im
                         session.doc.graphs.warm_saved_uses(ts);
                     }
                     let (w, h) = session.caches[ts].size;
-                    let plan = if prefer_gpu { crate::gpu::GpuLink::plan_import_set(session, ts) } else { Err("GPU compositing is disabled.") };
-                    match plan {
+                    let plan = if prefer_gpu {
+                        crate::gpu::GpuLink::plan_import_set(session, ts).map_err(str::to_owned).and_then(|program| {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if let Some(warmup) = &warmup
+                                && !program.is_neutral()
+                                && !worker.is_cancelled()
+                            {
+                                worker.log_detail(format!("Preparing GPU material pipelines for texture set {}", ts + 1));
+                                let start = std::time::Instant::now();
+                                warmup.prepare(&program)?;
+                                worker.log_detail(format!("GPU material pipelines ready for texture set {} in {} ms", ts + 1, start.elapsed().as_millis()));
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            let _ = program;
+                            Ok(())
+                        })
+                    } else {
+                        Err("GPU compositing is disabled.".into())
+                    };
+                    match &plan {
                         Ok(()) => worker.log_detail(format!("Texture set {} at {w}×{h} uses GPU viewport", ts + 1)),
                         Err(reason) => worker.log_detail(format!("Texture set {} at {w}×{h} uses CPU view preparation ({reason})", ts + 1)),
                     }

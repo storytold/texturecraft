@@ -696,14 +696,16 @@ impl GpuLink {
     }
 
     /// Leave imported sets with a valid GPU plan for the viewport's first material update.
-    pub(crate) fn plan_import_set(session: &Session, ts: usize) -> Result<(), &'static str> {
+    pub(crate) fn plan_import_set(session: &Session, ts: usize) -> Result<CompositeProgram, &'static str> {
         let project = &session.doc.project;
         let cache = session.caches.get(ts).filter(|cache| !cache.covered_tiles.is_empty()).ok_or("The texture set has no covered tiles.")?;
         let empty = Default::default();
         let baked = session.doc.baked.get(&ts).unwrap_or(&empty);
-        let graphs = CompositeGraphs::new(&session.doc.graphs, baked, &session.images, cache.size);
-        CompositeProgram::try_compile_with_graphs(project, &session.doc.pixels, ts, None, None, Some(graphs))
-            .and_then(|mut program| program.set_baked_inputs(Some(baked)))
+        let graphs = CompositeGraphs::new(&session.doc.graphs, baked, &session.images, cache.size).saved_snapshot();
+        let mut program = CompositeProgram::try_compile_with_graphs(project, &session.doc.pixels, ts, None, None, Some(graphs))?;
+        program.set_surface_inputs(&session.mesh, &cache.gbuf, Some(baked))?;
+        program.set_tile_images(&session.images);
+        Ok(program)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
