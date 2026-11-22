@@ -1,19 +1,20 @@
-//! [`GraphLibrary`]: every compiled graph of a project's embedded packages, decompiled once per import into graph text
-//! (the reader's decompiler) and looked up by the graph name a procedural uses, of its own package version where the
-//! project holds several.
+//! [`GraphLibrary`]: compiled graphs referenced by imported texture sets, decompiled into graph text once per import
+//! and looked up by name and package version.
 //!
 //! The import decompiles by default ([`crate::ImportOptions::graphs`]): a placeholder stands for nothing and locks its
 //! layer, a decompiled graph computes. Keeping graphs as placeholders remains an option.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use texturecraft_core::{BakedMap, GraphValue};
 use texturecraft_import_reader::decode::graph_package::GraphPackage;
 use texturecraft_import_reader::decompile::{Decompiled, decompile};
 use texturecraft_import_reader::format_names::PACKAGE_SUFFIX;
-use texturecraft_import_reader::model::Procedural;
+use texturecraft_import_reader::model::{Procedural, ProjectEffect, ProjectSource, ProjectTextureSet};
 use texturecraft_import_reader::project::ProjectFile;
+
+use crate::{Cancel, ImportError};
 
 /// Nominal size of decompiled graphs (they render at the texture set's resolution).
 const NOMINAL: usize = 512;
@@ -51,28 +52,87 @@ struct GreyRenders {
 /// Most bytes of grey renders the library keeps for sharing; past it a render is made and not kept.
 const MAX_GREY_BYTES: usize = 1 << 30;
 
-impl GraphLibrary {
-    /// Decompiles every graph of the project's embedded packages, one package's bytes at a time. Packages or graphs
-    /// that cannot be read are left out (their uses stay placeholders).
-    pub fn from_project(project: &ProjectFile) -> GraphLibrary {
-        let mut lib = GraphLibrary::default();
-        for r in project.resources().iter().filter(|r| r.file_name.ends_with(PACKAGE_SUFFIX)) {
-            if let Ok(data) = project.read(&r.path) {
-                lib.add_package(r.file_name.trim_end_matches(PACKAGE_SUFFIX), &data);
+fn used_graph_names<'a>(sets: impl Iterator<Item = &'a ProjectTextureSet>) -> HashSet<&'a str> {
+    let mut names = HashSet::new();
+    let mut effects = Vec::new();
+    let mut sources = Vec::new();
+    let mut procedurals = Vec::new();
+
+    for layer in sets.flat_map(|set| set.layers.iter().flat_map(|layer| layer.walk())) {
+        effects.extend(&layer.content);
+        if let Some(mask) = &layer.mask {
+            effects.extend(&mask.effects);
+        }
+        while let Some(effect) = effects.pop() {
+            match effect {
+                ProjectEffect::Fill(fill) => sources.extend(&fill.sources),
+                ProjectEffect::Paint(paint) => {
+                    sources.extend(&paint.colors);
+                    sources.extend(&paint.alpha);
+                    sources.extend(paint.stencil.iter());
+                }
+                ProjectEffect::Group(group) => effects.extend(&group.effects),
+                ProjectEffect::Filter(filter) => procedurals.extend(filter.procedural.iter()),
+                _ => {}
             }
         }
-        lib
+        while let Some(source) = sources.pop() {
+            if let ProjectSource::Procedural(source) = source {
+                procedurals.extend(source.procedural.iter());
+            }
+        }
+        while let Some(procedural) = procedurals.pop() {
+            names.insert(procedural.name());
+            for input in &procedural.inputs {
+                if let Some(ProjectSource::Procedural(source)) = input.source.as_deref() {
+                    procedurals.extend(source.procedural.iter());
+                }
+            }
+        }
+    }
+    names
+}
+
+impl GraphLibrary {
+    /// Decompiles candidate graphs for the sets being imported, one package at a time.
+    pub(crate) fn for_sets<'a>(project: &ProjectFile, sets: impl Iterator<Item = &'a ProjectTextureSet>, cancel: &Cancel) -> Result<GraphLibrary, ImportError> {
+        let names = used_graph_names(sets);
+        let mut lib = GraphLibrary::default();
+        if names.is_empty() {
+            return Ok(lib);
+        }
+        for r in project.resources().iter().filter(|r| r.file_name.ends_with(PACKAGE_SUFFIX)) {
+            if cancel.is_cancelled() {
+                return Err(ImportError::Cancelled);
+            }
+            if let Ok(data) = project.read(&r.path) {
+                // Some references omit a version or name a version that is missing. Keep matching
+                // names in their original package order so both versioned and fallback lookups work.
+                lib.add_matching_package(r.file_name.trim_end_matches(PACKAGE_SUFFIX), &data, |name, path| {
+                    names.contains(name) || path.is_some_and(|path| names.contains(path))
+                });
+            }
+        }
+        Ok(lib)
     }
 
     /// Decompiles every graph of one package (its bytes) with its version (empty when unknown).
     pub fn add_package(&mut self, version: &str, data: &[u8]) {
+        self.add_matching_package(version, data, |_, _| true);
+    }
+
+    fn add_matching_package(&mut self, version: &str, data: &[u8], wanted: impl Fn(&str, Option<&str>) -> bool) {
         let Ok(archive) = GraphPackage::read(data) else { return };
         for g in archive.graphs() {
-            let (Ok(desc), Ok(asm)) = (g.description(), g.assembly()) else { continue };
+            let Ok(desc) = g.description() else { continue };
+            let package_path = desc.pkg_url.strip_prefix("pkg://").map(|p| p.trim_start_matches('/'));
+            if !wanted(g.name(), package_path) {
+                continue;
+            }
+            let Ok(asm) = g.assembly() else { continue };
             let d = decompile(&desc, &asm, NOMINAL);
-            let package_path = desc.pkg_url.strip_prefix("pkg://").map(|p| p.trim_start_matches('/').to_string());
             let mut names = vec![g.name().to_string()];
-            names.extend(package_path);
+            names.extend(package_path.map(str::to_owned));
             self.insert_as(&names, version, d);
         }
     }

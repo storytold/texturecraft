@@ -338,7 +338,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     if options.graphs == crate::GraphMode::Decompile {
         (hooks.progress)(0.08, Step::ReadingFile);
     }
-    let library = graph_library(file, options, hooks, &mut report)?;
+    let library = graph_library(file, sets().filter_map(|ctx| ctx.project_set), options, hooks, &mut report)?;
     // the finished sets' layer pixels, out of memory until the import returns
     let mut finished = crate::pixel_spill::PixelSpill::default();
     let mut finished_baked = crate::pixel_spill::BakedSpill::default();
@@ -386,12 +386,18 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     Ok(imported)
 }
 
-fn graph_library(file: &ProjectFile, options: &ImportOptions, hooks: &Hooks<'_>, report: &mut ImportReport) -> Result<Option<GraphLibrary>, ImportError> {
+fn graph_library<'a>(
+    file: &ProjectFile,
+    sets: impl Iterator<Item = &'a ProjectTextureSet>,
+    options: &ImportOptions,
+    hooks: &Hooks<'_>,
+    report: &mut ImportReport,
+) -> Result<Option<GraphLibrary>, ImportError> {
     if options.graphs != crate::GraphMode::Decompile {
         return Ok(None);
     }
     hooks.check()?;
-    let library = GraphLibrary::from_project(file);
+    let library = GraphLibrary::for_sets(file, sets, hooks.cancel)?;
     report.add("compiled graphs", Fidelity::Approximated, format!("{} decompiled and run by TextureCraft's graph runtime", library.len()));
     Ok(Some(library))
 }
