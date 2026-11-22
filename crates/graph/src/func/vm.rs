@@ -9,7 +9,7 @@
 //! pass. That can't be stretched: a pass fixes what a node reads at its first demand, for it and everything below it,
 //! so a node would have to be visited in a pass even when its variables haven't changed.
 
-use super::code::{Code, FLOOR_ENV, FLOOR_PASS, FLOOR_RUN, Inst, NONE, build};
+use super::code::{Code, FLOOR_ENV, FLOOR_PASS, FLOOR_RUN, FLOORS, Inst, NONE, build};
 use super::{
     B, FnEnv, FnState, Num, Op, Prog, Value, binary, build_vec_ref, clamp3, clean, coerce, div_large, kind_of, lerp3, lum, map1, rnd, sample_filtered, smooth3,
     swizzle,
@@ -20,6 +20,10 @@ use crate::tex::get;
 
 type Fail = Box<String>;
 type R = Result<(), Fail>;
+
+/// The two low bits of a register's stamp hold its validity class, fixed during compilation.
+const CLOCK_STEP: u64 = 4;
+const FLOOR_MASK: u64 = CLOCK_STEP - 1;
 
 /// What a register the program doesn't have reads as. `code::build` gives every operand a register, so only a broken
 /// table could ask for one; reading this keeps that from being a panic.
@@ -46,9 +50,10 @@ fn no_instruction(i: usize) -> Fail {
 /// and kept over many runs because that is what makes values last.
 pub struct Frame {
     values: Vec<Value>,
-    /// Separate validity storage keeps the linear evaluator's registers densely packed.
+    /// Each stamp combines its clock value with the register's validity class. A cache hit needs only this
+    /// compact table and the frame's floors, without also fetching the code or the register's value.
     stamps: Vec<u64>,
-    floors: Vec<u64>,
+    floors: [u64; FLOORS],
     clock: u64,
     vars: Vec<Value>,
     wrote: Vec<u64>,
@@ -59,8 +64,6 @@ pub struct Frame {
     args: Vec<Option<Value>>,
     /// Image positions in the bound environment; None as a whole in a frame for a nested function call.
     images: Option<Vec<Option<usize>>>,
-    /// A complete run has initialized all constants and environment values for this linear program.
-    linear_ready: bool,
     kids: Vec<Option<Box<Frame>>>,
     run_start: u64,
     #[cfg(test)]
@@ -77,20 +80,18 @@ pub(super) struct Counts {
 impl Frame {
     fn new(c: &Code, kids: usize) -> Frame {
         let mut values = vec![NO_VALUE.clone(); c.insts.len()];
-        let mut stamps = vec![0; c.insts.len()];
+        let mut stamps: Vec<_> = c.floor.iter().copied().map(u64::from).collect();
         for (i, v) in &c.literals {
             if let (Some(value), Some(stamp)) = (values.get_mut(*i as usize), stamps.get_mut(*i as usize)) {
                 *value = v.clone();
-                *stamp = 1;
+                *stamp |= CLOCK_STEP;
             }
         }
-        // (every floor starts at 1, FLOOR_CONST's for good)
-        let floors = vec![1u64; c.floors.max(FLOOR_PASS as usize + 1)];
         Frame {
             values,
             stamps,
-            floors,
-            clock: 2,
+            floors: [CLOCK_STEP; FLOORS],
+            clock: 2 * CLOCK_STEP,
             vars: vec![Value::float(0.0); c.var_names.len()],
             wrote: vec![0; c.var_names.len()],
             rng: 0,
@@ -98,7 +99,6 @@ impl Frame {
             lcg_state: None,
             args: vec![None; c.arg_names.len()],
             images: None,
-            linear_ready: false,
             kids: (0..kids).map(|_| None).collect(),
             run_start: 0,
             #[cfg(test)]
@@ -114,13 +114,12 @@ impl Frame {
 
     /// Everything computed from the caller's environment stops counting.
     fn new_binding(&mut self) {
-        self.clock += 1;
+        self.clock += CLOCK_STEP;
         self.set_floor(FLOOR_ENV, self.clock);
-        self.linear_ready = false;
     }
 
     fn new_run(&mut self, pos: [f64; 2]) {
-        self.clock += 1;
+        self.clock += CLOCK_STEP;
         let t = self.clock;
         self.set_floor(FLOOR_RUN, t);
         self.set_floor(FLOOR_PASS, t);
@@ -136,7 +135,7 @@ impl Frame {
     /// A pass of a loop begins or ends: nodes with side effects and what reads variables run again.
     #[inline]
     fn new_pass(&mut self) {
-        self.clock += 1;
+        self.clock += CLOCK_STEP;
         self.set_floor(FLOOR_PASS, self.clock);
     }
 }
@@ -158,9 +157,11 @@ impl Prog {
         for (slot, name) in frame.args.iter_mut().zip(&c.arg_names) {
             *slot = env.args.get(name).cloned();
         }
-        let images = frame.images.get_or_insert_with(Vec::new);
-        images.clear();
-        images.extend(c.samples.iter().map(|sample| env.images.iter().position(|(name, _)| *name == sample.slot)));
+        if !c.samples.is_empty() {
+            let images = frame.images.get_or_insert_with(Vec::new);
+            images.clear();
+            images.extend(c.samples.iter().map(|sample| env.images.iter().position(|(name, _)| *name == sample.slot)));
+        }
         frame.new_binding();
     }
 
@@ -216,35 +217,16 @@ impl Prog {
     }
 
     fn go(&self, c: &Code, env: &FnEnv, fr: &mut Frame) -> Result<Value, String> {
-        if let Some(order) = &c.linear {
-            if fr.linear_ready {
-                // All operands are either fixed for this binding or already ran earlier in this order.
-                for step in order {
-                    let i = step.register as usize;
-                    body_inner::<true>(self, c, i, &step.inst, env, fr).map_err(|e| *wrap(self, i, e))?;
-                    #[cfg(test)]
-                    {
-                        fr.counts.computed += 1;
-                    }
-                }
-            } else {
-                // Use the normal demand order on the first run, including when a constant fails.
-                ensure(self, c, c.out as usize, env, fr).map_err(|e| *e)?;
-                fr.linear_ready = true;
-            }
-        } else {
-            ensure(self, c, c.out as usize, env, fr).map_err(|e| *e)?;
-        }
+        ensure(self, c, c.out as usize, env, fr).map_err(|e| *e)?;
         Ok(reg(fr, c.out as usize).clone())
     }
 }
 
 #[inline(always)]
 fn ensure(p: &Prog, c: &Code, i: usize, env: &FnEnv, fr: &mut Frame) -> R {
-    let stamp = fr.stamps.get(i).copied().unwrap_or(0);
-    // (a register without a floor is never valid: computing it reports the missing instruction)
-    let floor = c.floor.get(i).and_then(|f| fr.floors.get(*f as usize)).copied().unwrap_or(u64::MAX);
-    if stamp >= floor {
+    if let Some(&stamp) = fr.stamps.get(i)
+        && stamp >= fr.floors.get((stamp & FLOOR_MASK) as usize).copied().unwrap_or(u64::MAX)
+    {
         return Ok(());
     }
     compute(p, c, i, env, fr)
@@ -252,11 +234,11 @@ fn ensure(p: &Prog, c: &Code, i: usize, env: &FnEnv, fr: &mut Frame) -> R {
 
 fn compute(p: &Prog, c: &Code, i: usize, env: &FnEnv, fr: &mut Frame) -> R {
     let Some(inst) = c.insts.get(i) else { return Err(no_instruction(i)) };
-    if let Err(e) = body_inner::<false>(p, c, i, inst, env, fr) {
+    if let Err(e) = body_inner(p, c, i, inst, env, fr) {
         return Err(wrap(p, i, e));
     }
     if let Some(stamp) = fr.stamps.get_mut(i) {
-        *stamp = fr.clock;
+        *stamp = fr.clock | (*stamp & FLOOR_MASK);
     }
     #[cfg(test)]
     {
@@ -363,48 +345,43 @@ fn opt_val(p: &Prog, c: &Code, j: u32, env: &FnEnv, fr: &mut Frame) -> Result<Op
 }
 
 #[inline(always)]
-fn operand<const READY: bool>(p: &Prog, c: &Code, i: usize, env: &FnEnv, fr: &mut Frame) -> R {
-    if READY { Ok(()) } else { ensure(p, c, i, env, fr) }
-}
-
-#[inline(always)]
-fn body_inner<const READY: bool>(p: &Prog, c: &Code, i: usize, inst: &Inst, env: &FnEnv, fr: &mut Frame) -> R {
+fn body_inner(p: &Prog, c: &Code, i: usize, inst: &Inst, env: &FnEnv, fr: &mut Frame) -> R {
     let [a, b, ..] = inst.ins;
     let (au, bu) = (a as usize, b as usize);
     let r: Value = match inst.op {
         // a literal holds its value from the start; `f_pin` and `f_out` are read through
         Op::Float | Op::Int | Op::Bool | Op::Str => return Ok(()),
         Op::Out | Op::Pin => {
-            operand::<READY>(p, c, au, env, fr)?;
+            ensure(p, c, au, env, fr)?;
             reg(fr, au).clone()
         }
         Op::Swizzle => {
-            operand::<READY>(p, c, au, env, fr)?;
+            ensure(p, c, au, env, fr)?;
             fast_swizzle(reg(fr, au), entry(&c.swizzles, inst.x).flatten(), p.nodes.get(i).map_or("", |n| n.text.as_str()))?
         }
         Op::Un(u) => {
-            operand::<READY>(p, c, au, env, fr)?;
+            ensure(p, c, au, env, fr)?;
             super::unary(u, reg(fr, au))?
         }
         Op::Bin(o) => {
-            if inst.impure && !READY {
+            if inst.impure {
                 let x = val(p, c, a, env, fr)?;
-                operand::<READY>(p, c, bu, env, fr)?;
+                ensure(p, c, bu, env, fr)?;
                 fast_binary(o, &x, reg(fr, bu))?
             } else {
-                operand::<READY>(p, c, au, env, fr)?;
-                operand::<READY>(p, c, bu, env, fr)?;
+                ensure(p, c, au, env, fr)?;
+                ensure(p, c, bu, env, fr)?;
                 fast_binary(o, reg(fr, au), reg(fr, bu))?
             }
         }
         Op::Seq => {
-            operand::<READY>(p, c, au, env, fr)?;
-            operand::<READY>(p, c, bu, env, fr)?;
+            ensure(p, c, au, env, fr)?;
+            ensure(p, c, bu, env, fr)?;
             reg(fr, bu).clone()
         }
         // the rest in a function of its own: a chain of the operations above recurses through this frame only, so it
         // stays small (a deep function's run takes this frame once per node one behind the other)
-        _ => body_rest::<READY>(p, c, i, inst, env, fr)?,
+        _ => body_rest(p, c, i, inst, env, fr)?,
     };
     if let Some(value) = fr.values.get_mut(i) {
         *value = if p.single { super::to_single(r) } else { r };
@@ -414,18 +391,18 @@ fn body_inner<const READY: bool>(p: &Prog, c: &Code, i: usize, inst: &Inst, env:
 
 /// The operations [`body_inner`] doesn't do itself.
 #[inline(never)]
-fn body_rest<const READY: bool>(p: &Prog, c: &Code, i: usize, inst: &Inst, env: &FnEnv, fr: &mut Frame) -> Result<Value, Fail> {
+fn body_rest(p: &Prog, c: &Code, i: usize, inst: &Inst, env: &FnEnv, fr: &mut Frame) -> Result<Value, Fail> {
     let [a, b, d, e] = inst.ins;
     let (au, bu, du) = (a as usize, b as usize, d as usize);
     Ok(match inst.op {
         Op::Vec(lanes, int) => {
             let defaults = entry(&c.vec_defaults, inst.x).unwrap_or([0.0; 4]);
-            if inst.impure && !READY {
+            if inst.impure {
                 impure_vec(p, c, inst, lanes, int, defaults, env, fr)?
             } else {
                 for j in inst.ins {
                     if j != NONE {
-                        operand::<READY>(p, c, j as usize, env, fr)?;
+                        ensure(p, c, j as usize, env, fr)?;
                     }
                 }
                 let part = |j: u32| if j == NONE { None } else { Some(reg(fr, j as usize)) };
@@ -438,29 +415,29 @@ fn body_rest<const READY: bool>(p: &Prog, c: &Code, i: usize, inst: &Inst, env: 
                 Op::Lerp => lerp3,
                 _ => smooth3,
             };
-            if inst.impure && !READY {
+            if inst.impure {
                 let (x, y) = (val(p, c, a, env, fr)?, val(p, c, b, env, fr)?);
-                operand::<READY>(p, c, du, env, fr)?;
+                ensure(p, c, du, env, fr)?;
                 f(&x, &y, reg(fr, du))?
             } else {
-                operand::<READY>(p, c, au, env, fr)?;
-                operand::<READY>(p, c, bu, env, fr)?;
-                operand::<READY>(p, c, du, env, fr)?;
+                ensure(p, c, au, env, fr)?;
+                ensure(p, c, bu, env, fr)?;
+                ensure(p, c, du, env, fr)?;
                 f(reg(fr, au), reg(fr, bu), reg(fr, du))?
             }
         }
         Op::If => {
-            operand::<READY>(p, c, au, env, fr)?;
+            ensure(p, c, au, env, fr)?;
             let pick = match reg(fr, au) {
                 Value::Bool(true) => bu,
                 Value::Bool(false) => du,
                 _ => return Err(Box::new("the condition must be a boolean".to_string())),
             };
-            operand::<READY>(p, c, pick, env, fr)?;
+            ensure(p, c, pick, env, fr)?;
             reg(fr, pick).clone()
         }
         Op::Loop => {
-            operand::<READY>(p, c, au, env, fr)?;
+            ensure(p, c, au, env, fr)?;
             // every pass reads the variables anew, so nothing computed in the pass before counts
             for pass in 0..entry(&c.passes, inst.x).unwrap_or(0) {
                 // a compiled graph's loop can run billions of passes: it stops when the evaluation is cancelled
@@ -469,7 +446,7 @@ fn body_rest<const READY: bool>(p: &Prog, c: &Code, i: usize, inst: &Inst, env: 
                 }
                 fr.new_pass();
                 if d != NONE {
-                    operand::<READY>(p, c, du, env, fr)?;
+                    ensure(p, c, du, env, fr)?;
                     // a condition read back from a variable comes as a number
                     match reg(fr, du) {
                         Value::Bool(true) => break,
@@ -479,13 +456,13 @@ fn body_rest<const READY: bool>(p: &Prog, c: &Code, i: usize, inst: &Inst, env: 
                     }
                 }
                 fr.new_pass();
-                operand::<READY>(p, c, bu, env, fr)?;
+                ensure(p, c, bu, env, fr)?;
             }
             fr.new_pass();
             Value::float(0.0)
         }
         Op::Set => {
-            operand::<READY>(p, c, au, env, fr)?;
+            ensure(p, c, au, env, fr)?;
             let v = reg(fr, au).clone();
             if let Some(w) = fr.wrote.get_mut(inst.x as usize) {
                 *w = fr.clock;
@@ -504,7 +481,7 @@ fn body_rest<const READY: bool>(p: &Prog, c: &Code, i: usize, inst: &Inst, env: 
             }
         }
         Op::Random => random(p, c, i, env, fr)?,
-        Op::SampleGray | Op::SampleColor => sample::<READY>(p, c, inst, env, fr)?,
+        Op::SampleGray | Op::SampleColor => sample(p, c, inst, env, fr)?,
         Op::Stat(k) => stat(p, i, k, env)?,
         Op::Pos => Value::vec(2, [fr.pos[0], fr.pos[1], 0.0, 0.0]),
         Op::Size => Value::vec(2, [env.size[0], env.size[1], 0.0, 0.0]),
@@ -519,17 +496,17 @@ fn body_rest<const READY: bool>(p: &Prog, c: &Code, i: usize, inst: &Inst, env: 
         Op::Seed => Value::int(env.seed as i64),
         Op::Input | Op::GraphInput => input(p, c, i, env, fr),
         Op::ToFloat => {
-            operand::<READY>(p, c, au, env, fr)?;
+            ensure(p, c, au, env, fr)?;
             let n = reg(fr, au).num()?;
             Value::Num(Num { int: false, ..n })
         }
         Op::ToInt => {
-            operand::<READY>(p, c, au, env, fr)?;
+            ensure(p, c, au, env, fr)?;
             let n = reg(fr, au).num()?;
             map1(&n, true, |x| x.trunc())
         }
         Op::ToBool => {
-            operand::<READY>(p, c, au, env, fr)?;
+            ensure(p, c, au, env, fr)?;
             Value::Bool(match reg(fr, au) {
                 Value::Bool(t) => *t,
                 Value::Str(s) => !s.is_empty(),
@@ -594,9 +571,9 @@ fn random(p: &Prog, c: &Code, i: usize, env: &FnEnv, fr: &mut Frame) -> Result<V
 }
 
 #[inline(never)]
-fn sample<const READY: bool>(p: &Prog, c: &Code, inst: &Inst, env: &FnEnv, fr: &mut Frame) -> Result<Value, Fail> {
+fn sample(p: &Prog, c: &Code, inst: &Inst, env: &FnEnv, fr: &mut Frame) -> Result<Value, Fail> {
     let au = inst.ins[0] as usize;
-    operand::<READY>(p, c, au, env, fr)?;
+    ensure(p, c, au, env, fr)?;
     let (u, v) = match reg(fr, au) {
         Value::Num(Num { lanes: 2, v, .. }) => (v[0] as f32, v[1] as f32),
         Value::Str(_) => return Err(Box::new("a string cannot be used as a number".to_string())),

@@ -798,6 +798,11 @@ fn lanes_num(a: &Num, b: &Num) -> Result<Num, String> {
 }
 
 fn lerp3(a: &Value, b: &Value, t: &Value) -> Result<Value, String> {
+    if let (Value::Num(Num { lanes: 1, v: [p, ..], .. }), Value::Num(Num { lanes: 1, v: [q, ..], .. }), Value::Num(Num { lanes: 1, v: [t, ..], .. })) =
+        (a, b, t)
+    {
+        return Ok(Value::float(clean(p + (q - p) * t)));
+    }
     let (a, b, t) = (a.num()?, b.num()?, t.num()?);
     let lanes = lanes_of(&lanes_num(&a, &b)?, &t)?;
     let mut v = [0.0; 4];

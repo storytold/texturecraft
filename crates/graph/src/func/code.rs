@@ -21,9 +21,8 @@ pub const FLOOR_CONST: u32 = 0;
 pub const FLOOR_ENV: u32 = 1;
 pub const FLOOR_RUN: u32 = 2;
 pub const FLOOR_PASS: u32 = 3;
-const FLOORS: usize = 4;
+pub const FLOORS: usize = 4;
 
-#[derive(Clone, Copy)]
 pub struct Inst {
     pub op: Op,
     pub impure: bool,
@@ -33,11 +32,6 @@ pub struct Inst {
     pub x: u32,
     /// the type an `f_get` declares ([`Code::get_pins`])
     pub y: u32,
-}
-
-pub struct LinearStep {
-    pub register: u32,
-    pub inst: Inst,
 }
 
 /// An `f_input` / `f_graph_input`.
@@ -56,9 +50,7 @@ pub struct SampleInfo {
 
 pub struct Code {
     pub insts: Vec<Inst>,
-    /// Per-run nodes in demand order for programs which read all their operands in order and never restart a pass.
-    pub linear: Option<Vec<LinearStep>>,
-    /// floor of each register, apart from the instructions because it is what is read most
+    /// Initial validity class of each register.
     pub floor: Vec<u32>,
     pub out: u32,
     pub literals: Vec<(u32, Value)>,
@@ -73,7 +65,6 @@ pub struct Code {
     pub lcg_draws: Vec<Option<(i32, u32)>>,
     pub get_pins: Vec<Option<Pin>>,
     pub var_names: Vec<String>,
-    pub floors: usize,
     pub arg_names: Vec<String>,
     /// where each of `Prog::inputs` is bound
     pub input_args: Vec<u32>,
@@ -104,7 +95,6 @@ pub fn build(p: &Prog) -> Code {
     }
     let mut c = Code {
         insts: Vec::with_capacity(n),
-        linear: None,
         floor: vec![FLOOR_CONST; n],
         out: alias.get(p.out).copied().unwrap_or(NONE),
         literals: Vec::new(),
@@ -117,7 +107,6 @@ pub fn build(p: &Prog) -> Code {
         lcg_draws: Vec::new(),
         get_pins: Vec::new(),
         var_names: Vec::new(),
-        floors: FLOORS,
         arg_names: Vec::new(),
         input_args: Vec::new(),
     };
@@ -259,16 +248,6 @@ pub fn build(p: &Prog) -> Code {
         c.insts.push(inst);
     }
 
-    // Branches and calls can leave an operand unread. Random nodes choose different operands
-    // in different modes. Loops can demand an earlier register again in a new pass.
-    if !c.insts.iter().any(|inst| matches!(inst.op, Op::If | Op::Call | Op::Random | Op::Loop)) {
-        let steps = c.insts.iter().zip(&c.floor).enumerate().filter(|(_, (inst, floor))| **floor >= FLOOR_RUN && !matches!(inst.op, Op::Out | Op::Pin));
-        // The compact demand evaluator is faster for short functions. Long pixel processors
-        // amortize the contiguous schedule and benefit from leaving the validity table alone.
-        if steps.clone().take(128).count() == 128 {
-            c.linear = Some(steps.map(|(index, (inst, _))| LinearStep { register: index as u32, inst: *inst }).collect());
-        }
-    }
     c
 }
 
