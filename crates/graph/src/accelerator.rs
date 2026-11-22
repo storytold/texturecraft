@@ -77,6 +77,7 @@ pub enum FilterOperation<'a> {
     GradientWarp { map: GreyInput<'a>, displacement: [f32; 2] },
     Box { radius: [f32; 2] },
     ShortLine { major: usize, slope: f32, radius: f32 },
+    ShearedLine { major: usize, slope: f32, radius: f32 },
     Sharpen { weights: [f32; 2] },
 }
 

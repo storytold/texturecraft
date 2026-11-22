@@ -11,9 +11,10 @@ use crate::gpu_graph_grey::GreyRasterizer;
 const WORKGROUP: u32 = 8;
 const DIRECTIONAL_WARP: u32 = 0;
 const GRADIENT_WARP: u32 = 1;
-const SHORT_BOX: u32 = 2;
+const BOX: u32 = 2;
 const SHORT_LINE: u32 = 3;
 const SHARPEN: u32 = 4;
+const SHEARED_LINE: u32 = 5;
 const SHADER: &str = concat!(include_str!("shaders/graph_filter.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
 
 pub(crate) struct FilterRasterizer {
@@ -58,6 +59,7 @@ impl FilterRasterizer {
             direction: [0.0; 4],
         };
         let mut passes = Vec::with_capacity(2);
+        let mut shifts = None;
         let map = match filter.operation {
             FilterOperation::DirectionalWarp { map, intensity, offset, direction, aspect } => {
                 params.control[0] = DIRECTIONAL_WARP;
@@ -71,14 +73,15 @@ impl FilterRasterizer {
                 Some(map)
             }
             FilterOperation::Box { radius } => {
-                params.control[0] = SHORT_BOX;
+                params.control[0] = BOX;
                 for (axis, radius) in radius.into_iter().enumerate() {
                     if radius <= 0.5 && params.source[2] == params.output[2] {
                         continue;
                     }
                     params.control[1] = axis as u32;
                     params.values[0] = radius;
-                    let edge = (f64::from(radius) - 1.5).max(0.0);
+                    let radius = f64::from(radius);
+                    let edge = radius - ((radius - 0.5).ceil() - 0.5);
                     params.values[1] = (edge / (1.0 + edge) * 256.0).round() as f32;
                     passes.push(params);
                     params.source = params.output;
@@ -89,6 +92,14 @@ impl FilterRasterizer {
                 params.control[0] = SHORT_LINE;
                 params.control[1] = major as u32;
                 params.values = [radius, slope, 0.0, 0.0];
+                None
+            }
+            FilterOperation::ShearedLine { major, slope, radius } => {
+                params.control[0] = SHEARED_LINE;
+                params.control[1] = major as u32;
+                let pad = (radius - 0.5).ceil() as i32;
+                params.values = [radius, pad as f32, 0.0, 0.0];
+                shifts = Some(shear_shifts(if major == 0 { w } else { h }, pad, f64::from(slope)));
                 None
             }
             FilterOperation::Sharpen { weights } => {
@@ -129,7 +140,14 @@ impl FilterRasterizer {
         crate::gpu_trace::scoped(&self.device, "resident graph spatial filter", || {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("graph grayscale filters") });
             let mut front = &input.buffer;
-            let map = &external_map.as_ref().unwrap_or(&input).buffer;
+            let shift_buffer = shifts.as_ref().map(|shifts| {
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("graph line blur subpixel shifts"),
+                    contents: bytemuck::cast_slice(shifts),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+            });
+            let auxiliary = shift_buffer.as_ref().unwrap_or(&external_map.as_ref().unwrap_or(&input).buffer);
             let layout = self.pipeline.get_bind_group_layout(0);
             for (params, output) in passes.iter().zip(&outputs) {
                 let settings = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -137,7 +155,7 @@ impl FilterRasterizer {
                     contents: bytemuck::bytes_of(params),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
-                let buffers = [&settings, front, map, &output.buffer];
+                let buffers = [&settings, front, auxiliary, &output.buffer];
                 let entries = std::array::from_fn::<_, 4, _>(|i| wgpu::BindGroupEntry { binding: i as u32, resource: buffers[i].as_entire_binding() });
                 let bind_group =
                     self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("graph filter inputs"), layout: &layout, entries: &entries });
@@ -158,6 +176,20 @@ impl FilterRasterizer {
         }
         Ok(outputs.pop().map(|pixels| ResidentGrey16 { w, h, div: filter.div, alpha, pixels }))
     }
+}
+
+/// Compute each column's forward and reverse shear in the reference evaluator's precision.
+fn shear_shifts(columns: usize, pad: i32, slope: f64) -> Vec<[i32; 2]> {
+    let pack = |offset: f64| {
+        let row = offset.floor();
+        ((row as i32) << 9) | ((offset - row) * 256.0).round() as i32
+    };
+    (-pad..columns as i32 + pad)
+        .map(|column| {
+            let shift = (f64::from(column) + 0.5 - columns as f64 / 2.0) * slope;
+            [pack(shift), pack(-shift)]
+        })
+        .collect()
 }
 
 fn same_input(a: GreyInput<'_>, b: GreyInput<'_>) -> bool {
@@ -224,8 +256,14 @@ mod tests {
             ("grad_warp", 65535, "map=@2 intensity=0.8 aspect_x=0.5 tile_x=0", true),
             ("box_blur", 65535, "intensity=2.17 aspect_y=0.33", false),
             ("box_blur", 255, "intensity=1.7 tile_x=0 tile_y=0", false),
+            ("box_blur", 65535, "intensity=8.3 aspect_y=0.65", false),
+            ("box_blur", 255, "intensity=8.3 tile_y=0", false),
             ("line_blur", 65535, "intensity=1.3 angle=0.125", false),
             ("line_blur", 65535, "intensity=2.1 angle=0.25", false),
+            ("line_blur", 65535, "intensity=5.28 angle=0.0625", false),
+            ("line_blur", 65535, "intensity=10.56 angle=0.1875 tile_x=0 tile_y=0", false),
+            ("line_blur", 65535, "intensity=5.28 angle=-0.125 tile_x=0", false),
+            ("line_blur", 65535, "intensity=10.56 angle=0.25", false),
             ("laplacian_sharpen", 255, "intensity=0.4", false),
         ] {
             nodes.0.store(0, Relaxed);

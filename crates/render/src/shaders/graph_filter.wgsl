@@ -9,7 +9,7 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> front: array<u32>;
-@group(0) @binding(2) var<storage, read> height_map: array<u32>;
+@group(0) @binding(2) var<storage, read> auxiliary: array<u32>;
 @group(0) @binding(3) var<storage, read_write> output: array<u32>;
 
 fn limit(p: i32, n: i32, wrap: bool) -> u32 {
@@ -49,7 +49,7 @@ fn front_units(p: vec2<i32>) -> u32 {
 
 fn map_at(p: vec2<i32>, wraps: vec2<bool>) -> f32 {
     let i = address(p, params.map.xy, wraps);
-    return decode_grey(unpack_grey(height_map[i / 2u], i), params.map.z);
+    return decode_grey(unpack_grey(auxiliary[i / 2u], i), params.map.z);
 }
 
 fn lerp(lo: f32, hi: f32, weight: f32) -> f32 {
@@ -114,26 +114,77 @@ fn stepped_front(uv: vec2<f32>) -> f32 {
     return lerp(top, bottom, weights.y);
 }
 
-fn short_box(p: vec2<i32>) -> f32 {
+fn box_edge(p: vec2<i32>, axis: vec2<i32>, inner: i32, outer: i32) -> f32 {
+    let far = u32(params.values.y);
+    return f32((((256u - far) * front_units(p + inner * axis) + far * front_units(p + outer * axis)) + 128u) >> 8u);
+}
+
+fn box_pyramid_value(p: vec2<i32>, axis: vec2<i32>, start: i32, width: u32) -> u32 {
+    // At radius <= 12 the biggest aligned block has 16 samples. Its pair rounding matches the compiled format.
+    var values: array<u32, 16>;
+    for (var i = 0u; i < width; i++) {
+        values[i] = front_units(p + (start + i32(i)) * axis);
+    }
+    for (var count = width >> 1u; count > 0u; count >>= 1u) {
+        for (var i = 0u; i < count; i++) {
+            let sum = values[2u * i] + values[2u * i + 1u];
+            if params.output.z == 255u {
+                values[i] = compiled_8bit_sample(f32(sum) / 131070.0) * 257u;
+            } else {
+                values[i] = (sum + 1u) / 2u;
+            }
+        }
+    }
+    return width * values[0];
+}
+
+fn box_pyramid_sum(p: vec2<i32>, axis: vec2<i32>, start: i32, end: i32, side: i32) -> f32 {
+    // Cover the interior with the largest aligned blocks available at each position.
+    let origin = p.x * axis.x + p.y * axis.y;
+    let top = 1u << min(4u, firstLeadingBit(u32(2 * side - 1)));
+    var sum = 0u;
+    var offset = start;
+    while offset < end {
+        let remaining = u32(end - offset);
+        var width = min(top, 1u << firstLeadingBit(remaining));
+        while ((origin + offset) & i32(width - 1u)) != 0 {
+            width >>= 1u;
+        }
+        sum += box_pyramid_value(p, axis, offset, width);
+        offset += i32(width);
+    }
+    return f32(sum);
+}
+
+fn box_blur(p: vec2<i32>) -> f32 {
     let radius = params.values.x;
     if radius <= 0.5 {
         return front_at(p);
     }
     let axis = select(vec2<i32>(1, 0), vec2<i32>(0, 1), params.control.y != 0u);
-    let center = front_units(p);
-    let inner = vec2<u32>(front_units(p - axis), front_units(p + axis));
-    if radius <= 1.5 {
-        return (f32(center) + (radius - 0.5) * f32(inner.x + inner.y)) / (2.0 * radius * 65535.0);
-    }
-    let outer = vec2<u32>(front_units(p - 2 * axis), front_units(p + 2 * axis));
-    let edge = radius - 1.5;
+    let side = i32(ceil(radius - 0.5));
+    let edge = radius - (f32(side) - 0.5);
     let wrap = select(params.control.z, params.control.w, params.control.y != 0u);
-    if wrap == 0u {
-        return (f32(center + inner.x + inner.y) + edge * f32(outer.x + outer.y)) / (2.0 * radius * 65535.0);
+    let row_size = select(params.source.x, params.source.y, params.control.y != 0u);
+    let denominator = 2.0 * radius * 65535.0;
+    let outside = f32(front_units(p - side * axis) + front_units(p + side * axis));
+    if wrap == 0u || u32(2 * side + 1) >= row_size || side == 1 {
+        var inner = 0u;
+        for (var step = 1 - side; step < side; step++) {
+            inner += front_units(p + step * axis);
+        }
+        return (f32(inner) + edge * outside) / denominator;
     }
-    let weight = u32(params.values.y);
-    let tap = (((256u - weight) * inner + weight * outer) + 128u) >> vec2<u32>(8u);
-    return (f32(center) + (1.0 + edge) * f32(tap.x + tap.y)) / (2.0 * radius * 65535.0);
+    if side == 2 {
+        let ends = box_edge(p, axis, -1, -2) + box_edge(p, axis, 1, 2);
+        return (f32(front_units(p)) + (1.0 + edge) * ends) / denominator;
+    }
+    let start_is_odd = ((p.x * axis.x + p.y * axis.y - side) & 1) == 1;
+    let lone = select(side, -side, start_is_odd);
+    let mixed = -lone;
+    let neighbor = mixed - sign(mixed);
+    let interior = box_pyramid_sum(p, axis, -side + select(2, 1, start_is_odd), side - select(0, 1, start_is_odd), side);
+    return (edge * f32(front_units(p + lone * axis)) + (1.0 + edge) * box_edge(p, axis, neighbor, mixed) + interior) / denominator;
 }
 
 fn minor_read(p: vec2<i32>, minor: vec2<i32>, offset: f32) -> f32 {
@@ -154,6 +205,51 @@ fn short_line(p: vec2<i32>) -> f32 {
     return (front_at(p) + (radius - 0.5) * (a + b)) / (2.0 * radius);
 }
 
+fn shift_word(column: i32, reverse: bool) -> i32 {
+    let index = u32(column + i32(params.values.y)) * 2u + select(0u, 1u, reverse);
+    return bitcast<i32>(auxiliary[index]);
+}
+
+fn shift_weight(word: i32) -> f32 {
+    return f32(word & 511) / 256.0;
+}
+
+fn sheared_read(column: i32, row: i32, major: vec2<i32>) -> f32 {
+    let width = i32(select(params.source.x, params.source.y, major.y != 0));
+    let wrap = select(params.control.z, params.control.w, major.y != 0) != 0u;
+    // Clamping the sheared image repeats the shift of its edge column. Wrapping continues that shift across the seam.
+    let x = select(clamp(column, 0, width - 1), column, wrap);
+    let shift = shift_word(x, false);
+    let minor = major.yx;
+    let p = x * major + (row + (shift >> 9u)) * minor;
+    return lerp(front_at(p), front_at(p + minor), shift_weight(shift));
+}
+
+fn sheared_box(column: i32, row: i32, major: vec2<i32>) -> f32 {
+    let radius = params.values.x;
+    let side = i32(params.values.y);
+    let edge = radius - (f32(side) - 0.5);
+    var sum = 0.0;
+    for (var step = 1 - side; step < side; step++) {
+        sum += sheared_read(column + step, row, major);
+    }
+    let outer = sheared_read(column - side, row, major) + sheared_read(column + side, row, major);
+    return (sum + edge * outer) / (2.0 * radius);
+}
+
+fn sheared_line(p: vec2<i32>) -> f32 {
+    let major = select(vec2<i32>(1, 0), vec2<i32>(0, 1), params.control.y != 0u);
+    let column = select(p.x, p.y, major.y != 0);
+    let shift = shift_word(column, true);
+    let row = select(p.y, p.x, major.y != 0) + (shift >> 9u);
+    let a = sheared_box(column, row, major);
+    let weight = shift_weight(shift);
+    if weight == 0.0 {
+        return a;
+    }
+    return lerp(a, sheared_box(column, row + 1, major), weight);
+}
+
 fn sharpen(p: vec2<i32>) -> f32 {
     let c = front_at(p);
     let l = front_at(p - vec2<i32>(1, 0));
@@ -171,8 +267,9 @@ fn value_at(p: vec2<i32>) -> f32 {
             return stepped_front(uv + (distance * params.direction.xy) * params.values.zw);
         }
         case 1u: { return stepped_front(uv + params.values.xy * sampled_slope(uv)); }
-        case 2u: { return short_box(p); }
+        case 2u: { return box_blur(p); }
         case 3u: { return short_line(p); }
+        case 5u: { return sheared_line(p); }
         default: { return sharpen(p); }
     }
 }

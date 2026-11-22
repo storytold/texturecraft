@@ -211,6 +211,8 @@ pub(crate) fn resident_filter<'a>(
     map: Option<crate::accelerator::GreyInput<'a>>,
 ) -> Option<crate::accelerator::ResidentFilter<'a>> {
     use crate::accelerator::{FilterOperation, ResidentFilter};
+    // Direct GPU taps cover the default imported blur at up to 8K. Wider filters use the row-integral evaluator.
+    const MAX_GPU_RADIUS: f32 = 12.0;
 
     let packed = |input: crate::accelerator::GreyInput<'_>| {
         let (w, h, div, alpha) = input.info();
@@ -264,7 +266,7 @@ pub(crate) fn resident_filter<'a>(
         }
         "box_blur" if quantized_blur => {
             let radius = radii(value("intensity", BLUR_DEFAULT_INTENSITY)).map(f32::abs);
-            if radius.into_iter().any(|r| !(0.0..=2.5).contains(&r)) {
+            if radius.into_iter().any(|r| !(0.0..=MAX_GPU_RADIUS).contains(&r)) {
                 return None;
             }
             FilterOperation::Box { radius }
@@ -277,21 +279,31 @@ pub(crate) fn resident_filter<'a>(
             }
             if sin.abs() < AXIS_SLACK || cos.abs() < AXIS_SLACK {
                 let radius = if sin.abs() < AXIS_SLACK { [rx.abs(), 0.0] } else { [0.0, ry.abs()] };
-                if radius.into_iter().any(|r| r > 2.5) {
+                if radius.into_iter().any(|r| r > MAX_GPU_RADIUS) {
                     return None;
                 }
                 FilterOperation::Box { radius }
             } else {
                 let (dx, dy) = ((rx - LINE_HALF_PIXEL).max(0.0) * cos, (ry - LINE_HALF_PIXEL).max(0.0) * sin);
                 let longest = dx.abs().max(dy.abs());
+                let along_y = f64::from(dx.abs()) * h as f64 <= f64::from(dy.abs()) * w as f64 * (1.0 + TIE_SLACK);
                 if longest == 0.0 {
                     FilterOperation::Box { radius: [0.0; 2] }
                 } else if longest < 1.0 {
-                    let along_y = f64::from(dx.abs()) * h as f64 <= f64::from(dy.abs()) * w as f64 * (1.0 + TIE_SLACK);
                     let slope = if along_y { dx / dy * h as f32 / w as f32 } else { dy / dx * w as f32 / h as f32 };
                     FilterOperation::ShortLine { major: usize::from(along_y), slope, radius: LINE_HALF_PIXEL + longest }
                 } else {
-                    return None;
+                    let (major, minor, slope, radius, repeat_rows) =
+                        if along_y { (h, w, dx / dy, LINE_HALF_PIXEL + dy.abs(), tile[0]) } else { (w, h, dy / dx, LINE_HALF_PIXEL + dx.abs(), tile[1]) };
+                    if radius > MAX_GPU_RADIUS || !slope.is_finite() {
+                        return None;
+                    }
+                    let pad = radius.ceil() as usize + 2;
+                    let extra = if repeat_rows { 0 } else { (f64::from(slope.abs()) * (major as f64 / 2.0 + pad as f64 + f64::from(radius))) as usize + 3 };
+                    if minor + 2 * extra > MAX_SHEARED_SIDE {
+                        return None;
+                    }
+                    FilterOperation::ShearedLine { major: usize::from(along_y), slope, radius }
                 }
             }
         }
