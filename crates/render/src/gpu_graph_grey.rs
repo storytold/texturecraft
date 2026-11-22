@@ -11,6 +11,7 @@ use wgpu::util::DeviceExt;
 
 const BAND_BYTES: u64 = 8 << 20;
 const WORKGROUP: u32 = 8;
+const SHADER: &str = concat!(include_str!("shaders/graph_grey.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
 
 pub(crate) struct GreyRasterizer {
     device: wgpu::Device,
@@ -22,7 +23,8 @@ pub(crate) struct GreyRasterizer {
 impl GreyRasterizer {
     pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self, String> {
         let pipeline = crate::gpu_trace::scoped(device, "graph grayscale shader", || {
-            let module = device.create_shader_module(wgpu::include_wgsl!("shaders/graph_grey.wgsl"));
+            let module =
+                device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("graph grayscale"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("graph grayscale"),
                 layout: None,
@@ -47,7 +49,7 @@ impl GreyRasterizer {
         }
         let buffers = if self.device.adapter_info().device_type == wgpu::DeviceType::DiscreteGpu { 6 } else { 3 };
         let cap = (texturecraft_compose::graphs::budget::limit() / 8).min(storage.saturating_mul(buffers));
-        self.resident_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| used.checked_add(bytes).filter(|&used| used <= cap)).ok()?;
+        self.resident_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| used.checked_add(bytes).filter(|&used| used <= cap)).ok()?;
         Some(Arc::new(ResidentBytes { total: self.resident_bytes.clone(), bytes }))
     }
 
@@ -69,7 +71,7 @@ impl GreyRasterizer {
         GreyDevicePixels { device: self.device.clone(), queue: self.queue.clone(), buffer, reservation }
     }
 
-    fn bind_input(&self, input: GreyInput<'_>) -> Result<Option<GreyDevicePixels>, String> {
+    pub(crate) fn bind_input(&self, input: GreyInput<'_>) -> Result<Option<GreyDevicePixels>, String> {
         let host = match input {
             GreyInput::Host(host) => host,
             GreyInput::Device(image) => {
