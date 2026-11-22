@@ -21,7 +21,7 @@ pub mod spill;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use rayon::prelude::*;
 
@@ -34,7 +34,7 @@ use texturecraft_graph::rayon::ThreadPool;
 pub use texturecraft_graph::tex::Tex;
 use texturecraft_texel::{TILE, TileImage, from_u16, linear_to_srgb, srgb_to_linear, to_u16};
 
-use crate::store::{BakedMaps, ImageStore};
+use crate::store::{BakedMaps, ImageRes, ImageStore, Texels};
 pub use kept::KeptCooks;
 use once::Slots;
 
@@ -428,8 +428,8 @@ pub struct CookCache {
     renders: AtomicUsize,
     parsed: Mutex<HashMap<String, Arc<Graph>>>,
     kinds: Mutex<HashMap<String, u128>>,
-    /// Fingerprints of baked maps and image resources by the address and length of their data.
-    fingerprints: Mutex<HashMap<(usize, usize), u128>>,
+    baked_fingerprints: Mutex<Fingerprints<Texels>>,
+    image_fingerprints: Mutex<Fingerprints<ImageRes>>,
     pool: OnceLock<Option<Arc<ThreadPool>>>,
     trace: Mutex<Option<CookTrace>>,
     accelerator: Mutex<Option<Arc<dyn GraphAccelerator>>>,
@@ -463,6 +463,23 @@ pub struct GraphStore {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+type Fingerprints<T> = HashMap<usize, (Weak<T>, u128)>;
+
+fn fingerprint<T>(cache: &Mutex<Fingerprints<T>>, source: &Arc<T>, values: impl FnOnce(&T) -> u128) -> u128 {
+    let key = Arc::as_ptr(source) as usize;
+    if let Some((_, digest)) = lock(cache).get(&key) {
+        return *digest;
+    }
+    let digest = values(source);
+    let mut cached = lock(cache);
+    if cached.len() >= 256 {
+        cached.retain(|_, (source, _)| source.strong_count() != 0);
+    }
+    // The weak reference prevents this address from being recycled while the hash is cached.
+    cached.insert(key, (Arc::downgrade(source), digest));
+    digest
 }
 
 fn trace_name(name: &str) -> &str {
@@ -777,39 +794,24 @@ impl GraphStore {
         d
     }
 
-    /// A fingerprint of float data, by its address and length while it lives (baked maps are replaced, not changed in
-    /// place, when they are baked again).
-    fn fingerprint_floats(&self, data: &[f32]) -> u128 {
-        let at = (data.as_ptr() as usize, data.len());
-        if let Some(f) = lock(&self.read_cache().fingerprints).get(&at) {
-            return *f;
-        }
-        let mut h = StableHash::new();
-        for v in data {
-            h.f32(*v);
-        }
-        let f = h.finish();
-        lock(&self.read_cache().fingerprints).insert(at, f);
-        f
+    fn fingerprint_texels(&self, data: &Arc<Texels>) -> u128 {
+        fingerprint(&self.read_cache().baked_fingerprints, data, |data| {
+            let mut h = StableHash::new();
+            data.iter().for_each(|v| {
+                h.f32(v);
+            });
+            h.finish()
+        })
     }
 
-    /// [`GraphStore::fingerprint_floats`] of a baked map's values, however they are held.
-    fn fingerprint_texels(&self, data: &Arc<crate::Texels>) -> u128 {
-        let at = (Arc::as_ptr(data) as usize, data.len());
-        if let Some(f) = lock(&self.read_cache().fingerprints).get(&at) {
-            return *f;
-        }
-        let mut h = StableHash::new();
-        for v in data.iter() {
-            h.f32(v);
-        }
-        let f = h.finish();
-        lock(&self.read_cache().fingerprints).insert(at, f);
-        f
-    }
-
-    fn fingerprint_pixels(&self, data: &[[f32; 4]]) -> u128 {
-        self.fingerprint_floats(data.as_flattened())
+    fn fingerprint_image(&self, image: &Arc<ImageRes>) -> u128 {
+        fingerprint(&self.read_cache().image_fingerprints, image, |image| {
+            let mut h = StableHash::new();
+            image.rgba.as_flattened().iter().for_each(|&v| {
+                h.f32(v);
+            });
+            h.finish()
+        })
     }
 
     /// Hashes what decides `g`'s render besides the pixels a filter is given: the text by its key, the evaluator
@@ -851,7 +853,7 @@ impl GraphStore {
                 }
                 GraphInput::Image(name) => {
                     h.str("image").str(name);
-                    let fp = env.images.get(name).map_or(0, |img| self.fingerprint_pixels(&img.rgba));
+                    let fp = env.images.get(name).map_or(0, |img| self.fingerprint_image(img));
                     h.bytes(&fp.to_le_bytes());
                 }
                 GraphInput::Nested(inner) => {

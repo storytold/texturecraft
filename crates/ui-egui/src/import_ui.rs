@@ -196,11 +196,13 @@ fn start(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> Im
                     if prefer_gpu && ts == session.ts() {
                         session.doc.graphs.warm_saved_uses(ts);
                     }
-                    let cpu = !prefer_gpu || !crate::gpu::GpuLink::plans_import_set(session, ts);
                     let (w, h) = session.caches[ts].size;
-                    let backend = if cpu { "CPU view preparation" } else { "GPU viewport" };
-                    worker.log_detail(format!("Texture set {} at {w}×{h} uses {backend}", ts + 1));
-                    cpu
+                    let plan = if prefer_gpu { crate::gpu::GpuLink::plan_import_set(session, ts) } else { Err("GPU compositing is disabled.") };
+                    match plan {
+                        Ok(()) => worker.log_detail(format!("Texture set {} at {w}×{h} uses GPU viewport", ts + 1)),
+                        Err(reason) => worker.log_detail(format!("Texture set {} at {w}×{h} uses CPU view preparation ({reason})", ts + 1)),
+                    }
+                    plan.is_err()
                 })
                 .collect()
         })
