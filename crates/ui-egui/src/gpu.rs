@@ -822,7 +822,8 @@ impl GpuLink {
     }
 
     fn plan_gpu_composites(&mut self, session: &mut Session, shift: u32, interactive: bool, gpu_quick_mask: bool, out: &mut SceneSync, started: f64) {
-        let global_reason = self.gpu_composite_reason(interactive || session.solo.is_some());
+        let viewing_user_channel = matches!(session.view, ViewMode::Channel(channel) if channel.user_index().is_some());
+        let global_reason = self.gpu_composite_reason(interactive || session.solo.is_some() || viewing_user_channel);
         let mut submitted_stroke = false;
         let mut cpu_changed = false;
         for (ts, state) in self.compositors.iter_mut().enumerate() {

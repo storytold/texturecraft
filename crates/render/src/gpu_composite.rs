@@ -796,18 +796,17 @@ impl CompositeProgram {
         if !set.uv_tiles.is_empty() {
             return Err("UDIM texture sets use CPU compositing.");
         }
-        if set.channels.iter().any(|(channel, _)| channel.user_index().is_some()) {
-            return Err("User channels use CPU compositing.");
-        }
+        // User data stays in the document and its CPU composites for export. The viewport
+        // material only consumes the native display slots in the shader.
+        let display_channels = || set.channels.iter().copied().filter(|(channel, _)| channel.user_index().is_none());
         let measured_blend = project.rules.blend.is_measured();
         let unit_channels = if measured_blend {
-            set.channels
-                .iter()
+            display_channels()
                 .filter(|(channel, format)| {
                     channel.kind() != ChannelKind::Signed
                         && !matches!(format, ChannelFormat::L16F | ChannelFormat::Rgb16F | ChannelFormat::L32F | ChannelFormat::Rgb32F)
                 })
-                .fold(0, |mask, (channel, _)| mask | (1 << channel_slot(*channel)))
+                .fold(0, |mask, (channel, _)| mask | (1 << channel_slot(channel)))
         } else {
             0
         };
@@ -867,7 +866,7 @@ impl CompositeProgram {
                 // as its children changed it. Keep the geometry restriction at the
                 // group boundary if children publish anchors beyond it.
                 if mask.is_none()
-                    && set.channels.iter().all(|&(channel, _)| {
+                    && display_channels().all(|(channel, _)| {
                         layer.blend(channel).is_some_and(|blend| {
                             (if measured_blend { blend.mode == BlendMode::Passthrough } else { blend.mode != BlendMode::Disable })
                                 && blend.opacity.is_finite()
@@ -881,7 +880,7 @@ impl CompositeProgram {
                 }
                 let mut weights = [0.0f32; DISPLAY_CHANNELS];
                 let mut modes = [1; DISPLAY_CHANNELS];
-                for &(channel, _) in &set.channels {
+                for (channel, _) in display_channels() {
                     if let Some(blend) = layer.blend(channel).filter(|blend| blend.mode != BlendMode::Disable) {
                         if !blend.opacity.is_finite() {
                             return Err("A group has an invalid opacity.");
@@ -990,7 +989,7 @@ impl CompositeProgram {
             };
             let first_op = operations.len();
             let mut height_op = 0;
-            for &(channel, _) in &set.channels {
+            for (channel, _) in display_channels() {
                 if mask_background == 0.0 && mask_count == 0 {
                     break;
                 }
@@ -1112,7 +1111,7 @@ impl CompositeProgram {
             }
         }
         let mut display_outputs = display_bit(DisplayKind::BaseColor) | display_bit(DisplayKind::Orm);
-        for channel in Channel::ALL {
+        for (channel, _) in display_channels() {
             let slot = channel_slot(channel);
             if operations.iter().any(|op| {
                 !groups::is_group(op)
@@ -2864,6 +2863,41 @@ mod procedural_tests {
     use texturecraft_core::{Fill, Layer, Mask, OutputResolution, Procedural, TextureSet};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{srgb_lut, to_u16};
+
+    #[test]
+    fn user_channels_do_not_change_the_native_display_program() {
+        let mut project = Project::new("Custom channel outside the viewport material", "builtin:plane");
+        project.rules.blend = texturecraft_core::BlendRules::Measured;
+        let mut set = TextureSet::new("Plane", 0, TILE);
+        set.channels.push((Channel::User0, ChannelFormat::L32F));
+        let channels = set.channel_list();
+        project.texture_sets.push(set);
+
+        let folder = project.alloc_id();
+        let mut group = Layer::new(folder, "Translucent group", LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        group.channels.get_mut(&Channel::BaseColor).unwrap().opacity = 0.4;
+        project.insert_layer(0, group, None, false).unwrap();
+
+        let id = project.alloc_id();
+        let fill = Fill {
+            sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.2, 0.3, 0.4])), (Channel::User0, Source::Uniform([0.7; 3]))]),
+            ..Fill::default()
+        };
+        let layer = Layer::new(id, "Fill", LayerKind::Fill(fill), &channels);
+        project.insert_layer(0, layer, Some(folder), true).unwrap();
+
+        let pixels = PixelStore::default();
+        let program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+        assert!(!program.is_neutral());
+        assert!(project.texture_sets[0].has_channel(Channel::User0));
+        assert!(project.layers[&id].blend(Channel::User0).is_some());
+
+        project.texture_sets[0].channels.retain(|(channel, _)| *channel != Channel::User0);
+        let reference = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&program.operations), bytemuck::cast_slice::<_, u8>(&reference.operations));
+        assert_eq!(program.ramp_words, reference.ramp_words);
+        assert_eq!(program.display_outputs, reference.display_outputs);
+    }
 
     #[test]
     fn mask_and_content_anchors_match_cpu_in_material_and_mask_views() {
