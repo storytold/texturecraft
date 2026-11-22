@@ -2218,7 +2218,10 @@ pub(crate) mod tests {
         let levels_id = s.doc.project.alloc_id();
         let masked = s.doc.project.layers.get_mut(&masked).unwrap();
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(fill_id, EffectKind::Fill { source: Source::Uniform([0.22; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(
+            fill_id,
+            EffectKind::Fill { source: Source::Uniform([0.22; 3]), projection: Projection::default(), sampling: Default::default() },
+        ));
         mask.effects.push(Effect::new(invert_id, EffectKind::Filter(Filter::Invert)));
         masked.mask = Some(mask);
         masked.content_effects.push(Effect::new(levels_id, EffectKind::Filter(Filter::Clamp { min: 0.05, max: 0.75 })));

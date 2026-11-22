@@ -8,8 +8,8 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId,
-    LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Source,
+    Backface, BakedMap, BlendMode, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Filtering, Generator,
+    GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Projector, Sampling, ShapeCrop, Source,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
@@ -37,6 +37,7 @@ const NEIGHBOURHOOD_OPCODE: u32 = 36;
 const COMPARE_OPCODE: u32 = 37;
 const COLOR_SELECTION_OPCODE: u32 = 38;
 const NOOP_EFFECT_OPCODE: u32 = 39;
+const UV_TILE_PROJECTION: u32 = 10;
 const MASK_STAGE: u32 = 1 << 31;
 const GENERATOR_STAGE: u32 = 1 << 30;
 const MATERIAL_ANCHOR_STAGE: u32 = 1 << 29;
@@ -753,10 +754,7 @@ impl CompositeProgram {
                 LayerKind::Paint => None,
                 _ => return Err("A group or another layer type uses CPU compositing."),
             };
-            let decal = fill.and_then(|fill| match fill.projection {
-                Projection::Decal(frame) => Some(procedural.materials.register_decal(frame, fill.sources.values())),
-                _ => None,
-            });
+            let decal = fill.map(|fill| register_decal(fill, &mut procedural.materials)).transpose()?.flatten();
 
             let height = layer.height_mask;
             let height_params = if height.enabled && mask_count != 0 {
@@ -824,7 +822,7 @@ impl CompositeProgram {
                 let mut op = if fill.is_none() {
                     content_paint(layer.id, channel, painted, brush_value, stencil_pigment, &mut paint)
                 } else {
-                    fill.and_then(|fill| source_operation(source, &fill.projection, default, channel.kind(), &mut procedural))
+                    fill.and_then(|fill| source_operation(source, &fill.projection, fill.sampling, default, channel.kind(), &mut procedural))
                         .ok_or("A fill source or projection uses CPU compositing.")?
                 };
                 if let Some(decal) = decal {
@@ -1053,10 +1051,10 @@ fn content_deposit(
     }
     let mut op = if let EffectKind::Material(fill) = &effect.kind {
         let Some(source) = fill.sources.get(&channel) else { return Ok(None) };
-        let mut op = source_operation(Some(source), &fill.projection, channel.default_value(), channel.kind(), procedural)
+        let mut op = source_operation(Some(source), &fill.projection, fill.sampling, channel.default_value(), channel.kind(), procedural)
             .ok_or("A content material source or projection uses CPU compositing.")?;
-        if let Projection::Decal(frame) = fill.projection {
-            op.uv[0] = procedural.materials.register_decal(frame, fill.sources.values()) as f32;
+        if let Some(decal) = register_decal(fill, &mut procedural.materials)? {
+            op.uv[0] = decal as f32;
         }
         bind_tile_source(&mut op, Some(source), tile_patterns);
         op.ids[0] = channel_slot(channel);
@@ -1084,10 +1082,10 @@ fn compile_mask(
     let Some(mask) = mask else { return Ok(1.0) };
     for effect in mask.effects.iter().filter(|e| e.visible) {
         let mut op = match &effect.kind {
-            EffectKind::Fill { source, projection } => {
-                let mut operation = source_operation(Some(source), projection, [0.0; 3], ChannelKind::Scalar, procedural)
+            EffectKind::Fill { source, projection, sampling } => {
+                let mut operation = source_operation(Some(source), projection, *sampling, [0.0; 3], ChannelKind::Scalar, procedural)
                     .ok_or("A mask fill source or projection uses CPU compositing.")?;
-                if let Projection::Decal(frame) = projection {
+                if let Some(frame) = projection.placed() {
                     operation.uv[0] = procedural.materials.register_decal(*frame, std::iter::once(source)) as f32;
                 }
                 operation
@@ -1199,18 +1197,34 @@ fn bind_tile_source(op: &mut Operation, source: Option<&Source>, patterns: &mut 
     }
 }
 
+fn register_decal(fill: &texturecraft_core::Fill, materials: &mut MaterialImages) -> Result<Option<u32>, &'static str> {
+    let Some(frame) = fill.projection.placed() else { return Ok(None) };
+    // A decal's image alpha also controls the non-image channels.
+    if fill.sampling.filtering != Filtering::BilinearSharp && fill.sources.values().any(|source| matches!(source, Source::Image { .. })) {
+        return Err("A decal's image filtering uses CPU compositing.");
+    }
+    Ok(Some(materials.register_decal(*frame, fill.sources.values())))
+}
+
 fn source_operation(
     source: Option<&Source>,
     projection: &Projection,
+    sampling: Sampling,
     default: [f32; 3],
     channel: ChannelKind,
     inputs: &mut ProceduralInputs,
 ) -> Option<Operation> {
+    if !supports_projection(projection, sampling) {
+        return None;
+    }
     let mut op = Operation::zeroed();
     match source {
         None => op.low[..3].copy_from_slice(&default),
         Some(Source::Uniform(value)) => op.low[..3].copy_from_slice(value),
         Some(Source::Image { name, normal_format }) => {
+            if sampling.filtering != Filtering::BilinearSharp {
+                return None;
+            }
             let kind = match channel {
                 ChannelKind::Color => 0,
                 ChannelKind::Scalar => 1,
@@ -1230,28 +1244,30 @@ fn source_operation(
                     op.projection = [cos, sin, scale[0], scale[1]];
                     op.uv[..2].copy_from_slice(offset);
                 }
-                Projection::Triplanar { scale, sharpness, offset } => {
+                Projection::UvTile => op.procedural[3] = UV_TILE_PROJECTION,
+                Projection::Triplanar { scale, sharpness, offset, .. } => {
                     op.projection = [offset[0], offset[1], offset[2], *scale];
                     op.procedural[3] = 1;
                     op.balance[3] = sharpness.max(1.0);
                 }
-                Projection::Planar { scale, axis, offset } => {
+                Projection::Planar { placed: Some(_), .. } => {}
+                Projection::Planar { scale, axis, offset, .. } => {
                     op.projection = [offset[0], offset[1], offset[2], *scale];
                     op.procedural[3] = 2 + u32::from((*axis).min(2));
                 }
-                Projection::Spherical { scale } => {
-                    op.projection[3] = *scale;
+                Projection::Spherical { scale, offset, .. } => {
+                    op.projection = [offset[0], offset[1], offset[2], *scale];
                     op.procedural[3] = 5;
                 }
-                Projection::Cylindrical { scale, axis } => {
-                    op.projection[3] = *scale;
+                Projection::Cylindrical { scale, axis, offset, .. } => {
+                    op.projection = [offset[0], offset[1], offset[2], *scale];
                     op.procedural[3] = match axis {
                         0 => 6,
                         2 => 8,
                         _ => 7,
                     };
                 }
-                Projection::Decal(_) => {}
+                Projection::Warp { .. } => return None,
             }
         }
         Some(Source::Anchor { anchor, channel: read_channel, ramp }) => {
@@ -1329,6 +1345,8 @@ fn source_operation(
                         return None;
                     }
                 }
+                Projection::UvTile => op.procedural[3] = UV_TILE_PROJECTION,
+                Projection::Planar { placed: Some(_), .. } => {}
                 Projection::Triplanar { scale, offset, .. } | Projection::Planar { scale, offset, .. } => {
                     let frequency = *scale * op.uv[2];
                     if offset.iter().any(|o| frequency.abs() + o.abs() > 32_768.0) {
@@ -1342,12 +1360,12 @@ fn source_operation(
                         op.balance[3] = sharpness.max(1.0);
                     }
                 }
-                Projection::Spherical { scale } | Projection::Cylindrical { scale, .. } => {
+                Projection::Spherical { scale, offset, .. } | Projection::Cylindrical { scale, offset, .. } => {
                     let frequency = *scale * op.uv[2];
                     if frequency.abs() * 4.0 > 32_768.0 {
                         return None;
                     }
-                    op.projection[3] = frequency;
+                    op.projection = [offset[0], offset[1], offset[2], frequency];
                     op.procedural[3] = match projection {
                         Projection::Cylindrical { axis: 0, .. } => 6,
                         Projection::Cylindrical { axis: 2, .. } => 8,
@@ -1355,14 +1373,35 @@ fn source_operation(
                         _ => 5,
                     };
                 }
-                Projection::Decal(_) => {}
+                Projection::Warp { .. } => return None,
             }
         }
     }
-    if matches!(projection, Projection::Decal(_)) {
+    if projection.placed().is_some() {
         op.procedural[3] = DECAL_PROJECTION;
     }
     op.low.iter().chain(&op.high).chain(&op.projection).chain(&op.uv).chain(&op.balance).all(|v| v.is_finite()).then_some(op)
+}
+
+fn supports_projection(projection: &Projection, sampling: Sampling) -> bool {
+    // Keep the CPU result for projection features the compositor does not encode yet.
+    if sampling.wrap.repeats() != (true, true) || (sampling.symmetry.on && projection.takes_symmetry()) {
+        return false;
+    }
+    match projection {
+        Projection::Uv { .. } | Projection::UvTile => true,
+        Projection::Triplanar { uv, projector, .. } | Projection::Spherical { uv, projector, .. } => uv.is_default() && projector.is_default(),
+        Projection::Planar { uv, projector, placed, .. } => {
+            let expected = if placed.is_some() {
+                Projector { crop: ShapeCrop::Cropped, backface: Backface { on: true, ..Backface::default() }, ..Projector::default() }
+            } else {
+                Projector::default()
+            };
+            uv.is_default() && *projector == expected
+        }
+        Projection::Cylindrical { uv, projector, angle, .. } => uv.is_default() && projector.is_default() && *angle == texturecraft_core::FULL_TURN_DEGREES,
+        Projection::Warp { .. } => false,
+    }
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
@@ -1384,14 +1423,14 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
         ..Operation::zeroed()
     };
     if let Some(source) = generator.kind.inputs().first().and_then(|map| generator.inputs.get(map)) {
-        let mut source_op = source_operation(Some(source), &Projection::default(), [0.0; 3], ChannelKind::Scalar, inputs)?;
+        let mut source_op = source_operation(Some(source), &Projection::default(), Sampling::SAVED_BEFORE, [0.0; 3], ChannelKind::Scalar, inputs)?;
         bind_tile_source(&mut source_op, Some(source), patterns);
         inputs.generator_sources.push(source_op);
         op.effects[3] = inputs.generator_sources.len() as u32;
     }
     if let Some(micro) = generator.micro {
         let source = Source::Anchor { anchor: micro.anchor, channel: Channel::Height, ramp: Vec::new() };
-        let source = source_operation(Some(&source), &Projection::default(), [0.0; 3], ChannelKind::Signed, inputs)?;
+        let source = source_operation(Some(&source), &Projection::default(), Sampling::SAVED_BEFORE, [0.0; 3], ChannelKind::Signed, inputs)?;
         inputs.generator_sources.push(source);
         op.effects[2] = inputs.generator_sources.len() as u32;
         op.uv[2] = if micro.amount.is_finite() { micro.amount.clamp(0.0, 1.0) } else { 0.0 };
@@ -2448,7 +2487,10 @@ mod procedural_tests {
         let source = BTreeMap::from([(Channel::Height, Source::Uniform([0.8; 3]))]);
         let mut layer = Layer::new(lower, "Donor", LayerKind::Fill(Fill { sources: source, ..Fill::default() }), &channels);
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.6; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.6; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        ));
         mask.effects.push(Effect::new(mask_anchor, EffectKind::Anchor));
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
         layer.mask = Some(mask);
@@ -2480,6 +2522,7 @@ mod procedural_tests {
             EffectKind::Fill {
                 source: Source::Anchor { anchor: after_group_anchor, channel: Channel::Height, ramp: Vec::new() },
                 projection: Projection::default(),
+                sampling: Sampling::SAVED_BEFORE,
             },
         );
         mix_height.opacity = 0.3;
@@ -2560,7 +2603,10 @@ mod procedural_tests {
             &channels,
         );
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.8; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.8; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        ));
         mask.effects.push(Effect::new(mask_anchor, EffectKind::Anchor));
         donor.mask = Some(mask);
         donor.content_effects.push(Effect::new(content_anchor, EffectKind::Anchor));
@@ -2640,17 +2686,20 @@ mod procedural_tests {
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("AO override"));
         let pixels = PixelStore::default();
         let baked = BakedMaps::default();
-        let images = ImageStore::from([(
-            "AO override".into(),
-            Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[0.15; 4], [0.7; 4], [0.85; 4], [0.3; 4]], srgb: false }),
-        )]);
+        let images = ImageStore::from([("AO override".into(), Arc::new(ImageRes::new(2, 2, vec![[0.15; 4], [0.7; 4], [0.85; 4], [0.3; 4]], false)))]);
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.58; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.58; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        ));
         let mut effect = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
         effect.blend = BlendMode::LinearDodge;
         effect.opacity = 0.83;
         mask.effects.push(effect);
-        let mut subtract = Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.22; 3]), projection: Projection::default() });
+        let mut subtract = Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.22; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        );
         subtract.blend = BlendMode::Subtract;
         mask.effects.push(subtract);
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 })));
@@ -2701,7 +2750,7 @@ mod procedural_tests {
         layer.channels.get_mut(&Channel::BaseColor).unwrap().mode = BlendMode::Replace;
         let material = Fill {
             sources: BTreeMap::from([(Channel::BaseColor, Source::image("Decal")), (Channel::Height, Source::Uniform([-0.29; 3]))]),
-            projection: Projection::Decal(Decal {
+            projection: Projection::decal(Decal {
                 center: [-0.14, 0.0, 0.13],
                 normal: [0.0, 1.0, 0.0],
                 up: [0.0, 0.0, 1.0],
@@ -2712,6 +2761,7 @@ mod procedural_tests {
                 symmetry: None,
                 flip: [false, true],
             }),
+            sampling: Sampling::SAVED_BEFORE,
             ..Fill::default()
         };
         let mut material = Effect::new(project.alloc_id(), EffectKind::Material(material));
@@ -2743,7 +2793,7 @@ mod procedural_tests {
         }
         let images = ImageStore::from([(
             "Decal".into(),
-            Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[0.18, 0.26, 0.63, 0.14], [0.36, 0.8, 0.16, 0.82], [0.72; 4], [0.39; 4]], srgb: true }),
+            Arc::new(ImageRes::new(2, 2, vec![[0.18, 0.26, 0.63, 0.14], [0.36, 0.8, 0.16, 0.82], [0.72; 4], [0.39; 4]], true)),
         )]);
         let alpha = input_texture(&gpu.device, "test content stroke", size, 1, wgpu::TextureFormat::R16Uint);
         let mut preview = StrokePreview {
@@ -2952,7 +3002,7 @@ mod procedural_tests {
         let source = Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
         let fill = Fill {
             sources: BTreeMap::from([(Channel::BaseColor, source)]),
-            projection: Projection::Triplanar { scale: 1.0, sharpness: 6.0, offset: [0.0; 3] },
+            projection: Projection::Triplanar { scale: 1.0, sharpness: 6.0, offset: [0.0; 3], uv: Default::default(), projector: Default::default() },
             ..Default::default()
         };
         let layer = Layer::new(project.alloc_id(), "Overlapping tiles", LayerKind::Fill(fill), &[Channel::BaseColor]);
@@ -3004,7 +3054,10 @@ mod procedural_tests {
             effect.opacity = 0.77;
             layer.content_effects.push(effect);
             let mut mask = Mask::new(MaskBackground::Black);
-            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.36; 3]), projection: Projection::default() }));
+            mask.effects.push(Effect::new(
+                project.alloc_id(),
+                EffectKind::Fill { source: Source::Uniform([0.36; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+            ));
             let mut effect = Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone()));
             effect.opacity = 0.63;
             effect.blend = BlendMode::Multiply;
@@ -3074,7 +3127,10 @@ mod procedural_tests {
         let fill = Fill { sources: BTreeMap::from([(color, Source::Uniform([0.89, 0.19, 0.04]))]), ..Default::default() };
         let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &[color]);
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.75; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.75; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        ));
         let raw = [0.40101, 0.69217, 0.05289];
         let within = [0.375; 3];
         let exact = [0.21875, 0.78125, 0.09375];
@@ -3292,7 +3348,10 @@ mod procedural_tests {
         layer.geometry_mask = Some(vec!["Shared part".into(), "Layer only".into()]);
         layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.375; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.375; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        ));
         let mut compare = Effect::new(comparison, EffectKind::Compare { op: CompareOp::LesserThan, value: 0.5, tolerance: 0.0 });
         compare.opacity = 0.5;
         compare.blend = BlendMode::Multiply;
@@ -3710,7 +3769,8 @@ mod procedural_tests {
             gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
         }
         let uv = Projection::Uv { scale: [1.15, 0.76], rotation: 13.0, offset: [-0.51, 0.12] };
-        let triplanar = Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43] };
+        let triplanar =
+            Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43], uv: Default::default(), projector: Default::default() };
         let cases = ProceduralKind::ALL
             .iter()
             .copied()
@@ -3722,9 +3782,9 @@ mod procedural_tests {
         let reduced = [
             uv.clone(),
             triplanar.clone(),
-            Projection::Planar { scale: 0.8, axis: 1, offset: [0.03, 0.0, 0.34] },
-            Projection::Spherical { scale: 0.9 },
-            Projection::Cylindrical { scale: 0.7, axis: 2 },
+            Projection::Planar { scale: 0.8, axis: 1, offset: [0.03, 0.0, 0.34], uv: Default::default(), projector: Default::default(), placed: None },
+            Projection::Spherical { scale: 0.9, uv: Default::default(), projector: Default::default(), offset: [0.0; 3] },
+            Projection::Cylindrical { scale: 0.7, axis: 2, uv: Default::default(), projector: Default::default(), offset: [0.0; 3], angle: 360.0 },
         ]
         .into_iter()
         .flat_map(|projection| [(reduced_pattern.clone(), projection.clone(), false, ramp.clone()), (reduced_pattern.clone(), projection, true, ramp.clone())]);
@@ -3742,7 +3802,8 @@ mod procedural_tests {
             let mut layer = Layer::new(project.alloc_id(), "Procedural fill", LayerKind::Fill(fill), &[Channel::BaseColor]);
             if in_mask {
                 let mut mask = Mask::new(MaskBackground::Black);
-                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone() }));
+                mask.effects
+                    .push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone(), sampling: Sampling::SAVED_BEFORE }));
                 layer.mask = Some(mask);
             }
             project.insert_layer(0, layer, None, false).unwrap();
@@ -3777,7 +3838,7 @@ mod procedural_tests {
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
         let (lo, hi) = mesh.bounds();
-        let image = |rgba| Arc::new(ImageRes { width: 2, height: 2, rgba, srgb: false });
+        let image = |rgba| Arc::new(ImageRes::new(2, 2, rgba, false));
         let images = ImageStore::from([
             ("tile".into(), image(vec![[1.0, 0.0, 0.0, 1.0], [1.0; 4], [0.0; 4], [0.4; 4]])),
             ("another".into(), image(vec![[0.3; 4], [0.6; 4], [0.2; 4], [0.9; 4]])),
@@ -3791,7 +3852,7 @@ mod procedural_tests {
         for (index, shape) in TileShape::ALL.into_iter().enumerate() {
             let in_mask = index % 2 != 0;
             let projection = if in_mask {
-                Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43] }
+                Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43], uv: Default::default(), projector: Default::default() }
             } else {
                 Projection::Uv { scale: [1.15, 0.76], rotation: 13.0, offset: [-0.51, 0.12] }
             };
@@ -3848,7 +3909,8 @@ mod procedural_tests {
             let mut layer = Layer::new(project.alloc_id(), "Tile Generator", LayerKind::Fill(fill), &[Channel::BaseColor]);
             if in_mask {
                 let mut mask = Mask::new(MaskBackground::Black);
-                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone() }));
+                mask.effects
+                    .push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone(), sampling: Sampling::SAVED_BEFORE }));
                 layer.mask = Some(mask);
             }
             project.insert_layer(0, layer, None, false).unwrap();
@@ -3887,7 +3949,7 @@ mod procedural_tests {
         mesh.normals.fill(Vec3::new(0.3, 0.9, -0.2).normalize());
         let mesh = Arc::new(mesh);
         let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
-        let image = |rgba, srgb| Arc::new(ImageRes { width: 2, height: 2, rgba, srgb });
+        let image = |rgba, srgb| Arc::new(ImageRes::new(2, 2, rgba, srgb));
         let bytes = [[18, 206, 44, 17], [191, 51, 20, 237], [44, 12, 99, 0], [213, 221, 40, 110]].map(|pixel| pixel.map(|v| v as f32 / 255.0));
         let shorts = [[15324, 60403, 21177, 65535], [33499, 2177, 5828, 0], [21643, 8005, 11999, 9001], [57132, 39801, 6021, 32777]]
             .map(|pixel| pixel.map(|v| v as f32 / 65535.0));
@@ -3910,15 +3972,15 @@ mod procedural_tests {
         };
         let projections = [
             Projection::Uv { scale: [1.21, -0.78], rotation: 39.0, offset: [-0.54, 0.16] },
-            Projection::Triplanar { scale: 0.63, sharpness: 2.1, offset: [0.14, -0.27, 0.31] },
-            Projection::Planar { scale: 1.4, axis: 0, offset: [0.04, 0.23, 0.18] },
-            Projection::Planar { scale: 0.9, axis: 1, offset: [-0.18, -0.34, 1.03] },
-            Projection::Planar { scale: 1.1, axis: 2, offset: [0.65, -0.26, -0.31] },
-            Projection::Spherical { scale: 1.09 },
-            Projection::Cylindrical { scale: 1.21, axis: 0 },
-            Projection::Cylindrical { scale: 2.19, axis: 1 },
-            Projection::Cylindrical { scale: 0.87, axis: 2 },
-            Projection::Decal(decal),
+            Projection::Triplanar { scale: 0.63, sharpness: 2.1, offset: [0.14, -0.27, 0.31], uv: Default::default(), projector: Default::default() },
+            Projection::Planar { scale: 1.4, axis: 0, offset: [0.04, 0.23, 0.18], uv: Default::default(), projector: Default::default(), placed: None },
+            Projection::Planar { scale: 0.9, axis: 1, offset: [-0.18, -0.34, 1.03], uv: Default::default(), projector: Default::default(), placed: None },
+            Projection::Planar { scale: 1.1, axis: 2, offset: [0.65, -0.26, -0.31], uv: Default::default(), projector: Default::default(), placed: None },
+            Projection::Spherical { scale: 1.09, uv: Default::default(), projector: Default::default(), offset: [0.0; 3] },
+            Projection::Cylindrical { scale: 1.21, axis: 0, uv: Default::default(), projector: Default::default(), offset: [0.0; 3], angle: 360.0 },
+            Projection::Cylindrical { scale: 2.19, axis: 1, uv: Default::default(), projector: Default::default(), offset: [0.0; 3], angle: 360.0 },
+            Projection::Cylindrical { scale: 0.87, axis: 2, uv: Default::default(), projector: Default::default(), offset: [0.0; 3], angle: 360.0 },
+            Projection::decal(decal),
         ];
         let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal];
         for projection in projections {
@@ -3932,13 +3994,17 @@ mod procedural_tests {
                     (Channel::Normal, Source::Image { name: "normal".into(), normal_format: NormalFormat::DirectX }),
                 ]),
                 projection: projection.clone(),
+                sampling: Sampling::SAVED_BEFORE,
                 ..Fill::default()
             };
             let owner = project.alloc_id();
             let mut layer = Layer::new(owner, "Material images", LayerKind::Fill(fill), &channels);
             let mut mask = Mask::new(MaskBackground::Black);
             let mask_source = Source::image("normal");
-            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: mask_source, projection: projection.clone() }));
+            mask.effects.push(Effect::new(
+                project.alloc_id(),
+                EffectKind::Fill { source: mask_source, projection: projection.clone(), sampling: Sampling::SAVED_BEFORE },
+            ));
             layer.mask = Some(mask);
             project.insert_layer(0, layer, None, false).unwrap();
             let pixels = PixelStore::default();

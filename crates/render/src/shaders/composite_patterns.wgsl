@@ -125,33 +125,44 @@ fn sample_procedural(layer: Operation, p: vec3<f32>) -> f32 {
     return select(values.x, mix(mix(values.x, values.y, t.x), mix(values.z, values.w, t.x), t.y), reduced);
 }
 
+fn triplanar_weights(normal: vec3<f32>, sharpness: f32) -> vec3<f32> {
+    let axes = abs(normal);
+    let strongest = max(axes.x, max(axes.y, axes.z));
+    if strongest <= 0.0 {
+        return vec3(0.0);
+    }
+    // Keep the strongest axis at one to preserve normalized blends at high sharpness.
+    let weights = pow(axes / strongest, vec3(sharpness));
+    return weights / (weights.x + weights.y + weights.z);
+}
+
 fn procedural_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
     let mode = layer.procedural.w;
     let p = surface.position * layer.projection.w + layer.projection.xyz;
     var points = array<vec2<f32>, 3>(p.zy, p.xz, p.xy);
     var w = vec3(1.0, 0.0, 0.0);
     if mode == 1u {
-        let weighted = pow(abs(surface.normal), vec3(layer.balance.w));
-        let weights = weighted / max(weighted.x + weighted.y + weighted.z, 1e-6);
+        let weights = triplanar_weights(surface.normal, layer.balance.w);
         let minimum = 1.0 / (131072.0 * max(layer.uv.w, 1.0));
-        let retained = select(vec3(0.0), weights, weights >= vec3(minimum));
-        w = select(retained, weights, all(retained == vec3(0.0)));
+        w = select(vec3(0.0), weights, weights >= vec3(minimum));
     } else {
         switch mode {
             case 2u: {}
             case 3u: { points[0] = p.xz; }
             case 4u: { points[0] = p.xy; }
             case 5u: {
+                let position = surface.position + layer.projection.xyz;
                 var d = vec3(0.0, 1.0, 0.0);
-                if dot(surface.position, surface.position) > 0.0 { d = normalize(surface.position); }
+                if dot(position, position) > 0.0 { d = normalize(position); }
                 points[0] = vec2(azimuth(d.z, d.x) * 4.0, acos(clamp(d.y, -1.0, 1.0)) * (2.0 / 3.141592654)) * layer.projection.w;
             }
             case 6u, 7u, 8u: {
-                let pos = surface.position;
+                let pos = surface.position + layer.projection.xyz;
                 let axis = select(select(pos.xyz, pos.yxz, mode == 6u), pos.xzy, mode == 8u);
                 points[0] = vec2(azimuth(axis.z, axis.x) * 4.0, axis.y) * layer.projection.w;
             }
             case DECAL_PROJECTION: { points[0] = uv * layer.uv.z; }
+            case UV_TILE_PROJECTION: { points[0] = fract(uv) * layer.uv.z; }
             default: {
                 let rotation = layer.projection.xy;
                 let rotated = vec2(uv.x * rotation.x - uv.y * rotation.y, uv.x * rotation.y + uv.y * rotation.x);
