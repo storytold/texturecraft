@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use rayon::prelude::*;
-use texturecraft_engine::Session;
 use texturecraft_engine::compose::{DisplayKind, ImageRes, display_tile_bytes, kinds_for};
 use texturecraft_engine::core::{BakedMap, Channel, LayerId};
 use texturecraft_engine::geom::{Mesh, glam::Vec2};
 use texturecraft_engine::session::ReleasedDab;
+use texturecraft_engine::{Session, ViewMode};
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_engine::{
-    StackTarget, ViewMode, brush_device,
+    StackTarget, brush_device,
     compose::PaintTarget,
     paint::{Stamp, UvStamp},
     texel::TileImage,
