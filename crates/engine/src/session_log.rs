@@ -15,6 +15,24 @@ pub(crate) fn set_performance_log_path(path: std::path::PathBuf) {
     let _ = PERFORMANCE_LOG.set(path);
 }
 
+pub(crate) fn write_performance_log(entry: &LogEntry) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(path) = PERFORMANCE_LOG.get() {
+        use std::io::Write as _;
+        static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        let _guard = WRITE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "[{}] {}", entry.time.to_rfc3339(), entry.message);
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = entry;
+}
+
 impl SessionLog {
     pub fn new() -> SessionLog {
         SessionLog(Vec::new())
@@ -36,16 +54,7 @@ impl SessionLog {
     /// Keep timings in the session log and, on desktop, in the local diagnostic log.
     pub fn performance(&mut self, message: impl Into<String>) {
         let entry = LogEntry::new(LogLevel::Info, "Performance", message);
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(path) = PERFORMANCE_LOG.get() {
-            use std::io::Write as _;
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                let _ = writeln!(file, "[{}] {}", entry.time.to_rfc3339(), entry.message);
-            }
-        }
+        write_performance_log(&entry);
         self.0.push(entry);
     }
 

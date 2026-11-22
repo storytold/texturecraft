@@ -157,10 +157,11 @@ eighth, are reported). A set the original paints per UV tile imports as one text
 note in the report: where the file keeps each tile's pixels has not been seen yet.
 
 The import runs as an `engine::import_cmds::ImportTask` reporting to an `ImportProgress`: a fraction, the step (reading
-the file; per texture set converting and replaying strokes; cooking graphs or comparing with the original when
-requested; saving; and preparing the view) and a cancel flag. An interactive import evaluates procedural materials
-when it prepares the first view. CPU sets are composited on the worker and GPU sets go straight to the viewport.
-Offline import keeps the original-result comparison enabled by default. Inside a long step the bar moves by the work done: layers
+the file; per texture set converting, replaying strokes, and cooking graphs; saving; and preparing the view) and a
+cancel flag. The first cook prepares each stack's graph inputs before the viewport uses them. CPU sets are composited
+on the worker and GPU sets go straight to the viewport. Offline import keeps the original-result comparison enabled
+by default. The import window shows the latest graph or node activity. Native builds also record the phases and slow
+nodes in the local performance log. Inside a long step the bar moves by the work done: layers
 translated, strokes laid, graphs cooked (a running render by its nodes) against the graphs the stack runs, tiles
 composited. The flag is checked
 between steps, texture sets and strokes, and the imported project's graph store renders under it, so a graph render in

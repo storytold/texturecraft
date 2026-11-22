@@ -410,6 +410,9 @@ pub struct UseProblem {
     pub reason: String,
 }
 
+/// Listener for cold graph cook and node diagnostics.
+pub type CookTrace = Arc<dyn Fn(String) + Send + Sync>;
+
 /// Cooked outputs and what is known about them, shared by every snapshot of a document (a cook's key decides its
 /// pixels, so snapshots never disagree about one).
 #[derive(Default)]
@@ -424,6 +427,7 @@ pub struct CookCache {
     /// Fingerprints of baked maps and image resources by the address and length of their data.
     fingerprints: Mutex<HashMap<(usize, usize), u128>>,
     pool: OnceLock<Option<Arc<ThreadPool>>>,
+    trace: Mutex<Option<CookTrace>>,
     /// Where cooks are also kept between documents and runs ([`kept`]), if anywhere.
     kept: Mutex<Option<Arc<dyn KeptCooks>>>,
     /// Cooks found there instead of rendered.
@@ -456,6 +460,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn trace_name(name: &str) -> &str {
+    name.rsplit(['/', '\\']).next().unwrap_or_default()
+}
+
 /// The kinds of the nodes a graph text has (the third word of its `node` lines, nested graphs included).
 fn node_kinds(text: &str) -> BTreeSet<&str> {
     text.lines().filter_map(|l| l.trim_start().strip_prefix("node ")).filter_map(|rest| rest.split_whitespace().nth(1)).collect()
@@ -484,6 +492,11 @@ impl GraphStore {
     /// Also keeps cooks in `kept` (and looks there before rendering), for every snapshot sharing this store's cooks.
     pub fn keep_cooks_in(&self, kept: Option<Arc<dyn KeptCooks>>) {
         *lock(&self.cooks.kept) = kept;
+    }
+
+    /// Report diagnostics from uncached graph renders until the listener is removed.
+    pub fn trace_cooks(&self, trace: Option<CookTrace>) {
+        *lock(&self.cooks.trace) = trace;
     }
 
     /// Cooks found where they are kept ([`GraphStore::keep_cooks_in`]) instead of rendered.
@@ -806,21 +819,36 @@ impl GraphStore {
         if self.cooks.cancel.is_cancelled() {
             return Err("cancelled".to_string());
         }
+        let trace = lock(&self.cooks.trace).clone();
+        let name = trace_name(&g.name);
         if let Some(back) = self.cooks.spilled.get(key) {
+            if let Some(emit) = &trace {
+                emit(format!("Graph {name:?}: loaded from project cache ({key})"));
+            }
             self.cooks.filled.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::new(back));
         }
         let kept = lock(&self.cooks.kept).clone();
         if let Some(found) = kept.as_ref().and_then(|k| k.get(key)).and_then(|bytes| kept::decode(&bytes)) {
+            if let Some(emit) = &trace {
+                emit(format!("Graph {name:?}: result cache hit ({key})"));
+            }
             self.cooks.kept_found.fetch_add(1, Ordering::Relaxed);
             self.cooks.filled.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::new(found));
         }
         self.cooks.renders.fetch_add(1, Ordering::Relaxed);
+        if let Some(emit) = &trace {
+            emit(format!("Graph {name:?}: preparing {} px cook ({key})", env.side));
+        }
         // a share of the render budget for its estimated peak; nested graphs render within their parent's
         let share = if depth == 0 { Some(budget::acquire(budget::estimate(&*self.parsed(&g.key)?, env.side))) } else { None };
-        let cooked = self.render(g, env, given, depth);
+        let cooked = self.render(g, env, given, depth, trace.clone());
         drop(share);
+        if let Some(emit) = &trace {
+            let status = if cooked.is_ok() { "finished" } else { "stopped" };
+            emit(format!("Graph {name:?}: {status} ({key})"));
+        }
         let cooked = cooked?;
         // a render stopped part way never gets here: it is an error
         if let Some(k) = &kept {
@@ -859,7 +887,7 @@ impl GraphStore {
     }
 
     /// Renders `g` (see the module docs).
-    fn render(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)], depth: usize) -> Result<Cooked, String> {
+    fn render(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)], depth: usize, trace: Option<CookTrace>) -> Result<Cooked, String> {
         let side = env.side;
         let pool = self.pool();
         let mut graph = (*self.parsed(&g.key)?).clone();
@@ -904,12 +932,61 @@ impl GraphStore {
         }
         // the render's nodes as they finish, for the store's progress (nothing computed depends on it)
         let done = Arc::new(AtomicUsize::new(0));
-        let _running = Running::start(&self.cooks.running, done.clone(), graph.work_nodes());
-        let ec = EvalContext { cancel: self.cooks.cancel.clone(), pool, files: Files::none(), nodes_done: Some(done), ..EvalContext::default() };
+        let nodes = graph.work_nodes();
+        let _running = Running::start(&self.cooks.running, done.clone(), nodes);
+        let profiler = trace.map(|emit| {
+            let graph = trace_name(&g.name).to_owned();
+            emit(format!("Graph {graph:?}: evaluating {nodes} nodes"));
+            Arc::new(CookProfiler { emit, graph }) as Arc<dyn texturecraft_graph::profile::Profiler>
+        });
+        let ec = EvalContext { cancel: self.cooks.cancel.clone(), pool, files: Files::none(), nodes_done: Some(done), profiler, ..EvalContext::default() };
         let outs = evaluate(&graph, &ec, side, images, given)?;
         let linear: BTreeSet<String> =
             graph.meta.get("working").map(|w| w.trim_matches('"').split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
         Ok(Cooked::from_textures(outs, linear))
+    }
+}
+
+struct CookProfiler {
+    emit: CookTrace,
+    graph: String,
+}
+
+impl texturecraft_graph::profile::Profiler for CookProfiler {
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    fn span(&self, _: &str) -> Box<dyn std::any::Any + Send> {
+        Box::new(())
+    }
+
+    fn node(&self, id: u32, kind: &str, (width, height): (usize, usize)) -> Option<Box<dyn std::any::Any + Send>> {
+        let description = format!("#{id} {kind} ({width}×{height}) in {:?}", self.graph);
+        (self.emit)(format!("Node {description}"));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Some(Box::new(CookNodeTime { emit: self.emit.clone(), description, started: std::time::Instant::now() }))
+        }
+        #[cfg(target_arch = "wasm32")]
+        None
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct CookNodeTime {
+    emit: CookTrace,
+    description: String,
+    started: std::time::Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for CookNodeTime {
+    fn drop(&mut self) {
+        let ms = self.started.elapsed().as_millis();
+        if ms >= 100 {
+            (self.emit)(format!("Slow node {}: {ms} ms", self.description));
+        }
     }
 }
 

@@ -141,6 +141,8 @@ pub struct Hooks<'h> {
     pub replay: Option<&'h dyn StrokeReplayer>,
     /// Where graph cooks are also kept between imports (a folder on the desktop; `None`: render every one).
     pub kept_cooks: Option<std::sync::Arc<dyn texturecraft_compose::graphs::KeptCooks>>,
+    /// Live diagnostics from graph evaluation, scoped to this import.
+    pub trace: Option<texturecraft_compose::graphs::CookTrace>,
 }
 
 impl Hooks<'_> {
@@ -261,6 +263,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         strokes: BTreeMap::new(),
     };
     imported.graphs.keep_cooks_in(hooks.kept_cooks.clone());
+    imported.graphs.trace_cooks(hooks.trace.clone());
     for source in &binding.sets {
         mesh::merge_slots(&mut mesh, source.slot, &source.merged_slots);
         for m in &source.merged_slots {
@@ -436,7 +439,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     // in its original precision after compositing the stack.
     let mut cache: Vec<StoredChannel> = Vec::new();
     let only = ctx.options.translate_only;
-    let prepare_reference = !ctx.options.measure && !ctx.options.precompute_graphs;
+    let prepare_reference = !ctx.options.measure;
     let mut cached_resolution = None;
     match ctx.source.cache_set.as_ref().filter(|_| !only) {
         None if only => {}
@@ -680,7 +683,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let mut scores = Vec::new();
     let mut corrections: Vec<correction::ChannelCorrection> = Vec::new();
     let measuring = ctx.options.measure && !cache.is_empty() && stack.is_some();
-    let cooking = !only && ctx.options.precompute_graphs && stack.as_ref().is_some_and(|s| s.layers.iter().any(|l| !l.graphs().is_empty()));
+    let cooking = !only && stack.as_ref().is_some_and(|s| s.layers.iter().any(|l| !l.graphs().is_empty()));
     if measuring || cooking {
         ctx.hooks.check()?;
         let (set, of) = ctx.index;

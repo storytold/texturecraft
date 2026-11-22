@@ -134,14 +134,20 @@ fn notice(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> O
 /// Convert and prepare CPU-only materials on the worker. The viewport schedules GPU materials as it opens.
 fn start(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> ImportUi {
     let (file, path) = (task.file_name(), task.source_path().map(str::to_string));
-    let progress = Arc::new(ImportProgress::new());
+    let progress = Arc::new(ImportProgress::with_live_log(&file));
     let worker = progress.clone();
     let prefer_gpu = app.ui.prefs.gpu_compositing && app.gpu.as_ref().is_some_and(crate::gpu::GpuLink::supports_gpu_layers);
     let rx = crate::spawn_worker("texturecraft-import", move || {
         task.for_interactive_open().run_with_view_where(&worker, |session| {
             (0..session.caches.len())
                 .take_while(|_| !worker.is_cancelled())
-                .filter(|&ts| !prefer_gpu || !crate::gpu::GpuLink::plans_import_set(session, ts))
+                .filter(|&ts| {
+                    let cpu = !prefer_gpu || !crate::gpu::GpuLink::plans_import_set(session, ts);
+                    let (w, h) = session.caches[ts].size;
+                    let backend = if cpu { "CPU view preparation" } else { "GPU viewport" };
+                    worker.log_detail(format!("Texture set {} at {w}×{h} uses {backend}", ts + 1));
+                    cpu
+                })
                 .collect()
         })
     });
@@ -181,6 +187,7 @@ pub fn status(app: &TextureCraftApp, now: f64) -> serde_json::Value {
             "fraction": progress.fraction(),
             "elapsed": now - started,
             "cancelled": progress.is_cancelled(),
+            "log": progress.log_lines(),
         }),
         Some(ImportUi::Failed { file, step, error }) => json!({ "window": "failed", "file": file, "step": step.id(), "error": error }),
     }
@@ -224,6 +231,13 @@ fn running(
         ui.add(egui::ProgressBar::new(progress.fraction()).desired_width(WIDTH).show_percentage());
         ui.label(text);
         ui.label(RichText::new(trf("Elapsed: {time}", &[("time", &clock(now - started))])).weak());
+        ui.add_space(8.0);
+        ui.label(tr("Import log"));
+        egui::ScrollArea::vertical().id_salt("import_live_log").max_height(144.0).auto_shrink([false; 2]).stick_to_bottom(true).show(ui, |ui| {
+            for line in progress.log_lines() {
+                ui.add(egui::Label::new(RichText::new(line).monospace().size(11.0)).wrap());
+            }
+        });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

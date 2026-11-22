@@ -8,9 +8,10 @@
 //! set. Programmatic calls never open dialogs; the two-window import (notice, progress) belongs to the UI.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
+use texturecraft_compose::graphs::CookTrace;
 use texturecraft_formats::ProjectFile;
 use texturecraft_import::{Cancel, Hooks, ImportOptions, Imported};
 /// The project file extension the import reads, and the import's steps.
@@ -18,6 +19,9 @@ pub use texturecraft_import::{PROJECT_EXT, Step};
 
 use crate::commands::{CommandSpec, always, bad, boolp, strp};
 use crate::{EngineError, Result, Session, cmd};
+
+mod live_log;
+use live_log::LiveLog;
 
 const ID: &str = "file.importProject";
 /// Largest project file accepted as `bytes` (the web build holds it in memory).
@@ -135,6 +139,7 @@ pub struct ImportProgress {
     /// at its next node.
     pub cancel: Cancel,
     listener: Option<Box<dyn Fn(f32, Step) + Send + Sync>>,
+    live_log: Option<Arc<LiveLog>>,
 }
 
 impl Default for ImportProgress {
@@ -145,12 +150,34 @@ impl Default for ImportProgress {
 
 impl ImportProgress {
     pub fn new() -> ImportProgress {
-        ImportProgress { state: Mutex::new((0.0, Step::ReadingFile)), cancel: Cancel::new(), listener: None }
+        ImportProgress { state: Mutex::new((0.0, Step::ReadingFile)), cancel: Cancel::new(), listener: None, live_log: None }
     }
 
     /// Progress that also calls `listener` on every report (fraction, step), on the thread running the import.
     pub fn with_listener(listener: impl Fn(f32, Step) + Send + Sync + 'static) -> ImportProgress {
         ImportProgress { listener: Some(Box::new(listener)), ..ImportProgress::new() }
+    }
+
+    /// Keep a live diagnostic history for this import, with timestamped entries in the desktop performance log.
+    pub fn with_live_log(file: &str) -> ImportProgress {
+        ImportProgress { live_log: Some(Arc::new(LiveLog::new(file))), ..ImportProgress::new() }
+    }
+
+    /// The latest diagnostic lines, in the order they appeared.
+    pub fn log_lines(&self) -> Vec<String> {
+        self.live_log.as_ref().map_or_else(Vec::new, |log| log.lines())
+    }
+
+    /// Publish an import diagnostic to the live history and local performance log.
+    pub fn log_detail(&self, message: impl AsRef<str>) {
+        if let Some(log) = &self.live_log {
+            log.record(message.as_ref());
+        }
+    }
+
+    fn cook_trace(&self) -> Option<CookTrace> {
+        let log = Arc::clone(self.live_log.as_ref()?);
+        Some(Arc::new(move |message| log.record(&message)))
     }
 
     /// The fraction done, 0..1 (never goes back).
@@ -165,7 +192,11 @@ impl ImportProgress {
 
     /// Asks the import to stop.
     pub fn cancel(&self) {
+        let requested = self.is_cancelled();
         self.cancel.cancel();
+        if !requested && let Some(log) = &self.live_log {
+            let _ = log.push("Cancellation requested");
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -174,12 +205,16 @@ impl ImportProgress {
 
     /// Reports `step` at `fraction` (the import does; a front end's tests may, to show a step).
     pub fn report(&self, fraction: f32, step: Step) {
-        let fraction = {
+        let (fraction, changed_step) = {
             let mut state = self.lock();
             let f = if fraction.is_finite() { fraction.clamp(state.0, 1.0) } else { state.0 };
+            let changed_step = state.1 != step;
             *state = (f, step);
-            f
+            (f, changed_step)
         };
+        if changed_step && self.live_log.is_some() {
+            self.log_detail(format!("{step} ({:.0}%)", fraction * 100.0));
+        }
         if let Some(l) = &self.listener {
             l(fraction, step);
         }
@@ -269,10 +304,9 @@ impl ImportTask {
         self
     }
 
-    /// Evaluate imported materials when preparing the first viewport composite.
-    /// Diagnostic comparisons are optional for an interactive open.
+    /// Skip the optional comparison with the stored reference for an interactive open.
+    /// Evaluate the imported graphs before preparing the viewport.
     pub fn for_interactive_open(mut self) -> ImportTask {
-        self.options.precompute_graphs = false;
         self.options.measure &= self.options.original_correction || self.options.original_on_top;
         self
     }
@@ -317,13 +351,15 @@ impl ImportTask {
     }
 
     fn run_with_view_policy(self, progress: &ImportProgress, view: Option<impl FnOnce(&Session) -> BTreeSet<usize>>) -> Result<ImportOutput> {
+        progress.log_detail("Reading the file");
+        let diagnostic_path = progress.live_log.as_ref().and(self.source_path()).filter(|path| !path.is_empty()).map(str::to_owned);
         let ImportTask { source, options, result_cache, .. } = self;
         let cache = result_cache.map(|c| c.open());
         #[cfg(not(target_arch = "wasm32"))]
         let kept = cache.as_ref().map(|c| c.kept.clone());
         #[cfg(target_arch = "wasm32")]
         let kept = None;
-        let mut out = run_kept(progress, kept, view, move |hooks| match source {
+        let result = run_kept(progress, kept, view, move |hooks| match source {
             #[cfg(not(target_arch = "wasm32"))]
             ImportSource::Path(path) => texturecraft_import::import_path(std::path::Path::new(&path), &options, hooks).map_err(|e| (e, Some(path))),
             ImportSource::Bytes { bytes, name } => {
@@ -335,7 +371,21 @@ impl ImportTask {
                 }
                 texturecraft_import::import_bytes(bytes, &name, &options, hooks).map_err(|e| (e, None))
             }
-        })?;
+        });
+        if let Some(log) = &progress.live_log {
+            match &result {
+                Ok(_) => log.record("Import ready to open"),
+                Err(_) if progress.is_cancelled() => log.record("Import cancelled"),
+                Err(error) => {
+                    let mut message = error.to_string();
+                    if let Some(path) = diagnostic_path.as_deref() {
+                        message = message.replace(path, log.file());
+                    }
+                    log.record(&format!("Import failed while {} ({message})", progress.step()));
+                }
+            }
+        }
+        let mut out = result?;
         if let (Some(c), Some(o)) = (&cache, out.summary.as_object_mut()) {
             o.insert("resultCache".into(), c.summary());
         }
@@ -372,7 +422,7 @@ fn run_kept(
     let (converting, saved) = if view.is_some() { (CONVERTING_WITH_VIEW, VIEW) } else { (CONVERTING, 1.0) };
     let report = |f: f32, step: Step| progress.report(f * converting, step);
     let replayer = crate::import_replay::CancellableReplayer::new(progress.cancel.clone());
-    let mut hooks = Hooks { progress: &report, cancel: &progress.cancel, replay: Some(&replayer), kept_cooks: kept };
+    let mut hooks = Hooks { progress: &report, cancel: &progress.cancel, replay: Some(&replayer), kept_cooks: kept, trace: progress.cook_trace() };
     let imported = convert(&mut hooks).map_err(|(e, path)| match (e, path) {
         (texturecraft_import::ImportError::Cancelled, _) => bad(ID, CANCELLED),
         (e, Some(path)) => bad(ID, format!("{path}: {e}")),
@@ -380,6 +430,14 @@ fn run_kept(
     })?;
     progress.check()?;
     progress.report(converting, Step::Saving);
+    if progress.live_log.is_some() {
+        progress.log_detail(format!(
+            "Converted {} texture sets ({} graph renders, {} disk cache hits)",
+            imported.project.texture_sets.len(),
+            imported.graphs.renders(),
+            imported.graphs.kept_found()
+        ));
+    }
     let summary = summary(&imported);
     let session = Session::from_imported(imported)?;
     progress.check()?;
@@ -388,8 +446,12 @@ fn run_kept(
     if let Some(select) = view {
         progress.report(saved, Step::ComputingView);
         progress.check()?;
+        progress.log_detail(format!("Selecting viewport backends for {} texture sets", out.session.caches.len()));
         let sets = select(&out.session);
         compute_view(&mut out.session, progress, saved, &sets)?;
+    }
+    if progress.live_log.is_some() {
+        out.session.doc.graphs.trace_cooks(None);
     }
     Ok(out)
 }
@@ -420,8 +482,13 @@ fn all_view_sets(session: &Session) -> BTreeSet<usize> {
 fn compute_view(session: &mut Session, progress: &ImportProgress, from: f32, sets: &BTreeSet<usize>) -> Result<()> {
     let pending_tiles =
         |session: &Session| sets.iter().filter_map(|&ts| session.caches.get(ts)).map(|cache| cache.dirty.len() + cache.settle.len()).sum::<usize>();
-    let mut pending = pending_tiles(session);
-    let total = pending.max(1) as f32;
+    let initial_tiles = pending_tiles(session);
+    let mut pending = initial_tiles;
+    let total = initial_tiles.max(1) as f32;
+    let renders = session.doc.graphs.renders();
+    if pending > 0 {
+        progress.log_detail(format!("Preparing the CPU view for {} texture sets ({pending} tiles)", sets.len()));
+    }
     let start = clock::Clock::start();
     while pending > 0 {
         progress.check()?;
@@ -432,6 +499,9 @@ fn compute_view(session: &mut Session, progress: &ImportProgress, from: f32, set
     }
     progress.check()?;
     progress.report(1.0, Step::ComputingView);
+    if initial_tiles > 0 {
+        progress.log_detail(format!("CPU view ready ({} graph renders)", session.doc.graphs.renders().saturating_sub(renders)));
+    }
     Ok(())
 }
 
