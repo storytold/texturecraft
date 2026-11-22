@@ -64,8 +64,7 @@ fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
     let mode = layer.procedural.w;
     let p = surface.position * layer.projection.w + layer.projection.xyz;
     if mode == 1u {
-        let weights = pow(abs(surface.normal), vec3(layer.balance.w));
-        let w = weights / max(weights.x + weights.y + weights.z, 1e-6);
+        let w = triplanar_weights(surface.normal, layer.balance.w);
         var sampled = vec4(0.0);
         if w.x > 0.0 { sampled += w.x * material_image_at(image, vec2(p.z, -p.y)); }
         if w.y > 0.0 { sampled += w.y * material_image_at(image, p.xz); }
@@ -78,16 +77,18 @@ fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
         case 3u: { point = p.xz * 0.5 + 0.5; }
         case 4u: { point = vec2(p.x, -p.y) * 0.5 + 0.5; }
         case 5u: {
+            let position = surface.position + layer.projection.xyz;
             var dir = vec3(0.0, 1.0, 0.0);
-            if dot(surface.position, surface.position) > 0.0 { dir = normalize(surface.position); }
+            if dot(position, position) > 0.0 { dir = normalize(position); }
             point = vec2(azimuth(dir.z, dir.x), acos(clamp(dir.y, -1.0, 1.0)) / 3.141592654) * layer.projection.w;
         }
         case 6u, 7u, 8u: {
-            let pos = surface.position;
+            let pos = surface.position + layer.projection.xyz;
             let axis = select(select(pos.xyz, pos.yxz, mode == 6u), pos.xzy, mode == 8u);
             point = vec2(azimuth(axis.z, axis.x), 0.5 - axis.y * 0.5) * layer.projection.w;
         }
         case DECAL_PROJECTION: {}
+        case UV_TILE_PROJECTION: { point = fract(uv); }
         default: {
             let rotation = layer.projection.xy;
             let rotated = vec2(uv.x * rotation.x - uv.y * rotation.y, uv.x * rotation.y + uv.y * rotation.x);

@@ -613,12 +613,7 @@ mod tests {
         let bvh = Arc::new(Bvh::new(&mesh));
         for (tile, srgb) in [(false, true), (true, false)] {
             let stencil = Stencil {
-                image: Arc::new(ImageRes {
-                    width: 2,
-                    height: 2,
-                    rgba: vec![[0.3, 0.2, 0.1, 0.0], [0.0, 0.8, 1.4, 0.4], [0.9, 0.6, 0.1, 0.8], [0.04, 0.3, 0.5, 1.0]],
-                    srgb,
-                }),
+                image: Arc::new(ImageRes::new(2, 2, vec![[0.3, 0.2, 0.1, 0.0], [0.0, 0.8, 1.4, 0.4], [0.9, 0.6, 0.1, 0.8], [0.04, 0.3, 0.5, 1.0]], srgb)),
                 view_proj: Mat4::from_cols(Vec4::X, Vec4::Z, Vec4::Y, Vec4::W),
                 center: [0.08, -0.025],
                 half: [0.18, 0.23],
