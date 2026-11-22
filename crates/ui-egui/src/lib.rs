@@ -307,6 +307,13 @@ pub(crate) fn start_ui(saved: Option<UiState>, session: &mut Session) -> UiState
 }
 
 impl TextureCraftApp {
+    fn finish_ui_frame(&mut self, started_ms: f64) {
+        let ended_ms = now_ms();
+        let elapsed_ms = (ended_ms - started_ms) as f32;
+        self.ui_ms = if self.ui_ms == 0.0 { elapsed_ms } else { self.ui_ms * 0.9 + elapsed_ms * 0.1 };
+        self.profiler.end_frame(ended_ms, elapsed_ms);
+    }
+
     /// The app around `session`, with the saved UI state (or defaults in the OS language) and the GPU viewport.
     pub fn new(cc: &eframe::CreationContext<'_>, mut session: Session) -> TextureCraftApp {
         theme::install(&cc.egui_ctx);
@@ -1171,6 +1178,10 @@ impl eframe::App for TextureCraftApp {
         let started_ms = now_ms();
 
         if import_ui::show_preview(self, ui) {
+            windows::unsaved(self, &ctx);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.file_dialogs.show_pending(frame);
+            self.finish_ui_frame(started_ms);
             return;
         }
 
@@ -1209,10 +1220,7 @@ impl eframe::App for TextureCraftApp {
         #[cfg(not(target_arch = "wasm32"))]
         self.file_dialogs.show_pending(frame);
 
-        let ended_ms = now_ms();
-        let elapsed_ms = (ended_ms - started_ms) as f32;
-        self.ui_ms = if self.ui_ms == 0.0 { elapsed_ms } else { self.ui_ms * 0.9 + elapsed_ms * 0.1 };
-        self.profiler.end_frame(ended_ms, elapsed_ms);
+        self.finish_ui_frame(started_ms);
     }
 }
 

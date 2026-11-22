@@ -257,7 +257,10 @@ fn running(app: &mut TextureCraftApp, ctx: &egui::Context, state: ImportUi, prev
         finish_preview(app, ctx);
         return None;
     }
-    match rx.try_recv() {
+    // An outstanding close confirmation refers to the original project. Keep it in
+    // place until the confirmation has been answered.
+    let result = if app.ui.windows.unsaved.is_none() { rx.try_recv() } else { Err(TryRecvError::Empty) };
+    match result {
         Err(TryRecvError::Empty) => {}
         Ok(_) if progress.is_cancelled() => {
             finish_preview(app, ctx);
@@ -323,7 +326,7 @@ fn running(app: &mut TextureCraftApp, ctx: &egui::Context, state: ImportUi, prev
                 preview.show(ui, app.ui.prefs.background);
             }
         });
-        cancel |= ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        cancel |= app.ui.windows.unsaved.is_none() && ctx.input(|input| input.key_pressed(egui::Key::Escape));
     } else {
         modal(ctx, "import-progress", &title, show_progress);
     }

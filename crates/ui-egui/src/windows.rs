@@ -105,7 +105,7 @@ pub(crate) fn close_request(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
 /// Quitting, opening or closing a project with unsaved changes asks whether to save them first
 /// (in the browser, Save downloads the project).
-fn unsaved(app: &mut TextureCraftApp, ctx: &egui::Context) {
+pub(crate) fn unsaved(app: &mut TextureCraftApp, ctx: &egui::Context) {
     use crate::state::Unsaved;
 
     let Some(pending) = app.ui.windows.unsaved.clone() else { return };
