@@ -1336,8 +1336,9 @@ impl Session {
         }
         for (_, maps) in self.doc.baked.iter_mut().filter(|(ts, _)| **ts != working && **ts != active) {
             for map in maps.maps.values_mut() {
-                if let Some(texels) = Arc::get_mut(map) {
-                    texels.release();
+                if matches!(map.as_ref(), texturecraft_compose::Texels::Lazy(_)) && map.bytes() != 0 && Arc::strong_count(map) == 1 {
+                    // The graph fingerprint can hold a weak reference to the map.
+                    Arc::make_mut(map).release();
                 }
             }
         }
