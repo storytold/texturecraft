@@ -2524,11 +2524,7 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     // an explicit per-node Output Format (8 / 16 bit integer, 16 bit float, 5, 6, 7: 8 bit, 16 bit and 16 bit float as compiled graphs do them) quantises the
     // result; 32 bit float is untouched
     // (a node's own value 4 forces 32-bit float even when the graph rounds everything else)
-    let fmt = match n.nums.get("ofmt").map(|v| v.round() as u32) {
-        Some(v @ (1..=3 | 5..=7)) => v,
-        Some(4) => 0,
-        _ => g.default_format(),
-    };
+    let fmt = node_format(g, n);
     let read_rounding = matches!(fmt, 5 | 6) && matches!(n.kind.as_str(), "grad_warp" | "dir_warp" | "transform_matrix");
     // a format of whole 8- or 16-bit steps: results held in them
     let div = match fmt {
@@ -2540,7 +2536,7 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     // (for the node log: every input grey)
     let grey_ins = !ins.is_empty() && ins.values().all(|v| !matches!(v, NodeValue::Host(Val::Rgba(_))));
     let resident = if compiled && (!resize_inputs || samples_warp_map) {
-        if let Some(held) = forward_switch(n, &ins, fmt).or_else(|| forward_identity(n, ins.get("in"), sz, fmt)) {
+        if let Some(held) = forward_switch(g, n, &ins, ctx, fmt).or_else(|| forward_identity(n, ins.get("in"), sz, fmt)) {
             if matches!(held, NodeValue::Device(_) | NodeValue::DeviceFloat(_))
                 && let Some(profiler) = &ctx.ec.profiler
             {
@@ -4748,31 +4744,45 @@ fn forward_identity(n: &Node, source: Option<&NodeValue>, size: (usize, usize), 
 }
 
 /// A compiled switch at either endpoint holds exactly the selected input's 16-bit steps.
-fn forward_switch(n: &Node, ins: &BTreeMap<String, NodeValue>, format: u32) -> Option<NodeValue> {
-    if n.kind != "blend"
-        || format != crate::measured::COMPILED_16_BIT
-        || rolls(n)
-        || n.ins.contains_key("mask")
-        || !full_blend_frame(n)
-        || n.nums.get("mode") != Some(&21.0)
-    {
+fn forward_switch(g: &Graph, n: &Node, ins: &BTreeMap<String, NodeValue>, ctx: &Ctx<'_>, format: u32) -> Option<NodeValue> {
+    use crate::measured::COMPILED_16_BIT;
+    if n.kind != "blend" || format != COMPILED_16_BIT || rolls(n) || n.ins.contains_key("mask") || !full_blend_frame(n) || n.nums.get("mode") != Some(&21.0) {
+        return None;
+    }
+    let opacity = n.nums.get("opacity").copied().unwrap_or(1.0);
+    if !matches!(opacity, 0.0 | 1.0) {
         return None;
     }
     let foreground = ins.get("fg")?;
     let background = ins.get("bg")?;
-    let (_, _, fg_div, fa) = foreground.packed_grey()?.info();
-    let (_, _, bg_div, ba) = background.packed_grey()?.info();
-    if fg_div != 65535.0 || bg_div != 65535.0 || !crate::tex::grey_alpha_ok(fa) || !crate::tex::grey_alpha_ok(ba) {
+    let compiled_steps = |slot, image: &NodeValue| match image.packed_grey() {
+        Some(input) => input.info().2 == 65535.0,
+        // RGBA is held as floats. Its producer's format establishes bounded, finite 16-bit steps.
+        None => n
+            .ins
+            .get(slot)
+            .and_then(|id| ctx.instance.and_then(|i| i.nodes.get(id)).or_else(|| g.nodes.get(id)))
+            .is_some_and(|source| !source.strs.contains_key("fn.ofmt") && node_format(g, source) == COMPILED_16_BIT),
+    };
+    if !compiled_steps("fg", foreground) || !compiled_steps("bg", background) {
         return None;
     }
-    let opacity = n.nums.get("opacity").copied().unwrap_or(1.0);
     let alpha_mode = n.nums.get("alpha_mode").copied().unwrap_or(1.0) as u32;
+    let same_alpha = foreground.packed_grey().zip(background.packed_grey()).is_some_and(|(fg, bg)| fg.info().3 == bg.info().3);
     if opacity == 0.0 {
         Some(background.clone())
-    } else if opacity == 1.0 && (fa == ba || matches!(alpha_mode, 0 | 2..=4)) {
+    } else if same_alpha || matches!(alpha_mode, 0 | 2..=4) {
         Some(foreground.clone())
     } else {
         None
+    }
+}
+
+fn node_format(g: &Graph, n: &Node) -> u32 {
+    match n.nums.get("ofmt").map(|v| v.round() as u32) {
+        Some(v @ (1..=3 | 5..=7)) => v,
+        Some(4) => 0,
+        _ => g.default_format(),
     }
 }
 
