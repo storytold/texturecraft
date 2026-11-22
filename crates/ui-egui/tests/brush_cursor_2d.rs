@@ -142,16 +142,21 @@ fn a_ctrl_right_drag_out_of_the_2d_view_keeps_its_outline_at_the_anchor() {
     harness.event(Event::ModifiersChanged(ctrl));
     harness.event(Event::PointerButton { pos: center, button: egui::PointerButton::Secondary, pressed: true, modifiers: ctrl });
     harness.run_steps(2);
+
     // The outline stays anchored while the pointer is hidden inside the view
     harness.hover_at(center + egui::vec2(10.0, 0.0));
     harness.run_steps(3);
+
     assert_eq!(rings_at(&harness, center).len(), 1, "anchored outline while the pointer is in the view");
     assert_eq!(cursor(&harness), CursorIcon::None);
+
     // Outside the view, the outline stays anchored and the system pointer returns
     harness.hover_at(egui::pos2(2.0, 2.0));
     harness.run_steps(3);
+
     assert_eq!(rings_at(&harness, center).len(), 1, "the outline stays at the press origin outside the view");
     assert_ne!(cursor(&harness), CursorIcon::None, "outside the view the pointer is visible");
+
     harness.event(Event::PointerButton { pos: egui::pos2(2.0, 2.0), button: egui::PointerButton::Secondary, pressed: false, modifiers: ctrl });
     harness.event(Event::ModifiersChanged(egui::Modifiers::NONE));
     harness.run_steps(2);

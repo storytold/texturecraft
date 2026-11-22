@@ -203,6 +203,10 @@ pub struct ThumbService {
     queue: VecDeque<ThumbTarget>,
     in_flight: HashSet<(u64, ThumbTarget)>,
     wanted: HashSet<ThumbTarget>,
+    /// Asked for after this frame's poll (a panel drawn after the Layers panel): wanted again next frame
+    late: HashSet<ThumbTarget>,
+    /// Whether this frame's poll has run
+    polled: bool,
     gbufs: GbufCache,
     #[cfg(not(target_arch = "wasm32"))]
     worker: Option<Worker>,
@@ -227,6 +231,8 @@ impl Default for ThumbService {
             queue: VecDeque::new(),
             in_flight: HashSet::new(),
             wanted: HashSet::new(),
+            late: HashSet::new(),
+            polled: false,
             gbufs: GbufCache::default(),
             #[cfg(not(target_arch = "wasm32"))]
             worker: None,
@@ -243,9 +249,10 @@ impl ThumbService {
         ThumbService::default()
     }
 
-    /// Start of a frame: forget what the last frame asked for and notice document changes.
+    /// Start of a frame: forget what the last frame asked for (but what it asked for after its poll) and notice document changes
     pub fn begin_frame(&mut self, session: &Session, now: f64) {
-        self.wanted.clear();
+        self.wanted = std::mem::take(&mut self.late);
+        self.polled = false;
         let texture_set = session.ts();
         if self.seen == Some(session.revision)
             && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.ts == texture_set && snapshot.mesh_id == session.mesh_id)
@@ -276,6 +283,9 @@ impl ThumbService {
 
         if let Some(snapshot) = &self.snapshot {
             self.cache.retain(|target, _| snapshot.has(*target));
+
+            // Late requests still need a picture from this generation
+            self.queue.extend(self.wanted.iter().copied().filter(|target| snapshot.has(*target)));
         } else {
             self.cache.clear();
         }
@@ -290,6 +300,9 @@ impl ThumbService {
     /// picture is missing or out of date.
     pub fn get(&mut self, session: &Session, target: ThumbTarget) -> ThumbView {
         self.wanted.insert(target);
+        if self.polled {
+            self.late.insert(target);
+        }
         self.tick = self.tick.wrapping_add(1);
         let fresh = self.cache.get(&target).is_some_and(|entry| entry.generation == self.generation);
         let checked = self.checked(session);
@@ -316,6 +329,7 @@ impl ThumbService {
     /// End of a frame: collect results, discard unrequested rows, and dispatch new work.
     /// Returns whether another frame is needed, including to display newly collected pictures.
     pub fn poll(&mut self, session: &Session) -> bool {
+        self.polled = true;
         let changed = self.collect();
         self.queue.retain(|target| self.wanted.contains(target));
         self.dispatch();
@@ -502,19 +516,60 @@ mod tests {
         let (mut service, jobs, results) = held_worker();
         service.begin_frame(&session, 0.0);
         service.get(&session, target);
+
         assert!(service.poll(&session));
+
         let job = jobs.try_recv().unwrap();
         results.send(Done { generation: job.generation, target, image: job.snapshot.render(target) }).unwrap();
 
         service.begin_frame(&session, 0.1);
+
         assert!(service.get(&session, target).image.is_none());
+
         let repaint = service.poll(&session);
 
         assert!(service.is_fresh(target));
         assert!(repaint, "the frame drew before collecting the final thumbnail");
+
         service.begin_frame(&session, 0.2);
+
         assert!(service.get(&session, target).image.is_some());
         assert!(!service.poll(&session), "an idle cache must stop repainting");
+    }
+
+    #[test]
+    fn a_picture_asked_for_after_the_poll_renders_at_the_next_one() {
+        let session = test_session().unwrap();
+        let target = ThumbTarget::Content { layer: session.selected_layer().unwrap(), channel: Channel::BaseColor };
+        let (mut service, jobs, _results) = held_worker();
+        service.begin_frame(&session, 0.0);
+        service.poll(&session);
+        service.get(&session, target);
+
+        service.begin_frame(&session, 0.1);
+        service.poll(&session);
+
+        assert_eq!(jobs.try_recv().map(|job| job.target).ok(), Some(target), "the late request is dispatched, not dropped");
+    }
+
+    #[test]
+    fn a_late_request_survives_replacing_its_snapshot() {
+        let mut session = test_session().unwrap();
+        let layer = session.selected_layer().unwrap();
+        let target = ThumbTarget::Content { layer, channel: Channel::BaseColor };
+        let (mut service, jobs, _results) = held_worker();
+        service.begin_frame(&session, 0.0);
+        service.poll(&session);
+        service.get(&session, target);
+        crate::execute(&mut session, "layer.rename", &serde_json::json!({"layer": layer.0, "name": "Changed"})).unwrap();
+
+        service.begin_frame(&session, DEBOUNCE * 2.0);
+        service.poll(&session);
+
+        let job = jobs.try_recv().unwrap();
+
+        assert_eq!(job.target, target);
+        assert_eq!(job.snapshot.project.layer(layer).unwrap().name, "Changed");
     }
 
     #[test]

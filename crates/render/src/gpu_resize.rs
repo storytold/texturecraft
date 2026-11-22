@@ -9,6 +9,8 @@ use crate::paint_window::TileWindow;
 
 const OUTPUT_BYTES: u64 = 8 << 20;
 const INPUT_BYTES: u64 = 32 << 20;
+/// Keeps both center mapping and Q16 weight rounding within a WGSL u32.
+const MAX_INTEGER_RESIZE_SIDE: u32 = 32_768;
 
 pub struct PaintResampler {
     device: wgpu::Device,
@@ -39,7 +41,11 @@ impl PaintResampler {
         if (src.width(), src.height()) == size {
             return Ok(src.clone());
         }
-        let mut out = TileImage::new(size.0, size.1, src.comps());
+        let size = [size.0.max(1), size.1.max(1)];
+        if src.width().max(src.height()).max(size[0]).max(size[1]) > MAX_INTEGER_RESIZE_SIDE {
+            return Err("Paint resize dimensions exceed the GPU integer resampling limit".into());
+        }
+        let mut out = TileImage::new(size[0], size[1], src.comps());
         if src.allocated_count() == 0 {
             return Ok(out);
         }
@@ -65,10 +71,10 @@ impl PaintResampler {
                 return Err("Paint resize was cancelled".into());
             }
             let (lo, hi) = source_footprint(src, size, dest);
-            if !src.any_allocated_in(lo[0], lo[1], hi[0], hi[1]) {
+            if !src.has_allocated_texels(lo, hi) {
                 continue;
             }
-            let source = TileWindow::covering(lo.map(|v| (v as u32).saturating_sub(1)), hi.map(|v| v as u32 + 2), [src.width(), src.height()]);
+            let source = TileWindow::covering(lo, hi, [src.width(), src.height()]);
             if let Some(words) = source.words(std::slice::from_ref(src), (limit.min(INPUT_BYTES) / 4) as usize) {
                 source.pack(std::slice::from_ref(src), words, &mut packed);
                 self.resize_block(src, &mut out, source, dest, empty, &packed)?;
@@ -163,8 +169,8 @@ impl PaintResampler {
                 let x = dest.origin[0] + slot as u32 % dest.size[0];
                 let y = dest.origin[1] + slot as u32 / dest.size[0];
                 let tile = TileWindow { origin: [x, y], size: [1, 1] };
-                let (lo, hi) = source_footprint(src, (out.width(), out.height()), tile);
-                if src.any_allocated_in(lo[0], lo[1], hi[0], hi[1]) {
+                let (lo, hi) = source_footprint(src, [out.width(), out.height()], tile);
+                if src.has_allocated_texels(lo, hi) {
                     out.set_tile(x, y, Some(Arc::new(tile_data.iter().copied().map(u16::from_le).collect())));
                 }
             }
@@ -175,9 +181,8 @@ impl PaintResampler {
     }
 }
 
-fn source_footprint(src: &TileImage, size: (u32, u32), dest: TileWindow) -> ([f32; 2], [f32; 2]) {
-    let corner = |x, y| [(x * TILE) as f32 * src.width() as f32 / size.0 as f32, (y * TILE) as f32 * src.height() as f32 / size.1 as f32];
-    (corner(dest.origin[0], dest.origin[1]), corner(dest.origin[0] + dest.size[0], dest.origin[1] + dest.size[1]))
+fn source_footprint(src: &TileImage, size: [u32; 2], dest: TileWindow) -> ([u32; 2], [u32; 2]) {
+    src.resize_footprint(size, std::array::from_fn(|axis| dest.origin[axis]..dest.origin[axis] + dest.size[axis]))
 }
 
 fn buffer(device: &wgpu::Device, slot: &mut Option<wgpu::Buffer>, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -196,19 +201,21 @@ mod tests {
     #[test]
     fn bilinear_resize_preserves_sparse_color_and_signed_channel_tiles() {
         let Ok(gpu) = crate::headless::Headless::new() else { return };
+        eprintln!("Paint resize adapter: {:?}", gpu.device.adapter_info());
         let mut accelerator = PaintResampler::new(&gpu.device, &gpu.queue).unwrap();
         for (components, empty) in [(4, &[0, 0, 0, 0][..]), (2, &[32768, 0][..])] {
             let mut image = TileImage::new(192, 128, components);
             image.set(63, 63, &[4096, 61440, 1000, 65535]);
             image.set(64, 64, &[60000, 30000, 5000, 65535]);
-            for size in [(384, 256), (96, 64)] {
+            image.set(191, 127, &[65535, 1, 65534, 32768]);
+            for size in [(384, 256), (96, 64), (87, 135), (1, 1), (257, 1), (MAX_INTEGER_RESIZE_SIDE, 1)] {
                 let actual = accelerator.resize(&image, size, empty, || false).unwrap();
                 let expected = image.resampled(size.0, size.1, empty);
                 assert_eq!(actual.allocated().collect::<Vec<_>>(), expected.allocated().collect::<Vec<_>>());
                 for (x, y) in expected.allocated() {
                     let gpu = actual.tile(x, y).unwrap();
                     let cpu = expected.tile(x, y).unwrap();
-                    assert!(gpu.iter().zip(cpu).all(|(a, b)| a.abs_diff(*b) <= 1), "components {components}, size {size:?}, tile {x}/{y}");
+                    assert_eq!(gpu, cpu, "components {components}, size {size:?}, tile {x}/{y}");
                 }
             }
         }

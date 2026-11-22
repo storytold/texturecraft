@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 use texturecraft_core::{
     BakedMap, BlendMode, Channel, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator, GeneratorKind, LayerId, Levels, Mask,
-    MaskBackground, MicroDetail, Procedural, ProceduralKind, Project, Source,
+    MaskBackground, MicroDetail, Procedural, ProceduralKind, Project, Sampling, Source,
 };
 
 use crate::commands::{CommandSpec, always, bad, blend_param, boolp, channel_param, color_param, f32p, has_layer, layer_param, strp, u64p};
@@ -40,7 +40,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add fill",
             ["Layers", "Effects"],
             None,
-            "{layer?, target?: mask|content, name?, mask: value?: 0..1 | image?: resource name | procedural?: kind, scale?, seed?, contrast?, balance?, invert?, resolution?: auto|textureSet|uvTile|custom, customResolution?, resolutionFactor?: -3..3, tile?: {Tile Generator settings in camelCase, as project.inspect shows them}, tileDefaults?: true | anchor?: anchor effect id, anchorChannel?: channel (height); content: color? ([r,g,b] linear or \"#rrggbb\" sRGB), roughness?, metallic?, height?, opacity? (default: every layer channel); projection?}",
+            "{layer?, target?: mask|content, name?, mask: value?: 0..1 | image?: resource name | procedural?: kind, scale?, seed?, contrast?, balance?, invert?, resolution?: auto|textureSet|uvTile|custom, customResolution?, resolutionFactor?: -3..3, tile?: {Tile Generator settings in camelCase, as project.inspect shows them}, tileDefaults?: true | anchor?: anchor effect id, anchorChannel?: channel (height); content: color? ([r,g,b] linear or \"#rrggbb\" sRGB), roughness?, metallic?, height?, opacity? (default: every layer channel); projection?; filtering?: bilinearHq|bilinearSharp|nearest; wrap?: repeat|repeatHorizontally|repeatVertically|none}",
             has_layer,
             add_fill
         ),
@@ -295,16 +295,18 @@ fn image_source(session: &Session, command: &str, name: &str) -> Result<Source> 
 
 fn add_fill(session: &mut Session, params: &Value) -> Result<Value> {
     const CMD: &str = "effect.add.fill";
+    let sampling = crate::layer_cmds::sampling_from(params, CMD, Sampling::default())?;
     let blend = blend_param(CMD, params, "blend")?.unwrap_or(BlendMode::Normal);
     let layer = layer_param(session, CMD, params)?;
 
     if content_target(params, CMD)? {
         let mut fill = crate::layer_cmds::fill_from(CMD, params)?;
+        fill.sampling = sampling;
         if fill.sources.is_empty() {
             fill.sources = session.doc.project.layer(layer)?.channels.keys().map(|channel| (*channel, Source::uniform_of(*channel))).collect();
         }
 
-        fill.projection = projection_from(params, CMD, None)?;
+        fill.projection = projection_from(params, CMD, None, || crate::warp_cmds::fitted_frame(&session.mesh))?;
         return push_effect(session, params, EffectKind::Material(fill), blend);
     }
 
@@ -327,9 +329,9 @@ fn add_fill(session: &mut Session, params: &Value) -> Result<Value> {
 
     // A scalar controls pattern frequency, while a two-axis scale places the new mask
     let pattern_scale = matches!(source, Source::Procedural { .. }) && params.get("scale").is_some_and(Value::is_number);
-    let projection = projection_from_fields(params, CMD, None, !pattern_scale)?;
+    let projection = projection_from_fields(params, CMD, None, !pattern_scale, || crate::warp_cmds::fitted_frame(&session.mesh))?;
 
-    push_effect(session, params, EffectKind::Fill { source, projection }, blend)
+    push_effect(session, params, EffectKind::Fill { source, projection, sampling }, blend)
 }
 
 /// Apply `params` to `generator`, using `command` in errors
@@ -593,7 +595,7 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
         _ => None,
     };
 
-    // `input` names a generator input that `inputImage`, `inputValue` or `inputAnchor` replaces, or `inputBaked` puts back
+    // The input key identifies the generator slot to replace or restore
     let input = match session.doc.project.effect(effect) {
         Some((owner, Effect { kind: EffectKind::Generator(_), .. })) => generator_input_param(session, owner, params)?,
         _ => None,
@@ -613,6 +615,7 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
     };
     let swaps_filter = swapped.is_some();
 
+    let mesh = session.mesh.clone();
     session.edit("Edit effect", |session| {
         let edited = session.doc.project.effect_mut(effect).ok_or_else(|| bad(CMD, format!("no effect {}", effect.0)))?;
         if let Some((kind, label)) = swapped {
@@ -667,7 +670,7 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
             // The swapped filter was built with the parameters already
             EffectKind::Filter(_) if swaps_filter => {}
             EffectKind::Filter(filter) => crate::filter_lib::apply(params, filter, CMD)?,
-            EffectKind::Fill { source, projection } => {
+            EffectKind::Fill { source, projection, .. } => {
                 // `uniform` picks the source, so it outranks settings that would edit the current pattern
                 let uniform = f32p(params, "uniform").filter(|_| strp(params, "procedural").is_none());
                 if let Some(anchor) = anchor {
@@ -684,9 +687,9 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
                     *source = Source::Uniform([value.clamp(0.0, 1.0); 3]);
                 }
 
-                // Pattern edits keep the mask's existing projection scale
-                let read_scale = !matches!(source, Source::Procedural { .. });
-                *projection = projection_from_fields(params, CMD, Some(projection), read_scale)?;
+                // A scalar changes pattern frequency while an array places the projection
+                let pattern_scale = matches!(source, Source::Procedural { .. }) && params.get("scale").is_some_and(Value::is_number);
+                *projection = projection_from_fields(params, CMD, Some(&*projection), !pattern_scale, || crate::warp_cmds::fitted_frame(&mesh))?;
             }
             EffectKind::ColorSelection { colors, tolerance } => crate::color_selection_cmds::apply_params(params, colors, tolerance)?,
             EffectKind::Compare { tolerance, .. } => {
@@ -716,7 +719,9 @@ fn fill_pattern(command: &str, params: &Value, current: &Source) -> Result<Optio
         }
         None => {
             let has_settings = crate::procedural_params::has_pattern_settings(params);
-            let edits_pattern = has_settings || ["scale", "seed", "contrast", "balance", "invert"].iter().any(|key| params.get(key).is_some());
+            let edits_pattern = has_settings
+                || params.get("scale").is_some_and(Value::is_number)
+                || ["seed", "contrast", "balance", "invert"].iter().any(|key| params.get(key).is_some());
             match current {
                 Some(pattern) if edits_pattern => pattern.clone(),
                 None if has_settings => {

@@ -42,7 +42,7 @@ pub(crate) const MAX_BYTES: usize = 512 << 20;
 pub(crate) const EXR_SIGNATURE: &[u8] = &[0x76, 0x2f, 0x31, 0x01];
 
 pub(crate) fn decoded(d: texturecraft_formats::DecodedImage) -> Arc<ImageRes> {
-    Arc::new(ImageRes { width: d.width, height: d.height, rgba: d.rgba, srgb: d.srgb })
+    Arc::new(ImageRes::new(d.width, d.height, d.rgba, d.srgb))
 }
 
 impl Session {
@@ -247,6 +247,7 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     if !s.doc.resources.contains_key(&name) {
         return Err(bad("resource.remove", format!("no resource `{name}`")));
     }
+
     s.edit("Remove resource", |s| {
         s.doc.resources.remove(&name);
         Ok(())
@@ -307,7 +308,7 @@ fn add_image_fill(s: &mut Session, p: &Value) -> Result<Value> {
     let raw_name = strp(p, "name").ok_or_else(|| bad("layer.add.image", "`name` is required"))?;
     let name = resolve_resource_name(s, raw_name)?;
     let ch = channel_param("layer.add.image", p, "channel")?.unwrap_or(Channel::BaseColor);
-    let projection = crate::layer_cmds::projection_from(p, "layer.add.image", None)?;
+    let projection = crate::layer_cmds::projection_from(p, "layer.add.image", None, || crate::warp_cmds::fitted_frame(&s.mesh))?;
     let ts = s.ts();
     let label = std::path::Path::new(&name).file_stem().and_then(|n| n.to_str()).unwrap_or("Image").to_string();
     let layer_name = s.doc.project.next_layer_name(ts, &label);

@@ -41,26 +41,26 @@ fn environment_cache_retains_source_identity_until_replaced() {
     let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut app = egui_kittest::Harness::builder().build_eframe(|context| crate::TextureCraftApp::new(context, session())).into_state();
     app.session.doc.project.display.environment = "resource:environment".into();
-    let source = Arc::new(ImageRes { width: 2, height: 1, rgba: vec![[1.0, 0.0, 0.0, 1.0]; 2], srgb: false });
+    let source = Arc::new(ImageRes::new(2, 1, vec![[1.0, 0.0, 0.0, 1.0]; 2], false));
     let original_source = Arc::downgrade(&source);
     app.session.images.insert("environment".into(), source);
     let first_key = gpu_scene_key(&app.session);
-    let first = super::trace_scene(&app).env;
-    assert!(Arc::ptr_eq(&first, &super::trace_scene(&app).env), "unchanged images reuse the decoded environment");
+    let first = super::trace_scene(&app, false).env;
+    assert!(Arc::ptr_eq(&first, &super::trace_scene(&app, false).env), "unchanged images reuse the decoded environment");
 
-    let replacement = Arc::new(ImageRes { width: 2, height: 1, rgba: vec![[0.0, 1.0, 0.0, 1.0]; 2], srgb: false });
+    let replacement = Arc::new(ImageRes::new(2, 1, vec![[0.0, 1.0, 0.0, 1.0]; 2], false));
     app.session.images.insert("environment".into(), replacement.clone());
 
     assert!(original_source.upgrade().is_none(), "replacing the resource releases its decoded pixels immediately");
     assert_ne!(first_key, gpu_scene_key(&app.session), "a new source restarts tracing under the same environment name");
-    let second = super::trace_scene(&app).env;
+    let second = super::trace_scene(&app, false).env;
     assert!(!Arc::ptr_eq(&first, &second));
     assert_ne!(first.data, second.data, "replacing the image changes the lighting");
-    assert!(Arc::ptr_eq(&second, &super::trace_scene(&app).env));
+    assert!(Arc::ptr_eq(&second, &super::trace_scene(&app, false).env));
 
     app.session.images.insert("renamed".into(), replacement);
     app.session.doc.project.display.environment = "resource:renamed".into();
-    assert!(!Arc::ptr_eq(&second, &super::trace_scene(&app).env), "the environment name is also part of the key");
+    assert!(!Arc::ptr_eq(&second, &super::trace_scene(&app, false).env), "the environment name is also part of the key");
 }
 
 /// The display background is drawn into the render, so a new color starts it over.
@@ -191,6 +191,43 @@ fn composited_chunks_restart_the_gpu_render_only_when_displaced() {
     session.caches[0].revision += 1;
 
     assert_ne!(gpu_scene_key(&session), displaced, "displaced geometry follows the heights");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn gpu_owned_edits_reach_the_cpu_tracer_and_displaced_geometry() {
+    use serde_json::json;
+    use std::sync::Arc;
+    use texturecraft_engine::core::Channel;
+
+    let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut app = egui_kittest::Harness::builder().build_eframe(|context| crate::TextureCraftApp::new(context, session())).into_state();
+    let cpu_revision = app.session.caches[0].revision;
+    let flat = super::trace_scene(&app, false);
+    assert!(Arc::ptr_eq(&flat.mesh, &app.session.mesh));
+
+    app.session.doc.project.display.displacement = true;
+    let cpu_key = scene_key(&app.session, true);
+    let displaced_key = gpu_scene_key(&app.session);
+    let neutral = super::trace_scene(&app, false);
+    texturecraft_engine::execute(&mut app.session, "layer.add.fill", &json!({"color": [0.95, 0.05, 0.05], "height": 0.8})).unwrap();
+
+    assert_eq!(app.session.caches[0].revision, cpu_revision);
+    assert_ne!(scene_key(&app.session, true), cpu_key);
+    assert_ne!(gpu_scene_key(&app.session), displaced_key);
+    assert!((0..64).any(|_| super::prepare_cpu_materials(&mut app.session, true)), "material preparation finishes across frame slices");
+    let cpu = super::trace_scene(&app, true);
+    let set = &cpu.sets[0].composite;
+    let i = app.session.caches[0].gbuf.tri.iter().position(|&tri| tri != texturecraft_engine::geom::NO_TRI).unwrap() as u32;
+    let color = set.value(Channel::BaseColor, i % set.resolution, i / set.resolution);
+    assert!(color[0] > 0.9 && color[1] < 0.1, "{color:?}");
+
+    let displaced = super::trace_scene(&app, false);
+    assert!(Arc::ptr_eq(&cpu.mesh, &displaced.mesh));
+    assert_ne!(displaced.mesh.positions, neutral.mesh.positions);
+    assert!(super::prepare_cpu_materials(&mut app.session, false));
+    let updated = super::trace_scene(&app, false);
+    assert_eq!(displaced.mesh.positions, updated.mesh.positions);
 }
 
 /// Loading lasts until the composited tiles are uploaded too (the GPU render reads them).

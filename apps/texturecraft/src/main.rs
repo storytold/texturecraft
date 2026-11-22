@@ -164,12 +164,14 @@ impl eframe::App for Shell {
         self.app.save(storage);
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw: &mut egui::RawInput) {
-        // winit gives the window its caption back when it changes the window's flags (maximize,
-        // restore, …): take it off again before the frame is laid out.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // Restore the frameless style after winit changes the window flags
         if let Some(guard) = self.window_frame.as_mut() {
             guard();
         }
+
+        // The app's own hook: a drag holding the pointer reads its moves from it
+        self.app.raw_input_hook(ctx, raw);
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -391,5 +393,56 @@ mod tests {
         std::fs::remove_file(&json_path).unwrap();
         std::fs::remove_file(&ron_path).unwrap();
         assert_eq!(saved_prefs(Some(&json_path), Some(&ron_path)), texturecraft_ui_egui::state::Prefs::default());
+    }
+
+    /// How far the test's drag moves the mouse in one frame, in points
+    const DRAG_STEP: egui::Vec2 = egui::vec2(80.0, 0.0);
+
+    /// Points within which a put-back lands on the press point (the system rounds it to whole pixels)
+    const PUT_BACK_REACH: f32 = 1.0;
+
+    /// One frame of the window: the system's events go through the window's raw input hook, as eframe sends them; returns what the app asked of the window
+    fn window_frame(harness: &mut egui_kittest::Harness<'static, Shell>, events: Vec<egui::Event>) -> Vec<egui::ViewportCommand> {
+        let ctx = harness.ctx.clone();
+        let mut raw = harness.input_mut().clone();
+        raw.events.extend(events);
+        eframe::App::raw_input_hook(harness.state_mut(), &ctx, &mut raw);
+        *harness.input_mut() = raw;
+        harness.step();
+        harness.output().viewport_output.get(&egui::ViewportId::ROOT).map(|viewport| viewport.commands.clone()).unwrap_or_default()
+    }
+
+    /// Holding the fill's preview square in the window holds the system's pointer: put back to the press point every frame, or locked where the system locks it
+    #[test]
+    fn the_window_holds_the_pointer_while_the_preview_square_is_held() {
+        let session = Session::new_project("Hold", texturecraft_engine::geom::primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 128).unwrap();
+        let builder = egui_kittest::Harness::builder().with_size(egui::vec2(DEFAULT_SIZE[0], DEFAULT_SIZE[1]));
+        let mut harness = builder.build_eframe(|cc| Shell {
+            app: TextureCraftApp::new(cc, session),
+            window_frame: None,
+            #[cfg(target_os = "macos")]
+            movable: None,
+        });
+        harness.run_steps(4);
+        let layer = harness.state_mut().app.run("layer.add.fill", serde_json::json!({})).unwrap()["layer"].clone();
+        harness.state_mut().app.run("layer.fill.projection", serde_json::json!({"layer": layer, "projection": "triplanar"})).unwrap();
+        harness.run_steps(2);
+
+        let pad = egui_kittest::kittest::Queryable::get_by_label(&harness, "Move on model").rect().center();
+        let press = egui::Event::PointerButton { pos: pad, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE };
+        let pressed = window_frame(&mut harness, vec![egui::Event::PointerMoved(pad), press]);
+        let locked = pressed.contains(&egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
+
+        // A locked pointer stays still and the system reports only its raw motion
+        let mut moves = vec![egui::Event::MouseMoved(DRAG_STEP)];
+        if !locked {
+            moves.push(egui::Event::PointerMoved(pad + DRAG_STEP));
+        }
+        let moved = window_frame(&mut harness, moves);
+        let put_back = moved.iter().any(|command| matches!(command, egui::ViewportCommand::CursorPosition(to) if to.distance(pad) <= PUT_BACK_REACH));
+
+        assert!(locked || put_back, "the window puts the pointer back where the press began, so it never leaves: {moved:?}");
+        let seen = harness.ctx.input(|input| input.pointer.latest_pos());
+        assert!(seen.is_some_and(|seen| seen.distance(pad + DRAG_STEP) <= PUT_BACK_REACH), "the app reads the whole move: {seen:?}");
     }
 }

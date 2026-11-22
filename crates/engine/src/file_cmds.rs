@@ -763,15 +763,16 @@ fn write_materialx(s: &Session, sets: &[usize], opts: &ExportOptions, dir: &std:
 fn export_mesh(s: &mut Session, p: &Value) -> Result<Value> {
     let path = native::path_param(p, "path", "file.exportMesh")?;
     let out = s.mesh_export(path, strp(p, "format"))?;
-    let write = |path: &str, bytes: &[u8]| std::fs::write(path, bytes).map_err(|e| bad("file.exportMesh", format!("cannot write {path}: {e}")));
     let dir = std::path::Path::new(&out.path).parent().unwrap_or(std::path::Path::new(""));
-    let mut textures = Vec::new();
-    for (name, bytes) in &out.textures {
-        let file = dir.join(name).display().to_string();
-        write(&file, bytes)?;
-        textures.push(file);
-    }
-    write(&out.path, &out.bytes)?;
+    let texture_paths: Vec<std::path::PathBuf> = out.textures.iter().map(|(name, _)| dir.join(name)).collect();
+    let main_path = std::path::PathBuf::from(&out.path);
+    let entries = texture_paths
+        .iter()
+        .zip(&out.textures)
+        .map(|(file, (_, bytes))| (file.as_path(), bytes.as_slice()))
+        .chain(std::iter::once((main_path.as_path(), out.bytes.as_slice())));
+    texturecraft_formats::write_batch_atomic(entries).map_err(|e| bad("file.exportMesh", format!("cannot write {}: {e}", out.path)))?;
+    let textures = texture_paths.into_iter().map(|file| file.display().to_string()).collect();
     s.log.info("Exporter", format!("Exported mesh to {}", out.path));
     Ok(out.reply(textures))
 }
@@ -997,7 +998,48 @@ f 1/1 2/2 3/3
         assert_eq!(back.mesh.materials, s.mesh.materials);
         // Base color, ORM and normal per texture set.
         assert_eq!(bytes.windows(9).filter(|w| *w == b"image/png").count(), 3 * s.mesh.materials.len());
+        let reopened = Session::from_mesh_bytes("ball.glb", &bytes, 128, "ball").unwrap();
+        assert_eq!(reopened.mesh.triangle_count(), s.mesh.triangle_count());
+        assert_eq!(reopened.mesh.materials, s.mesh.materials);
         assert!(crate::execute(&mut s, "file.exportMesh", &json!({ "path": base, "format": "fbx" })).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejected_glb_export_preserves_existing_files_and_publishes_nothing() {
+        let mut s = Session::new_project("t", primitives::cube(1.0), "builtin:cube", None, 128).unwrap();
+        let dir = std::env::temp_dir().join(format!("tc_rejected_glb_export_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cube.glb");
+        crate::execute(&mut s, "file.exportMesh", &json!({ "path": path, "format": "glb" })).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        std::sync::Arc::make_mut(&mut s.mesh).indices[0] = u32::MAX;
+        assert!(s.mesh_glb_bytes().unwrap_err().to_string().contains("corner index is out of range"));
+        for destination in [path.clone(), dir.join("new.glb")] {
+            let error = crate::execute(&mut s, "file.exportMesh", &json!({ "path": destination, "format": "glb" })).unwrap_err();
+            assert!(error.to_string().contains("corner index is out of range"), "{error}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!dir.join("new.glb").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_mesh_publishes_nothing_when_final_target_is_a_directory() {
+        let mut s = Session::new_project("t", primitives::cube(1.0), "builtin:cube", None, 128).unwrap();
+        let dir = std::env::temp_dir().join(format!("tc_atomic_obj_export_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("blocked.obj")).unwrap();
+        let existing_mtl = dir.join("blocked.mtl");
+        std::fs::write(&existing_mtl, b"keep-existing-mtl").unwrap();
+
+        let error = crate::execute(&mut s, "file.exportMesh", &json!({ "path": dir.join("blocked.obj") })).unwrap_err();
+        assert!(error.to_string().contains("cannot write"), "{error}");
+        assert_eq!(std::fs::read(&existing_mtl).unwrap(), b"keep-existing-mtl");
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(entries.len(), 2, "no companion textures or temp files should be published: {entries:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

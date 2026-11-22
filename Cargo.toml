@@ -75,7 +75,7 @@ craft-tcraft = { git = "https://github.com/storytold/craft-libs", rev = "c376774
 # Isolated aligned writer; existing archive readers retain their pin and behavior.
 craft-zip-usdz = { package = "craft-zip", git = "https://github.com/storytold/craft-libs", rev = "5631e99fe126cffb74c673eb458db04299f2bb9b" }
 craft-zip = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
-craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "3dff4793f1a5bd1f99a4fe3280d48f515158dff3", default-features = false, features = ["stl", "ply", "fbx", "obj", "gltf", "dae", "abc"] }
+craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "a20dfd1623709b0bd9830106d3a92a1a443902e3", default-features = false, features = ["stl", "ply", "fbx", "obj", "gltf", "dae", "abc"] }
 craft-mcmat = { git = "https://github.com/storytold/craft-libs", rev = "7a7a18cb40ac4cd5fca29c0dc224ac5178d40a89" }
 # Who draws the window frame, and the app-drawn strip as the title bar (crates/ui-egui/src/titlebar.rs).
 craft-window = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585", features = ["egui"] }

@@ -49,7 +49,8 @@ const FIRST_GENERATOR: u32 = 40;
 const FIRST_EXTENDED_PATTERN: u32 = 48;
 pub(crate) const ROWS: u32 = 64;
 const WORKGROUP: u32 = 8;
-// Keep extreme Tile Generator overlap from monopolizing a single dispatch or submission.
+// Keep extreme Tile Generator overlap from monopolizing an update, dispatch, or submission.
+const MAX_TILE_WORK_PER_UPDATE: u64 = 8 << 30;
 const MAX_TILE_WORK_PER_BAND: u64 = 64 << 20;
 const MAX_TILE_WORK_PER_SUBMISSION: u64 = 256 << 20;
 const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
@@ -658,11 +659,13 @@ impl CompositeProgram {
                     continue;
                 }
                 // A full-weight group sees the incoming stack and returns it exactly
-                // as its children changed it. Keep such groups on the flat shader.
+                // as its children changed it. A geometry restriction must stay on the
+                // group boundary when children publish anchors outside that restriction.
                 if mask.is_none()
                     && set.channels.iter().all(|&(channel, _)| {
                         layer.blend(channel).is_some_and(|blend| blend.mode != BlendMode::Disable && blend.opacity.is_finite() && blend.opacity >= 1.0)
                     })
+                    && (geometry_mask == 0 || !groups::children_publish_anchors(project, children, depth + 1))
                 {
                     layers.extend(children.iter().rev().map(|&child| StackWork::Layer(child, depth + 1, geometry_mask)));
                     continue;
@@ -2010,7 +2013,9 @@ impl GpuCompositor {
         } else {
             0
         };
-        let tile_work = program.tile_work_per_pixel()?.saturating_add(program.groups.work_per_pixel()).saturating_add(selection_work);
+        let pattern_work = program.tile_work_per_pixel()?;
+        check_tile_update_budget(width, height, pattern_work)?;
+        let tile_work = pattern_work.saturating_add(program.groups.work_per_pixel()).saturating_add(selection_work);
         let grouped = program.groups.depth != 0;
         let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
         let halo = radius.saturating_add(program.filters.reach);
@@ -2357,6 +2362,14 @@ impl GpuCompositor {
     }
 }
 
+fn check_tile_update_budget(width: u32, height: u32, work_per_pixel: u64) -> Result<(), &'static str> {
+    let estimated_work = (u64::from(width) * u64::from(height)).saturating_mul(work_per_pixel);
+    if estimated_work > MAX_TILE_WORK_PER_UPDATE {
+        return Err("Tile Generator overlap exceeds the GPU compositor's interactive work budget.");
+    }
+    Ok(())
+}
+
 fn composite_band_size(width: u32, tile_work_per_pixel: u64) -> (u32, u32) {
     let texels = MAX_TILE_WORK_PER_BAND / tile_work_per_pixel.max(1);
     // Leave room for a full workgroup of rows when a costly pattern needs narrower bands.
@@ -2506,6 +2519,95 @@ mod procedural_tests {
         gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
         let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.aux_texture(0).unwrap()).unwrap();
         assert!(actual.as_chunks::<4>().0.iter().zip(expected).all(|(pixel, value)| pixel[0].abs_diff(value) <= 2));
+    }
+
+    #[test]
+    fn restricted_passthrough_groups_publish_child_anchors_on_both_parts() {
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles};
+        use texturecraft_compose::tile_bytes;
+        use texturecraft_geom::SubMesh;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        let mut mesh = primitives::plane(1.0, 1);
+        let original = mesh.submeshes[0].clone();
+        mesh.submeshes[0].count = 3;
+        mesh.submeshes.push(SubMesh { name: "Other part".into(), start: 3, count: 3, ..original.clone() });
+        let mesh = Arc::new(mesh);
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, TILE, TILE));
+        let probes = [0, 1].map(|id| gbuf.tri.iter().position(|&tri| tri == id).unwrap());
+
+        let mut project = Project::new("Part-restricted anchors", "builtin:plane");
+        let mut set = TextureSet::new("Plane", 0, TILE);
+        set.channels.push((Channel::Opacity, texturecraft_core::ChannelFormat::default_for(Channel::Opacity)));
+        let channels = set.channel_list();
+        project.texture_sets.push(set);
+        let folder = project.alloc_id();
+        let mut group = Layer::new(folder, "One part", LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        for blend in group.channels.values_mut() {
+            blend.mode = BlendMode::Passthrough;
+        }
+        group.geometry_mask = Some(vec![original.name]);
+        project.insert_layer(0, group, None, false).unwrap();
+
+        let donor = project.alloc_id();
+        let mask_anchor = project.alloc_id();
+        let content_anchor = project.alloc_id();
+        let material_anchor = project.alloc_id();
+        let mut donor = Layer::new(
+            donor,
+            "Donor",
+            LayerKind::Fill(Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.95; 3]))]), ..Default::default() }),
+            &channels,
+        );
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.8; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(mask_anchor, EffectKind::Anchor));
+        donor.mask = Some(mask);
+        donor.content_effects.push(Effect::new(content_anchor, EffectKind::Anchor));
+        donor.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
+        donor.content_effects.push(Effect::new(material_anchor, EffectKind::Anchor));
+        project.insert_layer(0, donor, Some(folder), true).unwrap();
+
+        let reader = project.alloc_id();
+        let sources = [(Channel::Opacity, mask_anchor), (Channel::Roughness, content_anchor), (Channel::Metallic, material_anchor)]
+            .into_iter()
+            .map(|(target, anchor)| (target, Source::Anchor { anchor, channel: Channel::BaseColor, ramp: Vec::new() }))
+            .collect();
+        project.insert_layer(0, Layer::new(reader, "Reader", LayerKind::Fill(Fill { sources, ..Default::default() }), &channels), None, false).unwrap();
+
+        let pixels = PixelStore::default();
+        let baked = BakedMaps::default();
+        let images = ImageStore::default();
+        let mut cpu = Composite::new(&channels, TILE);
+        composite_tiles(
+            &Inputs {
+                project: &project,
+                ts: 0,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked: &baked,
+                images: &images,
+                block_scales: project.texture_sets[0].block_scales(),
+                preview: None,
+                bounds: mesh.bounds(),
+            },
+            &mut cpu,
+            &[(0, 0)],
+        );
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((TILE, TILE), 0)], 1);
+        let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        for kind in [DisplayKind::BaseColor, DisplayKind::Orm] {
+            let expected = tile_bytes(&cpu, &baked, kind, 0, 0);
+            let texture = gpu.renderer.display_textures()[0][kind as usize];
+            let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
+            for (part, texel) in probes.into_iter().enumerate() {
+                let (actual, expected) = (&actual[texel * 4..][..4], &expected[texel * 4..][..4]);
+                assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(*b) <= 2), "{kind:?}, part {part}: GPU {actual:?}, CPU {expected:?}");
+            }
+        }
     }
 
     #[test]
@@ -2820,7 +2922,7 @@ mod procedural_tests {
     }
 
     #[test]
-    fn tile_generator_band_size_budgets_overlapping_work_at_8k() {
+    fn tile_generator_budget_rejects_full_overlap_and_allows_smaller_gpu_updates() {
         use texturecraft_core::{TileGenerator, TileSizeMode};
 
         let mut patterns = TilePatterns::default();
@@ -2831,9 +2933,12 @@ mod procedural_tests {
         let regular_work = patterns.work_per_sample(normal).unwrap();
         let overlapping_work = patterns.work_per_sample(overlapping_index).unwrap();
 
+        assert_eq!(check_tile_update_budget(8192, 8192, regular_work), Ok(()));
         assert_eq!(composite_band_size(8192, regular_work), (8192, ROWS));
-        let (width, rows) = composite_band_size(8192, overlapping_work);
-        assert!(width < 8192 && rows < ROWS);
+        assert!(check_tile_update_budget(8192, 8192, overlapping_work).is_err());
+        assert_eq!(check_tile_update_budget(256, 256, overlapping_work), Ok(()));
+        let (width, rows) = composite_band_size(256, overlapping_work);
+        assert!(rows < ROWS);
         assert!(u64::from(width) * u64::from(rows) * overlapping_work <= MAX_TILE_WORK_PER_BAND);
 
         let mut project = Project::new("Tile Generator budget", "builtin:plane");

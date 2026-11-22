@@ -36,14 +36,15 @@ pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
 
 fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
     let lim = limits();
-    let doc = craft_mesh::dae::read_document(bytes, &lim).map_err(convert)?;
+    let cameras_doc = craft_mesh::dae::read_document_with_cameras(bytes, &lim).map_err(convert)?;
+    let doc = cameras_doc.document();
     let to_mat = |m: craft_mesh::Mat4| Mat4::from_cols_array(&m.map(|v| v as f32));
     let global = to_mat(doc.global_transform());
-    let scene = doc.scene;
+    let scene = &doc.scene;
 
     let mut sink = PolygonSink::default();
-    for w in scene.warnings {
-        sink.warn(w);
+    for w in &scene.warnings {
+        sink.warn(w.clone());
     }
     let mut cameras = Vec::new();
     let mut stack: Vec<(usize, Mat4, usize)> = scene.roots.iter().rev().map(|&r| (r, global, 0)).collect();
@@ -56,10 +57,10 @@ fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
         let node = scene.nodes.get(id).ok_or_else(|| malformed(KIND, "node index out of range"))?;
         let world = parent * to_mat(node.transform);
 
-        if let Some(cam_idx) = node.camera
-            && cameras.len() < super::MAX_CAMERAS
-            && let Some(cam) = scene.cameras.get(cam_idx)
-        {
+        for cam in cameras_doc.cameras_for_node(id) {
+            if cameras.len() >= super::MAX_CAMERAS {
+                break;
+            }
             let (fov, ortho) = match cam.projection {
                 craft_mesh::Projection::Perspective { yfov, .. } => (yfov.to_degrees() as f32, None),
                 craft_mesh::Projection::Orthographic { ymag, .. } => (40.0, Some(ymag as f32)),
@@ -74,6 +75,7 @@ fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
             sink.part = node.name.clone();
             let uvs = mesh.uv_sets.first();
             for part in &mesh.parts {
+                // An explicit empty name is a binding; only an absent material uses the default.
                 let material = part.material.and_then(|m| scene.materials.get(m)).map_or("Default", |m| m.name.as_str());
                 for face in part.faces() {
                     let mut corners = Vec::with_capacity(face.len());

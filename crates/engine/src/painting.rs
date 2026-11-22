@@ -905,6 +905,10 @@ impl Session {
                 self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
             }
             self.doc = st.before;
+            // A paint effect created by the stroke can get the same ID on a different owner.
+            for cache in &mut self.caches {
+                cache.invalidate_paint_margin();
+            }
             if let Some(cache) = self.caches.get(st.ts) {
                 let revision = cache.material_revision;
                 self.display_stroke_end =
@@ -991,9 +995,7 @@ impl Session {
         let (width, height) = (cache.size.0 as f32, cache.size.1 as f32);
         let (x, y) = ((hit.uv.x * width).clamp(0.0, width - 1.0) as u32, (hit.uv.y * height).clamp(0.0, height - 1.0) as u32);
 
-        let tile = (x / texturecraft_texel::TILE, y / texturecraft_texel::TILE);
-        let source = self.document_composite(texture_set, &[tile]).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
-        let picked: BTreeMap<_, _> = source.channels.keys().map(|&channel| (channel, source.value(channel, x, y))).collect();
+        let picked = self.document_sample(texture_set, x, y).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
         self.tool.values.extend(&picked);
         self.tool.material = None;
         Ok(picked)

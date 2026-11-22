@@ -422,7 +422,7 @@ impl Session {
 
         let mut images = std::collections::HashSet::new();
         for image in self.images.values().filter(|image| images.insert(Arc::as_ptr(image))) {
-            retained_bytes = retained_bytes.saturating_add(image.rgba.capacity() as u64 * std::mem::size_of::<[f32; 4]>() as u64);
+            retained_bytes = retained_bytes.saturating_add(image.retained_texel_bytes());
         }
 
         budget.set_retained(retained_bytes);

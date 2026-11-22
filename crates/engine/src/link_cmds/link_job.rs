@@ -232,7 +232,7 @@ impl LinkJob {
                     continue;
                 };
 
-                let temporary_bytes = texturecraft_formats::mcmat::mesh_map_png_working_bytes(bakes.resolution, map.components());
+                let temporary_bytes = texturecraft_formats::mcmat::mesh_map_png_working_bytes(bakes.resolution, bakes.height(map), map.components());
                 budget.check(temporary_bytes)?;
                 budget.check_available(temporary_bytes)?;
                 if self.canceled.load(Ordering::Relaxed) {

@@ -48,6 +48,25 @@ impl DisplayPadding {
         if self.uniform.is_some() { BTreeSet::new() } else { pad_tiles(output, self, tiles) }
     }
 
+    /// The same nearest covered source as the dense map, without constructing it for one pick.
+    pub(crate) fn source_for_sample(&self, x: u32, y: u32) -> Option<(u32, u32)> {
+        if let Some(dense) = self.dense.get() {
+            return dense.source(x, y);
+        }
+        let gbuf = self.mixed.as_ref()?;
+        let block = if self.block == 0 { u32::MAX } else { self.block };
+        let bounds = |pos: u32, size: u32| {
+            let start = pos / block * block;
+            let last = start.saturating_add(block - 1).min(size - 1);
+            pos.saturating_sub(DISPLAY_PADDING).max(start)..=pos.saturating_add(DISPLAY_PADDING).min(last)
+        };
+        let columns = bounds(x, self.size.0);
+        bounds(y, self.size.1)
+            .flat_map(|sy| columns.clone().map(move |sx| (sx, sy)))
+            .filter(|&(sx, sy)| gbuf.tri[(sy * gbuf.width + sx) as usize] != NO_TRI)
+            .min_by_key(|&(sx, sy)| (sx.abs_diff(x).max(sy.abs_diff(y)), sy, sx))
+    }
+
     /// Whether every texel has a surface sample and the display needs no padding.
     pub fn fully_covered(&self) -> bool {
         self.uniform == Some(true)

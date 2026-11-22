@@ -14,7 +14,8 @@ use std::sync::{Mutex, PoisonError};
 
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use egui::{Color32, ColorImage, Rect, RichText, TextureHandle, TextureOptions, Ui, vec2};
-use texturecraft_engine::compose::ImageRes;
+use texturecraft_engine::compose::{Composite, ImageRes};
+use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::{Bvh, Mesh, OrbitCamera};
 use texturecraft_render::displace::trace_geometry;
 use texturecraft_render::gpu_trace::GpuTracer;
@@ -258,27 +259,69 @@ fn render_size(rect: Rect) -> (u32, u32) {
     ((rect.width() * scale).max(16.0) as u32, (rect.height() * scale).max(16.0) as u32)
 }
 
+/// Advance only the CPU composites needed by the selected tracer. The viewport may own
+/// these materials on the GPU, so its ordinary CPU update can leave them dirty indefinitely.
+fn prepare_cpu_materials(session: &mut texturecraft_engine::Session, height_only: bool) -> bool {
+    let needs_tiles = |session: &texturecraft_engine::Session, ts: usize| {
+        let cache = &session.caches[ts];
+        (!cache.dirty.is_empty() || !cache.settle.is_empty())
+            && (!height_only
+                || (session.doc.project.texture_sets.get(ts).is_some_and(|set| set.atlas_height_strength() != 0.0)
+                    && cache.composite.channels.contains_key(&Channel::Height)))
+    };
+    let pending: Vec<_> = (0..session.caches.len()).filter(|&ts| needs_tiles(session, ts)).collect();
+    if pending.is_empty() {
+        return true;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let ready = {
+        let waiting = |cache: &texturecraft_engine::SetCache| cache.size.0.max(cache.size.1) > 1024 && !cache.dilation.is_ready();
+        let mut ready: Vec<_> = pending.iter().copied().filter(|&ts| !waiting(&session.caches[ts])).collect();
+        if let Some(&ts) = pending.iter().find(|&&ts| waiting(&session.caches[ts]))
+            && session.caches[ts].dilation.prepare_on_worker()
+        {
+            ready.push(ts);
+        }
+        ready
+    };
+    #[cfg(target_arch = "wasm32")]
+    let ready = &pending;
+    if !ready.is_empty() {
+        session.update_for_view_where(2.0, crate::now_ms, Default::default(), |ts| ready.contains(&ts));
+    }
+    !pending.iter().any(|&ts| needs_tiles(session, ts))
+}
+
 /// Build a scene while retaining unchanged geometry and the decoded environment.
-fn trace_scene(app: &TextureCraftApp) -> TraceScene {
+fn trace_scene(app: &TextureCraftApp, cpu_materials: bool) -> TraceScene {
     let session = &app.session;
     let display = &session.doc.project.display;
-    let sets: Vec<TraceSet> = session
+    let revisions = composite_revisions(session, display.displacement);
+    let strengths: Vec<f32> = session.doc.project.texture_sets.iter().map(|set| set.atlas_height_strength()).collect();
+    let key = format!("{}|{revisions:?}|{strengths:?}|{}", session.mesh_id, display.displacement);
+    let mut cached = app.render.geometry.lock().unwrap_or_else(PoisonError::into_inner);
+    let geometry = cached.as_ref().filter(|(cached_key, ..)| *cached_key == key);
+    let need_height = display.displacement && geometry.is_none();
+    let mut sets: Vec<TraceSet> = session
         .doc
         .project
         .texture_sets
         .iter()
-        .zip(&session.caches)
-        .map(|(set, cache)| TraceSet { material: set.material, composite: cache.composite.clone(), height_strength: set.atlas_height_strength() })
+        .enumerate()
+        .filter_map(|(ts, set)| {
+            let cache = session.caches.get(ts)?;
+            let height_strength = set.atlas_height_strength();
+            let composite = if cpu_materials || (need_height && height_strength != 0.0 && cache.composite.channels.contains_key(&Channel::Height)) {
+                cache.composite.clone()
+            } else {
+                // The GPU tracer copies material textures from the viewport.
+                Composite::with_size(&[], cache.size.0, cache.size.1)
+            };
+            Some(TraceSet { material: set.material, composite, height_strength })
+        })
         .collect();
-    let env_image = display.environment_resource().and_then(|n| session.images.get(n));
-
-    // Only displaced geometry depends on the composites (their heights)
-    let revisions: Vec<u64> = if display.displacement { session.caches.iter().map(|cache| cache.revision).collect() } else { Vec::new() };
-    let strengths: Vec<f32> = sets.iter().map(|set| set.height_strength).collect();
-    let key = format!("{}|{revisions:?}|{strengths:?}|{}", session.mesh_id, display.displacement);
-    let mut cached = app.render.geometry.lock().unwrap_or_else(PoisonError::into_inner);
-    let (mesh, bvh) = match cached.as_ref() {
-        Some((cached_key, mesh, bvh)) if *cached_key == key => (mesh.clone(), bvh.clone()),
+    let (mesh, bvh) = match geometry {
+        Some((_, mesh, bvh)) => (mesh.clone(), bvh.clone()),
         _ => {
             let (mesh, bvh) = trace_geometry(&session.mesh, &session.bvh, &sets, display);
             *cached = Some((key, mesh.clone(), bvh.clone()));
@@ -286,7 +329,13 @@ fn trace_scene(app: &TextureCraftApp) -> TraceScene {
         }
     };
     drop(cached);
+    if !cpu_materials {
+        for set in &mut sets {
+            set.composite.channels.clear();
+        }
+    }
 
+    let env_image = display.environment_resource().and_then(|n| session.images.get(n));
     let mut env_cached = app.render.env.lock().unwrap_or_else(PoisonError::into_inner);
     let current_source = env_image.map(Arc::as_ptr);
     let env = match env_cached.as_ref() {
@@ -314,7 +363,7 @@ fn display(app: &TextureCraftApp) -> TraceDisplay {
 
 fn work(app: &TextureCraftApp, size: (u32, u32)) -> Work {
     Work {
-        scene: trace_scene(app),
+        scene: trace_scene(app, true),
         camera: app.session.camera,
         settings: settings(app),
         display: display(app),
@@ -323,10 +372,14 @@ fn work(app: &TextureCraftApp, size: (u32, u32)) -> Work {
     }
 }
 
-/// What the traced scene depends on. `composites`: the texture-set composites too (their
-/// revisions bump with every composited chunk, so while textures load this changes every frame).
+fn composite_revisions(session: &texturecraft_engine::Session, composites: bool) -> Vec<(u64, u64)> {
+    if composites { session.caches.iter().map(|cache| (cache.revision, cache.material_revision)).collect() } else { Vec::new() }
+}
+
+/// What the traced scene depends on. CPU consumers also track material edits made while
+/// compositing runs on the GPU, where the CPU cache's revision does not advance.
 fn scene_key(session: &texturecraft_engine::Session, composites: bool) -> String {
-    let revisions: Vec<u64> = if composites { session.caches.iter().map(|cache| cache.revision).collect() } else { Vec::new() };
+    let revisions = composite_revisions(session, composites);
     let sets: Vec<_> = session.doc.project.texture_sets.iter().map(|set| (set.material, set.atlas_height_strength())).collect();
 
     let display = &session.doc.project.display;
@@ -390,6 +443,12 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) {
 /// Advance the CPU render and keep the last completed image visible during restarts.
 fn show_cpu(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) {
     let ctx = ui.ctx().clone();
+    if !prepare_cpu_materials(&mut app.session, false) {
+        app.render.job = None;
+        paint(ui, rect, app.render.texture.as_ref().map(TextureHandle::id));
+        ctx.request_repaint();
+        return;
+    }
     let size = render_size(rect);
 
     // The CPU tracer reads the composites themselves: every change restarts it
@@ -457,6 +516,13 @@ fn show_gpu(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) -> bool {
         return false;
     }
 
+    if app.session.doc.project.display.displacement && !prepare_cpu_materials(&mut app.session, true) {
+        let shown = app.render.gpu.as_ref().filter(|view| view.has_image).map(|view| view.held.unwrap_or(view.texture));
+        paint(ui, rect, shown);
+        ui.ctx().request_repaint();
+        return true;
+    }
+    let scene_key = gpu_scene_key(&app.session);
     app.render.gpu_error = None;
     if app.render.job.take().is_some() {
         app.render.texture = None;
@@ -517,7 +583,7 @@ fn show_gpu(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) -> bool {
                 None => (
                     render_state.renderer.write().register_native_texture(&render_state.device, &out_view, wgpu::FilterMode::Linear),
                     scene_key.clone(),
-                    Arc::new(trace_scene(app)),
+                    Arc::new(trace_scene(app, false)),
                     SppControl::default(),
                 ),
             };
@@ -563,7 +629,7 @@ fn show_gpu(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) -> bool {
         view.started = now;
     }
     if view.scene_key != scene_key {
-        view.scene = Arc::new(trace_scene(app));
+        view.scene = Arc::new(trace_scene(app, false));
         view.scene_key = scene_key;
     }
 

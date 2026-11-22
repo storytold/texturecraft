@@ -79,11 +79,23 @@ pub fn mesh_map_png(width: u32, components: usize, data: &[f32]) -> Result<Vec<u
     Ok(encoded)
 }
 
-/// Estimated workspace for one quantized row, three encoder rows and the deflate state.
-pub fn mesh_map_png_working_bytes(width_px: u32, components: usize) -> u64 {
+/// Estimated temporary workspace for `write_mesh_map_png` with a file destination.
+pub fn mesh_map_png_working_bytes(width_px: u32, height_px: u32, components: usize) -> u64 {
+    // PngRows in the pinned codec deflates bands of up to 512 KiB filtered bytes,
+    // or one scanline for wider images.
+    const DEFLATE_BAND_BYTES: u64 = 512 << 10;
     const DEFLATE_WORKSPACE_BYTES: u64 = 1 << 20;
 
-    u64::from(width_px).saturating_mul(components as u64).saturating_mul(4 * std::mem::size_of::<u16>() as u64).saturating_add(DEFLATE_WORKSPACE_BYTES)
+    let row_bytes = u64::from(width_px).saturating_mul(components as u64).saturating_mul(std::mem::size_of::<u16>() as u64);
+    let filtered_row_bytes = row_bytes.saturating_add(1);
+    let band_rows = (DEFLATE_BAND_BYTES / filtered_row_bytes).max(1).min(u64::from(height_px));
+    let pending = row_bytes.saturating_mul(band_rows).saturating_mul(2);
+    let filtered = filtered_row_bytes.saturating_mul(band_rows);
+    let deflated = filtered.saturating_add(filtered / 8).saturating_add(1_024);
+    // Include spare row capacity and keep both the deflate output and the
+    // assembled zlib buffer in the estimate. Input floats are already charged.
+    let row_buffers = row_bytes.saturating_mul(8);
+    row_buffers.saturating_add(pending).saturating_add(filtered).saturating_add(deflated.saturating_mul(2)).saturating_add(DEFLATE_WORKSPACE_BYTES)
 }
 
 /// Encode a mesh map directly into its destination using one row of quantized samples.
@@ -130,6 +142,20 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn mesh_map_png_budget_covers_live_band_allocations() {
+        // The pinned encoder holds 85 rows for a 1024px RGB16 map. These
+        // three reserves coexist while deflating, even for compressible data.
+        const PENDING_BYTES: u64 = 522_240;
+        const FILTERED_BYTES: u64 = 522_325;
+        const DEFLATE_OUTPUT_BYTES: u64 = 588_639;
+        let unavoidable_workspace = PENDING_BYTES + FILTERED_BYTES + DEFLATE_OUTPUT_BYTES;
+        let estimate = mesh_map_png_working_bytes(1_024, 1_024, 3);
+        assert!(estimate >= unavoidable_workspace, "estimated {estimate} bytes for at least {unavoidable_workspace} bytes of workspace");
+        assert!(mesh_map_png_working_bytes(1_024, 1, 3) < estimate);
+        assert_eq!(mesh_map_png_working_bytes(u32::MAX, u32::MAX, usize::MAX), u64::MAX);
+    }
+
+    #[test]
     fn recognizes_v3_and_directs_older_authors_to_republish() {
         let source = craft_mcmat::write(b"<package/>", []).unwrap();
         assert!(is_mcmat(&source) && !is_mcraft(&source));
@@ -165,5 +191,46 @@ mod tests {
         assert!(mesh_map_png(2, 1, &[0.0; 3]).is_err());
         assert!(mesh_map_png(0, 1, &[]).is_err());
         assert!(mesh_map_png(2, 2, &[0.0; 8]).is_err());
+    }
+
+    #[test]
+    fn mesh_maps_encode_gray16_and_rgb16_with_exact_png_headers() {
+        let decode_raw_16 = |bytes: &[u8]| {
+            let decoder = png::Decoder::new(Cursor::new(bytes));
+            let mut reader = decoder.read_info().unwrap();
+            let info = reader.info().clone();
+            let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+            let frame = reader.next_frame(&mut buf).unwrap();
+            let samples: Vec<u16> = buf[..frame.buffer_size()].as_chunks::<2>().0.iter().copied().map(u16::from_be_bytes).collect();
+            (info, samples)
+        };
+
+        let gray = mesh_map_png(2, 1, &[-0.5, 0.25, 0.5, 1.5]).unwrap();
+        let (gray_info, gray_samples) = decode_raw_16(&gray);
+        assert_eq!(gray_info.bit_depth, png::BitDepth::Sixteen);
+        assert_eq!(gray_info.color_type, png::ColorType::Grayscale);
+        assert_eq!(gray_samples, [0, 16384, 32768, 65535]);
+
+        let rgb = mesh_map_png(2, 3, &[0.0, 0.25, 0.5, 1.0, 0.75, 0.125, 0.5, 0.5, 0.5, 0.0, 1.0, 0.0]).unwrap();
+        let (rgb_info, rgb_samples) = decode_raw_16(&rgb);
+        assert_eq!(rgb_info.bit_depth, png::BitDepth::Sixteen);
+        assert_eq!(rgb_info.color_type, png::ColorType::Rgb);
+        assert_eq!(rgb_samples, [0, 16384, 32768, 65535, 49151, 8192, 32768, 32768, 32768, 0, 65535, 0]);
+    }
+
+    #[test]
+    fn write_mesh_map_png_propagates_writer_errors() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = write_mesh_map_png(FailingWriter, 2, 1, &[0.0, 0.25, 0.5, 1.0]).unwrap_err();
+        assert!(matches!(error, FormatError::Invalid(_)), "{error}");
     }
 }

@@ -5,6 +5,7 @@ use super::{ANCHOR_PUBLISH_LAYER, ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, Composi
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Features {
     patterns: bool,
+    extended_patterns: bool,
     tile_generator: bool,
     authored_images: bool,
     mask_preview: bool,
@@ -43,6 +44,7 @@ impl Features {
             features.anchors |= kind == ANCHOR_SOURCE;
             features.color_selection |= kind == COLOR_SELECTION_OPCODE;
             features.patterns |= matches!(kind, 1..=9 | 11..=13 | FIRST_EXTENDED_PATTERN..=TILE_GENERATOR_OPCODE);
+            features.extended_patterns |= (FIRST_EXTENDED_PATTERN..TILE_GENERATOR_OPCODE).contains(&kind);
             features.tile_generator |= kind == TILE_GENERATOR_OPCODE;
             if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&kind) {
                 features.generators = true;
@@ -66,7 +68,12 @@ impl Features {
         [
             "override enable_authored_images: bool = false;\n             override enable_generators: bool = false;\n             override enable_curvature_detail: bool = false;\n             override enable_spatial_fields: bool = false;\n             override enable_anchor_reads: bool = false;",
             include_str!("shaders/noise.wgsl"),
-            include(self.patterns, include_str!("shaders/procedural_extra.wgsl"), ""),
+            // Keep the gradient fallback when the program has no extended patterns.
+            include(
+                self.extended_patterns,
+                include_str!("shaders/procedural_extra.wgsl"),
+                "fn extended_pattern(kind: u32, p: vec3<f32>, seed: u32) -> f32 { return fract(p.x); }",
+            ),
             include(
                 self.tile_generator,
                 include_str!("shaders/tile_generator.wgsl"),
