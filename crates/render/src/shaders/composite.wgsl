@@ -148,6 +148,17 @@ fn azimuth(y: f32, x: f32) -> f32 {
     if x == 0.0 && y == 0.0 { return 0.5; }
     return atan2(y, x) / 6.283185307 + 0.5;
 }
+fn triplanar_weights(normal: vec3<f32>, sharpness: f32) -> vec3<f32> {
+    let axes = abs(normal);
+    let strongest = max(axes.x, max(axes.y, axes.z));
+    if strongest <= 0.0 {
+        return vec3(0.0);
+    }
+    // Keep the strongest axis at one to preserve normalized blends at high sharpness.
+    let weights = pow(axes / strongest, vec3(sharpness));
+    return weights / (weights.x + weights.y + weights.z);
+}
+
 fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
     if enable_anchor_reads && layer.ids.y == 15u {
         let pixel = vec2<u32>(uv * vec2<f32>(params.source.xy));
