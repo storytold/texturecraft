@@ -270,6 +270,7 @@ fn value_at(p: vec2<i32>) -> f32 {
         case 2u: { return box_blur(p); }
         case 3u: { return short_line(p); }
         case 5u: { return sheared_line(p); }
+        case 6u: { return stepped_front(uv + params.values.xy); }
         default: { return sharpen(p); }
     }
 }
@@ -289,8 +290,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var words: vec2<u32>;
     if params.output.z == 255u {
         words = vec2<u32>(compiled_8bit_sample(values.x), compiled_8bit_sample(values.y));
-    } else if params.control.x < 2u {
-        // Warps round reads to 16 bits before applying the node's compiled format
+    } else if params.control.x < 2u || params.control.x == 6u {
+        // Warps and translations round reads to 16 bits before applying the node's compiled format.
         words = vec2<u32>(rounded_read(values.x), rounded_read(values.y));
     } else {
         words = compiled_16bit(values);

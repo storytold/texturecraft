@@ -112,6 +112,7 @@ pub enum FilterOperation<'a> {
     ShortLine { major: usize, slope: f32, radius: f32 },
     ShearedLine { major: usize, slope: f32, radius: f32 },
     Sharpen { weights: [f32; 2] },
+    WrappedTranslation { offset: [f32; 2] },
 }
 
 pub trait Accelerator: Send + Sync {

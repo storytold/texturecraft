@@ -15,6 +15,7 @@ const BOX: u32 = 2;
 const SHORT_LINE: u32 = 3;
 const SHARPEN: u32 = 4;
 const SHEARED_LINE: u32 = 5;
+const WRAPPED_TRANSLATION: u32 = 6;
 const SHADER: &str = concat!(include_str!("shaders/graph_filter.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
 
 pub(crate) struct FilterRasterizer {
@@ -105,6 +106,11 @@ impl FilterRasterizer {
             FilterOperation::Sharpen { weights } => {
                 params.control[0] = SHARPEN;
                 params.values = [weights[0], weights[1], 0.0, 0.0];
+                None
+            }
+            FilterOperation::WrappedTranslation { offset } => {
+                params.control[0] = WRAPPED_TRANSLATION;
+                params.values = [offset[0], offset[1], 0.0, 0.0];
                 None
             }
         };
@@ -218,7 +224,10 @@ mod tests {
     use texturecraft_graph::{context::EvalContext, graph::Graph, profile::Profiler, tex::Tex};
 
     #[derive(Default)]
-    struct Nodes(AtomicUsize);
+    struct Nodes {
+        resident: AtomicUsize,
+        readbacks: AtomicUsize,
+    }
 
     impl Profiler for Nodes {
         fn enabled(&self) -> bool {
@@ -230,7 +239,11 @@ mod tests {
         }
 
         fn resident_node(&self, _: u32, _: &str) {
-            self.0.fetch_add(1, Relaxed);
+            self.resident.fetch_add(1, Relaxed);
+        }
+
+        fn resident_readback(&self, _: u32, _: usize) {
+            self.readbacks.fetch_add(1, Relaxed);
         }
     }
 
@@ -266,7 +279,7 @@ mod tests {
             ("line_blur", 65535, "intensity=10.56 angle=0.25", false),
             ("laplacian_sharpen", 255, "intensity=0.4", false),
         ] {
-            nodes.0.store(0, Relaxed);
+            nodes.resident.store(0, Relaxed);
             let format = if div == 255 { "u8_compiled" } else { "u16_compiled" };
             let map_log2 = if gradient { map_size.ilog2() } else { size.ilog2() };
             let graph = Graph::parse(&format!(
@@ -278,13 +291,43 @@ mod tests {
             let inputs = make_inputs(if gradient { map_size } else { size });
             let cpu = &graph.evaluate_with_inputs(None, &inputs).unwrap()["out"];
             let gpu = &graph.evaluate_in(&context, None, &inputs).unwrap()["out"];
-            assert_eq!(nodes.0.load(Relaxed), 1, "{filter} {options}");
+            assert_eq!(nodes.resident.load(Relaxed), 1, "{filter} {options}");
             let errors = cpu.px.iter().zip(&gpu.px).map(|(a, b)| ((a[0] - b[0]).abs() * div as f32).round() as u32);
             let (max, sum) = errors.fold((0, 0), |(max, sum), error| (max.max(error), sum + error));
             let mean = f64::from(sum) / cpu.px.len() as f64;
             // A slope across two differently sized grids can cross one 1/256 interpolation weight.
             let max_steps = if gradient { 16 } else { 1 };
             assert!(max <= max_steps && mean < 0.05, "{filter} {options}: errors {max} maximum, {mean} mean quantization steps");
+        }
+    }
+
+    #[test]
+    fn translated_enlargement_keeps_packed_grey_and_alpha_on_the_gpu() {
+        let Ok(gpu) = crate::headless::Headless::new() else { return };
+        let nodes = Arc::new(Nodes::default());
+        let context = EvalContext {
+            accelerator: Some(Arc::new(crate::gpu_graph::GraphAccelerator::new(&gpu.device, &gpu.queue))),
+            profiler: Some(nodes.clone()),
+            ..Default::default()
+        };
+        let source = [Some(Tex::gray_fn(256, 256, |u, v| 0.5 + 0.5 * (u * 39.0).sin() * (v * 53.0).cos()))];
+        for axis in ["x", "y"] {
+            nodes.resident.store(0, Relaxed);
+            nodes.readbacks.store(0, Relaxed);
+            // The imported transform shifts a non-periodic input by one output texel with both axes wrapping.
+            let graph = Graph::parse(&format!(
+                "format 3\nsize 256\nmeta compiled \"1\"\nnode 1 input idx=0 gray=1 format=\"u16_compiled\"\n\
+                 node 2 levels_mid in=@1 out_low=1 out_high=0 format=\"u16_compiled\"\n\
+                 node 3 transform_matrix in=@2 offset_{axis}=-0.0009765625 osize_log2_x=10 osize_log2_y=10 format=\"u16_compiled\"\n\
+                 node 4 laplacian_sharpen in=@3 intensity=0 format=\"u16_compiled\"\noutput out 4\n"
+            ))
+            .unwrap();
+            let cpu = &graph.evaluate_with_inputs(None, &source).unwrap()["out"];
+            let gpu = &graph.evaluate_in(&context, None, &source).unwrap()["out"];
+            assert_eq!(nodes.resident.load(Relaxed), 2, "offset {axis}");
+            assert_eq!(nodes.readbacks.load(Relaxed), 1, "offset {axis}");
+            assert_eq!((gpu.w, gpu.h), (1024, 1024));
+            assert!(cpu.px.iter().zip(&gpu.px).all(|(a, b)| a[3] == 0.0 && b[3] == 0.0 && (a[0] - b[0]).abs() <= 1.01 / 65535.0));
         }
     }
 }

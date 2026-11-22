@@ -4821,8 +4821,18 @@ fn compute_resident_grey(
     let Some(accelerator) = &ctx.ec.accelerator else { return Ok(None) };
     let result = match n.kind.as_str() {
         "transform_matrix" | "blend" => {
-            let Some(pass) = grey_pass(n, ctx, steps, |slot| ins.get(slot).and_then(NodeValue::packed_grey)) else { return Ok(None) };
-            accelerator.resident_grey(pass, &ctx.ec.cancel)
+            if n.kind == "transform_matrix"
+                && let Some(steps) = steps.filter(|s| s.fmt == crate::measured::COMPILED_16_BIT)
+                && !rolls(n)
+                && ctx.size * ctx.height >= 64 * 1024
+                && let Some(source) = ins.get("in").and_then(NodeValue::packed_grey)
+                && let Some(filter) = crate::atomic::resident_filter(n, [ctx.size, ctx.height], steps.div, source, None)
+            {
+                accelerator.resident_filter(filter, &ctx.ec.cancel)
+            } else {
+                let Some(pass) = grey_pass(n, ctx, steps, |slot| ins.get(slot).and_then(NodeValue::packed_grey)) else { return Ok(None) };
+                accelerator.resident_grey(pass, &ctx.ec.cancel)
+            }
         }
         "levels_mid" if !rolls(n) => {
             let Some((source, steps)) = ins.get("in").and_then(NodeValue::packed_grey).zip(steps) else { return Ok(None) };

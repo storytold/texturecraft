@@ -221,8 +221,8 @@ pub(crate) fn resident_filter<'a>(
     if !packed(source) || !size.into_iter().all(usize::is_power_of_two) || size[0] < 2 {
         return None;
     }
-    let (w, h, ..) = source.info();
-    if n.kind != "grad_warp" && size != [w, h] {
+    let (w, h, source_div, _) = source.info();
+    if !matches!(n.kind.as_str(), "grad_warp" | "transform_matrix") && size != [w, h] {
         return None;
     }
     let value = |name, default| n.nums.get(name).copied().unwrap_or(default);
@@ -235,6 +235,24 @@ pub(crate) fn resident_filter<'a>(
     }
     let radii = |intensity: f32| [intensity * aspect[0] * w as f32 / INTENSITY_SPAN, intensity * aspect[1] * h as f32 / INTENSITY_SPAN];
     let operation = match n.kind.as_str() {
+        "transform_matrix" => {
+            let offset = [value("offset_x", 0.0), value("offset_y", 0.0)];
+            // Translated, wrapped enlargements read the original pixels directly. The identity-only case doubles first.
+            if source_div != STEPS_16 as f32
+                || tile != [true; 2]
+                || transform_matrix_bg(n) != [0.0; 4]
+                || value("filter", 1.0) != 1.0
+                || !matches!(value("mip", MIP_AUTOMATIC as f32).round() as u32, MIP_AUTOMATIC_TOO | MIP_AUTOMATIC)
+                || [value("m00", 1.0), value("m01", 0.0), value("m10", 0.0), value("m11", 1.0)] != [1.0, 0.0, 0.0, 1.0]
+                || offset == [0.0; 2]
+                || offset.into_iter().any(|offset| !(-1.0..=1.0).contains(&offset))
+                || size[0] < w
+                || size[1] < h
+            {
+                return None;
+            }
+            FilterOperation::WrappedTranslation { offset }
+        }
         "laplacian_sharpen" => {
             let weights = aspect.map(|axis| value("intensity", SHARPEN_DEFAULT_INTENSITY) * axis);
             if !weights.into_iter().all(f32::is_finite) {
