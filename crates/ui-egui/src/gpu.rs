@@ -290,7 +290,7 @@ impl GraphPreparation {
                     if warm_saved_uses {
                         graphs.warm_saved_uses(ts);
                     }
-                    if !warm_saved_uses || CompositeProgram::try_compile_inputs(&inputs, None).is_err() {
+                    if !warm_saved_uses || CompositeProgram::try_compile_saved_inputs(&inputs, None).is_err() {
                         texturecraft_engine::compose::eval::prepare_texture_set_graphs(&inputs);
                     }
                 }
@@ -470,6 +470,9 @@ impl SetCompositor {
         let mut graphs = CompositeGraphs::new(&session.doc.graphs, baked, &session.images, cache.size).resident_only();
         if self.graph_key.is_some_and(|previous| previous != graph_key && previous.mesh == graph_key.mesh && previous.size == graph_key.size) {
             graphs = graphs.without_stack_results();
+        }
+        if !session.modified && self.graph_key.is_none_or(|previous| previous == graph_key) {
+            graphs = graphs.saved_snapshot();
         }
         let graphs = Some(graphs);
         let program = match mask {

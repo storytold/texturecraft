@@ -215,16 +215,24 @@ pub struct CompositeGraphs<'a> {
     env: RenderEnv<'a>,
     prepared_stack: bool,
     disk_reads: bool,
+    saved_snapshot: bool,
 }
 
 impl<'a> CompositeGraphs<'a> {
     pub fn new(store: &'a GraphStore, baked: &'a BakedMaps, images: &'a ImageStore, size: (u32, u32)) -> Self {
-        Self { store, env: RenderEnv { baked, images, side: RenderEnv::side_for(size) }, prepared_stack: true, disk_reads: true }
+        Self { store, env: RenderEnv { baked, images, side: RenderEnv::side_for(size) }, prepared_stack: true, disk_reads: true, saved_snapshot: false }
     }
 
     /// Let the viewport defer disk reads to its graph preparation worker.
     pub fn resident_only(mut self) -> Self {
         self.disk_reads = false;
+        self
+    }
+
+    /// The document has just been opened from its saved archive, whose use table
+    /// records the pixels of that snapshot even after the graph evaluator changes.
+    pub fn saved_snapshot(mut self) -> Self {
+        self.saved_snapshot = true;
         self
     }
 
@@ -305,14 +313,11 @@ impl<'a> ProceduralInputs<'a> {
     ) -> Result<Option<(u32, u32)>, &'static str> {
         let inputs = self.graphs.ok_or(GRAPH_OUTPUT_PENDING)?;
         let use_ = GraphUse { set: self.set, id: owner.0, channel: owner.1 };
-        let key = if dynamic {
-            if !inputs.prepared_stack {
-                return Err(GRAPH_OUTPUT_PENDING);
-            }
-            inputs.store.use_cook_key(&use_)
-        } else {
-            inputs.store.cook_key(graph, &inputs.env, &[])
-        };
+        if dynamic && !inputs.prepared_stack {
+            return Err(GRAPH_OUTPUT_PENDING);
+        }
+        let saved = (dynamic || inputs.saved_snapshot).then(|| inputs.store.use_cook_key(&use_)).flatten();
+        let key = if dynamic { saved } else { saved.or_else(|| inputs.store.cook_key(graph, &inputs.env, &[])) };
         let Some(mut key) = key else {
             return if dynamic && inputs.store.has_problem(&use_) { Ok(None) } else { Err(GRAPH_OUTPUT_PENDING) };
         };
@@ -721,7 +726,19 @@ impl CompositeProgram {
     }
 
     pub fn try_compile_inputs(inputs: &Inputs<'_>, region: Option<CompositeRegion>) -> Result<Self, &'static str> {
-        let graphs = CompositeGraphs::new(inputs.graphs, inputs.baked, inputs.images, (inputs.gbuf.width, inputs.gbuf.height));
+        Self::try_compile_prepared_inputs(inputs, region, false)
+    }
+
+    /// Plan the initial view of an unchanged saved document using its archived cook table.
+    pub fn try_compile_saved_inputs(inputs: &Inputs<'_>, region: Option<CompositeRegion>) -> Result<Self, &'static str> {
+        Self::try_compile_prepared_inputs(inputs, region, true)
+    }
+
+    fn try_compile_prepared_inputs(inputs: &Inputs<'_>, region: Option<CompositeRegion>, saved: bool) -> Result<Self, &'static str> {
+        let mut graphs = CompositeGraphs::new(inputs.graphs, inputs.baked, inputs.images, (inputs.gbuf.width, inputs.gbuf.height));
+        if saved {
+            graphs = graphs.saved_snapshot();
+        }
         let mut program = Self::try_compile_with_graphs(inputs.project, inputs.pixels, inputs.ts, region, None, Some(graphs))?;
         program.set_baked_inputs(Some(inputs.baked))?;
         Ok(program)
