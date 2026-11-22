@@ -162,6 +162,7 @@ pub struct ImportPreview {
     pub material: usize,
     pub camera: texturecraft_geom::OrbitCamera,
     pub normal_format: texturecraft_core::NormalFormat,
+    pub spec_gloss: bool,
     pub overview: crate::MaterialOverview,
 }
 
@@ -205,6 +206,8 @@ impl ImportProgress {
             crate::camera_cmds::apply(&mut camera, saved);
         }
         let overview = crate::MaterialOverview::from_stored(&preview.composite);
+        let spec_gloss = preview.composite.channels.contains_key(&texturecraft_core::Channel::Glossiness)
+            && preview.composite.channels.contains_key(&texturecraft_core::Channel::Specular);
         if let Ok(mut out) = progress.pending.lock()
             && !self.is_cancelled()
         {
@@ -214,6 +217,7 @@ impl ImportProgress {
                 material: preview.material,
                 camera,
                 normal_format: preview.normal_format,
+                spec_gloss,
                 overview,
             });
             self.log_detail("Stored material preview prepared");

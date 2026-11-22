@@ -396,6 +396,7 @@ impl PreviewView {
             shade: Shade {
                 background,
                 normal_y: if self.source.normal_format == texturecraft_engine::core::NormalFormat::DirectX { -1.0 } else { 1.0 },
+                spec_gloss: self.source.spec_gloss,
                 ..Shade::default()
             },
             visible: vec![true],

@@ -527,10 +527,11 @@ fn read_stored_channels<'a>(ctx: &SetContext<'a, '_>, report: &mut ImportReport,
 }
 
 fn preview_tiles(image: &Rgba, channel: Channel, default: [f32; 3], side: u32) -> texturecraft_texel::TileImage {
-    use texturecraft_texel::{TileImage, to_u16};
+    use texturecraft_texel::{TileImage, to_u16, to_u16_signed};
 
     let image = resample(image, side);
     let mut tiles = TileImage::new(side, side, channel.components());
+    let quantize: fn(f32) -> u16 = if channel.kind() == texturecraft_core::ChannelKind::Signed { to_u16_signed } else { to_u16 };
     for y in 0..side {
         for x in 0..side {
             let [r, g, b, coverage] = image.get(x, y);
@@ -538,7 +539,7 @@ fn preview_tiles(image: &Rgba, channel: Channel, default: [f32; 3], side: u32) -
             let pixel = [r, g, b];
             let values = std::array::from_fn::<_, 3, _>(|index| {
                 let value = if pixel[index].is_finite() { pixel[index] } else { default[index] };
-                to_u16(value * coverage + default[index] * (1.0 - coverage))
+                quantize(value * coverage + default[index] * (1.0 - coverage))
             });
             tiles.set(x, y, &values);
         }
