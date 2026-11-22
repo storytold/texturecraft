@@ -194,6 +194,7 @@ impl Session {
             let _ = std::thread::Builder::new().name("texturecraft-free".into()).spawn(move || drop(old));
             #[cfg(target_arch = "wasm32")]
             drop(old);
+            crate::session::share_pattern_budget(&self.caches);
         }
         self.log.append(log);
         self.push_history("Texture set size", before);
