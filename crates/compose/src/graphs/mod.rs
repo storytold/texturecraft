@@ -17,6 +17,7 @@
 pub mod budget;
 pub mod kept;
 pub mod once;
+mod profiling;
 pub mod spill;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1113,7 +1114,7 @@ impl GraphStore {
         let profiler = trace.map(|emit| {
             let graph = trace_name(&g.name).to_owned();
             emit(format!("Graph {graph:?}: evaluating {nodes} nodes"));
-            Arc::new(CookProfiler { emit, graph }) as Arc<dyn texturecraft_graph::profile::Profiler>
+            Arc::new(profiling::CookProfiler::new(emit, graph)) as Arc<dyn texturecraft_graph::profile::Profiler>
         });
         let ec = EvalContext {
             cancel: self.cooks.cancel.clone(),
@@ -1128,61 +1129,6 @@ impl GraphStore {
         let linear: BTreeSet<String> =
             graph.meta.get("working").map(|w| w.trim_matches('"').split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
         Ok(Cooked::from_textures(outs, linear))
-    }
-}
-
-struct CookProfiler {
-    emit: CookTrace,
-    graph: String,
-}
-
-impl texturecraft_graph::profile::Profiler for CookProfiler {
-    fn enabled(&self) -> bool {
-        false
-    }
-
-    fn span(&self, _: &str) -> Box<dyn std::any::Any + Send> {
-        Box::new(())
-    }
-
-    fn accelerated_node(&self, id: u32, kind: &str) {
-        (self.emit)(format!("GPU result for node #{id} {kind} in {:?}", self.graph));
-    }
-
-    fn resident_node(&self, id: u32, kind: &str) {
-        (self.emit)(format!("GPU-resident result for node #{id} {kind} in {:?}", self.graph));
-    }
-
-    fn resident_readback(&self, id: u32, bytes: usize) {
-        (self.emit)(format!("GPU graph readback for node #{id} in {:?}: {bytes} bytes", self.graph));
-    }
-
-    fn node(&self, id: u32, kind: &str, (width, height): (usize, usize)) -> Option<Box<dyn std::any::Any + Send>> {
-        let description = format!("#{id} {kind} ({width}×{height}) in {:?}", self.graph);
-        (self.emit)(format!("Node {description}"));
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            Some(Box::new(CookNodeTime { emit: self.emit.clone(), description, started: std::time::Instant::now() }))
-        }
-        #[cfg(target_arch = "wasm32")]
-        None
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-struct CookNodeTime {
-    emit: CookTrace,
-    description: String,
-    started: std::time::Instant,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for CookNodeTime {
-    fn drop(&mut self) {
-        let ms = self.started.elapsed().as_millis();
-        if ms >= 100 {
-            (self.emit)(format!("Slow node {}: {ms} ms", self.description));
-        }
     }
 }
 
