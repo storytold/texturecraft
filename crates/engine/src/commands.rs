@@ -158,6 +158,7 @@ fn works_without_project(id: &str) -> bool {
         id,
         "file.open"
             | "file.new"
+            | "file.importProject"
             | "project.new"
             | "project.sample"
             | "project.inspect"

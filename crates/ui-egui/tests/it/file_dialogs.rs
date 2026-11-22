@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{ViewportCommand, ViewportEvent, ViewportId};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::Session;
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::file_dialogs::{Answer, Request};
@@ -61,6 +61,30 @@ fn open_returns_at_once_and_the_answer_opens_the_project_later() {
     h.run_steps(3);
     assert_eq!(h.state().session.doc.project.name, "Picked");
     assert_eq!(h.state().ui.recent.first().map(String::as_str), Some(file.display().to_string().as_str()));
+}
+
+#[test]
+fn import_project_opens_the_file_picker_without_an_open_project() {
+    let session = Session::closed().unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.prefs.language = "en".into();
+    let ext = texturecraft_engine::import_cmds::PROJECT_EXT;
+    answer(&mut h, move |request| {
+        let Request::File(dialog) = request else { panic!("expected a file picker") };
+        assert!(dialog.filters.iter().any(|filter| filter.extensions.iter().any(|value| value == ext)));
+        Answer::Paths(vec![PathBuf::from(format!("picked.{ext}"))])
+    });
+    h.run_steps(4);
+
+    h.get_by_label("File").click();
+    h.run_steps(2);
+    let import = h.get_by_label("Import project...");
+    assert!(!import.accesskit_node().is_disabled());
+    import.click();
+    h.run_steps(3);
+
+    assert!(matches!(h.state().import, Some(texturecraft_ui_egui::import_ui::ImportUi::Notice { .. })));
+    assert!(!h.state().session.project_open);
 }
 
 #[test]
