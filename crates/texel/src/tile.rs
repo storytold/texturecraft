@@ -26,12 +26,11 @@ enum TileOrigin {
     Source(Weak<ReadTiles>),
 }
 
-/// An image split into 64×64 tiles; unallocated tiles read as zero. Cloning shares the
-/// lazy or loaded table. A write detaches the table and the changed tiles.
+/// An image split into 64×64 tiles; unallocated tiles read as zero. Cloning shares any
+/// resident table. A write detaches the table and the changed tiles.
 ///
 /// An image opened from a file can be made with [`TileImage::lazy`]: its tiles are read when first needed, and while it
 /// is unchanged it can let them go ([`TileImage::release`]) and read them again later, the same.
-#[derive(Clone)]
 pub struct TileImage {
     width: u32,
     height: u32,
@@ -41,6 +40,14 @@ pub struct TileImage {
     tiles: Arc<OnceLock<TileSlots>>,
     /// Where the tiles can be read again, and how many are allocated; dropped at the first change.
     source: Option<(TileSource, usize)>,
+}
+
+impl Clone for TileImage {
+    fn clone(&self) -> Self {
+        // Opening one cold image must not pin those pixels in unrelated undo snapshots.
+        let tiles = if self.is_loaded() { Arc::clone(&self.tiles) } else { Arc::new(OnceLock::new()) };
+        Self { width: self.width, height: self.height, comps: self.comps, tiles_x: self.tiles_x, tiles_y: self.tiles_y, tiles, source: self.source.clone() }
+    }
 }
 
 impl std::fmt::Debug for TileImage {
