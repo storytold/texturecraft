@@ -56,6 +56,16 @@ fn lerp(lo: f32, hi: f32, weight: f32) -> f32 {
     return lo + (hi - lo) * weight;
 }
 
+fn affine_uv(uv: vec2<f32>) -> vec2<f32> {
+    let center = uv - 0.5;
+    // Retain the reference arithmetic's intermediate rounding at nearest and bilinear sampling boundaries.
+    let horizontal = bitcast<vec2<u32>>(params.direction.xy * center.x);
+    let vertical = bitcast<vec2<u32>>(params.direction.zw * center.y);
+    let shifted = bitcast<vec2<f32>>(select(horizontal, vec2<u32>(0u), horizontal == vec2<u32>(0x80000000u)))
+        + bitcast<vec2<f32>>(select(vertical, vec2<u32>(0u), vertical == vec2<u32>(0x80000000u)));
+    return shifted + 0.5 + params.values.xy;
+}
+
 fn luminance(v: f32) -> f32 {
     return (v * 0.2126 + v * 0.7152) + v * 0.0722;
 }
@@ -270,7 +280,13 @@ fn value_at(p: vec2<i32>) -> f32 {
         case 2u: { return box_blur(p); }
         case 3u: { return short_line(p); }
         case 5u: { return sheared_line(p); }
-        case 6u: { return stepped_front(uv + params.values.xy); }
+        case 6u: {
+            let input_uv = affine_uv(uv);
+            if params.control.y != 0u {
+                return stepped_front(input_uv);
+            }
+            return front_at(vec2<i32>(floor(input_uv * vec2<f32>(params.source.xy))));
+        }
         default: { return sharpen(p); }
     }
 }

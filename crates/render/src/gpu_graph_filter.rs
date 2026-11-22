@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use texturecraft_graph::accelerator::{FilterOperation, GreyInput, ResidentFilter, ResidentGrey16};
+use texturecraft_graph::accelerator::{FilterOperation, GreyInput, ResidentFilter, ResidentGrey16, ResidentGreyPass};
 use texturecraft_graph::context::Cancel;
 use wgpu::util::DeviceExt;
 
@@ -15,7 +15,7 @@ const BOX: u32 = 2;
 const SHORT_LINE: u32 = 3;
 const SHARPEN: u32 = 4;
 const SHEARED_LINE: u32 = 5;
-const WRAPPED_TRANSLATION: u32 = 6;
+const WRAPPED_AFFINE: u32 = 6;
 const SHADER: &str = concat!(include_str!("shaders/graph_filter.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
 
 pub(crate) struct FilterRasterizer {
@@ -61,6 +61,7 @@ impl FilterRasterizer {
         };
         let mut passes = Vec::with_capacity(2);
         let mut shifts = None;
+        let mut reduced = None;
         let map = match filter.operation {
             FilterOperation::DirectionalWarp { map, intensity, offset, direction, aspect } => {
                 params.control[0] = DIRECTIONAL_WARP;
@@ -108,9 +109,17 @@ impl FilterRasterizer {
                 params.values = [weights[0], weights[1], 0.0, 0.0];
                 None
             }
-            FilterOperation::WrappedTranslation { offset } => {
-                params.control[0] = WRAPPED_TRANSLATION;
+            FilterOperation::WrappedAffine { matrix, offset, bilinear, mip_side } => {
+                params.control[0] = WRAPPED_AFFINE;
+                params.control[1] = u32::from(bilinear);
+                if let Some(side) = mip_side {
+                    let Some(image) = pool.render_resident(ResidentGreyPass::Reduce { source, side }, cancel)? else { return Ok(None) };
+                    params.source[0] = side as u32;
+                    params.source[1] = side as u32;
+                    reduced = Some(image);
+                }
                 params.values = [offset[0], offset[1], 0.0, 0.0];
+                params.direction = matrix;
                 None
             }
         };
@@ -122,6 +131,7 @@ impl FilterRasterizer {
             passes.push(params);
         }
 
+        let source = reduced.as_ref().map_or(source, GreyInput::Device);
         self.device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
         let Some(input) = pool.bind_input(source)? else { return Ok(None) };
         let external_map = match map {
@@ -302,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn translated_enlargement_keeps_packed_grey_and_alpha_on_the_gpu() {
+    fn affine_transform_keeps_packed_grey_and_alpha_on_the_gpu() {
         let Ok(gpu) = crate::headless::Headless::new() else { return };
         let nodes = Arc::new(Nodes::default());
         let context = EvalContext {
@@ -311,23 +321,29 @@ mod tests {
             ..Default::default()
         };
         let source = [Some(Tex::gray_fn(256, 256, |u, v| 0.5 + 0.5 * (u * 39.0).sin() * (v * 53.0).cos()))];
-        for axis in ["x", "y"] {
+        for (log2, transform) in [
+            (10, "offset_x=-0.0009765625"),
+            (10, "offset_y=-0.0009765625"),
+            (8, "m00=2 m11=2"),
+            (8, "m00=4 m11=4"),
+            (8, "m00=0 m11=0 m01=-1 m10=1"),
+            (8, "m00=1.4 m11=0.85 m01=0.23 m10=-0.3 offset_x=0.34 filter=0 mip=0"),
+        ] {
             nodes.resident.store(0, Relaxed);
             nodes.readbacks.store(0, Relaxed);
-            // The imported transform shifts a non-periodic input by one output texel with both axes wrapping.
             let graph = Graph::parse(&format!(
                 "format 3\nsize 256\nmeta compiled \"1\"\nnode 1 input idx=0 gray=1 format=\"u16_compiled\"\n\
                  node 2 levels_mid in=@1 out_low=1 out_high=0 format=\"u16_compiled\"\n\
-                 node 3 transform_matrix in=@2 offset_{axis}=-0.0009765625 osize_log2_x=10 osize_log2_y=10 format=\"u16_compiled\"\n\
+                 node 3 transform_matrix in=@2 {transform} osize_log2_x={log2} osize_log2_y={log2} format=\"u16_compiled\"\n\
                  node 4 laplacian_sharpen in=@3 intensity=0 format=\"u16_compiled\"\noutput out 4\n"
             ))
             .unwrap();
             let cpu = &graph.evaluate_with_inputs(None, &source).unwrap()["out"];
             let gpu = &graph.evaluate_in(&context, None, &source).unwrap()["out"];
-            assert_eq!(nodes.resident.load(Relaxed), 2, "offset {axis}");
-            assert_eq!(nodes.readbacks.load(Relaxed), 1, "offset {axis}");
-            assert_eq!((gpu.w, gpu.h), (1024, 1024));
-            assert!(cpu.px.iter().zip(&gpu.px).all(|(a, b)| a[3] == 0.0 && b[3] == 0.0 && (a[0] - b[0]).abs() <= 1.01 / 65535.0));
+            assert_eq!(nodes.resident.load(Relaxed), 2, "{transform}");
+            assert_eq!(nodes.readbacks.load(Relaxed), 1, "{transform}");
+            assert_eq!((gpu.w, gpu.h), (1 << log2, 1 << log2));
+            assert!(cpu.px.iter().zip(&gpu.px).all(|(a, b)| a[3] == 0.0 && b[3] == 0.0 && (a[0] - b[0]).abs() <= 1.01 / 65535.0), "{transform}");
         }
     }
 }

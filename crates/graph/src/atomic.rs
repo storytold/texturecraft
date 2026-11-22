@@ -237,21 +237,38 @@ pub(crate) fn resident_filter<'a>(
     let operation = match n.kind.as_str() {
         "transform_matrix" => {
             let offset = [value("offset_x", 0.0), value("offset_y", 0.0)];
-            // Translated, wrapped enlargements read the original pixels directly. The identity-only case doubles first.
+            let matrix = [value("m00", 1.0), value("m01", 0.0), value("m10", 0.0), value("m11", 1.0)];
+            let bilinear = value("filter", 1.0) > 0.5;
+            let mip = value("mip", MIP_AUTOMATIC as f32).round() as u32;
             if source_div != STEPS_16 as f32
                 || tile != [true; 2]
                 || transform_matrix_bg(n) != [0.0; 4]
-                || value("filter", 1.0) != 1.0
-                || !matches!(value("mip", MIP_AUTOMATIC as f32).round() as u32, MIP_AUTOMATIC_TOO | MIP_AUTOMATIC)
-                || [value("m00", 1.0), value("m01", 0.0), value("m10", 0.0), value("m11", 1.0)] != [1.0, 0.0, 0.0, 1.0]
-                || offset == [0.0; 2]
-                || offset.into_iter().any(|offset| !(-1.0..=1.0).contains(&offset))
-                || size[0] < w
-                || size[1] < h
+                || matrix.into_iter().chain(offset).any(|v| !(-16.0..=16.0).contains(&v))
             {
                 return None;
             }
-            FilterOperation::WrappedTranslation { offset }
+            // Leave per-axis resampling and repeated doubling to their specialized paths.
+            if bilinear && mip >= MIP_AUTOMATIC_TOO && offset == [0.0; 2] && is_axis_swap(matrix) {
+                let [tw, th] = if matrix[0] == 0.0 { [size[1], size[0]] } else { size };
+                if ((w > tw || h > th) && w * th != h * tw) || (mip == MIP_AUTOMATIC && (w < size[0] || h < size[1])) {
+                    return None;
+                }
+            }
+            let [m00, m01, m10, m11] = matrix;
+            let level = transform_mip(
+                mip,
+                [m00 * w as f32 / size[0] as f32, m01 * h as f32 / size[0] as f32, m10 * w as f32 / size[1] as f32, m11 * h as f32 / size[1] as f32],
+            );
+            let mip_side = if level == 0 {
+                None
+            } else {
+                let side = w.checked_shr(level).unwrap_or_default();
+                if w != h || side < 2 {
+                    return None;
+                }
+                Some(side)
+            };
+            FilterOperation::WrappedAffine { matrix, offset, bilinear, mip_side }
         }
         "laplacian_sharpen" => {
             let weights = aspect.map(|axis| value("intensity", SHARPEN_DEFAULT_INTENSITY) * axis);

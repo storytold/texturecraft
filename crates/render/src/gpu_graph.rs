@@ -499,7 +499,7 @@ impl GraphAccelerator {
 
 impl Accelerator for GraphAccelerator {
     fn cache_tag(&self) -> &str {
-        "wgpu-graph-v3"
+        "wgpu-graph-v4"
     }
 
     fn pixel(&self, request: PixelRequest<'_>) -> Result<Option<PixelOutput>, String> {

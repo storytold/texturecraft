@@ -4821,17 +4821,18 @@ fn compute_resident_grey(
     let Some(accelerator) = &ctx.ec.accelerator else { return Ok(None) };
     let result = match n.kind.as_str() {
         "transform_matrix" | "blend" => {
-            if n.kind == "transform_matrix"
+            if let Some(pass) = grey_pass(n, ctx, steps, |slot| ins.get(slot).and_then(NodeValue::packed_grey)) {
+                accelerator.resident_grey(pass, &ctx.ec.cancel)
+            } else if n.kind == "transform_matrix"
                 && let Some(steps) = steps.filter(|s| s.fmt == crate::measured::COMPILED_16_BIT)
                 && !rolls(n)
-                && ctx.size * ctx.height >= 64 * 1024
                 && let Some(source) = ins.get("in").and_then(NodeValue::packed_grey)
+                && (matches!(source, GreyInput::Device(_)) || ctx.size * ctx.height >= 64 * 1024)
                 && let Some(filter) = crate::atomic::resident_filter(n, [ctx.size, ctx.height], steps.div, source, None)
             {
                 accelerator.resident_filter(filter, &ctx.ec.cancel)
             } else {
-                let Some(pass) = grey_pass(n, ctx, steps, |slot| ins.get(slot).and_then(NodeValue::packed_grey)) else { return Ok(None) };
-                accelerator.resident_grey(pass, &ctx.ec.cancel)
+                return Ok(None);
             }
         }
         "levels_mid" if !rolls(n) => {
@@ -4897,7 +4898,6 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
     if n.kind == "transform_matrix" {
         let (source, width) = source("in")?;
         if width < 2
-            || source.info().3 != 1.0
             || !ctx.size.is_power_of_two()
             || value("tile_x", 1.0) != 1.0
             || value("tile_y", 1.0) != 1.0
