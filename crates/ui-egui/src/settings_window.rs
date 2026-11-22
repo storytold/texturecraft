@@ -370,7 +370,7 @@ fn general(
 
     row(ui, tr("Low-resolution material preview"), |ui, label| {
         ui.checkbox(&mut p.material_start_preview, "").labelled_by(label).on_hover_text(tr(
-            "Show a quick preview while the CPU composes a texture set after opening or resizing. Turn off to see the finished tiles as they arrive.",
+            "Show a quick preview while detailed CPU tiles are prepared after opening or resizing. Sets composited on the GPU skip it. Turn off to see the finished tiles as they arrive.",
         ));
     });
 
