@@ -13,8 +13,8 @@ use texturecraft_core::{Channel, EffectKind, LayerId, LayerKind, Project};
 use texturecraft_formats::{FormatError, StrokeReplayData};
 use texturecraft_geom::{Bvh, Mesh, UvGBuffer, glam::Vec2};
 use texturecraft_paint::{
-    BrushSettings, CommitSource, EyeDepth, RasterCtx, Shape, Staging, Stamp, StrokeCanvas, commit_layer, commit_mask, rasterize, rasterize_uv, screen_point,
-    triangle_scan_texels,
+    BrushSettings, CommitSource, EyeDepth, RasterCtx, Shape, Staging, Stamp, StrokeCanvas, UvStamp, commit_layer, commit_mask, rasterize, rasterize_uv,
+    screen_point, triangle_scan_texels,
 };
 use texturecraft_texel::{TileIdentity, TileImage};
 
@@ -40,7 +40,7 @@ const MAX_REPLAY_GEOMETRY_VISITS: u64 = 1 << 23;
 type UvSample = [f32; 3];
 
 pub(crate) fn record_sample(placement: &mut Option<PaintPlacement>, uv: Vec2, pressure: f32) {
-    let Some(PaintPlacement::Uv { samples }) = placement.as_mut() else { return };
+    let Some(PaintPlacement::Uv { samples, .. }) = placement.as_mut() else { return };
     let sample = [uv.x, uv.y, pressure];
     if samples.len() < MAX_SAMPLES_PER_STROKE && valid_sample(sample) {
         samples.push(sample);
@@ -49,16 +49,49 @@ pub(crate) fn record_sample(placement: &mut Option<PaintPlacement>, uv: Vec2, pr
     }
 }
 
+/// Freeze the inputs the rasterizer received, including the chosen angle and per-dab seed.
+/// Keep pointer samples as a fallback for older readers and strokes over the dab limit.
+pub(crate) fn record_uv_dabs(placement: &mut Option<PaintPlacement>, batch: &[UvStamp]) {
+    let Some(PaintPlacement::Uv { dabs, .. }) = placement.as_mut() else { return };
+    let Some(recorded) = dabs else { return };
+    if batch.len() > MAX_RECORDED_DABS.saturating_sub(recorded.len()) {
+        *dabs = None;
+        return;
+    }
+    recorded.extend(batch.iter().map(|dab| RecordedUvDab([dab.center.x, dab.center.y, dab.radius, dab.angle, dab.flow, dab.hardness], dab.seed)));
+}
+
 fn valid_sample([u, v, pressure]: UvSample) -> bool {
     (-8.0..=9.0).contains(&u) && (-8.0..=9.0).contains(&v) && (0.0..=1.0).contains(&pressure)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RecordedUvDab([f32; 6], u32);
+
+impl RecordedUvDab {
+    fn stamp(&self) -> UvStamp {
+        let [u, v, radius, angle, flow, hardness] = self.0;
+        UvStamp { center: Vec2::new(u, v), radius, angle, flow, hardness, seed: self.1, source: None }
+    }
+
+    fn valid(&self) -> bool {
+        let [u, v, radius, angle, flow, hardness] = self.0;
+        valid_sample([u, v, 1.0]) && angle.is_finite() && [radius, flow, hardness].into_iter().all(|value| (0.0..=1.0).contains(&value))
+    }
 }
 
 /// The first archive version stored UV samples directly on the operation.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum PaintPlacement {
-    Uv { samples: Vec<UvSample> },
-    World { world: WorldPaint },
+    Uv {
+        samples: Vec<UvSample>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dabs: Option<Vec<RecordedUvDab>>,
+    },
+    World {
+        world: WorldPaint,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,14 +161,19 @@ impl PaintPlacement {
     /// Weight more expensive world-space coordinates in the archive's aggregate sample limit.
     fn sample_weight(&self) -> usize {
         match self {
-            Self::Uv { samples } => samples.len(),
+            Self::Uv { samples, dabs } => samples.len().saturating_add(dabs.as_ref().map_or(0, Vec::len)),
             Self::World { world } => world.dabs.len().saturating_mul(WORLD_SAMPLE_WEIGHT).saturating_add(world.view.hidden_count()),
         }
     }
 
     fn valid(&self) -> bool {
         match self {
-            Self::Uv { samples } => !samples.is_empty() && samples.len() <= MAX_SAMPLES_PER_STROKE && samples.iter().copied().all(valid_sample),
+            Self::Uv { samples, dabs } => {
+                !samples.is_empty()
+                    && samples.len() <= MAX_SAMPLES_PER_STROKE
+                    && samples.iter().copied().all(valid_sample)
+                    && dabs.as_ref().is_none_or(|dabs| !dabs.is_empty() && dabs.len() <= MAX_RECORDED_DABS && dabs.iter().all(RecordedUvDab::valid))
+            }
             Self::World { world } => world.valid(),
         }
     }
@@ -224,13 +262,19 @@ impl StrokeReplays {
     pub(crate) fn commit(
         &mut self,
         target: PaintTarget,
-        operation: Option<RecordedPaint>,
+        mut operation: Option<RecordedPaint>,
         before: &PixelStore,
         after: &PixelStore,
         mesh: &Arc<Mesh>,
         material: usize,
     ) -> bool {
         let prior = self.0.targets.get(&target);
+        if let Some(operation) = &mut operation
+            && self.0.samples.saturating_add(operation.placement.sample_weight()) > MAX_SAMPLES
+            && let PaintPlacement::Uv { dabs, .. } = &mut operation.placement
+        {
+            *dabs = None;
+        }
         let operation = operation.filter(|op| {
             self.0.strokes < MAX_STROKES
                 && self.0.samples.saturating_add(op.placement.sample_weight()) <= MAX_SAMPLES
@@ -438,7 +482,8 @@ struct ReplayBudget<'a> {
 impl<'a> ReplayBudget<'a> {
     fn reserve(&mut self, operation: &'a RecordedPaint, size: (u32, u32), scene: &ReplayScene<'_>) -> bool {
         match &operation.placement {
-            PaintPlacement::Uv { samples } => self.reserve_uv(&operation.settings, samples, size),
+            PaintPlacement::Uv { dabs: Some(dabs), .. } => self.reserve_uv_dabs(dabs, size),
+            PaintPlacement::Uv { samples, .. } => self.reserve_uv(&operation.settings, samples, size),
             PaintPlacement::World { world } => self.reserve_world(world, size, scene),
         }
     }
@@ -480,6 +525,19 @@ impl<'a> ReplayBudget<'a> {
             last = Some(uv);
         }
         true
+    }
+
+    fn reserve_uv_dabs(&mut self, dabs: &[RecordedUvDab], (width, height): (u32, u32)) -> bool {
+        let size = Vec2::new(width as f32, height as f32);
+        dabs.iter().all(|dab| {
+            let stamp = dab.stamp();
+            let center = stamp.center * size;
+            let radius = stamp.radius * size.x * 1.42;
+            let low = (center - radius).floor().clamp(Vec2::ZERO, size);
+            let high = (center + radius).ceil().clamp(Vec2::ZERO, size);
+            let span = (high - low).as_uvec2();
+            self.pay(1, u64::from(span.x) * u64::from(span.y), 0)
+        })
     }
 
     fn reserve_world(&mut self, world: &'a WorldPaint, size: (u32, u32), scene: &ReplayScene<'_>) -> bool {
@@ -548,7 +606,15 @@ impl RecordedPaint {
         let library = self.settings.library_alpha_image();
         let shape = Shape::new(self.settings.alpha, None, library.as_deref(), self.settings.alpha_params);
         match &self.placement {
-            PaintPlacement::Uv { samples } => {
+            PaintPlacement::Uv { dabs: Some(dabs), .. } => {
+                for dab in dabs {
+                    if progress.cancel.load(Relaxed) {
+                        break;
+                    }
+                    rasterize_uv(&mut canvas, gbuf, shape, &[dab.stamp()]);
+                }
+            }
+            PaintPlacement::Uv { samples, .. } => {
                 let mut stroke = UvStrokeState::default();
                 for &[u, v, pressure] in samples {
                     if progress.cancel.load(Relaxed) {

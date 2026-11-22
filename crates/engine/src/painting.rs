@@ -19,7 +19,7 @@ use crate::brush_device::{BrushTiles, DeviceStroke, DeviceStrokePreview, Project
 use crate::session::{
     ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, ReleasedDab, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
 };
-use crate::stroke_replay::{PaintPlacement, RecordedPaint, StrokeReplays, WorldPaint, record_sample};
+use crate::stroke_replay::{PaintPlacement, RecordedPaint, StrokeReplays, WorldPaint, record_sample, record_uv_dabs};
 use crate::uv_stroke_state::{UV_STAMP_BATCH, UvStrokeState};
 use crate::uv_symmetry::UvMirror;
 use crate::{EngineError, Result};
@@ -416,7 +416,7 @@ impl Session {
         let replay = if !can_record {
             None
         } else if uv_mode {
-            Some(PaintPlacement::Uv { samples: Vec::new() })
+            Some(PaintPlacement::Uv { samples: Vec::new(), dabs: Some(Vec::new()) })
         } else {
             self.stroke_visibility
                 .as_ref()
@@ -585,6 +585,7 @@ impl Session {
             .then(|| UvMirror::new(&settings.symmetry, active.stroke.center(), &self.mesh, &self.bvh, &cache.gbuf, material))
             .flatten();
         progress.sample(settings, uv, pressure, |batch| {
+            record_uv_dabs(&mut active.replay, batch);
             if let Some(mirror) = &mirror {
                 for index in 0..batch.len() {
                     if let Some(stamp) = batch.get(index).copied() {
