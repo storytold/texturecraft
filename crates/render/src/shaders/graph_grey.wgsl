@@ -1,12 +1,13 @@
 struct Params {
     dimensions: vec4<u32>, // output width, band rows, input width, opcode (0 enlarges, 1 reduces)
-    blend: vec4<u32>,      // opacity bits, whole-image input instead of a stripe with wrap padding
+    blend: vec4<u32>,      // opacity bits, whole-image input instead of a stripe with wrap padding, has mask
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> front: array<u32>;
 @group(0) @binding(2) var<storage, read> back: array<u32>;
 @group(0) @binding(3) var<storage, read_write> output: array<u32>;
+@group(0) @binding(4) var<storage, read> mask: array<u32>;
 
 fn even(word: u32) -> f32 {
     return decode(word & 0xffffu);
@@ -52,16 +53,40 @@ fn halved(x: u32, y: u32) -> vec2<f32> {
     return sum * 0.25;
 }
 
+// The CPU rounds each product before adding. Canonicalizing signed zeros
+// prevents contraction at ties without changing the quantized output.
+fn individual_product(a: vec2f, b: vec2f) -> vec2f {
+    let bits = bitcast<vec2u>(a * b);
+    return bitcast<vec2f>(select(bits, vec2u(0u), bits == vec2u(0x80000000u)));
+}
+
+fn mask_weight(i: u32) -> vec2f {
+    let word = mask[i];
+    let v = vec2(even(word), odd(word));
+    // Match the reference luminance of an RGB sample with three equal channels.
+    return individual_product(v, vec2f(0.2126)) + individual_product(v, vec2f(0.7152)) + individual_product(v, vec2f(0.0722));
+}
+
 fn blended(i: u32) -> vec2<f32> {
     let a = front[i];
     let b = back[i];
     let f = vec2(even(a), odd(a));
     let bg = vec2(even(b), odd(b));
-    let opacity = bitcast<f32>(params.blend.x);
-    switch params.dimensions.w {
-        case 3u: { return bg + (f - bg) * opacity; }
-        case 32u: { return bg + f * opacity; }
-        case 33u: { return bg - f * opacity; }
+    let opacity = vec2f(bitcast<f32>(params.blend.x));
+    let has_mask = params.blend.z != 0u;
+    let mode = params.dimensions.w - 3u; // Blend opcodes follow enlarge, reduce, and levels.
+    switch mode {
+        case 0u, 21u: { return bg + (f - bg) * opacity; }
+        case 3u: { return bg + individual_product(individual_product(f, bg) - bg, opacity); }
+        case 6u: { return bg + individual_product(max(f, bg) - bg, opacity); }
+        case 32u, 33u: {
+            if has_mask {
+                let foreground = individual_product(f, individual_product(mask_weight(i), opacity));
+                return bg + select(-foreground, foreground, mode == 32u);
+            }
+            if mode == 32u { return bg + f * opacity; }
+            return bg - f * opacity;
+        }
         default: { return bg + (2.0 * f - 1.0) * opacity; }
     }
 }

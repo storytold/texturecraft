@@ -4892,11 +4892,12 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
     let source = |slot| {
         let image = input(slot)?;
         let (w, h, div, alpha) = image.info();
-        (w == h && w.is_power_of_two() && div == STEPS_16 as f32 && alpha == 1.0).then_some((image, w))
+        (w == h && w.is_power_of_two() && div == STEPS_16 as f32 && crate::tex::grey_alpha_ok(alpha)).then_some((image, w))
     };
     if n.kind == "transform_matrix" {
         let (source, width) = source("in")?;
         if width < 2
+            || source.info().3 != 1.0
             || !ctx.size.is_power_of_two()
             || value("tile_x", 1.0) != 1.0
             || value("tile_y", 1.0) != 1.0
@@ -4921,19 +4922,27 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
         let (foreground, fg_width) = source("fg")?;
         let (background, bg_width) = source("bg")?;
         let (mode, opacity) = (value("mode", 0.0) as u32, value("opacity", 1.0));
-        let resident = [foreground, background].iter().any(|source| matches!(source, GreyInput::Device(_)));
+        let mask = if n.ins.contains_key("mask") {
+            let (mask, mask_width) = source("mask")?;
+            if !matches!(mode, 32 | 33) || mask_width != ctx.size {
+                return None;
+            }
+            Some(mask)
+        } else {
+            None
+        };
+        let resident = [Some(foreground), Some(background), mask].into_iter().flatten().any(|source| matches!(source, GreyInput::Device(_)));
         if (!resident && ctx.size < 4096)
-            || !matches!(mode, 0 | 21 | 32..=34)
+            || !matches!(mode, 0 | 3 | 6 | 21 | 32..=34)
             || value("alpha_mode", 1.0) as u32 != 1
             || !opacity.is_finite()
-            || n.ins.contains_key("mask")
             || fg_width != ctx.size
             || bg_width != ctx.size
             || [value("crop_x0", 0.0), value("crop_y0", 0.0), value("crop_x1", 1.0), value("crop_y1", 1.0)] != [0.0, 0.0, 1.0, 1.0]
         {
             return None;
         }
-        Some(ResidentGreyPass::Blend { foreground, background, mode, opacity })
+        Some(ResidentGreyPass::Blend { foreground, background, mask, mode, opacity })
     }
 }
 
@@ -4945,9 +4954,13 @@ fn compute_gpu_grey_pass(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &C
         _ => None,
     }) {
         Some(ResidentGreyPass::Enlarge { source: GreyInput::Host(source), side }) => GreyPass::Enlarge { source, side },
-        Some(ResidentGreyPass::Blend { foreground: GreyInput::Host(foreground), background: GreyInput::Host(background), mode: mode @ 32..=34, opacity }) => {
-            GreyPass::Blend { foreground, background, mode, opacity }
-        }
+        Some(ResidentGreyPass::Blend {
+            foreground: GreyInput::Host(foreground),
+            background: GreyInput::Host(background),
+            mask: None,
+            mode: mode @ (3 | 6 | 32..=34),
+            opacity,
+        }) => GreyPass::Blend { foreground, background, mode, opacity },
         _ => return Ok(None),
     };
     let result = accelerator.grey_pass(pass, &ctx.ec.cancel);

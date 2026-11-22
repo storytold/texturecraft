@@ -14,7 +14,7 @@ const WORKGROUP: u32 = 8;
 const ENLARGE: u32 = 0;
 const REDUCE: u32 = 1;
 const LEVELS: u32 = 2;
-const INTERPOLATE: u32 = 3;
+const BLEND_OFFSET: u32 = 3;
 const SHADER: &str = concat!(include_str!("shaders/graph_grey.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
 
 pub(crate) struct GreyRasterizer {
@@ -95,21 +95,19 @@ impl GreyRasterizer {
     }
 
     pub(crate) fn render_resident(&self, pass: ResidentGreyPass<'_>, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
-        let (foreground, background, side, mode, opacity) = match pass {
-            ResidentGreyPass::Enlarge { source, side } => (source, None, side, ENLARGE, 0.0),
-            ResidentGreyPass::Reduce { source, side } => (source, None, side, REDUCE, 0.0),
+        let (foreground, background, mask, side, mode, opacity) = match pass {
+            ResidentGreyPass::Enlarge { source, side } => (source, None, None, side, ENLARGE, 0.0),
+            ResidentGreyPass::Reduce { source, side } => (source, None, None, side, REDUCE, 0.0),
             ResidentGreyPass::Levels { source, curve, div, alpha } => return self.render_levels(source, &curve, div, alpha, cancel),
-            ResidentGreyPass::Blend { foreground, background, mode, opacity } => {
-                if !opacity.is_finite() {
+            ResidentGreyPass::Blend { foreground, background, mask, mode, opacity } => {
+                let (side, _) = grey_input_shape(&foreground);
+                if !opacity.is_finite()
+                    || !matches!(mode, 0 | 3 | 6 | 21 | 32..=34)
+                    || mask.as_ref().is_some_and(|mask| !matches!(mode, 32 | 33) || grey_input_shape(mask).0 != side)
+                {
                     return Ok(None);
                 }
-                let operation = match mode {
-                    0 | 21 => INTERPOLATE,
-                    32..=34 => mode,
-                    _ => return Ok(None),
-                };
-                let (side, _) = grey_input_shape(&foreground);
-                (foreground, Some(background), side, operation, opacity)
+                (foreground, Some(background), mask, side, BLEND_OFFSET + mode, opacity)
             }
         };
         let (source_side, alpha) = grey_input_shape(&foreground);
@@ -143,6 +141,13 @@ impl GreyRasterizer {
             }
             None => None,
         };
+        let mask = match mask {
+            Some(image) => {
+                let Some(bound) = self.bind_input(image)? else { return Ok(None) };
+                Some(bound)
+            }
+            None => None,
+        };
         let mut stages = Vec::new();
         let next_side = |size| match mode {
             ENLARGE => size * 2,
@@ -167,7 +172,7 @@ impl GreyRasterizer {
             let mut input = (source_side, &front);
             for (size, output) in &stages {
                 let back = &back.as_ref().unwrap_or(input.1).buffer; // Resizing does not read this binding.
-                self.encode_resident(&mut encoder, input, back, (*size, output), mode, opacity);
+                self.encode_resident(&mut encoder, input, (back, mask.as_ref().map(|mask| &mask.buffer)), (*size, output), mode, opacity);
                 input = (*size, output);
             }
             self.queue.submit([encoder.finish()]);
@@ -175,6 +180,9 @@ impl GreyRasterizer {
         front.retain_until_completed(&self.queue);
         if let Some(back) = back {
             back.retain_until_completed(&self.queue);
+        }
+        if let Some(mask) = mask {
+            mask.retain_until_completed(&self.queue);
         }
         for (_, pixels) in &stages {
             pixels.retain_until_completed(&self.queue);
@@ -198,7 +206,7 @@ impl GreyRasterizer {
                 usage: wgpu::BufferUsages::STORAGE,
             });
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("resident graph levels") });
-            self.encode_resident(&mut encoder, (w, &front), &table, (w, &output), LEVELS, 0.0);
+            self.encode_resident(&mut encoder, (w, &front), (&table, None), (w, &output), LEVELS, 0.0);
             self.queue.submit([encoder.finish()]);
         })?;
         front.retain_until_completed(&self.queue);
@@ -210,18 +218,18 @@ impl GreyRasterizer {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         (source_side, front): (usize, &GreyDevicePixels),
-        back: &wgpu::Buffer,
+        (back, mask): (&wgpu::Buffer, Option<&wgpu::Buffer>),
         (side, output): (usize, &GreyDevicePixels),
         mode: u32,
         opacity: f32,
     ) {
-        let params = [side as u32, side as u32, source_side as u32, mode, opacity.to_bits(), 1, 0, 0];
+        let params = [side as u32, side as u32, source_side as u32, mode, opacity.to_bits(), 1, u32::from(mask.is_some()), 0];
         let uniform = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("resident graph grayscale parameters"),
             contents: bytemuck::cast_slice(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let entries = [&uniform, &front.buffer, back, &output.buffer]
+        let entries = [&uniform, &front.buffer, back, &output.buffer, mask.unwrap_or(&front.buffer)]
             .into_iter()
             .enumerate()
             .map(|(binding, buffer)| wgpu::BindGroupEntry { binding: binding as u32, resource: buffer.as_entire_binding() })
@@ -267,10 +275,10 @@ impl GreyRasterizer {
                 Ok(Some(doubled))
             }
             GreyPass::Blend { foreground, background, mode, opacity } => {
-                if foreground.h != side || background.w != side || background.h != side || !(32..=34).contains(&mode) || !opacity.is_finite() {
+                if foreground.h != side || background.w != side || background.h != side || !matches!(mode, 3 | 6 | 32..=34) || !opacity.is_finite() {
                     return Ok(None);
                 }
-                bands.run(foreground, Some(background), mode, opacity, side, cancel).map(Some)
+                bands.run(foreground, Some(background), BLEND_OFFSET + mode, opacity, side, cancel).map(Some)
             }
         }
     }
@@ -397,7 +405,7 @@ impl<'a> Bands<'a> {
             let result = buffer("graph grey output", bytes, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
             let readback = buffer("graph grey readback", bytes, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
             let uniform = buffer("graph grey parameters", 32, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
-            let buffers = [&uniform, &inputs[0], &inputs[1], &result];
+            let buffers = [&uniform, &inputs[0], &inputs[1], &result, &inputs[0]];
             let entries = buffers.map(wgpu::Buffer::as_entire_binding);
             let entries = entries.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect::<Vec<_>>();
             let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {

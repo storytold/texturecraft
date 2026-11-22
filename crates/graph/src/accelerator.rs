@@ -93,7 +93,8 @@ pub enum PixelImageInput<'a> {
 pub enum ResidentGreyPass<'a> {
     Enlarge { source: GreyInput<'a>, side: usize },
     Reduce { source: GreyInput<'a>, side: usize },
-    Blend { foreground: GreyInput<'a>, background: GreyInput<'a>, mode: u32, opacity: f32 },
+    // Full-frame blend that preserves background alpha and can read a matching grayscale mask.
+    Blend { foreground: GreyInput<'a>, background: GreyInput<'a>, mask: Option<GreyInput<'a>>, mode: u32, opacity: f32 },
     Levels { source: GreyInput<'a>, curve: Vec<u16>, div: f32, alpha: f32 },
 }
 
