@@ -20,6 +20,7 @@ pub mod kept;
 pub mod once;
 mod outputs;
 mod parameters;
+mod plans;
 mod profiling;
 pub mod spill;
 pub use parameters::GraphParameter;
@@ -943,7 +944,7 @@ impl GraphStore {
             return Ok(g.clone());
         }
         let text = self.texts.get(key).ok_or_else(|| format!("the text of graph {key} is not in the project"))?;
-        let g = Arc::new(PreparedGraph::parse(text).map_err(|e| e.to_string())?);
+        let g = plans::get(key, text)?;
         let mut parsed = lock(&self.read_cache().parsed);
         if parsed.len() >= PARSED_KEPT {
             parsed.clear();
