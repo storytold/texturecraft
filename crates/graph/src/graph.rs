@@ -758,6 +758,76 @@ pub struct EvalAll {
     pub sizes: HashMap<u32, usize>,
 }
 
+/// A validated, immutable graph and the compiled functions shared by its instances.
+pub struct PreparedGraph {
+    graph: Graph,
+    programs: Mutex<HashMap<String, Result<Arc<crate::func::Prog>, String>>>,
+}
+
+impl PreparedGraph {
+    pub fn parse(text: &str) -> Result<Self, Error> {
+        Ok(Self { graph: Graph::parse(text)?, programs: Mutex::default() })
+    }
+
+    pub fn instance(&self, seed: u32) -> GraphInstance<'_> {
+        GraphInstance { plan: self, nodes: BTreeMap::new(), seed }
+    }
+
+    fn program(&self, name: &str) -> Result<Arc<crate::func::Prog>, String> {
+        if let Some(program) = self.programs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name) {
+            return program.clone();
+        }
+        let program = crate::func::compile_named(&self.graph.subgraphs, name).map(Arc::new);
+        self.programs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_owned(), program.clone());
+        program
+    }
+}
+
+impl std::ops::Deref for PreparedGraph {
+    type Target = Graph;
+
+    fn deref(&self) -> &Graph {
+        &self.graph
+    }
+}
+
+/// The runtime parameter bindings of a single material instance.
+pub struct GraphInstance<'a> {
+    plan: &'a PreparedGraph,
+    nodes: BTreeMap<u32, Node>,
+    seed: u32,
+}
+
+impl GraphInstance<'_> {
+    pub fn nodes(&self) -> impl Iterator<Item = &Node> {
+        self.plan.nodes.iter().map(|(id, node)| self.nodes.get(id).unwrap_or(node))
+    }
+
+    pub fn work_nodes(&self, outputs: &[&str]) -> usize {
+        let roots: Vec<_> = self.plan.output_nodes().into_iter().filter(|(_, name, _)| outputs.contains(&name.as_str())).map(|(_, _, id)| id).collect();
+        reached(self.plan, &roots).len()
+    }
+
+    pub fn bind_number(&mut self, id: u32, slot: &str, value: f32) {
+        if let Some(node) = self.plan.nodes.get(&id) {
+            self.nodes.entry(id).or_insert_with(|| node.clone()).nums.insert(slot.to_owned(), value);
+        }
+    }
+
+    pub fn bind_text(&mut self, id: u32, value: &str) {
+        if let Some(node) = self.plan.nodes.get(&id).filter(|node| node.kind == "input_value") {
+            self.nodes.entry(id).or_insert_with(|| node.clone()).strs.insert("v".into(), value.to_owned());
+        }
+    }
+
+    pub fn evaluate_owned(&self, ec: &EvalContext, size: usize, images: Vec<Option<Tex>>, outputs: &[&str]) -> Result<BTreeMap<String, Tex>, Error> {
+        crate::context::scoped(ec, || {
+            let ext = images.into_iter().map(|t| t.map(Val::of)).collect();
+            self.plan.evaluate_vals(ec, Some(size), ext, Some((self, outputs)))
+        })
+    }
+}
+
 struct Ctx<'a> {
     resident: bool,
     size: usize,
@@ -773,8 +843,19 @@ struct Ctx<'a> {
     depth: usize,
     /// values of the Input Value nodes of the graph being evaluated (read by function graphs)
     gin: &'a BTreeMap<String, crate::func::Value>,
+    instance: Option<&'a GraphInstance<'a>>,
+    plan: Option<&'a PreparedGraph>,
     /// what the host gave this evaluation: its cancel flag, logging, profiler and memory counter
     ec: &'a EvalContext,
+}
+
+impl Ctx<'_> {
+    fn program(&self, name: &str) -> Result<Arc<crate::func::Prog>, String> {
+        match self.plan {
+            Some(plan) => plan.program(name),
+            None => crate::func::compile_named(self.lib, name).map(Arc::new),
+        }
+    }
 }
 
 /// Node id used for the helper nodes of [`Graph::preview_host`] (far above any id an author would reach).
@@ -1609,33 +1690,49 @@ impl Graph {
     fn evaluate_impl(&self, ec: &EvalContext, size: Option<usize>, images: &[Option<Tex>]) -> Result<BTreeMap<String, Tex>, Error> {
         // the images held as node results are (grey ones in a quarter of the memory), one copy at a time
         let ext: Vec<Option<Val>> = images.iter().map(|t| t.as_ref().map(|t| Val::of(t.clone()))).collect();
-        self.evaluate_vals(ec, size, ext)
+        self.evaluate_vals(ec, size, ext, None)
     }
 
     /// Like [`Self::evaluate_in`], taking the images: none is copied (a grey one is held in a quarter of the memory).
     pub fn evaluate_owned(&self, ec: &EvalContext, size: Option<usize>, images: Vec<Option<Tex>>) -> Result<BTreeMap<String, Tex>, Error> {
-        crate::context::scoped(ec, || self.evaluate_vals(ec, size, images.into_iter().map(|t| t.map(Val::of)).collect()))
+        crate::context::scoped(ec, || self.evaluate_vals(ec, size, images.into_iter().map(|t| t.map(Val::of)).collect(), None))
     }
 
-    fn evaluate_vals(&self, ec: &EvalContext, size: Option<usize>, ext: Vec<Option<Val>>) -> Result<BTreeMap<String, Tex>, Error> {
-        match self.evaluate_outputs(ec, size, &ext, true) {
+    fn evaluate_vals(
+        &self,
+        ec: &EvalContext,
+        size: Option<usize>,
+        ext: Vec<Option<Val>>,
+        instance: Option<(&GraphInstance<'_>, &[&str])>,
+    ) -> Result<BTreeMap<String, Tex>, Error> {
+        if instance.is_none() {
+            self.validate()?;
+        }
+        match self.evaluate_outputs(ec, size, &ext, true, instance) {
             Err(Error::GpuReadback(..)) if !ec.is_cancelled() => {
                 if let Some(done) = &ec.nodes_done {
                     done.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
-                self.evaluate_outputs(ec, size, &ext, false)
+                self.evaluate_outputs(ec, size, &ext, false, instance)
             }
             result => result,
         }
     }
 
-    fn evaluate_outputs(&self, ec: &EvalContext, size: Option<usize>, ext: &[Option<Val>], resident: bool) -> Result<BTreeMap<String, Tex>, Error> {
-        self.validate()?;
+    fn evaluate_outputs(
+        &self,
+        ec: &EvalContext,
+        size: Option<usize>,
+        ext: &[Option<Val>],
+        resident: bool,
+        instance: Option<(&GraphInstance<'_>, &[&str])>,
+    ) -> Result<BTreeMap<String, Tex>, Error> {
         let size = size.unwrap_or(self.size);
         if size == 0 || size > 8192 {
             return Err(Error::BadSize(size));
         }
-        let gin = crate::func::graph_inputs(self);
+        let bound = instance.map(|(instance, _)| instance);
+        let gin = crate::func::graph_inputs_from(self.nodes.iter().map(|(id, node)| bound.and_then(|instance| instance.nodes.get(id)).unwrap_or(node)));
         let ctx = Ctx {
             resident,
             size,
@@ -1644,12 +1741,17 @@ impl Graph {
             graph: None,
             lib: &self.subgraphs,
             res: &self.resources,
-            so: self.seed_offset,
+            so: bound.map_or(self.seed_offset, |instance| instance.seed),
             depth: 0,
             gin: &gin,
+            instance: bound,
+            plan: bound.map(|instance| instance.plan),
             ec,
         };
-        let outs = self.output_nodes();
+        let mut outs = self.output_nodes();
+        if let Some((_, retained)) = instance {
+            outs.retain(|(_, name, _)| retained.contains(&name.as_str()));
+        }
         let keep: Vec<u32> = outs.iter().map(|o| o.2).collect();
         let mut cache = Cache::for_graph(self, &keep, false, &ec.live);
         let mut res = BTreeMap::new();
@@ -1707,6 +1809,8 @@ impl Graph {
             so: self.seed_offset,
             depth: 0,
             gin: &gin,
+            instance: None,
+            plan: None,
             ec,
         };
         let mut cache = Cache::for_graph(self, &[id], false, &ec.live);
@@ -1772,6 +1876,8 @@ impl Graph {
             so: self.seed_offset,
             depth: 0,
             gin: &gin,
+            instance: None,
+            plan: None,
             ec,
         };
         // thumbnails are taken the moment a node finishes, so intermediate textures can be freed as soon as every
@@ -2268,7 +2374,7 @@ impl NodeClock {
 }
 
 /// The first look at a node: its cached result, or the node with its settings bound, ready for its inputs.
-fn start_node<'g>(g: &'g Graph, id: u32, out: Option<&str>, ctx: &Ctx, cache: &mut Cache) -> Result<Start<'g>, Error> {
+fn start_node<'g>(g: &'g Graph, id: u32, out: Option<&str>, ctx: &Ctx<'g>, cache: &mut Cache) -> Result<Start<'g>, Error> {
     let key = cache_key(g, id, out);
     let out = if key != id { out } else { None };
     if let Some(t) = cache.map.get(&key) {
@@ -2291,7 +2397,7 @@ fn start_node<'g>(g: &'g Graph, id: u32, out: Option<&str>, ctx: &Ctx, cache: &m
         }
         return Ok(Start::Done(t));
     }
-    let n = g.nodes.get(&id).ok_or(Error::MissingNode(0, id))?;
+    let n = ctx.instance.and_then(|instance| instance.nodes.get(&id)).or_else(|| g.nodes.get(&id)).ok_or(Error::MissingNode(0, id))?;
     let node = if n.strs.keys().any(|k| k.starts_with("fn.")) {
         let _span = prof("node.bind_functions");
         std::borrow::Cow::Owned(bind_functions(id, n, ctx)?)
@@ -2328,6 +2434,8 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
             so: ctx.so,
             depth: ctx.depth,
             gin: ctx.gin,
+            instance: ctx.instance,
+            plan: ctx.plan,
             ec: ctx.ec,
         };
         &node_ctx
@@ -3011,7 +3119,7 @@ fn thumbnail(t: &Tex) -> Vec<u8> {
 /// Function-driven parameters: `fn.<param>="name"` runs that function and stores the result in `<param>`;
 /// `fa.<param>.<input>` numbers feed the function's inputs.
 fn bind_functions(id: u32, n: &Node, ctx: &Ctx) -> Result<Node, Error> {
-    use crate::func::{FnEnv, compile_named};
+    use crate::func::FnEnv;
     let mut out = n.clone();
     // the size first: the other parameters can read it
     let is_size = |k: &str| k.starts_with("fn.osize_");
@@ -3021,7 +3129,7 @@ fn bind_functions(id: u32, n: &Node, ctx: &Ctx) -> Result<Node, Error> {
         if fname.is_empty() {
             continue;
         }
-        let prog = compile_named(ctx.lib, fname).map_err(|e| Error::BadParam(id, format!("{k}: {e}")))?;
+        let prog = ctx.program(fname).map_err(|e| Error::BadParam(id, format!("{k}: {e}")))?;
         let mut env = FnEnv::new([ctx.size as f64, ctx.height as f64]);
         env.seed = ctx.so;
         env.graph_inputs = ctx.gin;
@@ -3096,8 +3204,8 @@ fn run_function(
     once: bool,
     grey: Option<Option<&crate::tex::Steps>>,
 ) -> Result<Computed, Error> {
-    use crate::func::{Value, compile_named};
-    let prog = compile_named(ctx.lib, fname).map_err(|e| Error::BadParam(id, e))?;
+    use crate::func::Value;
+    let prog = ctx.program(fname).map_err(|e| Error::BadParam(id, e))?;
     let (w, h) = (ctx.size, ctx.height);
     let mut env = pixel_function_env(n, ctx, &prog);
     env.images = images;
@@ -3228,6 +3336,8 @@ fn run_sub(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx, out: Optio
         so: ctx.so,
         depth: ctx.depth + 1,
         gin: &gin,
+        instance: None,
+        plan: ctx.plan,
         ec: ctx.ec,
     };
     let mut cache = Cache::for_graph(&sub, &[out_id], false, &ctx.ec.live);
@@ -4518,7 +4628,7 @@ fn compute_resident_grey(
             else {
                 return Ok(None);
             };
-            let prog = crate::func::compile_named(ctx.lib, name).map_err(|e| Error::BadParam(id, e))?;
+            let prog = ctx.program(name).map_err(|e| Error::BadParam(id, e))?;
             let env = pixel_function_env(n, ctx, &prog);
             let Some(shader) = prog.packed_pixel_shader(&env, &images) else { return Ok(None) };
             let sources = images.iter().map(|&(_, input)| input).collect::<Vec<_>>();

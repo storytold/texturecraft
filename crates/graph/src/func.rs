@@ -1321,8 +1321,12 @@ fn kind_of(op: Op) -> &'static str {
 
 /// Values of the Input Value nodes of a texture graph, by name (the editor's graph parameters).
 pub fn graph_inputs(g: &Graph) -> BTreeMap<String, Value> {
+    graph_inputs_from(g.nodes.values())
+}
+
+pub(crate) fn graph_inputs_from<'a>(nodes: impl Iterator<Item = &'a crate::graph::Node>) -> BTreeMap<String, Value> {
     let mut m = BTreeMap::new();
-    for n in g.nodes.values().filter(|n| n.kind == "input_value") {
+    for n in nodes.filter(|n| n.kind == "input_value") {
         let name = n.strs.get("name").cloned().unwrap_or_default();
         if name.is_empty() {
             continue;

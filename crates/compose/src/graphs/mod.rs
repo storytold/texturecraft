@@ -31,8 +31,8 @@ use rayon::prelude::*;
 use texturecraft_core::{BakedMap, Channel, ChannelKind, GraphInput, GraphRef, LayerId, MAX_GRAPH_NESTING, StableHash};
 pub use texturecraft_graph::context::Cancel;
 use texturecraft_graph::context::{EvalContext, Files};
-use texturecraft_graph::graph::Graph;
 pub use texturecraft_graph::graph::Graph as RuntimeGraph;
+use texturecraft_graph::graph::{Graph, GraphInstance, PreparedGraph};
 use texturecraft_graph::rayon::ThreadPool;
 pub use texturecraft_graph::tex::Tex;
 use texturecraft_texel::{TILE, TileImage, from_u16, linear_to_srgb, srgb_to_linear, to_u16};
@@ -429,7 +429,7 @@ pub struct CookCache {
     uses: Mutex<BTreeMap<GraphUse, String>>,
     problems: Mutex<BTreeMap<GraphUse, UseProblem>>,
     renders: AtomicUsize,
-    parsed: Mutex<HashMap<String, Arc<Graph>>>,
+    parsed: Mutex<HashMap<String, Arc<PreparedGraph>>>,
     parameters: Mutex<HashMap<String, Arc<[GraphParameter]>>>,
     kinds: Mutex<HashMap<String, u128>>,
     baked_fingerprints: Mutex<Fingerprints<Texels>>,
@@ -934,12 +934,12 @@ impl GraphStore {
             .collect()
     }
 
-    fn parsed(&self, key: &str) -> Result<Arc<Graph>, String> {
+    fn parsed(&self, key: &str) -> Result<Arc<PreparedGraph>, String> {
         if let Some(g) = lock(&self.read_cache().parsed).get(key) {
             return Ok(g.clone());
         }
         let text = self.texts.get(key).ok_or_else(|| format!("the text of graph {key} is not in the project"))?;
-        let g = Arc::new(Graph::parse(text).map_err(|e| e.to_string())?);
+        let g = Arc::new(PreparedGraph::parse(text).map_err(|e| e.to_string())?);
         let mut parsed = lock(&self.read_cache().parsed);
         if parsed.len() >= PARSED_KEPT {
             parsed.clear();
@@ -1070,15 +1070,19 @@ impl GraphStore {
     ) -> Result<Cooked, String> {
         let side = env.side;
         let pool = self.pool();
-        let mut graph = (*self.parsed(&g.key)?).clone();
-        apply_values(&mut graph, &g.params);
-        graph.seed_offset = g.seed;
-        let have = graph.output_idents();
+        let plan = self.parsed(&g.key)?;
+        let mut graph = plan.instance(g.seed);
+        for binding in parameter_bindings(&plan, &g.params) {
+            match binding {
+                ParameterBinding::Number(id, slot, value) => graph.bind_number(id, slot, value),
+                ParameterBinding::Text(id, value) => graph.bind_text(id, value),
+            }
+        }
+        let have = plan.output_idents();
         let mut names: Vec<&str> = g.rendered().into_iter().filter(|n| have.iter().any(|h| h == n)).collect();
         if names.is_empty() {
             names.extend(have.first().map(String::as_str));
         }
-        graph.keep_outputs(&names)?;
         let mut images: Vec<Option<Tex>> = Vec::new();
         let mut put = |k: u32, t: Tex| {
             let k = k as usize;
@@ -1112,7 +1116,7 @@ impl GraphStore {
         }
         // the render's nodes as they finish, for the store's progress (nothing computed depends on it)
         let done = Arc::new(AtomicUsize::new(0));
-        let nodes = graph.work_nodes();
+        let nodes = graph.work_nodes(&names);
         let _running = Running::start(&self.cooks.running, done.clone(), nodes, trace_name(&g.name));
         let profiler = trace.map(|emit| {
             let graph = trace_name(&g.name).to_owned();
@@ -1128,9 +1132,9 @@ impl GraphStore {
             accelerator,
             ..EvalContext::default()
         };
-        let outs = evaluate(&graph, &ec, side, images, given)?;
+        let outs = evaluate(&graph, &ec, side, images, given, &names)?;
         let linear: BTreeSet<String> =
-            graph.meta.get("working").map(|w| w.trim_matches('"').split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
+            plan.meta.get("working").map(|w| w.trim_matches('"').split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
         Ok(Cooked::from_textures(outs, linear))
     }
 }
@@ -1165,47 +1169,82 @@ impl Drop for Running<'_> {
 /// range, and files hold values outside it); a graph without such nodes takes it through its exposed parameter of that
 /// label. A value for a parameter the graph does not have changes nothing.
 pub fn apply_values(graph: &mut Graph, values: &BTreeMap<String, texturecraft_core::GraphValue>) {
-    for (name, value) in values {
-        // a text sets the text of every `input_value` node of its name (a text parameter has no exposed slider)
-        if let texturecraft_core::GraphValue::Text(t) = value {
-            for n in graph.nodes.values_mut().filter(|n| n.kind == "input_value" && n.strs.get("name").is_some_and(|s| s == name)) {
-                n.strs.insert("v".to_string(), t.clone());
+    // Collect node IDs before mutating the graph, the same binding path the immutable plan uses.
+    let bindings: Vec<_> = parameter_bindings(graph, values)
+        .into_iter()
+        .map(|binding| match binding {
+            ParameterBinding::Number(id, slot, value) => (id, slot.to_owned(), Ok(value)),
+            ParameterBinding::Text(id, value) => (id, "v".to_owned(), Err(value.to_owned())),
+        })
+        .collect();
+    for (id, slot, value) in bindings {
+        if let Some(node) = graph.nodes.get_mut(&id) {
+            match value {
+                Ok(value) => {
+                    node.nums.insert(slot, value);
+                }
+                Err(value) => {
+                    node.strs.insert(slot, value);
+                }
             }
-            continue;
-        }
-        let lanes = value.lanes();
-        let mut found = false;
-        for n in graph.nodes.values_mut().filter(|n| n.kind == "input_value" && n.strs.get("name").is_some_and(|s| s == name)) {
-            found = true;
-            if let Some(v) = lanes.first() {
-                n.nums.insert("v".to_string(), *v);
-            }
-            for (lane, v) in ["x", "y", "z", "w"].iter().zip(&lanes) {
-                n.nums.insert((*lane).to_string(), *v);
-            }
-        }
-        if !found {
-            let _ = graph.set_param(name, &lanes);
         }
     }
 }
 
+enum ParameterBinding<'a> {
+    Number(u32, &'a str, f32),
+    Text(u32, &'a str),
+}
+
+fn parameter_bindings<'a>(graph: &'a Graph, values: &'a BTreeMap<String, texturecraft_core::GraphValue>) -> Vec<ParameterBinding<'a>> {
+    use texturecraft_core::GraphValue;
+    let mut bindings = Vec::new();
+    for (name, value) in values {
+        let inputs = graph.nodes.iter().filter(|(_, node)| node.kind == "input_value" && node.strs.get("name") == Some(name));
+        if let GraphValue::Text(text) = value {
+            bindings.extend(inputs.map(|(&id, _)| ParameterBinding::Text(id, text)));
+            continue;
+        }
+        let lanes = value.lanes();
+        let mut found = false;
+        for (&id, _) in inputs {
+            found = true;
+            if let Some(&v) = lanes.first() {
+                bindings.push(ParameterBinding::Number(id, "v", v));
+            }
+            bindings.extend(["x", "y", "z", "w"].into_iter().zip(lanes.iter().copied()).map(|(slot, v)| ParameterBinding::Number(id, slot, v)));
+        }
+        if !found
+            && let [v] = lanes.as_slice()
+            && v.is_finite()
+            && let Some(exposure) = graph.exposed.iter().find(|exposure| exposure.label == *name)
+        {
+            bindings.push(ParameterBinding::Number(exposure.node, &exposure.param, v.clamp(exposure.min.min(exposure.max), exposure.min.max(exposure.max))));
+        }
+    }
+    bindings
+}
+
 /// Whether the graph's input `idx` is one its package reads as grey.
-fn reads_grey(graph: &Graph, idx: u32) -> bool {
-    graph
-        .nodes
-        .values()
-        .any(|n| n.kind == "input" && n.nums.get("idx").copied().unwrap_or(0.0) as u32 == idx && n.nums.get("gray").copied().unwrap_or(0.0) > 0.5)
+fn reads_grey(graph: &GraphInstance<'_>, idx: u32) -> bool {
+    graph.nodes().any(|n| n.kind == "input" && n.nums.get("idx").copied().unwrap_or(0.0) as u32 == idx && n.nums.get("gray").copied().unwrap_or(0.0) > 0.5)
 }
 
 /// Evaluates `graph` with `images`. A graph that reads a given input as grey and is given colour there runs once for
 /// each of red, green and blue, each as a grey image, and the results make up the colour (measured against the
 /// reference app with filters on base colour: 14 of the 16 filters that came out grey matched this way).
-fn evaluate(graph: &Graph, ec: &EvalContext, side: usize, images: Vec<Option<Tex>>, given: &[(u32, Tex)]) -> Result<BTreeMap<String, Tex>, String> {
+fn evaluate(
+    graph: &GraphInstance<'_>,
+    ec: &EvalContext,
+    side: usize,
+    images: Vec<Option<Tex>>,
+    given: &[(u32, Tex)],
+    outputs: &[&str],
+) -> Result<BTreeMap<String, Tex>, String> {
     let colour: Vec<u32> = given.iter().filter(|(k, t)| reads_grey(graph, *k) && !t.px.iter().all(|p| p[0] == p[1] && p[1] == p[2])).map(|(k, _)| *k).collect();
     if colour.is_empty() {
         // (the images handed over: the runtime holds them without a copy)
-        return graph.evaluate_owned(ec, Some(side), images).map_err(|e| e.to_string());
+        return graph.evaluate_owned(ec, side, images, outputs).map_err(|e| e.to_string());
     }
     let mut merged: BTreeMap<String, Tex> = BTreeMap::new();
     for c in 0..3 {
@@ -1215,7 +1254,7 @@ fn evaluate(graph: &Graph, ec: &EvalContext, side: usize, images: Vec<Option<Tex
                 t.px.iter_mut().for_each(|p| *p = [p[c], p[c], p[c], p[3]]);
             }
         }
-        for (name, t) in graph.evaluate_owned(ec, Some(side), one).map_err(|e| e.to_string())? {
+        for (name, t) in graph.evaluate_owned(ec, side, one, outputs).map_err(|e| e.to_string())? {
             match merged.get_mut(&name) {
                 Some(m) if (m.w, m.h) == (t.w, t.h) => m.px.iter_mut().zip(&t.px).for_each(|(a, b)| {
                     if let (Some(slot), Some(v)) = (a.get_mut(c), b.get(c)) {
