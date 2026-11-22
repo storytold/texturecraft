@@ -5105,19 +5105,20 @@ fn compute_resident_grey(
 
 /// The imported 16-bit grayscale pyramids frequently enlarge and blend whole 4K/8K images.
 fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, input: impl Fn(&str) -> Option<GreyInput<'a>>) -> Option<ResidentGreyPass<'a>> {
-    use crate::measured::{COMPILED_16_BIT, STEPS_16};
+    use crate::measured::{COMPILED_16_BIT, STEPS_8, STEPS_16};
 
     if ctx.size != ctx.height || !steps.is_some_and(|s| s.fmt == COMPILED_16_BIT) || rolls(n) {
         return None;
     }
     let value = |key, default| n.nums.get(key).copied().unwrap_or(default);
-    let source = |slot| {
+    let source = |slot, accepts_8_bit| {
         let image = input(slot)?;
         let (w, h, div, alpha) = image.info();
-        (w == h && w.is_power_of_two() && div == STEPS_16 as f32 && crate::tex::grey_alpha_ok(alpha)).then_some((image, w))
+        let packed = div == STEPS_16 as f32 || accepts_8_bit && div == STEPS_8 as f32;
+        (w == h && w.is_power_of_two() && packed && crate::tex::grey_alpha_ok(alpha)).then_some((image, w))
     };
     if n.kind == "transform_matrix" {
-        let (source, width) = source("in")?;
+        let (source, width) = source("in", true)?;
         if width < 2
             || !ctx.size.is_power_of_two()
             || value("tile_x", 1.0) != 1.0
@@ -5134,17 +5135,17 @@ fn grey_pass<'a>(n: &Node, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>, inp
         let resident = matches!(source, GreyInput::Device(_));
         if (ctx.size >= 4096 || resident) && width < ctx.size {
             Some(ResidentGreyPass::Enlarge { source, side: ctx.size })
-        } else if (resident || width >= 2048) && (2..width).contains(&ctx.size) {
+        } else if source.info().2 == STEPS_16 as f32 && (resident || width >= 2048) && (2..width).contains(&ctx.size) {
             Some(ResidentGreyPass::Reduce { source, side: ctx.size })
         } else {
             None
         }
     } else {
-        let (foreground, fg_width) = source("fg")?;
-        let (background, bg_width) = source("bg")?;
+        let (foreground, fg_width) = source("fg", false)?;
+        let (background, bg_width) = source("bg", false)?;
         let (mode, opacity) = (value("mode", 0.0) as u32, value("opacity", 1.0));
         let mask = if n.ins.contains_key("mask") {
-            let (mask, mask_width) = source("mask")?;
+            let (mask, mask_width) = source("mask", false)?;
             if mask_width != ctx.size {
                 return None;
             }

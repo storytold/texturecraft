@@ -119,7 +119,7 @@ impl GreyRasterizer {
                 (foreground, Some(background), mask, side, BLEND_OFFSET + mode, opacity, Some(alpha))
             }
         };
-        let (source_side, alpha) = grey_input_shape(&foreground, mode == REDUCE);
+        let (source_side, alpha) = grey_input_shape(&foreground, matches!(mode, ENLARGE | REDUCE));
         if cancel.is_cancelled() || !(2..=8192).contains(&side) || !side.is_power_of_two() || source_side == 0 {
             return Ok(None);
         }
@@ -174,8 +174,8 @@ impl GreyRasterizer {
 
         crate::gpu_trace::scoped(&self.device, "resident graph grayscale pass", || {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("resident graph grayscale") });
-            // The first mip of a compiled 8-bit source averages exact 8-bit reads into 16-bit steps.
-            let source_scale = if mode == REDUCE && foreground.info().2 == 255.0 { 257 } else { 1 };
+            // Resize an 8-bit source into 16-bit steps. Every subsequent pass reads those new steps.
+            let source_scale = if foreground.info().2 == 255.0 { 257 } else { 1 };
             let mut input = (source_side, &front, source_scale);
             for (size, output) in &stages {
                 let back = &back.as_ref().unwrap_or(input.1).buffer; // Resizing does not read this binding.
@@ -272,7 +272,13 @@ impl GreyRasterizer {
         let bands = Bands::new(self, band_rows, (side * band_rows * 2) as u64)?;
         match pass {
             GreyPass::Enlarge { source, side } => {
-                if source.w < 2 || source.w >= side || source.h != source.w || !source.w.is_power_of_two() || source.px.len() != source.w * source.h {
+                if source.w < 2
+                    || source.w >= side
+                    || source.h != source.w
+                    || !source.w.is_power_of_two()
+                    || !matches!(source.div, 255.0 | 65535.0)
+                    || source.px.len() != source.w * source.h
+                {
                     return Ok(None);
                 }
                 let mut doubled = bands.run(source, None, 0, 0.0, source.w * 2, cancel)?;
@@ -435,6 +441,7 @@ impl<'a> Bands<'a> {
     fn run(&self, foreground: &Grey16, background: Option<&Grey16>, mode: u32, opacity: f32, side: usize, cancel: &Cancel) -> Result<Grey16, String> {
         let (device, queue) = (&self.renderer.device, &self.renderer.queue);
         let mut pixels = Vec::with_capacity(side * side);
+        let source_scale = if foreground.div == 255.0 { 257 } else { 1 };
         for y in (0..side).step_by(self.rows) {
             if cancel.is_cancelled() {
                 return Err("GPU grayscale pass was cancelled".into());
@@ -452,7 +459,7 @@ impl<'a> Bands<'a> {
             } else {
                 upload_doubling_rows(queue, &self.inputs[0], foreground, y, rows)?;
             }
-            let params = [side as u32, rows as u32, foreground.w as u32, mode, opacity.to_bits(), 0, 0, 0];
+            let params = [side as u32, rows as u32, foreground.w as u32, mode, opacity.to_bits(), 0, 0, source_scale];
             queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&params));
             let bytes = (rows * side * 2) as u64;
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("graph grayscale band") });
@@ -512,6 +519,67 @@ mod tests {
             if kind == "blend" {
                 self.0.fetch_add(1, Relaxed);
             }
+        }
+    }
+
+    #[test]
+    fn imported_eight_bit_levels_enlarge_as_sixteen_bit_on_the_gpu() {
+        let Ok(gpu) = crate::headless::Headless::new() else { return };
+
+        #[derive(Default)]
+        struct Enlargements(AtomicUsize);
+
+        impl Profiler for Enlargements {
+            fn enabled(&self) -> bool {
+                false
+            }
+
+            fn span(&self, _: &str) -> Box<dyn std::any::Any + Send> {
+                Box::new(())
+            }
+
+            fn resident_node(&self, id: u32, _: &str) {
+                if matches!(id, 4 | 5) {
+                    self.0.fetch_or(1 << (id - 4), Relaxed);
+                }
+            }
+        }
+
+        let nodes = Arc::new(Enlargements::default());
+        let context = EvalContext {
+            accelerator: Some(Arc::new(crate::gpu_graph::GraphAccelerator::new(&gpu.device, &gpu.queue))),
+            profiler: Some(nodes.clone()),
+            ..Default::default()
+        };
+        let graph = Graph::parse(
+            r#"format 3
+size 512
+meta compiled "1"
+node 1 input idx=0 format="u8_compiled"
+node 2 transform_matrix in=@1 offset_x=0.00390625 format="u8_compiled"
+node 3 levels_mid in=@2 high=0.11776099 out_low=0.204225 format="u8_compiled"
+node 4 transform_matrix in=@3 format="u16_compiled" osize_log2_x=10 osize_log2_y=10
+node 5 transform_matrix in=@3 format="u16_compiled" osize_log2_x=11 osize_log2_y=11
+output once 4
+output twice 5
+"#,
+        )
+        .unwrap();
+        let input = Tex::gray_fn(512, 512, |u, v| {
+            let x = (u * 512.0) as u32;
+            let y = (v * 512.0) as u32;
+            ((x * 1229 + y * 1153 + x * y * 13) & 255) as f32 / 255.0
+        });
+        let inputs = [Some(input)];
+        let cpu = graph.evaluate_with_inputs(None, &inputs).unwrap();
+        let gpu = graph.evaluate_in(&context, None, &inputs).unwrap();
+
+        assert_eq!(nodes.0.load(Relaxed), 0b11);
+        for (name, side) in [("once", 1024), ("twice", 2048)] {
+            let (cpu, gpu) = (&cpu[name], &gpu[name]);
+            assert_eq!((gpu.w, gpu.h, gpu.px.len()), (side, side, cpu.px.len()));
+            let mismatch = cpu.px.iter().zip(&gpu.px).position(|(a, b)| a != b);
+            assert_eq!(mismatch, None, "{name}: first mismatched pixel");
         }
     }
 

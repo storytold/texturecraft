@@ -1,6 +1,6 @@
 struct Params {
     dimensions: vec4<u32>, // output width, band rows, input width, opcode (0 enlarges, 1 reduces)
-    blend: vec4<u32>,      // opacity bits, whole-image input, has mask, reduction input to 16-bit scale
+    blend: vec4<u32>,      // opacity bits, whole-image input, has mask, resize input to 16-bit scale
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -19,7 +19,8 @@ fn odd(word: u32) -> f32 {
 
 fn source(x: u32, y: u32) -> f32 {
     let word = front[(y * params.dimensions.z + x) / 2u];
-    return select(even(word), odd(word), (x & 1u) != 0u);
+    let value = (word >> ((x & 1u) * 16u)) & 0xffffu;
+    return decode(value * params.blend.w);
 }
 
 fn doubled(x: u32, y: u32) -> vec2<f32> {
@@ -35,9 +36,12 @@ fn doubled(x: u32, y: u32) -> vec2<f32> {
     let right = (x + 1u) & (w - 1u);
     let main_sample = vec2(source(left, main), source(right, main));
     let side_sample = vec2(source(left, side), source(right, side));
-    let main_row = source(x, main) * 0.75 + main_sample * 0.25;
-    let side_row = source(x, side) * 0.75 + side_sample * 0.25;
-    return main_row * 0.75 + side_row * 0.25;
+    // Round products before the additions, as the CPU does while doubling columns and rows.
+    let near = vec2f(0.75);
+    let far = vec2f(0.25);
+    let main_row = individual_product(vec2f(source(x, main)), near) + individual_product(main_sample, far);
+    let side_row = individual_product(vec2f(source(x, side)), near) + individual_product(side_sample, far);
+    return individual_product(main_row, near) + individual_product(side_row, far);
 }
 
 fn halved(x: u32, y: u32) -> vec2<f32> {
