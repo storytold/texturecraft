@@ -5,34 +5,70 @@ fn tc_wrap(i: vec2i, size: vec2i) -> vec2i {
     return select(remainder, remainder + size, remainder < vec2i(0));
 }
 
-fn tc_sample(input: texture_2d<f32>, uv: vec2f, mode: u32) -> vec4f {
-    let n = vec2i(textureDimensions(input));
-    let size = vec2f(n);
+fn tc_sample_position(uv: vec2f) -> vec2f {
     let finite = (bitcast<vec2u>(uv) & vec2u(0x7f800000u)) != vec2u(0x7f800000u);
-    var position = select(vec2f(0.0), uv, finite);
-    if ((mode & 1u) == 0u) {
-        if ((mode & 2u) != 0u) {
-            let pixel = clamp(vec2i(floor(clamp(position, vec2f(0.0), vec2f(1.0)) * size)), vec2i(0), n - 1);
-            return textureLoad(input, pixel, 0);
-        }
-        return textureLoad(input, tc_wrap(vec2i(floor(position * size)), n), 0);
+    return select(vec2f(0.0), uv, finite);
+}
+
+fn tc_nearest(position: vec2f, n: vec2i, mode: u32) -> vec2i {
+    let size = vec2f(n);
+    if ((mode & 2u) != 0u) {
+        return clamp(vec2i(floor(clamp(position, vec2f(0.0), vec2f(1.0)) * size)), vec2i(0), n - 1);
     }
+    return tc_wrap(vec2i(floor(position * size)), n);
+}
+
+struct SampleFootprint {
+    a: vec2i,
+    b: vec2i,
+    t: vec2f,
+}
+
+fn tc_bilinear(position: vec2f, n: vec2i, mode: u32) -> SampleFootprint {
+    let size = vec2f(n);
+    var uv = position;
     if ((mode & 2u) != 0u) {
         let edge = 0.5 / size;
-        position = clamp(position, edge, 1.0 - edge);
+        uv = clamp(uv, edge, 1.0 - edge);
     }
-    let texel = position * size - 0.5;
+    let texel = uv * size - 0.5;
     let base = floor(texel);
-    let t = texel - base;
     let a = tc_wrap(vec2i(base), n);
     let b = select(a + 1, vec2i(0), a + 1 == n);
-    let p00 = textureLoad(input, a, 0);
-    let p10 = textureLoad(input, vec2i(b.x, a.y), 0);
-    let p01 = textureLoad(input, vec2i(a.x, b.y), 0);
-    let p11 = textureLoad(input, b, 0);
-    let top = p00 + (p10 - p00) * t.x;
-    let bottom = p01 + (p11 - p01) * t.x;
-    return top + (bottom - top) * t.y;
+    return SampleFootprint(a, b, texel - base);
+}
+
+fn tc_sample(input: texture_2d<f32>, uv: vec2f, mode: u32) -> vec4f {
+    let n = vec2i(textureDimensions(input));
+    let position = tc_sample_position(uv);
+    if ((mode & 1u) == 0u) {
+        return textureLoad(input, tc_nearest(position, n, mode), 0);
+    }
+    let sample = tc_bilinear(position, n, mode);
+    let p00 = textureLoad(input, sample.a, 0);
+    let p10 = textureLoad(input, vec2i(sample.b.x, sample.a.y), 0);
+    let p01 = textureLoad(input, vec2i(sample.a.x, sample.b.y), 0);
+    let p11 = textureLoad(input, sample.b, 0);
+    let top = p00 + (p10 - p00) * sample.t.x;
+    let bottom = p01 + (p11 - p01) * sample.t.x;
+    return top + (bottom - top) * sample.t.y;
+}
+
+// Read packed grayscale values in the same normalized units as an uploaded float image.
+fn tc_sample_steps(input: texture_2d<u32>, uv: vec2f, mode: u32, div: f32) -> f32 {
+    let n = vec2i(textureDimensions(input));
+    let position = tc_sample_position(uv);
+    if ((mode & 1u) == 0u) {
+        return f32(textureLoad(input, tc_nearest(position, n, mode), 0).x) / div;
+    }
+    let sample = tc_bilinear(position, n, mode);
+    let p00 = f32(textureLoad(input, sample.a, 0).x) / div;
+    let p10 = f32(textureLoad(input, vec2i(sample.b.x, sample.a.y), 0).x) / div;
+    let p01 = f32(textureLoad(input, vec2i(sample.a.x, sample.b.y), 0).x) / div;
+    let p11 = f32(textureLoad(input, sample.b, 0).x) / div;
+    let top = p00 + (p10 - p00) * sample.t.x;
+    let bottom = p01 + (p11 - p01) * sample.t.x;
+    return top + (bottom - top) * sample.t.y;
 }
 
 fn tc_lum(p: vec4f) -> f32 {

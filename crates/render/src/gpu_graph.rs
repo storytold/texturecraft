@@ -259,7 +259,7 @@ impl GraphAccelerator {
 
 impl Accelerator for GraphAccelerator {
     fn cache_tag(&self) -> &str {
-        "wgpu-graph-v1"
+        "wgpu-graph-v2"
     }
 
     fn pixel(&self, request: PixelRequest<'_>) -> Result<Option<PixelOutput>, String> {
@@ -347,7 +347,8 @@ fn upload(device: &wgpu::Device, queue: &wgpu::Queue, image: ImgRef<'_>) -> wgpu
     let h = image.h() as u32;
     let (format, stride) = match image {
         ImgRef::Rgba(_) => (wgpu::TextureFormat::Rgba32Float, 16),
-        ImgRef::Grey(_) => (wgpu::TextureFormat::R32Float, 4),
+        ImgRef::Grey(texturecraft_graph::tex::GreyIn::F(..)) => (wgpu::TextureFormat::R32Float, 4),
+        ImgRef::Grey(texturecraft_graph::tex::GreyIn::Q(_)) => (wgpu::TextureFormat::R16Uint, 2),
     };
     let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -363,7 +364,12 @@ fn upload(device: &wgpu::Device, queue: &wgpu::Queue, image: ImgRef<'_>) -> wgpu
     let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride * w), rows_per_image: Some(h) };
     match image {
         ImgRef::Rgba(image) => queue.write_texture(texture.as_image_copy(), bytemuck::cast_slice(&image.px), layout, size),
-        ImgRef::Grey(image) => queue.write_texture(texture.as_image_copy(), bytemuck::cast_slice(&image.floats().px), layout, size),
+        ImgRef::Grey(texturecraft_graph::tex::GreyIn::F(image, _)) => {
+            queue.write_texture(texture.as_image_copy(), bytemuck::cast_slice(&image.px), layout, size);
+        }
+        ImgRef::Grey(texturecraft_graph::tex::GreyIn::Q(image)) => {
+            queue.write_texture(texture.as_image_copy(), bytemuck::cast_slice(&image.px), layout, size);
+        }
     }
     texture.create_view(&Default::default())
 }
@@ -381,16 +387,20 @@ mod tests {
         let graph = Graph::parse("size 256\nsubgraph example\nmeta kind \"function\"\nmeta float32 \"1\"\nnode 1 f_pos\nnode 2 f_sample_gray a=@1 slot=\"in\" filter=1\nnode 3 f_float v=0.2\nnode 4 f_add a=@2 b=@3\nnode 5 f_out in=@4\nend\nnode 1 pixel_processor fn=\"example\"\noutput out 1\n").unwrap();
         let program = compile_named(&graph.subgraphs, "example").unwrap();
         let input = Grey::from_fn(17, 19, |u, v| u * v);
-        let mut environment = FnEnv::new([256.0, 256.0]);
-        environment.images.push(("in", ImgRef::Grey(texturecraft_graph::tex::GreyIn::F(&input, 1.0))));
+        let steps = Grey16 { w: input.w, h: input.h, px: input.px.iter().map(|v| (v * 255.0).round() as u16).collect(), div: 255.0, alpha: 1.0 };
         let backend = GraphAccelerator::new(&gpu.device, &gpu.queue);
         let cancel = Cancel::new();
-        let Some(PixelOutput::Grey(pixels)) =
-            backend.pixel(PixelRequest { program: &program, environment: &environment, size: [256, 256], cancel: &cancel }).unwrap()
-        else {
-            panic!("the imported pixel program must execute on GPU");
-        };
-        let expected = Grey::from_fn(256, 256, |u, v| program.run(&environment, [f64::from(u), f64::from(v)]).unwrap().as_f32());
-        assert!(expected.px.iter().zip(pixels.px).all(|(&a, b)| (a - b).abs() < 2e-6));
+        use texturecraft_graph::tex::GreyIn::{F, Q};
+        for input in [F(&input, 1.0), Q(&steps)] {
+            let mut environment = FnEnv::new([256.0, 256.0]);
+            environment.images.push(("in", ImgRef::Grey(input)));
+            let Some(PixelOutput::Grey(pixels)) =
+                backend.pixel(PixelRequest { program: &program, environment: &environment, size: [256, 256], cancel: &cancel }).unwrap()
+            else {
+                panic!("the imported pixel program must execute on GPU");
+            };
+            let expected = Grey::from_fn(256, 256, |u, v| program.run(&environment, [f64::from(u), f64::from(v)]).unwrap().as_f32());
+            assert!(expected.px.iter().zip(pixels.px).all(|(&a, b)| (a - b).abs() < 2e-6));
+        }
     }
 }

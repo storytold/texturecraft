@@ -61,17 +61,21 @@ impl Prog {
         }
         for (slot, &image) in shader.images.iter().enumerate() {
             let (_, image) = env.images.get(image)?;
-            writeln!(shader.source, "@group(0) @binding({}) var input_{slot}: texture_2d<f32>;", slot + 2).ok()?;
-            if let crate::tex::ImgRef::Grey(grey) = image {
-                writeln!(
-                    shader.source,
-                    "fn sample_{slot}(uv: vec2f, mode: u32) -> vec4f {{ return vec4f(vec3f(tc_sample(input_{slot}, uv, mode).x), {}); }}",
-                    if grey.alpha() == 1.0 { "1.0" } else { "0.0" }
-                )
-                .ok()?;
-            } else {
-                writeln!(shader.source, "fn sample_{slot}(uv: vec2f, mode: u32) -> vec4f {{ return tc_sample(input_{slot}, uv, mode); }}").ok()?;
-            }
+            let alpha = match image {
+                crate::tex::ImgRef::Grey(grey) if grey.alpha() == 1.0 => "1.0",
+                _ => "0.0",
+            };
+            let (sample_type, sample) = match image {
+                crate::tex::ImgRef::Grey(crate::tex::GreyIn::Q(grey)) => {
+                    let div = shader.uniforms.len() + 1;
+                    shader.uniforms.push([grey.div, 0.0, 0.0, 0.0]);
+                    ("u32", format!("vec4f(vec3f(tc_sample_steps(input_{slot}, uv, mode, parameters[{div}].x)), {alpha})"))
+                }
+                crate::tex::ImgRef::Grey(_) => ("f32", format!("vec4f(vec3f(tc_sample(input_{slot}, uv, mode).x), {alpha})")),
+                crate::tex::ImgRef::Rgba(_) => ("f32", format!("tc_sample(input_{slot}, uv, mode)")),
+            };
+            writeln!(shader.source, "@group(0) @binding({}) var input_{slot}: texture_2d<{sample_type}>;", slot + 2).ok()?;
+            writeln!(shader.source, "fn sample_{slot}(uv: vec2f, mode: u32) -> vec4f {{ return {sample}; }}").ok()?;
         }
         let last = format!("r{}", code.out);
         let (ty, expression) = match result {
