@@ -2,9 +2,9 @@ struct Params {
     extent: vec4u, // width, height, operation, blend mode
     formats: vec4u, // front, back, mask, mask present
     alphas: vec4f, // packed grayscale alphas, opacity
-    weights: vec4f, // grayscale weights or warp intensity, offset and aspect
+    weights: vec4f, // grayscale weights, warp intensity/offset/aspect, or affine offset
     control: vec4u, // blend alpha mode or warp map dimensions and wrapping axes
-    warp_direction: vec4f,
+    direction: vec4f, // warp direction or affine matrix
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -124,14 +124,8 @@ fn lerp_color(lo: vec4f, hi: vec4f, weight: f32) -> vec4f {
     return lo + scaled;
 }
 
-fn warp_at(p: vec2u) -> vec4f {
-    let size = params.extent.xy;
-    let wraps = params.control.zw != vec2u(0u);
-    let uv = (vec2f(p) + 0.5) / vec2f(size);
-    let distance = mul(params.weights.x, warp_map(uv, p.y * size.x + p.x) - params.weights.y);
-    let direction = individual_product(vec2f(distance), params.warp_direction.xy);
-    let warped = uv + individual_product(direction, params.weights.zw);
-    let taps = stepped_taps(warped, size, wraps);
+fn stepped_color(uv: vec2f, size: vec2u, wraps: vec2<bool>) -> vec4f {
+    let taps = stepped_taps(uv, size, wraps);
     let a = pixel(0u, address(taps.base, size, wraps));
     let b = pixel(0u, address(taps.base + vec2i(1, 0), size, wraps));
     let c = pixel(0u, address(taps.base + vec2i(0, 1), size, wraps));
@@ -139,8 +133,27 @@ fn warp_at(p: vec2u) -> vec4f {
     return lerp_color(lerp_color(a, b, taps.weights.x), lerp_color(c, d, taps.weights.x), taps.weights.y);
 }
 
-fn write_warp(i: u32, p: vec4f) {
-    // Compiled warps round the sample to the 16-bit read steps before the node's own formatting.
+fn warp_at(p: vec2u) -> vec4f {
+    let size = params.extent.xy;
+    let wraps = params.control.zw != vec2u(0u);
+    let uv = (vec2f(p) + 0.5) / vec2f(size);
+    let distance = mul(params.weights.x, warp_map(uv, p.y * size.x + p.x) - params.weights.y);
+    let direction = individual_product(vec2f(distance), params.direction.xy);
+    let warped = uv + individual_product(direction, params.weights.zw);
+    return stepped_color(warped, size, wraps);
+}
+
+fn affine_at(p: vec2u) -> vec4f {
+    let size = params.extent.xy;
+    let center = (vec2f(p) + 0.5) / vec2f(size) - 0.5;
+    let horizontal = individual_product(params.direction.xy, vec2f(center.x));
+    let vertical = individual_product(params.direction.zw, vec2f(center.y));
+    let uv = horizontal + vertical + 0.5 + params.weights.xy;
+    return stepped_color(uv, size, vec2<bool>(true));
+}
+
+fn write_spatial(i: u32, p: vec4f) {
+    // The compiled transform and warp round reads to 16 bits before formatting.
     output[i * 2u] = packed(vec2u(rounded_read(p.x), rounded_read(p.y)));
     output[i * 2u + 1u] = packed(vec2u(rounded_read(p.z), rounded_read(p.w)));
 }
@@ -163,8 +176,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
         case 3u: {
             let p = vec2u(id.x * 2u, id.y);
-            write_warp(i, warp_at(p));
-            write_warp(i + 1u, warp_at(p + vec2u(1u, 0u)));
+            write_spatial(i, warp_at(p));
+            write_spatial(i + 1u, warp_at(p + vec2u(1u, 0u)));
+        }
+        case 4u: {
+            let p = vec2u(id.x * 2u, id.y);
+            write_spatial(i, affine_at(p));
+            write_spatial(i + 1u, affine_at(p + vec2u(1u, 0u)));
         }
         default: {
             let a = pixel(0u, i);

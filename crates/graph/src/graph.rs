@@ -4747,7 +4747,8 @@ fn compute_resident_image(id: u32, n: &Node, ins: &BTreeMap<String, NodeValue>, 
 
 fn compute_resident_color(id: u32, n: &Node, ins: &BTreeMap<String, NodeValue>, ctx: &Ctx<'_>, format: u32) -> Result<Option<NodeValue>, Error> {
     let Some(accelerator) = &ctx.ec.accelerator else { return Ok(None) };
-    if format != crate::measured::COMPILED_16_BIT || !matches!(n.kind.as_str(), "blend" | "grayscale_conversion" | "dir_warp") || rolls(n) {
+    if format != crate::measured::COMPILED_16_BIT || !matches!(n.kind.as_str(), "blend" | "grayscale_conversion" | "dir_warp" | "transform_matrix") || rolls(n)
+    {
         return Ok(None);
     }
     let resident = ins.values().any(|v| matches!(v, NodeValue::Device(_) | NodeValue::DeviceColor(_)));
@@ -4782,6 +4783,14 @@ fn compute_resident_color(id: u32, n: &Node, ins: &BTreeMap<String, NodeValue>, 
             return Ok(None);
         }
         ResidentColorPass::DirectionalWarp { source, map, settings, alpha: binary_alpha(source) }
+    } else if n.kind == "transform_matrix" {
+        let (Some(ColorInput::Device(source)), Some((matrix, offset))) = (input("in"), crate::atomic::resident_wrapped_color_affine(n)) else {
+            return Ok(None);
+        };
+        if source.w != ctx.size || source.h != ctx.height || source.w != source.h || !source.w.is_power_of_two() {
+            return Ok(None);
+        }
+        ResidentColorPass::WrappedAffine { source, matrix, offset }
     } else {
         let (Some(foreground), Some(background)) = (input("fg"), input("bg")) else { return Ok(None) };
         let mask = if n.ins.contains_key("mask") {

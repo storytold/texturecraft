@@ -20,6 +20,7 @@ const BLEND: u32 = 0;
 const GREY_PACKED: u32 = 1;
 const GREY_ALPHA: u32 = 2;
 const DIRECTIONAL_WARP: u32 = 3;
+const WRAPPED_AFFINE: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -29,7 +30,7 @@ struct Params {
     alphas: [f32; 4],
     weights: [f32; 4],
     control: [u32; 4],
-    warp_direction: [f32; 4],
+    direction: [f32; 4],
 }
 
 pub(crate) struct ColorRasterizer {
@@ -87,8 +88,16 @@ impl ColorRasterizer {
                 let [tile_x, tile_y] = settings.tile.map(u32::from);
                 params.control = [mw as u32, mh as u32, tile_x, tile_y];
                 params.weights = [settings.intensity, settings.offset, settings.aspect[0], settings.aspect[1]];
-                params.warp_direction[..2].copy_from_slice(&settings.direction);
+                params.direction[..2].copy_from_slice(&settings.direction);
                 (source, Some(ColorInput::Grey(map)), None, DIRECTIONAL_WARP, alpha)
+            }
+            ResidentColorPass::WrappedAffine { source, matrix, offset } => {
+                if source.w != source.h || !source.w.is_power_of_two() {
+                    return Ok(None);
+                }
+                params.direction = matrix;
+                params.weights[..2].copy_from_slice(&offset);
+                (ColorInput::Device(source), None, None, WRAPPED_AFFINE, source.alpha)
             }
         };
         let [w, h] = input_size(front);
@@ -286,5 +295,45 @@ mod tests {
                 cpu.px.iter().zip(&gpu.px).flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| ((a - b).abs() * 65535.0).round() as u32)).max().unwrap_or_default();
             assert!(max <= 1, "map {width}²: {max} u16 steps");
         }
+    }
+
+    #[test]
+    fn wrapped_color_transforms_keep_the_compiled_sample_and_alpha_on_gpu() {
+        let Ok(gpu) = crate::headless::Headless::new() else { return };
+        let nodes = Arc::new(Nodes::default());
+        let context = EvalContext {
+            accelerator: Some(Arc::new(crate::gpu_graph::GraphAccelerator::new(&gpu.device, &gpu.queue))),
+            profiler: Some(nodes.clone()),
+            ..Default::default()
+        };
+        let graph = Graph::parse(
+            r#"format 3
+size 1024
+meta compiled "1"
+subgraph offset
+meta kind "function"
+meta float32 "1"
+node 2 f_float v=0.12793
+node 1 f_out in=@2
+end
+node 1 input idx=0 format="u16_compiled"
+node 2 blend fg=@1 bg=@1 mode="copy" alpha_mode=1 format="u16_compiled"
+node 3 transform_matrix in=@2 m00=-0.00000004371139 m01=-1 m10=1 m11=-0.00000004371139 fn.offset_x="offset" offset_y=-0.29517 format="u16_compiled"
+node 4 transform_matrix in=@3 m00=0.81 m01=0.37 m10=-0.27 m11=1.1 mip=0 offset_y=0.20998 format="u16_compiled"
+output out 4
+"#,
+        )
+        .unwrap();
+        let input = Tex::from_fn(1024, 1024, |u, v| [u * v, (u * 1.7 + v).fract(), (u * 19.0 + v * 12.0).cos() * 0.5 + 0.5, (u * 3.0 + 2.0 * v).fract()]);
+        let inputs = [Some(input)];
+        let cpu = &graph.evaluate_with_inputs(None, &inputs).unwrap()["out"];
+        let gpu = &graph.evaluate_in(&context, None, &inputs).unwrap()["out"];
+        let seen = nodes.0.lock().unwrap();
+        assert_eq!(seen.get("blend"), Some(&1), "{seen:?}");
+        assert_eq!(seen.get("transform_matrix"), Some(&2), "{seen:?}");
+        assert_eq!(seen.get("readback"), Some(&1), "{seen:?}");
+        assert_eq!((gpu.w, gpu.h, gpu.px.len()), (cpu.w, cpu.h, cpu.px.len()));
+        let mismatch = cpu.px.iter().zip(&gpu.px).position(|(a, b)| a != b);
+        assert_eq!(mismatch, None, "first mismatched RGBA pixel");
     }
 }

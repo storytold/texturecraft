@@ -168,6 +168,11 @@ pub enum ResidentColorPass<'a> {
         settings: DirectionalWarpParams,
         alpha: Option<f32>,
     },
+    WrappedAffine {
+        source: &'a ResidentColor16,
+        matrix: [f32; 4],
+        offset: [f32; 2],
+    },
 }
 
 pub enum ResidentColorOutput {

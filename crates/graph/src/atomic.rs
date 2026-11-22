@@ -236,8 +236,7 @@ pub(crate) fn resident_filter<'a>(
     let radii = |intensity: f32| [intensity * aspect[0] * w as f32 / INTENSITY_SPAN, intensity * aspect[1] * h as f32 / INTENSITY_SPAN];
     let operation = match n.kind.as_str() {
         "transform_matrix" => {
-            let offset = [value("offset_x", 0.0), value("offset_y", 0.0)];
-            let matrix = [value("m00", 1.0), value("m01", 0.0), value("m10", 0.0), value("m11", 1.0)];
+            let (matrix, offset) = transform_matrix_coordinates(n);
             let bilinear = value("filter", 1.0) > 0.5;
             let mip = value("mip", MIP_AUTOMATIC as f32).round() as u32;
             if transform_matrix_bg(n) != [0.0; 4] || matrix.into_iter().chain(offset).any(|v| !(-16.0..=16.0).contains(&v)) {
@@ -438,6 +437,25 @@ pub(crate) fn transform_matrix_bg(n: &Node) -> [f32; 4] {
     [f("bg_r", 0.0), f("bg_g", 0.0), f("bg_b", 0.0), f("bg_a", 0.0)]
 }
 
+fn transform_matrix_coordinates(n: &Node) -> ([f32; 4], [f32; 2]) {
+    let value = |name, default| n.nums.get(name).copied().unwrap_or(default);
+    let matrix = [value("m00", 1.0), value("m01", 0.0), value("m10", 0.0), value("m11", 1.0)];
+    let offset = [value("offset_x", 0.0), value("offset_y", 0.0)];
+    (matrix, offset)
+}
+
+/// A wrapped bilinear affine transform at the source resolution of a square image.
+pub(crate) fn resident_wrapped_color_affine(n: &Node) -> Option<([f32; 4], [f32; 2])> {
+    let value = |name, default| n.nums.get(name).copied().unwrap_or(default);
+    let (matrix, offset) = transform_matrix_coordinates(n);
+    let mip = value("mip", MIP_AUTOMATIC as f32).round() as u32;
+    (["tile_x", "tile_y", "filter"].into_iter().all(|key| value(key, 1.0) > 0.5)
+        && transform_matrix_bg(n) == [0.0; 4]
+        && matrix.into_iter().chain(offset).all(|coordinate| (-16.0..=16.0).contains(&coordinate))
+        && transform_mip(mip, matrix) == 0)
+        .then_some((matrix, offset))
+}
+
 /// On each non-repeating axis the extreme output centers must have full coverage.
 fn affine_covers_image(matrix: [f32; 4], offset: [f32; 2], size: [usize; 2], tile: [bool; 2], fade: Option<[usize; 2]>) -> bool {
     let [m00, m01, m10, m11] = matrix;
@@ -477,8 +495,7 @@ pub(crate) fn transform_grey_alpha(n: &Node, alpha: f32) -> Option<f32> {
 /// A `transform_matrix` node on an image of pixels `P` (RGBA, or grey when [`transform_keeps_grey`]), `bg` its background.
 pub(crate) fn transform_matrix<P: Pixel, E: crate::tex::Emit<P>>(n: &Node, t: &Image<P>, size: [usize; 2], bg: P, out: E) -> E::Out {
     let f = |k: &str, d: f32| n.nums.get(k).copied().unwrap_or(d);
-    let m = [f("m00", 1.0), f("m01", 0.0), f("m10", 0.0), f("m11", 1.0)];
-    let (ox, oy) = (f("offset_x", 0.0), f("offset_y", 0.0));
+    let (m, [ox, oy]) = transform_matrix_coordinates(n);
     let (tx, ty) = (f("tile_x", 1.0) > 0.5, f("tile_y", 1.0) > 0.5);
     let (bilinear, mip) = (f("filter", 1.0) > 0.5, f("mip", MIP_AUTOMATIC as f32).round() as u32);
     let [w, h] = size;
