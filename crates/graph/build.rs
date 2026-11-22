@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 /// The functions that pick by node kind.
 const DISPATCHERS: &[Dispatcher] = &[
     Dispatcher { file: "src/graph.rs", function: "compute" },
-    Dispatcher { file: "src/graph.rs", function: "finish_node" },
+    Dispatcher { file: "src/graph.rs", function: "compute_host_node" },
+    Dispatcher { file: "src/graph.rs", function: "compute_resident_grey" },
     Dispatcher { file: "src/nodes2.rs", function: "compute" },
     Dispatcher { file: "src/atomic.rs", function: "compute" },
     Dispatcher { file: "src/compiled_ops.rs", function: "compute" },
