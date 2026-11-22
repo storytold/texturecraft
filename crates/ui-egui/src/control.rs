@@ -336,9 +336,16 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
 
 /// Encode a rendered view as PNG.
 pub fn screenshot(app: &TextureCraftApp, view: u64) -> Option<(u32, u32, Vec<u8>)> {
-    if !app.session.project_open {
+    let view = if crate::import_ui::preview_active(app) {
+        if view != crate::viewport::VIEW_3D {
+            return None;
+        }
+        crate::import_ui::VIEW_PREVIEW
+    } else if !app.session.project_open {
         return None;
-    }
+    } else {
+        view
+    };
 
     let rs = app.render_state.as_ref()?;
     let renderer = rs.renderer.read();

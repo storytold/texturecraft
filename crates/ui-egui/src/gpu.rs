@@ -113,6 +113,19 @@ impl Drop for CompositeWork {
 }
 
 impl SceneSync {
+    pub(crate) fn import_preview(preview: &texturecraft_engine::import_cmds::ImportPreview) -> Self {
+        let mesh_id = preview.mesh_id;
+        Self {
+            mesh: Some((preview.mesh.clone(), mesh_id)),
+            mesh_id,
+            sets: Some((vec![(preview.overview.size, preview.material)], preview.mesh.materials.len().max(1), 0)),
+            env: Some((texturecraft_engine::core::DisplaySettings::default().environment, None)),
+            overview: Some((0, preview.overview.clone())),
+            release_quick_mask: true,
+            ..Self::default()
+        }
+    }
+
     fn changes_base_color(&self, ts: usize) -> bool {
         self.sets.is_some()
             || self.cleared_overviews.contains(&ts)

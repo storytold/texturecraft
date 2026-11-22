@@ -225,6 +225,7 @@ pub struct TextureCraftApp {
     queued_resize: Option<(usize, u32)>,
     /// The project import's windows and the conversion running behind them.
     pub import: Option<import_ui::ImportUi>,
+    pub(crate) import_presentation: Option<import_ui::Presentation>,
     pub link_cooks: Vec<LinkCook>,
     #[cfg(not(target_arch = "wasm32"))]
     link_imports: Vec<link_import::LinkImport>,
@@ -352,6 +353,7 @@ impl TextureCraftApp {
             resize: None,
             queued_resize: None,
             import: None,
+            import_presentation: None,
             link_cooks: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             link_imports: Vec::new(),
@@ -1167,6 +1169,10 @@ impl eframe::App for TextureCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let started_ms = now_ms();
+
+        if import_ui::show_preview(self, ui) {
+            return;
+        }
 
         // Baking and rendering need a project (a saved layout may start in one of them)
         if !self.session.project_open {

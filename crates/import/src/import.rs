@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use texturecraft_compose::graphs::Cancel;
-use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, PixelStore};
+use texturecraft_compose::{BakedMaps, Composite, GraphStore, ImageStore, PixelStore};
 use texturecraft_core::{
     BlendMode, Channel, ChannelBlend, CompositeRules, Fidelity, Fill, HeightNormal, ImportReport, Layer, LayerId, LayerKind, LayerReport, LayerRole, Lock,
     LockReason, MAX_RESOLUTION, MIN_RESOLUTION, NormalFormat, Project, Source, StoredStrokes, TextureSet, import_report::original_result_layer,
@@ -61,6 +61,15 @@ pub struct Imported {
     pub sets: Vec<SetSummary>,
     /// The stroke records of the replay jobs, by the id of the pixels they paint.
     pub strokes: BTreeMap<LayerId, StoredStrokes>,
+}
+
+/// A reduced, view-only material computed from the file's saved texture channels.
+pub struct StoredPreview {
+    pub mesh: Mesh,
+    pub material: usize,
+    pub camera: Option<texturecraft_core::Camera>,
+    pub normal_format: NormalFormat,
+    pub composite: Composite,
 }
 
 /// What the safety net found for one texture set.
@@ -144,6 +153,8 @@ pub struct Hooks<'h> {
     /// Live diagnostics from graph evaluation, scoped to this import.
     pub trace: Option<texturecraft_compose::graphs::CookTrace>,
     pub accelerator: Option<std::sync::Arc<dyn texturecraft_compose::graphs::GraphAccelerator>>,
+    /// Publishes the saved material before translating the editable stack.
+    pub preview: Option<&'h (dyn Fn(StoredPreview) + Sync)>,
 }
 
 impl Hooks<'_> {
@@ -277,18 +288,13 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
             );
         }
     }
-    let library = match options.graphs {
-        crate::GraphMode::Decompile => {
-            hooks.check()?;
-            (hooks.progress)(0.08, Step::ReadingFile);
-            Some(GraphLibrary::from_project(file))
-        }
-        crate::GraphMode::Keep => None,
-    };
-    if let Some(lib) = &library {
-        report.add("compiled graphs", Fidelity::Approximated, format!("{} decompiled and run by TextureCraft's graph runtime", lib.len()));
-    }
     let count = binding.sets.len();
+    let preview = hooks.preview.filter(|_| count == 1 && !options.translate_only);
+    let mut library = None;
+    if preview.is_none() && options.graphs == crate::GraphMode::Decompile {
+        (hooks.progress)(0.08, Step::ReadingFile);
+        library = graph_library(file, options, hooks, &mut report)?;
+    }
     // the finished sets' layer pixels, out of memory until the import returns
     let mut finished = crate::pixel_spill::PixelSpill::default();
     let mut finished_baked = crate::pixel_spill::BakedSpill::default();
@@ -297,7 +303,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
         let span = (0.1 + 0.8 * i as f32 / count as f32, 0.8 / count as f32);
         (hooks.progress)(span.0, Step::ConvertingSet { set: i + 1, of: count });
         let project_set = source.record.scene_uid.filter(|_| source.in_document).and_then(|uid| model.as_ref()?.texture_set(uid));
-        let ctx = SetContext {
+        let mut ctx = SetContext {
             file,
             source,
             project_set,
@@ -310,11 +316,20 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
             normalization,
             cache: &cache_entries,
             hooks: &*hooks,
-            graphs: library.as_ref(),
+            graphs: None,
             index: (i + 1, count),
             span,
         };
-        let summary = build_set(&ctx, &mut project, &mut imported, &mut report)?;
+        let StoredChannels { cache, resolution, composite } = read_stored_channels(&ctx, &mut report, preview.is_some())?;
+        if let Some(publish) = preview {
+            if let Some(composite) = composite {
+                let camera = project.cameras.iter().find(|camera| camera.name == crate::cameras::SAVED_VIEW).cloned();
+                publish(StoredPreview { mesh: mesh.clone(), material: source.slot, camera, normal_format: project.normal_format, composite });
+            }
+            library = graph_library(file, options, hooks, &mut report)?;
+        }
+        ctx.graphs = library.as_ref();
+        let summary = build_set(&ctx, &mut project, &mut imported, &mut report, cache, resolution)?;
         imported.sets.push(summary);
         // the set's cooks out of memory (read back when a composite or the save needs them), so that the sets do not
         // all hold theirs at once; the last set's stay, the project opens with them
@@ -343,6 +358,16 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     imported.mesh = mesh;
     (hooks.progress)(1.0, Step::Saving);
     Ok(imported)
+}
+
+fn graph_library(file: &ProjectFile, options: &ImportOptions, hooks: &Hooks<'_>, report: &mut ImportReport) -> Result<Option<GraphLibrary>, ImportError> {
+    if options.graphs != crate::GraphMode::Decompile {
+        return Ok(None);
+    }
+    hooks.check()?;
+    let library = GraphLibrary::from_project(file);
+    report.add("compiled graphs", Fidelity::Approximated, format!("{} decompiled and run by TextureCraft's graph runtime", library.len()));
+    Ok(Some(library))
 }
 
 /// Document-wide settings the import does not handle (they apply to every set).
@@ -432,10 +457,16 @@ fn distinct_graphs(layers: &[Layer]) -> usize {
     seen.len()
 }
 
-/// Builds one texture set into `project` and `out`.
-fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report: &mut ImportReport) -> Result<SetSummary, ImportError> {
+struct StoredChannels<'a> {
+    cache: Vec<StoredChannel<'a>>,
+    resolution: u32,
+    composite: Option<Composite>,
+}
+
+/// Shares the saved channel decoding between a disposable view and the reference layer.
+fn read_stored_channels<'a>(ctx: &SetContext<'a, '_>, report: &mut ImportReport, preview: bool) -> Result<StoredChannels<'a>, ImportError> {
     let record = &ctx.source.record;
-    let name = record.name.clone();
+    let name = &record.name;
     let item = |what: &str| format!("texture set \"{name}\" / {what}");
     // Prepare the stored reference directly for interactive opens. An explicit comparison still reads each channel
     // in its original precision after compositing the stack.
@@ -443,6 +474,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let only = ctx.options.translate_only;
     let prepare_reference = !ctx.options.measure;
     let mut cached_resolution = None;
+    let mut preview = (preview && ctx.project_set.is_none_or(|set| !set.uses_uv_tiles)).then(|| Composite::new(&[], 256));
     match ctx.source.cache_set.as_ref().filter(|_| !only) {
         None if only => {}
         None => report.add(item("stored result"), Fidelity::Approximated, "no stored result (the original never rendered this set)"),
@@ -450,6 +482,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
             let (mut entries, other_tiles) = uv_tiles::one_tile(ctx.cache.iter().filter(|e| &e.set == folder).collect());
             if other_tiles > 0 {
                 report.add(item("stored result"), Fidelity::Approximated, uv_tiles::other_tiles_note(other_tiles));
+                preview = None;
             }
             entries.sort_by_key(|e| e.channel_bit);
             for e in entries {
@@ -471,9 +504,16 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
                     }
                 };
                 let (size, missing_bytes) = ((img.image.width, img.image.height), img.missing_bytes);
+                if let Some(preview) = &mut preview
+                    && missing_bytes == 0
+                    && channel.user_index().is_none()
+                {
+                    let default = uncovered_default(channel, ctx.project_set.and_then(|set| set.shader_model));
+                    preview.channels.insert(channel, preview_tiles(&img.image, channel, default, preview.resolution));
+                }
                 let prepared = if prepare_reference {
                     ctx.hooks.check()?;
-                    let resolution = *cached_resolution.get_or_insert_with(|| resolve_resolution(record, Some(size), ctx.options, &name, report));
+                    let resolution = *cached_resolution.get_or_insert_with(|| resolve_resolution(record, Some(size), ctx.options, name, report));
                     Some(resized_cache_image(img, resolution).image.layer_tiles(channel))
                 } else {
                     None
@@ -482,7 +522,43 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
             }
         }
     }
-    let resolution = cached_resolution.unwrap_or_else(|| resolve_resolution(record, cache.first().map(|s| s.size), ctx.options, &name, report));
+    let resolution = cached_resolution.unwrap_or_else(|| resolve_resolution(record, cache.first().map(|s| s.size), ctx.options, name, report));
+    Ok(StoredChannels { cache, resolution, composite: preview.filter(|image| !image.channels.is_empty()) })
+}
+
+fn preview_tiles(image: &Rgba, channel: Channel, default: [f32; 3], side: u32) -> texturecraft_texel::TileImage {
+    use texturecraft_texel::{TileImage, to_u16};
+
+    let image = resample(image, side);
+    let mut tiles = TileImage::new(side, side, channel.components());
+    for y in 0..side {
+        for x in 0..side {
+            let [r, g, b, coverage] = image.get(x, y);
+            let coverage = if coverage.is_finite() { coverage.clamp(0.0, 1.0) } else { 0.0 };
+            let pixel = [r, g, b];
+            let values = std::array::from_fn::<_, 3, _>(|index| {
+                let value = if pixel[index].is_finite() { pixel[index] } else { default[index] };
+                to_u16(value * coverage + default[index] * (1.0 - coverage))
+            });
+            tiles.set(x, y, &values);
+        }
+    }
+    tiles
+}
+
+/// Builds one texture set into `project` and `out`.
+fn build_set(
+    ctx: &SetContext,
+    project: &mut Project,
+    out: &mut Imported,
+    report: &mut ImportReport,
+    cache: Vec<StoredChannel>,
+    resolution: u32,
+) -> Result<SetSummary, ImportError> {
+    let record = &ctx.source.record;
+    let name = record.name.clone();
+    let item = |what: &str| format!("texture set \"{name}\" / {what}");
+    let only = ctx.options.translate_only;
     let mut set = TextureSet::new(name.clone(), ctx.source.slot, resolution);
     let shader_model = ctx.project_set.and_then(|s| s.shader_model);
     let mut declared = SetChannels::default();

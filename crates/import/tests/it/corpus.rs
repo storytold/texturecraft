@@ -50,7 +50,7 @@ fn corpus_projects_import_into_valid_projects() {
     let mut failures = Vec::new();
     for file in &files {
         let cancel = Cancel::new();
-        let mut hooks = Hooks { progress: &|_, _| {}, cancel: &cancel, replay: None, kept_cooks: None, trace: None, accelerator: None };
+        let mut hooks = Hooks { progress: &|_, _| {}, cancel: &cancel, replay: None, kept_cooks: None, trace: None, accelerator: None, preview: None };
         let result = import_path(file, &ImportOptions::default(), &mut hooks).map_err(|e| e.to_string()).and_then(|i| check(&i.project));
         if let Err(e) = result {
             failures.push(format!("{}: {e}", file.display()));
@@ -66,6 +66,6 @@ fn a_cancelled_import_stops() {
     let Some(file) = files.first() else { return };
     let cancel = Cancel::new();
     cancel.cancel();
-    let mut hooks = Hooks { progress: &|_, _| {}, cancel: &cancel, replay: None, kept_cooks: None, trace: None, accelerator: None };
+    let mut hooks = Hooks { progress: &|_, _| {}, cancel: &cancel, replay: None, kept_cooks: None, trace: None, accelerator: None, preview: None };
     assert!(matches!(import_path(file, &ImportOptions::default(), &mut hooks), Err(texturecraft_import::ImportError::Cancelled)));
 }

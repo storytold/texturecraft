@@ -125,7 +125,7 @@ fn saved(c: &OrbitCamera, name: String) -> Camera {
 }
 
 /// Move the view to saved camera `c` (values from project files are checked and clamped).
-fn apply(view: &mut OrbitCamera, c: &Camera) {
+pub(crate) fn apply(view: &mut OrbitCamera, c: &Camera) {
     let target = Vec3::from(c.target);
     if target.is_finite() {
         view.target = target;

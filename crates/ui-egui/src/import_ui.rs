@@ -6,11 +6,14 @@
 //! texture set resize; its result opens through [`Session::apply_import`](texturecraft_engine::Session::apply_import).
 //! Called through the control channel or MCP, the command runs on its own and opens no window.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 
 use egui::RichText;
-use texturecraft_engine::import_cmds::{ImportOutput, ImportProgress, ImportTask, Step};
+use texturecraft_engine::geom::OrbitCamera;
+use texturecraft_engine::import_cmds::{ImportOutput, ImportPreview, ImportProgress, ImportTask, Step};
+use texturecraft_render::{Frame, Shade, ViewKind};
 
 use crate::TextureCraftApp;
 use crate::i18n::{tr, trf};
@@ -18,6 +21,7 @@ use crate::widgets::primary_button;
 
 /// Where failed imports are reported.
 pub const ISSUES_URL: &str = "https://github.com/storytold/texturecraft/issues";
+pub(crate) const VIEW_PREVIEW: u64 = 3;
 
 /// The import windows' state.
 pub enum ImportUi {
@@ -27,6 +31,17 @@ pub enum ImportUi {
     Running { file: String, path: Option<String>, progress: Arc<ImportProgress>, rx: Receiver<texturecraft_engine::Result<ImportOutput>>, started: f64 },
     /// Window 2's error view: the step that failed and the error.
     Failed { file: String, step: Step, error: String },
+}
+
+pub(crate) struct Presentation {
+    origin_project: u64,
+    preview: Option<PreviewView>,
+}
+
+struct PreviewView {
+    source: ImportPreview,
+    camera: OrbitCamera,
+    lost: Arc<AtomicBool>,
 }
 
 /// Opens the notice for `task` (nothing runs until it is acknowledged). An import already showing keeps its window.
@@ -73,9 +88,36 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let Some(state) = app.import.take() else { return };
     app.import = match state {
         ImportUi::Notice { task } => notice(app, ctx, task),
-        ImportUi::Running { file, path, progress, rx, started } => running(app, ctx, file, path, progress, rx, started),
+        ImportUi::Running { .. } => running(app, ctx, state, None),
         ImportUi::Failed { file, step, error } => failed(ctx, file, step, error),
     };
+}
+
+/// Switches to a read-only viewport once the worker supplies saved textures. The current
+/// project remains in its own session until the worker finishes the editable project.
+pub(crate) fn show_preview(app: &mut TextureCraftApp, ui: &mut egui::Ui) -> bool {
+    let Some(ImportUi::Running { progress, .. }) = app.import.as_ref() else { return false };
+    let Some(presentation) = app.import_presentation.as_mut() else { return false };
+    if presentation.preview.is_none()
+        && let Some(source) = progress.take_preview()
+    {
+        let camera = source.camera;
+        presentation.preview = Some(PreviewView { source, camera, lost: Arc::new(AtomicBool::new(true)) });
+    }
+    if presentation.preview.is_none() {
+        return false;
+    }
+    if !app.ui.hide_ui {
+        crate::titlebar::show(app, ui);
+    }
+    let Some(import) = app.import.take() else { return false };
+    let ctx = ui.ctx().clone();
+    app.import = running(app, &ctx, import, Some(ui));
+    true
+}
+
+pub(crate) fn preview_active(app: &TextureCraftApp) -> bool {
+    app.import_presentation.as_ref().is_some_and(|presentation| presentation.preview.is_some())
 }
 
 /// A centered modal window titled `title`: the project behind it takes no input while it shows (an edit made during
@@ -134,7 +176,15 @@ fn notice(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> O
 /// Convert and prepare CPU-only materials on the worker. The viewport schedules GPU materials as it opens.
 fn start(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> ImportUi {
     let (file, path) = (task.file_name(), task.source_path().map(str::to_string));
-    let progress = Arc::new(ImportProgress::with_live_log(&file));
+    let progress = ImportProgress::with_live_log(&file);
+    #[cfg(not(target_arch = "wasm32"))]
+    let progress = if app.gpu.is_some() {
+        let repaint = ctx.clone();
+        progress.with_preview(move || repaint.request_repaint())
+    } else {
+        progress
+    };
+    let progress = Arc::new(progress);
     let worker = progress.clone();
     let prefer_gpu = app.ui.prefs.gpu_compositing && app.gpu.as_ref().is_some_and(crate::gpu::GpuLink::supports_gpu_layers);
     let task = task.with_graph_accelerator(app.material_graph_accelerator());
@@ -156,6 +206,7 @@ fn start(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> Im
         })
     });
     let started = ctx.input(|i| i.time);
+    app.import_presentation = Some(Presentation { origin_project: app.session.project_id, preview: None });
     app.session.log.push(format!("Import {file}: started"));
     ImportUi::Running { file, path, progress, rx, started }
 }
@@ -191,32 +242,36 @@ pub fn status(app: &TextureCraftApp, now: f64) -> serde_json::Value {
             "fraction": progress.fraction(),
             "elapsed": now - started,
             "cancelled": progress.is_cancelled(),
+            "preview": preview_active(app),
             "log": progress.log_lines(),
         }),
         Some(ImportUi::Failed { file, step, error }) => json!({ "window": "failed", "file": file, "step": step.id(), "error": error }),
     }
 }
 
-fn running(
-    app: &mut TextureCraftApp,
-    ctx: &egui::Context,
-    file: String,
-    path: Option<String>,
-    progress: Arc<ImportProgress>,
-    rx: Receiver<texturecraft_engine::Result<ImportOutput>>,
-    started: f64,
-) -> Option<ImportUi> {
+fn running(app: &mut TextureCraftApp, ctx: &egui::Context, state: ImportUi, preview_ui: Option<&mut egui::Ui>) -> Option<ImportUi> {
+    let ImportUi::Running { file, path, progress, rx, started } = state else { return Some(state) };
     let now = ctx.input(|i| i.time);
+    if app.import_presentation.as_ref().is_some_and(|presentation| presentation.origin_project != app.session.project_id) {
+        progress.cancel();
+        finish_preview(app, ctx);
+        return None;
+    }
     match rx.try_recv() {
         Err(TryRecvError::Empty) => {}
         Ok(_) if progress.is_cancelled() => {
+            finish_preview(app, ctx);
             app.session.log.push(format!("Import {file}: cancelled after {}", clock(now - started)));
             return None;
         }
         Ok(Ok(out)) => {
+            let camera = finish_preview(app, ctx);
             return match app.session.apply_import(out) {
                 Ok(_) => {
                     app.clear_project_jobs();
+                    if let Some(camera) = camera {
+                        app.session.camera = camera;
+                    }
                     app.session.log.push(format!("Import {file}: finished in {}", clock(now - started)));
                     app.ui.mode = crate::state::Mode::Painting;
                     None
@@ -224,35 +279,135 @@ fn running(
                 Err(e) => Some(fail(app, file, path.as_deref(), Step::Saving, &e.to_string())),
             };
         }
-        Ok(Err(e)) => return Some(fail(app, file, path.as_deref(), progress.step(), &e.to_string())),
-        Err(TryRecvError::Disconnected) => return Some(fail(app, file, path.as_deref(), progress.step(), "the import worker stopped")),
+        Ok(Err(e)) => {
+            finish_preview(app, ctx);
+            return Some(fail(app, file, path.as_deref(), progress.step(), &e.to_string()));
+        }
+        Err(TryRecvError::Disconnected) => {
+            finish_preview(app, ctx);
+            return Some(fail(app, file, path.as_deref(), progress.step(), "the import worker stopped"));
+        }
     }
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
     let stopping = progress.is_cancelled();
     let mut cancel = false;
-    modal(ctx, "import-progress", &trf("Converting {name}", &[("name", &file)]), |ui| {
+    let title = trf("Converting {name}", &[("name", &file)]);
+    let show_overview = preview_ui.is_some();
+    let mut show_progress = |ui: &mut egui::Ui| {
         let text = if stopping { tr("Stopping...").to_string() } else { step_label(progress.step()) };
         ui.add(egui::ProgressBar::new(progress.fraction()).desired_width(WIDTH).show_percentage());
         ui.label(text);
         ui.label(RichText::new(trf("Elapsed: {time}", &[("time", &clock(now - started))])).weak());
         ui.add_space(8.0);
-        ui.label(tr("Import log"));
-        egui::ScrollArea::vertical().id_salt("import_live_log").max_height(144.0).auto_shrink([false; 2]).stick_to_bottom(true).show(ui, |ui| {
-            for line in progress.log_lines() {
-                ui.add(egui::Label::new(RichText::new(line).monospace().size(11.0)).wrap());
-            }
-        });
+        if show_overview {
+            egui::CollapsingHeader::new(tr("Import log")).show(ui, |ui| show_log(ui, &progress));
+        } else {
+            ui.label(tr("Import log"));
+            show_log(ui, &progress);
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 cancel = ui.add_enabled(!stopping, egui::Button::new(tr("Cancel"))).clicked();
             });
         });
-    });
+    };
+    if let Some(ui) = preview_ui {
+        egui::Panel::top("import_preview_progress").show(ui, |ui| {
+            ui.heading(&title);
+            ui.label(tr("Stored material preview. Editing is available after conversion."));
+            show_progress(ui);
+        });
+        egui::CentralPanel::default().show(ui, |ui| {
+            if let Some(preview) = app.import_presentation.as_mut().and_then(|presentation| presentation.preview.as_mut()) {
+                preview.show(ui, app.ui.prefs.background);
+            }
+        });
+        cancel |= ctx.input(|input| input.key_pressed(egui::Key::Escape));
+    } else {
+        modal(ctx, "import-progress", &title, show_progress);
+    }
     if cancel {
         progress.cancel();
     }
     Some(ImportUi::Running { file, path, progress, rx, started })
+}
+
+fn show_log(ui: &mut egui::Ui, progress: &ImportProgress) {
+    egui::ScrollArea::vertical().id_salt("import_live_log").max_height(144.0).auto_shrink([false; 2]).stick_to_bottom(true).show(ui, |ui| {
+        for line in progress.log_lines() {
+            ui.add(egui::Label::new(RichText::new(line).monospace().size(11.0)).wrap());
+        }
+    });
+}
+
+fn finish_preview(app: &mut TextureCraftApp, ctx: &egui::Context) -> Option<OrbitCamera> {
+    let view = app.import_presentation.take()?.preview?;
+    if let Some(render_state) = &app.render_state
+        && let Some(gpu) = render_state.renderer.write().callback_resources.get_mut::<crate::gpu::GpuState>()
+    {
+        gpu.renderer.drop_view(VIEW_PREVIEW);
+    }
+    if let Some(gpu) = &app.gpu {
+        // The saved preview occupied the renderer's scene without changing the editable session.
+        gpu.lost.store(true, Ordering::Release);
+    }
+    ctx.request_repaint();
+    (view.camera != view.source.camera).then_some(view.camera)
+}
+
+impl PreviewView {
+    fn show(&mut self, ui: &mut egui::Ui, background: [[f32; 3]; 2]) {
+        use egui::{Key, PointerButton};
+
+        let rect = ui.available_rect_before_wrap();
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, tr("Stored material preview")));
+        if response.clicked() || response.drag_started() {
+            response.request_focus();
+        }
+        if response.dragged_by(PointerButton::Primary) {
+            let delta = response.drag_delta() * 0.006;
+            self.camera.orbit(delta.x, delta.y);
+        }
+        if response.dragged_by(PointerButton::Middle) {
+            let delta = response.drag_delta() / rect.height().max(1.0);
+            self.camera.pan(delta.x, delta.y);
+        }
+        if response.hovered() {
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+            self.camera.zoom(scroll * 0.002);
+        }
+        if response.has_focus() {
+            ui.input(|input| {
+                let key = |k| f32::from(u8::from(input.key_pressed(k)));
+                self.camera.orbit(0.15 * (key(Key::ArrowRight) - key(Key::ArrowLeft)), 0.15 * (key(Key::ArrowUp) - key(Key::ArrowDown)));
+                self.camera.zoom(0.15 * (key(Key::Plus) - key(Key::Minus)));
+            });
+        }
+
+        let pixels = ui.ctx().pixels_per_point();
+        let size = [(rect.width() * pixels).round().max(1.0) as u32, (rect.height() * pixels).round().max(1.0) as u32];
+        let frame = Frame {
+            view_id: VIEW_PREVIEW,
+            size,
+            kind: ViewKind::Scene,
+            camera: self.camera,
+            shade: Shade {
+                background,
+                normal_y: if self.source.normal_format == texturecraft_engine::core::NormalFormat::DirectX { -1.0 } else { 1.0 },
+                ..Shade::default()
+            },
+            visible: vec![true],
+            overlay: Vec::new(),
+        };
+        let upload = self.lost.swap(false, Ordering::AcqRel).then(|| crate::gpu::SceneSync::import_preview(&self.source));
+        let callback = crate::gpu::ViewCallback { frame, sync: Mutex::new(upload), rect, lost: self.lost.clone() };
+        ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, callback));
+        if response.has_focus() {
+            ui.painter().rect_stroke(rect.shrink(1.0), 0.0, ui.visuals().selection.stroke, egui::StrokeKind::Inside);
+        }
+    }
 }
 
 /// The error view: the error with the file's folder left out (the details name the file only).

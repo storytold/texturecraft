@@ -9,9 +9,20 @@ use texturecraft_texel::TILE;
 use crate::Session;
 
 /// Packed display maps, sampled across the entire atlas before full-size tiles arrive.
+#[derive(Clone)]
 pub struct MaterialOverview {
     pub size: (u32, u32),
     pub maps: Vec<(DisplayKind, Vec<u8>)>,
+}
+
+impl MaterialOverview {
+    /// Saved material channels have already been evaluated by the source application.
+    pub(crate) fn from_stored(composite: &Composite) -> Self {
+        let size = (composite.resolution, composite.height);
+        let channels: Vec<_> = composite.channels.keys().copied().collect();
+        let maps = pack_overview(composite, &BakedMaps::default(), &channels, &all_tiles(size.0, size.1));
+        Self { size, maps }
+    }
 }
 
 impl Session {

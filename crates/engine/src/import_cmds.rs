@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use texturecraft_compose::graphs::{CookTrace, GraphAccelerator};
 use texturecraft_formats::ProjectFile;
+use texturecraft_import::import::StoredPreview;
 use texturecraft_import::{Cancel, Hooks, ImportOptions, Imported};
 /// The project file extension the import reads, and the import's steps.
 pub use texturecraft_import::{PROJECT_EXT, Step};
@@ -146,6 +147,22 @@ pub struct ImportProgress {
     pub cancel: Cancel,
     listener: Option<Box<dyn Fn(f32, Step) + Send + Sync>>,
     live_log: Option<Arc<LiveLog>>,
+    preview: Option<PreviewProgress>,
+}
+
+struct PreviewProgress {
+    pending: Mutex<Option<ImportPreview>>,
+    wake: Box<dyn Fn() + Send + Sync>,
+}
+
+/// The original saved view in renderer upload formats, independent of the editable project.
+pub struct ImportPreview {
+    pub mesh: Arc<texturecraft_geom::Mesh>,
+    pub mesh_id: u64,
+    pub material: usize,
+    pub camera: texturecraft_geom::OrbitCamera,
+    pub normal_format: texturecraft_core::NormalFormat,
+    pub overview: crate::MaterialOverview,
 }
 
 impl Default for ImportProgress {
@@ -156,7 +173,7 @@ impl Default for ImportProgress {
 
 impl ImportProgress {
     pub fn new() -> ImportProgress {
-        ImportProgress { state: Mutex::new((0.0, Step::ReadingFile)), cancel: Cancel::new(), listener: None, live_log: None }
+        ImportProgress { state: Mutex::new((0.0, Step::ReadingFile)), cancel: Cancel::new(), listener: None, live_log: None, preview: None }
     }
 
     /// Progress that also calls `listener` on every report (fraction, step), on the thread running the import.
@@ -167,6 +184,42 @@ impl ImportProgress {
     /// Keep a live diagnostic history for this import, with timestamped entries in the desktop performance log.
     pub fn with_live_log(file: &str) -> ImportProgress {
         ImportProgress { live_log: Some(Arc::new(LiveLog::new(file))), ..ImportProgress::new() }
+    }
+
+    /// The desktop viewport can draw a stored material while the worker imports edit data.
+    pub fn with_preview(mut self, wake: impl Fn() + Send + Sync + 'static) -> Self {
+        self.preview = Some(PreviewProgress { pending: Mutex::default(), wake: Box::new(wake) });
+        self
+    }
+
+    pub fn take_preview(&self) -> Option<ImportPreview> {
+        self.preview.as_ref()?.pending.lock().ok()?.take()
+    }
+
+    fn publish_preview(&self, preview: StoredPreview) {
+        let Some(progress) = self.preview.as_ref() else { return };
+        let mut camera = texturecraft_geom::OrbitCamera::default();
+        let (lo, hi) = preview.mesh.bounds();
+        camera.frame(lo, hi);
+        if let Some(saved) = &preview.camera {
+            crate::camera_cmds::apply(&mut camera, saved);
+        }
+        let overview = crate::MaterialOverview::from_stored(&preview.composite);
+        if let Ok(mut out) = progress.pending.lock()
+            && !self.is_cancelled()
+        {
+            *out = Some(ImportPreview {
+                mesh: Arc::new(preview.mesh),
+                mesh_id: crate::session::next_mesh_id(),
+                material: preview.material,
+                camera,
+                normal_format: preview.normal_format,
+                overview,
+            });
+            self.log_detail("Stored material preview prepared");
+            drop(out);
+            (progress.wake)();
+        }
     }
 
     /// The latest diagnostic lines, in the order they appeared.
@@ -445,8 +498,11 @@ fn run_kept(
     progress.check()?;
     let (converting, saved) = if view.is_some() { (CONVERTING_WITH_VIEW, VIEW) } else { (CONVERTING, 1.0) };
     let report = |f: f32, step: Step| progress.report(f * converting, step);
+    let publish = |preview| progress.publish_preview(preview);
+    let preview = progress.preview.as_ref().map(|_| &publish as &(dyn Fn(StoredPreview) + Sync));
     let replayer = crate::import_replay::CancellableReplayer::new(progress.cancel.clone());
-    let mut hooks = Hooks { progress: &report, cancel: &progress.cancel, replay: Some(&replayer), kept_cooks: kept, trace: progress.cook_trace(), accelerator };
+    let mut hooks =
+        Hooks { progress: &report, cancel: &progress.cancel, replay: Some(&replayer), kept_cooks: kept, trace: progress.cook_trace(), accelerator, preview };
     let imported = convert(&mut hooks).map_err(|(e, path)| match (e, path) {
         (texturecraft_import::ImportError::Cancelled, _) => bad(ID, CANCELLED),
         (e, Some(path)) => bad(ID, format!("{path}: {e}")),
