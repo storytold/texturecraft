@@ -143,6 +143,7 @@ pub struct Hooks<'h> {
     pub kept_cooks: Option<std::sync::Arc<dyn texturecraft_compose::graphs::KeptCooks>>,
     /// Live diagnostics from graph evaluation, scoped to this import.
     pub trace: Option<texturecraft_compose::graphs::CookTrace>,
+    pub accelerator: Option<std::sync::Arc<dyn texturecraft_compose::graphs::GraphAccelerator>>,
 }
 
 impl Hooks<'_> {
@@ -264,6 +265,7 @@ pub fn import(file: &ProjectFile, file_name: &str, options: &ImportOptions, hook
     };
     imported.graphs.keep_cooks_in(hooks.kept_cooks.clone());
     imported.graphs.trace_cooks(hooks.trace.clone());
+    imported.graphs.set_accelerator(hooks.accelerator.clone());
     for source in &binding.sets {
         mesh::merge_slots(&mut mesh, source.slot, &source.merged_slots);
         for m in &source.merged_slots {

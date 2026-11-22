@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 use texturecraft_compose::{ImageRes, ImageStore, TileLayout, prepare_tile_layout};
 use texturecraft_core::{TileBlending, TileGenerator, TileShape};
+use texturecraft_texel::{TILE, TileImage};
 
 pub(crate) const TILE_GENERATOR_OPCODE: u32 = 80;
 const NO_IMAGE: u32 = u32::MAX;
@@ -175,6 +176,7 @@ enum RgbaEncoding {
     Bytes = 1,
     Shorts = 2,
     Floats = 4,
+    Gray16 = 5,
 }
 
 impl RgbaEncoding {
@@ -192,6 +194,10 @@ impl RgbaEncoding {
         }
     }
 
+    fn planes(self) -> usize {
+        if matches!(self, Self::Gray16) { 1 } else { self as usize }
+    }
+
     fn word(self, [r, g, b, a]: [f32; 4], lane: usize) -> u32 {
         match self {
             Self::Bytes => {
@@ -204,6 +210,7 @@ impl RgbaEncoding {
                 short(low) | (short(high) << 16)
             }
             Self::Floats => [r, g, b, a][lane].to_bits(),
+            Self::Gray16 => (r * 65535.0).round() as u32,
         }
     }
 }
@@ -213,22 +220,124 @@ struct RgbaRegion {
     planes: Vec<ImageRegion>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ColorImage<'a> {
+    Authored(&'a Arc<ImageRes>),
+    Cooked { key: &'a Arc<str>, name: &'a str, image: &'a TileImage, srgb: bool },
+}
+
+impl ColorImage<'_> {
+    fn size(self) -> [u32; 2] {
+        match self {
+            Self::Authored(image) => [image.width, image.height],
+            Self::Cooked { image, .. } => [image.width(), image.height()],
+        }
+        .map(|side| side.max(1))
+    }
+
+    pub(crate) fn srgb(self) -> bool {
+        match self {
+            Self::Authored(image) => image.srgb,
+            Self::Cooked { srgb, .. } => srgb,
+        }
+    }
+
+    fn encoding(self) -> RgbaEncoding {
+        match self {
+            Self::Authored(image) => RgbaEncoding::for_image(image),
+            Self::Cooked { image, .. } if image.comps() == 1 => RgbaEncoding::Gray16,
+            Self::Cooked { .. } => RgbaEncoding::Shorts,
+        }
+    }
+
+    fn pack_rows(self, encoding: RgbaEncoding, lane: usize, top: u32, rows: u32, width: u32, words: &mut Vec<u32>) {
+        let width = width as usize;
+        match self {
+            Self::Authored(image) => {
+                let first = top as usize * width;
+                let end = first + rows as usize * width;
+                words.extend((first..end).map(|index| encoding.word(image.rgba.get(index).copied().unwrap_or_default(), lane)));
+            }
+            Self::Cooked { image, .. } => {
+                let side = TILE as usize;
+                let components = image.comps();
+                words.resize(rows as usize * width, 0);
+                // A graph has 64×64 stored tiles. Read each tile once per band and
+                // write directly to the upload rows, without expanding the image to floats.
+                for (tx, left) in (0..width).step_by(side).enumerate() {
+                    for (ty, output_top) in (top..top + rows).step_by(side).enumerate() {
+                        let Some(tile) = image.tile(tx as u32, top / TILE + ty as u32) else { continue };
+                        let row_count = (top + rows - output_top).min(TILE) as usize;
+                        let row_width = side.min(width - left);
+                        for r in 0..row_count {
+                            let local = ((output_top % TILE) as usize + r) * side * components;
+                            let at = ((output_top - top) as usize + r) * width + left;
+                            let Some(source) = tile.get(local..local + row_width * components) else { continue };
+                            let destination = &mut words[at..at + row_width];
+                            if components == 1 {
+                                destination.iter_mut().zip(source).for_each(|(dst, val)| *dst = u32::from(*val));
+                            } else {
+                                let offset = lane * 2;
+                                destination.iter_mut().zip(source.chunks_exact(components)).for_each(|(dst, texel)| {
+                                    let low = u32::from(texel.get(offset).copied().unwrap_or(0));
+                                    let high = u32::from(texel.get(offset + 1).copied().unwrap_or(0));
+                                    *dst = low | (high << 16);
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum AtlasIdentity {
+    Authored(Weak<ImageRes>),
+    Cooked(Arc<str>, String),
+}
+
+impl AtlasIdentity {
+    fn of(image: ColorImage<'_>) -> Self {
+        match image {
+            ColorImage::Authored(image) => Self::Authored(Arc::downgrade(image)),
+            ColorImage::Cooked { key, name, .. } => Self::Cooked(key.clone(), name.to_owned()),
+        }
+    }
+
+    fn matches(&self, image: ColorImage<'_>) -> bool {
+        match (self, image) {
+            (Self::Authored(old), ColorImage::Authored(new)) => old.ptr_eq(&Arc::downgrade(new)),
+            (Self::Cooked(k, n), ColorImage::Cooked { key, name, .. }) => k == key && n == name,
+            _ => false,
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        match self {
+            Self::Authored(image) => image.strong_count() != 0,
+            // A cooked image can be evicted from host memory while its atlas is still useful.
+            Self::Cooked(..) => true,
+        }
+    }
+}
+
 pub(crate) struct TileImageAtlas {
-    images: Vec<Weak<ImageRes>>,
+    images: Vec<AtlasIdentity>,
     regions: Vec<ImageRegion>,
     color: Vec<RgbaRegion>,
     pub(crate) view: wgpu::TextureView,
 }
 
 impl TileImageAtlas {
-    pub(crate) fn matches(&self, gray: &[&Arc<ImageRes>], color: &[&Arc<ImageRes>]) -> bool {
+    pub(crate) fn matches(&self, gray: &[&Arc<ImageRes>], color: &[ColorImage<'_>]) -> bool {
         self.regions.len() == gray.len()
             && self.color.len() == color.len()
-            && self.images.iter().zip(gray.iter().chain(color)).all(|(old, new)| old.ptr_eq(&Arc::downgrade(new)))
+            && self.images.iter().zip(gray.iter().map(|&image| ColorImage::Authored(image)).chain(color.iter().copied())).all(|(old, new)| old.matches(new))
     }
 
     pub(crate) fn is_live(&self) -> bool {
-        self.images.iter().all(|image| image.strong_count() != 0)
+        self.images.iter().all(AtlasIdentity::is_live)
     }
 
     pub(crate) fn empty_view(device: &wgpu::Device) -> wgpu::TextureView {
@@ -247,14 +356,13 @@ impl TileImageAtlas {
         offset
     }
 
-    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, gray: &[&Arc<ImageRes>], color: &[&Arc<ImageRes>]) -> Result<Self, String> {
+    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, gray: &[&Arc<ImageRes>], color: &[ColorImage<'_>]) -> Result<Self, String> {
         let limits = device.limits();
-        let encodings: Vec<_> = color.iter().map(|image| RgbaEncoding::for_image(image)).collect();
-        let size = |image: &Arc<ImageRes>| [image.width.max(1), image.height.max(1)];
+        let encodings: Vec<_> = color.iter().copied().map(ColorImage::encoding).collect();
         let sizes: Vec<_> = gray
             .iter()
-            .map(|image| size(image))
-            .chain(color.iter().zip(&encodings).flat_map(|(image, &encoding)| std::iter::repeat_n(size(image), encoding as usize)))
+            .map(|&image| ColorImage::Authored(image).size())
+            .chain(color.iter().zip(&encodings).flat_map(|(&image, &encoding)| std::iter::repeat_n(image.size(), encoding.planes())))
             .collect();
         let budget = if color.is_empty() { MAX_ATLAS_BYTES } else { MAX_COLOR_ATLAS_BYTES };
         let (extent, regions) =
@@ -262,20 +370,13 @@ impl TileImageAtlas {
         let texture = atlas_texture(device, extent[0], extent[1], extent[2]);
         let mut pixels = Vec::new();
         let mut pending = 0;
-        let mut upload = |image: &ImageRes, region: &ImageRegion, encoding: Option<(RgbaEncoding, usize)>| -> Result<(), String> {
+        type PackRows<'a> = &'a mut dyn FnMut(u32, u32, u32, &mut Vec<u32>);
+        let mut upload = |region: &ImageRegion, pack: PackRows<'_>| -> Result<(), String> {
             let [width, height] = region.size;
             for top in (0..height).step_by(IMAGE_ROWS) {
                 let rows = (height - top).min(IMAGE_ROWS as u32);
-                let first = top as usize * width as usize;
-                let n = rows as usize * width as usize;
                 pixels.clear();
-                pixels.extend((first..first + n).map(|index| {
-                    let sample = image.rgba.get(index).copied().unwrap_or_default();
-                    match encoding {
-                        Some((encoding, lane)) => encoding.word(sample, lane),
-                        None => ((sample[0] + sample[1] + sample[2]) / 3.0).to_bits(),
-                    }
-                }));
+                pack(top, rows, width, &mut pixels);
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         origin: wgpu::Origin3d { x: region.origin[0], y: region.origin[1] + top, z: region.origin[2] },
@@ -296,19 +397,31 @@ impl TileImageAtlas {
         };
         let (gray_regions, mut color_regions) = regions.split_at(gray.len());
         for (image, region) in gray.iter().zip(gray_regions) {
-            upload(image, region, None)?;
+            upload(region, &mut |top, rows, width, words| {
+                let first = top as usize * width as usize;
+                let end = first + rows as usize * width as usize;
+                words.extend((first..end).map(|index| {
+                    let [r, g, b, _] = image.rgba.get(index).copied().unwrap_or_default();
+                    ((r + g + b) / 3.0).to_bits()
+                }));
+            })?;
         }
         let mut color_layout = Vec::new();
-        for (image, encoding) in color.iter().zip(encodings) {
-            let (planes, remaining) = color_regions.split_at(encoding as usize);
+        for (&image, encoding) in color.iter().zip(encodings) {
+            let (planes, remaining) = color_regions.split_at(encoding.planes());
             color_regions = remaining;
             for (lane, plane) in planes.iter().enumerate() {
-                upload(image, plane, Some((encoding, lane)))?;
+                upload(plane, &mut |top, rows, width, words| image.pack_rows(encoding, lane, top, rows, width, words))?;
             }
             color_layout.push(RgbaRegion { encoding, planes: planes.to_vec() });
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
-        Ok(Self { images: gray.iter().chain(color).map(|image| Arc::downgrade(image)).collect(), regions: gray_regions.to_vec(), color: color_layout, view })
+        Ok(Self {
+            images: gray.iter().map(|&image| ColorImage::Authored(image)).chain(color.iter().copied()).map(AtlasIdentity::of).collect(),
+            regions: gray_regions.to_vec(),
+            color: color_layout,
+            view,
+        })
     }
 }
 

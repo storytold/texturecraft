@@ -6,6 +6,7 @@
 //! profiler, memory counter) and to the node cache ([`graph::NodeCache::new`]). No evaluation state is process-wide.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+pub mod accelerator;
 pub mod atomic;
 pub mod checksum;
 pub mod compiled_ops;

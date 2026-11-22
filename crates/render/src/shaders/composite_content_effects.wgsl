@@ -18,6 +18,10 @@ fn content_over(content: vec4<f32>, source: vec4<f32>, effect: Operation, channe
 }
 
 fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
+    return layer_content_from(layer, texel, count, vec4(0.0), false);
+}
+
+fn layer_content_from(layer: Operation, texel: LayerTexel, count: u32, previous: vec4<f32>, passthrough: bool) -> vec4<f32> {
     let start = params.program.x + layer.effects.z;
     var skip = 0u;
     if enable_spatial_fields && layer.spatial.y != 0u {
@@ -35,6 +39,19 @@ fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
         content = vec4(color, coverage);
     } else {
         content = base_content(layer, texel);
+        if passthrough {
+            if measured_blend {
+                let empty = empty_channel(layer.ids.x);
+                var straight = empty;
+                if previous.a > 0.0 { straight = (previous.rgb - empty * (1.0 - previous.a)) / previous.a; }
+                var addition = layer;
+                addition.low.w = 1.0;
+                addition.balance.z = 0.0;
+                content = content_over(vec4(straight, previous.a), content, addition, layer.ids.x);
+            } else {
+                content = vec4(mix(previous.rgb, content.rgb, clamp(content.a, 0.0, 1.0)), 1.0);
+            }
+        }
     }
     if content.a <= 0.0 && layer.spatial.w == 0u {
         return vec4(0.0);
@@ -45,7 +62,10 @@ fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
             let paint = painted(effect, texel.pixel, texel.projected);
             content = content_over(content, paint, effect, layer.ids.x);
         } else if effect.ids.y < 20u || effect.ids.y >= 48u {
-            let fill = content_fill_value(effect, texel.uv, texel.surface);
+            var fill = content_fill_value(effect, texel.uv, texel.surface);
+            if effect.ids.y == IMAGE_SOURCE_OPCODE && effect.ids.w >= 8u && effect.procedural.x == 1u {
+                fill.a = content.a;
+            }
             content = content_over(content, fill, effect, layer.ids.x);
         } else if effect.ids.y != 39u {
             let filtered = effect_color(effect, content.rgb, layer.ids.x, texel.surface, texel.baked.x);

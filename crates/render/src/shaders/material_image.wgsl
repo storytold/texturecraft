@@ -15,6 +15,7 @@ fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>, repeat: v
     switch srgb[image + 2u] & 255u {
         case 1u: { return unpack4x8unorm(first); }
         case 2u: { return vec4(unpack2x16unorm(first), unpack2x16unorm(image_plane_at(planes + 3u, at))); }
+        case 5u: { return vec4(vec3(f32(first) / 65535.0), 1.0); }
         default: {
             return bitcast<vec4<f32>>(vec4(first, image_plane_at(planes + 3u, at), image_plane_at(planes + 6u, at), image_plane_at(planes + 9u, at)));
         }
@@ -53,7 +54,13 @@ fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> {
         case 1u: { return vec3(dot(rgb, vec3(0.3, 0.59, 0.11))); }
         case 2u: { return vec3(dot(rgb, vec3(0.3, 0.59, 0.11)) * 2.0 - 1.0); }
         case 4u: { return vec3(rgb.r, 1.0 - rgb.g, rgb.b); }
-        case 0u: {
+        case 9u: { return vec3(rgb.r); }
+        case 10u: { return vec3(rgb.r * 2.0 - 1.0); }
+        case 11u: {
+            let xy = vec2(rgb.r, 1.0 - rgb.g) * 2.0 - 1.0;
+            return vec3(rgb.r, 1.0 - rgb.g, 0.5 + 0.5 * sqrt(max(1.0 - dot(xy, xy), 0.0)));
+        }
+        case 0u, 8u: {
             if (srgb[layer.ids.z + 2u] & 256u) != 0u {
                 let encoded = clamp(rgb, vec3(0.0), vec3(1.0));
                 return select(pow((encoded + 0.055) / 1.055, vec3(2.4)), encoded / 12.92, encoded <= vec3(0.04045));
@@ -105,6 +112,83 @@ fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
         default: { point = transformed_uv(layer, uv); }
     }
     return material_image_at(image, point);
+}
+
+fn placed_image_coord(frame: u32, p: vec2<f32>) -> vec2<f32> {
+    let image_x = bitcast<vec2<f32>>(vec2(srgb[frame + 12u], srgb[frame + 13u]));
+    let image_y = bitcast<vec2<f32>>(vec2(srgb[frame + 14u], srgb[frame + 15u]));
+    let centered = p - bitcast<vec2<f32>>(vec2(srgb[frame + 16u], srgb[frame + 17u]));
+    return vec2(dot(centered, image_x), dot(centered, image_y)) + 0.5;
+}
+
+fn triplanar_sample(image: u32, frame: u32, p: vec3<f32>, n: vec3<f32>, weights: vec3<f32>) -> vec4<f32> {
+    let side = select(vec3(1.0), vec3(-1.0), n < vec3(0.0));
+    var result = vec4(0.0);
+    if weights.x > 0.0 { result += weights.x * material_image_at(image, placed_image_coord(frame, vec2(-p.z * side.x, -p.y))); }
+    if weights.y > 0.0 { result += weights.y * material_image_at(image, placed_image_coord(frame, vec2(p.x, p.z * side.y))); }
+    if weights.z > 0.0 { result += weights.z * material_image_at(image, placed_image_coord(frame, vec2(p.x * side.z, -p.y))); }
+    return result;
+}
+
+fn placed_volume_position(frame: u32, position: vec3<f32>) -> vec3<f32> {
+    return vec3(dot(decal_vector(frame), position), dot(decal_vector(frame + 4u), position), dot(decal_vector(frame + 8u), position))
+        + bitcast<vec3<f32>>(vec3(srgb[frame + 3u], srgb[frame + 7u], srgb[frame + 11u]));
+}
+
+fn authored_image_flat_warp(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> {
+    if !surface.valid { return vec4(0.0); }
+    let frame = u32(layer.uv.x);
+    let p = placed_volume_position(frame, surface.position);
+    if any(abs(p.xy) > vec2(0.5000005)) || (bitcast<f32>(srgb[frame + 19u]) != 0.0 && abs(p.z) > 0.5) {
+        return vec4(0.0);
+    }
+    let z = abs(2.0 * p.z);
+    let reach = bitcast<f32>(srgb[frame + 18u]);
+    if z > reach { return vec4(0.0); }
+    var coverage = 1.0;
+    if bitcast<f32>(srgb[frame + 20u]) != 0.0 {
+        let edge = bitcast<f32>(srgb[frame + 21u]) * reach;
+        if edge < reach { coverage = 1.0 - smoothstep(edge, reach, z); }
+        else { coverage = select(0.0, 1.0, z < edge); }
+    }
+    if coverage <= 0.0 { return vec4(0.0); }
+    let point = placed_image_coord(frame, clamp(vec2(p.x, -p.y), vec2(-0.5), vec2(0.5)));
+    let repeat = (vec2(layer.procedural.z) & vec2(1u, 2u)) != vec2(0u);
+    if !placed_uv_covered(point, repeat) { return vec4(0.0); }
+    if layer.ids.y != IMAGE_SOURCE_OPCODE { return vec4(layer.low.rgb, coverage); }
+    let sample = authored_image_placed(layer, point, repeat);
+    return vec4(sample.rgb, coverage * select(1.0, sample.a, with_alpha));
+}
+
+fn authored_image_triplanar(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> {
+    if !surface.valid { return vec4(0.0); }
+    let frame = u32(layer.uv.x);
+    let x = decal_vector(frame);
+    let y = decal_vector(frame + 4u);
+    let z = decal_vector(frame + 8u);
+    let p = placed_volume_position(frame, surface.position);
+    if bitcast<f32>(srgb[frame + 19u]) != 0.0 && any(abs(p) > vec3(0.5)) { return vec4(0.0); }
+    if layer.ids.y != IMAGE_SOURCE_OPCODE { return vec4(layer.low.rgb, 1.0); }
+    let image = layer.ids.z;
+    if image == MISSING_IMAGE { return vec4(vec3(0.5), 1.0); }
+    let n = vec3(dot(normalize(x), surface.normal), dot(normalize(y), surface.normal), dot(normalize(z), surface.normal));
+    let magnitude = abs(n);
+    let largest = max(max(magnitude.x, magnitude.y), magnitude.z);
+    let edge = bitcast<f32>(srgb[frame + 18u]);
+    var weights = vec3(0.0, 0.0, 1.0);
+    if largest > 1e-12 {
+        let share = magnitude / largest;
+        if edge >= 1.0 { weights = select(vec3(0.0), vec3(1.0), share >= vec3(1.0)); }
+        else { weights = smoothstep(vec3(edge), vec3(1.0), share); }
+        weights /= max(weights.x + weights.y + weights.z, 1e-12);
+    }
+    let sample = triplanar_sample(image, frame, p, n, weights);
+    var alpha = 1.0;
+    if with_alpha {
+        if layer.ids.w < 8u { alpha = sample.a; }
+        else if layer.procedural.y > 0u { alpha = triplanar_sample(layer.procedural.y - 1u, frame, p, n, weights).r; }
+    }
+    return vec4(decode_image_sample(layer, sample.rgb), clamp(alpha, 0.0, 1.0));
 }
 
 fn decal_vector(word: u32) -> vec3<f32> {
@@ -163,7 +247,16 @@ fn authored_image_content(layer: Operation, uv: vec2<f32>, surface: Surface) -> 
         return vec4(vec3(0.5), 1.0);
     }
     let sampled = image_projection(layer, uv, surface);
-    let alpha = select(0.0, clamp(sampled.a, 0.0, 1.0), abs(sampled.a) <= 3.402823466e38);
+    var alpha = sampled.a;
+    if layer.ids.w >= 8u {
+        alpha = select(1.0, sampled.a, layer.procedural.x == 2u);
+        if layer.procedural.y > 0u {
+            var matte = layer;
+            matte.ids.z = layer.procedural.y - 1u;
+            alpha = image_projection(matte, uv, surface).r;
+        }
+    }
+    alpha = select(0.0, clamp(alpha, 0.0, 1.0), abs(alpha) <= 3.402823466e38);
     return vec4(decode_image_sample(layer, sampled.rgb), alpha);
 }
 
@@ -172,7 +265,14 @@ fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>) ->
         return vec4(vec3(0.5), 1.0);
     }
     let sampled = material_image_at_with_repeat(layer.ids.z, uv, repeat);
-    let alpha = select(0.0, clamp(sampled.a, 0.0, 1.0), abs(sampled.a) <= 3.402823466e38);
+    var alpha = sampled.a;
+    if layer.ids.w >= 8u {
+        alpha = 1.0;
+        if layer.procedural.y > 0u {
+            alpha = material_image_at_with_repeat(layer.procedural.y - 1u, uv, repeat).r;
+        }
+    }
+    alpha = select(0.0, clamp(alpha, 0.0, 1.0), abs(alpha) <= 3.402823466e38);
     return vec4(decode_image_sample(layer, sampled.rgb), alpha);
 }
 
@@ -183,14 +283,18 @@ fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
         return vec4(0.0);
     }
     let alpha_image = srgb[frame + 11u];
+    var gain = decal.z;
+    if layer.ids.y == IMAGE_SOURCE_OPCODE && layer.ids.w >= 8u && layer.procedural.y > 0u {
+        gain *= clamp(material_image_at(layer.procedural.y - 1u, decal.xy).r, 0.0, 1.0);
+    }
     let sample_uv = select(decal.xy, uv, layer.ids.y == 15u);
     if alpha_image != MISSING_IMAGE {
         let sampled = material_image_at(alpha_image, decal.xy);
-        let coverage = decal.z * clamp(sampled.a, 0.0, 1.0);
+        let coverage = gain * clamp(sampled.a, 0.0, 1.0);
         if layer.ids.y == IMAGE_SOURCE_OPCODE && layer.ids.z == alpha_image {
             return vec4(decode_image_sample(layer, sampled.rgb), coverage);
         }
         return vec4(value(layer, sample_uv, surface), coverage);
     }
-    return vec4(value(layer, sample_uv, surface), decal.z);
+    return vec4(value(layer, sample_uv, surface), gain);
 }

@@ -164,6 +164,7 @@ pub struct EvalContext {
     pub logging: Logging,
     /// Measures named spans around nodes and stages; `None` measures nothing.
     pub profiler: Option<Arc<dyn crate::profile::Profiler>>,
+    pub accelerator: Option<Arc<dyn crate::accelerator::Accelerator>>,
     pub live: LiveBytes,
     /// The threads the evaluation's parallel loops run on; `None`: the pool the caller is in (rayon's global pool
     /// outside any). A host whose own parallel work waits on evaluations gives them a pool of their own, so that its
@@ -182,6 +183,7 @@ impl std::fmt::Debug for EvalContext {
             .field("cancel", &self.cancel)
             .field("logging", &self.logging)
             .field("profiler", &self.profiler.is_some())
+            .field("accelerator", &self.accelerator.is_some())
             .field("live", &self.live)
             .field("pool", &self.pool.as_ref().map(|p| p.current_num_threads()))
             .field("files", &"..")

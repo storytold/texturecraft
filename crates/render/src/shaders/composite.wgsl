@@ -62,6 +62,9 @@ const GEOMETRY_MASKS: u32 = 8u;
 const IMAGE_SOURCE_OPCODE: u32 = 14u;
 const DECAL_PROJECTION: u32 = 9u;
 const PLACED_UV_PROJECTION: u32 = 10u;
+const PLACED_TRIPLANAR_PROJECTION: u32 = 11u;
+const PLACED_FLAT_WARP_PROJECTION: u32 = 12u;
+const PASSTHROUGH_STACK: u32 = 0x80000000u;
 override enable_placed_uv: bool = false;
 const SPATIAL_FILTER_OPCODE: u32 = 36u;
 const COLOR_SELECTION_OPCODE: u32 = 38u;
@@ -198,6 +201,12 @@ fn placed_uv_value(layer: Operation, uv: vec2<f32>, with_alpha: bool) -> vec4<f3
 }
 
 fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    if enable_authored_images && layer.procedural.w == PLACED_FLAT_WARP_PROJECTION {
+        return authored_image_flat_warp(layer, surface, false);
+    }
+    if enable_authored_images && layer.procedural.w == PLACED_TRIPLANAR_PROJECTION {
+        return authored_image_triplanar(layer, surface, false);
+    }
     if enable_placed_uv && layer.procedural.w == PLACED_UV_PROJECTION {
         return placed_uv_value(layer, uv, false);
     }
@@ -208,10 +217,16 @@ fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
 }
 
 fn content_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    if enable_authored_images && layer.procedural.w == PLACED_FLAT_WARP_PROJECTION {
+        return authored_image_flat_warp(layer, surface, true);
+    }
+    if enable_authored_images && layer.procedural.w == PLACED_TRIPLANAR_PROJECTION {
+        return authored_image_triplanar(layer, surface, measured_blend || layer.ids.w >= 8u);
+    }
     if enable_placed_uv && layer.procedural.w == PLACED_UV_PROJECTION {
         return placed_uv_value(layer, uv, true);
     }
-    if measured_blend && enable_authored_images && layer.ids.y == IMAGE_SOURCE_OPCODE && layer.procedural.w != DECAL_PROJECTION {
+    if enable_authored_images && layer.ids.y == IMAGE_SOURCE_OPCODE && (measured_blend || layer.ids.w >= 8u) && layer.procedural.w != DECAL_PROJECTION {
         return authored_image_content(layer, uv, surface);
     }
     return fill_value(layer, uv, surface);
@@ -800,12 +815,23 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
             weight *= mask_value;
         }
         if weight <= 0.0 { continue; }
-        let content = layer_content(layer, texel, layer.effects.w);
         let destination = layer.ids.x;
+        let passthrough = (layer.constraints.y & PASSTHROUGH_STACK) != 0u;
+        var before = vec3(0.0);
+        if measured_blend || passthrough {
+            before = material_value(MaterialValues(base, normal, scalars, lobe_colors, lobe_values, coverage), destination);
+        }
+        let previous = vec4(before, select(1.0, coverage[destination], measured_blend));
+        let content = layer_content_from(layer, texel, layer.effects.w, previous, passthrough);
         if measured_blend {
-            if content.a <= 0.0 { continue; }
-            let before = material_value(MaterialValues(base, normal, scalars, lobe_colors, lobe_values, coverage), destination);
-            let after = measured_over(mode, vec4(before, coverage[destination]), content, weight, destination);
+            if content.a <= 0.0 && !passthrough { continue; }
+            var after: vec4<f32>;
+            if passthrough {
+                let shown = content.rgb * content.a + empty_channel(destination) * (1.0 - content.a);
+                after = measured_over(2u, previous, vec4(shown, content.a), weight, destination);
+            } else {
+                after = measured_over(mode, previous, content, weight, destination);
+            }
             coverage[destination] = after.a;
             if destination == 0u {
                 base = after.rgb;

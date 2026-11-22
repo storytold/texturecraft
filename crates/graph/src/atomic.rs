@@ -178,7 +178,7 @@ pub fn compute(kind: &str, id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, c
                 }
             }
             crate::patterns::render(program, ctx, f("seed", 0.0) as u32, &images, ins.get("bg").map(|t| t.as_ref()), pattern_frame(n))
-                .map_err(|e| Error::BadParam(id, e))?
+                .map_err(|e| if crate::context::cancelled() { Error::Cancelled } else { Error::BadParam(id, e) })?
         }
         other => return crate::compiled_ops::compute(other, id, n, ins, ctx.size),
     }))

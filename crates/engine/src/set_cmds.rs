@@ -5,12 +5,13 @@ use texturecraft_core::{Channel, ChannelBlend, ChannelFormat};
 
 use std::sync::Arc;
 
+use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, Inputs};
 use texturecraft_geom::{Bvh, Mesh};
 
 use crate::commands::{CommandSpec, always, bad, boolp, channel_param, f32p, normal_format_param, strp, u64p};
 use crate::session::{Document, SetCache, StackTarget, check_resolution};
 use crate::stroke_replay::ReplayScene;
-use crate::{Result, Session, cmd};
+use crate::{ResizeProgress, Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -126,10 +127,13 @@ pub struct ResizeTask {
     resolution: u32,
     doc: Document,
     mesh: Arc<Mesh>,
+    source: Arc<Mesh>,
     bvh: Arc<Bvh>,
+    images: ImageStore,
+    solo: Option<crate::Solo>,
     lookup_budget: usize,
-    /// The session's revision and mesh when the task was made: the result applies only to them.
-    from: (u64, u64),
+    /// The project, its revision and its mesh when the task was made.
+    from: (u64, u64, u64),
 }
 
 /// What [`ResizeTask::run`] computed.
@@ -137,11 +141,15 @@ pub struct ResizeOutput {
     ts: usize,
     resolution: u32,
     doc: Document,
-    /// The set's new caches (None when its UV tile layout moved: the session rebuilds them).
-    cache: Option<SetCache>,
+    cache: SetCache,
+    /// The replacement atlas mesh if the UV tile layout moved.
+    mesh: Option<Arc<Mesh>>,
+    graphs: Option<GraphStore>,
     log: crate::log::SessionLog,
-    from: (u64, u64),
+    from: (u64, u64, u64),
 }
+
+type Resampled = Option<std::result::Result<texturecraft_texel::TileImage, String>>;
 
 impl ResizeTask {
     /// Repaint recorded strokes at the new size, resample the other images, and build the set's
@@ -155,10 +163,36 @@ impl ResizeTask {
     pub fn run_with_resampler(
         self,
         progress: &texturecraft_bake::Progress,
-        mut accelerate: impl FnMut(&texturecraft_texel::TileImage, (u32, u32), &[u16]) -> Option<std::result::Result<texturecraft_texel::TileImage, String>>,
+        accelerate: impl FnMut(&texturecraft_texel::TileImage, (u32, u32), &[u16]) -> Resampled,
+    ) -> Result<ResizeOutput> {
+        self.run_inner(progress, accelerate, None::<(&ResizeProgress, fn(&Inputs) -> bool)>)
+    }
+
+    /// Prepare the new view and its graph results before replacing the document shown by the front end.
+    pub fn run_for_view(
+        self,
+        progress: &ResizeProgress,
+        accelerate: impl FnMut(&texturecraft_texel::TileImage, (u32, u32), &[u16]) -> Resampled,
+        gpu_can_compose: impl FnOnce(&Inputs) -> bool,
+    ) -> Result<ResizeOutput> {
+        self.run_inner(&progress.paint, accelerate, Some((progress, gpu_can_compose)))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn run_for_browser(self, progress: &ResizeProgress) -> Result<ResizeOutput> {
+        let output = self.run(&progress.paint)?;
+        progress.ready();
+        Ok(output)
+    }
+
+    fn run_inner(
+        self,
+        progress: &texturecraft_bake::Progress,
+        mut accelerate: impl FnMut(&texturecraft_texel::TileImage, (u32, u32), &[u16]) -> Resampled,
+        view: Option<(&ResizeProgress, impl FnOnce(&Inputs) -> bool)>,
     ) -> Result<ResizeOutput> {
         let start = chrono::Utc::now();
-        let ResizeTask { ts, resolution, mut doc, mesh, bvh, lookup_budget, from } = self;
+        let ResizeTask { ts, resolution, mut doc, mesh, source, bvh, images, solo, lookup_budget, from } = self;
         let set = doc.project.texture_set_mut(ts)?;
         let old = set.clone();
         set.resolution = resolution;
@@ -215,12 +249,11 @@ impl ResizeTask {
         progress.done.store(3_000, std::sync::atomic::Ordering::Relaxed);
         let resampled = chrono::Utc::now();
         let set = doc.project.texture_set(ts)?;
-        let cache = (crate::session::uv_layout(&old) == crate::session::uv_layout(set))
-            .then(|| SetCache::new(&mesh, set, if replay.is_empty() { lookup_budget } else { usize::MAX }));
+        let new_mesh = (crate::session::uv_layout(&old) != crate::session::uv_layout(set)).then(|| crate::session::tiled_mesh(&source, &doc.project));
+        let display_mesh = new_mesh.as_ref().unwrap_or(&mesh);
+        let mut cache = SetCache::new(display_mesh, set, if replay.is_empty() { lookup_budget } else { usize::MAX });
         let cache_built = chrono::Utc::now();
-        if let Some(cache) = &cache
-            && !replay.is_empty()
-        {
+        if !replay.is_empty() {
             let deferred = replay.deferred_count();
             let replayed = replay.run(&mut doc.pixels, &mut doc.stroke_replays, &cache.gbuf, &scene, progress)?;
             if deferred > 0 {
@@ -229,8 +262,6 @@ impl ResizeTask {
             if replayed > 0 {
                 log.performance(format!("Replayed {replayed} recorded paint strokes in {} ms", (chrono::Utc::now() - cache_built).num_milliseconds()));
             }
-        } else if !replay.is_empty() {
-            return Err(crate::EngineError::Other("The new texture layout cannot replay these paint strokes".into()));
         }
         if cancelled() {
             return Err(crate::EngineError::Other("Texture set resize was cancelled".into()));
@@ -240,16 +271,63 @@ impl ResizeTask {
             log.performance(format!("GPU paint resize used CPU fallback: {reason}"));
         }
         log.performance(format!(
-            "Resize of texture set {} from {} to {}: paint resampling {} ms (GPU {} images in {} ms including transfers), CPU UV cache {}",
+            "Resize of texture set {} from {} to {}: paint resampling {} ms (GPU {} images in {} ms including transfers), CPU UV cache {} ms",
             ts + 1,
             old.resolution,
             resolution,
             (resampled - start).num_milliseconds(),
             gpu_images,
             gpu_ms,
-            if cache.is_some() { format!("{} ms", (cache_built - resampled).num_milliseconds()) } else { "rebuilt on apply".into() }
+            (cache_built - resampled).num_milliseconds(),
         ));
-        Ok(ResizeOutput { ts, resolution, doc, cache, log, from })
+
+        let mut graphs = None;
+        if let Some((progress, gpu_can_compose)) = view {
+            let started = chrono::Utc::now();
+            let view_project = solo.and_then(|solo| texturecraft_compose::solo_project(&doc.project, solo.layer, solo.ignore_mask));
+            let project = view_project.as_ref().unwrap_or(&doc.project);
+            let set = project.texture_set(ts)?;
+            let count = project.render_tree(&set.stack).into_iter().filter_map(|id| project.layers.get(&id)).map(|layer| layer.graphs().len()).sum();
+            let prepared = doc.graphs.for_resize(progress.graphs_cancel.clone(), ts);
+            let empty = BakedMaps::default();
+            let gbuf = cache.gbuf().clone();
+            let inputs = Inputs {
+                project,
+                ts,
+                mesh: display_mesh,
+                gbuf: &gbuf,
+                pixels: &doc.pixels,
+                baked: doc.baked.get(&ts).unwrap_or(&empty),
+                block_scales: cache.composite.block_scales.clone(),
+                preview: None,
+                images: &images,
+                graphs: &prepared,
+                bounds: display_mesh.bounds(),
+            };
+            if count > 0 {
+                progress.graphs(&prepared, count);
+                texturecraft_compose::eval::prepare_texture_set_graphs(&inputs);
+            }
+            progress.check()?;
+            let prepared_display = !gpu_can_compose(&inputs);
+            if prepared_display {
+                crate::resize_view::prepare_cpu_view(progress, &inputs, &mut cache)?;
+            }
+            progress.check()?;
+            prepared.park_old_resize_results(crate::session::COOK_BUDGET);
+            progress.check()?;
+            progress.ready();
+            log.performance(format!(
+                "Resize view for texture set {} at {resolution}: {} in {} ms, {} graph renders, {} cached graph results",
+                ts + 1,
+                if prepared_display { "CPU view prepared" } else { "GPU inputs prepared" },
+                (chrono::Utc::now() - started).num_milliseconds(),
+                prepared.renders(),
+                prepared.resize_cache_hits(),
+            ));
+            graphs = Some(prepared);
+        }
+        Ok(ResizeOutput { ts, resolution, doc, cache, mesh: new_mesh, graphs, log, from })
     }
 }
 
@@ -260,7 +338,7 @@ impl ResizeOutput {
     }
 
     pub fn matches_session(&self, session: &Session) -> bool {
-        self.from == (session.revision, session.mesh_id) && !session.stroke_active()
+        self.from == (session.project_id, session.revision, session.mesh_id) && !session.stroke_active()
     }
 }
 
@@ -275,26 +353,37 @@ impl Session {
             resolution,
             doc: self.doc.clone(),
             mesh: self.mesh.clone(),
+            source: self.source.clone(),
             bvh: self.bvh.clone(),
+            images: self.images.clone(),
+            solo: self.solo,
             lookup_budget: self.lookup_budget_for(ts),
-            from: (self.revision, self.mesh_id),
+            from: (self.project_id, self.revision, self.mesh_id),
         })
     }
 
     /// Apply a finished resize as one undo step. When the document changed while it ran, the
     /// resize runs again here on the current document.
     pub fn apply_resize(&mut self, out: ResizeOutput) -> Result<Value> {
+        if out.from.0 != self.project_id {
+            return Err(crate::EngineError::Other("Texture set resize is from another project".into()));
+        }
         if !out.matches_session(self) {
             let task = self.resize_task(out.ts, out.resolution)?;
             return self.apply_resize(task.run(&texturecraft_bake::Progress::new())?);
         }
 
-        let ResizeOutput { ts, resolution, doc, cache, log, .. } = out;
+        let ResizeOutput { ts, resolution, doc, mut cache, mesh, graphs, log, .. } = out;
+        if let Some(graphs) = graphs {
+            doc.graphs.accept_resize(&graphs, ts);
+        }
         let before = std::mem::replace(&mut self.doc, doc);
 
         // Install the new caches before adding history to avoid rebuilding them
-        if let (Some(c), Some(slot)) = (cache, self.caches.get_mut(ts)) {
-            let old = std::mem::replace(slot, c);
+        if let Some(slot) = self.caches.get_mut(ts) {
+            cache.revision = slot.revision.wrapping_add(1);
+            cache.material_revision = slot.material_revision.wrapping_add(1);
+            let old = std::mem::replace(slot, cache);
 
             // Release large caches without blocking the UI
             #[cfg(not(target_arch = "wasm32"))]
@@ -303,7 +392,7 @@ impl Session {
             drop(old);
         }
         self.log.append(log);
-        self.push_history("Texture set size", before);
+        self.record_resize(before, ts, mesh);
         self.trim_lookups(self.ts());
         Ok(json!({ "ts": ts, "resolution": resolution }))
     }

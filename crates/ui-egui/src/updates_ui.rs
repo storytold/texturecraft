@@ -96,7 +96,6 @@ mod tests {
     use egui_kittest::kittest::Queryable as _;
     use serde_json::json;
     use texturecraft_engine::Tool;
-    use texturecraft_engine::bake::Progress;
     use texturecraft_engine::geom::glam::Vec2;
 
     use super::*;
@@ -267,7 +266,7 @@ mod tests {
         h.state_mut().bake = None;
 
         let project = h.state().session.project_id;
-        h.state_mut().resize = Some(crate::ResizeJob { progress: Arc::new(Progress::new()), rx: channel().1, project });
+        h.state_mut().resize = Some(crate::ResizeJob { progress: Arc::new(texturecraft_engine::ResizeProgress::default()), rx: channel().1, project });
         assert!(!safe_to_close(h.state()), "a resize");
         h.state_mut().resize = None;
 

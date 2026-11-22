@@ -15,6 +15,8 @@ pub trait Profiler: Send + Sync {
     fn node(&self, _id: u32, _kind: &str, _size: (usize, usize)) -> Option<Box<dyn Any + Send>> {
         None
     }
+    /// Observes a result supplied by an accelerator, including one reused from its cache.
+    fn accelerated_node(&self, _id: u32, _kind: &str) {}
 }
 
 /// A timed stretch of work: runs from [`span`] until dropped.

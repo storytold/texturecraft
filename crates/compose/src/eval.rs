@@ -1740,6 +1740,21 @@ fn prepare_graphs(inp: &Inputs, channels: &[Channel], layers: &[LayerId]) {
     }
 }
 
+/// Prepare the independent graph sources for a texture set before planning its viewport composite.
+pub fn prepare_texture_set_graphs(inp: &Inputs) {
+    let Ok(set) = inp.project.texture_set(inp.ts) else { return };
+    let channels = set.channel_list();
+    let mut order = Vec::new();
+    draw_order(inp.project, &set.stack, 0, &mut order);
+    let reads_stack = order.iter().filter_map(|&id| inp.project.content_layer(id)).flat_map(Layer::graphs).any(GraphRef::reads_stack);
+    if reads_stack {
+        let tiles = all_tiles(inp.gbuf.width, inp.gbuf.height);
+        neighbourhood_fields(inp, &channels, &tiles);
+    } else {
+        prepare_graphs(inp, &channels, &order);
+    }
+}
+
 /// Build the curvature detail sizes every visible generator of `layers` reads, once, before tiles composite in parallel.
 fn prepare_curvature_sizes(inp: &Inputs, layers: &[LayerId]) {
     let visible = layers.iter().filter(|id| inp.project.layers.get(id).is_some_and(|layer| layer.visible));

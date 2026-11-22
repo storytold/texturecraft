@@ -141,8 +141,13 @@ impl Frame {
 }
 
 impl Prog {
-    fn code(&self) -> &Code {
+    pub(super) fn code(&self) -> &Code {
         self.code.get_or_init(|| build(self))
+    }
+
+    pub(super) fn uniform_value(&self, env: &FnEnv, frame: &mut Frame, index: usize) -> Option<Value> {
+        ensure(self, self.code(), index, env, frame).ok()?;
+        frame.values.get(index).cloned()
     }
 
     /// Registers for running this program; reuse them over many runs (and bind again when the environment changes).

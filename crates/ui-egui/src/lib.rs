@@ -148,14 +148,14 @@ pub const UPDATE_APP: craft_update::App = craft_update::App {
 
 /// A texture set resize running on a worker thread (`Session::resize_task`).
 pub struct ResizeJob {
-    pub progress: Arc<Progress>,
+    pub progress: Arc<texturecraft_engine::ResizeProgress>,
     pub rx: std::sync::mpsc::Receiver<texturecraft_engine::Result<texturecraft_engine::ResizeOutput>>,
     project: u64,
 }
 
 impl Drop for ResizeJob {
     fn drop(&mut self) {
-        self.progress.cancel.store(true, Ordering::Relaxed);
+        self.progress.cancel();
     }
 }
 
@@ -221,6 +221,8 @@ pub struct TextureCraftApp {
     /// The Import PBR textures dialog while it is open.
     pub pbr_import: Option<pbr_import::PbrDialog>,
     pub resize: Option<ResizeJob>,
+    /// Latest resize requested while a cancelled worker releases its resources.
+    queued_resize: Option<(usize, u32)>,
     /// The project import's windows and the conversion running behind them.
     pub import: Option<import_ui::ImportUi>,
     pub link_cooks: Vec<LinkCook>,
@@ -254,6 +256,8 @@ pub struct TextureCraftApp {
     pub picking_symmetry_plane: bool,
     /// The wgpu state (screenshots read the renderer's targets).
     pub render_state: Option<eframe::egui_wgpu::RenderState>,
+    #[cfg(not(target_arch = "wasm32"))]
+    graph_accelerator: Option<Arc<texturecraft_render::gpu_graph::GraphAccelerator>>,
     /// CJK fallback fonts for the UI language.
     pub fonts: fonts::UiFonts,
     /// A notice across the top of the window until dismissed (English key, shown translated).
@@ -310,6 +314,12 @@ impl TextureCraftApp {
         #[cfg(not(target_arch = "wasm32"))]
         texturecraft_engine::bake::install_gpu_tracer(Arc::new(texturecraft_render::gpu_bake::GpuBaker::new()));
         let gpu = cc.wgpu_render_state.as_ref().map(|render_state| gpu::init(render_state, &cc.egui_ctx));
+        #[cfg(not(target_arch = "wasm32"))]
+        let graph_accelerator = cc
+            .wgpu_render_state
+            .as_ref()
+            .filter(|_| gpu.as_ref().is_some_and(gpu::GpuLink::supports_gpu_layers))
+            .map(|render_state| Arc::new(texturecraft_render::gpu_graph::GraphAccelerator::new(&render_state.device, &render_state.queue)));
 
         // The first run speaks the OS (or browser) language
         let mut ui_store = ui_state_store::UiStateStore::new(ui_state_store::FILE.get().cloned());
@@ -340,6 +350,7 @@ impl TextureCraftApp {
             bake_report: Default::default(),
             pbr_import: None,
             resize: None,
+            queued_resize: None,
             import: None,
             link_cooks: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -359,6 +370,8 @@ impl TextureCraftApp {
             picking_id_color: None,
             picking_symmetry_plane: false,
             render_state: cc.wgpu_render_state.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            graph_accelerator,
             fonts: fonts::UiFonts::default(),
             banner: None,
             title_bar: titlebar::TitleBar::default(),
@@ -487,6 +500,7 @@ impl TextureCraftApp {
     pub(crate) fn clear_project_jobs(&mut self) {
         self.pbr_import = None;
         self.resize = None;
+        self.queued_resize = None;
         #[cfg(not(target_arch = "wasm32"))]
         self.link_imports.clear();
         self.link_cooks.clear();
@@ -774,13 +788,16 @@ impl TextureCraftApp {
     /// Resize texture set `ts` to `resolution` on a worker thread (the document changes when
     /// it is done, as one undo step).
     pub fn start_resize(&mut self, ts: usize, resolution: u32) {
-        if self.resize.is_some() {
+        if let Some(job) = &self.resize {
+            if job.progress.is_cancelled() {
+                self.queued_resize = Some((ts, resolution));
+            }
             return;
         }
 
         match self.session.resize_task(ts, resolution) {
             Ok(task) => {
-                let progress = Arc::new(Progress::new());
+                let progress = Arc::new(texturecraft_engine::ResizeProgress::default());
                 let p = progress.clone();
                 #[cfg(not(target_arch = "wasm32"))]
                 let gpu = self
@@ -790,14 +807,22 @@ impl TextureCraftApp {
                     .map(|state| (state.device.clone(), state.queue.clone()));
                 let rx = spawn_worker("texturecraft-resize", move || {
                     #[cfg(not(target_arch = "wasm32"))]
-                    if let Some((device, queue)) = gpu {
-                        return resize_on_gpu(task, &p, &device, &queue);
-                    }
-                    task.run(&p)
+                    return resize_for_view(task, &p, gpu);
+                    #[cfg(target_arch = "wasm32")]
+                    return task.run_for_browser(&p);
                 });
                 self.resize = Some(ResizeJob { progress, rx, project: self.session.project_id });
             }
             Err(e) => self.toast(e.to_string(), true),
+        }
+    }
+
+    fn cancel_resize(&mut self) {
+        self.queued_resize = None;
+        if let Some(job) = &self.resize {
+            job.progress.cancel();
+            // Its result cannot commit, even if a GPU dispatch must drain before it returns.
+            self.toast(i18n::tr("Texture set resize cancelled"), false);
         }
     }
 
@@ -808,6 +833,7 @@ impl TextureCraftApp {
         // Nothing to resize without a project (a result that arrives after Close is dropped)
         if !self.session.project_open || self.session.project_id != job.project {
             self.resize = None;
+            self.queued_resize = None;
             return;
         }
 
@@ -821,7 +847,14 @@ impl TextureCraftApp {
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(texturecraft_engine::EngineError::Other(i18n::tr("The resize worker stopped").into())),
         };
+        let cancelled = job.progress.is_cancelled();
         self.resize = None;
+        if cancelled {
+            if let Some((ts, resolution)) = self.queued_resize.take() {
+                self.start_resize(ts, resolution);
+            }
+            return;
+        }
         if let Ok(output) = &result
             && !output.matches_session(&self.session)
         {
@@ -829,8 +862,17 @@ impl TextureCraftApp {
             self.start_resize(ts, resolution);
             return;
         }
-        if let Err(e) = result.and_then(|out| self.session.apply_resize(out)) {
-            self.toast(e.to_string(), true);
+        match result.and_then(|out| {
+            let target = out.target().0;
+            self.session.apply_resize(out)?;
+            Ok(target)
+        }) {
+            Ok(target) => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.replace_resized_view(self.session.project_id, target);
+                }
+            }
+            Err(error) => self.toast(error.to_string(), true),
         }
     }
 
@@ -867,20 +909,24 @@ impl TextureCraftApp {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn resize_on_gpu(
+fn resize_for_view(
     task: texturecraft_engine::ResizeTask,
-    progress: &Progress,
-    device: &texturecraft_render::wgpu::Device,
-    queue: &texturecraft_render::wgpu::Queue,
+    progress: &texturecraft_engine::ResizeProgress,
+    gpu: Option<(texturecraft_render::wgpu::Device, texturecraft_render::wgpu::Queue)>,
 ) -> texturecraft_engine::Result<texturecraft_engine::ResizeOutput> {
     use texturecraft_render::gpu_resize::PaintResampler;
     let mut resampler = None;
-    task.run_with_resampler(progress, |image, size, empty| {
-        Some(match resampler.get_or_insert_with(|| PaintResampler::new(device, queue)) {
-            Ok(resampler) => resampler.resize(image, size, empty, || progress.cancel.load(Ordering::Relaxed)),
-            Err(error) => Err(error.clone()),
-        })
-    })
+    task.run_for_view(
+        progress,
+        |image, size, empty| {
+            let (device, queue) = gpu.as_ref()?;
+            Some(match resampler.get_or_insert_with(|| PaintResampler::new(device, queue)) {
+                Ok(resampler) => resampler.resize(image, size, empty, || progress.is_cancelled()),
+                Err(error) => Err(error.clone()),
+            })
+        },
+        |inputs| gpu.is_some() && texturecraft_render::gpu_composite::CompositeProgram::try_compile_inputs(inputs, None).is_ok(),
+    )
 }
 
 /// Run `f` on a worker thread named `name`; its result arrives on the returned channel.
@@ -910,6 +956,14 @@ fn autosave_period_seconds(minutes: u32) -> f64 {
 }
 
 impl TextureCraftApp {
+    pub(crate) fn material_graph_accelerator(&self) -> Option<Arc<dyn texturecraft_engine::compose::graphs::GraphAccelerator>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.ui.prefs.gpu_compositing {
+            return self.graph_accelerator.clone().map(|backend| backend as _);
+        }
+        None
+    }
+
     fn reschedule_autosave_if_changed(&mut self, previous_minutes: u32) {
         let minutes = self.ui.prefs.autosave_minutes;
         if minutes != previous_minutes {
@@ -1033,6 +1087,7 @@ impl eframe::App for TextureCraftApp {
         }
         self.step_camera_glide(ctx);
         self.ui.prefs.apply_resource_limits();
+        self.session.doc.graphs.set_accelerator(self.material_graph_accelerator());
         #[cfg(not(target_arch = "wasm32"))]
         {
             let paint_view = self.session.quick_mask.editing

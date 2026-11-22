@@ -760,6 +760,49 @@ fn background_resizes_match_the_command_and_keep_later_edits() {
     assert_eq!(b.caches[0].size, (512, 512));
 }
 
+#[test]
+fn graph_resize_keeps_the_current_view_until_ready_and_reuses_previous_results() {
+    use texturecraft_engine::ResizeProgress;
+    use texturecraft_engine::core::{Fill, GraphRef, Layer, LayerKind, Source};
+
+    let mut s = session();
+    let key = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 color r=0.8 g=0.2 b=0.1\noutput out 1\n");
+    let mut fill = Fill::default();
+    fill.sources.insert(Channel::BaseColor, Source::Graph(Box::new(GraphRef::new(key, "resize test"))));
+    let layer = Layer::new(s.doc.project.alloc_id(), "graph fill", LayerKind::Fill(fill), &Channel::DEFAULT_SET);
+    s.doc.project.insert_layer(0, layer, None, false).unwrap();
+    let starting = s.caches[0].size;
+    s.touched();
+    s.update();
+    let old_uses = s.doc.graphs.uses();
+    let old_renders = s.doc.graphs.renders();
+    assert!(!old_uses.is_empty());
+
+    let progress = ResizeProgress::default();
+    let cancelled = s.resize_task(0, 128).unwrap();
+    progress.cancel();
+    assert!(cancelled.run_for_view(&progress, |_, _, _| None, |_| false).is_err());
+    assert_eq!(s.doc.graphs.uses(), old_uses);
+
+    let task = s.resize_task(0, 512).unwrap();
+    let replacement = task.run_for_view(&ResizeProgress::default(), |_, _, _| None, |_| false).unwrap();
+    assert_eq!(s.caches[0].size, starting);
+    assert_eq!(s.doc.graphs.uses(), old_uses);
+    s.apply_resize(replacement).unwrap();
+    assert_eq!(s.pending_tiles(), 0, "the live viewport needs no graph work after the swap");
+    assert!(!s.caches[0].upload.is_empty());
+    assert_ne!(s.doc.graphs.uses(), old_uses);
+    assert!(s.doc.graphs.renders() > old_renders);
+
+    let renders = s.doc.graphs.renders();
+    let task = s.resize_task(0, starting.0).unwrap();
+    let replacement = task.run_for_view(&ResizeProgress::default(), |_, _, _| None, |_| false).unwrap();
+    s.apply_resize(replacement).unwrap();
+    assert_eq!(s.pending_tiles(), 0);
+    assert_eq!(s.doc.graphs.uses(), old_uses, "the previous graph resolution is reusable");
+    assert_eq!(s.doc.graphs.renders(), renders, "returning to the previous size needs no render");
+}
+
 /// A 2048 sphere set with a fill layer and an empty paint layer, a small brush, and the
 /// oracle: the composite after recompositing every covered tile from scratch.
 fn painted_set() -> Session {

@@ -412,12 +412,16 @@ pub struct UseProblem {
 
 /// Listener for cold graph cook and node diagnostics.
 pub type CookTrace = Arc<dyn Fn(String) + Send + Sync>;
+pub use texturecraft_graph::accelerator::Accelerator as GraphAccelerator;
 
 /// Cooked outputs and what is known about them, shared by every snapshot of a document (a cook's key decides its
 /// pixels, so snapshots never disagree about one).
 #[derive(Default)]
 pub struct CookCache {
     cooks: Slots<String, Result<Arc<Cooked>, String>>,
+    /// Results a background resize can read without changing the live document's graph uses.
+    resize_source: Option<Arc<CookCache>>,
+    resize_cache_hits: AtomicUsize,
     /// The cook each use read last.
     uses: Mutex<BTreeMap<GraphUse, String>>,
     problems: Mutex<BTreeMap<GraphUse, UseProblem>>,
@@ -428,6 +432,7 @@ pub struct CookCache {
     fingerprints: Mutex<HashMap<(usize, usize), u128>>,
     pool: OnceLock<Option<Arc<ThreadPool>>>,
     trace: Mutex<Option<CookTrace>>,
+    accelerator: Mutex<Option<Arc<dyn GraphAccelerator>>>,
     /// Where cooks are also kept between documents and runs ([`kept`]), if anywhere.
     kept: Mutex<Option<Arc<dyn KeptCooks>>>,
     /// Cooks found there instead of rendered.
@@ -437,7 +442,7 @@ pub struct CookCache {
     /// Cooks made available since the store was made: rendered, found where kept or read back from a spill.
     filled: AtomicUsize,
     /// Renders running now: their finished nodes and the nodes they run (see [`GraphStore::cook_progress`]).
-    running: Mutex<Vec<(Arc<AtomicUsize>, usize)>>,
+    running: Mutex<Vec<RunningCook>>,
     /// Stops renders running for this document.
     pub cancel: Cancel,
 }
@@ -482,6 +487,65 @@ impl GraphStore {
         GraphStore { texts: BTreeMap::new(), cooks: Arc::new(CookCache { cancel, ..CookCache::default() }) }
     }
 
+    /// Evaluate a candidate resolution without updating the current view's graph usage or cancellation state.
+    pub fn for_resize(&self, cancel: Cancel, set: usize) -> GraphStore {
+        let store = GraphStore {
+            texts: self.texts.clone(),
+            cooks: Arc::new(CookCache {
+                resize_source: Some(self.cooks.clone()),
+                uses: Mutex::new(self.uses().into_iter().filter(|(use_, _)| use_.set == set).collect()),
+                cancel,
+                ..CookCache::default()
+            }),
+        };
+        store.set_accelerator(self.accelerator());
+        store
+    }
+
+    /// Preserve completed results and install the new uses only after the resize has been accepted.
+    pub fn accept_resize(&self, prepared: &GraphStore, set: usize) {
+        for (key, result) in prepared.cooks.cooks.values() {
+            self.cooks.cooks.insert(key, result);
+        }
+        let uses = prepared.uses();
+        let problems = prepared.problems();
+        {
+            let mut previous = lock(&self.cooks.uses);
+            previous.retain(|use_, _| use_.set != set);
+            previous.extend(uses);
+        }
+        {
+            let mut previous = lock(&self.cooks.problems);
+            previous.retain(|use_, _| use_.set != set);
+            previous.extend(problems);
+        }
+        self.cooks.renders.fetch_add(prepared.renders(), Ordering::Relaxed);
+        self.cooks.kept_found.fetch_add(prepared.kept_found(), Ordering::Relaxed);
+    }
+
+    /// Park older resolutions on disk when preparing another view would keep too much of their output in memory.
+    /// The currently shown and incoming results stay resident so neither view reads them back tile by tile.
+    pub fn park_old_resize_results(&self, limit: usize) {
+        let Some(source) = self.cooks.resize_source.as_ref() else { return };
+        let incoming: HashMap<_, _> = self.cooks.cooks.values().into_iter().filter_map(|(key, result)| result.ok().map(|cook| (key, cook.bytes()))).collect();
+        let previous: Vec<_> = source.cooks.values().into_iter().filter_map(|(key, result)| result.ok().map(|cook| (key, cook))).collect();
+        let held: usize = previous.iter().filter(|(key, _)| !incoming.contains_key(key)).map(|(_, cook)| cook.bytes()).sum();
+        let mut occupied = held.saturating_add(incoming.values().sum());
+        if occupied <= limit {
+            return;
+        }
+        let active: BTreeSet<_> = lock(&source.uses).values().cloned().collect();
+        for (key, cook) in previous {
+            if !active.contains(&key) && !incoming.contains_key(&key) && (source.spilled.outline(&key).is_some() || source.spilled.put(&key, &cook)) {
+                source.cooks.remove(&key);
+                occupied = occupied.saturating_sub(cook.bytes());
+                if occupied <= limit {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Adds a graph text, under its key.
     pub fn add_text(&mut self, text: &str) -> String {
         let key = texturecraft_core::text_key(text);
@@ -499,9 +563,22 @@ impl GraphStore {
         *lock(&self.cooks.trace) = trace;
     }
 
+    pub fn accelerator(&self) -> Option<Arc<dyn GraphAccelerator>> {
+        lock(&self.cooks.accelerator).clone()
+    }
+
+    pub fn set_accelerator(&self, accelerator: Option<Arc<dyn GraphAccelerator>>) {
+        *lock(&self.cooks.accelerator) = accelerator;
+    }
+
     /// Cooks found where they are kept ([`GraphStore::keep_cooks_in`]) instead of rendered.
     pub fn kept_found(&self) -> usize {
         self.cooks.kept_found.load(Ordering::Relaxed)
+    }
+
+    /// Matching results read from the live cache or disk during a background resize.
+    pub fn resize_cache_hits(&self) -> usize {
+        self.cooks.resize_cache_hits.load(Ordering::Relaxed) + self.kept_found()
     }
 
     /// Renders made since the store was made (by every snapshot sharing its cooks).
@@ -513,8 +590,15 @@ impl GraphStore {
     /// kept or read back), plus each running render's share of its nodes finished (at most 0.95). For a progress
     /// display; it only grows while nothing is cancelled.
     pub fn cook_progress(&self) -> f32 {
-        let running: f32 = lock(&self.cooks.running).iter().map(|(done, nodes)| (done.load(Ordering::Relaxed) as f32 / (*nodes).max(1) as f32).min(0.95)).sum();
+        let running: f32 = lock(&self.cooks.running).iter().map(|cook| (cook.done.load(Ordering::Relaxed) as f32 / cook.nodes.max(1) as f32).min(0.95)).sum();
         self.cooks.filled.load(Ordering::Relaxed) as f32 + running
+    }
+
+    /// Name and node progress of the latest graph currently evaluating.
+    pub fn active_cook(&self) -> Option<(String, usize, usize)> {
+        let running = lock(&self.cooks.running);
+        let cook = running.last()?;
+        Some((cook.name.clone(), cook.done.load(Ordering::Relaxed).min(cook.nodes), cook.nodes))
     }
 
     /// Uses whose graph showed nothing, or showed stale pixels, the last time they were composited.
@@ -537,11 +621,55 @@ impl GraphStore {
         *lock(&self.cooks.uses) = uses;
     }
 
+    /// The last complete cook read by an effect or source, including a stack-dependent effect.
+    pub fn use_cook_key(&self, use_: &GraphUse) -> Option<String> {
+        lock(&self.cooks.uses).get(use_).cloned()
+    }
+
+    /// Record a resolved source as used for this document, including when the GPU binds a cached result.
+    pub fn note_use(&self, use_: GraphUse, key: &str) {
+        let mut uses = lock(&self.cooks.uses);
+        if uses.get(&use_).is_none_or(|previous| previous != key) {
+            uses.insert(use_.clone(), key.to_owned());
+        }
+        drop(uses);
+        lock(&self.cooks.problems).remove(&use_);
+    }
+
+    /// Look up a result without paging in a disk cook on the UI thread.
+    pub fn resident_cook(&self, key: &str) -> Option<Arc<Cooked>> {
+        let key = key.to_owned();
+        self.cooks.cooks.get(&key).or_else(|| self.cooks.resize_source.as_ref()?.cooks.get(&key)).and_then(Result::ok)
+    }
+
+    pub fn failed_cook(&self, key: &str) -> bool {
+        self.cooks.cooks.get(&key.to_owned()).is_some_and(|cook| cook.is_err())
+    }
+
     /// The cook under `key`, if one is held (rendered or loaded; a spilled one is read back, not held again).
     pub fn cooked(&self, key: &str) -> Option<Arc<Cooked>> {
         match self.cooks.cooks.get(&key.to_string()) {
             Some(held) => held.ok(),
-            None => self.cooks.spilled.get(key).map(Arc::new),
+            None => self.cooks.spilled.get(key).map(Arc::new).or_else(|| {
+                let source = self.cooks.resize_source.as_ref()?;
+                source.cooks.get(&key.to_owned()).and_then(Result::ok).or_else(|| source.spilled.get(key).map(Arc::new))
+            }),
+        }
+    }
+
+    /// Read a saved set's recorded graph results on the preparation worker. A matching
+    /// archive snapshot can use these results without evaluating its stack again.
+    pub fn warm_saved_uses(&self, set: usize) {
+        let keys: BTreeSet<String> = self.uses().into_iter().filter_map(|(use_, key)| (use_.set == set).then_some(key)).collect();
+        for key in keys {
+            if self.cooks.cancel.is_cancelled() {
+                break;
+            }
+            if self.cooks.cooks.get(&key).is_none()
+                && let Some(cooked) = self.cooked(&key)
+            {
+                self.cooks.cooks.insert(key, Ok(cooked));
+            }
         }
     }
 
@@ -625,13 +753,17 @@ impl GraphStore {
         self.cooks.spilled.retain(|k| used.contains(k));
     }
 
+    fn read_cache(&self) -> &CookCache {
+        self.cooks.resize_source.as_deref().unwrap_or(&self.cooks)
+    }
+
     fn pool(&self) -> Option<Arc<ThreadPool>> {
-        self.cooks.pool.get_or_init(|| texturecraft_graph::context::own_pool("graph")).clone()
+        self.read_cache().pool.get_or_init(|| texturecraft_graph::context::own_pool("graph")).clone()
     }
 
     /// A digest of the evaluator versions of the node kinds text `key` uses ([`texturecraft_graph::versions`]).
     fn kind_digest(&self, key: &str) -> u128 {
-        if let Some(d) = lock(&self.cooks.kinds).get(key) {
+        if let Some(d) = lock(&self.read_cache().kinds).get(key) {
             return *d;
         }
         let mut h = StableHash::new();
@@ -641,7 +773,7 @@ impl GraphStore {
             }
         }
         let d = h.finish();
-        lock(&self.cooks.kinds).insert(key.to_string(), d);
+        lock(&self.read_cache().kinds).insert(key.to_string(), d);
         d
     }
 
@@ -649,7 +781,7 @@ impl GraphStore {
     /// place, when they are baked again).
     fn fingerprint_floats(&self, data: &[f32]) -> u128 {
         let at = (data.as_ptr() as usize, data.len());
-        if let Some(f) = lock(&self.cooks.fingerprints).get(&at) {
+        if let Some(f) = lock(&self.read_cache().fingerprints).get(&at) {
             return *f;
         }
         let mut h = StableHash::new();
@@ -657,14 +789,14 @@ impl GraphStore {
             h.f32(*v);
         }
         let f = h.finish();
-        lock(&self.cooks.fingerprints).insert(at, f);
+        lock(&self.read_cache().fingerprints).insert(at, f);
         f
     }
 
     /// [`GraphStore::fingerprint_floats`] of a baked map's values, however they are held.
     fn fingerprint_texels(&self, data: &Arc<crate::Texels>) -> u128 {
         let at = (Arc::as_ptr(data) as usize, data.len());
-        if let Some(f) = lock(&self.cooks.fingerprints).get(&at) {
+        if let Some(f) = lock(&self.read_cache().fingerprints).get(&at) {
             return *f;
         }
         let mut h = StableHash::new();
@@ -672,7 +804,7 @@ impl GraphStore {
             h.f32(v);
         }
         let f = h.finish();
-        lock(&self.cooks.fingerprints).insert(at, f);
+        lock(&self.read_cache().fingerprints).insert(at, f);
         f
     }
 
@@ -747,10 +879,14 @@ impl GraphStore {
 
     /// The key of `g`'s cook at `env.side`, given the images a filter reads (`given`, by input index). It holds the
     /// graph runtime's [`texturecraft_graph::versions::EPOCH`] and the versions of the node kinds the graph uses, but
-    /// not [`texturecraft_graph::versions::TOOLCHAIN`]: renders are the same bits on every machine and with every
-    /// compiler (the runtime takes its maths from one library), so a compiler update must not throw away every cook
-    /// stored in every project. `None` for graphs nested too deeply.
+    /// not [`texturecraft_graph::versions::TOOLCHAIN`]. The reference evaluator takes its maths from one library.
+    /// A host accelerator adds its own version to newly computed results. `None` for graphs nested too deeply.
     pub fn cook_key(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)]) -> Option<String> {
+        let base = self.reference_key(g, env, given)?;
+        Some(self.backend_key(base, self.accelerator().as_deref()))
+    }
+
+    fn reference_key(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)]) -> Option<String> {
         let mut h = StableHash::new();
         h.str("cook").u64(u64::from(texturecraft_graph::versions::EPOCH)).u64(env.side as u64);
         if !self.digest(&mut h, g, env, 0) {
@@ -769,6 +905,18 @@ impl GraphStore {
         Some(h.key())
     }
 
+    fn backend_key(&self, base: String, accelerator: Option<&dyn GraphAccelerator>) -> String {
+        let Some(accelerator) = accelerator else { return base };
+        // Retain results already saved by the reference evaluator for this precise request.
+        let held = |cache: &CookCache| cache.cooks.get(&base).is_some_and(|v| v.is_ok()) || cache.spilled.outline(&base).is_some();
+        if held(&self.cooks) || self.cooks.resize_source.as_ref().is_some_and(|cache| held(cache)) {
+            return base;
+        }
+        let mut h = StableHash::new();
+        h.str("accelerated cook").str(accelerator.cache_tag()).str(&base);
+        h.key()
+    }
+
     /// The image inputs graph `key` declares linear (`input … working=1`): they take a colour channel's values as they
     /// are, the others as display (sRGB) values.
     pub fn working_inputs(&self, key: &str) -> BTreeSet<u32> {
@@ -781,12 +929,12 @@ impl GraphStore {
     }
 
     fn parsed(&self, key: &str) -> Result<Arc<Graph>, String> {
-        if let Some(g) = lock(&self.cooks.parsed).get(key) {
+        if let Some(g) = lock(&self.read_cache().parsed).get(key) {
             return Ok(g.clone());
         }
         let text = self.texts.get(key).ok_or_else(|| format!("the text of graph {key} is not in the project"))?;
         let g = Arc::new(Graph::parse(text).map_err(|e| e.to_string())?);
-        let mut parsed = lock(&self.cooks.parsed);
+        let mut parsed = lock(&self.read_cache().parsed);
         if parsed.len() >= PARSED_KEPT {
             parsed.clear();
         }
@@ -801,11 +949,13 @@ impl GraphStore {
     }
 
     fn cook_at(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)], depth: usize) -> Result<(String, Arc<Cooked>), String> {
-        let key = self.cook_key(g, env, given).ok_or_else(|| format!("graphs nested deeper than {MAX_GRAPH_NESTING}"))?;
+        let accelerator = self.accelerator();
+        let base = self.reference_key(g, env, given).ok_or_else(|| format!("graphs nested deeper than {MAX_GRAPH_NESTING}"))?;
+        let key = self.backend_key(base, accelerator.as_deref());
         let pool = self.pool();
         let got = self.cooks.cooks.get_or_fill_own_pool(&key, || {
             // waiting for the render's pool here must not pick up the caller's pool's work (see `once`)
-            once::wait_outside(pool.as_deref(), || self.fill_cook(g, env, given, depth, &key))
+            once::wait_outside(pool.as_deref(), || self.fill_cook(g, env, given, depth, &key, accelerator))
         });
         // a cancelled render (not started, or stopped part way) is not remembered as a failure
         if got.is_err() && self.cooks.cancel.is_cancelled() {
@@ -815,12 +965,28 @@ impl GraphStore {
     }
 
     /// The cook under `key`: spilled or kept earlier, or rendered now.
-    fn fill_cook(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)], depth: usize, key: &str) -> Result<Arc<Cooked>, String> {
+    fn fill_cook(
+        &self,
+        g: &GraphRef,
+        env: &RenderEnv,
+        given: &[(u32, Tex)],
+        depth: usize,
+        key: &str,
+        accelerator: Option<Arc<dyn GraphAccelerator>>,
+    ) -> Result<Arc<Cooked>, String> {
         if self.cooks.cancel.is_cancelled() {
             return Err("cancelled".to_string());
         }
         let trace = lock(&self.cooks.trace).clone();
         let name = trace_name(&g.name);
+        if let Some(source) = &self.cooks.resize_source {
+            let result = source.cooks.get(&key.to_owned()).or_else(|| source.spilled.get(key).map(|result| Ok(Arc::new(result))));
+            if let Some(result) = result {
+                self.cooks.filled.fetch_add(1, Ordering::Relaxed);
+                self.cooks.resize_cache_hits.fetch_add(1, Ordering::Relaxed);
+                return result;
+            }
+        }
         if let Some(back) = self.cooks.spilled.get(key) {
             if let Some(emit) = &trace {
                 emit(format!("Graph {name:?}: loaded from project cache ({key})"));
@@ -828,7 +994,7 @@ impl GraphStore {
             self.cooks.filled.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::new(back));
         }
-        let kept = lock(&self.cooks.kept).clone();
+        let kept = lock(&self.cooks.kept).clone().or_else(|| self.cooks.resize_source.as_ref().and_then(|source| lock(&source.kept).clone()));
         if let Some(found) = kept.as_ref().and_then(|k| k.get(key)).and_then(|bytes| kept::decode(&bytes)) {
             if let Some(emit) = &trace {
                 emit(format!("Graph {name:?}: result cache hit ({key})"));
@@ -843,7 +1009,7 @@ impl GraphStore {
         }
         // a share of the render budget for its estimated peak; nested graphs render within their parent's
         let share = if depth == 0 { Some(budget::acquire(budget::estimate(&*self.parsed(&g.key)?, env.side))) } else { None };
-        let cooked = self.render(g, env, given, depth, trace.clone());
+        let cooked = self.render(g, env, given, depth, trace.clone(), accelerator);
         drop(share);
         if let Some(emit) = &trace {
             let status = if cooked.is_ok() { "finished" } else { "stopped" };
@@ -887,7 +1053,15 @@ impl GraphStore {
     }
 
     /// Renders `g` (see the module docs).
-    fn render(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)], depth: usize, trace: Option<CookTrace>) -> Result<Cooked, String> {
+    fn render(
+        &self,
+        g: &GraphRef,
+        env: &RenderEnv,
+        given: &[(u32, Tex)],
+        depth: usize,
+        trace: Option<CookTrace>,
+        accelerator: Option<Arc<dyn GraphAccelerator>>,
+    ) -> Result<Cooked, String> {
         let side = env.side;
         let pool = self.pool();
         let mut graph = (*self.parsed(&g.key)?).clone();
@@ -933,13 +1107,21 @@ impl GraphStore {
         // the render's nodes as they finish, for the store's progress (nothing computed depends on it)
         let done = Arc::new(AtomicUsize::new(0));
         let nodes = graph.work_nodes();
-        let _running = Running::start(&self.cooks.running, done.clone(), nodes);
+        let _running = Running::start(&self.cooks.running, done.clone(), nodes, trace_name(&g.name));
         let profiler = trace.map(|emit| {
             let graph = trace_name(&g.name).to_owned();
             emit(format!("Graph {graph:?}: evaluating {nodes} nodes"));
             Arc::new(CookProfiler { emit, graph }) as Arc<dyn texturecraft_graph::profile::Profiler>
         });
-        let ec = EvalContext { cancel: self.cooks.cancel.clone(), pool, files: Files::none(), nodes_done: Some(done), profiler, ..EvalContext::default() };
+        let ec = EvalContext {
+            cancel: self.cooks.cancel.clone(),
+            pool,
+            files: Files::none(),
+            nodes_done: Some(done),
+            profiler,
+            accelerator,
+            ..EvalContext::default()
+        };
         let outs = evaluate(&graph, &ec, side, images, given)?;
         let linear: BTreeSet<String> =
             graph.meta.get("working").map(|w| w.trim_matches('"').split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
@@ -959,6 +1141,10 @@ impl texturecraft_graph::profile::Profiler for CookProfiler {
 
     fn span(&self, _: &str) -> Box<dyn std::any::Any + Send> {
         Box::new(())
+    }
+
+    fn accelerated_node(&self, id: u32, kind: &str) {
+        (self.emit)(format!("GPU result for node #{id} {kind} in {:?}", self.graph));
     }
 
     fn node(&self, id: u32, kind: &str, (width, height): (usize, usize)) -> Option<Box<dyn std::any::Any + Send>> {
@@ -992,20 +1178,26 @@ impl Drop for CookNodeTime {
 
 /// A render listed among the running ones (see [`GraphStore::cook_progress`]) until dropped.
 struct Running<'a> {
-    list: &'a Mutex<Vec<(Arc<AtomicUsize>, usize)>>,
+    list: &'a Mutex<Vec<RunningCook>>,
     done: Arc<AtomicUsize>,
 }
 
+struct RunningCook {
+    done: Arc<AtomicUsize>,
+    nodes: usize,
+    name: String,
+}
+
 impl<'a> Running<'a> {
-    fn start(list: &'a Mutex<Vec<(Arc<AtomicUsize>, usize)>>, done: Arc<AtomicUsize>, nodes: usize) -> Running<'a> {
-        lock(list).push((done.clone(), nodes));
+    fn start(list: &'a Mutex<Vec<RunningCook>>, done: Arc<AtomicUsize>, nodes: usize, name: &str) -> Running<'a> {
+        lock(list).push(RunningCook { done: done.clone(), nodes, name: name.to_owned() });
         Running { list, done }
     }
 }
 
 impl Drop for Running<'_> {
     fn drop(&mut self) {
-        lock(self.list).retain(|(d, _)| !Arc::ptr_eq(d, &self.done));
+        lock(self.list).retain(|cook| !Arc::ptr_eq(&cook.done, &self.done));
     }
 }
 

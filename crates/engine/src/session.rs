@@ -885,6 +885,15 @@ impl Session {
     /// A change from `before`: a new undo step `label`, or with `merge` part of the previous one when it has the same label
     fn record(&mut self, label: &str, before: Document, merge: bool) {
         self.invalidate_changed(&before);
+        self.finish_record(label, before, merge);
+    }
+
+    pub(crate) fn record_resize(&mut self, before: Document, set: usize, mesh: Option<Arc<Mesh>>) {
+        self.invalidate_changed_except(&before, Some(set), mesh);
+        self.finish_record("Texture set size", before, false);
+    }
+
+    fn finish_record(&mut self, label: &str, before: Document, merge: bool) {
         if self.doc.stroke_replays.discard_stale(&self.doc.project, &self.doc.pixels, &self.mesh) {
             self.note_raster_paint();
         }
@@ -929,7 +938,11 @@ impl Session {
     /// Mark dirty every texture set whose composite differs between the previous and current
     /// document (after an edit, undo or redo).
     pub(crate) fn invalidate_changed(&mut self, previous_document: &Document) {
-        self.follow_uv_layouts(&previous_document.project);
+        self.invalidate_changed_except(previous_document, None, None);
+    }
+
+    fn invalidate_changed_except(&mut self, previous_document: &Document, prepared_set: Option<usize>, mesh: Option<Arc<Mesh>>) {
+        self.follow_uv_layouts(&previous_document.project, prepared_set, mesh);
         self.sync_caches();
 
         // Removed path effects must release their cached painted tiles
@@ -980,6 +993,9 @@ impl Session {
             )
         };
         for texture_set_index in 0..self.caches.len() {
+            if Some(texture_set_index) == prepared_set {
+                continue;
+            }
             let before = stack_key(previous_document, texture_set_index);
             let after = stack_key(&self.doc, texture_set_index);
             let resource_changed = removed_or_replaced_resource || uses_added_resource(texture_set_index);
@@ -1013,16 +1029,19 @@ impl Session {
     /// After the UV tile layout of a texture set changed (UV tiles on or off, tile
     /// resolutions) between `before` and the current project, map the mesh's UVs into the new
     /// atlas and rebuild those sets' caches.
-    fn follow_uv_layouts(&mut self, before: &Project) {
+    fn follow_uv_layouts(&mut self, before: &Project, prepared_set: Option<usize>, mesh: Option<Arc<Mesh>>) {
         let layout = |p: &Project, ts: usize| p.texture_sets.get(ts).map(uv_layout);
         let changed: Vec<usize> = (0..self.doc.project.texture_sets.len()).filter(|ts| layout(before, *ts) != layout(&self.doc.project, *ts)).collect();
         if changed.is_empty() && before.texture_sets.len() == self.doc.project.texture_sets.len() {
             return;
         }
-        self.mesh = tiled_mesh(&self.source, &self.doc.project);
+        self.mesh = mesh.unwrap_or_else(|| tiled_mesh(&self.source, &self.doc.project));
         self.mesh_id = next_mesh_id();
         self.stroke_visibility = None;
         for ts in changed {
+            if Some(ts) == prepared_set {
+                continue;
+            }
             let lookup_budget = self.lookup_budget_for(ts);
             if let (Some(c), Some(set)) = (self.caches.get_mut(ts), self.doc.project.texture_sets.get(ts)) {
                 *c = SetCache::new(&self.mesh, set, lookup_budget);
@@ -1735,7 +1754,7 @@ pub(crate) fn next_mesh_id() -> u64 {
 
 /// `source` with the UVs of each UV-tiled set's material mapped into its atlas (shared when no
 /// set is UV-tiled).
-fn tiled_mesh(source: &Arc<Mesh>, project: &Project) -> Arc<Mesh> {
+pub(crate) fn tiled_mesh(source: &Arc<Mesh>, project: &Project) -> Arc<Mesh> {
     let tiled: Vec<_> = project.texture_sets.iter().filter_map(|ts| Some((ts, ts.tile_grid()?))).collect();
     if tiled.is_empty() {
         return source.clone();

@@ -2304,8 +2304,17 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
             let t0 = ctx.ec.logging.node_times.then(NodeClock::start);
             let _span = crate::profile::enabled().then(|| crate::profile::span(&format!("node.{}", n.kind)));
             // grey inputs, an operation that keeps grey grey: computed on one channel
-            let grey = if extra.is_none() && GREY_KINDS.contains(&n.kind.as_str()) { compute_grey(id, n, &ins, ctx, steps.as_ref())? } else { None };
-            let r = match grey {
+            let accelerated = match n.kind.as_str() {
+                "pattern_program" => compute_gpu_pattern(id, n, &ins, ctx)?,
+                "transform_matrix" | "blend" => compute_gpu_grey_pass(id, n, &ins, ctx, steps.as_ref())?,
+                _ => None,
+            };
+            let grey = if accelerated.is_none() && extra.is_none() && GREY_KINDS.contains(&n.kind.as_str()) {
+                compute_grey(id, n, &ins, ctx, steps.as_ref())?
+            } else {
+                None
+            };
+            let r = match accelerated.or(grey) {
                 Some(c) => {
                     #[cfg(test)]
                     if matches!(c, Computed::Grey(..)) {
@@ -3004,6 +3013,23 @@ fn run_function(
     }
     if once {
         return Ok(Computed::Rgba(Tex::solid(w, h, to_px(&first))));
+    }
+    if let Some(accelerator) = &ctx.ec.accelerator {
+        use crate::accelerator::{PixelOutput, PixelRequest};
+        match accelerator.pixel(PixelRequest { program: &prog, environment: &env, size: [w, h], cancel: &ctx.ec.cancel }) {
+            Ok(Some(image)) => {
+                if let Some(profiler) = &ctx.ec.profiler {
+                    profiler.accelerated_node(id, &n.kind);
+                }
+                return Ok(match image {
+                    PixelOutput::Grey(image) => Computed::Grey(image, 1.0),
+                    PixelOutput::Rgba(image) => Computed::Rgba(image),
+                });
+            }
+            Ok(None) => {}
+            Err(_) if ctx.ec.is_cancelled() => return Err(Error::Cancelled),
+            Err(reason) => return Err(Error::BadParam(id, reason)),
+        }
     }
     // each worker keeps its registers, so what doesn't change from pixel to pixel is computed once
     let new_frame = || {
@@ -4193,17 +4219,13 @@ fn compute_grey(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx, steps
             };
             let name = n.strs.get("program").cloned().unwrap_or_default();
             let Some(program) = ctx.lib.get(&name) else { return Ok(None) };
-            // the images it draws, by position (a missing one leaves a gap), as RGBA
-            let held: Vec<(usize, Rc<Tex>)> = IMAGE_SLOTS.iter().enumerate().filter_map(|(k, slot)| ins.get(*slot).map(|v| (k, v.tex()))).collect();
-            let mut images: Vec<&Tex> = Vec::new();
-            for (k, t) in &held {
-                images.resize(*k, t.as_ref());
-                images.push(t.as_ref());
-            }
+            let held = pattern_images(ins);
+            let images: Vec<&Tex> = held.iter().map(Rc::as_ref).collect();
             let pctx = crate::patterns::Context { lib: ctx.lib, size: [s, hs], graph_inputs: ctx.gin, seed: ctx.so, graph: ctx.graph };
             let seed = f("seed", 0.0) as u32;
             match crate::patterns::render_grey(program, &pctx, seed, &images, bg.as_ref().map(|(t, a)| (t, *a)), crate::atomic::pattern_frame(n)) {
                 Ok(Some((t, a))) => Some(Computed::Grey(after_compute(t, n, s, hs), a)),
+                Err(_) if ctx.ec.is_cancelled() => return Err(Error::Cancelled),
                 // (an error is the RGBA form's to report)
                 Ok(None) | Err(_) => None,
             }
@@ -4307,6 +4329,115 @@ fn after_compute<P: crate::tex::Pixel>(out: crate::tex::Image<P>, n: &Node, s: u
         return ops::roll(&out, fx, fy);
     }
     out
+}
+
+fn compute_gpu_pattern(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx<'_>) -> Result<Option<Computed>, Error> {
+    // Readback and dispatch dominate the very small pattern nodes. Full-size procedural maps use the GPU.
+    if ctx.ec.accelerator.is_none() || ctx.size * ctx.height < 64 * 1024 {
+        return Ok(None);
+    }
+    let Some(program) = n.strs.get("program").and_then(|name| ctx.lib.get(name)) else { return Ok(None) };
+    let held = pattern_images(ins);
+    let images: Vec<&Tex> = held.iter().map(Rc::as_ref).collect();
+    let background = ins.get("bg").map(|v| (v.tex(), v.grey_in().map(|g| g.alpha())));
+    let size = [ctx.size, ctx.height];
+    let pctx = crate::patterns::Context { lib: ctx.lib, size, graph_inputs: ctx.gin, seed: ctx.so, graph: ctx.graph };
+    let seed = n.nums.get("seed").copied().unwrap_or(0.0) as u32;
+    let target = crate::patterns::render_accelerated(
+        program,
+        &pctx,
+        seed,
+        &images,
+        background.as_ref().map(|(t, alpha)| (t.as_ref(), *alpha)),
+        crate::atomic::pattern_frame(n),
+        ctx.ec,
+    );
+    if ctx.ec.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    if matches!(target, Ok(Some(_)))
+        && let Some(profiler) = &ctx.ec.profiler
+    {
+        profiler.accelerated_node(id, &n.kind);
+    }
+    target
+        .map(|t| {
+            t.map(|t| match t {
+                crate::patterns::RasterOutput::Grey(t, a) => Computed::Grey(after_compute(t, n, size[0], size[1]), a),
+                crate::patterns::RasterOutput::Rgba(t) => Computed::Rgba(after_compute(t, n, size[0], size[1])),
+            })
+        })
+        .map_err(|e| Error::BadParam(id, e))
+}
+
+/// The imported 16-bit grayscale pyramids frequently enlarge and blend whole 4K/8K images.
+fn compute_gpu_grey_pass(id: u32, n: &Node, ins: &BTreeMap<String, Val>, ctx: &Ctx<'_>, steps: Option<&crate::tex::Steps>) -> Result<Option<Computed>, Error> {
+    use crate::accelerator::GreyPass;
+    use crate::measured::{COMPILED_16_BIT, STEPS_16};
+
+    let Some(accelerator) = &ctx.ec.accelerator else { return Ok(None) };
+    if ctx.size < 4096 || ctx.size != ctx.height || !steps.is_some_and(|s| s.fmt == COMPILED_16_BIT) || rolls(n) {
+        return Ok(None);
+    }
+    let value = |key, default| n.nums.get(key).copied().unwrap_or(default);
+    let source = |slot| match ins.get(slot) {
+        Some(Val::Grey16(s)) if s.div == STEPS_16 as f32 && s.alpha.to_bits() == 1.0f32.to_bits() && s.w == s.h && s.w.is_power_of_two() => Some(s.as_ref()),
+        _ => None,
+    };
+    let pass = if n.kind == "transform_matrix" {
+        let Some(source) = source("in") else { return Ok(None) };
+        if !(2..ctx.size).contains(&source.w)
+            || !ctx.size.is_power_of_two()
+            || value("tile_x", 1.0) != 1.0
+            || value("tile_y", 1.0) != 1.0
+            || value("filter", 1.0) <= 0.5
+            || value("mip", 31.0).round() != 31.0
+            || value("offset_x", 0.0) != 0.0
+            || value("offset_y", 0.0) != 0.0
+            || crate::atomic::transform_matrix_bg(n) != [0.0; 4]
+            || [value("m00", 1.0), value("m01", 0.0), value("m10", 0.0), value("m11", 1.0)] != [1.0, 0.0, 0.0, 1.0]
+        {
+            return Ok(None);
+        }
+        GreyPass::Enlarge { source, side: ctx.size }
+    } else {
+        let (Some(foreground), Some(background)) = (source("fg"), source("bg")) else { return Ok(None) };
+        let (mode, opacity) = (value("mode", 0.0) as u32, value("opacity", 1.0));
+        if !(32..=34).contains(&mode)
+            || value("alpha_mode", 1.0) as u32 != 1
+            || !opacity.is_finite()
+            || ins.contains_key("mask")
+            || foreground.w != ctx.size
+            || background.w != ctx.size
+            || [value("crop_x0", 0.0), value("crop_y0", 0.0), value("crop_x1", 1.0), value("crop_y1", 1.0)] != [0.0, 0.0, 1.0, 1.0]
+        {
+            return Ok(None);
+        }
+        GreyPass::Blend { foreground, background, mode, opacity }
+    };
+    let result = accelerator.grey_pass(pass, &ctx.ec.cancel);
+    if ctx.ec.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    if result.as_ref().is_ok_and(Option::is_some)
+        && let Some(profiler) = &ctx.ec.profiler
+    {
+        profiler.accelerated_node(id, &n.kind);
+    }
+    result.map(|out| out.map(Computed::Stepped)).map_err(|message| Error::BadParam(id, message))
+}
+
+/// Pattern image slots hold RGBA images by position. Missing inputs leave gaps before later indices.
+fn pattern_images(ins: &BTreeMap<String, Val>) -> Vec<Rc<Tex>> {
+    let mut images = Vec::new();
+    for (index, slot) in IMAGE_SLOTS.iter().enumerate() {
+        if let Some(image) = ins.get(*slot) {
+            let image = image.tex();
+            images.resize(index, image.clone());
+            images.push(image);
+        }
+    }
+    images
 }
 
 /// The grey kernels against the RGBA ones: every graph here rendered both ways must give the same bits.

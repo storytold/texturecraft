@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use texturecraft_compose::graphs::CookTrace;
+use texturecraft_compose::graphs::{CookTrace, GraphAccelerator};
 use texturecraft_formats::ProjectFile;
 use texturecraft_import::{Cancel, Hooks, ImportOptions, Imported};
 /// The project file extension the import reads, and the import's steps.
@@ -108,7 +108,13 @@ impl Session {
 
     /// Imports the project file `bytes` (`name` names it) and opens it as the session's project.
     pub fn import_project_bytes(&mut self, bytes: Vec<u8>, name: &str, options: &ImportOptions) -> Result<Value> {
-        let task = ImportTask { source: ImportSource::Bytes { bytes, name: name.to_string() }, options: options.clone(), result_cache: None, view: false };
+        let task = ImportTask {
+            source: ImportSource::Bytes { bytes, name: name.to_string() },
+            options: options.clone(),
+            result_cache: None,
+            view: false,
+            accelerator: self.doc.graphs.accelerator(),
+        };
         let out = task.run(&ImportProgress::new())?;
         self.apply_import(out)
     }
@@ -247,6 +253,7 @@ pub struct ImportTask {
     result_cache: Option<crate::result_cache::ResultCache>,
     /// Whether the run also composites the converted project's view ([`ImportTask::with_view`]).
     view: bool,
+    accelerator: Option<Arc<dyn GraphAccelerator>>,
 }
 
 /// A finished import: the converted project as a session, the summary the command replies with, and the flag it ran
@@ -279,20 +286,27 @@ impl ImportTask {
                 options,
                 result_cache: crate::result_cache::ResultCache::from_params(ID, p)?,
                 view: false,
+                accelerator: None,
             });
         }
-        Ok(ImportTask { source: path_source(p)?, options, result_cache: crate::result_cache::ResultCache::from_params(ID, p)?, view: false })
+        Ok(ImportTask { source: path_source(p)?, options, result_cache: crate::result_cache::ResultCache::from_params(ID, p)?, view: false, accelerator: None })
     }
 
     /// Imports the file at `path` with the default options.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn path(path: impl Into<String>) -> ImportTask {
-        ImportTask { source: ImportSource::Path(path.into()), options: ImportOptions::default(), result_cache: None, view: false }
+        ImportTask { source: ImportSource::Path(path.into()), options: ImportOptions::default(), result_cache: None, view: false, accelerator: None }
     }
 
     /// Imports the project file `bytes` (named `name`) with the default options.
     pub fn bytes(name: impl Into<String>, bytes: Vec<u8>) -> ImportTask {
-        ImportTask { source: ImportSource::Bytes { bytes, name: name.into() }, options: ImportOptions::default(), result_cache: None, view: false }
+        ImportTask {
+            source: ImportSource::Bytes { bytes, name: name.into() },
+            options: ImportOptions::default(),
+            result_cache: None,
+            view: false,
+            accelerator: None,
+        }
     }
 
     /// Also composites the converted project's view before the run ends (step [`Step::ComputingView`]), so that the
@@ -314,6 +328,11 @@ impl ImportTask {
     /// Also keeps graph renders in `cache`'s folder and reuses those found there (native builds).
     pub fn with_result_cache(mut self, cache: Option<crate::result_cache::ResultCache>) -> ImportTask {
         self.result_cache = cache;
+        self
+    }
+
+    pub fn with_graph_accelerator(mut self, accelerator: Option<Arc<dyn GraphAccelerator>>) -> ImportTask {
+        self.accelerator = accelerator;
         self
     }
 
@@ -353,13 +372,13 @@ impl ImportTask {
     fn run_with_view_policy(self, progress: &ImportProgress, view: Option<impl FnOnce(&Session) -> BTreeSet<usize>>) -> Result<ImportOutput> {
         progress.log_detail("Reading the file");
         let diagnostic_path = progress.live_log.as_ref().and(self.source_path()).filter(|path| !path.is_empty()).map(str::to_owned);
-        let ImportTask { source, options, result_cache, .. } = self;
+        let ImportTask { source, options, result_cache, accelerator, .. } = self;
         let cache = result_cache.map(|c| c.open());
         #[cfg(not(target_arch = "wasm32"))]
         let kept = cache.as_ref().map(|c| c.kept.clone());
         #[cfg(target_arch = "wasm32")]
         let kept = None;
-        let result = run_kept(progress, kept, view, move |hooks| match source {
+        let result = run_kept(progress, kept, view, accelerator, move |hooks| match source {
             #[cfg(not(target_arch = "wasm32"))]
             ImportSource::Path(path) => texturecraft_import::import_path(std::path::Path::new(&path), &options, hooks).map_err(|e| (e, Some(path))),
             ImportSource::Bytes { bytes, name } => {
@@ -408,7 +427,7 @@ fn run_with(
     progress: &ImportProgress,
     convert: impl FnOnce(&mut Hooks) -> std::result::Result<Imported, (texturecraft_import::ImportError, Option<String>)>,
 ) -> Result<ImportOutput> {
-    run_kept(progress, None, None::<fn(&Session) -> BTreeSet<usize>>, convert)
+    run_kept(progress, None, None::<fn(&Session) -> BTreeSet<usize>>, None, convert)
 }
 
 /// Runs the conversion with the import's hooks (and graph cooks also kept in `kept`), then builds the session.
@@ -416,13 +435,14 @@ fn run_kept(
     progress: &ImportProgress,
     kept: Option<std::sync::Arc<dyn texturecraft_compose::graphs::KeptCooks>>,
     view: Option<impl FnOnce(&Session) -> BTreeSet<usize>>,
+    accelerator: Option<Arc<dyn GraphAccelerator>>,
     convert: impl FnOnce(&mut Hooks) -> std::result::Result<Imported, (texturecraft_import::ImportError, Option<String>)>,
 ) -> Result<ImportOutput> {
     progress.check()?;
     let (converting, saved) = if view.is_some() { (CONVERTING_WITH_VIEW, VIEW) } else { (CONVERTING, 1.0) };
     let report = |f: f32, step: Step| progress.report(f * converting, step);
     let replayer = crate::import_replay::CancellableReplayer::new(progress.cancel.clone());
-    let mut hooks = Hooks { progress: &report, cancel: &progress.cancel, replay: Some(&replayer), kept_cooks: kept, trace: progress.cook_trace() };
+    let mut hooks = Hooks { progress: &report, cancel: &progress.cancel, replay: Some(&replayer), kept_cooks: kept, trace: progress.cook_trace(), accelerator };
     let imported = convert(&mut hooks).map_err(|(e, path)| match (e, path) {
         (texturecraft_import::ImportError::Cancelled, _) => bad(ID, CANCELLED),
         (e, Some(path)) => bad(ID, format!("{path}: {e}")),
@@ -598,7 +618,7 @@ fn decode_base64(s: &str) -> Option<Vec<u8>> {
 }
 
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
-    let out = ImportTask::from_params(p)?.run(&ImportProgress::new())?;
+    let out = ImportTask::from_params(p)?.with_graph_accelerator(s.doc.graphs.accelerator()).run(&ImportProgress::new())?;
     s.apply_import(out)
 }
 
@@ -706,7 +726,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::<(f32, Step)>::new()));
         let log = seen.clone();
         let progress = ImportProgress::with_listener(move |f, step| log.lock().unwrap().push((f, step)));
-        let out = run_kept(&progress, None, Some(all_view_sets), |hooks| translate(hooks, 1, None)).unwrap();
+        let out = run_kept(&progress, None, Some(all_view_sets), None, |hooks| translate(hooks, 1, None)).unwrap();
         let seen = seen.lock().unwrap().clone();
         let mut ids: Vec<&str> = seen.iter().map(|(_, s)| s.id()).collect();
         ids.dedup();
@@ -724,7 +744,7 @@ mod tests {
         }
         // Texture sets the viewport can prepare stay pending for its compositor.
         let progress = ImportProgress::new();
-        let deferred = run_kept(&progress, None, Some(|_: &Session| BTreeSet::new()), |hooks| translate(hooks, 1, None)).unwrap();
+        let deferred = run_kept(&progress, None, Some(|_: &Session| BTreeSet::new()), None, |hooks| translate(hooks, 1, None)).unwrap();
         assert!(deferred.session().pending_tiles() > 0);
         assert_eq!((progress.fraction(), progress.step()), (1.0, Step::ComputingView));
         // a cancel during the view stops the run

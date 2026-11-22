@@ -20,6 +20,7 @@
 //!   scales each instance. The canvas is clamped to 0..1 once, at the end.
 //! - Patterns wrap around the canvas. Edges are hard: each pixel is sampled once, at its centre.
 
+use crate::context::Cancel;
 use crate::func::{FnEnv, FnFrame, FnState, Prog, Value, compile_named};
 use crate::graph::{Graph, Node, Spec};
 use crate::lcg_rand;
@@ -120,6 +121,85 @@ pub enum Canvas {
     Grey(crate::tex::Grey, f32),
 }
 
+/// One resolved draw in the order of the original program walk.
+pub struct RasterStamp {
+    /// The pixel bounds (inclusive), unwrapped unless the canvas has a custom frame.
+    pub bounds: [i32; 4],
+    /// The repeat bounds (inclusive) for a custom frame.
+    pub repeats: [i32; 4],
+    pub center: [f32; 2],
+    pub half_size: [f32; 2],
+    pub rotation: [f32; 2],
+    pub variation: f32,
+    pub pattern: i32,
+    pub brightness: [f32; 4],
+    /// The raster input image, at the mip selected by its footprint.
+    pub image: Option<u32>,
+    pub nearest: bool,
+    pub keep_larger: bool,
+}
+
+pub struct RasterRequest<'a> {
+    pub size: [usize; 2],
+    pub background: Option<&'a Tex>,
+    pub clear: [f32; 4],
+    pub color: bool,
+    /// Write only the brightness when the output is known to be grayscale.
+    pub grey_alpha: Option<f32>,
+    pub framed: bool,
+    pub region: [f32; 4],
+    pub period: [f32; 2],
+    pub stamps: &'a [RasterStamp],
+    pub images: &'a [&'a Tex],
+    pub cancel: &'a Cancel,
+}
+
+pub enum RasterOutput {
+    Grey(crate::tex::Grey, f32),
+    Rgba(Tex),
+}
+
+/// A temporary backend-neutral draw list. Very large lists remain on the streaming CPU path.
+const MAX_RASTER_STAMPS: usize = 1_000_000;
+
+struct Raster<'a> {
+    background: Option<&'a Tex>,
+    clear: [f32; 4],
+    stamps: Vec<RasterStamp>,
+    inputs: Vec<(&'a Tex, Option<Rc<Tex>>)>,
+    indices: BTreeMap<(usize, u32), u32>,
+    cancel: &'a Cancel,
+    full: bool,
+}
+
+enum Target<'a> {
+    Cpu(Canvas),
+    Raster(Raster<'a>),
+}
+
+impl Target<'_> {
+    fn set_background(&mut self, background: f32) {
+        let gray = [background, background, background, 1.0];
+        match self {
+            Self::Cpu(canvas) => {
+                let (w, h) = canvas.dims();
+                *canvas = match canvas {
+                    Canvas::Rgba(_) => Canvas::Rgba(Tex::solid(w, h, gray)),
+                    Canvas::Grey(..) => Canvas::Grey(crate::tex::Grey::solid(w, h, background), 1.0),
+                };
+            }
+            Self::Raster(raster) => {
+                raster.background = None;
+                raster.clear = gray;
+            }
+        }
+    }
+
+    fn full(&self) -> bool {
+        matches!(self, Self::Raster(raster) if raster.full)
+    }
+}
+
 impl Canvas {
     fn dims(&self) -> (usize, usize) {
         match self {
@@ -159,7 +239,8 @@ impl Canvas {
 struct Walk<'a> {
     g: &'a Graph,
     ctx: &'a Context<'a>,
-    canvas: Canvas,
+    target: Target<'a>,
+    cancel: Option<Cancel>,
     state: FnState,
     progs: BTreeMap<String, (Prog, FnFrame)>,
     seed: u32,
@@ -221,7 +302,11 @@ fn tree_depth(g: &Graph, id: u32, memo: &mut BTreeMap<u32, i32>, guard: u32) -> 
     d
 }
 
-impl Walk<'_> {
+impl<'a> Walk<'a> {
+    fn stopped(&self) -> bool {
+        self.target.full() || self.cancel.as_ref().is_some_and(Cancel::is_cancelled)
+    }
+
     /// Runs a parameter's function, if it has one.
     fn function_value(&mut self, node: &Node, name: &str) -> Result<Option<Value>, String> {
         let Some(fname) = node.strs.get(&format!("fn.{name}")).filter(|s| !s.is_empty()) else { return Ok(None) };
@@ -293,12 +378,7 @@ impl Walk<'_> {
             _ => None,
         };
         if let Some(bg) = scalar(self.function_value(node, "background")?) {
-            let bg = bg.clamp(0.0, 1.0);
-            let (w, h) = self.canvas.dims();
-            self.canvas = match self.canvas {
-                Canvas::Rgba(_) => Canvas::Rgba(Tex::solid(w, h, [bg, bg, bg, 1.0])),
-                Canvas::Grey(..) => Canvas::Grey(crate::tex::Grey::solid(w, h, bg), 1.0),
-            };
+            self.target.set_background(bg.clamp(0.0, 1.0));
         }
         if let Some(r) = scalar(self.function_value(node, "roughness")?) {
             self.levels = depth_levels(r, self.tree_depth);
@@ -327,7 +407,7 @@ impl Walk<'_> {
     }
 
     fn visit(&mut self, id: u32, cell: Cell, depth: u32, quads: usize) -> Result<(), String> {
-        if depth > MAX_DEPTH || self.instances >= MAX_INSTANCES {
+        if depth > MAX_DEPTH || self.instances >= MAX_INSTANCES || self.stopped() {
             return Ok(());
         }
         let Some(node) = self.g.nodes.get(&id) else { return Ok(()) };
@@ -348,7 +428,7 @@ impl Walk<'_> {
                 self.index = 0;
                 self.child(node, "first", cell, depth, quads)?;
                 for i in 0..count {
-                    if self.instances >= MAX_INSTANCES {
+                    if self.instances >= MAX_INSTANCES || self.stopped() {
                         break;
                     }
                     self.index = i;
@@ -417,25 +497,70 @@ impl Walk<'_> {
         let (cx, cy) = (cell.x + off[0], cell.y + off[1]);
         // half the pattern's box, signed: a negative size flips it
         let (hw, hh) = (size[0] * cell.w * 0.5, size[1] * cell.h * 0.5);
-        let (cw, ch) = (self.canvas.dims().0 as i64, self.canvas.dims().1 as i64);
+        let [cw, ch] = self.ctx.size.map(|v| v as i64);
         let rad = (hw * hw + hh * hh).sqrt();
         if rad <= 0.0 || !rad.is_finite() || !cx.is_finite() || !cy.is_finite() || hw == 0.0 || hh == 0.0 {
             return;
         }
         let (sn, cs) = math::sin_cos(-rot * std::f32::consts::TAU);
+        if !sn.is_finite() || !cs.is_finite() {
+            return;
+        }
+        // Bin the rotated rectangle, with a pixel of slack for the floating-point edge test.
+        // A square built from the diagonal is much larger for long, thin stamps.
+        let (rad_x, rad_y) = if matches!(self.target, Target::Raster(_)) {
+            let norm = sn * sn + cs * cs;
+            let projected = |a: f32, b: f32, pixels: i64| ((hw * a).abs() + (hh * b).abs()) / norm + 1.0 / pixels as f32;
+            (projected(cs, sn, cw).min(rad), projected(sn, cs, ch).min(rad))
+        } else {
+            (rad, rad)
+        };
         // 0: the pyramid level for the footprint, bilinear. 1: the image itself, bilinear. 2: the image itself, nearest.
         let filter = node.nums.get("image_filter").copied().unwrap_or(0.0).round() as i32;
         // instances come by the thousand and mostly share a level, so a level is made once
-        let mips = &mut self.mips;
         let image_mip = image.and_then(|t| {
             if filter != 0 {
                 return None;
             }
             let footprint = (t.w as f32 / (2.0 * hw.abs() * cw as f32)).max(t.h as f32 / (2.0 * hh.abs() * ch as f32));
             let level = mip_level(footprint);
-            mips.entry((image_index.max(0.0) as usize, level)).or_insert_with(|| mip_of(t, level).map(Rc::new)).clone()
+            self.mips.entry((image_index as usize, level)).or_insert_with(|| mip_of(t, level).map(Rc::new)).clone().map(|mip| (level, mip))
         });
-        let image = image.map(|t| image_mip.as_deref().unwrap_or(t));
+        let raster_image = |raster: &mut Raster<'a>| {
+            image.map(|source| {
+                let key = (image_index as usize, image_mip.as_ref().map_or(0, |(level, _)| *level));
+                *raster.indices.entry(key).or_insert_with(|| {
+                    let index = raster.inputs.len() as u32;
+                    raster.inputs.push((source, image_mip.as_ref().map(|(_, mip)| mip.clone())));
+                    index
+                })
+            })
+        };
+        let collect = |raster: &mut Raster<'a>, bounds: [i64; 4], repeats: [i64; 4]| {
+            if bounds[0] > bounds[2] || bounds[1] > bounds[3] || repeats[0] > repeats[2] || repeats[1] > repeats[3] {
+                return;
+            }
+            // Keep shader indexing and float pixel centres precise even for unexpectedly large offsets.
+            if raster.stamps.len() >= MAX_RASTER_STAMPS || bounds.iter().any(|v| !(-4_000_000..=4_000_000).contains(v)) {
+                raster.full = true;
+                return;
+            }
+            let image = raster_image(raster);
+            raster.stamps.push(RasterStamp {
+                bounds: bounds.map(|v| v as i32),
+                repeats: repeats.map(|v| v as i32),
+                center: [cx, cy],
+                half_size: [hw, hh],
+                rotation: [sn, cs],
+                variation,
+                pattern,
+                brightness,
+                image,
+                nearest: filter >= 2,
+                keep_larger,
+            });
+        };
+        let image = image.map(|t| image_mip.as_ref().map_or(t, |(_, mip)| mip.as_ref()));
         let color = self.color;
         let sample = |px: f32, py: f32| -> Option<[f32; 4]> {
             let (u, v) = (px - cx, py - cy);
@@ -459,10 +584,10 @@ impl Walk<'_> {
         let [rx0, rx1, ry0, ry1] = self.region;
         let (rw, rh) = (rx1 - rx0, ry1 - ry0);
         let [px_, py_] = self.period;
-        let framed = (rw > 0.0 && (rx0 != 0.0 || rw != 1.0)) || (rh > 0.0 && (ry0 != 0.0 || rh != 1.0)) || px_ != 1.0 || py_ != 1.0;
+        let framed = framed_region(self.region, self.period);
         if framed {
             // the box's copies: every repeat that reaches the part of pattern space the canvas shows
-            let copies = |c: f32, tile: bool, lo: f32, span: f32, period: f32| {
+            let copies = |c: f32, rad: f32, tile: bool, lo: f32, span: f32, period: f32| {
                 if !tile {
                     return 0..=0;
                 }
@@ -471,14 +596,23 @@ impl Walk<'_> {
                 let last = ((c + rad - lo) / period).ceil() as i64;
                 first.max(-MAX_REPEATS)..=last.min(MAX_REPEATS)
             };
-            let (kx, ky) = (copies(cx, self.tile[0], rx0, rw, px_), copies(cy, self.tile[1], ry0, rh, py_));
+            let (kx, ky) = (copies(cx, rad_x, self.tile[0], rx0, rw, px_), copies(cy, rad_y, self.tile[1], ry0, rh, py_));
             // an instance is often far smaller than the canvas: only the rows and columns its copies can reach
-            let (columns, rows) = if sn.is_finite() && cs.is_finite() {
-                (pixels_near(cx, rad, kx.clone(), px_, rx0, rw, cw), pixels_near(cy, rad, ky.clone(), py_, ry0, rh, ch))
-            } else {
-                (vec![(0, cw - 1)], vec![(0, ch - 1)])
-            };
+            let (columns, rows) = (pixels_near(cx, rad_x, kx.clone(), px_, rx0, rw, cw), pixels_near(cy, rad_y, ky.clone(), py_, ry0, rh, ch));
+            if let Target::Raster(raster) = &mut self.target {
+                let repeats = [*kx.start(), *ky.start(), *kx.end(), *ky.end()];
+                for &(y0, y1) in &rows {
+                    for &(x0, x1) in &columns {
+                        collect(raster, [x0, y0, x1, y1], repeats);
+                    }
+                }
+                return;
+            }
+            let Target::Cpu(canvas) = &mut self.target else { return };
             for y in rows.iter().flat_map(|r| r.0..=r.1) {
+                if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+                    return;
+                }
                 let v = (y as f32 + 0.5) / ch as f32;
                 let py = if rh > 0.0 { ry0 + v * rh } else { v };
                 for x in columns.iter().flat_map(|r| r.0..=r.1) {
@@ -487,17 +621,17 @@ impl Walk<'_> {
                     for j in ky.clone() {
                         for i in kx.clone() {
                             let Some(a) = sample(px + i as f32 * px_, py + j as f32 * py_) else { continue };
-                            self.canvas.draw((y * cw + x) as usize, a, brightness, keep_larger, color);
+                            canvas.draw((y * cw + x) as usize, a, brightness, keep_larger, color);
                         }
                     }
                 }
             }
             return;
         }
-        let mut x0 = ((cx - rad) * cw as f32).floor() as i64;
-        let mut x1 = ((cx + rad) * cw as f32).ceil() as i64;
-        let mut y0 = ((cy - rad) * ch as f32).floor() as i64;
-        let mut y1 = ((cy + rad) * ch as f32).ceil() as i64;
+        let mut x0 = ((cx - rad_x) * cw as f32).floor() as i64;
+        let mut x1 = ((cx + rad_x) * cw as f32).ceil() as i64;
+        let mut y0 = ((cy - rad_y) * ch as f32).floor() as i64;
+        let mut y1 = ((cy + rad_y) * ch as f32).ceil() as i64;
         let centre = ((cx * cw as f32) as i64, (cy * ch as f32) as i64);
         (x0, x1) = (x0.max(centre.0 - MAX_WRAPS * cw), x1.min(centre.0 + MAX_WRAPS * cw));
         (y0, y1) = (y0.max(centre.1 - MAX_WRAPS * ch), y1.min(centre.1 + MAX_WRAPS * ch));
@@ -507,11 +641,19 @@ impl Walk<'_> {
         if !self.tile[1] {
             (y0, y1) = (y0.max(0), y1.min(ch - 1));
         }
+        if let Target::Raster(raster) = &mut self.target {
+            collect(raster, [x0, y0, x1, y1], [0; 4]);
+            return;
+        }
+        let Target::Cpu(canvas) = &mut self.target else { return };
         for y in y0..=y1 {
+            if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+                return;
+            }
             for x in x0..=x1 {
                 let Some(a) = sample((x as f32 + 0.5) / cw as f32, (y as f32 + 0.5) / ch as f32) else { continue };
                 let i = (y.rem_euclid(ch) * cw + x.rem_euclid(cw)) as usize;
-                self.canvas.draw(i, a, brightness, keep_larger, color);
+                canvas.draw(i, a, brightness, keep_larger, color);
             }
         }
     }
@@ -719,14 +861,95 @@ pub(crate) fn render_grey(
 }
 
 fn render_on(program: &Graph, ctx: &Context<'_>, seed: u32, images: &[&Tex], canvas: Canvas, frame: Frame) -> Result<Canvas, String> {
+    let walk = walk_program(program, ctx, seed, images, Target::Cpu(canvas), frame)?;
+    let Target::Cpu(mut out) = walk.target else { return Err("pattern program has no CPU canvas".into()) };
+    if walk.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+        return Err("pattern program was cancelled".into());
+    }
+    match &mut out {
+        Canvas::Rgba(t) => {
+            for p in &mut t.px {
+                for c in p.iter_mut().take(3) {
+                    *c = c.clamp(0.0, 1.0);
+                }
+            }
+        }
+        Canvas::Grey(t, _) => t.px.iter_mut().for_each(|c| *c = c.clamp(0.0, 1.0)),
+    }
+    Ok(out)
+}
+
+/// Prepare the sequential program once and let the backend rasterize the ordered draws.
+pub(crate) fn render_accelerated(
+    program: &Graph,
+    ctx: &Context<'_>,
+    seed: u32,
+    images: &[&Tex],
+    background: Option<(&Tex, Option<f32>)>,
+    frame: Frame,
+    eval: &crate::context::EvalContext,
+) -> Result<Option<RasterOutput>, String> {
+    let Some(accelerator) = &eval.accelerator else { return Ok(None) };
+    let cancel = &eval.cancel;
+    let bg = frame.background.clamp(0.0, 1.0);
+    let target = Target::Raster(Raster {
+        background: background.map(|(image, _)| image),
+        clear: frame.background_color.unwrap_or([bg, bg, bg, 1.0]),
+        stamps: Vec::new(),
+        inputs: Vec::new(),
+        indices: BTreeMap::new(),
+        cancel,
+        full: false,
+    });
+    let walk = walk_program(program, ctx, seed, images, target, frame)?;
+    let Target::Raster(raster) = walk.target else { return Ok(None) };
+    if raster.full || cancel.is_cancelled() {
+        return Ok(None);
+    }
+    let images: Vec<&Tex> = raster.inputs.iter().map(|(src, mip)| mip.as_deref().unwrap_or(src)).collect();
+    let framed = framed_region(walk.region, walk.period);
+    let grey_alpha = if frame.color {
+        None
+    } else if raster.background.is_some() {
+        background.and_then(|(_, alpha)| alpha)
+    } else {
+        let [r, g, b, a] = raster.clear;
+        (r.to_bits() == g.to_bits() && g.to_bits() == b.to_bits() && crate::tex::grey_alpha_ok(a)).then_some(a)
+    };
+    accelerator.pattern(RasterRequest {
+        size: ctx.size,
+        background: raster.background,
+        clear: raster.clear,
+        color: frame.color,
+        grey_alpha,
+        framed,
+        region: walk.region,
+        period: walk.period,
+        stamps: &raster.stamps,
+        images: &images,
+        cancel,
+    })
+}
+
+fn framed_region([x0, x1, y0, y1]: [f32; 4], [x, y]: [f32; 2]) -> bool {
+    let (w, h) = (x1 - x0, y1 - y0);
+    (w > 0.0 && (x0 != 0.0 || w != 1.0)) || (h > 0.0 && (y0 != 0.0 || h != 1.0)) || x != 1.0 || y != 1.0
+}
+
+fn walk_program<'a>(program: &'a Graph, ctx: &'a Context<'a>, seed: u32, images: &'a [&'a Tex], target: Target<'a>, frame: Frame) -> Result<Walk<'a>, String> {
     let roots: Vec<u32> = program.nodes.iter().filter(|(_, n)| n.kind == "pp_out").map(|(i, _)| *i).collect();
     let [root] = roots.as_slice() else { return Err("a pattern program needs exactly one pp_out node".into()) };
     program.check_cycles().map_err(|e| e.to_string())?;
     let depth = tree_depth(program, *root, &mut BTreeMap::new(), 0).max(0) as u32;
+    let cancel = match &target {
+        Target::Cpu(_) => crate::context::current_cancel(),
+        Target::Raster(raster) => Some(raster.cancel.clone()),
+    };
     let mut walk = Walk {
         g: program,
         ctx,
-        canvas,
+        target,
+        cancel,
         state: FnState::default(),
         progs: BTreeMap::new(),
         mips: BTreeMap::new(),
@@ -746,18 +969,7 @@ fn render_on(program: &Graph, ctx: &Context<'_>, seed: u32, images: &[&Tex], can
         tree_depth: depth,
     };
     walk.visit(*root, Cell { x: 0.5, y: 0.5, w: 1.0, h: 1.0 }, 0, 0)?;
-    let mut out = walk.canvas;
-    match &mut out {
-        Canvas::Rgba(t) => {
-            for p in &mut t.px {
-                for c in p.iter_mut().take(3) {
-                    *c = c.clamp(0.0, 1.0);
-                }
-            }
-        }
-        Canvas::Grey(t, _) => t.px.iter_mut().for_each(|c| *c = c.clamp(0.0, 1.0)),
-    }
-    Ok(out)
+    Ok(walk)
 }
 
 #[cfg(test)]

@@ -24,6 +24,12 @@ pub mod gpu_bake;
 pub mod gpu_brush;
 pub mod gpu_composite;
 mod gpu_curvature;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gpu_graph;
+#[cfg(not(target_arch = "wasm32"))]
+mod gpu_graph_grey;
+#[cfg(not(target_arch = "wasm32"))]
+mod gpu_graph_patterns;
 mod gpu_image_source;
 mod gpu_neighbourhood;
 pub mod gpu_quick_mask;

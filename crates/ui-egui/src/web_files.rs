@@ -187,6 +187,7 @@ pub fn load(app: &mut TextureCraftApp, name: &str, bytes: Vec<u8>) {
             app.session.switch_to(next);
             app.pbr_import = None;
             app.resize = None;
+            app.queued_resize = None;
             app.layer_panel = Default::default();
             app.toast(trf("Opened {name}", &[("name", &name)]), false);
         }

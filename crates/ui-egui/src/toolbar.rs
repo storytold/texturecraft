@@ -549,9 +549,27 @@ pub fn status_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                     if ui.small_button(tr("Cancel")).clicked() {
                         app.cancel_bake();
                     }
-                } else if let Some(job) = &app.resize {
-                    let bar = egui::ProgressBar::new(job.progress.fraction()).desired_width(160.0).desired_height(10.0);
-                    ui.add(bar.animate(true).text(RichText::new(tr("Resizing textures")).size(10.0)));
+                } else if let Some(job) = app.resize.as_ref().filter(|job| !job.progress.is_cancelled() || app.queued_resize.is_some()) {
+                    use texturecraft_engine::ResizeStage;
+                    let (fraction, stage) = job.progress.status();
+                    let waiting = job.progress.is_cancelled();
+                    let label = if waiting {
+                        tr("Waiting for the previous resize").to_owned()
+                    } else {
+                        match stage {
+                            ResizeStage::Paint => tr("Resizing textures").to_owned(),
+                            ResizeStage::Graphs(Some((graph, done, total))) => {
+                                trf("{graph} ({done}/{total} nodes)", &[("graph", &graph), ("done", &done), ("total", &total)])
+                            }
+                            ResizeStage::Graphs(None) => tr("Preparing material graphs").to_owned(),
+                            ResizeStage::Display | ResizeStage::Ready => tr("Computing the view").to_owned(),
+                        }
+                    };
+                    let bar = egui::ProgressBar::new(if waiting { 0.0 } else { fraction }).desired_width(185.0).desired_height(10.0);
+                    ui.add(bar.animate(true).text(RichText::new(label).size(10.0)));
+                    if ui.small_button(tr("Cancel")).clicked() {
+                        app.cancel_resize();
+                    }
                 } else if app.gpu.as_ref().is_some_and(|gpu| gpu.cpu_padding_pending()) {
                     ui.add(egui::Spinner::new().size(10.0));
                     ui.label(RichText::new(tr("CPU preparing UV padding")).size(11.0));

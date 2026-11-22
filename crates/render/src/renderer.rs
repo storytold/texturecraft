@@ -438,6 +438,8 @@ struct SetGpu {
     /// until its sets are painted.
     tex: Vec<Tex>,
     bind_group: wgpu::BindGroup,
+    /// The last complete material, kept bound until the new resolution has been uploaded.
+    resize_from: Option<wgpu::BindGroup>,
     mips_dirty: Vec<MipsDirty>,
     /// Textures whose full-size allocation failed (out of GPU memory): they keep their
     /// placeholder until the set is re-created, instead of retrying on every tile.
@@ -455,6 +457,12 @@ struct PendingTex {
     /// `None` for success, else what went wrong. (A mutex: the renderer is shared with the
     /// paint callback, so it must be `Sync`.)
     answer: std::sync::Mutex<std::sync::mpsc::Receiver<Option<String>>>,
+}
+
+impl SetGpu {
+    fn display_bind_group(&self) -> &wgpu::BindGroup {
+        self.resize_from.as_ref().unwrap_or(&self.bind_group)
+    }
 }
 
 struct PendingDisplaySeed {
@@ -1422,6 +1430,7 @@ impl Renderer {
         // not be replaced by a late overview from the previous mesh.
         for set in &mut self.sets {
             set.pending_seed = None;
+            set.resize_from = None;
             set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
         }
         if let Some(compositor) = &mut self.compositor {
@@ -1605,6 +1614,18 @@ impl Renderer {
     /// UV-tiled set's atlas) and map mesh materials to sets. Re-created textures start neutral;
     /// returns the sets that were reset (the caller must upload all their tiles).
     pub fn set_texture_sets(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, sets: &[((u32, u32), usize)], material_count: usize) -> Vec<usize> {
+        self.set_texture_sets_preserving(device, queue, sets, material_count, &[])
+    }
+
+    /// For an interactive resize, draw the previous material while the replacement texture fills.
+    pub fn set_texture_sets_preserving(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sets: &[((u32, u32), usize)],
+        material_count: usize,
+        resizing: &[usize],
+    ) -> Vec<usize> {
         let mut reset = Vec::new();
         self.content_rev += 1;
         self.sets.truncate(sets.len());
@@ -1618,9 +1639,11 @@ impl Renderer {
         for (i, &(size, material)) in sets.iter().enumerate() {
             // Downscale sets that exceed the device's texture dimension limit
             let shift = (0..31).find(|s| size.0.max(size.1) >> s <= max).unwrap_or(0).max(self.display_shift);
-            if self.sets.get(i).is_some_and(|s| s.size == size && s.shift == shift && s.material == material) {
+            let preserve = resizing.contains(&i);
+            if !preserve && self.sets.get(i).is_some_and(|s| s.size == size && s.shift == shift && s.material == material) {
                 continue;
             }
+            let resize_from = self.sets.get(i).filter(|s| preserve && s.material == material).map(|s| s.display_bind_group().clone());
 
             // Allocate full-size textures on the first non-neutral upload
             let mut tex: Vec<Tex> =
@@ -1634,6 +1657,7 @@ impl Renderer {
                 shift,
                 tex,
                 bind_group,
+                resize_from,
                 mips_dirty: vec![MipsDirty::All; n],
                 failed: vec![false; n],
                 pending: (0..n).map(|_| None).collect(),
@@ -1653,6 +1677,17 @@ impl Renderer {
             }
         }
         reset
+    }
+
+    /// Publish a CPU-prepared resized texture set once its last tile is uploaded.
+    pub fn finish_texture_set_resize(&mut self, ts: usize) {
+        if let Some(set) = self.sets.get_mut(ts)
+            && set.pending.iter().all(Option::is_none)
+            && set.pending_seed.is_none()
+            && set.resize_from.take().is_some()
+        {
+            self.content_rev += 1;
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1709,6 +1744,7 @@ impl Renderer {
                 set.mips_dirty[i] = MipsDirty::Clean;
             }
             set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
+            set.resize_from = None;
             self.content_rev += 1;
             return Ok(());
         }
@@ -1777,6 +1813,7 @@ impl Renderer {
             set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
             set.pending_seed = None;
             set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
+            set.resize_from = None;
             self.content_rev += 1;
         }
         Ok(())
@@ -2521,7 +2558,7 @@ impl Renderer {
                 pass.set_vertex_buffer(0, geo.vb.slice(..));
                 pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
                 for (range, set) in self.drawable(&geo.draws, visible, None) {
-                    pass.set_bind_group(1, &set.bind_group, &[]);
+                    pass.set_bind_group(1, set.display_bind_group(), &[]);
                     pass.draw_indexed(range, 0, 0..1);
                 }
             }
@@ -2735,7 +2772,7 @@ impl Renderer {
             pass.set_vertex_buffer(0, geo.vb.slice(..));
             pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
             for (range, set) in self.drawable(&geo.draws, &frame.visible, None) {
-                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.set_bind_group(1, set.display_bind_group(), &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
         }
@@ -2884,7 +2921,7 @@ impl Renderer {
             pass.set_vertex_buffer(0, vertices.slice(..));
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
             for (range, set) in self.drawable(ranges, &frame.visible, only_set) {
-                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.set_bind_group(1, set.display_bind_group(), &[]);
                 pass.draw_indexed(range, 0, 0..instances);
             }
         }
@@ -2900,7 +2937,7 @@ impl Renderer {
             pass.set_vertex_buffer(0, mesh.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
             for (range, set) in self.drawable(&seams.line_draws, &frame.visible, Some(texture_set)) {
-                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.set_bind_group(1, set.display_bind_group(), &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
         }
@@ -2934,7 +2971,7 @@ impl Renderer {
             pass.set_vertex_buffer(0, low_poly.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
             for (range, set) in self.drawable(&seams.line_draws, &frame.visible, None) {
-                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.set_bind_group(1, set.display_bind_group(), &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
         }
@@ -3222,6 +3259,19 @@ mod tests {
         let (width, _, bytes) = crate::readback::Readback::blocking_level(&h.device, &h.queue, texture, 0).unwrap();
         let offset = (y * width as usize + x) * 4;
         bytes[offset..offset + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn a_cpu_resize_keeps_the_old_material_bound_until_its_replacement_is_ready() {
+        let Ok(mut h) = Headless::new() else { return };
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((128, 128), 0)], 1);
+        let previous = h.renderer.sets[0].display_bind_group().clone();
+        h.renderer.set_texture_sets_preserving(&h.device, &h.queue, &[((256, 256), 0)], 1, &[0]);
+        h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, 0, 0, &[230, 20, 25, 255].repeat(64 * 64));
+        assert_eq!(h.renderer.sets[0].display_bind_group(), &previous, "partial replacement tiles must not be visible");
+        h.renderer.finish_texture_set_resize(0);
+        assert_ne!(h.renderer.sets[0].display_bind_group(), &previous);
+        assert_eq!(base_pixel(&h, 32, 32), [230, 20, 25, 255]);
     }
 
     #[test]

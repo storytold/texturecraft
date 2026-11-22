@@ -19,8 +19,10 @@ mod differential;
 #[cfg(test)]
 mod reference;
 mod vm;
+mod wgsl;
 
 pub use vm::Frame as FnFrame;
+pub use wgsl::PixelShader;
 
 use crate::graph::{Graph, Pin, Spec};
 use crate::math;

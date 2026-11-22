@@ -97,7 +97,9 @@ impl Features {
                 include_str!("shaders/material_image.wgsl"),
                 "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }
                  fn authored_image_content(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }
-                 fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>) -> vec4<f32> { return vec4(0.5, 0.5, 0.5, 1.0); }",
+                 fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>) -> vec4<f32> { return vec4(0.5, 0.5, 0.5, 1.0); }
+                 fn authored_image_triplanar(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }
+                 fn authored_image_flat_warp(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }",
             ),
             include_str!("shaders/stencil_projection.wgsl"),
             include(
@@ -146,7 +148,10 @@ impl Features {
                 "fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
                     let content = base_content(layer, texel);
                     return select(vec4(0.0), content, content.a > 0.0);
-                }",
+                 }
+                 fn layer_content_from(layer: Operation, texel: LayerTexel, count: u32, previous: vec4<f32>, passthrough: bool) -> vec4<f32> {
+                     return layer_content(layer, texel, count);
+                 }",
             ),
             include(
                 self.height_mask,
