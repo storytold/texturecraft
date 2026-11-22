@@ -300,11 +300,16 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
     if let Some(rotation) = f32p(params, "rotation") {
         decal.rotation = rotation.rem_euclid(360.0);
     }
-    if let Some(offset) = params.get("offset").and_then(Value::as_array) {
-        let values: Vec<f32> = offset.iter().filter_map(Value::as_f64).map(|value| value as f32).filter(|value| value.is_finite()).collect();
-        let [right, up] = values.as_slice() else { return Err(bad(command, "`offset` must be [right, up]")) };
-
-        decal.offset = [right.clamp(-mesh_diagonal, mesh_diagonal), up.clamp(-mesh_diagonal, mesh_diagonal)];
+    if let Some(offset) = params.get("offset").filter(|offset| !offset.is_null()) {
+        let pair = offset
+            .as_array()
+            .and_then(|parts| {
+                let [right, up] = parts.as_slice() else { return None };
+                let pair = [right.as_f64()? as f32, up.as_f64()? as f32];
+                pair.iter().all(|value| value.is_finite()).then_some(pair)
+            })
+            .ok_or_else(|| bad(command, "`offset` must be [right, up]"))?;
+        decal.offset = pair.map(|value| value.clamp(-mesh_diagonal, mesh_diagonal));
     }
     if let Some(depth) = f32p(params, "depth") {
         decal.depth = depth.clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE);

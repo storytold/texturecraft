@@ -450,6 +450,36 @@ fn text_becomes_a_brush_alpha_and_a_decal() {
 }
 
 #[test]
+fn malformed_decal_offsets_leave_the_edit_untouched() {
+    let mut s = session();
+    let mut png = Vec::new();
+    let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255]));
+    image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let name = s.import_resource_bytes("decal.png", png).unwrap();
+    let added = execute(&mut s, "layer.add.decal", &json!({"image": name, "position": [0, 0, 1], "normal": [0, 0, 1]})).unwrap();
+    let layer = added["layer"].as_u64().unwrap();
+
+    let (lo, hi) = s.mesh.bounds();
+    let limit = (hi - lo).length().max(1e-3);
+    let updated = execute(&mut s, "layer.decal.set", &json!({"layer": layer, "offset": [limit * 2.0, -0.25]})).unwrap();
+    assert_eq!(updated["decal"]["offset"], json!([limit, -0.25]));
+
+    let revision = s.revision;
+    let undo_count = s.history_labels().len();
+    for offset in [json!([0.1, "bad", 0.2]), json!([0.1, 0.2, 0.3]), json!([1e40, 0.2]), json!(0.1)] {
+        let error = execute(&mut s, "layer.decal.set", &json!({"layer": layer, "offset": offset, "rotation": 45})).unwrap_err();
+        assert!(error.to_string().contains("`offset`"));
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.history_labels().len(), undo_count);
+    }
+
+    for params in [json!({"layer": layer}), json!({"layer": layer, "offset": null})] {
+        let unchanged = execute(&mut s, "layer.decal.set", &params).unwrap();
+        assert_eq!(unchanged["decal"], updated["decal"]);
+    }
+}
+
+#[test]
 fn projection_tool_paints_the_stencil_colors() {
     let mut s = session();
     let mut png = Vec::new();
