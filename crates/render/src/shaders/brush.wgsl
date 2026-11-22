@@ -136,7 +136,8 @@ fn procedural_alpha(p: vec2<f32>, hardness: f32, seed: u32) -> f32 {
 
 fn tip_texel(p: vec2<i32>, side: i32, mip: u32) -> f32 {
     if any(p < vec2(0)) || any(p >= vec2(side)) { return 0.0; }
-    return textureLoad(tip, p, mip).x;
+    // The GLSL backend needs an i32 level here.
+    return textureLoad(tip, p, i32(mip)).x;
 }
 
 fn library_alpha(local: vec2<f32>, radius: f32) -> f32 {
