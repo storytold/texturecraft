@@ -505,6 +505,9 @@ impl TileImage {
     /// texels read as `empty` (one value per component); destination tiles whose source
     /// footprint is entirely unallocated stay unallocated.
     pub fn resampled(&self, width: u32, height: u32, empty: &[u16]) -> TileImage {
+        if (self.width, self.height) == (width.max(1), height.max(1)) {
+            return self.clone();
+        }
         let mut out = TileImage::new(width, height, self.comps);
         if self.allocated_count() == 0 {
             return out;
@@ -519,37 +522,65 @@ impl TileImage {
         out
     }
 
+    /// Conservative source texel bounds (exclusive maximum) for a rectangular output tile range.
+    pub fn resize_footprint(&self, size: [u32; 2], tiles: [std::ops::Range<u32>; 2]) -> ([u32; 2], [u32; 2]) {
+        let source = [self.width, self.height];
+        let scale = |axis: usize, tile| {
+            let texel = u64::from(tile) * u64::from(TILE);
+            let texel = texel.min(u64::from(size[axis]));
+            (texel * u64::from(source[axis]) / u64::from(size[axis].max(1))) as u32
+        };
+        let start = std::array::from_fn(|axis| scale(axis, tiles[axis].start).saturating_sub(1));
+        let end = std::array::from_fn(|axis| scale(axis, tiles[axis].end).saturating_add(2).min(source[axis]));
+        (start, end)
+    }
+
+    /// Whether the half-open integer bounds contain any part of an allocated tile.
+    pub fn has_allocated_texels(&self, start: [u32; 2], end: [u32; 2]) -> bool {
+        let end = [end[0].min(self.width), end[1].min(self.height)];
+        start[0] < end[0]
+            && start[1] < end[1]
+            && (start[1] / TILE..end[1].div_ceil(TILE)).any(|y| (start[0] / TILE..end[0].div_ceil(TILE)).any(|x| self.is_allocated(x, y)))
+    }
+
     /// Tile (tx, ty) of [`TileImage::resampled`] alone (None when its source footprint is
-    /// entirely unallocated).
+    /// entirely unallocated). Coordinates and interpolation match the paint resize shader.
     pub fn resampled_tile(&self, width: u32, height: u32, tx: u32, ty: u32, empty: &[u16]) -> Option<Vec<u16>> {
-        let (sw, sh) = (self.width as f32, self.height as f32);
         let (dw, dh) = (width.max(1), height.max(1));
-        let comps = self.comps;
-        // Skip destination tiles whose source footprint has no allocated tile.
-        let (x0, y0) = ((tx * TILE) as f32 * sw / dw as f32, (ty * TILE) as f32 * sh / dh as f32);
-        let (x1, y1) = (((tx + 1) * TILE) as f32 * sw / dw as f32, ((ty + 1) * TILE) as f32 * sh / dh as f32);
-        let any = ((y0 as u32).saturating_sub(1) / TILE..=((y1 as u32 + 1) / TILE).min(self.tiles_y.saturating_sub(1))).any(|sy| {
-            ((x0 as u32).saturating_sub(1) / TILE..=((x1 as u32 + 1) / TILE).min(self.tiles_x.saturating_sub(1))).any(|sx| self.is_allocated(sx, sy))
-        });
-        if !any || self.width == 0 || self.height == 0 {
+        if tx >= dw.div_ceil(TILE) || ty >= dh.div_ceil(TILE) {
             return None;
         }
-        let mut data = vec![0u16; TILE_AREA * comps];
-        for ly in 0..TILE {
-            let y = ty * TILE + ly;
-            if y >= dh {
-                break;
-            }
-            let fy = (y as f32 + 0.5) * sh / dh as f32;
-            for lx in 0..TILE {
-                let x = tx * TILE + lx;
-                if x >= dw {
-                    break;
-                }
-                let fx = (x as f32 + 0.5) * sw / dw as f32;
-                let o = ((ly * TILE + lx) as usize) * comps;
-                if let Some(out) = data.get_mut(o..o + comps) {
-                    self.bilinear(fx, fy, empty, out);
+        let (start, end) = self.resize_footprint([dw, dh], [tx..tx + 1, ty..ty + 1]);
+        if !self.has_allocated_texels(start, end) {
+            return None;
+        }
+        let mut absent = [0u16; 4];
+        for (value, default) in absent.iter_mut().zip(empty) {
+            *value = *default;
+        }
+        let sample = |x, y| {
+            if self.is_allocated(x / TILE, y / TILE) { self.get(x, y) } else { absent }
+        };
+        let left = tx * TILE;
+        let top = ty * TILE;
+        let columns = TILE.min(dw - left);
+        let mut x_samples = [(0, 0, 0); TILE as usize];
+        for (column, sample) in x_samples.iter_mut().take(columns as usize).enumerate() {
+            *sample = resize_axis(left + column as u32, self.width, dw);
+        }
+        let mut data = vec![0u16; TILE_AREA * self.comps];
+        for (row, y) in data.chunks_exact_mut(TILE as usize * self.comps).zip(top..dh) {
+            let (y0, y1, wy) = resize_axis(y, self.height, dh);
+            for (out, &(x0, x1, wx)) in row.chunks_exact_mut(self.comps).zip(x_samples.iter().take(columns as usize)) {
+                let a = sample(x0, y0);
+                let b = sample(x1, y0);
+                let c = sample(x0, y1);
+                let d = sample(x1, y1);
+                for (k, value) in out.iter_mut().enumerate() {
+                    let top = u32::from(a[k]) * (RESIZE_ONE - wx) + u32::from(b[k]) * wx;
+                    let bottom = u32::from(c[k]) * (RESIZE_ONE - wx) + u32::from(d[k]) * wx;
+                    let blended = u64::from(top) * u64::from(RESIZE_ONE - wy) + u64::from(bottom) * u64::from(wy);
+                    *value = ((blended + (1u64 << 31)) >> 32) as u16;
                 }
             }
         }
@@ -619,6 +650,26 @@ impl TileImage {
         }
         any.then_some(data)
     }
+}
+
+const RESIZE_ONE: u32 = 1 << 16;
+
+/// Map an output pixel center onto two input texels with a 16-bit fractional weight.
+/// Divide before doubling the remainder so the calculation also works for large atlases.
+fn resize_axis(pixel: u32, source: u32, dest: u32) -> (u32, u32, u32) {
+    let (source, dest) = (u64::from(source), u64::from(dest));
+    let scaled = u64::from(pixel) * source;
+    let base = scaled / dest;
+    let center = 2 * (scaled % dest) + source;
+    let (base, fraction) = if center >= dest {
+        (base + (center - dest) / (2 * dest), (center - dest) % (2 * dest))
+    } else if base == 0 {
+        (0, 0)
+    } else {
+        (base - 1, center + dest)
+    };
+    let weight = ((fraction * u64::from(RESIZE_ONE) + dest) / (2 * dest)) as u32;
+    (base.min(source - 1) as u32, (base + 1).min(source - 1) as u32, weight)
 }
 
 #[cfg(test)]
