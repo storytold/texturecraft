@@ -21,7 +21,7 @@ use texturecraft_engine::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_render::gpu_composite::GRAPH_OUTPUT_PENDING;
-use texturecraft_render::gpu_composite::{CompositeGraphs, CompositeProgram, CompositeRegion};
+use texturecraft_render::gpu_composite::{CompositeGraphs, CompositeProgram, CompositeRegion, CompositeTiming};
 use texturecraft_render::{BakeVisualization, CageGeometry, Frame, Renderer, wgpu};
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_render::{
@@ -143,7 +143,18 @@ impl SceneSync {
             || self.tiles.iter().any(|(set, kind, ..)| *set == ts && *kind == DisplayKind::BaseColor)
     }
 
+    #[cfg(test)]
     fn apply_display(&self, renderer: &mut Renderer, device: &wgpu::Device, queue: &wgpu::Queue) -> (Vec<usize>, Vec<(usize, String)>) {
+        self.apply_display_reporting(renderer, device, queue, None)
+    }
+
+    fn apply_display_reporting(
+        &self,
+        renderer: &mut Renderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        reports: Option<&Mutex<GpuReports>>,
+    ) -> (Vec<usize>, Vec<(usize, String)>) {
         let mut reset = Vec::new();
         if let Some((sets, material_count, shift)) = &self.sets {
             let resizing: Vec<_> = self.resized_sets.iter().filter_map(|(ts, staged)| (!staged.load(Ordering::Acquire)).then_some(*ts)).collect();
@@ -162,9 +173,16 @@ impl SceneSync {
         }
         let mut errors = Vec::new();
         for (ts, program, failed) in &self.composites {
-            if let Err(error) = renderer.composite_on_gpu(device, queue, *ts, program) {
+            let mut timing = (reports.is_some() && !program.is_neutral() && !program.is_mask_preview()).then(CompositeTiming::default);
+            if let Err(error) = renderer.composite_on_gpu_timed(device, queue, *ts, program, timing.as_mut()) {
                 failed.store(true, Ordering::Release);
                 errors.push((*ts, error));
+            } else if let (Some(timing), Some(reports)) = (timing, reports) {
+                reports
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .performance
+                    .push((self.mesh_id, format!("GPU material preparation for texture set {}: {timing}", ts + 1)));
             }
         }
         if let Some((ts, overview)) = &self.overview {
@@ -1344,7 +1362,8 @@ impl CallbackTrait for ViewCallback {
             if let Some((mesh, id)) = &sync.mesh {
                 gpu.renderer.set_mesh(device, queue, mesh, *id);
             }
-            let (reset, errors) = sync.apply_display(&mut gpu.renderer, device, queue);
+            let timing = sync.composite_work.as_ref().and_then(|work| work.started).map(|_| gpu.reports.as_ref());
+            let (reset, errors) = sync.apply_display_reporting(&mut gpu.renderer, device, queue, timing);
             let submitted = sync.composites.iter().any(|(_, program, failed)| !program.is_neutral() && !failed.load(Ordering::Acquire));
             if !errors.is_empty() {
                 let mut reports = gpu.reports.lock().unwrap_or_else(PoisonError::into_inner);

@@ -1,6 +1,7 @@
 //! Compile the viewport's supported UV fills to a small GPU layer program.
 
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use std::{borrow::Cow, collections::BTreeMap};
 
 use bytemuck::{Pod, Zeroable};
@@ -38,6 +39,44 @@ const LOOKUP_WORDS: u32 = 4096;
 const DISPLAY_CHANNELS: usize = 21;
 const NO_PAINT_IMAGE: u32 = u32::MAX;
 const GRAPH_IMAGE_COLOR: u32 = 8;
+
+/// Host timings for one viewport composition. Upload time measures staging calls, not device throughput.
+#[derive(Default)]
+pub struct CompositeTiming {
+    pipelines: Duration,
+    scene_inputs: Duration,
+    pub(crate) packing: Duration,
+    pub(crate) upload: Duration,
+    pub(crate) upload_wait: Duration,
+}
+
+impl std::fmt::Display for CompositeTiming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        write!(
+            f,
+            "pipelines {:.1} ms, surface and bake setup {:.1} ms, image and paint packing {:.1} ms, upload staging {:.1} ms, upload waits {:.1} ms",
+            ms(self.pipelines),
+            ms(self.scene_inputs),
+            ms(self.packing),
+            ms(self.upload),
+            ms(self.upload_wait)
+        )
+    }
+}
+
+pub(crate) fn time_composite<T>(time: Option<&mut Duration>, work: impl FnOnce() -> T) -> T {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(time) = time {
+        let start = std::time::Instant::now();
+        let result = work();
+        *time += start.elapsed();
+        return result;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = time;
+    work()
+}
 const GRAPH_IMAGE_SCALAR: u32 = 9;
 const GRAPH_IMAGE_SIGNED: u32 = 10;
 const GRAPH_IMAGE_NORMAL: u32 = 11;
@@ -2327,7 +2366,14 @@ impl GpuCompositor {
         Ok(Some(levels))
     }
 
-    fn tile_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<Option<&TileImageAtlas>, String> {
+    fn tile_atlas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ts: usize,
+        program: &CompositeProgram,
+        timing: Option<&mut CompositeTiming>,
+    ) -> Result<Option<&TileImageAtlas>, String> {
         let gray: Vec<_> = program.tile_patterns.image_sources().collect();
         let color: Vec<_> = program.material_images.sources().collect();
         if gray.is_empty() && color.is_empty() {
@@ -2336,7 +2382,7 @@ impl GpuCompositor {
         }
         if self.tile_images.get(&ts).is_none_or(|atlas| !atlas.matches(&gray, &color)) {
             self.tile_images.remove(&ts);
-            let atlas = TileImageAtlas::new(device, queue, &gray, &color)?;
+            let atlas = TileImageAtlas::new(device, queue, &gray, &color, timing)?;
             self.tile_images.insert(ts, atlas);
         }
         Ok(self.tile_images.get(&ts))
@@ -2351,6 +2397,7 @@ impl GpuCompositor {
         target: (usize, (u32, u32), u32, Option<CompositeRegion>),
         textures: &[&wgpu::Texture],
         submitted: &mut Option<CompositeRegion>,
+        mut timing: Option<&mut CompositeTiming>,
     ) -> Result<(), String> {
         let (device, queue) = gpu;
         let (ts, source_size, shift, region) = target;
@@ -2384,14 +2431,22 @@ impl GpuCompositor {
             if tile_work == 0 {
                 band_rows = height.min(256);
             }
-            self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::new(device));
         }
-        let (pipeline, prepare) = self.pipelines.get(device, &self.pipeline_layout, program);
-        let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
-        let (surface, vertices) = self.surface_inputs(device, queue, program)?;
-        let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
-        let curvature = self.curvature_inputs(device, queue, ts, program, &baked)?;
-        let id_bake = self.id_bake_input(device, queue, ts, program.id_bake.as_ref())?;
+        let (pipeline, prepare) = time_composite(timing.as_deref_mut().map(|t| &mut t.pipelines), || {
+            if filtered {
+                self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::new(device));
+            }
+            self.pipelines.get(device, &self.pipeline_layout, program)
+        });
+        let (coverage, surface, vertices, baked, curvature, id_bake) =
+            time_composite(timing.as_deref_mut().map(|t| &mut t.scene_inputs), || -> Result<_, String> {
+                let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
+                let (surface, vertices) = self.surface_inputs(device, queue, program)?;
+                let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
+                let curvature = self.curvature_inputs(device, queue, ts, program, &baked)?;
+                let id_bake = self.id_bake_input(device, queue, ts, program.id_bake.as_ref())?;
+                Ok((coverage, surface, vertices, baked, curvature, id_bake))
+            })?;
         let [id_width, id_height] = program.id_bake.as_ref().map_or([0; 2], |id| id.size);
         let mut words_per_pixel = 0;
         let copies = DisplayKind::ALL.map(|kind| {
@@ -2436,7 +2491,7 @@ impl GpuCompositor {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let atlas = self.tile_atlas(device, queue, ts, program)?;
+        let atlas = self.tile_atlas(device, queue, ts, program, timing.as_deref_mut())?;
         let tile_images = atlas.map(|atlas| atlas.view.clone());
         let (operations, lookup) =
             if program.tile_patterns.is_empty() && program.ramp_words.is_empty() && program.geometry.words.is_empty() && program.material_images.is_empty() {
@@ -2513,10 +2568,12 @@ impl GpuCompositor {
         };
         for (chunk, window, words) in windows {
             let bytes = (words * 4) as u64;
-            window.pack(&program.paint, words, &mut packed);
+            time_composite(timing.as_deref_mut().map(|t| &mut t.packing), || window.pack(&program.paint, words, &mut packed));
             let [paint_x, paint_y, paint_columns, paint_rows] = window.params();
             if pending_bytes + bytes > (max_words * 4) as u64 {
-                device.poll(wgpu::PollType::Wait { submission_index: last_submission.take(), timeout: None }).map_err(|e| e.to_string())?;
+                time_composite(timing.as_deref_mut().map(|t| &mut t.upload_wait), || {
+                    device.poll(wgpu::PollType::Wait { submission_index: last_submission.take(), timeout: None }).map_err(|e| e.to_string())
+                })?;
                 pending_bytes = 0;
             }
             let upload_size = bytes.next_power_of_two().min((max_words * 4) as u64);
@@ -2529,7 +2586,7 @@ impl GpuCompositor {
                 }));
             }
             let paint = self.paint_upload.as_ref().ok_or("paint upload buffer is missing")?;
-            queue.write_buffer(paint, 0, bytemuck::cast_slice(&packed));
+            time_composite(timing.as_deref_mut().map(|t| &mut t.upload), || queue.write_buffer(paint, 0, bytemuck::cast_slice(&packed)));
             let mut encoder = make_encoder();
             let mut work = 0u64;
             let mut bounds: Option<CompositeRegion> = None;

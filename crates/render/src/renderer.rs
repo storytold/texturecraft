@@ -34,7 +34,7 @@ use texturecraft_texel::TILE;
 use crate::bake_visualization::BakeVisualization;
 use crate::cage_geometry::CageGeometry;
 use crate::cage_gpu::CageGpu;
-use crate::gpu_composite::{CompositeProgram, CompositeRegion, GpuCompositor};
+use crate::gpu_composite::{CompositeProgram, CompositeRegion, CompositeTiming, GpuCompositor};
 use crate::gpu_quick_mask::{QuickMaskAlpha, QuickMaskGpu, QuickMaskOverlay};
 use crate::gpu_trace::{Checked, checked};
 use crate::high_poly_gpu::HighPolyGpu;
@@ -1721,6 +1721,18 @@ impl Renderer {
     /// Composite a supported layer stack or standalone mask into the viewport's textures.
     /// Scratch holds one band. The final maps stay on the adapter for shading and mip generation.
     pub fn composite_on_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<(), String> {
+        self.composite_on_gpu_timed(device, queue, ts, program, None)
+    }
+
+    /// Composite with optional host-side timings for the main viewport material.
+    pub fn composite_on_gpu_timed(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ts: usize,
+        program: &CompositeProgram,
+        timing: Option<&mut CompositeTiming>,
+    ) -> Result<(), String> {
         if program.is_mask_preview() {
             return self.composite_mask_preview(device, queue, ts, program);
         }
@@ -1782,6 +1794,7 @@ impl Renderer {
                 (ts, set.size, set.shift, program.region),
                 &targets.each_ref().map(|target| &target.texture),
                 &mut submitted,
+                timing,
             )?;
             maps.extend(set.tex.last().cloned());
             Ok::<_, String>((compositor, maps))
@@ -1839,7 +1852,7 @@ impl Renderer {
         let result = crate::gpu_trace::scoped(device, "viewport GPU mask preview", || {
             let mut compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
             let tex = if reuse { old.clone() } else { Tex::new(device, "tc_gpu_mask_preview", size, size, wgpu::TextureFormat::Rgba8Unorm, mip_count(size)) };
-            compositor.compose((device, queue), program, (ts, set.size, shift, region), &[&tex.texture], &mut submitted)?;
+            compositor.compose((device, queue), program, (ts, set.size, shift, region), &[&tex.texture], &mut submitted, None)?;
             Ok::<_, String>((compositor, tex))
         })
         .and_then(|output| output);

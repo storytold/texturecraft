@@ -1,6 +1,7 @@
 //! Settings and authored images for the GPU Tile Generator. Placement and random draws
 //! are constant per cell. The shader evaluates shapes and blends at each material texel.
 
+use crate::gpu_composite::{CompositeTiming, time_composite};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
@@ -356,7 +357,13 @@ impl TileImageAtlas {
         offset
     }
 
-    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, gray: &[&Arc<ImageRes>], color: &[ColorImage<'_>]) -> Result<Self, String> {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        gray: &[&Arc<ImageRes>],
+        color: &[ColorImage<'_>],
+        mut timing: Option<&mut CompositeTiming>,
+    ) -> Result<Self, String> {
         let limits = device.limits();
         let encodings: Vec<_> = color.iter().copied().map(ColorImage::encoding).collect();
         let sizes: Vec<_> = gray
@@ -376,20 +383,24 @@ impl TileImageAtlas {
             for top in (0..height).step_by(IMAGE_ROWS) {
                 let rows = (height - top).min(IMAGE_ROWS as u32);
                 pixels.clear();
-                pack(top, rows, width, &mut pixels);
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        origin: wgpu::Origin3d { x: region.origin[0], y: region.origin[1] + top, z: region.origin[2] },
-                        ..texture.as_image_copy()
-                    },
-                    bytemuck::cast_slice(&pixels),
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: None },
-                    wgpu::Extent3d { width, height: rows, depth_or_array_layers: 1 },
-                );
+                time_composite(timing.as_deref_mut().map(|t| &mut t.packing), || pack(top, rows, width, &mut pixels));
+                time_composite(timing.as_deref_mut().map(|t| &mut t.upload), || {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            origin: wgpu::Origin3d { x: region.origin[0], y: region.origin[1] + top, z: region.origin[2] },
+                            ..texture.as_image_copy()
+                        },
+                        bytemuck::cast_slice(&pixels),
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: None },
+                        wgpu::Extent3d { width, height: rows, depth_or_array_layers: 1 },
+                    );
+                });
                 pending += u64::from(width) * u64::from(rows) * 4;
                 if pending >= MAX_PENDING_UPLOAD_BYTES {
-                    let submission = queue.submit([]);
-                    device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }).map_err(|error| error.to_string())?;
+                    time_composite(timing.as_deref_mut().map(|t| &mut t.upload_wait), || {
+                        let submission = queue.submit([]);
+                        device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }).map_err(|error| error.to_string())
+                    })?;
                     pending = 0;
                 }
             }
