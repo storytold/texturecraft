@@ -2535,7 +2535,22 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     let format = NodeFormat { code: fmt, read_rounding, steps: div.map(|div| crate::tex::Steps { read_rounding, fmt, div }) };
     // (for the node log: every input grey)
     let grey_ins = !ins.is_empty() && ins.values().all(|v| !matches!(v, NodeValue::Host(Val::Rgba(_))));
-    let resident = if ctx.resident && compiled && !resize_inputs { compute_resident_image(id, n, &ins, ctx, &format)? } else { None };
+    let resident = if compiled && !resize_inputs {
+        if let Some(held) = forward_identity(n, ins.get("in"), sz, fmt) {
+            if matches!(held, NodeValue::Device(_) | NodeValue::DeviceFloat(_))
+                && let Some(profiler) = &ctx.ec.profiler
+            {
+                profiler.resident_node(id, &n.kind);
+            }
+            Some(held)
+        } else if ctx.resident {
+            compute_resident_image(id, n, &ins, ctx, &format)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let t = if let Some(image) = resident {
         image
     } else {
@@ -4702,6 +4717,32 @@ fn compute_resident_image(id: u32, n: &Node, ins: &BTreeMap<String, NodeValue>, 
         .map(|value| value.map(|image| NodeValue::Device(Arc::new(DeviceValue { image, host: OnceLock::new() }))))
 }
 
+/// A packed image already at the required size and quantization can pass through an identity unchanged.
+fn forward_identity(n: &Node, source: Option<&NodeValue>, size: (usize, usize), format: u32) -> Option<NodeValue> {
+    use crate::measured::{COMPILED_16_BIT, COMPILED_HALF};
+    let source = source?;
+    if source.dims() != size || rolls(n) {
+        return None;
+    }
+    let same_storage = match source {
+        NodeValue::DeviceFloat(_) => format == COMPILED_HALF,
+        value => value.packed_grey().is_some_and(|packed| packed.info().2 == 65535.0 && format == COMPILED_16_BIT),
+    };
+    if matches!(n.kind.as_str(), "dot" | "output") && (format == 0 || same_storage) {
+        return Some(source.clone());
+    }
+    if n.kind != "transform_matrix" || !same_storage || !size.0.is_power_of_two() || !size.1.is_power_of_two() {
+        return None;
+    }
+    let value = |key, default| n.nums.get(key).copied().unwrap_or(default);
+    let mip = value("mip", 31.0).round() as u32;
+    (matches!(mip, 0 | 30..)
+        && value("offset_x", 0.0) == 0.0
+        && value("offset_y", 0.0) == 0.0
+        && [value("m00", 1.0), value("m01", 0.0), value("m10", 0.0), value("m11", 1.0)] == [1.0, 0.0, 0.0, 1.0])
+    .then(|| source.clone())
+}
+
 fn half_transform<'a>(n: &Node, ctx: &Ctx<'_>, source: Option<&'a NodeValue>) -> Option<HalfTransform<'a>> {
     let source = source?;
     let value = |key, default| n.nums.get(key).copied().unwrap_or(default);
@@ -4755,7 +4796,7 @@ fn compute_resident_textured_pixel(id: u32, n: &Node, ins: &BTreeMap<String, Nod
     else {
         return Ok(None);
     };
-    let prog = crate::func::compile_named(ctx.lib, name).map_err(|e| Error::BadParam(id, e))?;
+    let prog = ctx.program(name).map_err(|e| Error::BadParam(id, e))?;
     let env = pixel_function_env(n, ctx, &prog);
     let Some(shader) = prog.textured_pixel_shader(&env, &images) else { return Ok(None) };
     let sources = images.iter().map(|&(_, image)| image).collect::<Vec<_>>();
