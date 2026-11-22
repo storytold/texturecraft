@@ -2,7 +2,14 @@
 
 use std::sync::Arc;
 
-use texturecraft_compose::{ImageRes, ImageStore, pattern::decal_axes, placed::rotation_xyz};
+use texturecraft_compose::{
+    ImageRes, ImageStore,
+    pattern::decal_axes,
+    placed::{
+        rotation_xyz,
+        warp::{self, WarpSurface},
+    },
+};
 use texturecraft_core::{Decal, DecalFlip, Falloff, ImagePlacement, PlacedProjection, Source, Volume, WarpGrid};
 use texturecraft_geom::{Mesh, glam::Vec3};
 
@@ -13,7 +20,7 @@ pub(crate) const IMAGE_SOURCE_OPCODE: u32 = 14;
 pub(crate) const DECAL_PROJECTION: u32 = 9;
 pub(crate) const PLACED_UV_PROJECTION: u32 = 10;
 pub(crate) const PLACED_TRIPLANAR_PROJECTION: u32 = 11;
-pub(crate) const PLACED_FLAT_WARP_PROJECTION: u32 = 12;
+pub(crate) const PLACED_WARP_PROJECTION: u32 = 12;
 
 #[derive(Debug, Default)]
 pub(crate) struct MaterialImages {
@@ -42,6 +49,7 @@ struct VolumeSource {
     volume: Volume,
     image: ImagePlacement,
     settings: [f32; 3],
+    warp: Option<Arc<WarpSurface>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -91,19 +99,17 @@ impl MaterialImages {
 
     pub(crate) fn register_triplanar(&mut self, placed: &PlacedProjection, hardness: f32) -> u32 {
         let edge = 0.5 + 0.5 * normalized_hardness(hardness);
-        self.register_volume(placed, [edge, 0.0, 0.0])
+        self.register_volume(placed, [edge, 0.0, 0.0], None)
     }
 
-    pub(crate) fn register_flat_warp(&mut self, placed: &PlacedProjection, grid: &WarpGrid, depth: Falloff) -> Option<u32> {
-        if !flat_regular_grid(grid) {
-            return None;
-        }
+    pub(crate) fn register_warp(&mut self, placed: &PlacedProjection, grid: &WarpGrid, depth: Falloff) -> Option<u32> {
+        let surface = if flat_regular_grid(grid) { None } else { Some(warp::surface_for(grid).ok()?) };
         let reach = if grid.depth.is_finite() { grid.depth.max(0.0) } else { 0.0 };
-        Some(self.register_volume(placed, [reach, f32::from(u8::from(depth.on)), normalized_hardness(depth.hardness)]))
+        Some(self.register_volume(placed, [reach, f32::from(u8::from(depth.on)), normalized_hardness(depth.hardness)], surface))
     }
 
-    fn register_volume(&mut self, placed: &PlacedProjection, settings: [f32; 3]) -> u32 {
-        let source = VolumeSource { volume: placed.volume, image: placed.image, settings };
+    fn register_volume(&mut self, placed: &PlacedProjection, settings: [f32; 3], warp: Option<Arc<WarpSurface>>) -> u32 {
+        let source = VolumeSource { volume: placed.volume, image: placed.image, settings, warp };
         if let Some(index) = self.volumes.iter().position(|existing| *existing == source) {
             return index as u32;
         }
@@ -114,6 +120,10 @@ impl MaterialImages {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.sources.is_empty() && self.decals.is_empty() && self.volumes.is_empty()
+    }
+
+    pub(crate) fn has_curved_warp(&self) -> bool {
+        self.volumes.iter().any(|volume| volume.warp.is_some())
     }
 
     pub(crate) fn set_images(&mut self, images: &ImageStore) {
@@ -162,11 +172,29 @@ impl MaterialImages {
             .iter()
             .map(|source| {
                 let offset = words.len() as u32;
+                let start = words.len();
                 words.extend(mesh.map_or([0; 24], |mesh| volume_words(source, mesh)));
+                if let Some(warp) = &source.warp {
+                    let data = words.len() as u32;
+                    words[start + 22] = data;
+                    append_warp(words, warp);
+                }
                 offset
             })
             .collect();
         (image_offsets, decal_offsets, volume_offsets)
+    }
+}
+
+/// Geometry shared by the inverse queries for every texel of a warp.
+fn append_warp(words: &mut Vec<u32>, surface: &WarpSurface) {
+    let grid = surface.inverse_grid();
+    words.extend([grid.rows as u32, grid.columns as u32, grid.size[0] as u32, grid.size[1] as u32]);
+    words.extend([grid.origin[0], grid.origin[1], grid.cell_size].map(|v| (v as f32).to_bits()));
+    words.extend(grid.controls.iter().flatten().map(|&v| (v as f32).to_bits()));
+    words.extend(grid.image_uvs.iter().flatten().map(|&v| (v as f32).to_bits()));
+    for seed in grid.seeds() {
+        words.extend(seed.unwrap_or([-1.0; 2]).map(f32::to_bits));
     }
 }
 

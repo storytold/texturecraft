@@ -135,14 +135,25 @@ fn placed_volume_position(frame: u32, position: vec3<f32>) -> vec3<f32> {
         + bitcast<vec3<f32>>(vec3(srgb[frame + 3u], srgb[frame + 7u], srgb[frame + 11u]));
 }
 
-fn authored_image_flat_warp(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> {
+fn authored_image_warp(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> {
     if !surface.valid { return vec4(0.0); }
     let frame = u32(layer.uv.x);
     let p = placed_volume_position(frame, surface.position);
-    if any(abs(p.xy) > vec2(0.5000005)) || (bitcast<f32>(srgb[frame + 19u]) != 0.0 && abs(p.z) > 0.5) {
+    let data = srgb[frame + 22u];
+    if bitcast<f32>(srgb[frame + 19u]) != 0.0 && any(abs(p) > vec3(0.5)) {
         return vec4(0.0);
     }
-    let z = abs(2.0 * p.z);
+    var image_coord = clamp(vec2(p.x, -p.y), vec2(-0.5), vec2(0.5));
+    var depth = 0.0;
+    if data == 0u {
+        if any(abs(p.xy) > vec2(0.5000005)) { return vec4(0.0); }
+    } else {
+        let hit = warp_inverse(data, 2.0 * p.xy);
+        if hit.w == 0.0 { return vec4(0.0); }
+        image_coord = hit.xy - 0.5;
+        depth = hit.z;
+    }
+    let z = abs(2.0 * p.z - depth);
     let reach = bitcast<f32>(srgb[frame + 18u]);
     if z > reach { return vec4(0.0); }
     var coverage = 1.0;
@@ -152,7 +163,7 @@ fn authored_image_flat_warp(layer: Operation, surface: Surface, with_alpha: bool
         else { coverage = select(0.0, 1.0, z < edge); }
     }
     if coverage <= 0.0 { return vec4(0.0); }
-    let point = placed_image_coord(frame, clamp(vec2(p.x, -p.y), vec2(-0.5), vec2(0.5)));
+    let point = placed_image_coord(frame, image_coord);
     let repeat = (vec2(layer.procedural.z) & vec2(1u, 2u)) != vec2(0u);
     if !placed_uv_covered(point, repeat) { return vec4(0.0); }
     if layer.ids.y != IMAGE_SOURCE_OPCODE { return vec4(layer.low.rgb, coverage); }

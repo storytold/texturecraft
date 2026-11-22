@@ -360,7 +360,39 @@ fn control_net(anchors: &[WarpPoint], rows: usize, columns: usize) -> BezierMesh
     BezierMesh { us: knots(columns), vs: knots(rows), points }
 }
 
+/// The regular bicubic control net and the initial guesses for a parallel inverse query.
+pub struct InverseGrid<'a> {
+    pub rows: usize,
+    pub columns: usize,
+    pub controls: &'a [[f64; 3]],
+    pub image_uvs: &'a [[f64; 2]],
+    pub origin: [f64; 2],
+    pub cell_size: f64,
+    pub size: [usize; 2],
+    cells: &'a [Option<Cell>],
+}
+
+impl InverseGrid<'_> {
+    /// A starting parameter pair per lookup cell, row by row.
+    pub fn seeds(&self) -> impl Iterator<Item = Option<[f32; 2]>> + '_ {
+        self.cells.iter().map(|cell| cell.map(|cell| cell.st))
+    }
+}
+
 impl WarpSurface {
+    pub fn inverse_grid(&self) -> InverseGrid<'_> {
+        InverseGrid {
+            rows: self.rows,
+            columns: self.columns,
+            controls: &self.mesh.points,
+            image_uvs: &self.uvs,
+            origin: self.lookup.origin,
+            cell_size: self.lookup.cell,
+            size: [self.lookup.width, self.lookup.height],
+            cells: &self.lookup.cells,
+        }
+    }
+
     /// The surface of `grid` with its inverse, or why the grid cannot be evaluated.
     pub fn new(grid: &WarpGrid) -> Result<WarpSurface, String> {
         let anchors = anchors(grid)?;

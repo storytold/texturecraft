@@ -12,6 +12,7 @@ struct Features {
     tile_generator: bool,
     authored_images: bool,
     placed_uv: bool,
+    curved_warp: bool,
     mask_preview: bool,
     extended_blend_modes: bool,
     measured_blend: bool,
@@ -31,6 +32,7 @@ impl Features {
     fn of(program: &CompositeProgram) -> Self {
         let mut features = Self {
             authored_images: !program.material_images.is_empty(),
+            curved_warp: program.material_images.has_curved_warp(),
             mask_preview: program.is_mask_preview(),
             measured_blend: program.measured_blend,
             extended_blend_modes: program.measured_blend && program.groups.depth != 0,
@@ -99,7 +101,12 @@ impl Features {
                  fn authored_image_content(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }
                  fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>) -> vec4<f32> { return vec4(0.5, 0.5, 0.5, 1.0); }
                  fn authored_image_triplanar(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }
-                 fn authored_image_flat_warp(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }",
+                 fn authored_image_warp(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }",
+            ),
+            include(
+                self.curved_warp,
+                include_str!("shaders/material_warp.wgsl"),
+                "fn warp_inverse(data: u32, position: vec2f) -> vec4f { return vec4f(0.0); }",
             ),
             include_str!("shaders/stencil_projection.wgsl"),
             include(

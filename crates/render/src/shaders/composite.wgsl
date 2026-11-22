@@ -63,7 +63,7 @@ const IMAGE_SOURCE_OPCODE: u32 = 14u;
 const DECAL_PROJECTION: u32 = 9u;
 const PLACED_UV_PROJECTION: u32 = 10u;
 const PLACED_TRIPLANAR_PROJECTION: u32 = 11u;
-const PLACED_FLAT_WARP_PROJECTION: u32 = 12u;
+const PLACED_WARP_PROJECTION: u32 = 12u;
 const PASSTHROUGH_STACK: u32 = 0x80000000u;
 override enable_placed_uv: bool = false;
 const SPATIAL_FILTER_OPCODE: u32 = 36u;
@@ -201,8 +201,8 @@ fn placed_uv_value(layer: Operation, uv: vec2<f32>, with_alpha: bool) -> vec4<f3
 }
 
 fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
-    if enable_authored_images && layer.procedural.w == PLACED_FLAT_WARP_PROJECTION {
-        return authored_image_flat_warp(layer, surface, false);
+    if enable_authored_images && layer.procedural.w == PLACED_WARP_PROJECTION {
+        return authored_image_warp(layer, surface, false);
     }
     if enable_authored_images && layer.procedural.w == PLACED_TRIPLANAR_PROJECTION {
         return authored_image_triplanar(layer, surface, false);
@@ -217,8 +217,8 @@ fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
 }
 
 fn content_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
-    if enable_authored_images && layer.procedural.w == PLACED_FLAT_WARP_PROJECTION {
-        return authored_image_flat_warp(layer, surface, true);
+    if enable_authored_images && layer.procedural.w == PLACED_WARP_PROJECTION {
+        return authored_image_warp(layer, surface, true);
     }
     if enable_authored_images && layer.procedural.w == PLACED_TRIPLANAR_PROJECTION {
         return authored_image_triplanar(layer, surface, measured_blend || layer.ids.w >= 8u);

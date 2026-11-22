@@ -17,7 +17,7 @@ use texturecraft_texel::{TILE, TileImage};
 
 use crate::gpu_curvature::{CurvatureGpu, CurvatureInput, CurvatureLevels};
 use crate::gpu_image_source::{
-    DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages, PLACED_FLAT_WARP_PROJECTION, PLACED_TRIPLANAR_PROJECTION, PLACED_UV_PROJECTION,
+    DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages, PLACED_TRIPLANAR_PROJECTION, PLACED_UV_PROJECTION, PLACED_WARP_PROJECTION,
 };
 use crate::gpu_neighbourhood::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
@@ -1555,10 +1555,10 @@ fn placed_image_projection(op: &mut Operation, placed: &texturecraft_core::Place
             op.uv[0] = inputs.materials.register_triplanar(placed, *hardness) as f32;
         }
         PlacedMode::Warp { depth, grid } => {
-            op.procedural[3] = PLACED_FLAT_WARP_PROJECTION;
+            op.procedural[3] = PLACED_WARP_PROJECTION;
             let repeat = placed.sampling_repeat().axes();
             op.procedural[2] = u32::from(repeat[0]) | (u32::from(repeat[1]) << 1);
-            op.uv[0] = inputs.materials.register_flat_warp(placed, grid, *depth)? as f32;
+            op.uv[0] = inputs.materials.register_warp(placed, grid, *depth)? as f32;
         }
         _ => return None,
     }
@@ -2473,7 +2473,7 @@ impl GpuCompositor {
                     if op.procedural[3] == DECAL_PROJECTION {
                         op.uv[0] = *decals.get(op.uv[0] as usize).ok_or("A decal has no frame.")? as f32;
                     }
-                    if matches!(op.procedural[3], PLACED_TRIPLANAR_PROJECTION | PLACED_FLAT_WARP_PROJECTION) {
+                    if matches!(op.procedural[3], PLACED_TRIPLANAR_PROJECTION | PLACED_WARP_PROJECTION) {
                         op.uv[0] = *volumes.get(op.uv[0] as usize).ok_or("A placed volume projection has no frame.")? as f32;
                     }
                 }
@@ -4358,6 +4358,9 @@ mod procedural_tests {
                 ..*point
             })
             .collect();
+        let mut curved = texturecraft_compose::placed::warp::regular_points(3, 3);
+        curved[4].pos = [0.26, -0.16, 0.08];
+        curved[7].pos = [0.1, -0.85, 0.05];
         let projections = [
             Projection::Uv { scale: [1.21, -0.78], rotation: 39.0, offset: [-0.54, 0.16] },
             Projection::Triplanar { scale: 0.63, sharpness: 2.1, offset: [0.14, -0.27, 0.31] },
@@ -4373,6 +4376,12 @@ mod procedural_tests {
                 mode: PlacedMode::Warp { depth: Falloff { on: true, hardness: 0.75 }, grid: WarpGrid { rows: 3, columns: 3, depth: 0.22, points } },
                 volume: Volume { offset: [0.06, 0.024, -0.03], size: [0.85, 0.83, 1.0], rotation: [-86.0, 6.0, 4.0], clip: false },
                 image: ImagePlacement { tiling: [0.85, 1.4], rotation: -23.0, offset: [0.06, 0.09] },
+                repeat: Repeat::None,
+            })),
+            Projection::Placed(Box::new(PlacedProjection {
+                mode: PlacedMode::Warp { depth: Falloff { on: true, hardness: 0.6 }, grid: WarpGrid { rows: 3, columns: 3, depth: 0.35, points: curved } },
+                volume: Volume { offset: [0.03, 0.02, 0.0], size: [0.9, 0.98, 1.1], rotation: [-88.0, 4.0, 1.0], clip: false },
+                image: ImagePlacement { tiling: [1.0, 0.9], rotation: -10.0, offset: [0.12, 0.03] },
                 repeat: Repeat::None,
             })),
         ];
