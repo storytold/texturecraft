@@ -15,6 +15,7 @@
 //! signed height and normals with green up.
 
 pub mod budget;
+mod cook_use;
 pub mod kept;
 pub mod once;
 mod outputs;
@@ -39,6 +40,7 @@ pub use texturecraft_graph::tex::Tex;
 use texturecraft_texel::{TILE, TileImage, from_u16, linear_to_srgb, srgb_to_linear, to_u16};
 
 use crate::store::{BakedMaps, ImageRes, ImageStore, Texels};
+use cook_use::CookUse;
 pub use kept::KeptCooks;
 use once::Slots;
 
@@ -427,7 +429,7 @@ pub struct CookCache {
     resize_source: Option<Arc<CookCache>>,
     resize_cache_hits: AtomicUsize,
     /// The cook each use read last.
-    uses: Mutex<BTreeMap<GraphUse, String>>,
+    uses: Mutex<BTreeMap<GraphUse, CookUse>>,
     problems: Mutex<BTreeMap<GraphUse, UseProblem>>,
     renders: AtomicUsize,
     parsed: Mutex<HashMap<String, Arc<PreparedGraph>>>,
@@ -516,7 +518,7 @@ impl GraphStore {
             texts: self.texts.clone(),
             cooks: Arc::new(CookCache {
                 resize_source: Some(self.cooks.clone()),
-                uses: Mutex::new(self.uses().into_iter().filter(|(use_, _)| use_.set == set).collect()),
+                uses: Mutex::new(lock(&self.cooks.uses).iter().filter(|(use_, _)| use_.set == set).map(|(u, k)| (u.clone(), k.clone())).collect()),
                 cancel,
                 ..CookCache::default()
             }),
@@ -530,7 +532,7 @@ impl GraphStore {
         for (key, result) in prepared.cooks.cooks.values() {
             self.cooks.cooks.insert(key, result);
         }
-        let uses = prepared.uses();
+        let uses = lock(&prepared.cooks.uses).clone();
         let problems = prepared.problems();
         {
             let mut previous = lock(&self.cooks.uses);
@@ -557,7 +559,7 @@ impl GraphStore {
         if occupied <= limit {
             return;
         }
-        let active: BTreeSet<_> = lock(&source.uses).values().cloned().collect();
+        let active: BTreeSet<_> = lock(&source.uses).values().map(|cook| cook.key.clone()).collect();
         for (key, cook) in previous {
             if !active.contains(&key) && !incoming.contains_key(&key) && (source.spilled.outline(&key).is_some() || source.spilled.put(&key, &cook)) {
                 source.cooks.remove(&key);
@@ -636,24 +638,24 @@ impl GraphStore {
 
     /// The cook each use read last.
     pub fn uses(&self) -> BTreeMap<GraphUse, String> {
-        lock(&self.cooks.uses).clone()
+        lock(&self.cooks.uses).iter().map(|(use_, cook)| (use_.clone(), cook.key.clone())).collect()
     }
 
-    /// Sets what each use read last (from a project file).
+    /// Attaches cook keys whose definitions are unknown.
     pub fn set_uses(&self, uses: BTreeMap<GraphUse, String>) {
-        *lock(&self.cooks.uses) = uses;
+        *lock(&self.cooks.uses) = uses.into_iter().map(|(use_, key)| (use_, CookUse::new(key, None))).collect();
     }
 
     /// The last complete cook read by an effect or source, including a stack-dependent effect.
     pub fn use_cook_key(&self, use_: &GraphUse) -> Option<String> {
-        lock(&self.cooks.uses).get(use_).cloned()
+        lock(&self.cooks.uses).get(use_).map(|cook| cook.key.clone())
     }
 
     /// Record a resolved source as used for this document, including when the GPU binds a cached result.
-    pub fn note_use(&self, use_: GraphUse, key: &str) {
+    pub fn note_use(&self, use_: GraphUse, key: &str, graph: &GraphRef) {
         let mut uses = lock(&self.cooks.uses);
-        if uses.get(&use_).is_none_or(|previous| previous != key) {
-            uses.insert(use_.clone(), key.to_owned());
+        if uses.get(&use_).is_none_or(|previous| previous.key != key || previous.source.is_none()) {
+            uses.insert(use_.clone(), CookUse::new(key.to_owned(), Some(graph)));
         }
         drop(uses);
         lock(&self.cooks.problems).remove(&use_);
@@ -1039,19 +1041,11 @@ impl GraphStore {
     pub fn cook_for(&self, use_: GraphUse, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)]) -> Option<Arc<Cooked>> {
         match self.cook(g, env, given) {
             Ok((key, cooked)) => {
-                let mut uses = lock(&self.cooks.uses);
-                if uses.get(&use_) != Some(&key) {
-                    uses.insert(use_.clone(), key);
-                }
-                drop(uses);
-                let mut problems = lock(&self.cooks.problems);
-                if problems.contains_key(&use_) {
-                    problems.remove(&use_);
-                }
+                self.note_use(use_, &key, g);
                 Some(cooked)
             }
             Err(reason) => {
-                let last = lock(&self.cooks.uses).get(&use_).cloned().and_then(|k| self.cooked(&k));
+                let last = self.use_cook_key(&use_).and_then(|k| self.cooked(&k));
                 let problem = UseProblem { graph: g.name.clone(), stale: last.is_some(), reason };
                 let mut problems = lock(&self.cooks.problems);
                 if problems.get(&use_) != Some(&problem) {

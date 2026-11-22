@@ -1040,7 +1040,7 @@ fn version_3_features_round_trip_identically() {
     assert!(load_project_bytes(&bytes).is_err());
 }
 
-const GREY: &str = "format 3\nsize 8\nnode 1 color r=0.5 g=0.5 b=0.5\noutput grey 1\n";
+const GREY: &str = "format 3\nsize 8\nnode 1 color r=0.5 g=0.5 b=0.5\noutput grey 1\nexpose gain 1 r 0 1\n";
 const UNUSED: &str = "format 3\nsize 8\nnode 1 color r=1 g=0 b=0\noutput red 1\n";
 
 /// A sample with a graph source, a nested graph in a mask generator, and one cook the source's use read.
@@ -1071,6 +1071,35 @@ fn graph_sample() -> (ProjectFile, String) {
     pf.graphs.insert_cooked(texturecraft_core::StableHash::of(b"unused cook").key(), Cooked::from_textures(BTreeMap::new(), Default::default()));
     pf.graphs.set_uses([(GraphUse { set: 0, id, channel: Some(Channel::Roughness) }, key.clone())].into());
     (pf, key)
+}
+
+#[test]
+fn saving_a_parameter_edit_does_not_reattach_the_old_graph_pixels() {
+    use texturecraft_compose::ImageStore;
+    use texturecraft_compose::graphs::RenderEnv;
+    use texturecraft_core::{GraphValue, Source};
+
+    let (original, key) = graph_sample();
+    let loaded = load_project_bytes(&save_project_bytes(&original).unwrap()).unwrap();
+    let mut edited = loaded.clone();
+    let use_ = loaded.graphs.uses().into_keys().next().unwrap();
+    let LayerKind::Fill(fill) = &mut edited.project.layers.get_mut(&use_.id).unwrap().kind else { panic!("graph fill") };
+    let Source::Graph(graph) = fill.sources.get_mut(&Channel::Roughness).unwrap() else { panic!("graph source") };
+    graph.params.insert("gain".into(), GraphValue::Float(0.75));
+    let updated = graph.as_ref().clone();
+
+    let reopened = load_project_bytes(&save_project_bytes(&edited).unwrap()).unwrap();
+    assert_eq!(reopened.graphs.use_cook_key(&use_), None, "the older result is not current");
+    assert!(reopened.graphs.cooked(&key).is_none(), "a cook held only by an older state is not written");
+    assert_eq!(loaded.graphs.use_cook_key(&use_), Some(key.clone()), "the existing use is still available to Undo");
+    assert_eq!(save_project_bytes(&loaded).unwrap(), save_project_bytes(&original).unwrap());
+
+    let env = RenderEnv { baked: &BakedMaps::default(), images: &ImageStore::default(), side: 8 };
+    edited.graphs.cook_for(use_.clone(), &updated, &env, &[]).unwrap();
+    let fresh = edited.graphs.use_cook_key(&use_).unwrap();
+    assert_ne!(fresh, key);
+    let reopened = load_project_bytes(&save_project_bytes(&edited).unwrap()).unwrap();
+    assert_eq!(reopened.graphs.use_cook_key(&use_), Some(fresh));
 }
 
 #[cfg(not(target_arch = "wasm32"))]

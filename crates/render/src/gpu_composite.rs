@@ -332,7 +332,7 @@ impl<'a> ProceduralInputs<'a> {
             self.cooked.insert(key.clone(), (Arc::from(key.as_str()), cooked.ok_or(GRAPH_OUTPUT_PENDING)?));
         }
         if !dynamic && !failed {
-            inputs.store.note_use(use_, &key);
+            inputs.store.note_use(use_, &key, graph);
         }
         let (key, cooked) = self.cooked.get(&key).ok_or(GRAPH_OUTPUT_PENDING)?;
         let output = output.or_else(|| cooked.outputs.keys().next().map(String::as_str));

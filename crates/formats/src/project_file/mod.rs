@@ -34,7 +34,7 @@
 //! and older builds open a project with them (they skip the entries).
 
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
@@ -401,13 +401,14 @@ fn graph_entries<'a>(pf: &'a ProjectFile<impl Borrow<Vec<u8>>>, deflate: SimpleF
             body: Box::new(move |w| w.write_all(text.as_bytes())),
         });
     }
-    let uses = graphs.uses();
+    let uses = graphs.archive_uses(&pf.project);
     if uses.is_empty() {
         return Ok(());
     }
     let mut index = CookIndex { version: COOK_INDEX_VERSION, ..CookIndex::default() };
     // cooks one at a time: a spilled one is read back only while its outputs are written
-    for key in graphs.used_cook_keys() {
+    let keys: BTreeSet<_> = uses.values().cloned().collect();
+    for key in keys {
         if !texturecraft_core::is_key(&key) {
             continue;
         }
@@ -729,7 +730,7 @@ fn load_cooks<R: Read + Seek>(zip: &mut ZipArchive<R>, index: CookIndex, pf: &mu
     }
     #[cfg(target_arch = "wasm32")]
     let _ = (kept, outlines);
-    pf.graphs.set_uses(index.uses.into_iter().collect());
+    pf.graphs.set_archive_uses(&pf.project, index.uses.into_iter().collect());
     if dropped > 0 {
         pf.warnings.push(format!("Note: {dropped} cooked graph result(s) could not be read; they will be rendered again when needed."));
     }
