@@ -4213,25 +4213,7 @@ fn compute(id: u32, n: &Node, ins: &BTreeMap<String, Rc<Tex>>, ctx: &Ctx) -> Res
             let c = [f("r", 1.0), f("g", 1.0), f("b", 1.0)];
             tex("in")?.map(move |p| [p[0] * c[0], p[1] * c[1], p[2] * c[2], p[3]])
         }
-        "colorize" => {
-            let mut stops = Vec::new();
-            for i in 0..512 {
-                if let Some(p) = n.nums.get(&format!("p{i}")) {
-                    let g = |c: &str| n.nums.get(&format!("{c}{i}")).copied().unwrap_or(0.0);
-                    stops.push((*p, [g("r"), g("g"), g("b")], n.nums.get(&format!("a{i}")).copied().unwrap_or(1.0)));
-                }
-            }
-            if stops.is_empty() {
-                return Err(Error::BadParam(id, "colorize needs at least one stop (p0 r0 g0 b0)".into()));
-            }
-            if f("table", 0.0) > 0.5 {
-                // read the gradient through a table of 256 entries, straight lines between them
-                let ramp = Tex { w: 256, h: 1, px: (0..256).map(|i| [i as f32 / 255.0, i as f32 / 255.0, i as f32 / 255.0, 1.0]).collect() };
-                let table = ops::colorize_ex(&ramp, &stops, f("interp", 0.0) as u32, f("smoothness", 1.0), false, true);
-                return Ok(ops::colorize_table(tex("in")?, &table, f("use_alpha", 0.0) > 0.5));
-            }
-            ops::colorize_ex(tex("in")?, &stops, f("interp", 0.0) as u32, f("smoothness", 1.0), f("addressing", 0.0) > 0.5, f("use_alpha", 0.0) > 0.5)
-        }
+        "colorize" => colorize(n, tex("in")?).ok_or_else(|| Error::BadParam(id, "colorize needs at least one stop (p0 r0 g0 b0)".into()))?,
         "hsl" => ops::hsl_adjust(tex("in")?, f("hue", 0.0), f("sat", 1.0), f("val", 1.0)),
         "transform" => {
             ops::transform(tex("in")?, f("offset_x", 0.0), f("offset_y", 0.0), f("scale_x", 1.0), f("scale_y", 1.0), f("rotation", 0.0), f("tiling", 0.0) < 0.5)
@@ -4859,6 +4841,62 @@ fn compute_resident_textured_pixel(id: u32, n: &Node, ins: &BTreeMap<String, Nod
     Ok(Some(NodeValue::Device(Arc::new(DeviceValue { image, host: OnceLock::new() }))))
 }
 
+fn colorize(n: &Node, input: &Tex) -> Option<Tex> {
+    let f = |key, default| n.nums.get(key).copied().unwrap_or(default);
+    let mut stops = Vec::new();
+    for i in 0..512 {
+        if let Some(position) = n.nums.get(&format!("p{i}")) {
+            let channel = |name| n.nums.get(&format!("{name}{i}")).copied().unwrap_or(0.0);
+            let alpha = n.nums.get(&format!("a{i}")).copied().unwrap_or(1.0);
+            stops.push((*position, [channel("r"), channel("g"), channel("b")], alpha));
+        }
+    }
+    if stops.is_empty() {
+        return None;
+    }
+    let interpolation = f("interp", 0.0) as u32;
+    let smoothness = f("smoothness", 1.0);
+    let use_alpha = f("use_alpha", 0.0) > 0.5;
+    if f("table", 0.0) > 0.5 {
+        let ramp = Tex { w: 256, h: 1, px: (0..256).map(|i| [i as f32 / 255.0, i as f32 / 255.0, i as f32 / 255.0, 1.0]).collect() };
+        let table = ops::colorize_ex(&ramp, &stops, interpolation, smoothness, false, true);
+        Some(ops::colorize_table(input, &table, use_alpha))
+    } else {
+        Some(ops::colorize_ex(input, &stops, interpolation, smoothness, f("addressing", 0.0) > 0.5, use_alpha))
+    }
+}
+
+/// Every possible packed input has one gradient result. Use the reference gradient
+/// evaluator to build the exact curve, provided the result fits packed grayscale.
+fn colorize_curve(n: &Node, div: f32, alpha: f32, steps: &crate::tex::Steps) -> Option<(Vec<u16>, f32)> {
+    if !matches!(div, 255.0 | 65535.0) {
+        return None;
+    }
+    let px = (0..=div as u16)
+        .map(|i| {
+            let level = f32::from(i) / div;
+            [level, level, level, alpha]
+        })
+        .collect::<Vec<_>>();
+    let rendered = colorize(n, &Tex { w: px.len(), h: 1, px })?;
+    let &[_, _, _, alpha] = rendered.px.first()?;
+    if !crate::tex::grey_alpha_ok(alpha) {
+        return None;
+    }
+    let alpha_bits = alpha.to_bits();
+    let curve = rendered
+        .px
+        .into_iter()
+        .map(|[r, g, b, a]| {
+            if r.to_bits() != g.to_bits() || r.to_bits() != b.to_bits() || a.to_bits() != alpha_bits {
+                return None;
+            }
+            steps.step(r)
+        })
+        .collect::<Option<_>>()?;
+    Some((curve, alpha))
+}
+
 fn compute_resident_grey(
     id: u32,
     n: &Node,
@@ -4889,7 +4927,7 @@ fn compute_resident_grey(
                 return Ok(None);
             }
         }
-        "levels_mid" if !rolls(n) => {
+        "levels_mid" | "colorize" if !rolls(n) => {
             let Some((source, steps)) = ins.get("in").and_then(NodeValue::packed_grey).zip(steps) else { return Ok(None) };
             let (_, _, div, alpha) = source.info();
             // A smaller device image can keep the whole chain resident. Host
@@ -4898,7 +4936,11 @@ fn compute_resident_grey(
             if ctx.size * ctx.height < minimum_pixels {
                 return Ok(None);
             }
-            let Some((curve, alpha)) = crate::atomic::levels_mid_curve(n, div, alpha, steps) else { return Ok(None) };
+            let curve = match n.kind.as_str() {
+                "levels_mid" => crate::atomic::levels_mid_curve(n, div, alpha, steps),
+                _ => colorize_curve(n, div, alpha, steps),
+            };
+            let Some((curve, alpha)) = curve else { return Ok(None) };
             accelerator.resident_grey(ResidentGreyPass::Levels { source, curve, div: steps.div, alpha }, &ctx.ec.cancel)
         }
         "dir_warp" | "grad_warp" | "box_blur" | "line_blur" | "laplacian_sharpen" if !rolls(n) && ctx.size * ctx.height >= 64 * 1024 => {

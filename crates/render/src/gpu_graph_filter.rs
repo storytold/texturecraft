@@ -319,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_levels_keeps_a_smaller_warp_result_resident() {
+    fn imported_levels_and_gradient_keep_a_smaller_warp_resident() {
         let Ok(gpu) = crate::headless::Headless::new() else { return };
         let nodes = Arc::new(Nodes::default());
         let context = EvalContext {
@@ -332,13 +332,15 @@ mod tests {
              node 1 input idx=0 gray=1 format=\"u16_compiled\"\n\
              node 2 input idx=1 gray=1 format=\"u16_compiled\"\n\
              node 3 dir_warp in=@1 map=@2 intensity=0 format=\"u16_compiled\"\n\
-             node 4 levels_mid in=@3 mid=0.4 format=\"u16_compiled\"\noutput out 4\n",
+             node 4 levels_mid in=@3 mid=0.4 format=\"u16_compiled\"\n\
+             node 5 colorize in=@4 table=1 p0=0 r0=0 g0=0 b0=0 p1=0.4 r1=1 g1=1 b1=1 p2=1 r2=0.2 g2=0.2 b2=0.2 format=\"u16_compiled\"\n\
+             output out 5\n",
         )
         .unwrap();
         let inputs = [Some(Tex::gray_fn(512, 512, |u, v| 0.5 + 0.4 * (u * 18.0).sin() * (v * 20.0).cos())), Some(Tex::gray_fn(512, 512, |u, v| u * v))];
         let cpu = graph.evaluate_with_inputs(None, &inputs).unwrap();
         let accelerated = graph.evaluate_in(&context, None, &inputs).unwrap();
-        assert_eq!(nodes.resident.load(Relaxed), 2);
+        assert_eq!(nodes.resident.load(Relaxed), 3);
         assert_eq!(nodes.readbacks.load(Relaxed), 1);
         assert_eq!(cpu["out"].px, accelerated["out"].px);
     }
