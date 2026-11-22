@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 use texturecraft_compose::{ImageRes, ImageStore};
 use texturecraft_import_reader::decode::image::ImageResource;
 use texturecraft_import_reader::decode::pixels::{RowOrder, SourceFormat};
-use texturecraft_import_reader::decode::texture_cache::CacheTexture;
+use texturecraft_import_reader::decode::texture_cache::{CacheHeader, CacheTexture};
 use texturecraft_import_reader::model::MeshMapRef;
 use texturecraft_import_reader::project::{CacheEntryRef, ProjectFile, paths};
 
 use crate::error::PartError;
-use crate::image::Rgba;
+use crate::image::{ImageError, MAX_SIDE, Rgba};
 
 /// URL scheme of shelf resources (file-format data).
 pub(crate) const SHELF_SCHEME: &str = "resource://";
@@ -131,12 +131,29 @@ pub fn read_image(project: &ProjectFile, id: &str) -> Result<ResourceImage, Part
 
 /// Reads and decodes one texture-cache entry (stored bottom row first, as textures are).
 pub fn read_cache(project: &ProjectFile, entry: &CacheEntryRef) -> Result<CacheImage, PartError> {
+    const HEADER_PREFIX: usize = 4096;
+
+    // Reject unsupported pixel layouts and oversized dimensions before loading the payload.
+    // A longer header can still be read by the complete parser.
+    if let Ok(prefix) = project.read_prefix(&entry.path, HEADER_PREFIX)
+        && let Ok(header) = CacheHeader::parse(&prefix)
+    {
+        cache_format(header.width, header.height, header.gl_internal_format, header.gl_format_name())?;
+    }
     let data = project.read(&entry.path)?;
     let texture = CacheTexture::parse(&data)?;
-    let format = SourceFormat::from_gl(texture.gl_internal_format).ok_or_else(|| PartError::UnknownFormat(texture.gl_format_name().to_string()))?;
+    let format = cache_format(texture.width, texture.height, texture.gl_internal_format, texture.gl_format_name())?;
     let pixels = texture.decompress_padded()?;
     let image = Rgba::decode(format, RowOrder::BottomFirst, texture.width, texture.height, &pixels.bytes)?;
     Ok(CacheImage { bit: entry.channel_bit, image, srgb: format == SourceFormat::CacheSrgb8Alpha8, missing_bytes: pixels.missing })
+}
+
+fn cache_format(width: u32, height: u32, format: u32, name: &str) -> Result<SourceFormat, PartError> {
+    let format = SourceFormat::from_gl(format).ok_or_else(|| PartError::UnknownFormat(name.to_string()))?;
+    if width == 0 || height == 0 || width > MAX_SIDE || height > MAX_SIDE {
+        return Err(ImageError(format!("image is {width}x{height}")).into());
+    }
+    Ok(format)
 }
 
 /// A resource of the imported project: its file bytes, and the image the compositor samples while it is held (see

@@ -380,17 +380,21 @@ struct StoredChannel<'e> {
     entry: &'e CacheEntryRef,
     size: (u32, u32),
     missing_bytes: usize,
+    prepared: Option<texturecraft_texel::TileImage>,
 }
 
 impl StoredChannel<'_> {
     /// The channel read from the file, at `resolution` square.
     fn read(&self, file: &ProjectFile, resolution: u32) -> Option<CacheImage> {
-        let mut img = read_cache(file, self.entry).ok()?;
-        if (img.image.width, img.image.height) != (resolution, resolution) {
-            img.image = resample(&img.image, resolution);
-        }
-        Some(img)
+        read_cache(file, self.entry).ok().map(|img| resized_cache_image(img, resolution))
     }
+}
+
+fn resized_cache_image(mut image: CacheImage, resolution: u32) -> CacheImage {
+    if (image.image.width, image.image.height) != (resolution, resolution) {
+        image.image = resample(&image.image, resolution);
+    }
+    image
 }
 
 /// Shares of a set's span (start, length): translating its layers, replaying strokes, cooking graphs (the composite
@@ -428,10 +432,12 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let record = &ctx.source.record;
     let name = record.name.clone();
     let item = |what: &str| format!("texture set \"{name}\" / {what}");
-    // the stored result: each channel read once now (whether it reads, its size), and again one at a time where it is
-    // compared and kept, so that a set never holds all its channels as floats at once
+    // Prepare the stored reference directly for interactive opens. An explicit comparison still reads each channel
+    // in its original precision after compositing the stack.
     let mut cache: Vec<StoredChannel> = Vec::new();
     let only = ctx.options.translate_only;
+    let prepare_reference = !ctx.options.measure && !ctx.options.precompute_graphs;
+    let mut cached_resolution = None;
     match ctx.source.cache_set.as_ref().filter(|_| !only) {
         None if only => {}
         None => report.add(item("stored result"), Fidelity::Approximated, "no stored result (the original never rendered this set)"),
@@ -452,14 +458,26 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
                     );
                     continue;
                 };
-                match read_cache(ctx.file, e) {
-                    Ok(img) => cache.push(StoredChannel { channel, entry: e, size: (img.image.width, img.image.height), missing_bytes: img.missing_bytes }),
-                    Err(err) => report.add(item(&format!("channel {label}")), Fidelity::Approximated, format!("unreadable stored result: {err}")),
-                }
+                let img = match read_cache(ctx.file, e) {
+                    Ok(img) => img,
+                    Err(err) => {
+                        report.add(item(&format!("channel {label}")), Fidelity::Approximated, format!("unreadable stored result: {err}"));
+                        continue;
+                    }
+                };
+                let (size, missing_bytes) = ((img.image.width, img.image.height), img.missing_bytes);
+                let prepared = if prepare_reference {
+                    ctx.hooks.check()?;
+                    let resolution = *cached_resolution.get_or_insert_with(|| resolve_resolution(record, Some(size), ctx.options, &name, report));
+                    Some(resized_cache_image(img, resolution).image.layer_tiles(channel))
+                } else {
+                    None
+                };
+                cache.push(StoredChannel { channel, entry: e, size, missing_bytes, prepared });
             }
         }
     }
-    let resolution = resolve_resolution(record, cache.first().map(|s| s.size), ctx.options, &name, report);
+    let resolution = cached_resolution.unwrap_or_else(|| resolve_resolution(record, cache.first().map(|s| s.size), ctx.options, &name, report));
     let mut set = TextureSet::new(name.clone(), ctx.source.slot, resolution);
     let shader_model = ctx.project_set.and_then(|s| s.shader_model);
     let mut declared = SetChannels::default();
@@ -662,7 +680,7 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     let mut scores = Vec::new();
     let mut corrections: Vec<correction::ChannelCorrection> = Vec::new();
     let measuring = ctx.options.measure && !cache.is_empty() && stack.is_some();
-    let cooking = !only && stack.as_ref().is_some_and(|s| s.layers.iter().any(|l| !l.graphs().is_empty()));
+    let cooking = !only && ctx.options.precompute_graphs && stack.as_ref().is_some_and(|s| s.layers.iter().any(|l| !l.graphs().is_empty()));
     if measuring || cooking {
         ctx.hooks.check()?;
         let (set, of) = ctx.index;
@@ -698,15 +716,20 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
     }
     let agrees = scores.iter().all(|(_, s)| s.mean <= AGREEMENT_STEPS);
     let strategy = Strategy::choose(exact, !cache.is_empty(), agrees);
-    let note = scores.iter().map(|(c, s)| format!("{} mean {:.2} max {:.1}", declared.label(*c), s.mean, s.max)).collect::<Vec<_>>().join(", ");
-    let fidelity = match strategy {
-        Strategy::RealStack => Fidelity::Exact,
-        Strategy::Disagrees | Strategy::NotReproduced => Fidelity::Approximated,
-        Strategy::BestEffort => Fidelity::Approximated,
-    };
+    let note = scores
+        .iter()
+        .filter(|(_, s)| s.texels > 0)
+        .map(|(c, s)| format!("{} mean {:.2} max {:.1}", declared.label(*c), s.mean, s.max))
+        .collect::<Vec<_>>()
+        .join(", ");
     if stack.is_some() {
+        let (fidelity, description) = match strategy {
+            Strategy::RealStack if note.is_empty() => (Fidelity::Approximated, "the known layer parts translated exactly and are used for the result"),
+            Strategy::RealStack => (Fidelity::Exact, strategy.describe()),
+            _ => (Fidelity::Approximated, strategy.describe()),
+        };
         let measured = if note.is_empty() { "not measured".to_string() } else { format!("against the stored result: {note}") };
-        report.add(item("layer stack"), fidelity, format!("{layer_count} layers; {}; {measured}", strategy.describe()));
+        report.add(item("layer stack"), fidelity, format!("{layer_count} layers; {description}; {measured}"));
     }
     if let Some(s) = &stack {
         for (_, path, why) in &s.verdict.mask_failures {
@@ -732,9 +755,9 @@ fn build_set(ctx: &SetContext, project: &mut Project, out: &mut Imported, report
         let shown = ctx.options.original_on_top && matches!(strategy, Strategy::NotReproduced | Strategy::Disagrees) || stack.is_none();
         let id = project.alloc_id();
         let layer = original_result_layer(id, &cache_channels, shown);
-        for stored in &cache {
+        for mut stored in cache {
             let c = &stored.channel;
-            let tiles = kept.remove(c).or_else(|| stored.read(ctx.file, resolution).map(|img| img.image.layer_tiles(*c)));
+            let tiles = stored.prepared.take().or_else(|| kept.remove(c)).or_else(|| stored.read(ctx.file, resolution).map(|img| img.image.layer_tiles(*c)));
             let Some(tiles) = tiles else { continue };
             out.pixels.layers.insert((id, *c), tiles);
             let missing = stored.missing_bytes;

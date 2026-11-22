@@ -269,6 +269,14 @@ impl ImportTask {
         self
     }
 
+    /// Evaluate imported materials when preparing the first viewport composite.
+    /// Diagnostic comparisons are optional for an interactive open.
+    pub fn for_interactive_open(mut self) -> ImportTask {
+        self.options.precompute_graphs = false;
+        self.options.measure &= self.options.original_correction || self.options.original_on_top;
+        self
+    }
+
     /// Also keeps graph renders in `cache`'s folder and reuses those found there (native builds).
     pub fn with_result_cache(mut self, cache: Option<crate::result_cache::ResultCache>) -> ImportTask {
         self.result_cache = cache;

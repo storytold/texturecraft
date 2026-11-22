@@ -19,6 +19,9 @@ pub struct ImportOptions {
     /// Composites each texture set and compares it with the original's stored result (the safety net). On by default;
     /// without it every stack counts as not measured.
     pub measure: bool,
+    /// Prepare graph outputs during import for consumers that save or inspect the result without compositing a view.
+    /// Interactive consumers that immediately composite the project can evaluate graphs in that first pass instead.
+    pub precompute_graphs: bool,
     /// Largest texture set resolution kept (larger sets are imported at this size, the original's result reduced);
     /// `None` keeps the file's resolution.
     pub max_resolution: Option<u32>,
@@ -41,6 +44,7 @@ impl Default for ImportOptions {
             original_correction: false,
             native_filters: false,
             measure: true,
+            precompute_graphs: true,
             max_resolution: None,
             replay_strokes: true,
             graphs: crate::GraphMode::Decompile,

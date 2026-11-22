@@ -23,6 +23,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use rayon::prelude::*;
+
 use texturecraft_core::{BakedMap, Channel, ChannelKind, GraphInput, GraphRef, LayerId, MAX_GRAPH_NESTING, StableHash};
 pub use texturecraft_graph::context::Cancel;
 use texturecraft_graph::context::{EvalContext, Files};
@@ -859,6 +861,7 @@ impl GraphStore {
     /// Renders `g` (see the module docs).
     fn render(&self, g: &GraphRef, env: &RenderEnv, given: &[(u32, Tex)], depth: usize) -> Result<Cooked, String> {
         let side = env.side;
+        let pool = self.pool();
         let mut graph = (*self.parsed(&g.key)?).clone();
         apply_values(&mut graph, &g.params);
         graph.seed_offset = g.seed;
@@ -880,7 +883,7 @@ impl GraphStore {
         };
         for (k, input) in &g.inputs {
             match input {
-                GraphInput::Baked(m) => put(*k, baked_tex(env.baked, *m, side)),
+                GraphInput::Baked(m) => put(*k, baked_tex(env.baked, *m, side, pool.as_deref())),
                 GraphInput::Constant(c) => put(*k, Tex::solid(side, side, [c[0], c[1], c[2], 1.0])),
                 GraphInput::Image(name) => {
                     if let Some(img) = env.images.get(name) {
@@ -902,7 +905,7 @@ impl GraphStore {
         // the render's nodes as they finish, for the store's progress (nothing computed depends on it)
         let done = Arc::new(AtomicUsize::new(0));
         let _running = Running::start(&self.cooks.running, done.clone(), graph.work_nodes());
-        let ec = EvalContext { cancel: self.cooks.cancel.clone(), pool: self.pool(), files: Files::none(), nodes_done: Some(done), ..EvalContext::default() };
+        let ec = EvalContext { cancel: self.cooks.cancel.clone(), pool, files: Files::none(), nodes_done: Some(done), ..EvalContext::default() };
         let outs = evaluate(&graph, &ec, side, images, given)?;
         let linear: BTreeSet<String> =
             graph.meta.get("working").map(|w| w.trim_matches('"').split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
@@ -984,7 +987,7 @@ fn evaluate(graph: &Graph, ec: &EvalContext, side: usize, images: Vec<Option<Tex
                 t.px.iter_mut().for_each(|p| *p = [p[c], p[c], p[c], p[3]]);
             }
         }
-        for (name, t) in graph.evaluate_in(ec, Some(side), &one).map_err(|e| e.to_string())? {
+        for (name, t) in graph.evaluate_owned(ec, Some(side), one).map_err(|e| e.to_string())? {
             match merged.get_mut(&name) {
                 Some(m) if (m.w, m.h) == (t.w, t.h) => m.px.iter_mut().zip(&t.px).for_each(|(a, b)| {
                     if let (Some(slot), Some(v)) = (a.get_mut(c), b.get(c)) {
@@ -1002,21 +1005,39 @@ fn evaluate(graph: &Graph, ec: &EvalContext, side: usize, images: Vec<Option<Tex
 }
 
 /// A baked map as a graph reads it, at `side` (normal maps with green pointing down, as the graph's own normals).
-fn baked_tex(baked: &BakedMaps, m: BakedMap, side: usize) -> Tex {
-    let s = side as u32;
-    let flip = m == BakedMap::Normal;
-    let neutral = m.neutral();
-    let mut t = Tex::solid(side, side, [neutral[0], neutral[1], neutral[2], 1.0]);
-    if !baked.maps.contains_key(&m) {
-        return t;
-    }
-    for (i, p) in t.px.iter_mut().enumerate() {
-        let (x, y) = ((i % side) as u32, (i / side) as u32);
-        if let Some(v) = baked.sample(m, x, y, (s, s)) {
-            *p = [v[0], if flip { 1.0 - v[1] } else { v[1] }, v[2], 1.0];
+fn baked_tex(baked: &BakedMaps, map: BakedMap, side: usize, pool: Option<&ThreadPool>) -> Tex {
+    let [r, g, b] = map.neutral();
+    let mut tex = Tex::solid(side, side, [r, g, b, 1.0]);
+    let Some(data) = baked.maps.get(&map).filter(|_| side > 0) else { return tex };
+
+    // Match BakedMaps::sample's integer nearest-texel mapping. The source map and
+    // horizontal sampling offsets are the same for every output row.
+    let width = u64::from(baked.resolution.max(1));
+    let height = u64::from(baked.height(map).max(1));
+    let components = map.components();
+    let columns: Vec<_> = (0..side).map(|x| (x as u64 * width / side as u64) as usize).collect();
+    let normal = map == BakedMap::Normal;
+    let row = |(y, pixels): (usize, &mut [[f32; 4]])| {
+        let start = (y as u64 * height / side as u64 * width) as usize;
+        for (p, x) in pixels.iter_mut().zip(&columns) {
+            let Some(i) = (start + x).checked_mul(components) else { continue };
+            if components == 3 {
+                if let (Some(r), Some(g), Some(b)) = (data.get(i), data.get(i + 1), data.get(i + 2)) {
+                    *p = [r, if normal { 1.0 - g } else { g }, b, 1.0];
+                }
+            } else if let Some(v) = data.get(i) {
+                *p = [v, v, v, 1.0];
+            }
         }
+    };
+    // A compositor worker can be waiting for this cook. Use the graph's pool
+    // so preparing its inputs never waits on the compositor's pool.
+    if let Some(pool) = pool.filter(|_| side >= 256) {
+        pool.install(|| tex.px.par_chunks_mut(side).with_min_len(32).enumerate().for_each(row));
+    } else {
+        tex.px.chunks_mut(side).enumerate().for_each(row);
     }
-    t
+    tex
 }
 
 #[cfg(test)]

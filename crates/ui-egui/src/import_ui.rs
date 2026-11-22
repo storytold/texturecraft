@@ -138,7 +138,7 @@ fn start(app: &mut TextureCraftApp, ctx: &egui::Context, task: ImportTask) -> Im
     let worker = progress.clone();
     let prefer_gpu = app.ui.prefs.gpu_compositing && app.gpu.as_ref().is_some_and(crate::gpu::GpuLink::supports_gpu_layers);
     let rx = crate::spawn_worker("texturecraft-import", move || {
-        task.run_with_view_where(&worker, |session| {
+        task.for_interactive_open().run_with_view_where(&worker, |session| {
             (0..session.caches.len())
                 .take_while(|_| !worker.is_cancelled())
                 .filter(|&ts| !prefer_gpu || !crate::gpu::GpuLink::plans_import_set(session, ts))
