@@ -61,7 +61,8 @@ const FIRST_GENERATOR: u32 = 40;
 const FIRST_EXTENDED_PATTERN: u32 = 48;
 pub(crate) const ROWS: u32 = 64;
 const WORKGROUP: u32 = 8;
-// Keep extreme Tile Generator overlap from monopolizing a single dispatch or submission.
+// Keep extreme Tile Generator overlap from monopolizing an update, dispatch, or submission.
+const MAX_TILE_WORK_PER_UPDATE: u64 = 8 << 30;
 const MAX_TILE_WORK_PER_BAND: u64 = 64 << 20;
 const MAX_TILE_WORK_PER_SUBMISSION: u64 = 256 << 20;
 const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
@@ -2366,7 +2367,9 @@ impl GpuCompositor {
         } else {
             0
         };
-        let tile_work = program.tile_work_per_pixel()?.saturating_add(program.groups.work_per_pixel()).saturating_add(selection_work);
+        let pattern_work = program.tile_work_per_pixel()?;
+        check_tile_update_budget(width, height, pattern_work)?;
+        let tile_work = pattern_work.saturating_add(program.groups.work_per_pixel()).saturating_add(selection_work);
         let grouped = program.groups.depth != 0;
         let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
         let halo = radius.saturating_add(program.filters.reach);
@@ -2717,6 +2720,14 @@ impl GpuCompositor {
         }
         Ok(())
     }
+}
+
+fn check_tile_update_budget(width: u32, height: u32, work_per_pixel: u64) -> Result<(), &'static str> {
+    let estimated_work = (u64::from(width) * u64::from(height)).saturating_mul(work_per_pixel);
+    if estimated_work > MAX_TILE_WORK_PER_UPDATE {
+        return Err("Tile Generator overlap exceeds the GPU compositor's interactive work budget.");
+    }
+    Ok(())
 }
 
 fn composite_band_size(width: u32, tile_work_per_pixel: u64) -> (u32, u32) {
@@ -3276,7 +3287,7 @@ mod procedural_tests {
     }
 
     #[test]
-    fn tile_generator_band_size_budgets_overlapping_work_at_8k() {
+    fn tile_generator_budget_rejects_full_overlap_and_allows_smaller_gpu_updates() {
         use texturecraft_core::{TileGenerator, TileSizeMode};
 
         let mut patterns = TilePatterns::default();
@@ -3287,9 +3298,12 @@ mod procedural_tests {
         let regular_work = patterns.work_per_sample(normal).unwrap();
         let overlapping_work = patterns.work_per_sample(overlapping_index).unwrap();
 
+        assert_eq!(check_tile_update_budget(8192, 8192, regular_work), Ok(()));
         assert_eq!(composite_band_size(8192, regular_work), (8192, ROWS));
-        let (width, rows) = composite_band_size(8192, overlapping_work);
-        assert!(width < 8192 && rows < ROWS);
+        assert!(check_tile_update_budget(8192, 8192, overlapping_work).is_err());
+        assert_eq!(check_tile_update_budget(256, 256, overlapping_work), Ok(()));
+        let (width, rows) = composite_band_size(256, overlapping_work);
+        assert!(rows < ROWS);
         assert!(u64::from(width) * u64::from(rows) * overlapping_work <= MAX_TILE_WORK_PER_BAND);
 
         let mut project = Project::new("Tile Generator budget", "builtin:plane");
