@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use super::code::{Code, FLOOR_ENV, NONE};
+use super::code::{Code, FLOOR_ENV, NONE, indexed_lcg_draw};
 use super::{B, FnEnv, Op, Prog, U, Value};
 use crate::accelerator::{GreyInput, PixelImageInput};
 use crate::graph::Pin;
@@ -168,7 +168,10 @@ fn uniform_initialiser(code: &Code, root: u32) -> bool {
             continue;
         }
         let Some(inst) = code.insts.get(index as usize) else { return false };
-        if matches!(inst.op, Op::Pos | Op::SampleGray | Op::SampleColor | Op::Stat(_) | Op::Random | Op::Loop | Op::Call) {
+        if matches!(inst.op, Op::Pos | Op::SampleGray | Op::SampleColor | Op::Stat(_) | Op::Loop | Op::Call) {
+            return false;
+        }
+        if inst.op == Op::Random && !code.lcg_draws.get(inst.x as usize).copied().flatten().is_some_and(|(site, _)| indexed_lcg_draw(site)) {
             return false;
         }
         todo.extend(inst.ins.into_iter().filter(|&i| i != NONE));

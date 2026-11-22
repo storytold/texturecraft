@@ -560,7 +560,7 @@ fn random(p: &Prog, c: &Code, i: usize, env: &FnEnv, fr: &mut Frame) -> Result<V
                 sr::step(site, fr.lcg_state.unwrap_or(0))
             }
         };
-        if !matches!(mode, 2 | 5) {
+        if !super::code::indexed_lcg_draw(mode) {
             fr.lcg_state = Some(state);
         }
         return Ok(Value::float(hi * sr::output(state)));

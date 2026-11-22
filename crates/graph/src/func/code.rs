@@ -23,6 +23,12 @@ pub const FLOOR_RUN: u32 = 2;
 pub const FLOOR_PASS: u32 = 3;
 pub const FLOORS: usize = 4;
 
+/// The compiled value and size sites restart from the given seed for each indexed draw.
+/// They neither read the pixel position nor change the caller's generator state.
+pub(super) fn indexed_lcg_draw(site: i32) -> bool {
+    matches!(site, 2 | 5)
+}
+
 pub struct Inst {
     pub op: Op,
     pub impure: bool,

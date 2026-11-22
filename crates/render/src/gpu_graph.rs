@@ -689,4 +689,34 @@ mod tests {
             assert!(expected.px.iter().zip(pixels.px).all(|(&a, b)| (a - b).abs() < 2e-6));
         }
     }
+
+    #[test]
+    fn imported_pixel_program_binds_indexed_random_initializers() {
+        let Ok(gpu) = crate::headless::Headless::new() else { return };
+        let backend = GraphAccelerator::new(&gpu.device, &gpu.queue);
+        let cancel = Cancel::new();
+        for (site, seed_source, independent) in [("size", 1, true), ("value", 1, true), ("pixel", 1, false), ("size", 4, false)] {
+            let graph = Graph::parse(&format!(
+                "size 256\nsubgraph example\nmeta kind \"function\"\nmeta float32 \"1\"\n\
+                 node 1 f_seed\nnode 2 f_pos\nnode 3 f_swizzle a=@2 mask=\"x\"\nnode 4 f_to_int a=@3\n\
+                 node 5 f_random lcg=\"{site}\" s=@{seed_source} k=2\nnode 6 f_set a=@5 name=\"offset\"\n\
+                 node 7 f_get name=\"offset\" type=0\nnode 8 f_add a=@3 b=@7\nnode 9 f_sequence a=@6 b=@8\n\
+                 node 10 f_out in=@9\nend\nnode 1 pixel_processor fn=\"example\"\noutput out 1\n",
+            ))
+            .unwrap();
+            let program = compile_named(&graph.subgraphs, "example").unwrap();
+            let mut environment = FnEnv::new([256.0, 256.0]);
+            for seed in [432, 123_456_789] {
+                environment.seed = seed;
+                let output = backend.pixel(PixelRequest { program: &program, environment: &environment, size: [256, 256], cancel: &cancel }).unwrap();
+                if !independent {
+                    assert!(output.is_none());
+                    continue;
+                }
+                let Some(PixelOutput::Grey(pixels)) = output else { panic!("the indexed draw should be bound on the GPU") };
+                let expected = Grey::from_fn(256, 256, |u, v| program.run(&environment, [f64::from(u), f64::from(v)]).unwrap().as_f32());
+                assert_eq!(pixels.px, expected.px);
+            }
+        }
+    }
 }
