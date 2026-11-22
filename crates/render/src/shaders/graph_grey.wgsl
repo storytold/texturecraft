@@ -1,5 +1,5 @@
 struct Params {
-    dimensions: vec4<u32>, // output width, band rows, input width, blend opcode or zero for a doubling
+    dimensions: vec4<u32>, // output width, band rows, input width, opcode (0 enlarges, 1 reduces)
     blend: vec4<u32>,      // opacity bits, whole-image input instead of a stripe with wrap padding
 }
 
@@ -50,6 +50,19 @@ fn doubled(x: u32, y: u32) -> vec2<f32> {
     return main_row * 0.75 + side_row * 0.25;
 }
 
+fn halved(x: u32, y: u32) -> vec2<f32> {
+    let stride = params.dimensions.z / 2u;
+    let i = 2u * (y * stride + x);
+    let top = vec2(front[i], front[i + 1u]);
+    let bottom = vec2(front[i + stride], front[i + stride + 1u]);
+    // Accumulate in CPU row order. A packed integer average changes ties because the CPU sums decoded f32 values.
+    var sum = vec2(even(top.x), even(top.y));
+    sum += vec2(odd(top.x), odd(top.y));
+    sum += vec2(even(bottom.x), even(bottom.y));
+    sum += vec2(odd(bottom.x), odd(bottom.y));
+    return sum * 0.25;
+}
+
 fn rounded_read(input: f32) -> u32 {
     // Match the CPU's half-up read using integer high and low words for the exact product of the
     // f32 significand and 65535. A direct f32 multiply would round twice around the midpoint.
@@ -95,8 +108,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let i = gid.y * width + gid.x;
     var words: vec2<u32>;
-    if params.dimensions.w == 0u {
-        let value = doubled(gid.x, gid.y);
+    if params.dimensions.w <= 1u {
+        var value: vec2<f32>;
+        if params.dimensions.w == 0u {
+            value = doubled(gid.x, gid.y);
+        } else {
+            value = halved(gid.x, gid.y);
+        }
         words = vec2(rounded_read(value.x), rounded_read(value.y));
     } else {
         words = compiled_16bit(blended(i));

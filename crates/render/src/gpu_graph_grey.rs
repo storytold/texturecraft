@@ -11,6 +11,8 @@ use wgpu::util::DeviceExt;
 
 const BAND_BYTES: u64 = 8 << 20;
 const WORKGROUP: u32 = 8;
+const ENLARGE: u32 = 0;
+const REDUCE: u32 = 1;
 const SHADER: &str = concat!(include_str!("shaders/graph_grey.wgsl"), "\n", include_str!("shaders/graph_compiled_grey.wgsl"));
 
 pub(crate) struct GreyRasterizer {
@@ -92,7 +94,8 @@ impl GreyRasterizer {
 
     pub(crate) fn render_resident(&self, pass: ResidentGreyPass<'_>, cancel: &Cancel) -> Result<Option<ResidentGrey16>, String> {
         let (foreground, background, side, mode, opacity) = match pass {
-            ResidentGreyPass::Enlarge { source, side } => (source, None, side, 0, 0.0),
+            ResidentGreyPass::Enlarge { source, side } => (source, None, side, ENLARGE, 0.0),
+            ResidentGreyPass::Reduce { source, side } => (source, None, side, REDUCE, 0.0),
             ResidentGreyPass::Blend { foreground, background, mode, opacity } => {
                 if !(32..=34).contains(&mode) || !opacity.is_finite() {
                     return Ok(None);
@@ -102,7 +105,7 @@ impl GreyRasterizer {
             }
         };
         let (source_side, alpha) = grey_input_shape(&foreground);
-        if cancel.is_cancelled() || !(4..=8192).contains(&side) || !side.is_power_of_two() || source_side == 0 {
+        if cancel.is_cancelled() || !(2..=8192).contains(&side) || !side.is_power_of_two() || source_side == 0 {
             return Ok(None);
         }
         let alpha = if let Some(background) = &background {
@@ -112,13 +115,14 @@ impl GreyRasterizer {
             }
             alpha
         } else {
-            if source_side >= side {
+            if (mode == ENLARGE && source_side >= side) || (mode == REDUCE && source_side <= side) {
                 return Ok(None);
             }
             alpha
         };
         let limit = self.device.limits();
-        if (side as u32).div_ceil(WORKGROUP) > limit.max_compute_workgroups_per_dimension {
+        let largest_output_side = if mode == REDUCE { source_side / 2 } else { side };
+        if (largest_output_side as u32).div_ceil(WORKGROUP) > limit.max_compute_workgroups_per_dimension {
             return Ok(None);
         }
         // Poll without waiting so completed submissions can release reservations before trying to reserve more.
@@ -127,19 +131,24 @@ impl GreyRasterizer {
         let back = match background {
             Some(image) => {
                 let Some(bound) = self.bind_input(image)? else { return Ok(None) };
-                bound
+                Some(bound)
             }
-            None => front.clone(), // The doubling kernel does not read this binding.
+            None => None,
         };
         let mut stages = Vec::new();
-        let mut size = if mode == 0 { source_side * 2 } else { side };
+        let next_side = |size| match mode {
+            ENLARGE => size * 2,
+            REDUCE => size / 2,
+            _ => side,
+        };
+        let mut size = next_side(source_side);
         loop {
             let Some(output) = self.allocate_resident(size, size)? else { return Ok(None) };
             stages.push((size, output));
             if size == side {
                 break;
             }
-            size *= 2;
+            size = next_side(size);
         }
         if cancel.is_cancelled() {
             return Ok(None);
@@ -149,14 +158,14 @@ impl GreyRasterizer {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("resident graph grayscale") });
             let mut input = (source_side, &front);
             for (size, output) in &stages {
-                let back = if mode == 0 { input.1 } else { &back };
+                let back = back.as_ref().unwrap_or(input.1); // Resizing does not read this binding.
                 self.encode_resident(&mut encoder, input, back, (*size, output), mode, opacity);
                 input = (*size, output);
             }
             self.queue.submit([encoder.finish()]);
         })?;
         front.retain_until_completed(&self.queue);
-        if mode != 0 {
+        if let Some(back) = back {
             back.retain_until_completed(&self.queue);
         }
         for (_, pixels) in &stages {
