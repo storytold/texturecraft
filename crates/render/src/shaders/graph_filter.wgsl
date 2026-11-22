@@ -71,7 +71,11 @@ fn luminance(v: f32) -> f32 {
 }
 
 fn map_luminance(uv: vec2<f32>) -> f32 {
-    let xy = uv * vec2<f32>(params.map.xy) - vec2<f32>(0.5);
+    // A compiled warp samples a differently sized map with clamped edges.
+    // At the output pixel centers, this is equivalent to resampling it first.
+    let size = vec2<f32>(params.map.xy);
+    let half_texel = 0.5 / size;
+    let xy = clamp(uv, half_texel, 1.0 - half_texel) * size - 0.5;
     let base = vec2<i32>(floor(xy));
     let weight = fract(xy);
     let wraps = vec2<bool>(true);

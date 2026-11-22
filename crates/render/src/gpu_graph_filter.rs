@@ -266,53 +266,80 @@ mod tests {
             profiler: Some(nodes.clone()),
             ..Default::default()
         };
-        let [size, map_size] = [256, 128];
+        let size = 256_usize;
         let make_inputs = |map_size| {
             [
                 Some(Tex::gray_fn(size, size, |u, v| 0.5 + 0.45 * (u * 18.0).sin() * (v * 20.0).cos())),
                 Some(Tex::gray_fn(map_size, map_size, |u, v| 0.5 + 0.5 * (u * 9.0).sin() * (v * 15.0).cos())),
             ]
         };
-        for (filter, div, options, gradient) in [
-            ("dir_warp", 65535, "map=@2 angle=0.166 intensity=5", false),
-            ("dir_warp", 65535, "map=@2 angle=-0.124 intensity=0.9 map_offset=0.5 tile_x=0 tile_y=0", false),
-            ("grad_warp", 65535, "map=@2 intensity=0.8 aspect_x=0.5 tile_x=0", true),
-            ("box_blur", 65535, "intensity=2.17 aspect_y=0.33", false),
-            ("box_blur", 255, "intensity=1.7 tile_x=0 tile_y=0", false),
-            ("box_blur", 65535, "intensity=8.3 aspect_y=0.65", false),
-            ("box_blur", 255, "intensity=8.3 tile_y=0", false),
-            ("line_blur", 65535, "intensity=1.3 angle=0.125", false),
-            ("line_blur", 65535, "intensity=2.1 angle=0.25", false),
-            ("line_blur", 65535, "intensity=5.28 angle=0.0625", false),
-            ("line_blur", 65535, "intensity=10.56 angle=0.1875 tile_x=0 tile_y=0", false),
-            ("line_blur", 65535, "intensity=5.28 angle=-0.125 tile_x=0", false),
-            ("line_blur", 65535, "intensity=10.56 angle=0.25", false),
-            ("line_blur", 65535, "intensity=26.4 angle=0", false),
-            ("line_blur", 65535, "intensity=47.52 angle=0.25", false),
-            ("line_blur", 65535, "intensity=47.52 angle=0.125", false),
-            ("line_blur", 65535, "intensity=47.52 angle=-0.125", false),
-            ("laplacian_sharpen", 255, "intensity=0.4", false),
+        for (filter, div, options, map_size) in [
+            ("dir_warp", 65535, "map=@2 angle=0.166 intensity=5", size),
+            ("dir_warp", 65535, "map=@2 angle=-0.124 intensity=0.9 map_offset=0.5 tile_x=0 tile_y=0", size),
+            ("dir_warp", 65535, "map=@2 angle=0.25 intensity=42", 64),
+            ("dir_warp", 65535, "map=@2 angle=-0.25 intensity=42 tile_x=0 tile_y=0", 512),
+            ("grad_warp", 65535, "map=@2 intensity=0.8 aspect_x=0.5 tile_x=0", 128),
+            ("box_blur", 65535, "intensity=2.17 aspect_y=0.33", size),
+            ("box_blur", 255, "intensity=1.7 tile_x=0 tile_y=0", size),
+            ("box_blur", 65535, "intensity=8.3 aspect_y=0.65", size),
+            ("box_blur", 255, "intensity=8.3 tile_y=0", size),
+            ("line_blur", 65535, "intensity=1.3 angle=0.125", size),
+            ("line_blur", 65535, "intensity=2.1 angle=0.25", size),
+            ("line_blur", 65535, "intensity=5.28 angle=0.0625", size),
+            ("line_blur", 65535, "intensity=10.56 angle=0.1875 tile_x=0 tile_y=0", size),
+            ("line_blur", 65535, "intensity=5.28 angle=-0.125 tile_x=0", size),
+            ("line_blur", 65535, "intensity=10.56 angle=0.25", size),
+            ("line_blur", 65535, "intensity=26.4 angle=0", size),
+            ("line_blur", 65535, "intensity=47.52 angle=0.25", size),
+            ("line_blur", 65535, "intensity=47.52 angle=0.125", size),
+            ("line_blur", 65535, "intensity=47.52 angle=-0.125", size),
+            ("laplacian_sharpen", 255, "intensity=0.4", size),
         ] {
             nodes.resident.store(0, Relaxed);
             let format = if div == 255 { "u8_compiled" } else { "u16_compiled" };
-            let map_log2 = if gradient { map_size.ilog2() } else { size.ilog2() };
+            let map_log2 = map_size.ilog2();
             let graph = Graph::parse(&format!(
                 "format 3\nsize {size}\nmeta compiled \"1\"\nnode 1 input idx=0 gray=1 format=\"{format}\" osize_mode=1\n\
                  node 2 input idx=1 gray=1 format=\"{format}\" osize_log2_x={map_log2} osize_log2_y={map_log2}\n\
                  node 3 {filter} in=@1 format=\"{format}\" {options}\noutput out 3\n"
             ))
             .unwrap();
-            let inputs = make_inputs(if gradient { map_size } else { size });
+            let inputs = make_inputs(map_size);
             let cpu = &graph.evaluate_with_inputs(None, &inputs).unwrap()["out"];
             let gpu = &graph.evaluate_in(&context, None, &inputs).unwrap()["out"];
             assert_eq!(nodes.resident.load(Relaxed), 1, "{filter} {options}");
             let errors = cpu.px.iter().zip(&gpu.px).map(|(a, b)| ((a[0] - b[0]).abs() * div as f32).round() as u32);
             let (max, sum) = errors.fold((0, 0), |(max, sum), error| (max.max(error), sum + error));
             let mean = f64::from(sum) / cpu.px.len() as f64;
-            // A slope across two differently sized grids can cross one 1/256 interpolation weight.
-            let max_steps = if gradient { 16 } else { 1 };
+            // Sampling a differently sized map can cross one 1/256 interpolation weight.
+            let max_steps = if map_size != size { 16 } else { 1 };
             assert!(max <= max_steps && mean < 0.05, "{filter} {options}: errors {max} maximum, {mean} mean quantization steps");
         }
+    }
+
+    #[test]
+    fn imported_levels_keeps_a_smaller_warp_result_resident() {
+        let Ok(gpu) = crate::headless::Headless::new() else { return };
+        let nodes = Arc::new(Nodes::default());
+        let context = EvalContext {
+            accelerator: Some(Arc::new(crate::gpu_graph::GraphAccelerator::new(&gpu.device, &gpu.queue))),
+            profiler: Some(nodes.clone()),
+            ..Default::default()
+        };
+        let graph = Graph::parse(
+            "format 3\nsize 512\nmeta compiled \"1\"\n\
+             node 1 input idx=0 gray=1 format=\"u16_compiled\"\n\
+             node 2 input idx=1 gray=1 format=\"u16_compiled\"\n\
+             node 3 dir_warp in=@1 map=@2 intensity=0 format=\"u16_compiled\"\n\
+             node 4 levels_mid in=@3 mid=0.4 format=\"u16_compiled\"\noutput out 4\n",
+        )
+        .unwrap();
+        let inputs = [Some(Tex::gray_fn(512, 512, |u, v| 0.5 + 0.4 * (u * 18.0).sin() * (v * 20.0).cos())), Some(Tex::gray_fn(512, 512, |u, v| u * v))];
+        let cpu = graph.evaluate_with_inputs(None, &inputs).unwrap();
+        let accelerated = graph.evaluate_in(&context, None, &inputs).unwrap();
+        assert_eq!(nodes.resident.load(Relaxed), 2);
+        assert_eq!(nodes.readbacks.load(Relaxed), 1);
+        assert_eq!(cpu["out"].px, accelerated["out"].px);
     }
 
     #[test]

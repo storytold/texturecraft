@@ -2496,6 +2496,10 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     let compiled = g.meta.contains_key("compiled");
     let reads_positions = compiled && matches!(n.kind.as_str(), "pixel_processor" | "transform_matrix" | "laplacian_sharpen" | "grad_warp" | "pattern_program");
     let resize_inputs = !reads_positions && ins.values().any(|t| t.dims() != sz);
+    // Directional warp can sample a differently sized map at the output pixel centers,
+    // giving the same values as resampling the whole map first. Its source still needs
+    // to match the output size, and the host fallback still resizes both inputs.
+    let samples_warp_map = n.kind == "dir_warp" && ins.iter().all(|(slot, image)| slot == "map" || image.dims() == sz);
     let node_ctx;
     let ctx = if sz.0 != ctx.size || sz.1 != ctx.height {
         node_ctx = Ctx {
@@ -2535,7 +2539,7 @@ fn finish_node(g: &Graph, p: Pending, ctx: &Ctx, ext: &[Option<Val>], cache: &mu
     let format = NodeFormat { code: fmt, read_rounding, steps: div.map(|div| crate::tex::Steps { read_rounding, fmt, div }) };
     // (for the node log: every input grey)
     let grey_ins = !ins.is_empty() && ins.values().all(|v| !matches!(v, NodeValue::Host(Val::Rgba(_))));
-    let resident = if compiled && !resize_inputs {
+    let resident = if compiled && (!resize_inputs || samples_warp_map) {
         if let Some(held) = forward_switch(n, &ins, fmt).or_else(|| forward_identity(n, ins.get("in"), sz, fmt)) {
             if matches!(held, NodeValue::Device(_) | NodeValue::DeviceFloat(_))
                 && let Some(profiler) = &ctx.ec.profiler
@@ -4872,8 +4876,10 @@ fn compute_resident_grey(
         "levels_mid" if !rolls(n) => {
             let Some((source, steps)) = ins.get("in").and_then(NodeValue::packed_grey).zip(steps) else { return Ok(None) };
             let (_, _, div, alpha) = source.info();
-            // At smaller sizes, building a new curve and uploading host pixels can cost more than using the CPU.
-            if ctx.size * ctx.height < 1024 * 1024 {
+            // A smaller device image can keep the whole chain resident. Host
+            // images still need to amortize both the curve and the pixel upload.
+            let minimum_pixels = if matches!(source, GreyInput::Device(_)) { 512 * 512 } else { 1024 * 1024 };
+            if ctx.size * ctx.height < minimum_pixels {
                 return Ok(None);
             }
             let Some((curve, alpha)) = crate::atomic::levels_mid_curve(n, div, alpha, steps) else { return Ok(None) };
