@@ -6,6 +6,9 @@ use texturecraft_core::Projection;
 use texturecraft_geom::Mesh;
 use texturecraft_geom::glam::{Vec2, Vec3};
 
+use texturecraft_core::FillSymmetry;
+
+use crate::fill_copies::FillCopies;
 use crate::fill_copy::FillCopy;
 use crate::organic::smoothstep;
 use crate::projector_view::ProjectorView;
@@ -30,7 +33,53 @@ const MIN_CELL_SIZE: f32 = 1e-6;
 /// A cell centre this close outside a triangle's edge (as a share of its area) still counts as inside, so shared edges leave no gaps
 const EDGE_TOLERANCE: f32 = 1e-6;
 
+/// A depth map's grid as the CPU reads it in [`ProjectorDepth::cover`], for the GPU compositor
+#[derive(Clone, Copy, Debug)]
+pub struct DepthGrid<'a> {
+    /// The view the grid lies across
+    pub view: ProjectorView,
+    /// The view point at the grid's lower corner
+    pub origin: Vec2,
+    /// One cell's size across and up in the view
+    pub cell: Vec2,
+    /// Cells across and up
+    pub grid_side: usize,
+    /// The mesh radius measured along the view's depth axis
+    pub nearness_unit: f32,
+    /// Per cell, row by row from the lower corner: the nearest surface's nearness at the cell centre and its slope across and up (nearness -inf where no surface is)
+    pub front: &'a [[f32; 3]],
+    /// `cover`'s bias, slope bias limit and fade width, in mesh radii
+    pub bias: f32,
+    pub max_slope_bias: f32,
+    pub fade: f32,
+}
+
 impl ProjectorDepth {
+    /// The grid as `cover` reads it.
+    pub fn grid(&self) -> DepthGrid<'_> {
+        DepthGrid {
+            view: self.view,
+            origin: self.origin,
+            cell: self.cell,
+            grid_side: self.grid_side,
+            nearness_unit: self.nearness_unit,
+            front: &self.front,
+            bias: BIAS,
+            max_slope_bias: MAX_SLOPE_BIAS,
+            fade: FADE,
+        }
+    }
+
+    /// The depth maps of a fill's symmetry copies (one per copy, None where a copy sees nothing),
+    /// sharing one grid's storage and raster budget as the CPU evaluator does.
+    pub fn build_copies(view: ProjectorView, mesh: &Mesh, symmetry: &FillSymmetry, center: Vec3, radius: f32) -> Vec<Option<ProjectorDepth>> {
+        let copies = FillCopies::new(symmetry, center, center, radius);
+        let count = symmetry.copies() as usize;
+        let grid_side = (GRID_SIDE * GRID_SIDE / count).isqrt();
+        let cell_budget = CELL_BUDGET / count;
+        (0..count).map(|index| Self::build_for_copy(view, mesh, Some(copies.copy(index as u32)), grid_side, cell_budget)).collect()
+    }
+
     /// Build the depth map of a borrowed mesh, if the projection uses depth culling.
     pub fn of(mesh: &Mesh, bounds: (Vec3, Vec3), projection: &Projection) -> Option<Arc<ProjectorDepth>> {
         let view = ProjectorView::of(projection, bounds)?;
@@ -42,7 +91,8 @@ impl ProjectorDepth {
         Self::build_for_copy(view, mesh, None, GRID_SIDE, CELL_BUDGET)
     }
 
-    pub(crate) fn build_for_copy(view: ProjectorView, mesh: &Mesh, copy: Option<FillCopy>, mut grid_side: usize, cell_budget: usize) -> Option<Self> {
+    /// [`Self::build`] for one copy of a fill (`copy` places the mesh), on a grid of at most `grid_side` cells across within `cell_budget` cell visits.
+    pub fn build_for_copy(view: ProjectorView, mesh: &Mesh, copy: Option<FillCopy>, mut grid_side: usize, cell_budget: usize) -> Option<Self> {
         let projected: Vec<_> = mesh.positions.iter().map(|&point| view.local(copy.map_or(point, |copy| copy.point(point)))).collect();
         let (min, max) = projected
             .iter()
@@ -161,13 +211,13 @@ fn edge(a: Vec2, b: Vec2, q: Vec2) -> f32 {
 }
 
 /// Cells across and up the grid
-pub(crate) const GRID_SIDE: usize = 512;
+pub const GRID_SIDE: usize = 512;
 
 /// A triangle flatter than this on screen is seen edge on
 const MIN_SCREEN_AREA: f32 = 1e-12;
 
 /// Cell visits available at each resolution before large overlapping triangles require a coarser grid.
-pub(crate) const CELL_BUDGET: usize = 256 * GRID_SIDE * GRID_SIDE;
+pub const CELL_BUDGET: usize = 256 * GRID_SIDE * GRID_SIDE;
 
 /// Steepest surface slope kept, in nearness per view unit
 const MAX_SLOPE: f32 = 1e4;
@@ -206,6 +256,29 @@ mod tests {
         projector.depth.on = on;
         projector.depth.hardness = hardness;
         Projection::Planar { scale: 1.0, axis: 2, offset: [0.0; 3], uv: UvTransform::default(), projector, placed: None }
+    }
+
+    /// The grid the GPU compositor reads is the one `cover` reads, and the copy maps are the
+    /// ones fill symmetry builds.
+    #[test]
+    fn the_read_accessors_expose_the_grid_cover_reads() {
+        let mesh = two_squares(0.5, -0.5);
+        let projection = planar_z(true, 1.0);
+        let depth = ProjectorDepth::of(&mesh, mesh.bounds(), &projection).unwrap();
+        let grid = depth.grid();
+        assert_eq!(grid.front.len(), grid.grid_side * grid.grid_side);
+        assert_eq!((grid.origin, grid.cell, grid.nearness_unit), (depth.origin, depth.cell, depth.nearness_unit));
+        assert!(grid.front.iter().any(|cell| cell[0].is_finite()));
+        let view = ProjectorView::of(&projection, mesh.bounds()).unwrap();
+        let symmetry = texturecraft_core::FillSymmetry { on: true, ..texturecraft_core::FillSymmetry::OFF };
+        let copies = ProjectorDepth::build_copies(view, &mesh, &symmetry, Vec3::ZERO, 1.0);
+        assert_eq!(copies.len(), symmetry.copies() as usize);
+        let Some(crate::fill_depth::FillDepth::Copies(maps)) = crate::fill_depth::FillDepth::build(&mesh, (view, Some((symmetry, Vec3::ZERO, 1.0)))) else {
+            panic!("symmetry builds one map per copy")
+        };
+        for (built, expected) in copies.iter().zip(maps.iter()) {
+            assert_eq!(built.as_ref().map(|depth| depth.front.clone()), expected.as_ref().map(|depth| depth.front.clone()));
+        }
     }
 
     #[test]

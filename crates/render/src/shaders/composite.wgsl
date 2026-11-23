@@ -40,7 +40,8 @@ struct Params {
     anchor: vec4<u32>,
     anchor_default: vec4<f32>,
     // Words per field texel (5, or 6 with the input word), input word present, the prepare
-    // pass's input operation plus one, reserved.
+    // pass's input operation plus one, the prepare pass's stage flags (bit 0: the stage wraps).
+    // The fields' origin, filter_region.xy, is i32 bits: it lies below zero with a wrapping stage.
     field_layout: vec4<u32>,
     // One vec4 per GPU port package, P1 to P8, written by its `band_uniform` in Rust.
     packages: array<vec4<u32>, 8>,

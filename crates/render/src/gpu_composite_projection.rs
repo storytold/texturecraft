@@ -19,6 +19,21 @@
 //! - P1 also owns `gpu_image_source.rs` (`MaterialImages`, mip chains, filtering, wrap) and
 //!   `shaders/material_image.wgsl`. `MaterialImages::register_image(name, ImageUse)` is the frozen
 //!   API P3 and P7 call: add image kinds as `ImageUse` variants, never change the signature.
+//! - Hooks P0b added (stubs return today's result):
+//!   - [`place_image`], [`place_procedural`] and [`place_cover`] get the fill's `sampling` and
+//!     `&mut ProceduralInputs`; `place_cover` runs after every source kind (uniform and anchor
+//!     too), since the CPU's coverage applies to all of them.
+//!   - [`image_use`] picks the `ImageUse` that `source_operation` registers an image source with.
+//!   - `MaterialImages::register_decal(frame, sources, sampling)` gets the fill's sampling (the
+//!     decal path's Nearest and Bilinear HQ come in their own commit of the P1 series).
+//!   - Mip chains: `MaterialImages::atlas_images` returns an `AtlasMips` per colour image
+//!     (`ImageRes::mip_chain`, or `linear_mip_chain` for an sRGB colour read); the atlas uploads
+//!     the levels and `append_rgba` sets flag bit 9 and appends the level origins.
+//!   - Depth culling: `MaterialImages::set_surface(mesh)` runs in `set_surface_inputs` before
+//!     the atlas is built; build the grids there with `ProjectorDepth::build`/`build_copies` and
+//!     `grid()` (compose), return them from `raw_planes()` as exact-f32 `RawPlane`s, and read
+//!     their origins with `TileImageAtlas::append_raw`.
+//!   - P1 owns `gpu_tile_pattern.rs`'s atlas (`TileImageAtlas`, `AtlasMips`, `RawPlane`) from P0b on.
 //! - Band-wide values go in [`band_uniform`] (`params.packages[0]` in WGSL).
 //! - Keep [`uses_shader`] true for every program that needs the full WGSL file.
 //!
@@ -29,8 +44,8 @@
 use texturecraft_core::{Backface, Filtering, Projection, Projector, Sampling, ShapeCrop};
 
 use super::packages::PROJECTION_SELECTORS;
-use super::{CompositeProgram, Operation, UV_TILE_PROJECTION};
-use crate::gpu_image_source::DECAL_PROJECTION;
+use super::{CompositeProgram, Operation, ProceduralInputs, UV_TILE_PROJECTION};
+use crate::gpu_image_source::{DECAL_PROJECTION, ImageUse};
 
 /// Library filter ids P1 still leaves on the CPU (see `gpu_composite_packages.rs`).
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
@@ -67,8 +82,15 @@ pub(super) fn supports_image_sampling(sampling: Sampling) -> bool {
     sampling.filtering == Filtering::BilinearSharp
 }
 
+/// How an image source with `sampling` registers its image (`MaterialImages::register_image`;
+/// P1: the kind that makes the atlas hold its mip chain for Bilinear HQ, or a nearest read).
+pub(super) fn image_use(_sampling: Sampling) -> ImageUse {
+    ImageUse::Material
+}
+
 /// The projection words of an image source operation. None for a projection it cannot encode.
-pub(super) fn place_image(projection: &Projection, op: &mut Operation) -> Option<()> {
+/// `sampling` and the side table (`inputs.pack_params`) are there for P1's settings.
+pub(super) fn place_image(projection: &Projection, _sampling: Sampling, op: &mut Operation, _inputs: &mut ProceduralInputs) -> Option<()> {
     match projection {
         Projection::Uv { scale, rotation, offset } => {
             let (sin, cos) = rotation.to_radians().sin_cos();
@@ -105,7 +127,7 @@ pub(super) fn place_image(projection: &Projection, op: &mut Operation) -> Option
 
 /// The projection words of a procedural source operation, whose scale is already in `op.uv[2]`.
 /// None for a projection it cannot encode, or coordinates beyond the guarded f32 range.
-pub(super) fn place_procedural(projection: &Projection, op: &mut Operation) -> Option<()> {
+pub(super) fn place_procedural(projection: &Projection, _sampling: Sampling, op: &mut Operation, _inputs: &mut ProceduralInputs) -> Option<()> {
     match projection {
         Projection::Uv { scale, rotation, offset } => {
             let (sin, cos) = rotation.to_radians().sin_cos();
@@ -148,8 +170,11 @@ pub(super) fn place_procedural(projection: &Projection, op: &mut Operation) -> O
     Some(())
 }
 
-/// A placed (decal) projection reads its frame from `op.uv[0]` (`register_decal`).
-pub(super) fn place_decal(projection: &Projection, op: &mut Operation) {
+/// The coverage words of every source operation (uniform, anchor, image and procedural alike),
+/// after the source kind's own words: the CPU's coverage (wrap `tile_cover`, shape crop,
+/// backface, depth culling, decal frames) applies to every kind. Today: a placed (decal)
+/// projection reads its frame from `op.uv[0]` (`register_decal`).
+pub(super) fn place_cover(projection: &Projection, _sampling: Sampling, op: &mut Operation, _inputs: &mut ProceduralInputs) {
     if projection.placed().is_some() {
         op.procedural[3] = DECAL_PROJECTION;
     }
@@ -176,6 +201,32 @@ mod tests {
     /// stays) and add its oracle test.
     fn still_on_cpu() -> Vec<EffectKind> {
         Vec::new()
+    }
+
+    /// The placement hooks (P0b) leave every source kind's operation as before: no package
+    /// word, no side-table words, the same projection selector, images registered as material.
+    #[test]
+    fn placement_hooks_leave_the_operations_as_before() {
+        use texturecraft_core::{ChannelKind, NormalFormat, Procedural, ProceduralKind, Projection, Sampling, Source};
+
+        use crate::gpu_composite::{ProceduralInputs, source_operation};
+        use crate::gpu_image_source::ImageUse;
+
+        let procedural = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.1; 3], high: [0.9; 3], ramp: Vec::new() };
+        let image = Source::Image { name: "fill.png".into(), normal_format: NormalFormat::OpenGl };
+        for (projection, selector) in [(Projection::default(), 0), (Projection::UvTile, 10), (Projection::triplanar(), 1)] {
+            for source in [None, Some(Source::Uniform([0.4; 3])), Some(image.clone()), Some(procedural.clone())] {
+                let mut inputs = ProceduralInputs::new(64);
+                let op = source_operation(source.as_ref(), &projection, Sampling::SAVED_BEFORE, [0.5; 3], ChannelKind::Color, &mut inputs)
+                    .unwrap_or_else(|| panic!("{projection:?} {source:?}"));
+                assert_eq!(op.ext, [0; 4], "{projection:?} {source:?}");
+                assert!(inputs.ramp_words.is_empty(), "{projection:?} {source:?}");
+                let expected = if matches!(source, Some(Source::Image { .. }) | Some(Source::Procedural { .. })) { selector } else { 0 };
+                assert_eq!(op.procedural[3], expected, "{projection:?} {source:?}");
+            }
+        }
+        assert_eq!(super::image_use(Sampling::default()), ImageUse::Material);
+        assert_eq!(super::image_use(Sampling::SAVED_BEFORE), ImageUse::Material);
     }
 
     #[test]
