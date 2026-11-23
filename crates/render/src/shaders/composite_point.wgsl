@@ -167,6 +167,8 @@ fn point_scalar_filter(op: Operation, x: f32) -> f32 {
         }
         // Gradient Curve: low.xyz balance, contrast and 1 to invert, ids.z the shape
         case 134u: { return point_curve(op.ids.z, point_shape_gray(x, op.low.x, op.low.y, op.low.z > 0.5)); }
+        // Gradient Dynamic: high.x the colour's luminance
+        case 135u: { return op.high.x; }
         default: { return x; }
     }
 }
@@ -178,6 +180,8 @@ fn point_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surfac
         switch op.ids.y {
             case 128u: { return point_perceptive_adjust(op, c); }
             case 131u: { return point_color_correct(op, c); }
+            // Gradient Dynamic: low.xyz the colour
+            case 135u: { return op.low.xyz; }
             default: {}
         }
     }

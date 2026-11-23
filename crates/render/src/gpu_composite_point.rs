@@ -29,13 +29,13 @@
 //! oracle test (`crate::gpu_composite::oracle`) in colour, another content channel and the mask,
 //! for each setting value, set to Disable too, at opacity below 1 with a non-Normal blend.
 
-use texturecraft_core::{CurvePreset, Effect, Filter, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN};
+use texturecraft_core::{CurvePreset, Effect, Filter, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, finite_unit, lum};
 
 use super::packages::{POINT_OP_BITS, POINT_OPCODES};
 use super::{CompositeProgram, Operation, ProceduralInputs};
 
 /// Library filter ids P2 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["gradientMap", "gradientDynamic", "grayscale"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["gradientMap", "grayscale"];
 
 // P2's opcodes (the same constants head composite_point.wgsl)
 const HSL_PERCEPTIVE: u32 = 128;
@@ -45,6 +45,7 @@ const COLOR_CORRECT: u32 = 131;
 const SMOOTHSTEP: u32 = 132;
 const HEIGHT_ADJUST: u32 = 133;
 const GRADIENT_CURVE: u32 = 134;
+const GRADIENT_DYNAMIC: u32 = 135;
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_point.wgsl");
 /// The same functions without P2's code, for programs that do not use it.
@@ -89,6 +90,11 @@ pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, _inpu
         Filter::GradientCurve { preset, invert, balance, contrast } => {
             op.ids[2] = curve_shape(*preset);
             Some((GRADIENT_CURVE, [*balance, *contrast, f32::from(u8::from(*invert))]))
+        }
+        Filter::GradientDynamic { color, .. } => {
+            // Scalar channels and masks read the colour's luminance
+            op.high[0] = finite_unit(lum(*color));
+            Some((GRADIENT_DYNAMIC, color.map(finite_unit)))
         }
         _ => None,
     }
@@ -313,6 +319,19 @@ mod tests {
         assert_filters_match_cpu(&sines, Tolerance::TRANSCENDENTAL);
         // Stairs and full contrast are hard decisions; the painted values sit away from them
         assert_filters_match_cpu(&steps, Tolerance::POINT.with_flips(4));
+    }
+
+    #[test]
+    fn gradient_dynamic_matches_the_cpu() {
+        let filters = [
+            // The library default
+            Filter::GradientDynamic { vertical: false, position: 0.0, color: [0.6; 3] },
+            Filter::GradientDynamic { vertical: true, position: 0.3, color: [0.2, 0.7, 0.4] },
+            // Components beyond 0..1 clamp
+            Filter::GradientDynamic { vertical: false, position: 0.0, color: [1.3, -0.2, 0.5] },
+        ];
+
+        assert_filters_match_cpu(&filters, Tolerance::POINT);
     }
 
     #[test]
