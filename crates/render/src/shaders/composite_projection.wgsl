@@ -83,6 +83,8 @@ const P1_DEPTH_FADE_START: f32 = 0.75;
 // Nearer a cylinder's axis than this a texel counts as facing out (compose projector_cover.rs)
 const P1_MIN_AXIS_DISTANCE: f32 = 1e-6;
 const P1_FLOAT_EPSILON: f32 = 1.1920929e-7;
+// A warp quad's twist this small against its area counts as parallel sides (compose warp.rs RELATIVE_PARALLEL)
+const P1_RELATIVE_PARALLEL: f32 = 1e-6;
 // Symmetry copies stop once they cover this much (compose eval.rs COVERED)
 const P1_COVERED: f32 = 0.9999;
 // The word of a decal's alpha image in its frame words (gpu_image_source.rs decal_words)
@@ -466,11 +468,104 @@ fn p1_placed(op: Operation, world: vec3<f32>, nrm: vec3<f32>) -> vec4<f32> {
     return select(mirrored, direct, direct.w != 0.0);
 }
 
+fn p1_perp(a: vec2<f32>, b: vec2<f32>) -> f32 {
+    return a.x * b.y - a.y * b.x;
+}
+
+// How far across the warp's quad a point lies at height `v`, solved on the axis the quad's edge
+// spans most: u, and 1 in y where it is finite (compose warp.rs `across`)
+fn p1_warp_across(top: vec2<f32>, left: vec2<f32>, twist: vec2<f32>, relative: vec2<f32>, v: f32) -> vec2<f32> {
+    let span = top + twist * v;
+    var u = (relative.y - left.y * v) / span.y;
+    if abs(span.x) >= abs(span.y) {
+        u = (relative.x - left.x * v) / span.x;
+    }
+    return vec2(u, select(0.0, 1.0, p1_finite(u)));
+}
+
+// How far `uv` lies outside the image's 0..1 square (compose warp.rs `outside`)
+fn p1_outside(uv: vec2<f32>) -> f32 {
+    let past = uv - clamp(uv, vec2(0.0), vec2(1.0));
+    return dot(past, past);
+}
+
+// Texture coordinates of a point in frame units: the inverse of the bilinear quad the warp's
+// corners make, 1 in z where there is one (compose warp.rs `warp_uv`)
+fn p1_warp_uv(op: Operation, point: vec2<f32>) -> vec3<f32> {
+    let top_left = p1_vec2(op, P1_WARP_CORNERS);
+    let top_right = p1_vec2(op, P1_WARP_CORNERS + 2u);
+    let bottom_right = p1_vec2(op, P1_WARP_CORNERS + 4u);
+    let bottom_left = p1_vec2(op, P1_WARP_CORNERS + 6u);
+    let top = top_right - top_left;
+    let left = bottom_left - top_left;
+    let twist = top_left - top_right + bottom_right - bottom_left;
+    let relative = point - top_left;
+    let base_area = p1_perp(top, left);
+    let quadratic = p1_perp(twist, left);
+    let linear = base_area + p1_perp(relative, twist);
+    let constant = p1_perp(relative, top);
+
+    var uv: vec3<f32>;
+    if abs(quadratic) <= P1_RELATIVE_PARALLEL * abs(base_area) {
+        // Parallel sides make the quad's equation linear in v
+        let v = -constant / linear;
+        let u = p1_warp_across(top, left, twist, relative, v);
+        uv = vec3(u.x, v, u.y);
+    } else {
+        let discriminant = linear * linear - 4.0 * constant * quadratic;
+        if discriminant < 0.0 {
+            return vec3(0.0);
+        }
+
+        // Avoid subtracting near-equal values when the quad is nearly a parallelogram
+        let root = sqrt(discriminant);
+        let root_term = -0.5 * (linear + select(root, -root, linear < 0.0));
+        let first_v = root_term / quadratic;
+        let second_v = constant / root_term;
+        let first_u = p1_warp_across(top, left, twist, relative, first_v);
+        let second_u = p1_warp_across(top, left, twist, relative, second_v);
+        let first = vec3(first_u.x, first_v, first_u.y);
+        let second = vec3(second_u.x, second_v, second_u.y);
+        if first.z == 0.0 {
+            uv = second;
+        } else if second.z == 0.0 {
+            uv = first;
+        } else {
+            uv = select(first, second, p1_outside(second.xy) < p1_outside(first.xy));
+        }
+    }
+    if uv.z == 0.0 || !p1_finite(uv.x) || !p1_finite(uv.y) {
+        return vec3(0.0);
+    }
+    return uv;
+}
+
+// A warp at world point `world`: its uv in the quad, and how much of the quad and its reach cover
+// it when cropped; 0 in w where nothing lands (compose `warp_cover`)
+fn p1_warp_cover(op: Operation, world: vec3<f32>) -> vec4<f32> {
+    let local = p1_frame_local(op, world);
+    if local.w == 0.0 {
+        return vec4(0.0);
+    }
+    let uv = p1_warp_uv(op, local.xy);
+    if uv.z == 0.0 {
+        return vec4(0.0);
+    }
+    if (op.ext.y & P1_CROP) == 0u {
+        return vec4(uv.xy, 1.0, 1.0);
+    }
+    let inside = all(uv.xy >= vec2(0.0) & uv.xy <= vec2(1.0));
+    return vec4(uv.xy, select(0.0, p1_depth_fade(local.z, param(op, P1_FRAME_DEPTH)), inside), 1.0);
+}
+
 // A framed projection at world point `world` with normal `nrm`: uv, cover, and 0 in w where
 // nothing lands (compose `framed_cover`)
 fn p1_framed(op: Operation, world: vec3<f32>, nrm: vec3<f32>) -> vec4<f32> {
     if (op.ext.y & P1_FRAME_VALID) == 0u {
         return vec4(0.0);
+    }
+    if param_word(op, P1_KIND) == P1_KIND_WARP {
+        return p1_warp_cover(op, world);
     }
     return p1_placed(op, world, nrm);
 }

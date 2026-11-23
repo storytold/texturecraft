@@ -277,9 +277,16 @@ fn built_in(projection: &Projection, sampling: Sampling, op: &Operation) -> bool
 fn still_on_cpu(projection: &Projection, sampling: Sampling, op: &Operation) -> bool {
     let reads_image = op.ids[1] == IMAGE_SOURCE_OPCODE || projection.placed().is_some();
     (sampling.filtering == Filtering::BilinearHq && reads_image)
-        || matches!(projection, Projection::Warp { .. })
+        || cropped_warp_reads_image_alpha(projection)
         || (projection.placed().is_some() && sampling.filtering != Filtering::BilinearSharp)
         || projection.depth_culling().is_some()
+}
+
+/// A warp cropped to its shape takes its image's alpha, which only the fill knows: the GPU has
+/// no frame record for a warp (`register_decal` registers placed planars only), so it stays on
+/// the CPU.
+fn cropped_warp_reads_image_alpha(projection: &Projection) -> bool {
+    matches!(projection, Projection::Warp { projector, .. } if projector.crop == ShapeCrop::Cropped && !projector.ignore_image_alpha)
 }
 
 /// The `procedural[3]` selector of a fill on P1's path, so the program binds the surface its
@@ -667,7 +674,7 @@ mod tests {
             corners: Projection::FRAME_CORNERS,
             depth: Projection::WARP_DEPTH,
             uv: UvTransform::default(),
-            projector: Projector::default(),
+            projector: Projector { crop: ShapeCrop::Cropped, ..Projector::default() },
         };
         let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
         vec![
@@ -922,6 +929,27 @@ mod tests {
                 let sampling = Sampling { symmetry, ..Sampling::SAVED_BEFORE };
                 assert_fill_matches(&mut gpu, &sphere(), projection, sampling, Tolerance::BILINEAR.with_flips(FLIPS), &format!("{name} {label}"));
             }
+        }
+    }
+
+    /// A warp bends the source to the quad its pulled corners make, reaching past it or cropped
+    /// to it and its Projection Depth, turned, and with a UV transformation
+    #[test]
+    fn warp_projections_match_the_cpu() {
+        let mut gpu = headless();
+        let pulled = [[-0.6, 0.45], [0.55, 0.6], [0.4, -0.5], [-0.45, -0.4]];
+        let parallel = [[-0.5, 0.5], [0.6, 0.5], [0.6, -0.5], [-0.5, -0.5]];
+        let cropped = Projector { crop: ShapeCrop::Cropped, ignore_image_alpha: true, ..Projector::default() };
+        let turned = Projector { rotation: [0.0, 0.0, -20.0], scale: [1.2, 0.9, 1.0], ..cropped };
+        let cases = [
+            ("pulled", pulled, 0.3, Projector::default(), UvTransform::default()),
+            ("parallel", parallel, 0.3, Projector::default(), UvTransform::default()),
+            ("cropped", pulled, 0.4, cropped, UvTransform::default()),
+            ("turned and placed", pulled, 0.5, turned, UvTransform { tiling: [1.4, 0.7], rotation: 30.0, offset: [0.2, -0.1] }),
+        ];
+        for (label, corners, depth, projector, uv) in cases {
+            let projection = Projection::Warp { frame: frame(), corners, depth, uv, projector };
+            assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, Tolerance::BILINEAR.with_flips(FLIPS), &format!("warp {label}"));
         }
     }
 
