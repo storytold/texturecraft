@@ -1141,4 +1141,71 @@ mod tests {
             }
         }
     }
+
+    /// Composite time of Glow, Drop Shadow and Bevel (the library's) at 2K and 4K, the GPU's (median
+    /// of five after a warm-up) against the CPU's, on the oracle's paint:
+    /// `cargo test -p texturecraft-render --release --lib bench_box_and_distance_filters -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_box_and_distance_filters() {
+        use std::time::{Duration, Instant};
+
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles};
+        use texturecraft_geom::UvGBuffer;
+        use texturecraft_texel::TILE;
+
+        use crate::gpu_composite::CompositeProgram;
+
+        let Some(mut gpu) = headless() else { return };
+        let mesh = oracle_mesh(false);
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let filters = [("Glow", LIBRARY_GLOW), ("Drop Shadow", LIBRARY_DROP_SHADOW), ("Bevel", Filter::DistanceBevel(Bevel::LIBRARY))];
+        for side in [2048, 4096] {
+            gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((side, side), 0)], 1);
+            let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, side, side));
+            for (label, filter) in &filters {
+                let (project, pixels, _) = painted_project(&[(filter.clone(), 1.0, BlendMode::Normal)], BlendMode::Normal, (false, side)).unwrap();
+                let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+                program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+                // A halo too large for the adapter's working memory is reported, not timed
+                if let Err(error) = gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program) {
+                    println!("{label} at {side}: GPU [{}] {error}", gpu.adapter_name);
+                    continue;
+                }
+                let mut gpu_times: Vec<Duration> = (0..5)
+                    .map(|_| {
+                        let start = Instant::now();
+                        let _ = gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program);
+                        let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+                        start.elapsed()
+                    })
+                    .collect();
+                gpu_times.sort_unstable();
+
+                let channels: Vec<Channel> = project.texture_sets[0].channels.iter().map(|&(channel, _)| channel).collect();
+                let inputs = Inputs {
+                    project: &project,
+                    ts: 0,
+                    mesh: &mesh,
+                    gbuf: &gbuf,
+                    pixels: &pixels,
+                    baked: &baked,
+                    block_scales: project.texture_sets[0].block_scales(),
+                    preview: None,
+                    images: &images,
+                    bounds: mesh.bounds(),
+                };
+                let tiles: Vec<(u32, u32)> = (0..side / TILE).flat_map(|y| (0..side / TILE).map(move |x| (x, y))).collect();
+                let mut oracle = Composite::new(&channels, side);
+                let start = Instant::now();
+                composite_tiles(&inputs, &mut oracle, &tiles);
+                let cpu_time = start.elapsed();
+
+                println!(
+                    "{label} at {side}: GPU [{}] median {:?} (range {:?}..{:?}), CPU {:?}",
+                    gpu.adapter_name, gpu_times[2], gpu_times[0], gpu_times[4], cpu_time
+                );
+            }
+        }
+    }
 }
