@@ -4,6 +4,7 @@
 
 // Opcodes of P2's block (the constants in gpu_composite_point.rs)
 const POINT_HSL_PERCEPTIVE: u32 = 128u;
+const POINT_POSTERIZE_ALPHA: u32 = 129u;
 
 // Destination slots that hold no colour (channel_slot in Rust)
 const POINT_HEIGHT_SLOT: u32 = 6u;
@@ -66,11 +67,18 @@ fn point_perceptive_adjust(op: Operation, c: vec3<f32>) -> vec3<f32> {
     return vec3(filter_unit(red), filter_unit(green), filter_unit(blue));
 }
 
+// x in steps + 1 levels, as posterize in Rust
+fn point_posterize(steps: f32, x: f32) -> f32 {
+    return floor(filter_unit(x) * steps + 0.5) / steps;
+}
+
 // A P2 opcode (128..144) on a scalar channel or a mask value.
 fn point_scalar_filter(op: Operation, x: f32) -> f32 {
     switch op.ids.y {
         // HSL Perceptive: grays and masks shift their lightness only, as opcode 31
         case 128u: { return shift_unit(filter_unit(x), op.low.z); }
+        // Posterize with Apply to Alpha: the values as plain Posterize, low.x the steps
+        case 129u: { return point_posterize(op.low.x, x); }
         default: { return x; }
     }
 }
@@ -88,7 +96,11 @@ fn point_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surfac
 // default mixes point_effect_color by the opacity; take over for coverage or texel reads.
 fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, texel: LayerTexel) -> vec4<f32> {
     let filtered = point_effect_color(effect, content.rgb, channel, texel.surface, texel.baked.x);
-    return vec4(content.rgb + (filtered - content.rgb) * effect.low.w, content.a);
+    var coverage = content.a;
+    if effect.ids.y == POINT_POSTERIZE_ALPHA {
+        coverage += (point_posterize(effect.low.x, content.a) - content.a) * effect.low.w;
+    }
+    return vec4(content.rgb + (filtered - content.rgb) * effect.low.w, coverage);
 }
 
 // A point opcode in the layer_mask loop: the result the loop mixes in by the opacity.

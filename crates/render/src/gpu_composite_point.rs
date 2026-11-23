@@ -29,7 +29,7 @@
 //! oracle test (`crate::gpu_composite::oracle`) in colour, another content channel and the mask,
 //! for each setting value, set to Disable too, at opacity below 1 with a non-Normal blend.
 
-use texturecraft_core::{Effect, Filter};
+use texturecraft_core::{Effect, Filter, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN};
 
 use super::packages::{POINT_OP_BITS, POINT_OPCODES};
 use super::{CompositeProgram, Operation, ProceduralInputs};
@@ -40,6 +40,7 @@ pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] =
 
 // P2's opcodes (the same constants head composite_point.wgsl)
 const HSL_PERCEPTIVE: u32 = 128;
+const POSTERIZE_ALPHA: u32 = 129;
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_point.wgsl");
 /// The same functions without P2's code, for programs that do not use it.
@@ -59,6 +60,11 @@ pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, _inpu
             let (sine, cosine) = (hue * std::f32::consts::TAU).sin_cos();
             op.high[..2].copy_from_slice(&[sine, cosine]);
             Some((HSL_PERCEPTIVE, [*hue, *saturation, *lightness]))
+        }
+        Filter::Posterize { levels, alpha: true } => {
+            // The steps between the levels, as `posterize` rounds them
+            let steps = (levels.clamp(POSTERIZE_LEVELS_MIN, POSTERIZE_LEVELS_MAX).round() - 1.0).max(1.0);
+            Some((POSTERIZE_ALPHA, [steps, 0.0, 0.0]))
         }
         _ => None,
     }
@@ -190,6 +196,19 @@ mod tests {
         assert_filters_match_cpu(&filters, Tolerance::TRANSCENDENTAL);
     }
 
+    #[test]
+    fn posterize_apply_to_alpha_steps_the_coverage_as_the_cpu_does() {
+        let filters = [
+            Filter::Posterize { levels: 4.0, alpha: true },
+            Filter::Posterize { levels: 8.0, alpha: true },
+            // Rounds to three levels
+            Filter::Posterize { levels: 2.6, alpha: true },
+        ];
+
+        // Steps are hard decisions; the painted values sit away from them
+        assert_filters_match_cpu(&filters, Tolerance::POINT.with_flips(4));
+    }
+
     /// P2's filters and settings that still composite on the CPU, in content and in masks. Port
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
     fn still_on_cpu() -> Vec<Filter> {
@@ -228,7 +247,6 @@ mod tests {
                 debug: true,
             },
             Filter::HistogramScan { position: 0.4, contrast: 0.5, invert_position: true },
-            Filter::Posterize { levels: 4.0, alpha: true },
         ]
     }
 
