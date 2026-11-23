@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use super::packages::{self, ShaderFlags};
 use super::{ANCHOR_PUBLISH_LAYER, ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, TILE_GENERATOR_OPCODE};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,6 +21,8 @@ struct Features {
     anchors: bool,
     material_anchors: bool,
     color_selection: bool,
+    // The GPU port packages' WGSL files compiled in full (gpu_composite_packages.rs)
+    packages: ShaderFlags,
 }
 
 impl Features {
@@ -28,6 +31,7 @@ impl Features {
             authored_images: !program.material_images.is_empty(),
             mask_preview: program.is_mask_preview(),
             spatial: !program.filters.stages.is_empty(),
+            packages: ShaderFlags::of(program),
             ..Self::default()
         };
         features.material_anchors = program.filters.stages.iter().any(|stage| stage.anchor.is_some());
@@ -146,6 +150,9 @@ impl Features {
             include_str!("shaders/composite_groups.wgsl"),
             include_str!("shaders/composite.wgsl"),
         ]
+        .into_iter()
+        .chain(packages::shader_sources(self.packages))
+        .collect::<Vec<_>>()
         .join("\n")
     }
 
@@ -221,5 +228,30 @@ impl CompositePipelines {
             variants.prepare[usize::from(grouped_capture)].get_or_insert_with(|| pipeline("prepare_filter", "tc_spatial_source", grouped_capture)).clone()
         });
         (render, prepare)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::{Features, ShaderFlags};
+    use crate::gpu_composite::oracle;
+
+    /// Every package WGSL file (and every stub) must compile into the composite shader, also
+    /// while no program selects it yet.
+    #[test]
+    fn package_shaders_compile_in_full_and_as_stubs() {
+        let Some(gpu) = oracle::headless() else { return };
+        for packages in [ShaderFlags::default(), ShaderFlags::ALL] {
+            for spatial in [false, true] {
+                let features = Features { spatial, mask_effects: true, content_effects: true, packages, ..Features::default() };
+                let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let _module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("tc_gpu_composite_packages"),
+                    source: wgpu::ShaderSource::Wgsl(features.source(true, true).into()),
+                });
+                let error = pollster::block_on(scope.pop());
+                assert!(error.is_none(), "packages {packages:?}, spatial {spatial}: {error:?}");
+            }
+        }
     }
 }

@@ -8,15 +8,14 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    Backface, BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter,
-    Filtering, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Projector, Sampling,
-    ShapeCrop, Source, ThresholdMode,
+    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator,
+    GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source, ThresholdMode,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
 use crate::gpu_curvature::{CurvatureGpu, CurvatureInput, CurvatureLevels};
-use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages};
+use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, ImageUse, MaterialImages};
 use crate::gpu_neighbourhood::{self, FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
 use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
@@ -27,6 +26,25 @@ use wgpu::util::DeviceExt;
 mod groups;
 #[path = "gpu_composite_pipelines.rs"]
 mod pipelines;
+// The GPU port packages (texturecraft #713): the hub chains every package's hooks, each package
+// owns its module. See gpu_composite_packages.rs for the ownership table and shared layouts.
+#[path = "gpu_composite_brush.rs"]
+mod brush;
+#[path = "gpu_composite_projection.rs"]
+mod fill_projection;
+#[path = "gpu_composite_lighting.rs"]
+mod lighting;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "gpu_composite_oracle.rs"]
+pub(crate) mod oracle;
+#[path = "gpu_composite_packages.rs"]
+mod packages;
+#[path = "gpu_composite_point.rs"]
+mod point;
+#[path = "gpu_composite_stack.rs"]
+mod stack;
+#[path = "gpu_composite_udim.rs"]
+mod udim;
 use groups::{BEGIN_GROUP, END_GROUP, GroupPlan, StackWork};
 use pipelines::CompositePipelines;
 
@@ -46,6 +64,10 @@ const MASK_ANCHOR_STAGE: u32 = 1 << 28;
 const ANCHOR_SOURCE: u32 = 15;
 const ANCHOR_PUBLISH_MASK: u32 = 16;
 const ANCHOR_PUBLISH_LAYER: u32 = 17;
+// Opcodes are classified by range, in the shaders too (`is_fill_opcode` in
+// composite_packages.wgsl): fills and patterns below 20 and from 48 below 128, built-in effects
+// 20..40, generators 40..48, the GPU port packages' effects 128..192 (`packages::EXTENDED_EFFECTS`,
+// one block per package), group markers 200 and 201. Never renumber an existing opcode.
 // Extended procedural sources follow the filter and generator opcodes.
 const FIRST_GENERATOR: u32 = 40;
 const FIRST_EXTENDED_PATTERN: u32 = 48;
@@ -114,6 +136,9 @@ struct Operation {
     // Geometry mask row (resolved to a lookup offset at upload), height operation plus one,
     // height-mask contrast and offset encoded as floats.
     constraints: [u32; 4],
+    // The GPU port packages' word, zero everywhere else (layout in gpu_composite_packages.rs):
+    // side-table offset (0: none), P1 projection flags, P2/P3/P6/P7 flag bytes, P8 word.
+    ext: [u32; 4],
 }
 
 #[derive(Debug, Default)]
@@ -263,6 +288,26 @@ impl ProceduralInputs {
         Some([offset, count])
     }
 
+    /// Append finite `values` to the parameter side table (the words after the sRGB lookup in
+    /// binding 2, shared with [`Self::pack_rgb`]) and return their absolute word offset for
+    /// `Operation::ext[0]`. The shader reads them with `param(op, i)`. None for a non-finite value.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn pack_params(&mut self, values: &[f32]) -> Option<u32> {
+        if values.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let words: Vec<u32> = values.iter().map(|value| value.to_bits()).collect();
+        self.pack_words(&words)
+    }
+
+    /// [`Self::pack_params`] for raw words (counts, packed flags, offsets); read with `param_word(op, i)`.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn pack_words(&mut self, words: &[u32]) -> Option<u32> {
+        let offset = LOOKUP_WORDS.checked_add(u32::try_from(self.ramp_words.len()).ok()?)?;
+        self.ramp_words.extend_from_slice(words);
+        Some(offset)
+    }
+
     fn pack_curvature(&mut self, detail: &CurvatureDetail, derive_levels: bool) -> Option<[f32; 2]> {
         let offset = LOOKUP_WORDS.checked_add(u32::try_from(self.ramp_words.len()).ok()?)?;
         if offset >= 1 << 24 || detail.weights.iter().any(|weight| !weight.is_finite()) {
@@ -289,6 +334,9 @@ struct FilterStage {
     filter: Option<NeighbourhoodFilter>,
     cell: u32,
     anchor: Option<(Channel, u32, u32)>,
+    /// The operation (index plus one, 0: none) the prepare pass evaluates into the field's sixth
+    /// word: an image input's gray (P3) or the layer's own Height (P5, Height To Normal).
+    input: u32,
 }
 
 #[derive(Debug, Default)]
@@ -345,7 +393,7 @@ impl FilterPlan {
         for (read, &(producer, channel)) in inputs.reads.iter().enumerate().filter(|(_, (producer, _))| *producer == publication) {
             debug_assert_eq!(producer, publication);
             self.anchor_slots[read] = self.stages.len() as u32 + 1;
-            self.stages.push(FilterStage { layer, preceding, filter: None, cell: 1, anchor: material.map(|(first, cut)| (channel, first, cut)) });
+            self.stages.push(FilterStage { layer, preceding, filter: None, cell: 1, anchor: material.map(|(first, cut)| (channel, first, cut)), input: 0 });
         }
     }
 
@@ -371,7 +419,7 @@ impl FilterPlan {
                 if cell > 1 {
                     reach = reach.saturating_add(cell * 2);
                 }
-                self.stages.push(FilterStage { layer, preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE, filter, cell, anchor: None });
+                self.stages.push(FilterStage { layer, preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE, filter, cell, anchor: None, input: 0 });
                 continue;
             }
             if effect.ids[1] != NEIGHBOURHOOD_OPCODE {
@@ -382,7 +430,7 @@ impl FilterPlan {
             let slot = self.stages.len();
             effect.spatial[0] = if mask { slot } else { slot - first } as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None });
+            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input: 0 });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
@@ -393,7 +441,14 @@ impl FilterPlan {
     }
 
     fn words(&self, area: u64) -> u64 {
-        if self.stages.is_empty() { 0 } else { (self.stages.len() as u64 + 3) * u64::from(FIELD_WORDS) * area }
+        if self.stages.is_empty() { 0 } else { (self.stages.len() as u64 + 3) * u64::from(self.field_words()) * area }
+    }
+
+    /// Words per field texel: four premultiplied components and the UV coverage, plus a sixth
+    /// word when a stage carries an input ([`FilterStage::input`]). One stride for every field
+    /// of the program; the shaders read it from the uniform, never from a literal.
+    fn field_words(&self) -> u32 {
+        if self.stages.iter().any(|stage| stage.input != 0) { FIELD_WORDS + 1 } else { FIELD_WORDS }
     }
 }
 
@@ -619,9 +674,7 @@ impl CompositeProgram {
         brush: Option<LiveBrush>,
     ) -> Result<Self, &'static str> {
         let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
-        if !set.uv_tiles.is_empty() {
-            return Err("UDIM texture sets use CPU compositing.");
-        }
+        packages::check_set(set, false)?;
         if let Some(brush) = &brush {
             brush.validate(set.size())?;
         }
@@ -848,6 +901,7 @@ impl CompositeProgram {
                 }
                 operations.push(op);
             }
+            packages::order_layer_operations(&mut operations[first_op..]);
             for op in &mut operations[first_op..] {
                 op.constraints = [geometry_mask, height_op, height_params[0], height_params[1]];
             }
@@ -943,9 +997,7 @@ impl CompositeProgram {
         brush: Option<LiveBrush>,
     ) -> Result<Self, &'static str> {
         let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
-        if !set.uv_tiles.is_empty() {
-            return Err("UDIM texture sets use CPU mask preview.");
-        }
+        packages::check_set(set, true)?;
         // Folders around the layer (an instance's own, as the CPU places it, or its source's) re-place its mask fills
         let requested = owner;
         let owner = project.mask_owner(owner);
@@ -1006,8 +1058,18 @@ impl CompositeProgram {
     }
 }
 
+/// Filter library ids that still composite on the CPU with their library defaults, as
+/// (package, id). The GPU port's library gate (crates/ui-egui/src/gpu_port_gate.rs) checks this
+/// against the compiler; at the end of the port it is empty.
+#[doc(hidden)]
+pub fn library_filters_still_on_cpu() -> Vec<(&'static str, &'static str)> {
+    packages::library_still_on_cpu()
+}
+
 fn needs_surface(operations: &[Operation]) -> bool {
-    operations.iter().any(|op| op.procedural[3] != 0 || op.ids[1] == BAKED_LIGHTING_OPCODE || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]))
+    operations.iter().any(|op| {
+        op.procedural[3] != 0 || op.ids[1] == BAKED_LIGHTING_OPCODE || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]) || packages::needs_surface(op)
+    })
 }
 
 fn sparse_channel(pixels: &PixelStore, id: LayerId, channel: Channel) -> Result<Option<&TileImage>, &'static str> {
@@ -1255,7 +1317,7 @@ fn bind_tile_source(op: &mut Operation, source: Option<&Source>, patterns: &mut 
 fn register_decal(fill: &texturecraft_core::Fill, materials: &mut MaterialImages) -> Result<Option<u32>, &'static str> {
     let Some(frame) = fill.projection.placed() else { return Ok(None) };
     // A decal's image alpha also controls the non-image channels.
-    if fill.sampling.filtering != Filtering::BilinearSharp && fill.sources.values().any(|source| matches!(source, Source::Image { .. })) {
+    if !fill_projection::supports_image_sampling(fill.sampling) && fill.sources.values().any(|source| matches!(source, Source::Image { .. })) {
         return Err("A decal's image filtering uses CPU compositing.");
     }
     Ok(Some(materials.register_decal(*frame, fill.sources.values())))
@@ -1269,7 +1331,7 @@ fn source_operation(
     channel: ChannelKind,
     inputs: &mut ProceduralInputs,
 ) -> Option<Operation> {
-    if !supports_projection(projection, sampling) {
+    if !fill_projection::supports(projection, sampling) {
         return None;
     }
     let mut op = Operation::zeroed();
@@ -1277,7 +1339,7 @@ fn source_operation(
         None => op.low[..3].copy_from_slice(&default),
         Some(Source::Uniform(value)) => op.low[..3].copy_from_slice(value),
         Some(Source::Image { name, normal_format }) => {
-            if sampling.filtering != Filtering::BilinearSharp {
+            if !fill_projection::supports_image_sampling(sampling) {
                 return None;
             }
             let kind = match channel {
@@ -1292,38 +1354,8 @@ fn source_operation(
                     }
                 }
             };
-            op.ids = [0, IMAGE_SOURCE_OPCODE, inputs.materials.register_image(name), kind];
-            match projection {
-                Projection::Uv { scale, rotation, offset } => {
-                    let (sin, cos) = rotation.to_radians().sin_cos();
-                    op.projection = [cos, sin, scale[0], scale[1]];
-                    op.uv[..2].copy_from_slice(offset);
-                }
-                Projection::UvTile => op.procedural[3] = UV_TILE_PROJECTION,
-                Projection::Triplanar { scale, sharpness, offset, .. } => {
-                    op.projection = [offset[0], offset[1], offset[2], *scale];
-                    op.procedural[3] = 1;
-                    op.balance[3] = sharpness.max(1.0);
-                }
-                Projection::Planar { placed: Some(_), .. } => {}
-                Projection::Planar { scale, axis, offset, .. } => {
-                    op.projection = [offset[0], offset[1], offset[2], *scale];
-                    op.procedural[3] = 2 + u32::from((*axis).min(2));
-                }
-                Projection::Spherical { scale, offset, .. } => {
-                    op.projection = [offset[0], offset[1], offset[2], *scale];
-                    op.procedural[3] = 5;
-                }
-                Projection::Cylindrical { scale, axis, offset, .. } => {
-                    op.projection = [offset[0], offset[1], offset[2], *scale];
-                    op.procedural[3] = match axis {
-                        0 => 6,
-                        2 => 8,
-                        _ => 7,
-                    };
-                }
-                Projection::Warp { .. } => return None,
-            }
+            op.ids = [0, IMAGE_SOURCE_OPCODE, inputs.materials.register_image(name, ImageUse::Material), kind];
+            fill_projection::place_image(projection, &mut op)?;
         }
         Some(Source::Anchor { anchor, channel: read_channel, ramp }) => {
             let (reference, is_mask) = inputs.anchors.read(*anchor, *read_channel);
@@ -1391,72 +1423,11 @@ fn source_operation(
             if channel == ChannelKind::Color && !ramp.is_empty() {
                 op.procedural[1..3].copy_from_slice(&inputs.pack_rgb(ramp)?);
             }
-            match projection {
-                Projection::Uv { scale, rotation, offset } => {
-                    let (sin, cos) = rotation.to_radians().sin_cos();
-                    op.projection = [cos, sin, scale[0], scale[1]];
-                    op.uv[..2].copy_from_slice(offset);
-                    if scale.iter().zip(offset).any(|(s, o)| (s.abs() * 2.0 + o.abs()) * op.uv[2] > 32_768.0) {
-                        return None;
-                    }
-                }
-                Projection::UvTile => op.procedural[3] = UV_TILE_PROJECTION,
-                Projection::Planar { placed: Some(_), .. } => {}
-                Projection::Triplanar { scale, offset, .. } | Projection::Planar { scale, offset, .. } => {
-                    let frequency = *scale * op.uv[2];
-                    if offset.iter().any(|o| frequency.abs() + o.abs() > 32_768.0) {
-                        return None;
-                    }
-                    op.projection = [offset[0], offset[1], offset[2], frequency];
-                    if let Projection::Planar { axis, .. } = projection {
-                        op.procedural[3] = 2 + u32::from((*axis).min(2));
-                    } else if let Projection::Triplanar { sharpness, .. } = projection {
-                        op.procedural[3] = 1;
-                        op.balance[3] = sharpness.max(1.0);
-                    }
-                }
-                Projection::Spherical { scale, offset, .. } | Projection::Cylindrical { scale, offset, .. } => {
-                    let frequency = *scale * op.uv[2];
-                    if frequency.abs() * 4.0 > 32_768.0 {
-                        return None;
-                    }
-                    op.projection = [offset[0], offset[1], offset[2], frequency];
-                    op.procedural[3] = match projection {
-                        Projection::Cylindrical { axis: 0, .. } => 6,
-                        Projection::Cylindrical { axis: 2, .. } => 8,
-                        Projection::Cylindrical { .. } => 7,
-                        _ => 5,
-                    };
-                }
-                Projection::Warp { .. } => return None,
-            }
+            fill_projection::place_procedural(projection, &mut op)?;
         }
     }
-    if projection.placed().is_some() {
-        op.procedural[3] = DECAL_PROJECTION;
-    }
+    fill_projection::place_decal(projection, &mut op);
     op.low.iter().chain(&op.high).chain(&op.projection).chain(&op.uv).chain(&op.balance).all(|v| v.is_finite()).then_some(op)
-}
-
-fn supports_projection(projection: &Projection, sampling: Sampling) -> bool {
-    // Keep the CPU result for projection features the compositor does not encode yet.
-    if sampling.wrap.repeats() != (true, true) || (sampling.symmetry.on && projection.takes_symmetry()) {
-        return false;
-    }
-    match projection {
-        Projection::Uv { .. } | Projection::UvTile => true,
-        Projection::Triplanar { uv, projector, .. } | Projection::Spherical { uv, projector, .. } => uv.is_default() && projector.is_default(),
-        Projection::Planar { uv, projector, placed, .. } => {
-            let expected = if placed.is_some() {
-                Projector { crop: ShapeCrop::Cropped, backface: Backface { on: true, ..Backface::default() }, ..Projector::default() }
-            } else {
-                Projector::default()
-            };
-            uv.is_default() && *projector == expected
-        }
-        Projection::Cylindrical { uv, projector, angle, .. } => uv.is_default() && projector.is_default() && *angle == texturecraft_core::FULL_TURN_DEGREES,
-        Projection::Warp { .. } => false,
-    }
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
@@ -1576,8 +1547,8 @@ fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operat
                 }
                 (if spatial.is_some() { NEIGHBOURHOOD_OPCODE } else { NOOP_EFFECT_OPCODE }, [0.0; 3])
             }
-            // Every other filter, and new settings of the ones above, composite on the CPU
-            _ => return None,
+            // Every other filter, and new settings of the ones above: a GPU port package lowers it, or the stack composites on the CPU
+            filter => packages::lower_filter(filter, effect, &mut op, inputs)?,
         },
         _ => return None,
     };
@@ -2183,6 +2154,7 @@ impl GpuCompositor {
             }
         }
         let pitch = band_width.next_multiple_of(64);
+        let texel_words = program.filters.field_words();
         let submit_budget = if grouped || filtered || band_width < width || band_rows < ROWS { MAX_TILE_WORK_PER_SUBMISSION } else { u64::MAX };
         let area = pitch * band_rows;
         let stride = u64::from(area) * 4;
@@ -2300,7 +2272,8 @@ impl GpuCompositor {
                 }
                 let field = CompositeRegion { min: [left << shift, top << shift], max: [(left + width) << shift, (top + rows) << shift] }.expanded(halo);
                 let field_rect = [field.min[0], field.min[1], field.max[0].min(source_size.0) - field.min[0], field.max[1].min(source_size.1) - field.min[1]];
-                let values = [
+                let mut values = [0; packages::UNIFORM_WORDS];
+                values[..packages::FIELD_LAYOUT].copy_from_slice(&[
                     width,
                     rows,
                     top,
@@ -2348,7 +2321,11 @@ impl GpuCompositor {
                     0,
                     0,
                     0,
-                ];
+                ]);
+                // Words per field texel and whether the sixth (input) word is present; the
+                // prepare pass adds its stage's input operation in the third word.
+                values[packages::FIELD_LAYOUT..packages::FIELD_LAYOUT + 2].copy_from_slice(&[texel_words, u32::from(texel_words > FIELD_WORDS)]);
+                packages::write_band_uniform(program, &mut values);
                 let bindings = |values: &[u32]| {
                     let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("tc_composite_band"),
@@ -2392,7 +2369,7 @@ impl GpuCompositor {
                 };
                 if let (Some(prepare), Some(kernels)) = (&prepare, &self.filter_gpu) {
                     let fields = program.filters.stages.len() as u32;
-                    let field_words = field_rect[2] * field_rect[3] * FIELD_WORDS;
+                    let field_words = field_rect[2] * field_rect[3] * texel_words;
                     let offset = |slot| field_base + slot * field_words;
                     let (source_width, source_rows) =
                         if tile_work == 0 { (field_rect[2], field_rect[3]) } else { composite_band_size(field_rect[2], tile_work) };
@@ -2401,6 +2378,7 @@ impl GpuCompositor {
                         let direct = stage.filter.is_none() && stage.cell == 1;
                         let slot = if direct { output as u32 } else { fields };
                         source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
+                        source[packages::FIELD_LAYOUT + 2] = stage.input;
                         if let Some((channel, first, cut)) = stage.anchor {
                             source[36..39].copy_from_slice(&[channel_slot(channel), first, cut]);
                             source[40..43].copy_from_slice(&channel.default_value().map(f32::to_bits));
@@ -2433,6 +2411,8 @@ impl GpuCompositor {
                             original: offset(fields),
                             blur: [offset(fields + 1), offset(fields + 2)],
                             output: offset(output as u32),
+                            field_words: texel_words,
+                            input: u32::from(texel_words > FIELD_WORDS),
                         };
                         if stage.cell > 1 {
                             let target = if stage.filter.is_some() { region.original } else { region.output };
@@ -3091,244 +3071,10 @@ mod procedural_tests {
         assert_eq!(program.tile_work_per_pixel().unwrap(), overlapping_work * 12, "the three planes each need four samples");
     }
 
-    /// Every effect kind or setting the GPU program does not evaluate makes the stack composite on
-    /// the CPU instead of being skipped.
-    #[test]
-    fn effects_without_a_gpu_evaluation_fall_back_to_the_cpu() {
-        use texturecraft_core::{ChannelBlend, ContentsOffset, GradientInput, SelectionBackground, StylizedLighting};
-
-        let channels = [Channel::BaseColor, Channel::Height];
-        let compile = |content: Option<Effect>, mask: Option<Effect>, folder: ContentsOffset| {
-            let mut project = Project::new("CPU effects", "builtin:plane");
-            project.texture_sets.push(TextureSet::new("Plane", 0, 64));
-            let folder_id = project.alloc_id();
-            let mut group = Layer::new(folder_id, "Folder", LayerKind::folder(), &channels);
-            if let LayerKind::Group { contents, .. } = &mut group.kind {
-                *contents = folder;
-            }
-            project.insert_layer(0, group, None, false).unwrap();
-            let owner = project.alloc_id();
-            let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.6, 0.3, 0.2]))]), ..Default::default() };
-            let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
-            layer.content_effects.extend(content);
-            let mut layer_mask = Mask::new(MaskBackground::White);
-            layer_mask.effects.extend(mask);
-            layer.mask = Some(layer_mask);
-            project.insert_layer(0, layer, Some(folder_id), true).unwrap();
-            let pixels = PixelStore::default();
-            let material = CompositeProgram::try_compile_region(&project, &pixels, 0, None).map(|_| ());
-            let mask_preview = CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).map(|_| ());
-            (material, mask_preview)
-        };
-        let effect = |kind| Effect::new(LayerId(900), kind);
-        let none = ContentsOffset::NONE;
-
-        // A stack the GPU evaluates, including a filter not chosen yet
-        let (material, mask) = compile(Some(effect(EffectKind::Filter(Filter::Empty))), Some(effect(EffectKind::Filter(Filter::Invert))), none);
-        assert!(material.is_ok() && mask.is_ok(), "{material:?} {mask:?}");
-
-        let unsupported = [
-            // Neighbourhood filters without a GPU stage
-            Filter::Fxaa { alpha: false },
-            Filter::DropShadow { angle: 45.0, distance: 0.02, size: 8.0, spread: 0.0, opacity: 1.0, color: [0.0; 3] },
-            // Point filters the GPU does not have
-            Filter::Smoothstep { min: 0.2, max: 0.8 },
-            // New settings of filters the GPU has
-            Filter::Blur { radius: 8.0, wrap: true },
-            Filter::Mosaic { size: 8.0, alpha: false },
-            Filter::HighPass { radius: 8.0, space: HighpassSpace::SrgbFromLinear, alpha: false },
-            Filter::Hsl { hue: 0.1, saturation: 0.0, lightness: 0.0, perceptive: true },
-            Filter::GradientMap {
-                colors: vec![[0.0; 3], [1.0; 3]],
-                positions: vec![0.0, 0.3],
-                quantity: None,
-                input: Default::default(),
-                linear: true,
-                debug: false,
-            },
-            Filter::GradientMap {
-                colors: vec![[0.0; 3], [1.0; 3], [0.5; 3]],
-                positions: Vec::new(),
-                quantity: Some(2),
-                input: Default::default(),
-                linear: true,
-                debug: false,
-            },
-            Filter::GradientMap {
-                colors: vec![[0.0; 3], [1.0; 3]],
-                positions: Vec::new(),
-                quantity: None,
-                input: GradientInput { blur: 2.0, ..Default::default() },
-                linear: true,
-                debug: false,
-            },
-            Filter::GradientMap {
-                colors: vec![[0.0; 3], [1.0; 3]],
-                positions: Vec::new(),
-                quantity: None,
-                input: Default::default(),
-                linear: false,
-                debug: false,
-            },
-            Filter::GradientMap {
-                colors: vec![[0.0; 3], [1.0; 3]],
-                positions: Vec::new(),
-                quantity: None,
-                input: Default::default(),
-                linear: true,
-                debug: true,
-            },
-            Filter::HistogramScan { position: 0.4, contrast: 0.5, invert_position: true },
-            Filter::Posterize { levels: 4.0, alpha: true },
-            Filter::Bevel { width: 16.0, wrap: true },
-            Filter::HighPass { radius: 8.0, space: HighpassSpace::Working, alpha: true },
-        ];
-        for filter in unsupported {
-            let (material, _) = compile(Some(effect(EffectKind::Filter(filter.clone()))), None, none);
-            assert!(material.is_err(), "content {filter:?}");
-            let (material, mask) = compile(None, Some(effect(EffectKind::Filter(filter.clone()))), none);
-            assert!(material.is_err() && mask.is_err(), "mask {filter:?}");
-        }
-
-        // Levels limited to one channel of the content
-        let one_channel = Levels { affects: Some(Channel::Height), ..Levels::default() };
-        assert!(compile(Some(effect(EffectKind::Levels(one_channel))), None, none).0.is_err());
-
-        // Per-channel blends, channels switched off and image inputs
-        let mut per_channel = effect(EffectKind::Filter(Filter::Invert));
-        per_channel.channel_blends.insert(Channel::Height, ChannelBlend { mode: BlendMode::Multiply, opacity: 0.5 });
-        let mut switched_off = effect(EffectKind::Filter(Filter::Invert));
-        switched_off.off_channels.insert(Channel::Height);
-        let mut with_input = effect(EffectKind::Filter(Filter::Invert));
-        with_input.inputs.insert("mask".into(), Source::Uniform([0.5; 3]));
-        for effect in [per_channel.clone(), switched_off.clone()] {
-            assert!(compile(Some(effect.clone()), None, none).0.is_err(), "{effect:?}");
-        }
-        // A mask blends by the shared blend alone (no channel), so the CPU ignores these there too
-        for effect in [per_channel, switched_off] {
-            let (material, mask) = compile(None, Some(effect.clone()), none);
-            assert!(material.is_ok() && mask.is_ok(), "mask {effect:?}: {material:?} {mask:?}");
-        }
-        // Only an input the filter reads counts: Grayscale Conversion reads its Custom Input once switched on
-        let conversion = texturecraft_core::GrayscaleConversion { custom_input: true, ..texturecraft_core::GrayscaleConversion::LIBRARY };
-        let mut reads_input = effect(EffectKind::Filter(Filter::GrayscaleConversion(conversion)));
-        reads_input.inputs.insert(texturecraft_core::ImageInput::CUSTOM_INPUT.id.into(), Source::Uniform([0.5; 3]));
-        assert!(effect_needs_cpu(&reads_input, false).is_some() && reads_image_input(&reads_input));
-        // An input left behind by the filter it replaced reads nothing
-        assert!(compile(Some(with_input.clone()), None, none).0.is_ok(), "{with_input:?}");
-        assert!(compile(None, Some(with_input.clone()), none).1.is_ok(), "{with_input:?}");
-
-        // Lighting reads the base color: in content it needs the CPU, in a mask it changes nothing on both
-        let lighting = [
-            Filter::BakedLighting {
-                azimuth: 0.0,
-                elevation: 45.0,
-                light: 1.0,
-                ambient: 1.0,
-                occlusion: 0.0,
-                stylized: Some(Box::new(StylizedLighting::library())),
-            },
-            Filter::EnvironmentLighting {
-                horizontal: 0.0,
-                vertical: 0.0,
-                exposure: 0.0,
-                height_intensity: 1.0,
-                ambient_occlusion: 1.0,
-                specular_occlusion: 1.0,
-            },
-        ];
-        for filter in lighting {
-            assert!(compile(Some(effect(EffectKind::Filter(filter.clone()))), None, none).0.is_err(), "content {filter:?}");
-        }
-
-        // Mask comparisons reading layers or with a soft edge, and soft or ID-map colour selections
-        let compare = |left, hardness| EffectKind::Compare {
-            op: CompareOp::GreaterThan,
-            value: 0.5,
-            tolerance: 0.0,
-            left,
-            right: CompareSource::Constant,
-            channel: Channel::Height,
-            hardness,
-        };
-        let mut soft_selection = ColorSelection::new(vec![[1.0, 0.0, 0.0]], 0.1);
-        soft_selection.hardness = 0.5;
-        let mut white_selection = ColorSelection::new(vec![[1.0, 0.0, 0.0]], 0.1);
-        white_selection.background = SelectionBackground::White;
-        let mut gray_selection = ColorSelection::new(vec![[1.0, 0.0, 0.0]], 0.1);
-        gray_selection.output = 0.5;
-        let mut id_map_selection = ColorSelection::new(vec![[1.0, 0.0, 0.0]], 0.1);
-        id_map_selection.id_map = Some("id.png".into());
-        let layer_on_right = EffectKind::Compare {
-            op: CompareOp::GreaterThan,
-            value: 0.5,
-            tolerance: 0.0,
-            left: CompareSource::ThisMask,
-            right: CompareSource::ThisLayer,
-            channel: Channel::Height,
-            hardness: 1.0,
-        };
-        for kind in [
-            compare(CompareSource::LayersBelow, 1.0),
-            compare(CompareSource::ThisMask, 0.5),
-            layer_on_right,
-            EffectKind::ColorSelection(soft_selection),
-            EffectKind::ColorSelection(white_selection),
-            EffectKind::ColorSelection(gray_selection),
-            EffectKind::ColorSelection(id_map_selection),
-        ] {
-            let (material, mask) = compile(None, Some(effect(kind.clone())), none);
-            assert!(material.is_err() && mask.is_err(), "{kind:?}");
-        }
-
-        // A folder's Scale and Rotation re-place the fills inside it
-        let (material, mask) = compile(None, None, ContentsOffset::new(2.0, 30.0));
-        assert!(material.is_err() && mask.is_err(), "{material:?} {mask:?}");
-
-        // A folder nested in one without an offset, and an instance of a fill inside such a folder
-        let mut project = Project::new("Nested offsets", "builtin:plane");
-        project.texture_sets.push(TextureSet::new("Plane", 0, 64));
-        let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.6, 0.3, 0.2]))]), ..Default::default() };
-        let source = project.alloc_id();
-        project.insert_layer(0, Layer::new(source, "Source", LayerKind::Fill(fill), &channels), None, false).unwrap();
-        let outer = project.alloc_id();
-        project.insert_layer(0, Layer::new(outer, "Outer", LayerKind::folder(), &channels), None, false).unwrap();
-        let inner = project.alloc_id();
-        let mut group = Layer::new(inner, "Inner", LayerKind::folder(), &channels);
-        if let LayerKind::Group { contents, .. } = &mut group.kind {
-            *contents = ContentsOffset::new(0.5, -20.0);
-        }
-        project.insert_layer(0, group, Some(outer), true).unwrap();
-        let pixels = PixelStore::default();
-        assert!(CompositeProgram::try_compile_region(&project, &pixels, 0, None).is_err(), "a nested folder with an offset");
-        let instance = project.alloc_id();
-        project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source }, &channels), Some(inner), true).unwrap();
-        assert!(CompositeProgram::try_compile_region(&project, &pixels, 0, None).is_err(), "an instance inside it");
-        if let LayerKind::Group { contents, .. } = &mut project.layer_mut(inner).unwrap().kind {
-            *contents = ContentsOffset::NONE;
-        }
-        assert!(CompositeProgram::try_compile_region(&project, &pixels, 0, None).is_ok(), "the same stack without the offset");
-
-        // An instance inside such a folder draws its source's mask placed by the instance's folders
-        let mut project = Project::new("Instanced mask", "builtin:plane");
-        project.texture_sets.push(TextureSet::new("Plane", 0, 64));
-        let source = project.alloc_id();
-        let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.6, 0.3, 0.2]))]), ..Default::default() };
-        let mut layer = Layer::new(source, "Source", LayerKind::Fill(fill), &channels);
-        layer.mask = Some(Mask::new(MaskBackground::White));
-        project.insert_layer(0, layer, None, false).unwrap();
-        let folder_id = project.alloc_id();
-        let mut group = Layer::new(folder_id, "Folder", LayerKind::folder(), &channels);
-        if let LayerKind::Group { contents, .. } = &mut group.kind {
-            *contents = ContentsOffset::new(2.0, 30.0);
-        }
-        project.insert_layer(0, group, None, false).unwrap();
-        let instance = project.alloc_id();
-        project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source }, &channels), Some(folder_id), true).unwrap();
-        let pixels = PixelStore::default();
-        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, source, None, None).is_ok(), "the source itself sits outside the folder");
-        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, instance, None, None).is_err());
-    }
+    // The CPU fallback tables of the GPU port live with each package (`still_on_cpu` in
+    // gpu_composite_point.rs, gpu_composite_stack.rs, gpu_composite_lighting.rs,
+    // gpu_neighbourhood_box.rs, gpu_neighbourhood_gather.rs, …); the stacks that must stay on the
+    // GPU are checked in gpu_composite_packages.rs.
 
     #[test]
     fn point_filters_match_cpu_for_material_channels_and_mask_preview() {

@@ -1,7 +1,8 @@
-// Each scratch texel holds four float components followed by UV coverage.
+// Each scratch texel holds four float components followed by UV coverage, and a sixth word (the
+// stage's input, FilterStage::input in Rust) when params.field_layout.y is set.
 fn field_word(slot: u32, local: vec2<u32>) -> u32 {
     let size = params.filter_region.zw;
-    return params.filter_stage.x + (slot * size.x * size.y + local.y * size.x + local.x) * 5u;
+    return params.filter_stage.x + (slot * size.x * size.y + local.y * size.x + local.x) * params.field_layout.x;
 }
 
 fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> {
@@ -35,6 +36,7 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel = params.filter_region.xy + local;
     var prepared = vec4(0.0);
     var geometric_weight = 0.0;
+    var stage_input = 0.0;
     var covered = all(pixel < params.source.xy);
     if covered && params.coverage.x != 0u {
         covered = uv_texel_covered(pixel);
@@ -72,6 +74,9 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
             let content = layer_content(layer, texel, count);
             prepared = vec4(content.rgb * content.a, content.a);
         }
+        if params.field_layout.z != 0u {
+            stage_input = stage_input_value(layers[params.field_layout.z - 1u], texel);
+        }
         geometric_weight = 1.0;
     }
     let start = field_word(params.filter_stage.y, local);
@@ -81,4 +86,7 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     output[start + 2u] = words.z;
     output[start + 3u] = words.w;
     output[start + 4u] = bitcast<u32>(geometric_weight);
+    if params.field_layout.y != 0u {
+        output[start + 5u] = bitcast<u32>(stage_input);
+    }
 }

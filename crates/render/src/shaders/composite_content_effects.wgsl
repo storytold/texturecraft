@@ -42,7 +42,7 @@ fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
         if effect.ids.y == 10u {
             let paint = painted(effect, texel.pixel, texel.projected);
             content = content_over(content, paint, effect, layer.ids.x);
-        } else if effect.ids.y < 20u || effect.ids.y >= 48u {
+        } else if is_fill_opcode(effect.ids.y) {
             let fill = fill_value(effect, texel.uv, texel.surface);
             content = content_over(content, fill, effect, layer.ids.x);
         } else if effect.ids.y != 39u {

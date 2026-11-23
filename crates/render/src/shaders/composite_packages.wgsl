@@ -1,0 +1,68 @@
+// Registration hub of the GPU port packages in the composite shader (gpu_composite_packages.rs).
+// Frozen after Package 0: a package defines its functions in its own file (or stub) and never
+// edits this one. The opcode blocks and flag bytes match the Rust constants there.
+
+const FIRST_EXTENDED_EFFECT: u32 = 128u;
+const END_EXTENDED_EFFECT: u32 = 192u;
+const POINT_OPCODES_START: u32 = 128u;
+const POINT_OPCODES_END: u32 = 144u;
+const STACK_OPCODES_START: u32 = 144u;
+const STACK_OPCODES_END: u32 = 152u;
+const LIGHTING_OPCODES_START: u32 = 152u;
+const LIGHTING_OPCODES_END: u32 = 160u;
+// Flag bytes of Operation.ext.z
+const POINT_OP_BITS: u32 = 0x000000ffu;
+const STACK_OP_BITS: u32 = 0x0000ff00u;
+const LIGHTING_OP_BITS: u32 = 0x00ff0000u;
+const BRUSH_OP_BITS: u32 = 0xff000000u;
+
+// Fills, paint and patterns: below the built-in effects, and the extended patterns before the
+// packages' effects. Generators (40..48) and effects are checked by their callers.
+fn is_fill_opcode(kind: u32) -> bool {
+    return kind < 20u || (kind >= 48u && kind < FIRST_EXTENDED_EFFECT);
+}
+
+fn is_extended_effect(kind: u32) -> bool {
+    return kind >= FIRST_EXTENDED_EFFECT && kind < END_EXTENDED_EFFECT;
+}
+
+// Parameter `index` of an operation from the side table (ProceduralInputs::pack_params).
+fn param(op: Operation, index: u32) -> f32 {
+    return bitcast<f32>(srgb[op.ext.x + index]);
+}
+
+// Raw word `index` of an operation from the side table (ProceduralInputs::pack_words).
+fn param_word(op: Operation, index: u32) -> u32 {
+    return srgb[op.ext.x + index];
+}
+
+// scalar_filter's default branch: the packages' opcodes, and x for every other opcode.
+fn extended_scalar_filter(op: Operation, x: f32) -> f32 {
+    let kind = op.ids.y;
+    if kind >= POINT_OPCODES_START && kind < POINT_OPCODES_END {
+        return point_scalar_filter(op, x);
+    }
+    if kind >= STACK_OPCODES_START && kind < STACK_OPCODES_END {
+        return stack_scalar_filter(op, x);
+    }
+    if kind >= LIGHTING_OPCODES_START && kind < LIGHTING_OPCODES_END {
+        return lighting_scalar_filter(op, x);
+    }
+    return x;
+}
+
+// effect_color for the packages' opcodes (is_extended_effect). channel is the destination slot
+// (channel_slot in Rust: 0 Base Color, 6 Height, 7 Normal, …).
+fn extended_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> {
+    let kind = op.ids.y;
+    if kind >= POINT_OPCODES_START && kind < POINT_OPCODES_END {
+        return point_effect_color(op, c, channel, surface, baked_ao);
+    }
+    if kind >= STACK_OPCODES_START && kind < STACK_OPCODES_END {
+        return stack_effect_color(op, c, channel, surface, baked_ao);
+    }
+    if kind >= LIGHTING_OPCODES_START && kind < LIGHTING_OPCODES_END {
+        return lighting_effect_color(op, c, channel, surface, baked_ao);
+    }
+    return c;
+}

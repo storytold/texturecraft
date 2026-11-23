@@ -13,6 +13,9 @@ struct Operation {
     spatial: vec4<u32>,
     // Geometry lookup offset, Height operation plus one, contrast and offset.
     constraints: vec4<u32>,
+    // GPU port packages: side-table offset (0: none, read with `param`), P1 projection flags,
+    // P2/P3/P6/P7 flag bytes, P8 word. Zero for every operation the packages do not emit.
+    ext: vec4<u32>,
 }
 
 struct Params {
@@ -36,6 +39,11 @@ struct Params {
     // Channel, start of anchor owner's draws, content cut, mask preview draw.
     anchor: vec4<u32>,
     anchor_default: vec4<f32>,
+    // Words per field texel (5, or 6 with the input word), input word present, the prepare
+    // pass's input operation plus one, reserved.
+    field_layout: vec4<u32>,
+    // One vec4 per GPU port package, P1 to P8, written by its `band_uniform` in Rust.
+    packages: array<vec4<u32>, 8>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -184,6 +192,10 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
 }
 
 fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    // P1 (composite_projection.wgsl) evaluates fills that carry projection or sampling flags
+    if layer.ext.y != 0u {
+        return projection_fill_value(layer, uv, surface);
+    }
     if !enable_authored_images || layer.procedural.w != DECAL_PROJECTION {
         return vec4(value(layer, uv, surface), 1.0);
     }
@@ -273,7 +285,10 @@ fn painted(layer: Operation, pixel: vec2<u32>, projected: ProjectedBrush) -> vec
         if (params.coverage.w & PROJECTED_BRUSH) == 0u {
             m = brush_coverage(pixel) * layer.uv.w;
         }
-        if m > 0.0 {
+        if m > 0.0 && (layer.ext.z & BRUSH_OP_BITS) != 0u {
+            // P7 (composite_brush.wgsl) previews the live stroke modes it flags
+            stored = live_brush_paint(layer, stored, m, projected);
+        } else if m > 0.0 {
             // Match the paint commit's premultiplied over and 16-bit channel encoding.
             let value = select(layer.uv.xxx, layer.uv.xyz, layer.ids.w == 4u);
             let pigment = select(value, projected.rgba.rgb, layer.projection.w == 2.0);
@@ -409,11 +424,15 @@ fn scalar_filter(op: Operation, x: f32) -> f32 {
             if op.ids.z == 2u { passes = x > op.low.x; }
             return select(0.0, 1.0, passes);
         }
-        default: { return x; }
+        // Opcodes without a scalar form here, and the GPU port packages' opcodes
+        default: { return extended_scalar_filter(op, x); }
     }
 }
 
 fn effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> {
+    if is_extended_effect(op.ids.y) {
+        return extended_effect_color(op, c, channel, surface, baked_ao);
+    }
     if op.ids.y == 35u {
         if channel != 0u { return c; }
         let facing = max(0.0, dot(surface.normal, op.high.xyz));

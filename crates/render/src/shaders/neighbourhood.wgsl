@@ -6,6 +6,10 @@ struct Params {
     mode: vec4<u32>,       // Radius, filter kind, seed, and first box pass.
     weights: vec4<f32>,    // Opacity, amount, noise frequency, and high-pass middle.
     direction: vec4<f32>,
+    // Words per field texel (5, or 6 with the input word), input word present, and two words of
+    // the GPU port packages (NeighbourhoodFilter::words).
+    field_layout: vec4<u32>,
+    extra: array<vec4<f32>, 2>, // The packages' parameters (NeighbourhoodFilter::extra).
 }
 
 struct Texel {
@@ -16,13 +20,28 @@ struct Texel {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read_write> fields: array<u32>;
 
-const FIELD_WORDS: u32 = 5u;
 const MIN_WEIGHT: f32 = 1e-6;
 const FIX: f32 = 16777216.0;
 const EMPTY: Texel = Texel(vec4(0.0), 0.0);
 
 fn word_at(offset: u32, position: vec2<u32>) -> u32 {
-    return offset + (position.y * params.rect.z + position.x) * FIELD_WORDS;
+    return offset + (position.y * params.rect.z + position.x) * params.field_layout.x;
+}
+
+// The optional sixth word of an original-field texel (FilterStage::input in Rust): an input's
+// gray or the layer's Height, zero when the program's fields have no input word.
+fn input_at(position: vec2<u32>) -> f32 {
+    if params.field_layout.y == 0u { return 0.0; }
+    return bitcast<f32>(fields[word_at(params.buffers.x, position) + 5u]);
+}
+
+// Kinds 16..32 are P4's (neighbourhood_box.wgsl), 32..56 P5's (neighbourhood_gather.wgsl).
+// Whether a kind runs the box passes; NeighbourhoodFilter::uses_box in Rust must agree.
+fn uses_box_kind(kind: u32) -> bool {
+    if kind <= 4u { return true; }
+    if kind >= 16u && kind < 32u { return box_family_uses_box(kind); }
+    if kind >= 32u && kind < 56u { return gather_family_uses_box(kind); }
+    return false;
 }
 
 fn read_at(offset: u32, position: vec2<u32>) -> Texel {
@@ -121,7 +140,13 @@ fn filtered_box(original: vec4<f32>, blurred: vec4<f32>) -> vec4<f32> {
             return vec4(side * min(distance, max(2.0 * blurred.rgb * side - distance, vec3(0.0))), original.a);
         }
         case 4u: { return vec4(original.rgb + params.weights.y * blurred.rgb, original.a); }
-        default: { return blurred; }
+        case 0u: { return blurred; }
+        default: {
+            let kind = params.mode.y;
+            if kind >= 16u && kind < 32u { return box_family_filtered(original, blurred); }
+            if kind >= 32u && kind < 56u { return gather_family_filtered(original, blurred); }
+            return blurred;
+        }
     }
 }
 
@@ -196,9 +221,15 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
                 acc = sample_field(acc, point + direction * (f32(i) * step));
             }
         }
-        default: {
+        case 10u: {
             let center = (floor(point / radius) + 0.5) * radius - 0.5;
             acc = sample_field(acc, center);
+        }
+        default: {
+            let kind = params.mode.y;
+            if kind >= 16u && kind < 32u { return box_family_gathered(point, original); }
+            if kind >= 32u && kind < 56u { return gather_family_gathered(point, original); }
+            return original;
         }
     }
     return normalized_or(acc, original);
@@ -211,7 +242,7 @@ fn apply_neighbourhood(@builtin(global_invocation_id) id: vec3<u32>) {
     let original = original_at(point);
     var filtered = original.value;
     if original.coverage > 0.0 {
-        if params.mode.y <= 4u {
+        if uses_box_kind(params.mode.y) {
             let blurred = read_at(params.buffers.y, point);
             if blurred.coverage > MIN_WEIGHT {
                 filtered = filtered_box(original.value, blurred.value / blurred.coverage);

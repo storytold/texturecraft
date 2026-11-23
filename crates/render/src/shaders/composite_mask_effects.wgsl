@@ -20,11 +20,11 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
             let sampled = painted(e, texel.pixel, texel.projected);
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.w;
-        } else if e.ids.y < 20u || e.ids.y >= 48u {
+        } else if is_fill_opcode(e.ids.y) {
             let sampled = fill_value(e, texel.uv, texel.surface);
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.a;
-        } else if enable_generators && e.ids.y >= 40u {
+        } else if enable_generators && e.ids.y >= 40u && e.ids.y < 48u {
             var ramp: f32;
             if !enable_spatial_fields || e.spatial.y == 0u {
                 ramp = generator_ramp(e, texel);

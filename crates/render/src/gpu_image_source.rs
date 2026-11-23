@@ -11,6 +11,16 @@ use crate::gpu_tile_pattern::TileImageAtlas;
 pub(crate) const IMAGE_SOURCE_OPCODE: u32 = 14;
 pub(crate) const DECAL_PROJECTION: u32 = 9;
 
+/// What a registered image is read for. The GPU port packages register images only through
+/// [`MaterialImages::register_image`]; P1 owns this type and adds kinds (mip-mapped, nearest, …)
+/// as variants here, keeping that signature. P3 (Color Selection ID maps, effect image inputs)
+/// and P7 (the mask image a stroke paints) read plain texels with `Material`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageUse {
+    /// Texels as material image fills and decals sample them today.
+    Material,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct MaterialImages {
     names: Vec<String>,
@@ -25,7 +35,9 @@ struct DecalSource {
 }
 
 impl MaterialImages {
-    pub(crate) fn register_image(&mut self, name: &str) -> u32 {
+    pub(crate) fn register_image(&mut self, name: &str, usage: ImageUse) -> u32 {
+        // Every image is read as material texels until P1 adds another kind.
+        debug_assert_eq!(usage, ImageUse::Material);
         if let Some(index) = self.names.iter().position(|existing| existing == name) {
             return index as u32;
         }
@@ -37,7 +49,7 @@ impl MaterialImages {
     pub(crate) fn register_decal<'a>(&mut self, frame: Decal, sources: impl Iterator<Item = &'a Source>) -> u32 {
         let alpha_images = sources
             .filter_map(|source| match source {
-                Source::Image { name, .. } => Some(self.register_image(name)),
+                Source::Image { name, .. } => Some(self.register_image(name, ImageUse::Material)),
                 _ => None,
             })
             .collect();
