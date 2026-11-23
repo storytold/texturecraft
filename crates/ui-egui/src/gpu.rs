@@ -622,7 +622,7 @@ impl GpuLink {
         } else if !self.gpu_composite_enabled {
             n_("GPU compositing is unavailable on this device.")
         } else if interactive {
-            n_("The active view hides the material, so no layers are composited.")
+            n_("The active view composites no layers.")
         } else {
             ""
         }
@@ -2336,53 +2336,75 @@ pub(crate) mod tests {
     }
 
     /// A soloed layer composites on the GPU from the isolated copy the CPU draws: the stack with
-    /// every other layer hidden, and with Ignore Mask its own mask switched off too.
+    /// every other layer hidden (a folder's siblings too, an instance's source kept), with Ignore
+    /// Mask its own mask switched off, and the mask view stays the document's.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_soloed_layer_composites_on_the_gpu_like_the_stack_with_the_others_hidden() {
-        use texturecraft_engine::core::{Effect, EffectKind, LayerKind, Mask, MaskBackground, Projection, Source};
+        use texturecraft_engine::core::{Effect, EffectKind, Fill, Layer, LayerKind, Mask, MaskBackground, Projection, Source};
         use texturecraft_render::{headless::Headless, readback::Readback};
 
         let Ok(mut gpu) = Headless::new() else { return };
-        let render = |gpu: &mut Headless, session: &mut Session| {
+        let render = |gpu: &mut Headless, session: &mut Session, aux: Option<AuxView>| {
             let mut link = link();
             link.gpu_composite_enabled = true;
-            let scene = link.sync(session, None, None, 0, 0.0);
+            let scene = link.sync(session, aux, None, 0, 0.0);
             assert!(!scene.composites.is_empty(), "the view composites on the GPU");
             scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
-            assert_eq!(link.compositor_status().0, "Layers: GPU");
-            Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][0]).unwrap().2
+            let texture = if aux.is_some() { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
+            Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap().2
         };
-
-        // The stack with a half mask on its first fill layer
-        let masked_stack = || {
-            let mut session = procedural_stack(128);
-            let stack = session.doc.project.texture_sets[0].stack.clone();
-            let layer = *stack.iter().find(|id| matches!(session.doc.project.layers[*id].kind, LayerKind::Fill(_))).unwrap();
-            let fill_id = session.doc.project.alloc_id();
+        let half_mask = |session: &mut Session| {
             let mut mask = Mask::new(MaskBackground::Black);
             let fill = EffectKind::Fill { source: Source::Uniform([0.5; 3]), projection: Projection::default(), sampling: Default::default() };
-            mask.effects.push(Effect::new(fill_id, fill));
-            session.doc.project.layers.get_mut(&layer).unwrap().mask = Some(mask);
-            (session, stack, layer)
+            mask.effects.push(Effect::new(session.doc.project.alloc_id(), fill));
+            mask
         };
-        let whole = render(&mut gpu, &mut masked_stack().0);
 
-        for ignore_mask in [false, true] {
-            let (mut soloed, stack, layer) = masked_stack();
+        // The procedural stack with a half mask on its first fill, a folder holding a masked fill and an instance of the first fill
+        let build = || {
+            let mut session = procedural_stack(128);
+            let stack = session.doc.project.texture_sets[0].stack.clone();
+            let first = *stack.iter().find(|id| matches!(session.doc.project.layers[*id].kind, LayerKind::Fill(_))).unwrap();
+            let mask = half_mask(&mut session);
+            session.doc.project.layers.get_mut(&first).unwrap().mask = Some(mask);
+            let project = &mut session.doc.project;
+            let folder = project.alloc_id();
+            project.insert_layer(0, Layer::new(folder, "Folder", LayerKind::folder(), &[Channel::BaseColor]), None, false).unwrap();
+            let inner = project.alloc_id();
+            let fill = Fill { sources: [(Channel::BaseColor, Source::Uniform([0.2, 0.7, 0.4]))].into(), ..Default::default() };
+            project.insert_layer(0, Layer::new(inner, "Inner", LayerKind::Fill(fill), &[Channel::BaseColor]), Some(folder), true).unwrap();
+            let instance = project.alloc_id();
+            project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source: first }, &[Channel::BaseColor]), None, false).unwrap();
+            let mask = half_mask(&mut session);
+            session.doc.project.layers.get_mut(&inner).unwrap().mask = Some(mask);
+            (session, [first, folder, inner, instance])
+        };
+        let (_, [first, folder, inner, instance]) = build();
+        let whole = render(&mut gpu, &mut build().0, None);
+
+        // (soloed layer, Ignore Mask, the top-level layers left visible, the mask it switches off)
+        let cases = [(first, false, vec![first], None), (first, true, vec![first], Some(first)), (inner, false, vec![folder], None), (instance, false, vec![instance, first], None)];
+        for (layer, ignore_mask, shown, unmasked) in cases {
+            let (mut soloed, _) = build();
             soloed.set_solo(Some(texturecraft_engine::Solo { layer, ignore_mask }));
-            let solo = render(&mut gpu, &mut soloed);
+            let solo = render(&mut gpu, &mut soloed, None);
 
-            let (mut hidden, _, _) = masked_stack();
-            for id in stack.iter().filter(|id| **id != layer) {
-                hidden.doc.project.layers.get_mut(id).unwrap().visible = false;
+            let (mut hidden, _) = build();
+            for id in hidden.doc.project.texture_sets[0].stack.clone().into_iter().filter(|id| !shown.contains(id)) {
+                hidden.doc.project.layers.get_mut(&id).unwrap().visible = false;
             }
-            if let Some(mask) = hidden.doc.project.layers.get_mut(&layer).unwrap().mask.as_mut() {
-                mask.enabled = !ignore_mask;
+            if let Some(mask) = unmasked.and_then(|id| hidden.doc.project.layers.get_mut(&id).unwrap().mask.as_mut()) {
+                mask.enabled = false;
             }
-            assert_eq!(solo, render(&mut gpu, &mut hidden), "ignore mask {ignore_mask}: the solo view draws the soloed layer alone");
+            assert_eq!(solo, render(&mut gpu, &mut hidden, None), "solo {layer:?}, ignore mask {ignore_mask}: the soloed layer alone");
             assert_ne!(solo, whole);
         }
+
+        // The mask view reads the document's mask, soloed or not
+        let (mut soloed, _) = build();
+        soloed.set_solo(Some(texturecraft_engine::Solo { layer: inner, ignore_mask: true }));
+        assert_eq!(render(&mut gpu, &mut soloed, Some(AuxView::Mask(inner))), render(&mut gpu, &mut build().0, Some(AuxView::Mask(inner))));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

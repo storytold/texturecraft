@@ -10,16 +10,17 @@
 //! instances and in the mask preview), and the solo view.
 //!
 //! P3 also owns these shared regions outright (no other package edits them):
-//! - in gpu_composite.rs: the stack loop of `try_compile_with_brush`, `compile_mask`,
-//!   `content_filter`, `content_deposit`, `content_depends_on_channel`, `uniform_blend`,
-//!   `effect_needs_cpu` and `reads_image_input` (P6 only reorders finished operations through
+//! - in gpu_composite.rs: the stack loop of `try_compile_with_brush` (with the folder offset it
+//!   carries per draw), `compile_mask`, `content_filter`, `content_deposit`,
+//!   `content_depends_on_channel`, `uniform_blend`, `blends_per_channel`, `channel_filter`,
+//!   `placed`, `effect_needs_cpu`, `reads_image_input`, and the folder offset and anchored-mask
+//!   lines of `try_compile_mask_preview` (P6 only reorders finished operations through
 //!   `packages::order_layer_operations`, after P3 has merged);
 //! - `shaders/composite_mask_effects.wgsl` and `shaders/composite_content_effects.wgsl` (P7's
 //!   erase preview coordinates with P3 there);
 //! - in crates/ui-egui/src/gpu.rs: `view_project` (which project a view compiles: the solo
-//!   copy, `compose::solo_project`), the solo term of `gpu_composite_reason`, and the status
-//!   text "The active view uses CPU compositing." for aux views (reword it: the material is
-//!   hidden there, nothing composites on the CPU).
+//!   copy, `compose::solo_project`, for the material; the document for the mask view) and the
+//!   aux-view status text of `gpu_composite_reason`.
 //!
 //! How:
 //! - New mask or content opcodes come from `packages::STACK_OPCODES` (144..152), handled in WGSL
@@ -36,7 +37,8 @@
 //! Tables: [`LIBRARY_STILL_ON_CPU`] and the tests below. Every port gets a CPU oracle test
 //! (`crate::gpu_composite::oracle`) per context and setting value, chained and with a region.
 
-use texturecraft_core::SelectionBackground;
+use texturecraft_core::project::MAX_DEPTH;
+use texturecraft_core::{ContentsOffset, LayerId, LayerKind, Project, SelectionBackground};
 
 use super::packages::{STACK_OP_BITS, STACK_OPCODES};
 use super::{CompositeProgram, Operation, ProceduralInputs};
@@ -88,9 +90,33 @@ pub(super) fn soften_selection(op: &mut Operation, output: f32, hardness: f32, b
     if output == 1.0 && width <= 0.0 && background_value == Some(0.0) {
         return Some(());
     }
+
     op.ext[0] = inputs.pack_params(&[output, width, background_value.unwrap_or(TRANSPARENT_BACKGROUND)])?;
     op.ext[2] |= SOFT_MASK_EFFECT;
     Some(())
+}
+
+/// The folder offsets of every draw of layer `target` in `stack`, walked as the material program
+/// walks it: visible layers, instances through their sources, folders' children under
+/// `around.then(contents)`.
+pub(super) fn draw_offsets(project: &Project, stack: &[LayerId], target: LayerId) -> Vec<ContentsOffset> {
+    let mut offsets = Vec::new();
+    let mut todo: Vec<_> = stack.iter().rev().map(|&id| (id, 0, ContentsOffset::NONE)).collect();
+    while let Some((id, depth, around)) = todo.pop() {
+        if !project.layers.get(&id).is_some_and(|layer| layer.visible) {
+            continue;
+        }
+
+        if id == target {
+            offsets.push(around);
+        }
+        if let Some(LayerKind::Group { children, contents, .. }) = project.content_layer(id).map(|layer| &layer.kind)
+            && depth <= MAX_DEPTH
+        {
+            todo.extend(children.iter().rev().map(|&child| (child, depth + 1, around.then(*contents))));
+        }
+    }
+    offsets
 }
 
 /// Whether a program needs the full `composite_stack.wgsl`.
@@ -159,13 +185,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn folder_offsets_still_on_the_cpu_fall_back() {
-        // A mask reading an anchor previews through the material program, which keeps one draw per
-        // layer: inside a folder with Scale or Rotation that draw need not be the requested one
+    /// A fill whose mask reads an anchor published by the layer below and an image fill, inside a
+    /// folder with Scale and Rotation: (project, owner, folder).
+    fn anchored_mask_in_offset_folder() -> (Project, LayerId, LayerId) {
         let channels = [Channel::BaseColor, Channel::Height];
         let mut project = Project::new("Anchored mask", "builtin:plane");
-        project.texture_sets.push(TextureSet::new("Plane", 0, 64));
+        project.texture_sets.push(TextureSet::new("Plane", 0, TILE * 2));
+        let publisher = project.alloc_id();
+        let fill = Fill { sources: BTreeMap::from([(Channel::Height, Source::Uniform([0.4; 3]))]), ..Default::default() };
+        let mut below = Layer::new(publisher, "Below", LayerKind::Fill(fill), &channels);
+        let anchor = Effect::new(project.alloc_id(), EffectKind::Anchor);
+        let anchor_id = anchor.id;
+        below.content_effects.push(anchor);
+        project.insert_layer(0, below, None, false).unwrap();
         let folder_id = project.alloc_id();
         let mut group = Layer::new(folder_id, "Folder", LayerKind::folder(), &channels);
         if let LayerKind::Group { contents, .. } = &mut group.kind {
@@ -175,13 +207,52 @@ mod tests {
         let owner = project.alloc_id();
         let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.6, 0.3, 0.2]))]), ..Default::default() };
         let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
-        let mut mask = Mask::new(MaskBackground::White);
-        let anchored = Source::Anchor { anchor: LayerId(901), channel: Channel::Height, ramp: Vec::new() };
+        let mut mask = Mask::new(MaskBackground::Black);
+        let anchored = Source::Anchor { anchor: anchor_id, channel: Channel::Height, ramp: Vec::new() };
         mask.effects.push(effect(EffectKind::Fill { source: anchored, projection: Projection::default(), sampling: Sampling::SAVED_BEFORE }));
+        let image = Source::Image { name: "Pattern".into(), normal_format: NormalFormat::default() };
+        let projection = Projection::Uv { scale: [2.0, 1.0], rotation: 15.0, offset: [0.1, 0.0] };
+        let mut placed = effect(EffectKind::Fill { source: image, projection, sampling: Sampling::SAVED_BEFORE });
+        placed.blend = BlendMode::Multiply;
+        mask.effects.push(placed);
         layer.mask = Some(mask);
         project.insert_layer(0, layer, Some(folder_id), true).unwrap();
+        (project, owner, folder_id)
+    }
+
+    /// A 4×4 linear image with distinct texels, for fills whose placement must show.
+    fn pattern_images() -> ImageStore {
+        let texels = (0..16).map(|index| [0.1 + 0.05 * index as f32, 0.9 - 0.04 * index as f32, (index % 5) as f32 * 0.2, 1.0]).collect();
+        ImageStore::from([("Pattern".into(), Arc::new(ImageRes::new(4, 4, texels, false)))])
+    }
+
+    #[test]
+    fn folder_offsets_still_on_the_cpu_fall_back() {
+        // A mask reading an anchor previews through the material program, which keeps the owner's
+        // last draw: with the owner also drawn by an instanced folder under another offset, that
+        // draw need not sit where the requested layer does
+        let (mut project, owner, folder_id) = anchored_mask_in_offset_folder();
         let pixels = PixelStore::default();
-        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).is_err());
+        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).is_ok(), "drawn once");
+
+        let instanced = project.alloc_id();
+        let channels = [Channel::BaseColor, Channel::Height];
+        project.insert_layer(0, Layer::new(instanced, "Instanced folder", LayerKind::Instance { source: folder_id }, &channels), None, false).unwrap();
+        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).is_err(), "drawn under two offsets");
+    }
+
+    /// An anchored mask inside a folder with Scale and Rotation, drawn once, previews on the GPU
+    /// through the material program as the CPU's `mask_image` places it.
+    #[test]
+    fn an_anchored_mask_inside_an_offset_folder_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images, pixels) = (BakedMaps::default(), pattern_images(), PixelStore::default());
+        let (project, owner, _) = anchored_mask_in_offset_folder();
+
+        let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+        case.mask_owner = Some(owner);
+        assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, "anchored mask in an offset folder");
     }
 
     /// A paint layer with colour, roughness and height painted in a block (so a filter's halo
@@ -238,10 +309,15 @@ mod tests {
         });
         let blur = EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false });
 
+        // Set to Disable as a whole yet on for Height: the content filters Height alone, the mask filters anyway
+        let mut disabled_but_height = with(invert(), 0.8, &[(Channel::Height, BlendMode::Normal, 1.0)], &[]);
+        disabled_but_height.blend = BlendMode::Disable;
+
         let cases: Vec<(&str, Vec<Effect>, Tolerance)> = vec![
             ("per-channel multiply", vec![with(invert(), 0.77, &[(Channel::Height, BlendMode::Multiply, 0.5)], &[])], Tolerance::POINT),
             ("switched off", vec![with(invert(), 0.77, &[], &[Channel::Roughness])], Tolerance::POINT),
             ("disabled on colour", vec![with(invert(), 1.0, &[(Channel::BaseColor, BlendMode::Disable, 1.0)], &[])], Tolerance::POINT),
+            ("disabled but on height", vec![disabled_but_height], Tolerance::POINT),
             ("levels on height", vec![with(EffectKind::Levels(levels(Some(Channel::Height))), 0.6, &[], &[])], Tolerance::POINT),
             ("levels on colour", vec![with(EffectKind::Levels(levels(Some(Channel::BaseColor))), 1.0, &[], &[])], Tolerance::POINT),
             ("library levels", vec![with(EffectKind::Levels(Levels { affects: Some(Channel::BaseColor), ..Levels::default() }), 1.0, &[], &[])], Tolerance::POINT),
@@ -279,6 +355,64 @@ mod tests {
             case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
             assert_matches_cpu(&mut gpu, &case, tolerance, label);
         }
+    }
+
+    /// A lowering with a stage before its operation (the Gradient's input blur seam) laid on each
+    /// channel apart: a channel set to Disable keeps a NOOP in the stage's place, so every channel
+    /// has the same operations and the content cut of the anchor above holds for the layer that
+    /// reads it. The staged program equals the one of a Blur and an Invert with the same per-channel
+    /// settings, which matches the CPU in colour, the other channels and the mask.
+    #[test]
+    fn a_staged_lowering_keeps_every_channel_aligned_for_the_anchor_above() {
+        let build = |staged: bool| {
+            let per_channel = |kind: EffectKind, opacity: f32| {
+                let mut effect = effect(kind);
+                effect.opacity = opacity;
+                effect.channel_blends.insert(Channel::Height, ChannelBlend { mode: BlendMode::Disable, opacity: 1.0 });
+                effect
+            };
+            let mut content = if staged {
+                vec![per_channel(EffectKind::Filter(Filter::Smoothstep { min: 0.0, max: 1.0 }), 0.77)]
+            } else {
+                vec![per_channel(EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false }), 1.0), per_channel(EffectKind::Filter(Filter::Invert), 0.77)]
+            };
+            content.push(effect(EffectKind::Levels(Levels { gamma: 1.4, affects: Some(Channel::Roughness), ..Levels::default() })));
+            let anchor = Effect::new(LayerId(950), EffectKind::Anchor);
+            content.push(anchor);
+            content.push(effect(EffectKind::Filter(Filter::Invert)));
+            let (mut project, pixels, owner) = painted_layer(content, Vec::new());
+
+            // A fill above reads the anchor's roughness, cut after the effects below it
+            let reader = project.alloc_id();
+            let source = Source::Anchor { anchor: LayerId(950), channel: Channel::Roughness, ramp: Vec::new() };
+            let fill = Fill { sources: BTreeMap::from([(Channel::Roughness, source)]), ..Default::default() };
+            project.insert_layer(0, Layer::new(reader, "Reader", LayerKind::Fill(fill), &[Channel::Roughness]), None, false).unwrap();
+            (project, pixels, owner)
+        };
+        let compile = |project: &Project, pixels: &PixelStore| {
+            let program = CompositeProgram::try_compile_region(project, pixels, 0, None).unwrap();
+            let counts: Vec<u32> = program.operations[..program.layer_count as usize].iter().filter(|op| op.ids[1] == 10).map(|op| op.effects[3]).collect();
+            (bytemuck::cast_slice::<_, u8>(&program.operations).to_vec(), program.filters.stages.len(), counts)
+        };
+
+        let (staged_project, staged_pixels, _) = build(true);
+        super::super::packages::STAGED_TEST_LOWERING.set(true);
+        let staged = compile(&staged_project, &staged_pixels);
+        super::super::packages::STAGED_TEST_LOWERING.set(false);
+        let (project, pixels, owner) = build(false);
+        let separate = compile(&project, &pixels);
+
+        assert_eq!(staged.2.len(), 3, "a paint operation per channel");
+        assert!(staged.2.iter().all(|&count| count == staged.2[0]), "every channel has the same operations: {:?}", staged.2);
+        assert_eq!(staged, separate);
+
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+        case.mask_owner = Some(owner);
+        case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
+        assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, "staged lowering per channel");
     }
 
     /// A fill layer whose mask is painted as a ramp across the set (0 at the left, 1 at the
@@ -358,20 +492,15 @@ mod tests {
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let images = ImageStore::default();
 
-        // ID colours on, at and past the tolerance of the picked ones, and far from them
+        // ID colours on, at and just past the tolerance of the picked ones, and far from them; the
+        // hard selections read IDs clear of the tolerance, where one ulp cannot flip a whole cell
         let picked = vec![[0.40101, 0.69217, 0.05289], [0.375; 3], [0.21875, 0.78125, 0.09375]];
-        let ids = [
-            [0.40101, 0.69217, 0.05289],
-            [0.390625; 3],
-            [0.390626, 0.375, 0.375],
-            [0.21875, 0.78125, 0.09375],
-            [0.1, 0.9, 0.2],
-            [0.8, 0.1, 0.9],
-            [0.359375; 3],
-            [0.0; 3],
-            [0.3, 0.6, 0.1],
-        ];
-        let baked = BakedMaps { resolution: 3, maps: BTreeMap::from([(BakedMap::Id, Arc::new(ids.into_iter().flatten().collect()))]) };
+        let ids = |boundary: bool| {
+            let [at, past, below] = if boundary { [[0.390625; 3], [0.390626, 0.375, 0.375], [0.359375; 3]] } else { [[0.38; 3], [0.42, 0.375, 0.375], [0.37; 3]] };
+            let colors = [[0.40101, 0.69217, 0.05289], at, past, [0.21875, 0.78125, 0.09375], [0.1, 0.9, 0.2], [0.8, 0.1, 0.9], below, [0.0; 3], [0.3, 0.6, 0.1]];
+            BakedMaps { resolution: 3, maps: BTreeMap::from([(BakedMap::Id, Arc::new(colors.into_iter().flatten().collect()))]) }
+        };
+        let (boundary, clear) = (ids(true), ids(false));
         let selection = |colors: Vec<[f32; 3]>, output, hardness, background, blend, opacity| {
             let mut selection = ColorSelection::new(colors, 1.0 / 64.0);
             selection.output = output;
@@ -395,24 +524,26 @@ mod tests {
         cases.push(vec![invert.clone(), selection(picked.clone(), 0.4, 0.3, SelectionBackground::Transparent, BlendMode::Screen, 0.9), invert]);
         for effects in cases {
             let label = format!("{effects:?}");
+            let hard = effects.iter().any(|effect| matches!(&effect.kind, EffectKind::ColorSelection(selection) if selection.hardness >= 1.0));
+            let baked = if hard { &clear } else { &boundary };
             let (project, pixels, owner) = ramp_mask_layer(effects);
-            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            let mut case = OracleCase::new(&project, &pixels, baked, &images, &mesh);
             case.mask_owner = Some(owner);
             assert_matches_cpu(&mut gpu, &case, Tolerance::POINT, &label);
         }
     }
 
     /// Fills inside folders with Scale and Rotation match the CPU: nested folders, a folder with
-    /// a mask of its own (drawn as a group), a material deposit, an instance in another such
-    /// folder and an instanced folder, in the material, the layer's mask preview and the instance's.
+    /// a mask of its own (drawn as a group), a material deposit, a blur on the content and in the
+    /// mask of a layer drawn under several offsets (an instance in another such folder and an
+    /// instanced folder), in the material with a partial update and in both mask previews.
     #[test]
     fn fills_inside_folders_with_scale_and_rotation_match_the_cpu() {
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let baked = BakedMaps::default();
         let channels = [Channel::BaseColor, Channel::Roughness];
-        let texels = (0..16).map(|index| [0.1 + 0.05 * index as f32, 0.9 - 0.04 * index as f32, (index % 5) as f32 * 0.2, 1.0]).collect();
-        let images = ImageStore::from([("Pattern".into(), Arc::new(ImageRes::new(4, 4, texels, false)))]);
+        let images = pattern_images();
         let image = || Source::Image { name: "Pattern".into(), normal_format: NormalFormat::default() };
         let own = Projection::Uv { scale: [2.0, 1.0], rotation: 15.0, offset: [0.1, 0.0] };
         let folder = |project: &mut Project, offset: ContentsOffset, parent: Option<LayerId>| {
@@ -438,8 +569,13 @@ mod tests {
         deposit.opacity = 0.6;
         deposit.blend = BlendMode::Multiply;
         layer.content_effects.push(deposit);
+
+        // A blur on the content and in the mask: each draw of the owner keeps its own fields
+        let blur = || effect(EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false }));
+        layer.content_effects.push(blur());
         let mut mask = Mask::new(MaskBackground::Black);
         mask.effects.push(effect(EffectKind::Fill { source: image(), projection: own.clone(), sampling: Sampling::SAVED_BEFORE }));
+        mask.effects.push(blur());
         layer.mask = Some(mask);
         project.insert_layer(0, layer, Some(inner), true).unwrap();
 
@@ -462,7 +598,8 @@ mod tests {
         for mask_owner in [owner, instance] {
             let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
             case.mask_owner = Some(mask_owner);
-            assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, &format!("folder offsets, mask of {mask_owner:?}"));
+            case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
+            assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("folder offsets, mask of {mask_owner:?}"));
         }
     }
 }

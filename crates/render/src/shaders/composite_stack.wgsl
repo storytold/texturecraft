@@ -30,7 +30,7 @@ fn stack_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 {
     return stack_scalar_filter(effect, mask);
 }
 
-// A mask comparison with a soft edge (CompareOp::mask): low.z is the ramp's width past the edge.
+// A mask comparison with a soft edge (CompareOp::mask), low.z the ramp's width past the edge
 fn stack_soft_compare(op: Operation, mask: f32) -> f32 {
     let width = op.low.z;
     if op.ids.z == 0u {
@@ -42,8 +42,7 @@ fn stack_soft_compare(op: Operation, mask: f32) -> f32 {
     return clamp(1.0 + (op.low.y - abs(mask - op.low.x)) / width, 0.0, 1.0);
 }
 
-// A colour selection's gray and how much of it covers the mask below (ColorSelection::value).
-// The side table holds the output, the edge width and the background (below 0: transparent).
+// A colour selection's gray and cover (ColorSelection::value): side table output, edge width, background (below 0: transparent)
 fn stack_color_selection(effect: Operation, pixel: vec2<u32>) -> vec2<f32> {
     let output = param(effect, 0u);
     let width = param(effect, 1u);

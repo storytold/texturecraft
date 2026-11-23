@@ -1057,10 +1057,11 @@ impl CompositeProgram {
         let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
         let mask = mask.ok_or("The layer has no enabled mask.")?;
         if mask.effects.iter().any(|effect| effect.visible && !effect.kind.anchors_read().is_empty()) {
-            // The material program keeps one draw per layer, which need not sit where the requested one does
-            if project.render_tree(&set.stack).iter().any(|&id| !project.contents_offset(id).is_none()) {
+            // The material program keeps the owner's last draw, which must sit where the requested layer does
+            if stack::draw_offsets(project, &set.stack, owner).iter().any(|offset| *offset != around) {
                 return Err("A mask reading anchors inside a folder with Scale or Rotation uses CPU mask preview.");
             }
+
             let mut program = Self::try_compile_with_brush(project, pixels, ts, region, brush)?;
             program.mask_layer = *program.mask_layers.get(&owner).ok_or("The mask's GPU anchor stack is missing.")?;
             program.mask_preview = true;
