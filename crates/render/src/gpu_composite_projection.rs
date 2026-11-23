@@ -275,13 +275,11 @@ fn built_in(projection: &Projection, sampling: Sampling, op: &Operation) -> bool
 
 /// The settings P1's path does not evaluate yet: those fills stay on the CPU.
 fn still_on_cpu(projection: &Projection, sampling: Sampling, op: &Operation) -> bool {
-    let projector = projector_of(projection);
     let reads_image = op.ids[1] == IMAGE_SOURCE_OPCODE || projection.placed().is_some();
     (sampling.filtering == Filtering::BilinearHq && reads_image)
-        || projector.is_some_and(|projector| projector.crop != ShapeCrop::ExtendsOutside || projector.backface.on || projector.ignore_image_alpha)
         || (sampling.symmetry.on && projection.takes_symmetry())
         || matches!(projection, Projection::Warp { .. })
-        || projection.placed().is_some()
+        || (projection.placed().is_some() && sampling.filtering != Filtering::BilinearSharp)
         || projection.depth_culling().is_some()
 }
 
@@ -505,9 +503,10 @@ pub(super) fn uses_shader(program: &CompositeProgram) -> bool {
     program.operations.iter().any(|op| op.ext[1] != 0 || PROJECTION_SELECTORS.contains(&op.procedural[3]))
 }
 
-/// P1's vec4 of the band uniform (`params.packages[0]`).
-pub(super) fn band_uniform(_program: &CompositeProgram) -> [u32; 4] {
-    [0; 4]
+/// P1's vec4 of the band uniform (`params.packages[0]`): the mesh's centre and radius, which turn
+/// the shader's positions in mesh radii back into the world positions frames read.
+pub(super) fn band_uniform(program: &CompositeProgram) -> [u32; 4] {
+    program.material_images.mesh_frame().map_or([0; 4], |(center, radius)| [center.x, center.y, center.z, radius].map(f32::to_bits))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -666,13 +665,6 @@ mod tests {
         let fill = |source: &Source, projection: Projection, sampling: Sampling| EffectKind::Fill { source: source.clone(), projection, sampling };
         let mirror = FillSymmetry { on: true, ..FillSymmetry::OFF };
         let radial = FillSymmetry { on: true, kind: SymmetryKind::Radial, axis: 1, count: 5, ..FillSymmetry::OFF };
-        let cropped = Projection::Spherical {
-            scale: 1.0,
-            uv: UvTransform::default(),
-            offset: [0.0; 3],
-            projector: Projector { crop: ShapeCrop::Cropped, ..Projector::default() },
-        };
-        let backface = planar(Projector { backface: Backface { on: true, ..Backface::default() }, ..Projector::default() });
         let warp = Projection::Warp {
             frame: frame(),
             corners: Projection::FRAME_CORNERS,
@@ -682,8 +674,6 @@ mod tests {
         };
         let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
         vec![
-            fill(&uniform, cropped, sharp),
-            fill(&uniform, backface, sharp),
             fill(&uniform, planar(Projector::default()), Sampling { symmetry: mirror, ..sharp }),
             fill(&uniform, planar(Projector::default()), Sampling { symmetry: radial, ..sharp }),
             fill(&uniform, warp, sharp),
@@ -821,6 +811,92 @@ mod tests {
             for (label, projection) in turned_projections(uv, projector) {
                 assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, Tolerance::BILINEAR, &format!("{name} {label}"));
             }
+        }
+    }
+
+    /// Cropped to its shape, each 3D projection covers only the texels inside its box, frame,
+    /// sphere or cylinder (sized here so the shape's edge crosses the sphere)
+    #[test]
+    fn shape_crops_match_the_cpu() {
+        let mut gpu = headless();
+        let cropped = Projector { crop: ShapeCrop::Cropped, ..Projector::default() };
+        let shrunk = Projector { scale: [0.45, 0.5, 0.4], ..cropped };
+        let uv = UvTransform::default();
+        let cases = [
+            ("tri-planar", Projection::Triplanar { scale: 0.8, sharpness: 4.0, offset: [0.0; 3], uv, projector: shrunk }),
+            ("planar X", Projection::Planar { scale: 2.0, axis: 0, offset: [0.1, 0.2, -0.1], uv, projector: cropped, placed: None }),
+            ("planar Y", Projection::Planar { scale: 1.9, axis: 1, offset: [-0.2, 0.0, 0.3], uv, projector: cropped, placed: None }),
+            ("planar Z", Projection::Planar { scale: 2.2, axis: 2, offset: [0.3, -0.3, 0.0], uv, projector: cropped, placed: None }),
+            ("spherical", Projection::Spherical { scale: 1.3, uv, offset: [0.6, 0.0, -0.2], projector: cropped }),
+            ("cylindrical", Projection::Cylindrical { scale: 1.1, axis: 1, uv, offset: [0.0, 0.2, 0.1], projector: shrunk, angle: 360.0 }),
+        ];
+        for (label, projection) in cases {
+            assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, Tolerance::BILINEAR.with_flips(FLIPS), &format!("cropped {label}"));
+        }
+    }
+
+    /// Backface culling fades off planar and cylindrical projections on faces turned away, hard
+    /// and soft, also inside a cropped and turned projector
+    #[test]
+    fn backface_culling_matches_the_cpu() {
+        let mut gpu = headless();
+        let uv = UvTransform::default();
+        for backface in [
+            Backface { on: true, angle: 60.0, hardness: 0.0 },
+            Backface { on: true, angle: 120.0, hardness: 1.0 },
+            Backface { on: true, ..Backface::default() },
+        ] {
+            let culled = Projector { backface, ..Projector::default() };
+            let turned = Projector { rotation: [10.0, -25.0, 15.0], crop: ShapeCrop::Cropped, backface, ..Projector::default() };
+            let cases = [
+                ("planar X", Projection::Planar { scale: 0.9, axis: 0, offset: [0.0; 3], uv, projector: culled, placed: None }),
+                ("planar Y", Projection::Planar { scale: 0.9, axis: 1, offset: [0.0; 3], uv, projector: culled, placed: None }),
+                ("planar Z turned", Projection::Planar { scale: 1.6, axis: 2, offset: [0.1, 0.0, 0.0], uv, projector: turned, placed: None }),
+                ("cylindrical X", Projection::Cylindrical { scale: 1.0, axis: 0, uv, offset: [0.0; 3], projector: culled, angle: 360.0 }),
+                ("cylindrical Z turned", Projection::Cylindrical { scale: 1.0, axis: 2, uv, offset: [0.1, 0.0, 0.0], projector: turned, angle: 360.0 }),
+            ];
+            for (label, projection) in cases {
+                let label = format!("backface {} degrees hardness {} {label}", backface.angle, backface.hardness);
+                assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, Tolerance::BILINEAR.with_flips(FLIPS), &label);
+            }
+        }
+    }
+
+    /// A planar projection placed on the surface with other projector settings than a decal's:
+    /// reaching past its frame, culling at another angle, ignoring its image's alpha, turned,
+    /// with a UV transformation, and with a mirrored copy
+    #[test]
+    fn placed_frames_match_the_cpu() {
+        let mut gpu = headless();
+        let mirrored = Decal { symmetry: Some(texturecraft_core::DecalSymmetry { axis: 2, flip: texturecraft_core::DecalFlip::U, offset: 0.1 }), ..frame() };
+        let soft = Backface { on: true, angle: 70.0, hardness: 0.2 };
+        let cases = [
+            ("reaching past its frame", frame(), Projector::default(), UvTransform::default()),
+            ("culled softly", frame(), Projector { backface: soft, crop: ShapeCrop::Cropped, ..Projector::default() }, UvTransform::default()),
+            (
+                "ignoring its image alpha",
+                frame(),
+                Projector { crop: ShapeCrop::Cropped, ignore_image_alpha: true, ..Projector::default() },
+                UvTransform::default(),
+            ),
+            (
+                "turned and placed",
+                frame(),
+                Projector { rotation: [0.0, 0.0, 25.0], scale: [1.3, 0.8, 1.0], crop: ShapeCrop::Cropped, backface: soft, ..Projector::default() },
+                UvTransform { tiling: [1.5, 1.2], rotation: 15.0, offset: [0.1, 0.0] },
+            ),
+            ("mirrored", mirrored, Projector { crop: ShapeCrop::Cropped, backface: soft, ..Projector::default() }, UvTransform::default()),
+        ];
+        for (label, frame, projector, uv) in cases {
+            let projection = Projection::Planar { scale: 1.0, axis: 2, offset: [0.0; 3], uv, projector, placed: Some(frame) };
+            assert_fill_matches(
+                &mut gpu,
+                &sphere(),
+                &projection,
+                Sampling::SAVED_BEFORE,
+                Tolerance::BILINEAR.with_flips(FLIPS),
+                &format!("placed frame {label}"),
+            );
         }
     }
 

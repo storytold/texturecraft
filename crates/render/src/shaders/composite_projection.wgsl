@@ -78,6 +78,13 @@ const P1_CYLINDER_PATTERN_TILES: f32 = 4.0;
 const P1_TRIPLANAR_SKIP: f32 = 1.0 / 131072.0;
 const P1_FULL_TURN_DEGREES: f32 = 360.0;
 const P1_MIN_CYLINDER_ANGLE: f32 = 1.0;
+// Where a frame's depth fade starts, as a share of its depth (compose pattern.rs DEPTH_FADE_START)
+const P1_DEPTH_FADE_START: f32 = 0.75;
+// Nearer a cylinder's axis than this a texel counts as facing out (compose projector_cover.rs)
+const P1_MIN_AXIS_DISTANCE: f32 = 1e-6;
+const P1_FLOAT_EPSILON: f32 = 1.1920929e-7;
+// The word of a decal's alpha image in its frame words (gpu_image_source.rs decal_words)
+const P1_DECAL_ALPHA_WORD: u32 = 11u;
 
 // Where a projection reads the texel (compose pattern.rs Coords): UV, position in mesh radii
 // from the mesh's centre, normal
@@ -91,6 +98,12 @@ struct P1Coords {
 struct P1Samples {
     points: array<vec2<f32>, 3>,
     weights: vec3<f32>,
+}
+
+// Where a framed projection reads the texel and how much its frame lets through (compose Texel::projected)
+struct P1Projected {
+    coords: P1Coords,
+    cover: f32,
 }
 
 // One copy of a symmetric fill (compose fill_copy.rs): the texel samples the projection at
@@ -122,6 +135,18 @@ fn p1_normalized(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
         return v * reciprocal;
     }
     return fallback;
+}
+
+// compose organic.rs `smoothstep`
+fn p1_smoothstep(start: f32, end: f32, value: f32) -> f32 {
+    let t = clamp((value - start) / (end - start), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// The texel's world position from its place in mesh radii (P1's band uniform: the mesh's centre and radius)
+fn p1_world(position: vec3<f32>) -> vec3<f32> {
+    let frame = bitcast<vec4<f32>>(params.packages[0]);
+    return position * frame.w + frame.xyz;
 }
 
 fn p1_identity_copy() -> P1Copy {
@@ -348,6 +373,199 @@ fn p1_procedural_value(op: Operation, samples: P1Samples, uv: vec2<f32>, surface
     return procedural_value(planes, uv, surface);
 }
 
+// World point `world` in the frame turned and stretched by the projector: across and up in frame
+// sizes, out along its normal in world units; w is 0 where it is not finite (compose `frame_local`)
+fn p1_frame_local(op: Operation, world: vec3<f32>) -> vec4<f32> {
+    let from_origin = world - p1_vec3(op, P1_FRAME_ORIGIN);
+    var local = vec3(dot(from_origin, p1_vec3(op, P1_FRAME_RIGHT)), dot(from_origin, p1_vec3(op, P1_FRAME_UP)), dot(from_origin, p1_vec3(op, P1_FRAME_NORMAL)));
+    if (op.ext.y & P1_TURNS) != 0u {
+        local = p1_to_local(op) * local / p1_vec3(op, P1_STRETCH);
+    }
+    let size = p1_vec2(op, P1_FRAME_SIZE);
+    let placed = vec3(local.x / size.x, local.y / size.y, local.z);
+    return vec4(placed, select(0.0, 1.0, all(abs(placed) <= vec3(P1_LARGEST_FLOAT))));
+}
+
+// How squarely a surface with normal `nrm` faces the turned frame (compose `frame_sample`)
+fn p1_frame_facing(op: Operation, nrm: vec3<f32>) -> f32 {
+    let normal = p1_vec3(op, P1_FRAME_NORMAL);
+    if (op.ext.y & P1_TURNS) == 0u {
+        return dot(nrm, normal);
+    }
+    let turned = vec3(dot(nrm, p1_vec3(op, P1_FRAME_RIGHT)), dot(nrm, p1_vec3(op, P1_FRAME_UP)), dot(nrm, normal));
+    return p1_normalized(p1_to_local(op) * turned * p1_vec3(op, P1_STRETCH), turned).z;
+}
+
+// How much a face turned `facing` (the cosine of its turn from the projection) keeps (compose `backface_cover`)
+fn p1_backface(op: Operation, facing: f32) -> f32 {
+    let threshold = param(op, P1_BACKFACE_THRESHOLD);
+    let width = param(op, P1_BACKFACE_WIDTH);
+    if width <= P1_FLOAT_EPSILON {
+        return select(0.0, 1.0, facing > threshold);
+    }
+    return p1_smoothstep(threshold, threshold + width, facing);
+}
+
+// 0 past `depth` (already at least the smallest frame extent) in front of or behind a frame,
+// fading near it (compose `depth_fade`)
+fn p1_depth_fade(z: f32, depth: f32) -> f32 {
+    let distance = abs(z);
+    if distance > depth {
+        return 0.0;
+    }
+    return 1.0 - p1_smoothstep(P1_DEPTH_FADE_START * depth, depth, distance);
+}
+
+// A placed frame at world point `world` with normal `nrm`: its uv, how much it covers, and 1 in w
+// (0 in w where the point is not finite) (compose `placed_cover`)
+fn p1_placed_cover(op: Operation, world: vec3<f32>, nrm: vec3<f32>) -> vec4<f32> {
+    let local = p1_frame_local(op, world);
+    if local.w == 0.0 {
+        return vec4(0.0);
+    }
+    var cover = 1.0;
+    if (op.ext.y & P1_BACKFACE) != 0u {
+        cover = p1_backface(op, p1_frame_facing(op, nrm));
+    }
+    if (op.ext.y & P1_CROP) != 0u {
+        if abs(local.x) > 0.5 || abs(local.y) > 0.5 {
+            cover = 0.0;
+        } else {
+            cover *= p1_depth_fade(local.z, param(op, P1_FRAME_DEPTH));
+        }
+    }
+    let uv = vec2(local.x + 0.5, 0.5 - local.y);
+    let flip = (vec2(param_word(op, P1_FRAME_FLIP)) & vec2(1u, 2u)) != vec2(0u);
+    return vec4(select(uv, vec2(1.0) - uv, flip), cover, 1.0);
+}
+
+// A placed frame and its mirrored copy: whichever covers the point more (compose `placed_cover_symmetric`)
+fn p1_placed(op: Operation, world: vec3<f32>, nrm: vec3<f32>) -> vec4<f32> {
+    let direct = p1_placed_cover(op, world, nrm);
+    let mirror = param_word(op, P1_FRAME_MIRROR_AXIS);
+    if mirror == 0u {
+        return direct;
+    }
+    let axis = mirror - 1u;
+    let center = bitcast<vec4<f32>>(params.packages[0]).xyz;
+    var position = world;
+    var normal = nrm;
+    position[axis] = 2.0 * (center[axis] + param(op, P1_FRAME_MIRROR_OFFSET)) - world[axis];
+    normal[axis] = -nrm[axis];
+    var mirrored = p1_placed_cover(op, position, normal);
+    switch param_word(op, P1_FRAME_MIRROR_FLIP) {
+        case 1u: { mirrored.x = 1.0 - mirrored.x; }
+        case 2u: { mirrored.y = 1.0 - mirrored.y; }
+        default: {}
+    }
+    if direct.w != 0.0 && mirrored.w != 0.0 {
+        return select(direct, mirrored, mirrored.z > direct.z);
+    }
+    return select(mirrored, direct, direct.w != 0.0);
+}
+
+// A framed projection at world point `world` with normal `nrm`: uv, cover, and 0 in w where
+// nothing lands (compose `framed_cover`)
+fn p1_framed(op: Operation, world: vec3<f32>, nrm: vec3<f32>) -> vec4<f32> {
+    if (op.ext.y & P1_FRAME_VALID) == 0u {
+        return vec4(0.0);
+    }
+    return p1_placed(op, world, nrm);
+}
+
+// Where the projection reads the texel at `coords` on `surface` (compose Texel::projected)
+fn p1_projected(op: Operation, coords: P1Coords, surface: Surface) -> P1Projected {
+    if (op.ext.y & P1_FRAMED) == 0u {
+        return P1Projected(coords, 1.0);
+    }
+    if !surface.valid {
+        return P1Projected(coords, 0.0);
+    }
+    let framed = p1_framed(op, p1_world(surface.position), coords.nrm);
+    if framed.w == 0.0 {
+        return P1Projected(coords, 0.0);
+    }
+    return P1Projected(P1Coords(framed.xy, coords.pos, coords.nrm), framed.z);
+}
+
+// How much the shape crop and backface culling of a tri-planar, planar, spherical or cylindrical
+// projection let through (compose `projector_cover`)
+fn p1_projector_cover(op: Operation, coords: P1Coords) -> f32 {
+    let flags = op.ext.y;
+    if (flags & (P1_CROP | P1_BACKFACE)) == 0u {
+        return 1.0;
+    }
+    let local = p1_local(op, coords);
+    let offset = p1_vec3(op, P1_OFFSET);
+    var inside = true;
+    var facing = 1.0;
+    var faces = false;
+    switch param_word(op, P1_KIND) {
+        case P1_KIND_TRIPLANAR: {
+            let reach = abs(local.pos);
+            inside = max(reach.x, max(reach.y, reach.z)) <= 1.0;
+        }
+        case P1_KIND_PLANAR: {
+            // The frame across the axis, and the side the image reads the right way round from
+            let scaled = local.pos * param(op, P1_SCALE) + offset;
+            var frame = max(abs(scaled.x), abs(scaled.y));
+            facing = local.nrm.z;
+            switch param_word(op, P1_AXIS) {
+                case 0u: {
+                    frame = max(abs(scaled.z), abs(scaled.y));
+                    facing = -local.nrm.x;
+                }
+                case 1u: {
+                    frame = max(abs(scaled.x), abs(scaled.z));
+                    facing = local.nrm.y;
+                }
+                default: {}
+            }
+            inside = frame <= 1.0;
+            faces = true;
+        }
+        case P1_KIND_SPHERICAL: { inside = length(local.pos + offset) <= 1.0; }
+        case P1_KIND_CYLINDRICAL: {
+            let position = local.pos + offset;
+            var axes = position;
+            var normal = local.nrm.xz;
+            switch param_word(op, P1_AXIS) {
+                case 0u: {
+                    axes = vec3(position.y, position.x, position.z);
+                    normal = local.nrm.yz;
+                }
+                case 2u: {
+                    axes = vec3(position.x, position.z, position.y);
+                    normal = local.nrm.xy;
+                }
+                default: {}
+            }
+            let radius = length(axes.xz);
+            facing = select(1.0, (normal.x * axes.x + normal.y * axes.z) / radius, radius > P1_MIN_AXIS_DISTANCE);
+            inside = radius <= 1.0 && abs(axes.y) <= 1.0;
+            faces = true;
+        }
+        default: {}
+    }
+    if (flags & P1_CROP) != 0u && !inside {
+        return 0.0;
+    }
+    if faces && (flags & P1_BACKFACE) != 0u {
+        return p1_backface(op, facing);
+    }
+    return 1.0;
+}
+
+// A cropped placed frame takes the shape of its image too (compose Texel::shape_cover): the alpha
+// of the frame's image (from its decal words) at `point`, read with the fill's sampling
+fn p1_frame_alpha(op: Operation, point: vec2<f32>, surface: Surface) -> f32 {
+    let alpha_image = srgb[u32(op.uv.x) + P1_DECAL_ALPHA_WORD];
+    if alpha_image == P1_MISSING {
+        return 1.0;
+    }
+    return clamp(p1_read_image(op, alpha_image, point, surface, 1.0, false, P1_ALPHA_KIND).x, 0.0, 1.0);
+}
+
 // Image texels per surface texel in each image plane (compose Texel::footprints)
 fn p1_footprints(op: Operation, samples: P1Samples, uv: vec2<f32>, copy: P1Copy, size: vec2<f32>) -> vec3<f32> {
     return vec3(1.0);
@@ -364,12 +582,22 @@ fn p1_tile_cover(op: Operation, uv: vec2<f32>) -> f32 {
     return select(0.0, 1.0, all(inside | repeats));
 }
 
-// How much of the texel the fill covers (compose Texel::cover), the surface as the copy sees it
-fn p1_cover(op: Operation, coords: P1Coords, uv: vec2<f32>, surface: Surface, copy: P1Copy) -> f32 {
-    if (op.ext.y & P1_TILE_COVER) == 0u {
+// How much of the texel the fill covers (compose Texel::cover, `shape_cover`), the surface as
+// the copy sees it
+fn p1_cover(op: Operation, coords: P1Coords, projected: P1Projected, surface: Surface, copy: P1Copy) -> f32 {
+    let flags = op.ext.y;
+    if (flags & P1_FRAMED) != 0u {
+        let point = p1_flipped(p1_image_points(op, projected.coords), copy).points[0];
+        var cover = projected.cover;
+        if (flags & P1_IMAGE_ALPHA) != 0u && cover > 0.0 {
+            cover *= p1_frame_alpha(op, point, surface);
+        }
+        return cover * p1_tile_cover(op, point);
+    }
+    if (flags & (P1_TILE_COVER | P1_CROP | P1_BACKFACE)) == 0u {
         return 1.0;
     }
-    return p1_tile_cover(op, p1_flipped(p1_image_points(op, coords), copy).points[0]);
+    return p1_tile_cover(op, p1_flipped(p1_image_points(op, coords), copy).points[0]) * p1_projector_cover(op, coords);
 }
 
 // The surface as copy `copy` sees it (compose Texel::surface)
@@ -384,21 +612,22 @@ fn p1_copied(surface: Surface, copy: P1Copy) -> Surface {
 fn p1_fill_once(op: Operation, uv: vec2<f32>, surface: Surface, copy: P1Copy) -> vec4<f32> {
     let copied = p1_copied(surface, copy);
     let coords = P1Coords(uv, copied.position, copied.normal);
+    let projected = p1_projected(op, coords, copied);
     let kind = op.ids.y;
     var rgb: vec3<f32>;
     if kind == IMAGE_SOURCE_OPCODE {
-        let samples = p1_flipped(p1_image_points(op, coords), copy);
+        let samples = p1_flipped(p1_image_points(op, projected.coords), copy);
         var footprints = vec3(1.0);
         if (op.ext.y & P1_HQ) != 0u && op.ids.z != P1_MISSING {
             footprints = p1_footprints(op, samples, uv, copy, vec2<f32>(vec2(srgb[op.ids.z], srgb[op.ids.z + 1u])));
         }
         rgb = p1_image_value(op, samples, surface, footprints);
     } else if kind != 0u && kind != P1_ANCHOR_SOURCE {
-        rgb = p1_procedural_value(op, p1_pattern_points(op, coords), uv, surface);
+        rgb = p1_procedural_value(op, p1_pattern_points(op, projected.coords), uv, surface);
     } else {
         rgb = value(op, uv, surface);
     }
-    return vec4(rgb, p1_cover(op, coords, uv, copied, copy));
+    return vec4(rgb, p1_cover(op, coords, projected, copied, copy));
 }
 
 // A fill whose operation has projection or sampling flags (Operation.ext.y != 0): the value and

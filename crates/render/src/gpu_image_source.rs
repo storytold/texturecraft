@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use texturecraft_compose::{ImageRes, ImageStore, pattern::decal_axes};
+use texturecraft_compose::{
+    ImageRes, ImageStore,
+    pattern::{decal_axes, mesh_frame},
+};
 use texturecraft_core::{Decal, DecalFlip, Sampling, Source};
 use texturecraft_geom::{Mesh, glam::Vec3};
 
@@ -26,6 +29,9 @@ pub(crate) struct MaterialImages {
     names: Vec<String>,
     images: Vec<Option<Arc<ImageRes>>>,
     decals: Vec<DecalSource>,
+    /// The composited mesh's centre and radius (`set_surface`): P1's band uniform turns positions
+    /// in mesh radii back into world positions with them
+    mesh_frame: Option<(Vec3, f32)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -87,7 +93,14 @@ impl MaterialImages {
     /// The mesh the program composites (P1: build the depth grids of depth-culled projections
     /// here, with `texturecraft_compose::projector_depth`). Called by
     /// `CompositeProgram::set_surface_inputs` before the atlas reads [`Self::raw_planes`].
-    pub(crate) fn set_surface(&mut self, _mesh: &Mesh) {}
+    pub(crate) fn set_surface(&mut self, mesh: &Mesh) {
+        self.mesh_frame = Some(mesh_frame(mesh.bounds()));
+    }
+
+    /// The composited mesh's centre and radius, once [`Self::set_surface`] has run.
+    pub(crate) fn mesh_frame(&self) -> Option<(Vec3, f32)> {
+        self.mesh_frame
+    }
 
     pub(crate) fn append_words(&self, words: &mut Vec<u32>, atlas: Option<&TileImageAtlas>, mesh: Option<&Mesh>) -> (Vec<u32>, Vec<u32>) {
         let mut index = 0;
@@ -115,7 +128,7 @@ impl MaterialImages {
             .map(|decal| {
                 let offset = words.len() as u32;
                 let alpha = decal.alpha_images.iter().map(|&slot| image_offsets[slot as usize]).find(|&offset| offset != u32::MAX).unwrap_or(u32::MAX);
-                words.extend(normalization.map_or([0; 16], |(center, radius)| decal_words(&decal.frame, alpha, center, radius)));
+                words.extend(normalization.map_or_else(|| unplaced_decal_words(alpha), |(center, radius)| decal_words(&decal.frame, alpha, center, radius)));
                 offset
             })
             .collect();
@@ -123,9 +136,20 @@ impl MaterialImages {
     }
 }
 
+/// The word of a decal's alpha image (`composite_projection.wgsl` reads it for P1's frames)
+const DECAL_ALPHA_WORD: usize = 11;
+
+/// The words of a decal that projects nothing (the built-in decal path skips it), keeping its
+/// alpha image for P1's frames
+fn unplaced_decal_words(alpha: u32) -> [u32; 16] {
+    let mut words = [0; 16];
+    words[DECAL_ALPHA_WORD] = alpha;
+    words
+}
+
 fn decal_words(decal: &Decal, alpha: u32, center: Vec3, radius: f32) -> [u32; 16] {
     let Some((origin, right, up, normal)) = decal_axes(decal) else {
-        return [0; 16];
+        return unplaced_decal_words(alpha);
     };
     // The UV surface buffer already stores positions relative to this center and radius.
     let origin = (origin - center) / radius;
