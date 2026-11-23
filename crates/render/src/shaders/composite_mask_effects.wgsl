@@ -42,10 +42,21 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
         } else if is_extended_effect(e.ids.y) {
             result = extended_mask_effect(e, mask, texel);
         } else if e.ids.y == COLOR_SELECTION_OPCODE {
-            result = blend_scalar(u32(e.balance.z), mask, color_selection(e, texel.pixel));
+            if (e.ext.z & STACK_OP_BITS) != 0u {
+                // Output, soft edge and background; a transparent background covers only the selection
+                let selected = stack_color_selection(e, texel.pixel);
+                result = blend_scalar(u32(e.balance.z), mask, selected.x);
+                weight *= selected.y;
+            } else {
+                result = blend_scalar(u32(e.balance.z), mask, color_selection(e, texel.pixel));
+            }
         } else if e.ids.y == 37u {
             // A comparison blends its pass or fail into the mask like a fill
-            result = blend_scalar(u32(e.balance.z), mask, scalar_filter(e, mask));
+            var compared = scalar_filter(e, mask);
+            if (e.ext.z & STACK_OP_BITS) != 0u {
+                compared = stack_soft_compare(e, mask);
+            }
+            result = blend_scalar(u32(e.balance.z), mask, compared);
         } else {
             result = scalar_filter(e, mask);
         }

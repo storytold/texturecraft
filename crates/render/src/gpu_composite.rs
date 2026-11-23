@@ -1302,25 +1302,28 @@ fn compile_mask(
             }
             EffectKind::Generator(generator) => generator_operation(generator, procedural, tile_patterns).ok_or("A mask generator uses CPU compositing.")?,
             EffectKind::ColorSelection(selection) => {
-                // The GPU selects hard, on black, from the baked ID map
+                // The GPU reads the baked ID map; an image as ID map stays on the CPU
                 let ColorSelection { colors, tolerance, output, hardness, background, id_map } = selection;
-                if *output != 1.0 || *hardness != 1.0 || *background != texturecraft_core::SelectionBackground::Black || id_map.is_some() {
-                    return Err("A color selection's output, hardness, background or ID map uses CPU compositing.");
+                if id_map.is_some() {
+                    return Err("A color selection's ID map image uses CPU compositing.");
                 }
                 let [offset, count] = procedural.pack_rgb(colors).ok_or("A color selection has invalid colors.")?;
                 if !tolerance.is_finite() {
                     return Err("A color selection has invalid tolerance.");
                 }
-                Operation { ids: [0, COLOR_SELECTION_OPCODE, 0, 0], low: [*tolerance, 0.0, 0.0, 0.0], procedural: [0, offset, count, 0], ..Operation::zeroed() }
+                let mut operation =
+                    Operation { ids: [0, COLOR_SELECTION_OPCODE, 0, 0], low: [*tolerance, 0.0, 0.0, 0.0], procedural: [0, offset, count, 0], ..Operation::zeroed() };
+                stack::soften_selection(&mut operation, *output, *hardness, *background, procedural).ok_or("A color selection has invalid parameters.")?;
+                operation
             }
             EffectKind::Anchor => {
                 let publication = procedural.anchors.publish(effect.id, true);
                 Operation { ids: [0, ANCHOR_PUBLISH_MASK, publication, 0], ..Operation::zeroed() }
             }
             EffectKind::Compare { op, value, tolerance, left, right, channel: _, hardness } => {
-                // The GPU compares the mask so far with a constant, hard; the channel is read only by layer sides
-                if *left != CompareSource::ThisMask || *right != CompareSource::Constant || *hardness != 1.0 {
-                    return Err("A mask comparison reading layers or with a soft edge uses CPU compositing.");
+                // The GPU compares the mask so far with a constant; the channel is read only by layer sides
+                if *left != CompareSource::ThisMask || *right != CompareSource::Constant {
+                    return Err("A mask comparison reading layers uses CPU compositing.");
                 }
                 if !value.is_finite() || !tolerance.is_finite() {
                     return Err("A mask comparison has invalid parameters.");
@@ -1330,7 +1333,9 @@ fn compile_mask(
                     CompareOp::WithinTolerance => 1,
                     CompareOp::GreaterThan => 2,
                 };
-                Operation { ids: [0, COMPARE_OPCODE, compare, 0], low: [*value, *tolerance, 0.0, 0.0], ..Operation::zeroed() }
+                let mut operation = Operation { ids: [0, COMPARE_OPCODE, compare, 0], low: [*value, *tolerance, 0.0, 0.0], ..Operation::zeroed() };
+                stack::soften_compare(&mut operation, *hardness);
+                operation
             }
             // Lighting reads the base color, which a mask does not have
             EffectKind::Filter(Filter::BakedLighting { .. } | Filter::EnvironmentLighting { .. }) => continue,

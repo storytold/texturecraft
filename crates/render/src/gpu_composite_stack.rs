@@ -36,8 +36,10 @@
 //! Tables: [`LIBRARY_STILL_ON_CPU`] and the tests below. Every port gets a CPU oracle test
 //! (`crate::gpu_composite::oracle`) per context and setting value, chained and with a region.
 
-use super::CompositeProgram;
+use texturecraft_core::SelectionBackground;
+
 use super::packages::{STACK_OP_BITS, STACK_OPCODES};
+use super::{CompositeProgram, Operation, ProceduralInputs};
 
 /// Library filter ids P3 still leaves on the CPU (filters whose only blocker is a P3 setting are
 /// listed under the package that ports the filter).
@@ -52,7 +54,44 @@ fn stack_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
     return vec4(content.rgb + (filtered - content.rgb) * effect.low.w, content.a);
 }
 fn stack_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 { return stack_scalar_filter(effect, mask); }
-fn stage_input_value(op: Operation, texel: LayerTexel) -> f32 { return base_content(op, texel).x; }";
+fn stage_input_value(op: Operation, texel: LayerTexel) -> f32 { return base_content(op, texel).x; }
+fn stack_soft_compare(op: Operation, mask: f32) -> f32 { return scalar_filter(op, mask); }
+fn stack_color_selection(effect: Operation, pixel: vec2<u32>) -> vec2<f32> { return vec2(color_selection(effect, pixel), 1.0); }";
+
+/// `Operation::ext[2]` flag of a mask comparison or colour selection with a soft edge, an output
+/// or a background (`composite_mask_effects.wgsl` then calls this package's functions).
+pub(super) const SOFT_MASK_EFFECT: u32 = 0x0000_0100;
+/// The background value of a transparent colour selection, which covers only what it selects.
+const TRANSPARENT_BACKGROUND: f32 = -1.0;
+
+/// Lets a mask comparison ramp over `1 - hardness` past its edge (`CompareOp::mask`), the width
+/// in `low.z`. A hard comparison, and a NaN hardness the CPU also treats as hard, stays as it is.
+pub(super) fn soften_compare(op: &mut Operation, hardness: f32) {
+    let width = (1.0 - hardness).clamp(0.0, 1.0);
+    if width > 0.0 {
+        op.low[2] = width;
+        op.ext[2] |= SOFT_MASK_EFFECT;
+    }
+}
+
+/// Lets a colour selection give `output` with an edge ramping over `1 - hardness` past its
+/// tolerance, on `background` (`ColorSelection::value`): output, width and background go in the
+/// side table. A selection with full output, a hard edge and a black background stays as it is.
+/// None for a non-finite output or hardness (the CPU selects nothing at a NaN hardness).
+pub(super) fn soften_selection(op: &mut Operation, output: f32, hardness: f32, background: SelectionBackground, inputs: &mut ProceduralInputs) -> Option<()> {
+    if !output.is_finite() || !hardness.is_finite() {
+        return None;
+    }
+
+    let width = 1.0 - hardness.clamp(0.0, 1.0);
+    let background_value = background.value();
+    if output == 1.0 && width <= 0.0 && background_value == Some(0.0) {
+        return Some(());
+    }
+    op.ext[0] = inputs.pack_params(&[output, width, background_value.unwrap_or(TRANSPARENT_BACKGROUND)])?;
+    op.ext[2] |= SOFT_MASK_EFFECT;
+    Some(())
+}
 
 /// Whether a program needs the full `composite_stack.wgsl`.
 pub(super) fn uses_shader(program: &CompositeProgram) -> bool {
@@ -72,8 +111,8 @@ mod tests {
 
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
-        BlendMode, Channel, ChannelBlend, ColorSelection, CompareOp, CompareSource, ContentsOffset, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind,
-        Levels, Mask, MaskBackground, Project, Projection, Sampling, SelectionBackground, Source, TextureSet,
+        BakedMap, BlendMode, Channel, ChannelBlend, ColorSelection, CompareOp, CompareSource, ContentsOffset, Effect, EffectKind, Fill, Filter, Layer, LayerId,
+        LayerKind, Levels, Mask, MaskBackground, Project, Projection, Sampling, SelectionBackground, Source, TextureSet,
     };
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TILE, to_u16, to_u16_signed};
@@ -93,22 +132,16 @@ mod tests {
         reads_input.inputs.insert(texturecraft_core::ImageInput::CUSTOM_INPUT.id.into(), Source::Uniform([0.5; 3]));
         assert!(effect_needs_cpu(&reads_input).is_some() && reads_image_input(&reads_input));
 
-        // Mask comparisons reading layers or with a soft edge, and soft or ID-map colour selections
-        let compare = |left, hardness| EffectKind::Compare {
+        // Mask comparisons reading layers, and colour selections reading an image as ID map
+        let compare = |left| EffectKind::Compare {
             op: CompareOp::GreaterThan,
             value: 0.5,
             tolerance: 0.0,
             left,
             right: CompareSource::Constant,
             channel: Channel::Height,
-            hardness,
+            hardness: 1.0,
         };
-        let mut soft_selection = ColorSelection::new(vec![[1.0, 0.0, 0.0]], 0.1);
-        soft_selection.hardness = 0.5;
-        let mut white_selection = ColorSelection::new(vec![[1.0, 0.0, 0.0]], 0.1);
-        white_selection.background = SelectionBackground::White;
-        let mut gray_selection = ColorSelection::new(vec![[1.0, 0.0, 0.0]], 0.1);
-        gray_selection.output = 0.5;
         let mut id_map_selection = ColorSelection::new(vec![[1.0, 0.0, 0.0]], 0.1);
         id_map_selection.id_map = Some("id.png".into());
         let layer_on_right = EffectKind::Compare {
@@ -120,15 +153,7 @@ mod tests {
             channel: Channel::Height,
             hardness: 1.0,
         };
-        for kind in [
-            compare(CompareSource::LayersBelow, 1.0),
-            compare(CompareSource::ThisMask, 0.5),
-            layer_on_right,
-            EffectKind::ColorSelection(soft_selection),
-            EffectKind::ColorSelection(white_selection),
-            EffectKind::ColorSelection(gray_selection),
-            EffectKind::ColorSelection(id_map_selection),
-        ] {
+        for kind in [compare(CompareSource::LayersBelow), layer_on_right, EffectKind::ColorSelection(id_map_selection)] {
             let (material, mask) = compile_effects(None, Some(effect(kind.clone())), none);
             assert!(material.is_err() && mask.is_err(), "{kind:?}");
         }
@@ -277,6 +302,127 @@ mod tests {
             case.mask_owner = Some(owner);
             case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
             assert_matches_cpu(&mut gpu, &case, tolerance, label);
+        }
+    }
+
+    /// A fill layer whose mask is painted as a ramp across the set (0 at the left, 1 at the
+    /// right, with a step down the middle row) followed by `effects`, as (project, pixels, owner).
+    fn ramp_mask_layer(effects: Vec<Effect>) -> (Project, PixelStore, LayerId) {
+        const SIZE: u32 = TILE * 2;
+        let mut project = Project::new("Mask effects", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let owner = project.alloc_id();
+        let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.89, 0.19, 0.04]))]), ..Default::default() };
+        let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &[Channel::BaseColor]);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let paint = project.alloc_id();
+        mask.effects.push(Effect::new(paint, EffectKind::Paint));
+        mask.effects.extend(effects);
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+
+        let mut pixels = PixelStore::default();
+        let ramp = pixels.mask_mut(paint, (SIZE, SIZE));
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let step = if y >= SIZE / 2 { 0.13 } else { 0.0 };
+                ramp.set(x, y, &[to_u16((x as f32 + 0.5) / SIZE as f32 - step), u16::MAX]);
+            }
+        }
+        (project, pixels, owner)
+    }
+
+    /// Mask comparisons with a soft edge ramp as the CPU's `CompareOp::mask` does, for every
+    /// comparison, at opacity below 1, with a non-Normal blend and set to Disable, chained.
+    #[test]
+    fn soft_mask_comparisons_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let compare = |op, hardness, blend, opacity| {
+            let mut effect = effect(EffectKind::Compare {
+                op,
+                value: 0.45,
+                tolerance: 0.12,
+                left: CompareSource::ThisMask,
+                right: CompareSource::Constant,
+                channel: Channel::Height,
+                hardness,
+            });
+            effect.blend = blend;
+            effect.opacity = opacity;
+            effect
+        };
+        let invert = effect(EffectKind::Filter(Filter::Invert));
+
+        let mut cases = Vec::new();
+        for op in [CompareOp::LesserThan, CompareOp::WithinTolerance, CompareOp::GreaterThan] {
+            for hardness in [0.6, 0.0, -2.0] {
+                cases.push(vec![compare(op, hardness, BlendMode::Normal, 1.0)]);
+            }
+            cases.push(vec![compare(op, 0.7, BlendMode::Multiply, 0.8)]);
+            cases.push(vec![compare(op, 0.7, BlendMode::Disable, 0.8)]);
+            cases.push(vec![invert.clone(), compare(op, 0.5, BlendMode::Screen, 0.9), invert.clone()]);
+        }
+        for effects in cases {
+            let label = format!("{effects:?}");
+            let (project, pixels, owner) = ramp_mask_layer(effects);
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            assert_matches_cpu(&mut gpu, &case, Tolerance::POINT, &label);
+        }
+    }
+
+    /// Colour selections with an output, a soft edge and each background match the CPU's
+    /// `ColorSelection::value` (a transparent one covers only what it selects), at opacity below
+    /// 1, with a non-Normal blend, chained, and with no colours picked.
+    #[test]
+    fn soft_colour_selections_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let images = ImageStore::default();
+
+        // ID colours on, at and past the tolerance of the picked ones, and far from them
+        let picked = vec![[0.40101, 0.69217, 0.05289], [0.375; 3], [0.21875, 0.78125, 0.09375]];
+        let ids = [
+            [0.40101, 0.69217, 0.05289],
+            [0.390625; 3],
+            [0.390626, 0.375, 0.375],
+            [0.21875, 0.78125, 0.09375],
+            [0.1, 0.9, 0.2],
+            [0.8, 0.1, 0.9],
+            [0.359375; 3],
+            [0.0; 3],
+            [0.3, 0.6, 0.1],
+        ];
+        let baked = BakedMaps { resolution: 3, maps: BTreeMap::from([(BakedMap::Id, Arc::new(ids.into_iter().flatten().collect()))]) };
+        let selection = |colors: Vec<[f32; 3]>, output, hardness, background, blend, opacity| {
+            let mut selection = ColorSelection::new(colors, 1.0 / 64.0);
+            selection.output = output;
+            selection.hardness = hardness;
+            selection.background = background;
+            let mut effect = effect(EffectKind::ColorSelection(selection));
+            effect.blend = blend;
+            effect.opacity = opacity;
+            effect
+        };
+        let invert = effect(EffectKind::Filter(Filter::Invert));
+
+        let mut cases = Vec::new();
+        for background in [SelectionBackground::Black, SelectionBackground::White, SelectionBackground::Gray, SelectionBackground::Transparent] {
+            cases.push(vec![selection(picked.clone(), 1.0, 1.0, background, BlendMode::Normal, 1.0)]);
+            cases.push(vec![selection(picked.clone(), 0.6, 0.5, background, BlendMode::Normal, 1.0)]);
+            cases.push(vec![selection(picked.clone(), 0.8, 0.2, background, BlendMode::Multiply, 0.75)]);
+            cases.push(vec![selection(Vec::new(), 0.7, 0.5, background, BlendMode::Normal, 1.0)]);
+        }
+        cases.push(vec![selection(picked.clone(), 0.6, 0.5, SelectionBackground::Gray, BlendMode::Disable, 0.9)]);
+        cases.push(vec![invert.clone(), selection(picked.clone(), 0.4, 0.3, SelectionBackground::Transparent, BlendMode::Screen, 0.9), invert]);
+        for effects in cases {
+            let label = format!("{effects:?}");
+            let (project, pixels, owner) = ramp_mask_layer(effects);
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            assert_matches_cpu(&mut gpu, &case, Tolerance::POINT, &label);
         }
     }
 }
