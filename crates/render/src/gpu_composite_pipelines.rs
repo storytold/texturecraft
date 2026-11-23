@@ -278,9 +278,12 @@ mod tests {
     /// path) for every entry point with the override constants of both group variants.
     fn naga_check(label: &str, source: &str, entries: &[&str], constants: &[Vec<(&'static str, f64)>]) {
         let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|error| panic!("{label}: {}", error.emit_to_string(source)));
-        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32)
-            .validate(&module)
-            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
+        )
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
         for constants in constants {
             let mut values = naga::back::PipelineConstants::default();
             values.extend(constants.iter().map(|&(name, value)| (name.to_owned(), value)));
