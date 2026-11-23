@@ -46,6 +46,8 @@ pub mod fonts;
 mod frame_gizmo;
 mod generator_panel;
 pub mod gpu;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod gpu_port_gate;
 mod gray_slider;
 mod grid_tile;
 mod histogram_cache;

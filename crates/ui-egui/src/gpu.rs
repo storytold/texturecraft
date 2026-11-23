@@ -252,6 +252,12 @@ struct SetCompositor {
     logged_status: Option<(&'static str, &'static str)>,
 }
 
+/// The project the GPU compositor compiles for the view. The GPU port's P3 compiles the solo view
+/// from its isolated copy here; the stroke lines of `SetCompositor::plan` before it are P7's.
+fn view_project(session: &Session) -> &texturecraft_engine::core::Project {
+    &session.doc.project
+}
+
 impl SetCompositor {
     fn uses_gpu(&self) -> bool {
         self.current.is_some() && !self.failed.load(Ordering::Acquire)
@@ -349,9 +355,10 @@ impl SetCompositor {
         };
         #[cfg(target_arch = "wasm32")]
         let brush = None;
+        let project = view_project(session);
         let program = match mask {
-            Some(owner) => CompositeProgram::try_compile_mask_preview(&session.doc.project, pixels, ts, owner, region, brush),
-            None => CompositeProgram::try_compile_with_brush(&session.doc.project, pixels, ts, region, brush),
+            Some(owner) => CompositeProgram::try_compile_mask_preview(project, pixels, ts, owner, region, brush),
+            None => CompositeProgram::try_compile_with_brush(project, pixels, ts, region, brush),
         };
         let mut program = match program {
             Ok(program) => program,
