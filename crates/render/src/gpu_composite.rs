@@ -472,7 +472,9 @@ impl FilterPlan {
             let slot = self.stages.len();
             effect.spatial[0] = if mask { slot } else { slot - first } as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input: 0, wrap: false });
+            // P4: Blur and Bevel with Wrap read the set periodically past its edges
+            let wrap = gpu_neighbourhood::box_family::wraps(filter);
+            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input: 0, wrap });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);

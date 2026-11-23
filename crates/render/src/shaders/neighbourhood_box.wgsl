@@ -5,15 +5,26 @@
 
 // Pixelate laid on each texel's own material alpha (box_family::PIXELATE_KEEPING_ALPHA)
 const PIXELATE_KEEPING_ALPHA: u32 = 16u;
+// Blur and Bevel with Wrap over a field the prepare pass fills periodically
+const BOX_WRAPPED_BLUR: u32 = 17u;
+const BOX_WRAPPED_BEVEL: u32 = 18u;
+
 
 // Whether a P4 kind runs the three box passes first (box_family::uses_box must agree).
 fn box_family_uses_box(kind: u32) -> bool {
-    return false;
+    var uses = kind == BOX_WRAPPED_BLUR || kind == BOX_WRAPPED_BEVEL;
+    return uses;
 }
 
 // A P4 kind after the box passes: the original and the box-blurred field, unpremultiplied
 // by coverage like filtered_box.
 fn box_family_filtered(original: vec4<f32>, blurred: vec4<f32>) -> vec4<f32> {
+    // Away from 0 by at most the value itself, as the built-in Bevel
+    if params.mode.y == BOX_WRAPPED_BEVEL {
+        let side = sign(original.rgb);
+        let distance = abs(original.rgb);
+        return vec4(side * min(distance, max(2.0 * blurred.rgb * side - distance, vec3(0.0))), original.a);
+    }
     return blurred;
 }
 
