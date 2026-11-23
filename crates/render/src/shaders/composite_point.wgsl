@@ -6,6 +6,9 @@
 const POINT_HSL_PERCEPTIVE: u32 = 128u;
 const POINT_POSTERIZE_ALPHA: u32 = 129u;
 
+// Histogram Scan's narrowest soft cut (SCAN_MIN_WIDTH in Rust)
+const POINT_SCAN_MIN_WIDTH: f32 = 1e-3;
+
 // Destination slots that hold no colour (channel_slot in Rust)
 const POINT_HEIGHT_SLOT: u32 = 6u;
 const POINT_NORMAL_SLOT: u32 = 7u;
@@ -79,6 +82,12 @@ fn point_scalar_filter(op: Operation, x: f32) -> f32 {
         case 128u: { return shift_unit(filter_unit(x), op.low.z); }
         // Posterize with Apply to Alpha: the values as plain Posterize, low.x the steps
         case 129u: { return point_posterize(op.low.x, x); }
+        // Histogram Scan from the other end: low.x is 1 - position, low.y the contrast
+        case 130u: {
+            if op.low.y >= 1.0 { return select(0.0, 1.0, x >= op.low.x); }
+            let width = max(1.0 - clamp(op.low.y, 0.0, 1.0), POINT_SCAN_MIN_WIDTH);
+            return filter_unit((x - op.low.x) / width + 0.5);
+        }
         default: { return x; }
     }
 }

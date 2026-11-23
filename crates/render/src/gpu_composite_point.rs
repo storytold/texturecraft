@@ -41,6 +41,7 @@ pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] =
 // P2's opcodes (the same constants head composite_point.wgsl)
 const HSL_PERCEPTIVE: u32 = 128;
 const POSTERIZE_ALPHA: u32 = 129;
+const HISTOGRAM_SCAN_INVERTED: u32 = 130;
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_point.wgsl");
 /// The same functions without P2's code, for programs that do not use it.
@@ -66,6 +67,7 @@ pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, _inpu
             let steps = (levels.clamp(POSTERIZE_LEVELS_MIN, POSTERIZE_LEVELS_MAX).round() - 1.0).max(1.0);
             Some((POSTERIZE_ALPHA, [steps, 0.0, 0.0]))
         }
+        Filter::HistogramScan { position, contrast, invert_position: true } => Some((HISTOGRAM_SCAN_INVERTED, [1.0 - position, *contrast, 0.0])),
         _ => None,
     }
 }
@@ -209,6 +211,20 @@ mod tests {
         assert_filters_match_cpu(&filters, Tolerance::POINT.with_flips(4));
     }
 
+    #[test]
+    fn histogram_scan_invert_position_matches_the_cpu() {
+        let soft = [
+            Filter::HistogramScan { position: 0.4, contrast: 0.5, invert_position: true },
+            Filter::HistogramScan { position: 0.7, contrast: 0.0, invert_position: true },
+            Filter::HistogramScan { position: 0.35, contrast: 0.95, invert_position: true },
+        ];
+        let hard = [Filter::HistogramScan { position: 0.45, contrast: 1.0, invert_position: true }];
+
+        assert_filters_match_cpu(&soft, Tolerance::POINT);
+        // Full contrast is a threshold; the painted values sit away from it
+        assert_filters_match_cpu(&hard, Tolerance::POINT.with_flips(4));
+    }
+
     /// P2's filters and settings that still composite on the CPU, in content and in masks. Port
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
     fn still_on_cpu() -> Vec<Filter> {
@@ -246,7 +262,6 @@ mod tests {
                 linear: true,
                 debug: true,
             },
-            Filter::HistogramScan { position: 0.4, contrast: 0.5, invert_position: true },
         ]
     }
 
