@@ -41,6 +41,9 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
             result = blend_scalar(u32(e.balance.z), mask, finish_generator(e, ramp));
         } else if e.ids.y == COLOR_SELECTION_OPCODE {
             result = blend_scalar(u32(e.balance.z), mask, color_selection(e, texel.pixel));
+        } else if e.ids.y == 37u {
+            // A comparison blends its pass or fail into the mask like a fill
+            result = blend_scalar(u32(e.balance.z), mask, scalar_filter(e, mask));
         } else {
             result = scalar_filter(e, mask);
         }

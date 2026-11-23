@@ -2477,17 +2477,19 @@ pub(crate) mod tests {
             assert!(s.doc.pixels.masks.is_empty(), "live GPU painting keeps the document untouched");
             assert!(link.sync(&mut s, aux, None, 0, 0.0).composites.is_empty(), "stationary brush does not redispatch");
 
+            // A stroke paints the gray it began with, as staging, the CPU preview and the commit do
             s.tool.mask_value = 0.35;
-            let gray = display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, true);
-            assert_ne!(gray, painted, "a gray-value change updates existing coverage");
-            assert_ne!(gray, initial);
+            assert!(link.sync(&mut s, aux, None, 0, 0.0).composites.is_empty(), "a mid-stroke gray change leaves the stroke as it is");
             s.cancel_stroke();
             assert_eq!(display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, true), initial);
 
             s.brush_device = link.brush_device(&s);
             s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
             assert!(s.device_stroke().is_some());
-            assert_eq!(display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, true), gray);
+            let gray = display(link.sync(&mut s, aux, None, 0, 0.0), mask_view, true);
+            assert_ne!(gray, painted, "the next stroke paints the new gray");
+            assert_ne!(gray, initial);
+            s.tool.mask_value = 1.0;
             s.end_stroke().unwrap();
             let committed = s.doc.pixels.masks.values().next().expect("a paint effect must persist the stroke").get(size / 2, size / 2);
             assert!(committed[0] > 0 && committed[1] > 0);
@@ -2503,6 +2505,63 @@ pub(crate) mod tests {
             }
             s.tool.mask_value = 1.0;
         }
+    }
+
+    /// A mask stroke painting an image's gray has no GPU preview of it: coverage, preview and commit
+    /// run on the CPU, and the preview shows exactly what the commit writes.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_mask_image_stroke_previews_and_commits_on_the_cpu() {
+        let Ok(gpu) = Headless::new() else { return };
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let mut s = Session::new_project("Image mask", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+        execute(&mut s, "mask.add.black", &json!({})).unwrap();
+        execute(&mut s, "tool.brush", &json!({"size": 40})).unwrap();
+        let grays = texturecraft_engine::formats::gray16_png(2, 2, [0.2, 0.9, 0.5, 0.7].into_iter()).unwrap();
+        let image = s.import_resource_bytes("gray.png", grays).unwrap();
+        execute(&mut s, "tool.material", &json!({"maskImage": image, "maskValue": 1.0})).unwrap();
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+        let scene = link.sync(&mut s, None, None, 0, 0.0);
+        {
+            let gpu = &mut *brush.0.lock().unwrap();
+            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+
+        let stroke = |s: &mut Session| {
+            s.brush_device = link.brush_device(s);
+            assert!(s.brush_device.is_some(), "the material composites on the GPU");
+            s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+            assert!(s.device_stroke().is_none(), "the GPU previews one gray, not an image");
+        };
+        stroke(&mut s);
+        assert!(s.log.iter().any(|entry| entry.message == "Brush: CPU (mask image)"));
+        assert!(s.display_stroke_pixels(0, None).is_some_and(|preview| !preview.masks.is_empty()));
+        s.cancel_stroke();
+        assert!(s.doc.pixels.masks.is_empty(), "cancel restores the mask");
+
+        stroke(&mut s);
+        let preview = s.display_stroke_pixels(0, None).unwrap();
+        // Changing the gray mid-stroke leaves the stroke's image
+        execute(&mut s, "tool.material", &json!({"maskImage": null, "maskValue": 0.0})).unwrap();
+        s.end_stroke().unwrap();
+        let (effect, committed) = s.doc.pixels.masks.iter().next().expect("the stroke persists");
+        let previewed = preview.masks.get(effect).unwrap();
+        let centre = (64, 64);
+        for (x, y) in [centre, (52, 60), (70, 75), (64, 50)] {
+            assert_eq!(previewed.get(x, y), committed.get(x, y), "texel {x},{y}");
+        }
+        let [value, coverage] = committed.get(centre.0, centre.1)[..2].try_into().unwrap();
+        assert!(coverage > 0);
+        let gray = f32::from(value) / f32::from(coverage);
+        let image_gray =
+            texturecraft_engine::compose::MaskGray::Image { name: image.clone(), image: s.images.get(&image).unwrap().clone() }.at(64, 64, (128, 128));
+        assert!((gray - image_gray).abs() < 0.02, "the stroke paints the image's gray {image_gray}, got {gray}");
+        s.undo().unwrap();
+        assert!(s.doc.pixels.masks.is_empty(), "undo restores the mask");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
