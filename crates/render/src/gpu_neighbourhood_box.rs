@@ -33,9 +33,9 @@
 //! mask, chained, and with a partial region (the halo); distance filters also compare the raw
 //! distance field exactly.
 
-use texturecraft_core::Filter;
+use texturecraft_core::{ChannelKind, Filter, HighpassSpace};
 
-use super::{BOX_KINDS, BOX_PASSES, Kind, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, StageInputs};
+use super::{APPLY_WORKGROUP, BOX_KINDS, BOX_PASSES, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs};
 
 /// Library filter ids P4 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["bevel", "bevelSmooth", "directionalDistance", "glow", "dropShadow", "maskOutline"];
@@ -48,6 +48,8 @@ const PIXELATE_KEEPING_ALPHA: Kind = Kind(BOX_KINDS.start);
 const WRAPPED_BLUR: Kind = Kind(BOX_KINDS.start + 1);
 /// Bevel with Wrap, as [`WRAPPED_BLUR`].
 const WRAPPED_BEVEL: Kind = Kind(BOX_KINDS.start + 2);
+/// Highpass of colour in an sRGB space, or of the alpha too.
+const HIGHPASS: Kind = Kind(BOX_KINDS.start + 3);
 
 /// Filter sizes are texels at this many texels per side, as the CPU scales them.
 const FILTER_SIZE_RESOLUTION: f32 = 2048.0;
@@ -58,19 +60,24 @@ const MIN_FILTER_RADIUS: f32 = 0.5;
 const BILINEAR_SAMPLE_WORK: u64 = 5;
 /// Work per texel the built-in stages count for a box filter and its apply pass.
 const BOX_FILTER_WORK: u64 = 8;
+/// Work per texel of a pass of P4's own (prepare, apply, a distance line or the edges).
+const OWN_PASS_WORK: u64 = 2;
 
 /// P4's own compute pipelines, created from the neighbourhood module.
-pub(super) struct Pipelines;
+pub(super) struct Pipelines {
+    prepare: wgpu::ComputePipeline,
+    apply: wgpu::ComputePipeline,
+}
 
 impl Pipelines {
-    pub(super) fn new(_pipeline: &dyn Fn(&'static str) -> wgpu::ComputePipeline) -> Self {
-        Self
+    pub(super) fn new(pipeline: &dyn Fn(&'static str) -> wgpu::ComputePipeline) -> Self {
+        Self { prepare: pipeline("box_family_prepare"), apply: pipeline("box_family_apply") }
     }
 }
 
 /// Whether a P4 stage evaluates `filter` as the CPU does.
 pub(super) fn supports(filter: &Filter) -> bool {
-    matches!(filter, Filter::Mosaic { alpha: false, .. } | Filter::Blur { wrap: true, .. } | Filter::Bevel { wrap: true, .. })
+    matches!(filter, Filter::Mosaic { alpha: false, .. } | Filter::Blur { wrap: true, .. } | Filter::Bevel { wrap: true, .. } | Filter::HighPass { .. })
 }
 
 /// The P4 stage for `filter`, None when its size reaches nothing.
@@ -83,8 +90,28 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
         Filter::Blur { radius, wrap: true } => (*radius > 0.0).then(|| stage.filter(WRAPPED_BLUR, texels(*radius))),
         // Three box passes ramp an edge over about twice their radius
         Filter::Bevel { width, wrap: true } => Some(stage.filter(WRAPPED_BEVEL, texels(*width * 0.5))),
+        Filter::HighPass { radius, space, alpha } => Some(highpass(stage, texels(*radius), *space, *alpha)),
         _ => None,
     }
+}
+
+/// A Highpass stage: masks filter their value in the working space, content other than colour
+/// keeps the working space (filter_region in eval.rs). The built-in stage takes what is left.
+fn highpass(stage: StageInputs, texels: f32, space: HighpassSpace, alpha: bool) -> NeighbourhoodFilter {
+    let space = if stage.channel == Some(ChannelKind::Color) { space } else { HighpassSpace::Working };
+    let alpha = alpha && stage.channel.is_some();
+    if space == HighpassSpace::Working && !alpha {
+        return stage.filter(Kind::HIGH_PASS, texels);
+    }
+
+    let mut highpass = stage.filter(HIGHPASS, texels);
+    let space_word = match space {
+        HighpassSpace::Working => 0,
+        HighpassSpace::SrgbFromLinear => 1,
+        HighpassSpace::SrgbFromAcescg => 2,
+    };
+    highpass.words = [space_word, u32::from(alpha)];
+    highpass
 }
 
 /// Whether the stage reads past the set's edges from the far side (`FilterStage::wrap`).
@@ -93,7 +120,7 @@ pub(crate) fn wraps(filter: NeighbourhoodFilter) -> bool {
 }
 
 pub(super) fn uses_box(filter: NeighbourhoodFilter) -> bool {
-    matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL)
+    matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL | HIGHPASS)
 }
 
 pub(super) fn reach(filter: NeighbourhoodFilter) -> u32 {
@@ -106,20 +133,69 @@ pub(super) fn reach(filter: NeighbourhoodFilter) -> u32 {
 pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
     match filter.kind {
         PIXELATE_KEEPING_ALPHA => BILINEAR_SAMPLE_WORK,
+        HIGHPASS => BOX_FILTER_WORK + OWN_PASS_WORK,
         _ => BOX_FILTER_WORK,
     }
 }
 
+/// The three horizontal and three vertical box passes over the field at `first` (read on the
+/// first pass as the original is), radius `radius`; the offset of the blurred field.
+fn box_passes(
+    run: &mut impl FnMut(&wgpu::ComputePipeline, [u32; 4], u32, bool, [u32; 2]),
+    box_blur: &wgpu::ComputePipeline,
+    region: NeighbourhoodRegion,
+    first: u32,
+    radius: u32,
+) -> u32 {
+    let [_, _, width, height] = region.rect;
+    let mut source = first;
+    for step in 0..2 * BOX_PASSES {
+        let vertical = step >= BOX_PASSES;
+        let line_count = if vertical { width } else { height };
+        let target = region.blur[step % 2];
+        run(box_blur, [first, source, target, u32::from(vertical)], radius, step == 0, [line_count.div_ceil(LINE_WORKGROUP), 1]);
+        source = target;
+    }
+    source
+}
+
 /// Encodes a P4 stage with passes of its own; false lets the box and apply passes run.
 pub(super) fn encode(
-    (_gpu, _pipelines): (&NeighbourhoodGpu, &Pipelines),
-    _device: &wgpu::Device,
-    _encoder: &mut wgpu::CommandEncoder,
-    _scratch: &wgpu::Buffer,
-    _region: NeighbourhoodRegion,
-    _filter: NeighbourhoodFilter,
+    (gpu, pipelines): (&NeighbourhoodGpu, &Pipelines),
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    scratch: &wgpu::Buffer,
+    region: NeighbourhoodRegion,
+    filter: NeighbourhoodFilter,
 ) -> bool {
-    false
+    let [_, _, width, height] = region.rect;
+    let texel_groups = [width.div_ceil(APPLY_WORKGROUP), height.div_ceil(APPLY_WORKGROUP)];
+    let mut run = |pipeline: &wgpu::ComputePipeline, buffers: [u32; 4], radius: u32, first_box: bool, groups: [u32; 2]| {
+        let params = Params {
+            rect: region.rect,
+            buffers,
+            mode: [radius, filter.kind.0, filter.seed, u32::from(first_box)],
+            weights: [filter.opacity, filter.amount, filter.frequency, filter.middle],
+            direction: [filter.direction[0], filter.direction[1], 0.0, 0.0],
+            field_layout: region.field_layout(filter.words),
+            extra: filter.extra,
+            stage: [filter.context, u32::from(region.wrap), 0, 0],
+            bounds: region.bounds,
+        };
+        NeighbourhoodGpu::run(pipeline, device, encoder, scratch, &params, groups);
+    };
+    let (original, output) = (region.original, region.output);
+    match filter.kind {
+        // What the box passes blur goes to the output field first, which the apply pass overwrites
+        HIGHPASS => {
+            run(&pipelines.prepare, [original, 0, output, 0], filter.radius, false, texel_groups);
+            let blurred = box_passes(&mut run, &gpu.box_blur, region, output, filter.radius);
+            run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups);
+        }
+        // Pixelate gathers and the wrapping filters run the built-in passes
+        _ => return false,
+    }
+    true
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -166,7 +242,6 @@ mod tests {
     fn still_on_cpu() -> Vec<Filter> {
         vec![
             Filter::DropShadow { angle: 45.0, distance: 0.02, size: 8.0, spread: 0.0, opacity: 1.0, color: [0.0; 3] },
-            Filter::HighPass { radius: 8.0, space: HighpassSpace::SrgbFromLinear, alpha: false },
             Filter::GradientMap {
                 colors: vec![[0.0; 3], [1.0; 3]],
                 positions: Vec::new(),
@@ -175,7 +250,6 @@ mod tests {
                 linear: true,
                 debug: false,
             },
-            Filter::HighPass { radius: 8.0, space: HighpassSpace::Working, alpha: true },
         ]
     }
 
@@ -194,7 +268,14 @@ mod tests {
     #[test]
     fn box_and_distance_filters_compile_on_the_gpu() {
         let none = ContentsOffset::NONE;
-        let ported = [Filter::Mosaic { size: 96.0, alpha: false }, Filter::Blur { radius: 8.0, wrap: true }, Filter::Bevel { width: 16.0, wrap: true }];
+        let ported = [
+            Filter::Mosaic { size: 96.0, alpha: false },
+            Filter::Blur { radius: 8.0, wrap: true },
+            Filter::Bevel { width: 16.0, wrap: true },
+            Filter::HighPass { radius: 8.0, space: HighpassSpace::SrgbFromLinear, alpha: false },
+            Filter::HighPass { radius: 8.0, space: HighpassSpace::SrgbFromAcescg, alpha: true },
+            Filter::HighPass { radius: 8.0, space: HighpassSpace::Working, alpha: true },
+        ];
 
         for filter in ported {
             let (material, _) = compile_effects(Some(effect(EffectKind::Filter(filter.clone()))), None, none);
@@ -373,5 +454,32 @@ mod tests {
         case.region = Some(CORNER);
 
         assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, "wrapped Blur after a generator's cells");
+    }
+
+    /// Highpass in either sRGB space and of the alpha matches the CPU (colour spaces apply to Base
+    /// Color only, the alpha to content only), below full opacity, disabled and between filters.
+    #[test]
+    fn highpass_spaces_and_alpha_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let highpass = |space, alpha| Filter::HighPass { radius: 96.0, space, alpha };
+        let normal = BlendMode::Normal;
+        let cases = [
+            ("Highpass sRGB from linear", vec![(highpass(HighpassSpace::SrgbFromLinear, false), 1.0, normal)], normal),
+            ("Highpass sRGB from ACEScg", vec![(highpass(HighpassSpace::SrgbFromAcescg, false), 0.8, normal)], BlendMode::Multiply),
+            ("Highpass alpha", vec![(highpass(HighpassSpace::Working, true), 1.0, normal)], normal),
+            ("Highpass sRGB and alpha", vec![(highpass(HighpassSpace::SrgbFromLinear, true), 0.7, normal)], normal),
+            ("Highpass disabled", vec![(highpass(HighpassSpace::SrgbFromAcescg, true), 1.0, BlendMode::Disable)], normal),
+            (
+                "Highpass between filters",
+                vec![
+                    (Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal),
+                    (highpass(HighpassSpace::SrgbFromLinear, true), 0.9, normal),
+                    (Filter::Invert, 1.0, normal),
+                ],
+                normal,
+            ),
+        ];
+
+        assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
     }
 }

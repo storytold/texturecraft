@@ -8,11 +8,16 @@ const PIXELATE_KEEPING_ALPHA: u32 = 16u;
 // Blur and Bevel with Wrap over a field the prepare pass fills periodically
 const BOX_WRAPPED_BLUR: u32 = 17u;
 const BOX_WRAPPED_BEVEL: u32 = 18u;
+// Highpass in an sRGB space or of the alpha
+const BOX_HIGHPASS: u32 = 19u;
 
+// Highpass in sRGB from ACEScg (params.field_layout.z; 0 is the working space, 1 sRGB from linear)
+const BOX_SPACE_SRGB_FROM_ACESCG: u32 = 2u;
 
 // Whether a P4 kind runs the three box passes first (box_family::uses_box must agree).
 fn box_family_uses_box(kind: u32) -> bool {
     var uses = kind == BOX_WRAPPED_BLUR || kind == BOX_WRAPPED_BEVEL;
+    uses = uses || kind == BOX_HIGHPASS;
     return uses;
 }
 
@@ -50,4 +55,134 @@ fn pixelate_keeping_alpha(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
 
     let scale = original.w * sample.coverage / sample.value.w;
     return vec4(sample.value.rgb * scale, original.w * sample.coverage) / sample.coverage;
+}
+
+// The kind's flags or mode (NeighbourhoodFilter::words[0])
+fn box_flags() -> u32 {
+    return params.field_layout.z;
+}
+
+fn box_srgb_from_linear(value: f32) -> f32 {
+    let v = clamp(value, 0.0, 1.0);
+    if v <= 0.0031308 {
+        return v * 12.92;
+    }
+    return 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+
+fn box_linear_from_srgb(value: f32) -> f32 {
+    let v = clamp(value, 0.0, 1.0);
+    if v <= 0.04045 {
+        return v / 12.92;
+    }
+    return pow((v + 0.055) / 1.055, 2.4);
+}
+
+// Matrix rows times a column, summed in the CPU's order (times in highpass_space.rs)
+fn box_times_rows(first: vec3<f32>, second: vec3<f32>, third: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
+    return vec3(
+        first.x * v.x + first.y * v.y + first.z * v.z,
+        second.x * v.x + second.y * v.y + second.z * v.z,
+        third.x * v.x + third.y * v.y + third.z * v.z,
+    );
+}
+
+// HighpassSpace::encode of a straight colour
+fn box_highpass_encode(rgb: vec3<f32>) -> vec3<f32> {
+    var linear_rgb = rgb;
+    if box_flags() == BOX_SPACE_SRGB_FROM_ACESCG {
+        // AP1_TO_REC709 in highpass_space.rs
+        linear_rgb = box_times_rows(vec3(1.70505, -0.62179, -0.08326), vec3(-0.13026, 1.14080, -0.01055), vec3(-0.02400, -0.12897, 1.15297), rgb);
+    }
+    return vec3(box_srgb_from_linear(linear_rgb.x), box_srgb_from_linear(linear_rgb.y), box_srgb_from_linear(linear_rgb.z));
+}
+
+// HighpassSpace::decode of a straight colour
+fn box_highpass_decode(rgb: vec3<f32>) -> vec3<f32> {
+    let linear_rgb = vec3(box_linear_from_srgb(rgb.x), box_linear_from_srgb(rgb.y), box_linear_from_srgb(rgb.z));
+    if box_flags() == BOX_SPACE_SRGB_FROM_ACESCG {
+        // REC709_TO_AP1 in highpass_space.rs
+        return box_times_rows(vec3(0.61310, 0.33952, 0.04737), vec3(0.07019, 0.91635, 0.01345), vec3(0.02062, 0.10957, 0.86981), linear_rgb);
+    }
+    return linear_rgb;
+}
+
+// Premultiplied content with its straight colour moved into or out of the Highpass space (recode in eval.rs)
+fn box_highpass_recode(value: vec4<f32>, encode: bool) -> vec4<f32> {
+    if box_flags() == 0u || value.w <= MIN_WEIGHT {
+        return value;
+    }
+    let straight = value.rgb / value.w;
+    if encode {
+        return vec4(box_highpass_encode(straight) * value.w, value.w);
+    }
+    return vec4(box_highpass_decode(straight) * value.w, value.w);
+}
+
+// Highpass in its space and of the alpha when params.field_layout.w is set (filter_region and recover in eval.rs)
+fn box_highpass_texel(original: vec4<f32>, blurred: Texel) -> vec4<f32> {
+    let with_alpha = params.field_layout.w != 0u;
+    let encoded = box_highpass_recode(original, true);
+    var result = encoded;
+    if blurred.coverage > MIN_WEIGHT {
+        let average = blurred.value / blurred.coverage;
+        let rgb = encoded.rgb - average.rgb + params.weights.w * encoded.w;
+        var alpha = encoded.w;
+        if with_alpha {
+            alpha = clamp(encoded.w - average.w + 0.5, 0.0, 1.0);
+        }
+        result = encoded + (vec4(rgb, alpha) - encoded) * params.weights.x;
+    }
+
+    // The colours laid on the new coverage, mid gray where there was none
+    if with_alpha {
+        if original.w > MIN_WEIGHT {
+            result = vec4(result.rgb * (result.w / original.w), result.w);
+        } else {
+            result = vec4(vec3(params.weights.w * result.w), result.w);
+        }
+    }
+    return box_highpass_recode(result, false);
+}
+
+// The apply pass of the kinds with passes of their own: the original at buffers.x, the filtered field at buffers.y, the result to buffers.z
+@compute @workgroup_size(8, 8)
+fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
+    let point = id.xy;
+    if any(point >= params.rect.zw) {
+        return;
+    }
+    let original = original_at(point);
+    let filtered = read_at(params.buffers.y, point);
+    let kind = params.mode.y;
+
+    // Uncovered texels stay empty
+    if original.coverage <= 0.0 {
+        write_at(params.buffers.z, point, original);
+        return;
+    }
+
+    var result = original.value;
+    if kind == BOX_HIGHPASS {
+        result = box_highpass_texel(original.value, filtered);
+    }
+    write_at(params.buffers.z, point, Texel(result, original.coverage));
+}
+
+// What the box passes of a kind with passes of its own blur, from the original at buffers.x into buffers.z
+@compute @workgroup_size(8, 8)
+fn box_family_prepare(@builtin(global_invocation_id) id: vec3<u32>) {
+    let point = id.xy;
+    if any(point >= params.rect.zw) {
+        return;
+    }
+    let kind = params.mode.y;
+    var prepared = EMPTY;
+
+    // Highpass blurs the colour in its space
+    if kind == BOX_HIGHPASS {
+        let original = original_at(point);
+        prepared = Texel(box_highpass_recode(original.value, true), original.coverage);
+    }
+    write_at(params.buffers.z, point, prepared);
 }
