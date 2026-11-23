@@ -367,7 +367,13 @@ impl NeighbourhoodGpu {
         cell: u32,
     ) {
         let [left, top, width, height] = region.rect;
-        let cells = [(left + width).div_ceil(cell) - left / cell, (top + height).div_ceil(cell) - top / cell];
+
+        // The field's origin is i32 bits and lies below zero in a program with a wrapping stage
+        let cells_across = |origin: u32, size: u32| {
+            let (origin, cell) = (i64::from(origin as i32), i64::from(cell.max(1)));
+            ((origin + i64::from(size) + cell - 1).div_euclid(cell) - origin.div_euclid(cell)) as u32
+        };
+        let cells = [cells_across(left, width), cells_across(top, height)];
         let params = Params {
             rect: region.rect,
             buffers: [region.original, region.blur[0], region.output, 0],

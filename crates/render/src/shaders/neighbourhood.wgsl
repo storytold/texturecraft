@@ -274,22 +274,28 @@ fn apply_neighbourhood(@builtin(global_invocation_id) id: vec3<u32>) {
     write_at(params.buffers.z, point, Texel(filtered, original.coverage));
 }
 
-fn first_cell() -> vec2<u32> {
-    return params.rect.xy / params.mode.x;
+// Floor division (WGSL's rounds towards zero), for cells of a field whose origin lies below zero
+fn floor_div_cells(value: vec2<i32>, cell: i32) -> vec2<i32> {
+    let quotient = value / cell;
+    return quotient - select(vec2(0), vec2(1), (value % cell != vec2(0)) & (value < vec2(0)));
 }
 
-fn cell_extent() -> vec2<u32> {
-    let cell = params.mode.x;
-    return (params.rect.xy + params.rect.zw + vec2(cell - 1u)) / cell - first_cell();
+fn first_cell() -> vec2<i32> {
+    return floor_div_cells(field_origin(), i32(params.mode.x));
+}
+
+fn cell_extent() -> vec2<i32> {
+    let cell = i32(params.mode.x);
+    return floor_div_cells(field_origin() + vec2<i32>(params.rect.zw) + vec2(cell - 1), cell) - first_cell();
 }
 
 @compute @workgroup_size(8, 8)
 fn average_cells(@builtin(global_invocation_id) id: vec3<u32>) {
-    if any(id.xy >= cell_extent()) { return; }
-    let cell = params.mode.x;
-    let origin = (first_cell() + id.xy) * cell;
-    let first = max(origin, params.rect.xy) - params.rect.xy;
-    let end = min(origin + vec2(cell), params.rect.xy + params.rect.zw) - params.rect.xy;
+    if any(vec2<i32>(id.xy) >= cell_extent()) { return; }
+    let cell = i32(params.mode.x);
+    let origin = (first_cell() + vec2<i32>(id.xy)) * cell;
+    let first = vec2<u32>(max(origin, field_origin()) - field_origin());
+    let end = vec2<u32>(min(origin + vec2(cell), field_origin() + vec2<i32>(params.rect.zw)) - field_origin());
     var sum = 0.0;
     var count = 0u;
     for (var y = first.y; y < end.y; y++) {
@@ -306,7 +312,7 @@ fn average_cells(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 fn cell_corner(point: vec2<i32>, weight: f32) -> vec2<f32> {
-    let cell = vec2<u32>(clamp(point, vec2(0), vec2<i32>(cell_extent()) - 1));
+    let cell = vec2<u32>(clamp(point, vec2(0), cell_extent() - 1));
     let sample = read_at(params.buffers.y, cell);
     return vec2(sample.value.x, 1.0) * (weight * sample.coverage);
 }
@@ -317,7 +323,7 @@ fn interpolate_cells(@builtin(global_invocation_id) id: vec3<u32>) {
     let original = original_at(id.xy);
     var value = original.value.x;
     if original.coverage > 0.0 {
-        let position = (vec2<f32>(params.rect.xy + id.xy) + 0.5) / f32(params.mode.x) - 0.5 - vec2<f32>(first_cell());
+        let position = (vec2<f32>(field_origin() + vec2<i32>(id.xy)) + 0.5) / f32(params.mode.x) - 0.5 - vec2<f32>(first_cell());
         let cell = vec2<i32>(floor(position));
         let f = fract(position);
         let weighted = cell_corner(cell, (1.0 - f.x) * (1.0 - f.y))
