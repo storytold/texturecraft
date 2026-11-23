@@ -278,7 +278,6 @@ fn still_on_cpu(projection: &Projection, sampling: Sampling, op: &Operation) -> 
     let projector = projector_of(projection);
     let reads_image = op.ids[1] == IMAGE_SOURCE_OPCODE || projection.placed().is_some();
     (sampling.filtering == Filtering::BilinearHq && reads_image)
-        || matches!(projection, Projection::Cylindrical { angle, .. } if *angle != FULL_TURN_DEGREES)
         || uv_transform_of(projection).is_some_and(|uv| !uv.is_default())
         || projector.is_some_and(Projector::turns)
         || projector.is_some_and(|projector| projector.crop != ShapeCrop::ExtendsOutside || projector.backface.on || projector.ignore_image_alpha)
@@ -669,8 +668,6 @@ mod tests {
         let fill = |source: &Source, projection: Projection, sampling: Sampling| EffectKind::Fill { source: source.clone(), projection, sampling };
         let mirror = FillSymmetry { on: true, ..FillSymmetry::OFF };
         let radial = FillSymmetry { on: true, kind: SymmetryKind::Radial, axis: 1, count: 5, ..FillSymmetry::OFF };
-        let cylinder =
-            Projection::Cylindrical { scale: 1.0, axis: 1, uv: UvTransform::default(), offset: [0.0; 3], projector: Projector::default(), angle: 120.0 };
         let placed_uv = Projection::Triplanar {
             scale: 1.0,
             sharpness: 4.0,
@@ -701,7 +698,6 @@ mod tests {
         };
         let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
         vec![
-            fill(&uniform, cylinder, sharp),
             fill(&uniform, placed_uv, sharp),
             fill(&uniform, turned, sharp),
             fill(&uniform, cropped, sharp),
@@ -789,6 +785,19 @@ mod tests {
             for (label, mesh, projection, sampling) in cases {
                 assert_fill_matches(&mut gpu, &mesh, &projection, sampling, Tolerance::BILINEAR.with_flips(FLIPS), &format!("{wrap:?} {label}"));
             }
+        }
+    }
+
+    /// A cylindrical projection over less than a full turn spreads one repeat over its arc, round
+    /// every axis, for images and patterns
+    #[test]
+    fn cylindrical_angles_match_the_cpu() {
+        let mut gpu = headless();
+        for (axis, angle) in [(0, 120.0), (1, 45.0), (2, 270.0), (1, 10.0)] {
+            let projection =
+                Projection::Cylindrical { scale: 1.1, axis, uv: UvTransform::default(), offset: [0.05, 0.1, -0.1], projector: Projector::default(), angle };
+            let label = format!("cylindrical axis {axis} over {angle} degrees");
+            assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, Tolerance::BILINEAR, &label);
         }
     }
 
