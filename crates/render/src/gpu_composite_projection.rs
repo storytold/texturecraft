@@ -238,7 +238,7 @@ pub(super) fn place_cover(projection: &Projection, sampling: Sampling, op: &mut 
     if built_in(projection, sampling, op) {
         return Some(());
     }
-    if still_on_cpu(projection, sampling) {
+    if still_on_cpu(projection, sampling, op) {
         return None;
     }
 
@@ -274,8 +274,19 @@ fn built_in(projection: &Projection, sampling: Sampling, op: &Operation) -> bool
 }
 
 /// The settings P1's path does not evaluate yet: those fills stay on the CPU.
-fn still_on_cpu(_projection: &Projection, _sampling: Sampling) -> bool {
-    true
+fn still_on_cpu(projection: &Projection, sampling: Sampling, op: &Operation) -> bool {
+    let projector = projector_of(projection);
+    let reads_image = op.ids[1] == IMAGE_SOURCE_OPCODE || projection.placed().is_some();
+    (sampling.filtering == Filtering::BilinearHq && reads_image)
+        || sampling.wrap.repeats() != (true, true)
+        || matches!(projection, Projection::Cylindrical { angle, .. } if *angle != FULL_TURN_DEGREES)
+        || uv_transform_of(projection).is_some_and(|uv| !uv.is_default())
+        || projector.is_some_and(Projector::turns)
+        || projector.is_some_and(|projector| projector.crop != ShapeCrop::ExtendsOutside || projector.backface.on || projector.ignore_image_alpha)
+        || (sampling.symmetry.on && projection.takes_symmetry())
+        || matches!(projection, Projection::Warp { .. })
+        || projection.placed().is_some()
+        || projection.depth_culling().is_some()
 }
 
 /// The `procedural[3]` selector of a fill on P1's path, so the program binds the surface its
@@ -505,12 +516,130 @@ pub(super) fn band_uniform(_program: &CompositeProgram) -> [u32; 4] {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use texturecraft_core::{
-        Backface, ContentsOffset, Decal, DepthCulling, EffectKind, FillSymmetry, Filtering, Projection, Projector, Sampling, ShapeCrop, Source, SymmetryKind,
-        UvTransform, UvWrap,
-    };
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-    use crate::gpu_composite::oracle::{compile_effects, effect};
+    use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
+    use texturecraft_core::{
+        Backface, BlendMode, Channel, ChannelBlend, ContentsOffset, Decal, DepthCulling, Effect, EffectKind, Fill, FillSymmetry, Filter, Filtering, Layer,
+        LayerId, LayerKind, Mask, MaskBackground, Procedural, ProceduralKind, Project, Projection, Projector, Sampling, ShapeCrop, Source, SymmetryKind,
+        TextureSet, UvTransform, UvWrap,
+    };
+    use texturecraft_geom::{Mesh, primitives};
+    use texturecraft_texel::TILE;
+
+    use crate::gpu_composite::CompositeProgram;
+    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
+    use crate::headless::Headless;
+
+    /// Texture set side of the oracle cases
+    const SIZE: u32 = TILE * 2;
+    /// Texels a hard decision (nearest texel, an edge, culling) may flip: 0.1 % of the set
+    const FLIPS: usize = (SIZE * SIZE / 1000) as usize;
+
+    /// A unit sphere: positions and normals all round, its UVs over the whole set
+    fn sphere() -> Arc<Mesh> {
+        Arc::new(primitives::sphere(1.0, 48, 24))
+    }
+
+    /// A flat square whose UVs cover the whole set
+    fn plane() -> Arc<Mesh> {
+        Arc::new(primitives::plane(1.0, 1))
+    }
+
+    /// A busy sRGB colour image with alpha, stored as bytes and larger than the set, and a float
+    /// image beyond 0..1
+    fn images() -> ImageStore {
+        const COLOR_SIDE: u32 = 256;
+        const FLOAT_SIDE: u32 = 96;
+        let color = (0..COLOR_SIDE * COLOR_SIDE)
+            .map(|index| {
+                let (x, y) = (index % COLOR_SIDE, index / COLOR_SIDE);
+                let checker = ((x / 3 + y / 5) % 2) as f32;
+                [x as f32 / 255.0, y as f32 / 255.0, checker, (64 + (x + 2 * y) % 192) as f32 / 255.0]
+            })
+            .collect();
+        let float = (0..FLOAT_SIDE * FLOAT_SIDE)
+            .map(|index| {
+                let (x, y) = (index % FLOAT_SIDE, index / FLOAT_SIDE);
+                let value = ((x * 13 + y * 7) % 101) as f32 / 97.0 - 0.1;
+                [value, 1.0 - value, value * 0.5, 1.0]
+            })
+            .collect();
+        ImageStore::from([
+            ("color".into(), Arc::new(ImageRes::new(COLOR_SIDE, COLOR_SIDE, color, true))),
+            ("float".into(), Arc::new(ImageRes::new(FLOAT_SIDE, FLOAT_SIDE, float, false))),
+        ])
+    }
+
+    /// A base fill under a fill projected by `projection` with `sampling` in every source kind
+    /// (sRGB image colour, pattern, uniform, float image height), its colour blended Multiply at
+    /// 0.7, inverted after. Its mask lays the projected image over a uniform fill, then a disabled
+    /// projected pattern and an inversion. Returns the project and the projected layer.
+    fn fill_project(projection: &Projection, sampling: Sampling) -> (Project, LayerId) {
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Metallic, Channel::Height];
+        let mut project = Project::new("Fill sampling", "builtin:sphere");
+        project.texture_sets.push(TextureSet::new("Set", 0, SIZE));
+        let base_sources = BTreeMap::from([
+            (Channel::BaseColor, Source::Uniform([0.62, 0.48, 0.3])),
+            (Channel::Roughness, Source::Uniform([0.55; 3])),
+            (Channel::Height, Source::Uniform([0.1; 3])),
+        ]);
+        let base_id = project.alloc_id();
+        let base = Layer::new(base_id, "Base", LayerKind::Fill(Fill { sources: base_sources, ..Fill::default() }), &channels);
+        assert!(project.insert_layer(0, base, None, false).is_ok());
+
+        let pattern = Procedural { scale: 3.7, seed: 19, ..Procedural::new(ProceduralKind::Clouds) };
+        let pattern = Source::Procedural { pattern, low: [0.1; 3], high: [0.9; 3], ramp: Vec::new() };
+        let sources = BTreeMap::from([
+            (Channel::BaseColor, Source::image("color")),
+            (Channel::Roughness, pattern.clone()),
+            (Channel::Metallic, Source::Uniform([0.8; 3])),
+            (Channel::Height, Source::image("float")),
+        ]);
+        let owner = project.alloc_id();
+        let fill = Fill { sources, projection: projection.clone(), sampling, ..Fill::default() };
+        let mut layer = Layer::new(owner, "Projected", LayerKind::Fill(fill), &channels);
+        layer.channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Multiply, opacity: 0.7 });
+        let mut invert = Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert));
+        invert.opacity = 0.6;
+        layer.content_effects.push(invert);
+
+        let mut mask = Mask::new(MaskBackground::Black);
+        let under = EffectKind::Fill { source: Source::Uniform([0.35; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE };
+        mask.effects.push(Effect::new(project.alloc_id(), under));
+        let mut projected = Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::image("color"), projection: projection.clone(), sampling });
+        projected.opacity = 0.8;
+        projected.blend = BlendMode::Lighten;
+        mask.effects.push(projected);
+        let mut disabled = Effect::new(project.alloc_id(), EffectKind::Fill { source: pattern, projection: projection.clone(), sampling });
+        disabled.blend = BlendMode::Disable;
+        mask.effects.push(disabled);
+        let mut mask_invert = Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert));
+        mask_invert.opacity = 0.5;
+        mask.effects.push(mask_invert);
+        layer.mask = Some(mask);
+        assert!(project.insert_layer(0, layer, None, false).is_ok());
+        (project, owner)
+    }
+
+    /// `fill_project` for `projection` and `sampling` compiles, takes P1's path, and (with an
+    /// adapter) matches the CPU in every map and the mask preview.
+    fn assert_fill_matches(gpu: &mut Option<Headless>, mesh: &Arc<Mesh>, projection: &Projection, sampling: Sampling, tolerance: Tolerance, label: &str) {
+        let (project, owner) = fill_project(projection, sampling);
+        let pixels = PixelStore::default();
+        let program = CompositeProgram::try_compile_region(&project, &pixels, 0, None);
+        let mask = CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None);
+        assert_eq!(program.as_ref().err(), None, "{label}");
+        assert_eq!(mask.as_ref().err(), None, "{label} mask");
+        assert!(program.is_ok_and(|program| program.operations.iter().any(|op| op.ext[1] != 0)), "{label}: no fill takes P1's path");
+        let Some(gpu) = gpu else { return };
+
+        let (baked, images) = (BakedMaps::default(), images());
+        let mut case = OracleCase::new(&project, &pixels, &baked, &images, mesh);
+        case.mask_owner = Some(owner);
+        assert_matches_cpu(gpu, &case, tolerance, label);
+    }
 
     /// A frame in front of a unit sphere, facing +Z, turned and moved a little
     fn frame() -> Decal {
@@ -573,7 +702,6 @@ mod tests {
         };
         let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
         vec![
-            fill(&image, Projection::default(), Sampling { filtering: Filtering::Nearest, ..sharp }),
             fill(&uniform, Projection::default(), Sampling { wrap: UvWrap::RepeatHorizontally, ..sharp }),
             fill(&uniform, Projection::default(), Sampling { wrap: UvWrap::RepeatVertically, ..sharp }),
             fill(&uniform, Projection::default(), Sampling { wrap: UvWrap::None, ..sharp }),
@@ -615,6 +743,29 @@ mod tests {
             }
         }
         assert_eq!(super::image_use(Sampling::SAVED_BEFORE, ChannelKind::Color), ImageUse::Material);
+    }
+
+    /// Image sources read the nearest texel through every projection the built-in paths have
+    #[test]
+    fn nearest_image_fills_match_the_cpu() {
+        let mut gpu = headless();
+        let nearest = Sampling { filtering: Filtering::Nearest, ..Sampling::SAVED_BEFORE };
+        let triplanar =
+            Projection::Triplanar { scale: 0.7, sharpness: 3.0, offset: [0.1, -0.2, 0.05], uv: UvTransform::default(), projector: Projector::default() };
+        let spherical = Projection::Spherical { scale: 1.2, uv: UvTransform::default(), offset: [0.0; 3], projector: Projector::default() };
+        let cylindrical =
+            Projection::Cylindrical { scale: 0.9, axis: 0, uv: UvTransform::default(), offset: [0.0; 3], projector: Projector::default(), angle: 360.0 };
+        let cases = [
+            ("UV", plane(), Projection::Uv { scale: [1.3, 0.85], rotation: 21.0, offset: [0.17, -0.31] }),
+            ("UV tile", plane(), Projection::UvTile),
+            ("tri-planar", sphere(), triplanar),
+            ("planar", sphere(), planar(Projector::default())),
+            ("spherical", sphere(), spherical),
+            ("cylindrical", sphere(), cylindrical),
+        ];
+        for (label, mesh, projection) in cases {
+            assert_fill_matches(&mut gpu, &mesh, &projection, nearest, Tolerance::BILINEAR.with_flips(FLIPS), &format!("nearest {label}"));
+        }
     }
 
     #[test]

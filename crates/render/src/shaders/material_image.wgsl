@@ -59,10 +59,73 @@ fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> {
     return rgb;
 }
 
-// P1 (composite_projection.wgsl): the image at a point the fill already projected, as its
-// sampling reads it
+// One stored level of an image for P1: its first plane's origin word, size and encoding
+// (gpu_tile_pattern.rs append_rgba)
+struct P1ImageLevel {
+    planes: u32,
+    size: vec2<i32>,
+    encoding: u32,
+}
+
+fn p1_base_level(image: u32) -> P1ImageLevel {
+    return P1ImageLevel(image + 3u, vec2<i32>(i32(srgb[image]), i32(srgb[image + 1u])), srgb[image + 2u] & 255u);
+}
+
+// Texel `pixel` of `level`: wrapped on the axes that repeat, the edge texel past the edge on the others
+fn p1_level_texel(level: P1ImageLevel, pixel: vec2<i32>, clamps: vec2<bool>) -> vec4<f32> {
+    let wrapped = vec2(wrap_coordinate(pixel.x, level.size.x), wrap_coordinate(pixel.y, level.size.y));
+    let at = select(wrapped, clamp(pixel, vec2(0), level.size - 1), clamps);
+    let first = image_plane_at(level.planes, at);
+    switch level.encoding {
+        case 1u: { return unpack4x8unorm(first); }
+        case 2u: { return vec4(unpack2x16unorm(first), unpack2x16unorm(image_plane_at(level.planes + 3u, at))); }
+        default: {
+            return bitcast<vec4<f32>>(vec4(first, image_plane_at(level.planes + 3u, at), image_plane_at(level.planes + 6u, at), image_plane_at(level.planes + 9u, at)));
+        }
+    }
+}
+
+// floor(t) as texel indices: huge repeating coordinates reduced by the period, stopped ones kept
+// just past the edge, so the integer conversion never overflows
+fn p1_texel_index(t: vec2<f32>, size: vec2<i32>, clamps: vec2<bool>) -> vec2<i32> {
+    let period = vec2<f32>(size);
+    var base = floor(t);
+    base = select(base, base % period, abs(base) >= vec2(2147483520.0) & !clamps);
+    base = select(base, clamp(base, vec2(-1.0), period), clamps);
+    return vec2<i32>(base);
+}
+
+// The texel under `uv` (compose ImageRes::nearest)
+fn p1_nearest(level: P1ImageLevel, uv: vec2<f32>, clamps: vec2<bool>) -> vec4<f32> {
+    return p1_level_texel(level, p1_texel_index(uv * vec2<f32>(level.size), level.size, clamps), clamps);
+}
+
+// Bilinear sample of `level` (compose store.rs `bilinear`)
+fn p1_bilinear(level: P1ImageLevel, uv: vec2<f32>, clamps: vec2<bool>) -> vec4<f32> {
+    let grid = uv * vec2<f32>(level.size) - 0.5;
+    let at = p1_texel_index(grid, level.size, clamps);
+    let f = grid - floor(grid);
+    let a = p1_level_texel(level, at, clamps);
+    let b = p1_level_texel(level, at + vec2(1, 0), clamps);
+    let c = p1_level_texel(level, at + vec2(0, 1), clamps);
+    let d = p1_level_texel(level, at + vec2(1, 1), clamps);
+    let top = a + (b - a) * f.x;
+    let bottom = c + (d - c) * f.x;
+    return top + (bottom - top) * f.y;
+}
+
+// P1 (composite_projection.wgsl): the image at a point the fill already projected, read as its
+// sampling says (compose ImageRes::sample_filtered)
 fn p1_image_at(image: u32, uv: vec2<f32>, layer: Operation) -> vec4<f32> {
-    return material_image_at(image, uv);
+    if !all(abs(uv) <= vec2(3.402823466e38)) {
+        return vec4(0.0);
+    }
+    let level = p1_base_level(image);
+    let clamps = vec2(false);
+    if (layer.ext.y & P1_NEAREST) != 0u {
+        return p1_nearest(level, uv, clamps);
+    }
+    return p1_bilinear(level, uv, clamps);
 }
 
 fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
