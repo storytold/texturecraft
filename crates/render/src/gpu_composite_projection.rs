@@ -229,6 +229,47 @@ mod tests {
         assert_eq!(super::image_use(Sampling::SAVED_BEFORE), ImageUse::Material);
     }
 
+    /// Placed planars and warps get a frame record (P0d), other projections none, and a warp
+    /// fill still composites on the CPU with the same reason until P1 evaluates it.
+    #[test]
+    fn warps_get_a_frame_record_like_placed_planars() {
+        use std::collections::BTreeMap;
+
+        use texturecraft_compose::PixelStore;
+        use texturecraft_core::{Channel, Decal, Fill, Layer, LayerKind, Project, Projection, Source, TextureSet};
+
+        use crate::gpu_composite::{CompositeProgram, register_decal};
+        use crate::gpu_image_source::MaterialImages;
+
+        let frame = Decal {
+            center: [0.1, 0.0, 0.05],
+            normal: [0.0, 1.0, 0.0],
+            up: [0.0, 0.0, 1.0],
+            size: [0.5, 0.7],
+            rotation: 12.0,
+            offset: [0.0; 2],
+            depth: 0.07,
+            symmetry: None,
+            flip: [false; 2],
+        };
+        let fill = |projection: Projection| Fill {
+            sources: BTreeMap::from([(Channel::BaseColor, Source::Image { name: "decal.png".into(), normal_format: Default::default() })]),
+            projection,
+            ..Default::default()
+        };
+        let mut materials = MaterialImages::default();
+        assert_eq!(register_decal(&fill(Projection::default()), &mut materials), Ok(None));
+        assert_eq!(register_decal(&fill(Projection::decal(frame)), &mut materials), Ok(Some(0)));
+        assert_eq!(register_decal(&fill(Projection::warp(frame)), &mut materials), Ok(Some(0)), "the same frame and image share a record");
+
+        let mut project = Project::new("Warp", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, 64));
+        let layer = Layer::new(project.alloc_id(), "Warp", LayerKind::Fill(fill(Projection::warp(frame))), &[Channel::BaseColor]);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let result = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).map(|_| ());
+        assert_eq!(result, Err("A fill source or projection uses CPU compositing."));
+    }
+
     #[test]
     fn fill_sampling_and_projections_still_on_the_cpu_fall_back() {
         for kind in still_on_cpu() {

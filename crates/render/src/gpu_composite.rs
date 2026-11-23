@@ -1260,7 +1260,7 @@ fn compile_mask(
             EffectKind::Fill { source, projection, sampling } => {
                 let mut operation = source_operation(Some(source), projection, *sampling, [0.0; 3], ChannelKind::Scalar, procedural)
                     .ok_or("A mask fill source or projection uses CPU compositing.")?;
-                if let Some(frame) = projection.placed() {
+                if let Some(frame) = projection.frame() {
                     operation.uv[0] = procedural.materials.register_decal(*frame, std::iter::once(source), *sampling) as f32;
                 }
                 operation
@@ -1384,12 +1384,10 @@ fn bind_tile_source(op: &mut Operation, source: Option<&Source>, patterns: &mut 
     }
 }
 
+/// The frame record of a placed planar or warp fill (its first image's alpha also controls the
+/// non-image channels), as `op.uv[0]` of its operations.
 fn register_decal(fill: &texturecraft_core::Fill, materials: &mut MaterialImages) -> Result<Option<u32>, &'static str> {
-    let Some(frame) = fill.projection.placed() else { return Ok(None) };
-    // A decal's image alpha also controls the non-image channels.
-    if !fill_projection::supports_image_sampling(fill.sampling) && fill.sources.values().any(|source| matches!(source, Source::Image { .. })) {
-        return Err("A decal's image filtering uses CPU compositing.");
-    }
+    let Some(frame) = fill.projection.frame() else { return Ok(None) };
     Ok(Some(materials.register_decal(*frame, fill.sources.values(), fill.sampling)))
 }
 
@@ -2277,7 +2275,8 @@ impl GpuCompositor {
                     if op.ids[1] == IMAGE_SOURCE_OPCODE {
                         op.ids[2] = *images.get(op.ids[2] as usize).ok_or("An image source has no binding.")?;
                     }
-                    if op.procedural[3] == DECAL_PROJECTION {
+                    // Placed planars and warps (the first of P1's selectors) read their frame record
+                    if op.procedural[3] == DECAL_PROJECTION || op.procedural[3] == packages::PROJECTION_SELECTORS.start {
                         op.uv[0] = *decals.get(op.uv[0] as usize).ok_or("A decal has no frame.")? as f32;
                     }
                 }
