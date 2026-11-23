@@ -2548,8 +2548,8 @@ pub(crate) mod tests {
         // Changing the gray mid-stroke leaves the stroke's image
         execute(&mut s, "tool.material", &json!({"maskImage": null, "maskValue": 0.0})).unwrap();
         s.end_stroke().unwrap();
-        let (effect, committed) = s.doc.pixels.masks.iter().next().expect("the stroke persists");
-        let previewed = preview.masks.get(effect).unwrap();
+        let (&effect, committed) = s.doc.pixels.masks.iter().next().expect("the stroke persists");
+        let previewed = preview.masks.get(&effect).unwrap();
         let centre = (64, 64);
         for (x, y) in [centre, (52, 60), (70, 75), (64, 50)] {
             assert_eq!(previewed.get(x, y), committed.get(x, y), "texel {x},{y}");
@@ -2560,6 +2560,18 @@ pub(crate) mod tests {
         let image_gray =
             texturecraft_engine::compose::MaskGray::Image { name: image.clone(), image: s.images.get(&image).unwrap().clone() }.at(64, 64, (128, 128));
         assert!((gray - image_gray).abs() < 0.02, "the stroke paints the image's gray {image_gray}, got {gray}");
+
+        // Erasing reads no gray: the eraser takes its usual route with the image still loaded
+        execute(&mut s, "tool.material", &json!({"maskImage": image, "maskValue": 1.0})).unwrap();
+        execute(&mut s, "tool.eraser", &json!({})).unwrap();
+        let image_routes = s.log.iter().filter(|entry| entry.message == "Brush: CPU (mask image)").count();
+        s.brush_device = link.brush_device(&s);
+        s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+        s.end_stroke().unwrap();
+        assert_eq!(s.log.iter().filter(|entry| entry.message == "Brush: CPU (mask image)").count(), image_routes);
+        let erased = s.doc.pixels.masks.get(&effect).unwrap().get(centre.0, centre.1)[1];
+        assert!(erased < coverage, "the eraser removes coverage: {erased} of {coverage}");
+        s.undo().unwrap();
         s.undo().unwrap();
         assert!(s.doc.pixels.masks.is_empty(), "undo restores the mask");
     }

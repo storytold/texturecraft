@@ -368,7 +368,14 @@ fn scalar_filter(op: Operation, x: f32) -> f32 {
             return lerp(op.high.x, op.high.y, t);
         }
         case 21u: { return 1.0 - x; }
-        case 22u: { return select(0.0, 1.0, x >= op.low.x); }
+        case 22u: {
+            // Threshold: ids.z picks at or above, above, below, or at or below the level
+            var passes = x >= op.low.x;
+            if op.ids.z == 1u { passes = x > op.low.x; }
+            if op.ids.z == 2u { passes = x < op.low.x; }
+            if op.ids.z == 3u { passes = x <= op.low.x; }
+            return select(0.0, 1.0, passes);
+        }
         case 23u: { return clamp((x - 0.5) * (1.0 + clamp(op.low.x, -1.0, 1.0)) + 0.5 + op.low.y, 0.0, 1.0); }
         case 24u: {
             let steps = max(floor(clamp(op.low.x, 2.0, 64.0) + 0.5) - 1.0, 1.0);
