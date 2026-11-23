@@ -21,6 +21,10 @@
 //!   the WGSL functions `box_family_filtered`/`box_family_gathered` then compute the texel.
 //!   New entry points go in [`Pipelines`].
 //!
+//! - The Gradient's `input.blur` (with P2): P4 provides the stage (a kind whose output keeps the
+//!   original colour for the opacity mix and carries the blurred gray where P2's gradient reads
+//!   it); P2's `lower` queues it with `ProceduralInputs::precede_with_stage` before the gradient.
+//!
 //! Tables: [`LIBRARY_STILL_ON_CPU`] and `still_on_cpu` in the tests below. Every port gets a CPU
 //! oracle test (`crate::gpu_composite::oracle`, `Tolerance::NEIGHBOURHOOD`) on paint and in a
 //! mask, chained, and with a partial region (the halo); distance filters also compare the raw

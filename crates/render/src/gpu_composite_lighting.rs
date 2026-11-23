@@ -23,6 +23,8 @@
 //!   `lighting_content_effect`/`lighting_mask_effect`. Reading the layer's other channels needs
 //!   the channel accumulator in `compose()` (composite.wgsl), an open hook P6 adds after P3.
 //! - [`needs_surface`] keeps the surface inputs bound for P6 operations.
+//! - [`order_layer_operations`] may move any operation of the layer; the caller then finds the
+//!   Height operation again for the height mask (`height_op`) and writes the constraints.
 //! - Lighting is skipped in masks on both sides (`compile_mask`), keep it so.
 //!
 //! Tables: [`LIBRARY_STILL_ON_CPU`] and `still_on_cpu` in the tests below. Every port gets a CPU
