@@ -349,6 +349,150 @@ mod tests {
         assert!(stages.contains(&(STAGE_SIGNED, 0.0)), "{stages:?}");
     }
 
+    /// Without a wrapping stage the field lies inside the set, so the set bounds a stage that
+    /// does not wrap stays within reach past the whole field; with one, they are the set itself.
+    #[test]
+    fn set_bounds_cover_the_field_unless_the_program_wraps() {
+        let size = (128, 96);
+        for rect in [[0, 0, 128, 96], [32, 16, 64, 48], [96, 64, 32, 32]] {
+            let [x0, y0, x1, y1] = super::super::field_bounds(rect, size);
+            assert!(x0 <= 0 && y0 <= 0 && x1 >= rect[2] as i32 && y1 >= rect[3] as i32, "{rect:?}");
+            assert_eq!([x1 - x0, y1 - y0], [128, 96], "the bounds are the set, {rect:?}");
+        }
+        // A wrapping program's field starts 30 texels before the set's corner
+        let start = (-30i32) as u32;
+        assert_eq!(super::super::field_bounds([start, start, 76, 76], size), [30, 30, 158, 126]);
+    }
+
+    /// A stack whose upper Blur wraps over a lower one that does not (P0e): the wrapping stage
+    /// reads the lower field's periodic copies past the set's edges and the lower stage stays
+    /// inside the set, as the CPU widens lower regions across a crossed edge. Staged before P4:
+    /// the GPU program compiles the stack without wrap and marks the stage, the CPU evaluates
+    /// `wrap: true`. Content on paint near the corner (full and a corner region), and a mask with
+    /// a blurred generator and painting near the edge.
+    #[test]
+    fn a_wrapping_stage_over_a_lower_stage_matches_the_cpu_at_the_corner() {
+        use std::sync::Arc;
+
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
+        use texturecraft_compose::{BakedMaps, DisplayKind, ImageRes, ImageStore, tile_bytes};
+        use texturecraft_core::{BakedMap, Effect, Generator, GeneratorKind};
+        use texturecraft_geom::{UvGBuffer, primitives};
+        use texturecraft_texel::{TILE, TileImage, to_u16};
+
+        use crate::gpu_composite::CompositeRegion;
+        use crate::gpu_composite::oracle::headless;
+        use crate::readback::Readback;
+
+        let Some(mut gpu) = headless() else { return };
+        const SIZE: u32 = 128;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let baked = BakedMaps::default();
+        let images = ImageStore::from([("AO override".into(), Arc::new(ImageRes::new(2, 2, vec![[0.15; 4], [0.7; 4], [0.85; 4], [0.3; 4]], false)))]);
+        let build = |wrap: bool| {
+            let mut project = Project::new("Wrapped dependency", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+            let owner = project.alloc_id();
+            let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+            layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false })));
+            layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 160.0, wrap })));
+            let mut mask = Mask::new(MaskBackground::Black);
+            let mask_paint = project.alloc_id();
+            mask.effects.push(Effect::new(mask_paint, EffectKind::Paint));
+            let mut generator = Generator::new(GeneratorKind::Dirt);
+            generator.noise_amount = 0.0;
+            generator.global.blur = 0.85;
+            generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("AO override"));
+            let mut ramp = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
+            ramp.blend = BlendMode::LinearDodge;
+            ramp.opacity = 0.6;
+            mask.effects.push(ramp);
+            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 160.0, wrap })));
+            layer.mask = Some(mask);
+            project.insert_layer(0, layer, None, false).unwrap();
+            (project, owner, mask_paint)
+        };
+        let (cpu_project, owner, mask_paint) = build(true);
+        let (gpu_project, _, _) = build(false);
+        let mut pixels = PixelStore::default();
+        let paint = pixels.layer_mut(owner, Channel::BaseColor, (SIZE, SIZE));
+        let mut mask_pixels = TileImage::new(SIZE, SIZE, 2);
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                // Shapes against the left and top edges and in the far corner
+                let near_edge = (x < 9 && (20..70).contains(&y)) || (y < 7 && (30..90).contains(&x)) || (x > 116 && y > 112);
+                if near_edge {
+                    paint.set(x, y, &[to_u16(0.8), to_u16(0.25), to_u16(0.4), u16::MAX]);
+                    mask_pixels.set(x, y, &[to_u16(0.9), u16::MAX]);
+                }
+            }
+        }
+        pixels.masks.insert(mask_paint, mask_pixels);
+
+        let inputs = Inputs {
+            project: &cpu_project,
+            ts: 0,
+            mesh: &mesh,
+            gbuf: &gbuf,
+            pixels: &pixels,
+            baked: &baked,
+            block_scales: cpu_project.texture_sets[0].block_scales(),
+            preview: None,
+            images: &images,
+            bounds: mesh.bounds(),
+        };
+        // The stages of the 160 blur wrap; the generator's blur and the 24 blur do not
+        let wide = crate::gpu_neighbourhood::NeighbourhoodFilter::new(&Filter::Blur { radius: 160.0, wrap: false }, SIZE, SIZE, 1.0, None).unwrap().radius;
+        let mark = |program: &mut CompositeProgram| {
+            for stage in &mut program.filters.stages {
+                // Resolution cells do not read signed origins yet (brief section 1.2)
+                assert_eq!(stage.cell, 1);
+                stage.wrap = stage.filter.is_some_and(|filter| filter.radius == wide) && stage.preceding & super::super::GENERATOR_STAGE == 0;
+            }
+            assert!(program.filters.wraps());
+        };
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+
+        let tiles: Vec<_> = (0..SIZE / TILE).flat_map(|y| (0..SIZE / TILE).map(move |x| (x, y))).collect();
+        let mut oracle = Composite::new(&[Channel::BaseColor], SIZE);
+        composite_tiles(&inputs, &mut oracle, &tiles);
+        let mut program = CompositeProgram::try_compile_region(&gpu_project, &pixels, 0, None).unwrap();
+        mark(&mut program);
+        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        program.set_tile_images(&images);
+        let read = |gpu: &crate::headless::Headless| {
+            let texture = gpu.renderer.display_textures()[0][DisplayKind::BaseColor as usize];
+            Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap().2
+        };
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        let full = read(&gpu);
+        for &(tx, ty) in &tiles {
+            let expected = tile_bytes(&oracle, &baked, DisplayKind::BaseColor, tx, ty);
+            for (y, row) in expected.as_chunks::<{ TILE as usize * 4 }>().0.iter().enumerate() {
+                let start = ((ty * TILE + y as u32) * SIZE + tx * TILE) as usize * 4;
+                for (x, (gpu, cpu)) in full[start..start + row.len()].as_chunks::<4>().0.iter().zip(row.as_chunks::<4>().0).enumerate() {
+                    let largest = gpu.iter().zip(cpu).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+                    assert!(largest <= 2, "material ({}, {}): GPU {gpu:?}, CPU {cpu:?}", tx * TILE + x as u32, ty * TILE + y as u32);
+                }
+            }
+        }
+        program.region = Some(CompositeRegion { min: [0, 0], max: [16, 16] });
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        assert!(read(&gpu).iter().zip(&full).all(|(a, b)| a.abs_diff(*b) <= 1), "the corner region changed the result");
+
+        let expected = mask_image(&inputs, owner, SIZE).unwrap();
+        let mut mask = CompositeProgram::try_compile_mask_preview(&gpu_project, &pixels, 0, owner, None, None).unwrap();
+        mark(&mut mask);
+        mask.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        mask.set_tile_images(&images);
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &mask).unwrap();
+        let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.aux_texture(0).unwrap()).unwrap();
+        for (index, (&expected, pixel)) in expected.iter().zip(actual.as_chunks::<4>().0).enumerate() {
+            assert!(pixel[0].abs_diff(expected) <= 2, "mask texel {index}: {} instead of {expected}", pixel[0]);
+        }
+    }
+
     #[test]
     fn package_opcode_blocks_are_disjoint_and_inside_the_extended_range() {
         let blocks = [POINT_OPCODES, STACK_OPCODES, LIGHTING_OPCODES];

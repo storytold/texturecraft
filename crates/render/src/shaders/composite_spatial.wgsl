@@ -11,8 +11,16 @@ fn field_origin() -> vec2<i32> {
     return bitcast<vec2<i32>>(params.filter_region.xy);
 }
 
+// The field texel a periodic prepare pass writes (u32 max otherwise): there every field read
+// (lower stages, anchors, generator ramps) takes the same copy of the set, not the pixel's
+// position inside the set.
+var<private> periodic_local: vec2<u32> = vec2(0xffffffffu);
+
 // The texel of a field at source pixel `pixel`, or None (u32 max) outside the field.
 fn field_local(pixel: vec2<u32>) -> vec2<u32> {
+    if periodic_local.x != 0xffffffffu {
+        return periodic_local;
+    }
     let local = vec2<i32>(pixel) - field_origin();
     if any(local < vec2(0)) || any(local >= vec2<i32>(params.filter_region.zw)) {
         return vec2(0xffffffffu);
@@ -59,14 +67,16 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let local = params.filter_chunk.xy + id.xy;
-    // A field can start below zero; a wrapping stage (field_layout.w bit 0) reads the set
-    // periodically there, any other stage reads empty texels outside the set.
+    // A field can start below zero. In a wrapping program (field_layout.w bit 0) every stage's
+    // field holds periodic copies of the set there, and reads the lower fields at the same copy;
+    // otherwise the field lies inside the set.
     let position = field_origin() + vec2<i32>(local);
     var pixel = vec2<u32>(max(position, vec2(0)));
     var covered = all(position >= vec2(0)) && all(pixel < params.source.xy);
     if (params.field_layout.w & 1u) != 0u {
         pixel = vec2<u32>(vec2(wrap_coordinate(position.x, i32(params.source.x)), wrap_coordinate(position.y, i32(params.source.y))));
         covered = true;
+        periodic_local = local;
     }
     var prepared = vec4(0.0);
     var geometric_weight = 0.0;

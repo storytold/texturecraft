@@ -10,8 +10,12 @@ struct Params {
     // the GPU port packages (NeighbourhoodFilter::words).
     field_layout: vec4<u32>,
     extra: array<vec4<f32>, 2>, // The packages' parameters (NeighbourhoodFilter::extra).
-    // What the stage filters (stage_context), then reserved.
+    // What the stage filters (stage_context), whether it wraps (bit 0), reserved.
     stage: vec4<u32>,
+    // The set in field-local texels [x0, y0, x1, y1] (NeighbourhoodRegion::bounds). In a wrapping
+    // program the field holds periodic copies past the set's edges; a stage that does not wrap
+    // never reads across these bounds, as the CPU's region stops at the set's edge.
+    bounds: vec4<i32>,
 }
 
 struct Texel {
@@ -47,6 +51,18 @@ const STAGE_NORMAL_MAP: u32 = 4u;
 fn stage_context() -> u32 {
     return params.stage.x;
 }
+
+fn stage_wraps() -> bool {
+    return (params.stage.y & 1u) != 0u;
+}
+
+// Which copy of the set a field-local texel lies in, per axis: -1 before, 0 in, 1 past the set.
+fn copy_of(point: vec2<i32>) -> vec2<i32> {
+    return select(select(vec2(0), vec2(1), point >= params.bounds.zw), vec2(-1), point < params.bounds.xy);
+}
+
+// The copy of the set the texel being written lies in (apply_neighbourhood).
+var<private> output_copy: vec2<i32> = vec2(0);
 
 // The field's origin in source texels. It can lie below zero (a wrapping stage's field: the
 // prepare pass then fills it periodically), so read it signed.
@@ -115,22 +131,17 @@ fn add_box_sample(acc: BoxSum, texel: Texel, weight: f32) -> BoxSum {
     return BoxSum(sum, Texel((sum.value - acc.sum.value) - rgb, (sum.coverage - acc.sum.coverage) - coverage), nonzero, covered);
 }
 
-// One running window per line. Its initial sum visits at most the length of
-// the line, and every subsequent pixel adds and removes at most one sample.
-@compute @workgroup_size(64)
-fn box_blur(@builtin(global_invocation_id) id: vec3<u32>) {
-    let vertical = params.buffers.w != 0u;
-    let size = select(params.rect.zw, params.rect.wz, vertical);
-    let line = id.x;
-    if line >= size.y { return; }
+// One running window per line segment [start, end). Its initial sum visits at most the length
+// of the segment, and every subsequent pixel adds and removes at most one sample.
+fn box_segment(line: u32, vertical: bool, start: u32, end: u32) {
     let radius = params.mode.x;
     let reciprocal = 1.0 / f32(radius * 2u + 1u);
     var acc = BoxSum(EMPTY, EMPTY, vec4(0), 0);
-    for (var index = 0u; index < min(radius + 1u, size.x); index++) {
+    for (var index = start; index < min(start + radius + 1u, end); index++) {
         let point = vec2(index, line);
         acc = add_box_sample(acc, box_sample(select(point, point.yx, vertical)), 1.0);
     }
-    for (var index = 0u; index < size.x; index++) {
+    for (var index = start; index < end; index++) {
         let point = vec2(index, line);
         // Preserve exact zeros outside the filter footprint. A residual in alpha
         // would make sparse Replace blend an otherwise empty texel.
@@ -138,15 +149,35 @@ fn box_blur(@builtin(global_invocation_id) id: vec3<u32>) {
         let coverage = select(0.0, round_fixed(vec4(max(acc.sum.coverage, 0.0) * reciprocal * FIX)).x / FIX, acc.covered > 0);
         write_at(params.buffers.z, select(point, point.yx, vertical), Texel(value, coverage));
         let next = index + radius + 1u;
-        if next < size.x {
+        if next < end {
             let added = vec2(next, line);
             acc = add_box_sample(acc, box_sample(select(added, added.yx, vertical)), 1.0);
         }
-        if index >= radius {
+        if index >= start + radius {
             let previous = vec2(index - radius, line);
             acc = add_box_sample(acc, box_sample(select(previous, previous.yx, vertical)), -1.0);
         }
     }
+}
+
+// A stage that does not wrap sums each copy of the set apart (the field lies inside the set
+// unless the program wraps, so this is one segment then).
+@compute @workgroup_size(64)
+fn box_blur(@builtin(global_invocation_id) id: vec3<u32>) {
+    let vertical = params.buffers.w != 0u;
+    let size = select(params.rect.zw, params.rect.wz, vertical);
+    let line = id.x;
+    if line >= size.y { return; }
+    if stage_wraps() {
+        box_segment(line, vertical, 0u, size.x);
+        return;
+    }
+    let length = i32(size.x);
+    let first = u32(clamp(select(params.bounds.x, params.bounds.y, vertical), 0, length));
+    let last = u32(clamp(select(params.bounds.z, params.bounds.w, vertical), 0, length));
+    box_segment(line, vertical, 0u, first);
+    box_segment(line, vertical, first, last);
+    box_segment(line, vertical, last, size.x);
 }
 
 fn filtered_box(original: vec4<f32>, blurred: vec4<f32>) -> vec4<f32> {
@@ -171,6 +202,8 @@ fn filtered_box(original: vec4<f32>, blurred: vec4<f32>) -> vec4<f32> {
 
 fn add_weighted(acc: Texel, point: vec2<i32>, weight: f32) -> Texel {
     if weight <= 0.0 || any(point < vec2(0)) || any(point >= vec2<i32>(params.rect.zw)) { return acc; }
+    // A stage that does not wrap reads nothing across the set's edges
+    if !stage_wraps() && any(copy_of(point) != output_copy) { return acc; }
     let texel = original_at(vec2<u32>(point));
     return Texel(acc.value + texel.value * weight, acc.coverage + texel.coverage * weight);
 }
@@ -260,6 +293,7 @@ fn apply_neighbourhood(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(point >= params.rect.zw) { return; }
     let original = original_at(point);
     var filtered = original.value;
+    output_copy = copy_of(vec2<i32>(point));
     if original.coverage > 0.0 {
         if uses_box_kind(params.mode.y) {
             let blurred = read_at(params.buffers.y, point);
