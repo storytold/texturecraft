@@ -59,9 +59,18 @@ fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> {
     return rgb;
 }
 
+// P1 (composite_projection.wgsl): the image at a point the fill already projected, as its
+// sampling reads it
+fn p1_image_at(image: u32, uv: vec2<f32>, layer: Operation) -> vec4<f32> {
+    return material_image_at(image, uv);
+}
+
 fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
     let image = layer.ids.z;
     let mode = layer.procedural.w;
+    if mode == P1_POINT_PROJECTION {
+        return p1_image_at(image, uv, layer);
+    }
     let p = surface.position * layer.projection.w + layer.projection.xyz;
     if mode == 1u {
         let w = triplanar_weights(surface.normal, layer.balance.w);
@@ -146,7 +155,11 @@ fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> ve
     if layer.ids.z == MISSING_IMAGE {
         return vec3(0.5);
     }
-    return decode_image_sample(layer, image_projection(layer, uv, surface).rgb);
+    let sampled = image_projection(layer, uv, surface);
+    if layer.ids.w == P1_ALPHA_KIND {
+        return vec3(sampled.a);
+    }
+    return decode_image_sample(layer, sampled.rgb);
 }
 
 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {

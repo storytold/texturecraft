@@ -1,8 +1,13 @@
 //! P1, fill sampling and projection (plan section 2.1). Owned by the P1 agent; no other package
 //! edits this file or `shaders/composite_projection.wgsl`.
 //!
-//! What P1 implements here, until [`supports`] accepts every projection and sampling the CPU has
-//! and [`supports_image_sampling`] accepts every filtering:
+//! The compositor's built-in paths evaluate the fills they always did (`built_in`). Every other
+//! fill takes P1's path: [`place_cover`] writes the whole projection into the side table
+//! (`SLOT_*`, offset in `ext[0]`) and its flags into `ext[1]` (`FLAG_*`), and
+//! `projection_fill_value` in the WGSL file ports the CPU evaluator's fill texel from them.
+//! `still_on_cpu` lists the settings that path does not evaluate yet.
+//!
+//! What P1 implements here:
 //! - image filtering Bilinear HQ (the default: a mip chain per material image and a footprint
 //!   from the UV derivatives) and Nearest;
 //! - UV wrap other than Repeat, fill symmetry (copies), `UvTransform` and projector rotation and
@@ -11,21 +16,18 @@
 //! - procedural coordinates beyond ±32768 (only after the parity study, plan risk 2).
 //!
 //! How:
-//! - [`place_image`] and [`place_procedural`] fill the operation's projection words. New
-//!   projections take a selector from `packages::PROJECTION_SELECTORS` (16..32) in
-//!   `procedural[3]`, flags in `Operation::ext[1]` (any bit set routes the fill through
-//!   `projection_fill_value` in the WGSL file) and further numbers in the side table
-//!   (`ProceduralInputs::pack_params`, offset in `ext[0]`).
+//! - [`place_image`] and [`place_procedural`] fill the operation's projection words for the
+//!   built-in paths. New projections take a selector from `packages::PROJECTION_SELECTORS`
+//!   (16..32) in `procedural[3]`.
 //! - P1 also owns `gpu_image_source.rs` (`MaterialImages`, mip chains, filtering, wrap) and
 //!   `shaders/material_image.wgsl`. `MaterialImages::register_image(name, ImageUse)` is the frozen
 //!   API P3 and P7 call: add image kinds as `ImageUse` variants, never change the signature.
-//! - Hooks P0b added (stubs return today's result):
+//! - Hooks P0b added:
 //!   - [`place_image`], [`place_procedural`] and [`place_cover`] get the fill's `sampling` and
 //!     `&mut ProceduralInputs`; `place_cover` runs after every source kind (uniform and anchor
 //!     too), since the CPU's coverage applies to all of them.
 //!   - [`image_use`] picks the `ImageUse` that `source_operation` registers an image source with.
-//!   - `MaterialImages::register_decal(frame, sources, sampling)` gets the fill's sampling (the
-//!     decal path's Nearest and Bilinear HQ come in their own commit of the P1 series).
+//!   - `MaterialImages::register_decal(frame, sources, sampling)` gets the fill's sampling.
 //!   - Mip chains: `MaterialImages::atlas_images` returns an `AtlasMips` per colour image
 //!     (`ImageRes::mip_chain`, or `linear_mip_chain` for an sRGB colour read); the atlas uploads
 //!     the levels and `append_rgba` sets flag bit 9 and appends the level origins.
@@ -41,55 +43,111 @@
 //! below. Every port gets a CPU oracle test (`crate::gpu_composite::oracle`) per context (colour,
 //! other channel, mask), per setting value, with opacity below 1 and a non-Normal blend.
 
-use texturecraft_core::{Backface, Filtering, Projection, Projector, Sampling, ShapeCrop};
+use texturecraft_compose::frame_placement::warp_reach;
+use texturecraft_compose::pattern::{cylinder_axis_index, decal_axes, projector_stretch};
+use texturecraft_core::{
+    Backface, ChannelKind, Decal, DecalFlip, FULL_TURN_DEGREES, FillSymmetry, Filtering, Projection, Projector, Sampling, ShapeCrop, SymmetryKind, UvTransform,
+};
+use texturecraft_geom::glam::{EulerRot, Mat3};
 
 use super::packages::PROJECTION_SELECTORS;
 use super::{CompositeProgram, Operation, ProceduralInputs, UV_TILE_PROJECTION};
-use crate::gpu_image_source::{DECAL_PROJECTION, ImageUse};
+use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, ImageUse};
 
 /// Library filter ids P1 still leaves on the CPU (see `gpu_composite_packages.rs`).
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
-pub(super) const WGSL: &str = include_str!("shaders/composite_projection.wgsl");
-/// The same functions without P1's code, for programs that do not use it.
-pub(super) const WGSL_STUB: &str =
-    "fn projection_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(value(layer, uv, surface), 1.0); }";
+pub(super) const WGSL: &str = concat!(include_str!("shaders/composite_projection_shared.wgsl"), include_str!("shaders/composite_projection.wgsl"));
+/// The same functions without P1's code, for programs that do not use it. The shared constants
+/// stay: material_image.wgsl and composite_patterns.wgsl read them.
+pub(super) const WGSL_STUB: &str = concat!(
+    include_str!("shaders/composite_projection_shared.wgsl"),
+    "fn projection_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(value(layer, uv, surface), 1.0); }"
+);
 
-/// Whether the GPU encodes `projection` with `sampling` as the CPU evaluates it.
-pub(super) fn supports(projection: &Projection, sampling: Sampling) -> bool {
-    // Keep the CPU result for projection features the compositor does not encode yet.
-    if sampling.wrap.repeats() != (true, true) || (sampling.symmetry.on && projection.takes_symmetry()) {
-        return false;
-    }
-    match projection {
-        Projection::Uv { .. } | Projection::UvTile => true,
-        Projection::Triplanar { uv, projector, .. } | Projection::Spherical { uv, projector, .. } => uv.is_default() && projector.is_default(),
-        Projection::Planar { uv, projector, placed, .. } => {
-            let expected = if placed.is_some() {
-                Projector { crop: ShapeCrop::Cropped, backface: Backface { on: true, ..Backface::default() }, ..Projector::default() }
-            } else {
-                Projector::default()
-            };
-            uv.is_default() && *projector == expected
-        }
-        Projection::Cylindrical { uv, projector, angle, .. } => uv.is_default() && projector.is_default() && *angle == texturecraft_core::FULL_TURN_DEGREES,
-        Projection::Warp { .. } => false,
-    }
-}
+/// `procedural[3]` of a warp projection
+const WARP_PROJECTION: u32 = PROJECTION_SELECTORS.start;
+
+// `Operation::ext[1]` of a fill on P1's path (the P1_* constants of the WGSL files)
+const FLAG_ROUTED: u32 = 1 << 0;
+const FLAG_NEAREST: u32 = 1 << 1;
+const FLAG_HQ: u32 = 1 << 2;
+const FLAG_CLAMP_U: u32 = 1 << 3;
+const FLAG_CLAMP_V: u32 = 1 << 4;
+const FLAG_TILE_COVER: u32 = 1 << 5;
+const FLAG_TURNS: u32 = 1 << 6;
+const FLAG_CROP: u32 = 1 << 7;
+const FLAG_BACKFACE: u32 = 1 << 8;
+const FLAG_SYMMETRY: u32 = 1 << 9;
+const FLAG_DEPTH: u32 = 1 << 10;
+const FLAG_FRAMED: u32 = 1 << 11;
+const FLAG_IMAGE_ALPHA: u32 = 1 << 12;
+const FLAG_FRAME_VALID: u32 = 1 << 13;
+const FLAG_UV_PLACED: u32 = 1 << 14;
+
+// Side-table words of a fill on P1's path, from `ext[0]` (the P1_* slots of composite_projection.wgsl)
+const SLOT_KIND: usize = 0;
+const SLOT_AXIS: usize = 1;
+const SLOT_SCALE: usize = 2;
+const SLOT_SHARPNESS: usize = 4;
+const SLOT_OFFSET: usize = 5;
+const SLOT_ROTATION: usize = 8;
+const SLOT_TO_LOCAL: usize = 10;
+const SLOT_STRETCH: usize = 19;
+const SLOT_UV_TILING: usize = 22;
+const SLOT_UV_ROTATION: usize = 24;
+const SLOT_UV_OFFSET: usize = 26;
+const SLOT_CYLINDER_ANGLE: usize = 28;
+const SLOT_BACKFACE_THRESHOLD: usize = 29;
+const SLOT_BACKFACE_WIDTH: usize = 30;
+const SLOT_FRAME_ORIGIN: usize = 31;
+const SLOT_FRAME_RIGHT: usize = 34;
+const SLOT_FRAME_UP: usize = 37;
+const SLOT_FRAME_NORMAL: usize = 40;
+const SLOT_FRAME_SIZE: usize = 43;
+const SLOT_FRAME_DEPTH: usize = 45;
+const SLOT_FRAME_FLIP: usize = 46;
+const SLOT_FRAME_MIRROR_AXIS: usize = 47;
+const SLOT_FRAME_MIRROR_OFFSET: usize = 48;
+const SLOT_FRAME_MIRROR_FLIP: usize = 49;
+const SLOT_WARP_CORNERS: usize = 50;
+const SLOT_SYMMETRY_KIND: usize = 58;
+const SLOT_SYMMETRY_AXIS: usize = 59;
+const SLOT_SYMMETRY_COUNT: usize = 60;
+const SLOT_SYMMETRY_POSITION: usize = 61;
+const SLOT_SYMMETRY_STEP: usize = 64;
+const SLOT_SYMMETRY_SPAN: usize = 65;
+const SLOT_SYMMETRY_FLIP: usize = 66;
+const SLOT_DEPTH_HARDNESS: usize = 67;
+const SLOT_WORDS: usize = 69;
+
+// Projection kinds in `SLOT_KIND`
+const KIND_UV: u32 = 0;
+const KIND_UV_TILE: u32 = 1;
+const KIND_TRIPLANAR: u32 = 2;
+const KIND_PLANAR: u32 = 3;
+const KIND_SPHERICAL: u32 = 4;
+const KIND_CYLINDRICAL: u32 = 5;
+const KIND_PLACED: u32 = 6;
+const KIND_WARP: u32 = 7;
+
+/// The turn (in cosine) over which backface culling fades at hardness 0, as compose's `projector_cover`
+const BACKFACE_FADE: f32 = 0.6;
+/// Smallest frame side or depth in world units, as compose's `pattern` keeps them
+const MIN_FRAME_EXTENT: f32 = 1e-6;
 
 /// Whether the GPU samples image sources (fills and decals) with this filtering as the CPU does.
 pub(super) fn supports_image_sampling(sampling: Sampling) -> bool {
     sampling.filtering == Filtering::BilinearSharp
 }
 
-/// How an image source with `sampling` registers its image (`MaterialImages::register_image`;
-/// P1: the kind that makes the atlas hold its mip chain for Bilinear HQ, or a nearest read).
-pub(super) fn image_use(_sampling: Sampling) -> ImageUse {
+/// How an image source read as a `channel` with `sampling` registers its image
+/// (`MaterialImages::register_image`).
+pub(super) fn image_use(_sampling: Sampling, _channel: ChannelKind) -> ImageUse {
     ImageUse::Material
 }
 
-/// The projection words of an image source operation. None for a projection it cannot encode.
-/// `sampling` and the side table (`inputs.pack_params`) are there for P1's settings.
+/// The projection words of an image source operation for the built-in paths.
 pub(super) fn place_image(projection: &Projection, _sampling: Sampling, op: &mut Operation, _inputs: &mut ProceduralInputs) -> Option<()> {
     match projection {
         Projection::Uv { scale, rotation, offset } => {
@@ -103,7 +161,8 @@ pub(super) fn place_image(projection: &Projection, _sampling: Sampling, op: &mut
             op.procedural[3] = 1;
             op.balance[3] = sharpness.max(1.0);
         }
-        Projection::Planar { placed: Some(_), .. } => {}
+        // Framed projections read everything from P1's side table
+        Projection::Planar { placed: Some(_), .. } | Projection::Warp { .. } => {}
         Projection::Planar { scale, axis, offset, .. } => {
             op.projection = [offset[0], offset[1], offset[2], *scale];
             op.procedural[3] = 2 + u32::from((*axis).min(2));
@@ -120,13 +179,12 @@ pub(super) fn place_image(projection: &Projection, _sampling: Sampling, op: &mut
                 _ => 7,
             };
         }
-        Projection::Warp { .. } => return None,
     }
     Some(())
 }
 
 /// The projection words of a procedural source operation, whose scale is already in `op.uv[2]`.
-/// None for a projection it cannot encode, or coordinates beyond the guarded f32 range.
+/// None for coordinates beyond the guarded f32 range.
 pub(super) fn place_procedural(projection: &Projection, _sampling: Sampling, op: &mut Operation, _inputs: &mut ProceduralInputs) -> Option<()> {
     match projection {
         Projection::Uv { scale, rotation, offset } => {
@@ -138,7 +196,7 @@ pub(super) fn place_procedural(projection: &Projection, _sampling: Sampling, op:
             }
         }
         Projection::UvTile => op.procedural[3] = UV_TILE_PROJECTION,
-        Projection::Planar { placed: Some(_), .. } => {}
+        Projection::Planar { placed: Some(_), .. } | Projection::Warp { .. } => {}
         Projection::Triplanar { scale, offset, .. } | Projection::Planar { scale, offset, .. } => {
             let frequency = *scale * op.uv[2];
             if offset.iter().any(|o| frequency.abs() + o.abs() > 32_768.0) {
@@ -165,19 +223,274 @@ pub(super) fn place_procedural(projection: &Projection, _sampling: Sampling, op:
                 _ => 5,
             };
         }
-        Projection::Warp { .. } => return None,
     }
     Some(())
 }
 
-/// The coverage words of every source operation (uniform, anchor, image and procedural alike),
-/// after the source kind's own words: the CPU's coverage (wrap `tile_cover`, shape crop,
-/// backface, depth culling, decal frames) applies to every kind. Today: a placed (decal)
-/// projection reads its frame from `op.uv[0]` (`register_decal`).
-pub(super) fn place_cover(projection: &Projection, _sampling: Sampling, op: &mut Operation, _inputs: &mut ProceduralInputs) {
+/// The coverage of every source operation (uniform, anchor, image and procedural alike), after
+/// the source kind's own words: a fill the built-in paths evaluate keeps them, any other takes
+/// P1's path. None for a fill that stays on the CPU.
+pub(super) fn place_cover(projection: &Projection, sampling: Sampling, op: &mut Operation, inputs: &mut ProceduralInputs) -> Option<()> {
+    // A placed (decal) projection reads its frame from `op.uv[0]` (`register_decal`)
     if projection.placed().is_some() {
         op.procedural[3] = DECAL_PROJECTION;
     }
+    if built_in(projection, sampling, op) {
+        return Some(());
+    }
+    if still_on_cpu(projection, sampling) {
+        return None;
+    }
+
+    let mut flags = FLAG_ROUTED;
+    let words = side_table(projection, sampling, &mut flags)?;
+    op.ext[0] = inputs.pack_words(&words)?;
+    op.ext[1] = flags;
+    op.procedural[3] = selector(projection);
+    Some(())
+}
+
+/// The projector of a decal the built-in decal path evaluates.
+fn decal_projector() -> Projector {
+    Projector { crop: ShapeCrop::Cropped, backface: Backface { on: true, ..Backface::default() }, ..Projector::default() }
+}
+
+/// Whether the compositor's built-in paths evaluate `op` through `projection` with `sampling` as
+/// the CPU does, so it needs nothing from P1.
+fn built_in(projection: &Projection, sampling: Sampling, op: &Operation) -> bool {
+    // Filtering changes only what an image source reads
+    let filtering = sampling.filtering == Filtering::BilinearSharp || op.ids[1] != IMAGE_SOURCE_OPCODE;
+    if sampling.wrap.repeats() != (true, true) || (sampling.symmetry.on && projection.takes_symmetry()) {
+        return false;
+    }
+    match projection {
+        Projection::Uv { .. } | Projection::UvTile => filtering,
+        Projection::Triplanar { uv, projector, .. } | Projection::Spherical { uv, projector, .. } => filtering && uv.is_default() && projector.is_default(),
+        Projection::Planar { uv, projector, placed: Some(_), .. } => filtering && uv.is_default() && *projector == decal_projector(),
+        Projection::Planar { uv, projector, .. } => filtering && uv.is_default() && projector.is_default(),
+        Projection::Cylindrical { uv, projector, angle, .. } => filtering && uv.is_default() && projector.is_default() && *angle == FULL_TURN_DEGREES,
+        Projection::Warp { .. } => false,
+    }
+}
+
+/// The settings P1's path does not evaluate yet: those fills stay on the CPU.
+fn still_on_cpu(_projection: &Projection, _sampling: Sampling) -> bool {
+    true
+}
+
+/// The `procedural[3]` selector of a fill on P1's path, so the program binds the surface its
+/// projection reads.
+fn selector(projection: &Projection) -> u32 {
+    match projection {
+        Projection::Uv { .. } => 0,
+        Projection::UvTile => UV_TILE_PROJECTION,
+        Projection::Triplanar { .. } => 1,
+        Projection::Planar { placed: Some(_), .. } => DECAL_PROJECTION,
+        Projection::Planar { axis, .. } => 2 + u32::from((*axis).min(2)),
+        Projection::Spherical { .. } => 5,
+        Projection::Cylindrical { axis: 0, .. } => 6,
+        Projection::Cylindrical { axis: 2, .. } => 8,
+        Projection::Cylindrical { .. } => 7,
+        Projection::Warp { .. } => WARP_PROJECTION,
+    }
+}
+
+fn projector_of(projection: &Projection) -> Option<&Projector> {
+    match projection {
+        Projection::Uv { .. } | Projection::UvTile => None,
+        Projection::Triplanar { projector, .. }
+        | Projection::Planar { projector, .. }
+        | Projection::Spherical { projector, .. }
+        | Projection::Cylindrical { projector, .. }
+        | Projection::Warp { projector, .. } => Some(projector),
+    }
+}
+
+fn uv_transform_of(projection: &Projection) -> Option<&UvTransform> {
+    match projection {
+        Projection::Uv { .. } | Projection::UvTile => None,
+        Projection::Triplanar { uv, .. }
+        | Projection::Planar { uv, .. }
+        | Projection::Spherical { uv, .. }
+        | Projection::Cylindrical { uv, .. }
+        | Projection::Warp { uv, .. } => Some(uv),
+    }
+}
+
+/// Write finite `values` from word `slot` on; None for a value that is not finite.
+fn put(words: &mut [u32; SLOT_WORDS], slot: usize, values: &[f32]) -> Option<()> {
+    if !values.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    for (word, value) in words[slot..slot + values.len()].iter_mut().zip(values) {
+        *word = value.to_bits();
+    }
+    Some(())
+}
+
+/// The side-table words of a fill on P1's path, its flags added to `flags`. None for a setting
+/// that is not finite.
+fn side_table(projection: &Projection, sampling: Sampling, flags: &mut u32) -> Option<[u32; SLOT_WORDS]> {
+    let mut words = [0; SLOT_WORDS];
+    *flags |= match sampling.filtering {
+        Filtering::Nearest => FLAG_NEAREST,
+        Filtering::BilinearHq => FLAG_HQ,
+        Filtering::BilinearSharp => 0,
+    };
+    let (across, down) = sampling.wrap.repeats();
+    if !across {
+        *flags |= FLAG_CLAMP_U;
+    }
+    if !down {
+        *flags |= FLAG_CLAMP_V;
+    }
+
+    // Tri-planar never ends, so only the other projections leave their tile
+    if !(across && down) && !matches!(projection, Projection::Triplanar { .. }) {
+        *flags |= FLAG_TILE_COVER;
+    }
+
+    match projection {
+        Projection::Uv { scale, rotation, offset } => {
+            words[SLOT_KIND] = KIND_UV;
+            let (sin, cos) = rotation.to_radians().sin_cos();
+            put(&mut words, SLOT_SCALE, scale)?;
+            put(&mut words, SLOT_ROTATION, &[sin, cos])?;
+            put(&mut words, SLOT_OFFSET, &[offset[0], offset[1], 0.0])?;
+        }
+        Projection::UvTile => words[SLOT_KIND] = KIND_UV_TILE,
+        Projection::Triplanar { scale, sharpness, offset, .. } => {
+            words[SLOT_KIND] = KIND_TRIPLANAR;
+            put(&mut words, SLOT_SCALE, &[*scale; 2])?;
+            put(&mut words, SLOT_SHARPNESS, &[sharpness.max(1.0)])?;
+            put(&mut words, SLOT_OFFSET, offset)?;
+        }
+        Projection::Planar { placed: Some(frame), .. } => {
+            words[SLOT_KIND] = KIND_PLACED;
+            put_frame(&mut words, frame, frame.depth, flags)?;
+            if let Some(symmetry) = frame.symmetry {
+                words[SLOT_FRAME_MIRROR_AXIS] = u32::from(symmetry.axis.min(2)) + 1;
+                words[SLOT_FRAME_MIRROR_FLIP] = match symmetry.flip {
+                    DecalFlip::None => 0,
+                    DecalFlip::U => 1,
+                    DecalFlip::V => 2,
+                };
+                put(&mut words, SLOT_FRAME_MIRROR_OFFSET, &[symmetry.offset])?;
+            }
+        }
+        Projection::Planar { scale, axis, offset, .. } => {
+            words[SLOT_KIND] = KIND_PLANAR;
+            words[SLOT_AXIS] = u32::from((*axis).min(2));
+            put(&mut words, SLOT_SCALE, &[*scale; 2])?;
+            put(&mut words, SLOT_OFFSET, offset)?;
+        }
+        Projection::Spherical { scale, offset, .. } => {
+            words[SLOT_KIND] = KIND_SPHERICAL;
+            put(&mut words, SLOT_SCALE, &[*scale; 2])?;
+            put(&mut words, SLOT_OFFSET, offset)?;
+        }
+        Projection::Cylindrical { scale, axis, offset, angle, .. } => {
+            words[SLOT_KIND] = KIND_CYLINDRICAL;
+            words[SLOT_AXIS] = cylinder_axis_index(*axis) as u32;
+            put(&mut words, SLOT_SCALE, &[*scale; 2])?;
+            put(&mut words, SLOT_OFFSET, offset)?;
+            put(&mut words, SLOT_CYLINDER_ANGLE, &[*angle])?;
+        }
+        Projection::Warp { frame, corners, depth, .. } => {
+            words[SLOT_KIND] = KIND_WARP;
+            put_frame(&mut words, frame, warp_reach(frame.size, *depth), flags)?;
+            put(&mut words, SLOT_WARP_CORNERS, corners.as_flattened())?;
+        }
+    }
+
+    if let Some(uv) = uv_transform_of(projection).filter(|uv| !uv.is_default()) {
+        *flags |= FLAG_UV_PLACED;
+        let (sin, cos) = uv.rotation.to_radians().sin_cos();
+        put(&mut words, SLOT_UV_TILING, &uv.tiling)?;
+        put(&mut words, SLOT_UV_ROTATION, &[sin, cos])?;
+        put(&mut words, SLOT_UV_OFFSET, &uv.offset)?;
+    }
+
+    if let Some(projector) = projector_of(projection) {
+        put_projector(&mut words, projection, projector, flags)?;
+    }
+
+    if sampling.symmetry.on && projection.takes_symmetry() {
+        *flags |= FLAG_SYMMETRY;
+        put_symmetry(&mut words, &sampling.symmetry)?;
+    }
+
+    // The depth grid's directory word is filled in when the program uploads (`MaterialImages::append_words`)
+    if let Some(culling) = projection.depth_culling().filter(|culling| culling.hardness.is_finite()) {
+        *flags |= FLAG_DEPTH;
+        put(&mut words, SLOT_DEPTH_HARDNESS, &[culling.hardness])?;
+    }
+    Some(words)
+}
+
+/// A framed projection's frame in world units (compose `decal_axes`, `frame_local`), reaching
+/// `depth` in front of and behind it. A degenerate frame covers nothing.
+fn put_frame(words: &mut [u32; SLOT_WORDS], frame: &Decal, depth: f32, flags: &mut u32) -> Option<()> {
+    *flags |= FLAG_FRAMED;
+    let Some((origin, right, up, normal)) = decal_axes(frame) else { return Some(()) };
+
+    *flags |= FLAG_FRAME_VALID;
+    put(words, SLOT_FRAME_ORIGIN, &origin.to_array())?;
+    put(words, SLOT_FRAME_RIGHT, &right.to_array())?;
+    put(words, SLOT_FRAME_UP, &up.to_array())?;
+    put(words, SLOT_FRAME_NORMAL, &normal.to_array())?;
+    put(words, SLOT_FRAME_SIZE, &frame.size.map(|side| side.max(MIN_FRAME_EXTENT)))?;
+    put(words, SLOT_FRAME_DEPTH, &[depth.max(MIN_FRAME_EXTENT)])?;
+    words[SLOT_FRAME_FLIP] = u32::from(frame.flip[0]) | (u32::from(frame.flip[1]) << 1);
+    Some(())
+}
+
+/// The projector's turn and stretch (compose `projector_local`), shape crop and backface culling
+/// (compose `projector_cover`, `placed_cover`).
+fn put_projector(words: &mut [u32; SLOT_WORDS], projection: &Projection, projector: &Projector, flags: &mut u32) -> Option<()> {
+    if projector.turns() {
+        *flags |= FLAG_TURNS;
+        let [x, y, z] = projector.rotation.map(f32::to_radians);
+        let to_local = Mat3::from_euler(EulerRot::ZYX, z, y, x).transpose();
+        put(words, SLOT_TO_LOCAL, &to_local.to_cols_array())?;
+        put(words, SLOT_STRETCH, &projector_stretch(projector).to_array())?;
+    }
+    if projector.crop == ShapeCrop::Cropped {
+        *flags |= FLAG_CROP;
+
+        // Cropped to its shape, a placed frame takes the shape of its image too
+        if projection.placed().is_some() && !projector.ignore_image_alpha {
+            *flags |= FLAG_IMAGE_ALPHA;
+        }
+    }
+
+    // A hand-edited NaN angle or hardness culls nothing
+    let backface = projector.backface;
+    if backface.on && backface.angle.is_finite() && backface.hardness.is_finite() {
+        *flags |= FLAG_BACKFACE;
+        let threshold = (90.0 - backface.angle).to_radians().sin();
+        let width = (1.0 - backface.hardness.clamp(0.0, 1.0)) * BACKFACE_FADE;
+        put(words, SLOT_BACKFACE_THRESHOLD, &[threshold])?;
+        put(words, SLOT_BACKFACE_WIDTH, &[width])?;
+    }
+    Some(())
+}
+
+/// A fill's symmetry (compose `FillCopies`): its kind, axis, copies, pivot in mesh radii, radial
+/// step and span, and the copies' flip.
+fn put_symmetry(words: &mut [u32; SLOT_WORDS], symmetry: &FillSymmetry) -> Option<()> {
+    let reach = FillSymmetry::REACH;
+    let position = symmetry.position.map(|coordinate| if coordinate.is_finite() { coordinate.clamp(-reach, reach) } else { 0.0 });
+
+    // A span that is not a number spreads the copies over a full turn
+    let span = if symmetry.span.is_nan() { FULL_TURN_DEGREES } else { symmetry.span };
+    words[SLOT_SYMMETRY_KIND] = u32::from(symmetry.kind == SymmetryKind::Radial);
+    words[SLOT_SYMMETRY_AXIS] = symmetry.axis_index() as u32;
+    words[SLOT_SYMMETRY_COUNT] = symmetry.copies();
+    words[SLOT_SYMMETRY_FLIP] = u32::from(symmetry.flip[0]) | (u32::from(symmetry.flip[1]) << 1);
+    put(words, SLOT_SYMMETRY_POSITION, &position)?;
+    put(words, SLOT_SYMMETRY_STEP, &[symmetry.step()])?;
+    put(words, SLOT_SYMMETRY_SPAN, &[span])
 }
 
 /// Whether a program needs the full `composite_projection.wgsl`.
@@ -192,22 +505,98 @@ pub(super) fn band_uniform(_program: &CompositeProgram) -> [u32; 4] {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use texturecraft_core::{ContentsOffset, EffectKind};
+    use texturecraft_core::{
+        Backface, ContentsOffset, Decal, DepthCulling, EffectKind, FillSymmetry, Filtering, Projection, Projector, Sampling, ShapeCrop, Source, SymmetryKind,
+        UvTransform, UvWrap,
+    };
 
     use crate::gpu_composite::oracle::{compile_effects, effect};
+
+    /// A frame in front of a unit sphere, facing +Z, turned and moved a little
+    fn frame() -> Decal {
+        Decal {
+            center: [0.0, 0.0, 0.9],
+            normal: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            size: [0.9, 0.7],
+            rotation: 17.0,
+            offset: [0.05, -0.04],
+            depth: 0.6,
+            symmetry: None,
+            flip: [false, true],
+        }
+    }
+
+    fn planar(projector: Projector) -> Projection {
+        Projection::Planar { scale: 0.8, axis: 2, offset: [0.1, -0.05, 0.0], uv: UvTransform::default(), projector, placed: None }
+    }
 
     /// P1's cases that still composite on the CPU, as mask effects (the content and the mask
     /// preview both compile them). Port one: delete its row (this test fails while a ported row
     /// stays) and add its oracle test.
     fn still_on_cpu() -> Vec<EffectKind> {
-        Vec::new()
+        let image = Source::image("still");
+        let uniform = Source::Uniform([0.5; 3]);
+        let sharp = Sampling::SAVED_BEFORE;
+        let fill = |source: &Source, projection: Projection, sampling: Sampling| EffectKind::Fill { source: source.clone(), projection, sampling };
+        let mirror = FillSymmetry { on: true, ..FillSymmetry::OFF };
+        let radial = FillSymmetry { on: true, kind: SymmetryKind::Radial, axis: 1, count: 5, ..FillSymmetry::OFF };
+        let cylinder =
+            Projection::Cylindrical { scale: 1.0, axis: 1, uv: UvTransform::default(), offset: [0.0; 3], projector: Projector::default(), angle: 120.0 };
+        let placed_uv = Projection::Triplanar {
+            scale: 1.0,
+            sharpness: 4.0,
+            offset: [0.0; 3],
+            uv: UvTransform { tiling: [1.5, 0.5], rotation: 20.0, offset: [0.1, 0.2] },
+            projector: Projector::default(),
+        };
+        let turned = Projection::Triplanar {
+            scale: 1.0,
+            sharpness: 4.0,
+            offset: [0.0; 3],
+            uv: UvTransform::default(),
+            projector: Projector { rotation: [20.0, 0.0, 0.0], ..Projector::default() },
+        };
+        let cropped = Projection::Spherical {
+            scale: 1.0,
+            uv: UvTransform::default(),
+            offset: [0.0; 3],
+            projector: Projector { crop: ShapeCrop::Cropped, ..Projector::default() },
+        };
+        let backface = planar(Projector { backface: Backface { on: true, ..Backface::default() }, ..Projector::default() });
+        let warp = Projection::Warp {
+            frame: frame(),
+            corners: Projection::FRAME_CORNERS,
+            depth: Projection::WARP_DEPTH,
+            uv: UvTransform::default(),
+            projector: Projector::default(),
+        };
+        let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
+        vec![
+            fill(&image, Projection::default(), Sampling { filtering: Filtering::Nearest, ..sharp }),
+            fill(&uniform, Projection::default(), Sampling { wrap: UvWrap::RepeatHorizontally, ..sharp }),
+            fill(&uniform, Projection::default(), Sampling { wrap: UvWrap::RepeatVertically, ..sharp }),
+            fill(&uniform, Projection::default(), Sampling { wrap: UvWrap::None, ..sharp }),
+            fill(&uniform, cylinder, sharp),
+            fill(&uniform, placed_uv, sharp),
+            fill(&uniform, turned, sharp),
+            fill(&uniform, cropped, sharp),
+            fill(&uniform, backface, sharp),
+            fill(&uniform, planar(Projector::default()), Sampling { symmetry: mirror, ..sharp }),
+            fill(&uniform, planar(Projector::default()), Sampling { symmetry: radial, ..sharp }),
+            fill(&uniform, warp, sharp),
+            fill(&image, Projection::default(), Sampling { filtering: Filtering::BilinearHq, ..sharp }),
+            fill(&image, Projection::decal(frame()), Sampling { filtering: Filtering::Nearest, ..sharp }),
+            fill(&image, Projection::decal(frame()), Sampling { filtering: Filtering::BilinearHq, ..sharp }),
+            fill(&uniform, culled, sharp),
+        ]
     }
 
     /// The placement hooks (P0b) leave every source kind's operation as before: no package
     /// word, no side-table words, the same projection selector, images registered as material.
     #[test]
     fn placement_hooks_leave_the_operations_as_before() {
-        use texturecraft_core::{ChannelKind, NormalFormat, Procedural, ProceduralKind, Projection, Sampling, Source};
+        use texturecraft_core::{ChannelKind, NormalFormat, Procedural, ProceduralKind};
 
         use crate::gpu_composite::{ProceduralInputs, source_operation};
         use crate::gpu_image_source::ImageUse;
@@ -225,8 +614,7 @@ mod tests {
                 assert_eq!(op.procedural[3], expected, "{projection:?} {source:?}");
             }
         }
-        assert_eq!(super::image_use(Sampling::default()), ImageUse::Material);
-        assert_eq!(super::image_use(Sampling::SAVED_BEFORE), ImageUse::Material);
+        assert_eq!(super::image_use(Sampling::SAVED_BEFORE, ChannelKind::Color), ImageUse::Material);
     }
 
     #[test]

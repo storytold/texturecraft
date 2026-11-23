@@ -134,6 +134,10 @@ fn procedural_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f
         let weights = triplanar_weights(surface.normal, layer.balance.w);
         let minimum = 1.0 / (131072.0 * max(layer.uv.w, 1.0));
         w = select(vec3(0.0), weights, weights >= vec3(minimum));
+    } else if mode == P1_PLANES_PROJECTION {
+        // P1 placed the points and weighed the planes (composite_projection.wgsl)
+        points = array<vec2<f32>, 3>(layer.projection.xy, layer.projection.zw, bitcast<vec2<f32>>(layer.constraints.xy));
+        w = layer.balance.yzw;
     } else {
         switch mode {
             case 2u: {}
@@ -160,7 +164,7 @@ fn procedural_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f
         }
     }
     var n = 0.0;
-    for (var plane = 0u; plane < select(1u, 3u, mode == 1u); plane++) {
+    for (var plane = 0u; plane < select(1u, 3u, mode == 1u || mode == P1_PLANES_PROJECTION); plane++) {
         if w[plane] > 0.0 {
             n += w[plane] * sample_procedural(layer, vec3(points[plane], 0.0));
         }

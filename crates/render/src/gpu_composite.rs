@@ -1368,17 +1368,11 @@ fn source_operation(
     channel: ChannelKind,
     inputs: &mut ProceduralInputs,
 ) -> Option<Operation> {
-    if !fill_projection::supports(projection, sampling) {
-        return None;
-    }
     let mut op = Operation::zeroed();
     match source {
         None => op.low[..3].copy_from_slice(&default),
         Some(Source::Uniform(value)) => op.low[..3].copy_from_slice(value),
         Some(Source::Image { name, normal_format }) => {
-            if !fill_projection::supports_image_sampling(sampling) {
-                return None;
-            }
             let kind = match channel {
                 ChannelKind::Color => 0,
                 ChannelKind::Scalar => 1,
@@ -1391,7 +1385,7 @@ fn source_operation(
                     }
                 }
             };
-            op.ids = [0, IMAGE_SOURCE_OPCODE, inputs.materials.register_image(name, fill_projection::image_use(sampling)), kind];
+            op.ids = [0, IMAGE_SOURCE_OPCODE, inputs.materials.register_image(name, fill_projection::image_use(sampling, channel)), kind];
             fill_projection::place_image(projection, sampling, &mut op, inputs)?;
         }
         Some(Source::Anchor { anchor, channel: read_channel, ramp }) => {
@@ -1464,7 +1458,7 @@ fn source_operation(
         }
     }
     // Coverage of every source kind (wrap, crop, backface, depth culling, decals)
-    fill_projection::place_cover(projection, sampling, &mut op, inputs);
+    fill_projection::place_cover(projection, sampling, &mut op, inputs)?;
     op.low.iter().chain(&op.high).chain(&op.projection).chain(&op.uv).chain(&op.balance).all(|v| v.is_finite()).then_some(op)
 }
 
