@@ -121,7 +121,7 @@ fn p1_image_at(image: u32, uv: vec2<f32>, layer: Operation) -> vec4<f32> {
         return vec4(0.0);
     }
     let level = p1_base_level(image);
-    let clamps = vec2(false);
+    let clamps = (vec2(layer.ext.y) & vec2(P1_CLAMP_U, P1_CLAMP_V)) != vec2(0u);
     if (layer.ext.y & P1_NEAREST) != 0u {
         return p1_nearest(level, uv, clamps);
     }

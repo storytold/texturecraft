@@ -353,9 +353,23 @@ fn p1_footprints(op: Operation, samples: P1Samples, uv: vec2<f32>, copy: P1Copy,
     return vec3(1.0);
 }
 
+// 1 where the image point `uv` lies inside its 0..1 tile on every axis that does not repeat
+// (compose Texel::tile_cover)
+fn p1_tile_cover(op: Operation, uv: vec2<f32>) -> f32 {
+    if (op.ext.y & P1_TILE_COVER) == 0u {
+        return 1.0;
+    }
+    let inside = uv >= vec2(0.0) & uv < vec2(1.0);
+    let repeats = (vec2(op.ext.y) & vec2(P1_CLAMP_U, P1_CLAMP_V)) == vec2(0u);
+    return select(0.0, 1.0, all(inside | repeats));
+}
+
 // How much of the texel the fill covers (compose Texel::cover), the surface as the copy sees it
 fn p1_cover(op: Operation, coords: P1Coords, uv: vec2<f32>, surface: Surface, copy: P1Copy) -> f32 {
-    return 1.0;
+    if (op.ext.y & P1_TILE_COVER) == 0u {
+        return 1.0;
+    }
+    return p1_tile_cover(op, p1_flipped(p1_image_points(op, coords), copy).points[0]);
 }
 
 // The surface as copy `copy` sees it (compose Texel::surface)

@@ -278,7 +278,6 @@ fn still_on_cpu(projection: &Projection, sampling: Sampling, op: &Operation) -> 
     let projector = projector_of(projection);
     let reads_image = op.ids[1] == IMAGE_SOURCE_OPCODE || projection.placed().is_some();
     (sampling.filtering == Filtering::BilinearHq && reads_image)
-        || sampling.wrap.repeats() != (true, true)
         || matches!(projection, Projection::Cylindrical { angle, .. } if *angle != FULL_TURN_DEGREES)
         || uv_transform_of(projection).is_some_and(|uv| !uv.is_default())
         || projector.is_some_and(Projector::turns)
@@ -702,9 +701,6 @@ mod tests {
         };
         let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
         vec![
-            fill(&uniform, Projection::default(), Sampling { wrap: UvWrap::RepeatHorizontally, ..sharp }),
-            fill(&uniform, Projection::default(), Sampling { wrap: UvWrap::RepeatVertically, ..sharp }),
-            fill(&uniform, Projection::default(), Sampling { wrap: UvWrap::None, ..sharp }),
             fill(&uniform, cylinder, sharp),
             fill(&uniform, placed_uv, sharp),
             fill(&uniform, turned, sharp),
@@ -765,6 +761,34 @@ mod tests {
         ];
         for (label, mesh, projection) in cases {
             assert_fill_matches(&mut gpu, &mesh, &projection, nearest, Tolerance::BILINEAR.with_flips(FLIPS), &format!("nearest {label}"));
+        }
+    }
+
+    /// Every wrap stops the fill at its tile's edges on the axes that do not repeat, and stops
+    /// image reads at the edge texel there; tri-planar never leaves its tile but clamps its reads
+    #[test]
+    fn uv_wrap_matches_the_cpu() {
+        let mut gpu = headless();
+        let uv = Projection::Uv { scale: [1.31, 0.83], rotation: 9.0, offset: [0.17, -0.12] };
+        let triplanar =
+            Projection::Triplanar { scale: 0.9, sharpness: 2.0, offset: [0.4, -0.2, 0.3], uv: UvTransform::default(), projector: Projector::default() };
+        let spherical = Projection::Spherical { scale: 1.7, uv: UvTransform::default(), offset: [0.0; 3], projector: Projector::default() };
+        let cylindrical =
+            Projection::Cylindrical { scale: 1.4, axis: 1, uv: UvTransform::default(), offset: [0.0; 3], projector: Projector::default(), angle: 360.0 };
+        for wrap in [UvWrap::RepeatHorizontally, UvWrap::RepeatVertically, UvWrap::None] {
+            let sharp = Sampling { wrap, ..Sampling::SAVED_BEFORE };
+            let cases = [
+                ("UV", plane(), uv.clone(), sharp),
+                ("UV nearest", plane(), uv.clone(), Sampling { filtering: Filtering::Nearest, ..sharp }),
+                ("UV tile", plane(), Projection::UvTile, sharp),
+                ("tri-planar", sphere(), triplanar.clone(), sharp),
+                ("planar", sphere(), planar(Projector::default()), sharp),
+                ("spherical", sphere(), spherical.clone(), sharp),
+                ("cylindrical", sphere(), cylindrical.clone(), sharp),
+            ];
+            for (label, mesh, projection, sampling) in cases {
+                assert_fill_matches(&mut gpu, &mesh, &projection, sampling, Tolerance::BILINEAR.with_flips(FLIPS), &format!("{wrap:?} {label}"));
+            }
         }
     }
 
