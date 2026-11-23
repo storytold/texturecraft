@@ -98,7 +98,7 @@ fn ticking_export_materialx_with_any_template_writes_the_openpbr_maps_beside_its
     assert!(references > 0);
 
     let written: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-    assert!(written.iter().any(|f| f.ends_with("_baseColor.png")), "the template's own maps are still written: {written:?}");
+    assert!(written.iter().any(|f| f.ends_with("_Base_color.png")), "the template's own maps are still written: {written:?}");
     assert!(written.iter().any(|f| f.ends_with("_base_color.png")), "{written:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -235,6 +235,7 @@ fn base_colour_template() -> texturecraft_engine::formats::ExportPreset {
             bit_depth: 8,
             channels: vec![(Dest::R, source(0)), (Dest::G, source(1)), (Dest::B, source(2))],
             inverted: Vec::new(),
+            dither: false,
         }],
     }
 }

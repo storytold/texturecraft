@@ -71,7 +71,7 @@ pub fn usd_export_options() -> ExportOptions {
                 "ClearcoatRoughness" => gray(ch(Channel::CoatRoughness, 0)),
                 _ => gray(ch(Channel::Opacity, 0)),
             };
-            MapSpec { file: stem.into(), format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new() }
+            MapSpec { file: stem.into(), format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new(), dither: false }
         })
         .collect();
     super::png8_options(ExportPreset { name: "USD preview surface".into(), maps }, NormalFormat::OpenGl)

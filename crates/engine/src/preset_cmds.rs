@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Get an export preset",
             [],
             None,
-            "{name} → {name, maps: [{file, format, bit_depth, channels, inverted?: [dest, ...]}]}",
+            "{name} → {name, maps: [{file, format, bit_depth, channels, inverted?: [dest, ...], dither?: true}]}",
             always,
             get
         ),

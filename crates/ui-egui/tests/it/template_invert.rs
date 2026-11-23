@@ -43,6 +43,7 @@ fn template() -> ExportPreset {
             bit_depth: 8,
             channels: vec![(Dest::R, ch(Channel::Roughness)), (Dest::G, ch(Channel::Metallic)), (Dest::B, SourceRef::Constant(0.5))],
             inverted: Vec::new(),
+            dither: false,
         }],
     }
 }

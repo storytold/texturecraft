@@ -1,10 +1,14 @@
-//! Built-in export presets and user preset JSON. Preset names are ours; their contents follow
-//! each engine's public material conventions.
+//! Built-in export presets and user preset JSON. The reference app's built-in output templates
+//! come first, with its names, file names and channel packing; a few of our own follow.
 
 use texturecraft_core::{BakedMap, Channel, ChannelKind};
 
 use crate::export::{Dest, ExportPreset, FileFormat, MapSpec, SourceRef, VirtualMap};
 use crate::{FormatError, Result};
+
+mod reference_templates;
+#[cfg(test)]
+mod tests;
 
 /// Largest preset JSON accepted.
 const MAX_PRESET_JSON: usize = 1 << 20;
@@ -17,9 +21,18 @@ pub(crate) fn virt(map: VirtualMap, component: u8) -> SourceRef {
     SourceRef::Virtual { map, component }
 }
 
+fn baked(map: BakedMap, component: u8) -> SourceRef {
+    SourceRef::Baked { map, component }
+}
+
+/// One output map of a template.
+fn output(file: &str, format: FileFormat, bit_depth: u8, dither: bool, channels: Vec<(Dest, SourceRef)>) -> MapSpec {
+    MapSpec { file: file.into(), format, bit_depth, channels, inverted: Vec::new(), dither }
+}
+
 /// `$mesh_$textureSet_<suffix>` PNG.
 fn map(suffix: &str, bit_depth: u8, channels: Vec<(Dest, SourceRef)>) -> MapSpec {
-    MapSpec { file: format!("$mesh_$textureSet_{suffix}"), format: FileFormat::Png, bit_depth, channels, inverted: Vec::new() }
+    output(&format!("$mesh_$textureSet_{suffix}"), FileFormat::Png, bit_depth, false, channels)
 }
 
 pub(crate) fn rgb(f: impl Fn(u8) -> SourceRef) -> Vec<(Dest, SourceRef)> {
@@ -68,7 +81,7 @@ pub(crate) const GLTF_SHEEN: &str = "Sheen";
 /// glTF metallic-roughness maps (8-bit PNG), plus the clear coat and sheen extension maps where
 /// the texture set has those channels; `file` turns a stem above into a file template.
 pub(crate) fn gltf_pbr_maps(file: impl Fn(&str) -> String) -> Vec<MapSpec> {
-    let spec = |stem: &str, channels| MapSpec { file: file(stem), format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new() };
+    let spec = |stem: &str, channels| output(&file(stem), FileFormat::Png, 8, false, channels);
     let mut sheen = rgb(|k| virt(VirtualMap::SheenTint, k));
     sheen.push((Dest::A, ch(Channel::SheenRoughness, 0)));
     vec![
@@ -81,70 +94,96 @@ pub(crate) fn gltf_pbr_maps(file: impl Fn(&str) -> String) -> Vec<MapSpec> {
     ]
 }
 
-/// Every built-in preset, in menu order.
+/// The reference's first channels of the document channel templates, in its order (its order of
+/// the channels it did not list is not known; ours follow in [`Channel::ALL`] order)
+const DOCUMENT_CHANNELS_FIRST: [Channel; 7] =
+    [Channel::BaseColor, Channel::Height, Channel::Roughness, Channel::Metallic, Channel::Normal, Channel::Opacity, Channel::Emissive];
+
+/// "Document channels + Normal + AO": one map per texture set channel (named after its label),
+/// the DirectX normal and the mixed AO; `alpha` adds the UV coverage as each map's alpha.
+fn document_channel_maps(alpha: bool) -> Vec<MapSpec> {
+    let with_alpha = |mut channels: Vec<(Dest, SourceRef)>| {
+        if alpha {
+            channels.push((Dest::A, virt(VirtualMap::UvCoverage, 0)));
+        }
+        channels
+    };
+
+    // The mixed AO map stands for the AO channel
+    let rest = Channel::ALL.into_iter().filter(|c| !DOCUMENT_CHANNELS_FIRST.contains(c) && *c != Channel::AmbientOcclusion);
+    let mut maps: Vec<MapSpec> = DOCUMENT_CHANNELS_FIRST
+        .into_iter()
+        .chain(rest)
+        .map(|c| {
+            let (channels, bit_depth) = match c.kind() {
+                ChannelKind::Color => (rgb(|k| ch(c, k)), 8),
+                ChannelKind::NormalMap => (rgb(|k| ch(c, k)), 16),
+                ChannelKind::Signed => (gray(ch(c, 0)), 16),
+                ChannelKind::Scalar => (gray(ch(c, 0)), 8),
+            };
+            output(&format!("$textureSet_{}", c.label().replace(' ', "_")), FileFormat::Png, bit_depth, false, with_alpha(channels))
+        })
+        .collect();
+    maps.push(output("$textureSet_Normal_DirectX", FileFormat::Png, 16, false, with_alpha(normal(VirtualMap::NormalDirectX))));
+    maps.push(output("$textureSet_Mixed_AO", FileFormat::Png, 8, false, with_alpha(gray(virt(VirtualMap::AoMixed, 0)))));
+    maps
+}
+
+/// The glTF templates' maps (the reference's displacement variant writes the same ones), plus our
+/// clear coat and sheen extension maps where the texture set has those channels.
+fn gltf_template_maps() -> Vec<MapSpec> {
+    let png = |file: &str, dither: bool, channels| output(file, FileFormat::Png, 8, dither, channels);
+    let mut sheen = rgb(|k| virt(VirtualMap::SheenTint, k));
+    sheen.push((Dest::A, ch(Channel::SheenRoughness, 0)));
+    vec![
+        png("$textureSet_baseColor", false, base_with_alpha()),
+        png("$textureSet_occlusionRoughnessMetallic", false, orm()),
+        png("$textureSet_normal", true, normal(VirtualMap::NormalOpenGl)),
+        png("$textureSet_emissive", false, rgb(|k| ch(Channel::Emissive, k))),
+        png("$textureSet_clearcoat", false, vec![(Dest::R, ch(Channel::CoatWeight, 0)), (Dest::G, ch(Channel::CoatRoughness, 0))]),
+        png("$textureSet_sheen", false, sheen),
+    ]
+}
+
+/// The Sketchfab template's maps (the reference writes them into a folder of its upload; here
+/// they go beside the others).
+fn sketchfab_maps() -> Vec<MapSpec> {
+    let jpeg = |file: &str, channels| output(file, FileFormat::Jpeg, 8, false, channels);
+    vec![
+        jpeg("$textureSet_albedo", rgb(|k| ch(Channel::BaseColor, k))),
+        jpeg("$textureSet_opacity", gray(ch(Channel::Opacity, 0))),
+        jpeg("$textureSet_emissive", rgb(|k| ch(Channel::Emissive, k))),
+        jpeg("$textureSet_roughness", gray(ch(Channel::Roughness, 0))),
+        jpeg("$textureSet_metallic", gray(ch(Channel::Metallic, 0))),
+        output("$textureSet_normal", FileFormat::Png, 8, true, normal(VirtualMap::NormalOpenGl)),
+    ]
+}
+
+fn usdz_maps() -> Vec<MapSpec> {
+    let jpeg = |file: &str, channels| output(file, FileFormat::Jpeg, 8, false, channels);
+    vec![
+        output("$textureSet_baseColor", FileFormat::Png, 8, false, base_with_alpha()),
+        jpeg("$textureSet_roughness", gray(ch(Channel::Roughness, 0))),
+        jpeg("$textureSet_metallic", gray(ch(Channel::Metallic, 0))),
+        output("$textureSet_normal", FileFormat::Png, 8, true, normal(VirtualMap::NormalOpenGl)),
+        jpeg("$textureSet_emissive", rgb(|k| ch(Channel::Emissive, k))),
+    ]
+}
+
+/// Every built-in preset, in menu order: the reference's templates that follow the texture set's
+/// channels (without "2D View", which needs a rendered 2D view), its static templates, then ours.
 pub fn builtin_presets() -> Vec<ExportPreset> {
     let preset = |name: &str, maps: Vec<MapSpec>| ExportPreset { name: name.into(), maps };
-    vec![
-        preset(DEFAULT_PRESET, {
-            let mut maps: Vec<MapSpec> =
-                Channel::ALL.into_iter().filter(|c| !matches!(c, Channel::Normal | Channel::AmbientOcclusion)).map(channel_map).collect();
-            maps.push(map("normal", 8, rgb(|k| ch(Channel::Normal, k))));
-            maps.push(map("ambientOcclusion", 8, gray(virt(VirtualMap::AoMixed, 0))));
-            maps
-        }),
-        preset("glTF PBR Metal Roughness", gltf_pbr_maps(|s| format!("$mesh_$textureSet_{s}"))),
-        preset(
-            "Unreal Engine (Packed)",
-            vec![map("BaseColor", 8, base_with_alpha()), map("OcclusionRoughnessMetallic", 8, orm()), map("Normal", 8, normal(VirtualMap::NormalDirectX))],
-        ),
-        preset(
-            "Unity HDRP (Mask Map)",
-            vec![
-                map("BaseMap", 8, base_with_alpha()),
-                map(
-                    "MaskMap",
-                    8,
-                    vec![
-                        (Dest::R, ch(Channel::Metallic, 0)),
-                        (Dest::G, virt(VirtualMap::AoMixed, 0)),
-                        // The preset has no detail mask
-                        (Dest::B, SourceRef::Constant(0.0)),
-                        (Dest::A, virt(VirtualMap::Glossiness, 0)),
-                    ],
-                ),
-                map("Normal", 8, normal(VirtualMap::NormalOpenGl)),
-            ],
-        ),
-        preset(
-            "Unity Standard (Metallic Smoothness)",
-            vec![
-                map("Albedo", 8, base_with_alpha()),
-                map(
-                    "MetallicSmoothness",
-                    8,
-                    vec![
-                        (Dest::R, ch(Channel::Metallic, 0)),
-                        (Dest::G, SourceRef::Constant(0.0)),
-                        (Dest::B, SourceRef::Constant(0.0)),
-                        (Dest::A, virt(VirtualMap::Glossiness, 0)),
-                    ],
-                ),
-                map("Normal", 8, normal(VirtualMap::NormalOpenGl)),
-                map("Occlusion", 8, gray(virt(VirtualMap::AoMixed, 0))),
-            ],
-        ),
-        preset(
-            "Blender (Principled BSDF)",
-            vec![
-                map("BaseColor", 8, base_with_alpha()),
-                map("Metallic", 8, gray(ch(Channel::Metallic, 0))),
-                map("Roughness", 8, gray(ch(Channel::Roughness, 0))),
-                map("Normal", 8, normal(VirtualMap::NormalOpenGl)),
-                map("Height", 16, gray(ch(Channel::Height, 0))),
-                map("Emission", 8, rgb(|k| ch(Channel::Emissive, k))),
-                map("Specular", 8, gray(ch(Channel::SpecularLevel, 0))),
-            ],
-        ),
+    let mut presets = vec![
+        preset(DEFAULT_PRESET, document_channel_maps(false)),
+        preset("Document channels + Normal + AO (With Alpha)", document_channel_maps(true)),
+        preset("glTF PBR Metal Roughness", gltf_template_maps()),
+        preset("glTF PBR Metal Roughness + Displacement texture (experimental)", gltf_template_maps()),
+        preset("Sketchfab", sketchfab_maps()),
+        preset("USDz (Apple AR)", usdz_maps()),
+    ];
+    presets.extend(reference_templates::static_templates());
+    presets.extend([
         preset(
             "Godot 4 (ORM)",
             vec![
@@ -177,30 +216,26 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
             ]
         }),
         preset("Separate maps", Channel::ALL.into_iter().map(channel_map).collect()),
-        preset(
-            "Mesh maps",
-            BakedMap::ALL
-                .into_iter()
-                .map(|m| {
-                    let src = |component| SourceRef::Baked { map: m, component };
-                    map("$channel", 16, if m.components() == 3 { rgb(src) } else { gray(src(0)) })
-                })
-                .collect(),
-        ),
-    ]
+    ]);
+    presets
 }
 
 /// The default export template.
 pub const DEFAULT_PRESET: &str = "Document channels + Normal + AO (No Alpha)";
 
-/// The default template's name before it took the reference's "(No Alpha)" (saved settings and
-/// scripts still use it).
-const OLD_DEFAULT_PRESET: &str = "Document channels + Normal + AO";
+/// Built-in templates that were renamed or replaced by a reference template: (old name, current
+/// name). Saved settings and scripts still use the old names; the old "Mesh maps" finds "Mesh Maps"
+/// because names compare ignoring case.
+const RENAMED_PRESETS: [(&str, &str); 3] = [
+    ("Document channels + Normal + AO", DEFAULT_PRESET),
+    ("Unity HDRP (Mask Map)", "Unity HD Render Pipeline (Metallic Standard)"),
+    ("Unity Standard (Metallic Smoothness)", "Unity Universal Render Pipeline (Metallic Standard)"),
+];
 
 /// A built-in preset by name (case-insensitive).
 pub fn builtin_preset(name: &str) -> Option<ExportPreset> {
     let name = name.trim();
-    let name = if name.eq_ignore_ascii_case(OLD_DEFAULT_PRESET) { DEFAULT_PRESET } else { name };
+    let name = RENAMED_PRESETS.iter().find(|(old, _)| old.eq_ignore_ascii_case(name)).map_or(name, |(_, current)| *current);
     builtin_presets().into_iter().find(|p| p.name.eq_ignore_ascii_case(name))
 }
 

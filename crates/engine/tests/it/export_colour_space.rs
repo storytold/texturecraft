@@ -34,7 +34,7 @@ fn colour_maps_are_written_in_the_chosen_space() {
     let (plain, dir_plain) = export(&mut s, "plain", json!({}));
     let (aces, dir_aces) = export(&mut s, "aces", json!({ "colorSpace": "ACEScg" }));
     let base =
-        |r: &Value| std::path::PathBuf::from(r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).find(|f| f.contains("BaseColor")).unwrap());
+        |r: &Value| std::path::PathBuf::from(r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).find(|f| f.contains("baseColor")).unwrap());
     let (a, b) = (first_pixel(&base(&plain)), first_pixel(&base(&aces)));
     let want = ColorSpace::AcesCg.from_linear_rec709(a);
     assert!((0..3).all(|k| (b[k] - want[k]).abs() < 1e-3), "{b:?} vs {want:?}");
