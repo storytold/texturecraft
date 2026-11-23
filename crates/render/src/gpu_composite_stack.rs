@@ -187,6 +187,7 @@ mod tests {
 
     /// A fill whose mask reads an anchor published by the layer below and an image fill, inside a
     /// folder with Scale and Rotation: (project, owner, folder).
+    #[allow(clippy::unwrap_used)] // A test helper: a project that does not build fails the test
     fn anchored_mask_in_offset_folder() -> (Project, LayerId, LayerId) {
         let channels = [Channel::BaseColor, Channel::Height];
         let mut project = Project::new("Anchored mask", "builtin:plane");
@@ -235,9 +236,16 @@ mod tests {
         let pixels = PixelStore::default();
         assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).is_ok(), "drawn once");
 
-        let instanced = project.alloc_id();
         let channels = [Channel::BaseColor, Channel::Height];
-        project.insert_layer(0, Layer::new(instanced, "Instanced folder", LayerKind::Instance { source: folder_id }, &channels), None, false).unwrap();
+        let around = project.alloc_id();
+        let mut group = Layer::new(around, "Around", LayerKind::folder(), &channels);
+        if let LayerKind::Group { contents, .. } = &mut group.kind {
+            *contents = ContentsOffset::new(0.5, 45.0);
+        }
+        project.insert_layer(0, group, None, false).unwrap();
+        let instanced = project.alloc_id();
+        let instance = Layer::new(instanced, "Instanced folder", LayerKind::Instance { source: folder_id }, &channels);
+        project.insert_layer(0, instance, Some(around), true).unwrap();
         assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).is_err(), "drawn under two offsets");
     }
 
@@ -257,6 +265,7 @@ mod tests {
 
     /// A paint layer with colour, roughness and height painted in a block (so a filter's halo
     /// shows), `content` on its content and `mask` after a gray fill in its black mask.
+    #[allow(clippy::unwrap_used)] // A test helper: a project that does not build fails the test
     fn painted_layer(content: Vec<Effect>, mask: Vec<Effect>) -> (Project, PixelStore, LayerId) {
         const SIZE: u32 = TILE * 2;
         let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height];
@@ -276,7 +285,11 @@ mod tests {
         for y in 22..103 {
             for x in 23..98 {
                 let gain = if x >= 63 { 1.0 } else { 0.65 };
-                pixels.layer_mut(owner, Channel::BaseColor, (SIZE, SIZE)).set(x, y, &[to_u16(0.7 * gain), to_u16(0.2 * gain), to_u16(0.3 * gain), to_u16(gain)]);
+                pixels.layer_mut(owner, Channel::BaseColor, (SIZE, SIZE)).set(
+                    x,
+                    y,
+                    &[to_u16(0.7 * gain), to_u16(0.2 * gain), to_u16(0.3 * gain), to_u16(gain)],
+                );
                 pixels.layer_mut(owner, Channel::Roughness, (SIZE, SIZE)).set(x, y, &[to_u16(0.41 * gain), to_u16(gain)]);
                 pixels.layer_mut(owner, Channel::Height, (SIZE, SIZE)).set(x, y, &[to_u16_signed(-0.34 * gain), to_u16(gain)]);
             }
@@ -320,9 +333,17 @@ mod tests {
             ("disabled but on height", vec![disabled_but_height], Tolerance::POINT),
             ("levels on height", vec![with(EffectKind::Levels(levels(Some(Channel::Height))), 0.6, &[], &[])], Tolerance::POINT),
             ("levels on colour", vec![with(EffectKind::Levels(levels(Some(Channel::BaseColor))), 1.0, &[], &[])], Tolerance::POINT),
-            ("library levels", vec![with(EffectKind::Levels(Levels { affects: Some(Channel::BaseColor), ..Levels::default() }), 1.0, &[], &[])], Tolerance::POINT),
+            (
+                "library levels",
+                vec![with(EffectKind::Levels(Levels { affects: Some(Channel::BaseColor), ..Levels::default() }), 1.0, &[], &[])],
+                Tolerance::POINT,
+            ),
             // Levels does not blend, so Disable leaves it on
-            ("levels disabled", vec![with(EffectKind::Levels(levels(Some(Channel::Roughness))), 0.7, &[(Channel::Roughness, BlendMode::Disable, 0.7)], &[])], Tolerance::POINT),
+            (
+                "levels disabled",
+                vec![with(EffectKind::Levels(levels(Some(Channel::Roughness))), 0.7, &[(Channel::Roughness, BlendMode::Disable, 0.7)], &[])],
+                Tolerance::POINT,
+            ),
             (
                 "chained",
                 vec![
@@ -417,6 +438,7 @@ mod tests {
 
     /// A fill layer whose mask is painted as a ramp across the set (0 at the left, 1 at the
     /// right, with a step down the middle row) followed by `effects`, as (project, pixels, owner).
+    #[allow(clippy::unwrap_used)] // A test helper: a project that does not build fails the test
     fn ramp_mask_layer(effects: Vec<Effect>) -> (Project, PixelStore, LayerId) {
         const SIZE: u32 = TILE * 2;
         let mut project = Project::new("Mask effects", "builtin:plane");
@@ -496,8 +518,10 @@ mod tests {
         // hard selections read IDs clear of the tolerance, where one ulp cannot flip a whole cell
         let picked = vec![[0.40101, 0.69217, 0.05289], [0.375; 3], [0.21875, 0.78125, 0.09375]];
         let ids = |boundary: bool| {
-            let [at, past, below] = if boundary { [[0.390625; 3], [0.390626, 0.375, 0.375], [0.359375; 3]] } else { [[0.38; 3], [0.42, 0.375, 0.375], [0.37; 3]] };
-            let colors = [[0.40101, 0.69217, 0.05289], at, past, [0.21875, 0.78125, 0.09375], [0.1, 0.9, 0.2], [0.8, 0.1, 0.9], below, [0.0; 3], [0.3, 0.6, 0.1]];
+            let [at, past, below] =
+                if boundary { [[0.390625; 3], [0.390626, 0.375, 0.375], [0.359375; 3]] } else { [[0.38; 3], [0.42, 0.375, 0.375], [0.37; 3]] };
+            let colors =
+                [[0.40101, 0.69217, 0.05289], at, past, [0.21875, 0.78125, 0.09375], [0.1, 0.9, 0.2], [0.8, 0.1, 0.9], below, [0.0; 3], [0.3, 0.6, 0.1]];
             BakedMaps { resolution: 3, maps: BTreeMap::from([(BakedMap::Id, Arc::new(colors.into_iter().flatten().collect()))]) }
         };
         let (boundary, clear) = (ids(true), ids(false));

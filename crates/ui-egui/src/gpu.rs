@@ -2384,7 +2384,12 @@ pub(crate) mod tests {
         let whole = render(&mut gpu, &mut build().0, None);
 
         // (soloed layer, Ignore Mask, the top-level layers left visible, the mask it switches off)
-        let cases = [(first, false, vec![first], None), (first, true, vec![first], Some(first)), (inner, false, vec![folder], None), (instance, false, vec![instance, first], None)];
+        let cases = [
+            (first, false, vec![first], None),
+            (first, true, vec![first], Some(first)),
+            (inner, false, vec![folder], None),
+            (instance, false, vec![instance, first], None),
+        ];
         for (layer, ignore_mask, shown, unmasked) in cases {
             let (mut soloed, _) = build();
             soloed.set_solo(Some(texturecraft_engine::Solo { layer, ignore_mask }));

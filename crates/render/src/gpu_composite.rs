@@ -843,8 +843,7 @@ impl CompositeProgram {
             }
             let mut content_anchors = Vec::new();
             let mut visible_cut = 0u32;
-            let per_channel =
-                layer.content_effects.iter().any(|effect| effect.visible && (content_depends_on_channel(effect) || blends_per_channel(effect)));
+            let per_channel = layer.content_effects.iter().any(|effect| effect.visible && (content_depends_on_channel(effect) || blends_per_channel(effect)));
             let mut templates = Vec::new();
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
                 if let Some(reason) = effect_needs_cpu(effect) {
@@ -931,7 +930,9 @@ impl CompositeProgram {
                     effects.extend(stage);
                     let op = if let Some(op) = template {
                         op
-                    } else if let Some(op) = content_deposit(effect, (channel, around), pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))? {
+                    } else if let Some(op) =
+                        content_deposit(effect, (channel, around), pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))?
+                    {
                         adds_coverage = true;
                         op
                     } else {
@@ -1358,8 +1359,12 @@ fn compile_mask(
                 if !tolerance.is_finite() {
                     return Err("A color selection has invalid tolerance.");
                 }
-                let mut operation =
-                    Operation { ids: [0, COLOR_SELECTION_OPCODE, 0, 0], low: [*tolerance, 0.0, 0.0, 0.0], procedural: [0, offset, count, 0], ..Operation::zeroed() };
+                let mut operation = Operation {
+                    ids: [0, COLOR_SELECTION_OPCODE, 0, 0],
+                    low: [*tolerance, 0.0, 0.0, 0.0],
+                    procedural: [0, offset, count, 0],
+                    ..Operation::zeroed()
+                };
                 stack::soften_selection(&mut operation, *output, *hardness, *background, procedural).ok_or("A color selection has invalid parameters.")?;
                 operation
             }
