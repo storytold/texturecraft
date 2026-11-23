@@ -1,6 +1,7 @@
 //! Bridge between the session and the wgpu renderer: per-frame scene sync (mesh, texture set
 //! layout, dirty tiles, environment) and the egui paint callback that renders and blits a view.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -252,10 +253,14 @@ struct SetCompositor {
     logged_status: Option<(&'static str, &'static str)>,
 }
 
-/// The project the GPU compositor compiles for the view. The GPU port's P3 compiles the solo view
-/// from its isolated copy here; the stroke lines of `SetCompositor::plan` before it are P7's.
-fn view_project(session: &Session) -> &texturecraft_engine::core::Project {
-    &session.doc.project
+/// The project the GPU compositor compiles for the view: while a layer is soloed, the material
+/// from its isolated copy (`compose::solo_project`, as the CPU compositor draws it); the mask view
+/// reads the document's own mask, as the CPU's `mask_image` does. The stroke lines of
+/// `SetCompositor::plan` before the call are P7's.
+fn view_project(session: &Session, mask_view: bool) -> Cow<'_, texturecraft_engine::core::Project> {
+    let solo = session.solo.filter(|_| !mask_view);
+    let soloed = solo.and_then(|solo| texturecraft_engine::compose::solo_project(&session.doc.project, solo.layer, solo.ignore_mask));
+    soloed.map_or(Cow::Borrowed(&session.doc.project), Cow::Owned)
 }
 
 impl SetCompositor {
@@ -355,10 +360,10 @@ impl SetCompositor {
         };
         #[cfg(target_arch = "wasm32")]
         let brush = None;
-        let project = view_project(session);
+        let project = view_project(session, mask.is_some());
         let program = match mask {
-            Some(owner) => CompositeProgram::try_compile_mask_preview(project, pixels, ts, owner, region, brush),
-            None => CompositeProgram::try_compile_with_brush(project, pixels, ts, region, brush),
+            Some(owner) => CompositeProgram::try_compile_mask_preview(&project, pixels, ts, owner, region, brush),
+            None => CompositeProgram::try_compile_with_brush(&project, pixels, ts, region, brush),
         };
         let mut program = match program {
             Ok(program) => program,
@@ -617,14 +622,14 @@ impl GpuLink {
         } else if !self.gpu_composite_enabled {
             n_("GPU compositing is unavailable on this device.")
         } else if interactive {
-            n_("The active view uses CPU compositing.")
+            n_("The active view hides the material, so no layers are composited.")
         } else {
             ""
         }
     }
 
     fn plan_gpu_composites(&mut self, session: &mut Session, shift: u32, interactive: bool, gpu_quick_mask: bool, out: &mut SceneSync, started: f64) {
-        let global_reason = self.gpu_composite_reason(interactive || session.solo.is_some());
+        let global_reason = self.gpu_composite_reason(interactive);
         let mut submitted_stroke = false;
         let mut cpu_changed = false;
         for (ts, state) in self.compositors.iter_mut().enumerate() {
@@ -2328,6 +2333,40 @@ pub(crate) mod tests {
         assert!(link.display_pending(&s) || !cpu.tiles.is_empty());
         link.prefer_gpu_layers = true;
         assert!(!link.sync(&mut s, None, None, 0, 0.0).composites.is_empty());
+    }
+
+    /// A soloed layer composites on the GPU from the isolated copy the CPU draws: the stack with
+    /// every other layer hidden.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_soloed_layer_composites_on_the_gpu_like_the_stack_with_the_others_hidden() {
+        use texturecraft_engine::core::LayerKind;
+        use texturecraft_render::{headless::Headless, readback::Readback};
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        let render = |gpu: &mut Headless, session: &mut Session| {
+            let mut link = link();
+            link.gpu_composite_enabled = true;
+            let scene = link.sync(session, None, None, 0, 0.0);
+            assert!(!scene.composites.is_empty(), "the view composites on the GPU");
+            scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert_eq!(link.compositor_status().0, "Layers: GPU");
+            Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][0]).unwrap().2
+        };
+        let mut soloed = procedural_stack(128);
+        let stack = soloed.doc.project.texture_sets[0].stack.clone();
+        let layer = *stack.iter().find(|id| matches!(soloed.doc.project.layers[*id].kind, LayerKind::Fill(_))).unwrap();
+        let mut hidden = procedural_stack(128);
+        for id in stack.iter().filter(|id| **id != layer) {
+            hidden.doc.project.layers.get_mut(id).unwrap().visible = false;
+        }
+        let whole = render(&mut gpu, &mut procedural_stack(128));
+
+        soloed.set_solo(Some(texturecraft_engine::Solo { layer, ignore_mask: false }));
+        let solo = render(&mut gpu, &mut soloed);
+
+        assert_eq!(solo, render(&mut gpu, &mut hidden), "the solo view draws the soloed layer alone");
+        assert_ne!(solo, whole);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
