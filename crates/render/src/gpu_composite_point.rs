@@ -42,7 +42,7 @@ use super::{CompositeProgram, Operation, ProceduralInputs};
 /// Library filter ids P2 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
-// P2's opcodes (the same constants head composite_point.wgsl)
+// P2's opcodes (composite_point.wgsl switches on the same numbers)
 const HSL_PERCEPTIVE: u32 = 128;
 const POSTERIZE_ALPHA: u32 = 129;
 const HISTOGRAM_SCAN_INVERTED: u32 = 130;
@@ -264,7 +264,7 @@ mod tests {
             (Channel::Normal, Source::Uniform([0.37, 0.68, 0.89])),
         ]);
         let below = Layer::new(project.alloc_id(), "Below", LayerKind::Fill(Fill { sources, ..Default::default() }), &channels);
-        project.insert_layer(0, below, None, false).unwrap();
+        assert!(project.insert_layer(0, below, None, false).is_ok());
 
         let owner = project.alloc_id();
         let painted_mask = project.alloc_id();
@@ -280,7 +280,7 @@ mod tests {
             }
         }
         layer.mask = Some(mask);
-        project.insert_layer(0, layer, None, false).unwrap();
+        assert!(project.insert_layer(0, layer, None, false).is_ok());
 
         // Premultiplied paint, as the store keeps it
         let mut pixels = PixelStore::default();
@@ -408,16 +408,14 @@ mod tests {
         let curve = |preset| Filter::GradientCurve { preset, invert: false, balance: 0.5, contrast: 0.0 };
         let mut filters: Vec<Filter> = [CurvePreset::Round, CurvePreset::Pinch, CurvePreset::EaseOut, CurvePreset::Ease, CurvePreset::EaseIn]
             .into_iter()
-            .chain([CurvePreset::PeakOut, CurvePreset::Peak, CurvePreset::PeakIn, CurvePreset::Triangular])
+            .chain([CurvePreset::PeakOut, CurvePreset::Peak, CurvePreset::PeakIn, CurvePreset::Bump, CurvePreset::DoubleBump, CurvePreset::Triangular])
             .map(curve)
             .collect();
         filters.push(Filter::GradientCurve { preset: CurvePreset::Round, invert: true, balance: 0.3, contrast: 0.4 });
         filters.push(Filter::GradientCurve { preset: CurvePreset::Ease, invert: false, balance: 0.65, contrast: 0.8 });
-        let sines = [CurvePreset::Bump, CurvePreset::DoubleBump].map(curve);
         let steps = [curve(CurvePreset::Stairs), Filter::GradientCurve { preset: CurvePreset::Round, invert: false, balance: 0.5, contrast: 1.0 }];
 
         assert_filters_match_cpu(&filters, Tolerance::POINT);
-        assert_filters_match_cpu(&sines, Tolerance::TRANSCENDENTAL);
         // Stairs and full contrast are hard decisions; the painted values sit away from them
         assert_filters_match_cpu(&steps, Tolerance::POINT.with_flips(4));
     }
@@ -452,7 +450,7 @@ mod tests {
 
     #[test]
     fn gradients_with_stops_quantity_srgb_and_input_match_the_cpu() {
-        let three = vec![[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
+        let three = [[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
         let ramp = |colors: &[[f32; 3]], positions: &[f32], quantity, input, linear| Filter::GradientMap {
             colors: colors.to_vec(),
             positions: positions.to_vec(),
@@ -494,9 +492,9 @@ mod tests {
 
     #[test]
     fn the_gradient_debug_view_matches_the_cpu() {
-        let three = vec![[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
+        let three = [[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
         let debug = |positions: &[f32], input, linear| Filter::GradientMap {
-            colors: three.clone(),
+            colors: three.to_vec(),
             positions: positions.to_vec(),
             quantity: None,
             input,
