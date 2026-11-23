@@ -180,6 +180,15 @@ pub(super) fn place_cover(projection: &Projection, _sampling: Sampling, op: &mut
     }
 }
 
+/// The work per output texel of operation `op`, whose own work (a Tile Generator's placements
+/// per plane and sample, 0 for other operations) is `own`: P1 adds its fills' cost here,
+/// symmetry copies times sampling (planes, Bilinear HQ levels), so bands shrink and one
+/// submission stays short. It counts against the update budget too
+/// (`MAX_TILE_WORK_PER_UPDATE`). Today: `own`.
+pub(super) fn work_per_texel(_op: &Operation, own: u64) -> u64 {
+    own
+}
+
 /// Whether a program needs the full `composite_projection.wgsl`.
 pub(super) fn uses_shader(program: &CompositeProgram) -> bool {
     program.operations.iter().any(|op| op.ext[1] != 0 || PROJECTION_SELECTORS.contains(&op.procedural[3]))
@@ -225,6 +234,10 @@ mod tests {
                 assert_eq!(op.procedural[3], expected, "{projection:?} {source:?}");
             }
         }
+        // The work hook adds nothing yet: a fill costs what the bands counted before
+        let op = source_operation(Some(&image), &Projection::triplanar(), Sampling::SAVED_BEFORE, [0.5; 3], ChannelKind::Color, &mut ProceduralInputs::new(64))
+            .unwrap();
+        assert_eq!((super::work_per_texel(&op, 0), super::work_per_texel(&op, 7)), (0, 7));
         assert_eq!(super::image_use(Sampling::default()), ImageUse::Material);
         assert_eq!(super::image_use(Sampling::SAVED_BEFORE), ImageUse::Material);
     }

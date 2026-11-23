@@ -294,6 +294,13 @@ pub(crate) struct NeighbourhoodRegion {
     pub(crate) field_words: u32,
     /// 1 when the original field carries the input word.
     pub(crate) input: u32,
+    /// The stage wraps: it reads the field's periodic copies past the set's edges.
+    pub(crate) wrap: bool,
+    /// The set in field-local texels [x0, y0, x1, y1]: in a wrapping program the field holds
+    /// periodic copies of the set past its edges, and a stage that does not wrap never reads
+    /// across these bounds (`bounds` and the segment checks in neighbourhood.wgsl). Without a
+    /// wrapping stage the field lies inside the set and the bounds reach past it.
+    pub(crate) bounds: [i32; 4],
 }
 
 impl NeighbourhoodRegion {
@@ -313,6 +320,7 @@ struct Params {
     field_layout: [u32; 4],
     extra: [f32; 8],
     stage: [u32; 4],
+    bounds: [i32; 4],
 }
 
 pub(crate) struct NeighbourhoodGpu {
@@ -373,6 +381,7 @@ impl NeighbourhoodGpu {
             buffers: [region.original, region.blur[0], region.output, 0],
             mode: [cell, 0, 0, 0],
             field_layout: region.field_layout([0; 2]),
+            bounds: region.bounds,
             ..Params::zeroed()
         };
         Self::run(&self.cell_average, device, encoder, scratch, &params, cells.map(|side| side.div_ceil(APPLY_WORKGROUP)));
@@ -433,7 +442,8 @@ impl NeighbourhoodGpu {
                 direction: [filter.direction[0], filter.direction[1], 0.0, 0.0],
                 field_layout: region.field_layout(filter.words),
                 extra: filter.extra,
-                stage: [filter.context, 0, 0, 0],
+                stage: [filter.context, u32::from(region.wrap), 0, 0],
+                bounds: region.bounds,
             };
             Self::run(pipeline, device, encoder, scratch, &params, groups);
         };

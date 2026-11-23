@@ -663,12 +663,19 @@ impl CompositeProgram {
         self.mask_preview
     }
 
+    /// Work per output texel that sizes bands and submissions: Tile Generator placements per
+    /// plane and sample, and what P1 declares for its fills (`fill_projection::work_per_texel`:
+    /// symmetry copies times sampling cost).
     fn tile_work_per_pixel(&self) -> Result<u64, &'static str> {
-        self.operations.iter().filter(|op| op.ids[1] == TILE_GENERATOR_OPCODE).try_fold(0u64, |work, op| {
-            let tile_work = self.tile_patterns.work_per_sample(op.high[3] as usize).ok_or("A Tile Generator operation has no settings.")?;
-            let planes = if op.procedural[3] == 1 { 3 } else { 1 };
-            let samples = if op.procedural[0] == 0 { 1 } else { 4 };
-            Ok(work.saturating_add(tile_work.saturating_mul(planes * samples)))
+        self.operations.iter().try_fold(0u64, |work, op| {
+            let mut own = 0;
+            if op.ids[1] == TILE_GENERATOR_OPCODE {
+                let tile_work = self.tile_patterns.work_per_sample(op.high[3] as usize).ok_or("A Tile Generator operation has no settings.")?;
+                let planes = if op.procedural[3] == 1 { 3 } else { 1 };
+                let samples = if op.procedural[0] == 0 { 1 } else { 4 };
+                own = tile_work.saturating_mul(planes * samples);
+            }
+            Ok(work.saturating_add(fill_projection::work_per_texel(op, own)))
         })
     }
 
@@ -2354,6 +2361,9 @@ impl GpuCompositor {
                     let start = |pixel: u32| (i64::from(pixel << shift) - i64::from(halo)) as i32 as u32;
                     field_rect = [start(left), start(top), (width << shift).saturating_add(halo * 2), (rows << shift).saturating_add(halo * 2)];
                 }
+                // The set in field-local texels: a stage that does not wrap never reads across its
+                // edges (the CPU's region stops there), a wrapping one reads the periodic copy
+                let set_bounds = field_bounds(field_rect, source_size);
                 let mut values = [0; packages::UNIFORM_WORDS];
                 values[..packages::FIELD_LAYOUT].copy_from_slice(&[
                     width,
@@ -2461,7 +2471,9 @@ impl GpuCompositor {
                         let slot = if direct { output as u32 } else { fields };
                         source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
                         source[packages::FIELD_LAYOUT + 2] = stage.input;
-                        source[packages::FIELD_LAYOUT + 3] = u32::from(stage.wrap);
+                        // In a wrapping program every stage's field is a periodic copy of the set
+                        // past its edges; the stages keep apart what lies across a seam (`bounds`)
+                        source[packages::FIELD_LAYOUT + 3] = u32::from(wraps);
                         if let Some((channel, first, cut)) = stage.anchor {
                             source[36..39].copy_from_slice(&[channel_slot(channel), first, cut]);
                             source[40..43].copy_from_slice(&channel.default_value().map(f32::to_bits));
@@ -2496,6 +2508,8 @@ impl GpuCompositor {
                             output: offset(output as u32),
                             field_words: texel_words,
                             input: u32::from(texel_words > FIELD_WORDS),
+                            wrap: stage.wrap,
+                            bounds: set_bounds,
                         };
                         if stage.cell > 1 {
                             let target = if stage.filter.is_some() { region.original } else { region.output };
@@ -2537,6 +2551,13 @@ impl GpuCompositor {
     }
 }
 
+/// The set in the field-local texels of `field_rect` (origin as i32 bits) [x0, y0, x1, y1]:
+/// what a stage that does not wrap stays within (`NeighbourhoodRegion::bounds`).
+fn field_bounds(field_rect: [u32; 4], source_size: (u32, u32)) -> [i32; 4] {
+    let origin = [field_rect[0] as i32, field_rect[1] as i32];
+    [-origin[0], -origin[1], source_size.0 as i32 - origin[0], source_size.1 as i32 - origin[1]]
+}
+
 fn check_tile_update_budget(width: u32, height: u32, work_per_pixel: u64) -> Result<(), &'static str> {
     let estimated_work = (u64::from(width) * u64::from(height)).saturating_mul(work_per_pixel);
     if estimated_work > MAX_TILE_WORK_PER_UPDATE {
@@ -2566,7 +2587,15 @@ fn paint_windows(
     let mut work = vec![region];
     let mut windows = Vec::new();
     while let Some(chunk) = work.pop() {
-        let source = CompositeRegion { min: chunk.min.map(|p| p << shift), max: chunk.max.map(|p| p << shift) }.expanded(radius);
+        let mut source = CompositeRegion { min: chunk.min.map(|p| p << shift), max: chunk.max.map(|p| p << shift) }.expanded(radius);
+        if program.filters.wraps() {
+            // A wrapping program's fields read the far side of the set across a crossed edge
+            for (axis, side) in [size.0, size.1].into_iter().enumerate() {
+                if (chunk.min[axis] << shift) < radius || source.max[axis] > side {
+                    (source.min[axis], source.max[axis]) = (0, side);
+                }
+            }
+        }
         let window = CompositePaintWindow::covering(source.min, source.max, [size.0, size.1], &program.paint);
         if let Some(words) = window.words(&program.paint, limit) {
             windows.push((chunk, window, words));
