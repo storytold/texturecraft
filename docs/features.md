@@ -161,9 +161,11 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   channel with the summary and the message for each failed set.
 - **Live bake preview:** while the app bakes, each mesh map shows on the model as soon as it is
   finished; the bake bar follows the newest map, pins a finished one or shows the material.
-- **Export presets** for glTF PBR Metal Roughness, Unreal Engine (packed), Unity HDRP (mask map),
-  Unity Standard, Blender (Principled BSDF), Godot 4 (ORM), OpenPBR (with the coat, fuzz,
-  anisotropy, transmission and subsurface maps), separate maps, mesh maps and document channels, in
+- **Export presets**: the reference app's 40 built-in output templates (document channels with
+  and without alpha, glTF, Sketchfab, USDz and its static templates from Amazon Lumberyard to Vray
+  Next UDIM Legacy, with their file names, file types and channel packing; 2D View is listed
+  greyed), plus Godot 4 (ORM), OpenPBR (with the coat, fuzz, anisotropy, transmission and
+  subsurface maps) and separate maps, in
   PNG, JPEG, JNG, PGM, TGA, TIFF, BMP, WEBP, PSD, EXR or HDR at 8 bits (optionally dithered), 16
   bits or 32-bit float (TIFF, EXR, HDR; 16-bit half float for EXR), with UV padding (dilation,
   infinite, or dilation + diffusion), size override and OpenGL or DirectX normals.
