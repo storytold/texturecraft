@@ -15,6 +15,8 @@ const BOX_PRE_BLUR: u32 = 20u;
 // Glow and Drop Shadow
 const BOX_HALO: u32 = 21u;
 const BOX_OUTLINE: u32 = 22u;
+const BOX_DISTANCE_BEVEL: u32 = 24u;
+const BOX_BEVEL_SMOOTH: u32 = 25u;
 
 // Highpass in sRGB from ACEScg (params.field_layout.z; 0 is the working space, 1 sRGB from linear)
 const BOX_SPACE_SRGB_FROM_ACESCG: u32 = 2u;
@@ -36,6 +38,14 @@ const OUTLINE_COVERS_OUTSIDE: u32 = 4u;
 const OUTLINE_BAND_OFF: u32 = 8u;
 // The shapes' blurred share at their edge
 const BOX_OUTLINE_EDGE_SHARE: f32 = 0.5;
+// Flags in params.field_layout.z
+const DISTANCE_ANGULAR: u32 = 1u;
+const DISTANCE_INWARD: u32 = 2u;
+const DISTANCE_NON_UNIFORM: u32 = 4u;
+const SMOOTH_IN: u32 = 8u;
+const SMOOTH_IN_OUT: u32 = 16u;
+// From a texel's centre to the edge between it and the nearest texel across
+const BOX_EDGE_OFFSET: f32 = 0.5;
 
 // Whether a P4 kind runs the three box passes first (box_family::uses_box must agree).
 fn box_family_uses_box(kind: u32) -> bool {
@@ -335,6 +345,31 @@ fn box_outline_texel(original: Texel, blurred: Texel) -> vec4<f32> {
     return vec4((before + (max(before, vec3(band)) - before) * opacity) * value.w, value.w);
 }
 
+// Bevel::apply on the slope: an inward slope scales the shapes, an outward one rises around them
+fn box_bevel_texel(original: Texel, slope: f32) -> vec4<f32> {
+    let inside = box_inside_shapes(original);
+    let inward = (box_flags() & DISTANCE_INWARD) != 0u;
+    let value = original.value;
+    let opacity = params.weights.x;
+    if box_is_mask() {
+        var after = value.x;
+        if inward && inside {
+            after = value.x * slope;
+        } else if !inward && !inside {
+            after = max(value.x, slope);
+        }
+        return vec4(value.x + (after - value.x) * opacity, value.yzw);
+    }
+    let before = box_straight_color(value);
+    var after = before;
+    if inward && inside {
+        after = before * slope;
+    } else if !inward && !inside {
+        after = max(before, vec3(slope));
+    }
+    return vec4((before + (after - before) * opacity) * value.w, value.w);
+}
+
 // The apply pass of the kinds with passes of their own: the original at buffers.x, the filtered field at buffers.y, the result to buffers.z
 @compute @workgroup_size(8, 8)
 fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -365,6 +400,19 @@ fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     if kind == BOX_OUTLINE {
         result = box_outline_texel(original, filtered);
+    }
+    if kind == BOX_DISTANCE_BEVEL {
+        // buffers.z holds the unsmoothed slope; without smoothing (params.field_layout.w) buffers.y is that slope too
+        let sharp = read_at(params.buffers.z, point).value.x;
+        var slope = filtered.value.x;
+        if params.field_layout.w > 0u && (box_flags() & DISTANCE_NON_UNIFORM) != 0u {
+            // Keep the foot sharp and blur the top at full strength
+            slope = sharp + (filtered.value.x - sharp) * sharp;
+        }
+        result = box_bevel_texel(original, slope);
+    }
+    if kind == BOX_BEVEL_SMOOTH {
+        result = box_laid_on(original.value, filtered.value.x);
     }
     write_at(params.buffers.z, point, Texel(result, original.coverage));
 }
@@ -406,4 +454,326 @@ fn box_family_prepare(@builtin(global_invocation_id) id: vec3<u32>) {
         prepared = Texel(vec4(select(0.0, original.coverage, box_inside_shapes(original)), 0.0, 0.0, 0.0), original.coverage);
     }
     write_at(params.buffers.z, point, prepared);
+}
+
+// Floor division (WGSL's rounds towards zero)
+fn box_floor_div(value: i32, divisor: i32) -> i32 {
+    let quotient = value / divisor;
+    if value % divisor != 0 && (value < 0) != (divisor < 0) {
+        return quotient - 1;
+    }
+    return quotient;
+}
+
+// Where a line without a feature starts: beyond the field, squared or chessboard (shape_distance.rs)
+fn box_distance_far(angular: bool) -> f32 {
+    let side = f32(params.rect.z + params.rect.w);
+    if angular {
+        return side;
+    }
+    return side * side;
+}
+
+fn box_field_float(offset: u32, position: vec2<u32>, word: u32) -> f32 {
+    return bitcast<f32>(fields[word_at(offset, position) + word]);
+}
+
+fn box_field_word(offset: u32, position: vec2<u32>, word: u32) -> u32 {
+    return fields[word_at(offset, position) + word];
+}
+
+fn box_set_field_word(offset: u32, position: vec2<u32>, word: u32, value: u32) {
+    fields[word_at(offset, position) + word] = value;
+}
+
+// One invocation per row: the distance along it to the nearest texel inside (word 0) and outside (word 1) into buffers.z, the inside flag in word 4
+// A stage that does not wrap measures each copy of the set apart, as the CPU's region stops at the set's edges
+@compute @workgroup_size(64)
+fn distance_rows(@builtin(global_invocation_id) id: vec3<u32>) {
+    let y = id.x;
+    if y >= params.rect.w {
+        return;
+    }
+    let width = i32(params.rect.z);
+    var edges = array<i32, 4>(0, clamp(params.bounds.x, 0, width), clamp(params.bounds.z, 0, width), width);
+    for (var segment = 0; segment < 3; segment++) {
+        let start = select(edges[segment], 0, stage_wraps());
+        let end = select(edges[segment + 1], width, stage_wraps());
+        if start < end && (segment == 0 || !stage_wraps()) {
+            box_row_segment(y, start, end);
+        }
+    }
+}
+
+// Texels [start, end) of row y as one line
+fn box_row_segment(y: u32, start: i32, end: i32) {
+    let angular = (box_flags() & DISTANCE_ANGULAR) != 0u;
+    let far = box_distance_far(angular);
+    let rows = params.buffers.z;
+
+    // The nearest texel of each side to the left first
+    var last_inside = -1;
+    var last_outside = -1;
+    for (var x = start; x < end; x++) {
+        let position = vec2(u32(x), y);
+        let inside = box_inside_shapes(original_at(position));
+        if inside {
+            last_inside = x;
+        } else {
+            last_outside = x;
+        }
+        box_set_field_word(rows, position, 0u, bitcast<u32>(last_inside));
+        box_set_field_word(rows, position, 1u, bitcast<u32>(last_outside));
+        box_set_field_word(rows, position, BOX_SECOND_WORD, select(0u, 1u, inside));
+    }
+
+    // Then the nearer of it and the one to the right
+    var next_inside = -1;
+    var next_outside = -1;
+    for (var x = end - 1; x >= start; x--) {
+        let position = vec2(u32(x), y);
+        if box_field_word(rows, position, BOX_SECOND_WORD) != 0u {
+            next_inside = x;
+        } else {
+            next_outside = x;
+        }
+        for (var side = 0u; side < 2u; side++) {
+            let left = bitcast<i32>(box_field_word(rows, position, side));
+            let right = select(next_outside, next_inside, side == 0u);
+            var nearest = -1;
+            if left >= 0 {
+                nearest = x - left;
+            }
+            if right >= 0 && (nearest < 0 || right - x < nearest) {
+                nearest = right - x;
+            }
+            var distance = far;
+            if nearest >= 0 {
+                distance = f32(nearest);
+                if !angular {
+                    distance = distance * distance;
+                }
+            }
+            box_set_field_word(rows, position, side, bitcast<u32>(distance));
+        }
+    }
+}
+
+// A parabola (a cone for chessboard distances) of apex `apex` and height `height` at `place`
+fn box_envelope_value(place: i32, apex: i32, height: u32, angular: bool) -> u32 {
+    let across = u32(abs(place - apex));
+    if angular {
+        return max(across, height);
+    }
+    return across * across + height;
+}
+
+// The last place where the parabola of `apex` stays at or below that of `later` (Meijster's Sep)
+fn box_envelope_separation(apex: i32, later: i32, height_apex: u32, height_later: u32, angular: bool) -> i32 {
+    if angular {
+        let middle = box_floor_div(apex + later, 2);
+        if height_apex <= height_later {
+            return max(apex + i32(height_later), middle);
+        }
+        return min(later - i32(height_apex), middle);
+    }
+    let lifted = (later * later + i32(height_later)) - (apex * apex + i32(height_apex));
+    return box_floor_div(lifted, 2 * (later - apex));
+}
+
+// A column segment's lower envelope in exact integers (Meijster), where the CPU crosses the parabolas in f64
+// Rows [first, end) of column x: heights in word `side` of buffers.z, apexes and starts in buffers.y, the result in word side + 2 of buffers.z
+fn box_column_envelope(x: u32, side: u32, angular: bool, first: i32, end: i32) {
+    let height = end - first;
+    let heights = params.buffers.z;
+    let stack = params.buffers.y;
+    let apex_word = side * 2u;
+    let start_word = side * 2u + 1u;
+    let at = vec2(x, u32(first));
+    var top = 0;
+    box_set_field_word(stack, at, apex_word, 0u);
+    box_set_field_word(stack, at, start_word, 0u);
+    for (var u = 1; u < height; u++) {
+        let height_u = u32(box_field_float(heights, vec2(x, u32(first + u)), side));
+        loop {
+            if top < 0 {
+                break;
+            }
+            let apex = i32(box_field_word(stack, vec2(x, u32(first + top)), apex_word));
+            let start = i32(box_field_word(stack, vec2(x, u32(first + top)), start_word));
+            let height_apex = u32(box_field_float(heights, vec2(x, u32(first + apex)), side));
+            if box_envelope_value(start, apex, height_apex, angular) > box_envelope_value(start, u, height_u, angular) {
+                top -= 1;
+            } else {
+                break;
+            }
+        }
+        if top < 0 {
+            top = 0;
+            box_set_field_word(stack, at, apex_word, u32(u));
+            box_set_field_word(stack, at, start_word, 0u);
+        } else {
+            let apex = i32(box_field_word(stack, vec2(x, u32(first + top)), apex_word));
+            let height_apex = u32(box_field_float(heights, vec2(x, u32(first + apex)), side));
+            let start = 1 + box_envelope_separation(apex, u, height_apex, height_u, angular);
+            if start < height {
+                top += 1;
+                box_set_field_word(stack, vec2(x, u32(first + top)), apex_word, u32(u));
+                box_set_field_word(stack, vec2(x, u32(first + top)), start_word, u32(start));
+            }
+        }
+    }
+    for (var u = height - 1; u >= 0; u--) {
+        let apex = i32(box_field_word(stack, vec2(x, u32(first + top)), apex_word));
+        let start = i32(box_field_word(stack, vec2(x, u32(first + top)), start_word));
+        let height_apex = box_field_float(heights, vec2(x, u32(first + apex)), side);
+        var distance: f32;
+        if angular {
+            distance = max(f32(abs(u - apex)), height_apex);
+        } else {
+            // As DistanceEnvelope::lower computes it, in f32
+            let across = f32(u) - f32(apex);
+            distance = across * across + height_apex;
+        }
+        box_set_field_word(heights, vec2(x, u32(first + u)), side + 2u, bitcast<u32>(distance));
+        if u == start {
+            top -= 1;
+        }
+    }
+}
+
+// One invocation per column: both sides' envelopes over the row distances in buffers.z, each copy of the set apart unless the stage wraps
+@compute @workgroup_size(64)
+fn distance_columns(@builtin(global_invocation_id) id: vec3<u32>) {
+    let x = id.x;
+    if x >= params.rect.z {
+        return;
+    }
+    let angular = (box_flags() & DISTANCE_ANGULAR) != 0u;
+    let height = i32(params.rect.w);
+    var edges = array<i32, 4>(0, clamp(params.bounds.y, 0, height), clamp(params.bounds.w, 0, height), height);
+    for (var segment = 0; segment < 3; segment++) {
+        let start = select(edges[segment], 0, stage_wraps());
+        let end = select(edges[segment + 1], height, stage_wraps());
+        if start < end && (segment == 0 || !stage_wraps()) {
+            box_column_envelope(x, 0u, angular, start, end);
+            box_column_envelope(x, 1u, angular, start, end);
+        }
+    }
+}
+
+// The sum of two unsigned 64-bit integers, each two u32 words with the high one first
+fn box_wide_add(first: vec2<u32>, second: vec2<u32>) -> vec2<u32> {
+    let low = first.y + second.y;
+    return vec2(first.x + second.x + select(0u, 1u, low < first.y), low);
+}
+
+// The product of two integers below 2^26 as an unsigned 64-bit integer
+fn box_wide_product(first: u32, second: u32) -> vec2<u32> {
+    let first_high = first >> 13u;
+    let first_low = first & 0x1fffu;
+    let second_high = second >> 13u;
+    let second_low = second & 0x1fffu;
+    let high = first_high * second_high;
+    let cross_term = first_high * second_low + first_low * second_high;
+    let low = first_low * second_low;
+    let upper = box_wide_add(vec2(high >> 6u, high << 26u), vec2(cross_term >> 19u, cross_term << 13u));
+    return box_wide_add(upper, vec2(0u, low));
+}
+
+// `value` times 2^shift as an unsigned 64-bit integer
+fn box_wide_shifted(value: u32, shift: u32) -> vec2<u32> {
+    if shift >= 32u {
+        return vec2(value << (shift - 32u), 0u);
+    }
+    if shift == 0u {
+        return vec2(0u, value);
+    }
+    return vec2(value >> (32u - shift), value << shift);
+}
+
+fn box_wide_less(first: vec2<u32>, second: vec2<u32>) -> bool {
+    return first.x < second.x || (first.x == second.x && first.y < second.y);
+}
+
+// Whether integer `value` lies below the square of odd · 2^exponent (exponent below zero)
+fn box_below_square(value: u32, odd: u32, exponent: i32) -> bool {
+    return box_wide_less(box_wide_shifted(value, u32(-2 * exponent)), box_wide_product(odd, odd));
+}
+
+// The correctly rounded square root of an integer-valued f32 below 2^32, as the CPU's sqrt gives it (WGSL's may be off)
+// A root of an integer never lies on a midpoint between two floats unless it is whole, so the midpoints decide
+fn box_exact_sqrt(squared: f32) -> f32 {
+    let value = u32(squared);
+    if value == 0u {
+        return 0.0;
+    }
+    var root = sqrt(squared);
+    for (var attempt = 0; attempt < 4; attempt++) {
+        let bits = bitcast<u32>(root);
+        let exponent = i32(bits >> 23u) - 127;
+        let mantissa = (bits & 0x7fffffu) | 0x800000u;
+        if !box_below_square(value, 2u * mantissa + 1u, exponent - 24) {
+            root = bitcast<f32>(bits + 1u);
+            continue;
+        }
+
+        // Below a power of two the next float down is half as far
+        var below_lower: bool;
+        if (bits & 0x7fffffu) == 0u {
+            below_lower = box_below_square(value, 4u * mantissa - 1u, exponent - 25);
+        } else {
+            below_lower = box_below_square(value, 2u * mantissa - 1u, exponent - 24);
+        }
+        if !below_lower {
+            break;
+        }
+        root = bitcast<f32>(bits - 1u);
+    }
+    return root;
+}
+
+// The edge distance (word 1) and the ramp a distance filter makes of it (word 0) into buffers.z from the envelopes in buffers.y
+// Coverage 1 everywhere, so the smoothing blurs every texel alike as the CPU's blur does; the reach in extra 1
+@compute @workgroup_size(8, 8)
+fn distance_edges(@builtin(global_invocation_id) id: vec3<u32>) {
+    let point = id.xy;
+    if any(point >= params.rect.zw) {
+        return;
+    }
+    let distances = params.buffers.y;
+    let inside = box_field_word(distances, point, BOX_SECOND_WORD) != 0u;
+    let flags = box_flags();
+    var distance = box_field_float(distances, point, select(2u, 3u, inside));
+    if (flags & DISTANCE_ANGULAR) == 0u {
+        distance = box_exact_sqrt(distance);
+    }
+    let edge = max(distance - BOX_EDGE_OFFSET, 0.0);
+    var reach = box_extra(1u);
+
+    // Bevel Smooth's Distance Map reads 0 off the mesh, which takes its reach away there
+    if params.mode.y == BOX_BEVEL_SMOOTH && original_at(point).coverage <= 0.0 {
+        reach = 0.0;
+    }
+    var along = 1.0;
+    if reach > 0.0 {
+        along = clamp(edge / reach, 0.0, 1.0);
+    }
+    var ramp: f32;
+    if params.mode.y == BOX_DISTANCE_BEVEL {
+        // Bevel::slope
+        let inward = (flags & DISTANCE_INWARD) != 0u;
+        ramp = select(select(0.0, along, inside), select(1.0 - along, 1.0, inside), !inward);
+    } else {
+        // BevelSmooth::value, bent by its curve (offset in extra 2, exponent in extra 3)
+        let curved = box_ramp_curve(along, box_extra(2u), box_extra(3u));
+        if (flags & SMOOTH_IN) != 0u {
+            ramp = select(0.0, curved, inside);
+        } else if (flags & SMOOTH_IN_OUT) != 0u {
+            ramp = select(0.5 - 0.5 * curved, 0.5 + 0.5 * curved, inside);
+        } else {
+            ramp = select(1.0 - curved, 1.0, inside);
+        }
+    }
+    write_at(params.buffers.z, point, Texel(vec4(ramp, edge, 0.0, 0.0), 1.0));
 }

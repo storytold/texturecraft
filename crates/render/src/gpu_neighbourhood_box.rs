@@ -37,12 +37,15 @@
 //! mask, chained, and with a partial region (the halo); distance filters also compare the raw
 //! distance field exactly.
 
-use texturecraft_core::{ChannelKind, Filter, GrayscaleMode, HighpassSpace, MaskOutline};
+use texturecraft_core::{Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, ChannelKind, Filter, GrayscaleMode, HighpassSpace, MaskOutline};
 
-use super::{APPLY_WORKGROUP, BOX_KINDS, BOX_PASSES, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs};
+use super::{
+    APPLY_WORKGROUP, BOX_KINDS, BOX_PASSES, DISTANCE_KINDS, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params,
+    StageInputs,
+};
 
 /// Library filter ids P4 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["bevel", "bevelSmooth", "directionalDistance"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["directionalDistance"];
 
 pub(super) const WGSL: &str = include_str!("shaders/neighbourhood_box.wgsl");
 
@@ -61,6 +64,10 @@ const PRE_BLUR: Kind = Kind(BOX_KINDS.start + 4);
 const HALO: Kind = Kind(BOX_KINDS.start + 5);
 /// Mask Outline.
 const OUTLINE: Kind = Kind(BOX_KINDS.start + 6);
+/// Bevel (`DistanceBevel`).
+const DISTANCE_BEVEL: Kind = Kind(DISTANCE_KINDS.start);
+/// Bevel Smooth.
+const BEVEL_SMOOTH: Kind = Kind(DISTANCE_KINDS.start + 1);
 
 /// Flag bits of `NeighbourhoodFilter::words[0]` per kind (the same constants in the WGSL file).
 const HALO_INNER: u32 = 1;
@@ -69,6 +76,13 @@ const OUTLINE_FROM_BLACK: u32 = 1;
 const OUTLINE_COVERS_INSIDE: u32 = 2;
 const OUTLINE_COVERS_OUTSIDE: u32 = 4;
 const OUTLINE_BAND_OFF: u32 = 8;
+const DISTANCE_ANGULAR: u32 = 1;
+const DISTANCE_INWARD: u32 = 2;
+const DISTANCE_NON_UNIFORM: u32 = 4;
+const SMOOTH_IN: u32 = 8;
+const SMOOTH_IN_OUT: u32 = 16;
+/// A distance filter that reads past the set's edges from the far side (the shader ignores it).
+const DISTANCE_WRAP: u32 = 256;
 
 /// Filter sizes are texels at this many texels per side, as the CPU scales them.
 const FILTER_SIZE_RESOLUTION: f32 = 2048.0;
@@ -92,11 +106,20 @@ const OWN_PASS_WORK: u64 = 2;
 pub(super) struct Pipelines {
     prepare: wgpu::ComputePipeline,
     apply: wgpu::ComputePipeline,
+    distance_rows: wgpu::ComputePipeline,
+    distance_columns: wgpu::ComputePipeline,
+    distance_edges: wgpu::ComputePipeline,
 }
 
 impl Pipelines {
     pub(super) fn new(pipeline: &dyn Fn(&'static str) -> wgpu::ComputePipeline) -> Self {
-        Self { prepare: pipeline("box_family_prepare"), apply: pipeline("box_family_apply") }
+        Self {
+            prepare: pipeline("box_family_prepare"),
+            apply: pipeline("box_family_apply"),
+            distance_rows: pipeline("distance_rows"),
+            distance_columns: pipeline("distance_columns"),
+            distance_edges: pipeline("distance_edges"),
+        }
     }
 }
 
@@ -112,6 +135,8 @@ pub(super) fn supports(filter: &Filter) -> bool {
             | Filter::HaloGlow { .. }
             | Filter::DropShadow { .. }
             | Filter::MaskOutline(_)
+            | Filter::DistanceBevel(_)
+            | Filter::BevelSmooth(_)
     )
 }
 
@@ -143,6 +168,8 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
             Some(halo(stage, texels(*size * Filter::HALO_REACH), 0, (*spread, *opacity), *color, true, offset))
         }
         Filter::MaskOutline(outline) => Some(mask_outline(stage, outline)),
+        Filter::DistanceBevel(bevel) => Some(distance_bevel(stage, bevel)),
+        Filter::BevelSmooth(smooth) => Some(bevel_smooth(stage, smooth)),
         _ => None,
     }
 }
@@ -247,9 +274,54 @@ fn mask_outline(stage: StageInputs, outline: &MaskOutline) -> NeighbourhoodFilte
     stage_filter
 }
 
+/// A distance filter's stage: three box passes' reach covers the distance and its smoothing.
+fn distance_stage(stage: StageInputs, kind: Kind, distance_reach: f32) -> NeighbourhoodFilter {
+    stage.filter(kind, distance_reach / BOX_PASSES as f32 + 1.0)
+}
+
+/// A Bevel stage: the edge threshold and the reach in `extra`, the smoothing radius in `words[1]`.
+fn distance_bevel(stage: StageInputs, bevel: &Bevel) -> NeighbourhoodFilter {
+    let reach = bevel.reach(stage.resolution);
+    let smoothing = bevel.smoothing_texels(stage.resolution);
+    let flags = flag(bevel.corner == BevelCorner::Angular, DISTANCE_ANGULAR)
+        | flag(bevel.inward(), DISTANCE_INWARD)
+        | flag(bevel.blur == BevelBlur::NonUniform, DISTANCE_NON_UNIFORM)
+        | flag(bevel.wrap, DISTANCE_WRAP);
+
+    let mut stage_filter = distance_stage(stage, DISTANCE_BEVEL, reach + BOX_PASSES as f32 * smoothing);
+    stage_filter.extra[..2].copy_from_slice(&[Bevel::EDGE, reach]);
+    stage_filter.words = [flags, smoothing.round() as u32];
+    stage_filter
+}
+
+/// A Bevel Smooth stage: threshold, reach and curve in `extra`, the smoothing radius in `words[1]`.
+fn bevel_smooth(stage: StageInputs, smooth: &BevelSmooth) -> NeighbourhoodFilter {
+    let reach = smooth.reach(stage.resolution);
+    let smoothing = smooth.smoothing_texels(stage.resolution);
+    let direction_flag = match smooth.direction {
+        BevelDirection::Out => 0,
+        BevelDirection::In => SMOOTH_IN,
+        BevelDirection::InOut => SMOOTH_IN_OUT,
+    };
+
+    let mut stage_filter = distance_stage(stage, BEVEL_SMOOTH, reach + BOX_PASSES as f32 * smoothing);
+    stage_filter.extra[..4].copy_from_slice(&[
+        threshold(smooth.threshold, BevelSmooth::LIBRARY.threshold),
+        reach,
+        bounded_curve(smooth.curve_offset),
+        curve_exponent(smooth.curve_shape),
+    ]);
+    stage_filter.words = [direction_flag | flag(smooth.wrap, DISTANCE_WRAP), smoothing.round() as u32];
+    stage_filter
+}
+
 /// Whether the stage reads past the set's edges from the far side (`FilterStage::wrap`).
 pub(crate) fn wraps(filter: NeighbourhoodFilter) -> bool {
-    matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL)
+    match filter.kind {
+        WRAPPED_BLUR | WRAPPED_BEVEL => true,
+        DISTANCE_BEVEL | BEVEL_SMOOTH => filter.words[0] & DISTANCE_WRAP != 0,
+        _ => false,
+    }
 }
 
 pub(super) fn uses_box(filter: NeighbourhoodFilter) -> bool {
@@ -272,6 +344,8 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
         PRE_BLUR => BOX_FILTER_WORK + OWN_PASS_WORK,
         HALO => BOX_FILTER_WORK + OWN_PASS_WORK,
         OUTLINE => BOX_FILTER_WORK + OWN_PASS_WORK,
+        // Rows, columns, edges, the smoothing's box passes and the apply pass
+        DISTANCE_BEVEL | BEVEL_SMOOTH => BOX_FILTER_WORK + 4 * OWN_PASS_WORK,
         _ => BOX_FILTER_WORK,
     }
 }
@@ -334,6 +408,16 @@ pub(super) fn encode(
             let blurred = box_passes(&mut run, &gpu.box_blur, region, original, filter.radius);
             run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups);
         }
+        // Row distances in the first blur field, the envelopes' stacks in the second, the ramp in the output, then its smoothing
+        DISTANCE_BEVEL | BEVEL_SMOOTH => {
+            let [rows, stacks] = region.blur;
+            run(&pipelines.distance_rows, [original, 0, rows, 0], filter.radius, false, [height.div_ceil(LINE_WORKGROUP), 1]);
+            run(&pipelines.distance_columns, [original, stacks, rows, 0], filter.radius, false, [width.div_ceil(LINE_WORKGROUP), 1]);
+            run(&pipelines.distance_edges, [original, rows, output, 0], filter.radius, false, texel_groups);
+            let smoothing = filter.words[1];
+            let ramp = if smoothing > 0 { box_passes(&mut run, &gpu.box_blur, region, output, smoothing) } else { output };
+            run(&pipelines.apply, [original, ramp, output, 0], filter.radius, false, texel_groups);
+        }
         // Pixelate gathers and the wrapping filters run the built-in passes
         _ => return false,
     }
@@ -344,23 +428,27 @@ pub(super) fn encode(
 mod tests {
     use std::sync::Arc;
 
+    use texturecraft_compose::distance_test_hooks;
     use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
     use texturecraft_core::{
-        BakedMap, BlendMode, Channel, ChannelKind, ContentsOffset, Effect, EffectKind, Filter, Generator, GeneratorKind, GradientInput, GrayscaleMode,
-        HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground, MaskOutline, OutlinePosition, Project, Source, TextureSet,
+        BakedMap, Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, BlendMode, Channel, ChannelKind, ContentsOffset, Effect, EffectKind, Filter,
+        Generator, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground, MaskOutline, OutlinePosition,
+        Project, Source, TextureSet,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TileImage, to_u16, to_u16_signed};
     use wgpu::util::DeviceExt;
 
-    use super::super::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, StageInputs};
+    use super::super::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs};
     use crate::gpu_composite::CompositeRegion;
     use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
     use crate::headless::Headless;
 
     /// Side of the oracle sets, in texels.
     const SIZE: u32 = 128;
+    /// Side of the sets whose smoothing reaches two texels and more.
+    const SMOOTHING_SIZE: u32 = 256;
 
     /// Cell centres are a hard decision: at most 0.1 % of the texels may flip.
     const CELL_CENTRES: Tolerance = Tolerance::NEIGHBOURHOOD.with_flips((SIZE * SIZE / 1000) as usize);
@@ -385,6 +473,8 @@ mod tests {
     const MIDDLE: CompositeRegion = CompositeRegion { min: [61, 57], max: [75, 73] };
     /// A corner of the set, whose halo reaches across its edges.
     const CORNER: CompositeRegion = CompositeRegion { min: [120, 2], max: [128, 18] };
+    /// [`MIDDLE`] in a [`SMOOTHING_SIZE`] set.
+    const SMOOTHING_MIDDLE: CompositeRegion = CompositeRegion { min: [122, 114], max: [150, 146] };
 
     /// P4's filters and settings that still composite on the CPU, in content and in masks. Port
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
@@ -425,6 +515,9 @@ mod tests {
             LIBRARY_GLOW,
             LIBRARY_DROP_SHADOW,
             Filter::MaskOutline(MaskOutline::LIBRARY),
+            Filter::DistanceBevel(Bevel::LIBRARY),
+            Filter::DistanceBevel(Bevel { wrap: true, ..Bevel::LIBRARY }),
+            Filter::BevelSmooth(BevelSmooth::LIBRARY),
         ];
 
         for filter in ported {
@@ -812,5 +905,150 @@ mod tests {
         ];
 
         assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
+    }
+
+    /// Bevel and Bevel Smooth match the CPU: the library's, every corner, blur, direction and side,
+    /// curves, below full opacity, disabled and chained.
+    #[test]
+    fn bevel_and_bevel_smooth_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let angular = Bevel { corner: BevelCorner::Angular, smoothing: 2.0, blur: BevelBlur::Uniform, ..Bevel::LIBRARY };
+        let outward = Bevel { distance: 0.08, smoothing: 1.0, ..Bevel::LIBRARY };
+        let inward_smooth = BevelSmooth { direction: BevelDirection::In, curve_offset: 0.2, curve_shape: 0.5, ..BevelSmooth::LIBRARY };
+        let across_smooth = BevelSmooth { direction: BevelDirection::InOut, smoothing: 0.0, curve_shape: -0.7, ..BevelSmooth::LIBRARY };
+        let normal = BlendMode::Normal;
+        let cases = [
+            ("library Bevel", vec![(Filter::DistanceBevel(Bevel::LIBRARY), 1.0, normal)], normal),
+            ("angular uniform Bevel", vec![(Filter::DistanceBevel(angular), 0.8, normal)], BlendMode::Multiply),
+            ("outward Bevel", vec![(Filter::DistanceBevel(outward), 1.0, normal)], normal),
+            ("Bevel disabled", vec![(Filter::DistanceBevel(Bevel::LIBRARY), 1.0, BlendMode::Disable)], normal),
+            ("library Bevel Smooth", vec![(Filter::BevelSmooth(BevelSmooth::LIBRARY), 1.0, normal)], normal),
+            ("inward curved Bevel Smooth", vec![(Filter::BevelSmooth(inward_smooth), 0.7, normal)], normal),
+            ("Bevel Smooth across the edge", vec![(Filter::BevelSmooth(across_smooth), 1.0, normal)], normal),
+            (
+                "Bevel between filters",
+                vec![(Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal), (Filter::DistanceBevel(outward), 0.9, normal), (Filter::Invert, 1.0, normal)],
+                normal,
+            ),
+        ];
+
+        assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
+    }
+
+    /// The smoothing of Bevel (both blurs) and Bevel Smooth over two texels and more matches the CPU
+    /// on a mesh that leaves the set's border uncovered, where Bevel Smooth's Distance Map reads 0.
+    #[test]
+    fn distance_smoothing_matches_the_cpu_off_the_mesh_too() {
+        let Some(mut gpu) = headless() else { return };
+        let non_uniform = Bevel { smoothing: 4.0, ..Bevel::LIBRARY };
+        let uniform = Bevel { smoothing: 5.0, blur: BevelBlur::Uniform, corner: BevelCorner::Angular, ..Bevel::LIBRARY };
+        let smooth = BevelSmooth { smoothing: 8.0, ..BevelSmooth::LIBRARY };
+        let normal = BlendMode::Normal;
+        let cases = [
+            ("smoothed non-uniform Bevel", vec![(Filter::DistanceBevel(non_uniform), 1.0, normal)], normal),
+            ("smoothed uniform Bevel", vec![(Filter::DistanceBevel(uniform), 0.8, normal)], BlendMode::Multiply),
+            ("smoothed Bevel Smooth", vec![(Filter::BevelSmooth(smooth), 1.0, normal)], normal),
+            (
+                "smoothed Bevel after a blur",
+                vec![(Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal), (Filter::DistanceBevel(non_uniform), 0.9, normal)],
+                normal,
+            ),
+        ];
+
+        assert!(check_cases(&mut gpu, &cases, (false, SMOOTHING_SIZE, true), SMOOTHING_MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
+    }
+
+    /// Bevel and Bevel Smooth with Wrap match the CPU on paint across the set's edges, and a Bevel
+    /// without it matches in a program whose wrapping Blur widens every field past the edges.
+    #[test]
+    fn wrapping_and_mixed_distance_filters_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let normal = BlendMode::Normal;
+        let smoothed = Bevel { smoothing: 1.0, ..Bevel::LIBRARY };
+        let cases = [
+            ("wrapped Bevel", vec![(Filter::DistanceBevel(Bevel { wrap: true, ..smoothed }), 1.0, normal)], normal),
+            ("wrapped Bevel Smooth", vec![(Filter::BevelSmooth(BevelSmooth { wrap: true, ..BevelSmooth::LIBRARY }), 0.8, normal)], normal),
+            (
+                "Bevel after a wrapped Blur",
+                vec![(Filter::Blur { radius: 64.0, wrap: true }, 1.0, normal), (Filter::DistanceBevel(smoothed), 1.0, normal)],
+                normal,
+            ),
+        ];
+
+        assert!(check_cases(&mut gpu, &cases, EDGE_PAINT, CORNER, Tolerance::NEIGHBOURHOOD).is_some());
+    }
+
+    /// The fields after only P4's own `passes` of `filter` (entry point, then the original, the
+    /// field read and the field written by index: 0 original, 1 and 2 the blur fields, 3 the output).
+    fn run_passes(gpu: &Headless, texels: &[([f32; 4], f32)], size: (u32, u32), filter: NeighbourhoodFilter, passes: &[(&str, [usize; 3])]) -> Vec<[u32; 5]> {
+        let (scratch, region) = fields_on_gpu(gpu, texels, size);
+        let offsets = [region.original, region.blur[0], region.blur[1], region.output];
+        let kernels = NeighbourhoodGpu::new(&gpu.device);
+        let pipelines = &kernels.box_family;
+        let texel_groups = [size.0.div_ceil(8), size.1.div_ceil(8)];
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        for (entry, [original, read, written]) in passes {
+            let (pipeline, groups) = match *entry {
+                "distance_rows" => (&pipelines.distance_rows, [size.1.div_ceil(64), 1]),
+                "distance_columns" => (&pipelines.distance_columns, [size.0.div_ceil(64), 1]),
+                "distance_edges" => (&pipelines.distance_edges, texel_groups),
+                _ => (&pipelines.prepare, texel_groups),
+            };
+            let params = Params {
+                rect: region.rect,
+                buffers: [offsets[*original], offsets[*read], offsets[*written], 0],
+                mode: [filter.radius, filter.kind.0, filter.seed, 0],
+                weights: [filter.opacity, filter.amount, filter.frequency, filter.middle],
+                direction: [filter.direction[0], filter.direction[1], 0.0, 0.0],
+                field_layout: region.field_layout(filter.words),
+                extra: filter.extra,
+                stage: [filter.context, 0, 0, 0],
+                bounds: region.bounds,
+            };
+            NeighbourhoodGpu::run(pipeline, &gpu.device, &mut encoder, &scratch, &params, groups);
+        }
+        read_fields(gpu, encoder, &scratch)
+    }
+
+    /// Shapes with straight edges, corners, a disc, single texels and gaps over a field wider than tall.
+    fn shapes(width: usize, height: usize) -> Vec<bool> {
+        let mut seed = 12345u32;
+        (0..width * height)
+            .map(|texel| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let (x, y) = (texel % width, texel / width);
+                let block = (9..31).contains(&x) && (5..22).contains(&y);
+                let disc = (x as f32 - 52.0).hypot(y as f32 - 30.0) < 11.5;
+                block || disc || (seed >> 16) % 97 < 3
+            })
+            .collect()
+    }
+
+    /// The shapes as a mask field: inside 1, outside 0, every texel covered.
+    fn mask_field(inside: &[bool]) -> Vec<([f32; 4], f32)> {
+        inside.iter().map(|&inside| ([if inside { 1.0 } else { 0.0 }, 0.0, 0.0, 1.0], 1.0)).collect()
+    }
+
+    /// The edge distances of the GPU's integer envelopes and exact square roots equal the CPU's
+    /// f64 ones bit for bit, straight and chessboard.
+    #[test]
+    fn edge_distances_equal_the_cpu_exactly() {
+        let Some(gpu) = headless() else { return };
+        let (width, height) = (77usize, 53usize);
+        let inside = shapes(width, height);
+        let field = mask_field(&inside);
+        let passes = [("distance_rows", [0, 0, 1]), ("distance_columns", [0, 2, 1]), ("distance_edges", [0, 1, 3])];
+
+        for corner in [BevelCorner::Round, BevelCorner::Angular] {
+            let bevel = Filter::DistanceBevel(Bevel { corner, ..Bevel::LIBRARY });
+            let filter = super::new(&bevel, stage_at_2k(None, 1.0)).unwrap();
+
+            let fields = run_passes(&gpu, &field, (width as u32, height as u32), filter, &passes);
+
+            let gpu_distances: Vec<u32> = fields[3 * width * height..].iter().map(|texel| texel[1]).collect();
+            let cpu_distances: Vec<u32> =
+                distance_test_hooks::edge_distances(&inside, (width, height), corner == BevelCorner::Angular).iter().map(|d| d.to_bits()).collect();
+            assert_eq!(gpu_distances, cpu_distances, "{corner:?}");
+        }
     }
 }
