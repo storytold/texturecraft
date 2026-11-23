@@ -20,13 +20,18 @@ pub(crate) const DECAL_PROJECTION: u32 = 9;
 /// and P7 (the mask image a stroke paints) read plain texels with `Material`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImageUse {
-    /// Texels as material image fills and decals sample them today.
+    /// The image's texels alone (Bilinear Sharp and Nearest reads).
     Material,
+    /// The image and its halved levels as stored: Bilinear HQ of a scalar, normal or alpha read.
+    Mipmapped,
+    /// The image and its halved levels for a colour read: an sRGB image's levels are linear.
+    MipmappedColor,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct MaterialImages {
-    names: Vec<String>,
+    /// Each registered image with what it is read for: one image read two ways is held twice
+    names: Vec<(String, ImageUse)>,
     images: Vec<Option<Arc<ImageRes>>>,
     decals: Vec<DecalSource>,
     /// The composited mesh's centre and radius (`set_surface`): P1's band uniform turns positions
@@ -42,13 +47,11 @@ struct DecalSource {
 
 impl MaterialImages {
     pub(crate) fn register_image(&mut self, name: &str, usage: ImageUse) -> u32 {
-        // Every image is read as material texels until P1 adds another kind.
-        debug_assert_eq!(usage, ImageUse::Material);
-        if let Some(index) = self.names.iter().position(|existing| existing == name) {
+        if let Some(index) = self.names.iter().position(|(existing, existing_usage)| existing == name && *existing_usage == usage) {
             return index as u32;
         }
         let index = self.names.len() as u32;
-        self.names.push(name.to_owned());
+        self.names.push((name.to_owned(), usage));
         index
     }
 
@@ -76,13 +79,22 @@ impl MaterialImages {
     }
 
     pub(crate) fn set_images(&mut self, images: &ImageStore) {
-        self.images = self.names.iter().map(|name| images.get(name).cloned()).collect();
+        self.images = self.names.iter().map(|(name, _)| images.get(name).cloned()).collect();
     }
 
-    /// The colour images for the atlas, each with the halved levels it needs (P1: mip chains for
-    /// Bilinear HQ; none today, so the atlas uploads exactly what it did before).
+    /// The colour images for the atlas, each with the halved levels its reads need: the chain
+    /// Bilinear HQ reads (`ImageRes::mip_chain`), linear for an sRGB image's colour read
+    /// (`ImageRes::linear_mip_chain`).
     pub(crate) fn atlas_images(&self) -> impl Iterator<Item = (&Arc<ImageRes>, AtlasMips)> {
-        self.images.iter().flatten().map(|image| (image, AtlasMips::None))
+        self.names.iter().zip(&self.images).filter_map(|((_, usage), image)| {
+            let image = image.as_ref()?;
+            let mips = match usage {
+                ImageUse::Material => AtlasMips::None,
+                ImageUse::MipmappedColor if image.srgb => AtlasMips::LinearColor,
+                ImageUse::Mipmapped | ImageUse::MipmappedColor => AtlasMips::Stored,
+            };
+            Some((image, mips))
+        })
     }
 
     /// Exact-f32 planes for the atlas (P1: projector depth grids built in [`Self::set_surface`]).

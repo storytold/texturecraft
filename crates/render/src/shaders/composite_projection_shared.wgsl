@@ -7,6 +7,9 @@ const P1_HQ: u32 = 4u;
 const P1_CLAMP_U: u32 = 8u;
 const P1_CLAMP_V: u32 = 16u;
 
+// An image descriptor's flag: its halved levels follow its planes (gpu_tile_pattern.rs append_rgba)
+const P1_IMAGE_LEVELS: u32 = 512u;
+
 // Operation.procedural.w of the reads P1 hands to the image and pattern code: one image point
 // already projected, or up to three pattern points already placed, with their weights
 const P1_POINT_PROJECTION: u32 = 17u;

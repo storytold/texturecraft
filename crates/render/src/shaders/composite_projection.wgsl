@@ -85,6 +85,8 @@ const P1_MIN_AXIS_DISTANCE: f32 = 1e-6;
 const P1_FLOAT_EPSILON: f32 = 1.1920929e-7;
 // A warp quad's twist this small against its area counts as parallel sides (compose warp.rs RELATIVE_PARALLEL)
 const P1_RELATIVE_PARALLEL: f32 = 1e-6;
+// A neighbour farther than this share of the image away lies across a UV seam (compose eval.rs SEAM_JUMP_SHARE)
+const P1_SEAM_JUMP_SHARE: f32 = 0.25;
 // Symmetry copies stop once they cover this much (compose eval.rs COVERED)
 const P1_COVERED: f32 = 0.9999;
 // The word of a decal's alpha image in its frame words (gpu_image_source.rs decal_words)
@@ -663,9 +665,54 @@ fn p1_frame_alpha(op: Operation, point: vec2<f32>, surface: Surface) -> f32 {
     return clamp(p1_read_image(op, alpha_image, point, surface, 1.0, false, P1_ALPHA_KIND).x, 0.0, 1.0);
 }
 
-// Image texels per surface texel in each image plane (compose Texel::footprints)
+// Image texels per surface texel in each image plane of an image `size` texels large (compose
+// Texel::footprints): from the UV step on UV projections, else from where the next texels across
+// and down land
 fn p1_footprints(op: Operation, samples: P1Samples, uv: vec2<f32>, copy: P1Copy, size: vec2<f32>) -> vec3<f32> {
-    return vec3(1.0);
+    let source = vec2<f32>(params.source.xy);
+    let kind = param_word(op, P1_KIND);
+    if kind == P1_KIND_UV || kind == P1_KIND_UV_TILE {
+        // The current tile's affine mapping, even where a neighbour wraps or is uncovered
+        let step = 1.0 / source;
+        var span = max(step.x * size.x, step.y * size.y);
+        if kind == P1_KIND_UV {
+            let scale = p1_vec2(op, P1_SCALE);
+            let turn = p1_vec2(op, P1_ROTATION);
+            let across = length(p1_place(vec2(step.x, 0.0), scale, turn, vec2(0.0)) * size);
+            let down = length(p1_place(vec2(0.0, step.y), scale, turn, vec2(0.0)) * size);
+            span = max(across, down);
+        }
+        return vec3(select(1.0, max(span, 1.0), p1_finite(span)), 1.0, 1.0);
+    }
+
+    var points = samples.points;
+    var footprints = vec3(1.0);
+    let pixel = vec2<u32>(uv * source);
+    let seam_limit = max(size.x, size.y) * P1_SEAM_JUMP_SHARE;
+    for (var across = 0u; across < 2u; across++) {
+        let next_pixel = pixel + vec2(1u - across, across);
+        let neighbour = p1_copied(surface_at(next_pixel), copy);
+        if !neighbour.valid {
+            continue;
+        }
+        var coords = P1Coords((vec2<f32>(next_pixel) + 0.5) / source, neighbour.position, neighbour.normal);
+        if (op.ext.y & P1_FRAMED) != 0u {
+            let framed = p1_framed(op, p1_world(neighbour.position), neighbour.normal);
+            if framed.w == 0.0 {
+                continue;
+            }
+            coords.uv = framed.xy;
+        }
+        var next = p1_flipped(p1_image_points(op, coords), copy).points;
+        for (var plane = 0u; plane < 3u; plane++) {
+            // Neighbours can land on disconnected surfaces at a UV seam
+            let span = length((next[plane] - points[plane]) * size);
+            if p1_finite(span) && span < seam_limit {
+                footprints[plane] = max(footprints[plane], span);
+            }
+        }
+    }
+    return footprints;
 }
 
 // 1 where the image point `uv` lies inside its 0..1 tile on every axis that does not repeat

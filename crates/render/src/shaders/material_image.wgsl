@@ -114,8 +114,45 @@ fn p1_bilinear(level: P1ImageLevel, uv: vec2<f32>, clamps: vec2<bool>) -> vec4<f
     return top + (bottom - top) * f.y;
 }
 
+// The halved levels an image holds besides itself (flag bit 9 of its descriptor, gpu_tile_pattern.rs)
+fn p1_level_count(image: u32) -> u32 {
+    if (srgb[image + 2u] & P1_IMAGE_LEVELS) == 0u {
+        return 0u;
+    }
+    return srgb[image + 3u + 3u * p1_base_level(image).encoding];
+}
+
+// Halved level `index` of an image that holds it (1 is half the size), its plane origins after
+// the count: width, height, encoding, then one origin per plane
+fn p1_halved_level(image: u32, index: u32) -> P1ImageLevel {
+    var word = image + 4u + 3u * p1_base_level(image).encoding;
+    for (var level = 1u; level < index; level++) {
+        word += 3u + 3u * srgb[word + 2u];
+    }
+    return P1ImageLevel(word + 3u, vec2<i32>(i32(srgb[word]), i32(srgb[word + 1u])), srgb[word + 2u]);
+}
+
+// Level `index` of an image read bilinearly, `full` (the image itself) at 0 and past the last level
+fn p1_level_sample(image: u32, index: u32, uv: vec2<f32>, clamps: vec2<bool>, full: vec4<f32>) -> vec4<f32> {
+    if index == 0u || index > p1_level_count(image) {
+        return full;
+    }
+    return p1_bilinear(p1_halved_level(image, index), uv, clamps);
+}
+
+// An sRGB colour read as linear: the image's own level decodes after its bilinear blend (compose
+// ImageRes::sample_srgb_color); alpha stays
+fn p1_linear_read(sample: vec4<f32>, linear: bool) -> vec4<f32> {
+    if !linear {
+        return sample;
+    }
+    let encoded = clamp(sample.rgb, vec3(0.0), vec3(1.0));
+    return vec4(select(pow((encoded + 0.055) / 1.055, vec3(2.4)), encoded / 12.92, encoded <= vec3(0.04045)), sample.a);
+}
+
 // P1 (composite_projection.wgsl): the image at a point the fill already projected, read as its
-// sampling says (compose ImageRes::sample_filtered)
+// sampling says (compose ImageRes::sample_filtered). The read's projection.x is its footprint in
+// image texels per surface texel, projection.y 1 for an sRGB colour read in linear space.
 fn p1_image_at(image: u32, uv: vec2<f32>, layer: Operation) -> vec4<f32> {
     if !all(abs(uv) <= vec2(3.402823466e38)) {
         return vec4(0.0);
@@ -125,7 +162,22 @@ fn p1_image_at(image: u32, uv: vec2<f32>, layer: Operation) -> vec4<f32> {
     if (layer.ext.y & P1_NEAREST) != 0u {
         return p1_nearest(level, uv, clamps);
     }
-    return p1_bilinear(level, uv, clamps);
+    let full = p1_linear_read(p1_bilinear(level, uv, clamps), layer.projection.y != 0.0);
+    let footprint = layer.projection.x;
+    if (layer.ext.y & P1_HQ) == 0u || !(footprint > 1.0 && footprint <= 3.402823466e38) {
+        return full;
+    }
+
+    // Blend the two levels round the footprint's level of detail
+    let detail = min(log2(footprint), f32(p1_level_count(image)));
+    let finer = u32(floor(detail));
+    let toward_coarser = detail - f32(finer);
+    let finer_sample = p1_level_sample(image, finer, uv, clamps, full);
+    if toward_coarser <= 0.0 {
+        return finer_sample;
+    }
+    let coarser = p1_level_sample(image, finer + 1u, uv, clamps, full);
+    return finer_sample + (coarser - finer_sample) * toward_coarser;
 }
 
 fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {

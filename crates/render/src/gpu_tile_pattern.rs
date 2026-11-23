@@ -229,10 +229,8 @@ pub(crate) enum AtlasMips {
     #[default]
     None,
     /// `ImageRes::mip_chain`: the levels as stored (Bilinear HQ of scalar and alpha reads).
-    #[allow(dead_code)] // Chosen by P1
     Stored,
     /// `ImageRes::linear_mip_chain`: RGB linear, alpha unchanged (an sRGB image's colour read).
-    #[allow(dead_code)] // Chosen by P1
     LinearColor,
 }
 

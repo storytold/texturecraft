@@ -142,9 +142,14 @@ pub(super) fn supports_image_sampling(sampling: Sampling) -> bool {
 }
 
 /// How an image source read as a `channel` with `sampling` registers its image
-/// (`MaterialImages::register_image`).
-pub(super) fn image_use(_sampling: Sampling, _channel: ChannelKind) -> ImageUse {
-    ImageUse::Material
+/// (`MaterialImages::register_image`): Bilinear HQ needs the image's halved levels, linear ones
+/// for an sRGB colour read.
+pub(super) fn image_use(sampling: Sampling, channel: ChannelKind) -> ImageUse {
+    match (sampling.filtering, channel) {
+        (Filtering::BilinearHq, ChannelKind::Color) => ImageUse::MipmappedColor,
+        (Filtering::BilinearHq, _) => ImageUse::Mipmapped,
+        (Filtering::BilinearSharp | Filtering::Nearest, _) => ImageUse::Material,
+    }
 }
 
 /// The projection words of an image source operation for the built-in paths.
@@ -238,7 +243,7 @@ pub(super) fn place_cover(projection: &Projection, sampling: Sampling, op: &mut 
     if built_in(projection, sampling, op) {
         return Some(());
     }
-    if still_on_cpu(projection, sampling, op) {
+    if still_on_cpu(projection, sampling) {
         return None;
     }
 
@@ -274,10 +279,8 @@ fn built_in(projection: &Projection, sampling: Sampling, op: &Operation) -> bool
 }
 
 /// The settings P1's path does not evaluate yet: those fills stay on the CPU.
-fn still_on_cpu(projection: &Projection, sampling: Sampling, op: &Operation) -> bool {
-    let reads_image = op.ids[1] == IMAGE_SOURCE_OPCODE || projection.placed().is_some();
-    (sampling.filtering == Filtering::BilinearHq && reads_image)
-        || cropped_warp_reads_image_alpha(projection)
+fn still_on_cpu(projection: &Projection, sampling: Sampling) -> bool {
+    cropped_warp_reads_image_alpha(projection)
         || (projection.placed().is_some() && sampling.filtering != Filtering::BilinearSharp)
         || projection.depth_culling().is_some()
 }
@@ -679,7 +682,6 @@ mod tests {
         let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
         vec![
             fill(&uniform, warp, sharp),
-            fill(&image, Projection::default(), Sampling { filtering: Filtering::BilinearHq, ..sharp }),
             fill(&image, Projection::decal(frame()), Sampling { filtering: Filtering::Nearest, ..sharp }),
             fill(&image, Projection::decal(frame()), Sampling { filtering: Filtering::BilinearHq, ..sharp }),
             fill(&uniform, culled, sharp),
@@ -709,6 +711,8 @@ mod tests {
             }
         }
         assert_eq!(super::image_use(Sampling::SAVED_BEFORE, ChannelKind::Color), ImageUse::Material);
+        assert_eq!(super::image_use(Sampling::default(), ChannelKind::Color), ImageUse::MipmappedColor);
+        assert_eq!(super::image_use(Sampling::default(), ChannelKind::Scalar), ImageUse::Mipmapped);
     }
 
     /// Image sources read the nearest texel through every projection the built-in paths have
@@ -950,6 +954,37 @@ mod tests {
         for (label, corners, depth, projector, uv) in cases {
             let projection = Projection::Warp { frame: frame(), corners, depth, uv, projector };
             assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, Tolerance::BILINEAR.with_flips(FLIPS), &format!("warp {label}"));
+        }
+    }
+
+    /// Bilinear HQ, the default of new image fills, reads the image level its footprint shrinks
+    /// it to (linear levels for sRGB colour), through every projection, with wrap and copies
+    #[test]
+    fn bilinear_hq_matches_the_cpu() {
+        let mut gpu = headless();
+        let hq = Sampling { filtering: Filtering::BilinearHq, ..Sampling::SAVED_BEFORE };
+        let uv = UvTransform::default();
+        let mirror = FillSymmetry { on: true, ..FillSymmetry::OFF };
+        let cases = [
+            ("UV shrunk", plane(), Projection::Uv { scale: [3.3, 2.1], rotation: 17.0, offset: [0.1, -0.2] }, hq),
+            ("UV between levels", plane(), Projection::Uv { scale: [1.45, 1.45], rotation: 0.0, offset: [0.0; 2] }, hq),
+            ("UV enlarged", plane(), Projection::Uv { scale: [0.3, 0.4], rotation: -40.0, offset: [0.3, 0.2] }, hq),
+            ("UV tile", plane(), Projection::UvTile, hq),
+            ("UV wrap none", plane(), Projection::Uv { scale: [2.6, 1.2], rotation: 5.0, offset: [0.2, 0.1] }, Sampling { wrap: UvWrap::None, ..hq }),
+            ("tri-planar", sphere(), Projection::Triplanar { scale: 2.5, sharpness: 3.0, offset: [0.1, 0.0, -0.1], uv, projector: Projector::default() }, hq),
+            ("planar", sphere(), Projection::Planar { scale: 2.8, axis: 1, offset: [0.0; 3], uv, projector: Projector::default(), placed: None }, hq),
+            ("spherical", sphere(), Projection::Spherical { scale: 3.0, uv, offset: [0.0; 3], projector: Projector::default() }, hq),
+            ("cylindrical", sphere(), Projection::Cylindrical { scale: 2.0, axis: 1, uv, offset: [0.0; 3], projector: Projector::default(), angle: 90.0 }, hq),
+            (
+                "mirrored planar",
+                sphere(),
+                Projection::Planar { scale: 2.4, axis: 0, offset: [0.1, 0.0, 0.0], uv, projector: Projector::default(), placed: None },
+                Sampling { symmetry: mirror, ..hq },
+            ),
+            ("library defaults", plane(), Projection::default(), Sampling::default()),
+        ];
+        for (label, mesh, projection, sampling) in cases {
+            assert_fill_matches(&mut gpu, &mesh, &projection, sampling, Tolerance::BILINEAR, &format!("bilinear HQ {label}"));
         }
     }
 
