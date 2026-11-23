@@ -8,8 +8,9 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator,
-    GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source, ThresholdMode,
+    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, ContentsOffset, CurvatureDetail, CurvatureMode, Effect, EffectKind,
+    Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source,
+    ThresholdMode,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
@@ -709,8 +710,9 @@ impl CompositeProgram {
         let mut mask_layers = BTreeMap::new();
         let mut non_default = [false; Channel::ALL.len()];
         let stencil_pigment = brush.as_ref().is_some_and(|brush| brush.stencil.is_some());
-        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| StackWork::Layer(id, 0, 0)).collect();
-        while let Some(work) = layers.pop() {
+        // Each draw carries the Scale and Rotation of the folders holding it (an instanced folder's too)
+        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (StackWork::Layer(id, 0, 0), ContentsOffset::NONE)).collect();
+        while let Some((work, around)) = layers.pop() {
             let (id, depth, inherited_geometry) = match work {
                 StackWork::Layer(id, depth, geometry) => (id, depth, geometry),
                 StackWork::EndGroup(start) => {
@@ -734,9 +736,7 @@ impl CompositeProgram {
                     continue;
                 }
                 // A folder's Scale and Rotation (an instanced folder's too) re-place every fill inside it
-                if !contents.is_none() {
-                    return Err("A folder with Scale or Rotation uses CPU compositing.");
-                }
+                let children_around = around.then(*contents);
                 // A full-weight group sees the incoming stack and returns it exactly
                 // as its children changed it. A geometry restriction must stay on the
                 // group boundary when children publish anchors outside that restriction.
@@ -746,7 +746,7 @@ impl CompositeProgram {
                     })
                     && (geometry_mask == 0 || !groups::children_publish_anchors(project, children, depth + 1))
                 {
-                    layers.extend(children.iter().rev().map(|&child| StackWork::Layer(child, depth + 1, geometry_mask)));
+                    layers.extend(children.iter().rev().map(|&child| (StackWork::Layer(child, depth + 1, geometry_mask), children_around)));
                     continue;
                 }
                 let mut weights = [0.0f32; Channel::ALL.len()];
@@ -764,7 +764,7 @@ impl CompositeProgram {
                     continue;
                 }
                 let begin = effects.len() as u32;
-                let background = compile_mask(mask, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
+                let background = compile_mask(mask, around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
                 let count = effects.len() as u32 - begin;
                 let height = layer.height_mask;
                 let height_params = if height.enabled && count != 0 {
@@ -793,13 +793,13 @@ impl CompositeProgram {
                 procedural.anchors.draw_ranges.push(open as u32..open as u32 + 1);
                 group_depth += 1;
                 groups.depth = groups.depth.max(group_depth);
-                layers.push(StackWork::EndGroup(open));
+                layers.push((StackWork::EndGroup(open), ContentsOffset::NONE));
                 // The group tests its geometry before entering. Children still apply their own masks.
-                layers.extend(children.iter().rev().map(|&child| StackWork::Layer(child, depth + 1, 0)));
+                layers.extend(children.iter().rev().map(|&child| (StackWork::Layer(child, depth + 1, 0), children_around)));
                 continue;
             }
             let mask_start = effects.len() as u32;
-            let mask_background = compile_mask(mask, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
+            let mask_background = compile_mask(mask, around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
             let shared_content = effects.len() as u32;
             let mask_count = shared_content - mask_start;
             let has_content_anchors = layer.content_effects.iter().any(|effect| effect.visible && matches!(effect.kind, EffectKind::Anchor));
@@ -896,7 +896,7 @@ impl CompositeProgram {
                     effects.extend(stage);
                     let op = if let Some(op) = template {
                         op
-                    } else if let Some(op) = content_deposit(effect, channel, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))? {
+                    } else if let Some(op) = content_deposit(effect, (channel, around), pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))? {
                         adds_coverage = true;
                         op
                     } else {
@@ -930,7 +930,7 @@ impl CompositeProgram {
                 let mut op = if fill.is_none() {
                     content_paint(layer.id, channel, painted, brush_value, stencil_pigment, &mut paint)
                 } else {
-                    fill.and_then(|fill| source_operation(source, &fill.projection, fill.sampling, default, channel.kind(), &mut procedural))
+                    fill.and_then(|fill| source_operation(source, &placed(around, &fill.projection), fill.sampling, default, channel.kind(), &mut procedural))
                         .ok_or("A fill source or projection uses CPU compositing.")?
                 };
                 if let Some(decal) = decal {
@@ -1050,15 +1050,17 @@ impl CompositeProgram {
     ) -> Result<Self, &'static str> {
         let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
         packages::check_set(set, true)?;
-        // Folders around the layer (an instance's own, as the CPU places it, or its source's) re-place its mask fills
+        // The folders around the requested layer (an instance's own, as the CPU places it) re-place its mask fills
         let requested = owner;
         let owner = project.mask_owner(owner);
-        if !project.contents_around(requested).is_none() || !project.contents_around(owner).is_none() {
-            return Err("A mask inside a folder with Scale or Rotation uses CPU mask preview.");
-        }
+        let around = project.contents_around(requested);
         let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
         let mask = mask.ok_or("The layer has no enabled mask.")?;
         if mask.effects.iter().any(|effect| effect.visible && !effect.kind.anchors_read().is_empty()) {
+            // The material program keeps one draw per layer, which need not sit where the requested one does
+            if project.layers.values().any(|layer| matches!(&layer.kind, LayerKind::Group { contents, .. } if !contents.is_none())) {
+                return Err("A mask reading anchors inside a folder with Scale or Rotation uses CPU mask preview.");
+            }
             let mut program = Self::try_compile_with_brush(project, pixels, ts, region, brush)?;
             program.mask_layer = *program.mask_layers.get(&owner).ok_or("The mask's GPU anchor stack is missing.")?;
             program.mask_preview = true;
@@ -1072,7 +1074,7 @@ impl CompositeProgram {
         let mut paint = PaintInputs::default();
         let mut procedural = ProceduralInputs::new(set.resolution);
         let mut tile_patterns = TilePatterns::default();
-        let background = compile_mask(Some(mask), pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
+        let background = compile_mask(Some(mask), around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
         operations[0].effects[1] = operations.len() as u32 - 1;
         operations[0].balance[1] = background;
         let filters = FilterPlan::compile(&mut operations, 1, &procedural);
@@ -1133,6 +1135,12 @@ fn sparse_channel(pixels: &PixelStore, id: LayerId, channel: Channel) -> Result<
         return Err("A paint layer has a layout that uses CPU compositing.");
     }
     Ok(image)
+}
+
+/// `projection` under the Scale and Rotation `around` of the folders holding its fill, borrowed
+/// when they change nothing.
+fn placed(around: ContentsOffset, projection: &Projection) -> Cow<'_, Projection> {
+    if around.is_none() { Cow::Borrowed(projection) } else { Cow::Owned(around.apply(projection)) }
 }
 
 fn content_paint(
@@ -1219,7 +1227,7 @@ fn reads_image_input(effect: &Effect) -> bool {
 
 fn content_deposit(
     effect: &Effect,
-    channel: Channel,
+    (channel, around): (Channel, ContentsOffset),
     pixels: &PixelStore,
     brush: Option<&LiveBrush>,
     (paint, procedural, tile_patterns): (&mut PaintInputs, &mut ProceduralInputs, &mut TilePatterns),
@@ -1236,7 +1244,7 @@ fn content_deposit(
     }
     let mut op = if let EffectKind::Material(fill) = &effect.kind {
         let Some(source) = fill.sources.get(&channel) else { return Ok(None) };
-        let mut op = source_operation(Some(source), &fill.projection, fill.sampling, channel.default_value(), channel.kind(), procedural)
+        let mut op = source_operation(Some(source), &placed(around, &fill.projection), fill.sampling, channel.default_value(), channel.kind(), procedural)
             .ok_or("A content material source or projection uses CPU compositing.")?;
         if let Some(decal) = register_decal(fill, &mut procedural.materials)? {
             op.uv[0] = decal as f32;
@@ -1257,8 +1265,11 @@ fn content_deposit(
     Ok(Some(op))
 }
 
+/// `mask`'s effects as operations, its fills under the Scale and Rotation `around` of the folders
+/// holding the layer, and the mask's background value.
 fn compile_mask(
     mask: Option<&Mask>,
+    around: ContentsOffset,
     pixels: &PixelStore,
     brush: Option<&LiveBrush>,
     (paint, procedural, tile_patterns): (&mut PaintInputs, &mut ProceduralInputs, &mut TilePatterns),
@@ -1271,7 +1282,7 @@ fn compile_mask(
         }
         let mut op = match &effect.kind {
             EffectKind::Fill { source, projection, sampling } => {
-                let mut operation = source_operation(Some(source), projection, *sampling, [0.0; 3], ChannelKind::Scalar, procedural)
+                let mut operation = source_operation(Some(source), &placed(around, projection), *sampling, [0.0; 3], ChannelKind::Scalar, procedural)
                     .ok_or("A mask fill source or projection uses CPU compositing.")?;
                 if let Some(frame) = projection.placed() {
                     operation.uv[0] = procedural.materials.register_decal(*frame, std::iter::once(source)) as f32;

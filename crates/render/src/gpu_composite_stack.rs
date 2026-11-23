@@ -109,10 +109,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
+    use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
     use texturecraft_core::{
         BakedMap, BlendMode, Channel, ChannelBlend, ColorSelection, CompareOp, CompareSource, ContentsOffset, Effect, EffectKind, Fill, Filter, Layer, LayerId,
-        LayerKind, Levels, Mask, MaskBackground, Project, Projection, Sampling, SelectionBackground, Source, TextureSet,
+        LayerKind, Levels, Mask, MaskBackground, NormalFormat, Project, Projection, Sampling, SelectionBackground, Source, TextureSet,
     };
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TILE, to_u16, to_u16_signed};
@@ -161,51 +161,27 @@ mod tests {
 
     #[test]
     fn folder_offsets_still_on_the_cpu_fall_back() {
+        // A mask reading an anchor previews through the material program, which keeps one draw per
+        // layer: inside a folder with Scale or Rotation that draw need not be the requested one
         let channels = [Channel::BaseColor, Channel::Height];
-
-        // A folder's Scale and Rotation re-place the fills inside it
-        let (material, mask) = compile_effects(None, None, ContentsOffset::new(2.0, 30.0));
-        assert!(material.is_err() && mask.is_err(), "{material:?} {mask:?}");
-
-        // A folder nested in one without an offset, and an instance of a fill inside such a folder
-        let mut project = Project::new("Nested offsets", "builtin:plane");
+        let mut project = Project::new("Anchored mask", "builtin:plane");
         project.texture_sets.push(TextureSet::new("Plane", 0, 64));
-        let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.6, 0.3, 0.2]))]), ..Default::default() };
-        let source = project.alloc_id();
-        project.insert_layer(0, Layer::new(source, "Source", LayerKind::Fill(fill), &channels), None, false).unwrap();
-        let outer = project.alloc_id();
-        project.insert_layer(0, Layer::new(outer, "Outer", LayerKind::folder(), &channels), None, false).unwrap();
-        let inner = project.alloc_id();
-        let mut group = Layer::new(inner, "Inner", LayerKind::folder(), &channels);
-        if let LayerKind::Group { contents, .. } = &mut group.kind {
-            *contents = ContentsOffset::new(0.5, -20.0);
-        }
-        project.insert_layer(0, group, Some(outer), true).unwrap();
-        let pixels = PixelStore::default();
-        assert!(CompositeProgram::try_compile_region(&project, &pixels, 0, None).is_err(), "a nested folder with an offset");
-        let instance = project.alloc_id();
-        project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source }, &channels), Some(inner), true).unwrap();
-        assert!(CompositeProgram::try_compile_region(&project, &pixels, 0, None).is_err(), "an instance inside it");
-
-        // An instance inside such a folder draws its source's mask placed by the instance's folders
-        // (the source's own preview stays on the GPU: gpu_composite_packages.rs)
-        let mut project = Project::new("Instanced mask", "builtin:plane");
-        project.texture_sets.push(TextureSet::new("Plane", 0, 64));
-        let source = project.alloc_id();
-        let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.6, 0.3, 0.2]))]), ..Default::default() };
-        let mut layer = Layer::new(source, "Source", LayerKind::Fill(fill), &channels);
-        layer.mask = Some(Mask::new(MaskBackground::White));
-        project.insert_layer(0, layer, None, false).unwrap();
         let folder_id = project.alloc_id();
         let mut group = Layer::new(folder_id, "Folder", LayerKind::folder(), &channels);
         if let LayerKind::Group { contents, .. } = &mut group.kind {
             *contents = ContentsOffset::new(2.0, 30.0);
         }
         project.insert_layer(0, group, None, false).unwrap();
-        let instance = project.alloc_id();
-        project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source }, &channels), Some(folder_id), true).unwrap();
+        let owner = project.alloc_id();
+        let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.6, 0.3, 0.2]))]), ..Default::default() };
+        let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
+        let mut mask = Mask::new(MaskBackground::White);
+        let anchored = Source::Anchor { anchor: LayerId(901), channel: Channel::Height, ramp: Vec::new() };
+        mask.effects.push(effect(EffectKind::Fill { source: anchored, projection: Projection::default(), sampling: Sampling::SAVED_BEFORE }));
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, Some(folder_id), true).unwrap();
         let pixels = PixelStore::default();
-        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, instance, None, None).is_err());
+        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).is_err());
     }
 
     /// A paint layer with colour, roughness and height painted in a block (so a filter's halo
@@ -423,6 +399,70 @@ mod tests {
             let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
             case.mask_owner = Some(owner);
             assert_matches_cpu(&mut gpu, &case, Tolerance::POINT, &label);
+        }
+    }
+
+    /// Fills inside folders with Scale and Rotation match the CPU: nested folders, a folder with
+    /// a mask of its own (drawn as a group), a material deposit, an instance in another such
+    /// folder and an instanced folder, in the material, the layer's mask preview and the instance's.
+    #[test]
+    fn fills_inside_folders_with_scale_and_rotation_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let baked = BakedMaps::default();
+        let channels = [Channel::BaseColor, Channel::Roughness];
+        let texels = (0..16).map(|index| [0.1 + 0.05 * index as f32, 0.9 - 0.04 * index as f32, (index % 5) as f32 * 0.2, 1.0]).collect();
+        let images = ImageStore::from([("Pattern".into(), Arc::new(ImageRes::new(4, 4, texels, false)))]);
+        let image = || Source::Image { name: "Pattern".into(), normal_format: NormalFormat::default() };
+        let own = Projection::Uv { scale: [2.0, 1.0], rotation: 15.0, offset: [0.1, 0.0] };
+        let folder = |project: &mut Project, offset: ContentsOffset, parent: Option<LayerId>| {
+            let id = project.alloc_id();
+            let mut group = Layer::new(id, "Folder", LayerKind::folder(), &channels);
+            if let LayerKind::Group { contents, .. } = &mut group.kind {
+                *contents = offset;
+            }
+            project.insert_layer(0, group, parent, parent.is_some()).unwrap();
+            id
+        };
+
+        let mut project = Project::new("Folder offsets", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, TILE * 2));
+        let outer = folder(&mut project, ContentsOffset::new(2.0, 30.0), None);
+        let inner = folder(&mut project, ContentsOffset::new(1.5, -10.0), Some(outer));
+        let owner = project.alloc_id();
+        let sources = BTreeMap::from([(Channel::BaseColor, image()), (Channel::Roughness, image())]);
+        let fill = Fill { sources, projection: own.clone(), sampling: Sampling::SAVED_BEFORE, ..Default::default() };
+        let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
+        let deposit = Fill { sources: BTreeMap::from([(Channel::BaseColor, image())]), sampling: Sampling::SAVED_BEFORE, ..Default::default() };
+        let mut deposit = effect(EffectKind::Material(deposit));
+        deposit.opacity = 0.6;
+        deposit.blend = BlendMode::Multiply;
+        layer.content_effects.push(deposit);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(effect(EffectKind::Fill { source: image(), projection: own.clone(), sampling: Sampling::SAVED_BEFORE }));
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, Some(inner), true).unwrap();
+
+        // A masked folder at part opacity draws as a group, its mask under the folders around it
+        let masked = folder(&mut project, ContentsOffset::new(0.5, 45.0), Some(outer));
+        let masked_layer = project.layer_mut(masked).unwrap();
+        masked_layer.channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Normal, opacity: 0.8 });
+        let mut group_mask = Mask::new(MaskBackground::Black);
+        group_mask.effects.push(effect(EffectKind::Fill { source: image(), projection: own, sampling: Sampling::SAVED_BEFORE }));
+        masked_layer.mask = Some(group_mask);
+        let instance = project.alloc_id();
+        project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source: owner }, &channels), Some(masked), true).unwrap();
+
+        // The inner folder instanced at the top, inside a folder of its own
+        let around = folder(&mut project, ContentsOffset::new(3.0, -60.0), None);
+        let instanced = project.alloc_id();
+        project.insert_layer(0, Layer::new(instanced, "Instanced folder", LayerKind::Instance { source: inner }, &channels), Some(around), true).unwrap();
+
+        let pixels = PixelStore::default();
+        for mask_owner in [owner, instance] {
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(mask_owner);
+            assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, &format!("folder offsets, mask of {mask_owner:?}"));
         }
     }
 }
