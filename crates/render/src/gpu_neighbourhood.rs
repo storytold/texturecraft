@@ -8,7 +8,7 @@
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
-use texturecraft_core::{Filter, HighpassSpace};
+use texturecraft_core::{ChannelKind, Filter, HighpassSpace};
 use wgpu::util::DeviceExt;
 
 #[path = "gpu_neighbourhood_box.rs"]
@@ -74,21 +74,47 @@ pub(crate) struct NeighbourhoodFilter {
     /// The packages' words: `params.field_layout.zw` and `params.extra` in WGSL.
     pub(crate) words: [u32; 2],
     pub(crate) extra: [f32; 8],
+    /// What the stage filters ([`stage_context`]): `params.stage.x` in WGSL (`stage_context()`).
+    pub(crate) context: u32,
+}
+
+/// `params.stage.x` of a stage filtering a mask, and of content by the channel's kind.
+pub(crate) const STAGE_MASK: u32 = 0;
+pub(crate) const STAGE_COLOR: u32 = 1;
+pub(crate) const STAGE_SCALAR: u32 = 2;
+pub(crate) const STAGE_SIGNED: u32 = 3;
+pub(crate) const STAGE_NORMAL_MAP: u32 = 4;
+
+/// The stage context word of `channel` (None: a mask).
+pub(crate) fn stage_context(channel: Option<ChannelKind>) -> u32 {
+    match channel {
+        None => STAGE_MASK,
+        Some(ChannelKind::Color) => STAGE_COLOR,
+        Some(ChannelKind::Scalar) => STAGE_SCALAR,
+        Some(ChannelKind::Signed) => STAGE_SIGNED,
+        Some(ChannelKind::NormalMap) => STAGE_NORMAL_MAP,
+    }
 }
 
 /// What a package's stage constructor gets: the CPU evaluator's working resolution, the longest
-/// side, the effect's opacity and whether the channel is signed (Height).
+/// side, the effect's opacity and what the stage filters: `channel` is the content channel's
+/// kind, None for a mask (and for the callers that only ask whether a stage exists).
 #[allow(dead_code)] // Read by the GPU port packages
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StageInputs {
     pub(crate) resolution: u32,
     pub(crate) longest_side: u32,
     pub(crate) opacity: f32,
-    pub(crate) signed: bool,
+    pub(crate) channel: Option<ChannelKind>,
 }
 
 #[allow(dead_code)] // Used by the GPU port packages
 impl StageInputs {
+    /// Whether the stage filters a signed channel (Height): its high-pass middle is 0.
+    pub(crate) fn signed(self) -> bool {
+        self.channel == Some(ChannelKind::Signed)
+    }
+
     /// Source texels for a size given at 2048 texels, at least half a texel, as the CPU scales it.
     pub(crate) fn texels_at_2k(self, at_2k: f32) -> f32 {
         (at_2k * (self.resolution.max(1) as f32 / 2048.0)).max(0.5)
@@ -102,11 +128,12 @@ impl StageInputs {
             opacity: self.opacity.clamp(0.0, 1.0),
             amount: 0.0,
             frequency: 0.0,
-            middle: if self.signed { 0.0 } else { 0.5 },
+            middle: if self.signed() { 0.0 } else { 0.5 },
             direction: [0.0; 2],
             seed: 0,
             words: [0; 2],
             extra: [0.0; 8],
+            context: stage_context(self.channel),
         }
     }
 }
@@ -139,10 +166,15 @@ fn supports_built_in(filter: &Filter) -> bool {
 impl NeighbourhoodFilter {
     /// The source-pixel parameters used by the CPU evaluator at the same working resolution.
     /// A nonpositive radius for an optional effect leaves the incoming field unchanged.
-    /// None as well for a filter [`supports`] rejects.
-    pub(crate) fn new(filter: &Filter, resolution: u32, longest_side: u32, opacity: f32, signed: bool) -> Option<Self> {
+    /// `channel` is what the stage filters (None: a mask, or a caller that only asks whether a
+    /// stage exists). None for a filter no stage evaluates. The packages' `new` may also build a
+    /// stage for a filter their `supports` rejects: one a lowering queues with
+    /// `ProceduralInputs::precede_with_stage` (the Gradient's pre-blur), which never becomes an
+    /// effect's own stage.
+    pub(crate) fn new(filter: &Filter, resolution: u32, longest_side: u32, opacity: f32, channel: Option<ChannelKind>) -> Option<Self> {
+        let signed = channel == Some(ChannelKind::Signed);
         if !supports_built_in(filter) {
-            let stage = StageInputs { resolution, longest_side, opacity, signed };
+            let stage = StageInputs { resolution, longest_side, opacity, channel };
             return box_family::new(filter, stage).or_else(|| gather::new(filter, stage));
         }
         let scale = resolution.max(1) as f32 / 2048.0;
@@ -158,6 +190,7 @@ impl NeighbourhoodFilter {
             seed: 0,
             words: [0; 2],
             extra: [0.0; 8],
+            context: stage_context(channel),
         };
         let direction = |degrees: f32| {
             let (sin, cos) = degrees.to_radians().sin_cos();
@@ -279,6 +312,7 @@ struct Params {
     direction: [f32; 4],
     field_layout: [u32; 4],
     extra: [f32; 8],
+    stage: [u32; 4],
 }
 
 pub(crate) struct NeighbourhoodGpu {
@@ -399,6 +433,7 @@ impl NeighbourhoodGpu {
                 direction: [filter.direction[0], filter.direction[1], 0.0, 0.0],
                 field_layout: region.field_layout(filter.words),
                 extra: filter.extra,
+                stage: [filter.context, 0, 0, 0],
             };
             Self::run(pipeline, device, encoder, scratch, &params, groups);
         };
