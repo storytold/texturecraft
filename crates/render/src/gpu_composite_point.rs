@@ -22,10 +22,16 @@
 //! - Keep [`uses_shader`] true for every program with a P2 opcode.
 //! - The Gradient's `input.blur` (with P4): [`lower`] calls
 //!   `inputs.precede_with_stage(gradient, opacity)` with the gradient filter itself, so P4's
-//!   `box_family::new` keys its stage on it, then returns the gradient's opcode. The stage runs
-//!   right before the gradient operation and its output field replaces the content the gradient
-//!   reads (test `a_lowering_can_run_a_neighbourhood_stage_before_its_operation`). Until P4 builds
-//!   that stage the call fails and the gradient stays on the CPU (its row in `still_on_cpu`).
+//!   `box_family::new` keys its stage on it, then returns the gradient's opcode with the
+//!   `GRADIENT_BLURRED` flag. The stage runs right before the gradient operation (test
+//!   `a_lowering_can_run_a_neighbourhood_stage_before_its_operation`). Its output keeps the
+//!   original premultiplied texel in words 0-3, so the loop resumes from the unblurred content,
+//!   and word 4 holds the blurred gray: the input's mode applied to the blurred straight colour,
+//!   or the blurred first component on scalar and signed channels and masks. The WGSL reads it
+//!   with `preceding_stage_word`, maps it through the gradient and mixes the result over the
+//!   unblurred content by the opacity, keeping its coverage, as `map_blurred` does on the CPU.
+//!   Until P4 builds that stage the call fails and the gradient stays on the CPU (its row in
+//!   `still_on_cpu`).
 //!
 //! Tables: [`LIBRARY_STILL_ON_CPU`] and `still_on_cpu` in the tests below. Every port gets a CPU
 //! oracle test (`crate::gpu_composite::oracle`) in colour, another content channel and the mask,
@@ -59,6 +65,7 @@ const GRADIENT_EVEN_LINEAR: u32 = 1;
 const GRADIENT_SRGB: u32 = 2;
 const GRADIENT_NEUTRAL_INPUT: u32 = 4;
 const GRADIENT_DEBUG: u32 = 8;
+const GRADIENT_BLURRED: u32 = 16;
 
 // The grays `point_gray` in composite_point.wgsl reads
 const GRAY_DESATURATION: u32 = 0;
@@ -153,7 +160,8 @@ fn lower_gradient(filter: &Filter, effect: &Effect, op: &mut Operation, inputs: 
     let count = u32::try_from(colors.len()).ok()?;
 
     // The input's blur runs as the box family's stage (P4) right before the gradient; the debug view reads no input
-    if input.blur > 0.0 && !debug {
+    let blurred = input.blur > 0.0 && !debug;
+    if blurred {
         inputs.precede_with_stage(filter, effect.opacity)?;
     }
 
@@ -163,6 +171,7 @@ fn lower_gradient(filter: &Filter, effect: &Effect, op: &mut Operation, inputs: 
     flags |= if linear { 0 } else { GRADIENT_SRGB };
     flags |= if unshaped { GRADIENT_NEUTRAL_INPUT } else { 0 };
     flags |= if *debug { GRADIENT_DEBUG } else { 0 };
+    flags |= if blurred { GRADIENT_BLURRED } else { 0 };
 
     if even {
         op.procedural[1] = offset;
@@ -186,6 +195,7 @@ fn lower_gradient(filter: &Filter, effect: &Effect, op: &mut Operation, inputs: 
 /// place order. The stable sort keeps the list order at a shared place, which decides the stop
 /// the CPU reads there.
 fn sorted_stops(colors: &[[f32; 3]], positions: &[f32], linear: bool) -> Vec<(f32, [f32; 3])> {
+    // A copy of core's `ramp_stops` (gradient_input.rs), which core keeps private
     let last = colors.len().saturating_sub(1);
     let mut stops: Vec<(f32, [f32; 3])> = colors
         .iter()
@@ -231,17 +241,17 @@ pub(super) fn band_uniform(_program: &CompositeProgram) -> [u32; 4] {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
-        BlendMode, Channel, ContentsOffset, ConversionMode, CurvePreset, Effect, EffectKind, Fill, Filter, GradientInput, GrayscaleConversion, GrayscaleMode,
-        Layer, LayerId, LayerKind, Mask, MaskBackground, Project, Source, TextureSet,
+        BlendMode, Channel, ChannelFormat, ChannelKind, ContentsOffset, ConversionMode, CurvePreset, Effect, EffectKind, Fill, Filter, GradientInput,
+        GrayscaleConversion, GrayscaleMode, Layer, LayerId, LayerKind, Mask, MaskBackground, Project, Source, TextureSet,
     };
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TILE, to_u16, to_u16_signed};
 
+    use crate::gpu_composite::CompositeRegion;
     use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
 
     /// The oracle's texture set is one tile across
@@ -250,25 +260,36 @@ mod tests {
     /// The opacity of the filter under test, below 1 so the mix is exercised
     const EFFECT_OPACITY: f32 = 0.77;
 
-    /// A painted layer over a uniform fill, carrying `effects` (filter, opacity) in its content and
-    /// in its painted mask, each set to `blend`: (project, pixels, the painted layer). The paint
-    /// sweeps every channel and the mask across the tile at a coverage that rises down it.
-    fn painted_case(effects: &[(Filter, f32)], blend: BlendMode) -> (Project, PixelStore, LayerId) {
-        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal];
+    /// Every kind of content channel: colours in Base Color and a colour lobe, a scalar, the
+    /// signed Height, and both normal maps
+    const CHANNELS: [Channel; 6] = [Channel::BaseColor, Channel::Emissive, Channel::Roughness, Channel::Height, Channel::Normal, Channel::CoatNormal];
+
+    /// A painted layer over a uniform fill in `channels`, carrying `effects` (filter, opacity) in
+    /// its content and in its painted mask, each set to `blend`: (project, pixels, the painted
+    /// layer). The paint sweeps every channel and the mask across the tile at a coverage that
+    /// rises down it.
+    fn painted_case(effects: &[(Filter, f32)], blend: BlendMode, channels: &[Channel]) -> (Project, PixelStore, LayerId) {
         let mut project = Project::new("Point filters", "builtin:plane");
-        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
-        let sources = BTreeMap::from([
-            (Channel::BaseColor, Source::Uniform([0.47, 0.3, 0.58])),
-            (Channel::Roughness, Source::Uniform([0.41; 3])),
-            (Channel::Height, Source::Uniform([-0.34; 3])),
-            (Channel::Normal, Source::Uniform([0.37, 0.68, 0.89])),
-        ]);
-        let below = Layer::new(project.alloc_id(), "Below", LayerKind::Fill(Fill { sources, ..Default::default() }), &channels);
+        let mut set = TextureSet::new("Plane", 0, SIZE);
+        for &channel in channels {
+            if !set.channels.iter().any(|&(existing, _)| existing == channel) {
+                set.channels.push((channel, ChannelFormat::default_for(channel)));
+            }
+        }
+        project.texture_sets.push(set);
+        let below = |channel: Channel| match channel.kind() {
+            ChannelKind::Color => [0.47, 0.3, 0.58],
+            ChannelKind::Scalar => [0.41; 3],
+            ChannelKind::Signed => [-0.34; 3],
+            ChannelKind::NormalMap => [0.37, 0.68, 0.89],
+        };
+        let sources = channels.iter().map(|&channel| (channel, Source::Uniform(below(channel)))).collect();
+        let below = Layer::new(project.alloc_id(), "Below", LayerKind::Fill(Fill { sources, ..Default::default() }), channels);
         assert!(project.insert_layer(0, below, None, false).is_ok());
 
         let owner = project.alloc_id();
         let painted_mask = project.alloc_id();
-        let mut layer = Layer::new(owner, "Painted", LayerKind::Paint, &channels);
+        let mut layer = Layer::new(owner, "Painted", LayerKind::Paint, channels);
         let mut mask = Mask::new(MaskBackground::Black);
         mask.effects.push(Effect::new(painted_mask, EffectKind::Paint));
         for (filter, opacity) in effects {
@@ -291,21 +312,30 @@ mod tests {
                 let coverage = 0.25 + 0.75 * down;
                 let premultiplied = |value: f32| to_u16(value * coverage);
                 let alpha = to_u16(coverage);
-                let color = [premultiplied(across), premultiplied(0.15 + 0.7 * down), premultiplied(0.9 - 0.6 * across), alpha];
-                pixels.layer_mut(owner, Channel::BaseColor, size).set(x, y, &color);
-                pixels.layer_mut(owner, Channel::Roughness, size).set(x, y, &[premultiplied(0.05 + 0.6 * across + 0.3 * down), alpha]);
-                pixels.layer_mut(owner, Channel::Height, size).set(x, y, &[to_u16_signed((-0.8 + 1.2 * across + 0.4 * down) * coverage), alpha]);
-                let normal = [premultiplied(0.35 + 0.3 * across), premultiplied(0.35 + 0.3 * down), premultiplied(0.92), alpha];
-                pixels.layer_mut(owner, Channel::Normal, size).set(x, y, &normal);
+                for &channel in channels {
+                    let texel = match channel.kind() {
+                        ChannelKind::Color => vec![premultiplied(across), premultiplied(0.15 + 0.7 * down), premultiplied(0.9 - 0.6 * across), alpha],
+                        ChannelKind::Scalar => vec![premultiplied(0.05 + 0.6 * across + 0.3 * down), alpha],
+                        ChannelKind::Signed => vec![to_u16_signed((-0.8 + 1.2 * across + 0.4 * down) * coverage), alpha],
+                        ChannelKind::NormalMap => vec![premultiplied(0.35 + 0.3 * across), premultiplied(0.35 + 0.3 * down), premultiplied(0.92), alpha],
+                    };
+                    pixels.layer_mut(owner, channel, size).set(x, y, &texel);
+                }
                 pixels.mask_mut(painted_mask, size).set(x, y, &[to_u16(0.05 + 0.6 * across + 0.3 * (1.0 - down)), u16::MAX]);
             }
         }
         (project, pixels, owner)
     }
 
-    /// Each filter in content (colour and the other channels) and in the mask matches the CPU:
-    /// alone, set to Disable, and between two filters the GPU already evaluates
+    /// Each filter in every content channel and in the mask matches the CPU: alone, set to
+    /// Disable, and between two filters the GPU already evaluates
     fn assert_filters_match_cpu(filters: &[Filter], tolerance: Tolerance) {
+        assert_contexts_match_cpu(filters, &CHANNELS, true, tolerance, None);
+    }
+
+    /// [`assert_filters_match_cpu`] in `channels`, with the mask preview when `mask_preview`, and
+    /// recomposited in `region` too when it has one
+    fn assert_contexts_match_cpu(filters: &[Filter], channels: &[Channel], mask_preview: bool, tolerance: Tolerance, region: Option<CompositeRegion>) {
         for filter in filters {
             let added = || Some(effect(EffectKind::Filter(filter.clone())));
             let (material, mask) = compile_effects(added(), added(), ContentsOffset::NONE);
@@ -323,9 +353,10 @@ mod tests {
             let stacks =
                 [(alone.clone(), BlendMode::Multiply, "alone"), (alone, BlendMode::Disable, "set to Disable"), (chained, BlendMode::Multiply, "chained")];
             for (effects, blend, context) in stacks {
-                let (project, pixels, owner) = painted_case(&effects, blend);
+                let (project, pixels, owner) = painted_case(&effects, blend, channels);
                 let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
-                case.mask_owner = Some(owner);
+                case.mask_owner = mask_preview.then_some(owner);
+                case.region = region;
                 assert_matches_cpu(&mut gpu, &case, tolerance, &format!("{filter:?} {context}"));
             }
         }
@@ -342,8 +373,9 @@ mod tests {
             Filter::Hsl { hue: 1.3, saturation: -1.0, lightness: -1.0, perceptive: true },
         ];
 
-        // OKLab takes cube roots
-        assert_filters_match_cpu(&filters, Tolerance::TRANSCENDENTAL);
+        // OKLab takes cube roots in colours only; the other channels and the mask shift a lightness
+        assert_contexts_match_cpu(&filters, &[Channel::BaseColor, Channel::Emissive], false, Tolerance::TRANSCENDENTAL, None);
+        assert_contexts_match_cpu(&filters, &[Channel::Roughness, Channel::Height, Channel::Normal, Channel::CoatNormal], true, Tolerance::POINT, None);
     }
 
     #[test]
@@ -518,6 +550,29 @@ mod tests {
         });
 
         assert_filters_match_cpu(&filters, Tolerance::POINT);
+    }
+
+    #[test]
+    #[ignore = "needs P4 stage"]
+    fn gradients_after_their_input_blur_match_the_cpu() {
+        let three = [[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
+        let blurred =
+            |input, linear| Filter::GradientMap { colors: three.to_vec(), positions: vec![0.0, 0.4, 1.0], quantity: None, input, linear, debug: false };
+        let filters = [
+            blurred(GradientInput { blur: 4.0, ..GradientInput::LIBRARY }, true),
+            blurred(GradientInput { blur: 12.0, balance: 0.6, contrast: 0.3, invert: true, ..GradientInput::default() }, false),
+        ];
+        // A region inside the tile, so the blur's halo reaches past it
+        let region = CompositeRegion { min: [21, 17], max: [43, 39] };
+
+        // The stage carries one blurred gray, so the normal maps, which the CPU blurs themselves, stay out
+        assert_contexts_match_cpu(
+            &filters,
+            &[Channel::BaseColor, Channel::Emissive, Channel::Roughness, Channel::Height],
+            true,
+            Tolerance::NEIGHBOURHOOD,
+            Some(region),
+        );
     }
 
     #[test]

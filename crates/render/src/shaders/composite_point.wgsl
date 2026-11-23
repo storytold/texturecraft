@@ -12,6 +12,7 @@ const POINT_GRADIENT_EVEN_LINEAR: u32 = 1u;
 const POINT_GRADIENT_SRGB: u32 = 2u;
 const POINT_GRADIENT_NEUTRAL_INPUT: u32 = 4u;
 const POINT_GRADIENT_DEBUG: u32 = 8u;
+const POINT_GRADIENT_BLURRED: u32 = 16u;
 
 // Histogram Scan's narrowest soft cut (SCAN_MIN_WIDTH in Rust)
 const POINT_SCAN_MIN_WIDTH: f32 = 1e-3;
@@ -136,7 +137,8 @@ fn point_curve(shape: u32, x: f32) -> f32 {
         case 7u: { y = peak; }
         case 8u: { y = peak * peak; }
         case 9u: { y = sin(POINT_PI * t); }
-        case 10u: { y = abs(sin(2.0 * POINT_PI * t)); }
+        // Folded into -π..π, where GPU sines are accurate; |sin(2πt - π)| = |sin(2πt)|
+        case 10u: { y = abs(sin(2.0 * POINT_PI * t - POINT_PI)); }
         default: { y = 1.0 - abs((2.0 * POINT_TRIANGULAR_TEETH * t) % 2.0 - 1.0); }
     }
     return clamp(y, 0.0, 1.0);
@@ -225,6 +227,37 @@ fn point_gradient_position(op: Operation, x: f32) -> f32 {
     return point_shape_gray(x, op.low.x, op.low.y, op.low.z > 0.5);
 }
 
+// A gradient on a gray (a non-colour channel or a mask): its ramp's luminance; a ramp without colours leaves the gray
+fn point_gradient_gray(op: Operation, gray: f32) -> f32 {
+    if op.procedural.z == 0u {
+        return gray;
+    }
+    return point_luma(point_ramp(op, point_gradient_position(op, gray)));
+}
+
+// A gradient after its input blur stage: gray is the stage's blurred gray (word 4), c the unblurred content (map_blurred in Rust)
+fn point_blurred_gradient(op: Operation, c: vec3<f32>, channel: u32, gray: f32) -> vec3<f32> {
+    // The CPU blurs a normal map's own value here, which the stage does not carry; the effect leaves normals as they are
+    if channel == POINT_NORMAL_SLOT || channel == POINT_COAT_NORMAL_SLOT {
+        return c;
+    }
+    if point_is_color(channel) {
+        if op.procedural.z == 0u {
+            return c;
+        }
+        return point_ramp(op, point_gradient_position(op, gray));
+    }
+    if channel == POINT_HEIGHT_SLOT {
+        return vec3(point_gradient_gray(op, gray * 0.5 + 0.5) * 2.0 - 1.0);
+    }
+    return vec3(point_gradient_gray(op, gray));
+}
+
+// A gradient whose input blur ran as the preceding stage
+fn point_is_gradient_blurred(op: Operation) -> bool {
+    return op.ids.y == POINT_GRADIENT && (op.ext.z & POINT_GRADIENT_BLURRED) != 0u;
+}
+
 // A gradient's debug view: its ramp left to right across each UV tile in place of the mapped values
 fn point_is_gradient_debug(op: Operation) -> bool {
     return op.ids.y == POINT_GRADIENT && (op.ext.z & POINT_GRADIENT_DEBUG) != 0u;
@@ -268,10 +301,7 @@ fn point_scalar_filter(op: Operation, x: f32) -> f32 {
         // Grayscale Conversion: a mask weighs alpha as 1
         case 136u: { return point_conversion_gray(op, vec3(x), 1.0); }
         // A gradient on a gray reads its ramp's luminance; a ramp without colours leaves the gray
-        case 137u: {
-            if op.procedural.z == 0u { return x; }
-            return point_luma(point_ramp(op, point_gradient_position(op, x)));
-        }
+        case 137u: { return point_gradient_gray(op, x); }
         default: { return x; }
     }
 }
@@ -311,6 +341,9 @@ fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
         }
         let ramp = point_ramp(effect, fract(texel.uv.x));
         filtered = select(vec3(point_luma(ramp)), ramp, point_is_color(channel));
+    } else if point_is_gradient_blurred(effect) {
+        // The stage keeps the unblurred texel, so the mix and the coverage stay the original's
+        filtered = point_blurred_gradient(effect, content.rgb, channel, preceding_stage_word(texel.pixel));
     } else {
         filtered = point_effect_color(effect, content.rgb, channel, texel.surface, texel.baked.x);
     }
@@ -328,6 +361,9 @@ fn point_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 {
             return mask;
         }
         return point_luma(point_ramp(effect, fract(texel.uv.x)));
+    }
+    if point_is_gradient_blurred(effect) {
+        return point_gradient_gray(effect, preceding_stage_word(texel.pixel));
     }
     return point_scalar_filter(effect, mask);
 }
