@@ -29,13 +29,13 @@
 //! oracle test (`crate::gpu_composite::oracle`) in colour, another content channel and the mask,
 //! for each setting value, set to Disable too, at opacity below 1 with a non-Normal blend.
 
-use texturecraft_core::{CurvePreset, Effect, Filter, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, finite_unit, lum};
+use texturecraft_core::{ConversionMode, CurvePreset, Effect, Filter, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, finite_unit, lum};
 
 use super::packages::{POINT_OP_BITS, POINT_OPCODES};
 use super::{CompositeProgram, Operation, ProceduralInputs};
 
 /// Library filter ids P2 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["gradientMap", "grayscale"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["gradientMap"];
 
 // P2's opcodes (the same constants head composite_point.wgsl)
 const HSL_PERCEPTIVE: u32 = 128;
@@ -46,6 +46,14 @@ const SMOOTHSTEP: u32 = 132;
 const HEIGHT_ADJUST: u32 = 133;
 const GRADIENT_CURVE: u32 = 134;
 const GRADIENT_DYNAMIC: u32 = 135;
+const GRAYSCALE_CONVERSION: u32 = 136;
+
+// The grays `point_gray` in composite_point.wgsl reads
+const GRAY_DESATURATION: u32 = 0;
+const GRAY_AVERAGE: u32 = 2;
+const GRAY_MAX: u32 = 3;
+const GRAY_MIN: u32 = 4;
+const GRAY_WEIGHTS: u32 = 5;
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_point.wgsl");
 /// The same functions without P2's code, for programs that do not use it.
@@ -96,6 +104,18 @@ pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, _inpu
             op.high[0] = finite_unit(lum(*color));
             Some((GRADIENT_DYNAMIC, color.map(finite_unit)))
         }
+        // A Custom Input waits for the image inputs of the stack plumbing (P3)
+        Filter::GrayscaleConversion(conversion) if !conversion.custom_input => {
+            op.ids[2] = match conversion.mode {
+                ConversionMode::Desaturation => GRAY_DESATURATION,
+                ConversionMode::ChannelsWeights => GRAY_WEIGHTS,
+                ConversionMode::Average => GRAY_AVERAGE,
+                ConversionMode::Max => GRAY_MAX,
+                ConversionMode::Min => GRAY_MIN,
+            };
+            op.high = conversion.weights;
+            Some((GRAYSCALE_CONVERSION, [conversion.balance, conversion.contrast, f32::from(u8::from(conversion.invert))]))
+        }
         _ => None,
     }
 }
@@ -135,8 +155,8 @@ mod tests {
 
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
-        BlendMode, Channel, ContentsOffset, CurvePreset, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind, Mask, MaskBackground, Project, Source,
-        TextureSet,
+        BlendMode, Channel, ContentsOffset, ConversionMode, CurvePreset, Effect, EffectKind, Fill, Filter, GrayscaleConversion, Layer, LayerId, LayerKind,
+        Mask, MaskBackground, Project, Source, TextureSet,
     };
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TILE, to_u16, to_u16_signed};
@@ -335,6 +355,21 @@ mod tests {
     }
 
     #[test]
+    fn grayscale_conversion_matches_the_cpu() {
+        let library = GrayscaleConversion::LIBRARY;
+        let mut conversions: Vec<GrayscaleConversion> = ConversionMode::ALL.into_iter().map(|mode| GrayscaleConversion { mode, ..library }).collect();
+        // Alpha weighs the content's coverage, and 1 in a mask
+        conversions.push(GrayscaleConversion { weights: [0.2, 0.3, 0.1, 0.4], ..library });
+        conversions.push(GrayscaleConversion { invert: true, balance: 0.6, contrast: 0.3, ..library });
+        let filters: Vec<Filter> = conversions.into_iter().map(Filter::GrayscaleConversion).collect();
+        let hard = [Filter::GrayscaleConversion(GrayscaleConversion { contrast: 1.0, mode: ConversionMode::Average, ..library })];
+
+        assert_filters_match_cpu(&filters, Tolerance::POINT);
+        // Full contrast is a step at mid gray; the painted values sit away from it
+        assert_filters_match_cpu(&hard, Tolerance::POINT.with_flips(4));
+    }
+
+    #[test]
     fn height_adjust_matches_the_cpu() {
         let filters = [
             // The library default
@@ -350,6 +385,7 @@ mod tests {
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
     fn still_on_cpu() -> Vec<Filter> {
         vec![
+            Filter::GrayscaleConversion(GrayscaleConversion { custom_input: true, ..GrayscaleConversion::LIBRARY }),
             Filter::GradientMap {
                 colors: vec![[0.0; 3], [1.0; 3]],
                 positions: vec![0.0, 0.3],

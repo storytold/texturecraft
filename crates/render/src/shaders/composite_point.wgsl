@@ -4,6 +4,7 @@
 
 // Opcodes of P2's block that the loop-level hooks test (the constants in gpu_composite_point.rs)
 const POINT_POSTERIZE_ALPHA: u32 = 129u;
+const POINT_GRAYSCALE_CONVERSION: u32 = 136u;
 
 // Histogram Scan's narrowest soft cut (SCAN_MIN_WIDTH in Rust)
 const POINT_SCAN_MIN_WIDTH: f32 = 1e-3;
@@ -134,6 +135,37 @@ fn point_curve(shape: u32, x: f32) -> f32 {
     return clamp(y, 0.0, 1.0);
 }
 
+// A colour's gray: 0 desaturation, 1 luma, 2 average, 3 max, 4 min, else weights of red, green, blue and alpha
+fn point_gray(mode: u32, rgb: vec3<f32>, alpha: f32, weights: vec4<f32>) -> f32 {
+    switch mode {
+        case 0u: { return (max(rgb.r, max(rgb.g, rgb.b)) + min(rgb.r, min(rgb.g, rgb.b))) / 2.0; }
+        case 1u: { return point_luma(rgb); }
+        case 2u: { return (rgb.r + rgb.g + rgb.b) / 3.0; }
+        case 3u: { return max(rgb.r, max(rgb.g, rgb.b)); }
+        case 4u: { return min(rgb.r, min(rgb.g, rgb.b)); }
+        default: { return rgb.r * weights.x + rgb.g * weights.y + rgb.b * weights.z + alpha * weights.w; }
+    }
+}
+
+// Grayscale Conversion's shaped gray: ids.z the gray, high the weights, low.xyz balance, contrast and 1 to invert
+fn point_conversion_gray(op: Operation, rgb: vec3<f32>, alpha: f32) -> f32 {
+    return point_shape_gray(point_gray(op.ids.z, rgb, alpha, op.high), op.low.x, op.low.y, op.low.z > 0.5);
+}
+
+// Grayscale Conversion on a channel whose coverage is alpha (GrayscaleConversion::channel_value in Rust)
+fn point_conversion_channel(op: Operation, c: vec3<f32>, channel: u32, alpha: f32) -> vec3<f32> {
+    if channel == POINT_NORMAL_SLOT || channel == POINT_COAT_NORMAL_SLOT {
+        return c;
+    }
+    if point_is_color(channel) {
+        return vec3(point_conversion_gray(op, c, alpha));
+    }
+    if channel == POINT_HEIGHT_SLOT {
+        return vec3(point_conversion_gray(op, vec3(c.x * 0.5 + 0.5), alpha) * 2.0 - 1.0);
+    }
+    return vec3(point_conversion_gray(op, vec3(c.x), alpha));
+}
+
 // x in steps + 1 levels, as posterize in Rust
 fn point_posterize(steps: f32, x: f32) -> f32 {
     return floor(filter_unit(x) * steps + 0.5) / steps;
@@ -169,6 +201,8 @@ fn point_scalar_filter(op: Operation, x: f32) -> f32 {
         case 134u: { return point_curve(op.ids.z, point_shape_gray(x, op.low.x, op.low.y, op.low.z > 0.5)); }
         // Gradient Dynamic: high.x the colour's luminance
         case 135u: { return op.high.x; }
+        // Grayscale Conversion: a mask weighs alpha as 1
+        case 136u: { return point_conversion_gray(op, vec3(x), 1.0); }
         default: { return x; }
     }
 }
@@ -182,6 +216,7 @@ fn point_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surfac
             case 131u: { return point_color_correct(op, c); }
             // Gradient Dynamic: low.xyz the colour
             case 135u: { return op.low.xyz; }
+            case 136u: { return vec3(point_conversion_gray(op, c, 1.0)); }
             default: {}
         }
     }
@@ -191,7 +226,13 @@ fn point_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surfac
 // A point opcode in the layer_content loop: the content after the effect, opacity applied. The
 // default mixes point_effect_color by the opacity; take over for coverage or texel reads.
 fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, texel: LayerTexel) -> vec4<f32> {
-    let filtered = point_effect_color(effect, content.rgb, channel, texel.surface, texel.baked.x);
+    var filtered: vec3<f32>;
+    if effect.ids.y == POINT_GRAYSCALE_CONVERSION {
+        // Grayscale Conversion weighs the content's coverage as its alpha
+        filtered = point_conversion_channel(effect, content.rgb, channel, content.a);
+    } else {
+        filtered = point_effect_color(effect, content.rgb, channel, texel.surface, texel.baked.x);
+    }
     var coverage = content.a;
     if effect.ids.y == POINT_POSTERIZE_ALPHA {
         coverage += (point_posterize(effect.low.x, content.a) - content.a) * effect.low.w;
