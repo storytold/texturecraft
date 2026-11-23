@@ -20,10 +20,12 @@
 //!   loop-level `point_content_effect` (content with coverage and the whole texel: Posterize
 //!   alpha, the Grayscale alpha weight, Gradient debug) and `point_mask_effect`.
 //! - Keep [`uses_shader`] true for every program with a P2 opcode.
-//! - The Gradient's `input.blur` (with P4): from [`lower`], call
-//!   `inputs.precede_with_stage(&stage_filter, opacity)` with P4's stage filter, then return the
-//!   gradient's opcode. The stage runs right before the gradient operation and its output field
-//!   replaces the content the gradient reads (test `a_lowering_can_run_a_neighbourhood_stage_before_its_operation`).
+//! - The Gradient's `input.blur` (with P4): [`lower`] calls
+//!   `inputs.precede_with_stage(gradient, opacity)` with the gradient filter itself, so P4's
+//!   `box_family::new` keys its stage on it, then returns the gradient's opcode. The stage runs
+//!   right before the gradient operation and its output field replaces the content the gradient
+//!   reads (test `a_lowering_can_run_a_neighbourhood_stage_before_its_operation`). Until P4 builds
+//!   that stage the call fails and the gradient stays on the CPU (its row in `still_on_cpu`).
 //!
 //! Tables: [`LIBRARY_STILL_ON_CPU`] and `still_on_cpu` in the tests below. Every port gets a CPU
 //! oracle test (`crate::gpu_composite::oracle`) in colour, another content channel and the mask,
