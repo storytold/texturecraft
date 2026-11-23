@@ -320,7 +320,12 @@ mod tests {
         let Some(gpu) = oracle::headless() else { return };
         let compositor = GpuCompositor::new(&gpu.device);
         let (curvature, id) = (compositor.pipelines.supports_curvature, compositor.pipelines.supports_id);
-        for features in variants() {
+        // Every package variant; the program with every other feature too is left to the naga
+        // check above: Mesa's GL compiler needs over 28 GB for it (llvmpipe, measured)
+        // The program with every other feature too stays with the naga check above: Mesa's GL
+        // compiler (llvmpipe) runs out of 28 GB on its prepare_filter pipeline, with the package
+        // files as stubs too (a property of the base features, not of the packages).
+        for features in variants().into_iter().filter(|features| !features.generators) {
             let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tc_gpu_composite_packages"),
