@@ -42,7 +42,7 @@ use texturecraft_core::{ChannelKind, Filter, GrayscaleMode, HighpassSpace};
 use super::{APPLY_WORKGROUP, BOX_KINDS, BOX_PASSES, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs};
 
 /// Library filter ids P4 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["bevel", "bevelSmooth", "directionalDistance", "glow", "dropShadow", "maskOutline"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["bevel", "bevelSmooth", "directionalDistance", "maskOutline"];
 
 pub(super) const WGSL: &str = include_str!("shaders/neighbourhood_box.wgsl");
 
@@ -57,11 +57,19 @@ const HIGHPASS: Kind = Kind(BOX_KINDS.start + 3);
 /// The Gradient's input blur, queued by P2 before the gradient: the original texel in words 0-3
 /// of the output and the blurred gray in word 4 (a normal map's blur mixed in by the opacity).
 const PRE_BLUR: Kind = Kind(BOX_KINDS.start + 4);
+/// Glow (`HaloGlow`) and Drop Shadow.
+const HALO: Kind = Kind(BOX_KINDS.start + 5);
+
+/// Flag bits of `NeighbourhoodFilter::words[0]` per kind (the same constants in the WGSL file).
+const HALO_INNER: u32 = 1;
+const HALO_PRECISE: u32 = 2;
 
 /// Filter sizes are texels at this many texels per side, as the CPU scales them.
 const FILTER_SIZE_RESOLUTION: f32 = 2048.0;
 /// The smallest radius a filter runs at, in texels.
 const MIN_FILTER_RADIUS: f32 = 0.5;
+/// How soft a full spread leaves a halo: its least hardness (`HALO_SOFTEST` in eval.rs).
+const HALO_SOFTEST: f32 = 0.01;
 
 /// Work per texel of one bilinear sample, as the built-in Pixelate counts it.
 const BILINEAR_SAMPLE_WORK: u64 = 5;
@@ -85,7 +93,15 @@ impl Pipelines {
 /// Whether a P4 stage evaluates `filter` as the CPU does.
 /// The Gradient's input blur is no effect of its own: P2 queues [`new`]'s stage for it before the gradient.
 pub(super) fn supports(filter: &Filter) -> bool {
-    matches!(filter, Filter::Mosaic { alpha: false, .. } | Filter::Blur { wrap: true, .. } | Filter::Bevel { wrap: true, .. } | Filter::HighPass { .. })
+    matches!(
+        filter,
+        Filter::Mosaic { alpha: false, .. }
+            | Filter::Blur { wrap: true, .. }
+            | Filter::Bevel { wrap: true, .. }
+            | Filter::HighPass { .. }
+            | Filter::HaloGlow { .. }
+            | Filter::DropShadow { .. }
+    )
 }
 
 /// The P4 stage for `filter`, None when its size reaches nothing.
@@ -104,8 +120,29 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
             blur.words[0] = gray_mode(input.mode);
             Some(blur)
         }
+        Filter::HaloGlow { on_mask, precise, width, spread, opacity, color } => {
+            let flags = flag(*width < 0.0, HALO_INNER) | flag(*precise, HALO_PRECISE);
+            Some(halo(stage, texels(width.abs() * Filter::HALO_REACH), flags, (*spread, *opacity), *color, *on_mask, [0; 2]))
+        }
+        Filter::DropShadow { angle, distance, size, spread, opacity, color } => {
+            // Cast away from the light: `distance` of a UV tile, against the light's direction
+            let [dx, dy] = direction(*angle);
+            let reach = distance.clamp(-Filter::SHADOW_DISTANCE_MAX, Filter::SHADOW_DISTANCE_MAX) * stage.resolution as f32;
+            let offset = [(-dx * reach).round() as i32, (-dy * reach).round() as i32];
+            Some(halo(stage, texels(*size * Filter::HALO_REACH), 0, (*spread, *opacity), *color, true, offset))
+        }
         _ => None,
     }
+}
+
+fn flag(on: bool, bit: u32) -> u32 {
+    if on { bit } else { 0 }
+}
+
+/// Unit texel-space vector of `angle` degrees, as `direction` in eval.rs.
+fn direction(angle: f32) -> [f32; 2] {
+    let (sine, cosine) = angle.to_radians().sin_cos();
+    [cosine, -sine]
 }
 
 /// `GrayscaleMode` as the WGSL `box_gray_of` numbers it.
@@ -138,18 +175,49 @@ fn highpass(stage: StageInputs, texels: f32, space: HighpassSpace, alpha: bool) 
     highpass
 }
 
+/// A Glow or Drop Shadow stage (halo in eval.rs): tint, hardness and strength in `extra`, the
+/// shadow's offset in `direction` and its texels moved in `words[1]`.
+fn halo(
+    stage: StageInputs,
+    texels: f32,
+    flags: u32,
+    (spread, strength): (f32, f32),
+    color: [f32; 3],
+    mask_white: bool,
+    offset: [i32; 2],
+) -> NeighbourhoodFilter {
+    // Rec. 709 luminance, unlike lum's weights on purpose (as halo in eval.rs)
+    let luminance = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
+    let tint = match stage.channel {
+        Some(ChannelKind::Color) => color,
+        Some(_) => [luminance; 3],
+        None if mask_white => [1.0; 3],
+        None => [luminance; 3],
+    };
+    let hardness = (1.0 - spread.clamp(0.0, 1.0)).max(HALO_SOFTEST);
+
+    let mut halo = stage.filter(HALO, texels);
+    halo.extra[..5].copy_from_slice(&[tint[0], tint[1], tint[2], hardness, strength.clamp(0.0, 1.0)]);
+    halo.direction = offset.map(|texels| texels as f32);
+    let moved = offset[0].unsigned_abs().max(offset[1].unsigned_abs()).min(stage.longest_side);
+    halo.words = [flags, moved];
+    halo
+}
+
 /// Whether the stage reads past the set's edges from the far side (`FilterStage::wrap`).
 pub(crate) fn wraps(filter: NeighbourhoodFilter) -> bool {
     matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL)
 }
 
 pub(super) fn uses_box(filter: NeighbourhoodFilter) -> bool {
-    matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL | HIGHPASS | PRE_BLUR)
+    matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL | HIGHPASS | PRE_BLUR | HALO)
 }
 
 pub(super) fn reach(filter: NeighbourhoodFilter) -> u32 {
     match filter.kind {
         PIXELATE_KEEPING_ALPHA => filter.radius.saturating_add(1),
+        // A shadow also reads the shapes it was moved from
+        HALO => filter.radius.saturating_mul(BOX_PASSES as u32).saturating_add(filter.words[1]),
         _ => filter.radius.saturating_mul(BOX_PASSES as u32),
     }
 }
@@ -159,6 +227,7 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
         PIXELATE_KEEPING_ALPHA => BILINEAR_SAMPLE_WORK,
         HIGHPASS => BOX_FILTER_WORK + OWN_PASS_WORK,
         PRE_BLUR => BOX_FILTER_WORK + OWN_PASS_WORK,
+        HALO => BOX_FILTER_WORK + OWN_PASS_WORK,
         _ => BOX_FILTER_WORK,
     }
 }
@@ -212,7 +281,7 @@ pub(super) fn encode(
     let (original, output) = (region.original, region.output);
     match filter.kind {
         // What the box passes blur goes to the output field first, which the apply pass overwrites
-        HIGHPASS => {
+        HIGHPASS | HALO => {
             run(&pipelines.prepare, [original, 0, output, 0], filter.radius, false, texel_groups);
             let blurred = box_passes(&mut run, &gpu.box_blur, region, output, filter.radius);
             run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups);
@@ -252,6 +321,10 @@ mod tests {
     /// Cell centres are a hard decision: at most 0.1 % of the texels may flip.
     const CELL_CENTRES: Tolerance = Tolerance::NEIGHBOURHOOD.with_flips((SIZE * SIZE / 1000) as usize);
 
+    /// The library's Glow and Drop Shadow (filter_lib.rs in the engine).
+    const LIBRARY_GLOW: Filter = Filter::HaloGlow { on_mask: false, precise: false, width: 0.15, spread: 0.0, opacity: 1.0, color: [0.871, 0.578, 0.188] };
+    const LIBRARY_DROP_SHADOW: Filter = Filter::DropShadow { angle: 90.0, distance: 0.1, size: 0.2, spread: 0.0, opacity: 0.5, color: [0.0; 3] };
+
     /// A stack of (filter, effect opacity, effect blend).
     type Stack = Vec<(Filter, f32, BlendMode)>;
 
@@ -273,17 +346,14 @@ mod tests {
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
     /// The Gradient's input blur compiles once P2's gradient queues P4's stage before it.
     fn still_on_cpu() -> Vec<Filter> {
-        vec![
-            Filter::DropShadow { angle: 45.0, distance: 0.02, size: 8.0, spread: 0.0, opacity: 1.0, color: [0.0; 3] },
-            Filter::GradientMap {
-                colors: vec![[0.0; 3], [1.0; 3]],
-                positions: Vec::new(),
-                quantity: None,
-                input: GradientInput { blur: 2.0, ..Default::default() },
-                linear: true,
-                debug: false,
-            },
-        ]
+        vec![Filter::GradientMap {
+            colors: vec![[0.0; 3], [1.0; 3]],
+            positions: Vec::new(),
+            quantity: None,
+            input: GradientInput { blur: 2.0, ..Default::default() },
+            linear: true,
+            debug: false,
+        }]
     }
 
     #[test]
@@ -308,6 +378,8 @@ mod tests {
             Filter::HighPass { radius: 8.0, space: HighpassSpace::SrgbFromLinear, alpha: false },
             Filter::HighPass { radius: 8.0, space: HighpassSpace::SrgbFromAcescg, alpha: true },
             Filter::HighPass { radius: 8.0, space: HighpassSpace::Working, alpha: true },
+            LIBRARY_GLOW,
+            LIBRARY_DROP_SHADOW,
         ];
 
         for filter in ported {
@@ -646,5 +718,31 @@ mod tests {
                 assert!((gray - expected).abs() < 1e-5, "{label}: {gray} against {expected}");
             }
         }
+    }
+
+    /// Glow and Drop Shadow match the CPU: the library's, an inner precise glow on a mask in white,
+    /// a soft spread shadow cast the other way in colour, below full opacity, disabled and chained.
+    #[test]
+    fn glow_and_drop_shadow_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let inner_glow = Filter::HaloGlow { on_mask: true, precise: true, width: -0.6, spread: 0.4, opacity: 0.8, color: [0.2, 0.7, 0.4] };
+        let outer_glow = Filter::HaloGlow { on_mask: false, precise: true, width: 0.8, spread: 0.0, opacity: 1.0, color: [0.9, 0.5, 0.1] };
+        let shadow = Filter::DropShadow { angle: 30.0, distance: -0.05, size: 0.6, spread: 0.5, opacity: 0.9, color: [0.2, 0.4, 0.9] };
+        let normal = BlendMode::Normal;
+        let cases = [
+            ("library Glow", vec![(LIBRARY_GLOW, 1.0, normal)], normal),
+            ("library Drop Shadow", vec![(LIBRARY_DROP_SHADOW, 1.0, normal)], normal),
+            ("inner precise Glow", vec![(inner_glow, 0.75, normal)], BlendMode::Multiply),
+            ("outer precise Glow", vec![(outer_glow.clone(), 1.0, normal)], normal),
+            ("spread Drop Shadow", vec![(shadow.clone(), 1.0, normal)], normal),
+            ("Drop Shadow disabled", vec![(shadow, 1.0, BlendMode::Disable)], normal),
+            (
+                "Glow between filters",
+                vec![(Filter::Invert, 1.0, normal), (outer_glow, 0.8, normal), (Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal)],
+                normal,
+            ),
+        ];
+
+        assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
     }
 }

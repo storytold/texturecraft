@@ -12,6 +12,8 @@ const BOX_WRAPPED_BEVEL: u32 = 18u;
 const BOX_HIGHPASS: u32 = 19u;
 // The Gradient's input blur for P2's gradient
 const BOX_PRE_BLUR: u32 = 20u;
+// Glow and Drop Shadow
+const BOX_HALO: u32 = 21u;
 
 // Highpass in sRGB from ACEScg (params.field_layout.z; 0 is the working space, 1 sRGB from linear)
 const BOX_SPACE_SRGB_FROM_ACESCG: u32 = 2u;
@@ -19,12 +21,20 @@ const BOX_SPACE_SRGB_FROM_ACESCG: u32 = 2u;
 const BOX_MIN_ALPHA: f32 = 1e-5;
 // Word 4 of a field texel: its coverage, the pre-blur's gray in a stage output, scratch in the distance passes
 const BOX_SECOND_WORD: u32 = 4u;
+// Flags in params.field_layout.z
+const HALO_INNER: u32 = 1u;
+const HALO_PRECISE: u32 = 2u;
+// The blurred value a precise halo is solid from
+const BOX_PRECISE_EDGE: f32 = 0.5;
+// The largest finite f32
+const BOX_LARGEST_FINITE: f32 = 3.402823466e38;
 
 // Whether a P4 kind runs the three box passes first (box_family::uses_box must agree).
 fn box_family_uses_box(kind: u32) -> bool {
     var uses = kind == BOX_WRAPPED_BLUR || kind == BOX_WRAPPED_BEVEL;
     uses = uses || kind == BOX_HIGHPASS;
     uses = uses || kind == BOX_PRE_BLUR;
+    uses = uses || kind == BOX_HALO;
     return uses;
 }
 
@@ -205,6 +215,52 @@ fn box_pre_blur_texel(point: vec2<u32>, original: Texel, blurred: Texel) {
     fields[word_at(params.buffers.z, point) + BOX_SECOND_WORD] = bitcast<u32>(gray);
 }
 
+fn box_extra(index: u32) -> f32 {
+    return params.extra[index / 4u][index % 4u];
+}
+
+fn box_is_mask() -> bool {
+    return stage_context() == STAGE_MASK;
+}
+
+fn box_smoothstep(start: f32, end: f32, value: f32) -> f32 {
+    let t = clamp((value - start) / (end - start), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// Glow or drop shadow in its tint over the texel (halo in eval.rs): tint in extra 0-2, hardness 3, strength 4
+fn box_halo_texel(original: vec4<f32>, blurred: Texel) -> vec4<f32> {
+    var shape = 0.0;
+    if blurred.coverage > MIN_WEIGHT {
+        shape = clamp(blurred.value.x / blurred.coverage, 0.0, 1.0);
+    }
+    if (box_flags() & HALO_PRECISE) != 0u {
+        shape = box_smoothstep(0.0, BOX_PRECISE_EDGE, shape);
+    }
+    let tint = vec3(box_extra(0u), box_extra(1u), box_extra(2u));
+    let glow = min(shape / box_extra(3u), 1.0) * box_extra(4u);
+    let inner = (box_flags() & HALO_INNER) != 0u;
+    var result = original;
+    if box_is_mask() {
+        // A mask's own value is its cover
+        let cover = clamp(original.x, 0.0, 1.0);
+        if inner {
+            result.x += (tint.x - result.x) * (glow * cover);
+        } else {
+            result.x += tint.x * (glow * (1.0 - cover));
+        }
+    } else {
+        let cover = clamp(original.w, 0.0, 1.0);
+        if inner {
+            result = vec4(result.rgb + (tint * cover - result.rgb) * glow, result.w);
+        } else {
+            let under = glow * (1.0 - cover);
+            result = vec4(result.rgb + tint * under, result.w + under);
+        }
+    }
+    return original + (result - original) * params.weights.x;
+}
+
 // The apply pass of the kinds with passes of their own: the original at buffers.x, the filtered field at buffers.y, the result to buffers.z
 @compute @workgroup_size(8, 8)
 fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -230,6 +286,9 @@ fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
         box_pre_blur_texel(point, original, filtered);
         return;
     }
+    if kind == BOX_HALO {
+        result = box_halo_texel(original.value, filtered);
+    }
     write_at(params.buffers.z, point, Texel(result, original.coverage));
 }
 
@@ -247,6 +306,21 @@ fn box_family_prepare(@builtin(global_invocation_id) id: vec3<u32>) {
     if kind == BOX_HIGHPASS {
         let original = original_at(point);
         prepared = Texel(box_highpass_recode(original.value, true), original.coverage);
+    }
+
+    // A halo blurs the shapes moved by the shadow's offset: content's coverage or a mask's value, outside them for an inner glow
+    if kind == BOX_HALO {
+        let moved_from = vec2<i32>(point) - vec2<i32>(params.direction.xy);
+        let segment = copy_segment(vec2<i32>(point));
+        if all(moved_from >= segment.xy) && all(moved_from < segment.zw) {
+            let source = original_at(vec2<u32>(moved_from));
+            var shape = select(source.value.w, source.value.x, box_is_mask());
+            shape = select(0.0, clamp(shape, 0.0, 1.0), abs(shape) <= BOX_LARGEST_FINITE);
+            if (box_flags() & HALO_INNER) != 0u {
+                shape = 1.0 - shape;
+            }
+            prepared = Texel(vec4(shape * source.coverage, 0.0, 0.0, 0.0), source.coverage);
+        }
     }
     write_at(params.buffers.z, point, prepared);
 }
