@@ -119,7 +119,7 @@ fn blurred_mask_session() -> Session {
 }
 
 #[test]
-fn swapping_mask_gray_refreshes_the_last_displayed_dab_and_keeps_its_priority() {
+fn swapping_mask_gray_mid_stroke_keeps_the_stroke_gray_and_the_dab_priority() {
     let mut session = Session::new_project("Mask stroke", primitives::plane(1.0, 1), "builtin:plane", None, RESOLUTION).unwrap();
     execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap();
     execute(&mut session, "mask.add.white", &json!({})).unwrap();
@@ -137,12 +137,21 @@ fn swapping_mask_gray_refreshes_the_last_displayed_dab_and_keeps_its_priority() 
     session.clear_display_stroke_tiles();
     assert!(session.pending_display_stroke(0).unwrap().1.is_empty());
 
+    // A stroke paints the gray it began with: staging, previews and the commit read one gray
     execute(&mut session, "tool.swapMaskValue", &json!({})).unwrap();
-    assert!(session.pending_display_stroke(0).unwrap().1.contains(&tile), "a new gray refreshes existing coverage");
+    assert!(session.pending_display_stroke(0).unwrap().1.is_empty(), "a new gray leaves the stroke's coverage as it is");
+    session.continue_stroke_uv([0.6, 0.5].into(), 1.0);
+    session.continue_stroke_uv([0.5, 0.5].into(), 1.0);
+    assert!(session.pending_display_stroke(0).unwrap().1.contains(&tile));
+    session.update();
+    session.take_uploads(0);
     let revision = session.caches[0].material_revision;
     session.end_stroke().unwrap();
 
-    assert!(session.finished_display_stroke(0, id, revision).unwrap().contains(&tile), "the commit refreshes the last displayed gray");
+    assert!(session.finished_display_stroke(0, id, revision).unwrap().contains(&tile), "the commit refreshes the last displayed dab");
+    let mask = session.doc.pixels.masks.values().next().expect("the stroke persists");
+    let [value, coverage] = mask.get(RESOLUTION / 2, RESOLUTION / 2)[..2].try_into().unwrap();
+    assert!(coverage > 0 && value == coverage, "the stroke keeps painting white: {value} of {coverage}");
     assert!(session.caches[0].settle.contains(&tile));
     assert!(session.caches[0].dirty.is_empty() && session.caches[0].upload.is_empty(), "only the settle queue holds the released dab");
     let demand = session.tile_demand(None);
