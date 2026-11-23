@@ -56,6 +56,7 @@ const GRADIENT: u32 = 137;
 const GRADIENT_EVEN_LINEAR: u32 = 1;
 const GRADIENT_SRGB: u32 = 2;
 const GRADIENT_NEUTRAL_INPUT: u32 = 4;
+const GRADIENT_DEBUG: u32 = 8;
 
 // The grays `point_gray` in composite_point.wgsl reads
 const GRAY_DESATURATION: u32 = 0;
@@ -126,17 +127,17 @@ pub(super) fn lower(filter: &Filter, effect: &Effect, op: &mut Operation, inputs
             op.high = conversion.weights;
             Some((GRAYSCALE_CONVERSION, [conversion.balance, conversion.contrast, f32::from(u8::from(conversion.invert))]))
         }
-        Filter::GradientMap { debug: false, .. } => lower_gradient(filter, effect, op, inputs),
+        Filter::GradientMap { .. } => lower_gradient(filter, effect, op, inputs),
         _ => None,
     }
 }
 
 /// A gradient the built-in opcode 33 does not take: placed stops, a Color Quantity, sRGB
-/// blending or a changed input. Its stops go in the side table (evenly spaced linear ones as
-/// opcode 33 packs them), the input's gray in `ids[2]` and its balance, contrast and invert in the
-/// parameters.
+/// blending, a changed input or the debug view. Its stops go in the side table (evenly spaced
+/// linear ones as opcode 33 packs them), the input's gray in `ids[2]` and its balance, contrast
+/// and invert in the parameters.
 fn lower_gradient(filter: &Filter, effect: &Effect, op: &mut Operation, inputs: &mut ProceduralInputs) -> Option<(u32, [f32; 3])> {
-    let Filter::GradientMap { positions, input, linear, .. } = filter else { return None };
+    let Filter::GradientMap { positions, input, linear, debug, .. } = filter else { return None };
     let linear = *linear;
     let colors = filter.ramp_colors();
     let even = positions.is_empty() && linear;
@@ -149,8 +150,8 @@ fn lower_gradient(filter: &Filter, effect: &Effect, op: &mut Operation, inputs: 
     };
     let count = u32::try_from(colors.len()).ok()?;
 
-    // The input's blur runs as the box family's stage (P4) right before the gradient
-    if input.blur > 0.0 {
+    // The input's blur runs as the box family's stage (P4) right before the gradient; the debug view reads no input
+    if input.blur > 0.0 && !debug {
         inputs.precede_with_stage(filter, effect.opacity)?;
     }
 
@@ -159,6 +160,7 @@ fn lower_gradient(filter: &Filter, effect: &Effect, op: &mut Operation, inputs: 
     let mut flags = if even { GRADIENT_EVEN_LINEAR } else { 0 };
     flags |= if linear { 0 } else { GRADIENT_SRGB };
     flags |= if unshaped { GRADIENT_NEUTRAL_INPUT } else { 0 };
+    flags |= if *debug { GRADIENT_DEBUG } else { 0 };
 
     if even {
         op.procedural[1] = offset;
@@ -489,6 +491,36 @@ mod tests {
     }
 
     #[test]
+    fn the_gradient_debug_view_matches_the_cpu() {
+        let three = vec![[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
+        let debug = |positions: &[f32], input, linear| Filter::GradientMap {
+            colors: three.clone(),
+            positions: positions.to_vec(),
+            quantity: None,
+            input,
+            linear,
+            debug: true,
+        };
+        let mut filters = vec![
+            debug(&[], GradientInput::default(), true),
+            debug(&[0.0, 0.3, 0.9], GradientInput::LIBRARY, true),
+            debug(&[0.1, 0.75, 1.0], GradientInput::default(), false),
+            // The debug view reads no input, so its blur changes nothing
+            debug(&[], GradientInput { blur: 4.0, ..GradientInput::default() }, true),
+        ];
+        filters.push(Filter::GradientMap {
+            colors: Vec::new(),
+            positions: Vec::new(),
+            quantity: None,
+            input: GradientInput::default(),
+            linear: true,
+            debug: true,
+        });
+
+        assert_filters_match_cpu(&filters, Tolerance::POINT);
+    }
+
+    #[test]
     fn height_adjust_matches_the_cpu() {
         let filters = [
             // The library default
@@ -513,14 +545,6 @@ mod tests {
                 input: GradientInput { blur: 4.0, ..GradientInput::default() },
                 linear: true,
                 debug: false,
-            },
-            Filter::GradientMap {
-                colors: vec![[0.0; 3], [1.0; 3]],
-                positions: Vec::new(),
-                quantity: None,
-                input: Default::default(),
-                linear: true,
-                debug: true,
             },
         ]
     }

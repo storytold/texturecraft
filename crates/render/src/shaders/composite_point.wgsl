@@ -5,11 +5,13 @@
 // Opcodes of P2's block that the loop-level hooks test (the constants in gpu_composite_point.rs)
 const POINT_POSTERIZE_ALPHA: u32 = 129u;
 const POINT_GRAYSCALE_CONVERSION: u32 = 136u;
+const POINT_GRADIENT: u32 = 137u;
 
 // A gradient's flags in Operation.ext.z (the constants in gpu_composite_point.rs)
 const POINT_GRADIENT_EVEN_LINEAR: u32 = 1u;
 const POINT_GRADIENT_SRGB: u32 = 2u;
 const POINT_GRADIENT_NEUTRAL_INPUT: u32 = 4u;
+const POINT_GRADIENT_DEBUG: u32 = 8u;
 
 // Histogram Scan's narrowest soft cut (SCAN_MIN_WIDTH in Rust)
 const POINT_SCAN_MIN_WIDTH: f32 = 1e-3;
@@ -223,6 +225,11 @@ fn point_gradient_position(op: Operation, x: f32) -> f32 {
     return point_shape_gray(x, op.low.x, op.low.y, op.low.z > 0.5);
 }
 
+// A gradient's debug view: its ramp left to right across each UV tile in place of the mapped values
+fn point_is_gradient_debug(op: Operation) -> bool {
+    return op.ids.y == POINT_GRADIENT && (op.ext.z & POINT_GRADIENT_DEBUG) != 0u;
+}
+
 // x in steps + 1 levels, as posterize in Rust
 fn point_posterize(steps: f32, x: f32) -> f32 {
     return floor(filter_unit(x) * steps + 0.5) / steps;
@@ -297,6 +304,13 @@ fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
     if effect.ids.y == POINT_GRAYSCALE_CONVERSION {
         // Grayscale Conversion weighs the content's coverage as its alpha
         filtered = point_conversion_channel(effect, content.rgb, channel, content.a);
+    } else if point_is_gradient_debug(effect) {
+        // Every channel but a colour shows the ramp's luminance as it is, heights and normals too
+        if effect.procedural.z == 0u {
+            return content;
+        }
+        let ramp = point_ramp(effect, fract(texel.uv.x));
+        filtered = select(vec3(point_luma(ramp)), ramp, point_is_color(channel));
     } else {
         filtered = point_effect_color(effect, content.rgb, channel, texel.surface, texel.baked.x);
     }
@@ -309,5 +323,11 @@ fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
 
 // A point opcode in the layer_mask loop: the result the loop mixes in by the opacity.
 fn point_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 {
+    if point_is_gradient_debug(effect) {
+        if effect.procedural.z == 0u {
+            return mask;
+        }
+        return point_luma(point_ramp(effect, fract(texel.uv.x)));
+    }
     return point_scalar_filter(effect, mask);
 }
