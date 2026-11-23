@@ -14,6 +14,7 @@ const BOX_HIGHPASS: u32 = 19u;
 const BOX_PRE_BLUR: u32 = 20u;
 // Glow and Drop Shadow
 const BOX_HALO: u32 = 21u;
+const BOX_OUTLINE: u32 = 22u;
 
 // Highpass in sRGB from ACEScg (params.field_layout.z; 0 is the working space, 1 sRGB from linear)
 const BOX_SPACE_SRGB_FROM_ACESCG: u32 = 2u;
@@ -28,6 +29,13 @@ const HALO_PRECISE: u32 = 2u;
 const BOX_PRECISE_EDGE: f32 = 0.5;
 // The largest finite f32
 const BOX_LARGEST_FINITE: f32 = 3.402823466e38;
+// Flags in params.field_layout.z
+const OUTLINE_FROM_BLACK: u32 = 1u;
+const OUTLINE_COVERS_INSIDE: u32 = 2u;
+const OUTLINE_COVERS_OUTSIDE: u32 = 4u;
+const OUTLINE_BAND_OFF: u32 = 8u;
+// The shapes' blurred share at their edge
+const BOX_OUTLINE_EDGE_SHARE: f32 = 0.5;
 
 // Whether a P4 kind runs the three box passes first (box_family::uses_box must agree).
 fn box_family_uses_box(kind: u32) -> bool {
@@ -35,6 +43,7 @@ fn box_family_uses_box(kind: u32) -> bool {
     uses = uses || kind == BOX_HIGHPASS;
     uses = uses || kind == BOX_PRE_BLUR;
     uses = uses || kind == BOX_HALO;
+    uses = uses || kind == BOX_OUTLINE;
     return uses;
 }
 
@@ -261,6 +270,71 @@ fn box_halo_texel(original: vec4<f32>, blurred: Texel) -> vec4<f32> {
     return original + (result - original) * params.weights.x;
 }
 
+// What the shape filters threshold: a mask's value, content's luminance of its straight colour
+fn box_shape_value(value: vec4<f32>) -> f32 {
+    if box_is_mask() {
+        return value.x;
+    }
+    if value.w > BOX_MIN_ALPHA {
+        return box_lum(value.rgb / value.w);
+    }
+    return 0.0;
+}
+
+// Whether a covered texel lies inside the shapes (the threshold in extra 0, tolerance included)
+fn box_inside_shapes(texel: Texel) -> bool {
+    return texel.coverage > 0.0 && box_shape_value(texel.value) >= box_extra(0u);
+}
+
+// A ramp moved by offset and bent by exponent (RampCurve::apply)
+fn box_ramp_curve(along: f32, offset: f32, exponent: f32) -> f32 {
+    let moved = clamp(along + offset, 0.0, 1.0);
+    if exponent == 1.0 || moved <= 0.0 {
+        return moved;
+    }
+    return pow(moved, exponent);
+}
+
+// The texel's colours (a mask's value) moved to `after` and mixed in by the opacity in straight colour; the coverage stays
+fn box_laid_on(value: vec4<f32>, after: f32) -> vec4<f32> {
+    let opacity = params.weights.x;
+    if box_is_mask() {
+        return vec4(value.x + (after - value.x) * opacity, value.yzw);
+    }
+    let before = box_straight_color(value);
+    return vec4((before + (vec3(after) - before) * opacity) * value.w, value.w);
+}
+
+// Mask Outline's band over the texel (mask_outline in eval.rs): blur in extra 1, fade exponent in extra 2
+fn box_outline_texel(original: Texel, blurred: Texel) -> vec4<f32> {
+    let inside = box_inside_shapes(original);
+    var share = 0.0;
+    if blurred.coverage > MIN_WEIGHT {
+        share = clamp(blurred.value.x / blurred.coverage, 0.0, 1.0);
+    }
+    let closeness = clamp(select(share, 1.0 - share, inside) / BOX_OUTLINE_EDGE_SHARE, 0.0, 1.0);
+    let covers = (box_flags() & select(OUTLINE_COVERS_OUTSIDE, OUTLINE_COVERS_INSIDE, inside)) != 0u;
+    var band = 0.0;
+    if covers && closeness > 0.0 && (box_flags() & OUTLINE_BAND_OFF) == 0u {
+        band = 1.0;
+        if box_extra(1u) > 0.0 {
+            band = box_ramp_curve(closeness / box_extra(1u), 0.0, box_extra(2u));
+        }
+    }
+
+    // From black the band alone, else the band over the value
+    let value = original.value;
+    if (box_flags() & OUTLINE_FROM_BLACK) != 0u {
+        return box_laid_on(value, band);
+    }
+    let opacity = params.weights.x;
+    if box_is_mask() {
+        return vec4(value.x + (max(value.x, band) - value.x) * opacity, value.yzw);
+    }
+    let before = box_straight_color(value);
+    return vec4((before + (max(before, vec3(band)) - before) * opacity) * value.w, value.w);
+}
+
 // The apply pass of the kinds with passes of their own: the original at buffers.x, the filtered field at buffers.y, the result to buffers.z
 @compute @workgroup_size(8, 8)
 fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -288,6 +362,9 @@ fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     if kind == BOX_HALO {
         result = box_halo_texel(original.value, filtered);
+    }
+    if kind == BOX_OUTLINE {
+        result = box_outline_texel(original, filtered);
     }
     write_at(params.buffers.z, point, Texel(result, original.coverage));
 }
@@ -321,6 +398,12 @@ fn box_family_prepare(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             prepared = Texel(vec4(shape * source.coverage, 0.0, 0.0, 0.0), source.coverage);
         }
+    }
+
+    // Mask Outline blurs the shapes
+    if kind == BOX_OUTLINE {
+        let original = original_at(point);
+        prepared = Texel(vec4(select(0.0, original.coverage, box_inside_shapes(original)), 0.0, 0.0, 0.0), original.coverage);
     }
     write_at(params.buffers.z, point, prepared);
 }

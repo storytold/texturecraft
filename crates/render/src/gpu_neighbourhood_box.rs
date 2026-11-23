@@ -37,12 +37,12 @@
 //! mask, chained, and with a partial region (the halo); distance filters also compare the raw
 //! distance field exactly.
 
-use texturecraft_core::{ChannelKind, Filter, GrayscaleMode, HighpassSpace};
+use texturecraft_core::{ChannelKind, Filter, GrayscaleMode, HighpassSpace, MaskOutline};
 
 use super::{APPLY_WORKGROUP, BOX_KINDS, BOX_PASSES, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs};
 
 /// Library filter ids P4 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["bevel", "bevelSmooth", "directionalDistance", "maskOutline"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["bevel", "bevelSmooth", "directionalDistance"];
 
 pub(super) const WGSL: &str = include_str!("shaders/neighbourhood_box.wgsl");
 
@@ -59,10 +59,16 @@ const HIGHPASS: Kind = Kind(BOX_KINDS.start + 3);
 const PRE_BLUR: Kind = Kind(BOX_KINDS.start + 4);
 /// Glow (`HaloGlow`) and Drop Shadow.
 const HALO: Kind = Kind(BOX_KINDS.start + 5);
+/// Mask Outline.
+const OUTLINE: Kind = Kind(BOX_KINDS.start + 6);
 
 /// Flag bits of `NeighbourhoodFilter::words[0]` per kind (the same constants in the WGSL file).
 const HALO_INNER: u32 = 1;
 const HALO_PRECISE: u32 = 2;
+const OUTLINE_FROM_BLACK: u32 = 1;
+const OUTLINE_COVERS_INSIDE: u32 = 2;
+const OUTLINE_COVERS_OUTSIDE: u32 = 4;
+const OUTLINE_BAND_OFF: u32 = 8;
 
 /// Filter sizes are texels at this many texels per side, as the CPU scales them.
 const FILTER_SIZE_RESOLUTION: f32 = 2048.0;
@@ -70,6 +76,10 @@ const FILTER_SIZE_RESOLUTION: f32 = 2048.0;
 const MIN_FILTER_RADIUS: f32 = 0.5;
 /// How soft a full spread leaves a halo: its least hardness (`HALO_SOFTEST` in eval.rs).
 const HALO_SOFTEST: f32 = 0.01;
+/// What a threshold gives way by (`THRESHOLD_TOLERANCE` in core's unit_value.rs).
+const THRESHOLD_TOLERANCE: f32 = f32::EPSILON;
+/// The base a ramp curve's shape bends by (`CURVE_SHAPE_BASE` in core's ramp_curve.rs).
+const CURVE_SHAPE_BASE: f32 = 4.0;
 
 /// Work per texel of one bilinear sample, as the built-in Pixelate counts it.
 const BILINEAR_SAMPLE_WORK: u64 = 5;
@@ -101,6 +111,7 @@ pub(super) fn supports(filter: &Filter) -> bool {
             | Filter::HighPass { .. }
             | Filter::HaloGlow { .. }
             | Filter::DropShadow { .. }
+            | Filter::MaskOutline(_)
     )
 }
 
@@ -131,6 +142,7 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
             let offset = [(-dx * reach).round() as i32, (-dy * reach).round() as i32];
             Some(halo(stage, texels(*size * Filter::HALO_REACH), 0, (*spread, *opacity), *color, true, offset))
         }
+        Filter::MaskOutline(outline) => Some(mask_outline(stage, outline)),
         _ => None,
     }
 }
@@ -143,6 +155,21 @@ fn flag(on: bool, bit: u32) -> u32 {
 fn direction(angle: f32) -> [f32; 2] {
     let (sine, cosine) = angle.to_radians().sin_cos();
     [cosine, -sine]
+}
+
+/// A threshold as `at_or_above_threshold` reads it, its tolerance taken off.
+fn threshold(value: f32, fallback: f32) -> f32 {
+    (if value.is_finite() { value.clamp(0.0, 1.0) } else { fallback }) - THRESHOLD_TOLERANCE
+}
+
+/// A ramp curve's offset or shape, as `RampCurve::new` bounds it.
+fn bounded_curve(value: f32) -> f32 {
+    if value.is_finite() { value.clamp(-1.0, 1.0) } else { 0.0 }
+}
+
+/// The exponent a ramp curve's shape bends by.
+fn curve_exponent(shape: f32) -> f32 {
+    CURVE_SHAPE_BASE.powf(-bounded_curve(shape))
 }
 
 /// `GrayscaleMode` as the WGSL `box_gray_of` numbers it.
@@ -204,13 +231,29 @@ fn halo(
     halo
 }
 
+/// A Mask Outline stage: threshold, blur and fade exponent in `extra`.
+fn mask_outline(stage: StageInputs, outline: &MaskOutline) -> NeighbourhoodFilter {
+    // Three box passes reach the band's width
+    let texels = (outline.width * stage.resolution as f32 / BOX_PASSES as f32).max(MIN_FILTER_RADIUS);
+    let flags = flag(outline.from_black, OUTLINE_FROM_BLACK)
+        | flag(outline.position.covers(true), OUTLINE_COVERS_INSIDE)
+        | flag(outline.position.covers(false), OUTLINE_COVERS_OUTSIDE)
+        | flag(!outline.width.is_finite() || outline.width <= 0.0, OUTLINE_BAND_OFF);
+    let blur = if outline.blur.is_finite() { outline.blur.clamp(0.0, 1.0) } else { 0.0 };
+
+    let mut stage_filter = stage.filter(OUTLINE, texels);
+    stage_filter.extra[..3].copy_from_slice(&[threshold(outline.threshold, MaskOutline::LIBRARY.threshold), blur, curve_exponent(outline.curve)]);
+    stage_filter.words[0] = flags;
+    stage_filter
+}
+
 /// Whether the stage reads past the set's edges from the far side (`FilterStage::wrap`).
 pub(crate) fn wraps(filter: NeighbourhoodFilter) -> bool {
     matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL)
 }
 
 pub(super) fn uses_box(filter: NeighbourhoodFilter) -> bool {
-    matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL | HIGHPASS | PRE_BLUR | HALO)
+    matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL | HIGHPASS | PRE_BLUR | HALO | OUTLINE)
 }
 
 pub(super) fn reach(filter: NeighbourhoodFilter) -> u32 {
@@ -228,6 +271,7 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
         HIGHPASS => BOX_FILTER_WORK + OWN_PASS_WORK,
         PRE_BLUR => BOX_FILTER_WORK + OWN_PASS_WORK,
         HALO => BOX_FILTER_WORK + OWN_PASS_WORK,
+        OUTLINE => BOX_FILTER_WORK + OWN_PASS_WORK,
         _ => BOX_FILTER_WORK,
     }
 }
@@ -281,7 +325,7 @@ pub(super) fn encode(
     let (original, output) = (region.original, region.output);
     match filter.kind {
         // What the box passes blur goes to the output field first, which the apply pass overwrites
-        HIGHPASS | HALO => {
+        HIGHPASS | HALO | OUTLINE => {
             run(&pipelines.prepare, [original, 0, output, 0], filter.radius, false, texel_groups);
             let blurred = box_passes(&mut run, &gpu.box_blur, region, output, filter.radius);
             run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups);
@@ -303,7 +347,7 @@ mod tests {
     use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
     use texturecraft_core::{
         BakedMap, BlendMode, Channel, ChannelKind, ContentsOffset, Effect, EffectKind, Filter, Generator, GeneratorKind, GradientInput, GrayscaleMode,
-        HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground, Project, Source, TextureSet,
+        HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground, MaskOutline, OutlinePosition, Project, Source, TextureSet,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::primitives;
@@ -380,6 +424,7 @@ mod tests {
             Filter::HighPass { radius: 8.0, space: HighpassSpace::Working, alpha: true },
             LIBRARY_GLOW,
             LIBRARY_DROP_SHADOW,
+            Filter::MaskOutline(MaskOutline::LIBRARY),
         ];
 
         for filter in ported {
@@ -739,6 +784,29 @@ mod tests {
             (
                 "Glow between filters",
                 vec![(Filter::Invert, 1.0, normal), (outer_glow, 0.8, normal), (Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal)],
+                normal,
+            ),
+        ];
+
+        assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
+    }
+
+    /// Mask Outline matches the CPU at every position, on black and over the values, sharp and
+    /// faded with a curve, below full opacity, disabled and chained.
+    #[test]
+    fn mask_outline_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let outline = |position, from_black, blur, curve| Filter::MaskOutline(MaskOutline { position, from_black, threshold: 0.5, width: 0.08, blur, curve });
+        let normal = BlendMode::Normal;
+        let cases = [
+            ("library Mask Outline", vec![(Filter::MaskOutline(MaskOutline::LIBRARY), 1.0, normal)], normal),
+            ("Mask Outline outside", vec![(outline(OutlinePosition::Outside, true, 0.0, 0.0), 1.0, normal)], normal),
+            ("Mask Outline inside, over the values", vec![(outline(OutlinePosition::Inside, false, 0.5, 0.4), 0.7, normal)], BlendMode::Multiply),
+            ("Mask Outline both, faded", vec![(outline(OutlinePosition::Both, true, 0.8, -0.6), 1.0, normal)], normal),
+            ("Mask Outline disabled", vec![(outline(OutlinePosition::Both, true, 0.0, 0.0), 1.0, BlendMode::Disable)], normal),
+            (
+                "Mask Outline after a blur",
+                vec![(Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal), (outline(OutlinePosition::Outside, false, 0.3, 0.0), 0.9, normal)],
                 normal,
             ),
         ];
