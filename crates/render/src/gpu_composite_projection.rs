@@ -277,7 +277,6 @@ fn built_in(projection: &Projection, sampling: Sampling, op: &Operation) -> bool
 fn still_on_cpu(projection: &Projection, sampling: Sampling, op: &Operation) -> bool {
     let reads_image = op.ids[1] == IMAGE_SOURCE_OPCODE || projection.placed().is_some();
     (sampling.filtering == Filtering::BilinearHq && reads_image)
-        || (sampling.symmetry.on && projection.takes_symmetry())
         || matches!(projection, Projection::Warp { .. })
         || (projection.placed().is_some() && sampling.filtering != Filtering::BilinearSharp)
         || projection.depth_culling().is_some()
@@ -663,8 +662,6 @@ mod tests {
         let uniform = Source::Uniform([0.5; 3]);
         let sharp = Sampling::SAVED_BEFORE;
         let fill = |source: &Source, projection: Projection, sampling: Sampling| EffectKind::Fill { source: source.clone(), projection, sampling };
-        let mirror = FillSymmetry { on: true, ..FillSymmetry::OFF };
-        let radial = FillSymmetry { on: true, kind: SymmetryKind::Radial, axis: 1, count: 5, ..FillSymmetry::OFF };
         let warp = Projection::Warp {
             frame: frame(),
             corners: Projection::FRAME_CORNERS,
@@ -674,8 +671,6 @@ mod tests {
         };
         let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
         vec![
-            fill(&uniform, planar(Projector::default()), Sampling { symmetry: mirror, ..sharp }),
-            fill(&uniform, planar(Projector::default()), Sampling { symmetry: radial, ..sharp }),
             fill(&uniform, warp, sharp),
             fill(&image, Projection::default(), Sampling { filtering: Filtering::BilinearHq, ..sharp }),
             fill(&image, Projection::decal(frame()), Sampling { filtering: Filtering::Nearest, ..sharp }),
@@ -897,6 +892,36 @@ mod tests {
                 Tolerance::BILINEAR.with_flips(FLIPS),
                 &format!("placed frame {label}"),
             );
+        }
+    }
+
+    /// Mirrored and radial copies of 3D projections, moved off the centre and flipped, laid
+    /// over each other with the texel's own copy on top, cropped so copies overlap partly
+    #[test]
+    fn fill_symmetry_matches_the_cpu() {
+        let mut gpu = headless();
+        let on = FillSymmetry { on: true, ..FillSymmetry::OFF };
+        let symmetries = [
+            ("mirror X", on),
+            ("mirror Y off centre, flipped", FillSymmetry { axis: 1, position: [0.0, 0.2, 0.0], flip: [true, false], ..on }),
+            ("mirror Z", FillSymmetry { axis: 2, flip: [false, true], ..on }),
+            ("radial Y, 5", FillSymmetry { kind: SymmetryKind::Radial, axis: 1, count: 5, ..on }),
+            ("radial Z, 4 over 180", FillSymmetry { kind: SymmetryKind::Radial, axis: 2, count: 4, span: 180.0, flip: [true, true], ..on }),
+            ("radial X, 3 off centre", FillSymmetry { kind: SymmetryKind::Radial, axis: 0, count: 3, position: [0.1, -0.2, 0.3], ..on }),
+        ];
+        let uv = UvTransform::default();
+        let cropped = Projector { crop: ShapeCrop::Cropped, ..Projector::default() };
+        let projections = [
+            ("planar", Projection::Planar { scale: 1.6, axis: 0, offset: [0.2, 0.1, 0.0], uv, projector: cropped, placed: None }),
+            ("tri-planar", Projection::Triplanar { scale: 0.8, sharpness: 4.0, offset: [0.1, 0.0, 0.2], uv, projector: Projector::default() }),
+            ("spherical", Projection::Spherical { scale: 1.2, uv, offset: [0.4, 0.0, 0.1], projector: cropped }),
+            ("decal", Projection::decal(frame())),
+        ];
+        for (name, symmetry) in symmetries {
+            for (label, projection) in &projections {
+                let sampling = Sampling { symmetry, ..Sampling::SAVED_BEFORE };
+                assert_fill_matches(&mut gpu, &sphere(), projection, sampling, Tolerance::BILINEAR.with_flips(FLIPS), &format!("{name} {label}"));
+            }
         }
     }
 

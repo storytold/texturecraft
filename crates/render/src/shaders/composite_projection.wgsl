@@ -83,6 +83,8 @@ const P1_DEPTH_FADE_START: f32 = 0.75;
 // Nearer a cylinder's axis than this a texel counts as facing out (compose projector_cover.rs)
 const P1_MIN_AXIS_DISTANCE: f32 = 1e-6;
 const P1_FLOAT_EPSILON: f32 = 1.1920929e-7;
+// Symmetry copies stop once they cover this much (compose eval.rs COVERED)
+const P1_COVERED: f32 = 0.9999;
 // The word of a decal's alpha image in its frame words (gpu_image_source.rs decal_words)
 const P1_DECAL_ALPHA_WORD: u32 = 11u;
 
@@ -630,8 +632,92 @@ fn p1_fill_once(op: Operation, uv: vec2<f32>, surface: Surface, copy: P1Copy) ->
     return vec4(rgb, p1_cover(op, coords, projected, copied, copy));
 }
 
+// The radial copy nearest a texel `turned` degrees round the axis, of `count` copies `step`
+// degrees apart over `span` degrees (compose fill_copies.rs `nearest_copy`)
+fn p1_nearest_copy(turned: f32, step: f32, count: u32, span: f32) -> u32 {
+    // A span of nothing (or no step at all) stacks every copy on the original
+    if !(step > 0.0) {
+        return 0u;
+    }
+    let by_step = u32(floor(turned / step + 0.5));
+    if span >= P1_FULL_TURN_DEGREES {
+        return by_step % count;
+    }
+    let last = min(by_step, count - 1u);
+    let past_last = abs(turned - f32(last) * step);
+    let before_first = P1_FULL_TURN_DEGREES - turned;
+    return select(last, 0u, before_first <= past_last);
+}
+
+// Copy `index` of the fill's symmetry about `pivot`: the original at 0, then the mirror or the
+// radial copies in turn (compose `FillCopies::copy`)
+fn p1_copy(op: Operation, index: u32, pivot: vec3<f32>) -> P1Copy {
+    var copy = p1_identity_copy();
+    copy.index = index;
+    copy.moves = true;
+    copy.pivot = pivot;
+    if index == 0u {
+        return copy;
+    }
+    copy.flip = param_word(op, P1_SYMMETRY_FLIP);
+    let axis = param_word(op, P1_SYMMETRY_AXIS);
+    if param_word(op, P1_SYMMETRY_KIND) == 0u {
+        var scale = vec3(1.0);
+        scale[axis] = -1.0;
+        copy.turn = mat3x3(vec3(scale.x, 0.0, 0.0), vec3(0.0, scale.y, 0.0), vec3(0.0, 0.0, scale.z));
+        return copy;
+    }
+
+    // Copy `index` is the original turned by `index` steps, so a texel samples the original turned back
+    let angle = -radians(f32(index) * param(op, P1_SYMMETRY_STEP));
+    let s = sin(angle);
+    let c = cos(angle);
+    switch axis {
+        case 0u: { copy.turn = mat3x3(vec3(1.0, 0.0, 0.0), vec3(0.0, c, s), vec3(0.0, -s, c)); }
+        case 1u: { copy.turn = mat3x3(vec3(c, 0.0, -s), vec3(0.0, 1.0, 0.0), vec3(s, 0.0, c)); }
+        default: { copy.turn = mat3x3(vec3(c, s, 0.0), vec3(-s, c, 0.0), vec3(0.0, 0.0, 1.0)); }
+    }
+    return copy;
+}
+
+// Every copy of a symmetric fill laid over the others, the texel's own copy on top (compose
+// Texel::symmetric_copies; positions in mesh radii, where the pivot is the symmetry's position)
+fn p1_symmetric(op: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    let pivot = p1_vec3(op, P1_SYMMETRY_POSITION);
+    let axis = param_word(op, P1_SYMMETRY_AXIS);
+    let count = param_word(op, P1_SYMMETRY_COUNT);
+    let from_pivot = surface.position - pivot;
+
+    // The copy whose half (mirror) or wedge (radial) holds the texel comes first
+    var first = select(0u, 1u, from_pivot[axis] < 0.0);
+    if param_word(op, P1_SYMMETRY_KIND) != 0u {
+        let turned = degrees(atan2(from_pivot[(axis + 2u) % 3u], from_pivot[(axis + 1u) % 3u]));
+        first = p1_nearest_copy(select(turned, turned + P1_FULL_TURN_DEGREES, turned < 0.0), param(op, P1_SYMMETRY_STEP), count, param(op, P1_SYMMETRY_SPAN));
+    }
+
+    var color = vec3(0.0);
+    var cover = 0.0;
+    for (var next = 0u; next < count; next++) {
+        let one = p1_fill_once(op, uv, surface, p1_copy(op, (first + next) % count, pivot));
+        let weight = clamp(one.a, 0.0, 1.0) * (1.0 - cover);
+        color += one.rgb * weight;
+        cover += weight;
+        if cover >= P1_COVERED {
+            break;
+        }
+    }
+    if cover <= 0.0 {
+        return vec4(0.0);
+    }
+    return vec4(color / cover, cover);
+}
+
 // A fill whose operation has projection or sampling flags (Operation.ext.y != 0): the value and
 // its coverage in alpha. fill_value in composite.wgsl calls it before its own paths.
 fn projection_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    // An uncovered texel has no place to copy, so it samples the fill once
+    if (layer.ext.y & P1_SYMMETRY) != 0u && surface.valid {
+        return p1_symmetric(layer, uv, surface);
+    }
     return p1_fill_once(layer, uv, surface, p1_identity_copy());
 }
