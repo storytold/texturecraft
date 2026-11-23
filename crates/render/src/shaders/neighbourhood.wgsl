@@ -61,6 +61,19 @@ fn copy_of(point: vec2<i32>) -> vec2<i32> {
     return select(select(vec2(0), vec2(1), point >= params.bounds.zw), vec2(-1), point < params.bounds.xy);
 }
 
+// The texels [x0, y0, x1, y1) of the field a stage reads around field-local `point`: the whole
+// field for a wrapping stage, else the copy of the set the point lies in (clipped to the field)
+fn copy_segment(point: vec2<i32>) -> vec4<i32> {
+    let size = vec2<i32>(params.rect.zw);
+    if stage_wraps() {
+        return vec4(vec2(0), size);
+    }
+    let copy = copy_of(point);
+    let start = select(select(params.bounds.xy, params.bounds.zw, copy > vec2(0)), vec2(0), copy < vec2(0));
+    let end = select(select(params.bounds.zw, size, copy > vec2(0)), params.bounds.xy, copy < vec2(0));
+    return vec4(clamp(start, vec2(0), size), clamp(end, vec2(0), size));
+}
+
 // The copy of the set the texel being written lies in (apply_neighbourhood).
 var<private> output_copy: vec2<i32> = vec2(0);
 
@@ -345,8 +358,10 @@ fn average_cells(@builtin(global_invocation_id) id: vec3<u32>) {
     write_at(params.buffers.y, id.xy, Texel(vec4(value, 0.0, 0.0, 1.0), select(0.0, 1.0, count != 0u)));
 }
 
-fn cell_corner(point: vec2<i32>, weight: f32) -> vec2<f32> {
-    let cell = vec2<u32>(clamp(point, vec2(0), cell_extent() - 1));
+// Cells clamp to those of the texel's copy of the set (`cells`: first and last), as the CPU clamps to its region's.
+// Set sides are multiples of the generators' cells, so no cell straddles two copies
+fn cell_corner(point: vec2<i32>, weight: f32, cells: vec4<i32>) -> vec2<f32> {
+    let cell = vec2<u32>(clamp(point, cells.xy, cells.zw));
     let sample = read_at(params.buffers.y, cell);
     return vec2(sample.value.x, 1.0) * (weight * sample.coverage);
 }
@@ -360,10 +375,15 @@ fn interpolate_cells(@builtin(global_invocation_id) id: vec3<u32>) {
         let position = (vec2<f32>(field_origin() + vec2<i32>(id.xy)) + 0.5) / f32(params.mode.x) - 0.5 - vec2<f32>(first_cell());
         let cell = vec2<i32>(floor(position));
         let f = fract(position);
-        let weighted = cell_corner(cell, (1.0 - f.x) * (1.0 - f.y))
-            + cell_corner(cell + vec2(1, 0), f.x * (1.0 - f.y))
-            + cell_corner(cell + vec2(0, 1), (1.0 - f.x) * f.y)
-            + cell_corner(cell + vec2(1), f.x * f.y);
+        let segment = copy_segment(vec2<i32>(id.xy));
+        let size = i32(params.mode.x);
+        let first = floor_div_cells(field_origin() + segment.xy, size) - first_cell();
+        let last = min(floor_div_cells(field_origin() + segment.zw - 1, size) - first_cell(), cell_extent() - 1);
+        let cells = vec4(max(first, vec2(0)), last);
+        let weighted = cell_corner(cell, (1.0 - f.x) * (1.0 - f.y), cells)
+            + cell_corner(cell + vec2(1, 0), f.x * (1.0 - f.y), cells)
+            + cell_corner(cell + vec2(0, 1), (1.0 - f.x) * f.y, cells)
+            + cell_corner(cell + vec2(1), f.x * f.y, cells);
         if weighted.y > MIN_WEIGHT {
             value = weighted.x / weighted.y;
         }
