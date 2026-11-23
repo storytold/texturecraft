@@ -1,4 +1,4 @@
-//! Image fill bindings and world-space decal frames for the GPU compositor.
+//! Image fill bindings, world-space decal frames and projector depth grids for the GPU compositor.
 
 use std::sync::Arc;
 
@@ -6,10 +6,14 @@ use texturecraft_compose::{
     ImageRes, ImageStore,
     pattern::{decal_axes, mesh_frame},
 };
-use texturecraft_core::{Decal, DecalFlip, Filtering, Sampling, Source};
+use texturecraft_core::{Decal, DecalFlip, FillSymmetry, Filtering, Projection, Sampling, Source};
 use texturecraft_geom::{Mesh, glam::Vec3};
 
 use crate::gpu_tile_pattern::{AtlasMips, RawPlane, TileImageAtlas};
+
+#[path = "gpu_depth_grid.rs"]
+mod depth_grid;
+use depth_grid::{FillGrids, depth_grids, missing_entry};
 
 pub(crate) const IMAGE_SOURCE_OPCODE: u32 = 14;
 pub(crate) const DECAL_PROJECTION: u32 = 9;
@@ -37,6 +41,12 @@ pub(crate) struct MaterialImages {
     /// The composited mesh's centre and radius (`set_surface`): P1's band uniform turns positions
     /// in mesh radii back into world positions with them
     mesh_frame: Option<(Vec3, f32)>,
+    /// Depth-culled fills: projection, symmetry, and the side-table word their depth directory's
+    /// offset goes in
+    depths: Vec<(Projection, Option<FillSymmetry>, u32)>,
+    /// Each depth-culled fill's grids over the mesh (`set_surface`), with each copy's raw plane
+    depth_grids: Vec<Option<(FillGrids, Vec<Option<usize>>)>>,
+    raw_planes: Vec<RawPlane>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -74,8 +84,15 @@ impl MaterialImages {
         index
     }
 
+    /// A depth-culled fill with `sampling`: its grids are built over the mesh in
+    /// [`Self::set_surface`], and side-table word `directory_word` gets its depth directory's
+    /// offset when the program uploads.
+    pub(crate) fn register_depth(&mut self, projection: &Projection, sampling: Sampling, directory_word: u32) {
+        self.depths.push((projection.clone(), sampling.symmetry.on.then_some(sampling.symmetry), directory_word));
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.names.is_empty() && self.decals.is_empty()
+        self.names.is_empty() && self.decals.is_empty() && self.depths.is_empty()
     }
 
     pub(crate) fn set_images(&mut self, images: &ImageStore) {
@@ -97,16 +114,38 @@ impl MaterialImages {
         })
     }
 
-    /// Exact-f32 planes for the atlas (P1: projector depth grids built in [`Self::set_surface`]).
+    /// Exact-f32 planes for the atlas: the projector depth grids built in [`Self::set_surface`].
     pub(crate) fn raw_planes(&self) -> &[RawPlane] {
-        &[]
+        &self.raw_planes
     }
 
-    /// The mesh the program composites (P1: build the depth grids of depth-culled projections
-    /// here, with `texturecraft_compose::projector_depth`). Called by
-    /// `CompositeProgram::set_surface_inputs` before the atlas reads [`Self::raw_planes`].
-    pub(crate) fn set_surface(&mut self, mesh: &Mesh) {
+    /// The mesh the program composites: its frame, and the depth grids of the depth-culled
+    /// fills, one raw plane per distinct grid. Called by `CompositeProgram::set_surface_inputs`
+    /// before the atlas reads [`Self::raw_planes`].
+    pub(crate) fn set_surface(&mut self, mesh: &Arc<Mesh>) {
         self.mesh_frame = Some(mesh_frame(mesh.bounds()));
+        let mut planes: Vec<RawPlane> = Vec::new();
+        let grids = self
+            .depths
+            .iter()
+            .map(|(projection, symmetry, _)| {
+                let grids = depth_grids(mesh, projection, *symmetry)?;
+                let indices = grids
+                    .iter()
+                    .map(|grid| {
+                        let grid = grid.as_ref()?;
+                        let index = planes.iter().position(|plane| Arc::ptr_eq(&plane.texels, &grid.plane.texels)).unwrap_or_else(|| {
+                            planes.push(grid.plane.clone());
+                            planes.len() - 1
+                        });
+                        Some(index)
+                    })
+                    .collect();
+                Some((grids, indices))
+            })
+            .collect();
+        self.depth_grids = grids;
+        self.raw_planes = planes;
     }
 
     /// The composited mesh's centre and radius, once [`Self::set_surface`] has run.
@@ -144,7 +183,27 @@ impl MaterialImages {
                 offset
             })
             .collect();
+        self.append_depth_directories(words, atlas);
         (image_offsets, decal_offsets)
+    }
+
+    /// Each depth-culled fill's directory (its copy count, then one entry per copy) after the
+    /// grids' plane descriptors, its offset written into the fill's side-table word.
+    fn append_depth_directories(&self, words: &mut Vec<u32>, atlas: Option<&TileImageAtlas>) {
+        let plane_offsets: Vec<u32> = atlas.map_or_else(Vec::new, |atlas| (0..self.raw_planes.len()).map(|index| atlas.append_raw(words, index)).collect());
+        for ((_, _, directory_word), grids) in self.depths.iter().zip(&self.depth_grids) {
+            let Some((grids, indices)) = grids else { continue };
+
+            let directory = words.len() as u32;
+            words.push(grids.len() as u32);
+            for (grid, index) in grids.iter().zip(indices) {
+                let plane = index.and_then(|index| plane_offsets.get(index).copied());
+                words.extend(grid.as_ref().zip(plane).map_or_else(missing_entry, |(grid, plane)| grid.entry(plane)));
+            }
+            if let Some(word) = words.get_mut(*directory_word as usize) {
+                *word = directory;
+            }
+        }
     }
 }
 

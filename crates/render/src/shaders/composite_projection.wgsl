@@ -56,6 +56,11 @@ const P1_SYMMETRY_FLIP: u32 = 66u;
 const P1_DEPTH_HARDNESS: u32 = 67u;
 const P1_DEPTH_DIRECTORY: u32 = 68u;
 
+// A depth directory (gpu_depth_grid.rs): the copy count, then per copy its grid's plane
+// descriptor (width, height, x, y, layer in the image atlas), origin, cell size, cells per side,
+// nearness unit, bias, slope bias limit and fade width
+const P1_DEPTH_ENTRY_WORDS: u32 = 10u;
+
 // Projection kinds in the side table (KIND_* in gpu_composite_projection.rs)
 const P1_KIND_UV: u32 = 0u;
 const P1_KIND_UV_TILE: u32 = 1u;
@@ -731,9 +736,87 @@ fn p1_tile_cover(op: Operation, uv: vec2<f32>) -> f32 {
     return select(0.0, 1.0, all(inside | repeats));
 }
 
-// How much of the texel the fill covers (compose Texel::cover, `shape_cover`), the surface as
-// the copy sees it
+// How much depth culling leaves of the projection at `position` (in mesh radii, as copy
+// `copy_index` sees it) through that copy's grid: 0 behind the surface nearest the projector,
+// 1 on it or where nothing is in front (compose ProjectorDepth::cover)
+fn p1_depth_cover(op: Operation, copy_index: u32, position: vec3<f32>) -> f32 {
+    let directory = param_word(op, P1_DEPTH_DIRECTORY);
+    if directory == 0u || copy_index >= srgb[directory] {
+        return 1.0;
+    }
+    let entry = directory + 1u + copy_index * P1_DEPTH_ENTRY_WORDS;
+    let plane = srgb[entry];
+    if plane == P1_MISSING {
+        return 1.0;
+    }
+
+    // The point in the projector's view: across, up and how near the projector (compose ProjectorView::local)
+    var view: vec3<f32>;
+    if param_word(op, P1_KIND) == P1_KIND_PLANAR {
+        var local = position;
+        if (op.ext.y & P1_TURNS) != 0u {
+            local = p1_to_local(op) * position / p1_vec3(op, P1_STRETCH);
+        }
+        switch param_word(op, P1_AXIS) {
+            case 0u: { view = vec3(local.z, local.y, -local.x); }
+            case 1u: { view = vec3(local.x, local.z, local.y); }
+            default: { view = local; }
+        }
+    } else {
+        let local = p1_frame_local(op, p1_world(position));
+        if local.w == 0.0 {
+            return 1.0;
+        }
+        view = local.xyz;
+    }
+    if !all(abs(view) <= vec3(P1_LARGEST_FLOAT)) {
+        return 1.0;
+    }
+
+    let origin = bitcast<vec2<f32>>(vec2(srgb[entry + 1u], srgb[entry + 2u]));
+    let cell = bitcast<vec2<f32>>(vec2(srgb[entry + 3u], srgb[entry + 4u]));
+    let side = srgb[entry + 5u];
+    let unit = bitcast<f32>(srgb[entry + 6u]);
+    let at = (view.xy - origin) / cell;
+    if !(at.x >= 0.0 && at.y >= 0.0 && at.x <= f32(side) && at.y <= f32(side)) {
+        return 1.0;
+    }
+    let cell_at = min(vec2<u32>(at), vec2(side - 1u));
+
+    // The cell's nearest surface (nearness, then its slope across and up) in three texels of a row
+    let texel = vec2<i32>(i32(srgb[plane + 2u] + cell_at.x * 3u), i32(srgb[plane + 3u] + cell_at.y));
+    let layer = i32(srgb[plane + 4u]);
+    let near = bitcast<f32>(textureLoad(tile_images, texel, layer, 0).x);
+    if !p1_finite(near) {
+        return 1.0;
+    }
+    let slope = bitcast<vec2<f32>>(vec2(textureLoad(tile_images, texel + vec2(1, 0), layer, 0).x, textureLoad(tile_images, texel + vec2(2, 0), layer, 0).x));
+
+    // Extend the cell's plane to avoid culling a surface against itself, with a slope bias for
+    // curvature across adjacent triangles
+    let centre = origin + (vec2<f32>(cell_at) + 0.5) * cell;
+    let behind = near + dot(slope, view.xy - centre) - view.z;
+    let bias = bitcast<f32>(srgb[entry + 7u]) * unit + min(dot(abs(slope) * cell, vec2(1.0)), bitcast<f32>(srgb[entry + 8u]) * unit);
+    let width = (1.0 - clamp(param(op, P1_DEPTH_HARDNESS), 0.0, 1.0)) * bitcast<f32>(srgb[entry + 9u]) * unit;
+    if width <= P1_FLOAT_EPSILON {
+        return select(0.0, 1.0, behind <= bias);
+    }
+    return 1.0 - p1_smoothstep(bias, bias + width, behind);
+}
+
+// How much of the texel the fill covers (compose Texel::cover): its shape cover, then depth
+// culling where any is left of it
 fn p1_cover(op: Operation, coords: P1Coords, projected: P1Projected, uv: vec2<f32>, surface: Surface, copy: P1Copy) -> f32 {
+    let shape = p1_shape_cover(op, coords, projected, uv, surface, copy);
+    if (op.ext.y & P1_DEPTH) == 0u || shape <= 0.0 || !surface.valid {
+        return shape;
+    }
+    return shape * p1_depth_cover(op, copy.index, surface.position);
+}
+
+// How much of the texel the fill's shape covers (compose Texel::shape_cover), the surface as the
+// copy sees it
+fn p1_shape_cover(op: Operation, coords: P1Coords, projected: P1Projected, uv: vec2<f32>, surface: Surface, copy: P1Copy) -> f32 {
     let flags = op.ext.y;
     if (flags & P1_FRAMED) != 0u {
         let samples = p1_flipped(p1_image_points(op, projected.coords), copy);

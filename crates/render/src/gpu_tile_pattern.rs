@@ -236,7 +236,6 @@ pub(crate) enum AtlasMips {
 
 /// One exact-f32 plane of the atlas (P1: a projector depth grid), row by row. The atlas keeps a
 /// weak pointer to `texels`, so a plane rebuilt for every program rebuilds the atlas.
-#[allow(dead_code)] // Built by P1's depth culling
 #[derive(Clone, Debug)]
 pub(crate) struct RawPlane {
     pub(crate) size: [u32; 2],
@@ -294,7 +293,6 @@ impl TileImageAtlas {
     }
 
     /// The words of raw plane `index`: width, height and its origin (x, y, layer), read as f32 bits.
-    #[allow(dead_code)] // Read by P1's depth culling
     pub(crate) fn append_raw(&self, words: &mut Vec<u32>, index: usize) -> u32 {
         let offset = words.len() as u32;
         let (_, region) = &self.raw[index];

@@ -5,15 +5,17 @@
 //! fill takes P1's path: [`place_cover`] writes the whole projection into the side table
 //! (`SLOT_*`, offset in `ext[0]`) and its flags into `ext[1]` (`FLAG_*`), and
 //! `projection_fill_value` in the WGSL file ports the CPU evaluator's fill texel from them.
-//! `still_on_cpu` lists the settings that path does not evaluate yet.
 //!
-//! What P1 implements here:
-//! - image filtering Bilinear HQ (the default: a mip chain per material image and a footprint
-//!   from the UV derivatives) and Nearest;
+//! P1's path evaluates:
+//! - image filtering Bilinear HQ (the default: a mip chain per material image and the CPU's
+//!   footprint) and Nearest, on fills and placed frames;
 //! - UV wrap other than Repeat, fill symmetry (copies), `UvTransform` and projector rotation and
 //!   scale on the mesh projections, shape crop and backface, depth culling (the default of new
-//!   planar fills), cylindrical angles below 360, the warp projection;
-//! - procedural coordinates beyond ±32768 (only after the parity study, plan risk 2).
+//!   planar fills, through the CPU's own depth grids), cylindrical angles below 360, the warp
+//!   projection.
+//!
+//! Still on the CPU: a cropped warp that takes its image's alpha (no frame record carries a
+//! warp's images), and procedural coordinates beyond ±32768 (after the parity study, plan risk 2).
 //!
 //! How:
 //! - [`place_image`] and [`place_procedural`] fill the operation's projection words for the
@@ -119,6 +121,7 @@ const SLOT_SYMMETRY_STEP: usize = 64;
 const SLOT_SYMMETRY_SPAN: usize = 65;
 const SLOT_SYMMETRY_FLIP: usize = 66;
 const SLOT_DEPTH_HARDNESS: usize = 67;
+const SLOT_DEPTH_DIRECTORY: usize = 68;
 const SLOT_WORDS: usize = 69;
 
 // Projection kinds in `SLOT_KIND`
@@ -244,13 +247,19 @@ pub(super) fn place_cover(projection: &Projection, sampling: Sampling, op: &mut 
     if built_in(projection, sampling, op) {
         return Some(());
     }
-    if still_on_cpu(projection) {
+    if cropped_warp_reads_image_alpha(projection) {
         return None;
     }
 
     let mut flags = FLAG_ROUTED;
     let words = side_table(projection, sampling, &mut flags)?;
-    op.ext[0] = inputs.pack_words(&words)?;
+    let offset = inputs.pack_words(&words)?;
+
+    // The grids are built over the mesh, their directory written into the side table on upload
+    if flags & FLAG_DEPTH != 0 {
+        inputs.materials.register_depth(projection, sampling, offset.checked_add(SLOT_DEPTH_DIRECTORY as u32)?);
+    }
+    op.ext[0] = offset;
     op.ext[1] = flags;
     op.procedural[3] = selector(projection);
     Some(())
@@ -280,11 +289,6 @@ fn built_in(projection: &Projection, sampling: Sampling, op: &Operation) -> bool
         Projection::Cylindrical { uv, projector, angle, .. } => filtering && uv.is_default() && projector.is_default() && *angle == FULL_TURN_DEGREES,
         Projection::Warp { .. } => false,
     }
-}
-
-/// The settings P1's path does not evaluate yet: those fills stay on the CPU.
-fn still_on_cpu(projection: &Projection) -> bool {
-    cropped_warp_reads_image_alpha(projection) || projection.depth_culling().is_some()
 }
 
 /// A warp cropped to its shape takes its image's alpha, which only the fill knows: the GPU has
@@ -668,20 +672,18 @@ mod tests {
 
     /// P1's cases that still composite on the CPU, as mask effects (the content and the mask
     /// preview both compile them). Port one: delete its row (this test fails while a ported row
-    /// stays) and add its oracle test.
+    /// stays) and add its oracle test. A cropped warp that takes its image's alpha waits for a
+    /// frame record that carries a warp's images (`register_decal` in gpu_composite.rs).
     fn still_on_cpu() -> Vec<EffectKind> {
-        let uniform = Source::Uniform([0.5; 3]);
-        let sharp = Sampling::SAVED_BEFORE;
-        let fill = |source: &Source, projection: Projection, sampling: Sampling| EffectKind::Fill { source: source.clone(), projection, sampling };
+        let cropped = Projector { crop: ShapeCrop::Cropped, ..Projector::default() };
         let warp = Projection::Warp {
             frame: frame(),
             corners: Projection::FRAME_CORNERS,
             depth: Projection::WARP_DEPTH,
             uv: UvTransform::default(),
-            projector: Projector { crop: ShapeCrop::Cropped, ..Projector::default() },
+            projector: cropped,
         };
-        let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
-        vec![fill(&uniform, warp, sharp), fill(&uniform, culled, sharp)]
+        vec![EffectKind::Fill { source: Source::Uniform([0.5; 3]), projection: warp, sampling: Sampling::SAVED_BEFORE }]
     }
 
     /// The placement hooks (P0b) leave every source kind's operation as before: no package
@@ -1010,6 +1012,45 @@ mod tests {
                 // The frame's edge crops hard
                 assert_fill_matches(&mut gpu, &sphere(), &projection, sampling, Tolerance::BILINEAR.with_flips(FLIPS), &format!("{filtering:?} {label}"));
             }
+        }
+    }
+
+    /// Depth culling, the default of new planar and warp fills, hides surfaces behind the one
+    /// nearest the projector through the CPU's own grid, read from the atlas's float planes:
+    /// planar axes, hard and soft, turned, placed frames, warps and symmetry copies' own grids
+    #[test]
+    fn depth_culling_matches_the_cpu() {
+        let mut gpu = headless();
+        let uv = UvTransform::default();
+        let culled = Projector::depth_culled();
+        let hard = Projector { depth: DepthCulling { on: true, hardness: 1.0 }, ..Projector::default() };
+        let soft = Projector { depth: DepthCulling { on: true, hardness: 0.0 }, ..Projector::default() };
+        let turned = Projector { rotation: [30.0, -20.0, 0.0], scale: [1.2, 1.0, 0.8], ..culled };
+        let decal = Projector { crop: ShapeCrop::Cropped, backface: Backface { on: true, ..Backface::default() }, ..culled };
+        let mirror = FillSymmetry { on: true, axis: 1, ..FillSymmetry::OFF };
+        let radial = FillSymmetry { on: true, kind: SymmetryKind::Radial, axis: 1, count: 3, ..FillSymmetry::OFF };
+        let sharp = Sampling::SAVED_BEFORE;
+        let cases = [
+            ("planar X", Projection::Planar { scale: 0.9, axis: 0, offset: [0.0; 3], uv, projector: culled, placed: None }, sharp),
+            ("planar Y hard", Projection::Planar { scale: 0.9, axis: 1, offset: [0.0; 3], uv, projector: hard, placed: None }, sharp),
+            ("planar Z soft", Projection::Planar { scale: 0.9, axis: 2, offset: [0.0; 3], uv, projector: soft, placed: None }, sharp),
+            ("planar turned", Projection::Planar { scale: 1.1, axis: 2, offset: [0.1, 0.0, 0.0], uv, projector: turned, placed: None }, sharp),
+            ("placed frame", Projection::Planar { scale: 1.0, axis: 2, offset: [0.0; 3], uv, projector: decal, placed: Some(frame()) }, sharp),
+            ("warp", Projection::Warp { frame: frame(), corners: Projection::FRAME_CORNERS, depth: 0.5, uv, projector: culled }, sharp),
+            (
+                "mirrored planar",
+                Projection::Planar { scale: 0.9, axis: 0, offset: [0.2, 0.0, 0.0], uv, projector: culled, placed: None },
+                Sampling { symmetry: mirror, ..sharp },
+            ),
+            (
+                "radial planar",
+                Projection::Planar { scale: 0.9, axis: 2, offset: [0.0; 3], uv, projector: culled, placed: None },
+                Sampling { symmetry: radial, ..sharp },
+            ),
+            ("planar bilinear HQ", Projection::Planar { scale: 2.5, axis: 2, offset: [0.0; 3], uv, projector: culled, placed: None }, Sampling::default()),
+        ];
+        for (label, projection, sampling) in cases {
+            assert_fill_matches(&mut gpu, &sphere(), &projection, sampling, Tolerance::BILINEAR.with_flips(FLIPS), &format!("depth culled {label}"));
         }
     }
 
