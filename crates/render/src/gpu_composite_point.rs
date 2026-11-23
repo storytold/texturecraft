@@ -36,7 +36,10 @@ use super::{CompositeProgram, Operation, ProceduralInputs};
 
 /// Library filter ids P2 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] =
-    &["hsl", "colorCorrect", "gradientMap", "gradientCurve", "gradientDynamic", "smoothstep", "heightAdjust", "grayscale"];
+    &["colorCorrect", "gradientMap", "gradientCurve", "gradientDynamic", "smoothstep", "heightAdjust", "grayscale"];
+
+// P2's opcodes (the same constants head composite_point.wgsl)
+const HSL_PERCEPTIVE: u32 = 128;
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_point.wgsl");
 /// The same functions without P2's code, for programs that do not use it.
@@ -49,8 +52,16 @@ fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
 fn point_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 { return point_scalar_filter(effect, mask); }";
 
 /// A filter as a P2 point operation: (opcode, three parameters), or None.
-pub(super) fn lower(_filter: &Filter, _effect: &Effect, _op: &mut Operation, _inputs: &mut ProceduralInputs) -> Option<(u32, [f32; 3])> {
-    None
+pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, _inputs: &mut ProceduralInputs) -> Option<(u32, [f32; 3])> {
+    match filter {
+        Filter::Hsl { hue, saturation, lightness, perceptive: true } => {
+            // The hue turn as the CPU computes it, so the shader only rotates
+            let (sine, cosine) = (hue * std::f32::consts::TAU).sin_cos();
+            op.high[..2].copy_from_slice(&[sine, cosine]);
+            Some((HSL_PERCEPTIVE, [*hue, *saturation, *lightness]))
+        }
+        _ => None,
+    }
 }
 
 /// Whether a program needs the full `composite_point.wgsl`.
@@ -65,16 +76,125 @@ pub(super) fn band_uniform(_program: &CompositeProgram) -> [u32; 4] {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use texturecraft_core::{ContentsOffset, EffectKind, Filter};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-    use crate::gpu_composite::oracle::{compile_effects, effect};
+    use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
+    use texturecraft_core::{
+        BlendMode, Channel, ContentsOffset, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind, Mask, MaskBackground, Project, Source, TextureSet,
+    };
+    use texturecraft_geom::primitives;
+    use texturecraft_texel::{TILE, to_u16, to_u16_signed};
+
+    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
+
+    /// The oracle's texture set is one tile across
+    const SIZE: u32 = TILE;
+
+    /// The opacity of the filter under test, below 1 so the mix is exercised
+    const EFFECT_OPACITY: f32 = 0.77;
+
+    /// A painted layer over a uniform fill, carrying `effects` (filter, opacity) in its content and
+    /// in its painted mask, each set to `blend`: (project, pixels, the painted layer). The paint
+    /// sweeps every channel and the mask across the tile at a coverage that rises down it.
+    fn painted_case(effects: &[(Filter, f32)], blend: BlendMode) -> (Project, PixelStore, LayerId) {
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal];
+        let mut project = Project::new("Point filters", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let sources = BTreeMap::from([
+            (Channel::BaseColor, Source::Uniform([0.47, 0.3, 0.58])),
+            (Channel::Roughness, Source::Uniform([0.41; 3])),
+            (Channel::Height, Source::Uniform([-0.34; 3])),
+            (Channel::Normal, Source::Uniform([0.37, 0.68, 0.89])),
+        ]);
+        let below = Layer::new(project.alloc_id(), "Below", LayerKind::Fill(Fill { sources, ..Default::default() }), &channels);
+        project.insert_layer(0, below, None, false).unwrap();
+
+        let owner = project.alloc_id();
+        let painted_mask = project.alloc_id();
+        let mut layer = Layer::new(owner, "Painted", LayerKind::Paint, &channels);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(painted_mask, EffectKind::Paint));
+        for (filter, opacity) in effects {
+            for stack in [&mut layer.content_effects, &mut mask.effects] {
+                let mut added = Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone()));
+                added.opacity = *opacity;
+                added.blend = blend;
+                stack.push(added);
+            }
+        }
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+
+        // Premultiplied paint, as the store keeps it
+        let mut pixels = PixelStore::default();
+        let size = (SIZE, SIZE);
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let (across, down) = ((x as f32 + 0.5) / SIZE as f32, (y as f32 + 0.5) / SIZE as f32);
+                let coverage = 0.25 + 0.75 * down;
+                let premultiplied = |value: f32| to_u16(value * coverage);
+                let alpha = to_u16(coverage);
+                let color = [premultiplied(across), premultiplied(0.15 + 0.7 * down), premultiplied(0.9 - 0.6 * across), alpha];
+                pixels.layer_mut(owner, Channel::BaseColor, size).set(x, y, &color);
+                pixels.layer_mut(owner, Channel::Roughness, size).set(x, y, &[premultiplied(0.05 + 0.6 * across + 0.3 * down), alpha]);
+                pixels.layer_mut(owner, Channel::Height, size).set(x, y, &[to_u16_signed((-0.8 + 1.2 * across + 0.4 * down) * coverage), alpha]);
+                let normal = [premultiplied(0.35 + 0.3 * across), premultiplied(0.35 + 0.3 * down), premultiplied(0.92), alpha];
+                pixels.layer_mut(owner, Channel::Normal, size).set(x, y, &normal);
+                pixels.mask_mut(painted_mask, size).set(x, y, &[to_u16(0.05 + 0.6 * across + 0.3 * (1.0 - down)), u16::MAX]);
+            }
+        }
+        (project, pixels, owner)
+    }
+
+    /// Each filter in content (colour and the other channels) and in the mask matches the CPU:
+    /// alone, set to Disable, and between two filters the GPU already evaluates
+    fn assert_filters_match_cpu(filters: &[Filter], tolerance: Tolerance) {
+        for filter in filters {
+            let added = || Some(effect(EffectKind::Filter(filter.clone())));
+            let (material, mask) = compile_effects(added(), added(), ContentsOffset::NONE);
+            assert!(material.is_ok() && mask.is_ok(), "{filter:?}: {material:?} {mask:?}");
+        }
+
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let before = Filter::ContrastLuminosity { contrast: 0.2, luminosity: 0.05 };
+        let after = Filter::Hsl { hue: 0.1, saturation: 0.2, lightness: -0.05, perceptive: false };
+        for filter in filters {
+            let alone = vec![(filter.clone(), EFFECT_OPACITY)];
+            let chained = vec![(before.clone(), 0.9), (filter.clone(), EFFECT_OPACITY), (after.clone(), 0.85)];
+            let stacks =
+                [(alone.clone(), BlendMode::Multiply, "alone"), (alone, BlendMode::Disable, "set to Disable"), (chained, BlendMode::Multiply, "chained")];
+            for (effects, blend, context) in stacks {
+                let (project, pixels, owner) = painted_case(&effects, blend);
+                let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+                case.mask_owner = Some(owner);
+                assert_matches_cpu(&mut gpu, &case, tolerance, &format!("{filter:?} {context}"));
+            }
+        }
+    }
+
+    #[test]
+    fn hsl_perceptive_matches_the_cpu() {
+        let filters = [
+            // The library default
+            Filter::Hsl { hue: 0.0, saturation: 0.0, lightness: 0.0, perceptive: true },
+            Filter::Hsl { hue: 0.2, saturation: 0.3, lightness: -0.1, perceptive: true },
+            Filter::Hsl { hue: -0.35, saturation: -0.6, lightness: 0.4, perceptive: true },
+            Filter::Hsl { hue: 0.45, saturation: 0.8, lightness: 0.25, perceptive: true },
+            Filter::Hsl { hue: 1.3, saturation: -1.0, lightness: -1.0, perceptive: true },
+        ];
+
+        // OKLab takes cube roots
+        assert_filters_match_cpu(&filters, Tolerance::TRANSCENDENTAL);
+    }
 
     /// P2's filters and settings that still composite on the CPU, in content and in masks. Port
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
     fn still_on_cpu() -> Vec<Filter> {
         vec![
             Filter::Smoothstep { min: 0.2, max: 0.8 },
-            Filter::Hsl { hue: 0.1, saturation: 0.0, lightness: 0.0, perceptive: true },
             Filter::GradientMap {
                 colors: vec![[0.0; 3], [1.0; 3]],
                 positions: vec![0.0, 0.3],
