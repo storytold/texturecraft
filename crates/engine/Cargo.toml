@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 texturecraft-core = { workspace = true }
 texturecraft-texel = { workspace = true }
 texturecraft-geom = { workspace = true }
@@ -21,6 +22,19 @@ epaint_default_fonts = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tempfile = "3"
+
+[target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
+sysinfo = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+processkit = { version = "3.3.4", default-features = false, features = ["limits"] }
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }

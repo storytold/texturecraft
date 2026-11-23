@@ -45,6 +45,11 @@ pub(crate) fn reset_query(app: &mut TextureCraftApp) {
 /// Read the user's saved assets from disk again and redraw their thumbnails
 fn refresh(app: &mut TextureCraftApp) {
     app.library = None;
-    app.brushes = None;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    for warning in app.session.load_brush_presets(crate::user_dir("brushes")) {
+        app.toast(warning, true);
+    }
+
     app.thumbs.forget_saved_files();
 }

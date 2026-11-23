@@ -102,7 +102,7 @@ fn closing_the_project_with_changes_asks_first() {
     assert_eq!(name(&h), "Edited", "the project stays until answered");
     h.get_by_label("Don't save").click();
     h.run_steps(2);
-    assert_ne!(name(&h), "Edited", "Don't save closes the project");
+    assert!(!h.state().session.project_open, "Don't save closes the project");
     assert!(h.state().ui.windows.unsaved.is_none() && !h.state().session.modified);
 }
 

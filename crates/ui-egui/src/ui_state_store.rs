@@ -243,9 +243,11 @@ fn read_bytes(_file: &Path) -> std::io::Result<Vec<u8>> {
     Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "UI settings use browser storage"))
 }
 
-/// Whether both docks were read rather than replaced by a default
+/// Whether every dock, the two in use and those of the named layouts, was read rather than replaced by a default
 fn fully_read(ui: &UiState) -> bool {
-    !ui.dock.replaced_unreadable() && !ui.inactive_mode_dock.replaced_unreadable()
+    !ui.dock.replaced_unreadable()
+        && !ui.inactive_mode_dock.replaced_unreadable()
+        && ui.named_layouts.iter().all(|layout| !layout.painting.replaced_unreadable() && !layout.baking.replaced_unreadable())
 }
 
 /// The `n`th copy name of an unreadable state: `<stem>.unreadable.<extension>`, then `<stem>.unreadable-N.<extension>`
@@ -410,6 +412,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_unreadable_named_layout_keeps_a_copy_of_the_state_before_the_next_save() {
+        let folder = test_folder("unreadable-named");
+        let file = folder.join("ui.json");
+        let mut ui = UiState { dock: moved_panels(), ..UiState::default() };
+        assert!(ui.save_named_layout("mine"));
+        let mut storage = MemoryStorage::default();
+        UiStateStore::new(Some(file.clone())).save(&ui, &mut storage);
+        let saved = std::fs::read_to_string(&file).unwrap();
+
+        // The last "Assets" belongs to the saved layout; the docks in use come first
+        let at = saved.rfind("\"Assets\"").expect("the named layout holds Assets");
+        let broken = format!("{}\"Bogus\"{}", &saved[..at], &saved[at + "\"Assets\"".len()..]);
+        std::fs::write(&file, &broken).unwrap();
+
+        let mut store = UiStateStore::new(Some(file.clone()));
+        let loaded = store.load(Some(&storage)).expect("the state loads");
+        assert_eq!(loaded.dock, ui.dock, "the docks in use were readable");
+        assert!(!fully_read(&loaded), "the damaged named layout counts as unread");
+
+        store.save(&loaded, &mut storage);
+        assert_eq!(std::fs::read_to_string(folder.join(unreadable_name("ui", 1, "json"))).unwrap(), broken);
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn valid_named_layouts_and_none_at_all_count_as_read() {
+        let mut ui = UiState::default();
+        assert!(fully_read(&ui));
+        ui.save_named_layout("mine");
+        assert!(fully_read(&restart(&ui)));
+    }
+
+    #[test]
     fn an_unreadable_state_that_cannot_be_kept_is_not_saved_over() {
         let folder = test_folder("frozen");
         let file = folder.join("ui.json");
@@ -507,6 +542,24 @@ pub(crate) mod tests {
 
         store.save(&UiState { uv_pan: [f32::NAN, 0.0], ..UiState::default() }, &mut storage);
         assert_eq!(storage.values[STORAGE_KEY], saved);
+    }
+
+    #[test]
+    fn an_overflowing_shelf_split_still_allows_saving_other_preferences() {
+        let defaults = UiState::default();
+        let mut saved = serde_json::to_value(&defaults).unwrap();
+        saved["shelf_panes_split"] = serde_json::json!(1e100);
+        let mut storage = MemoryStorage::default();
+        storage.values.insert(STORAGE_KEY.to_owned(), saved.to_string());
+
+        let mut store = UiStateStore::default();
+        let mut ui = store.load(Some(&storage)).expect("settings load with both panes closed");
+        ui.shelf_filter = "rust".to_owned();
+        store.save(&ui, &mut storage);
+
+        let restarted = UiStateStore::default().load(Some(&storage)).unwrap();
+        assert_eq!(restarted.shelf_filter, "rust");
+        assert_eq!(restarted.shelf_panes_split, defaults.shelf_panes_split);
     }
 
     #[test]
@@ -677,5 +730,54 @@ pub(crate) mod tests {
 
         store.save(&loaded, &mut storage);
         assert_eq!(storage.values["ui.unreadable.json"], original);
+    }
+
+    #[test]
+    fn tool_settings_survive_a_restart() {
+        let mut tool = texturecraft_engine::ToolState::default();
+        tool.brush.size = 0.31;
+        tool.brush.hardness = 0.9;
+        tool.brush.symmetry.z = true;
+        tool.smudge_strength = 0.8;
+        tool.clone_from = texturecraft_engine::CloneFrom::Layer;
+        tool.path.fill = true;
+        let ui = UiState { tool_settings: texturecraft_engine::ToolSettings::of(&tool), ..UiState::default() };
+
+        let restarted = restart(&ui);
+
+        assert_eq!(restarted.tool_settings, ui.tool_settings);
+        let mut next = texturecraft_engine::ToolState::default();
+        restarted.tool_settings.apply(&mut next);
+        assert_eq!((next.brush.size, next.brush.hardness, next.smudge_strength), (0.31, 0.9, 0.8));
+        assert!(next.brush.symmetry.z && next.path.fill);
+        assert_eq!(next.clone_from, texturecraft_engine::CloneFrom::Layer);
+    }
+
+    #[test]
+    fn a_state_saved_before_tool_settings_existed_loads_with_the_defaults() {
+        let mut saved = serde_json::to_value(UiState::default()).unwrap();
+        saved.as_object_mut().unwrap().remove("tool_settings").expect("the saved state has tool settings");
+        let mut storage = MemoryStorage::default();
+        storage.values.insert(STORAGE_KEY.into(), saved.to_string());
+        let mut store = UiStateStore::default();
+
+        let loaded = store.load(Some(&storage)).expect("the old state loads");
+
+        assert_eq!(loaded.tool_settings, texturecraft_engine::ToolSettings::default());
+
+        // Nothing was unreadable, so nothing is kept beside the state on the next save
+        assert!(store.unreadable.is_none());
+    }
+
+    #[test]
+    fn the_app_starts_with_the_saved_tool_settings() {
+        let mut tool = texturecraft_engine::ToolState::default();
+        tool.brush.size = 0.31;
+        let ui = UiState { tool_settings: texturecraft_engine::ToolSettings::of(&tool), ..UiState::default() };
+        let mut session = texturecraft_engine::sample_session(128, 64).unwrap();
+
+        crate::start_ui(Some(restart(&ui)), &mut session);
+
+        assert_eq!(session.tool.brush.size, 0.31);
     }
 }

@@ -20,7 +20,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Use image as mesh map",
             [],
             None,
-            "{ts?, map: mesh map id (normal, ambientOcclusion, curvature, id, height…), image: resource name} → {map, resolution} — resampled to the size of the set's other mesh maps (or its bake size); a normal map is read in the project's normal format. A UV-tiled set takes one image per tile, named alike with the tile number (`image: \"ao.1001.png\"` finds ao.1002.png…)",
+            "{ts?, map: mesh map id (normal, ambientOcclusion, curvature, id, height…), image: resource name} → {map, resolution} — resampled to the size of the set's other mesh maps (or its bake size); a normal or bent normal map is read in the project's normal format. A UV-tiled set takes one image per tile, named alike with the tile number (`image: \"ao.1001.png\"` finds ao.1002.png…)",
             always,
             set
         ),
@@ -62,7 +62,8 @@ pub(crate) fn use_images(s: &mut Session, cmd: &str, ts: usize, map: BakedMap, i
 
     let (width, height) = image_map_size(s, cmd, ts)?;
 
-    let flip_green = map == BakedMap::Normal && s.doc.project.normal_format == NormalFormat::DirectX;
+    // Bent normals are tangent-space maps like the normal map, so both follow the project's normal format
+    let flip_green = matches!(map, BakedMap::Normal | BakedMap::BentNormal) && s.doc.project.normal_format == NormalFormat::DirectX;
     let data = match (grid, images.values().next()) {
         (_, None) => return Err(bad(cmd, "no image to use")),
         (None, Some(image)) => resample(map.components(), (width, height), flip_green, |u, v| image.sample(u, v)),
@@ -134,7 +135,7 @@ fn udim_in(name: &str) -> Option<usize> {
 
 /// `w` × `h` texels of `comps` values each from `sample` (atlas UV → RGBA), as stored in the
 /// file (mesh maps hold data, not colors, so nothing is linearized); `flip_green` reads a
-/// DirectX normal map.
+/// DirectX normal or bent normal map.
 fn resample(comps: usize, (w, h): (u32, u32), flip_green: bool, sample: impl Fn(f32, f32) -> [f32; 4] + Sync) -> Vec<f32> {
     let mut out = vec![0.0; w as usize * h as usize * comps];
     out.par_chunks_mut(w as usize * comps).enumerate().for_each(|(y, row)| {

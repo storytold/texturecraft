@@ -293,6 +293,9 @@ pub fn semibold(size: f32) -> FontId {
 /// The semibold family: Inter SemiBold, the regular font without it.
 pub(crate) const SEMIBOLD: &str = "ui-semibold";
 
+/// Colour of the hard, unblurred shadow under the panel's own popups (pickers, menus, tips)
+pub(crate) const HARD_SHADOW: Color32 = Color32::from_rgb(12, 14, 18);
+
 /// The app's fonts: Inter (regular and semibold) when built with craft-fonts, egui's defaults
 /// otherwise, egui's monospace face for values, and the Phosphor icon font (`fonts::UiFonts`
 /// adds CJK).
@@ -332,8 +335,7 @@ pub fn apply(ctx: &egui::Context, b: Brightness, accent: Accent) {
     let t = Tokens::for_brightness(b).with_accent(accent);
     ctx.data_mut(|d| d.insert_temp(egui::Id::NULL, t));
     ctx.all_styles_mut(|s| {
-        // VectorCraft's type scale: 11 small print, 13 body and controls, 15 headings (semibold),
-        // 11.5 values in the monospace face.
+        // Match VectorCraft's type scale for print, body, headings and monospace values
         s.text_styles = [
             (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
             (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
@@ -342,7 +344,8 @@ pub fn apply(ctx: &egui::Context, b: Brightness, accent: Accent) {
             (TextStyle::Monospace, FontId::new(11.5, FontFamily::Monospace)),
         ]
         .into();
-        // A 2-4-6-8-12 spacing scale: 6 between items, 4 between rows, controls 24 high.
+
+        // A 2-4-6-8-12 spacing scale: 6 between items, 4 between rows, controls 24 high
         s.spacing.item_spacing = egui::vec2(6.0, 4.0);
         s.spacing.button_padding = egui::vec2(8.0, 3.0);
         s.spacing.interact_size = egui::vec2(24.0, 24.0);
@@ -363,18 +366,20 @@ pub fn apply(ctx: &egui::Context, b: Brightness, accent: Accent) {
         v.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(if t.dark { 120 } else { 60 }) };
         v.window_shadow = egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(if t.dark { 140 } else { 70 }) };
         v.selection.bg_fill = t.accent_dim;
-        // Selected options and selected text are lettered in the strong colour: the accent on its
-        // own tint is hard to read.
+
+        // Strong text stays legible on the tinted selection background
         v.selection.stroke = Stroke::new(1.0, t.text_strong);
         v.hyperlink_color = t.accent;
         let w = &mut v.widgets;
         craft_ui::theme::WidgetPalette { noninteractive: t.panel, inactive: t.button, hovered: t.row_hover, active: t.tool_active, open: t.row_hover }
             .apply_to(w, t.cr(), Stroke::new(1.0, t.text));
-        // Hovered and pressed lettering, and `RichText::strong` (captions), in the strong colour.
+
+        // Hovered and pressed lettering, and `RichText::strong` (captions), in the strong colour
         w.hovered.fg_stroke.color = t.text_strong;
         w.active.fg_stroke.color = t.text_strong;
         w.noninteractive.bg_stroke = Stroke::new(1.0, t.separator);
-        // Flat buttons: the outline is the face's own colour, so only text fields show it.
+
+        // Flat buttons: the outline is the face's own colour, so only text fields show it
         w.inactive.bg_stroke = Stroke::new(1.0, t.button);
         w.hovered.bg_stroke = Stroke::new(1.0, t.field_border);
         w.active.bg_stroke = Stroke::new(1.0, t.accent);
@@ -382,6 +387,56 @@ pub fn apply(ctx: &egui::Context, b: Brightness, accent: Accent) {
         v.striped = false;
         s.visuals = v;
     });
+}
+
+/// X, Y and Z as the view corner, the symmetry manipulator and the 3D fields show them
+pub const AXIS_COLORS: [Color32; 3] = [Color32::from_rgb(0xd8, 0x60, 0x4f), Color32::from_rgb(0x6c, 0xbc, 0x5a), Color32::from_rgb(0x5a, 0x8c, 0xe0)];
+
+/// An axis arrow's shaft as the symmetry manipulator and the projection gizmos draw it: its width, the dark halo under it and the halo's extra width (points at the default size)
+pub const SHAFT_WIDTH: f32 = 2.2;
+pub const SHAFT_HALO: Color32 = Color32::from_black_alpha(128);
+pub const SHAFT_HALO_EXTRA_WIDTH: f32 = 3.0;
+
+/// The axes' letters, as the Axis switches and the 3D fields' tags show them
+pub const AXIS_NAMES: [&str; 3] = ["X", "Y", "Z"];
+
+/// Cyan, magenta and yellow: the opposites of [`AXIS_COLORS`] at the same brightness (Color Balance's color names)
+pub const OPPOSITE_COLORS: [Color32; 3] = [Color32::from_rgb(0x52, 0xb8, 0xc4), Color32::from_rgb(0xc4, 0x6a, 0xc8), Color32::from_rgb(0xd2, 0xb8, 0x52)];
+
+/// `from` moved `amount` of the way to `to` in gamma space, opaque
+pub(crate) fn lerp_color(from: Color32, to: Color32, amount: f32) -> Color32 {
+    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(mix(from.r(), to.r()), mix(from.g(), to.g()), mix(from.b(), to.b()))
+}
+
+/// Least contrast a tinted color name keeps against its background (the WCAG ratio for normal text: the names are regular 12 pt lettering)
+const TINT_MIN_CONTRAST: f32 = 4.5;
+
+/// How finely [`legible_tint`] walks from the tint to the text colour: a tenth of the way at a time keeps as much of the tint as reads
+const TINT_STEPS: u8 = 10;
+
+/// `tint` moved toward `text` just enough to read on `background` (Color Balance's yellow and cyan names on a light card); a tint that already reads stays as it is
+pub fn legible_tint(tint: Color32, background: Color32, text: Color32) -> Color32 {
+    (0..=TINT_STEPS)
+        .map(|step| tint.lerp_to_gamma(text, f32::from(step) / f32::from(TINT_STEPS)))
+        .find(|color| contrast_ratio(*color, background) >= TINT_MIN_CONTRAST)
+        .unwrap_or(text)
+}
+
+/// WCAG's flare term, added to both luminances so black still has a ratio
+const WCAG_FLARE: f32 = 0.05;
+
+/// The WCAG contrast ratio of two opaque colors (1..21)
+fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let luminance = |color: Color32| {
+        let linear = egui::Rgba::from(color);
+
+        // Rec. 709 luminance
+        0.2126 * linear.r() + 0.7152 * linear.g() + 0.0722 * linear.b()
+    };
+    let (first, second) = (luminance(a), luminance(b));
+    let (high, low) = (first.max(second), first.min(second));
+    (high + WCAG_FLARE) / (low + WCAG_FLARE)
 }
 
 /// A section caption inside a panel: semibold in the strong colour, as written (no capitals).
@@ -392,6 +447,23 @@ pub fn caption(text: &str) -> egui::RichText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tint_names_reach_normal_text_contrast_and_a_tint_that_already_reads_stays_as_it_is() {
+        for theme in [Brightness::Light, Brightness::MediumLight, Brightness::MediumDark, Brightness::Dark] {
+            let tokens = Tokens::for_brightness(theme);
+            for tint in OPPOSITE_COLORS.into_iter().chain(AXIS_COLORS) {
+                let shown = legible_tint(tint, tokens.row, tokens.text);
+                assert!(contrast_ratio(shown, tokens.row) >= TINT_MIN_CONTRAST, "{theme:?} {tint:?} -> {shown:?}");
+                if contrast_ratio(tint, tokens.row) >= TINT_MIN_CONTRAST {
+                    assert_eq!(shown, tint, "{theme:?}: a tint that already reads stays as it is");
+                }
+            }
+        }
+
+        let light = Tokens::for_brightness(Brightness::Light);
+        assert_ne!(legible_tint(OPPOSITE_COLORS[2], light.row, light.text), OPPOSITE_COLORS[2], "yellow darkens on a light card");
+    }
 
     #[test]
     fn settings_round_trip_and_unknown_values_load_the_defaults() {
@@ -410,21 +482,11 @@ mod tests {
 
     #[test]
     fn every_brightness_and_accent_reads() {
-        // Relative luminance (WCAG) and contrast ratio.
-        let lum = |c: Color32| {
-            let ch = |v: u8| {
-                let v = f32::from(v) / 255.0;
-                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-            };
-            0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
-        };
-        let contrast = |a: Color32, b: Color32| {
-            let (x, y) = (lum(a), lum(b));
-            (x.max(y) + 0.05) / (x.min(y) + 0.05)
-        };
+        let contrast = contrast_ratio;
         for b in Brightness::ALL {
             for a in Accent::ALL {
                 let t = Tokens::for_brightness(b).with_accent(a);
+
                 assert_eq!(t.dark, matches!(b, Brightness::Dark | Brightness::MediumDark));
                 assert!(contrast(t.text, t.panel) >= 7.0, "{b:?}: text on panel");
                 assert!(contrast(t.text_dim, t.panel) >= 4.5, "{b:?}: dim text on panel");
@@ -434,11 +496,13 @@ mod tests {
                 assert!(contrast(t.accent, t.panel) >= 2.5, "{b:?} {a:?}: accent on panel");
                 assert!(contrast(Color32::WHITE, t.accent_strong) >= 2.5, "{b:?} {a:?}: white on accent button");
                 assert!(contrast(t.viewport_text, t.viewport) >= 3.0, "{b:?}: lettering on the views");
-                // Slider rails show on the card.
+
+                // Slider rails show on the card
                 assert!(contrast(t.button_border, t.panel) >= 1.6, "{b:?}: rail on panel");
             }
         }
-        // The views keep their studio slate.
+
+        // The views keep their studio slate
         assert_eq!(Tokens::for_brightness(Brightness::Light).viewport, Tokens::for_brightness(Brightness::Dark).viewport);
     }
 }

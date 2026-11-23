@@ -43,7 +43,8 @@ degenerate are refused (MikkTSpace crashes on them).
 ### Mesh export (`mesh_export`)
 
 ```rust
-pub fn obj_bytes(mesh: &Mesh, name: &str) -> Vec<u8>;
+pub fn obj_bytes(mesh: &Mesh, name: &str) -> Result<Vec<u8>>;
+pub fn obj_with_mtl(mesh: &Mesh, name: &str, stem: &str, textures: &[Vec<ExportedFile>]) -> Result<(Vec<u8>, NamedFiles)>;
 pub fn glb_bytes(mesh: &Mesh, name: &str, textures: &[GlbTextures]) -> Result<Vec<u8>>;
 pub fn glb_export_options() -> ExportOptions;                     // render GlbTextures with these
 pub struct GlbTextures { pub base_color, pub orm, pub normal, pub emissive: Option<Vec<u8>> }  // PNG
@@ -52,6 +53,9 @@ pub fn usd_export_options() -> ExportOptions;                     // render each
 pub enum UsdFormat { Usda, Usdc, Usdz }
 pub struct UsdExport { pub bytes: Vec<u8>, pub textures: Vec<(String, Vec<u8>)> }  // textures: usda/usdc only
 ```
+
+OBJ export propagates shared writer validation and limit errors rather than returning empty bytes.
+An unsuccessful OBJ export returns no material library or texture files.
 
 USD: one `Mesh` prim (vertex normals and `primvars:st`, `subdivisionScheme = "none"`), one
 `materialBind` GeomSubset per material when there are several, and a UsdPreviewSurface material
@@ -78,24 +82,30 @@ pub fn preset_from_json(json: &str) -> Result<ExportPreset>;
 pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
 ```
 
-- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)> }`
+- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)>, inverted: Vec<Dest> }`
   (serde JSON, so presets can be user files).
 - `Dest`: `R G B A` or `L` (gray; `L` + `A` = gray + alpha).
 - `SourceRef`: `Channel { channel, component }` (`Normal` = the **final** normal in the export
   normal format), `Virtual { map, component }` (`NormalOpenGl`, `NormalDirectX`, `Glossiness` =
   1 − roughness, `AoMixed` = baked AO × AO channel, `F0` = 0.08 × specular level),
   `Baked { map, component }`, `Constant(f32)`.
-- `ExportOptions { preset, format_override, bit_depth_override, padding, size, normal_format }`;
-  `Padding::{None, Dilation(n), DilationDefault(n), Infinite}`; `size` must be a power of two
+- `ExportOptions::new(preset)` accepts format and bit-depth overrides, per-map settings in
+  `maps`, dithering, padding, size and normal format.
+  `Padding::{None, Dilation(n), DilationDefault(n), DilationDiffusion(n), Infinite}`; `size` must be a power of two
   (box filter down, bilinear up).
 - File templates: `$project`, `$mesh`, `$textureSet`, `$channel`, `$colorSpace`; names are
   sanitized to `[A-Za-z0-9_.-]` (reserved device names get a `_` prefix); case-insensitive
   collisions get `_2`, `_3`, … plus a warning.
 - A map is written only when one of its sources has data in the texture set (channel present,
   map baked, …); alpha from a missing channel is dropped.
-- Formats: PNG 8/16, JPEG 8 (q 95), TGA 8, TIFF 8/16, BMP 8, WebP 8 (lossless), EXR 16f/32f
-  (`Y`, `YA`, `RGB`, `RGBA`, ZIP), HDR 32f. Color maps are sRGB in 8/16-bit and linear in float
-  formats; data maps are linear; height is stored as `h · 0.5 + 0.5`.
+- Formats: PNG 8/16, JPEG 8 (q 95), JNG 8 (JPEG colour, deflate alpha), PGM 8/16 (gray; colour
+  becomes luminance), TGA 8, TIFF 8/16/32f, BMP 8, WebP 8 (lossless), PSD 8/16 (merged image, no
+  layers; alpha is an extra alpha channel, not transparency), EXR 16f/32f (`Y`, `YA`, `RGB`, `RGBA`, ZIP), HDR 32f. 8-bit files can be dithered
+  (`ExportOptions::dither`, an 8×8 ordered pattern). When `ExportOptions::color_space` is unset,
+  color maps default to sRGB in integer files and linear Rec.709 in float files. An explicit
+  override can select another supported space. PGM writes sRGB or linear Rec.709 luminance and
+  falls back to linear Rec.709 when an ACES space is requested. Data maps are linear, and height
+  is stored as `h · 0.5 + 0.5`.
 - Final normal: Sobel normal from the height channel (strength = `height_strength`; with 1, a
   height change of 1 over 1/16 of the texture width tilts 45°; `+Y` up the image), combined with
   the normal channel, then with the baked normal map, by Reoriented Normal Mapping. DirectX
@@ -105,7 +115,7 @@ Built-in presets:
 
 | Preset | Files (`$mesh_$textureSet_…`) |
 |---|---|
-| Document channels + Normal + AO | one per document channel (`$channel`), plus `normal` and `ambientOcclusion` (mixed) |
+| Document channels + Normal + AO (No Alpha) | one per document channel (`$channel`), plus `normal` and `ambientOcclusion` (mixed) |
 | glTF PBR Metal Roughness | `BaseColor` (sRGB, A = opacity), `OcclusionRoughnessMetallic`, `Normal` (OpenGL), `Emissive` (if present) |
 | Unreal Engine (Packed) | `BaseColor`, `OcclusionRoughnessMetallic`, `Normal` (DirectX) |
 | Unity HDRP (Mask Map) | `BaseMap`, `MaskMap` (R metal, G AO, B detail = 0, A smoothness), `Normal` (OpenGL) |
@@ -151,6 +161,10 @@ Project format version 2 stores baked maps in uniform UV tile blocks, independen
 tile-resolution overrides. Older projects load their stored bake pixels as-is, without converting
 the old layout; their appearance may change until rebaked. Painted layers and cage/skew correction
 maps retain their working atlas layout.
+
+Project format version 3 stores baked bent normal maps in tangent space (OpenGL green, like the
+normal map). Version 2 and older files held them in world space: loading drops those maps, keeps
+the bake settings and warns that the Bent Normals map needs a re-bake.
 
 Loading runs `Project::validate`, refuses a newer `format_version` (`FormatError::NewerVersion`),
 checks every tile against its texture set's resolution and component count, rejects repeated or

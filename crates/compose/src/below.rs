@@ -7,13 +7,15 @@
 //! identical to a full evaluation.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::Arc;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Weak};
 
 use texturecraft_core::project::MAX_DEPTH;
-use texturecraft_core::{BakedMap, Channel, EffectKind, Layer, LayerId, LayerKind, Project, Source, TextureSet};
+use texturecraft_core::{BakedMap, Channel, EffectKind, Filter, Layer, LayerId, LayerKind, Project, Source, TextureSet};
+use texturecraft_geom::Mesh;
 use texturecraft_texel::TileImage;
 
-use crate::eval::{Inputs, PaintTarget};
+use crate::eval::{Inputs, PaintTarget, lights_material};
 use crate::held_fields::HeldFields;
 use crate::image_identity::ImageIdentity;
 use crate::store::{BakedMaps, ImageStore, PixelStore};
@@ -25,6 +27,8 @@ pub const BELOW_BUDGET: usize = 256 << 20;
 /// See the module docs. One per texture set.
 #[derive(Debug)]
 pub struct BelowCache {
+    mesh: Weak<Mesh>,
+    borrowed_mesh_key: Option<u64>,
     hot: Option<LayerId>,
     key: Option<StackKey>,
     /// Tiles with the stamp of their last use.
@@ -52,6 +56,8 @@ pub struct BelowCache {
 impl Default for BelowCache {
     fn default() -> Self {
         BelowCache {
+            mesh: Weak::new(),
+            borrowed_mesh_key: None,
             hot: None,
             key: None,
             tiles: HashMap::new(),
@@ -98,6 +104,8 @@ pub struct StackKey {
     pixels: Vec<(LayerId, Option<Channel>, Shared)>,
     baked: (u32, Vec<(BakedMap, usize)>),
     images: Vec<(String, ImageIdentity)>,
+    /// The viewport environment, its rotation (bits) and its image when it is an imported one, where Baked Lighting Environment lights with them
+    environment: Option<(String, u32, Option<ImageIdentity>)>,
 }
 
 impl StackKey {
@@ -142,22 +150,23 @@ impl StackKey {
 
         let mut referenced_images = BTreeSet::new();
         if !images.is_empty() {
-            let mut record_image_reference = |source: &Source| {
-                if let Source::Image { name, .. } = source
-                    && let Some((name, _)) = images.get_key_value(name)
-                {
+            let mut record_image_name = |name: &str| {
+                if let Some((name, _)) = images.get_key_value(name) {
                     referenced_images.insert(name);
                 }
             };
             for layer in render_tree.iter().filter_map(|id| project.layers.get(id)) {
                 if let LayerKind::Fill(fill) = &layer.kind {
-                    fill.sources.values().for_each(&mut record_image_reference);
+                    fill.sources.values().flat_map(Source::images).for_each(&mut record_image_name);
                 }
                 for effect in layer.mask.iter().flat_map(|mask| &mask.effects).chain(&layer.content_effects) {
+                    // A filter's image inputs, also one its mode leaves unread: that only empties the cache more often
+                    effect.inputs.values().flat_map(Source::images).for_each(&mut record_image_name);
                     match &effect.kind {
-                        EffectKind::Fill { source, .. } => record_image_reference(source),
-                        EffectKind::Material(fill) => fill.sources.values().for_each(&mut record_image_reference),
-                        EffectKind::Generator(generator) => generator.inputs.values().for_each(&mut record_image_reference),
+                        EffectKind::Fill { source, .. } => source.images().into_iter().for_each(&mut record_image_name),
+                        EffectKind::Material(fill) => fill.sources.values().flat_map(Source::images).for_each(&mut record_image_name),
+                        EffectKind::Generator(generator) => generator.inputs.values().flat_map(Source::images).for_each(&mut record_image_name),
+                        EffectKind::ColorSelection(selection) => selection.id_map.iter().for_each(|name| record_image_name(name)),
                         _ => {}
                     }
                 }
@@ -167,6 +176,16 @@ impl StackKey {
         let image_identities =
             referenced_images.into_iter().filter_map(|name| images.get(name).map(|image| (name.clone(), ImageIdentity::new(image)))).collect();
 
+        let lit = render_tree
+            .iter()
+            .filter_map(|id| project.layers.get(id))
+            .flat_map(|layer| layer.content_effects.iter())
+            .any(|effect| matches!(effect.kind, EffectKind::Filter(Filter::EnvironmentLighting { .. })));
+        let environment = lit.then(|| {
+            let image = project.display.environment_resource().and_then(|name| images.get(name)).map(ImageIdentity::new);
+            (project.display.environment.clone(), project.display.env_rotation.to_bits(), image)
+        });
+
         Some(StackKey {
             set,
             roots,
@@ -174,7 +193,63 @@ impl StackKey {
             pixels: pixel_handles,
             baked: (baked.resolution, baked.maps.iter().map(|(map, data)| (*map, Arc::as_ptr(data) as usize)).collect()),
             images: image_identities,
+            environment,
         })
+    }
+}
+
+impl StackKey {
+    /// The tiles whose pixels differ between `self` and `other` when nothing but painted pixels
+    /// changed (same set, roots, layers, baked maps and images; the same images by id, channel
+    /// and size). None when anything else differs: the caller recomposites everything.
+    pub fn changed_tiles(&self, other: &StackKey) -> Option<BTreeSet<(u32, u32)>> {
+        if self.set != other.set
+            || self.roots != other.roots
+            || self.layers != other.layers
+            || self.baked != other.baked
+            || self.images != other.images
+            || self.environment != other.environment
+        {
+            return None;
+        }
+
+        if self.pixels.len() != other.pixels.len() {
+            return None;
+        }
+
+        let size = self.set.size();
+        let mut changed = BTreeSet::new();
+        for ((left_id, left_channel, left_image), (right_id, right_channel, right_image)) in self.pixels.iter().zip(&other.pixels) {
+            let (left_image, right_image) = (&left_image.0, &right_image.0);
+            let same_shape = left_id == right_id
+                && left_channel == right_channel
+                && left_image.width() == right_image.width()
+                && left_image.height() == right_image.height()
+                && left_image.comps() == right_image.comps();
+
+            // Image tiles are composite tiles only when the grids coincide
+            if !same_shape || (left_image.width(), left_image.height()) != size {
+                return None;
+            }
+
+            if left_image.same_tiles(right_image) {
+                continue;
+            }
+
+            for tile_y in 0..left_image.tiles_y() {
+                for tile_x in 0..left_image.tiles_x() {
+                    let equal = match (left_image.tile_handle(tile_x, tile_y), right_image.tile_handle(tile_x, tile_y)) {
+                        (None, None) => true,
+                        (Some(left_tile), Some(right_tile)) => Arc::ptr_eq(left_tile, right_tile),
+                        _ => false,
+                    };
+                    if !equal {
+                        changed.insert((tile_x, tile_y));
+                    }
+                }
+            }
+        }
+        Some(changed)
     }
 }
 
@@ -186,17 +261,18 @@ struct Shared(TileImage);
 
 impl PartialEq for Shared {
     fn eq(&self, other: &Self) -> bool {
-        let (a, b) = (&self.0, &other.0);
-        a.width() == b.width()
-            && a.height() == b.height()
-            && a.comps() == b.comps()
-            && (0..a.tiles_y()).all(|ty| {
-                (0..a.tiles_x()).all(|tx| match (a.tile_handle(tx, ty), b.tile_handle(tx, ty)) {
-                    (None, None) => true,
-                    (Some(x), Some(y)) => Arc::ptr_eq(x, y),
-                    _ => false,
-                })
-            })
+        let (left_image, right_image) = (&self.0, &other.0);
+        left_image.width() == right_image.width()
+            && left_image.height() == right_image.height()
+            && left_image.comps() == right_image.comps()
+            && (left_image.same_tiles(right_image)
+                || (0..left_image.tiles_y()).all(|tile_y| {
+                    (0..left_image.tiles_x()).all(|tile_x| match (left_image.tile_handle(tile_x, tile_y), right_image.tile_handle(tile_x, tile_y)) {
+                        (None, None) => true,
+                        (Some(left_tile), Some(right_tile)) => Arc::ptr_eq(left_tile, right_tile),
+                        _ => false,
+                    })
+                }))
     }
 }
 
@@ -217,6 +293,48 @@ fn render_view(l: &Layer) -> Layer {
 }
 
 impl BelowCache {
+    pub(crate) fn bind_mesh(&mut self, mesh: &Arc<Mesh>) {
+        if !std::ptr::eq(self.mesh.as_ptr(), mesh.as_ref()) {
+            self.clear();
+            self.borrowed_mesh_key = None;
+            self.mesh = Arc::downgrade(mesh);
+        }
+    }
+
+    pub(crate) fn bind_borrowed_mesh(&mut self, mesh: &Mesh) {
+        if std::ptr::eq(self.mesh.as_ptr(), mesh) {
+            return;
+        }
+
+        // A borrow alone cannot distinguish in-place edits or reuse of the same address
+        let mut key = DefaultHasher::new();
+        for attribute in [&mesh.positions, &mesh.normals] {
+            attribute.len().hash(&mut key);
+            for value in attribute {
+                value.to_array().map(f32::to_bits).hash(&mut key);
+            }
+        }
+        mesh.tangents.len().hash(&mut key);
+        for value in &mesh.tangents {
+            value.to_array().map(f32::to_bits).hash(&mut key);
+        }
+        mesh.uvs.len().hash(&mut key);
+        for value in &mesh.uvs {
+            value.to_array().map(f32::to_bits).hash(&mut key);
+        }
+        mesh.indices.hash(&mut key);
+        for part in &mesh.submeshes {
+            (&part.name, part.start, part.count, part.material).hash(&mut key);
+        }
+
+        let key = key.finish();
+        if self.borrowed_mesh_key != Some(key) {
+            self.clear();
+            self.mesh = Weak::new();
+            self.borrowed_mesh_key = Some(key);
+        }
+    }
+
     /// Cache the stack around `hot` from now on (a different layer empties the cache).
     pub fn set_hot(&mut self, hot: Option<LayerId>) {
         if self.hot != hot {
@@ -320,8 +438,17 @@ impl BelowCache {
         let project = inp.project;
         let set = project.texture_set(inp.ts).ok()?;
 
-        // Anchor readers depend on the stack below them
-        if project.render_tree(&set.stack).iter().any(|id| project.layers.get(id).is_some_and(Layer::reads_anchor)) {
+        // Replaying cached colors would reuse the material below a lighting or validation effect
+        if project
+            .render_tree(&set.stack)
+            .iter()
+            .filter_map(|id| project.layers.get(id))
+            .any(|layer| layer.reads_stack() || layer.content_effects.iter().any(|effect| effect.visible && lights_material(&effect.kind)))
+        {
+            if self.key.is_some() {
+                self.clear();
+            }
+
             return None;
         }
 
@@ -415,5 +542,49 @@ mod tests {
         assert!(c.tile((9, 9)).is_none(), "bigger than the whole budget");
         c.set_hot(Some(LayerId(3)));
         assert!(c.is_empty() && c.bytes() == 0);
+    }
+
+    /// A project with one paint layer in a 128 px set, its pixels and a key builder.
+    fn painted() -> (Project, PixelStore, LayerId) {
+        let mut project = Project::new("t", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, 128));
+        let id = project.alloc_id();
+        let layer = Layer::new(id, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+        project.insert_layer(0, layer, None, false).unwrap();
+        (project, PixelStore::default(), id)
+    }
+
+    fn key(project: &Project, pixels: &PixelStore) -> StackKey {
+        let stack = project.texture_sets[0].stack.clone();
+        StackKey::new(project, pixels, &BakedMaps::default(), &ImageStore::default(), 0, &stack).unwrap()
+    }
+
+    #[test]
+    fn changed_tiles_lists_only_rewritten_tiles() {
+        let (project, mut pixels, id) = painted();
+        pixels.layer_mut(id, Channel::BaseColor, (128, 128)).set(70, 5, &[9, 9, 9, 9]);
+        let before = key(&project, &pixels);
+        pixels.layer_mut(id, Channel::BaseColor, (128, 128)).set(70, 6, &[1, 1, 1, 1]);
+        let after = key(&project, &pixels);
+        assert_eq!(before.changed_tiles(&after), Some(BTreeSet::from([(1, 0)])));
+    }
+
+    #[test]
+    fn changed_tiles_is_none_when_a_layer_changes() {
+        let (mut project, pixels, id) = painted();
+        let before = key(&project, &pixels);
+        project
+            .layer_mut(id)
+            .unwrap()
+            .channels
+            .insert(Channel::BaseColor, texturecraft_core::ChannelBlend { mode: texturecraft_core::BlendMode::Multiply, opacity: 0.5 });
+        assert_eq!(before.changed_tiles(&key(&project, &pixels)), None);
+    }
+
+    #[test]
+    fn changed_tiles_is_empty_for_identical_documents() {
+        let (project, mut pixels, id) = painted();
+        pixels.layer_mut(id, Channel::BaseColor, (128, 128)).set(3, 3, &[5, 5, 5, 5]);
+        assert_eq!(key(&project, &pixels).changed_tiles(&key(&project, &pixels)), Some(BTreeSet::new()));
     }
 }

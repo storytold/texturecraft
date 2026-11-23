@@ -38,6 +38,7 @@ fn version() -> String {
 struct Args {
     file: Option<String>,
     control: Option<u16>,
+    /// With `--control`: start with an empty material ball instead of the sample project
     empty: bool,
     gpu: Option<String>,
     power_pref: Option<eframe::wgpu::PowerPreference>,
@@ -84,30 +85,42 @@ fn parse_args_from<I: IntoIterator<Item = String>>(it: I) -> Result<Option<Args>
 }
 
 fn initial_session(args: &Args) -> Session {
-    if let Some(f) = &args.file {
-        match texturecraft_engine::file_cmds::open_path(f) {
-            Ok(s) => return s,
-            Err(e) => eprintln!("texturecraft: could not open {f}: {e}"),
+    if let Some(path) = &args.file {
+        match texturecraft_engine::file_cmds::open_path(path) {
+            Ok(session) => return session,
+            Err(error) => eprintln!("texturecraft: could not open {path}: {error}"),
         }
     }
-    if !args.empty
-        && let Ok(s) = texturecraft_engine::sample_session(2048, 512)
-    {
-        return s;
+
+    // Control runs retain their sample project; interactive runs start empty
+    if args.control.is_some() {
+        if !args.empty
+            && let Ok(session) = texturecraft_engine::sample_session(2048, 512)
+        {
+            return session;
+        }
+
+        return match Session::new_project("Untitled", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 2048) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("texturecraft: {error}");
+                std::process::exit(1);
+            }
+        };
     }
-    match Session::new_project("Untitled", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 2048) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("texturecraft: {e}");
+
+    match Session::closed() {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("texturecraft: {error}");
             std::process::exit(1);
         }
     }
 }
 
 fn icon() -> Option<egui::IconData> {
-    let img = image::load_from_memory(ICON_PNG).ok()?.into_rgba8();
-    let (w, h) = img.dimensions();
-    Some(egui::IconData { rgba: img.into_raw(), width: w, height: h })
+    let img = craft_image_codecs::decode(ICON_PNG).ok()?;
+    Some(egui::IconData { rgba: img.to_rgba8(), width: img.width(), height: img.height() })
 }
 
 /// Windows shows a window's big icon (`ICON_BIG`) in the taskbar and Alt+Tab; eframe sets only the
@@ -151,12 +164,14 @@ impl eframe::App for Shell {
         self.app.save(storage);
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw: &mut egui::RawInput) {
-        // winit gives the window its caption back when it changes the window's flags (maximize,
-        // restore, …): take it off again before the frame is laid out.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // Restore the frameless style after winit changes the window flags
         if let Some(guard) = self.window_frame.as_mut() {
             guard();
         }
+
+        // The app's own hook: a drag holding the pointer reads its moves from it
+        self.app.raw_input_hook(ctx, raw);
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -176,11 +191,18 @@ fn checks_for_updates_at_start(control: Option<u16>) -> bool {
 }
 
 fn main() {
-    // Windows: the update helper is a copy of this program started with `--finish-update`.
+    // Windows: the update helper is a copy of this program started with `--finish-update`
     #[cfg(windows)]
     if let Some(result) = craft_update::self_update::finish(&texturecraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
         std::process::exit(i32::from(result.is_err()));
     }
+
+    // Windows: the eyedropper's pointer keeper (screen_pick) is a copy of this program started with its own argument
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == texturecraft_ui_egui::screen_pick::KEEPER_ARG) {
+        std::process::exit(texturecraft_ui_egui::screen_pick::keep_pointer());
+    }
+
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => return,
@@ -189,15 +211,17 @@ fn main() {
             std::process::exit(2);
         }
     };
+
     // Errors before the window opens speak the system's language; the app then applies the saved one
     texturecraft_ui_egui::i18n::set_language(texturecraft_ui_egui::i18n::os_language());
-    let prev = std::panic::take_hook();
+    let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // A message box needs the main thread on macOS; other threads' panics are only logged
         fatal(&format!("internal error: {info}"), std::thread::current().name() == Some("main"));
-        prev(info);
+        previous_hook(info);
     }));
-    // Scripted runs (agents, films, tests) set TEXTURECRAFT_NO_PREFS to keep the user's saved settings untouched: state goes to throwaway files
+
+    // Scripted runs use temporary files so they cannot overwrite saved settings
     let persistence_path =
         std::env::var_os("TEXTURECRAFT_NO_PREFS").map(|_| std::env::temp_dir().join(format!("texturecraft-noprefs-{}.ron", std::process::id())));
     let ui_file =
@@ -206,6 +230,9 @@ fn main() {
         let _ = ui_state_store::FILE.set(file.clone());
     }
     let prefs = saved_prefs(ui_file.as_deref(), persistence_path.as_deref());
+
+    // The worker pool's size can only be set before its first job
+    prefs.apply_work_threads();
     prefs.apply_resource_limits();
     let session = initial_session(&args);
     let title_bar = TitleBar::decide(prefs.system_title_bar);
@@ -220,9 +247,7 @@ fn main() {
         std::process::exit(2);
     }
     let control = args.control;
-    // The start window offers new, open and recent projects, unless a file was given or a script drives the app
-    let start = args.file.is_none() && control.is_none();
-    let r = eframe::run_native(
+    let result = eframe::run_native(
         APP_NAME,
         options,
         Box::new(move |cc| {
@@ -230,7 +255,8 @@ fn main() {
             if let Some(w) = cc.winit_window() {
                 set_taskbar_icon(w);
             }
-            // winit's Quit ends the process without asking; this menu's asks like the close button.
+
+            // winit's Quit ends the process without asking; this menu's asks like the close button
             #[cfg(target_os = "macos")]
             if let Err(e) = craft_menu::mac::install_app_menu(&cc.egui_ctx, APP_NAME) {
                 log::warn!("the app menu could not be installed: {e}");
@@ -238,7 +264,6 @@ fn main() {
             let window_frame = window_frame::service(cc, matches!(title_bar, TitleBar::App(_)));
             let mut app = TextureCraftApp::new(cc, session);
             app.title_bar = title_bar;
-            app.ui.windows.start = start && app.ui.prefs.start_window;
             app.set_startup_update_check(checks_for_updates_at_start(control));
             if let Some(port) = control {
                 app.control = Some(control_server::start(port, cc.egui_ctx.clone()));
@@ -251,7 +276,7 @@ fn main() {
             }))
         }),
     );
-    if let Err(e) = r {
+    if let Err(e) = result {
         fatal(&e.to_string(), true);
         std::process::exit(1);
     }
@@ -312,6 +337,13 @@ mod tests {
     }
 
     #[test]
+    fn bundled_app_icon_decodes_to_rgba() {
+        let icon = icon().unwrap();
+        assert!(icon.width > 0 && icon.height > 0);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+    }
+
+    #[test]
     fn rejects_missing_or_invalid_gpu_args() {
         assert!(parse_args_from(["--gpu".to_string()]).is_err());
         assert!(parse_args_from(["--power-pref".to_string()]).is_err());
@@ -364,5 +396,56 @@ mod tests {
         std::fs::remove_file(&json_path).unwrap();
         std::fs::remove_file(&ron_path).unwrap();
         assert_eq!(saved_prefs(Some(&json_path), Some(&ron_path)), texturecraft_ui_egui::state::Prefs::default());
+    }
+
+    /// How far the test's drag moves the mouse in one frame, in points
+    const DRAG_STEP: egui::Vec2 = egui::vec2(80.0, 0.0);
+
+    /// Points within which a put-back lands on the press point (the system rounds it to whole pixels)
+    const PUT_BACK_REACH: f32 = 1.0;
+
+    /// One frame of the window: the system's events go through the window's raw input hook, as eframe sends them; returns what the app asked of the window
+    fn window_frame(harness: &mut egui_kittest::Harness<'static, Shell>, events: Vec<egui::Event>) -> Vec<egui::ViewportCommand> {
+        let ctx = harness.ctx.clone();
+        let mut raw = harness.input_mut().clone();
+        raw.events.extend(events);
+        eframe::App::raw_input_hook(harness.state_mut(), &ctx, &mut raw);
+        *harness.input_mut() = raw;
+        harness.step();
+        harness.output().viewport_output.get(&egui::ViewportId::ROOT).map(|viewport| viewport.commands.clone()).unwrap_or_default()
+    }
+
+    /// Holding the fill's preview square in the window holds the system's pointer: put back to the press point every frame, or locked where the system locks it
+    #[test]
+    fn the_window_holds_the_pointer_while_the_preview_square_is_held() {
+        let session = Session::new_project("Hold", texturecraft_engine::geom::primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 128).unwrap();
+        let builder = egui_kittest::Harness::builder().with_size(egui::vec2(DEFAULT_SIZE[0], DEFAULT_SIZE[1]));
+        let mut harness = builder.build_eframe(|cc| Shell {
+            app: TextureCraftApp::new(cc, session),
+            window_frame: None,
+            #[cfg(target_os = "macos")]
+            movable: None,
+        });
+        harness.run_steps(4);
+        let layer = harness.state_mut().app.run("layer.add.fill", serde_json::json!({})).unwrap()["layer"].clone();
+        harness.state_mut().app.run("layer.fill.projection", serde_json::json!({"layer": layer, "projection": "triplanar"})).unwrap();
+        harness.run_steps(2);
+
+        let pad = egui_kittest::kittest::Queryable::get_by_label(&harness, "Move on model").rect().center();
+        let press = egui::Event::PointerButton { pos: pad, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE };
+        let pressed = window_frame(&mut harness, vec![egui::Event::PointerMoved(pad), press]);
+        let locked = pressed.contains(&egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
+
+        // A locked pointer stays still and the system reports only its raw motion
+        let mut moves = vec![egui::Event::MouseMoved(DRAG_STEP)];
+        if !locked {
+            moves.push(egui::Event::PointerMoved(pad + DRAG_STEP));
+        }
+        let moved = window_frame(&mut harness, moves);
+        let put_back = moved.iter().any(|command| matches!(command, egui::ViewportCommand::CursorPosition(to) if to.distance(pad) <= PUT_BACK_REACH));
+
+        assert!(locked || put_back, "the window puts the pointer back where the press began, so it never leaves: {moved:?}");
+        let seen = harness.ctx.input(|input| input.pointer.latest_pos());
+        assert!(seen.is_some_and(|seen| seen.distance(pad + DRAG_STEP) <= PUT_BACK_REACH), "the app reads the whole move: {seen:?}");
     }
 }

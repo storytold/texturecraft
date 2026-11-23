@@ -7,6 +7,10 @@ use crate::{Session, StackTarget, Tool};
 impl Session {
     /// Whether `tool` can act on the selection (or on the quick mask while it is being edited)
     pub fn tool_usable(&self, tool: Tool) -> bool {
+        if !self.project_open {
+            return false;
+        }
+
         match tool {
             // The picker reads the composite under the cursor, whatever is selected
             Tool::ColorPicker => return true,
@@ -22,11 +26,9 @@ impl Session {
         let project = &self.doc.project;
         let Some(layer) = self.selected_layer().and_then(|id| project.layers.get(&id)) else { return false };
 
-        // Smudge and Clone read layer content, so they can't yet paint mask values
-        let reads_content = matches!(tool, Tool::Smudge | Tool::Clone);
         match self.target {
             StackTarget::Content => matches!(layer.kind, LayerKind::Paint),
-            StackTarget::Mask => !reads_content,
+            StackTarget::Mask => true,
             StackTarget::Effect(effect) => {
                 let Some((owner, found)) = project.effect(effect) else { return false };
                 let Some(owner_layer) = project.layers.get(&owner) else { return false };
@@ -37,7 +39,7 @@ impl Session {
                     // Paths saved in a fill layer before paths there were removed stay editable
                     EffectKind::Path(_) => tool == Tool::Path,
                     EffectKind::Paint if tool == Tool::Path => !in_fill_content,
-                    EffectKind::Paint => in_content || !reads_content,
+                    EffectKind::Paint => true,
                     _ => false,
                 }
             }

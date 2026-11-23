@@ -168,6 +168,9 @@ impl Session {
     pub fn bake_preview_end(&mut self) {
         if let Some(preview) = self.bake_preview.take() {
             self.view = preview.restore;
+
+            // The image behind a deferred "Other..." view may have been removed during the bake
+            self.drop_missing_image_view();
             self.revision = self.revision.wrapping_add(1);
         }
     }

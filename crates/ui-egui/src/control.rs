@@ -7,7 +7,9 @@
 //! - `session.inspect`: project, texture sets, layer stack, tool, camera, display, history.
 //! - `ui.inspect`: the UI state (panels, windows, mode, layout, viewport rect, who draws the title bar).
 //! - `ui.menu.list`: the menu catalog with ids, shortcuts and whether each is live.
-//! - `ui.menu.invoke {id}`: behave like a menu click (may open a window).
+//! - `ui.menu.invoke {id}`: behave like a menu click (may open a window; `ui.resetUi` asks first).
+//!   `{id: "ui.layout.apply", name}` switches to the saved panel layout `name` (an error when there is none).
+//! - `ui.reset`: reset the panels and every view setting at once, without the question the menu asks.
 //! - `ui.set {...}`: merge fields into the UI state (e.g. `{"layout":"Only3D"}`).
 //! - `viewport.screenshot {view?: "3d"|"2d"}`: PNG of a viewport, base64.
 //! - `ui.screenshot`: PNG of the whole window (replies after the next frame).
@@ -18,6 +20,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::TextureCraftApp;
+use crate::state::Prefs;
 
 pub struct ControlRequest {
     pub method: String,
@@ -45,7 +48,7 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let reqs: Vec<ControlRequest> = rx.try_iter().collect();
     for r in reqs {
         if r.method == "ui.screenshot" {
-            // Replies when the next frame has been captured.
+            // Reply after the next frame is captured
             let reply = r.reply;
             let repaint = ctx.clone();
             let callback = egui::ScreenshotCallback::new(move |img| {
@@ -59,6 +62,7 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
             ctx.request_repaint();
             continue;
         }
+
         let reply = handle(app, ctx, &r.method, &r.params);
         let _ = r.reply.send(reply);
         ctx.request_repaint();
@@ -66,18 +70,61 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
 }
 
 pub(crate) fn encode_png(w: u32, h: u32, rgba: Vec<u8>) -> Option<(u32, u32, Vec<u8>)> {
-    let img = image::RgbaImage::from_raw(w, h, rgba)?;
-    let mut png = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    let img = craft_image_codecs::Image::from_u8(w, h, craft_image_codecs::ChannelLayout::Rgba, rgba).ok()?;
+    let png = craft_image_codecs::encode(&img, craft_image_codecs::Format::Png, &Default::default()).ok()?;
     Some((w, h, png))
 }
 
-pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &Value) -> Value {
+fn refresh_draft_preferences(draft: &mut Prefs, previous: &Prefs, current: &Prefs) {
+    // Exhaustive destructuring requires reconciliation for every new preference
+    macro_rules! refresh_fields {
+        ($($field:ident),+ $(,)?) => {
+            let Prefs { $($field),+ } = current;
+
+            $(
+                if &previous.$field != $field {
+                    draft.$field.clone_from($field);
+                }
+            )+
+        };
+    }
+
+    refresh_fields!(
+        ui_scale,
+        autosave_minutes,
+        language,
+        viewport_texture,
+        brightness,
+        accent,
+        system_title_bar,
+        data_folder,
+        reserved_cores,
+        project_open_limit_gib,
+        save_ram_percent,
+        work_threads,
+        rotation_speed,
+        zoom_speed,
+        zoom_inverse,
+        wheel_speed,
+        wheel_inverse,
+        gpu_raytracing,
+        libraries,
+        background,
+    );
+}
+
+pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, params: &Value) -> Value {
     app.ui.prefs.apply_resource_limits();
+
+    // These direct control jobs bypass the engine command availability check
+    if !app.session.project_open && matches!(method, "ui.bake.start" | "debug.paintTest") {
+        return err("no project is open");
+    }
+
     match method {
         "ping" => ok(json!("pong")),
         "ui.resize" => {
-            let size = |k: &str| p.get(k).and_then(Value::as_f64).filter(|v| v.is_finite()).map(|v| v.clamp(640.0, 7680.0) as f32);
+            let size = |key: &str| params.get(key).and_then(Value::as_f64).filter(|value| value.is_finite()).map(|value| value.clamp(640.0, 7680.0) as f32);
             match (size("width"), size("height")) {
                 (Some(w), Some(h)) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
@@ -88,38 +135,60 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
             }
         }
         "debug.frames" => ok(app.profiler.report()),
-        "debug.paintTest" => match crate::profile::start_paint_test(app, p) {
+        "debug.paintTest" => match crate::profile::start_paint_test(app, params) {
             Ok(()) => ok(Value::Null),
-            Err(e) => err(e),
+            Err(error) => err(error),
         },
         "command.run" => {
-            let Some(id) = p.get("id").and_then(Value::as_str) else { return err("`id` is required") };
-            let params = p.get("params").cloned().unwrap_or(Value::Null);
-            match texturecraft_engine::execute(&mut app.session, id, &params) {
-                Ok(v) => ok(v),
-                Err(e) => err(e),
+            let Some(id) = params.get("id").and_then(Value::as_str) else { return err("`id` is required") };
+            let command_params = params.get("params").cloned().unwrap_or(Value::Null);
+            let before = app.session.camera;
+            match texturecraft_engine::execute(&mut app.session, id, &command_params) {
+                Ok(value) => {
+                    if matches!(id, "brush.preset.store" | "brush.preset.rename" | "brush.preset.delete") {
+                        app.thumbs.forget_saved_files();
+                    }
+
+                    // Work from the old project must not reach its replacement
+                    if matches!(id, "file.open" | "file.new" | "file.close" | "project.new" | "project.sample") {
+                        app.resize = None;
+                        app.pbr_import = None;
+                        app.layer_panel = Default::default();
+                    }
+
+                    // The Export dialog cannot operate after Close
+                    if id == "file.close" {
+                        app.ui.windows.export = false;
+                    }
+
+                    // A command that moved the camera takes over from a glide in progress; a projection switch joins it
+                    app.settle_camera_glide(id, before);
+
+                    ok(value)
+                }
+                Err(error) => err(error),
             }
         }
-        "command.list" => ok(texturecraft_engine::commands::list(&app.session, p.get("filter").and_then(Value::as_str))),
+        "command.list" => ok(texturecraft_engine::commands::list(&app.session, params.get("filter").and_then(Value::as_str))),
         "session.inspect" => ok(texturecraft_engine::inspect::session(&app.session)),
         "ui.inspect" => {
-            let r = app.viewport_rect;
+            let viewport = app.viewport_rect;
             ok(json!({
                 "state": app.ui,
-                "viewport": [r.min.x, r.min.y, r.width(), r.height()],
+                "viewport": [viewport.min.x, viewport.min.y, viewport.width(), viewport.height()],
                 "fps": app.fps,
                 "uiMs": app.ui_ms,
                 "titleBar": app.title_bar.name(),
                 "baking": app.bake_progress(),
                 "bakeStatus": app.bake_status(),
                 "bakePreview": texturecraft_engine::bake_preview::preview_json(&app.session),
-                "toasts": app.toasts.iter().map(|t| json!({"text": t.text, "error": t.error})).collect::<Vec<_>>(),
+                "toasts": app.toasts.iter().map(|toast| json!({"text": toast.text, "error": toast.error})).collect::<Vec<_>>(),
             }))
         }
         "ui.bake.start" => {
             // Bake in the background like the Bake button: the 3D view shows the maps as they finish
             let count = app.session.doc.project.texture_sets.len();
-            let sets: Vec<usize> = match p.get("ts") {
+            let sets: Vec<usize> = match params.get("ts") {
                 Some(value) => match serde_json::from_value::<Vec<usize>>(if value.is_array() { value.clone() } else { json!([value]) }) {
                     Ok(list) if list.iter().all(|&index| index < count) => list,
                     _ => return err(format!("`ts` must be texture set indices below {count}")),
@@ -154,39 +223,76 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
         "ui.menu.list" => ok(json!(
             crate::menus::CATALOG
                 .iter()
-                .filter(|i| i.label != "-")
-                .map(|i| json!({
-                    "menu": i.menu, "submenu": i.sub, "label": i.label, "id": i.id, "shortcut": crate::keymap::shortcut_of(&app.ui.keymap, i.id),
-                    "implemented": crate::menus::implemented(i.id), "enabled": crate::menus::enabled(app, i.id),
+                .filter(|item| item.label != "-")
+                .map(|item| json!({
+                    "menu": item.menu, "submenu": item.sub, "label": item.label, "id": item.id, "shortcut": crate::keymap::shortcut_of(&app.ui.keymap, item.id),
+                    "implemented": crate::menus::implemented(item.id), "enabled": crate::menus::enabled(app, item.id),
                 }))
                 .collect::<Vec<_>>()
         )),
         "ui.menu.invoke" => {
-            let Some(id) = p.get("id").and_then(Value::as_str) else { return err("`id` is required") };
+            let Some(id) = params.get("id").and_then(Value::as_str) else { return err("`id` is required") };
+            if id == "ui.layout.apply" {
+                let Some(name) = params.get("name").and_then(Value::as_str) else { return err("`name` is required") };
+                return if app.ui.apply_named_layout(name) { ok(Value::Null) } else { err(format!("no saved layout named `{name}`")) };
+            }
+
             if !crate::menus::implemented(id) {
                 return err(format!("menu item `{id}` is not implemented"));
             }
+
             crate::menus::invoke(app, ctx, id);
             ok(Value::Null)
         }
+
+        // What Window > Reset UI does once the question is answered with Reset
+        "ui.reset" => {
+            app.ui.adopt_layout(crate::UiState::default());
+            ok(Value::Null)
+        }
         "ui.set" => {
-            let mut cur = serde_json::to_value(&app.ui).unwrap_or(Value::Null);
-            if let (Some(obj), Some(patch)) = (cur.as_object_mut(), p.as_object()) {
-                for (k, v) in patch {
-                    obj.insert(k.clone(), v.clone());
+            let mut current_state = serde_json::to_value(&app.ui).unwrap_or(Value::Null);
+            if let (Some(object), Some(patch)) = (current_state.as_object_mut(), params.as_object()) {
+                for (key, value) in patch {
+                    object.insert(key.clone(), value.clone());
                 }
             }
-            match serde_json::from_value(cur) {
-                Ok(ui) => {
+
+            match serde_json::from_value::<crate::UiState>(current_state) {
+                Ok(mut ui) => {
+                    let previous_autosave_minutes = app.ui.prefs.autosave_minutes;
+                    if ui.prefs.libraries != app.ui.prefs.libraries {
+                        app.library = None;
+                    }
+
+                    // Pending dialogs and editor text do not appear in the serialized state
+                    if params.get("windows").is_none() {
+                        ui.windows = std::mem::take(&mut app.ui.windows);
+                    } else {
+                        ui.windows.mesh_export_options = app.ui.windows.mesh_export_options;
+                        if ui.windows.settings {
+                            ui.windows.settings_draft = app.ui.windows.settings_draft.take();
+                        }
+                    }
+                    ui.bake_preset_name = std::mem::take(&mut app.ui.bake_preset_name);
+
+                    // Live changes take precedence only for the fields they affect
+                    if params.get("prefs").is_some()
+                        && let Some(draft) = &mut ui.windows.settings_draft
+                    {
+                        refresh_draft_preferences(&mut draft.prefs, &app.ui.prefs, &ui.prefs);
+                    }
+
                     app.ui = ui;
+                    app.reschedule_autosave_if_changed(previous_autosave_minutes);
                     app.ui.prefs.apply_resource_limits();
                     ok(Value::Null)
                 }
-                Err(e) => err(format!("invalid UI state: {e}")),
+                Err(error) => err(format!("invalid UI state: {error}")),
             }
         }
         "viewport.screenshot" => {
-            let view = if p.get("view").and_then(Value::as_str) == Some("2d") { crate::viewport::VIEW_2D } else { crate::viewport::VIEW_3D };
+            let view = if params.get("view").and_then(Value::as_str) == Some("2d") { crate::viewport::VIEW_2D } else { crate::viewport::VIEW_3D };
             match screenshot(app, view) {
                 Some((w, h, png)) => ok(json!({ "width": w, "height": h, "png": base64::engine::general_purpose::STANDARD.encode(png) })),
                 None => err("no rendered view to capture yet"),
@@ -198,9 +304,49 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
 
 /// Encode a rendered view as PNG.
 pub fn screenshot(app: &TextureCraftApp, view: u64) -> Option<(u32, u32, Vec<u8>)> {
+    if !app.session.project_open {
+        return None;
+    }
+
     let rs = app.render_state.as_ref()?;
     let renderer = rs.renderer.read();
     let gpu = renderer.callback_resources.get::<crate::gpu::GpuState>()?;
     let (w, h, rgba) = gpu.renderer.read_view(&rs.device, &rs.queue, view)?;
     encode_png(w, h, rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_rgba_buffer_to_png() {
+        let (w, h, png) = encode_png(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
+        assert_eq!((w, h), (2, 1));
+        let decoded = craft_image_codecs::decode(&png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+        assert_eq!(decoded.to_rgba8(), vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert!(encode_png(2, 1, vec![0; 3]).is_none());
+    }
+
+    #[test]
+    fn a_live_background_change_reaches_an_open_settings_draft() {
+        let previous = Prefs::default();
+        let mut current = previous.clone();
+        current.background = [[0.5, 0.0, 0.0], [0.0, 0.0, 0.5]];
+
+        let mut draft = previous.clone();
+        draft.language = "de".into();
+        refresh_draft_preferences(&mut draft, &previous, &current);
+        assert_eq!(draft.background, current.background, "the control change shows in the open window");
+        assert_eq!(draft.language, "de", "the window's own edit stays");
+
+        // A background edited in the window and not by the control stays as edited
+        let mut edited = previous.clone();
+        edited.background[0] = [0.1, 0.2, 0.3];
+        let mut language_only = previous.clone();
+        language_only.language = "fr".into();
+        refresh_draft_preferences(&mut edited, &previous, &language_only);
+        assert_eq!(edited.background[0], [0.1, 0.2, 0.3]);
+    }
 }

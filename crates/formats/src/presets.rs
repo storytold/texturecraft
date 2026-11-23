@@ -19,7 +19,7 @@ pub(crate) fn virt(map: VirtualMap, component: u8) -> SourceRef {
 
 /// `$mesh_$textureSet_<suffix>` PNG.
 fn map(suffix: &str, bit_depth: u8, channels: Vec<(Dest, SourceRef)>) -> MapSpec {
-    MapSpec { file: format!("$mesh_$textureSet_{suffix}"), format: FileFormat::Png, bit_depth, channels }
+    MapSpec { file: format!("$mesh_$textureSet_{suffix}"), format: FileFormat::Png, bit_depth, channels, inverted: Vec::new() }
 }
 
 pub(crate) fn rgb(f: impl Fn(u8) -> SourceRef) -> Vec<(Dest, SourceRef)> {
@@ -68,7 +68,7 @@ pub(crate) const GLTF_SHEEN: &str = "Sheen";
 /// glTF metallic-roughness maps (8-bit PNG), plus the clear coat and sheen extension maps where
 /// the texture set has those channels; `file` turns a stem above into a file template.
 pub(crate) fn gltf_pbr_maps(file: impl Fn(&str) -> String) -> Vec<MapSpec> {
-    let spec = |stem: &str, channels| MapSpec { file: file(stem), format: FileFormat::Png, bit_depth: 8, channels };
+    let spec = |stem: &str, channels| MapSpec { file: file(stem), format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new() };
     let mut sheen = rgb(|k| virt(VirtualMap::SheenTint, k));
     sheen.push((Dest::A, ch(Channel::SheenRoughness, 0)));
     vec![
@@ -85,7 +85,7 @@ pub(crate) fn gltf_pbr_maps(file: impl Fn(&str) -> String) -> Vec<MapSpec> {
 pub fn builtin_presets() -> Vec<ExportPreset> {
     let preset = |name: &str, maps: Vec<MapSpec>| ExportPreset { name: name.into(), maps };
     vec![
-        preset("Document channels + Normal + AO", {
+        preset(DEFAULT_PRESET, {
             let mut maps: Vec<MapSpec> =
                 Channel::ALL.into_iter().filter(|c| !matches!(c, Channel::Normal | Channel::AmbientOcclusion)).map(channel_map).collect();
             maps.push(map("normal", 8, rgb(|k| ch(Channel::Normal, k))));
@@ -107,7 +107,7 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                     vec![
                         (Dest::R, ch(Channel::Metallic, 0)),
                         (Dest::G, virt(VirtualMap::AoMixed, 0)),
-                        // Detail mask: none.
+                        // The preset has no detail mask
                         (Dest::B, SourceRef::Constant(0.0)),
                         (Dest::A, virt(VirtualMap::Glossiness, 0)),
                     ],
@@ -154,7 +154,7 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 map("emission", 8, rgb(|k| ch(Channel::Emissive, k))),
             ],
         ),
-        // OpenPBR Surface inputs, one map each (maps of channels a set lacks are skipped).
+        // One map per OpenPBR input present in the texture set
         preset("OpenPBR (separate maps)", {
             let gray8 = |name: &str, c: Channel| map(name, 8, gray(ch(c, 0)));
             let rgb8 = |name: &str, c: Channel| map(name, 8, rgb(|k| ch(c, k)));
@@ -190,9 +190,18 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
     ]
 }
 
+/// The default export template.
+pub const DEFAULT_PRESET: &str = "Document channels + Normal + AO (No Alpha)";
+
+/// The default template's name before it took the reference's "(No Alpha)" (saved settings and
+/// scripts still use it).
+const OLD_DEFAULT_PRESET: &str = "Document channels + Normal + AO";
+
 /// A built-in preset by name (case-insensitive).
 pub fn builtin_preset(name: &str) -> Option<ExportPreset> {
-    builtin_presets().into_iter().find(|p| p.name.eq_ignore_ascii_case(name.trim()))
+    let name = name.trim();
+    let name = if name.eq_ignore_ascii_case(OLD_DEFAULT_PRESET) { DEFAULT_PRESET } else { name };
+    builtin_presets().into_iter().find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
 /// Parse and validate a user preset.

@@ -54,6 +54,27 @@ pub static LANGUAGES: [Language; COUNT] = [
 
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 
+/// How a fill reads its images, as the Filtering combo names it
+pub(crate) fn filtering_label(filtering: texturecraft_engine::core::Filtering) -> &'static str {
+    use texturecraft_engine::core::Filtering;
+    match filtering {
+        Filtering::BilinearHq => n_("Bilinear | HQ"),
+        Filtering::BilinearSharp => n_("Bilinear | Sharp"),
+        Filtering::Nearest => n_("Nearest"),
+    }
+}
+
+/// Whether a fill repeats past its tile, as the UV Wrap combo names it
+pub(crate) fn wrap_label(wrap: texturecraft_engine::core::UvWrap) -> &'static str {
+    use texturecraft_engine::core::UvWrap;
+    match wrap {
+        UvWrap::None => n_("None"),
+        UvWrap::RepeatHorizontally => n_("Repeat horizontally"),
+        UvWrap::RepeatVertically => n_("Repeat vertically"),
+        UvWrap::Repeat => n_("Repeat"),
+    }
+}
+
 /// Display labels belong to the UI; the model exposes only map identities
 pub(crate) fn baked_map_label(map: texturecraft_engine::core::BakedMap) -> &'static str {
     use texturecraft_engine::core::BakedMap;
@@ -72,8 +93,12 @@ pub(crate) fn baked_map_label(map: texturecraft_engine::core::BakedMap) -> &'sta
     }
 }
 
-/// Switch the UI language (unknown codes fall back to English).
+/// The saved language that follows the operating system's (Settings > Language > Default (System Language)).
+pub const SYSTEM_LANGUAGE: &str = "";
+
+/// Switch the UI language ([`SYSTEM_LANGUAGE`] follows the system; unknown codes fall back to English).
 pub fn set_language(code: &str) {
+    let code = if code == SYSTEM_LANGUAGE { system_language() } else { code };
     CURRENT.store(LANGUAGES.iter().position(|l| l.code.eq_ignore_ascii_case(code) && available(l.code)).unwrap_or(0), Ordering::Relaxed);
 }
 
@@ -101,6 +126,36 @@ pub fn trf(template: &str, args: &[(&str, &dyn Display)]) -> String {
     craft_i18n::fmt(tr(template), &args)
 }
 
+/// An undo step's label in the current language. A label with a layer name, path number or
+/// smart mask name in it ("Paint on Rust") is matched to its engine template, which is translated
+/// and filled in again; any other label is translated as it is.
+pub fn tr_history(label: &str) -> String {
+    tr_history_with(label, |text| tr(text).to_string())
+}
+
+/// [`tr_history`] with its own lookup `translate`
+fn tr_history_with(label: &str, translate: impl Fn(&str) -> String) -> String {
+    match history_template(label) {
+        Some((template, name, value)) => craft_i18n::fmt(&translate(template), &[(name, value)]),
+        None => translate(label),
+    }
+}
+
+/// The engine template a history label was made from, its placeholder name and the value in it.
+/// The template with the longest fixed start wins.
+fn history_template(label: &str) -> Option<(&'static str, &'static str, &str)> {
+    texturecraft_engine::HISTORY_TEMPLATES
+        .iter()
+        .filter_map(|template| {
+            let (open, close) = (template.find('{')?, template.find('}')?);
+            let (prefix, suffix) = (&template[..open], &template[close + 1..]);
+            let value = label.strip_prefix(prefix)?.strip_suffix(suffix)?;
+            Some((prefix.len(), *template, &template[open + 1..close], value))
+        })
+        .max_by_key(|(prefix_length, ..)| *prefix_length)
+        .map(|(_, template, name, value)| (template, name, value))
+}
+
 /// The supported language for a locale such as "de-AT", "pt_BR.UTF-8" or "zh-Hant-TW" ("en" when
 /// none matches). Chinese locales get Simplified Chinese; Portuguese ones get Brazilian Portuguese.
 pub fn language_for_locale(locale: &str) -> &'static str {
@@ -119,6 +174,12 @@ pub fn os_language() -> &'static str {
     #[cfg(target_arch = "wasm32")]
     let locale = web_sys::window().and_then(|w| w.navigator().language());
     locale.map_or("en", |l| language_for_locale(&l))
+}
+
+/// [`os_language`] read once: the language is applied every frame.
+fn system_language() -> &'static str {
+    static SYSTEM: OnceLock<&'static str> = OnceLock::new();
+    SYSTEM.get_or_init(os_language)
 }
 
 /// Tests that switch the global UI language, or draw the UI under it, run one at a time.
@@ -156,7 +217,9 @@ mod tests {
     /// The labels of the menu catalog, panels, shortcuts, shelf tabs and engine enums that are
     /// translated where they are shown.
     fn catalog_keys() -> Vec<&'static str> {
-        use texturecraft_engine::core::{BlendMode, Channel, EffectKind, GeneratorKind, ProceduralKind};
+        use texturecraft_engine::core::{
+            BlendMode, Channel, EffectKind, GeneratorKind, ProceduralKind, TileBlending, TileInputDistribution, TileShape, TileSizeMode, TileSymmetry,
+        };
         use texturecraft_engine::filter_lib::{FILTERS, build, scalar_params};
         let mut keys: Vec<&'static str> = Vec::new();
         keys.extend(crate::menus::TOP);
@@ -174,12 +237,22 @@ mod tests {
         keys.extend(BlendMode::all().map(|mode| mode.label()));
         keys.extend(texturecraft_engine::formats::export::VirtualMap::ALL.iter().map(|map| map.label()));
         keys.extend(texturecraft_engine::Tool::ALL.iter().map(|tool| tool.label()));
+        keys.extend(texturecraft_engine::HISTORY_TEMPLATES);
         keys.extend(ProceduralKind::ALL.iter().map(|kind| kind.label()));
         keys.extend(GeneratorKind::ALL.iter().map(|kind| kind.label()));
+        keys.extend(TileShape::ALL.iter().map(|shape| shape.label()));
+        keys.extend(TileSizeMode::ALL.iter().map(|mode| mode.label()));
+        keys.extend(TileInputDistribution::ALL.iter().map(|distribution| distribution.label()));
+        keys.extend(TileSymmetry::ALL.iter().map(|symmetry| symmetry.label()));
+        keys.extend(TileBlending::ALL.iter().map(|blending| blending.label()));
         keys.extend(texturecraft_engine::paint::BrushAlpha::ALL.iter().map(|alpha| alpha.label()));
         keys.extend(texturecraft_engine::geom::primitives::BUILTINS.iter().map(|(_, label)| *label));
         for filter in FILTERS {
             keys.extend([filter.label, filter.group]);
+            if let Some(about) = filter.about() {
+                keys.push(about.description);
+                keys.extend(about.tags);
+            }
             if let Ok(EffectKind::Filter(effect)) = build(filter.id, &serde_json::Value::Null) {
                 keys.push(effect.label());
                 keys.extend(scalar_params(&effect).into_iter().map(|parameter| parameter.1));
@@ -242,6 +315,17 @@ mod tests",
     }
 
     #[test]
+    fn the_system_language_setting_speaks_the_operating_system_language() {
+        let _language = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_language(SYSTEM_LANGUAGE);
+        let shown = current().code;
+        set_language("en");
+
+        let expected = if available(os_language()) { os_language() } else { "en" };
+        assert_eq!(shown, expected);
+    }
+
+    #[test]
     fn embedded_catalogs_are_valid() {
         assert!(I18N.check_all().is_empty(), "{:?}", I18N.check_all());
     }
@@ -283,6 +367,36 @@ mod tests",
             let stale: Vec<_> = rows.keys().filter(|key| !used.contains(key.as_str())).collect();
             eprintln!("{locale}: missing {} {missing:?}; unused/shared {} {stale:?}", missing.len(), stale.len());
         }
+    }
+
+    #[test]
+    fn history_labels_are_matched_to_their_templates() {
+        assert_eq!(history_template("Paint on Rust"), Some(("Paint on {layer}", "layer", "Rust")));
+        assert_eq!(history_template("Paint on Paint mask of x"), Some(("Paint on {layer}", "layer", "Paint mask of x")));
+        assert_eq!(history_template("Paint mask of Paint on x"), Some(("Paint mask of {layer}", "layer", "Paint on x")));
+        assert_eq!(history_template("Erase mask of Rust"), Some(("Erase mask of {layer}", "layer", "Rust")));
+        assert_eq!(history_template("Edit path 2"), Some(("Edit path {n}", "n", "2")));
+        assert_eq!(history_template("Apply smart mask Dirt"), Some(("Apply smart mask {name}", "name", "Dirt")));
+        assert_eq!(history_template("Rename layer"), None);
+    }
+
+    /// The template is translated and the layer name filled in; other labels are translated whole
+    #[test]
+    fn history_labels_with_a_layer_name_are_translated_through_their_template() {
+        let translate = |text: &str| {
+            match text {
+                "Paint on {layer}" => "Auf {layer} malen",
+                "Paint mask of {layer}" => "Maske von {layer} malen",
+                "Remove layer" => "Ebene entfernen",
+                other => other,
+            }
+            .to_string()
+        };
+        assert_eq!(tr_history_with("Paint on Rust", translate), "Auf Rust malen");
+        assert_eq!(tr_history_with("Paint mask of Paint on x", translate), "Maske von Paint on x malen");
+        assert_eq!(tr_history_with("Remove layer", translate), "Ebene entfernen");
+        assert_eq!(tr_history_with("Clone on Rust", translate), "Clone on Rust");
+        assert_eq!(tr_history_with("Paint on {layer}", translate), "Auf {layer} malen");
     }
 
     const UNTRANSLATED: &[&str] = &["RGB", "RGBA"];

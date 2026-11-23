@@ -4,6 +4,7 @@
 use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
 use egui::{Color32, CornerRadius, Response, RichText, Sense, Stroke, Ui, vec2};
 
+use crate::drawn_icon::DrawnIcon;
 use crate::i18n::tr;
 use crate::theme::Tokens;
 
@@ -21,6 +22,36 @@ pub fn slider(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::RangeI
     slider_inner(ui, label, value, range, decimals).0
 }
 
+/// For an editor `id` drawn every frame: `Some(merge)` when it `changed`, merge true for a press's later changes (one undo step per drag; typing never merges)
+pub(crate) fn press_edit(ui: &Ui, id: egui::Id, changed: bool) -> Option<bool> {
+    let (press, release_only) = ui.input(|input| {
+        let pointer = &input.pointer;
+        (pointer.press_start_time().map(f64::to_bits), pointer.any_released() && !pointer.any_pressed())
+    });
+    if press.is_none() && !changed {
+        return None;
+    }
+
+    ui.memory_mut(|memory| {
+        let edits = memory.caches.cache::<egui::cache::FramePublisher<egui::Id, u64>>();
+        let id = id.with("pointer edit");
+        let previous = edits.get(&id).copied();
+        let merge = match press {
+            Some(start) => {
+                let continuing = previous == Some(start);
+                if changed || continuing {
+                    edits.set(id, start);
+                }
+                continuing
+            }
+
+            // A final movement still belongs to the press that ended
+            None => release_only && previous.is_some(),
+        };
+        changed.then_some(merge)
+    })
+}
+
 /// [`slider`] for a value re-read from the document every frame: `Some(merge)` on every frame
 /// that changes `value` (live while dragging, a click on the track, a typed value). `merge` is
 /// true for the later changes of one drag, so the edit that applies them (with the command's
@@ -29,15 +60,28 @@ pub fn slider_edit(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::R
     slider_inner(ui, label, value, range, decimals).1
 }
 
-fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, decimals: usize) -> (Response, Option<bool>) {
+/// Least width of a slider's value field, wide enough for a short number
+const SLIDER_VALUE_MIN_WIDTH: f32 = 44.0;
+
+/// Height of a slider's track row
+const SLIDER_TRACK_HEIGHT: f32 = 14.0;
+
+/// From the track row's sides to the track's ends, so the knob stays inside the row
+const SLIDER_TRACK_INSET: f32 = 5.0;
+
+/// Thickness of a slider's rail and its knob's radius
+const SLIDER_RAIL_WIDTH: f32 = 2.0;
+const SLIDER_KNOB_RADIUS: f32 = 4.5;
+
+/// The row above a slider's track, `label` and `value` as a field to type in: the field's id, and `Some(false)` on the frame a typed value replaces `value`
+pub(crate) fn value_header(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, decimals: usize) -> (egui::Id, Option<bool>) {
     let tokens = Tokens::get(ui.ctx());
     let (minimum, maximum) = (*range.start(), *range.end());
-    let width = ui.available_width();
     let font = egui::TextStyle::Body.resolve(ui.style());
     let value_width = [minimum, maximum]
         .into_iter()
         .map(|bound| ui.painter().layout_no_wrap(format!("{bound:.decimals$}"), font.clone(), tokens.text).size().x)
-        .fold(44.0, f32::max);
+        .fold(SLIDER_VALUE_MIN_WIDTH, f32::max);
     let mut edit = None;
     let field = ui
         .horizontal(|ui| {
@@ -45,6 +89,7 @@ fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::Rang
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let id = ui.next_auto_id();
                 let shown = format!("{value:.decimals$}");
+
                 // Keep unfinished input while the document value is re-read each frame
                 let mut text = ui.data(|data| data.get_temp::<String>(id)).unwrap_or_else(|| shown.clone());
                 let response = ui.add(
@@ -56,9 +101,10 @@ fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::Rang
                         .frame(egui::Frame::NONE),
                 );
                 if response.has_focus() {
-                    ui.data_mut(|data| data.insert_temp(id, text.clone()));
+                    ui.data_mut(|data| data.insert_temp(id, text));
                 } else {
                     ui.data_mut(|data| data.remove_temp::<String>(id));
+
                     // Escape can lose focus before the app consumes the key
                     let escape =
                         ui.input(|input| input.raw.events.iter().any(|event| matches!(event, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })));
@@ -78,7 +124,14 @@ fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::Rang
             .inner
         })
         .inner;
-    let (rect, mut response) = ui.allocate_exact_size(vec2(width, 14.0), Sense::click_and_drag());
+    (field, edit)
+}
+
+fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, decimals: usize) -> (Response, Option<bool>) {
+    let (minimum, maximum) = (*range.start(), *range.end());
+    let width = ui.available_width();
+    let (field, mut edit) = value_header(ui, label, value, range, decimals);
+    let (rect, mut response) = ui.allocate_exact_size(vec2(width, SLIDER_TRACK_HEIGHT), Sense::click_and_drag());
     if response.is_pointer_button_down_on() {
         ui.data_mut(|data| data.remove_temp::<String>(field));
         ui.memory_mut(|memory| memory.surrender_focus(field));
@@ -86,24 +139,26 @@ fn slider_inner(ui: &mut Ui, label: &str, value: &mut f32, range: std::ops::Rang
     if edit.is_some() {
         response.mark_changed();
     }
-    if (response.dragged() || response.clicked())
+
+    let mut moved = false;
+    if (response.dragged() || response.drag_stopped() || response.clicked())
         && let Some(pointer) = response.interact_pointer_pos()
     {
-        let fraction = ((pointer.x - rect.left() - 5.0) / (rect.width() - 10.0).max(1.0)).clamp(0.0, 1.0);
+        let fraction = ((pointer.x - rect.left() - SLIDER_TRACK_INSET) / (rect.width() - 2.0 * SLIDER_TRACK_INSET).max(1.0)).clamp(0.0, 1.0);
         let next = minimum + (maximum - minimum) * fraction;
         if (next - *value).abs() > f32::EPSILON {
             *value = next;
             response.mark_changed();
-            // Later frames of one drag share its undo step
-            edit = Some(ui.data_mut(|data| std::mem::replace(data.get_temp_mut_or_default::<bool>(response.id), true)));
+            moved = true;
         }
     }
-    if response.drag_stopped() || response.clicked() {
-        ui.data_mut(|data| data.remove_temp::<bool>(response.id));
-    }
+
+    // Later frames of one drag share its undo step, and a drag wins over typing in the same frame
+    edit = press_edit(ui, response.id, moved).or(edit);
 
     let fraction = if maximum > minimum { ((*value - minimum) / (maximum - minimum)).clamp(0.0, 1.0) } else { 0.0 };
-    track(ui, &response, rect.left() + 5.0..=rect.right() - 5.0, rect.center().y, fraction, 2.0, 4.5);
+    let track_ends = rect.left() + SLIDER_TRACK_INSET..=rect.right() - SLIDER_TRACK_INSET;
+    track(ui, &response, track_ends, rect.center().y, fraction, SLIDER_RAIL_WIDTH, SLIDER_KNOB_RADIUS);
     (response, edit)
 }
 
@@ -153,6 +208,15 @@ pub fn elided(painter: &egui::Painter, text: impl Into<String>, size: f32, color
 /// A square Phosphor icon button with a tooltip and an accent well when selected
 pub fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, selected: bool, size: f32) -> Response {
     icon_button_without_tooltip(ui, icon, tooltip, selected, size).on_hover_text(tooltip)
+}
+
+/// An `icon_button` showing an icon drawn in code
+pub(crate) fn drawn_icon_button(ui: &mut Ui, icon: DrawnIcon, tooltip: &str, selected: bool, size: f32) -> Response {
+    let style = icon_button_style(&Tokens::get(ui.ctx()));
+    IconButton::new(tooltip, vec2(size, size), &style)
+        .selected(selected)
+        .show(ui, |ui, rect, color| icon.paint(ui.painter(), rect.center(), size * ICON_SCALE, color))
+        .on_hover_text(tooltip)
 }
 
 /// Icon glyph size as a fraction of the button height
@@ -367,6 +431,7 @@ pub fn chip(ui: &mut Ui, text: &str, on: bool) -> Response {
     let galley = ui.painter().layout_no_wrap(text.into(), egui::FontId::proportional(11.0), tk.text);
     let size = vec2(galley.size().x + 14.0, 20.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, text));
     let p = ui.painter();
     let fill = if on {
         tk.tool_active
@@ -412,7 +477,8 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
     let tk = Tokens::get(ui.ctx());
     let mut srgb = [c.r(), c.g(), c.b()];
     let hsv_of = |srgb: [u8; 3]| hsv_from_rgb(srgb.map(|v| v as f32 / 255.0));
-    // Remembered with the color it was for, so hue and saturation survive black, white and grays.
+
+    // Remembered with the color it was for, so hue and saturation survive black, white and grays
     let (mut h, mut s, mut v) = ui.data(|d| d.get_temp::<(Color32, (f32, f32, f32))>(id)).filter(|(k, _)| k == c).map_or_else(|| hsv_of(srgb), |(_, hsv)| hsv);
     let mut typed = false;
     let mut dragged = false;
@@ -428,7 +494,8 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
         (h, s, v) = hsv_of(srgb);
     }
     let border = Stroke::new(1.0, tk.field_border);
-    // Saturation across, value up.
+
+    // Saturation across, value up
     let (rect, resp) = ui.allocate_exact_size(vec2(width, width), Sense::click_and_drag());
     if let Some(p) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
         (s, v) = (((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0), 1.0 - ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0));
@@ -458,25 +525,49 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
     changed
 }
 
-/// Fill `rect` with `rgb(x, y)` (sRGB 0..1 over 0..1 across and down), as a shaded mesh.
-fn gradient(painter: &egui::Painter, rect: egui::Rect, rgb: impl Fn(f32, f32) -> [f32; 3]) {
-    const N: u32 = 24;
-    let mut mesh = egui::Mesh::default();
-    for j in 0..=N {
-        for i in 0..=N {
-            let (x, y) = (i as f32 / N as f32, j as f32 / N as f32);
-            let [r, g, b] = rgb(x, y).map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+/// Fill `rect` with `rgb(x, y)` (sRGB 0..1 over 0..1 across and down), as a shaded mesh
+pub(crate) fn gradient(painter: &egui::Painter, rect: egui::Rect, rgb: impl Fn(f32, f32) -> [f32; 3]) {
+    /// Cells across and down: fine enough that a hue strip's six ramps read smooth
+    const GRID_CELLS: u32 = 24;
+
+    let side_vertices = GRID_CELLS as usize + 1;
+    let cell_count = (GRID_CELLS * GRID_CELLS) as usize;
+    // Each grid cell contributes two triangles
+    let mut mesh =
+        egui::Mesh { vertices: Vec::with_capacity(side_vertices * side_vertices), indices: Vec::with_capacity(cell_count * 6), ..Default::default() };
+
+    for j in 0..=GRID_CELLS {
+        for i in 0..=GRID_CELLS {
+            let (x, y) = (i as f32 / GRID_CELLS as f32, j as f32 / GRID_CELLS as f32);
+            let [r, g, b] = rgb(x, y).map(|component| (component.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
             mesh.colored_vertex(rect.lerp_inside(vec2(x, y)), Color32::from_rgb(r, g, b));
         }
     }
-    for j in 0..N {
-        for i in 0..N {
-            let k = j * (N + 1) + i;
-            mesh.add_triangle(k, k + 1, k + N + 1);
-            mesh.add_triangle(k + 1, k + N + 2, k + N + 1);
+
+    for j in 0..GRID_CELLS {
+        for i in 0..GRID_CELLS {
+            let top_left = j * (GRID_CELLS + 1) + i;
+            let bottom_left = top_left + GRID_CELLS + 1;
+            mesh.add_triangle(top_left, top_left + 1, bottom_left);
+            mesh.add_triangle(top_left + 1, bottom_left + 1, bottom_left);
         }
     }
+
     painter.add(mesh);
+}
+
+/// Gap above empty panel text, in points
+const EMPTY_NOTE_TOP_GAP: f32 = 9.0;
+
+/// Aligns an empty panel's note with its header
+pub(crate) fn empty_note(ui: &mut Ui, text: &str) {
+    let tokens = Tokens::get(ui.ctx());
+    let side_margin = crate::docking::HEADER_TITLE_LEFT as i8;
+
+    ui.add_space(EMPTY_NOTE_TOP_GAP);
+    egui::Frame::new().inner_margin(egui::Margin::symmetric(side_margin, 0)).show(ui, |ui| {
+        ui.label(RichText::new(text).color(tokens.text_dim));
+    });
 }
 
 /// Panel title row with optional trailing content.

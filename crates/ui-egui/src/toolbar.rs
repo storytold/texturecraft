@@ -7,11 +7,12 @@ use texturecraft_engine::Tool;
 
 use crate::TextureCraftApp;
 use crate::docking::Panel;
+use crate::drawn_icon::DrawnIcon;
 use crate::i18n::{tr, trf};
 use crate::keymap::{shortcut_of, tip};
 use crate::state::{Mode, ViewLayout};
 use crate::theme::{GUTTER, Tokens, card};
-use crate::widgets::{bar_slider, icon_button, icon_button_without_tooltip, icon_dropdown_button, icon_dropdown_button_width};
+use crate::widgets::{bar_slider, drawn_icon_button, icon_button, icon_button_without_tooltip, icon_dropdown_button, icon_dropdown_button_width};
 
 const BAR_SPACING: f32 = 10.0;
 const COMPACT_BAR_SPACING: f32 = 4.0;
@@ -76,30 +77,37 @@ pub fn paint_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 
 /// Width of `view_buttons`, so the bar knows when to move them into the scrolling strip
 fn view_buttons_width(button_size: f32, spacing: f32) -> f32 {
-    // Two icons, two dropdowns, two separators and the five gaps between them
-    2.0 * button_size + 2.0 * icon_dropdown_button_width(button_size) + 2.0 * BAR_SEPARATOR_WIDTH + 5.0 * spacing
+    // Two icons, three dropdowns, one separator and the five gaps between them
+    2.0 * button_size + 3.0 * icon_dropdown_button_width(button_size) + BAR_SEPARATOR_WIDTH + 5.0 * spacing
 }
 
-/// View buttons in a right-to-left layout, with the screenshot button at the end
+/// View buttons in a right-to-left layout: the layout, then the camera type, then the screenshot and UV checker
 fn view_buttons(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let button_size = ui.spacing().interact_size.y;
-    if icon_button(ui, ic::CAMERA, tr("Screenshot of the viewport"), false, button_size).clicked() {
-        app.toast(tr("Use the control channel or `texturecraft-cli render` for screenshots"), false);
-    }
 
+    // Only the layout works without a project: the others act on it
+    let project_open = app.session.project_open;
+
+    // Right-to-left: the UV checker is added first and sits rightmost
+    ui.add_enabled_ui(project_open, |ui| {
+        let checker = app.session.view == texturecraft_engine::ViewMode::UvChecker;
+        if icon_button(ui, ic::CHECKERBOARD, &tip(&app.ui.keymap, tr("UV checker"), "ui.uvChecker"), checker, button_size).clicked() {
+            let mode = if checker { "material" } else { "uvChecker" };
+            app.run("viewport.view", json!({"mode": mode}));
+        }
+        if icon_button(ui, ic::CAMERA, tr("Screenshot of the viewport"), false, button_size).clicked() {
+            app.toast(tr("Use the control channel or `texturecraft-cli render` for screenshots"), false);
+        }
+    });
     ui.add(egui::Separator::default().spacing(BAR_SEPARATOR_WIDTH));
-    projection_dropdown(app, ui);
+    ui.add_enabled_ui(project_open, |ui| {
+        rotation_dropdown(app, ui);
+        projection_dropdown(app, ui);
+    });
     layout_dropdown(app, ui);
-
-    ui.add(egui::Separator::default().spacing(BAR_SEPARATOR_WIDTH));
-    let checker = app.session.view == texturecraft_engine::ViewMode::UvChecker;
-    if icon_button(ui, ic::CHECKERBOARD, &tip(&app.ui.keymap, tr("UV checker"), "ui.uvChecker"), checker, button_size).clicked() {
-        let mode = if checker { "material" } else { "uvChecker" };
-        app.run("viewport.view", json!({"mode": mode}));
-    }
 }
 
-/// The 3D/2D, 3D-only and 2D-only layouts, showing the current one's icon
+/// The 3D/2D, 3D-only and 2D-only layouts and the swap, showing the current one's icon
 fn layout_dropdown(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     const LAYOUTS: [(ViewLayout, &str, &str, &str); 3] = [
         (ViewLayout::Split, ic::SQUARE_SPLIT_HORIZONTAL, "3D/2D views", "ui.layout.split"),
@@ -115,6 +123,9 @@ fn layout_dropdown(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
             if dropdown_row(ui, icon, tr(label), shortcut_of(&app.ui.keymap, command), app.ui.layout == layout) {
                 chosen = Some(command);
             }
+        }
+        if dropdown_row(ui, ic::ARROWS_LEFT_RIGHT, tr("Swap 3D/2D"), shortcut_of(&app.ui.keymap, "ui.layout.swap"), false) {
+            chosen = Some("ui.layout.swap");
         }
     });
 
@@ -139,6 +150,28 @@ fn projection_dropdown(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 
     if let Some(choice) = chosen.filter(|choice| *choice != ortho) {
         app.run("camera.set", json!({"ortho": choice}));
+    }
+}
+
+/// Constrained (horizon stays level) or free (trackball) camera rotation
+fn rotation_dropdown(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    let modes = [
+        (false, ic::ARROWS_HORIZONTAL, "Constrained rotation", "camera.rotation.constrained"),
+        (true, ic::ARROWS_CLOCKWISE, "Free rotation", "camera.rotation.free"),
+    ];
+    let free = app.session.camera.free;
+    let (_, icon, label, _) = modes.iter().find(|(choice, ..)| *choice == free).unwrap_or(&modes[0]);
+    let mut chosen = None;
+    icon_dropdown(ui, "view_rotation", icon, tr(label), |ui| {
+        for (choice, icon, label, command) in modes {
+            if dropdown_row(ui, icon, tr(label), shortcut_of(&app.ui.keymap, command), free == choice) {
+                chosen = Some(command);
+            }
+        }
+    });
+
+    if let Some(command) = chosen {
+        crate::menus::invoke(app, &ui.ctx().clone(), command);
     }
 }
 
@@ -228,31 +261,54 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
     const DEFAULT_LAZY_DISTANCE_PX: f32 = 20.0;
     const TOOL_ICON_SIZE: f32 = 15.0;
 
+    // Slider widths: the longer-named Size and Stroke opacity get more room, Lazy mouse's Distance less
+    const WIDE_SLIDER_WIDTH: f32 = 110.0;
+    const SLIDER_WIDTH: f32 = 100.0;
+    const NARROW_SLIDER_WIDTH: f32 = 90.0;
+
+    /// The sliders show fractions as percentages
+    const PERCENT: f32 = 100.0;
+
+    /// Size's track, in percent of the largest brush
+    const SIZE_PERCENT_RANGE: std::ops::RangeInclusive<f32> = 0.05..=100.0;
+
+    /// Spacing's track, in percent of the brush's diameter
+    const SPACING_PERCENT_RANGE: std::ops::RangeInclusive<f32> = 1.0..=200.0;
+
+    /// Lazy mouse Distance's track, in pixels
+    const LAZY_DISTANCE_RANGE_PX: std::ops::RangeInclusive<f32> = 1.0..=200.0;
+
     let button_size = ui.spacing().interact_size.y;
     let tool = app.session.tool.tool;
-    ui.label(RichText::new(tool_icon(tool)).size(TOOL_ICON_SIZE).color(tokens.text_strong)).on_hover_text(tr(tool.label()));
+    if tool == Tool::ColorPicker {
+        let (icon, response) = ui.allocate_exact_size(vec2(TOOL_ICON_SIZE, TOOL_ICON_SIZE), egui::Sense::hover());
+        DrawnIcon::Pipette.paint(ui.painter(), icon.center(), TOOL_ICON_SIZE, tokens.text_strong);
+        response.on_hover_text(tr(tool.label()));
+    } else {
+        ui.label(RichText::new(tool_icon(tool)).size(TOOL_ICON_SIZE).color(tokens.text_strong)).on_hover_text(tr(tool.label()));
+    }
 
     let brush = &mut app.session.tool.brush;
     match tool {
         Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Smudge | Tool::Clone | Tool::Path => {
-            let mut size = brush.size / MAX_BRUSH_SIZE * 100.0;
-            if bar_slider(ui, tr("Size"), &mut size, 0.05..=100.0, 110.0).changed() {
-                brush.size = (size / 100.0 * MAX_BRUSH_SIZE).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
+            let mut size = brush.size / MAX_BRUSH_SIZE * PERCENT;
+            if bar_slider(ui, tr("Size"), &mut size, SIZE_PERCENT_RANGE, WIDE_SLIDER_WIDTH).changed() {
+                brush.size = (size / PERCENT * MAX_BRUSH_SIZE).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
             }
 
-            let mut flow = brush.flow * 100.0;
-            if bar_slider(ui, tr("Flow"), &mut flow, 0.0..=100.0, 100.0).changed() {
-                brush.flow = flow / 100.0;
+            let mut flow = brush.flow * PERCENT;
+            if bar_slider(ui, tr("Flow"), &mut flow, 0.0..=PERCENT, SLIDER_WIDTH).changed() {
+                brush.flow = flow / PERCENT;
             }
 
-            let mut opacity = brush.opacity * 100.0;
-            if bar_slider(ui, tr("Stroke opacity"), &mut opacity, 0.0..=100.0, 110.0).changed() {
-                brush.opacity = opacity / 100.0;
+            let mut opacity = brush.opacity * PERCENT;
+            if bar_slider(ui, tr("Stroke opacity"), &mut opacity, 0.0..=PERCENT, WIDE_SLIDER_WIDTH).changed() {
+                brush.opacity = opacity / PERCENT;
             }
 
-            let mut spacing = brush.spacing * 100.0;
-            if bar_slider(ui, tr("Spacing"), &mut spacing, 1.0..=200.0, 100.0).changed() {
-                brush.spacing = spacing / 100.0;
+            let mut spacing = brush.spacing * PERCENT;
+            if bar_slider(ui, tr("Spacing"), &mut spacing, SPACING_PERCENT_RANGE, SLIDER_WIDTH).changed() {
+                brush.spacing = spacing / PERCENT;
             }
 
             ui.separator();
@@ -262,7 +318,7 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
             }
             if lazy_on {
                 let mut distance = brush.lazy;
-                if bar_slider(ui, tr("Distance"), &mut distance, 1.0..=200.0, 90.0).changed() {
+                if bar_slider(ui, tr("Distance"), &mut distance, LAZY_DISTANCE_RANGE_PX, NARROW_SLIDER_WIDTH).changed() {
                     brush.lazy = distance;
                 }
             }
@@ -277,9 +333,9 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
 
             if tool == Tool::Smudge {
                 ui.separator();
-                let mut strength = app.session.tool.smudge_strength * 100.0;
-                if bar_slider(ui, tr("Strength"), &mut strength, 0.0..=100.0, 100.0).changed() {
-                    app.session.tool.smudge_strength = (strength / 100.0).clamp(0.0, 1.0);
+                let mut strength = app.session.tool.smudge_strength * PERCENT;
+                if bar_slider(ui, tr("Strength"), &mut strength, 0.0..=PERCENT, SLIDER_WIDTH).changed() {
+                    app.session.tool.smudge_strength = (strength / PERCENT).clamp(0.0, 1.0);
                 }
             }
 
@@ -293,7 +349,11 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
                 path_controls(app, ui);
             }
         }
-        Tool::PolygonFill => fill_mode_buttons(app, ui),
+        Tool::PolygonFill => {
+            fill_mode_buttons(app, ui);
+            ui.separator();
+            crate::symmetry::toolbar_controls(app, ui);
+        }
         Tool::ColorPicker => {
             ui.label(RichText::new(tr("Click the mesh to pick its material into the brush")).color(tokens.text_dim));
         }
@@ -311,7 +371,10 @@ fn mode_buttons(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
         (Mode::Painting, ic::PALETTE, tr("Painting"), "ui.mode.paint"),
         (Mode::Baking, ic::ATOM, tr("Bake Mesh Maps"), "ui.mode.bake"),
     ] {
-        if icon_button(ui, icon, &tip(&app.ui.keymap, label, command), app.ui.mode == mode, button_size).clicked() {
+        // Greyed (Painting stays shown as the current mode) while no project is open
+        let on = crate::menus::enabled(app, command);
+        let button = ui.add_enabled_ui(on, |ui| icon_button(ui, icon, &tip(&app.ui.keymap, label, command), app.ui.mode == mode, button_size)).inner;
+        if button.clicked() {
             crate::menus::invoke(app, &ui.ctx().clone(), command);
         }
     }
@@ -341,6 +404,7 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let (closed, fill) = (path.closed, path.fill);
     let selected = path.selected.is_some_and(|i| i < path.points.len());
     let has_points = !path.points.is_empty();
+    let corner = path.selected.is_some_and(|i| path.is_corner(i));
     if icon_button(ui, ic::POLYGON, tr("Closed path"), closed, button_size).clicked() {
         app.session.set_path_closed(!closed);
     }
@@ -348,6 +412,11 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let fill_tip = if closed { tr("Fill the closed path (lasso)") } else { tr("Fill the path (close it first)") };
     if icon_button(ui, ic::PAINT_BUCKET, fill_tip, fill, button_size).clicked() {
         app.session.set_path_fill(!fill);
+    }
+
+    if ui.add_enabled_ui(selected, |ui| icon_button(ui, ic::ANGLE, tr("Corner point (Shift+click places one)"), corner, button_size)).inner.clicked() {
+        // The command repaints an edited path and is one undo step
+        app.run("path.corner", json!({}));
     }
 
     if ui.add_enabled_ui(selected, |ui| icon_button(ui, ic::BACKSPACE, tr("Remove point"), false, button_size)).inner.clicked() {
@@ -411,7 +480,12 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                             (usable, usable && app.session.tool.tool == tool)
                         }
                     };
-                    let button = ui.add_enabled_ui(usable, |ui| icon_button(ui, tool_icon(tool), &hint, selected, SHELF_BUTTON_SIZE)).inner;
+                    let button = ui
+                        .add_enabled_ui(usable, |ui| match tool {
+                            Tool::ColorPicker => drawn_icon_button(ui, DrawnIcon::Pipette, &hint, selected, SHELF_BUTTON_SIZE),
+                            _ => icon_button(ui, tool_icon(tool), &hint, selected, SHELF_BUTTON_SIZE),
+                        })
+                        .inner;
                     if button.on_disabled_hover_text(tr(tool.label())).clicked() && app.ui.mode == Mode::Painting {
                         app.run("tool.select", json!({"tool": tool.id()}));
                     }
@@ -457,18 +531,15 @@ const RAIL_ICON_SIZE: f32 = 26.0;
 const RAIL_ICON_GAP: f32 = 4.0;
 
 /// Padding inside the rail's card around its icons, as the tool shelf's
-const RAIL_CARD_PADDING: egui::Margin = egui::Margin::symmetric(3, 6);
+const RAIL_CARD_PADDING: egui::Margin = SHELF_PADDING;
 
-/// The icon rail: Export, then the rail panels that are not in the dock, each opening its popup
+/// The icon rail: the rail panels that are not in the dock (Export first), each opening its popup
 pub fn rail(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let tokens = Tokens::get(ui.ctx());
     egui::Panel::right("rail").resizable(false).exact_size(RAIL_WIDTH).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
         card(ui, &tokens, egui::Margin { left: 0, right: GUTTER, top: GUTTER, bottom: GUTTER }, RAIL_CARD_PADDING, |ui| {
             ui.spacing_mut().item_spacing.y = RAIL_ICON_GAP;
             crate::rail_popup::begin_rail(ui.ctx(), ui.max_rect());
-            if icon_button(ui, ic::EXPORT, &tip(&app.ui.keymap, tr("Export textures"), "ui.export"), app.ui.windows.export, RAIL_ICON_SIZE).clicked() {
-                app.ui.windows.export = !app.ui.windows.export;
-            }
 
             // A panel in the dock, docked or floating, leaves the rail until it is closed there
             for (panel, icon, id) in crate::rail_popup::RAIL_PANELS {
@@ -506,7 +577,7 @@ pub fn status_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                     ui.add(egui::ProgressBar::new(p).desired_width(160.0).desired_height(10.0).text(RichText::new(tr("Compositing")).size(10.0)));
                     ui.ctx().request_repaint();
                 } else if let Some(msg) = app.session.log.last() {
-                    ui.label(RichText::new(msg).size(11.0).color(tk.text_dim));
+                    ui.label(RichText::new(&msg.message).size(11.0).color(tk.text_dim));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let gpu = app.gpu.as_ref().map(|g| g.adapter.as_str()).unwrap_or(tr("no GPU"));
@@ -515,23 +586,6 @@ pub fn status_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                             .size(11.0)
                             .color(tk.text_dim),
                     );
-                    ui.separator();
-                    let m = app.session.memory();
-                    let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
-                    let total = mb(m.total());
-                    let decimals = if total < 10.0 { 1 } else { 0 };
-                    let mb1 = |b: usize| format!("{:.1}", mb(b));
-                    ui.label(RichText::new(trf("Layer memory: {mb} MB", &[("mb", &format!("{total:.decimals$}"))])).size(11.0).color(tk.text_dim)).on_hover_ui(
-                        |ui| {
-                            ui.label(trf(
-                                "Painted layer pixels {pixels} MB, composited channels {composites} MB, compositing cache {cache} MB",
-                                &[("pixels", &mb1(m.pixels)), ("composites", &mb1(m.composites)), ("cache", &mb1(m.cache))],
-                            ));
-                        },
-                    );
-                    ui.separator();
-                    ui.label(RichText::new(trf("UI {ms} ms", &[("ms", &format!("{:.1}", app.ui_ms))])).size(11.0).color(tk.text_dim));
-                    ui.add_space(vec2(0.0, 0.0).x);
                 });
             });
         });

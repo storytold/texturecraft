@@ -28,7 +28,7 @@ USAGE:
   texturecraft-cli bake <input> [-o <out.tcraft>] [--resolution <px>] [--maps <id,id,...>]
       Bake mesh maps for every texture set (a project is saved in place without -o).
   texturecraft-cli export <input> <dir> [--preset <name>] [--format <ext>] [--padding <mode>] [--size <px>]
-      Export textures (default preset: Document channels + Normal + AO).
+      Export textures (default preset: Document channels + Normal + AO (No Alpha)).
   texturecraft-cli render <input> <out.png> [--size <W>x<H>] [--view 3d|2d] [--camera <name>] [--yaw <deg>]
                    [--pitch <deg>] [--samples <n>] [--bounces <n>] [--cpu]
       Render the viewport to PNG (needs a GPU or software adapter); --camera looks through a

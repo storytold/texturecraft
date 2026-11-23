@@ -1,5 +1,6 @@
 //! Symmetry: the toolbar toggle and settings popup, and what the 3D view draws for it
 
+mod plane_pick;
 mod ribbons;
 mod settings_popup;
 mod symmetry_display;
@@ -14,6 +15,7 @@ use egui_phosphor::regular as ic;
 use texturecraft_engine::Tool;
 use texturecraft_engine::paint::Symmetry;
 
+pub(crate) use plane_pick::input as plane_pick_input;
 pub use symmetry_display::SymmetryDisplay;
 pub(crate) use view_overlay::{manipulator_hovered, manipulator_input, overlay, scene_overlay};
 
@@ -24,9 +26,9 @@ use crate::widgets::{icon_badge_dropdown_button, icon_button};
 /// Radial copies a brush gets when radial symmetry is enabled
 const DEFAULT_RADIAL_COUNT: u8 = 6;
 
-/// Whether `tool` paints symmetry copies
+/// Whether `tool` paints or fills symmetry copies
 pub(crate) fn applies_to(tool: Tool) -> bool {
-    matches!(tool, Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Clone | Tool::Path)
+    matches!(tool, Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Smudge | Tool::Clone | Tool::Path | Tool::PolygonFill)
 }
 
 /// Whether the 3D view shows symmetry now: not while the active tool can't act on the selection
@@ -100,14 +102,17 @@ pub(crate) fn toolbar_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
         .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
         .show(|ui| settings_popup::show(app, ui));
 
-    // A click outside the popup and the dropdowns it opens (foreground layers too) closes it
+    // Outside clicks and drags dismiss the menu unless they belong to a child popup
     if let Some(shown) = shown
         && !response.clicked()
-        && ui.input(|input| input.pointer.any_click())
-        && let Some(at) = ui.input(|input| input.pointer.interact_pos())
-        && ui.ctx().layer_id_at(at).is_none_or(|layer| layer != shown.response.layer_id && layer.order != egui::Order::Foreground)
     {
-        open = false;
+        let clicked_at = ui.input(|input| input.pointer.interact_pos().filter(|_| input.pointer.any_click()));
+        let click_outside = clicked_at
+            .is_some_and(|at| ui.ctx().layer_id_at(at).is_none_or(|layer| layer != shown.response.layer_id && layer.order != egui::Order::Foreground));
+
+        if click_outside || crate::popup_drag::drag_outside_popups(ui.ctx()) {
+            open = false;
+        }
     }
 
     ui.data_mut(|data| data.insert_temp(popup_id, open));

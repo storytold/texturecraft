@@ -8,6 +8,8 @@ struct Post {
     c: vec4<f32>, // depth of field (fx.wgsl): x circle of confusion at infinity (pixels), y focus depth, z largest circle radius (pixels), w accumulation sample
     d: vec4<f32>, // subsurface blur (fx.wgsl): xyz mean free path per channel (world units), w pixels per world unit at depth 1
     e: vec4<f32>, // x orthographic camera (1: pixels per world unit don't fall off with depth), y accumulation sample, zw -
+    back_top: vec4<f32>, // rgb background color at the top of the view (linear), a -
+    back_bottom: vec4<f32>, // rgb background color at the bottom of the view (linear), a -
 };
 
 @group(0) @binding(3) var<uniform> post: Post;
@@ -34,12 +36,10 @@ fn tonemap(hdr: vec3<f32>) -> vec3<f32> {
     return min(x, vec3<f32>(1.0));
 }
 
-// The studio backdrop behind the scene: the interface's cool slate (#30343b at the top to #1b1e23
-// at the bottom, faintly tinted so colors still read true), a little darker in the corners so the
-// stage doesn't look like a hole.
+// The plain background behind the scene: the two colors of Settings > General > Background color,
+// top to bottom (the same color at both ends is a flat background).
 fn backdrop(uv: vec2<f32>) -> vec3<f32> {
-    let d = uv * 2.0 - 1.0;
-    return mix(vec3<f32>(0.0295, 0.0343, 0.0437), vec3<f32>(0.0110, 0.0130, 0.0168), uv.y) * (1.0 - 0.09 * dot(d, d));
+    return mix(post.back_top.rgb, post.back_bottom.rgb, uv.y);
 }
 
 // Display-linear color of one pixel (scene over backdrop), without bloom.

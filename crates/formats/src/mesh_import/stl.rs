@@ -55,7 +55,8 @@ pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
     if has_colors {
         raw.colors = Some(vertex_colors);
     }
-    raw.groups.push(("Default".into(), String::new(), (0..raw.positions.len() as u32).collect()));
+    let vertex_count = raw.positions.len() as u32;
+    raw.group("Default", "").extend(0..vertex_count);
     Ok(raw)
 }
 

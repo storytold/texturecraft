@@ -210,7 +210,7 @@ impl Stroke {
         let bitangent = normal.cross(tangent);
         let jittered_radius = radius * (1.0 + jitter(JITTER_SIZE, settings.jitter_size)).max(MIN_JITTERED_SIZE);
         let offset = (tangent * jitter(JITTER_ACROSS, 1.0) + bitangent * jitter(JITTER_ALONG, 1.0)) * settings.jitter_position * radius;
-        let flow = (settings.uv_stamp_flow(pressure) * (1.0 - jitter(JITTER_FLOW, settings.jitter_flow).abs())).clamp(0.0, 1.0);
+        let flow = (settings.stamp_flow(pressure) * (1.0 - jitter(JITTER_FLOW, settings.jitter_flow).abs())).clamp(0.0, 1.0);
 
         Stamp {
             center: hit.pos + offset,
@@ -263,6 +263,11 @@ impl Stroke {
         }
 
         copies
+    }
+
+    /// The center of the mesh the stroke paints, which the symmetry planes are measured from
+    pub fn center(&self) -> Vec3 {
+        self.center
     }
 
     pub fn last_hit(&self) -> Option<SurfaceHit> {
@@ -319,15 +324,18 @@ mod tests {
         let (m, b, c) = ctx_parts();
         let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
         let settings = BrushSettings { flow: 0.8, min_flow: 0.25, ..BrushSettings::default() };
-        let mut s = Stroke::new(&settings, &m);
-        let st_full = s.add(&ctx, Vec2::new(200.0, 200.0), 1.0);
+        let mut full = Stroke::new(&settings, &m);
+        let mut light = Stroke::new(&settings, &m);
+        let st_full = full.add(&ctx, Vec2::new(200.0, 200.0), 1.0);
+        let st_light = light.add(&ctx, Vec2::new(200.0, 200.0), 0.5);
         assert_eq!(st_full.len(), 1);
+        assert_eq!(st_light.len(), 1);
         assert!((st_full[0].flow - 0.8).abs() < 1e-4);
+        assert!((st_light[0].flow - 0.5).abs() < 1e-4);
 
-        let mut s_half = Stroke::new(&settings, &m);
-        let st_half = s_half.add(&ctx, Vec2::new(200.0, 200.0), 0.5);
-        assert_eq!(st_half.len(), 1);
-        assert!((st_half[0].flow - 0.5).abs() < 1e-4);
+        let continued: Vec<_> = (1..=20).flat_map(|i| full.add(&ctx, Vec2::new(200.0 + i as f32 * 2.5, 200.0), 0.5)).collect();
+        assert!(!continued.is_empty(), "the stroke emitted stamps after the pressure changed");
+        assert!(continued.iter().all(|stamp| (stamp.flow - 0.5).abs() < 1e-4));
     }
 
     #[test]

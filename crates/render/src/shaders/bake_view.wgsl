@@ -124,8 +124,9 @@ fn fs_wire_cage_missing_seam(surface: BakeViewOut) -> @location(0) vec4<f32> {
     return g.bake_missing_seam;
 }
 
-// Shade the neutral material using the texture set's normal, occlusion and optional bent normal
-fn neutral_color(n: vec3<f32>, n_geo: vec3<f32>, v: vec3<f32>, world_position: vec3<f32>, ao_channel: f32, packed_bent: vec3<f32>) -> vec4<f32> {
+// Shade the neutral material using the texture set's normal, occlusion and optional bent normal.
+// `t`, `b` and `n_geo` are the tangent frame the normal map is read in; the bent normal is stored in it too.
+fn neutral_color(n: vec3<f32>, n_geo: vec3<f32>, t: vec3<f32>, b: vec3<f32>, v: vec3<f32>, world_position: vec3<f32>, ao_channel: f32, packed_bent: vec3<f32>) -> vec4<f32> {
     let albedo = g.bake_neutral_color.rgb;
     let rough = clamp(g.bake_neutral.x, MIN_NEUTRAL_ROUGHNESS, 1.0);
     let metal = g.bake_neutral.y;
@@ -135,8 +136,10 @@ fn neutral_color(n: vec3<f32>, n_geo: vec3<f32>, v: vec3<f32>, world_position: v
     let nov = clamp(abs(dot(n, v)), MIN_COSINE, 1.0);
 
     // An unbaked bent normal reads as the neutral gray (length 0): the surface normal stands in
-    var bent = packed_bent * 2.0 - 1.0;
-    bent = select(n, normalize(bent), dot(bent, bent) > BENT_NORMAL_MIN_LENGTH * BENT_NORMAL_MIN_LENGTH);
+    // Decoded like the normal map (texel 128 is exactly 0)
+    let bent_tangent = snorm8(packed_bent);
+    let bent_world = t * bent_tangent.x + b * bent_tangent.y + n_geo * bent_tangent.z;
+    let bent = select(n, normalize(bent_world), dot(bent_tangent, bent_tangent) > BENT_NORMAL_MIN_LENGTH * BENT_NORMAL_MIN_LENGTH);
     let diffuse = sh_irradiance(normalize(mix(n, bent, g.bake_bent_normal.x)), vec3<f32>(0.0)) * diffuse_col * ao;
     let r = reflect(-v, n);
     let horizon = clamp(1.0 + HORIZON_FADE * dot(r, n_geo), 0.0, 1.0);

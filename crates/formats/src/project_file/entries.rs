@@ -36,6 +36,8 @@ pub(super) struct Entry<'a> {
 mod limits {
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
+    const FALLBACK_AVAILABLE_RAM_BYTES: u64 = 8 << 30;
+
     /// Cores a save leaves to the UI (an autosave runs while the user keeps painting).
     static RESERVED_CORES: AtomicUsize = AtomicUsize::new(DEFAULT_RESERVED_CORES);
     /// Share of the available RAM, in percent, that entries in flight may hold.
@@ -56,11 +58,31 @@ mod limits {
     /// RAM the system can give out now, in bytes (the total when the system does not say it; 8 GiB
     /// when the system tells nothing).
     pub fn available_ram() -> u64 {
-        let Ok(mut sys) = sysinfo::System::new() else { return 8 << 30 };
+        let Ok(mut sys) = sysinfo::System::new() else { return FALLBACK_AVAILABLE_RAM_BYTES };
         sys.refresh_memory();
-        match sys.available_memory() {
-            0 => sys.total_memory(),
-            n => n,
+        let available_bytes = reported_ram(sys.available_memory(), sys.total_memory());
+        sys.cgroup_limits().map_or(available_bytes, |limits| available_bytes.min(limits.free_memory))
+    }
+
+    fn reported_ram(available: u64, total: u64) -> u64 {
+        if available != 0 {
+            available
+        } else if total != 0 {
+            total
+        } else {
+            FALLBACK_AVAILABLE_RAM_BYTES
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::reported_ram;
+
+        #[test]
+        fn missing_memory_readings_use_fallback() {
+            assert_eq!(reported_ram(0, 0), 8 << 30);
+            assert_eq!(reported_ram(0, 12 << 30), 12 << 30);
+            assert_eq!(reported_ram(3 << 30, 12 << 30), 3 << 30);
         }
     }
 }
@@ -86,6 +108,12 @@ pub fn available_save_resources() -> (usize, u64) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_ram_budget(available_ram_bytes: u64, ram_percent: u8) -> u64 {
     u64::try_from(u128::from(available_ram_bytes) * u128::from(ram_percent.clamp(1, 100)) / 100).unwrap_or(u64::MAX)
+}
+
+/// The configured Settings share of currently available RAM, in bytes.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn configured_ram_budget() -> u64 {
+    save_ram_budget(limits::available_ram(), limits::get().1)
 }
 
 /// Worker threads and in-flight byte budget for a save of `entries` entries.

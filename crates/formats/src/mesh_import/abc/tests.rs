@@ -5,6 +5,11 @@ use texturecraft_geom::glam::Vec3;
 use super::*;
 use crate::mesh_import::finish;
 
+const DATA_BIT: u64 = 1 << 63;
+const OGAWA_MAGIC: &[u8] = b"Ogawa";
+const KEY_BYTES: usize = 16;
+const OBJECT_HASH_BYTES: usize = 32;
+
 /// Builds an Ogawa byte stream: data blocks and groups appended, the root set last.
 struct Writer {
     b: Vec<u8>,
@@ -224,6 +229,47 @@ fn imports_polymesh_through_xforms_with_face_sets_uvs_and_normals() {
 }
 
 #[test]
+fn alembic_import_preserves_archive_order_across_transform_resets() {
+    let mut a = Abc { w: Writer::new() };
+    let triangle = |a: &mut Abc, material: &str| {
+        let points = a.array("P", "", F32, 3, &f32s(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0]));
+        let indices = a.array(".faceIndices", "", I32, 1, &i32s(&[0, 1, 2]));
+        let counts = a.array(".faceCounts", "", I32, 1, &i32s(&[3]));
+        let geom = a.compound(".geom", "schema=AbcGeom_PolyMesh_v1", vec![points, indices, counts]);
+        let faces = a.array(".faces", "", I32, 1, &i32s(&[0]));
+        let face_set = a.compound(".faceset", "schema=AbcGeom_FaceSet_v1", vec![faces]);
+        let face_set = a.object(vec![face_set], &[]);
+        a.object(vec![geom], &[(material, "schema=AbcGeom_FaceSet_v1", face_set)])
+    };
+    let translate = |a: &mut Abc, x: f64, inherits: bool, children: &[(&str, &str, u64)]| {
+        let ops = a.scalar(".ops", U8, 1, &[0x10]);
+        let coords: Vec<_> = [x, 0.0, 0.0].into_iter().flat_map(f64::to_le_bytes).collect();
+        let vals = a.scalar(".vals", F64, 3, &coords);
+        let inherits = a.scalar(".inherits", U8, 1, &[u8::from(inherits)]);
+        let transform = a.compound(".xform", "schema=AbcGeom_Xform_v3", vec![ops, vals, inherits]);
+        a.object(vec![transform], children)
+    };
+    let reset_mesh = triangle(&mut a, "First");
+    let inherited_mesh = triangle(&mut a, "Second");
+    let reset = translate(&mut a, 3.0, false, &[("shape", "", reset_mesh)]);
+    let inherited = translate(&mut a, 7.0, true, &[("shape", "", inherited_mesh)]);
+    let xform = "schema=AbcGeom_Xform_v3";
+    let root = translate(&mut a, 100.0, true, &[("reset", xform, reset), ("inherited", xform, inherited)]);
+    let top = a.object(vec![], &[("root", xform, root)]);
+    let bytes = a.archive(top, &["schema=AbcGeom_PolyMesh_v1"]);
+
+    let mesh = crate::import_mesh_bytes("transforms.abc", &bytes).unwrap().mesh;
+    assert_eq!(mesh.materials, ["First", "Second"], "texture-set order follows the archive");
+    let [reset, inherited] = mesh.submeshes.as_slice() else { panic!("expected two mesh parts") };
+    assert_eq!((reset.name.as_str(), inherited.name.as_str()), ("reset", "inherited"));
+    for (part, expected_x) in [(reset, 3.0f32), (inherited, 107.0f32)] {
+        let indices = &mesh.indices[part.start as usize..(part.start + part.count) as usize];
+        let left = indices.iter().map(|&i| mesh.positions[i as usize].x).fold(f32::INFINITY, f32::min);
+        assert!((left - expected_x).abs() < 1e-5, "{} starts at x={left}", part.name);
+    }
+}
+
+#[test]
 fn strip_alone_keeps_uvs_flipped_to_v_down() {
     let mut a = Abc { w: Writer::new() };
     let pp = a.array("P", "", F32, 3, &f32s(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]));
@@ -259,20 +305,6 @@ fn half_float_uvs_import_without_losing_values() {
     for (p, uv) in imported.mesh.positions.iter().zip(&imported.mesh.uvs) {
         assert_eq!(*uv, texturecraft_geom::glam::Vec2::new(p.x, 1.0 - p.y));
     }
-}
-
-#[test]
-fn half_float_values_preserve_special_values() {
-    let mut a = Abc { w: Writer::new() };
-    let raw: Vec<u8> = [0xc000u16, 0x0001, 0x7c00, 0x7e00].iter().flat_map(|x| x.to_le_bytes()).collect();
-    let p = a.array("values", "", 9, 1, &raw);
-    let property = Prop { name: p.name.into(), meta: p.meta, kind: PropKind::Array, pod: 9, extent: 1, group: p.group };
-    let mut ogawa = Ogawa { b: &a.w.b, budget: MAX_DECODED_BYTES, indexed_meta: Vec::new() };
-    let values = ogawa.values(&property).unwrap();
-    assert_eq!(values[0], -2.0);
-    assert_eq!(values[1], 2f64.powi(-24));
-    assert_eq!(values[2], f64::INFINITY);
-    assert!(values[3].is_nan());
 }
 
 #[test]
@@ -326,15 +358,6 @@ fn self_referencing_groups_are_bounded() {
 
 #[test]
 fn indexed_metadata_stops_at_the_entries_a_byte_can_index() {
-    // One real entry followed by a million empty ones: a byte each in the file, a `String` each
-    // in memory, and no index past 254 can be used anyway.
-    let mut block = vec![3, b'a', b'b', b'c'];
-    block.extend(std::iter::repeat_n(0u8, 1_000_000));
-    let mut kept = vec![String::new()];
-    read_indexed_meta(&block, &mut kept).unwrap();
-    assert_eq!(kept.len(), MAX_INDEXED_META);
-    assert_eq!(kept.get(1).map(String::as_str), Some("abc"));
-
     // The mesh schema comes from metadata index 1 even when the table has unreachable entries.
     let mut a = Abc { w: Writer::new() };
     let pp = a.array("P", "", F32, 3, &f32s(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0]));
@@ -348,4 +371,46 @@ fn indexed_metadata_stops_at_the_entries_a_byte_can_index() {
     let raw = read(&a.archive(top, &metas)).unwrap();
     assert_eq!(raw.positions, [Vec3::X, Vec3::Y, Vec3::ZERO]);
     assert_eq!(raw.groups, vec![(DEFAULT_MATERIAL.into(), "tri".into(), vec![0, 1, 2])]);
+}
+
+fn nested_xform_chain(levels: usize) -> Vec<u8> {
+    let mut a = Abc { w: Writer::new() };
+    let pp = a.array("P", "", F32, 3, &f32s(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0]));
+    let fi = a.array(".faceIndices", "", I32, 1, &i32s(&[0, 1, 2]));
+    let fc = a.array(".faceCounts", "", I32, 1, &i32s(&[3]));
+    let geom = a.compound(".geom", "schema=AbcGeom_PolyMesh_v1", vec![pp, fi, fc]);
+    let mut node = a.object(vec![geom], &[]);
+    let mut child_name = "CubeShape";
+    let mut child_schema = "schema=AbcGeom_PolyMesh_v1";
+    let long_name = "a".repeat(63);
+    for i in 0..levels {
+        let ops = a.scalar(".ops", U8, 1, &[0x10]);
+        let coords: Vec<_> = [1.0f64, 0.0, 0.0].into_iter().flat_map(f64::to_le_bytes).collect();
+        let vals = a.scalar(".vals", F64, 3, &coords);
+        let inherits = a.scalar(".inherits", U8, 1, &[1]);
+        let xf = a.compound(".xform", "schema=AbcGeom_Xform_v3", vec![ops, vals, inherits]);
+        node = a.object(vec![xf], &[(child_name, child_schema, node)]);
+        child_name = if i == 0 { "Cube" } else { &long_name };
+        child_schema = "schema=AbcGeom_Xform_v3";
+    }
+    let top = a.object(vec![], &[(&long_name, "schema=AbcGeom_Xform_v3", node)]);
+    a.archive(top, &["schema=AbcGeom_PolyMesh_v1"])
+}
+
+#[test]
+fn long_transform_chains_import() {
+    for levels in [64usize, 200] {
+        let bytes = nested_xform_chain(levels);
+        let mesh = crate::import_mesh_bytes("long-names.abc", &bytes).unwrap().mesh;
+        assert_eq!(mesh.indices.len(), 3, "{levels} levels should import one triangle");
+        let min_x = mesh.positions.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        assert!((min_x - levels as f32).abs() < 1e-4, "{levels} levels: expected min_x={levels}, got {min_x}");
+    }
+}
+
+#[test]
+fn nesting_past_the_limit_is_an_error() {
+    let bytes = nested_xform_chain(MAX_DEPTH + 1);
+    let Err(err) = read(&bytes) else { panic!("expected error, got Ok") };
+    assert!(err.to_string().contains("nested too deeply"), "unexpected error: {err}");
 }

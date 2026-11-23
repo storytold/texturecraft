@@ -115,14 +115,17 @@ pub fn procedural_image(kind: ProceduralKind, size: usize) -> ColorImage {
     use texturecraft_engine::core::{Procedural, Projection};
     use texturecraft_engine::geom::glam::{Vec2, Vec3};
 
-    let pattern = Procedural { scale: PROCEDURAL_SCALE, ..Procedural::new(kind) };
-    let mut img = ColorImage::filled([size, size], Color32::BLACK);
-    for (i, px) in img.pixels.iter_mut().enumerate() {
-        let uv = Vec2::new(((i % size) as f32 + 0.5) / size as f32, ((i / size) as f32 + 0.5) / size as f32);
-        let v = procedural(&pattern, &Projection::default(), &Coords { uv, pos: Vec3::ZERO, nrm: Vec3::Y });
-        *px = Color32::from_gray((v.clamp(0.0, 1.0) * 255.0) as u8);
+    // The Tile Generator's tile counts set its frequency: its swatch shows its grid once
+    let defaults = Procedural::new(kind);
+    let scale = if kind == ProceduralKind::TileGenerator { defaults.scale } else { PROCEDURAL_SCALE };
+    let pattern = Procedural { scale, ..defaults };
+    let mut image = ColorImage::filled([size, size], Color32::BLACK);
+    for (index, pixel) in image.pixels.iter_mut().enumerate() {
+        let uv = Vec2::new(((index % size) as f32 + 0.5) / size as f32, ((index / size) as f32 + 0.5) / size as f32);
+        let value = procedural(&pattern, &Projection::default(), &Coords { uv, pos: Vec3::ZERO, nrm: Vec3::Y });
+        *pixel = Color32::from_gray((value.clamp(0.0, 1.0) * 255.0) as u8);
     }
-    img
+    image
 }
 
 /// White-on-black `size²` swatch of library alpha `alpha`
@@ -166,7 +169,7 @@ pub fn stroke_preview(brush: &BrushSettings, size_px: usize, image: Option<&Imag
 
     let library = brush.alpha_library.as_deref().and_then(alphas::find).map(alphas::LibraryAlpha::image);
     let radius = size_px as f32 * STROKE_RADIUS_FRACTION;
-    let shape = Shape { alpha: brush.alpha, image, library, level: 0 }.at_radius(radius);
+    let shape = Shape { alpha: brush.alpha, image, library, params: brush.alpha_params, level: 0 }.at_radius(radius);
 
     // The horizontal inset and vertical wave keep the S curve inside the swatch
     let curve = |t: f32| {
@@ -193,6 +196,7 @@ pub fn stroke_preview(brush: &BrushSettings, size_px: usize, image: Option<&Imag
         if travelled < step {
             continue;
         }
+
         travelled = 0.0;
         i += 1;
         let stamp_radius = radius * (1.0 - brush.jitter_size * jitter_sample(i, 1));
