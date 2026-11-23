@@ -117,7 +117,7 @@ impl Features {
             include(
                 self.spatial,
                 include_str!("shaders/composite_spatial.wgsl"),
-                "fn previous_field(start: u32, count: u32) -> u32 { return 0u; }\n                 fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> { return vec4(0.0); }",
+                "fn previous_field(start: u32, count: u32) -> u32 { return 0u; }\n                 fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> { return vec4(0.0); }\n                 var<private> preceding_field: u32 = 0xffffffffu;\n                 fn preceding_stage_word(pixel: vec2<u32>) -> f32 { return 0.0; }",
             ),
             include(
                 self.material_anchors,

@@ -63,5 +63,13 @@ pub use pattern_context::PatternContext;
 pub use projector_depth_cache::ProjectorDepthCache;
 pub use solo::solo_project;
 pub use store::{BakedMaps, ImageRes, ImageStore, PixelStore};
+
+/// The raw distance transforms of the distance filters (Bevel, Bevel Smooth, Directional
+/// Distance), so the GPU compositor's tests can compare its distances exactly. Not a stable API.
+#[doc(hidden)]
+pub mod distance_test_hooks {
+    pub use crate::distance_envelope::DistanceEnvelope;
+    pub use crate::shape_distance::{edge_distances, trail_distances};
+}
 pub use thumb::{THUMB_TEXELS, ThumbImage, ThumbTarget};
 pub use tile_pattern::{TileLayout, prepare_tile_layout};

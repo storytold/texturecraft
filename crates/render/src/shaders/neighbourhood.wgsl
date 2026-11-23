@@ -10,6 +10,8 @@ struct Params {
     // the GPU port packages (NeighbourhoodFilter::words).
     field_layout: vec4<u32>,
     extra: array<vec4<f32>, 2>, // The packages' parameters (NeighbourhoodFilter::extra).
+    // What the stage filters (stage_context), then reserved.
+    stage: vec4<u32>,
 }
 
 struct Texel {
@@ -33,6 +35,23 @@ fn word_at(offset: u32, position: vec2<u32>) -> u32 {
 fn input_at(position: vec2<u32>) -> f32 {
     if params.field_layout.y == 0u { return 0.0; }
     return bitcast<f32>(fields[word_at(params.buffers.x, position) + 5u]);
+}
+
+// What the stage filters (NeighbourhoodFilter::context): a mask, or content by channel kind.
+const STAGE_MASK: u32 = 0u;
+const STAGE_COLOR: u32 = 1u;
+const STAGE_SCALAR: u32 = 2u;
+const STAGE_SIGNED: u32 = 3u;
+const STAGE_NORMAL_MAP: u32 = 4u;
+
+fn stage_context() -> u32 {
+    return params.stage.x;
+}
+
+// The field's origin in source texels. It can lie below zero (a wrapping stage's field: the
+// prepare pass then fills it periodically), so read it signed.
+fn field_origin() -> vec2<i32> {
+    return bitcast<vec2<i32>>(params.rect.xy);
 }
 
 // Kinds 16..32 are P4's (neighbourhood_box.wgsl), 32..56 P5's (neighbourhood_gather.wgsl).
@@ -160,7 +179,7 @@ fn add_weighted(acc: Texel, point: vec2<i32>, weight: f32) -> Texel {
 // paint-window split does not shift filter effects.
 fn sample_field(acc: Texel, point: vec2<f32>) -> Texel {
     if !all(abs(point) <= vec2(3.402823466e38)) { return acc; }
-    let base = vec2<i32>(floor(point)) - vec2<i32>(params.rect.xy);
+    let base = vec2<i32>(floor(point)) - field_origin();
     let fraction = fract(point);
     let rest = 1.0 - fraction;
     var result = add_weighted(acc, base, rest.x * rest.y);
@@ -248,7 +267,7 @@ fn apply_neighbourhood(@builtin(global_invocation_id) id: vec3<u32>) {
                 filtered = filtered_box(original.value, blurred.value / blurred.coverage);
             }
         } else {
-            filtered = gathered(vec2<f32>(point + params.rect.xy), original.value);
+            filtered = gathered(vec2<f32>(vec2<i32>(point) + field_origin()), original.value);
         }
         filtered = original.value + (filtered - original.value) * params.weights.x;
     }
