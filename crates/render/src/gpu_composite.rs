@@ -946,9 +946,10 @@ impl CompositeProgram {
         if !set.uv_tiles.is_empty() {
             return Err("UDIM texture sets use CPU mask preview.");
         }
+        // Folders around the layer (an instance's own, as the CPU places it, or its source's) re-place its mask fills
+        let requested = owner;
         let owner = project.mask_owner(owner);
-        // Folders around the layer re-place its mask fills
-        if !project.contents_around(owner).is_none() {
+        if !project.contents_around(requested).is_none() || !project.contents_around(owner).is_none() {
             return Err("A mask inside a folder with Scale or Rotation uses CPU mask preview.");
         }
         let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
@@ -2945,8 +2946,12 @@ mod procedural_tests {
             Filter::SlopeBlur { radius: 64.0, scale: 6.0, seed: 11, divider: 1 },
             Filter::Mosaic { size: 64.0, alpha: true },
         ];
-        let cases = filters.into_iter().map(|filter| (filter, BlendMode::Normal)).chain([(Filter::Blur { radius: 64.0, wrap: false }, BlendMode::Replace)]);
-        for (filter, blend) in cases {
+        // A filter set to Disable leaves content alone; a mask filter applies whatever its blend
+        let cases = filters.into_iter().map(|filter| (filter, BlendMode::Normal, BlendMode::Normal)).chain([
+            (Filter::Blur { radius: 64.0, wrap: false }, BlendMode::Replace, BlendMode::Normal),
+            (Filter::Blur { radius: 64.0, wrap: false }, BlendMode::Normal, BlendMode::Disable),
+        ]);
+        for (filter, blend, effect_blend) in cases {
             let mut project = Project::new("Neighbourhood filters", "builtin:plane");
             project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
             let owner = project.alloc_id();
@@ -2958,6 +2963,7 @@ mod procedural_tests {
             for stack in [&mut layer.content_effects, &mut mask.effects] {
                 let mut effect = Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone()));
                 effect.opacity = 0.8;
+                effect.blend = effect_blend;
                 stack.push(effect);
                 stack.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Clamp { min: 0.18, max: 0.86 })));
                 stack.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false })));
@@ -2992,7 +2998,8 @@ mod procedural_tests {
             composite_tiles(&inputs, &mut oracle, &tiles);
             let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
             program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
-            assert_eq!(program.filters.stages.len(), 4);
+            // A disabled content filter is no stage
+            assert_eq!(program.filters.stages.len(), if effect_blend == BlendMode::Disable { 3 } else { 4 });
             gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
             let texture = gpu.renderer.display_textures()[0][DisplayKind::BaseColor as usize];
             let (_, _, full) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
@@ -3171,6 +3178,26 @@ mod procedural_tests {
         // A folder's Scale and Rotation re-place the fills inside it
         let (material, mask) = compile(None, None, ContentsOffset::new(2.0, 30.0));
         assert!(material.is_err() && mask.is_err(), "{material:?} {mask:?}");
+
+        // An instance inside such a folder draws its source's mask placed by the instance's folders
+        let mut project = Project::new("Instanced mask", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, 64));
+        let source = project.alloc_id();
+        let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.6, 0.3, 0.2]))]), ..Default::default() };
+        let mut layer = Layer::new(source, "Source", LayerKind::Fill(fill), &channels);
+        layer.mask = Some(Mask::new(MaskBackground::White));
+        project.insert_layer(0, layer, None, false).unwrap();
+        let folder_id = project.alloc_id();
+        let mut group = Layer::new(folder_id, "Folder", LayerKind::folder(), &channels);
+        if let LayerKind::Group { contents, .. } = &mut group.kind {
+            *contents = ContentsOffset::new(2.0, 30.0);
+        }
+        project.insert_layer(0, group, None, false).unwrap();
+        let instance = project.alloc_id();
+        project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source }, &channels), Some(folder_id), true).unwrap();
+        let pixels = PixelStore::default();
+        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, source, None, None).is_ok(), "the source itself sits outside the folder");
+        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, instance, None, None).is_err());
     }
 
     #[test]
@@ -3215,7 +3242,8 @@ mod procedural_tests {
         let levels = |clamp| Levels { in_low: 0.38, in_high: 0.52, gamma: 1.6, out_low: 0.1, out_high: 0.85, affects: None, clamp };
         let kinds = filters.into_iter().map(EffectKind::Filter).chain([EffectKind::Levels(levels(true)), EffectKind::Levels(levels(false))]);
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
-        for filter in kinds {
+        // Each once more set to Disable: content filters then change nothing, mask filters apply anyway
+        for (filter, disabled) in kinds.flat_map(|kind| [(kind.clone(), false), (kind, true)]) {
             let mut project = Project::new("Point filters", "builtin:plane");
             project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
             let owner = project.alloc_id();
@@ -3223,6 +3251,9 @@ mod procedural_tests {
             let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
             let mut effect = Effect::new(project.alloc_id(), filter.clone());
             effect.opacity = 0.77;
+            if disabled {
+                effect.blend = BlendMode::Disable;
+            }
             layer.content_effects.push(effect);
             let mut mask = Mask::new(MaskBackground::Black);
             mask.effects.push(Effect::new(
@@ -3231,7 +3262,7 @@ mod procedural_tests {
             ));
             let mut effect = Effect::new(project.alloc_id(), filter.clone());
             effect.opacity = 0.63;
-            effect.blend = BlendMode::Multiply;
+            effect.blend = if disabled { BlendMode::Disable } else { BlendMode::Multiply };
             mask.effects.push(effect);
             layer.mask = Some(mask);
             project.insert_layer(0, layer, None, false).unwrap();
@@ -3262,10 +3293,10 @@ mod procedural_tests {
                     for (actual, expected) in actual.as_chunks::<2>().0.iter().zip(expected.as_chunks::<2>().0) {
                         let actual = half::f16::from_le_bytes(*actual).to_f32();
                         let expected = half::f16::from_le_bytes(*expected).to_f32();
-                        assert!((actual - expected).abs() <= 0.001, "{filter:?} {kind:?}: GPU {actual} vs CPU {expected}");
+                        assert!((actual - expected).abs() <= 0.001, "{filter:?} disabled {disabled} {kind:?}: GPU {actual} vs CPU {expected}");
                     }
                 } else {
-                    assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1), "{filter:?} {kind:?}");
+                    assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1), "{filter:?} disabled {disabled} {kind:?}");
                 }
             }
 
@@ -3277,7 +3308,7 @@ mod procedural_tests {
             let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
             assert_eq!(rgba.len(), expected.len() * 4);
             for (&expected, &[r, g, b, a]) in expected.iter().zip(rgba.as_chunks::<4>().0) {
-                assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255, "{filter:?} mask: GPU {r} vs CPU {expected}");
+                assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255, "{filter:?} disabled {disabled} mask: GPU {r} vs CPU {expected}");
             }
         }
     }
