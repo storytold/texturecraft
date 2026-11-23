@@ -55,8 +55,8 @@ fn stack_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
 }
 fn stack_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 { return stack_scalar_filter(effect, mask); }
 fn stage_input_value(op: Operation, texel: LayerTexel) -> f32 { return base_content(op, texel).x; }
-fn stack_soft_compare(op: Operation, mask: f32) -> f32 { return scalar_filter(op, mask); }
-fn stack_color_selection(effect: Operation, pixel: vec2<u32>) -> vec2<f32> { return vec2(color_selection(effect, pixel), 1.0); }";
+fn stack_soft_compare(op: Operation, mask: f32) -> f32 { return mask; }
+fn stack_color_selection(effect: Operation, pixel: vec2<u32>) -> vec2<f32> { return vec2(0.0, 1.0); }";
 
 /// `Operation::ext[2]` flag of a mask comparison or colour selection with a soft edge, an output
 /// or a background (`composite_mask_effects.wgsl` then calls this package's functions).

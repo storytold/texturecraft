@@ -1058,7 +1058,7 @@ impl CompositeProgram {
         let mask = mask.ok_or("The layer has no enabled mask.")?;
         if mask.effects.iter().any(|effect| effect.visible && !effect.kind.anchors_read().is_empty()) {
             // The material program keeps one draw per layer, which need not sit where the requested one does
-            if project.layers.values().any(|layer| matches!(&layer.kind, LayerKind::Group { contents, .. } if !contents.is_none())) {
+            if project.render_tree(&set.stack).iter().any(|&id| !project.contents_offset(id).is_none()) {
                 return Err("A mask reading anchors inside a folder with Scale or Rotation uses CPU mask preview.");
             }
             let mut program = Self::try_compile_with_brush(project, pixels, ts, region, brush)?;
