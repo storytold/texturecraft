@@ -808,10 +808,11 @@ impl CompositeProgram {
             }
             let mut content_anchors = Vec::new();
             let mut visible_cut = 0u32;
-            let per_channel = layer.content_effects.iter().any(|effect| effect.visible && content_depends_on_channel(effect));
+            let per_channel =
+                layer.content_effects.iter().any(|effect| effect.visible && (content_depends_on_channel(effect) || blends_per_channel(effect)));
             let mut templates = Vec::new();
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
-                if let Some(reason) = effect_needs_cpu(effect, true) {
+                if let Some(reason) = effect_needs_cpu(effect) {
                     return Err(reason);
                 }
                 if matches!(effect.kind, EffectKind::Anchor) {
@@ -819,16 +820,32 @@ impl CompositeProgram {
                     continue;
                 }
                 visible_cut += 1;
-                let op = if content_depends_on_channel(effect) {
+
+                // A filter laid on each channel apart is lowered once per channel of the set
+                let channel_ops = if blends_per_channel(effect) && !content_depends_on_channel(effect) {
+                    let mut ops = BTreeMap::new();
+                    for &(channel, _) in &set.channels {
+                        let op = channel_filter(effect, channel, &mut procedural).ok_or("A layer effect uses CPU compositing.")?;
+                        ops.insert(channel, (procedural.preceding_stage.take(), op));
+                    }
+                    Some(ops)
+                } else {
+                    None
+                };
+                let op = if content_depends_on_channel(effect) || channel_ops.is_some() {
                     None
                 } else {
                     Some(content_filter(effect, &mut procedural).ok_or("A layer effect uses CPU compositing.")?)
                 };
-                // A lowering with a stage before its operation takes two operations
-                let stage = procedural.preceding_stage.take();
+
+                // A lowering with a stage before its operation takes two operations, on every channel alike
+                let mut stage = procedural.preceding_stage.take();
+                if channel_ops.as_ref().is_some_and(|ops| ops.values().any(|(channel_stage, _)| channel_stage.is_some())) {
+                    stage = Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() });
+                }
                 visible_cut += u32::from(stage.is_some());
                 if per_channel {
-                    templates.push((effect, stage, op));
+                    templates.push((effect, stage, op, channel_ops));
                 } else if let Some(op) = op {
                     effects.extend(stage);
                     effects.push(op);
@@ -870,7 +887,12 @@ impl CompositeProgram {
                 };
                 let content_start = if per_channel { effects.len() as u32 } else { shared_content };
                 let mut adds_coverage = false;
-                for &(effect, stage, template) in &templates {
+                for (effect, shared_stage, shared_template, channel_ops) in &templates {
+                    // A channel without a stage of its own keeps the placeholder, so an anchor's content cut holds on every channel
+                    let (stage, template) = match channel_ops.as_ref().and_then(|ops| ops.get(&channel)) {
+                        Some((channel_stage, op)) => (shared_stage.map(|placeholder| channel_stage.unwrap_or(placeholder)), Some(*op)),
+                        None => (*shared_stage, *shared_template),
+                    };
                     effects.extend(stage);
                     let op = if let Some(op) = template {
                         op
@@ -1139,26 +1161,49 @@ fn content_filter(effect: &Effect, procedural: &mut ProceduralInputs) -> Option<
     match &effect.kind {
         // A mask-only effect authored in this stack leaves its content alone.
         EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection(_) | EffectKind::Compare { .. } => Some(noop),
-        // Levels limited to one channel would need a program per channel
-        EffectKind::Levels(levels) if levels.affects.is_some() => None,
         // A blending effect set to Disable leaves the content as it is
         kind if kind.blends() && effect.blend == BlendMode::Disable && uniform_blend(effect) => Some(noop),
         _ => point_effect(effect, procedural),
     }
 }
 
-/// Whether the effect blends every channel alike: the GPU program reads one blend mode and opacity per effect
+/// Whether the effect blends every channel alike: one operation then serves every channel
 fn uniform_blend(effect: &Effect) -> bool {
     effect.channel_blends.is_empty() && effect.off_channels.is_empty()
 }
 
-/// Settings of a content effect the GPU program does not model: per-channel blends, channels
-/// switched off, and image inputs its filter reads. A mask ignores per-channel blends (it blends
-/// by [`Effect::blend_of`] with no channel), so a mask effect is checked with `content` false.
-fn effect_needs_cpu(effect: &Effect, content: bool) -> Option<&'static str> {
-    if content && !uniform_blend(effect) {
-        return Some("An effect with per-channel blending uses CPU compositing.");
+/// Whether a content effect lays onto each channel apart: per-channel blends, switched-off
+/// channels, or Levels remapping one channel only (`Levels::affects`).
+fn blends_per_channel(effect: &Effect) -> bool {
+    !uniform_blend(effect) || matches!(&effect.kind, EffectKind::Levels(levels) if levels.affects.is_some())
+}
+
+/// A content filter's operation on `channel`: lowered with the channel's own blend and opacity
+/// ([`Effect::applied_blend`], none on a switched-off channel), and Levels only on the channel it
+/// remaps, as the CPU's `content_effect` lays it on.
+fn channel_filter(effect: &Effect, channel: Channel, procedural: &mut ProceduralInputs) -> Option<Operation> {
+    if let EffectKind::Levels(levels) = &effect.kind
+        && !levels.remaps(channel)
+    {
+        return Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() });
     }
+
+    let blend = effect.applied_blend(Some(channel));
+    let mut on_channel = effect.clone();
+    on_channel.blend = blend.mode;
+    on_channel.opacity = blend.opacity;
+    on_channel.channel_blends.clear();
+    on_channel.off_channels.clear();
+    if let EffectKind::Levels(levels) = &mut on_channel.kind {
+        levels.affects = None;
+    }
+    content_filter(&on_channel, procedural)
+}
+
+/// Settings of an effect the GPU program does not model: image inputs its filter reads. A mask
+/// ignores per-channel blends (it blends by [`Effect::blend_of`] with no channel), and content
+/// effects lay them on per channel ([`channel_filter`], [`content_deposit`]).
+fn effect_needs_cpu(effect: &Effect) -> Option<&'static str> {
     if reads_image_input(effect) {
         return Some("An effect with an image input uses CPU compositing.");
     }
@@ -1179,11 +1224,14 @@ fn content_deposit(
     brush: Option<&LiveBrush>,
     (paint, procedural, tile_patterns): (&mut PaintInputs, &mut ProceduralInputs, &mut TilePatterns),
 ) -> Result<Option<Operation>, &'static str> {
-    if !effect.opacity.is_finite() {
+    // The channel's own blend, at no opacity where the effect is switched off
+    let blend = effect.applied_blend(Some(channel));
+    if !blend.opacity.is_finite() {
         return Err("A content effect has an invalid opacity.");
     }
+
     // A deposit set to Disable leaves the content and its coverage as they are
-    if effect.opacity <= 0.0 || effect.blend == BlendMode::Disable {
+    if blend.opacity <= 0.0 || blend.mode == BlendMode::Disable {
         return Ok(None);
     }
     let mut op = if let EffectKind::Material(fill) = &effect.kind {
@@ -1204,8 +1252,8 @@ fn content_deposit(
         }
         content_paint(effect.id, channel, image, value, brush.is_some_and(|brush| brush.stencil.is_some()), paint)
     };
-    op.low[3] = effect.opacity.min(1.0);
-    op.balance[2] = blend_code(effect.blend) as f32;
+    op.low[3] = blend.opacity.min(1.0);
+    op.balance[2] = blend_code(blend.mode) as f32;
     Ok(Some(op))
 }
 
@@ -1218,7 +1266,7 @@ fn compile_mask(
 ) -> Result<f32, &'static str> {
     let Some(mask) = mask else { return Ok(1.0) };
     for effect in mask.effects.iter().filter(|e| e.visible) {
-        if let Some(reason) = effect_needs_cpu(effect, false) {
+        if let Some(reason) = effect_needs_cpu(effect) {
             return Err(reason);
         }
         let mut op = match &effect.kind {

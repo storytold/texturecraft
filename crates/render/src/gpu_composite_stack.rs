@@ -40,9 +40,8 @@ use super::CompositeProgram;
 use super::packages::{STACK_OP_BITS, STACK_OPCODES};
 
 /// Library filter ids P3 still leaves on the CPU (filters whose only blocker is a P3 setting are
-/// listed under the package that ports the filter). A content Levels from the library remaps Base
-/// Color only (`affects`, engine/src/mask_cmds.rs), so every new one falls back today.
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["levels"];
+/// listed under the package that ports the filter).
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_stack.wgsl");
 /// The same functions without P3's code, for programs that do not use it.
@@ -69,15 +68,18 @@ pub(super) fn band_uniform(_program: &CompositeProgram) -> [u32; 4] {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-    use texturecraft_compose::PixelStore;
+    use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
-        BlendMode, Channel, ChannelBlend, ColorSelection, CompareOp, CompareSource, ContentsOffset, EffectKind, Fill, Filter, Layer, LayerKind, Levels, Mask,
-        MaskBackground, Project, SelectionBackground, Source, TextureSet,
+        BlendMode, Channel, ChannelBlend, ColorSelection, CompareOp, CompareSource, ContentsOffset, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind,
+        Levels, Mask, MaskBackground, Project, Projection, Sampling, SelectionBackground, Source, TextureSet,
     };
+    use texturecraft_geom::primitives;
+    use texturecraft_texel::{TILE, to_u16, to_u16_signed};
 
-    use crate::gpu_composite::oracle::{compile_effects, effect};
-    use crate::gpu_composite::{CompositeProgram, effect_needs_cpu, reads_image_input};
+    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
+    use crate::gpu_composite::{CompositeProgram, CompositeRegion, effect_needs_cpu, reads_image_input};
 
     /// P3's effect settings that still composite on the CPU. Port one: delete its row or block
     /// (these tests fail while a ported case stays) and add its oracle test.
@@ -85,24 +87,11 @@ mod tests {
     fn stack_settings_still_on_the_cpu_fall_back() {
         let none = ContentsOffset::NONE;
 
-        // Levels limited to one channel of the content
-        let one_channel = Levels { affects: Some(Channel::Height), ..Levels::default() };
-        assert!(compile_effects(Some(effect(EffectKind::Levels(one_channel))), None, none).0.is_err());
-
-        // Per-channel blends and channels switched off on content effects
-        let mut per_channel = effect(EffectKind::Filter(Filter::Invert));
-        per_channel.channel_blends.insert(Channel::Height, ChannelBlend { mode: BlendMode::Multiply, opacity: 0.5 });
-        let mut switched_off = effect(EffectKind::Filter(Filter::Invert));
-        switched_off.off_channels.insert(Channel::Height);
-        for effect in [per_channel, switched_off] {
-            assert!(compile_effects(Some(effect.clone()), None, none).0.is_err(), "{effect:?}");
-        }
-
         // Only an input the filter reads counts: Grayscale Conversion reads its Custom Input once switched on
         let conversion = texturecraft_core::GrayscaleConversion { custom_input: true, ..texturecraft_core::GrayscaleConversion::LIBRARY };
         let mut reads_input = effect(EffectKind::Filter(Filter::GrayscaleConversion(conversion)));
         reads_input.inputs.insert(texturecraft_core::ImageInput::CUSTOM_INPUT.id.into(), Source::Uniform([0.5; 3]));
-        assert!(effect_needs_cpu(&reads_input, false).is_some() && reads_image_input(&reads_input));
+        assert!(effect_needs_cpu(&reads_input).is_some() && reads_image_input(&reads_input));
 
         // Mask comparisons reading layers or with a soft edge, and soft or ID-map colour selections
         let compare = |left, hardness| EffectKind::Compare {
@@ -192,5 +181,102 @@ mod tests {
         project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source }, &channels), Some(folder_id), true).unwrap();
         let pixels = PixelStore::default();
         assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, instance, None, None).is_err());
+    }
+
+    /// A paint layer with colour, roughness and height painted in a block (so a filter's halo
+    /// shows), `content` on its content and `mask` after a gray fill in its black mask.
+    fn painted_layer(content: Vec<Effect>, mask: Vec<Effect>) -> (Project, PixelStore, LayerId) {
+        const SIZE: u32 = TILE * 2;
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height];
+        let mut project = Project::new("Per-channel effects", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "Surface", LayerKind::Paint, &channels);
+        layer.content_effects = content;
+        let mut layer_mask = Mask::new(MaskBackground::Black);
+        let fill = EffectKind::Fill { source: Source::Uniform([0.36; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE };
+        layer_mask.effects.push(Effect::new(project.alloc_id(), fill));
+        layer_mask.effects.extend(mask);
+        layer.mask = Some(layer_mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+
+        let mut pixels = PixelStore::default();
+        for y in 22..103 {
+            for x in 23..98 {
+                let gain = if x >= 63 { 1.0 } else { 0.65 };
+                pixels.layer_mut(owner, Channel::BaseColor, (SIZE, SIZE)).set(x, y, &[to_u16(0.7 * gain), to_u16(0.2 * gain), to_u16(0.3 * gain), to_u16(gain)]);
+                pixels.layer_mut(owner, Channel::Roughness, (SIZE, SIZE)).set(x, y, &[to_u16(0.41 * gain), to_u16(gain)]);
+                pixels.layer_mut(owner, Channel::Height, (SIZE, SIZE)).set(x, y, &[to_u16_signed(-0.34 * gain), to_u16(gain)]);
+            }
+        }
+        (project, pixels, owner)
+    }
+
+    /// Content effects laid on each channel apart (per-channel blends, switched-off channels,
+    /// Levels remapping one channel) match the CPU on colour and the other channels, alone and
+    /// chained, around a neighbourhood stage with a partial update, and in the mask, which
+    /// ignores the per-channel settings.
+    #[test]
+    fn content_effects_laid_on_each_channel_apart_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let with = |kind: EffectKind, opacity: f32, blends: &[(Channel, BlendMode, f32)], off: &[Channel]| {
+            let mut effect = effect(kind);
+            effect.opacity = opacity;
+            effect.channel_blends.extend(blends.iter().map(|&(channel, mode, opacity)| (channel, ChannelBlend { mode, opacity })));
+            effect.off_channels.extend(off.iter().copied());
+            effect
+        };
+        let levels = |affects| Levels { in_low: 0.2, in_high: 0.8, gamma: 1.6, out_low: 0.1, out_high: 0.85, affects, clamp: false };
+        let invert = || EffectKind::Filter(Filter::Invert);
+        let contrast = EffectKind::Filter(Filter::ContrastLuminosity { contrast: 0.4, luminosity: 0.05 });
+        let material = EffectKind::Material(Fill {
+            sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.2, 0.6, 0.35])), (Channel::Roughness, Source::Uniform([0.8; 3]))]),
+            ..Default::default()
+        });
+        let blur = EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false });
+
+        let cases: Vec<(&str, Vec<Effect>, Tolerance)> = vec![
+            ("per-channel multiply", vec![with(invert(), 0.77, &[(Channel::Height, BlendMode::Multiply, 0.5)], &[])], Tolerance::POINT),
+            ("switched off", vec![with(invert(), 0.77, &[], &[Channel::Roughness])], Tolerance::POINT),
+            ("disabled on colour", vec![with(invert(), 1.0, &[(Channel::BaseColor, BlendMode::Disable, 1.0)], &[])], Tolerance::POINT),
+            ("levels on height", vec![with(EffectKind::Levels(levels(Some(Channel::Height))), 0.6, &[], &[])], Tolerance::POINT),
+            ("levels on colour", vec![with(EffectKind::Levels(levels(Some(Channel::BaseColor))), 1.0, &[], &[])], Tolerance::POINT),
+            ("library levels", vec![with(EffectKind::Levels(Levels { affects: Some(Channel::BaseColor), ..Levels::default() }), 1.0, &[], &[])], Tolerance::POINT),
+            // Levels does not blend, so Disable leaves it on
+            ("levels disabled", vec![with(EffectKind::Levels(levels(Some(Channel::Roughness))), 0.7, &[(Channel::Roughness, BlendMode::Disable, 0.7)], &[])], Tolerance::POINT),
+            (
+                "chained",
+                vec![
+                    with(contrast.clone(), 0.8, &[(Channel::Roughness, BlendMode::Normal, 0.3)], &[]),
+                    with(EffectKind::Levels(levels(Some(Channel::BaseColor))), 0.9, &[], &[]),
+                    with(invert(), 0.5, &[], &[Channel::Height]),
+                ],
+                Tolerance::POINT,
+            ),
+            (
+                "material deposit",
+                vec![with(material, 0.8, &[(Channel::BaseColor, BlendMode::Multiply, 0.6)], &[Channel::Roughness]), with(invert(), 0.4, &[], &[])],
+                Tolerance::POINT,
+            ),
+            (
+                "neighbourhood stage",
+                vec![
+                    with(blur, 0.9, &[(Channel::Roughness, BlendMode::Normal, 0.3), (Channel::BaseColor, BlendMode::Disable, 1.0)], &[Channel::Height]),
+                    with(contrast, 1.0, &[], &[]),
+                ],
+                Tolerance::NEIGHBOURHOOD,
+            ),
+        ];
+        for (label, content, tolerance) in cases {
+            // The mask takes the same filters (a material is content only)
+            let mask = content.iter().filter(|effect| !matches!(effect.kind, EffectKind::Material(_))).cloned().collect();
+            let (project, pixels, owner) = painted_layer(content, mask);
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
+            assert_matches_cpu(&mut gpu, &case, tolerance, label);
+        }
     }
 }
