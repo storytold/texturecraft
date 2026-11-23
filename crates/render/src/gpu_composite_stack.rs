@@ -40,8 +40,9 @@ use super::CompositeProgram;
 use super::packages::{STACK_OP_BITS, STACK_OPCODES};
 
 /// Library filter ids P3 still leaves on the CPU (filters whose only blocker is a P3 setting are
-/// listed under the package that ports the filter).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
+/// listed under the package that ports the filter). A content Levels from the library remaps Base
+/// Color only (`affects`, engine/src/mask_cmds.rs), so every new one falls back today.
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["levels"];
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_stack.wgsl");
 /// The same functions without P3's code, for programs that do not use it.

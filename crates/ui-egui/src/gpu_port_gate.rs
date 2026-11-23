@@ -21,7 +21,7 @@ use texturecraft_render::gpu_composite::{CompositeProgram, library_filters_still
 /// Why library filter `id` added to a fill layer (its content, or its mask) is not composited on
 /// the GPU, or None when it is.
 fn cpu_reason(id: &str, mask: bool) -> Option<String> {
-    let mut session = Session::new_project("Library gate", primitives::plane(1.0, 1), "builtin:plane", None, 64).unwrap();
+    let mut session = Session::new_project("Library gate", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
     let added = execute(&mut session, "layer.add.fill", &json!({"color": [0.6, 0.3, 0.2]})).unwrap();
     let layer = LayerId(added["layer"].as_u64().unwrap());
     // A signed Height source next to the colour, so a filter that falls back only on Height counts
