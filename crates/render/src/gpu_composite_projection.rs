@@ -278,8 +278,6 @@ fn still_on_cpu(projection: &Projection, sampling: Sampling, op: &Operation) -> 
     let projector = projector_of(projection);
     let reads_image = op.ids[1] == IMAGE_SOURCE_OPCODE || projection.placed().is_some();
     (sampling.filtering == Filtering::BilinearHq && reads_image)
-        || uv_transform_of(projection).is_some_and(|uv| !uv.is_default())
-        || projector.is_some_and(Projector::turns)
         || projector.is_some_and(|projector| projector.crop != ShapeCrop::ExtendsOutside || projector.backface.on || projector.ignore_image_alpha)
         || (sampling.symmetry.on && projection.takes_symmetry())
         || matches!(projection, Projection::Warp { .. })
@@ -668,20 +666,6 @@ mod tests {
         let fill = |source: &Source, projection: Projection, sampling: Sampling| EffectKind::Fill { source: source.clone(), projection, sampling };
         let mirror = FillSymmetry { on: true, ..FillSymmetry::OFF };
         let radial = FillSymmetry { on: true, kind: SymmetryKind::Radial, axis: 1, count: 5, ..FillSymmetry::OFF };
-        let placed_uv = Projection::Triplanar {
-            scale: 1.0,
-            sharpness: 4.0,
-            offset: [0.0; 3],
-            uv: UvTransform { tiling: [1.5, 0.5], rotation: 20.0, offset: [0.1, 0.2] },
-            projector: Projector::default(),
-        };
-        let turned = Projection::Triplanar {
-            scale: 1.0,
-            sharpness: 4.0,
-            offset: [0.0; 3],
-            uv: UvTransform::default(),
-            projector: Projector { rotation: [20.0, 0.0, 0.0], ..Projector::default() },
-        };
         let cropped = Projection::Spherical {
             scale: 1.0,
             uv: UvTransform::default(),
@@ -698,8 +682,6 @@ mod tests {
         };
         let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
         vec![
-            fill(&uniform, placed_uv, sharp),
-            fill(&uniform, turned, sharp),
             fill(&uniform, cropped, sharp),
             fill(&uniform, backface, sharp),
             fill(&uniform, planar(Projector::default()), Sampling { symmetry: mirror, ..sharp }),
@@ -798,6 +780,47 @@ mod tests {
                 Projection::Cylindrical { scale: 1.1, axis, uv: UvTransform::default(), offset: [0.05, 0.1, -0.1], projector: Projector::default(), angle };
             let label = format!("cylindrical axis {axis} over {angle} degrees");
             assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, Tolerance::BILINEAR, &label);
+        }
+    }
+
+    /// The 3D projections that turn the CPU's way, every one of them with a UV transformation
+    /// and a projector turned and stretched
+    fn turned_projections(uv: UvTransform, projector: Projector) -> [(&'static str, Projection); 6] {
+        [
+            ("tri-planar", Projection::Triplanar { scale: 0.8, sharpness: 5.0, offset: [0.2, -0.1, 0.3], uv, projector }),
+            ("planar X", Projection::Planar { scale: 0.9, axis: 0, offset: [0.1, 0.2, -0.1], uv, projector, placed: None }),
+            ("planar Y", Projection::Planar { scale: 1.2, axis: 1, offset: [-0.2, 0.1, 0.3], uv, projector, placed: None }),
+            ("planar Z", Projection::Planar { scale: 0.7, axis: 2, offset: [0.3, -0.3, 0.0], uv, projector, placed: None }),
+            ("spherical", Projection::Spherical { scale: 1.3, uv, offset: [0.1, 0.0, -0.2], projector }),
+            ("cylindrical", Projection::Cylindrical { scale: 1.1, axis: 2, uv, offset: [0.0, 0.2, 0.1], projector, angle: 200.0 }),
+        ]
+    }
+
+    /// A UV transformation tiles, turns and moves the source on every 3D projection
+    #[test]
+    fn uv_transformations_match_the_cpu() {
+        let mut gpu = headless();
+        let uv = UvTransform { tiling: [1.7, 0.6], rotation: 23.0, offset: [0.11, -0.3] };
+        for (label, projection) in turned_projections(uv, Projector::default()) {
+            assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, Tolerance::BILINEAR, &format!("UV transformation {label}"));
+        }
+    }
+
+    /// A projector's rotation and per-axis scale (one of them flipped) turn and stretch every 3D
+    /// projection, alone and with a UV transformation
+    #[test]
+    fn projector_rotation_and_scale_match_the_cpu() {
+        let mut gpu = headless();
+        let uv = UvTransform { tiling: [0.8, 1.4], rotation: -35.0, offset: [0.2, 0.05] };
+        let rotated = Projector { rotation: [20.0, 35.0, -10.0], ..Projector::default() };
+        let stretched = Projector { scale: [1.2, -0.8, 0.6], ..Projector::default() };
+        let both = Projector { rotation: [-15.0, 60.0, 5.0], scale: [0.7, 1.3, 1.1], ..Projector::default() };
+        for (name, projector, uv) in
+            [("rotated", rotated, UvTransform::default()), ("stretched", stretched, UvTransform::default()), ("turned and placed", both, uv)]
+        {
+            for (label, projection) in turned_projections(uv, projector) {
+                assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, Tolerance::BILINEAR, &format!("{name} {label}"));
+            }
         }
     }
 
