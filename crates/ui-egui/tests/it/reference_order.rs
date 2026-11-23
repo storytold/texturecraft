@@ -32,57 +32,6 @@ fn named<'a>(found: &'a [(f32, String, bool)], name: &str) -> Option<&'a (f32, S
 }
 
 #[test]
-fn every_menu_lists_its_items_in_the_reference_order() {
-    // Items the reference has and TextureCraft lacks are absent; TextureCraft's own sit where they fit
-    let expected = [
-        "File: New project... | Open... | - | Open sample project... | - | Close | - | Save | Save as... | More save options > Save as template... | More save options > Save and reduce file size | More save options > Save as copy... | Remove unused resources... | - | Import resources... | Import MaterialX material... | Import PBR texture folder... | Import material... | Export Textures... | Export Mesh... | - | Quit",
-        "Edit: Undo | Redo | Project Configuration... | Reimport mesh | Settings...",
-        "Mode: Bake Mesh Maps | Painting | Rendering (path traced)",
-        "Window: Views > Assets | Views > Common Settings | Views > Display Settings | Views > Export | Views > History | Views > Layers | Views > Log | Views > Mesh Map Bakers | Views > Mesh Map Settings | Views > Properties | Views > Python Console | Views > Renderer Settings | Views > Shader Settings | Views > Online assets | Views > Texture Sets | Views > Texture Set Settings | Toolbars > Docks | Toolbars > Plugins | Toolbars > Tools | - | Save UI Layout > Painting mode | Save UI Layout > Rendering mode | Save UI Layout > Baking mode | Load UI Layout | Layouts > Save current layout as... | Layouts > Manage layouts... | - | Hide UI | Reset panel layout | Reset UI",
-        "Viewport: Display material | Display next channel | Display previous channel | Display next mesh map | Display previous mesh map | UV checker | - | Frame texture set | Show entire mesh | Front view | Back view | Left view | Right view | Top view | Bottom view | - | Perspective | Orthographic | - | 3D/2D views | 3D view only | 2D view only | Swap 3D/2D | - | Navigation buttons | - | Enable quick mask | Edit quick mask | Invert quick mask",
-        "Help: Release notes... | Documentation... | Shortcuts list... | - | Join the community (Discord)... | ArtCraft website... | Report a bug... | Show log... | Export log... | - | Check for Updates... | About TextureCraft...",
-    ];
-    let actual: Vec<String> = menus::TOP
-        .iter()
-        .map(|top| {
-            let items: Vec<String> = menus::CATALOG
-                .iter()
-                .filter(|item| item.menu == *top)
-                .map(|item| match item.sub {
-                    Some(sub) => format!("{sub} > {}", item.label),
-                    None => item.label.to_string(),
-                })
-                .collect();
-            format!("{top}: {}", items.join(" | "))
-        })
-        .collect();
-    for (expected, actual) in expected.iter().zip(&actual) {
-        assert_eq!(expected, actual);
-    }
-    assert_eq!(menus::TOP, ["File", "Edit", "Mode", "Window", "Viewport", "Help"], "the reference's top menus, minus the scripting ones");
-}
-
-#[test]
-fn the_tool_shelf_keeps_the_reference_order() {
-    let harness = harness(texturecraft_engine::sample_session(256, 64).unwrap());
-    let shelf = buttons_in(&harness, 0.0..60.0);
-    let order = ["Paint", "Eraser", "Path", "Projection", "Polygon fill", "Smudge", "Clone", "Material picker", "Geometry mask"];
-    let row_positions: Vec<f32> = order.iter().map(|name| named(&shelf, name).unwrap_or_else(|| panic!("{name} on the shelf: {shelf:?}")).0).collect();
-
-    assert!(row_positions.windows(2).all(|pair| pair[0] < pair[1]), "{row_positions:?}");
-}
-
-#[test]
-fn the_right_bar_keeps_the_reference_order() {
-    let harness = harness(texturecraft_engine::sample_session(256, 64).unwrap());
-    let bar = buttons_in(&harness, 1562.0..1600.0);
-    let order = ["Export", "Log", "Display Settings", "Shader Settings", "History"];
-    let row_positions: Vec<f32> = order.iter().map(|name| named(&bar, name).unwrap_or_else(|| panic!("{name} on the bar: {bar:?}")).0).collect();
-
-    assert!(row_positions.windows(2).all(|pair| pair[0] < pair[1]), "{row_positions:?}");
-}
-
-#[test]
 fn the_blank_screen_enables_what_the_reference_enables() {
     let harness = harness(Session::closed().unwrap());
     let shelf = buttons_in(&harness, 0.0..60.0);

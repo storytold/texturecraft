@@ -9,6 +9,8 @@ use texturecraft_engine::core::{Channel, LayerId};
 use texturecraft_engine::{StackTarget, execute};
 use texturecraft_ui_egui::TextureCraftApp;
 
+use crate::SETTLE_FRAMES;
+
 fn id(v: Value, key: &str) -> u64 {
     v[key].as_u64().unwrap()
 }
@@ -266,13 +268,7 @@ fn layer_toolbar_stays_on_one_row_in_a_1280_by_800_window() {
     let h = narrow_harness();
     let buttons = ["Add paint layer", "Add fill layer", "Add folder"].map(|label| h.get_by_label(label).rect());
 
-    // The effect menu button is the wand left of the paint button (effect rows draw wands too)
-    let wand = h
-        .query_all_by_label(egui_phosphor::regular::MAGIC_WAND)
-        .map(|n| n.rect())
-        .filter(|r| r.right() < buttons[0].left())
-        .max_by(|a, b| a.right().total_cmp(&b.right()))
-        .expect("the effect menu button");
+    let wand = h.get_by_label("Add effect").rect();
     let remove = h.query_all_by_label_contains("Remove layer").next().expect("the remove button").rect();
     for rect in buttons.into_iter().chain([remove]) {
         assert!((rect.center().y - wand.center().y).abs() < 1.0, "the toolbar wrapped: {rect:?} against {wand:?}");
@@ -412,5 +408,44 @@ fn alt_click_on_the_content_thumbnail_leaves_the_view_alone() {
     let (mut h, _) = harness();
     let at = thumb(&h, "Masked fill", false);
     alt_click(&mut h, at);
+
     assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Material);
+}
+
+/// Pointer moves of the opacity cell drag, one per frame
+const OPACITY_DRAG_MOVES: usize = 4;
+
+/// How far left each move of the opacity cell drag goes, in points
+const OPACITY_DRAG_STEP: f32 = 10.0;
+
+/// A drag on a row's opacity cell is one undo step, however many frames it spans
+#[test]
+fn dragging_a_row_opacity_adds_one_undo_step() {
+    let (mut h, layer) = harness();
+    let row = h.get_by_label("Masked fill").rect();
+    let cell = h.get_all_by_role(egui::accesskit::Role::SpinButton).map(|node| node.rect()).find(|cell| row.contains(cell.center())).unwrap();
+    let opacity = |h: &Harness<'_, TextureCraftApp>| h.state().session.doc.project.layers[&layer].blend(Channel::BaseColor).unwrap().opacity;
+    let (before, steps) = (opacity(&h), h.state().session.history_labels().len());
+
+    // A leftward drag lowers it from 100 %, a frame per move as a real drag arrives
+    let from = cell.center();
+    h.hover_at(from);
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    let step_left = |step: usize| from - egui::vec2(OPACITY_DRAG_STEP * step as f32, 0.0);
+    for step in 1..=OPACITY_DRAG_MOVES {
+        h.hover_at(step_left(step));
+        h.run_steps(1);
+    }
+    h.event(egui::Event::PointerButton {
+        pos: step_left(OPACITY_DRAG_MOVES),
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(SETTLE_FRAMES);
+
+    assert!(opacity(&h) < before, "the drag lowers the opacity: {}", opacity(&h));
+    assert_eq!(h.state().session.history_labels().len(), steps + 1, "every frame of the drag merges into one step");
 }

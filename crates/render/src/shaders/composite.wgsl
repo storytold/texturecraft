@@ -358,8 +358,14 @@ fn replace_color(op: Operation, c: vec3<f32>) -> vec3<f32> {
 fn scalar_filter(op: Operation, x: f32) -> f32 {
     switch op.ids.y {
         case 20u: {
-            let t = clamp((x - op.low.x) / max(op.low.y - op.low.x, 1e-5), 0.0, 1.0);
-            return lerp(op.high.x, op.high.y, pow(t, 1.0 / max(op.low.z, 1e-3)));
+            // Levels: high.z is 1 when it clamps; unclamped, values outside the input range stay on the line through it
+            let range = op.low.y - op.low.x;
+            let between = (x - op.low.x) / select(1e-5, range, range > 0.0);
+            var t = between;
+            if op.high.z > 0.5 || (between >= 0.0 && between <= 1.0) {
+                t = pow(clamp(between, 0.0, 1.0), 1.0 / max(op.low.z, 1e-3));
+            }
+            return lerp(op.high.x, op.high.y, t);
         }
         case 21u: { return 1.0 - x; }
         case 22u: { return select(0.0, 1.0, x >= op.low.x); }

@@ -128,6 +128,20 @@ impl PropertySheet<'_> {
         response
     }
 
+    /// [`Self::dropdown`] whose list holds its options in groups, each under its caption, built only while the list is open; returns the picked option
+    pub(crate) fn grouped_dropdown<'g, T: Copy + PartialEq, Groups: IntoIterator<Item = (&'g str, Vec<T>)>>(
+        &mut self,
+        label: &str,
+        current: T,
+        groups: impl FnOnce() -> Groups,
+        name: impl Fn(T) -> String,
+        picture: ChoicePicture<'_, T>,
+    ) -> Option<T> {
+        let response = self.dropdown_row(RowLead::label(label), current, &name, Some(picture));
+        let captioned = || groups().into_iter().map(|(caption, options)| (Some(caption), options));
+        self.hanging_groups(&response, current, captioned, &name, Some(picture)).0
+    }
+
     /// Paints a dropdown's button in `rect` and returns its response
     pub(super) fn dropdown_button(&mut self, rect: Rect, value: &str, picture: Option<impl Fn(&Painter, Rect)>) -> Response {
         self.dropdown_button_led(rect, value, |painter| match picture {

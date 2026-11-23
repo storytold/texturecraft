@@ -1,7 +1,7 @@
 //! GPU stages for the neighbourhood filters over a premultiplied texel field.
 
 use bytemuck::{Pod, Zeroable};
-use texturecraft_core::Filter;
+use texturecraft_core::{Filter, HighpassSpace};
 use wgpu::util::DeviceExt;
 
 pub(crate) const FIELD_WORDS: u32 = 5;
@@ -37,10 +37,34 @@ pub(crate) struct NeighbourhoodFilter {
     seed: u32,
 }
 
+/// Whether the GPU stages evaluate neighbourhood filter `filter` as the CPU does. Kinds without a
+/// stage, and settings the stages do not model (edge wrapping, Highpass colour space and alpha,
+/// Mosaic leaving alpha alone), make the caller composite on the CPU.
+pub(crate) fn supports(filter: &Filter) -> bool {
+    matches!(
+        filter,
+        Filter::Blur { wrap: false, .. }
+            | Filter::Sharpen { .. }
+            | Filter::HighPass { space: HighpassSpace::Working, alpha: false, .. }
+            | Filter::Bevel { wrap: false, .. }
+            | Filter::Glow { .. }
+            | Filter::DirectionalBlur { .. }
+            | Filter::Warp { .. }
+            | Filter::DirectionalWarp { .. }
+            | Filter::EdgeDetect { .. }
+            | Filter::SlopeBlur { .. }
+            | Filter::Mosaic { alpha: true, .. }
+    )
+}
+
 impl NeighbourhoodFilter {
     /// The source-pixel parameters used by the CPU evaluator at the same working resolution.
     /// A nonpositive radius for an optional effect leaves the incoming field unchanged.
+    /// None as well for a filter [`supports`] rejects.
     pub(crate) fn new(filter: &Filter, resolution: u32, longest_side: u32, opacity: f32, signed: bool) -> Option<Self> {
+        if !supports(filter) {
+            return None;
+        }
         let scale = resolution.max(1) as f32 / 2048.0;
         let radius = |at_2k: f32| (at_2k * scale).max(0.5);
         let mut out = Self {
@@ -58,15 +82,17 @@ impl NeighbourhoodFilter {
             [cos, -sin]
         };
         let noise_frequency = |scale: f32| (if scale.is_finite() { scale.clamp(0.01, 1000.0) } else { 1.0 }) / resolution.max(1) as f32;
+        // A size over its intensity divider (a divider of 0 counts as 1), as the CPU reads it
+        let divided = |size: f32, divider: u16| size / f32::from(divider.max(1));
 
         let (kind, texels) = match *filter {
-            Filter::Blur { radius: r } if r > 0.0 => (Kind::Blur, radius(r)),
+            Filter::Blur { radius: r, .. } if r > 0.0 => (Kind::Blur, radius(r)),
             Filter::Sharpen { amount } => {
                 out.amount = amount;
                 (Kind::Sharpen, (1.5 * scale).max(0.75))
             }
-            Filter::HighPass { radius: r } => (Kind::HighPass, radius(r)),
-            Filter::Bevel { width } => (Kind::Bevel, radius(width * 0.5)),
+            Filter::HighPass { radius: r, .. } => (Kind::HighPass, radius(r)),
+            Filter::Bevel { width, .. } => (Kind::Bevel, radius(width * 0.5)),
             Filter::Glow { radius: r, amount } => {
                 out.amount = amount;
                 (Kind::Glow, radius(r))
@@ -75,24 +101,24 @@ impl NeighbourhoodFilter {
                 out.direction = direction(angle);
                 (Kind::DirectionalBlur, radius(r))
             }
-            Filter::Warp { intensity, scale, seed } if intensity > 0.0 => {
+            Filter::Warp { intensity, scale, seed, divider } if intensity > 0.0 => {
                 out.frequency = noise_frequency(scale);
                 out.seed = seed;
-                (Kind::Warp, radius(intensity))
+                (Kind::Warp, radius(divided(intensity, divider)))
             }
-            Filter::DirectionalWarp { intensity, angle, scale, seed } if intensity > 0.0 => {
+            Filter::DirectionalWarp { intensity, angle, scale, seed, divider } if intensity > 0.0 => {
                 out.frequency = noise_frequency(scale);
                 out.direction = direction(angle);
                 out.seed = seed;
-                (Kind::DirectionalWarp, radius(intensity))
+                (Kind::DirectionalWarp, radius(divided(intensity, divider)))
             }
             Filter::EdgeDetect { width } => (Kind::Edge, radius(width)),
-            Filter::SlopeBlur { radius: r, scale, seed } if r > 0.0 => {
+            Filter::SlopeBlur { radius: r, scale, seed, divider } if r > 0.0 => {
                 out.frequency = noise_frequency(scale);
                 out.seed = seed;
-                (Kind::SlopeBlur, radius(r))
+                (Kind::SlopeBlur, radius(divided(r, divider)))
             }
-            Filter::Mosaic { size } => (Kind::Mosaic, radius(size)),
+            Filter::Mosaic { size, .. } => (Kind::Mosaic, radius(size)),
             _ => return None,
         };
         out.kind = kind;

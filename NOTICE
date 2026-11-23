@@ -12,6 +12,18 @@ Third-party material
 This product bundles third-party material under its own licenses, listed below. The per-file
 list (author, source, license) is in ATTRIBUTION.md.
 
+Studio Small 09 HDR environment (assets/hdr/studio_small_09_512.hdr),
+by Sergej Majboroda (Poly Haven) — CC0-1.0.
+Source: https://polyhaven.com/a/studio_small_09 (1K HDR, reduced to 512x256).
+
+Native eyedropper components:
+- raw-window-handle — MIT OR Apache-2.0 OR Zlib. Copyright (c) 2019, 2020 Osspial.
+- winsafe — MIT. Copyright (c) 2019-present, Rodrigo Cesar de Freitas Dias.
+- xcap — Apache-2.0.
+- widestring (through xcap on Windows) — MIT OR Apache-2.0.
+- x11rb — MIT OR Apache-2.0. Copyright 2019 x11rb contributors.
+- zbus — MIT. Copyright (c) 2024 Zeeshan Ali Khan and zbus contributors.
+
 Phosphor Icons (compiled in through the egui-phosphor crate) — MIT.
 egui default fonts (compiled in through the epaint_default_fonts crate): Ubuntu-Light — Ubuntu
 Font Licence 1.0; Hack — MIT and Bitstream Vera License; Noto Emoji — SIL Open Font License 1.1;

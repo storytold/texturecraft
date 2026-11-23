@@ -145,6 +145,15 @@ impl ImageRes {
         bilinear(&self.rgba, self.width, self.height, u, v, (true, true))
     }
 
+    /// The texel under (`u`, `v`) as stored, wrapping (an ID map's colors must not blend)
+    pub fn sample_nearest(&self, u: f32, v: f32) -> [f32; 4] {
+        if !u.is_finite() || !v.is_finite() {
+            return [0.0; 4];
+        }
+
+        self.nearest(u, v, (true, true))
+    }
+
     /// The texel under (`u`, `v`), on the axes that do not `repeat` the edge texel past the edge
     fn nearest(&self, u: f32, v: f32, repeat: (bool, bool)) -> [f32; 4] {
         self.texel((u * self.width as f32).floor() as i64, (v * self.height as f32).floor() as i64, repeat)

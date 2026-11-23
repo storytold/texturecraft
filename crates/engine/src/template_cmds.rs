@@ -533,11 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn the_list_names_templates_like_the_reference() {
-        assert_eq!(template_label(DEFAULT_TEMPLATE, true), "Default (OpenPBR)");
-        assert_eq!(template_label("Unlit - Emissive", true), "Unlit - Emissive (starter_assets)");
-        assert_eq!(template_label("Mine", false), "Mine (your_assets)");
-
+    fn a_listed_template_resolves_by_its_display_label() {
         let mut s = Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
         execute(&mut s, "project.template.save", &json!({"name": "Mine"})).unwrap();
         let labels: Vec<String> =

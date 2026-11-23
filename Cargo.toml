@@ -8,8 +8,6 @@ default-members = ["crates/core", "crates/texel", "crates/geom", "crates/compose
 version = "0.6.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.95"
-repository = "https://github.com/storytold/texturecraft"
 
 [workspace.dependencies]
 craft-usd = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "3dff4793f1a5bd1f99a4fe3280d48f515158dff3" }
@@ -53,10 +51,8 @@ rfd = "0.17"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names", "KHR_materials_emissive_strength"] }
 flate2 = "1"
-lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 quick-xml = "0.41"
 mikktspace = { version = "0.3", default-features = false, features = ["glam"] }
-proptest = "1"
 rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "net", "io-util", "time"] }
 schemars = "1"

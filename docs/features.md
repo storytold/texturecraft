@@ -77,9 +77,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   pattern resolution separately for each source. Each channel takes its own image, such as a
   normal, roughness or height map. Import it with *File › Import resources...*, then select it
   in the channel's source picker or drop it from the Assets panel onto the channel. Mark
-  DirectX normal maps (Y down) with **DirectX normal map**.
-  For a color channel that reads a pattern or anchor point, choose **Gradient Map** from the
-  three-dot menu beside its source slot. Up to 16 color stops map dark to light across the
+  DirectX normal maps (Y down) by choosing **DirectX** under **Attributes › Normal format**.
+  For a color channel that reads a pattern or anchor point, use `layer.fill.set` with
+  `gradientMap: true` to initialize a ramp, or supply its stops in `colors`. Up to 16 stops map dark to light across the
   pattern or recolor the stack below by its lightness. The **Gradient map** filter does the
   same for a whole layer's content.
   Alt+click a material channel (of a fill or the brush) to keep that channel alone.
@@ -105,8 +105,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **MaterialCraft materials:** *File › Import material*, a drop on the window, or MaterialCraft's
   *File › Send to TextureCraft* (it lands under *My smart materials*) adds a `.mcmat` portable
   material, or a `.mcraft` package, as a fill layer. Its exposed graph inputs (numbers, vectors,
-  toggles, options, colors) and presets show in the layer's properties; every change re-cooks
-  the maps through MaterialCraft's command line at the texture set's resolution, on a worker
+  toggles, options, colors) and presets appear in the layer's properties. Editing them re-cooks
+  the maps through MaterialCraft's command line at the selected resolution, on a worker
   thread, with the set's baked mesh maps (curvature, AO, thickness…) feeding graph inputs of the
   same name. *Open in MaterialCraft* edits the graph itself. In the browser the cooked maps paint,
   but the inputs are read-only.

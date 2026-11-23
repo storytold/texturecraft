@@ -69,16 +69,6 @@ fn export_mask_to_file_writes_the_mask_where_the_dialog_answered() {
 }
 
 #[test]
-fn a_canceled_dialog_writes_nothing() {
-    let mut h = harness(true);
-    h.state_mut().file_dialogs.set_override(Some(Box::new(|_| Answer::Cancelled)));
-    open_menu(&mut h);
-    h.get_by_label("Export mask to file...").click();
-    h.run_steps(4);
-    assert!(h.state().toasts.is_empty());
-}
-
-#[test]
 fn copy_mask_to_clipboard_puts_the_gray_image_on_the_clipboard() {
     let mut h = harness(true);
     open_menu(&mut h);

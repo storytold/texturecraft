@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use egui::{Color32, ColorImage, Painter, Pos2, Rect, TextureHandle, TextureOptions};
+use texturecraft_engine::Session;
 use texturecraft_engine::compose::{ImageRes, ImageStore};
-use texturecraft_engine::core::ProceduralKind;
+use texturecraft_engine::core::{BakedMap, ProceduralKind};
 use texturecraft_engine::paint::presets::BrushPreset;
 use texturecraft_engine::paint::{BrushAlpha, BrushSettings, alphas};
 use texturecraft_engine::texel::linear_to_srgb;
@@ -50,6 +51,9 @@ pub struct Thumbs {
     saved_files_epoch: u64,
     images: HashMap<String, (Weak<ImageRes>, TextureHandle)>,
     images_revision: Option<u64>,
+    preview_session: Option<(u64, u64)>,
+    /// Each texture set's ID mesh map preview, with the map it shows (a rebake's new map replaces it)
+    id_maps: HashMap<usize, (Weak<Vec<f32>>, TextureHandle)>,
     /// (frame, thumbnails rendered in it)
     budget: (u64, usize),
     /// Renders the orb thumbnails and the big previews
@@ -91,6 +95,30 @@ impl Thumbs {
         texture
     }
 
+    /// Cached preview of texture set `set_index`'s ID mesh map, its colors as stored (the ID view's); a rebake makes a new one
+    pub fn id_mesh_map(&mut self, ctx: &egui::Context, set_index: usize, baked: &texturecraft_engine::compose::BakedMaps) -> Option<TextureHandle> {
+        let data = baked.maps.get(&BakedMap::Id)?;
+
+        // The weak reference keeps the shown map's allocation, so a new map never takes its address
+        if let Some((shown, texture)) = self.id_maps.get(&set_index)
+            && std::ptr::eq(shown.as_ptr(), Arc::as_ptr(data))
+        {
+            return Some(texture.clone());
+        }
+
+        let mut image = ColorImage::filled([IMAGE_PX, IMAGE_PX], Color32::TRANSPARENT);
+        for (index, pixel) in image.pixels.iter_mut().enumerate() {
+            let uv = [((index % IMAGE_PX) as f32 + 0.5) / IMAGE_PX as f32, ((index / IMAGE_PX) as f32 + 0.5) / IMAGE_PX as f32];
+            if let Some(color) = baked.sample_uv(BakedMap::Id, uv) {
+                let [red, green, blue] = color.map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8);
+                *pixel = Color32::from_rgb(red, green, blue);
+            }
+        }
+        let texture = ctx.load_texture(format!("mesh_id_{set_index}"), image, TextureOptions::NEAREST);
+        self.id_maps.insert(set_index, (Arc::downgrade(data), texture.clone()));
+        Some(texture)
+    }
+
     /// Cached preview of an image resource (64 px, letterboxed)
     pub fn image(&mut self, ctx: &egui::Context, name: &str, image: &Arc<ImageRes>) -> TextureHandle {
         if let Some((cached_image, texture)) = self.images.get(name)
@@ -114,6 +142,27 @@ impl Thumbs {
         self.images.retain(|key, (cached_image, _)| {
             let name = key.strip_prefix("stencil:").unwrap_or(key);
             images.get(name).is_some_and(|image| cached_image.ptr_eq(&Arc::downgrade(image)))
+        });
+    }
+
+    /// Keep project previews only while they refer to current resources or bake maps.
+    pub(crate) fn sync_project_previews(&mut self, session: &Session) {
+        let current = (session.project_id, session.revision);
+        let previous = self.preview_session.replace(current);
+        if previous == Some(current) {
+            return;
+        }
+
+        // Two projects can have the same revision
+        if previous.is_none_or(|(project, _)| project != session.project_id) {
+            self.images_revision = None;
+            self.id_maps.clear();
+        }
+
+        self.sync_images(&session.images, session.revision);
+        self.id_maps.retain(|&set, (shown, _)| {
+            set < session.doc.project.texture_sets.len()
+                && session.baked(set).and_then(|baked| baked.maps.get(&BakedMap::Id)).is_some_and(|map| std::ptr::eq(shown.as_ptr(), Arc::as_ptr(map)))
         });
     }
 
@@ -183,6 +232,7 @@ impl Thumbs {
         if self.received_in_pass == pass {
             return;
         }
+
         self.received_in_pass = pass;
 
         for (key, image) in self.worker.poll() {
@@ -402,7 +452,10 @@ pub fn paint_alpha(p: &Painter, rect: Rect, a: BrushAlpha, hardness: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use texturecraft_engine::compose::BakedMaps;
 
     use crate::orb_shape::OrbShape;
 
@@ -441,6 +494,7 @@ mod tests {
         let old_preview = thumbs.saved_brush_preview(&path, &images);
 
         assert!(thumbs.big(&ctx, old_preview, 8).is_none());
+
         images.insert("alpha.png".into(), image(0.8));
         let current_preview = thumbs.saved_brush_preview(&path, &images);
         assert!(thumbs.big(&ctx, current_preview.clone(), 8).is_none());
@@ -452,6 +506,7 @@ mod tests {
 
         let mut output = ctx.run_pass(Default::default(), |_| {});
         output.textures_delta.clear();
+
         assert!(thumbs.rendered_big(&ctx, &current_preview, 8).is_some(), "the current completion must survive an old failure");
     }
 
@@ -539,6 +594,7 @@ mod tests {
         drop(thumbs.saved_brush_preview(&second_path, &images));
         drop(old_image);
         drop(other_image);
+
         assert!(old_weak.upgrade().is_none(), "cached settings do not retain a replaced image");
         assert!(other_weak.upgrade().is_some(), "the project still owns its current image");
         eprintln!(
@@ -549,10 +605,12 @@ mod tests {
         let replacement = Arc::new(ImageRes::new(IMAGE_SIDE, IMAGE_SIDE, vec![[0.0; 4]; IMAGE_TEXELS], false));
         images.insert("alpha.png".into(), replacement);
         drop(thumbs.saved_brush_preview(&first_path, &images));
+
         assert!(other_weak.upgrade().is_none(), "another saved brush does not retain the old project image");
         eprintln!("saved brush cache after second replacement: 0 of {IMAGE_BYTES} previous image bytes retained");
 
         thumbs.forget_saved_files();
+
         assert!(thumbs.saved_brush_previews.is_empty(), "refresh releases parsed brush settings");
     }
 
@@ -601,11 +659,59 @@ mod tests {
         images.insert("image-3".into(), Arc::new(ImageRes::new(2, 2, vec![[0.7; 4]; 4], false)));
         drop(thumbs.image(&context, "image-3", &images["image-3"]));
         thumbs.sync_images(&images, 2);
+
         assert_eq!(thumbs.images.len(), 2);
 
         images.clear();
         thumbs.sync_images(&images, 3);
         eprintln!("cached previews after clearing resources: {}", thumbs.images.len());
         assert!(thumbs.images.is_empty());
+    }
+
+    /// A 2 × 2 ID map of one red, in a map of its own
+    fn id_map() -> BakedMaps {
+        BakedMaps { resolution: 2, maps: BTreeMap::from([(BakedMap::Id, Arc::new([1.0, 0.0, 0.0].repeat(4)))]) }
+    }
+
+    #[test]
+    fn an_id_map_preview_is_kept_while_its_map_lives_and_a_rebaked_map_gets_a_new_one() {
+        let ctx = egui::Context::default();
+        let mut thumbs = Thumbs::default();
+        let baked = id_map();
+
+        let first = thumbs.id_mesh_map(&ctx, 0, &baked).map(|texture| texture.id());
+        let shared = thumbs.id_mesh_map(&ctx, 0, &baked.clone()).map(|texture| texture.id());
+        let rebaked = thumbs.id_mesh_map(&ctx, 0, &id_map()).map(|texture| texture.id());
+
+        assert!(first.is_some());
+        assert_eq!(shared, first, "the same map keeps its cached preview");
+        assert_ne!(rebaked, first, "a new map of the same texture set, even of equal texels, gets a new preview");
+    }
+
+    #[test]
+    fn dropped_bakes_and_replaced_projects_release_their_id_preview_textures() {
+        use texturecraft_engine::geom::primitives;
+
+        let ctx = egui::Context::default();
+        let mut thumbs = Thumbs::default();
+        let mut project = Session::new_project("A", primitives::material_ball(), "builtin:materialBall", None, 128).unwrap();
+        project.doc.baked.insert(0, id_map());
+        project.doc.baked.insert(1, id_map());
+        thumbs.sync_project_previews(&project);
+        let first = thumbs.id_mesh_map(&ctx, 0, project.baked(0).unwrap()).unwrap().id();
+        let second = thumbs.id_mesh_map(&ctx, 1, project.baked(1).unwrap()).unwrap().id();
+
+        let _undo_map = project.doc.baked.remove(&0).unwrap();
+        project.revision += 1;
+        thumbs.sync_project_previews(&project);
+
+        assert!(ctx.tex_manager().read().meta(first).is_none(), "an undo-owned map does not need a preview");
+        assert!(ctx.tex_manager().read().meta(second).is_some(), "a live bake keeps its texture");
+
+        let mut replacement = Session::new_project("B", primitives::plane(2.0, 2), "builtin:plane", None, 128).unwrap();
+        replacement.revision = project.revision;
+        thumbs.sync_project_previews(&replacement);
+
+        assert!(ctx.tex_manager().read().meta(second).is_none(), "a different project with the same revision releases the old texture");
     }
 }

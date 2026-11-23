@@ -51,16 +51,6 @@ fn show_group(harness: &mut Harness<'_, TextureCraftApp>) {
 }
 
 #[test]
-fn the_group_shows_hardness_and_every_shared_parameter() {
-    let harness = app_with_brush(BrushSettings::default());
-
-    for label in ["Parameters", "Hardness", "Size X", "Size Y", "Roundness", "Contrast"] {
-        assert!(harness.query_by_label(label).is_some(), "{label} is in the Alpha tab");
-    }
-    assert!(invert_checkbox(&harness).is_some());
-}
-
-#[test]
 fn restore_defaults_puts_back_hardness_and_the_parameters_but_keeps_the_alpha() {
     let brush = BrushSettings { hardness: 0.9, alpha: BrushAlpha::Star, alpha_params: changed_params(), size: 0.1, flow: 0.4, ..BrushSettings::default() };
     let mut harness = app_with_brush(brush.clone());

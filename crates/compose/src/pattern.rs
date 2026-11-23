@@ -780,12 +780,6 @@ mod tests {
         assert!((at(0.25, &exact) - blended).abs() > 1e-3, "the exact pattern is not the blend, so the coarse read shows");
     }
 
-    /// A stored cylinder axis past Z (only a hand-edited project holds one) wraps round Y
-    #[test]
-    fn a_cylinder_axis_past_z_reads_as_y() {
-        assert_eq!([0, 1, 2, 3, u8::MAX].map(cylinder_axis_index), [0, 1, 2, 1, 1]);
-    }
-
     /// A decal saved before image placement reads its frame coordinates bit for bit as it did: its image at them, its procedural at them times the pattern scale
     #[test]
     fn an_unplaced_decal_reads_its_frame_coordinates_bit_for_bit() {

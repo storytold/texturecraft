@@ -49,7 +49,7 @@ fn a_pattern_parameter_given_alone_keeps_every_other_one() {
     for (key, value, change) in edits {
         let mut expected = roughness(&session, layer);
         change(&mut expected);
-        let mut edit = json!({"layer": layer.0, "channel": "roughness", "procedural": "Clouds"});
+        let mut edit = json!({"layer": layer.0, "channel": "roughness"});
         edit[key] = value;
         execute(&mut session, "layer.fill.set", &edit).unwrap();
 

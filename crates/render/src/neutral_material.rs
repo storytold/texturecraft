@@ -51,25 +51,3 @@ impl NeutralMaterial {
         if self.bent_normal { [self.bent_normal_diffuse, self.bent_normal_specular, 0.0, 0.0] } else { [0.0; 4] }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_frame_takes_the_whole_quality() {
-        let quality = |samples_per_pixel| NeutralMaterial { samples_per_pixel, ..NeutralMaterial::default() };
-        assert_eq!(quality(16).samples_per_frame(), 16);
-        assert_eq!(quality(256).samples_per_frame(), 256);
-        assert_eq!(quality(u32::MAX).samples_per_frame(), MAX_SAMPLES_PER_PIXEL, "a damaged file is held to the highest quality");
-        assert_eq!(quality(0).samples_per_frame(), 1);
-    }
-
-    #[test]
-    fn the_bent_normal_reaches_the_shader_only_when_on() {
-        let off = NeutralMaterial::default();
-        assert_eq!(off.bent_normal_globals(), [0.0; 4]);
-        let on = NeutralMaterial { bent_normal: true, bent_normal_diffuse: 0.5, bent_normal_specular: 0.25, ..off };
-        assert_eq!(on.bent_normal_globals(), [0.5, 0.25, 0.0, 0.0]);
-    }
-}

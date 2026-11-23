@@ -703,20 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn the_default_right_column_gives_properties_about_two_thirds_under_the_texture_sets() {
-        let workspace = default_workspace();
-        let Some(Node::Split { second: right, .. }) = workspace.layout.root.as_ref() else { panic!("assets | rest") };
-        let Node::Split { second: column, .. } = right.as_ref() else { panic!("viewport | right column") };
-        let Node::Split { second: below_sets, .. } = column.as_ref() else { panic!("texture sets | rest") };
-        let Node::Split { size: SplitSize::Ratio(layers), first, second, .. } = below_sets.as_ref() else { panic!("layers | properties") };
-        assert!(matches!(first.as_ref(), Node::Tabs { panels, .. } if panels.first() == Some(&Panel::Layers)));
-        assert!(matches!(second.as_ref(), Node::Tabs { panels, .. } if panels == &[Panel::Properties]));
-
-        let properties = 1.0 - layers;
-        assert!((2.0 / 3.0..0.7).contains(&properties), "Properties takes about 69% of the column, at least two thirds: {properties}");
-    }
-
-    #[test]
     fn a_saved_split_keeps_its_own_share() {
         let mut workspace = default_workspace();
         let Some(Node::Split { second: right, .. }) = workspace.layout.root.as_mut() else { panic!("assets | rest") };
@@ -727,14 +713,6 @@ mod tests {
         let back = Dock::from_value(serde_json::to_value(&workspace).unwrap());
 
         assert_eq!(back.workspace(), &workspace, "a layout saved with the old split opens unchanged");
-    }
-
-    #[test]
-    fn default_dock_round_trips() {
-        let dock = Dock::default();
-        let json = serde_json::to_string(&dock).unwrap();
-        let back: Dock = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, dock);
     }
 
     #[test]

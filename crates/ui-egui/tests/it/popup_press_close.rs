@@ -1,6 +1,7 @@
 //! A press outside a popup closes it when it turns into a drag (a paint stroke on the model), as a click does: the tool's colour, the layer menus and the symmetry settings, in the default layout and in a rearranged one restored after a restart
 
 use eframe::App as _;
+use egui::accesskit::Role;
 use egui::{Event, Modifiers, PointerButton, Pos2, Vec2, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -127,6 +128,19 @@ fn an_alt_orbit_keeps_the_tool_colour_popup_open() {
     stroke_on_model(&mut harness, Modifiers::ALT);
 
     assert!(egui::Popup::is_any_open(&harness.ctx), "an Alt+drag orbits the camera and keeps the popup, like the colour picker");
+}
+
+#[test]
+fn a_stroke_on_the_model_closes_the_add_effect_menu() {
+    let mut harness = app(&MemoryStorage::default());
+    harness.get_by_role_and_label(Role::Button, "Add effect").click();
+    harness.run_steps(SETTLE_FRAMES);
+
+    assert!(egui::Popup::is_any_open(&harness.ctx), "the menu opens");
+
+    stroke_on_model(&mut harness, Modifiers::NONE);
+
+    assert!(!egui::Popup::is_any_open(&harness.ctx), "the stroke closes the menu");
 }
 
 #[test]

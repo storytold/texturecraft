@@ -4,6 +4,7 @@
 use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
 use egui::{Color32, CornerRadius, Response, RichText, Sense, Stroke, Ui, vec2};
 
+use crate::drawn_icon::DrawnIcon;
 use crate::i18n::tr;
 use crate::theme::Tokens;
 
@@ -207,6 +208,15 @@ pub fn elided(painter: &egui::Painter, text: impl Into<String>, size: f32, color
 /// A square Phosphor icon button with a tooltip and an accent well when selected
 pub fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, selected: bool, size: f32) -> Response {
     icon_button_without_tooltip(ui, icon, tooltip, selected, size).on_hover_text(tooltip)
+}
+
+/// An `icon_button` showing an icon drawn in code
+pub(crate) fn drawn_icon_button(ui: &mut Ui, icon: DrawnIcon, tooltip: &str, selected: bool, size: f32) -> Response {
+    let style = icon_button_style(&Tokens::get(ui.ctx()));
+    IconButton::new(tooltip, vec2(size, size), &style)
+        .selected(selected)
+        .show(ui, |ui, rect, color| icon.paint(ui.painter(), rect.center(), size * ICON_SCALE, color))
+        .on_hover_text(tooltip)
 }
 
 /// Icon glyph size as a fraction of the button height
@@ -516,7 +526,7 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
 }
 
 /// Fill `rect` with `rgb(x, y)` (sRGB 0..1 over 0..1 across and down), as a shaded mesh
-fn gradient(painter: &egui::Painter, rect: egui::Rect, rgb: impl Fn(f32, f32) -> [f32; 3]) {
+pub(crate) fn gradient(painter: &egui::Painter, rect: egui::Rect, rgb: impl Fn(f32, f32) -> [f32; 3]) {
     /// Cells across and down: fine enough that a hue strip's six ramps read smooth
     const GRID_CELLS: u32 = 24;
 

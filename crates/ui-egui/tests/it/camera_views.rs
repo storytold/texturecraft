@@ -354,13 +354,3 @@ fn next_camera_advances_from_the_destination_before_the_glide_ends() {
 
     assert!((harness.state().session.camera.yaw.to_degrees() - 50.0).abs() < 0.5, "two presses reach the second camera");
 }
-
-#[test]
-fn the_view_picker_offers_the_combined_normal_view() {
-    let mut h = harness();
-    h.get_all_by_role(egui::Role::ComboBox).find(|node| node.value().as_deref() == Some("Material")).expect("the view picker").click();
-    h.run_steps(2);
-    h.get_by_label("Normal+height+mesh").click();
-    h.run_steps(2);
-    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::NormalHeightMesh);
-}

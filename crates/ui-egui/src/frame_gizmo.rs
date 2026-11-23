@@ -248,9 +248,7 @@ impl Gizmo for FrameGizmo {
         handles.extend((0..3).filter_map(|axis| Some((FrameGrab::Axis(axis), arrow_distance(at, self.center, self.arrows[axis]?)))));
         let near = |points: [Pos2; 4], grab: fn(usize) -> FrameGrab| (0..4).map(move |index| (grab(index), points[index].distance(at)));
         match self.warp {
-            // A mask effect's warp corners have no command to pull them
-            Some(_) if self.effect.is_none() => handles.extend(near(self.corners, FrameGrab::Corner)),
-            Some(_) => {}
+            Some(_) => handles.extend(near(self.corners, FrameGrab::Corner)),
             None => handles.extend(near(self.corners, |_| FrameGrab::Scale)),
         }
         handles.extend(near(self.sides, FrameGrab::Side));
@@ -302,14 +300,15 @@ impl Gizmo for FrameGizmo {
                 let dragged_corner = *self.corners.get(corner)? + delta;
                 *corners.get_mut(corner)? = self.on_plane(app, rect, dragged_corner)?;
 
-                return Some(("layer.fill.projection", json!({"layer": self.layer.0, "warpCorners": corners})));
+                json!({"warpCorners": corners})
             }
         };
         params["layer"] = json!(self.layer.0);
         if let Some(effect) = self.effect {
             params["effect"] = json!(effect.0);
         }
-        Some(("layer.decal.set", params))
+        let command = if matches!(grab, FrameGrab::Corner(_)) { "layer.fill.projection" } else { "layer.decal.set" };
+        Some((command, params))
     }
 
     fn cursor(&self, grab: FrameGrab, dragging: bool) -> egui::CursorIcon {

@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 
+use texturecraft_compose::MaskGray;
 use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::{Mesh, NO_TRI};
 use texturecraft_paint::{EyeDepth, fill_triangles, screen_point};
@@ -191,7 +192,7 @@ impl Session {
 
         let (gbuf, mut canvas) = self.fill_canvas(ts)?;
         fill_triangles(&mut canvas, &gbuf, &triangles);
-        self.commit_fill("Polygon fill", ts, &canvas)?;
+        self.commit_fill("Polygon fill", ts, &canvas, &MaskGray::Value(self.tool.mask_value))?;
         Ok(triangles.len())
     }
 
@@ -262,7 +263,7 @@ impl Session {
         } else {
             self.fill_canvas(ts).and_then(|(gbuf, mut canvas)| {
                 fill_triangles(&mut canvas, &gbuf, &selected);
-                self.paint_fill(ts, &canvas)
+                self.paint_fill(ts, &canvas, &MaskGray::Value(self.tool.mask_value))
             })
         };
         self.invalidate_changed(&previous);

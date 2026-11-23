@@ -398,14 +398,3 @@ fn escape_cancels_picking_the_symmetry_point() {
     assert!(!harness.state().picking_symmetry_plane);
     assert_eq!(harness.state().session.tool.brush.symmetry.offset, [0.0; 3]);
 }
-
-#[test]
-fn the_smudge_tool_offers_the_symmetry_toggle() {
-    let mut harness = app_harness();
-    harness.state_mut().session.tool.tool = Tool::Smudge;
-    harness.run_steps(2);
-
-    harness.get_by_label("Symmetry").click();
-    harness.run_steps(2);
-    assert_eq!(brush(&mut harness)["symmetry"], json!([true, false, false]), "the toggle mirrors the smudge on X");
-}

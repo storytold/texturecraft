@@ -82,7 +82,7 @@ impl Session {
         let (stem, extension) = base.rfind('.').map_or((base.as_str(), ""), |extension_start| base.split_at(extension_start));
         let mut name = base.clone();
         let mut duplicate_index = 2;
-        while self.doc.resources.contains_key(&name) {
+        while self.doc.resources.contains_key(&name) || crate::fill_alpha::library_alpha_of(&name).is_some() {
             let discriminator = format!("{duplicate_index}_");
             let available = MAX_RESOURCE_NAME_LEN - discriminator.len();
 
@@ -102,6 +102,7 @@ impl Session {
     /// Decode resources that are not decoded yet and forget removed ones (after undo, redo, load).
     pub fn sync_images(&mut self) {
         self.images.retain(|name, _| self.doc.resources.contains_key(name));
+        self.library_alphas.retain(|name| self.images.contains_key(name));
 
         let mut linked_packages = std::collections::HashSet::new();
         let mut linked_images = std::collections::HashMap::new();
@@ -132,6 +133,10 @@ impl Session {
             };
             match image {
                 Ok(image) => {
+                    if crate::fill_alpha::matches_saved_picture(name, &image) {
+                        self.library_alphas.insert(name.clone());
+                    }
+
                     self.images.insert(name.clone(), decoded(image));
                 }
                 Err(error) => self.log.warn(crate::log::LIBRARY_SOURCE, format!("resource {name}: {error}")),
@@ -256,7 +261,7 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
-/// Drop resources unused by layers, mask effects, the brush alpha, the stencil or the environment.
+/// Drop resources no layer, mask effect, the brush alpha, the projection stencil, the mask brush or the environment uses (one undo step)
 fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     let mut used = Vec::new();
     for set in &s.doc.project.texture_sets {
@@ -266,6 +271,7 @@ fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     }
     used.extend(s.tool.stencil.as_ref().map(|st| st.image.clone()));
     used.extend(s.tool.brush.alpha_image.clone());
+    used.extend(s.tool.mask_image.clone());
     used.extend(s.doc.project.display.environment_resource().map(str::to_string));
     let unused: Vec<String> = s.doc.resources.keys().filter(|k| !used.contains(k)).cloned().collect();
     if !unused.is_empty() {

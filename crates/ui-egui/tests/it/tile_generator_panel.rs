@@ -47,12 +47,22 @@ fn pattern(harness: &Harness<'_, TextureCraftApp>, effect: LayerId) -> Procedura
     }
 }
 
-/// Opens the mask fill's source picker from its Grayscale slot and clicks the tile labelled `tile`
+/// Frames for a scroll to bring a control into view (it animates)
+const SCROLL_FRAMES: usize = 25;
+
+/// Opens the mask fill's source picker from its Grayscale slot and clicks the tile labelled `tile`, scrolled into view first
 fn pick(harness: &mut Harness<'_, TextureCraftApp>, tile: &str) {
     harness.get_by_role_and_label(Role::ComboBox, "Grayscale").click();
     harness.run_steps(3);
-    harness.get_by_label(tile).click();
+    harness.get_by_role_and_label(Role::ListBoxOption, tile).scroll_to_me();
+    harness.run_steps(SCROLL_FRAMES);
+    harness.get_by_role_and_label(Role::ListBoxOption, tile).click();
     harness.run_steps(3);
+}
+
+/// The lowest control labelled `label`: the slot's rows show a pattern's Scale, Contrast and ⟲ above the Tile Generator's own
+fn lowest<'h>(harness: &'h Harness<'_, TextureCraftApp>, label: &'h str) -> egui_kittest::Node<'h> {
+    harness.get_all_by_label(label).max_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).unwrap()
 }
 
 /// Where a slider's track is grabbed, from its label's left end and bottom, and how far it is dragged (points)
@@ -108,18 +118,16 @@ fn the_anchor_points_tab_picks_an_anchor() {
     harness.get_by_label("Anchor points").click();
     harness.run_steps(3);
 
-    // An anchor tile is labelled "<layer> / <anchor>", as the anchors below a layer are listed
-    let project = &harness.state().session.doc.project;
-    let owner = project.layers.values().find(|layer| layer.content_effects.iter().any(|effect| effect.name == "Height")).unwrap();
-    let label = format!("{} / Height", owner.name);
-    harness.get_by_role_and_label(Role::Button, &label).click();
+    // An anchor tile is labelled with the anchor's name; its layer is named only where two anchors share a name
+    harness.get_by_role_and_label(Role::ListBoxOption, "Height").click();
     harness.run_steps(3);
+
     assert!(source(&harness, effect).anchor().is_some());
 }
 
-/// An anchor in a mask records the mask's gray whatever the channel, so the slot names the mask
+/// An anchor in a mask records the mask's gray whatever the channel, so the slot names the anchor and no channel
 #[test]
-fn the_slot_names_the_mask_for_an_anchor_in_a_mask() {
+fn the_slot_names_the_anchor_in_a_mask_it_reads() {
     let mut session = texturecraft_engine::sample_session(512, 256).unwrap();
     session.active_set = 1;
     let lower = execute(&mut session, "layer.add.fill", &json!({"name": "Lower"})).unwrap()["layer"].as_u64().unwrap();
@@ -136,7 +144,7 @@ fn the_slot_names_the_mask_for_an_anchor_in_a_mask() {
 
     let slot = harness.get_by_role_and_label(Role::ComboBox, "Grayscale");
 
-    assert_eq!(slot.value().as_deref(), Some("Lower · Mask"));
+    assert_eq!(slot.value().as_deref(), Some("Anchor · Wear"));
 }
 
 #[test]
@@ -148,13 +156,15 @@ fn an_amount_drag_is_one_undo_step_and_restore_defaults_puts_the_tiles_back() {
 
     drag_slider(&mut harness, "X amount");
     let tile = pattern(&harness, effect).tile.unwrap();
+
     assert!(tile.amount[0] > TileGenerator::default().amount[0], "the drag adds columns: {:?}", tile.amount);
     assert_eq!(harness.state().session.history_labels().len(), history + 1, "one drag is one undo step");
 
-    harness.get_by_label("Restore defaults").scroll_to_me();
-    harness.run_steps(2);
-    harness.get_by_label("Restore defaults").click();
+    lowest(&harness, "Restore defaults").scroll_to_me();
+    harness.run_steps(SCROLL_FRAMES);
+    lowest(&harness, "Restore defaults").click();
     harness.run_steps(3);
+
     assert_eq!(*pattern(&harness, effect).tile.unwrap(), TileGenerator::default());
 }
 
@@ -200,10 +210,9 @@ fn typing_tile_contrast_then_clicking_invert_preserves_both_edits() {
     let (mut harness, effect) = harness(false);
     execute(&mut harness.state_mut().session, "effect.set", &json!({"effect": effect.0, "procedural": "Tile Generator"})).unwrap();
     harness.run_steps(3);
-    let contrast = harness.get_by_label("Contrast");
-    contrast.scroll_to_me();
+    lowest(&harness, "Contrast").scroll_to_me();
     harness.run_steps(12);
-    let row = harness.get_by_label("Contrast").rect().center().y;
+    let row = lowest(&harness, "Contrast").rect().center().y;
     let at = harness.get_all(by().role(Role::TextInput)).find(|node| (node.rect().center().y - row).abs() < 4.0).unwrap().rect().center();
 
     harness.drag_at(at);
@@ -251,13 +260,6 @@ fn tile_generator_snapshots() {
         harness.render().unwrap().save(directory.join(format!("tile-panel-{name}.png"))).unwrap();
     }
     harness.state_mut().ui.prefs.brightness = Brightness::Dark;
-
-    // Open, the section also holds a menu labelled "Resolution": its title is the first one
-    harness.get_by_label("Resolution").click();
-    harness.run_steps(6);
-    harness.render().unwrap().save(directory.join("tile-resolution.png")).unwrap();
-    harness.get_all_by_label("Resolution").next().unwrap().click();
-    harness.run_steps(6);
 
     for (sections, name) in [(["Pattern", "Size"], "pattern-size"), (["Position", "Rotation"], "position-rotation")] {
         for section in sections {

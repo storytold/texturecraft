@@ -76,12 +76,12 @@ pub(crate) fn rewrite(ctx: &Context, raw: &mut RawInput) {
 
 /// The end of the app's frame: a drag that asked this frame takes or keeps the pointer (hidden, put back), one that stopped asking lets it go
 pub(crate) fn settle(ctx: &Context) {
-    let asked = ctx.data(|data| data.get_temp::<u64>(asked_id())) == Some(ctx.cumulative_pass_nr());
+    let asked = !crate::viewport::focus_lost(ctx) && ctx.data(|data| data.get_temp::<u64>(asked_id())) == Some(ctx.cumulative_pass_nr());
     let held = ctx.data(|data| data.get_temp::<Lock>(lock_id())).filter(|lock| !lock.let_go);
     let mut lock = match (asked, held) {
         (true, Some(lock)) => lock,
         (true, None) => {
-            let hold = ctx.data(|data| data.get_temp::<Hold>(hold_override_id())).unwrap_or_else(Hold::of_platform);
+            let hold = ctx.data(|data| data.get_temp::<Hold>(hold_override_id())).unwrap_or_else(|| Hold::of_platform(ctx));
             let (origin, latest) = ctx.input(|input| (input.pointer.press_origin(), input.pointer.latest_pos()));
             let (Some(seen), false) = (latest, hold == Hold::Free) else {
                 return;
@@ -94,7 +94,7 @@ pub(crate) fn settle(ctx: &Context) {
         }
         (false, Some(mut lock)) => {
             // Put back before the grab ends: Wayland moves only a locked pointer
-            if lock.seen.distance(lock.anchor) > PUT_BACK_REACH {
+            if !lock.putting_back && lock.seen.distance(lock.anchor) > PUT_BACK_REACH {
                 ctx.send_viewport_cmd(ViewportCommand::CursorPosition(lock.anchor));
             }
             if lock.hold == Hold::Locked {
@@ -109,7 +109,7 @@ pub(crate) fn settle(ctx: &Context) {
     };
 
     ctx.set_cursor_icon(CursorIcon::None);
-    if lock.hold.puts_back() && lock.seen.distance(lock.anchor) > PUT_BACK_REACH {
+    if lock.hold.puts_back() && !lock.putting_back && lock.seen.distance(lock.anchor) > PUT_BACK_REACH {
         ctx.send_viewport_cmd(ViewportCommand::CursorPosition(lock.anchor));
 
         // A folding system reads every later move from where it put the pointer, its own move folded in

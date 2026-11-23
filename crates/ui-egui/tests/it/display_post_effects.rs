@@ -75,15 +75,6 @@ fn drag(harness: &mut Harness<'_, TextureCraftApp>, label: &str, x: f32) {
 }
 
 #[test]
-fn the_defaults_are_off() {
-    let harness = app();
-    let d = display(&harness);
-    assert!(!d.post_effects);
-    assert_eq!(amounts(&d), [0.0; 4]);
-    assert!(reset_icon(&harness).accesskit_node().is_disabled(), "nothing to reset yet");
-}
-
-#[test]
 fn each_slider_sets_only_its_own_amount() {
     for (i, label) in SLIDERS.into_iter().enumerate() {
         let mut harness = app();

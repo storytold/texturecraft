@@ -161,3 +161,19 @@ fn a_ctrl_right_drag_out_of_the_2d_view_keeps_its_outline_at_the_anchor() {
     harness.event(Event::ModifiersChanged(egui::Modifiers::NONE));
     harness.run_steps(2);
 }
+
+#[test]
+fn a_waiting_eyedropper_hides_the_2d_brush_outline() {
+    let mut harness = harness();
+    harness.state_mut().picking_color = Some(egui::Id::unique("a colour bar"));
+    let pointer = egui::pos2(800.0, 480.0);
+    harness.hover_at(pointer);
+    harness.run_steps(3);
+
+    assert!(rings_at(&harness, pointer).is_empty(), "no brush outline under the eyedropper (its own pointer is drawn instead)");
+
+    harness.state_mut().picking_color = None;
+    harness.run_steps(3);
+
+    assert_eq!(rings_at(&harness, pointer).len(), 1, "without a pick the outline is back");
+}

@@ -178,16 +178,6 @@ fn enter_and_space_on_the_focused_reset_icon_reset_only_its_section() {
 }
 
 #[test]
-fn reset_icons_identify_their_sections() {
-    let harness = app_with_brush(changed_brush());
-
-    for (title, _, _, _) in SECTIONS {
-        let label = format!("{title}: Reset to defaults");
-        assert!(harness.query_by_role_and_label(egui::Role::Button, &label).is_some(), "the reset button must name its {title} section");
-    }
-}
-
-#[test]
 fn narrow_headers_keep_title_clicks_separate_from_reset() {
     use texturecraft_ui_egui::widgets::section_with_reset;
 

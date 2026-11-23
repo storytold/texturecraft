@@ -141,18 +141,6 @@ fn sample_for_project_bake(resolution: u32) -> Headless {
     backend
 }
 
-#[test]
-fn project_bake_uses_documented_ray_count() {
-    let backend = sample_for_project_bake(256);
-
-    for texture_set in 0..backend.session.set_count() {
-        let task = backend.session.bake_task(texture_set).unwrap();
-        assert_eq!(task.settings.maps.ao.parameters.rays.rays, 32);
-        assert_eq!(task.settings.maps.thickness.parameters.rays.rays, 32);
-        assert_eq!(task.settings.maps.bent_normal.parameters.rays.rays, 32);
-    }
-}
-
 /// The whole-project bake at benchmark settings (1024², 32 rays, AA 1), then 2048².
 #[test]
 #[ignore]

@@ -8,15 +8,16 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    Backface, BakedMap, BlendMode, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Filtering, Generator,
-    GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Projector, Sampling, ShapeCrop, Source,
+    Backface, BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter,
+    Filtering, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Projector, Sampling,
+    ShapeCrop, Source, ThresholdMode,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
 use crate::gpu_curvature::{CurvatureGpu, CurvatureInput, CurvatureLevels};
 use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages};
-use crate::gpu_neighbourhood::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
+use crate::gpu_neighbourhood::{self, FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
 use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
 use crate::paint_window::CompositePaintWindow;
@@ -655,9 +656,13 @@ impl CompositeProgram {
             let Some(layer) = project.content_layer(id) else { continue };
             let geometry_mask = geometry.register(inherited_geometry, own.geometry_mask.as_deref());
             let mask = project.layers.get(&project.mask_owner(id)).and_then(|owner| owner.mask.as_ref()).filter(|m| m.enabled);
-            if let LayerKind::Group { children, .. } = &layer.kind {
+            if let LayerKind::Group { children, contents, .. } = &layer.kind {
                 if depth > texturecraft_core::project::MAX_DEPTH {
                     continue;
+                }
+                // A folder's Scale and Rotation (an instanced folder's too) re-place every fill inside it
+                if !contents.is_none() {
+                    return Err("A folder with Scale or Rotation uses CPU compositing.");
                 }
                 // A full-weight group sees the incoming stack and returns it exactly
                 // as its children changed it. A geometry restriction must stay on the
@@ -733,6 +738,9 @@ impl CompositeProgram {
             let per_channel = layer.content_effects.iter().any(|effect| effect.visible && content_depends_on_channel(effect));
             let mut templates = Vec::new();
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
+                if let Some(reason) = effect_needs_cpu(effect) {
+                    return Err(reason);
+                }
                 if matches!(effect.kind, EffectKind::Anchor) {
                     content_anchors.push((effect.id, visible_cut));
                     continue;
@@ -939,6 +947,10 @@ impl CompositeProgram {
             return Err("UDIM texture sets use CPU mask preview.");
         }
         let owner = project.mask_owner(owner);
+        // Folders around the layer re-place its mask fills
+        if !project.contents_around(owner).is_none() {
+            return Err("A mask inside a folder with Scale or Rotation uses CPU mask preview.");
+        }
         let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
         let mask = mask.ok_or("The layer has no enabled mask.")?;
         if mask.effects.iter().any(|effect| effect.visible && !effect.kind.anchors_read().is_empty()) {
@@ -1027,13 +1039,32 @@ fn content_depends_on_channel(effect: &Effect) -> bool {
 }
 
 fn content_filter(effect: &Effect, procedural: &mut ProceduralInputs) -> Option<Operation> {
-    match effect.kind {
+    let noop = Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() };
+    match &effect.kind {
         // A mask-only effect authored in this stack leaves its content alone.
-        EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection { .. } | EffectKind::Compare { .. } => {
-            Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() })
-        }
+        EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection(_) | EffectKind::Compare { .. } => Some(noop),
+        // Levels limited to one channel would need a program per channel
+        EffectKind::Levels(levels) if levels.affects.is_some() => None,
+        // A blending effect set to Disable leaves the content as it is
+        kind if kind.blends() && effect.blend == BlendMode::Disable && uniform_blend(effect) => Some(noop),
         _ => point_effect(effect, procedural),
     }
+}
+
+/// Whether the effect blends every channel alike: the GPU program reads one blend mode and opacity per effect
+fn uniform_blend(effect: &Effect) -> bool {
+    effect.channel_blends.is_empty() && effect.off_channels.is_empty()
+}
+
+/// Settings of an effect the GPU program does not model: per-channel blends, channels switched off, and filter image inputs
+fn effect_needs_cpu(effect: &Effect) -> Option<&'static str> {
+    if !uniform_blend(effect) {
+        return Some("An effect with per-channel blending uses CPU compositing.");
+    }
+    if !effect.inputs.is_empty() {
+        return Some("An effect with an image input uses CPU compositing.");
+    }
+    None
 }
 
 fn content_deposit(
@@ -1046,7 +1077,8 @@ fn content_deposit(
     if !effect.opacity.is_finite() {
         return Err("A content effect has an invalid opacity.");
     }
-    if effect.opacity <= 0.0 {
+    // A deposit set to Disable leaves the content and its coverage as they are
+    if effect.opacity <= 0.0 || effect.blend == BlendMode::Disable {
         return Ok(None);
     }
     let mut op = if let EffectKind::Material(fill) = &effect.kind {
@@ -1081,6 +1113,9 @@ fn compile_mask(
 ) -> Result<f32, &'static str> {
     let Some(mask) = mask else { return Ok(1.0) };
     for effect in mask.effects.iter().filter(|e| e.visible) {
+        if let Some(reason) = effect_needs_cpu(effect) {
+            return Err(reason);
+        }
         let mut op = match &effect.kind {
             EffectKind::Fill { source, projection, sampling } => {
                 let mut operation = source_operation(Some(source), projection, *sampling, [0.0; 3], ChannelKind::Scalar, procedural)
@@ -1113,7 +1148,12 @@ fn compile_mask(
                 op
             }
             EffectKind::Generator(generator) => generator_operation(generator, procedural, tile_patterns).ok_or("A mask generator uses CPU compositing.")?,
-            EffectKind::ColorSelection { colors, tolerance } => {
+            EffectKind::ColorSelection(selection) => {
+                // The GPU selects hard, on black, from the baked ID map
+                let ColorSelection { colors, tolerance, output, hardness, background, id_map } = selection;
+                if *output != 1.0 || *hardness != 1.0 || *background != texturecraft_core::SelectionBackground::Black || id_map.is_some() {
+                    return Err("A color selection's output, hardness, background or ID map uses CPU compositing.");
+                }
                 let [offset, count] = procedural.pack_rgb(colors).ok_or("A color selection has invalid colors.")?;
                 if !tolerance.is_finite() {
                     return Err("A color selection has invalid tolerance.");
@@ -1124,7 +1164,11 @@ fn compile_mask(
                 let publication = procedural.anchors.publish(effect.id, true);
                 Operation { ids: [0, ANCHOR_PUBLISH_MASK, publication, 0], ..Operation::zeroed() }
             }
-            EffectKind::Compare { op, value, tolerance } => {
+            EffectKind::Compare { op, value, tolerance, left, right, channel: _, hardness } => {
+                // The GPU compares the mask so far with a constant, hard; the channel is read only by layer sides
+                if *left != CompareSource::ThisMask || *right != CompareSource::Constant || *hardness != 1.0 {
+                    return Err("A mask comparison reading layers or with a soft edge uses CPU compositing.");
+                }
                 if !value.is_finite() || !tolerance.is_finite() {
                     return Err("A mask comparison has invalid parameters.");
                 }
@@ -1135,7 +1179,8 @@ fn compile_mask(
                 };
                 Operation { ids: [0, COMPARE_OPCODE, compare, 0], low: [*value, *tolerance, 0.0, 0.0], ..Operation::zeroed() }
             }
-            EffectKind::Filter(Filter::BakedLighting { .. }) => continue,
+            // Lighting reads the base color, which a mask does not have
+            EffectKind::Filter(Filter::BakedLighting { .. } | Filter::EnvironmentLighting { .. }) => continue,
             _ => point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?,
         };
         if !effect.opacity.is_finite() {
@@ -1439,7 +1484,7 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
     let cell = generator.resolution.cell(resolution, resolution);
     op.spatial[2] = u32::from(generator.global.blur > 0.0 || generator.resolution.can_reduce());
     let blur = (generator.global.blur_radius_at(resolution).round() > 0.0)
-        .then(|| Filter::Blur { radius: generator.global.blur_radius() })
+        .then(|| Filter::Blur { radius: generator.global.blur_radius(), wrap: false })
         .and_then(|blur| NeighbourhoodFilter::new(&blur, resolution, resolution, 1.0, false));
     if let (Some(_), _) | (None, 2..) = (blur, cell) {
         inputs.generator_stages.push((blur, cell));
@@ -1453,35 +1498,39 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
     op.low.iter().chain(&op.projection).all(|x| x.is_finite()).then_some(op)
 }
 
+/// One effect as a GPU point operation, or a neighbourhood stage. None for any kind or setting
+/// the GPU program does not evaluate as the CPU does, so the stack composites on the CPU.
 fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operation> {
     use Filter::*;
-    if !effect.opacity.is_finite() {
+    if !effect.opacity.is_finite() || effect_needs_cpu(effect).is_some() {
         return None;
     }
     let mut op = Operation::zeroed();
     let (kind, params) = match &effect.kind {
         EffectKind::Levels(levels) => {
-            op.high[..2].copy_from_slice(&[levels.out_low, levels.out_high]);
+            // Unclamped Levels keep values outside the input range on the line through it
+            op.high[..3].copy_from_slice(&[levels.out_low, levels.out_high, f32::from(u8::from(levels.clamp))]);
             (20, [levels.in_low, levels.in_high, levels.gamma])
         }
         EffectKind::Filter(filter) => match filter {
             Invert => (21, [0.0; 3]),
-            Threshold { level } => (22, [*level, 0.0, 0.0]),
+            Threshold { level, mode: ThresholdMode::GreaterOrEqual } => (22, [*level, 0.0, 0.0]),
             ContrastLuminosity { contrast, luminosity } => (23, [*contrast, *luminosity, 0.0]),
-            Posterize { levels } => (24, [*levels, 0.0, 0.0]),
+            Posterize { levels, alpha: false } => (24, [*levels, 0.0, 0.0]),
             Clamp { min, max } => (25, [min.min(*max), min.max(*max), 0.0]),
-            HistogramScan { position, contrast } => (26, [*position, *contrast, 0.0]),
+            HistogramScan { position, contrast, invert_position: false } => (26, [*position, *contrast, 0.0]),
             HistogramRange { range, position } => (27, [*range, *position, 0.0]),
             HistogramShift { offset } => (28, [*offset, 0.0, 0.0]),
             Grayscale => (29, [0.0; 3]),
             NormalInvert => (30, [0.0; 3]),
-            Hsl { hue, saturation, lightness } => (31, [*hue, *saturation, *lightness]),
+            Hsl { hue, saturation, lightness, perceptive: false } => (31, [*hue, *saturation, *lightness]),
             ColorBalance { shadows, midtones, highlights } => {
                 op.high[..3].copy_from_slice(midtones);
                 op.projection[..3].copy_from_slice(highlights);
                 (32, *shadows)
             }
-            GradientMap { colors } => {
+            // An evenly spaced linear ramp read from the plain gray
+            GradientMap { colors, positions, quantity: None, input, linear: true, debug: false } if positions.is_empty() && input.is_unchanged() => {
                 op.procedural[1..3].copy_from_slice(&inputs.pack_rgb(colors)?);
                 (33, [0.0; 3])
             }
@@ -1490,13 +1539,16 @@ fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operat
                 op.projection[..2].copy_from_slice(&[tolerance.clamp(0.0, 1.0), softness.clamp(0.0, 1.0)]);
                 (34, *from)
             }
-            BakedLighting { azimuth, elevation, light, ambient, occlusion } => {
+            BakedLighting { azimuth, elevation, light, ambient, occlusion, stylized: None } => {
                 let (sa, ca) = azimuth.to_radians().sin_cos();
                 let (se, ce) = elevation.to_radians().sin_cos();
                 op.high[..3].copy_from_slice(&[ce * sa, se, ce * ca]);
                 (BAKED_LIGHTING_OPCODE, [*light, *ambient, occlusion.clamp(0.0, 1.0)])
             }
-            filter if filter.is_neighbourhood() => {
+            // Invert switched off and a filter not chosen yet change nothing
+            InvertOff | Empty => (NOOP_EFFECT_OPCODE, [0.0; 3]),
+            filter if gpu_neighbourhood::supports(filter) => {
+                // A known stage whose size reaches nothing leaves the field as the CPU does
                 let spatial = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, effect.opacity, false);
                 if spatial.is_some() {
                     op.ids[2] = inputs.filters.len() as u32;
@@ -1504,6 +1556,7 @@ fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operat
                 }
                 (if spatial.is_some() { NEIGHBOURHOOD_OPCODE } else { NOOP_EFFECT_OPCODE }, [0.0; 3])
             }
+            // Every other filter, and new settings of the ones above, composite on the CPU
             _ => return None,
         },
         _ => return None,
@@ -2460,7 +2513,7 @@ mod procedural_tests {
     use crate::{headless::Headless, readback::Readback};
     use texturecraft_compose::PatternContext;
     use texturecraft_compose::pattern::{Coords, procedural_in};
-    use texturecraft_core::{Fill, Layer, Mask, OutputResolution, Procedural, TextureSet};
+    use texturecraft_core::{Fill, HighpassSpace, Layer, Mask, OutputResolution, Procedural, TextureSet};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{srgb_lut, to_u16};
 
@@ -2478,7 +2531,7 @@ mod procedural_tests {
         project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
         let channels = [Channel::BaseColor, Channel::Height];
         let folder = project.alloc_id();
-        let mut group = Layer::new(folder, "Translucent folder", LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        let mut group = Layer::new(folder, "Translucent folder", LayerKind::folder(), &channels);
         group.channels.get_mut(&Channel::Height).unwrap().opacity = 0.45;
         project.insert_layer(0, group, None, false).unwrap();
         let lower = project.alloc_id();
@@ -2585,7 +2638,7 @@ mod procedural_tests {
         let channels = set.channel_list();
         project.texture_sets.push(set);
         let folder = project.alloc_id();
-        let mut group = Layer::new(folder, "One part", LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        let mut group = Layer::new(folder, "One part", LayerKind::folder(), &channels);
         for blend in group.channels.values_mut() {
             blend.mode = BlendMode::Passthrough;
         }
@@ -2702,7 +2755,7 @@ mod procedural_tests {
         );
         subtract.blend = BlendMode::Subtract;
         mask.effects.push(subtract);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 })));
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0, wrap: false })));
         layer.mask = Some(mask);
         project.insert_layer(0, layer, None, false).unwrap();
         let inputs = Inputs {
@@ -2770,7 +2823,7 @@ mod procedural_tests {
         paint.opacity = 0.78;
         paint.blend = BlendMode::Screen;
         let paint_id = paint.id;
-        let blur = Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 96.0 }));
+        let blur = Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 96.0, wrap: false }));
         let mut path = Effect::new(project.alloc_id(), EffectKind::Path(Vec::new()));
         path.opacity = 0.48;
         path.blend = BlendMode::Subtract;
@@ -2802,7 +2855,7 @@ mod procedural_tests {
             opacity: 0.8,
             erase: false,
             values: BTreeMap::from([(Channel::BaseColor, [0.11, 0.46, 0.22]), (Channel::Height, [0.42; 3])]),
-            mask_value: 1.0,
+            mask_gray: texturecraft_compose::MaskGray::Value(1.0),
             stencil: None,
             carried: BTreeMap::new(),
             carried_mask: None,
@@ -2879,19 +2932,19 @@ mod procedural_tests {
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[(size, 0)], 1);
 
         let filters = [
-            Filter::Blur { radius: 64.0 },
+            Filter::Blur { radius: 64.0, wrap: false },
             Filter::Sharpen { amount: 0.85 },
-            Filter::HighPass { radius: 64.0 },
-            Filter::Bevel { width: 128.0 },
+            Filter::HighPass { radius: 64.0, space: HighpassSpace::Working, alpha: false },
+            Filter::Bevel { width: 128.0, wrap: false },
             Filter::Glow { radius: 64.0, amount: 0.65 },
             Filter::DirectionalBlur { radius: 64.0, angle: 34.0 },
-            Filter::Warp { intensity: 64.0, scale: 6.0, seed: 11 },
-            Filter::DirectionalWarp { intensity: 64.0, angle: 40.0, scale: 6.0, seed: 11 },
+            Filter::Warp { intensity: 64.0, scale: 6.0, seed: 11, divider: 1 },
+            Filter::DirectionalWarp { intensity: 64.0, angle: 40.0, scale: 6.0, seed: 11, divider: 1 },
             Filter::EdgeDetect { width: 52.0 },
-            Filter::SlopeBlur { radius: 64.0, scale: 6.0, seed: 11 },
-            Filter::Mosaic { size: 64.0 },
+            Filter::SlopeBlur { radius: 64.0, scale: 6.0, seed: 11, divider: 1 },
+            Filter::Mosaic { size: 64.0, alpha: true },
         ];
-        let cases = filters.into_iter().map(|filter| (filter, BlendMode::Normal)).chain([(Filter::Blur { radius: 64.0 }, BlendMode::Replace)]);
+        let cases = filters.into_iter().map(|filter| (filter, BlendMode::Normal)).chain([(Filter::Blur { radius: 64.0, wrap: false }, BlendMode::Replace)]);
         for (filter, blend) in cases {
             let mut project = Project::new("Neighbourhood filters", "builtin:plane");
             project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
@@ -2906,7 +2959,7 @@ mod procedural_tests {
                 effect.opacity = 0.8;
                 stack.push(effect);
                 stack.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Clamp { min: 0.18, max: 0.86 })));
-                stack.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 24.0 })));
+                stack.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false })));
             }
             layer.mask = Some(mask);
             project.insert_layer(0, layer, None, false).unwrap();
@@ -3038,10 +3091,10 @@ mod procedural_tests {
         ]);
         let filters = [
             Filter::ColorBalance { shadows: [0.27, 0.06, -0.13], midtones: [-0.11, 0.23, 0.09], highlights: [0.08, 0.21, -0.08] },
-            Filter::GradientMap { colors: vec![[0.04, 0.13, 0.7], [0.85, 0.56, 0.22], [0.76, 0.11, 0.34]] },
-            Filter::GradientMap { colors: Vec::new() },
+            Filter::even_gradient(vec![[0.04, 0.13, 0.7], [0.85, 0.56, 0.22], [0.76, 0.11, 0.34]]),
+            Filter::even_gradient(Vec::new()),
             Filter::ReplaceColor { from: [0.2, 0.43, 0.72], to: [0.62, 0.35, 0.33], tolerance: 0.09, softness: 0.28 },
-            Filter::BakedLighting { azimuth: 30.0, elevation: 60.0, light: 0.6, ambient: 0.35, occlusion: 0.72 },
+            Filter::BakedLighting { azimuth: 30.0, elevation: 60.0, light: 0.6, ambient: 0.35, occlusion: 0.72, stylized: None },
         ];
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
         for filter in filters {
@@ -3134,7 +3187,7 @@ mod procedural_tests {
         let raw = [0.40101, 0.69217, 0.05289];
         let within = [0.375; 3];
         let exact = [0.21875, 0.78125, 0.09375];
-        let effect_kind = |tolerance| EffectKind::ColorSelection { colors: vec![raw, within, exact], tolerance };
+        let effect_kind = |tolerance| EffectKind::ColorSelection(ColorSelection::new(vec![raw, within, exact], tolerance));
         let mut select = Effect::new(project.alloc_id(), effect_kind(1.0 / 64.0));
         select.blend = BlendMode::Multiply;
         select.opacity = 0.75;
@@ -3330,7 +3383,7 @@ mod procedural_tests {
         let mut project = Project::new("Layer mask constraints", "builtin:plane");
         project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
         let folder_id = project.alloc_id();
-        let mut folder = Layer::new(folder_id, "Folder", LayerKind::Group { children: Vec::new(), collapsed: false }, &project.texture_sets[0].channel_list());
+        let mut folder = Layer::new(folder_id, "Folder", LayerKind::folder(), &project.texture_sets[0].channel_list());
         for blend in folder.channels.values_mut() {
             blend.mode = BlendMode::Passthrough;
         }
@@ -3352,7 +3405,18 @@ mod procedural_tests {
             project.alloc_id(),
             EffectKind::Fill { source: Source::Uniform([0.375; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
         ));
-        let mut compare = Effect::new(comparison, EffectKind::Compare { op: CompareOp::LesserThan, value: 0.5, tolerance: 0.0 });
+        let mut compare = Effect::new(
+            comparison,
+            EffectKind::Compare {
+                op: CompareOp::LesserThan,
+                value: 0.5,
+                tolerance: 0.0,
+                left: CompareSource::ThisMask,
+                right: CompareSource::Constant,
+                channel: Channel::Height,
+                hardness: 1.0,
+            },
+        );
         compare.opacity = 0.5;
         compare.blend = BlendMode::Multiply;
         mask.effects.push(compare);
@@ -3376,7 +3440,15 @@ mod procedural_tests {
         for (op, value, tolerance, passes, height_enabled) in cases {
             let layer = project.layer_mut(owner).unwrap();
             layer.channels.get_mut(&Channel::Height).unwrap().mode = if height_enabled { BlendMode::Normal } else { BlendMode::Disable };
-            layer.mask.as_mut().unwrap().effects[1].kind = EffectKind::Compare { op, value, tolerance };
+            layer.mask.as_mut().unwrap().effects[1].kind = EffectKind::Compare {
+                op,
+                value,
+                tolerance,
+                left: CompareSource::ThisMask,
+                right: CompareSource::Constant,
+                channel: Channel::Height,
+                hardness: 1.0,
+            };
             let inputs = Inputs {
                 project: &project,
                 ts: 0,
@@ -3449,7 +3521,7 @@ mod procedural_tests {
 
         let outer = project.alloc_id();
         let inner = project.alloc_id();
-        let group = |id, name| Layer::new(id, name, LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        let group = |id, name| Layer::new(id, name, LayerKind::folder(), &channels);
         let mut folder = group(outer, "Masked folder");
         for blend in folder.channels.values_mut() {
             // The CPU uses the group's channel opacity with the completed inner
@@ -3463,7 +3535,7 @@ mod procedural_tests {
         let mut mask = Mask::new(MaskBackground::Black);
         let position = Generator { direction: [1.0, 0.0, 0.0], softness: 0.18, ..Generator::new(GeneratorKind::Position) };
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(position)));
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 })));
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0, wrap: false })));
         folder.mask = Some(mask);
         project.insert_layer(0, folder, None, false).unwrap();
 
@@ -3555,7 +3627,7 @@ mod procedural_tests {
         let owner = project.alloc_id();
         let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.8, 0.45, 0.1]))]), ..Default::default() };
         let mut layer = Layer::new(owner, "Lit surface", LayerKind::Fill(fill), &channels);
-        let filter = Filter::BakedLighting { azimuth: 0.0, elevation: 20.0, light: 0.45, ambient: 0.45, occlusion: 1.0 };
+        let filter = Filter::BakedLighting { azimuth: 0.0, elevation: 20.0, light: 0.45, ambient: 0.45, occlusion: 1.0, stylized: None };
         layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(filter)));
         project.insert_layer(0, layer, None, false).unwrap();
 

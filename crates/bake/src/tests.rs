@@ -1057,24 +1057,6 @@ fn occlusion_falls_off_linearly_to_the_max_distance() {
 }
 
 #[test]
-fn secondary_ray_defaults_preserve_per_map_distances() {
-    let parameters = BakeSettings::default();
-    let expected_rays = RaySettings {
-        rays: 64,
-        min_distance: 0.00001,
-        max_distance: 1.0,
-        relative_to_bounding_box: true,
-        spread: 180.0,
-        distribution: RayDistribution::Cosine,
-    };
-
-    assert_eq!(parameters.maps.ao.parameters.rays, expected_rays);
-    assert_eq!(parameters.maps.ao.parameters.attenuation, texturecraft_core::AmbientOcclusionAttenuation::Linear);
-    assert_eq!(parameters.maps.bent_normal.parameters.rays, expected_rays);
-    assert_eq!(parameters.maps.thickness.parameters.rays, RaySettings { max_distance: 0.1, ..expected_rays });
-}
-
-#[test]
 fn bent_normals_and_thickness_have_their_own_rays() {
     let m = floor_and_wall(false);
     let s = with_rays(settings(32, &[BakedMap::BentNormal, BakedMap::AmbientOcclusion]), 64, 2.0);

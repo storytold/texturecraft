@@ -370,6 +370,41 @@ mod tests {
 
     use super::*;
 
+    /// A repeating map far denser than the tiles drawn (Scaling 64 turned 45°) still fills the whole window, its far corner too
+    #[test]
+    fn a_dense_repeating_preview_leaves_no_bare_field() {
+        use texturecraft_engine::core::TileTransform;
+
+        let tokens = Tokens::for_brightness(crate::theme::Brightness::MediumDark);
+        let transform = TileTransform { scaling: [64.0, 64.0], rotation: 45.0, ..TileTransform::LIBRARY };
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| lattice_preview(ui.painter(), rect, transform.affine(), true, &tokens));
+
+        // Whether a filled shape other than the bare field covers `point`
+        let covered = |point: Pos2| {
+            output.shapes.iter().any(|clipped| match &clipped.shape {
+                Shape::Rect(shape) => shape.fill != tokens.field && shape.fill != Color32::TRANSPARENT && shape.rect.contains(point),
+                Shape::Path(path) if path.fill != Color32::TRANSPARENT => {
+                    let corners = &path.points;
+                    let side = |index: usize| {
+                        let (from, to) = (corners[index], corners[(index + 1) % corners.len()]);
+                        (to - from).x * (point - from).y - (to - from).y * (point - from).x
+                    };
+                    let sides: Vec<f32> = (0..corners.len()).map(side).collect();
+                    sides.iter().all(|side| *side >= 0.0) || sides.iter().all(|side| *side <= 0.0)
+                }
+                _ => false,
+            })
+        };
+        for corner in [pos2(1.0, 1.0), pos2(99.0, 1.0), pos2(1.0, 99.0), pos2(99.0, 99.0)] {
+            assert!(covered(corner), "the preview fills {corner:?}");
+        }
+
+        // No renderer takes the uploads here
+        output.drop_without_applying_deltas();
+    }
+
     /// A hand-edited span past a full turn spaces the ring's dots as the engine spaces the copies: six copies 60° apart, none on top of another
     #[test]
     fn the_ring_spaces_its_copies_as_the_engine_does() {

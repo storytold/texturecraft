@@ -13,6 +13,10 @@ pub mod below;
 mod curvature_size_level;
 pub mod curvature_sizes;
 pub mod display;
+mod distance_envelope;
+mod effect_histogram;
+pub mod environment_sh;
+pub mod environment_sky;
 pub mod eval;
 mod fabric;
 pub mod fill_copies;
@@ -23,6 +27,7 @@ pub mod frame_placement;
 mod fur_lock;
 mod held_fields;
 mod image_identity;
+mod mask_gray;
 pub mod mip_level;
 mod organic;
 pub mod pattern;
@@ -31,6 +36,9 @@ pub mod projector_cover;
 pub mod projector_depth;
 mod projector_depth_cache;
 pub mod projector_view;
+mod shape_distance;
+mod slope_texel;
+mod soft_box;
 pub mod solo;
 pub mod store;
 pub mod thumb;
@@ -39,14 +47,18 @@ mod tile_pattern;
 mod tile_random_stream;
 mod timber;
 pub mod warp;
+mod warp_source_sample;
+mod warp_texel;
 
 pub use below::{BelowCache, StackKey};
 pub use display::{DisplayKind, display_tile_bytes, kinds_for, tile_bytes};
+pub use effect_histogram::EffectHistogram;
 pub use eval::{
-    BLOCK, Composite, Inputs, MASK_CHANNEL, PaintTarget, Stencil, StrokePreview, all_tiles, composite_tiles, composite_tiles_cached,
+    BLOCK, Composite, Inputs, MASK_CHANNEL, PaintTarget, Stencil, StrokePreview, all_tiles, compare_histograms, composite_tiles, composite_tiles_cached,
     composite_tiles_with_projectors, covered_tiles, effect_histogram, flatten_layer, mask_at, mask_image, mask_texels, mask_values, pad_tiles,
     stack_reads_neighbours,
 };
+pub use mask_gray::MaskGray;
 pub use pattern_context::PatternContext;
 pub use projector_depth_cache::ProjectorDepthCache;
 pub use solo::solo_project;

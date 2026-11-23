@@ -326,7 +326,7 @@ fn input_slot(app: &mut TextureCraftApp, ui: &mut Ui, (layer, id): (LayerId, u64
             });
         });
         combo(ui, tr("Source"), current.clone(), |ui| {
-            let anchors = anchors_below(app, layer);
+            let anchors = anchors_below(&app.session.doc.project, layer);
             if ui.selectable_label(source.is_none(), tr("Mesh map")).clicked() {
                 app.run("effect.set", json!({"effect": id, "input": input, "inputBaked": true}));
             }

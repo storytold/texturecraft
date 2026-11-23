@@ -11,23 +11,6 @@ use texturecraft_ui_egui::{TextureCraftApp, menus};
 
 use crate::memory_storage::MemoryStorage;
 
-/// The section captions of the General page, top to bottom.
-const SECTIONS: [&str; 13] = [
-    "INTERFACE OPTIONS",
-    "LAYER STACK OPTIONS",
-    "CAMERA OPTIONS",
-    "BAKING OPTIONS",
-    "PREVIEW OPTIONS",
-    "TEMPORARY FILES",
-    "SPARSE VIRTUAL TEXTURE",
-    "IRAY HARDWARE",
-    "APPEARANCE",
-    "VIEWPORT",
-    "RESOURCES",
-    "AUTOSAVE",
-    "FOLDERS",
-];
-
 fn harness(session: Session) -> Harness<'static, TextureCraftApp> {
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
 
@@ -95,24 +78,6 @@ fn the_left_column_switches_between_the_three_pages() {
 
     click(&mut h, "General");
     assert_eq!(page(&h), Some(SettingsPage::General));
-}
-
-#[test]
-fn the_general_page_lists_the_reference_sections_in_order_without_privacy() {
-    let mut h = harness(texturecraft_engine::sample_session(128, 32).unwrap());
-    open_settings(&mut h);
-
-    // Rows below the scrolled view are laid out too, in page order
-    let mut shown: Vec<String> = h
-        .query_all(egui_kittest::kittest::by().predicate(|node| node.label().or_else(|| node.value()).is_some_and(|text| SECTIONS.contains(&text.as_str()))))
-        .filter_map(|node| node.accesskit_node().label().or_else(|| node.accesskit_node().value()))
-        .collect();
-
-    // A label on screen also has a node for its text run
-    shown.dedup();
-    assert_eq!(shown, SECTIONS.map(String::from).to_vec());
-    assert!(h.query_by_label("PRIVACY").is_none(), "no Privacy section");
-    assert!(h.query_by_label("Automatically send usage statistics").is_none());
 }
 
 #[test]

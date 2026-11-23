@@ -15,14 +15,14 @@ pub(crate) enum Hold {
 
 impl Hold {
     /// The way this platform holds a pointer; Wayland is told apart from X11 the way the window system picks it
-    pub(crate) fn of_platform() -> Hold {
+    pub(crate) fn of_platform(ctx: &egui::Context) -> Hold {
         if cfg!(target_arch = "wasm32") {
             Hold::Free
         } else if cfg!(target_os = "macos") {
             Hold::Locked
         } else if cfg!(target_os = "windows") {
             Hold::PutBackFolded
-        } else if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        } else if !crate::uses_wayland(ctx) {
             Hold::PutBack
         } else {
             Hold::Locked
