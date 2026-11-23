@@ -29,13 +29,13 @@
 //! oracle test (`crate::gpu_composite::oracle`) in colour, another content channel and the mask,
 //! for each setting value, set to Disable too, at opacity below 1 with a non-Normal blend.
 
-use texturecraft_core::{Effect, Filter, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN};
+use texturecraft_core::{CurvePreset, Effect, Filter, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN};
 
 use super::packages::{POINT_OP_BITS, POINT_OPCODES};
 use super::{CompositeProgram, Operation, ProceduralInputs};
 
 /// Library filter ids P2 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["gradientMap", "gradientCurve", "gradientDynamic", "grayscale"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["gradientMap", "gradientDynamic", "grayscale"];
 
 // P2's opcodes (the same constants head composite_point.wgsl)
 const HSL_PERCEPTIVE: u32 = 128;
@@ -44,6 +44,7 @@ const HISTOGRAM_SCAN_INVERTED: u32 = 130;
 const COLOR_CORRECT: u32 = 131;
 const SMOOTHSTEP: u32 = 132;
 const HEIGHT_ADJUST: u32 = 133;
+const GRADIENT_CURVE: u32 = 134;
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_point.wgsl");
 /// The same functions without P2's code, for programs that do not use it.
@@ -85,7 +86,29 @@ pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, _inpu
             let multiply = if multiply.is_finite() { *multiply } else { 1.0 };
             Some((HEIGHT_ADJUST, [f32::from(u8::from(*invert)), offset, multiply]))
         }
+        Filter::GradientCurve { preset, invert, balance, contrast } => {
+            op.ids[2] = curve_shape(*preset);
+            Some((GRADIENT_CURVE, [*balance, *contrast, f32::from(u8::from(*invert))]))
+        }
         _ => None,
+    }
+}
+
+/// The shape `point_curve` in composite_point.wgsl draws for a Gradient Curve preset
+fn curve_shape(preset: CurvePreset) -> u32 {
+    match preset {
+        CurvePreset::Round => 0,
+        CurvePreset::Pinch => 1,
+        CurvePreset::Stairs => 2,
+        CurvePreset::EaseOut => 3,
+        CurvePreset::Ease => 4,
+        CurvePreset::EaseIn => 5,
+        CurvePreset::PeakOut => 6,
+        CurvePreset::Peak => 7,
+        CurvePreset::PeakIn => 8,
+        CurvePreset::Bump => 9,
+        CurvePreset::DoubleBump => 10,
+        CurvePreset::Triangular => 11,
     }
 }
 
@@ -106,7 +129,8 @@ mod tests {
 
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
-        BlendMode, Channel, ContentsOffset, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind, Mask, MaskBackground, Project, Source, TextureSet,
+        BlendMode, Channel, ContentsOffset, CurvePreset, Effect, EffectKind, Fill, Filter, Layer, LayerId, LayerKind, Mask, MaskBackground, Project, Source,
+        TextureSet,
     };
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TILE, to_u16, to_u16_signed};
@@ -269,6 +293,26 @@ mod tests {
         assert_filters_match_cpu(&soft, Tolerance::POINT);
         // Equal bounds are a step; the painted values sit away from it
         assert_filters_match_cpu(&step, Tolerance::POINT.with_flips(4));
+    }
+
+    #[test]
+    fn gradient_curve_presets_match_the_cpu() {
+        // Each preset at the library's balance, contrast and invert (Round is the library default)
+        let curve = |preset| Filter::GradientCurve { preset, invert: false, balance: 0.5, contrast: 0.0 };
+        let mut filters: Vec<Filter> = [CurvePreset::Round, CurvePreset::Pinch, CurvePreset::EaseOut, CurvePreset::Ease, CurvePreset::EaseIn]
+            .into_iter()
+            .chain([CurvePreset::PeakOut, CurvePreset::Peak, CurvePreset::PeakIn, CurvePreset::Triangular])
+            .map(curve)
+            .collect();
+        filters.push(Filter::GradientCurve { preset: CurvePreset::Round, invert: true, balance: 0.3, contrast: 0.4 });
+        filters.push(Filter::GradientCurve { preset: CurvePreset::Ease, invert: false, balance: 0.65, contrast: 0.8 });
+        let sines = [CurvePreset::Bump, CurvePreset::DoubleBump].map(curve);
+        let steps = [curve(CurvePreset::Stairs), Filter::GradientCurve { preset: CurvePreset::Round, invert: false, balance: 0.5, contrast: 1.0 }];
+
+        assert_filters_match_cpu(&filters, Tolerance::POINT);
+        assert_filters_match_cpu(&sines, Tolerance::TRANSCENDENTAL);
+        // Stairs and full contrast are hard decisions; the painted values sit away from them
+        assert_filters_match_cpu(&steps, Tolerance::POINT.with_flips(4));
     }
 
     #[test]

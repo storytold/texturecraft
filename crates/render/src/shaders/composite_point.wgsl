@@ -69,6 +69,15 @@ fn point_perceptive_adjust(op: Operation, c: vec3<f32>) -> vec3<f32> {
     return vec3(filter_unit(red), filter_unit(green), filter_unit(blue));
 }
 
+// The balance that keeps a gray, and the steepest soft contrast (gradient_input.rs)
+const POINT_NEUTRAL_BALANCE: f32 = 0.5;
+const POINT_MIN_STEEPNESS: f32 = 1e-3;
+
+// Gradient Curve's Stairs steps and Triangular teeth (curve_preset.rs)
+const POINT_STAIRS_STEPS: f32 = 4.0;
+const POINT_TRIANGULAR_TEETH: f32 = 2.0;
+const POINT_PI: f32 = 3.14159265358979;
+
 // Smoothstep bounds closer than this are a step (MIN_SMOOTHSTEP_SPAN in Rust)
 const POINT_MIN_SMOOTHSTEP_SPAN: f32 = 1e-6;
 
@@ -90,6 +99,39 @@ fn point_color_correct(op: Operation, c: vec3<f32>) -> vec3<f32> {
     let gray = point_luma(corrected);
     let gain = 2.0 * clamp(tone.z, 0.0, 1.0);
     return vec3(filter_unit(gray + (corrected.r - gray) * gain), filter_unit(gray + (corrected.g - gray) * gain), filter_unit(gray + (corrected.b - gray) * gain));
+}
+
+// A gray balanced, contrasted around mid gray and maybe inverted (shape_gray in Rust)
+fn point_shape_gray(x: f32, balance: f32, contrast: f32, invert: bool) -> f32 {
+    let balanced = filter_unit(x) + filter_unit(balance) - POINT_NEUTRAL_BALANCE;
+    let steepness = filter_unit(contrast);
+    var shaped = select(0.0, 1.0, balanced >= POINT_NEUTRAL_BALANCE);
+    if steepness != 1.0 {
+        shaped = filter_unit((balanced - POINT_NEUTRAL_BALANCE) / max(1.0 - steepness, POINT_MIN_STEEPNESS) + POINT_NEUTRAL_BALANCE);
+    }
+    return select(shaped, 1.0 - shaped, invert);
+}
+
+// A Gradient Curve preset at t, by the shape curve_shape picks in Rust (CurvePreset::at)
+fn point_curve(shape: u32, x: f32) -> f32 {
+    let t = filter_unit(x);
+    let peak = 1.0 - abs(2.0 * t - 1.0);
+    var y = t;
+    switch shape {
+        case 0u: { y = sqrt(1.0 - (1.0 - t) * (1.0 - t)); }
+        case 1u: { y = 1.0 - sqrt(1.0 - t * t); }
+        case 2u: { y = min(floor(t * POINT_STAIRS_STEPS) / (POINT_STAIRS_STEPS - 1.0), 1.0); }
+        case 3u: { y = 1.0 - (1.0 - t) * (1.0 - t); }
+        case 4u: { y = t * t * (3.0 - 2.0 * t); }
+        case 5u: { y = t * t; }
+        case 6u: { y = sqrt(peak); }
+        case 7u: { y = peak; }
+        case 8u: { y = peak * peak; }
+        case 9u: { y = sin(POINT_PI * t); }
+        case 10u: { y = abs(sin(2.0 * POINT_PI * t)); }
+        default: { y = 1.0 - abs((2.0 * POINT_TRIANGULAR_TEETH * t) % 2.0 - 1.0); }
+    }
+    return clamp(y, 0.0, 1.0);
 }
 
 // x in steps + 1 levels, as posterize in Rust
@@ -123,6 +165,8 @@ fn point_scalar_filter(op: Operation, x: f32) -> f32 {
             let flipped = select(x, 1.0 - x, op.low.x > 0.5);
             return filter_unit((flipped - 0.5) * op.low.z + 0.5 + op.low.y);
         }
+        // Gradient Curve: low.xyz balance, contrast and 1 to invert, ids.z the shape
+        case 134u: { return point_curve(op.ids.z, point_shape_gray(x, op.low.x, op.low.y, op.low.z > 0.5)); }
         default: { return x; }
     }
 }
