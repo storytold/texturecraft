@@ -31,7 +31,8 @@ use super::packages::{POINT_OP_BITS, POINT_OPCODES};
 use super::{CompositeProgram, Operation, ProceduralInputs};
 
 /// Library filter ids P2 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["hsl", "colorCorrect", "gradientMap", "gradientCurve", "gradientDynamic", "smoothstep", "heightAdjust", "grayscale"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] =
+    &["hsl", "colorCorrect", "gradientMap", "gradientCurve", "gradientDynamic", "smoothstep", "heightAdjust", "grayscale"];
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_point.wgsl");
 /// The same functions without P2's code, for programs that do not use it.

@@ -148,7 +148,8 @@ pub(crate) fn assert_matches_cpu(gpu: &mut Headless, case: &OracleCase, toleranc
 
     if let Some(owner) = case.mask_owner {
         let expected = mask_image(&inputs, owner, width).unwrap_or_else(|| panic!("{label}: no CPU mask"));
-        let mut mask = CompositeProgram::try_compile_mask_preview(case.project, case.pixels, case.ts, owner, None, None).unwrap_or_else(|reason| panic!("{label}: {reason}"));
+        let mut mask = CompositeProgram::try_compile_mask_preview(case.project, case.pixels, case.ts, owner, None, None)
+            .unwrap_or_else(|reason| panic!("{label}: {reason}"));
         mask.set_surface_inputs(case.mesh, &gbuf, Some(case.baked)).unwrap_or_else(|reason| panic!("{label}: {reason}"));
         mask.set_tile_images(case.images);
         gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, case.ts, &mask).unwrap_or_else(|error| panic!("{label}: {error}"));
@@ -228,7 +229,9 @@ mod tests {
     use std::sync::Arc;
 
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
-    use texturecraft_core::{Channel, Effect, EffectKind, Fill, Filter, Layer, LayerKind, Mask, MaskBackground, Project, Projection, Sampling, Source, TextureSet};
+    use texturecraft_core::{
+        Channel, Effect, EffectKind, Fill, Filter, Layer, LayerKind, Mask, MaskBackground, Project, Projection, Sampling, Source, TextureSet,
+    };
     use texturecraft_geom::primitives;
     use texturecraft_texel::TILE;
 

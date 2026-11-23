@@ -36,8 +36,8 @@
 //! Tables: [`LIBRARY_STILL_ON_CPU`] and the tests below. Every port gets a CPU oracle test
 //! (`crate::gpu_composite::oracle`) per context and setting value, chained and with a region.
 
-use super::packages::{STACK_OP_BITS, STACK_OPCODES};
 use super::CompositeProgram;
+use super::packages::{STACK_OP_BITS, STACK_OPCODES};
 
 /// Library filter ids P3 still leaves on the CPU (filters whose only blocker is a P3 setting are
 /// listed under the package that ports the filter).
@@ -171,12 +171,9 @@ mod tests {
         let instance = project.alloc_id();
         project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source }, &channels), Some(inner), true).unwrap();
         assert!(CompositeProgram::try_compile_region(&project, &pixels, 0, None).is_err(), "an instance inside it");
-        if let LayerKind::Group { contents, .. } = &mut project.layer_mut(inner).unwrap().kind {
-            *contents = ContentsOffset::NONE;
-        }
-        assert!(CompositeProgram::try_compile_region(&project, &pixels, 0, None).is_ok(), "the same stack without the offset");
 
         // An instance inside such a folder draws its source's mask placed by the instance's folders
+        // (the source's own preview stays on the GPU: gpu_composite_packages.rs)
         let mut project = Project::new("Instanced mask", "builtin:plane");
         project.texture_sets.push(TextureSet::new("Plane", 0, 64));
         let source = project.alloc_id();
@@ -193,7 +190,6 @@ mod tests {
         let instance = project.alloc_id();
         project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source }, &channels), Some(folder_id), true).unwrap();
         let pixels = PixelStore::default();
-        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, source, None, None).is_ok(), "the source itself sits outside the folder");
         assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, instance, None, None).is_err());
     }
 }

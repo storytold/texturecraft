@@ -292,9 +292,18 @@ pub(crate) struct NeighbourhoodGpu {
 }
 
 impl NeighbourhoodGpu {
+    /// The neighbourhood shader with the packages' files.
+    pub(crate) fn source() -> String {
+        [include_str!("shaders/noise.wgsl"), include_str!("shaders/neighbourhood.wgsl"), box_family::WGSL, gather::WGSL].join("\n")
+    }
+
+    /// The entry points of the built-in passes (the packages add theirs in their `Pipelines`).
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) const ENTRY_POINTS: [&str; 4] = ["box_blur", "apply_neighbourhood", "average_cells", "interpolate_cells"];
+
     pub(crate) fn new(device: &wgpu::Device) -> Self {
-        let source = [include_str!("shaders/noise.wgsl"), include_str!("shaders/neighbourhood.wgsl"), box_family::WGSL, gather::WGSL].join("\n");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc_neighbourhood"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+        let module = device
+            .create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc_neighbourhood"), source: wgpu::ShaderSource::Wgsl(Self::source().into()) });
         let pipeline = |entry: &'static str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
@@ -376,8 +385,8 @@ impl NeighbourhoodGpu {
             return;
         }
         // A package encodes its kinds itself when they need passes of their own
-        if (filter.kind.box_family() && box_family::encode(self, device, encoder, scratch, region, filter))
-            || (filter.kind.gather() && gather::encode(self, device, encoder, scratch, region, filter))
+        if (filter.kind.box_family() && box_family::encode((self, &self.box_family), device, encoder, scratch, region, filter))
+            || (filter.kind.gather() && gather::encode((self, &self.gather), device, encoder, scratch, region, filter))
         {
             return;
         }

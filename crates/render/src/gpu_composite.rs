@@ -233,6 +233,9 @@ struct ProceduralInputs {
     generator_stages: Vec<(Option<NeighbourhoodFilter>, u32)>,
     generator_sources: Vec<Operation>,
     anchors: AnchorInputs,
+    /// A neighbourhood stage a package lowering asked to run right before the effect's own
+    /// operation ([`Self::precede_with_stage`]); the callers of `point_effect` push it first.
+    preceding_stage: Option<Operation>,
 }
 
 #[derive(Default)]
@@ -275,7 +278,24 @@ impl ProceduralInputs {
             generator_stages: Vec::new(),
             generator_sources: Vec::new(),
             anchors: AnchorInputs::default(),
+            preceding_stage: None,
         }
+    }
+
+    /// Lets a package lowering (in `packages::lower_filter`) run the neighbourhood stage of
+    /// `filter` right before the effect's own operation: one effect, two operations. This is the
+    /// seam of the Gradient's `input.blur` (P4 defines the stage, P2 the gradient that follows).
+    /// The point operation then reads the stage's output field in place of the content, so a
+    /// stage that must keep the original colour (for the opacity mix) passes its derived value in
+    /// a component or the sixth field word, as P4 defines it. None, and nothing queued, when the
+    /// GPU has no stage for `filter` or its size reaches nothing.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn precede_with_stage(&mut self, filter: &Filter, opacity: f32) -> Option<()> {
+        NeighbourhoodFilter::new(filter, self.resolution, self.resolution, opacity, false)?;
+        let ids = [0, NEIGHBOURHOOD_OPCODE, u32::try_from(self.filters.len()).ok()?, 0];
+        self.filters.push((filter.clone(), opacity));
+        self.preceding_stage = Some(Operation { ids, low: [0.0, 0.0, 0.0, opacity.clamp(0.0, 1.0)], ..Operation::zeroed() });
+        Some(())
     }
 
     fn pack_rgb(&mut self, colors: &[[f32; 3]]) -> Option<[u32; 2]> {
@@ -804,9 +824,13 @@ impl CompositeProgram {
                 } else {
                     Some(content_filter(effect, &mut procedural).ok_or("A layer effect uses CPU compositing.")?)
                 };
+                // A lowering with a stage before its operation takes two operations
+                let stage = procedural.preceding_stage.take();
+                visible_cut += u32::from(stage.is_some());
                 if per_channel {
-                    templates.push((effect, op));
+                    templates.push((effect, stage, op));
                 } else if let Some(op) = op {
+                    effects.extend(stage);
                     effects.push(op);
                 }
             }
@@ -846,7 +870,8 @@ impl CompositeProgram {
                 };
                 let content_start = if per_channel { effects.len() as u32 } else { shared_content };
                 let mut adds_coverage = false;
-                for &(effect, template) in &templates {
+                for &(effect, stage, template) in &templates {
+                    effects.extend(stage);
                     let op = if let Some(op) = template {
                         op
                     } else if let Some(op) = content_deposit(effect, channel, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))? {
@@ -902,6 +927,11 @@ impl CompositeProgram {
                 operations.push(op);
             }
             packages::order_layer_operations(&mut operations[first_op..]);
+            if height_op != 0 {
+                // The reorder can move the Height operation that the height mask reads
+                let height = operations[first_op..].iter().position(|op| op.ids[0] == channel_slot(Channel::Height));
+                height_op = height.map_or(0, |index| (first_op + index) as u32 + 1);
+            }
             for op in &mut operations[first_op..] {
                 op.constraints = [geometry_mask, height_op, height_params[0], height_params[1]];
             }
@@ -1068,7 +1098,10 @@ pub fn library_filters_still_on_cpu() -> Vec<(&'static str, &'static str)> {
 
 fn needs_surface(operations: &[Operation]) -> bool {
     operations.iter().any(|op| {
-        op.procedural[3] != 0 || op.ids[1] == BAKED_LIGHTING_OPCODE || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]) || packages::needs_surface(op)
+        op.procedural[3] != 0
+            || op.ids[1] == BAKED_LIGHTING_OPCODE
+            || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1])
+            || packages::needs_surface(op)
     })
 }
 
@@ -1263,6 +1296,8 @@ fn compile_mask(
         }
         op.low[3] = effect.opacity.clamp(0.0, 1.0);
         op.balance[2] = blend_code(effect.blend) as f32;
+        // A lowering with a stage before its operation (`ProceduralInputs::precede_with_stage`)
+        effects.extend(procedural.preceding_stage.take());
         effects.push(op);
     }
     Ok(if mask.background == MaskBackground::White { 1.0 } else { 0.0 })

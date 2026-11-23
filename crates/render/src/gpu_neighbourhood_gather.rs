@@ -68,7 +68,7 @@ pub(super) fn work_per_texel(_filter: NeighbourhoodFilter) -> u64 {
 
 /// Encodes a P5 stage with passes of its own; false lets the apply pass run.
 pub(super) fn encode(
-    _gpu: &NeighbourhoodGpu,
+    (_gpu, _pipelines): (&NeighbourhoodGpu, &Pipelines),
     _device: &wgpu::Device,
     _encoder: &mut wgpu::CommandEncoder,
     _scratch: &wgpu::Buffer,

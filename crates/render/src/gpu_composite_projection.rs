@@ -37,7 +37,8 @@ pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_projection.wgsl");
 /// The same functions without P1's code, for programs that do not use it.
-pub(super) const WGSL_STUB: &str = "fn projection_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(value(layer, uv, surface), 1.0); }";
+pub(super) const WGSL_STUB: &str =
+    "fn projection_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(value(layer, uv, surface), 1.0); }";
 
 /// Whether the GPU encodes `projection` with `sampling` as the CPU evaluates it.
 pub(super) fn supports(projection: &Projection, sampling: Sampling) -> bool {

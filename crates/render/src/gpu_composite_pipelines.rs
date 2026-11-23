@@ -234,24 +234,116 @@ impl CompositePipelines {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{Features, ShaderFlags};
-    use crate::gpu_composite::oracle;
+    use crate::gpu_composite::{GpuCompositor, oracle};
+    use crate::gpu_neighbourhood::NeighbourhoodGpu;
 
-    /// Every package WGSL file (and every stub) must compile into the composite shader, also
-    /// while no program selects it yet.
-    #[test]
-    fn package_shaders_compile_in_full_and_as_stubs() {
-        let Some(gpu) = oracle::headless() else { return };
-        for packages in [ShaderFlags::default(), ShaderFlags::ALL] {
-            for spatial in [false, true] {
-                let features = Features { spatial, mask_effects: true, content_effects: true, packages, ..Features::default() };
-                let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
-                let _module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("tc_gpu_composite_packages"),
-                    source: wgpu::ShaderSource::Wgsl(features.source(true, true).into()),
-                });
-                let error = pollster::block_on(scope.pop());
-                assert!(error.is_none(), "packages {packages:?}, spatial {spatial}: {error:?}");
+    /// Every package stub, each package in full alone and all in full, each with and without
+    /// neighbourhood fields, plus a mask preview and a program using every other feature.
+    fn variants() -> Vec<Features> {
+        let mut packages = vec![ShaderFlags::default(), ShaderFlags::ALL];
+        packages.extend(ShaderFlags::EACH);
+        let mut variants: Vec<Features> = packages
+            .into_iter()
+            .flat_map(|packages| [false, true].map(|spatial| Features { spatial, mask_effects: true, content_effects: true, packages, ..Features::default() }))
+            .collect();
+        variants.push(Features { mask_preview: true, spatial: true, mask_effects: true, packages: ShaderFlags::ALL, ..Features::default() });
+        variants.push(Features {
+            patterns: true,
+            extended_patterns: true,
+            tile_generator: true,
+            authored_images: true,
+            mask_preview: false,
+            extended_blend_modes: true,
+            generators: true,
+            curvature: true,
+            sampled_generator_inputs: true,
+            spatial: true,
+            mask_effects: true,
+            content_effects: true,
+            height_mask: true,
+            anchors: true,
+            material_anchors: true,
+            color_selection: true,
+            packages: ShaderFlags::ALL,
+        });
+        variants
+    }
+
+    fn entry_points(features: Features) -> Vec<&'static str> {
+        if features.spatial { vec!["compose", "prepare_filter"] } else { vec!["compose"] }
+    }
+
+    #[allow(clippy::panic)] // A test helper: a shader that does not translate fails the test
+    /// Parse and validate `source`, then write GLSL (GLES 3.1 and desktop 4.3, the GL backends'
+    /// path) for every entry point with the override constants of both group variants.
+    fn naga_check(label: &str, source: &str, entries: &[&str], constants: &[Vec<(&'static str, f64)>]) {
+        let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|error| panic!("{label}: {}", error.emit_to_string(source)));
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32)
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        for constants in constants {
+            let mut values = naga::back::PipelineConstants::default();
+            values.extend(constants.iter().map(|&(name, value)| (name.to_owned(), value)));
+            for &entry in entries {
+                let (module, info) = naga::back::pipeline_constants::process_overrides(&module, &info, Some((naga::ShaderStage::Compute, entry)), &values)
+                    .unwrap_or_else(|error| panic!("{label} {entry}: {error}"));
+                for version in [naga::back::glsl::Version::new_gles(310), naga::back::glsl::Version::Desktop(430)] {
+                    let options = naga::back::glsl::Options { version, ..Default::default() };
+                    let pipeline =
+                        naga::back::glsl::PipelineOptions { shader_stage: naga::ShaderStage::Compute, entry_point: entry.to_owned(), multiview: None };
+                    let mut glsl = String::new();
+                    naga::back::glsl::Writer::new(&mut glsl, &module, &info, &options, &pipeline, naga::proc::BoundsCheckPolicies::default())
+                        .and_then(|mut writer| writer.write())
+                        .unwrap_or_else(|error| panic!("{label} {entry} {version:?} {constants:?}: {error}"));
+                }
             }
         }
+    }
+
+    /// Every package WGSL file and stub, in the composite and the neighbourhood shader, without
+    /// an adapter: so this never skips.
+    #[test]
+    fn package_shaders_validate_and_write_glsl_without_an_adapter() {
+        for features in variants() {
+            for (curvature, id) in [(false, false), (true, true)] {
+                let constants = [false, true].map(|grouped| features.constants(grouped).to_vec());
+                naga_check(&format!("{features:?} curvature {curvature} id {id}"), &features.source(curvature, id), &entry_points(features), &constants);
+            }
+        }
+        naga_check("neighbourhood", &NeighbourhoodGpu::source(), &NeighbourhoodGpu::ENTRY_POINTS, &[Vec::new()]);
+    }
+
+    /// The same programs as compute pipelines on the adapter, as `CompositePipelines::get`
+    /// creates them (both group variants), and the neighbourhood pipelines.
+    #[test]
+    fn package_shaders_build_compute_pipelines_in_full_and_as_stubs() {
+        let Some(gpu) = oracle::headless() else { return };
+        let compositor = GpuCompositor::new(&gpu.device);
+        let (curvature, id) = (compositor.pipelines.supports_curvature, compositor.pipelines.supports_id);
+        for features in variants() {
+            let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tc_gpu_composite_packages"),
+                source: wgpu::ShaderSource::Wgsl(features.source(curvature, id).into()),
+            });
+            for grouped in [false, true] {
+                for entry in entry_points(features) {
+                    let _pipeline = gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(entry),
+                        layout: Some(&compositor.pipeline_layout),
+                        module: &module,
+                        entry_point: Some(entry),
+                        compilation_options: wgpu::PipelineCompilationOptions { constants: &features.constants(grouped), ..Default::default() },
+                        cache: None,
+                    });
+                }
+            }
+            let error = pollster::block_on(scope.pop());
+            assert!(error.is_none(), "{features:?} on {}: {error:?}", gpu.adapter_name);
+        }
+        let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _neighbourhood = NeighbourhoodGpu::new(&gpu.device);
+        let error = pollster::block_on(scope.pop());
+        assert!(error.is_none(), "neighbourhood on {}: {error:?}", gpu.adapter_name);
     }
 }

@@ -31,3 +31,5 @@ wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 image = { workspace = true }
+# The version wgpu uses: checks the composite and neighbourhood WGSL and its GLSL output without an adapter
+naga = { version = "30.0.1", features = ["wgsl-in", "glsl-out"] }
