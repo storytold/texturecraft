@@ -2,8 +2,7 @@
 // Compiled into the composite shader when the program needs it, else replaced by the stub
 // string in the Rust module (keep both signatures identical).
 
-// Opcodes of P2's block (the constants in gpu_composite_point.rs)
-const POINT_HSL_PERCEPTIVE: u32 = 128u;
+// Opcodes of P2's block that the loop-level hooks test (the constants in gpu_composite_point.rs)
 const POINT_POSTERIZE_ALPHA: u32 = 129u;
 
 // Histogram Scan's narrowest soft cut (SCAN_MIN_WIDTH in Rust)
@@ -70,6 +69,29 @@ fn point_perceptive_adjust(op: Operation, c: vec3<f32>) -> vec3<f32> {
     return vec3(filter_unit(red), filter_unit(green), filter_unit(blue));
 }
 
+// Smoothstep bounds closer than this are a step (MIN_SMOOTHSTEP_SPAN in Rust)
+const POINT_MIN_SMOOTHSTEP_SPAN: f32 = 1e-6;
+
+// Color Correct's [contrast, luminosity, saturation] at a lightness: shadows in low, midtones in high, highlights in projection
+fn point_tone(op: Operation, lightness: f32) -> vec3<f32> {
+    let l = filter_unit(lightness);
+    return op.low.xyz * ((1.0 - l) * (1.0 - l)) + op.high.xyz * (2.0 * l * (1.0 - l)) + op.projection.xyz * (l * l);
+}
+
+// Color Correct's contrast around mid gray and luminosity shift
+fn point_correct(x: f32, tone: vec3<f32>) -> f32 {
+    return (x - 0.5) * (1.0 + clamp(tone.x, -1.0, 1.0)) + 0.5 + clamp(tone.y, -1.0, 1.0);
+}
+
+// Color Correct on a colour: each component corrected, then the saturation scales them around their gray
+fn point_color_correct(op: Operation, c: vec3<f32>) -> vec3<f32> {
+    let tone = point_tone(op, point_luma(c));
+    let corrected = vec3(point_correct(c.r, tone), point_correct(c.g, tone), point_correct(c.b, tone));
+    let gray = point_luma(corrected);
+    let gain = 2.0 * clamp(tone.z, 0.0, 1.0);
+    return vec3(filter_unit(gray + (corrected.r - gray) * gain), filter_unit(gray + (corrected.g - gray) * gain), filter_unit(gray + (corrected.b - gray) * gain));
+}
+
 // x in steps + 1 levels, as posterize in Rust
 fn point_posterize(steps: f32, x: f32) -> f32 {
     return floor(filter_unit(x) * steps + 0.5) / steps;
@@ -88,6 +110,19 @@ fn point_scalar_filter(op: Operation, x: f32) -> f32 {
             let width = max(1.0 - clamp(op.low.y, 0.0, 1.0), POINT_SCAN_MIN_WIDTH);
             return filter_unit((x - op.low.x) / width + 0.5);
         }
+        case 131u: { return filter_unit(point_correct(x, point_tone(op, x))); }
+        // Smoothstep: low.xy the bounds in order
+        case 132u: {
+            let span = op.low.y - op.low.x;
+            if span <= POINT_MIN_SMOOTHSTEP_SPAN { return select(0.0, 1.0, x >= op.low.y); }
+            let t = clamp((x - op.low.x) / span, 0.0, 1.0);
+            return t * t * (3.0 - 2.0 * t);
+        }
+        // Height Adjust: low.x 1 to invert, low.y the offset, low.z the multiplier
+        case 133u: {
+            let flipped = select(x, 1.0 - x, op.low.x > 0.5);
+            return filter_unit((flipped - 0.5) * op.low.z + 0.5 + op.low.y);
+        }
         default: { return x; }
     }
 }
@@ -95,8 +130,12 @@ fn point_scalar_filter(op: Operation, x: f32) -> f32 {
 // A P2 opcode on a content channel; channel is the destination slot (0 Base Color, 6 Height,
 // 7 Normal, 8..10 colour lobes; channel_slot in Rust).
 fn point_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> {
-    if point_is_color(channel) && op.ids.y == POINT_HSL_PERCEPTIVE {
-        return point_perceptive_adjust(op, c);
+    if point_is_color(channel) {
+        switch op.ids.y {
+            case 128u: { return point_perceptive_adjust(op, c); }
+            case 131u: { return point_color_correct(op, c); }
+            default: {}
+        }
     }
     return point_per_unit(op, c, channel);
 }

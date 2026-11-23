@@ -35,13 +35,15 @@ use super::packages::{POINT_OP_BITS, POINT_OPCODES};
 use super::{CompositeProgram, Operation, ProceduralInputs};
 
 /// Library filter ids P2 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] =
-    &["colorCorrect", "gradientMap", "gradientCurve", "gradientDynamic", "smoothstep", "heightAdjust", "grayscale"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["gradientMap", "gradientCurve", "gradientDynamic", "grayscale"];
 
 // P2's opcodes (the same constants head composite_point.wgsl)
 const HSL_PERCEPTIVE: u32 = 128;
 const POSTERIZE_ALPHA: u32 = 129;
 const HISTOGRAM_SCAN_INVERTED: u32 = 130;
+const COLOR_CORRECT: u32 = 131;
+const SMOOTHSTEP: u32 = 132;
+const HEIGHT_ADJUST: u32 = 133;
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_point.wgsl");
 /// The same functions without P2's code, for programs that do not use it.
@@ -68,6 +70,21 @@ pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, _inpu
             Some((POSTERIZE_ALPHA, [steps, 0.0, 0.0]))
         }
         Filter::HistogramScan { position, contrast, invert_position: true } => Some((HISTOGRAM_SCAN_INVERTED, [1.0 - position, *contrast, 0.0])),
+        Filter::ColorCorrect { shadows, midtones, highlights } => {
+            op.high[..3].copy_from_slice(midtones);
+            op.projection[..3].copy_from_slice(highlights);
+            Some((COLOR_CORRECT, *shadows))
+        }
+        Filter::Smoothstep { min, max } => {
+            // The bounds in order, as `smoothstep` reads them
+            let (low, high) = (min.min(*max), min.max(*max));
+            Some((SMOOTHSTEP, [if low.is_finite() { low } else { 0.0 }, if high.is_finite() { high } else { 1.0 }, 0.0]))
+        }
+        Filter::HeightAdjust { invert, offset, multiply } => {
+            let offset = if offset.is_finite() { *offset } else { 0.0 };
+            let multiply = if multiply.is_finite() { *multiply } else { 1.0 };
+            Some((HEIGHT_ADJUST, [f32::from(u8::from(*invert)), offset, multiply]))
+        }
         _ => None,
     }
 }
@@ -225,11 +242,51 @@ mod tests {
         assert_filters_match_cpu(&hard, Tolerance::POINT.with_flips(4));
     }
 
+    #[test]
+    fn color_correct_matches_the_cpu() {
+        let filters = [
+            // The library default
+            Filter::ColorCorrect { shadows: [0.0, 0.0, 0.5], midtones: [0.0, 0.0, 0.5], highlights: [0.0, 0.0, 0.5] },
+            Filter::ColorCorrect { shadows: [0.3, -0.1, 0.2], midtones: [-0.2, 0.15, 0.7], highlights: [0.1, 0.05, 0.4] },
+            // Contrast and luminosity beyond their range clamp
+            Filter::ColorCorrect { shadows: [1.4, 0.6, 1.0], midtones: [-1.0, -0.3, 0.0], highlights: [0.5, -1.2, 0.9] },
+        ];
+
+        assert_filters_match_cpu(&filters, Tolerance::POINT);
+    }
+
+    #[test]
+    fn smoothstep_matches_the_cpu() {
+        let soft = [
+            // The library default
+            Filter::Smoothstep { min: 0.0, max: 1.0 },
+            Filter::Smoothstep { min: 0.2, max: 0.8 },
+            // Swapped bounds read in order
+            Filter::Smoothstep { min: 0.7, max: 0.3 },
+        ];
+        let step = [Filter::Smoothstep { min: 0.55, max: 0.55 }];
+
+        assert_filters_match_cpu(&soft, Tolerance::POINT);
+        // Equal bounds are a step; the painted values sit away from it
+        assert_filters_match_cpu(&step, Tolerance::POINT.with_flips(4));
+    }
+
+    #[test]
+    fn height_adjust_matches_the_cpu() {
+        let filters = [
+            // The library default
+            Filter::HeightAdjust { invert: false, offset: 0.0, multiply: 1.0 },
+            Filter::HeightAdjust { invert: true, offset: 0.1, multiply: 1.5 },
+            Filter::HeightAdjust { invert: false, offset: -0.2, multiply: 0.6 },
+        ];
+
+        assert_filters_match_cpu(&filters, Tolerance::POINT);
+    }
+
     /// P2's filters and settings that still composite on the CPU, in content and in masks. Port
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
     fn still_on_cpu() -> Vec<Filter> {
         vec![
-            Filter::Smoothstep { min: 0.2, max: 0.8 },
             Filter::GradientMap {
                 colors: vec![[0.0; 3], [1.0; 3]],
                 positions: vec![0.0, 0.3],
