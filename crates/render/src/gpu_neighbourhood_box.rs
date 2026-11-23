@@ -24,16 +24,20 @@
 //! - Wrapping stages ([`wraps`]) set `FilterStage::wrap`: the prepare pass then fills their field
 //!   periodically past the set's edges, so the box passes stay local.
 //!
-//! - The Gradient's `input.blur` (with P2): P4 provides the stage (a kind whose output keeps the
-//!   original colour for the opacity mix and carries the blurred gray where P2's gradient reads
-//!   it); P2's `lower` queues it with `ProceduralInputs::precede_with_stage` before the gradient.
+//! - The Gradient's `input.blur` (with P2): P4 provides the stage `PRE_BLUR`. Its output keeps the
+//!   original premultiplied texel in words 0-3 for the gradient's opacity mix and the blurred gray
+//!   in word 4 (`preceding_stage_word`): `GrayscaleMode::gray` of the blurred straight colour for
+//!   colour, the blurred first component for other channels and masks. A normal map's gradient is
+//!   the identity, so there the stage writes the final value, the blurred normal mixed in by the
+//!   opacity, and word 4 stays 0. P2's `lower` queues it with
+//!   `ProceduralInputs::precede_with_stage` before the gradient; [`supports`] stays false for it.
 //!
 //! Tables: [`LIBRARY_STILL_ON_CPU`] and `still_on_cpu` in the tests below. Every port gets a CPU
 //! oracle test (`crate::gpu_composite::oracle`, `Tolerance::NEIGHBOURHOOD`) on paint and in a
 //! mask, chained, and with a partial region (the halo); distance filters also compare the raw
 //! distance field exactly.
 
-use texturecraft_core::{ChannelKind, Filter, HighpassSpace};
+use texturecraft_core::{ChannelKind, Filter, GrayscaleMode, HighpassSpace};
 
 use super::{APPLY_WORKGROUP, BOX_KINDS, BOX_PASSES, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs};
 
@@ -50,6 +54,9 @@ const WRAPPED_BLUR: Kind = Kind(BOX_KINDS.start + 1);
 const WRAPPED_BEVEL: Kind = Kind(BOX_KINDS.start + 2);
 /// Highpass of colour in an sRGB space, or of the alpha too.
 const HIGHPASS: Kind = Kind(BOX_KINDS.start + 3);
+/// The Gradient's input blur, queued by P2 before the gradient: the original texel in words 0-3
+/// of the output and the blurred gray in word 4 (a normal map's blur mixed in by the opacity).
+const PRE_BLUR: Kind = Kind(BOX_KINDS.start + 4);
 
 /// Filter sizes are texels at this many texels per side, as the CPU scales them.
 const FILTER_SIZE_RESOLUTION: f32 = 2048.0;
@@ -76,6 +83,7 @@ impl Pipelines {
 }
 
 /// Whether a P4 stage evaluates `filter` as the CPU does.
+/// The Gradient's input blur is no effect of its own: P2 queues [`new`]'s stage for it before the gradient.
 pub(super) fn supports(filter: &Filter) -> bool {
     matches!(filter, Filter::Mosaic { alpha: false, .. } | Filter::Blur { wrap: true, .. } | Filter::Bevel { wrap: true, .. } | Filter::HighPass { .. })
 }
@@ -91,7 +99,23 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
         // Three box passes ramp an edge over about twice their radius
         Filter::Bevel { width, wrap: true } => Some(stage.filter(WRAPPED_BEVEL, texels(*width * 0.5))),
         Filter::HighPass { radius, space, alpha } => Some(highpass(stage, texels(*radius), *space, *alpha)),
+        Filter::GradientMap { input, debug: false, .. } if input.blur > 0.0 => {
+            let mut blur = stage.filter(PRE_BLUR, texels(input.blur));
+            blur.words[0] = gray_mode(input.mode);
+            Some(blur)
+        }
         _ => None,
+    }
+}
+
+/// `GrayscaleMode` as the WGSL `box_gray_of` numbers it.
+fn gray_mode(mode: GrayscaleMode) -> u32 {
+    match mode {
+        GrayscaleMode::Desaturation => 0,
+        GrayscaleMode::Luma => 1,
+        GrayscaleMode::Average => 2,
+        GrayscaleMode::Max => 3,
+        GrayscaleMode::Min => 4,
     }
 }
 
@@ -120,7 +144,7 @@ pub(crate) fn wraps(filter: NeighbourhoodFilter) -> bool {
 }
 
 pub(super) fn uses_box(filter: NeighbourhoodFilter) -> bool {
-    matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL | HIGHPASS)
+    matches!(filter.kind, WRAPPED_BLUR | WRAPPED_BEVEL | HIGHPASS | PRE_BLUR)
 }
 
 pub(super) fn reach(filter: NeighbourhoodFilter) -> u32 {
@@ -134,6 +158,7 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
     match filter.kind {
         PIXELATE_KEEPING_ALPHA => BILINEAR_SAMPLE_WORK,
         HIGHPASS => BOX_FILTER_WORK + OWN_PASS_WORK,
+        PRE_BLUR => BOX_FILTER_WORK + OWN_PASS_WORK,
         _ => BOX_FILTER_WORK,
     }
 }
@@ -192,6 +217,10 @@ pub(super) fn encode(
             let blurred = box_passes(&mut run, &gpu.box_blur, region, output, filter.radius);
             run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups);
         }
+        PRE_BLUR => {
+            let blurred = box_passes(&mut run, &gpu.box_blur, region, original, filter.radius);
+            run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups);
+        }
         // Pixelate gathers and the wrapping filters run the built-in passes
         _ => return false,
     }
@@ -202,17 +231,20 @@ pub(super) fn encode(
 mod tests {
     use std::sync::Arc;
 
-    use crate::gpu_composite::CompositeRegion;
-    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
-    use crate::headless::Headless;
     use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
     use texturecraft_core::{
-        BakedMap, BlendMode, Channel, ContentsOffset, Effect, EffectKind, Filter, Generator, GeneratorKind, GradientInput, HighpassSpace, Layer, LayerId,
-        LayerKind, Mask, MaskBackground, Project, Source, TextureSet,
+        BakedMap, BlendMode, Channel, ChannelKind, ContentsOffset, Effect, EffectKind, Filter, Generator, GeneratorKind, GradientInput, GrayscaleMode,
+        HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground, Project, Source, TextureSet,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TileImage, to_u16, to_u16_signed};
+    use wgpu::util::DeviceExt;
+
+    use super::super::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, StageInputs};
+    use crate::gpu_composite::CompositeRegion;
+    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
+    use crate::headless::Headless;
 
     /// Side of the oracle sets, in texels.
     const SIZE: u32 = 128;
@@ -239,6 +271,7 @@ mod tests {
 
     /// P4's filters and settings that still composite on the CPU, in content and in masks. Port
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
+    /// The Gradient's input blur compiles once P2's gradient queues P4's stage before it.
     fn still_on_cpu() -> Vec<Filter> {
         vec![
             Filter::DropShadow { angle: 45.0, distance: 0.02, size: 8.0, spread: 0.0, opacity: 1.0, color: [0.0; 3] },
@@ -481,5 +514,137 @@ mod tests {
         ];
 
         assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
+    }
+
+    /// A stage's inputs at 2K texels across, as a material channel of `channel` kind or a mask.
+    fn stage_at_2k(channel: Option<ChannelKind>, opacity: f32) -> StageInputs {
+        StageInputs { resolution: 2048, longest_side: 2048, opacity, channel }
+    }
+
+    /// The scratch buffer of four fields (original, two blur fields, output) of `texels`
+    /// (premultiplied value and coverage) and their region.
+    fn fields_on_gpu(gpu: &Headless, texels: &[([f32; 4], f32)], (width, height): (u32, u32)) -> (wgpu::Buffer, NeighbourhoodRegion) {
+        let field = width * height * FIELD_WORDS;
+        let mut words = vec![0u32; 4 * field as usize];
+        for (texel, (value, coverage)) in words.as_chunks_mut::<{ FIELD_WORDS as usize }>().0.iter_mut().zip(texels) {
+            texel[..4].copy_from_slice(&value.map(f32::to_bits));
+            texel[4] = coverage.to_bits();
+        }
+        let scratch = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tc_box_family_test_fields"),
+            contents: bytemuck::cast_slice(&words),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let region = NeighbourhoodRegion {
+            rect: [0, 0, width, height],
+            original: 0,
+            blur: [field, 2 * field],
+            output: 3 * field,
+            field_words: FIELD_WORDS,
+            input: 0,
+            wrap: false,
+            bounds: [0, 0, width as i32, height as i32],
+        };
+        (scratch, region)
+    }
+
+    /// The four fields' words, texel by texel, after the passes in `encoder`.
+    fn read_fields(gpu: &Headless, mut encoder: wgpu::CommandEncoder, scratch: &wgpu::Buffer) -> Vec<[u32; 5]> {
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tc_box_family_test_read"),
+            size: scratch.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(scratch, 0, &staging, 0, Some(scratch.size()));
+        gpu.queue.submit([encoder.finish()]);
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        // A failed mapping reads no texels, which the tests' comparisons then report
+        let Ok(bytes) = staging.slice(..).get_mapped_range() else { return Vec::new() };
+        bytemuck::cast_slice::<u8, u32>(&bytes).as_chunks::<5>().0.to_vec()
+    }
+
+    /// The fields after running the stage `filter` over `texels` as the compositor does.
+    fn run_stage(gpu: &Headless, texels: &[([f32; 4], f32)], size: (u32, u32), filter: NeighbourhoodFilter) -> Vec<[u32; 5]> {
+        let (scratch, region) = fields_on_gpu(gpu, texels, size);
+        let kernels = NeighbourhoodGpu::new(&gpu.device);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        kernels.encode(&gpu.device, &mut encoder, &scratch, region, filter);
+        read_fields(gpu, encoder, &scratch)
+    }
+
+    /// The pre-blur stage keeps the original texel in words 0-3 and leaves in word 4 the gray of
+    /// the blurred colour (the Blur stage's) by each of the gradient's modes, its first component
+    /// in other channels and masks; a normal map gets the blurred normal mixed in by the opacity.
+    #[test]
+    fn the_pre_blur_stage_keeps_the_texel_and_leaves_the_blurred_gray() {
+        let Some(gpu) = headless() else { return };
+        let (width, height) = (40u32, 24u32);
+        let texels: Vec<([f32; 4], f32)> = (0..width * height)
+            .map(|texel| {
+                let (x, y) = ((texel % width) as f32, (texel / width) as f32);
+                let alpha = if x < 20.0 { 1.0 } else { 0.55 };
+                let color = [0.2 + 0.02 * x, 0.9 - 0.03 * y, if (x + y) % 7.0 < 3.0 { 0.8 } else { 0.1 }];
+                let covered = !(x > 30.0 && y < 6.0);
+                if covered { ([color[0] * alpha, color[1] * alpha, color[2] * alpha, alpha], 1.0) } else { ([0.0; 4], 0.0) }
+            })
+            .collect();
+        let field = (width * height) as usize;
+        let straight = |value: &[f32]| if value[3] > 1e-5 { [value[0] / value[3], value[1] / value[3], value[2] / value[3]] } else { [0.0; 3] };
+        let opacity = 0.6;
+        let color = Some(ChannelKind::Color);
+        let contexts = [
+            (color, GrayscaleMode::Desaturation),
+            (color, GrayscaleMode::Luma),
+            (color, GrayscaleMode::Average),
+            (color, GrayscaleMode::Max),
+            (color, GrayscaleMode::Min),
+            (Some(ChannelKind::Scalar), GrayscaleMode::Average),
+            (Some(ChannelKind::Signed), GrayscaleMode::Min),
+            (Some(ChannelKind::NormalMap), GrayscaleMode::Luma),
+            (None, GrayscaleMode::Luma),
+        ];
+
+        for (channel, mode) in contexts {
+            let gradient = Filter::GradientMap {
+                colors: vec![[0.0; 3], [1.0; 3]],
+                positions: Vec::new(),
+                quantity: None,
+                input: GradientInput { blur: 3.0, mode, ..Default::default() },
+                linear: true,
+                debug: false,
+            };
+            let stage = super::new(&gradient, stage_at_2k(channel, opacity)).unwrap();
+            let blur = NeighbourhoodFilter::new(&Filter::Blur { radius: 3.0, wrap: false }, 2048, 2048, 1.0, channel).unwrap();
+
+            let staged = run_stage(&gpu, &texels, (width, height), stage);
+            let blurred = run_stage(&gpu, &texels, (width, height), blur);
+
+            for (index, ((original, output), blurred)) in texels.iter().zip(&staged[3 * field..]).zip(&blurred[3 * field..]).enumerate() {
+                if original.1 <= 0.0 {
+                    continue;
+                }
+                let value: Vec<f32> = output[..4].iter().map(|word| f32::from_bits(*word)).collect();
+                let average: Vec<f32> = blurred[..4].iter().map(|word| f32::from_bits(*word)).collect();
+                let gray = f32::from_bits(output[4]);
+                let label = format!("{channel:?} {mode:?} texel {index}");
+                if channel == Some(ChannelKind::NormalMap) {
+                    let (before, after) = (straight(&original.0), straight(&average));
+                    for component in 0..3 {
+                        let mixed = (before[component] + (after[component] - before[component]) * opacity) * original.0[3];
+                        assert!((value[component] - mixed).abs() < 1e-5, "{label}: {value:?}");
+                    }
+                    continue;
+                }
+                assert_eq!(value, original.0.to_vec(), "{label}: the original texel");
+                let expected = match channel {
+                    Some(ChannelKind::Color) => mode.gray(straight(&average)),
+                    Some(_) => straight(&average)[0],
+                    None => average[0],
+                };
+                assert!((gray - expected).abs() < 1e-5, "{label}: {gray} against {expected}");
+            }
+        }
     }
 }

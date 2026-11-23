@@ -10,14 +10,21 @@ const BOX_WRAPPED_BLUR: u32 = 17u;
 const BOX_WRAPPED_BEVEL: u32 = 18u;
 // Highpass in an sRGB space or of the alpha
 const BOX_HIGHPASS: u32 = 19u;
+// The Gradient's input blur for P2's gradient
+const BOX_PRE_BLUR: u32 = 20u;
 
 // Highpass in sRGB from ACEScg (params.field_layout.z; 0 is the working space, 1 sRGB from linear)
 const BOX_SPACE_SRGB_FROM_ACESCG: u32 = 2u;
+// Below this alpha content has no straight colour (MIN_ALPHA in eval.rs)
+const BOX_MIN_ALPHA: f32 = 1e-5;
+// Word 4 of a field texel: its coverage, the pre-blur's gray in a stage output, scratch in the distance passes
+const BOX_SECOND_WORD: u32 = 4u;
 
 // Whether a P4 kind runs the three box passes first (box_family::uses_box must agree).
 fn box_family_uses_box(kind: u32) -> bool {
     var uses = kind == BOX_WRAPPED_BLUR || kind == BOX_WRAPPED_BEVEL;
     uses = uses || kind == BOX_HIGHPASS;
+    uses = uses || kind == BOX_PRE_BLUR;
     return uses;
 }
 
@@ -145,6 +152,59 @@ fn box_highpass_texel(original: vec4<f32>, blurred: Texel) -> vec4<f32> {
     return box_highpass_recode(result, false);
 }
 
+// Luminance as core::lum weighs it
+fn box_lum(color: vec3<f32>) -> f32 {
+    return 0.3 * color.x + 0.59 * color.y + 0.11 * color.z;
+}
+
+// Premultiplied content's straight colour, black without alpha
+fn box_straight_color(value: vec4<f32>) -> vec3<f32> {
+    return select(vec3(0.0), value.rgb / value.w, value.w > BOX_MIN_ALPHA);
+}
+
+// GrayscaleMode::gray of a straight colour, the mode in params.field_layout.z
+fn box_gray_of(rgb: vec3<f32>) -> f32 {
+    let mode = params.field_layout.z;
+    if mode == 0u {
+        return (max(max(rgb.x, rgb.y), rgb.z) + min(min(rgb.x, rgb.y), rgb.z)) / 2.0;
+    }
+    if mode == 1u {
+        return box_lum(rgb);
+    }
+    if mode == 2u {
+        return (rgb.x + rgb.y + rgb.z) / 3.0;
+    }
+    if mode == 3u {
+        return max(max(rgb.x, rgb.y), rgb.z);
+    }
+    return min(min(rgb.x, rgb.y), rgb.z);
+}
+
+// The pre-blur's output (map_blurred in eval.rs): the original texel in words 0-3, the blurred gray in word 4
+// A normal map's gradient is the identity, so there the blur is mixed in here and word 4 stays 0
+fn box_pre_blur_texel(point: vec2<u32>, original: Texel, blurred: Texel) {
+    var average = original.value;
+    if blurred.coverage > MIN_WEIGHT {
+        average = blurred.value / blurred.coverage;
+    }
+    var value = original.value;
+    var gray = average.x;
+    let context = stage_context();
+    if context != STAGE_MASK {
+        let straight = box_straight_color(average);
+        gray = straight.x;
+        if context == STAGE_COLOR {
+            gray = box_gray_of(straight);
+        } else if context == STAGE_NORMAL_MAP {
+            let before = box_straight_color(original.value);
+            value = vec4((before + (straight - before) * params.weights.x) * original.value.w, original.value.w);
+            gray = 0.0;
+        }
+    }
+    write_at(params.buffers.z, point, Texel(value, original.coverage));
+    fields[word_at(params.buffers.z, point) + BOX_SECOND_WORD] = bitcast<u32>(gray);
+}
+
 // The apply pass of the kinds with passes of their own: the original at buffers.x, the filtered field at buffers.y, the result to buffers.z
 @compute @workgroup_size(8, 8)
 fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -165,6 +225,10 @@ fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
     var result = original.value;
     if kind == BOX_HIGHPASS {
         result = box_highpass_texel(original.value, filtered);
+    }
+    if kind == BOX_PRE_BLUR {
+        box_pre_blur_texel(point, original, filtered);
+        return;
     }
     write_at(params.buffers.z, point, Texel(result, original.coverage));
 }
