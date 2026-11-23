@@ -6,7 +6,7 @@ use texturecraft_compose::{
     ImageRes, ImageStore,
     pattern::{decal_axes, mesh_frame},
 };
-use texturecraft_core::{Decal, DecalFlip, Sampling, Source};
+use texturecraft_core::{Decal, DecalFlip, Filtering, Sampling, Source};
 use texturecraft_geom::{Mesh, glam::Vec3};
 
 use crate::gpu_tile_pattern::{AtlasMips, RawPlane, TileImageAtlas};
@@ -55,13 +55,13 @@ impl MaterialImages {
         index
     }
 
-    /// A decal's frame and the images whose alpha it reads, sampled with the fill's `sampling`
-    /// (P1: the decal path's Nearest and Bilinear HQ; today every decal image samples as
-    /// Bilinear Sharp, `register_decal` in gpu_composite.rs rejects the others).
-    pub(crate) fn register_decal<'a>(&mut self, frame: Decal, sources: impl Iterator<Item = &'a Source>, _sampling: Sampling) -> u32 {
+    /// A decal's frame and the images whose alpha it reads, sampled with the fill's `sampling`:
+    /// Bilinear HQ reads the alpha's halved levels (the same in either chain).
+    pub(crate) fn register_decal<'a>(&mut self, frame: Decal, sources: impl Iterator<Item = &'a Source>, sampling: Sampling) -> u32 {
+        let usage = if sampling.filtering == Filtering::BilinearHq { ImageUse::Mipmapped } else { ImageUse::Material };
         let alpha_images = sources
             .filter_map(|source| match source {
-                Source::Image { name, .. } => Some(self.register_image(name, ImageUse::Material)),
+                Source::Image { name, .. } => Some(self.register_image(name, usage)),
                 _ => None,
             })
             .collect();

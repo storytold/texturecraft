@@ -656,13 +656,18 @@ fn p1_projector_cover(op: Operation, coords: P1Coords) -> f32 {
 }
 
 // A cropped placed frame takes the shape of its image too (compose Texel::shape_cover): the alpha
-// of the frame's image (from its decal words) at `point`, read with the fill's sampling
-fn p1_frame_alpha(op: Operation, point: vec2<f32>, surface: Surface) -> f32 {
+// of the frame's image (from its decal words) at the first image point, read with the fill's
+// sampling and footprint so shrunk colour and coverage agree
+fn p1_frame_alpha(op: Operation, samples: P1Samples, uv: vec2<f32>, surface: Surface, copy: P1Copy) -> f32 {
     let alpha_image = srgb[u32(op.uv.x) + P1_DECAL_ALPHA_WORD];
     if alpha_image == P1_MISSING {
         return 1.0;
     }
-    return clamp(p1_read_image(op, alpha_image, point, surface, 1.0, false, P1_ALPHA_KIND).x, 0.0, 1.0);
+    var footprint = 1.0;
+    if (op.ext.y & P1_HQ) != 0u {
+        footprint = p1_footprints(op, samples, uv, copy, vec2<f32>(vec2(srgb[alpha_image], srgb[alpha_image + 1u]))).x;
+    }
+    return clamp(p1_read_image(op, alpha_image, samples.points[0], surface, footprint, false, P1_ALPHA_KIND).x, 0.0, 1.0);
 }
 
 // Image texels per surface texel in each image plane of an image `size` texels large (compose
@@ -728,15 +733,15 @@ fn p1_tile_cover(op: Operation, uv: vec2<f32>) -> f32 {
 
 // How much of the texel the fill covers (compose Texel::cover, `shape_cover`), the surface as
 // the copy sees it
-fn p1_cover(op: Operation, coords: P1Coords, projected: P1Projected, surface: Surface, copy: P1Copy) -> f32 {
+fn p1_cover(op: Operation, coords: P1Coords, projected: P1Projected, uv: vec2<f32>, surface: Surface, copy: P1Copy) -> f32 {
     let flags = op.ext.y;
     if (flags & P1_FRAMED) != 0u {
-        let point = p1_flipped(p1_image_points(op, projected.coords), copy).points[0];
+        let samples = p1_flipped(p1_image_points(op, projected.coords), copy);
         var cover = projected.cover;
         if (flags & P1_IMAGE_ALPHA) != 0u && cover > 0.0 {
-            cover *= p1_frame_alpha(op, point, surface);
+            cover *= p1_frame_alpha(op, samples, uv, surface, copy);
         }
-        return cover * p1_tile_cover(op, point);
+        return cover * p1_tile_cover(op, samples.points[0]);
     }
     if (flags & (P1_TILE_COVER | P1_CROP | P1_BACKFACE)) == 0u {
         return 1.0;
@@ -771,7 +776,7 @@ fn p1_fill_once(op: Operation, uv: vec2<f32>, surface: Surface, copy: P1Copy) ->
     } else {
         rgb = value(op, uv, surface);
     }
-    return vec4(rgb, p1_cover(op, coords, projected, copied, copy));
+    return vec4(rgb, p1_cover(op, coords, projected, uv, copied, copy));
 }
 
 // The radial copy nearest a texel `turned` degrees round the axis, of `count` copies `step`

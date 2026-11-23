@@ -136,9 +136,10 @@ const BACKFACE_FADE: f32 = 0.6;
 /// Smallest frame side or depth in world units, as compose's `pattern` keeps them
 const MIN_FRAME_EXTENT: f32 = 1e-6;
 
-/// Whether the GPU samples image sources (fills and decals) with this filtering as the CPU does.
-pub(super) fn supports_image_sampling(sampling: Sampling) -> bool {
-    sampling.filtering == Filtering::BilinearSharp
+/// Whether the GPU samples image sources (fills and decals) with this filtering as the CPU does:
+/// every filtering, a decal's on P1's path.
+pub(super) fn supports_image_sampling(_sampling: Sampling) -> bool {
+    true
 }
 
 /// How an image source read as a `channel` with `sampling` registers its image
@@ -243,7 +244,7 @@ pub(super) fn place_cover(projection: &Projection, sampling: Sampling, op: &mut 
     if built_in(projection, sampling, op) {
         return Some(());
     }
-    if still_on_cpu(projection, sampling) {
+    if still_on_cpu(projection) {
         return None;
     }
 
@@ -271,7 +272,10 @@ fn built_in(projection: &Projection, sampling: Sampling, op: &Operation) -> bool
     match projection {
         Projection::Uv { .. } | Projection::UvTile => filtering,
         Projection::Triplanar { uv, projector, .. } | Projection::Spherical { uv, projector, .. } => filtering && uv.is_default() && projector.is_default(),
-        Projection::Planar { uv, projector, placed: Some(_), .. } => filtering && uv.is_default() && *projector == decal_projector(),
+        // The decal path reads its frame's image alpha bilinearly, whatever the source
+        Projection::Planar { uv, projector, placed: Some(_), .. } => {
+            sampling.filtering == Filtering::BilinearSharp && uv.is_default() && *projector == decal_projector()
+        }
         Projection::Planar { uv, projector, .. } => filtering && uv.is_default() && projector.is_default(),
         Projection::Cylindrical { uv, projector, angle, .. } => filtering && uv.is_default() && projector.is_default() && *angle == FULL_TURN_DEGREES,
         Projection::Warp { .. } => false,
@@ -279,10 +283,8 @@ fn built_in(projection: &Projection, sampling: Sampling, op: &Operation) -> bool
 }
 
 /// The settings P1's path does not evaluate yet: those fills stay on the CPU.
-fn still_on_cpu(projection: &Projection, sampling: Sampling) -> bool {
-    cropped_warp_reads_image_alpha(projection)
-        || (projection.placed().is_some() && sampling.filtering != Filtering::BilinearSharp)
-        || projection.depth_culling().is_some()
+fn still_on_cpu(projection: &Projection) -> bool {
+    cropped_warp_reads_image_alpha(projection) || projection.depth_culling().is_some()
 }
 
 /// A warp cropped to its shape takes its image's alpha, which only the fill knows: the GPU has
@@ -668,7 +670,6 @@ mod tests {
     /// preview both compile them). Port one: delete its row (this test fails while a ported row
     /// stays) and add its oracle test.
     fn still_on_cpu() -> Vec<EffectKind> {
-        let image = Source::image("still");
         let uniform = Source::Uniform([0.5; 3]);
         let sharp = Sampling::SAVED_BEFORE;
         let fill = |source: &Source, projection: Projection, sampling: Sampling| EffectKind::Fill { source: source.clone(), projection, sampling };
@@ -680,12 +681,7 @@ mod tests {
             projector: Projector { crop: ShapeCrop::Cropped, ..Projector::default() },
         };
         let culled = planar(Projector { depth: DepthCulling::NEW, ..Projector::default() });
-        vec![
-            fill(&uniform, warp, sharp),
-            fill(&image, Projection::decal(frame()), Sampling { filtering: Filtering::Nearest, ..sharp }),
-            fill(&image, Projection::decal(frame()), Sampling { filtering: Filtering::BilinearHq, ..sharp }),
-            fill(&uniform, culled, sharp),
-        ]
+        vec![fill(&uniform, warp, sharp), fill(&uniform, culled, sharp)]
     }
 
     /// The placement hooks (P0b) leave every source kind's operation as before: no package
@@ -985,6 +981,35 @@ mod tests {
         ];
         for (label, mesh, projection, sampling) in cases {
             assert_fill_matches(&mut gpu, &mesh, &projection, sampling, Tolerance::BILINEAR, &format!("bilinear HQ {label}"));
+        }
+    }
+
+    /// Decals and other placed frames read their images and the alpha that crops them with
+    /// Nearest and Bilinear HQ, also with wrap and copies
+    #[test]
+    fn decal_filtering_matches_the_cpu() {
+        let mut gpu = headless();
+        let shrunk = Decal { size: [0.35, 0.3], ..frame() };
+        let mirror = FillSymmetry { on: true, ..FillSymmetry::OFF };
+        for filtering in [Filtering::Nearest, Filtering::BilinearHq] {
+            let sampling = Sampling { filtering, ..Sampling::SAVED_BEFORE };
+            let decal = Projector { crop: ShapeCrop::Cropped, backface: Backface { on: true, ..Backface::default() }, ..Projector::default() };
+            let turned = Projector { rotation: [0.0, 0.0, 40.0], ..decal };
+            let cases = [
+                ("decal", Projection::decal(frame()), sampling),
+                ("shrunk decal", Projection::decal(shrunk), sampling),
+                (
+                    "turned frame",
+                    Projection::Planar { scale: 1.0, axis: 2, offset: [0.0; 3], uv: UvTransform::default(), projector: turned, placed: Some(shrunk) },
+                    sampling,
+                ),
+                ("decal, wrap none", Projection::decal(frame()), Sampling { wrap: UvWrap::None, ..sampling }),
+                ("mirrored decal", Projection::decal(frame()), Sampling { symmetry: mirror, ..sampling }),
+            ];
+            for (label, projection, sampling) in cases {
+                // The frame's edge crops hard
+                assert_fill_matches(&mut gpu, &sphere(), &projection, sampling, Tolerance::BILINEAR.with_flips(FLIPS), &format!("{filtering:?} {label}"));
+            }
         }
     }
 
