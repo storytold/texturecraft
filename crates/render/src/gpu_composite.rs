@@ -15,7 +15,7 @@ use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
 use crate::gpu_curvature::{CurvatureGpu, CurvatureInput, CurvatureLevels};
-use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, ImageUse, MaterialImages};
+use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages};
 use crate::gpu_neighbourhood::{self, FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
 use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
@@ -656,6 +656,8 @@ impl CompositeProgram {
 
     /// Mesh-space projections and generators share the viewport's surface and bake inputs.
     pub fn set_surface_inputs(&mut self, mesh: &Arc<Mesh>, gbuf: &Arc<UvGBuffer>, baked: Option<&BakedMaps>) -> Result<(), &'static str> {
+        // P1's projector depth grids, before the atlas reads them
+        self.material_images.set_surface(mesh);
         if self.needs_surface || !self.geometry.parts.is_empty() {
             self.surface = Some((mesh.clone(), gbuf.clone()));
         }
@@ -1226,7 +1228,7 @@ fn compile_mask(
                 let mut operation = source_operation(Some(source), projection, *sampling, [0.0; 3], ChannelKind::Scalar, procedural)
                     .ok_or("A mask fill source or projection uses CPU compositing.")?;
                 if let Some(frame) = projection.placed() {
-                    operation.uv[0] = procedural.materials.register_decal(*frame, std::iter::once(source)) as f32;
+                    operation.uv[0] = procedural.materials.register_decal(*frame, std::iter::once(source), *sampling) as f32;
                 }
                 operation
             }
@@ -1355,7 +1357,7 @@ fn register_decal(fill: &texturecraft_core::Fill, materials: &mut MaterialImages
     if !fill_projection::supports_image_sampling(fill.sampling) && fill.sources.values().any(|source| matches!(source, Source::Image { .. })) {
         return Err("A decal's image filtering uses CPU compositing.");
     }
-    Ok(Some(materials.register_decal(*frame, fill.sources.values())))
+    Ok(Some(materials.register_decal(*frame, fill.sources.values(), fill.sampling)))
 }
 
 fn source_operation(
@@ -1389,8 +1391,8 @@ fn source_operation(
                     }
                 }
             };
-            op.ids = [0, IMAGE_SOURCE_OPCODE, inputs.materials.register_image(name, ImageUse::Material), kind];
-            fill_projection::place_image(projection, &mut op)?;
+            op.ids = [0, IMAGE_SOURCE_OPCODE, inputs.materials.register_image(name, fill_projection::image_use(sampling)), kind];
+            fill_projection::place_image(projection, sampling, &mut op, inputs)?;
         }
         Some(Source::Anchor { anchor, channel: read_channel, ramp }) => {
             let (reference, is_mask) = inputs.anchors.read(*anchor, *read_channel);
@@ -1458,10 +1460,11 @@ fn source_operation(
             if channel == ChannelKind::Color && !ramp.is_empty() {
                 op.procedural[1..3].copy_from_slice(&inputs.pack_rgb(ramp)?);
             }
-            fill_projection::place_procedural(projection, &mut op)?;
+            fill_projection::place_procedural(projection, sampling, &mut op, inputs)?;
         }
     }
-    fill_projection::place_decal(projection, &mut op);
+    // Coverage of every source kind (wrap, crop, backface, depth culling, decals)
+    fill_projection::place_cover(projection, sampling, &mut op, inputs);
     op.low.iter().chain(&op.high).chain(&op.projection).chain(&op.uv).chain(&op.balance).all(|v| v.is_finite()).then_some(op)
 }
 
@@ -2093,14 +2096,15 @@ impl GpuCompositor {
 
     fn tile_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<Option<&TileImageAtlas>, String> {
         let gray: Vec<_> = program.tile_patterns.image_sources().collect();
-        let color: Vec<_> = program.material_images.sources().collect();
-        if gray.is_empty() && color.is_empty() {
+        let color: Vec<_> = program.material_images.atlas_images().collect();
+        let raw = program.material_images.raw_planes();
+        if gray.is_empty() && color.is_empty() && raw.is_empty() {
             self.tile_images.remove(&ts);
             return Ok(None);
         }
-        if self.tile_images.get(&ts).is_none_or(|atlas| !atlas.matches(&gray, &color)) {
+        if self.tile_images.get(&ts).is_none_or(|atlas| !atlas.matches(&gray, &color, raw)) {
             self.tile_images.remove(&ts);
-            let atlas = TileImageAtlas::new(device, queue, &gray, &color)?;
+            let atlas = TileImageAtlas::new(device, queue, &gray, &color, raw)?;
             self.tile_images.insert(ts, atlas);
         }
         Ok(self.tile_images.get(&ts))

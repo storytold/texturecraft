@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use texturecraft_compose::{ImageRes, ImageStore, pattern::decal_axes};
-use texturecraft_core::{Decal, DecalFlip, Source};
+use texturecraft_core::{Decal, DecalFlip, Sampling, Source};
 use texturecraft_geom::{Mesh, glam::Vec3};
 
-use crate::gpu_tile_pattern::TileImageAtlas;
+use crate::gpu_tile_pattern::{AtlasMips, RawPlane, TileImageAtlas};
 
 pub(crate) const IMAGE_SOURCE_OPCODE: u32 = 14;
 pub(crate) const DECAL_PROJECTION: u32 = 9;
@@ -46,7 +46,10 @@ impl MaterialImages {
         index
     }
 
-    pub(crate) fn register_decal<'a>(&mut self, frame: Decal, sources: impl Iterator<Item = &'a Source>) -> u32 {
+    /// A decal's frame and the images whose alpha it reads, sampled with the fill's `sampling`
+    /// (P1: the decal path's Nearest and Bilinear HQ; today every decal image samples as
+    /// Bilinear Sharp, `register_decal` in gpu_composite.rs rejects the others).
+    pub(crate) fn register_decal<'a>(&mut self, frame: Decal, sources: impl Iterator<Item = &'a Source>, _sampling: Sampling) -> u32 {
         let alpha_images = sources
             .filter_map(|source| match source {
                 Source::Image { name, .. } => Some(self.register_image(name, ImageUse::Material)),
@@ -70,9 +73,21 @@ impl MaterialImages {
         self.images = self.names.iter().map(|name| images.get(name).cloned()).collect();
     }
 
-    pub(crate) fn sources(&self) -> impl Iterator<Item = &Arc<ImageRes>> {
-        self.images.iter().flatten()
+    /// The colour images for the atlas, each with the halved levels it needs (P1: mip chains for
+    /// Bilinear HQ; none today, so the atlas uploads exactly what it did before).
+    pub(crate) fn atlas_images(&self) -> impl Iterator<Item = (&Arc<ImageRes>, AtlasMips)> {
+        self.images.iter().flatten().map(|image| (image, AtlasMips::None))
     }
+
+    /// Exact-f32 planes for the atlas (P1: projector depth grids built in [`Self::set_surface`]).
+    pub(crate) fn raw_planes(&self) -> &[RawPlane] {
+        &[]
+    }
+
+    /// The mesh the program composites (P1: build the depth grids of depth-culled projections
+    /// here, with `texturecraft_compose::projector_depth`). Called by
+    /// `CompositeProgram::set_surface_inputs` before the atlas reads [`Self::raw_planes`].
+    pub(crate) fn set_surface(&mut self, _mesh: &Mesh) {}
 
     pub(crate) fn append_words(&self, words: &mut Vec<u32>, atlas: Option<&TileImageAtlas>, mesh: Option<&Mesh>) -> (Vec<u32>, Vec<u32>) {
         let mut index = 0;
