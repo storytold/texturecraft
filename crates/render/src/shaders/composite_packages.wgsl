@@ -51,6 +51,43 @@ fn extended_scalar_filter(op: Operation, x: f32) -> f32 {
     return x;
 }
 
+// A packages' content effect in the layer_content loop: the content (colour, coverage) after the
+// effect, opacity (effect.low.w) applied. channel is the destination slot, texel the full texel
+// (pixel, UV, surface, bakes) for effects that read more than the colour or change coverage.
+fn extended_content_effect(effect: Operation, content: vec4<f32>, channel: u32, texel: LayerTexel) -> vec4<f32> {
+    let kind = effect.ids.y;
+    if kind >= POINT_OPCODES_START && kind < POINT_OPCODES_END {
+        return point_content_effect(effect, content, channel, texel);
+    }
+    if kind >= STACK_OPCODES_START && kind < STACK_OPCODES_END {
+        return stack_content_effect(effect, content, channel, texel);
+    }
+    if kind >= LIGHTING_OPCODES_START && kind < LIGHTING_OPCODES_END {
+        return lighting_content_effect(effect, content, channel, texel);
+    }
+    return content;
+}
+
+// A packages' mask effect in the layer_mask loop: the effect's result for mask value mask, which
+// the loop then mixes in by the effect's opacity (effect.low.w).
+fn extended_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 {
+    let kind = effect.ids.y;
+    if kind >= POINT_OPCODES_START && kind < POINT_OPCODES_END {
+        return point_mask_effect(effect, mask, texel);
+    }
+    if kind >= STACK_OPCODES_START && kind < STACK_OPCODES_END {
+        return stack_mask_effect(effect, mask, texel);
+    }
+    if kind >= LIGHTING_OPCODES_START && kind < LIGHTING_OPCODES_END {
+        return lighting_mask_effect(effect, mask, texel);
+    }
+    return mask;
+}
+
+// WGSL rejects recursion: a package function must not call anything that leads back to the hook
+// that called it (scalar_filter, effect_color, layer_content and layer_mask reach the hooks above,
+// fill_value reaches projection_fill_value, painted reaches live_brush_paint).
+
 // effect_color for the packages' opcodes (is_extended_effect). channel is the destination slot
 // (channel_slot in Rust: 0 Base Color, 6 Height, 7 Normal, …).
 fn extended_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> {

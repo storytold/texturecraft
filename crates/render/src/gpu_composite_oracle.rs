@@ -5,6 +5,8 @@
 //! mask preview of one layer, and optionally a partial update against the full one. Tolerances
 //! follow plan section 6; never loosen them, investigate instead. [`compile_effects`] is the
 //! compile-only probe of the packages' `still_on_cpu` tables.
+// Test support: failing loudly is the point, and the packages use the helpers as they port.
+#![allow(clippy::unwrap_used, clippy::panic, dead_code)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

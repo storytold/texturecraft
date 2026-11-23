@@ -39,6 +39,8 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
                 continue;
             }
             result = blend_scalar(u32(e.balance.z), mask, finish_generator(e, ramp));
+        } else if is_extended_effect(e.ids.y) {
+            result = extended_mask_effect(e, mask, texel);
         } else if e.ids.y == COLOR_SELECTION_OPCODE {
             result = blend_scalar(u32(e.balance.z), mask, color_selection(e, texel.pixel));
         } else if e.ids.y == 37u {

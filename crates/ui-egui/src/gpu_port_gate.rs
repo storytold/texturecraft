@@ -6,6 +6,7 @@
 //! `LIBRARY_STILL_ON_CPU` (crates/render/src/gpu_composite_*.rs and gpu_neighbourhood_*.rs).
 //! Compiling needs no adapter, so this gate never skips. At the end of the port the lists are
 //! empty. Package 0 owns this file; packages edit only their own list.
+#![allow(clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
 

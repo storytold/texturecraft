@@ -23,7 +23,8 @@
 //!
 //! How:
 //! - New mask or content opcodes come from `packages::STACK_OPCODES` (144..152), handled in WGSL
-//!   by `stack_scalar_filter`/`stack_effect_color` (or directly in composite_mask_effects.wgsl);
+//!   by `stack_scalar_filter`/`stack_effect_color` or the loop-level `stack_content_effect`/
+//!   `stack_mask_effect` (or directly in composite_mask_effects.wgsl);
 //!   flags go in `op.ext[2] & STACK_OP_BITS`, numbers in the side table (`pack_params`).
 //! - Inputs: set `FilterStage::input` to the source operation's index plus one; the prepare pass
 //!   then writes `stage_input_value(op, texel)` (this WGSL file) into the field's sixth word and
@@ -46,6 +47,11 @@ pub(super) const WGSL: &str = include_str!("shaders/composite_stack.wgsl");
 /// The same functions without P3's code, for programs that do not use it.
 pub(super) const WGSL_STUB: &str = "fn stack_scalar_filter(op: Operation, x: f32) -> f32 { return x; }
 fn stack_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> { return c; }
+fn stack_content_effect(effect: Operation, content: vec4<f32>, channel: u32, texel: LayerTexel) -> vec4<f32> {
+    let filtered = stack_effect_color(effect, content.rgb, channel, texel.surface, texel.baked.x);
+    return vec4(content.rgb + (filtered - content.rgb) * effect.low.w, content.a);
+}
+fn stack_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 { return stack_scalar_filter(effect, mask); }
 fn stage_input_value(op: Operation, texel: LayerTexel) -> f32 { return base_content(op, texel).x; }";
 
 /// Whether a program needs the full `composite_stack.wgsl`.

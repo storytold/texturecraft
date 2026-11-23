@@ -19,7 +19,9 @@
 //!   with an opcode from `packages::LIGHTING_OPCODES` (152..160), or None without touching `op`.
 //!   About 30 stylized parameters go in the side table (`inputs.pack_params`, offset in
 //!   `op.ext[0]`); flags in `op.ext[2] & LIGHTING_OP_BITS`.
-//! - The WGSL file defines `lighting_scalar_filter` and `lighting_effect_color`.
+//! - The WGSL file defines `lighting_scalar_filter`, `lighting_effect_color` and the loop-level
+//!   `lighting_content_effect`/`lighting_mask_effect`. Reading the layer's other channels needs
+//!   the channel accumulator in `compose()` (composite.wgsl), an open hook P6 adds after P3.
 //! - [`needs_surface`] keeps the surface inputs bound for P6 operations.
 //! - Lighting is skipped in masks on both sides (`compile_mask`), keep it so.
 //!
@@ -38,7 +40,12 @@ pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["bakedLighting", "bakedLighti
 pub(super) const WGSL: &str = include_str!("shaders/composite_lighting.wgsl");
 /// The same functions without P6's code, for programs that do not use it.
 pub(super) const WGSL_STUB: &str = "fn lighting_scalar_filter(op: Operation, x: f32) -> f32 { return x; }
-fn lighting_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> { return c; }";
+fn lighting_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> { return c; }
+fn lighting_content_effect(effect: Operation, content: vec4<f32>, channel: u32, texel: LayerTexel) -> vec4<f32> {
+    let filtered = lighting_effect_color(effect, content.rgb, channel, texel.surface, texel.baked.x);
+    return vec4(content.rgb + (filtered - content.rgb) * effect.low.w, content.a);
+}
+fn lighting_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 { return lighting_scalar_filter(effect, mask); }";
 
 /// A filter as a P6 operation: (opcode, three parameters), or None.
 pub(super) fn lower(_filter: &Filter, _effect: &Effect, _op: &mut Operation, _inputs: &mut ProceduralInputs) -> Option<(u32, [f32; 3])> {

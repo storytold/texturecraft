@@ -45,6 +45,8 @@ fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
         } else if is_fill_opcode(effect.ids.y) {
             let fill = fill_value(effect, texel.uv, texel.surface);
             content = content_over(content, fill, effect, layer.ids.x);
+        } else if is_extended_effect(effect.ids.y) {
+            content = extended_content_effect(effect, content, layer.ids.x, texel);
         } else if effect.ids.y != 39u {
             let filtered = effect_color(effect, content.rgb, layer.ids.x, texel.surface, texel.baked.x);
             content = vec4(content.rgb + (filtered - content.rgb) * effect.low.w, content.a);

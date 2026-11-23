@@ -16,7 +16,9 @@
 //!   (`inputs.pack_params(&[..])`, offset in `op.ext[0]`, read with `param(op, i)` in WGSL);
 //!   flags in `op.ext[2] & POINT_OP_BITS`.
 //! - The WGSL file defines `point_scalar_filter` (scalar channels and masks) and
-//!   `point_effect_color` (every content channel; `channel` is the destination slot).
+//!   `point_effect_color` (every content channel; `channel` is the destination slot), and the
+//!   loop-level `point_content_effect` (content with coverage and the whole texel: Posterize
+//!   alpha, the Grayscale alpha weight, Gradient debug) and `point_mask_effect`.
 //! - Keep [`uses_shader`] true for every program with a P2 opcode.
 //!
 //! Tables: [`LIBRARY_STILL_ON_CPU`] and `still_on_cpu` in the tests below. Every port gets a CPU
@@ -34,7 +36,12 @@ pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["hsl", "colorCorrect", "gradi
 pub(super) const WGSL: &str = include_str!("shaders/composite_point.wgsl");
 /// The same functions without P2's code, for programs that do not use it.
 pub(super) const WGSL_STUB: &str = "fn point_scalar_filter(op: Operation, x: f32) -> f32 { return x; }
-fn point_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> { return c; }";
+fn point_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> { return c; }
+fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, texel: LayerTexel) -> vec4<f32> {
+    let filtered = point_effect_color(effect, content.rgb, channel, texel.surface, texel.baked.x);
+    return vec4(content.rgb + (filtered - content.rgb) * effect.low.w, content.a);
+}
+fn point_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 { return point_scalar_filter(effect, mask); }";
 
 /// A filter as a P2 point operation: (opcode, three parameters), or None.
 pub(super) fn lower(_filter: &Filter, _effect: &Effect, _op: &mut Operation, _inputs: &mut ProceduralInputs) -> Option<(u32, [f32; 3])> {
