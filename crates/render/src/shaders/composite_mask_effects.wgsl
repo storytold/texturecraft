@@ -2,10 +2,12 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
     let start = params.program.x + layer.effects.x;
     var skip = 0u;
     var mask = layer.balance.y;
+    preceding_field = 0xffffffffu;
     if enable_spatial_fields && layer.spatial.z != 0u {
         skip = previous_field(start, count);
         if skip != 0u {
             let field = layers[start + skip - 1u].spatial.x;
+            preceding_field = field;
             mask = clamp(filter_value(field, texel.pixel).x, 0.0, 1.0);
         }
     }

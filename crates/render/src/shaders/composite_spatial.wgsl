@@ -5,16 +5,42 @@ fn field_word(slot: u32, local: vec2<u32>) -> u32 {
     return params.filter_stage.x + (slot * size.x * size.y + local.y * size.x + local.x) * params.field_layout.x;
 }
 
-fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> {
-    if any(pixel < params.filter_region.xy) {
-        return vec4(0.0);
+// The fields' origin in source texels. It lies below zero when the program has a wrapping
+// stage (FilterPlan::wraps in Rust), so read it signed.
+fn field_origin() -> vec2<i32> {
+    return bitcast<vec2<i32>>(params.filter_region.xy);
+}
+
+// The texel of a field at source pixel `pixel`, or None (u32 max) outside the field.
+fn field_local(pixel: vec2<u32>) -> vec2<u32> {
+    let local = vec2<i32>(pixel) - field_origin();
+    if any(local < vec2(0)) || any(local >= vec2<i32>(params.filter_region.zw)) {
+        return vec2(0xffffffffu);
     }
-    let local = pixel - params.filter_region.xy;
-    if any(local >= params.filter_region.zw) {
+    return vec2<u32>(local);
+}
+
+fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> {
+    let local = field_local(pixel);
+    if local.x == 0xffffffffu {
         return vec4(0.0);
     }
     let start = field_word(slot, local);
     return bitcast<vec4<f32>>(vec4(output[start], output[start + 1u], output[start + 2u], output[start + 3u]));
+}
+
+// The field the layer_content or layer_mask loop resumed from (its preceding stage), or none.
+var<private> preceding_field: u32 = 0xffffffffu;
+
+// Word 4 of the preceding stage's output field at `pixel`: a stage's output keeps its coverage
+// there, which no reader uses, so a stage can leave a second value in it (P4's pre-blur gray
+// for P2's gradient after `precede_with_stage`). Zero outside the field or without a stage.
+fn preceding_stage_word(pixel: vec2<u32>) -> f32 {
+    let local = field_local(pixel);
+    if preceding_field == 0xffffffffu || local.x == 0xffffffffu {
+        return 0.0;
+    }
+    return bitcast<f32>(output[field_word(preceding_field, local) + 4u]);
 }
 
 // The most recent prepared field already contains all the effects below it.
@@ -33,11 +59,18 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let local = params.filter_chunk.xy + id.xy;
-    let pixel = params.filter_region.xy + local;
+    // A field can start below zero; a wrapping stage (field_layout.w bit 0) reads the set
+    // periodically there, any other stage reads empty texels outside the set.
+    let position = field_origin() + vec2<i32>(local);
+    var pixel = vec2<u32>(max(position, vec2(0)));
+    var covered = all(position >= vec2(0)) && all(pixel < params.source.xy);
+    if (params.field_layout.w & 1u) != 0u {
+        pixel = vec2<u32>(vec2(wrap_coordinate(position.x, i32(params.source.x)), wrap_coordinate(position.y, i32(params.source.y))));
+        covered = true;
+    }
     var prepared = vec4(0.0);
     var geometric_weight = 0.0;
     var stage_input = 0.0;
-    var covered = all(pixel < params.source.xy);
     if covered && params.coverage.x != 0u {
         covered = uv_texel_covered(pixel);
     }

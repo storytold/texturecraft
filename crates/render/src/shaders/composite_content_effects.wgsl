@@ -18,12 +18,14 @@ fn content_over(content: vec4<f32>, source: vec4<f32>, effect: Operation, channe
 fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
     let start = params.program.x + layer.effects.z;
     var skip = 0u;
+    preceding_field = 0xffffffffu;
     if enable_spatial_fields && layer.spatial.y != 0u {
         skip = previous_field(start, count);
     }
     var content: vec4<f32>;
     if skip != 0u {
         let field = layer.spatial.x + layers[start + skip - 1u].spatial.x;
+        preceding_field = field;
         let filtered = filter_value(field, texel.pixel);
         let coverage = clamp(filtered.a, 0.0, 1.0);
         var color = vec3(0.0);

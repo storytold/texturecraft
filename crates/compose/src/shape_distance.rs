@@ -122,7 +122,7 @@ pub(crate) fn distance_filter(
 }
 
 /// Every texel's distance (texels) to the edge between it and the nearest texel on the other side of the shapes `inside`: straight-line, or the larger axis distance when `angular`
-fn edge_distances(inside: &[bool], (width, height): (usize, usize), angular: bool) -> Vec<f32> {
+pub fn edge_distances(inside: &[bool], (width, height): (usize, usize), angular: bool) -> Vec<f32> {
     let distances = if angular { chessboard_distances } else { straight_distances };
     let mut to_inside = distances(inside, (width, height), true);
     let to_outside = distances(inside, (width, height), false);
@@ -187,7 +187,7 @@ fn chessboard_distances(inside: &[bool], (width, height): (usize, usize), target
 }
 
 /// For every texel, how far (a share of `reach` texels) the nearest texel of the shapes `inside` lies behind it against `direction`, if one is in reach
-fn trail_distances(inside: &[bool], (width, height): (usize, usize), direction: [f32; 2], reach: f32) -> Vec<Option<f32>> {
+pub fn trail_distances(inside: &[bool], (width, height): (usize, usize), direction: [f32; 2], reach: f32) -> Vec<Option<f32>> {
     let steps = trail_steps((width, height), direction, reach);
 
     // Each row of shapes as bits, a row without one as no words: steps landing on it find nothing
