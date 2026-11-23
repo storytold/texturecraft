@@ -37,7 +37,9 @@
 //! mask, chained, and with a partial region (the halo); distance filters also compare the raw
 //! distance field exactly.
 
-use texturecraft_core::{Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, ChannelKind, Filter, GrayscaleMode, HighpassSpace, MaskOutline};
+use texturecraft_core::{
+    Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, ChannelKind, DirectionalDistance, Filter, GrayscaleMode, HighpassSpace, MaskOutline,
+};
 
 use super::{
     APPLY_WORKGROUP, BOX_KINDS, BOX_PASSES, DISTANCE_KINDS, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params,
@@ -45,7 +47,7 @@ use super::{
 };
 
 /// Library filter ids P4 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["directionalDistance"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
 pub(super) const WGSL: &str = include_str!("shaders/neighbourhood_box.wgsl");
 
@@ -68,6 +70,8 @@ const OUTLINE: Kind = Kind(BOX_KINDS.start + 6);
 const DISTANCE_BEVEL: Kind = Kind(DISTANCE_KINDS.start);
 /// Bevel Smooth.
 const BEVEL_SMOOTH: Kind = Kind(DISTANCE_KINDS.start + 1);
+/// Directional Distance.
+const DIRECTIONAL_DISTANCE: Kind = Kind(DISTANCE_KINDS.start + 2);
 
 /// Flag bits of `NeighbourhoodFilter::words[0]` per kind (the same constants in the WGSL file).
 const HALO_INNER: u32 = 1;
@@ -94,6 +98,8 @@ const HALO_SOFTEST: f32 = 0.01;
 const THRESHOLD_TOLERANCE: f32 = f32::EPSILON;
 /// The base a ramp curve's shape bends by (`CURVE_SHAPE_BASE` in core's ramp_curve.rs).
 const CURVE_SHAPE_BASE: f32 = 4.0;
+/// The most contrast Directional Distance reaches (`DirectionalDistance::HARDEST`).
+const HARDEST_TRAIL_CONTRAST: f32 = 0.99;
 
 /// Work per texel of one bilinear sample, as the built-in Pixelate counts it.
 const BILINEAR_SAMPLE_WORK: u64 = 5;
@@ -109,6 +115,7 @@ pub(super) struct Pipelines {
     distance_rows: wgpu::ComputePipeline,
     distance_columns: wgpu::ComputePipeline,
     distance_edges: wgpu::ComputePipeline,
+    directional_trail: wgpu::ComputePipeline,
 }
 
 impl Pipelines {
@@ -119,6 +126,7 @@ impl Pipelines {
             distance_rows: pipeline("distance_rows"),
             distance_columns: pipeline("distance_columns"),
             distance_edges: pipeline("distance_edges"),
+            directional_trail: pipeline("directional_trail"),
         }
     }
 }
@@ -137,6 +145,7 @@ pub(super) fn supports(filter: &Filter) -> bool {
             | Filter::MaskOutline(_)
             | Filter::DistanceBevel(_)
             | Filter::BevelSmooth(_)
+            | Filter::DirectionalDistance(_)
     )
 }
 
@@ -170,6 +179,7 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
         Filter::MaskOutline(outline) => Some(mask_outline(stage, outline)),
         Filter::DistanceBevel(bevel) => Some(distance_bevel(stage, bevel)),
         Filter::BevelSmooth(smooth) => Some(bevel_smooth(stage, smooth)),
+        Filter::DirectionalDistance(trail) => Some(directional_distance(stage, trail)),
         _ => None,
     }
 }
@@ -315,6 +325,25 @@ fn bevel_smooth(stage: StageInputs, smooth: &BevelSmooth) -> NeighbourhoodFilter
     stage_filter
 }
 
+/// A Directional Distance stage: the steps of `trail_steps` in shape_distance.rs (count, length
+/// and direction) and the trail's reach and contrast.
+fn directional_distance(stage: StageInputs, trail: &DirectionalDistance) -> NeighbourhoodFilter {
+    let reach = trail.reach(stage.resolution);
+    let along = direction(trail.angle);
+
+    // Steps of one texel along the direction's longer axis visit every column (or row) the trail crosses
+    let longer_axis = along[0].abs().max(along[1].abs());
+    let samples = if reach > 0.0 && longer_axis > 0.0 { (reach * longer_axis).ceil() as u32 } else { 0 };
+    let step = if samples > 0 { reach / samples as f32 } else { 0.0 };
+    let contrast = if trail.contrast.is_finite() { trail.contrast.clamp(0.0, HARDEST_TRAIL_CONTRAST) } else { 0.0 };
+
+    let mut stage_filter = distance_stage(stage, DIRECTIONAL_DISTANCE, reach);
+    stage_filter.extra[..4].copy_from_slice(&[DirectionalDistance::EDGE, reach, step, 1.0 - contrast]);
+    stage_filter.direction = along;
+    stage_filter.words = [samples, 0];
+    stage_filter
+}
+
 /// Whether the stage reads past the set's edges from the far side (`FilterStage::wrap`).
 pub(crate) fn wraps(filter: NeighbourhoodFilter) -> bool {
     match filter.kind {
@@ -346,6 +375,8 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
         OUTLINE => BOX_FILTER_WORK + OWN_PASS_WORK,
         // Rows, columns, edges, the smoothing's box passes and the apply pass
         DISTANCE_BEVEL | BEVEL_SMOOTH => BOX_FILTER_WORK + 4 * OWN_PASS_WORK,
+        // Every texel walks the trail's steps
+        DIRECTIONAL_DISTANCE => u64::from(filter.words[0]).saturating_add(2 * OWN_PASS_WORK),
         _ => BOX_FILTER_WORK,
     }
 }
@@ -418,6 +449,12 @@ pub(super) fn encode(
             let ramp = if smoothing > 0 { box_passes(&mut run, &gpu.box_blur, region, output, smoothing) } else { output };
             run(&pipelines.apply, [original, ramp, output, 0], filter.radius, false, texel_groups);
         }
+        DIRECTIONAL_DISTANCE => {
+            let inside = region.blur[0];
+            run(&pipelines.prepare, [original, 0, inside, 0], filter.radius, false, texel_groups);
+            run(&pipelines.directional_trail, [original, inside, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.apply, [original, output, output, 0], filter.radius, false, texel_groups);
+        }
         // Pixelate gathers and the wrapping filters run the built-in passes
         _ => return false,
     }
@@ -431,9 +468,9 @@ mod tests {
     use texturecraft_compose::distance_test_hooks;
     use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
     use texturecraft_core::{
-        BakedMap, Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, BlendMode, Channel, ChannelKind, ContentsOffset, Effect, EffectKind, Filter,
-        Generator, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground, MaskOutline, OutlinePosition,
-        Project, Source, TextureSet,
+        BakedMap, Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, BlendMode, Channel, ChannelKind, ContentsOffset, DirectionalDistance, Effect,
+        EffectKind, Filter, Generator, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground,
+        MaskOutline, OutlinePosition, Project, Source, TextureSet,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::primitives;
@@ -518,6 +555,7 @@ mod tests {
             Filter::DistanceBevel(Bevel::LIBRARY),
             Filter::DistanceBevel(Bevel { wrap: true, ..Bevel::LIBRARY }),
             Filter::BevelSmooth(BevelSmooth::LIBRARY),
+            Filter::DirectionalDistance(DirectionalDistance::LIBRARY),
         ];
 
         for filter in ported {
@@ -992,6 +1030,7 @@ mod tests {
                 "distance_rows" => (&pipelines.distance_rows, [size.1.div_ceil(64), 1]),
                 "distance_columns" => (&pipelines.distance_columns, [size.0.div_ceil(64), 1]),
                 "distance_edges" => (&pipelines.distance_edges, texel_groups),
+                "directional_trail" => (&pipelines.directional_trail, texel_groups),
                 _ => (&pipelines.prepare, texel_groups),
             };
             let params = Params {
@@ -1049,6 +1088,57 @@ mod tests {
             let cpu_distances: Vec<u32> =
                 distance_test_hooks::edge_distances(&inside, (width, height), corner == BevelCorner::Angular).iter().map(|d| d.to_bits()).collect();
             assert_eq!(gpu_distances, cpu_distances, "{corner:?}");
+        }
+    }
+
+    /// Directional Distance matches the CPU: the library's, at an angle with contrast and a
+    /// shorter reach, below full opacity, disabled and chained.
+    #[test]
+    fn directional_distance_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let trail = DirectionalDistance { angle: 30.0, contrast: 0.6, multiplier: 0.5, ..DirectionalDistance::LIBRARY };
+        let normal = BlendMode::Normal;
+        let cases = [
+            ("library Directional Distance", vec![(Filter::DirectionalDistance(DirectionalDistance::LIBRARY), 1.0, normal)], normal),
+            ("hard short Directional Distance", vec![(Filter::DirectionalDistance(trail), 0.85, normal)], BlendMode::Multiply),
+            ("Directional Distance disabled", vec![(Filter::DirectionalDistance(trail), 1.0, BlendMode::Disable)], normal),
+            (
+                "Directional Distance after a blur",
+                vec![(Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal), (Filter::DirectionalDistance(trail), 0.9, normal)],
+                normal,
+            ),
+        ];
+
+        assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
+    }
+
+    /// Every texel's trail finds the same shape at the same share of the reach as the CPU's.
+    #[test]
+    fn trail_distances_equal_the_cpu_exactly() {
+        let Some(gpu) = headless() else { return };
+        let (width, height) = (77usize, 53usize);
+        let inside = shapes(width, height);
+        let field = mask_field(&inside);
+        let passes = [("box_family_prepare", [0, 0, 1]), ("directional_trail", [0, 1, 3])];
+
+        for angle in [0.0, 17.0, 45.0, 90.0, 200.0, 333.0] {
+            for distance in [0.0045, 0.02] {
+                let trail = Filter::DirectionalDistance(DirectionalDistance { angle, distance, ..DirectionalDistance::LIBRARY });
+                let filter = super::new(&trail, stage_at_2k(None, 1.0)).unwrap();
+                let (reach, step) = (filter.extra[1], filter.extra[2]);
+
+                let fields = run_passes(&gpu, &field, (width as u32, height as u32), filter, &passes);
+
+                let found: Vec<Option<f32>> = fields[3 * width * height..]
+                    .iter()
+                    .map(|texel| {
+                        let sample = f32::from_bits(texel[1]);
+                        (sample >= 0.0).then(|| if reach > 0.0 { sample * step / reach } else { 0.0 })
+                    })
+                    .collect();
+                let expected = distance_test_hooks::trail_distances(&inside, (width, height), filter.direction, reach);
+                assert_eq!(found, expected, "{angle}° {distance}");
+            }
         }
     }
 }

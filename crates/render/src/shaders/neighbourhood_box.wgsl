@@ -17,6 +17,7 @@ const BOX_HALO: u32 = 21u;
 const BOX_OUTLINE: u32 = 22u;
 const BOX_DISTANCE_BEVEL: u32 = 24u;
 const BOX_BEVEL_SMOOTH: u32 = 25u;
+const BOX_DIRECTIONAL_DISTANCE: u32 = 26u;
 
 // Highpass in sRGB from ACEScg (params.field_layout.z; 0 is the working space, 1 sRGB from linear)
 const BOX_SPACE_SRGB_FROM_ACESCG: u32 = 2u;
@@ -414,6 +415,9 @@ fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
     if kind == BOX_BEVEL_SMOOTH {
         result = box_laid_on(original.value, filtered.value.x);
     }
+    if kind == BOX_DIRECTIONAL_DISTANCE {
+        result = box_laid_on(original.value, filtered.value.x);
+    }
     write_at(params.buffers.z, point, Texel(result, original.coverage));
 }
 
@@ -452,6 +456,11 @@ fn box_family_prepare(@builtin(global_invocation_id) id: vec3<u32>) {
     if kind == BOX_OUTLINE {
         let original = original_at(point);
         prepared = Texel(vec4(select(0.0, original.coverage, box_inside_shapes(original)), 0.0, 0.0, 0.0), original.coverage);
+    }
+
+    // Directional Distance walks over the inside flags
+    if kind == BOX_DIRECTIONAL_DISTANCE {
+        prepared = Texel(vec4(select(0.0, 1.0, box_inside_shapes(original_at(point))), 0.0, 0.0, 0.0), 1.0);
     }
     write_at(params.buffers.z, point, prepared);
 }
@@ -776,4 +785,88 @@ fn distance_edges(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     write_at(params.buffers.z, point, Texel(vec4(ramp, edge, 0.0, 0.0), 1.0));
+}
+
+// The IEEE f32 product of two normal floats, rounded to nearest even in integers: a driver cannot fuse it into an addition
+fn box_exact_product(first: f32, second: f32) -> f32 {
+    if first == 0.0 || second == 0.0 {
+        return 0.0;
+    }
+    let first_bits = bitcast<u32>(first);
+    let second_bits = bitcast<u32>(second);
+    let sign = (first_bits ^ second_bits) & 0x80000000u;
+    let product = box_wide_product((first_bits & 0x7fffffu) | 0x800000u, (second_bits & 0x7fffffu) | 0x800000u);
+    var exponent = i32((first_bits >> 23u) & 0xffu) + i32((second_bits >> 23u) & 0xffu) - 127;
+
+    // The 48-bit product of two 24-bit mantissas keeps its top 24 bits; the rest rounds
+    var shift = 23u;
+    if product.x >= 0x8000u {
+        shift = 24u;
+        exponent += 1;
+    }
+    var mantissa = (product.x << (32u - shift)) | (product.y >> shift);
+    let rest = product.y & ((1u << shift) - 1u);
+    let half = 1u << (shift - 1u);
+    if rest > half || (rest == half && (mantissa & 1u) != 0u) {
+        mantissa += 1u;
+    }
+    if mantissa == 0x1000000u {
+        mantissa = 0x800000u;
+        exponent += 1;
+    }
+    return bitcast<f32>(sign | (u32(exponent) << 23u) | (mantissa & 0x7fffffu));
+}
+
+// Directional Distance: each texel walks back against the direction over the inside flags in buffers.y (trail_distances)
+// The trail into word 0 of buffers.z, the step that found a shape (-1: none) into word 1; reach in extra 1, step length 2, 1 - contrast 3
+@compute @workgroup_size(8, 8)
+fn directional_trail(@builtin(global_invocation_id) id: vec3<u32>) {
+    let point = id.xy;
+    if any(point >= params.rect.zw) {
+        return;
+    }
+    // The texel's copy of the set is the CPU's region
+    let segment = copy_segment(vec2<i32>(point));
+    let size = segment.zw - segment.xy;
+    let direction = params.direction.xy;
+    let reach = box_extra(1u);
+    let step_length = box_extra(2u);
+    var found = -1;
+    for (var sample = 0u; sample <= params.field_layout.z; sample++) {
+        let back = f32(sample) * step_length;
+
+        // Rounded half up as trail_steps rounds, the products rounded exactly as the CPU's
+        let moved = floor(vec2(0.5) - vec2(box_exact_product(direction.x, back), box_exact_product(direction.y, back)));
+        if !all(abs(moved) <= vec2(BOX_LARGEST_FINITE)) {
+            break;
+        }
+
+        // A step as long as the field leaves it from every texel, one past its top or bottom for good
+        let offset = vec2<i32>(moved);
+        if abs(offset.x) >= size.x || abs(offset.y) >= size.y {
+            break;
+        }
+        let source = vec2<i32>(point) + offset;
+        if source.y < segment.y || source.y >= segment.w {
+            break;
+        }
+        if source.x >= segment.x && source.x < segment.z && box_field_float(params.buffers.y, vec2<u32>(source), 0u) != 0.0 {
+            found = i32(sample);
+            break;
+        }
+    }
+
+    // DirectionalDistance::value: no shape in reach leaves black
+    var trail = 0.0;
+    if found >= 0 {
+        var along = 0.0;
+        if reach > 0.0 {
+            along = f32(found) * step_length / reach;
+        }
+        if along <= 1.0 {
+            let fade = 1.0 - clamp(along, 0.0, 1.0);
+            trail = clamp(0.5 + (fade - 0.5) / box_extra(3u), 0.0, 1.0);
+        }
+    }
+    write_at(params.buffers.z, point, Texel(vec4(trail, f32(found), 0.0, 0.0), 1.0));
 }
