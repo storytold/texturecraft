@@ -29,13 +29,16 @@
 //! oracle test (`crate::gpu_composite::oracle`) in colour, another content channel and the mask,
 //! for each setting value, set to Disable too, at opacity below 1 with a non-Normal blend.
 
-use texturecraft_core::{ConversionMode, CurvePreset, Effect, Filter, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, finite_unit, lum};
+use texturecraft_core::{
+    ConversionMode, CurvePreset, Effect, Filter, GradientInput, GrayscaleMode, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, finite_unit, lum,
+};
+use texturecraft_texel::linear_to_srgb;
 
 use super::packages::{POINT_OP_BITS, POINT_OPCODES};
 use super::{CompositeProgram, Operation, ProceduralInputs};
 
 /// Library filter ids P2 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["gradientMap"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
 // P2's opcodes (the same constants head composite_point.wgsl)
 const HSL_PERCEPTIVE: u32 = 128;
@@ -47,9 +50,16 @@ const HEIGHT_ADJUST: u32 = 133;
 const GRADIENT_CURVE: u32 = 134;
 const GRADIENT_DYNAMIC: u32 = 135;
 const GRAYSCALE_CONVERSION: u32 = 136;
+const GRADIENT: u32 = 137;
+
+// A gradient's flags in `Operation::ext[2]` (within `POINT_OP_BITS`)
+const GRADIENT_EVEN_LINEAR: u32 = 1;
+const GRADIENT_SRGB: u32 = 2;
+const GRADIENT_NEUTRAL_INPUT: u32 = 4;
 
 // The grays `point_gray` in composite_point.wgsl reads
 const GRAY_DESATURATION: u32 = 0;
+const GRAY_LUMA: u32 = 1;
 const GRAY_AVERAGE: u32 = 2;
 const GRAY_MAX: u32 = 3;
 const GRAY_MIN: u32 = 4;
@@ -66,7 +76,7 @@ fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
 fn point_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 { return point_scalar_filter(effect, mask); }";
 
 /// A filter as a P2 point operation: (opcode, three parameters), or None.
-pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, _inputs: &mut ProceduralInputs) -> Option<(u32, [f32; 3])> {
+pub(super) fn lower(filter: &Filter, effect: &Effect, op: &mut Operation, inputs: &mut ProceduralInputs) -> Option<(u32, [f32; 3])> {
     match filter {
         Filter::Hsl { hue, saturation, lightness, perceptive: true } => {
             // The hue turn as the CPU computes it, so the shader only rotates
@@ -116,8 +126,75 @@ pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, _inpu
             op.high = conversion.weights;
             Some((GRAYSCALE_CONVERSION, [conversion.balance, conversion.contrast, f32::from(u8::from(conversion.invert))]))
         }
+        Filter::GradientMap { debug: false, .. } => lower_gradient(filter, effect, op, inputs),
         _ => None,
     }
+}
+
+/// A gradient the built-in opcode 33 does not take: placed stops, a Color Quantity, sRGB
+/// blending or a changed input. Its stops go in the side table (evenly spaced linear ones as
+/// opcode 33 packs them), the input's gray in `ids[2]` and its balance, contrast and invert in the
+/// parameters.
+fn lower_gradient(filter: &Filter, effect: &Effect, op: &mut Operation, inputs: &mut ProceduralInputs) -> Option<(u32, [f32; 3])> {
+    let Filter::GradientMap { positions, input, linear, .. } = filter else { return None };
+    let linear = *linear;
+    let colors = filter.ramp_colors();
+    let even = positions.is_empty() && linear;
+    let offset = if even {
+        inputs.pack_rgb(colors)?[0]
+    } else {
+        let words: Vec<f32> =
+            sorted_stops(colors, positions, linear).into_iter().flat_map(|(position, [red, green, blue])| [position, red, green, blue]).collect();
+        inputs.pack_params(&words)?
+    };
+    let count = u32::try_from(colors.len()).ok()?;
+
+    // The input's blur runs as the box family's stage (P4) right before the gradient
+    if input.blur > 0.0 {
+        inputs.precede_with_stage(filter, effect.opacity)?;
+    }
+
+    let neutral = GradientInput::default();
+    let unshaped = input.balance == neutral.balance && input.contrast == neutral.contrast && input.invert == neutral.invert;
+    let mut flags = if even { GRADIENT_EVEN_LINEAR } else { 0 };
+    flags |= if linear { 0 } else { GRADIENT_SRGB };
+    flags |= if unshaped { GRADIENT_NEUTRAL_INPUT } else { 0 };
+
+    if even {
+        op.procedural[1] = offset;
+    } else {
+        op.ext[0] = offset;
+    }
+    op.procedural[2] = count;
+    op.ext[2] = flags;
+    op.ids[2] = match input.mode {
+        GrayscaleMode::Desaturation => GRAY_DESATURATION,
+        GrayscaleMode::Luma => GRAY_LUMA,
+        GrayscaleMode::Average => GRAY_AVERAGE,
+        GrayscaleMode::Max => GRAY_MAX,
+        GrayscaleMode::Min => GRAY_MIN,
+    };
+    Some((GRADIENT, [input.balance, input.contrast, f32::from(u8::from(input.invert))]))
+}
+
+/// A ramp's stops as the CPU places them (`ramp_stops` in core: a missing or non-finite place
+/// evenly spaced, every place clamped to 0..1), sRGB-encoded when the ramp blends in sRGB, in
+/// place order. The stable sort keeps the list order at a shared place, which decides the stop
+/// the CPU reads there.
+fn sorted_stops(colors: &[[f32; 3]], positions: &[f32], linear: bool) -> Vec<(f32, [f32; 3])> {
+    let last = colors.len().saturating_sub(1);
+    let mut stops: Vec<(f32, [f32; 3])> = colors
+        .iter()
+        .enumerate()
+        .map(|(index, color)| {
+            let even = if last == 0 { 0.0 } else { index as f32 / last as f32 };
+            let position = positions.get(index).copied().filter(|position| position.is_finite()).unwrap_or(even);
+            let position = if position <= 0.0 { 0.0 } else { position.min(1.0) };
+            (position, if linear { *color } else { color.map(linear_to_srgb) })
+        })
+        .collect();
+    stops.sort_by(|left, right| left.0.total_cmp(&right.0));
+    stops
 }
 
 /// The shape `point_curve` in composite_point.wgsl draws for a Gradient Curve preset
@@ -155,8 +232,8 @@ mod tests {
 
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
-        BlendMode, Channel, ContentsOffset, ConversionMode, CurvePreset, Effect, EffectKind, Fill, Filter, GrayscaleConversion, Layer, LayerId, LayerKind,
-        Mask, MaskBackground, Project, Source, TextureSet,
+        BlendMode, Channel, ContentsOffset, ConversionMode, CurvePreset, Effect, EffectKind, Fill, Filter, GradientInput, GrayscaleConversion, GrayscaleMode,
+        Layer, LayerId, LayerKind, Mask, MaskBackground, Project, Source, TextureSet,
     };
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TILE, to_u16, to_u16_signed};
@@ -370,6 +447,48 @@ mod tests {
     }
 
     #[test]
+    fn gradients_with_stops_quantity_srgb_and_input_match_the_cpu() {
+        let three = vec![[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
+        let ramp = |colors: &[[f32; 3]], positions: &[f32], quantity, input, linear| Filter::GradientMap {
+            colors: colors.to_vec(),
+            positions: positions.to_vec(),
+            quantity,
+            input,
+            linear,
+            debug: false,
+        };
+        let luma = GradientInput::default();
+        // The library default: black, mid gray and white placed at 0, 0.5 and 1 of ten colours, the average gray
+        let mut library_colors = vec![[0.0; 3], [0.214; 3]];
+        library_colors.resize(10, [1.0; 3]);
+        let mut library_positions = vec![0.0, 0.5];
+        library_positions.resize(10, 1.0);
+        let mut filters = vec![
+            ramp(&library_colors, &library_positions, Some(3), GradientInput::LIBRARY, true),
+            ramp(&three, &[0.0, 0.3, 0.9], None, luma, true),
+            // Missing, non-finite and out-of-range places
+            ramp(&three, &[-0.2, f32::NAN], None, luma, true),
+            ramp(&[[0.2, 0.3, 0.4], [0.9, 0.1, 0.5], [0.1, 0.7, 0.3], [0.6, 0.6, 0.1]], &[], Some(2), luma, true),
+            ramp(&three, &[], None, luma, false),
+            ramp(&three, &[0.1, 0.75, 1.4], Some(2), luma, false),
+            ramp(&[[0.4, 0.2, 0.7]], &[], None, luma, false),
+            // No colours leave colours as they are and grays as gray
+            ramp(&[], &[], None, GradientInput::LIBRARY, true),
+        ];
+        let shaped = |mode| GradientInput { mode, balance: 0.6, contrast: 0.3, invert: true, ..luma };
+        filters.extend(GrayscaleMode::ALL.into_iter().map(|mode| ramp(&three, &[], None, shaped(mode), true)));
+        let hard = [
+            // A shared place is a jump in the ramp; the later stop in the list wins there
+            ramp(&[[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8], [0.6, 0.6, 0.6]], &[0.8, 0.2, 0.2, 0.5], None, luma, false),
+            ramp(&three, &[], None, GradientInput { contrast: 1.0, ..GradientInput::LIBRARY }, true),
+        ];
+
+        assert_filters_match_cpu(&filters, Tolerance::POINT);
+        // The jump and full contrast are hard decisions; the painted values sit away from them
+        assert_filters_match_cpu(&hard, Tolerance::POINT.with_flips(4));
+    }
+
+    #[test]
     fn height_adjust_matches_the_cpu() {
         let filters = [
             // The library default
@@ -386,28 +505,13 @@ mod tests {
     fn still_on_cpu() -> Vec<Filter> {
         vec![
             Filter::GrayscaleConversion(GrayscaleConversion { custom_input: true, ..GrayscaleConversion::LIBRARY }),
-            Filter::GradientMap {
-                colors: vec![[0.0; 3], [1.0; 3]],
-                positions: vec![0.0, 0.3],
-                quantity: None,
-                input: Default::default(),
-                linear: true,
-                debug: false,
-            },
-            Filter::GradientMap {
-                colors: vec![[0.0; 3], [1.0; 3], [0.5; 3]],
-                positions: Vec::new(),
-                quantity: Some(2),
-                input: Default::default(),
-                linear: true,
-                debug: false,
-            },
+            // The input's blur waits for the box family's stage (P4)
             Filter::GradientMap {
                 colors: vec![[0.0; 3], [1.0; 3]],
                 positions: Vec::new(),
                 quantity: None,
-                input: Default::default(),
-                linear: false,
+                input: GradientInput { blur: 4.0, ..GradientInput::default() },
+                linear: true,
                 debug: false,
             },
             Filter::GradientMap {

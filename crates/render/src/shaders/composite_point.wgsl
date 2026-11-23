@@ -6,6 +6,11 @@
 const POINT_POSTERIZE_ALPHA: u32 = 129u;
 const POINT_GRAYSCALE_CONVERSION: u32 = 136u;
 
+// A gradient's flags in Operation.ext.z (the constants in gpu_composite_point.rs)
+const POINT_GRADIENT_EVEN_LINEAR: u32 = 1u;
+const POINT_GRADIENT_SRGB: u32 = 2u;
+const POINT_GRADIENT_NEUTRAL_INPUT: u32 = 4u;
+
 // Histogram Scan's narrowest soft cut (SCAN_MIN_WIDTH in Rust)
 const POINT_SCAN_MIN_WIDTH: f32 = 1e-3;
 
@@ -166,6 +171,58 @@ fn point_conversion_channel(op: Operation, c: vec3<f32>, channel: u32, alpha: f3
     return vec3(point_conversion_gray(op, vec3(c.x), alpha));
 }
 
+// The linear value of an sRGB component (srgb_to_linear in Rust)
+fn point_srgb_to_linear(v: f32) -> f32 {
+    let x = clamp(v, 0.0, 1.0);
+    if x <= 0.04045 {
+        return x / 12.92;
+    }
+    return pow((x + 0.055) / 1.055, 2.4);
+}
+
+// Stop index of a gradient in the side table: its place, then its colour
+fn point_stop(op: Operation, index: u32) -> vec4<f32> {
+    let at = index * 4u;
+    return vec4(param(op, at), param(op, at + 1u), param(op, at + 2u), param(op, at + 3u));
+}
+
+// A gradient's colour at t from its procedural.z stops (at least one); evenly spaced linear ones read as opcode 33 does
+fn point_ramp(op: Operation, t: f32) -> vec3<f32> {
+    if (op.ext.z & POINT_GRADIENT_EVEN_LINEAR) != 0u {
+        return gradient_color(op, t);
+    }
+
+    // The last stop at or before t and the first one after it; the stops are in place order
+    let count = op.procedural.z;
+    let position = filter_unit(t);
+    var split = 0u;
+    for (var index = 0u; index < count; index++) {
+        if param(op, index * 4u) <= position {
+            split = index + 1u;
+        }
+    }
+    let before = point_stop(op, max(split, 1u) - 1u);
+    let after = point_stop(op, min(split, count - 1u));
+
+    var share = 0.0;
+    if after.x > before.x {
+        share = clamp((position - before.x) / (after.x - before.x), 0.0, 1.0);
+    }
+    let color = before.yzw + (after.yzw - before.yzw) * share;
+    if (op.ext.z & POINT_GRADIENT_SRGB) == 0u {
+        return color;
+    }
+    return vec3(point_srgb_to_linear(color.x), point_srgb_to_linear(color.y), point_srgb_to_linear(color.z));
+}
+
+// The ramp position of gray x after the gradient's balance, contrast and invert (GradientInput::shape in Rust)
+fn point_gradient_position(op: Operation, x: f32) -> f32 {
+    if (op.ext.z & POINT_GRADIENT_NEUTRAL_INPUT) != 0u {
+        return x;
+    }
+    return point_shape_gray(x, op.low.x, op.low.y, op.low.z > 0.5);
+}
+
 // x in steps + 1 levels, as posterize in Rust
 fn point_posterize(steps: f32, x: f32) -> f32 {
     return floor(filter_unit(x) * steps + 0.5) / steps;
@@ -203,6 +260,11 @@ fn point_scalar_filter(op: Operation, x: f32) -> f32 {
         case 135u: { return op.high.x; }
         // Grayscale Conversion: a mask weighs alpha as 1
         case 136u: { return point_conversion_gray(op, vec3(x), 1.0); }
+        // A gradient on a gray reads its ramp's luminance; a ramp without colours leaves the gray
+        case 137u: {
+            if op.procedural.z == 0u { return x; }
+            return point_luma(point_ramp(op, point_gradient_position(op, x)));
+        }
         default: { return x; }
     }
 }
@@ -217,6 +279,11 @@ fn point_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surfac
             // Gradient Dynamic: low.xyz the colour
             case 135u: { return op.low.xyz; }
             case 136u: { return vec3(point_conversion_gray(op, c, 1.0)); }
+            // A gradient on a colour: ids.z the gray it reads
+            case 137u: {
+                if op.procedural.z == 0u { return c; }
+                return point_ramp(op, point_gradient_position(op, point_gray(op.ids.z, c, 1.0, vec4(0.0))));
+            }
             default: {}
         }
     }
