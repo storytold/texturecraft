@@ -29,3 +29,43 @@ fn stack_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
 fn stack_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 {
     return stack_scalar_filter(effect, mask);
 }
+
+// A mask comparison with a soft edge (CompareOp::mask), low.z the ramp's width past the edge
+fn stack_soft_compare(op: Operation, mask: f32) -> f32 {
+    let width = op.low.z;
+    if op.ids.z == 0u {
+        return clamp((op.low.x - mask) / width, 0.0, 1.0);
+    }
+    if op.ids.z == 2u {
+        return clamp((mask - op.low.x) / width, 0.0, 1.0);
+    }
+    return clamp(1.0 + (op.low.y - abs(mask - op.low.x)) / width, 0.0, 1.0);
+}
+
+// A colour selection's gray and cover (ColorSelection::value): side table output, edge width, background (below 0: transparent)
+fn stack_color_selection(effect: Operation, pixel: vec2<u32>) -> vec2<f32> {
+    let output = param(effect, 0u);
+    let width = param(effect, 1u);
+    let background = param(effect, 2u);
+    var amount = 0.0;
+    if params.id_bake.x != 0u && effect.procedural.z > 0u {
+        let color = id_color_at(pixel);
+        var distance = 3.402823466e38;
+        for (var i = 0u; i < effect.procedural.z; i++) {
+            let at = effect.procedural.y + i * 3u;
+            let picked = bitcast<vec3<f32>>(vec3(srgb[at], srgb[at + 1u], srgb[at + 2u]));
+            let gap = abs(picked - color);
+            distance = min(distance, max(gap.x, max(gap.y, gap.z)));
+        }
+        let past = distance - effect.low.x;
+        if past <= 0.0 {
+            amount = 1.0;
+        } else if width > 0.0 {
+            amount = clamp(1.0 - past / width, 0.0, 1.0);
+        }
+    }
+    if background < 0.0 {
+        return vec2(output, amount);
+    }
+    return vec2(background + (output - background) * amount, 1.0);
+}

@@ -11,8 +11,9 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator,
-    GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source, ThresholdMode,
+    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, ContentsOffset, CurvatureDetail, CurvatureMode, Effect, EffectKind,
+    Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source,
+    ThresholdMode,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
@@ -948,8 +949,9 @@ impl CompositeProgram {
         let mut mask_layers = BTreeMap::new();
         let mut non_default = [false; Channel::ALL.len()];
         let stencil_pigment = brush.as_ref().is_some_and(|brush| brush.stencil.is_some());
-        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| StackWork::Layer(id, 0, 0)).collect();
-        while let Some(work) = layers.pop() {
+        // Each draw carries the Scale and Rotation of the folders holding it (an instanced folder's too)
+        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (StackWork::Layer(id, 0, 0), ContentsOffset::NONE)).collect();
+        while let Some((work, around)) = layers.pop() {
             let (id, depth, inherited_geometry) = match work {
                 StackWork::Layer(id, depth, geometry) => (id, depth, geometry),
                 StackWork::EndGroup(start) => {
@@ -973,9 +975,7 @@ impl CompositeProgram {
                     continue;
                 }
                 // A folder's Scale and Rotation (an instanced folder's too) re-place every fill inside it
-                if !contents.is_none() {
-                    return Err("A folder with Scale or Rotation uses CPU compositing.");
-                }
+                let children_around = around.then(*contents);
                 // A full-weight group sees the incoming stack and returns it exactly
                 // as its children changed it. A geometry restriction must stay on the
                 // group boundary when children publish anchors outside that restriction.
@@ -985,7 +985,7 @@ impl CompositeProgram {
                     })
                     && (geometry_mask == 0 || !groups::children_publish_anchors(project, children, depth + 1))
                 {
-                    layers.extend(children.iter().rev().map(|&child| StackWork::Layer(child, depth + 1, geometry_mask)));
+                    layers.extend(children.iter().rev().map(|&child| (StackWork::Layer(child, depth + 1, geometry_mask), children_around)));
                     continue;
                 }
                 let mut weights = [0.0f32; Channel::ALL.len()];
@@ -1003,7 +1003,7 @@ impl CompositeProgram {
                     continue;
                 }
                 let begin = effects.len() as u32;
-                let background = compile_mask(mask, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
+                let background = compile_mask(mask, around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
                 let count = effects.len() as u32 - begin;
                 let height = layer.height_mask;
                 let height_params = if height.enabled && count != 0 {
@@ -1032,13 +1032,13 @@ impl CompositeProgram {
                 procedural.anchors.draw_ranges.push(open as u32..open as u32 + 1);
                 group_depth += 1;
                 groups.depth = groups.depth.max(group_depth);
-                layers.push(StackWork::EndGroup(open));
+                layers.push((StackWork::EndGroup(open), ContentsOffset::NONE));
                 // The group tests its geometry before entering. Children still apply their own masks.
-                layers.extend(children.iter().rev().map(|&child| StackWork::Layer(child, depth + 1, 0)));
+                layers.extend(children.iter().rev().map(|&child| (StackWork::Layer(child, depth + 1, 0), children_around)));
                 continue;
             }
             let mask_start = effects.len() as u32;
-            let mask_background = compile_mask(mask, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
+            let mask_background = compile_mask(mask, around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
             let shared_content = effects.len() as u32;
             let mask_count = shared_content - mask_start;
             let has_content_anchors = layer.content_effects.iter().any(|effect| effect.visible && matches!(effect.kind, EffectKind::Anchor));
@@ -1047,10 +1047,10 @@ impl CompositeProgram {
             }
             let mut content_anchors = Vec::new();
             let mut visible_cut = 0u32;
-            let per_channel = layer.content_effects.iter().any(|effect| effect.visible && content_depends_on_channel(effect));
+            let per_channel = layer.content_effects.iter().any(|effect| effect.visible && (content_depends_on_channel(effect) || blends_per_channel(effect)));
             let mut templates = Vec::new();
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
-                if let Some(reason) = effect_needs_cpu(effect, true) {
+                if let Some(reason) = effect_needs_cpu(effect) {
                     return Err(reason);
                 }
                 if matches!(effect.kind, EffectKind::Anchor) {
@@ -1058,16 +1058,32 @@ impl CompositeProgram {
                     continue;
                 }
                 visible_cut += 1;
-                let op = if content_depends_on_channel(effect) {
+
+                // A filter laid on each channel apart is lowered once per channel of the set
+                let channel_ops = if blends_per_channel(effect) && !content_depends_on_channel(effect) {
+                    let mut ops = BTreeMap::new();
+                    for &(channel, _) in &set.channels {
+                        let op = channel_filter(effect, channel, &mut procedural).ok_or("A layer effect uses CPU compositing.")?;
+                        ops.insert(channel, (procedural.preceding_stage.take(), op));
+                    }
+                    Some(ops)
+                } else {
+                    None
+                };
+                let op = if content_depends_on_channel(effect) || channel_ops.is_some() {
                     None
                 } else {
                     Some(content_filter(effect, &mut procedural).ok_or("A layer effect uses CPU compositing.")?)
                 };
-                // A lowering with a stage before its operation takes two operations
-                let stage = procedural.preceding_stage.take();
+
+                // A lowering with a stage before its operation takes two operations, on every channel alike
+                let mut stage = procedural.preceding_stage.take();
+                if channel_ops.as_ref().is_some_and(|ops| ops.values().any(|(channel_stage, _)| channel_stage.is_some())) {
+                    stage = Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() });
+                }
                 visible_cut += u32::from(stage.is_some());
                 if per_channel {
-                    templates.push((effect, stage, op));
+                    templates.push((effect, stage, op, channel_ops));
                 } else if let Some(op) = op {
                     effects.extend(stage);
                     effects.push(op);
@@ -1109,11 +1125,18 @@ impl CompositeProgram {
                 };
                 let content_start = if per_channel { effects.len() as u32 } else { shared_content };
                 let mut adds_coverage = false;
-                for &(effect, stage, template) in &templates {
+                for (effect, shared_stage, shared_template, channel_ops) in &templates {
+                    // A channel without a stage of its own keeps the placeholder, so an anchor's content cut holds on every channel
+                    let (stage, template) = match channel_ops.as_ref().and_then(|ops| ops.get(&channel)) {
+                        Some((channel_stage, op)) => (shared_stage.map(|placeholder| channel_stage.unwrap_or(placeholder)), Some(*op)),
+                        None => (*shared_stage, *shared_template),
+                    };
                     effects.extend(stage);
                     let op = if let Some(op) = template {
                         op
-                    } else if let Some(op) = content_deposit(effect, channel, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))? {
+                    } else if let Some(op) =
+                        content_deposit(effect, (channel, around), pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))?
+                    {
                         adds_coverage = true;
                         op
                     } else {
@@ -1147,7 +1170,7 @@ impl CompositeProgram {
                 let mut op = if fill.is_none() {
                     content_paint(layer.id, channel, painted, brush_value, stencil_pigment, &mut paint)
                 } else {
-                    fill.and_then(|fill| source_operation(source, &fill.projection, fill.sampling, default, channel.kind(), &mut procedural))
+                    fill.and_then(|fill| source_operation(source, &placed(around, &fill.projection), fill.sampling, default, channel.kind(), &mut procedural))
                         .ok_or("A fill source or projection uses CPU compositing.")?
                 };
                 if let Some(decal) = decal {
@@ -1269,15 +1292,18 @@ impl CompositeProgram {
     ) -> Result<Self, &'static str> {
         let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
         packages::check_set(set, true)?;
-        // Folders around the layer (an instance's own, as the CPU places it, or its source's) re-place its mask fills
+        // The folders around the requested layer (an instance's own, as the CPU places it) re-place its mask fills
         let requested = owner;
         let owner = project.mask_owner(owner);
-        if !project.contents_around(requested).is_none() || !project.contents_around(owner).is_none() {
-            return Err("A mask inside a folder with Scale or Rotation uses CPU mask preview.");
-        }
+        let around = project.contents_around(requested);
         let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
         let mask = mask.ok_or("The layer has no enabled mask.")?;
         if mask.effects.iter().any(|effect| effect.visible && !effect.kind.anchors_read().is_empty()) {
+            // The material program keeps the owner's last draw, which must sit where the requested layer does
+            if stack::draw_offsets(project, &set.stack, owner).iter().any(|offset| *offset != around) {
+                return Err("A mask reading anchors inside a folder with Scale or Rotation uses CPU mask preview.");
+            }
+
             let mut program = Self::try_compile_with_brush(project, pixels, ts, region, brush)?;
             program.mask_layer = *program.mask_layers.get(&owner).ok_or("The mask's GPU anchor stack is missing.")?;
             program.mask_preview = true;
@@ -1291,7 +1317,7 @@ impl CompositeProgram {
         let mut paint = PaintInputs::default();
         let mut procedural = ProceduralInputs::new(set.resolution);
         let mut tile_patterns = TilePatterns::default();
-        let background = compile_mask(Some(mask), pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
+        let background = compile_mask(Some(mask), around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
         operations[0].effects[1] = operations.len() as u32 - 1;
         operations[0].balance[1] = background;
         bind_input_sources(&mut operations, 1, &procedural.input_sources);
@@ -1356,6 +1382,12 @@ fn sparse_channel(pixels: &PixelStore, id: LayerId, channel: Channel) -> Result<
     Ok(image)
 }
 
+/// `projection` under the Scale and Rotation `around` of the folders holding its fill, borrowed
+/// when they change nothing.
+fn placed(around: ContentsOffset, projection: &Projection) -> Cow<'_, Projection> {
+    if around.is_none() { Cow::Borrowed(projection) } else { Cow::Owned(around.apply(projection)) }
+}
+
 fn content_paint(
     id: LayerId,
     channel: Channel,
@@ -1382,26 +1414,49 @@ fn content_filter(effect: &Effect, procedural: &mut ProceduralInputs) -> Option<
     match &effect.kind {
         // A mask-only effect authored in this stack leaves its content alone.
         EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection(_) | EffectKind::Compare { .. } => Some(noop),
-        // Levels limited to one channel would need a program per channel
-        EffectKind::Levels(levels) if levels.affects.is_some() => None,
         // A blending effect set to Disable leaves the content as it is
         kind if kind.blends() && effect.blend == BlendMode::Disable && uniform_blend(effect) => Some(noop),
         _ => point_effect(effect, procedural),
     }
 }
 
-/// Whether the effect blends every channel alike: the GPU program reads one blend mode and opacity per effect
+/// Whether the effect blends every channel alike: one operation then serves every channel
 fn uniform_blend(effect: &Effect) -> bool {
     effect.channel_blends.is_empty() && effect.off_channels.is_empty()
 }
 
-/// Settings of a content effect the GPU program does not model: per-channel blends, channels
-/// switched off, and image inputs its filter reads. A mask ignores per-channel blends (it blends
-/// by [`Effect::blend_of`] with no channel), so a mask effect is checked with `content` false.
-fn effect_needs_cpu(effect: &Effect, content: bool) -> Option<&'static str> {
-    if content && !uniform_blend(effect) {
-        return Some("An effect with per-channel blending uses CPU compositing.");
+/// Whether a content effect lays onto each channel apart: per-channel blends, switched-off
+/// channels, or Levels remapping one channel only (`Levels::affects`).
+fn blends_per_channel(effect: &Effect) -> bool {
+    !uniform_blend(effect) || matches!(&effect.kind, EffectKind::Levels(levels) if levels.affects.is_some())
+}
+
+/// A content filter's operation on `channel`: lowered with the channel's own blend and opacity
+/// ([`Effect::applied_blend`], none on a switched-off channel), and Levels only on the channel it
+/// remaps, as the CPU's `content_effect` lays it on.
+fn channel_filter(effect: &Effect, channel: Channel, procedural: &mut ProceduralInputs) -> Option<Operation> {
+    if let EffectKind::Levels(levels) = &effect.kind
+        && !levels.remaps(channel)
+    {
+        return Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() });
     }
+
+    let blend = effect.applied_blend(Some(channel));
+    let mut on_channel = effect.clone();
+    on_channel.blend = blend.mode;
+    on_channel.opacity = blend.opacity;
+    on_channel.channel_blends.clear();
+    on_channel.off_channels.clear();
+    if let EffectKind::Levels(levels) = &mut on_channel.kind {
+        levels.affects = None;
+    }
+    content_filter(&on_channel, procedural)
+}
+
+/// Settings of an effect the GPU program does not model: image inputs its filter reads. A mask
+/// ignores per-channel blends (it blends by [`Effect::blend_of`] with no channel), and content
+/// effects lay them on per channel ([`channel_filter`], [`content_deposit`]).
+fn effect_needs_cpu(effect: &Effect) -> Option<&'static str> {
     if reads_image_input(effect) {
         return Some("An effect with an image input uses CPU compositing.");
     }
@@ -1417,21 +1472,24 @@ fn reads_image_input(effect: &Effect) -> bool {
 
 fn content_deposit(
     effect: &Effect,
-    channel: Channel,
+    (channel, around): (Channel, ContentsOffset),
     pixels: &PixelStore,
     brush: Option<&LiveBrush>,
     (paint, procedural, tile_patterns): (&mut PaintInputs, &mut ProceduralInputs, &mut TilePatterns),
 ) -> Result<Option<Operation>, &'static str> {
-    if !effect.opacity.is_finite() {
+    // The channel's own blend, at no opacity where the effect is switched off
+    let blend = effect.applied_blend(Some(channel));
+    if !blend.opacity.is_finite() {
         return Err("A content effect has an invalid opacity.");
     }
+
     // A deposit set to Disable leaves the content and its coverage as they are
-    if effect.opacity <= 0.0 || effect.blend == BlendMode::Disable {
+    if blend.opacity <= 0.0 || blend.mode == BlendMode::Disable {
         return Ok(None);
     }
     let mut op = if let EffectKind::Material(fill) = &effect.kind {
         let Some(source) = fill.sources.get(&channel) else { return Ok(None) };
-        let mut op = source_operation(Some(source), &fill.projection, fill.sampling, channel.default_value(), channel.kind(), procedural)
+        let mut op = source_operation(Some(source), &placed(around, &fill.projection), fill.sampling, channel.default_value(), channel.kind(), procedural)
             .ok_or("A content material source or projection uses CPU compositing.")?;
         if let Some(decal) = register_decal(fill, &mut procedural.materials)? {
             op.uv[0] = decal as f32;
@@ -1447,13 +1505,16 @@ fn content_deposit(
         }
         content_paint(effect.id, channel, image, value, brush.is_some_and(|brush| brush.stencil.is_some()), paint)
     };
-    op.low[3] = effect.opacity.min(1.0);
-    op.balance[2] = blend_code(effect.blend) as f32;
+    op.low[3] = blend.opacity.min(1.0);
+    op.balance[2] = blend_code(blend.mode) as f32;
     Ok(Some(op))
 }
 
+/// `mask`'s effects as operations, its fills under the Scale and Rotation `around` of the folders
+/// holding the layer, and the mask's background value.
 fn compile_mask(
     mask: Option<&Mask>,
+    around: ContentsOffset,
     pixels: &PixelStore,
     brush: Option<&LiveBrush>,
     (paint, procedural, tile_patterns): (&mut PaintInputs, &mut ProceduralInputs, &mut TilePatterns),
@@ -1461,12 +1522,12 @@ fn compile_mask(
 ) -> Result<f32, &'static str> {
     let Some(mask) = mask else { return Ok(1.0) };
     for effect in mask.effects.iter().filter(|e| e.visible) {
-        if let Some(reason) = effect_needs_cpu(effect, false) {
+        if let Some(reason) = effect_needs_cpu(effect) {
             return Err(reason);
         }
         let mut op = match &effect.kind {
             EffectKind::Fill { source, projection, sampling } => {
-                let mut operation = source_operation(Some(source), projection, *sampling, [0.0; 3], ChannelKind::Scalar, procedural)
+                let mut operation = source_operation(Some(source), &placed(around, projection), *sampling, [0.0; 3], ChannelKind::Scalar, procedural)
                     .ok_or("A mask fill source or projection uses CPU compositing.")?;
                 if let Some(frame) = projection.frame() {
                     operation.uv[0] = procedural.materials.register_decal(*frame, std::iter::once(source), *sampling) as f32;
@@ -1497,25 +1558,32 @@ fn compile_mask(
             }
             EffectKind::Generator(generator) => generator_operation(generator, procedural, tile_patterns).ok_or("A mask generator uses CPU compositing.")?,
             EffectKind::ColorSelection(selection) => {
-                // The GPU selects hard, on black, from the baked ID map
+                // The GPU reads the baked ID map; an image as ID map stays on the CPU
                 let ColorSelection { colors, tolerance, output, hardness, background, id_map } = selection;
-                if *output != 1.0 || *hardness != 1.0 || *background != texturecraft_core::SelectionBackground::Black || id_map.is_some() {
-                    return Err("A color selection's output, hardness, background or ID map uses CPU compositing.");
+                if id_map.is_some() {
+                    return Err("A color selection's ID map image uses CPU compositing.");
                 }
                 let [offset, count] = procedural.pack_rgb(colors).ok_or("A color selection has invalid colors.")?;
                 if !tolerance.is_finite() {
                     return Err("A color selection has invalid tolerance.");
                 }
-                Operation { ids: [0, COLOR_SELECTION_OPCODE, 0, 0], low: [*tolerance, 0.0, 0.0, 0.0], procedural: [0, offset, count, 0], ..Operation::zeroed() }
+                let mut operation = Operation {
+                    ids: [0, COLOR_SELECTION_OPCODE, 0, 0],
+                    low: [*tolerance, 0.0, 0.0, 0.0],
+                    procedural: [0, offset, count, 0],
+                    ..Operation::zeroed()
+                };
+                stack::soften_selection(&mut operation, *output, *hardness, *background, procedural).ok_or("A color selection has invalid parameters.")?;
+                operation
             }
             EffectKind::Anchor => {
                 let publication = procedural.anchors.publish(effect.id, true);
                 Operation { ids: [0, ANCHOR_PUBLISH_MASK, publication, 0], ..Operation::zeroed() }
             }
             EffectKind::Compare { op, value, tolerance, left, right, channel: _, hardness } => {
-                // The GPU compares the mask so far with a constant, hard; the channel is read only by layer sides
-                if *left != CompareSource::ThisMask || *right != CompareSource::Constant || *hardness != 1.0 {
-                    return Err("A mask comparison reading layers or with a soft edge uses CPU compositing.");
+                // The GPU compares the mask so far with a constant; the channel is read only by layer sides
+                if *left != CompareSource::ThisMask || *right != CompareSource::Constant {
+                    return Err("A mask comparison reading layers uses CPU compositing.");
                 }
                 if !value.is_finite() || !tolerance.is_finite() {
                     return Err("A mask comparison has invalid parameters.");
@@ -1525,7 +1593,9 @@ fn compile_mask(
                     CompareOp::WithinTolerance => 1,
                     CompareOp::GreaterThan => 2,
                 };
-                Operation { ids: [0, COMPARE_OPCODE, compare, 0], low: [*value, *tolerance, 0.0, 0.0], ..Operation::zeroed() }
+                let mut operation = Operation { ids: [0, COMPARE_OPCODE, compare, 0], low: [*value, *tolerance, 0.0, 0.0], ..Operation::zeroed() };
+                stack::soften_compare(&mut operation, *hardness);
+                operation
             }
             // Lighting reads the base color, which a mask does not have
             EffectKind::Filter(Filter::BakedLighting { .. } | Filter::EnvironmentLighting { .. }) => continue,
