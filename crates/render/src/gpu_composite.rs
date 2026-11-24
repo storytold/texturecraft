@@ -1072,14 +1072,25 @@ impl CompositeRegion {
 pub struct LiveBrush {
     pub target: LiveBrushTarget,
     pub opacity: f32,
+    /// The Eraser: the stroke scales the target's paint and coverage down. A layer target then
+    /// lists the channels the commit erases, with unused values.
+    pub erase: bool,
     pub alpha: wgpu::TextureView,
     /// Supplies opacity modulation and Base Color for a projection stroke.
     pub stencil: Option<GpuStencil>,
 }
 
 pub enum LiveBrushTarget {
-    Layer { layer: LayerId, values: BTreeMap<Channel, [f32; 3]> },
-    Mask { effect: LayerId, value: f32 },
+    Layer {
+        layer: LayerId,
+        values: BTreeMap<Channel, [f32; 3]>,
+    },
+    /// `image`: the image resource whose gray the stroke paints per texel instead of `value`.
+    Mask {
+        effect: LayerId,
+        value: f32,
+        image: Option<String>,
+    },
 }
 
 impl LiveBrush {
@@ -1098,12 +1109,14 @@ impl LiveBrush {
         Ok(())
     }
 
-    fn value_for_layer(&self, id: LayerId, channel: Channel) -> Option<([f32; 3], f32)> {
+    /// The live paint of `channel` on paint layer or content paint effect `id`: its value, the
+    /// stroke opacity and whether it erases.
+    fn value_for_layer(&self, id: LayerId, channel: Channel) -> Option<([f32; 3], f32, bool)> {
         let LiveBrushTarget::Layer { layer, values } = &self.target else { return None };
         if *layer != id {
             return None;
         }
-        values.get(&channel).map(|&value| (value, self.opacity.clamp(0.0, 1.0)))
+        values.get(&channel).map(|&value| (value, self.opacity.clamp(0.0, 1.0), self.erase))
     }
 }
 
@@ -1800,15 +1813,16 @@ fn content_paint(
     id: LayerId,
     channel: Channel,
     image: Option<&TileImage>,
-    brush_value: Option<([f32; 3], f32)>,
+    brush_value: Option<([f32; 3], f32, bool)>,
     stencil_pigment: bool,
     paint: &mut PaintInputs,
 ) -> Operation {
     let image_index = image.map_or(NO_PAINT_IMAGE, |image| paint.register(id, Some(channel), image));
     let mut op = Operation { ids: [channel_slot(channel), 10, image_index, (channel.components() + 1) as u32], ..Operation::zeroed() };
-    if let Some(([r, g, b], opacity)) = brush_value {
+    if let Some(([r, g, b], opacity, erase)) = brush_value {
         op.projection[3] = if stencil_pigment && channel == Channel::BaseColor { 2.0 } else { 1.0 };
         op.uv = [r, g, b, opacity];
+        op.ext[2] = brush::live_paint_bits(erase, false);
     }
     op
 }
@@ -1949,8 +1963,8 @@ fn compile_mask(
             }
             EffectKind::Paint | EffectKind::Path(_) => {
                 let live = brush.and_then(|brush| match &brush.target {
-                    LiveBrushTarget::Mask { effect: id, value } if *id == effect.id && matches!(effect.kind, EffectKind::Paint) => {
-                        Some((value.clamp(0.0, 1.0), brush.opacity.clamp(0.0, 1.0)))
+                    LiveBrushTarget::Mask { effect: id, value, image } if *id == effect.id && matches!(effect.kind, EffectKind::Paint) => {
+                        Some((value.clamp(0.0, 1.0), brush.opacity.clamp(0.0, 1.0), brush.erase, image.as_deref()))
                     }
                     _ => None,
                 });
@@ -1963,9 +1977,14 @@ fn compile_mask(
                 }
                 let image_index = image.map_or(NO_PAINT_IMAGE, |image| paint.register(effect.id, None, image));
                 let mut op = Operation { ids: [0, 10, image_index, 2], ..Operation::zeroed() };
-                if let Some((value, opacity)) = live {
+                if let Some((value, opacity, erase, mask_image)) = live {
                     op.projection[3] = 1.0;
                     op.uv = [value, value, value, opacity];
+                    let mask_image = mask_image.filter(|_| !erase);
+                    op.ext[2] = brush::live_paint_bits(erase, mask_image.is_some());
+                    if let Some(name) = mask_image {
+                        op.ext[0] = procedural.pack_image(name, ImageUse::Material).ok_or("The live brush's mask image does not fit the GPU program.")?;
+                    }
                 }
                 op
             }
@@ -4109,6 +4128,7 @@ mod procedural_tests {
             let live_brush = live.then(|| LiveBrush {
                 target: LiveBrushTarget::Layer { layer: paint_id, values: preview.values.clone() },
                 opacity: preview.opacity,
+                erase: false,
                 alpha: alpha.create_view(&Default::default()),
                 stencil: None,
             });

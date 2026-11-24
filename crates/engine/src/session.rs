@@ -460,6 +460,8 @@ pub(crate) struct DisplayStrokeEnd {
     pub previous_revision: u64,
     pub revision: u64,
     pub tiles: BTreeSet<(u32, u32)>,
+    /// The other texture sets the stroke fed: set, revision before and revision after.
+    pub fed: Vec<(usize, u64, u64)>,
 }
 
 pub(crate) struct ActiveStroke {

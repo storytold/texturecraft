@@ -37,7 +37,11 @@ pub struct DeviceStrokePreview<'a> {
     pub target: PaintTarget,
     pub values: &'a BTreeMap<Channel, [f32; 3]>,
     pub mask_value: f32,
+    /// The image resource whose gray a mask stroke paints per texel in place of `mask_value`.
+    pub mask_image: Option<&'a str>,
     pub opacity: f32,
+    /// The Eraser: the stroke scales the target's paint and coverage down instead of painting.
+    pub erase: bool,
     pub stroke: &'a dyn DeviceStroke,
 }
 

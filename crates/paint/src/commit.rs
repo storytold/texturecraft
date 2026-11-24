@@ -295,7 +295,7 @@ impl Staging {
 
 /// The channels a layer commit writes: the painted ones, or every painted channel of the layer
 /// when erasing (only those in `values` when it is not empty).
-fn commit_channels(pixels: &PixelStore, layer: LayerId, values: &BTreeMap<Channel, [f32; 3]>, erase: bool) -> Vec<Channel> {
+pub fn commit_channels(pixels: &PixelStore, layer: LayerId, values: &BTreeMap<Channel, [f32; 3]>, erase: bool) -> Vec<Channel> {
     if erase {
         let painted: BTreeSet<Channel> = pixels.layers.keys().filter(|(id, _)| *id == layer).map(|(_, c)| *c).collect();
         painted.into_iter().filter(|c| values.is_empty() || values.contains_key(c)).collect()

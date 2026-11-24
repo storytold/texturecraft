@@ -339,30 +339,20 @@ impl Session {
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
         let settings = &stroke.settings;
-        let gpu_tool = tool == Tool::Paint || (quick_mask && erase) || (tool == Tool::Projection && !uv_mode && stencil.is_some());
+        // A 3D view projection without a stencil was refused above; the 2D view paints without one. A path repaints its curve as a stroke
+        let gpu_tool = matches!(tool, Tool::Paint | Tool::Projection | Tool::Path) || erase;
         // Resolved once: staging, both previews and the commit paint this gray
         let mask_gray = self.mask_gray();
-        // The device previews one gray; a mask image paints on the CPU
-        let image_mask = matches!(target, Some(PaintTarget::Mask(_))) && matches!(mask_gray, MaskGray::Image { .. });
-        if image_mask && gpu_tool && self.brush_device.is_some() {
-            self.log.performance("Brush: CPU (mask image)");
-        }
+        // Symmetry copies reach the device with the stamps (a 3D copy carries its source for visibility); an Eraser with particles stays on the CPU
         let device = if gpu_tool
-            && !image_mask
             && canvas.pickup.is_none()
-            && !settings.symmetry.any()
+            && !(erase && settings.particles.enabled)
             && settings.alpha_image.is_none()
             && settings.alpha_library.is_none()
             && let Some(backend) = &self.brush_device
             && let Some(cache) = self.caches.get(ts)
             && backend.surface.ptr_eq(&std::sync::Arc::downgrade(&cache.gbuf))
-            && target.is_none_or(|target| {
-                self.doc
-                    .project
-                    .sets_drawing(self.paint_owner(target))
-                    .into_iter()
-                    .all(|other| other == ts || self.caches.get(other).is_none_or(|other| other.size != size))
-            }) {
+        {
             let surface = crate::brush_device::BrushSurface {
                 mesh: self.mesh.clone(),
                 bvh: self.bvh.clone(),
@@ -665,17 +655,20 @@ impl Session {
     /// The live material compositor uses the device's coverage directly while the stroke is active.
     pub fn device_stroke(&self) -> Option<DeviceStrokePreview<'_>> {
         let stroke = self.stroke.as_ref()?;
-        // The gray resolved when the stroke began; a mask image never runs on the device
+
+        // The gray resolved when the stroke began: one value, or an image's gray per texel
         let mask_value = match &stroke.mask_gray {
             MaskGray::Value(value) => value.clamp(0.0, 1.0),
-            MaskGray::Image { .. } => return None,
+            MaskGray::Image { .. } => 0.0,
         };
         Some(DeviceStrokePreview {
             ts: stroke.ts,
             target: stroke.target?,
             values: &stroke.values,
             mask_value,
+            mask_image: stroke.mask_gray.image_name(),
             opacity: stroke.stroke.settings.opacity,
+            erase: stroke.erase,
             stroke: stroke.device.as_deref()?,
         })
     }
@@ -730,12 +723,36 @@ impl Session {
         valid.then_some(device)
     }
 
-    /// Identity and tiles of a supported live stroke since the display last drew it.
+    /// Identity and tiles of a supported live stroke since the display last drew it, on its own
+    /// texture set or another one it feeds. A pickup (clone, smudge, brush material) shows
+    /// through [`Session::display_stroke_pixels`].
     pub fn pending_display_stroke(&self, ts: usize) -> Option<(u64, &BTreeSet<(u32, u32)>)> {
         let stroke = self.stroke.as_ref()?;
         let tiles = &stroke.display_tiles;
         let can_preview = stroke.stencil.is_none() || stroke.device.is_some();
-        (stroke.ts == ts && stroke.target.is_some() && can_preview && stroke.canvas.pickup.is_none()).then_some((stroke.display_id, tiles))
+        (self.stroke_feeds(ts) && stroke.target.is_some() && can_preview).then_some((stroke.display_id, tiles))
+    }
+
+    /// Whether texture set `ts` shows the active stroke live: the set it paints, or another set of
+    /// the same size drawing the painted layer (an instance), whose texels are the same pixels. A
+    /// stencil is sampled at the painted set's surface, which another set's texels do not share.
+    fn stroke_feeds(&self, ts: usize) -> bool {
+        self.stroke.as_ref().is_some_and(|stroke| self.feeds(stroke, ts))
+    }
+
+    /// Whether `stroke` shows live on texture set `ts` (see [`Session::stroke_feeds`]).
+    fn feeds(&self, stroke: &ActiveStroke, ts: usize) -> bool {
+        if stroke.ts == ts {
+            return true;
+        }
+
+        if stroke.stencil.is_some() {
+            return false;
+        }
+
+        let size = |set: usize| self.caches.get(set).map(|cache| cache.size);
+        let same_size = size(ts).is_some() && size(ts) == size(stroke.ts);
+        same_size && stroke.target.is_some_and(|target| self.doc.project.sets_drawing(self.paint_owner(target)).contains(&ts))
     }
 
     /// Copy-on-write material pixels for display. The staged blends are the same tiles the
@@ -782,7 +799,15 @@ impl Session {
     pub fn finished_display_stroke(&self, ts: usize, id: u64, previous_revision: u64) -> Option<&BTreeSet<(u32, u32)>> {
         let end = self.display_stroke_end.as_ref()?;
         let revision = self.caches.get(ts)?.material_revision;
-        (end.ts == ts && end.id == id && end.previous_revision == previous_revision && end.revision == revision).then_some(&end.tiles)
+        let own = end.ts == ts && end.previous_revision == previous_revision && end.revision == revision;
+        let fed = end.fed.contains(&(ts, previous_revision, revision));
+        (end.id == id && (own || fed)).then_some(&end.tiles)
+    }
+
+    /// The texture sets other than its own that `stroke` feeds, with their material revisions.
+    fn fed_revisions(&self, stroke: &ActiveStroke) -> Vec<(usize, u64)> {
+        let fed = |&(set, _): &(usize, &crate::session::SetCache)| set != stroke.ts && self.feeds(stroke, set);
+        self.caches.iter().enumerate().filter(fed).map(|(set, cache)| (set, cache.material_revision)).collect()
     }
 
     /// Commit the active stroke (one undo step).
@@ -834,6 +859,7 @@ impl Session {
         } else {
             commit(&stroke.canvas.dirty, None);
         }
+        let fed_before = self.fed_revisions(&stroke);
         self.undo.push((stroke.label.clone(), stroke.before));
         if self.undo.len() > crate::session::MAX_HISTORY {
             self.undo.remove(0);
@@ -845,6 +871,8 @@ impl Session {
         let previous_revision = self.caches.get(stroke.ts).map_or(0, |cache| cache.material_revision);
         // Recompute committed tiles at low priority because the live preview already shows them
         self.mark_settle(stroke.ts, stroke.target, stroke.canvas.dirty.iter().copied());
+        let revision_of = |set: usize| self.caches.get(set).map_or(0, |cache| cache.material_revision);
+        let fed = fed_before.into_iter().map(|(set, before)| (set, before, revision_of(set))).collect();
         if let Some(cache) = self.caches.get_mut(stroke.ts) {
             self.display_stroke_end = Some(DisplayStrokeEnd {
                 id: stroke.display_id,
@@ -852,6 +880,7 @@ impl Session {
                 previous_revision,
                 revision: cache.material_revision,
                 tiles: stroke.display_tiles,
+                fed,
             });
             cache.finished_dab = brush_tile
                 .filter(|tile| stroke.canvas.dirty.contains(tile) && (cache.dirty.contains(tile) || cache.upload.contains(tile) || cache.settle.contains(tile)))
@@ -863,6 +892,7 @@ impl Session {
     /// Abandon the active stroke (Esc).
     pub fn cancel_stroke(&mut self) {
         if let Some(st) = self.stroke.take() {
+            let fed = self.fed_revisions(&st).into_iter().map(|(set, revision)| (set, revision, revision)).collect();
             self.mark_painted(st.ts, st.target, st.canvas.dirty.iter().copied(), false);
             if st.target.is_none() {
                 self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
@@ -875,7 +905,7 @@ impl Session {
             if let Some(cache) = self.caches.get(st.ts) {
                 let revision = cache.material_revision;
                 self.display_stroke_end =
-                    Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision: revision, revision, tiles: st.canvas.dirty });
+                    Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision: revision, revision, tiles: st.canvas.dirty, fed });
             }
         }
     }
