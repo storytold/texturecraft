@@ -2761,6 +2761,44 @@ pub(crate) mod tests {
         }
     }
 
+    /// A 2D view stroke with symmetry runs on the GPU brush: its mirrored copy shows live where
+    /// the release commits it
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_symmetric_2d_view_stroke_previews_its_copies_on_the_gpu() {
+        let Ok(gpu) = Headless::new() else { return };
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let mut s = Session::new_project("GPU symmetry", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        let layer = s.selected_layer().unwrap();
+        execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.1, 0.7, 0.2]})).unwrap();
+        execute(&mut s, "tool.brush", &json!({"size": 20, "symmetryOn": true, "symmetryX": true})).unwrap();
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+        let display = |link: &mut GpuLink, s: &mut Session| -> [[u8; 4]; 2] {
+            let scene = link.sync(s, None, None, 0, 0.0);
+            let gpu = &mut *brush.0.lock().unwrap();
+            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{errors:?}");
+            let texture = gpu.renderer.display_textures()[0][0];
+            [32, 96].map(|x| read_pixel(gpu, texture, x, 64))
+        };
+        let neutral = display(&mut link, &mut s);
+
+        s.brush_device = link.brush_device(&s);
+        s.begin_stroke_uv(Vec2::new(0.25, 0.5), 1.0).unwrap();
+        assert!(s.device_stroke().is_some(), "the symmetric stroke runs on the device");
+        let live = display(&mut link, &mut s);
+        s.end_stroke().unwrap();
+        let committed = display(&mut link, &mut s);
+
+        let pixels = s.doc.pixels.layer(layer, Channel::BaseColor).unwrap();
+        assert!([32, 96].iter().all(|&x| pixels.get(x, 64).last().is_some_and(|&coverage| coverage > 0)), "the commit paints the stroke and its copy");
+        assert!(live.iter().zip(neutral).all(|(live, neutral)| *live != neutral), "both the stroke and its copy show live: {live:?}");
+        let close = |a: &[u8; 4], b: &[u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(*b) <= 1);
+        assert!(live.iter().zip(&committed).all(|(a, b)| close(a, b)), "live {live:?}, committed {committed:?}");
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_mask_brush_previews_commits_and_cancels_in_both_views() {

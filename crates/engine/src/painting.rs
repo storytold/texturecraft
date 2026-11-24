@@ -347,10 +347,11 @@ impl Session {
         if image_mask && gpu_tool && self.brush_device.is_some() {
             self.log.performance("Brush: CPU (mask image)");
         }
+        // A 2D view batch carries its symmetry copies; a 3D copy's visibility reads its source stamp, which the device lacks
         let device = if gpu_tool
             && !image_mask
             && canvas.pickup.is_none()
-            && !settings.symmetry.any()
+            && (uv_mode || !settings.symmetry.any())
             && settings.alpha_image.is_none()
             && settings.alpha_library.is_none()
             && let Some(backend) = &self.brush_device
