@@ -69,6 +69,8 @@ pub(super) const WGSL_STUB: &str = concat!(
     "fn p1_image_at(image: u32, uv: vec2<f32>, layer: Operation) -> vec4<f32> { return vec4(0.0); }"
 );
 
+/// `procedural[3]` of a tri-planar projection
+const TRIPLANAR_PROJECTION: u32 = 1;
 /// `procedural[3]` of a warp projection
 const WARP_PROJECTION: u32 = PROJECTION_SELECTORS.start;
 
@@ -88,6 +90,10 @@ const FLAG_FRAMED: u32 = 1 << 11;
 const FLAG_IMAGE_ALPHA: u32 = 1 << 12;
 const FLAG_FRAME_VALID: u32 = 1 << 13;
 const FLAG_UV_PLACED: u32 = 1 << 14;
+/// The symmetry's copy count, from this bit on (the shader reads the count from the side table)
+const COPIES_SHIFT: u32 = 16;
+/// Flags of a coverage that can leave a texel uncovered, so symmetry copies under it get evaluated too
+const PARTIAL_COVER: u32 = FLAG_TILE_COVER | FLAG_CROP | FLAG_BACKFACE | FLAG_FRAMED | FLAG_DEPTH | FLAG_IMAGE_ALPHA;
 
 // Side-table words of a fill on P1's path, from `ext[0]` (the P1_* slots of composite_projection.wgsl)
 const SLOT_KIND: usize = 0;
@@ -331,7 +337,7 @@ fn selector(projection: &Projection) -> u32 {
     match projection {
         Projection::Uv { .. } => 0,
         Projection::UvTile => UV_TILE_PROJECTION,
-        Projection::Triplanar { .. } => 1,
+        Projection::Triplanar { .. } => TRIPLANAR_PROJECTION,
         Projection::Planar { placed: Some(_), .. } => DECAL_PROJECTION,
         Projection::Planar { axis, .. } => 2 + u32::from((*axis).min(2)),
         Projection::Spherical { .. } => 5,
@@ -464,7 +470,7 @@ fn side_table(projection: &Projection, sampling: Sampling, flags: &mut u32) -> O
     }
 
     if sampling.symmetry.on && projection.takes_symmetry() {
-        *flags |= FLAG_SYMMETRY;
+        *flags |= FLAG_SYMMETRY | (sampling.symmetry.copies() << COPIES_SHIFT);
         put_symmetry(&mut words, &sampling.symmetry)?;
     }
 
@@ -542,12 +548,27 @@ fn put_symmetry(words: &mut [u32; SLOT_WORDS], symmetry: &FillSymmetry) -> Optio
 }
 
 /// The work per output texel of operation `op`, whose own work (a Tile Generator's placements
-/// per plane and sample, 0 for other operations) is `own`: P1 adds its fills' cost here,
-/// symmetry copies times sampling (planes, Bilinear HQ levels), so bands shrink and one
-/// submission stays short. It counts against the update budget too
-/// (`MAX_TILE_WORK_PER_UPDATE`). Today: `own`.
-pub(super) fn work_per_texel(_op: &Operation, own: u64) -> u64 {
-    own
+/// per plane and sample, 0 for other operations) is `own`: P1 adds its fills' cost here, so
+/// bands shrink and one submission stays short. It counts against the update budget too
+/// (`MAX_TILE_WORK_PER_UPDATE`).
+///
+/// A unit is one sampled read: per copy an image reads each plane at one level (two with
+/// Bilinear HQ) plus the footprint's neighbours, a pattern or uniform once, and depth culling
+/// and a frame's image alpha add their reads. Symmetry multiplies by the copies only where a
+/// copy can leave the texel uncovered: otherwise the first copy covers it and the rest are
+/// skipped. Fills on the built-in paths add nothing.
+pub(super) fn work_per_texel(op: &Operation, own: u64) -> u64 {
+    let flags = op.ext[1];
+    if flags == 0 {
+        return own;
+    }
+
+    let hq = u64::from(flags & FLAG_HQ != 0);
+    let planes = if op.procedural[3] == TRIPLANAR_PROJECTION { 3 } else { 1 };
+    let reads = if op.ids[1] == IMAGE_SOURCE_OPCODE { planes * (1 + hq) + hq } else { 1 };
+    let cover = u64::from(flags & FLAG_DEPTH != 0) + u64::from(flags & FLAG_IMAGE_ALPHA != 0) * (1 + 2 * hq);
+    let copies = if flags & FLAG_SYMMETRY != 0 && flags & PARTIAL_COVER != 0 { u64::from(flags >> COPIES_SHIFT) } else { 1 };
+    own.saturating_add(copies * (reads + cover))
 }
 
 /// Whether a program needs the full `composite_projection.wgsl`.
@@ -1278,6 +1299,34 @@ mod tests {
 
         assert_eq!(first.len(), CULLED_FILLS, "one grid per view");
         assert!(first.iter().zip(&second).all(|(before, after)| Arc::ptr_eq(&before.texels, &after.texels)), "the recompile rebuilt a grid");
+    }
+
+    /// 64 radial copies of a small cropped planar fill read with Bilinear HQ cost the bands so
+    /// much per texel that a 4K set composites in shorter bands than a plain fill, still within
+    /// the update budget; uncropped copies (the first covers every texel) cost one copy
+    #[test]
+    fn symmetry_copies_shrink_the_bands() {
+        const WIDTH: u32 = 4096;
+        let hq = Sampling { filtering: Filtering::BilinearHq, ..Sampling::SAVED_BEFORE };
+        let radial = FillSymmetry { on: true, kind: SymmetryKind::Radial, axis: 1, count: 64, position: OFF_POLE, ..FillSymmetry::OFF };
+        let cropped = Projector { crop: ShapeCrop::Cropped, ..Projector::default() };
+        let small = Projection::Planar { scale: 3.0, axis: 2, offset: [0.0; 3], uv: UvTransform::default(), projector: cropped, placed: None };
+        let triplanar = Projection::Triplanar { scale: 2.5, sharpness: 4.0, offset: [0.0; 3], uv: UvTransform::default(), projector: Projector::default() };
+        let work = |projection: Projection, sampling: Sampling| {
+            let sources = BTreeMap::from([(Channel::BaseColor, Source::image("color")), (Channel::Height, Source::image("float"))]);
+            let project = one_fill(sources, projection, sampling, WIDTH);
+            CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap().tile_work_per_pixel().unwrap()
+        };
+
+        let plain = work(Projection::default(), Sampling::default());
+        let copied = work(small, Sampling { symmetry: radial, ..hq });
+        let covering = work(triplanar.clone(), Sampling { symmetry: radial, ..hq });
+        let once = work(triplanar, hq);
+
+        let rows = |work| crate::gpu_composite::composite_band_size(WIDTH, work).1;
+        assert!(rows(copied) < rows(plain), "{copied} against {plain}");
+        assert_eq!(crate::gpu_composite::check_tile_update_budget(WIDTH, WIDTH, copied), Ok(()));
+        assert_eq!(covering, once, "copies past one that covers every texel are skipped");
     }
 
     /// An image is uploaded once per chain of levels: an HQ decal's sRGB colour and the alpha that
