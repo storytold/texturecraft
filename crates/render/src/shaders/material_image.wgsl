@@ -59,133 +59,13 @@ fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> {
     return rgb;
 }
 
-// One stored level of an image for P1: its first plane's origin word, size and encoding
-// (gpu_tile_pattern.rs append_rgba)
-struct P1ImageLevel {
-    planes: u32,
-    size: vec2<i32>,
-    encoding: u32,
-}
-
-fn p1_base_level(image: u32) -> P1ImageLevel {
-    return P1ImageLevel(image + 3u, vec2<i32>(i32(srgb[image]), i32(srgb[image + 1u])), srgb[image + 2u] & 255u);
-}
-
-// Texel `pixel` of `level`: wrapped on the axes that repeat, the edge texel past the edge on the others
-fn p1_level_texel(level: P1ImageLevel, pixel: vec2<i32>, clamps: vec2<bool>) -> vec4<f32> {
-    let wrapped = vec2(wrap_coordinate(pixel.x, level.size.x), wrap_coordinate(pixel.y, level.size.y));
-    let at = select(wrapped, clamp(pixel, vec2(0), level.size - 1), clamps);
-    let first = image_plane_at(level.planes, at);
-    switch level.encoding {
-        case 1u: { return unpack4x8unorm(first); }
-        case 2u: { return vec4(unpack2x16unorm(first), unpack2x16unorm(image_plane_at(level.planes + 3u, at))); }
-        default: {
-            return bitcast<vec4<f32>>(vec4(first, image_plane_at(level.planes + 3u, at), image_plane_at(level.planes + 6u, at), image_plane_at(level.planes + 9u, at)));
-        }
-    }
-}
-
-// floor(t) as texel indices: huge repeating coordinates reduced by the period, stopped ones kept
-// just past the edge, so the integer conversion never overflows
-fn p1_texel_index(t: vec2<f32>, size: vec2<i32>, clamps: vec2<bool>) -> vec2<i32> {
-    let period = vec2<f32>(size);
-    var base = floor(t);
-    base = select(base, base % period, abs(base) >= vec2(2147483520.0) & !clamps);
-    base = select(base, clamp(base, vec2(-1.0), period), clamps);
-    return vec2<i32>(base);
-}
-
-// The texel under `uv` (compose ImageRes::nearest)
-fn p1_nearest(level: P1ImageLevel, uv: vec2<f32>, clamps: vec2<bool>) -> vec4<f32> {
-    return p1_level_texel(level, p1_texel_index(uv * vec2<f32>(level.size), level.size, clamps), clamps);
-}
-
-// Bilinear sample of `level` (compose store.rs `bilinear`)
-fn p1_bilinear(level: P1ImageLevel, uv: vec2<f32>, clamps: vec2<bool>) -> vec4<f32> {
-    let grid = uv * vec2<f32>(level.size) - 0.5;
-    let at = p1_texel_index(grid, level.size, clamps);
-    let f = grid - floor(grid);
-    let a = p1_level_texel(level, at, clamps);
-    let b = p1_level_texel(level, at + vec2(1, 0), clamps);
-    let c = p1_level_texel(level, at + vec2(0, 1), clamps);
-    let d = p1_level_texel(level, at + vec2(1, 1), clamps);
-    let top = a + (b - a) * f.x;
-    let bottom = c + (d - c) * f.x;
-    return top + (bottom - top) * f.y;
-}
-
-// The halved levels an image holds besides itself (flag bit 9 of its descriptor, gpu_tile_pattern.rs)
-fn p1_level_count(image: u32) -> u32 {
-    if (srgb[image + 2u] & P1_IMAGE_LEVELS) == 0u {
-        return 0u;
-    }
-    return srgb[image + 3u + 3u * p1_base_level(image).encoding];
-}
-
-// Halved level `index` of an image that holds it (1 is half the size), its plane origins after
-// the count: width, height, encoding, then one origin per plane
-fn p1_halved_level(image: u32, index: u32) -> P1ImageLevel {
-    var word = image + 4u + 3u * p1_base_level(image).encoding;
-    for (var level = 1u; level < index; level++) {
-        word += 3u + 3u * srgb[word + 2u];
-    }
-    return P1ImageLevel(word + 3u, vec2<i32>(i32(srgb[word]), i32(srgb[word + 1u])), srgb[word + 2u]);
-}
-
-// Level `index` of an image read bilinearly, `full` (the image itself) at 0 and past the last level
-fn p1_level_sample(image: u32, index: u32, uv: vec2<f32>, clamps: vec2<bool>, full: vec4<f32>) -> vec4<f32> {
-    if index == 0u || index > p1_level_count(image) {
-        return full;
-    }
-    return p1_bilinear(p1_halved_level(image, index), uv, clamps);
-}
-
-// An sRGB colour read as linear: the image's own level decodes after its bilinear blend (compose
-// ImageRes::sample_srgb_color); alpha stays
-fn p1_linear_read(sample: vec4<f32>, linear: bool) -> vec4<f32> {
-    if !linear {
-        return sample;
-    }
-    let encoded = clamp(sample.rgb, vec3(0.0), vec3(1.0));
-    return vec4(select(pow((encoded + 0.055) / 1.055, vec3(2.4)), encoded / 12.92, encoded <= vec3(0.04045)), sample.a);
-}
-
-// P1 (composite_projection.wgsl): the image at a point the fill already projected, read as its
-// sampling says (compose ImageRes::sample_filtered). The read's projection.x is its footprint in
-// image texels per surface texel, projection.y 1 for an sRGB colour read in linear space.
-fn p1_image_at(image: u32, uv: vec2<f32>, layer: Operation) -> vec4<f32> {
-    if !all(abs(uv) <= vec2(3.402823466e38)) {
-        return vec4(0.0);
-    }
-    let level = p1_base_level(image);
-    let clamps = (vec2(layer.ext.y) & vec2(P1_CLAMP_U, P1_CLAMP_V)) != vec2(0u);
-    if (layer.ext.y & P1_NEAREST) != 0u {
-        return p1_nearest(level, uv, clamps);
-    }
-    let full = p1_linear_read(p1_bilinear(level, uv, clamps), layer.projection.y != 0.0);
-    let footprint = layer.projection.x;
-    if (layer.ext.y & P1_HQ) == 0u || !(footprint > 1.0 && footprint <= 3.402823466e38) {
-        return full;
-    }
-
-    // Blend the two levels round the footprint's level of detail
-    let detail = min(log2(footprint), f32(p1_level_count(image)));
-    let finer = u32(floor(detail));
-    let toward_coarser = detail - f32(finer);
-    let finer_sample = p1_level_sample(image, finer, uv, clamps, full);
-    if toward_coarser <= 0.0 {
-        return finer_sample;
-    }
-    let coarser = p1_level_sample(image, finer + 1u, uv, clamps, full);
-    return finer_sample + (coarser - finer_sample) * toward_coarser;
-}
-
 fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
     let image = layer.ids.z;
     let mode = layer.procedural.w;
     if mode == P1_POINT_PROJECTION {
         return p1_image_at(image, uv, layer);
     }
+
     let p = surface.position * layer.projection.w + layer.projection.xyz;
     if mode == 1u {
         let w = triplanar_weights(surface.normal, layer.balance.w);
@@ -274,6 +154,7 @@ fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> ve
     if layer.ids.w == P1_ALPHA_KIND {
         return vec3(sampled.a);
     }
+
     return decode_image_sample(layer, sampled.rgb);
 }
 

@@ -16,7 +16,7 @@ use crate::gpu_tile_pattern::RawPlane;
 /// Words of one copy's entry in a depth directory (`P1_DEPTH_ENTRY_WORDS` in composite_projection.wgsl)
 pub(crate) const ENTRY_WORDS: usize = 10;
 
-/// Views whose grids stay cached for the last mesh, as the CPU evaluator's cache keeps them
+/// Views whose grids stay cached for the last mesh besides the ones the last program used
 const MAX_CACHED_VIEWS: usize = 8;
 
 /// A fill's projector view and, with symmetry on, its copies about the mesh's centre and radius
@@ -25,7 +25,7 @@ type ViewKey = (ProjectorView, Option<(FillSymmetry, Vec3, f32)>);
 /// One grid per symmetry copy (one without symmetry), None where a copy sees nothing
 pub(crate) type FillGrids = Arc<[Option<DepthGrid>]>;
 
-/// Grids by view, newest first
+/// Grids by view, the last program's first
 type CachedViews = Vec<(ViewKey, Option<FillGrids>)>;
 
 /// The last mesh's grids, so a recompiled program keeps its atlas planes
@@ -88,34 +88,50 @@ pub(crate) fn missing_entry() -> [u32; ENTRY_WORDS] {
     entry
 }
 
-/// The depth grids of a depth-culled `projection` over `mesh`, one per copy of `symmetry`, as the
-/// CPU evaluator builds them (compose `EvaluationInputs::projector_depth`); None where the
-/// projection culls nothing.
-pub(crate) fn depth_grids(mesh: &Arc<Mesh>, projection: &Projection, symmetry: Option<FillSymmetry>) -> Option<FillGrids> {
+/// The depth grids of each depth-culled projection over `mesh` with its symmetry, one per copy,
+/// as the CPU evaluator builds them (compose `EvaluationInputs::projector_depth`); None where a
+/// projection culls nothing. The cache keeps every view this program asks for, then the most
+/// recent others, so a recompile of a program with many culled fills rebuilds nothing.
+pub(crate) fn depth_grids(mesh: &Arc<Mesh>, requests: &[(Projection, Option<FillSymmetry>)]) -> Vec<Option<FillGrids>> {
     let bounds = mesh.bounds();
-    let view = ProjectorView::of(projection, bounds)?;
-    let copies = symmetry.map(|symmetry| {
-        let (center, radius) = mesh_frame(bounds);
+    let (center, radius) = mesh_frame(bounds);
+    let keys: Vec<Option<ViewKey>> = requests
+        .iter()
+        .map(|(projection, symmetry)| {
+            let view = ProjectorView::of(projection, bounds)?;
 
-        // Flipping the image leaves the projector's depth view unchanged
-        (FillSymmetry { flip: [false; 2], ..symmetry }, center, radius)
-    });
-    let key = (view, copies);
+            // Flipping the image leaves the projector's depth view unchanged
+            let copies = symmetry.map(|symmetry| (FillSymmetry { flip: [false; 2], ..symmetry }, center, radius));
+            Some((view, copies))
+        })
+        .collect();
 
     let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if cache.0.upgrade().is_none_or(|cached| !Arc::ptr_eq(&cached, mesh)) {
         *cache = (Arc::downgrade(mesh), Vec::new());
     }
-    if let Some(index) = cache.1.iter().position(|(cached, _)| *cached == key) {
-        let entry = cache.1.remove(index);
-        let grids = entry.1.clone();
-        cache.1.insert(0, entry);
-        return grids;
-    }
+    let mut used: CachedViews = Vec::new();
+    let grids = keys
+        .iter()
+        .map(|key| {
+            let key = (*key)?;
+            if let Some((_, grids)) = used.iter().find(|(cached, _)| *cached == key) {
+                return grids.clone();
+            }
 
-    let grids = build(mesh, key);
-    cache.1.insert(0, (key, grids.clone()));
-    cache.1.truncate(MAX_CACHED_VIEWS);
+            let grids = match cache.1.iter().position(|(cached, _)| *cached == key) {
+                Some(index) => cache.1.remove(index).1,
+                None => build(mesh, key),
+            };
+            used.push((key, grids.clone()));
+            grids
+        })
+        .collect();
+
+    // This program's views stay, then the most recent others
+    let older = std::mem::take(&mut cache.1);
+    used.extend(older.into_iter().take(MAX_CACHED_VIEWS));
+    cache.1 = used;
     grids
 }
 

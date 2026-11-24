@@ -30,13 +30,19 @@ pub(crate) enum ImageUse {
     Mipmapped,
     /// The image and its halved levels for a colour read: an sRGB image's levels are linear.
     MipmappedColor,
+    /// The image and either chain of its halved levels: an alpha read, whose levels agree in both.
+    MipmappedAlpha,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct MaterialImages {
-    /// Each registered image with what it is read for: one image read two ways is held twice
+    /// Each registered image with what it is read for
     names: Vec<(String, ImageUse)>,
     images: Vec<Option<Arc<ImageRes>>>,
+    /// The atlas's colour images, each image and chain once (`set_images`), and each registered
+    /// image's entry among them
+    atlas: Vec<(Arc<ImageRes>, AtlasMips)>,
+    entries: Vec<Option<usize>>,
     decals: Vec<DecalSource>,
     /// The composited mesh's centre and radius (`set_surface`): P1's band uniform turns positions
     /// in mesh radii back into world positions with them
@@ -60,15 +66,16 @@ impl MaterialImages {
         if let Some(index) = self.names.iter().position(|(existing, existing_usage)| existing == name && *existing_usage == usage) {
             return index as u32;
         }
+
         let index = self.names.len() as u32;
         self.names.push((name.to_owned(), usage));
         index
     }
 
-    /// A decal's frame and the images whose alpha it reads, sampled with the fill's `sampling`:
-    /// Bilinear HQ reads the alpha's halved levels (the same in either chain).
+    /// A frame and the images whose alpha it reads, sampled with the fill's `sampling`: Bilinear
+    /// HQ reads the alpha's halved levels.
     pub(crate) fn register_decal<'a>(&mut self, frame: Decal, sources: impl Iterator<Item = &'a Source>, sampling: Sampling) -> u32 {
-        let usage = if sampling.filtering == Filtering::BilinearHq { ImageUse::Mipmapped } else { ImageUse::Material };
+        let usage = if sampling.filtering == Filtering::BilinearHq { ImageUse::MipmappedAlpha } else { ImageUse::Material };
         let alpha_images = sources
             .filter_map(|source| match source {
                 Source::Image { name, .. } => Some(self.register_image(name, usage)),
@@ -79,6 +86,7 @@ impl MaterialImages {
         if let Some(index) = self.decals.iter().position(|existing| *existing == decal) {
             return index as u32;
         }
+
         let index = self.decals.len() as u32;
         self.decals.push(decal);
         index
@@ -95,23 +103,49 @@ impl MaterialImages {
         self.names.is_empty() && self.decals.is_empty() && self.depths.is_empty()
     }
 
+    /// Resolve the registered images and lay out the atlas's colour images: each image once per
+    /// chain of halved levels its reads need (`ImageRes::mip_chain`, or `linear_mip_chain` for an
+    /// sRGB colour read). An alpha read takes any chain the image already has, and a read of the
+    /// image's own texels any entry at all.
     pub(crate) fn set_images(&mut self, images: &ImageStore) {
         self.images = self.names.iter().map(|(name, _)| images.get(name).cloned()).collect();
+        self.atlas.clear();
+        self.entries = vec![None; self.names.len()];
+
+        // The chains first, then the reads an existing entry may serve
+        for pass in 0..3 {
+            for (slot, ((_, usage), image)) in self.names.iter().zip(&self.images).enumerate() {
+                let Some(image) = image else { continue };
+                let mips = match (pass, usage) {
+                    (0, ImageUse::Mipmapped) => AtlasMips::Stored,
+                    (0, ImageUse::MipmappedColor) => AtlasMips::LinearColor,
+                    (1, ImageUse::MipmappedAlpha) => AtlasMips::Stored,
+                    (2, ImageUse::Material) => AtlasMips::None,
+                    _ => continue,
+                };
+
+                // An sRGB colour read needs the linear chain, which a stored image does not differ from
+                let mips = if mips == AtlasMips::LinearColor && !image.srgb { AtlasMips::Stored } else { mips };
+                let serves = |entry: &(Arc<ImageRes>, AtlasMips)| {
+                    Arc::ptr_eq(&entry.0, image)
+                        && match usage {
+                            ImageUse::Material => true,
+                            ImageUse::MipmappedAlpha => entry.1 != AtlasMips::None,
+                            ImageUse::Mipmapped | ImageUse::MipmappedColor => entry.1 == mips,
+                        }
+                };
+                let entry = self.atlas.iter().position(serves).unwrap_or_else(|| {
+                    self.atlas.push((image.clone(), mips));
+                    self.atlas.len() - 1
+                });
+                self.entries[slot] = Some(entry);
+            }
+        }
     }
 
-    /// The colour images for the atlas, each with the halved levels its reads need: the chain
-    /// Bilinear HQ reads (`ImageRes::mip_chain`), linear for an sRGB image's colour read
-    /// (`ImageRes::linear_mip_chain`).
+    /// The colour images for the atlas with the halved levels each holds (see [`Self::set_images`]).
     pub(crate) fn atlas_images(&self) -> impl Iterator<Item = (&Arc<ImageRes>, AtlasMips)> {
-        self.names.iter().zip(&self.images).filter_map(|((_, usage), image)| {
-            let image = image.as_ref()?;
-            let mips = match usage {
-                ImageUse::Material => AtlasMips::None,
-                ImageUse::MipmappedColor if image.srgb => AtlasMips::LinearColor,
-                ImageUse::Mipmapped | ImageUse::MipmappedColor => AtlasMips::Stored,
-            };
-            Some((image, mips))
-        })
+        self.atlas.iter().map(|(image, mips)| (image, *mips))
     }
 
     /// Exact-f32 planes for the atlas: the projector depth grids built in [`Self::set_surface`].
@@ -124,12 +158,12 @@ impl MaterialImages {
     /// before the atlas reads [`Self::raw_planes`].
     pub(crate) fn set_surface(&mut self, mesh: &Arc<Mesh>) {
         self.mesh_frame = Some(mesh_frame(mesh.bounds()));
+        let requests: Vec<_> = self.depths.iter().map(|(projection, symmetry, _)| (projection.clone(), *symmetry)).collect();
         let mut planes: Vec<RawPlane> = Vec::new();
-        let grids = self
-            .depths
-            .iter()
-            .map(|(projection, symmetry, _)| {
-                let grids = depth_grids(mesh, projection, *symmetry)?;
+        let grids = depth_grids(mesh, &requests)
+            .into_iter()
+            .map(|grids| {
+                let grids = grids?;
                 let indices = grids
                     .iter()
                     .map(|grid| {
@@ -154,20 +188,10 @@ impl MaterialImages {
     }
 
     pub(crate) fn append_words(&self, words: &mut Vec<u32>, atlas: Option<&TileImageAtlas>, mesh: Option<&Mesh>) -> (Vec<u32>, Vec<u32>) {
-        let mut index = 0;
-        let image_offsets: Vec<_> = self
-            .names
-            .iter()
-            .enumerate()
-            .map(|(slot, _)| {
-                if let Some((image, atlas)) = self.images.get(slot).and_then(Option::as_ref).zip(atlas) {
-                    let offset = atlas.append_rgba(words, index, image.srgb);
-                    index += 1;
-                    offset
-                } else {
-                    u32::MAX
-                }
-            })
+        let entry_offsets: Vec<u32> =
+            atlas.map_or_else(Vec::new, |atlas| self.atlas.iter().enumerate().map(|(index, (image, _))| atlas.append_rgba(words, index, image.srgb)).collect());
+        let image_offsets: Vec<_> = (0..self.names.len())
+            .map(|slot| self.entries.get(slot).copied().flatten().and_then(|entry| entry_offsets.get(entry).copied()).unwrap_or(u32::MAX))
             .collect();
         let normalization = mesh.map(|mesh| {
             let (lo, hi) = mesh.bounds();
