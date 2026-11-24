@@ -114,9 +114,6 @@ fn imported_mesh_maps_display_and_export_the_entire_overridden_tile() {
             bit_depth: 8,
             channels: vec![(Dest::L, SourceRef::Baked { map, component: 0 })],
             inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
         }],
     });
     let files = session.export_files(&[0], &options).unwrap();

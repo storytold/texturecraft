@@ -94,9 +94,6 @@ fn warns_when_a_template_with_openpbr_names_has_no_channels_to_write() {
             bit_depth: 8,
             channels: vec![(Dest::L, SourceRef::Channel { channel: texturecraft_engine::core::Channel::CoatWeight, component: 0 })],
             inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
         }],
     };
     let directory = temp("no-maps");
@@ -175,15 +172,15 @@ fn per_map_overrides_of_the_template_do_not_reach_the_openpbr_maps() {
     let result = execute(
         &mut session,
         "file.exportTextures",
-        &json!({"dir": dir.display().to_string(), "preset": DEFAULT, "materialX": true, "maps": [{"map": 0, "enabled": false}, {"map": 7, "format": "tiff", "bitDepth": 16}]}),
+        &json!({"dir": dir.display().to_string(), "preset": DEFAULT, "materialX": true, "maps": [{"map": 0, "enabled": false}, {"map": 19, "format": "tiff", "bitDepth": 16}]}),
     )
     .unwrap();
 
     let all = names(&result);
-    assert!(!all.iter().any(|f| f.ends_with("_Base_color.png")), "the template's base colour was left out: {all:?}");
+    assert!(!all.iter().any(|f| f.ends_with("_baseColor.png")), "the template's base colour was left out: {all:?}");
     assert!(all.iter().any(|f| f.ends_with("_base_color.png")), "the material's base colour is still written: {all:?}");
     assert!(all.iter().any(|f| f.ends_with("_geometry_normal.png")), "{all:?}");
-    assert!(all.iter().any(|f| f.ends_with("_Normal.tif")), "the override applies to the template's own normal map: {all:?}");
+    assert!(all.iter().any(|f| f.ends_with("_normal.tif")), "the override applies to the template's own normal map: {all:?}");
     assert!(!all.iter().any(|f| f.ends_with(".tif") && f.contains("_geometry_")), "{all:?}");
 }
 
@@ -201,7 +198,7 @@ fn a_file_type_a_material_cannot_use_falls_back_to_png() {
         .unwrap();
 
         let all = names(&result);
-        assert!(all.iter().any(|f| f.ends_with(&format!("_Base_color.{ext}"))), "{format}: the template's files keep the file type: {all:?}");
+        assert!(all.iter().any(|f| f.ends_with(&format!("_baseColor.{ext}"))), "{format}: the template's files keep the file type: {all:?}");
         let mtlx = files(&result).into_iter().find(|f| f.ends_with(".mtlx")).unwrap_or_else(|| panic!("{format}: no .mtlx in {all:?}"));
         let text = std::fs::read_to_string(mtlx).unwrap();
         let wanted = if format == "tiff" { "tif" } else { "png" };
@@ -258,9 +255,6 @@ fn a_file_of_the_template_is_never_replaced_by_an_openpbr_map() {
             bit_depth: 8,
             channels: vec![(Dest::R, source(0)), (Dest::G, source(1)), (Dest::B, source(2))],
             inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
         }],
     };
     let params = |dir: &std::path::Path, mtlx: bool| json!({"dir": dir.display().to_string(), "preset": preset, "ts": [0, 1], "materialX": mtlx});
@@ -292,9 +286,6 @@ fn base_colour_template() -> texturecraft_engine::formats::ExportPreset {
             bit_depth: 8,
             channels: vec![(Dest::R, source(0)), (Dest::G, source(1)), (Dest::B, source(2))],
             inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
         }],
     }
 }
@@ -457,16 +448,7 @@ fn explicit_srgb_float_tiff_tags_match_gray_and_rgb_samples() {
         let directory = temp(tag);
         let preset = ExportPreset {
             name: "TIFF base colour".into(),
-            maps: vec![MapSpec {
-                file: "$mesh_$textureSet_base_color".into(),
-                format: FileFormat::Tiff,
-                bit_depth: 32,
-                channels,
-                inverted: Vec::new(),
-                dither: false,
-                when_channels: Vec::new(),
-                unless_channels: Vec::new(),
-            }],
+            maps: vec![MapSpec { file: "$mesh_$textureSet_base_color".into(), format: FileFormat::Tiff, bit_depth: 32, channels, inverted: Vec::new() }],
         };
 
         let result = execute(
@@ -617,7 +599,7 @@ fn the_materials_normal_map_is_opengl_whatever_the_export_asks_for() {
     .unwrap();
 
     let all = files(&result);
-    let own = all.iter().find(|f| f.ends_with("_Normal.png")).unwrap();
+    let own = all.iter().find(|f| f.ends_with("_normal.png")).unwrap();
     let material = all.iter().find(|f| f.ends_with("_geometry_normal.png")).unwrap();
     assert!(green_at_centre(own).abs_diff(184) <= 3, "the template's own normal map is DirectX: {}", green_at_centre(own));
     assert!(green_at_centre(material).abs_diff(71) <= 3, "the material's normal map is OpenGL: {}", green_at_centre(material));
@@ -686,9 +668,6 @@ fn an_openpbr_filename_does_not_turn_a_data_map_into_base_color() {
             bit_depth: 8,
             channels: vec![(Dest::L, SourceRef::Channel { channel: texturecraft_engine::core::Channel::Roughness, component: 0 })],
             inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
         }],
     };
     let directory = temp("misleading-map");

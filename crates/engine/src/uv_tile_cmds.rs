@@ -440,7 +440,7 @@ mod tests {
         let files = s.export_files(&[0], &opts).unwrap();
         // The red (x) of the exported normal at the middle of a tile.
         let tilt = |tile: &str| {
-            let f = files.iter().find(|f| f.name.ends_with(&format!("_Normal.{tile}.png"))).expect("a normal map per tile");
+            let f = files.iter().find(|f| f.name.ends_with(&format!("_normal.{tile}.png"))).expect("a normal map per tile");
             let img = image::load_from_memory(&f.bytes).unwrap().to_rgb8();
             img.get_pixel(img.width() / 2, img.height() / 2)[0] as i32
         };

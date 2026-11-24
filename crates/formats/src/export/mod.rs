@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use texturecraft_compose::{BakedMaps, Composite};
 use texturecraft_core::{AoMixing, BakedMap, BlockScales, Channel, ChannelKind, NormalFormat, NormalMixing, Project, TextureSet};
 use texturecraft_geom::glam::Vec3;
-use texturecraft_texel::{ColorSpace, DilationMap, linear_to_srgb, srgb_to_linear};
+use texturecraft_texel::{ColorSpace, DilationMap, linear_to_srgb};
 
 use crate::{FormatError, MAX_IMAGE_SIZE, Result};
 
@@ -33,11 +33,6 @@ pub use map_override::MapOverride;
 /// Height-to-normal slope: with strength 1, a height change of 1 across 1/16 of the texture
 /// width tilts the normal 45°, at any resolution.
 const HEIGHT_SPAN: f32 = 16.0;
-/// Dielectric reflectance at normal incidence per unit of specular level (0.5 gives 4 %).
-const F0_PER_SPECULAR_LEVEL: f32 = 0.08;
-/// The dielectric reflectance and index of refraction the reference's converted maps assume
-const DIELECTRIC_F0: f32 = 0.04;
-const DIELECTRIC_IOR: f32 = 1.5;
 const JPEG_QUALITY: u8 = 95;
 const PSD_MAX_SIDE_PIXELS: u32 = 30_000;
 const PSD_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -213,29 +208,10 @@ pub enum VirtualMap {
     HeightNormal,
     /// Sheen color × sheen weight (glTF's sheen color, a color map).
     SheenTint,
-    /// Specular/glossiness diffuse color from metal/roughness: base color × (1 − metallic).
-    Diffuse,
-    /// Specular/glossiness F0 color from metal/roughness: a dielectric F0 of 4 % blended to the
-    /// base color by metallic (the specular level is not read).
-    SpecularColor,
-    /// A renderer's reflection color: white blended to the sRGB base color by the sRGB-encoded
-    /// metallic, `1 − enc(metallic) × (1 − enc(base color))`, as the reference computes it.
-    Reflection,
-    /// 1 / index of refraction: `(1 − metallic) / 1.5` (dielectrics have an IOR of 1.5).
-    InverseIor,
-    /// Squared glossiness: `(1 − roughness)²`.
-    Glossiness2,
-    /// A legacy engine's diffuse color: the base color, whatever the metallic.
-    LegacyDiffuse,
-    /// A legacy engine's glossiness: `(1 − roughness + metallic) / 2`.
-    LegacyGlossiness,
-    /// 1 on the mesh's UV islands, 0 outside them (padding included): the alpha of a channel
-    /// written with transparency; estimated, not verified against the reference.
-    UvCoverage,
 }
 
 impl VirtualMap {
-    pub const ALL: [VirtualMap; 16] = [
+    pub const ALL: [VirtualMap; 8] = [
         VirtualMap::NormalOpenGl,
         VirtualMap::NormalDirectX,
         VirtualMap::HeightNormal,
@@ -244,14 +220,6 @@ impl VirtualMap {
         VirtualMap::AoMixed,
         VirtualMap::F0,
         VirtualMap::SheenTint,
-        VirtualMap::Diffuse,
-        VirtualMap::SpecularColor,
-        VirtualMap::Reflection,
-        VirtualMap::InverseIor,
-        VirtualMap::Glossiness2,
-        VirtualMap::LegacyDiffuse,
-        VirtualMap::LegacyGlossiness,
-        VirtualMap::UvCoverage,
     ];
 
     pub fn id(self) -> &'static str {
@@ -262,14 +230,6 @@ impl VirtualMap {
             VirtualMap::AoMixed => "ambientOcclusion",
             VirtualMap::F0 => "f0",
             VirtualMap::SheenTint => "sheenTint",
-            VirtualMap::Diffuse => "diffuse",
-            VirtualMap::SpecularColor => "specular",
-            VirtualMap::Reflection => "reflection",
-            VirtualMap::InverseIor => "inverseIor",
-            VirtualMap::Glossiness2 => "glossiness2",
-            VirtualMap::LegacyDiffuse => "legacyDiffuse",
-            VirtualMap::LegacyGlossiness => "legacyGlossiness",
-            VirtualMap::UvCoverage => "uvCoverage",
         }
     }
 
@@ -283,33 +243,13 @@ impl VirtualMap {
             VirtualMap::AoMixed => "Mixed AO",
             VirtualMap::F0 => "F0 from specular level",
             VirtualMap::SheenTint => "Sheen color × weight",
-            VirtualMap::Diffuse => "Diffuse from metallic",
-            VirtualMap::SpecularColor => "Specular from metallic",
-            VirtualMap::Reflection => "Reflection",
-            VirtualMap::InverseIor => "1/IOR from metallic",
-            VirtualMap::Glossiness2 => "Glossiness²",
-            VirtualMap::LegacyDiffuse => "Legacy diffuse",
-            VirtualMap::LegacyGlossiness => "Legacy glossiness",
-            VirtualMap::UvCoverage => "UV coverage",
         }
-    }
-
-    /// Whether the map holds a color (written in the export's colour space).
-    pub fn is_color(self) -> bool {
-        matches!(self, VirtualMap::SheenTint | VirtualMap::Diffuse | VirtualMap::SpecularColor | VirtualMap::Reflection | VirtualMap::LegacyDiffuse)
     }
 
     /// 3 for normals and colors, 1 otherwise.
     pub fn components(self) -> usize {
         match self {
-            VirtualMap::NormalOpenGl
-            | VirtualMap::NormalDirectX
-            | VirtualMap::HeightNormal
-            | VirtualMap::SheenTint
-            | VirtualMap::Diffuse
-            | VirtualMap::SpecularColor
-            | VirtualMap::Reflection
-            | VirtualMap::LegacyDiffuse => 3,
+            VirtualMap::NormalOpenGl | VirtualMap::NormalDirectX | VirtualMap::HeightNormal | VirtualMap::SheenTint => 3,
             _ => 1,
         }
     }
@@ -372,16 +312,6 @@ pub struct MapSpec {
     /// is inverted before the colour-space encoding, so a colour map is inverted in linear light.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inverted: Vec<Dest>,
-    /// The template dithers this map when it is written as an 8-bit integer file (absent in old
-    /// files: no). A dithering chosen for the export or the map decides instead.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub dither: bool,
-    /// The map is written only when the texture set has all of these channels.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub when_channels: Vec<Channel>,
-    /// The map is written only when the texture set has none of these channels.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unless_channels: Vec<Channel>,
 }
 
 impl MapSpec {
@@ -391,7 +321,7 @@ impl MapSpec {
             *dest != Dest::A
                 && match source {
                     SourceRef::Channel { channel, .. } => channel.kind() == ChannelKind::Color,
-                    SourceRef::Virtual { map, .. } => map.is_color(),
+                    SourceRef::Virtual { map, .. } => *map == VirtualMap::SheenTint,
                     _ => false,
                 }
         })
@@ -488,10 +418,9 @@ pub struct ExportOptions {
     /// Per map (by index into the preset's maps) settings.
     #[serde(default)]
     pub maps: std::collections::BTreeMap<usize, MapOverride>,
-    /// Dither 8-bit integer files (an ordered pattern, the same on every export); None leaves it to
-    /// each template map.
+    /// Dither 8-bit integer files (an ordered pattern, the same on every export).
     #[serde(default)]
-    pub dither: Option<bool>,
+    pub dither: bool,
 }
 
 impl ExportOptions {
@@ -537,7 +466,7 @@ impl ExportOptions {
             atlas: false,
             color_space: None,
             maps: Default::default(),
-            dither: None,
+            dither: false,
         }
     }
 }
@@ -600,14 +529,6 @@ pub(crate) fn source_present(set: &TextureSet, s: &SourceRef) -> bool {
         SourceRef::Virtual { map: VirtualMap::Roughness, .. } => set.has_channel(Channel::Glossiness),
         SourceRef::Virtual { map: VirtualMap::HeightNormal, .. } => set.has_channel(Channel::Height),
         SourceRef::Virtual { map: VirtualMap::SheenTint, .. } => set.has_channel(Channel::SheenWeight),
-        SourceRef::Virtual { map: VirtualMap::Diffuse | VirtualMap::LegacyDiffuse, .. } => set.has_channel(Channel::BaseColor),
-        SourceRef::Virtual { map: VirtualMap::SpecularColor | VirtualMap::Reflection | VirtualMap::InverseIor, .. } => {
-            set.has_channel(Channel::BaseColor) || set.has_channel(Channel::Metallic)
-        }
-        SourceRef::Virtual { map: VirtualMap::Glossiness2, .. } => set.has_channel(Channel::Roughness),
-        SourceRef::Virtual { map: VirtualMap::LegacyGlossiness, .. } => set.has_channel(Channel::Roughness) || set.has_channel(Channel::Metallic),
-        // Coverage is the alpha of other data, never data of its own
-        SourceRef::Virtual { map: VirtualMap::UvCoverage, .. } => false,
         SourceRef::Baked { map, .. } => set.baked.contains(map),
         SourceRef::Constant(_) => false,
     }
@@ -656,34 +577,6 @@ pub fn sanitize_file_stem(s: &str) -> String {
     out
 }
 
-/// `template` with each variable replaced by its value, in `values` order: `(variable, value,
-/// empty)`. A `(...)` group holding a variable is optional: it is dropped when one of its
-/// variables is empty, and written without the parentheses otherwise. Other parentheses stay.
-fn fill_file_template(template: &str, values: &[(&str, &str, bool)]) -> String {
-    let substitute = |text: &str| values.iter().fold(text.to_string(), |text, (variable, value, _)| text.replace(variable, value));
-    let mut out = String::new();
-    let mut rest = template;
-    while let Some(open) = rest.find('(') {
-        let (before, group) = rest.split_at(open);
-        out.push_str(&substitute(before));
-        let Some(close) = group.find(')') else {
-            rest = group;
-            break;
-        };
-
-        let inner = group.get(1..close).unwrap_or_default();
-        let variables: Vec<_> = values.iter().filter(|(variable, _, _)| inner.contains(variable)).collect();
-        if variables.is_empty() {
-            out.push_str(&substitute(group.get(..=close).unwrap_or_default()));
-        } else if variables.iter().all(|(_, _, empty)| !empty) {
-            out.push_str(&substitute(inner));
-        }
-        rest = group.get(close + 1..).unwrap_or_default();
-    }
-    out.push_str(&substitute(rest));
-    out
-}
-
 /// [`sanitize_file_stem`] for each `/`-separated folder name and the file stem.
 pub fn sanitize_file_path(s: &str) -> String {
     s.split('/').map(sanitize_file_stem).collect::<Vec<_>>().join("/")
@@ -706,8 +599,7 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
     let grid = set.tile_grid();
     let block_resolution = set.block_resolution();
     for (i, map) in opts.preset.maps.iter().enumerate() {
-        let channels_fit = map.when_channels.iter().all(|c| set.has_channel(*c)) && !map.unless_channels.iter().any(|c| set.has_channel(*c));
-        if !channels_fit || !map.channels.iter().any(|(_, s)| source_present(set, s)) {
+        if !map.channels.iter().any(|(_, s)| source_present(set, s)) {
             continue;
         }
 
@@ -716,9 +608,7 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
         let bit_depth = format.depth(own.and_then(|o| o.bit_depth).or(opts.bit_depth_override).unwrap_or(map.bit_depth));
         let enabled = own.is_none_or(|o| o.enabled);
         let psd_channels = (enabled && format == FileFormat::Psd).then(|| layout(set, map).len());
-
-        // The map's own setting, then the export's, then the template's
-        let dither = bit_depth == 8 && !format.holds_float(bit_depth) && own.and_then(|o| o.dither).or(opts.dither).unwrap_or(map.dither);
+        let dither = bit_depth == 8 && !format.holds_float(bit_depth) && own.and_then(|o| o.dither).unwrap_or(opts.dither);
         let space = opts.space_for_map(map, format, bit_depth);
         let requested_space = opts.space_for_depth(format, bit_depth);
         let color_map = map.is_color();
@@ -753,22 +643,25 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
                 check_psd_size(size, channels, bit_depth)?;
             }
 
-            // Optional groups drop out without a tile or a chosen colour space
-            let fill = |udim: &str| {
-                let values = [
-                    ("$udim", udim, tile.is_none()),
-                    ("$project", project.name.as_str(), false),
-                    ("$mesh", mesh_name, false),
-                    ("$textureSet", set.name.as_str(), false),
-                    ("$channel", channel_label(map), false),
-                    ("$colorSpace", color_space, opts.color_space.is_none()),
-                ];
-                fill_file_template(&template, &values)
-            };
-            let stem = fill(&tile.unwrap_or(1001).to_string());
+            let stem = template
+                .replace("$udim", &tile.unwrap_or(1001).to_string())
+                .replace("$project", &project.name)
+                .replace("$mesh", mesh_name)
+                .replace("$textureSet", &set.name)
+                .replace("$channel", channel_label(map))
+                .replace("$colorSpace", color_space);
 
             // Replace the tile number with `<UDIM>` in the shared name
-            let token_stem = tile.map(|_| sanitize_file_path(&fill("UDIMTOKEN")));
+            let token_stem = tile.map(|_| {
+                let t = template
+                    .replace("$udim", "UDIMTOKEN")
+                    .replace("$project", &project.name)
+                    .replace("$mesh", mesh_name)
+                    .replace("$textureSet", &set.name)
+                    .replace("$channel", channel_label(map))
+                    .replace("$colorSpace", color_space);
+                sanitize_file_path(&t)
+            });
             let stem = sanitize_file_path(&stem);
             let ext = format.extension();
             let mut name = format!("{stem}.{ext}");
@@ -944,30 +837,9 @@ impl Sampler<'_> {
                 VirtualMap::NormalOpenGl => self.normal(at, NormalFormat::OpenGl, cache),
                 VirtualMap::NormalDirectX => self.normal(at, NormalFormat::DirectX, cache),
                 VirtualMap::Glossiness => [1.0 - self.channel(Channel::Roughness, at)[0]; 3],
-                VirtualMap::F0 => [F0_PER_SPECULAR_LEVEL * self.channel(Channel::SpecularLevel, at)[0]; 3],
+                VirtualMap::F0 => [0.08 * self.channel(Channel::SpecularLevel, at)[0]; 3],
                 VirtualMap::Roughness => [1.0 - self.channel(Channel::Glossiness, at)[0]; 3],
                 VirtualMap::SheenTint => self.channel(Channel::SheenColor, at).map(|c| c * self.channel(Channel::SheenWeight, at)[0]),
-                VirtualMap::Diffuse => {
-                    let metallic = self.channel(Channel::Metallic, at)[0];
-                    self.channel(Channel::BaseColor, at).map(|c| c * (1.0 - metallic))
-                }
-                VirtualMap::LegacyDiffuse => self.channel(Channel::BaseColor, at),
-                VirtualMap::SpecularColor => {
-                    let metallic = self.channel(Channel::Metallic, at)[0];
-                    self.channel(Channel::BaseColor, at).map(|c| DIELECTRIC_F0 + (c - DIELECTRIC_F0) * metallic)
-                }
-                VirtualMap::Reflection => {
-                    // The reference blends the encoded values; the result is decoded to stay a linear colour
-                    let metallic = linear_to_srgb(self.channel(Channel::Metallic, at)[0]);
-                    self.channel(Channel::BaseColor, at).map(|c| srgb_to_linear(1.0 - metallic * (1.0 - linear_to_srgb(c))))
-                }
-                VirtualMap::InverseIor => [(1.0 - self.channel(Channel::Metallic, at)[0]) / DIELECTRIC_IOR; 3],
-                VirtualMap::Glossiness2 => [(1.0 - self.channel(Channel::Roughness, at)[0]).powi(2); 3],
-                VirtualMap::LegacyGlossiness => {
-                    let (roughness, metallic) = (self.channel(Channel::Roughness, at)[0], self.channel(Channel::Metallic, at)[0]);
-                    [(1.0 - roughness + metallic) / 2.0; 3]
-                }
-                VirtualMap::UvCoverage => [if at == At::Default { 0.0 } else { 1.0 }; 3],
                 VirtualMap::HeightNormal => {
                     let n = match at {
                         At::Texel(x, y) => self.height_normal(x, y),
@@ -1075,8 +947,7 @@ pub fn render_planned_maps(input: &ExportInput, options: &ExportOptions, planned
             data.par_chunks_mut(w as usize * component_count).enumerate().for_each(|(row_y, row)| {
                 let y = y0 + row_y as u32;
                 for (column, x) in (x0..x0 + w).enumerate() {
-                    let covered = sampler.covered(x, y);
-                    let at = if covered {
+                    let at = if sampler.covered(x, y) {
                         Some(At::Texel(x, y))
                     } else {
                         match dilation_map.as_ref().and_then(|d| d.source(x, y)) {
@@ -1088,11 +959,7 @@ pub fn render_planned_maps(input: &ExportInput, options: &ExportOptions, planned
                     let mut cache = None;
                     for (component, (_, source)) in channel_layout.iter().enumerate() {
                         if let Some(value) = row.get_mut(column * component_count + component) {
-                            // Coverage belongs to the written texel, not to the texel padding copies
-                            let sample = match source {
-                                SourceRef::Virtual { map: VirtualMap::UvCoverage, .. } => f32::from(u8::from(covered)),
-                                _ => sampler.sample(source, at, &mut cache),
-                            };
+                            let sample = sampler.sample(source, at, &mut cache);
                             *value = if inverted.get(component).copied().unwrap_or(false) { 1.0 - sample } else { sample };
                         }
                     }

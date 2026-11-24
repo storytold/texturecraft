@@ -80,7 +80,7 @@ fn gltf_png_matches_the_composite() {
     let fx = Fx::new(&default_channels());
     let files = fx.render_preset("glTF PBR Metal Roughness");
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, ["Body_Set_baseColor.png", "Body_Set_occlusionRoughnessMetallic.png", "Body_Set_normal.png"]);
+    assert_eq!(names, ["sphere_Body_Set_BaseColor.png", "sphere_Body_Set_OcclusionRoughnessMetallic.png", "sphere_Body_Set_Normal.png"]);
     let base = decode(&files[0]);
     assert_eq!(base.color(), image::ColorType::Rgb8, "no opacity channel → no alpha");
     for (x, y) in [(0, 0), (10, 40), (63, 63), (32, 7)] {
@@ -100,7 +100,7 @@ fn gltf_png_matches_the_composite() {
     let mut channels = default_channels();
     channels.push(Channel::Emissive);
     let fx = Fx::new(&channels);
-    assert!(fx.render_preset("glTF PBR Metal Roughness").iter().any(|f| f.name.ends_with("_emissive.png")));
+    assert!(fx.render_preset("glTF PBR Metal Roughness").iter().any(|f| f.name.ends_with("_Emissive.png")));
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn exr_values_are_linear() {
         opts.format_override = Some(FileFormat::Exr);
         opts.bit_depth_override = Some(depth);
         let files = fx.render(&opts);
-        let base = find(&files, "_baseColor.exr");
+        let base = find(&files, "_BaseColor.exr");
         let img = decode(base).to_rgb32f();
         for (x, y) in [(0, 0), (10, 40), (63, 63)] {
             let v = fx.comp.value(Channel::BaseColor, x, y);
@@ -154,9 +154,6 @@ fn exr_exports_luminance_and_alpha_at_both_depths() {
         bit_depth: 16,
         channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 }), (Dest::A, SourceRef::Constant(0.75))],
         inverted: Vec::new(),
-        dither: false,
-        when_channels: Vec::new(),
-        unless_channels: Vec::new(),
     }];
     let mut opts = ExportOptions::new(preset);
 
@@ -192,7 +189,7 @@ fn directx_flips_green() {
     let n = Vec3::new(0.3, 0.4, 0.0);
     let n = Vec3::new(n.x, n.y, (1.0 - n.length_squared()).sqrt());
     fx.set_all(Channel::Normal, |_, _| (n * 0.5 + Vec3::splat(0.5)).to_array());
-    let gl = decode(find(&fx.render_preset("glTF PBR Metal Roughness"), "_normal.png")).to_rgb8();
+    let gl = decode(find(&fx.render_preset("glTF PBR Metal Roughness"), "_Normal.png")).to_rgb8();
     let dx = decode(find(&fx.render_preset("Unreal Engine (Packed)"), "_Normal.png")).to_rgb8();
     let (a, b) = (gl.get_pixel(9, 9), dx.get_pixel(9, 9));
     assert!((a[0] as i32 - ((n.x * 0.5 + 0.5) * 255.0).round() as i32).abs() <= 1);
@@ -203,7 +200,7 @@ fn directx_flips_green() {
     // The normal-format override applies to every normal output.
     let mut opts = ExportOptions::new(builtin_preset("glTF PBR Metal Roughness").unwrap());
     opts.normal_format = Some(NormalFormat::DirectX);
-    assert_eq!(decode(find(&fx.render(&opts), "_normal.png")).to_rgb8(), dx);
+    assert_eq!(decode(find(&fx.render(&opts), "_Normal.png")).to_rgb8(), dx);
 }
 
 #[test]
@@ -244,11 +241,11 @@ fn ao_mixes_baked_and_channel() {
     fx.project.texture_sets[0].baked.insert(BakedMap::AmbientOcclusion);
     let orm = decode(find(&fx.render_preset("glTF PBR Metal Roughness"), "Metallic.png")).to_rgb8();
     assert!((orm.get_pixel(3, 3)[0] as i32 - 64).abs() <= 1);
-    let mesh_maps = fx.render_preset("Mesh Maps");
+    let mesh_maps = fx.render_preset("Mesh maps");
     assert_eq!(mesh_maps.len(), 1, "only baked maps are exported");
     let ao = decode(&mesh_maps[0]);
-    assert_eq!(mesh_maps[0].name, "Body_Set_ambient_occlusion.png");
-    assert_eq!(ao.color(), image::ColorType::L8);
+    assert_eq!(mesh_maps[0].name, "sphere_Body_Set_ambientOcclusion.png");
+    assert_eq!(ao.color(), image::ColorType::L16);
 }
 
 #[test]
@@ -261,24 +258,24 @@ fn mesh_maps_write_tangent_normals_with_the_green_of_the_project_format() {
     let stored = |v: f32| std::sync::Arc::new([0.5, v, 0.5].repeat((RES * RES) as usize));
     fx.baked = BakedMaps { resolution: RES, maps: [(BakedMap::BentNormal, stored(0.25)), (BakedMap::Normal, stored(0.25))].into() };
     fx.project.texture_sets[0].baked.extend([BakedMap::BentNormal, BakedMap::Normal]);
-    let opts = ExportOptions::new(builtin_preset("Mesh Maps").unwrap());
+    let opts = ExportOptions::new(builtin_preset("Mesh maps").unwrap());
     let quarter = (0.25f32 * 65535.0).round() as i32;
     let three_quarters = (0.75f32 * 65535.0).round() as i32;
-    for name in ["_bent_normals_base.png", "_normal_base.png"] {
+    for name in ["_bentNormal.png", "_normal.png"] {
         assert!((green(&fx, &opts, name) - quarter).abs() <= 1, "{name}: OpenGL project keeps the stored green");
     }
     fx.project.normal_format = NormalFormat::DirectX;
-    for name in ["_bent_normals_base.png", "_normal_base.png"] {
+    for name in ["_bentNormal.png", "_normal.png"] {
         assert!((green(&fx, &opts, name) - three_quarters).abs() <= 1, "{name}: DirectX project flips green");
     }
     // The export's own format wins over the project's
     let mut gl = opts.clone();
     gl.normal_format = Some(NormalFormat::OpenGl);
-    assert!((green(&fx, &gl, "_bent_normals_base.png") - quarter).abs() <= 1);
+    assert!((green(&fx, &gl, "_bentNormal.png") - quarter).abs() <= 1);
     fx.project.normal_format = NormalFormat::OpenGl;
     let mut dx = opts.clone();
     dx.normal_format = Some(NormalFormat::DirectX);
-    assert!((green(&fx, &dx, "_bent_normals_base.png") - three_quarters).abs() <= 1, "a DirectX export of an OpenGL project flips green");
+    assert!((green(&fx, &dx, "_bentNormal.png") - three_quarters).abs() <= 1, "a DirectX export of an OpenGL project flips green");
 }
 
 #[test]
@@ -290,9 +287,6 @@ fn templates_are_sanitized_and_collisions_suffixed() {
         bit_depth: 8,
         channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 })],
         inverted: Vec::new(),
-        dither: false,
-        when_channels: Vec::new(),
-        unless_channels: Vec::new(),
     };
     let preset = ExportPreset {
         name: "t".into(),
@@ -308,7 +302,10 @@ fn templates_are_sanitized_and_collisions_suffixed() {
     let opts = ExportOptions::new(preset);
     let planned = list_outputs(&fx.project, 0, "sphere", &opts).unwrap();
     let names: Vec<&str> = planned.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["My_Project_Body_Set_roughness_.png", "My_Project_Body_Set_roughness__2.png", "_con.png", "A.png", "a_2.png", "texture.png"]);
+    assert_eq!(
+        names,
+        ["My_Project_Body_Set_roughness__linear_.png", "My_Project_Body_Set_roughness__linear__2.png", "_con.png", "A.png", "a_2.png", "texture.png"]
+    );
     assert!(planned[0].warnings.is_empty());
     assert_eq!(planned[1].warnings.len(), 1);
     assert_eq!(planned[4].warnings.len(), 1);
@@ -365,9 +362,6 @@ fn every_format_encodes_and_decodes() {
         bit_depth: 8,
         channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 }), (Dest::A, SourceRef::Constant(0.5))],
         inverted: Vec::new(),
-        dither: false,
-        when_channels: Vec::new(),
-        unless_channels: Vec::new(),
     };
     let mut preset = builtin_preset("glTF PBR Metal Roughness").unwrap();
     preset.maps.push(gray_alpha);
@@ -390,9 +384,9 @@ fn every_format_encodes_and_decodes() {
             }
 
             // Roughness 0.25 everywhere survives every format (JPEG within its loss)
-            let px = decode(find(&files, "occlusionRoughnessMetallic.")).to_rgba32f().get_pixel(1, 1)[1];
+            let px = decode(find(&files, "OcclusionRoughnessMetallic.")).to_rgba32f().get_pixel(1, 1)[1];
             assert!((px - 0.25).abs() < 0.01, "{format:?}/{depth}: {px}");
-            let base = find(&files, "_baseColor.");
+            let base = find(&files, "_BaseColor.");
             match format {
                 FileFormat::Jpeg | FileFormat::Hdr => assert!(base.warnings.iter().any(|w| w.contains("alpha")), "{format:?}"),
                 _ => assert!(decode(base).color().has_alpha(), "{format:?} keeps opacity"),
@@ -409,7 +403,7 @@ fn jpeg_texture_export_keeps_full_chroma() {
     let mut opts = ExportOptions::new(builtin_preset("glTF PBR Metal Roughness").unwrap());
     opts.format_override = Some(FileFormat::Jpeg);
     let files = fx.render(&opts);
-    let base = find(&files, "_baseColor.jpg");
+    let base = find(&files, "_BaseColor.jpg");
 
     // Find the baseline JPEG frame for the generated 64 × 64 RGB export.
     let frame_header = [0xff, 0xc0, 0, 17, 8, 0, RES as u8, 0, RES as u8, 3];
@@ -431,9 +425,6 @@ fn jpeg_grayscale_and_depth_policy_preserve_8bit_output() {
             bit_depth: 8,
             channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 })],
             inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
         },
         MapSpec {
             file: "gray_alpha".into(),
@@ -441,9 +432,6 @@ fn jpeg_grayscale_and_depth_policy_preserve_8bit_output() {
             bit_depth: 8,
             channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 }), (Dest::A, SourceRef::Constant(0.5))],
             inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
         },
     ];
     for depth in [8, 16, 32] {
@@ -564,16 +552,7 @@ fn write_files_accepts_planned_name_with_max_length_stem() {
 }
 
 fn gray_map(file: &str, src: SourceRef) -> MapSpec {
-    MapSpec {
-        file: file.into(),
-        format: FileFormat::Png,
-        bit_depth: 8,
-        channels: vec![(Dest::L, src)],
-        inverted: Vec::new(),
-        dither: false,
-        when_channels: Vec::new(),
-        unless_channels: Vec::new(),
-    }
+    MapSpec { file: file.into(), format: FileFormat::Png, bit_depth: 8, channels: vec![(Dest::L, src)], inverted: Vec::new() }
 }
 
 #[test]
@@ -616,9 +595,6 @@ fn converted_maps_invert_and_derive_normals() {
         bit_depth: 8,
         channels: [Dest::R, Dest::G, Dest::B].into_iter().zip(0u8..).map(|(d, k)| (d, SourceRef::Virtual { map, component: k })).collect(),
         inverted: Vec::new(),
-        dither: false,
-        when_channels: Vec::new(),
-        unless_channels: Vec::new(),
     };
     let preset = ExportPreset {
         name: "converted".into(),
@@ -677,9 +653,6 @@ fn uv_tiles_export_one_file_per_tile_without_padding_across() {
                 (Dest::B, SourceRef::Channel { channel: Channel::BaseColor, component: 2 }),
             ],
             inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
         }],
     };
     let files = render_maps(&input, &ExportOptions::new(preset.clone())).unwrap();
@@ -745,19 +718,7 @@ fn the_udim_name_is_the_file_name_with_its_tile_number_as_placeholder() {
     project.texture_sets.push(ts);
     let udim_names = |file: String| {
         let channels = vec![(Dest::R, SourceRef::Channel { channel: Channel::BaseColor, component: 0 })];
-        let preset = ExportPreset {
-            name: "t".into(),
-            maps: vec![MapSpec {
-                file,
-                format: FileFormat::Png,
-                bit_depth: 8,
-                channels,
-                inverted: Vec::new(),
-                dither: false,
-                when_channels: Vec::new(),
-                unless_channels: Vec::new(),
-            }],
-        };
+        let preset = ExportPreset { name: "t".into(), maps: vec![MapSpec { file, format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new() }] };
         list_outputs(&project, 0, "m", &ExportOptions::new(preset)).unwrap().into_iter().map(|f| f.udim_name).collect::<Vec<_>>()
     };
     let placeholder = Some("Body_<UDIM>.png".to_string());
@@ -766,10 +727,8 @@ fn the_udim_name_is_the_file_name_with_its_tile_number_as_placeholder() {
     // The length limit cuts the longer placeholder where it doesn't cut the tile number: none then
     assert_eq!(udim_names(format!("{}_$udim_$textureSet", "a".repeat(MAX_STEM - 10))), [None, None]);
 
-    // An optional tile group keeps its dot, and a folder stays in both names
-    let planned = list_outputs(&project, 0, "m", &ExportOptions::new(builtin_preset("PBR Metallic Roughness (folders or PSD groups)").unwrap())).unwrap();
-    assert_eq!(planned.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["BaseColor/Body_BaseColor.1001.png", "BaseColor/Body_BaseColor.1002.png"]);
-    assert_eq!(planned[0].udim_name.as_deref(), Some("BaseColor/Body_BaseColor.<UDIM>.png"));
+    // A folder stays in the placeholder name
+    assert_eq!(udim_names("Base/$textureSet_$udim".into()), [Some("Base/Body_<UDIM>.png".to_string()), Some("Base/Body_<UDIM>.png".to_string())]);
 }
 
 #[test]
@@ -784,11 +743,9 @@ fn lobe_channels_export_as_document_maps_and_gltf_extension_maps() {
     fx.set_all(Channel::SheenRoughness, |_, _| [0.4; 3]);
     let doc = fx.render_preset("Document channels + Normal + AO");
     for c in Channel::LOBES {
-        let (_, file) = crate::presets::DOCUMENT_CHANNEL_FILES.iter().find(|(channel, _)| *channel == c).unwrap();
-        find(&doc, &format!("_{file}."));
+        find(&doc, &format!("_{}.", c.id()));
     }
-    let glb_maps = ExportOptions::new(ExportPreset { name: "glb".into(), maps: crate::presets::gltf_pbr_maps(|stem| format!("$textureSet_{stem}")) });
-    let gltf = fx.render(&glb_maps);
+    let gltf = fx.render_preset("glTF PBR Metal Roughness");
     let coat = decode(find(&gltf, "_Clearcoat.png")).to_rgb8();
     let px = coat.get_pixel(3, 3);
     assert!(px[0] == 255 && (px[1] as i32 - 51).abs() <= 1 && px[2] == 0, "weight in R, roughness in G: {px:?}");
@@ -797,7 +754,7 @@ fn lobe_channels_export_as_document_maps_and_gltf_extension_maps() {
     // sRGB color × weight (0.5, 0.25, 0) and linear roughness in alpha.
     let want = [188, 137, 0, 102];
     assert!(px.0.iter().zip(want).all(|(a, b)| (*a as i32 - b).abs() <= 1), "{px:?}");
-    let plain = Fx::new(&default_channels()).render(&glb_maps);
+    let plain = Fx::new(&default_channels()).render_preset("glTF PBR Metal Roughness");
     assert!(!plain.iter().any(|f| f.name.contains("Clearcoat") || f.name.contains("Sheen")), "sets without the lobes export no extension maps");
 }
 
@@ -812,7 +769,7 @@ fn colour_space_converts_colour_maps_only() {
     exr.bit_depth_override = Some(32);
     exr.color_space = Some(ColorSpace::AcesCg);
     let files = fx.render(&exr);
-    let img = decode(find(&files, "_baseColor.exr")).to_rgb32f();
+    let img = decode(find(&files, "_BaseColor.exr")).to_rgb32f();
     for (x, y) in [(0, 0), (10, 40), (63, 63)] {
         let (px, want) = (img.get_pixel(x, y), want_at(ColorSpace::AcesCg, x, y));
         assert!((0..3).all(|k| (px[k] - want[k]).abs() < 1e-4), "({x},{y}) {px:?} vs {want:?}");
@@ -820,14 +777,14 @@ fn colour_space_converts_colour_maps_only() {
     // Data maps are never converted: roughness and metalness (packed in the ORM map) are as before.
     let default_files =
         fx.render(&ExportOptions { format_override: Some(FileFormat::Exr), bit_depth_override: Some(32), ..ExportOptions::new(preset.clone()) });
-    assert_eq!(find(&files, "occlusionRoughnessMetallic").bytes, find(&default_files, "occlusionRoughnessMetallic").bytes);
-    assert_eq!(find(&files, "_normal").bytes, find(&default_files, "_normal").bytes);
-    assert_ne!(find(&files, "_baseColor").bytes, find(&default_files, "_baseColor").bytes);
+    assert_eq!(find(&files, "OcclusionRoughnessMetallic").bytes, find(&default_files, "OcclusionRoughnessMetallic").bytes);
+    assert_eq!(find(&files, "_Normal").bytes, find(&default_files, "_Normal").bytes);
+    assert_ne!(find(&files, "_BaseColor").bytes, find(&default_files, "_BaseColor").bytes);
 
     // Linear Rec.709 in an 8-bit PNG: the values are written without the sRGB curve.
     let mut lin = ExportOptions::new(preset.clone());
     lin.color_space = Some(ColorSpace::LinearRec709);
-    let png = decode(find(&fx.render(&lin), "_baseColor.png"));
+    let png = decode(find(&fx.render(&lin), "_BaseColor.png"));
     let v = fx.comp.value(Channel::BaseColor, 10, 40);
     for k in 0..3 {
         assert!((png.get_pixel(10, 40)[k] as f32 - v[k] * 255.0).abs() <= 1.0, "[{k}]");
@@ -837,18 +794,18 @@ fn colour_space_converts_colour_maps_only() {
     let mut srgb = ExportOptions::new(preset.clone());
     srgb.color_space = Some(ColorSpace::Srgb);
     let srgb_png = fx.render(&srgb);
-    assert_eq!(decode(find(&default_png, "_baseColor.png")).to_rgb8(), decode(find(&srgb_png, "_baseColor.png")).to_rgb8());
+    assert_eq!(decode(find(&default_png, "_BaseColor.png")).to_rgb8(), decode(find(&srgb_png, "_BaseColor.png")).to_rgb8());
     // The chosen one is written into the file as its profile; the default says nothing, as before.
-    assert_eq!(embedded_icc(FileFormat::Png, &find(&srgb_png, "_baseColor.png").bytes), crate::icc::profile(ColorSpace::Srgb));
-    assert_eq!(embedded_icc(FileFormat::Png, &find(&default_png, "_baseColor.png").bytes), None);
+    assert_eq!(embedded_icc(FileFormat::Png, &find(&srgb_png, "_BaseColor.png").bytes), crate::icc::profile(ColorSpace::Srgb));
+    assert_eq!(embedded_icc(FileFormat::Png, &find(&default_png, "_BaseColor.png").bytes), None);
     // Data maps carry none, even when a space is chosen.
-    assert_eq!(embedded_icc(FileFormat::Png, &find(&srgb_png, "_normal.png").bytes), None);
+    assert_eq!(embedded_icc(FileFormat::Png, &find(&srgb_png, "_Normal.png").bytes), None);
     // An explicit sRGB in a float file is encoded once, not twice.
     let mut float_srgb = ExportOptions::new(preset);
     float_srgb.format_override = Some(FileFormat::Exr);
     float_srgb.bit_depth_override = Some(32);
     float_srgb.color_space = Some(ColorSpace::Srgb);
-    let px = *decode(find(&fx.render(&float_srgb), "_baseColor.exr")).to_rgb32f().get_pixel(10, 40);
+    let px = *decode(find(&fx.render(&float_srgb), "_BaseColor.exr")).to_rgb32f().get_pixel(10, 40);
     assert!((px[0] - linear_to_srgb(v[0])).abs() < 1e-4, "{px:?}");
 }
 
@@ -867,9 +824,6 @@ fn colour_space_names_the_files_and_warns_when_integer_files_clamp() {
                 (Dest::B, SourceRef::Channel { channel: Channel::BaseColor, component: 2 }),
             ],
             inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
         }],
     };
     let plan = |space: Option<ColorSpace>, format: Option<FileFormat>| {
@@ -987,9 +941,6 @@ fn invert_map(depth: u8, inverted: Vec<Dest>) -> MapSpec {
             (Dest::A, SourceRef::Constant(1.0)),
         ],
         inverted,
-        dither: false,
-        when_channels: Vec::new(),
-        unless_channels: Vec::new(),
     }
 }
 
@@ -1071,9 +1022,6 @@ fn inverting_a_colour_channel_inverts_the_linear_value_before_encoding() {
                 .map(|(d, k)| (d, SourceRef::Channel { channel: Channel::BaseColor, component: k }))
                 .collect(),
             inverted,
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
         };
         let mut opts = ExportOptions::new(ExportPreset { name: "c".into(), maps: vec![map] });
         opts.size = size;
@@ -1106,19 +1054,7 @@ fn the_default_template_keeps_its_old_name_and_file_types_their_listed_names() {
 
 /// One-map preset: `channels` written as `format` at `depth`
 fn one_map(format: FileFormat, depth: u8, channels: Vec<(Dest, SourceRef)>) -> ExportOptions {
-    ExportOptions::new(ExportPreset {
-        name: "t".into(),
-        maps: vec![MapSpec {
-            file: "out".into(),
-            format,
-            bit_depth: depth,
-            channels,
-            inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
-        }],
-    })
+    ExportOptions::new(ExportPreset { name: "t".into(), maps: vec![MapSpec { file: "out".into(), format, bit_depth: depth, channels, inverted: Vec::new() }] })
 }
 
 fn rgba_half_alpha() -> Vec<(Dest, SourceRef)> {
@@ -1353,7 +1289,7 @@ fn float_tiff_marks_straight_alpha_and_preserves_the_color_profile() {
 fn dithering_is_ordered_and_keeps_the_average() {
     let fx = Fx::new(&default_channels());
     let plain = one_map(FileFormat::Png, 8, rgba_half_alpha());
-    let dithered = ExportOptions { dither: Some(true), ..plain.clone() };
+    let dithered = ExportOptions { dither: true, ..plain.clone() };
     let a = decode(&fx.render(&plain)[0]).to_rgba8();
     let b = decode(&fx.render(&dithered)[0]).to_rgba8();
     assert_ne!(a, b);
@@ -1397,195 +1333,22 @@ fn diffusion_padding_fills_beyond_the_dilation_smoothly() {
     }
 }
 
-fn file_names(files: &[ExportedFile]) -> Vec<&str> {
-    files.iter().map(|f| f.name.as_str()).collect()
-}
-
-#[test]
-fn reference_templates_export_their_files() {
-    let mut channels = default_channels();
-    channels.push(Channel::Opacity);
-    let fx = Fx::new(&channels);
-
-    let unreal = fx.render_preset("Unreal Engine (Packed)");
-    let unity = fx.render_preset("Unity HD Render Pipeline (Metallic Standard)");
-    let gltf = fx.render_preset("glTF PBR Metal Roughness");
-    let arnold = fx.render_preset("Arnold UDIM Legacy (AiStandard)");
-
-    // Optional name parts drop out without a chosen colour space
-    assert_eq!(file_names(&unreal), ["sphere_Body_Set_BaseColor.png", "sphere_Body_Set_OcclusionRoughnessMetallic.png", "sphere_Body_Set_Normal.png"]);
-    assert!(decode(&unreal[0]).color().has_alpha(), "opacity in the base colour's alpha");
-    assert_eq!(decode(&unreal[1]).to_rgb8().get_pixel(5, 5).0, [255, 64, 191], "AO (none: white), roughness, metallic");
-    let planned = list_outputs(&fx.project, 0, "sphere", &ExportOptions::new(builtin_preset("Unreal Engine (Packed)").unwrap())).unwrap();
-    assert_eq!(planned.iter().map(|p| p.dither).collect::<Vec<_>>(), [false, false, true], "the template dithers its normal");
-
-    assert_eq!(file_names(&unity), ["sphere_Body_Set_BaseMap.png", "sphere_Body_Set_MaskMap.png", "sphere_Body_Set_Normal.png"]);
-    assert_eq!(decode(&unity[1]).to_rgba8().get_pixel(5, 5).0, [191, 255, 0, 191], "metallic, AO, no detail mask, smoothness");
-
-    assert_eq!(file_names(&gltf), ["Body_Set_baseColor.png", "Body_Set_occlusionRoughnessMetallic.png", "Body_Set_normal.png"]);
-
-    // The texture set name comes last; the normal carries the UV coverage as alpha
-    assert_eq!(
-        file_names(&arnold),
-        [
-            "sphere_BaseColor.Body_Set.png",
-            "sphere_Metalness.Body_Set.png",
-            "sphere_Roughness.Body_Set.png",
-            "sphere_Normal.Body_Set.png",
-            "sphere_Height.Body_Set.png"
-        ]
-    );
-    assert_eq!(decode(find(&arnold, "_Normal.")).color(), image::ColorType::Rgba16);
-    let mut named = ExportOptions::new(builtin_preset("Arnold UDIM Legacy (AiStandard)").unwrap());
-    named.color_space = Some(ColorSpace::Srgb);
-    let names: Vec<String> = list_outputs(&fx.project, 0, "sphere", &named).unwrap().into_iter().map(|p| p.name).collect();
-    assert_eq!((names[0].as_str(), names[3].as_str()), ("sphere_BaseColor_sRGB.Body_Set.png", "sphere_Normal_linear.Body_Set.png"));
-}
-
-#[test]
-fn with_alpha_templates_write_the_uv_coverage_as_alpha() {
-    let mut fx = Fx::new(&default_channels());
-    fx.coverage = (0..RES * RES).map(|i| i % RES < 32).collect();
-
-    let files = fx.render_preset("Document channels + Normal + AO (With Alpha)");
-
-    let base = decode(find(&files, "_Base_color.png")).to_rgba8();
-    assert_eq!(base.get_pixel(10, 10)[3], 255);
-    assert_eq!(base.get_pixel(40, 10)[3], 0, "padding copies the colour, not the coverage");
-    assert_eq!(decode(find(&files, "_Roughness.png")).color(), image::ColorType::La8, "a gray map with alpha");
-}
-
-#[test]
-fn diffuse_is_the_base_color_without_its_metallic_part() {
-    let fx = Fx::new(&default_channels());
-    let diffuse = |k| SourceRef::Virtual { map: VirtualMap::Diffuse, component: k };
-
-    let files = fx.render(&one_map(FileFormat::Exr, 32, vec![(Dest::R, diffuse(0)), (Dest::G, diffuse(1)), (Dest::B, diffuse(2))]));
-
-    let image = decode(&files[0]).to_rgb32f();
-    for (x, y) in [(0, 0), (10, 40), (63, 63)] {
-        let (base, metallic) = (fx.comp.value(Channel::BaseColor, x, y), fx.comp.value(Channel::Metallic, x, y)[0]);
-        let pixel = image.get_pixel(x, y);
-        assert!((0..3).all(|k| (pixel[k] - base[k] * (1.0 - metallic)).abs() < 1e-4), "({x},{y}) {pixel:?} vs {base:?} at metallic {metallic}");
-    }
-}
-
-#[test]
-fn optional_name_groups_need_a_variable_and_a_closing_parenthesis() {
-    let values = [("$udim", "1001", true), ("$textureSet", "Body", false)];
-
-    assert_eq!(fill_file_template("$textureSet(_$udim) (v2)", &values), "Body (v2)", "a group without a variable stays");
-    assert_eq!(fill_file_template("$textureSet(_x", &values), "Body(_x", "an open parenthesis stays");
-    assert_eq!(fill_file_template("($textureSet)_(.$udim)", &values), "Body_");
-}
-
-/// The reference's measured converted maps: (base color as linear, metallic, roughness, [(map,
-/// the value it wrote)]); colour maps are sRGB-encoded in its files, the others linear
-type MeasuredSet = ([f32; 3], f32, f32, [(VirtualMap, [f32; 3]); 7]);
-
-#[test]
-fn converted_maps_give_the_reference_values() {
-    let base = [0.6054688, 0.1328125, 0.0332031];
-    let gray = [0.2158203; 3];
-    let sets: [MeasuredSet; 4] = [
-        (
-            base,
-            0.0,
-            0.6,
-            [
-                (VirtualMap::Diffuse, [0.8009704, 0.3999265, 0.2003212]),
-                (VirtualMap::SpecularColor, [0.2209223; 3]),
-                (VirtualMap::Reflection, [1.0; 3]),
-                (VirtualMap::InverseIor, [0.6666666; 3]),
-                (VirtualMap::Glossiness2, [0.16; 3]),
-                (VirtualMap::LegacyDiffuse, [0.8009704, 0.3999265, 0.2003212]),
-                (VirtualMap::LegacyGlossiness, [0.2; 3]),
-            ],
-        ),
-        (
-            base,
-            1.0,
-            0.6,
-            [
-                (VirtualMap::Diffuse, [0.0; 3]),
-                (VirtualMap::SpecularColor, [0.8009704, 0.3999265, 0.2003212]),
-                (VirtualMap::Reflection, [0.8009704, 0.3999265, 0.2003212]),
-                (VirtualMap::InverseIor, [0.0; 3]),
-                (VirtualMap::Glossiness2, [0.16; 3]),
-                (VirtualMap::LegacyDiffuse, [0.8009704, 0.3999265, 0.2003212]),
-                (VirtualMap::LegacyGlossiness, [0.7; 3]),
-            ],
-        ),
-        (
-            base,
-            0.2980392,
-            0.2509804,
-            [
-                (VirtualMap::Diffuse, [0.6836241, 0.3375598, 0.1653188]),
-                (VirtualMap::SpecularColor, [0.4940082, 0.2884814, 0.2150116]),
-                (VirtualMap::Reflection, [0.8841462, 0.6507011, 0.5345122]),
-                (VirtualMap::InverseIor, [0.4679738; 3]),
-                (VirtualMap::Glossiness2, [0.5610304; 3]),
-                (VirtualMap::LegacyDiffuse, [0.8009704, 0.3999265, 0.2003212]),
-                (VirtualMap::LegacyGlossiness, [0.5235294; 3]),
-            ],
-        ),
-        (
-            gray,
-            0.2980392,
-            0.2509804,
-            [
-                (VirtualMap::Diffuse, [0.4255737; 3]),
-                (VirtualMap::SpecularColor, [0.3361037; 3]),
-                (VirtualMap::Reflection, [0.7100728; 3]),
-                (VirtualMap::InverseIor, [0.4679738; 3]),
-                (VirtualMap::Glossiness2, [0.5610304; 3]),
-                (VirtualMap::LegacyDiffuse, [0.5019233; 3]),
-                (VirtualMap::LegacyGlossiness, [0.5235294; 3]),
-            ],
-        ),
-    ];
-
-    // The specular level changes none of them
-    for specular_level in [0.2, 0.8] {
-        for (base, metallic, roughness, maps) in sets {
-            let mut channels = default_channels();
-            channels.push(Channel::SpecularLevel);
-            let mut fx = Fx::new(&channels);
-            fx.set_all(Channel::BaseColor, |_, _| base);
-            fx.set_all(Channel::Metallic, |_, _| [metallic; 3]);
-            fx.set_all(Channel::Roughness, |_, _| [roughness; 3]);
-            fx.set_all(Channel::SpecularLevel, |_, _| [specular_level; 3]);
-
-            for (map, want) in maps {
-                let source = |k| SourceRef::Virtual { map, component: k };
-                let files = fx.render(&one_map(FileFormat::Png, 16, vec![(Dest::R, source(0)), (Dest::G, source(1)), (Dest::B, source(2))]));
-
-                let pixel = decode(&files[0]).to_rgb16().get_pixel(5, 5).0.map(|v| f32::from(v) / 65535.0);
-                assert!((0..3).all(|k| (pixel[k] - want[k]).abs() < 4e-4), "{map:?} at metallic {metallic} roughness {roughness}: {pixel:?} vs {want:?}");
-            }
-        }
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn folder_templates_write_their_folders_inside_the_output_directory() {
-    let mut channels = default_channels();
-    channels.push(Channel::Opacity);
-    let fx = Fx::new(&channels);
+    let fx = Fx::new(&default_channels());
     let dir = std::env::temp_dir().join(format!("tc-formats-export-folders-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    let rough = |file: &str| gray_map(file, SourceRef::Channel { channel: Channel::Roughness, component: 0 });
+    let preset = ExportPreset { name: "t".into(), maps: vec![rough("$project.ts/$textureSet/roughness"), rough("Roughness/$textureSet_Roughness")] };
+    let files = fx.render(&ExportOptions::new(preset));
 
-    let keyshot = fx.render_preset("KeyShot 9+");
-    let folders = fx.render_preset("PBR Metallic Roughness (folders or PSD groups)");
-    write_files(&keyshot, &dir).unwrap();
-    write_files(&folders, &dir).unwrap();
+    write_files(&files, &dir).unwrap();
 
-    assert!(dir.join("My_Project.sp/Body_Set.ts/base_color.png").is_file(), "{:?}", file_names(&keyshot));
-    assert!(dir.join("Roughness/Body_Set_Roughness.png").is_file(), "{:?}", file_names(&folders));
+    assert!(dir.join("My_Project.ts/Body_Set/roughness.png").is_file(), "{:?}", files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>());
+    assert!(dir.join("Roughness/Body_Set_Roughness.png").is_file());
     for name in ["../evil.png", "/evil.png", "a//evil.png", r"a\evil.png"] {
-        let evil = ExportedFile { name: name.into(), ..keyshot[0].clone() };
+        let evil = ExportedFile { name: name.into(), ..files[0].clone() };
         assert!(write_files(&[evil], &dir).is_err(), "{name}");
     }
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1600,4 +1363,115 @@ fn file_names_in_different_folders_do_not_collide_and_the_same_path_does() {
     let names: Vec<String> = list_outputs(&fx.project, 0, "sphere", &ExportOptions::new(preset)).unwrap().into_iter().map(|p| p.name).collect();
 
     assert_eq!(names, ["a/x.png", "b/x.png", "A/x_2.png"]);
+}
+
+/// A set whose channels hold distinct constants, to see where a template writes each of them
+fn packing_fixture() -> Fx {
+    let mut channels = default_channels();
+    channels.extend([Channel::AmbientOcclusion, Channel::Opacity, Channel::Emissive]);
+    let mut fx = Fx::new(&channels);
+    fx.set_all(Channel::AmbientOcclusion, |_, _| [0.6; 3]);
+    fx.set_all(Channel::Roughness, |_, _| [0.4; 3]);
+    fx.set_all(Channel::Metallic, |_, _| [0.8; 3]);
+    fx.set_all(Channel::Opacity, |_, _| [0.9; 3]);
+    fx.set_all(Channel::Emissive, |_, _| [0.3; 3]);
+    fx
+}
+
+/// The 8-bit value of an image position as RGBA
+fn pixel(file: &ExportedFile) -> [i32; 4] {
+    decode(file).to_rgba8().get_pixel(3, 3).0.map(i32::from)
+}
+
+fn byte(value: f32) -> i32 {
+    (value * 255.0).round() as i32
+}
+
+fn assert_close(actual: [i32; 4], expected: [i32; 4], what: &str) {
+    assert!(actual.iter().zip(expected).all(|(a, e)| (a - e).abs() <= 1), "{what}: {actual:?} instead of {expected:?}");
+}
+
+#[test]
+fn packed_templates_write_occlusion_roughness_and_metallic_where_the_spec_says() {
+    let fx = packing_fixture();
+    let expected = [byte(0.6), byte(0.4), byte(0.8)];
+
+    for (template, file) in
+        [("glTF PBR Metal Roughness", "OcclusionRoughnessMetallic"), ("Unreal Engine (Packed)", "OcclusionRoughnessMetallic"), ("Godot 4 (ORM)", "orm")]
+    {
+        let files = fx.render_preset(template);
+
+        let [r, g, b, _] = pixel(find(&files, file));
+        assert_close([r, g, b, 0], [expected[0], expected[1], expected[2], 0], &format!("{template}: R occlusion, G roughness, B metallic"));
+    }
+}
+
+#[test]
+fn unity_templates_write_smoothness_in_the_alpha_of_the_metallic_map() {
+    let fx = packing_fixture();
+    let smoothness = byte(1.0 - 0.4);
+
+    let hdrp = pixel(find(&fx.render_preset("Unity HDRP (Mask Map)"), "MaskMap"));
+    let urp = pixel(find(&fx.render_preset("Unity URP Lit (Metallic Smoothness)"), "MetallicMap"));
+
+    assert_close(hdrp, [byte(0.8), byte(0.6), 0, smoothness], "HDRP mask map: R metallic, G occlusion, B detail mask, A smoothness");
+    assert_close(urp, [byte(0.8), 0, 0, smoothness], "URP metallic map: R metallic, A smoothness");
+}
+
+#[test]
+fn the_usd_preview_surface_template_writes_one_map_per_input_named_like_it() {
+    let fx = packing_fixture();
+
+    let files = fx.render_preset("USD Preview Surface (separate maps)");
+
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    for (input, expected) in [("roughness", byte(0.4)), ("metallic", byte(0.8)), ("occlusion", byte(0.6)), ("opacity", byte(0.9))] {
+        let file = find(&files, &format!("_{input}.png"));
+        assert_eq!(decode(file).color(), image::ColorType::L8, "{input} is one 8-bit channel: {names:?}");
+        assert_close(pixel(file), [expected, expected, expected, 255], input);
+    }
+    for input in ["diffuseColor", "emissiveColor", "normal"] {
+        assert_eq!(decode(find(&files, &format!("_{input}.png"))).color(), image::ColorType::Rgb8, "{input} is a colour map: {names:?}");
+    }
+    assert!(!names.iter().any(|name| name.contains("clearcoat")), "sets without the coat write no coat maps: {names:?}");
+}
+
+#[test]
+fn only_the_unreal_template_writes_a_directx_normal_map() {
+    let mut fx = packing_fixture();
+    let tilt = Vec3::new(0.3, 0.4, 0.0);
+    let tilt = Vec3::new(tilt.x, tilt.y, (1.0 - tilt.length_squared()).sqrt());
+    fx.set_all(Channel::Normal, |_, _| (tilt * 0.5 + Vec3::splat(0.5)).to_array());
+    let open_gl_green = byte(tilt.y * 0.5 + 0.5);
+
+    for (template, file, flipped) in [
+        ("glTF PBR Metal Roughness", "_Normal.png", false),
+        ("Unreal Engine (Packed)", "_Normal.png", true),
+        ("Unity HDRP (Mask Map)", "_Normal.png", false),
+        ("Unity URP Lit (Metallic Smoothness)", "NormalMap", false),
+        ("Godot 4 (ORM)", "normal", false),
+        ("USD Preview Surface (separate maps)", "_normal.png", false),
+    ] {
+        let green = pixel(find(&fx.render_preset(template), file))[1];
+
+        let want = if flipped { 255 - open_gl_green } else { open_gl_green };
+        assert!((green - want).abs() <= 1, "{template}: green {green} instead of {want}");
+    }
+}
+
+#[test]
+fn spec_templates_write_8_bit_png_files_with_the_expected_colour_encoding() {
+    let fx = packing_fixture();
+    let base = fx.comp.value(Channel::BaseColor, 3, 3).map(|v| byte(linear_to_srgb(v)));
+
+    for template in ["glTF PBR Metal Roughness", "Unreal Engine (Packed)", "Unity HDRP (Mask Map)", "Unity URP Lit (Metallic Smoothness)", "Godot 4 (ORM)"] {
+        let files = fx.render_preset(template);
+
+        let color = files.iter().find(|f| ["BaseColor", "BaseMap", "albedo"].iter().any(|stem| f.name.contains(stem))).unwrap();
+
+        assert!(files.iter().all(|f| f.name.ends_with(".png")), "{template}: {:?}", files.iter().map(|f| &f.name).collect::<Vec<_>>());
+        let [r, g, b, a] = pixel(color);
+        assert_close([r, g, b, 0], [base[0], base[1], base[2], 0], &format!("{template}: sRGB-encoded base color"));
+        assert!((a - byte(0.9)).abs() <= 1, "{template}: opacity in alpha");
+    }
 }

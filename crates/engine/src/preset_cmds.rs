@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Get an export preset",
             [],
             None,
-            "{name} → {name, maps: [{file, format, bit_depth, channels, inverted?: [dest, ...], dither?: true}]}",
+            "{name} → {name, maps: [{file, format, bit_depth, channels, inverted?: [dest, ...]}]}",
             always,
             get
         ),
@@ -350,13 +350,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tc_presets_shadowed_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("Corona.json"), preset("Corona").to_string()).unwrap();
+        std::fs::write(dir.join("Usd.json"), preset("USD Preview Surface (separate maps)").to_string()).unwrap();
         let mut s = session();
 
         let warnings = s.load_export_presets(dir.clone());
 
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert_eq!(s.export_presets.list.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Corona 2"]);
+        assert_eq!(s.export_presets.list.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["USD Preview Surface (separate maps) 2"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

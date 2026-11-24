@@ -36,7 +36,7 @@ const VALUE_WIDTH: f32 = 360.0;
 pub(crate) const SIZES: [u32; 7] = [128, 256, 512, 1024, 2048, 4096, 8192];
 
 /// Templates the reference lists above the separator, in its order (one more carries a vendor
-/// name and is left out). TextureCraft has all of them but 2D View, which is listed greyed.
+/// name and is left out). TextureCraft has some of them; the others are listed greyed.
 const FIRST_GROUP: [&str; 7] = [
     "2D View",
     "Document channels + Normal + AO (No Alpha)",
@@ -1298,7 +1298,6 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     {
         app.ui.export.preset = b.name;
     }
-    app.ui.export.update_saved_templates();
     keep_file_type_visible(&mut app.ui.export);
     follow_texture_sets(app);
     if app.ui.export.opened_with.is_none() {

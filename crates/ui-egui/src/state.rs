@@ -25,14 +25,12 @@ mod export_job;
 mod export_set_plan;
 mod file_type;
 mod map_export;
-mod saved_template_maps;
 mod set_export;
 pub use console_line::ConsoleLine;
 pub use export_job::ExportJob;
 pub use export_set_plan::ExportSetPlan;
 pub use file_type::FileType;
 pub use map_export::MapExport;
-pub use saved_template_maps::TEMPLATES_VERSION;
 pub use set_export::SetExport;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -375,9 +373,6 @@ pub struct ExportUi {
     /// Per texture set (by index) overrides of the settings above.
     #[serde(default)]
     pub sets: std::collections::BTreeMap<usize, SetExport>,
-    /// The built-in template list `sets` refers to (0: saved before the reference's templates).
-    #[serde(default)]
-    pub templates_version: u32,
     /// Whose `skip` and `sets` these are: the project name, then its texture set names in order.
     /// Another project drops them; texture sets that moved take theirs along, removed ones lose them.
     #[serde(default)]
@@ -438,7 +433,6 @@ impl Default for ExportUi {
             materialx: false,
             skip: Vec::new(),
             sets: Default::default(),
-            templates_version: TEMPLATES_VERSION,
             owner: Vec::new(),
             owner_id: None,
             tab: 0,
@@ -796,33 +790,6 @@ impl Default for UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn per_map_settings_saved_with_the_old_templates_follow_their_maps() {
-        let left_out = MapExport { enabled: false, file_type: None };
-        let old = |template: &str, index: usize| SetExport { maps_template: template.into(), maps: [(index, left_out.clone())].into(), ..Default::default() };
-        let mut settings = ExportUi { templates_version: 0, ..ExportUi::default() };
-        settings.sets = [
-            (0, old("Document channels + Normal + AO", 19)),
-            (1, old("Mesh maps", 3)),
-            (2, old("Unity Standard (Metallic Smoothness)", 3)),
-            (3, old("Blender (Principled BSDF)", 6)),
-        ]
-        .into();
-
-        settings.update_saved_templates();
-
-        let index_of = |template: &str, file: &str| {
-            texturecraft_engine::formats::builtin_preset(template).unwrap().maps.iter().position(|m| m.file.starts_with(file)).unwrap()
-        };
-        let default = &settings.sets[&0];
-        assert_eq!(default.maps_template, texturecraft_engine::formats::DEFAULT_PRESET);
-        assert_eq!(default.maps.keys().copied().collect::<Vec<_>>(), [index_of(&default.maps_template, "$textureSet_Normal")], "the old normal map");
-        assert_eq!(settings.sets[&1].maps_template, "Mesh Maps");
-        assert_eq!(settings.sets[&1].maps.keys().copied().collect::<Vec<_>>(), [index_of("Mesh Maps", "$textureSet_ambient_occlusion")]);
-        assert!(!settings.sets.contains_key(&2) && !settings.sets.contains_key(&3), "maps the new templates do not have lose their settings");
-        assert_eq!(settings.templates_version, TEMPLATES_VERSION);
-    }
 
     #[test]
     fn camera_speeds_scale_the_built_in_navigation_and_inverse_flips_it() {

@@ -285,7 +285,8 @@ that numbers hide once a tile is under 40 points on screen.
   Parameters* has its reset button ("Restore the default export parameters"). *Output directory*
   is a button showing the path (it opens the folder picker) with an *R* button ("Reset to
   default"). The template list starts with the reference's first group (TextureCraft has
-  all of them but "2D View", which is greyed with "Not available yet"; one entry names another
+  "Document channels + Normal + AO (No Alpha)", the new name of its default template, and "glTF
+  PBR Metal Roughness"; the others are greyed with "Not available yet"; one entry names another
   vendor's product and is left out), then a separator ("Some templates in this list are unavailable") and every other template sorted by name. File type lists "Based on output
   template", then the types in the reference order and names ("targa", "jpeg", "tiff"). Size
   adds "Maximum size for all Texture Sets" and 128. Padding uses the reference order; the

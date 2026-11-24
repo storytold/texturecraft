@@ -53,8 +53,6 @@ fn the_rows_show_each_map_with_its_pattern_and_file_type() {
     assert!(h.query_all_by_label("png   16 bits").next().is_some(), "height is 16-bit in the default template");
 
     // A pattern longer than the column is cut at the front, the whole one is its tooltip
-    h.state_mut().ui.export.preset = "Unreal Engine (Packed)".into();
-    h.run_steps(4);
     let preset = texturecraft_engine::formats::builtin_preset(&h.state().ui.export.preset).unwrap();
     let long =
         plan(&mut h).iter().map(|f| preset.maps[f["map"].as_u64().unwrap() as usize].file.clone()).find(|p| p.chars().count() > 26).expect("a long pattern");

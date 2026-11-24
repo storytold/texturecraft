@@ -75,16 +75,7 @@ pub fn usd_export_options() -> ExportOptions {
                 "ClearcoatRoughness" => gray(ch(Channel::CoatRoughness, 0)),
                 _ => gray(ch(Channel::Opacity, 0)),
             };
-            MapSpec {
-                file: stem.into(),
-                format: FileFormat::Png,
-                bit_depth: 8,
-                channels,
-                inverted: Vec::new(),
-                dither: false,
-                when_channels: Vec::new(),
-                unless_channels: Vec::new(),
-            }
+            MapSpec { file: stem.into(), format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new() }
         })
         .collect();
     super::png8_options(ExportPreset { name: "USD preview surface".into(), maps }, NormalFormat::OpenGl)
@@ -576,16 +567,7 @@ mod texture_binding_tests {
     }
 
     fn map(file: &str, format: FileFormat, channels: Vec<(Dest, SourceRef)>) -> MapSpec {
-        MapSpec {
-            file: file.into(),
-            format,
-            bit_depth: 8,
-            channels,
-            inverted: Vec::new(),
-            dither: false,
-            when_channels: Vec::new(),
-            unless_channels: Vec::new(),
-        }
+        MapSpec { file: file.into(), format, bit_depth: 8, channels, inverted: Vec::new() }
     }
 
     fn options(maps: Vec<MapSpec>) -> ExportOptions {

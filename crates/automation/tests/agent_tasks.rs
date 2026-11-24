@@ -189,8 +189,8 @@ async fn agent_completes_texturing_tasks() {
     // 7. Export with the glTF preset.
     let r = tool(&c, "textures_export", json!({"dir": "tex", "preset": "glTF PBR Metal Roughness"})).await;
     let files: Vec<&str> = r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
-    assert!(files.iter().any(|f| f.contains("baseColor")), "task 7: {r}");
-    assert!(files.iter().any(|f| f.contains("occlusionRoughnessMetallic")), "task 7: {r}");
+    assert!(files.iter().any(|f| f.contains("BaseColor")), "task 7: {r}");
+    assert!(files.iter().any(|f| f.contains("OcclusionRoughnessMetallic")), "task 7: {r}");
     for f in &files {
         assert!(std::fs::metadata(dir.join(f)).unwrap().len() > 100, "task 7: {f}");
     }

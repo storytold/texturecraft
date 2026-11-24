@@ -90,14 +90,12 @@ pub fn preset_from_json(json: &str) -> Result<ExportPreset>;
 pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
 ```
 
-- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)>, inverted: Vec<Dest>, dither: bool, when_channels, unless_channels }`
+- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)>, inverted: Vec<Dest> }`
   (serde JSON, so presets can be user files).
 - `Dest`: `R G B A` or `L` (gray; `L` + `A` = gray + alpha).
 - `SourceRef`: `Channel { channel, component }` (`Normal` = the **final** normal in the export
   normal format), `Virtual { map, component }` (`NormalOpenGl`, `NormalDirectX`, `Glossiness` =
-  1 − roughness, `AoMixed` = baked AO × AO channel, `F0` = 0.08 × specular level, `Diffuse`,
-  `SpecularColor`, `Reflection`, `InverseIor`, `Glossiness2`, `LegacyDiffuse`, `LegacyGlossiness`, `UvCoverage`; see
-  Converted maps below),
+  1 − roughness, `AoMixed` = baked AO × AO channel, `F0` = 0.08 × specular level),
   `Baked { map, component }`, `Constant(f32)`.
 - `ExportOptions::new(preset)` accepts format and bit-depth overrides, per-map settings in
   `maps`, dithering, padding, size and normal format.
@@ -121,71 +119,26 @@ pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
   the normal channel, then with the baked normal map, by Reoriented Normal Mapping. DirectX
   flips green.
 
-Built-in presets: the reference app's built-in output templates with its names, file names, file
-types, bit depths, dithering and channel packing, then a few of our own. Its template names and
-contents are checked against listings of the reference app's templates
-(`src/presets/fixtures/reference_templates.json`, and `reference_generator_stacks.json` for the
-templates that follow the channels, on a specular/glossiness stack, a stack with extra channels and
-one without opacity and height).
-
-- Templates that follow the texture set's channels (only the maps with a source in the set are
-  written; a map can also need or exclude channels): *Document channels + Normal + AO (No Alpha)*
-  (the default: `$textureSet_<channel name>` in the reference's order and names, height, normals
-  and anisotropy angle 16-bit, plus `Normal_DirectX` and `Mixed_AO`), *Document channels + Normal +
-  AO (With Alpha)* (the same with the UV coverage as alpha), *glTF PBR Metal Roughness* and its *+
-  Displacement texture (experimental)* variant (`$textureSet_baseColor` with opacity in alpha,
-  `occlusionRoughnessMetallic`, `normal` dithered, `emissive`; plus our `clearcoat` and `sheen`
-  maps where the set has those channels), *Sketchfab* (JPEG maps and a PNG normal in
-  `exportsketchfab/textures/`, the AO only with an AO channel) and *USDz (Apple AR)* (a PNG base
-  color with opacity, or a JPEG one without). A set with a Glossiness channel is a
-  specular/glossiness set: its base color is written as `Diffuse`, and the metal/roughness
-  templates leave it out. *2D View* needs a rendered 2D view and is listed greyed.
-- Static templates, alphabetical: Amazon Lumberyard, Arnold (AiStandard), Arnold UDIM Legacy
-  (AiStandard), Blender (Principled BSDF), Corona, CryEngine, Dota 2, KeyShot, KeyShot 9+, Lens
-  Studio, Maxwell (Metallic Roughness), Maxwell (Specular Glossiness), Mesh Maps, Non-PBR Specular
-  Glossiness, PBR Metallic Roughness, PBR Metallic Roughness (folders or PSD groups), PBR Specular
-  Glossiness, PBR Specular Glossiness (converted from Metallic Roughness), Redshift (rsMaterial),
-  Renderman (pxrDisney), Renderman (pxrSurface), Roblox (MaterialVariant), Roblox
-  (SurfaceAppearance), Shade 3D, Spark AR Studio, Unity HD Render Pipeline (Metallic Standard),
-  Unity HD Render Pipeline (Specular), Unity Universal Render Pipeline (Metallic Standard), Unity
-  Universal Render Pipeline (Specular), Unreal Engine (Packed), Unreal Engine SSS (Packed), Vray
-  Next (Metallic Roughness), Vray Next (Specular Glossiness), Vray Next UDIM Legacy (Metallic
-  Roughness).
-- Ours: *Godot 4 (ORM)* (`albedo` with opacity in alpha, `orm`, `normal` OpenGL, `emission`),
-  *OpenPBR (separate maps)* (one map per OpenPBR Surface input the set has: `base_color`,
-  `base_metalness`, `specular_roughness`, `specular_roughness_anisotropy`, `coat_weight`,
-  `coat_roughness`, `fuzz_weight`, `fuzz_color`, `fuzz_roughness`, `transmission_weight`,
-  `subsurface_weight`, `emission_color`, `geometry_opacity`, `geometry_normal` OpenGL, `height`
-  16-bit) and *Separate maps* (one file per channel, gray where scalar, height 16-bit).
-
-Old names still find their template: "Document channels + Normal + AO", "Unity HDRP (Mask Map)"
-(now *Unity HD Render Pipeline (Metallic Standard)*), "Unity Standard (Metallic Smoothness)" (now
-*Unity Universal Render Pipeline (Metallic Standard)*) and "Mesh maps" (*Mesh Maps*).
-
-Differences from the reference: its `diffuse` channel is read from the base color (the diffuse
-color of a specular/glossiness project), its `transmissive` color from the transmission weight and
-its `scattering` from the scattering weight; the `user0`-`user3` channels do not exist here, so
-maps of them alone are left out. The document channel templates write the final normal (with the
-baked normal and the height) where the reference writes the normal channel alone. Sketchfab's own
-padding for its normal map is not applied. Converted colour maps follow the file format like the
-other colour maps (linear in float files), where the reference writes them sRGB-encoded in every
-format.
-
 File names may hold folders: `/` separates folder names inside the output directory (each one
 sanitized; a backslash, `..`, a leading `/` and empty folder names are refused), and the folders
 are created when the files are written.
 
-File names: `(...)` around a variable is optional, as in the reference: it is left out when the
-variable is empty (`$colorSpace` without a chosen colour space, `$udim` without UV tiles) and
-written without the parentheses otherwise. Other parentheses are kept. Each template map can ask
-for dithering; a dithering chosen for the map or the export decides instead.
+Built-in presets (each one lists the public specification its packing follows in `src/presets.rs`):
 
-Converted maps, with the reference's measured formulas: Diffuse (`base color × (1 − metallic)`),
-Specular (`lerp(0.04, base color, metallic)`, the specular level is not read), Reflection (`1 −
-enc(metallic) × (1 − enc(base color))` on sRGB-encoded values), 1/IOR (`(1 − metallic) / 1.5`),
-Glossiness² (`(1 − roughness)²`), the legacy diffuse (the base color) and the legacy glossiness
-(`(1 − roughness + metallic) / 2`). The UV coverage (1 on the UV islands, 0 outside, the alpha of
-channels written with transparency) is estimated, not verified against the reference.
+| Preset | Files (`$mesh_$textureSet_…`) |
+|---|---|
+| Document channels + Normal + AO (No Alpha) | one per document channel (`$channel`), plus `normal` and `ambientOcclusion` (mixed) |
+| glTF PBR Metal Roughness | `BaseColor` (sRGB, A = opacity), `OcclusionRoughnessMetallic`, `Normal` (OpenGL), `Emissive` (if present) |
+| Unreal Engine (Packed) | `BaseColor`, `OcclusionRoughnessMetallic`, `Normal` (DirectX) |
+| Unity HDRP (Mask Map) | `BaseMap`, `MaskMap` (R metal, G AO, B detail = 0, A smoothness), `Normal` (OpenGL) |
+| Unity Standard (Metallic Smoothness) | `Albedo`, `MetallicSmoothness` (R metal, A smoothness), `Normal` (OpenGL), `Occlusion` |
+| Blender (Principled BSDF) | `BaseColor`, `Metallic`, `Roughness`, `Normal` (OpenGL), `Height` (16-bit), `Emission`, `Specular` |
+| Godot 4 (ORM) | `albedo` (A = opacity), `orm` (R AO, G roughness, B metal), `normal` (OpenGL), `emission` |
+| OpenPBR (separate maps) | one map per OpenPBR Surface input the set has: `base_color`, `base_metalness`, `specular_roughness`, `specular_roughness_anisotropy`, `coat_weight`, `coat_roughness`, `fuzz_weight`, `fuzz_color`, `fuzz_roughness`, `transmission_weight`, `subsurface_weight`, `emission_color`, `geometry_opacity`, `geometry_normal` (OpenGL), `height` (16-bit) |
+| Unity URP Lit (Metallic Smoothness) | `BaseMap`, `MetallicMap` (R metal, A smoothness), `NormalMap` (OpenGL), `OcclusionMap`, `EmissionMap` |
+| USD Preview Surface (separate maps) | one map per UsdPreviewSurface input the set has, named like it: `diffuseColor`, `emissiveColor`, `metallic`, `roughness`, `normal` (OpenGL), `occlusion`, `opacity`, `clearcoat`, `clearcoatRoughness` |
+| Separate maps | one file per channel, gray where scalar, height 16-bit |
+| Mesh maps | every baked map (`$channel` = map id), 16-bit |
 
 ### Project file (`project_file`)
 
