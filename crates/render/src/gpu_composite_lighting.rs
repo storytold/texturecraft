@@ -392,22 +392,29 @@ mod tests {
             (stylized_lighting(StylizedLighting::library()), 1.0, BlendMode::Normal, true),
             (Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, false),
         ];
-        let project = lit_project(&effects, |project| {
-            let compare = EffectKind::Compare {
-                op: CompareOp::GreaterThan,
-                value: 0.45,
-                tolerance: 0.12,
-                left: CompareSource::ThisLayer,
-                right: CompareSource::Constant,
-                channel: Channel::BaseColor,
-                hardness: 0.1,
-            };
-            let ids = [project.alloc_id(), project.alloc_id()];
-            if let Some(mask) = lit_layer(project).and_then(|layer| layer.mask.as_mut()) {
-                mask.effects = vec![Effect::new(ids[0], compare), Effect::new(ids[1], EffectKind::Filter(Filter::Blur { radius: 16.0, wrap: false }))];
-            }
-        });
-        assert_lit_matches(&mut gpu, &project, &lit_bakes(true, true), (true, Tolerance::TRANSCENDENTAL), "a mask comparing its lit Base Color");
+        let project = |hardness: f32| {
+            lit_project(&effects, |project| {
+                let compare = EffectKind::Compare {
+                    op: CompareOp::GreaterThan,
+                    value: 0.45,
+                    tolerance: 0.12,
+                    left: CompareSource::ThisLayer,
+                    right: CompareSource::Constant,
+                    channel: Channel::BaseColor,
+                    hardness,
+                };
+                let ids = [project.alloc_id(), project.alloc_id()];
+                if let Some(mask) = lit_layer(project).and_then(|layer| layer.mask.as_mut()) {
+                    mask.effects = vec![Effect::new(ids[0], compare), Effect::new(ids[1], EffectKind::Filter(Filter::Blur { radius: 16.0, wrap: false }))];
+                }
+            })
+        };
+        let bakes = lit_bakes(true, true);
+        assert_lit_matches(&mut gpu, &project(0.1), &bakes, (true, Tolerance::TRANSCENDENTAL), "a mask comparing its lit Base Color");
+        // A steeper ramp turns float noise into a few steps (at most 0.1 % of the texels; at
+        // hardness 0.6 the sphere's pole holds 22 to 70 such texels, over 0.1 %)
+        let flips = (LIT_SIZE * LIT_SIZE / 1000) as usize;
+        assert_lit_matches(&mut gpu, &project(0.4), &bakes, (true, Tolerance::TRANSCENDENTAL.with_flips(flips)), "a steep mask comparing its lit Base Color");
     }
 
     /// One content effect of the lit layer: filter, opacity, blend, and whether it starts on Base
