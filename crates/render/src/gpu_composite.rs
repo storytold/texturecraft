@@ -1008,10 +1008,9 @@ impl CompositeProgram {
                 let background = compile_mask(mask, around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
                 let count = effects.len() as u32 - begin;
 
-                // A folder has no content of its own for a comparison to read
-                if effects[begin as usize..].iter().any(stack::reads_own_layer) {
-                    return Err("A folder mask comparing its own layer uses CPU compositing.");
-                }
+                // A folder's This Layer is the stack below it, as the CPU reads it
+                effects[begin as usize..].iter_mut().for_each(stack::read_folder_layers);
+
                 let height = layer.height_mask;
                 let height_params = if height.enabled && count != 0 {
                     if !height.contrast.is_finite() || !height.offset.is_finite() {
@@ -1065,6 +1064,7 @@ impl CompositeProgram {
                     continue;
                 }
                 visible_cut += 1;
+                let first_input = procedural.input_sources.len();
 
                 // A filter laid on each channel apart is lowered once per channel of the set
                 let channel_ops = if blends_per_channel(effect) && !content_depends_on_channel(effect) {
@@ -1082,6 +1082,7 @@ impl CompositeProgram {
                 } else {
                     Some(content_filter(effect, &mut procedural).ok_or("A layer effect uses CPU compositing.")?)
                 };
+                stack::bind_input_tiles(effect, &mut procedural.input_sources[first_input..], &mut tile_patterns);
 
                 // A lowering with a stage before its operation takes two operations, on every channel alike
                 let mut stage = procedural.preceding_stage.take();
@@ -1195,6 +1196,13 @@ impl CompositeProgram {
                 }
                 operations.push(op);
             }
+
+            // A mask stage after This Layer is prepared before the content fields it would read
+            let (mask_ops, content_ops) = effects[mask_start as usize..].split_at((shared_content - mask_start) as usize);
+            if stack::reads_own_layer_before_stage(mask_ops) && content_ops.iter().any(|op| op.ids[1] == NEIGHBOURHOOD_OPCODE) {
+                return Err("A mask filter after a comparison reading its own filtered layer uses CPU compositing.");
+            }
+
             packages::order_layer_operations(&mut operations[first_op..]);
             if height_op != 0 {
                 // The reorder can move the Height operation that the height mask reads
@@ -1305,11 +1313,15 @@ impl CompositeProgram {
         let around = project.contents_around(requested);
         let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
         let mask = mask.ok_or("The layer has no enabled mask.")?;
+
         // A mask reading anchors or the layers needs the stack below it: the material program
-        if mask.effects.iter().any(|effect| effect.visible && (!effect.kind.anchors_read().is_empty() || effect.kind.reads_stack())) {
+        let reads_below = |effect: &Effect| {
+            !effect.kind.anchors_read().is_empty() || effect.inputs.values().any(|source| source.reads_anchor(None)) || effect.kind.reads_stack()
+        };
+        if mask.effects.iter().any(|effect| effect.visible && reads_below(effect)) {
             // The material program keeps the owner's last draw, which must sit where the requested layer does
             if stack::draw_offsets(project, &set.stack, owner).iter().any(|offset| *offset != around) {
-                return Err("A mask reading anchors inside a folder with Scale or Rotation uses CPU mask preview.");
+                return Err("A mask reading anchors or layers inside a folder with Scale or Rotation uses CPU mask preview.");
             }
 
             let mut program = Self::try_compile_with_brush(project, pixels, ts, region, brush)?;
@@ -1424,7 +1436,11 @@ fn content_filter(effect: &Effect, procedural: &mut ProceduralInputs) -> Option<
         EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection(_) | EffectKind::Compare { .. } => Some(noop),
         // A blending effect set to Disable leaves the content as it is
         kind if kind.blends() && effect.blend == BlendMode::Disable && uniform_blend(effect) => Some(noop),
-        _ => point_effect(effect, procedural),
+        _ => {
+            let mut op = point_effect(effect, procedural)?;
+            stack::attach_distance_map(effect, &mut op, procedural)?;
+            Some(op)
+        }
     }
 }
 
@@ -1606,7 +1622,13 @@ fn compile_mask(
             }
             // Lighting reads the base color, which a mask does not have
             EffectKind::Filter(Filter::BakedLighting { .. } | Filter::EnvironmentLighting { .. }) => continue,
-            _ => point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?,
+            _ => {
+                let first_input = procedural.input_sources.len();
+                let mut operation = point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?;
+                stack::attach_distance_map(effect, &mut operation, procedural).ok_or("A mask effect's Distance Map uses CPU compositing.")?;
+                stack::bind_input_tiles(effect, &mut procedural.input_sources[first_input..], tile_patterns);
+                operation
+            }
         };
         if !effect.opacity.is_finite() {
             return Err("A mask effect has an invalid opacity.");

@@ -36,40 +36,49 @@ fn stack_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 {
 
 // A mask comparison reading layers (LAYER_COMPARE in gpu_composite_stack.rs)
 const STACK_LAYER_COMPARE: u32 = 144u;
+// Side codes in ids.w, four bits each, left side first (the *_SIDE constants in Rust)
+const STACK_SIDE_BITS: u32 = 4u;
+const STACK_SIDE_MASK: u32 = 15u;
+const STACK_MASK_SIDE: u32 = 0u;
+const STACK_CONSTANT_SIDE: u32 = 1u;
+const STACK_THIS_LAYER_SIDE: u32 = 3u;
+// The compared channel's kind in ids.w from bit 8 (the *_KIND constants in Rust)
+const STACK_KIND_SHIFT: u32 = 8u;
+const STACK_KIND_MASK: u32 = 255u;
+const STACK_SCALAR_KIND: u32 = 1u;
+const STACK_SIGNED_KIND: u32 = 2u;
 
-// One side of a layer comparison (compare_side in the CPU's eval.rs), its code in four bits of
-// ids.w: 0 the mask so far, 1 the constant, 2 the layers below, 3 this layer over them
+// One side of a layer comparison (compare_side in the CPU's eval.rs)
 fn stack_compare_side(op: Operation, side: u32, mask: f32, texel: LayerTexel) -> f32 {
-    if side == 0u {
+    if side == STACK_MASK_SIDE {
         return mask;
     }
-    if side == 1u {
+    if side == STACK_CONSTANT_SIDE {
         return op.low.x;
     }
 
     // Where the layer is empty or thin it shows the stack below it
     var read = stack_at(op, texel.pixel);
-    if side == 3u {
+    if side == STACK_THIS_LAYER_SIDE {
         let own = this_layer_content(op, texel);
         read = read + (own.rgb - read) * own.a;
     }
 
-    // The channel's kind in ids.w from bit 8: colour, scalar, signed, normal map
-    let kind = (op.ids.w >> 8u) & 255u;
-    if kind == 1u {
+    // Colours and normal maps compare their luminance, signed values their place in 0..1
+    let kind = (op.ids.w >> STACK_KIND_SHIFT) & STACK_KIND_MASK;
+    if kind == STACK_SCALAR_KIND {
         return read.x;
     }
-    if kind == 2u {
+    if kind == STACK_SIGNED_KIND {
         return read.x * 0.5 + 0.5;
     }
     return luminance(read);
 }
 
-// A comparison of two sides (CompareOp::mask): ids.z the comparison, low.y the tolerance, low.z
-// the ramp's width past the edge (0: hard)
+// A comparison of two sides (CompareOp::mask), low.z the ramp's width past the edge (0: hard)
 fn stack_layer_compare(op: Operation, mask: f32, texel: LayerTexel) -> f32 {
-    let left = stack_compare_side(op, op.ids.w & 15u, mask, texel);
-    let right = stack_compare_side(op, (op.ids.w >> 4u) & 15u, mask, texel);
+    let left = stack_compare_side(op, op.ids.w & STACK_SIDE_MASK, mask, texel);
+    let right = stack_compare_side(op, (op.ids.w >> STACK_SIDE_BITS) & STACK_SIDE_MASK, mask, texel);
     var past = op.low.y - abs(left - right);
     if op.ids.z == 0u {
         past = right - left;
@@ -82,6 +91,7 @@ fn stack_layer_compare(op: Operation, mask: f32, texel: LayerTexel) -> f32 {
         let passes = select(past > 0.0, past >= 0.0, op.ids.z == 1u);
         return select(0.0, 1.0, passes);
     }
+
     var ramp = past / width;
     if op.ids.z == 1u {
         ramp += 1.0;
@@ -104,8 +114,7 @@ fn stack_soft_compare(op: Operation, mask: f32) -> f32 {
 // The ID map flag of a colour selection (ID_MAP_IMAGE in gpu_composite_stack.rs)
 const STACK_ID_MAP_IMAGE: u32 = 0x00000200u;
 
-// A colour selection's gray and cover (ColorSelection::value): side table image record, output,
-// edge width and background (below 0: transparent)
+// A colour selection's gray and cover (ColorSelection::value), side table: image record, output, edge width, background (below 0: transparent)
 fn stack_color_selection(effect: Operation, texel: LayerTexel) -> vec2<f32> {
     let output = param(effect, 1u);
     let width = param(effect, 2u);

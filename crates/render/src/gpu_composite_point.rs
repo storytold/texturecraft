@@ -38,7 +38,7 @@
 //! for each setting value, set to Disable too, at opacity below 1 with a non-Normal blend.
 
 use texturecraft_core::{
-    ConversionMode, CurvePreset, Effect, Filter, GradientInput, GrayscaleMode, ImageInput, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, finite_unit, lum,
+    ChannelKind, ConversionMode, CurvePreset, Effect, Filter, GradientInput, GrayscaleMode, ImageInput, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, finite_unit, lum,
 };
 use texturecraft_texel::linear_to_srgb;
 
@@ -127,7 +127,7 @@ pub(super) fn lower(filter: &Filter, effect: &Effect, op: &mut Operation, inputs
         Filter::GrayscaleConversion(conversion) => {
             // The Custom Input's colour replaces the channel's (P3's image inputs, `effect_input`)
             if conversion.custom_input {
-                op.effects[3] = stack::register_image_input(effect, &ImageInput::CUSTOM_INPUT, inputs)?;
+                op.effects[3] = stack::register_image_input(effect, &ImageInput::CUSTOM_INPUT, ChannelKind::Color, inputs)?;
             }
             op.ids[2] = match conversion.mode {
                 ConversionMode::Desaturation => GRAY_DESATURATION,
