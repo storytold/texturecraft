@@ -343,14 +343,8 @@ impl Session {
         let gpu_tool = matches!(tool, Tool::Paint | Tool::Projection | Tool::Path) || erase;
         // Resolved once: staging, both previews and the commit paint this gray
         let mask_gray = self.mask_gray();
-        // The device previews one gray; a mask image paints on the CPU, and erasing reads no gray
-        let image_mask = !erase && matches!(target, Some(PaintTarget::Mask(_))) && matches!(mask_gray, MaskGray::Image { .. });
-        if image_mask && gpu_tool && self.brush_device.is_some() {
-            self.log.performance("Brush: CPU (mask image)");
-        }
         // Symmetry copies reach the device with the stamps (a 3D copy carries its source for visibility); particle strokes stay on the CPU
         let device = if gpu_tool
-            && !image_mask
             && canvas.pickup.is_none()
             && !settings.particles.enabled
             && settings.alpha_image.is_none()
@@ -661,19 +655,18 @@ impl Session {
     /// The live material compositor uses the device's coverage directly while the stroke is active.
     pub fn device_stroke(&self) -> Option<DeviceStrokePreview<'_>> {
         let stroke = self.stroke.as_ref()?;
-        let target = stroke.target?;
 
-        // The gray resolved when the stroke began; a layer stroke paints channel values and erasing reads no gray, so only painting a mask reads it
-        let mask_value = match (&stroke.mask_gray, target) {
-            (MaskGray::Value(value), _) => value.clamp(0.0, 1.0),
-            (MaskGray::Image { .. }, PaintTarget::Mask(_)) if !stroke.erase => return None,
-            (MaskGray::Image { .. }, _) => 0.0,
+        // The gray resolved when the stroke began: one value, or an image's gray per texel
+        let mask_value = match &stroke.mask_gray {
+            MaskGray::Value(value) => value.clamp(0.0, 1.0),
+            MaskGray::Image { .. } => 0.0,
         };
         Some(DeviceStrokePreview {
             ts: stroke.ts,
-            target,
+            target: stroke.target?,
             values: &stroke.values,
             mask_value,
+            mask_image: stroke.mask_gray.image_name(),
             opacity: stroke.stroke.settings.opacity,
             erase: stroke.erase,
             stroke: stroke.device.as_deref()?,

@@ -866,8 +866,16 @@ pub struct LiveBrush {
 }
 
 pub enum LiveBrushTarget {
-    Layer { layer: LayerId, values: BTreeMap<Channel, [f32; 3]> },
-    Mask { effect: LayerId, value: f32 },
+    Layer {
+        layer: LayerId,
+        values: BTreeMap<Channel, [f32; 3]>,
+    },
+    /// `image`: the image resource whose gray the stroke paints per texel instead of `value`.
+    Mask {
+        effect: LayerId,
+        value: f32,
+        image: Option<String>,
+    },
 }
 
 impl LiveBrush {
@@ -1566,7 +1574,7 @@ fn content_paint(
     if let Some(([r, g, b], opacity, erase)) = brush_value {
         op.projection[3] = if stencil_pigment && channel == Channel::BaseColor { 2.0 } else { 1.0 };
         op.uv = [r, g, b, opacity];
-        op.ext[2] = brush::live_paint_bits(erase);
+        op.ext[2] = brush::live_paint_bits(erase, false);
     }
     op
 }
@@ -1702,8 +1710,8 @@ fn compile_mask(
             }
             EffectKind::Paint | EffectKind::Path(_) => {
                 let live = brush.and_then(|brush| match &brush.target {
-                    LiveBrushTarget::Mask { effect: id, value } if *id == effect.id && matches!(effect.kind, EffectKind::Paint) => {
-                        Some((value.clamp(0.0, 1.0), brush.opacity.clamp(0.0, 1.0), brush.erase))
+                    LiveBrushTarget::Mask { effect: id, value, image } if *id == effect.id && matches!(effect.kind, EffectKind::Paint) => {
+                        Some((value.clamp(0.0, 1.0), brush.opacity.clamp(0.0, 1.0), brush.erase, image.as_deref()))
                     }
                     _ => None,
                 });
@@ -1716,10 +1724,14 @@ fn compile_mask(
                 }
                 let image_index = image.map_or(NO_PAINT_IMAGE, |image| paint.register(effect.id, None, image));
                 let mut op = Operation { ids: [0, 10, image_index, 2], ..Operation::zeroed() };
-                if let Some((value, opacity, erase)) = live {
+                if let Some((value, opacity, erase, mask_image)) = live {
                     op.projection[3] = 1.0;
                     op.uv = [value, value, value, opacity];
-                    op.ext[2] = brush::live_paint_bits(erase);
+                    let mask_image = mask_image.filter(|_| !erase);
+                    op.ext[2] = brush::live_paint_bits(erase, mask_image.is_some());
+                    if let Some(name) = mask_image {
+                        op.ext[0] = procedural.pack_image(name, ImageUse::Material).ok_or("The live brush's mask image does not fit the GPU program.")?;
+                    }
                 }
                 op
             }

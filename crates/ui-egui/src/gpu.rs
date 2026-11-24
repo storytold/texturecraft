@@ -394,7 +394,7 @@ impl SetCompositor {
                     LiveBrushTarget::Layer { layer, values: channels.into_iter().map(|channel| (channel, [0.0; 3])).collect() }
                 }
                 PaintTarget::Layer(layer) => LiveBrushTarget::Layer { layer, values: brush.values.clone() },
-                PaintTarget::Mask(effect) => LiveBrushTarget::Mask { effect, value: brush.mask_value },
+                PaintTarget::Mask(effect) => LiveBrushTarget::Mask { effect, value: brush.mask_value, image: brush.mask_image.map(str::to_owned) },
             };
             Some(LiveBrush { target, opacity: brush.opacity, erase: brush.erase, alpha: coverage.view(), stencil: coverage.stencil() })
         } else {
@@ -2663,73 +2663,76 @@ pub(crate) mod tests {
         }
     }
 
-    /// A mask stroke painting an image's gray has no GPU preview of it: coverage, preview and commit
-    /// run on the CPU, and the preview shows exactly what the commit writes.
+    /// A mask stroke painting an image's gray runs on the GPU brush: in the material and the mask
+    /// view the live stroke shows the gray its release commits, and the Eraser ignores the image.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn a_mask_image_stroke_previews_and_commits_on_the_cpu() {
+    fn a_mask_image_stroke_previews_its_gray_on_the_gpu() {
         let Ok(gpu) = Headless::new() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
-        let mut s = Session::new_project("Image mask", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
-        execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
-        execute(&mut s, "mask.add.black", &json!({})).unwrap();
-        execute(&mut s, "tool.brush", &json!({"size": 40})).unwrap();
-        let grays = texturecraft_engine::formats::gray16_png(2, 2, [0.2, 0.9, 0.5, 0.7].into_iter()).unwrap();
-        let image = s.import_resource_bytes("gray.png", grays).unwrap();
-        execute(&mut s, "tool.material", &json!({"maskImage": image, "maskValue": 1.0})).unwrap();
-        let mut link = link();
-        link.gpu_composite_enabled = true;
-        link.brush_device = Some(brush.clone());
-        let scene = link.sync(&mut s, None, None, 0, 0.0);
-        {
+        let texels = [(64, 64), (52, 60), (70, 75), (64, 50)];
+        let display = |link: &mut GpuLink, s: &mut Session, aux: Option<AuxView>| -> [[u8; 4]; 4] {
+            let scene = link.sync(s, aux, None, 0, 0.0);
             let gpu = &mut *brush.0.lock().unwrap();
             let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
-        }
-
-        let stroke = |s: &mut Session| {
-            s.brush_device = link.brush_device(s);
-            assert!(s.brush_device.is_some(), "the material composites on the GPU");
-            s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
-            assert!(s.device_stroke().is_none(), "the GPU previews one gray, not an image");
+            let texture = if aux.is_some() { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
+            texels.map(|(x, y)| read_display(gpu, texture, x, y))
         };
-        stroke(&mut s);
-        assert!(s.log.iter().any(|entry| entry.message == "Brush: CPU (mask image)"));
-        assert!(s.display_stroke_pixels(0, None).is_some_and(|preview| !preview.masks.is_empty()));
-        s.cancel_stroke();
-        assert!(s.doc.pixels.masks.is_empty(), "cancel restores the mask");
+        let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 1);
+        for mask_view in [false, true] {
+            let mut s = Session::new_project("Image mask", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+            execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+            execute(&mut s, "mask.add.black", &json!({})).unwrap();
+            execute(&mut s, "tool.brush", &json!({"size": 40})).unwrap();
+            let grays = texturecraft_engine::formats::gray16_png(2, 2, [0.2, 0.9, 0.5, 0.7].into_iter()).unwrap();
+            let image = s.import_resource_bytes("gray.png", grays).unwrap();
+            execute(&mut s, "tool.material", &json!({"maskImage": image, "maskValue": 1.0})).unwrap();
+            let layer = s.selected_layer().unwrap();
+            let aux = mask_view.then_some(AuxView::Mask(layer));
+            if mask_view {
+                s.view = ViewMode::Mask(layer);
+            }
+            let mut link = link();
+            link.gpu_composite_enabled = true;
+            link.brush_device = Some(brush.clone());
+            let before = display(&mut link, &mut s, aux);
 
-        stroke(&mut s);
-        let preview = s.display_stroke_pixels(0, None).unwrap();
-        // Changing the gray mid-stroke leaves the stroke's image
-        execute(&mut s, "tool.material", &json!({"maskImage": null, "maskValue": 0.0})).unwrap();
-        s.end_stroke().unwrap();
-        let (&effect, committed) = s.doc.pixels.masks.iter().next().expect("the stroke persists");
-        let previewed = preview.masks.get(&effect).unwrap();
-        let centre = (64, 64);
-        for (x, y) in [centre, (52, 60), (70, 75), (64, 50)] {
-            assert_eq!(previewed.get(x, y), committed.get(x, y), "texel {x},{y}");
+            s.brush_device = link.brush_device(&s);
+            s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+            assert!(s.device_stroke().is_some(), "mask view {mask_view}: the image stroke runs on the device");
+            let live = display(&mut link, &mut s, aux);
+            assert!(s.doc.pixels.masks.is_empty(), "live GPU painting keeps the document untouched");
+            // Changing the gray mid-stroke leaves the stroke's image
+            execute(&mut s, "tool.material", &json!({"maskImage": null, "maskValue": 0.0})).unwrap();
+            s.end_stroke().unwrap();
+            let committed = display(&mut link, &mut s, aux);
+
+            assert_ne!(live[0], before[0], "mask view {mask_view}: the stroke shows while it is drawn");
+            for ((x, y), (live, committed)) in texels.into_iter().zip(live.into_iter().zip(committed)) {
+                assert!(close(live, committed), "mask view {mask_view}, texel {x},{y}: live {live:?}, committed {committed:?}");
+            }
+            let (_, mask) = s.doc.pixels.masks.iter().next().expect("the stroke persists");
+            let [value, coverage] = mask.get(64, 64)[..2].try_into().unwrap();
+            assert!(coverage > 0);
+            let gray = f32::from(value) / f32::from(coverage);
+            let image_gray =
+                texturecraft_engine::compose::MaskGray::Image { name: image.clone(), image: s.images.get(&image).unwrap().clone() }.at(64, 64, (128, 128));
+            assert!((gray - image_gray).abs() < 0.02, "the stroke paints the image's gray {image_gray}, got {gray}");
+
+            // Erasing reads no gray: the Eraser runs on the device with the image still loaded
+            execute(&mut s, "tool.material", &json!({"maskImage": image, "maskValue": 1.0})).unwrap();
+            execute(&mut s, "tool.eraser", &json!({})).unwrap();
+            display(&mut link, &mut s, aux);
+            s.brush_device = link.brush_device(&s);
+            s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+            assert!(s.device_stroke().is_some_and(|stroke| stroke.erase));
+            let live = display(&mut link, &mut s, aux);
+            s.end_stroke().unwrap();
+            assert!(close(live[0], display(&mut link, &mut s, aux)[0]), "mask view {mask_view}: the erase shows what it commits");
+            let erased = s.doc.pixels.masks.values().next().unwrap().get(64, 64)[1];
+            assert!(erased < coverage, "the eraser removes coverage: {erased} of {coverage}");
         }
-        let [value, coverage] = committed.get(centre.0, centre.1)[..2].try_into().unwrap();
-        assert!(coverage > 0);
-        let gray = f32::from(value) / f32::from(coverage);
-        let image_gray =
-            texturecraft_engine::compose::MaskGray::Image { name: image.clone(), image: s.images.get(&image).unwrap().clone() }.at(64, 64, (128, 128));
-        assert!((gray - image_gray).abs() < 0.02, "the stroke paints the image's gray {image_gray}, got {gray}");
-
-        // Erasing reads no gray: the eraser takes its usual route with the image still loaded
-        execute(&mut s, "tool.material", &json!({"maskImage": image, "maskValue": 1.0})).unwrap();
-        execute(&mut s, "tool.eraser", &json!({})).unwrap();
-        let image_routes = s.log.iter().filter(|entry| entry.message == "Brush: CPU (mask image)").count();
-        s.brush_device = link.brush_device(&s);
-        s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
-        s.end_stroke().unwrap();
-        assert_eq!(s.log.iter().filter(|entry| entry.message == "Brush: CPU (mask image)").count(), image_routes);
-        let erased = s.doc.pixels.masks.get(&effect).unwrap().get(centre.0, centre.1)[1];
-        assert!(erased < coverage, "the eraser removes coverage: {erased} of {coverage}");
-        s.undo().unwrap();
-        s.undo().unwrap();
-        assert!(s.doc.pixels.masks.is_empty(), "undo restores the mask");
     }
 
     /// A mask image in the tool is a mask gray: a layer stroke paints channel values, so the GPU
