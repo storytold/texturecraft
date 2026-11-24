@@ -949,6 +949,32 @@ mod tests {
         assert!(check_cases(&mut gpu, &cases, EDGE_PAINT, CORNER, GATHER_DECISIONS).is_some());
     }
 
+    /// Kuwahara's tensor pass and Color Match's row sums split by rows under a tiny pre-pass work
+    /// budget (each chunk submitted on its own) and still match the CPU.
+    #[test]
+    fn own_passes_in_row_chunks_match_the_cpu() {
+        use crate::gpu_composite::PRE_PASS_TEST_BUDGET;
+        use crate::gpu_neighbourhood::{NeighbourhoodFilter, WHOLE_SET_TEST_REACH};
+
+        let Some(mut gpu) = headless() else { return };
+        let normal = BlendMode::Normal;
+        let widest = Filter::AnisotropicKuwahara(AnisotropicKuwahara { radius: AnisotropicKuwahara::MAX_RADIUS, ..AnisotropicKuwahara::LIBRARY });
+        let reach = NeighbourhoodFilter::new(&widest, KUWAHARA_SIZE, KUWAHARA_SIZE, 1.0, None).unwrap().reach();
+        let cases = [
+            ("Kuwahara in row chunks", vec![(widest, 1.0, normal)], normal),
+            ("Color Match in row chunks", vec![(Filter::ColorMatch(ColorMatch::LIBRARY), 1.0, normal)], normal),
+        ];
+
+        // The Kuwahara stage runs in the pre-pass too, where the budget applies
+        WHOLE_SET_TEST_REACH.set(Some(reach));
+        PRE_PASS_TEST_BUDGET.set(Some(20_000));
+        let checked = check_cases(&mut gpu, &cases, (false, KUWAHARA_SIZE), KUWAHARA_MIDDLE, KUWAHARA_DECISIONS);
+        WHOLE_SET_TEST_REACH.set(None);
+        PRE_PASS_TEST_BUDGET.set(None);
+
+        assert!(checked.is_some());
+    }
+
     /// Anisotropic Kuwahara matches the CPU through its structure tensor pass, at the library's
     /// settings and each setting away from them (the custom input unlinked): below full opacity
     /// under Multiply, disabled, between filters and in a partial update.
