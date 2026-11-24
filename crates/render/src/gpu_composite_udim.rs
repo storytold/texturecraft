@@ -203,7 +203,7 @@ mod tests {
     use texturecraft_core::{
         BakedMap, Bevel, BlendMode, Channel, ColorSelection, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, HeightToNormal, Layer,
         LayerId, LayerKind, Mask, MaskBackground, Mirror, Procedural, ProceduralKind, Project, Projection, Sampling, Source, SourceWarp, StylizedLighting,
-        TextureSet, TileTransform, WarpSource, WarpSourceMode,
+        TextureSet, TileTransform, WarpMode, WarpSource, WarpSourceMode,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::{Mesh, UvGBuffer, primitives};
@@ -460,7 +460,9 @@ mod tests {
         let mirror = Filter::Mirror(Mirror { offset: [0.4, 0.5], ..Mirror::LIBRARY });
         let transform = Filter::Transform(TileTransform { rotation: 30.0, offset: [0.1, -0.2], ..TileTransform::LIBRARY });
         let repeating = WarpSource { mode: WarpSourceMode::PreviousInput, tiling: 2.0, ..WarpSource::LIBRARY };
-        let warp = Filter::SourceWarp(SourceWarp { intensity: 0.5, source: repeating, ..SourceWarp::LIBRARY });
+        // Directional: Warp mode's slope is a finite difference across the stripes' hard edges,
+        // which llvmpipe turns at a few texels
+        let warp = Filter::SourceWarp(SourceWarp { intensity: 0.5, mode: WarpMode::Directional, angle: 30.0, source: repeating, ..SourceWarp::LIBRARY });
         let cases = [
             ("Mirror", vec![(mirror.clone(), 1.0, normal)]),
             ("Transform", vec![(transform, 1.0, normal)]),
@@ -686,11 +688,12 @@ mod tests {
 
     /// Whole-set stages take one pre-pass entry per filter whatever the tile scales: a Mirror
     /// and a Transform in the content and in the mask, on a three-scale and a four-scale atlas,
-    /// all run in the pre-pass, at a block of 512 texels.
+    /// all run in the pre-pass, at a block of 256 texels.
     #[test]
     fn whole_set_filters_keep_the_pre_pass_on_atlases_of_many_scales() {
         let Some(mut gpu) = headless() else { return };
-        const LARGE: u32 = 512;
+        // Up to sixteen results of 256 K texels fit a 128 MiB storage binding
+        const LARGE: u32 = 256;
         let normal = BlendMode::Normal;
         let mirror = Filter::Mirror(Mirror { offset: [0.4, 0.5], ..Mirror::LIBRARY });
         let transform = Filter::Transform(TileTransform { rotation: 30.0, offset: [0.1, -0.2], ..TileTransform::LIBRARY });
