@@ -56,6 +56,10 @@ struct Dab {
     bitangent: [f32; 4],
     seed: u32,
     padding: [u32; 3],
+    /// A symmetry copy's source origin with w 1, zero for any other dab
+    source: [f32; 4],
+    /// The columns of the copy's `StampSource::to_source`
+    to_source: [[f32; 4]; 3],
 }
 
 struct Visibility {
@@ -271,6 +275,10 @@ impl GpuBrushStroke {
             if !stamp.radius.is_finite() || stamp.radius <= 0.0 || !stamp.center.is_finite() {
                 continue;
             }
+            let (source, to_source) = match stamp.source {
+                Some(source) => (source.origin.extend(1.0).to_array(), source.to_source.to_cols_array_2d().map(|[x, y, z]| [x, y, z, 0.0])),
+                None => ([0.0; 4], [[0.0; 4]; 3]),
+            };
             let index = dabs.len() as u32;
             dabs.push(Dab {
                 center: stamp.center.extend(stamp.radius).to_array(),
@@ -279,6 +287,8 @@ impl GpuBrushStroke {
                 bitangent: stamp.bitangent.extend(stamp.hardness).to_array(),
                 seed: stamp.seed,
                 padding: [0; 3],
+                source,
+                to_source,
             });
             let extent = stamp.world_extent();
             let mut touched = Tiles::new();
@@ -316,6 +326,8 @@ impl GpuBrushStroke {
                 bitangent: [0.0, 0.0, 0.0, stamp.hardness],
                 seed: stamp.seed,
                 padding: [0; 3],
+                source: [0.0; 4],
+                to_source: [[0.0; 4]; 3],
             });
             let reach = Vec2::splat(radius * 1.42);
             let mut touched = Tiles::new();
@@ -837,6 +849,65 @@ mod tests {
         let expected = cpu.get(32, 32)[0];
         assert!(expected > 0 && expected < u16::MAX);
         assert_eq!(actual.get(32, 32)[0], expected);
+    }
+
+    /// Coverage within one 8-bit step, except visibility decisions flipped on at most 0.1 % of
+    /// the covered texels
+    fn assert_coverage_matches(cpu: &TileImage, gpu: &TileImage, label: &str) {
+        const EIGHT_BIT_STEP: u16 = 257;
+        let (mut covered, mut differing) = (0, 0);
+        for y in 0..cpu.height() {
+            for x in 0..cpu.width() {
+                let (expected, observed) = (cpu.get(x, y)[0], gpu.get(x, y)[0]);
+                covered += usize::from(expected != 0 || observed != 0);
+                differing += usize::from(expected.abs_diff(observed) > EIGHT_BIT_STEP);
+            }
+        }
+        assert!(covered > 0, "{label}: nothing painted");
+        assert!(differing * 1000 <= covered, "{label}: {differing}/{covered} texels differ");
+    }
+
+    #[test]
+    fn symmetry_copies_see_the_texel_from_their_source_stamp() {
+        use texturecraft_geom::glam::Mat3;
+        use texturecraft_paint::StampSource;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        let camera = OrbitCamera { pitch: 1.2, ..OrbitCamera::default() };
+
+        // A stroke and its copy across the X plane, with culling and the camera's visibility
+        let mirror_x = StampSource { origin: Vec3::ZERO, to_source: Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0)) };
+        let stroke = Stamp {
+            center: Vec3::new(-0.25, 0.0, 0.1),
+            normal: Vec3::Y,
+            tangent: Vec3::X,
+            bitangent: Vec3::Z,
+            radius: 0.15,
+            flow: 0.8,
+            hardness: 0.7,
+            depth: 1.0,
+            seed: 3,
+            source: None,
+        };
+        let copy = Stamp { center: Vec3::new(0.25, 0.0, 0.1), tangent: Vec3::NEG_X, bitangent: Vec3::Y.cross(Vec3::NEG_X), source: Some(mirror_x), ..stroke };
+        let settings = BrushSettings { backface_culling: true, ..Default::default() };
+        let (cpu, actual) = world_brush_coverage(&mut gpu, primitives::plane(1.0, 4), settings.clone(), Some(camera), &[stroke, copy]);
+        assert_coverage_matches(&cpu, &actual, "mirrored plane");
+        assert!(actual.get(96, 77)[0] > 0, "the copy paints across the plane");
+
+        // A copy whose source point lies under another surface, inside the stamp depth
+        let corners = [Vec3::new(-1.0, 0.03, -1.0), Vec3::new(1.0, 0.03, -1.0), Vec3::new(1.0, 0.03, 1.0), Vec3::new(-1.0, 0.03, 1.0)];
+        let source_corners = corners.map(|point| Vec3::new(point.x, -0.02, point.z));
+        let uvs = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y].into_iter().chain([Vec2::ZERO; 4]).collect();
+        let indices = [0, 2, 1, 0, 3, 2, 4, 6, 5, 4, 7, 6].to_vec();
+        let mesh = Mesh::from_parts(corners.into_iter().chain(source_corners).collect(), None, uvs, indices, "Asymmetric mirror").unwrap();
+        let mirror_y = StampSource { origin: Vec3::ZERO, to_source: Mat3::from_diagonal(Vec3::new(1.0, -1.0, 1.0)) };
+        let copy = Stamp { center: Vec3::new(0.0, 0.03, 0.0), radius: 0.3, flow: 1.0, hardness: 0.9, source: Some(mirror_y), ..stroke };
+        let looking_down = OrbitCamera { pitch: 1.45, ..OrbitCamera::default() };
+        let settings = BrushSettings { backface_culling: false, ..settings };
+        let (cpu, actual) = world_brush_coverage(&mut gpu, mesh, settings, Some(looking_down), &[copy]);
+        assert_coverage_matches(&cpu, &actual, "source behind its surface");
+        assert!(actual.get(64, 64)[0] > 0, "the copy paints the visible texel");
     }
 
     #[test]

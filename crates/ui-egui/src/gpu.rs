@@ -2764,42 +2764,57 @@ pub(crate) mod tests {
         }
     }
 
-    /// A 2D view stroke with symmetry runs on the GPU brush: its mirrored copy shows live where
-    /// the release commits it
+    /// A stroke with symmetry runs on the GPU brush in the 2D and the 3D view: its mirrored copy
+    /// shows live where the release commits it
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn a_symmetric_2d_view_stroke_previews_its_copies_on_the_gpu() {
+    fn symmetric_strokes_preview_their_copies_on_the_gpu() {
+        const SIZE: u32 = 128;
         let Ok(gpu) = Headless::new() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
-        let mut s = Session::new_project("GPU symmetry", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
-        let layer = s.selected_layer().unwrap();
-        execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.1, 0.7, 0.2]})).unwrap();
-        execute(&mut s, "tool.brush", &json!({"size": 20, "symmetryOn": true, "symmetryX": true})).unwrap();
-        let mut link = link();
-        link.gpu_composite_enabled = true;
-        link.brush_device = Some(brush.clone());
-        let display = |link: &mut GpuLink, s: &mut Session| -> [[u8; 4]; 2] {
-            let scene = link.sync(s, None, None, 0, 0.0);
-            let gpu = &mut *brush.0.lock().unwrap();
-            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
-            assert!(errors.is_empty(), "{errors:?}");
-            let texture = gpu.renderer.display_textures()[0][0];
-            [32, 96].map(|x| read_pixel(gpu, texture, x, 64))
-        };
-        let neutral = display(&mut link, &mut s);
+        for in_3d in [false, true] {
+            let mut s = Session::new_project("GPU symmetry", primitives::plane(1.0, 1), "builtin:plane", None, SIZE).unwrap();
+            s.camera.set_angles(0.0, 1.45);
+            s.camera.ortho = true;
+            s.camera.distance = 1.8;
+            s.viewport = Vec2::splat(400.0);
+            let layer = s.selected_layer().unwrap();
+            execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.1, 0.7, 0.2]})).unwrap();
+            execute(&mut s, "tool.brush", &json!({"size": 20, "symmetryOn": true, "symmetryX": true})).unwrap();
+            let screen = Vec2::new(144.0, 200.0);
+            let uv = if in_3d { s.pick(screen, s.viewport).unwrap().uv } else { Vec2::new(0.25, 0.5) };
+            let texels = [uv, Vec2::new(1.0 - uv.x, uv.y)].map(|uv| (uv * SIZE as f32).as_uvec2().min(texturecraft_engine::geom::glam::UVec2::splat(SIZE - 1)));
+            let mut link = link();
+            link.gpu_composite_enabled = true;
+            link.brush_device = Some(brush.clone());
+            let display = |link: &mut GpuLink, s: &mut Session| -> [[u8; 4]; 2] {
+                let scene = link.sync(s, None, None, 0, 0.0);
+                let gpu = &mut *brush.0.lock().unwrap();
+                let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+                assert!(errors.is_empty(), "{errors:?}");
+                let texture = gpu.renderer.display_textures()[0][0];
+                texels.map(|texel| read_pixel(gpu, texture, texel.x, texel.y))
+            };
+            let neutral = display(&mut link, &mut s);
 
-        s.brush_device = link.brush_device(&s);
-        s.begin_stroke_uv(Vec2::new(0.25, 0.5), 1.0).unwrap();
-        assert!(s.device_stroke().is_some(), "the symmetric stroke runs on the device");
-        let live = display(&mut link, &mut s);
-        s.end_stroke().unwrap();
-        let committed = display(&mut link, &mut s);
+            s.brush_device = link.brush_device(&s);
+            if in_3d {
+                assert!(s.begin_stroke(screen, s.viewport, 1.0).unwrap());
+            } else {
+                s.begin_stroke_uv(uv, 1.0).unwrap();
+            }
+            assert!(s.device_stroke().is_some(), "3D {in_3d}: the symmetric stroke runs on the device");
+            let live = display(&mut link, &mut s);
+            s.end_stroke().unwrap();
+            let committed = display(&mut link, &mut s);
 
-        let pixels = s.doc.pixels.layer(layer, Channel::BaseColor).unwrap();
-        assert!([32, 96].iter().all(|&x| pixels.get(x, 64).last().is_some_and(|&coverage| coverage > 0)), "the commit paints the stroke and its copy");
-        assert!(live.iter().zip(neutral).all(|(live, neutral)| *live != neutral), "both the stroke and its copy show live: {live:?}");
-        let close = |a: &[u8; 4], b: &[u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(*b) <= 1);
-        assert!(live.iter().zip(&committed).all(|(a, b)| close(a, b)), "live {live:?}, committed {committed:?}");
+            let pixels = s.doc.pixels.layer(layer, Channel::BaseColor).unwrap();
+            let painted = texels.iter().all(|texel| pixels.get(texel.x, texel.y).last().is_some_and(|&coverage| coverage > 0));
+            assert!(painted, "3D {in_3d}: the commit paints the stroke and its copy");
+            assert!(live.iter().zip(neutral).all(|(live, neutral)| *live != neutral), "3D {in_3d}: both the stroke and its copy show live: {live:?}");
+            let close = |a: &[u8; 4], b: &[u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(*b) <= 1);
+            assert!(live.iter().zip(&committed).all(|(a, b)| close(a, b)), "3D {in_3d}: live {live:?}, committed {committed:?}");
+        }
     }
 
     /// One device stroke feeds every texture set of its size drawing the painted layer: an
