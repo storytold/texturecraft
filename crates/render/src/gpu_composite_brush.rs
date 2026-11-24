@@ -1,20 +1,13 @@
 //! P7, brush and live stroke (plan section 2.6), the compositor side. Owned by the P7 agent; no
 //! other package edits this file or `shaders/composite_brush.wgsl`.
 //!
-//! What P7 implements: the Eraser on layers and masks, mask strokes painting a mask image, the
-//! pickup tools (Smudge, Clone, Paint with a material pattern; first step: let the GPU compositor
-//! preview them from `display_stroke_pixels`), symmetry, brush alpha images and library tips, the
-//! Projection tool in the UV view and without a stencil, Polygon Fill and Path, and one device
-//! stroke feeding several texture sets of the same size. Ask the user first whether the Eraser
-//! and UV-view Projection ports count as the off-limits physical functions (plan section 4.5).
-//!
-//! Known bug to fix first (verified in the code, plan "suspected silent mismatch"): with a mask
-//! image loaded in the tool, a Paint stroke on a layer starts the GPU brush (`image_mask` in
-//! crates/engine/src/painting.rs only covers mask targets), but `Session::device_stroke` returns
-//! None for any `MaskGray::Image` and `display_stroke_pixels` returns None while a device exists,
-//! so `SetCompositor::plan` (crates/ui-egui/src/gpu.rs) composites without the live stroke: it is
-//! invisible until release. Resolve the gray per target, or return the device stroke for layer
-//! targets, and test it.
+//! On the GPU brush: Paint, the Eraser on layers and masks (the ordinary eraser, flagged with
+//! `BRUSH_ERASE`), the Projection tool in both views, symmetry copies in both views, and one
+//! device stroke feeding every texture set of its size that draws the layer. Pickup strokes
+//! (Smudge, Clone, Paint with a material pattern) rasterise on the CPU and composite live on the
+//! GPU from `display_stroke_pixels`. Still on the CPU: mask strokes painting a mask image (the
+//! live gray needs the texel in `live_brush_paint`), and strokes with a brush alpha image or a
+//! library tip.
 //!
 //! P7 also owns `gpu_brush.rs`, `shaders/brush.wgsl`, crates/engine/src/painting.rs,
 //! crates/engine/src/brush_device.rs, `LiveBrush` and `content_paint` in gpu_composite.rs, and
