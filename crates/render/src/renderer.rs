@@ -1620,6 +1620,12 @@ impl Renderer {
         }
     }
 
+    /// Bytes of the GPU compositor's last update: its working buffer and its paint upload buffer.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn composite_update_bytes(&self) -> [u64; 2] {
+        self.compositor.as_ref().map_or([0; 2], |compositor| compositor.update_bytes())
+    }
+
     /// Composite a supported layer stack or standalone mask into the viewport's textures.
     /// Scratch holds one band. The final maps stay on the adapter for shading and mip generation.
     pub fn composite_on_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<(), String> {

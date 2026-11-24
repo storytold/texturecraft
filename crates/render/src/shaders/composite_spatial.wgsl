@@ -1,8 +1,22 @@
 // Each scratch texel holds four float components followed by UV coverage, and a sixth word (the
-// stage's input, FilterStage::input in Rust) when params.field_layout.y is set.
+// stage's input, FilterStage::input in Rust) when params.field_layout.y is set, or three words
+// (the input's colour) when the stride is eight.
+// A whole-set pre-pass keeps only its own stages and the working fields (whole_compact): a slot
+// outside them has no field there (u32 max).
 fn field_word(slot: u32, local: vec2<u32>) -> u32 {
     let size = params.filter_region.zw;
-    return params.filter_stage.x + (slot * size.x * size.y + local.y * size.x + local.x) * params.field_layout.x;
+    var compact = slot;
+    let table = params.whole_compact;
+    if table.w != 0u {
+        if slot >= table.z {
+            compact = table.y + slot - table.z;
+        } else if slot >= table.x && slot - table.x < table.y {
+            compact = slot - table.x;
+        } else {
+            return 0xffffffffu;
+        }
+    }
+    return params.filter_stage.x + (compact * size.x * size.y + local.y * size.x + local.x) * params.field_layout.x;
 }
 
 // The fields' origin in source texels. It lies below zero when the program has a wrapping
@@ -85,6 +99,11 @@ fn previous_field(start: u32, count: u32) -> u32 {
     return 0u;
 }
 
+// Bits of the prepare pass's params.field_layout.w besides bit 0 (the stage wraps): how it reads
+// its input (FilterStage::input_kind in Rust)
+const INPUT_LAYER: u32 = 2u;
+const INPUT_COLOR: u32 = 4u;
+
 @compute @workgroup_size(8, 8)
 fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy >= params.filter_chunk.zw) {
@@ -104,7 +123,7 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     var prepared = vec4(0.0);
     var geometric_weight = 0.0;
-    var stage_input = 0.0;
+    var stage_input = vec3(0.0);
     if covered && params.coverage.x != 0u {
         covered = uv_texel_covered(pixel);
     }
@@ -142,7 +161,16 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
             prepared = vec4(content.rgb * content.a, content.a);
         }
         if params.field_layout.z != 0u {
-            stage_input = stage_input_value(layers[params.field_layout.z - 1u], texel);
+            let source = layers[params.field_layout.z - 1u];
+            if (params.field_layout.w & INPUT_LAYER) != 0u {
+                // A layer operation's content times its coverage (Height To Normal's own Height)
+                let content = layer_content(source, texel, source.effects.w);
+                stage_input = vec3(content.x * content.a);
+            } else if (params.field_layout.w & INPUT_COLOR) != 0u {
+                stage_input = base_content(source, texel).rgb;
+            } else {
+                stage_input = vec3(stage_input_value(source, texel));
+            }
         }
         geometric_weight = 1.0;
     }
@@ -154,6 +182,10 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     output[start + 3u] = words.w;
     output[start + 4u] = bitcast<u32>(geometric_weight);
     if params.field_layout.y != 0u {
-        output[start + 5u] = bitcast<u32>(stage_input);
+        output[start + 5u] = bitcast<u32>(stage_input.x);
+        if params.field_layout.x >= 8u {
+            output[start + 6u] = bitcast<u32>(stage_input.y);
+            output[start + 7u] = bitcast<u32>(stage_input.z);
+        }
     }
 }

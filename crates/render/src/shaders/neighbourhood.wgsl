@@ -10,7 +10,8 @@ struct Params {
     // the GPU port packages (NeighbourhoodFilter::words).
     field_layout: vec4<u32>,
     extra: array<vec4<f32>, 2>, // The packages' parameters (NeighbourhoodFilter::extra).
-    // What the stage filters (stage_context), whether it wraps (bit 0), reserved.
+    // What the stage filters (stage_context), whether it wraps (bit 0), the first row of an apply
+    // dispatch split by rows (NeighbourhoodGpu::run), reserved.
     stage: vec4<u32>,
     // The set in field-local texels [x0, y0, x1, y1] (NeighbourhoodRegion::bounds). In a wrapping
     // program the field holds periodic copies past the set's edges; a stage that does not wrap
@@ -39,6 +40,20 @@ fn word_at(offset: u32, position: vec2<u32>) -> u32 {
 fn input_at(position: vec2<u32>) -> f32 {
     if params.field_layout.y == 0u { return 0.0; }
     return bitcast<f32>(fields[word_at(params.buffers.x, position) + 5u]);
+}
+
+// Whether this stage has an input of its own (a linked image input or the layer's Height), not
+// only the program's input word (NeighbourhoodRegion::input bit 1).
+fn stage_linked() -> bool {
+    return (params.field_layout.y & 2u) != 0u;
+}
+
+// The input's colour at an original-field texel: words 5..8 when the fields carry colour
+// (NeighbourhoodRegion::input bit 2, ProceduralInputs::register_color_input), else its gray.
+fn input_color_at(position: vec2<u32>) -> vec3<f32> {
+    if (params.field_layout.y & 4u) == 0u { return vec3(input_at(position)); }
+    let i = word_at(params.buffers.x, position);
+    return bitcast<vec3<f32>>(vec3(fields[i + 5u], fields[i + 6u], fields[i + 7u]));
 }
 
 // What the stage filters (NeighbourhoodFilter::context): a mask, or content by channel kind.
@@ -252,6 +267,10 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
     let n = i32(clamp(params.mode.x, 1u, 24u));
     let step = radius / f32(n);
     let seed = params.mode.z;
+    // The texel's home in the set: in a wrapping program a periodic copy past the set's edges
+    // takes its noise and cells there, as the CPU's wrapped read of the lower stage does
+    let shift = vec2<f32>(copy_of(vec2<i32>(point) - field_origin()) * (params.bounds.zw - params.bounds.xy));
+    let home = point - shift;
     var acc = EMPTY;
     switch params.mode.y {
         case 5u: {
@@ -260,11 +279,11 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
             }
         }
         case 6u: {
-            let offset = vec2(warp_offset(point, seed, radius), warp_offset(point, seed ^ 0x5bd1e995u, radius));
+            let offset = vec2(warp_offset(home, seed, radius), warp_offset(home, seed ^ 0x5bd1e995u, radius));
             acc = sample_field(acc, point + offset);
         }
         case 7u: {
-            acc = sample_field(acc, point + params.direction.xy * warp_offset(point, seed, radius));
+            acc = sample_field(acc, point + params.direction.xy * warp_offset(home, seed, radius));
         }
         case 8u: {
             let left = normalized_or(sample_field(EMPTY, point - vec2(radius, 0.0)), original);
@@ -278,16 +297,21 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
         }
         case 9u: {
             let d = vec2(
-                height_noise(point, vec2(-0.01, 0.0), seed) - height_noise(point, vec2(0.01, 0.0), seed),
-                height_noise(point, vec2(0.0, -0.01), seed) - height_noise(point, vec2(0.0, 0.01), seed),
+                height_noise(home, vec2(-0.01, 0.0), seed) - height_noise(home, vec2(0.01, 0.0), seed),
+                height_noise(home, vec2(0.0, -0.01), seed) - height_noise(home, vec2(0.0, 0.01), seed),
             );
             let direction = d / max(length(d), 1e-20);
             for (var i = 0; i <= n; i++) {
                 acc = sample_field(acc, point + direction * (f32(i) * step));
             }
         }
+        // Test probe (INPUT_PROBE in Rust): the stage's input colour at the texel
+        case 15u: {
+            let local = vec2<u32>(vec2<i32>(point) - field_origin());
+            return vec4(input_color_at(local) * original.a, original.a);
+        }
         case 10u: {
-            let center = (floor(point / radius) + 0.5) * radius - 0.5;
+            let center = (floor(home / radius) + 0.5) * radius - 0.5 + shift;
             acc = sample_field(acc, center);
         }
         default: {
@@ -302,7 +326,8 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
 
 @compute @workgroup_size(8, 8)
 fn apply_neighbourhood(@builtin(global_invocation_id) id: vec3<u32>) {
-    let point = id.xy;
+    // A dispatch split by rows (NeighbourhoodGpu::run under a work budget) starts at row stage.z
+    let point = vec2(id.x, id.y + params.stage.z);
     if any(point >= params.rect.zw) { return; }
     let original = original_at(point);
     var filtered = original.value;

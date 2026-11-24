@@ -34,7 +34,8 @@ struct Params {
     // The high bit of the last word selects the mask stack.
     filter_stage: vec4<u32>,
     filter_chunk: vec4<u32>,
-    // Original ID bake dimensions, both zero when absent.
+    // Original ID bake dimensions, both zero when absent; bake rows per block (0: one block, the
+    // whole texture) and the second block's presence bits (bake_has).
     id_bake: vec4<u32>,
     // Channel, start of anchor owner's draws, content cut, mask preview draw.
     anchor: vec4<u32>,
@@ -51,6 +52,9 @@ struct Params {
     whole_slots: vec4<u32>,
     whole_bases: vec4<u32>,
     whole_rect: vec4<u32>,
+    // In a pre-pass with compact slots (WholePass::compact in Rust): its first stage slot, its
+    // stage count, the program's first working field, and 1 when active. Zero in the bands.
+    whole_compact: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -64,6 +68,8 @@ struct SurfaceVertex {
     position: vec4<f32>,
     normal: vec4<f32>,
 }
+// Three vertices per triangle (position and U, normal and V), then their tangents (xyz and the
+// bitangent sign) two per element: GpuCompositor::uv_surface.
 @group(0) @binding(7) var<storage, read> surface_vertices: array<SurfaceVertex>;
 @group(0) @binding(8) var bake_maps: texture_2d<u32>;
 @group(0) @binding(9) var brush_alpha: texture_2d<u32>;
@@ -84,6 +90,26 @@ struct Surface {
     position: vec3<f32>,
     normal: vec3<f32>,
     valid: bool,
+    // The MikkTSpace tangent (unit xyz) and the bitangent sign in w, as the CPU g-buffer's
+    // surface_at gives them: xyz interpolated and normalised, the sign of the triangle's first vertex.
+    tangent: vec4<f32>,
+}
+
+const NO_SURFACE = Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false, vec4(1.0, 0.0, 0.0, 1.0));
+
+// The tangent of vertex `vertex` from the block after the vertices.
+fn surface_tangent(vertex: u32) -> vec4<f32> {
+    let vertices = arrayLength(&surface_vertices) * 2u / 3u;
+    let pair = surface_vertices[vertices + vertex / 2u];
+    return select(pair.position, pair.normal, (vertex & 1u) == 1u);
+}
+
+// glam's Vec3::any_orthonormal_vector: the tangent the CPU takes where the interpolated one vanishes.
+fn any_orthonormal(n: vec3<f32>) -> vec3<f32> {
+    let sign = select(1.0, -1.0, (bitcast<u32>(n.z) >> 31u) == 1u);
+    let a = -1.0 / (sign + n.z);
+    let b = n.x * n.y * a;
+    return vec3(b, sign + n.y * n.y * a, -n.y);
 }
 
 fn edge(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
@@ -94,11 +120,11 @@ fn edge(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
 
 fn surface_at(pixel: vec2<u32>) -> Surface {
     if (params.coverage.w & 1u) == 0u || any(pixel >= params.source.xy) {
-        return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false);
+        return NO_SURFACE;
     }
     let hit = textureLoad(surface_uv, vec2<i32>(pixel), 0).xy;
     if hit.x == 0xffffffffu {
-        return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false);
+        return NO_SURFACE;
     }
     let a = surface_vertices[hit.x * 3u];
     let b = surface_vertices[hit.x * 3u + 1u];
@@ -118,13 +144,40 @@ fn surface_at(pixel: vec2<u32>) -> Surface {
     let w = 1.0 - weight.x - weight.y;
     let position = a.position.xyz * w + b.position.xyz * weight.x + c.position.xyz * weight.y;
     let normal = a.normal.xyz * w + b.normal.xyz * weight.x + c.normal.xyz * weight.y;
-    return Surface(position, select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12), true);
+    let unit = select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12);
+    let ta = surface_tangent(hit.x * 3u);
+    let tangent = ta.xyz * w + surface_tangent(hit.x * 3u + 1u).xyz * weight.x + surface_tangent(hit.x * 3u + 2u).xyz * weight.y;
+    let length_squared = dot(tangent, tangent);
+    let direction = select(any_orthonormal(unit), tangent * inverseSqrt(length_squared), length_squared > 0.0 && length_squared < 3.4e38);
+    return Surface(position, unit, true, vec4(direction, select(1.0, -1.0, ta.w < 0.0)));
+}
+
+// One row block of the bake texture: the whole texture, or params.id_bake.z rows when the
+// program has the second block (BakedInputs::blocks in Rust).
+fn bake_block_size() -> vec2<u32> {
+    let size = textureDimensions(bake_maps);
+    return vec2(size.x, select(params.id_bake.z, size.y, params.id_bake.z == 0u));
 }
 
 fn bake_pixel_at(pixel: vec2<u32>) -> vec2<u32> {
-    let size = textureDimensions(bake_maps);
+    let size = bake_block_size();
     let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
     return min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
+}
+
+// The second bake row block's maps (ProceduralInputs::read_bake_rows): bits of params.id_bake.w.
+const BAKED_HEIGHT: u32 = 1u;
+const BAKED_WORLD_NORMAL: u32 = 2u;
+
+fn bake_has(maps: u32) -> bool {
+    return (params.id_bake.w & maps) == maps;
+}
+
+// Row block `block` at the texel: 0 the built-in maps (baked_at), 1 the baked Height in x and the
+// stored World Normal in yzw (f32 bits; zeros where bake_has says a map is missing).
+fn baked_block_at(pixel: vec2<u32>, block: u32) -> vec4<u32> {
+    let at = bake_pixel_at(pixel) + vec2(0u, block * bake_block_size().y);
+    return textureLoad(bake_maps, vec2<i32>(at), 0);
 }
 
 fn baked_at(pixel: vec2<u32>) -> vec4<u32> {
@@ -293,8 +346,10 @@ fn painted(layer: Operation, pixel: vec2<u32>, projected: ProjectedBrush) -> vec
             m = brush_coverage(pixel) * layer.uv.w;
         }
         if m > 0.0 && (layer.ext.z & BRUSH_OP_BITS) != 0u {
-            // P7 (composite_brush.wgsl) previews the live stroke modes it flags
-            stored = live_brush_paint(layer, stored, m, projected);
+            // P7 (composite_brush.wgsl) previews the live stroke modes it flags, at the texel's
+            // pixel and UV (a mask stroke's image value, MaskGray::at)
+            let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
+            stored = live_brush_paint(layer, stored, m, projected, pixel, uv);
         } else if m > 0.0 {
             // Match the paint commit's premultiplied over and 16-bit channel encoding.
             let value = select(layer.uv.xxx, layer.uv.xyz, layer.ids.w == 4u);

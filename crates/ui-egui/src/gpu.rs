@@ -251,6 +251,35 @@ struct SetCompositor {
     reason: &'static str,
     neutral: bool,
     logged_status: Option<(&'static str, &'static str)>,
+    /// The environment the current program lights with, when it reads it (P6's Baked Lighting
+    /// Environment): a turned or changed environment compiles the program again
+    environment: Option<LitEnvironment>,
+}
+
+/// The viewport environment a program read its diffuse light from: name, rotation bits and the
+/// identity of an imported environment image (a re-imported resource differs)
+#[derive(Debug, PartialEq)]
+struct LitEnvironment {
+    name: String,
+    rotation: u32,
+    image: usize,
+}
+
+impl LitEnvironment {
+    fn of(session: &Session) -> Self {
+        let display = &session.doc.project.display;
+        Self { name: display.environment.clone(), rotation: display.env_rotation.to_bits(), image: Self::image(session) }
+    }
+
+    fn image(session: &Session) -> usize {
+        let display = &session.doc.project.display;
+        display.environment_resource().and_then(|name| session.images.get(name)).map_or(0, |image| Arc::as_ptr(image) as usize)
+    }
+
+    fn matches(&self, session: &Session) -> bool {
+        let display = &session.doc.project.display;
+        self.name == display.environment && self.rotation == display.env_rotation.to_bits() && self.image == Self::image(session)
+    }
 }
 
 /// The project the GPU compositor compiles for the view: while a layer is soloed, the material
@@ -300,7 +329,8 @@ impl SetCompositor {
             return Err(n_("The texture set has no covered UV texels."));
         }
         let stroke_id = stroke.map(|(id, _)| id);
-        let current = self.current == Some(key);
+        // A program lit by the environment is current only while the environment stays as it was
+        let current = self.current == Some(key) && self.environment.as_ref().is_none_or(|lit| lit.matches(session));
         let unchanged_stroke = self.stroke == stroke_id;
         if current && unchanged_stroke && stroke.is_none_or(|(_, tiles)| tiles.is_empty()) {
             return Ok(None);
@@ -384,6 +414,7 @@ impl SetCompositor {
             return Err(reason);
         }
         program.set_tile_images(&session.images);
+        self.environment = program.environment().map(|_| LitEnvironment::of(session));
         self.neutral = program.is_neutral();
         if !current {
             self.failed = Arc::default();
@@ -1342,6 +1373,21 @@ pub(crate) mod tests {
             cpu_padding_pending: false,
             bake_scene: BakeSceneLink::default(),
         }
+    }
+
+    /// A program lit by the environment stops being current when the environment turns or
+    /// changes; a program that does not read it keeps no environment and stays current.
+    #[test]
+    fn a_turned_environment_makes_a_lit_program_stale() {
+        let mut s = session(false);
+        let lit = LitEnvironment::of(&s);
+        assert!(lit.matches(&s));
+        s.doc.project.display.env_rotation += 15.0;
+        assert!(!lit.matches(&s), "a turned environment");
+        let turned = LitEnvironment::of(&s);
+        s.doc.project.display.environment = "Night".into();
+        assert!(!turned.matches(&s), "another environment");
+        assert!(SetCompositor::default().environment.is_none());
     }
 
     fn session(emissive: bool) -> Session {
