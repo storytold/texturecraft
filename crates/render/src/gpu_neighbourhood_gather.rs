@@ -726,7 +726,8 @@ mod tests {
             library,
             WarpSource { blur: 0.4, tiling: 3.0, ..library },
             previous,
-            WarpSource { blur: 0.5, balance: 0.6, contrast: 0.3, ..previous },
+            // Balanced and contrasted short of saturating, where the slope's flat test is a hard decision
+            WarpSource { blur: 0.5, balance: 0.45, contrast: 0.2, ..previous },
             WarpSource { contrast: 1.0, ..previous },
             WarpSource { tiling: 2.0, ..previous },
             WarpSource { mode: WarpSourceMode::CustomNoise, ..library },
@@ -893,7 +894,12 @@ mod tests {
             ("FXAA with alpha", vec![(fxaa(true), 1.0, normal)], normal),
             ("FXAA under Multiply", vec![(fxaa(false), 0.7, normal)], BlendMode::Multiply),
             ("FXAA disabled", vec![(fxaa(true), 1.0, BlendMode::Disable)], normal),
-            ("FXAA after a blur", vec![(blur.clone(), 1.0, normal), (fxaa(true), 0.85, normal), (Filter::Invert, 1.0, normal)], normal),
+            // After a point filter: a blur below spreads every edge over the edge search's hard decisions
+            (
+                "FXAA after a filter",
+                vec![(Filter::Clamp { min: 0.15, max: 0.85 }, 1.0, normal), (fxaa(true), 0.85, normal), (Filter::Invert, 1.0, normal)],
+                normal,
+            ),
             ("FXAA before a blur", vec![(Filter::Invert, 1.0, normal), (fxaa(false), 0.85, normal), (blur, 1.0, normal)], normal),
         ];
 
