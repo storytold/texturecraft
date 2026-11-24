@@ -2883,7 +2883,7 @@ pub(crate) mod tests {
         assert!(covered > 0 && differing * 1000 <= covered, "{differing}/{covered} texels differ");
     }
 
-    /// A stroke with particles never reaches the GPU brush, the Eraser included.
+    /// An Eraser stroke with particles stays off the GPU brush; Paint with particles keeps it.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_particle_eraser_stroke_stays_off_the_gpu_brush() {
@@ -2896,14 +2896,18 @@ pub(crate) mod tests {
         link.gpu_composite_enabled = true;
         link.brush_device = Some(brush.clone());
         link.sync(&mut s, None, None, 0, 0.0);
-        execute(&mut s, "tool.eraser", &json!({})).unwrap();
         execute(&mut s, "tool.brush", &json!({"particles": {"enabled": true}})).unwrap();
 
         s.brush_device = link.brush_device(&s);
         assert!(s.brush_device.is_some(), "the material composites on the GPU");
         s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+        assert!(s.device_stroke().is_some(), "Paint with particles keeps the GPU brush");
+        s.cancel_stroke();
+        execute(&mut s, "tool.eraser", &json!({})).unwrap();
+        s.brush_device = link.brush_device(&s);
+        s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
 
-        assert!(s.device_stroke().is_none(), "a particle stroke rasterises on the CPU");
+        assert!(s.device_stroke().is_none(), "an Eraser with particles rasterises on the CPU");
         s.end_stroke().unwrap();
     }
 

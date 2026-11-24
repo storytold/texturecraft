@@ -343,10 +343,10 @@ impl Session {
         let gpu_tool = matches!(tool, Tool::Paint | Tool::Projection | Tool::Path) || erase;
         // Resolved once: staging, both previews and the commit paint this gray
         let mask_gray = self.mask_gray();
-        // Symmetry copies reach the device with the stamps (a 3D copy carries its source for visibility); particle strokes stay on the CPU
+        // Symmetry copies reach the device with the stamps (a 3D copy carries its source for visibility); an Eraser with particles stays on the CPU
         let device = if gpu_tool
             && canvas.pickup.is_none()
-            && !settings.particles.enabled
+            && !(erase && settings.particles.enabled)
             && settings.alpha_image.is_none()
             && settings.alpha_library.is_none()
             && let Some(backend) = &self.brush_device
