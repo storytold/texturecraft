@@ -198,8 +198,7 @@ pub(super) struct ShaderFlags {
     projection: bool,
     point: bool,
     stack: bool,
-    /// P6's lighting kinds (`lighting::KIND_*` bits): each compiles in full only when used
-    lighting: u8,
+    lighting: bool,
     brush: bool,
     udim: bool,
 }
@@ -210,26 +209,23 @@ impl ShaderFlags {
             projection: fill_projection::uses_shader(program),
             point: point::uses_shader(program),
             stack: stack::uses_shader(program),
-            lighting: lighting::shader_kinds(program),
+            lighting: lighting::uses_shader(program),
             brush: brush::uses_shader(program),
             udim: udim::uses_shader(program),
         }
     }
 
     #[cfg(all(test, not(target_arch = "wasm32")))]
-    pub(super) const ALL: Self = Self { projection: true, point: true, stack: true, lighting: lighting::KINDS_ALL, brush: true, udim: true };
+    pub(super) const ALL: Self = Self { projection: true, point: true, stack: true, lighting: true, brush: true, udim: true };
     #[cfg(all(test, not(target_arch = "wasm32")))]
-    const NONE: Self = Self { projection: false, point: false, stack: false, lighting: 0, brush: false, udim: false };
-    /// Each package's file in full, the others as stubs (P6: each lighting kind alone and all).
+    const NONE: Self = Self { projection: false, point: false, stack: false, lighting: false, brush: false, udim: false };
+    /// Each package's file in full, the others as stubs.
     #[cfg(all(test, not(target_arch = "wasm32")))]
-    pub(super) const EACH: [Self; 9] = [
+    pub(super) const EACH: [Self; 6] = [
         Self { projection: true, ..Self::NONE },
         Self { point: true, ..Self::NONE },
         Self { stack: true, ..Self::NONE },
-        Self { lighting: lighting::KIND_STYLIZED, ..Self::NONE },
-        Self { lighting: lighting::KIND_ENVIRONMENT, ..Self::NONE },
-        Self { lighting: lighting::KIND_VALIDATE, ..Self::NONE },
-        Self { lighting: lighting::KINDS_ALL, ..Self::NONE },
+        Self { lighting: true, ..Self::NONE },
         Self { brush: true, ..Self::NONE },
         Self { udim: true, ..Self::NONE },
     ];
@@ -244,7 +240,7 @@ pub(super) fn shader_sources(flags: ShaderFlags) -> [&'static str; 7] {
         pick(flags.projection, fill_projection::WGSL, fill_projection::WGSL_STUB),
         pick(flags.point, point::WGSL, point::WGSL_STUB),
         pick(flags.stack, stack::WGSL, stack::WGSL_STUB),
-        lighting::source(flags.lighting),
+        pick(flags.lighting, lighting::WGSL, lighting::WGSL_STUB),
         pick(flags.brush, brush::WGSL, brush::WGSL_STUB),
         pick(flags.udim, udim::WGSL, udim::WGSL_STUB),
     ]

@@ -19,10 +19,10 @@
 //!   touching `op`. Stylized keeps 39 words in the side table (`inputs.pack_params`, offset in
 //!   `op.ext[0]`), Environment its late-bound light and 7 settings; the relief is the first
 //!   parameter (`op.low.x`) and the flags are in `op.ids[2]`.
-//! - The WGSL files: the dispatcher (`lighting_content_effect`, which reads the material and the
-//!   lit normal once) and one file per kind, each compiled in full only when a program uses that
-//!   kind ([`shader_kinds`], `ShaderFlags::lighting`; [`source`]). The layer's other channels
-//!   come from stack reads of its material (`spatial[3]` and `spatial[2]`, `effects[1] = 1`).
+//! - The WGSL file: the dispatcher (`lighting_content_effect`, which reads the material and the
+//!   lit normal once), the lit normal and one section per kind, compiled in full for any program
+//!   with a lighting operation ([`uses_shader`]). The layer's other channels come from stack
+//!   reads of its material (`spatial[3]` and `spatial[2]`, `effects[1] = 1`).
 //! - [`needs_surface`] keeps the surface inputs bound for P6 operations.
 //! - [`order_layer_operations`] may move any operation of the layer; the caller then finds the
 //!   Height operation again for the height mask (`height_op`) and writes the constraints.
@@ -40,25 +40,9 @@ use super::{CompositeProgram, Operation, ProceduralInputs, channel_slot};
 /// Library filter ids P6 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
-/// The dispatcher and helpers; each kind's file (or its stub) follows it ([`source`])
-const WGSL: &str = include_str!("shaders/composite_lighting.wgsl");
-/// The lit normal, for Stylized and Environment
-const NORMAL_WGSL: &str = include_str!("shaders/composite_lighting_normal.wgsl");
-const NORMAL_STUB: &str = "fn lighting_normal(effect: Operation, texel: LayerTexel) -> vec3<f32> { return texel.surface.normal; }\n";
-const STYLIZED_WGSL: &str = include_str!("shaders/composite_lighting_stylized.wgsl");
-const STYLIZED_STUB: &str = "fn lighting_stylized(effect: Operation, albedo: vec3<f32>, normal: vec3<f32>, baked: vec2<f32>, first: vec3<f32>, second: vec3<f32>) -> vec3<f32> { return albedo; }\n";
-const ENVIRONMENT_WGSL: &str = include_str!("shaders/composite_lighting_environment.wgsl");
-const ENVIRONMENT_STUB: &str =
-    "fn lighting_environment(effect: Operation, albedo: vec3<f32>, normal: vec3<f32>, ao: f32, metal_read: f32) -> vec3<f32> { return albedo; }\n";
-const VALIDATE_WGSL: &str = include_str!("shaders/composite_lighting_validate.wgsl");
-const VALIDATE_STUB: &str = "fn lighting_pbr_validate(effect: Operation, color: vec3<f32>, metal: f32) -> vec3<f32> { return color; }\n";
-/// The lighting kinds a program compiles ([`shader_kinds`], `ShaderFlags::lighting`)
-pub(super) const KIND_STYLIZED: u8 = 1;
-pub(super) const KIND_ENVIRONMENT: u8 = 2;
-pub(super) const KIND_VALIDATE: u8 = 4;
-pub(super) const KINDS_ALL: u8 = KIND_STYLIZED | KIND_ENVIRONMENT | KIND_VALIDATE;
+pub(super) const WGSL: &str = include_str!("shaders/composite_lighting.wgsl");
 /// The same functions without P6's code, for programs that do not use it.
-const WGSL_STUB: &str = "fn lighting_scalar_filter(op: Operation, x: f32) -> f32 { return x; }
+pub(super) const WGSL_STUB: &str = "fn lighting_scalar_filter(op: Operation, x: f32) -> f32 { return x; }
 fn lighting_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> { return c; }
 fn lighting_content_effect(effect: Operation, content: vec4<f32>, channel: u32, texel: LayerTexel) -> vec4<f32> {
     let filtered = lighting_effect_color(effect, content.rgb, channel, texel.surface, texel.baked.x);
@@ -205,43 +189,9 @@ pub(super) fn order_layer_operations(operations: &mut [Operation]) {
     }
 }
 
-/// The lighting kinds a program's operations use ([`KIND_STYLIZED`], …): only those compile in full.
-pub(super) fn shader_kinds(program: &CompositeProgram) -> u8 {
-    program.operations.iter().fold(0, |kinds, op| {
-        kinds
-            | match op.ids[1] {
-                STYLIZED_OPCODE => KIND_STYLIZED,
-                ENVIRONMENT_OPCODE => KIND_ENVIRONMENT,
-                PBR_VALIDATE_OPCODE => KIND_VALIDATE,
-                _ if op.ext[2] & LIGHTING_OP_BITS != 0 => KINDS_ALL,
-                _ => 0,
-            }
-    })
-}
-
-/// The lighting WGSL of `kinds`: the stub without any, else the dispatcher with each kind's
-/// file in full or as its stub (the lit normal in full for Stylized or Environment).
-pub(super) fn source(kinds: u8) -> &'static str {
-    static SOURCES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let sources = SOURCES.get_or_init(|| {
-        (0..=KINDS_ALL)
-            .map(|kinds| {
-                if kinds == 0 {
-                    return WGSL_STUB.to_string();
-                }
-                let pick = |kind: u8, full: &str, stub: &str| if kinds & kind != 0 { full.to_string() } else { stub.to_string() };
-                [
-                    WGSL.to_string(),
-                    pick(KIND_STYLIZED | KIND_ENVIRONMENT, NORMAL_WGSL, NORMAL_STUB),
-                    pick(KIND_STYLIZED, STYLIZED_WGSL, STYLIZED_STUB),
-                    pick(KIND_ENVIRONMENT, ENVIRONMENT_WGSL, ENVIRONMENT_STUB),
-                    pick(KIND_VALIDATE, VALIDATE_WGSL, VALIDATE_STUB),
-                ]
-                .join("\n")
-            })
-            .collect()
-    });
-    sources.get(usize::from(kinds & KINDS_ALL)).map_or(WGSL_STUB, String::as_str)
+/// Whether a program needs the full `composite_lighting.wgsl`.
+pub(super) fn uses_shader(program: &CompositeProgram) -> bool {
+    program.operations.iter().any(|op| LIGHTING_OPCODES.contains(&op.ids[1]) || op.ext[2] & LIGHTING_OP_BITS != 0)
 }
 
 /// P6's vec4 of the band uniform (`params.packages[5]`).
