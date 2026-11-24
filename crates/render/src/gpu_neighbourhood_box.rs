@@ -6,8 +6,8 @@
 //! gradient), Glow (`HaloGlow`), Drop Shadow, Mask Outline, and the distance filters Bevel
 //! (`DistanceBevel`), Bevel Smooth and Directional Distance (separable distance transform with
 //! exact integer envelope arithmetic: the CPU computes the crossings in f64). The Distance Map
-//! input of Bevel Smooth and Directional Distance waits for P3's inputs: an effect with an image
-//! input still composites on the CPU (`effect_needs_cpu`).
+//! of Bevel Smooth and Directional Distance is the stage's input (the field's sixth word,
+//! `input_at`); the lowering registers it for every such stage, its default gray included.
 //!
 //! How:
 //! - [`supports`] and [`new`] take every filter the built-in stages reject (the built-in ones keep
@@ -477,7 +477,7 @@ mod tests {
     use texturecraft_core::{
         BakedMap, Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, BlendMode, Channel, ChannelKind, ContentsOffset, DirectionalDistance, Effect,
         EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground,
-        MaskOutline, OutlinePosition, Project, Source, TextureSet,
+        MaskOutline, OutlinePosition, Procedural, ProceduralKind, Project, Source, TextureSet,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::primitives;
@@ -1109,6 +1109,62 @@ mod tests {
         ];
 
         assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
+    }
+
+    /// `map` as the Distance Map of the last effect of `owner`'s content and of its mask.
+    fn set_distance_map(project: &mut Project, owner: LayerId, map: &Source) -> Option<()> {
+        let layer = project.layers.get_mut(&owner)?;
+        layer.content_effects.last_mut()?.inputs.insert("distanceMap".into(), map.clone());
+        layer.mask.as_mut()?.effects.last_mut()?.inputs.insert("distanceMap".into(), map.clone());
+        Some(())
+    }
+
+    /// Bevel Smooth and Directional Distance read their Distance Map as the CPU does, texel by
+    /// texel: a uniform gray and a procedural pattern (in the whole-set pre-pass), and a painted
+    /// layer below read through an anchor (in bands), each with a partial update.
+    #[test]
+    fn distance_maps_scale_bevel_smooth_and_directional_distance_like_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.3; 3], high: [0.9; 3], ramp: Vec::new() };
+        let smooth = Filter::BevelSmooth(BevelSmooth { distance: 0.2, ..BevelSmooth::LIBRARY });
+        let trail = Filter::DirectionalDistance(DirectionalDistance { angle: 30.0, ..DirectionalDistance::LIBRARY });
+        let normal = BlendMode::Normal;
+        // The checker's cell edges are a hard decision on both sides
+        let tolerance = Tolerance::NEIGHBOURHOOD.with_flips((SIZE * SIZE / 1000) as usize);
+        let cases = [
+            ("Bevel Smooth, uniform map", smooth.clone(), Source::Uniform([0.5; 3])),
+            ("Bevel Smooth, procedural map", smooth.clone(), checker.clone()),
+            ("Directional Distance, uniform map", trail.clone(), Source::Uniform([0.6; 3])),
+            ("Directional Distance, procedural map", trail.clone(), checker),
+        ];
+
+        for (label, filter, map) in &cases {
+            let (mut project, pixels, owner) = painted_project(&[(filter.clone(), 0.9, normal)], normal, (false, SIZE)).unwrap();
+            set_distance_map(&mut project, owner, map).unwrap();
+
+            check_project(&mut gpu, (&project, &pixels, owner), false, MIDDLE, tolerance, label);
+        }
+
+        // A painted gradient below, recorded by an anchor the map reads
+        for (label, filter) in [("Bevel Smooth, painted map", smooth), ("Directional Distance, painted map", trail)] {
+            let (mut project, mut pixels, owner) = painted_project(&[(filter, 1.0, normal)], normal, (false, SIZE)).unwrap();
+            let (donor, anchor) = (project.alloc_id(), project.alloc_id());
+            let mut layer = Layer::new(donor, "Map", LayerKind::Paint, &[Channel::BaseColor]);
+            layer.content_effects.push(Effect::new(anchor, EffectKind::Anchor));
+            project.insert_layer(0, layer, None, false).unwrap();
+            let stack = &mut project.texture_sets[0].stack;
+            stack.retain(|id| *id != donor);
+            stack.insert(0, donor);
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    let gray = to_u16(0.2 + 0.8 * x as f32 / SIZE as f32);
+                    pixels.layer_mut(donor, Channel::BaseColor, (SIZE, SIZE)).set(x, y, &[gray, gray, gray, u16::MAX]);
+                }
+            }
+            set_distance_map(&mut project, owner, &Source::Anchor { anchor, channel: Channel::BaseColor, ramp: Vec::new() }).unwrap();
+
+            check_project(&mut gpu, (&project, &pixels, owner), false, MIDDLE, Tolerance::NEIGHBOURHOOD, label);
+        }
     }
 
     /// Every texel's trail finds the same shape at the same share of the reach as the CPU's.

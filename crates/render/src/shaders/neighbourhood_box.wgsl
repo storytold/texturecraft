@@ -742,6 +742,15 @@ fn box_exact_sqrt(squared: f32) -> f32 {
     return root;
 }
 
+// The Distance Map at the texel (the stage's input word, 0..1), else what the CPU reads without one: 1 on the mesh, 0 off it
+// FilterStage::input is set for every Bevel Smooth and Directional Distance stage, so the word is this stage's whenever the fields carry it
+fn box_distance_map(point: vec2<u32>) -> f32 {
+    if params.field_layout.y != 0u {
+        return clamp(input_at(point), 0.0, 1.0);
+    }
+    return select(0.0, 1.0, original_at(point).coverage > 0.0);
+}
+
 // The edge distance (word 1) and the ramp a distance filter makes of it (word 0) into buffers.z from the envelopes in buffers.y
 // Coverage 1 everywhere, so the smoothing blurs every texel alike as the CPU's blur does; the reach in extra 1
 @compute @workgroup_size(8, 8)
@@ -760,9 +769,9 @@ fn distance_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     let edge = max(distance - BOX_EDGE_OFFSET, 0.0);
     var reach = box_extra(1u);
 
-    // Bevel Smooth's Distance Map reads 0 off the mesh, which takes its reach away there
-    if params.mode.y == BOX_BEVEL_SMOOTH && original_at(point).coverage <= 0.0 {
-        reach = 0.0;
+    // Bevel Smooth's Distance Map scales its reach texel by texel
+    if params.mode.y == BOX_BEVEL_SMOOTH {
+        reach = reach * box_distance_map(point);
     }
     var along = 1.0;
     if reach > 0.0 {
@@ -857,13 +866,20 @@ fn directional_trail(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     // DirectionalDistance::value: no shape in reach leaves black
+    // The Distance Map shortens the texel's reach: a share of the full reach is a larger share of a shorter one, none where it is black
     var trail = 0.0;
     if found >= 0 {
         var along = 0.0;
         if reach > 0.0 {
             along = f32(found) * step_length / reach;
         }
-        if along <= 1.0 {
+        let map = box_distance_map(point);
+        var in_reach = true;
+        if along > 0.0 {
+            in_reach = map > 0.0;
+            along = along / map;
+        }
+        if in_reach && along <= 1.0 {
             let fade = 1.0 - clamp(along, 0.0, 1.0);
             trail = clamp(0.5 + (fade - 0.5) / box_extra(3u), 0.0, 1.0);
         }
