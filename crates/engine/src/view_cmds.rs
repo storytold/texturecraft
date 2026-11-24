@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 use texturecraft_core::project::ENVIRONMENTS;
-use texturecraft_core::{BakedMap, Channel, EffectKind, EnvAlignment, Filter, Project, ShadowMode, ToneMapping};
+use texturecraft_core::{BakedMap, Channel, EnvAlignment, ShadowMode, ToneMapping};
 use texturecraft_geom::glam::Vec3;
 
 use crate::commands::{CommandSpec, always, bad, boolp, can_redo, can_undo, color_param, f32p, strp, u64p};
@@ -301,7 +301,7 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
     }
 
     let scatter_color = color_param("display.set", p, "scatterColor")?;
-    let (environment_before, rotation_before) = (s.doc.project.display.environment.clone(), s.doc.project.display.env_rotation);
+    let (environment_before, rotation_before_degrees) = (s.doc.project.display.environment.clone(), s.doc.project.display.env_rotation);
     let settings = &mut s.doc.project.display;
     if let Some(picked) = environment {
         settings.environment = picked;
@@ -370,30 +370,27 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
         s.camera.fov = s.doc.project.display.fov;
     }
 
-    relight_environment(s, &environment_before, rotation_before);
+    relight_environment(s, &environment_before, rotation_before_degrees);
     s.revision = s.revision.wrapping_add(1);
     Ok(serde_json::to_value(&s.doc.project.display).unwrap_or(Value::Null))
 }
 
-/// After the viewport environment changed from `environment_before` turned `rotation_before`
-/// degrees (`display.set`, the Display Settings panel, Shift+right-drag in the viewport): the
-/// layers Baked Lighting Environment lights with it composite again when it turned or changed.
-pub fn relight_environment(s: &mut Session, environment_before: &str, rotation_before: f32) {
+/// After the viewport environment changed from `environment_before` turned
+/// `rotation_before_degrees` (`display.set`, the Display Settings panel, Shift+right-drag in the
+/// viewport): the texture sets whose layers Baked Lighting Environment lights with it composite
+/// again when it turned or changed; the others keep their material.
+pub fn relight_environment(s: &mut Session, environment_before: &str, rotation_before_degrees: f32) {
     let display = &s.doc.project.display;
-    if (display.environment.as_str(), display.env_rotation) != (environment_before, rotation_before) && lit_by_environment(&s.doc.project) {
-        for cache in &mut s.caches {
+    if (display.environment.as_str(), display.env_rotation) == (environment_before, rotation_before_degrees) {
+        return;
+    }
+
+    let project = &s.doc.project;
+    for (texture_set_index, cache) in s.caches.iter_mut().enumerate() {
+        if texturecraft_compose::eval::lit_by_environment(project, texture_set_index) {
             cache.invalidate_all();
         }
     }
-}
-
-/// Whether a layer's content has a Baked Lighting Environment
-fn lit_by_environment(project: &Project) -> bool {
-    project
-        .layers
-        .values()
-        .flat_map(|layer| layer.content_effects.iter())
-        .any(|effect| matches!(effect.kind, EffectKind::Filter(Filter::EnvironmentLighting { .. })))
 }
 
 #[cfg(test)]

@@ -377,7 +377,9 @@ mod tests {
         display.env_rotation += 40.0;
         apply_display(app, display);
 
-        let after = revisions(app);
-        assert!(!before.is_empty() && before.iter().zip(&after).all(|(before, after)| before != after), "{before:?} {after:?}");
+        // Only the set holding the lit layer composites again
+        let (after, lit) = (revisions(app), app.session.ts());
+        let changed: Vec<usize> = before.iter().zip(&after).enumerate().filter(|(_, (before, after))| before != after).map(|(set, _)| set).collect();
+        assert_eq!(changed, [lit], "{before:?} {after:?}");
     }
 }

@@ -2541,10 +2541,10 @@ fn eyedrop(app: &mut TextureCraftApp, ctx: &egui::Context, bar: egui::Id, pixel:
 /// Environment lights with it composite again, as `display.set` does
 fn turn_environment(session: &mut Session, degrees: f32) {
     let display = &mut session.doc.project.display;
-    let rotation_before = display.env_rotation;
-    display.env_rotation = (rotation_before + degrees).rem_euclid(360.0);
+    let rotation_before_degrees = display.env_rotation;
+    display.env_rotation = (rotation_before_degrees + degrees).rem_euclid(360.0);
     let environment = display.environment.clone();
-    texturecraft_engine::view_cmds::relight_environment(session, &environment, rotation_before);
+    texturecraft_engine::view_cmds::relight_environment(session, &environment, rotation_before_degrees);
 }
 
 #[cfg(test)]
@@ -3097,7 +3097,9 @@ mod tests {
 
         turn_environment(&mut session, 25.0);
 
-        let after = revisions(&session);
-        assert!(!before.is_empty() && before.iter().zip(&after).all(|(before, after)| before != after), "{before:?} {after:?}");
+        // Only the set holding the lit layer composites again
+        let (after, lit) = (revisions(&session), session.ts());
+        let changed: Vec<usize> = before.iter().zip(&after).enumerate().filter(|(_, (before, after))| before != after).map(|(set, _)| set).collect();
+        assert_eq!(changed, [lit], "{before:?} {after:?}");
     }
 }
