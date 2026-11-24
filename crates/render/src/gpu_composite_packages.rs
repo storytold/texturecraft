@@ -95,6 +95,10 @@ pub(super) fn lower_filter(filter: &Filter, effect: &Effect, op: &mut Operation,
                 let environment = inputs.reserve_environment()?;
                 op.ext[0] = inputs.pack_words(&[6, environment, *max as u32])?;
             }
+            (_, 9) => {
+                op.ext[0] = inputs.pack_words(&[9])?;
+                inputs.pack_image("probe", crate::gpu_image_source::ImageUse::Material)?;
+            }
             (_, selector) => {
                 if selector >= 7 {
                     inputs.read_bake_rows();
@@ -131,7 +135,7 @@ thread_local! {
     /// Test seam: with probe 191, a P0h hook in place of the image input (`probe_late_hooks` in
     /// composite_packages.wgsl): 1..4 the surface tangent, 5 the second stack read (channel slots
     /// `min` and `max`), 6 environment word `max`, 7 the baked Height row, 8 the ambient
-    /// occlusion with the bake rows present.
+    /// occlusion with the bake rows present, 9 the image "probe" bilinear and clamped.
     pub(super) static PROBE_SELECTOR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -1006,6 +1010,25 @@ mod tests {
             let mut program = build(selector, 0.0, 0.0);
             inputs(&plane, &mut program, Some(maps));
             uniform(&mask_gray(&mut gpu, &program), to_gray(expected), &format!("bake rows, selector {selector}"));
+        }
+
+        // A 2 × 2 image read bilinearly without wrapping, as the CPU's BilinearSharp single image
+        let image = Arc::new(texturecraft_compose::ImageRes::new(2, 2, [51.0, 102.0, 204.0, 153.0].map(|v: f32| [v / 255.0, 0.0, 0.0, 1.0]).to_vec(), false));
+        let images = ImageStore::from([("probe".into(), image.clone())]);
+        let mut program = build(9, 0.0, 0.0);
+        let gbuf = Arc::new(UvGBuffer::new(&plane, 0, SIZE, SIZE));
+        program.set_surface_inputs(&plane, &gbuf, None).unwrap();
+        program.set_tile_images(&images);
+        let gray = mask_gray(&mut gpu, &program);
+        let sampling = texturecraft_core::Sampling {
+            filtering: texturecraft_core::Filtering::BilinearSharp,
+            wrap: texturecraft_core::UvWrap::None,
+            ..texturecraft_core::Sampling::SAVED_BEFORE
+        };
+        for (index, &actual) in gray.iter().enumerate() {
+            let (x, y) = (index as u32 % SIZE, index as u32 / SIZE);
+            let [red, ..] = image.sample_filtered((x as f32 + 0.5) / SIZE as f32, (y as f32 + 0.5) / SIZE as f32, sampling, 1.0);
+            assert!(actual.abs_diff(to_gray(red)) <= 1, "bilinear at ({x}, {y}): {actual} vs {}", to_gray(red));
         }
     }
 

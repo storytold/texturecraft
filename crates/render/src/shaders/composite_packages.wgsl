@@ -137,6 +137,25 @@ fn image_texel_nearest(image: u32, uv: vec2<f32>) -> vec4<f32> {
     return material_image_texel(image, pixel, size);
 }
 
+// An image's stored texels under `uv` blended bilinearly without wrapping: past an edge it keeps
+// the edge texels, as ImageRes::sample_filtered with BilinearSharp and UvWrap::None reads it
+// (P7: the brush mask image, MaskGray::at). `image` as for image_texel_nearest.
+fn image_texel_bilinear_clamped(image: u32, uv: vec2<f32>) -> vec4<f32> {
+    if image == 0xffffffffu {
+        return vec4(0.0);
+    }
+    let size = vec2<i32>(i32(srgb[image]), i32(srgb[image + 1u]));
+    let at = uv * vec2<f32>(size) - 0.5;
+    let corner = floor(at);
+    let t = at - corner;
+    let last = size - 1;
+    let low = clamp(vec2<i32>(corner), vec2(0), last);
+    let high = clamp(vec2<i32>(corner) + 1, vec2(0), last);
+    let top = mix(material_image_texel(image, low, size), material_image_texel(image, vec2(high.x, low.y), size), t.x);
+    let bottom = mix(material_image_texel(image, vec2(low.x, high.y), size), material_image_texel(image, high, size), t.x);
+    return mix(top, bottom, t.y);
+}
+
 // Test probes of the hooks above (opcodes 188..192, emitted only by the render crate's tests).
 const PROBE_OPCODES_START: u32 = 188u;
 fn probe_mask_effect(effect: Operation, texel: LayerTexel) -> f32 {
@@ -156,7 +175,8 @@ fn probe_mask_effect(effect: Operation, texel: LayerTexel) -> f32 {
 // Opcode 191 with a selector in its first side-table word probes the P0h hooks: 1..4 the surface
 // tangent's x, y, z and sign as 0.5 + 0.5 v, 5 the second stack read, 6 environment word
 // param_word(effect, 2u) of the block at param_word(effect, 1u), 7 the baked Height of the bake
-// rows (0.25 without one), 8 the baked ambient occlusion where baked_at reads it.
+// rows (0.25 without one), 8 the baked ambient occlusion where baked_at reads it, 9 the image
+// "probe" read bilinearly without wrapping.
 fn probe_late_hooks(effect: Operation, texel: LayerTexel) -> f32 {
     let selector = param_word(effect, 0u);
     switch selector {
@@ -164,6 +184,7 @@ fn probe_late_hooks(effect: Operation, texel: LayerTexel) -> f32 {
         case 5u: { return stack_at_second(effect, texel.pixel).x; }
         case 6u: { return bitcast<f32>(srgb[param_word(effect, 1u) + param_word(effect, 2u)]); }
         case 8u: { return bitcast<f32>(baked_at(texel.pixel).x); }
+        case 9u: { return image_texel_bilinear_clamped(param_word(effect, 1u), texel.uv).x; }
         default: {
             if !bake_has(BAKED_HEIGHT) {
                 return 0.25;

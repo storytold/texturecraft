@@ -343,8 +343,10 @@ fn painted(layer: Operation, pixel: vec2<u32>, projected: ProjectedBrush) -> vec
             m = brush_coverage(pixel) * layer.uv.w;
         }
         if m > 0.0 && (layer.ext.z & BRUSH_OP_BITS) != 0u {
-            // P7 (composite_brush.wgsl) previews the live stroke modes it flags
-            stored = live_brush_paint(layer, stored, m, projected);
+            // P7 (composite_brush.wgsl) previews the live stroke modes it flags, at the texel's
+            // pixel and UV (a mask stroke's image value, MaskGray::at)
+            let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
+            stored = live_brush_paint(layer, stored, m, projected, pixel, uv);
         } else if m > 0.0 {
             // Match the paint commit's premultiplied over and 16-bit channel encoding.
             let value = select(layer.uv.xxx, layer.uv.xyz, layer.ids.w == 4u);
