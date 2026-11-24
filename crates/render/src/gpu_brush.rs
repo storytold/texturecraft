@@ -913,7 +913,20 @@ mod tests {
     }
 
     fn world_brush_coverage(gpu: &mut Headless, mesh: Mesh, settings: BrushSettings, camera: Option<OrbitCamera>, dabs: &[Stamp]) -> (TileImage, TileImage) {
+        world_tip_coverage(gpu, mesh, settings, None, camera, dabs)
+    }
+
+    /// [`world_brush_coverage`] with the settings' library alpha or an image tip on both sides
+    fn world_tip_coverage(
+        gpu: &mut Headless,
+        mesh: Mesh,
+        settings: BrushSettings,
+        alpha_image: Option<Arc<ImageRes>>,
+        camera: Option<OrbitCamera>,
+        dabs: &[Stamp],
+    ) -> (TileImage, TileImage) {
         let size = 128;
+        let library = settings.library_alpha_image();
         let mesh = Arc::new(mesh);
         let bvh = Arc::new(Bvh::new(&mesh));
         let uv = Arc::new(UvGBuffer::new(&mesh, 0, size, size));
@@ -927,12 +940,12 @@ mod tests {
             eye: depth.as_ref().map_or(Vec3::ZERO, |depth| depth.eye),
             backface_culling: settings.backface_culling,
             angle_fade: settings.angle_fade,
-            shape: Shape::new(settings.alpha, None, None, settings.alpha_params),
+            shape: Shape::new(settings.alpha, alpha_image.as_deref(), library.as_deref(), settings.alpha_params),
         };
         let mut cpu = StrokeCanvas::new(size, size);
         rasterize(&mut cpu, &context, dabs);
 
-        let input = BrushInput { mesh, bvh, uv, material: 0, depth, settings, alpha_image: None, stencil: None, limit: None };
+        let input = BrushInput { mesh, bvh, uv, material: 0, depth, settings, alpha_image, stencil: None, limit: None };
         let mut stroke = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input).unwrap();
         let tiles = stroke.append_world(dabs).unwrap();
         (cpu.alpha, stroke.read_alpha(&tiles).unwrap())
@@ -1068,6 +1081,37 @@ mod tests {
         let (cpu, actual) = world_brush_coverage(&mut gpu, mesh, settings, Some(looking_down), &[copy]);
         assert_coverage_matches(&cpu, &actual, "source behind its surface");
         assert!(actual.get(64, 64)[0] > 0, "the copy paints the visible texel");
+    }
+
+    #[test]
+    fn symmetry_copies_paint_library_and_image_tips_like_the_cpu() {
+        use texturecraft_geom::glam::Mat3;
+        use texturecraft_paint::StampSource;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        let camera = OrbitCamera { pitch: 1.2, ..OrbitCamera::default() };
+        let mirror_x = StampSource { origin: Vec3::ZERO, to_source: Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0)) };
+        let stroke = Stamp {
+            center: Vec3::new(-0.25, 0.0, 0.1),
+            normal: Vec3::Y,
+            tangent: Vec3::X,
+            bitangent: Vec3::Z,
+            radius: 0.2,
+            flow: 0.8,
+            hardness: 0.7,
+            depth: 1.0,
+            seed: 3,
+            source: None,
+        };
+        let copy = Stamp { center: Vec3::new(0.25, 0.0, 0.1), tangent: Vec3::NEG_X, bitangent: Vec3::Y.cross(Vec3::NEG_X), source: Some(mirror_x), ..stroke };
+        let letter = BrushSettings { alpha_library: Some("letter_f".into()), ..Default::default() };
+        let (black, white) = ([0.0, 0.0, 0.0, 1.0], [1.0; 4]);
+        let corner = Arc::new(ImageRes::new(2, 2, vec![black, white, white, white], false));
+
+        let (cpu, actual) = world_tip_coverage(&mut gpu, primitives::plane(1.0, 4), letter, None, Some(camera), &[stroke, copy]);
+        assert_coverage_matches(&cpu, &actual, "mirrored library tip");
+        let (cpu, actual) = world_tip_coverage(&mut gpu, primitives::plane(1.0, 4), BrushSettings::default(), Some(corner), Some(camera), &[stroke, copy]);
+        assert_coverage_matches(&cpu, &actual, "mirrored image tip");
     }
 
     #[test]

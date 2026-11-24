@@ -852,3 +852,33 @@ impl StrokeReplays {
         (Self(Arc::new(journal)), ignored)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use texturecraft_geom::{glam::Vec2, primitives};
+
+    use crate::{Session, execute};
+
+    #[test]
+    fn a_mask_stroke_painting_a_mask_image_is_not_recorded() {
+        let mut session = Session::new_project("Mask image replay", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+        execute(&mut session, "mask.add.black", &json!({})).unwrap();
+        let records = |session: &mut Session| {
+            session.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+            let recorded = session.stroke.as_ref().is_some_and(|stroke| stroke.replay.is_some());
+            session.cancel_stroke();
+            recorded
+        };
+        let grays = crate::formats::gray16_png(2, 2, [0.2, 0.9, 0.5, 0.7].into_iter()).unwrap();
+        let image = session.import_resource_bytes("gray.png", grays).unwrap();
+
+        let with_value = records(&mut session);
+        execute(&mut session, "tool.material", &json!({"maskImage": image})).unwrap();
+        let with_image = records(&mut session);
+
+        assert!(with_value, "a mask stroke painting one gray is recorded");
+        assert!(!with_image, "a replay could not repaint the image's gray");
+    }
+}

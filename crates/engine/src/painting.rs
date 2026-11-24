@@ -408,8 +408,10 @@ impl Session {
         let settings = &stroke.settings;
         let image_alpha = settings.alpha_image.as_ref().and_then(|name| self.images.get(name)).cloned();
         let library_alpha = if image_alpha.is_none() { settings.library_alpha_image() } else { None };
+
         // Resolved once: staging, both previews and the commit paint this gray
         let mask_gray = self.mask_gray();
+
         // A replay repaints one recorded gray, so a mask stroke painting a mask image is not recorded
         let can_record = matches!(tool, Tool::Paint | Tool::Eraser)
             && stencil.is_none()
@@ -910,6 +912,7 @@ impl Session {
             commit(&stroke.canvas.dirty, None);
         }
         let fed_before = self.fed_revisions(&stroke);
+
         // A layer stroke paints channel values, and a mask stroke painting an image is never recorded
         let mask_value = match &stroke.mask_gray {
             MaskGray::Value(value) => value.clamp(0.0, 1.0),
