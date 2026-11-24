@@ -10,12 +10,19 @@ pub struct Headless {
 }
 
 impl Headless {
-    /// Create a device on the default adapter. Errors when no GPU (or software) adapter exists.
+    /// Create a device on the default adapter with every limit it reports. Errors when no GPU
+    /// (or software) adapter exists.
     pub fn new() -> Result<Headless, String> {
+        Self::with_limits(crate::device_limits)
+    }
+
+    /// [`Headless::new`] with the limits `limits` picks for the adapter (a test of a smaller GPU).
+    pub fn with_limits(limits: impl FnOnce(&wgpu::Adapter) -> wgpu::Limits) -> Result<Headless, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).map_err(|e| format!("no GPU adapter: {e}"))?;
         let adapter_name = adapter.get_info().name;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).map_err(|e| format!("no GPU device: {e}"))?;
+        let descriptor = wgpu::DeviceDescriptor { required_limits: limits(&adapter), ..Default::default() };
+        let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).map_err(|e| format!("no GPU device: {e}"))?;
         let renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
         Ok(Headless { device, queue, renderer, adapter_name })
     }
@@ -26,6 +33,20 @@ impl Headless {
         self.renderer.prepare(&self.device, &self.queue, &mut enc, frame);
         self.queue.submit([enc.finish()]);
         self.renderer.read_view(&self.device, &self.queue, frame.view_id)
+    }
+}
+
+#[cfg(test)]
+mod limits_tests {
+    /// The device gets every limit the adapter reports (`device_limits`), so the compositor
+    /// plans against the adapter's full range.
+    #[test]
+    fn the_device_gets_the_adapters_limits() {
+        let Some(gpu) = crate::gpu_composite::oracle::headless() else { return };
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
+        assert_eq!(adapter.get_info().name, gpu.adapter_name);
+        assert_eq!(gpu.device.limits(), adapter.limits());
     }
 }
 

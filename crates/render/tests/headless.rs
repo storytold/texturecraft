@@ -48,7 +48,11 @@ const MESH_ID: u64 = 1;
 
 /// A headless renderer with the material ball framed in a 480×360 view (None without a GPU).
 fn setup() -> Option<(Headless, Frame)> {
-    let Ok(mut h) = Headless::new() else {
+    setup_with(Headless::new())
+}
+
+fn setup_with(headless: Result<Headless, String>) -> Option<(Headless, Frame)> {
+    let Ok(mut h) = headless else {
         eprintln!("skipping: no GPU adapter");
         return None;
     };
@@ -595,7 +599,8 @@ fn bake_visualization_draws_the_high_poly_and_the_cage() {
 
 #[test]
 fn oversized_bake_high_poly_leaves_the_view_renderable() {
-    let Some((mut headless, frame)) = setup() else { return };
+    // The WebGPU default buffer limit (256 MiB) keeps the oversized mesh small enough to build
+    let Some((mut headless, frame)) = setup_with(Headless::with_limits(|_| texturecraft_render::wgpu::Limits::default())) else { return };
 
     let high = primitives::sphere(0.5, 16, 8);
     headless.renderer.set_bake_high(&headless.device, &headless.queue, Some(&high), 1).unwrap();
