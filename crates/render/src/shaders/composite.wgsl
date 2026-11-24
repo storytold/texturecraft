@@ -161,7 +161,8 @@ fn bake_block_size() -> vec2<u32> {
 
 fn bake_pixel_at(pixel: vec2<u32>) -> vec2<u32> {
     let size = bake_block_size();
-    let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
+    // P8: a UV tile smaller than its atlas block reads its own share of the bake (BlockScales::bake_uv)
+    let uv = udim_bake_uv((vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy)).xy;
     return min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
 }
 
@@ -176,12 +177,20 @@ fn bake_has(maps: u32) -> bool {
 // Row block `block` at the texel: 0 the built-in maps (baked_at), 1 the baked Height in x and the
 // stored World Normal in yzw (f32 bits; zeros where bake_has says a map is missing).
 fn baked_block_at(pixel: vec2<u32>, block: u32) -> vec4<u32> {
+    // P8: no bake where a smaller UV tile leaves its block empty, and maps of different heights
+    // in rows of their own (params.packages[7].y)
+    if !udim_bake_valid(pixel) {
+        return udim_absent_bake(block);
+    }
+    if params.packages[7].y != 0u {
+        return udim_separate_bake(pixel, block);
+    }
     let at = bake_pixel_at(pixel) + vec2(0u, block * bake_block_size().y);
     return textureLoad(bake_maps, vec2<i32>(at), 0);
 }
 
 fn baked_at(pixel: vec2<u32>) -> vec4<u32> {
-    return textureLoad(bake_maps, vec2<i32>(bake_pixel_at(pixel)), 0);
+    return baked_block_at(pixel, 0u);
 }
 
 fn unpack_baked_normal(packed: u32) -> vec3<f32> {
@@ -252,14 +261,17 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
 }
 
 fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    // P8: a reduced pattern's texels per repeat follow the UV tile at the texel
+    let placed = udim_placed(layer, uv);
     // P1 (composite_projection.wgsl) evaluates fills that carry projection or sampling flags
-    if layer.ext.y != 0u {
-        return projection_fill_value(layer, uv, surface);
+    if placed.ext.y != 0u {
+        return projection_fill_value(placed, uv, surface);
     }
-    if !enable_authored_images || layer.procedural.w != DECAL_PROJECTION {
-        return vec4(value(layer, uv, surface), 1.0);
+    if !enable_authored_images || placed.procedural.w != DECAL_PROJECTION {
+        // P8: the mesh's own UV on a UV tile atlas, so projections repeat per tile
+        return vec4(value(placed, udim_value_uv(placed, uv), surface), 1.0);
     }
-    return decal_fill_value(layer, uv, surface);
+    return decal_fill_value(placed, uv, surface);
 }
 
 fn stored_sample(layer: Operation, table: u32, origin: vec2<u32>, size: vec2<u32>, pixel: vec2<u32>, empty: vec4<f32>) -> vec4<f32> {
@@ -925,9 +937,9 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         output[display_index(6u, index)] = pack_srgb(lobe_colors[0], lobe_values[0]);
     }
     if writes_display(7u) {
-        // The GPU compositor uses one full-resolution UV block, so tile scale is zero.
+        // P8: the alpha holds the UV tile's scale (zero but in a smaller tile of a UV tile atlas)
         let signed_xy = quantized_color(lobe_colors[3]).xy * 2.0 - 1.0;
         let packed = vec2<u32>(clamp(128.0 + 127.0 * signed_xy, vec2(0.0), vec2(255.0)) + 0.5);
-        output[display_index(7u, index)] = packed.x | (packed.y << 8u) | ((to_u16(lobe_values[7]) >> 8u) << 16u);
+        output[display_index(7u, index)] = packed.x | (packed.y << 8u) | ((to_u16(lobe_values[7]) >> 8u) << 16u) | (udim_extra_scale(sample_pixel) << 24u);
     }
 }

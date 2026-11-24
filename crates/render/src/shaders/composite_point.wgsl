@@ -360,7 +360,8 @@ fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
         if effect.procedural.z == 0u {
             return content;
         }
-        let ramp = point_ramp(effect, fract(texel.uv.x));
+        // Across each UV tile of a UV tile atlas too (P8: the mesh's own UV)
+        let ramp = point_ramp(effect, fract(udim_mesh_uv(texel.uv).x));
         filtered = select(vec3(point_luma(ramp)), ramp, point_is_color(channel));
     } else if point_is_gradient_blurred(effect) {
         // The stage keeps the unblurred texel, so the mix and the coverage stay the original's
@@ -384,7 +385,7 @@ fn point_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 {
         if effect.procedural.z == 0u {
             return mask;
         }
-        return point_luma(point_ramp(effect, fract(texel.uv.x)));
+        return point_luma(point_ramp(effect, fract(udim_mesh_uv(texel.uv).x)));
     }
     if point_is_gradient_blurred(effect) {
         return point_gradient_gray(effect, preceding_stage_word(texel.pixel));

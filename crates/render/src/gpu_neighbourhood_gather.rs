@@ -365,7 +365,7 @@ fn source_settings(out: &mut NeighbourhoodFilter, source: &WarpSource, resolutio
 
 /// The seed word of a Warp or Blur Slope: its noise seed, or for a source repeating within the UV
 /// tile the tile's side (`resolution` texels) and its atlas block's, the same in a classic set
-/// (`WarpSourceSample::new`'s block and tile sizes).
+/// (`WarpSourceSample::new`'s block and tile sizes; P8 moves the block with [`set_block`]).
 fn source_seed(seed: u32, source: &WarpSource, resolution: u32) -> u32 {
     if !tiled_source(source) {
         return seed;
@@ -373,6 +373,21 @@ fn source_seed(seed: u32, source: &WarpSource, resolution: u32) -> u32 {
 
     let side = resolution.min(BLOCK_SIDE_MASK);
     side | (side << TILE_SIDE_SHIFT)
+}
+
+/// Put a stage built at a UV tile's resolution into an atlas block of `block` texels (P8): a
+/// Mirror, a Transform and a repeating Warp or Blur Slope source find their tile at the block's
+/// stride, as the CPU's `filter_region` passes the base block, and reach across the block.
+pub(crate) fn set_block(filter: &mut NeighbourhoodFilter, block: u32) {
+    match filter.kind {
+        MIRROR => filter.extra[MIRROR_BLOCK] = block as f32,
+        TRANSFORM => filter.extra[TRANSFORM_BLOCK] = block as f32,
+        SOURCE_WARP | SOURCE_SLOPE_BLUR if filter.words[0] & SOURCE_TILED != 0 => {
+            filter.seed = (filter.seed & !BLOCK_SIDE_MASK) | block.min(BLOCK_SIDE_MASK);
+        }
+        _ => return,
+    }
+    filter.radius = filter.radius.max(block);
 }
 
 /// A Warp stage: the move in `amount`, the directions (Warp mode: the slope's measuring span) in
@@ -429,7 +444,7 @@ fn source_slope_blur(stage: StageInputs, slope: &SourceSlopeBlur) -> Neighbourho
 
 /// A Mirror stage: the axes, the debug line's half width (a share of the tile), the tile's side
 /// and its atlas block's in `extra`, its sides in `words[0]`. The block is the tile's side but in
-/// a UV tile atlas's smaller tiles.
+/// a UV tile atlas's smaller tiles ([`set_block`]).
 fn mirror_stage(stage: StageInputs, mirror: &Mirror) -> NeighbourhoodFilter {
     let side = stage.resolution.max(1) as f32;
     let axis = |at: f32| if at.is_finite() { at.clamp(0.0, 1.0) } else { 0.5 };
