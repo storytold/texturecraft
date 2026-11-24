@@ -339,8 +339,8 @@ impl Session {
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
         let settings = &stroke.settings;
-        // A 3D view projection without a stencil was refused above; the 2D view paints without one
-        let gpu_tool = matches!(tool, Tool::Paint | Tool::Projection) || erase;
+        // A 3D view projection without a stencil was refused above; the 2D view paints without one. A path repaints its curve as a stroke
+        let gpu_tool = matches!(tool, Tool::Paint | Tool::Projection | Tool::Path) || erase;
         // Resolved once: staging, both previews and the commit paint this gray
         let mask_gray = self.mask_gray();
         // The device previews one gray; a mask image paints on the CPU, and erasing reads no gray

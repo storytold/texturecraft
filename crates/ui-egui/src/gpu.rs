@@ -2781,6 +2781,48 @@ pub(crate) mod tests {
         }
     }
 
+    /// A path repaints its curve through the GPU brush while it is edited and committed, and
+    /// paints what the CPU rasteriser paints.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_path_paints_its_curve_with_the_gpu_brush() {
+        const EIGHT_BIT_STEP: u16 = 257;
+        let Ok(gpu) = Headless::new() else { return };
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let new_session = || {
+            let mut s = Session::new_project("GPU path", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+            execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.2, 0.6, 0.9]})).unwrap();
+            execute(&mut s, "tool.brush", &json!({"size": 10})).unwrap();
+            s
+        };
+        let paint_path = |s: &mut Session| {
+            execute(s, "tool.path", &json!({"uvPoints": [[0.2, 0.5], [0.5, 0.45], [0.8, 0.5]], "commit": true})).unwrap();
+        };
+        let base_color = |s: &Session| s.doc.pixels.layers.iter().find(|((_, channel), _)| *channel == Channel::BaseColor).map(|(_, image)| image.clone()).unwrap();
+        let mut cpu = new_session();
+        paint_path(&mut cpu);
+        let mut s = new_session();
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+        link.sync(&mut s, None, None, 0, 0.0);
+        s.brush_device = link.brush_device(&s);
+
+        paint_path(&mut s);
+
+        assert!(s.log.iter().any(|entry| entry.message.starts_with("Brush: GPU")), "the path's curve runs on the device");
+        let (expected, actual) = (base_color(&cpu), base_color(&s));
+        let (mut covered, mut differing) = (0, 0);
+        for y in 0..expected.height() {
+            for x in 0..expected.width() {
+                let (expected, actual) = (expected.get(x, y), actual.get(x, y));
+                covered += usize::from(expected.last() != Some(&0) || actual.last() != Some(&0));
+                differing += usize::from(expected.iter().zip(actual.iter()).any(|(a, b)| a.abs_diff(*b) > EIGHT_BIT_STEP));
+            }
+        }
+        assert!(covered > 0 && differing * 1000 <= covered, "{differing}/{covered} texels differ");
+    }
+
     /// A stroke with particles never reaches the GPU brush, the Eraser included
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
