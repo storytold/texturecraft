@@ -3112,7 +3112,7 @@ impl GpuCompositor {
             }
             self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::new(device));
         }
-        let (pipeline, prepare) = self.pipelines.get(device, &self.pipeline_layout, program);
+        let (pipeline, prepare) = self.pipelines.get(device, &self.pipeline_layout, program).ok_or(GPU_PIPELINES_PENDING)?;
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
@@ -3681,12 +3681,33 @@ impl GpuCompositor {
         Ok(())
     }
 
+    /// Whether `program`'s pipelines are compiled; starts compiling them otherwise (on worker
+    /// threads when [`Self::set_asynchronous_compile`] is on).
+    pub(crate) fn pipelines_ready(&mut self, device: &wgpu::Device, program: &CompositeProgram) -> bool {
+        self.pipelines.get(device, &self.pipeline_layout, program).is_some()
+    }
+
+    /// Start compiling `program`'s pipelines on worker threads without compositing.
+    pub(crate) fn prewarm(&mut self, device: &wgpu::Device, program: &CompositeProgram) {
+        self.pipelines.prewarm(device, &self.pipeline_layout, program);
+    }
+
+    /// Compile new pipelines on worker threads (the app's viewport) or in place (tests, wasm).
+    pub(crate) fn set_asynchronous_compile(&mut self, asynchronous: bool) {
+        self.pipelines.asynchronous = asynchronous && !cfg!(target_arch = "wasm32");
+    }
+
     /// Bytes of the last update's working buffer and paint upload buffer.
     #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn update_bytes(&self) -> [u64; 2] {
         self.update_bytes
     }
 }
+
+/// What `Renderer::composite_on_gpu` answers while a new program's pipelines compile on worker
+/// threads: neither a failure nor a reason for the CPU; the viewport keeps its last result and
+/// asks again.
+pub const GPU_PIPELINES_PENDING: &str = "GPU pipelines are compiling.";
 
 /// The work one submission of the whole-set pre-pass's kernels may hold
 fn pre_pass_budget() -> u64 {

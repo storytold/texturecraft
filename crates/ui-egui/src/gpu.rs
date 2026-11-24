@@ -20,7 +20,7 @@ use texturecraft_engine::{
     paint::{Stamp, UvStamp},
     texel::TileImage,
 };
-use texturecraft_render::gpu_composite::{CompositeProgram, CompositeRegion};
+use texturecraft_render::gpu_composite::{CompositeProgram, CompositeRegion, GPU_PIPELINES_PENDING};
 use texturecraft_render::{BakeVisualization, CageGeometry, Frame, Renderer, wgpu};
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_render::{
@@ -76,7 +76,11 @@ pub struct SceneSync {
     pub overview: Option<(usize, texturecraft_engine::MaterialOverview)>,
     cleared_overviews: Vec<usize>,
     cpu_texture_sets: Vec<usize>,
-    composites: Vec<(usize, CompositeProgram, Arc<AtomicBool>)>,
+    /// Texture set, program, its compositor's failure flag and its pending flag (pipelines still
+    /// compiling: `SetCompositor::pending`)
+    composites: Vec<(usize, CompositeProgram, Arc<AtomicBool>, Arc<AtomicBool>)>,
+    /// Programs whose pipelines the GPU starts compiling ahead (the project's sets at load)
+    prewarm: Vec<CompositeProgram>,
     composite_work: Option<CompositeWork>,
     pub(crate) compositor_changed: bool,
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
@@ -116,11 +120,12 @@ impl SceneSync {
         self.sets.is_some()
             || self.cleared_overviews.contains(&ts)
             || self.overview.as_ref().is_some_and(|(set, _)| *set == ts)
-            || self.composites.iter().any(|(set, program, _)| *set == ts && !program.is_mask_preview())
+            || self.composites.iter().any(|(set, program, _, _)| *set == ts && !program.is_mask_preview())
             || self.tiles.iter().any(|(set, kind, ..)| *set == ts && *kind == DisplayKind::BaseColor)
     }
 
-    fn apply_display(&self, renderer: &mut Renderer, device: &wgpu::Device, queue: &wgpu::Queue) -> (Vec<usize>, Vec<(usize, String)>) {
+    /// The sets recreated, the errors, and whether a composite waits for its pipelines.
+    fn apply_display(&self, renderer: &mut Renderer, device: &wgpu::Device, queue: &wgpu::Queue) -> (Vec<usize>, Vec<(usize, String)>, bool) {
         let mut reset = Vec::new();
         if let Some((sets, material_count, shift)) = &self.sets {
             renderer.set_display_shift(*shift);
@@ -133,11 +138,23 @@ impl SceneSync {
         for &ts in &self.cpu_texture_sets {
             renderer.release_composite_inputs(ts);
         }
+        for program in &self.prewarm {
+            renderer.prewarm_composite(device, program);
+        }
         let mut errors = Vec::new();
-        for (ts, program, failed) in &self.composites {
-            if let Err(error) = renderer.composite_on_gpu(device, queue, *ts, program) {
-                failed.store(true, Ordering::Release);
-                errors.push((*ts, error));
+        let mut waiting = false;
+        for (ts, program, failed, pending) in &self.composites {
+            match renderer.composite_on_gpu(device, queue, *ts, program) {
+                // Its pipelines still compile: the set keeps its last result, and plans again
+                Err(error) if error == GPU_PIPELINES_PENDING => {
+                    pending.store(true, Ordering::Release);
+                    waiting = true;
+                }
+                Err(error) => {
+                    failed.store(true, Ordering::Release);
+                    errors.push((*ts, error));
+                }
+                Ok(()) => {}
             }
         }
         if let Some((ts, overview)) = &self.overview {
@@ -161,7 +178,7 @@ impl SceneSync {
         for dab in &self.released_dabs {
             dab.acknowledge_upload();
         }
-        (reset, errors)
+        (reset, errors, waiting)
     }
 }
 
@@ -239,6 +256,8 @@ pub struct GpuReports {
 
 /// Most distinct uncaptured GPU errors kept until the UI shows them.
 const MAX_GPU_ERRORS: usize = 8;
+/// How often a frame looks again while a composite waits for its pipelines
+const PIPELINE_POLL: std::time::Duration = std::time::Duration::from_millis(30);
 const GPU_COMPOSITE_ERROR: &str = n_("GPU compositing reported a device error. See the app log for details.");
 const NO_COVERED_TEXELS: &str = n_("The texture set has no covered UV texels.");
 
@@ -255,6 +274,9 @@ struct SetCompositor {
     /// The environment the current program lights with, when it reads it (P6's Baked Lighting
     /// Environment): a turned or changed environment compiles the program again
     environment: Option<LitEnvironment>,
+    /// The GPU reported the program's pipelines still compiling: keep the last result (no CPU
+    /// fallback) and plan the program again
+    pending: Arc<AtomicBool>,
 }
 
 /// The viewport environment a program read its diffuse light from: name, rotation bits and the
@@ -336,7 +358,8 @@ impl SetCompositor {
         }
         let stroke_id = stroke.map(|(id, _)| id);
         // A program lit by the environment is current only while the environment stays as it was
-        let current = self.current == Some(key) && self.environment.as_ref().is_none_or(|lit| lit.matches(session));
+        let waited = self.pending.swap(false, Ordering::AcqRel);
+        let current = self.current == Some(key) && !waited && self.environment.as_ref().is_none_or(|lit| lit.matches(session));
         let unchanged_stroke = self.stroke == stroke_id;
         if current && unchanged_stroke && stroke.is_none_or(|(_, tiles)| tiles.is_empty()) {
             return Ok(None);
@@ -522,7 +545,9 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         // The UI may be idle: draw a frame to show it
         wake.request_repaint();
     }));
-    let renderer = Renderer::new(&rs.device, &rs.queue, rs.target_format);
+    let mut renderer = Renderer::new(&rs.device, &rs.queue, rs.target_format);
+    // New composite pipelines compile on worker threads; the viewport keeps its last result
+    renderer.set_asynchronous_compile(true);
     rs.renderer.write().callback_resources.insert(GpuState { renderer, recreated: recreated.clone(), reports: reports.clone(), ctx: ctx.clone() });
     let info = rs.adapter.get_info();
     GpuLink {
@@ -679,7 +704,7 @@ impl GpuLink {
             let reason = match state.plan(session, ts, shift, global_reason, None) {
                 Ok(program) => {
                     if let Some(program) = program {
-                        out.composites.push((ts, program, state.failed.clone()));
+                        out.composites.push((ts, program, state.failed.clone(), state.pending.clone()));
                         submitted_stroke |= session.pending_display_stroke(ts).is_some();
                         self.sent.entry(ts).or_default().extend(DisplayKind::ALL);
                     }
@@ -744,7 +769,7 @@ impl GpuLink {
         let reason = match state.plan(session, ts, shift, global_reason, Some(layer)) {
             Ok(program) => {
                 if let Some(program) = program {
-                    out.composites.push((ts, program, state.failed.clone()));
+                    out.composites.push((ts, program, state.failed.clone(), state.pending.clone()));
                     if session.stroke_mask_owner() == Some(session.doc.project.mask_owner(layer)) {
                         session.clear_display_stroke_tiles();
                     }
@@ -851,6 +876,8 @@ impl GpuLink {
             self.quick_mask_failed = Arc::default();
 
             out.sets = Some((sets.clone(), session.mesh.materials.len().max(1), shift));
+            // Start compiling each set's pipelines now, so the first composites do not wait
+            out.prewarm = (0..sets.len()).filter_map(|ts| CompositeProgram::compile(&session.doc.project, &session.doc.pixels, ts)).collect();
             self.sets = sets;
             self.shift = shift;
         }
@@ -894,7 +921,7 @@ impl GpuLink {
         if !gpu_mask {
             self.plan_gpu_composites(session, shift, interactive, gpu_quick_mask, &mut out, start_ms);
         }
-        if out.composites.iter().any(|(_, program, _)| !program.is_neutral()) {
+        if out.composites.iter().any(|(_, program, _, _)| !program.is_neutral()) {
             self.gpu_composite_in_flight.fetch_add(1, Ordering::AcqRel);
             out.composite_work = Some(CompositeWork { in_flight: self.gpu_composite_in_flight.clone(), started: out.compositor_changed.then_some(start_ms) });
         }
@@ -1171,9 +1198,10 @@ fn record_recreated_uploads(recreated: &mut BTreeMap<usize, BTreeSet<DisplayKind
         return;
     }
 
-    for (ts, program, failed) in &sync.composites {
+    for (ts, program, failed, pending) in &sync.composites {
         if !program.is_mask_preview()
             && !failed.load(Ordering::Acquire)
+            && !pending.load(Ordering::Acquire)
             && let Some(kinds) = recreated.get_mut(ts)
         {
             kinds.extend(DisplayKind::ALL);
@@ -1234,8 +1262,14 @@ impl CallbackTrait for ViewCallback {
             if let Some((mesh, id)) = &sync.mesh {
                 gpu.renderer.set_mesh(device, queue, mesh, *id);
             }
-            let (reset, errors) = sync.apply_display(&mut gpu.renderer, device, queue);
-            let submitted = sync.composites.iter().any(|(_, program, failed)| !program.is_neutral() && !failed.load(Ordering::Acquire));
+            let (reset, errors, waiting) = sync.apply_display(&mut gpu.renderer, device, queue);
+            if waiting {
+                gpu.ctx.request_repaint_after(PIPELINE_POLL);
+            }
+            let submitted = sync
+                .composites
+                .iter()
+                .any(|(_, program, failed, pending)| !program.is_neutral() && !failed.load(Ordering::Acquire) && !pending.load(Ordering::Acquire));
             if !errors.is_empty() {
                 let mut reports = gpu.reports.lock().unwrap_or_else(PoisonError::into_inner);
                 reports
@@ -1663,7 +1697,7 @@ pub(crate) mod tests {
         assert_eq!(replay.tiles.first().map(|t| (t.2, t.3)), Some((15, 15)), "a dropped callback must preserve the dab's priority");
         #[cfg(not(target_arch = "wasm32"))]
         if let Ok(mut gpu) = texturecraft_render::headless::Headless::new() {
-            let (_, errors) = replay.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (_, errors, _) = replay.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty());
             assert!(!s.tile_demand(None).focused(), "a consumed callback clears the released dab's priority");
         }
@@ -1756,7 +1790,7 @@ pub(crate) mod tests {
                 if let Some((mesh, id)) = &scene.mesh {
                     h.renderer.set_mesh(&h.device, &h.queue, mesh, *id);
                 }
-                let (reset, _) = scene.apply_display(&mut h.renderer, &h.device, &h.queue);
+                let (reset, _, _) = scene.apply_display(&mut h.renderer, &h.device, &h.queue);
                 record_recreated_uploads(&mut gpu.recreated.lock().unwrap(), &reset, &scene);
                 frames += 1;
                 let ready = s.pending_tiles() == 0 && s.caches[0].upload.is_empty();
@@ -1845,7 +1879,7 @@ pub(crate) mod tests {
         execute(&mut session, "effect.add.filter", &json!({"target":"content", "filter":"blur", "radius":32})).unwrap();
         let scene = link.sync(&mut session, None, None, 0, 0.0);
         assert_eq!(scene.composites.len(), 1);
-        let (_, errors) = scene.apply_display(&mut headless.renderer, &headless.device, &headless.queue);
+        let (_, errors, _) = scene.apply_display(&mut headless.renderer, &headless.device, &headless.queue);
         assert!(errors.is_empty(), "{errors:?}");
         let (_, _, blurred) = Readback::blocking(&headless.device, &headless.queue, headless.renderer.display_textures()[0][0]).unwrap();
         let edge = (32 * width as usize + 32) * 4;
@@ -1886,10 +1920,10 @@ pub(crate) mod tests {
             }
             let scene = link.sync(&mut session, None, None, 0, 0.0);
             let expected: &[usize] = if size == 2048 { &[0, 1] } else { &[0] };
-            assert_eq!(scene.composites.iter().map(|(ts, _, _)| *ts).collect::<Vec<_>>(), expected);
+            assert_eq!(scene.composites.iter().map(|(ts, _, _, _)| *ts).collect::<Vec<_>>(), expected);
             assert!(scene.tiles.is_empty());
             assert!(scene.overview.is_none());
-            let (recreated, errors) = scene.apply_display(&mut headless.renderer, &headless.device, &headless.queue);
+            let (recreated, errors, _) = scene.apply_display(&mut headless.renderer, &headless.device, &headless.queue);
             assert!(errors.is_empty(), "{errors:?}");
             record_recreated_uploads(&mut link.recreated.lock().unwrap(), &recreated, &scene);
             headless.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
@@ -1949,7 +1983,7 @@ pub(crate) mod tests {
             if status != "Layers: GPU" || update.composites.len() != 1 || !update.tiles.is_empty() {
                 rejected.push(format!("{}: {status} ({reason})", material.id));
             } else if let Some(gpu) = &mut gpu {
-                let (_, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+                let (_, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
                 rejected.extend(errors.into_iter().map(|(_, error)| format!("{}: {error}", material.id)));
                 gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
             }
@@ -1968,13 +2002,13 @@ pub(crate) mod tests {
         let expected_status = if mask { "Mask: GPU" } else { "Layers: GPU" };
         let (status, reason) = link.compositor_status();
         let uses_expected_route = status == expected_status
-            && update.composites.iter().any(|(set, program, _)| *set == ts && program.is_mask_preview() == mask && !program.is_neutral())
+            && update.composites.iter().any(|(set, program, _, _)| *set == ts && program.is_mask_preview() == mask && !program.is_neutral())
             && update.tiles.is_empty()
             && update.aux.iter().all(|(set, ..)| *set != ts);
         if let Some((mesh, id)) = &update.mesh {
             gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
         }
-        let (_, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+        let (_, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
         for (ts, size, pixels) in update.aux {
             gpu.renderer.upload_aux(&gpu.device, &gpu.queue, ts, size, &pixels);
         }
@@ -2083,7 +2117,7 @@ pub(crate) mod tests {
             link.gpu_composite_enabled = true;
             let update = link.sync(&mut session, None, None, 0, 0.0);
             assert_eq!(link.compositor_status().0, "Layers: GPU", "{material}: {}", link.compositor_status().1);
-            let (_, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (_, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{material}: {errors:?}");
             session.update();
 
@@ -2134,7 +2168,7 @@ pub(crate) mod tests {
         let update = link.sync(&mut session, None, None, 0, 0.0);
         assert_eq!(link.compositor_status().0, "Layers: GPU", "{}", link.compositor_status().1);
         let Ok(mut gpu) = Headless::new() else { return };
-        let (_, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+        let (_, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
         assert!(errors.is_empty(), "{errors:?}");
         session.update();
         let textures = gpu.renderer.display_textures();
@@ -2172,12 +2206,12 @@ pub(crate) mod tests {
                 execute(&mut session, "textureSet.resolution", &json!({"ts":0,"resolution":size})).unwrap();
             }
             let update = link.sync(&mut session, None, None, 0, 0.0);
-            let planned: Vec<_> = update.composites.iter().map(|(ts, _, _)| *ts).collect();
+            let planned: Vec<_> = update.composites.iter().map(|(ts, _, _, _)| *ts).collect();
             assert_eq!(planned, sets, "{}", link.compositor_status().1);
             assert!(update.tiles.is_empty());
             assert_eq!(link.compositor_status().0, "Layers: GPU");
             if let Some(gpu) = &mut headless {
-                let (reset, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+                let (reset, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
                 assert!(errors.is_empty(), "{errors:?}");
                 record_recreated_uploads(&mut link.recreated.lock().unwrap(), &reset, &update);
                 gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
@@ -2203,7 +2237,7 @@ pub(crate) mod tests {
 
             // Compare a few baked and generated sample pixels at 128².
             let update = link.sync(&mut session, None, None, 0, 0.0);
-            let (_, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (_, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
             session.update();
             for ts in 0..2 {
@@ -2272,7 +2306,7 @@ pub(crate) mod tests {
         link.gpu_composite_enabled = true;
         link.material_start_preview = false;
         let initial = link.sync(&mut session, None, None, 0, 0.0);
-        let (reset, errors) = initial.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+        let (reset, errors, _) = initial.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
         assert!(errors.is_empty(), "{errors:?}");
         record_recreated_uploads(&mut link.recreated.lock().unwrap(), &reset, &initial);
         gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
@@ -2294,7 +2328,7 @@ pub(crate) mod tests {
             let update = link.sync(&mut session, None, None, 0, 0.0);
             assert_eq!(update.composites.iter().map(|(ts, ..)| *ts).collect::<Vec<_>>(), [0], "{}", link.compositor_status().1);
             assert!(update.tiles.is_empty());
-            let (reset, errors) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (reset, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
             record_recreated_uploads(&mut link.recreated.lock().unwrap(), &reset, &update);
             gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
@@ -2510,7 +2544,7 @@ pub(crate) mod tests {
 
         let display_at_center = |scene: SceneSync| -> Vec<u8> {
             let Headless { renderer, device, queue, .. } = &mut *brush.0.lock().unwrap();
-            let (_, errors) = scene.apply_display(renderer, device, queue);
+            let (_, errors, _) = scene.apply_display(renderer, device, queue);
             assert!(errors.is_empty(), "{errors:?}");
             let (w, h, rgba) = Readback::blocking(device, queue, renderer.display_textures()[0][0]).unwrap();
             let center = ((h / 2 * w + w / 2) * 4) as usize;
@@ -2603,12 +2637,12 @@ pub(crate) mod tests {
 
         let display = |scene: SceneSync, mask_view: bool, dispatch: bool| {
             assert_eq!(scene.composites.len(), usize::from(dispatch), "unexpected GPU program count");
-            if let Some((_, program, _)) = scene.composites.first() {
+            if let Some((_, program, _, _)) = scene.composites.first() {
                 assert_eq!(program.is_mask_preview(), mask_view);
             }
             assert!(scene.tiles.is_empty() && scene.aux.is_empty(), "the active set does not upload CPU pixels");
             let gpu = &mut *brush.0.lock().unwrap();
-            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (_, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{size}²: {errors:?}");
             let texture = if mask_view { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
             read_center(gpu, texture)
@@ -2674,7 +2708,7 @@ pub(crate) mod tests {
         let display = |link: &mut GpuLink, s: &mut Session, aux: Option<AuxView>| -> [[u8; 4]; 4] {
             let scene = link.sync(s, aux, None, 0, 0.0);
             let gpu = &mut *brush.0.lock().unwrap();
-            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (_, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
             let texture = if aux.is_some() { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
             texels.map(|(x, y)| read_display(gpu, texture, x, y))
@@ -2755,7 +2789,7 @@ pub(crate) mod tests {
         link.brush_device = Some(brush.clone());
         let display_at_center = |scene: SceneSync| -> Vec<u8> {
             let Headless { renderer, device, queue, .. } = &mut *brush.0.lock().unwrap();
-            let (_, errors) = scene.apply_display(renderer, device, queue);
+            let (_, errors, _) = scene.apply_display(renderer, device, queue);
             assert!(errors.is_empty(), "{errors:?}");
             let (w, h, rgba) = Readback::blocking(device, queue, renderer.display_textures()[0][0]).unwrap();
             let center = ((h / 2 * w + w / 2) * 4) as usize;
@@ -2788,7 +2822,7 @@ pub(crate) mod tests {
         let display = |link: &mut GpuLink, s: &mut Session, aux: Option<AuxView>| -> [u8; 4] {
             let scene = link.sync(s, aux, None, 0, 0.0);
             let gpu = &mut *brush.0.lock().unwrap();
-            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (_, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
             let texture = if aux.is_some() { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
             read_center(gpu, texture)
@@ -2937,7 +2971,7 @@ pub(crate) mod tests {
             let display = |link: &mut GpuLink, s: &mut Session| -> [[u8; 4]; 2] {
                 let scene = link.sync(s, None, None, 0, 0.0);
                 let gpu = &mut *brush.0.lock().unwrap();
-                let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+                let (_, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
                 assert!(errors.is_empty(), "{errors:?}");
                 let texture = gpu.renderer.display_textures()[0][0];
                 texels.map(|texel| read_display(gpu, texture, texel.x, texel.y))
@@ -2988,7 +3022,7 @@ pub(crate) mod tests {
         let display = |link: &mut GpuLink, s: &mut Session| -> [[u8; 4]; 2] {
             let scene = link.sync(s, None, None, 0, 0.0);
             let gpu = &mut *brush.0.lock().unwrap();
-            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (_, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
             let gpu: &Headless = gpu;
             [0, 1].map(|ts| read_display(gpu, gpu.renderer.display_textures()[ts][0], x, y))
@@ -3026,7 +3060,7 @@ pub(crate) mod tests {
         let display = |link: &mut GpuLink, s: &mut Session| -> [u8; 4] {
             let scene = link.sync(s, None, None, 0, 0.0);
             let gpu = &mut *brush.0.lock().unwrap();
-            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (_, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
             let texture = gpu.renderer.display_textures()[0][0];
             read_center(gpu, texture)
@@ -3063,7 +3097,7 @@ pub(crate) mod tests {
             if let Some((mesh, id)) = &scene.mesh {
                 gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
             }
-            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (_, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
             let texture = gpu.renderer.display_textures()[0][0];
             let extent = texture.width();
@@ -3128,12 +3162,12 @@ pub(crate) mod tests {
             if let Some((mesh, id)) = &scene.mesh {
                 gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
             }
-            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (_, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
             read_pixel(gpu, gpu.renderer.aux_texture(0).unwrap(), 32, 32)
         };
         let mut attempted = link.sync(&mut s, aux, None, 0, 0.0);
-        let (_, _, failed) = attempted.composites.pop().expect("material was queued for GPU composition");
+        let (_, _, failed, _) = attempted.composites.pop().expect("material was queued for GPU composition");
         assert!(attempted.composites.is_empty());
         failed.store(true, Ordering::Release);
         display(&attempted);
@@ -3200,7 +3234,7 @@ pub(crate) mod tests {
             if let Some((mesh, id)) = &scene.mesh {
                 gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
             }
-            let (reset, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            let (reset, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{size}²: {errors:?}");
             let _ = reset;
             for (ts, size, bytes) in &scene.aux {
@@ -3368,7 +3402,7 @@ pub(crate) mod tests {
                 if let Some((mesh, id)) = &scene.mesh {
                     gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
                 }
-                let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+                let (_, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
                 assert!(errors.is_empty(), "{size}², mask view {mask_view}: {errors:?}");
                 let texture = if mask_view { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
                 uvs.map(|uv| {
