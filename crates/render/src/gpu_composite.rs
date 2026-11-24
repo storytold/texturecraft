@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, ContentsOffset, CurvatureDetail, CurvatureMode, Effect, EffectKind,
+    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, ContentsOffset, CurvatureDetail, CurvatureMode, Effect, EffectKind,
     Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source,
     ThresholdMode,
 };
@@ -1007,6 +1007,11 @@ impl CompositeProgram {
                 let begin = effects.len() as u32;
                 let background = compile_mask(mask, around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
                 let count = effects.len() as u32 - begin;
+
+                // A folder has no content of its own for a comparison to read
+                if effects[begin as usize..].iter().any(stack::reads_own_layer) {
+                    return Err("A folder mask comparing its own layer uses CPU compositing.");
+                }
                 let height = layer.height_mask;
                 let height_params = if height.enabled && count != 0 {
                     if !height.contrast.is_finite() || !height.offset.is_finite() {
@@ -1300,7 +1305,8 @@ impl CompositeProgram {
         let around = project.contents_around(requested);
         let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
         let mask = mask.ok_or("The layer has no enabled mask.")?;
-        if mask.effects.iter().any(|effect| effect.visible && !effect.kind.anchors_read().is_empty()) {
+        // A mask reading anchors or the layers needs the stack below it: the material program
+        if mask.effects.iter().any(|effect| effect.visible && (!effect.kind.anchors_read().is_empty() || effect.kind.reads_stack())) {
             // The material program keeps the owner's last draw, which must sit where the requested layer does
             if stack::draw_offsets(project, &set.stack, owner).iter().any(|offset| *offset != around) {
                 return Err("A mask reading anchors inside a folder with Scale or Rotation uses CPU mask preview.");
@@ -1465,11 +1471,12 @@ fn effect_needs_cpu(effect: &Effect) -> Option<&'static str> {
     None
 }
 
-/// Whether the effect's filter reads one of the image inputs set on it now (inputs a filter it
-/// was swapped from left behind, or that its mode does not read, change nothing)
+/// Whether the effect's filter reads one of the image inputs set on it now and the GPU does not
+/// evaluate that input (inputs a filter it was swapped from left behind, or that its mode does not
+/// read, change nothing; [`stack::evaluates_inputs`] lists the filters whose inputs it reads)
 fn reads_image_input(effect: &Effect) -> bool {
     let EffectKind::Filter(filter) = &effect.kind else { return false };
-    texturecraft_core::ImageInput::of(filter).iter().any(|input| effect.inputs.contains_key(input.id))
+    !stack::evaluates_inputs(filter) && texturecraft_core::ImageInput::of(filter).iter().any(|input| effect.inputs.contains_key(input.id))
 }
 
 fn content_deposit(
@@ -1560,11 +1567,8 @@ fn compile_mask(
             }
             EffectKind::Generator(generator) => generator_operation(generator, procedural, tile_patterns).ok_or("A mask generator uses CPU compositing.")?,
             EffectKind::ColorSelection(selection) => {
-                // The GPU reads the baked ID map; an image as ID map stays on the CPU
-                let ColorSelection { colors, tolerance, output, hardness, background, id_map } = selection;
-                if id_map.is_some() {
-                    return Err("A color selection's ID map image uses CPU compositing.");
-                }
+                // The baked ID map, or an image as ID map through the side table
+                let ColorSelection { colors, tolerance, .. } = selection;
                 let [offset, count] = procedural.pack_rgb(colors).ok_or("A color selection has invalid colors.")?;
                 if !tolerance.is_finite() {
                     return Err("A color selection has invalid tolerance.");
@@ -1575,18 +1579,14 @@ fn compile_mask(
                     procedural: [0, offset, count, 0],
                     ..Operation::zeroed()
                 };
-                stack::soften_selection(&mut operation, *output, *hardness, *background, procedural).ok_or("A color selection has invalid parameters.")?;
+                stack::soften_selection(&mut operation, selection, procedural).ok_or("A color selection has invalid parameters.")?;
                 operation
             }
             EffectKind::Anchor => {
                 let publication = procedural.anchors.publish(effect.id, true);
                 Operation { ids: [0, ANCHOR_PUBLISH_MASK, publication, 0], ..Operation::zeroed() }
             }
-            EffectKind::Compare { op, value, tolerance, left, right, channel: _, hardness } => {
-                // The GPU compares the mask so far with a constant; the channel is read only by layer sides
-                if *left != CompareSource::ThisMask || *right != CompareSource::Constant {
-                    return Err("A mask comparison reading layers uses CPU compositing.");
-                }
+            EffectKind::Compare { op, value, tolerance, left, right, channel, hardness } => {
                 if !value.is_finite() || !tolerance.is_finite() {
                     return Err("A mask comparison has invalid parameters.");
                 }
@@ -1597,6 +1597,11 @@ fn compile_mask(
                 };
                 let mut operation = Operation { ids: [0, COMPARE_OPCODE, compare, 0], low: [*value, *tolerance, 0.0, 0.0], ..Operation::zeroed() };
                 stack::soften_compare(&mut operation, *hardness);
+
+                // A side reading the layers below or this layer reads the material of the channel at the texel
+                if left.reads_stack() || right.reads_stack() {
+                    stack::read_layers(&mut operation, *left, *right, *channel);
+                }
                 operation
             }
             // Lighting reads the base color, which a mask does not have
@@ -3149,7 +3154,7 @@ mod procedural_tests {
     use crate::{headless::Headless, readback::Readback};
     use texturecraft_compose::PatternContext;
     use texturecraft_compose::pattern::{Coords, procedural_in};
-    use texturecraft_core::{Fill, HighpassSpace, Layer, Levels, Mask, OutputResolution, Procedural, TextureSet};
+    use texturecraft_core::{CompareSource, Fill, HighpassSpace, Layer, Levels, Mask, OutputResolution, Procedural, TextureSet};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{srgb_lut, to_u16};
 

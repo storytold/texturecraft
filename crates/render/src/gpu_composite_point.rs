@@ -3,7 +3,7 @@
 //!
 //! What P2 implements here: HSL Perceptive (OKLab), Posterize `alpha`, Histogram Scan
 //! `invert_position`, Color Correct, Smoothstep, Height Adjust, Gradient Curve, Gradient Dynamic,
-//! Grayscale Conversion (its Custom Input waits for P3's image inputs), and the Gradient's
+//! Grayscale Conversion (its Custom Input through P3's image inputs), and the Gradient's
 //! `positions`, `quantity`, `linear: false`, `input` mode/balance/contrast/invert and `debug`.
 //! Levels `affects` is P3's (per-channel stack plumbing).
 //!
@@ -38,12 +38,12 @@
 //! for each setting value, set to Disable too, at opacity below 1 with a non-Normal blend.
 
 use texturecraft_core::{
-    ConversionMode, CurvePreset, Effect, Filter, GradientInput, GrayscaleMode, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, finite_unit, lum,
+    ConversionMode, CurvePreset, Effect, Filter, GradientInput, GrayscaleMode, ImageInput, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, finite_unit, lum,
 };
 use texturecraft_texel::linear_to_srgb;
 
 use super::packages::{POINT_OP_BITS, POINT_OPCODES};
-use super::{CompositeProgram, Operation, ProceduralInputs};
+use super::{CompositeProgram, Operation, ProceduralInputs, stack};
 
 /// Library filter ids P2 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
@@ -124,8 +124,11 @@ pub(super) fn lower(filter: &Filter, effect: &Effect, op: &mut Operation, inputs
             op.high[0] = finite_unit(lum(*color));
             Some((GRADIENT_DYNAMIC, color.map(finite_unit)))
         }
-        // A Custom Input waits for the image inputs of the stack plumbing (P3)
-        Filter::GrayscaleConversion(conversion) if !conversion.custom_input => {
+        Filter::GrayscaleConversion(conversion) => {
+            // The Custom Input's colour replaces the channel's (P3's image inputs, `effect_input`)
+            if conversion.custom_input {
+                op.effects[3] = stack::register_image_input(effect, &ImageInput::CUSTOM_INPUT, inputs)?;
+            }
             op.ids[2] = match conversion.mode {
                 ConversionMode::Desaturation => GRAY_DESATURATION,
                 ConversionMode::ChannelsWeights => GRAY_WEIGHTS,
@@ -589,7 +592,8 @@ mod tests {
     /// P2's filters and settings that still composite on the CPU, in content and in masks. Port
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
     fn still_on_cpu() -> Vec<Filter> {
-        vec![Filter::GrayscaleConversion(GrayscaleConversion { custom_input: true, ..GrayscaleConversion::LIBRARY })]
+        // Grayscale Conversion's Custom Input moved to P3's image inputs (gpu_composite_stack.rs)
+        Vec::new()
     }
 
     #[test]
