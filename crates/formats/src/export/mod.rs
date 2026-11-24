@@ -643,11 +643,13 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
                 check_psd_size(size, channels, bit_depth)?;
             }
 
+            // A name of the project, mesh or texture set never adds a folder
+            let no_folder = |name: &str| name.replace('/', "_");
             let stem = template
                 .replace("$udim", &tile.unwrap_or(1001).to_string())
-                .replace("$project", &project.name)
-                .replace("$mesh", mesh_name)
-                .replace("$textureSet", &set.name)
+                .replace("$project", &no_folder(&project.name))
+                .replace("$mesh", &no_folder(mesh_name))
+                .replace("$textureSet", &no_folder(&set.name))
                 .replace("$channel", channel_label(map))
                 .replace("$colorSpace", color_space);
 
@@ -655,9 +657,9 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
             let token_stem = tile.map(|_| {
                 let t = template
                     .replace("$udim", "UDIMTOKEN")
-                    .replace("$project", &project.name)
-                    .replace("$mesh", mesh_name)
-                    .replace("$textureSet", &set.name)
+                    .replace("$project", &no_folder(&project.name))
+                    .replace("$mesh", &no_folder(mesh_name))
+                    .replace("$textureSet", &no_folder(&set.name))
                     .replace("$channel", channel_label(map))
                     .replace("$colorSpace", color_space);
                 sanitize_file_path(&t)

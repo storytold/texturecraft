@@ -1475,3 +1475,16 @@ fn spec_templates_write_8_bit_png_files_with_the_expected_colour_encoding() {
         assert!((a - byte(0.9)).abs() <= 1, "{template}: opacity in alpha");
     }
 }
+
+#[test]
+fn a_slash_in_a_project_or_texture_set_name_does_not_make_a_folder() {
+    let mut fx = Fx::new(&default_channels());
+    fx.project.name = "Wood/Oak".into();
+    fx.project.texture_sets[0].name = "Body/Hull".into();
+    let preset =
+        ExportPreset { name: "t".into(), maps: vec![gray_map("$project_$textureSet", SourceRef::Channel { channel: Channel::Roughness, component: 0 })] };
+
+    let names: Vec<String> = list_outputs(&fx.project, 0, "sphere", &ExportOptions::new(preset)).unwrap().into_iter().map(|p| p.name).collect();
+
+    assert_eq!(names, ["Wood_Oak_Body_Hull.png"]);
+}

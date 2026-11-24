@@ -130,13 +130,6 @@ impl Session {
         let mut lib = UserPresets { list: Vec::new(), dir: Some(dir) };
         for path in files.into_iter().take(MAX_USER_PRESETS) {
             match texturecraft_formats::load_preset(&path).map_err(|e| e.to_string()) {
-                // A built-in may arrive later under a user preset's name: keep the user's under a free name
-                Ok(mut p) if builtin_preset(&p.name).is_some() => {
-                    let free = lib.unique_name(&p.name, None);
-                    warnings.push(format!("{}: preset \"{}\" has the name of a built-in template, so it is listed as \"{free}\"", path.display(), p.name));
-                    p.name = free;
-                    lib.list.push(p);
-                }
                 Ok(p) if lib.taken(&p.name, None) => warnings.push(format!("{}: preset \"{}\" exists already", path.display(), p.name)),
                 Ok(p) => lib.list.push(p),
                 Err(e) => warnings.push(format!("{}: {e}", path.display())),
@@ -341,22 +334,6 @@ mod tests {
         assert_eq!(fresh.export_preset("other").unwrap().name, "Other");
         run(&mut fresh, "export.preset.remove", json!({"name": "Other"})).unwrap();
         assert!(!dir.join("Other.json").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn a_user_preset_named_like_a_new_built_in_is_kept_under_a_free_name() {
-        let dir = std::env::temp_dir().join(format!("tc_presets_shadowed_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("Usd.json"), preset("USD Preview Surface (separate maps)").to_string()).unwrap();
-        let mut s = session();
-
-        let warnings = s.load_export_presets(dir.clone());
-
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert_eq!(s.export_presets.list.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["USD Preview Surface (separate maps) 2"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
