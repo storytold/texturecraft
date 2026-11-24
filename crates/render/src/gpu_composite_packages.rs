@@ -853,6 +853,40 @@ mod tests {
         assert_eq!(plan.field_words(), crate::gpu_neighbourhood::FIELD_WORDS + 1);
     }
 
+    /// A 4K whole-set stage with a Drop Shadow's reach (563 texels) in four channels plans its
+    /// stripes beside the four results within a 2 GiB binding: the stripe fields are clamped to
+    /// the set, and stripes shrink before planning fails.
+    #[test]
+    fn a_large_reach_whole_set_stage_plans_at_4k() {
+        use crate::gpu_neighbourhood::WHOLE_SET_TEST_REACH;
+
+        const SIZE: u32 = 4096;
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Metallic, Channel::Height];
+        let mut project = Project::new("Large reach", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let owner = project.alloc_id();
+        let sources = channels.map(|channel| (channel, Source::Uniform([0.4; 3])));
+        let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(Fill { sources: sources.into(), ..Default::default() }), &channels);
+        // Three box passes of 188 texels at 4K: a reach of 564
+        layer.content_effects.push(effect(EffectKind::Filter(Filter::Blur { radius: 94.0, wrap: false })));
+        project.insert_layer(0, layer, None, false).unwrap();
+        WHOLE_SET_TEST_REACH.set(Some(563));
+        let program = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None);
+        WHOLE_SET_TEST_REACH.set(None);
+        let program = program.unwrap();
+        let whole = program.filters.whole_set().expect("the Blur runs in the pre-pass");
+        assert_eq!((whole.outputs.len(), whole.reach), (4, 564));
+        let full = super::super::CompositeRegion { min: [0, 0], max: [SIZE, SIZE] };
+        let pass = super::super::WholeSetPass::plan(whole, (full, 0), (SIZE, SIZE), program.filters.band_reach(), false, 5, program.filters.stages.len());
+        let limit = 2047u64 << 20;
+        let results = pass.result_bytes();
+        let pass = pass.with_stripes(limit - results).expect("the stripes fit beside the results");
+        assert!(pass.stripe_bytes() + results <= limit && pass.stripe_rows >= 1);
+        // Every stripe's field stays inside the set
+        let rect = pass.field_rect(0, pass.stripe_rows);
+        assert!(rect[0] == 0 && rect[1] == 0 && rect[2] == SIZE && rect[3] <= SIZE, "{rect:?}");
+    }
+
     #[test]
     fn package_opcode_blocks_are_disjoint_and_inside_the_extended_range() {
         let blocks = [POINT_OPCODES, STACK_OPCODES, LIGHTING_OPCODES];

@@ -2664,7 +2664,7 @@ impl GpuCompositor {
                 }
                 let paint = self.paint_upload.as_ref().ok_or("paint upload buffer is missing")?;
                 queue.write_buffer(paint, 0, bytemuck::cast_slice(&packed));
-                let field_rect = whole.field_rect(top, rows, source_size);
+                let field_rect = whole.field_rect(top, rows);
                 let set_bounds = field_bounds(field_rect, source_size);
                 let values = band_values((0, 0, 0, 0), window.params(), field_rect, 0);
                 let field_words = field_rect[2] * field_rect[3] * texel_words;
@@ -2902,6 +2902,7 @@ fn scratch_limit(limits: &wgpu::Limits, live: u64) -> u64 {
 struct WholeSetPass {
     stages: WholeSet,
     region: [u32; 4],
+    size: (u32, u32),
     wraps: bool,
     texel_words: u32,
     /// Field slots of the program (stages plus the three working fields)
@@ -2917,7 +2918,7 @@ impl WholeSetPass {
         };
         let [x0, x1] = axis(region.min[0], region.max[0], size.0);
         let [y0, y1] = axis(region.min[1], region.max[1], size.1);
-        Self { region: [x0, y0, x1, y1], wraps, texel_words, slots: stage_count as u64 + 3, stripe_rows: (y1 - y0).max(1), stages }
+        Self { region: [x0, y0, x1, y1], size, wraps, texel_words, slots: stage_count as u64 + 3, stripe_rows: (y1 - y0).max(1), stages }
     }
 
     fn result_words(&self) -> u64 {
@@ -2936,23 +2937,30 @@ impl WholeSetPass {
 
     /// The field of the stripe of `rows` from row `top`: the reach on every side, clamped to the
     /// set unless the program wraps (origin as i32 bits).
-    fn field_rect(&self, top: u32, rows: u32, size: (u32, u32)) -> [u32; 4] {
-        let reach = i64::from(self.stages.reach);
+    fn field_rect(&self, top: u32, rows: u32) -> [u32; 4] {
         let [x0, _, x1, _] = self.region;
-        let span = |low: u32, high: u32, side: u32| {
-            let (low, high) = (i64::from(low) - reach, i64::from(high) + reach);
-            if self.wraps { (low, high) } else { (low.max(0), high.min(i64::from(side))) }
-        };
-        let (left, right) = span(x0, x1, size.0);
-        let (upper, lower) = span(top, top + rows, size.1);
+        let (left, right) = self.span(x0, x1, self.size.0);
+        let (upper, lower) = self.span(top, top + rows, self.size.1);
         [left as i32 as u32, upper as i32 as u32, (right - left) as u32, (lower - upper) as u32]
     }
 
-    /// Bytes of a stripe's fields: every slot of the program over the stripe plus its reach.
+    /// `low..high` plus the reach on both sides: clamped to the set (`side`) unless the program
+    /// wraps, where the field holds periodic copies past the set's edges.
+    fn span(&self, low: u32, high: u32, side: u32) -> (i64, i64) {
+        let reach = i64::from(self.stages.reach);
+        let (low, high) = (i64::from(low) - reach, i64::from(high) + reach);
+        if self.wraps { (low, high) } else { (low.max(0), high.min(i64::from(side))) }
+    }
+
+    /// Bytes of the largest stripe's fields: every slot of the program over the stripe plus its
+    /// reach, as `field_rect` clamps it to the set.
     fn stripe_bytes(&self) -> u64 {
-        let reach = u64::from(self.stages.reach) * 2;
         let [x0, _, x1, _] = self.region;
-        (u64::from(x1 - x0) + reach) * (u64::from(self.stripe_rows) + reach) * self.slots * u64::from(self.texel_words) * 4
+        let (left, right) = self.span(x0, x1, self.size.0);
+        let reach = u64::from(self.stages.reach) * 2;
+        let rows = u64::from(self.stripe_rows) + reach;
+        let rows = if self.wraps { rows } else { rows.min(u64::from(self.size.1)) };
+        (right - left) as u64 * rows * self.slots * u64::from(self.texel_words) * 4
     }
 
     /// The tallest stripes whose fields fit in `limit` bytes beside the results.
