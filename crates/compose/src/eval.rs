@@ -4991,6 +4991,12 @@ pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Opti
     Some(out.into_iter().flatten().collect())
 }
 
+/// Whether texture set `texture_set_index` lights a visible layer with the viewport environment
+/// (Baked Lighting Environment): its material changes when the environment turns or changes.
+pub fn lit_by_environment(project: &Project, texture_set_index: usize) -> bool {
+    project.texture_set(texture_set_index).is_ok_and(|set| uses_environment(project, &set.stack, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

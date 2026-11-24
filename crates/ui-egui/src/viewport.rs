@@ -816,8 +816,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         if alt {
             app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT * app.ui.prefs.drag_zoom_scale());
         } else if shift {
-            let display = &mut app.session.doc.project.display;
-            display.env_rotation = (display.env_rotation + delta.x * LIGHT_DEGREES_PER_POINT).rem_euclid(360.0);
+            turn_environment(&mut app.session, delta.x * LIGHT_DEGREES_PER_POINT);
         } else {
             orbit(app, delta);
         }
@@ -2538,6 +2537,16 @@ fn eyedrop(app: &mut TextureCraftApp, ctx: &egui::Context, bar: egui::Id, pixel:
     }
 }
 
+/// Turn the viewport environment by `degrees` (Shift+right-drag): the layers Baked Lighting
+/// Environment lights with it composite again, as `display.set` does
+fn turn_environment(session: &mut Session, degrees: f32) {
+    let display = &mut session.doc.project.display;
+    let rotation_before_degrees = display.env_rotation;
+    display.env_rotation = (rotation_before_degrees + degrees).rem_euclid(360.0);
+    let environment = display.environment.clone();
+    texturecraft_engine::view_cmds::relight_environment(session, &environment, rotation_before_degrees);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3072,5 +3081,25 @@ mod tests {
         visible_dashes(VIEW, &[pos2(-50.0, -10.0), pos2(150.0, -10.0), pos2(120.0, 300.0)], 6.0, 4.0, |_| count += 1);
 
         assert_eq!(count, 0);
+    }
+
+    /// Shift+right-drag's turn composites the layers Baked Lighting Environment lights again, as
+    /// `display.set` does: the CPU material keeps the old light otherwise
+    #[test]
+    fn turning_the_environment_in_the_viewport_relights_the_layers_lit_by_it() {
+        use texturecraft_engine::execute;
+
+        let mut session = texturecraft_engine::sample_session(128, 32).unwrap();
+        execute(&mut session, "layer.add.fill", &serde_json::json!({})).unwrap();
+        execute(&mut session, "effect.add.filter", &serde_json::json!({"target": "content", "filter": "bakedLightingEnvironment"})).unwrap();
+        let revisions = |session: &Session| session.caches.iter().map(|cache| cache.material_revision).collect::<Vec<_>>();
+        let before = revisions(&session);
+
+        turn_environment(&mut session, 25.0);
+
+        // Only the set holding the lit layer composites again
+        let (after, lit) = (revisions(&session), session.ts());
+        let changed: Vec<usize> = before.iter().zip(&after).enumerate().filter(|(_, (before, after))| before != after).map(|(set, _)| set).collect();
+        assert_eq!(changed, [lit], "{before:?} {after:?}");
     }
 }

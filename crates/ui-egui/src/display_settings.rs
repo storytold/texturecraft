@@ -48,23 +48,30 @@ pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
     });
 
     if display != app.session.doc.project.display {
-        if display.fov != app.session.doc.project.display.fov {
-            app.session.camera.fov = display.fov;
-            if let Some(glide) = &mut app.camera_glide {
-                glide.from.fov = display.fov;
-                glide.to.fov = display.fov;
-            }
-        }
-
-        app.session.doc.project.display = display;
-        app.session.modified = true;
-        app.session.revision = app.session.revision.wrapping_add(1);
+        apply_display(app, display);
     }
 
     if import_hdr {
         let ctx = ui.ctx().clone();
         crate::web_files::import_environment(app, &ctx);
     }
+}
+
+/// Take the panel's edited display settings: the camera's field of view follows, and the layers
+/// Baked Lighting Environment lights composite again when the environment turned or changed
+fn apply_display(app: &mut TextureCraftApp, display: DisplaySettings) {
+    if display.fov != app.session.doc.project.display.fov {
+        app.session.camera.fov = display.fov;
+        if let Some(glide) = &mut app.camera_glide {
+            glide.from.fov = display.fov;
+            glide.to.fov = display.fov;
+        }
+    }
+
+    let before = std::mem::replace(&mut app.session.doc.project.display, display);
+    texturecraft_engine::view_cmds::relight_environment(&mut app.session, &before.environment, before.env_rotation);
+    app.session.modified = true;
+    app.session.revision = app.session.revision.wrapping_add(1);
 }
 
 /// A sub-heading inside a section, as the reference's "Environment" and "Shadows"
@@ -352,5 +359,27 @@ mod tests {
 
         let names: Vec<_> = harness.state().session.doc.project.cameras.iter().map(|camera| camera.name.as_str()).collect();
         assert_eq!(names, [edited.as_str(), "Third"]);
+    }
+
+    /// The panel's turned environment composites the layers Baked Lighting Environment lights
+    /// again, as `display.set` does: the CPU material keeps the old light otherwise
+    #[test]
+    fn a_turned_environment_on_the_panel_relights_the_layers_lit_by_it() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut harness = display_harness();
+        let app = harness.state_mut();
+        app.run("layer.add.fill", json!({})).unwrap();
+        app.run("effect.add.filter", json!({"target": "content", "filter": "bakedLightingEnvironment"})).unwrap();
+        let revisions = |app: &TextureCraftApp| app.session.caches.iter().map(|cache| cache.material_revision).collect::<Vec<_>>();
+        let before = revisions(app);
+
+        let mut display = app.session.doc.project.display.clone();
+        display.env_rotation += 40.0;
+        apply_display(app, display);
+
+        // Only the set holding the lit layer composites again
+        let (after, lit) = (revisions(app), app.session.ts());
+        let changed: Vec<usize> = before.iter().zip(&after).enumerate().filter(|(_, (before, after))| before != after).map(|(set, _)| set).collect();
+        assert_eq!(changed, [lit], "{before:?} {after:?}");
     }
 }

@@ -592,8 +592,9 @@ impl FilterPlan {
         let mut read_effects = BTreeSet::new();
         let mut prepared = BTreeSet::new();
         for index in 0..layers.len() {
+            let run = layer_run(&inputs.anchors.draw_ranges, index);
             if layers[index].ids[1] != ANCHOR_PUBLISH_LAYER {
-                plan.bind_stack_reads(layers, effects, index, (&mut stack_reads, &mut read_effects));
+                plan.bind_stack_reads(layers, effects, index, run.clone(), false, (&mut stack_reads, &mut read_effects));
             }
             let layer = &mut layers[index];
             if layer.ids[1] == ANCHOR_PUBLISH_LAYER {
@@ -602,13 +603,17 @@ impl FilterPlan {
             }
             let [mask, mask_count, _, _] = layer.effects;
             // A mask reading its own layer's content: that layer's content stacks first, so the
-            // mask's prepare pass resumes from prepared content fields
+            // mask's prepare pass resumes from prepared content fields. A Base Color that reads
+            // the layer's material waits for the mask too, which the material's capture reads.
             if mask_count > 0 && !masks.contains_key(&mask) && effects.iter().skip(mask as usize).take(mask_count as usize).any(packages::mask_reads_own_layer)
             {
-                let same_layer = |op: &Operation| op.effects[..2] == layers[index].effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
-                let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
-                for own in index..end {
-                    plan.add_layer_content(layers, effects, own, inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
+                let lit = own_material_base(layers, effects, run.clone());
+                for own in run.clone() {
+                    if lit == Some(own) {
+                        plan.bind_stack_reads(layers, effects, own, run.clone(), false, (&mut stack_reads, &mut read_effects));
+                    } else {
+                        plan.add_layer_content(layers, effects, own, run.clone(), inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
+                    }
                 }
             }
             let mask_has_fields = mask_count > 0
@@ -617,7 +622,9 @@ impl FilterPlan {
                     plan.add_stack(effects, (mask, mask_count), (index as u32, None), None, inputs);
                     plan.stages.len() != before
                 });
-            plan.add_layer_content(layers, effects, index, inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
+            // The layer's own material is captured after its mask and its other channels' stacks
+            plan.bind_stack_reads(layers, effects, index, run.clone(), true, (&mut stack_reads, &mut read_effects));
+            plan.add_layer_content(layers, effects, index, run, inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
             layers[index].spatial[2] = u32::from(mask_has_fields);
         }
         // An anchor can carry a filter's footprint into the next layer. Independent
@@ -715,31 +722,48 @@ impl FilterPlan {
     /// and Roughness, or Glossiness and Specular). It is bound like the first, up to the same
     /// operation, and shares a stage with any read of the same channel there; it gets no
     /// `this_layer_content`.
+    ///
+    /// With `own_material` false it binds the reads of operation `index`'s own effects that stop
+    /// below the layer (`effects[1]` 0). With it true, at the layer's Base Color operation, it
+    /// binds every read of the layer's material (each channel operation's copy), so the capture
+    /// follows the layer's mask and the stacks of its other channels; a layer without a Base
+    /// Color operation has nothing for them to read, and they read nothing.
+    #[allow(clippy::too_many_arguments)]
     fn bind_stack_reads(
         &mut self,
         layers: &[Operation],
         effects: &mut [Operation],
         index: usize,
+        run: std::ops::Range<usize>,
+        own_material: bool,
         (stages, done): (&mut BTreeMap<(u32, Channel), u32>, &mut BTreeSet<usize>),
     ) {
-        let layer = &layers[index];
-        let [mask, mask_count, content, content_count] = layer.effects.map(|word| word as usize);
-        let reads: Vec<usize> = (mask..mask + mask_count)
-            .chain(content..content + content_count)
-            .filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2]) && !done.contains(&effect))
-            .collect();
-        if reads.is_empty() {
-            return;
-        }
-        // The layer's operations: the run sharing its mask range
-        let same_layer = |op: &Operation| op.effects[..2] == layer.effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
-        let first = (0..index).rev().take_while(|&earlier| same_layer(&layers[earlier])).last().unwrap_or(index);
-        let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
+        let base_color = (run.start..run.end).find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor));
+        let reads: BTreeSet<usize> = if own_material {
+            if base_color.is_some_and(|base| base != index) {
+                return;
+            }
+            // A set: operations sharing a content range list its effects once each
+            run.clone()
+                .flat_map(|own| effect_ranges(&layers[own]))
+                .filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] == 1))
+                .collect()
+        } else {
+            effect_ranges(&layers[index]).filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] != 1)).collect()
+        };
         for effect in reads {
-            done.insert(effect);
+            if !done.insert(effect) {
+                continue;
+            }
             let op = &mut effects[effect];
-            let until =
-                if op.effects[1] == 1 { (first..end).find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor)).unwrap_or(end) } else { first };
+            let until = if op.effects[1] == 1 { base_color } else { Some(run.start) };
+            let Some(until) = until else {
+                op.spatial[3] = 0;
+                if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) {
+                    op.spatial[2] = 0;
+                }
+                continue;
+            };
             let [first_read, second_read] = stack_reads(op);
             let mut bind = |read: u32| {
                 let slot = read.checked_sub(1)?;
@@ -767,7 +791,7 @@ impl FilterPlan {
                 op.spatial[2] = second_stage.map_or(0, |(_, stage)| stage);
             }
             if let Some((slot, _)) = first_stage {
-                op.effects[0] = (first..end).find(|&own| layers[own].ids[0] == slot).map_or(0, |own| own as u32 + 1);
+                op.effects[0] = run.clone().find(|&own| layers[own].ids[0] == slot).map_or(0, |own| own as u32 + 1);
             }
         }
     }
@@ -776,22 +800,24 @@ impl FilterPlan {
     /// and whether it has any in the layer's `spatial[0..2]`. A Normal operation whose stack has a
     /// Height To Normal stage reads its layer's own Height operation (`INPUT_LAYER`), whose stack
     /// goes first so the Normal stage's prepare pass reads prepared Height fields.
+    #[allow(clippy::too_many_arguments)]
     fn add_layer_content(
         &mut self,
         layers: &mut [Operation],
         effects: &mut [Operation],
         index: usize,
+        run: std::ops::Range<usize>,
         inputs: &ProceduralInputs,
         (prepared, stages, done): ContentProgress,
     ) {
         if !prepared.insert(index) {
             return;
         }
-        let height = layer_height(layers, effects, index, inputs);
+        let height = layer_height(layers, effects, index, run.clone(), inputs);
         if let Some(height) = height.filter(|&height| height != index) {
-            self.add_layer_content(layers, effects, height, inputs, (prepared, stages, done));
+            self.add_layer_content(layers, effects, height, run.clone(), inputs, (prepared, stages, done));
         }
-        self.bind_stack_reads(layers, effects, index, (stages, done));
+        self.bind_stack_reads(layers, effects, index, run, false, (stages, done));
         let [_, _, content, content_count] = layers[index].effects;
         let first = self.stages.len();
         self.add_stack(effects, (content, content_count), (index as u32, height.map(|height| height as u32)), Some(slot_kind(layers[index].ids[0])), inputs);
@@ -928,10 +954,10 @@ impl FilterPlan {
     }
 }
 
-/// The layer's own Height operation (in the run of operations of layer operation `index`) when
+/// The layer's own Height operation (in `run`, the draw of layer operation `index`) when
 /// `index` is a Normal operation whose content has a Height To Normal stage: the CPU's stage
 /// reads the layer's Height content times its coverage as its gray (`plan_in(.., Height)`).
-fn layer_height(layers: &[Operation], effects: &[Operation], index: usize, inputs: &ProceduralInputs) -> Option<usize> {
+fn layer_height(layers: &[Operation], effects: &[Operation], index: usize, run: std::ops::Range<usize>, inputs: &ProceduralInputs) -> Option<usize> {
     let layer = &layers[index];
     if layer.ids[0] != channel_slot(Channel::Normal) {
         return None;
@@ -943,10 +969,7 @@ fn layer_height(layers: &[Operation], effects: &[Operation], index: usize, input
     if !reads {
         return None;
     }
-    let same_layer = |op: &Operation| op.effects[..2] == layer.effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
-    let first = (0..index).rev().take_while(|&earlier| same_layer(&layers[earlier])).last().unwrap_or(index);
-    let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
-    (first..end).find(|&own| layers[own].ids[0] == channel_slot(Channel::Height))
+    run.into_iter().find(|&own| layers[own].ids[0] == channel_slot(Channel::Height))
 }
 
 /// The channel slots plus one an effect operation asks the stack for (`FilterPlan::bind_stack_reads`):
@@ -957,6 +980,29 @@ fn stack_reads(op: &Operation) -> [u32; 2] {
         return [0; 2];
     }
     [op.spatial[3], if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) { op.spatial[2] } else { 0 }]
+}
+
+/// The layer operations of the draw holding layer operation `index`, from the draws
+/// `try_compile_with_brush` records (`AnchorInputs::draw_ranges`); the operation alone without
+/// them (the standalone mask preview has one layer operation)
+fn layer_run(draw_ranges: &[std::ops::Range<u32>], index: usize) -> std::ops::Range<usize> {
+    let at = u32::try_from(index).unwrap_or(u32::MAX);
+    draw_ranges.iter().find(|range| range.contains(&at)).map_or(index..index + 1, |range| range.start as usize..range.end as usize)
+}
+
+/// An operation's mask and content effects
+fn effect_ranges(op: &Operation) -> impl Iterator<Item = usize> {
+    let [mask, mask_count, content, content_count] = op.effects.map(|word| word as usize);
+    (mask..mask + mask_count).chain(content..content + content_count)
+}
+
+/// The Base Color operation of the run when one of its effects reads the layer's material (`effects[1]` 1)
+fn own_material_base(layers: &[Operation], effects: &[Operation], run: std::ops::Range<usize>) -> Option<usize> {
+    let reads = run
+        .clone()
+        .flat_map(|own| effect_ranges(&layers[own]))
+        .any(|effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] == 1));
+    run.into_iter().find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor)).filter(|_| reads)
 }
 
 /// Append the effects' image input sources and rebind each effect's `effects[3]` reference to
