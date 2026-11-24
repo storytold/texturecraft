@@ -173,6 +173,8 @@ impl Features {
 /// A pipeline compiled, or compiling on a worker thread (`CompositePipelines::asynchronous`)
 enum Slot {
     Ready(wgpu::ComputePipeline),
+    // The web compiles in place: no worker threads there
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Compiling(Arc<Mutex<Option<wgpu::ComputePipeline>>>),
 }
 

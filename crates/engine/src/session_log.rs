@@ -72,7 +72,7 @@ impl SessionLog {
                 let _ = writeln!(file, "[{}] {}", entry.time.to_rfc3339(), entry.message);
             }
         }
-        self.0.push(entry);
+        self.record(entry);
     }
 
     pub fn warn(&mut self, source: &str, message: impl Into<String>) {
@@ -97,9 +97,14 @@ impl SessionLog {
         }
     }
 
-    pub(crate) fn prepend(&mut self, mut earlier: SessionLog) {
-        earlier.0.append(&mut self.0);
-        self.0 = earlier.0;
+    /// Put the entries of `earlier` before this log's; every entry gets a new occurrence after
+    /// the ones this log handed out, so none is reused
+    pub(crate) fn prepend(&mut self, earlier: SessionLog) {
+        let mut merged = SessionLog { last_occurrence: self.last_occurrence, ..SessionLog::default() };
+        for entry in earlier.entries.into_iter().chain(std::mem::take(&mut self.entries)) {
+            merged.record(entry);
+        }
+        *self = merged;
     }
 
     pub fn clear(&mut self) {
@@ -130,5 +135,28 @@ impl<'a> IntoIterator for &'a SessionLog {
     type IntoIter = std::slice::Iter<'a, LogEntry>;
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionLog;
+
+    /// Entries put before a log keep their order and get occurrences after the ones the log
+    /// handed out, so a reader past them still reads every later entry
+    #[test]
+    fn prepended_entries_come_first_with_new_occurrences() {
+        let mut log = SessionLog::new();
+        log.push("opened".into());
+        let mut earlier = SessionLog::new();
+        earlier.performance("decoded");
+
+        log.prepend(earlier);
+        log.push("later".into());
+
+        let messages: Vec<&str> = log.entries().iter().map(|entry| entry.message.as_str()).collect();
+        assert_eq!(messages, ["decoded", "opened", "later"]);
+        let occurrences: Vec<u64> = log.entries_after(0).map(|(occurrence, _)| occurrence).collect();
+        assert_eq!(occurrences, [2, 3, 4]);
     }
 }
