@@ -512,8 +512,9 @@ impl FilterPlan {
         let mut read_effects = BTreeSet::new();
         let mut prepared = BTreeSet::new();
         for index in 0..layers.len() {
+            let run = layer_run(&inputs.anchors.draw_ranges, index);
             if layers[index].ids[1] != ANCHOR_PUBLISH_LAYER {
-                plan.bind_stack_reads(layers, effects, index, (&mut stack_reads, &mut read_effects));
+                plan.bind_stack_reads(layers, effects, index, run.clone(), false, (&mut stack_reads, &mut read_effects));
             }
             let layer = &mut layers[index];
             if layer.ids[1] == ANCHOR_PUBLISH_LAYER {
@@ -522,15 +523,17 @@ impl FilterPlan {
             }
             let [mask, mask_count, _, _] = layer.effects;
             // A mask reading its own layer's content: that layer's content stacks first, so the
-            // mask's prepare pass resumes from prepared content fields
+            // mask's prepare pass resumes from prepared content fields. A Base Color that reads
+            // the layer's material waits for the mask too, which the material's capture reads.
             if mask_count > 0 && !masks.contains_key(&mask) && effects.iter().skip(mask as usize).take(mask_count as usize).any(packages::mask_reads_own_layer)
             {
-                let same_layer = |op: &Operation| op.effects[..2] == layers[index].effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
-                let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
-                for own in index..end {
-                    plan.bind_stack_reads(layers, effects, own, (&mut stack_reads, &mut read_effects));
-                    plan.add_content_stack(layers, effects, own, inputs);
-                    prepared.insert(own);
+                let lit = own_material_base(layers, effects, run.clone());
+                for own in run.clone() {
+                    plan.bind_stack_reads(layers, effects, own, run.clone(), false, (&mut stack_reads, &mut read_effects));
+                    if lit != Some(own) {
+                        plan.add_content_stack(layers, effects, own, inputs);
+                        prepared.insert(own);
+                    }
                 }
             }
             let mask_has_fields = mask_count > 0
@@ -539,6 +542,8 @@ impl FilterPlan {
                     plan.add_stack(effects, mask, mask_count, index as u32, None, inputs);
                     plan.stages.len() != before
                 });
+            // The layer's own material is captured after its mask and its other channels' stacks
+            plan.bind_stack_reads(layers, effects, index, run, true, (&mut stack_reads, &mut read_effects));
             if !prepared.contains(&index) {
                 plan.add_content_stack(layers, effects, index, inputs);
             }
@@ -620,39 +625,48 @@ impl FilterPlan {
     /// and Roughness, or Glossiness and Specular). It is bound like the first, up to the same
     /// operation, and shares a stage with any read of the same channel there; it gets no
     /// `this_layer_content`.
+    ///
+    /// With `own_material` false it binds the reads of operation `index`'s own effects that stop
+    /// below the layer (`effects[1]` 0). With it true, at the layer's Base Color operation, it
+    /// binds every read of the layer's material (each channel operation's copy), so the capture
+    /// follows the layer's mask and the stacks of its other channels; a layer without a Base
+    /// Color operation has nothing for them to read, and they read nothing.
+    #[allow(clippy::too_many_arguments)]
     fn bind_stack_reads(
         &mut self,
         layers: &[Operation],
         effects: &mut [Operation],
         index: usize,
+        run: std::ops::Range<usize>,
+        own_material: bool,
         (stages, done): (&mut BTreeMap<(u32, Channel), u32>, &mut BTreeSet<usize>),
     ) {
-        let layer = &layers[index];
-        // The layer's operations: the run sharing its mask range
-        let same_layer = |op: &Operation| op.effects[..2] == layer.effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
-        let first = (0..index).rev().take_while(|&earlier| same_layer(&layers[earlier])).last().unwrap_or(index);
-        let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
-        // Reads of the layer's own material (every operation's copy) bind at the operation they end at, so their capture follows the stacks of the other channels
-        let own_end = (first..end).find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor)).unwrap_or(end - 1);
-        let ranges = |op: &Operation| {
-            let [mask, mask_count, content, content_count] = op.effects.map(|word| word as usize);
-            (mask..mask + mask_count).chain(content..content + content_count)
+        let base_color = (run.start..run.end).find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor));
+        let reads: BTreeSet<usize> = if own_material {
+            if base_color.is_some_and(|base| base != index) {
+                return;
+            }
+            // A set: operations sharing a content range list its effects once each
+            run.clone()
+                .flat_map(|own| effect_ranges(&layers[own]))
+                .filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] == 1))
+                .collect()
+        } else {
+            effect_ranges(&layers[index]).filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] != 1)).collect()
         };
-        let own = if index == own_end { (first..end).flat_map(|own| ranges(&layers[own])).collect() } else { Vec::new() };
-        // A set: operations sharing a content range list its effects once each
-        let reads: BTreeSet<usize> = ranges(layer)
-            .filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] != 1))
-            .chain(own.into_iter().filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] == 1)))
-            .filter(|effect| !done.contains(effect))
-            .collect();
-        if reads.is_empty() {
-            return;
-        }
         for effect in reads {
-            done.insert(effect);
+            if !done.insert(effect) {
+                continue;
+            }
             let op = &mut effects[effect];
-            let until =
-                if op.effects[1] == 1 { (first..end).find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor)).unwrap_or(end) } else { first };
+            let until = if op.effects[1] == 1 { base_color } else { Some(run.start) };
+            let Some(until) = until else {
+                op.spatial[3] = 0;
+                if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) {
+                    op.spatial[2] = 0;
+                }
+                continue;
+            };
             let [first_read, second_read] = stack_reads(op);
             let mut bind = |read: u32| {
                 let slot = read.checked_sub(1)?;
@@ -679,7 +693,7 @@ impl FilterPlan {
                 op.spatial[2] = second_stage.map_or(0, |(_, stage)| stage);
             }
             if let Some((slot, _)) = first_stage {
-                op.effects[0] = (first..end).find(|&own| layers[own].ids[0] == slot).map_or(0, |own| own as u32 + 1);
+                op.effects[0] = run.clone().find(|&own| layers[own].ids[0] == slot).map_or(0, |own| own as u32 + 1);
             }
         }
     }
@@ -796,6 +810,29 @@ fn stack_reads(op: &Operation) -> [u32; 2] {
         return [0; 2];
     }
     [op.spatial[3], if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) { op.spatial[2] } else { 0 }]
+}
+
+/// The layer operations of the draw holding layer operation `index`, from the draws
+/// `try_compile_with_brush` records (`AnchorInputs::draw_ranges`); the operation alone without
+/// them (the standalone mask preview has one layer operation)
+fn layer_run(draw_ranges: &[std::ops::Range<u32>], index: usize) -> std::ops::Range<usize> {
+    let at = u32::try_from(index).unwrap_or(u32::MAX);
+    draw_ranges.iter().find(|range| range.contains(&at)).map_or(index..index + 1, |range| range.start as usize..range.end as usize)
+}
+
+/// An operation's mask and content effects
+fn effect_ranges(op: &Operation) -> impl Iterator<Item = usize> {
+    let [mask, mask_count, content, content_count] = op.effects.map(|word| word as usize);
+    (mask..mask + mask_count).chain(content..content + content_count)
+}
+
+/// The Base Color operation of the run when one of its effects reads the layer's material (`effects[1]` 1)
+fn own_material_base(layers: &[Operation], effects: &[Operation], run: std::ops::Range<usize>) -> Option<usize> {
+    let reads = run
+        .clone()
+        .flat_map(|own| effect_ranges(&layers[own]))
+        .any(|effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] == 1));
+    run.into_iter().find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor)).filter(|_| reads)
 }
 
 /// Append the effects' image input sources and rebind each effect's `effects[3]` reference to

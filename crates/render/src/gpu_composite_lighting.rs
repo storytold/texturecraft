@@ -14,17 +14,19 @@
 //!
 //! How:
 //! - [`lower`] is called from `point_effect` for every filter the built-in arms do not take
-//!   (`BakedLighting { stylized: None, .. }` stays built in). Return `(opcode, [three params])`
-//!   with an opcode from `packages::LIGHTING_OPCODES` (152..160), or None without touching `op`.
-//!   About 30 stylized parameters go in the side table (`inputs.pack_params`, offset in
-//!   `op.ext[0]`); flags in `op.ext[2] & LIGHTING_OP_BITS`.
-//! - The WGSL file defines `lighting_scalar_filter`, `lighting_effect_color` and the loop-level
-//!   `lighting_content_effect`/`lighting_mask_effect`. The layer's other channels come from a
-//!   stack read of its material (P0g: `spatial[3]`, `effects[1] = 1`, `stack_at` in WGSL).
+//!   (`BakedLighting { stylized: None, .. }` stays built in). It returns `(opcode, [three
+//!   params])` with an opcode from `packages::LIGHTING_OPCODES` (152..160), or None without
+//!   touching `op`. Stylized keeps 39 words in the side table (`inputs.pack_params`, offset in
+//!   `op.ext[0]`), Environment its late-bound light and 7 settings; the relief is the first
+//!   parameter (`op.low.x`) and the flags are in `op.ids[2]`.
+//! - The WGSL files: the dispatcher (`lighting_content_effect`, which reads the material and the
+//!   lit normal once) and one file per kind, each compiled in full only when a program uses that
+//!   kind ([`shader_kinds`], `ShaderFlags::lighting`; [`source`]). The layer's other channels
+//!   come from stack reads of its material (`spatial[3]` and `spatial[2]`, `effects[1] = 1`).
 //! - [`needs_surface`] keeps the surface inputs bound for P6 operations.
 //! - [`order_layer_operations`] may move any operation of the layer; the caller then finds the
 //!   Height operation again for the height mask (`height_op`) and writes the constraints.
-//! - Lighting is skipped in masks on both sides (`compile_mask`), keep it so.
+//! - Lighting and PBR Validate are skipped in masks on both sides (`compile_mask`), keep it so.
 //!
 //! Tables: [`LIBRARY_STILL_ON_CPU`] and `still_on_cpu` in the tests below. Every port gets a CPU
 //! oracle test (`crate::gpu_composite::oracle`) on Base Color with the other channels present,
@@ -38,9 +40,25 @@ use super::{CompositeProgram, Operation, ProceduralInputs, channel_slot};
 /// Library filter ids P6 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
-pub(super) const WGSL: &str = include_str!("shaders/composite_lighting.wgsl");
+/// The dispatcher and helpers; each kind's file (or its stub) follows it ([`source`])
+const WGSL: &str = include_str!("shaders/composite_lighting.wgsl");
+/// The lit normal, for Stylized and Environment
+const NORMAL_WGSL: &str = include_str!("shaders/composite_lighting_normal.wgsl");
+const NORMAL_STUB: &str = "fn lighting_normal(effect: Operation, texel: LayerTexel) -> vec3<f32> { return texel.surface.normal; }\n";
+const STYLIZED_WGSL: &str = include_str!("shaders/composite_lighting_stylized.wgsl");
+const STYLIZED_STUB: &str = "fn lighting_stylized(effect: Operation, albedo: vec3<f32>, normal: vec3<f32>, baked: vec2<f32>, first: vec3<f32>, second: vec3<f32>) -> vec3<f32> { return albedo; }\n";
+const ENVIRONMENT_WGSL: &str = include_str!("shaders/composite_lighting_environment.wgsl");
+const ENVIRONMENT_STUB: &str =
+    "fn lighting_environment(effect: Operation, albedo: vec3<f32>, normal: vec3<f32>, ao: f32, metal_read: f32) -> vec3<f32> { return albedo; }\n";
+const VALIDATE_WGSL: &str = include_str!("shaders/composite_lighting_validate.wgsl");
+const VALIDATE_STUB: &str = "fn lighting_pbr_validate(effect: Operation, color: vec3<f32>, metal: f32) -> vec3<f32> { return color; }\n";
+/// The lighting kinds a program compiles ([`shader_kinds`], `ShaderFlags::lighting`)
+pub(super) const KIND_STYLIZED: u8 = 1;
+pub(super) const KIND_ENVIRONMENT: u8 = 2;
+pub(super) const KIND_VALIDATE: u8 = 4;
+pub(super) const KINDS_ALL: u8 = KIND_STYLIZED | KIND_ENVIRONMENT | KIND_VALIDATE;
 /// The same functions without P6's code, for programs that do not use it.
-pub(super) const WGSL_STUB: &str = "fn lighting_scalar_filter(op: Operation, x: f32) -> f32 { return x; }
+const WGSL_STUB: &str = "fn lighting_scalar_filter(op: Operation, x: f32) -> f32 { return x; }
 fn lighting_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> { return c; }
 fn lighting_content_effect(effect: Operation, content: vec4<f32>, channel: u32, texel: LayerTexel) -> vec4<f32> {
     let filtered = lighting_effect_color(effect, content.rgb, channel, texel.surface, texel.baked.x);
@@ -55,7 +73,7 @@ const ENVIRONMENT_OPCODE: u32 = LIGHTING_OPCODES.start + 1;
 /// PBR Validate: the base color checked against the metal of the layer's material
 const PBR_VALIDATE_OPCODE: u32 = LIGHTING_OPCODES.start + 2;
 /// Baked Lighting Stylized's flags in `ids[2]`: Specular Glossiness, the diffuse and specular
-/// outputs, and the detail normal (Mesh + Height + Normal)
+/// outputs, and the detail normal (Mesh + Height + Normal, always on for Environment)
 const SPECULAR_GLOSSINESS: u32 = 1;
 const LIT_DIFFUSE: u32 = 2;
 const LIT_SPECULAR: u32 = 4;
@@ -88,21 +106,22 @@ pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, input
                 sin_tilt,
                 cos_tilt,
                 exposure.clamp(-stops, stops).exp2(),
-                height_intensity / ENVIRONMENT_HEIGHT_UNIT,
                 finite_unit(*ambient_occlusion),
                 finite_unit(*specular_occlusion),
                 DIELECTRIC_REFLECTANCE,
             ];
-            if values.iter().any(|value| !value.is_finite()) {
+            let relief = height_intensity / ENVIRONMENT_HEIGHT_UNIT;
+            if !relief.is_finite() || values.iter().any(|value| !value.is_finite()) {
                 return None;
             }
 
             // The environment's late-bound words first, then the settings
             let words: Vec<u32> = std::iter::once(light).chain(values.map(f32::to_bits)).collect();
             op.ext[0] = inputs.pack_words(&words)?;
+            op.ids[2] = DETAIL_NORMAL;
             read_material(op, Channel::Metallic);
             inputs.read_bake_rows();
-            Some((ENVIRONMENT_OPCODE, [0.0; 3]))
+            Some((ENVIRONMENT_OPCODE, [relief, 0.0, 0.0]))
         }
         Filter::PbrValidate(validate) => {
             let flag = |on: bool, bit: u32| if on { bit } else { 0 };
@@ -119,8 +138,8 @@ pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, input
 
 /// Baked Lighting Stylized as `StylizedShading::new` works its settings out, in the side table:
 /// three lights of seven words (direction toward it, intensity, color), the sky intensity, the
-/// sky, horizon and ground colors, the AO, cavity and edges amounts, the two smoothnesses, the
-/// dielectric reflectance and the relief. Highlights read the material's Metallic and Roughness,
+/// sky, horizon and ground colors, the AO, cavity and edges amounts, the two smoothnesses and the
+/// dielectric reflectance (39 words); the relief is the first parameter. Highlights read the material's Metallic and Roughness,
 /// or Glossiness and Specular; None for Baked Lighting saved before the stylized settings.
 fn stylized(filter: &Filter, op: &mut Operation, inputs: &mut ProceduralInputs) -> Option<(u32, [f32; 3])> {
     let (settings, light) = filter.stylized_lighting()?;
@@ -140,7 +159,6 @@ fn stylized(filter: &Filter, op: &mut Operation, inputs: &mut ProceduralInputs) 
         smoothness(settings.cavity_smoothness),
         smoothness(settings.edges_smoothness),
         finite_unit(settings.dielectric_reflectance),
-        relief.unwrap_or(0.0),
     ]);
     op.ext[0] = inputs.pack_params(&values)?;
 
@@ -160,7 +178,8 @@ fn stylized(filter: &Filter, op: &mut Operation, inputs: &mut ProceduralInputs) 
     if relief.is_some() {
         inputs.read_bake_rows();
     }
-    Some((STYLIZED_OPCODE, [0.0; 3]))
+    let relief = relief.unwrap_or(0.0);
+    relief.is_finite().then_some((STYLIZED_OPCODE, [relief, 0.0, 0.0]))
 }
 
 /// Let `op` read `channel` of its layer's material at the texel: the stack below with the layer's
@@ -186,9 +205,43 @@ pub(super) fn order_layer_operations(operations: &mut [Operation]) {
     }
 }
 
-/// Whether a program needs the full `composite_lighting.wgsl`.
-pub(super) fn uses_shader(program: &CompositeProgram) -> bool {
-    program.operations.iter().any(|op| LIGHTING_OPCODES.contains(&op.ids[1]) || op.ext[2] & LIGHTING_OP_BITS != 0)
+/// The lighting kinds a program's operations use ([`KIND_STYLIZED`], …): only those compile in full.
+pub(super) fn shader_kinds(program: &CompositeProgram) -> u8 {
+    program.operations.iter().fold(0, |kinds, op| {
+        kinds
+            | match op.ids[1] {
+                STYLIZED_OPCODE => KIND_STYLIZED,
+                ENVIRONMENT_OPCODE => KIND_ENVIRONMENT,
+                PBR_VALIDATE_OPCODE => KIND_VALIDATE,
+                _ if op.ext[2] & LIGHTING_OP_BITS != 0 => KINDS_ALL,
+                _ => 0,
+            }
+    })
+}
+
+/// The lighting WGSL of `kinds`: the stub without any, else the dispatcher with each kind's
+/// file in full or as its stub (the lit normal in full for Stylized or Environment).
+pub(super) fn source(kinds: u8) -> &'static str {
+    static SOURCES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let sources = SOURCES.get_or_init(|| {
+        (0..=KINDS_ALL)
+            .map(|kinds| {
+                if kinds == 0 {
+                    return WGSL_STUB.to_string();
+                }
+                let pick = |kind: u8, full: &str, stub: &str| if kinds & kind != 0 { full.to_string() } else { stub.to_string() };
+                [
+                    WGSL.to_string(),
+                    pick(KIND_STYLIZED | KIND_ENVIRONMENT, NORMAL_WGSL, NORMAL_STUB),
+                    pick(KIND_STYLIZED, STYLIZED_WGSL, STYLIZED_STUB),
+                    pick(KIND_ENVIRONMENT, ENVIRONMENT_WGSL, ENVIRONMENT_STUB),
+                    pick(KIND_VALIDATE, VALIDATE_WGSL, VALIDATE_STUB),
+                ]
+                .join("\n")
+            })
+            .collect()
+    });
+    sources.get(usize::from(kinds & KINDS_ALL)).map_or(WGSL_STUB, String::as_str)
 }
 
 /// P6's vec4 of the band uniform (`params.packages[5]`).
@@ -320,6 +373,56 @@ mod tests {
         case.mask_owner = Some(owner);
         case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
         assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, "before a Blur");
+
+        // Over a maskless layer of another metal: the dark base color is valid only as the lit layer's own non-metal
+        let dark = |project: &mut Project| {
+            without_masks(project);
+            if let Some(LayerKind::Fill(fill)) = lit_layer(project).map(|layer| &mut layer.kind) {
+                fill.sources.insert(Channel::BaseColor, Source::Uniform([0.03; 3]));
+            }
+        };
+        let maskless = lit_project(&[(validate, 1.0, BlendMode::Normal, true)], dark);
+        assert_lit_matches(&mut gpu, &maskless, &lit_bakes(false, false), (false, Tolerance::POINT), "maskless layers");
+    }
+
+    /// A lit layer whose blurred mask reads the layer (Compare This Layer, test probe 188): the
+    /// material's capture comes after the mask's stack, which it reads, and before the Base
+    /// Color stage that reads it
+    #[test]
+    fn a_mask_reading_its_lit_layer_comes_before_the_material_capture() {
+        use texturecraft_compose::PixelStore;
+        use texturecraft_core::{Channel, Effect, Fill, Layer, LayerKind, Mask, MaskBackground, PbrValidate, Project, TextureSet};
+
+        use super::super::packages::PROBE_LOWERING;
+        use super::super::{CompositeProgram, MASK_STAGE, channel_slot};
+
+        let mut project = Project::new("Order", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, 64));
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "Lit", LayerKind::Fill(Fill::default()), &[Channel::BaseColor, Channel::Metallic]);
+        for filter in [Filter::PbrValidate(PbrValidate::LIBRARY), Filter::Blur { radius: 4.0, wrap: false }] {
+            let mut added = Effect::new(project.alloc_id(), EffectKind::Filter(filter));
+            added.off_channels.insert(Channel::Metallic);
+            layer.content_effects.push(added);
+        }
+        let mut mask = Mask::new(MaskBackground::White);
+        let slot = channel_slot(Channel::Metallic) as f32;
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Smoothstep { min: slot, max: 0.0 })));
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 4.0, wrap: false })));
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+        PROBE_LOWERING.set(Some(188));
+        let program = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None);
+        PROBE_LOWERING.set(None);
+        let program = program.unwrap();
+
+        let layers = &program.operations[..program.layer_count as usize];
+        let base = layers.iter().position(|op| op.ids[0] == channel_slot(Channel::BaseColor)).unwrap() as u32;
+        let stages = &program.filters.stages;
+        let capture = stages.iter().position(|stage| stage.layer == base && stage.anchor.is_some_and(|(channel, ..)| channel == Channel::Metallic));
+        let last_mask = stages.iter().rposition(|stage| stage.preceding & MASK_STAGE != 0 && stage.filter.is_some());
+        let first_base = stages.iter().position(|stage| stage.layer == base && stage.filter.is_some() && stage.preceding & MASK_STAGE == 0);
+        assert!(matches!((last_mask, capture, first_base), (Some(mask), Some(capture), Some(base)) if mask < capture && capture < base), "{stages:?}");
     }
 
     /// One content effect of the lit layer: filter, opacity, blend, and whether it starts on Base
@@ -423,13 +526,53 @@ mod tests {
         texturecraft_compose::BakedMaps { resolution: LIT_BAKE_SIZE as u32, maps }
     }
 
-    /// Composite `project` against the CPU with `baked`, the lit layer's mask preview too, and a
-    /// partial update when `region` is set
+    /// The lit layer of [`lit_project`]
+    fn lit_layer(project: &mut texturecraft_core::Project) -> Option<&mut texturecraft_core::Layer> {
+        project.layers.values_mut().find(|layer| layer.name == "Lit")
+    }
+
+    /// Every layer without its mask, as a new fill layer comes
+    fn without_masks(project: &mut texturecraft_core::Project) {
+        for layer in project.layers.values_mut() {
+            layer.mask = None;
+        }
+    }
+
+    /// The lit layer's first Blur on Metallic alone, and a Blur in its mask: the material's
+    /// capture must follow the Metallic stack and the mask's
+    fn blurred_metal_and_mask(project: &mut texturecraft_core::Project) {
+        use texturecraft_core::{Channel, Effect, EffectKind, Filter};
+
+        let id = project.alloc_id();
+        let Some(layer) = lit_layer(project) else { return };
+        if let Some(blur) = layer.content_effects.iter_mut().find(|effect| matches!(effect.kind, EffectKind::Filter(Filter::Blur { .. }))) {
+            blur.off_channels = Channel::ALL.into_iter().filter(|&channel| channel != Channel::Metallic).collect();
+        }
+        if let Some(mask) = &mut layer.mask {
+            mask.effects.push(Effect::new(id, EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false })));
+        }
+    }
+
+    /// The lit layer laying Base Color alone under a blurred mask: its Base Color operation is
+    /// the layer's first, and the material's capture must still follow the mask's stack
+    fn base_color_alone_under_a_blurred_mask(project: &mut texturecraft_core::Project) {
+        use texturecraft_core::{Channel, Effect, EffectKind, Filter};
+
+        let id = project.alloc_id();
+        let Some(layer) = lit_layer(project) else { return };
+        layer.channels.retain(|&channel, _| channel == Channel::BaseColor);
+        if let Some(mask) = &mut layer.mask {
+            mask.effects.push(Effect::new(id, EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false })));
+        }
+    }
+
+    /// Composite `project` against the CPU with `baked` within `tolerance`, the lit layer's mask
+    /// preview too when it has a mask, and a partial update when `region` is set
     fn assert_lit_matches(
         gpu: &mut crate::headless::Headless,
         (project, owner): &(texturecraft_core::Project, texturecraft_core::LayerId),
         baked: &texturecraft_compose::BakedMaps,
-        region: bool,
+        (region, tolerance): (bool, crate::gpu_composite::oracle::Tolerance),
         label: &str,
     ) {
         use std::sync::Arc;
@@ -438,16 +581,16 @@ mod tests {
         use texturecraft_geom::primitives;
 
         use crate::gpu_composite::CompositeRegion;
-        use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu};
+        use crate::gpu_composite::oracle::{OracleCase, assert_matches_cpu};
 
         let mesh = Arc::new(primitives::sphere(1.0, 24, 12));
         let (pixels, images) = (PixelStore::default(), ImageStore::default());
         let mut case = OracleCase::new(project, &pixels, baked, &images, &mesh);
-        case.mask_owner = Some(*owner);
+        case.mask_owner = project.layers.get(owner).and_then(|layer| layer.mask.as_ref()).map(|_| *owner);
         if region {
             case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
         }
-        assert_matches_cpu(gpu, &case, Tolerance::TRANSCENDENTAL, label);
+        assert_matches_cpu(gpu, &case, tolerance, label);
     }
 
     /// Baked Lighting Stylized lights the base color as the CPU does: its sun, extra lights and sky
@@ -460,14 +603,16 @@ mod tests {
     /// or no bakes, and chained after Invert and before a Blur with a partial update.
     #[test]
     fn baked_lighting_stylized_matches_the_cpu() {
-        use texturecraft_core::{BlendMode, DirectionalLight, LightingOutput, StylizedLighting};
+        use texturecraft_core::{BlendMode, Channel, DirectionalLight, LightingOutput, StylizedLighting};
 
-        use crate::gpu_composite::oracle::headless;
+        use crate::gpu_composite::oracle::{Tolerance, headless};
 
         let library = StylizedLighting::library();
         assert!(compile_effects(Some(effect(EffectKind::Filter(stylized_lighting(library.clone())))), None, ContentsOffset::NONE).0.is_ok());
 
         let Some(mut gpu) = headless() else { return };
+        // Every value of the shading is a product, a sum, a square root or a division
+        let tolerance = Tolerance::POINT;
         let detailed = StylizedLighting {
             lights: [
                 DirectionalLight { azimuth: 120.0, elevation: 20.0, intensity: 0.6, color: [0.4, 0.6, 1.0] },
@@ -493,7 +638,13 @@ mod tests {
         ];
         let baked = lit_bakes(true, true);
         for (label, settings) in settings {
-            assert_lit_matches(&mut gpu, &lit_project(&[(stylized_lighting(settings), 1.0, BlendMode::Normal, true)], |_| {}), &baked, false, label);
+            assert_lit_matches(
+                &mut gpu,
+                &lit_project(&[(stylized_lighting(settings), 1.0, BlendMode::Normal, true)], |_| {}),
+                &baked,
+                (false, tolerance),
+                label,
+            );
         }
 
         let filter = stylized_lighting(detailed);
@@ -503,19 +654,45 @@ mod tests {
             ("every channel on", (filter.clone(), 0.77, BlendMode::Normal, false)),
         ];
         for (label, lit) in blends {
-            assert_lit_matches(&mut gpu, &lit_project(&[lit], |_| {}), &baked, false, label);
+            assert_lit_matches(&mut gpu, &lit_project(&[lit], |_| {}), &baked, (false, tolerance), label);
         }
 
         let lit = (filter, 1.0, BlendMode::Normal, true);
         for (label, baked) in
             [("no Height", lit_bakes(false, true)), ("no World Normal", lit_bakes(true, false)), ("no bakes", texturecraft_compose::BakedMaps::default())]
         {
-            assert_lit_matches(&mut gpu, &lit_project(std::slice::from_ref(&lit), |_| {}), &baked, false, label);
+            assert_lit_matches(&mut gpu, &lit_project(std::slice::from_ref(&lit), |_| {}), &baked, (false, tolerance), label);
         }
 
         // Invert on every channel changes the material it reads; a Blur after it reads the lit base color in its prepare pass
         let chain = [(Filter::Invert, 1.0, BlendMode::Normal, false), lit.clone(), (Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, true)];
-        assert_lit_matches(&mut gpu, &lit_project(&chain, |_| {}), &baked, true, "after Invert and before a Blur");
+        assert_lit_matches(&mut gpu, &lit_project(&chain, |_| {}), &baked, (true, tolerance), "after Invert and before a Blur");
+
+        // The material of the lit layer alone, not of the maskless layer below it
+        assert_lit_matches(&mut gpu, &lit_project(std::slice::from_ref(&lit), without_masks), &baked, (false, tolerance), "maskless layers");
+        let every_channel = (lit.0.clone(), 1.0, BlendMode::Normal, false);
+        let blurred = [(Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, false), every_channel];
+        assert_lit_matches(
+            &mut gpu,
+            &lit_project(&blurred, blurred_metal_and_mask),
+            &baked,
+            (true, tolerance),
+            "after a Blur on Metallic, under a blurred mask",
+        );
+        assert_lit_matches(
+            &mut gpu,
+            &lit_project(std::slice::from_ref(&lit), base_color_alone_under_a_blurred_mask),
+            &baked,
+            (true, tolerance),
+            "Base Color alone",
+        );
+
+        // Highlights from the Glossiness and Specular defaults on a set without those channels
+        let glossy = (stylized_lighting(StylizedLighting { specular_glossiness: true, ..library }), 1.0, BlendMode::Normal, true);
+        let without = |project: &mut texturecraft_core::Project| {
+            project.texture_sets[0].channels.retain(|&(channel, _)| !matches!(channel, Channel::Glossiness | Channel::Specular))
+        };
+        assert_lit_matches(&mut gpu, &lit_project(&[glossy], without), &baked, (false, tolerance), "specular glossiness without its channels");
     }
 
     /// Baked Lighting Environment lights the base color with the viewport environment's diffuse
@@ -526,9 +703,9 @@ mod tests {
     /// partial update.
     #[test]
     fn baked_lighting_environment_matches_the_cpu() {
-        use texturecraft_core::BlendMode;
+        use texturecraft_core::{BlendMode, Effect, EffectKind};
 
-        use crate::gpu_composite::oracle::headless;
+        use crate::gpu_composite::oracle::{Tolerance, headless};
 
         let environment = |horizontal, vertical, exposure, height_intensity, ambient_occlusion, specular_occlusion| Filter::EnvironmentLighting {
             horizontal,
@@ -542,30 +719,52 @@ mod tests {
         assert!(compile_effects(Some(effect(EffectKind::Filter(defaults.clone()))), None, ContentsOffset::NONE).0.is_ok());
 
         let Some(mut gpu) = headless() else { return };
+        let tolerance = Tolerance::TRANSCENDENTAL;
         let baked = lit_bakes(true, true);
         let changed = environment(75.0, 30.0, -1.5, 2.5, 0.4, 0.8);
         let on_base = |filter: &Filter| (filter.clone(), 1.0, BlendMode::Normal, true);
-        assert_lit_matches(&mut gpu, &lit_project(&[on_base(&defaults)], |_| {}), &baked, false, "defaults");
-        assert_lit_matches(&mut gpu, &lit_project(&[on_base(&changed)], |_| {}), &baked, false, "every setting");
+        assert_lit_matches(&mut gpu, &lit_project(&[on_base(&defaults)], |_| {}), &baked, (false, tolerance), "defaults");
+        assert_lit_matches(&mut gpu, &lit_project(&[on_base(&changed)], |_| {}), &baked, (false, tolerance), "every setting");
         let turned = lit_project(&[on_base(&changed)], |project| project.display.env_rotation = 70.0);
-        assert_lit_matches(&mut gpu, &turned, &baked, false, "turned environment");
+        assert_lit_matches(&mut gpu, &turned, &baked, (false, tolerance), "turned environment");
         let night = lit_project(&[on_base(&changed)], |project| project.display.environment = "Night".into());
-        assert_lit_matches(&mut gpu, &night, &baked, false, "another environment");
+        assert_lit_matches(&mut gpu, &night, &baked, (false, tolerance), "another environment");
 
         for (label, lit) in
             [("opacity and Multiply", (changed.clone(), 0.77, BlendMode::Multiply, true)), ("disabled", (changed.clone(), 0.77, BlendMode::Disable, true))]
         {
-            assert_lit_matches(&mut gpu, &lit_project(&[lit], |_| {}), &baked, false, label);
+            assert_lit_matches(&mut gpu, &lit_project(&[lit], |_| {}), &baked, (false, tolerance), label);
         }
         for (label, baked) in
             [("no Height", lit_bakes(false, true)), ("no World Normal", lit_bakes(true, false)), ("no bakes", texturecraft_compose::BakedMaps::default())]
         {
-            assert_lit_matches(&mut gpu, &lit_project(&[on_base(&changed)], |_| {}), &baked, false, label);
+            assert_lit_matches(&mut gpu, &lit_project(&[on_base(&changed)], |_| {}), &baked, (false, tolerance), label);
         }
 
         let chain =
             [(Filter::Invert, 1.0, BlendMode::Normal, false), on_base(&changed), (Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, true)];
-        assert_lit_matches(&mut gpu, &lit_project(&chain, |_| {}), &baked, true, "after Invert and before a Blur");
+        assert_lit_matches(&mut gpu, &lit_project(&chain, |_| {}), &baked, (true, tolerance), "after Invert and before a Blur");
+
+        assert_lit_matches(&mut gpu, &lit_project(&[on_base(&changed)], without_masks), &baked, (false, tolerance), "maskless layers");
+        let every_channel = (changed.clone(), 0.77, BlendMode::Normal, false);
+        assert_lit_matches(&mut gpu, &lit_project(&[every_channel], |_| {}), &baked, (false, tolerance), "every channel on");
+        let blurred = [(Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, false), (changed.clone(), 1.0, BlendMode::Normal, false)];
+        assert_lit_matches(
+            &mut gpu,
+            &lit_project(&blurred, blurred_metal_and_mask),
+            &baked,
+            (true, tolerance),
+            "after a Blur on Metallic, under a blurred mask",
+        );
+
+        // In a mask it lights nothing, as the CPU skips it there
+        let in_mask = |project: &mut texturecraft_core::Project| {
+            let id = project.alloc_id();
+            if let Some(mask) = lit_layer(project).and_then(|layer| layer.mask.as_mut()) {
+                mask.effects.push(Effect::new(id, EffectKind::Filter(changed.clone())));
+            }
+        };
+        assert_lit_matches(&mut gpu, &lit_project(&[], in_mask), &baked, (false, tolerance), "in a mask");
     }
 
     /// The lit sphere's whole material at 2K and 4K, on the CPU and the GPU (warm), for each
@@ -585,6 +784,26 @@ mod tests {
         use crate::gpu_composite::CompositeProgram;
         use crate::gpu_composite::oracle::headless;
 
+        // The pipelines' compile times (debug log lines of this crate)
+        struct PipelineLog;
+        impl log::Log for PipelineLog {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                metadata.level() <= log::Level::Debug && metadata.target().starts_with("texturecraft_render")
+            }
+
+            fn log(&self, record: &log::Record) {
+                if self.enabled(record.metadata()) {
+                    println!("BENCH {}", record.args());
+                }
+            }
+
+            fn flush(&self) {}
+        }
+        static PIPELINE_LOG: PipelineLog = PipelineLog;
+        if log::set_logger(&PIPELINE_LOG).is_ok() {
+            log::set_max_level(log::LevelFilter::Debug);
+        }
+
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::sphere(1.0, 64, 32));
         let baked = lit_bakes(true, true);
@@ -596,13 +815,20 @@ mod tests {
             ambient_occlusion: 0.4,
             specular_occlusion: 0.8,
         };
-        let filters = [("stylized", stylized_lighting(StylizedLighting::library())), ("environment", environment)];
+        // Unlit first: the pipelines of each later kind compile on its first frame
+        let filters = [
+            ("unlit", None),
+            ("PBR Validate", Some(Filter::PbrValidate(texturecraft_core::PbrValidate::LIBRARY))),
+            ("environment", Some(environment)),
+            ("stylized", Some(stylized_lighting(StylizedLighting::library()))),
+        ];
         let (pixels, images) = (PixelStore::default(), ImageStore::default());
         for size in [2048u32, 4096] {
             let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, size, size));
             gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((size, size), 0)], 1);
             for (name, filter) in &filters {
-                let (project, _) = lit_project(&[(filter.clone(), 1.0, BlendMode::Normal, true)], |project| project.texture_sets[0].resolution = size);
+                let effects: Vec<LitEffect> = filter.iter().map(|filter| (filter.clone(), 1.0, BlendMode::Normal, true)).collect();
+                let (project, _) = lit_project(&effects, |project| project.texture_sets[0].resolution = size);
                 let set = &project.texture_sets[0];
                 let inputs = Inputs {
                     project: &project,
