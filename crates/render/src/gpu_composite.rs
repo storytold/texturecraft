@@ -1,7 +1,10 @@
 //! Compile the viewport's supported UV fills to a small GPU layer program.
 
 use std::sync::{Arc, Weak};
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
@@ -15,7 +18,7 @@ use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
 use crate::gpu_curvature::{CurvatureGpu, CurvatureInput, CurvatureLevels};
-use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages};
+use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, ImageUse, MaterialImages};
 use crate::gpu_neighbourhood::{self, FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
 use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
@@ -236,6 +239,12 @@ struct ProceduralInputs {
     /// A neighbourhood stage a package lowering asked to run right before the effect's own
     /// operation ([`Self::precede_with_stage`]); the callers of `point_effect` push it first.
     preceding_stage: Option<Operation>,
+    /// Source operations effects read as image inputs (`register_input`), appended after the
+    /// effects like the generators' sources.
+    input_sources: Vec<Operation>,
+    /// Side-table words that hold an image's record offset once the atlas is laid out
+    /// (`pack_image`): (word index in the side table, image index).
+    image_words: Vec<(u32, u32)>,
 }
 
 #[derive(Default)]
@@ -279,7 +288,34 @@ impl ProceduralInputs {
             generator_sources: Vec::new(),
             anchors: AnchorInputs::default(),
             preceding_stage: None,
+            input_sources: Vec::new(),
+            image_words: Vec::new(),
         }
+    }
+
+    /// Register `source` (a `source_operation`) as an effect's image input: the returned
+    /// reference goes in the effect operation's `effects[3]`. The program appends the source
+    /// after the effects and rebinds the reference to its operation index plus one, which a
+    /// neighbourhood stage then evaluates into its field's sixth word (`FilterStage::input`) and
+    /// a point operation reads with `effect_input(effect, texel)` in WGSL. The CPU reads inputs
+    /// with `Sampling::default()` (Bilinear HQ): build the source with P1's sampling.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn register_input(&mut self, source: Operation) -> u32 {
+        self.input_sources.push(source);
+        self.input_sources.len() as u32
+    }
+
+    /// A side-table word that will hold image `name`'s record offset (the atlas layout of
+    /// `MaterialImages`, `u32::MAX` while the image is missing): the returned offset goes where
+    /// the operation's shader reads it with `param_word`, and `image_texel_nearest` reads the
+    /// image there (P3: a Color Selection's ID map).
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn pack_image(&mut self, name: &str, usage: ImageUse) -> Option<u32> {
+        let image = self.materials.register_image(name, usage);
+        let word = u32::try_from(self.ramp_words.len()).ok()?;
+        let offset = self.pack_words(&[u32::MAX])?;
+        self.image_words.push((word, image));
+        Some(offset)
     }
 
     /// Lets a package lowering (in `packages::lower_filter`) run the neighbourhood stage of
@@ -402,14 +438,22 @@ struct FilterPlan {
 
 impl FilterPlan {
     fn compile(operations: &mut [Operation], layer_count: u32, inputs: &ProceduralInputs) -> Self {
-        if inputs.filters.is_empty() && inputs.generator_stages.is_empty() && inputs.anchors.reads.is_empty() {
+        let reads_stack =
+            operations.iter().skip(layer_count as usize).any(|op| op.spatial[3] != 0 && !(FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]));
+        if inputs.filters.is_empty() && inputs.generator_stages.is_empty() && inputs.anchors.reads.is_empty() && !reads_stack {
             return Self::default();
         }
         let mut plan = Self::default();
         let (layers, effects) = operations.split_at_mut(layer_count as usize);
         let mut masks = BTreeMap::new();
         plan.anchor_slots.resize(inputs.anchors.reads.len(), 0);
-        for (index, layer) in layers.iter_mut().enumerate() {
+        let mut stack_reads = BTreeMap::new();
+        let mut read_effects = BTreeSet::new();
+        for index in 0..layers.len() {
+            if layers[index].ids[1] != ANCHOR_PUBLISH_LAYER {
+                plan.bind_stack_reads(layers, effects, index, (&mut stack_reads, &mut read_effects));
+            }
+            let layer = &mut layers[index];
             if layer.ids[1] == ANCHOR_PUBLISH_LAYER {
                 plan.add_anchor(layer.ids[2], index as u32, MATERIAL_ANCHOR_STAGE, &inputs.anchors, Some((layer.effects[0], layer.effects[1])));
                 continue;
@@ -439,6 +483,11 @@ impl FilterPlan {
                 reach.saturating_add(layer)
             });
             plan.reach = plan.reach.max(across_layers);
+        }
+        // A stack read's field holds every layer below it at the texel, filters included
+        if !stack_reads.is_empty() {
+            let total = plan.stages.iter().fold(0u32, |sum, stage| sum.saturating_add(stage.reach()));
+            plan.reach = plan.reach.max(total);
         }
         // The pre-pass resumes no anchor reads, and the band uniform addresses a few outputs
         let anchors = plan.stages.iter().any(FilterStage::anchors);
@@ -480,6 +529,62 @@ impl FilterPlan {
             }
         }
         stacks.into_values().max().unwrap_or(0)
+    }
+
+    /// Bind the stack reads of layer operation `index`'s mask and content effects: an effect
+    /// operation that sets `spatial[3]` to a channel slot plus one asks for the material of that
+    /// channel at the texel, accumulated over every layer below its layer (`effects[1]` 0) or
+    /// also over its layer's operations before Base Color (`effects[1]` 1, P6's material reads).
+    /// A stage captures it (a material-anchor capture without a cut), `spatial[3]` becomes that
+    /// stage's slot plus one (`stack_at` in WGSL), and `effects[0]` the layer's own operation of
+    /// that channel plus one (0: none; `this_layer_content` in WGSL). P3: Compare reading This
+    /// Layer and Layers Below; P6: lighting's material.
+    fn bind_stack_reads(
+        &mut self,
+        layers: &[Operation],
+        effects: &mut [Operation],
+        index: usize,
+        (stages, done): (&mut BTreeMap<(u32, Channel), u32>, &mut BTreeSet<usize>),
+    ) {
+        let layer = &layers[index];
+        let [mask, mask_count, content, content_count] = layer.effects.map(|word| word as usize);
+        let reads: Vec<usize> = (mask..mask + mask_count)
+            .chain(content..content + content_count)
+            .filter(|&effect| effects.get(effect).is_some_and(|op| op.spatial[3] != 0) && !done.contains(&effect))
+            .collect();
+        if reads.is_empty() {
+            return;
+        }
+        // The layer's operations: the run sharing its mask range
+        let same_layer = |op: &Operation| op.effects[..2] == layer.effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
+        let first = (0..index).rev().take_while(|&earlier| same_layer(&layers[earlier])).last().unwrap_or(index);
+        let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
+        for effect in reads {
+            done.insert(effect);
+            let op = &mut effects[effect];
+            let slot = op.spatial[3] - 1;
+            let Some(channel) = Channel::ALL.into_iter().find(|&channel| channel_slot(channel) == slot) else {
+                op.spatial[3] = 0;
+                continue;
+            };
+            let until =
+                if op.effects[1] == 1 { (first..end).find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor)).unwrap_or(end) } else { first };
+            let stage = *stages.entry((until as u32, channel)).or_insert_with(|| {
+                self.stages.push(FilterStage {
+                    layer: until as u32,
+                    preceding: MATERIAL_ANCHOR_STAGE,
+                    filter: None,
+                    cell: 1,
+                    anchor: Some((channel, u32::MAX, 0)),
+                    input: 0,
+                    wrap: false,
+                    whole: false,
+                });
+                self.stages.len() as u32
+            });
+            op.spatial[3] = stage;
+            op.effects[0] = (first..end).find(|&own| layers[own].ids[0] == slot).map_or(0, |own| own as u32 + 1);
+        }
     }
 
     fn add_anchor(&mut self, publication: u32, layer: u32, preceding: u32, inputs: &AnchorInputs, material: Option<(u32, u32)>) {
@@ -545,7 +650,9 @@ impl FilterPlan {
             let whole = filter.whole_set(inputs.resolution);
             effect.spatial[0] = if mask { slot } else { slot - first } as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input: 0, wrap: false, whole });
+            // An image input the effect registered (`ProceduralInputs::register_input`)
+            let input = effect.effects[3];
+            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input, wrap: false, whole });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
@@ -571,6 +678,21 @@ impl FilterPlan {
     fn field_words(&self) -> u32 {
         if self.stages.iter().any(|stage| stage.input != 0) { FIELD_WORDS + 1 } else { FIELD_WORDS }
     }
+}
+
+/// Append the effects' image input sources and rebind each effect's `effects[3]` reference to
+/// the source's operation index plus one (generators keep their own source words).
+fn bind_input_sources(operations: &mut Vec<Operation>, layer_count: u32, sources: &[Operation]) {
+    if sources.is_empty() {
+        return;
+    }
+    let offset = operations.len() as u32;
+    for op in operations.iter_mut().skip(layer_count as usize).filter(|op| !(FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1])) {
+        if op.effects[3] != 0 {
+            op.effects[3] += offset;
+        }
+    }
+    operations.extend_from_slice(sources);
 }
 
 fn bind_generator_sources(operations: &mut Vec<Operation>, sources: &[Operation]) {
@@ -685,6 +807,8 @@ pub struct CompositeProgram {
     mask_preview: bool,
     mask_layer: u32,
     mask_layers: BTreeMap<LayerId, u32>,
+    /// Side-table words to fill with image record offsets at upload (`ProceduralInputs::pack_image`)
+    image_words: Vec<(u32, u32)>,
 }
 
 fn display_bit(kind: DisplayKind) -> u32 {
@@ -1099,6 +1223,7 @@ impl CompositeProgram {
             geometry.parts.clear();
         }
         operations.extend(effects);
+        bind_input_sources(&mut operations, layer_count, &procedural.input_sources);
         let filters = FilterPlan::compile(&mut operations, layer_count, &procedural);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
         filters.bind_anchors(&mut operations);
@@ -1129,6 +1254,7 @@ impl CompositeProgram {
             mask_preview: false,
             mask_layer: 0,
             mask_layers,
+            image_words: procedural.image_words,
         })
     }
 
@@ -1168,6 +1294,7 @@ impl CompositeProgram {
         let background = compile_mask(Some(mask), pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
         operations[0].effects[1] = operations.len() as u32 - 1;
         operations[0].balance[1] = background;
+        bind_input_sources(&mut operations, 1, &procedural.input_sources);
         let filters = FilterPlan::compile(&mut operations, 1, &procedural);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
         filters.bind_anchors(&mut operations);
@@ -1199,6 +1326,7 @@ impl CompositeProgram {
             mask_preview: true,
             mask_layer: 0,
             mask_layers: BTreeMap::new(),
+            image_words: procedural.image_words,
         })
     }
 }
@@ -2352,6 +2480,11 @@ impl GpuCompositor {
                 let offsets = program.tile_patterns.append_words(&mut words, atlas);
                 let mesh = program.surface.as_ref().map(|(mesh, _)| mesh.as_ref());
                 let (images, decals) = program.material_images.append_words(&mut words, atlas, mesh);
+                // Side-table words that name an image hold its record offset (`pack_image`)
+                for &(word, image) in &program.image_words {
+                    let at = LOOKUP_WORDS as usize + word as usize;
+                    words[at] = images.get(image as usize).copied().unwrap_or(u32::MAX);
+                }
                 let limits = device.limits();
                 // The operation stores the offset as an exactly represented float.
                 if ((!offsets.is_empty() || !decals.is_empty()) && words.len() >= 1 << 24)
@@ -4624,6 +4757,7 @@ mod paint_window_tests {
             mask_preview: false,
             mask_layer: 0,
             mask_layers: BTreeMap::new(),
+            image_words: Vec::new(),
         };
         let region = CompositeRegion { min: [0, 0], max: [128, 128] };
         let limit = 6 * 64 * 64 * 2 + 32;

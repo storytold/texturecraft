@@ -72,6 +72,9 @@ fn extended_content_effect(effect: Operation, content: vec4<f32>, channel: u32, 
 // the loop then mixes in by the effect's opacity (effect.low.w).
 fn extended_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 {
     let kind = effect.ids.y;
+    if kind >= PROBE_OPCODES_START && kind < END_EXTENDED_EFFECT {
+        return probe_mask_effect(effect, texel);
+    }
     if kind >= POINT_OPCODES_START && kind < POINT_OPCODES_END {
         return point_mask_effect(effect, mask, texel);
     }
@@ -82,6 +85,58 @@ fn extended_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 
         return lighting_mask_effect(effect, mask, texel);
     }
     return mask;
+}
+
+// The channel's material at `pixel` that an effect's stack read asked for (Operation.spatial.w,
+// bound by FilterPlan::bind_stack_reads): every layer below the effect's layer, or also its
+// own operations before Base Color. Zero without a read.
+fn stack_at(effect: Operation, pixel: vec2<u32>) -> vec3<f32> {
+    if effect.spatial.w == 0u {
+        return vec3(0.0);
+    }
+    return filter_value(effect.spatial.w - 1u, pixel).rgb;
+}
+
+// The effect's layer's own content of the read channel (Operation.effects.x), with its coverage
+// in alpha: Compare's This Layer mixes it over stack_at. Call it from mask effects only:
+// layer_content reaches the content hooks, and WGSL rejects recursion.
+fn this_layer_content(effect: Operation, texel: LayerTexel) -> vec4<f32> {
+    if effect.effects.x == 0u {
+        return vec4(0.0);
+    }
+    let layer = layers[effect.effects.x - 1u];
+    return layer_content(layer, texel, layer.effects.w);
+}
+
+// The effect's image input at the texel (Operation.effects.w, ProceduralInputs::register_input).
+fn effect_input(effect: Operation, texel: LayerTexel) -> f32 {
+    if effect.effects.w == 0u {
+        return 0.0;
+    }
+    return stage_input_value(layers[effect.effects.w - 1u], texel);
+}
+
+// An image's stored texel under `uv`, wrapping, as ImageRes::sample_nearest reads it (an ID
+// map's colours must not blend). `image` is the record offset ProceduralInputs::pack_image's
+// side-table word holds (u32 max: missing).
+fn image_texel_nearest(image: u32, uv: vec2<f32>) -> vec4<f32> {
+    if image == 0xffffffffu {
+        return vec4(0.0);
+    }
+    let size = vec2<i32>(i32(srgb[image]), i32(srgb[image + 1u]));
+    let pixel = vec2<i32>(floor(uv * vec2<f32>(size)));
+    return material_image_texel(image, pixel, size);
+}
+
+// Test probes of the hooks above (opcodes 188..192, emitted only by the render crate's tests).
+const PROBE_OPCODES_START: u32 = 188u;
+fn probe_mask_effect(effect: Operation, texel: LayerTexel) -> f32 {
+    switch effect.ids.y {
+        case 188u: { return this_layer_content(effect, texel).x; }
+        case 189u: { return stack_at(effect, texel.pixel).x; }
+        case 190u: { return image_texel_nearest(param_word(effect, 0u), texel.uv).x; }
+        default: { return effect_input(effect, texel); }
+    }
 }
 
 // WGSL rejects recursion: a package function must not call anything that leads back to the hook

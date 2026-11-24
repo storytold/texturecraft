@@ -80,6 +80,15 @@ pub(super) fn lower_filter(filter: &Filter, effect: &Effect, op: &mut Operation,
         inputs.precede_with_stage(&Filter::Blur { radius: 24.0, wrap: false }, 1.0)?;
         return Some((21, [0.0; 3]));
     }
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if let (Some(probe), Filter::Smoothstep { min, max }) = (PROBE_LOWERING.get(), filter) {
+        match probe {
+            188 | 189 => op.spatial[3] = *min as u32 + 1,
+            190 => op.ext[0] = inputs.pack_image("probe", crate::gpu_image_source::ImageUse::Material)?,
+            _ => op.effects[3] = inputs.register_input(Operation { low: [*max; 4], ..bytemuck::Zeroable::zeroed() }),
+        }
+        return Some((probe, [0.0; 3]));
+    }
     let mut lowered = point::lower(filter, effect, op, inputs);
     if lowered.is_none() {
         lowered = lighting::lower(filter, effect, op, inputs);
@@ -100,6 +109,10 @@ thread_local! {
     /// Test seam: lower Smoothstep as a Blur stage followed by Invert, the shape of a lowering
     /// that runs a neighbourhood stage before its operation.
     pub(super) static STAGED_TEST_LOWERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: lower Smoothstep as a probe of the P0g hooks (opcodes 188..192 in
+    /// composite_packages.wgsl): 188 this layer, 189 the stack below (channel slot `min`),
+    /// 190 an image named "probe" read nearest, 191 an image input of uniform `max`.
+    pub(super) static PROBE_LOWERING: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether an operation needs the surface inputs (positions, normals, bakes) besides the
@@ -717,6 +730,127 @@ mod tests {
         program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
         gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+    }
+
+    /// The P0g hooks reach the shader (test probes, opcodes 188..192): a mask effect reads the
+    /// stack below its layer and its layer's own content (both against a mask of that value),
+    /// an image by nearest texel and an image input, through the mask preview.
+    #[test]
+    fn stack_reads_images_and_inputs_reach_the_shader() {
+        use std::sync::Arc;
+
+        use texturecraft_compose::{BakedMaps, DisplayKind, ImageRes, ImageStore};
+        use texturecraft_core::{Effect, Projection, Sampling};
+        use texturecraft_geom::{UvGBuffer, primitives};
+
+        use crate::gpu_composite::oracle::headless;
+        use crate::readback::Readback;
+
+        let Some(mut gpu) = headless() else { return };
+        const SIZE: u32 = 64;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let baked = BakedMaps::default();
+        let images = ImageStore::from([(
+            "probe".into(),
+            Arc::new(ImageRes::new(2, 2, [51.0, 102.0, 204.0, 153.0].map(|v: f32| [v / 255.0, 0.0, 0.0, 1.0]).to_vec(), false)),
+        )]);
+        let roughness = super::super::channel_slot(Channel::Roughness);
+        let channels = [Channel::BaseColor, Channel::Roughness];
+        // A lower fill of roughness 0.3, an upper white fill of roughness 0.8 masked by `mask`
+        let build = |mask: EffectKind| {
+            let mut project = Project::new("Probes", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+            let lower = Fill {
+                sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.1, 0.4, 0.2])), (Channel::Roughness, Source::Uniform([0.3; 3]))]),
+                ..Default::default()
+            };
+            let lower_id = project.alloc_id();
+            project.insert_layer(0, Layer::new(lower_id, "Lower", LayerKind::Fill(lower), &channels), None, false).unwrap();
+            let owner = project.alloc_id();
+            let upper = Fill {
+                sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([1.0; 3])), (Channel::Roughness, Source::Uniform([0.8; 3]))]),
+                ..Default::default()
+            };
+            let mut layer = Layer::new(owner, "Upper", LayerKind::Fill(upper), &channels);
+            let mut layer_mask = Mask::new(MaskBackground::Black);
+            layer_mask.effects.push(Effect::new(project.alloc_id(), mask));
+            layer.mask = Some(layer_mask);
+            project.insert_layer(0, layer, None, false).unwrap();
+            (project, owner)
+        };
+        let uniform =
+            |value: f32| EffectKind::Fill { source: Source::Uniform([value; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE };
+        let probe = |kind: u32, min: f32, max: f32| {
+            super::PROBE_LOWERING.set(Some(kind));
+            let filter = EffectKind::Filter(Filter::Smoothstep { min, max });
+            (build(filter), kind)
+        };
+        let compile = |project: &Project, owner, mask_preview: bool| {
+            let pixels = PixelStore::default();
+            let mut program = if mask_preview {
+                CompositeProgram::try_compile_mask_preview(project, &pixels, 0, owner, None, None).unwrap()
+            } else {
+                CompositeProgram::try_compile_region(project, &pixels, 0, None).unwrap()
+            };
+            super::PROBE_LOWERING.set(None);
+            program.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+            program.set_tile_images(&images);
+            program
+        };
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        let base_color = |gpu: &mut crate::headless::Headless, program: &CompositeProgram| {
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, program).unwrap();
+            let texture = gpu.renderer.display_textures()[0][DisplayKind::BaseColor as usize];
+            Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap().2
+        };
+        let mask_gray = |gpu: &mut crate::headless::Headless, program: &CompositeProgram| {
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, program).unwrap();
+            let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.aux_texture(0).unwrap()).unwrap();
+            rgba.as_chunks::<4>().0.iter().map(|texel| texel[0]).collect::<Vec<u8>>()
+        };
+
+        // The stack below (roughness 0.3) and this layer's roughness (0.8) as the upper layer's mask
+        for (kind, value) in [(189, 0.3), (188, 0.8)] {
+            let ((project, owner), _) = probe(kind, roughness as f32, 0.0);
+            let program = compile(&project, owner, false);
+            assert!(program.filters.stages.iter().any(|stage| stage.anchor == Some((Channel::Roughness, u32::MAX, 0))), "probe {kind}: a capture stage");
+            let (reference, owner) = build(uniform(value));
+            let expected = base_color(&mut gpu, &compile(&reference, owner, false));
+            let actual = base_color(&mut gpu, &program);
+            assert!(actual.iter().zip(&expected).all(|(a, b)| a.abs_diff(*b) <= 1), "probe {kind}: {:?} vs {:?}", &actual[..4], &expected[..4]);
+        }
+
+        // The probe image by nearest texel: 51, 102 on the first row, 204, 153 on the second
+        let ((project, owner), _) = probe(190, 0.0, 0.0);
+        let gray = mask_gray(&mut gpu, &compile(&project, owner, true));
+        let half = SIZE as usize / 2;
+        for (x, y, expected) in [(5, 5, 51u8), (half + 5, 5, 102), (5, half + 5, 204), (half + 5, half + 5, 153)] {
+            assert_eq!(gray[y * SIZE as usize + x], expected, "image texel at ({x}, {y})");
+        }
+
+        // An image input of 0.65
+        let ((project, owner), _) = probe(191, 0.0, 0.65);
+        let gray = mask_gray(&mut gpu, &compile(&project, owner, true));
+        assert!(gray.iter().all(|&value| value.abs_diff(166) <= 1), "{:?}", &gray[..4]);
+    }
+
+    /// A neighbourhood stage carries its effect's registered image input into the field's sixth
+    /// word (P0g): the reference is rebound to the source's operation and the fields grow.
+    #[test]
+    fn a_neighbourhood_stage_takes_its_registered_input() {
+        let mut inputs = super::super::ProceduralInputs::new(64);
+        let blur = Filter::Blur { radius: 64.0, wrap: false };
+        inputs.filters.push((blur, 1.0));
+        let source = inputs.register_input(super::super::Operation { low: [0.4; 4], ..bytemuck::Zeroable::zeroed() });
+        let layer = super::super::Operation { ids: [0, 0, 0, 0], effects: [0, 0, 0, 1], ..bytemuck::Zeroable::zeroed() };
+        let stage = super::super::Operation { ids: [0, super::super::NEIGHBOURHOOD_OPCODE, 0, 0], effects: [0, 0, 0, source], ..bytemuck::Zeroable::zeroed() };
+        let mut operations = vec![layer, stage];
+        super::super::bind_input_sources(&mut operations, 1, &inputs.input_sources);
+        let plan = super::super::FilterPlan::compile(&mut operations, 1, &inputs);
+        assert_eq!(operations.len(), 3);
+        assert_eq!(plan.stages[0].input, 3, "the source's operation index plus one");
+        assert_eq!(plan.field_words(), crate::gpu_neighbourhood::FIELD_WORDS + 1);
     }
 
     #[test]

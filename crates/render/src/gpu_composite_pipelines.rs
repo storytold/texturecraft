@@ -35,6 +35,8 @@ impl Features {
             ..Self::default()
         };
         features.material_anchors = program.filters.stages.iter().any(|stage| stage.anchor.is_some());
+        // A capture stage (an anchor or a stack read) runs the prepare pass's anchor path
+        features.anchors |= features.material_anchors;
         for op in program.operations.iter().take(program.layer_count as usize).filter(|op| op.ids[1] != ANCHOR_PUBLISH_LAYER) {
             features.mask_effects |= op.effects[1] != 0;
             features.content_effects |= op.effects[3] != 0;
@@ -91,7 +93,7 @@ impl Features {
             include(
                 self.authored_images,
                 include_str!("shaders/material_image.wgsl"),
-                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }",
+                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }\n                 fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> { return vec4(0.0); }",
             ),
             include_str!("shaders/stencil_projection.wgsl"),
             include(
