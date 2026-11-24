@@ -159,7 +159,7 @@ pub(super) fn read_layers(op: &mut Operation, left: CompareSource, right: Compar
 }
 
 /// Whether a mask operation compares this layer's own content (`this_layer_content`): the hub
-/// then prepares the layer's content stacks before its mask stack (`FilterPlan::compile`).
+/// gives it a This Layer stage prepared before its mask stack (`FilterPlan::compile`).
 pub(super) fn reads_own_layer(op: &Operation) -> bool {
     let reads = |side: u32| side & SIDE_MASK == THIS_LAYER_SIDE;
     op.ids[1] == LAYER_COMPARE && (reads(op.ids[3]) || reads(op.ids[3] >> SIDE_BITS))
@@ -220,7 +220,40 @@ pub(super) fn register_image_input(effect: &Effect, input: &ImageInput, kind: Ch
 /// Grayscale Conversion's Custom Input (lowered in gpu_composite_point.rs) and the Distance Map
 /// of Bevel Smooth and Directional Distance ([`attach_distance_map`], read by P4's kernels).
 pub(super) fn evaluates_inputs(filter: &Filter) -> bool {
-    matches!(filter, Filter::GrayscaleConversion(_) | Filter::BevelSmooth(_) | Filter::DirectionalDistance(_))
+    matches!(
+        filter,
+        Filter::GrayscaleConversion(_)
+            | Filter::BevelSmooth(_)
+            | Filter::DirectionalDistance(_)
+            | Filter::SourceWarp(_)
+            | Filter::SourceSlopeBlur(_)
+            | Filter::AnisotropicKuwahara(_)
+            | Filter::ColorMatch(_)
+    )
+}
+
+/// Gives a P5 gather stage (Warp and Blur Slope's Custom Noise, Kuwahara's Custom Input, Color
+/// Match's Input or Image Input) the input it reads at its texels, and its filter the inputs it
+/// does not (`gather::bind_inputs`). Other operations stay as they are. None leaves the effect on
+/// the CPU.
+pub(super) fn attach_gather_input(effect: &Effect, op: &mut Operation, inputs: &mut ProceduralInputs) -> Option<()> {
+    let EffectKind::Filter(filter @ (Filter::SourceWarp(_) | Filter::SourceSlopeBlur(_) | Filter::AnisotropicKuwahara(_) | Filter::ColorMatch(_))) =
+        &effect.kind
+    else {
+        return Some(());
+    };
+    if op.ids[1] != NEIGHBOURHOOD_OPCODE {
+        return Some(());
+    }
+
+    let (bound, input) = crate::gpu_neighbourhood::gather::bind_inputs(effect, filter)?;
+    inputs.filters.get_mut(op.ids[2] as usize)?.0 = bound;
+    if let Some((input, kind)) = input {
+        let source = effect.input(&input);
+        let operation = source_operation(Some(&source), &Projection::default(), Sampling::default(), [0.0; 3], kind, inputs)?;
+        op.effects[3] = if kind == ChannelKind::Color { inputs.register_color_input(operation) } else { inputs.register_input(operation) };
+    }
+    Some(())
 }
 
 /// The folder offsets of every draw of layer `target` in `stack`, walked as the material program

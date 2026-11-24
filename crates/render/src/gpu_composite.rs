@@ -1926,6 +1926,7 @@ fn content_filter(effect: &Effect, procedural: &mut ProceduralInputs) -> Option<
         _ => {
             let mut op = point_effect(effect, procedural)?;
             stack::attach_distance_map(effect, &mut op, procedural)?;
+            stack::attach_gather_input(effect, &mut op, procedural)?;
             Some(op)
         }
     }
@@ -2119,6 +2120,7 @@ fn compile_mask(
                 let first_input = procedural.input_sources.len();
                 let mut operation = point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?;
                 stack::attach_distance_map(effect, &mut operation, procedural).ok_or("A mask effect's Distance Map uses CPU compositing.")?;
+                stack::attach_gather_input(effect, &mut operation, procedural).ok_or("A mask effect's image input uses CPU compositing.")?;
                 stack::bind_input_tiles(effect, &mut procedural.input_sources[first_input..], tile_patterns);
                 operation
             }

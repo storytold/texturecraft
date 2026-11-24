@@ -316,16 +316,19 @@ impl NeighbourhoodFilter {
         if self.uses_box() { self.radius.saturating_mul(BOX_PASSES as u32) } else { self.radius.saturating_add(1) }
     }
 
-    /// Whether the stage runs the three box passes before its apply pass (`uses_box_kind` in
-    /// neighbourhood.wgsl must agree).
     /// The working fields its passes use besides the original and the output
-    /// (`NeighbourhoodRegion::blur`): two for the box passes and every package kind (P4's
-    /// distance passes, P5's frames and reductions; P5 declares fewer at its merge), none for a
-    /// built-in gather. The whole-set pre-pass gives a stage only these.
+    /// (`NeighbourhoodRegion::blur`): two for the box passes and P4's kinds, P5's own count
+    /// (`gather::blur_fields`), none for a built-in gather. The whole-set pre-pass gives a stage
+    /// only these.
     pub(crate) fn blur_fields(self) -> u32 {
-        if self.kind.box_family() || self.kind.gather() || self.uses_box() { 2 } else { 0 }
+        if self.kind.gather() {
+            return gather::blur_fields(self);
+        }
+        if self.kind.box_family() || self.uses_box() { 2 } else { 0 }
     }
 
+    /// Whether the stage runs the three box passes before its apply pass (`uses_box_kind` in
+    /// neighbourhood.wgsl must agree).
     pub(crate) fn uses_box(self) -> bool {
         if self.kind.box_family() {
             return box_family::uses_box(self);
