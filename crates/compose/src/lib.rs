@@ -55,8 +55,8 @@ pub use display::{DisplayKind, display_tile_bytes, kinds_for, tile_bytes};
 pub use effect_histogram::EffectHistogram;
 pub use eval::{
     BLOCK, Composite, Inputs, MASK_CHANNEL, PaintTarget, Stencil, StrokePreview, all_tiles, compare_histograms, composite_tiles, composite_tiles_cached,
-    composite_tiles_with_projectors, covered_tiles, effect_histogram, flatten_layer, mask_at, mask_image, mask_texels, mask_values, pad_tiles,
-    stack_reads_neighbours,
+    composite_tiles_with_projectors, covered_tiles, effect_histogram, flatten_layer, mask_at, mask_image, mask_image_sized, mask_texels, mask_values,
+    pad_tiles, stack_reads_neighbours,
 };
 pub use mask_gray::MaskGray;
 pub use pattern_context::PatternContext;

@@ -4532,8 +4532,14 @@ pub fn mask_texels(inputs: &Inputs, id: LayerId) -> Option<Vec<f32>> {
 /// Keep preview tiles at 8 bits instead of retaining the export's full float atlas
 /// Returns None without an enabled mask or when the pixel count exceeds the supported range
 pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
-    let size = size.max(1);
-    let pixel_count = usize::try_from(size.checked_mul(size)?).ok()?;
+    mask_image_sized(inputs, id, (size, size))
+}
+
+/// [`mask_image`] at `extent` (width, height): output texel (x, y) shows the set's texel
+/// (x · width / extent width, y · height / extent height)
+pub fn mask_image_sized(inputs: &Inputs, id: LayerId, extent: (u32, u32)) -> Option<Vec<u8>> {
+    let (columns, rows) = (extent.0.max(1), extent.1.max(1));
+    let pixel_count = usize::try_from(columns.checked_mul(rows)?).ok()?;
     let projectors = ProjectorDepthCache::default();
     let inputs = &EvaluationInputs::new(inputs, &projectors);
     let mask = layer_mask(inputs.project, id).filter(|mask| mask.enabled)?;
@@ -4545,8 +4551,8 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
     prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
 
     let fields = evaluation_fields(inputs, &channels, &coordinates);
-    if size <= width.min(height) && (width != size || height != size) {
-        return Some(downsample_mask(inputs, id, mask, &channels, &fields, size));
+    if columns <= width && rows <= height && (width, height) != (columns, rows) {
+        return Some(downsample_mask(inputs, id, mask, &channels, &fields, (columns, rows)));
     }
 
     let width_usize = width as usize;
@@ -4567,19 +4573,19 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
         }
     });
 
-    if width == size && height == size {
+    if (width, height) == (columns, rows) {
         return Some(atlas);
     }
 
     let mut output = Vec::new();
     output.try_reserve_exact(pixel_count).ok()?;
     output.resize(pixel_count, 0);
-    for y in 0..size {
-        for x in 0..size {
-            let sample_x = (u64::from(x) * u64::from(width) / u64::from(size)) as u32;
-            let sample_y = (u64::from(y) * u64::from(height) / u64::from(size)) as u32;
+    for y in 0..rows {
+        for x in 0..columns {
+            let sample_x = (u64::from(x) * u64::from(width) / u64::from(columns)) as u32;
+            let sample_y = (u64::from(y) * u64::from(height) / u64::from(rows)) as u32;
             if let Some(value) = atlas.get(sample_y as usize * width_usize + sample_x as usize)
-                && let Some(destination) = output.get_mut((y * size + x) as usize)
+                && let Some(destination) = output.get_mut((y * columns + x) as usize)
             {
                 *destination = *value;
             }
@@ -4589,20 +4595,21 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
 }
 
 /// Sample a smaller mask image directly into disjoint output row groups
-fn downsample_mask(inputs: &EvaluationInputs, id: LayerId, mask: &Mask, channels: &[Channel], fields: &Fields, size: u32) -> Vec<u8> {
+fn downsample_mask(inputs: &EvaluationInputs, id: LayerId, mask: &Mask, channels: &[Channel], fields: &Fields, extent: (u32, u32)) -> Vec<u8> {
     let (width, height) = (inputs.gbuf.width, inputs.gbuf.height);
-    let source_at = |pixel, span| ((u64::from(pixel) * u64::from(span)) / u64::from(size)) as u32;
-    let first_output = |source, span| (u64::from(source) * u64::from(size)).div_ceil(u64::from(span)).min(u64::from(size)) as u32;
-    let mut output = vec![0; size as usize * size as usize];
+    let (columns, row_count) = extent;
+    let source_at = |pixel, span, size| ((u64::from(pixel) * u64::from(span)) / u64::from(size)) as u32;
+    let first_output = |source, span, size| (u64::from(source) * u64::from(size)).div_ceil(u64::from(span)).min(u64::from(size)) as u32;
+    let mut output = vec![0; columns as usize * row_count as usize];
     let mut destination = output.as_mut_slice();
     let mut bands = Vec::with_capacity(height.div_ceil(TILE) as usize);
 
     // Partition rows by the tile that contains each row's source texels
     for tile_y in 0..height.div_ceil(TILE) {
-        let first_row = first_output(tile_y * TILE, height);
-        let past_row = first_output((tile_y + 1) * TILE, height);
+        let first_row = first_output(tile_y * TILE, height, row_count);
+        let past_row = first_output((tile_y + 1) * TILE, height, row_count);
         if past_row > first_row {
-            let (rows, rest) = destination.split_at_mut((past_row - first_row) as usize * size as usize);
+            let (rows, rest) = destination.split_at_mut((past_row - first_row) as usize * columns as usize);
             bands.push((tile_y, first_row, past_row, rows));
             destination = rest;
         }
@@ -4610,18 +4617,18 @@ fn downsample_mask(inputs: &EvaluationInputs, id: LayerId, mask: &Mask, channels
 
     bands.into_par_iter().for_each(|(tile_y, first_row, past_row, rows)| {
         for tile_x in 0..width.div_ceil(TILE) {
-            let first_column = first_output(tile_x * TILE, width);
-            let past_column = first_output((tile_x + 1) * TILE, width);
+            let first_column = first_output(tile_x * TILE, width, columns);
+            let past_column = first_output((tile_x + 1) * TILE, width, columns);
             if first_column == past_column {
                 continue;
             }
 
             let offsets = (first_row..past_row).flat_map(|row| {
-                let y = source_at(row, height) % TILE;
-                (first_column..past_column).map(move |column| (y * TILE + source_at(column, width) % TILE) as usize)
+                let y = source_at(row, height, row_count) % TILE;
+                (first_column..past_column).map(move |column| (y * TILE + source_at(column, width, columns) % TILE) as usize)
             });
             let texels = mask_tile(inputs, id, mask, channels, fields, (tile_x, tile_y), offsets);
-            let pixels = rows.chunks_exact_mut(size as usize).flat_map(|row| &mut row[first_column as usize..past_column as usize]);
+            let pixels = rows.chunks_exact_mut(columns as usize).flat_map(|row| &mut row[first_column as usize..past_column as usize]);
             for (pixel, (_, value)) in pixels.zip(texels) {
                 *pixel = (value * 255.0 + 0.5) as u8;
             }

@@ -222,8 +222,6 @@ mod tests {
     const BLOCK: u32 = 64;
     /// Texels per side of the atlas, two blocks across and down.
     const SIDE: u32 = 2 * BLOCK;
-    /// The atlas's UV tiles: UDIM and the mesh UV of its corner.
-    const TILES: [(u32, [f32; 2]); 4] = [(1001, [0.0, 0.0]), (1002, [1.0, 0.0]), (1011, [0.0, -1.0]), (1012, [1.0, -1.0])];
     /// A region on the corner of all four blocks, so a halo crosses tiles of every scale.
     const BLOCK_CORNER: CompositeRegion = CompositeRegion { min: [56, 54], max: [74, 70] };
     /// Hard decisions (edge searches, cell centres): at most 0.1 % of the texels may flip.
@@ -236,20 +234,27 @@ mod tests {
     /// Tile sides that do not divide the block (three quarters and three eighths of it).
     const UNEVEN: [u32; 4] = [BLOCK, 3 * BLOCK / 4, BLOCK, 3 * BLOCK / 8];
 
-    /// A set of the four tiles of [`TILES`] in a 2 × 2 atlas of `block` texels per block, each
+    /// A set of the four tiles 1001, 1002, 1011 and 1012 in a 2 × 2 atlas of `block` texels per block, each
     /// tile at its resolution in `resolutions` (its block's when equal), and a mesh of four planes,
     /// one per tile, its UVs laid in the atlas as an imported UV tile mesh's are.
-    #[allow(clippy::unwrap_used)] // A test helper: a fixture that does not build fails the test
     fn atlas_of(block: u32, resolutions: [u32; 4], channels: &[Channel]) -> (Project, Arc<Mesh>) {
+        grid_atlas((2, 2), block, &resolutions, channels)
+    }
+
+    /// [`atlas_of`] for a grid of `columns` × `rows` tiles from 1001, the tiles row by row.
+    #[allow(clippy::unwrap_used)] // A test helper: a fixture that does not build fails the test
+    fn grid_atlas((columns, rows): (u32, u32), block: u32, resolutions: &[u32], channels: &[Channel]) -> (Project, Arc<Mesh>) {
+        let tiles: Vec<(u32, [f32; 2])> =
+            (0..rows).flat_map(|row| (0..columns).map(move |column| (1001 + column + 10 * row, [column as f32, -(row as f32)]))).collect();
         let mut set = TextureSet::new("Tiles", 0, block);
-        set.uv_tiles = TILES.map(|(udim, ..)| udim).to_vec();
+        set.uv_tiles = tiles.iter().map(|&(udim, _)| udim).collect();
         set.channels.retain(|(channel, _)| channels.contains(channel));
         set.tile_resolutions
-            .extend(TILES.iter().zip(resolutions).filter(|&(_, resolution)| resolution != block).map(|(&(udim, ..), resolution)| (udim, resolution)));
+            .extend(tiles.iter().zip(resolutions).filter(|&(_, &resolution)| resolution != block).map(|(&(udim, _), &resolution)| (udim, resolution)));
         let grid = set.tile_grid().unwrap();
 
         let mut mesh = Mesh::default();
-        for (index, &(_, corner)) in TILES.iter().enumerate() {
+        for (index, &(_, corner)) in tiles.iter().enumerate() {
             let mut part = primitives::plane(1.0, 4);
             for position in &mut part.positions {
                 position.x += 1.5 * index as f32;
@@ -267,7 +272,6 @@ mod tests {
         (project, Arc::new(mesh))
     }
 
-    /// [`atlas_of`] at [`BLOCK`] texels per block, uniform or `scaled`.
     fn atlas(scaled: bool, channels: &[Channel]) -> (Project, Arc<Mesh>) {
         atlas_of(BLOCK, if scaled { SCALED } else { UNIFORM }, channels)
     }
@@ -391,6 +395,46 @@ mod tests {
     fn image_fills_follow_each_uv_tile() {
         let Some(mut gpu) = headless() else { return };
         uv_tile_fills(&mut gpu, Some((Channel::Height, Source::image("stripes"))), false);
+    }
+
+    /// The mask view of tile grids that are not 2 × 2 (2 × 1, 3 × 1, 3 × 2 with tiles at their own
+    /// resolutions, and a 3 × 1 grid of 1024-texel blocks the view halves) previews on the GPU,
+    /// each tile as the square of its block, as the CPU's `mask_image_sized` samples it.
+    #[test]
+    fn mask_previews_of_tile_grids_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        const LARGE: u32 = 1024;
+        type Grid = (&'static str, (u32, u32), u32, Vec<u32>);
+        let grids: [Grid; 4] = [
+            ("2 × 1", (2, 1), BLOCK, vec![BLOCK; 2]),
+            ("3 × 1", (3, 1), BLOCK, vec![BLOCK; 3]),
+            ("3 × 2, tiles at their own resolutions", (3, 2), BLOCK, vec![BLOCK, BLOCK / 2, BLOCK, 3 * BLOCK / 4, BLOCK, BLOCK / 4]),
+            ("3 × 1 of 1024-texel blocks, halved", (3, 1), LARGE, vec![LARGE, LARGE / 2, 3 * LARGE / 4]),
+        ];
+        let channels = [Channel::BaseColor];
+        let mut checker = Procedural::new(ProceduralKind::Checker);
+        checker.resolution.factor = -1;
+        let baked = BakedMaps::default();
+        let (pixels, images) = (PixelStore::default(), ImageStore::default());
+
+        for (label, grid, block, resolutions) in grids {
+            let (mut project, mesh) = grid_atlas(grid, block, &resolutions, &channels);
+            let owner = project.alloc_id();
+            let base_color = Source::Procedural { pattern: checker.clone(), low: [0.1, 0.2, 0.3], high: [0.8, 0.7, 0.2], ramp: Vec::new() };
+            let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, base_color)]), projection: Projection::UvTile, ..Fill::default() };
+            let mut layer = Layer::new(owner, "Tiles", LayerKind::Fill(fill), &channels);
+            let mut mask = Mask::new(MaskBackground::Black);
+            let checker_mask = Source::Procedural { pattern: checker.clone(), low: [0.2; 3], high: [0.9; 3], ramp: Vec::new() };
+            let mask_fill = EffectKind::Fill { source: checker_mask, projection: Projection::UvTile, sampling: Sampling::default() };
+            mask.effects.push(Effect::new(project.alloc_id(), mask_fill));
+            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false })));
+            layer.mask = Some(mask);
+            assert!(project.insert_layer(0, layer, None, false).is_ok());
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+
+            assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, &format!("mask view of a {label} grid"));
+        }
     }
 
     /// The gradient's debug ramp across each tile, in the material and in the mask, over the

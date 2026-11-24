@@ -384,7 +384,23 @@ fn display_dims(size: (u32, u32), shift: u32) -> (u32, u32) {
 /// Side of the square aux (mesh map / mask / quick mask) texture of a set of `size` texels; it
 /// stretches over the set like its other textures.
 pub fn aux_size(size: (u32, u32)) -> u32 {
-    size.0.max(size.1).clamp(1, 2048)
+    size.0.max(size.1).clamp(1, MAX_AUX_SIDE)
+}
+
+/// The longest side of an aux texture.
+const MAX_AUX_SIDE: u32 = 2048;
+
+/// Width and height of the mask view's aux texture for a set of `size` texels: the set halved
+/// until its longer side fits [`aux_size`]'s limit, so a set of UV tiles shows each tile as the
+/// square its block is. Output texel (x, y) shows the set's texel (x · width / mask width, y ·
+/// height / mask height), as `texturecraft_compose::mask_image_sized` samples it.
+pub fn mask_view_extent(size: (u32, u32)) -> (u32, u32) {
+    display_dims(size, mask_view_shift(size))
+}
+
+/// How many times [`mask_view_extent`] halves a set of `size` texels.
+fn mask_view_shift(size: (u32, u32)) -> u32 {
+    size.0.max(size.1).max(1).div_ceil(MAX_AUX_SIDE).next_power_of_two().trailing_zeros()
 }
 
 impl Tex {
@@ -1777,20 +1793,23 @@ impl Renderer {
         let set = self.sets.get(ts).ok_or("texture set does not exist")?;
         let slot = DisplayKind::ALL.len();
         let old = set.tex.get(slot).ok_or("The GPU aux texture is missing.")?;
-        let size = aux_size(set.size);
-        // Classic texture sets use the same power-of-two sampling in both axes.
-        let step = set.size.0 / size;
-        if !step.is_power_of_two() || set.size != (size * step, size * step) {
+        let shift = mask_view_shift(set.size);
+        let (width, height) = mask_view_extent(set.size);
+        // The GPU reads every 2^shift-th texel: the CPU's nearest texel only when both sides divide
+        if (width << shift, height << shift) != set.size {
             return Err("The mask preview layout uses CPU compositing.".into());
         }
-        let shift = step.trailing_zeros();
-        let reuse = (old.texture.width(), old.texture.height()) == (size, size);
+        let reuse = (old.texture.width(), old.texture.height()) == (width, height);
         let region = if reuse { program.region } else { None };
         let mut submitted = None;
         let asynchronous = self.asynchronous_compile;
         let result = crate::gpu_trace::scoped(device, "viewport GPU mask preview", || {
             let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, asynchronous));
-            let tex = if reuse { old.clone() } else { Tex::new(device, "tc_gpu_mask_preview", size, size, wgpu::TextureFormat::Rgba8Unorm, mip_count(size)) };
+            let tex = if reuse {
+                old.clone()
+            } else {
+                Tex::new(device, "tc_gpu_mask_preview", width, height, wgpu::TextureFormat::Rgba8Unorm, mip_count(width.max(height)))
+            };
             compositor.compose((device, queue), program, (ts, set.size, shift, region), &[&tex.texture], &mut submitted)?;
             Ok::<_, String>((compositor, tex))
         })
@@ -1809,7 +1828,7 @@ impl Renderer {
         if reuse {
             let dirty = &mut set.mips_dirty[slot];
             if let Some(region) = region {
-                let region = region.viewport(shift, (size, size));
+                let region = region.viewport(shift, (width, height));
                 if tex.mips > 1 {
                     dirty.add(region.min[0], region.min[1], region.max[0], region.max[1]);
                 }
@@ -2084,23 +2103,32 @@ impl Renderer {
     /// Upload the aux (mesh map / debug) texture of a set: RGBA8, `size × size` with `size` from
     /// [`aux_size`]. The first upload allocates it.
     pub fn upload_aux(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, size: u32, rgba: &[u8]) {
+        self.upload_aux_sized(device, queue, texture_set, (size, size), rgba);
+    }
+
+    /// [`Renderer::upload_aux`] at `extent` (width, height): `aux_size` × `aux_size`, or the
+    /// mask view's [`mask_view_extent`].
+    pub fn upload_aux_sized(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, extent: (u32, u32), rgba: &[u8]) {
         let Some(set) = self.sets.get_mut(texture_set) else { return };
-        let desired_size = aux_size(set.size);
+        let square = aux_size(set.size);
         let aux_index = set.tex.len().saturating_sub(1);
         let Some(texture) = set.tex.last() else { return };
-        if size != desired_size || rgba.len() < (size as usize) * (size as usize) * 4 {
+        let (width, height) = extent;
+        let known = extent == (square, square) || extent == mask_view_extent(set.size);
+        if !known || rgba.len() < (width as usize) * (height as usize) * 4 {
             return;
         }
 
         let allocation_pending = set.pending.get(aux_index).is_some_and(Option::is_some);
-        if !allocation_pending && texture.texture.width() != size {
+        if !allocation_pending && (texture.texture.width(), texture.texture.height()) != extent {
             if set.failed.get(aux_index).copied().unwrap_or(true) {
                 return;
             }
 
-            let allocation_label = format!("texture set {} (mesh map view, {size}×{size})", texture_set + 1);
-            let full_texture =
-                checked(device, &allocation_label, || neutral_tex(device, queue, (size, size), wgpu::TextureFormat::Rgba8Unorm, mip_count(size), &AUX_NEUTRAL));
+            let allocation_label = format!("texture set {} (mesh map view, {width}×{height})", texture_set + 1);
+            let full_texture = checked(device, &allocation_label, || {
+                neutral_tex(device, queue, extent, wgpu::TextureFormat::Rgba8Unorm, mip_count(width.max(height)), &AUX_NEUTRAL)
+            });
             if !grow(set, texture_set, aux_index, full_texture, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
                 return;
             }
@@ -3085,6 +3113,26 @@ fn highlight_shift(size: [u32; 2]) -> [f32; 4] {
 mod tests {
     use super::*;
     use crate::headless::Headless;
+
+    /// The mask view halves a set until its longer side fits 2048 texels, keeping its shape: a
+    /// classic square set as before, a grid of UV tiles one square per block.
+    #[test]
+    fn the_mask_view_halves_a_set_until_it_fits() {
+        let cases = [
+            ((1024, 1024), (1024, 1024)),
+            ((4096, 4096), (2048, 2048)),
+            ((128, 64), (128, 64)),
+            ((3072, 1024), (1536, 512)),
+            ((6144, 4096), (1536, 1024)),
+            ((3000, 3000), (1500, 1500)),
+        ];
+
+        for (size, extent) in cases {
+            assert_eq!(mask_view_extent(size), extent, "{size:?}");
+            let shift = mask_view_shift(size);
+            assert_eq!((extent.0 << shift, extent.1 << shift), size, "{size:?}: every 2^shift-th texel, as the CPU samples it");
+        }
+    }
 
     #[test]
     fn oversized_overlays_leave_the_view_usable() {

@@ -1394,10 +1394,11 @@ impl Session {
         })
     }
 
-    /// Grayscale RGBA8 of layer `id`'s mask at `size²` for the mask view (None without a mask).
-    pub fn mask_view_rgba(&self, id: LayerId, size: u32) -> Option<Vec<u8>> {
+    /// Grayscale RGBA8 of layer `id`'s mask at `extent` (width, height) for the mask view (None
+    /// without a mask).
+    pub fn mask_view_rgba(&self, id: LayerId, extent: (u32, u32)) -> Option<Vec<u8>> {
         let (ts, _, _) = self.doc.project.locate(id)?;
-        let gray = self.with_inputs(ts, |inp| texturecraft_compose::mask_image(inp, id, size))?;
+        let gray = self.with_inputs(ts, |inp| texturecraft_compose::mask_image_sized(inp, id, extent))?;
         Some(gray.iter().flat_map(|g| [*g, *g, *g, 255]).collect())
     }
 

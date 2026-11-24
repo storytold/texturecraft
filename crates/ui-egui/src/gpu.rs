@@ -85,7 +85,7 @@ pub struct SceneSync {
     pub(crate) compositor_changed: bool,
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
     released_dabs: Vec<ReleasedDab>,
-    pub aux: Vec<(usize, u32, Vec<u8>)>,
+    pub aux: Vec<(usize, (u32, u32), Vec<u8>)>,
     quick_masks: Vec<(usize, QuickMaskOverlay)>,
     quick_mask_failed: Option<Arc<AtomicBool>>,
     release_quick_mask: bool,
@@ -1049,10 +1049,12 @@ impl GpuLink {
                 if !gpu_mask && let Some((texture_set, _, _)) = session.doc.project.locate(id) {
                     let key = (format!("mask{}", id.0), session.revision);
                     if self.aux.get(&texture_set) != Some(&key) && !session.stroke_active() {
-                        let resolution =
-                            session.caches.get(texture_set).map_or(MASK_VIEW_FALLBACK_RESOLUTION, |cache| texturecraft_render::aux_size(cache.size));
-                        let rgba = session.mask_view_rgba(id, resolution).unwrap_or_else(|| MASK_VIEW_BLANK.repeat((resolution * resolution) as usize));
-                        out.aux.push((texture_set, resolution, rgba));
+                        let extent = session
+                            .caches
+                            .get(texture_set)
+                            .map_or((MASK_VIEW_FALLBACK_RESOLUTION, MASK_VIEW_FALLBACK_RESOLUTION), |cache| texturecraft_render::mask_view_extent(cache.size));
+                        let rgba = session.mask_view_rgba(id, extent).unwrap_or_else(|| MASK_VIEW_BLANK.repeat((extent.0 * extent.1) as usize));
+                        out.aux.push((texture_set, extent, rgba));
                         self.aux.insert(texture_set, key);
                     }
                 }
@@ -1064,7 +1066,7 @@ impl GpuLink {
                     let resolution = texturecraft_render::aux_size(cache.size);
                     let key = ("maskblank".to_owned(), u64::from(resolution));
                     if self.aux.get(&texture_set) != Some(&key) {
-                        out.aux.push((texture_set, resolution, MASK_VIEW_BLANK.repeat((resolution * resolution) as usize)));
+                        out.aux.push((texture_set, (resolution, resolution), MASK_VIEW_BLANK.repeat((resolution * resolution) as usize)));
                         self.aux.insert(texture_set, key);
                     }
                 }
@@ -1121,7 +1123,7 @@ impl GpuLink {
                     } else {
                         let resolution = texturecraft_render::aux_size(cache.size);
                         if let Some(rgba) = session.quick_mask_rgba(texture_set, resolution) {
-                            out.aux.push((texture_set, resolution, rgba));
+                            out.aux.push((texture_set, (resolution, resolution), rgba));
                         }
                     }
                     self.aux.insert(texture_set, key);
@@ -1158,7 +1160,7 @@ impl GpuLink {
             } else {
                 texturecraft_render::mesh_maps::mesh_map_rgba(baked, map, resolution, cache.size, &cache.composite.block_scales)
             };
-            out.aux.push((texture_set, resolution, rgba));
+            out.aux.push((texture_set, (resolution, resolution), rgba));
             self.aux.insert(texture_set, key);
         }
     }
@@ -1177,7 +1179,7 @@ impl GpuLink {
         if (!same_image || self.aux.get(&texture_set) != Some(&key))
             && let Some(rgba) = session.id_mask_view_rgba(effect, resolution)
         {
-            out.aux.push((texture_set, resolution, rgba));
+            out.aux.push((texture_set, (resolution, resolution), rgba));
             self.aux.insert(texture_set, key);
 
             // A weak owner keeps the address unique without retaining the decoded pixels
@@ -1296,8 +1298,8 @@ impl CallbackTrait for ViewCallback {
                 });
             }
             record_recreated_uploads(&mut gpu.recreated.lock().unwrap_or_else(PoisonError::into_inner), &reset, &sync);
-            for (texture_set, size, bytes) in &sync.aux {
-                gpu.renderer.upload_aux(device, queue, *texture_set, *size, bytes);
+            for (texture_set, extent, bytes) in &sync.aux {
+                gpu.renderer.upload_aux_sized(device, queue, *texture_set, *extent, bytes);
             }
             for (size, (sets, bytes)) in &sync.image_aux {
                 for &texture_set in sets {
@@ -1473,9 +1475,9 @@ pub(crate) mod tests {
         execute(&mut s, "mask.toggle", &json!({"layer": layer.0, "enabled": false})).unwrap();
         let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
         assert_eq!(out.aux.len(), 1, "disabling the displayed mask replaces its old upload");
-        let (set, resolution, rgba) = &out.aux[0];
+        let (set, (width, height), rgba) = &out.aux[0];
         assert_eq!(*set, owner);
-        assert_eq!(*rgba, MASK_VIEW_BLANK.repeat((resolution * resolution) as usize));
+        assert_eq!(*rgba, MASK_VIEW_BLANK.repeat((width * height) as usize));
         assert_eq!(gpu.aux.len(), sets, "only view keys remain in the link");
         drop(out);
         let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
@@ -2009,8 +2011,8 @@ pub(crate) mod tests {
             gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
         }
         let (_, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
-        for (ts, size, pixels) in update.aux {
-            gpu.renderer.upload_aux(&gpu.device, &gpu.queue, ts, size, &pixels);
+        for (ts, extent, pixels) in update.aux {
+            gpu.renderer.upload_aux_sized(&gpu.device, &gpu.queue, ts, extent, &pixels);
         }
         if !errors.is_empty() {
             Err(format!("{errors:?}"))
@@ -2076,7 +2078,7 @@ pub(crate) mod tests {
             if actual.iter().any(|[r, g, b, a]| r != g || r != b || *a != 255) {
                 failures.push(format!("{name}: mask texture is not opaque grayscale"));
             }
-            let expected = session.mask_view_rgba(layer, SIZE).unwrap();
+            let expected = session.mask_view_rgba(layer, (SIZE, SIZE)).unwrap();
             if expected.as_chunks::<4>().0.iter().any(|p| p[0] > 8)
                 && !actual.iter().zip(expected.as_chunks::<4>().0).any(|(gpu, cpu)| gpu[0] > 0 && cpu[0] > 8)
             {
@@ -3237,8 +3239,8 @@ pub(crate) mod tests {
             let (reset, errors, _) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{size}²: {errors:?}");
             let _ = reset;
-            for (ts, size, bytes) in &scene.aux {
-                gpu.renderer.upload_aux(&gpu.device, &gpu.queue, *ts, *size, bytes);
+            for (ts, extent, bytes) in &scene.aux {
+                gpu.renderer.upload_aux_sized(&gpu.device, &gpu.queue, *ts, *extent, bytes);
             }
             let tex = if inspect_aux { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
             [center, outside].map(|uv| {
@@ -3457,7 +3459,7 @@ pub(crate) mod tests {
                 cpu.end_stroke().unwrap();
                 cpu.update();
                 let expected = if mask_view {
-                    let rgba = cpu.mask_view_rgba(layer, size).unwrap();
+                    let rgba = cpu.mask_view_rgba(layer, (size, size)).unwrap();
                     uvs.map(|uv| {
                         let (x, y) = texel(uv, size);
                         let i = ((y * size + x) * 4) as usize;
