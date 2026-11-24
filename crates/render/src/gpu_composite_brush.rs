@@ -51,3 +51,127 @@ pub(super) fn uses_shader(program: &CompositeProgram) -> bool {
 pub(super) fn band_uniform(_program: &CompositeProgram) -> [u32; 4] {
     [0; 4]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::*;
+    use crate::{headless::Headless, readback::Readback};
+    use texturecraft_compose::{Composite, Inputs, MaskGray, PaintTarget, StrokePreview, composite_tiles, tile_bytes};
+    use texturecraft_core::{Layer, TextureSet};
+    use texturecraft_geom::primitives;
+    use texturecraft_texel::{to_u16, to_u16_signed};
+
+    /// The live Eraser against the CPU's preview of the same erase: Base Color under a non-Normal
+    /// blend, the signed Height, and a mask paint effect
+    #[test]
+    fn a_live_erase_matches_the_cpu_on_layers_and_masks() {
+        let Ok(mut gpu) = Headless::new() else { return };
+        const SIZE: u32 = TILE;
+        let size = (SIZE, SIZE);
+        let channels = [Channel::BaseColor, Channel::Height];
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let mut project = Project::new("Live erase", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let layer_id = project.alloc_id();
+        let mut layer = Layer::new(layer_id, "Painted layer", LayerKind::Paint, &channels);
+        let base_color = layer.channels.get_mut(&Channel::BaseColor).unwrap();
+        base_color.mode = BlendMode::Screen;
+        base_color.opacity = 0.7;
+        let mut mask = Mask::new(MaskBackground::White);
+        let mask_paint = Effect::new(project.alloc_id(), EffectKind::Paint);
+        let mask_id = mask_paint.id;
+        mask.effects.push(mask_paint);
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+
+        let mut pixels = PixelStore::default();
+        let color = pixels.layer_mut(layer_id, Channel::BaseColor, size);
+        for y in 10..50 {
+            for x in 12..54 {
+                color.set(x, y, &[to_u16(0.31), to_u16(0.12), to_u16(0.5), to_u16(0.82)]);
+            }
+        }
+        let height = pixels.layer_mut(layer_id, Channel::Height, size);
+        for y in 20..60 {
+            for x in 6..40 {
+                height.set(x, y, &[to_u16_signed(-0.27), to_u16(0.66)]);
+            }
+        }
+        let painted_mask = pixels.mask_mut(mask_id, size);
+        for y in 30..64 {
+            for x in 30..64 {
+                painted_mask.set(x, y, &[to_u16(0.2), to_u16(0.9)]);
+            }
+        }
+        let alpha = input_texture(&gpu.device, "test erase stroke", size, 1, wgpu::TextureFormat::R16Uint);
+        let mut stroke_alpha = TileImage::new(SIZE, SIZE, 1);
+        let mut dense_alpha = vec![0; (SIZE * SIZE) as usize];
+        for y in 16..56 {
+            for x in 18..58 {
+                let value = to_u16(0.15 + 0.02 * (x - 18) as f32);
+                stroke_alpha.set(x, y, &[value]);
+                dense_alpha[(y * SIZE + x) as usize] = value;
+            }
+        }
+        write_input(&gpu.queue, &alpha, size, (0, 0), &dense_alpha);
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[(size, 0)], 1);
+        let baked = BakedMaps::default();
+        let images = ImageStore::default();
+
+        for target in [PaintTarget::Layer(layer_id), PaintTarget::Mask(mask_id)] {
+            let preview = StrokePreview {
+                target,
+                alpha: stroke_alpha.clone(),
+                opacity: 0.85,
+                erase: true,
+                values: BTreeMap::new(),
+                mask_gray: MaskGray::Value(1.0),
+                stencil: None,
+                carried: BTreeMap::new(),
+                carried_mask: None,
+            };
+            let inputs = Inputs {
+                project: &project,
+                ts: 0,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked: &baked,
+                block_scales: project.texture_sets[0].block_scales(),
+                preview: Some(&preview),
+                images: &images,
+                bounds: mesh.bounds(),
+            };
+            let mut cpu = Composite::new(&channels, SIZE);
+            composite_tiles(&inputs, &mut cpu, &[(0, 0)]);
+
+            // The CPU preview erases every painted channel, as a commit with no channel listed does
+            let live_target = match target {
+                PaintTarget::Layer(layer) => LiveBrushTarget::Layer { layer, values: channels.iter().map(|&channel| (channel, [0.0; 3])).collect() },
+                PaintTarget::Mask(effect) => LiveBrushTarget::Mask { effect, value: 1.0 },
+            };
+            let live = LiveBrush { target: live_target, opacity: preview.opacity, erase: true, alpha: alpha.create_view(&Default::default()), stencil: None };
+            let mut program = CompositeProgram::try_compile_with_brush(&project, &pixels, 0, None, Some(live)).unwrap();
+            program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+            program.set_tile_images(&images);
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+
+            for kind in [DisplayKind::BaseColor, DisplayKind::Height] {
+                let expected = tile_bytes(&cpu, &baked, kind, 0, 0);
+                let texture = gpu.renderer.display_textures()[0][kind as usize];
+                let (_, _, actual) = Readback::blocking_level(&gpu.device, &gpu.queue, texture, 0).unwrap();
+                assert_eq!(actual.len(), expected.len());
+                if kind == DisplayKind::Height {
+                    for (actual, expected) in actual.as_chunks::<2>().0.iter().zip(expected.as_chunks::<2>().0) {
+                        let actual = half::f16::from_le_bytes(*actual).to_f32();
+                        let expected = half::f16::from_le_bytes(*expected).to_f32();
+                        assert!((actual - expected).abs() <= 0.001, "{target:?}: GPU height {actual}, CPU {expected}");
+                    }
+                } else {
+                    assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1), "{target:?}: GPU color differs from CPU");
+                }
+            }
+        }
+    }
+}

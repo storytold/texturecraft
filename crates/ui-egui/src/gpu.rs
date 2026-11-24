@@ -2720,47 +2720,64 @@ pub(crate) mod tests {
     }
 
     /// The Eraser on a paint layer and on a mask runs on the GPU brush, and its live preview shows
-    /// what the release commits
+    /// what the release commits: on every painted channel, on the enabled ones only, and on a
+    /// mask in the material and the mask view
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_eraser_previews_what_it_commits_on_layers_and_masks() {
         let Ok(gpu) = Headless::new() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
-        let display = |link: &mut GpuLink, s: &mut Session| -> [u8; 4] {
-            let scene = link.sync(s, None, None, 0, 0.0);
+        let display = |link: &mut GpuLink, s: &mut Session, aux: Option<AuxView>| -> [u8; 4] {
+            let scene = link.sync(s, aux, None, 0, 0.0);
             let gpu = &mut *brush.0.lock().unwrap();
             let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
-            let texture = gpu.renderer.display_textures()[0][0];
+            let texture = if aux.is_some() { gpu.renderer.aux_texture(0).unwrap() } else { gpu.renderer.display_textures()[0][0] };
             read_center(gpu, texture)
         };
         let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 1);
-        for on_mask in [false, true] {
+
+        // (case, paints a mask, erases Height only, mask view)
+        let cases = [("layer", false, false, false), ("layer, Height only", false, true, false), ("mask", true, false, false), ("mask view", true, false, true)];
+        for (case, on_mask, height_only, mask_view) in cases {
             let mut s = Session::new_project("GPU eraser", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
             if on_mask {
                 execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
                 execute(&mut s, "mask.add.black", &json!({})).unwrap();
             } else {
                 execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.9, 0.3, 0.1]})).unwrap();
+                execute(&mut s, "tool.material", &json!({"channel": "height", "value": 0.4, "enabled": true})).unwrap();
+            }
+            let layer = s.selected_layer().unwrap();
+            let aux = mask_view.then_some(AuxView::Mask(layer));
+            if mask_view {
+                s.view = ViewMode::Mask(layer);
             }
             execute(&mut s, "tool.brush", &json!({"size": 40})).unwrap();
             s.stroke_uv_points(&[Vec2::splat(0.5)]).unwrap();
             let mut link = link();
             link.gpu_composite_enabled = true;
             link.brush_device = Some(brush.clone());
-            let painted = display(&mut link, &mut s);
+            let painted = display(&mut link, &mut s, aux);
 
             execute(&mut s, "tool.eraser", &json!({})).unwrap();
             execute(&mut s, "tool.brush", &json!({"opacity": 60})).unwrap();
+            if height_only {
+                execute(&mut s, "tool.material", &json!({"channel": "baseColor", "enabled": false})).unwrap();
+            }
             s.brush_device = link.brush_device(&s);
             s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
-            assert!(s.device_stroke().is_some_and(|stroke| stroke.erase), "mask {on_mask}: the Eraser runs on the device");
-            let live = display(&mut link, &mut s);
+            assert!(s.device_stroke().is_some_and(|stroke| stroke.erase), "{case}: the Eraser runs on the device");
+            let live = display(&mut link, &mut s, aux);
             s.end_stroke().unwrap();
-            let committed = display(&mut link, &mut s);
+            let committed = display(&mut link, &mut s, aux);
 
-            assert_ne!(live, painted, "mask {on_mask}: the erase shows while it is drawn");
-            assert!(close(live, committed), "mask {on_mask}: live {live:?}, committed {committed:?}");
+            if height_only {
+                assert!(close(live, painted), "{case}: Base Color stays as the commit leaves it: {live:?} vs {painted:?}");
+            } else {
+                assert_ne!(live, painted, "{case}: the erase shows while it is drawn");
+            }
+            assert!(close(live, committed), "{case}: live {live:?}, committed {committed:?}");
         }
     }
 
