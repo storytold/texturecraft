@@ -38,10 +38,18 @@
 //! (`crate::gpu_composite::oracle`) per context and setting value, chained and with a region.
 
 use texturecraft_core::project::MAX_DEPTH;
-use texturecraft_core::{ContentsOffset, LayerId, LayerKind, Project, SelectionBackground};
+use texturecraft_core::{
+    Channel, ChannelKind, ColorSelection, CompareSource, ContentsOffset, Effect, EffectKind, Filter, ImageInput, LayerId, LayerKind, Project, Projection,
+    Sampling, Source,
+};
 
 use super::packages::{STACK_OP_BITS, STACK_OPCODES};
-use super::{CompositeProgram, Operation, ProceduralInputs};
+use super::{
+    CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, NEIGHBOURHOOD_OPCODE, Operation, ProceduralInputs, bind_tile_source, channel_slot,
+    source_operation,
+};
+use crate::gpu_image_source::ImageUse;
+use crate::gpu_tile_pattern::TilePatterns;
 
 /// Library filter ids P3 still leaves on the CPU (filters whose only blocker is a P3 setting are
 /// listed under the package that ports the filter).
@@ -58,13 +66,34 @@ fn stack_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
 fn stack_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 { return stack_scalar_filter(effect, mask); }
 fn stage_input_value(op: Operation, texel: LayerTexel) -> f32 { return base_content(op, texel).x; }
 fn stack_soft_compare(op: Operation, mask: f32) -> f32 { return mask; }
-fn stack_color_selection(effect: Operation, pixel: vec2<u32>) -> vec2<f32> { return vec2(0.0, 1.0); }";
+fn stack_color_selection(effect: Operation, texel: LayerTexel) -> vec2<f32> { return vec2(0.0, 1.0); }";
 
 /// `Operation::ext[2]` flag of a mask comparison or colour selection with a soft edge, an output
 /// or a background (`composite_mask_effects.wgsl` then calls this package's functions).
 pub(super) const SOFT_MASK_EFFECT: u32 = 0x0000_0100;
+/// `Operation::ext[2]` flag of a colour selection reading an image as its ID map, whose record
+/// is the first word of its side-table parameters (`ProceduralInputs::pack_image`).
+const ID_MAP_IMAGE: u32 = 0x0000_0200;
 /// The background value of a transparent colour selection, which covers only what it selects.
 const TRANSPARENT_BACKGROUND: f32 = -1.0;
+/// P3 opcode: a mask comparison with a side reading the layers below or this layer.
+const LAYER_COMPARE: u32 = 144;
+/// Width of a side code in `ids[3]` (the left side, then the right side above it).
+const SIDE_BITS: u32 = 4;
+/// The bits of one side code.
+const SIDE_MASK: u32 = (1 << SIDE_BITS) - 1;
+/// Side codes of a layer comparison (`stack_compare_side` in WGSL).
+const MASK_SIDE: u32 = 0;
+const CONSTANT_SIDE: u32 = 1;
+const LAYERS_BELOW_SIDE: u32 = 2;
+const THIS_LAYER_SIDE: u32 = 3;
+/// Shift of the compared channel's kind in `ids[3]`.
+const KIND_SHIFT: u32 = 8;
+/// Kind codes of the compared channel.
+const COLOR_KIND: u32 = 0;
+const SCALAR_KIND: u32 = 1;
+const SIGNED_KIND: u32 = 2;
+const NORMAL_MAP_KIND: u32 = 3;
 
 /// Lets a mask comparison ramp over `1 - hardness` past its edge (`CompareOp::mask`), the width
 /// in `low.z`. A hard comparison, and a NaN hardness the CPU also treats as hard, stays as it is.
@@ -76,24 +105,133 @@ pub(super) fn soften_compare(op: &mut Operation, hardness: f32) {
     }
 }
 
-/// Lets a colour selection give `output` with an edge ramping over `1 - hardness` past its
-/// tolerance, on `background` (`ColorSelection::value`): output, width and background go in the
-/// side table. A selection with full output, a hard edge and a black background stays as it is.
-/// None for a non-finite output or hardness (the CPU selects nothing at a NaN hardness).
-pub(super) fn soften_selection(op: &mut Operation, output: f32, hardness: f32, background: SelectionBackground, inputs: &mut ProceduralInputs) -> Option<()> {
+/// Lets a colour selection give its output with an edge ramping over `1 - hardness` past its
+/// tolerance, on its background (`ColorSelection::value`), and read an image as its ID map
+/// (`id_color`, the image's stored texel at the texel's place): the image record, output, width
+/// and background go in the side table. A selection with full output, a hard edge and a black
+/// background on the baked ID map stays as it is. None for a non-finite output or hardness (the
+/// CPU selects nothing at a NaN hardness).
+pub(super) fn soften_selection(op: &mut Operation, selection: &ColorSelection, inputs: &mut ProceduralInputs) -> Option<()> {
+    let ColorSelection { output, hardness, background, id_map, .. } = selection;
     if !output.is_finite() || !hardness.is_finite() {
         return None;
     }
 
     let width = 1.0 - hardness.clamp(0.0, 1.0);
     let background_value = background.value();
-    if output == 1.0 && width <= 0.0 && background_value == Some(0.0) {
+    if *output == 1.0 && width <= 0.0 && background_value == Some(0.0) && id_map.is_none() {
         return Some(());
     }
 
-    op.ext[0] = inputs.pack_params(&[output, width, background_value.unwrap_or(TRANSPARENT_BACKGROUND)])?;
+    // The record word comes first, the parameters right after it
+    let record = match id_map {
+        Some(name) => {
+            op.ext[2] |= ID_MAP_IMAGE;
+            inputs.pack_image(name, ImageUse::Material)?
+        }
+        None => inputs.pack_words(&[0])?,
+    };
+    inputs.pack_params(&[*output, width, background_value.unwrap_or(TRANSPARENT_BACKGROUND)])?;
+    op.ext[0] = record;
     op.ext[2] |= SOFT_MASK_EFFECT;
     Some(())
+}
+
+/// Turns a mask comparison into one reading the material of `channel` at the texel for its
+/// layer sides (`compare_side`): the layers below (`stack_at`) or this layer's own content over
+/// them (`this_layer_content`), through the program's stack read (`spatial[3]`). The sides and
+/// the channel's kind go in `ids[3]`.
+pub(super) fn read_layers(op: &mut Operation, left: CompareSource, right: CompareSource, channel: Channel) {
+    let side = |source: CompareSource| match source {
+        CompareSource::ThisMask => MASK_SIDE,
+        CompareSource::Constant => CONSTANT_SIDE,
+        CompareSource::LayersBelow => LAYERS_BELOW_SIDE,
+        CompareSource::ThisLayer => THIS_LAYER_SIDE,
+    };
+    let kind = match channel.kind() {
+        ChannelKind::Color => COLOR_KIND,
+        ChannelKind::Scalar => SCALAR_KIND,
+        ChannelKind::Signed => SIGNED_KIND,
+        ChannelKind::NormalMap => NORMAL_MAP_KIND,
+    };
+    op.ids[1] = LAYER_COMPARE;
+    op.ids[3] = side(left) | (side(right) << SIDE_BITS) | (kind << KIND_SHIFT);
+    op.spatial[3] = channel_slot(channel) + 1;
+    op.effects[1] = 0;
+}
+
+/// Whether a mask operation compares this layer's own content.
+fn reads_own_layer(op: &Operation) -> bool {
+    let reads = |side: u32| side & SIDE_MASK == THIS_LAYER_SIDE;
+    op.ids[1] == LAYER_COMPARE && (reads(op.ids[3]) || reads(op.ids[3] >> SIDE_BITS))
+}
+
+/// Whether a mask's operations compare this layer's content before a filter stage of the mask:
+/// the prepare pass builds the mask's fields before the layer's content fields, so the content
+/// that comparison reads would lack its filters (the hub orders them later).
+pub(super) fn reads_own_layer_before_stage(mask: &[Operation]) -> bool {
+    let Some(first) = mask.iter().position(reads_own_layer) else { return false };
+    mask[first + 1..]
+        .iter()
+        .any(|op| op.ids[1] == NEIGHBOURHOOD_OPCODE || ((FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]) && op.spatial[1] != 0))
+}
+
+/// A folder mask's comparison: the CPU's This Layer of a folder is the stack below the folder
+/// (a folder has no content of its own), so its sides read Layers Below.
+pub(super) fn read_folder_layers(op: &mut Operation) {
+    if op.ids[1] != LAYER_COMPARE {
+        return;
+    }
+
+    for shift in [0, SIDE_BITS] {
+        if (op.ids[3] >> shift) & SIDE_MASK == THIS_LAYER_SIDE {
+            op.ids[3] = (op.ids[3] & !(SIDE_MASK << shift)) | (LAYERS_BELOW_SIDE << shift);
+        }
+    }
+}
+
+/// Gives a Bevel Smooth or Directional Distance stage its Distance Map (set, or its default
+/// gray), which the stage evaluates into its field's input word. Other operations stay as they
+/// are. None leaves the effect on the CPU.
+pub(super) fn attach_distance_map(effect: &Effect, op: &mut Operation, inputs: &mut ProceduralInputs) -> Option<()> {
+    let EffectKind::Filter(Filter::BevelSmooth(_) | Filter::DirectionalDistance(_)) = &effect.kind else { return Some(()) };
+    if op.ids[1] != NEIGHBOURHOOD_OPCODE {
+        return Some(());
+    }
+
+    op.effects[3] = register_image_input(effect, &ImageInput::DISTANCE_MAP, ChannelKind::Scalar, inputs)?;
+    Some(())
+}
+
+/// Gives the Tile Generator sources among `sources` (the inputs `effect` just registered) their
+/// tile settings, from the input of the effect's filter that reads a Tile Generator.
+pub(super) fn bind_input_tiles(effect: &Effect, sources: &mut [Operation], patterns: &mut TilePatterns) {
+    let EffectKind::Filter(filter) = &effect.kind else { return };
+    let Some(source) = ImageInput::of(filter).iter().map(|input| effect.input(input)).find(|source| matches!(source, Source::Procedural { .. })) else {
+        return;
+    };
+
+    for op in sources.iter_mut() {
+        bind_tile_source(op, Some(&source), patterns);
+    }
+}
+
+/// Register `effect`'s image input `input` (its source, else its default gray) as the source the
+/// effect operation reads at the texel, read as a `kind` channel: the reference for the
+/// operation's `effects[3]`. The CPU reads inputs with `Sampling::default()` and no projection,
+/// so an image source waits for the sampling P1 adds (`source_operation` refuses it); a Tile
+/// Generator gets its settings from [`bind_input_tiles`]. None leaves the effect on the CPU.
+pub(super) fn register_image_input(effect: &Effect, input: &ImageInput, kind: ChannelKind, inputs: &mut ProceduralInputs) -> Option<u32> {
+    let source = effect.input(input);
+    let operation = source_operation(Some(&source), &Projection::default(), Sampling::default(), [0.0; 3], kind, inputs)?;
+    Some(inputs.register_input(operation))
+}
+
+/// Whether the GPU evaluates the image inputs of `filter` (`ProceduralInputs::register_input`):
+/// Grayscale Conversion's Custom Input (lowered in gpu_composite_point.rs) and the Distance Map
+/// of Bevel Smooth and Directional Distance ([`attach_distance_map`], read by P4's kernels).
+pub(super) fn evaluates_inputs(filter: &Filter) -> bool {
+    matches!(filter, Filter::GrayscaleConversion(_) | Filter::BevelSmooth(_) | Filter::DirectionalDistance(_))
 }
 
 /// The folder offsets of every draw of layer `target` in `stack`, walked as the material program
@@ -144,7 +282,7 @@ mod tests {
     use texturecraft_texel::{TILE, to_u16, to_u16_signed};
 
     use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
-    use crate::gpu_composite::{CompositeProgram, CompositeRegion, effect_needs_cpu, reads_image_input};
+    use crate::gpu_composite::{CompositeProgram, CompositeRegion};
 
     /// P3's effect settings that still composite on the CPU. Port one: delete its row or block
     /// (these tests fail while a ported case stays) and add its oracle test.
@@ -152,37 +290,21 @@ mod tests {
     fn stack_settings_still_on_the_cpu_fall_back() {
         let none = ContentsOffset::NONE;
 
-        // Only an input the filter reads counts: Grayscale Conversion reads its Custom Input once switched on
+        // An image as Custom Input waits for the Bilinear HQ sampling of P1
         let conversion = texturecraft_core::GrayscaleConversion { custom_input: true, ..texturecraft_core::GrayscaleConversion::LIBRARY };
-        let mut reads_input = effect(EffectKind::Filter(Filter::GrayscaleConversion(conversion)));
-        reads_input.inputs.insert(texturecraft_core::ImageInput::CUSTOM_INPUT.id.into(), Source::Uniform([0.5; 3]));
-        assert!(effect_needs_cpu(&reads_input).is_some() && reads_image_input(&reads_input));
+        let mut image_input = effect(EffectKind::Filter(Filter::GrayscaleConversion(conversion)));
+        let image = Source::Image { name: "Pattern".into(), normal_format: NormalFormat::default() };
+        image_input.inputs.insert(texturecraft_core::ImageInput::CUSTOM_INPUT.id.into(), image);
+        assert!(compile_effects(Some(image_input.clone()), None, none).0.is_err());
+        let (material, mask) = compile_effects(None, Some(image_input), none);
+        assert!(material.is_err() && mask.is_err());
 
-        // Mask comparisons reading layers, and colour selections reading an image as ID map
-        let compare = |left| EffectKind::Compare {
-            op: CompareOp::GreaterThan,
-            value: 0.5,
-            tolerance: 0.0,
-            left,
-            right: CompareSource::Constant,
-            channel: Channel::Height,
-            hardness: 1.0,
-        };
-        let mut id_map_selection = ColorSelection::new(vec![[1.0, 0.0, 0.0]], 0.1);
-        id_map_selection.id_map = Some("id.png".into());
-        let layer_on_right = EffectKind::Compare {
-            op: CompareOp::GreaterThan,
-            value: 0.5,
-            tolerance: 0.0,
-            left: CompareSource::ThisMask,
-            right: CompareSource::ThisLayer,
-            channel: Channel::Height,
-            hardness: 1.0,
-        };
-        for kind in [compare(CompareSource::LayersBelow), layer_on_right, EffectKind::ColorSelection(id_map_selection)] {
-            let (material, mask) = compile_effects(None, Some(effect(kind.clone())), none);
-            assert!(material.is_err() && mask.is_err(), "{kind:?}");
-        }
+        // A mask filter stage after This Layer: the prepare pass builds the mask's fields before the
+        // layer's content fields, so the filtered content is not there yet (the hub orders them later)
+        let (mut project, pixels, owner) = compare_stack(vec![own_layer_compare(), effect(EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false }))]);
+        project.layer_mut(owner).unwrap().content_effects.push(effect(EffectKind::Filter(Filter::Blur { radius: 12.0, wrap: false })));
+        assert!(CompositeProgram::try_compile_region(&project, &pixels, 0, None).is_err());
+        assert!(CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).is_err());
     }
 
     /// A fill whose mask reads an anchor published by the layer below and an image fill, inside a
@@ -624,6 +746,307 @@ mod tests {
             case.mask_owner = Some(mask_owner);
             case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
             assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("folder offsets, mask of {mask_owner:?}"));
+        }
+    }
+
+    /// How a layer-comparison project is laid out: whether a layer lies below, how many folders
+    /// hold the compared layer, whether the innermost folder's mask (not the layer's) holds the
+    /// effects, the compared layer's content effects, and whether the layer below publishes an
+    /// anchor ([`BELOW_ANCHOR`]).
+    type CompareLayout = (bool, usize, bool, Vec<Effect>, bool);
+
+    /// The anchor the layer below publishes when the layout asks for it.
+    const BELOW_ANCHOR: LayerId = LayerId(960);
+
+    /// [`compare_stack_in`] with a layer below and the effects in the compared layer's mask.
+    fn compare_stack(effects: Vec<Effect>) -> (Project, PixelStore, LayerId) {
+        compare_stack_in(effects, (true, 0, false, Vec::new(), false))
+    }
+
+    /// A layer below with colour, roughness, height and normal ramping across the set under a
+    /// blur, and above it a paint layer painted in a block (inside `folders` folders, the inner
+    /// one at part opacity), with a black mask holding a gray fill and `effects` on the layer or on
+    /// the innermost folder: (project, pixels, the mask's owner).
+    #[allow(clippy::unwrap_used)] // A test helper: a project that does not build fails the test
+    fn compare_stack_in(effects: Vec<Effect>, (below, folders, folder_mask, content, anchor): CompareLayout) -> (Project, PixelStore, LayerId) {
+        const SIZE: u32 = TILE * 2;
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal];
+        let mut project = Project::new("Layer comparisons", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let below_id = project.alloc_id();
+        if below {
+            let mut layer = Layer::new(below_id, "Below", LayerKind::Paint, &channels);
+            layer.content_effects.push(effect(EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false })));
+            if anchor {
+                layer.content_effects.push(Effect::new(BELOW_ANCHOR, EffectKind::Anchor));
+            }
+            project.insert_layer(0, layer, None, false).unwrap();
+        }
+        let mut mask = Mask::new(MaskBackground::Black);
+        let fill = EffectKind::Fill { source: Source::Uniform([0.36; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE };
+        mask.effects.push(Effect::new(project.alloc_id(), fill));
+        mask.effects.extend(effects);
+
+        // The folders, the innermost at part opacity
+        let mut parent = None;
+        for depth in 0..folders {
+            let folder = project.alloc_id();
+            let mut group = Layer::new(folder, "Folder", LayerKind::folder(), &channels);
+            if depth + 1 == folders {
+                group.channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Normal, opacity: 0.8 });
+                if folder_mask {
+                    group.mask = Some(mask.clone());
+                }
+            }
+            project.insert_layer(0, group, parent, parent.is_some()).unwrap();
+            parent = Some(folder);
+        }
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "Compared", LayerKind::Paint, &channels);
+        layer.content_effects = content;
+        if !folder_mask {
+            layer.mask = Some(mask);
+        }
+        project.insert_layer(0, layer, parent, parent.is_some()).unwrap();
+
+        let mut pixels = PixelStore::default();
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let t = (x as f32 + 0.5) / SIZE as f32;
+                if below {
+                    pixels.layer_mut(below_id, Channel::BaseColor, (SIZE, SIZE)).set(x, y, &[to_u16(t), to_u16(0.5 * t + 0.2), to_u16(1.0 - t), u16::MAX]);
+                    pixels.layer_mut(below_id, Channel::Roughness, (SIZE, SIZE)).set(x, y, &[to_u16(t), u16::MAX]);
+                    pixels.layer_mut(below_id, Channel::Height, (SIZE, SIZE)).set(x, y, &[to_u16_signed(1.2 * t - 0.6), u16::MAX]);
+                    pixels.layer_mut(below_id, Channel::Normal, (SIZE, SIZE)).set(x, y, &[to_u16(t), to_u16(0.5), to_u16(1.0 - 0.4 * t), u16::MAX]);
+                }
+            }
+        }
+        for y in 22..103 {
+            for x in 23..98 {
+                let gain = if x >= 63 { 1.0 } else { 0.65 };
+                pixels.layer_mut(owner, Channel::BaseColor, (SIZE, SIZE)).set(
+                    x,
+                    y,
+                    &[to_u16(0.7 * gain), to_u16(0.2 * gain), to_u16(0.3 * gain), to_u16(gain)],
+                );
+                pixels.layer_mut(owner, Channel::Roughness, (SIZE, SIZE)).set(x, y, &[to_u16(0.8 * gain), to_u16(gain)]);
+                pixels.layer_mut(owner, Channel::Height, (SIZE, SIZE)).set(x, y, &[to_u16_signed(0.5 * gain), to_u16(gain)]);
+                pixels.layer_mut(owner, Channel::Normal, (SIZE, SIZE)).set(x, y, &[to_u16(0.3 * gain), to_u16(0.6 * gain), to_u16(0.9 * gain), to_u16(gain)]);
+            }
+        }
+        let mask_owner = if folder_mask { parent.unwrap() } else { owner };
+        (project, pixels, mask_owner)
+    }
+
+    /// A soft comparison of this layer's roughness with a constant.
+    fn own_layer_compare() -> Effect {
+        compare_effect(CompareOp::GreaterThan, (CompareSource::ThisLayer, CompareSource::Constant), Channel::Roughness, 0.6, BlendMode::Normal, 1.0)
+    }
+
+    /// A comparison with the constant 0.45 and tolerance 0.12.
+    fn compare_effect(op: CompareOp, (left, right): (CompareSource, CompareSource), channel: Channel, hardness: f32, blend: BlendMode, opacity: f32) -> Effect {
+        let mut effect = effect(EffectKind::Compare { op, value: 0.45, tolerance: 0.12, left, right, channel, hardness });
+        effect.blend = blend;
+        effect.opacity = opacity;
+        effect
+    }
+
+    /// Composite each mask stack laid out by `layout` and compare it with the CPU in every map,
+    /// a partial region around the blur and the mask preview (a hard comparison may flip where a
+    /// side lies within an ulp of the constant).
+    fn assert_compare_cases(cases: Vec<Vec<Effect>>, layout: impl Fn() -> CompareLayout) {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        for effects in cases {
+            let label = format!("{effects:?}");
+            let (project, pixels, mask_owner) = compare_stack_in(effects, layout());
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(mask_owner);
+            case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
+            assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD.with_flips(16), &label);
+        }
+    }
+
+    const SIDES: [(CompareSource, CompareSource); 4] = [
+        (CompareSource::LayersBelow, CompareSource::Constant),
+        (CompareSource::ThisLayer, CompareSource::Constant),
+        (CompareSource::ThisMask, CompareSource::LayersBelow),
+        (CompareSource::LayersBelow, CompareSource::ThisLayer),
+    ];
+
+    /// Mask comparisons reading the layers below or this layer over them match the CPU's
+    /// `compare_side` on a colour, a scalar, a signed and a normal channel, on either side, for
+    /// every comparison, soft and hard, at opacity below 1, with a non-Normal blend, set to
+    /// Disable, chained, the library's default (This Layer against Layers Below on Height), around
+    /// the blur below with a partial update, and in the mask preview through the material program.
+    #[test]
+    fn mask_comparisons_reading_layers_match_the_cpu() {
+        let invert = effect(EffectKind::Filter(Filter::Invert));
+        let mut cases = Vec::new();
+        for channel in [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal] {
+            for pair in SIDES {
+                cases.push(vec![compare_effect(CompareOp::GreaterThan, pair, channel, 0.6, BlendMode::Normal, 1.0)]);
+            }
+            for op in [CompareOp::LesserThan, CompareOp::WithinTolerance, CompareOp::GreaterThan] {
+                cases.push(vec![compare_effect(op, SIDES[1], channel, 1.0, BlendMode::Normal, 1.0)]);
+                cases.push(vec![compare_effect(op, SIDES[3], channel, 0.3, BlendMode::Multiply, 0.8)]);
+            }
+        }
+        cases.push(vec![compare_effect(CompareOp::GreaterThan, SIDES[0], Channel::Roughness, 0.5, BlendMode::Disable, 0.7)]);
+        cases.push(vec![invert.clone(), compare_effect(CompareOp::WithinTolerance, SIDES[1], Channel::Height, 0.4, BlendMode::Screen, 0.9), invert]);
+        let library = (CompareSource::ThisLayer, CompareSource::LayersBelow);
+        cases.push(vec![compare_effect(CompareOp::GreaterThan, library, Channel::Height, 0.9, BlendMode::Normal, 1.0)]);
+        assert_compare_cases(cases, || (true, 0, false, Vec::new(), false));
+    }
+
+    /// Layer comparisons with nothing below (the channel's default), on a layer inside a folder,
+    /// and on a layer with content effects (a point filter and a blur, without a mask filter after
+    /// the comparison) match the CPU.
+    #[test]
+    fn mask_comparisons_reading_layers_in_other_stacks_match_the_cpu() {
+        let cases = || {
+            [Channel::BaseColor, Channel::Height]
+                .into_iter()
+                .flat_map(|channel| SIDES.map(|pair| vec![compare_effect(CompareOp::GreaterThan, pair, channel, 0.6, BlendMode::Normal, 1.0)]))
+                .collect::<Vec<_>>()
+        };
+        assert_compare_cases(cases(), || (false, 0, false, Vec::new(), false));
+        assert_compare_cases(cases(), || (true, 2, false, Vec::new(), false));
+        let content = || vec![effect(EffectKind::Filter(Filter::Invert)), effect(EffectKind::Filter(Filter::Blur { radius: 12.0, wrap: false }))];
+        assert_compare_cases(cases(), || (true, 0, false, content(), false));
+    }
+
+    /// A folder's mask comparing This Layer reads the stack below the folder, as the CPU does (a
+    /// folder has no content of its own), and Layers Below likewise: Base Color and Height, a
+    /// folder nested in another, chained, around the blur below with a partial update.
+    #[test]
+    fn folder_mask_comparisons_read_the_stack_below_as_the_cpu_does() {
+        let invert = effect(EffectKind::Filter(Filter::Invert));
+        let mut cases = Vec::new();
+        for channel in [Channel::BaseColor, Channel::Height] {
+            for pair in SIDES {
+                cases.push(vec![compare_effect(CompareOp::GreaterThan, pair, channel, 0.6, BlendMode::Normal, 1.0)]);
+            }
+        }
+        cases.push(vec![invert.clone(), compare_effect(CompareOp::LesserThan, SIDES[1], Channel::Height, 0.4, BlendMode::Multiply, 0.9), invert]);
+        assert_compare_cases(cases.clone(), || (true, 1, true, Vec::new(), false));
+        assert_compare_cases(cases, || (true, 2, true, Vec::new(), false));
+    }
+
+    /// This Layer read before a mask filter stage on a layer whose content has its own filter
+    /// stage: enabled once the hub prepares content stacks before the mask stack that reads them.
+    #[test]
+    #[ignore = "needs hub ordering"]
+    fn a_mask_stage_after_this_layer_reads_the_filtered_content() {
+        let blur = |radius| effect(EffectKind::Filter(Filter::Blur { radius, wrap: false }));
+        assert_compare_cases(vec![vec![own_layer_compare(), blur(24.0)]], || (true, 0, false, vec![blur(12.0)], false));
+    }
+
+    /// Colour selections reading an image as their ID map match the CPU's `id_color` (the image's
+    /// stored texel at the texel's place): hard and soft, on each background, at opacity below 1
+    /// with a non-Normal blend, set to Disable, chained, from a 3×3 sRGB image, and with the image
+    /// missing (nothing selected).
+    #[test]
+    fn colour_selections_reading_an_id_map_image_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let baked = BakedMaps::default();
+
+        // Byte-exact ID colours: picked ones, ones a little and well inside the tolerance, and far ones
+        let byte = |k: u8| f32::from(k) / 255.0;
+        let colors = [[200, 40, 10], [10, 180, 90], [60, 60, 220], [201, 41, 11], [12, 178, 92], [100, 100, 100], [0, 0, 0], [255, 255, 255]];
+        let texels = |count: usize| (0..count).map(|index| colors[index % colors.len()]).map(|[r, g, b]| [byte(r), byte(g), byte(b), 1.0]).collect();
+        let images = ImageStore::from([
+            ("Ids".into(), Arc::new(ImageRes::new(4, 4, texels(16), false))),
+            ("Ids sRGB".into(), Arc::new(ImageRes::new(3, 3, texels(9), true))),
+        ]);
+        let picked = vec![[200, 40, 10], [10, 180, 90], [60, 60, 220]].into_iter().map(|[r, g, b]| [byte(r), byte(g), byte(b)]).collect::<Vec<_>>();
+        let selection = |name: &str, output, hardness, background, blend, opacity| {
+            let mut selection = ColorSelection::new(picked.clone(), 1.0 / 64.0);
+            selection.id_map = Some(name.into());
+            selection.output = output;
+            selection.hardness = hardness;
+            selection.background = background;
+            let mut effect = effect(EffectKind::ColorSelection(selection));
+            effect.blend = blend;
+            effect.opacity = opacity;
+            effect
+        };
+        let invert = effect(EffectKind::Filter(Filter::Invert));
+
+        let mut cases = Vec::new();
+        for background in [SelectionBackground::Black, SelectionBackground::White, SelectionBackground::Gray, SelectionBackground::Transparent] {
+            cases.push(vec![selection("Ids", 1.0, 1.0, background, BlendMode::Normal, 1.0)]);
+            cases.push(vec![selection("Ids", 0.6, 0.3, background, BlendMode::Multiply, 0.75)]);
+            cases.push(vec![selection("Ids sRGB", 0.7, 0.4, background, BlendMode::Normal, 1.0)]);
+            cases.push(vec![selection("Missing", 0.8, 1.0, background, BlendMode::Normal, 1.0)]);
+        }
+        cases.push(vec![selection("Ids", 0.6, 0.5, SelectionBackground::White, BlendMode::Disable, 0.8)]);
+        cases.push(vec![invert.clone(), selection("Ids", 0.4, 0.5, SelectionBackground::Gray, BlendMode::Screen, 0.9), invert]);
+        for effects in cases {
+            let label = format!("{effects:?}");
+            let (project, pixels, owner) = ramp_mask_layer(effects);
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            assert_matches_cpu(&mut gpu, &case, Tolerance::POINT, &label);
+        }
+    }
+
+    /// Grayscale Conversion with its Custom Input switched on reads the input's colour (set, or its
+    /// default gray) in place of the channel, its alpha weighed as 1, as the CPU's
+    /// `GrayscaleConversion::channel_value` does: on colour, the other channels and the mask, for
+    /// each mode, at opacity below 1 with a non-Normal blend, set to Disable, switched off on a
+    /// channel, chained, and from inputs varying per texel (an anchor and a Tile Generator).
+    #[test]
+    fn grayscale_conversion_reads_its_custom_input_as_the_cpu_does() {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let conversion = |mode, input: Option<Source>, blend, opacity, off: &[Channel]| {
+            let conversion = texturecraft_core::GrayscaleConversion { custom_input: true, mode, ..texturecraft_core::GrayscaleConversion::LIBRARY };
+            let mut effect = effect(EffectKind::Filter(Filter::GrayscaleConversion(conversion)));
+            if let Some(source) = input {
+                effect.inputs.insert(texturecraft_core::ImageInput::CUSTOM_INPUT.id.into(), source);
+            }
+            effect.blend = blend;
+            effect.opacity = opacity;
+            effect.off_channels.extend(off.iter().copied());
+            effect
+        };
+        let contrast = effect(EffectKind::Filter(Filter::ContrastLuminosity { contrast: 0.4, luminosity: 0.05 }));
+        let color = || Some(Source::Uniform([0.8, 0.3, 0.1]));
+        let anchored = || Some(Source::Anchor { anchor: BELOW_ANCHOR, channel: Channel::BaseColor, ramp: Vec::new() });
+        let tiles = || {
+            let tile = texturecraft_core::TileGenerator { amount: [6, 6], ..texturecraft_core::TileGenerator::default() };
+            let pattern = texturecraft_core::Procedural {
+                tile: Some(Box::new(tile)),
+                seed: 73,
+                ..texturecraft_core::Procedural::new(texturecraft_core::ProceduralKind::TileGenerator)
+            };
+            Some(Source::Procedural { pattern, low: [0.1, 0.2, 0.3], high: [0.9, 0.7, 0.5], ramp: Vec::new() })
+        };
+        use texturecraft_core::ConversionMode::*;
+
+        let mut cases = Vec::new();
+        for mode in texturecraft_core::ConversionMode::ALL {
+            cases.push((vec![conversion(mode, color(), BlendMode::Normal, 1.0, &[])], Tolerance::POINT));
+        }
+        cases.push((vec![conversion(Desaturation, None, BlendMode::Normal, 1.0, &[])], Tolerance::POINT));
+        cases.push((vec![conversion(ChannelsWeights, color(), BlendMode::Multiply, 0.7, &[])], Tolerance::POINT));
+        cases.push((vec![conversion(Average, color(), BlendMode::Disable, 0.9, &[])], Tolerance::POINT));
+        cases.push((vec![conversion(Max, color(), BlendMode::Normal, 0.8, &[Channel::Roughness])], Tolerance::POINT));
+        cases.push((vec![contrast.clone(), conversion(Min, color(), BlendMode::Normal, 0.6, &[]), contrast], Tolerance::POINT));
+        cases.push((vec![conversion(Desaturation, anchored(), BlendMode::Normal, 0.9, &[])], Tolerance::NEIGHBOURHOOD));
+
+        // The tiles' hard edges may flip where a texel centre lies within an ulp of one
+        cases.push((vec![conversion(Average, tiles(), BlendMode::Normal, 1.0, &[])], Tolerance::POINT.with_flips(16)));
+        for (content, tolerance) in cases {
+            let label = format!("{content:?}");
+            let (project, pixels, owner) = compare_stack_in(content.clone(), (true, 0, false, content, true));
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            assert_matches_cpu(&mut gpu, &case, tolerance, &label);
         }
     }
 }

@@ -49,7 +49,7 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
         } else if e.ids.y == COLOR_SELECTION_OPCODE {
             if (e.ext.z & SOFT_MASK_EFFECT) != 0u {
                 // Output, soft edge and background; a transparent background covers only the selection
-                let selected = stack_color_selection(e, texel.pixel);
+                let selected = stack_color_selection(e, texel);
                 result = blend_scalar(u32(e.balance.z), mask, selected.x);
                 weight *= selected.y;
             } else {

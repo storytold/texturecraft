@@ -175,6 +175,24 @@ fn point_conversion_channel(op: Operation, c: vec3<f32>, channel: u32, alpha: f3
     return vec3(point_conversion_gray(op, vec3(c.x), alpha));
 }
 
+// Grayscale Conversion's Custom Input at the texel: its source operation (effects.w, register_input) as a colour
+fn point_custom_input(op: Operation, texel: LayerTexel) -> vec3<f32> {
+    return base_content(layers[op.effects.w - 1u], texel).rgb;
+}
+
+// Grayscale Conversion of a Custom Input onto a channel (GrayscaleConversion::channel_value with an input)
+fn point_conversion_input(op: Operation, input: vec3<f32>, c: vec3<f32>, channel: u32) -> vec3<f32> {
+    if channel == POINT_NORMAL_SLOT || channel == POINT_COAT_NORMAL_SLOT {
+        return c;
+    }
+
+    let gray = point_conversion_gray(op, input, 1.0);
+    if channel == POINT_HEIGHT_SLOT {
+        return vec3(gray * 2.0 - 1.0);
+    }
+    return vec3(gray);
+}
+
 // The linear value of an sRGB component (srgb_to_linear in Rust)
 fn point_srgb_to_linear(v: f32) -> f32 {
     let x = clamp(v, 0.0, 1.0);
@@ -331,7 +349,10 @@ fn point_effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surfac
 // default mixes point_effect_color by the opacity; take over for coverage or texel reads.
 fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, texel: LayerTexel) -> vec4<f32> {
     var filtered: vec3<f32>;
-    if effect.ids.y == POINT_GRAYSCALE_CONVERSION {
+    if effect.ids.y == POINT_GRAYSCALE_CONVERSION && effect.effects.w != 0u {
+        // A Custom Input gives its colour's gray, its alpha weighed as 1
+        filtered = point_conversion_input(effect, point_custom_input(effect, texel), content.rgb, channel);
+    } else if effect.ids.y == POINT_GRAYSCALE_CONVERSION {
         // Grayscale Conversion weighs the content's coverage as its alpha
         filtered = point_conversion_channel(effect, content.rgb, channel, content.a);
     } else if point_is_gradient_debug(effect) {
@@ -356,6 +377,9 @@ fn point_content_effect(effect: Operation, content: vec4<f32>, channel: u32, tex
 
 // A point opcode in the layer_mask loop: the result the loop mixes in by the opacity.
 fn point_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 {
+    if effect.ids.y == POINT_GRAYSCALE_CONVERSION && effect.effects.w != 0u {
+        return point_conversion_gray(effect, point_custom_input(effect, texel), 1.0);
+    }
     if point_is_gradient_debug(effect) {
         if effect.procedural.z == 0u {
             return mask;
