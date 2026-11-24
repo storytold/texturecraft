@@ -2665,6 +2665,48 @@ pub(crate) mod tests {
         assert!(s.doc.pixels.masks.is_empty(), "undo restores the mask");
     }
 
+    /// A mask image in the tool is a mask gray: a layer stroke paints channel values, so the GPU
+    /// brush shows it live and the release keeps what the stroke showed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_layer_stroke_with_a_mask_image_loaded_previews_on_the_gpu() {
+        use texturecraft_render::readback::Readback;
+
+        let Ok(gpu) = Headless::new() else { return };
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let mut s = Session::new_project("Layer with a mask image", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        let layer = s.selected_layer().unwrap();
+        execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [1.0, 0.0, 0.0]})).unwrap();
+        let grays = texturecraft_engine::formats::gray16_png(2, 2, [0.2, 0.9, 0.5, 0.7].into_iter()).unwrap();
+        let image = s.import_resource_bytes("gray.png", grays).unwrap();
+        execute(&mut s, "tool.material", &json!({"maskImage": image})).unwrap();
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+        let display_at_center = |scene: SceneSync| -> Vec<u8> {
+            let Headless { renderer, device, queue, .. } = &mut *brush.0.lock().unwrap();
+            let (_, errors) = scene.apply_display(renderer, device, queue);
+            assert!(errors.is_empty(), "{errors:?}");
+            let (w, h, rgba) = Readback::blocking(device, queue, renderer.display_textures()[0][0]).unwrap();
+            let center = ((h / 2 * w + w / 2) * 4) as usize;
+            rgba[center..center + 4].to_vec()
+        };
+        let neutral = display_at_center(link.sync(&mut s, None, None, 0, 0.0));
+
+        s.brush_device = link.brush_device(&s);
+        s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+        assert!(s.device_stroke().is_some(), "the layer stroke previews from the device");
+        let frame = link.sync(&mut s, None, None, 0, 0.0);
+        assert!(!frame.composites.is_empty());
+        let live = display_at_center(frame);
+        assert_ne!(live, neutral, "the stroke shows while it is drawn");
+
+        s.end_stroke().unwrap();
+        assert!(s.doc.pixels.layer(layer, Channel::BaseColor).is_some());
+        let committed = display_at_center(link.sync(&mut s, None, None, 0, 0.0));
+        assert!(committed.iter().zip(&live).all(|(a, b)| a.abs_diff(*b) <= 1), "{committed:?} vs {live:?}");
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_mask_brush_previews_commits_and_cancels_in_both_views() {

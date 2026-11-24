@@ -665,14 +665,17 @@ impl Session {
     /// The live material compositor uses the device's coverage directly while the stroke is active.
     pub fn device_stroke(&self) -> Option<DeviceStrokePreview<'_>> {
         let stroke = self.stroke.as_ref()?;
-        // The gray resolved when the stroke began; a mask image never runs on the device
-        let mask_value = match &stroke.mask_gray {
-            MaskGray::Value(value) => value.clamp(0.0, 1.0),
-            MaskGray::Image { .. } => return None,
+        let target = stroke.target?;
+
+        // The gray resolved when the stroke began; a layer stroke paints channel values, so only a mask target reads it
+        let mask_value = match (&stroke.mask_gray, target) {
+            (MaskGray::Value(value), _) => value.clamp(0.0, 1.0),
+            (MaskGray::Image { .. }, PaintTarget::Layer(_)) => 0.0,
+            (MaskGray::Image { .. }, PaintTarget::Mask(_)) => return None,
         };
         Some(DeviceStrokePreview {
             ts: stroke.ts,
-            target: stroke.target?,
+            target,
             values: &stroke.values,
             mask_value,
             opacity: stroke.stroke.settings.opacity,
