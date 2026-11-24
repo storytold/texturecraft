@@ -281,14 +281,13 @@ fn height_to_normal_stage(stage: StageInputs, to_normal: &HeightToNormal) -> Nei
 }
 
 /// `filter` with the inputs it does not read at its texels laid in (an unlinked input reads its
-/// default, a uniform one of Color Match is its colour), and the input it reads at its texels
-/// with the kind to read it as (Color Match's in colour). The caller registers that input
-/// (`register_input`, or `register_color_input` for colour) in the operation's `effects[3]` and
-/// stores the returned filter in place of the effect's. None when two inputs are read at the
-/// texels (Color Match's Input and Image Input both linked to non-uniform sources): one stage
-/// carries one input, so that effect stays on the CPU.
-#[allow(dead_code)] // Called by the stack plumbing once it registers the gather filters' inputs
-pub(crate) fn bind_inputs(effect: &Effect, filter: &Filter) -> Option<(Filter, Option<(ImageInput, ChannelKind)>)> {
+/// default, a uniform one of Color Match is its colour), and the inputs it reads at its texels
+/// with the kind to read them as (Color Match's in colour). The caller registers the first in the
+/// operation's `effects[3]` (`register_input`, or `register_color_input` for colour) and a second
+/// in its `effects[2]` (`register_color_input`: Color Match's Image Input beside its Input), and
+/// stores the returned filter in place of the effect's.
+#[allow(dead_code)] // Called by the stack plumbing, which registers the gather filters' inputs
+pub(crate) fn bind_inputs(effect: &Effect, filter: &Filter) -> (Filter, Vec<(ImageInput, ChannelKind)>) {
     let linked = |input: &ImageInput| effect.inputs.get(input.id);
     match filter {
         Filter::ColorMatch(matcher) => {
@@ -308,16 +307,11 @@ pub(crate) fn bind_inputs(effect: &Effect, filter: &Filter) -> Option<(Filter, O
                     Some(_) => texel_inputs.push(ImageInput::TARGET_INPUT),
                 }
             }
-            let input = match texel_inputs.as_slice() {
-                [] => None,
-                [input] => Some((*input, ChannelKind::Color)),
-                _ => return None,
-            };
-            Some((Filter::ColorMatch(matcher), input))
+            (Filter::ColorMatch(matcher), texel_inputs.into_iter().map(|input| (input, ChannelKind::Color)).collect())
         }
         filter => {
             let input = ImageInput::of(filter).into_iter().find(|input| linked(input).is_some());
-            Some((filter.clone(), input.map(|input| (input, ChannelKind::Scalar))))
+            (filter.clone(), input.map(|input| (input, ChannelKind::Scalar)).into_iter().collect())
         }
     }
 }
@@ -592,7 +586,7 @@ mod tests {
         Mask, MaskBackground, Mirror, MirrorCorner, MirrorMode, Project, RepeatMode, SlopeBlending, SourceColorMode, SourceSlopeBlur, SourceWarp,
         TargetColorMode, TextureSet, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode,
     };
-    use texturecraft_core::{ImageInput, Procedural, ProceduralKind, Source};
+    use texturecraft_core::{Fill, ImageInput, Procedural, ProceduralKind, Source};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TileImage, to_u16, to_u16_signed};
 
@@ -1033,7 +1027,7 @@ mod tests {
 
     /// Linked image inputs match the CPU: Warp's and Blur Slope's Custom Noise (procedural and
     /// uniform), Kuwahara's Custom Input, and Color Match's Input and Image Input in colour, one
-    /// uniform beside one read at the texels too. Two inputs read at the texels stay on the CPU.
+    /// uniform beside one read at the texels too.
     #[test]
     fn linked_inputs_match_the_cpu() {
         let Some(mut gpu) = headless() else { return };
@@ -1090,12 +1084,52 @@ mod tests {
         let cases =
             [("Kuwahara from a linked Custom Input", vec![(Filter::AnisotropicKuwahara(kuwahara), 1.0, normal)], vec![(ImageInput::CUSTOM_INPUT.id, gray)])];
         assert!(check_linked(&mut gpu, &cases, (false, KUWAHARA_SIZE), KUWAHARA_MIDDLE, KUWAHARA_DECISIONS).is_some());
+    }
 
-        // Both Color Match inputs read at the texels: one stage carries one input
-        let mut two = effect(EffectKind::Filter(Filter::ColorMatch(both)));
-        two.inputs.insert(source_input.into(), colours.clone());
-        two.inputs.insert(target_input.into(), colours);
-        assert!(compile_effects(Some(two), None, ContentsOffset::NONE).0.is_err());
+    /// Color Match with both its Input and its Image Input read at the texels (the second in the
+    /// stage's second input) matches the CPU: an anchored layer below and a procedural, each way
+    /// round, with and without Custom Color Variation, below full opacity under Multiply.
+    #[test]
+    fn color_match_with_both_inputs_linked_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let normal = BlendMode::Normal;
+        let colours = procedural(ProceduralKind::Clouds, [0.7, 0.2, 0.1], [0.1, 0.3, 0.8]);
+        let both = ColorMatch { source_mode: SourceColorMode::Input, target_mode: TargetColorMode::ImageInput, ..ColorMatch::LIBRARY };
+        let (source_input, target_input) = (ImageInput::SOURCE_INPUT.id, ImageInput::TARGET_INPUT.id);
+        let cases = [
+            ("anchored Input, procedural Image Input", both, 1.0, normal, true),
+            ("procedural Input, anchored Image Input", ColorMatch { custom_variation: false, ..both }, 0.8, BlendMode::Multiply, false),
+        ];
+        for (label, matcher, opacity, channel_blend, anchor_is_source) in cases {
+            let (mut project, pixels, owner) = painted_project(&[(Filter::ColorMatch(matcher), opacity, normal)], channel_blend, MIDDLE_PAINT).unwrap();
+
+            // A layer below the paint, its colour published by an anchor
+            let below = project.alloc_id();
+            let anchor = project.alloc_id();
+            let fill =
+                Fill { sources: [(Channel::BaseColor, procedural(ProceduralKind::Perlin, [0.6, 0.5, 0.1], [0.2, 0.6, 0.7]))].into(), ..Default::default() };
+            let mut layer = Layer::new(below, "Below", LayerKind::Fill(fill), &[Channel::BaseColor]);
+            layer.content_effects.push(Effect::new(anchor, EffectKind::Anchor));
+            project.insert_layer(0, layer, None, false).unwrap();
+            let stack = &mut project.texture_sets[0].stack;
+            stack.retain(|&id| id != below);
+            stack.insert(0, below);
+
+            let anchored = Source::Anchor { anchor, channel: Channel::BaseColor, ramp: Vec::new() };
+            let (source, target) = if anchor_is_source { (anchored, colours.clone()) } else { (colours.clone(), anchored) };
+            let layer = project.layers.get_mut(&owner).unwrap();
+            for effect in layer.content_effects.iter_mut().filter(|effect| matches!(effect.kind, EffectKind::Filter(_))) {
+                effect.inputs.insert(source_input.into(), source.clone());
+                effect.inputs.insert(target_input.into(), target.clone());
+            }
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            case.region = Some(MIDDLE);
+
+            assert_matches_cpu(&mut gpu, &case, Tolerance::TRANSCENDENTAL, label);
+        }
     }
 
     /// Anisotropic Kuwahara matches the CPU through its structure tensor pass, at the library's

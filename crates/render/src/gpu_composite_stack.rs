@@ -246,12 +246,14 @@ pub(super) fn attach_gather_input(effect: &Effect, op: &mut Operation, inputs: &
         return Some(());
     }
 
-    let (bound, input) = crate::gpu_neighbourhood::gather::bind_inputs(effect, filter)?;
+    let (bound, texel_inputs) = crate::gpu_neighbourhood::gather::bind_inputs(effect, filter);
     inputs.filters.get_mut(op.ids[2] as usize)?.0 = bound;
-    if let Some((input, kind)) = input {
+
+    // The first input in `effects[3]`, a second (always colour) in `effects[2]`
+    for (slot, (input, kind)) in [3, 2].into_iter().zip(texel_inputs) {
         let source = effect.input(&input);
         let operation = source_operation(Some(&source), &Projection::default(), Sampling::default(), [0.0; 3], kind, inputs)?;
-        op.effects[3] = if kind == ChannelKind::Color { inputs.register_color_input(operation) } else { inputs.register_input(operation) };
+        op.effects[slot] = if kind == ChannelKind::Color { inputs.register_color_input(operation) } else { inputs.register_input(operation) };
     }
     Some(())
 }
