@@ -373,19 +373,43 @@ mod tests {
     }
 
     /// A fill seen through the mesh's own UVs per tile: a reduced Checker repeating once per UV
-    /// tile at each tile's resolution, Clouds through the UV projection, a Bilinear HQ image (the
-    /// footprint of each tile's UV step), and the gradient's debug ramp across each tile, in the
-    /// material and in the mask.
+    /// tile at each tile's resolution, with Clouds through the UV projection, under a mask of
+    /// the Checker.
     #[test]
-    fn fills_and_the_gradient_debug_view_follow_each_uv_tile() {
+    fn fills_follow_each_uv_tile() {
         let Some(mut gpu) = headless() else { return };
+        let clouds = Procedural { scale: 3.0, seed: 7, ..Procedural::new(ProceduralKind::Clouds) };
+        let roughness = Source::Procedural { pattern: clouds, low: [0.2; 3], high: [0.9; 3], ramp: Vec::new() };
+
+        uv_tile_fills(&mut gpu, Some((Channel::Roughness, roughness)), false);
+    }
+
+    /// [`fills_follow_each_uv_tile`] with a Bilinear HQ image (the footprint of each tile's UV
+    /// step). Apart: one program with the Clouds, the image and the debug view compiles to over
+    /// 9 GB on llvmpipe, this one alone to 8.6 GB.
+    #[test]
+    fn image_fills_follow_each_uv_tile() {
+        let Some(mut gpu) = headless() else { return };
+        uv_tile_fills(&mut gpu, Some((Channel::Height, Source::image("stripes"))), false);
+    }
+
+    /// The gradient's debug ramp across each tile, in the material and in the mask, over the
+    /// reduced Checker.
+    #[test]
+    fn the_gradient_debug_view_follows_each_uv_tile() {
+        let Some(mut gpu) = headless() else { return };
+        uv_tile_fills(&mut gpu, None, true);
+    }
+
+    /// The reduced Checker per UV tile in the material and the mask, with the `extra` source and
+    /// with the gradient's debug view when `debug_view`.
+    fn uv_tile_fills(gpu: &mut Headless, extra: Option<(Channel, Source)>, debug_view: bool) {
         let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height];
         let stripes: Vec<[f32; 4]> = (0..96 * 4).map(|texel| [0.2 + 0.6 * f32::from((texel % 96) % 6 >= 3), 0.4, 0.3, 1.0]).collect();
         let images = ImageStore::from([("stripes".to_owned(), Arc::new(ImageRes::new(96, 4, stripes, false)))]);
         let baked = BakedMaps::default();
         let mut checker = Procedural::new(ProceduralKind::Checker);
         checker.resolution.factor = -1;
-        let clouds = Procedural { scale: 3.0, seed: 7, ..Procedural::new(ProceduralKind::Clouds) };
         let debug = Filter::GradientMap {
             colors: vec![[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]],
             positions: vec![0.0, 0.3, 0.9],
@@ -398,34 +422,38 @@ mod tests {
         for scaled in [false, true] {
             let (mut project, mesh) = atlas(scaled, &channels);
             let owner = project.alloc_id();
-            let sources = BTreeMap::from([
-                (Channel::BaseColor, Source::Procedural { pattern: checker.clone(), low: [0.1, 0.2, 0.3], high: [0.8, 0.7, 0.2], ramp: Vec::new() }),
-                (Channel::Roughness, Source::Procedural { pattern: clouds.clone(), low: [0.2; 3], high: [0.9; 3], ramp: Vec::new() }),
-                (Channel::Height, Source::image("stripes")),
-            ]);
+            let mut sources = BTreeMap::from([(
+                Channel::BaseColor,
+                Source::Procedural { pattern: checker.clone(), low: [0.1, 0.2, 0.3], high: [0.8, 0.7, 0.2], ramp: Vec::new() },
+            )]);
+            sources.extend(extra.clone());
             let fill = Fill { sources, projection: Projection::UvTile, ..Fill::default() };
             let mut layer = Layer::new(owner, "Tiles", LayerKind::Fill(fill), &channels);
-            let mut shown = Effect::new(project.alloc_id(), EffectKind::Filter(debug.clone()));
-            shown.opacity = 0.5;
-            layer.content_effects.push(shown);
+            if debug_view {
+                let mut shown = Effect::new(project.alloc_id(), EffectKind::Filter(debug.clone()));
+                shown.opacity = 0.5;
+                layer.content_effects.push(shown);
+            }
             let mut mask = Mask::new(MaskBackground::Black);
             let checker_mask = Source::Procedural { pattern: checker.clone(), low: [0.2; 3], high: [0.9; 3], ramp: Vec::new() };
             mask.effects.push(Effect::new(
                 project.alloc_id(),
                 EffectKind::Fill { source: checker_mask, projection: Projection::default(), sampling: Sampling::default() },
             ));
-            let mut masked = Effect::new(project.alloc_id(), EffectKind::Filter(debug.clone()));
-            masked.opacity = 0.6;
-            mask.effects.push(masked);
+            if debug_view {
+                let mut masked = Effect::new(project.alloc_id(), EffectKind::Filter(debug.clone()));
+                masked.opacity = 0.6;
+                mask.effects.push(masked);
+            }
             // A stage, so the GPU leaves the texels the mesh does not cover as the CPU does
             mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false })));
             layer.mask = Some(mask);
-            project.insert_layer(0, layer, None, false).unwrap();
+            assert!(project.insert_layer(0, layer, None, false).is_ok());
             let pixels = PixelStore::default();
             let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
             case.mask_owner = Some(owner);
 
-            assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, &format!("UV tile fills, scaled {scaled}"));
+            assert_matches_cpu(gpu, &case, Tolerance::BILINEAR, &format!("UV tile fills with {extra:?}, debug view {debug_view}, scaled {scaled}"));
         }
     }
 

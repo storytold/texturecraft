@@ -1465,7 +1465,8 @@ pub struct CompositeProgram {
     glossiness: bool,
     mask_preview: bool,
     mask_layer: u32,
-    mask_layers: BTreeMap<LayerId, u32>,
+    /// The first operation of each draw of a layer with a mask, with the draw's placement
+    mask_layers: Vec<(LayerId, ContentsOffset, u32)>,
     /// Side-table words to fill with image record offsets at upload (`ProceduralInputs::pack_image`)
     image_words: Vec<(u32, u32)>,
     /// The environment's diffuse light the program reads (`ProceduralInputs::reserve_environment`)
@@ -1692,7 +1693,7 @@ impl CompositeProgram {
         let mut geometry = GeometryMasks::default();
         let mut groups = GroupPlan::default();
         let mut group_depth = 0;
-        let mut mask_layers = BTreeMap::new();
+        let mut mask_layers = Vec::new();
         let mut non_default = [false; Channel::ALL.len()];
         let stencil_pigment = brush.as_ref().is_some_and(|brush| brush.stencil.is_some());
         // Each draw carries the Scale and Rotation of the folders holding it (an instanced folder's too)
@@ -1778,7 +1779,7 @@ impl CompositeProgram {
                 };
                 op.balance[1] = background;
                 operations.push(op);
-                mask_layers.insert(id, open as u32);
+                mask_layers.push((id, around, open as u32));
                 procedural.anchors.draw_ranges.push(open as u32..open as u32 + 1);
                 group_depth += 1;
                 groups.depth = groups.depth.max(group_depth);
@@ -1800,9 +1801,6 @@ impl CompositeProgram {
             let per_channel = layer.content_effects.iter().any(|effect| effect.visible && (content_depends_on_channel(effect) || blends_per_channel(effect)));
             let mut templates = Vec::new();
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
-                if let Some(reason) = effect_needs_cpu(effect) {
-                    return Err(reason);
-                }
                 if matches!(effect.kind, EffectKind::Anchor) {
                     content_anchors.push((effect.id, visible_cut));
                     continue;
@@ -1951,12 +1949,12 @@ impl CompositeProgram {
                 op.constraints = [geometry_mask, height_op, height_params[0], height_params[1]];
             }
             if first_op != operations.len() {
-                mask_layers.insert(id, first_op as u32);
+                mask_layers.push((id, around, first_op as u32));
             } else if mask.as_ref().is_some_and(|mask| {
                 mask.effects.iter().any(|effect| effect.visible && (!effect.kind.anchors_read().is_empty() || matches!(effect.kind, EffectKind::Anchor)))
             }) {
                 // A layer with no display channels can still publish anchors in its mask.
-                mask_layers.insert(id, first_op as u32);
+                mask_layers.push((id, around, first_op as u32));
                 operations.push(Operation {
                     ids: [u32::MAX, ANCHOR_PUBLISH_MASK, 0, 0],
                     effects: [mask_start, mask_count, 0, 0],
@@ -2066,13 +2064,10 @@ impl CompositeProgram {
             !effect.kind.anchors_read().is_empty() || effect.inputs.values().any(|source| source.reads_anchor(None)) || effect.kind.reads_stack()
         };
         if mask.effects.iter().any(|effect| effect.visible && reads_below(effect)) {
-            // The material program keeps the owner's last draw, which must sit where the requested layer does
-            if stack::draw_offsets(project, &set.stack, owner).iter().any(|offset| *offset != around) {
-                return Err("A mask reading anchors or layers inside a folder with Scale or Rotation uses CPU mask preview.");
-            }
-
+            // The material program draws the owner once per placement: show the draw where the requested layer sits
             let mut program = Self::try_compile_with_brush(project, pixels, ts, region, brush)?;
-            program.mask_layer = *program.mask_layers.get(&owner).ok_or("The mask's GPU anchor stack is missing.")?;
+            let draw = program.mask_layers.iter().rev().find(|&&(id, offset, _)| (id == requested || id == owner) && offset == around);
+            program.mask_layer = draw.ok_or("The mask's GPU anchor stack is missing.")?.2;
             program.mask_preview = true;
             program.display_outputs = display_bit(DisplayKind::BaseColor);
             return Ok(program);
@@ -2122,7 +2117,7 @@ impl CompositeProgram {
             glossiness: false,
             mask_preview: true,
             mask_layer: 0,
-            mask_layers: BTreeMap::new(),
+            mask_layers: Vec::new(),
             image_words: procedural.image_words,
             environment: LateEnvironment::new(procedural.environment_word, &project.display),
             bake_rows: procedural.bake_rows,
@@ -2234,24 +2229,6 @@ fn channel_filter(effect: &Effect, channel: Channel, procedural: &mut Procedural
     content_filter(&on_channel, procedural)
 }
 
-/// Settings of an effect the GPU program does not model: image inputs its filter reads. A mask
-/// ignores per-channel blends (it blends by [`Effect::blend_of`] with no channel), and content
-/// effects lay them on per channel ([`channel_filter`], [`content_deposit`]).
-fn effect_needs_cpu(effect: &Effect) -> Option<&'static str> {
-    if reads_image_input(effect) {
-        return Some("An effect with an image input uses CPU compositing.");
-    }
-    None
-}
-
-/// Whether the effect's filter reads one of the image inputs set on it now and the GPU does not
-/// evaluate that input (inputs a filter it was swapped from left behind, or that its mode does not
-/// read, change nothing; [`stack::evaluates_inputs`] lists the filters whose inputs it reads)
-fn reads_image_input(effect: &Effect) -> bool {
-    let EffectKind::Filter(filter) = &effect.kind else { return false };
-    !stack::evaluates_inputs(filter) && texturecraft_core::ImageInput::of(filter).iter().any(|input| effect.inputs.contains_key(input.id))
-}
-
 fn content_deposit(
     effect: &Effect,
     (channel, around): (Channel, ContentsOffset),
@@ -2304,9 +2281,6 @@ fn compile_mask(
 ) -> Result<f32, &'static str> {
     let Some(mask) = mask else { return Ok(1.0) };
     for effect in mask.effects.iter().filter(|e| e.visible) {
-        if let Some(reason) = effect_needs_cpu(effect) {
-            return Err(reason);
-        }
         let mut op = match &effect.kind {
             EffectKind::Fill { source, projection, sampling } => {
                 let mut operation = source_operation(Some(source), &placed(around, projection), *sampling, [0.0; 3], ChannelKind::Scalar, procedural)
@@ -2629,7 +2603,7 @@ fn generator_stage(generator: &Generator, resolution: u32, inputs: &ProceduralIn
 fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operation> {
     use Filter::*;
     // Per-channel blends are checked by the content caller; a mask ignores them
-    if !effect.opacity.is_finite() || reads_image_input(effect) {
+    if !effect.opacity.is_finite() {
         return None;
     }
     let mut op = Operation::zeroed();
@@ -5934,7 +5908,7 @@ mod paint_window_tests {
             glossiness: false,
             mask_preview: false,
             mask_layer: 0,
-            mask_layers: BTreeMap::new(),
+            mask_layers: Vec::new(),
             image_words: Vec::new(),
             environment: None,
             bake_rows: false,
