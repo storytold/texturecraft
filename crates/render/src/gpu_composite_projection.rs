@@ -139,12 +139,6 @@ const BACKFACE_FADE: f32 = 0.6;
 /// Smallest frame side or depth in world units, as compose's `pattern` keeps them
 const MIN_FRAME_EXTENT: f32 = 1e-6;
 
-/// Whether the GPU samples image sources (fills and decals) with this filtering as the CPU does:
-/// every filtering, a decal's on P1's path.
-pub(super) fn supports_image_sampling(_sampling: Sampling) -> bool {
-    true
-}
-
 /// How an image source read as a `channel` with `sampling` registers its image
 /// (`MaterialImages::register_image`): Bilinear HQ needs the image's halved levels, linear ones
 /// for an sRGB colour read.
@@ -1052,6 +1046,47 @@ mod tests {
         for (label, projection, sampling) in cases {
             assert_fill_matches(&mut gpu, &sphere(), &projection, sampling, Tolerance::BILINEAR.with_flips(FLIPS), &format!("depth culled {label}"));
         }
+    }
+
+    /// Placed planars and warps get a frame record (P0d), other projections none, and a warp
+    /// fill composites on the GPU.
+    #[test]
+    fn warps_get_a_frame_record_like_placed_planars() {
+        use std::collections::BTreeMap;
+
+        use texturecraft_compose::PixelStore;
+        use texturecraft_core::{Channel, Decal, Fill, Layer, LayerKind, Project, Projection, Source, TextureSet};
+
+        use crate::gpu_composite::{CompositeProgram, register_decal};
+        use crate::gpu_image_source::MaterialImages;
+
+        let frame = Decal {
+            center: [0.1, 0.0, 0.05],
+            normal: [0.0, 1.0, 0.0],
+            up: [0.0, 0.0, 1.0],
+            size: [0.5, 0.7],
+            rotation: 12.0,
+            offset: [0.0; 2],
+            depth: 0.07,
+            symmetry: None,
+            flip: [false; 2],
+        };
+        let fill = |projection: Projection| Fill {
+            sources: BTreeMap::from([(Channel::BaseColor, Source::Image { name: "decal.png".into(), normal_format: Default::default() })]),
+            projection,
+            ..Default::default()
+        };
+        let mut materials = MaterialImages::default();
+        assert_eq!(register_decal(&fill(Projection::default()), &mut materials), Ok(None));
+        assert_eq!(register_decal(&fill(Projection::decal(frame)), &mut materials), Ok(Some(0)));
+        assert_eq!(register_decal(&fill(Projection::warp(frame)), &mut materials), Ok(Some(0)), "the same frame and image share a record");
+
+        let mut project = Project::new("Warp", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, 64));
+        let layer = Layer::new(project.alloc_id(), "Warp", LayerKind::Fill(fill(Projection::warp(frame))), &[Channel::BaseColor]);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let result = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).map(|_| ());
+        assert_eq!(result, Ok(()), "P1 evaluates warps");
     }
 
     #[test]

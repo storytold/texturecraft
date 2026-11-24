@@ -40,7 +40,8 @@ use super::{CompositeProgram, NEIGHBOURHOOD_OPCODE, NOOP_EFFECT_OPCODE, Operatio
 use crate::gpu_neighbourhood::{box_family, gather};
 
 /// First word of the field layout in the band uniform (`Params.field_layout`): words per field
-/// texel, input word present, the prepare pass's input operation plus one, reserved.
+/// texel, input word present, the prepare pass's input operation plus one, and the prepare
+/// pass's stage flags (bit 0: the stage wraps, `FilterStage::wrap`).
 pub(super) const FIELD_LAYOUT: usize = 44;
 /// First word of the package vec4s (`Params.packages`): P1 at 48, P2 at 52, … P8 at 76.
 const PACKAGE_SLOTS: usize = 48;
@@ -316,6 +317,36 @@ mod tests {
         // A content stage per channel operation and one for the shared mask; the preview has the mask stage
         assert!(staged[0].1 >= 2 && staged[1].1 == 1, "{:?}", (staged[0].1, staged[1].1));
         assert_eq!(staged, separate);
+    }
+
+    /// Every stage knows what it filters (P0c): colour and Height content and the mask, while the
+    /// built-in stages read only `middle` (0 on Height) as before, and no stage wraps yet.
+    #[test]
+    fn stages_carry_their_context_and_built_in_settings_stay() {
+        use crate::gpu_neighbourhood::{STAGE_COLOR, STAGE_MASK, STAGE_SIGNED};
+
+        let channels = [Channel::BaseColor, Channel::Height];
+        let mut project = Project::new("Stage context", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, 64));
+        let owner = project.alloc_id();
+        let sources = BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.6, 0.3, 0.2])), (Channel::Height, Source::Uniform([-0.3; 3]))]);
+        let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(Fill { sources, ..Default::default() }), &channels);
+        layer.content_effects.push(effect(EffectKind::Filter(Filter::HighPass {
+            radius: 64.0,
+            space: texturecraft_core::HighpassSpace::Working,
+            alpha: false,
+        })));
+        let mut mask = Mask::new(MaskBackground::White);
+        mask.effects.push(effect(EffectKind::Filter(Filter::Blur { radius: 64.0, wrap: false })));
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let program = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap();
+        let stages: Vec<_> = program.filters.stages.iter().filter_map(|stage| stage.filter.map(|filter| (filter.context, filter.middle))).collect();
+        assert!(!program.filters.wraps());
+        assert_eq!(stages.len(), 3, "{stages:?}");
+        assert!(stages.contains(&(STAGE_MASK, 0.5)), "{stages:?}");
+        assert!(stages.contains(&(STAGE_COLOR, 0.5)), "{stages:?}");
+        assert!(stages.contains(&(STAGE_SIGNED, 0.0)), "{stages:?}");
     }
 
     #[test]

@@ -291,7 +291,7 @@ impl ProceduralInputs {
     /// GPU has no stage for `filter` or its size reaches nothing.
     #[allow(dead_code)] // Used by the GPU port packages
     fn precede_with_stage(&mut self, filter: &Filter, opacity: f32) -> Option<()> {
-        NeighbourhoodFilter::new(filter, self.resolution, self.resolution, opacity, false)?;
+        NeighbourhoodFilter::new(filter, self.resolution, self.resolution, opacity, None)?;
         let ids = [0, NEIGHBOURHOOD_OPCODE, u32::try_from(self.filters.len()).ok()?, 0];
         self.filters.push((filter.clone(), opacity));
         self.preceding_stage = Some(Operation { ids, low: [0.0, 0.0, 0.0, opacity.clamp(0.0, 1.0)], ..Operation::zeroed() });
@@ -357,6 +357,9 @@ struct FilterStage {
     /// The operation (index plus one, 0: none) the prepare pass evaluates into the field's sixth
     /// word: an image input's gray (P3) or the layer's own Height (P5, Height To Normal).
     input: u32,
+    /// The prepare pass reads the set periodically outside it (P4: Blur and Bevel `wrap`), and
+    /// the fields of the program may start below zero ([`FilterPlan::wraps`]).
+    wrap: bool,
 }
 
 #[derive(Debug, Default)]
@@ -384,11 +387,11 @@ impl FilterPlan {
             let mask_has_fields = mask_count > 0
                 && *masks.entry(mask).or_insert_with(|| {
                     let before = plan.stages.len();
-                    plan.add_stack(effects, mask, mask_count, index as u32, true, false, inputs);
+                    plan.add_stack(effects, mask, mask_count, index as u32, None, inputs);
                     plan.stages.len() != before
                 });
             let first = plan.stages.len();
-            plan.add_stack(effects, content, content_count, index as u32, false, layer.ids[0] == channel_slot(Channel::Height), inputs);
+            plan.add_stack(effects, content, content_count, index as u32, Some(slot_kind(layer.ids[0])), inputs);
             layer.spatial[..3].copy_from_slice(&[first as u32, u32::from(first != plan.stages.len()), u32::from(mask_has_fields)]);
         }
         // An anchor can carry a filter's footprint into the next layer. Independent
@@ -413,7 +416,15 @@ impl FilterPlan {
         for (read, &(producer, channel)) in inputs.reads.iter().enumerate().filter(|(_, (producer, _))| *producer == publication) {
             debug_assert_eq!(producer, publication);
             self.anchor_slots[read] = self.stages.len() as u32 + 1;
-            self.stages.push(FilterStage { layer, preceding, filter: None, cell: 1, anchor: material.map(|(first, cut)| (channel, first, cut)), input: 0 });
+            self.stages.push(FilterStage {
+                layer,
+                preceding,
+                filter: None,
+                cell: 1,
+                anchor: material.map(|(first, cut)| (channel, first, cut)),
+                input: 0,
+                wrap: false,
+            });
         }
     }
 
@@ -424,7 +435,10 @@ impl FilterPlan {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn add_stack(&mut self, effects: &mut [Operation], start: u32, count: u32, layer: u32, mask: bool, signed: bool, inputs: &ProceduralInputs) {
+    /// The stages of one effect stack: a mask's when `channel` is None, else the content of a
+    /// channel of that kind (the stage context the packages' stages read).
+    fn add_stack(&mut self, effects: &mut [Operation], start: u32, count: u32, layer: u32, channel: Option<ChannelKind>, inputs: &ProceduralInputs) {
+        let mask = channel.is_none();
         let first = self.stages.len();
         let mut reach: u32 = 0;
         for (preceding, effect) in effects.iter_mut().skip(start as usize).take(count as usize).enumerate() {
@@ -439,18 +453,26 @@ impl FilterPlan {
                 if cell > 1 {
                     reach = reach.saturating_add(cell * 2);
                 }
-                self.stages.push(FilterStage { layer, preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE, filter, cell, anchor: None, input: 0 });
+                self.stages.push(FilterStage {
+                    layer,
+                    preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE,
+                    filter,
+                    cell,
+                    anchor: None,
+                    input: 0,
+                    wrap: false,
+                });
                 continue;
             }
             if effect.ids[1] != NEIGHBOURHOOD_OPCODE {
                 continue;
             }
             let (filter, opacity) = &inputs.filters[effect.ids[2] as usize];
-            let Some(filter) = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, *opacity, signed) else { continue };
+            let Some(filter) = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, *opacity, channel) else { continue };
             let slot = self.stages.len();
             effect.spatial[0] = if mask { slot } else { slot - first } as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input: 0 });
+            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input: 0, wrap: false });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
@@ -467,6 +489,12 @@ impl FilterPlan {
     /// Words per field texel: four premultiplied components and the UV coverage, plus a sixth
     /// word when a stage carries an input ([`FilterStage::input`]). One stride for every field
     /// of the program; the shaders read it from the uniform, never from a literal.
+    /// Whether a stage wraps: the fields then extend by the halo past the set's edges, with an
+    /// origin below zero, and the prepare pass fills the wrapping stages periodically there.
+    fn wraps(&self) -> bool {
+        self.stages.iter().any(|stage| stage.wrap)
+    }
+
     fn field_words(&self) -> u32 {
         if self.stages.iter().any(|stage| stage.input != 0) { FIELD_WORDS + 1 } else { FIELD_WORDS }
     }
@@ -616,6 +644,11 @@ fn channel_slot(channel: Channel) -> u32 {
         Transmission => 19,
         Glossiness => 20,
     }
+}
+
+/// The kind of the channel in destination slot `slot` ([`channel_slot`]).
+fn slot_kind(slot: u32) -> ChannelKind {
+    Channel::ALL.into_iter().find(|&channel| channel_slot(channel) == slot).map_or(ChannelKind::Scalar, Channel::kind)
 }
 
 impl CompositeProgram {
@@ -1227,7 +1260,7 @@ fn compile_mask(
             EffectKind::Fill { source, projection, sampling } => {
                 let mut operation = source_operation(Some(source), projection, *sampling, [0.0; 3], ChannelKind::Scalar, procedural)
                     .ok_or("A mask fill source or projection uses CPU compositing.")?;
-                if let Some(frame) = projection.placed() {
+                if let Some(frame) = projection.frame() {
                     operation.uv[0] = procedural.materials.register_decal(*frame, std::iter::once(source), *sampling) as f32;
                 }
                 operation
@@ -1351,12 +1384,10 @@ fn bind_tile_source(op: &mut Operation, source: Option<&Source>, patterns: &mut 
     }
 }
 
+/// The frame record of a placed planar or warp fill (its first image's alpha also controls the
+/// non-image channels), as `op.uv[0]` of its operations.
 fn register_decal(fill: &texturecraft_core::Fill, materials: &mut MaterialImages) -> Result<Option<u32>, &'static str> {
-    let Some(frame) = fill.projection.placed() else { return Ok(None) };
-    // A decal's image alpha also controls the non-image channels.
-    if !fill_projection::supports_image_sampling(fill.sampling) && fill.sources.values().any(|source| matches!(source, Source::Image { .. })) {
-        return Err("A decal's image filtering uses CPU compositing.");
-    }
+    let Some(frame) = fill.projection.frame() else { return Ok(None) };
     Ok(Some(materials.register_decal(*frame, fill.sources.values(), fill.sampling)))
 }
 
@@ -1498,7 +1529,7 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
     op.spatial[2] = u32::from(generator.global.blur > 0.0 || generator.resolution.can_reduce());
     let blur = (generator.global.blur_radius_at(resolution).round() > 0.0)
         .then(|| Filter::Blur { radius: generator.global.blur_radius(), wrap: false })
-        .and_then(|blur| NeighbourhoodFilter::new(&blur, resolution, resolution, 1.0, false));
+        .and_then(|blur| NeighbourhoodFilter::new(&blur, resolution, resolution, 1.0, None));
     if let (Some(_), _) | (None, 2..) = (blur, cell) {
         inputs.generator_stages.push((blur, cell));
         op.spatial[1] = inputs.generator_stages.len() as u32;
@@ -1572,7 +1603,7 @@ fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operat
             InvertOff | Empty => (NOOP_EFFECT_OPCODE, [0.0; 3]),
             filter if gpu_neighbourhood::supports(filter) => {
                 // A known stage whose size reaches nothing leaves the field as the CPU does
-                let spatial = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, effect.opacity, false);
+                let spatial = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, effect.opacity, None);
                 if spatial.is_some() {
                     op.ids[2] = inputs.filters.len() as u32;
                     inputs.filters.push((filter.clone(), effect.opacity));
@@ -2165,8 +2196,13 @@ impl GpuCompositor {
             words_per_pixel += u64::from(bytes_per_texel / 4);
             Some((offset, bytes_per_texel))
         });
+        // A wrapping stage's fields extend past the set's edges (FilterPlan::wraps)
+        let wraps = program.filters.wraps();
         let field_area = |width: u32, rows: u32| {
-            let side = |pixels: u32, limit: u32| (pixels << shift).saturating_add(halo.saturating_mul(2)).min(limit);
+            let side = |pixels: u32, limit: u32| {
+                let side = (pixels << shift).saturating_add(halo.saturating_mul(2));
+                if wraps { side } else { side.min(limit) }
+            };
             u64::from(side(width, source_size.0)) * u64::from(side(rows, source_size.1))
         };
         let band_area = |width: u32, rows: u32| u64::from(width.next_multiple_of(64) * rows);
@@ -2233,7 +2269,8 @@ impl GpuCompositor {
                     if op.ids[1] == IMAGE_SOURCE_OPCODE {
                         op.ids[2] = *images.get(op.ids[2] as usize).ok_or("An image source has no binding.")?;
                     }
-                    if op.procedural[3] == DECAL_PROJECTION {
+                    // Placed planars and warps (the first of P1's selectors) read their frame record
+                    if op.procedural[3] == DECAL_PROJECTION || op.procedural[3] == packages::PROJECTION_SELECTORS.start {
                         op.uv[0] = *decals.get(op.uv[0] as usize).ok_or("A decal has no frame.")? as f32;
                     }
                 }
@@ -2304,7 +2341,13 @@ impl GpuCompositor {
                     work = 0;
                 }
                 let field = CompositeRegion { min: [left << shift, top << shift], max: [(left + width) << shift, (top + rows) << shift] }.expanded(halo);
-                let field_rect = [field.min[0], field.min[1], field.max[0].min(source_size.0) - field.min[0], field.max[1].min(source_size.1) - field.min[1]];
+                let mut field_rect =
+                    [field.min[0], field.min[1], field.max[0].min(source_size.0) - field.min[0], field.max[1].min(source_size.1) - field.min[1]];
+                if wraps {
+                    // The whole halo on every side; the origin can lie below zero (i32 bits)
+                    let start = |pixel: u32| (i64::from(pixel << shift) - i64::from(halo)) as i32 as u32;
+                    field_rect = [start(left), start(top), (width << shift).saturating_add(halo * 2), (rows << shift).saturating_add(halo * 2)];
+                }
                 let mut values = [0; packages::UNIFORM_WORDS];
                 values[..packages::FIELD_LAYOUT].copy_from_slice(&[
                     width,
@@ -2412,6 +2455,7 @@ impl GpuCompositor {
                         let slot = if direct { output as u32 } else { fields };
                         source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
                         source[packages::FIELD_LAYOUT + 2] = stage.input;
+                        source[packages::FIELD_LAYOUT + 3] = u32::from(stage.wrap);
                         if let Some((channel, first, cut)) = stage.anchor {
                             source[36..39].copy_from_slice(&[channel_slot(channel), first, cut]);
                             source[40..43].copy_from_slice(&channel.default_value().map(f32::to_bits));

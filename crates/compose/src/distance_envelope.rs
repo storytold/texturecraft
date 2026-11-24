@@ -2,7 +2,7 @@
 
 /// The lower envelope of the parabolas over a line of squared distances, which gives each place's squared distance to the nearest feature along it and the line before
 #[derive(Default)]
-pub(crate) struct DistanceEnvelope {
+pub struct DistanceEnvelope {
     /// The parabolas still lowest somewhere: their vertex and where their stretch begins
     parabolas: Vec<(usize, f64)>,
     /// The line as it was
@@ -11,7 +11,7 @@ pub(crate) struct DistanceEnvelope {
 
 impl DistanceEnvelope {
     /// Replace `line` with each place's squared distance to the nearest feature
-    pub(crate) fn lower(&mut self, line: &mut [f32]) {
+    pub fn lower(&mut self, line: &mut [f32]) {
         self.heights.clear();
         self.heights.extend_from_slice(line);
         self.parabolas.clear();
@@ -48,6 +48,20 @@ impl DistanceEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The test hooks the GPU compositor's distance tests read are the evaluator's own functions
+    #[test]
+    fn the_distance_test_hooks_give_the_evaluator_distances() {
+        let mut line = vec![0.0, f32::MAX, f32::MAX, 0.0, f32::MAX];
+        crate::distance_test_hooks::DistanceEnvelope::default().lower(&mut line);
+        assert_eq!(line, [0.0, 1.0, 1.0, 0.0, 1.0]);
+        let mut inside = vec![false; 25];
+        inside[12] = true;
+        let hooked = crate::distance_test_hooks::edge_distances(&inside, (5, 5), false);
+        assert_eq!(hooked, crate::shape_distance::edge_distances(&inside, (5, 5), false));
+        let trail = crate::distance_test_hooks::trail_distances(&inside, (5, 5), [1.0, 0.0], 2.0);
+        assert_eq!(trail, crate::shape_distance::trail_distances(&inside, (5, 5), [1.0, 0.0], 2.0));
+    }
 
     /// Past 4096 texels a squared place is no longer exact in f32: two close features at the end of a wide line still each read 0
     #[test]
