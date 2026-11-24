@@ -236,6 +236,8 @@ fn base_colour_template() -> texturecraft_engine::formats::ExportPreset {
             channels: vec![(Dest::R, source(0)), (Dest::G, source(1)), (Dest::B, source(2))],
             inverted: Vec::new(),
             dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
         }],
     }
 }

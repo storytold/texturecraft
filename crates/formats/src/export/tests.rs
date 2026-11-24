@@ -155,6 +155,8 @@ fn exr_exports_luminance_and_alpha_at_both_depths() {
         channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 }), (Dest::A, SourceRef::Constant(0.75))],
         inverted: Vec::new(),
         dither: false,
+        when_channels: Vec::new(),
+        unless_channels: Vec::new(),
     }];
     let mut opts = ExportOptions::new(preset);
 
@@ -289,6 +291,8 @@ fn templates_are_sanitized_and_collisions_suffixed() {
         channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 })],
         inverted: Vec::new(),
         dither: false,
+        when_channels: Vec::new(),
+        unless_channels: Vec::new(),
     };
     let preset = ExportPreset {
         name: "t".into(),
@@ -304,10 +308,7 @@ fn templates_are_sanitized_and_collisions_suffixed() {
     let opts = ExportOptions::new(preset);
     let planned = list_outputs(&fx.project, 0, "sphere", &opts).unwrap();
     let names: Vec<&str> = planned.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(
-        names,
-        ["My_Project_Body_Set_roughness_.png", "My_Project_Body_Set_roughness__2.png", "_con.png", "A.png", "a_2.png", "texture.png"]
-    );
+    assert_eq!(names, ["My_Project_Body_Set_roughness_.png", "My_Project_Body_Set_roughness__2.png", "_con.png", "A.png", "a_2.png", "texture.png"]);
     assert!(planned[0].warnings.is_empty());
     assert_eq!(planned[1].warnings.len(), 1);
     assert_eq!(planned[4].warnings.len(), 1);
@@ -365,6 +366,8 @@ fn every_format_encodes_and_decodes() {
         channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 }), (Dest::A, SourceRef::Constant(0.5))],
         inverted: Vec::new(),
         dither: false,
+        when_channels: Vec::new(),
+        unless_channels: Vec::new(),
     };
     let mut preset = builtin_preset("glTF PBR Metal Roughness").unwrap();
     preset.maps.push(gray_alpha);
@@ -429,6 +432,8 @@ fn jpeg_grayscale_and_depth_policy_preserve_8bit_output() {
             channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 })],
             inverted: Vec::new(),
             dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
         },
         MapSpec {
             file: "gray_alpha".into(),
@@ -437,6 +442,8 @@ fn jpeg_grayscale_and_depth_policy_preserve_8bit_output() {
             channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 }), (Dest::A, SourceRef::Constant(0.5))],
             inverted: Vec::new(),
             dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
         },
     ];
     for depth in [8, 16, 32] {
@@ -557,7 +564,16 @@ fn write_files_accepts_planned_name_with_max_length_stem() {
 }
 
 fn gray_map(file: &str, src: SourceRef) -> MapSpec {
-    MapSpec { file: file.into(), format: FileFormat::Png, bit_depth: 8, channels: vec![(Dest::L, src)], inverted: Vec::new(), dither: false }
+    MapSpec {
+        file: file.into(),
+        format: FileFormat::Png,
+        bit_depth: 8,
+        channels: vec![(Dest::L, src)],
+        inverted: Vec::new(),
+        dither: false,
+        when_channels: Vec::new(),
+        unless_channels: Vec::new(),
+    }
 }
 
 #[test]
@@ -570,7 +586,7 @@ fn validation_rejects_bad_presets() {
         p.validate().is_err()
     };
     let long = "x".repeat(300);
-    for file in ["a/b", r"a\b", "..", "x..y", "$meshes_$foo", "$", "", " ", "a\u{7}b", long.as_str()] {
+    for file in ["/a", "a/", "a//b", r"a\b", "..", "x..y", "a/../b", "$meshes_$foo", "$", "", " ", "a\u{7}b", long.as_str()] {
         assert!(refused(&|p| p.maps[0].file = file.into()), "file template {file:?} must be refused");
     }
     assert!(refused(&|p| p.name = "  ".into()));
@@ -601,6 +617,8 @@ fn converted_maps_invert_and_derive_normals() {
         channels: [Dest::R, Dest::G, Dest::B].into_iter().zip(0u8..).map(|(d, k)| (d, SourceRef::Virtual { map, component: k })).collect(),
         inverted: Vec::new(),
         dither: false,
+        when_channels: Vec::new(),
+        unless_channels: Vec::new(),
     };
     let preset = ExportPreset {
         name: "converted".into(),
@@ -660,6 +678,8 @@ fn uv_tiles_export_one_file_per_tile_without_padding_across() {
             ],
             inverted: Vec::new(),
             dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
         }],
     };
     let files = render_maps(&input, &ExportOptions::new(preset.clone())).unwrap();
@@ -725,7 +745,19 @@ fn the_udim_name_is_the_file_name_with_its_tile_number_as_placeholder() {
     project.texture_sets.push(ts);
     let udim_names = |file: String| {
         let channels = vec![(Dest::R, SourceRef::Channel { channel: Channel::BaseColor, component: 0 })];
-        let preset = ExportPreset { name: "t".into(), maps: vec![MapSpec { file, format: FileFormat::Png, bit_depth: 8, channels, inverted: Vec::new(), dither: false }] };
+        let preset = ExportPreset {
+            name: "t".into(),
+            maps: vec![MapSpec {
+                file,
+                format: FileFormat::Png,
+                bit_depth: 8,
+                channels,
+                inverted: Vec::new(),
+                dither: false,
+                when_channels: Vec::new(),
+                unless_channels: Vec::new(),
+            }],
+        };
         list_outputs(&project, 0, "m", &ExportOptions::new(preset)).unwrap().into_iter().map(|f| f.udim_name).collect::<Vec<_>>()
     };
     let placeholder = Some("Body_<UDIM>.png".to_string());
@@ -733,6 +765,11 @@ fn the_udim_name_is_the_file_name_with_its_tile_number_as_placeholder() {
 
     // The length limit cuts the longer placeholder where it doesn't cut the tile number: none then
     assert_eq!(udim_names(format!("{}_$udim_$textureSet", "a".repeat(MAX_STEM - 10))), [None, None]);
+
+    // An optional tile group keeps its dot, and a folder stays in both names
+    let planned = list_outputs(&project, 0, "m", &ExportOptions::new(builtin_preset("PBR Metallic Roughness (folders or PSD groups)").unwrap())).unwrap();
+    assert_eq!(planned.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["BaseColor/Body_BaseColor.1001.png", "BaseColor/Body_BaseColor.1002.png"]);
+    assert_eq!(planned[0].udim_name.as_deref(), Some("BaseColor/Body_BaseColor.<UDIM>.png"));
 }
 
 #[test]
@@ -747,19 +784,21 @@ fn lobe_channels_export_as_document_maps_and_gltf_extension_maps() {
     fx.set_all(Channel::SheenRoughness, |_, _| [0.4; 3]);
     let doc = fx.render_preset("Document channels + Normal + AO");
     for c in Channel::LOBES {
-        find(&doc, &format!("_{}.", c.label().replace(' ', "_")));
+        let (_, file) = crate::presets::DOCUMENT_CHANNEL_FILES.iter().find(|(channel, _)| *channel == c).unwrap();
+        find(&doc, &format!("_{file}."));
     }
-    let gltf = fx.render_preset("glTF PBR Metal Roughness");
-    let coat = decode(find(&gltf, "_clearcoat.png")).to_rgb8();
+    let glb_maps = ExportOptions::new(ExportPreset { name: "glb".into(), maps: crate::presets::gltf_pbr_maps(|stem| format!("$textureSet_{stem}")) });
+    let gltf = fx.render(&glb_maps);
+    let coat = decode(find(&gltf, "_Clearcoat.png")).to_rgb8();
     let px = coat.get_pixel(3, 3);
     assert!(px[0] == 255 && (px[1] as i32 - 51).abs() <= 1 && px[2] == 0, "weight in R, roughness in G: {px:?}");
-    let sheen = decode(find(&gltf, "_sheen.png")).to_rgba8();
+    let sheen = decode(find(&gltf, "_Sheen.png")).to_rgba8();
     let px = sheen.get_pixel(3, 3);
     // sRGB color × weight (0.5, 0.25, 0) and linear roughness in alpha.
     let want = [188, 137, 0, 102];
     assert!(px.0.iter().zip(want).all(|(a, b)| (*a as i32 - b).abs() <= 1), "{px:?}");
-    let plain = Fx::new(&default_channels()).render_preset("glTF PBR Metal Roughness");
-    assert!(!plain.iter().any(|f| f.name.contains("clearcoat") || f.name.contains("sheen")), "sets without the lobes export no extension maps");
+    let plain = Fx::new(&default_channels()).render(&glb_maps);
+    assert!(!plain.iter().any(|f| f.name.contains("Clearcoat") || f.name.contains("Sheen")), "sets without the lobes export no extension maps");
 }
 
 #[test]
@@ -829,6 +868,8 @@ fn colour_space_names_the_files_and_warns_when_integer_files_clamp() {
             ],
             inverted: Vec::new(),
             dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
         }],
     };
     let plan = |space: Option<ColorSpace>, format: Option<FileFormat>| {
@@ -947,6 +988,8 @@ fn invert_map(depth: u8, inverted: Vec<Dest>) -> MapSpec {
         ],
         inverted,
         dither: false,
+        when_channels: Vec::new(),
+        unless_channels: Vec::new(),
     }
 }
 
@@ -1029,6 +1072,8 @@ fn inverting_a_colour_channel_inverts_the_linear_value_before_encoding() {
                 .collect(),
             inverted,
             dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
         };
         let mut opts = ExportOptions::new(ExportPreset { name: "c".into(), maps: vec![map] });
         opts.size = size;
@@ -1061,7 +1106,19 @@ fn the_default_template_keeps_its_old_name_and_file_types_their_listed_names() {
 
 /// One-map preset: `channels` written as `format` at `depth`
 fn one_map(format: FileFormat, depth: u8, channels: Vec<(Dest, SourceRef)>) -> ExportOptions {
-    ExportOptions::new(ExportPreset { name: "t".into(), maps: vec![MapSpec { file: "out".into(), format, bit_depth: depth, channels, inverted: Vec::new(), dither: false }] })
+    ExportOptions::new(ExportPreset {
+        name: "t".into(),
+        maps: vec![MapSpec {
+            file: "out".into(),
+            format,
+            bit_depth: depth,
+            channels,
+            inverted: Vec::new(),
+            dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
+        }],
+    })
 }
 
 fn rgba_half_alpha() -> Vec<(Dest, SourceRef)> {
@@ -1296,7 +1353,7 @@ fn float_tiff_marks_straight_alpha_and_preserves_the_color_profile() {
 fn dithering_is_ordered_and_keeps_the_average() {
     let fx = Fx::new(&default_channels());
     let plain = one_map(FileFormat::Png, 8, rgba_half_alpha());
-    let dithered = ExportOptions { dither: true, ..plain.clone() };
+    let dithered = ExportOptions { dither: Some(true), ..plain.clone() };
     let a = decode(&fx.render(&plain)[0]).to_rgba8();
     let b = decode(&fx.render(&dithered)[0]).to_rgba8();
     assert_ne!(a, b);
@@ -1370,7 +1427,13 @@ fn reference_templates_export_their_files() {
     // The texture set name comes last; the normal carries the UV coverage as alpha
     assert_eq!(
         file_names(&arnold),
-        ["sphere_BaseColor.Body_Set.png", "sphere_Metalness.Body_Set.png", "sphere_Roughness.Body_Set.png", "sphere_Normal.Body_Set.png", "sphere_Height.Body_Set.png"]
+        [
+            "sphere_BaseColor.Body_Set.png",
+            "sphere_Metalness.Body_Set.png",
+            "sphere_Roughness.Body_Set.png",
+            "sphere_Normal.Body_Set.png",
+            "sphere_Height.Body_Set.png"
+        ]
     );
     assert_eq!(decode(find(&arnold, "_Normal.")).color(), image::ColorType::Rgba16);
     let mut named = ExportOptions::new(builtin_preset("Arnold UDIM Legacy (AiStandard)").unwrap());
@@ -1405,4 +1468,136 @@ fn diffuse_is_the_base_color_without_its_metallic_part() {
         let pixel = image.get_pixel(x, y);
         assert!((0..3).all(|k| (pixel[k] - base[k] * (1.0 - metallic)).abs() < 1e-4), "({x},{y}) {pixel:?} vs {base:?} at metallic {metallic}");
     }
+}
+
+#[test]
+fn optional_name_groups_need_a_variable_and_a_closing_parenthesis() {
+    let values = [("$udim", "1001", true), ("$textureSet", "Body", false)];
+
+    assert_eq!(fill_file_template("$textureSet(_$udim) (v2)", &values), "Body (v2)", "a group without a variable stays");
+    assert_eq!(fill_file_template("$textureSet(_x", &values), "Body(_x", "an open parenthesis stays");
+    assert_eq!(fill_file_template("($textureSet)_(.$udim)", &values), "Body_");
+}
+
+/// The reference's measured converted maps: (base color as linear, metallic, roughness, [(map,
+/// the value it wrote)]); colour maps are sRGB-encoded in its files, the others linear
+type MeasuredSet = ([f32; 3], f32, f32, [(VirtualMap, [f32; 3]); 7]);
+
+#[test]
+fn converted_maps_give_the_reference_values() {
+    let base = [0.6054688, 0.1328125, 0.0332031];
+    let gray = [0.2158203; 3];
+    let sets: [MeasuredSet; 4] = [
+        (
+            base,
+            0.0,
+            0.6,
+            [
+                (VirtualMap::Diffuse, [0.8009704, 0.3999265, 0.2003212]),
+                (VirtualMap::SpecularColor, [0.2209223; 3]),
+                (VirtualMap::Reflection, [1.0; 3]),
+                (VirtualMap::InverseIor, [0.6666666; 3]),
+                (VirtualMap::Glossiness2, [0.16; 3]),
+                (VirtualMap::LegacyDiffuse, [0.8009704, 0.3999265, 0.2003212]),
+                (VirtualMap::LegacyGlossiness, [0.2; 3]),
+            ],
+        ),
+        (
+            base,
+            1.0,
+            0.6,
+            [
+                (VirtualMap::Diffuse, [0.0; 3]),
+                (VirtualMap::SpecularColor, [0.8009704, 0.3999265, 0.2003212]),
+                (VirtualMap::Reflection, [0.8009704, 0.3999265, 0.2003212]),
+                (VirtualMap::InverseIor, [0.0; 3]),
+                (VirtualMap::Glossiness2, [0.16; 3]),
+                (VirtualMap::LegacyDiffuse, [0.8009704, 0.3999265, 0.2003212]),
+                (VirtualMap::LegacyGlossiness, [0.7; 3]),
+            ],
+        ),
+        (
+            base,
+            0.2980392,
+            0.2509804,
+            [
+                (VirtualMap::Diffuse, [0.6836241, 0.3375598, 0.1653188]),
+                (VirtualMap::SpecularColor, [0.4940082, 0.2884814, 0.2150116]),
+                (VirtualMap::Reflection, [0.8841462, 0.6507011, 0.5345122]),
+                (VirtualMap::InverseIor, [0.4679738; 3]),
+                (VirtualMap::Glossiness2, [0.5610304; 3]),
+                (VirtualMap::LegacyDiffuse, [0.8009704, 0.3999265, 0.2003212]),
+                (VirtualMap::LegacyGlossiness, [0.5235294; 3]),
+            ],
+        ),
+        (
+            gray,
+            0.2980392,
+            0.2509804,
+            [
+                (VirtualMap::Diffuse, [0.4255737; 3]),
+                (VirtualMap::SpecularColor, [0.3361037; 3]),
+                (VirtualMap::Reflection, [0.7100728; 3]),
+                (VirtualMap::InverseIor, [0.4679738; 3]),
+                (VirtualMap::Glossiness2, [0.5610304; 3]),
+                (VirtualMap::LegacyDiffuse, [0.5019233; 3]),
+                (VirtualMap::LegacyGlossiness, [0.5235294; 3]),
+            ],
+        ),
+    ];
+
+    // The specular level changes none of them
+    for specular_level in [0.2, 0.8] {
+        for (base, metallic, roughness, maps) in sets {
+            let mut channels = default_channels();
+            channels.push(Channel::SpecularLevel);
+            let mut fx = Fx::new(&channels);
+            fx.set_all(Channel::BaseColor, |_, _| base);
+            fx.set_all(Channel::Metallic, |_, _| [metallic; 3]);
+            fx.set_all(Channel::Roughness, |_, _| [roughness; 3]);
+            fx.set_all(Channel::SpecularLevel, |_, _| [specular_level; 3]);
+
+            for (map, want) in maps {
+                let source = |k| SourceRef::Virtual { map, component: k };
+                let files = fx.render(&one_map(FileFormat::Png, 16, vec![(Dest::R, source(0)), (Dest::G, source(1)), (Dest::B, source(2))]));
+
+                let pixel = decode(&files[0]).to_rgb16().get_pixel(5, 5).0.map(|v| f32::from(v) / 65535.0);
+                assert!((0..3).all(|k| (pixel[k] - want[k]).abs() < 4e-4), "{map:?} at metallic {metallic} roughness {roughness}: {pixel:?} vs {want:?}");
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn folder_templates_write_their_folders_inside_the_output_directory() {
+    let mut channels = default_channels();
+    channels.push(Channel::Opacity);
+    let fx = Fx::new(&channels);
+    let dir = std::env::temp_dir().join(format!("tc-formats-export-folders-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let keyshot = fx.render_preset("KeyShot 9+");
+    let folders = fx.render_preset("PBR Metallic Roughness (folders or PSD groups)");
+    write_files(&keyshot, &dir).unwrap();
+    write_files(&folders, &dir).unwrap();
+
+    assert!(dir.join("My_Project.sp/Body_Set.ts/base_color.png").is_file(), "{:?}", file_names(&keyshot));
+    assert!(dir.join("Roughness/Body_Set_Roughness.png").is_file(), "{:?}", file_names(&folders));
+    for name in ["../evil.png", "/evil.png", "a//evil.png", r"a\evil.png"] {
+        let evil = ExportedFile { name: name.into(), ..keyshot[0].clone() };
+        assert!(write_files(&[evil], &dir).is_err(), "{name}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn file_names_in_different_folders_do_not_collide_and_the_same_path_does() {
+    let fx = Fx::new(&default_channels());
+    let rough = |file: &str| gray_map(file, SourceRef::Channel { channel: Channel::Roughness, component: 0 });
+    let preset = ExportPreset { name: "t".into(), maps: vec![rough("a/x"), rough("b/x"), rough("A/x")] };
+
+    let names: Vec<String> = list_outputs(&fx.project, 0, "sphere", &ExportOptions::new(preset)).unwrap().into_iter().map(|p| p.name).collect();
+
+    assert_eq!(names, ["a/x.png", "b/x.png", "A/x_2.png"]);
 }

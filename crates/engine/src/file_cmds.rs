@@ -343,7 +343,7 @@ pub fn export_options(session: &Session, params: &Value, cmd: &str) -> Result<Ex
     if let Some(depth) = u64p(params, "bitDepth") {
         options.bit_depth_override = Some(depth.min(32) as u8);
     }
-    options.dither = params.get("dithering").and_then(Value::as_bool).unwrap_or(false);
+    options.dither = params.get("dithering").and_then(Value::as_bool);
     let dilation_pixels = u64p(params, "dilation").map(|v| v.min(256) as u32).unwrap_or(16);
     if let Some(pad) = strp(params, "padding") {
         options.padding = match pad {

@@ -95,6 +95,8 @@ fn warns_when_a_template_with_openpbr_names_has_no_channels_to_write() {
             channels: vec![(Dest::L, SourceRef::Channel { channel: texturecraft_engine::core::Channel::CoatWeight, component: 0 })],
             inverted: Vec::new(),
             dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
         }],
     };
     let directory = temp("no-maps");
@@ -173,7 +175,7 @@ fn per_map_overrides_of_the_template_do_not_reach_the_openpbr_maps() {
     let result = execute(
         &mut session,
         "file.exportTextures",
-        &json!({"dir": dir.display().to_string(), "preset": DEFAULT, "materialX": true, "maps": [{"map": 0, "enabled": false}, {"map": 4, "format": "tiff", "bitDepth": 16}]}),
+        &json!({"dir": dir.display().to_string(), "preset": DEFAULT, "materialX": true, "maps": [{"map": 0, "enabled": false}, {"map": 7, "format": "tiff", "bitDepth": 16}]}),
     )
     .unwrap();
 
@@ -257,6 +259,8 @@ fn a_file_of_the_template_is_never_replaced_by_an_openpbr_map() {
             channels: vec![(Dest::R, source(0)), (Dest::G, source(1)), (Dest::B, source(2))],
             inverted: Vec::new(),
             dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
         }],
     };
     let params = |dir: &std::path::Path, mtlx: bool| json!({"dir": dir.display().to_string(), "preset": preset, "ts": [0, 1], "materialX": mtlx});
@@ -289,6 +293,8 @@ fn base_colour_template() -> texturecraft_engine::formats::ExportPreset {
             channels: vec![(Dest::R, source(0)), (Dest::G, source(1)), (Dest::B, source(2))],
             inverted: Vec::new(),
             dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
         }],
     }
 }
@@ -451,7 +457,16 @@ fn explicit_srgb_float_tiff_tags_match_gray_and_rgb_samples() {
         let directory = temp(tag);
         let preset = ExportPreset {
             name: "TIFF base colour".into(),
-            maps: vec![MapSpec { file: "$mesh_$textureSet_base_color".into(), format: FileFormat::Tiff, bit_depth: 32, channels, inverted: Vec::new(), dither: false }],
+            maps: vec![MapSpec {
+                file: "$mesh_$textureSet_base_color".into(),
+                format: FileFormat::Tiff,
+                bit_depth: 32,
+                channels,
+                inverted: Vec::new(),
+                dither: false,
+                when_channels: Vec::new(),
+                unless_channels: Vec::new(),
+            }],
         };
 
         let result = execute(
@@ -672,6 +687,8 @@ fn an_openpbr_filename_does_not_turn_a_data_map_into_base_color() {
             channels: vec![(Dest::L, SourceRef::Channel { channel: texturecraft_engine::core::Channel::Roughness, component: 0 })],
             inverted: Vec::new(),
             dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
         }],
     };
     let directory = temp("misleading-map");

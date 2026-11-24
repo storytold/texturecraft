@@ -33,7 +33,7 @@ fn harness(library: &Library) -> Harness<'static, TextureCraftApp> {
 /// Type an invalid file name into the first output of the selected template, as the editor would.
 fn break_draft(h: &mut Harness<'_, TextureCraftApp>) {
     let draft = h.state_mut().ui.export.draft.as_mut().unwrap();
-    draft.maps[0].file = "a/b".into();
+    draft.maps[0].file = r"a\b".into();
     assert!(draft.validate().is_err());
     h.run_steps(3);
 }
@@ -98,7 +98,7 @@ fn unfinished_edit_asks_before_selecting_another_template_and_keep_editing_stays
     h.get_by_label("Keep editing").click();
     h.run_steps(3);
     assert_eq!(selected(&h), "Alpha tpl");
-    assert_eq!(h.state().ui.export.draft.as_ref().unwrap().maps[0].file, "a/b", "the edit is intact");
+    assert_eq!(h.state().ui.export.draft.as_ref().unwrap().maps[0].file, r"a\b", "the edit is intact");
     assert!(h.state().ui.export.ask.is_none());
 }
 
@@ -118,7 +118,7 @@ fn unfinished_edit_discard_switches_to_the_other_template() {
     assert_eq!(draft.name, "Beta tpl");
     assert!(draft.validate().is_ok(), "the dropped edit did not follow");
     let alpha = h.state().session.export_preset("Alpha tpl").unwrap();
-    assert_ne!(alpha.maps[0].file, "a/b", "the invalid edit was never saved");
+    assert_ne!(alpha.maps[0].file, r"a\b", "the invalid edit was never saved");
 }
 
 #[test]

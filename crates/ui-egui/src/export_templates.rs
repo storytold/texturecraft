@@ -155,7 +155,16 @@ fn set_layout(map: &mut MapSpec, layout: Layout) {
 }
 
 fn new_map(layout: Layout) -> MapSpec {
-    let mut map = MapSpec { file: "$mesh_$textureSet_Output".into(), format: FileFormat::Png, bit_depth: 8, channels: Vec::new(), inverted: Vec::new(), dither: false };
+    let mut map = MapSpec {
+        file: "$mesh_$textureSet_Output".into(),
+        format: FileFormat::Png,
+        bit_depth: 8,
+        channels: Vec::new(),
+        inverted: Vec::new(),
+        dither: false,
+        when_channels: Vec::new(),
+        unless_channels: Vec::new(),
+    };
     set_layout(&mut map, layout);
     map
 }

@@ -159,9 +159,9 @@ fn export_writes_each_set_with_its_overrides_and_cancel_drops_them() {
     h.run_steps(2);
     let finished = h.state().ui.export.console.iter().any(|l| matches!(l, ConsoleLine::Done(t) if t == "Texture export complete"));
     assert!(h.state().ui.export.job.is_none() && finished, "the export finished");
-    let sets: Vec<String> = h.state().session.doc.project.texture_sets.iter().map(|t| format!("_{}_", t.name)).collect();
+    let sets: Vec<String> = h.state().session.doc.project.texture_sets.iter().map(|t| format!("{}_", t.name)).collect();
     let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "png")).collect();
-    let of = |set: &str| files.iter().filter(|f| f.file_name().unwrap().to_string_lossy().contains(set)).collect::<Vec<_>>();
+    let of = |set: &str| files.iter().filter(|f| f.file_name().unwrap().to_string_lossy().starts_with(set)).collect::<Vec<_>>();
     assert!(!of(&sets[0]).is_empty());
     for f in of(&sets[0]) {
         assert_eq!(png_width(f), 128, "{}", f.display());

@@ -8,6 +8,7 @@ use super::*;
 use crate::export::{ExportOptions, list_outputs};
 
 const LISTING: &str = include_str!("fixtures/reference_templates.json");
+const STACKS: &str = include_str!("fixtures/reference_generator_stacks.json");
 
 /// The stack the reference resolved its channel-following templates against
 const REFERENCE_STACK: [Channel; 7] =
@@ -32,6 +33,9 @@ fn our_source(kind: &str, name: &str, channel: &str) -> SourceRef {
         ("documentMap", "height") => ch(Channel::Height, 0),
         ("documentMap", "emissive") => ch(Channel::Emissive, 0),
         ("documentMap", "opacity") => ch(Channel::Opacity, 0),
+        ("documentMap", "ambientOcclusion") => ch(Channel::AmbientOcclusion, 0),
+        ("documentMap", "coatOpacity") => ch(Channel::CoatWeight, 0),
+        ("documentMap", "sheenColor") => ch(Channel::SheenColor, 0),
         ("documentMap", "specularLevel") => ch(Channel::SpecularLevel, 0),
         ("documentMap", "specular") => ch(Channel::Specular, 0),
         ("documentMap", "glossiness") => ch(Channel::Glossiness, 0),
@@ -77,7 +81,7 @@ fn our_source(kind: &str, name: &str, channel: &str) -> SourceRef {
     }
 }
 
-/// The output map the reference lists, in our terms: folders become part of the file name, and
+/// The output map the reference lists, in our terms: paths are relative to the output folder, and
 /// a red channel written with only an alpha is gray with alpha
 fn our_map(reference: &Value) -> MapSpec {
     let channels = reference["channels"].as_array().unwrap_or_else(|| panic!("no channels in {reference}"));
@@ -102,26 +106,41 @@ fn our_map(reference: &Value) -> MapSpec {
     let format = FileFormat::from_extension(&text(reference, "format")).unwrap_or_else(|| panic!("format of {reference}"));
     let bit_depth = reference["bitDepth"].as_u64().unwrap_or_default() as u8;
     let dither = reference["dithering"].as_bool().unwrap_or_default();
-    output(&text(reference, "file").replace('/', "_"), format, bit_depth, dither, channels)
+    output(text(reference, "file").trim_start_matches('/'), format, bit_depth, dither, channels)
 }
 
-/// A texture set with the reference stack and the baked maps its mixed AO and normals read
-fn reference_project() -> Project {
+/// A project whose one texture set has `channels` and `baked`
+fn stack_project(channels: &[Channel], baked: &[BakedMap]) -> Project {
     let mut project = Project::new("Reference", "builtin:sphere");
     let mut set = TextureSet::new("Set", 0, 64);
-    set.channels = REFERENCE_STACK.iter().map(|c| (*c, ChannelFormat::default_for(*c))).collect();
-
-    // The reference writes the mixed AO without an AO channel; here it needs the baked AO
-    set.baked.extend([BakedMap::AmbientOcclusion, BakedMap::Normal]);
+    set.channels = channels.iter().map(|c| (*c, ChannelFormat::default_for(*c))).collect();
+    set.baked.extend(baked.iter().copied());
     project.texture_sets.push(set);
     project
+}
+
+/// The maps `preset` writes for the one texture set of `project`, as written: without the
+/// channel conditions that chose them and without an alpha from a channel the set lacks
+fn planned_maps(project: &Project, preset: &ExportPreset) -> Vec<MapSpec> {
+    let set = &project.texture_sets[0];
+    let written = |(dest, source): &(Dest, SourceRef)| !matches!((dest, source), (Dest::A, SourceRef::Channel { channel, .. }) if !set.has_channel(*channel));
+    let planned = list_outputs(project, 0, "mesh", &ExportOptions::new(preset.clone())).unwrap();
+    planned
+        .iter()
+        .map(|file| {
+            let map = preset.maps[file.map].clone();
+            MapSpec { channels: map.channels.iter().filter(|c| written(c)).cloned().collect(), when_channels: Vec::new(), unless_channels: Vec::new(), ..map }
+        })
+        .collect()
 }
 
 #[test]
 fn built_in_templates_match_the_reference_listing() {
     let listing: Value = serde_json::from_str(LISTING).unwrap();
     let templates = listing["templates"].as_array().unwrap();
-    let project = reference_project();
+
+    // The reference writes the mixed AO without an AO channel; here it needs the baked AO
+    let project = stack_project(&REFERENCE_STACK, &[BakedMap::AmbientOcclusion, BakedMap::Normal]);
     assert_eq!(templates.len(), 41);
 
     for template in templates {
@@ -132,12 +151,7 @@ fn built_in_templates_match_the_reference_listing() {
         };
 
         // Channel-following templates are compared as they resolve for the reference stack
-        let ours: Vec<MapSpec> = if template["generator"].as_bool().unwrap_or_default() {
-            let planned = list_outputs(&project, 0, "mesh", &ExportOptions::new(preset.clone())).unwrap();
-            planned.iter().map(|file| preset.maps[file.map].clone()).collect()
-        } else {
-            preset.maps.clone()
-        };
+        let ours: Vec<MapSpec> = if template["generator"].as_bool().unwrap_or_default() { planned_maps(&project, &preset) } else { preset.maps.clone() };
         let reference: Vec<MapSpec> = template["maps"].as_array().unwrap().iter().map(our_map).collect();
 
         assert_eq!(preset.name, name);
@@ -162,5 +176,46 @@ fn old_template_names_find_their_replacements() {
         ("Mesh maps", "Mesh Maps"),
     ] {
         assert_eq!(builtin_preset(old).map(|p| p.name).as_deref(), Some(current), "{old}");
+    }
+}
+
+/// Whether the reference writes `map` on a set with `channels`: it lists maps of its user channels
+/// (which TextureCraft does not have) and the mixed AO without an AO source, but writes neither
+fn written_by_reference(map: &Value, channels: &[Channel]) -> bool {
+    let sources: Vec<(String, String)> = map["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c[3] != "A")
+        .map(|c| (c[1].as_str().unwrap_or_default().to_string(), c[2].as_str().unwrap_or_default().to_string()))
+        .collect();
+    let user_channel = |name: &str| name.starts_with("user");
+    let mixed_ao_without_source = |name: &str| name == "AO_Mixed" && !channels.contains(&Channel::AmbientOcclusion);
+    !sources.iter().all(|(_, name)| user_channel(name) || mixed_ao_without_source(name))
+}
+
+#[test]
+fn channel_following_templates_match_the_reference_on_other_stacks() {
+    let listing: Value = serde_json::from_str(STACKS).unwrap();
+
+    for stack in listing["stacks"].as_array().unwrap() {
+        let tag = text(stack, "stack");
+        let channels: Vec<Channel> = stack["channels"].as_array().unwrap().iter().map(|c| Channel::parse(c.as_str().unwrap()).unwrap()).collect();
+        let project = stack_project(&channels, &[]);
+        for template in stack["templates"].as_array().unwrap() {
+            let name = text(template, "name");
+            let Some(preset) = builtin_preset(&name) else {
+                assert_eq!(name, "2D View", "{tag}");
+                continue;
+            };
+
+            let ours = planned_maps(&project, &preset);
+            let reference: Vec<MapSpec> = template["maps"].as_array().unwrap().iter().filter(|map| written_by_reference(map, &channels)).map(our_map).collect();
+
+            assert_eq!(ours.len(), reference.len(), "{tag} {name}: {:?}", ours.iter().map(|m| &m.file).collect::<Vec<_>>());
+            for (index, (our, theirs)) in ours.iter().zip(&reference).enumerate() {
+                assert_eq!(our, theirs, "{tag} {name}, output map {index}");
+            }
+        }
     }
 }

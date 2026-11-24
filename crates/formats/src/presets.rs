@@ -27,7 +27,7 @@ fn baked(map: BakedMap, component: u8) -> SourceRef {
 
 /// One output map of a template.
 fn output(file: &str, format: FileFormat, bit_depth: u8, dither: bool, channels: Vec<(Dest, SourceRef)>) -> MapSpec {
-    MapSpec { file: file.into(), format, bit_depth, channels, inverted: Vec::new(), dither }
+    MapSpec { file: file.into(), format, bit_depth, channels, inverted: Vec::new(), dither, when_channels: Vec::new(), unless_channels: Vec::new() }
 }
 
 /// `$mesh_$textureSet_<suffix>` PNG.
@@ -94,13 +94,45 @@ pub(crate) fn gltf_pbr_maps(file: impl Fn(&str) -> String) -> Vec<MapSpec> {
     ]
 }
 
-/// The reference's first channels of the document channel templates, in its order (its order of
-/// the channels it did not list is not known; ours follow in [`Channel::ALL`] order)
-const DOCUMENT_CHANNELS_FIRST: [Channel; 7] =
-    [Channel::BaseColor, Channel::Height, Channel::Roughness, Channel::Metallic, Channel::Normal, Channel::Opacity, Channel::Emissive];
+/// The channel-following templates' files per texture set channel, in the reference's order:
+/// (channel, file name after `$textureSet_`). A set with a Glossiness channel is a
+/// specular/glossiness set, whose base color is its diffuse.
+pub(crate) const DOCUMENT_CHANNEL_FILES: [(Channel, &str); 22] = [
+    (Channel::BaseColor, "Base_color"),
+    (Channel::BaseColor, "Diffuse"),
+    (Channel::Specular, "Specular"),
+    (Channel::Glossiness, "Glossiness"),
+    (Channel::Height, "Height"),
+    (Channel::Roughness, "Roughness"),
+    (Channel::Metallic, "Metallic"),
+    (Channel::Normal, "Normal"),
+    (Channel::Opacity, "Opacity"),
+    (Channel::Emissive, "Emissive"),
+    (Channel::AmbientOcclusion, "Ambient_occlusion"),
+    (Channel::SpecularLevel, "Specular_level"),
+    (Channel::AnisotropyLevel, "Anisotropy_level"),
+    (Channel::AnisotropyAngle, "Anisotropy_angle"),
+    (Channel::CoatWeight, "Coat_opacity"),
+    (Channel::SheenColor, "Sheen_color"),
+    (Channel::ScatterWeight, "Scattering"),
+    (Channel::Transmission, "Transmissive"),
+    // Channels the reference does not have
+    (Channel::CoatRoughness, "Coat_roughness"),
+    (Channel::SheenWeight, "Sheen_weight"),
+    (Channel::SheenRoughness, "Sheen_roughness"),
+    (Channel::CoatNormal, "Coat_normal"),
+];
 
-/// "Document channels + Normal + AO": one map per texture set channel (named after its label),
-/// the DirectX normal and the mixed AO; `alpha` adds the UV coverage as each map's alpha.
+/// The texture set channel that marks a specular/glossiness set.
+const SPECULAR_GLOSSINESS_MARK: Channel = Channel::Glossiness;
+
+/// `map` written only for metal/roughness sets (its base color is not a diffuse).
+fn metal_roughness_only(map: MapSpec) -> MapSpec {
+    MapSpec { unless_channels: vec![SPECULAR_GLOSSINESS_MARK], ..map }
+}
+
+/// "Document channels + Normal + AO": one map per texture set channel, the DirectX normal and the
+/// mixed AO; `alpha` adds the UV coverage as each map's alpha.
 fn document_channel_maps(alpha: bool) -> Vec<MapSpec> {
     let with_alpha = |mut channels: Vec<(Dest, SourceRef)>| {
         if alpha {
@@ -109,19 +141,20 @@ fn document_channel_maps(alpha: bool) -> Vec<MapSpec> {
         channels
     };
 
-    // The mixed AO map stands for the AO channel
-    let rest = Channel::ALL.into_iter().filter(|c| !DOCUMENT_CHANNELS_FIRST.contains(c) && *c != Channel::AmbientOcclusion);
-    let mut maps: Vec<MapSpec> = DOCUMENT_CHANNELS_FIRST
+    let mut maps: Vec<MapSpec> = DOCUMENT_CHANNEL_FILES
         .into_iter()
-        .chain(rest)
-        .map(|c| {
-            let (channels, bit_depth) = match c.kind() {
-                ChannelKind::Color => (rgb(|k| ch(c, k)), 8),
-                ChannelKind::NormalMap => (rgb(|k| ch(c, k)), 16),
-                ChannelKind::Signed => (gray(ch(c, 0)), 16),
-                ChannelKind::Scalar => (gray(ch(c, 0)), 8),
+        .map(|(c, name)| {
+            let wide = matches!(c, Channel::Height | Channel::Normal | Channel::AnisotropyAngle | Channel::CoatNormal);
+            let channels = match c.kind() {
+                ChannelKind::Color | ChannelKind::NormalMap => rgb(|k| ch(c, k)),
+                ChannelKind::Signed | ChannelKind::Scalar => gray(ch(c, 0)),
             };
-            output(&format!("$textureSet_{}", c.label().replace(' ', "_")), FileFormat::Png, bit_depth, false, with_alpha(channels))
+            let map = output(&format!("$textureSet_{name}"), FileFormat::Png, if wide { 16 } else { 8 }, false, with_alpha(channels));
+            match name {
+                "Base_color" => metal_roughness_only(map),
+                "Diffuse" => MapSpec { when_channels: vec![SPECULAR_GLOSSINESS_MARK], ..map },
+                _ => map,
+            }
         })
         .collect();
     maps.push(output("$textureSet_Normal_DirectX", FileFormat::Png, 16, false, with_alpha(normal(VirtualMap::NormalDirectX))));
@@ -129,40 +162,48 @@ fn document_channel_maps(alpha: bool) -> Vec<MapSpec> {
     maps
 }
 
-/// The glTF templates' maps (the reference's displacement variant writes the same ones), plus our
-/// clear coat and sheen extension maps where the texture set has those channels.
+/// The glTF templates' maps (the reference's displacement variant writes the same ones; the
+/// GLB export adds the clear coat and sheen maps).
 fn gltf_template_maps() -> Vec<MapSpec> {
     let png = |file: &str, dither: bool, channels| output(file, FileFormat::Png, 8, dither, channels);
-    let mut sheen = rgb(|k| virt(VirtualMap::SheenTint, k));
-    sheen.push((Dest::A, ch(Channel::SheenRoughness, 0)));
     vec![
-        png("$textureSet_baseColor", false, base_with_alpha()),
+        metal_roughness_only(png("$textureSet_baseColor", false, base_with_alpha())),
         png("$textureSet_occlusionRoughnessMetallic", false, orm()),
         png("$textureSet_normal", true, normal(VirtualMap::NormalOpenGl)),
         png("$textureSet_emissive", false, rgb(|k| ch(Channel::Emissive, k))),
-        png("$textureSet_clearcoat", false, vec![(Dest::R, ch(Channel::CoatWeight, 0)), (Dest::G, ch(Channel::CoatRoughness, 0))]),
-        png("$textureSet_sheen", false, sheen),
     ]
 }
 
-/// The Sketchfab template's maps (the reference writes them into a folder of its upload; here
-/// they go beside the others).
+/// The mixed AO, written only for sets with an AO channel (as the reference's upload templates do).
+fn ao_channel_map(file: &str) -> MapSpec {
+    let map = output(file, FileFormat::Jpeg, 8, false, gray(virt(VirtualMap::AoMixed, 0)));
+    MapSpec { when_channels: vec![Channel::AmbientOcclusion], ..map }
+}
+
+/// The Sketchfab template's maps, in the folder the reference uploads from.
 fn sketchfab_maps() -> Vec<MapSpec> {
-    let jpeg = |file: &str, channels| output(file, FileFormat::Jpeg, 8, false, channels);
+    let jpeg = |file: &str, channels| output(&format!("exportsketchfab/textures/$textureSet_{file}"), FileFormat::Jpeg, 8, false, channels);
     vec![
-        jpeg("$textureSet_albedo", rgb(|k| ch(Channel::BaseColor, k))),
-        jpeg("$textureSet_opacity", gray(ch(Channel::Opacity, 0))),
-        jpeg("$textureSet_emissive", rgb(|k| ch(Channel::Emissive, k))),
-        jpeg("$textureSet_roughness", gray(ch(Channel::Roughness, 0))),
-        jpeg("$textureSet_metallic", gray(ch(Channel::Metallic, 0))),
-        output("$textureSet_normal", FileFormat::Png, 8, true, normal(VirtualMap::NormalOpenGl)),
+        metal_roughness_only(jpeg("albedo", rgb(|k| ch(Channel::BaseColor, k)))),
+        jpeg("opacity", gray(ch(Channel::Opacity, 0))),
+        jpeg("emissive", rgb(|k| ch(Channel::Emissive, k))),
+        jpeg("roughness", gray(ch(Channel::Roughness, 0))),
+        jpeg("metallic", gray(ch(Channel::Metallic, 0))),
+        output("exportsketchfab/textures/$textureSet_normal", FileFormat::Png, 8, true, normal(VirtualMap::NormalOpenGl)),
+        ao_channel_map("exportsketchfab/textures/$textureSet_AO"),
     ]
 }
 
+/// The USDz template's maps: the base color is a PNG with opacity in alpha when the set has
+/// opacity, a JPEG otherwise.
 fn usdz_maps() -> Vec<MapSpec> {
     let jpeg = |file: &str, channels| output(file, FileFormat::Jpeg, 8, false, channels);
+    let with_opacity = output("$textureSet_baseColor", FileFormat::Png, 8, false, base_with_alpha());
+    let without_opacity = jpeg("$textureSet_baseColor", rgb(|k| ch(Channel::BaseColor, k)));
     vec![
-        output("$textureSet_baseColor", FileFormat::Png, 8, false, base_with_alpha()),
+        MapSpec { when_channels: vec![Channel::Opacity], ..metal_roughness_only(with_opacity) },
+        MapSpec { unless_channels: vec![Channel::Opacity, SPECULAR_GLOSSINESS_MARK], ..without_opacity },
+        ao_channel_map("$textureSet_occlusion"),
         jpeg("$textureSet_roughness", gray(ch(Channel::Roughness, 0))),
         jpeg("$textureSet_metallic", gray(ch(Channel::Metallic, 0))),
         output("$textureSet_normal", FileFormat::Png, 8, true, normal(VirtualMap::NormalOpenGl)),

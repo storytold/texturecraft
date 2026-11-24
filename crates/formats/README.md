@@ -82,13 +82,13 @@ pub fn preset_from_json(json: &str) -> Result<ExportPreset>;
 pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
 ```
 
-- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)>, inverted: Vec<Dest>, dither: bool }`
+- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)>, inverted: Vec<Dest>, dither: bool, when_channels, unless_channels }`
   (serde JSON, so presets can be user files).
 - `Dest`: `R G B A` or `L` (gray; `L` + `A` = gray + alpha).
 - `SourceRef`: `Channel { channel, component }` (`Normal` = the **final** normal in the export
   normal format), `Virtual { map, component }` (`NormalOpenGl`, `NormalDirectX`, `Glossiness` =
   1 − roughness, `AoMixed` = baked AO × AO channel, `F0` = 0.08 × specular level, `Diffuse`,
-  `SpecularColor`, `Reflection`, `InverseIor`, `Glossiness2`, `LegacyDiffuse`, `UvCoverage`; see
+  `SpecularColor`, `Reflection`, `InverseIor`, `Glossiness2`, `LegacyDiffuse`, `LegacyGlossiness`, `UvCoverage`; see
   Converted maps below),
   `Baked { map, component }`, `Constant(f32)`.
 - `ExportOptions::new(preset)` accepts format and bit-depth overrides, per-map settings in
@@ -115,17 +115,23 @@ pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
 
 Built-in presets: the reference app's built-in output templates with its names, file names, file
 types, bit depths, dithering and channel packing, then a few of our own. Its template names and
-contents are checked against a listing of the reference app's templates
-(`src/presets/fixtures/reference_templates.json`).
+contents are checked against listings of the reference app's templates
+(`src/presets/fixtures/reference_templates.json`, and `reference_generator_stacks.json` for the
+templates that follow the channels, on a specular/glossiness stack, a stack with extra channels and
+one without opacity and height).
 
 - Templates that follow the texture set's channels (only the maps with a source in the set are
-  written): *Document channels + Normal + AO (No Alpha)* (the default: `$textureSet_<channel
-  label>`, height and normals 16-bit, plus `Normal_DirectX` and `Mixed_AO`), *Document channels +
-  Normal + AO (With Alpha)* (the same with the UV coverage as alpha), *glTF PBR Metal Roughness*
-  and its *+ Displacement texture (experimental)* variant (`$textureSet_baseColor` with opacity in
-  alpha, `occlusionRoughnessMetallic`, `normal` dithered, `emissive`; plus our `clearcoat` and
-  `sheen` maps where the set has those channels), *Sketchfab* (JPEG maps and a PNG normal) and
-  *USDz (Apple AR)*. *2D View* needs a rendered 2D view and is listed greyed.
+  written; a map can also need or exclude channels): *Document channels + Normal + AO (No Alpha)*
+  (the default: `$textureSet_<channel name>` in the reference's order and names, height, normals
+  and anisotropy angle 16-bit, plus `Normal_DirectX` and `Mixed_AO`), *Document channels + Normal +
+  AO (With Alpha)* (the same with the UV coverage as alpha), *glTF PBR Metal Roughness* and its *+
+  Displacement texture (experimental)* variant (`$textureSet_baseColor` with opacity in alpha,
+  `occlusionRoughnessMetallic`, `normal` dithered, `emissive`; plus our `clearcoat` and `sheen`
+  maps where the set has those channels), *Sketchfab* (JPEG maps and a PNG normal in
+  `exportsketchfab/textures/`, the AO only with an AO channel) and *USDz (Apple AR)* (a PNG base
+  color with opacity, or a JPEG one without). A set with a Glossiness channel is a
+  specular/glossiness set: its base color is written as `Diffuse`, and the metal/roughness
+  templates leave it out. *2D View* needs a rendered 2D view and is listed greyed.
 - Static templates, alphabetical: Amazon Lumberyard, Arnold (AiStandard), Arnold UDIM Legacy
   (AiStandard), Blender (Principled BSDF), Corona, CryEngine, Dota 2, KeyShot, KeyShot 9+, Lens
   Studio, Maxwell (Metallic Roughness), Maxwell (Specular Glossiness), Mesh Maps, Non-PBR Specular
@@ -148,23 +154,30 @@ Old names still find their template: "Document channels + Normal + AO", "Unity H
 (now *Unity HD Render Pipeline (Metallic Standard)*), "Unity Standard (Metallic Smoothness)" (now
 *Unity Universal Render Pipeline (Metallic Standard)*) and "Mesh maps" (*Mesh Maps*).
 
-Differences from the reference: a folder in a file name (`BaseColor/…`, `$project.sp/…`) becomes
-part of the name (`/` is written as `_`), and Sketchfab's maps go beside the others. The reference's
-`diffuse` channel is read from the base color (the diffuse color of a specular/glossiness
-project), its `transmissive` color from the transmission weight and its `scattering` from the
-scattering weight; the `user0`-`user3` channels do not exist here, so maps of them alone are left
-out. Sketchfab's own padding for its normal map is not applied.
+Differences from the reference: its `diffuse` channel is read from the base color (the diffuse
+color of a specular/glossiness project), its `transmissive` color from the transmission weight and
+its `scattering` from the scattering weight; the `user0`-`user3` channels do not exist here, so
+maps of them alone are left out. The document channel templates write the final normal (with the
+baked normal and the height) where the reference writes the normal channel alone. Sketchfab's own
+padding for its normal map is not applied. Converted colour maps follow the file format like the
+other colour maps (linear in float files), where the reference writes them sRGB-encoded in every
+format.
+
+File names may hold folders: `/` separates folder names inside the output directory (each one
+sanitized; a backslash, `..`, a leading `/` and empty folder names are refused), and the folders
+are created when the files are written.
 
 File names: `(...)` around a variable is optional, as in the reference: it is left out when the
 variable is empty (`$colorSpace` without a chosen colour space, `$udim` without UV tiles) and
 written without the parentheses otherwise. Other parentheses are kept. Each template map can ask
-for dithering, which applies unless the export chooses its own file type.
+for dithering; a dithering chosen for the map or the export decides instead.
 
-Converted maps: Diffuse (`base color × (1 − metallic)`) and Specular (`lerp(0.08 × specular
-level, base color, metallic)`). These are estimated, not verified against the reference: UV
-coverage (1 on the UV islands, 0 outside, used as the alpha of channels written with
-transparency), Reflection (the specular color), 1/IOR (the IOR of `F0 = 0.08 × specular level`),
-the alternative glossiness (`1 − √roughness`) and the legacy diffuse (the diffuse above).
+Converted maps, with the reference's measured formulas: Diffuse (`base color × (1 − metallic)`),
+Specular (`lerp(0.04, base color, metallic)`, the specular level is not read), Reflection (`1 −
+enc(metallic) × (1 − enc(base color))` on sRGB-encoded values), 1/IOR (`(1 − metallic) / 1.5`),
+Glossiness² (`(1 − roughness)²`), the legacy diffuse (the base color) and the legacy glossiness
+(`(1 − roughness + metallic) / 2`). The UV coverage (1 on the UV islands, 0 outside, the alpha of
+channels written with transparency) is estimated, not verified against the reference.
 
 ### Project file (`project_file`)
 

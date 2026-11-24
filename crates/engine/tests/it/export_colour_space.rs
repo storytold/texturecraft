@@ -82,12 +82,12 @@ fn a_chosen_colour_space_is_recorded_in_colour_maps_only() {
         p
     };
     let (default, d0) = export(&mut s, "icc_default", png(json!({})));
-    assert_eq!(png_icc(find(&default, "BaseColor")), None, "nothing is written unless a space is chosen");
+    assert_eq!(png_icc(find(&default, "baseColor")), None, "nothing is written unless a space is chosen");
     let (aces, d1) = export(&mut s, "icc_aces", png(json!({ "colorSpace": "ACEScg" })));
-    let icc = png_icc(find(&aces, "BaseColor")).expect("the base colour map carries a profile");
+    let icc = png_icc(find(&aces, "baseColor")).expect("the base colour map carries a profile");
     assert!(icc.windows(6).any(|w| w == b"ACEScg"), "the profile names its space");
     assert_eq!(Some(icc), texturecraft_formats::icc::profile(ColorSpace::AcesCg));
-    assert_eq!(png_icc(find(&aces, "Normal")), None, "a normal map is data and has no colour space");
+    assert_eq!(png_icc(find(&aces, "_normal")), None, "a normal map is data and has no colour space");
     // Formats that can't hold one say so, once per colour map.
     let (tga, d2) = export(&mut s, "icc_tga", png(json!({ "colorSpace": "ACEScg", "format": "tga" })));
     assert!(tga["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("TGA") && w.as_str().unwrap().contains("colour space")), "{tga}");

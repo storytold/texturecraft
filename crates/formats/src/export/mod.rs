@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use texturecraft_compose::{BakedMaps, Composite};
 use texturecraft_core::{AoMixing, BakedMap, BlockScales, Channel, ChannelKind, NormalFormat, NormalMixing, Project, TextureSet};
 use texturecraft_geom::glam::Vec3;
-use texturecraft_texel::{ColorSpace, DilationMap, linear_to_srgb};
+use texturecraft_texel::{ColorSpace, DilationMap, linear_to_srgb, srgb_to_linear};
 
 use crate::{FormatError, MAX_IMAGE_SIZE, Result};
 
@@ -35,6 +35,9 @@ pub use map_override::MapOverride;
 const HEIGHT_SPAN: f32 = 16.0;
 /// Dielectric reflectance at normal incidence per unit of specular level (0.5 gives 4 %).
 const F0_PER_SPECULAR_LEVEL: f32 = 0.08;
+/// The dielectric reflectance and index of refraction the reference's converted maps assume
+const DIELECTRIC_F0: f32 = 0.04;
+const DIELECTRIC_IOR: f32 = 1.5;
 const JPEG_QUALITY: u8 = 95;
 const PSD_MAX_SIDE_PIXELS: u32 = 30_000;
 const PSD_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -55,14 +58,18 @@ pub const FILE_TOKENS: [(&str, &str); 6] = [
     ("$udim", "UV tile number (1001 for sets without UV tiles)"),
 ];
 
-/// Why `template` is not a valid file name template: path separators, `..`, control characters
-/// and unknown `$` variables are refused.
+/// Why `template` is not a valid file name template. `/` separates folders inside the output
+/// directory; a backslash, `..`, a leading `/`, an empty folder name, control characters and
+/// unknown `$` variables are refused.
 pub fn template_error(template: &str) -> Option<String> {
     if template.trim().is_empty() || template.len() > MAX_TEMPLATE {
         return Some(format!("file name \"{template}\" is empty or longer than {MAX_TEMPLATE} bytes"));
     }
-    if template.contains(['/', '\\']) || template.contains("..") || template.chars().any(char::is_control) {
-        return Some(format!("file name \"{template}\" contains a path separator, \"..\" or a control character"));
+    if template.contains('\\') || template.contains("..") || template.chars().any(char::is_control) {
+        return Some(format!("file name \"{template}\" contains a backslash, \"..\" or a control character"));
+    }
+    if template.split('/').any(|segment| segment.trim().is_empty()) {
+        return Some(format!("file name \"{template}\" starts or ends with \"/\" or has an empty folder name"));
     }
     let mut rest = template;
     while let Some(i) = rest.find('$') {
@@ -208,28 +215,27 @@ pub enum VirtualMap {
     SheenTint,
     /// Specular/glossiness diffuse color from metal/roughness: base color × (1 − metallic).
     Diffuse,
-    /// Specular/glossiness F0 color from metal/roughness: dielectric F0 (0.08 × specular level)
-    /// blended to the base color by metallic.
+    /// Specular/glossiness F0 color from metal/roughness: a dielectric F0 of 4 % blended to the
+    /// base color by metallic (the specular level is not read).
     SpecularColor,
-    /// A renderer's reflection color; formula estimated, not verified against the reference: the
-    /// specular F0 color.
+    /// A renderer's reflection color: white blended to the sRGB base color by the sRGB-encoded
+    /// metallic, `1 − enc(metallic) × (1 − enc(base color))`, as the reference computes it.
     Reflection,
-    /// 1 / index of refraction; formula estimated, not verified against the reference: the IOR of
-    /// the dielectric F0 (0.08 × specular level).
+    /// 1 / index of refraction: `(1 − metallic) / 1.5` (dielectrics have an IOR of 1.5).
     InverseIor,
-    /// A renderer's glossiness remap; formula estimated, not verified against the reference:
-    /// 1 − √roughness.
+    /// Squared glossiness: `(1 − roughness)²`.
     Glossiness2,
-    /// A legacy engine's diffuse color; formula estimated, not verified against the reference: the
-    /// same as [`VirtualMap::Diffuse`].
+    /// A legacy engine's diffuse color: the base color, whatever the metallic.
     LegacyDiffuse,
+    /// A legacy engine's glossiness: `(1 − roughness + metallic) / 2`.
+    LegacyGlossiness,
     /// 1 on the mesh's UV islands, 0 outside them (padding included): the alpha of a channel
     /// written with transparency; estimated, not verified against the reference.
     UvCoverage,
 }
 
 impl VirtualMap {
-    pub const ALL: [VirtualMap; 15] = [
+    pub const ALL: [VirtualMap; 16] = [
         VirtualMap::NormalOpenGl,
         VirtualMap::NormalDirectX,
         VirtualMap::HeightNormal,
@@ -244,6 +250,7 @@ impl VirtualMap {
         VirtualMap::InverseIor,
         VirtualMap::Glossiness2,
         VirtualMap::LegacyDiffuse,
+        VirtualMap::LegacyGlossiness,
         VirtualMap::UvCoverage,
     ];
 
@@ -261,6 +268,7 @@ impl VirtualMap {
             VirtualMap::InverseIor => "inverseIor",
             VirtualMap::Glossiness2 => "glossiness2",
             VirtualMap::LegacyDiffuse => "legacyDiffuse",
+            VirtualMap::LegacyGlossiness => "legacyGlossiness",
             VirtualMap::UvCoverage => "uvCoverage",
         }
     }
@@ -278,9 +286,10 @@ impl VirtualMap {
             VirtualMap::Diffuse => "Diffuse from metallic",
             VirtualMap::SpecularColor => "Specular from metallic",
             VirtualMap::Reflection => "Reflection",
-            VirtualMap::InverseIor => "1/IOR from specular level",
-            VirtualMap::Glossiness2 => "Glossiness (alternative remap)",
+            VirtualMap::InverseIor => "1/IOR from metallic",
+            VirtualMap::Glossiness2 => "Glossiness²",
             VirtualMap::LegacyDiffuse => "Legacy diffuse",
+            VirtualMap::LegacyGlossiness => "Legacy glossiness",
             VirtualMap::UvCoverage => "UV coverage",
         }
     }
@@ -364,9 +373,15 @@ pub struct MapSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inverted: Vec<Dest>,
     /// The template dithers this map when it is written as an 8-bit integer file (absent in old
-    /// files: no). A file type chosen for the export decides instead.
+    /// files: no). A dithering chosen for the export or the map decides instead.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dither: bool,
+    /// The map is written only when the texture set has all of these channels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub when_channels: Vec<Channel>,
+    /// The map is written only when the texture set has none of these channels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unless_channels: Vec<Channel>,
 }
 
 impl MapSpec {
@@ -473,9 +488,10 @@ pub struct ExportOptions {
     /// Per map (by index into the preset's maps) settings.
     #[serde(default)]
     pub maps: std::collections::BTreeMap<usize, MapOverride>,
-    /// Dither 8-bit integer files (an ordered pattern, the same on every export).
+    /// Dither 8-bit integer files (an ordered pattern, the same on every export); None leaves it to
+    /// each template map.
     #[serde(default)]
-    pub dither: bool,
+    pub dither: Option<bool>,
 }
 
 impl ExportOptions {
@@ -521,7 +537,7 @@ impl ExportOptions {
             atlas: false,
             color_space: None,
             maps: Default::default(),
-            dither: false,
+            dither: None,
         }
     }
 }
@@ -585,11 +601,11 @@ fn source_present(set: &TextureSet, s: &SourceRef) -> bool {
         SourceRef::Virtual { map: VirtualMap::HeightNormal, .. } => set.has_channel(Channel::Height),
         SourceRef::Virtual { map: VirtualMap::SheenTint, .. } => set.has_channel(Channel::SheenWeight),
         SourceRef::Virtual { map: VirtualMap::Diffuse | VirtualMap::LegacyDiffuse, .. } => set.has_channel(Channel::BaseColor),
-        SourceRef::Virtual { map: VirtualMap::SpecularColor | VirtualMap::Reflection, .. } => {
-            set.has_channel(Channel::BaseColor) || set.has_channel(Channel::Metallic) || set.has_channel(Channel::SpecularLevel)
+        SourceRef::Virtual { map: VirtualMap::SpecularColor | VirtualMap::Reflection | VirtualMap::InverseIor, .. } => {
+            set.has_channel(Channel::BaseColor) || set.has_channel(Channel::Metallic)
         }
-        SourceRef::Virtual { map: VirtualMap::InverseIor, .. } => set.has_channel(Channel::SpecularLevel),
         SourceRef::Virtual { map: VirtualMap::Glossiness2, .. } => set.has_channel(Channel::Roughness),
+        SourceRef::Virtual { map: VirtualMap::LegacyGlossiness, .. } => set.has_channel(Channel::Roughness) || set.has_channel(Channel::Metallic),
         // Coverage is the alpha of other data, never data of its own
         SourceRef::Virtual { map: VirtualMap::UvCoverage, .. } => false,
         SourceRef::Baked { map, .. } => set.baked.contains(map),
@@ -668,6 +684,11 @@ fn fill_file_template(template: &str, values: &[(&str, &str, bool)]) -> String {
     out
 }
 
+/// [`sanitize_file_stem`] for each `/`-separated folder name and the file stem.
+pub fn sanitize_file_path(s: &str) -> String {
+    s.split('/').map(sanitize_file_stem).collect::<Vec<_>>().join("/")
+}
+
 /// The files `opts` produces for texture set `ts`, without rendering (for the export dialog).
 /// Template variables: [`FILE_TOKENS`].
 pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &ExportOptions) -> Result<Vec<PlannedFile>> {
@@ -685,7 +706,8 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
     let grid = set.tile_grid();
     let block_resolution = set.block_resolution();
     for (i, map) in opts.preset.maps.iter().enumerate() {
-        if !map.channels.iter().any(|(_, s)| source_present(set, s)) {
+        let channels_fit = map.when_channels.iter().all(|c| set.has_channel(*c)) && !map.unless_channels.iter().any(|c| set.has_channel(*c));
+        if !channels_fit || !map.channels.iter().any(|(_, s)| source_present(set, s)) {
             continue;
         }
 
@@ -695,10 +717,8 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
         let enabled = own.is_none_or(|o| o.enabled);
         let psd_channels = (enabled && format == FileFormat::Psd).then(|| layout(set, map).len());
 
-        // A file type chosen for the export brings its own dithering; otherwise the template's map may ask for it
-        let type_chosen = opts.format_override.is_some() || opts.bit_depth_override.is_some();
-        let export_dither = if type_chosen { opts.dither } else { opts.dither || map.dither };
-        let dither = bit_depth == 8 && !format.holds_float(bit_depth) && own.and_then(|o| o.dither).unwrap_or(export_dither);
+        // The map's own setting, then the export's, then the template's
+        let dither = bit_depth == 8 && !format.holds_float(bit_depth) && own.and_then(|o| o.dither).or(opts.dither).unwrap_or(map.dither);
         let space = opts.space_for_map(map, format, bit_depth);
         let requested_space = opts.space_for_depth(format, bit_depth);
         let color_map = map.is_color();
@@ -748,8 +768,8 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
             let stem = fill(&tile.unwrap_or(1001).to_string());
 
             // Replace the tile number with `<UDIM>` in the shared name
-            let token_stem = tile.map(|_| sanitize_file_stem(&fill("UDIMTOKEN")));
-            let stem = sanitize_file_stem(&stem);
+            let token_stem = tile.map(|_| sanitize_file_path(&fill("UDIMTOKEN")));
+            let stem = sanitize_file_path(&stem);
             let ext = format.extension();
             let mut name = format!("{stem}.{ext}");
             let mut warnings = Vec::new();
@@ -927,21 +947,26 @@ impl Sampler<'_> {
                 VirtualMap::F0 => [F0_PER_SPECULAR_LEVEL * self.channel(Channel::SpecularLevel, at)[0]; 3],
                 VirtualMap::Roughness => [1.0 - self.channel(Channel::Glossiness, at)[0]; 3],
                 VirtualMap::SheenTint => self.channel(Channel::SheenColor, at).map(|c| c * self.channel(Channel::SheenWeight, at)[0]),
-                VirtualMap::Diffuse | VirtualMap::LegacyDiffuse => {
+                VirtualMap::Diffuse => {
                     let metallic = self.channel(Channel::Metallic, at)[0];
                     self.channel(Channel::BaseColor, at).map(|c| c * (1.0 - metallic))
                 }
-                VirtualMap::SpecularColor | VirtualMap::Reflection => {
+                VirtualMap::LegacyDiffuse => self.channel(Channel::BaseColor, at),
+                VirtualMap::SpecularColor => {
                     let metallic = self.channel(Channel::Metallic, at)[0];
-                    let dielectric = F0_PER_SPECULAR_LEVEL * self.channel(Channel::SpecularLevel, at)[0];
-                    self.channel(Channel::BaseColor, at).map(|c| dielectric + (c - dielectric) * metallic)
+                    self.channel(Channel::BaseColor, at).map(|c| DIELECTRIC_F0 + (c - DIELECTRIC_F0) * metallic)
                 }
-                VirtualMap::InverseIor => {
-                    // F0 = ((ior - 1) / (ior + 1))², so 1 / ior = (1 - √F0) / (1 + √F0)
-                    let f0_root = (F0_PER_SPECULAR_LEVEL * self.channel(Channel::SpecularLevel, at)[0]).max(0.0).sqrt();
-                    [(1.0 - f0_root) / (1.0 + f0_root); 3]
+                VirtualMap::Reflection => {
+                    // The reference blends the encoded values; the result is decoded to stay a linear colour
+                    let metallic = linear_to_srgb(self.channel(Channel::Metallic, at)[0]);
+                    self.channel(Channel::BaseColor, at).map(|c| srgb_to_linear(1.0 - metallic * (1.0 - linear_to_srgb(c))))
                 }
-                VirtualMap::Glossiness2 => [1.0 - self.channel(Channel::Roughness, at)[0].max(0.0).sqrt(); 3],
+                VirtualMap::InverseIor => [(1.0 - self.channel(Channel::Metallic, at)[0]) / DIELECTRIC_IOR; 3],
+                VirtualMap::Glossiness2 => [(1.0 - self.channel(Channel::Roughness, at)[0]).powi(2); 3],
+                VirtualMap::LegacyGlossiness => {
+                    let (roughness, metallic) = (self.channel(Channel::Roughness, at)[0], self.channel(Channel::Metallic, at)[0]);
+                    [(1.0 - roughness + metallic) / 2.0; 3]
+                }
                 VirtualMap::UvCoverage => [if at == At::Default { 0.0 } else { 1.0 }; 3],
                 VirtualMap::HeightNormal => {
                     let n = match at {
@@ -1660,18 +1685,29 @@ fn keep_first_names<T>(files: Vec<T>, name: impl Fn(&T) -> &str, warnings: impl 
 /// Write exported files into `dir` (created if missing) via [`crate::write_batch_atomic`]:
 /// all filenames are validated and staged before any rename, and a later rename failure rolls
 /// back earlier publications (concurrent readers may briefly observe a mixed generation during
-/// the rename loop). Names must be plain file names.
+/// the rename loop). Names are file names, or relative paths with `/` between sanitized folder
+/// names; the folders are created inside `dir`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_files(files: &[ExportedFile], dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     std::fs::create_dir_all(dir)?;
+    let root = dir.canonicalize()?;
     let mut targets = Vec::with_capacity(files.len());
     for f in files {
         // Cap the sanitized stem before adding the extension
         let (stem, ext) = f.name.rsplit_once('.').unwrap_or((&f.name, ""));
-        if f.name.is_empty() || stem != sanitize_file_stem(stem) || !ext.chars().all(|c| c.is_ascii_alphanumeric()) || f.name.trim_matches('.').is_empty() {
-            return Err(FormatError::Invalid(format!("\"{}\" is not a plain file name", f.name)));
+        if f.name.is_empty() || stem != sanitize_file_path(stem) || !ext.chars().all(|c| c.is_ascii_alphanumeric()) || f.name.trim_matches('.').is_empty() {
+            return Err(FormatError::Invalid(format!("\"{}\" is not a file name or a relative path", f.name)));
         }
-        targets.push((dir.join(&f.name), f.bytes.as_slice()));
+
+        // A folder that links elsewhere must not take the file out of `dir`
+        let target = dir.join(&f.name);
+        if let Some(parent) = target.parent().filter(|parent| *parent != dir) {
+            std::fs::create_dir_all(parent)?;
+            if !parent.canonicalize()?.starts_with(&root) {
+                return Err(FormatError::Invalid(format!("\"{}\" leads out of the output folder", f.name)));
+            }
+        }
+        targets.push((target, f.bytes.as_slice()));
     }
     crate::write_batch_atomic(targets.iter().map(|(path, bytes)| (path.as_path(), *bytes)))?;
     Ok(targets.into_iter().map(|(path, _)| path).collect())

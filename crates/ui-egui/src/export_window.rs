@@ -33,7 +33,7 @@ const VALUE_WIDTH: f32 = 360.0;
 pub(crate) const SIZES: [u32; 7] = [128, 256, 512, 1024, 2048, 4096, 8192];
 
 /// Templates the reference lists above the separator, in its order (one more carries a vendor
-/// name and is left out). TextureCraft has some of them; the others are listed greyed.
+/// name and is left out). TextureCraft has all of them but 2D View, which is listed greyed.
 const FIRST_GROUP: [&str; 7] = [
     "2D View",
     "Document channels + Normal + AO (No Alpha)",
@@ -339,14 +339,21 @@ fn export_step(app: &mut TextureCraftApp, frame: u64) {
         params["reservedNames"] = job.written.iter().chain(&job.material_udim_patterns).map(|name| json!(name)).collect();
     }
 
+    let directory = std::path::PathBuf::from(params["dir"].as_str().unwrap_or_default());
     let Some(response) = app.run("file.exportTextures", params) else {
         app.ui.export.job = None;
         return;
     };
 
-    let files: Vec<String> = response_strings(&response, "files")
-        .map(|file| std::path::Path::new(file).file_name().map_or_else(|| file.to_string(), |n| n.to_string_lossy().into_owned()))
-        .collect();
+    // Names relative to the output folder keep a template's folders
+    let relative = |file: &str| {
+        let path = std::path::Path::new(file);
+        match path.strip_prefix(&directory) {
+            Ok(inside) => inside.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"),
+            Err(_) => path.file_name().map_or_else(|| file.to_string(), |name| name.to_string_lossy().into_owned()),
+        }
+    };
+    let files: Vec<String> = response_strings(&response, "files").map(relative).collect();
     let mut lines = vec![set(), ConsoleLine::Step(tr("Saving texture files").into())];
     for file in &files {
         let stem = file.rsplit_once('.').map_or(file.as_str(), |(stem, _)| stem);
@@ -1254,6 +1261,7 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     {
         app.ui.export.preset = b.name;
     }
+    app.ui.export.update_saved_templates();
     keep_file_type_visible(&mut app.ui.export);
     follow_texture_sets(app);
     if app.ui.export.opened_with.is_none() {
