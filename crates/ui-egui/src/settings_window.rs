@@ -8,7 +8,7 @@ use crate::TextureCraftApp;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::file_dialogs::{Bound, FileDialog};
 use crate::i18n::{LANGUAGES, SYSTEM_LANGUAGE, n_, tr, trf};
-use crate::state::{CAMERA_SPEED_RANGE, LibraryLocation, Prefs};
+use crate::state::{CAMERA_SPEED_RANGE, LibraryLocation, MAX_RECENT_PROJECTS, Prefs};
 use crate::theme::{Accent, Brightness, Tokens, caption};
 use crate::unavailable::NOT_AVAILABLE;
 use crate::widgets::icon_button;
@@ -75,77 +75,84 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     crate::keymap::follow(&mut app.settings_bindings, &draft.keymap, ctx);
     let shortcut_conflict = crate::keymap::has_conflict(&app.settings_bindings);
 
-    crate::windows::window("settings", tr("Settings"), &mut open).resizable(false).show(ctx, |ui| {
-        // Keep the footer inside the viewport when the fixed-width controls need to scroll
-        ui.set_max_width(content_width);
-        ui.horizontal_top(|ui| {
-            egui::ScrollArea::vertical().id_salt("settings_navigation").min_scrolled_height(0.0).max_height(page_height).show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(PAGE_BUTTON.x);
-                    for page in SettingsPage::ALL {
-                        let warn = page == SettingsPage::Shortcuts && shortcut_conflict;
-                        if page_button(ui, page, draft.page == page, warn).clicked() {
-                            draft.page = page;
-                        }
-                        ui.add_space(6.0);
+    crate::windows::window("settings", tr("Settings"), &mut open)
+        .default_size(vec2(content_width + frame_width, page_height + WINDOW_CHROME_HEIGHT_POINTS))
+        .show(ctx, |ui| {
+            // Measure the footer through layout, then let the pages use only what remains
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                // Recheck after drawing the page as well, before accepting any edits
+                let conflict = crate::keymap::has_conflict(&app.settings_bindings);
+                ui.horizontal(|ui| {
+                    if conflict {
+                        let danger = Tokens::get(ui.ctx()).danger;
+                        ui.label(RichText::new(format!("{} {}", ic::WARNING, tr(SHORTCUT_ERRORS))).color(danger));
                     }
-                });
-            });
-            ui.add_space(8.0);
-            egui::ScrollArea::both()
-                .id_salt(("settings_page", draft.page as u8))
-                .auto_shrink([false, false])
-                .min_scrolled_width(0.0)
-                .min_scrolled_height(page_height)
-                .max_height(page_height)
-                .show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(PAGE_WIDTH);
-                        match draft.page {
-                            SettingsPage::General => {
-                                general(
-                                    ui,
-                                    &mut draft.prefs,
-                                    &drawable,
-                                    gpu.as_deref(),
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    resources,
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    &mut pick,
-                                );
-                            }
-                            SettingsPage::Shortcuts => {
-                                crate::keymap::actions_page(ui, &mut draft.keymap, &app.bindings, &mut app.settings_bindings);
-                            }
-                            SettingsPage::Libraries => {
-                                libraries(
-                                    ui,
-                                    &mut draft,
-                                    project_open,
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    &mut pick,
-                                );
-                            }
-                        }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        cancel = ui.add(egui::Button::new(tr("Cancel")).min_size(vec2(100.0, 0.0))).clicked();
+                        ok = ui.add_enabled(!conflict, egui::Button::new(tr("OK")).min_size(vec2(100.0, 0.0))).clicked();
                     });
                 });
-        });
-        ui.separator();
-
-        // The page has brought the checker up to date, so OK follows this frame's edits
-        let conflict = crate::keymap::has_conflict(&app.settings_bindings);
-        ui.horizontal(|ui| {
-            if conflict {
-                let danger = Tokens::get(ui.ctx()).danger;
-                ui.label(RichText::new(format!("{} {}", ic::WARNING, tr(SHORTCUT_ERRORS))).color(danger));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                cancel = ui.add(egui::Button::new(tr("Cancel")).min_size(vec2(100.0, 0.0))).clicked();
-                ok = ui.add_enabled(!conflict, egui::Button::new(tr("OK")).min_size(vec2(100.0, 0.0))).clicked();
+                ui.separator();
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    let page_height = ui.available_height().max(0.0);
+                    ui.horizontal_top(|ui| {
+                        egui::ScrollArea::vertical().id_salt("settings_navigation").min_scrolled_height(0.0).max_height(page_height).show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(PAGE_BUTTON.x);
+                                for page in SettingsPage::ALL {
+                                    let warn = page == SettingsPage::Shortcuts && shortcut_conflict;
+                                    if page_button(ui, page, draft.page == page, warn).clicked() {
+                                        draft.page = page;
+                                    }
+                                    ui.add_space(6.0);
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        egui::ScrollArea::both()
+                            .id_salt(("settings_page", draft.page as u8))
+                            .content_margin(crate::windows::dialog_scroll_margin(ui))
+                            .auto_shrink([false, false])
+                            .min_scrolled_width(0.0)
+                            .min_scrolled_height(0.0)
+                            .max_height(page_height)
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_min_width(PAGE_WIDTH);
+                                    match draft.page {
+                                        SettingsPage::General => {
+                                            general(
+                                                ui,
+                                                &mut draft.prefs,
+                                                &drawable,
+                                                gpu.as_deref(),
+                                                #[cfg(not(target_arch = "wasm32"))]
+                                                resources,
+                                                #[cfg(not(target_arch = "wasm32"))]
+                                                &mut pick,
+                                            );
+                                        }
+                                        SettingsPage::Shortcuts => {
+                                            crate::keymap::actions_page(ui, &mut draft.keymap, &app.bindings, &mut app.settings_bindings);
+                                        }
+                                        SettingsPage::Libraries => {
+                                            libraries(
+                                                ui,
+                                                &mut draft,
+                                                project_open,
+                                                #[cfg(not(target_arch = "wasm32"))]
+                                                &mut pick,
+                                            );
+                                        }
+                                    }
+                                });
+                            });
+                    });
+                });
             });
         });
-    });
 
+    ok &= !crate::keymap::has_conflict(&app.settings_bindings);
     app.ui.windows.settings_page = draft.page;
     if draft.page != SettingsPage::Shortcuts || ok || cancel || !open {
         crate::keymap::stop_settings_capture(ctx);
@@ -169,6 +176,7 @@ fn apply(app: &mut TextureCraftApp, draft: SettingsDraft) {
     let previous_autosave_minutes = app.ui.prefs.autosave_minutes;
 
     app.ui.prefs = draft.prefs;
+    app.ui.trim_recent();
     app.reschedule_autosave_if_changed(previous_autosave_minutes);
 
     let ids: std::collections::BTreeSet<&String> = draft.keymap.keys().chain(draft.keymap_at_open.keys()).collect();
@@ -352,6 +360,12 @@ fn general(
             )
             .labelled_by(label);
         });
+    });
+
+    row(ui, tr("Recent projects limit"), |ui, label| {
+        ui.add(egui::DragValue::new(&mut p.recent_projects_limit).range(0..=MAX_RECENT_PROJECTS))
+            .labelled_by(label)
+            .on_hover_text(tr("Number of recent projects to remember. 0 disables recent-project history."));
     });
 
     section(ui, n_("LAYER STACK OPTIONS"));

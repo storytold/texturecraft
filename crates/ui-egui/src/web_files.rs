@@ -241,8 +241,8 @@ fn zip_files(files: Vec<ExportedFile>) -> Result<Vec<u8>, String> {
 
 #[cfg(target_arch = "wasm32")]
 pub use web::{
-    download, export_mesh, export_textures, import_bake_mesh, import_environment, import_images, import_material, import_preset, open, pick_new_project_mesh,
-    save_project, sync_unsaved, unsaved,
+    download, export_mesh, export_textures, import_bake_mesh, import_environment, import_images, import_material, import_preset, open, open_sample_project,
+    pick_new_project_mesh, save_project, sync_unsaved, unsaved,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -267,6 +267,11 @@ mod web {
     /// File › Open: the browser's file picker; the file loads on a later frame (see [`poll`]).
     pub fn open(ctx: &egui::Context) {
         pick(ctx, tr("Projects and meshes"), OPEN_EXTS, false, Pick::Open);
+    }
+
+    /// File > Open Sample Project: choose a saved TextureCraft project.
+    pub fn open_sample_project(ctx: &egui::Context) {
+        pick(ctx, tr("TextureCraft project"), &[PROJECT_EXT], false, Pick::Open);
     }
 
     /// File › Import material: pick materials; they add as layers on a later frame.

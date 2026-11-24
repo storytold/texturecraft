@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::core::{BakeResolution, BakedMap, CurvatureMethod, HeightNormalization};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::docking::Panel;
@@ -40,6 +40,16 @@ fn save(harness: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
     let img = harness.render().unwrap_or_else(|e| panic!("{name}: {e}"));
     let path = dir.join(format!("{name}.png"));
     img.save(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let tree = [egui::Role::Button, egui::Role::SpinButton, egui::Role::CheckBox]
+        .into_iter()
+        .flat_map(|role| harness.get_all_by_role(role))
+        .filter_map(|button| {
+            let node = button.accesskit_node();
+            node.label().map(|label| format!("{label}: disabled={}, checked={:?}", node.is_disabled(), node.toggled()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.join(format!("{name}.txt")), tree).unwrap();
     eprintln!("wrote {}", path.display());
 }
 
@@ -53,6 +63,28 @@ fn empty_start_snapshot() {
     harness.state_mut().ui.prefs.language = "en".into();
 
     save(&mut harness, &output_dir, "empty-start");
+    for top in ["File", "Edit", "Mode", "Window", "Viewport", "Help"] {
+        harness.get_by_label(top).click();
+        harness.run_steps(4);
+        save(&mut harness, &output_dir, &format!("empty-menu-{top}"));
+        if top == "Window" {
+            harness.get_by_label("Views").click();
+            save(&mut harness, &output_dir, "empty-menu-views");
+        }
+        harness.key_press(egui::Key::Escape);
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(3);
+    }
+    harness.state_mut().ui.toolbar_tools = false;
+    save(&mut harness, &output_dir, "empty-tools-off");
+    for label in ["Snooze Autosave", "Resources Updater"] {
+        assert!(harness.get_by_label(label).accesskit_node().is_disabled());
+    }
+    harness.get_by_label("Edit").click();
+    harness.run_steps(3);
+    harness.get_by_label("Settings").click();
+    save(&mut harness, &output_dir, "settings-recent-project-limit");
+    assert!(!harness.get_by_label("Recent projects limit").accesskit_node().is_disabled());
 }
 
 /// Closing rejects a same-frame capture, then releases both rendered view targets.

@@ -15,7 +15,7 @@ const QUAD: &str = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 1 1\n
 const TRIANGLE: &str = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n";
 /// The format combo's tooltip, which is its accessible label.
 const FORMAT_HINT: &str = "For the whole project: how normal map images set as mesh maps are read (set them again after a change), and the default for export";
-const TITLE: &str = "Project configuration";
+const TITLE: &str = "Project Configuration";
 
 fn temp_dir(test: &str) -> TempDir {
     TempDir::new(test)

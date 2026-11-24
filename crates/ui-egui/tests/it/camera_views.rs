@@ -1,4 +1,4 @@
-//! F5 and F6 switch the projection, the Viewport menu goes to fixed views, and Alt+Shift+drag orbits
+//! F5 and F6 switch the projection, bound shortcuts go to fixed views, and Alt+Shift+drag orbits
 //! in 90° steps.
 
 use std::f32::consts::FRAC_PI_2;
@@ -54,7 +54,7 @@ fn f6_switches_to_orthographic_and_f5_back_to_perspective_keeping_the_view() {
 }
 
 #[test]
-fn the_viewport_menu_goes_to_the_front_view_and_orbit_works_afterwards() {
+fn a_bound_front_view_shortcut_keeps_orbit_working_afterwards() {
     let mut h = harness();
     h.state_mut().run("camera.set", json!({"yaw": 70, "pitch": 30, "ortho": true}));
     h.run_steps(2);
@@ -62,7 +62,11 @@ fn the_viewport_menu_goes_to_the_front_view_and_orbit_works_afterwards() {
     // The menu bar's "Viewport", above the dock's tab of the same name
     h.get_all_by_label("Viewport").min_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).unwrap().click();
     h.run_steps(2);
-    h.get_by_label_contains("Front view").click();
+    assert!(h.query_by_label_contains("Front view").is_none(), "fixed views are absent from the menu");
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    h.state_mut().ui.keymap.insert("camera.view.front".into(), "F12".into());
+    h.key_press(Key::F12);
 
     // The UI glides there over about a third of a second
     h.run_steps(6);

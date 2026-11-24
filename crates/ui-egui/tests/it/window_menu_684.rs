@@ -10,7 +10,6 @@ use std::rc::Rc;
 use texturecraft_engine::Session;
 use texturecraft_ui_egui::file_dialogs::{Answer, Request};
 use texturecraft_ui_egui::state::Mode;
-use texturecraft_ui_egui::unavailable::NOT_AVAILABLE;
 use texturecraft_ui_egui::{TextureCraftApp, menus};
 
 use super::temp_dir::TempDir;
@@ -37,25 +36,16 @@ fn open_sub(h: &mut Harness<'_, TextureCraftApp>, name: &str) {
     h.run_steps(3);
 }
 
-fn hover_hint(h: &mut Harness<'_, TextureCraftApp>, label: &str) -> bool {
-    let at = h.get_by_label_contains(label).rect().center();
-    h.hover_at(egui::pos2(1.0, 1.0));
-    h.run_steps(2);
-    h.hover_at(at);
-    h.run_steps(30);
-    h.query_by_label(NOT_AVAILABLE).is_some()
-}
-
 #[test]
-fn views_lists_renderer_settings_and_the_greyed_entries_with_a_hint() {
-    let mut h = app();
+fn views_omit_unrequested_entries_and_disable_mode_specific_panels() {
+    let mut h = app_with(Session::closed().unwrap());
     open_sub(&mut h, "Views");
-    assert!(h.query_by_label_contains("Renderer Settings").is_some());
-    for label in ["Python Console", "Online assets"] {
-        assert!(h.get_by_label_contains(label).accesskit_node().is_disabled(), "{label} is greyed");
+    for label in ["Baking Log", "Common Settings", "Mesh Map Bakers", "Mesh Map Settings", "Renderer Settings"] {
+        assert!(h.get_by_label_contains(label).accesskit_node().is_disabled(), "{label}");
     }
-    assert!(hover_hint(&mut h, "Python Console"), "Python Console says it is not available yet");
-    assert!(hover_hint(&mut h, "Online assets"), "Online assets says it is not available yet");
+    for label in ["Python Console", "Online assets"] {
+        assert!(h.query_by_label_contains(label).is_none());
+    }
 }
 
 #[test]
@@ -71,14 +61,13 @@ fn properties_names_the_tool_while_a_project_is_open() {
 }
 
 #[test]
-fn toolbars_lists_docks_plugins_and_tools() {
+fn toolbars_lists_only_docks_and_tools() {
     let mut h = app();
     open_sub(&mut h, "Toolbars");
     for label in ["Docks", "Tools"] {
         assert!(!h.get_by_label_contains(label).accesskit_node().is_disabled(), "{label}");
     }
-    assert!(h.get_by_label_contains("Plugins").accesskit_node().is_disabled());
-    assert!(hover_hint(&mut h, "Plugins"));
+    assert!(h.query_by_label_contains("Plugins").is_none());
 
     assert!(h.state().ui.toolbar_docks && h.state().ui.toolbar_tools, "both bars start shown");
     h.get_by_label_contains("Docks").click();
@@ -116,9 +105,9 @@ fn hide_ui_shows_its_check_mark() {
 fn save_ui_layout_has_one_entry_per_mode_and_writes_that_modes_layout() {
     let dir = TempDir::new("layout-per-mode");
     for (item, file, mode, baking) in [
-        ("Painting mode", "p.json", Mode::Painting, false),
-        ("Rendering mode", "r.json", Mode::Rendering, false),
-        ("Baking mode", "b.json", Mode::Baking, true),
+        ("Painting Mode", "p.json", Mode::Painting, false),
+        ("Rendering Mode", "r.json", Mode::Rendering, false),
+        ("Baking Mode", "b.json", Mode::Baking, true),
     ] {
         let mut h = app();
         let path = dir.join(file);
@@ -130,7 +119,10 @@ fn save_ui_layout_has_one_entry_per_mode_and_writes_that_modes_layout() {
 
         let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| panic!("{item}: {e}"))).unwrap();
         assert_eq!(saved["mode"], serde_json::to_value(mode).unwrap(), "{item}");
-        assert_eq!(saved["dock_is_baking"], baking, "{item}: the file's dock is the mode's own");
+        assert!(saved.get("inactive_mode_dock").is_none(), "only one mode is saved");
+        assert!(saved.get("prefs").is_none(), "preferences are not a layout");
+        let dock = texturecraft_ui_egui::docking::Dock::from_value(saved["dock"].clone());
+        assert_eq!(dock.is_open(texturecraft_ui_egui::docking::Panel::MeshMapBakers), baking);
         assert_eq!(h.state().ui.mode, Mode::Painting, "saving does not switch the mode");
     }
 }
@@ -152,7 +144,7 @@ fn the_legacy_layout_save_command_saves_the_active_mode() {
     assert_eq!(reply["ok"], true);
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(saved["mode"], serde_json::to_value(Mode::Baking).unwrap());
-    assert_eq!(saved["dock_is_baking"], true);
+    assert!(saved.get("inactive_mode_dock").is_none());
 }
 
 #[test]

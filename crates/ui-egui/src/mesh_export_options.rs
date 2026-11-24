@@ -22,7 +22,7 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
     let mut open = true;
     let (mut export, mut cancel) = (false, false);
-    crate::windows::dialog("mesh_export_options", tr("Mesh Export Options"), &mut open).show(ctx, |ui| {
+    crate::windows::dialog(ctx, "mesh_export_options", tr("Mesh Export Options"), &mut open).show(ctx, |ui| {
         // TextureCraft exports the mesh as it is: triangulated, without displacement
         ui.add(egui::RadioButton::new(true, tr("Without displacement/tessellation")));
         option(ui, true, tr("Apply triangulation"));

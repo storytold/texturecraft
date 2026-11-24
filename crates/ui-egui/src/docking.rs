@@ -43,14 +43,16 @@ pub enum Panel {
     Shader,
     History,
     Log,
+    BakingLog,
     Export,
     /// The path tracer's settings (Window ▸ Views ▸ Renderer Settings, Rendering mode only)
     Renderer,
 }
 
 /// Window ▸ Views items and the panels they show or hide.
-pub const VIEWS: [(&str, Panel); 14] = [
+pub const VIEWS: [(&str, Panel); 15] = [
     ("ui.view.assets", Panel::Assets),
+    ("ui.view.bakingLog", Panel::BakingLog),
     ("ui.view.bakeMaps", Panel::MeshMapSettings),
     ("ui.view.bakeSettings", Panel::CommonSettings),
     ("ui.view.display", Panel::Display),
@@ -79,7 +81,7 @@ impl Panel {
     pub(crate) fn available_in(self, mode: crate::state::Mode) -> bool {
         use crate::state::Mode;
         match self {
-            Self::MeshMapSettings | Self::CommonSettings | Self::MeshMapBakers => mode == Mode::Baking,
+            Self::MeshMapSettings | Self::CommonSettings | Self::MeshMapBakers | Self::BakingLog => mode == Mode::Baking,
             Self::Assets | Self::Layers | Self::Properties | Self::TextureSetSettings | Self::Export => mode == Mode::Painting,
             Self::History => mode != Mode::Rendering,
             Self::Shader => mode != Mode::Baking,
@@ -88,7 +90,7 @@ impl Panel {
         }
     }
 
-    pub const ALL: [Panel; 15] = [
+    pub const ALL: [Panel; 16] = [
         Panel::Viewport,
         Panel::Assets,
         Panel::MeshMapSettings,
@@ -102,6 +104,7 @@ impl Panel {
         Panel::Shader,
         Panel::History,
         Panel::Log,
+        Panel::BakingLog,
         Panel::Export,
         Panel::Renderer,
     ];
@@ -121,6 +124,7 @@ impl Panel {
             Panel::Shader => "Shader Settings",
             Panel::History => "History",
             Panel::Log => "Log",
+            Panel::BakingLog => "Baking Log",
             Panel::Export => "Export",
             Panel::Renderer => "Renderer Settings",
         }
@@ -135,6 +139,7 @@ impl Panel {
             Panel::Log => 3.0,
             Panel::Export => 4.0,
             Panel::Renderer => 5.0,
+            Panel::BakingLog => 6.0,
             _ => return None,
         };
         Some([960.0, 90.0 + 50.0 * slot, 300.0, 380.0])
@@ -576,6 +581,13 @@ pub(crate) fn panel_body(app: &mut TextureCraftApp, ui: &mut Ui, panel: Panel) {
         Panel::Shader => crate::shader_settings::body(app, ui),
         Panel::History => crate::windows::history(app, ui),
         Panel::Log => crate::log_panel::body(app, ui),
+        Panel::BakingLog => {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for entry in app.session.log.entries().iter().filter(|entry| entry.source == "Baker") {
+                    ui.label(entry.line());
+                }
+            });
+        }
         Panel::Export => crate::export_panel::body(app, ui),
         Panel::Renderer => crate::render_mode::settings_body(app, ui),
         Panel::Viewport => {}

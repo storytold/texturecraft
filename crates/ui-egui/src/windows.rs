@@ -1,6 +1,8 @@
 //! Floating windows and the dockable History panel
 
-use egui::{RichText, Ui, vec2};
+#[cfg(any(target_arch = "wasm32", test))]
+use egui::vec2;
+use egui::{RichText, Ui};
 use egui_phosphor::regular as ic;
 use serde_json::json;
 
@@ -50,8 +52,8 @@ fn reset_ui(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
     let mut open = true;
     let (mut reset, mut cancel) = (false, false);
-    dialog("reset_ui", tr("Reset UI"), &mut open).show(ctx, |ui| {
-        ui.label(tr("Reset the panels, view layout, zoom and every other view setting to their defaults? Settings and shortcuts stay. To reset only the panels, use Reset panel layout."));
+    dialog(ctx, "reset_ui", tr("Reset UI"), &mut open).show(ctx, |ui| {
+        ui.label(tr("Reset the panels, view layout, zoom and every other view setting to their defaults? Settings and shortcuts stay."));
         ui.add_space(8.0);
 
         // One row keeps the window to its contents; a bare right-to-left layout fills the screen height
@@ -123,7 +125,7 @@ fn unsaved(app: &mut TextureCraftApp, ctx: &egui::Context) {
     } else {
         trf("Save the changes to {name} first?", &question_args)
     };
-    dialog("unsaved", tr("Unsaved changes"), &mut open).show(ctx, |ui| {
+    dialog(ctx, "unsaved", tr("Unsaved Changes"), &mut open).show(ctx, |ui| {
         ui.label(question);
         ui.add_space(8.0);
 
@@ -199,14 +201,29 @@ pub(crate) fn window<'a>(id: &str, title: &str, open: &'a mut bool) -> egui::Win
         .default_width(300.0)
 }
 
-/// A centered dialog; `id` keeps its place across UI languages.
-pub(crate) fn dialog<'a>(id: &str, title: &str, open: &'a mut bool) -> egui::Window<'a> {
+/// A movable, resizable dialog, initially centered; `id` keeps its place across UI languages.
+pub(crate) fn dialog<'a>(ctx: &egui::Context, id: &str, title: &str, open: &'a mut bool) -> egui::Window<'a> {
     egui::Window::new(title.to_owned())
         .id(egui::Id::unique(id))
         .open(open)
         .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .resizable(true)
+        .default_height(0.0)
+        .default_pos(ctx.content_rect().center())
+        .pivot(egui::Align2::CENTER_CENTER)
+}
+
+/// Keep form controls clear of the scrollbar even when its floating handle expands.
+pub(crate) fn dialog_scroll_margin(ui: &egui::Ui) -> egui::Margin {
+    let scroll = &ui.spacing().scroll;
+    let mut margin = scroll.content_margin;
+    let clearance = (scroll.bar_width + ui.spacing().item_spacing.x).ceil() as i8;
+    if ui.style().right_to_left {
+        margin.left = margin.left.max(clearance);
+    } else {
+        margin.right = margin.right.max(clearance);
+    }
+    margin
 }
 
 /// The History panel body (a dock tab)
@@ -271,7 +288,7 @@ fn export_mesh(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
     let mut open = true;
     let mut picked = None;
-    dialog("export_mesh", tr("Export mesh"), &mut open).show(ctx, |ui| {
+    dialog(ctx, "export_mesh", tr("Export Mesh"), &mut open).show(ctx, |ui| {
         ui.label(crate::theme::caption(tr("Download as")));
         for (extension, label, hint) in formats {
             if ui.add_sized(vec2(220.0, ui.spacing().interact_size.y), egui::Button::new(label)).on_hover_text(hint).clicked() {
@@ -290,7 +307,7 @@ fn export_mesh(app: &mut TextureCraftApp, ctx: &egui::Context) {
 fn about(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let tk = Tokens::get(ctx);
     let mut open = app.ui.windows.about;
-    dialog("about", tr("About TextureCraft"), &mut open).show(ctx, |ui| {
+    dialog(ctx, "about", tr("About TextureCraft"), &mut open).show(ctx, |ui| {
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("TextureCraft").size(22.0).strong().color(tk.text_strong));
             ui.label(trf("Version {version}", &[("version", &texturecraft_engine::VERSION)]));
@@ -308,7 +325,7 @@ fn about(app: &mut TextureCraftApp, ctx: &egui::Context) {
 }
 
 /// Render the session log as text, preserving each entry's occurrence time, severity and source.
-fn log_text(entries: &[texturecraft_engine::LogEntry]) -> String {
+pub(crate) fn log_text(entries: &[texturecraft_engine::LogEntry]) -> String {
     use std::fmt::Write as _;
 
     const UTC_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
@@ -328,11 +345,43 @@ fn log_text(entries: &[texturecraft_engine::LogEntry]) -> String {
     text
 }
 
+/// Open the current run's log in the desktop's text-file handler.
+pub(crate) fn show_log(app: &mut TextureCraftApp, _ctx: &egui::Context) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let result = match app.session_log_file.as_mut() {
+            Some(file) => file.sync(app.session.log_id, &app.session.log).map(|()| file.path.clone()),
+            None => Err(std::io::Error::other(tr("No session log file is available"))),
+        };
+        match result.and_then(|path| app.file_dialogs.show_folder(&path)) {
+            Ok(()) => {}
+            Err(error) => app.toast(trf("Could not open the log: {error}", &[("error", &error)]), true),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    export_log(app);
+}
+
 /// Help ▸ Export log...: saves the whole log to a text file chosen in a save dialog.
 pub(crate) fn export_log(app: &mut TextureCraftApp) {
     let text = log_text(app.session.log.entries());
     #[cfg(not(target_arch = "wasm32"))]
-    app.ask_file(FileDialog::save().filter(tr("Text file"), &["txt"]).file_name("texturecraft-log.txt"), Bound::App, move |app, paths| {
+    let text = if let Some(file) = &mut app.session_log_file {
+        match file.sync(app.session.log_id, &app.session.log).and_then(|()| file.text()) {
+            Ok(lines) => format!("{}{lines}", log_text(&[])),
+            Err(error) => {
+                app.toast(trf("Could not export the log: {error}", &[("error", &error)]), true);
+                return;
+            }
+        }
+    } else {
+        text
+    };
+    let backend = app.render_state.as_ref().map(|state| format!("{:?}", state.adapter.get_info().backend)).unwrap_or_else(|| "CPU".into());
+    let name =
+        format!("Log_TextureCraft_{}_{}_{}_{}.txt", env!("CARGO_PKG_VERSION"), chrono::Utc::now().format("%Y-%m-%d_%H-%M-%S"), std::env::consts::OS, backend);
+    #[cfg(not(target_arch = "wasm32"))]
+    app.ask_file(FileDialog::save().filter(tr("Text file"), &["txt"]).file_name(&name), Bound::App, move |app, paths| {
         let Some(path) = paths.first() else { return };
         match std::fs::write(path, &text) {
             Ok(()) => app.toast(trf("Exported the log to {path}", &[("path", &path.display().to_string())]), false),
@@ -340,7 +389,7 @@ pub(crate) fn export_log(app: &mut TextureCraftApp) {
         }
     });
     #[cfg(target_arch = "wasm32")]
-    match crate::web_files::download("texturecraft-log.txt", text.as_bytes()) {
+    match crate::web_files::download(&name, text.as_bytes()) {
         Ok(()) => app.toast(tr("Exported the log"), false),
         Err(e) => app.toast(trf("Could not export the log: {error}", &[("error", &e)]), true),
     }
@@ -357,7 +406,7 @@ pub fn file_dialogs_available() -> bool {
 pub fn remember(app: &mut TextureCraftApp, path: &str) {
     app.ui.recent.retain(|p| p != path);
     app.ui.recent.insert(0, path.to_string());
-    app.ui.recent.truncate(10);
+    app.ui.trim_recent();
 }
 
 /// Start a save picker in its library folder when available.
@@ -387,9 +436,7 @@ pub fn save_layout(app: &mut TextureCraftApp, mode: crate::state::Mode) {
     app.ask_file(dialog, Bound::App, move |app, paths| {
         let Some(path) = paths.first() else { return };
 
-        // The file carries both docks; the mode's own is the one in use when it is loaded
-        let mut layout = crate::UiState { recent: Vec::new(), named_layouts: Vec::new(), mode, ..app.ui.clone() };
-        layout.sync_mode_dock();
+        let layout = crate::mode_layout::ModeLayout::of(&app.ui, mode);
         let result = serde_json::to_vec_pretty(&layout)
             .map_err(|error| error.to_string())
             .and_then(|bytes| texturecraft_engine::formats::write_atomic(path, &bytes).map_err(|error| error.to_string()))
@@ -408,13 +455,10 @@ pub fn load_layout(app: &mut TextureCraftApp) {
     let dialog = FileDialog::open().title(tr("Select a UI layout file.")).filter(tr("UI layout"), &["json"]).directory(dir);
     app.ask_file(dialog, Bound::App, move |app, paths| {
         let Some(path) = paths.first() else { return };
-        let result = std::fs::read(path)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| serde_json::from_slice::<crate::UiState>(&bytes).map_err(|e| e.to_string()))
-            .map(|layout| {
-                app.ui.adopt_layout(layout);
-                trf("Loaded UI layout {path}", &[("path", &path.display())])
-            });
+        let result = std::fs::read(path).map_err(|e| e.to_string()).and_then(|bytes| crate::mode_layout::ModeLayout::read(&bytes)).map(|layout| {
+            layout.apply(&mut app.ui);
+            trf("Loaded UI layout {path}", &[("path", &path.display())])
+        });
         match result {
             Ok(msg) => app.toast(msg, false),
             Err(e) => app.toast(trf("UI layout: {error}", &[("error", &e)]), true),
@@ -472,12 +516,35 @@ pub fn load_layout(app: &mut TextureCraftApp) {
     app.toast(tr("Saving UI layouts to files is available in the desktop app"), false);
 }
 
+/// The extension of MaterialX documents (`file.importMaterialX`)
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const MATERIALX_EXT: &str = "mtlx";
+
+/// Add the MaterialX material at `path` as a layer, logging what it could not read. Returns whether it was added.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn import_materialx(app: &mut TextureCraftApp, path: &str) -> bool {
+    let Some(result) = app.run("file.importMaterialX", json!({"path": path})) else { return false };
+
+    let name = result["material"].as_str().unwrap_or_default();
+    for warning in result["warnings"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str) {
+        app.session.log.warn(texturecraft_engine::log::LIBRARY_SOURCE, format!("MaterialX {name}: {warning}"));
+    }
+    app.toast(trf("Imported {name}", &[("name", &name)]), false);
+    app.ui.dock.focus(crate::docking::Panel::Layers);
+    true
+}
+
 /// File menu actions that need dialogs. Returns true when handled.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn file_action(app: &mut TextureCraftApp, _ctx: &egui::Context, id: &str) -> bool {
     match id {
-        "file.open" => {
-            app.ask_file(FileDialog::open().filter(tr("TextureCraft project or mesh"), crate::web_files::OPEN_EXTS), Bound::App, |app, paths| {
+        "file.open" | "project.sample" => {
+            let dialog = if id == "project.sample" {
+                FileDialog::open().title(tr("Open Sample Project")).filter(tr("TextureCraft project"), &[texturecraft_engine::core::PROJECT_EXT])
+            } else {
+                FileDialog::open().filter(tr("TextureCraft project or mesh"), crate::web_files::OPEN_EXTS)
+            };
+            app.ask_file(dialog, Bound::App, |app, paths| {
                 if let Some(path) = paths.first() {
                     open_path(app, &path.display().to_string());
                 }
@@ -512,16 +579,9 @@ pub fn file_action(app: &mut TextureCraftApp, _ctx: &egui::Context, id: &str) ->
             true
         }
         "file.importMaterialX" => {
-            app.ask_file(FileDialog::open().filter(tr("MaterialX materials"), &["mtlx"]), Bound::Project, |app, paths| {
-                if let Some(path) = paths.first()
-                    && let Some(result) = app.run("file.importMaterialX", json!({"path": path.display().to_string()}))
-                {
-                    let name = result["material"].as_str().unwrap_or_default();
-                    for warning in result["warnings"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str) {
-                        app.session.log.warn(texturecraft_engine::log::LIBRARY_SOURCE, format!("MaterialX {name}: {warning}"));
-                    }
-                    app.toast(trf("Imported {name}", &[("name", &name)]), false);
-                    app.ui.dock.focus(crate::docking::Panel::Layers);
+            app.ask_file(FileDialog::open().filter(tr("MaterialX materials"), &[MATERIALX_EXT]), Bound::Project, |app, paths| {
+                if let Some(path) = paths.first() {
+                    import_materialx(app, &path.display().to_string());
                 }
             });
             true
@@ -623,6 +683,7 @@ pub fn open_path(app: &mut TextureCraftApp, path: &str) {
 pub fn file_action(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) -> bool {
     match id {
         "file.open" => crate::web_files::open(ctx),
+        "project.sample" => crate::web_files::open_sample_project(ctx),
         "file.importResources" | "resource.import" => crate::web_files::import_images(ctx),
         "material.load" => crate::web_files::import_material(ctx),
         "file.save" | "file.saveAs" | "file.saveCopy" => crate::web_files::save_project(app),

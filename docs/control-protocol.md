@@ -225,20 +225,31 @@ keeps its state in a throwaway file.
 | `command.list` | `{filter?}` | `[{id, label, menu, shortcut, params, enabled}]` |
 | `session.inspect` | | project, mesh, texture sets, layer stack, tool, camera, display, history, `memoryBytes` (paint, composites, band cache and UV geometry), `geometryBytes` (UV lookup, covered tiles and materialized display padding) |
 | `ui.inspect` | | UI state, viewport rect, fps, bake progress (`baking`, 0..1), the running bake's stage (`bakeStatus`, e.g. "Baking Ambient Occlusion (2/4)") and live preview (`bakePreview`, see *Live bake preview*), toasts, `titleBar` (who draws the title bar this run: `app`, `integrated` on macOS, or `system`) |
-| `ui.menu.list` | | the menu catalog: `{menu, submenu, label, id, shortcut, implemented, enabled}` |
-| `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question; `file.exportMesh` opens the Mesh Export Options prompt, whose Export asks for the file; `ui.view.export` opens the right bar's Export panel). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a panel layout saved under Window > Layouts (panels only; mode, zoom and wireframes stay) and errors when no layout has that name. `ui.layout.save` still saves the active mode; `ui.layout.save.painting`, `ui.layout.save.rendering` and `ui.layout.save.baking` ask where to save that mode's layout as a JSON file, `ui.layout.load` asks for one to load ("Select a UI layout file."); `ui.toolbar.docks` and `ui.toolbar.tools` show or hide the right bar and the tool shelf (`ui.toolbar.plugins`, `ui.view.pythonConsole` and `ui.view.onlineAssets` are listed as not implemented and not enabled); `ui.view.renderer` toggles the Renderer Settings panel (Rendering mode only). `{"id": "ui.layout.swap"}` swaps the 3D and 2D views of the split layout (F4) |
-| `ui.menu.invoke` id `ui.saveAsTemplate` | `{id}` | File > More save options > Save as template... opens a save dialog in the user templates folder. The choice supplies the file path and template name to `project.template.save`. `ui.saveReduced` (Save and reduce file size) is listed as not implemented and not enabled |
-| `ui.menu.invoke` ids `ui.help.releaseNotes`, `ui.help.exportLog` | `{id}` | Help > Release notes... opens the releases page in the browser; Help > Export log... exports the session log with each entry’s recorded UTC time, severity and source (a save dialog on desktop, a download on the web) |
-| `ui.menu.invoke` id `ui.wireframe` | `{id}` | Show mesh wireframe: shows or hides the mesh wireframe in the 3D and 2D views (the Display Settings check box). It has no menu entry and no default key; bind it in Settings > Shortcuts. The key bindings `camera.next` and `camera.previous` (Select next camera `>`, Select previous camera `<`) and `ui.mode.bake` (Ctrl+Shift+B) run the same commands as before |
+| `ui.menu.list` | | the menu catalog: `{menu, submenu, label, id, shortcut, implemented, enabled, checked}` |
+| `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question; `file.exportMesh` opens the Mesh Export Options prompt, whose Export asks for the file; `ui.view.export` opens the right bar's Export panel). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a legacy named panel layout (still accessible through assigned shortcuts) (panels only; mode, zoom and wireframes stay) and errors when no layout has that name. `ui.layout.save` still saves the active mode; `ui.layout.save.painting`, `ui.layout.save.rendering` and `ui.layout.save.baking` ask where to save only that mode's panels and view arrangement as a JSON file (without preferences or recent projects); loading preserves the other modes, `ui.layout.load` asks for one to load ("Load UI Layout"); `ui.toolbar.docks` and `ui.toolbar.tools` show or hide the right bar and the painting tools; the disabled Snooze Autosave and Resources Updater buttons stay visible when Tools is off; `ui.view.renderer` toggles the Renderer Settings panel (Rendering Mode only). `{"id": "ui.layout.swap"}` swaps the 3D and 2D views of the split layout (F4) |
+| `ui.menu.invoke` id `project.sample` | `{id}` | File > Open Sample Project opens a file picker for a `.tcraft` project. The direct `project.sample` engine command still creates the generated sample for automation. |
+| `ui.menu.invoke` id `ui.saveAsTemplate` | `{id}` | File > More Save Options > Save As Template opens a save dialog in the user templates folder. The choice supplies the file path and template name to `project.template.save`. `ui.saveReduced` (Save and Reduce File Size) is listed as not implemented and not enabled |
+| `ui.menu.invoke` ids `ui.help.releaseNotes`, `ui.help.showLog`, `ui.help.exportLog` | `{id}` | Help > Release Notes opens the releases page in the browser; Help > Show Log opens the current desktop run's rolling `log.txt` in the system text-file handler; Help > Export Log exports the session log with each entry’s recorded UTC time, severity and source (a save dialog on desktop with a `Log_TextureCraft_<version>_<date>_<os>_<gpuMode>.txt` name, a download on the web) |
+| `ui.menu.invoke` id `ui.wireframe` | `{id}` | Show mesh wireframe: shows or hides the mesh wireframe in the 3D and 2D views (the Display Settings check box). It has no menu entry and no default key; bind it in Settings > Shortcuts. The key bindings `camera.next` and `camera.previous` (Select next camera `>`, Select previous camera `<`) and `ui.mode.bake` (F8) run the same commands as before |
 | `ui.reset` | | resets the panels, view layout, zoom and every other view setting at once, without the question the Reset UI menu item asks; settings and shortcuts stay |
 | `ui.bake.start` | `{ts?: index \| [indices]}` (default: the sets ticked in Bake mode) | Opens Bake mode and bakes in the background like the Bake button: the 3D view shows the maps landing on the model as they finish (see *Live bake preview*). → the `bake.preview` state. Errors when a bake is already running |
 | `ui.bake.cancel` | | Stops the running bake; the set being baked keeps the maps it had, sets already finished stay applied, and the previous view mode comes back |
-| `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History`, `Log`, `Export` and `Renderer` (a floating window holding one right-bar panel is that panel undocked); `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds), `log_channel` the Log panel's tab (`General` or `Assets`) | `null` |
+| `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History`, `Log`, `BakingLog`, `MeshMapBakers`, `BakeMaps`, `BakeSettings`, `Export` and `Renderer` (a floating window holding one right-bar panel is that panel undocked); `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds), `log_channel` the Log panel's tab (`General` or `Assets`) | `null` |
 | `viewport.screenshot` | `{view?: "3d" \| "2d"}` | `{width, height, png}` (PNG, base64) |
 | `ui.screenshot` | | `{width, height, png}` of the whole window, after the next frame |
 | `ui.resize` | `{width, height}` | Sets the window's inner size in points (640–7680), leaving maximized state; for recordings and screenshots at a fixed size |
 | `debug.paintTest` | `{from: [x, y], to: [x, y], frames?: 120}` | Paints a straight stroke through the real frame loop (viewport pixels, one point per frame) for performance work |
 | `debug.frames` | | Frame timing since the last call (then cleared): `{frames, intervalMs, uiMs, syncMs, logicMs}` each `{avg, p95, max}`; `syncMs` is compositing plus display tile conversion, `logicMs` input, control requests and scripted strokes before the UI is built; `worst` breaks down the slowest frame; `strokeEnd` lists the frame that committed a `debug.paintTest` stroke and the one after it (null without one) |
+
+The empty-project menus keep Recent Projects openable with Clear disabled when the list is empty.
+`ui.recent.clear` clears that list. More Save Options is disabled until a project is open.
+Help > Shortcuts list opens Settings on its Shortcuts page. Window > Reset UI restores the
+Assets, Layers, Properties, Texture Set List and Texture Set Settings panels and both toolbars.
+Baking Log and the bake/render settings views are disabled without a project. Import resources
+can open its dialog on desktop without a project; importing still requires an open project,
+and the dialog explains that asset-library import is not available yet.
+
+Settings > General > Recent Projects limit controls the retained history (default 10, range 0–100; 0 disables history). Automation uses `ui.set {"prefs":{"recent_projects_limit":10}}`. A lower limit trims the oldest paths immediately.
 
 Example session:
 
@@ -513,9 +524,10 @@ Maps are found by file name, case-insensitively, from the last known word in the
   import is an error that changes nothing. `maps` describes detection; `channels` and `resources`
   describe the successful import. Scan validates import options without decoding pixels.
 
-In the app: File › Import PBR texture folder... or drop a folder, a `.zip` or several map files on the
-window. The dialog shows the maps found, lets you pick between candidates, set the normal convention and
-projection, and keep the material in the library (shelf › Materials).
+In the app: drop a folder, a `.zip` or several map files on the window. The dialog shows the maps found,
+lets you pick between candidates, set the normal convention and projection, and keep the material in the
+library (shelf › Materials). A `.mtlx` added in File › Import Resources is imported as `file.importMaterialX`
+does it.
 
 ## Smart masks
 
@@ -579,13 +591,13 @@ In the app, `viewport.frame` also resets the 2D view (pan, zoom and rotation), a
 
 `camera.view {view}` looks at the mesh from one side (`front` from +Z, `back`, `left` from -X,
 `right`, `top` and `bottom` at the orbit's ±89° pitch limit) and frames it; the projection stays.
-`camera.view.front` … `camera.view.bottom` do the same without params (Viewport menu, no default
+`camera.view.front` … `camera.view.bottom` do the same without params (no default
 shortcut, bindable in Settings ▸ Shortcuts). `camera.perspective` (F5) and `camera.orthographic` (F6)
 change only the projection; position and rotation stay. None of them is an undo step. In the 3D
 view, Alt+Shift+left drag orbits in 90° steps.
 
 `camera.rotation {mode: constrained|free}` (or `camera.rotation.constrained` / `camera.rotation.free`,
-Viewport menu and the rotation dropdown of the top bar) picks the orbit: constrained (the default) keeps
+the rotation dropdown of the top bar) picks the orbit: constrained (the default) keeps
 the horizon level and stops at the poles; free is a trackball that turns the camera about its own axes,
 so the model can be turned over and rolled. `camera.get` shows it as `rotation`; `camera.set` takes
 `rotation` too. Switching keeps the direction of view; going back to constrained drops the roll.
