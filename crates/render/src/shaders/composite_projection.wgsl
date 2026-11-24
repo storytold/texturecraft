@@ -824,7 +824,8 @@ fn p1_footprints(op: Operation, samples: P1Samples, uv: vec2<f32>, neighbours: P
     let kind = param_word(op, P1_KIND);
     if kind == P1_KIND_UV || kind == P1_KIND_UV_TILE {
         // The current tile's affine mapping, even where a neighbour wraps or is uncovered
-        let uv_step = 1.0 / source;
+        // P8: in a UV tile atlas, the mesh UV step of the texel's own tile
+        let uv_step = udim_mesh_uv_step(vec2<u32>(uv * source));
         var span = max(uv_step.x * size.x, uv_step.y * size.y);
         if kind == P1_KIND_UV {
             let scale = p1_vec2(op, P1_SCALE);
@@ -851,7 +852,8 @@ fn p1_footprints(op: Operation, samples: P1Samples, uv: vec2<f32>, neighbours: P
             continue;
         }
 
-        var coords = P1Coords((vec2<f32>(next_pixel) + 0.5) / source, neighbour.position, neighbour.normal);
+        // P8: the neighbour's mesh UV on a UV tile atlas
+        var coords = P1Coords(udim_mesh_uv((vec2<f32>(next_pixel) + 0.5) / source), neighbour.position, neighbour.normal);
         if (op.ext.y & P1_FRAMED) != 0u {
             let framed = p1_framed(op, p1_world(neighbour.position), neighbour.normal);
             if framed.w == 0.0 {
@@ -1010,7 +1012,8 @@ fn p1_copied(surface: Surface, copy: P1Copy) -> Surface {
 // The fill sampled once through `copy`: its value and its coverage (compose Texel::fill_texel)
 fn p1_fill_once(op: Operation, uv: vec2<f32>, surface: Surface, neighbours: P1Neighbours, copy: P1Copy) -> vec4<f32> {
     let copied = p1_copied(surface, copy);
-    let coords = P1Coords(uv, copied.position, copied.normal);
+    // P8: projections see the mesh's own UV on a UV tile atlas, so they repeat per tile
+    let coords = P1Coords(udim_mesh_uv(uv), copied.position, copied.normal);
     let projected = p1_projected(op, coords, copied);
     let kind = op.ids.y;
     var rgb: vec3<f32>;

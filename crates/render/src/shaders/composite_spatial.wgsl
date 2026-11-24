@@ -45,15 +45,19 @@ fn field_local(pixel: vec2<u32>) -> vec2<u32> {
 // The first word of stage `slot` at source pixel `pixel`, or u32 max outside its field. A
 // whole-set stage (whole_slots) reads the pre-pass result at the pixel, also in a periodic
 // prepare pass; any other stage its band field.
-fn slot_word(slot: u32, pixel: vec2<u32>) -> u32 {
+fn slot_word(stage_slot: u32, pixel: vec2<u32>) -> u32 {
+    // P8: a texel of a smaller UV tile reads its tile scale's level stage
+    let slot = udim_level_slot(stage_slot, pixel);
     if params.whole_slots.x != 0u {
         for (var k = 0u; k < 4u; k++) {
-            if params.whole_slots[k] == slot + 1u {
+            if params.whole_slots[k] == stage_slot + 1u {
                 let local = vec2<i32>(pixel) - bitcast<vec2<i32>>(params.whole_rect.xy);
                 if any(local < vec2(0)) || any(local >= vec2<i32>(params.whole_rect.zw)) {
                     return 0xffffffffu;
                 }
-                return params.whole_bases[k] + (u32(local.y) * params.whole_rect.z + u32(local.x)) * params.field_layout.x;
+                // P8: a level stage's result follows its base stage's
+                let result = (slot - stage_slot) * params.whole_rect.z * params.whole_rect.w;
+                return params.whole_bases[k] + (result + u32(local.y) * params.whole_rect.z + u32(local.x)) * params.field_layout.x;
             }
         }
     }

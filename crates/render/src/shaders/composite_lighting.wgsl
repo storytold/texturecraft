@@ -82,20 +82,34 @@ fn lighting_baked_height(pixel: vec2<u32>) -> f32 {
     return bitcast<f32>(baked_block_at(pixel, 1u).x);
 }
 
-// The baked height's change per UV unit along U and V at `pixel`, as the CPU's height_slope
-fn lighting_height_slope(pixel: vec2<u32>) -> vec2<f32> {
-    let size = params.source.xy;
-    let low = max(pixel, vec2(1u)) - 1u;
-    let high = min(pixel + 1u, size - 1u);
-    let across = lighting_baked_height(vec2(high.x, pixel.y)) - lighting_baked_height(vec2(low.x, pixel.y));
-    let down = lighting_baked_height(vec2(pixel.x, high.y)) - lighting_baked_height(vec2(pixel.x, low.y));
-    return vec2(across / f32(max(high.x - low.x, 1u)) * f32(size.x), down / f32(max(high.y - low.y, 1u)) * f32(size.y));
+// The baked height's change per UV unit along U and V at `pixel`, as the CPU's height_slope, and
+// 1 in z where there is one: within the texel's UV tile (P8: a UV tile atlas's block, or the
+// part of it a smaller tile fills), where every height it reads is baked
+fn lighting_height_slope(pixel: vec2<u32>) -> vec3<f32> {
+    let frame = udim_tile_frame(pixel);
+    let last = min(frame.xy + max(frame.zw, vec2(1u)) - 1u, params.source.xy - 1u);
+    if any(pixel > last) {
+        return vec3(0.0);
+    }
+
+    let low = max(pixel, frame.xy + 1u) - 1u;
+    let high = min(pixel + 1u, last);
+    var taps = array<vec2<u32>, 4>(vec2(high.x, pixel.y), vec2(low.x, pixel.y), vec2(pixel.x, high.y), vec2(pixel.x, low.y));
+    for (var tap = 0u; tap < 4u; tap++) {
+        if !udim_bake_valid(taps[tap]) {
+            return vec3(0.0);
+        }
+    }
+    let across = lighting_baked_height(taps[0]) - lighting_baked_height(taps[1]);
+    let down = lighting_baked_height(taps[2]) - lighting_baked_height(taps[3]);
+    return vec3(across / f32(max(high.x - low.x, 1u)) * f32(frame.z), down / f32(max(high.y - low.y, 1u)) * f32(frame.w), 1.0);
 }
 
 // The baked world normal (the mesh's without one) tilted along the surface tangent by the baked height's slope times `relief`, as the CPU's detail_normal
 fn lighting_detail_normal(texel: LayerTexel, relief: f32) -> vec3<f32> {
     var normal = texel.surface.normal;
-    if bake_has(BAKED_WORLD_NORMAL) {
+    // P8: no world normal where a smaller UV tile leaves its block empty
+    if bake_has(BAKED_WORLD_NORMAL) && udim_bake_valid(texel.pixel) {
         let detail = bitcast<vec3<f32>>(baked_block_at(texel.pixel, 1u).yzw) * 2.0 - 1.0;
         let length_squared = dot(detail, detail);
         if length_squared > LIGHTING_MIN_NORMAL_LENGTH_SQUARED {
@@ -107,7 +121,7 @@ fn lighting_detail_normal(texel: LayerTexel, relief: f32) -> vec3<f32> {
     }
 
     let slope = lighting_height_slope(texel.pixel);
-    if !lighting_finite(slope.x) || !lighting_finite(slope.y) {
+    if slope.z == 0.0 || !lighting_finite(slope.x) || !lighting_finite(slope.y) {
         return normal;
     }
     let tangent = texel.surface.tangent.xyz;

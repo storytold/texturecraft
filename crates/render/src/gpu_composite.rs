@@ -95,25 +95,42 @@ const MAX_ID_UPLOAD_BYTES: usize = 64 << 20;
 #[derive(Debug)]
 struct BakedInputs {
     width: u32,
+    /// The maps' common height; with maps of different heights ([`Self::separate`]) the
+    /// Curvature's, else the first baked map's
     height: u32,
     maps: [Option<Arc<Vec<f32>>>; BAKE_MAPS.len()],
     /// The second row block's maps ([`BAKE_ROW_MAPS`]), only in programs that read them
     rows: [Option<Arc<Vec<f32>>>; BAKE_ROW_MAPS.len()],
+    /// P8: each map's height in texels, [`BAKE_MAPS`] then [`BAKE_ROW_MAPS`] (0 where not baked)
+    heights: [u32; SEPARATE_MAPS],
 }
 
+/// P8: the maps of the bake texture with maps of different heights, [`BAKE_MAPS`] then
+/// [`BAKE_ROW_MAPS`], as `udim_separate_bake` in WGSL numbers them
+const SEPARATE_MAPS: usize = BAKE_MAPS.len() + BAKE_ROW_MAPS.len();
+/// P8: the order their rows take: the Curvature's first, where the curvature detail sizes read them
+const SEPARATE_ORDER: [usize; SEPARATE_MAPS] = [2, 0, 1, 3, 4, 5];
+
 impl BakedInputs {
-    /// The bakes a program reads: the built-in maps, and with `rows` the second row block's
+    /// The bakes a program reads: the built-in maps, and with `rows` the second row block's. Maps
+    /// of different heights each keep their own (P8, [`Self::separate`]).
     fn new(baked: &BakedMaps, rows: bool) -> Result<Option<Self>, &'static str> {
         let present = |map: &BakedMap| baked.maps.get(map).filter(|data| !data.is_empty()).cloned();
         let maps = BAKE_MAPS.map(|map| present(&map));
         let rows = BAKE_ROW_MAPS.map(|map| present(&map).filter(|_| rows));
         let all = BAKE_MAPS.iter().zip(&maps).chain(BAKE_ROW_MAPS.iter().zip(&rows));
         let Some(first) = all.clone().find_map(|(&map, data)| data.as_ref().map(|_| map)) else { return Ok(None) };
-        let height = baked.height(first);
-        if height == 0 || baked.resolution == 0 || all.into_iter().any(|(&map, data)| data.is_some() && baked.height(map) != height) {
-            return Err("The baked maps have different layouts and use CPU compositing.");
+        if baked.resolution == 0 || all.clone().any(|(&map, data)| data.is_some() && baked.height(map) == 0) {
+            return Err("A baked map has no whole row of texels and uses CPU compositing.");
         }
-        Ok(Some(Self { width: baked.resolution, height, maps, rows }))
+
+        let mut heights = [0; SEPARATE_MAPS];
+        for (height, (&map, data)) in heights.iter_mut().zip(all) {
+            *height = if data.is_some() { baked.height(map) } else { 0 };
+        }
+        let curvature = baked.height(BakedMap::Curvature);
+        let height = if maps[2].is_some() && curvature != 0 { curvature } else { baked.height(first) };
+        Ok(Some(Self { width: baked.resolution, height, maps, rows, heights }))
     }
 
     /// Row blocks of the bake texture: the built-in maps', and the second block's when a map of it is baked
@@ -122,11 +139,99 @@ impl BakedInputs {
     }
 
     /// The band uniform's bake words (`params.id_bake.zw`): rows per block (0: one block, the
-    /// whole texture) and the second block's presence bits
+    /// whole texture; the Curvature's rows with maps of different heights) and the second
+    /// block's presence bits
     fn uniform_words(&self) -> [u32; 2] {
         let present = self.rows.iter().enumerate().filter(|(_, data)| data.is_some()).fold(0, |bits, (index, _)| bits | 1 << index);
-        [if self.blocks() > 1 { self.height } else { 0 }, present]
+        [if self.blocks() > 1 || self.separate() { self.height } else { 0 }, present]
     }
+
+    /// P8: whether the baked maps have different heights. Each height's maps then take rows of
+    /// their own, with a header row after them ([`Self::separate_layout`]).
+    fn separate(&self) -> bool {
+        let mut heights = self.heights.iter().filter(|&&height| height != 0);
+        let first = heights.next();
+        heights.any(|height| Some(height) != first)
+    }
+
+    /// P8: the rows of baked maps of different heights: each map's first row and height
+    /// ([`BAKE_MAPS`] then [`BAKE_ROW_MAPS`], no rows where not baked), and the header row after
+    /// them. The built-in maps of one height share rows, the row maps of one height too.
+    fn separate_layout(&self) -> ([[u32; 2]; SEPARATE_MAPS], u32) {
+        let mut groups: Vec<((bool, u32), u32)> = Vec::new();
+        let mut next = 0u32;
+        let mut entries = [[0; 2]; SEPARATE_MAPS];
+        for index in SEPARATE_ORDER {
+            let height = self.heights[index];
+            if height == 0 {
+                continue;
+            }
+            let key = (index >= BAKE_MAPS.len(), height);
+            let first = match groups.iter().find(|(group, _)| *group == key) {
+                Some(&(_, first)) => first,
+                None => {
+                    groups.push((key, next));
+                    next = next.saturating_add(height);
+                    next - height
+                }
+            };
+            entries[index] = [first, height];
+        }
+        (entries, next)
+    }
+}
+
+/// P8: upload baked maps of different heights ([`BakedInputs::separate_layout`]): each height's
+/// maps in rows of their own, laid as the one-height texture lays them (a map of another height
+/// keeps its fallback there), then each map's first row and height in the header rows, texel
+/// `map` (`udim_separate_bake` in WGSL).
+fn write_separate_bakes(queue: &wgpu::Queue, texture: &wgpu::Texture, baked: &BakedInputs, (entries, header): ([[u32; 2]; SEPARATE_MAPS], u32)) {
+    let width = baked.width;
+    let mut written: Vec<u32> = Vec::new();
+    for (index, &[first, height]) in entries.iter().enumerate() {
+        if height == 0 || written.contains(&first) {
+            continue;
+        }
+        written.push(first);
+        let row_maps = index >= BAKE_MAPS.len();
+        let own = |map: usize| entries[map] == [first, height];
+        for top in (0..height).step_by(ROWS as usize) {
+            let end = (top + ROWS).min(height);
+            let indices = top as usize * width as usize..end as usize * width as usize;
+            let texels: Vec<[u32; 4]> = if row_maps {
+                // Height in x, the stored world normal in yzw; zeros where a map is not baked here
+                let row = |map: usize, i: usize, component: usize| {
+                    let components = BAKE_ROW_MAPS[map].components();
+                    let data = baked.rows[map].as_ref().filter(|_| own(BAKE_MAPS.len() + map));
+                    data.and_then(|data| data.get(i * components + component).copied()).unwrap_or(0.0).to_bits()
+                };
+                indices.into_par_iter().map(|i| [row(0, i, 0), row(1, i, 0), row(1, i, 1), row(1, i, 2)]).collect()
+            } else {
+                let value = |map: usize, i: usize, fallback: f32| {
+                    baked.maps[map].as_ref().filter(|_| own(map)).and_then(|data| data.get(i).copied()).unwrap_or(fallback)
+                };
+                indices
+                    .into_par_iter()
+                    .map(|i| {
+                        let normal = if baked.maps[1].is_some() && own(1) {
+                            encode_baked_normal([value(1, i * 3, 0.5), value(1, i * 3 + 1, 0.5), value(1, i * 3 + 2, 1.0)])
+                        } else {
+                            0
+                        };
+                        [value(0, i, 1.0).to_bits(), value(2, i, 0.5).to_bits(), value(3, i, 1.0).to_bits(), normal]
+                    })
+                    .collect()
+            };
+            write_input(queue, texture, (width, end - top), (first + top, 0), &texels);
+        }
+    }
+
+    let header_rows = SEPARATE_MAPS.div_ceil(width.max(1) as usize) as u32;
+    let mut texels = vec![[0u32; 4]; width as usize * header_rows as usize];
+    for (texel, [first, height]) in texels.iter_mut().zip(entries) {
+        *texel = [first, height, 0, 0];
+    }
+    write_input(queue, texture, (width, header_rows), (header, 0), &texels);
 }
 
 #[derive(Debug)]
@@ -254,7 +359,20 @@ impl GeometryMasks {
 }
 
 struct ProceduralInputs {
+    /// Texels per side of a UV tile at the base stage's scale (the set's resolution, or a UV
+    /// tile atlas's block)
     resolution: u32,
+    /// The set's own resolution, the texture set size of `OutputResolution::output_size`
+    texture_set: u32,
+    /// The working atlas's longest side, which caps filter radii
+    longest_side: u32,
+    /// P8: a UV tile atlas's block side, where a whole-tile stage finds its tile
+    block: u32,
+    /// P8: the tile resolutions of a UV tile atlas's further scales (`udim::UdimLayout::levels`),
+    /// each a neighbourhood stage of its own after the base stage
+    levels: Vec<u32>,
+    /// P8: each generator stage's (filter, cell) at those further scales, by generator stage
+    generator_levels: Vec<Vec<(Option<NeighbourhoodFilter>, u32)>>,
     ramp_words: Vec<u32>,
     curvature_sizes: [bool; CurvatureDetail::BLURRED_SIZES],
     filters: Vec<(Filter, f32)>,
@@ -313,6 +431,11 @@ impl ProceduralInputs {
     fn new(resolution: u32) -> Self {
         Self {
             resolution,
+            texture_set: resolution,
+            longest_side: resolution,
+            block: resolution,
+            levels: Vec::new(),
+            generator_levels: Vec::new(),
             ramp_words: Vec::new(),
             curvature_sizes: [false; CurvatureDetail::BLURRED_SIZES],
             filters: Vec::new(),
@@ -401,7 +524,7 @@ impl ProceduralInputs {
     /// GPU has no stage for `filter` or its size reaches nothing.
     #[allow(dead_code)] // Used by the GPU port packages
     fn precede_with_stage(&mut self, filter: &Filter, opacity: f32) -> Option<()> {
-        NeighbourhoodFilter::new(filter, self.resolution, self.resolution, opacity, None)?;
+        NeighbourhoodFilter::new(filter, self.resolution, self.longest_side, opacity, None)?;
         let ids = [0, NEIGHBOURHOOD_OPCODE, u32::try_from(self.filters.len()).ok()?, 0];
         self.filters.push((filter.clone(), opacity));
         self.preceding_stage = Some(Operation { ids, low: [0.0, 0.0, 0.0, opacity.clamp(0.0, 1.0)], ..Operation::zeroed() });
@@ -485,6 +608,10 @@ struct FilterStage {
     view: u32,
     /// The prepare pass's `mask_view` (`FilterPlan::add_lit_mask_views`), zero for most stages
     mask_view: [u32; 4],
+    /// P8: 0 for a stage of its own; `n` for the stage of the base stage `n` slots before it at a
+    /// UV tile atlas's level `n` (a smaller tile scale), whose output the texels of that level's
+    /// blocks read instead (`udim_level_slot` in WGSL)
+    level: u32,
 }
 
 /// The whole-set pre-pass of a program: the stages it evaluates (the whole-set stages and the
@@ -494,6 +621,9 @@ struct FilterStage {
 struct WholeSet {
     stages: Vec<usize>,
     outputs: Vec<usize>,
+    /// The outputs the band uniform names (indices into `outputs`): every output but a level
+    /// stage, whose results follow its base stage's (P8)
+    entries: Vec<usize>,
     /// The largest pass's reach
     reach: u32,
     /// One pass per stack, run one after another in the same working space
@@ -569,6 +699,11 @@ const MAX_WHOLE_SET_STAGES: usize = 4;
 
 impl FilterStage {
     fn reach(&self) -> u32 {
+        // A level stage runs beside its base stage, which reaches at least as far
+        if self.level != 0 {
+            return 0;
+        }
+
         self.filter.map_or(0, NeighbourhoodFilter::reach).saturating_add(if self.cell > 1 { self.cell * 2 } else { 0 })
     }
 
@@ -676,8 +811,7 @@ impl FilterPlan {
             let mut draw_reach = BTreeMap::<(u32, bool), u32>::new();
             for stage in &plan.stages {
                 let reach = draw_reach.entry((stage.layer, stage.preceding & MASK_STAGE != 0)).or_default();
-                *reach =
-                    reach.saturating_add(stage.filter.map_or(0, NeighbourhoodFilter::reach)).saturating_add(if stage.cell > 1 { stage.cell * 2 } else { 0 });
+                *reach = reach.saturating_add(stage.reach());
             }
             let across_layers = inputs.anchors.draw_ranges.iter().fold(0u32, |reach, range| {
                 let layer = draw_reach.range((range.start, false)..(range.end, false)).map(|(_, reach)| *reach).max().unwrap_or(0);
@@ -692,8 +826,11 @@ impl FilterPlan {
         }
         // The pre-pass resumes no anchor reads, and the band uniform addresses a few outputs
         let anchors = plan.stages.iter().any(FilterStage::anchors);
-        for (index, stage) in plan.stages.iter_mut().filter(|stage| stage.whole).enumerate() {
-            stage.whole = !anchors && index < MAX_WHOLE_SET_STAGES;
+        let mut entries = 0;
+        for stage in plan.stages.iter_mut().filter(|stage| stage.whole) {
+            // P8: a stage's level stages share its entry, their results right after its own
+            entries += usize::from(stage.level == 0);
+            stage.whole = !anchors && entries <= MAX_WHOLE_SET_STAGES;
         }
         plan
     }
@@ -736,7 +873,8 @@ impl FilterPlan {
         let mut stages: Vec<usize> = passes.iter().flat_map(|pass| pass.stages.iter().copied()).collect();
         stages.sort_unstable();
         let reach = passes.iter().map(|pass| pass.reach).max().unwrap_or(0);
-        Some(WholeSet { stages, outputs, reach, passes })
+        let entries = outputs.iter().enumerate().filter(|&(_, &output)| self.stages[output].level == 0).map(|(index, _)| index).collect();
+        Some(WholeSet { stages, outputs, entries, reach, passes })
     }
 
     /// The halo of a band: every stack's reach, without the stages the whole-set pre-pass
@@ -827,6 +965,7 @@ impl FilterPlan {
                         whole: false,
                         view: 0,
                         mask_view: [0; 4],
+                        level: 0,
                     });
                     self.stages.len() as u32
                 });
@@ -892,6 +1031,7 @@ impl FilterPlan {
             whole: false,
             view,
             mask_view: [0; 4],
+            level: 0,
         });
         self.stages.len() as u32
     }
@@ -981,6 +1121,7 @@ impl FilterPlan {
                 whole: false,
                 view: 0,
                 mask_view: [0; 4],
+                level: 0,
             });
         }
     }
@@ -1012,7 +1153,8 @@ impl FilterPlan {
                 continue;
             }
             if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&effect.ids[1]) && effect.spatial[1] != 0 {
-                let (filter, cell) = inputs.generator_stages[effect.spatial[1] as usize - 1];
+                let generator = effect.spatial[1] as usize - 1;
+                let (filter, cell) = inputs.generator_stages[generator];
                 // Relative to the stack's first stage, as a mask stack's fields are read
                 // (`layer_mask` adds the layer's mask base, `spatial[2]`)
                 effect.spatial[1] = (self.stages.len() - first) as u32 + 1;
@@ -1020,27 +1162,34 @@ impl FilterPlan {
                 if cell > 1 {
                     reach = reach.saturating_add(cell * 2);
                 }
-                self.stages.push(FilterStage {
-                    layer,
-                    preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE,
-                    filter,
-                    cell,
-                    anchor: None,
-                    input: 0,
-                    input_kind: 0,
-                    input2: 0,
-                    wrap: false,
-                    whole: false,
-                    view: 0,
-                    mask_view: [0; 4],
-                });
+                // P8: the generator at each further UV tile scale follows its base stage
+                let levels = inputs.generator_levels.get(generator).map_or(&[][..], Vec::as_slice);
+                for (level, &(filter, cell)) in std::iter::once(&(filter, cell)).chain(levels).enumerate() {
+                    self.stages.push(FilterStage {
+                        layer,
+                        preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE,
+                        filter,
+                        cell,
+                        anchor: None,
+                        input: 0,
+                        input_kind: 0,
+                        input2: 0,
+                        wrap: false,
+                        whole: false,
+                        view: 0,
+                        mask_view: [0; 4],
+                        level: level as u32,
+                    });
+                }
                 continue;
             }
             if effect.ids[1] != NEIGHBOURHOOD_OPCODE {
                 continue;
             }
-            let (filter, opacity) = &inputs.filters[effect.ids[2] as usize];
-            let Some(filter) = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, *opacity, channel) else { continue };
+            let (effect_filter, opacity) = &inputs.filters[effect.ids[2] as usize];
+            let Some(filter) = NeighbourhoodFilter::new(effect_filter, inputs.resolution, inputs.longest_side, *opacity, channel) else { continue };
+            // P8: the same filter at each further UV tile scale, each a stage after this one
+            let level_filters = udim::level_filters(effect_filter, filter, (*opacity, channel), inputs);
             let slot = self.stages.len();
             let whole = filter.whole_set(inputs.resolution);
             effect.spatial[0] = (slot - first) as u32;
@@ -1061,20 +1210,23 @@ impl FilterPlan {
             // P4: Blur and Bevel with Wrap read the set periodically past its edges
             let wrap = gpu_neighbourhood::box_family::wraps(filter);
             let input2 = effect.effects[2];
-            self.stages.push(FilterStage {
-                layer,
-                preceding,
-                filter: Some(filter),
-                cell: 1,
-                anchor: None,
-                input,
-                input_kind,
-                input2,
-                wrap,
-                whole,
-                view: 0,
-                mask_view: [0; 4],
-            });
+            for (level, filter) in std::iter::once(filter).chain(level_filters).map(Some).enumerate() {
+                self.stages.push(FilterStage {
+                    layer,
+                    preceding,
+                    filter,
+                    cell: 1,
+                    anchor: None,
+                    input,
+                    input_kind,
+                    input2,
+                    wrap,
+                    whole,
+                    view: 0,
+                    mask_view: [0; 4],
+                    level: level as u32,
+                });
+            }
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
@@ -1320,6 +1472,10 @@ pub struct CompositeProgram {
     environment: Option<LateEnvironment>,
     /// Upload the second bake row block (`ProceduralInputs::read_bake_rows`)
     bake_rows: bool,
+    /// P8: the side-table record of a UV tile atlas (`udim::bind`), 0 for a classic set
+    udim: u32,
+    /// P8: the UV tile atlas's blocks, which say where a level stage has texels to filter
+    udim_layout: Option<udim::UdimLayout>,
 }
 
 /// A program's late-bound environment words: where they start in the side table, the display
@@ -1530,6 +1686,9 @@ impl CompositeProgram {
         let mut tile_patterns = TilePatterns::default();
         let mut effects = Vec::new();
         let mut procedural = ProceduralInputs::new(set.resolution);
+        // P8: a UV tile atlas's block, its tile scales and the set's own resolution
+        let layout = udim::UdimLayout::of(set);
+        udim::prepare(layout.as_ref(), &mut procedural);
         let mut geometry = GeometryMasks::default();
         let mut groups = GroupPlan::default();
         let mut group_depth = 0;
@@ -1841,9 +2000,14 @@ impl CompositeProgram {
         }
         operations.extend(effects);
         bind_input_sources(&mut operations, layer_count, &procedural.input_sources);
-        let filters = FilterPlan::compile(&mut operations, layer_count, &procedural);
+        let mut filters = FilterPlan::compile(&mut operations, layer_count, &procedural);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
         filters.bind_anchors(&mut operations);
+        let udim = udim::bind(layout.as_ref(), &mut filters, &mut procedural).ok_or("The UV tile layout exceeds the GPU parameter table.")?;
+        // A UV tile smaller than its block shades its height slopes at its own scale (Extra's alpha)
+        if layout.as_ref().is_some_and(|layout| layout.scaled) {
+            display_outputs |= display_bit(DisplayKind::Extra);
+        }
         let region = filters.expand(region);
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
@@ -1874,6 +2038,8 @@ impl CompositeProgram {
             image_words: procedural.image_words,
             environment: LateEnvironment::new(procedural.environment_word, &project.display),
             bake_rows: procedural.bake_rows,
+            udim,
+            udim_layout: layout,
         })
     }
 
@@ -1917,14 +2083,18 @@ impl CompositeProgram {
         let mut operations = vec![Operation::zeroed()];
         let mut paint = PaintInputs::default();
         let mut procedural = ProceduralInputs::new(set.resolution);
+        // P8: a UV tile atlas's block, its tile scales and the set's own resolution
+        let layout = udim::UdimLayout::of(set);
+        udim::prepare(layout.as_ref(), &mut procedural);
         let mut tile_patterns = TilePatterns::default();
         let background = compile_mask(Some(mask), around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
         operations[0].effects[1] = operations.len() as u32 - 1;
         operations[0].balance[1] = background;
         bind_input_sources(&mut operations, 1, &procedural.input_sources);
-        let filters = FilterPlan::compile(&mut operations, 1, &procedural);
+        let mut filters = FilterPlan::compile(&mut operations, 1, &procedural);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
         filters.bind_anchors(&mut operations);
+        let udim = udim::bind(layout.as_ref(), &mut filters, &mut procedural).ok_or("The UV tile layout exceeds the GPU parameter table.")?;
         let region = filters.expand(region);
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
@@ -1956,6 +2126,8 @@ impl CompositeProgram {
             image_words: procedural.image_words,
             environment: LateEnvironment::new(procedural.environment_word, &project.display),
             bake_rows: procedural.bake_rows,
+            udim,
+            udim_layout: layout,
         })
     }
 }
@@ -2380,7 +2552,9 @@ fn source_operation(
             op.uv[2] = pattern.scale.max(1e-4);
             op.uv[3] = pattern.contrast.max(0.0);
             op.balance[0] = pattern.balance;
-            op.procedural[0] = pattern_pixels(pattern, inputs.resolution, inputs.resolution).unwrap_or(0);
+            op.procedural[0] = pattern_pixels(pattern, inputs.resolution, inputs.texture_set).unwrap_or(0);
+            // P8: a UV tile atlas's smaller tiles reduce the pattern at their own resolution
+            op.ext[3] = udim::pattern_levels(pattern, inputs)?;
             if channel == ChannelKind::Color && !ramp.is_empty() {
                 op.procedural[1..3].copy_from_slice(&inputs.pack_rgb(ramp)?);
             }
@@ -2423,15 +2597,14 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
         op.effects[2] = inputs.generator_sources.len() as u32;
         op.uv[2] = if micro.amount.is_finite() { micro.amount.clamp(0.0, 1.0) } else { 0.0 };
     }
-    let resolution = inputs.resolution;
-    let cell = generator.resolution.cell(resolution, resolution);
     op.spatial[2] = u32::from(generator.global.blur > 0.0 || generator.resolution.can_reduce());
-    let blur = (generator.global.blur_radius_at(resolution).round() > 0.0)
-        .then(|| Filter::Blur { radius: generator.global.blur_radius(), wrap: false })
-        .and_then(|blur| NeighbourhoodFilter::new(&blur, resolution, resolution, 1.0, None));
+    let (blur, cell) = generator_stage(generator, inputs.resolution, inputs);
     if let (Some(_), _) | (None, 2..) = (blur, cell) {
         inputs.generator_stages.push((blur, cell));
         op.spatial[1] = inputs.generator_stages.len() as u32;
+        // P8: the generator's cells and blur at each further UV tile scale
+        let levels: Vec<_> = inputs.levels.iter().map(|&resolution| generator_stage(generator, resolution, inputs)).collect();
+        inputs.generator_levels.push(levels);
     }
     if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear)
         && let Some(detail) = &generator.detail
@@ -2439,6 +2612,16 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
         op.uv[..2].copy_from_slice(&inputs.pack_curvature(detail, op.effects[3] == 0)?);
     }
     op.low.iter().chain(&op.projection).all(|x| x.is_finite()).then_some(op)
+}
+
+/// A generator's blur and cell side for a UV tile of `resolution` texels (`generator_region` in
+/// eval.rs): its blur stage, if it blurs, and its cells' side in texels.
+fn generator_stage(generator: &Generator, resolution: u32, inputs: &ProceduralInputs) -> (Option<NeighbourhoodFilter>, u32) {
+    let cell = generator.resolution.cell(resolution, inputs.texture_set);
+    let blur = (generator.global.blur_radius_at(resolution).round() > 0.0)
+        .then(|| Filter::Blur { radius: generator.global.blur_radius(), wrap: false })
+        .and_then(|blur| NeighbourhoodFilter::new(&blur, resolution, inputs.longest_side, 1.0, None));
+    (blur, cell)
 }
 
 /// One effect as a GPU point operation, or a neighbourhood stage. None for any kind or setting
@@ -2502,7 +2685,7 @@ fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operat
             InvertOff | Empty => (NOOP_EFFECT_OPCODE, [0.0; 3]),
             filter if gpu_neighbourhood::supports(filter) => {
                 // A known stage whose size reaches nothing leaves the field as the CPU does
-                let spatial = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, effect.opacity, None);
+                let spatial = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.longest_side, effect.opacity, None);
                 if spatial.is_some() {
                     op.ids[2] = inputs.filters.len() as u32;
                     inputs.filters.push((filter.clone(), effect.opacity));
@@ -2925,8 +3108,14 @@ impl GpuCompositor {
         }) {
             return Ok(cache.view.clone());
         }
-        // The second row block (Height and World Normal) sits below the built-in maps
-        let rows = size.1.checked_mul(baked.blocks()).ok_or("Baked maps exceed the GPU texture dimensions")?;
+        // The second row block (Height and World Normal) sits below the built-in maps; P8: maps of
+        // different heights take rows of their own, the header rows after them
+        let separate = baked.separate().then(|| baked.separate_layout());
+        let rows = match separate {
+            Some((_, header)) => header.checked_add(SEPARATE_MAPS.div_ceil(size.0.max(1) as usize) as u32),
+            None => size.1.checked_mul(baked.blocks()),
+        }
+        .ok_or("Baked maps exceed the GPU texture dimensions")?;
         if size.0.max(rows) > device.limits().max_texture_dimension_2d {
             return Err("Baked maps exceed the GPU texture dimensions".into());
         }
@@ -2934,6 +3123,12 @@ impl GpuCompositor {
         // Keep all three scalar inputs at f32 precision for narrow generator ramps. The
         // normal uses the remaining word, keeping the atlas at 16 bytes per texel.
         let texture = input_texture(device, "tc_composite_bakes", (size.0, rows), 1, wgpu::TextureFormat::Rgba32Uint);
+        if let Some(layout) = separate {
+            write_separate_bakes(queue, &texture, baked, layout);
+            let view = texture.create_view(&Default::default());
+            self.baked.insert(ts, BakeCache { size, maps: refs, view: view.clone() });
+            return Ok(view);
+        }
         let value = |map: usize, i: usize, fallback: f32| baked.maps[map].as_ref().and_then(|data| data.get(i).copied()).unwrap_or(fallback);
         for top in (0..size.1).step_by(ROWS as usize) {
             let end = (top + ROWS).min(size.1);
@@ -3036,15 +3231,19 @@ impl GpuCompositor {
         {
             return Ok(Some(cache.levels.clone()));
         }
-        let coverage = (gbuf.covered_count() != gbuf.tri.len()).then(|| self.coverage_buffer(device, Some(gbuf))).transpose()?;
+        // P8: a UV tile atlas pads, blurs and coarsens each block of the bake alone, and a tile smaller
+        // than its block covers only its share of the bake
+        let layout = program.udim_layout.as_ref();
+        let block = layout.map_or(size, |layout| [size[0] / layout.grid.cols.max(1), size[1] / layout.grid.rows.max(1)]);
+        let scales = layout.filter(|layout| layout.scaled).map_or((0, &[][..]), |layout| (layout.block, layout.scales.as_slice()));
+        let partly_covered = gbuf.covered_count() != gbuf.tri.len() || !scales.1.is_empty();
+        let coverage = partly_covered.then(|| self.coverage_buffer(device, Some(gbuf))).transpose()?;
         let curvature = self.curvature.as_mut().ok_or("The GPU curvature adapter is unavailable.")?;
         curvature.cache.remove(&ts);
         let gpu = curvature.gpu.get_or_insert_with(|| CurvatureGpu::new(device));
-        let levels = gpu.build(
-            device,
-            queue,
-            CurvatureInput { baked: baked_view, bake_size: size, coverage: coverage.as_ref(), working_size: [gbuf.width, gbuf.height], needed },
-        )?;
+        let working_size = [gbuf.width, gbuf.height];
+        let levels =
+            gpu.build(device, queue, CurvatureInput { baked: baked_view, bake_size: size, coverage: coverage.as_ref(), working_size, needed, block, scales })?;
         curvature.cache.insert(ts, CurvatureCache { gbuf: key, map, size, needed, levels: levels.clone() });
         Ok(Some(levels))
     }
@@ -3433,6 +3632,11 @@ impl GpuCompositor {
                     let mut work = 0u64;
                     for &output in &pass.stages {
                         let stage = &program.filters.stages[output];
+                        // P8: a level stage runs only where a block of its tile scale lies, on its base stage's field
+                        if !udim::runs_over(program.udim_layout.as_ref(), stage.level, field_rect, (source_size, wraps)) {
+                            continue;
+                        }
+                        let reuses_field = udim::reuses_base_field(&program.filters.stages, output);
                         let direct = stage.filter.is_none() && stage.cell == 1;
                         let slot = if direct { output as u32 } else { fields };
                         let stage_values = |paint_params: [u32; 4]| {
@@ -3445,7 +3649,8 @@ impl GpuCompositor {
                             source[packages::MASK_VIEW..packages::MASK_VIEW + 4].copy_from_slice(&stage.mask_view);
                             source
                         };
-                        let mut chunks: Vec<[u32; 4]> = (0..field_rect[3])
+                        let source_rows_total = if reuses_field { 0 } else { field_rect[3] };
+                        let mut chunks: Vec<[u32; 4]> = (0..source_rows_total)
                             .step_by(source_rows as usize)
                             .flat_map(|y| {
                                 (0..field_rect[2])
@@ -3506,6 +3711,18 @@ impl GpuCompositor {
                         // within the submission budget
                         queue.submit([std::mem::replace(&mut encoder, make_encoder()).finish()]);
                         work = 0;
+                        if reuses_field && direct {
+                            let field = (field_rect[2], field_rect[3]);
+                            kernels.encode_copy(
+                                device,
+                                &mut encoder,
+                                &scratch,
+                                (region.original, field.0, [0; 2]),
+                                (region.output, field.0, 0),
+                                [field.0, field.1],
+                                texel_words,
+                            );
+                        }
                         let _budget = kernels.budget(queue, stage.filter.map_or(1, NeighbourhoodFilter::work_per_texel), pre_pass_budget());
                         if stage.cell > 1 {
                             let target = if stage.filter.is_some() { region.original } else { region.output };
@@ -3596,6 +3813,11 @@ impl GpuCompositor {
                         if whole.as_ref().is_some_and(|whole| whole.stages.stages.contains(&output)) {
                             continue;
                         }
+                        // P8: a level stage runs only where a block of its tile scale lies, on its base stage's field
+                        if !udim::runs_over(program.udim_layout.as_ref(), stage.level, field_rect, (source_size, wraps)) {
+                            continue;
+                        }
+                        let reuses_field = udim::reuses_base_field(&program.filters.stages, output);
                         let mut source = values;
                         let direct = stage.filter.is_none() && stage.cell == 1;
                         let slot = if direct { output as u32 } else { fields };
@@ -3611,7 +3833,8 @@ impl GpuCompositor {
                             source[36..39].copy_from_slice(&[channel_slot(channel), first, cut]);
                             source[40..43].copy_from_slice(&channel.default_value().map(f32::to_bits));
                         }
-                        for y in (0..field_rect[3]).step_by(source_rows as usize) {
+                        let source_chunks = if reuses_field { 0 } else { field_rect[3] };
+                        for y in (0..source_chunks).step_by(source_rows as usize) {
                             for x in (0..field_rect[2]).step_by(source_width as usize) {
                                 let columns = source_width.min(field_rect[2] - x);
                                 let rows = source_rows.min(field_rect[3] - y);
@@ -3644,6 +3867,18 @@ impl GpuCompositor {
                             wrap: stage.wrap,
                             bounds: set_bounds,
                         };
+                        if reuses_field && direct {
+                            let field = (field_rect[2], field_rect[3]);
+                            kernels.encode_copy(
+                                device,
+                                &mut encoder,
+                                &scratch,
+                                (region.original, field.0, [0; 2]),
+                                (region.output, field.0, 0),
+                                [field.0, field.1],
+                                texel_words,
+                            );
+                        }
                         if stage.cell > 1 {
                             let target = if stage.filter.is_some() { region.original } else { region.output };
                             kernels.encode_cells(device, &mut encoder, &scratch, NeighbourhoodRegion { output: target, ..region }, stage.cell);
@@ -3864,9 +4099,9 @@ impl WholeSetPass {
     /// The band uniform's whole-set table: each output's slot plus one, its first word, the region.
     fn write_uniform(&self, values: &mut [u32; packages::UNIFORM_WORDS], base: u32) {
         let table = &mut values[packages::WHOLE_SET..packages::WHOLE_SET + 12];
-        for (index, &output) in self.stages.outputs.iter().enumerate() {
-            table[index] = output as u32 + 1;
-            table[4 + index] = self.result_base(base, index);
+        for (entry, &index) in self.stages.entries.iter().enumerate() {
+            table[entry] = self.stages.outputs[index] as u32 + 1;
+            table[4 + entry] = self.result_base(base, index);
         }
         let [x0, y0, x1, y1] = self.region;
         table[8..].copy_from_slice(&[x0, y0, x1 - x0, y1 - y0]);
@@ -5703,6 +5938,8 @@ mod paint_window_tests {
             image_words: Vec::new(),
             environment: None,
             bake_rows: false,
+            udim: 0,
+            udim_layout: None,
         };
         let region = CompositeRegion { min: [0, 0], max: [128, 128] };
         let limit = 6 * 64 * 64 * 2 + 32;

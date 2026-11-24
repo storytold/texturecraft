@@ -130,6 +130,8 @@ fn stack_color_selection(effect: Operation, texel: LayerTexel) -> vec2<f32> {
             color = image_texel_nearest(record, texel.uv).rgb;
         }
     } else if has_id {
+        // P8: no baked ID where a smaller UV tile leaves its block empty
+        has_id = udim_bake_valid(texel.pixel);
         color = id_color_at(texel.pixel);
     }
     var amount = 0.0;
