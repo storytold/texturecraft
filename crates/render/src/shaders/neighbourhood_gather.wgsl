@@ -5,6 +5,7 @@
 
 // The P5 kinds (gpu_neighbourhood_gather.rs)
 const GATHER_FXAA: u32 = 32u;
+const GATHER_KUWAHARA: u32 = 33u;
 const GATHER_SOURCE_WARP: u32 = 34u;
 const GATHER_SOURCE_SLOPE_BLUR: u32 = 35u;
 const GATHER_MIRROR: u32 = 36u;
@@ -26,6 +27,19 @@ const GATHER_MIRROR_Y: u32 = 2u;
 const GATHER_MIRROR_KEEP_RIGHT: u32 = 4u;
 const GATHER_MIRROR_KEEP_BOTTOM: u32 = 8u;
 const GATHER_MIRROR_DEBUG: u32 = 16u;
+
+// Anisotropic Kuwahara (kuwahara_texel in eval.rs): the ellipse's sample rows each side, its
+// sectors, the least tensor with a direction, the samples' falloff and the spread's 8-bit scale
+const GATHER_KUWAHARA_STEPS: i32 = 6;
+const GATHER_KUWAHARA_SECTORS: u32 = 8u;
+const GATHER_MIN_TENSOR: f32 = 1e-12;
+const GATHER_KUWAHARA_FALLOFF: f32 = 2.0;
+const GATHER_KUWAHARA_SPREAD_SCALE: f32 = 255.0;
+// Flag bit of a Kuwahara stage's words[0]: Extract Direction Custom Input
+const GATHER_KUWAHARA_CUSTOM_INPUT: u32 = 1u;
+const GATHER_PI: f32 = 3.141592653589793;
+const GATHER_HALF_PI: f32 = 1.5707963267948966;
+const GATHER_TAU: f32 = 6.283185307179586;
 
 // Bit fields of a Warp's or Blur Slope's words[0]: the warp mode, the blending, the directions,
 // the source's mode, whether the source repeats within the UV tile, and the read count
@@ -409,6 +423,187 @@ fn gather_source_slope_blur(home: vec2<f32>) -> Texel {
     return gather_extreme_texel(extreme);
 }
 
+// atan2 as Rust computes it where y is zero (0, or a half turn for negative x), which WGSL
+// leaves to the implementation at the origin
+fn gather_atan2(y: f32, x: f32) -> f32 {
+    if y == 0.0 {
+        return select(0.0, GATHER_PI, x < 0.0);
+    }
+    return atan2(y, x);
+}
+
+// The gray Kuwahara takes its direction from at home position `home`: its custom input, or the
+// luma of the values it filters; (gray, 1), or (0, 0) off the UV island
+fn gather_kuwahara_gray(home: vec2<f32>) -> vec2<f32> {
+    if (params.field_layout.z & GATHER_KUWAHARA_CUSTOM_INPUT) != 0u {
+        return gather_input(home);
+    }
+    let found = gather_read(home);
+    if found.coverage <= MIN_WEIGHT {
+        return vec2(0.0);
+    }
+    return vec2(gather_luma(found.value / found.coverage), 1.0);
+}
+
+// The gray at `home` plus `offset`, or `own` where it covers nothing
+fn gather_kuwahara_gray_or(home: vec2<f32>, offset: vec2<f32>, own: vec2<f32>) -> vec2<f32> {
+    let gray = gather_kuwahara_gray(home + offset);
+    return select(own, gray, gray.y > 0.0);
+}
+
+// The ellipse of the texel at home position `home`: (cos, sin) of its direction, then its semi
+// axes along and across it. The structure tensor of the gray's gradients over a 3 × 3 grid
+// spread by Tensor Smoothness, the middle weighing most
+fn gather_kuwahara_ellipse(home: vec2<f32>) -> vec4<f32> {
+    let radius = params.extra[0].x;
+    let spread = params.extra[0].y * radius;
+    var xx = 0.0;
+    var xy = 0.0;
+    var yy = 0.0;
+    for (var grid_y = -1; grid_y <= 1; grid_y++) {
+        for (var grid_x = -1; grid_x <= 1; grid_x++) {
+            let at = home + vec2(f32(grid_x) * spread, f32(grid_y) * spread);
+            let own = gather_kuwahara_gray(at);
+            let left = gather_kuwahara_gray_or(at, vec2(-1.0, 0.0), own);
+            let right = gather_kuwahara_gray_or(at, vec2(1.0, 0.0), own);
+            let up = gather_kuwahara_gray_or(at, vec2(0.0, -1.0), own);
+            let down = gather_kuwahara_gray_or(at, vec2(0.0, 1.0), own);
+            if left.y <= 0.0 || right.y <= 0.0 || up.y <= 0.0 || down.y <= 0.0 {
+                continue;
+            }
+
+            // Central differences over two texels, weighed by a 1-2-1 binomial kernel each way
+            let dx = (right.x - left.x) * 0.5;
+            let dy = (down.x - up.x) * 0.5;
+            let weight = f32(4 >> u32(abs(grid_x) + abs(grid_y)));
+            xx += weight * dx * dx;
+            xy += weight * dx * dy;
+            yy += weight * dy * dy;
+        }
+    }
+    let root = sqrt((xx - yy) * (xx - yy) + 4.0 * xy * xy);
+    var clear = 0.0;
+    if xx + yy > GATHER_MIN_TENSOR {
+        clear = root / (xx + yy);
+    }
+
+    // Strokes run across the steepest change; Anisotropy Angle turns the ellipse counterclockwise on screen
+    let turned = 0.5 * gather_atan2(2.0 * xy, xx - yy) + GATHER_HALF_PI - params.extra[1].y;
+    var frame = vec2(1.0, 0.0);
+    if gather_finite(turned) {
+        frame = vec2(cos(turned), sin(turned));
+    }
+    let stretch = params.extra[1].x * clamp(select(0.0, clear, gather_finite(clear)), 0.0, 1.0);
+    return vec4(frame, radius * (1.0 + stretch), radius / (1.0 + stretch));
+}
+
+// Kuwahara's structure tensor pass: each covered texel's ellipse (gather_kuwahara_ellipse) into
+// the field at buffers.z, which the apply pass reads at buffers.y
+@compute @workgroup_size(8, 8)
+fn gather_kuwahara_frame(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= params.rect.z || id.y >= params.rect.w {
+        return;
+    }
+
+    var ellipse = vec4(0.0);
+    if original_at(id.xy).coverage > 0.0 {
+        output_copy = copy_of(vec2<i32>(id.xy));
+        ellipse = gather_kuwahara_ellipse(gather_begin(vec2<f32>(vec2<i32>(id.xy) + field_origin())));
+    }
+    write_at(params.buffers.z, id.xy, Texel(ellipse, 0.0));
+}
+
+// Anisotropic Kuwahara at home position `home` with its ellipse `ellipse` (kuwahara_texel in
+// eval.rs): its sectors' means weighed by their calm
+fn gather_kuwahara(home: vec2<f32>, ellipse: vec4<f32>) -> Texel {
+    let content = gather_is_content();
+    let sector_exponent = params.extra[0].z;
+    let sharpness = params.extra[0].w;
+    var steps = 1;
+    if gather_finite(ellipse.z) {
+        steps = clamp(i32(ceil(ellipse.z)), 1, GATHER_KUWAHARA_STEPS);
+    }
+
+    // Each sector's weighted sum, squared sum and weight
+    var sums: array<vec4<f32>, 8>;
+    var squares: array<f32, 8>;
+    var weights: array<f32, 8>;
+    for (var row = -steps; row <= steps; row++) {
+        for (var column = -steps; column <= steps; column++) {
+            let u = f32(column) / f32(steps);
+            let v = f32(row) / f32(steps);
+            let spread = u * u + v * v;
+            if spread > 1.0 {
+                continue;
+            }
+
+            let across = u * ellipse.z;
+            let along = v * ellipse.w;
+            let found = gather_read(home + vec2(across * ellipse.x - along * ellipse.y, across * ellipse.y + along * ellipse.x));
+            if found.coverage <= MIN_WEIGHT {
+                continue;
+            }
+            var value = found.value / found.coverage;
+            var squared = value.x * value.x;
+            if content {
+                squared = value.x * value.x + value.y * value.y + value.z * value.z;
+            } else {
+                value = vec4(value.x, 0.0, 0.0, 0.0);
+            }
+            let falloff = exp(-GATHER_KUWAHARA_FALLOFF * spread);
+            let heading = gather_atan2(v, u);
+            for (var sector = 0u; sector < GATHER_KUWAHARA_SECTORS; sector++) {
+                // The center contributes to every sector while other weights taper at sector boundaries
+                let facing = cos(heading - f32(sector) * GATHER_TAU / f32(GATHER_KUWAHARA_SECTORS));
+                var weight = falloff;
+                if spread > 0.0 {
+                    if facing <= 0.0 {
+                        continue;
+                    }
+                    weight = falloff * pow(facing, sector_exponent);
+                }
+                sums[sector] += weight * value;
+                weights[sector] += weight;
+                squares[sector] += weight * squared;
+            }
+        }
+    }
+
+    // Weight low-variance sectors more and use logarithms to avoid overflow
+    var logs: array<f32, 8>;
+    var top = 0.0;
+    var any_sector = false;
+    for (var sector = 0u; sector < GATHER_KUWAHARA_SECTORS; sector++) {
+        let weight = weights[sector];
+        if weight <= MIN_WEIGHT {
+            continue;
+        }
+        let mean = sums[sector] / weight;
+        var mean_squared = mean.x * mean.x;
+        if content {
+            mean_squared = mean.x * mean.x + mean.y * mean.y + mean.z * mean.z;
+        }
+        let deviation = sqrt(max(squares[sector] / weight - mean_squared, 0.0));
+        logs[sector] = -sharpness * log(1.0 + GATHER_KUWAHARA_SPREAD_SCALE * deviation);
+        top = select(logs[sector], max(top, logs[sector]), any_sector);
+        any_sector = true;
+    }
+    if !any_sector {
+        return EMPTY;
+    }
+
+    var total = EMPTY;
+    for (var sector = 0u; sector < GATHER_KUWAHARA_SECTORS; sector++) {
+        let weight = weights[sector];
+        if weight <= MIN_WEIGHT {
+            continue;
+        }
+        let share = exp(logs[sector] - top);
+        total = Texel(total.value + share * sums[sector] / weight, total.coverage + share);
+    }
+    return total;
+}
+
 // value.rem_euclid(modulus) as Rust computes it for a positive modulus: the truncated remainder,
 // moved up by the modulus when below zero
 fn gather_rem_euclid(value: f32, modulus: f32) -> f32 {
@@ -545,6 +740,9 @@ fn gather_family_gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
         if (flags & GATHER_FXAA_ALPHA) == 0u {
             acc = gather_keep_coverage(acc, original.w);
         }
+    } else if kind == GATHER_KUWAHARA {
+        let local = vec2<u32>(vec2<i32>(point) - field_origin());
+        acc = gather_kuwahara(home, read_at(params.buffers.y, local).value);
     } else if kind == GATHER_SOURCE_WARP {
         acc = gather_source_warp(home);
     } else if kind == GATHER_SOURCE_SLOPE_BLUR {

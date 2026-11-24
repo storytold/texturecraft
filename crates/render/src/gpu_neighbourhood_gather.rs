@@ -31,19 +31,22 @@
 //! product) on paint and in a mask, chained, and with a partial region.
 
 use texturecraft_core::{
-    Filter, Mirror, MirrorMode, RepeatMode, SlopeBlending, SourceSlopeBlur, SourceWarp, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode,
+    AnisotropicKuwahara, Filter, Mirror, MirrorMode, RepeatMode, SlopeBlending, SourceSlopeBlur, SourceWarp, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode,
     finite_unit,
 };
 
-use super::{GATHER_KINDS, Kind, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, StageInputs};
+use super::{APPLY_WORKGROUP, GATHER_KINDS, Kind, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs};
 
 /// Library filter ids P5 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["anisotropicKuwahara", "colorMatch", "heightToNormal"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["colorMatch", "heightToNormal"];
 
 pub(super) const WGSL: &str = include_str!("shaders/neighbourhood_gather.wgsl");
 
 /// FXAA: the luma edge search of `fxaa_texel` in eval.rs.
 const FXAA: Kind = Kind(GATHER_KINDS.start);
+/// Anisotropic Kuwahara: an ellipse frame per texel from its own structure tensor pass, then the
+/// sector gather (`kuwahara_texel` in eval.rs).
+const KUWAHARA: Kind = Kind(GATHER_KINDS.start + 1);
 /// Warp (`SourceWarp`): where its source sends a texel (`warp_texel.rs`).
 const SOURCE_WARP: Kind = Kind(GATHER_KINDS.start + 2);
 /// Blur Slope (`SourceSlopeBlur`): the reads downhill of its source (`slope_texel.rs`).
@@ -66,6 +69,14 @@ const MIRROR_Y: u32 = 2;
 const MIRROR_KEEP_RIGHT: u32 = 4;
 const MIRROR_KEEP_BOTTOM: u32 = 8;
 const MIRROR_DEBUG: u32 = 16;
+
+/// Flag bit of a Kuwahara stage's `words[0]` (the same constant in the WGSL file): Extract
+/// Direction Custom Input.
+const KUWAHARA_CUSTOM_INPUT: u32 = 1;
+
+/// Sample rows (and columns) on each side of the middle a Kuwahara ellipse reads at most
+/// (`KUWAHARA_STEPS` in eval.rs).
+const KUWAHARA_STEPS: u64 = 6;
 
 /// Bit fields of a Warp's or Blur Slope's `words[0]` (the same constants in the WGSL file): the
 /// warp mode, the blending, the directions, the source's mode, whether the source repeats within
@@ -97,12 +108,21 @@ const FXAA_READS: u64 = 9 + 2 * FXAA_SEARCH as u64 + 1;
 /// Source reads of a warp or slope blur texel at most: four slope probes, each at its blur's corners.
 const SOURCE_READS: u64 = 4 * 4;
 
+/// Gray reads of a Kuwahara texel's structure tensor: a 3 × 3 grid, each with its four sides.
+const KUWAHARA_TENSOR_READS: u64 = 9 * 4;
+
+/// Work per Kuwahara ellipse read: the read and its sectors' weights.
+const KUWAHARA_SAMPLE_WORK: u64 = 3 * SAMPLE_WORK;
+
 /// P5's own compute pipelines, created from the neighbourhood module.
-pub(super) struct Pipelines;
+pub(super) struct Pipelines {
+    /// Anisotropic Kuwahara's structure tensor: each texel's ellipse frame.
+    kuwahara_frame: wgpu::ComputePipeline,
+}
 
 impl Pipelines {
-    pub(super) fn new(_pipeline: &dyn Fn(&'static str) -> wgpu::ComputePipeline) -> Self {
-        Self
+    pub(super) fn new(pipeline: &dyn Fn(&'static str) -> wgpu::ComputePipeline) -> Self {
+        Self { kuwahara_frame: pipeline("gather_kuwahara_frame") }
     }
 }
 
@@ -112,7 +132,7 @@ fn flag(on: bool, bit: u32) -> u32 {
 
 /// Whether a P5 stage evaluates `filter` as the CPU does.
 pub(super) fn supports(filter: &Filter) -> bool {
-    matches!(filter, Filter::Fxaa { .. } | Filter::SourceWarp(_) | Filter::SourceSlopeBlur(_) | Filter::Mirror(_) | Filter::Transform(_))
+    matches!(filter, Filter::Fxaa { .. } | Filter::AnisotropicKuwahara(_) | Filter::SourceWarp(_) | Filter::SourceSlopeBlur(_) | Filter::Mirror(_) | Filter::Transform(_))
 }
 
 /// The P5 stage for `filter`, None when its size reaches nothing.
@@ -124,6 +144,8 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
             fxaa.words[0] = flag(*alpha, FXAA_ALPHA);
             Some(fxaa)
         }
+        // Both the direction search and the ellipse can reach twice the radius
+        Filter::AnisotropicKuwahara(kuwahara) if kuwahara.radius > 0.0 => Some(kuwahara_stage(stage, kuwahara)),
         Filter::SourceWarp(warp) if warp.move_texels(stage.resolution) > 0.0 => Some(source_warp(stage, warp)),
         Filter::SourceSlopeBlur(slope) if slope.move_texels(stage.resolution) > 0.0 => Some(source_slope_blur(stage, slope)),
         // A mirror or transform reads anywhere in its UV tile; one that changes nothing is skipped
@@ -131,6 +153,27 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
         Filter::Transform(transform) if !transform.is_identity() => Some(transform_stage(stage, transform)),
         _ => None,
     }
+}
+
+/// An Anisotropic Kuwahara stage: the radius, the tensor's reach as a share of it, the sector and
+/// sharpness exponents, the Anisotropy and the Angle (radians) in `extra`, the custom input in
+/// `words[0]`.
+fn kuwahara_stage(stage: StageInputs, kuwahara: &AnisotropicKuwahara) -> NeighbourhoodFilter {
+    let radius = (kuwahara.radius.min(AnisotropicKuwahara::MAX_RADIUS) * stage.resolution as f32 / FILTER_SIZE_RESOLUTION).max(MIN_FILTER_RADIUS);
+    let tensor_reach = kuwahara.tensor_reach();
+    let anisotropy = if kuwahara.anisotropy.is_finite() { kuwahara.anisotropy.clamp(0.0, 1.0) } else { AnisotropicKuwahara::LIBRARY.anisotropy };
+
+    let mut out = stage.filter(KUWAHARA, radius * (2.0 + tensor_reach) + 1.0);
+    out.extra[..6].copy_from_slice(&[
+        radius,
+        tensor_reach,
+        kuwahara.sector_exponent(),
+        kuwahara.sharpness_exponent(),
+        anisotropy,
+        kuwahara.angle.to_radians(),
+    ]);
+    out.words[0] = flag(kuwahara.custom_input, KUWAHARA_CUSTOM_INPUT);
+    out
 }
 
 /// Unit texel-space vector of `angle` degrees, as `direction` in eval.rs.
@@ -271,6 +314,7 @@ pub(super) fn reach(filter: NeighbourhoodFilter) -> u32 {
 pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
     match filter.kind {
         FXAA => SAMPLE_WORK * FXAA_READS,
+        KUWAHARA => SAMPLE_WORK * KUWAHARA_TENSOR_READS + KUWAHARA_SAMPLE_WORK * (2 * KUWAHARA_STEPS + 1).pow(2),
         // The source read at the four corners of its blur round the texel and its slope probes
         SOURCE_WARP => SAMPLE_WORK * (SOURCE_READS + u64::from(SourceWarp::DIRECTIONS[2])),
         SOURCE_SLOPE_BLUR => SAMPLE_WORK * (SOURCE_READS + u64::from(filter.words[0] >> READ_COUNT_SHIFT) + 1),
@@ -295,14 +339,41 @@ pub(super) fn whole_set(filter: NeighbourhoodFilter, _resolution: u32) -> bool {
 
 /// Encodes a P5 stage with passes of its own; false lets the apply pass run.
 pub(super) fn encode(
-    (_gpu, _pipelines): (&NeighbourhoodGpu, &Pipelines),
-    _device: &wgpu::Device,
-    _encoder: &mut wgpu::CommandEncoder,
-    _scratch: &wgpu::Buffer,
-    _region: NeighbourhoodRegion,
-    _filter: NeighbourhoodFilter,
+    (gpu, pipelines): (&NeighbourhoodGpu, &Pipelines),
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    scratch: &wgpu::Buffer,
+    region: NeighbourhoodRegion,
+    filter: NeighbourhoodFilter,
 ) -> bool {
-    false
+    let [_, _, width, height] = region.rect;
+    let texel_groups = [width.div_ceil(APPLY_WORKGROUP), height.div_ceil(APPLY_WORKGROUP)];
+    let mut run = |pipeline: &wgpu::ComputePipeline, buffers: [u32; 4], groups: [u32; 2]| {
+        let params = Params {
+            rect: region.rect,
+            buffers,
+            mode: [filter.radius, filter.kind.0, filter.seed, 0],
+            weights: [filter.opacity, filter.amount, filter.frequency, filter.middle],
+            direction: [filter.direction[0], filter.direction[1], 0.0, 0.0],
+            field_layout: region.field_layout(filter.words),
+            extra: filter.extra,
+            stage: [filter.context, u32::from(region.wrap), 0, 0],
+            bounds: region.bounds,
+        };
+        NeighbourhoodGpu::run(pipeline, device, encoder, scratch, &params, groups);
+    };
+    let (original, output) = (region.original, region.output);
+    match filter.kind {
+        // Each texel's ellipse frame in the first blur field, which the apply pass reads
+        KUWAHARA => {
+            let frame = region.blur[0];
+            run(&pipelines.kuwahara_frame, [original, 0, frame, 0], texel_groups);
+            run(&gpu.apply, [original, frame, output, 0], texel_groups);
+        }
+        // The other kinds gather in the apply pass
+        _ => return false,
+    }
+    true
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -311,7 +382,7 @@ mod tests {
 
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
-        BlendMode, Channel, ContentsOffset, Effect, EffectKind, Filter, FlipMode, HeightToNormal, Layer, LayerId, LayerKind, Mask, MaskBackground, Mirror,
+        AnisotropicKuwahara, BlendMode, Channel, ContentsOffset, Effect, EffectKind, Filter, FlipMode, HeightToNormal, Layer, LayerId, LayerKind, Mask, MaskBackground, Mirror,
         MirrorCorner, MirrorMode, Project, RepeatMode, SlopeBlending, SourceSlopeBlur, SourceWarp, TextureSet, TileTransform, WarpBlending, WarpMode,
         WarpSource, WarpSourceMode,
     };
@@ -330,6 +401,15 @@ mod tests {
 
     /// A corner of the set, whose halo reaches across its edges.
     const CORNER: CompositeRegion = CompositeRegion { min: [120, 2], max: [128, 18] };
+
+    /// Side of the Kuwahara sets: the largest radius reaches more than a texel there.
+    const KUWAHARA_SIZE: u32 = 256;
+
+    /// [`MIDDLE`] in a [`KUWAHARA_SIZE`] set.
+    const KUWAHARA_MIDDLE: CompositeRegion = CompositeRegion { min: [122, 114], max: [150, 146] };
+
+    /// Sector weights fall to zero at the sectors' edges: at most 0.1 % of the texels may flip.
+    const KUWAHARA_DECISIONS: Tolerance = Tolerance::TRANSCENDENTAL.with_flips((KUWAHARA_SIZE * KUWAHARA_SIZE / 1000) as usize);
 
     /// Edge searches and blend decisions are hard: at most 0.1 % of the texels may flip.
     const GATHER_DECISIONS: Tolerance = Tolerance::TRANSCENDENTAL.with_flips((SIZE * SIZE / 1000) as usize);
@@ -366,11 +446,27 @@ mod tests {
     /// Every filter and setting P5 ported, as content and in the mask.
     fn ported() -> Vec<Filter> {
         let mut filters = vec![Filter::Fxaa { alpha: false }, Filter::Fxaa { alpha: true }];
+        filters.extend(kuwaharas().into_iter().map(Filter::AnisotropicKuwahara));
         filters.extend(warps().into_iter().map(Filter::SourceWarp));
         filters.extend(slope_blurs().into_iter().map(Filter::SourceSlopeBlur));
         filters.extend(mirrors().into_iter().map(Filter::Mirror));
         filters.extend(transforms().into_iter().map(Filter::Transform));
         filters
+    }
+
+    /// The library's Anisotropic Kuwahara and each setting away from it.
+    fn kuwaharas() -> Vec<AnisotropicKuwahara> {
+        let library = AnisotropicKuwahara::LIBRARY;
+        let widest = AnisotropicKuwahara { radius: AnisotropicKuwahara::MAX_RADIUS, ..library };
+        vec![
+            library,
+            widest,
+            AnisotropicKuwahara { custom_input: true, ..widest },
+            AnisotropicKuwahara { smoothness: 1.0, sharpness: 1.0, ..widest },
+            AnisotropicKuwahara { smoothness: 0.0, sharpness: 0.6, ..widest },
+            AnisotropicKuwahara { tensor_smoothness: 0.6, anisotropy: 0.0, angle: 30.0, ..widest },
+            AnisotropicKuwahara { anisotropy: 0.5, angle: -75.0, ..widest },
+        ]
     }
 
     /// A warp moving 6.4 texels at 128 texels across, from its default noise.
@@ -574,6 +670,18 @@ mod tests {
     fn check_labelled(gpu: &mut Headless, cases: &[(String, Stack, BlendMode)], fixture: Fixture, region: CompositeRegion, tolerance: Tolerance) -> Option<()> {
         let cases: Vec<(&str, Stack, BlendMode)> = cases.iter().map(|(label, stack, blend)| (label.as_str(), stack.clone(), *blend)).collect();
         check_cases(gpu, &cases, fixture, region, tolerance)
+    }
+
+    /// Anisotropic Kuwahara matches the CPU through its structure tensor pass, at the library's
+    /// settings and each setting away from them (the custom input unlinked): below full opacity
+    /// under Multiply, disabled, between filters and in a partial update.
+    #[test]
+    fn anisotropic_kuwahara_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let widest = AnisotropicKuwahara { radius: AnisotropicKuwahara::MAX_RADIUS, ..AnisotropicKuwahara::LIBRARY };
+        let cases = filter_cases(kuwaharas().into_iter().map(Filter::AnisotropicKuwahara), &Filter::AnisotropicKuwahara(widest));
+
+        assert!(check_labelled(&mut gpu, &cases, (false, KUWAHARA_SIZE), KUWAHARA_MIDDLE, KUWAHARA_DECISIONS).is_some());
     }
 
     /// Warp matches the CPU from every source (default noise, the values it filters and an
