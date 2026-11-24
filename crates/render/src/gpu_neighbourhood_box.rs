@@ -6,8 +6,8 @@
 //! gradient), Glow (`HaloGlow`), Drop Shadow, Mask Outline, and the distance filters Bevel
 //! (`DistanceBevel`), Bevel Smooth and Directional Distance (separable distance transform with
 //! exact integer envelope arithmetic: the CPU computes the crossings in f64). The Distance Map
-//! input of Bevel Smooth and Directional Distance waits for P3's inputs: an effect with an image
-//! input still composites on the CPU (`effect_needs_cpu`).
+//! of Bevel Smooth and Directional Distance is the stage's input (the field's sixth word,
+//! `input_at`); the lowering registers it for every such stage, its default gray included.
 //!
 //! How:
 //! - [`supports`] and [`new`] take every filter the built-in stages reject (the built-in ones keep
@@ -107,6 +107,10 @@ const BILINEAR_SAMPLE_WORK: u64 = 5;
 const BOX_FILTER_WORK: u64 = 8;
 /// Work per texel of a pass of P4's own (prepare, apply, a distance line or the edges).
 const OWN_PASS_WORK: u64 = 2;
+/// Work per texel of the distance row pass (two sweeps along the line).
+const ROW_PASS_WORK: u64 = 4;
+/// Work per texel of the distance column pass (two envelopes, built and read back).
+const COLUMN_PASS_WORK: u64 = 8;
 
 /// P4's own compute pipelines, created from the neighbourhood module.
 pub(super) struct Pipelines {
@@ -384,7 +388,7 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
 /// The three horizontal and three vertical box passes over the field at `first` (read on the
 /// first pass as the original is), radius `radius`; the offset of the blurred field.
 fn box_passes(
-    run: &mut impl FnMut(&wgpu::ComputePipeline, [u32; 4], u32, bool, [u32; 2]),
+    run: &mut impl FnMut(&wgpu::ComputePipeline, [u32; 4], u32, bool, [u32; 2], (u32, u64)),
     box_blur: &wgpu::ComputePipeline,
     region: NeighbourhoodRegion,
     first: u32,
@@ -396,10 +400,22 @@ fn box_passes(
         let vertical = step >= BOX_PASSES;
         let line_count = if vertical { width } else { height };
         let target = region.blur[step % 2];
-        run(box_blur, [first, source, target, u32::from(vertical)], radius, step == 0, [line_count.div_ceil(LINE_WORKGROUP), 1]);
+        // The built-in box kernel reads no first line, so it runs whole
+        run(box_blur, [first, source, target, u32::from(vertical)], radius, step == 0, [line_count.div_ceil(LINE_WORKGROUP), 1], (LINE_WORKGROUP, 0));
         source = target;
     }
     source
+}
+
+/// The working fields a P4 stage uses besides the original and the output
+/// (`NeighbourhoodFilter::blur_fields`): none for Pixelate's gather, one for Directional
+/// Distance's inside flags, two for the box passes and the distance envelopes.
+pub(super) fn blur_fields(filter: NeighbourhoodFilter) -> u32 {
+    match filter.kind {
+        PIXELATE_KEEPING_ALPHA => 0,
+        DIRECTIONAL_DISTANCE => 1,
+        _ => 2,
+    }
 }
 
 /// Whether a stage runs in the whole-set pre-pass instead of in every band (see
@@ -419,8 +435,12 @@ pub(super) fn encode(
 ) -> bool {
     let [_, _, width, height] = region.rect;
     let texel_groups = [width.div_ceil(APPLY_WORKGROUP), height.div_ceil(APPLY_WORKGROUP)];
-    let mut run = |pipeline: &wgpu::ComputePipeline, buffers: [u32; 4], radius: u32, first_box: bool, groups: [u32; 2]| {
-        let params = Params {
+    let line_groups = |lines: u32| [lines.div_ceil(LINE_WORKGROUP), 1];
+
+    // Under the work budget of the whole-set pre-pass a pass is split, each chunk submitted on its own
+    let budget = super::BUDGET.with_borrow(|budget| budget.as_ref().map(|budget| (budget.queue.clone(), budget.limit)));
+    let mut run = |pipeline: &wgpu::ComputePipeline, buffers: [u32; 4], radius: u32, first_box: bool, groups: [u32; 2], (unit, group_work): (u32, u64)| {
+        let mut params = Params {
             rect: region.rect,
             buffers,
             mode: [radius, filter.kind.0, filter.seed, u32::from(first_box)],
@@ -431,35 +451,60 @@ pub(super) fn encode(
             stage: [filter.context, u32::from(region.wrap), 0, 0],
             bounds: region.bounds,
         };
-        NeighbourhoodGpu::run(pipeline, device, encoder, scratch, &params, groups);
+
+        // Texel passes split by rows of workgroups, line passes by workgroups of lines (stage.z: the first row or line)
+        let axis = usize::from(unit == APPLY_WORKGROUP);
+        let chunk =
+            budget.as_ref().filter(|_| group_work > 0).map(|(queue, limit)| (queue, (limit / group_work).clamp(1, u64::from(groups[axis].max(1))) as u32));
+        let Some((queue, per_chunk)) = chunk.filter(|(_, per_chunk)| *per_chunk < groups[axis]) else {
+            NeighbourhoodGpu::run(pipeline, device, encoder, scratch, &params, groups);
+            return;
+        };
+
+        let mut first = 0;
+        while first < groups[axis] {
+            let mut chunk_groups = groups;
+            chunk_groups[axis] = per_chunk.min(groups[axis] - first);
+            params.stage[2] = first * unit;
+            NeighbourhoodGpu::run(pipeline, device, encoder, scratch, &params, chunk_groups);
+            first += chunk_groups[axis];
+            let finished = std::mem::replace(&mut *encoder, device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_box_family") }));
+            queue.submit([finished.finish()]);
+        }
     };
+
+    // The work of one workgroup row of a texel pass at `per_texel`, and of one workgroup of lines `length` long
+    let texel_pass = |per_texel: u64| (APPLY_WORKGROUP, u64::from(texel_groups[0]) * u64::from(APPLY_WORKGROUP * APPLY_WORKGROUP) * per_texel);
+    let line_pass = |length: u32, per_texel: u64| (LINE_WORKGROUP, u64::from(LINE_WORKGROUP) * u64::from(length) * per_texel);
+    let own = texel_pass(OWN_PASS_WORK);
     let (original, output) = (region.original, region.output);
     match filter.kind {
         // What the box passes blur goes to the output field first, which the apply pass overwrites
         HIGHPASS | HALO | OUTLINE => {
-            run(&pipelines.prepare, [original, 0, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.prepare, [original, 0, output, 0], filter.radius, false, texel_groups, own);
             let blurred = box_passes(&mut run, &gpu.box_blur, region, output, filter.radius);
-            run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups, own);
         }
         PRE_BLUR => {
             let blurred = box_passes(&mut run, &gpu.box_blur, region, original, filter.radius);
-            run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups, own);
         }
         // Row distances in the first blur field, the envelopes' stacks in the second, the ramp in the output, then its smoothing
         DISTANCE_BEVEL | BEVEL_SMOOTH => {
             let [rows, stacks] = region.blur;
-            run(&pipelines.distance_rows, [original, 0, rows, 0], filter.radius, false, [height.div_ceil(LINE_WORKGROUP), 1]);
-            run(&pipelines.distance_columns, [original, stacks, rows, 0], filter.radius, false, [width.div_ceil(LINE_WORKGROUP), 1]);
-            run(&pipelines.distance_edges, [original, rows, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.distance_rows, [original, 0, rows, 0], filter.radius, false, line_groups(height), line_pass(width, ROW_PASS_WORK));
+            run(&pipelines.distance_columns, [original, stacks, rows, 0], filter.radius, false, line_groups(width), line_pass(height, COLUMN_PASS_WORK));
+            run(&pipelines.distance_edges, [original, rows, output, 0], filter.radius, false, texel_groups, own);
             let smoothing = filter.words[1];
             let ramp = if smoothing > 0 { box_passes(&mut run, &gpu.box_blur, region, output, smoothing) } else { output };
-            run(&pipelines.apply, [original, ramp, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.apply, [original, ramp, output, 0], filter.radius, false, texel_groups, own);
         }
         DIRECTIONAL_DISTANCE => {
             let inside = region.blur[0];
-            run(&pipelines.prepare, [original, 0, inside, 0], filter.radius, false, texel_groups);
-            run(&pipelines.directional_trail, [original, inside, output, 0], filter.radius, false, texel_groups);
-            run(&pipelines.apply, [original, output, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.prepare, [original, 0, inside, 0], filter.radius, false, texel_groups, own);
+            let trail = texel_pass(u64::from(filter.words[0]).saturating_add(1));
+            run(&pipelines.directional_trail, [original, inside, output, 0], filter.radius, false, texel_groups, trail);
+            run(&pipelines.apply, [original, output, output, 0], filter.radius, false, texel_groups, own);
         }
         // Pixelate gathers and the wrapping filters run the built-in passes
         _ => return false,
@@ -477,7 +522,7 @@ mod tests {
     use texturecraft_core::{
         BakedMap, Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, BlendMode, Channel, ChannelKind, ContentsOffset, DirectionalDistance, Effect,
         EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground,
-        MaskOutline, OutlinePosition, Project, Source, TextureSet,
+        MaskOutline, OutlinePosition, Procedural, ProceduralKind, Project, Source, TextureSet,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::primitives;
@@ -1111,6 +1156,62 @@ mod tests {
         assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
     }
 
+    /// `map` as the Distance Map of the last effect of `owner`'s content and of its mask.
+    fn set_distance_map(project: &mut Project, owner: LayerId, map: &Source) -> Option<()> {
+        let layer = project.layers.get_mut(&owner)?;
+        layer.content_effects.last_mut()?.inputs.insert("distanceMap".into(), map.clone());
+        layer.mask.as_mut()?.effects.last_mut()?.inputs.insert("distanceMap".into(), map.clone());
+        Some(())
+    }
+
+    /// Bevel Smooth and Directional Distance read their Distance Map as the CPU does, texel by
+    /// texel: a uniform gray and a procedural pattern (in the whole-set pre-pass), and a painted
+    /// layer below read through an anchor (in bands), each with a partial update.
+    #[test]
+    fn distance_maps_scale_bevel_smooth_and_directional_distance_like_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.3; 3], high: [0.9; 3], ramp: Vec::new() };
+        let smooth = Filter::BevelSmooth(BevelSmooth { distance: 0.2, ..BevelSmooth::LIBRARY });
+        let trail = Filter::DirectionalDistance(DirectionalDistance { angle: 30.0, ..DirectionalDistance::LIBRARY });
+        let normal = BlendMode::Normal;
+        // The checker's cell edges are a hard decision on both sides
+        let tolerance = Tolerance::NEIGHBOURHOOD.with_flips((SIZE * SIZE / 1000) as usize);
+        let cases = [
+            ("Bevel Smooth, uniform map", smooth.clone(), Source::Uniform([0.5; 3])),
+            ("Bevel Smooth, procedural map", smooth.clone(), checker.clone()),
+            ("Directional Distance, uniform map", trail.clone(), Source::Uniform([0.6; 3])),
+            ("Directional Distance, procedural map", trail.clone(), checker),
+        ];
+
+        for (label, filter, map) in &cases {
+            let (mut project, pixels, owner) = painted_project(&[(filter.clone(), 0.9, normal)], normal, (false, SIZE)).unwrap();
+            set_distance_map(&mut project, owner, map).unwrap();
+
+            check_project(&mut gpu, (&project, &pixels, owner), false, MIDDLE, tolerance, label);
+        }
+
+        // A painted gradient below, recorded by an anchor the map reads
+        for (label, filter) in [("Bevel Smooth, painted map", smooth), ("Directional Distance, painted map", trail)] {
+            let (mut project, mut pixels, owner) = painted_project(&[(filter, 1.0, normal)], normal, (false, SIZE)).unwrap();
+            let (donor, anchor) = (project.alloc_id(), project.alloc_id());
+            let mut layer = Layer::new(donor, "Map", LayerKind::Paint, &[Channel::BaseColor]);
+            layer.content_effects.push(Effect::new(anchor, EffectKind::Anchor));
+            project.insert_layer(0, layer, None, false).unwrap();
+            let stack = &mut project.texture_sets[0].stack;
+            stack.retain(|id| *id != donor);
+            stack.insert(0, donor);
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    let gray = to_u16(0.2 + 0.8 * x as f32 / SIZE as f32);
+                    pixels.layer_mut(donor, Channel::BaseColor, (SIZE, SIZE)).set(x, y, &[gray, gray, gray, u16::MAX]);
+                }
+            }
+            set_distance_map(&mut project, owner, &Source::Anchor { anchor, channel: Channel::BaseColor, ramp: Vec::new() }).unwrap();
+
+            check_project(&mut gpu, (&project, &pixels, owner), false, MIDDLE, Tolerance::NEIGHBOURHOOD, label);
+        }
+    }
+
     /// Every texel's trail finds the same shape at the same share of the reach as the CPU's.
     #[test]
     fn trail_distances_equal_the_cpu_exactly() {
@@ -1160,8 +1261,9 @@ mod tests {
         check_project(&mut gpu, (&project, &pixels, owner), false, MIDDLE, Tolerance::NEIGHBOURHOOD, "Bevel and Glow with an anchor read");
     }
 
-    /// Composite time of Glow, Drop Shadow and Bevel (the library's) at 2K and 4K, the GPU's (median
-    /// of five after a warm-up) against the CPU's, on the oracle's paint:
+    /// Composite time of Glow, Drop Shadow, Bevel, Bevel Smooth and Directional Distance (the
+    /// library's, the last two also with a Distance Map) at 2K and 4K, the GPU's (median of five
+    /// after a warm-up) against the CPU's, on the oracle's paint:
     /// `cargo test -p texturecraft-render --release --lib bench_box_and_distance_filters -- --ignored --nocapture`
     #[test]
     #[ignore = "benchmark"]
@@ -1177,18 +1279,24 @@ mod tests {
         let Some(mut gpu) = headless() else { return };
         let mesh = oracle_mesh(false);
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.3; 3], high: [0.9; 3], ramp: Vec::new() };
         let filters = [
-            ("Glow", LIBRARY_GLOW),
-            ("Drop Shadow", LIBRARY_DROP_SHADOW),
-            ("Bevel", Filter::DistanceBevel(Bevel::LIBRARY)),
-            ("Bevel Smooth", Filter::BevelSmooth(BevelSmooth::LIBRARY)),
-            ("Directional Distance", Filter::DirectionalDistance(DirectionalDistance::LIBRARY)),
+            ("Glow", LIBRARY_GLOW, None),
+            ("Drop Shadow", LIBRARY_DROP_SHADOW, None),
+            ("Bevel", Filter::DistanceBevel(Bevel::LIBRARY), None),
+            ("Bevel Smooth", Filter::BevelSmooth(BevelSmooth::LIBRARY), None),
+            ("Directional Distance", Filter::DirectionalDistance(DirectionalDistance::LIBRARY), None),
+            ("Bevel Smooth with a procedural map", Filter::BevelSmooth(BevelSmooth::LIBRARY), Some(checker.clone())),
+            ("Directional Distance with a procedural map", Filter::DirectionalDistance(DirectionalDistance::LIBRARY), Some(checker)),
         ];
         for side in [2048, 4096] {
             gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((side, side), 0)], 1);
             let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, side, side));
-            for (label, filter) in &filters {
-                let (project, pixels, _) = painted_project(&[(filter.clone(), 1.0, BlendMode::Normal)], BlendMode::Normal, (false, side)).unwrap();
+            for (label, filter, map) in &filters {
+                let (mut project, pixels, owner) = painted_project(&[(filter.clone(), 1.0, BlendMode::Normal)], BlendMode::Normal, (false, side)).unwrap();
+                if let Some(map) = map {
+                    set_distance_map(&mut project, owner, map).unwrap();
+                }
                 let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
                 program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
                 // A halo too large for the adapter's working memory is reported, not timed

@@ -324,7 +324,10 @@ impl NeighbourhoodFilter {
         if self.kind.gather() {
             return gather::blur_fields(self);
         }
-        if self.kind.box_family() || self.uses_box() { 2 } else { 0 }
+        if self.kind.box_family() {
+            return box_family::blur_fields(self);
+        }
+        if self.uses_box() { 2 } else { 0 }
     }
 
     /// Whether the stage runs the three box passes before its apply pass (`uses_box_kind` in
