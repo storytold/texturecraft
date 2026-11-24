@@ -831,11 +831,16 @@ fn gather_color_match(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
     }
     var goal = params.extra[1].xyz;
 
-    // A linked Input or Image Input gives the texel its own source or target
+    // A linked Input or Image Input gives the texel its own source or target; with both, the
+    // Image Input is the second input
     if stage_linked() {
-        let linked = gather_color_reference(input_color_at(vec2<u32>(vec2<i32>(point) - field_origin())), polar);
+        let local = vec2<u32>(vec2<i32>(point) - field_origin());
+        let linked = gather_color_reference(input_color_at(local), polar);
         if (flags & GATHER_COLOR_MATCH_SOURCE_INPUT) != 0u {
             source = linked;
+            if stage_has_second_input() {
+                goal = gather_color_reference(input2_color_at(local), polar);
+            }
         } else if (flags & GATHER_COLOR_MATCH_TARGET_INPUT) != 0u {
             goal = linked;
         }
