@@ -2799,6 +2799,41 @@ pub(crate) mod tests {
         assert!(live.iter().zip(&committed).all(|(a, b)| close(a, b)), "live {live:?}, committed {committed:?}");
     }
 
+    /// A stroke carrying picked-up values (here the brush material's pattern) rasterises on the
+    /// CPU, and the GPU compositor shows it live from the pixels its release commits
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_pickup_stroke_composites_live_on_the_gpu() {
+        let Ok(gpu) = Headless::new() else { return };
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let mut s = Session::new_project("GPU pickup preview", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        execute(&mut s, "tool.material", &json!({"material": "copper"})).unwrap();
+        execute(&mut s, "tool.brush", &json!({"size": 40})).unwrap();
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+        let display = |link: &mut GpuLink, s: &mut Session| -> [u8; 4] {
+            let scene = link.sync(s, None, None, 0, 0.0);
+            let gpu = &mut *brush.0.lock().unwrap();
+            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{errors:?}");
+            let texture = gpu.renderer.display_textures()[0][0];
+            read_center(gpu, texture)
+        };
+        let neutral = display(&mut link, &mut s);
+
+        s.brush_device = link.brush_device(&s);
+        s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+        assert!(s.device_stroke().is_none(), "a pickup rasterises on the CPU");
+        let live = display(&mut link, &mut s);
+        assert_eq!(link.compositor_status().0, "Layers: GPU", "the live pickup stroke composites on the GPU");
+        s.end_stroke().unwrap();
+        let committed = display(&mut link, &mut s);
+
+        assert_ne!(live, neutral, "the stroke shows while it is drawn");
+        assert!(live.iter().zip(committed).all(|(a, b)| a.abs_diff(b) <= 1), "live {live:?}, committed {committed:?}");
+    }
+
     /// The Projection tool in the 2D view runs on the GPU brush: the stencil the 3D camera lays
     /// colours the live stroke as its release does
     #[cfg(not(target_arch = "wasm32"))]

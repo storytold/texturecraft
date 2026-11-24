@@ -736,12 +736,13 @@ impl Session {
         valid.then_some(device)
     }
 
-    /// Identity and tiles of a supported live stroke since the display last drew it.
+    /// Identity and tiles of a supported live stroke since the display last drew it. A pickup
+    /// (clone, smudge, brush material) shows through [`Session::display_stroke_pixels`].
     pub fn pending_display_stroke(&self, ts: usize) -> Option<(u64, &BTreeSet<(u32, u32)>)> {
         let stroke = self.stroke.as_ref()?;
         let tiles = &stroke.display_tiles;
         let can_preview = stroke.stencil.is_none() || stroke.device.is_some();
-        (stroke.ts == ts && stroke.target.is_some() && can_preview && stroke.canvas.pickup.is_none()).then_some((stroke.display_id, tiles))
+        (stroke.ts == ts && stroke.target.is_some() && can_preview).then_some((stroke.display_id, tiles))
     }
 
     /// Copy-on-write material pixels for display. The staged blends are the same tiles the
