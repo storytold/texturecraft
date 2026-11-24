@@ -59,6 +59,9 @@ const GATHER_DIRECTION_COUNT_SHIFT: u32 = 4u;
 const GATHER_SOURCE_MODE_SHIFT: u32 = 8u;
 const GATHER_SOURCE_TILED: u32 = 1024u;
 const GATHER_READ_COUNT_SHIFT: u32 = 16u;
+// A repeating source's seed word (gather::source_seed): its block's side below, its tile's above
+const GATHER_TILE_SIDE_SHIFT: u32 = 16u;
+const GATHER_BLOCK_SIDE_MASK: u32 = 0xffffu;
 const GATHER_WARP_MODE_WARP: u32 = 0u;
 const GATHER_WARP_MODE_MULTI_DIRECTIONAL: u32 = 2u;
 const GATHER_WARP_BLENDING_MAX: u32 = 1u;
@@ -347,11 +350,13 @@ fn gather_source_raw(texel: vec2<f32>, position: vec2<f32>) -> vec2<f32> {
     // Keep the bilinear taps in this UV tile at the ends of each repeat
     var at = position;
     if (flags & GATHER_SOURCE_TILED) != 0u {
-        let side = vec2<f32>(params.bounds.zw - params.bounds.xy);
-        let origin = floor(texel / side) * side;
+        // The tile at its atlas block's stride, which a UV tile atlas's smaller tile fills only in part
+        let block = f32(params.mode.z & GATHER_BLOCK_SIDE_MASK);
+        let side = f32(params.mode.z >> GATHER_TILE_SIDE_SHIFT);
+        let origin = floor(texel / block) * block;
         let repeated = (position - origin + 0.5) * params.weights.z;
-        let wrapped = vec2(gather_rem_euclid(repeated.x, side.x), gather_rem_euclid(repeated.y, side.y)) - 0.5;
-        at = origin + clamp(wrapped, vec2(0.0), side - 1.0);
+        let wrapped = vec2(gather_rem_euclid(repeated.x, side), gather_rem_euclid(repeated.y, side)) - 0.5;
+        at = origin + clamp(wrapped, vec2(0.0), vec2(side - 1.0));
     }
     if mode == GATHER_SOURCE_CUSTOM_NOISE {
         return gather_input(at);
@@ -880,7 +885,7 @@ fn gather_round(value: f32) -> f32 {
     return sign(value) * (whole + select(0.0, 1.0, abs(value) - whole >= 0.5));
 }
 
-// The top left of the UV tile (`side` texels) a home position lies in
+// The top left of the atlas block (`side` texels) a home position lies in, where its UV tile starts
 fn gather_tile_origin(home: vec2<f32>, side: f32) -> vec2<f32> {
     return floor(home / side) * side;
 }
@@ -903,7 +908,8 @@ fn gather_mirror(home: vec2<f32>, original: vec4<f32>) -> Texel {
     let axes = params.extra[0].xy;
     let line = params.extra[0].z;
     let side = params.extra[0].w;
-    let origin = gather_tile_origin(home, side);
+    // The tile at its atlas block's stride (a UV tile atlas's smaller tile fills part of it)
+    let origin = gather_tile_origin(home, params.extra[1].x);
     let local = home - origin;
     if local.x >= side || local.y >= side {
         return EMPTY;
@@ -940,7 +946,8 @@ fn gather_transform(home: vec2<f32>) -> Texel {
     let shift = params.extra[1].xy;
     let side = params.extra[1].z;
     let repeats = params.field_layout.z != 0u;
-    let origin = gather_tile_origin(home, side);
+    // The tile at its atlas block's stride (a UV tile atlas's smaller tile fills part of it)
+    let origin = gather_tile_origin(home, params.extra[1].w);
     let local = home - origin;
     if local.x >= side || local.y >= side {
         return EMPTY;

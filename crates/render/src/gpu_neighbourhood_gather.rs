@@ -119,6 +119,15 @@ const READ_COUNT_SHIFT: u32 = 16;
 /// Samples along a slope blur at most (`LINE_SAMPLES` in eval.rs).
 const LINE_SAMPLES: u32 = 24;
 
+/// Where a Mirror and a Transform stage keep their atlas block's side in `extra` (`params.extra[1].x`
+/// and `.w` in the WGSL file): a UV tile atlas's tile can fill only part of its block (P8).
+const MIRROR_BLOCK: usize = 4;
+const TRANSFORM_BLOCK: usize = 7;
+/// A Warp's or Blur Slope's repeating source keeps its atlas block's side in the low bits of
+/// `seed` (unused by a source other than the default noise) and its tile's side above them (P8).
+const TILE_SIDE_SHIFT: u32 = 16;
+const BLOCK_SIDE_MASK: u32 = (1 << TILE_SIDE_SHIFT) - 1;
+
 /// The least steepness a source contrast below 1 keeps (`MIN_STEEPNESS` in core's gradient_input.rs).
 const MIN_SOURCE_STEEPNESS: f32 = 1e-3;
 
@@ -354,6 +363,18 @@ fn source_settings(out: &mut NeighbourhoodFilter, source: &WarpSource, resolutio
     (mode << SOURCE_MODE_SHIFT) | flag(tiled_source(source), SOURCE_TILED)
 }
 
+/// The seed word of a Warp or Blur Slope: its noise seed, or for a source repeating within the UV
+/// tile the tile's side (`resolution` texels) and its atlas block's, the same in a classic set
+/// (`WarpSourceSample::new`'s block and tile sizes).
+fn source_seed(seed: u32, source: &WarpSource, resolution: u32) -> u32 {
+    if !tiled_source(source) {
+        return seed;
+    }
+
+    let side = resolution.min(BLOCK_SIDE_MASK);
+    side | (side << TILE_SIDE_SHIFT)
+}
+
 /// A Warp stage: the move in `amount`, the directions (Warp mode: the slope's measuring span) in
 /// `extra`, the source as [`source_settings`] lays it out.
 fn source_warp(stage: StageInputs, warp: &SourceWarp) -> NeighbourhoodFilter {
@@ -380,7 +401,7 @@ fn source_warp(stage: StageInputs, warp: &SourceWarp) -> NeighbourhoodFilter {
         *slot = *along;
     }
     out.amount = warp.move_texels(resolution);
-    out.seed = warp.seed;
+    out.seed = source_seed(warp.seed, &warp.source, resolution);
     let source = source_settings(&mut out, &warp.source, resolution);
     out.words[0] = (mode << WARP_MODE_SHIFT) | (blending << BLENDING_SHIFT) | ((directions.len() as u32) << DIRECTION_COUNT_SHIFT) | source;
     out
@@ -400,14 +421,15 @@ fn source_slope_blur(stage: StageInputs, slope: &SourceSlopeBlur) -> Neighbourho
 
     let mut out = stage.filter(SOURCE_SLOPE_BLUR, source_texels(slope.reach(resolution), &slope.source, stage));
     out.amount = reach;
-    out.seed = slope.seed;
+    out.seed = source_seed(slope.seed, &slope.source, resolution);
     let source = source_settings(&mut out, &slope.source, resolution);
     out.words[0] = (blending << BLENDING_SHIFT) | (reads << READ_COUNT_SHIFT) | source;
     out
 }
 
-/// A Mirror stage: the axes, the debug line's half width (a share of the tile) and the tile's
-/// side in `extra`, its sides in `words[0]`. The CPU's block is the tile's side too.
+/// A Mirror stage: the axes, the debug line's half width (a share of the tile), the tile's side
+/// and its atlas block's in `extra`, its sides in `words[0]`. The block is the tile's side but in
+/// a UV tile atlas's smaller tiles.
 fn mirror_stage(stage: StageInputs, mirror: &Mirror) -> NeighbourhoodFilter {
     let side = stage.resolution.max(1) as f32;
     let axis = |at: f32| if at.is_finite() { at.clamp(0.0, 1.0) } else { 0.5 };
@@ -423,6 +445,7 @@ fn mirror_stage(stage: StageInputs, mirror: &Mirror) -> NeighbourhoodFilter {
 
     let mut out = stage.filter(MIRROR, side);
     out.extra[..4].copy_from_slice(&[axes[0], axes[1], line, side]);
+    out.extra[MIRROR_BLOCK] = side;
     out.words[0] = flag(mirrored[0], MIRROR_X)
         | flag(mirrored[1], MIRROR_Y)
         | flag(keep_after[0], MIRROR_KEEP_RIGHT)
@@ -431,14 +454,15 @@ fn mirror_stage(stage: StageInputs, mirror: &Mirror) -> NeighbourhoodFilter {
     out
 }
 
-/// A Transform stage: the affine's columns and shift and the tile's side in `extra`, whether it
-/// repeats in `words[0]`.
+/// A Transform stage: the affine's columns and shift, the tile's side and its atlas block's in
+/// `extra`, whether it repeats in `words[0]`.
 fn transform_stage(stage: StageInputs, transform: &TileTransform) -> NeighbourhoodFilter {
     let side = stage.resolution.max(1) as f32;
     let (columns, shift) = transform.affine();
 
     let mut out = stage.filter(TRANSFORM, side);
     out.extra[..7].copy_from_slice(&[columns[0][0], columns[0][1], columns[1][0], columns[1][1], shift[0], shift[1], side]);
+    out.extra[TRANSFORM_BLOCK] = side;
     out.words[0] = u32::from(transform.repeat == RepeatMode::HorizontallyAndVertically);
     out
 }
