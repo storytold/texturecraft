@@ -2354,7 +2354,9 @@ fn fields_of(inp: &EvaluationInputs, channels: &[Channel], (list, around): (&[La
 }
 
 /// The order a layer's content fields are built in: the set's channels, with Height before Normal
-/// when a Height To Normal reads the layer's Height (its Normal stage reads the Height's field)
+/// when a Height To Normal reads the layer's Height (its Normal stage reads the Height's field),
+/// and Base Color last when it is lit by the layer's material (a stage after the lighting reads
+/// the other channels' fields, see `lit_prefix`)
 fn field_channel_order(layer: &Layer, channels: &[Channel]) -> Vec<Channel> {
     let mut ordered = channels.to_vec();
     let reads_height = layer.content_effects.iter().any(|effect| effect.visible && matches!(effect.kind, EffectKind::Filter(Filter::HeightToNormal(_))));
@@ -2364,6 +2366,12 @@ fn field_channel_order(layer: &Layer, channels: &[Channel]) -> Vec<Channel> {
     {
         let moved = ordered.remove(height);
         ordered.insert(normal, moved);
+    }
+
+    let lit = layer.content_effects.iter().any(|effect| effect.visible && lights_material(&effect.kind));
+    if let (true, Some(base_color)) = (lit, ordered.iter().position(|&channel| channel == Channel::BaseColor)) {
+        let moved = ordered.remove(base_color);
+        ordered.push(moved);
     }
     ordered
 }
@@ -5370,6 +5378,74 @@ mod tests {
 
         assert_eq!(default_order, height_first, "the Normal stage reads the blurred Height in the default order too");
         assert_ne!(height_first, normals(true, false), "the blur changes the normal");
+    }
+
+    /// Lighting before a Base Color stage (`lit_prefix`) reads its layer's material after the
+    /// material's own neighbourhood stages (a Blur on Metallic, Roughness, Normal and Height),
+    /// whatever order the set lists Base Color in.
+    #[test]
+    fn lighting_before_a_stage_reads_the_blurred_material_in_any_channel_order() {
+        use texturecraft_core::StylizedLighting;
+
+        let stylized = Filter::BakedLighting {
+            azimuth: 30.0,
+            elevation: 50.0,
+            light: 1.0,
+            ambient: 1.0,
+            occlusion: 0.0,
+            stylized: Some(Box::new(StylizedLighting::library())),
+        };
+        let environment = Filter::EnvironmentLighting {
+            horizontal: 0.0,
+            vertical: 0.0,
+            exposure: 0.0,
+            height_intensity: 1.0,
+            ambient_occlusion: 1.0,
+            specular_occlusion: 1.0,
+        };
+        let lit = |lighting: &Filter, base_color_last: bool, blurred: bool| {
+            let mut f = fixture();
+            if base_color_last {
+                let channels = &mut f.project.texture_sets[0].channels;
+                let base_color = channels.iter().position(|(channel, _)| *channel == Channel::BaseColor).unwrap();
+                let entry = channels.remove(base_color);
+                channels.push(entry);
+            }
+            let id = f.project.alloc_id();
+            let channels = [Channel::BaseColor, Channel::Metallic, Channel::Roughness, Channel::Normal, Channel::Height];
+            let mut layer = Layer::new(id, "Paint", LayerKind::Paint, &channels);
+            let on = |filter: Filter, only: &[Channel], f: &mut Fixture| {
+                let mut effect = Effect::new(f.project.alloc_id(), EffectKind::Filter(filter));
+                effect.off_channels = channels.into_iter().filter(|channel| !only.contains(channel)).collect();
+                effect
+            };
+            if blurred {
+                layer.content_effects.push(on(Filter::Blur { radius: 160.0, wrap: false }, &channels[1..], &mut f));
+            }
+            layer.content_effects.push(on(lighting.clone(), &[Channel::BaseColor], &mut f));
+            layer.content_effects.push(on(Filter::Blur { radius: 4.0, wrap: false }, &[Channel::BaseColor], &mut f));
+            f.project.insert_layer(0, layer, None, false).unwrap();
+
+            // Steps in the material: only the blurred steps change it away from the edge
+            for y in 0..64 {
+                for x in 0..64 {
+                    let right = x >= 32;
+                    f.pixels.layer_mut(id, Channel::BaseColor, (64, 64)).set(x, y, &[to_u16(0.6), to_u16(0.45), to_u16(0.3), u16::MAX]);
+                    f.pixels.layer_mut(id, Channel::Metallic, (64, 64)).set(x, y, &[to_u16(if right { 1.0 } else { 0.0 }), u16::MAX]);
+                    f.pixels.layer_mut(id, Channel::Roughness, (64, 64)).set(x, y, &[to_u16(if right { 0.2 } else { 0.8 }), u16::MAX]);
+                    f.pixels.layer_mut(id, Channel::Normal, (64, 64)).set(x, y, &[to_u16(0.5), to_u16(0.5), u16::MAX, u16::MAX]);
+                    f.pixels.layer_mut(id, Channel::Height, (64, 64)).set(x, y, &[to_u16_signed(if right { 0.4 } else { 0.0 }), u16::MAX]);
+                }
+            }
+            let out = run(&f, None);
+            (24..40).map(|x| out.value(Channel::BaseColor, x, 20)).collect::<Vec<_>>()
+        };
+
+        for lighting in [stylized, environment] {
+            let base_color_last = lit(&lighting, true, true);
+            assert_eq!(lit(&lighting, false, true), base_color_last, "{lighting:?}: the default order reads the blurred material too");
+            assert_ne!(base_color_last, lit(&lighting, true, false), "{lighting:?}: the blur changes the lit base color");
+        }
     }
 
     #[test]
