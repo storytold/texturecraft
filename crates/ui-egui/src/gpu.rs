@@ -2724,7 +2724,7 @@ pub(crate) mod tests {
 
     /// The Eraser on a paint layer and on a mask runs on the GPU brush, and its live preview shows
     /// what the release commits: on every painted channel, on the enabled ones only, and on a
-    /// mask in the material and the mask view
+    /// mask in the material and the mask view.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_eraser_previews_what_it_commits_on_layers_and_masks() {
@@ -2826,7 +2826,7 @@ pub(crate) mod tests {
         assert!(covered > 0 && differing * 1000 <= covered, "{differing}/{covered} texels differ");
     }
 
-    /// A stroke with particles never reaches the GPU brush, the Eraser included
+    /// A stroke with particles never reaches the GPU brush, the Eraser included.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_particle_eraser_stroke_stays_off_the_gpu_brush() {
@@ -2851,7 +2851,7 @@ pub(crate) mod tests {
     }
 
     /// A stroke with symmetry runs on the GPU brush in the 2D and the 3D view: its mirrored copy
-    /// shows live where the release commits it
+    /// shows live where the release commits it.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn symmetric_strokes_preview_their_copies_on_the_gpu() {
@@ -2904,7 +2904,7 @@ pub(crate) mod tests {
     }
 
     /// One device stroke feeds every texture set of its size drawing the painted layer: an
-    /// instance on another set shows the stroke live as it shows the release
+    /// instance on another set shows the stroke live as it shows the release.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_gpu_stroke_feeds_an_instance_on_another_texture_set() {
@@ -2950,7 +2950,7 @@ pub(crate) mod tests {
     }
 
     /// A stroke carrying picked-up values (here the brush material's pattern) rasterises on the
-    /// CPU, and the GPU compositor shows it live from the pixels its release commits
+    /// CPU, and the GPU compositor shows it live from the pixels its release commits.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_pickup_stroke_composites_live_on_the_gpu() {
@@ -2985,7 +2985,7 @@ pub(crate) mod tests {
     }
 
     /// The Projection tool in the 2D view runs on the GPU brush: the stencil the 3D camera lays
-    /// colours the live stroke as its release does
+    /// colours the live stroke as its release does.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_2d_view_projection_stroke_previews_its_stencil_on_the_gpu() {

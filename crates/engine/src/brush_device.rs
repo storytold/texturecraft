@@ -38,7 +38,7 @@ pub struct DeviceStrokePreview<'a> {
     pub values: &'a BTreeMap<Channel, [f32; 3]>,
     pub mask_value: f32,
     pub opacity: f32,
-    /// The Eraser: the stroke scales the target's paint and coverage down instead of painting
+    /// The Eraser: the stroke scales the target's paint and coverage down instead of painting.
     pub erase: bool,
     pub stroke: &'a dyn DeviceStroke,
 }

@@ -56,9 +56,9 @@ struct Dab {
     bitangent: [f32; 4],
     seed: u32,
     padding: [u32; 3],
-    /// A symmetry copy's source origin with w 1, zero for any other dab
+    /// A symmetry copy's source origin with w 1, zero for any other dab.
     source: [f32; 4],
-    /// The columns of the copy's `StampSource::to_source`
+    /// The columns of the copy's `StampSource::to_source`.
     to_source: [[f32; 4]; 3],
 }
 
@@ -852,7 +852,7 @@ mod tests {
     }
 
     /// Coverage within one 8-bit step, except visibility decisions flipped on at most 0.1 % of
-    /// the covered texels
+    /// the covered texels.
     fn assert_coverage_matches(cpu: &TileImage, gpu: &TileImage, label: &str) {
         const EIGHT_BIT_STEP: u16 = 257;
         let (mut covered, mut differing) = (0, 0);

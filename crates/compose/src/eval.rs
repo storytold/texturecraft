@@ -5347,7 +5347,7 @@ mod tests {
         assert!(close(out.value(Channel::BaseColor, 3, 3), [0.5; 3]));
     }
 
-    /// A live erase previews the channels its commit erases: the listed ones, or every painted one
+    /// A live erase previews the channels its commit erases: the listed ones, or every painted one.
     #[test]
     fn a_live_erase_previews_only_the_channels_it_erases() {
         let mut f = fixture();

@@ -780,7 +780,7 @@ impl LiveBrush {
     }
 
     /// The live paint of `channel` on paint layer or content paint effect `id`: its value, the
-    /// stroke opacity and whether it erases
+    /// stroke opacity and whether it erases.
     fn value_for_layer(&self, id: LayerId, channel: Channel) -> Option<([f32; 3], f32, bool)> {
         let LiveBrushTarget::Layer { layer, values } = &self.target else { return None };
         if *layer != id {

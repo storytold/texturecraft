@@ -2,12 +2,14 @@
 //! other package edits this file or `shaders/composite_brush.wgsl`.
 //!
 //! On the GPU brush: Paint, the Eraser on layers and masks (the ordinary eraser, flagged with
-//! `BRUSH_ERASE`), the Projection tool in both views, symmetry copies in both views, and one
-//! device stroke feeding every texture set of its size that draws the layer. Pickup strokes
-//! (Smudge, Clone, Paint with a material pattern) rasterise on the CPU and composite live on the
-//! GPU from `display_stroke_pixels`. Still on the CPU: mask strokes painting a mask image (the
-//! live gray needs the texel in `live_brush_paint`), and strokes with a brush alpha image or a
-//! library tip.
+//! `BRUSH_ERASE`), the Projection tool in both views, symmetry copies in both views, path curves,
+//! and one device stroke feeding every texture set of its size that draws the layer. A stencil
+//! stroke feeds only its own set, because the stencil is sampled at that set's surface. Pickup
+//! strokes (Smudge, Clone, Paint with a material pattern) rasterise on the CPU and composite live
+//! on the GPU from `display_stroke_pixels`. Still on the CPU: particle strokes, mask strokes
+//! painting a mask image (the live gray needs the texel in `live_brush_paint`), strokes with a
+//! brush alpha image or a library tip, and Polygon Fill, which fills whole triangles into the
+//! document pixels in one step with no live stroke to preview or composite.
 //!
 //! P7 also owns `gpu_brush.rs`, `shaders/brush.wgsl`, crates/engine/src/painting.rs,
 //! crates/engine/src/brush_device.rs, `LiveBrush` and `content_paint` in gpu_composite.rs, and
@@ -28,11 +30,11 @@ use super::packages::BRUSH_OP_BITS;
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
 /// The `ext[2]` bit (one of [`BRUSH_OP_BITS`]) of a live paint operation whose stroke erases;
-/// `BRUSH_ERASE` in WGSL
+/// `BRUSH_ERASE` in WGSL.
 const BRUSH_ERASE: u32 = 0x0100_0000;
 
 /// The P7 bits of a live paint operation's `ext[2]`: zero leaves the premultiplied over of
-/// `painted()` in composite.wgsl
+/// `painted()` in composite.wgsl.
 pub(super) fn live_paint_bits(erase: bool) -> u32 {
     if erase { BRUSH_ERASE } else { 0 }
 }
