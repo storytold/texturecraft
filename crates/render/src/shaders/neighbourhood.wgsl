@@ -41,6 +41,20 @@ fn input_at(position: vec2<u32>) -> f32 {
     return bitcast<f32>(fields[word_at(params.buffers.x, position) + 5u]);
 }
 
+// Whether this stage has an input of its own (a linked image input or the layer's Height), not
+// only the program's input word (NeighbourhoodRegion::input bit 1).
+fn stage_linked() -> bool {
+    return (params.field_layout.y & 2u) != 0u;
+}
+
+// The input's colour at an original-field texel: words 5..8 when the fields carry colour
+// (NeighbourhoodRegion::input bit 2, ProceduralInputs::register_color_input), else its gray.
+fn input_color_at(position: vec2<u32>) -> vec3<f32> {
+    if (params.field_layout.y & 4u) == 0u { return vec3(input_at(position)); }
+    let i = word_at(params.buffers.x, position);
+    return bitcast<vec3<f32>>(vec3(fields[i + 5u], fields[i + 6u], fields[i + 7u]));
+}
+
 // What the stage filters (NeighbourhoodFilter::context): a mask, or content by channel kind.
 const STAGE_MASK: u32 = 0u;
 const STAGE_COLOR: u32 = 1u;
@@ -289,6 +303,11 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
             for (var i = 0; i <= n; i++) {
                 acc = sample_field(acc, point + direction * (f32(i) * step));
             }
+        }
+        // Test probe (INPUT_PROBE in Rust): the stage's input colour at the texel
+        case 15u: {
+            let local = vec2<u32>(vec2<i32>(point) - field_origin());
+            return vec4(input_color_at(local) * original.a, original.a);
         }
         case 10u: {
             let center = (floor(home / radius) + 0.5) * radius - 0.5 + shift;

@@ -108,6 +108,18 @@ pub(super) fn lower_filter(filter: &Filter, effect: &Effect, op: &mut Operation,
         }
         return Some((probe, [0.0; 3]));
     }
+    // Test seam: Height To Normal and Color Match as the input probe stage, Color Match with a
+    // colour input of its `source` colour
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if crate::gpu_neighbourhood::INPUT_PROBE.get() && matches!(filter, Filter::HeightToNormal(_) | Filter::ColorMatch(_)) {
+        if let Filter::ColorMatch(matching) = filter {
+            let color = matching.source_color;
+            op.effects[3] = inputs.register_color_input(Operation { low: [color[0], color[1], color[2], 1.0], ..bytemuck::Zeroable::zeroed() });
+        }
+        op.ids[2] = inputs.filters.len() as u32;
+        inputs.filters.push((filter.clone(), effect.opacity));
+        return Some((super::NEIGHBOURHOOD_OPCODE, [0.0; 3]));
+    }
     let mut lowered = point::lower(filter, effect, op, inputs);
     if lowered.is_none() {
         lowered = lighting::lower(filter, effect, op, inputs);

@@ -277,6 +277,8 @@ struct ProceduralInputs {
     environment_word: Option<u32>,
     /// A lowering reads the Height and World Normal bake rows (`read_bake_rows`).
     bake_rows: bool,
+    /// The image inputs (`register_input` references) read as colour (`register_color_input`).
+    color_inputs: BTreeSet<u32>,
 }
 
 #[derive(Default)]
@@ -324,7 +326,18 @@ impl ProceduralInputs {
             image_words: Vec::new(),
             environment_word: None,
             bake_rows: false,
+            color_inputs: BTreeSet::new(),
         }
+    }
+
+    /// [`Self::register_input`] for an input read as colour: a neighbourhood stage's field then
+    /// carries its RGB in words 5..8 (`input_color_at` in neighbourhood.wgsl), and a point
+    /// operation reads it with `effect_input_color(effect, texel)`. P5: Color Match's inputs.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn register_color_input(&mut self, source: Operation) -> u32 {
+        let reference = self.register_input(source);
+        self.color_inputs.insert(reference);
+        reference
     }
 
     /// Reserve the [`ENVIRONMENT_WORDS`] side-table words that hold the viewport environment's
@@ -455,6 +468,8 @@ struct FilterStage {
     /// The operation (index plus one, 0: none) the prepare pass evaluates into the field's sixth
     /// word: an image input's gray (P3) or the layer's own Height (P5, Height To Normal).
     input: u32,
+    /// How the prepare pass reads `input` ([`INPUT_LAYER`], [`INPUT_COLOR`]; 0: an input source's gray)
+    input_kind: u32,
     /// The prepare pass reads the set periodically outside it (P4: Blur and Bevel `wrap`), and
     /// the fields of the program may start below zero ([`FilterPlan::wraps`]).
     wrap: bool,
@@ -472,6 +487,12 @@ struct WholeSet {
     outputs: Vec<usize>,
     reach: u32,
 }
+
+/// `FilterStage::input_kind`, also the bits of the prepare pass's `field_layout.w`: the input is a
+/// layer operation whose content times coverage the prepare pass evaluates (Height To Normal's
+/// own Height, `layer_content`), or an input source read as colour into words 5..8.
+const INPUT_LAYER: u32 = 2;
+const INPUT_COLOR: u32 = 4;
 
 /// Whole-set stages the band uniform can address (`whole_slots` in composite.wgsl)
 const MAX_WHOLE_SET_STAGES: usize = 4;
@@ -491,11 +512,17 @@ impl FilterStage {
     }
 }
 
+/// What `FilterPlan::compile` has done so far: the layer operations whose content is planned, the
+/// capture stages of the stack reads by (end operation, channel), and the effects bound to one.
+type ContentProgress<'a> = (&'a mut BTreeSet<usize>, &'a mut BTreeMap<(u32, Channel), u32>, &'a mut BTreeSet<usize>);
+
 #[derive(Debug, Default)]
 struct FilterPlan {
     stages: Vec<FilterStage>,
     reach: u32,
     anchor_slots: Vec<u32>,
+    /// The operation index of the first input source (`bind_input_sources`), while compiling
+    input_base: u32,
 }
 
 impl FilterPlan {
@@ -504,7 +531,7 @@ impl FilterPlan {
         if inputs.filters.is_empty() && inputs.generator_stages.is_empty() && inputs.anchors.reads.is_empty() && !reads_stack {
             return Self::default();
         }
-        let mut plan = Self::default();
+        let mut plan = Self { input_base: (operations.len() - inputs.input_sources.len()) as u32, ..Self::default() };
         let (layers, effects) = operations.split_at_mut(layer_count as usize);
         let mut masks = BTreeMap::new();
         plan.anchor_slots.resize(inputs.anchors.reads.len(), 0);
@@ -528,20 +555,16 @@ impl FilterPlan {
                 let same_layer = |op: &Operation| op.effects[..2] == layers[index].effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
                 let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
                 for own in index..end {
-                    plan.bind_stack_reads(layers, effects, own, (&mut stack_reads, &mut read_effects));
-                    plan.add_content_stack(layers, effects, own, inputs);
-                    prepared.insert(own);
+                    plan.add_layer_content(layers, effects, own, inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
                 }
             }
             let mask_has_fields = mask_count > 0
                 && *masks.entry(mask).or_insert_with(|| {
                     let before = plan.stages.len();
-                    plan.add_stack(effects, mask, mask_count, index as u32, None, inputs);
+                    plan.add_stack(effects, (mask, mask_count), (index as u32, None), None, inputs);
                     plan.stages.len() != before
                 });
-            if !prepared.contains(&index) {
-                plan.add_content_stack(layers, effects, index, inputs);
-            }
+            plan.add_layer_content(layers, effects, index, inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
             layers[index].spatial[2] = u32::from(mask_has_fields);
         }
         // An anchor can carry a filter's footprint into the next layer. Independent
@@ -657,6 +680,7 @@ impl FilterPlan {
                         cell: 1,
                         anchor: Some((channel, u32::MAX, 0)),
                         input: 0,
+                        input_kind: 0,
                         wrap: false,
                         whole: false,
                     });
@@ -676,12 +700,29 @@ impl FilterPlan {
         }
     }
 
-    /// The content stack of layer operation `index`: its first stage and whether it has any in
-    /// the layer's `spatial[0..2]`.
-    fn add_content_stack(&mut self, layers: &mut [Operation], effects: &mut [Operation], index: usize, inputs: &ProceduralInputs) {
+    /// The stack reads and the content stack of layer operation `index`, once: its first stage
+    /// and whether it has any in the layer's `spatial[0..2]`. A Normal operation whose stack has a
+    /// Height To Normal stage reads its layer's own Height operation (`INPUT_LAYER`), whose stack
+    /// goes first so the Normal stage's prepare pass reads prepared Height fields.
+    fn add_layer_content(
+        &mut self,
+        layers: &mut [Operation],
+        effects: &mut [Operation],
+        index: usize,
+        inputs: &ProceduralInputs,
+        (prepared, stages, done): ContentProgress,
+    ) {
+        if !prepared.insert(index) {
+            return;
+        }
+        let height = layer_height(layers, effects, index, inputs);
+        if let Some(height) = height.filter(|&height| height != index) {
+            self.add_layer_content(layers, effects, height, inputs, (prepared, stages, done));
+        }
+        self.bind_stack_reads(layers, effects, index, (stages, done));
         let [_, _, content, content_count] = layers[index].effects;
         let first = self.stages.len();
-        self.add_stack(effects, content, content_count, index as u32, Some(slot_kind(layers[index].ids[0])), inputs);
+        self.add_stack(effects, (content, content_count), (index as u32, height.map(|height| height as u32)), Some(slot_kind(layers[index].ids[0])), inputs);
         layers[index].spatial[..2].copy_from_slice(&[first as u32, u32::from(first != self.stages.len())]);
     }
 
@@ -696,6 +737,7 @@ impl FilterPlan {
                 cell: 1,
                 anchor: material.map(|(first, cut)| (channel, first, cut)),
                 input: 0,
+                input_kind: 0,
                 wrap: false,
                 whole: false,
             });
@@ -711,7 +753,15 @@ impl FilterPlan {
     #[allow(clippy::too_many_arguments)]
     /// The stages of one effect stack: a mask's when `channel` is None, else the content of a
     /// channel of that kind (the stage context the packages' stages read).
-    fn add_stack(&mut self, effects: &mut [Operation], start: u32, count: u32, layer: u32, channel: Option<ChannelKind>, inputs: &ProceduralInputs) {
+    /// `height` is the layer's own Height operation a Height To Normal stage reads (`layer_height`).
+    fn add_stack(
+        &mut self,
+        effects: &mut [Operation],
+        (start, count): (u32, u32),
+        (layer, height): (u32, Option<u32>),
+        channel: Option<ChannelKind>,
+        inputs: &ProceduralInputs,
+    ) {
         let mask = channel.is_none();
         let first = self.stages.len();
         let mut reach: u32 = 0;
@@ -734,6 +784,7 @@ impl FilterPlan {
                     cell,
                     anchor: None,
                     input: 0,
+                    input_kind: 0,
                     wrap: false,
                     whole: false,
                 });
@@ -748,11 +799,22 @@ impl FilterPlan {
             let whole = filter.whole_set(inputs.resolution);
             effect.spatial[0] = if mask { slot } else { slot - first } as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
-            // An image input the effect registered (`ProceduralInputs::register_input`)
-            let input = effect.effects[3];
+            // An image input the effect registered (`ProceduralInputs::register_input`), read as
+            // colour when registered so; Height To Normal on a Normal operation reads the layer's
+            // own Height in its place
+            let (input, input_kind) = match height.filter(|_| matches!(inputs.filters[effect.ids[2] as usize].0, Filter::HeightToNormal(_))) {
+                Some(height) => (height + 1, INPUT_LAYER),
+                None => {
+                    let input = effect.effects[3];
+                    let color = input != 0 && inputs.color_inputs.contains(&input.saturating_sub(self.input_base));
+                    (input, if color { INPUT_COLOR } else { 0 })
+                }
+            };
+            // The pre-pass carries the lower stages of the stage's own stack only, not the Height's
+            let whole = whole && input_kind != INPUT_LAYER;
             // P4: Blur and Bevel with Wrap read the set periodically past its edges
             let wrap = gpu_neighbourhood::box_family::wraps(filter);
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input, wrap, whole });
+            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input, input_kind, wrap, whole });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
@@ -773,11 +835,46 @@ impl FilterPlan {
     }
 
     /// Words per field texel: four premultiplied components and the UV coverage, plus a sixth
-    /// word when a stage carries an input ([`FilterStage::input`]). One stride for every field
-    /// of the program; the shaders read it from the uniform, never from a literal.
+    /// word when a stage carries an input ([`FilterStage::input`]), or three when one reads its
+    /// input as colour. One stride for every field of the program; the shaders read it from the
+    /// uniform, never from a literal.
     fn field_words(&self) -> u32 {
-        if self.stages.iter().any(|stage| stage.input != 0) { FIELD_WORDS + 1 } else { FIELD_WORDS }
+        if self.stages.iter().any(|stage| stage.input_kind == INPUT_COLOR) {
+            FIELD_WORDS + 3
+        } else if self.stages.iter().any(|stage| stage.input != 0) {
+            FIELD_WORDS + 1
+        } else {
+            FIELD_WORDS
+        }
     }
+
+    /// The kernels' `NeighbourhoodRegion::input` bits for `stage`: the fields carry input words
+    /// (1), the stage has an input of its own (2), the fields carry colour words 5..8 (4).
+    fn input_bits(&self, stage: &FilterStage) -> u32 {
+        let words = self.field_words();
+        u32::from(words > FIELD_WORDS) | (u32::from(stage.input != 0) << 1) | (u32::from(words >= FIELD_WORDS + 3) << 2)
+    }
+}
+
+/// The layer's own Height operation (in the run of operations of layer operation `index`) when
+/// `index` is a Normal operation whose content has a Height To Normal stage: the CPU's stage
+/// reads the layer's Height content times its coverage as its gray (`plan_in(.., Height)`).
+fn layer_height(layers: &[Operation], effects: &[Operation], index: usize, inputs: &ProceduralInputs) -> Option<usize> {
+    let layer = &layers[index];
+    if layer.ids[0] != channel_slot(Channel::Normal) {
+        return None;
+    }
+    let [_, _, content, count] = layer.effects.map(|word| word as usize);
+    let reads = effects.iter().skip(content).take(count).any(|op| {
+        op.ids[1] == NEIGHBOURHOOD_OPCODE && inputs.filters.get(op.ids[2] as usize).is_some_and(|(filter, _)| matches!(filter, Filter::HeightToNormal(_)))
+    });
+    if !reads {
+        return None;
+    }
+    let same_layer = |op: &Operation| op.effects[..2] == layer.effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
+    let first = (0..index).rev().take_while(|&earlier| same_layer(&layers[earlier])).last().unwrap_or(index);
+    let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
+    (first..end).find(|&own| layers[own].ids[0] == channel_slot(Channel::Height))
 }
 
 /// The channel slots plus one an effect operation asks the stack for (`FilterPlan::bind_stack_reads`):
@@ -1038,6 +1135,21 @@ impl CompositeProgram {
     /// again when either changes (or the imported environment image does).
     pub fn environment(&self) -> Option<(&str, f32)> {
         self.environment.as_ref().map(|environment| (environment.display.environment.as_str(), environment.display.env_rotation))
+    }
+
+    /// Tests: the stage of the layer's Height operation and the stage reading it as its input.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn input_stages(&self) -> (usize, usize) {
+        let stages = &self.filters.stages;
+        let height = stages.iter().position(|stage| self.operations[stage.layer as usize].ids[0] == channel_slot(Channel::Height));
+        let reader = stages.iter().position(|stage| stage.input_kind == INPUT_LAYER);
+        (height.unwrap_or(usize::MAX), reader.unwrap_or(usize::MAX))
+    }
+
+    /// Tests: the last stage's input and input kind.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn input_of_last_stage(&self) -> (u32, u32) {
+        self.filters.stages.last().map_or((u32::MAX, u32::MAX), |stage| (stage.input, stage.input_kind))
     }
 
     /// Replace the environment's diffuse light (tests: a stub reader instead of `EnvironmentSh::of`).
@@ -2938,7 +3050,7 @@ impl GpuCompositor {
                     let slot = if direct { output as u32 } else { fields };
                     source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
                     source[packages::FIELD_LAYOUT + 2] = stage.input;
-                    source[packages::FIELD_LAYOUT + 3] = u32::from(wraps);
+                    source[packages::FIELD_LAYOUT + 3] = u32::from(wraps) | stage.input_kind;
                     for y in (0..field_rect[3]).step_by(source_rows as usize) {
                         for x in (0..field_rect[2]).step_by(source_width as usize) {
                             let columns = source_width.min(field_rect[2] - x);
@@ -2964,7 +3076,7 @@ impl GpuCompositor {
                         blur: [offset(fields + 1), offset(fields + 2)],
                         output: offset(output as u32),
                         field_words: texel_words,
-                        input: u32::from(texel_words > FIELD_WORDS),
+                        input: program.filters.input_bits(stage),
                         wrap: stage.wrap,
                         bounds: set_bounds,
                     };
@@ -3062,7 +3174,7 @@ impl GpuCompositor {
                         source[packages::FIELD_LAYOUT + 2] = stage.input;
                         // In a wrapping program every stage's field is a periodic copy of the set
                         // past its edges; the stages keep apart what lies across a seam (`bounds`)
-                        source[packages::FIELD_LAYOUT + 3] = u32::from(wraps);
+                        source[packages::FIELD_LAYOUT + 3] = u32::from(wraps) | stage.input_kind;
                         if let Some((channel, first, cut)) = stage.anchor {
                             source[36..39].copy_from_slice(&[channel_slot(channel), first, cut]);
                             source[40..43].copy_from_slice(&channel.default_value().map(f32::to_bits));
@@ -3096,7 +3208,7 @@ impl GpuCompositor {
                             blur: [offset(fields + 1), offset(fields + 2)],
                             output: offset(output as u32),
                             field_words: texel_words,
-                            input: u32::from(texel_words > FIELD_WORDS),
+                            input: program.filters.input_bits(stage),
                             wrap: stage.wrap,
                             bounds: set_bounds,
                         };

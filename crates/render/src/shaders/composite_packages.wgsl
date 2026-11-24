@@ -125,6 +125,14 @@ fn effect_input(effect: Operation, texel: LayerTexel) -> f32 {
     return stage_input_value(layers[effect.effects.w - 1u], texel);
 }
 
+// The effect's image input as colour (ProceduralInputs::register_color_input).
+fn effect_input_color(effect: Operation, texel: LayerTexel) -> vec3<f32> {
+    if effect.effects.w == 0u {
+        return vec3(0.0);
+    }
+    return base_content(layers[effect.effects.w - 1u], texel).rgb;
+}
+
 // An image's stored texel under `uv`, wrapping, as ImageRes::sample_nearest reads it (an ID
 // map's colours must not blend). `image` is the record offset ProceduralInputs::pack_image's
 // side-table word holds (u32 max: missing).
