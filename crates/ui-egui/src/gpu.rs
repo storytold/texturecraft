@@ -2515,6 +2515,12 @@ pub(crate) mod tests {
         read_pixel(gpu, texture, texture.width() / 2, texture.height() / 2)
     }
 
+    /// Texel (`x`, `y`) of a display texture; a neutral program displays one texel for all.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_display(gpu: &Headless, texture: &wgpu::Texture, x: u32, y: u32) -> [u8; 4] {
+        if texture.width() == 1 { read_pixel(gpu, texture, 0, 0) } else { read_pixel(gpu, texture, x, y) }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn read_pixel(gpu: &Headless, texture: &wgpu::Texture, x: u32, y: u32) -> [u8; 4] {
         let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2881,7 +2887,7 @@ pub(crate) mod tests {
                 let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
                 assert!(errors.is_empty(), "{errors:?}");
                 let texture = gpu.renderer.display_textures()[0][0];
-                texels.map(|texel| read_pixel(gpu, texture, texel.x, texel.y))
+                texels.map(|texel| read_display(gpu, texture, texel.x, texel.y))
             };
             let neutral = display(&mut link, &mut s);
 
@@ -2932,7 +2938,7 @@ pub(crate) mod tests {
             let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty(), "{errors:?}");
             let gpu: &Headless = gpu;
-            [0, 1].map(|ts| read_pixel(gpu, gpu.renderer.display_textures()[ts][0], x, y))
+            [0, 1].map(|ts| read_display(gpu, gpu.renderer.display_textures()[ts][0], x, y))
         };
         let before = display(&mut link, &mut s);
 
