@@ -229,16 +229,13 @@ pub(crate) enum AtlasMips {
     #[default]
     None,
     /// `ImageRes::mip_chain`: the levels as stored (Bilinear HQ of scalar and alpha reads).
-    #[allow(dead_code)] // Chosen by P1
     Stored,
     /// `ImageRes::linear_mip_chain`: RGB linear, alpha unchanged (an sRGB image's colour read).
-    #[allow(dead_code)] // Chosen by P1
     LinearColor,
 }
 
 /// One exact-f32 plane of the atlas (P1: a projector depth grid), row by row. The atlas keeps a
 /// weak pointer to `texels`, so a plane rebuilt for every program rebuilds the atlas.
-#[allow(dead_code)] // Built by P1's depth culling
 #[derive(Clone, Debug)]
 pub(crate) struct RawPlane {
     pub(crate) size: [u32; 2],
@@ -276,16 +273,20 @@ impl TileImageAtlas {
         let region = &self.color[color_index];
         let offset = words.len() as u32;
         let [width, height] = region.planes[0].size;
-        // Bit 9: halved levels follow the planes (count, then per level width, height,
-        // encoding and plane origins). Without levels the words are exactly as before.
+        // Bit 9: halved levels follow the planes; without levels the words are exactly as before
         let flags = region.encoding as u32 | (u32::from(srgb) << 8) | (u32::from(!region.levels.is_empty()) << 9);
         words.extend([width, height, flags]);
         for plane in &region.planes {
             words.extend(plane.origin);
         }
+
+        // The level count, each level's word offset (so a level is one read away), then per level its width, height, encoding and plane origins
         if !region.levels.is_empty() {
             words.push(region.levels.len() as u32);
-            for level in &region.levels {
+            let table = words.len();
+            words.resize(table + region.levels.len(), 0);
+            for (index, level) in region.levels.iter().enumerate() {
+                words[table + index] = words.len() as u32;
                 words.extend([level.size[0], level.size[1], level.encoding as u32]);
                 for plane in &level.planes {
                     words.extend(plane.origin);
@@ -296,7 +297,6 @@ impl TileImageAtlas {
     }
 
     /// The words of raw plane `index`: width, height and its origin (x, y, layer), read as f32 bits.
-    #[allow(dead_code)] // Read by P1's depth culling
     pub(crate) fn append_raw(&self, words: &mut Vec<u32>, index: usize) -> u32 {
         let offset = words.len() as u32;
         let (_, region) = &self.raw[index];
@@ -527,7 +527,8 @@ mod tests {
         let levels = image.linear_mip_chain();
         let planes = atlas.color[0].planes.len();
         assert_eq!(words[3 + planes * 3] as usize, levels.len());
-        assert_eq!(words[4 + planes * 3..6 + planes * 3], [levels[0].width, levels[0].height]);
+        let first_level = words[4 + planes * 3] as usize;
+        assert_eq!(words[first_level..first_level + 2], [levels[0].width, levels[0].height]);
         let mut raw = Vec::new();
         atlas.append_raw(&mut raw, 0);
         assert_eq!(raw[..2], [3, 2]);
