@@ -1216,8 +1216,9 @@ mod tests {
         check_project(&mut gpu, (&project, &pixels, owner), false, MIDDLE, Tolerance::NEIGHBOURHOOD, "Bevel and Glow with an anchor read");
     }
 
-    /// Composite time of Glow, Drop Shadow and Bevel (the library's) at 2K and 4K, the GPU's (median
-    /// of five after a warm-up) against the CPU's, on the oracle's paint:
+    /// Composite time of Glow, Drop Shadow, Bevel, Bevel Smooth and Directional Distance (the
+    /// library's, the last two also with a Distance Map) at 2K and 4K, the GPU's (median of five
+    /// after a warm-up) against the CPU's, on the oracle's paint:
     /// `cargo test -p texturecraft-render --release --lib bench_box_and_distance_filters -- --ignored --nocapture`
     #[test]
     #[ignore = "benchmark"]
@@ -1233,18 +1234,24 @@ mod tests {
         let Some(mut gpu) = headless() else { return };
         let mesh = oracle_mesh(false);
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.3; 3], high: [0.9; 3], ramp: Vec::new() };
         let filters = [
-            ("Glow", LIBRARY_GLOW),
-            ("Drop Shadow", LIBRARY_DROP_SHADOW),
-            ("Bevel", Filter::DistanceBevel(Bevel::LIBRARY)),
-            ("Bevel Smooth", Filter::BevelSmooth(BevelSmooth::LIBRARY)),
-            ("Directional Distance", Filter::DirectionalDistance(DirectionalDistance::LIBRARY)),
+            ("Glow", LIBRARY_GLOW, None),
+            ("Drop Shadow", LIBRARY_DROP_SHADOW, None),
+            ("Bevel", Filter::DistanceBevel(Bevel::LIBRARY), None),
+            ("Bevel Smooth", Filter::BevelSmooth(BevelSmooth::LIBRARY), None),
+            ("Directional Distance", Filter::DirectionalDistance(DirectionalDistance::LIBRARY), None),
+            ("Bevel Smooth with a procedural map", Filter::BevelSmooth(BevelSmooth::LIBRARY), Some(checker.clone())),
+            ("Directional Distance with a procedural map", Filter::DirectionalDistance(DirectionalDistance::LIBRARY), Some(checker)),
         ];
         for side in [2048, 4096] {
             gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((side, side), 0)], 1);
             let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, side, side));
-            for (label, filter) in &filters {
-                let (project, pixels, _) = painted_project(&[(filter.clone(), 1.0, BlendMode::Normal)], BlendMode::Normal, (false, side)).unwrap();
+            for (label, filter, map) in &filters {
+                let (mut project, pixels, owner) = painted_project(&[(filter.clone(), 1.0, BlendMode::Normal)], BlendMode::Normal, (false, side)).unwrap();
+                if let Some(map) = map {
+                    set_distance_map(&mut project, owner, map).unwrap();
+                }
                 let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
                 program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
                 // A halo too large for the adapter's working memory is reported, not timed
