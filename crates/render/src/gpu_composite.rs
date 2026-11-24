@@ -79,8 +79,8 @@ const FIRST_GENERATOR: u32 = 40;
 const FIRST_EXTENDED_PATTERN: u32 = 48;
 pub(crate) const ROWS: u32 = 64;
 const WORKGROUP: u32 = 8;
-// Keep extreme Tile Generator overlap from monopolizing an update, dispatch, or submission.
-const MAX_TILE_WORK_PER_UPDATE: u64 = 8 << 30;
+// Keep costly fills (Tile Generator overlap, symmetry copies) from monopolizing a dispatch or a
+// submission: an update of any cost runs in more bands and submissions instead.
 const MAX_TILE_WORK_PER_BAND: u64 = 64 << 20;
 const MAX_TILE_WORK_PER_SUBMISSION: u64 = 256 << 20;
 const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
@@ -2825,7 +2825,7 @@ impl GpuCompositor {
             0
         };
         let pattern_work = program.tile_work_per_pixel()?;
-        check_tile_update_budget(width, height, pattern_work)?;
+        check_texel_work(pattern_work)?;
         let tile_work = pattern_work.saturating_add(program.groups.work_per_pixel()).saturating_add(selection_work);
         let grouped = program.groups.depth != 0;
         let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
@@ -2904,7 +2904,13 @@ impl GpuCompositor {
             }
         }
         let pitch = band_width.next_multiple_of(64);
-        let submit_budget = if grouped || filtered || band_width < width || band_rows < ROWS { MAX_TILE_WORK_PER_SUBMISSION } else { u64::MAX };
+        // A costly update submits its bands in parts of the submission budget
+        let update_work = (u64::from(width) * u64::from(height)).saturating_mul(tile_work);
+        let submit_budget = if grouped || filtered || band_width < width || band_rows < ROWS || update_work > MAX_TILE_WORK_PER_SUBMISSION {
+            MAX_TILE_WORK_PER_SUBMISSION
+        } else {
+            u64::MAX
+        };
         let area = pitch * band_rows;
         let stride = u64::from(area) * 4;
         let field_base = (display_words(band_width, band_rows)) as u32;
@@ -3599,10 +3605,11 @@ fn field_bounds(field_rect: [u32; 4], source_size: (u32, u32)) -> [i32; 4] {
     [-origin[0], -origin[1], source_size.0 as i32 - origin[0], source_size.1 as i32 - origin[1]]
 }
 
-fn check_tile_update_budget(width: u32, height: u32, work_per_pixel: u64) -> Result<(), &'static str> {
-    let estimated_work = (u64::from(width) * u64::from(height)).saturating_mul(work_per_pixel);
-    if estimated_work > MAX_TILE_WORK_PER_UPDATE {
-        return Err("Tile Generator overlap exceeds the GPU compositor's interactive work budget.");
+/// Whether one texel's fill work fits a band: the bands and submissions split an update of any
+/// size, but not a texel. Only a single texel beyond a whole band's budget is refused.
+fn check_texel_work(work_per_pixel: u64) -> Result<(), &'static str> {
+    if work_per_pixel > MAX_TILE_WORK_PER_BAND {
+        return Err("The fill work of one texel exceeds what a GPU dispatch may hold.");
     }
     Ok(())
 }
@@ -4184,8 +4191,10 @@ mod procedural_tests {
         }
     }
 
+    /// A costly fill splits into narrower bands and more submissions at any update size; only a
+    /// single texel beyond a band's budget is refused.
     #[test]
-    fn tile_generator_budget_rejects_full_overlap_and_allows_smaller_gpu_updates() {
+    fn costly_fills_split_into_bands_instead_of_leaving_the_gpu() {
         use texturecraft_core::{TileGenerator, TileSizeMode};
 
         let mut patterns = TilePatterns::default();
@@ -4196,10 +4205,10 @@ mod procedural_tests {
         let regular_work = patterns.work_per_sample(normal).unwrap();
         let overlapping_work = patterns.work_per_sample(overlapping_index).unwrap();
 
-        assert_eq!(check_tile_update_budget(8192, 8192, regular_work), Ok(()));
+        assert_eq!(check_texel_work(regular_work), Ok(()));
         assert_eq!(composite_band_size(8192, regular_work), (8192, ROWS));
-        assert!(check_tile_update_budget(8192, 8192, overlapping_work).is_err());
-        assert_eq!(check_tile_update_budget(256, 256, overlapping_work), Ok(()));
+        assert_eq!(check_texel_work(overlapping_work * 12), Ok(()), "an update of any size splits");
+        assert!(check_texel_work(MAX_TILE_WORK_PER_BAND + 1).is_err());
         let (width, rows) = composite_band_size(256, overlapping_work);
         assert!(rows < ROWS);
         assert!(u64::from(width) * u64::from(rows) * overlapping_work <= MAX_TILE_WORK_PER_BAND);
@@ -4222,6 +4231,45 @@ mod procedural_tests {
         project.insert_layer(0, layer, None, false).unwrap();
         let program = CompositeProgram::compile(&project, &PixelStore::default(), 0).unwrap();
         assert_eq!(program.tile_work_per_pixel().unwrap(), overlapping_work * 12, "the three planes each need four samples");
+    }
+
+    /// A 4K fill whose every texel evaluates 2304 overlapping tile placements on two channels
+    /// (about 39 G in all, beyond the old 8 G update cap) composites on the GPU in bands and
+    /// submissions.
+    #[test]
+    fn a_costly_4k_fill_composites_on_the_gpu() {
+        use texturecraft_core::{TileGenerator, TileSizeMode};
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        // About 39 G placements: seconds on a GPU, far longer on a software rasterizer
+        if gpu.device.adapter_info().device_type == wgpu::DeviceType::Cpu {
+            return;
+        }
+        const SIZE: u32 = 4096;
+        let overlapping = TileGenerator { amount: [12, 8], size_mode: TileSizeMode::Absolute, size_absolute: [1.0; 2], ..TileGenerator::default() };
+        let mut project = Project::new("Costly fill", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let pattern = Procedural { tile: Some(Box::new(overlapping)), seed: 0, ..Procedural::new(ProceduralKind::TileGenerator) };
+        let source = Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
+        let fill = Fill {
+            sources: BTreeMap::from([(Channel::BaseColor, source.clone()), (Channel::Roughness, source)]),
+            projection: Projection::Triplanar { scale: 1.0, sharpness: 6.0, offset: [0.0; 3], uv: Default::default(), projector: Default::default() },
+            ..Default::default()
+        };
+        let layer = Layer::new(project.alloc_id(), "Overlapping tiles", LayerKind::Fill(fill), &[Channel::BaseColor, Channel::Roughness]);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let mut program = CompositeProgram::compile(&project, &PixelStore::default(), 0).unwrap();
+        let work = program.tile_work_per_pixel().unwrap();
+        assert!(u64::from(SIZE) * u64::from(SIZE) * work > 8 << 30, "{work} per texel");
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        program.set_tile_images(&ImageStore::default());
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        let started = std::time::Instant::now();
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        eprintln!("4K fill of {work} per texel: {:?}", started.elapsed());
     }
 
     // The CPU fallback tables of the GPU port live with each package (`still_on_cpu` in
