@@ -402,10 +402,19 @@ fn box_passes(
     source
 }
 
+/// The largest halo reach, in texels, that runs in the whole-set pre-pass. Beyond it (a 4K Drop
+/// Shadow's 563) four channels' stripes no longer fit beside their results on a 2 GiB binding,
+/// and the bands, 4x faster than the CPU there, take it.
+const HALO_WHOLE_SET_REACH: u32 = 512;
+
 /// Whether a stage runs in the whole-set pre-pass instead of in every band (see
 /// `NeighbourhoodFilter::whole_set`): large reaches and whole-set reads.
-pub(super) fn whole_set(_filter: NeighbourhoodFilter, _resolution: u32) -> bool {
-    false
+pub(super) fn whole_set(filter: NeighbourhoodFilter, _resolution: u32) -> bool {
+    match filter.kind {
+        HALO => reach(filter) <= HALO_WHOLE_SET_REACH,
+        DISTANCE_BEVEL | BEVEL_SMOOTH | DIRECTIONAL_DISTANCE => true,
+        _ => false,
+    }
 }
 
 /// Encodes a P4 stage with passes of its own; false lets the box and apply passes run.
@@ -469,13 +478,14 @@ pub(super) fn encode(
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use texturecraft_compose::distance_test_hooks;
     use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
     use texturecraft_core::{
         BakedMap, Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, BlendMode, Channel, ChannelKind, ContentsOffset, DirectionalDistance, Effect,
-        EffectKind, Filter, Generator, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground,
+        EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground,
         MaskOutline, OutlinePosition, Project, Source, TextureSet,
     };
     use texturecraft_geom::glam::Vec2;
@@ -1146,6 +1156,25 @@ mod tests {
                 assert_eq!(found, expected, "{angle}° {distance}");
             }
         }
+    }
+
+    /// With an anchor read in the program the large-reach stages run in bands, not in the
+    /// whole-set pre-pass, and still match the CPU.
+    #[test]
+    fn large_reach_stages_with_an_anchor_read_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let normal = BlendMode::Normal;
+        let stack = vec![(Filter::DistanceBevel(Bevel::LIBRARY), 1.0, normal), (LIBRARY_GLOW, 0.8, normal)];
+        let (mut project, pixels, owner) = painted_project(&stack, normal, (false, SIZE)).unwrap();
+        let anchor = project.alloc_id();
+        project.layers.get_mut(&owner).unwrap().content_effects.insert(0, Effect::new(anchor, EffectKind::Anchor));
+        let reader = project.alloc_id();
+        let sources = BTreeMap::from([(Channel::BaseColor, Source::Anchor { anchor, channel: Channel::BaseColor, ramp: Vec::new() })]);
+        let mut layer = Layer::new(reader, "Reader", LayerKind::Fill(Fill { sources, ..Fill::default() }), &[Channel::BaseColor]);
+        layer.channels.get_mut(&Channel::BaseColor).unwrap().mode = BlendMode::Multiply;
+        project.insert_layer(0, layer, None, false).unwrap();
+
+        check_project(&mut gpu, (&project, &pixels, owner), false, MIDDLE, Tolerance::NEIGHBOURHOOD, "Bevel and Glow with an anchor read");
     }
 
     /// Composite time of Glow, Drop Shadow and Bevel (the library's) at 2K and 4K, the GPU's (median
