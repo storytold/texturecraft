@@ -117,7 +117,7 @@ fn the_blank_screen_menus_match_the_measured_enabled_states() {
         assert!(menus::enabled(app, id), "{id} is enabled on the blank screen");
     }
     for id in ["ui.view.bakeSettings", "ui.view.bakeMaps", "ui.view.meshMapBakers"] {
-        assert!(!menus::enabled(app, id), "{id} belongs to Baking mode");
+        assert!(!menus::enabled(app, id), "{id} belongs to Baking Mode");
     }
 }
 

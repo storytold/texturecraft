@@ -12,7 +12,7 @@ use texturecraft_ui_egui::file_dialogs::{Answer, Request};
 
 use super::temp_dir::TempDir;
 
-const TITLE: &str = "Import resources";
+const TITLE: &str = "Import Resources";
 /// The prefix field's tooltip, which is its accessible label.
 const PREFIX_HINT: &str = "Put in front of the resource's name. Characters other than letters, digits and _ . - become _";
 
@@ -206,6 +206,33 @@ fn the_engine_command_still_imports_a_path_with_an_optional_prefix() {
 
     assert_eq!(plain["name"], "tile.png");
     assert_eq!(prefixed["name"], "a_b_tile.png");
+}
+
+#[test]
+fn a_materialx_document_imports_as_a_layer() {
+    let dir = TempDir::new("import-resources-materialx");
+    let file = dir.join("paint.mtlx");
+    std::fs::write(
+        &file,
+        r#"<?xml version="1.0"?>
+<materialx version="1.39">
+  <open_pbr_surface name="S" type="surfaceshader">
+    <input name="base_color" type="color3" value="0.8, 0.2, 0.1" />
+  </open_pbr_surface>
+  <surfacematerial name="Paint" type="material"><input name="surfaceshader" type="surfaceshader" nodename="S" /></surfacematerial>
+</materialx>"#,
+    )
+    .unwrap();
+    let mut h = app();
+    let layers = h.state().session.doc.project.layers.len();
+    invoke(&mut h);
+    add(&mut h, &[file]);
+
+    click(&mut h, "Import");
+
+    assert!(!is_open(&h), "the document was imported");
+    assert!(h.state().session.doc.project.layers.len() > layers, "the material became a layer");
+    assert!(resources(&h).is_empty(), "the document itself is not an image resource");
 }
 
 #[test]

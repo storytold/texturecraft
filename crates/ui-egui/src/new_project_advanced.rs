@@ -80,28 +80,43 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let mut open = true;
     let (mut create, mut cancel) = (false, false);
 
-    // A fixed height keeps the centered window still while its sections lay out
+    // Start with a form that fits the viewport; subsequent sizes follow the user's resize
     let form_height = (ctx.content_rect().height() - DIALOG_VIEWPORT_MARGIN_POINTS - DIALOG_CHROME_HEIGHT_POINTS)
         .clamp(crate::project_form::MIN_FORM_HEIGHT_POINTS, crate::project_form::FORM_HEIGHT_POINTS);
-    dialog("new_project", tr("New project"), &mut open).default_width(DIALOG_WIDTH_POINTS).show(ctx, |ui| {
-        ui.set_width(DIALOG_WIDTH_POINTS);
-        egui::ScrollArea::vertical().id_salt("np_form").min_scrolled_height(form_height).max_height(form_height).auto_shrink([false, true]).show(ui, |ui| {
-            basic_settings(app, ui);
-            ui.add_space(8.0);
-            advanced_settings(app, ui);
-        });
-        ui.separator();
-        let can_create = app.ui.new_project.file.is_some();
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                create = ui
-                    .add_enabled(can_create, primary_button(ui, tr("Create")).min_size(vec2(BUTTON_WIDTH_POINTS, 0.0)))
-                    .on_disabled_hover_text(tr("Select a 3D mesh first"))
-                    .clicked();
-                cancel = ui.add(egui::Button::new(tr("Cancel")).min_size(vec2(BUTTON_WIDTH_POINTS, 0.0))).clicked();
+    dialog(ctx, "new_project", tr("New Project"), &mut open).default_size(vec2(DIALOG_WIDTH_POINTS, form_height + DIALOG_CHROME_HEIGHT_POINTS)).show(
+        ctx,
+        |ui| {
+            // Lay out the actual footer first so it cannot make the window grow each frame
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                let can_create = app.ui.new_project.file.is_some();
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        create = ui
+                            .add_enabled(can_create, primary_button(ui, tr("Create")).min_size(vec2(BUTTON_WIDTH_POINTS, 0.0)))
+                            .on_disabled_hover_text(tr("Select a 3D mesh first"))
+                            .clicked();
+                        cancel = ui.add(egui::Button::new(tr("Cancel")).min_size(vec2(BUTTON_WIDTH_POINTS, 0.0))).clicked();
+                    });
+                });
+                ui.separator();
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    let form_height = ui.available_height().max(0.0);
+                    egui::ScrollArea::both()
+                        .id_salt("np_form")
+                        .content_margin(crate::windows::dialog_scroll_margin(ui))
+                        .min_scrolled_width(0.0)
+                        .min_scrolled_height(0.0)
+                        .max_height(form_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            basic_settings(app, ui);
+                            ui.add_space(8.0);
+                            advanced_settings(app, ui);
+                        });
+                });
             });
-        });
-    });
+        },
+    );
 
     if cancel || !open {
         app.ui.new_project.baked_maps = Vec::new();

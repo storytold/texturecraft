@@ -1,5 +1,5 @@
-//! Project templates: File > More save options (Save as template..., Save and reduce file size,
-//! Save as copy...), the New project list's reference names and the remembered template
+//! Project templates: File > More Save Options (Save As Template, Save and Reduce File Size,
+//! Save As Copy), the New project list's reference names and the remembered template
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -23,7 +23,7 @@ fn app() -> Harness<'static, TextureCraftApp> {
 fn open_more_save_options(h: &mut Harness<'_, TextureCraftApp>) {
     h.get_by_label("File").click();
     h.run_steps(3);
-    h.get_by_label("More save options").click();
+    h.get_by_label("More Save Options").click();
     h.run_steps(3);
 }
 
@@ -43,7 +43,7 @@ fn save_as_template_asks_in_the_templates_folder_and_saves_without_a_message() {
     })));
 
     open_more_save_options(&mut h);
-    h.get_by_label_contains("Save as template...").click();
+    h.get_by_label_contains("Save As Template").click();
     h.run_steps(4);
 
     let asked = asked.borrow();
@@ -83,12 +83,12 @@ fn a_saved_template_appears_in_new_project_with_the_your_assets_suffix() {
 fn save_and_reduce_file_size_is_greyed_with_the_hint() {
     let mut h = app();
     open_more_save_options(&mut h);
-    let item = h.get_by_label_contains("Save and reduce file size");
+    let item = h.get_by_label_contains("Save and Reduce File Size");
     let at = item.rect().center();
     h.hover_at(at);
     h.run_steps(30);
     assert!(h.query_by_label(NOT_AVAILABLE).is_some(), "the hint shows on hover");
-    assert!(h.get_by_label_contains("Save and reduce file size").accesskit_node().is_disabled(), "the item is greyed");
+    assert!(h.get_by_label_contains("Save and Reduce File Size").accesskit_node().is_disabled(), "the item is greyed");
     assert!(!menus::enabled(h.state(), "ui.saveReduced"));
     assert!(!menus::implemented("ui.saveReduced"));
 }

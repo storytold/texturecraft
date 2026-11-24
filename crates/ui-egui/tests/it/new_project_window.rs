@@ -324,7 +324,7 @@ fn create_asks_before_discarding_edits_made_after_the_form_opened() {
     h.get_by_role_and_label(Role::Button, "Create").click();
     h.run_steps(3);
 
-    assert!(h.query_by_label("Unsaved changes").is_some());
+    assert!(h.query_by_label("Unsaved Changes").is_some());
     assert_eq!(h.state().session.doc.project.name, "Open");
 
     h.get_by_role_and_label(Role::Button, "Don't save").click();

@@ -146,6 +146,8 @@ pub struct Prefs {
     pub ui_scale: f32,
     /// Minutes between autosaves of a modified project (0: off; desktop).
     pub autosave_minutes: u32,
+    /// Maximum recent projects retained (0 disables the history, capped at 100).
+    pub recent_projects_limit: u16,
     /// UI language code (`i18n::LANGUAGES`), or `i18n::SYSTEM_LANGUAGE` to follow the system.
     pub language: String,
     /// Viewport texture resolution: 0 full, 1 half, 2 quarter of each texture set's size (lighter
@@ -201,6 +203,7 @@ impl Default for Prefs {
         Prefs {
             ui_scale: 1.0,
             autosave_minutes: 10,
+            recent_projects_limit: 10,
             language: "en".into(),
             viewport_texture: 0,
             gpu_compositing: true,
@@ -523,6 +526,11 @@ pub struct UiState {
     pub(crate) inactive_mode_dock: Dock,
     #[serde(default)]
     pub(crate) dock_is_baking: bool,
+    /// Rendering's saved dock, or Painting's while Rendering is active. Older states start from Painting.
+    #[serde(default)]
+    pub(crate) inactive_render_dock: Option<Dock>,
+    #[serde(default)]
+    pub(crate) dock_is_rendering: bool,
     /// Window ▸ Toolbars ▸ Docks: the right bar of panel icons
     #[serde(default = "default_true")]
     pub toolbar_docks: bool,
@@ -638,15 +646,34 @@ pub struct UiState {
     pub log_id: u64,
 }
 
+pub(crate) const MAX_RECENT_PROJECTS: u16 = 100;
+
 impl UiState {
+    /// Keep recent-file history bounded, including values supplied through automation or old settings.
+    pub(crate) fn trim_recent(&mut self) {
+        self.prefs.recent_projects_limit = self.prefs.recent_projects_limit.min(MAX_RECENT_PROJECTS);
+        self.recent.truncate(usize::from(self.prefs.recent_projects_limit));
+    }
+
     /// Replace an outdated or unreadable saved bake dock by the bake layout, then give the mode its dock
     pub(crate) fn sync_mode_dock(&mut self) {
+        if self.dock_is_rendering {
+            if let Some(other) = self.inactive_render_dock.as_mut() {
+                std::mem::swap(&mut self.dock, other);
+            }
+            self.dock_is_rendering = false;
+        }
         self.reset_outdated_bake_dock();
 
         let baking = self.mode == Mode::Baking;
         if baking != self.dock_is_baking {
             std::mem::swap(&mut self.dock, &mut self.inactive_mode_dock);
             self.dock_is_baking = baking;
+        }
+        if self.mode == Mode::Rendering {
+            let other = self.inactive_render_dock.get_or_insert_with(|| self.dock.clone());
+            std::mem::swap(&mut self.dock, other);
+            self.dock_is_rendering = true;
         }
     }
 
@@ -661,11 +688,12 @@ impl UiState {
         self.bake_layout_version = BAKE_LAYOUT_VERSION;
     }
 
-    /// Put the panels, tabs and floating panels of both modes back to their defaults; the view split,
+    /// Put the panels, tabs and floating panels of every mode back to their defaults; the view split,
     /// zoom, wireframes, symmetry display, mode and every setting stay as they are
     pub fn reset_panel_layout(&mut self) {
         let (painting, baking) = (Dock::default(), Dock::for_baking());
         (self.dock, self.inactive_mode_dock) = if self.dock_is_baking { (baking, painting) } else { (painting, baking) };
+        self.inactive_render_dock = self.dock_is_rendering.then(Dock::default);
         self.bake_layout_version = BAKE_LAYOUT_VERSION;
         self.rail_panel = None;
     }
@@ -714,6 +742,8 @@ impl Default for UiState {
             rail_panel: None,
             inactive_mode_dock: Dock::for_baking(),
             dock_is_baking: false,
+            inactive_render_dock: None,
+            dock_is_rendering: false,
             toolbar_docks: true,
             toolbar_tools: true,
             bake_layout_version: BAKE_LAYOUT_VERSION,

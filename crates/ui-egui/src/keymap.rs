@@ -55,7 +55,7 @@ const LISTED_SHORTCUTS: &[ShortcutListEntry] = &[
     ShortcutListEntry::new("ui.quit", "Quit application", Some("Ctrl+Q")),
     ShortcutListEntry::new("ui.export", "Export Textures...", Some("Ctrl+Shift+E")),
     ShortcutListEntry::new("file.reimportMesh", "Reimport mesh", Some("Ctrl+Shift+R")),
-    ShortcutListEntry::new("ui.mode.bake", "Switch to baking mode", Some("Ctrl+Shift+B")),
+    ShortcutListEntry::new("ui.mode.bake", "Switch to baking mode", Some("F8")),
     ShortcutListEntry::new("ui.mode.paint", "Switch to edition mode", Some("F9")),
     ShortcutListEntry::new("ui.mode.render", "Switch to rendering mode (path traced)", Some("F10")),
     ShortcutListEntry::new("ui.wireframe", "Show mesh wireframe", None),
@@ -76,6 +76,11 @@ const LISTED_SHORTCUTS: &[ShortcutListEntry] = &[
     ShortcutListEntry::new("ui.layout.3d", "Viewers layout: 3D only", Some("F2")),
     ShortcutListEntry::new("ui.layout.2d", "Viewers layout: 2D only", Some("F3")),
     ShortcutListEntry::new("ui.layout.swap", "Viewers layout: Swap 3D/2D", Some("F4")),
+    ShortcutListEntry::new("ui.layout.saveAs", "Save current layout as...", None),
+    ShortcutListEntry::new("ui.layout.manage", "Manage layouts...", None),
+    ShortcutListEntry::new("ui.resetPanelLayout", "Reset panel layout", None),
+    ShortcutListEntry::new("ui.navButtons", "Navigation buttons", None),
+    ShortcutListEntry::new("ui.uvChecker", "UV checker", None),
 ];
 
 /// The menu a command without a menu entry is listed under, from its id.
@@ -515,7 +520,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
     app.bindings.sync(&app.ui.keymap, craft_keymap::egui::platform(ctx));
     let mut filter: String = ctx.data(|d| d.get_temp(filter_id)).unwrap_or_default();
     let mut open = true;
-    crate::windows::window("keyboard_shortcuts", tr("Keyboard shortcuts"), &mut open).default_width(480.0).show(ctx, |ui| {
+    crate::windows::window("keyboard_shortcuts", tr("Keyboard Shortcuts"), &mut open).default_width(480.0).show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(ic::MAGNIFYING_GLASS).color(tk.text_dim));
             ui.add(egui::TextEdit::singleline(&mut filter).hint_text(tr("Search commands or keys")).desired_width(300.0));

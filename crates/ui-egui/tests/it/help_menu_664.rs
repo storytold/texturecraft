@@ -1,4 +1,4 @@
-//! Help > Export log... saves the log with each entry's time and level.
+//! Help > Export Log saves the log with each entry's time and level.
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -32,7 +32,7 @@ fn export_log_writes_every_line_with_time_and_level() {
     let file = dir.join("log.txt");
     let answer = file.clone();
     h.state_mut().file_dialogs.set_override(Some(Box::new(move |_| Answer::Paths(vec![answer.clone()]))));
-    click_help_item(&mut h, "Export log...");
+    click_help_item(&mut h, "Export Log");
 
     let text = std::fs::read_to_string(&file).expect("the log file was written");
     let lines: Vec<&str> = text.lines().collect();
