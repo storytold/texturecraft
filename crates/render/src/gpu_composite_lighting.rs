@@ -31,10 +31,10 @@
 //! oracle test (`crate::gpu_composite::oracle`) on Base Color with the other channels present,
 //! with and without bakes, chained after and before other filters, at opacity below 1.
 
-use texturecraft_core::{Effect, Filter};
+use texturecraft_core::{Channel, Effect, Filter};
 
 use super::packages::{LIGHTING_OP_BITS, LIGHTING_OPCODES};
-use super::{CompositeProgram, Operation, ProceduralInputs};
+use super::{CompositeProgram, Operation, ProceduralInputs, channel_slot};
 
 /// Library filter ids P6 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["bakedLighting", "bakedLightingEnvironment", "pbrValidate"];
@@ -60,8 +60,15 @@ pub(super) fn needs_surface(op: &Operation) -> bool {
 }
 
 /// Reorders one layer's channel operations (in set order now) so that the channels P6 effects
-/// read come before Base Color.
-pub(super) fn order_layer_operations(_operations: &mut [Operation]) {}
+/// read come before Base Color: a stack read of the layer's material (`effects[1] = 1`) captures
+/// everything before the Base Color operation, as the CPU lays the other channels first
+/// (`Texel::lit_content`). Each operation writes its own channel, so the order changes nothing else.
+pub(super) fn order_layer_operations(operations: &mut [Operation]) {
+    let base_color = channel_slot(Channel::BaseColor);
+    if let Some(index) = operations.iter().position(|op| op.ids[0] == base_color) {
+        operations[index..].rotate_left(1);
+    }
+}
 
 /// Whether a program needs the full `composite_lighting.wgsl`.
 pub(super) fn uses_shader(program: &CompositeProgram) -> bool {
