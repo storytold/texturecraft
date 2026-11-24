@@ -559,22 +559,86 @@ mod tests {
         (region, tolerance): (bool, crate::gpu_composite::oracle::Tolerance),
         label: &str,
     ) {
+        assert_lit_matches_with(gpu, (project, *owner), baked, &texturecraft_compose::PixelStore::default(), (region, tolerance), label);
+    }
+
+    /// [`assert_lit_matches`] with painted `pixels`
+    fn assert_lit_matches_with(
+        gpu: &mut crate::headless::Headless,
+        (project, owner): (&texturecraft_core::Project, texturecraft_core::LayerId),
+        baked: &texturecraft_compose::BakedMaps,
+        pixels: &texturecraft_compose::PixelStore,
+        (region, tolerance): (bool, crate::gpu_composite::oracle::Tolerance),
+        label: &str,
+    ) {
         use std::sync::Arc;
 
-        use texturecraft_compose::{ImageStore, PixelStore};
+        use texturecraft_compose::ImageStore;
         use texturecraft_geom::primitives;
 
         use crate::gpu_composite::CompositeRegion;
         use crate::gpu_composite::oracle::{OracleCase, assert_matches_cpu};
 
         let mesh = Arc::new(primitives::sphere(1.0, 24, 12));
-        let (pixels, images) = (PixelStore::default(), ImageStore::default());
-        let mut case = OracleCase::new(project, &pixels, baked, &images, &mesh);
-        case.mask_owner = project.layers.get(owner).and_then(|layer| layer.mask.as_ref()).map(|_| *owner);
+        let images = ImageStore::default();
+        let mut case = OracleCase::new(project, pixels, baked, &images, &mesh);
+        case.mask_owner = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).map(|_| owner);
         if region {
             case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
         }
         assert_matches_cpu(gpu, &case, tolerance, label);
+    }
+
+    /// Lighting before a Base Color stage reads its layer's material after the material's own
+    /// stages in the set's default channel order (Base Color first, compose's
+    /// `field_channel_order`): a painted lit layer with a Blur on its other channels, Stylized or
+    /// Environment, then a Blur on Base Color, with a partial update
+    #[test]
+    fn lighting_before_a_stage_reads_the_blurred_material() {
+        use texturecraft_compose::PixelStore;
+        use texturecraft_core::{BlendMode, Channel, EffectKind, LayerKind, StylizedLighting};
+        use texturecraft_texel::{to_u16, to_u16_signed};
+
+        use crate::gpu_composite::oracle::{Tolerance, headless};
+
+        // The lit layer painted, its first Blur on every channel but Base Color
+        let painted = |project: &mut texturecraft_core::Project| {
+            let Some(layer) = lit_layer(project) else { return };
+            layer.kind = LayerKind::Paint;
+            if let Some(blur) = layer.content_effects.iter_mut().find(|effect| matches!(effect.kind, EffectKind::Filter(Filter::Blur { .. }))) {
+                blur.off_channels = [Channel::BaseColor].into();
+            }
+        };
+        let environment = Filter::EnvironmentLighting {
+            horizontal: 75.0,
+            vertical: 30.0,
+            exposure: -1.5,
+            height_intensity: 2.5,
+            ambient_occlusion: 0.4,
+            specular_occlusion: 0.8,
+        };
+        let cases = [("stylized", stylized_lighting(StylizedLighting::library()), Tolerance::POINT), ("environment", environment, Tolerance::TRANSCENDENTAL)];
+
+        let Some(mut gpu) = headless() else { return };
+        let baked = lit_bakes(true, true);
+        for (label, lighting, tolerance) in cases {
+            let blur = || (Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, true);
+            let lit = lit_project(&[blur(), (lighting, 1.0, BlendMode::Normal, true), blur()], painted);
+            let mut pixels = PixelStore::default();
+            let size = (LIT_SIZE, LIT_SIZE);
+            for y in 0..LIT_SIZE {
+                for x in 0..LIT_SIZE {
+                    // Steps in the material: its blur changes the light near them
+                    let right = x >= LIT_SIZE / 2;
+                    pixels.layer_mut(lit.1, Channel::BaseColor, size).set(x, y, &[to_u16(0.62), to_u16(0.45), to_u16(0.3), u16::MAX]);
+                    pixels.layer_mut(lit.1, Channel::Metallic, size).set(x, y, &[to_u16(if right { 1.0 } else { 0.0 }), u16::MAX]);
+                    pixels.layer_mut(lit.1, Channel::Roughness, size).set(x, y, &[to_u16(if right { 0.2 } else { 0.8 }), u16::MAX]);
+                    pixels.layer_mut(lit.1, Channel::Normal, size).set(x, y, &[to_u16(0.5), to_u16(0.5), u16::MAX, u16::MAX]);
+                    pixels.layer_mut(lit.1, Channel::Height, size).set(x, y, &[to_u16_signed(if right { 0.4 } else { 0.0 }), u16::MAX]);
+                }
+            }
+            assert_lit_matches_with(&mut gpu, (&lit.0, lit.1), &baked, &pixels, (true, tolerance), label);
+        }
     }
 
     /// Baked Lighting Stylized lights the base color as the CPU does: its sun, extra lights and sky
