@@ -553,7 +553,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs P4 stage"]
     fn gradients_after_their_input_blur_match_the_cpu() {
         let three = [[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
         let blurred =
@@ -590,18 +589,7 @@ mod tests {
     /// P2's filters and settings that still composite on the CPU, in content and in masks. Port
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
     fn still_on_cpu() -> Vec<Filter> {
-        vec![
-            Filter::GrayscaleConversion(GrayscaleConversion { custom_input: true, ..GrayscaleConversion::LIBRARY }),
-            // The input's blur waits for the box family's stage (P4)
-            Filter::GradientMap {
-                colors: vec![[0.0; 3], [1.0; 3]],
-                positions: Vec::new(),
-                quantity: None,
-                input: GradientInput { blur: 4.0, ..GradientInput::default() },
-                linear: true,
-                debug: false,
-            },
-        ]
+        vec![Filter::GrayscaleConversion(GrayscaleConversion { custom_input: true, ..GrayscaleConversion::LIBRARY })]
     }
 
     #[test]

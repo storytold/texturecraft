@@ -402,19 +402,10 @@ fn box_passes(
     source
 }
 
-/// The largest halo reach, in texels, that runs in the whole-set pre-pass. Beyond it (a 4K Drop
-/// Shadow's 563) four channels' stripes no longer fit beside their results on a 2 GiB binding,
-/// and the bands, 4x faster than the CPU there, take it.
-const HALO_WHOLE_SET_REACH: u32 = 512;
-
 /// Whether a stage runs in the whole-set pre-pass instead of in every band (see
 /// `NeighbourhoodFilter::whole_set`): large reaches and whole-set reads.
 pub(super) fn whole_set(filter: NeighbourhoodFilter, _resolution: u32) -> bool {
-    match filter.kind {
-        HALO => reach(filter) <= HALO_WHOLE_SET_REACH,
-        DISTANCE_BEVEL | BEVEL_SMOOTH | DIRECTIONAL_DISTANCE => true,
-        _ => false,
-    }
+    matches!(filter.kind, HALO | DISTANCE_BEVEL | BEVEL_SMOOTH | DIRECTIONAL_DISTANCE)
 }
 
 /// Encodes a P4 stage with passes of its own; false lets the box and apply passes run.
@@ -531,16 +522,8 @@ mod tests {
 
     /// P4's filters and settings that still composite on the CPU, in content and in masks. Port
     /// one: delete its row (this test fails while a ported row stays) and add its oracle test.
-    /// The Gradient's input blur compiles once P2's gradient queues P4's stage before it.
     fn still_on_cpu() -> Vec<Filter> {
-        vec![Filter::GradientMap {
-            colors: vec![[0.0; 3], [1.0; 3]],
-            positions: Vec::new(),
-            quantity: None,
-            input: GradientInput { blur: 2.0, ..Default::default() },
-            linear: true,
-            debug: false,
-        }]
+        Vec::new()
     }
 
     #[test]
